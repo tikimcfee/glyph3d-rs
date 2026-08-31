@@ -6,6 +6,11 @@
 //! Stage F: fly camera (windowed) + per-file CPU frustum/LOD culling with
 //!          far-LOD backdrop quads — the repo field is interactive.
 //!          `--no-cull` keeps the legacy full-field draws for A/B.
+//! Stage G: CPU picking + live manipulation. `--pick-file/--pick-row/
+//!          --pick-col/--pick-px` resolve file → row/col → char; `--verb`
+//!          edits instances (recolor/nudge/scale glyph, recolor line) and
+//!          groups (move/scale/tint/hide) with partial buffer uploads.
+//!          Windowed: left click picks, h/g/t/x verbs, right-drag look.
 //!
 //! Run modes:
 //!   (default) [--render-file <path>] [--copies N]
@@ -27,7 +32,7 @@ mod windowed;
 
 use std::path::{Path, PathBuf};
 
-use glyph_scene::{CameraMode, GlyphScene};
+use glyph_scene::{CameraMode, GlyphScene, PickCommand, Verb};
 use gpu::GpuContext;
 use scene::{Scene, SceneLike};
 
@@ -169,6 +174,84 @@ struct Cli {
     repo_scan_only: bool,
     /// Stage F: disable the cull/LOD pass (legacy per-chunk draws; debug/A-B).
     no_cull: bool,
+    /// Stage G: the interleaved pick/verb script, in CLI order. Verbs apply
+    /// to the most recent pick.
+    ops: Vec<Op>,
+}
+
+/// Stage G: one scripted operation (picks and verbs interleave in CLI order).
+pub enum Op {
+    Pick(PickCommand),
+    Verb(Verb),
+}
+
+/// --pick-row/--pick-col upgrade the most recent --pick-file pick into a
+/// deterministic RowCol pick (defaults: row 0 / col 0 for the unset half).
+fn set_pick_row_col(ops: &mut Vec<Op>, row: Option<u32>, col: Option<u32>) {
+    match ops.last_mut() {
+        Some(Op::Pick(PickCommand::File(f))) => {
+            let f = f.clone();
+            ops.pop();
+            ops.push(Op::Pick(PickCommand::RowCol {
+                file: f,
+                row: row.unwrap_or(0),
+                col: col.unwrap_or(0),
+            }));
+        }
+        Some(Op::Pick(PickCommand::RowCol { row: r, col: c, .. })) => {
+            if let Some(row) = row {
+                *r = row;
+            }
+            if let Some(col) = col {
+                *c = col;
+            }
+        }
+        _ => panic!("--pick-row/--pick-col must follow --pick-file"),
+    }
+}
+
+/// Parse a `--verb` string into a Verb. Forms:
+///   recolor-glyph [rrggbb]      recolor-line [rrggbb]
+///   nudge-glyph dx dy [dz]      scale-glyph f
+///   move-group dx dy dz         scale-group s
+///   tint-group rrggbb           tint-cycle
+///   hide-group | show-group | toggle-hidden
+fn parse_verb(s: &str) -> Verb {
+    let t: Vec<&str> = s.split_whitespace().collect();
+    let usage = "unknown/malformed --verb {s:?} — expected recolor-glyph|recolor-line|\
+                 nudge-glyph|scale-glyph|move-group|scale-group|tint-group|tint-cycle|\
+                 hide-group|show-group|toggle-hidden";
+    let f = |i: usize| -> f32 {
+        t.get(i)
+            .and_then(|v| v.parse().ok())
+            .unwrap_or_else(|| panic!("--verb {s:?}: bad/missing float at position {i}"))
+    };
+    let hex = |i: usize| -> [u8; 3] {
+        let h = t
+            .get(i)
+            .unwrap_or_else(|| panic!("--verb {s:?}: missing rrggbb at position {i}"))
+            .trim_start_matches('#');
+        let v = u32::from_str_radix(h, 16)
+            .unwrap_or_else(|_| panic!("--verb {s:?}: bad hex color {h:?}"));
+        [((v >> 16) & 0xFF) as u8, ((v >> 8) & 0xFF) as u8, (v & 0xFF) as u8]
+    };
+    match t.first().copied().unwrap_or("") {
+        "recolor-glyph" => Verb::RecolorGlyph(if t.len() > 1 { hex(1) } else { [255, 80, 80] }),
+        "recolor-line" => Verb::RecolorLine(if t.len() > 1 { hex(1) } else { [255, 213, 79] }),
+        "nudge-glyph" => Verb::NudgeGlyph([f(1), f(2), if t.len() > 3 { f(3) } else { 0.0 }]),
+        "scale-glyph" => Verb::ScaleGlyph(f(1)),
+        "move-group" => Verb::MoveGroup([f(1), f(2), f(3)]),
+        "scale-group" => Verb::ScaleGroup(f(1)),
+        "tint-group" => {
+            let [r, g, b] = hex(1);
+            Verb::TintGroup([r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0])
+        }
+        "tint-cycle" => Verb::TintCycle,
+        "hide-group" => Verb::SetHidden(true),
+        "show-group" => Verb::SetHidden(false),
+        "toggle-hidden" => Verb::ToggleHidden,
+        _ => panic!("{usage}"),
+    }
 }
 
 fn parse_cli() -> Cli {
@@ -191,6 +274,7 @@ fn parse_cli() -> Cli {
         focus_file: None,
         repo_scan_only: false,
         no_cull: false,
+        ops: Vec::new(),
     };
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -254,6 +338,33 @@ fn parse_cli() -> Cli {
             }
             "--repo-scan-only" => cli.repo_scan_only = true,
             "--no-cull" => cli.no_cull = true,
+            "--pick-file" => {
+                let s = args.next().expect("--pick-file requires a path substring");
+                cli.ops.push(Op::Pick(PickCommand::File(s)));
+            }
+            "--pick-row" => {
+                let n = args.next().expect("--pick-row requires a row number");
+                let row: u32 = n.parse().expect("--pick-row must be a non-negative integer");
+                set_pick_row_col(&mut cli.ops, Some(row), None);
+            }
+            "--pick-col" => {
+                let n = args.next().expect("--pick-col requires a column number");
+                let col: u32 = n.parse().expect("--pick-col must be a non-negative integer");
+                set_pick_row_col(&mut cli.ops, None, Some(col));
+            }
+            "--pick-px" => {
+                let x = args.next().expect("--pick-px requires X Y (physical pixels)");
+                let y = args.next().expect("--pick-px requires X Y (physical pixels)");
+                let px = (
+                    x.parse().expect("--pick-px X must be a number"),
+                    y.parse().expect("--pick-px Y must be a number"),
+                );
+                cli.ops.push(Op::Pick(PickCommand::Pixel { x: px.0, y: px.1 }));
+            }
+            "--verb" => {
+                let s = args.next().expect("--verb requires a verb string, e.g. --verb \"move-group 10 0 0\"");
+                cli.ops.push(Op::Verb(parse_verb(&s)));
+            }
             "-h" | "--help" => {
                 eprintln!(
                     "usage: glyph3d-native [options]\n\
@@ -275,8 +386,18 @@ fn parse_cli() -> Cli {
                      \x20 --focus-file SUBSTR  frame the first file whose path contains SUBSTR\n\
                      \x20 --repo-scan-only     walk+engine+stage+stats, no GPU, then exit\n\
                      \x20 --no-cull            Stage F: disable cull/LOD (legacy full-field draws)\n\
-                     \x20 windowed mode: fly camera — click to grab the mouse, WASD move,\n\
-                     \x20   E|R up, Q|F down, mouse-look, scroll = speed, Esc releases"
+                     \x20 --pick-file SUBSTR   Stage G: pick the first file whose path contains SUBSTR\n\
+                     \x20 --pick-row N         with --pick-file: deterministic glyph pick (folded row)\n\
+                     \x20 --pick-col M         with --pick-file: deterministic glyph pick (folded col)\n\
+                     \x20 --pick-px X Y        ray pick through physical pixel (X,Y) of the viewport\n\
+                     \x20 --verb \"V [ARGS]\"    manipulation verb on the pick (repeatable):\n\
+                     \x20   recolor-glyph [rrggbb] | recolor-line [rrggbb] |\n\
+                     \x20   nudge-glyph dx dy [dz] | scale-glyph f |\n\
+                     \x20   move-group dx dy dz | scale-group s |\n\
+                     \x20   tint-group rrggbb | tint-cycle | hide-group | show-group | toggle-hidden\n\
+                     \x20 windowed mode: fly camera — WASD move, E|R up, Q|F down, RIGHT-drag\n\
+                     \x20   look, scroll = speed, Esc releases | interact: LEFT click = pick glyph,\n\
+                     \x20   h highlight line, g grab file (mouse drags, scroll scales), t tint, x hide"
                 );
                 std::process::exit(0);
             }
@@ -441,7 +562,9 @@ fn main() {
     let ctx = pollster::block_on(gpu::init(None));
 
     match cli.screenshot {
-        Some(path) => offscreen::run(&ctx, &choice, &path, cli.frames, cli.zoom, !cli.no_cull),
-        None => windowed::run(ctx, &choice, !cli.no_cull),
+        Some(path) => offscreen::run(
+            &ctx, &choice, &path, cli.frames, cli.zoom, !cli.no_cull, &cli.ops,
+        ),
+        None => windowed::run(ctx, &choice, !cli.no_cull, &cli.ops),
     }
 }

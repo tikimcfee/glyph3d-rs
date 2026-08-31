@@ -1,0 +1,26 @@
+[2026-08-31T17:35:31Z INFO  glyph3d_native::gpu] adapter: name="Apple M2" backend=Metal vendor=0x0000 device=0x0000 driver=""
+[2026-08-31T17:35:31Z INFO  glyph3d_native::gpu] adapter features: MULTI_DRAW_INDIRECT_COUNT=false
+[2026-08-31T17:35:31Z INFO  glyph3d_native::gpu] device limits: max_storage_buffer_binding_size=4294967292 (4095 MiB) max_buffer_size=4294967295 (4095 MiB)
+[2026-08-31T17:35:35Z INFO  glyph3d_native::repo] layout: target_w 15104, field 15098x22682
+repo: 1305 files, 96.9 MB source (75 dirs walked, 4 skipped >10 MiB, 0 skipped non-UTF-8)
+repo: 96860762 engine records -> 95181245 glyph instances (1679517 blank/missing dropped) | engine path: naive per-file
+phases: walk 0.198s | engine 1.805s (53.7 MB/s) | stage 1.438s | layout 0.000s | total 3.442s
+[2026-08-31T17:35:35Z INFO  glyph3d_native::atlas] atlas: 4431 slots, 82239 curves (1024x161), 5349 mapped codepoints, fonts upem=2048 cell=1229fu em=2320fu
+[2026-08-31T17:35:35Z INFO  glyph3d_native::repo] field bounds: x [0, 15098], y [-22682, 1.2] — 15098x22683 world units
+[2026-08-31T17:35:41Z INFO  glyph3d_native::glyph_scene] glyph field: 95181245 instances (4357 MiB) in 2 chunk(s) of ≤89478485 (4095 MiB binding limit), 1305 groups
+[2026-08-31T17:35:41Z INFO  glyph3d_native::glyph_scene] cull: 1305 segments (CPU frustum+LOD) | backdrop buffer 41760 B (KB-scale, no instance-sized buffers added)
+[2026-08-31T17:35:41Z INFO  glyph3d_native::windowed] surface: 3200x2000 Bgra8UnormSrgb present=Fifo
+fly camera: WASD move | E|R up, Q|F down | RIGHT-drag look | scroll = speed | Esc releases
+  interact: LEFT click = pick glyph | h highlight line | g grab file (mouse drags, scroll scales) | t cycle tint | x hide/show
+[2026-08-31T17:35:41Z INFO  glyph3d_native::glyph_scene] pick cache: packages/glyph3d-core/src/compute/liveTrie.js — 3673 records re-derived in 999.6µs (3697 B) | fold cross-check: PASS (0 mismatch)
+pick: packages/glyph3d-core/src/compute/liveTrie.js group=1010 rec=2329 row=40 col=11 line=40 byte=2351 char='b' slot=92884782 pos=(5.83,-50.00,0.00)
+verb recolor-line: packages/glyph3d-core/src/compute/liveTrie.js row 40 — 26 glyphs in 1 run(s), 1248 B uploaded
+pick: packages/glyph3d-core/src/compute/liveTrie.js group=1010 (file-level pick, no glyph resolved)
+verb move-group: packages/glyph3d-core/src/compute/liveTrie.js group 1010 offset -> (9576.0,-2065.8,0.0) (80 B row)
+verb scale-group: packages/glyph3d-core/src/compute/liveTrie.js group 1010 scale -> 0.500 (80 B row)
+pick: packages/glyph3d-core/src/core/glyphVertex.js group=1019 (file-level pick, no glyph resolved)
+verb hide-group: packages/glyph3d-core/src/core/glyphVertex.js group 1019 (alpha -> 0, 80 B row; cull skips the segment)
+FPS: 97.7 (98 frames in 1.00s, 95181245 instances)
+FPS: 116.3 (117 frames in 1.01s, 95181245 instances)
+FPS: 5.0 (10 frames in 2.01s, 95181245 instances)
+FPS: 61.0 (62 frames in 1.02s, 95181245 instances)

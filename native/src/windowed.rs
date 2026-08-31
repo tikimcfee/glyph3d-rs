@@ -1,11 +1,17 @@
 //! Windowed mode: winit window + wgpu surface, uncapped continuous render loop,
 //! FPS printed to stdout once per second. Renders whichever scene the CLI chose.
 //!
-//! Stage F: the glyph scenes run a FLY camera — click the window to grab the
-//! mouse (pointer confined + hidden), then WASD strafe/forward, E|R up,
-//! Q|F down, mouse-look, scroll wheel = speed multiplier; Esc releases the
-//! pointer. Input feeds the scene through the SceneLike hooks; per-frame
-//! motion integrates in `tick`.
+//! Stage F: the glyph scenes run a FLY camera — WASD strafe/forward, E|R up,
+//! Q|F down, scroll wheel = speed multiplier.
+//! Stage G: interaction is split between the two mouse buttons so picking and
+//! the fly camera coexist:
+//!   - LEFT click (ungrabbed pointer) = PICK the glyph under the cursor
+//!     (prints file:row:col:char, flash-highlights it);
+//!   - RIGHT press-and-drag = mouse-look (pointer confined + hidden while
+//!     held; raw DeviceEvent deltas); Esc also releases;
+//!   - verb keys act on the last pick: `h` highlight line, `g` grab/release
+//!     the picked file (mouse drags it in the view plane, scroll scales it),
+//!     `t` cycle the tint palette, `x` toggle hidden.
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -19,7 +25,7 @@ use winit::window::{CursorGrabMode, Window, WindowId};
 use crate::glyph_scene::CameraMode;
 use crate::gpu::GpuContext;
 use crate::scene::{self, SceneLike};
-use crate::{build_scene, SceneChoice};
+use crate::{build_scene, Op, SceneChoice};
 
 struct WindowState {
     window: Arc<Window>,
@@ -28,8 +34,11 @@ struct WindowState {
     depth: wgpu::TextureView,
     scene: Box<dyn SceneLike>,
     start: Instant,
-    /// Stage F: mouse-look is active only while the pointer is grabbed.
+    /// Stage F/G: mouse-look is active only while the pointer is grabbed
+    /// (right button held).
     grabbed: bool,
+    /// Last cursor position, physical px (click picks use it).
+    cursor: (f32, f32),
     last_frame: Instant,
     // FPS accounting
     frames: u32,
@@ -128,6 +137,9 @@ struct App<'a> {
     ctx: GpuContext,
     choice: &'a SceneChoice,
     cull: bool,
+    /// Stage G: scripted picks/verbs applied once at startup (smoke testing
+    /// the same code path the windowed verbs use).
+    ops: &'a [Op],
     start: Instant,
     state: Option<WindowState>,
 }
@@ -179,7 +191,7 @@ impl ApplicationHandler for App<'_> {
 
         // Stage F: windowed glyph scenes get the fly camera (the Stage A demo
         // scene keeps its internal orbit; it ignores camera_mode).
-        let scene = build_scene(&self.ctx, format, self.choice, CameraMode::Fly, self.cull);
+        let mut scene = build_scene(&self.ctx, format, self.choice, CameraMode::Fly, self.cull);
         let depth = scene::create_depth(&self.ctx.device, scene.depth_format(), config.width, config.height);
         log::info!(
             "surface: {}x{} {:?} present={:?}",
@@ -189,9 +201,23 @@ impl ApplicationHandler for App<'_> {
             config.present_mode
         );
         println!(
-            "fly camera: click to grab the mouse | WASD move | E|R up, Q|F down | \
-             mouse-look | scroll = speed | Esc releases"
+            "fly camera: WASD move | E|R up, Q|F down | RIGHT-drag look | scroll = speed | Esc releases\n\
+             \x20 interact: LEFT click = pick glyph | h highlight line | g grab file \
+             (mouse drags, scroll scales) | t cycle tint | x hide/show"
         );
+
+        // Stage G: scripted startup picks/verbs (same entry points the
+        // windowed event handlers use).
+        scene.set_viewport(config.width, config.height);
+        for op in self.ops {
+            let line = match op {
+                Op::Pick(p) => scene.apply_pick(&self.ctx, p),
+                Op::Verb(v) => scene.apply_verb(&self.ctx, v),
+            };
+            if let Some(line) = line {
+                println!("{line}");
+            }
+        }
 
         self.state = Some(WindowState {
             window,
@@ -201,6 +227,7 @@ impl ApplicationHandler for App<'_> {
             scene,
             start: self.start,
             grabbed: false,
+            cursor: (0.0, 0.0),
             last_frame: Instant::now(),
             frames: 0,
             fps_window_start: Instant::now(),
@@ -211,7 +238,10 @@ impl ApplicationHandler for App<'_> {
         let Some(state) = self.state.as_mut() else { return };
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
-            WindowEvent::Resized(size) => state.resize(&self.ctx, size.width, size.height),
+            WindowEvent::Resized(size) => {
+                state.resize(&self.ctx, size.width, size.height);
+                state.scene.set_viewport(size.width, size.height);
+            }
             WindowEvent::RedrawRequested => state.render(&self.ctx),
             WindowEvent::KeyboardInput { event, .. } => {
                 if let PhysicalKey::Code(code) = event.physical_key {
@@ -220,12 +250,27 @@ impl ApplicationHandler for App<'_> {
                     if code == KeyCode::Escape && pressed {
                         state.ungrab();
                     } else {
-                        state.scene.on_key(code, pressed);
+                        state.scene.on_key(&self.ctx, code, pressed);
                     }
                 }
             }
-            WindowEvent::MouseInput { state: ElementState::Pressed, button: MouseButton::Left, .. } => {
+            // Stage G: LEFT click picks (only while the pointer is NOT
+            // grabbed); RIGHT press grabs for mouse-look, release ungrabs.
+            WindowEvent::MouseInput { state: ElementState::Pressed, button: MouseButton::Right, .. } => {
                 state.grab();
+            }
+            WindowEvent::MouseInput { state: ElementState::Released, button: MouseButton::Right, .. } => {
+                state.ungrab();
+            }
+            WindowEvent::MouseInput { state: ElementState::Pressed, button: MouseButton::Left, .. } => {
+                if !state.grabbed {
+                    let (x, y) = state.cursor;
+                    state.scene.on_click(&self.ctx, x, y);
+                }
+            }
+            WindowEvent::CursorMoved { position, .. } => {
+                state.cursor = (position.x as f32, position.y as f32);
+                state.scene.on_cursor(&self.ctx, state.cursor.0, state.cursor.1);
             }
             WindowEvent::MouseWheel { delta, .. } => {
                 let lines = match delta {
@@ -233,7 +278,7 @@ impl ApplicationHandler for App<'_> {
                     // Pixel deltas (macOS trackpads): ~53 px per notch.
                     MouseScrollDelta::PixelDelta(p) => (p.y / 53.0) as f32,
                 };
-                state.scene.on_scroll(lines);
+                state.scene.on_scroll(&self.ctx, lines);
             }
             _ => {}
         }
@@ -245,7 +290,7 @@ impl ApplicationHandler for App<'_> {
         if let DeviceEvent::MouseMotion { delta: (dx, dy) } = event {
             if let Some(state) = self.state.as_mut() {
                 if state.grabbed {
-                    state.scene.on_mouse_look(dx as f32, dy as f32);
+                    state.scene.on_mouse_look(&self.ctx, dx as f32, dy as f32);
                 }
             }
         }
@@ -263,12 +308,13 @@ impl ApplicationHandler for App<'_> {
     }
 }
 
-pub fn run(ctx: GpuContext, choice: &SceneChoice, cull: bool) {
+pub fn run(ctx: GpuContext, choice: &SceneChoice, cull: bool, ops: &[Op]) {
     let event_loop = EventLoop::new().expect("event loop creation failed");
     let mut app = App {
         ctx,
         choice,
         cull,
+        ops,
         start: Instant::now(),
         state: None,
     };

@@ -227,6 +227,7 @@ pub fn file_item_params(p: &RepoParams, byte_len: usize, newline_count: usize) -
 /// One file's view into the shared arena. The base/count fields are the
 /// MegaGlyphField-style view contract; Stage G picking reads them (plus the
 /// per-file engine params, which make a deterministic re-layout possible).
+#[allow(dead_code)]
 pub struct FileView {
     pub rel_path: String,
     /// Parent directory (relative) — the group-tint key.
@@ -735,7 +736,7 @@ impl RepoLoad {
                     [v.width.max(1.0) * 0.5, v.height.max(1.0) * 0.5],
                 ));
                 log::info!(
-                    "focus: {} ({}x{} records, page {:.0}x{:.0} world units)",
+                    "focus: {} ({}x{} records, page {:.3}x{:.3} world units)",
                     v.rel_path,
                     v.record_count,
                     v.slot_count,

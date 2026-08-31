@@ -9,9 +9,18 @@ use std::path::Path;
 use crate::glyph_scene::CameraMode;
 use crate::gpu::GpuContext;
 use crate::scene;
-use crate::{build_scene, SceneChoice, OFFSCREEN_HEIGHT, OFFSCREEN_WIDTH};
+use crate::{build_scene, Op, SceneChoice, OFFSCREEN_HEIGHT, OFFSCREEN_WIDTH};
 
-pub fn run(ctx: &GpuContext, choice: &SceneChoice, path: &Path, frames: u32, zoom: f32, cull: bool) {
+#[allow(clippy::too_many_arguments)]
+pub fn run(
+    ctx: &GpuContext,
+    choice: &SceneChoice,
+    path: &Path,
+    frames: u32,
+    zoom: f32,
+    cull: bool,
+    ops: &[Op],
+) {
     let device = &ctx.device;
 
     // sRGB target so the PNG bytes are display-ready sRGB values straight
@@ -35,7 +44,34 @@ pub fn run(ctx: &GpuContext, choice: &SceneChoice, path: &Path, frames: u32, zoo
     let color_view = texture.create_view(&Default::default());
     let depth_view = scene::create_depth(device, wgpu::TextureFormat::Depth32Float, size.width, size.height);
 
-    let scene = build_scene(ctx, format, choice, CameraMode::Front { zoom }, cull);
+    let mut scene = build_scene(ctx, format, choice, CameraMode::Front { zoom }, cull);
+
+    // Stage G: scripted picks + verbs, applied in CLI order before the first
+    // frame. Deterministic: the Front camera + fixed viewport make --pick-px
+    // reproducible, and --pick-row/--pick-col don't involve a ray at all.
+    scene.set_viewport(size.width, size.height);
+    for op in ops {
+        let line = match op {
+            Op::Pick(p) => scene.apply_pick(ctx, p),
+            Op::Verb(v) => scene.apply_verb(ctx, v),
+        };
+        match line {
+            Some(line) => println!("{line}"),
+            None => println!("op: scene does not support picking/manipulation"),
+        }
+    }
+
+    // Stage G debug: GLYPH_G_DUMP=<slot>[,<len>] reads back instance bytes
+    // after the ops to verify partial uploads landed.
+    if let Some(spec) = std::env::var_os("GLYPH_G_DUMP") {
+        let spec = spec.to_string_lossy().to_string();
+        let mut parts = spec.split(',');
+        let slot: u64 = parts.next().and_then(|s| s.parse().ok()).expect("GLYPH_G_DUMP slot");
+        let len: u64 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(96);
+        let mut buf = vec![0u32; (len as usize / 4).max(12)];
+        scene.debug_dump_instances(ctx, slot, &mut buf);
+        println!("GLYPH_G_DUMP slot {slot}: {buf:08x?}");
+    }
 
     // Readback buffer: copy_texture_to_buffer requires 256-byte-aligned rows.
     let unpadded_bpr = size.width * 4;

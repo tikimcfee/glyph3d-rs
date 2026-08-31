@@ -189,6 +189,7 @@ pub enum Verb {
 }
 
 /// A resolved glyph within a file.
+#[derive(Clone)]
 pub struct PickGlyph {
     /// Record index within the file (== UTF-8 leader index).
     pub record: usize,
@@ -209,6 +210,7 @@ pub struct PickGlyph {
 }
 
 /// A resolved pick: always the file; the glyph when one is close enough.
+#[derive(Clone)]
 pub struct PickHit {
     pub group_id: u32,
     pub rel_path: String,
@@ -756,6 +758,9 @@ pub struct GlyphScene {
     /// Flash-highlighted glyph: (arena slot, original packed color); the next
     /// click restores it before flashing the new pick.
     flash: Option<(u32, u32)>,
+    /// Geometry overrides from nudge/scale-glyph verbs (slot → pos/advance/
+    /// height), so a later recolor-line rebuild preserves them.
+    geom_overrides: std::collections::HashMap<u32, ([f32; 3], f32, f32)>,
     /// One-entry cache of the last pick's re-derived file data.
     cache: Option<PickCacheEntry>,
     /// Windowed grab verb: the group being dragged with the mouse.
@@ -817,14 +822,19 @@ impl GlyphScene {
                 device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                     label: Some(&label),
                     contents: bytemuck::cast_slice(chunk),
-                    usage: wgpu::BufferUsages::STORAGE,
+                    // Stage G: COPY_DST for partial per-slot edit uploads;
+                    // COPY_SRC for the GLYPH_G_DUMP verification readback.
+                    usage: wgpu::BufferUsages::STORAGE
+                        | wgpu::BufferUsages::COPY_DST
+                        | wgpu::BufferUsages::COPY_SRC,
                 })
             })
             .collect();
         let group_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("group table"),
             contents: bytemuck::cast_slice(&groups),
-            usage: wgpu::BufferUsages::STORAGE,
+            // Stage G: COPY_DST for partial per-row edit uploads (80 B/row).
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
         });
         log::info!(
             "glyph field: {} instances ({} MiB) in {} chunk(s) of ≤{} ({} MiB binding limit), {} groups",
@@ -1075,11 +1085,16 @@ impl GlyphScene {
                 depth_format,
                 &camera_buf,
                 &segments,
+                &groups,
             ))
         } else {
             log::info!("culling disabled (--no-cull) — legacy per-chunk draws");
             None
         };
+
+        let pick = staged.pick;
+        let groups_cpu = groups.clone();
+        let tint_step = vec![0u32; groups.len()];
 
         Self {
             pipeline,
@@ -1096,6 +1111,18 @@ impl GlyphScene {
             camera_mode,
             fly,
             cull,
+            instance_bufs,
+            group_buf,
+            groups_cpu,
+            pick,
+            picked: None,
+            flash: None,
+            geom_overrides: std::collections::HashMap::new(),
+            cache: None,
+            grabbed_group: None,
+            cursor: (0.0, 0.0),
+            viewport: Cell::new((1600, 1000)), // refreshed every render()
+            tint_step,
         }
     }
 
@@ -1129,6 +1156,767 @@ impl GlyphScene {
             eye,
         }
     }
+
+    // ── Stage G: picking & live manipulation ───────────────────────────────
+
+    /// Group TRS from the CPU mirror: (offset, scale, rgb, alpha).
+    fn group_trs(&self, gid: u32) -> Option<(Vec3, Vec3, [f32; 3], f32)> {
+        let g = self.groups_cpu.get(gid as usize)?;
+        Some((
+            Vec3::new(g.cols[0][0], g.cols[0][1], g.cols[0][2]),
+            Vec3::new(g.cols[3][0], g.cols[3][1], g.cols[3][2]),
+            [g.cols[2][0], g.cols[2][1], g.cols[2][2]],
+            g.cols[2][3],
+        ))
+    }
+
+    fn group_hidden(&self, gid: u32) -> bool {
+        self.group_trs(gid).is_some_and(|(_, _, _, a)| a <= 0.01)
+    }
+
+    /// Ensure the one-entry pick cache holds `gid`'s re-derived file data:
+    /// records (bit-identical engine re-run) + the CPU byte walks. The fold
+    /// cross-check (CPU row/col vs engine ROW/COL lanes, every record) is the
+    /// standing pick-correctness gate and runs on every cache fill.
+    fn ensure_pick_cache(&mut self, gid: u32) -> bool {
+        if self.cache.as_ref().is_some_and(|c| c.group_id == gid) {
+            return true;
+        }
+        let Some(pctx) = &self.pick else { return false };
+        let Some(info) = pctx.files.iter().find(|f| f.group_id == gid) else {
+            return false;
+        };
+        let t = std::time::Instant::now();
+        let Ok((records, bytes)) =
+            crate::repo::rederive_records(&pctx.root, &pctx.trie, &info.rel_path, &info.item)
+        else {
+            log::warn!("pick: failed to re-read/re-run {}", info.rel_path);
+            return false;
+        };
+        let (leaders, rows, cols, lines) = crate::text::fold_leaders(&bytes, info.item.wrap_width);
+        let mut mismatch = 0usize;
+        if leaders.len() != records.len() {
+            mismatch += 1;
+        } else {
+            for (i, r) in records.iter().enumerate() {
+                if r.row() != rows[i] || r.col() != cols[i] {
+                    mismatch += 1;
+                }
+            }
+        }
+        let colors = crate::text::colorize_leaders(&bytes);
+        let mut slot_of = vec![u32::MAX; records.len()];
+        let mut k = info.slot_base;
+        for (i, r) in records.iter().enumerate() {
+            if r.glyph_id() != 0 {
+                slot_of[i] = k;
+                k += 1;
+            }
+        }
+        debug_assert_eq!(k, info.slot_base + info.slot_count);
+        log::info!(
+            "pick cache: {} — {} records re-derived in {:.1?} ({} B) | fold cross-check: {} ({} mismatch)",
+            info.rel_path,
+            records.len(),
+            t.elapsed(),
+            bytes.len(),
+            if mismatch == 0 { "PASS" } else { "FAIL" },
+            mismatch,
+        );
+        if mismatch != 0 {
+            log::warn!("pick: fold/engine row-col mismatch on {} — char resolution unreliable", info.rel_path);
+        }
+        self.cache = Some(PickCacheEntry {
+            group_id: gid,
+            records,
+            leaders,
+            lines,
+            colors,
+            slot_of,
+        });
+        true
+    }
+
+    /// Build a PickGlyph for record `rec` of the cached file `gid`.
+    fn make_glyph(&self, gid: u32, rec: usize) -> Option<PickGlyph> {
+        let c = self.cache.as_ref().filter(|c| c.group_id == gid)?;
+        let r = c.records.get(rec)?;
+        let (byte_off, cp) = c.leaders[rec];
+        Some(PickGlyph {
+            record: rec,
+            slot: (c.slot_of[rec] != u32::MAX).then_some(c.slot_of[rec]),
+            row: r.row(),
+            col: r.col(),
+            line: c.lines[rec],
+            byte_off,
+            ch: char::from_u32(cp).unwrap_or('\u{FFFD}'),
+            pos: [r.x(), r.y(), r.z()],
+            advance: r.advance(),
+            height: r.height(),
+            color: c.colors.get(rec).copied().unwrap_or(0xFF_D4D4D4),
+        })
+    }
+
+    /// Unproject a physical pixel to a world ray under the CURRENT camera.
+    /// wgpu clip z ∈ [0,1]: ndc z=0 is the near plane, z=1 the far plane.
+    fn pixel_ray(&self, x: f32, y: f32) -> Option<(Vec3, Vec3)> {
+        let (w, h) = self.viewport.get();
+        if w == 0 || h == 0 {
+            return None;
+        }
+        let frame = self.camera_frame(0.0, w as f32 / h as f32);
+        let inv = frame.view_proj.inverse();
+        let nx = (x / w as f32) * 2.0 - 1.0;
+        let ny = 1.0 - (y / h as f32) * 2.0;
+        let p0 = inv * Vec4::new(nx, ny, 0.0, 1.0);
+        let p1 = inv * Vec4::new(nx, ny, 1.0, 1.0);
+        if p0.w.abs() < 1e-9 || p1.w.abs() < 1e-9 {
+            return None;
+        }
+        let a = p0.truncate() / p0.w;
+        let b = p1.truncate() / p1.w;
+        let d = b - a;
+        if d.length_squared() < 1e-12 {
+            return None;
+        }
+        Some((a, d.normalize()))
+    }
+
+    /// Nearest non-hidden file whose live world AABB the ray pierces.
+    fn ray_file(&self, ro: Vec3, rd: Vec3) -> Option<(u32, f32)> {
+        let pctx = self.pick.as_ref()?;
+        let mut best: Option<(u32, f32)> = None;
+        for info in &pctx.files {
+            if self.group_hidden(info.group_id) {
+                continue;
+            }
+            let Some((off, sc, _, _)) = self.group_trs(info.group_id) else {
+                continue;
+            };
+            let min = Vec3::new(
+                info.aabb_min[0] * sc.x + off.x,
+                info.aabb_min[1] * sc.y + off.y,
+                off.z - 1.0,
+            );
+            let max = Vec3::new(
+                info.aabb_max[0] * sc.x + off.x,
+                info.aabb_max[1] * sc.y + off.y,
+                off.z + 1.0,
+            );
+            if let Some(t) = ray_aabb(ro, rd, min, max) {
+                if best.is_none_or(|(_, bt)| t < bt) {
+                    best = Some((info.group_id, t));
+                }
+            }
+        }
+        best
+    }
+
+    /// Ray pick: nearest file AABB → ray ∩ file plane → nearest record cell.
+    fn pick_ray(&mut self, x: f32, y: f32) -> Option<PickHit> {
+        let (ro, rd) = self.pixel_ray(x, y)?;
+        let (gid, t_aabb) = self.ray_file(ro, rd)?;
+        let rel_path = self
+            .pick
+            .as_ref()?
+            .files
+            .iter()
+            .find(|f| f.group_id == gid)?
+            .rel_path
+            .clone();
+        let (off, sc, _, _) = self.group_trs(gid)?;
+        // All glyphs live in the z = offset.z plane (group quats are identity).
+        let t = if rd.z.abs() > 1e-9 {
+            (off.z - ro.z) / rd.z
+        } else {
+            t_aabb
+        };
+        let p = ro + rd * t.max(0.0);
+        let qx = (p.x - off.x) / sc.x.max(1e-6);
+        let qy = (p.y - off.y) / sc.y.max(1e-6);
+        if !self.ensure_pick_cache(gid) {
+            return Some(PickHit {
+                group_id: gid,
+                rel_path,
+                glyph: None,
+            });
+        }
+        let c = self.cache.as_ref().unwrap();
+        // Nearest record cell: 2-D distance from the local point to each
+        // glyph's rect [x, x+advance] × [y−h/2, y+h/2]. O(records of ONE
+        // file) — microseconds for typical files, ~10 ms for a 10 MB monster.
+        let mut best = (f32::MAX, 0usize);
+        for (i, r) in c.records.iter().enumerate() {
+            let x0 = r.x();
+            let x1 = x0 + r.advance();
+            let y0 = r.y() - r.height() * 0.5;
+            let y1 = r.y() + r.height() * 0.5;
+            let dx = (x0 - qx).max(0.0).max(qx - x1);
+            let dy = (y0 - qy).max(0.0).max(qy - y1);
+            let d = dx * dx + dy * dy;
+            if d < best.0 {
+                best = (d, i);
+            }
+        }
+        let dist_world = best.0.sqrt() * (sc.x + sc.y) * 0.5;
+        // Accept within ~3/4 of a cell; further out it's file background.
+        let glyph = if !c.records.is_empty() && dist_world <= 0.8 {
+            self.make_glyph(gid, best.1)
+        } else {
+            None
+        };
+        Some(PickHit {
+            group_id: gid,
+            rel_path,
+            glyph,
+        })
+    }
+
+    /// Deterministic scripted pick: exact folded (row, col) within the first
+    /// file whose path contains `file` (snaps to the nearest col on that row
+    /// with a warning if there is no exact record).
+    fn pick_row_col(&mut self, file: &str, row: u32, col: u32) -> Option<PickHit> {
+        let pctx = self.pick.as_ref()?;
+        let info = pctx.files.iter().find(|f| f.rel_path.contains(file))?;
+        let gid = info.group_id;
+        let rel_path = info.rel_path.clone();
+        if !self.ensure_pick_cache(gid) {
+            return Some(PickHit {
+                group_id: gid,
+                rel_path,
+                glyph: None,
+            });
+        }
+        let c = self.cache.as_ref().unwrap();
+        let mut exact = None;
+        let mut nearest: Option<(u32, usize)> = None;
+        for (i, r) in c.records.iter().enumerate() {
+            if r.row() == row {
+                if r.col() == col {
+                    exact = Some(i);
+                    break;
+                }
+                let d = r.col().abs_diff(col);
+                if nearest.is_none_or(|(bd, _)| d < bd) {
+                    nearest = Some((d, i));
+                }
+            }
+        }
+        if exact.is_none() {
+            match nearest {
+                Some((_, i)) => {
+                    let r = c.records[i];
+                    log::warn!(
+                        "pick: no exact record at row {row} col {col} in {rel_path}; \
+                         snapped to row {} col {}",
+                        r.row(),
+                        r.col()
+                    );
+                }
+                None => log::warn!("pick: no record on row {row} in {rel_path}"),
+            }
+        }
+        let idx = exact.or(nearest.map(|(_, i)| i));
+        let glyph = idx.and_then(|i| self.make_glyph(gid, i));
+        Some(PickHit {
+            group_id: gid,
+            rel_path,
+            glyph,
+        })
+    }
+
+    /// Resolve a pick command, store it as the current pick, return the log line.
+    pub fn apply_pick(&mut self, _ctx: &GpuContext, cmd: &PickCommand) -> Option<String> {
+        if self.pick.is_none() {
+            return Some("pick: this scene has no pick context (repo mode only)".to_string());
+        }
+        let hit = match cmd {
+            PickCommand::File(f) => {
+                let pctx = self.pick.as_ref().unwrap();
+                pctx.files
+                    .iter()
+                    .find(|i| i.rel_path.contains(f.as_str()))
+                    .map(|i| PickHit {
+                        group_id: i.group_id,
+                        rel_path: i.rel_path.clone(),
+                        glyph: None,
+                    })
+            }
+            PickCommand::RowCol { file, row, col } => self.pick_row_col(file, *row, *col),
+            PickCommand::Pixel { x, y } => self.pick_ray(*x, *y),
+        };
+        match hit {
+            Some(h) => {
+                let line = format_pick(&h);
+                self.picked = Some(h);
+                Some(line)
+            }
+            None => Some("pick: MISS (no file under the ray / no path match)".to_string()),
+        }
+    }
+
+    /// Partial instance-field upload: `data` at byte `field_off` within a
+    /// slot (48 B stride, 4-aligned offsets — write_buffer's requirement).
+    fn write_instance(&self, ctx: &GpuContext, slot: u32, field_off: u64, data: &[u8]) {
+        let chunk = (slot / self.chunk_cap) as usize;
+        let local = (slot % self.chunk_cap) as u64;
+        ctx.queue
+            .write_buffer(&self.instance_bufs[chunk], local * 48 + field_off, data);
+    }
+
+    /// Upload one edited group row (80 B) — never the whole table.
+    fn write_group_row(&self, ctx: &GpuContext, gid: u32) {
+        if let Some(g) = self.groups_cpu.get(gid as usize) {
+            ctx.queue
+                .write_buffer(&self.group_buf, gid as u64 * 80, bytemuck::bytes_of(g));
+        }
+    }
+
+    /// Re-derive a cull segment from the live group TRS: the world AABB
+    /// follows offset/scale, and the backdrop tint follows the group color
+    /// relative to its as-staged value (so untouched segments keep their
+    /// Stage F-fitted tint exactly).
+    fn sync_segment(&mut self, gid: u32) {
+        let Some(g) = self.groups_cpu.get(gid as usize).copied() else {
+            return;
+        };
+        let Some(cull) = &mut self.cull else { return };
+        let i = gid as usize;
+        if i >= cull.segments.len() {
+            return;
+        }
+        let (ox, oy) = (g.cols[0][0], g.cols[0][1]);
+        let (sx, sy) = (g.cols[3][0].max(0.0), g.cols[3][1].max(0.0));
+        cull.segments[i].min = [
+            cull.local_min[i][0] * sx + ox,
+            cull.local_min[i][1] * sy + oy,
+        ];
+        cull.segments[i].max = [
+            cull.local_max[i][0] * sx + ox,
+            cull.local_max[i][1] * sy + oy,
+        ];
+        let bt = cull.base_tint[i];
+        let orig = cull.orig_group_rgb[i];
+        let mut t = bt;
+        for (c, tc) in t.iter_mut().enumerate().take(3) {
+            let newc = g.cols[2][c].max(0.0).powf(2.2);
+            let oldc = orig[c].max(1e-6).powf(2.2);
+            *tc = (bt[c] * newc / oldc).min(1.0);
+        }
+        cull.segments[i].tint = t;
+    }
+
+    /// Apply a manipulation verb to the current pick. All GPU writes are
+    /// partial uploads; the return string is the audit log line.
+    pub fn apply_verb(&mut self, ctx: &GpuContext, verb: &Verb) -> String {
+        let Some(hit) = &self.picked else {
+            return "verb: nothing picked yet — ignored".to_string();
+        };
+        let gid = hit.group_id;
+        let rel = hit.rel_path.clone();
+        let glyph = hit.glyph.clone();
+        let pack = |rgb: [u8; 3]| -> u32 {
+            rgb[0] as u32 | (rgb[1] as u32) << 8 | (rgb[2] as u32) << 16 | 0xFF00_0000
+        };
+        match verb {
+            Verb::RecolorGlyph(rgb) => {
+                let Some(g) = &glyph else {
+                    return format!("verb recolor-glyph: {rel} pick has no glyph");
+                };
+                let Some(slot) = g.slot else {
+                    return format!("verb recolor-glyph: {rel} '{}' is blank (no instance)", g.ch);
+                };
+                self.write_instance(ctx, slot, 24, &pack(*rgb).to_le_bytes());
+                format!(
+                    "verb recolor-glyph: {rel} row {} col {} slot {slot} -> #{:02x}{:02x}{:02x} (4 B)",
+                    g.row, g.col, rgb[0], rgb[1], rgb[2]
+                )
+            }
+            Verb::RecolorLine(rgb) => {
+                let Some(g) = &glyph else {
+                    return format!("verb recolor-line: {rel} pick has no glyph");
+                };
+                let row = g.row;
+                if !self.ensure_pick_cache(gid) {
+                    return format!("verb recolor-line: {rel} pick cache unavailable");
+                }
+                let c = self.cache.as_ref().unwrap();
+                let packed = pack(*rgb);
+                // Collect (slot, record) for the row, coalesce into runs of
+                // CONTIGUOUS SLOTS, then rebuild the full 48 B instance
+                // records for each run from the cache (the color field is
+                // strided 48 B apart — a raw color-only byte range would
+                // stomp neighboring fields; a rebuilt-instance range write
+                // keeps it to ONE write_buffer per run).
+                let mut runs: Vec<(u32, Vec<GlyphInstance>)> = Vec::new();
+                let mut total = 0usize;
+                for (i, r) in c.records.iter().enumerate() {
+                    if r.row() != row {
+                        continue;
+                    }
+                    let s = c.slot_of[i];
+                    if s == u32::MAX {
+                        continue;
+                    }
+                    total += 1;
+                    let (mut pos, mut advance, mut height) =
+                        ([r.x(), r.y(), r.z()], r.advance(), r.height());
+                    // Preserve earlier nudge/scale-glyph edits on this slot.
+                    if let Some((p, a, h)) = self.geom_overrides.get(&s) {
+                        pos = *p;
+                        advance = *a;
+                        height = *h;
+                    }
+                    let inst = GlyphInstance {
+                        pos,
+                        glyph_id: r.glyph_id(),
+                        row: r.row(),
+                        col: r.col(),
+                        color: packed,
+                        group_id: gid,
+                        advance,
+                        height,
+                        flags: 0,
+                        _pad: 0,
+                    };
+                    match runs.last_mut() {
+                        Some((start, insts))
+                            if *start + insts.len() as u32 == s
+                                && *start / self.chunk_cap == s / self.chunk_cap =>
+                        {
+                            insts.push(inst);
+                        }
+                        _ => runs.push((s, vec![inst])),
+                    }
+                }
+                let mut bytes = 0u64;
+                for (start, insts) in &runs {
+                    let chunk = (*start / self.chunk_cap) as usize;
+                    let local = (*start % self.chunk_cap) as u64;
+                    ctx.queue.write_buffer(
+                        &self.instance_bufs[chunk],
+                        local * 48,
+                        bytemuck::cast_slice(insts),
+                    );
+                    bytes += insts.len() as u64 * 48;
+                }
+                format!(
+                    "verb recolor-line: {rel} row {row} — {total} glyphs in {} run(s), {bytes} B uploaded",
+                    runs.len()
+                )
+            }
+            Verb::NudgeGlyph(d) => {
+                let Some(g) = &glyph else {
+                    return format!("verb nudge-glyph: {rel} pick has no glyph");
+                };
+                let Some(slot) = g.slot else {
+                    return format!("verb nudge-glyph: {rel} '{}' is blank (no instance)", g.ch);
+                };
+                let new = [g.pos[0] + d[0], g.pos[1] + d[1], g.pos[2] + d[2]];
+                self.write_instance(ctx, slot, 0, bytemuck::cast_slice(&new));
+                self.geom_overrides
+                    .entry(slot)
+                    .or_insert((new, g.advance, g.height))
+                    .0 = new;
+                if let Some(h) = &mut self.picked {
+                    if let Some(pg) = &mut h.glyph {
+                        pg.pos = new;
+                    }
+                }
+                format!(
+                    "verb nudge-glyph: {rel} slot {slot} pos -> ({:.2},{:.2},{:.2}) (12 B)",
+                    new[0], new[1], new[2]
+                )
+            }
+            Verb::ScaleGlyph(f) => {
+                let Some(g) = &glyph else {
+                    return format!("verb scale-glyph: {rel} pick has no glyph");
+                };
+                let Some(slot) = g.slot else {
+                    return format!("verb scale-glyph: {rel} '{}' is blank (no instance)", g.ch);
+                };
+                let new_ah = [g.advance * f, g.height * f];
+                self.write_instance(ctx, slot, 32, bytemuck::cast_slice(&new_ah));
+                let ov = self
+                    .geom_overrides
+                    .entry(slot)
+                    .or_insert((g.pos, g.advance, g.height));
+                ov.1 = new_ah[0];
+                ov.2 = new_ah[1];
+                if let Some(h) = &mut self.picked {
+                    if let Some(pg) = &mut h.glyph {
+                        pg.advance = new_ah[0];
+                        pg.height = new_ah[1];
+                    }
+                }
+                format!(
+                    "verb scale-glyph: {rel} slot {slot} advance/height -> ({:.2},{:.2}) x{f} (8 B)",
+                    new_ah[0], new_ah[1]
+                )
+            }
+            Verb::MoveGroup(d) => {
+                let Some(g) = self.groups_cpu.get_mut(gid as usize) else {
+                    return format!("verb move-group: group {gid} out of range");
+                };
+                g.cols[0][0] += d[0];
+                g.cols[0][1] += d[1];
+                g.cols[0][2] += d[2];
+                let off = [g.cols[0][0], g.cols[0][1], g.cols[0][2]];
+                self.write_group_row(ctx, gid);
+                self.sync_segment(gid);
+                format!(
+                    "verb move-group: {rel} group {gid} offset -> ({:.1},{:.1},{:.1}) (80 B row)",
+                    off[0], off[1], off[2]
+                )
+            }
+            Verb::ScaleGroup(f) => {
+                let Some(g) = self.groups_cpu.get_mut(gid as usize) else {
+                    return format!("verb scale-group: group {gid} out of range");
+                };
+                for c in 0..3 {
+                    g.cols[3][c] = (g.cols[3][c] * f).clamp(0.001, 100.0);
+                }
+                let s = g.cols[3][0];
+                self.write_group_row(ctx, gid);
+                self.sync_segment(gid);
+                format!("verb scale-group: {rel} group {gid} scale -> {s:.3} (80 B row)")
+            }
+            Verb::TintGroup(rgb) => {
+                let Some(g) = self.groups_cpu.get_mut(gid as usize) else {
+                    return format!("verb tint-group: group {gid} out of range");
+                };
+                g.cols[2][0] = rgb[0];
+                g.cols[2][1] = rgb[1];
+                g.cols[2][2] = rgb[2];
+                self.write_group_row(ctx, gid);
+                self.sync_segment(gid);
+                format!(
+                    "verb tint-group: {rel} group {gid} tint -> ({:.2},{:.2},{:.2}) (80 B row)",
+                    rgb[0], rgb[1], rgb[2]
+                )
+            }
+            Verb::TintCycle => {
+                let i = gid as usize;
+                let step = self.tint_step.get(i).copied().unwrap_or(0) + 1;
+                if i < self.tint_step.len() {
+                    self.tint_step[i] = step;
+                }
+                let rgb = crate::repo::DIR_TINTS[(step as usize) % crate::repo::DIR_TINTS.len()];
+                let line = self.apply_verb(ctx, &Verb::TintGroup(rgb));
+                format!("{line} [palette step {step}]")
+            }
+            Verb::SetHidden(hide) => {
+                let Some(g) = self.groups_cpu.get_mut(gid as usize) else {
+                    return format!("verb hide/show: group {gid} out of range");
+                };
+                g.cols[2][3] = if *hide { 0.0 } else { 1.0 };
+                if let Some(cull) = &mut self.cull {
+                    if (gid as usize) < cull.hidden.len() {
+                        cull.hidden[gid as usize] = *hide;
+                    }
+                }
+                self.write_group_row(ctx, gid);
+                format!(
+                    "verb {}: {rel} group {gid} (alpha -> {}, 80 B row; cull skips the segment)",
+                    if *hide { "hide-group" } else { "show-group" },
+                    g_alpha(self.groups_cpu.get(gid as usize)),
+                )
+            }
+            Verb::ToggleHidden => {
+                let hidden = self.group_hidden(gid);
+                self.apply_verb(ctx, &Verb::SetHidden(!hidden))
+            }
+        }
+    }
+
+    /// Windowed click: restore the previous flash, pick at the pixel, flash
+    /// the new glyph (bright yellow), return the pick log line.
+    pub fn click_pick(&mut self, ctx: &GpuContext, x: f32, y: f32) -> Option<String> {
+        if let Some((slot, old)) = self.flash.take() {
+            self.write_instance(ctx, slot, 24, &old.to_le_bytes());
+        }
+        let line = self.apply_pick(ctx, &PickCommand::Pixel { x, y });
+        let target = self
+            .picked
+            .as_ref()
+            .and_then(|h| h.glyph.as_ref())
+            .and_then(|g| g.slot.map(|s| (s, g.color)));
+        if let Some((slot, old_color)) = target {
+            let flash_packed: u32 = 255 | 240 << 8 | 120 << 16 | 0xFF00_0000;
+            self.write_instance(ctx, slot, 24, &flash_packed.to_le_bytes());
+            self.flash = Some((slot, old_color));
+        }
+        line
+    }
+
+    /// Windowed cursor move: while a group is grabbed (`g`), drag it in the
+    /// view plane through its AABB center.
+    pub fn cursor_moved(&mut self, ctx: &GpuContext, x: f32, y: f32) {
+        let prev = self.cursor;
+        self.cursor = (x, y);
+        let Some(gid) = self.grabbed_group else { return };
+        if (x - prev.0).abs() + (y - prev.1).abs() < 1e-3 {
+            return;
+        }
+        let (Some((o0, d0)), Some((o1, d1))) =
+            (self.pixel_ray(prev.0, prev.1), self.pixel_ray(x, y))
+        else {
+            return;
+        };
+        let (w, h) = self.viewport.get();
+        let Some((_, fwd)) = self.pixel_ray(w as f32 * 0.5, h as f32 * 0.5) else {
+            return;
+        };
+        let Some((off, sc, _, _)) = self.group_trs(gid) else {
+            return;
+        };
+        let center_local = self
+            .pick
+            .as_ref()
+            .and_then(|p| p.files.iter().find(|f| f.group_id == gid))
+            .map(|i| {
+                [
+                    (i.aabb_min[0] + i.aabb_max[0]) * 0.5,
+                    (i.aabb_min[1] + i.aabb_max[1]) * 0.5,
+                ]
+            });
+        let Some(cl) = center_local else {
+            self.grabbed_group = None;
+            return;
+        };
+        let c = Vec3::new(cl[0] * sc.x + off.x, cl[1] * sc.y + off.y, off.z);
+        let hit_plane = |o: Vec3, d: Vec3| -> Option<Vec3> {
+            let denom = d.dot(fwd);
+            if denom.abs() < 1e-9 {
+                None
+            } else {
+                Some(o + d * ((c - o).dot(fwd) / denom))
+            }
+        };
+        let (Some(p0), Some(p1)) = (hit_plane(o0, d0), hit_plane(o1, d1)) else {
+            return;
+        };
+        let delta = p1 - p0;
+        if let Some(g) = self.groups_cpu.get_mut(gid as usize) {
+            g.cols[0][0] += delta.x;
+            g.cols[0][1] += delta.y;
+            g.cols[0][2] += delta.z;
+        }
+        self.write_group_row(ctx, gid);
+        self.sync_segment(gid);
+    }
+
+    /// Windowed scroll: scales the grabbed group; otherwise camera speed.
+    fn scroll_or_scale(&mut self, ctx: &GpuContext, lines: f32) {
+        if let Some(gid) = self.grabbed_group {
+            let f = 1.1f32.powf(lines);
+            let mut s = 0.0;
+            if let Some(g) = self.groups_cpu.get_mut(gid as usize) {
+                for c in 0..3 {
+                    g.cols[3][c] = (g.cols[3][c] * f).clamp(0.001, 100.0);
+                }
+                s = g.cols[3][0];
+            }
+            self.write_group_row(ctx, gid);
+            self.sync_segment(gid);
+            println!("grab: group {gid} scale -> {s:.3}");
+        } else if matches!(self.camera_mode, CameraMode::Fly) {
+            self.fly.on_scroll(lines);
+        }
+    }
+
+    /// Windowed verb keys: h highlight line, g grab/release file, t cycle
+    /// tint, x toggle hidden.
+    fn verb_key(&mut self, ctx: &GpuContext, key: winit::keyboard::KeyCode) {
+        use winit::keyboard::KeyCode as K;
+        match key {
+            K::KeyH => {
+                let line = self.apply_verb(ctx, &Verb::RecolorLine([255, 213, 79]));
+                println!("{line}");
+            }
+            K::KeyT => {
+                let line = self.apply_verb(ctx, &Verb::TintCycle);
+                println!("{line}");
+            }
+            K::KeyX => {
+                let line = self.apply_verb(ctx, &Verb::ToggleHidden);
+                println!("{line}");
+            }
+            K::KeyG => match self.grabbed_group {
+                Some(gid) => {
+                    self.grabbed_group = None;
+                    println!("grab: released group {gid}");
+                }
+                None => match &self.picked {
+                    Some(h) => {
+                        self.grabbed_group = Some(h.group_id);
+                        println!(
+                            "grab: {} (group {}) — mouse drags it in the view plane, scroll scales, g releases",
+                            h.rel_path, h.group_id
+                        );
+                    }
+                    None => println!("grab: nothing picked (click a file first)"),
+                },
+            },
+            _ => {}
+        }
+    }
+}
+
+/// Slab ray-AABB test; returns the entry t (0 when the origin is inside).
+fn ray_aabb(ro: Vec3, rd: Vec3, min: Vec3, max: Vec3) -> Option<f32> {
+    let mut t0 = 0.0f32;
+    let mut t1 = f32::MAX;
+    for ax in 0..3 {
+        let (o, d, lo, hi) = (ro[ax], rd[ax], min[ax], max[ax]);
+        if d.abs() < 1e-12 {
+            if o < lo || o > hi {
+                return None;
+            }
+        } else {
+            let inv = 1.0 / d;
+            let (mut ta, mut tb) = ((lo - o) * inv, (hi - o) * inv);
+            if ta > tb {
+                std::mem::swap(&mut ta, &mut tb);
+            }
+            t0 = t0.max(ta);
+            t1 = t1.min(tb);
+            if t0 > t1 {
+                return None;
+            }
+        }
+    }
+    Some(t0)
+}
+
+/// One-line pick report: file, group, folded row/col, source line, byte
+/// offset, the actual character, and the arena slot.
+fn format_pick(h: &PickHit) -> String {
+    match &h.glyph {
+        Some(g) => format!(
+            "pick: {} group={} rec={} row={} col={} line={} byte={} char={:?} slot={} pos=({:.2},{:.2},{:.2})",
+            h.rel_path,
+            h.group_id,
+            g.record,
+            g.row,
+            g.col,
+            g.line,
+            g.byte_off,
+            g.ch,
+            g.slot.map_or("-".to_string(), |s| s.to_string()),
+            g.pos[0],
+            g.pos[1],
+            g.pos[2],
+        ),
+        None => format!(
+            "pick: {} group={} (file-level pick, no glyph resolved)",
+            h.rel_path, h.group_id
+        ),
+    }
+}
+
+fn g_alpha(g: Option<&GroupRow>) -> f32 {
+    g.map_or(f32::NAN, |g| g.cols[2][3])
 }
 
 impl SceneLike for GlyphScene {
@@ -1140,22 +1928,77 @@ impl SceneLike for GlyphScene {
         self.instance_count
     }
 
-    fn on_key(&mut self, key: winit::keyboard::KeyCode, pressed: bool) {
+    fn on_key(&mut self, ctx: &GpuContext, key: winit::keyboard::KeyCode, pressed: bool) {
         if matches!(self.camera_mode, CameraMode::Fly) {
             self.fly.on_key(key, pressed);
         }
+        if pressed {
+            self.verb_key(ctx, key);
+        }
     }
 
-    fn on_mouse_look(&mut self, dx: f32, dy: f32) {
+    fn on_mouse_look(&mut self, _ctx: &GpuContext, dx: f32, dy: f32) {
         if matches!(self.camera_mode, CameraMode::Fly) {
             self.fly.on_look(dx, dy);
         }
     }
 
-    fn on_scroll(&mut self, lines: f32) {
-        if matches!(self.camera_mode, CameraMode::Fly) {
-            self.fly.on_scroll(lines);
+    fn on_scroll(&mut self, ctx: &GpuContext, lines: f32) {
+        // Stage G: scroll scales a grabbed group; otherwise camera speed.
+        self.scroll_or_scale(ctx, lines);
+    }
+
+    fn on_cursor(&mut self, ctx: &GpuContext, x: f32, y: f32) {
+        self.cursor_moved(ctx, x, y);
+    }
+
+    fn on_click(&mut self, ctx: &GpuContext, x: f32, y: f32) {
+        if let Some(line) = self.click_pick(ctx, x, y) {
+            println!("{line}");
         }
+    }
+
+    fn set_viewport(&mut self, w: u32, h: u32) {
+        self.viewport.set((w, h));
+    }
+
+    fn apply_pick(&mut self, ctx: &GpuContext, cmd: &PickCommand) -> Option<String> {
+        GlyphScene::apply_pick(self, ctx, cmd)
+    }
+
+    fn apply_verb(&mut self, ctx: &GpuContext, verb: &Verb) -> Option<String> {
+        Some(GlyphScene::apply_verb(self, ctx, verb))
+    }
+
+    fn debug_dump_instances(&self, ctx: &GpuContext, slot: u64, out: &mut [u32]) {
+        let chunk = (slot as u32 / self.chunk_cap) as usize;
+        let local = (slot as u32 % self.chunk_cap) as u64;
+        let size = (out.len() * 4) as u64;
+        let buf = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("debug dump"),
+            size,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut enc = ctx.device.create_command_encoder(&Default::default());
+        enc.copy_buffer_to_buffer(&self.instance_bufs[chunk], local * 48, &buf, 0, size);
+        ctx.queue.submit([enc.finish()]);
+        let slice = buf.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |r| {
+            let _ = tx.send(r);
+        });
+        ctx.device
+            .poll(wgpu::PollType::Wait {
+                submission_index: None,
+                timeout: None,
+            })
+            .expect("debug dump poll failed");
+        rx.recv().expect("dump cb dropped").expect("dump map failed");
+        let data = slice.get_mapped_range().expect("dump range");
+        out.copy_from_slice(bytemuck::cast_slice(&data[..size as usize]));
+        drop(data);
+        buf.unmap();
     }
 
     fn tick(&mut self, dt: f32) {
@@ -1175,6 +2018,7 @@ impl SceneLike for GlyphScene {
         t: f32,
     ) {
         let aspect = width as f32 / height.max(1) as f32;
+        self.viewport.set((width, height));
         let frame = self.camera_frame(t, aspect);
         let cam = CameraUniform {
             view_proj: frame.view_proj.to_cols_array(),
@@ -1189,6 +2033,7 @@ impl SceneLike for GlyphScene {
             let planes = frustum_planes(&frame.view_proj);
             let (draws, backdrops) = cull_segments(
                 &cull.segments,
+                &cull.hidden,
                 &planes,
                 frame.eye,
                 px_scale,

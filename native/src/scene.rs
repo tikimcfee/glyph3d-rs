@@ -32,10 +32,32 @@ pub trait SceneLike {
     // Default no-ops: the Stage A demo scene and all offscreen runs ignore
     // them. `tick` integrates per-frame camera motion; the input handlers
     // feed it. `dt` is wall-clock seconds since the previous frame.
-    fn on_key(&mut self, _key: winit::keyboard::KeyCode, _pressed: bool) {}
-    fn on_mouse_look(&mut self, _dx: f32, _dy: f32) {}
-    fn on_scroll(&mut self, _lines: f32) {}
+    // Stage G: the hooks take &GpuContext so scenes can issue partial buffer
+    // uploads from event handlers (pick flash, group drags, verb keys).
+    fn on_key(&mut self, _ctx: &GpuContext, _key: winit::keyboard::KeyCode, _pressed: bool) {}
+    fn on_mouse_look(&mut self, _ctx: &GpuContext, _dx: f32, _dy: f32) {}
+    fn on_scroll(&mut self, _ctx: &GpuContext, _lines: f32) {}
+    /// Cursor position in physical px (tracked even without pointer grab).
+    fn on_cursor(&mut self, _ctx: &GpuContext, _x: f32, _y: f32) {}
+    /// Left-click at a physical px position (ungrabbed pointer only).
+    fn on_click(&mut self, _ctx: &GpuContext, _x: f32, _y: f32) {}
     fn tick(&mut self, _dt: f32) {}
+
+    // ── Stage G: scripted picking & manipulation (offscreen + windowed) ────
+    /// Viewport in physical px for ray unprojection (offscreen sets this
+    /// before scripted picks; windowed scenes track it per render).
+    fn set_viewport(&mut self, _w: u32, _h: u32) {}
+    /// Resolve a pick; returns a log line (None = scene doesn't support it).
+    fn apply_pick(&mut self, _ctx: &GpuContext, _cmd: &crate::glyph_scene::PickCommand) -> Option<String> {
+        None
+    }
+    /// Apply a manipulation verb to the current pick; returns a log line.
+    fn apply_verb(&mut self, _ctx: &GpuContext, _verb: &crate::glyph_scene::Verb) -> Option<String> {
+        None
+    }
+    /// Stage G debug: read back instance bytes at a global slot (partial-
+    /// upload verification). Default no-op.
+    fn debug_dump_instances(&self, _ctx: &GpuContext, _slot: u64, _out: &mut [u32]) {}
 }
 
 /// Stress-test target: 1,000,000 instances, one draw call.
