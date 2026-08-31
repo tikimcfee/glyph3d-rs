@@ -1,0 +1,4 @@
+const registerNode = (node) => nodes.add(node);
+// The group table row schema ONE storage buffer
+const registerNode = (node) => nodes.add(node);
+// The group table row schema ONE storage buffer

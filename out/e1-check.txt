@@ -1,0 +1,4 @@
+Hello, glyph3d! ASCII prose on line one.
+	second line starts with a tab; Ω falls back.
+Bitmap rat: 🐀  Missing rocket: 🚀  Latin: naïve café.
+End.

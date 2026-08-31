@@ -1,0 +1,20 @@
+[package]
+name = "glyph3d-native"
+version = "0.1.0"
+edition = "2021"
+description = "Stage A: native wgpu shell for the million-glyph code-visualization port"
+
+[dependencies]
+# Latest stable wgpu (v30.x). Let cargo resolve within the major line.
+wgpu = "30"
+winit = "0.30"
+pollster = "0.4"
+bytemuck = { version = "1", features = ["derive"] }
+env_logger = "0.11"
+log = "0.4"
+image = "0.25"
+glam = "0.30"
+
+[profile.release]
+# Keep debug info in release so future profiling stages stay sane.
+debug = true

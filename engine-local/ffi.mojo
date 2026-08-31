@@ -1,0 +1,313 @@
+# ffi.mojo — C ABI wrapper around the glyph pipeline (Stage D smoke test).
+#
+# GOAL: prove the Mojo engine can be linked IN-PROCESS into the Rust+wgpu app.
+# The surface is deliberately scalars + one opaque pointer (ABI-stability
+# discipline): no Mojo types, no exceptions, no ownership transfer of Mojo
+# containers across the boundary. Records are copied OUT into caller memory.
+#
+# Wire record (32 B per rendered glyph), per schema/glyph-identity.json:
+#   f32 X, Y, Z, ADVANCE, HEIGHT   (20 B — render-read measures)
+#   u32 GLYPH_ID, ROW, COL         (12 B — counts)
+#
+# Portability notes for this toolchain (Mojo 1.1.0.dev2026083005):
+#   - std.runtime.asyncrt went private; the engine copies were patched to
+#     import TaskGroup from std.runtime._asyncrt (tagged MOJO-1.1-PORT).
+#   - std.runtime.initialize_runtime() MUST be called before any TaskGroup
+#     work when the host process is not Mojo — without it the first parallel
+#     dispatch segfaults on a null async runtime (GEX-3993).
+#   - Heap handles use std.memory.alloc's Allocation/Layout (Pointer.alloc is
+#     gone in this nightly).
+
+from std.collections.span import Span
+from std.ffi import c_int, c_size_t, c_double
+from std.memory import bitcast, Allocation
+from std.memory.alloc import alloc, dealloc, Layout
+from std.runtime import initialize_runtime
+
+from glyph_pipeline import Item, Trie, run_pipeline, F_LEADER  # NATIVE-PORT: F_LEADER for load_items per-item counts
+from glyph_record import RecordSet, compact
+from fixture_io import load_trie_auto  # NATIVE-PORT: G3DF fixture or G3TR blob
+
+
+struct EngineState(Movable):
+    """One engine handle: the loaded trie, plus the last item's records.
+
+    NATIVE-PORT (Stage E1): the trie is owned DIRECTLY (it may come from a
+    'G3TR' blob now, not only from a pipe fixture), instead of sitting inside
+    a discarded-fixture field."""
+
+    var trie: Trie
+    var has_trie: Bool
+    var records: RecordSet
+    var byte_len: Int
+    var leaders: Int
+
+    def __init__(out self):
+        self.trie = Trie(List[UInt32](), List[Float32](), List[UInt32]())
+        self.has_trie = False
+        self.records = RecordSet()
+        self.byte_len = 0
+        self.leaders = 0
+
+
+comptime Handle = Pointer[NoneType, MutUntrackedOrigin]
+
+# Status codes (c_int): keep them greppable.
+comptime GE_OK: c_int = 0
+comptime GE_NULL_HANDLE: c_int = 1
+comptime GE_NO_TRIE: c_int = 2
+comptime GE_RAISED: c_int = 3
+comptime GE_EMPTY: c_int = 4
+
+
+def _state(h: Handle) -> Pointer[EngineState, MutUntrackedOrigin]:
+    return h.unsafe_bitcast[EngineState]()
+
+
+@export("glyph_engine_new")
+def glyph_engine_new() abi("C") -> Handle:
+    # MANDATORY when the host process is not Mojo: creates the async runtime
+    # that run_pipeline's TaskGroup shards dispatch onto.
+    initialize_runtime()
+    var a = alloc(Layout[EngineState](count=1))
+    a.unsafe_ptr().unsafe_write(EngineState())
+    return a^.unsafe_leak().unsafe_bitcast[NoneType]()
+
+
+@export("glyph_engine_free")
+def glyph_engine_free(h: Handle) abi("C"):
+    var p = _state(h)
+    var v = p.unsafe_take_pointee()
+    _ = v^  # drops trie + records (frees their Lists)
+    dealloc(
+        Allocation[EngineState](
+            unsafe_owned_ptr=p, layout=Layout[EngineState](count=1)
+        )
+    )
+
+
+@export("glyph_engine_load_trie_file")
+def glyph_engine_load_trie_file(
+    h: Handle, path_ptr: Pointer[UInt8, MutUntrackedOrigin], path_len: c_size_t
+) abi("C") -> c_int:
+    """Load the trie (font metric tables). NATIVE-PORT (Stage E1): dispatches
+    on magic — a 'G3TR' blob (the app atlas's real codepoint→slot mapping,
+    tools/gen-real-trie.mjs) or a legacy 'G3DF' .pipe.bin fixture (the
+    conformance corpus; its expected-output sections are parsed and discarded).
+    """
+    try:
+        var span = Span[UInt8, ImmUntrackedOrigin](
+            unsafe_ptr=path_ptr, length=Int(path_len)
+        )
+        var path = String(unsafe_from_utf8=span)
+        _state(h)[].trie = load_trie_auto(path)
+        _state(h)[].has_trie = True
+        return GE_OK
+    except:
+        return GE_RAISED
+
+
+@export("glyph_engine_load_item")
+def glyph_engine_load_item(
+    h: Handle,
+    bytes_ptr: Pointer[UInt8, MutUntrackedOrigin],
+    byte_len: c_size_t,
+    origin_x: c_double,
+    origin_y: c_double,
+    origin_z: c_double,
+    line_height: c_double,
+    z_step: c_double,
+    wrap_width: c_int,
+    has_page: c_int,
+    page_rows: c_int,
+    page_cols: c_int,
+    scroll_rows: c_int,
+    pages_wide: c_int,
+    page_gap_x: c_double,
+    band_stride_y: c_double,
+    depth_per_band: c_double,
+    depth_per_col: c_double,
+    page_line_height: c_double,
+) abi("C") -> c_int:
+    """Run decode → fold → paginate → compact for ONE item (one text file).
+    Results are kept in the handle as 32 B wire records; retrieve with
+    glyph_engine_slot_count / glyph_engine_copy_slots."""
+    initialize_runtime()  # idempotent; guards against free/new reordering
+    var s = _state(h)
+    if not s[].has_trie:
+        return GE_NO_TRIE
+    s[].records.glyphs = 0  # reuse the arena across loads
+    var n = Int(byte_len)
+    s[].byte_len = n
+    if n == 0:
+        s[].leaders = 0
+        return GE_EMPTY
+
+    var it = Item()
+    it.byte_start = 0
+    it.byte_count = n
+    it.origin_x = origin_x
+    it.origin_y = origin_y
+    it.origin_z = origin_z
+    it.line_height = line_height
+    it.z_step = z_step
+    it.wrap_width = Int(wrap_width)
+    it.has_page = has_page != 0
+    it.page_rows = Int(page_rows)
+    it.page_cols = Int(page_cols)
+    it.scroll_rows = Int(scroll_rows)
+    it.pages_wide = Int(pages_wide)
+    it.page_gap_x = page_gap_x
+    it.band_stride_y = band_stride_y
+    it.depth_per_band = depth_per_band
+    it.depth_per_col = depth_per_col
+    it.page_line_height = page_line_height
+    var items = List[Item]()
+    items.append(it^)
+
+    # The span borrows the CALLER's buffer; run_pipeline only reads it, and the
+    # Rust side holds the Vec alive for the whole call.
+    var span = Span[UInt8, ImmUntrackedOrigin](unsafe_ptr=bytes_ptr, length=n)
+    # Elided instantiation: production form — no witness tier, render-read
+    # arrays bit-identical to the witnessed form (conformance_elide pins it).
+    var r = run_pipeline[witness=False](span, s[].trie, items)
+    s[].leaders = r.leaders
+    compact(r, n, r.leaders, s[].records)
+    _ = len(items)
+    return GE_OK
+
+
+# NATIVE-PORT (Stage E2) — batched load: ONE call runs the whole corpus.
+#
+# Per-file load_item calls pay the TaskGroup dispatch + scratch setup per
+# call (~50 MB/s at repo-file sizes); the pipeline itself is built for
+# multi-item arenas (Item list over one byte span), so this entry amortizes
+# ALL per-call overhead: the caller concatenates the corpus into one blob and
+# passes one 128-byte descriptor block per item, and gets back one record
+# stream plus per-item record counts (computed from the flag lanes, so they
+# are EXACT: one record per leader byte, as compact emits).
+#
+# Descriptor block layout (128 B, little-endian, serialized EXPLICITLY on both
+# sides — no repr(C) guessing):
+#   0..80    ten f64: origin_x, origin_y, origin_z, line_height, z_step,
+#            page_gap_x, band_stride_y, depth_per_band, depth_per_col,
+#            page_line_height
+#   80..104  six i32: wrap_width, has_page, page_rows, page_cols,
+#            scroll_rows, pages_wide
+#   104..112 pad
+#   112      u64 byte_start
+#   120      u64 byte_count
+#
+# Items must be contiguous and ascending by byte_start (the pipeline's
+# documented requirement). Per-item ordinals stay per item, so the 2^24-byte
+# ordinal wall remains a PER-ITEM bound, not a per-blob one.
+
+comptime ITEM_DESC_SIZE: Int = 128
+
+
+@export("glyph_engine_load_items")
+def glyph_engine_load_items(
+    h: Handle,
+    blob_ptr: Pointer[UInt8, MutUntrackedOrigin],
+    blob_len: c_size_t,
+    desc_ptr: Pointer[UInt8, MutUntrackedOrigin],
+    item_count: c_size_t,
+    counts_out: Pointer[UInt64, MutUntrackedOrigin],
+) abi("C") -> c_int:
+    """Run decode → fold → paginate → compact for N items in ONE call.
+    counts_out receives item_count u64s: records (= leaders) per item, in
+    descriptor order. Retrieve the stream with glyph_engine_copy_slots."""
+    initialize_runtime()
+    var s = _state(h)
+    if not s[].has_trie:
+        return GE_NO_TRIE
+    s[].records.glyphs = 0  # reuse the arena across loads
+    var n = Int(blob_len)
+    var m = Int(item_count)
+    s[].byte_len = n
+    if n == 0 or m == 0:
+        s[].leaders = 0
+        return GE_EMPTY
+
+    var items = List[Item]()
+    for i in range(m):
+        var base = desc_ptr.unsafe_offset(i * ITEM_DESC_SIZE)
+        var f64s = base.unsafe_bitcast[Float64]()
+        var i32s = base.unsafe_bitcast[Int32]()
+        var u64s = base.unsafe_bitcast[UInt64]()
+        var it = Item()
+        it.origin_x = f64s[unsafe_offset = 0]
+        it.origin_y = f64s[unsafe_offset = 1]
+        it.origin_z = f64s[unsafe_offset = 2]
+        it.line_height = f64s[unsafe_offset = 3]
+        it.z_step = f64s[unsafe_offset = 4]
+        it.page_gap_x = f64s[unsafe_offset = 5]
+        it.band_stride_y = f64s[unsafe_offset = 6]
+        it.depth_per_band = f64s[unsafe_offset = 7]
+        it.depth_per_col = f64s[unsafe_offset = 8]
+        it.page_line_height = f64s[unsafe_offset = 9]
+        it.wrap_width = Int(i32s[unsafe_offset = 20])
+        it.has_page = i32s[unsafe_offset = 21] != 0
+        it.page_rows = Int(i32s[unsafe_offset = 22])
+        it.page_cols = Int(i32s[unsafe_offset = 23])
+        it.scroll_rows = Int(i32s[unsafe_offset = 24])
+        it.pages_wide = Int(i32s[unsafe_offset = 25])
+        it.byte_start = Int(u64s[unsafe_offset = 14])  # offset 112
+        it.byte_count = Int(u64s[unsafe_offset = 15])  # offset 120
+        items.append(it^)
+
+    var span = Span[UInt8, ImmUntrackedOrigin](unsafe_ptr=blob_ptr, length=n)
+    var r = run_pipeline[witness=False](span, s[].trie, items)
+    s[].leaders = r.leaders
+    compact(r, n, r.leaders, s[].records)
+
+    # Per-item record counts: one pass over the flag lanes, advancing the item
+    # cursor at descriptor boundaries (items are contiguous + ascending).
+    for i in range(m):
+        counts_out[unsafe_offset = i] = 0
+    var it_i = 0
+    var it_end = Int(desc_ptr.unsafe_bitcast[UInt64]()[unsafe_offset = 14]) + Int(
+        desc_ptr.unsafe_bitcast[UInt64]()[unsafe_offset = 15]
+    )
+    for id in range(n):
+        while id >= it_end and it_i + 1 < m:
+            it_i += 1
+            var base = desc_ptr.unsafe_offset(it_i * ITEM_DESC_SIZE)
+            it_end = Int(base.unsafe_bitcast[UInt64]()[unsafe_offset = 14]) + Int(base.unsafe_bitcast[UInt64]()[unsafe_offset = 15])
+        if (Int(r.fl[id]) & F_LEADER) != 0:
+            counts_out[unsafe_offset = it_i] += 1
+    _ = len(items)
+    return GE_OK
+
+
+@export("glyph_engine_slot_count")
+def glyph_engine_slot_count(h: Handle) abi("C") -> UInt64:
+    """Number of 32 B wire records from the last load_item (= rendered glyphs)."""
+    return UInt64(_state(h)[].records.glyphs)
+
+
+@export("glyph_engine_copy_slots")
+def glyph_engine_copy_slots(
+    h: Handle, out_ptr: Pointer[UInt32, MutUntrackedOrigin], out_len: c_size_t
+) abi("C") -> UInt64:
+    """Copy up to out_len records into out_ptr as packed 32 B records:
+    [f32 X Y Z ADVANCE HEIGHT][u32 GLYPH_ID ROW COL]. Returns records written.
+    The u32 view is deliberate: the f32 lanes cross the boundary as BITS,
+    so no float reformatting can happen at the seam."""
+    var s = _state(h)
+    var n = s[].records.glyphs
+    if Int(out_len) < n:
+        n = Int(out_len)
+    var mp = s[].records.measures.unsafe_ptr()
+    var cp = s[].records.counts.unsafe_ptr()
+    for i in range(n):
+        var mo = i * 5
+        var co = i * 3
+        var wo = i * 8
+        for k in range(5):
+            out_ptr[unsafe_offset = wo + k] = bitcast[DType.uint32](
+                mp[unsafe_offset = mo + k]
+            )
+        for k in range(3):
+            out_ptr[unsafe_offset = wo + 5 + k] = cp[unsafe_offset = co + k]
+    return UInt64(n)

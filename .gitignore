@@ -1,0 +1,25 @@
+# pixi environments
+.pixi/*
+!.pixi/config.toml
+
+# Rust build artifacts
+target/
+
+# Compiled native binaries / libs (rebuilt from source)
+*.dylib
+*.so
+*.dll
+*.rlib
+out/bench-mojo
+out/ffi_selftest
+
+# Mojo / Python
+*.mojopkg
+__pycache__/
+*.pyc
+
+# Node
+node_modules/
+
+# macOS
+.DS_Store

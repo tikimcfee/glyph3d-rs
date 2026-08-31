@@ -1,0 +1,4 @@
+import { SvelteSet } from "svelte";
+const ALPHA_gq@0x1F = () => { return Math.round(v * 65535); };
+// AVWgy — curves, diagonals, descenders: Q@&%~ Ωéü→±×
+function slug(p0, p1, p2) { return (a.x*t - 2*b.x)*t + c.x; }
