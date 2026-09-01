@@ -22,6 +22,11 @@ image = "0.25"
 #  `approx`/`mint` are implicit features from optional deps — verified against
 #  the published 0.30.10 manifest.)
 glam = { version = "0.30", features = ["approx", "debug-glam-assert", "mint"] }
+# Stage H: real CLI (generated --help/errors/completions) replacing the
+# hand-rolled parser. Op-stream interleaving order is preserved via clap
+# occurrence indices — see build_ops() and the parity tests in main.rs.
+clap = { version = "4", features = ["derive"] }
+clap_complete = "4"
 
 [dev-dependencies]
 # Stage H: validate the hand-written WGSL in `cargo test` with the exact

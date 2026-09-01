@@ -32,6 +32,7 @@ mod windowed;
 
 use std::path::{Path, PathBuf};
 
+use clap::{ArgAction, CommandFactory, FromArgMatches, Parser};
 use glyph_scene::{CameraMode, GlyphScene, PickCommand, Verb};
 use gpu::GpuContext;
 use scene::{Scene, SceneLike};
@@ -142,41 +143,127 @@ pub fn build_scene(
     }
 }
 
+/// Long-form help tail: the mode summary + verb reference + windowed keys from
+/// the hand-rolled parser's --help (nothing user-facing was dropped).
+const AFTER_LONG_HELP: &str = "\
+MODES:
+  no args                windowed text field (default file: this crate's main.rs)
+  --demo                 windowed: Stage A quad-field demo
+  --screenshot PATH      offscreen: render N frames, write PNG, print timing,
+                         exit 0. Deterministic (fixed virtual clock).
+
+VERBS (--verb \"V [ARGS]\", repeatable; applies to the most recent pick):
+  recolor-glyph [rrggbb] | recolor-line [rrggbb]
+  nudge-glyph dx dy [dz] | scale-glyph f
+  move-group dx dy dz | scale-group s
+  tint-group rrggbb | tint-cycle | hide-group | show-group | toggle-hidden
+
+WINDOWED MODE:
+  fly camera — WASD move, E|R up, Q|F down, RIGHT-drag look, scroll = speed,
+  Esc releases | interact: LEFT click = pick glyph, h highlight line,
+  g grab file (mouse drags, scroll scales), t tint, x hide";
+
+/// Stage H: clap-derive CLI. Semantics (flags, defaults, op-stream order) are
+/// preserved from the hand-rolled parser it replaced — parity is pinned by the
+/// tests at the bottom of this file. `args_override_self` keeps the old
+/// last-wins behavior for repeated scalar flags.
+#[derive(Parser)]
+#[command(
+    name = "glyph3d-native",
+    about = "native GPU port of the glyph3d-js code-visualization system (dev/verification CLI)",
+    after_long_help = AFTER_LONG_HELP,
+    args_override_self = true,
+)]
 struct Cli {
+    /// Offscreen: render to PATH (PNG), print timing, exit 0
+    #[arg(long, value_name = "PATH")]
     screenshot: Option<PathBuf>,
+    /// Frames to render offscreen
+    #[arg(long, value_name = "N", default_value_t = 1)]
     frames: u32,
+    /// Stage A quad-field demo instead of the text field
+    #[arg(long)]
     demo: bool,
+    /// Text file to stage (UTF-8); default: this crate's main.rs
+    #[arg(long, value_name = "PATH")]
     render_file: Option<PathBuf>,
+    /// Tile the file N times (stress)
+    #[arg(long, value_name = "N", default_value_t = 1)]
     copies: u32,
+    /// Camera magnification for offscreen
+    #[arg(long, value_name = "F", default_value_t = 1.0, allow_negative_numbers = true)]
     zoom: f32,
-    /// Stage D: run the Mojo glyph engine in-process on this file and exit.
+    /// Stage D: run the Mojo glyph engine in-process on PATH, print records, exit
+    #[arg(long, value_name = "PATH")]
     engine_file: Option<PathBuf>,
-    /// Trie for the engine modes (default: assets/atlas/engine-trie.bin —
-    /// the real atlas mapping; pass a .pipe.bin fixture for the toy one).
+    /// Trie for engine modes (default: assets/atlas/engine-trie.bin — the real
+    /// atlas mapping; pass a .pipe.bin fixture for the toy one)
+    #[arg(long, value_name = "PATH")]
     engine_trie: Option<PathBuf>,
-    /// Repeat the load N times (leak/stability loop for --engine-file).
+    /// Repeat the --engine-file load N times (leak/stability loop)
+    #[arg(long, value_name = "N", default_value_t = 1)]
     engine_loop: u32,
-    /// Stage E1: cross-check --engine-file output against text.rs's CPU
-    /// reference layout (bit-exact) and exit.
+    /// Stage E1: cross-check engine output vs text.rs CPU reference (bit-exact), exit
+    #[arg(long, value_name = "PATH")]
     engine_check: Option<PathBuf>,
-    /// Stage E1: render engine records through the Slug renderer.
+    /// Stage E1: render engine records through the Slug renderer
+    #[arg(long, value_name = "PATH")]
     engine_render: Option<PathBuf>,
-    /// Stage E2: load a whole repository as a field of code pages.
+    /// Stage E2: load a whole repository as a field of code pages
+    #[arg(long, value_name = "DIR")]
     load_repo: Option<PathBuf>,
-    /// Stage E2: engine path for repo loads — "naive" (default; measured
-    /// faster on the 97 MB corpus — see out/STAGE_E2_REPORT.md) or "batch".
+    /// Stage E2: engine path for repo loads (naive measured faster on the
+    /// 97 MB corpus — see out/STAGE_E2_REPORT.md)
+    #[arg(long, value_name = "MODE", default_value = "naive", value_parser = ["naive", "batch"])]
     repo_engine: String,
-    /// Stage E2: diff batch vs naive bit-exact over the whole repo.
+    /// Stage E2: diff batch vs naive bit-exact over the whole repo
+    #[arg(long)]
     repo_verify: bool,
-    /// Stage E2: frame the first file whose path contains this substring.
+    /// Stage E2: frame the first file whose path contains SUBSTR
+    #[arg(long, value_name = "SUBSTR")]
     focus_file: Option<String>,
-    /// Stage E2: walk + engine + stage + stats, then exit (no GPU).
+    /// Stage E2: walk + engine + stage + stats, then exit (no GPU)
+    #[arg(long)]
     repo_scan_only: bool,
-    /// Stage F: disable the cull/LOD pass (legacy per-chunk draws; debug/A-B).
+    /// Stage F: disable the cull/LOD pass (legacy per-chunk draws; debug/A-B)
+    #[arg(long)]
     no_cull: bool,
+    /// Generate shell completions for SHELL and exit
+    #[arg(long, value_name = "SHELL")]
+    generate: Option<clap_complete::Shell>,
+    /// Stage G op-stream flags, captured per-flag by clap and re-interleaved
+    /// into `ops` by build_ops().
+    #[command(flatten)]
+    raw_ops: RawOps,
     /// Stage G: the interleaved pick/verb script, in CLI order. Verbs apply
     /// to the most recent pick.
+    #[arg(skip)]
     ops: Vec<Op>,
+}
+
+/// The op-stream flags exactly as clap captures them (per-flag vectors).
+/// `build_ops` restores the true CLI interleaving via occurrence indices.
+#[derive(clap::Args, Default)]
+struct RawOps {
+    /// Stage G: pick the first file whose path contains SUBSTR
+    #[arg(long, value_name = "SUBSTR", action = ArgAction::Append)]
+    pick_file: Vec<String>,
+    /// With --pick-file: deterministic glyph pick (folded row)
+    #[arg(long, value_name = "N", action = ArgAction::Append)]
+    pick_row: Vec<u32>,
+    /// With --pick-file: deterministic glyph pick (folded col)
+    #[arg(long, value_name = "M", action = ArgAction::Append)]
+    pick_col: Vec<u32>,
+    /// Ray pick through physical pixel (X,Y) of the viewport
+    #[arg(long, value_names = ["X", "Y"], num_args = 2, action = ArgAction::Append, allow_negative_numbers = true)]
+    pick_px: Vec<f32>,
+    /// Scripted Fly-camera pose: eye + yaw/pitch in DEGREES (interleaves with
+    /// picks/verbs like --pick-px)
+    #[arg(long, value_names = ["X", "Y", "Z", "YAW", "PITCH"], num_args = 5, action = ArgAction::Append, allow_negative_numbers = true)]
+    cam_pose: Vec<f32>,
+    /// Manipulation verb on the most recent pick (repeatable — see VERBS below)
+    #[arg(long, value_name = "V [ARGS]", action = ArgAction::Append, value_parser = parse_verb)]
+    verb: Vec<Verb>,
 }
 
 /// Stage G: one scripted operation (picks and verbs interleave in CLI order).
@@ -213,217 +300,117 @@ fn set_pick_row_col(ops: &mut Vec<Op>, row: Option<u32>, col: Option<u32>) {
     }
 }
 
-/// Parse a `--verb` string into a Verb. Forms:
+/// Parse a `--verb` string into a Verb (clap `value_parser`). Forms:
 ///   recolor-glyph [rrggbb]      recolor-line [rrggbb]
 ///   nudge-glyph dx dy [dz]      scale-glyph f
 ///   move-group dx dy dz         scale-group s
 ///   tint-group rrggbb           tint-cycle
 ///   hide-group | show-group | toggle-hidden
-fn parse_verb(s: &str) -> Verb {
+fn parse_verb(s: &str) -> Result<Verb, String> {
     let t: Vec<&str> = s.split_whitespace().collect();
-    let usage = "unknown/malformed --verb {s:?} — expected recolor-glyph|recolor-line|\
-                 nudge-glyph|scale-glyph|move-group|scale-group|tint-group|tint-cycle|\
-                 hide-group|show-group|toggle-hidden";
-    let f = |i: usize| -> f32 {
+    let usage = format!(
+        "unknown/malformed --verb {s:?} — expected recolor-glyph|recolor-line|\
+         nudge-glyph|scale-glyph|move-group|scale-group|tint-group|tint-cycle|\
+         hide-group|show-group|toggle-hidden"
+    );
+    let f = |i: usize| -> Result<f32, String> {
         t.get(i)
             .and_then(|v| v.parse().ok())
-            .unwrap_or_else(|| panic!("--verb {s:?}: bad/missing float at position {i}"))
+            .ok_or_else(|| format!("--verb {s:?}: bad/missing float at position {i}"))
     };
-    let hex = |i: usize| -> [u8; 3] {
+    let hex = |i: usize| -> Result<[u8; 3], String> {
         let h = t
             .get(i)
-            .unwrap_or_else(|| panic!("--verb {s:?}: missing rrggbb at position {i}"))
+            .ok_or_else(|| format!("--verb {s:?}: missing rrggbb at position {i}"))?
             .trim_start_matches('#');
         let v = u32::from_str_radix(h, 16)
-            .unwrap_or_else(|_| panic!("--verb {s:?}: bad hex color {h:?}"));
-        [((v >> 16) & 0xFF) as u8, ((v >> 8) & 0xFF) as u8, (v & 0xFF) as u8]
+            .map_err(|_| format!("--verb {s:?}: bad hex color {h:?}"))?;
+        Ok([((v >> 16) & 0xFF) as u8, ((v >> 8) & 0xFF) as u8, (v & 0xFF) as u8])
     };
-    match t.first().copied().unwrap_or("") {
-        "recolor-glyph" => Verb::RecolorGlyph(if t.len() > 1 { hex(1) } else { [255, 80, 80] }),
-        "recolor-line" => Verb::RecolorLine(if t.len() > 1 { hex(1) } else { [255, 213, 79] }),
-        "nudge-glyph" => Verb::NudgeGlyph([f(1), f(2), if t.len() > 3 { f(3) } else { 0.0 }]),
-        "scale-glyph" => Verb::ScaleGlyph(f(1)),
-        "move-group" => Verb::MoveGroup([f(1), f(2), f(3)]),
-        "scale-group" => Verb::ScaleGroup(f(1)),
+    Ok(match t.first().copied().unwrap_or("") {
+        "recolor-glyph" => Verb::RecolorGlyph(if t.len() > 1 { hex(1)? } else { [255, 80, 80] }),
+        "recolor-line" => Verb::RecolorLine(if t.len() > 1 { hex(1)? } else { [255, 213, 79] }),
+        "nudge-glyph" => Verb::NudgeGlyph([f(1)?, f(2)?, if t.len() > 3 { f(3)? } else { 0.0 }]),
+        "scale-glyph" => Verb::ScaleGlyph(f(1)?),
+        "move-group" => Verb::MoveGroup([f(1)?, f(2)?, f(3)?]),
+        "scale-group" => Verb::ScaleGroup(f(1)?),
         "tint-group" => {
-            let [r, g, b] = hex(1);
+            let [r, g, b] = hex(1)?;
             Verb::TintGroup([r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0])
         }
         "tint-cycle" => Verb::TintCycle,
         "hide-group" => Verb::SetHidden(true),
         "show-group" => Verb::SetHidden(false),
         "toggle-hidden" => Verb::ToggleHidden,
-        _ => panic!("{usage}"),
+        _ => return Err(usage),
+    })
+}
+
+/// Re-interleave the op stream in true CLI order. clap stores each flag's
+/// values separately; `indices_of` yields one argv index PER VALUE (verified
+/// against clap_builder 4.6.6: `push_arg_values` pushes an index per value),
+/// so for multi-value flags (--pick-px, --cam-pose) both values and indices
+/// are chunked by the flag's arity and zipped occurrence-by-occurrence.
+fn build_ops(matches: &clap::ArgMatches, raw: &RawOps) -> Vec<Op> {
+    enum Keyed {
+        PickFile(String),
+        Row(u32),
+        Col(u32),
+        Px(f32, f32),
+        CamPose([f32; 3], f32, f32),
+        Verb(Verb),
     }
+    let indices = |id: &str| -> Vec<usize> {
+        matches.indices_of(id).map(Iterator::collect).unwrap_or_default()
+    };
+    let mut keyed: Vec<(usize, Keyed)> = Vec::new();
+    for (i, f) in indices("pick_file").into_iter().zip(raw.pick_file.iter()) {
+        keyed.push((i, Keyed::PickFile(f.clone())));
+    }
+    for (i, r) in indices("pick_row").into_iter().zip(raw.pick_row.iter()) {
+        keyed.push((i, Keyed::Row(*r)));
+    }
+    for (i, c) in indices("pick_col").into_iter().zip(raw.pick_col.iter()) {
+        keyed.push((i, Keyed::Col(*c)));
+    }
+    for (ic, xy) in indices("pick_px").chunks(2).zip(raw.pick_px.chunks_exact(2)) {
+        keyed.push((ic[0], Keyed::Px(xy[0], xy[1])));
+    }
+    for (ic, v) in indices("cam_pose").chunks(5).zip(raw.cam_pose.chunks_exact(5)) {
+        // Degrees on the CLI, radians in the op stream (unchanged semantics).
+        keyed.push((
+            ic[0],
+            Keyed::CamPose([v[0], v[1], v[2]], v[3].to_radians(), v[4].to_radians()),
+        ));
+    }
+    for (i, v) in indices("verb").into_iter().zip(raw.verb.iter()) {
+        keyed.push((i, Keyed::Verb(v.clone())));
+    }
+    keyed.sort_by_key(|(i, _)| *i);
+
+    let mut ops = Vec::new();
+    for (_, k) in keyed {
+        match k {
+            Keyed::PickFile(f) => ops.push(Op::Pick(PickCommand::File(f))),
+            Keyed::Row(r) => set_pick_row_col(&mut ops, Some(r), None),
+            Keyed::Col(c) => set_pick_row_col(&mut ops, None, Some(c)),
+            Keyed::Px(x, y) => ops.push(Op::Pick(PickCommand::Pixel { x, y })),
+            Keyed::CamPose(p, yaw, pitch) => ops.push(Op::CamPose(p, yaw, pitch)),
+            Keyed::Verb(v) => ops.push(Op::Verb(v)),
+        }
+    }
+    ops
+}
+
+/// Parse argv (including argv[0]) into a Cli, reconstructing the op stream.
+fn parse_cli_from(matches: clap::ArgMatches) -> Cli {
+    let mut cli = Cli::from_arg_matches(&matches).expect("clap derive round-trip");
+    cli.ops = build_ops(&matches, &cli.raw_ops);
+    cli
 }
 
 fn parse_cli() -> Cli {
-    // Minimal hand-rolled parser; this is a dev/verification tool, not a product CLI.
-    let mut cli = Cli {
-        screenshot: None,
-        frames: 1,
-        demo: false,
-        render_file: None,
-        copies: 1,
-        zoom: 1.0,
-        engine_file: None,
-        engine_trie: None,
-        engine_loop: 1,
-        engine_check: None,
-        engine_render: None,
-        load_repo: None,
-        repo_engine: "naive".to_string(),
-        repo_verify: false,
-        focus_file: None,
-        repo_scan_only: false,
-        no_cull: false,
-        ops: Vec::new(),
-    };
-    let mut args = std::env::args().skip(1);
-    while let Some(arg) = args.next() {
-        match arg.as_str() {
-            "--screenshot" => {
-                let path = args
-                    .next()
-                    .expect("--screenshot requires a path argument, e.g. --screenshot out.png");
-                cli.screenshot = Some(PathBuf::from(path));
-            }
-            "--frames" => {
-                let n = args.next().expect("--frames requires a count");
-                cli.frames = n.parse().expect("--frames must be a positive integer");
-            }
-            "--demo" => cli.demo = true,
-            "--render-file" => {
-                let path = args.next().expect("--render-file requires a path argument");
-                cli.render_file = Some(PathBuf::from(path));
-            }
-            "--copies" => {
-                let n = args.next().expect("--copies requires a count");
-                cli.copies = n.parse().expect("--copies must be a positive integer");
-            }
-            "--zoom" => {
-                let z = args.next().expect("--zoom requires a factor");
-                cli.zoom = z.parse().expect("--zoom must be a positive number");
-            }
-            "--engine-file" => {
-                let path = args.next().expect("--engine-file requires a path argument");
-                cli.engine_file = Some(PathBuf::from(path));
-            }
-            "--engine-trie" => {
-                let path = args.next().expect("--engine-trie requires a path argument");
-                cli.engine_trie = Some(PathBuf::from(path));
-            }
-            "--engine-loop" => {
-                let n = args.next().expect("--engine-loop requires a count");
-                cli.engine_loop = n.parse().expect("--engine-loop must be a positive integer");
-            }
-            "--engine-check" => {
-                let path = args.next().expect("--engine-check requires a path argument");
-                cli.engine_check = Some(PathBuf::from(path));
-            }
-            "--engine-render" => {
-                let path = args.next().expect("--engine-render requires a path argument");
-                cli.engine_render = Some(PathBuf::from(path));
-            }
-            "--load-repo" => {
-                let path = args.next().expect("--load-repo requires a directory argument");
-                cli.load_repo = Some(PathBuf::from(path));
-            }
-            "--repo-engine" => {
-                let mode = args.next().expect("--repo-engine requires naive|batch");
-                assert!(mode == "naive" || mode == "batch", "--repo-engine must be naive|batch");
-                cli.repo_engine = mode;
-            }
-            "--repo-verify" => cli.repo_verify = true,
-            "--focus-file" => {
-                let s = args.next().expect("--focus-file requires a path substring");
-                cli.focus_file = Some(s);
-            }
-            "--repo-scan-only" => cli.repo_scan_only = true,
-            "--no-cull" => cli.no_cull = true,
-            "--cam-pose" => {
-                let f = |a: Option<String>| -> f32 {
-                    a.expect("--cam-pose requires X Y Z YAW PITCH (yaw/pitch in degrees)")
-                        .parse()
-                        .expect("--cam-pose components must be numbers")
-                };
-                let (x, y, z) = (f(args.next()), f(args.next()), f(args.next()));
-                let (yaw, pitch) = (f(args.next()), f(args.next()));
-                cli.ops.push(Op::CamPose([x, y, z], yaw.to_radians(), pitch.to_radians()));
-            }
-            "--pick-file" => {
-                let s = args.next().expect("--pick-file requires a path substring");
-                cli.ops.push(Op::Pick(PickCommand::File(s)));
-            }
-            "--pick-row" => {
-                let n = args.next().expect("--pick-row requires a row number");
-                let row: u32 = n.parse().expect("--pick-row must be a non-negative integer");
-                set_pick_row_col(&mut cli.ops, Some(row), None);
-            }
-            "--pick-col" => {
-                let n = args.next().expect("--pick-col requires a column number");
-                let col: u32 = n.parse().expect("--pick-col must be a non-negative integer");
-                set_pick_row_col(&mut cli.ops, None, Some(col));
-            }
-            "--pick-px" => {
-                let x = args.next().expect("--pick-px requires X Y (physical pixels)");
-                let y = args.next().expect("--pick-px requires X Y (physical pixels)");
-                let px = (
-                    x.parse().expect("--pick-px X must be a number"),
-                    y.parse().expect("--pick-px Y must be a number"),
-                );
-                cli.ops.push(Op::Pick(PickCommand::Pixel { x: px.0, y: px.1 }));
-            }
-            "--verb" => {
-                let s = args.next().expect("--verb requires a verb string, e.g. --verb \"move-group 10 0 0\"");
-                cli.ops.push(Op::Verb(parse_verb(&s)));
-            }
-            "-h" | "--help" => {
-                eprintln!(
-                    "usage: glyph3d-native [options]\n\
-                     \x20 no args              windowed text field (default file: this crate's main.rs)\n\
-                     \x20 --demo               Stage A quad-field demo instead of the text field\n\
-                     \x20 --render-file PATH   text file to stage (UTF-8)\n\
-                     \x20 --copies N           tile the file N times (stress; default 1)\n\
-                     \x20 --screenshot PATH    offscreen render -> PNG, then exit\n\
-                     \x20 --frames N           frames to render offscreen (default 1)\n\
-                     \x20 --zoom F             camera magnification for offscreen (default 1)\n\
-                     \x20 --engine-file PATH   run the Mojo engine on PATH, print records, exit\n\
-                     \x20 --engine-trie PATH   trie for engine modes (default: assets/atlas/engine-trie.bin)\n\
-                     \x20 --engine-loop N      repeat --engine-file load N times\n\
-                     \x20 --engine-check PATH  cross-check engine output vs text.rs CPU reference\n\
-                     \x20 --engine-render PATH render engine records through the Slug renderer\n\
-                     \x20 --load-repo DIR      Stage E2: load a whole repo as a field of code pages\n\
-                     \x20 --repo-engine MODE   repo engine path: naive (default) | batch\n\
-                     \x20 --repo-verify        diff batch vs naive bit-exact over the repo\n\
-                     \x20 --focus-file SUBSTR  frame the first file whose path contains SUBSTR\n\
-                     \x20 --repo-scan-only     walk+engine+stage+stats, no GPU, then exit\n\
-                     \x20 --no-cull            Stage F: disable cull/LOD (legacy full-field draws)\n\
-                     \x20 --cam-pose X Y Z YAW PITCH\n\
-                     \x20                      scripted Fly-camera pose (yaw/pitch in DEGREES;\n\
-                     \x20                      interleaves with picks/verbs like --verb)\n\
-                     \x20 --pick-file SUBSTR   Stage G: pick the first file whose path contains SUBSTR\n\
-                     \x20 --pick-row N         with --pick-file: deterministic glyph pick (folded row)\n\
-                     \x20 --pick-col M         with --pick-file: deterministic glyph pick (folded col)\n\
-                     \x20 --pick-px X Y        ray pick through physical pixel (X,Y) of the viewport\n\
-                     \x20 --verb \"V [ARGS]\"    manipulation verb on the pick (repeatable):\n\
-                     \x20   recolor-glyph [rrggbb] | recolor-line [rrggbb] |\n\
-                     \x20   nudge-glyph dx dy [dz] | scale-glyph f |\n\
-                     \x20   move-group dx dy dz | scale-group s |\n\
-                     \x20   tint-group rrggbb | tint-cycle | hide-group | show-group | toggle-hidden\n\
-                     \x20 windowed mode: fly camera — WASD move, E|R up, Q|F down, RIGHT-drag\n\
-                     \x20   look, scroll = speed, Esc releases | interact: LEFT click = pick glyph,\n\
-                     \x20   h highlight line, g grab file (mouse drags, scroll scales), t tint, x hide"
-                );
-                std::process::exit(0);
-            }
-            other => {
-                eprintln!("unknown argument: {other} (try --help)");
-                std::process::exit(2);
-            }
-        }
-    }
-    cli
+    parse_cli_from(Cli::command().get_matches())
 }
 
 fn default_text_file() -> PathBuf {
@@ -526,6 +513,13 @@ fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     let cli = parse_cli();
 
+    // Stage H: shell completions, then exit (no GPU).
+    if let Some(shell) = cli.generate {
+        let mut cmd = Cli::command();
+        clap_complete::generate(shell, &mut cmd, "glyph3d-native", &mut std::io::stdout());
+        return;
+    }
+
     // Stage E1: engine ↔ CPU-reference cross-check — no GPU involved.
     if let Some(file) = &cli.engine_check {
         run_engine_check(file, cli.engine_trie.as_deref());
@@ -582,5 +576,269 @@ fn main() {
             &ctx, &choice, &path, cli.frames, cli.zoom, !cli.no_cull, &cli.ops,
         ),
         None => windowed::run(ctx, &choice, !cli.no_cull, &cli.ops),
+    }
+}
+
+// ── Stage H: CLI parity tests ────────────────────────────────────────────────
+// Pin the clap migration against the hand-rolled parser's semantics: same
+// flags, same defaults, same op-stream interleaving, same pick-row/col upgrade
+// rules (including the error path), same last-wins scalar repeats.
+#[cfg(test)]
+mod cli_tests {
+    use super::*;
+
+    fn try_parse(args: &[&str]) -> Result<Cli, clap::Error> {
+        let argv = std::iter::once("glyph3d-native").chain(args.iter().copied());
+        let matches = Cli::command().try_get_matches_from(argv)?;
+        Ok(parse_cli_from(matches))
+    }
+
+    fn parse(args: &[&str]) -> Cli {
+        try_parse(args).unwrap_or_else(|e| panic!("parse failed: {e}"))
+    }
+
+    #[test]
+    fn defaults_match_old_parser() {
+        let cli = parse(&[]);
+        assert!(cli.screenshot.is_none());
+        assert_eq!(cli.frames, 1);
+        assert!(!cli.demo);
+        assert!(cli.render_file.is_none());
+        assert_eq!(cli.copies, 1);
+        assert_eq!(cli.zoom, 1.0);
+        assert!(cli.engine_file.is_none());
+        assert!(cli.engine_trie.is_none());
+        assert_eq!(cli.engine_loop, 1);
+        assert!(cli.engine_check.is_none());
+        assert!(cli.engine_render.is_none());
+        assert!(cli.load_repo.is_none());
+        assert_eq!(cli.repo_engine, "naive");
+        assert!(!cli.repo_verify);
+        assert!(cli.focus_file.is_none());
+        assert!(!cli.repo_scan_only);
+        assert!(!cli.no_cull);
+        assert!(cli.ops.is_empty());
+    }
+
+    #[test]
+    fn scalar_flags_parse() {
+        let cli = parse(&[
+            "--screenshot", "out.png", "--frames", "2", "--demo", "--copies", "3", "--zoom",
+            "2.5", "--no-cull", "--engine-loop", "4", "--load-repo", "fixtures/g-pick-repo",
+            "--repo-engine", "batch", "--repo-verify", "--focus-file", "alpha",
+            "--render-file", "src/main.rs", "--engine-file", "a.rs", "--engine-trie", "t.bin",
+            "--engine-check", "b.rs", "--engine-render", "c.rs",
+        ]);
+        assert_eq!(cli.screenshot, Some(PathBuf::from("out.png")));
+        assert_eq!(cli.frames, 2);
+        assert!(cli.demo);
+        assert_eq!(cli.copies, 3);
+        assert_eq!(cli.zoom, 2.5);
+        assert!(cli.no_cull);
+        assert_eq!(cli.engine_loop, 4);
+        assert_eq!(cli.load_repo, Some(PathBuf::from("fixtures/g-pick-repo")));
+        assert_eq!(cli.repo_engine, "batch");
+        assert!(cli.repo_verify);
+        assert_eq!(cli.focus_file.as_deref(), Some("alpha"));
+        assert_eq!(cli.render_file, Some(PathBuf::from("src/main.rs")));
+        assert_eq!(cli.engine_file, Some(PathBuf::from("a.rs")));
+        assert_eq!(cli.engine_trie, Some(PathBuf::from("t.bin")));
+        assert_eq!(cli.engine_check, Some(PathBuf::from("b.rs")));
+        assert_eq!(cli.engine_render, Some(PathBuf::from("c.rs")));
+    }
+
+    #[test]
+    fn repeated_scalar_flag_is_last_wins() {
+        // The hand-rolled parser silently took the last occurrence.
+        let cli = parse(&["--zoom", "2", "--zoom", "3"]);
+        assert_eq!(cli.zoom, 3.0);
+    }
+
+    #[test]
+    fn op_stream_preserves_cli_order() {
+        let cli = parse(&[
+            "--pick-file", "alpha", "--pick-row", "4", "--pick-col", "4",
+            "--verb", "recolor-line ff0000",
+            "--cam-pose", "1", "2", "3", "30", "-10",
+            "--pick-px", "100", "200",
+            "--verb", "tint-cycle",
+            "--pick-px", "300", "400",
+            "--pick-file", "beta",
+            "--verb", "hide-group",
+        ]);
+        assert_eq!(cli.ops.len(), 8);
+        match &cli.ops[0] {
+            Op::Pick(PickCommand::RowCol { file, row, col }) => {
+                assert_eq!(file, "alpha");
+                assert_eq!(*row, 4);
+                assert_eq!(*col, 4);
+            }
+            _ => panic!("op[0] should be the upgraded RowCol pick"),
+        }
+        assert!(matches!(cli.ops[1], Op::Verb(Verb::RecolorLine([255, 0, 0]))));
+        match &cli.ops[2] {
+            Op::CamPose(p, yaw, pitch) => {
+                assert_eq!(*p, [1.0, 2.0, 3.0]);
+                assert!((yaw - 30f32.to_radians()).abs() < 1e-6);
+                assert!((pitch - (-10f32).to_radians()).abs() < 1e-6);
+            }
+            _ => panic!("op[2] should be CamPose"),
+        }
+        assert!(matches!(
+            cli.ops[3],
+            Op::Pick(PickCommand::Pixel { x: 100.0, y: 200.0 })
+        ));
+        assert!(matches!(cli.ops[4], Op::Verb(Verb::TintCycle)));
+        assert!(matches!(
+            cli.ops[5],
+            Op::Pick(PickCommand::Pixel { x: 300.0, y: 400.0 })
+        ));
+        assert!(matches!(&cli.ops[6], Op::Pick(PickCommand::File(f)) if f == "beta"));
+        assert!(matches!(&cli.ops[7], Op::Verb(Verb::SetHidden(true))));
+    }
+
+    #[test]
+    fn pick_file_beta_is_in_stream() {
+        let cli = parse(&["--pick-px", "1", "2", "--pick-file", "beta", "--pick-row", "7"]);
+        assert_eq!(cli.ops.len(), 2);
+        assert!(matches!(
+            cli.ops[0],
+            Op::Pick(PickCommand::Pixel { x: 1.0, y: 2.0 })
+        ));
+        match &cli.ops[1] {
+            Op::Pick(PickCommand::RowCol { file, row, col }) => {
+                assert_eq!(file, "beta");
+                assert_eq!(*row, 7);
+                assert_eq!(*col, 0);
+            }
+            _ => panic!("op[1] should be RowCol beta 7 0"),
+        }
+    }
+
+    #[test]
+    fn pick_row_col_upgrade_semantics() {
+        // Repeated upgrades mutate the same pick (row/col defaults 0).
+        let cli = parse(&["--pick-file", "a", "--pick-row", "1", "--pick-row", "2"]);
+        assert_eq!(cli.ops.len(), 1);
+        match &cli.ops[0] {
+            Op::Pick(PickCommand::RowCol { file, row, col }) => {
+                assert_eq!(file, "a");
+                assert_eq!(*row, 2);
+                assert_eq!(*col, 0);
+            }
+            _ => panic!("expected RowCol"),
+        }
+        let cli = parse(&["--pick-file", "a", "--pick-col", "5", "--pick-row", "3"]);
+        match &cli.ops[0] {
+            Op::Pick(PickCommand::RowCol { row, col, .. }) => {
+                assert_eq!(*row, 3);
+                assert_eq!(*col, 5);
+            }
+            _ => panic!("expected RowCol"),
+        }
+        // No row/col: plain File pick survives.
+        let cli = parse(&["--pick-file", "a"]);
+        assert!(matches!(&cli.ops[0], Op::Pick(PickCommand::File(f)) if f == "a"));
+    }
+
+    #[test]
+    #[should_panic(expected = "--pick-row/--pick-col must follow --pick-file")]
+    fn pick_row_without_pick_file_panics() {
+        parse(&["--pick-row", "1"]);
+    }
+
+    #[test]
+    #[should_panic(expected = "--pick-row/--pick-col must follow --pick-file")]
+    fn pick_row_after_verb_panics() {
+        parse(&["--pick-file", "a", "--verb", "tint-cycle", "--pick-row", "1"]);
+    }
+
+    #[test]
+    fn unknown_flag_errors() {
+        let err = try_parse(&["--bogus"]).err().expect("--bogus must fail");
+        assert_eq!(err.kind(), clap::error::ErrorKind::UnknownArgument);
+    }
+
+    #[test]
+    fn help_is_display_help() {
+        // -h/--help surface as DisplayHelp via try_get_matches_from; the real
+        // binary exits 0 through clap's default error exit path.
+        let err = Cli::command()
+            .try_get_matches_from(["glyph3d-native", "--help"])
+            .unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::DisplayHelp);
+    }
+
+    #[test]
+    fn repo_engine_rejects_bad_value() {
+        assert!(try_parse(&["--repo-engine", "turbo"]).is_err());
+    }
+
+    #[test]
+    fn verb_error_messages_survive() {
+        let err = parse_verb("frobnicate 1 2").err().expect("bad verb must fail");
+        assert!(err.contains("unknown/malformed --verb"), "{err}");
+        let err = parse_verb("nudge-glyph 1").err().expect("bad verb must fail");
+        assert!(err.contains("bad/missing float at position 2"), "{err}");
+        let err = parse_verb("tint-group zzzz").err().expect("bad verb must fail");
+        assert!(err.contains("bad hex color"), "{err}");
+        let err = try_parse(&["--verb", "frobnicate"]).err().expect("bad verb must fail");
+        assert!(err.to_string().contains("unknown/malformed --verb"), "{err}");
+    }
+
+    #[test]
+    fn verb_defaults_and_forms() {
+        assert!(matches!(
+            parse_verb("recolor-glyph").unwrap(),
+            Verb::RecolorGlyph([255, 80, 80])
+        ));
+        assert!(matches!(
+            parse_verb("recolor-line").unwrap(),
+            Verb::RecolorLine([255, 213, 79])
+        ));
+        assert!(matches!(
+            parse_verb("nudge-glyph 1 2").unwrap(),
+            Verb::NudgeGlyph(v) if v == [1.0, 2.0, 0.0]
+        ));
+        assert!(matches!(
+            parse_verb("move-group 1 2 3").unwrap(),
+            Verb::MoveGroup(v) if v == [1.0, 2.0, 3.0]
+        ));
+        assert!(matches!(
+            parse_verb("tint-group ff0080").unwrap(),
+            Verb::TintGroup(v) if (v[0] - 1.0).abs() < 1e-6 && v[1] == 0.0
+        ));
+        assert!(matches!(parse_verb("show-group").unwrap(), Verb::SetHidden(false)));
+        assert!(matches!(parse_verb("toggle-hidden").unwrap(), Verb::ToggleHidden));
+        assert!(matches!(
+            parse_verb("scale-glyph 2.5").unwrap(),
+            Verb::ScaleGlyph(s) if s == 2.5
+        ));
+        assert!(matches!(
+            parse_verb("scale-group 0.5").unwrap(),
+            Verb::ScaleGroup(s) if s == 0.5
+        ));
+    }
+
+    #[test]
+    fn generate_flag_parses() {
+        let cli = parse(&["--generate", "bash"]);
+        assert_eq!(cli.generate, Some(clap_complete::Shell::Bash));
+        assert!(try_parse(&["--generate", "tcsh"]).is_err());
+    }
+
+    #[test]
+    fn negative_numbers_in_cam_pose_and_pick_px() {
+        // The old parser took the next raw tokens unconditionally; clap needs
+        // allow_negative_numbers to match that for oblique camera repros.
+        let cli = parse(&["--cam-pose", "-1", "-2", "-3", "-180", "-45"]);
+        match &cli.ops[0] {
+            Op::CamPose(p, yaw, pitch) => {
+                assert_eq!(*p, [-1.0, -2.0, -3.0]);
+                assert!((yaw - (-180f32).to_radians()).abs() < 1e-6);
+                assert!((pitch - (-45f32).to_radians()).abs() < 1e-6);
+            }
+            _ => panic!("expected CamPose"),
+        }
     }
 }
