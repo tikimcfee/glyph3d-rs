@@ -1,0 +1,27 @@
+fn main() {
+	let alpha = 1_000_000;       // tab-indented, like real source
+	let omega = "Ω Ω Ω";         // unicode fallback glyphs
+	let phrase = "café — résumé"; // é + em dash
+
+	for i in 0..alpha {
+		println!("{i}: {omega} {phrase}");
+	}
+}
+
+struct GlyphInstance {
+	pos: [f32; 3],   // 0..12
+	glyph_id: u16,   // 12..16  (atlas slot, row-major)
+	row: u32,        // 16..20
+	col: u32,        // 20..24
+}
+
+// Blank lines above and below exercise the row-advance path.
+
+const PI: f32 = 3.14159265;
+const TAU: f32 = 2.0 * PI;
+const SYMBOLS: &str = "!@#$%^&*()_+-=[]{}|;':\",./<>?`~";
+
+	// mixed tabs/spaces alignment:
+	let x = 1;           // col 41 comment
+	let longer_name = 2; // col 25 comment
+	let z = 3;				// multiple trailing tabs
