@@ -13,7 +13,15 @@ bytemuck = { version = "1", features = ["derive"] }
 env_logger = "0.11"
 log = "0.4"
 image = "0.25"
-glam = "0.30"
+# Stage H: feature flags only — NO version bump (fence 2).
+#   approx            — epsilon-compare traits for oracle-style tests (additive
+#                       trait impls; existing bit-exact compares stay the standard)
+#   debug-glam-assert — extra validation asserts in debug builds only
+#   mint              — interop shim for future math-typed crates
+# (0.30.10 has no `debug-glam-assertions`; the real name is `debug-glam-assert`.
+#  `approx`/`mint` are implicit features from optional deps — verified against
+#  the published 0.30.10 manifest.)
+glam = { version = "0.30", features = ["approx", "debug-glam-assert", "mint"] }
 
 [dev-dependencies]
 # Stage H: validate the hand-written WGSL in `cargo test` with the exact
