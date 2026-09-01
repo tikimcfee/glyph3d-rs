@@ -48,6 +48,9 @@ struct WindowState {
     // FPS accounting
     frames: u32,
     fps_window_start: Instant,
+    /// Stage H: GPU pass timing accumulator for the once-per-second line
+    /// (only fed when GLYPH_PROFILE=1 built a profiler).
+    profile: crate::gpu::ProfileAccumulator,
 }
 
 impl WindowState {
@@ -128,16 +131,47 @@ impl WindowState {
             self.config.height,
             self.time(),
         );
+        // Stage H: resolve profiler queries before submit (see offscreen.rs).
+        if let Some(p) = &ctx.profiler {
+            p.borrow_mut().resolve_queries(&mut encoder);
+        }
         ctx.queue.submit([encoder.finish()]);
         // wgpu 30: presentation goes through the queue, not the texture.
         ctx.queue.present(frame);
+
+        // Stage H: close the profiler frame and fold any GPU-completed frame
+        // into the running means (non-blocking pump for the query maps).
+        if let Some(p) = &ctx.profiler {
+            if let Err(e) = p.borrow_mut().end_frame() {
+                log::warn!("profiler end_frame: {e}");
+            }
+            let _ = ctx.device.poll(wgpu::PollType::Poll);
+            let period = ctx.queue.get_timestamp_period();
+            if let Some(results) = p.borrow_mut().process_finished_frame(period) {
+                self.profile.add_frame(&results);
+            }
+        }
 
         // FPS: print a line every second.
         self.frames += 1;
         let elapsed = self.fps_window_start.elapsed();
         if elapsed.as_secs_f32() >= 1.0 {
+            let profile_suffix = if ctx.profiler.is_some() {
+                let cpu = crate::gpu::take_cpu_scope_summary(ctx);
+                format!(
+                    " | profile: GPU {} | CPU {}",
+                    if self.profile.scopes.is_empty() {
+                        "—".to_string()
+                    } else {
+                        self.profile.summary()
+                    },
+                    if cpu.is_empty() { "—".to_string() } else { cpu },
+                )
+            } else {
+                String::new()
+            };
             println!(
-                "FPS: {:.1} ({} frames in {:.2?}, {} instances)",
+                "FPS: {:.1} ({} frames in {:.2?}, {} instances){profile_suffix}",
                 self.frames as f32 / elapsed.as_secs_f32(),
                 self.frames,
                 elapsed,
@@ -145,6 +179,7 @@ impl WindowState {
             );
             self.frames = 0;
             self.fps_window_start = Instant::now();
+            self.profile = crate::gpu::ProfileAccumulator::default();
         }
     }
 
@@ -257,6 +292,7 @@ impl ApplicationHandler for App<'_> {
             last_frame: Instant::now(),
             frames: 0,
             fps_window_start: Instant::now(),
+            profile: crate::gpu::ProfileAccumulator::default(),
         });
     }
 

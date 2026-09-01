@@ -2163,6 +2163,8 @@ impl SceneLike for GlyphScene {
         // --- Stage F: CPU segment cull (frustum + LOD), then range draws ----
         let mut culled_draws: Option<(Vec<Vec<std::ops::Range<u32>>>, Vec<BackdropInst>)> = None;
         if let Some(cull) = &self.cull {
+            // Stage H: CPU scope timing (only when GLYPH_PROFILE=1 built a profiler).
+            let cull_t0 = ctx.profiler.as_ref().map(|_| std::time::Instant::now());
             let px_scale = height as f32 / (2.0 * (FOV_Y.to_radians() * 0.5).tan());
             let planes = frustum_planes(&frame.view_proj);
             let (draws, backdrops) = cull_segments(
@@ -2181,6 +2183,9 @@ impl SceneLike for GlyphScene {
                     bytemuck::cast_slice(&backdrops),
                 );
             }
+            if let Some(t0) = cull_t0 {
+                crate::gpu::record_cpu_scope(ctx, "cull (CPU)", t0.elapsed().as_secs_f64() * 1000.0);
+            }
             if std::env::var_os("GLYPH_CULL_DEBUG").is_some() && t == 0.0 {
                 let insts: u64 = draws
                     .iter()
@@ -2197,9 +2202,19 @@ impl SceneLike for GlyphScene {
             culled_draws = Some((draws, backdrops));
         }
 
-
+        // Stage H: pass-level GPU timer (TIMESTAMP_QUERY; pass-boundary writes,
+        // so it works on Metal). Nested in-pass scopes below additionally need
+        // TIMESTAMP_QUERY_INSIDE_PASSES — where unsupported they simply report
+        // no time. Queries must always be closed, timing or not.
+        let pass_query = ctx
+            .profiler
+            .as_ref()
+            .map(|p| p.borrow().begin_pass_query("glyph field pass", encoder));
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("glyph field pass"),
+            timestamp_writes: pass_query
+                .as_ref()
+                .and_then(|q| q.render_pass_timestamp_writes()),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                 view: color_view,
                 resolve_target: None,
@@ -2229,13 +2244,24 @@ impl SceneLike for GlyphScene {
             // backdrop quads (plain draw — no indirect machinery, see the
             // module header).
             if !backdrops.is_empty() {
+                let q = ctx
+                    .profiler
+                    .as_ref()
+                    .map(|p| p.borrow().begin_query("backdrop stream", &mut pass));
                 pass.set_pipeline(&cull.backdrop_pipeline);
                 pass.set_bind_group(0, &cull.backdrop_bind_group, &[]);
                 pass.draw(0..6, 0..backdrops.len() as u32);
+                if let (Some(p), Some(q)) = (&ctx.profiler, q) {
+                    p.borrow().end_query(&mut pass, q);
+                }
             }
             // Glyph stream: one range draw per visible segment per chunk.
             // Ranges ascend in arena order per chunk, so within-pixel blend
             // order matches the legacy full draws exactly.
+            let q = ctx
+                .profiler
+                .as_ref()
+                .map(|p| p.borrow().begin_query("glyph stream", &mut pass));
             pass.set_pipeline(&self.pipeline);
             for (bg, ranges) in self.bind_groups.iter().zip(draws.iter()) {
                 if ranges.is_empty() {
@@ -2246,7 +2272,14 @@ impl SceneLike for GlyphScene {
                     pass.draw(0..6, r.clone());
                 }
             }
+            if let (Some(p), Some(q)) = (&ctx.profiler, q) {
+                p.borrow().end_query(&mut pass, q);
+            }
         } else {
+            let q = ctx
+                .profiler
+                .as_ref()
+                .map(|p| p.borrow().begin_query("glyph stream", &mut pass));
             pass.set_pipeline(&self.pipeline);
             // Legacy: one instanced draw per arena chunk (chunk-local
             // instance_index). Kept as the no-feature / --no-cull fallback.
@@ -2254,6 +2287,13 @@ impl SceneLike for GlyphScene {
                 pass.set_bind_group(0, bg, &[]);
                 pass.draw(0..6, 0..*count);
             }
+            if let (Some(p), Some(q)) = (&ctx.profiler, q) {
+                p.borrow().end_query(&mut pass, q);
+            }
+        }
+        drop(pass);
+        if let (Some(p), Some(q)) = (&ctx.profiler, pass_query) {
+            p.borrow().end_query(encoder, q);
         }
     }
 }

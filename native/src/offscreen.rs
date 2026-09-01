@@ -99,12 +99,21 @@ pub fn run(
         scene.instance_count(),
     );
 
+    // Stage H: per-frame drain keeps the profiler's pending-frame queue (cap
+    // 3) from silently dropping newer frames; the post-loop drain below
+    // collects whatever is still in flight.
+    let mut profile_acc = crate::gpu::ProfileAccumulator::default();
     let t0 = std::time::Instant::now();
     for frame in 0..frames {
         let mut encoder = device.create_command_encoder(&Default::default());
         // Fixed virtual clock step (1/60 s per frame) so screenshots are
         // deterministic regardless of how fast frames actually encode.
         scene.render(ctx, &mut encoder, &color_view, &depth_view, size.width, size.height, frame as f32 / 60.0);
+        // Stage H: resolve profiler queries into their readback buffers before
+        // submit (extra copy commands only — the render target is untouched).
+        if let Some(p) = &ctx.profiler {
+            p.borrow_mut().resolve_queries(&mut encoder);
+        }
         if frame == frames - 1 {
             encoder.copy_texture_to_buffer(
                 wgpu::TexelCopyTextureInfo {
@@ -125,6 +134,17 @@ pub fn run(
             );
         }
         ctx.queue.submit([encoder.finish()]);
+        if let Some(p) = &ctx.profiler {
+            if let Err(e) = p.borrow_mut().end_frame() {
+                log::warn!("profiler end_frame: {e}");
+            }
+            // Non-blocking pump: fold any GPU-completed frame into the means.
+            let _ = device.poll(wgpu::PollType::Poll);
+            let period = ctx.queue.get_timestamp_period();
+            if let Some(results) = p.borrow_mut().process_finished_frame(period) {
+                profile_acc.add_frame(&results);
+            }
+        }
     }
     let encode_submit = t0.elapsed();
 
@@ -169,6 +189,26 @@ pub fn run(
     .expect("failed to write PNG");
 
     let total = t0.elapsed();
+    // Stage H: drain every profiler frame the GPU has completed (the readback
+    // poll above already waited for all submissions, so the query maps are
+    // done too) and print mean per-pass times.
+    if let Some(p) = &ctx.profiler {
+        let period = ctx.queue.get_timestamp_period();
+        loop {
+            let results = p.borrow_mut().process_finished_frame(period);
+            match results {
+                Some(results) => profile_acc.add_frame(&results),
+                None => break,
+            }
+        }
+        let cpu = crate::gpu::take_cpu_scope_summary(ctx);
+        println!(
+            "profile: {} frame(s) measured | GPU: {} | CPU: {}",
+            profile_acc.frames_measured,
+            if profile_acc.scopes.is_empty() { "—".to_string() } else { profile_acc.summary() },
+            if cpu.is_empty() { "—".to_string() } else { cpu },
+        );
+    }
     // encode+submit for N frames, plus one map/wait; per-frame render time is
     // the honest number for throughput comparisons. The map wait blocks until
     // ALL submitted frames have GPU-completed (the copy is enqueued last), so

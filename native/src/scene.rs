@@ -293,8 +293,16 @@ impl Scene {
         ctx.queue
             .write_buffer(&self.camera_buf, 0, bytemuck::bytes_of(&cam));
 
+        // Stage H: pass-level GPU timer (see GlyphScene::render for the scheme).
+        let pass_query = ctx
+            .profiler
+            .as_ref()
+            .map(|p| p.borrow().begin_pass_query("quad field pass", encoder));
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("quad field pass"),
+            timestamp_writes: pass_query
+                .as_ref()
+                .and_then(|q| q.render_pass_timestamp_writes()),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                 view: color_view,
                 resolve_target: None,
@@ -323,6 +331,10 @@ impl Scene {
         pass.set_bind_group(0, &self.bind_group, &[]);
         // 6 vertices per quad, all instances, ONE draw call.
         pass.draw(0..6, 0..self.instance_count);
+        drop(pass);
+        if let (Some(p), Some(q)) = (&ctx.profiler, pass_query) {
+            p.borrow().end_query(encoder, q);
+        }
     }
 }
 
