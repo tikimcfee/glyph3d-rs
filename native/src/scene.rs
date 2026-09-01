@@ -269,8 +269,9 @@ impl Scene {
         let height = 620.0;
         let angle = t * 0.15; // rad/s — one orbit ~42 s
         let eye = Vec3::new(radius * angle.cos(), height, radius * angle.sin());
-        let view = Mat4::look_at_rh(eye, Vec3::ZERO, Vec3::Y);
-        let proj = Mat4::perspective_rh(60f32.to_radians(), aspect, 1.0, 5000.0);
+        let view = glam::camera::rh::view::look_at_mat4(eye, Vec3::ZERO, Vec3::Y);
+        let proj =
+            glam::camera::rh::proj::directx::perspective(60f32.to_radians(), aspect, 1.0, 5000.0);
         proj * view
     }
 

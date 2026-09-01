@@ -13,15 +13,17 @@ bytemuck = { version = "1", features = ["derive"] }
 env_logger = "0.11"
 log = "0.4"
 image = "0.25"
-# Stage H: feature flags only — NO version bump (fence 2).
+# Stage I: 0.30 → 0.33 bump (its own gated mini-stage — see out/STAGE_I_REPORT.md).
+# Feature flags from Stage H carried over; all three names verified to still
+# exist in the published 0.33.6 manifest (docs.rs/crate/glam/0.33.6/features):
 #   approx            — epsilon-compare traits for oracle-style tests (additive
 #                       trait impls; existing bit-exact compares stay the standard)
 #   debug-glam-assert — extra validation asserts in debug builds only
 #   mint              — interop shim for future math-typed crates
-# (0.30.10 has no `debug-glam-assertions`; the real name is `debug-glam-assert`.
-#  `approx`/`mint` are implicit features from optional deps — verified against
-#  the published 0.30.10 manifest.)
-glam = { version = "0.30", features = ["approx", "debug-glam-assert", "mint"] }
+# 0.33.2 moved look_at/look_to/perspective off the matrix types into
+# glam::camera::{rh,lh}::{view,proj::*} free functions (old methods deprecated);
+# call sites use the WebGPU-convention directx projection module.
+glam = { version = "0.33", features = ["approx", "debug-glam-assert", "mint"] }
 # Stage H: real CLI (generated --help/errors/completions) replacing the
 # hand-rolled parser. Op-stream interleaving order is preserved via clap
 # occurrence indices — see build_ops() and the parity tests in main.rs.

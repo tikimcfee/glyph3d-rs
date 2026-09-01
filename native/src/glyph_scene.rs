@@ -1186,10 +1186,12 @@ impl GlyphScene {
         // (Oracle screenshots are all the Front camera, where eye−target is
         // exact; this changes nothing they cover.)
         let view = match self.camera_mode {
-            CameraMode::Fly => Mat4::look_to_rh(eye, self.fly.forward(), Vec3::Y),
-            _ => Mat4::look_at_rh(eye, target, Vec3::Y),
+            CameraMode::Fly => {
+                glam::camera::rh::view::look_to_mat4(eye, self.fly.forward(), Vec3::Y)
+            }
+            _ => glam::camera::rh::view::look_at_mat4(eye, target, Vec3::Y),
         };
-        let proj = Mat4::perspective_rh(fov, aspect, near, far);
+        let proj = glam::camera::rh::proj::directx::perspective(fov, aspect, near, far);
         CamFrame {
             view_proj: proj * view,
             eye,
