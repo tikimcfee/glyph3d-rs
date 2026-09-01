@@ -18,12 +18,11 @@ use crate::gpu::GpuContext;
 /// TEXTURE_WIDTH). Texel `i` lives at `(i % 1024, i / 1024)`.
 pub const ATLAS_TEX_WIDTH: u32 = 1024;
 
-/// Trie entry flags (FORMAT.md, codepoints.bin).
+/// Trie entry flags (FORMAT.md, codepoints.bin). FLAG_BLANK (4) — a covered
+/// codepoint resolving to slot 0 — exists in the format but is not yet
+/// consumed here (no growth logic); add it back when a reader lands.
 pub const FLAG_MISSING: u32 = 1;
 pub const FLAG_BITMAP: u32 = 2;
-/// BLANK: covered codepoint resolving to slot 0 — kept for Stage E growth logic.
-#[allow(dead_code)]
-pub const FLAG_BLANK: u32 = 4;
 
 /// Primary-font layout metrics (glyphs.bin header).
 #[derive(Clone, Copy, Debug)]
@@ -39,7 +38,6 @@ pub struct TrieEntry {
     pub glyph_id: u32,
     pub advance_fu: i32,
     /// Constant = primaryEmHeightFu for every entry today; kept for Stage E.
-    #[allow(dead_code)]
     pub height_fu: i32,
     pub flags: u32,
 }
@@ -54,7 +52,6 @@ pub struct TrieTable {
     blocks: Vec<u32>,
     entry_stride: u32,
     /// Informational header fields (mapped codepoint count).
-    #[allow(dead_code)]
     pub mapped_count: u32,
     pub slot_count: u32,
 }
@@ -117,11 +114,6 @@ pub struct Atlas {
     /// The CPU-side codepoint→slot trie (Stage E1: shared with the engine
     /// cross-check via [`TrieTable`]).
     pub trie: TrieTable,
-    // Informational header fields — kept for Stage D/E (live growth, debugging).
-    #[allow(dead_code)]
-    pub slot_count: u32,
-    #[allow(dead_code)]
-    pub curve_count: u32,
 }
 
 fn read_words(path: &Path) -> Vec<u32> {
@@ -140,7 +132,7 @@ fn read_words(path: &Path) -> Vec<u32> {
 
 fn check_magic(words: &[u32], expected: &str, path: &Path) {
     let magic = words.first().copied().unwrap_or(0);
-    let exp = u32::from_le_bytes(expected.as_bytes().try_into().unwrap());
+    let exp = u32::from_le_bytes(expected.as_bytes().try_into().expect("magic constants are exactly 4 ASCII bytes"));
     assert_eq!(
         magic, exp,
         "{}: bad magic 0x{magic:08x}, expected {expected}",
@@ -247,8 +239,6 @@ impl Atlas {
             glyphmap,
             metrics,
             trie,
-            slot_count,
-            curve_count,
         }
     }
 

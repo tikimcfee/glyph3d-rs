@@ -224,21 +224,20 @@ pub fn file_item_params(p: &RepoParams, byte_len: usize, newline_count: usize) -
     }
 }
 
-/// One file's view into the shared arena. The base/count fields are the
-/// MegaGlyphField-style view contract; Stage G picking reads them (plus the
-/// per-file engine params, which make a deterministic re-layout possible).
-#[allow(dead_code)]
+/// One file's view into the shared arena. Stage G picking reads the
+/// slot-range fields (plus the per-file engine params, which make a
+/// deterministic re-layout possible). The engine-record base and row count
+/// were part of the original MegaGlyphField-style contract but no reader
+/// ever landed — dropped in the Stage J sweep (re-derivable from `item`).
 pub struct FileView {
     pub rel_path: String,
     /// Parent directory (relative) — the group-tint key.
     pub dir: String,
     pub group_id: u32,
-    pub record_base: usize,
     pub record_count: usize,
     /// Render-arena range (instances; blanks/missing are dropped from it).
     pub slot_base: usize,
     pub slot_count: usize,
-    pub rows: u32,
     /// Page size in world units (before the group offset).
     pub width: f32,
     pub height: f32,
@@ -320,7 +319,6 @@ struct StageCtx<'a> {
 fn stage_one(
     f: &RepoFile,
     records: &[GlyphRecord],
-    record_base: usize,
     group_id: u32,
     item: ItemParams,
     cx: &mut StageCtx<'_>,
@@ -334,7 +332,6 @@ fn stage_one(
         f.rel_path
     );
     let slot_base = cx.instances.len();
-    let mut rows = 1u32;
     let mut max_x: f32 = 0.0;
     let mut min_y: f32 = 0.0;
     let mut blank = 0usize;
@@ -346,7 +343,6 @@ fn stage_one(
         if r.y() < min_y {
             min_y = r.y();
         }
-        rows = rows.max(r.row() + 1);
         if r.glyph_id() == 0 {
             blank += 1;
             continue;
@@ -369,11 +365,9 @@ fn stage_one(
         rel_path: f.rel_path.clone(),
         dir: f.dir.clone(),
         group_id,
-        record_base,
         record_count: records.len(),
         slot_base,
         slot_count: cx.instances.len() - slot_base,
-        rows,
         width: max_x,
         // Paginated footprint: glyph centers run from y=0 down to min_y;
         // one line pitch of margin covers the bottom row's descenders.
@@ -523,7 +517,7 @@ pub fn load_repo(
         for (fi, f) in walk.files.iter().enumerate() {
             let n = counts[fi] as usize;
             let records = &all[rec_base..rec_base + n];
-            views.push(stage_one(f, records, rec_base, fi as u32, file_params[fi], &mut cx));
+            views.push(stage_one(f, records, fi as u32, file_params[fi], &mut cx));
             rec_base += n;
             total_records += n;
         }
@@ -544,14 +538,7 @@ pub fn load_repo(
             let records = eng.records();
             engine_dur += t.elapsed();
             let t = Instant::now();
-            views.push(stage_one(
-                f,
-                &records,
-                total_records,
-                fi as u32,
-                file_params[fi],
-                &mut cx,
-            ));
+            views.push(stage_one(f, &records, fi as u32, file_params[fi], &mut cx));
             stage_dur += t.elapsed();
             total_records += records.len();
             if let Some(s) = &mut kept_stream {

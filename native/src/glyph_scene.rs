@@ -1422,7 +1422,7 @@ impl GlyphScene {
                 glyph: None,
             });
         }
-        let c = self.cache.as_ref().unwrap();
+        let c = self.cache.as_ref().expect("cache populated: ensure_pick_cache just returned true");
         // Nearest record cell: 2-D distance from the local point to each
         // glyph's rect [x, x+advance] × [y−h/2, y+h/2]. O(records of ONE
         // file) — microseconds for typical files, ~10 ms for a 10 MB monster.
@@ -1481,7 +1481,7 @@ impl GlyphScene {
                 glyph: None,
             });
         }
-        let c = self.cache.as_ref().unwrap();
+        let c = self.cache.as_ref().expect("cache populated: ensure_pick_cache just returned true");
         let mut exact = None;
         let mut nearest: Option<(u32, usize)> = None;
         for (i, r) in c.records.iter().enumerate() {
@@ -1546,7 +1546,7 @@ impl GlyphScene {
         }
         let hit = match cmd {
             PickCommand::File(f) => {
-                let pctx = self.pick.as_ref().unwrap();
+                let pctx = self.pick.as_ref().expect("pick context checked Some at apply_pick entry");
                 pctx.files
                     .iter()
                     .find(|i| i.rel_path.contains(f.as_str()))
@@ -1654,7 +1654,7 @@ impl GlyphScene {
                 if !self.ensure_pick_cache(gid) {
                     return format!("verb recolor-line: {rel} pick cache unavailable");
                 }
-                let c = self.cache.as_ref().unwrap();
+                let c = self.cache.as_ref().expect("cache populated: ensure_pick_cache just returned true");
                 let packed = pack(*rgb);
                 // Collect (slot, record) for the row, coalesce into runs of
                 // CONTIGUOUS SLOTS, then rebuild the full 48 B instance
