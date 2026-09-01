@@ -85,8 +85,11 @@ pub const BACKDROP_GAIN: f32 = 0.7;
 
 /// Per-instance glyph slot — 48 B, mirrors `InstanceSlot` in glyph_field.wgsl.
 /// (Layout rationale is documented in the shader header.)
+/// Stage H: encase ShaderType derive — generated WGSL-layout size/offsets,
+/// asserted against the bytemuck wire format in `layout_tests` below (the
+/// Stage G strided-color bug class, caught at compile/test time).
 #[repr(C)]
-#[derive(Clone, Copy, Pod, Zeroable)]
+#[derive(Clone, Copy, Pod, Zeroable, encase::ShaderType)]
 pub struct GlyphInstance {
     pub pos: [f32; 3],
     pub glyph_id: u32,
@@ -103,7 +106,7 @@ pub struct GlyphInstance {
 /// Group table row — 5 vec4s, 80 B, the web's GROUP_STRIDE=5 schema
 /// (glyphVertex.js): offset / quat / color+alpha / scale+colorBlend / clip.
 #[repr(C)]
-#[derive(Clone, Copy, Pod, Zeroable)]
+#[derive(Clone, Copy, Pod, Zeroable, encase::ShaderType)]
 pub struct GroupRow {
     pub cols: [[f32; 4]; 5],
 }
@@ -2295,5 +2298,86 @@ impl SceneLike for GlyphScene {
         if let (Some(p), Some(q)) = (&ctx.profiler, pass_query) {
             p.borrow().end_query(encoder, q);
         }
+    }
+}
+
+// ── Stage H (Phase 5) — encase layout assertions ────────────────────────────
+// The WGSL lane maps (glyph_field.wgsl header: 12×4 B lanes; GROUP_STRIDE=5
+// vec4s) are mirrored by hand in the repr(C) structs above — the Stage G
+// strided-color bug came from exactly this mirroring. encase's derive computes
+// WGSL-layout size/offsets independently; these tests pin the two
+// representations against each other AND against bytemuck's raw bytes, so a
+// layout edit that disagrees with the shaders fails `cargo test` at compile
+// time instead of corrupting a render.
+#[cfg(test)]
+mod layout_tests {
+    use super::*;
+    use encase::{ShaderSize, ShaderType};
+
+    #[test]
+    fn glyph_instance_size_and_offsets() {
+        assert_eq!(<GlyphInstance as ShaderSize>::SHADER_SIZE.get(), 48, "WGSL lane map is 12 x 4 B");
+        assert_eq!(std::mem::size_of::<GlyphInstance>(), 48);
+        // Lane map from the glyph_field.wgsl header (offset in bytes).
+        // (Metadata is by-value; METADATA is a const, so re-instantiate it.)
+        let expected = [
+            ("pos", 0),
+            ("glyph_id", 12),
+            ("row", 16),
+            ("col", 20),
+            ("color", 24),
+            ("group_id", 28),
+            ("advance", 32),
+            ("height", 36),
+            ("flags", 40),
+            ("_pad", 44),
+        ];
+        for (i, (name, off)) in expected.iter().enumerate() {
+            assert_eq!(GlyphInstance::METADATA.offset(i), *off as u64, "field {name} offset");
+        }
+    }
+
+    #[test]
+    fn group_row_size_and_offsets() {
+        assert_eq!(<GroupRow as ShaderSize>::SHADER_SIZE.get(), 80, "GROUP_STRIDE=5 vec4s");
+        assert_eq!(std::mem::size_of::<GroupRow>(), 80);
+        assert_eq!(GroupRow::METADATA.offset(0), 0, "cols offset");
+    }
+
+    /// Decisive check: encase's serialization must be byte-identical to the
+    /// bytemuck wire format for distinctive bit patterns — if this holds, the
+    /// write paths can never diverge silently.
+    #[test]
+    fn encase_bytes_match_bytemuck() {
+        let inst = GlyphInstance {
+            pos: [1.5, -2.25, 3.75],
+            glyph_id: 0xAABBCCDD,
+            row: 0x11223344,
+            col: 0x55667788,
+            color: 0xDEADBEEF,
+            group_id: 7,
+            advance: 0.529_741_4,
+            height: 1.0,
+            flags: 0x80000001,
+            _pad: 0x42424242,
+        };
+        let mut buf = Vec::<u8>::new();
+        encase::StorageBuffer::new(&mut buf).write(&inst).unwrap();
+        assert_eq!(buf.len(), 48);
+        assert_eq!(&buf[..], bytemuck::bytes_of(&inst), "GlyphInstance bytes");
+
+        let row = GroupRow {
+            cols: [
+                [1.0, 2.0, 3.0, 4.0],
+                [0.0, 0.0, 0.0, 1.0],
+                [0.25, 0.5, 0.75, 1.0],
+                [2.0, 2.0, 2.0, 0.0],
+                [-1.0, -2.0, 1e10, f32::MIN_POSITIVE],
+            ],
+        };
+        let mut buf = Vec::<u8>::new();
+        encase::StorageBuffer::new(&mut buf).write(&row).unwrap();
+        assert_eq!(buf.len(), 80);
+        assert_eq!(&buf[..], bytemuck::bytes_of(&row), "GroupRow bytes");
     }
 }

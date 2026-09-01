@@ -28,6 +28,7 @@ glam = { version = "0.30", features = ["approx", "debug-glam-assert", "mint"] }
 clap = { version = "4", features = ["derive"] }
 clap_complete = "4"
 wgpu-profiler = "0.28"
+encase = "0.12"
 
 [dev-dependencies]
 # Stage H: validate the hand-written WGSL in `cargo test` with the exact
