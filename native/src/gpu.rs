@@ -94,6 +94,10 @@ pub fn take_cpu_scope_summary(ctx: &GpuContext) -> String {
         .join(", ")
 }
 
+/// Create the instance/adapter/device/queue. Requests the adapter's FULL
+/// storage-buffer/buffer-size headroom (repo-scale arenas need it) and, only
+/// under GLYPH_PROFILE=1, TIMESTAMP_QUERY. Panics when no adapter is found —
+/// there is no CPU fallback to recover to.
 pub async fn init(compatible_surface: Option<&wgpu::Surface<'_>>) -> GpuContext {
     // wgpu 30: takes the descriptor by value.
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {

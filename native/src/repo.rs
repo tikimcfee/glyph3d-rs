@@ -5,7 +5,7 @@
 //! call per file (naive) or one batched `load_items` call over a concatenated
 //! blob — and stages the records into ONE glyph arena. Each file is a GROUP
 //! (group_id == file index) placed on a 2D grid of code pages; files are
-//! views {record_base/count, slot_base/count} into the shared arena — the
+//! views {slot_base/count, engine params} into the shared arena — the
 //! web's MegaGlyphField architecture (one arena, files as views).
 //!
 //! Correctness guards:

@@ -1,5 +1,6 @@
 //! Stage C — glyph field scene: Slug pipeline, group table, text camera.
-//! Stage F — fly camera + two-level GPU culling with LOD backdrops.
+//! Stage F — fly camera + two-level CPU culling with LOD backdrops (the GPU
+//! indirect-draw design is documented as broken-in-wgpu-30 below).
 //! Stage G — CPU picking + live instance/group manipulation.
 //!
 //! Mode-agnostic like `scene.rs`: windowed and offscreen both build one

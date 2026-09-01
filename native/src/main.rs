@@ -11,6 +11,11 @@
 //!          edits instances (recolor/nudge/scale glyph, recolor line) and
 //!          groups (move/scale/tint/hide) with partial buffer uploads.
 //!          Windowed: left click picks, h/g/t/x verbs, right-drag look.
+//! Stage H: clap CLI (parity-tested), naga WGSL validation in `cargo test`,
+//!          opt-in wgpu-profiler pass timings (GLYPH_PROFILE=1), encase
+//!          layout assertions for the hand-mirrored WGSL lane maps.
+//! Stage I: glam 0.30 → 0.33 (byte-identical under the full A/B suite);
+//!          baseline views moved onto the immutable fixtures/baseline-view.txt.
 //!
 //! Run modes:
 //!   (default) [--render-file <path>] [--copies N]
