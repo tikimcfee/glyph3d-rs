@@ -15,6 +15,12 @@ log = "0.4"
 image = "0.25"
 glam = "0.30"
 
+[dev-dependencies]
+# Stage H: validate the hand-written WGSL in `cargo test` with the exact
+# compiler wgpu 30 bundles (naga 30.0.1 is already in the tree via wgpu, so
+# version pairing is automatic). Test-only — never ships in release bins.
+naga = { version = "30", features = ["wgsl-in"] }
+
 [profile.release]
 # Keep debug info in release so future profiling stages stay sane.
 debug = true

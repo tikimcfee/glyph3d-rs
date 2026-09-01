@@ -888,6 +888,7 @@ dependencies = [
  "glam",
  "image",
  "log",
+ "naga",
  "pollster",
  "wgpu",
  "winit",
