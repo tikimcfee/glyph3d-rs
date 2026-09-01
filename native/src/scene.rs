@@ -9,22 +9,26 @@ use wgpu::util::DeviceExt;
 
 use crate::gpu::GpuContext;
 
+/// The views a frame draws into, plus their physical-pixel size.
+/// (Stage F: the cull/LOD pass needs the height to convert world units to
+/// on-screen pixels.) Bundled so `SceneLike::render` stays a 4-arg signature.
+pub struct FrameTarget<'a> {
+    pub color_view: &'a wgpu::TextureView,
+    pub depth_view: &'a wgpu::TextureView,
+    pub width: u32,
+    pub height: u32,
+}
+
 /// Mode-agnostic scene interface: windowed and offscreen modes drive any scene
 /// (Stage A quad field, Stage C glyph field, …) through exactly this.
 pub trait SceneLike {
     fn depth_format(&self) -> wgpu::TextureFormat;
     fn instance_count(&self) -> u32;
-    #[allow(clippy::too_many_arguments)]
     fn render(
         &self,
         ctx: &GpuContext,
         encoder: &mut wgpu::CommandEncoder,
-        color_view: &wgpu::TextureView,
-        depth_view: &wgpu::TextureView,
-        // Stage F: size in physical pixels (the cull/LOD pass needs the
-        // height to convert world units to on-screen pixels).
-        width: u32,
-        height: u32,
+        target: &FrameTarget<'_>,
         t: f32,
     );
 
@@ -281,12 +285,15 @@ impl Scene {
         &self,
         ctx: &GpuContext,
         encoder: &mut wgpu::CommandEncoder,
-        color_view: &wgpu::TextureView,
-        depth_view: &wgpu::TextureView,
-        width: u32,
-        height: u32,
+        target: &FrameTarget<'_>,
         t: f32,
     ) {
+        let FrameTarget {
+            color_view,
+            depth_view,
+            width,
+            height,
+        } = *target;
         let aspect = width as f32 / height.max(1) as f32;
         let cam = CameraUniform {
             view_proj: self.camera(t, aspect).to_cols_array(),
@@ -350,14 +357,11 @@ impl SceneLike for Scene {
         &self,
         ctx: &GpuContext,
         encoder: &mut wgpu::CommandEncoder,
-        color_view: &wgpu::TextureView,
-        depth_view: &wgpu::TextureView,
-        width: u32,
-        height: u32,
+        target: &FrameTarget<'_>,
         t: f32,
     ) {
         // Delegate to the inherent implementation.
-        Scene::render(self, ctx, encoder, color_view, depth_view, width, height, t);
+        Scene::render(self, ctx, encoder, target, t);
     }
 }
 

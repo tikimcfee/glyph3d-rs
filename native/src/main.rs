@@ -373,10 +373,10 @@ fn build_ops(matches: &clap::ArgMatches, raw: &RawOps) -> Vec<Op> {
     for (i, c) in indices("pick_col").into_iter().zip(raw.pick_col.iter()) {
         keyed.push((i, Keyed::Col(*c)));
     }
-    for (ic, xy) in indices("pick_px").chunks(2).zip(raw.pick_px.chunks_exact(2)) {
+    for (ic, xy) in indices("pick_px").chunks(2).zip(raw.pick_px.as_chunks::<2>().0) {
         keyed.push((ic[0], Keyed::Px(xy[0], xy[1])));
     }
-    for (ic, v) in indices("cam_pose").chunks(5).zip(raw.cam_pose.chunks_exact(5)) {
+    for (ic, v) in indices("cam_pose").chunks(5).zip(raw.cam_pose.as_chunks::<5>().0) {
         // Degrees on the CLI, radians in the op stream (unchanged semantics).
         keyed.push((
             ic[0],

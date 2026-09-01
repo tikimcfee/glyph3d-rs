@@ -125,10 +125,12 @@ impl WindowState {
         self.scene.render(
             ctx,
             &mut encoder,
-            &view,
-            &self.depth,
-            self.config.width,
-            self.config.height,
+            &crate::scene::FrameTarget {
+                color_view: &view,
+                depth_view: &self.depth,
+                width: self.config.width,
+                height: self.config.height,
+            },
             self.time(),
         );
         // Stage H: resolve profiler queries before submit (see offscreen.rs).

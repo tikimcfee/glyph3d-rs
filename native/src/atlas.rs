@@ -127,10 +127,14 @@ pub struct Atlas {
 fn read_words(path: &Path) -> Vec<u32> {
     let bytes = std::fs::read(path)
         .unwrap_or_else(|e| panic!("failed to read {}: {e}", path.display()));
-    assert!(bytes.len() % 4 == 0, "{}: not a u32 array", path.display());
+    assert!(bytes.len().is_multiple_of(4), "{}: not a u32 array", path.display());
+    // as_chunks is byte-identical to chunks_exact(4) here: the assert above
+    // guarantees no remainder, so both yield every consecutive 4-byte group.
     bytes
-        .chunks_exact(4)
-        .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|c| u32::from_le_bytes(*c))
         .collect()
 }
 

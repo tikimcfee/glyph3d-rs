@@ -40,6 +40,7 @@
 //!     chunk-local, exactly like the legacy per-chunk draws), and
 //!   - a compacted backdrop list (flat quads: mean ink color × ink coverage)
 //!     for segments whose whole em is below one screen pixel.
+//!
 //! Culling is visually lossless: a culled segment is entirely outside the
 //! frustum, and the LOD tier only substitutes subpixel glyphs.
 //!
@@ -2150,12 +2151,15 @@ impl SceneLike for GlyphScene {
         &self,
         ctx: &GpuContext,
         encoder: &mut wgpu::CommandEncoder,
-        color_view: &wgpu::TextureView,
-        depth_view: &wgpu::TextureView,
-        width: u32,
-        height: u32,
+        target: &crate::scene::FrameTarget<'_>,
         t: f32,
     ) {
+        let crate::scene::FrameTarget {
+            color_view,
+            depth_view,
+            width,
+            height,
+        } = *target;
         let aspect = width as f32 / height.max(1) as f32;
         self.viewport.set((width, height));
         let frame = self.camera_frame(t, aspect);
@@ -2166,7 +2170,9 @@ impl SceneLike for GlyphScene {
             .write_buffer(&self.camera_buf, 0, bytemuck::bytes_of(&cam));
 
         // --- Stage F: CPU segment cull (frustum + LOD), then range draws ----
-        let mut culled_draws: Option<(Vec<Vec<std::ops::Range<u32>>>, Vec<BackdropInst>)> = None;
+        // (per-chunk draw ranges for visible segments, compacted backdrop quads)
+        type CulledDraws = (Vec<Vec<std::ops::Range<u32>>>, Vec<BackdropInst>);
+        let mut culled_draws: Option<CulledDraws> = None;
         if let Some(cull) = &self.cull {
             // Stage H: CPU scope timing (only when GLYPH_PROFILE=1 built a profiler).
             let cull_t0 = ctx.profiler.as_ref().map(|_| std::time::Instant::now());

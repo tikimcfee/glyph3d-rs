@@ -11,8 +11,6 @@
 
 use std::cell::RefCell;
 
-use wgpu;
-
 /// Logged adapter identity, kept around for diagnostics.
 pub struct GpuContext {
     pub instance: wgpu::Instance,
@@ -132,9 +130,11 @@ pub async fn init(compatible_surface: Option<&wgpu::Surface<'_>>) -> GpuContext 
     // arena so no single binding exceeds max_storage_buffer_binding_size, so
     // any adapter value works — but the bigger the limit, the fewer chunks.
     let supported = adapter.limits();
-    let mut limits = wgpu::Limits::default();
-    limits.max_storage_buffer_binding_size = supported.max_storage_buffer_binding_size;
-    limits.max_buffer_size = supported.max_buffer_size;
+    let limits = wgpu::Limits {
+        max_storage_buffer_binding_size: supported.max_storage_buffer_binding_size,
+        max_buffer_size: supported.max_buffer_size,
+        ..Default::default()
+    };
 
     // Stage F: multi_draw_indirect is CORE in wgpu 30 (per-chunk indirect
     // draws for the cull pass need no feature gate). Log the count variant

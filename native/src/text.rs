@@ -419,6 +419,10 @@ pub fn reference_layout(
     out
 }
 
+/// fold_leaders output: per-engine-record (byte offset, codepoint), folded
+/// ROW, folded COL, source line — four parallel vectors in record order.
+pub type FoldTables = (Vec<(usize, u32)>, Vec<u32>, Vec<u32>, Vec<u32>);
+
 /// Stage G — decode the UTF-8 leaders of `bytes` and fold them with the
 /// engine's exact conventions (glyph_pipeline.mojo, THE FOLD): COL is the raw
 /// leader count within the source line (NOT col % wrap), ROW is
@@ -428,10 +432,7 @@ pub fn reference_layout(
 /// folded COL, source line. Picking uses this to resolve a record to the
 /// actual character in the file bytes, and cross-checks ROW/COL against the
 /// engine's records bit-for-bit.
-pub fn fold_leaders(
-    bytes: &[u8],
-    wrap: i32,
-) -> (Vec<(usize, u32)>, Vec<u32>, Vec<u32>, Vec<u32>) {
+pub fn fold_leaders(bytes: &[u8], wrap: i32) -> FoldTables {
     let mut leaders: Vec<(usize, u32)> = Vec::new();
     let mut rows: Vec<u32> = Vec::new();
     let mut cols: Vec<u32> = Vec::new();
@@ -472,13 +473,14 @@ pub fn fold_leaders(
                     | (byte_at(id + 3) & 0x3F)
             }
         };
-        let wrap_row = if w > 0 { col / w } else { 0 };
+        let wrap_row = col.checked_div(w).unwrap_or(0);
         leaders.push((id, cp));
         rows.push(base_row + wrap_row);
         cols.push(col);
         lines.push(line);
         if cp == 0x0A {
-            base_row += (if w > 0 { col / w } else { 0 }) + 1;
+            // Same col/w as wrap_row above (col is unchanged in this branch).
+            base_row += wrap_row + 1;
             col = 0;
             line += 1;
         } else {

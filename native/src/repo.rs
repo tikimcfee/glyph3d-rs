@@ -307,6 +307,14 @@ fn dir_tint(dir: &str) -> [f32; 3] {
     DIR_TINTS[(h as usize) % DIR_TINTS.len()]
 }
 
+/// Shared context threaded through every `stage_one` call: layout params,
+/// the arena being appended to, and the dropped-blank counter.
+struct StageCtx<'a> {
+    params: &'a RepoParams,
+    instances: &'a mut Vec<GlyphInstance>,
+    blanks: &'a mut usize,
+}
+
 /// Stage one file's engine records into the arena (blanks/missing dropped —
 /// their advance is baked into the survivors' X), returning its FileView.
 fn stage_one(
@@ -314,11 +322,10 @@ fn stage_one(
     records: &[GlyphRecord],
     record_base: usize,
     group_id: u32,
-    params: &RepoParams,
     item: ItemParams,
-    instances: &mut Vec<GlyphInstance>,
-    blanks: &mut usize,
+    cx: &mut StageCtx<'_>,
 ) -> FileView {
+    let params = cx.params;
     let colors = text::colorize_leaders(&f.bytes);
     debug_assert_eq!(
         colors.len(),
@@ -326,7 +333,7 @@ fn stage_one(
         "color/record count mismatch on {}",
         f.rel_path
     );
-    let slot_base = instances.len();
+    let slot_base = cx.instances.len();
     let mut rows = 1u32;
     let mut max_x: f32 = 0.0;
     let mut min_y: f32 = 0.0;
@@ -344,7 +351,7 @@ fn stage_one(
             blank += 1;
             continue;
         }
-        instances.push(GlyphInstance {
+        cx.instances.push(GlyphInstance {
             pos: [r.x(), r.y(), r.z()],
             glyph_id: r.glyph_id(),
             row: r.row(),
@@ -357,7 +364,7 @@ fn stage_one(
             _pad: 0,
         });
     }
-    *blanks += blank;
+    *cx.blanks += blank;
     FileView {
         rel_path: f.rel_path.clone(),
         dir: f.dir.clone(),
@@ -365,7 +372,7 @@ fn stage_one(
         record_base,
         record_count: records.len(),
         slot_base,
-        slot_count: instances.len() - slot_base,
+        slot_count: cx.instances.len() - slot_base,
         rows,
         width: max_x,
         // Paginated footprint: glyph centers run from y=0 down to min_y;
@@ -507,20 +514,16 @@ pub fn load_repo(
             "batch per-item counts do not sum to the record count"
         );
         let t = Instant::now();
+        let mut cx = StageCtx {
+            params,
+            instances: &mut instances,
+            blanks: &mut total_blanks,
+        };
         let mut rec_base = 0usize;
         for (fi, f) in walk.files.iter().enumerate() {
             let n = counts[fi] as usize;
             let records = &all[rec_base..rec_base + n];
-            views.push(stage_one(
-                f,
-                records,
-                rec_base,
-                fi as u32,
-                params,
-                file_params[fi],
-                &mut instances,
-                &mut total_blanks,
-            ));
+            views.push(stage_one(f, records, rec_base, fi as u32, file_params[fi], &mut cx));
             rec_base += n;
             total_records += n;
         }
@@ -529,6 +532,11 @@ pub fn load_repo(
             *s = all;
         }
     } else {
+        let mut cx = StageCtx {
+            params,
+            instances: &mut instances,
+            blanks: &mut total_blanks,
+        };
         for (fi, f) in walk.files.iter().enumerate() {
             let t = Instant::now();
             eng.load_item(&f.bytes, &file_params[fi])
@@ -541,10 +549,8 @@ pub fn load_repo(
                 &records,
                 total_records,
                 fi as u32,
-                params,
                 file_params[fi],
-                &mut instances,
-                &mut total_blanks,
+                &mut cx,
             ));
             stage_dur += t.elapsed();
             total_records += records.len();

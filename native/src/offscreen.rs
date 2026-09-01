@@ -108,7 +108,17 @@ pub fn run(
         let mut encoder = device.create_command_encoder(&Default::default());
         // Fixed virtual clock step (1/60 s per frame) so screenshots are
         // deterministic regardless of how fast frames actually encode.
-        scene.render(ctx, &mut encoder, &color_view, &depth_view, size.width, size.height, frame as f32 / 60.0);
+        scene.render(
+            ctx,
+            &mut encoder,
+            &crate::scene::FrameTarget {
+                color_view: &color_view,
+                depth_view: &depth_view,
+                width: size.width,
+                height: size.height,
+            },
+            frame as f32 / 60.0,
+        );
         // Stage H: resolve profiler queries into their readback buffers before
         // submit (extra copy commands only — the render target is untouched).
         if let Some(p) = &ctx.profiler {
