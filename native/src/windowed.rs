@@ -35,8 +35,13 @@ struct WindowState {
     scene: Box<dyn SceneLike>,
     start: Instant,
     /// Stage F/G: mouse-look is active only while the pointer is grabbed
-    /// (right button held).
+    /// (right button held, or backquote toggle).
     grabbed: bool,
+    /// True once any DeviceEvent::MouseMotion has arrived during the current
+    /// grab. Environments where raw device deltas never arrive (some macOS
+    /// trackpad / remote-desktop paths) fall back to CursorMoved deltas;
+    /// without the flag both paths would fire and look would double-apply.
+    saw_device_delta: bool,
     /// Last cursor position, physical px (click picks use it).
     cursor: (f32, f32),
     last_frame: Instant,
@@ -59,14 +64,30 @@ impl WindowState {
     /// Stage F: grab the pointer for mouse-look (confined to the window —
     /// Locked is unsupported on macOS — and hidden). DeviceEvent deltas keep
     /// arriving at the window edges, which is what look control needs.
+    ///
+    /// Robustness fix: a failed cursor grab must NOT silently kill mouse-look
+    /// (that was the "right-drag does nothing" bug — no log, grabbed stayed
+    /// false). We now try Confined then Locked, log the outcome, and stay
+    /// grabbed even if both fail: the CursorMoved fallback still gives look
+    /// control, just without edge confinement.
     fn grab(&mut self) {
         if self.grabbed {
             return;
         }
+        self.saw_device_delta = false;
         if self.window.set_cursor_grab(CursorGrabMode::Confined).is_ok() {
             self.window.set_cursor_visible(false);
-            self.grabbed = true;
+            log::info!("mouse-look: pointer grabbed (confined)");
+        } else if self.window.set_cursor_grab(CursorGrabMode::Locked).is_ok() {
+            self.window.set_cursor_visible(false);
+            log::info!("mouse-look: pointer grabbed (locked)");
+        } else {
+            log::warn!(
+                "mouse-look: cursor grab unsupported here — look still works, \
+                 but the pointer is not confined to the window"
+            );
         }
+        self.grabbed = true;
     }
 
     fn ungrab(&mut self) {
@@ -201,7 +222,7 @@ impl ApplicationHandler for App<'_> {
             config.present_mode
         );
         println!(
-            "fly camera: WASD move | E|R up, Q|F down | RIGHT-drag look | scroll = speed | Esc releases\n\
+            "fly camera: WASD move | E|R up, Q|F down | RIGHT-drag or ` (backquote) = look | scroll = speed | Esc releases\n\
              \x20 interact: LEFT click = pick glyph | h highlight line | g grab file \
              (mouse drags, scroll scales) | t cycle tint | x hide/show"
         );
@@ -213,6 +234,10 @@ impl ApplicationHandler for App<'_> {
             let line = match op {
                 Op::Pick(p) => scene.apply_pick(&self.ctx, p),
                 Op::Verb(v) => scene.apply_verb(&self.ctx, v),
+                Op::CamPose(eye, yaw, pitch) => {
+                    scene.set_cam_pose(*eye, *yaw, *pitch);
+                    None
+                }
             };
             if let Some(line) = line {
                 println!("{line}");
@@ -227,6 +252,7 @@ impl ApplicationHandler for App<'_> {
             scene,
             start: self.start,
             grabbed: false,
+            saw_device_delta: false,
             cursor: (0.0, 0.0),
             last_frame: Instant::now(),
             frames: 0,
@@ -249,6 +275,15 @@ impl ApplicationHandler for App<'_> {
                     // Esc releases the pointer grab (and is not camera input).
                     if code == KeyCode::Escape && pressed {
                         state.ungrab();
+                    } else if code == KeyCode::Backquote && pressed {
+                        // Backquote toggles mouse-look grab — an always-available
+                        // alternative to holding the right button (trackpads,
+                        // mice without a usable right button, accessibility).
+                        if state.grabbed {
+                            state.ungrab();
+                        } else {
+                            state.grab();
+                        }
                     } else {
                         state.scene.on_key(&self.ctx, code, pressed);
                     }
@@ -269,8 +304,18 @@ impl ApplicationHandler for App<'_> {
                 }
             }
             WindowEvent::CursorMoved { position, .. } => {
-                state.cursor = (position.x as f32, position.y as f32);
-                state.scene.on_cursor(&self.ctx, state.cursor.0, state.cursor.1);
+                let (px, py) = (position.x as f32, position.y as f32);
+                // Fallback look path: while grabbed, if no raw DeviceEvent
+                // deltas have ever arrived this grab (dead device-delta
+                // environments), drive look from cursor movement instead.
+                if state.grabbed && !state.saw_device_delta {
+                    let (dx, dy) = (px - state.cursor.0, py - state.cursor.1);
+                    if dx != 0.0 || dy != 0.0 {
+                        state.scene.on_mouse_look(&self.ctx, dx, dy);
+                    }
+                }
+                state.cursor = (px, py);
+                state.scene.on_cursor(&self.ctx, px, py);
             }
             WindowEvent::MouseWheel { delta, .. } => {
                 let lines = match delta {
@@ -290,6 +335,7 @@ impl ApplicationHandler for App<'_> {
         if let DeviceEvent::MouseMotion { delta: (dx, dy) } = event {
             if let Some(state) = self.state.as_mut() {
                 if state.grabbed {
+                    state.saw_device_delta = true;
                     state.scene.on_mouse_look(&self.ctx, dx as f32, dy as f32);
                 }
             }

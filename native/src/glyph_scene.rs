@@ -14,7 +14,10 @@
 //! world AABBs, and ~1.3k ray-AABB tests cost microseconds. A GPU ID pass
 //! would buy nothing at this scale and would re-enter the wgpu/Metal
 //! indirect-draw morass documented below. Resolution order:
-//!   screen px → ray (inverse view-proj) → nearest visible file AABB →
+//!   screen px → ray (ANALYTIC, f64: camera basis + fov/aspect — never the
+//!   inverse of the f32 view-proj, whose near/far conditioning is fatal at
+//!   Fly's near=0.05/far≈1.7e6; see tools/repro_pick_oblique.py)
+//!   → nearest visible file AABB →
 //!   ray ∩ file plane (z = group offset.z) → local point (undo group TRS) →
 //!   nearest record cell → (row, col) → source line/byte/char via
 //!   text::fold_leaders, cross-checked against the engine's ROW/COL lanes.
@@ -51,7 +54,7 @@
 //! be revisited after a wgpu upgrade.
 
 use bytemuck::{Pod, Zeroable};
-use glam::{Mat4, Vec3, Vec4};
+use glam::{DVec3, Mat4, Vec3};
 use std::cell::Cell;
 use std::path::PathBuf;
 use wgpu::util::DeviceExt;
@@ -482,7 +485,9 @@ impl FlyCamera {
 
     fn on_look(&mut self, dx: f32, dy: f32) {
         const SENS: f32 = 0.0022;
-        self.yaw -= dx * SENS;
+        // yaw += : mouse-right rotates the view toward +X (camera right).
+        // (was yaw -=, which swung the view left — inverted horizontal look)
+        self.yaw += dx * SENS;
         self.pitch = (self.pitch - dy * SENS).clamp(-1.55, 1.55);
     }
 
@@ -1126,30 +1131,61 @@ impl GlyphScene {
         }
     }
 
-    fn camera_frame(&self, t: f32, aspect: f32) -> CamFrame {
+    /// Camera eye/target for the mode at time `t` — the SINGLE source both
+    /// the render frame and the pick ray derive from, so they always see the
+    /// same camera.
+    fn camera_eye_target(&self, t: f32, aspect: f32) -> (Vec3, Vec3) {
         let fov = FOV_Y.to_radians();
         let half_h_needed = (self.half_h).max(self.half_w / aspect);
         let fit = half_h_needed / (fov * 0.5).tan() * 1.08 + 2.0;
-        let (eye, target, near, far) = match self.camera_mode {
+        match self.camera_mode {
             CameraMode::Front { zoom } => {
                 let d = fit / zoom.max(0.01);
-                let e = self.center + Vec3::new(0.0, 0.0, d);
-                (e, self.center, d * 0.01, d * 20.0)
+                (self.center + Vec3::new(0.0, 0.0, d), self.center)
             }
             CameraMode::Orbit => {
                 let r = fit * 1.05;
                 let a = t * 0.12; // slow orbit
-                let e = self.center + Vec3::new(r * a.cos(), r * 0.18, r * a.sin());
-                (e, self.center, r * 0.01, r * 20.0)
+                (
+                    self.center + Vec3::new(r * a.cos(), r * 0.18, r * a.sin()),
+                    self.center,
+                )
+            }
+            CameraMode::Fly => (self.fly.eye, self.fly.eye + self.fly.forward()),
+        }
+    }
+
+    fn camera_frame(&self, t: f32, aspect: f32) -> CamFrame {
+        let fov = FOV_Y.to_radians();
+        let half_h_needed = (self.half_h).max(self.half_w / aspect);
+        let fit = half_h_needed / (fov * 0.5).tan() * 1.08 + 2.0;
+        let (near, far) = match self.camera_mode {
+            CameraMode::Front { zoom } => {
+                let d = fit / zoom.max(0.01);
+                (d * 0.01, d * 20.0)
+            }
+            CameraMode::Orbit => {
+                let r = fit * 1.05;
+                (r * 0.01, r * 20.0)
             }
             CameraMode::Fly => {
-                let e = self.fly.eye;
                 // Depth is test-only (nothing writes it), so a wide range is
                 // safe; near stays small enough for single-glyph closeups.
-                (e, e + self.fly.forward(), 0.05, (self.fit * 50.0).max(20_000.0))
+                (0.05, (self.fit * 50.0).max(20_000.0))
             }
         };
-        let view = Mat4::look_at_rh(eye, target, Vec3::Y);
+        let (eye, target) = self.camera_eye_target(t, aspect);
+        // Fly: build the view from the DIRECTION directly. look_at(eye,
+        // eye+fwd) forms `eye - (eye+fwd)` in f32; with eye ~1e4 world units
+        // that cancellation rounds the forward vector to ~1e-3 rad, rotating
+        // the whole render away from fly.forward() — the pick ray derives
+        // from the same direction, so both paths must skip the roundtrip.
+        // (Oracle screenshots are all the Front camera, where eye−target is
+        // exact; this changes nothing they cover.)
+        let view = match self.camera_mode {
+            CameraMode::Fly => Mat4::look_to_rh(eye, self.fly.forward(), Vec3::Y),
+            _ => Mat4::look_at_rh(eye, target, Vec3::Y),
+        };
         let proj = Mat4::perspective_rh(fov, aspect, near, far);
         CamFrame {
             view_proj: proj * view,
@@ -1258,34 +1294,53 @@ impl GlyphScene {
     }
 
     /// Unproject a physical pixel to a world ray under the CURRENT camera.
-    /// wgpu clip z ∈ [0,1]: ndc z=0 is the near plane, z=1 the far plane.
-    fn pixel_ray(&self, x: f32, y: f32) -> Option<(Vec3, Vec3)> {
+    ///
+    /// ANALYTIC, in f64 — deliberately NOT the inverse of the f32 view-proj.
+    /// The Fly projection spans near=0.05 … far=(fit·50).max(20000); at the
+    /// full-field fit (far≈1.7e6) the near/far ratio is past f32 epsilon, so
+    /// the inverted matrix unprojects the far-plane point to w≈0 and EVERY
+    /// pick returned None (windowed clicks always MISSed); even at
+    /// far=20000 the inverse's angular error grows linearly with distance
+    /// and crosses the 0.8-world-unit acceptance at D≈50 (measured; see
+    /// tools/repro_pick_oblique.py). The ray is derived exactly from the
+    /// same eye/target the view matrix is built from — right/up/back basis +
+    /// fov/aspect — so there is no matrix to invert and no near/far
+    /// conditioning at all. (The GPU's forward f32 projection of a world
+    /// point differs from this ray by ≲1e-4 px — subpixel.)
+    fn pixel_ray(&self, x: f32, y: f32) -> Option<(DVec3, DVec3)> {
         let (w, h) = self.viewport.get();
         if w == 0 || h == 0 {
             return None;
         }
-        let frame = self.camera_frame(0.0, w as f32 / h as f32);
-        let inv = frame.view_proj.inverse();
-        let nx = (x / w as f32) * 2.0 - 1.0;
-        let ny = 1.0 - (y / h as f32) * 2.0;
-        let p0 = inv * Vec4::new(nx, ny, 0.0, 1.0);
-        let p1 = inv * Vec4::new(nx, ny, 1.0, 1.0);
-        if p0.w.abs() < 1e-9 || p1.w.abs() < 1e-9 {
+        let aspect = w as f64 / h as f64;
+        let (eye, target) = self.camera_eye_target(0.0, (w as f32) / (h as f32));
+        // Forward direction WITHOUT the big-coordinate f32 roundtrip: for
+        // Fly, `target` was formed as eye+fwd in f32, so eye−target loses
+        // ~1e-3 rad to cancellation at field-scale coordinates — use the
+        // camera's own forward (the same one camera_frame's look_to uses).
+        let fwd = match self.camera_mode {
+            CameraMode::Fly => self.fly.forward(),
+            _ => (target - eye).normalize(),
+        };
+        let eye = eye.as_dvec3();
+        let back = -fwd.as_dvec3().normalize(); // view z axis (backward)
+        if back.length_squared() < 1e-24 {
             return None;
         }
-        let a = p0.truncate() / p0.w;
-        let b = p1.truncate() / p1.w;
-        let d = b - a;
-        if d.length_squared() < 1e-12 {
-            return None;
-        }
-        Some((a, d.normalize()))
+        let right = DVec3::Y.cross(back).normalize(); // view x axis
+        let up = back.cross(right); // view y axis
+        let tan = (FOV_Y as f64 * 0.5).to_radians().tan();
+        let nx = (x as f64 / w as f64) * 2.0 - 1.0;
+        let ny = 1.0 - (y as f64 / h as f64) * 2.0;
+        // View-space ray (nx·tan·aspect, ny·tan, −1) rotated to world.
+        let dir = (right * (nx * tan * aspect) + up * (ny * tan) - back).normalize();
+        Some((eye, dir))
     }
 
     /// Nearest non-hidden file whose live world AABB the ray pierces.
-    fn ray_file(&self, ro: Vec3, rd: Vec3) -> Option<(u32, f32)> {
+    fn ray_file(&self, ro: DVec3, rd: DVec3) -> Option<(u32, f64)> {
         let pctx = self.pick.as_ref()?;
-        let mut best: Option<(u32, f32)> = None;
+        let mut best: Option<(u32, f64)> = None;
         for info in &pctx.files {
             if self.group_hidden(info.group_id) {
                 continue;
@@ -1293,15 +1348,15 @@ impl GlyphScene {
             let Some((off, sc, _, _)) = self.group_trs(info.group_id) else {
                 continue;
             };
-            let min = Vec3::new(
-                info.aabb_min[0] * sc.x + off.x,
-                info.aabb_min[1] * sc.y + off.y,
-                off.z - 1.0,
+            let min = DVec3::new(
+                info.aabb_min[0] as f64 * sc.x as f64 + off.x as f64,
+                info.aabb_min[1] as f64 * sc.y as f64 + off.y as f64,
+                off.z as f64 - 1.0,
             );
-            let max = Vec3::new(
-                info.aabb_max[0] * sc.x + off.x,
-                info.aabb_max[1] * sc.y + off.y,
-                off.z + 1.0,
+            let max = DVec3::new(
+                info.aabb_max[0] as f64 * sc.x as f64 + off.x as f64,
+                info.aabb_max[1] as f64 * sc.y as f64 + off.y as f64,
+                off.z as f64 + 1.0,
             );
             if let Some(t) = ray_aabb(ro, rd, min, max) {
                 if best.is_none_or(|(_, bt)| t < bt) {
@@ -1314,8 +1369,22 @@ impl GlyphScene {
 
     /// Ray pick: nearest file AABB → ray ∩ file plane → nearest record cell.
     fn pick_ray(&mut self, x: f32, y: f32) -> Option<PickHit> {
-        let (ro, rd) = self.pixel_ray(x, y)?;
-        let (gid, t_aabb) = self.ray_file(ro, rd)?;
+        let dbg = std::env::var_os("GLYPH_PICK_DEBUG").is_some();
+        let Some((ro, rd)) = self.pixel_ray(x, y) else {
+            if dbg {
+                println!("pickdbg: px ({x},{y}) — pixel_ray returned None (degenerate unprojection)");
+            }
+            return None;
+        };
+        let Some((gid, t_aabb)) = self.ray_file(ro, rd) else {
+            if dbg {
+                println!(
+                    "pickdbg: px ({x},{y}) ro=({:.4},{:.4},{:.4}) rd=({:.6},{:.6},{:.6}) — no file AABB under the ray",
+                    ro.x, ro.y, ro.z, rd.x, rd.y, rd.z
+                );
+            }
+            return None;
+        };
         let rel_path = self
             .pick
             .as_ref()?
@@ -1326,14 +1395,20 @@ impl GlyphScene {
             .clone();
         let (off, sc, _, _) = self.group_trs(gid)?;
         // All glyphs live in the z = offset.z plane (group quats are identity).
-        let t = if rd.z.abs() > 1e-9 {
-            (off.z - ro.z) / rd.z
+        let t = if rd.z.abs() > 1e-12 {
+            (off.z as f64 - ro.z) / rd.z
         } else {
             t_aabb
         };
         let p = ro + rd * t.max(0.0);
-        let qx = (p.x - off.x) / sc.x.max(1e-6);
-        let qy = (p.y - off.y) / sc.y.max(1e-6);
+        let qx = ((p.x - off.x as f64) / (sc.x as f64).max(1e-6)) as f32;
+        let qy = ((p.y - off.y as f64) / (sc.y as f64).max(1e-6)) as f32;
+        if dbg {
+            println!(
+                "pickdbg: px ({x},{y}) ro=({:.4},{:.4},{:.4}) rd=({:.6},{:.6},{:.6}) t={t:.4} q=({qx:.4},{qy:.4}) file={rel_path}",
+                ro.x, ro.y, ro.z, rd.x, rd.y, rd.z
+            );
+        }
         if !self.ensure_pick_cache(gid) {
             return Some(PickHit {
                 group_id: gid,
@@ -1359,6 +1434,19 @@ impl GlyphScene {
             }
         }
         let dist_world = best.0.sqrt() * (sc.x + sc.y) * 0.5;
+        if dbg && !c.records.is_empty() {
+            let r = c.records[best.1];
+            println!(
+                "pickdbg: nearest rec={} row={} col={} cell=({:.4},{:.4}) adv={:.4} h={:.4} dist_world={dist_world:.4} (accept ≤ 0.8)",
+                best.1,
+                r.row(),
+                r.col(),
+                r.x(),
+                r.y(),
+                r.advance(),
+                r.height()
+            );
+        }
         // Accept within ~3/4 of a cell; further out it's file background.
         let glyph = if !c.records.is_empty() && dist_world <= 0.8 {
             self.make_glyph(gid, best.1)
@@ -1418,6 +1506,26 @@ impl GlyphScene {
         }
         let idx = exact.or(nearest.map(|(_, i)| i));
         let glyph = idx.and_then(|i| self.make_glyph(gid, i));
+        if std::env::var_os("GLYPH_PICK_DEBUG").is_some() {
+            if let (Some((off, sc, _, _)), Some(g)) = (self.group_trs(gid), &glyph) {
+                println!(
+                    "pickdbg: target {rel_path} rec={} local=({:.4},{:.4}) adv={:.4} h={:.4} \
+                     off=({:.4},{:.4},{:.4}) sc=({:.4},{:.4}) — world cell center ({:.4},{:.4})",
+                    g.record,
+                    g.pos[0],
+                    g.pos[1],
+                    g.advance,
+                    g.height,
+                    off.x,
+                    off.y,
+                    off.z,
+                    sc.x,
+                    sc.y,
+                    (g.pos[0] + g.advance * 0.5) * sc.x + off.x,
+                    g.pos[1] * sc.y + off.y,
+                );
+            }
+        }
         Some(PickHit {
             group_id: gid,
             rel_path,
@@ -1729,6 +1837,24 @@ impl GlyphScene {
         }
     }
 
+    /// Scriptable Fly-camera pose (offscreen repro of oblique windowed
+    /// picks): switches the camera to Fly and pins eye/yaw/pitch. Offscreen
+    /// mode never ticks the camera, so the pose holds for every op and frame.
+    pub fn set_cam_pose(&mut self, eye: [f32; 3], yaw: f32, pitch: f32) {
+        self.camera_mode = CameraMode::Fly;
+        self.fly.eye = Vec3::new(eye[0], eye[1], eye[2]);
+        self.fly.yaw = yaw;
+        self.fly.pitch = pitch;
+        self.fly.vel = Vec3::ZERO;
+        self.fly.keys = 0;
+        log::info!(
+            "cam pose: eye=({:.2},{:.2},{:.2}) yaw={yaw:.4} pitch={pitch:.4} (Fly)",
+            eye[0],
+            eye[1],
+            eye[2]
+        );
+    }
+
     /// Windowed click: restore the previous flash, pick at the pixel, flash
     /// the new glyph (bright yellow), return the pick log line.
     pub fn click_pick(&mut self, ctx: &GpuContext, x: f32, y: f32) -> Option<String> {
@@ -1784,10 +1910,14 @@ impl GlyphScene {
             self.grabbed_group = None;
             return;
         };
-        let c = Vec3::new(cl[0] * sc.x + off.x, cl[1] * sc.y + off.y, off.z);
-        let hit_plane = |o: Vec3, d: Vec3| -> Option<Vec3> {
+        let c = DVec3::new(
+            cl[0] as f64 * sc.x as f64 + off.x as f64,
+            cl[1] as f64 * sc.y as f64 + off.y as f64,
+            off.z as f64,
+        );
+        let hit_plane = |o: DVec3, d: DVec3| -> Option<DVec3> {
             let denom = d.dot(fwd);
-            if denom.abs() < 1e-9 {
+            if denom.abs() < 1e-12 {
                 None
             } else {
                 Some(o + d * ((c - o).dot(fwd) / denom))
@@ -1798,9 +1928,9 @@ impl GlyphScene {
         };
         let delta = p1 - p0;
         if let Some(g) = self.groups_cpu.get_mut(gid as usize) {
-            g.cols[0][0] += delta.x;
-            g.cols[0][1] += delta.y;
-            g.cols[0][2] += delta.z;
+            g.cols[0][0] += delta.x as f32;
+            g.cols[0][1] += delta.y as f32;
+            g.cols[0][2] += delta.z as f32;
         }
         self.write_group_row(ctx, gid);
         self.sync_segment(gid);
@@ -1864,12 +1994,12 @@ impl GlyphScene {
 }
 
 /// Slab ray-AABB test; returns the entry t (0 when the origin is inside).
-fn ray_aabb(ro: Vec3, rd: Vec3, min: Vec3, max: Vec3) -> Option<f32> {
-    let mut t0 = 0.0f32;
-    let mut t1 = f32::MAX;
+fn ray_aabb(ro: DVec3, rd: DVec3, min: DVec3, max: DVec3) -> Option<f64> {
+    let mut t0 = 0.0f64;
+    let mut t1 = f64::MAX;
     for ax in 0..3 {
         let (o, d, lo, hi) = (ro[ax], rd[ax], min[ax], max[ax]);
-        if d.abs() < 1e-12 {
+        if d.abs() < 1e-15 {
             if o < lo || o > hi {
                 return None;
             }
@@ -1960,6 +2090,10 @@ impl SceneLike for GlyphScene {
 
     fn set_viewport(&mut self, w: u32, h: u32) {
         self.viewport.set((w, h));
+    }
+
+    fn set_cam_pose(&mut self, eye: [f32; 3], yaw: f32, pitch: f32) {
+        GlyphScene::set_cam_pose(self, eye, yaw, pitch);
     }
 
     fn apply_pick(&mut self, ctx: &GpuContext, cmd: &PickCommand) -> Option<String> {

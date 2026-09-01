@@ -183,6 +183,9 @@ struct Cli {
 pub enum Op {
     Pick(PickCommand),
     Verb(Verb),
+    /// Scripted Fly-camera pose: eye + yaw/pitch (RADIANS) — repro of
+    /// oblique windowed camera states for --pick-px.
+    CamPose([f32; 3], f32, f32),
 }
 
 /// --pick-row/--pick-col upgrade the most recent --pick-file pick into a
@@ -338,6 +341,16 @@ fn parse_cli() -> Cli {
             }
             "--repo-scan-only" => cli.repo_scan_only = true,
             "--no-cull" => cli.no_cull = true,
+            "--cam-pose" => {
+                let f = |a: Option<String>| -> f32 {
+                    a.expect("--cam-pose requires X Y Z YAW PITCH (yaw/pitch in degrees)")
+                        .parse()
+                        .expect("--cam-pose components must be numbers")
+                };
+                let (x, y, z) = (f(args.next()), f(args.next()), f(args.next()));
+                let (yaw, pitch) = (f(args.next()), f(args.next()));
+                cli.ops.push(Op::CamPose([x, y, z], yaw.to_radians(), pitch.to_radians()));
+            }
             "--pick-file" => {
                 let s = args.next().expect("--pick-file requires a path substring");
                 cli.ops.push(Op::Pick(PickCommand::File(s)));
@@ -386,6 +399,9 @@ fn parse_cli() -> Cli {
                      \x20 --focus-file SUBSTR  frame the first file whose path contains SUBSTR\n\
                      \x20 --repo-scan-only     walk+engine+stage+stats, no GPU, then exit\n\
                      \x20 --no-cull            Stage F: disable cull/LOD (legacy full-field draws)\n\
+                     \x20 --cam-pose X Y Z YAW PITCH\n\
+                     \x20                      scripted Fly-camera pose (yaw/pitch in DEGREES;\n\
+                     \x20                      interleaves with picks/verbs like --verb)\n\
                      \x20 --pick-file SUBSTR   Stage G: pick the first file whose path contains SUBSTR\n\
                      \x20 --pick-row N         with --pick-file: deterministic glyph pick (folded row)\n\
                      \x20 --pick-col M         with --pick-file: deterministic glyph pick (folded col)\n\

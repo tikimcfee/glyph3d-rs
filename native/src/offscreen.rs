@@ -49,11 +49,16 @@ pub fn run(
     // Stage G: scripted picks + verbs, applied in CLI order before the first
     // frame. Deterministic: the Front camera + fixed viewport make --pick-px
     // reproducible, and --pick-row/--pick-col don't involve a ray at all.
+    // --cam-pose switches to a scripted Fly pose (oblique-pick repro).
     scene.set_viewport(size.width, size.height);
     for op in ops {
         let line = match op {
             Op::Pick(p) => scene.apply_pick(ctx, p),
             Op::Verb(v) => scene.apply_verb(ctx, v),
+            Op::CamPose(eye, yaw, pitch) => {
+                scene.set_cam_pose(*eye, *yaw, *pitch);
+                None
+            }
         };
         match line {
             Some(line) => println!("{line}"),

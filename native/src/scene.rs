@@ -47,6 +47,9 @@ pub trait SceneLike {
     /// Viewport in physical px for ray unprojection (offscreen sets this
     /// before scripted picks; windowed scenes track it per render).
     fn set_viewport(&mut self, _w: u32, _h: u32) {}
+    /// Pin the camera to an explicit Fly pose (scripted oblique-pick repro).
+    /// Default no-op (non-camera scenes ignore it).
+    fn set_cam_pose(&mut self, _eye: [f32; 3], _yaw: f32, _pitch: f32) {}
     /// Resolve a pick; returns a log line (None = scene doesn't support it).
     fn apply_pick(&mut self, _ctx: &GpuContext, _cmd: &crate::glyph_scene::PickCommand) -> Option<String> {
         None
