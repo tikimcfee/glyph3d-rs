@@ -565,3 +565,20 @@ files show `(hidden)` and tint swatches follow t/tint verbs.
 **IME:** dead-key/CJK input into a text field renders preedit; note any
 candidate-window positioning oddity (document, don't fix).
 
+
+---
+
+## Post-stage erratum (commit ebaaec4, 2026-09-02)
+
+**First human run caught what every agent smoke missed.** K1's "empty UI" used
+`CentralPanel::default()`, which paints an opaque full-viewport `panel_fill`
+rect — "background layer" only governs input order, not fill. Result on any
+repo: Debug window visible over an opaque gray blanket, scene healthy
+underneath (cull/draw/present all nominal — 127,589 instances @ 60 fps on the
+integration-notes repo). Log/FPS-only smoke verification structurally cannot
+see this class of bug; it needed eyes. Fix: the vestigial panel is removed
+(`egui::Window` needs no CentralPanel). Gates: check-all ALL GATES GREEN.
+Lesson recorded for the human-pass column: **any "invisible by construction"
+UI claim requires one pixel-level check per stage** — the windowed readback
+seam (COPY_SRC surface + copy_texture_to_buffer, note 10's in-window
+screenshot) would make that agent-verifiable.
