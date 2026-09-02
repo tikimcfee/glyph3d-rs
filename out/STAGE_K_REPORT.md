@@ -9,12 +9,15 @@ change to the offscreen oracle path** and zero WGSL edits, per
 
 ## Result
 
-**Phases K1–K3 landed** (K1 `c99631f` + report `4e10720`, K2 `2118305`, K3
-`d6e8efa`; 2026-09-02): the egui 0.36.1 stack, full render/input plumbing,
-the input-consumption gating matrix, and the Debug panel (FPS, camera, pick
-inspector, verb buttons, scratch text field). All six gates green after every
-commit; one wgpu in the tree; windowed FPS band unchanged; `--no-ui`
-reproduces pre-K behavior exactly. K4–K5 remain.
+**Phases K1–K4 landed** (K1 `c99631f` + report `4e10720`, K2 `2118305`, K3
+`d6e8efa`, K4 `f4d2934`; 2026-09-02): the egui 0.36.1 stack, full
+render/input plumbing, the input-consumption gating matrix, the Debug panel
+(FPS, camera, pick inspector, verb buttons, scratch text field), and live
+LOD_MIN_PX tuning with cull readouts and an F1 panel toggle. All six gates
+green after every commit; one wgpu in the tree; windowed FPS band unchanged;
+`--no-ui` reproduces pre-K behavior exactly. **Cut:** the BACKDROP_GAIN
+slider (handoff's mechanism premise was wrong — see Phase K4). Only K5
+(stretch: group-tree browser) remains.
 
 ---
 
@@ -148,11 +151,11 @@ glyph3d-native` also matches an unrelated concurrent experiment running from
 --screenshot` loop) — those processes were identified by full path and left
 untouched.
 
-## Remaining gaps (K4–K5)
+## Remaining gaps (K5)
 
-- K4: live `LOD_MIN_PX` / `BACKDROP_GAIN` (windowed-only; offscreen keeps
-  compile-time defaults).
 - K5 (stretch): group-tree browser (virtualized rows).
+- BACKDROP_GAIN live slider — cut in K4 (mechanism premise false; future
+  seam recorded in the K4 section below).
 - puffin_egui still pinned to egui 0.33 (house note; not adopted here).
 - AccessKit feature left ON (egui-winit default); no adapters are
   initialized without `init_accesskit`, so it is inert — revisit only if
@@ -274,3 +277,100 @@ None from the handoff. Two scope choices recorded: (1) verb buttons cover
 the zero-arg/default CLI verbs only (see above); (2) the panel is always
 open — there is no close/reopen affordance yet (a `.open(&mut bool)` toggle
 plus a hotkey/menu is a natural K4 add; `--no-ui` remains the clean view).
+
+---
+
+## Phase K4 as-executed (commit `f4d2934`)
+
+### LOD_MIN_PX — live, with offscreen consts preserved by construction
+
+**Read-site audit (grep-verified):** exactly ONE code read of `LOD_MIN_PX`
+in the crate — the `glyph_px < LOD_MIN_PX` classification inside
+`cull_segments` (glyph_scene.rs). Every other mention is a doc comment or
+the seed. `cull_segments` is shared by windowed and offscreen, so the
+handoff's "shared read site" case applies.
+
+**Mechanism:**
+- `CullState` gains `lod_min_px: Cell<f32>`, seeded `Cell::new(LOD_MIN_PX)`
+  in `CullState::new` (the `viewport: Cell` precedent — `render(&self)`
+  stays immutable).
+- `cull_segments` takes the threshold as part of a new `CullView` bundle
+  (`planes/eye/px_scale/lod_min_px` — view-derived per-frame inputs; the
+  bundle also keeps the function under clippy's 7-arg limit without an
+  `#[allow]`).
+- The Debug-panel slider writes `UiProbeState.lod_min_px` (seeded from the
+  const at install); `GlyphScene::render` copies it into the Cell **before
+  culling**, so a drag takes effect the same frame. That copy is the SINGLE
+  write site and runs only when a probe is installed.
+- **Proof of construction for offscreen:** probes are installed only by
+  `build_scene_probed` (windowed); `build_scene` (offscreen) passes
+  `probe=false`. Offscreen ⇒ no probe ⇒ no write ⇒ the Cell holds the const
+  ⇒ `cull_segments` receives exactly `1.0` ⇒ gate 6's four byte-equal PNGs
+  are the empirical proof (they pass).
+
+### BACKDROP_GAIN — CUT (handoff mechanism premise was wrong)
+
+The handoff assumed the gain lived in the Params uniform, tunable by a
+per-change `queue.write_buffer`. Ground truth: `Params` (glyph_field.wgsl)
+carries only the Slug minification dials (`dilate_px/soften/min_lo/min_hi`);
+`cull.wgsl`'s own header documents that the backdrop color/alpha are "baked
+at staging into `SegCull.tint`" — `seg_tint` computes
+`E = min(ink_frac × BACKDROP_GAIN, 1)` on the CPU at staging, and that
+staging path is shared by `text.rs` and `repo.rs` (offscreen included). A
+live gain therefore requires either a `cull.wgsl` edit (fence 4 — forbidden)
+or an `ink_frac` plumbing redesign across `seg_tint` → `CullState` →
+`sync_segment` with f32/f64 rounding care — a different design than
+sanctioned, touching the determinism-adjacent staging modules. **Cut per
+the "don't improvise scope" rule.**
+
+Feasible future seam (recorded, not built): store per-segment `ink_frac` at
+staging (`seg_tint` returns it alongside the tint), keep the baked
+`tint[3]` as the `gain == BACKDROP_GAIN` fast path (offscreen-exact), and
+apply `min(ink_frac × live_gain, 1)` at backdrop-compaction time in
+`cull_segments` when the slider deviates — the backdrop instance buffer is
+already rewritten every frame, so the GPU cost is zero. `sync_segment`'s
+alpha handling needs the same treatment. That is its own mini-stage with an
+A/B suite, not a fence workaround.
+
+### Live cull readouts
+
+The Debug window shows `cull: N draw ranges, M instances | K backdrops` —
+the same sums `GLYPH_CULL_DEBUG` prints at t=0, written into the probe every
+frame (only when installed; zeros under `--no-cull`). The probe refresh
+moved to a single point after the cull section so counters and camera/pick
+state are written together.
+
+### Panel close/reopen
+
+`.open(&mut debug_open)` on the Debug window (its own close button works)
+plus **F1 toggles** it. F1 sits in the unconsumed-key path of the K2 matrix
+and is never scene input; if egui has keyboard focus it consumes F1 first
+(Esc the field, then F1) — acceptable, does not complicate the matrix.
+
+### Verification
+
+- `check-all.sh`: ALL GATES GREEN (0 build + 0 clippy warnings; 19 tests;
+  engine-check bit-exact; stage-g PASS; four PNGs byte-equal — offscreen
+  kept the const, per above).
+- `cargo check --release --no-default-features`: clean.
+- **`GLYPH_K4_SELFTEST=1`** (new dev-only env var, documented in AGENTS.md):
+  moves the slider programmatically at t≈3 s and logs the counters:
+  `before: lod_min_px=1.00 → ranges=4 instances=10857 backdrops=0`, then
+  `after: lod_min_px=16.00 → ranges=0 instances=0 backdrops=4` — the full
+  panel → probe → `CullState` → `cull_segments` write path proven in a live
+  run. (First iteration used 64.0 and exposed that egui sliders clamp
+  out-of-range values into the range on show — harmless in real use since
+  the slider is the only writer; the selftest now uses the range max.)
+- FPS held at 60.0 in both K4 runs; no panics; no leftover processes.
+- **Human pass pending:** visually dragging the slider trades glyphs for
+  backdrop quads (mechanism proven by the selftest; the visual judgement
+  needs eyes), and F1 toggle feel.
+
+### Human-pass checklist additions
+
+- Drag LOD_MIN_PX up: visible segments collapse into backdrop quads; drag
+  back down: glyphs return. Counters in the panel track the change live.
+- With the pointer over the slider, scroll must NOT change fly speed (K2
+  wheel gating) and WASD must not fly while the scratch field is focused.
+- F1 closes and reopens the Debug window; the window's own × closes it.
+- `--no-ui` runs keep pre-K behavior (no panel, F1 inert).
