@@ -633,7 +633,7 @@ pixel-verification gap the erratum above identified).
 - `check-all.sh`: ALL GATES GREEN (20 tests — the new
   `screenshot_frame_flags_parse`; four PNGs trivially byte-equal, offscreen
   untouched). `cargo check --no-default-features` clean.
-- **`/tmp/k6-fixture.png`** (frame 90, 3200×2000, fixture repo): the Debug
+- **`out/k6-fixture.png`** (frame 90, 3200×2000, fixture repo): the Debug
   window is fully composed top-left — FPS 55.0, camera Fly
   eye=(45.17,-84.88,257.56), pick line, six verb buttons, the LOD_MIN_PX
   slider at 1.00 with live counters (`4 draw ranges, 10857 instances | 0
@@ -644,7 +644,7 @@ pixel-verification gap the erratum above identified).
   top. **The ebaaec4 opaque-blanket regression is NOT present.** The
   background is the correct dark blue-gray (0.07,0.07,0.09) — not
   brown/orange — so the BGRA→RGBA swizzle is right.
-- **`/tmp/k6-notes.png`** (frame 120, integration-notes repo): 127,589
+- **`out/k6-notes.png`** (frame 120, integration-notes repo): 127,589
   instances, 12 draw ranges; dozens of markdown pages in the grid with sane
   colors (white body text, reddish heading tints) on the same blue-gray;
   Debug window composed on top with the notes file list
