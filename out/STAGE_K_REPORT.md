@@ -9,11 +9,12 @@ change to the offscreen oracle path** and zero WGSL edits, per
 
 ## Result
 
-**Phase K1 landed (commit `c99631f`, 2026-09-02):** the full egui 0.36.1
-dependency stack and complete render/input plumbing with an EMPTY UI
-(`CentralPanel::default()`, no widgets). All six gates green; one wgpu in the
-tree; windowed FPS band unchanged; `--no-ui` reproduces pre-K behavior
-exactly. K2–K5 remain.
+**Phases K1–K3 landed** (K1 `c99631f` + report `4e10720`, K2 `2118305`, K3
+`d6e8efa`; 2026-09-02): the egui 0.36.1 stack, full render/input plumbing,
+the input-consumption gating matrix, and the Debug panel (FPS, camera, pick
+inspector, verb buttons, scratch text field). All six gates green after every
+commit; one wgpu in the tree; windowed FPS band unchanged; `--no-ui`
+reproduces pre-K behavior exactly. K4–K5 remain.
 
 ---
 
@@ -147,11 +148,8 @@ glyph3d-native` also matches an unrelated concurrent experiment running from
 --screenshot` loop) — those processes were identified by full path and left
 untouched.
 
-## Remaining gaps (K2–K5)
+## Remaining gaps (K4–K5)
 
-- K2: input-consumption correctness with REAL widgets (text-field isolation,
-  grab↔UI-focus interplay, IME smoke).
-- K3: debug panel (FPS, camera, pick inspector, verb buttons).
 - K4: live `LOD_MIN_PX` / `BACKDROP_GAIN` (windowed-only; offscreen keeps
   compile-time defaults).
 - K5 (stretch): group-tree browser (virtualized rows).
@@ -159,3 +157,120 @@ untouched.
 - AccessKit feature left ON (egui-winit default); no adapters are
   initialized without `init_accesskit`, so it is inert — revisit only if
   binary size or platform issues appear.
+
+---
+
+## Phase K2 as-executed (commit `2118305`, windowed.rs only)
+
+### The gating matrix (final rules, all in `App::window_event` + `WindowState::render`)
+
+egui sees EVERY window event first (`egui_state.on_window_event`); the
+returned `EventResponse.consumed` implements the study §2.2 cheat-sheet
+(pointer/wheel consumed ⇔ `egui_wants_pointer_input`; CursorMoved consumed ⇔
+`egui_is_using_pointer`; keys consumed ⇔ `egui_wants_keyboard_input` OR Tab,
+which is always egui's). Scene routing:
+
+| Event | Routed to scene when | Notes |
+|---|---|---|
+| CloseRequested / Resized / RedrawRequested | always (egui never consumes; arms match before the consumption arm) | resize handling stays ours (egui-winit never touches the wgpu surface) |
+| KeyboardInput (fly WASD/ERQF, verbs h/g/t/x, Esc, backquote) | `!consumed` | a focused egui widget (K3's text field) swallows keys → typing cannot fly the camera or fire verbs; Esc/backquote are egui's whenever a widget has focus |
+| MouseInput Right **Pressed** (grab look) | `!consumed` | press over a panel starts NO grab |
+| MouseInput Right **Released** | **always ungrabs** — arm placed ABOVE the consumption arm | the K1 latch (grab starts outside, release lands on a panel, release consumed → grab stuck) is fixed by construction; `ungrab()` is a no-op when ungrabbed |
+| MouseInput Left Pressed (pick) | `!consumed` && `!grabbed` | click on a panel never picks |
+| CursorMoved | bookkeeping (`state.cursor`) ALWAYS; scene effects (look fallback, `on_cursor` group drags) only when `!egui_wants_pointer_input()` | `consumed` alone is insufficient here — it excludes hover; a g-grabbed group must not track the pointer across panels |
+| MouseWheel | `!consumed` | scroll over a panel never changes fly speed |
+| DeviceEvent::MouseMotion | while `grabbed` (unchanged) | raw look bypasses egui by design; coexistence is prevented by the ungrab-on-focus rule |
+| Ime | never scene-routed; egui gets it first; `handle_platform_output` drives `set_ime_allowed`/`cursor_area` | candidate-window positioning quirks = known rough edge (documented, not fixed) |
+
+### Ungrab-on-UI-focus (the grab interplay rule)
+
+Each frame, after `run_ui` (focus/hover state fresh for THIS frame):
+`if (egui_wants_pointer_input() || egui_wants_keyboard_input()) && grabbed { ungrab() }`.
+Rationale: while grabbed, raw `DeviceEvent` deltas drive look and bypass
+egui, and the pointer is hidden/confined — egui must not believe it is
+hovered. Re-acquisition is automatic: once the pointer leaves egui's area,
+`egui_wants_pointer_input()` is false, so the next right-press routes to the
+scene's grab arm. Mid-look-drags over panels are NOT interrupted: while a
+button is down and the drag started outside egui, egui's `any_down` clause
+reports wanting nothing (verified against `context.rs:3084-3087`).
+
+### Verification status — **verified by code inspection; human pass pending**
+
+I cannot drive the GUI with real input events. The matrix above was verified
+by tracing every event arm against the egui 0.36.1 source semantics; the
+empty-UI K1 smoke and the K3 smoke ran clean. **The human pass should
+exercise** (STEP 0 inventory + K2 additions): WASD/ERQF fly, scroll speed,
+right-drag look, backquote toggle, Esc release, left-click pick + flash,
+h/g/t/x verbs, `saw_device_delta` fallback — PLUS: type WASD/h/g/t/x into
+the Debug window's text field (scene must not react), right-drag starting on
+the Debug window (no grab), right-drag starting on the scene then releasing
+over the Debug window (grab releases), Tab with the field focused (never
+reaches the scene), IME dead-key/CJK input into the field (preedit renders;
+candidate-window position may be off — document only).
+
+Gates: `check-all.sh` ALL GATES GREEN; `cargo check --no-default-features`
+clean; 10 s windowed smoke 60.0 FPS, no panic/error, no leftover process.
+
+---
+
+## Phase K3 as-executed (commit `d6e8efa`)
+
+### The Debug window
+
+One `egui::Window` titled "Debug", explicit `.id(egui::Id::new("stage_k_debug_panel"))`:
+
+- **FPS readout** — the same 1 Hz figure the stdout line prints (mirrored
+  into `WindowState.ui_fps` at the same site; the println is untouched and
+  remains the offscreen-facing output).
+- **Camera readout** — mode + this frame's ACTUAL eye (`CamFrame.eye`, the
+  same eye the cull pass uses) + fly yaw/pitch.
+- **Pick inspector** — the last pick formatted by the SAME `format_pick`
+  that produces the stdout pick line; "(none yet)" before the first pick.
+- **Verb buttons** — `recolor-glyph`, `recolor-line`, `tint-cycle`,
+  `hide-group`, `show-group`, `toggle-hidden`. Each button parses its
+  CLI-literal string through `crate::parse_verb` (the very parser the
+  `--verb` flag uses) and applies it through `SceneLike::apply_verb`, with
+  the returned line println'd exactly like the op stream. **Panel ⇔ CLI
+  equivalence is by construction** — same parser, same entry point, same
+  log format. Parameterized verbs (nudge/scale/move, tint-group rrggbb)
+  stay CLI-only until a phase adds arg entry (cut deliberately, recorded
+  here).
+- **Scratch text field** — the K2 typing-isolation trap test.
+
+### The readout seam (fence-4-clean; no `SceneLike` change)
+
+Windowed holds the scene as `Box<dyn SceneLike>`, and fence 4 forbids trait
+changes, so the panel cannot query the concrete scene. Solution: a
+**probe cell** — `glyph_scene::UiProbeState { camera_mode, eye, yaw, pitch,
+last_pick }` behind `Rc<RefCell<_>>` (single-threaded: winit's event-loop
+thread owns writer and reader). `GlyphScene::init_ui_probe()` installs it on
+the CONCRETE scene before boxing; `main.rs` gained `build_scene_probed`
+(windowed) while `build_scene` (offscreen) keeps its exact signature and
+passes `probe=false` through the shared `build_scene_impl` — construction
+order and semantics byte-identical for offscreen. The probe is written once
+per frame at the top of `GlyphScene::render` ONLY when installed, so the
+offscreen determinism chain provably never touches it (and the four PNG
+gates stay byte-equal). The Stage A demo scene has no probe — the panel
+shows "n/a".
+
+### Verification
+
+- `check-all.sh` ALL GATES GREEN; `cargo check --no-default-features` clean.
+- 20 s windowed smoke (`--load-repo fixtures/g-pick-repo --pick-file alpha
+  --pick-row 2 --pick-col 5 --verb "recolor-line"`): scripted pick and verb
+  produced the exact expected log lines (`pick: alpha.rs group=0 rec=20
+  row=2 col=5 line=2 byte=20 char='i' slot=18 …`, `verb recolor-line:
+  alpha.rs row 2 — 11 glyphs in 1 run(s), 528 B uploaded`); FPS settles to
+  60.0 after a ~2 s startup transient (egui font atlas upload); no
+  panic/error; no leftover process.
+- **OS screenshot NOT captured**: `screencapture` is blocked by macOS Screen
+  Recording permission in this environment ("could not create image from
+  display"). The panel code path executes 60×/s without fault; visual
+  eyeballing of the Debug window is part of the pending human pass.
+
+### Deviations
+
+None from the handoff. Two scope choices recorded: (1) verb buttons cover
+the zero-arg/default CLI verbs only (see above); (2) the panel is always
+open — there is no close/reopen affordance yet (a `.open(&mut bool)` toggle
+plus a hotkey/menu is a natural K4 add; `--no-ui` remains the clean view).
