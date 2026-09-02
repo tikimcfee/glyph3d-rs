@@ -296,10 +296,12 @@ impl WindowState {
             let filter = &mut egui.filter;
             let selected_group = &mut egui.selected_group;
             let full_output = egui_ctx.run_ui(raw_input, |root_ui| {
-                // The CentralPanel lives on the background layer, so
-                // `is_pointer_over_egui` stays false for it and it consumes
-                // no scene input (K1/K2 rules).
-                egui::CentralPanel::default().show(root_ui, |_ui| {});
+                // K1 leftover REMOVED (stage-k fix): the empty
+                // `CentralPanel::default()` paints an OPAQUE full-viewport
+                // panel_fill rect that blanketed the 3D scene — "background
+                // layer" only affects input order, not fill. With real
+                // windows present it is vestigial; no CentralPanel is needed
+                // (egui::Window shows fine without one).
                 // K3: the Debug window. Every scene-facing call below is the
                 // exact API the CLI ops use — verb buttons parse CLI-literal
                 // strings through crate::parse_verb and call
