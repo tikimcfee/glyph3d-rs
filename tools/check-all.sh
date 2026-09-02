@@ -6,10 +6,10 @@
 #                                     schema's own validation rules run (this is
 #                                     the tier check; it had no home in this tree
 #                                     until 2026-09-02)
-#   2. engine-local/check.sh cpu    — the ten Mojo CPU conformance suites (the
-#                                     five GPU suites are parked: max.gpu is not
-#                                     in this pixi env, and check.sh says so
-#                                     rather than printing a blanket green)
+#   2. engine/check.sh            — all fifteen Mojo conformance suites, CPU
+#                                     AND GPU. The five GPU suites run on Metal
+#                                     since `max` became a real dependency
+#                                     (pixi.toml) on 2026-09-02.
 #   3. cargo build --release        — zero warnings (house rule)
 #   4. cargo clippy --release       — zero warnings
 #   5. cargo test                   — all tests green (19 at Stage J:
@@ -45,8 +45,8 @@ for g in "tools/gen_real_trie.py --verify-only" "tools/gen_schema.py --check"; d
 done
 [ "$G_OK" = 1 ] || echo "      (a generator drifted from its committed output, or the schema is invalid)"
 
-step "2/8 engine-local/check.sh cpu (ten Mojo conformance suites)"
-if OUT=$(./engine-local/check.sh cpu 2>&1); then
+step "2/8 engine/check.sh (fifteen Mojo conformance suites, CPU + GPU)"
+if OUT=$(./engine/check.sh 2>&1); then
   echo "$OUT" | tail -2
   echo "PASS  engine suites"
 else

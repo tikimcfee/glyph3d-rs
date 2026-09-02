@@ -1,6 +1,6 @@
 //! engine.rs — safe Rust wrapper over the Mojo glyph engine's C ABI (Stage D).
 //!
-//! The FFI surface (engine-local/ffi.mojo) is scalars + one opaque handle:
+//! The FFI surface (engine/ffi.mojo) is scalars + one opaque handle:
 //! no Mojo types cross the boundary, records are copied into caller memory,
 //! and the f32 lanes cross as raw bits inside the 32 B wire record.
 //!
@@ -148,6 +148,7 @@ extern "C" {
         depth_per_col: f64,
         page_line_height: f64,
     ) -> i32;
+    fn glyph_engine_fp_probe(a: f32, b: f32, c: f32) -> u32;
     fn glyph_engine_slot_count(handle: *mut c_void) -> u64;
     fn glyph_engine_copy_slots(handle: *mut c_void, out_ptr: *mut u32, out_len: usize)
         -> u64;
@@ -203,6 +204,45 @@ pub fn write_item_desc(block: &mut [u8], params: &ItemParams, byte_start: u64, b
     block[120..128].copy_from_slice(&byte_count.to_le_bytes());
 }
 
+/// Assert the linked dylib was built with `--fp-mode contract=off`.
+///
+/// The flag is load-bearing — FMA contraction fuses `a*b + c` across statements
+/// and this pipeline is bit-exact against a CPU reference that does not fuse.
+/// Until 2026-09-02 NOTHING in this tree could detect its absence: the Mojo
+/// suites pass either way (engine/check.sh's own header says so), and
+/// `--engine-check` is blind because it runs with origin (0,0,0), which makes
+/// its only fusable multiply-add FMA-invariant. Raising the origin would not
+/// help — the fold computes in f64 and narrows to f32, so an f64-ulp difference
+/// survives that narrowing only by luck (~2^-29 per record).
+///
+/// So this asks the compiler directly instead of hoping a corpus notices.
+/// The operands are passed IN, so the expression cannot be constant-folded:
+/// the fusion decision is made in the dylib's emitted code, which is the thing
+/// under test. Measured against dylibs built both ways, 2026-09-02.
+const FP_PROBE_A_BITS: u32 = 0x3f80_0002; // 1.0 + 2 ulp
+const FP_PROBE_UNFUSED: u32 = 0x3500_0000; // product rounded, then added
+const FP_PROBE_FUSED: u32 = 0x3500_0001; // single rounding — contraction ON
+
+fn assert_fp_contract_off() {
+    let a = f32::from_bits(FP_PROBE_A_BITS);
+    let got = unsafe { glyph_engine_fp_probe(a, a, -1.0) };
+    if got == FP_PROBE_UNFUSED {
+        return;
+    }
+    let how = if got == FP_PROBE_FUSED {
+        "it FUSED the multiply-add, so it was built with FP contraction ON"
+    } else {
+        "it returned neither the fused nor the unfused value"
+    };
+    panic!(
+        "libglyph_engine.dylib was built WITHOUT `--fp-mode contract=off`.\n\
+         The fp probe returned {got:#010x}; expected {FP_PROBE_UNFUSED:#010x} \
+         (fused would be {FP_PROBE_FUSED:#010x}) — {how}.\n\
+         Every float this engine produces is therefore suspect against the CPU \
+         reference. Rebuild:  pixi run build-engine"
+    );
+}
+
 /// A live engine handle. NOT Send/Sync: the Mojo runtime shards work onto its
 /// own thread pool, but the handle itself is plain mutable state — keep it on
 /// one thread (Stage E concern if we ever want N handles).
@@ -214,6 +254,10 @@ impl Engine {
     pub fn new() -> Self {
         let handle = unsafe { glyph_engine_new() };
         assert!(!handle.is_null(), "glyph_engine_new returned null");
+        // Fail loud at the substrate seam: a dylib with the wrong FP semantics
+        // produces plausible-looking wrong numbers, which is the worst failure
+        // mode available. Cheap (one FFI call per handle) and deterministic.
+        assert_fp_contract_off();
         Engine { handle }
     }
 

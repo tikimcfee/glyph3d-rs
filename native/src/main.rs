@@ -534,7 +534,7 @@ fn run_engine_check(file: &Path, trie_path: Option<&Path>) -> ! {
         Ok(()) => {
             println!(
                 "engine-check PASS: {} ({} B) — {} records bit-exact vs the CPU reference \
-                 (trie: {})",
+                 [fp contract=off verified at the dylib] (trie: {})",
                 file.display(),
                 bytes.len(),
                 records.len(),

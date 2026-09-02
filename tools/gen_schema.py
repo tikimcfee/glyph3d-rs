@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""gen_schema.py — generate engine-local/glyph_schema.mojo from schema/glyph-identity.json.
+"""gen_schema.py — generate engine/glyph_schema.mojo from schema/glyph-identity.json.
 
 PORTED FROM the web repo's tools/gen-schema.mjs (2026-09-02). The schema JSON is
 vendored verbatim; the emitted Mojo is byte-identical to what the JS produced,
@@ -11,7 +11,7 @@ generated file is pointless because the next run overwrites it.
 
 Validation runs FIRST and raises. A schema that violates the invariants is a
 build failure, not a review miss — which is the whole reason the schema exists.
-Until this file existed here, engine-local/glyph_schema.mojo was an ORPHAN: a
+Until this file existed here, engine/glyph_schema.mojo was an ORPHAN: a
 generated artifact with no generator in its tree, and none of the rules below
 were enforced on the native side at all.
 
@@ -31,7 +31,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 SCHEMA_PATH = ROOT / "schema" / "glyph-identity.json"
-MOJO_OUT = ROOT / "engine-local" / "glyph_schema.mojo"
+MOJO_OUT = ROOT / "engine" / "glyph_schema.mojo"
 
 
 def validate(s: dict) -> dict:

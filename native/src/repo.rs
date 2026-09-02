@@ -13,7 +13,7 @@
 //!   codepoint past the trie's 4352-entry block index — the engine's decode
 //!   assumes well-formed leads, see Stage E1 report);
 //! - the 10 MB per-file cap also keeps every item far under the engine's
-//!   per-item 2^24-byte ordinal wall (engine-local README, ordinal_invariant).
+//!   per-item 2^24-byte ordinal wall (engine README, ordinal_invariant).
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};

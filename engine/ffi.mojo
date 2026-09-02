@@ -311,3 +311,32 @@ def glyph_engine_copy_slots(
         for k in range(3):
             out_ptr[unsafe_offset = wo + 5 + k] = cp[unsafe_offset = co + k]
     return UInt64(n)
+
+
+@export("glyph_engine_fp_probe")
+def glyph_engine_fp_probe(a: Float32, b: Float32, c: Float32) abi("C") -> UInt32:
+    """NATIVE-PORT (2026-09-02): report whether THIS DYLIB was built with
+    `--fp-mode contract=off`, by doing the one thing the flag governs.
+
+    WHY THIS EXISTS. The flag is load-bearing (README-FFI.md, build.rs,
+    check.sh's header all say so) and until now NOTHING COULD DETECT ITS
+    ABSENCE. check.sh's own header admits the Mojo suites pass either way; the
+    Rust `--engine-check` is blind for a separate reason, measured 2026-09-02:
+    it runs with origin (0,0,0), which makes its only fusable multiply-add
+    (`-row*lh + oy`) FMA-invariant, and the pagination terms that DO have a
+    nonzero addend never execute under its params. Even with a nonzero origin
+    it would stay blind — the fold computes in Float64 and narrows to Float32,
+    and an FMA/non-FMA difference at f64 ulp survives that narrowing only when
+    the result lands within ~2^-53 of an f32 rounding boundary (~2^-29 per
+    record). That is a lottery, not a gate.
+
+    So: stop hoping a corpus notices, and ask the compiler directly. `a * b + c`
+    is exactly the shape contraction fuses. The operands are PARAMETERS, not
+    literals, so the expression cannot be constant-folded at compile time — the
+    fusion decision is made in emitted code, which is the thing under test.
+
+    Caller passes a = b = 0x3f800002 (1.0 + 2 ulp), c = -1.0 and expects:
+        0x35000000  built with contract=off  (product rounded, then added)
+        0x35000001  built with contract=fast (single rounding — FORBIDDEN)
+    One ulp apart, deterministic, no fixtures involved."""
+    return UInt32((a * b + c).to_bits())

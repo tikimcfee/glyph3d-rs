@@ -10,8 +10,8 @@
 #   3. STRESS: 1000 load/free cycles on one handle, full record copy each time
 #      (leak/crash check; run under `time -l` to watch RSS).
 #
-# Run:  mojo run  --fp-mode contract=off -I engine-local engine-local/ffi_selftest.mojo
-# Build: mojo build --fp-mode contract=off -I engine-local engine-local/ffi_selftest.mojo -o out/ffi_selftest
+# Run:  mojo run  --fp-mode contract=off -I engine engine/ffi_selftest.mojo
+# Build: mojo build --fp-mode contract=off -I engine engine/ffi_selftest.mojo -o out/ffi_selftest
 
 from std.sys import argv
 from std.memory import bitcast
