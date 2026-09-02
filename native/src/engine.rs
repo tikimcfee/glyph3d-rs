@@ -99,6 +99,80 @@ impl Default for ItemParams {
     }
 }
 
+/// Rust-side rejection, raised BEFORE the FFI call — deliberately outside the
+/// engine's status range so it can never be confused with one.
+const GE_BAD_PARAMS: i32 = -1;
+
+impl ItemParams {
+    /// Refuse a layout the engine would silently turn into NaN.
+    ///
+    /// WHY THIS EXISTS. The Mojo engine performs NO input validation:
+    /// `Item.line_height` is a raw `Float64` and `glyph_pipeline.mojo` says in
+    /// as many words that "an unset line_height is NaN here and propagates".
+    /// Every gate in this tree then compares layouts BY BITS — and two NaNs
+    /// compare bit-equal. So a NaN pitch produces a NaN layout that
+    /// `--engine-check`, all fifteen conformance suites, and the byte-equal
+    /// render A/B would every one of them pass. The JS oracle has carried an
+    /// `assertLineHeight` for exactly this since before the port; the native
+    /// side never grew one. (Found 2026-09-02 auditing the JS oracle's tests.)
+    ///
+    /// NaN specifically is not "some invalid float": it is the `.pipe.bin`
+    /// wire encoding for UNSET. Reaching this function means an unset pitch
+    /// travelled all the way to the layout call without anyone resolving it,
+    /// which is a different bug from a corrupt one and says so.
+    ///
+    /// ZERO IS LEGAL, and that is the subtle half. A zero pitch collapses
+    /// every row onto one baseline — a degenerate layout, but a CHOICE, and
+    /// not the same thing as an omission. The idiomatic Rust reflex
+    /// (`if lh == 0.0 { default }`, or `Option::unwrap_or`) quietly conflates
+    /// the two; this does not.
+    pub fn validate(&self, item: usize) -> Result<(), EngineError> {
+        let bad = |what: &str, why: &str| {
+            Err(EngineError {
+                status: GE_BAD_PARAMS,
+                what: format!("item {item}: {what} — {why}"),
+            })
+        };
+        if self.line_height.is_nan() {
+            return bad(
+                "line_height is NaN",
+                "NaN is the wire encoding for UNSET, so an unresolved pitch reached                  the layout call. Every gate here compares by bits and two NaNs are                  bit-equal, so nothing downstream would notice",
+            );
+        }
+        for (name, v) in [
+            ("line_height", self.line_height),
+            ("origin_x", self.origin_x),
+            ("origin_y", self.origin_y),
+            ("origin_z", self.origin_z),
+            ("z_step", self.z_step),
+            ("page_gap_x", self.page_gap_x),
+            ("band_stride_y", self.band_stride_y),
+            ("depth_per_band", self.depth_per_band),
+            ("depth_per_col", self.depth_per_col),
+            ("page_line_height", self.page_line_height),
+        ] {
+            if !v.is_finite() {
+                return bad(
+                    &format!("{name} is {v}"),
+                    "a non-finite measure propagates into every position it touches",
+                );
+            }
+        }
+        for (name, v) in [
+            ("wrap_width", self.wrap_width),
+            ("page_rows", self.page_rows),
+            ("page_cols", self.page_cols),
+            ("scroll_rows", self.scroll_rows),
+            ("pages_wide", self.pages_wide),
+        ] {
+            if v < 0 {
+                return bad(&format!("{name} is {v}"), "page geometry counts are non-negative");
+            }
+        }
+        Ok(())
+    }
+}
+
 // Status codes from ffi.mojo.
 const GE_OK: i32 = 0;
 const GE_NO_TRIE: i32 = 2;
@@ -284,6 +358,7 @@ impl Engine {
     /// Run the pipeline for one text file. Results stay in the handle until
     /// the next load; pull them with [`Engine::records`].
     pub fn load_item(&mut self, bytes: &[u8], params: &ItemParams) -> Result<u64, EngineError> {
+        params.validate(0)?;
         let status = unsafe {
             glyph_engine_load_item(
                 self.handle,
@@ -336,6 +411,9 @@ impl Engine {
         let mut desc_words = vec![0u64; items.len() * (ITEM_DESC_SIZE / 8)];
         let desc_bytes: &mut [u8] = bytemuck::cast_slice_mut(&mut desc_words);
         for (i, (start, count, params)) in items.iter().enumerate() {
+            // Per item, and the error names WHICH — with a whole corpus in one
+            // arena, an unnamed refusal is unactionable.
+            params.validate(i)?;
             write_item_desc(
                 &mut desc_bytes[i * ITEM_DESC_SIZE..(i + 1) * ITEM_DESC_SIZE],
                 params,
@@ -389,5 +467,117 @@ impl Engine {
 impl Drop for Engine {
     fn drop(&mut self) {
         unsafe { glyph_engine_free(self.handle) }
+    }
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ok_params() -> ItemParams {
+        ItemParams { line_height: 1.2, ..Default::default() }
+    }
+
+    #[test]
+    fn a_stated_pitch_still_runs() {
+        // THE COUNTERFACTUAL FOR THE GUARD. Without this, `return Err(..)` at
+        // the top of validate() would pass every negative test below.
+        assert!(ok_params().validate(0).is_ok());
+    }
+
+    #[test]
+    fn zero_is_legal_a_degenerate_pitch_is_a_choice() {
+        // Every row on one baseline is a layout, not an omission. The reflex
+        // `if lh == 0.0 { default }` conflates them; we must not.
+        let p = ItemParams { line_height: 0.0, ..Default::default() };
+        assert!(p.validate(0).is_ok(), "zero pitch must be accepted, not defaulted");
+    }
+
+    #[test]
+    fn nan_pitch_is_refused_and_named_as_the_unset_encoding() {
+        let p = ItemParams { line_height: f64::NAN, ..Default::default() };
+        let e = p.validate(3).expect_err("NaN pitch must be refused");
+        assert_eq!(e.status, GE_BAD_PARAMS);
+        assert!(e.what.contains("item 3"), "must name the item: {}", e.what);
+        assert!(e.what.contains("line_height"), "must name the field: {}", e.what);
+        assert!(e.what.contains("UNSET"), "must say NaN means unset: {}", e.what);
+    }
+
+    #[test]
+    fn infinite_pitch_is_refused() {
+        for lh in [f64::INFINITY, f64::NEG_INFINITY] {
+            let p = ItemParams { line_height: lh, ..Default::default() };
+            assert!(p.validate(0).is_err(), "{lh} must be refused");
+        }
+    }
+
+    #[test]
+    fn every_measure_is_checked_not_just_the_pitch() {
+        // A non-finite anywhere propagates into positions. Walk them all so a
+        // newly added measure that skips validate() shows up as a gap here.
+        let mut n = 0;
+        for mutate in [
+            (|p: &mut ItemParams| p.origin_x = f64::NAN) as fn(&mut ItemParams),
+            |p: &mut ItemParams| p.origin_y = f64::INFINITY,
+            |p: &mut ItemParams| p.origin_z = f64::NAN,
+            |p: &mut ItemParams| p.z_step = f64::NAN,
+            |p: &mut ItemParams| p.page_gap_x = f64::NAN,
+            |p: &mut ItemParams| p.band_stride_y = f64::NAN,
+            |p: &mut ItemParams| p.depth_per_band = f64::NAN,
+            |p: &mut ItemParams| p.depth_per_col = f64::NAN,
+            |p: &mut ItemParams| p.page_line_height = f64::NAN,
+        ] {
+            let mut p = ok_params();
+            mutate(&mut p);
+            assert!(p.validate(0).is_err(), "a non-finite measure slipped through");
+            n += 1;
+        }
+        assert_eq!(n, 9, "the sweep must cover every f64 measure but the pitch");
+    }
+
+    #[test]
+    fn negative_page_geometry_is_refused() {
+        let mut n = 0;
+        for mutate in [
+            (|p: &mut ItemParams| p.wrap_width = -1) as fn(&mut ItemParams),
+            |p: &mut ItemParams| p.page_rows = -1,
+            |p: &mut ItemParams| p.page_cols = -1,
+            |p: &mut ItemParams| p.scroll_rows = -1,
+            |p: &mut ItemParams| p.pages_wide = -1,
+        ] {
+            let mut p = ok_params();
+            mutate(&mut p);
+            assert!(p.validate(0).is_err(), "a negative count slipped through");
+            n += 1;
+        }
+        assert_eq!(n, 5, "the sweep must cover every integer count");
+    }
+
+    /// The unit tests above prove `validate()` decides correctly; this proves it
+    /// is actually WIRED to the entry point. Without it the `?` in `load_item`
+    /// would be trusted by inspection, which is the habit this repo keeps
+    /// catching itself in. Uses a live engine + the real atlas trie.
+    #[test]
+    fn a_nan_pitch_cannot_reach_the_engine_through_load_item() {
+        let trie = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../assets/atlas/engine-trie.bin");
+        let mut eng = Engine::new();
+        eng.load_trie_file(&trie).expect("trie");
+
+        let good = ItemParams { line_height: 1.2, ..Default::default() };
+        assert!(eng.load_item(b"ab\ncd\n", &good).is_ok(), "the guard must not reject valid work");
+
+        let bad = ItemParams { line_height: f64::NAN, ..Default::default() };
+        let e = eng.load_item(b"ab\ncd\n", &bad).expect_err("NaN pitch must be refused AT the seam");
+        assert_eq!(e.status, GE_BAD_PARAMS, "must be the Rust-side refusal, not an engine status");
+        assert!(e.what.contains("UNSET"), "{}", e.what);
+    }
+
+    #[test]
+    fn the_default_params_are_themselves_valid() {
+        // repo.rs and main.rs both build on ..Default::default(); if the default
+        // were invalid every caller would fail at the seam.
+        assert!(ItemParams::default().validate(0).is_ok());
     }
 }

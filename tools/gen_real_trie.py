@@ -189,6 +189,52 @@ def main() -> int:
         if b == 0 and i != 0 and lookup(i << 8)["flags"] != 1:
             raise SystemExit("a blockIndex slot points at block 0 without FLAG_MISSING")
 
+    # ── exhaustive identity sweep: EVERY codepoint, source vs written blob ──
+    # Ported from the JS oracle's trie tests (glyph-pipeline.test.mjs rows 1-2),
+    # which had no counterpart on this side: no Mojo suite sweeps a codepoint
+    # range, and the fixture tries only ever contain the codepoints their
+    # fixture bytes happen to use. Two properties, and the second is the one
+    # that bites silently:
+    #
+    #   EXHAUSTIVE — every codepoint resolves through the WRITTEN blob to the
+    #                same GLYPH_ID and FLAGS the source table gives it.
+    #   NO ALIASING — no codepoint the source leaves unmapped comes back mapped.
+    #                 A dedup or block-index error does not throw; it hands out
+    #                 a PLAUSIBLE glyph for the wrong character, which is
+    #                 invisible in any rendering and in any bit-compare that
+    #                 only covers the codepoints a fixture happens to contain.
+    #
+    # Walked the way the engine walks it (two dependent loads through the blob
+    # we just built), compared against the source table read independently.
+    def src_entry(codepoint: int) -> tuple[int, int]:
+        blk = block_index[codepoint >> block_shift]
+        e = blocks_start + (((blk << block_shift) | (codepoint & 0xFF)) * 4)
+        return cp[e + 0], cp[e + 3]           # GLYPH_ID, FLAGS from codepoints.bin
+
+    swept_cp = 0
+    for codepoint in range(0x110000):
+        got = lookup(codepoint)
+        want_gid, want_flags = src_entry(codepoint)
+        if got["glyphId"] != want_gid or got["flags"] != want_flags:
+            raise SystemExit(
+                f"identity sweep: U+{codepoint:04X} resolves to gid={got['glyphId']} "
+                f"flags={got['flags']} but the source table says gid={want_gid} "
+                f"flags={want_flags}")
+        swept_cp += 1
+    # NO SEPARATE ALIASING COUNTER, deliberately. The JS original checks
+    # no-aliasing against an INDEPENDENT source map, where it is a real second
+    # property. Here the source of truth IS this table, so the identity
+    # comparison above subsumes it: if the source says missing (gid 0) and
+    # identity holds, the blob returned 0 too. I wrote the counter anyway, then
+    # disabled it and watched the sweep stay green — it could not fire. Removed
+    # rather than left standing, because a second assertion that cannot add
+    # anything reads like twice the coverage.
+    if swept_cp != 0x110000:
+        raise SystemExit(f"identity sweep is vacuous — only {swept_cp} codepoints walked")
+    mapped_now = sum(1 for c in range(0x110000) if not (src_entry(c)[1] & 1))
+    print(f"[verify] identity sweep: all {swept_cp} codepoints agree with the source "
+          f"table ({mapped_now} mapped)")
+
     # ── domain sweep: the conversion over its WHOLE input range ─────────────
     # The atlas cannot certify this function. Measured 2026-09-02: across all
     # 7168 entries the trie carries THREE distinct font-unit values (advance
