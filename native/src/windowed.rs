@@ -17,8 +17,18 @@
 //! runtime gives exact pre-K behavior). egui sees every window event FIRST;
 //! scene input routing only handles events egui did not consume. Per frame,
 //! after the scene pass on the SAME encoder, an egui pass (LoadOp::Load, no
-//! depth attachment) paints the tessellated UI onto the surface. K1 ships the
-//! plumbing with an EMPTY CentralPanel — no widgets yet.
+//! depth attachment) paints the tessellated UI onto the surface. K1 shipped
+//! the plumbing with an EMPTY CentralPanel. K2 input-consumption rules:
+//!   - keys route only when egui hasn't consumed them (a focused egui widget
+//!     swallows keys — typing WASD/h/g/t/x in a text field must not fly the
+//!     camera or fire verbs; Tab is always egui's);
+//!   - right-press grab and left-click pick route only when egui doesn't
+//!     want the pointer (hovering a panel counts); right-RELEASE always
+//!     ungrabs (consumed releases must not latch the grab);
+//!   - cursor bookkeeping always updates; scene cursor effects (look
+//!     fallback, grabbed-group drags) skip while egui wants the pointer;
+//!   - the moment egui wants ANY input, the look-grab is released (checked
+//!     per frame in render()); it re-acquires once the pointer leaves egui.
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -122,6 +132,25 @@ impl WindowState {
         self.grabbed = false;
     }
 
+    /// Stage K (K2): does egui currently want the pointer (hovering a panel,
+    /// or mid-drag of a widget)? Feature off / `--no-ui`: never.
+    /// `EventResponse.consumed` for CursorMoved only covers the mid-drag
+    /// case (`egui_is_using_pointer`); this query additionally covers hover,
+    /// so scene cursor effects (grabbed-group drags) don't track the pointer
+    /// across egui windows.
+    fn egui_wants_pointer(&self) -> bool {
+        #[cfg(feature = "egui-ui")]
+        {
+            self.egui
+                .as_ref()
+                .is_some_and(|e| e.ctx.egui_wants_pointer_input())
+        }
+        #[cfg(not(feature = "egui-ui"))]
+        {
+            false
+        }
+    }
+
     fn render(&mut self, ctx: &GpuContext) {
         // wgpu 30: get_current_texture returns a status enum instead of Result.
         use wgpu::CurrentSurfaceTexture as Cst;
@@ -168,6 +197,11 @@ impl WindowState {
         // scoped and dropped before we touch the encoder again.
         #[cfg(feature = "egui-ui")]
         let mut egui_textures_delta: Option<egui::TexturesDelta> = None;
+        // Stage K (K2): set inside the egui block (post-run_ui, so egui's
+        // focus/hover state is fresh for THIS frame); acted on after the
+        // borrow ends.
+        #[cfg(feature = "egui-ui")]
+        let mut egui_wants_input = false;
         #[cfg(feature = "egui-ui")]
         if let Some(egui) = self.egui.as_mut() {
             let raw_input = egui.state.take_egui_input(&self.window);
@@ -240,6 +274,23 @@ impl WindowState {
                 p.borrow().end_query(&mut encoder, q);
             }
             egui_textures_delta = Some(textures_delta);
+            egui_wants_input =
+                egui.ctx.egui_wants_pointer_input() || egui.ctx.egui_wants_keyboard_input();
+        }
+
+        // Stage K (K2): UI focus and the mouse-look grab cannot coexist —
+        // while grabbed, raw DeviceEvent deltas drive look and bypass egui
+        // entirely, and a hidden/confined pointer must never leave egui
+        // thinking it is being hovered. The moment egui wants input (pointer
+        // over a panel, or a focused widget), release the grab. Grab
+        // re-acquires normally once the pointer leaves egui's area
+        // (`egui_wants_pointer_input` is false again, so right-press routes
+        // to the scene). Mid-look-drags are NOT interrupted: while a button
+        // is down and the drag started outside egui, egui reports wanting
+        // nothing (see `egui_wants_pointer_input`'s `any_down` clause).
+        #[cfg(feature = "egui-ui")]
+        if egui_wants_input && self.grabbed {
+            self.ungrab();
         }
 
         // Stage H: resolve profiler queries before submit (see offscreen.rs).
@@ -470,6 +521,14 @@ impl ApplicationHandler for App<'_> {
                 state.scene.set_viewport(size.width, size.height);
             }
             WindowEvent::RedrawRequested => state.render(&self.ctx),
+            // Stage K (K2): right-RELEASE always ungrabs, even when egui
+            // consumed the event (e.g. the release landed on a panel).
+            // Otherwise a grab started outside a panel would latch on
+            // forever (the K1 ordering swallowed consumed releases). ungrab()
+            // is a no-op when not grabbed, so panel releases stay harmless.
+            WindowEvent::MouseInput { state: ElementState::Released, button: MouseButton::Right, .. } => {
+                state.ungrab();
+            }
             // Consumed by egui (e.g. click on a panel, typing in a focused
             // widget): never routed to the scene.
             _ if egui_consumed => {}
@@ -494,12 +553,10 @@ impl ApplicationHandler for App<'_> {
                 }
             }
             // Stage G: LEFT click picks (only while the pointer is NOT
-            // grabbed); RIGHT press grabs for mouse-look, release ungrabs.
+            // grabbed); RIGHT press grabs for mouse-look. (The release arm
+            // lives above the egui-consumed arm — see the K2 note there.)
             WindowEvent::MouseInput { state: ElementState::Pressed, button: MouseButton::Right, .. } => {
                 state.grab();
-            }
-            WindowEvent::MouseInput { state: ElementState::Released, button: MouseButton::Right, .. } => {
-                state.ungrab();
             }
             WindowEvent::MouseInput { state: ElementState::Pressed, button: MouseButton::Left, .. } => {
                 if !state.grabbed {
@@ -509,17 +566,28 @@ impl ApplicationHandler for App<'_> {
             }
             WindowEvent::CursorMoved { position, .. } => {
                 let (px, py) = (position.x as f32, position.y as f32);
+                // Stage K (K2): cursor POSITION bookkeeping always updates
+                // (click picks read it), but scene cursor effects route only
+                // while egui doesn't want the pointer — hovering an egui
+                // window included (EventResponse.consumed for CursorMoved
+                // covers only mid-widget-drag, not hover). This stops a
+                // g-grabbed group from tracking the pointer across panels.
+                let route_to_scene = !state.egui_wants_pointer();
                 // Fallback look path: while grabbed, if no raw DeviceEvent
                 // deltas have ever arrived this grab (dead device-delta
                 // environments), drive look from cursor movement instead.
-                if state.grabbed && !state.saw_device_delta {
+                // Mid-look-drag egui wants nothing (drag started outside
+                // it), so this still fires while grabbed over a panel.
+                if route_to_scene && state.grabbed && !state.saw_device_delta {
                     let (dx, dy) = (px - state.cursor.0, py - state.cursor.1);
                     if dx != 0.0 || dy != 0.0 {
                         state.scene.on_mouse_look(&self.ctx, dx, dy);
                     }
                 }
                 state.cursor = (px, py);
-                state.scene.on_cursor(&self.ctx, px, py);
+                if route_to_scene {
+                    state.scene.on_cursor(&self.ctx, px, py);
+                }
             }
             WindowEvent::MouseWheel { delta, .. } => {
                 let lines = match delta {
