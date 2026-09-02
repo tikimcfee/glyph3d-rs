@@ -24,6 +24,12 @@ pub struct GpuContext {
     /// Stage H: CPU-side scope times (e.g. the cull pass), merged into the
     /// profile summary. Written by scenes only when `profiler` is `Some`.
     pub cpu_scopes: RefCell<std::collections::BTreeMap<String, (f64, u64)>>,
+    /// Stage K: the device was created with INDIRECT_FIRST_INSTANCE. The GPU
+    /// cull's indirect draws carry `first_instance = chunk-local base`, and
+    /// WebGPU only honors a nonzero first_instance in an indirect draw under
+    /// this feature — wgpu's indirect-validation pass zeroes the draw
+    /// otherwise (the Stage F "Metal bug"; src/bin/mdi_probe.rs is the proof).
+    pub indirect_first_instance: bool,
 }
 
 /// Record one CPU scope sample (ms) — no-op semantics live at the call site
@@ -140,20 +146,33 @@ pub async fn init(compatible_surface: Option<&wgpu::Surface<'_>>) -> GpuContext 
         ..Default::default()
     };
 
-    // Stage F: multi_draw_indirect is CORE in wgpu 30 (per-chunk indirect
-    // draws for the cull pass need no feature gate). Log the count variant
-    // for diagnostics only — the fixed-slot args scheme doesn't use it.
+    let adapter_features = adapter.features();
+    let mut required_features = wgpu::Features::empty();
+
+    // Stage K: multi_draw_indirect is core in wgpu 30 (Metal emulates it as a
+    // loop of single indirect draws; the _COUNT variant is unimplemented
+    // there — gfx-rs/wgpu#2148 — so the cull uses fixed slots with
+    // zero-instance padding and never needs it). The feature that matters is
+    // INDIRECT_FIRST_INSTANCE: without it WebGPU makes every indirect draw
+    // with first_instance != 0 a no-op, and wgpu's indirect-validation pass
+    // enforces exactly that. Stage F requested Features::empty() and read the
+    // resulting silence as a Metal bug. Request it whenever the adapter has
+    // it; GlyphScene keeps the CPU cull where it doesn't.
+    let indirect_first_instance =
+        adapter_features.contains(wgpu::Features::INDIRECT_FIRST_INSTANCE);
+    if indirect_first_instance {
+        required_features |= wgpu::Features::INDIRECT_FIRST_INSTANCE;
+    }
     log::info!(
-        "adapter features: MULTI_DRAW_INDIRECT_COUNT={}",
-        adapter.features().contains(wgpu::Features::MULTI_DRAW_INDIRECT_COUNT)
+        "adapter features: INDIRECT_FIRST_INSTANCE={} MULTI_DRAW_INDIRECT_COUNT={}",
+        indirect_first_instance,
+        adapter_features.contains(wgpu::Features::MULTI_DRAW_INDIRECT_COUNT)
     );
 
     // Stage H: opt-in profiling. Request TIMESTAMP_QUERY (+ INSIDE_PASSES for
     // nested in-pass scopes) ONLY when GLYPH_PROFILE=1 and the adapter
     // supports it; a missing feature must never break a render.
     let profile_wanted = std::env::var_os("GLYPH_PROFILE").is_some();
-    let adapter_features = adapter.features();
-    let mut required_features = wgpu::Features::empty();
     let profiling_supported = profile_wanted
         && adapter_features.contains(wgpu::Features::TIMESTAMP_QUERY);
     if profile_wanted {
@@ -221,5 +240,39 @@ pub async fn init(compatible_surface: Option<&wgpu::Surface<'_>>) -> GpuContext 
         queue,
         profiler,
         cpu_scopes: RefCell::new(std::collections::BTreeMap::new()),
+        indirect_first_instance,
     }
+}
+
+/// Stage K: synchronous readback of `size` bytes at `offset` of `src` —
+/// debug/verification paths only (it blocks until the GPU has drained).
+/// Shared by the GLYPH_G_DUMP instance dump and `--cull-verify`.
+pub fn read_buffer(ctx: &GpuContext, src: &wgpu::Buffer, offset: u64, size: u64) -> Vec<u8> {
+    let buf = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("readback"),
+        size,
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    });
+    let mut enc = ctx.device.create_command_encoder(&Default::default());
+    enc.copy_buffer_to_buffer(src, offset, &buf, 0, size);
+    ctx.queue.submit([enc.finish()]);
+    let slice = buf.slice(..);
+    let (tx, rx) = std::sync::mpsc::channel();
+    slice.map_async(wgpu::MapMode::Read, move |r| {
+        let _ = tx.send(r);
+    });
+    ctx.device
+        .poll(wgpu::PollType::Wait {
+            submission_index: None,
+            timeout: None,
+        })
+        .expect("readback poll failed");
+    rx.recv().expect("readback callback dropped").expect("readback map failed");
+    let data = slice
+        .get_mapped_range()
+        .expect("readback range not mapped")
+        .to_vec();
+    buf.unmap();
+    data
 }

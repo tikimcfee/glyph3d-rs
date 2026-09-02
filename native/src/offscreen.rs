@@ -18,7 +18,8 @@ pub fn run(
     path: &Path,
     frames: u32,
     zoom: f32,
-    cull: bool,
+    cull: crate::glyph_scene::CullMode,
+    cull_verify: bool,
     ops: &[Op],
 ) {
     let device = &ctx.device;
@@ -242,4 +243,21 @@ pub fn run(
         );
     }
     println!("wrote {}", path.display());
+
+    // Stage K: GPU-cull parity check on the LAST frame's args (the indirect
+    // buffers hold that frame's cull; the camera is re-derived for its t).
+    if cull_verify {
+        let t_last = (frames - 1) as f32 / 60.0;
+        match scene.debug_cull_verify(ctx, size.width, size.height, t_last) {
+            Some(Ok(line)) => println!("{line}"),
+            Some(Err(report)) => {
+                println!("{report}");
+                std::process::exit(1);
+            }
+            None => {
+                println!("cull-verify: no GPU cull in this run (cull path {cull:?}) — nothing to verify");
+                std::process::exit(1);
+            }
+        }
+    }
 }

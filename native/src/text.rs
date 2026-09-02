@@ -89,7 +89,8 @@ fn cover_segment(instances: &[GlyphInstance], min: [f32; 2], max: [f32; 2]) -> S
         max,
         slot_base: 0,
         slot_count: instances.len() as u32,
-        _pad: [0.0; 2],
+        flags: 0,
+        _pad: 0,
         tint: seg_tint(instances, max[0] - min[0], max[1] - min[1]),
     }
 }

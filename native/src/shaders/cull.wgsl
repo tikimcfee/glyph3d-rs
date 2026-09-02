@@ -24,11 +24,14 @@
 //      legacy full draws); backdrop survivors are compacted CPU-side into
 //      the instance buffer below and drawn with ONE instanced draw.
 //
-// The original Stage F design ran this cull as a GPU compute pass feeding
-// indirect multi-draws. wgpu 30.0.1's Metal backend silently rasterizes
-// NOTHING for any indirect draw with first_instance != 0 (verified via
-// readback: args were correct), so the draws are CPU-issued. The backdrop
-// shader side is unchanged by that decision.
+// Stage K: the same cull also runs as a GPU compute pass (cull_gpu.wgsl)
+// that writes this file's backdrop list — stably compacted, segment order —
+// plus the indirect draw args for both streams; `--cull gpu` draws them with
+// draw_indirect / multi_draw_indirect, `--cull cpu` keeps the CPU-issued
+// draws. This shader is shared by both paths, unchanged. (Stage F had
+// abandoned the GPU design over indirect draws with first_instance != 0
+// rasterizing nothing — that was WebGPU's indirect-first-instance rule, not
+// Metal: the device simply never requested INDIRECT_FIRST_INSTANCE.)
 
 // 32 B — mirrors BackdropInst in glyph_scene.rs.
 struct BackdropInst {

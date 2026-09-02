@@ -65,6 +65,18 @@ pub trait SceneLike {
     /// Stage G debug: read back instance bytes at a global slot (partial-
     /// upload verification). Default no-op.
     fn debug_dump_instances(&self, _ctx: &GpuContext, _slot: u64, _out: &mut [u32]) {}
+    /// Stage K debug: GPU-cull parity — read the compute-written draw args
+    /// back and diff them against the CPU cull for the same frame. `None`
+    /// when the scene has no GPU cull; `Some(Err(report))` on divergence.
+    fn debug_cull_verify(
+        &self,
+        _ctx: &GpuContext,
+        _width: u32,
+        _height: u32,
+        _t: f32,
+    ) -> Option<Result<String, String>> {
+        None
+    }
 }
 
 /// Stress-test target: 1,000,000 instances, one draw call.

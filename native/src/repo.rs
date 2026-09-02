@@ -701,7 +701,8 @@ impl RepoLoad {
                     max: [v.offset[0] + v.width + 0.6, v.offset[1] + 0.75],
                     slot_base: v.slot_base as u32,
                     slot_count: v.slot_count as u32,
-                    _pad: [0.0; 2],
+                    flags: 0,
+                    _pad: 0,
                     tint: crate::glyph_scene::seg_tint(insts, v.width, v.height),
                 }
             })

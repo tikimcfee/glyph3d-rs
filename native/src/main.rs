@@ -16,6 +16,11 @@
 //!          layout assertions for the hand-mirrored WGSL lane maps.
 //! Stage I: glam 0.30 → 0.33 (byte-identical under the full A/B suite);
 //!          baseline views moved onto the immutable fixtures/baseline-view.txt.
+//! Stage K: GPU-driven culling — a compute pass classifies segments and
+//!          writes indirect draw args consumed by multi_draw_indirect
+//!          (`--cull auto|cpu|gpu|off`, `--cull-verify` diffs GPU vs CPU
+//!          decisions). Unblocked by requesting INDIRECT_FIRST_INSTANCE;
+//!          `mdi-probe` (src/bin) is the standing proof.
 //!
 //! Run modes:
 //!   (default) [--render-file <path>] [--copies N]
@@ -38,7 +43,7 @@ mod windowed;
 use std::path::{Path, PathBuf};
 
 use clap::{ArgAction, CommandFactory, FromArgMatches, Parser};
-use glyph_scene::{CameraMode, GlyphScene, PickCommand, Verb};
+use glyph_scene::{CameraMode, CullMode, GlyphScene, PickCommand, Verb};
 use gpu::GpuContext;
 use scene::{Scene, SceneLike};
 
@@ -103,7 +108,7 @@ pub fn build_scene(
     color_format: wgpu::TextureFormat,
     choice: &SceneChoice,
     camera_mode: CameraMode,
-    cull: bool,
+    cull: CullMode,
 ) -> Box<dyn SceneLike> {
     match choice {
         SceneChoice::Demo => Box::new(Scene::new(ctx, color_format)),
@@ -230,9 +235,18 @@ struct Cli {
     /// Stage E2: walk + engine + stage + stats, then exit (no GPU)
     #[arg(long)]
     repo_scan_only: bool,
-    /// Stage F: disable the cull/LOD pass (legacy per-chunk draws; debug/A-B)
+    /// Stage K: cull path — auto (GPU compute cull + indirect multi-draws
+    /// when the adapter has INDIRECT_FIRST_INSTANCE, else CPU), cpu, gpu, off
+    #[arg(long, value_name = "MODE", default_value = "auto", value_parser = ["auto", "cpu", "gpu", "off"])]
+    cull: String,
+    /// Stage F: disable the cull/LOD pass (legacy per-chunk draws; debug/A-B).
+    /// Same as `--cull off`
     #[arg(long)]
     no_cull: bool,
+    /// Stage K (offscreen): after the frames, read the GPU cull's draw args
+    /// back and diff them against the CPU cull; exit 1 on any divergence
+    #[arg(long)]
+    cull_verify: bool,
     /// Generate shell completions for SHELL and exit
     #[arg(long, value_name = "SHELL")]
     generate: Option<clap_complete::Shell>,
@@ -576,11 +590,44 @@ fn main() {
     // Device/queue/adapter init is shared by both modes (gpu::init).
     let ctx = pollster::block_on(gpu::init(None));
 
+    // Stage K: resolve the cull path against the device (auto → GPU only
+    // when INDIRECT_FIRST_INSTANCE was granted; see gpu.rs).
+    let cull_mode = resolve_cull_mode(&cli.cull, cli.no_cull, ctx.indirect_first_instance);
+    log::info!(
+        "cull path: {cull_mode:?} (--cull {}{})",
+        cli.cull,
+        if cli.no_cull { ", --no-cull" } else { "" }
+    );
+
     match cli.screenshot {
         Some(path) => offscreen::run(
-            &ctx, &choice, &path, cli.frames, cli.zoom, !cli.no_cull, &cli.ops,
+            &ctx, &choice, &path, cli.frames, cli.zoom, cull_mode, cli.cull_verify, &cli.ops,
         ),
-        None => windowed::run(ctx, &choice, !cli.no_cull, &cli.ops),
+        None => windowed::run(ctx, &choice, cull_mode, &cli.ops),
+    }
+}
+
+/// Stage K: `--cull` + `--no-cull` → CullMode. `gpu` on an adapter without
+/// INDIRECT_FIRST_INSTANCE is a hard error: its indirect draws would be spec
+/// no-ops (exactly the Stage F symptom), so refusing beats a silent blank
+/// frame. `--no-cull` wins over `--cull` (it predates it).
+fn resolve_cull_mode(flag: &str, no_cull: bool, indirect_first_instance: bool) -> CullMode {
+    if no_cull {
+        return CullMode::Off;
+    }
+    match flag {
+        "off" => CullMode::Off,
+        "cpu" => CullMode::Cpu,
+        "gpu" => {
+            assert!(
+                indirect_first_instance,
+                "--cull gpu: this adapter lacks INDIRECT_FIRST_INSTANCE, so indirect draws with first_instance != 0 would be spec no-ops — use --cull cpu"
+            );
+            CullMode::Gpu
+        }
+        "auto" if indirect_first_instance => CullMode::Gpu,
+        "auto" => CullMode::Cpu,
+        other => panic!("--cull: unknown mode {other:?} (clap should have rejected it)"),
     }
 }
 
@@ -622,7 +669,23 @@ mod cli_tests {
         assert!(cli.focus_file.is_none());
         assert!(!cli.repo_scan_only);
         assert!(!cli.no_cull);
+        assert_eq!(cli.cull, "auto");
+        assert!(!cli.cull_verify);
         assert!(cli.ops.is_empty());
+    }
+
+    /// Stage K: the cull flag parses, rejects unknown modes, and resolves
+    /// against the device feature the way the docs promise.
+    #[test]
+    fn cull_mode_flag_and_resolution() {
+        assert_eq!(parse(&["--cull", "gpu"]).cull, "gpu");
+        assert!(parse(&["--cull-verify"]).cull_verify);
+        assert!(try_parse(&["--cull", "fast"]).is_err(), "unknown cull mode must be rejected");
+        assert_eq!(resolve_cull_mode("auto", false, true), CullMode::Gpu);
+        assert_eq!(resolve_cull_mode("auto", false, false), CullMode::Cpu);
+        assert_eq!(resolve_cull_mode("cpu", false, true), CullMode::Cpu);
+        assert_eq!(resolve_cull_mode("off", false, true), CullMode::Off);
+        assert_eq!(resolve_cull_mode("gpu", true, true), CullMode::Off, "--no-cull wins");
     }
 
     #[test]

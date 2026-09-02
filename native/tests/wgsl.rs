@@ -32,7 +32,7 @@ fn all_wgsl_shaders_parse_and_validate() {
         .collect();
     assert_eq!(
         names,
-        ["cull.wgsl", "glyph_field.wgsl", "quad_field.wgsl"],
+        ["cull.wgsl", "cull_gpu.wgsl", "glyph_field.wgsl", "quad_field.wgsl"],
         "shader file set changed — update the test's expected list"
     );
 

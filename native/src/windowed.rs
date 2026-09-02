@@ -194,7 +194,7 @@ impl WindowState {
 struct App<'a> {
     ctx: GpuContext,
     choice: &'a SceneChoice,
-    cull: bool,
+    cull: crate::glyph_scene::CullMode,
     /// Stage G: scripted picks/verbs applied once at startup (smoke testing
     /// the same code path the windowed verbs use).
     ops: &'a [Op],
@@ -211,7 +211,7 @@ impl ApplicationHandler for App<'_> {
             event_loop
                 .create_window(
                     Window::default_attributes()
-                        .with_title("glyph3d-native — Stage F (fly camera + GPU cull/LOD)")
+                        .with_title("glyph3d-native — Stage K (fly camera + GPU cull → indirect multi-draw)")
                         .with_inner_size(winit::dpi::LogicalSize::new(1600.0, 1000.0)),
                 )
                 .expect("window creation failed"),
@@ -392,7 +392,7 @@ impl ApplicationHandler for App<'_> {
     }
 }
 
-pub fn run(ctx: GpuContext, choice: &SceneChoice, cull: bool, ops: &[Op]) {
+pub fn run(ctx: GpuContext, choice: &SceneChoice, cull: crate::glyph_scene::CullMode, ops: &[Op]) {
     let event_loop = EventLoop::new().expect("event loop creation failed");
     let mut app = App {
         ctx,

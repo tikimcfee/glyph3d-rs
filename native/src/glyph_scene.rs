@@ -1,7 +1,8 @@
 //! Stage C — glyph field scene: Slug pipeline, group table, text camera.
-//! Stage F — fly camera + two-level CPU culling with LOD backdrops (the GPU
-//! indirect-draw design is documented as broken-in-wgpu-30 below).
+//! Stage F — fly camera + two-level CPU culling with LOD backdrops.
 //! Stage G — CPU picking + live instance/group manipulation.
+//! Stage K — the same cull as a GPU compute pass driving indirect
+//!           multi-draws: the Stage F design, unblocked (see below).
 //!
 //! Mode-agnostic like `scene.rs`: windowed and offscreen both build one
 //! `GlyphScene` and call `render()` into their own target.
@@ -13,8 +14,8 @@
 //! the engine with the SAME ItemParams it was staged with — bit-identical by
 //! the Stage E2 verify discipline), the segment table already holds per-file
 //! world AABBs, and ~1.3k ray-AABB tests cost microseconds. A GPU ID pass
-//! would buy nothing at this scale and would re-enter the wgpu/Metal
-//! indirect-draw morass documented below. Resolution order:
+//! would buy nothing at this scale and would need a readback the rest of
+//! the pipeline never does. Resolution order:
 //!   screen px → ray (ANALYTIC, f64: camera basis + fov/aspect — never the
 //!   inverse of the f32 view-proj, whose near/far conditioning is fatal at
 //!   Fly's near=0.05/far≈1.7e6; see tools/repro_pick_oblique.py)
@@ -33,9 +34,11 @@
 //! ## Stage F cull/LOD contract (see shaders/cull.wgsl header for the backdrop side)
 //!
 //! The staged instances are partitioned into SEGMENTS (one per file in repo
-//! mode; a single cover segment for text scenes). Each frame, `cull_segments`
-//! (CPU, ~1.3k AABBs ≈ microseconds) tests each segment's world AABB against
-//! the frustum and its on-screen glyph size against LOD_MIN_PX, producing:
+//! mode; a single cover segment for text scenes). Each frame the cull —
+//! `cull_segments` on the CPU (~1.3k AABBs ≈ microseconds), or its Stage K
+//! compute twin (shaders/cull_gpu.wgsl) — tests each segment's world AABB
+//! against the frustum and its on-screen glyph size against LOD_MIN_PX,
+//! producing:
 //!   - per-chunk vertex-range draw lists for visible segments
 //!     (`pass.draw(0..6, base..base+count)` — instance_index stays
 //!     chunk-local, exactly like the legacy per-chunk draws), and
@@ -45,15 +48,39 @@
 //! Culling is visually lossless: a culled segment is entirely outside the
 //! frustum, and the LOD tier only substitutes subpixel glyphs.
 //!
-//! WHY CPU + DIRECT DRAWS: the original Stage F design was the standard
-//! WebGPU pattern (compute cull pass → indirect multi-draws). It is
-//! empirically BROKEN in wgpu 30.0.1's Metal backend: any indirect draw with
-//! `first_instance != 0` rasterizes nothing (verified via GLYPH_CULL_DEBUG
-//! readbacks — args correct — plus per-chunk/per-offset A/Bs; draws with
-//! first_instance = 0 work, nonzero never do, through the indirect-validation
-//! batcher). 1,305 tiny CPU AABB tests + direct range draws are ~free, fully
-//! deterministic, and need no indirect machinery. The GPU compute path can
-//! be revisited after a wgpu upgrade.
+//! ## Stage K — GPU cull → indirect multi-draw (`--cull gpu`; the default
+//! wherever the adapter has INDIRECT_FIRST_INSTANCE)
+//!
+//! The Stage F original design, revived: three compute dispatches classify
+//! every segment, write one DrawIndirectArgs per STATIC (segment, chunk)
+//! draw slot — `first_instance` = chunk-local base, zero instances when
+//! culled — and stably compact the backdrop quads plus their own draw args;
+//! render() then issues ONE multi_draw_indirect per chunk and one
+//! draw_indirect for the backdrops. Nothing is read back; the CPU never
+//! decides visibility. Slot order == the CPU path's draw order, so the two
+//! paths blend identically (`--cull-verify` diffs the GPU args against
+//! `cull_segments` frame-for-frame; tools/check-mdi.sh byte-compares the
+//! renders).
+//!
+//! WHAT ACTUALLY BLOCKED STAGE F: not Metal. WebGPU's "indirect-first-
+//! instance" rule — an indirect draw with first_instance != 0 is a no-op
+//! unless the device was created with Features::INDIRECT_FIRST_INSTANCE —
+//! is enforced by wgpu's indirect-validation compute pass, which rewrites
+//! offending draws to zero instances in ITS OWN copy of the args (hence
+//! "readbacks showed correct args, nothing drew"). gpu.rs requested
+//! Features::empty(); Metal has advertised the feature all along.
+//! src/bin/mdi_probe.rs is the standing proof (3 device configs × 9 draw
+//! forms, readback-graded, run by `cargo test`).
+//!
+//! METAL COST MODEL: wgpu-hal emulates multi_draw_indirect on Metal as a
+//! loop of single indirect draws and cannot implement the _COUNT variant
+//! (no draw-count-buffer concept; Indirect Command Buffers would be needed —
+//! gfx-rs/wgpu#2148). So the GPU path's ENCODE cost is O(segments) tiny
+//! draw calls per frame while its GPU cost is O(visible); the CPU path's
+//! encode cost is O(visible) draws plus the cull itself. GLYPH_PROFILE=1
+//! reports both ("cull (GPU)" pass, "pass end (CPU)" encode scope);
+//! out/STAGE_K_REPORT.md has the numbers. `--cull cpu` keeps the Stage F
+//! path (byte-identical output); `--cull off` the legacy full draws.
 
 use bytemuck::{Pod, Zeroable};
 use glam::{DVec3, Mat4, Vec3};
@@ -240,25 +267,33 @@ struct PickCacheEntry {
     slot_of: Vec<u32>,
 }
 
-/// Stage F — per-segment cull record, 48 B, mirrors `SegCull` in cull.wgsl
-/// (vec4 alignment: the `_pad` lane keeps `tint` at offset 32 on both sides).
-/// One segment per FILE in repo mode; text scenes stage a single segment
-/// covering the whole block. Bounds are WORLD-space xy with the group offset
-/// already applied; all instances live in the z=0 plane (the cull pass tests
-/// z ∈ [-1, 1] as a margin).
+/// Stage F — per-segment cull record, 48 B, mirrors `SegCull` in
+/// cull_gpu.wgsl (vec4 alignment: the flags/_pad lanes keep `tint` at offset
+/// 32 on both sides; encase-asserted in `layout_tests`). One segment per
+/// FILE in repo mode; text scenes stage a single segment covering the whole
+/// block. Bounds are WORLD-space xy with the group offset already applied;
+/// all instances live in the z=0 plane (the cull tests z ∈ [-1, 1] as a
+/// margin). Stage K: the table is uploaded as-is to the GPU cull and is the
+/// single source of truth for both cull paths (hidden = SEG_HIDDEN).
 #[repr(C)]
-#[derive(Clone, Copy, Pod, Zeroable)]
+#[derive(Clone, Copy, Pod, Zeroable, encase::ShaderType)]
 pub struct SegCull {
     pub min: [f32; 2],
     pub max: [f32; 2],
     pub slot_base: u32,
     pub slot_count: u32,
-    pub _pad: [f32; 2],
+    /// Stage K: bit0 = SEG_HIDDEN (Stage G hide-group verb).
+    pub flags: u32,
+    pub _pad: u32,
     /// rgb = mean LINEAR ink color (sRGB bytes pow-2.2 decoded at staging);
     /// w = effective per-pixel ink coverage E at deep minification
     /// (`ink_frac × BACKDROP_GAIN`, clamped to 1) — the backdrop alpha.
     pub tint: [f32; 4],
 }
+
+/// Stage K: `SegCull::flags` bit — the group is hidden; both cull paths skip
+/// the segment entirely (no glyph draw, no backdrop).
+pub const SEG_HIDDEN: u32 = 1;
 
 /// Stage F — world cell footprint used for ink-density estimates: em advance
 /// 1229/2320 ≈ 0.53 world units × 1.25 line pitch. Approximation only; it
@@ -319,16 +354,276 @@ struct BackdropInst {
     rgba: [f32; 4],
 }
 
+/// Stage K — which cull path a scene runs. `Off` = the legacy per-chunk
+/// full draws (`--no-cull`); `Cpu` = Stage F (`cull_segments` + direct range
+/// draws); `Gpu` = the compute cull driving indirect multi-draws.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum CullMode {
+    Off,
+    Cpu,
+    Gpu,
+}
+
+/// Stage K — one static (segment, chunk) draw slot, 16 B, mirrors `DrawSlot`
+/// in cull_gpu.wgsl. `base`/`count` are chunk-local instance indices.
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable, encase::ShaderType)]
+struct DrawSlot {
+    seg: u32,
+    base: u32,
+    count: u32,
+    _pad: u32,
+}
+
+/// Stage K — per-frame cull uniform, 128 B, mirrors `CullParams` in
+/// cull_gpu.wgsl (planes = the `frustum_planes` output; eye/px_scale = the
+/// values `cull_segments` receives, so the two paths see identical inputs).
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable, encase::ShaderType)]
+struct CullParams {
+    planes: [[f32; 4]; 6],
+    eye: [f32; 3],
+    px_scale: f32,
+    lod_min_px: f32,
+    seg_count: u32,
+    slot_count: u32,
+    _pad: u32,
+}
+
+/// Stage K — what `CullState` needs to know about the arena to build the
+/// static draw-slot table, plus which path to build.
+struct CullBuild {
+    chunk_cap: u32,
+    chunk_count: u32,
+    mode: CullMode,
+}
+
+/// Stage K — the GPU cull: the segment table and the static draw-slot table
+/// on the GPU, the three compute pipelines, and the indirect-args buffers
+/// the render pass consumes. cull_gpu.wgsl carries the pass contract.
+struct GpuCull {
+    /// seg_count × 48 B — the SegCull table (edits mirror single rows).
+    seg_buf: wgpu::Buffer,
+    params_buf: wgpu::Buffer,
+    /// slot_count × 16 B — one DrawIndirectArgs per draw slot.
+    args_buf: wgpu::Buffer,
+    /// 16 B — DrawIndirectArgs for the compacted backdrop stream.
+    backdrop_args_buf: wgpu::Buffer,
+    /// Per chunk: (first slot, slot count) — render() issues exactly one
+    /// multi_draw_indirect over this range per chunk.
+    slot_ranges: Vec<(u32, u32)>,
+    /// CPU copy of the slot table (`--cull-verify` decodes the args by it).
+    slots: Vec<DrawSlot>,
+    classify: wgpu::ComputePipeline,
+    draw_args: wgpu::ComputePipeline,
+    compact: wgpu::ComputePipeline,
+    bind_group: wgpu::BindGroup,
+}
+
+fn compute_buffer_entry(binding: u32, ty: wgpu::BufferBindingType) -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::COMPUTE,
+        ty: wgpu::BindingType::Buffer {
+            ty,
+            has_dynamic_offset: false,
+            min_binding_size: None,
+        },
+        count: None,
+    }
+}
+
+impl GpuCull {
+    /// The static slot table, walked exactly the way `cull_segments` walks
+    /// segments: per chunk, in segment order, one slot per intersection —
+    /// so slot order IS the CPU path's draw order.
+    fn build_slots(
+        segments: &[SegCull],
+        chunk_cap: u32,
+        chunk_count: u32,
+    ) -> (Vec<DrawSlot>, Vec<(u32, u32)>) {
+        let mut slots = Vec::new();
+        let mut ranges = Vec::with_capacity(chunk_count as usize);
+        for c in 0..chunk_count {
+            let first = slots.len() as u32;
+            let c_lo = c * chunk_cap;
+            for (si, seg) in segments.iter().enumerate() {
+                let slot_end = seg.slot_base + seg.slot_count;
+                let lo = seg.slot_base.max(c_lo);
+                let hi = slot_end.min(c_lo + chunk_cap);
+                if hi > lo {
+                    slots.push(DrawSlot {
+                        seg: si as u32,
+                        base: lo - c_lo,
+                        count: hi - lo,
+                        _pad: 0,
+                    });
+                }
+            }
+            ranges.push((first, slots.len() as u32 - first));
+        }
+        (slots, ranges)
+    }
+
+    fn new(
+        ctx: &GpuContext,
+        segments: &[SegCull],
+        backdrop_insts_buf: &wgpu::Buffer,
+        chunk_cap: u32,
+        chunk_count: u32,
+    ) -> Self {
+        let device = &ctx.device;
+        let (slots, slot_ranges) = Self::build_slots(segments, chunk_cap, chunk_count);
+        let seg_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("cull segments"),
+            contents: bytemuck::cast_slice(segments),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        });
+        let params_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("cull params"),
+            size: std::mem::size_of::<CullParams>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let seg_mode_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("cull segment modes"),
+            size: (segments.len().max(1) * 4) as u64,
+            usage: wgpu::BufferUsages::STORAGE,
+            mapped_at_creation: false,
+        });
+        // Never bind an empty slot table: one zeroed entry, and the uniform's
+        // slot_count (0) keeps the shader from touching it.
+        let mut slots_upload = slots.clone();
+        if slots_upload.is_empty() {
+            slots_upload.push(DrawSlot::zeroed());
+        }
+        let draw_slots_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("cull draw slots"),
+            contents: bytemuck::cast_slice(&slots_upload),
+            usage: wgpu::BufferUsages::STORAGE,
+        });
+        let args_size = std::mem::size_of::<wgpu::util::DrawIndirectArgs>() as u64;
+        let args_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("cull draw args"),
+            size: slots_upload.len() as u64 * args_size,
+            usage: wgpu::BufferUsages::INDIRECT
+                | wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let backdrop_args_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("backdrop draw args"),
+            size: args_size,
+            usage: wgpu::BufferUsages::INDIRECT
+                | wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("cull_gpu.wgsl"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("shaders/cull_gpu.wgsl").into()),
+        });
+        let ro = wgpu::BufferBindingType::Storage { read_only: true };
+        let rw = wgpu::BufferBindingType::Storage { read_only: false };
+        let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("cull (GPU) bgl"),
+            entries: &[
+                compute_buffer_entry(0, wgpu::BufferBindingType::Uniform),
+                compute_buffer_entry(1, ro),
+                compute_buffer_entry(2, rw),
+                compute_buffer_entry(3, ro),
+                compute_buffer_entry(4, rw),
+                compute_buffer_entry(5, rw),
+                compute_buffer_entry(6, rw),
+            ],
+        });
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("cull (GPU) bg"),
+            layout: &bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: params_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: seg_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: seg_mode_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: draw_slots_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: args_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: backdrop_insts_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: backdrop_args_buf.as_entire_binding(),
+                },
+            ],
+        });
+        let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("cull (GPU) pl"),
+            bind_group_layouts: &[Some(&bgl)],
+            immediate_size: 0,
+        });
+        let pipeline = |label: &str, entry: &str| {
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some(label),
+                layout: Some(&layout),
+                module: &shader,
+                entry_point: Some(entry),
+                compilation_options: Default::default(),
+                cache: None,
+            })
+        };
+        let classify = pipeline("cull classify", "cs_classify");
+        let draw_args = pipeline("cull draw args", "cs_draw_args");
+        let compact = pipeline("cull backdrop compact", "cs_backdrop_compact");
+        log::info!(
+            "cull (GPU): {} segments → {} draw slots over {} chunk(s) | segment table {} B, draw args {} B (multi_draw_indirect per chunk, draw_indirect for backdrops)",
+            segments.len(),
+            slots.len(),
+            chunk_count,
+            std::mem::size_of_val(segments),
+            slots_upload.len() as u64 * args_size,
+        );
+
+        Self {
+            seg_buf,
+            params_buf,
+            args_buf,
+            backdrop_args_buf,
+            slot_ranges,
+            slots,
+            classify,
+            draw_args,
+            compact,
+            bind_group,
+        }
+    }
+}
+
 /// Stage F — CPU cull: frustum + LOD over the segment table. Returns the
 /// glyph draw list (chunk, chunk_local_base, count — in arena order per
 /// chunk, so blending matches the legacy full draws exactly) and the
-/// compacted backdrop list. See the module header for the contract and for
-/// why this runs on the CPU. Stage G: `hidden` (parallel to `segments`,
-/// empty = nothing hidden) skips user-hidden groups entirely — no glyph
-/// draws AND no backdrop.
+/// compacted backdrop list. See the module header for the contract. Stage G:
+/// SEG_HIDDEN segments are skipped entirely — no glyph draws AND no
+/// backdrop. Stage K: this is also the REFERENCE for the GPU cull —
+/// cull_gpu.wgsl mirrors these tests operand-for-operand and `--cull-verify`
+/// diffs the two.
 fn cull_segments(
     segments: &[SegCull],
-    hidden: &[bool],
     planes: &[[f32; 4]; 6],
     eye: Vec3,
     px_scale: f32,
@@ -338,8 +633,8 @@ fn cull_segments(
     let mut draws: Vec<Vec<std::ops::Range<u32>>> =
         (0..chunk_count).map(|_| Vec::new()).collect();
     let mut backdrops = Vec::new();
-    for (si, seg) in segments.iter().enumerate() {
-        if hidden.get(si).copied().unwrap_or(false) {
+    for seg in segments {
+        if seg.flags & SEG_HIDDEN != 0 {
             continue;
         }
         // Frustum: positive-vertex test per plane; z margin ±1 (z=0 plane).
@@ -541,11 +836,10 @@ struct CamFrame {
     eye: Vec3,
 }
 
-/// Stage F — the cull/LOD subsystem. The per-frame segment cull itself runs
-/// on the CPU (`cull_segments`, ~1.3k AABB tests ≈ microseconds — see the
-/// module header for why the GPU-indirect design was abandoned); what remains
-/// here is the far-LOD BACKDROP stream: a CPU-compacted quad list uploaded
-/// per frame plus the flat-tint pipeline drawing it.
+/// Stage F — the cull/LOD subsystem: the CPU segment table, the far-LOD
+/// BACKDROP stream (quad list + the flat-tint pipeline drawing it) and,
+/// Stage K, the optional GPU cull that fills the quad list and the indirect
+/// draw args on the GPU instead of `cull_segments` doing it per frame.
 struct CullState {
     /// CPU copy of the segment table (the per-frame cull input).
     segments: Vec<SegCull>,
@@ -558,11 +852,13 @@ struct CullState {
     /// Group color rgb at staging time — tint edits scale the backdrop by
     /// pow(new)/pow(orig) so an untouched segment keeps its Stage F tint.
     orig_group_rgb: Vec<[f32; 3]>,
-    hidden: Vec<bool>,
-    /// seg_count × 32 B staging target for the per-frame backdrop list.
+    /// seg_count × 32 B backdrop list: written by `queue.write_buffer` on
+    /// the CPU path, by cs_backdrop_compact on the GPU path.
     backdrop_insts_buf: wgpu::Buffer,
     backdrop_pipeline: wgpu::RenderPipeline,
     backdrop_bind_group: wgpu::BindGroup,
+    /// Stage K: present in `CullMode::Gpu`.
+    gpu: Option<GpuCull>,
 }
 
 impl CullState {
@@ -573,6 +869,7 @@ impl CullState {
         camera_buf: &wgpu::Buffer,
         segments: &[SegCull],
         groups: &[GroupRow],
+        arena: CullBuild,
     ) -> Self {
         let device = &ctx.device;
         let seg_count = segments.len() as u32;
@@ -602,12 +899,16 @@ impl CullState {
         let backdrop_insts_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("backdrop instances"),
             size: (seg_count.max(1) * 32) as u64,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            // Stage K: COPY_SRC for the --cull-verify readback.
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
         log::info!(
-            "cull: {} segments (CPU frustum+LOD) | backdrop buffer {} B (KB-scale, no instance-sized buffers added)",
+            "cull: {} segments ({:?} frustum+LOD) | backdrop buffer {} B (KB-scale, no instance-sized buffers added)",
             seg_count,
+            arena.mode,
             seg_count * 32,
         );
 
@@ -713,16 +1014,28 @@ impl CullState {
             cache: None,
         });
 
+        // Stage K: the GPU twin shares the backdrop buffer (it writes the
+        // compacted list the same vs_backdrop reads).
+        let gpu = (arena.mode == CullMode::Gpu).then(|| {
+            GpuCull::new(
+                ctx,
+                segments,
+                &backdrop_insts_buf,
+                arena.chunk_cap,
+                arena.chunk_count,
+            )
+        });
+
         Self {
             segments: segments.to_vec(),
             local_min,
             local_max,
             base_tint,
             orig_group_rgb,
-            hidden: vec![false; segments.len()],
             backdrop_insts_buf,
             backdrop_pipeline,
             backdrop_bind_group,
+            gpu,
         }
     }
 }
@@ -790,7 +1103,7 @@ impl GlyphScene {
         atlas: &Atlas,
         staged: StagedText,
         camera_mode: CameraMode,
-        cull_enabled: bool,
+        cull_mode: CullMode,
     ) -> Self {
         let device = &ctx.device;
 
@@ -817,7 +1130,19 @@ impl GlyphScene {
 
         // Chunk the arena so no storage BUFFER exceeds the binding limit.
         let binding_limit = ctx.device.limits().max_storage_buffer_binding_size as usize;
-        let chunk_cap = (binding_limit / std::mem::size_of::<GlyphInstance>()).max(1);
+        let mut chunk_cap = (binding_limit / std::mem::size_of::<GlyphInstance>()).max(1);
+        // Stage K: debug lever — GLYPH_CHUNK_CAP=<n> forces small arena chunks
+        // so the fixture repo exercises the multi-chunk slot split of both
+        // cull paths (the 4 GB repo needs 2 chunks; the fixtures fit in 1).
+        if let Some(v) = std::env::var_os("GLYPH_CHUNK_CAP") {
+            let forced: usize = v
+                .to_string_lossy()
+                .trim()
+                .parse()
+                .expect("GLYPH_CHUNK_CAP must be a positive integer");
+            chunk_cap = chunk_cap.min(forced.max(1));
+            log::info!("GLYPH_CHUNK_CAP: arena chunk cap forced to {chunk_cap} instances");
+        }
         let chunks: Vec<&[GlyphInstance]> = instances.chunks(chunk_cap).collect();
         let chunk_counts: Vec<u32> = chunks.iter().map(|c| c.len() as u32).collect();
         let instance_bufs: Vec<wgpu::Buffer> = chunks
@@ -1076,7 +1401,8 @@ impl GlyphScene {
                 max: [staged.bounds_max[0], staged.bounds_max[1]],
                 slot_base: 0,
                 slot_count: instances.len() as u32,
-                _pad: [0.0; 2],
+                flags: 0,
+                _pad: 0,
                 tint: seg_tint(
                     &instances,
                     staged.bounds_max[0] - staged.bounds_min[0],
@@ -1084,22 +1410,28 @@ impl GlyphScene {
                 ),
             });
         }
-        // multi_draw_indirect is core in wgpu 30 — but its Metal backend
-        // silently drops any indirect draw with first_instance != 0 (see the
-        // module header), so Stage F culls on the CPU instead; --no-cull
-        // keeps the legacy per-chunk full draws for A/B.
-        let cull = if cull_enabled {
-            Some(CullState::new(
+        // Stage K: `--cull gpu` runs the compute cull + indirect multi-draws,
+        // `--cull cpu` the Stage F CPU cull + direct range draws (identical
+        // output — module header); `--cull off` keeps the legacy per-chunk
+        // full draws for A/B.
+        let cull = match cull_mode {
+            CullMode::Off => {
+                log::info!("culling disabled (--cull off) — legacy per-chunk draws");
+                None
+            }
+            CullMode::Cpu | CullMode::Gpu => Some(CullState::new(
                 ctx,
                 color_format,
                 depth_format,
                 &camera_buf,
                 &segments,
                 &groups,
-            ))
-        } else {
-            log::info!("culling disabled (--no-cull) — legacy per-chunk draws");
-            None
+                CullBuild {
+                    chunk_cap: chunk_cap as u32,
+                    chunk_count: chunk_counts.len() as u32,
+                    mode: cull_mode,
+                },
+            )),
         };
 
         let pick = staged.pick;
@@ -1591,7 +1923,7 @@ impl GlyphScene {
     /// follows offset/scale, and the backdrop tint follows the group color
     /// relative to its as-staged value (so untouched segments keep their
     /// Stage F-fitted tint exactly).
-    fn sync_segment(&mut self, gid: u32) {
+    fn sync_segment(&mut self, ctx: &GpuContext, gid: u32) {
         let Some(g) = self.groups_cpu.get(gid as usize).copied() else {
             return;
         };
@@ -1619,6 +1951,132 @@ impl GlyphScene {
             *tc = (bt[c] * newc / oldc).min(1.0);
         }
         cull.segments[i].tint = t;
+        // Stage K: the GPU cull reads the segment table on the GPU — mirror
+        // the edited row (48 B) so the next frame's classify sees it.
+        if let Some(gpu) = &cull.gpu {
+            ctx.queue.write_buffer(
+                &gpu.seg_buf,
+                i as u64 * std::mem::size_of::<SegCull>() as u64,
+                bytemuck::bytes_of(&cull.segments[i]),
+            );
+        }
+    }
+
+    /// Stage K: parity check for the GPU cull. Reads the compute-written
+    /// draw args, backdrop args and backdrop instances back and diffs them
+    /// against `cull_segments` for the same camera frame. Exact equality is
+    /// the contract: same slots, same ranges, same order, same backdrop
+    /// bytes. `None` without a GPU cull; `Some(Err(report))` on divergence.
+    fn verify_cull(
+        &self,
+        ctx: &GpuContext,
+        width: u32,
+        height: u32,
+        t: f32,
+    ) -> Option<Result<String, String>> {
+        let cull = self.cull.as_ref()?;
+        let gpu = cull.gpu.as_ref()?;
+        let aspect = width as f32 / height.max(1) as f32;
+        let frame = self.camera_frame(t, aspect);
+        let px_scale = height as f32 / (2.0 * (FOV_Y.to_radians() * 0.5).tan());
+        let planes = frustum_planes(&frame.view_proj);
+        let chunk_count = self.bind_groups.len() as u32;
+        let (cpu_draws, cpu_backdrops) = cull_segments(
+            &cull.segments,
+            &planes,
+            frame.eye,
+            px_scale,
+            self.chunk_cap,
+            chunk_count,
+        );
+
+        let args_size = std::mem::size_of::<wgpu::util::DrawIndirectArgs>() as u64;
+        let args: Vec<wgpu::util::DrawIndirectArgs> = bytemuck::pod_collect_to_vec(
+            &crate::gpu::read_buffer(ctx, &gpu.args_buf, 0, gpu.slots.len().max(1) as u64 * args_size),
+        );
+        let backdrop_args: wgpu::util::DrawIndirectArgs = bytemuck::pod_read_unaligned(
+            &crate::gpu::read_buffer(ctx, &gpu.backdrop_args_buf, 0, args_size),
+        );
+
+        let mut issues: Vec<String> = Vec::new();
+        let mut gpu_draw_total = 0usize;
+        for (c, &(first, n)) in gpu.slot_ranges.iter().enumerate() {
+            let mut gpu_ranges: Vec<std::ops::Range<u32>> = Vec::new();
+            for i in first..first + n {
+                let a = args[i as usize];
+                if a.vertex_count != 6 || a.first_vertex != 0 {
+                    issues.push(format!(
+                        "chunk {c} slot {i}: malformed args vertex_count={} first_vertex={}",
+                        a.vertex_count, a.first_vertex
+                    ));
+                }
+                if a.instance_count > 0 {
+                    gpu_ranges.push(a.first_instance..a.first_instance + a.instance_count);
+                }
+            }
+            gpu_draw_total += gpu_ranges.len();
+            let cpu_ranges = &cpu_draws[c];
+            if gpu_ranges != *cpu_ranges {
+                let at = gpu_ranges
+                    .iter()
+                    .zip(cpu_ranges.iter())
+                    .position(|(g, p)| g != p)
+                    .unwrap_or(gpu_ranges.len().min(cpu_ranges.len()));
+                issues.push(format!(
+                    "chunk {c}: gpu {} draw ranges vs cpu {}; first divergence at draw #{at}: gpu {:?} cpu {:?}",
+                    gpu_ranges.len(),
+                    cpu_ranges.len(),
+                    gpu_ranges.get(at),
+                    cpu_ranges.get(at)
+                ));
+            }
+        }
+        if backdrop_args.vertex_count != 6
+            || backdrop_args.first_vertex != 0
+            || backdrop_args.first_instance != 0
+        {
+            issues.push(format!("backdrop args malformed: {backdrop_args:?}"));
+        }
+        let gpu_backdrops = backdrop_args.instance_count as usize;
+        let mut backdrop_bytes = "equal";
+        if gpu_backdrops != cpu_backdrops.len() {
+            issues.push(format!(
+                "backdrop count: gpu {gpu_backdrops} vs cpu {}",
+                cpu_backdrops.len()
+            ));
+            backdrop_bytes = "DIFFER";
+        } else if gpu_backdrops > 0 {
+            let inst_size = std::mem::size_of::<BackdropInst>();
+            let bytes = crate::gpu::read_buffer(
+                ctx,
+                &cull.backdrop_insts_buf,
+                0,
+                (gpu_backdrops * inst_size) as u64,
+            );
+            let cpu_bytes: &[u8] = bytemuck::cast_slice(&cpu_backdrops);
+            if bytes != cpu_bytes {
+                backdrop_bytes = "DIFFER";
+                let at = bytes
+                    .iter()
+                    .zip(cpu_bytes)
+                    .position(|(a, b)| a != b)
+                    .unwrap_or(0)
+                    / inst_size;
+                issues.push(format!("backdrop instances differ (first at index {at})"));
+            }
+        }
+        let cpu_draw_total: usize = cpu_draws.iter().map(|c| c.len()).sum();
+        let summary = format!(
+            "cull-verify: {} — glyph draws gpu {gpu_draw_total} vs cpu {cpu_draw_total} over {chunk_count} chunk(s) ({} slots), backdrops gpu {gpu_backdrops} vs cpu {} (bytes {backdrop_bytes})",
+            if issues.is_empty() { "EXACT" } else { "MISMATCH" },
+            gpu.slots.len(),
+            cpu_backdrops.len(),
+        );
+        Some(if issues.is_empty() {
+            Ok(summary)
+        } else {
+            Err(format!("{summary}\n  {}", issues.join("\n  ")))
+        })
     }
 
     /// Apply a manipulation verb to the current pick. All GPU writes are
@@ -1778,7 +2236,7 @@ impl GlyphScene {
                 g.cols[0][2] += d[2];
                 let off = [g.cols[0][0], g.cols[0][1], g.cols[0][2]];
                 self.write_group_row(ctx, gid);
-                self.sync_segment(gid);
+                self.sync_segment(ctx, gid);
                 format!(
                     "verb move-group: {rel} group {gid} offset -> ({:.1},{:.1},{:.1}) (80 B row)",
                     off[0], off[1], off[2]
@@ -1793,7 +2251,7 @@ impl GlyphScene {
                 }
                 let s = g.cols[3][0];
                 self.write_group_row(ctx, gid);
-                self.sync_segment(gid);
+                self.sync_segment(ctx, gid);
                 format!("verb scale-group: {rel} group {gid} scale -> {s:.3} (80 B row)")
             }
             Verb::TintGroup(rgb) => {
@@ -1804,7 +2262,7 @@ impl GlyphScene {
                 g.cols[2][1] = rgb[1];
                 g.cols[2][2] = rgb[2];
                 self.write_group_row(ctx, gid);
-                self.sync_segment(gid);
+                self.sync_segment(ctx, gid);
                 format!(
                     "verb tint-group: {rel} group {gid} tint -> ({:.2},{:.2},{:.2}) (80 B row)",
                     rgb[0], rgb[1], rgb[2]
@@ -1825,12 +2283,22 @@ impl GlyphScene {
                     return format!("verb hide/show: group {gid} out of range");
                 };
                 g.cols[2][3] = if *hide { 0.0 } else { 1.0 };
-                if let Some(cull) = &mut self.cull {
-                    if (gid as usize) < cull.hidden.len() {
-                        cull.hidden[gid as usize] = *hide;
+                // Stage K: hidden lives in the segment table (SEG_HIDDEN) so
+                // both cull paths read one source of truth; sync_segment
+                // mirrors the row to the GPU cull's copy.
+                if let Some(seg) = self
+                    .cull
+                    .as_mut()
+                    .and_then(|c| c.segments.get_mut(gid as usize))
+                {
+                    if *hide {
+                        seg.flags |= SEG_HIDDEN;
+                    } else {
+                        seg.flags &= !SEG_HIDDEN;
                     }
                 }
                 self.write_group_row(ctx, gid);
+                self.sync_segment(ctx, gid);
                 format!(
                     "verb {}: {rel} group {gid} (alpha -> {}, 80 B row; cull skips the segment)",
                     if *hide { "hide-group" } else { "show-group" },
@@ -1940,7 +2408,7 @@ impl GlyphScene {
             g.cols[0][2] += delta.z as f32;
         }
         self.write_group_row(ctx, gid);
-        self.sync_segment(gid);
+        self.sync_segment(ctx, gid);
     }
 
     /// Windowed scroll: scales the grabbed group; otherwise camera speed.
@@ -1955,7 +2423,7 @@ impl GlyphScene {
                 s = g.cols[3][0];
             }
             self.write_group_row(ctx, gid);
-            self.sync_segment(gid);
+            self.sync_segment(ctx, gid);
             println!("grab: group {gid} scale -> {s:.3}");
         } else if matches!(self.camera_mode, CameraMode::Fly) {
             self.fly.on_scroll(lines);
@@ -2115,31 +2583,19 @@ impl SceneLike for GlyphScene {
         let chunk = (slot as u32 / self.chunk_cap) as usize;
         let local = (slot as u32 % self.chunk_cap) as u64;
         let size = (out.len() * 4) as u64;
-        let buf = ctx.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("debug dump"),
-            size,
-            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-            mapped_at_creation: false,
-        });
-        let mut enc = ctx.device.create_command_encoder(&Default::default());
-        enc.copy_buffer_to_buffer(&self.instance_bufs[chunk], local * 48, &buf, 0, size);
-        ctx.queue.submit([enc.finish()]);
-        let slice = buf.slice(..);
-        let (tx, rx) = std::sync::mpsc::channel();
-        slice.map_async(wgpu::MapMode::Read, move |r| {
-            let _ = tx.send(r);
-        });
-        ctx.device
-            .poll(wgpu::PollType::Wait {
-                submission_index: None,
-                timeout: None,
-            })
-            .expect("debug dump poll failed");
-        rx.recv().expect("dump cb dropped").expect("dump map failed");
-        let data = slice.get_mapped_range().expect("dump range");
-        out.copy_from_slice(bytemuck::cast_slice(&data[..size as usize]));
-        drop(data);
-        buf.unmap();
+        // Stage K: shared synchronous readback (also behind --cull-verify).
+        let bytes = crate::gpu::read_buffer(ctx, &self.instance_bufs[chunk], local * 48, size);
+        out.copy_from_slice(&bytemuck::pod_collect_to_vec::<u8, u32>(&bytes));
+    }
+
+    fn debug_cull_verify(
+        &self,
+        ctx: &GpuContext,
+        width: u32,
+        height: u32,
+        t: f32,
+    ) -> Option<Result<String, String>> {
+        self.verify_cull(ctx, width, height, t)
     }
 
     fn tick(&mut self, dt: f32) {
@@ -2170,48 +2626,89 @@ impl SceneLike for GlyphScene {
         ctx.queue
             .write_buffer(&self.camera_buf, 0, bytemuck::bytes_of(&cam));
 
-        // --- Stage F: CPU segment cull (frustum + LOD), then range draws ----
-        // (per-chunk draw ranges for visible segments, compacted backdrop quads)
+        // --- Stage F/K: segment cull (frustum + LOD) ------------------------
+        // CPU path: per-chunk draw ranges + compacted backdrop quads, uploaded
+        // now and drawn directly below. GPU path: three compute dispatches
+        // write the indirect args the render pass consumes (cull_gpu.wgsl).
         type CulledDraws = (Vec<Vec<std::ops::Range<u32>>>, Vec<BackdropInst>);
         let mut culled_draws: Option<CulledDraws> = None;
         if let Some(cull) = &self.cull {
-            // Stage H: CPU scope timing (only when GLYPH_PROFILE=1 built a profiler).
-            let cull_t0 = ctx.profiler.as_ref().map(|_| std::time::Instant::now());
             let px_scale = height as f32 / (2.0 * (FOV_Y.to_radians() * 0.5).tan());
             let planes = frustum_planes(&frame.view_proj);
-            let (draws, backdrops) = cull_segments(
-                &cull.segments,
-                &cull.hidden,
-                &planes,
-                frame.eye,
-                px_scale,
-                self.chunk_cap,
-                self.bind_groups.len() as u32,
-            );
-            if !backdrops.is_empty() {
-                ctx.queue.write_buffer(
-                    &cull.backdrop_insts_buf,
-                    0,
-                    bytemuck::cast_slice(&backdrops),
+            let chunk_count = self.bind_groups.len() as u32;
+            let debug = std::env::var_os("GLYPH_CULL_DEBUG").is_some() && t == 0.0;
+            if let Some(gpu) = &cull.gpu {
+                let params = CullParams {
+                    planes,
+                    eye: frame.eye.to_array(),
+                    px_scale,
+                    lod_min_px: LOD_MIN_PX,
+                    seg_count: cull.segments.len() as u32,
+                    slot_count: gpu.slots.len() as u32,
+                    _pad: 0,
+                };
+                ctx.queue
+                    .write_buffer(&gpu.params_buf, 0, bytemuck::bytes_of(&params));
+                let cull_query = ctx
+                    .profiler
+                    .as_ref()
+                    .map(|p| p.borrow().begin_pass_query("cull (GPU)", encoder));
+                {
+                    let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                        label: Some("cull (GPU)"),
+                        timestamp_writes: cull_query
+                            .as_ref()
+                            .and_then(|q| q.compute_pass_timestamp_writes()),
+                    });
+                    cpass.set_bind_group(0, &gpu.bind_group, &[]);
+                    cpass.set_pipeline(&gpu.classify);
+                    cpass.dispatch_workgroups((cull.segments.len() as u32).div_ceil(64), 1, 1);
+                    cpass.set_pipeline(&gpu.draw_args);
+                    cpass.dispatch_workgroups((gpu.slots.len() as u32).div_ceil(64), 1, 1);
+                    cpass.set_pipeline(&gpu.compact);
+                    cpass.dispatch_workgroups(1, 1, 1);
+                }
+                if let (Some(p), Some(q)) = (&ctx.profiler, cull_query) {
+                    p.borrow().end_query(encoder, q);
+                }
+                if debug {
+                    // The CPU twin, for the printout only — the GPU decides.
+                    let (draws, backdrops) = cull_segments(
+                        &cull.segments,
+                        &planes,
+                        frame.eye,
+                        px_scale,
+                        self.chunk_cap,
+                        chunk_count,
+                    );
+                    print_cull_debug("(gpu path; cpu twin says) ", &draws, &backdrops);
+                }
+            } else {
+                // Stage H: CPU scope timing (only when GLYPH_PROFILE=1 built a profiler).
+                let cull_t0 = ctx.profiler.as_ref().map(|_| std::time::Instant::now());
+                let (draws, backdrops) = cull_segments(
+                    &cull.segments,
+                    &planes,
+                    frame.eye,
+                    px_scale,
+                    self.chunk_cap,
+                    chunk_count,
                 );
+                if !backdrops.is_empty() {
+                    ctx.queue.write_buffer(
+                        &cull.backdrop_insts_buf,
+                        0,
+                        bytemuck::cast_slice(&backdrops),
+                    );
+                }
+                if let Some(t0) = cull_t0 {
+                    crate::gpu::record_cpu_scope(ctx, "cull (CPU)", t0.elapsed().as_secs_f64() * 1000.0);
+                }
+                if debug {
+                    print_cull_debug("", &draws, &backdrops);
+                }
+                culled_draws = Some((draws, backdrops));
             }
-            if let Some(t0) = cull_t0 {
-                crate::gpu::record_cpu_scope(ctx, "cull (CPU)", t0.elapsed().as_secs_f64() * 1000.0);
-            }
-            if std::env::var_os("GLYPH_CULL_DEBUG").is_some() && t == 0.0 {
-                let insts: u64 = draws
-                    .iter()
-                    .flat_map(|c| c.iter())
-                    .map(|r| (r.end - r.start) as u64)
-                    .sum();
-                println!(
-                    "CULLDBG glyph draws={} instances={} | backdrops={}",
-                    draws.iter().map(|c| c.len()).sum::<usize>(),
-                    insts,
-                    backdrops.len(),
-                );
-            }
-            culled_draws = Some((draws, backdrops));
         }
 
         // Stage H: pass-level GPU timer (TIMESTAMP_QUERY; pass-boundary writes,
@@ -2251,10 +2748,44 @@ impl SceneLike for GlyphScene {
             }),
             ..Default::default()
         });
-        if let (Some(cull), Some((draws, backdrops))) = (&self.cull, &culled_draws) {
+        let gpu_cull = self
+            .cull
+            .as_ref()
+            .and_then(|c| c.gpu.as_ref().map(|g| (c, g)));
+        if let Some((cull, gpu)) = gpu_cull {
+            // Stage K: both streams are GPU-driven — the backdrop count and
+            // every glyph slot come from cull_gpu.wgsl; zero-instance slots
+            // are no-ops. Same pipelines, same order as the CPU path below.
+            let q = ctx
+                .profiler
+                .as_ref()
+                .map(|p| p.borrow().begin_query("backdrop stream (indirect)", &mut pass));
+            pass.set_pipeline(&cull.backdrop_pipeline);
+            pass.set_bind_group(0, &cull.backdrop_bind_group, &[]);
+            pass.draw_indirect(&gpu.backdrop_args_buf, 0);
+            if let (Some(p), Some(q)) = (&ctx.profiler, q) {
+                p.borrow().end_query(&mut pass, q);
+            }
+            let q = ctx
+                .profiler
+                .as_ref()
+                .map(|p| p.borrow().begin_query("glyph stream (multi-draw indirect)", &mut pass));
+            pass.set_pipeline(&self.pipeline);
+            let args_size = std::mem::size_of::<wgpu::util::DrawIndirectArgs>() as u64;
+            for (bg, &(first, n)) in self.bind_groups.iter().zip(gpu.slot_ranges.iter()) {
+                if n == 0 {
+                    continue;
+                }
+                pass.set_bind_group(0, bg, &[]);
+                pass.multi_draw_indirect(&gpu.args_buf, u64::from(first) * args_size, n);
+            }
+            if let (Some(p), Some(q)) = (&ctx.profiler, q) {
+                p.borrow().end_query(&mut pass, q);
+            }
+        } else if let (Some(cull), Some((draws, backdrops))) = (&self.cull, &culled_draws) {
             // Far LOD stream first: one instanced draw over the compacted
-            // backdrop quads (plain draw — no indirect machinery, see the
-            // module header).
+            // backdrop quads (plain draw — no indirect machinery on this
+            // path, see the module header).
             if !backdrops.is_empty() {
                 let q = ctx
                     .profiler
@@ -2303,11 +2834,36 @@ impl SceneLike for GlyphScene {
                 p.borrow().end_query(&mut pass, q);
             }
         }
+        // Stage K: ending the pass REPLAYS it into the Metal encoder — for
+        // the GPU path that is the O(segments) loop of single indirect draws
+        // wgpu-hal emulates multi_draw_indirect with; for the CPU path the
+        // O(visible) direct draws. Timed as a CPU scope so the two encode
+        // costs are directly comparable under GLYPH_PROFILE=1.
+        let end_t0 = ctx.profiler.as_ref().map(|_| std::time::Instant::now());
         drop(pass);
+        if let Some(t0) = end_t0 {
+            crate::gpu::record_cpu_scope(ctx, "pass end (CPU)", t0.elapsed().as_secs_f64() * 1000.0);
+        }
         if let (Some(p), Some(q)) = (&ctx.profiler, pass_query) {
             p.borrow().end_query(encoder, q);
         }
     }
+}
+
+/// GLYPH_CULL_DEBUG line (format kept from Stage F): draw count, instance
+/// count, backdrop count — `prefix` tags the GPU path's CPU-twin printout.
+fn print_cull_debug(prefix: &str, draws: &[Vec<std::ops::Range<u32>>], backdrops: &[BackdropInst]) {
+    let insts: u64 = draws
+        .iter()
+        .flat_map(|c| c.iter())
+        .map(|r| (r.end - r.start) as u64)
+        .sum();
+    println!(
+        "CULLDBG {prefix}glyph draws={} instances={} | backdrops={}",
+        draws.iter().map(|c| c.len()).sum::<usize>(),
+        insts,
+        backdrops.len(),
+    );
 }
 
 // ── Stage H (Phase 5) — encase layout assertions ────────────────────────────
@@ -2351,6 +2907,56 @@ mod layout_tests {
         assert_eq!(<GroupRow as ShaderSize>::SHADER_SIZE.get(), 80, "GROUP_STRIDE=5 vec4s");
         assert_eq!(std::mem::size_of::<GroupRow>(), 80);
         assert_eq!(GroupRow::METADATA.offset(0), 0, "cols offset");
+    }
+
+    /// Stage K: the cull-side structs mirrored by hand in cull_gpu.wgsl
+    /// (SegCull is also the 48 B row `sync_segment` uploads per edit).
+    #[test]
+    fn cull_structs_size_and_offsets() {
+        assert_eq!(<SegCull as ShaderSize>::SHADER_SIZE.get(), 48, "SegCull is 12 x 4 B");
+        assert_eq!(std::mem::size_of::<SegCull>(), 48);
+        let seg_fields = [
+            ("min", 0),
+            ("max", 8),
+            ("slot_base", 16),
+            ("slot_count", 20),
+            ("flags", 24),
+            ("_pad", 28),
+            ("tint", 32),
+        ];
+        for (i, (name, off)) in seg_fields.iter().enumerate() {
+            assert_eq!(SegCull::METADATA.offset(i), *off as u64, "SegCull field {name} offset");
+        }
+        assert_eq!(<DrawSlot as ShaderSize>::SHADER_SIZE.get(), 16);
+        assert_eq!(std::mem::size_of::<DrawSlot>(), 16);
+        assert_eq!(<CullParams as ShaderSize>::SHADER_SIZE.get(), 128, "6 planes + eye/px/lod + counts");
+        assert_eq!(std::mem::size_of::<CullParams>(), 128);
+        let param_fields = [
+            ("planes", 0),
+            ("eye", 96),
+            ("px_scale", 108),
+            ("lod_min_px", 112),
+            ("seg_count", 116),
+            ("slot_count", 120),
+            ("_pad", 124),
+        ];
+        for (i, (name, off)) in param_fields.iter().enumerate() {
+            assert_eq!(CullParams::METADATA.offset(i), *off as u64, "CullParams field {name} offset");
+        }
+        // Decisive: encase bytes == the bytemuck bytes the upload path writes.
+        let seg = SegCull {
+            min: [-1.5, 2.25],
+            max: [3.0, -4.5],
+            slot_base: 0xAABBCCDD,
+            slot_count: 0x11223344,
+            flags: SEG_HIDDEN,
+            _pad: 0x42424242,
+            tint: [0.1, 0.2, 0.3, 0.7],
+        };
+        let mut buf = Vec::<u8>::new();
+        encase::StorageBuffer::new(&mut buf).write(&seg).unwrap();
+        assert_eq!(buf.len(), 48);
+        assert_eq!(&buf[..], bytemuck::bytes_of(&seg), "SegCull bytes");
     }
 
     /// Decisive check: encase's serialization must be byte-identical to the
