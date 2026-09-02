@@ -137,7 +137,18 @@ impl WindowState {
         if let Some(p) = &ctx.profiler {
             p.borrow_mut().resolve_queries(&mut encoder);
         }
-        ctx.queue.submit([encoder.finish()]);
+        // Stage K: finish() is where wgpu 30 encodes the frame into Metal
+        // (see offscreen.rs) — the draw-list encode cost, profiled.
+        let finish_t0 = ctx.profiler.as_ref().map(|_| Instant::now());
+        let cmd = encoder.finish();
+        if let Some(t0) = finish_t0 {
+            crate::gpu::record_cpu_scope(ctx, "encoder finish (CPU)", t0.elapsed().as_secs_f64() * 1000.0);
+        }
+        let submit_t0 = ctx.profiler.as_ref().map(|_| Instant::now());
+        ctx.queue.submit([cmd]);
+        if let Some(t0) = submit_t0 {
+            crate::gpu::record_cpu_scope(ctx, "queue submit (CPU)", t0.elapsed().as_secs_f64() * 1000.0);
+        }
         // wgpu 30: presentation goes through the queue, not the texture.
         ctx.queue.present(frame);
 

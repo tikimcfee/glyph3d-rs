@@ -104,6 +104,10 @@ pub fn run(
     // 3) from silently dropping newer frames; the post-loop drain below
     // collects whatever is still in flight.
     let mut profile_acc = crate::gpu::ProfileAccumulator::default();
+    // Stage K: profiler frames submitted but not yet folded (see the
+    // back-pressure note in the loop). Half the profiler's pending cap.
+    const PROFILER_MAX_IN_FLIGHT: u32 = 32;
+    let mut profiled_in_flight = 0u32;
     let t0 = std::time::Instant::now();
     for frame in 0..frames {
         let mut encoder = device.create_command_encoder(&Default::default());
@@ -144,16 +148,53 @@ pub fn run(
                 size,
             );
         }
-        ctx.queue.submit([encoder.finish()]);
+        // Stage K: `encoder.finish()` is where wgpu 30 encodes the recorded
+        // passes into the Metal command buffer (ending a pass only queues
+        // it), so THIS is the CPU cost of the frame's draw list — the
+        // O(segments) loop of single indirect draws wgpu-hal emulates
+        // multi_draw_indirect with on the GPU cull path, the O(visible)
+        // direct draws on the CPU path. Timed only under GLYPH_PROFILE=1.
+        let finish_t0 = ctx.profiler.as_ref().map(|_| std::time::Instant::now());
+        let cmd = encoder.finish();
+        if let Some(t0) = finish_t0 {
+            crate::gpu::record_cpu_scope(ctx, "encoder finish (CPU)", t0.elapsed().as_secs_f64() * 1000.0);
+        }
+        let submit_t0 = ctx.profiler.as_ref().map(|_| std::time::Instant::now());
+        ctx.queue.submit([cmd]);
+        if let Some(t0) = submit_t0 {
+            crate::gpu::record_cpu_scope(ctx, "queue submit (CPU)", t0.elapsed().as_secs_f64() * 1000.0);
+        }
         if let Some(p) = &ctx.profiler {
             if let Err(e) = p.borrow_mut().end_frame() {
                 log::warn!("profiler end_frame: {e}");
             }
-            // Non-blocking pump: fold any GPU-completed frame into the means.
+            profiled_in_flight += 1;
+            // Non-blocking pump: fold every GPU-completed frame into the means.
             let _ = device.poll(wgpu::PollType::Poll);
             let period = ctx.queue.get_timestamp_period();
-            if let Some(results) = p.borrow_mut().process_finished_frame(period) {
+            while let Some(results) = p.borrow_mut().process_finished_frame(period) {
                 profile_acc.add_frame(&results);
+                profiled_in_flight -= 1;
+            }
+            // Stage K: back-pressure. A culled frame encodes in microseconds,
+            // so the CPU runs hundreds of frames ahead of the GPU; past
+            // max_num_pending_frames (64) wgpu-profiler evicts a pending
+            // frame and recycles its query pools under a still-in-flight
+            // map_async — "Query Read Buffer is invalid" panic at frame ~65
+            // on every corpus view, both cull paths. Block for the GPU well
+            // before that. Only the profiled loop pays (a drained queue every
+            // 32 frames, sub-ms); the unprofiled loop is untouched.
+            if profiled_in_flight >= PROFILER_MAX_IN_FLIGHT {
+                device
+                    .poll(wgpu::PollType::Wait {
+                        submission_index: None,
+                        timeout: None,
+                    })
+                    .expect("device poll failed draining profiler frames");
+                while let Some(results) = p.borrow_mut().process_finished_frame(period) {
+                    profile_acc.add_frame(&results);
+                    profiled_in_flight -= 1;
+                }
             }
         }
     }

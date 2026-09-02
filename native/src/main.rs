@@ -17,9 +17,10 @@
 //! Stage I: glam 0.30 → 0.33 (byte-identical under the full A/B suite);
 //!          baseline views moved onto the immutable fixtures/baseline-view.txt.
 //! Stage K: GPU-driven culling — a compute pass classifies segments and
-//!          writes indirect draw args consumed by multi_draw_indirect
-//!          (`--cull auto|cpu|gpu|off`, `--cull-verify` diffs GPU vs CPU
-//!          decisions). Unblocked by requesting INDIRECT_FIRST_INSTANCE;
+//!          writes indirect draw args: per-segment slots for
+//!          multi_draw_indirect (`--cull gpu`) or one packed draw per chunk
+//!          (`--cull gpu-packed`); `--cull-verify` diffs GPU vs CPU
+//!          decisions. Unblocked by requesting INDIRECT_FIRST_INSTANCE;
 //!          `mdi-probe` (src/bin) is the standing proof.
 //!
 //! Run modes:
@@ -235,9 +236,10 @@ struct Cli {
     /// Stage E2: walk + engine + stage + stats, then exit (no GPU)
     #[arg(long)]
     repo_scan_only: bool,
-    /// Stage K: cull path — auto (GPU compute cull + indirect multi-draws
-    /// when the adapter has INDIRECT_FIRST_INSTANCE, else CPU), cpu, gpu, off
-    #[arg(long, value_name = "MODE", default_value = "auto", value_parser = ["auto", "cpu", "gpu", "off"])]
+    /// Stage K: cull path — auto (GPU compute cull when the adapter has
+    /// INDIRECT_FIRST_INSTANCE, else CPU), cpu, gpu (per-segment
+    /// multi_draw_indirect), gpu-packed (one indirect draw per chunk), off
+    #[arg(long, value_name = "MODE", default_value = "auto", value_parser = ["auto", "cpu", "gpu", "gpu-packed", "off"])]
     cull: String,
     /// Stage F: disable the cull/LOD pass (legacy per-chunk draws; debug/A-B).
     /// Same as `--cull off`
@@ -611,6 +613,12 @@ fn main() {
 /// INDIRECT_FIRST_INSTANCE is a hard error: its indirect draws would be spec
 /// no-ops (exactly the Stage F symptom), so refusing beats a silent blank
 /// frame. `--no-cull` wins over `--cull` (it predates it).
+///
+/// `auto` = the multi-draw form (`Gpu`) when the feature is there: on the
+/// corpus it matches or beats the CPU path on every benchmark view and it is
+/// the design Stage F specified; the packed form wins the all-backdrop view
+/// but pays ~12% for its vertex remap on the glyph-heavy one
+/// (out/STAGE_K_REPORT.md §4). Without the feature, `Cpu`.
 fn resolve_cull_mode(flag: &str, no_cull: bool, indirect_first_instance: bool) -> CullMode {
     if no_cull {
         return CullMode::Off;
@@ -621,10 +629,13 @@ fn resolve_cull_mode(flag: &str, no_cull: bool, indirect_first_instance: bool) -
         "gpu" => {
             assert!(
                 indirect_first_instance,
-                "--cull gpu: this adapter lacks INDIRECT_FIRST_INSTANCE, so indirect draws with first_instance != 0 would be spec no-ops — use --cull cpu"
+                "--cull gpu: this adapter lacks INDIRECT_FIRST_INSTANCE, so indirect draws with first_instance != 0 would be spec no-ops — use --cull gpu-packed or --cull cpu"
             );
             CullMode::Gpu
         }
+        // The packed form's indirect draws all carry first_instance = 0, so
+        // it needs no feature at all.
+        "gpu-packed" => CullMode::GpuPacked,
         "auto" if indirect_first_instance => CullMode::Gpu,
         "auto" => CullMode::Cpu,
         other => panic!("--cull: unknown mode {other:?} (clap should have rejected it)"),
@@ -686,6 +697,12 @@ mod cli_tests {
         assert_eq!(resolve_cull_mode("cpu", false, true), CullMode::Cpu);
         assert_eq!(resolve_cull_mode("off", false, true), CullMode::Off);
         assert_eq!(resolve_cull_mode("gpu", true, true), CullMode::Off, "--no-cull wins");
+        assert_eq!(parse(&["--cull", "gpu-packed"]).cull, "gpu-packed");
+        assert_eq!(
+            resolve_cull_mode("gpu-packed", false, false),
+            CullMode::GpuPacked,
+            "packed draws use first_instance 0 — no feature needed"
+        );
     }
 
     #[test]

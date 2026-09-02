@@ -19,10 +19,11 @@ bit-exact Mojo engine vs the text.rs CPU oracle, (5) `tools/check-stage-g.sh`
 (6) four-view **byte-equal** A/B: demo / text / repo-zoom / repo-wide
 re-rendered into `out/tooling-ab/sweep/` and `cmp`'d against
 `out/tooling-ab/baseline/`, (7) `tools/check-mdi.sh` — Stage K: the GPU
-cull's draw args read back **exactly** equal the CPU cull per view
-(`--cull-verify`), `--cull cpu` and `--cull gpu` renders byte-equal, and the
-forced multi-chunk arena splits match. Any divergence means the commit is
-wrong — revert or fix, never re-baseline casually.
+cull's outputs read back **exactly** equal the CPU cull per view
+(`--cull-verify`, both `gpu` and `gpu-packed`), every GPU render byte-equal
+to the `--cull cpu` render, and the forced multi-chunk arena splits match.
+Any divergence means the commit is wrong — revert or fix, never re-baseline
+casually.
 
 ## The determinism chain (why the gates can be this strict)
 
@@ -77,14 +78,28 @@ byte-identical PNG. Everything that could break this is fenced:
 
 ## Cull paths (Stage K)
 
-`--cull auto|cpu|gpu|off` (`--no-cull` = off). `auto` = gpu when the device
-has `INDIRECT_FIRST_INSTANCE` (Metal does), else cpu. `--cull-verify`
-(offscreen) reads the GPU cull's args back after the run and exits 1 on any
-divergence from `cull_segments`. `mdi-probe` (`cargo run --release --bin
-mdi-probe`) is the standalone proof that nonzero `first_instance` in an
-indirect draw needs that feature — it is WebGPU's rule, not a Metal bug.
-`tools/bench-mdi.sh` runs the three corpus views on both paths with
-GLYPH_PROFILE=1.
+`--cull auto|cpu|gpu|gpu-packed|off` (`--no-cull` = off). `gpu` = one
+`multi_draw_indirect` per chunk over per-segment slots (zero-instance
+padding; needs `INDIRECT_FIRST_INSTANCE`, which Metal has); `gpu-packed` =
+one `draw_indirect` per chunk over the packed visible instances (vs_packed
+remaps through cs_pack's prefix table; needs no feature). `auto` picks the
+GPU form documented in `resolve_cull_mode` (main.rs) when the device has
+`INDIRECT_FIRST_INSTANCE`, else cpu. `--cull-verify` (offscreen) reads the
+GPU cull's outputs back after the run and exits 1 on any divergence from
+`cull_segments`. `mdi-probe` (`cargo run --release --bin mdi-probe`) is the
+standalone proof that nonzero `first_instance` in an indirect draw needs
+that feature — WebGPU's rule, not a Metal bug. `tools/bench-mdi.sh` runs the
+three corpus views on all paths (`PROFILE=0|1`). Measurement levers:
+`WGPU_VALIDATION_INDIRECT_CALL=0` (drops wgpu's per-submit indirect
+validation pass) and `GLYPH_MDI_LIMIT=<n>` (caps issued slots — output is
+wrong when it truncates; pricing only).
+
+**Arena chunks stay below 4 GiB, always.** naga's Metal bounds checks hold
+buffer sizes in 32 bits; a ≥4 GiB storage binding reads as fully out of
+bounds (blank frame, no error). wgpu only clamps the reported limits to
+u32::MAX while its indirect validation is on — with it off the M2 reports
+9093 MiB. `GlyphScene::new` clamps the chunk cap itself (Stage K); do not
+"simplify" that away.
 
 ## Commit cadence
 

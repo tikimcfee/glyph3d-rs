@@ -42,6 +42,19 @@
 //      the one O(segments/256) serial loop in the pipeline; a multi-workgroup
 //      decoupled-lookback scan is the upgrade once tables reach ~1e5 files.
 //
+//   3b. cs_pack  (`--cull gpu-packed`, replaces cs_draw_args) ONE workgroup:
+//      per chunk, a stable scan over that chunk's draw slots compacts the
+//      visible ones into `packed_slots` — (exclusive instance prefix, chunk-
+//      local base) per visible slot — and writes ONE DrawIndirectArgs
+//      {6, Σ visible counts, 0, 0} per chunk plus `packed_meta[c]` = (first
+//      packed slot, visible slot count). glyph_field.wgsl's vs_packed then
+//      maps instance_index back to an arena slot by binary-searching the
+//      prefix table, so the draw list is ONE draw_indirect per chunk with
+//      no zero-instance padding at all: encode O(chunks), GPU O(visible),
+//      arena order preserved (packed order == slot order == arena order).
+//      This is the Metal-scaling form — the per-slot multi-draw loop above
+//      costs a fixed amount per frame on wgpu/Metal whatever is visible.
+//
 // first_instance != 0 in an indirect draw REQUIRES the device to be created
 // with Features::INDIRECT_FIRST_INSTANCE — otherwise wgpu's indirect
 // validation (spec: "indirect-first-instance") turns the draw into a no-op.
@@ -64,7 +77,11 @@ struct SegCull {
     tint: vec4<f32>, // rgb linear mean ink, a = coverage E
 };
 
-// 128 B uniform — mirrors `CullParams` in glyph_scene.rs.
+// 384 B uniform — mirrors `CullParams` in glyph_scene.rs. chunk_ranges[c] =
+// (first draw slot, slot count) of arena chunk c — in the UNIFORM so the
+// packed scan's per-chunk loop bounds are provably uniform (the barriers
+// inside must sit in uniform control flow). MAX_CHUNKS mirrors the Rust const.
+const MAX_CHUNKS: u32 = 16u;
 struct CullParams {
     planes: array<vec4<f32>, 6>,
     eye: vec3<f32>,
@@ -72,7 +89,8 @@ struct CullParams {
     lod_min_px: f32,
     seg_count: u32,
     slot_count: u32,
-    _pad: u32,
+    chunk_count: u32,
+    chunk_ranges: array<vec4<u32>, 16>,
 };
 
 // 16 B — mirrors `DrawSlot` in glyph_scene.rs.
@@ -104,7 +122,15 @@ struct BackdropInst {
 @group(0) @binding(3) var<storage, read> draw_slots: array<DrawSlot>;
 @group(0) @binding(4) var<storage, read_write> draw_args: array<DrawArgs>;
 @group(0) @binding(5) var<storage, read_write> binsts: array<BackdropInst>;
-@group(0) @binding(6) var<storage, read_write> backdrop_args: DrawArgs;
+// The non-slot indirect draws, one buffer (the default limit is 8 storage
+// buffers per stage): aux_args[0] = the backdrop stream's DrawArgs,
+// aux_args[1 + c] = chunk c's packed DrawArgs {6, Σ visible counts, 0, 0}.
+@group(0) @binding(6) var<storage, read_write> aux_args: array<DrawArgs>;
+// Packed form only (tiny, always bound):
+//   packed_slots[i] = (exclusive instance prefix within the chunk, chunk-local base)
+//   packed_meta[c]  = (first packed slot of chunk c, visible slot count of chunk c)
+@group(0) @binding(7) var<storage, read_write> packed_slots: array<vec2<u32>>;
+@group(0) @binding(8) var<storage, read_write> packed_meta: array<vec2<u32>>;
 
 @compute @workgroup_size(64)
 fn cs_classify(@builtin(global_invocation_id) id: vec3<u32>) {
@@ -195,6 +221,67 @@ fn cs_backdrop_compact(@builtin(local_invocation_id) lid: vec3<u32>) {
         workgroupBarrier();
     }
     if t == 0u {
-        backdrop_args = DrawArgs(QUAD_VERTICES, carry, 0u, 0u);
+        aux_args[0] = DrawArgs(QUAD_VERTICES, carry, 0u, 0u);
+    }
+}
+
+var<workgroup> scan_vis: array<u32, 256>;
+var<workgroup> scan_cnt: array<u32, 256>;
+
+// Packed form: per chunk, stable-compact the visible draw slots and prefix-sum
+// their instance counts. Two inclusive scans per 256-slot block (visible
+// flag → packed index; count → instance prefix), carries per chunk.
+@compute @workgroup_size(256)
+fn cs_pack(@builtin(local_invocation_id) lid: vec3<u32>) {
+    let t = lid.x;
+    // Next free packed slot across chunks (workgroup-uniform by construction).
+    var packed_cursor = 0u;
+    for (var c = 0u; c < min(params.chunk_count, MAX_CHUNKS); c = c + 1u) {
+        let range = params.chunk_ranges[c];
+        let packed_first = packed_cursor;
+        var vis_carry = 0u;
+        var cnt_carry = 0u;
+        for (var base = 0u; base < range.y; base = base + SCAN_WG) {
+            let k = base + t;
+            var vis = 0u;
+            var cnt = 0u;
+            var slot_base = 0u;
+            if k < range.y {
+                let slot = draw_slots[range.x + k];
+                if seg_mode[slot.seg] == MODE_GLYPHS {
+                    vis = 1u;
+                    cnt = slot.count;
+                    slot_base = slot.base;
+                }
+            }
+            scan_vis[t] = vis;
+            scan_cnt[t] = cnt;
+            workgroupBarrier();
+            for (var off = 1u; off < SCAN_WG; off = off << 1u) {
+                var v = 0u;
+                var n = 0u;
+                if t >= off {
+                    v = scan_vis[t - off];
+                    n = scan_cnt[t - off];
+                }
+                workgroupBarrier();
+                scan_vis[t] = scan_vis[t] + v;
+                scan_cnt[t] = scan_cnt[t] + n;
+                workgroupBarrier();
+            }
+            if vis == 1u {
+                // Inclusive scans → this slot's packed index and exclusive prefix.
+                packed_slots[packed_first + vis_carry + scan_vis[t] - 1u] =
+                    vec2<u32>(cnt_carry + scan_cnt[t] - cnt, slot_base);
+            }
+            vis_carry = vis_carry + scan_vis[SCAN_WG - 1u];
+            cnt_carry = cnt_carry + scan_cnt[SCAN_WG - 1u];
+            workgroupBarrier();
+        }
+        if t == 0u {
+            packed_meta[c] = vec2<u32>(packed_first, vis_carry);
+            aux_args[1u + c] = DrawArgs(QUAD_VERTICES, cnt_carry, 0u, 0u);
+        }
+        packed_cursor = packed_cursor + vis_carry;
     }
 }

@@ -106,13 +106,22 @@ pub fn take_cpu_scope_summary(ctx: &GpuContext) -> String {
 /// there is no CPU fallback to recover to.
 pub async fn init(compatible_surface: Option<&wgpu::Surface<'_>>) -> GpuContext {
     // wgpu 30: takes the descriptor by value.
+    // Stage K: instance flags honor the WGPU_* environment (identical to the
+    // build defaults when unset). The lever that matters here is
+    // WGPU_VALIDATION_INDIRECT_CALL=0 — it drops wgpu's per-submit
+    // indirect-validation compute pass, which the GPU cull's own compute
+    // shader makes redundant (every slot it writes is a valid draw). Used by
+    // the Stage K cost experiments; the default keeps validation ON.
+    let flags = wgpu::InstanceFlags::from_env_or_default();
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
         // PRIMARY backends on macOS resolve to Metal.
         backends: wgpu::Backends::PRIMARY,
+        flags,
         // wgpu 30: InstanceDescriptor has no Default impl; start from the
         // no-display-handle constructor and override what we need.
         ..wgpu::InstanceDescriptor::new_without_display_handle()
     });
+    log::info!("instance flags: {flags:?}");
 
     let adapter = instance
         .request_adapter(&wgpu::RequestAdapterOptions {

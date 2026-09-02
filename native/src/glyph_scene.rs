@@ -48,19 +48,27 @@
 //! Culling is visually lossless: a culled segment is entirely outside the
 //! frustum, and the LOD tier only substitutes subpixel glyphs.
 //!
-//! ## Stage K — GPU cull → indirect multi-draw (`--cull gpu`; the default
-//! wherever the adapter has INDIRECT_FIRST_INSTANCE)
+//! ## Stage K — GPU cull → indirect draws (`--cull gpu` / `--cull gpu-packed`)
 //!
-//! The Stage F original design, revived: three compute dispatches classify
-//! every segment, write one DrawIndirectArgs per STATIC (segment, chunk)
-//! draw slot — `first_instance` = chunk-local base, zero instances when
-//! culled — and stably compact the backdrop quads plus their own draw args;
-//! render() then issues ONE multi_draw_indirect per chunk and one
-//! draw_indirect for the backdrops. Nothing is read back; the CPU never
-//! decides visibility. Slot order == the CPU path's draw order, so the two
-//! paths blend identically (`--cull-verify` diffs the GPU args against
+//! The Stage F original design, revived: compute dispatches classify every
+//! segment (cs_classify), stably compact the backdrop quads plus their own
+//! draw args (cs_backdrop_compact), and produce the glyph draw list in one
+//! of two forms:
+//!   - `gpu` (multi-draw): one DrawIndirectArgs per STATIC (segment, chunk)
+//!     draw slot — `first_instance` = chunk-local base, zero instances when
+//!     culled — consumed by ONE multi_draw_indirect per chunk (cs_draw_args);
+//!   - `gpu-packed`: per chunk, the visible slots compacted with an instance
+//!     prefix sum (cs_pack) and ONE draw_indirect over the visible total;
+//!     vs_packed maps the dense instance_index back to an arena slot by a
+//!     binary search of that prefix table. No zero-instance padding, encode
+//!     O(chunks) — the form that scales on Metal, where wgpu emulates
+//!     multi-draw as a loop of single indirect draws.
+//!
+//! Nothing is read back; the CPU never decides visibility. Slot order ==
+//! packed order == the CPU path's draw order, so all paths blend
+//! identically (`--cull-verify` diffs the GPU outputs against
 //! `cull_segments` frame-for-frame; tools/check-mdi.sh byte-compares the
-//! renders).
+//! renders of every form).
 //!
 //! WHAT ACTUALLY BLOCKED STAGE F: not Metal. WebGPU's "indirect-first-
 //! instance" rule — an indirect draw with first_instance != 0 is a no-op
@@ -75,10 +83,13 @@
 //! METAL COST MODEL: wgpu-hal emulates multi_draw_indirect on Metal as a
 //! loop of single indirect draws and cannot implement the _COUNT variant
 //! (no draw-count-buffer concept; Indirect Command Buffers would be needed —
-//! gfx-rs/wgpu#2148). So the GPU path's ENCODE cost is O(segments) tiny
-//! draw calls per frame while its GPU cost is O(visible); the CPU path's
-//! encode cost is O(visible) draws plus the cull itself. GLYPH_PROFILE=1
-//! reports both ("cull (GPU)" pass, "pass end (CPU)" encode scope);
+//! gfx-rs/wgpu#2148). So the multi-draw form's ENCODE cost is O(segments)
+//! tiny draw calls per frame — and wgpu's indirect-validation pass validates
+//! every one of them per submit — while its GPU cost is O(visible); the
+//! packed form's encode and validation are O(chunks). The CPU path's encode
+//! cost is O(visible) draws plus the cull itself. GLYPH_PROFILE=1 reports
+//! all of it ("cull (GPU)" pass; "encoder finish (CPU)" = the encode, timed
+//! by offscreen/windowed because wgpu 30 encodes at finish());
 //! out/STAGE_K_REPORT.md has the numbers. `--cull cpu` keeps the Stage F
 //! path (byte-identical output); `--cull off` the legacy full draws.
 
@@ -356,13 +367,30 @@ struct BackdropInst {
 
 /// Stage K — which cull path a scene runs. `Off` = the legacy per-chunk
 /// full draws (`--no-cull`); `Cpu` = Stage F (`cull_segments` + direct range
-/// draws); `Gpu` = the compute cull driving indirect multi-draws.
+/// draws); `Gpu` = the compute cull driving one multi_draw_indirect per
+/// chunk over per-segment slots; `GpuPacked` = the same cull driving ONE
+/// draw_indirect per chunk over the packed visible instances (vs_packed
+/// remaps instance_index through the prefix table cs_pack writes).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum CullMode {
     Off,
     Cpu,
     Gpu,
+    GpuPacked,
 }
+
+impl CullMode {
+    /// Any GPU-driven form (compute cull + indirect draws).
+    pub fn is_gpu(self) -> bool {
+        matches!(self, CullMode::Gpu | CullMode::GpuPacked)
+    }
+}
+
+/// Stage K — arena chunks the packed cull can address per frame: the
+/// per-chunk slot ranges ride in the `CullParams` uniform (so cs_pack's loop
+/// bounds are provably uniform for its barriers). Mirrors MAX_CHUNKS in
+/// cull_gpu.wgsl. The 4 GB corpus needs 2; GLYPH_CHUNK_CAP tests reach 12.
+pub const MAX_CHUNKS: usize = 16;
 
 /// Stage K — one static (segment, chunk) draw slot, 16 B, mirrors `DrawSlot`
 /// in cull_gpu.wgsl. `base`/`count` are chunk-local instance indices.
@@ -375,9 +403,10 @@ struct DrawSlot {
     _pad: u32,
 }
 
-/// Stage K — per-frame cull uniform, 128 B, mirrors `CullParams` in
+/// Stage K — per-frame cull uniform, 384 B, mirrors `CullParams` in
 /// cull_gpu.wgsl (planes = the `frustum_planes` output; eye/px_scale = the
-/// values `cull_segments` receives, so the two paths see identical inputs).
+/// values `cull_segments` receives, so the two paths see identical inputs;
+/// chunk_ranges[c] = (first draw slot, slot count) of arena chunk c).
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable, encase::ShaderType)]
 struct CullParams {
@@ -387,7 +416,8 @@ struct CullParams {
     lod_min_px: f32,
     seg_count: u32,
     slot_count: u32,
-    _pad: u32,
+    chunk_count: u32,
+    chunk_ranges: [[u32; 4]; MAX_CHUNKS],
 }
 
 /// Stage K — what `CullState` needs to know about the arena to build the
@@ -407,17 +437,81 @@ struct GpuCull {
     params_buf: wgpu::Buffer,
     /// slot_count × 16 B — one DrawIndirectArgs per draw slot.
     args_buf: wgpu::Buffer,
-    /// 16 B — DrawIndirectArgs for the compacted backdrop stream.
-    backdrop_args_buf: wgpu::Buffer,
+    /// (1 + chunks) × 16 B — the non-slot indirect draws: [0] the compacted
+    /// backdrop stream, [1 + c] chunk c's packed draw (one buffer keeps the
+    /// compute layout within the default 8 storage buffers per stage).
+    aux_args_buf: wgpu::Buffer,
     /// Per chunk: (first slot, slot count) — render() issues exactly one
     /// multi_draw_indirect over this range per chunk.
     slot_ranges: Vec<(u32, u32)>,
     /// CPU copy of the slot table (`--cull-verify` decodes the args by it).
     slots: Vec<DrawSlot>,
+    /// Stage K measurement lever: GLYPH_MDI_LIMIT=<n> caps the slots issued
+    /// per chunk. The render is WRONG whenever it truncates a visible slot —
+    /// it exists to price the loop of zero-instance indirect draws (n=0 on
+    /// an all-backdrop view is exact, since every slot is empty there).
+    slot_limit: Option<u32>,
     classify: wgpu::ComputePipeline,
     draw_args: wgpu::ComputePipeline,
     compact: wgpu::ComputePipeline,
     bind_group: wgpu::BindGroup,
+    /// Which GPU form this cull drives (`Gpu` = multi-draw slots, `GpuPacked`).
+    mode: CullMode,
+    // ── packed form (cs_pack outputs; allocated in both GPU modes, tiny) ──
+    /// (S+C) × 8 B — (instance prefix, chunk-local base) per visible slot.
+    packed_slots_buf: wgpu::Buffer,
+    /// chunks × 8 B — (first packed slot, visible slot count) per chunk.
+    packed_meta_buf: wgpu::Buffer,
+    pack: wgpu::ComputePipeline,
+}
+
+/// Stage K — the packed form's render side: vs_packed + the glyph fragment
+/// stage, one bind group per arena chunk carrying the glyph bindings plus the
+/// prefix table, the per-chunk meta and the chunk index uniform.
+struct PackedDraw {
+    pipeline: wgpu::RenderPipeline,
+    bind_groups: Vec<wgpu::BindGroup>,
+}
+
+/// The glyph pipeline's shared bindings (everything but the per-chunk arena
+/// buffer). Stage K builds the packed form's bind groups from the same six.
+struct GlyphBindings<'a> {
+    camera: &'a wgpu::Buffer,
+    groups: &'a wgpu::Buffer,
+    glyphmap: &'a wgpu::TextureView,
+    curves: &'a wgpu::TextureView,
+    params: &'a wgpu::Buffer,
+}
+
+impl<'a> GlyphBindings<'a> {
+    fn entries(&self, chunk: &'a wgpu::Buffer) -> [wgpu::BindGroupEntry<'a>; 6] {
+        [
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: self.camera.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: chunk.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: self.groups.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 3,
+                resource: wgpu::BindingResource::TextureView(self.glyphmap),
+            },
+            wgpu::BindGroupEntry {
+                binding: 4,
+                resource: wgpu::BindingResource::TextureView(self.curves),
+            },
+            wgpu::BindGroupEntry {
+                binding: 5,
+                resource: self.params.as_entire_binding(),
+            },
+        ]
+    }
 }
 
 fn compute_buffer_entry(binding: u32, ty: wgpu::BufferBindingType) -> wgpu::BindGroupLayoutEntry {
@@ -471,9 +565,14 @@ impl GpuCull {
         backdrop_insts_buf: &wgpu::Buffer,
         chunk_cap: u32,
         chunk_count: u32,
+        mode: CullMode,
     ) -> Self {
         let device = &ctx.device;
         let (slots, slot_ranges) = Self::build_slots(segments, chunk_cap, chunk_count);
+        assert!(
+            (chunk_count as usize) <= MAX_CHUNKS,
+            "GPU cull: {chunk_count} arena chunks exceed MAX_CHUNKS={MAX_CHUNKS} (raise the const in glyph_scene.rs and cull_gpu.wgsl, or use --cull cpu)"
+        );
         let seg_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("cull segments"),
             contents: bytemuck::cast_slice(segments),
@@ -511,12 +610,26 @@ impl GpuCull {
                 | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
-        let backdrop_args_buf = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("backdrop draw args"),
-            size: args_size,
+        let aux_args_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("backdrop + packed draw args"),
+            size: u64::from(1 + chunk_count) * args_size,
             usage: wgpu::BufferUsages::INDIRECT
                 | wgpu::BufferUsages::STORAGE
                 | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        // Packed form buffers (tiny; always allocated so one bind group
+        // layout serves both GPU modes).
+        let packed_slots_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("packed slots"),
+            size: (slots_upload.len() * 8) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let packed_meta_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("packed chunk meta"),
+            size: (chunk_count.max(1) * 8) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
 
@@ -536,6 +649,8 @@ impl GpuCull {
                 compute_buffer_entry(4, rw),
                 compute_buffer_entry(5, rw),
                 compute_buffer_entry(6, rw),
+                compute_buffer_entry(7, rw),
+                compute_buffer_entry(8, rw),
             ],
         });
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -568,7 +683,15 @@ impl GpuCull {
                 },
                 wgpu::BindGroupEntry {
                     binding: 6,
-                    resource: backdrop_args_buf.as_entire_binding(),
+                    resource: aux_args_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 7,
+                    resource: packed_slots_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 8,
+                    resource: packed_meta_buf.as_entire_binding(),
                 },
             ],
         });
@@ -590,26 +713,65 @@ impl GpuCull {
         let classify = pipeline("cull classify", "cs_classify");
         let draw_args = pipeline("cull draw args", "cs_draw_args");
         let compact = pipeline("cull backdrop compact", "cs_backdrop_compact");
+        let pack = pipeline("cull pack", "cs_pack");
+        let slot_limit = std::env::var_os("GLYPH_MDI_LIMIT").map(|v| {
+            let n: u32 = v
+                .to_string_lossy()
+                .trim()
+                .parse()
+                .expect("GLYPH_MDI_LIMIT must be a non-negative integer");
+            log::warn!("GLYPH_MDI_LIMIT={n}: indirect draw slots capped per chunk — MEASUREMENT ONLY, output is not the full scene");
+            n
+        });
         log::info!(
-            "cull (GPU): {} segments → {} draw slots over {} chunk(s) | segment table {} B, draw args {} B (multi_draw_indirect per chunk, draw_indirect for backdrops)",
+            "cull ({mode:?}): {} segments → {} draw slots over {} chunk(s) | segment table {} B, draw args {} B ({})",
             segments.len(),
             slots.len(),
             chunk_count,
             std::mem::size_of_val(segments),
             slots_upload.len() as u64 * args_size,
+            if mode == CullMode::GpuPacked {
+                "one packed draw_indirect per chunk, draw_indirect for backdrops"
+            } else {
+                "multi_draw_indirect per chunk, draw_indirect for backdrops"
+            },
         );
 
         Self {
             seg_buf,
             params_buf,
             args_buf,
-            backdrop_args_buf,
+            aux_args_buf,
             slot_ranges,
             slots,
+            slot_limit,
             classify,
             draw_args,
             compact,
             bind_group,
+            mode,
+            packed_slots_buf,
+            packed_meta_buf,
+            pack,
+        }
+    }
+
+    /// The per-frame uniform for `frame` — shared by render() and the verify
+    /// path so both describe the same chunk layout to the shaders.
+    fn params(&self, seg_count: u32, planes: [[f32; 4]; 6], eye: Vec3, px_scale: f32) -> CullParams {
+        let mut chunk_ranges = [[0u32; 4]; MAX_CHUNKS];
+        for (dst, &(first, n)) in chunk_ranges.iter_mut().zip(self.slot_ranges.iter()) {
+            *dst = [first, n, 0, 0];
+        }
+        CullParams {
+            planes,
+            eye: eye.to_array(),
+            px_scale,
+            lod_min_px: LOD_MIN_PX,
+            seg_count,
+            slot_count: self.slots.len() as u32,
+            chunk_count: self.slot_ranges.len() as u32,
+            chunk_ranges,
         }
     }
 }
@@ -1016,13 +1178,14 @@ impl CullState {
 
         // Stage K: the GPU twin shares the backdrop buffer (it writes the
         // compacted list the same vs_backdrop reads).
-        let gpu = (arena.mode == CullMode::Gpu).then(|| {
+        let gpu = arena.mode.is_gpu().then(|| {
             GpuCull::new(
                 ctx,
                 segments,
                 &backdrop_insts_buf,
                 arena.chunk_cap,
                 arena.chunk_count,
+                arena.mode,
             )
         });
 
@@ -1066,6 +1229,9 @@ pub struct GlyphScene {
     /// Stage F: present unless culling is disabled (`--no-cull`); None keeps
     /// the legacy per-chunk draws.
     cull: Option<CullState>,
+    /// Stage K: the packed form's vs_packed pipeline + per-chunk bind groups
+    /// (`CullMode::GpuPacked` only).
+    packed_draw: Option<PackedDraw>,
     // ── Stage G: picking & live manipulation ────────────────────────────
     /// Arena chunk buffers, kept for partial per-slot uploads (verbs).
     instance_bufs: Vec<wgpu::Buffer>,
@@ -1129,7 +1295,21 @@ impl GlyphScene {
         }
 
         // Chunk the arena so no storage BUFFER exceeds the binding limit.
-        let binding_limit = ctx.device.limits().max_storage_buffer_binding_size as usize;
+        // Stage K: never let an arena chunk reach 4 GiB. naga's MSL bounds
+        // checks carry buffer sizes as `uint` (`_mslBufferSizes`), so a
+        // storage binding of 4 GiB or more reads as entirely out of bounds —
+        // every glyph culls, blank frame. wgpu only clamps the reported
+        // limits to u32::MAX while its indirect validation is ON
+        // (adjust_limits_for_indirect_validation); with it off the M2 reports
+        // 9093 MiB and the Stage E2 chunking, built against "4095 MiB", put
+        // the whole 4357 MiB corpus into one chunk. Found by the Stage K
+        // WGPU_VALIDATION_INDIRECT_CALL=0 experiments; the clamp reproduces
+        // the validation-on chunking exactly (89,478,485 slots per chunk).
+        let binding_limit = ctx
+            .device
+            .limits()
+            .max_storage_buffer_binding_size
+            .min(u64::from(u32::MAX)) as usize;
         let mut chunk_cap = (binding_limit / std::mem::size_of::<GlyphInstance>()).max(1);
         // Stage K: debug lever — GLYPH_CHUNK_CAP=<n> forces small arena chunks
         // so the fixture repo exercises the multi-chunk slot split of both
@@ -1215,89 +1395,54 @@ impl GlyphScene {
             },
             count: None,
         };
+        let vs_buffer = |binding: u32, ty: wgpu::BufferBindingType, visibility: wgpu::ShaderStages| {
+            wgpu::BindGroupLayoutEntry {
+                binding,
+                visibility,
+                ty: wgpu::BindingType::Buffer {
+                    ty,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            }
+        };
+        let ro = wgpu::BufferBindingType::Storage { read_only: true };
+        // The Stage C glyph bindings 0-5; the Stage K packed form appends 6-8
+        // (prefix table, chunk meta, chunk index) to the SAME list, so the
+        // vs_main pipeline's layout is untouched.
+        let glyph_entries = vec![
+            vs_buffer(0, wgpu::BufferBindingType::Uniform, wgpu::ShaderStages::VERTEX),
+            vs_buffer(1, ro, wgpu::ShaderStages::VERTEX),
+            vs_buffer(2, ro, wgpu::ShaderStages::VERTEX),
+            uint_tex(3, wgpu::ShaderStages::VERTEX),   // glyphmap
+            uint_tex(4, wgpu::ShaderStages::FRAGMENT), // curves
+            vs_buffer(
+                5,
+                wgpu::BufferBindingType::Uniform,
+                wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
+            ),
+        ];
         let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("glyph bgl"),
-            entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::VERTEX,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::VERTEX,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: true },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 2,
-                    visibility: wgpu::ShaderStages::VERTEX,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: true },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                uint_tex(3, wgpu::ShaderStages::VERTEX),   // glyphmap
-                uint_tex(4, wgpu::ShaderStages::FRAGMENT), // curves
-                wgpu::BindGroupLayoutEntry {
-                    binding: 5,
-                    visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-            ],
+            entries: &glyph_entries,
         });
+        let glyphmap_view = atlas.glyphmap.create_view(&Default::default());
+        let curves_view = atlas.curves.create_view(&Default::default());
+        let shared = GlyphBindings {
+            camera: &camera_buf,
+            groups: &group_buf,
+            glyphmap: &glyphmap_view,
+            curves: &curves_view,
+            params: &params_buf,
+        };
         let bind_groups: Vec<wgpu::BindGroup> = instance_bufs
             .iter()
             .map(|buf| {
                 device.create_bind_group(&wgpu::BindGroupDescriptor {
                     label: Some("glyph bg"),
                     layout: &bgl,
-                    entries: &[
-                        wgpu::BindGroupEntry {
-                            binding: 0,
-                            resource: camera_buf.as_entire_binding(),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 1,
-                            resource: buf.as_entire_binding(),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 2,
-                            resource: group_buf.as_entire_binding(),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 3,
-                            resource: wgpu::BindingResource::TextureView(
-                                &atlas.glyphmap.create_view(&Default::default()),
-                            ),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 4,
-                            resource: wgpu::BindingResource::TextureView(
-                                &atlas.curves.create_view(&Default::default()),
-                            ),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 5,
-                            resource: params_buf.as_entire_binding(),
-                        },
-                    ],
+                    entries: &shared.entries(buf),
                 })
             })
             .collect();
@@ -1313,56 +1458,62 @@ impl GlyphScene {
             bind_group_layouts: &[Some(&bgl)],
             immediate_size: 0,
         });
-        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("glyph field pipeline"),
-            layout: Some(&layout),
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: Some("vs_main"),
-                compilation_options: Default::default(),
-                buffers: &[], // geometry from vertex_index — no vertex buffers
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &shader,
-                entry_point: Some("fs_main"),
-                compilation_options: Default::default(),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: color_format,
-                    // Premultiplied-alpha compositing: fragment outputs
-                    // rgb·alpha and alpha; ONE / 1−SrcAlpha is the correct
-                    // coverage composite (see shader header note).
-                    blend: Some(wgpu::BlendState {
-                        color: wgpu::BlendComponent {
-                            src_factor: wgpu::BlendFactor::One,
-                            dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
-                            operation: wgpu::BlendOperation::Add,
-                        },
-                        alpha: wgpu::BlendComponent {
-                            src_factor: wgpu::BlendFactor::One,
-                            dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
-                            operation: wgpu::BlendOperation::Add,
-                        },
-                    }),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-            }),
-            primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::TriangleList,
-                cull_mode: None,
-                ..Default::default()
-            },
-            depth_stencil: Some(wgpu::DepthStencilState {
-                format: depth_format,
-                // Blended coverage pass: test but don't write depth.
-                depth_write_enabled: Some(false),
-                depth_compare: Some(wgpu::CompareFunction::Less),
-                stencil: Default::default(),
-                bias: Default::default(),
-            }),
-            multisample: wgpu::MultisampleState::default(), // AA is analytic
-            multiview_mask: None,
-            cache: None,
-        });
+        // Stage K: the same pipeline state serves vs_main (direct/multi-draw
+        // paths) and vs_packed (packed indirect path) — only the vertex entry
+        // point and the layout differ.
+        let glyph_pipeline = |label: &str, layout: &wgpu::PipelineLayout, vs_entry: &str| {
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some(label),
+                layout: Some(layout),
+                vertex: wgpu::VertexState {
+                    module: &shader,
+                    entry_point: Some(vs_entry),
+                    compilation_options: Default::default(),
+                    buffers: &[], // geometry from vertex_index — no vertex buffers
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &shader,
+                    entry_point: Some("fs_main"),
+                    compilation_options: Default::default(),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: color_format,
+                        // Premultiplied-alpha compositing: fragment outputs
+                        // rgb·alpha and alpha; ONE / 1−SrcAlpha is the correct
+                        // coverage composite (see shader header note).
+                        blend: Some(wgpu::BlendState {
+                            color: wgpu::BlendComponent {
+                                src_factor: wgpu::BlendFactor::One,
+                                dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+                                operation: wgpu::BlendOperation::Add,
+                            },
+                            alpha: wgpu::BlendComponent {
+                                src_factor: wgpu::BlendFactor::One,
+                                dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+                                operation: wgpu::BlendOperation::Add,
+                            },
+                        }),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleList,
+                    cull_mode: None,
+                    ..Default::default()
+                },
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: depth_format,
+                    // Blended coverage pass: test but don't write depth.
+                    depth_write_enabled: Some(false),
+                    depth_compare: Some(wgpu::CompareFunction::Less),
+                    stencil: Default::default(),
+                    bias: Default::default(),
+                }),
+                multisample: wgpu::MultisampleState::default(), // AA is analytic
+                multiview_mask: None,
+                cache: None,
+            })
+        };
+        let pipeline = glyph_pipeline("glyph field pipeline", &layout, "vs_main");
 
         // Camera fit from staged bounds (or the Stage E2 focus-file override).
         let (center, half_w, half_h) = match staged.focus_bounds {
@@ -1419,7 +1570,7 @@ impl GlyphScene {
                 log::info!("culling disabled (--cull off) — legacy per-chunk draws");
                 None
             }
-            CullMode::Cpu | CullMode::Gpu => Some(CullState::new(
+            CullMode::Cpu | CullMode::Gpu | CullMode::GpuPacked => Some(CullState::new(
                 ctx,
                 color_format,
                 depth_format,
@@ -1432,6 +1583,68 @@ impl GlyphScene {
                     mode: cull_mode,
                 },
             )),
+        };
+
+        // Stage K packed form: vs_packed + the same fragment stage; one bind
+        // group per chunk = the six glyph bindings + cs_pack's outputs + this
+        // chunk's index. Built here (not in CullState) because it needs the
+        // atlas views and the glyph layout.
+        let packed_draw = match (&cull, cull_mode) {
+            (Some(cull), CullMode::GpuPacked) => {
+                let gpu = cull.gpu.as_ref().expect("GpuPacked always builds a GpuCull");
+                let mut packed_entries = glyph_entries.clone();
+                packed_entries.push(vs_buffer(6, ro, wgpu::ShaderStages::VERTEX));
+                packed_entries.push(vs_buffer(7, ro, wgpu::ShaderStages::VERTEX));
+                packed_entries.push(vs_buffer(
+                    8,
+                    wgpu::BufferBindingType::Uniform,
+                    wgpu::ShaderStages::VERTEX,
+                ));
+                let packed_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                    label: Some("glyph packed bgl"),
+                    entries: &packed_entries,
+                });
+                let packed_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                    label: Some("glyph packed pl"),
+                    bind_group_layouts: &[Some(&packed_bgl)],
+                    immediate_size: 0,
+                });
+                let pipeline = glyph_pipeline("glyph field pipeline (packed)", &packed_layout, "vs_packed");
+                let bind_groups = instance_bufs
+                    .iter()
+                    .enumerate()
+                    .map(|(c, buf)| {
+                        let chunk_index_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                            label: Some("packed chunk index"),
+                            contents: bytemuck::bytes_of(&[c as u32, 0, 0, 0]),
+                            usage: wgpu::BufferUsages::UNIFORM,
+                        });
+                        let mut entries = shared.entries(buf).to_vec();
+                        entries.push(wgpu::BindGroupEntry {
+                            binding: 6,
+                            resource: gpu.packed_slots_buf.as_entire_binding(),
+                        });
+                        entries.push(wgpu::BindGroupEntry {
+                            binding: 7,
+                            resource: gpu.packed_meta_buf.as_entire_binding(),
+                        });
+                        entries.push(wgpu::BindGroupEntry {
+                            binding: 8,
+                            resource: chunk_index_buf.as_entire_binding(),
+                        });
+                        device.create_bind_group(&wgpu::BindGroupDescriptor {
+                            label: Some("glyph packed bg"),
+                            layout: &packed_bgl,
+                            entries: &entries,
+                        })
+                    })
+                    .collect();
+                Some(PackedDraw {
+                    pipeline,
+                    bind_groups,
+                })
+            }
+            _ => None,
         };
 
         let pick = staged.pick;
@@ -1453,6 +1666,7 @@ impl GlyphScene {
             camera_mode,
             fly,
             cull,
+            packed_draw,
             instance_bufs,
             group_buf,
             groups_cpu,
@@ -1994,41 +2208,97 @@ impl GlyphScene {
         let args: Vec<wgpu::util::DrawIndirectArgs> = bytemuck::pod_collect_to_vec(
             &crate::gpu::read_buffer(ctx, &gpu.args_buf, 0, gpu.slots.len().max(1) as u64 * args_size),
         );
-        let backdrop_args: wgpu::util::DrawIndirectArgs = bytemuck::pod_read_unaligned(
-            &crate::gpu::read_buffer(ctx, &gpu.backdrop_args_buf, 0, args_size),
+        // aux_args: [0] backdrop stream, [1 + c] packed chunk c.
+        let aux_args: Vec<wgpu::util::DrawIndirectArgs> = bytemuck::pod_collect_to_vec(
+            &crate::gpu::read_buffer(ctx, &gpu.aux_args_buf, 0, u64::from(1 + chunk_count) * args_size),
         );
+        let backdrop_args = aux_args[0];
 
         let mut issues: Vec<String> = Vec::new();
         let mut gpu_draw_total = 0usize;
-        for (c, &(first, n)) in gpu.slot_ranges.iter().enumerate() {
-            let mut gpu_ranges: Vec<std::ops::Range<u32>> = Vec::new();
-            for i in first..first + n {
-                let a = args[i as usize];
-                if a.vertex_count != 6 || a.first_vertex != 0 {
+        if gpu.mode == CullMode::GpuPacked {
+            // Packed form: per chunk, one args entry (instance total), the
+            // (first, count) meta and the (prefix, base) list must equal the
+            // CPU ranges walked in order.
+            let pargs = &aux_args[1..];
+            let meta: Vec<[u32; 2]> = bytemuck::pod_collect_to_vec(&crate::gpu::read_buffer(
+                ctx,
+                &gpu.packed_meta_buf,
+                0,
+                u64::from(chunk_count) * 8,
+            ));
+            let pslots: Vec<[u32; 2]> = bytemuck::pod_collect_to_vec(&crate::gpu::read_buffer(
+                ctx,
+                &gpu.packed_slots_buf,
+                0,
+                gpu.slots.len().max(1) as u64 * 8,
+            ));
+            for (c, cpu_ranges) in cpu_draws.iter().enumerate() {
+                let total: u32 = cpu_ranges.iter().map(|r| r.end - r.start).sum();
+                let a = pargs[c];
+                if a.vertex_count != 6 || a.first_vertex != 0 || a.first_instance != 0 {
+                    issues.push(format!("chunk {c}: malformed packed args {a:?}"));
+                }
+                if a.instance_count != total {
                     issues.push(format!(
-                        "chunk {c} slot {i}: malformed args vertex_count={} first_vertex={}",
-                        a.vertex_count, a.first_vertex
+                        "chunk {c}: packed instance_count gpu {} vs cpu {total}",
+                        a.instance_count
                     ));
                 }
-                if a.instance_count > 0 {
-                    gpu_ranges.push(a.first_instance..a.first_instance + a.instance_count);
+                let first = meta[c][0] as usize;
+                let n = meta[c][1] as usize;
+                gpu_draw_total += n;
+                if n != cpu_ranges.len() {
+                    issues.push(format!(
+                        "chunk {c}: packed visible slots gpu {n} vs cpu {}",
+                        cpu_ranges.len()
+                    ));
+                    continue;
+                }
+                let mut prefix = 0u32;
+                for (k, r) in cpu_ranges.iter().enumerate() {
+                    let want = [prefix, r.start];
+                    let got = pslots.get(first + k).copied().unwrap_or([u32::MAX; 2]);
+                    if got != want {
+                        issues.push(format!(
+                            "chunk {c}: packed slot #{k} (prefix, base) gpu {got:?} vs cpu {want:?}"
+                        ));
+                        break;
+                    }
+                    prefix += r.end - r.start;
                 }
             }
-            gpu_draw_total += gpu_ranges.len();
-            let cpu_ranges = &cpu_draws[c];
-            if gpu_ranges != *cpu_ranges {
-                let at = gpu_ranges
-                    .iter()
-                    .zip(cpu_ranges.iter())
-                    .position(|(g, p)| g != p)
-                    .unwrap_or(gpu_ranges.len().min(cpu_ranges.len()));
-                issues.push(format!(
-                    "chunk {c}: gpu {} draw ranges vs cpu {}; first divergence at draw #{at}: gpu {:?} cpu {:?}",
-                    gpu_ranges.len(),
-                    cpu_ranges.len(),
-                    gpu_ranges.get(at),
-                    cpu_ranges.get(at)
-                ));
+        } else {
+            for (c, &(first, n)) in gpu.slot_ranges.iter().enumerate() {
+                let mut gpu_ranges: Vec<std::ops::Range<u32>> = Vec::new();
+                for i in first..first + n {
+                    let a = args[i as usize];
+                    if a.vertex_count != 6 || a.first_vertex != 0 {
+                        issues.push(format!(
+                            "chunk {c} slot {i}: malformed args vertex_count={} first_vertex={}",
+                            a.vertex_count, a.first_vertex
+                        ));
+                    }
+                    if a.instance_count > 0 {
+                        gpu_ranges.push(a.first_instance..a.first_instance + a.instance_count);
+                    }
+                }
+                gpu_draw_total += gpu_ranges.len();
+                let cpu_ranges = &cpu_draws[c];
+                if gpu_ranges != *cpu_ranges {
+                    let at = gpu_ranges
+                        .iter()
+                        .zip(cpu_ranges.iter())
+                        .position(|(g, p)| g != p)
+                        .unwrap_or(gpu_ranges.len().min(cpu_ranges.len()));
+                    issues.push(format!(
+                        "chunk {c}: gpu {} draw ranges vs cpu {}; first divergence at draw #{at}: gpu {:?} cpu {:?}",
+                        gpu_ranges.len(),
+                        cpu_ranges.len(),
+                        gpu_ranges.get(at),
+                        cpu_ranges.get(at)
+                    ));
+                }
             }
         }
         if backdrop_args.vertex_count != 6
@@ -2067,8 +2337,9 @@ impl GlyphScene {
         }
         let cpu_draw_total: usize = cpu_draws.iter().map(|c| c.len()).sum();
         let summary = format!(
-            "cull-verify: {} — glyph draws gpu {gpu_draw_total} vs cpu {cpu_draw_total} over {chunk_count} chunk(s) ({} slots), backdrops gpu {gpu_backdrops} vs cpu {} (bytes {backdrop_bytes})",
+            "cull-verify: {} — [{:?}] glyph draws gpu {gpu_draw_total} vs cpu {cpu_draw_total} over {chunk_count} chunk(s) ({} slots), backdrops gpu {gpu_backdrops} vs cpu {} (bytes {backdrop_bytes})",
             if issues.is_empty() { "EXACT" } else { "MISMATCH" },
+            gpu.mode,
             gpu.slots.len(),
             cpu_backdrops.len(),
         );
@@ -2638,15 +2909,7 @@ impl SceneLike for GlyphScene {
             let chunk_count = self.bind_groups.len() as u32;
             let debug = std::env::var_os("GLYPH_CULL_DEBUG").is_some() && t == 0.0;
             if let Some(gpu) = &cull.gpu {
-                let params = CullParams {
-                    planes,
-                    eye: frame.eye.to_array(),
-                    px_scale,
-                    lod_min_px: LOD_MIN_PX,
-                    seg_count: cull.segments.len() as u32,
-                    slot_count: gpu.slots.len() as u32,
-                    _pad: 0,
-                };
+                let params = gpu.params(cull.segments.len() as u32, planes, frame.eye, px_scale);
                 ctx.queue
                     .write_buffer(&gpu.params_buf, 0, bytemuck::bytes_of(&params));
                 let cull_query = ctx
@@ -2663,8 +2926,13 @@ impl SceneLike for GlyphScene {
                     cpass.set_bind_group(0, &gpu.bind_group, &[]);
                     cpass.set_pipeline(&gpu.classify);
                     cpass.dispatch_workgroups((cull.segments.len() as u32).div_ceil(64), 1, 1);
-                    cpass.set_pipeline(&gpu.draw_args);
-                    cpass.dispatch_workgroups((gpu.slots.len() as u32).div_ceil(64), 1, 1);
+                    if gpu.mode == CullMode::GpuPacked {
+                        cpass.set_pipeline(&gpu.pack);
+                        cpass.dispatch_workgroups(1, 1, 1);
+                    } else {
+                        cpass.set_pipeline(&gpu.draw_args);
+                        cpass.dispatch_workgroups((gpu.slots.len() as u32).div_ceil(64), 1, 1);
+                    }
                     cpass.set_pipeline(&gpu.compact);
                     cpass.dispatch_workgroups(1, 1, 1);
                 }
@@ -2762,25 +3030,43 @@ impl SceneLike for GlyphScene {
                 .map(|p| p.borrow().begin_query("backdrop stream (indirect)", &mut pass));
             pass.set_pipeline(&cull.backdrop_pipeline);
             pass.set_bind_group(0, &cull.backdrop_bind_group, &[]);
-            pass.draw_indirect(&gpu.backdrop_args_buf, 0);
+            pass.draw_indirect(&gpu.aux_args_buf, 0);
             if let (Some(p), Some(q)) = (&ctx.profiler, q) {
                 p.borrow().end_query(&mut pass, q);
             }
-            let q = ctx
-                .profiler
-                .as_ref()
-                .map(|p| p.borrow().begin_query("glyph stream (multi-draw indirect)", &mut pass));
-            pass.set_pipeline(&self.pipeline);
             let args_size = std::mem::size_of::<wgpu::util::DrawIndirectArgs>() as u64;
-            for (bg, &(first, n)) in self.bind_groups.iter().zip(gpu.slot_ranges.iter()) {
-                if n == 0 {
-                    continue;
+            if let Some(packed) = &self.packed_draw {
+                // Packed form: ONE indirect draw per chunk over the visible
+                // instance total; vs_packed remaps through the prefix table.
+                let q = ctx
+                    .profiler
+                    .as_ref()
+                    .map(|p| p.borrow().begin_query("glyph stream (packed indirect)", &mut pass));
+                pass.set_pipeline(&packed.pipeline);
+                for (c, bg) in packed.bind_groups.iter().enumerate() {
+                    pass.set_bind_group(0, bg, &[]);
+                    pass.draw_indirect(&gpu.aux_args_buf, (1 + c as u64) * args_size);
                 }
-                pass.set_bind_group(0, bg, &[]);
-                pass.multi_draw_indirect(&gpu.args_buf, u64::from(first) * args_size, n);
-            }
-            if let (Some(p), Some(q)) = (&ctx.profiler, q) {
-                p.borrow().end_query(&mut pass, q);
+                if let (Some(p), Some(q)) = (&ctx.profiler, q) {
+                    p.borrow().end_query(&mut pass, q);
+                }
+            } else {
+                let q = ctx
+                    .profiler
+                    .as_ref()
+                    .map(|p| p.borrow().begin_query("glyph stream (multi-draw indirect)", &mut pass));
+                pass.set_pipeline(&self.pipeline);
+                for (bg, &(first, n)) in self.bind_groups.iter().zip(gpu.slot_ranges.iter()) {
+                    let n = gpu.slot_limit.map_or(n, |limit| n.min(limit));
+                    if n == 0 {
+                        continue;
+                    }
+                    pass.set_bind_group(0, bg, &[]);
+                    pass.multi_draw_indirect(&gpu.args_buf, u64::from(first) * args_size, n);
+                }
+                if let (Some(p), Some(q)) = (&ctx.profiler, q) {
+                    p.borrow().end_query(&mut pass, q);
+                }
             }
         } else if let (Some(cull), Some((draws, backdrops))) = (&self.cull, &culled_draws) {
             // Far LOD stream first: one instanced draw over the compacted
@@ -2834,16 +3120,13 @@ impl SceneLike for GlyphScene {
                 p.borrow().end_query(&mut pass, q);
             }
         }
-        // Stage K: ending the pass REPLAYS it into the Metal encoder — for
-        // the GPU path that is the O(segments) loop of single indirect draws
-        // wgpu-hal emulates multi_draw_indirect with; for the CPU path the
-        // O(visible) direct draws. Timed as a CPU scope so the two encode
-        // costs are directly comparable under GLYPH_PROFILE=1.
-        let end_t0 = ctx.profiler.as_ref().map(|_| std::time::Instant::now());
+        // Stage K: wgpu 30 only QUEUES the pass here (render_pass_end pushes
+        // a RunRenderPass command); the Metal encoding — the O(segments)
+        // loop of single indirect draws wgpu-hal emulates multi_draw_indirect
+        // with on the GPU path, the O(visible) direct draws on the CPU path —
+        // happens in `encoder.finish()`, which offscreen/windowed time as
+        // the "encoder finish (CPU)" scope under GLYPH_PROFILE=1.
         drop(pass);
-        if let Some(t0) = end_t0 {
-            crate::gpu::record_cpu_scope(ctx, "pass end (CPU)", t0.elapsed().as_secs_f64() * 1000.0);
-        }
         if let (Some(p), Some(q)) = (&ctx.profiler, pass_query) {
             p.borrow().end_query(encoder, q);
         }
@@ -2929,8 +3212,8 @@ mod layout_tests {
         }
         assert_eq!(<DrawSlot as ShaderSize>::SHADER_SIZE.get(), 16);
         assert_eq!(std::mem::size_of::<DrawSlot>(), 16);
-        assert_eq!(<CullParams as ShaderSize>::SHADER_SIZE.get(), 128, "6 planes + eye/px/lod + counts");
-        assert_eq!(std::mem::size_of::<CullParams>(), 128);
+        assert_eq!(<CullParams as ShaderSize>::SHADER_SIZE.get(), 384, "6 planes + eye/px/lod + counts + 16 chunk ranges");
+        assert_eq!(std::mem::size_of::<CullParams>(), 384);
         let param_fields = [
             ("planes", 0),
             ("eye", 96),
@@ -2938,7 +3221,8 @@ mod layout_tests {
             ("lod_min_px", 112),
             ("seg_count", 116),
             ("slot_count", 120),
-            ("_pad", 124),
+            ("chunk_count", 124),
+            ("chunk_ranges", 128),
         ];
         for (i, (name, off)) in param_fields.iter().enumerate() {
             assert_eq!(CullParams::METADATA.offset(i), *off as u64, "CullParams field {name} offset");

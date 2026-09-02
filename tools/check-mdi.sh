@@ -36,29 +36,37 @@ else
   tail -25 "$OUT/mdi-probe.log"; echo "FAIL  mdi-probe"; FAIL=1
 fi
 
-# view <name> <args...>: gpu(+verify) and cpu renders, then cmp.
+# view <name> <args...>: cpu render, then gpu and gpu-packed renders with
+# --cull-verify, each byte-compared against the cpu render.
 view() {
   local name=$1; shift
-  local glog="$OUT/$name-gpu.log" clog="$OUT/$name-cpu.log"
-  (cd native && GLYPH_CULL_DEBUG=1 "$BIN" "$@" --frames 2 --cull gpu --cull-verify \
-      --screenshot "$OUT/$name-gpu.png" > "$glog" 2>&1)
-  local grc=$?
+  local clog="$OUT/$name-cpu.log"
+  # Never compare against a stale render from an earlier run.
+  rm -f "$OUT/$name-cpu.png" "$OUT/$name-gpu.png" "$OUT/$name-gpu-packed.png"
   (cd native && GLYPH_CULL_DEBUG=1 "$BIN" "$@" --frames 2 --cull cpu \
       --screenshot "$OUT/$name-cpu.png" > "$clog" 2>&1)
   local crc=$?
-  local verify dbg
-  verify=$(grep -E '^cull-verify:' "$glog" | head -1)
+  local dbg
   dbg=$(grep -E '^CULLDBG' "$clog" | head -1 | sed 's/^CULLDBG //')
-  if [ "$grc" = 0 ] && grep -q '^cull-verify: EXACT' "$glog"; then
-    echo "PASS  $name  verify ${verify#cull-verify: }"
-  else
-    echo "FAIL  $name  verify (rc=$grc): ${verify:-no cull-verify line}"; tail -6 "$glog"; FAIL=1
-  fi
-  if [ "$crc" = 0 ] && cmp -s "$OUT/$name-gpu.png" "$OUT/$name-cpu.png"; then
-    echo "PASS  $name  cpu vs gpu BYTE-EQUAL  [cpu cull: $dbg]"
-  else
-    echo "FAIL  $name  cpu vs gpu DIFFER (cpu rc=$crc)"; FAIL=1
-  fi
+  [ "$crc" = 0 ] || { echo "FAIL  $name  cpu render exited $crc"; tail -4 "$clog"; FAIL=1; }
+  for mode in gpu gpu-packed; do
+    local glog="$OUT/$name-$mode.log"
+    (cd native && GLYPH_CULL_DEBUG=1 "$BIN" "$@" --frames 2 --cull "$mode" --cull-verify \
+        --screenshot "$OUT/$name-$mode.png" > "$glog" 2>&1)
+    local grc=$?
+    local verify
+    verify=$(grep -E '^cull-verify:' "$glog" | head -1)
+    if [ "$grc" = 0 ] && grep -q '^cull-verify: EXACT' "$glog"; then
+      echo "PASS  $name [$mode]  verify ${verify#cull-verify: }"
+    else
+      echo "FAIL  $name [$mode]  verify (rc=$grc): ${verify:-no cull-verify line}"; tail -6 "$glog"; FAIL=1
+    fi
+    if [ "$crc" = 0 ] && cmp -s "$OUT/$name-$mode.png" "$OUT/$name-cpu.png"; then
+      echo "PASS  $name [$mode]  vs cpu BYTE-EQUAL  [cpu cull: $dbg]"
+    else
+      echo "FAIL  $name [$mode]  vs cpu DIFFER"; FAIL=1
+    fi
+  done
 }
 
 step "2/3 per view — GPU args == CPU cull (exact), renders byte-equal"
@@ -72,26 +80,30 @@ view repo-move --load-repo fixtures/g-pick-repo --zoom 0.5 --pick-file wide.txt 
 
 step "3/3 multi-chunk arena (GLYPH_CHUNK_CAP) — draw-slot split across chunks"
 for cap in 977 4096; do
-  glog="$OUT/chunk$cap-gpu.log"; clog="$OUT/chunk$cap-cpu.log"
-  (cd native && GLYPH_CHUNK_CAP=$cap GLYPH_CULL_DEBUG=1 "$BIN" --load-repo fixtures/g-pick-repo --frames 2 \
-      --cull gpu --cull-verify --screenshot "$OUT/chunk$cap-gpu.png" > "$glog" 2>&1)
-  grc=$?
+  clog="$OUT/chunk$cap-cpu.log"
+  rm -f "$OUT/chunk$cap-cpu.png" "$OUT/chunk$cap-gpu.png" "$OUT/chunk$cap-gpu-packed.png"
   (cd native && GLYPH_CHUNK_CAP=$cap "$BIN" --load-repo fixtures/g-pick-repo --frames 2 \
       --cull cpu --screenshot "$OUT/chunk$cap-cpu.png" > "$clog" 2>&1)
   crc=$?
-  chunks=$(grep -oE 'in [0-9]+ chunk\(s\)' "$glog" | head -1)
-  verify=$(grep -E '^cull-verify:' "$glog" | head -1)
-  if [ "$grc" = 0 ] && grep -q '^cull-verify: EXACT' "$glog"; then
-    echo "PASS  cap=$cap ($chunks)  verify ${verify#cull-verify: }"
-  else
-    echo "FAIL  cap=$cap verify (rc=$grc): ${verify:-no cull-verify line}"; tail -6 "$glog"; FAIL=1
-  fi
-  if [ "$crc" = 0 ] && cmp -s "$OUT/chunk$cap-gpu.png" "$OUT/chunk$cap-cpu.png" \
-       && cmp -s "$OUT/chunk$cap-gpu.png" "$OUT/repo-wide-gpu.png"; then
-    echo "PASS  cap=$cap  cpu vs gpu vs single-chunk BYTE-EQUAL"
-  else
-    echo "FAIL  cap=$cap  renders diverge (cpu rc=$crc)"; FAIL=1
-  fi
+  for mode in gpu gpu-packed; do
+    glog="$OUT/chunk$cap-$mode.log"
+    (cd native && GLYPH_CHUNK_CAP=$cap GLYPH_CULL_DEBUG=1 "$BIN" --load-repo fixtures/g-pick-repo --frames 2 \
+        --cull "$mode" --cull-verify --screenshot "$OUT/chunk$cap-$mode.png" > "$glog" 2>&1)
+    grc=$?
+    chunks=$(grep -oE 'in [0-9]+ chunk\(s\)' "$glog" | head -1)
+    verify=$(grep -E '^cull-verify:' "$glog" | head -1)
+    if [ "$grc" = 0 ] && grep -q '^cull-verify: EXACT' "$glog"; then
+      echo "PASS  cap=$cap [$mode] ($chunks)  verify ${verify#cull-verify: }"
+    else
+      echo "FAIL  cap=$cap [$mode] verify (rc=$grc): ${verify:-no cull-verify line}"; tail -6 "$glog"; FAIL=1
+    fi
+    if [ "$crc" = 0 ] && cmp -s "$OUT/chunk$cap-$mode.png" "$OUT/chunk$cap-cpu.png" \
+         && cmp -s "$OUT/chunk$cap-$mode.png" "$OUT/repo-wide-cpu.png"; then
+      echo "PASS  cap=$cap [$mode]  vs cpu vs single-chunk BYTE-EQUAL"
+    else
+      echo "FAIL  cap=$cap [$mode]  renders diverge (cpu rc=$crc)"; FAIL=1
+    fi
+  done
 done
 
 echo

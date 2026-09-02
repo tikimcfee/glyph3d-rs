@@ -24,10 +24,18 @@
 // Stage F note: the renderer no longer draws the whole chunk per frame.
 // The CPU cull (glyph_scene.rs module header) issues ONE RANGE DRAW per
 // visible segment per chunk — draw(0..6, base..base+count), instance_index
-// chunk-local — so this shader is byte-for-byte unchanged from Stage E2 and
-// blending order within each chunk still matches the legacy full draws
-// (segment ranges ascend in arena order). Far (subpixel) segments are
-// substituted by flat backdrop quads from cull.wgsl, never partially drawn.
+// chunk-local — so vs_main is unchanged from Stage E2 and blending order
+// within each chunk still matches the legacy full draws (segment ranges
+// ascend in arena order). Far (subpixel) segments are substituted by flat
+// backdrop quads from cull.wgsl, never partially drawn.
+//
+// Stage K: the GPU cull's multi-draw form (`--cull gpu`) issues the same
+// per-segment ranges as indirect draws — vs_main, untouched. Its PACKED form
+// (`--cull gpu-packed`) issues ONE indirect draw per chunk over the visible
+// instance total and uses vs_packed, which maps the dense instance_index
+// back to an arena slot through the visible-slot prefix table cs_pack wrote
+// (cull_gpu.wgsl): binary search over (prefix, base) pairs, then the shared
+// glyph_vertex body. Same slots in the same order ⇒ same pixels.
 
 const MAX_CURVES: u32 = 256u;
 const TEX_W: i32 = 1024;
@@ -81,6 +89,17 @@ struct Params {
 @group(0) @binding(3) var glyphmap: texture_2d<u32>;
 @group(0) @binding(4) var curves: texture_2d<u32>;
 @group(0) @binding(5) var<uniform> params: Params;
+// Stage K packed form only (vs_packed): the cs_pack outputs, and which arena
+// chunk this bind group draws (packed_meta is indexed by it).
+@group(0) @binding(6) var<storage, read> packed_slots: array<vec2<u32>>;
+@group(0) @binding(7) var<storage, read> packed_meta: array<vec2<u32>>;
+struct PackedChunk {
+    index: u32,
+    _p0: u32,
+    _p1: u32,
+    _p2: u32,
+};
+@group(0) @binding(8) var<uniform> packed_chunk: PackedChunk;
 
 struct VsOut {
     @builtin(position) clip: vec4<f32>,
@@ -97,6 +116,36 @@ fn vs_main(
     @builtin(vertex_index) vi: u32,
     @builtin(instance_index) ii: u32,
 ) -> VsOut {
+    return glyph_vertex(vi, ii);
+}
+
+// Stage K packed form: instance_index is DENSE over this chunk's visible
+// instances; find the visible slot whose prefix range holds it (last slot
+// with prefix <= ii) and translate to the chunk-local arena slot.
+@vertex
+fn vs_packed(
+    @builtin(vertex_index) vi: u32,
+    @builtin(instance_index) ii: u32,
+) -> VsOut {
+    let chunk_meta = packed_meta[packed_chunk.index];
+    let first = chunk_meta.x;
+    var lo = 0u;
+    var hi = chunk_meta.y; // > 0 whenever a draw was issued (instance_count > 0)
+    while lo + 1u < hi {
+        let mid = (lo + hi) / 2u;
+        if packed_slots[first + mid].x <= ii {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    let ps = packed_slots[first + lo];
+    return glyph_vertex(vi, ps.y + (ii - ps.x));
+}
+
+// The Stage C vertex body: arena slot → world quad corner → clip, plus the
+// per-instance color/curve payload for the fragment stage.
+fn glyph_vertex(vi: u32, slot: u32) -> VsOut {
     // Unit quad corners, uv == position: (0,0)=bottom-left … (1,1)=top-right.
     // Matches the web's PlaneGeometry where uv = positionLocal + 0.5 and the
     // v axis runs bottom→top, so NO y-flip against the y-up curve data.
@@ -109,7 +158,7 @@ fn vs_main(
         vec2<f32>(0.0, 1.0),
     );
 
-    let inst = instances[ii];
+    let inst = instances[slot];
 
     // Glyph-map lookup: slot → curve range + mode.
     let gid = i32(inst.glyph_id);
