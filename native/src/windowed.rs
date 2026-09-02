@@ -948,8 +948,14 @@ impl ApplicationHandler for App<'_> {
                 if event.state == ElementState::Pressed
                     && matches!(event.physical_key, PhysicalKey::Code(KeyCode::F2)) =>
             {
-                state.capture_pending = Some(std::path::PathBuf::from(format!(
-                    "out/windowed-shot-{}.png",
+                // Anchor at the repo root's out/ (CARGO_MANIFEST_DIR is
+                // native/), not the process cwd — running from native/ used
+                // to scatter shots into native/out/.
+                state.capture_pending = Some(std::path::PathBuf::from(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/../out"
+                )).join(format!(
+                    "windowed-shot-{}.png",
                     utc_stamp(std::time::SystemTime::now())
                 )));
             }
@@ -1083,11 +1089,32 @@ fn utc_stamp(now: std::time::SystemTime) -> String {
     let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
     let y = yoe + era * 400;
     let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 456) / 153;
+    // Canonical Hinnant: (5*doy + 2)/153. (An earlier edit used the +456
+    // variant's constant with the canonical d/m formulas — the variants are
+    // not mixable; produced e.g. month=12 day=89 for 2026-09-02.)
+    let mp = (5 * doy + 2) / 153;
     let d = doy - (153 * mp + 2) / 5 + 1;
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
     let y = if m <= 2 { y + 1 } else { y };
     format!("{y:04}{m:02}{d:02}-{:02}{:02}{:02}", tod / 3600, tod % 3600 / 60, tod % 60)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::utc_stamp;
+    use std::time::{Duration, UNIX_EPOCH};
+
+    #[test]
+    fn utc_stamp_known_epochs() {
+        // Values pinned against `date -u` (macOS): epoch 0, and the K6 fix
+        // date 2026-09-02 18:21:12 UTC (the bad stamp that exposed the bug
+        // read "202612-89-182112").
+        let at = |s: u64| utc_stamp(UNIX_EPOCH + Duration::from_secs(s));
+        assert_eq!(at(0), "19700101-000000");
+        assert_eq!(at(1788373272), "20260902-182112");
+        assert_eq!(at(951782400), "20000229-000000"); // leap day, era boundary math
+        assert_eq!(at(4102444800), "21000101-000000"); // non-leap century year
+    }
 }
 
 pub fn run(
