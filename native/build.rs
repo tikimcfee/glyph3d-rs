@@ -9,7 +9,10 @@
 //! ```
 //!
 //! (See engine-local/README-FFI.md. `--fp-mode contract=off` is load-bearing —
-//! it pins the bit-exact float discipline; see engine-local/check.sh's header.)
+//! it pins the bit-exact float discipline; see engine-local/check.sh's header.
+//! NOTE: no gate in this tree can currently DETECT a dylib built without it —
+//! --engine-check runs with origin (0,0,0), which makes its only fusable
+//! multiply-add FMA-invariant. Build via `pixi run build-engine`.)
 //!
 //! This script only wires up linking: the search path, the dylib, and the two
 //! rpaths the resulting binary needs at runtime:

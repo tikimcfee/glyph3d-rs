@@ -92,7 +92,7 @@ def glyph_engine_load_trie_file(
 ) abi("C") -> c_int:
     """Load the trie (font metric tables). NATIVE-PORT (Stage E1): dispatches
     on magic — a 'G3TR' blob (the app atlas's real codepoint→slot mapping,
-    tools/gen-real-trie.mjs) or a legacy 'G3DF' .pipe.bin fixture (the
+    tools/gen_real_trie.py) or a legacy 'G3DF' .pipe.bin fixture (the
     conformance corpus; its expected-output sections are parsed and discarded).
     """
     try:

@@ -331,7 +331,7 @@ pub struct RefGlyph {
     pub col: u32,
 }
 
-/// The font-units→world conversion, shared with tools/gen-real-trie.mjs:
+/// The font-units→world conversion, shared with tools/gen_real_trie.py:
 /// `fround(fu * CELL_HEIGHT_WORLD / em_height_fu)`, computed in f64 and
 /// narrowed once — the same bits the generator wrote into engine-trie.bin.
 fn fu_to_world(fu: i32, em_height_fu: u32) -> f32 {
