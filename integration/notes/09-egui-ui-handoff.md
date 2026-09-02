@@ -211,3 +211,18 @@ gates per commit + the manual matrices + FPS bands + `cargo tree -i wgpu` / `-d`
 file diffs; remaining gaps (house convention — likely entries: puffin_egui still pinned to egui
 0.33; AccessKit feature left on/off and why; candidate-window quirks; glyphon labels (roadmap
 item 6) deferred).
+
+---
+
+## Addendum 2026-09-02 — Phase K6 landed (post-handoff): in-window screenshot
+
+K6 closed the pixel-verification gap this handoff's verification model couldn't cover (proven
+necessary by the post-stage erratum: K1's "invisible" empty CentralPanel actually painted an
+opaque full-viewport blanket — invisible to log/FPS-only smoke checks, caught by the first
+human run). The windowed surface is now configured with `COPY_SRC`; F2 (app-level hotkey, fires
+regardless of egui focus) or `--screenshot-frame N --screenshot-out PATH` reads the composed
+frame — scene pass AND the egui overlay — back from the acquired surface texture after the
+final submit and before present, swizzles BGRA→RGBA (windowed surface is `Bgra8UnormSrgb`), and
+writes a PNG. Lives in `windowed.rs` (`capture_to_png` + the F2 arm) and `main.rs` (the CLI
+pair); offscreen untouched. Agent-verifiable pixel checks are now possible per stage — the two
+K6 proof PNGs (fixture repo + notes repo) are described in `out/STAGE_K_REPORT.md`.

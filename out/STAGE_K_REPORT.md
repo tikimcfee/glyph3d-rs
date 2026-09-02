@@ -581,4 +581,84 @@ see this class of bug; it needed eyes. Fix: the vestigial panel is removed
 Lesson recorded for the human-pass column: **any "invisible by construction"
 UI claim requires one pixel-level check per stage** — the windowed readback
 seam (COPY_SRC surface + copy_texture_to_buffer, note 10's in-window
-screenshot) would make that agent-verifiable.
+screenshot) would make that agent-verifiable. **Update (2026-09-02): that
+seam has now landed as Phase K6 (commit `621d6e6`)** — F2 /
+`--screenshot-frame N --screenshot-out PATH` readback of the composed frame;
+the two proof PNGs it produced (fixture repo + integration-notes repo,
+Debug window visible over a healthy glyph field, correct colors) are
+described in the Phase K6 section below. The pixel-verification gap the
+erratum identified is closed.
+
+---
+
+## Phase K6 as-executed (commit `621d6e6`)
+
+### Mechanism
+
+Windowed frame readback producing the **composed frame** — 3D scene pass AND
+the egui Debug window; that inclusion is the point (it closes the
+pixel-verification gap the erratum above identified).
+
+- **Surface**: `RENDER_ATTACHMENT | COPY_SRC` in the windowed surface config
+  (windowed only — `offscreen.rs` and its target texture untouched).
+  `caps.usages` COPY_SRC support is asserted once at configure, so an
+  adapter without it fails loud at startup, not at capture time.
+- **Capture** (`WindowState::capture_to_png`, mirrors offscreen.rs's
+  readback): when a capture is pending, after the final `queue.submit` and
+  BEFORE `present`, encode `copy_texture_to_buffer` from the acquired
+  surface texture into a MAP_READ|COPY_DST buffer (256-byte-aligned rows),
+  blocking `PollType::Wait`, map, **swizzle BGRA→RGBA per pixel** (the
+  windowed surface is `Bgra8UnormSrgb`; offscreen's target is Rgba and
+  needs no swizzle — this is the one structural difference from
+  offscreen.rs), write PNG via the `image` crate, unmap. Fail-loud
+  `expect`s throughout. The blocking wait stalls the loop for one frame —
+  fine for on-demand capture.
+
+### Triggers
+
+- **F2** — app-level hotkey. It matches ABOVE the `_ if egui_consumed` arm,
+  so it fires regardless of egui focus (e.g. while typing in the scratch
+  field) — deliberately unlike F1, which yields to a focused field. Writes
+  `out/windowed-shot-<yyyymmdd-hhmmss UTC>.png` (tiny civil-from-days
+  helper, no chrono dep) and printlns the absolute path.
+- **`--screenshot-frame N --screenshot-out PATH`** — scripted capture of the
+  frame that reaches N. The flags mutually require each other and conflict
+  with offscreen `--screenshot` (clap-enforced, pinned by a dedicated
+  parity test — they could not join `scalar_flags_parse`, which already
+  exercises `--screenshot`). The app **keeps running** after the capture —
+  it never auto-exits (unlike `--screenshot`).
+
+### Verification (pixel-level, finally)
+
+- `check-all.sh`: ALL GATES GREEN (20 tests — the new
+  `screenshot_frame_flags_parse`; four PNGs trivially byte-equal, offscreen
+  untouched). `cargo check --no-default-features` clean.
+- **`/tmp/k6-fixture.png`** (frame 90, 3200×2000, fixture repo): the Debug
+  window is fully composed top-left — FPS 55.0, camera Fly
+  eye=(45.17,-84.88,257.56), pick line, six verb buttons, the LOD_MIN_PX
+  slider at 1.00 with live counters (`4 draw ranges, 10857 instances | 0
+  backdrops`), the K2 scratch field, the file browser (alpha.rs, long.md,
+  sub/deep.py indented, wide.txt — each with its tint swatch) — OVER the
+  visible glyph field: three tall text pages with colored (green/yellow/
+  white) glyph rows, the small wide.txt page at bottom, group labels at
+  top. **The ebaaec4 opaque-blanket regression is NOT present.** The
+  background is the correct dark blue-gray (0.07,0.07,0.09) — not
+  brown/orange — so the BGRA→RGBA swizzle is right.
+- **`/tmp/k6-notes.png`** (frame 120, integration-notes repo): 127,589
+  instances, 12 draw ranges; dozens of markdown pages in the grid with sane
+  colors (white body text, reddish heading tints) on the same blue-gray;
+  Debug window composed on top with the notes file list
+  (00-primitives-inventory.md … 03-graphics-helpers.md visible).
+- Both runs: FPS settled at 60.0, no panics, no leftover processes.
+- **F2: verified by code inspection only** (an agent cannot press keys).
+  The arm pattern-matches `KeyCode::F2` pressed above the consumption arm
+  and arms the same `capture_pending` → `capture_to_png` path the CLI
+  trigger proves. **Human pass addition: press F2 once and confirm the
+  `out/windowed-shot-*.png` appears and prints its absolute path.**
+
+### Human-pass checklist addition
+
+- Press F2 (including while the scratch field is focused — it must still
+  fire): a `windowed-shot-<timestamp>.png` appears under `out/`, the
+  absolute path is println'd, and the PNG contains whatever was on screen
+  (Debug window open or closed, UI on or `--no-ui`).
