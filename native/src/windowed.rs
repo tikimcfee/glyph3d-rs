@@ -34,6 +34,18 @@
 //! the exact CLI op API, K2 scratch text field). K4 makes LOD_MIN_PX live
 //! via a slider (probe-cell → CullState Cell seam; offscreen keeps the
 //! const) and adds live cull counters; F1 toggles the window.
+//!
+//! K6: in-window screenshot. The surface is configured with COPY_SRC (an
+//! assert at configure checks the adapter supports it); on demand (F2 — an
+//! app-level hotkey that fires regardless of egui focus — or the
+//! `--screenshot-frame N --screenshot-out PATH` CLI pair) the just-encoded
+//! surface texture is copied to a MAP_READ buffer AFTER the final
+//! queue.submit and BEFORE present, blocking-mapped, swizzled BGRA→RGBA
+//! (the windowed surface is Bgra8UnormSrgb — offscreen is Rgba and needs no
+//! swizzle), and written as PNG. The readback happens after BOTH the scene
+//! pass and the egui pass, so the PNG is the COMPOSED frame — 3D scene AND
+//! the Debug window; that inclusion is the point (pixel-verification seam
+//! for "invisible by construction" UI claims, per the stage erratum).
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -105,6 +117,15 @@ struct WindowState {
     /// Last cursor position, physical px (click picks use it).
     cursor: (f32, f32),
     last_frame: Instant,
+    /// Stage K (K6): frames presented since startup (the `--screenshot-frame`
+    /// counter — distinct from `frames`, which the FPS line resets every
+    /// second).
+    frames_total: u64,
+    /// Stage K (K6): armed CLI capture — capture the frame that reaches N.
+    shot_at_frame: Option<(u64, std::path::PathBuf)>,
+    /// Stage K (K6): capture THIS frame to the path after the final submit
+    /// (armed by F2, or by the CLI frame counter).
+    capture_pending: Option<std::path::PathBuf>,
     // FPS accounting
     frames: u32,
     fps_window_start: Instant,
@@ -195,6 +216,78 @@ impl WindowState {
         {
             false
         }
+    }
+
+    /// Stage K (K6): read back the just-encoded surface texture (the
+    /// COMPOSED frame — scene pass + egui pass) and write it to `path` as
+    /// PNG. Mirrors offscreen.rs's readback (256-byte-aligned rows,
+    /// blocking map) with one difference: the windowed surface is
+    /// Bgra8UnormSrgb, so every pixel is swizzled BGRA→RGBA (offscreen's
+    /// target is Rgba and skips this). Called after the final queue.submit
+    /// and before present; the blocking wait stalls the loop for one frame,
+    /// which is fine for an on-demand capture.
+    fn capture_to_png(&self, ctx: &GpuContext, frame: &wgpu::SurfaceTexture, path: &std::path::Path) {
+        let (w, h) = (self.config.width, self.config.height);
+        let unpadded_bpr = w * 4;
+        let padded_bpr = unpadded_bpr.div_ceil(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT)
+            * wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+        let readback = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("windowed shot readback"),
+            size: (padded_bpr * h) as u64,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut encoder = ctx.device.create_command_encoder(&Default::default());
+        encoder.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture: &frame.texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &readback,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(padded_bpr),
+                    rows_per_image: Some(h),
+                },
+            },
+            wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+        );
+        ctx.queue.submit([encoder.finish()]);
+
+        let slice = readback.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |res| {
+            let _ = tx.send(res);
+        });
+        ctx.device
+            .poll(wgpu::PollType::Wait { submission_index: None, timeout: None })
+            .expect("device poll failed during windowed-shot readback");
+        rx.recv()
+            .expect("windowed-shot map_async callback dropped")
+            .expect("windowed-shot buffer map failed");
+
+        let data = slice.get_mapped_range().expect("windowed-shot range not mapped");
+        let mut pixels = Vec::with_capacity((unpadded_bpr * h) as usize);
+        for row in 0..h {
+            let start = (row * padded_bpr) as usize;
+            for px in data[start..start + unpadded_bpr as usize].as_chunks::<4>().0 {
+                // BGRA → RGBA swizzle.
+                pixels.extend_from_slice(&[px[2], px[1], px[0], px[3]]);
+            }
+        }
+        drop(data);
+        readback.unmap();
+
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).expect("create windowed-shot directory");
+        }
+        image::save_buffer(path, &pixels, w, h, image::ColorType::Rgba8)
+            .expect("failed to write windowed-shot PNG");
+        let abs = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        println!("windowed shot: wrote {}", abs.display());
     }
 
     fn render(&mut self, ctx: &GpuContext) {
@@ -567,8 +660,22 @@ impl WindowState {
                 egui.renderer.free_texture(&id);
             }
         }
+        // Stage K (K6): scripted CLI capture — arm once this frame reaches N
+        // (the current frame is the (frames_total+1)-th).
+        if let Some((n, path)) = &self.shot_at_frame {
+            if self.frames_total + 1 >= *n {
+                self.capture_pending = Some(path.clone());
+                self.shot_at_frame = None;
+            }
+        }
+        // Stage K (K6): capture BEFORE present — the acquired texture is the
+        // composed frame (scene + egui), still ours to copy from.
+        if let Some(path) = self.capture_pending.take() {
+            self.capture_to_png(ctx, &frame, &path);
+        }
         // wgpu 30: presentation goes through the queue, not the texture.
         ctx.queue.present(frame);
+        self.frames_total += 1;
 
         // Stage H: close the profiler frame and fold any GPU-completed frame
         // into the running means (non-blocking pump for the query maps).
@@ -637,6 +744,9 @@ struct App<'a> {
     /// Stage K: build the egui overlay (false under `--no-ui`).
     #[cfg(feature = "egui-ui")]
     ui: bool,
+    /// Stage K (K6): scripted in-window capture (`--screenshot-frame N`
+    /// `--screenshot-out PATH`).
+    shot: Option<(u64, std::path::PathBuf)>,
 }
 
 impl ApplicationHandler for App<'_> {
@@ -669,9 +779,19 @@ impl ApplicationHandler for App<'_> {
             .copied()
             .find(|f| f.is_srgb())
             .unwrap_or(caps.formats[0]);
+        // Stage K (K6): COPY_SRC enables the in-window screenshot readback
+        // (copy_texture_to_buffer off the acquired surface texture). Metal
+        // supports it; assert once at configure so an exotic adapter fails
+        // loud at startup, not at capture time.
+        assert!(
+            caps.usages.contains(wgpu::TextureUsages::COPY_SRC),
+            "K6: surface/adapter does not support COPY_SRC — in-window screenshot impossible \
+             (caps.usages = {:?})",
+            caps.usages
+        );
         let size = window.inner_size();
         let config = wgpu::SurfaceConfiguration {
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
             format,
             // Auto == sRGB for 8-bit formats; required field in wgpu 30.
             color_space: wgpu::SurfaceColorSpace::Auto,
@@ -748,6 +868,7 @@ impl ApplicationHandler for App<'_> {
         if self.ui {
             println!("debug panel: F1 toggles the egui Debug window (sliders tune LOD_MIN_PX live)");
         }
+        println!("screenshot: F2 saves the next presented frame to out/windowed-shot-<timestamp>.png");
 
         // Stage G: scripted startup picks/verbs (same entry points the
         // windowed event handlers use).
@@ -777,6 +898,9 @@ impl ApplicationHandler for App<'_> {
             saw_device_delta: false,
             cursor: (0.0, 0.0),
             last_frame: Instant::now(),
+            frames_total: 0,
+            shot_at_frame: self.shot.clone(),
+            capture_pending: None,
             frames: 0,
             fps_window_start: Instant::now(),
             profile: crate::gpu::ProfileAccumulator::default(),
@@ -814,6 +938,21 @@ impl ApplicationHandler for App<'_> {
                 state.scene.set_viewport(size.width, size.height);
             }
             WindowEvent::RedrawRequested => state.render(&self.ctx),
+            // Stage K (K6): F2 = capture the next presented frame to PNG.
+            // App-level hotkey that must work REGARDLESS of egui focus (e.g.
+            // while typing in the scratch field), so it matches ABOVE the
+            // egui-consumed arm — unlike F1, which deliberately yields to a
+            // focused field. egui still saw the event first (the feed at the
+            // top); it ignores F2.
+            WindowEvent::KeyboardInput { event, .. }
+                if event.state == ElementState::Pressed
+                    && matches!(event.physical_key, PhysicalKey::Code(KeyCode::F2)) =>
+            {
+                state.capture_pending = Some(std::path::PathBuf::from(format!(
+                    "out/windowed-shot-{}.png",
+                    utc_stamp(std::time::SystemTime::now())
+                )));
+            }
             // Stage K (K2): right-RELEASE always ungrabs, even when egui
             // consumed the event (e.g. the release landed on a panel).
             // Otherwise a grab started outside a panel would latch on
@@ -929,7 +1068,36 @@ impl ApplicationHandler for App<'_> {
     }
 }
 
-pub fn run(ctx: GpuContext, choice: &SceneChoice, cull: bool, ops: &[Op], ui: bool) {
+/// Stage K (K6): `yyyymmdd-hhmmss` UTC stamp for shot filenames (no chrono
+/// dep; Howard Hinnant's civil-from-days algorithm).
+fn utc_stamp(now: std::time::SystemTime) -> String {
+    let secs = now
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock before the unix epoch")
+        .as_secs();
+    let days = (secs / 86400) as i64;
+    let tod = secs % 86400;
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 456) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    format!("{y:04}{m:02}{d:02}-{:02}{:02}{:02}", tod / 3600, tod % 3600 / 60, tod % 60)
+}
+
+pub fn run(
+    ctx: GpuContext,
+    choice: &SceneChoice,
+    cull: bool,
+    ops: &[Op],
+    ui: bool,
+    shot: Option<(u64, std::path::PathBuf)>,
+) {
     // Without the `egui-ui` feature the overlay is compiled out entirely;
     // the flag is accepted (and ignored) so the CLI is identical either way.
     #[cfg(not(feature = "egui-ui"))]
@@ -944,6 +1112,7 @@ pub fn run(ctx: GpuContext, choice: &SceneChoice, cull: bool, ops: &[Op], ui: bo
         state: None,
         #[cfg(feature = "egui-ui")]
         ui,
+        shot,
     };
     event_loop.run_app(&mut app).expect("event loop error");
 }

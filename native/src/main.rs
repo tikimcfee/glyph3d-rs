@@ -202,7 +202,9 @@ VERBS (--verb \"V [ARGS]\", repeatable; applies to the most recent pick):
 WINDOWED MODE:
   fly camera — WASD move, E|R up, Q|F down, RIGHT-drag look, scroll = speed,
   Esc releases | interact: LEFT click = pick glyph, h highlight line,
-  g grab file (mouse drags, scroll scales), t tint, x hide";
+  g grab file (mouse drags, scroll scales), t tint, x hide |
+  F1 toggle Debug panel, F2 save screenshot (out/windowed-shot-*.png) |
+  --screenshot-frame N --screenshot-out PATH: scripted capture, keeps running";
 
 /// Stage H: clap-derive CLI. Semantics (flags, defaults, op-stream order) are
 /// preserved from the hand-rolled parser it replaced — parity is pinned by the
@@ -272,6 +274,14 @@ struct Cli {
     /// Stage K: windowed without the egui UI overlay (exact pre-K behavior)
     #[arg(long)]
     no_ui: bool,
+    /// Stage K (K6): windowed only — capture the frame after N frames have
+    /// rendered (requires --screenshot-out; the app KEEPS RUNNING afterward —
+    /// unlike --screenshot it never exits)
+    #[arg(long, value_name = "N", requires = "screenshot_out", conflicts_with = "screenshot")]
+    screenshot_frame: Option<u64>,
+    /// Stage K (K6): windowed only — PNG path for --screenshot-frame
+    #[arg(long, value_name = "PATH", requires = "screenshot_frame", conflicts_with = "screenshot")]
+    screenshot_out: Option<PathBuf>,
     /// Generate shell completions for SHELL and exit
     #[arg(long, value_name = "SHELL")]
     generate: Option<clap_complete::Shell>,
@@ -619,7 +629,12 @@ fn main() {
         Some(path) => offscreen::run(
             &ctx, &choice, &path, cli.frames, cli.zoom, !cli.no_cull, &cli.ops,
         ),
-        None => windowed::run(ctx, &choice, !cli.no_cull, &cli.ops, !cli.no_ui),
+        None => {
+            // Stage K (K6): scripted in-window capture (windowed only — clap
+            // already rejected the combination with --screenshot).
+            let shot = cli.screenshot_frame.zip(cli.screenshot_out.clone());
+            windowed::run(ctx, &choice, !cli.no_cull, &cli.ops, !cli.no_ui, shot)
+        }
     }
 }
 
@@ -662,6 +677,8 @@ mod cli_tests {
         assert!(!cli.repo_scan_only);
         assert!(!cli.no_cull);
         assert!(!cli.no_ui);
+        assert!(cli.screenshot_frame.is_none());
+        assert!(cli.screenshot_out.is_none());
         assert!(cli.ops.is_empty());
     }
 
@@ -864,6 +881,22 @@ mod cli_tests {
             parse_verb("scale-group 0.5").unwrap(),
             Verb::ScaleGroup(s) if s == 0.5
         ));
+    }
+
+    #[test]
+    fn screenshot_frame_flags_parse() {
+        // Stage K (K6): the windowed capture pair parses together.
+        let cli = parse(&["--screenshot-frame", "90", "--screenshot-out", "/tmp/shot.png"]);
+        assert_eq!(cli.screenshot_frame, Some(90));
+        assert_eq!(cli.screenshot_out, Some(PathBuf::from("/tmp/shot.png")));
+        // They require each other.
+        assert!(try_parse(&["--screenshot-frame", "90"]).is_err());
+        assert!(try_parse(&["--screenshot-out", "/tmp/shot.png"]).is_err());
+        // Windowed-only: clap rejects combining them with offscreen --screenshot.
+        assert!(try_parse(&[
+            "--screenshot", "out.png", "--screenshot-frame", "90", "--screenshot-out", "/tmp/s.png",
+        ])
+        .is_err());
     }
 
     #[test]
