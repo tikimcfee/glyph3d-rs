@@ -29,6 +29,7 @@ cd "$(dirname "$0")/.."
 MOJO=(pixi run mojo)
 
 FP="--fp-mode contract=off"
+TMPBIN=$(mktemp -t glyph3d-bench-probe)
 PIPE=(engine/fixtures/*.pipe.bin)
 BAKE=(engine/fixtures/*.bake.bin)
 
@@ -36,6 +37,21 @@ CPU=(conformance conformance_scan ordinal_invariant conformance_record conforman
 # gaps and matrix take ONE fixture (for its trie) and build their own topologies
 GAPS=engine/fixtures/repo-file.pipe.bin
 GPU=(gpu_decode gpu_scan gpu_paginate gpu_bounds gpu_pipeline)
+
+# NATIVE-PORT 2026-09-02: the benches are COMPILED here, not run. They cannot run
+# in a fresh tree (engine/bench/bench.bin is untracked and its generator needs the
+# JS reference pipeline), but nothing compiled them either — so toolchain drift in
+# a bench file was invisible. It had already happened: blob_bench.mojo still used
+# `memcpy`, removed from std.memory in this nightly, and had not built for some
+# time. A build is cheap and catches exactly that class.
+compile_only() { # name, path
+    printf '%-22s ' "$1"
+    if out=$("${MOJO[@]}" build $FP -I engine "$2" -o "$TMPBIN" 2>&1); then
+        rm -f "$TMPBIN"; echo "compiles"
+    else
+        echo "FAILED TO BUILD"; echo "$out" | tail -4; exit 1
+    fi
+}
 
 run() { # name, fixtures...
     local name=$1; shift
@@ -55,13 +71,19 @@ run() { # name, fixtures...
 # suite, it is an absent one, and the honest move was to install the dep rather
 # than teach the runner to skip gracefully.
 case "${1:-all}" in
-    gpu) list=("${GPU[@]}") ;;
-    cpu) list=("${CPU[@]}") ;;
-    all) list=("${CPU[@]}" "${GPU[@]}") ;;
-    *)   echo "usage: engine/check.sh [cpu|gpu|all]" >&2; exit 2 ;;
+    gpu)   list=("${GPU[@]}") ;;
+    cpu)   list=("${CPU[@]}") ;;
+    bench) list=() ;;
+    all)   list=("${CPU[@]}" "${GPU[@]}") ;;
+    *)     echo "usage: engine/check.sh [cpu|gpu|bench|all]" >&2; exit 2 ;;
 esac
 
-for s in "${list[@]}"; do run "$s" "${PIPE[@]}"; done
+if [[ "${1:-all}" == "bench" || "${1:-all}" == "all" ]]; then
+    for b in engine/bench/*.mojo; do compile_only "$(basename "$b" .mojo)" "$b"; done
+fi
+
+# `set -u` + an empty array (bench mode) needs the guard.
+for s in ${list[@]+"${list[@]}"}; do run "$s" "${PIPE[@]}"; done
 [[ "${1:-all}" == "gpu" ]] || run conformance_gaps "$GAPS"
 [[ "${1:-all}" == "gpu" ]] || run conformance_matrix "$GAPS"
 # The cross-form runner: OUR OWN SOURCE TREE as a live corpus — no fixtures, the
@@ -73,6 +95,7 @@ for s in "${list[@]}"; do run "$s" "${PIPE[@]}"; done
 [[ "${1:-all}" == "gpu" ]] || run conformance_bake "${BAKE[@]}"
 case "${1:-all}" in
     cpu) echo "all 10 CPU suites green (fp contraction disabled); GPU suites NOT RUN" ;;
+    bench) echo "all bench files compile (they are not RUN: bench.bin is untracked)" ;;
     gpu) echo "all 5 GPU suites green (fp contraction disabled)" ;;
-    *)   echo "all 15 suites green, CPU + GPU (fp contraction disabled)" ;;
+    *)   echo "all 15 suites green + benches compile, CPU + GPU (fp contraction disabled)" ;;
 esac

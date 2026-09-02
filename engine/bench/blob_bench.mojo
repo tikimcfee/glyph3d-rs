@@ -16,7 +16,7 @@
 from std.collections.span import Span
 from std.sys import argv
 from std.time import perf_counter_ns
-from std.memory import memcpy
+from std.memory import unsafe_memcpy  # MOJO-1.1-PORT: memcpy removed in favour of the unsafe_ spelling (same signature)
 from glyph_schema import SM_STRIDE, GI_STRIDE, LM_STRIDE, LC_STRIDE
 comptime SLOT_BYTES = (SM_STRIDE + GI_STRIDE + 1 + LM_STRIDE + LC_STRIDE) * 4
 from glyph_pipeline import Item, run_pipeline
@@ -62,11 +62,11 @@ def main() raises:
         while used + nb > cap:
             cap *= 2
             var grown = List[UInt8](unsafe_uninit_length=cap)
-            memcpy(dest=grown.unsafe_ptr(), src=blob.unsafe_ptr(), count=used)
+            unsafe_memcpy(dest=grown.unsafe_ptr(), src=blob.unsafe_ptr(), count=used)
             blob = grown^
         starts.append(used)
         lens.append(nb)
-        memcpy(dest=blob.unsafe_ptr() + used, src=bytes.unsafe_ptr(), count=nb)
+        unsafe_memcpy(dest=blob.unsafe_ptr() + used, src=bytes.unsafe_ptr(), count=nb)
         used += nb
     var load_ns = perf_counter_ns() - t0
     var mb = Float64(used) / 1048576.0
