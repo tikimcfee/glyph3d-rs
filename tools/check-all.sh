@@ -1,11 +1,12 @@
 #!/bin/bash
 # check-all.sh — the full house gate suite in one command (Stage J).
 #
-#   1. generators                   — the two Python generators reproduce their
-#                                     committed outputs BYTE-IDENTICALLY, and the
-#                                     schema's own validation rules run (this is
-#                                     the tier check; it had no home in this tree
-#                                     until 2026-09-02)
+#   1. generators                   — the two Python generators AND the atlas
+#                                     exporter reproduce their committed outputs
+#                                     BYTE-IDENTICALLY, and the schema's own
+#                                     validation rules run (the tier check; it had
+#                                     no home in this tree until 2026-09-02). The
+#                                     atlas gate also keeps tools/vendor/ref honest.
 #   2. engine/check.sh            — all fifteen Mojo conformance suites, CPU
 #                                     AND GPU. The five GPU suites run on Metal
 #                                     since `max` became a real dependency
@@ -44,6 +45,21 @@ for g in "tools/gen_real_trie.py --verify-only" "tools/gen_schema.py --check"; d
   fi
 done
 [ "$G_OK" = 1 ] || echo "      (a generator drifted from its committed output, or the schema is invalid)"
+# The atlas exporter is a generator too, and since 2026-09-02 it reads only
+# tools/vendor/ref — so this gate is also what keeps the vendored tree honest.
+# It aborts on its own slot-set assertion before writing if the fonts or ranges
+# drift; the cmp below catches anything that assertion would not.
+A_TMP=$(mktemp -d)
+if node tools/export-atlas.mjs --out "$A_TMP" >/dev/null 2>&1; then
+  A_OK=1
+  for b in curves.bin glyphmap.bin glyphs.bin codepoints.bin; do
+    cmp -s "assets/atlas/$b" "$A_TMP/$b" || { echo "FAIL  export-atlas — $b differs from the committed asset"; A_OK=0; FAIL=1; }
+  done
+  [ "$A_OK" = 1 ] && echo "PASS  tools/export-atlas.mjs — 4 atlas bins BYTE-IDENTICAL (vendored inputs, no web repo)"
+else
+  echo "FAIL  tools/export-atlas.mjs errored"; FAIL=1
+fi
+rm -rf "$A_TMP"
 
 step "2/8 engine/check.sh (fifteen Mojo conformance suites, CPU + GPU)"
 if OUT=$(./engine/check.sh 2>&1); then

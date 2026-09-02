@@ -18,7 +18,9 @@ import subprocess
 import sys
 
 BIN = "native/target/release/glyph3d-native"
-REPO = os.environ.get("GLYPH_JS", "/Users/lugo/localdev/viz-web/glyph3d-js")
+# Was an absolute path into the web repo; this tree's own source is the corpus now.
+REPO = os.environ.get("GLYPH_JS", os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "native", "src"))
 ENV = {**os.environ, "GLYPH_PICK_DEBUG": "1", "RUST_LOG": "warn"}
 
 TARGET_RE = re.compile(

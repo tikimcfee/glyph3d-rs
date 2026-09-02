@@ -8,7 +8,13 @@ cd "$(dirname "$0")/.."
 BIN=native/target/release/glyph3d-native
 FIX=native/fixtures/g-pick-repo
 ORACLE="python3 tools/g_pick_oracle.py"
-REPO=${GLYPH_JS:-/Users/lugo/localdev/viz-web/glyph3d-js}
+# The "big real repo" corpus. Was an absolute path into the web repo, which made
+# gate 7 of check-all depend on a tree that is no longer trunk. This repo's own
+# Rust source is the same KIND of corpus — many files, deep paths, real text — and
+# it is always present. Both sides read the same live bytes (binary vs the python
+# fold oracle), so an edited corpus stays self-consistent; only the file set and
+# depth matter. GLYPH_JS still overrides, for anyone who wants the JS tree back.
+REPO=${GLYPH_JS:-$PWD/native/src}
 FAIL=0
 
 assert_char() { # desc, line, expected_char, expected_byte
@@ -95,13 +101,13 @@ print(round((x_ndc+1)*800), round((1-y_ndc)*500))
 pixel_roundtrip alpha.rs 4 4 50
 pixel_roundtrip long.md 200 5 7205
 
-echo "── glyph3d-js: oracle-asserted picks across files/depths ──────"
+echo "── native/src: oracle-asserted picks across files/depths ──────"
 OUT=$($BIN --load-repo "$REPO" --screenshot out/g-check-js.png \
-  --pick-file packages/glyph3d-core/src/GlyphField.js --pick-row 0 --pick-col 0 \
-  --pick-file packages/glyph3d-core/src/GlyphField.js --pick-row 12 --pick-col 7 \
-  --pick-file core/glyphVertex.js --pick-row 5 --pick-col 2 \
-  --pick-file liveTrie.js --pick-row 40 --pick-col 11 \
-  --pick-file README.md --pick-row 1 --pick-col 0 \
+  --pick-file text.rs --pick-row 0 --pick-col 0 \
+  --pick-file text.rs --pick-row 12 --pick-col 7 \
+  --pick-file engine.rs --pick-row 5 --pick-col 2 \
+  --pick-file glyph_scene.rs --pick-row 40 --pick-col 11 \
+  --pick-file gpu.rs --pick-row 1 --pick-col 0 \
   2>&1)
 echo "$OUT" | grep -E "^pick: " | while read -r line; do echo "  $line"; done
 echo "$OUT" | grep -E "fold cross-check: FAIL" && FAIL=1
@@ -117,11 +123,11 @@ js_check() { # relfile row col
         echo "FAIL  $rel row=$row col=$col — expected byte=$ebyte, got: $line"; FAIL=1
     fi
 }
-js_check packages/glyph3d-core/src/GlyphField.js 0 0
-js_check packages/glyph3d-core/src/GlyphField.js 12 7
-js_check packages/glyph3d-core/src/core/glyphVertex.js 5 2
-js_check packages/glyph3d-core/src/compute/liveTrie.js 40 11
-js_check README.md 1 0
+js_check text.rs 0 0
+js_check text.rs 12 7
+js_check engine.rs 5 2
+js_check glyph_scene.rs 40 11
+js_check gpu.rs 1 0
 
 echo "────────────────────────────────────────────────────────────────"
 [ $FAIL -eq 0 ] && echo "STAGE G PICK CHECK: ALL PASS" || { echo "STAGE G PICK CHECK: FAILURES"; exit 1; }

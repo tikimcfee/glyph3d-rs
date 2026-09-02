@@ -21,7 +21,8 @@
 import { readFileSync } from 'fs';
 import { gunzipSync } from 'zlib';
 
-const SRC = '/Users/lugo/localdev/viz-web/glyph3d-js/app/public/slug-core/slug-core.1tstke3lync.bin';
+// VENDORED 2026-09-02 — was an absolute path into the web repo.
+const SRC = new URL('./vendor/ref/app/public/slug-core/slug-core.1tstke3lync.bin', import.meta.url).pathname;
 const TEXTURE_WIDTH = 1024;
 const MAGIC = 0x43474c53;
 
