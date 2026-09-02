@@ -64,6 +64,12 @@ struct EguiUi {
     /// K4: Debug window visibility (F1 toggles; the window's own close
     /// button clears it).
     debug_open: bool,
+    /// K5: group-browser substring filter (doubles as a second K2
+    /// typing-isolation field).
+    filter: String,
+    /// K5: the browser's selected group (highlight only; click also flies
+    /// the camera to the file).
+    selected_group: Option<u32>,
 }
 
 /// Stage K (K3): Debug-panel verb buttons — CLI `--verb` literals parsed
@@ -287,6 +293,8 @@ impl WindowState {
             // inner closure capture disjoint fields.
             let debug_open = &mut egui.debug_open;
             let scratch = &mut egui.scratch;
+            let filter = &mut egui.filter;
+            let selected_group = &mut egui.selected_group;
             let full_output = egui_ctx.run_ui(raw_input, |root_ui| {
                 // The CentralPanel lives on the background layer, so
                 // `is_pointer_over_egui` stays false for it and it consumes
@@ -364,6 +372,102 @@ impl WindowState {
                         ui.separator();
                         ui.label("K2 typing test — WASD/h/g/t/x here must not move the scene:");
                         ui.text_edit_singleline(scratch);
+                        // K5: group browser — FLAT virtualized list
+                        // (ScrollArea::show_rows builds only the visible
+                        // rows; a CollapsingHeader-per-directory tree is NOT
+                        // virtualized and would be the classic egui
+                        // large-list trap at ~1.3k files). Vanilla egui — no
+                        // new deps (fence 2). Row click = select + fly-to
+                        // via the exact --cam-pose API (set_cam_pose);
+                        // framing mirrors camera_eye_target's Front formula.
+                        if let Some(snap) = &probe_snap {
+                            if !snap.files.is_empty() {
+                                ui.separator();
+                                ui.label(format!(
+                                    "files: {} (click = select + fly to file)",
+                                    snap.files.len()
+                                ));
+                                ui.horizontal(|ui| {
+                                    ui.label("filter:");
+                                    ui.text_edit_singleline(filter);
+                                });
+                                let needle = filter.to_lowercase();
+                                let idxs: Vec<usize> = snap
+                                    .files
+                                    .iter()
+                                    .enumerate()
+                                    .filter(|(_, r)| {
+                                        needle.is_empty()
+                                            || r.rel_path.to_lowercase().contains(&needle)
+                                    })
+                                    .map(|(i, _)| i)
+                                    .collect();
+                                let row_h = ui.text_style_height(&egui::TextStyle::Body);
+                                let viewport_aspect =
+                                    self.config.width as f32 / self.config.height.max(1) as f32;
+                                egui::ScrollArea::vertical()
+                                    .max_height(280.0)
+                                    .show_rows(ui, row_h, idxs.len(), |ui, range| {
+                                        for &i in &idxs[range] {
+                                            let row = &snap.files[i];
+                                            let dynst =
+                                                snap.file_dyn.get(i).copied().unwrap_or_default();
+                                            let depth = row.rel_path.matches('/').count();
+                                            ui.horizontal(|ui| {
+                                                // Tint swatch drawn, not
+                                                // typeset (no font-glyph
+                                                // dependency).
+                                                let (rect, _) = ui.allocate_exact_size(
+                                                    egui::vec2(10.0, 10.0),
+                                                    egui::Sense::hover(),
+                                                );
+                                                ui.painter().rect_filled(
+                                                    rect,
+                                                    2.0,
+                                                    egui::Color32::from_rgb(
+                                                        dynst.tint[0],
+                                                        dynst.tint[1],
+                                                        dynst.tint[2],
+                                                    ),
+                                                );
+                                                let label = format!(
+                                                    "{}{}{}",
+                                                    "  ".repeat(depth),
+                                                    row.rel_path,
+                                                    if dynst.hidden { "  (hidden)" } else { "" },
+                                                );
+                                                let resp = ui.selectable_label(
+                                                    *selected_group == Some(row.group_id),
+                                                    label,
+                                                );
+                                                if resp.clicked() {
+                                                    *selected_group = Some(row.group_id);
+                                                    // Front-camera framing
+                                                    // (camera_eye_target):
+                                                    // fit the AABB, margin
+                                                    // 1.08 + 2.0, text plane
+                                                    // faces +Z.
+                                                    let half_h_needed = dynst
+                                                        .half[1]
+                                                        .max(dynst.half[0] / viewport_aspect);
+                                                    let dist = half_h_needed
+                                                        / (crate::glyph_scene::FOV_Y
+                                                            .to_radians()
+                                                            * 0.5)
+                                                            .tan()
+                                                        * 1.08
+                                                        + 2.0;
+                                                    self.scene.set_cam_pose(
+                                                        [dynst.center[0], dynst.center[1], dist],
+                                                        0.0,
+                                                        0.0,
+                                                    );
+                                                }
+                                            });
+                                        }
+                                    });
+                            }
+                        }
                     });
             });
             let egui::FullOutput {
@@ -600,7 +704,15 @@ impl ApplicationHandler for App<'_> {
                 format,
                 egui_wgpu::RendererOptions::default(),
             );
-            Some(EguiUi { ctx: egui_ctx, state, renderer, scratch: String::new(), debug_open: true })
+            Some(EguiUi {
+                ctx: egui_ctx,
+                state,
+                renderer,
+                scratch: String::new(),
+                debug_open: true,
+                filter: String::new(),
+                selected_group: None,
+            })
         } else {
             None
         };

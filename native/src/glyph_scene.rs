@@ -68,7 +68,9 @@ use crate::scene::SceneLike;
 use crate::text::StagedText;
 
 /// Vertical field of view shared by every glyph-scene camera mode.
-const FOV_Y: f32 = 40f32;
+/// (pub since Stage K (K5): the Debug panel's file browser mirrors the
+/// Front-camera framing formula for click-to-fly navigation.)
+pub const FOV_Y: f32 = 40f32;
 
 /// Stage F: LOD threshold in on-screen pixels per em cell (cell height = 1.0
 /// world unit). Below 1 px/em individual glyphs are raster-lottery subpixel
@@ -472,6 +474,37 @@ pub struct UiProbeState {
     pub cull_ranges: usize,
     pub cull_instances: u64,
     pub cull_backdrops: usize,
+    // ── K5: group-browser data. `files` is STATIC (built once at install;
+    // Rc-shared so the panel's per-frame snapshot clones a refcount, not the
+    // rows). `file_dyn` is refreshed per frame (world pose under the live
+    // group TRS, hidden flag, tint) — parallel to `files`. ──
+    pub files: std::rc::Rc<Vec<UiFileRow>>,
+    pub file_dyn: Vec<UiFileDyn>,
+}
+
+/// Stage K (K5): one static group-browser row — file identity + the
+/// local-space (pre-TRS) AABB (same margins as the cull segment; the world
+/// pose derives from the live group TRS each frame, see UiFileDyn).
+#[derive(Clone)]
+pub struct UiFileRow {
+    pub rel_path: String,
+    pub group_id: u32,
+    pub aabb_min: [f32; 2],
+    pub aabb_max: [f32; 2],
+}
+
+/// Stage K (K5): per-frame dynamic row state for the group browser.
+#[derive(Clone, Copy, Default)]
+pub struct UiFileDyn {
+    /// World-space center/half extents under the live group TRS.
+    pub center: [f32; 2],
+    pub half: [f32; 2],
+    /// From the group row's alpha (the same place the hide/show verbs write),
+    /// so it is correct even under --no-cull.
+    pub hidden: bool,
+    /// Group tint as sRGB bytes (cols[2] is display-space — TintGroup verbs
+    /// store normalized sRGB there).
+    pub tint: [u8; 3],
 }
 
 /// Shared probe cell: GlyphScene writes, the egui panel reads.
@@ -1221,8 +1254,29 @@ impl GlyphScene {
     pub fn init_ui_probe(&mut self) -> UiProbe {
         // K4: the UI→scene controls are seeded from the compile-time consts,
         // so a windowed run starts bit-identical to an offscreen one.
+        // K5: the browser's static rows come from the pick context (repo
+        // scenes; empty for text/engine scenes → the panel hides the
+        // browser). Dynamic row state is filled on the first render.
+        let files: Vec<UiFileRow> = self
+            .pick
+            .as_ref()
+            .map(|pctx| {
+                pctx.files
+                    .iter()
+                    .map(|f| UiFileRow {
+                        rel_path: f.rel_path.clone(),
+                        group_id: f.group_id,
+                        aabb_min: f.aabb_min,
+                        aabb_max: f.aabb_max,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let file_dyn = vec![UiFileDyn::default(); files.len()];
         let probe = UiProbe::new(std::cell::RefCell::new(UiProbeState {
             lod_min_px: LOD_MIN_PX,
+            files: std::rc::Rc::new(files),
+            file_dyn,
             ..Default::default()
         }));
         self.ui_probe = Some(probe.clone());
@@ -2347,6 +2401,36 @@ impl SceneLike for GlyphScene {
                     p.cull_instances = 0;
                     p.cull_backdrops = 0;
                 }
+            }
+            // K5: refresh the browser's dynamic row state (world pose under
+            // the live group TRS, hidden, tint). ~1.3k cheap iterations at
+            // repo scale; skipped entirely offscreen (no probe installed).
+            if !p.files.is_empty() {
+                // Rc bump so the map below doesn't hold `p` and `files`
+                // through the same borrow awkwardly.
+                let files = p.files.clone();
+                p.file_dyn = files
+                    .iter()
+                    .map(|r| {
+                        let Some(g) = self.groups_cpu.get(r.group_id as usize) else {
+                            return UiFileDyn::default();
+                        };
+                        let (ox, oy) = (g.cols[0][0], g.cols[0][1]);
+                        let (sx, sy) = (g.cols[3][0].max(0.0), g.cols[3][1].max(0.0));
+                        let wmin = [r.aabb_min[0] * sx + ox, r.aabb_min[1] * sy + oy];
+                        let wmax = [r.aabb_max[0] * sx + ox, r.aabb_max[1] * sy + oy];
+                        UiFileDyn {
+                            center: [(wmin[0] + wmax[0]) * 0.5, (wmin[1] + wmax[1]) * 0.5],
+                            half: [(wmax[0] - wmin[0]) * 0.5, (wmax[1] - wmin[1]) * 0.5],
+                            hidden: g.cols[2][3] == 0.0,
+                            tint: [
+                                (g.cols[2][0].clamp(0.0, 1.0) * 255.0) as u8,
+                                (g.cols[2][1].clamp(0.0, 1.0) * 255.0) as u8,
+                                (g.cols[2][2].clamp(0.0, 1.0) * 255.0) as u8,
+                            ],
+                        }
+                    })
+                    .collect();
             }
         }
 
