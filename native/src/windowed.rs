@@ -29,6 +29,11 @@
 //!     fallback, grabbed-group drags) skip while egui wants the pointer;
 //!   - the moment egui wants ANY input, the look-grab is released (checked
 //!     per frame in render()); it re-acquires once the pointer leaves egui.
+//!
+//! K3 adds the Debug window (FPS/camera/pick readouts, verb buttons calling
+//! the exact CLI op API, K2 scratch text field). K4 makes LOD_MIN_PX live
+//! via a slider (probe-cell → CullState Cell seam; offscreen keeps the
+//! const) and adds live cull counters; F1 toggles the window.
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -56,6 +61,9 @@ struct EguiUi {
     /// typing-isolation trap test (typing WASD/h/g/t/x here must not fly the
     /// camera or fire verbs; the gating matrix in window_event ensures it).
     scratch: String,
+    /// K4: Debug window visibility (F1 toggles; the window's own close
+    /// button clears it).
+    debug_open: bool,
 }
 
 /// Stage K (K3): Debug-panel verb buttons — CLI `--verb` literals parsed
@@ -108,6 +116,11 @@ struct WindowState {
     /// println below stays the primary output — offscreen logs read it).
     #[cfg(feature = "egui-ui")]
     ui_fps: f32,
+    /// Stage K (K4) dev-only verification hook state (GLYPH_K4_SELFTEST=1):
+    /// 0 = off/done, 1 = armed (fires at t>3 s), 2 = fired (print the
+    /// after-counters next frame). See AGENTS.md debug env vars.
+    #[cfg(feature = "egui-ui")]
+    k4_selftest: u8,
 }
 
 impl WindowState {
@@ -179,6 +192,37 @@ impl WindowState {
     }
 
     fn render(&mut self, ctx: &GpuContext) {
+        // Stage K (K4) dev-only verification hook (GLYPH_K4_SELFTEST=1):
+        // move the LOD slider programmatically once (t≈3 s) and log the cull
+        // counters before/after — exercises the full panel → probe →
+        // CullState → cull_segments write path without a human at the mouse.
+        #[cfg(feature = "egui-ui")]
+        match self.k4_selftest {
+            1 if self.time() > 3.0 => {
+                if let Some(probe) = &self.ui_probe {
+                    let mut p = probe.borrow_mut();
+                    println!(
+                        "K4SELFTEST before: lod_min_px={:.2} -> ranges={} instances={} backdrops={}",
+                        p.lod_min_px, p.cull_ranges, p.cull_instances, p.cull_backdrops
+                    );
+                    // The panel slider's range max: at 16 px/em every visible
+                    // fixture segment drops to its backdrop quad.
+                    p.lod_min_px = 16.0;
+                }
+                self.k4_selftest = 2;
+            }
+            2 => {
+                if let Some(probe) = &self.ui_probe {
+                    let p = probe.borrow();
+                    println!(
+                        "K4SELFTEST after:  lod_min_px={:.2} -> ranges={} instances={} backdrops={}",
+                        p.lod_min_px, p.cull_ranges, p.cull_instances, p.cull_backdrops
+                    );
+                }
+                self.k4_selftest = 0;
+            }
+            _ => {}
+        }
         // wgpu 30: get_current_texture returns a status enum instead of Result.
         use wgpu::CurrentSurfaceTexture as Cst;
         let frame = match self.surface.get_current_texture() {
@@ -239,6 +283,10 @@ impl WindowState {
             // unborrowed across the UI build).
             let probe_snap = self.ui_probe.as_ref().map(|p| p.borrow().clone());
             let fps = self.ui_fps;
+            // K4: hoist the panel-state borrows so the Window builder and the
+            // inner closure capture disjoint fields.
+            let debug_open = &mut egui.debug_open;
+            let scratch = &mut egui.scratch;
             let full_output = egui_ctx.run_ui(raw_input, |root_ui| {
                 // The CentralPanel lives on the background layer, so
                 // `is_pointer_over_egui` stays false for it and it consumes
@@ -251,6 +299,7 @@ impl WindowState {
                 // egui exists.
                 egui::Window::new("Debug")
                     .id(egui::Id::new("stage_k_debug_panel"))
+                    .open(debug_open)
                     .show(root_ui.ctx(), |ui| {
                         ui.label(format!("FPS: {fps:.1}"));
                         match &probe_snap {
@@ -292,9 +341,29 @@ impl WindowState {
                                 }
                             }
                         });
+                        // K4: live cull/LOD tuning — the slider writes the
+                        // shared probe cell; GlyphScene::render applies it to
+                        // CullState's Cell before culling (same frame). The
+                        // readouts are the sums GLYPH_CULL_DEBUG prints.
+                        if let (Some(snap), Some(cell)) = (&probe_snap, &self.ui_probe) {
+                            ui.separator();
+                            ui.label("cull/LOD — live, windowed only (offscreen keeps consts):");
+                            // Range brackets the const default (1.0 px/em) with
+                            // ~2 octaves each way; logarithmic because the
+                            // threshold is a perceptual scale.
+                            ui.add(
+                                egui::Slider::new(&mut cell.borrow_mut().lod_min_px, 0.25..=16.0)
+                                    .logarithmic(true)
+                                    .text("LOD_MIN_PX px/em (const 1.0)"),
+                            );
+                            ui.label(format!(
+                                "cull: {} draw ranges, {} instances | {} backdrops",
+                                snap.cull_ranges, snap.cull_instances, snap.cull_backdrops
+                            ));
+                        }
                         ui.separator();
                         ui.label("K2 typing test — WASD/h/g/t/x here must not move the scene:");
-                        ui.text_edit_singleline(&mut egui.scratch);
+                        ui.text_edit_singleline(scratch);
                     });
             });
             let egui::FullOutput {
@@ -531,7 +600,7 @@ impl ApplicationHandler for App<'_> {
                 format,
                 egui_wgpu::RendererOptions::default(),
             );
-            Some(EguiUi { ctx: egui_ctx, state, renderer, scratch: String::new() })
+            Some(EguiUi { ctx: egui_ctx, state, renderer, scratch: String::new(), debug_open: true })
         } else {
             None
         };
@@ -561,6 +630,10 @@ impl ApplicationHandler for App<'_> {
              \x20 interact: LEFT click = pick glyph | h highlight line | g grab file \
              (mouse drags, scroll scales) | t cycle tint | x hide/show"
         );
+        #[cfg(feature = "egui-ui")]
+        if self.ui {
+            println!("debug panel: F1 toggles the egui Debug window (sliders tune LOD_MIN_PX live)");
+        }
 
         // Stage G: scripted startup picks/verbs (same entry points the
         // windowed event handlers use).
@@ -599,6 +672,8 @@ impl ApplicationHandler for App<'_> {
             ui_probe,
             #[cfg(feature = "egui-ui")]
             ui_fps: 0.0,
+            #[cfg(feature = "egui-ui")]
+            k4_selftest: u8::from(std::env::var_os("GLYPH_K4_SELFTEST").is_some()),
         });
     }
 
@@ -639,6 +714,16 @@ impl ApplicationHandler for App<'_> {
             WindowEvent::KeyboardInput { event, .. } => {
                 if let PhysicalKey::Code(code) = event.physical_key {
                     let pressed = event.state == ElementState::Pressed;
+                    // Stage K (K4): F1 toggles the Debug window — never scene
+                    // input. (With the scratch field focused, egui consumes
+                    // F1 first; release focus with Esc, then F1.)
+                    #[cfg(feature = "egui-ui")]
+                    if code == KeyCode::F1 && pressed {
+                        if let Some(egui) = state.egui.as_mut() {
+                            egui.debug_open = !egui.debug_open;
+                        }
+                        return;
+                    }
                     // Esc releases the pointer grab (and is not camera input).
                     if code == KeyCode::Escape && pressed {
                         state.ungrab();

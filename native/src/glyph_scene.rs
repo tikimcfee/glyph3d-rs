@@ -319,6 +319,19 @@ struct BackdropInst {
     rgba: [f32; 4],
 }
 
+/// Per-frame, view-derived cull inputs (everything the segment table doesn't
+/// provide). Bundled so `cull_segments` stays under the argument-count lint.
+struct CullView {
+    planes: [[f32; 4]; 6],
+    eye: Vec3,
+    /// px per world unit at distance 1 (height / 2·tan(fov/2)).
+    px_scale: f32,
+    /// Stage K (K4): the LOD threshold (px/em) is per-frame data (was the
+    /// LOD_MIN_PX const read directly) so windowed runs can tune it live;
+    /// offscreen always carries the const (see CullState::lod_min_px).
+    lod_min_px: f32,
+}
+
 /// Stage F — CPU cull: frustum + LOD over the segment table. Returns the
 /// glyph draw list (chunk, chunk_local_base, count — in arena order per
 /// chunk, so blending matches the legacy full draws exactly) and the
@@ -329,12 +342,11 @@ struct BackdropInst {
 fn cull_segments(
     segments: &[SegCull],
     hidden: &[bool],
-    planes: &[[f32; 4]; 6],
-    eye: Vec3,
-    px_scale: f32,
+    view: &CullView,
     chunk_cap: u32,
     chunk_count: u32,
 ) -> (Vec<Vec<std::ops::Range<u32>>>, Vec<BackdropInst>) {
+    let CullView { planes, eye, px_scale, lod_min_px } = *view;
     let mut draws: Vec<Vec<std::ops::Range<u32>>> =
         (0..chunk_count).map(|_| Vec::new()).collect();
     let mut backdrops = Vec::new();
@@ -366,7 +378,7 @@ fn cull_segments(
             .sqrt()
             .max(0.001);
         let glyph_px = px_scale / dist;
-        if glyph_px < LOD_MIN_PX {
+        if glyph_px < lod_min_px {
             if seg.slot_count > 0 {
                 backdrops.push(BackdropInst {
                     min: seg.min,
@@ -449,6 +461,17 @@ pub struct UiProbeState {
     /// The last resolved pick, formatted by the same `format_pick` as the
     /// stdout pick log line.
     pub last_pick: Option<String>,
+    // ── K4: UI → scene controls. Written by the Debug-panel sliders;
+    // applied by render() before culling. Seeded from the compile-time
+    // consts at install; offscreen never installs a probe, so the consts
+    // rule there. ──
+    /// Live LOD threshold in px/em (const default: LOD_MIN_PX = 1.0).
+    pub lod_min_px: f32,
+    // ── K4: live cull readouts (scene → UI; the same sums GLYPH_CULL_DEBUG
+    // prints). Zero when culling is disabled (--no-cull). ──
+    pub cull_ranges: usize,
+    pub cull_instances: u64,
+    pub cull_backdrops: usize,
 }
 
 /// Shared probe cell: GlyphScene writes, the egui panel reads.
@@ -586,6 +609,12 @@ struct CullState {
     /// pow(new)/pow(orig) so an untouched segment keeps its Stage F tint.
     orig_group_rgb: Vec<[f32; 3]>,
     hidden: Vec<bool>,
+    /// Stage K (K4): live LOD threshold (px/em), seeded from the LOD_MIN_PX
+    /// const. Cell because render(&self) is immutable (the `viewport: Cell`
+    /// precedent). The ONLY write site is the UI-controls application in
+    /// render(), which runs solely when a windowed probe is installed —
+    /// offscreen never writes it, so offscreen culls with the const.
+    lod_min_px: Cell<f32>,
     /// seg_count × 32 B staging target for the per-frame backdrop list.
     backdrop_insts_buf: wgpu::Buffer,
     backdrop_pipeline: wgpu::RenderPipeline,
@@ -747,6 +776,7 @@ impl CullState {
             base_tint,
             orig_group_rgb,
             hidden: vec![false; segments.len()],
+            lod_min_px: Cell::new(LOD_MIN_PX),
             backdrop_insts_buf,
             backdrop_pipeline,
             backdrop_bind_group,
@@ -811,6 +841,24 @@ pub struct GlyphScene {
     /// Stage K: windowed debug-UI probe (None offscreen / under --no-ui).
     ui_probe: Option<UiProbe>,
 }
+
+// ── Stage K (K4): what the live controls change, and what stays const ────
+//
+// LOD_MIN_PX becomes live in windowed runs via `CullState::lod_min_px`
+// (a Cell seeded from the const — the `viewport: Cell` precedent for
+// render(&self) immutability). The Debug-panel slider writes the shared
+// probe cell; render() copies it into the Cell before culling. That copy is
+// the SINGLE write site, and it runs only when a probe is installed
+// (windowed) — offscreen never installs one, so offscreen culls with the
+// const by construction (the byte-equal PNG gates prove it).
+//
+// BACKDROP_GAIN stays a compile-time const. The K4 handoff assumed it lived
+// in the Params uniform — it does NOT: Params carries only the Slug
+// minification dials (glyph_field.wgsl), while the gain is baked into
+// SegCull.tint's alpha at STAGING time by seg_tint (text.rs/repo.rs share
+// that path). A live gain would need either a cull.wgsl edit (fence 4) or
+// an ink_frac plumbing redesign across staging + sync_segment. Cut from K4;
+// the feasible future seam is recorded in out/STAGE_K_REPORT.md.
 
 impl GlyphScene {
     pub fn new(
@@ -1171,7 +1219,12 @@ impl GlyphScene {
     /// `Box<dyn SceneLike>` (build_scene_probed); offscreen never does, so
     /// the write in render() stays inert there.
     pub fn init_ui_probe(&mut self) -> UiProbe {
-        let probe = UiProbe::default();
+        // K4: the UI→scene controls are seeded from the compile-time consts,
+        // so a windowed run starts bit-identical to an offscreen one.
+        let probe = UiProbe::new(std::cell::RefCell::new(UiProbeState {
+            lod_min_px: LOD_MIN_PX,
+            ..Default::default()
+        }));
         self.ui_probe = Some(probe.clone());
         probe
     }
@@ -2205,17 +2258,14 @@ impl SceneLike for GlyphScene {
         self.viewport.set((width, height));
         let frame = self.camera_frame(t, aspect);
 
-        // Stage K: refresh the windowed debug-UI probe (installed only by
-        // windowed runs; offscreen skips this entirely). Camera fields are
-        // this frame's ACTUAL products; the pick line is the same string
-        // format_pick produces for the stdout log.
-        if let Some(probe) = &self.ui_probe {
-            let mut p = probe.borrow_mut();
-            p.camera_mode = Some(self.camera_mode);
-            p.eye = frame.eye.to_array();
-            p.yaw = self.fly.yaw;
-            p.pitch = self.fly.pitch;
-            p.last_pick = self.picked.as_ref().map(format_pick);
+        // Stage K (K4): apply live UI controls BEFORE culling so a slider
+        // drag takes effect this frame. This is the SINGLE write site of
+        // CullState::lod_min_px, and it runs only when a windowed probe is
+        // installed — offscreen never installs one, so offscreen culls with
+        // the LOD_MIN_PX const by construction (gate 6's byte-equal PNGs are
+        // the proof).
+        if let (Some(probe), Some(cull)) = (&self.ui_probe, &self.cull) {
+            cull.lod_min_px.set(probe.borrow().lod_min_px);
         }
 
         let cam = CameraUniform {
@@ -2231,14 +2281,16 @@ impl SceneLike for GlyphScene {
         if let Some(cull) = &self.cull {
             // Stage H: CPU scope timing (only when GLYPH_PROFILE=1 built a profiler).
             let cull_t0 = ctx.profiler.as_ref().map(|_| std::time::Instant::now());
-            let px_scale = height as f32 / (2.0 * (FOV_Y.to_radians() * 0.5).tan());
-            let planes = frustum_planes(&frame.view_proj);
+            let view = CullView {
+                planes: frustum_planes(&frame.view_proj),
+                eye: frame.eye,
+                px_scale: height as f32 / (2.0 * (FOV_Y.to_radians() * 0.5).tan()),
+                lod_min_px: cull.lod_min_px.get(),
+            };
             let (draws, backdrops) = cull_segments(
                 &cull.segments,
                 &cull.hidden,
-                &planes,
-                frame.eye,
-                px_scale,
+                &view,
                 self.chunk_cap,
                 self.bind_groups.len() as u32,
             );
@@ -2266,6 +2318,36 @@ impl SceneLike for GlyphScene {
                 );
             }
             culled_draws = Some((draws, backdrops));
+        }
+
+        // Stage K: refresh the windowed debug-UI probe (installed only by
+        // windowed runs; offscreen skips this entirely). Camera fields are
+        // this frame's ACTUAL products; the pick line is the same string
+        // format_pick produces for the stdout log; the K4 cull counters are
+        // the same sums GLYPH_CULL_DEBUG prints (zeros under --no-cull).
+        if let Some(probe) = &self.ui_probe {
+            let mut p = probe.borrow_mut();
+            p.camera_mode = Some(self.camera_mode);
+            p.eye = frame.eye.to_array();
+            p.yaw = self.fly.yaw;
+            p.pitch = self.fly.pitch;
+            p.last_pick = self.picked.as_ref().map(format_pick);
+            match &culled_draws {
+                Some((draws, backdrops)) => {
+                    p.cull_ranges = draws.iter().map(|c| c.len()).sum();
+                    p.cull_instances = draws
+                        .iter()
+                        .flat_map(|c| c.iter())
+                        .map(|r| (r.end - r.start) as u64)
+                        .sum();
+                    p.cull_backdrops = backdrops.len();
+                }
+                None => {
+                    p.cull_ranges = 0;
+                    p.cull_instances = 0;
+                    p.cull_backdrops = 0;
+                }
+            }
         }
 
         // Stage H: pass-level GPU timer (TIMESTAMP_QUERY; pass-boundary writes,
