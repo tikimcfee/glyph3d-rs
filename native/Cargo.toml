@@ -31,6 +31,22 @@ clap = { version = "4", features = ["derive"] }
 clap_complete = "4"
 wgpu-profiler = "0.28"
 encase = "0.12"
+# Stage K (K1): egui overlay on the WINDOWED renderer (windowed.rs only;
+# offscreen never touches it). egui-wgpu WITHOUT its `winit` feature — that
+# pulls in Painter, which owns the surface and clears the frame; we own the
+# surface/event loop/present and drive egui_wgpu::Renderer directly.
+# egui-wgpu depends on wgpu 30 with default-features = false, so our own wgpu
+# entry keeps sole control of backend selection and the tree unifies to one
+# wgpu (verified by `cargo tree -i wgpu`). egui 0.36 MSRV is rustc 1.95.
+egui = { version = "0.36", optional = true }
+egui-winit = { version = "0.36", optional = true }
+egui-wgpu = { version = "0.36", optional = true }
+
+[features]
+default = ["egui-ui"]
+# Stage K: build the windowed egui overlay. With the feature off (or `--no-ui`
+# at runtime) windowed behavior is exactly pre-K.
+egui-ui = ["dep:egui", "dep:egui-winit", "dep:egui-wgpu"]
 
 [dev-dependencies]
 # Stage H: validate the hand-written WGSL in `cargo test` with the exact

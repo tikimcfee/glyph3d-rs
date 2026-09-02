@@ -16,6 +16,8 @@
 //!          layout assertions for the hand-mirrored WGSL lane maps.
 //! Stage I: glam 0.30 → 0.33 (byte-identical under the full A/B suite);
 //!          baseline views moved onto the immutable fixtures/baseline-view.txt.
+//! Stage K: egui 0.36 overlay on the windowed renderer (K1: deps + plumbing
+//!          with an empty UI; `--no-ui` gives exact pre-K windowed behavior).
 //!
 //! Run modes:
 //!   (default) [--render-file <path>] [--copies N]
@@ -233,6 +235,9 @@ struct Cli {
     /// Stage F: disable the cull/LOD pass (legacy per-chunk draws; debug/A-B)
     #[arg(long)]
     no_cull: bool,
+    /// Stage K: windowed without the egui UI overlay (exact pre-K behavior)
+    #[arg(long)]
+    no_ui: bool,
     /// Generate shell completions for SHELL and exit
     #[arg(long, value_name = "SHELL")]
     generate: Option<clap_complete::Shell>,
@@ -580,7 +585,7 @@ fn main() {
         Some(path) => offscreen::run(
             &ctx, &choice, &path, cli.frames, cli.zoom, !cli.no_cull, &cli.ops,
         ),
-        None => windowed::run(ctx, &choice, !cli.no_cull, &cli.ops),
+        None => windowed::run(ctx, &choice, !cli.no_cull, &cli.ops, !cli.no_ui),
     }
 }
 
@@ -622,6 +627,7 @@ mod cli_tests {
         assert!(cli.focus_file.is_none());
         assert!(!cli.repo_scan_only);
         assert!(!cli.no_cull);
+        assert!(!cli.no_ui);
         assert!(cli.ops.is_empty());
     }
 
@@ -629,7 +635,7 @@ mod cli_tests {
     fn scalar_flags_parse() {
         let cli = parse(&[
             "--screenshot", "out.png", "--frames", "2", "--demo", "--copies", "3", "--zoom",
-            "2.5", "--no-cull", "--engine-loop", "4", "--load-repo", "fixtures/g-pick-repo",
+            "2.5", "--no-cull", "--no-ui", "--engine-loop", "4", "--load-repo", "fixtures/g-pick-repo",
             "--repo-engine", "batch", "--repo-verify", "--focus-file", "alpha",
             "--render-file", "src/main.rs", "--engine-file", "a.rs", "--engine-trie", "t.bin",
             "--engine-check", "b.rs", "--engine-render", "c.rs",
@@ -640,6 +646,7 @@ mod cli_tests {
         assert_eq!(cli.copies, 3);
         assert_eq!(cli.zoom, 2.5);
         assert!(cli.no_cull);
+        assert!(cli.no_ui);
         assert_eq!(cli.engine_loop, 4);
         assert_eq!(cli.load_repo, Some(PathBuf::from("fixtures/g-pick-repo")));
         assert_eq!(cli.repo_engine, "batch");

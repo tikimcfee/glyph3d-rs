@@ -12,6 +12,13 @@
 //!   - verb keys act on the last pick: `h` highlight line, `g` grab/release
 //!     the picked file (mouse drags it in the view plane, scroll scales it),
 //!     `t` cycle the tint palette, `x` toggle hidden.
+//!
+//! Stage K: egui 0.36 overlay (feature `egui-ui`, default ON; `--no-ui` at
+//! runtime gives exact pre-K behavior). egui sees every window event FIRST;
+//! scene input routing only handles events egui did not consume. Per frame,
+//! after the scene pass on the SAME encoder, an egui pass (LoadOp::Load, no
+//! depth attachment) paints the tessellated UI onto the surface. K1 ships the
+//! plumbing with an EMPTY CentralPanel — no widgets yet.
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -26,6 +33,16 @@ use crate::glyph_scene::CameraMode;
 use crate::gpu::GpuContext;
 use crate::scene::{self, SceneLike};
 use crate::{build_scene, Op, SceneChoice};
+
+/// Stage K: the egui overlay — context, winit event translation, and the
+/// wgpu painter. `None` in WindowState under `--no-ui`; the type (and all
+/// egui code below) is compiled out entirely without the `egui-ui` feature.
+#[cfg(feature = "egui-ui")]
+struct EguiUi {
+    ctx: egui::Context,
+    state: egui_winit::State,
+    renderer: egui_wgpu::Renderer,
+}
 
 struct WindowState {
     window: Arc<Window>,
@@ -51,6 +68,9 @@ struct WindowState {
     /// Stage H: GPU pass timing accumulator for the once-per-second line
     /// (only fed when GLYPH_PROFILE=1 built a profiler).
     profile: crate::gpu::ProfileAccumulator,
+    /// Stage K: egui overlay state; `None` under `--no-ui`.
+    #[cfg(feature = "egui-ui")]
+    egui: Option<EguiUi>,
 }
 
 impl WindowState {
@@ -133,11 +153,108 @@ impl WindowState {
             },
             self.time(),
         );
+
+        // Stage K (K1): egui overlay, painted as a second pass on the SAME
+        // encoder after the scene pass. Exact 0.36 lifecycle (verified against
+        // the vendored source): take_egui_input → run_ui →
+        // handle_platform_output → tessellate → update_texture per
+        // textures_delta.set (drained: TexturesDelta debug-panics if dropped
+        // with unapplied deltas) → update_buffers (mandatory — render()
+        // panics otherwise) → render pass with LoadOp::Load and NO depth
+        // attachment (egui paints OVER the scene) → submit → free_texture per
+        // textures_delta.free AFTER queue.submit (the freed textures may be
+        // referenced by the in-flight submission). `forget_lifetime` turns
+        // encoder-aliasing mistakes into runtime errors, so the pass is
+        // scoped and dropped before we touch the encoder again.
+        #[cfg(feature = "egui-ui")]
+        let mut egui_textures_delta: Option<egui::TexturesDelta> = None;
+        #[cfg(feature = "egui-ui")]
+        if let Some(egui) = self.egui.as_mut() {
+            let raw_input = egui.state.take_egui_input(&self.window);
+            let full_output = egui.ctx.run_ui(raw_input, |ui| {
+                // K1: empty UI — plumbing only. The CentralPanel lives on the
+                // background layer, so `is_pointer_over_egui` stays false and
+                // no scene input is consumed by it.
+                egui::CentralPanel::default().show(ui, |_ui| {});
+            });
+            let egui::FullOutput {
+                platform_output,
+                mut textures_delta,
+                shapes,
+                pixels_per_point,
+                viewport_output: _,
+            } = full_output;
+            egui.state
+                .handle_platform_output(&self.window, platform_output);
+            let clipped = egui.ctx.tessellate(shapes, pixels_per_point);
+            let screen = egui_wgpu::ScreenDescriptor {
+                size_in_pixels: [self.config.width, self.config.height],
+                pixels_per_point,
+            };
+            for (id, image_deltas) in textures_delta.set.drain() {
+                for image_delta in image_deltas {
+                    egui.renderer
+                        .update_texture(&ctx.device, &ctx.queue, id, &image_delta);
+                }
+            }
+            let user_cmds = egui.renderer.update_buffers(
+                &ctx.device,
+                &ctx.queue,
+                &mut encoder,
+                &clipped,
+                &screen,
+            );
+            // Callback command buffers (from paint callbacks) must be
+            // submitted before the main buffer. K1 registers no callbacks, so
+            // this is always empty — the branch keeps the contract explicit.
+            if !user_cmds.is_empty() {
+                ctx.queue.submit(user_cmds);
+            }
+            // Stage H scheme, mirrored: pass-boundary timestamp query.
+            let pass_query = ctx
+                .profiler
+                .as_ref()
+                .map(|p| p.borrow().begin_pass_query("egui pass", &mut encoder));
+            {
+                let pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("egui pass"),
+                    timestamp_writes: pass_query
+                        .as_ref()
+                        .and_then(|q| q.render_pass_timestamp_writes()),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &view,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Load,
+                            store: wgpu::StoreOp::Store,
+                        },
+                        depth_slice: None,
+                    })],
+                    depth_stencil_attachment: None,
+                    ..Default::default()
+                });
+                egui.renderer
+                    .render(&mut pass.forget_lifetime(), &clipped, &screen);
+            }
+            if let (Some(p), Some(q)) = (&ctx.profiler, pass_query) {
+                p.borrow().end_query(&mut encoder, q);
+            }
+            egui_textures_delta = Some(textures_delta);
+        }
+
         // Stage H: resolve profiler queries before submit (see offscreen.rs).
         if let Some(p) = &ctx.profiler {
             p.borrow_mut().resolve_queries(&mut encoder);
         }
         ctx.queue.submit([encoder.finish()]);
+        // Stage K: free egui textures only AFTER the submit that referenced
+        // them is handed to the queue.
+        #[cfg(feature = "egui-ui")]
+        if let (Some(egui), Some(delta)) = (self.egui.as_mut(), egui_textures_delta.as_mut()) {
+            for id in delta.free.drain() {
+                egui.renderer.free_texture(&id);
+            }
+        }
         // wgpu 30: presentation goes through the queue, not the texture.
         ctx.queue.present(frame);
 
@@ -200,6 +317,9 @@ struct App<'a> {
     ops: &'a [Op],
     start: Instant,
     state: Option<WindowState>,
+    /// Stage K: build the egui overlay (false under `--no-ui`).
+    #[cfg(feature = "egui-ui")]
+    ui: bool,
 }
 
 impl ApplicationHandler for App<'_> {
@@ -246,6 +366,33 @@ impl ApplicationHandler for App<'_> {
             view_formats: vec![],
         };
         surface.configure(&self.ctx.device, &config);
+
+        // Stage K (K1): egui overlay state, constructed after the surface is
+        // configured. The renderer gets the ACTUAL configured surface format
+        // (never hardcode it): our format is sRGB, which egui accepts via its
+        // linear-framebuffer shader path — it logs a once-per-pipeline warning
+        // (accepted: switching the surface to gamma-space would perturb the
+        // glyph pass's output encoding for zero UI gain).
+        #[cfg(feature = "egui-ui")]
+        let egui = if self.ui {
+            let egui_ctx = egui::Context::default();
+            let state = egui_winit::State::new(
+                egui_ctx.clone(),
+                egui::ViewportId::ROOT,
+                &*window,
+                Some(window.scale_factor() as f32),
+                None,
+                Some(self.ctx.device.limits().max_texture_dimension_2d as usize),
+            );
+            let renderer = egui_wgpu::Renderer::new(
+                &self.ctx.device,
+                format,
+                egui_wgpu::RendererOptions::default(),
+            );
+            Some(EguiUi { ctx: egui_ctx, state, renderer })
+        } else {
+            None
+        };
 
         // Stage F: windowed glyph scenes get the fly camera (the Stage A demo
         // scene keeps its internal orbit; it ignores camera_mode).
@@ -295,11 +442,27 @@ impl ApplicationHandler for App<'_> {
             frames: 0,
             fps_window_start: Instant::now(),
             profile: crate::gpu::ProfileAccumulator::default(),
+            #[cfg(feature = "egui-ui")]
+            egui,
         });
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
         let Some(state) = self.state.as_mut() else { return };
+        // Stage K: egui sees every window event FIRST. Scene routing below only
+        // handles events egui did not consume (0.36 semantics: pointer/wheel
+        // consumed when egui wants pointer input; CursorMoved consumed while
+        // egui is using the pointer; keys consumed when a widget has focus,
+        // and Tab always). CloseRequested/Resized/RedrawRequested are never
+        // consumed, so the lifecycle arms stay ungated — and are matched
+        // before the consumption arm defensively anyway.
+        #[cfg(feature = "egui-ui")]
+        let egui_consumed = match state.egui.as_mut() {
+            Some(egui) => egui.state.on_window_event(&state.window, &event).consumed,
+            None => false,
+        };
+        #[cfg(not(feature = "egui-ui"))]
+        let egui_consumed = false;
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::Resized(size) => {
@@ -307,6 +470,9 @@ impl ApplicationHandler for App<'_> {
                 state.scene.set_viewport(size.width, size.height);
             }
             WindowEvent::RedrawRequested => state.render(&self.ctx),
+            // Consumed by egui (e.g. click on a panel, typing in a focused
+            // widget): never routed to the scene.
+            _ if egui_consumed => {}
             WindowEvent::KeyboardInput { event, .. } => {
                 if let PhysicalKey::Code(code) = event.physical_key {
                     let pressed = event.state == ElementState::Pressed;
@@ -392,7 +558,11 @@ impl ApplicationHandler for App<'_> {
     }
 }
 
-pub fn run(ctx: GpuContext, choice: &SceneChoice, cull: bool, ops: &[Op]) {
+pub fn run(ctx: GpuContext, choice: &SceneChoice, cull: bool, ops: &[Op], ui: bool) {
+    // Without the `egui-ui` feature the overlay is compiled out entirely;
+    // the flag is accepted (and ignored) so the CLI is identical either way.
+    #[cfg(not(feature = "egui-ui"))]
+    let _ = ui;
     let event_loop = EventLoop::new().expect("event loop creation failed");
     let mut app = App {
         ctx,
@@ -401,6 +571,8 @@ pub fn run(ctx: GpuContext, choice: &SceneChoice, cull: bool, ops: &[Op]) {
         ops,
         start: Instant::now(),
         state: None,
+        #[cfg(feature = "egui-ui")]
+        ui,
     };
     event_loop.run_app(&mut app).expect("event loop error");
 }
