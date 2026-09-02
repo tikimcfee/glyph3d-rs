@@ -107,8 +107,42 @@ pub fn build_scene(
     camera_mode: CameraMode,
     cull: bool,
 ) -> Box<dyn SceneLike> {
+    // Offscreen path: never installs a UI probe (probe = false), so the
+    // scene behaves exactly as pre-K.
+    build_scene_impl(ctx, color_format, choice, camera_mode, cull, false).0
+}
+
+/// Stage K (K3): windowed scene construction. Same scenes as build_scene,
+/// plus a debug-UI probe handle installed on the concrete GlyphScene BEFORE
+/// type erasure — the egui Debug panel's read-back channel (windowed.rs
+/// holds the scene as Box<dyn SceneLike>; fence 4 forbids SceneLike
+/// changes). The demo scene has no probe (None).
+pub fn build_scene_probed(
+    ctx: &GpuContext,
+    color_format: wgpu::TextureFormat,
+    choice: &SceneChoice,
+    camera_mode: CameraMode,
+    cull: bool,
+) -> (Box<dyn SceneLike>, Option<glyph_scene::UiProbe>) {
+    build_scene_impl(ctx, color_format, choice, camera_mode, cull, true)
+}
+
+fn build_scene_impl(
+    ctx: &GpuContext,
+    color_format: wgpu::TextureFormat,
+    choice: &SceneChoice,
+    camera_mode: CameraMode,
+    cull: bool,
+    probe: bool,
+) -> (Box<dyn SceneLike>, Option<glyph_scene::UiProbe>) {
+    // Same construction order for both modes; only the probe install differs.
+    let glyph = |scene: GlyphScene| {
+        let mut scene = scene;
+        let p = probe.then(|| scene.init_ui_probe());
+        (Box::new(scene) as Box<dyn SceneLike>, p)
+    };
     match choice {
-        SceneChoice::Demo => Box::new(Scene::new(ctx, color_format)),
+        SceneChoice::Demo => (Box::new(Scene::new(ctx, color_format)), None),
         SceneChoice::Text { file, copies } => {
             let atlas = atlas::Atlas::load(ctx);
             let staged = text::stage_file(&atlas, file, *copies);
@@ -120,7 +154,7 @@ pub fn build_scene(
                 copies,
                 staged.missing_or_bitmap,
             );
-            Box::new(GlyphScene::new(ctx, color_format, &atlas, staged, camera_mode, cull))
+            glyph(GlyphScene::new(ctx, color_format, &atlas, staged, camera_mode, cull))
         }
         SceneChoice::EngineText { file, trie } => {
             let atlas = atlas::Atlas::load(ctx);
@@ -132,7 +166,7 @@ pub fn build_scene(
                 records.iter().filter(|r| r.glyph_id() == 0).count(),
             );
             let staged = text::stage_records(&records);
-            Box::new(GlyphScene::new(ctx, color_format, &atlas, staged, camera_mode, cull))
+            glyph(GlyphScene::new(ctx, color_format, &atlas, staged, camera_mode, cull))
         }
         SceneChoice::Repo {
             dir,
@@ -145,7 +179,7 @@ pub fn build_scene(
             load.print_stats();
             let atlas = atlas::Atlas::load(ctx);
             let staged = load.into_staged(focus.as_deref());
-            Box::new(GlyphScene::new(ctx, color_format, &atlas, staged, camera_mode, cull))
+            glyph(GlyphScene::new(ctx, color_format, &atlas, staged, camera_mode, cull))
         }
     }
 }

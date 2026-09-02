@@ -427,6 +427,33 @@ pub enum CameraMode {
     Fly,
 }
 
+// ── Stage K: windowed debug-UI probe ─────────────────────────────────────
+// The windowed egui Debug panel (K3) needs read-only scene state, but
+// windowed.rs holds the scene type-erased as `Box<dyn SceneLike>` and fence
+// 4 forbids trait changes. The probe is the channel: a shared cell installed
+// on the CONCRETE GlyphScene before boxing (see build_scene_probed in
+// main.rs), written once per frame by render(), read by the panel.
+// Offscreen never installs one, so the determinism chain never touches it.
+// Single-threaded: winit's event-loop thread owns both writer and reader.
+
+/// Read-only snapshot displayed by the windowed debug panel.
+#[derive(Clone, Default)]
+pub struct UiProbeState {
+    /// None until the first probed frame has rendered.
+    pub camera_mode: Option<CameraMode>,
+    /// The eye position actually used for this frame's cull/projection.
+    pub eye: [f32; 3],
+    /// Fly-camera angles (windowed always runs Fly).
+    pub yaw: f32,
+    pub pitch: f32,
+    /// The last resolved pick, formatted by the same `format_pick` as the
+    /// stdout pick log line.
+    pub last_pick: Option<String>,
+}
+
+/// Shared probe cell: GlyphScene writes, the egui panel reads.
+pub type UiProbe = std::rc::Rc<std::cell::RefCell<UiProbeState>>;
+
 /// Stage F — fly camera state: WASD strafe/forward, E|R up, Q|F down,
 /// mouse-look (yaw/pitch), scroll = persistent speed multiplier, exponential
 /// velocity damping. yaw = 0 looks down −Z (the text plane faces +Z).
@@ -781,6 +808,8 @@ pub struct GlyphScene {
     viewport: Cell<(u32, u32)>,
     /// Per-group position in the DIR_TINTS cycle (t verb).
     tint_step: Vec<u32>,
+    /// Stage K: windowed debug-UI probe (None offscreen / under --no-ui).
+    ui_probe: Option<UiProbe>,
 }
 
 impl GlyphScene {
@@ -1133,7 +1162,18 @@ impl GlyphScene {
             cursor: (0.0, 0.0),
             viewport: Cell::new((1600, 1000)), // refreshed every render()
             tint_step,
+            ui_probe: None,
         }
+    }
+
+    /// Stage K: install and return the windowed debug-UI probe. Windowed mode
+    /// calls this on the concrete scene BEFORE boxing it as
+    /// `Box<dyn SceneLike>` (build_scene_probed); offscreen never does, so
+    /// the write in render() stays inert there.
+    pub fn init_ui_probe(&mut self) -> UiProbe {
+        let probe = UiProbe::default();
+        self.ui_probe = Some(probe.clone());
+        probe
     }
 
     /// Camera eye/target for the mode at time `t` — the SINGLE source both
@@ -2164,6 +2204,20 @@ impl SceneLike for GlyphScene {
         let aspect = width as f32 / height.max(1) as f32;
         self.viewport.set((width, height));
         let frame = self.camera_frame(t, aspect);
+
+        // Stage K: refresh the windowed debug-UI probe (installed only by
+        // windowed runs; offscreen skips this entirely). Camera fields are
+        // this frame's ACTUAL products; the pick line is the same string
+        // format_pick produces for the stdout log.
+        if let Some(probe) = &self.ui_probe {
+            let mut p = probe.borrow_mut();
+            p.camera_mode = Some(self.camera_mode);
+            p.eye = frame.eye.to_array();
+            p.yaw = self.fly.yaw;
+            p.pitch = self.fly.pitch;
+            p.last_pick = self.picked.as_ref().map(format_pick);
+        }
+
         let cam = CameraUniform {
             view_proj: frame.view_proj.to_cols_array(),
         };

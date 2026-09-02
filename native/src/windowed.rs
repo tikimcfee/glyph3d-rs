@@ -52,7 +52,26 @@ struct EguiUi {
     ctx: egui::Context,
     state: egui_winit::State,
     renderer: egui_wgpu::Renderer,
+    /// K3: scratch text field in the Debug window — doubles as the K2
+    /// typing-isolation trap test (typing WASD/h/g/t/x here must not fly the
+    /// camera or fire verbs; the gating matrix in window_event ensures it).
+    scratch: String,
 }
+
+/// Stage K (K3): Debug-panel verb buttons — CLI `--verb` literals parsed
+/// through the same crate::parse_verb the CLI uses, so panel ⇔ CLI
+/// equivalence is by construction. Zero-arg/default forms only; the
+/// parameterized verbs (nudge/scale/move, tint-group rrggbb) stay CLI-only
+/// until a phase needs arg entry.
+#[cfg(feature = "egui-ui")]
+const PANEL_VERBS: &[&str] = &[
+    "recolor-glyph",
+    "recolor-line",
+    "tint-cycle",
+    "hide-group",
+    "show-group",
+    "toggle-hidden",
+];
 
 struct WindowState {
     window: Arc<Window>,
@@ -81,6 +100,14 @@ struct WindowState {
     /// Stage K: egui overlay state; `None` under `--no-ui`.
     #[cfg(feature = "egui-ui")]
     egui: Option<EguiUi>,
+    /// Stage K (K3): debug-UI probe — camera/pick snapshot written by the
+    /// scene each frame (None for the demo scene and under --no-ui).
+    #[cfg(feature = "egui-ui")]
+    ui_probe: Option<crate::glyph_scene::UiProbe>,
+    /// Stage K (K3): the 1 Hz FPS figure, mirrored for the Debug panel (the
+    /// println below stays the primary output — offscreen logs read it).
+    #[cfg(feature = "egui-ui")]
+    ui_fps: f32,
 }
 
 impl WindowState {
@@ -205,11 +232,70 @@ impl WindowState {
         #[cfg(feature = "egui-ui")]
         if let Some(egui) = self.egui.as_mut() {
             let raw_input = egui.state.take_egui_input(&self.window);
-            let full_output = egui.ctx.run_ui(raw_input, |ui| {
-                // K1: empty UI — plumbing only. The CentralPanel lives on the
-                // background layer, so `is_pointer_over_egui` stays false and
-                // no scene input is consumed by it.
-                egui::CentralPanel::default().show(ui, |_ui| {});
+            // Clone the Context (an Arc bump) so the closure below can borrow
+            // the other EguiUi / WindowState fields disjointly.
+            let egui_ctx = egui.ctx.clone();
+            // K3: snapshot the probe before the closure (RefCell stays
+            // unborrowed across the UI build).
+            let probe_snap = self.ui_probe.as_ref().map(|p| p.borrow().clone());
+            let fps = self.ui_fps;
+            let full_output = egui_ctx.run_ui(raw_input, |root_ui| {
+                // The CentralPanel lives on the background layer, so
+                // `is_pointer_over_egui` stays false for it and it consumes
+                // no scene input (K1/K2 rules).
+                egui::CentralPanel::default().show(root_ui, |_ui| {});
+                // K3: the Debug window. Every scene-facing call below is the
+                // exact API the CLI ops use — verb buttons parse CLI-literal
+                // strings through crate::parse_verb and call
+                // SceneLike::apply_verb; the determinism chain never learns
+                // egui exists.
+                egui::Window::new("Debug")
+                    .id(egui::Id::new("stage_k_debug_panel"))
+                    .show(root_ui.ctx(), |ui| {
+                        ui.label(format!("FPS: {fps:.1}"));
+                        match &probe_snap {
+                            Some(snap) => {
+                                let mode = match snap.camera_mode {
+                                    Some(crate::glyph_scene::CameraMode::Front { zoom }) => {
+                                        format!("Front(zoom {zoom:.2})")
+                                    }
+                                    Some(crate::glyph_scene::CameraMode::Orbit) => {
+                                        "Orbit".to_string()
+                                    }
+                                    Some(crate::glyph_scene::CameraMode::Fly) => "Fly".to_string(),
+                                    None => "—".to_string(),
+                                };
+                                ui.label(format!(
+                                    "camera: {mode} eye=({:.2},{:.2},{:.2}) yaw={:.3} pitch={:.3}",
+                                    snap.eye[0], snap.eye[1], snap.eye[2], snap.yaw, snap.pitch,
+                                ));
+                                ui.label(
+                                    snap.last_pick
+                                        .as_deref()
+                                        .unwrap_or("pick: (none yet — left-click a glyph)"),
+                                );
+                            }
+                            None => {
+                                ui.label("camera/pick: n/a (demo scene has no probe)");
+                            }
+                        }
+                        ui.separator();
+                        ui.label("verbs (same strings --verb parses):");
+                        ui.horizontal_wrapped(|ui| {
+                            for spec in PANEL_VERBS {
+                                if ui.button(*spec).clicked() {
+                                    let verb = crate::parse_verb(spec)
+                                        .expect("panel verb literal must parse like the CLI");
+                                    if let Some(line) = self.scene.apply_verb(ctx, &verb) {
+                                        println!("{line}");
+                                    }
+                                }
+                            }
+                        });
+                        ui.separator();
+                        ui.label("K2 typing test — WASD/h/g/t/x here must not move the scene:");
+                        ui.text_edit_singleline(&mut egui.scratch);
+                    });
             });
             let egui::FullOutput {
                 platform_output,
@@ -347,6 +433,11 @@ impl WindowState {
                 elapsed,
                 self.scene.instance_count(),
             );
+            // Stage K (K3): mirror the same figure for the Debug panel.
+            #[cfg(feature = "egui-ui")]
+            {
+                self.ui_fps = self.frames as f32 / elapsed.as_secs_f32();
+            }
             self.frames = 0;
             self.fps_window_start = Instant::now();
             self.profile = crate::gpu::ProfileAccumulator::default();
@@ -440,13 +531,22 @@ impl ApplicationHandler for App<'_> {
                 format,
                 egui_wgpu::RendererOptions::default(),
             );
-            Some(EguiUi { ctx: egui_ctx, state, renderer })
+            Some(EguiUi { ctx: egui_ctx, state, renderer, scratch: String::new() })
         } else {
             None
         };
 
         // Stage F: windowed glyph scenes get the fly camera (the Stage A demo
         // scene keeps its internal orbit; it ignores camera_mode).
+        // Stage K (K3): with the UI on, install the debug-UI probe on the
+        // concrete GlyphScene BEFORE type erasure (see build_scene_probed).
+        #[cfg(feature = "egui-ui")]
+        let (mut scene, ui_probe) = if self.ui {
+            crate::build_scene_probed(&self.ctx, format, self.choice, CameraMode::Fly, self.cull)
+        } else {
+            (build_scene(&self.ctx, format, self.choice, CameraMode::Fly, self.cull), None)
+        };
+        #[cfg(not(feature = "egui-ui"))]
         let mut scene = build_scene(&self.ctx, format, self.choice, CameraMode::Fly, self.cull);
         let depth = scene::create_depth(&self.ctx.device, scene.depth_format(), config.width, config.height);
         log::info!(
@@ -495,6 +595,10 @@ impl ApplicationHandler for App<'_> {
             profile: crate::gpu::ProfileAccumulator::default(),
             #[cfg(feature = "egui-ui")]
             egui,
+            #[cfg(feature = "egui-ui")]
+            ui_probe,
+            #[cfg(feature = "egui-ui")]
+            ui_fps: 0.0,
         });
     }
 
