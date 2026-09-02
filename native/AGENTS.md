@@ -94,6 +94,13 @@ three corpus views on all paths (`PROFILE=0|1`). Measurement levers:
 validation pass) and `GLYPH_MDI_LIMIT=<n>` (caps issued slots — output is
 wrong when it truncates; pricing only).
 
+Incremental levers (default off; all gates green with them on):
+`GLYPH_CPU_MEMO=backdrop|frame` lets `--cull cpu` skip the backdrop upload
+when its bytes are unchanged, or the whole cull when the camera key is
+unchanged (segment edits invalidate it); `GLYPH_UNIFORM_MEMO=1` skips the
+camera / cull-params uniform writes when unchanged on every path. Numbers
+and the reasoning in out/STAGE_K_REPORT.md §4.3.
+
 **Arena chunks stay below 4 GiB, always.** naga's Metal bounds checks hold
 buffer sizes in 32 bits; a ≥4 GiB storage binding reads as fully out of
 bounds (blank frame, no error). wgpu only clamps the reported limits to

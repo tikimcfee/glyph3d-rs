@@ -42,7 +42,8 @@ release build, 1600×1000 offscreen.
 | `061d737` | `mdi-probe` — the proof tool: 3 device configs × 9 indirect-draw forms, readback-graded |
 | `589290c` | GPU cull → `multi_draw_indirect` path (`--cull`), `--cull-verify`, gate 7, bench script |
 | `f043b64` | packed form (`--cull gpu-packed`, cs_pack + vs_packed), profiler back-pressure, encode-cost scopes at `encoder.finish()`, the ≥4 GiB chunk clamp (§5b), measurement levers, gate 7 covers both forms |
-| (this commit) | this report |
+| `b172e9e` | this report (first version) |
+| (commit 5) | the fair fight: CPU-path frame memo + uniform-write memo levers (§4.3), report update |
 
 ## 1. The diagnosis — `mdi-probe`
 
@@ -291,6 +292,71 @@ The deterministic CPU-side numbers are the point of this table:
   indirect draws; the residual is the compute pass encode and validation
   setup). This is the O(segments) term of §2, priced: ~0.2 ms per 1,300
   segments per frame on the multi-draw form, gone on the packed form.
+
+### 4.3 The fair fight — an incremental CPU path (commit 5)
+
+§4.1's wide-view result looked like a GPU win, but the CPU path there was
+paying for per-frame *traffic* (rebuilding and uploading the backdrop list,
+writing the camera uniform) for an answer that never changed. The GPU pass is
+stateless by design; the CPU's structural edge is that it can remember. So
+the CPU path was given a memo, behind levers that default to the Stage F
+behaviour:
+
+- `GLYPH_CPU_MEMO=backdrop` — cull every frame, upload the backdrop list only
+  when its bytes differ from what is on the GPU;
+- `GLYPH_CPU_MEMO=frame` — when the camera key (view-proj, eye, px_scale) is
+  bit-identical to last frame's, reuse last frame's draw list and backdrops
+  outright (segment edits through `sync_segment` invalidate it);
+- `GLYPH_UNIFORM_MEMO=1` — skip the camera / cull-params uniform writes when
+  the key is unchanged, on every path.
+
+All seven gates are green with `frame` + uniform memo exported (byte-equal
+to the committed baselines; gate 7 37/37), and every render below is
+byte-equal to `cpu-ref`. 900 frames × 3 interleaved repetitions, medians:
+
+| config | wide | mid |
+|---|---|---|
+| cpu (Stage F: cull + upload every frame) | **246** (246/256/234) | 148 (148/131/156) |
+| cpu, backdrop memo | 237 (169/237/267) | 142 (142/141/147) |
+| cpu, frame memo | 282 (282/249/284) | 151 (139/154/151) |
+| cpu, frame memo + uniform memo | **316** (313/491/316) | **157** (157/150/162) |
+| gpu (multi-draw) | **338** (361/338/303) | 146 (88/146/162) |
+| gpu + uniform memo | 325 (344/322/325) | 146 (144/171/146) |
+| gpu-packed | **341** (361/258/341) | 142 (130/142/179) |
+| gpu-packed + uniform memo | 324 (327/317/324) | 146 (131/149/146) |
+
+What it says, and what it corrects:
+
+- **The 41 KB backdrop upload was not the cost.** Skipping it alone
+  (`backdrop`) moved nothing outside the noise. The earlier explanation in
+  this report's first draft was wrong on that point.
+- **Not submitting is the cost.** Skipping the cull's per-frame work
+  (`frame`) is worth ~15%, and skipping the camera write on top of it — which
+  removes wgpu's pending-writes command buffer (a staging allocation, a copy
+  and a blit encoder) from every frame — takes the CPU path to 316 fps: parity
+  with the GPU forms (325–341) within the spread. One repetition hit 491 fps
+  with nothing but a render pass in the frame, which is roughly the harness
+  floor on this machine.
+- **The GPU forms gain nothing from the uniform memo.** Their frame still
+  carries the compute encoders, wgpu's validation pass and the indirect
+  draws, so the pending-writes buffer is not on their critical path.
+- **Mid is fragment-bound** (4–6 ms of Slug coverage); all eight
+  configurations sit in 142–157 fps.
+
+So the honest verdict on "was it a performance improvement": the GPU path won
+against the Stage F CPU path because that path uploaded every frame; against
+a CPU path allowed to be incremental, it is a draw on this corpus, with the
+GPU forms holding a flat per-frame cost that does not grow with segments and
+the CPU path holding a zero-cost idle frame. Where the fight is not fair in
+the GPU's favour is a moving camera over a much larger table: the CPU path
+then culls and re-uploads every frame with O(segments) work on the CPU, the
+GPU forms do the same O(segments) work in 25–58 µs of GPU time, and the
+packed form encodes O(chunks) draws. That is the case Stage K was built for.
+
+Defaults are unchanged in this commit (`GLYPH_CPU_MEMO=off`,
+`GLYPH_UNIFORM_MEMO` off): `--cull cpu` users get the Stage F behaviour
+unless they opt in. Flipping `frame` on for the CPU path is a one-line
+change with all gates already green for it.
 
 ## 5. Profiler back-pressure (commit 3)
 

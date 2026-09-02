@@ -358,11 +358,46 @@ struct Params {
 /// Stage F — one far-LOD backdrop quad, 32 B, mirrors `BackdropInst` in
 /// cull.wgsl: world rect + premultiplied-ready color (rgb linear, a = E).
 #[repr(C)]
-#[derive(Clone, Copy, Pod, Zeroable)]
+#[derive(Clone, Copy, Pod, Zeroable, PartialEq)]
 struct BackdropInst {
     min: [f32; 2],
     max: [f32; 2],
     rgba: [f32; 4],
+}
+
+/// Stage K "fair fight" — everything the per-frame uploads and the CPU cull
+/// derive from. Bit-exact compare: two frames with equal keys produce equal
+/// draw lists, equal backdrop bytes and equal uniforms.
+#[derive(Clone, Copy, PartialEq)]
+struct CamKey {
+    view_proj: [f32; 16],
+    eye: [f32; 3],
+    px_scale: f32,
+}
+
+/// Stage K "fair fight" — what the CPU cull path is allowed to remember
+/// between frames (GLYPH_CPU_MEMO=off|backdrop|frame). The GPU pass is
+/// stateless by design and recomputes every frame; the CPU's structural
+/// edge is that it can notice nothing changed and do nothing.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum CpuMemo {
+    /// Stage F behaviour: cull every frame, upload the backdrop list every frame.
+    Off,
+    /// Cull every frame; upload the backdrop list only when its bytes differ
+    /// from what is already on the GPU.
+    Backdrop,
+    /// Skip the cull AND the upload when the camera key is unchanged since
+    /// the last frame (segment edits invalidate the memo).
+    Frame,
+}
+
+/// The CPU path's last-frame memo (see `CpuMemo`).
+struct CullMemo {
+    key: CamKey,
+    draws: Vec<Vec<std::ops::Range<u32>>>,
+    backdrops: Vec<BackdropInst>,
+    /// The backdrop list whose bytes are currently on the GPU.
+    uploaded: Vec<BackdropInst>,
 }
 
 /// Stage K — which cull path a scene runs. `Off` = the legacy per-chunk
@@ -1021,6 +1056,9 @@ struct CullState {
     backdrop_bind_group: wgpu::BindGroup,
     /// Stage K: present in `CullMode::Gpu`.
     gpu: Option<GpuCull>,
+    /// Stage K "fair fight": the CPU path's last-frame memo (`CpuMemo`);
+    /// RefCell because render() is `&self`. Cleared by `sync_segment`.
+    memo: std::cell::RefCell<Option<CullMemo>>,
 }
 
 impl CullState {
@@ -1199,6 +1237,7 @@ impl CullState {
             backdrop_pipeline,
             backdrop_bind_group,
             gpu,
+            memo: std::cell::RefCell::new(None),
         }
     }
 }
@@ -1232,6 +1271,13 @@ pub struct GlyphScene {
     /// Stage K: the packed form's vs_packed pipeline + per-chunk bind groups
     /// (`CullMode::GpuPacked` only).
     packed_draw: Option<PackedDraw>,
+    /// Stage K "fair fight": what the CPU cull path may remember between
+    /// frames (GLYPH_CPU_MEMO).
+    cpu_memo: CpuMemo,
+    /// Stage K "fair fight": skip the camera / cull-params uniform writes
+    /// when the camera key is unchanged (GLYPH_UNIFORM_MEMO=1; every path).
+    uniform_memo: bool,
+    cam_memo: std::cell::RefCell<Option<CamKey>>,
     // ── Stage G: picking & live manipulation ────────────────────────────
     /// Arena chunk buffers, kept for partial per-slot uploads (verbs).
     instance_bufs: Vec<wgpu::Buffer>,
@@ -1651,6 +1697,20 @@ impl GlyphScene {
         let groups_cpu = groups.clone();
         let tint_step = vec![0u32; groups.len()];
 
+        // Stage K "fair fight" levers (see CpuMemo). Defaults = the Stage F
+        // behaviour so every gate compares like with like; the experiment in
+        // out/STAGE_K_REPORT.md §4.3 sets them.
+        let cpu_memo = match std::env::var("GLYPH_CPU_MEMO").as_deref() {
+            Ok("backdrop") => CpuMemo::Backdrop,
+            Ok("frame") => CpuMemo::Frame,
+            Ok("off") | Err(_) => CpuMemo::Off,
+            Ok(other) => panic!("GLYPH_CPU_MEMO must be off|backdrop|frame, got {other:?}"),
+        };
+        let uniform_memo = std::env::var_os("GLYPH_UNIFORM_MEMO").is_some_and(|v| v != "0");
+        if cpu_memo != CpuMemo::Off || uniform_memo {
+            log::info!("memo: cpu cull {cpu_memo:?}, uniform writes skipped when unchanged: {uniform_memo}");
+        }
+
         Self {
             pipeline,
             bind_groups,
@@ -1667,6 +1727,9 @@ impl GlyphScene {
             fly,
             cull,
             packed_draw,
+            cpu_memo,
+            uniform_memo,
+            cam_memo: std::cell::RefCell::new(None),
             instance_bufs,
             group_buf,
             groups_cpu,
@@ -2165,6 +2228,9 @@ impl GlyphScene {
             *tc = (bt[c] * newc / oldc).min(1.0);
         }
         cull.segments[i].tint = t;
+        // Stage K "fair fight": the table changed — last frame's CPU cull no
+        // longer describes it.
+        *cull.memo.get_mut() = None;
         // Stage K: the GPU cull reads the segment table on the GPU — mirror
         // the edited row (48 B) so the next frame's classify sees it.
         if let Some(gpu) = &cull.gpu {
@@ -2891,11 +2957,26 @@ impl SceneLike for GlyphScene {
         let aspect = width as f32 / height.max(1) as f32;
         self.viewport.set((width, height));
         let frame = self.camera_frame(t, aspect);
+        let px_scale = height as f32 / (2.0 * (FOV_Y.to_radians() * 0.5).tan());
         let cam = CameraUniform {
             view_proj: frame.view_proj.to_cols_array(),
         };
-        ctx.queue
-            .write_buffer(&self.camera_buf, 0, bytemuck::bytes_of(&cam));
+        // Stage K "fair fight": the camera key this frame's uploads and cull
+        // derive from; with GLYPH_UNIFORM_MEMO the unchanged-camera uniform
+        // writes are skipped on every path (the buffers keep their bytes).
+        let cam_key = CamKey {
+            view_proj: cam.view_proj,
+            eye: frame.eye.to_array(),
+            px_scale,
+        };
+        let cam_unchanged = self.uniform_memo && self.cam_memo.borrow().as_ref() == Some(&cam_key);
+        if !cam_unchanged {
+            ctx.queue
+                .write_buffer(&self.camera_buf, 0, bytemuck::bytes_of(&cam));
+        }
+        if self.uniform_memo {
+            *self.cam_memo.borrow_mut() = Some(cam_key);
+        }
 
         // --- Stage F/K: segment cull (frustum + LOD) ------------------------
         // CPU path: per-chunk draw ranges + compacted backdrop quads, uploaded
@@ -2904,14 +2985,15 @@ impl SceneLike for GlyphScene {
         type CulledDraws = (Vec<Vec<std::ops::Range<u32>>>, Vec<BackdropInst>);
         let mut culled_draws: Option<CulledDraws> = None;
         if let Some(cull) = &self.cull {
-            let px_scale = height as f32 / (2.0 * (FOV_Y.to_radians() * 0.5).tan());
             let planes = frustum_planes(&frame.view_proj);
             let chunk_count = self.bind_groups.len() as u32;
             let debug = std::env::var_os("GLYPH_CULL_DEBUG").is_some() && t == 0.0;
             if let Some(gpu) = &cull.gpu {
-                let params = gpu.params(cull.segments.len() as u32, planes, frame.eye, px_scale);
-                ctx.queue
-                    .write_buffer(&gpu.params_buf, 0, bytemuck::bytes_of(&params));
+                if !cam_unchanged {
+                    let params = gpu.params(cull.segments.len() as u32, planes, frame.eye, px_scale);
+                    ctx.queue
+                        .write_buffer(&gpu.params_buf, 0, bytemuck::bytes_of(&params));
+                }
                 let cull_query = ctx
                     .profiler
                     .as_ref()
@@ -2954,21 +3036,53 @@ impl SceneLike for GlyphScene {
             } else {
                 // Stage H: CPU scope timing (only when GLYPH_PROFILE=1 built a profiler).
                 let cull_t0 = ctx.profiler.as_ref().map(|_| std::time::Instant::now());
-                let (draws, backdrops) = cull_segments(
-                    &cull.segments,
-                    &planes,
-                    frame.eye,
-                    px_scale,
-                    self.chunk_cap,
-                    chunk_count,
-                );
-                if !backdrops.is_empty() {
+                // Stage K "fair fight": with a Frame memo and an unchanged
+                // camera the whole cull is last frame's; with any memo the
+                // backdrop list is uploaded only when its bytes would change.
+                let mut memo = cull.memo.borrow_mut();
+                let reuse = self.cpu_memo == CpuMemo::Frame
+                    && memo.as_ref().is_some_and(|m| m.key == cam_key);
+                let (draws, backdrops) = if reuse {
+                    let m = memo.as_ref().expect("memo present: checked by `reuse`");
+                    (m.draws.clone(), m.backdrops.clone())
+                } else {
+                    cull_segments(
+                        &cull.segments,
+                        &planes,
+                        frame.eye,
+                        px_scale,
+                        self.chunk_cap,
+                        chunk_count,
+                    )
+                };
+                let upload = !backdrops.is_empty()
+                    && match self.cpu_memo {
+                        CpuMemo::Off => true,
+                        CpuMemo::Backdrop | CpuMemo::Frame => {
+                            memo.as_ref().is_none_or(|m| m.uploaded != backdrops)
+                        }
+                    };
+                if upload {
                     ctx.queue.write_buffer(
                         &cull.backdrop_insts_buf,
                         0,
                         bytemuck::cast_slice(&backdrops),
                     );
                 }
+                if self.cpu_memo != CpuMemo::Off {
+                    let uploaded = if upload {
+                        backdrops.clone()
+                    } else {
+                        memo.as_ref().map(|m| m.uploaded.clone()).unwrap_or_default()
+                    };
+                    *memo = Some(CullMemo {
+                        key: cam_key,
+                        draws: draws.clone(),
+                        backdrops: backdrops.clone(),
+                        uploaded,
+                    });
+                }
+                drop(memo);
                 if let Some(t0) = cull_t0 {
                     crate::gpu::record_cpu_scope(ctx, "cull (CPU)", t0.elapsed().as_secs_f64() * 1000.0);
                 }
