@@ -9,15 +9,18 @@ change to the offscreen oracle path** and zero WGSL edits, per
 
 ## Result
 
-**Phases K1–K4 landed** (K1 `c99631f` + report `4e10720`, K2 `2118305`, K3
-`d6e8efa`, K4 `f4d2934`; 2026-09-02): the egui 0.36.1 stack, full
-render/input plumbing, the input-consumption gating matrix, the Debug panel
-(FPS, camera, pick inspector, verb buttons, scratch text field), and live
-LOD_MIN_PX tuning with cull readouts and an F1 panel toggle. All six gates
-green after every commit; one wgpu in the tree; windowed FPS band unchanged;
-`--no-ui` reproduces pre-K behavior exactly. **Cut:** the BACKDROP_GAIN
-slider (handoff's mechanism premise was wrong — see Phase K4). Only K5
-(stretch: group-tree browser) remains.
+**Stage K COMPLETE — all five phases landed** (K1 `c99631f` + report
+`4e10720`, K2 `2118305`, K3 `d6e8efa`, K4 `f4d2934` + report `1adf47e`, K5
+`3a4f75b`; 2026-09-02): the egui 0.36.1 stack, full render/input plumbing,
+the input-consumption gating matrix, the Debug panel (FPS, camera, pick
+inspector, verb buttons, scratch text field), live LOD_MIN_PX tuning with
+cull readouts and an F1 panel toggle, and the virtualized group browser with
+click-to-fly navigation. All six gates green after every commit; one wgpu in
+the tree; windowed FPS band unchanged (60 fps vsync-capped); `--no-ui`
+reproduces pre-K behavior exactly; the offscreen oracle path is provably
+untouched (four byte-equal PNGs after every commit). **One cut:**
+BACKDROP_GAIN live slider (handoff's mechanism premise was wrong — see Phase
+K4; feasible future seam recorded).
 
 ---
 
@@ -150,16 +153,6 @@ glyph3d-native` also matches an unrelated concurrent experiment running from
 `.claude/worktrees/multi-drawindirect/` (another session's `--frames 900
 --screenshot` loop) — those processes were identified by full path and left
 untouched.
-
-## Remaining gaps (K5)
-
-- K5 (stretch): group-tree browser (virtualized rows).
-- BACKDROP_GAIN live slider — cut in K4 (mechanism premise false; future
-  seam recorded in the K4 section below).
-- puffin_egui still pinned to egui 0.33 (house note; not adopted here).
-- AccessKit feature left ON (egui-winit default); no adapters are
-  initialized without `init_accesskit`, so it is inert — revisit only if
-  binary size or platform issues appear.
 
 ---
 
@@ -374,3 +367,201 @@ and is never scene input; if egui has keyboard focus it consumes F1 first
   wheel gating) and WASD must not fly while the scratch field is focused.
 - F1 closes and reopens the Debug window; the window's own × closes it.
 - `--no-ui` runs keep pre-K behavior (no panel, F1 inert).
+
+---
+
+## Phase K5 as-executed (commit `3a4f75b`)
+
+### Design choice: FLAT virtualized list (not a tree)
+
+`egui::ScrollArea::show_rows` builds only the visible rows, so per-frame
+work is bounded by the viewport, not the file count. A
+`CollapsingHeader`-per-directory tree is **not** virtualized — every header
+would be laid out every frame, the classic egui large-list trap at ~1.3k
+files (study §4). A properly virtualized collapsible tree needs a per-frame
+visible-row flattening pass over an expansion-state set — real complexity
+for a stretch goal. So: flat list, path-indented by directory depth, with a
+substring filter field. **Vanilla egui only — `egui_ltreeview` was not
+needed and no new dep was added (fence 2).**
+
+Rows: tint swatch (painter-drawn rect — no font-glyph dependency), the
+rel_path, `(hidden)` marker. Filter field doubles as a second K2
+typing-isolation test.
+
+### Data flow (read-only probe extension — no trait/WGSL/offscreen contact)
+
+- `UiProbeState.files: Rc<Vec<UiFileRow>>` — STATIC (rel_path, group_id,
+  local-space AABB from `PickFileInfo`), built once at `init_ui_probe` from
+  the pick context (repo scenes only; empty for text/engine/demo → panel
+  hides the browser). Rc-shared so the panel's per-frame snapshot clones a
+  refcount, not the rows — the large-list trap applies to widget
+  construction AND to data cloning; both are avoided.
+- `UiProbeState.file_dyn: Vec<UiFileDyn>` — refreshed per frame in the
+  probe write: world center/half under the LIVE group TRS (`groups_cpu`
+  offset+scale × local AABB — the same math `sync_segment` uses), hidden
+  from the group row alpha (`cols[2][3] == 0.0` — the same place the
+  hide/show verbs write, so it's correct even under `--no-cull`), tint
+  bytes from `cols[2]`. ~1.3k cheap iterations/frame at repo scale; never
+  executed offscreen (no probe installed → PNGs byte-equal, gate 6 passes).
+
+### Navigation: IMPLEMENTED (not cut)
+
+Row click = selection highlight + fly-to via the exact `--cam-pose` API
+(`SceneLike::set_cam_pose` — note 04's rule holds). The pose mirrors
+`camera_eye_target`'s Front framing:
+`dist = max(half_h, half_w/aspect) / tan(FOV_Y/2) × 1.08 + 2.0`,
+`eye = (center.x, center.y, dist)`, yaw/pitch = 0 (text plane faces +Z).
+`FOV_Y` was made `pub` for this (read-only const export). Because
+`file_dyn` refreshes per frame, clicking a group that was moved by a verb
+flies to its CURRENT pose.
+
+Click deliberately does NOT call `apply_pick`: `PickCommand::File` matching
+is substring-based ("first file whose rel path contains"), so a row click
+could flash a different file whose path merely contains this one. An
+exact-match pick variant would be new scene surface — skipped to stay
+fence-clean; recorded here as the follow-up if pick-from-browser is wanted
+(add `PickCommand::ExactFile(String)` or match by `group_id`, then the
+inspector + flash can follow row clicks).
+
+### Verification
+
+- `check-all.sh`: ALL GATES GREEN; `cargo check --no-default-features`
+  clean.
+- 30 s windowed smoke on `fixtures/g-pick-repo` with the browser open:
+  FPS 59.9–60.1 (mode 60.0) — band held; no panic/error; no leftover
+  process.
+- **Honesty note:** the fixture has ~5 files. The 1.3k-file scroll
+  responsiveness is asserted BY CONSTRUCTION (show_rows builds only visible
+  rows; the filter scan is a bounded O(n) substring pass; static rows are
+  Rc-shared) — NOT measured. Human pass on a real repo pending (checklist
+  above).
+
+---
+
+## Remaining gaps (end of stage)
+
+- **BACKDROP_GAIN live slider** — cut in K4 (mechanism premise false; the
+  gain is staging-baked into `SegCull.tint`, not a uniform). Feasible future
+  seam recorded in the K4 section (store `ink_frac` at staging, apply live
+  gain at backdrop-compaction time; needs its own mini-stage with A/B care).
+- **puffin_egui** still pinned to egui 0.33 upstream (house note; not
+  adopted — `wgpu-profiler` + the K1 `"egui pass"` query already cover
+  per-pass GPU timing; no puffin integration was attempted).
+- **AccessKit**: egui-winit's `accesskit` feature is ON (its default) but
+  **inert** — `State::init_accesskit` is never called, so no adapter is
+  created and no tree is built. Left on: disabling it saves compile time
+  only and would fight the crate's default-feature surface; revisit if
+  binary size or platform issues appear.
+- **IME**: comes free via egui-winit (`Ime` events → preedit;
+  `handle_platform_output` drives `set_ime_allowed`/`cursor_area`).
+  Candidate-window positioning quirks are a known rough edge upstream —
+  documented, not fixed. Human smoke with a dead-key/CJK input pending.
+- **glyphon labels** (roadmap item 6) deferred — untouched by this stage.
+- **Human interaction pass pending** — consolidated checklist at the bottom
+  of this report.
+
+## Verification summary (whole stage)
+
+### Gates per commit
+
+| Commit | Phase | check-all.sh |
+|---|---|---|
+| `c99631f` | K1 deps + plumbing | ALL GATES GREEN |
+| `2118305` | K2 gating matrix | ALL GATES GREEN |
+| `d6e8efa` | K3 Debug panel | ALL GATES GREEN |
+| `f4d2934` | K4 live LOD_MIN_PX | ALL GATES GREEN |
+| `3a4f75b` | K5 group browser | ALL GATES GREEN |
+
+Every run: build 0 warnings, clippy 0 warnings, 19 tests green,
+engine-check bit-exact, stage-g picks PASS, four-view A/B BYTE-EQUAL. The
+byte-equal PNGs are trivially guaranteed in K1–K3/K5 (offscreen code path
+untouched) and **by construction** in K4 (probe-guarded single write site —
+offscreen never installs a probe, so `cull_segments` receives the const).
+`cargo check --release --no-default-features` (feature off = pre-K) verified
+clean at every phase.
+
+### FPS bands (windowed, `--load-repo fixtures/g-pick-repo`, Fifo)
+
+| Run | Band | Mode |
+|---|---|---|
+| pre-K (`cb35552`, 35 s) | 58.2–60.0 | 60.0 |
+| K1 (`c99631f`, 30 s, UI on) | 59.0–60.1 | 60.0 |
+| K2 (`2118305`, 10 s) | 60.0 | 60.0 |
+| K3 (`d6e8efa`, 20 s) | 60.0 after ~2 s startup transient (font atlas) | 60.0 |
+| K4 (`f4d2934`, 2 runs) | 60.0 | 60.0 |
+| K5 (`3a4f75b`, 30 s, browser open) | 59.9–60.1 | 60.0 |
+
+Vsync-capped; the egui overlay never moved the band. `GLYPH_PROFILE=1`
+shows both passes (`glyph field pass`, `egui pass`); the absolute per-pass
+figures carry a Metal/TBDR pass-boundary timestamp artifact (recorded in
+K1), not real cost — FPS is flat.
+
+### Dependency tree / lock
+
+- `cargo tree -i wgpu`: exactly ONE wgpu (30.0.1) — glyph3d-native,
+  egui-wgpu, wgpu-profiler. One winit (0.30.13).
+- `cargo tree -d`: duplicates introduced by the egui stack — itertools 0.15
+  (egui; rav1e keeps 0.14), rustc-hash 2.1.3 (type-map; naga keeps 1.1.0),
+  objc2-app-kit/objc2-foundation 0.3.2 (arboard/webbrowser; winit keeps
+  0.2.2). Pre-existing duplicates (bitflags 1/2, objc2 0.5/0.6, block2,
+  syn 2/3, miniz_oxide) unchanged.
+- `native/Cargo.lock`: +777/−13 — the 13 deletions are dependency-reference
+  disambiguation qualifiers inside existing package blocks only (e.g.
+  `"rustc-hash"` → `"rustc-hash 1.1.0"`); zero version pins moved, zero
+  packages removed (verified line-by-line: no `-name`/`-version` lines).
+
+### File diffs (stage total, `cb35552..HEAD`)
+
+| File | +/- | Content |
+|---|---|---|
+| `native/Cargo.toml` | +16 | three optional egui 0.36 deps + `egui-ui` feature (default ON) |
+| `native/Cargo.lock` | +790/−13 | egui stack + transitive deps (new entries only, per above) |
+| `native/src/main.rs` | +53/−3 | `--no-ui` flag + parity-test extension; `build_scene_probed` (windowed) with `build_scene` (offscreen) as a `probe=false` wrapper over shared `build_scene_impl` |
+| `native/src/windowed.rs` | +555/−19 | all egui logic: EguiUi, construction, event gating matrix, frame lifecycle, Debug window (K3–K5 content), F1 toggle, K4 selftest hook |
+| `native/src/glyph_scene.rs` | +240/−17 | read-only probe types + install + per-frame write; `CullState::lod_min_px` Cell; `CullView` bundle; `FOV_Y` made pub |
+| `native/AGENTS.md` | +4 | `GLYPH_K4_SELFTEST` debug env var doc |
+
+Untouched: `offscreen.rs`, all `.wgsl`, the `SceneLike` trait,
+`engine-local/`, `assets/atlas/`, fixtures, all version pins.
+
+## Consolidated human-pass checklist (the one pending item)
+
+An agent cannot drive the GUI; everything below is verified by code
+inspection + scripted smoke and needs one human session. Run:
+`./target/release/glyph3d-native --load-repo fixtures/g-pick-repo` (then a
+real ~1.3k-file repo for K5 scale).
+
+**Base inventory (STEP 0):** WASD/ERQF fly; scroll = speed; right-drag look
+(confined pointer, hidden cursor); backquote toggle grab; Esc release;
+left-click pick + flash; h/g/t/x verbs; g-grabbed group drags + scroll
+scales it.
+
+**K2 gating matrix:** type WASD/h/g/t/x into the scratch field AND the
+browser filter — camera must not move, no verbs fire, no pick changes; Tab
+with a field focused never reaches the scene; right-press ON the Debug
+window starts no look-grab; right-drag started on the scene then released
+over the panel releases the grab (no latch); hover the panel while a group
+is g-grabbed — the group must not track the pointer across the panel;
+scroll over the panel must not change fly speed; pointer over the panel
+while grabbed (backquote) releases the grab; grab re-acquires after the
+pointer leaves the panel.
+
+**K3 panel:** FPS/camera readouts live and match the stdout line; click a
+glyph → the pick inspector shows the same string as stdout; each verb
+button produces the same log line and visual effect as its `--verb` CLI
+counterpart.
+
+**K4:** drag LOD_MIN_PX up — segments collapse into backdrop quads, panel
+counters track live; drag back — glyphs return; F1 closes/reopens the
+window, the window's × closes it; `--no-ui` keeps pre-K behavior (F1 inert).
+
+**K5:** browser scrolls smoothly on a ~1.3k-file repo (virtualized —
+bounded work by construction, but feel needs eyes); filter narrows rows;
+click a row → highlight + camera flies to the file (group moves AFTER a
+row's position was computed are reflected next frame — file_dyn refreshes
+per frame, so re-clicking a moved group flies to its new pose); hidden
+files show `(hidden)` and tint swatches follow t/tint verbs.
+
+**IME:** dead-key/CJK input into a text field renders preedit; note any
+candidate-window positioning oddity (document, don't fix).
+
