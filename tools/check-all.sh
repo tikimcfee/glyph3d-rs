@@ -36,7 +36,7 @@ warn_count() { grep -cE "^warning" <<<"$1" || true; }
 
 step "1/8 generators reproduce their committed outputs (byte-identical)"
 G_OK=1
-for g in "tools/gen_real_trie.py --verify-only" "tools/gen_schema.py --check"; do
+for g in "tools/gen_real_trie.py --verify-only" "tools/gen_schema.py --check" "tools/vendor-manifest.py --check"; do
   # No pipe: the exit code must be the GENERATOR's, not a tail's.
   if OUT=$(python3 $g 2>&1); then
     echo "PASS  ${g%% *} — $(echo "$OUT" | tail -1)"
