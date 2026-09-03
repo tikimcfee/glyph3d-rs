@@ -31,6 +31,14 @@ error: linking with `cc` failed
 command instead, so you should see an instruction rather than that dump. If you
 see the dump, your `build.rs` is behind.
 
+**This path has been walked end to end by a human, not just by gates** — `pixi
+install`, `build-engine`, `cargo build`, then a real corpus loaded and exercised
+in the app, all clean. Worth stating because the four render baselines are FIXED
+views of FIXED content: they would stay green even if the parallel-driver swap
+broke something that only appears at other item counts, other page geometries,
+or through picking. A live corpus covers what those baselines structurally
+cannot, and it came up clean.
+
 ---
 
 ## 2. Things that MOVED
