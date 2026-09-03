@@ -107,21 +107,42 @@ tg.wait()
 No nesting, no inter-task dependencies, no task results — every one of the 15 is
 `create_task` in a `for w in range(workers)` loop followed by `wait()`.
 
-**Why it is scoped and not done here.** Three reasons, in order:
+**DONE 2026-09-02, and it is faster.** All 12 engine sites migrated
+(`glyph_pipeline.mojo` 4, `glyph_scan.mojo` 8) plus the 9 `async def` shard
+bodies de-async'd — there is no `await` anywhere in either file, so `async` was
+purely a `create_task` affordance.
 
-1. **The 2.7x must be re-measured, not assumed.** `parallelize` creates and
-   synchronizes a `DeviceContext` per call; `glyph_scan.mojo` alone opens EIGHT
-   groups per run. The `ctx` parameter exists precisely so one context can be
-   reused across them, and whether that matters is a measurement.
-   `bench/split_bench.mojo` is the harness.
-2. **It touches the two most-shared files.** `glyph_pipeline.mojo` and
-   `glyph_scan.mojo` are otherwise near-byte-identical to the web tree; 15 edits
-   there is a deliberate widening of the fork, not a drive-by.
-3. Nothing is on fire. The private import works on a tracked, pinned lock, and
-   `check.sh` fails loudly at parse if a `pixi update` ever moves past it.
+Two of the twelve are not flat index spaces (paginate and the bounds grains
+iterate a filtered `items x shards` product with a running counter), so those
+materialize an explicit task table first: same tasks, same order, same disjoint
+ranges, only the dispatch changes.
 
-So: a scoped change of its own, with split_bench as its gate — not a bullet in
-this file's margin.
+Measured on the pinned build, best-of-3 each:
+
+| | TaskGroup | parallelize | |
+|---|---:|---:|---|
+| pipeline | 10.327 ms | **9.921 ms** | **1.041x** |
+| pipeline elided | 9.618 ms | **9.240 ms** | **1.041x** |
+| scan | 12.250 ms | **11.253 ms** | **1.089x** |
+| bake | 36.175 ms | 36.244 ms | 0.998x (does not use the driver) |
+
+Correctness, which mattered more than the number: **every checksum is
+bit-identical** (12178245 pipeline/elided/scan, 12471515 bake), all 15
+conformance suites pass across 22 fixtures, `--engine-check` is bit-exact
+against the Rust reference through the rebuilt dylib, and all four render
+baselines are byte-equal. The faster path produces the same bytes.
+
+`parallelize` coalesces consecutive work items across workers rather than
+dispatching one task per shard, which is the likely source of the gain — the
+scan form, with the most dispatches per run (eight groups), gains the most.
+
+**The three bench-harness sites are deliberately NOT migrated.**
+`bench/lane_write_bench.mojo` and `bench/split_bench.mojo` still construct
+`TaskGroup`. They are measurement tools whose absolute numbers are quoted in the
+README ledger, and changing their driver would make those historical entries
+incomparable — a separate, deliberate decision, not an oversight. The SHIPPED
+engine (ffi.mojo -> glyph_pipeline/glyph_scan) no longer touches the private API
+at all, which is the part that matters for the product.
 
 ## Checked and clear on this channel
 

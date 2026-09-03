@@ -11,8 +11,10 @@
 #
 # Portability notes for this toolchain (Mojo 1.1.0.dev2026083005):
 #   - std.runtime.asyncrt went private; the engine copies were patched to
-#     import TaskGroup from std.runtime._asyncrt (tagged MOJO-1.1-PORT).
-#   - std.runtime.initialize_runtime() MUST be called before any TaskGroup
+#     the engine copies moved to max.algorithm.parallelize, the PUBLIC parallel
+#     primitive (tagged MOJO-1.1-PORT). TaskGroup exists only in the private
+#     std.runtime._asyncrt and has no public counterpart.
+#   - std.runtime.initialize_runtime() MUST be called before any parallel
 #     work when the host process is not Mojo — without it the first parallel
 #     dispatch segfaults on a null async runtime (GEX-3993).
 #   - Heap handles use std.memory.alloc's Allocation/Layout (Pointer.alloc is
@@ -67,7 +69,7 @@ def _state(h: Handle) -> Pointer[EngineState, MutUntrackedOrigin]:
 @export("glyph_engine_new")
 def glyph_engine_new() abi("C") -> Handle:
     # MANDATORY when the host process is not Mojo: creates the async runtime
-    # that run_pipeline's TaskGroup shards dispatch onto.
+    # that run_pipeline's parallelize shards dispatch onto.
     initialize_runtime()
     var a = alloc(Layout[EngineState](count=1))
     a.unsafe_ptr().unsafe_write(EngineState())
@@ -179,7 +181,7 @@ def glyph_engine_load_item(
 
 # NATIVE-PORT (Stage E2) — batched load: ONE call runs the whole corpus.
 #
-# Per-file load_item calls pay the TaskGroup dispatch + scratch setup per
+# Per-file load_item calls pay the parallel dispatch + scratch setup per
 # call (~50 MB/s at repo-file sizes); the pipeline itself is built for
 # multi-item arenas (Item list over one byte span), so this entry amortizes
 # ALL per-call overhead: the caller concatenates the corpus into one blob and
