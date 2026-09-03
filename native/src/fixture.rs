@@ -27,6 +27,7 @@ use std::fmt::Write as _;
 use std::path::Path;
 
 use crate::fold::{run_pipeline, Item};
+use crate::scan::run_scan_pipeline;
 use crate::glyph_trie::{build_glyph_trie, GlyphMetrics, BLOCK_SHIFT, ENTRY_LANES};
 use crate::text::{ResolveGlyph, WorldEntry};
 
@@ -1077,6 +1078,195 @@ pub fn diff_full_fold(fx: &PipeFixture) -> FoldDiff {
         bytes: fx.byte_len,
         leaders: r.leaders,
         lanes: fx.byte_len * (FOLD_MEASURE_LANES + FOLD_COUNT_LANES),
+        bad,
+    }
+}
+
+// ── Stage 3: the scan form against the corpus, tiered ────────────────────
+
+/// Relative tolerance for the one tiered lane family.
+const REL_EPS: f64 = 1e-4;
+
+/// Bits-equal first, which covers +-inf and exact equality; otherwise relative
+/// against the EXPECTED magnitude, floored at 1 so small values get an absolute
+/// tolerance rather than a divide-by-nothing.
+fn rel_close(expected: f64, got: f64) -> bool {
+    if expected.to_bits() == got.to_bits() {
+        return true;
+    }
+    let magnitude = expected.abs().max(1.0);
+    (expected - got).abs() / magnitude <= REL_EPS
+}
+
+fn item_fold_unit(item: &Item) -> i64 {
+    if item.wrap_width > 0 {
+        item.wrap_width
+    } else if item.has_page {
+        item.page_cols
+    } else {
+        0
+    }
+}
+
+pub struct ScanDiff {
+    pub chunk_size: usize,
+    pub group_size: usize,
+    pub shards: usize,
+    /// Leader slots whose fold unit is > 0, i.e. held to the BIT-equal tier.
+    pub bit_exact_leaders: usize,
+    /// Leader slots on the tolerant tier.
+    pub tiered_leaders: usize,
+    pub bad: Vec<String>,
+}
+
+/// Run the scan form at one tuning and compare against the fixture under the
+/// repo's tiered contract (`engine/conformance_scan.mojo`,
+/// `tools/scan-layout.test.mjs`).
+///
+/// THE TOLERANT ROW IS TOLERANT BY CONSTRUCTION. A foldless X is an f64 prefix
+/// in the serial fold and an f32 monoid lane here, so the GROUPING differs and
+/// the rounding must. Every integer lane is exact in both forms, and the
+/// `fold > 0` position lanes are BIT-equal because `resolve_x` is the serial
+/// re-sum rescheduled. `bit_exact_leaders` is reported so a run cannot claim the
+/// strict tier while holding nothing to it.
+pub fn diff_scan(fx: &PipeFixture, chunk_size: usize, group_size: usize, shards: usize) -> ScanDiff {
+    let got = run_scan_pipeline(&fx.bytes, &fx.trie, &fx.items, chunk_size, group_size, shards);
+    let mut bad = Vec::new();
+    let mut bit_exact_leaders = 0usize;
+    let mut tiered_leaders = 0usize;
+
+    if got.leaders != fx.exp_leaders as usize {
+        bad.push(format!("leaders: got {} vs fixture {}", got.leaders, fx.exp_leaders));
+    }
+    if got.misses != fx.exp_misses {
+        bad.push(format!(
+            "miss list: got {} entries vs fixture {}",
+            got.misses.len(),
+            fx.exp_misses.len()
+        ));
+    }
+
+    // Per-byte fold unit decides which tier a position lane gets.
+    let mut fold_of_byte = vec![0i64; fx.byte_len];
+    for item in &fx.items {
+        let unit = item_fold_unit(item);
+        let start = item.byte_start.max(0) as usize;
+        let stop = ((item.byte_start + item.byte_count) as usize).min(fx.byte_len);
+        fold_of_byte[start..stop].fill(unit);
+    }
+
+    for (slot, &slot_fold_unit) in fold_of_byte.iter().enumerate() {
+        if got.slots.ord_to_byte[slot] != fx.exp_ord_to_byte[slot] {
+            bad.push(format!(
+                "ordToByte[{slot}]: got {} vs fixture {}",
+                got.slots.ord_to_byte[slot], fx.exp_ord_to_byte[slot]
+            ));
+        }
+        let is_leader =
+            fx.exp_counts[slot * FIXTURE_COUNT_STRIDE + FIX_C_FLAGS] & F_LEADER != 0;
+        if is_leader {
+            if slot_fold_unit > 0 {
+                bit_exact_leaders += 1;
+            } else {
+                tiered_leaders += 1;
+            }
+        }
+        for lane in 0..FIXTURE_MEASURE_STRIDE {
+            let expected = fx.exp_measures[slot * FIXTURE_MEASURE_STRIDE + lane];
+            if lane == FIX_M_GLYPH_ID {
+                // EXACT, and compared as the u32 it is — same reason as stage 2.
+                if got.slots.gi[slot] != expected as u32 {
+                    bad.push(format!(
+                        "slot {slot} GLYPH_ID: got {} vs fixture {}",
+                        got.slots.gi[slot], expected as u32
+                    ));
+                }
+                continue;
+            }
+            let got_lane = match lane {
+                FIX_M_X => got.slots.x(slot),
+                FIX_M_Y => got.slots.y(slot),
+                FIX_M_Z => got.slots.z(slot),
+                FIX_M_ADVANCE => got.slots.advance(slot),
+                FIX_M_HEIGHT => got.slots.height(slot),
+                FIX_M_BASE_X => got.slots.base_x(slot),
+                _ => got.slots.wm[slot],
+            };
+            let expected_lane = expected as f32;
+            let bits_equal = got_lane.to_bits() == expected_lane.to_bits();
+            let lane_ok = if !is_leader {
+                bits_equal // a non-leader's lanes never differ between the forms
+            } else if matches!(lane, FIX_M_X | FIX_M_Y | FIX_M_Z | FIX_M_BASE_X) {
+                if slot_fold_unit > 0 {
+                    bits_equal
+                } else {
+                    rel_close(expected_lane as f64, got_lane as f64)
+                }
+            } else if lane == FIX_M_LINE_ADV {
+                rel_close(expected_lane as f64, got_lane as f64)
+            } else {
+                bits_equal // the EXACT lanes
+            };
+            if !lane_ok {
+                bad.push(format!(
+                    "slot {slot} lane {lane} ({}, fold={slot_fold_unit}): got {got_lane} vs fixture {expected_lane}",
+                    measure_lane_name(lane)
+                ));
+            }
+        }
+        for lane in 0..FIXTURE_COUNT_STRIDE {
+            let expected = fx.exp_counts[slot * FIXTURE_COUNT_STRIDE + lane];
+            let got_lane = match lane {
+                FIX_C_ROW => got.slots.lc[slot * 2],
+                FIX_C_COL => got.slots.lc[slot * 2 + 1],
+                FIX_C_FLAGS => got.slots.fl[slot],
+                _ => got.slots.wc[slot],
+            };
+            if got_lane != expected {
+                bad.push(format!(
+                    "slot {slot} lane {lane} ({}): got {got_lane} vs fixture {expected}",
+                    count_lane_name(lane)
+                ));
+            }
+        }
+    }
+
+    // Bounds: TOTAL_ROWS (lane 6) exact, every other lane relative.
+    for (i, &want_bits) in fx.exp_item_bounds.iter().enumerate() {
+        let expected = f64::from_bits(want_bits);
+        let got_lane = got.item_bounds[i];
+        let ok = if i % 8 == 6 {
+            got_lane.to_bits() == want_bits
+        } else {
+            rel_close(expected, got_lane)
+        };
+        if !ok {
+            bad.push(format!(
+                "itemBounds[{}][{}]: got {got_lane} vs fixture {expected}",
+                i / 8,
+                i % 8
+            ));
+        }
+    }
+    for (lane, &want_bits) in fx.exp_batch.iter().enumerate() {
+        let expected = f64::from_bits(want_bits);
+        let got_lane = got.batch_bounds[lane];
+        let ok = if lane == 6 {
+            got_lane.to_bits() == want_bits
+        } else {
+            rel_close(expected, got_lane)
+        };
+        if !ok {
+            bad.push(format!("batchBounds[{lane}]: got {got_lane} vs fixture {expected}"));
+        }
+    }
+
+    ScanDiff {
+        chunk_size,
+        group_size,
+        shards,
+        bit_exact_leaders,
+        tiered_leaders,
         bad,
     }
 }

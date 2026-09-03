@@ -123,7 +123,7 @@ pub struct Slots {
 }
 
 impl Slots {
-    fn new(byte_len: usize) -> Self {
+    pub(crate) fn new(byte_len: usize) -> Self {
         Self {
             sm: vec![0.0; byte_len * 2],
             gi: vec![0; byte_len],
@@ -164,6 +164,25 @@ impl Slots {
     pub fn base_x(&self, id: usize) -> f32 {
         self.lm[id * 4 + 3]
     }
+    /// The scan form writes these from `resolve_x`, a separate dispatch from
+    /// the one that assigns row/col — hence setters the serial fold does not
+    /// need, since it computes a position and its lanes in the same breath.
+    #[inline]
+    pub(crate) fn set_position(&mut self, id: usize, x: f32, y: f32, z: f32) {
+        self.lm[id * 4] = x;
+        self.lm[id * 4 + 1] = y;
+        self.lm[id * 4 + 2] = z;
+    }
+    #[inline]
+    pub(crate) fn set_base_x(&mut self, id: usize, v: f32) {
+        self.lm[id * 4 + 3] = v;
+    }
+    #[inline]
+    pub(crate) fn zero_positional(&mut self, id: usize) {
+        self.lm[id * 4..id * 4 + 4].fill(0.0);
+        self.lc[id * 2..id * 2 + 2].fill(0);
+    }
+
     #[inline]
     pub fn row(&self, id: usize) -> i64 {
         self.lc[id * 2] as i64
@@ -186,7 +205,7 @@ pub struct FoldResult {
 
 /// Bytes the sequence starting at `i` occupies — 0 for a continuation or invalid
 /// byte, which is exactly the "am I a leader" test.
-fn sequence_length(bytes: &[u8], index: usize) -> usize {
+pub(crate) fn sequence_length(bytes: &[u8], index: usize) -> usize {
     if index >= bytes.len() {
         return 0;
     }
@@ -240,7 +259,7 @@ fn decode_codepoint_at(bytes: &[u8], slot: usize, sequence_len: usize) -> u32 {
 
 /// Visual rows a line occupies under `wrap`; the newline rides at column `len`,
 /// so an exact-multiple line ends with a row holding only the newline.
-fn rows_for_line(length: i64, wrap: i64) -> i64 {
+pub(crate) fn rows_for_line(length: i64, wrap: i64) -> i64 {
     if wrap <= 0 {
         1
     } else {
@@ -250,7 +269,7 @@ fn rows_for_line(length: i64, wrap: i64) -> i64 {
 
 /// THE stride formula: a row-paged item fans page columns at
 /// (widest item-relative row + page_gap_x); page_rows 0 derives 0.
-fn derive_stride(max_row_extent: f64, item: &Item) -> f64 {
+pub(crate) fn derive_stride(max_row_extent: f64, item: &Item) -> f64 {
     if !item.has_page || item.page_rows <= 0 {
         0.0
     } else {
@@ -260,13 +279,13 @@ fn derive_stride(max_row_extent: f64, item: &Item) -> f64 {
 
 /// Whether paginate does anything for this item — an all-zero page is an
 /// identity remap the kernel early-returns from, so the driver may skip it.
-fn page_active(item: &Item) -> bool {
+pub(crate) fn page_active(item: &Item) -> bool {
     item.has_page && (item.page_rows != 0 || item.page_cols != 0 || item.scroll_rows != 0)
 }
 
 /// KERNEL 1 — per byte: classify the sequence, resolve through the trie, write
 /// the STATIC lanes. Returns the codepoint for a leader, `None` otherwise.
-fn decode_and_resolve<T: ResolveGlyph + ?Sized>(
+pub(crate) fn decode_and_resolve<T: ResolveGlyph + ?Sized>(
     bytes: &[u8],
     slots: &mut Slots,
     trie: &T,
@@ -455,7 +474,7 @@ fn layout_item(
 /// oracle's `resolved[i].lineHeight ?? it.page?.lineHeight`, deleted as
 /// unreachable once the item's line height was guaranteed finite before
 /// paginate reads it. A page pitch was never a feature — it was gated on a bug.
-fn paginate(slots: &mut Slots, id: usize, item: &Item, page_stride_x: f64) {
+pub(crate) fn paginate(slots: &mut Slots, id: usize, item: &Item, page_stride_x: f64) {
     if slots.flags(id) & F_LEADER == 0 {
         return;
     }
@@ -493,7 +512,7 @@ fn paginate(slots: &mut Slots, id: usize, item: &Item, page_stride_x: f64) {
 }
 
 /// Min/max over one byte range, carried in registers and stored once.
-fn bounds_range(slots: &Slots, start: usize, stop: usize) -> [f64; 6] {
+pub(crate) fn bounds_range(slots: &Slots, start: usize, stop: usize) -> [f64; 6] {
     let mut box_lanes = [
         f64::INFINITY,
         f64::INFINITY,

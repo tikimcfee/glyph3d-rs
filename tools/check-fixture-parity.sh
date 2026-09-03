@@ -26,6 +26,12 @@
 # compared too — zero is their defined state, so a port that leaves them dirty
 # must fail.
 #
+# Plus the scan form (--fixture-scan, stage 3): the same fold recast as a
+# segmented monoid scan, run at a SWEEP of chunk/group/shard tunings and compared
+# under the repo's tiered contract. Invariance across the tunings is
+# associativity checked in situ. It fails if no leader was held to the BIT-exact
+# tier, since that is the tier carrying the claim.
+#
 # Plus the corpus diff (--fixture-diff): text.rs's CPU fold laid against every
 # fixture inside its domain and compared BIT-EXACT to the oracle's own expected
 # lanes. That half fails if NOTHING was in domain, because a differ that
@@ -75,6 +81,12 @@ if OUT=$("$BIN" --fixture-fold "${FIX[@]}" 2>&1); then
     echo "PASS  full fold — $(echo "$OUT" | tail -1)"
 else
     echo "FAIL  full fold:"; echo "$OUT" | tail -20; FAIL=1
+fi
+
+if OUT=$("$BIN" --fixture-scan "${FIX[@]}" 2>&1); then
+    echo "PASS  scan form — $(echo "$OUT" | tail -1)"
+else
+    echo "FAIL  scan form:"; echo "$OUT" | tail -20; FAIL=1
 fi
 
 if OUT=$("$BIN" --fixture-diff "${FIX[@]}" 2>&1); then

@@ -36,6 +36,7 @@ mod gpu;
 mod glyph_scene;
 mod offscreen;
 mod repo;
+mod scan;
 mod scene;
 mod text;
 mod windowed;
@@ -274,6 +275,11 @@ struct Cli {
     /// EVERY lane of EVERY byte plus boxes and the batch union, then exit.
     #[arg(long, value_name = "PATH", num_args = 1..)]
     fixture_fold: Vec<PathBuf>,
+    /// Stage 3: run the ported scan form over each .pipe.bin at a SWEEP of
+    /// chunk/group/shard tunings and compare under the tiered contract, then
+    /// exit. Invariance across the tunings is associativity in situ.
+    #[arg(long, value_name = "PATH", num_args = 1..)]
+    fixture_scan: Vec<PathBuf>,
     /// Stage E2: load a whole repository as a field of code pages
     #[arg(long, value_name = "DIR")]
     load_repo: Option<PathBuf>,
@@ -599,6 +605,92 @@ fn run_fixture_manifest(paths: &[PathBuf]) -> ! {
     std::process::exit(0);
 }
 
+/// The tunings stage 3 sweeps: (chunk_size, group_size, shards).
+///
+/// The Mojo suite runs two — the default and one awkward pair. Being serial
+/// makes more of them cheap, and each one is a different GROUPING of the same
+/// monoid, so the sweep is the associativity test. The degenerate ones matter
+/// most: chunk 1 makes every byte its own interval, group 1 removes the spine's
+/// grouping entirely, and a large chunk makes the whole buffer one interval so
+/// nothing is combined at all. `shards` is the dial on resolve_x's segment walk
+/// — with one shard per item the walk NEVER fires, because the first leader of
+/// an item always starts a segment.
+const SCAN_TUNINGS: &[(usize, usize, usize)] = &[
+    // The GPU's own defaults come from scan.rs so the sweep cannot drift from
+    // the tuning the shipped path would use.
+    (scan::DEFAULT_CHUNK_SIZE, scan::DEFAULT_GROUP_SIZE, 1),
+    (scan::DEFAULT_CHUNK_SIZE, scan::DEFAULT_GROUP_SIZE, 4), // resolve_x shards mid-segment
+    (7, 3, 3),      // seams inside multi-byte sequences AND fold units
+    (1, 1, 8),      // every byte its own interval, no grouping
+    (3, 1, 2),
+    (1, 64, 5),
+    (4096, 8, 7),   // one interval: nothing combines, everything shards
+    (13, 5, 11),
+];
+
+/// Stage 3: the scan form against the corpus, swept across tunings.
+fn run_fixture_scan(paths: &[PathBuf]) -> ! {
+    let mut failed = 0usize;
+    let mut strict = 0usize;
+    let mut tiered = 0usize;
+    let mut cases = 0usize;
+    for p in paths {
+        let fx = match fixture::load_pipe_fixture(p) {
+            Ok(fx) => fx,
+            Err(e) => {
+                eprintln!("fixture-scan FAIL: {e}");
+                std::process::exit(1);
+            }
+        };
+        let mut worst: Option<fixture::ScanDiff> = None;
+        let mut ok = true;
+        for &(chunk, group, shards) in SCAN_TUNINGS {
+            let d = fixture::diff_scan(&fx, chunk, group, shards);
+            cases += 1;
+            strict += d.bit_exact_leaders;
+            tiered += d.tiered_leaders;
+            if !d.bad.is_empty() {
+                ok = false;
+                if worst.is_none() {
+                    worst = Some(d);
+                }
+            }
+        }
+        if ok {
+            println!("  PASS {:<26} {} tunings within the tiered contract", fx.name, SCAN_TUNINGS.len());
+        } else {
+            failed += 1;
+            let d = worst.unwrap();
+            println!(
+                "  FAIL {:<26} K={}/G={}/S={} — {} mismatch(es)",
+                fx.name, d.chunk_size, d.group_size, d.shards, d.bad.len()
+            );
+            for line in d.bad.iter().take(8) {
+                println!("       {line}");
+            }
+        }
+    }
+    if failed > 0 {
+        eprintln!("fixture-scan FAIL: {failed}/{} fixtures differ", paths.len());
+        std::process::exit(1);
+    }
+    // ANTI-VACUITY. The strict tier is the load-bearing one — it is where the
+    // scan claims BIT equality with the serial fold — so a run that held no
+    // leader to it would be reporting the tolerant tier's green as the whole
+    // result.
+    if strict == 0 {
+        eprintln!("fixture-scan FAIL: no leader was held to the BIT-exact tier");
+        std::process::exit(1);
+    }
+    println!(
+        "fixture-scan PASS: {} fixture(s) x {} tunings = {cases} cases; \
+         {strict} leader-lanes BIT-exact, {tiered} within 1e-4 relative",
+        paths.len(),
+        SCAN_TUNINGS.len(),
+    );
+    std::process::exit(0);
+}
+
 /// Stage 2: the ported fold against the whole corpus, every lane of every byte.
 fn run_fixture_fold(paths: &[PathBuf]) -> ! {
     let mut lanes = 0usize;
@@ -759,6 +851,9 @@ fn main() {
     }
     if !cli.fixture_fold.is_empty() {
         run_fixture_fold(&cli.fixture_fold);
+    }
+    if !cli.fixture_scan.is_empty() {
+        run_fixture_scan(&cli.fixture_scan);
     }
 
     // Stage E1: engine ↔ CPU-reference cross-check — no GPU involved.

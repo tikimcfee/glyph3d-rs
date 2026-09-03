@@ -42,7 +42,7 @@ instead of a promise.
 | **0** ✅ | Rust `.pipe.bin` reader + bit-exact differ | reads all 14 fixtures; counts agree with `engine/fixture_io.mojo` | none, pure plumbing |
 | **1** ✅ | `GlyphTrie` -> Rust | rebuilds a fixture's trie BYTES | the ordering landmine |
 | **2** ✅ | serial fold -> Rust | fixture expected measures BIT-EXACT | the float discipline |
-| **3** | scan form -> Rust | tiered agreement with stage 2 | monoid associativity |
+| **3** ✅ | scan form -> Rust | tiered agreement with stage 2 | monoid associativity |
 | **4** | bake -> Rust | the 8 `.bake.bin` fixtures | lowest |
 
 **Stage 0 is DONE** (2026-09-02). `native/src/fixture.rs` mirrors
@@ -156,7 +156,61 @@ And one mutation in the first battery **did not land at all** — the `seg_adv`
 f64 attempt only introduced an unused variable, so its green meant "I failed to
 break it," not "the corpus cannot see it." Redone properly it reddens 6
 fixtures. That is the distinction this repo keeps paying for: assert the edit
-changed the ARITHMETIC, not just the text. Six mutations were run
+changed the ARITHMETIC, not just the text.
+
+**Stage 3 is DONE** (2026-09-03). `native/src/scan.rs` is the port: the same
+fold as a segmented monoid scan in the GPU's dispatch structure
+(chunk_reduce -> spine_reduce -> spine_scan -> partial_scan -> apply ->
+resolve_x -> paginate -> bounds). Serial like the fold, but keeping the
+chunk/group DECOMPOSITION, because that decomposition is the thing under test.
+
+`--fixture-scan` sweeps **8 tunings** of (chunk, group, shards) over all 14
+fixtures — 112 cases — under the repo's tiered contract. **1,144,944 leader
+lanes on the BIT-exact tier**, 53,192 on the 1e-4 relative one. The gate fails
+if no leader reached the strict tier, since that is the tier carrying the claim.
+
+`shards` is a dial the Mojo suite does not have, and it is the one that matters
+for `resolve_x`: with a single shard per item the segment WALK never fires,
+because an item's first leader always starts a segment. Sharding is what puts a
+shard boundary mid-segment.
+
+### THE PRECONDITION nobody had written down
+
+`scan_combine` is **not associative across a change of `wrap`**. The junction
+term is `rows_for_line(a.tail_len + b.head_len, wrap)`, and for
+`a.nl > 0, b.nl > 0, c.nl == 0` the left grouping supplies that wrap from `b`
+while the right supplies it from `c`. Measured by exhaustive search over
+reachable elements: **0 non-associative triples in 2,370,816 under a uniform
+wrap**, and a counterexample the moment wrap varies.
+
+It is safe anyway, and safe STRUCTURALLY rather than by luck: `wrap` is an
+item-level parameter and every item boundary emits a resetting leaf that absorbs
+whatever preceded it, so two elements with different wraps and no reset between
+them cannot arise from any real buffer. `mixed_wrap_is_outside_the_monoid_s_domain`
+pins both halves, so if wrap ever becomes per-line or per-range the scan form's
+regrouping freedom is re-derived rather than assumed.
+
+The associativity test is correspondingly scoped: exact on every integer field
+across 4 wrap regimes x 3,375 triples, with `tail_advance` held only to the
+tolerance — and an anti-vacuity assertion that regrouping DID move
+`tail_advance` on the sample, so the test cannot quietly assert something
+stronger than the contract and make the tolerant tier look like slack.
+
+### Stage 3's mutations
+
+13 mutations, 12 reddened. Two results worth keeping:
+
+- **The gap guard is caught by NOTHING in the corpus.** No fixture has a hole
+  between items, so removing the containment test in `apply_chunk` passes all
+  112 cases. `the_scan_agrees_with_the_serial_fold_across_a_gap` is the only
+  check that fails, and it does. The serial fold cannot exhibit this defect at
+  all — it stops at each item's end — which is what makes it a PORT divergence
+  and exactly the kind a shared-oracle corpus is blind to.
+- **One mutation was a no-op, and not for a reason the plan predicted.**
+  Swapping `next.wrap` for `accumulator.wrap` at the junction changes nothing,
+  because `accumulator.wrap = next.wrap` executes ABOVE the branch — the two are
+  already the same value. Not a corpus ceiling and not a test gap; a mutation
+  reading the same number twice. Recorded at the site so it is not re-run. Six mutations were run
 against gate 9 — swapped item fields, swapped carrier split, a reordered
 section of identical size, a dropped trailing section, the f32 `line_adv`, and
 every fixture forced out of domain — and all six reddened.
