@@ -852,7 +852,10 @@ impl CullState {
                 stencil: Default::default(),
                 bias: Default::default(),
             }),
-            multisample: wgpu::MultisampleState::default(),
+            multisample: wgpu::MultisampleState {
+                count: SCENE_SAMPLE_COUNT, // Stage L (L3): loud non-MSAA pin
+                ..Default::default()
+            },
             multiview_mask: None,
             cache: None,
         });
@@ -928,6 +931,12 @@ pub struct GlyphScene {
     tint_step: Vec<u32>,
     /// Stage K: windowed debug-UI probe (None offscreen / under --no-ui).
     ui_probe: Option<UiProbe>,
+    /// Stage L (L3): device handle for pool (re)creation in set_viewport
+    /// (which has no ctx param — the trait shape is fenced).
+    device: wgpu::Device,
+    /// Stage L (L3): composite machinery; None under --no-composite (the
+    /// direct-to-FrameTarget A/B escape hatch — REMOVED at stage end).
+    composite: Option<CompositeState>,
 }
 
 // ── Stage K (K4): what the live controls change, and what stays const ────
@@ -948,6 +957,107 @@ pub struct GlyphScene {
 // an ink_frac plumbing redesign across staging + sync_segment. Cut from K4;
 // the feasible future seam is recorded in out/STAGE_K_REPORT.md.
 
+// ── Stage L (L3): pooled view target + composite (the ViewBuilder borrow) ──
+//
+// re_renderer's ViewBuilder renders each view into a pooled target, then
+// composites into whatever pass the host provides. L3 lands the skeleton for
+// GlyphScene only (the demo Scene stays direct — it is the minimal template
+// by design): the phase lists draw into a ping-pong pair of POOL_FORMAT
+// textures + one depth, then composite into the driver's view:
+//   - same format (offscreen oracle, Rgba8UnormSrgb):
+//     copy_texture_to_texture — 1:1, no scaling, bit-exact BY CONSTRUCTION;
+//   - different format (windowed, Bgra8UnormSrgb — component-order
+//     incompatible with the pool, so a copy is invalid):
+//     a fullscreen shader composite through composite.wgsl.
+// The split exists for the component-order copy incompatibility; a future
+// scaled/sub-rect composite (minimap inset) extends the shader path only.
+// egui wrinkle (recorded, not solved): register_native_texture demands
+// Rgba8Unorm (NON-sRGB) — an egui-hosted view would want its own non-sRGB
+// pool or a conversion pass.
+
+/// Pooled view-target format: matches the offscreen oracle's target exactly.
+const POOL_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
+
+/// Both scene pipelines (glyph + backdrop) are non-MSAA. The pool's copy
+/// composite is invalid on multisample targets — this was a silent
+/// assumption before L3; now it is loud at both ends (the pipeline
+/// multisample states and ViewTarget::new's assert).
+const SCENE_SAMPLE_COUNT: u32 = 1;
+
+/// The persistent half of the composite: pipeline (targets the DRIVER's
+/// color format), bind group layout, sampler. `target` is sized by
+/// set_viewport; `parity` selects which pool texture the frame draws into.
+struct CompositeState {
+    pipeline: wgpu::RenderPipeline,
+    bind_group_layout: wgpu::BindGroupLayout,
+    sampler: wgpu::Sampler,
+    target: Option<ViewTarget>,
+    parity: Cell<u8>,
+}
+
+/// The per-size half: the ping-pong pair of pool textures (re_renderer's
+/// DynamicResourcePool is reference material, not a dependency — two
+/// textures, not a pool), one depth, and the composite bind groups that
+/// sample each pool texture.
+struct ViewTarget {
+    width: u32,
+    height: u32,
+    colors: [wgpu::Texture; 2],
+    color_views: [wgpu::TextureView; 2],
+    depth: wgpu::TextureView,
+    bind_groups: [wgpu::BindGroup; 2],
+}
+
+impl ViewTarget {
+    fn new(
+        device: &wgpu::Device,
+        width: u32,
+        height: u32,
+        bgl: &wgpu::BindGroupLayout,
+        sampler: &wgpu::Sampler,
+    ) -> Self {
+        assert_eq!(
+            SCENE_SAMPLE_COUNT, 1,
+            "L3: copy composite requires non-MSAA scene pipelines/targets"
+        );
+        let colors: [wgpu::Texture; 2] = std::array::from_fn(|i| {
+            device.create_texture(&wgpu::TextureDescriptor {
+                label: Some(if i == 0 { "view target A" } else { "view target B" }),
+                size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+                mip_level_count: 1,
+                sample_count: SCENE_SAMPLE_COUNT,
+                dimension: wgpu::TextureDimension::D2,
+                format: POOL_FORMAT,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                    | wgpu::TextureUsages::COPY_SRC
+                    | wgpu::TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            })
+        });
+        // TextureView is an owned handle (Arc inside) — no borrow ties.
+        let color_views: [wgpu::TextureView; 2] =
+            std::array::from_fn(|i| colors[i].create_view(&Default::default()));
+        let bind_groups: [wgpu::BindGroup; 2] = std::array::from_fn(|i| {
+            device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some(if i == 0 { "composite bg A" } else { "composite bg B" }),
+                layout: bgl,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(&color_views[i]),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::Sampler(sampler),
+                    },
+                ],
+            })
+        });
+        let depth = crate::scene::create_depth(device, wgpu::TextureFormat::Depth32Float, width, height);
+        Self { width, height, colors, color_views, depth, bind_groups }
+    }
+}
+
 impl GlyphScene {
     pub fn new(
         ctx: &GpuContext,
@@ -956,8 +1066,15 @@ impl GlyphScene {
         staged: StagedText,
         camera_mode: CameraMode,
         cull_enabled: bool,
+        composite: bool,
     ) -> Self {
         let device = &ctx.device;
+
+        // Stage L (L3): with the composite on, the glyph/backdrop pipelines
+        // render into the POOL format (Rgba8UnormSrgb) and a composite step
+        // maps the pool into the driver's view; --no-composite keeps the
+        // pre-L3 direct targeting (the A/B escape hatch).
+        let scene_target_format = if composite { POOL_FORMAT } else { color_format };
 
         // --- instance + group buffers --------------------------------------
         let mut instances = staged.instances;
@@ -1178,7 +1295,9 @@ impl GlyphScene {
                 entry_point: Some("fs_main"),
                 compilation_options: Default::default(),
                 targets: &[Some(wgpu::ColorTargetState {
-                    format: color_format,
+                    // Stage L (L3): the POOL format when compositing (the
+                    // composite pass targets the driver's format instead).
+                    format: scene_target_format,
                     // Premultiplied-alpha compositing: fragment outputs
                     // rgb·alpha and alpha; ONE / 1−SrcAlpha is the correct
                     // coverage composite (see shader header note).
@@ -1210,7 +1329,10 @@ impl GlyphScene {
                 stencil: Default::default(),
                 bias: Default::default(),
             }),
-            multisample: wgpu::MultisampleState::default(), // AA is analytic
+            multisample: wgpu::MultisampleState {
+                count: SCENE_SAMPLE_COUNT, // Stage L (L3): loud non-MSAA pin
+                ..Default::default()
+            }, // AA is analytic
             multiview_mask: None,
             cache: None,
         });
@@ -1267,7 +1389,7 @@ impl GlyphScene {
         let cull = if cull_enabled {
             Some(CullState::new(
                 ctx,
-                color_format,
+                scene_target_format, // Stage L (L3): the pool format when compositing
                 depth_format,
                 &camera_buf,
                 &segments,
@@ -1277,6 +1399,84 @@ impl GlyphScene {
             log::info!("culling disabled (--no-cull) — legacy per-chunk draws");
             None
         };
+
+        // Stage L (L3): the composite machinery (persistent half). The
+        // pooled target itself is sized by set_viewport — GlyphScene::new
+        // doesn't know the viewport (the drivers decide it later).
+        let composite = composite.then(|| {
+            let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("composite.wgsl"),
+                source: wgpu::ShaderSource::Wgsl(include_str!("shaders/composite.wgsl").into()),
+            });
+            let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("composite bgl"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            multisampled: false,
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                        count: None,
+                    },
+                ],
+            });
+            let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("composite pl"),
+                bind_group_layouts: &[Some(&bgl)],
+                immediate_size: 0,
+            });
+            let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("composite pipeline"),
+                layout: Some(&layout),
+                vertex: wgpu::VertexState {
+                    module: &shader,
+                    entry_point: Some("vs_main"),
+                    compilation_options: Default::default(),
+                    buffers: &[], // fullscreen triangle from vertex_index
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &shader,
+                    entry_point: Some("fs_main"),
+                    compilation_options: Default::default(),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        // The DRIVER's format (e.g. Bgra8UnormSrgb windowed).
+                        format: color_format,
+                        // Exact-overwrite passthrough — NOT a blend.
+                        blend: None,
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                primitive: wgpu::PrimitiveState::default(),
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState::default(),
+                multiview_mask: None,
+                cache: None,
+            });
+            let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+                label: Some("composite sampler"),
+                // 1:1 samples land on texel centers — exact; Linear is for
+                // future scaled composites (minimap inset).
+                mag_filter: wgpu::FilterMode::Linear,
+                min_filter: wgpu::FilterMode::Linear,
+                ..Default::default()
+            });
+            CompositeState {
+                pipeline,
+                bind_group_layout: bgl,
+                sampler,
+                target: None,
+                parity: Cell::new(0),
+            }
+        });
 
         let pick = staged.pick;
         let groups_cpu = groups.clone();
@@ -1310,6 +1510,8 @@ impl GlyphScene {
             viewport: Cell::new((1600, 1000)), // refreshed every render()
             tint_step,
             ui_probe: None,
+            device: device.clone(),
+            composite,
         }
     }
 
@@ -2310,6 +2512,25 @@ impl SceneLike for GlyphScene {
 
     fn set_viewport(&mut self, w: u32, h: u32) {
         self.viewport.set((w, h));
+        // Stage L (L3): (re)size the pooled view target to the viewport.
+        // Both drivers call set_viewport before the first render (windowed:
+        // on window creation and every resize; offscreen: once at startup).
+        if let Some(comp) = &mut self.composite {
+            let stale = comp
+                .target
+                .as_ref()
+                .is_none_or(|t| t.width != w || t.height != h);
+            if stale && w > 0 && h > 0 {
+                let target = ViewTarget::new(
+                    &self.device,
+                    w,
+                    h,
+                    &comp.bind_group_layout,
+                    &comp.sampler,
+                );
+                comp.target = Some(target);
+            }
+        }
     }
 
     fn set_cam_pose(&mut self, eye: [f32; 3], yaw: f32, pitch: f32) {
@@ -2372,6 +2593,8 @@ impl SceneLike for GlyphScene {
     ) {
         let crate::scene::FrameTarget {
             color_view,
+            color_texture,
+            color_format,
             depth_view,
             width,
             height,
@@ -2379,6 +2602,27 @@ impl SceneLike for GlyphScene {
         let aspect = width as f32 / height.max(1) as f32;
         self.viewport.set((width, height));
         let frame = self.camera_frame(t, aspect);
+
+        // Stage L (L3): with the composite on, the phase lists draw into the
+        // pooled view target (ping-pong slot selected here) and composite
+        // into the driver's view at the end of render; --no-composite draws
+        // directly (the A/B escape hatch).
+        let pool_slot = if let Some(comp) = &self.composite {
+            let vt = comp
+                .target
+                .as_ref()
+                .expect("L3: set_viewport must run before render (both drivers call it)");
+            assert_eq!(
+                (vt.width, vt.height),
+                (width, height),
+                "L3: pool/viewport size mismatch (set_viewport out of sync with the driver)"
+            );
+            let slot = (comp.parity.get() % 2) as usize;
+            comp.parity.set(comp.parity.get() + 1);
+            Some(slot)
+        } else {
+            None
+        };
 
         // Stage K (K4): apply live UI controls BEFORE culling so a slider
         // drag takes effect this frame. This is the SINGLE write site of
@@ -2531,13 +2775,28 @@ impl SceneLike for GlyphScene {
             .profiler
             .as_ref()
             .map(|p| p.borrow().begin_pass_query("glyph field pass", encoder));
+        // Stage L (L3): the pass renders into the pooled target when
+        // compositing, else directly into the driver's views (pre-L3 path).
+        let (draw_color_view, draw_depth_view) = match pool_slot {
+            Some(slot) => {
+                let vt = self
+                    .composite
+                    .as_ref()
+                    .expect("pool_slot implies composite")
+                    .target
+                    .as_ref()
+                    .expect("pool sized above");
+                (&vt.color_views[slot], &vt.depth)
+            }
+            None => (color_view, depth_view),
+        };
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("glyph field pass"),
             timestamp_writes: pass_query
                 .as_ref()
                 .and_then(|q| q.render_pass_timestamp_writes()),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view: color_view,
+                view: draw_color_view,
                 resolve_target: None,
                 ops: wgpu::Operations {
                     load: wgpu::LoadOp::Clear(wgpu::Color {
@@ -2551,7 +2810,7 @@ impl SceneLike for GlyphScene {
                 depth_slice: None,
             })],
             depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                view: depth_view,
+                view: draw_depth_view,
                 depth_ops: Some(wgpu::Operations {
                     load: wgpu::LoadOp::Clear(1.0),
                     store: wgpu::StoreOp::Store,
@@ -2617,6 +2876,70 @@ impl SceneLike for GlyphScene {
         drop(pass);
         if let (Some(p), Some(q)) = (&ctx.profiler, pass_query) {
             p.borrow().end_query(encoder, q);
+        }
+
+        // Stage L (L3): composite the pooled target into the driver's view.
+        if let Some(slot) = pool_slot {
+            let comp = self.composite.as_ref().expect("pool_slot implies composite");
+            let vt = comp.target.as_ref().expect("pool sized above");
+            if color_format == POOL_FORMAT {
+                // Offscreen/oracle path: same format, 1:1, no scaling —
+                // copy_texture_to_texture is bit-exact BY CONSTRUCTION (this
+                // is the gate-critical path; it cannot fail a byte compare).
+                assert_eq!(
+                    color_format, POOL_FORMAT,
+                    "L3: copy composite requires matching formats (deliberately loud)"
+                );
+                encoder.copy_texture_to_texture(
+                    wgpu::TexelCopyTextureInfo {
+                        texture: &vt.colors[slot],
+                        mip_level: 0,
+                        origin: wgpu::Origin3d::ZERO,
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    wgpu::TexelCopyTextureInfo {
+                        texture: color_texture,
+                        mip_level: 0,
+                        origin: wgpu::Origin3d::ZERO,
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+                );
+            } else {
+                // Windowed path: the surface (Bgra8UnormSrgb) is
+                // component-order-incompatible with the pool, so a copy is
+                // invalid — fullscreen shader composite instead. The pass
+                // clears-then-overwrites every pixel (blend disabled).
+                let composite_query = ctx
+                    .profiler
+                    .as_ref()
+                    .map(|p| p.borrow().begin_pass_query("composite pass", encoder));
+                {
+                    let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                        label: Some("composite pass"),
+                        timestamp_writes: composite_query
+                            .as_ref()
+                            .and_then(|q| q.render_pass_timestamp_writes()),
+                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                            view: color_view,
+                            resolve_target: None,
+                            ops: wgpu::Operations {
+                                load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                                store: wgpu::StoreOp::Store,
+                            },
+                            depth_slice: None,
+                        })],
+                        depth_stencil_attachment: None,
+                        ..Default::default()
+                    });
+                    pass.set_pipeline(&comp.pipeline);
+                    pass.set_bind_group(0, &vt.bind_groups[slot], &[]);
+                    pass.draw(0..3, 0..1);
+                }
+                if let (Some(p), Some(q)) = (&ctx.profiler, composite_query) {
+                    p.borrow().end_query(encoder, q);
+                }
+            }
         }
     }
 }

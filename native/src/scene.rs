@@ -12,8 +12,15 @@ use crate::gpu::GpuContext;
 /// The views a frame draws into, plus their physical-pixel size.
 /// (Stage F: the cull/LOD pass needs the height to convert world units to
 /// on-screen pixels.) Bundled so `SceneLike::render` stays a 4-arg signature.
+///
+/// Stage L (L3): `color_texture` + `color_format` added for the composite
+/// step — the copy path needs the texture handle (a TextureView can't be a
+/// copy endpoint), and the copy-vs-shader split keys on the format
+/// (Rgba8UnormSrgb offscreen → copy; Bgra8UnormSrgb windowed → shader).
 pub struct FrameTarget<'a> {
     pub color_view: &'a wgpu::TextureView,
+    pub color_texture: &'a wgpu::Texture,
+    pub color_format: wgpu::TextureFormat,
     pub depth_view: &'a wgpu::TextureView,
     pub width: u32,
     pub height: u32,
@@ -293,6 +300,9 @@ impl Scene {
             depth_view,
             width,
             height,
+            // Stage L (L3): the demo Scene keeps direct rendering — it never
+            // composites, so the texture handle and format go unused.
+            ..
         } = *target;
         let aspect = width as f32 / height.max(1) as f32;
         let cam = CameraUniform {

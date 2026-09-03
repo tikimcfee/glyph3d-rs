@@ -20,12 +20,25 @@ pub fn run(
     zoom: f32,
     cull: bool,
     ops: &[Op],
+    composite: bool,
 ) {
     let device = &ctx.device;
 
+    // Stage L (L3) dev-only verification hook: GLYPH_L3_SHADER_COMPOSITE=1
+    // makes the offscreen target Bgra8UnormSrgb, forcing the WINDOWED
+    // composite path (composite.wgsl shader instead of the format-matched
+    // copy) under the deterministic oracle driver — the live-display-free
+    // proof of the shader path. The readback below swizzles BGRA→RGBA so the
+    // PNG compares directly against the Rgba baselines. Default (unset)
+    // behavior is byte-identical to before; documented in AGENTS.md.
+    let shader_composite = std::env::var_os("GLYPH_L3_SHADER_COMPOSITE").is_some();
     // sRGB target so the PNG bytes are display-ready sRGB values straight
     // out of readback (no manual gamma pass needed).
-    let format = wgpu::TextureFormat::Rgba8UnormSrgb;
+    let format = if shader_composite {
+        wgpu::TextureFormat::Bgra8UnormSrgb
+    } else {
+        wgpu::TextureFormat::Rgba8UnormSrgb
+    };
     let size = wgpu::Extent3d {
         width: OFFSCREEN_WIDTH,
         height: OFFSCREEN_HEIGHT,
@@ -38,13 +51,19 @@ pub fn run(
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
         format,
-        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        // Stage L (L3): + COPY_DST — the pooled-target copy composite writes
+        // INTO this texture. (Its absence was caught by gate 8's byte
+        // compare: without COPY_DST the copy is a validation error and the
+        // frame never lands.)
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+            | wgpu::TextureUsages::COPY_SRC
+            | wgpu::TextureUsages::COPY_DST,
         view_formats: &[],
     });
     let color_view = texture.create_view(&Default::default());
     let depth_view = scene::create_depth(device, wgpu::TextureFormat::Depth32Float, size.width, size.height);
 
-    let mut scene = build_scene(ctx, format, choice, CameraMode::Front { zoom }, cull);
+    let mut scene = build_scene(ctx, format, choice, CameraMode::Front { zoom }, cull, composite);
 
     // Stage G: scripted picks + verbs, applied in CLI order before the first
     // frame. Deterministic: the Front camera + fixed viewport make --pick-px
@@ -115,6 +134,10 @@ pub fn run(
             &mut encoder,
             &crate::scene::FrameTarget {
                 color_view: &color_view,
+                // Stage L (L3): the composite's copy path needs the texture
+                // handle and the format.
+                color_texture: &texture,
+                color_format: format,
                 depth_view: &depth_view,
                 width: size.width,
                 height: size.height,
@@ -183,7 +206,16 @@ pub fn run(
     let mut pixels = Vec::with_capacity((unpadded_bpr * size.height) as usize);
     for row in 0..size.height {
         let start = (row * padded_bpr) as usize;
-        pixels.extend_from_slice(&data[start..start + unpadded_bpr as usize]);
+        let row_bytes = &data[start..start + unpadded_bpr as usize];
+        if shader_composite {
+            // The hook's target is BGRA — swizzle back to RGBA so the PNG
+            // compares directly against the Rgba baselines.
+            for px in row_bytes.as_chunks::<4>().0 {
+                pixels.extend_from_slice(&[px[2], px[1], px[0], px[3]]);
+            }
+        } else {
+            pixels.extend_from_slice(row_bytes);
+        }
     }
     drop(data);
     readback.unmap();
