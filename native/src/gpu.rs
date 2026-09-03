@@ -8,8 +8,113 @@
 //! requests TIMESTAMP_QUERY (when the adapter supports it) and constructs a
 //! GpuProfiler; without the env var the device is created exactly as before
 //! and every profiling call site is an `Option` no-op.
+//!
+//! Stage L (O1): `device.on_uncaptured_error` gets a dedup tracker — see
+//! `ErrorTracker` below.
 
 use std::cell::RefCell;
+
+// ── Stage L (O1): uncaptured-error dedup ─────────────────────────────────
+// ErrorTracker pattern from re_renderer (rerun/crates/viewer/re_renderer/
+// src/error_handling/error_tracker.rs): dedup by error identity, log the
+// first occurrence in full, count repeats and summarize at powers of ten.
+// Ours is a pure structure (unit-tested at the bottom of this file) — no
+// wgpu-core downcasting (re_renderer's native dedup heuristic needs wgc
+// types; the identity key here is simply (kind, description)).
+//
+// SEMANTIC NOTE (verified against wgpu-30.0.1 src/backend/wgpu_core.rs:692):
+// wgpu 30's DEFAULT uncaptured handler PANICS on the first error
+// ("Handling wgpu errors as fatal by default"). Installing this tracker
+// changes that to log-once-and-continue — the rerun-style behavior the
+// steal asks for ("log once"): a repeating per-frame error cannot spam, and
+// an interactive windowed session survives it. Any error that moves pixels
+// is still caught by the byte-equal gates; any error that doesn't is
+// precisely the class where continuing is informative. To restore fatality,
+// delete the on_uncaptured_error install in init().
+
+/// The wgpu::Error variant, for dedup identity.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+enum ErrorKind {
+    Validation,
+    Internal,
+    OutOfMemory,
+}
+
+/// What `ErrorTracker::track` decided for one occurrence.
+#[derive(Debug, PartialEq, Eq)]
+enum TrackDecision {
+    /// First sighting of this (kind, description): log it in full.
+    First,
+    /// A repeat; the payload is the total occurrence count. The caller logs
+    /// a one-line summary only when `is_count_milestone` holds.
+    Repeat(u64),
+}
+
+/// Log a repeat summary at 10, 100, 1000, … occurrences (bounded chatter,
+/// monotonically sparser).
+fn is_count_milestone(n: u64) -> bool {
+    if n < 10 {
+        return false;
+    }
+    let mut p = 10u64;
+    while p < n {
+        p *= 10;
+    }
+    p == n
+}
+
+/// Dedup state for uncaptured wgpu errors. Pure: no GPU types inside.
+#[derive(Default)]
+struct ErrorTracker {
+    /// (kind, description) → total occurrence count.
+    counts: std::collections::HashMap<(ErrorKind, String), u64>,
+}
+
+impl ErrorTracker {
+    fn track(&mut self, kind: ErrorKind, description: &str) -> TrackDecision {
+        let n = {
+            let e = self
+                .counts
+                .entry((kind, description.to_string()))
+                .or_insert(0);
+            *e += 1;
+            *e
+        };
+        if n == 1 {
+            TrackDecision::First
+        } else {
+            TrackDecision::Repeat(n)
+        }
+    }
+
+    /// Route one uncaptured wgpu error through the tracker and log per the
+    /// decision. This is the on_uncaptured_error callback body.
+    fn handle(tracker: &std::sync::Mutex<Self>, err: &wgpu::Error) {
+        let (kind, desc) = match err {
+            wgpu::Error::Validation { description, .. } => {
+                (ErrorKind::Validation, description.clone())
+            }
+            wgpu::Error::Internal { description, .. } => {
+                (ErrorKind::Internal, description.clone())
+            }
+            wgpu::Error::OutOfMemory { .. } => (ErrorKind::OutOfMemory, err.to_string()),
+        };
+        match tracker
+            .lock()
+            .expect("ErrorTracker mutex poisoned")
+            .track(kind, &desc)
+        {
+            TrackDecision::First => log::error!(
+                "wgpu {kind:?} error (first occurrence; repeats are counted, not spammed): {desc}"
+            ),
+            TrackDecision::Repeat(n) if is_count_milestone(n) => {
+                log::error!("wgpu {kind:?} error has now occurred {n} times: {desc}")
+            }
+            TrackDecision::Repeat(_) => {}
+        }
+    }
+}
+
 
 /// Logged adapter identity, kept around for diagnostics.
 pub struct GpuContext {
@@ -177,6 +282,18 @@ pub async fn init(compatible_surface: Option<&wgpu::Surface<'_>>) -> GpuContext 
         .await
         .expect("device request failed");
 
+    // Stage L (O1): dedup uncaptured errors (see ErrorTracker above). NOTE:
+    // this replaces wgpu 30's panic-on-first-error default with
+    // log-once-and-continue — the rerun-style behavior, and a deliberate,
+    // recorded semantic change (the byte-equal gates remain the
+    // pixel-correctness net).
+    {
+        let tracker = std::sync::Mutex::new(ErrorTracker::default());
+        device.on_uncaptured_error(std::sync::Arc::new(move |err| {
+            ErrorTracker::handle(&tracker, &err);
+        }));
+    }
+
     log::info!(
         "device limits: max_storage_buffer_binding_size={} ({} MiB) max_buffer_size={} ({} MiB)",
         limits.max_storage_buffer_binding_size,
@@ -221,5 +338,57 @@ pub async fn init(compatible_surface: Option<&wgpu::Surface<'_>>) -> GpuContext 
         queue,
         profiler,
         cpu_scopes: RefCell::new(std::collections::BTreeMap::new()),
+    }
+}
+
+// ── Stage L (O1): ErrorTracker unit tests (pure structure — no GPU) ──────
+#[cfg(test)]
+mod error_tracker_tests {
+    use super::*;
+
+    #[test]
+    fn first_occurrence_logs_then_repeats_count() {
+        let mut t = ErrorTracker::default();
+        assert_eq!(t.track(ErrorKind::Validation, "bad buffer"), TrackDecision::First);
+        assert_eq!(t.track(ErrorKind::Validation, "bad buffer"), TrackDecision::Repeat(2));
+        assert_eq!(t.track(ErrorKind::Validation, "bad buffer"), TrackDecision::Repeat(3));
+    }
+
+    #[test]
+    fn identity_is_kind_plus_description() {
+        let mut t = ErrorTracker::default();
+        // Same description, different kind → a distinct error.
+        assert_eq!(t.track(ErrorKind::Validation, "boom"), TrackDecision::First);
+        assert_eq!(t.track(ErrorKind::Internal, "boom"), TrackDecision::First);
+        // Same kind, different description → a distinct error.
+        assert_eq!(t.track(ErrorKind::Validation, "other"), TrackDecision::First);
+        // And the originals still count as repeats.
+        assert_eq!(t.track(ErrorKind::Validation, "boom"), TrackDecision::Repeat(2));
+    }
+
+    #[test]
+    fn milestones_are_powers_of_ten_starting_at_10() {
+        let mut t = ErrorTracker::default();
+        let mut milestones = Vec::new();
+        for _ in 0..12_000 {
+            if let TrackDecision::Repeat(n) = t.track(ErrorKind::Validation, "spam") {
+                if is_count_milestone(n) {
+                    milestones.push(n);
+                }
+            }
+        }
+        assert_eq!(milestones, [10, 100, 1_000, 10_000]);
+    }
+
+    #[test]
+    fn milestone_helper_edges() {
+        assert!(!is_count_milestone(0));
+        assert!(!is_count_milestone(1));
+        assert!(!is_count_milestone(9));
+        assert!(is_count_milestone(10));
+        assert!(!is_count_milestone(11));
+        assert!(is_count_milestone(100));
+        assert!(!is_count_milestone(999));
+        assert!(is_count_milestone(1_000));
     }
 }
