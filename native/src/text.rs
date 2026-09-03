@@ -317,14 +317,16 @@ fn word_color(word: &str) -> [u8; 3] {
 use crate::atlas::TrieTable;
 use crate::engine::GlyphRecord;
 
-/// A codepoint resolver in WORLD units — the fold's only view of a trie.
+/// Resolve a codepoint to a glyph in WORLD units — the fold's only view of
+/// a trie. The units live in `WorldEntry`, which is the whole point of the
+/// seam: the atlas stores font units and converts, a fixture does not.
 ///
 /// TWO SOURCES, one fold. The app atlas (`atlas::TrieTable`) stores FONT UNITS
 /// and converts here; a `.pipe.bin` fixture stores world units already, as f64
 /// VALUES narrowed once by its loader. Before this trait, `reference_layout`
 /// could only be pointed at the atlas, so the fixture corpus — the only
 /// artifacts with direct JS-oracle provenance — could not reach it at all.
-pub trait WorldTrie {
+pub trait ResolveGlyph {
     fn resolve(&self, cp: u32) -> WorldEntry;
 }
 
@@ -337,7 +339,7 @@ pub struct WorldEntry {
     pub flags: u32,
 }
 
-impl WorldTrie for TrieTable {
+impl ResolveGlyph for TrieTable {
     fn resolve(&self, cp: u32) -> WorldEntry {
         let e = self.lookup(cp);
         let em = self.metrics.em_height_fu;
@@ -377,7 +379,7 @@ fn fu_to_world(fu: i32, em_height_fu: u32) -> f32 {
 /// sequence length, continuation/invalid bytes are non-leaders (no record),
 /// and the codepoint assembles from masked payload bits WITHOUT validating
 /// the continuation bytes (bounds-checked reads return 0 past the end).
-pub fn reference_layout<T: WorldTrie + ?Sized>(
+pub fn reference_layout<T: ResolveGlyph + ?Sized>(
     trie: &T,
     bytes: &[u8],
     origin: [f64; 3],

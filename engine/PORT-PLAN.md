@@ -62,7 +62,7 @@ refuses any parse that does not consume the whole file. Gate 9,
 
 Two things fell out that stage 2 inherits:
 
-1. **`WorldTrie`** (`text.rs`) is the new seam. The fold used to take
+1. **`ResolveGlyph`** (`text.rs`) is the new seam. The fold used to take
    `&TrieTable` — font units, atlas only — so the fixture corpus could not
    reach it at all. Both tries now implement one trait and the fold is generic.
 2. **The float discipline is now DETECTABLE.** Mutating `line_adv` to

@@ -26,7 +26,7 @@
 use std::fmt::Write as _;
 use std::path::Path;
 
-use crate::text::{WorldEntry, WorldTrie};
+use crate::text::{ResolveGlyph, WorldEntry};
 
 /// 'G3DF' — a pipeline fixture.
 const PIPE_MAGIC: u32 = 0x4644_3347;
@@ -214,7 +214,7 @@ pub struct FixtureTrie {
 /// Must match BLOCK_SHIFT in glyph_pipeline.mojo.
 const BLOCK_SHIFT: u32 = 8;
 
-impl WorldTrie for FixtureTrie {
+impl ResolveGlyph for FixtureTrie {
     /// The same two dependent loads as `TrieTable::lookup`, including the
     /// out-of-range contract settled in 0ae7010: a codepoint past the last
     /// Unicode scalar resolves through storage block 0, the shared missing
