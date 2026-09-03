@@ -934,9 +934,10 @@ pub struct GlyphScene {
     /// Stage L (L3): device handle for pool (re)creation in set_viewport
     /// (which has no ctx param — the trait shape is fenced).
     device: wgpu::Device,
-    /// Stage L (L3): composite machinery; None under --no-composite (the
-    /// direct-to-FrameTarget A/B escape hatch — REMOVED at stage end).
-    composite: Option<CompositeState>,
+    /// Stage L (L3): composite machinery — the ONLY release path (the
+    /// --no-composite A/B escape hatch proved neutrality and was removed at
+    /// stage end; see out/STAGE_L_REPORT.md).
+    composite: CompositeState,
 }
 
 // ── Stage K (K4): what the live controls change, and what stays const ────
@@ -1066,15 +1067,13 @@ impl GlyphScene {
         staged: StagedText,
         camera_mode: CameraMode,
         cull_enabled: bool,
-        composite: bool,
     ) -> Self {
         let device = &ctx.device;
 
-        // Stage L (L3): with the composite on, the glyph/backdrop pipelines
-        // render into the POOL format (Rgba8UnormSrgb) and a composite step
-        // maps the pool into the driver's view; --no-composite keeps the
-        // pre-L3 direct targeting (the A/B escape hatch).
-        let scene_target_format = if composite { POOL_FORMAT } else { color_format };
+        // Stage L (L3): the glyph/backdrop pipelines render into the POOL
+        // format (Rgba8UnormSrgb); the composite step maps the pool into the
+        // driver's view. (The --no-composite direct path proved the pool
+        // draw byte-neutral and was removed at stage end.)
 
         // --- instance + group buffers --------------------------------------
         let mut instances = staged.instances;
@@ -1295,9 +1294,9 @@ impl GlyphScene {
                 entry_point: Some("fs_main"),
                 compilation_options: Default::default(),
                 targets: &[Some(wgpu::ColorTargetState {
-                    // Stage L (L3): the POOL format when compositing (the
-                    // composite pass targets the driver's format instead).
-                    format: scene_target_format,
+                    // Stage L (L3): the POOL format (the composite pass
+                    // targets the driver's format instead).
+                    format: POOL_FORMAT,
                     // Premultiplied-alpha compositing: fragment outputs
                     // rgb·alpha and alpha; ONE / 1−SrcAlpha is the correct
                     // coverage composite (see shader header note).
@@ -1389,7 +1388,7 @@ impl GlyphScene {
         let cull = if cull_enabled {
             Some(CullState::new(
                 ctx,
-                scene_target_format, // Stage L (L3): the pool format when compositing
+                POOL_FORMAT, // Stage L (L3): the backdrop pipeline renders into the pool
                 depth_format,
                 &camera_buf,
                 &segments,
@@ -1403,7 +1402,7 @@ impl GlyphScene {
         // Stage L (L3): the composite machinery (persistent half). The
         // pooled target itself is sized by set_viewport — GlyphScene::new
         // doesn't know the viewport (the drivers decide it later).
-        let composite = composite.then(|| {
+        let composite = {
             let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
                 label: Some("composite.wgsl"),
                 source: wgpu::ShaderSource::Wgsl(include_str!("shaders/composite.wgsl").into()),
@@ -1476,7 +1475,7 @@ impl GlyphScene {
                 target: None,
                 parity: Cell::new(0),
             }
-        });
+        };
 
         let pick = staged.pick;
         let groups_cpu = groups.clone();
@@ -2515,21 +2514,15 @@ impl SceneLike for GlyphScene {
         // Stage L (L3): (re)size the pooled view target to the viewport.
         // Both drivers call set_viewport before the first render (windowed:
         // on window creation and every resize; offscreen: once at startup).
-        if let Some(comp) = &mut self.composite {
-            let stale = comp
-                .target
-                .as_ref()
-                .is_none_or(|t| t.width != w || t.height != h);
-            if stale && w > 0 && h > 0 {
-                let target = ViewTarget::new(
-                    &self.device,
-                    w,
-                    h,
-                    &comp.bind_group_layout,
-                    &comp.sampler,
-                );
-                comp.target = Some(target);
-            }
+        let comp = &mut self.composite;
+        let stale = comp
+            .target
+            .as_ref()
+            .is_none_or(|t| t.width != w || t.height != h);
+        if stale && w > 0 && h > 0 {
+            let target =
+                ViewTarget::new(&self.device, w, h, &comp.bind_group_layout, &comp.sampler);
+            comp.target = Some(target);
         }
     }
 
@@ -2595,7 +2588,9 @@ impl SceneLike for GlyphScene {
             color_view,
             color_texture,
             color_format,
-            depth_view,
+            // Stage L (L3): unused — the pass renders into the pool's own
+            // depth; the driver's depth is only for direct scenes.
+            depth_view: _,
             width,
             height,
         } = *target;
@@ -2603,26 +2598,21 @@ impl SceneLike for GlyphScene {
         self.viewport.set((width, height));
         let frame = self.camera_frame(t, aspect);
 
-        // Stage L (L3): with the composite on, the phase lists draw into the
-        // pooled view target (ping-pong slot selected here) and composite
-        // into the driver's view at the end of render; --no-composite draws
-        // directly (the A/B escape hatch).
-        let pool_slot = if let Some(comp) = &self.composite {
-            let vt = comp
-                .target
-                .as_ref()
-                .expect("L3: set_viewport must run before render (both drivers call it)");
-            assert_eq!(
-                (vt.width, vt.height),
-                (width, height),
-                "L3: pool/viewport size mismatch (set_viewport out of sync with the driver)"
-            );
-            let slot = (comp.parity.get() % 2) as usize;
-            comp.parity.set(comp.parity.get() + 1);
-            Some(slot)
-        } else {
-            None
-        };
+        // Stage L (L3): the phase lists draw into the pooled view target
+        // (ping-pong slot selected here) and composite into the driver's
+        // view at the end of render.
+        let comp = &self.composite;
+        let vt = comp
+            .target
+            .as_ref()
+            .expect("L3: set_viewport must run before render (both drivers call it)");
+        assert_eq!(
+            (vt.width, vt.height),
+            (width, height),
+            "L3: pool/viewport size mismatch (set_viewport out of sync with the driver)"
+        );
+        let pool_slot = (comp.parity.get() % 2) as usize;
+        comp.parity.set(comp.parity.get() + 1);
 
         // Stage K (K4): apply live UI controls BEFORE culling so a slider
         // drag takes effect this frame. This is the SINGLE write site of
@@ -2775,21 +2765,9 @@ impl SceneLike for GlyphScene {
             .profiler
             .as_ref()
             .map(|p| p.borrow().begin_pass_query("glyph field pass", encoder));
-        // Stage L (L3): the pass renders into the pooled target when
-        // compositing, else directly into the driver's views (pre-L3 path).
-        let (draw_color_view, draw_depth_view) = match pool_slot {
-            Some(slot) => {
-                let vt = self
-                    .composite
-                    .as_ref()
-                    .expect("pool_slot implies composite")
-                    .target
-                    .as_ref()
-                    .expect("pool sized above");
-                (&vt.color_views[slot], &vt.depth)
-            }
-            None => (color_view, depth_view),
-        };
+        // Stage L (L3): the pass renders into the pooled target.
+        let draw_depth_view = &vt.depth;
+        let draw_color_view = &vt.color_views[pool_slot];
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("glyph field pass"),
             timestamp_writes: pass_query
@@ -2879,66 +2857,62 @@ impl SceneLike for GlyphScene {
         }
 
         // Stage L (L3): composite the pooled target into the driver's view.
-        if let Some(slot) = pool_slot {
-            let comp = self.composite.as_ref().expect("pool_slot implies composite");
-            let vt = comp.target.as_ref().expect("pool sized above");
-            if color_format == POOL_FORMAT {
-                // Offscreen/oracle path: same format, 1:1, no scaling —
-                // copy_texture_to_texture is bit-exact BY CONSTRUCTION (this
-                // is the gate-critical path; it cannot fail a byte compare).
-                assert_eq!(
-                    color_format, POOL_FORMAT,
-                    "L3: copy composite requires matching formats (deliberately loud)"
-                );
-                encoder.copy_texture_to_texture(
-                    wgpu::TexelCopyTextureInfo {
-                        texture: &vt.colors[slot],
-                        mip_level: 0,
-                        origin: wgpu::Origin3d::ZERO,
-                        aspect: wgpu::TextureAspect::All,
-                    },
-                    wgpu::TexelCopyTextureInfo {
-                        texture: color_texture,
-                        mip_level: 0,
-                        origin: wgpu::Origin3d::ZERO,
-                        aspect: wgpu::TextureAspect::All,
-                    },
-                    wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
-                );
-            } else {
-                // Windowed path: the surface (Bgra8UnormSrgb) is
-                // component-order-incompatible with the pool, so a copy is
-                // invalid — fullscreen shader composite instead. The pass
-                // clears-then-overwrites every pixel (blend disabled).
-                let composite_query = ctx
-                    .profiler
-                    .as_ref()
-                    .map(|p| p.borrow().begin_pass_query("composite pass", encoder));
-                {
-                    let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                        label: Some("composite pass"),
-                        timestamp_writes: composite_query
-                            .as_ref()
-                            .and_then(|q| q.render_pass_timestamp_writes()),
-                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                            view: color_view,
-                            resolve_target: None,
-                            ops: wgpu::Operations {
-                                load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
-                                store: wgpu::StoreOp::Store,
-                            },
-                            depth_slice: None,
-                        })],
-                        depth_stencil_attachment: None,
-                        ..Default::default()
-                    });
-                    pass.set_pipeline(&comp.pipeline);
-                    pass.set_bind_group(0, &vt.bind_groups[slot], &[]);
-                    pass.draw(0..3, 0..1);
-                }
-                if let (Some(p), Some(q)) = (&ctx.profiler, composite_query) {
-                    p.borrow().end_query(encoder, q);
-                }
+        if color_format == POOL_FORMAT {
+            // Offscreen/oracle path: same format, 1:1, no scaling —
+            // copy_texture_to_texture is bit-exact BY CONSTRUCTION (this
+            // is the gate-critical path; it cannot fail a byte compare).
+            assert_eq!(
+                color_format, POOL_FORMAT,
+                "L3: copy composite requires matching formats (deliberately loud)"
+            );
+            encoder.copy_texture_to_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &vt.colors[pool_slot],
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::TexelCopyTextureInfo {
+                    texture: color_texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+            );
+        } else {
+            // Windowed path: the surface (Bgra8UnormSrgb) is
+            // component-order-incompatible with the pool, so a copy is
+            // invalid — fullscreen shader composite instead. The pass
+            // clears-then-overwrites every pixel (blend disabled).
+            let composite_query = ctx
+                .profiler
+                .as_ref()
+                .map(|p| p.borrow().begin_pass_query("composite pass", encoder));
+            {
+                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("composite pass"),
+                    timestamp_writes: composite_query
+                        .as_ref()
+                        .and_then(|q| q.render_pass_timestamp_writes()),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: color_view,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                            store: wgpu::StoreOp::Store,
+                        },
+                        depth_slice: None,
+                    })],
+                    depth_stencil_attachment: None,
+                    ..Default::default()
+                });
+                pass.set_pipeline(&comp.pipeline);
+                pass.set_bind_group(0, &vt.bind_groups[pool_slot], &[]);
+                pass.draw(0..3, 0..1);
+            }
+            if let (Some(p), Some(q)) = (&ctx.profiler, composite_query) {
+                p.borrow().end_query(encoder, q);
             }
         }
     }

@@ -755,9 +755,6 @@ struct App<'a> {
     /// Stage K (K6): scripted in-window capture (`--screenshot-frame N`
     /// `--screenshot-out PATH`).
     shot: Option<(u64, std::path::PathBuf)>,
-    /// Stage L (L3): pooled-target composite on (false under
-    /// `--no-composite`).
-    composite: bool,
 }
 
 impl ApplicationHandler for App<'_> {
@@ -862,23 +859,12 @@ impl ApplicationHandler for App<'_> {
         // concrete GlyphScene BEFORE type erasure (see build_scene_probed).
         #[cfg(feature = "egui-ui")]
         let (mut scene, ui_probe) = if self.ui {
-            crate::build_scene_probed(
-                &self.ctx,
-                format,
-                self.choice,
-                CameraMode::Fly,
-                self.cull,
-                self.composite,
-            )
+            crate::build_scene_probed(&self.ctx, format, self.choice, CameraMode::Fly, self.cull)
         } else {
-            (
-                build_scene(&self.ctx, format, self.choice, CameraMode::Fly, self.cull, self.composite),
-                None,
-            )
+            (build_scene(&self.ctx, format, self.choice, CameraMode::Fly, self.cull), None)
         };
         #[cfg(not(feature = "egui-ui"))]
-        let mut scene =
-            build_scene(&self.ctx, format, self.choice, CameraMode::Fly, self.cull, self.composite);
+        let mut scene = build_scene(&self.ctx, format, self.choice, CameraMode::Fly, self.cull);
         let depth = scene::create_depth(&self.ctx.device, scene.depth_format(), config.width, config.height);
         log::info!(
             "surface: {}x{} {:?} present={:?}",
@@ -1152,7 +1138,6 @@ pub fn run(
     ops: &[Op],
     ui: bool,
     shot: Option<(u64, std::path::PathBuf)>,
-    composite: bool,
 ) {
     // Without the `egui-ui` feature the overlay is compiled out entirely;
     // the flag is accepted (and ignored) so the CLI is identical either way.
@@ -1169,7 +1154,6 @@ pub fn run(
         #[cfg(feature = "egui-ui")]
         ui,
         shot,
-        composite,
     };
     event_loop.run_app(&mut app).expect("event loop error");
 }

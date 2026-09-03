@@ -100,20 +100,16 @@ fn engine_layout(file: &Path, trie: &Path) -> Vec<engine::GlyphRecord> {
 }
 
 /// Build the chosen scene for a given color target format.
-/// `composite` (Stage L, L3): GlyphScene draws into its pooled view target
-/// and composites into the driver view; false = direct rendering (the
-/// --no-composite A/B escape hatch — removed at stage end).
 pub fn build_scene(
     ctx: &GpuContext,
     color_format: wgpu::TextureFormat,
     choice: &SceneChoice,
     camera_mode: CameraMode,
     cull: bool,
-    composite: bool,
 ) -> Box<dyn SceneLike> {
     // Offscreen path: never installs a UI probe (probe = false), so the
     // scene behaves exactly as pre-K.
-    build_scene_impl(ctx, color_format, choice, camera_mode, cull, composite, false).0
+    build_scene_impl(ctx, color_format, choice, camera_mode, cull, false).0
 }
 
 /// Stage K (K3): windowed scene construction. Same scenes as build_scene,
@@ -127,9 +123,8 @@ pub fn build_scene_probed(
     choice: &SceneChoice,
     camera_mode: CameraMode,
     cull: bool,
-    composite: bool,
 ) -> (Box<dyn SceneLike>, Option<glyph_scene::UiProbe>) {
-    build_scene_impl(ctx, color_format, choice, camera_mode, cull, composite, true)
+    build_scene_impl(ctx, color_format, choice, camera_mode, cull, true)
 }
 
 fn build_scene_impl(
@@ -138,7 +133,6 @@ fn build_scene_impl(
     choice: &SceneChoice,
     camera_mode: CameraMode,
     cull: bool,
-    composite: bool,
     probe: bool,
 ) -> (Box<dyn SceneLike>, Option<glyph_scene::UiProbe>) {
     // Same construction order for both modes; only the probe install differs.
@@ -160,7 +154,7 @@ fn build_scene_impl(
                 copies,
                 staged.missing_or_bitmap,
             );
-            glyph(GlyphScene::new(ctx, color_format, &atlas, staged, camera_mode, cull, composite))
+            glyph(GlyphScene::new(ctx, color_format, &atlas, staged, camera_mode, cull))
         }
         SceneChoice::EngineText { file, trie } => {
             let atlas = atlas::Atlas::load(ctx);
@@ -172,7 +166,7 @@ fn build_scene_impl(
                 records.iter().filter(|r| r.glyph_id() == 0).count(),
             );
             let staged = text::stage_records(&records);
-            glyph(GlyphScene::new(ctx, color_format, &atlas, staged, camera_mode, cull, composite))
+            glyph(GlyphScene::new(ctx, color_format, &atlas, staged, camera_mode, cull))
         }
         SceneChoice::Repo {
             dir,
@@ -185,7 +179,7 @@ fn build_scene_impl(
             load.print_stats();
             let atlas = atlas::Atlas::load(ctx);
             let staged = load.into_staged(focus.as_deref());
-            glyph(GlyphScene::new(ctx, color_format, &atlas, staged, camera_mode, cull, composite))
+            glyph(GlyphScene::new(ctx, color_format, &atlas, staged, camera_mode, cull))
         }
     }
 }
@@ -280,10 +274,6 @@ struct Cli {
     /// Stage K: windowed without the egui UI overlay (exact pre-K behavior)
     #[arg(long)]
     no_ui: bool,
-    /// Stage L (L3): render GlyphScene directly into the driver target
-    /// (bypass the pooled view target + composite; A/B escape hatch)
-    #[arg(long)]
-    no_composite: bool,
     /// Stage K (K6): windowed only — capture the frame after N frames have
     /// rendered (requires --screenshot-out; the app KEEPS RUNNING afterward —
     /// unlike --screenshot it never exits)
@@ -638,13 +628,12 @@ fn main() {
     match cli.screenshot {
         Some(path) => offscreen::run(
             &ctx, &choice, &path, cli.frames, cli.zoom, !cli.no_cull, &cli.ops,
-            !cli.no_composite,
         ),
         None => {
             // Stage K (K6): scripted in-window capture (windowed only — clap
             // already rejected the combination with --screenshot).
             let shot = cli.screenshot_frame.zip(cli.screenshot_out.clone());
-            windowed::run(ctx, &choice, !cli.no_cull, &cli.ops, !cli.no_ui, shot, !cli.no_composite)
+            windowed::run(ctx, &choice, !cli.no_cull, &cli.ops, !cli.no_ui, shot)
         }
     }
 }
@@ -690,7 +679,6 @@ mod cli_tests {
         assert!(!cli.no_ui);
         assert!(cli.screenshot_frame.is_none());
         assert!(cli.screenshot_out.is_none());
-        assert!(!cli.no_composite);
         assert!(cli.ops.is_empty());
     }
 
@@ -698,7 +686,7 @@ mod cli_tests {
     fn scalar_flags_parse() {
         let cli = parse(&[
             "--screenshot", "out.png", "--frames", "2", "--demo", "--copies", "3", "--zoom",
-            "2.5", "--no-cull", "--no-ui", "--no-composite", "--engine-loop", "4", "--load-repo", "fixtures/g-pick-repo",
+            "2.5", "--no-cull", "--no-ui", "--engine-loop", "4", "--load-repo", "fixtures/g-pick-repo",
             "--repo-engine", "batch", "--repo-verify", "--focus-file", "alpha",
             "--render-file", "src/main.rs", "--engine-file", "a.rs", "--engine-trie", "t.bin",
             "--engine-check", "b.rs", "--engine-render", "c.rs",
@@ -710,7 +698,6 @@ mod cli_tests {
         assert_eq!(cli.zoom, 2.5);
         assert!(cli.no_cull);
         assert!(cli.no_ui);
-        assert!(cli.no_composite);
         assert_eq!(cli.engine_loop, 4);
         assert_eq!(cli.load_repo, Some(PathBuf::from("fixtures/g-pick-repo")));
         assert_eq!(cli.repo_engine, "batch");

@@ -20,7 +20,6 @@ pub fn run(
     zoom: f32,
     cull: bool,
     ops: &[Op],
-    composite: bool,
 ) {
     let device = &ctx.device;
 
@@ -63,7 +62,7 @@ pub fn run(
     let color_view = texture.create_view(&Default::default());
     let depth_view = scene::create_depth(device, wgpu::TextureFormat::Depth32Float, size.width, size.height);
 
-    let mut scene = build_scene(ctx, format, choice, CameraMode::Front { zoom }, cull, composite);
+    let mut scene = build_scene(ctx, format, choice, CameraMode::Front { zoom }, cull);
 
     // Stage G: scripted picks + verbs, applied in CLI order before the first
     // frame. Deterministic: the Front camera + fixed viewport make --pick-px
