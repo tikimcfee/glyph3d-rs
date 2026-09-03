@@ -23,6 +23,14 @@
 # or all-unpaged run makes a mis-resolution invisible. Covering a property is not
 # the same as being able to observe it.
 #
+# ENGAGEMENT (added 2026-09-02). The five invariants are SELF-CONSISTENT — they
+# compare the pipeline's output against itself — so a cell whose property never
+# occurred passes all five silently. check() now asserts each cell exercised what
+# its label claims. On its first run it failed 16 of the 48: paging applies to ODD
+# items only (for a mixed run), and the items=1 column has no odd item, so every
+# items=1 x page cell carried a paged label over an unpaged run. build_items now
+# pages item 0 when count == 1.
+#
 # Run: mojo run -I engine --fp-mode contract=off engine/conformance_matrix.mojo \
 #          engine/fixtures/repo-file.pipe.bin
 
@@ -72,7 +80,13 @@ def build_items(n: Int, count: Int, wrap: Int, page: Int, scroll: Bool) -> List[
         it.origin_z = Float64(i) * 3.0               # distinct
         it.wrap_width = wrap
         it.z_step = 0.5
-        if page != 0 and (i % 2) == 1:
+        # ODD items only, so a run is MIXED and a thread landing on the wrong
+        # item crosses a paged/unpaged boundary. But a ONE-item run has no odd
+        # item and so paged nothing at all — 16 of the 48 cells carried a paged
+        # label over an unpaged run until the engagement check above caught it
+        # (2026-09-02). With a single item there is no mixture to preserve, so
+        # all-paged is what "page=N" can honestly mean there.
+        if page != 0 and (count == 1 or (i % 2) == 1):
             it.has_page = True
             it.pages_wide = 2
             it.page_gap_x = 1.0
@@ -93,11 +107,116 @@ def build_items(n: Int, count: Int, wrap: Int, page: Int, scroll: Bool) -> List[
     return items^
 
 
-def check(name: String, bytes: List[UInt8], trie: Trie, items: List[Item]) -> Int:
-    """Five invariants that hold for ANY input. No oracle required."""
+def check(
+    name: String, bytes: List[UInt8], trie: Trie, items: List[Item],
+    want_wrap: Int, want_page: Int, want_scroll: Bool,
+) -> Int:
+    """Five invariants that hold for ANY input, plus the engagement check that
+    says the cell exercised what its label claims. No oracle required."""
     var n = len(bytes)
     var r = run_pipeline(bytes, trie, items)
     var bad = 0
+
+    # ── 0. ENGAGEMENT. The five invariants below are SELF-CONSISTENT: they compare
+    #      the pipeline's output against itself, so a cell where the property under
+    #      test never occurred passes all five with nothing said. That is exactly
+    #      how real-kernels.pipe.bin advertised "wrapped AND paged at once" while
+    #      its page bag was typo'd inert. A label is a claim; this is where the
+    #      claim gets checked.
+    #
+    #      Added 2026-09-02 and it immediately failed 16 of the 48 cells: paging is
+    #      applied to ODD items only (a mixed run makes a mis-resolution visible),
+    #      and the items=1 column has no odd item, so every items=1 x page cell
+    #      constructed an unpaged run under a paged label. build_items now pages
+    #      item 0 when there is only one — a single-item run cannot be mixed, so
+    #      all-paged is the honest reading of "page=N" there.
+    var row_paged = 0
+    var col_paged = 0
+    var scrolled = 0
+    for i in range(len(items)):
+        if items[i].page_rows > 0:
+            row_paged += 1
+        if items[i].page_cols > 0:
+            col_paged += 1
+        if items[i].scroll_rows > 0:
+            scrolled += 1
+    if want_page == 1 and row_paged == 0:
+        print("  ", name, "VACUOUS: labelled row-paged, no item has page_rows > 0")
+        bad += 1
+    if want_page == 2 and col_paged == 0:
+        print("  ", name, "VACUOUS: labelled column-paged, no item has page_cols > 0")
+        bad += 1
+    if want_scroll and scrolled == 0:
+        print("  ", name, "VACUOUS: labelled scrolled, no item has scroll_rows > 0")
+        bad += 1
+    # Every cell must carry misses, or invariant 1 (miss ORDER) tests an empty
+    # list. NOTE the miss=0 label is a misnomer: the base corpus already yields
+    # 111 misses against this trie and miss=1 raises it to 506 — the dimension
+    # varies, it does not toggle.
+    #      UNPROVEN, and marked so deliberately: unlike the other three below,
+    #      this one has never fired. Making it fire needs a trie that resolves
+    #      every byte of the corpus, which this suite has no way to build — it
+    #      borrows its trie from whatever fixture is passed in. The condition is
+    #      a direct read of a length so there is little room for it to be wrong,
+    #      but that was equally true of the first wrap check, which could not
+    #      fail for a reason no amount of staring revealed. Treat it as
+    #      unverified until something makes it red.
+    if len(r.misses) == 0:
+        print("  ", name, "VACUOUS: no trie misses, so the miss-order invariant is empty")
+        bad += 1
+    # Wrapping engaged iff some rendered leader sits at a column past the wrap
+    # width — that is the fold's own definition of having wrapped.
+    # NOT `COL >= want_wrap`, which was the first thing written here and CANNOT
+    # FAIL: COL is the RAW leader count within the source line, not col % wrap,
+    # so it is satisfied by any line longer than the wrap width whether wrapping
+    # ran or not — neutering wrap_width to 0 left it green. The fold's real
+    # signature is arithmetic: a source line of length L occupies L//W + 1 rows,
+    # so a wrapped item's maximum ROW exceeds its newline count and an unwrapped
+    # item's cannot.
+    if want_wrap > 0:
+        var wrapped = False
+        var observable = False
+        for i in range(len(items)):
+            if page_active(items[i]):
+                continue          # paginate remaps rows; the count means nothing there
+            var newlines = 0
+            var max_row = 0
+            var stop = items[i].byte_start + items[i].byte_count
+            for id in range(items[i].byte_start, stop):
+                if id >= n:
+                    break
+                if bytes[id] == 0x0A:
+                    newlines += 1
+                var f = Int(r.fl[id])
+                if (f & F_LEADER) == 0 or (f & F_RENDERED) == 0:
+                    continue
+                var row = Int(r.lc[id * LC_STRIDE + LC_ROW])
+                if row > max_row:
+                    max_row = row
+            if max_row > newlines:
+                wrapped = True
+                break
+            observable = True
+        # An ALL-PAGED cell has no item whose rows survive un-remapped, so the
+        # output-side test above has nothing to look at. Falling back to a silent
+        # pass there would reintroduce exactly the vacuity this check exists to
+        # find, so assert the INPUT side instead: the corpus must contain a line
+        # longer than the wrap width, or `wrap=N` could not have done anything to
+        # it no matter what the fold did.
+        if not observable:
+            var run_len = 0
+            for id in range(n):
+                if bytes[id] == 0x0A:
+                    run_len = 0
+                else:
+                    run_len += 1
+                    if run_len > want_wrap:
+                        wrapped = True
+                        break
+        if not wrapped:
+            print("  ", name, "VACUOUS: labelled wrap=", want_wrap,
+                  "but nothing wrapped and no line exceeds that width")
+            bad += 1
     var printed = 0
 
     # ── 1. MISS ORDER. The shards' lists concatenate in shard order, which is byte
@@ -256,7 +375,10 @@ def main() raises:
                         label += " page=" + String(pages[pi])
                         label += " scroll=" + String(1 if scroll else 0)
                         label += " miss=" + String(1 if with_misses else 0)
-                        var b = check(label, bytes, fx.trie, items)
+                        var b = check(
+                            label, bytes, fx.trie, items,
+                            wraps[wi], pages[pi], scroll,
+                        )
                         cases += 1
                         if b != 0:
                             print("FAIL", label, "-", b, "defects")
