@@ -17,7 +17,7 @@
 # KERNELS TAKE POINTERS, DRIVERS SHARD THEM ACROSS CORES. The per-slot kernels
 # (decode_and_resolve, resolve_x, paginate) are thread-shaped —
 # `id` is the thread id, buffers are raw pointers, exactly the GPU's calling
-# convention — and the drivers run them over TaskGroup shards. Every parallel
+# convention — and the drivers run them over parallelize shards. Every parallel
 # reduction here is EXACT under regrouping: min/max merges and disjoint writes
 # only; anything order-sensitive (the fold, miss order) stays serial. There is
 # one code path — small inputs just get small shards.
@@ -29,7 +29,11 @@ from std.collections.span import Span
 from std.math import inf
 from std.memory import unsafe_memset_zero
 from std.runtime import parallelism_level
-from std.runtime._asyncrt import TaskGroup  # MOJO-1.1-PORT: asyncrt made private
+from max.algorithm import parallelize  # MOJO-1.1-PORT: the PUBLIC parallel
+# primitive. TaskGroup lives only in the private std.runtime._asyncrt; the
+# public surface consolidated under `max` exactly as std.gpu -> max.gpu did.
+# NOT std.algorithm.map, whose body is a serial `for i in range(size)` —
+# migrating onto it would have kept every checksum green at 1x.
 from glyph_schema import (
     SM_STRIDE, SM_ADVANCE, SM_HEIGHT, GI_STRIDE,
     LM_STRIDE, LM_X, LM_Y, LM_Z, LM_BASE_X,
@@ -795,10 +799,10 @@ def paginate(
     ))
 
 
-# ── Parallel shard workers (the TaskGroup bodies) ────────────────────────────
+# ── Parallel shard workers (the parallelize bodies) ──────────────────────────
 
 
-async def _decode_shard[
+def _decode_shard[
     o: ImmOrigin, mo2: Origin[mut=True], no: Origin[mut=True],
 ](
     bytes: Span[UInt8, o],
@@ -877,7 +881,7 @@ async def _decode_shard[
     tally[unsafe_offset = w * 2 + 1] = nmiss
 
 
-async def _fold_item[ko: Origin[mut=True], witness: Bool](
+def _fold_item[ko: Origin[mut=True], witness: Bool](
     slots: Slots,
     item: Item,
     w: Witness,
@@ -891,7 +895,7 @@ async def _fold_item[ko: Origin[mut=True], witness: Bool](
     )
 
 
-async def _paginate_shard(
+def _paginate_shard(
     slots: Slots,
     item: Item,
     stride: Float64,
@@ -902,7 +906,7 @@ async def _paginate_shard(
         paginate(slots, id, item, stride)
 
 
-async def _bounds_item[bo: Origin[mut=True]](
+def _bounds_item[bo: Origin[mut=True]](
     slots: Slots,
     box: Pointer[Float64, bo],
     base: Int,
@@ -911,7 +915,7 @@ async def _bounds_item[bo: Origin[mut=True]](
 ):
     """One task per ITEM, min/max carried in REGISTERS and stored once.
 
-    The previous form ran a TaskGroup per item (64,457 of them over linux, 258k
+    The previous form ran a task group per item (64,457 of them over linux, 258k
     tasks) and sharded every item `workers` ways regardless of size — a 167-byte
     file got 4 tasks of 42 bytes. Worse, bounds_reduce did a load-compare-store
     against `box` for every slot, making the accumulator a loop-carried dependency
@@ -1046,12 +1050,13 @@ def run_pipeline[o: ImmOrigin, witness: Bool = True](
     var msp = miss_scratch.unsafe_ptr()
     var tally = List[Int](length=workers * 2, fill=0)
     var tp = tally.unsafe_ptr()
-    var tg = TaskGroup()
-    for w in range(workers):
-        var a = shard_lo(0, byte_len, workers, w)
-        var b = shard_lo(0, byte_len, workers, w + 1)
-        tg.create_task(_decode_shard(bytes, slots, trie, msp, tp, w, a, b))
-    tg.wait()
+    def _decode_task(w: Int) {imm}:
+        _decode_shard(
+            bytes, slots, trie, msp, tp, w,
+            shard_lo(0, byte_len, workers, w),
+            shard_lo(0, byte_len, workers, w + 1),
+        )
+    parallelize(_decode_task, workers)
     _ = len(miss_scratch)
     _ = len(tally)
 
@@ -1068,17 +1073,20 @@ def run_pipeline[o: ImmOrigin, witness: Bool = True](
     var item_count = len(items)
     var item_bounds = List[Float64](length=item_count * 8, fill=0)
     var kp = item_bounds.unsafe_ptr()
-    var tg2 = TaskGroup()
-    for i in range(item_count):
-        tg2.create_task(
-            _fold_item[witness=witness](
-                slots, items[i], w, kp, i * 8, not page_active(items[i])
-            )
+    def _fold_task(i: Int) {imm}:
+        _fold_item[witness=witness](
+            slots, items[i], w, kp, i * 8, not page_active(items[i])
         )
-    tg2.wait()
+    parallelize(_fold_task, item_count)
 
     # ── paginate: stride DERIVED from the fold scalars; inactive items skip ───
-    var tg3 = TaskGroup()
+    # parallelize takes a FLAT [0, n) index, and this space is 2-D and filtered
+    # (active items x shards), so the task list is materialized first. Same tasks,
+    # same order, same disjoint ranges — only the dispatch changes.
+    var pag_item = List[Int]()
+    var pag_lo = List[Int]()
+    var pag_hi = List[Int]()
+    var pag_stride = List[Float64]()
     for i in range(item_count):
         if not page_active(items[i]):
             continue
@@ -1086,10 +1094,16 @@ def run_pipeline[o: ImmOrigin, witness: Bool = True](
         var start = items[i].byte_start
         var stop = start + items[i].byte_count
         for w in range(workers):
-            var a = shard_lo(start, stop, workers, w)
-            var b = shard_lo(start, stop, workers, w + 1)
-            tg3.create_task(_paginate_shard(slots, items[i], stride, a, b))
-    tg3.wait()
+            pag_item.append(i)
+            pag_lo.append(shard_lo(start, stop, workers, w))
+            pag_hi.append(shard_lo(start, stop, workers, w + 1))
+            pag_stride.append(stride)
+    def _paginate_task(t: Int) {imm}:
+        _paginate_shard(
+            slots, items[pag_item[t]], pag_stride[t], pag_lo[t], pag_hi[t]
+        )
+    if len(pag_item) > 0:
+        parallelize(_paginate_task, len(pag_item))
 
     # ── per-item boxes: sharded local boxes, exact min/max merge ─────────────
     var batch_bounds = List[Float64](length=8, fill=0)
@@ -1099,7 +1113,7 @@ def run_pipeline[o: ImmOrigin, witness: Bool = True](
     batch_bounds[3] = -F64_INF
     batch_bounds[4] = -F64_INF
     batch_bounds[5] = -F64_INF
-    # ONE TaskGroup for the whole job, one task per item. Lanes 6/7 are the fold
+    # ONE parallelize for the whole job, one task per item. Lanes 6/7 are the fold
     # scalars layout_item already wrote into item_bounds; only 0-5 are touched here.
     # GRAIN, not item boundaries. One task per item was already better than the old
     # workers-per-item form, but it is SIZE-BLIND: linux has 9,584 files under 1 KB
@@ -1128,7 +1142,8 @@ def run_pipeline[o: ImmOrigin, witness: Bool = True](
     # SERIAL — no CAS, no shared write. min/max being exact under regrouping says
     # nothing about a concurrent read-modify-write on a shared location, which is
     # the race an earlier form of this pass actually had.
-    var tg4 = TaskGroup()
+    var gr_at = List[Int]()
+    var gr_end = List[Int]()
     var gi = 0
     for i in range(item_count):
         var start = items[i].byte_start
@@ -1138,10 +1153,16 @@ def run_pipeline[o: ImmOrigin, witness: Bool = True](
             var end = at + BOUNDS_GRAIN
             if end > stop:
                 end = stop
-            tg4.create_task(_bounds_item(slots, gp, gi * 8, at, end))
+            gr_at.append(at)
+            gr_end.append(end)
             gi += 1
             at = end
-    tg4.wait()
+    # gi advanced in the same order the table was appended, so the flat task index
+    # IS the grain index — gp slot t*8 is what the old gi*8 wrote.
+    def _bounds_task(t: Int) {imm}:
+        _bounds_item(slots, gp, t * 8, gr_at[t], gr_end[t])
+    if len(gr_at) > 0:
+        parallelize(_bounds_task, len(gr_at))
 
     # serial merge: grains of item i are contiguous in gboxes
     gi = 0

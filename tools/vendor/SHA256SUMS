@@ -1,0 +1,16 @@
+c925c6d2c8036f2b1a4f3ad1eb922f784a0e759ceff0106205418538906d101e  engine/fixtures/inputs/foldGeometry.js
+9cd528affba50d7d32fc4ea5cbbb69a8e5f2dc95881dc1764a14e472638a8d86  engine/fixtures/inputs/glyphPipelineKernels.js
+b27a4f0cb6ae7ecd8d02d3615465507e9b65f5e1560a3ef8ea352bf7847f8614  schema/glyph-identity.json
+647ccdaba087de1fd76190ed1fa6c0d77e368ec35804581dbe26773c467fbe01  tools/vendor/ref/app/public/slug-core/slug-core.1tstke3lync.bin
+dcd526004fcfec4ec23a21ca458ea6111e1e0d4471c0ade2704927101b5dcedb  tools/vendor/ref/packages/glyph3d-core/src/fonts/Cousine-Regular.ttf
+6038a160b491e121c1f12c7bccb4a9c8730296e3adc1086a059404ed84b7451c  tools/vendor/ref/packages/glyph3d-core/src/fonts/DejaVuSans.ttf
+3cb52e923ca3981cecca9ea7307186e424e8521cbc5643fd0b5b5b1d7daa53d9  tools/vendor/ref/packages/glyph3d-core/src/fonts/MesloLGS-NF-Mono.ttf
+5ac242c70910d0594b2473cbb8620737a948a0e31c0de3f0cad70088bce340d9  tools/vendor/ref/packages/glyph3d-core/src/shaping/FontChain.js
+dfc4bbaba26394289f1b34128541ce8c00b97cadac26e9aa5b5d6a56c8b241a5  tools/vendor/ref/packages/glyph3d-core/src/shaping/HarfBuzzShaper.js
+c38a3ed428af522a098c919102adb848b9b7b1c5a6a2d6f971206901bca9b066  tools/vendor/ref/packages/glyph3d-core/src/shaping/MonospaceShapeCache.js
+9958483ddc5ae4a46942f103eb575cbb462f22c604f4eb58d278e6c82164c1d2  tools/vendor/ref/packages/glyph3d-core/src/shaping/vendor/harfbuzz.js
+79bc0bd8aa25ca2302ed8f165a8989298fc5bef1552fc04157ca571042bdbcc9  tools/vendor/ref/packages/glyph3d-core/src/shaping/vendor/hb.js
+ea319787a8efdf90599ade77e33d1f245d61da390380f6c8299ab3195ff00d6d  tools/vendor/ref/packages/glyph3d-core/src/shaping/vendor/hb.wasm
+4ef474e7567c2f2a388fc5d990866d4c42df90ded84fb7425a9f8da15fd7ce36  tools/vendor/ref/packages/glyph3d-core/src/shaping/vendor/hbjs.js
+33dbad8e14c5ecc0262c9952491acbee98cb20ec7f21dea5a467f14b72d28cd7  tools/vendor/ref/packages/glyph3d-r3f/src/coreRanges.js
+6f49cde4cc655eb2d41fa303a240fff04d03c47e5836a211bbbaeb848d7bf908  tools/vendor/ref/tools/headlessFontChain.mjs

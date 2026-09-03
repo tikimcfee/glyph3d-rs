@@ -27,7 +27,7 @@ culling/picking (no GPU-dependent traversal order), and a fixed atlas. So a
 given commit + given input ⇒ byte-identical PNG. Everything that could break
 this is fenced:
 
-- `engine-local/` — READ-ONLY. The Mojo engine is built by pixi/mojo, not cargo.
+- `engine/` — READ-ONLY. The Mojo engine is built by pixi/mojo, not cargo.
 - `assets/atlas/` — READ-ONLY. Atlas binaries define the glyph geometry.
 - `native/src/shaders/*.wgsl` — READ-ONLY without a dedicated stage; the naga
   test pins the shader *set*, encase tests pin the lane maps.

@@ -3,13 +3,17 @@
 //! The engine is built OUTSIDE cargo (Mojo has its own toolchain):
 //!
 //! ```sh
-//! pixi run mojo build --fp-mode contract=off -I engine-local \
-//!     engine-local/ffi.mojo -o native/libglyph_engine.dylib --emit shared-lib
+//! pixi run mojo build --fp-mode contract=off -I engine \
+//!     engine/ffi.mojo -o native/libglyph_engine.dylib --emit shared-lib
 //! install_name_tool -id @rpath/libglyph_engine.dylib native/libglyph_engine.dylib
 //! ```
 //!
-//! (See engine-local/README-FFI.md. `--fp-mode contract=off` is load-bearing —
-//! it pins the bit-exact float discipline; see engine-local/check.sh's header.)
+//! (See engine/README-FFI.md. `--fp-mode contract=off` is load-bearing —
+//! it pins the bit-exact float discipline; see engine/check.sh's header.
+//! It is now ENFORCED, not just documented: engine.rs::assert_fp_contract_off
+//! calls glyph_engine_fp_probe at every Engine::new() and panics if the dylib
+//! fused the multiply-add. Verified against dylibs built both ways. Build via
+//! `pixi run build-engine`.)
 //!
 //! This script only wires up linking: the search path, the dylib, and the two
 //! rpaths the resulting binary needs at runtime:
@@ -29,8 +33,8 @@ fn main() {
         panic!(
             "libglyph_engine.dylib not found at {}.\n\
              Build it first:\n\
-             \x20 pixi run mojo build --fp-mode contract=off -I engine-local \\\n\
-             \x20     engine-local/ffi.mojo -o native/libglyph_engine.dylib --emit shared-lib\n\
+             \x20 pixi run mojo build --fp-mode contract=off -I engine \\\n\
+             \x20     engine/ffi.mojo -o native/libglyph_engine.dylib --emit shared-lib\n\
              \x20 install_name_tool -id @rpath/libglyph_engine.dylib native/libglyph_engine.dylib",
             dylib.display()
         );

@@ -3,7 +3,7 @@
 # Port of glyphPipelineScan.js's runScanPipeline: the GPU's dispatch structure
 # (chunkReduce → spineReduce → spineScan → partialScan → apply → resolveX →
 # paginate → bounds), and here the dispatches actually RUN in parallel — each
-# TaskGroup shard below is a batch of the threads one GPU dispatch would launch.
+# parallelize shard below is a batch of the threads one GPU dispatch would launch.
 # spineScan stays one thread, exactly as it does on hardware. Determinism is
 # structural, same as the GPU's: workers write disjoint elements or reduce with
 # exact (min/max) merges; nothing order-sensitive crosses a shard.
@@ -20,7 +20,7 @@
 from std.collections.span import Span
 from std.memory import unsafe_memset_zero
 from std.runtime import parallelism_level
-from std.runtime._asyncrt import TaskGroup  # MOJO-1.1-PORT: asyncrt made private
+from max.algorithm import parallelize  # MOJO-1.1-PORT: see glyph_pipeline.mojo
 from glyph_schema import SM_STRIDE, LM_STRIDE, LC_STRIDE
 from glyph_pipeline import (
     Trie,
@@ -97,7 +97,7 @@ def fold_range(
         id += 1
 
 
-async def _chunk_reduce_shard[po: Origin[mut=True]](
+def _chunk_reduce_shard[po: Origin[mut=True]](
     slots: Slots,
     items: List[Item],
     wraps: List[Int],
@@ -116,7 +116,7 @@ async def _chunk_reduce_shard[po: Origin[mut=True]](
         partials[unsafe_offset = c] = acc^
 
 
-async def _spine_reduce_shard[po: Origin[mut=True], uo: Origin[mut=True]](
+def _spine_reduce_shard[po: Origin[mut=True], uo: Origin[mut=True]](
     partials: Pointer[ScanElem, po],
     supers: Pointer[ScanElem, uo],
     num_chunks: Int,
@@ -136,7 +136,7 @@ async def _spine_reduce_shard[po: Origin[mut=True], uo: Origin[mut=True]](
         supers[unsafe_offset = sg] = acc^
 
 
-async def _partial_scan_shard[
+def _partial_scan_shard[
     po: Origin[mut=True], fo: Origin[mut=True], xo: Origin[mut=True]
 ](
     partials: Pointer[ScanElem, po],
@@ -159,7 +159,7 @@ async def _partial_scan_shard[
             c += 1
 
 
-async def _apply_shard[
+def _apply_shard[
     po: Origin[mut=True],
 ](
     slots: Slots,
@@ -240,7 +240,7 @@ async def _apply_shard[
             id += 1
 
 
-async def _resolve_x_shard[
+def _resolve_x_shard[
     ko: Origin[mut=True]
 ](
     slots: Slots,
@@ -367,12 +367,11 @@ def run_scan_pipeline[o: ImmOrigin](
     var msp = miss_scratch.unsafe_ptr()
     var tally = List[Int](length=workers * 2, fill=0)
     var tp = tally.unsafe_ptr()
-    var tg1 = TaskGroup()
-    for w in range(workers):
-        var a = shard_lo(0, n, workers, w)
-        var b = shard_lo(0, n, workers, w + 1)
-        tg1.create_task(_decode_shard(bytes, slots, trie, msp, tp, w, a, b))
-    tg1.wait()
+    def _tg1_task(w: Int) {imm}:
+        _decode_shard(bytes, slots, trie, msp, tp, w, shard_lo(0, n, workers, w),
+            shard_lo(0, n, workers, w + 1),
+        )
+    parallelize(_tg1_task, workers)
     _ = len(miss_scratch)
     _ = len(tally)
 
@@ -395,12 +394,11 @@ def run_scan_pipeline[o: ImmOrigin](
     for _ in range(num_chunks):
         partials.append(scan_identity())
     var pp = partials.unsafe_ptr()
-    var tg2 = TaskGroup()
-    for w in range(workers):
-        var a = shard_lo(0, num_chunks, workers, w)
-        var b = shard_lo(0, num_chunks, workers, w + 1)
-        tg2.create_task(_chunk_reduce_shard(slots, items, wraps, pp, n, k, a, b))
-    tg2.wait()
+    def _tg2_task(w: Int) {imm}:
+        _chunk_reduce_shard(slots, items, wraps, pp, n, k, shard_lo(0, num_chunks, workers, w),
+            shard_lo(0, num_chunks, workers, w + 1),
+        )
+    parallelize(_tg2_task, workers)
 
     # ── dispatch 3: spineReduce — thread per group, groups sharded ────────────
     var num_supers = (num_chunks + g - 1) // g
@@ -408,12 +406,11 @@ def run_scan_pipeline[o: ImmOrigin](
     for _ in range(num_supers):
         supers.append(scan_identity())
     var up = supers.unsafe_ptr()
-    var tg3 = TaskGroup()
-    for w in range(workers):
-        var a = shard_lo(0, num_supers, workers, w)
-        var b = shard_lo(0, num_supers, workers, w + 1)
-        tg3.create_task(_spine_reduce_shard(pp, up, num_chunks, g, a, b))
-    tg3.wait()
+    def _tg3_task(w: Int) {imm}:
+        _spine_reduce_shard(pp, up, num_chunks, g, shard_lo(0, num_supers, workers, w),
+            shard_lo(0, num_supers, workers, w + 1),
+        )
+    parallelize(_tg3_task, workers)
 
     # ── dispatch 4: spineScan — ONE thread, exclusive scan of supers ──────────
     var super_prefix = List[ScanElem]()
@@ -430,12 +427,11 @@ def run_scan_pipeline[o: ImmOrigin](
     for _ in range(num_chunks):
         partial_prefix.append(scan_identity())
     var xp = partial_prefix.unsafe_ptr()
-    var tg5 = TaskGroup()
-    for w in range(workers):
-        var a = shard_lo(0, num_supers, workers, w)
-        var b = shard_lo(0, num_supers, workers, w + 1)
-        tg5.create_task(_partial_scan_shard(pp, fp, xp, num_chunks, g, a, b))
-    tg5.wait()
+    def _tg5_task(w: Int) {imm}:
+        _partial_scan_shard(pp, fp, xp, num_chunks, g, shard_lo(0, num_supers, workers, w),
+            shard_lo(0, num_supers, workers, w + 1),
+        )
+    parallelize(_tg5_task, workers)
 
     # ── dispatch 6: apply — thread per chunk, chunks sharded ──────────────────
     # The scan form is ALWAYS witnessed: dispatch 7 seeds its shards from ORD +
@@ -445,12 +441,11 @@ def run_scan_pipeline[o: ImmOrigin](
     r.ord_to_byte = List[UInt32](unsafe_uninit_length=n if n > 0 else 1)
     unsafe_memset_zero(r.ord_to_byte.unsafe_ptr(), len(r.ord_to_byte))
     var wtn = r.witness()
-    var tg6 = TaskGroup()
-    for w in range(workers):
-        var a = shard_lo(0, num_chunks, workers, w)
-        var b = shard_lo(0, num_chunks, workers, w + 1)
-        tg6.create_task(_apply_shard(slots, wtn, items, wraps, xp, n, k, a, b))
-    tg6.wait()
+    def _tg6_task(w: Int) {imm}:
+        _apply_shard(slots, wtn, items, wraps, xp, n, k, shard_lo(0, num_chunks, workers, w),
+            shard_lo(0, num_chunks, workers, w + 1),
+        )
+    parallelize(_tg6_task, workers)
 
     # ── dispatch 7: resolveX + fold-scalar reduce — per item, sharded, with
     #    per-shard scalar rows max-merged (exact under regrouping) ─────────────
@@ -463,14 +458,14 @@ def run_scan_pipeline[o: ImmOrigin](
             shard_scalars[w] = 0
         var start = items[i2].byte_start
         var stop = start + items[i2].byte_count
-        var tg7 = TaskGroup()
-        for w in range(workers):
-            var a = shard_lo(start, stop, workers, w)
-            var b = shard_lo(start, stop, workers, w + 1)
-            tg7.create_task(_resolve_x_shard(
-                slots, wtn, items[i2], ssp, w * 8, a, b, page_active(items[i2])
-            ))
-        tg7.wait()
+        def _tg7_task(w: Int) {imm}:
+            _resolve_x_shard(
+                slots, wtn, items[i2], ssp, w * 8,
+                shard_lo(start, stop, workers, w),
+                shard_lo(start, stop, workers, w + 1),
+                page_active(items[i2]),
+            )
+        parallelize(_tg7_task, workers)
         for w in range(workers):
             if shard_scalars[w * 8 + 6] > item_bounds[i2 * 8 + 6]:
                 item_bounds[i2 * 8 + 6] = shard_scalars[w * 8 + 6]
@@ -478,7 +473,12 @@ def run_scan_pipeline[o: ImmOrigin](
                 item_bounds[i2 * 8 + 7] = shard_scalars[w * 8 + 7]
 
     # ── dispatch 8: paginate, stride derived from the fold scalars ────────────
-    var tg8 = TaskGroup()
+    # parallelize takes a FLAT [0, n) index and this space is 2-D and filtered,
+    # so the task list is materialized first. Same tasks, same disjoint ranges.
+    var pag_item = List[Int]()
+    var pag_lo = List[Int]()
+    var pag_hi = List[Int]()
+    var pag_stride = List[Float64]()
     for i2 in range(item_count):
         if not page_active(items[i2]):
             continue
@@ -486,10 +486,16 @@ def run_scan_pipeline[o: ImmOrigin](
         var start = items[i2].byte_start
         var stop = start + items[i2].byte_count
         for w in range(workers):
-            var a = shard_lo(start, stop, workers, w)
-            var b = shard_lo(start, stop, workers, w + 1)
-            tg8.create_task(_paginate_shard(slots, items[i2], stride, a, b))
-    tg8.wait()
+            pag_item.append(i2)
+            pag_lo.append(shard_lo(start, stop, workers, w))
+            pag_hi.append(shard_lo(start, stop, workers, w + 1))
+            pag_stride.append(stride)
+    def _tg8_task(t: Int) {imm}:
+        _paginate_shard(
+            slots, items[pag_item[t]], pag_stride[t], pag_lo[t], pag_hi[t]
+        )
+    if len(pag_item) > 0:
+        parallelize(_tg8_task, len(pag_item))
 
     # ── per-item boxes: sharded local boxes, exact min/max merge ──────────────
     var batch_bounds = List[Float64](length=8, fill=0)
@@ -499,14 +505,15 @@ def run_scan_pipeline[o: ImmOrigin](
     batch_bounds[3] = -F64_INF
     batch_bounds[4] = -F64_INF
     batch_bounds[5] = -F64_INF
-    # ONE TaskGroup, one task per item — see _bounds_item in glyph_pipeline.
+    # ONE parallelize, one task per item — see _bounds_item in glyph_pipeline.
     var ibp = item_bounds.unsafe_ptr()
-    var tg9 = TaskGroup()
-    for i2 in range(item_count):
-        var start = items[i2].byte_start
-        var stop = start + items[i2].byte_count
-        tg9.create_task(_bounds_item(slots, ibp, i2 * 8, start, stop))
-    tg9.wait()
+    def _tg9_task(i2: Int) {imm}:
+        _bounds_item(
+            slots, ibp, i2 * 8,
+            items[i2].byte_start,
+            items[i2].byte_start + items[i2].byte_count,
+        )
+    parallelize(_tg9_task, item_count)
 
     for i2 in range(item_count):
         var b8 = i2 * 8

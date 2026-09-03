@@ -22,7 +22,8 @@
  *
  * Usage:  node tools/export-atlas.mjs [--out <dir>]
  * Requires: node ≥ 18 (CompressionStream-free; we use zlib). Reference repo must
- * exist at REF_ROOT (below) and is never written to.
+ * is vendored under tools/vendor/ref (see REF_ROOT below); the web repo is not
+ * read at all any more.
  */
 import { readFileSync, writeFileSync, mkdirSync, readdirSync } from 'fs';
 import { gunzipSync } from 'zlib';
@@ -30,7 +31,19 @@ import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
-const REF_ROOT = '/Users/lugo/localdev/viz-web/glyph3d-js';
+// VENDORED 2026-09-02. This was an absolute path into the web repo
+// ('/Users/lugo/localdev/viz-web/glyph3d-js') — a live dependency on a tree that
+// is no longer trunk, invisible until someone moved a directory. tools/vendor/ref
+// now mirrors that repo's LAYOUT exactly, so every vendored file is byte-verbatim
+// and this is the only line that changed. To refresh from the web repo, copy the
+// same relative paths over; to see what is vendored, `find tools/vendor/ref -type f`.
+//
+// The gate that makes this safe: re-run this script and `cmp` its four outputs
+// against assets/atlas/*.bin. Slot allocation is deterministic (dense counter in
+// prime order) and step 3 already asserts the reproduced ids against the baked
+// envelope's encodedIds before writing, so byte-identity is a real check, not a
+// coincidence. Verified byte-identical against the pre-vendoring baseline.
+const REF_ROOT = join(HERE, 'vendor', 'ref');
 const SLUG_CORE_DIR = join(REF_ROOT, 'app/public/slug-core');
 const OUT_DIR = process.argv.includes('--out')
     ? process.argv[process.argv.indexOf('--out') + 1]
@@ -87,7 +100,11 @@ const createHarfBuzz = require('./vendor/hb.cjs');
 
 const { FONTS, stubEmojiAtlas } = await import(`${REF_ROOT}/tools/headlessFontChain.mjs`);
 const { LARGE_CORE_RANGES } = await import(`${REF_ROOT}/packages/glyph3d-r3f/src/coreRanges.js`);
-const { FontChain, MonospaceShapeCache } = await import(`${REF_ROOT}/packages/glyph3d-core/src/shaping/index.js`);
+// Direct module imports, NOT shaping/index.js: that barrel also re-exports
+// SlugEncoder and LiveSlugAtlas, which import three. Nothing here needs them,
+// and going direct keeps three out of this tool's dependency graph.
+const FontChain = (await import(`${REF_ROOT}/packages/glyph3d-core/src/shaping/FontChain.js`)).default;
+const MonospaceShapeCache = (await import(`${REF_ROOT}/packages/glyph3d-core/src/shaping/MonospaceShapeCache.js`)).default;
 const HarfBuzzShaper = (await import(`${REF_ROOT}/packages/glyph3d-core/src/shaping/HarfBuzzShaper.js`)).default;
 const hbjs = (await import(`${REF_ROOT}/packages/glyph3d-core/src/shaping/vendor/hbjs.js`)).default;
 

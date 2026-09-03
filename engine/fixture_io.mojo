@@ -12,7 +12,7 @@ from glyph_pipeline import Trie, Item, trunc_nonneg, BLOCK_SHIFT
 
 comptime PIPE_MAGIC = 0x46443347
 # NATIVE-PORT (Stage E1): the app's own trie blob — magic 'G3TR'. Spec: the
-# header of tools/gen-real-trie.mjs. Same in-memory Trie as a fixture, but the
+# header of tools/gen_real_trie.py. Same in-memory Trie as a fixture, but the
 # blocks cross as the web trie's container (GlyphTrie.js): GLYPH_ID/FLAGS are
 # native u32, ADVANCE/HEIGHT are bitcast f32 WORLD units (font units ×
 # cellHeightWorld / emHeightFu, rounded once by the generator). This loader
@@ -173,7 +173,7 @@ def load_pipe_fixture(path: String) raises -> PipeFixture:
 
 def load_trie_blob(path: String) raises -> Trie:
     """NATIVE-PORT (Stage E1): load a 'G3TR' trie blob — the app atlas's REAL
-    codepoint→slot mapping, written by tools/gen-real-trie.mjs from
+    codepoint→slot mapping, written by tools/gen_real_trie.py from
     assets/atlas/codepoints.bin. Returns the same Trie the fixture loader
     produces; the on-disk difference is only the container (identity/bitfield
     native u32, measures bitcast f32) and the absence of expected-output

@@ -6,6 +6,19 @@ platforms = ["osx-arm64"]
 version = "0.1.0"
 
 [tasks]
+# The engine's own gates. `check.sh cpu` is the default; `all` also tries the
+# five GPU suites, which need `max` in this env (it is not there yet).
+suites = "./engine/check.sh cpu"
+suites-gpu = "./engine/check.sh gpu"
+# Generators: regenerate their committed outputs and prove byte-identity.
+gen-trie = "python3 tools/gen_real_trie.py"
+gen-schema = "python3 tools/gen_schema.py"
+check-gen = { cmd = "python3 tools/gen_real_trie.py --verify-only && python3 tools/gen_schema.py --check" }
+# Build the FFI dylib. --fp-mode contract=off is LOAD-BEARING; see
+# engine/check.sh's header for why (it is a real file again as of 2026-09-02).
+build-engine = "pixi run mojo build --fp-mode contract=off -I engine engine/ffi.mojo -o native/libglyph_engine.dylib --emit shared-lib && install_name_tool -id @rpath/libglyph_engine.dylib native/libglyph_engine.dylib"
+check-all = "./tools/check-all.sh"
 
 [dependencies]
 mojo = ">=1.1.0.dev2026083005,<2"
+max = ">=26.6.0.dev2026083005,<27"

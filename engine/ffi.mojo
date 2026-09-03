@@ -11,8 +11,10 @@
 #
 # Portability notes for this toolchain (Mojo 1.1.0.dev2026083005):
 #   - std.runtime.asyncrt went private; the engine copies were patched to
-#     import TaskGroup from std.runtime._asyncrt (tagged MOJO-1.1-PORT).
-#   - std.runtime.initialize_runtime() MUST be called before any TaskGroup
+#     the engine copies moved to max.algorithm.parallelize, the PUBLIC parallel
+#     primitive (tagged MOJO-1.1-PORT). TaskGroup exists only in the private
+#     std.runtime._asyncrt and has no public counterpart.
+#   - std.runtime.initialize_runtime() MUST be called before any parallel
 #     work when the host process is not Mojo — without it the first parallel
 #     dispatch segfaults on a null async runtime (GEX-3993).
 #   - Heap handles use std.memory.alloc's Allocation/Layout (Pointer.alloc is
@@ -67,7 +69,7 @@ def _state(h: Handle) -> Pointer[EngineState, MutUntrackedOrigin]:
 @export("glyph_engine_new")
 def glyph_engine_new() abi("C") -> Handle:
     # MANDATORY when the host process is not Mojo: creates the async runtime
-    # that run_pipeline's TaskGroup shards dispatch onto.
+    # that run_pipeline's parallelize shards dispatch onto.
     initialize_runtime()
     var a = alloc(Layout[EngineState](count=1))
     a.unsafe_ptr().unsafe_write(EngineState())
@@ -92,7 +94,7 @@ def glyph_engine_load_trie_file(
 ) abi("C") -> c_int:
     """Load the trie (font metric tables). NATIVE-PORT (Stage E1): dispatches
     on magic — a 'G3TR' blob (the app atlas's real codepoint→slot mapping,
-    tools/gen-real-trie.mjs) or a legacy 'G3DF' .pipe.bin fixture (the
+    tools/gen_real_trie.py) or a legacy 'G3DF' .pipe.bin fixture (the
     conformance corpus; its expected-output sections are parsed and discarded).
     """
     try:
@@ -179,7 +181,7 @@ def glyph_engine_load_item(
 
 # NATIVE-PORT (Stage E2) — batched load: ONE call runs the whole corpus.
 #
-# Per-file load_item calls pay the TaskGroup dispatch + scratch setup per
+# Per-file load_item calls pay the parallel dispatch + scratch setup per
 # call (~50 MB/s at repo-file sizes); the pipeline itself is built for
 # multi-item arenas (Item list over one byte span), so this entry amortizes
 # ALL per-call overhead: the caller concatenates the corpus into one blob and
@@ -311,3 +313,32 @@ def glyph_engine_copy_slots(
         for k in range(3):
             out_ptr[unsafe_offset = wo + 5 + k] = cp[unsafe_offset = co + k]
     return UInt64(n)
+
+
+@export("glyph_engine_fp_probe")
+def glyph_engine_fp_probe(a: Float32, b: Float32, c: Float32) abi("C") -> UInt32:
+    """NATIVE-PORT (2026-09-02): report whether THIS DYLIB was built with
+    `--fp-mode contract=off`, by doing the one thing the flag governs.
+
+    WHY THIS EXISTS. The flag is load-bearing (README-FFI.md, build.rs,
+    check.sh's header all say so) and until now NOTHING COULD DETECT ITS
+    ABSENCE. check.sh's own header admits the Mojo suites pass either way; the
+    Rust `--engine-check` is blind for a separate reason, measured 2026-09-02:
+    it runs with origin (0,0,0), which makes its only fusable multiply-add
+    (`-row*lh + oy`) FMA-invariant, and the pagination terms that DO have a
+    nonzero addend never execute under its params. Even with a nonzero origin
+    it would stay blind — the fold computes in Float64 and narrows to Float32,
+    and an FMA/non-FMA difference at f64 ulp survives that narrowing only when
+    the result lands within ~2^-53 of an f32 rounding boundary (~2^-29 per
+    record). That is a lottery, not a gate.
+
+    So: stop hoping a corpus notices, and ask the compiler directly. `a * b + c`
+    is exactly the shape contraction fuses. The operands are PARAMETERS, not
+    literals, so the expression cannot be constant-folded at compile time — the
+    fusion decision is made in emitted code, which is the thing under test.
+
+    Caller passes a = b = 0x3f800002 (1.0 + 2 ulp), c = -1.0 and expects:
+        0x35000000  built with contract=off  (product rounded, then added)
+        0x35000001  built with contract=fast (single rounding — FORBIDDEN)
+    One ulp apart, deterministic, no fixtures involved."""
+    return UInt32((a * b + c).to_bits())
