@@ -30,10 +30,15 @@
 //!   - the moment egui wants ANY input, the look-grab is released (checked
 //!     per frame in render()); it re-acquires once the pointer leaves egui.
 //!
-//! K3 adds the Debug window (FPS/camera/pick readouts, verb buttons calling
-//! the exact CLI op API, K2 scratch text field). K4 makes LOD_MIN_PX live
-//! via a slider (probe-cell → CullState Cell seam; offscreen keeps the
-//! const) and adds live cull counters; F1 toggles the window.
+//! K3 added the Debug window; K4 the live LOD dial; K5 the group browser.
+//!
+//! Stage M replaces the single Debug window with the interface shell
+//! (`ui.rs`): HUD (top), Files (left), Inspector (right), Console (bottom),
+//! palette popup. Every panel action returns a `ui::Command`; the executor
+//! below is the single place where intents become effects, through the exact
+//! SceneLike APIs the CLI op-stream uses. F1 toggles the whole shell;
+//! Cmd/Ctrl-K toggles the palette (app-level, like F2, so it fires even from
+//! a focused text field — a chord never types).
 //!
 //! K6: in-window screenshot. The surface is configured with COPY_SRC (an
 //! assert at configure checks the adapter supports it); on demand (F2 — an
@@ -69,35 +74,12 @@ struct EguiUi {
     ctx: egui::Context,
     state: egui_winit::State,
     renderer: egui_wgpu::Renderer,
-    /// K3: scratch text field in the Debug window — doubles as the K2
-    /// typing-isolation trap test (typing WASD/h/g/t/x here must not fly the
-    /// camera or fire verbs; the gating matrix in window_event ensures it).
-    scratch: String,
-    /// K4: Debug window visibility (F1 toggles; the window's own close
-    /// button clears it).
-    debug_open: bool,
-    /// K5: group-browser substring filter (doubles as a second K2
-    /// typing-isolation field).
-    filter: String,
-    /// K5: the browser's selected group (highlight only; click also flies
-    /// the camera to the file).
-    selected_group: Option<u32>,
+    /// Stage M: all interface memory — panel visibility, console log/input/
+    /// history, palette state, the K5 filter/selection (promoted), the
+    /// inspector's parameterized-verb scratch. One struct so a future stage
+    /// can serialize the session (notes/11, M6).
+    ui_state: crate::ui::UiState,
 }
-
-/// Stage K (K3): Debug-panel verb buttons — CLI `--verb` literals parsed
-/// through the same crate::parse_verb the CLI uses, so panel ⇔ CLI
-/// equivalence is by construction. Zero-arg/default forms only; the
-/// parameterized verbs (nudge/scale/move, tint-group rrggbb) stay CLI-only
-/// until a phase needs arg entry.
-#[cfg(feature = "egui-ui")]
-const PANEL_VERBS: &[&str] = &[
-    "recolor-glyph",
-    "recolor-line",
-    "tint-cycle",
-    "hide-group",
-    "show-group",
-    "toggle-hidden",
-];
 
 struct WindowState {
     window: Arc<Window>,
@@ -116,6 +98,10 @@ struct WindowState {
     saw_device_delta: bool,
     /// Last cursor position, physical px (click picks use it).
     cursor: (f32, f32),
+    /// Stage M: tracked from WindowEvent::ModifiersChanged — winit 0.30
+    /// removed KeyEvent's modifiers field, and chord hotkeys (Cmd/Ctrl-K)
+    /// need them app-level.
+    modifiers: winit::keyboard::ModifiersState,
     last_frame: Instant,
     /// Stage K (K6): frames presented since startup (the `--screenshot-frame`
     /// counter — distinct from `frames`, which the FPS line resets every
@@ -372,6 +358,10 @@ impl WindowState {
         // borrow ends.
         #[cfg(feature = "egui-ui")]
         let mut egui_wants_input = false;
+        // Stage M: commands collected by this frame's UI build; executed
+        // after the egui pass closes (loop below the block).
+        #[cfg(feature = "egui-ui")]
+        let mut commands: Vec<crate::ui::Command> = Vec::new();
         #[cfg(feature = "egui-ui")]
         if let Some(egui) = self.egui.as_mut() {
             let raw_input = egui.state.take_egui_input(&self.window);
@@ -382,188 +372,19 @@ impl WindowState {
             // unborrowed across the UI build).
             let probe_snap = self.ui_probe.as_ref().map(|p| p.borrow().clone());
             let fps = self.ui_fps;
-            // K4: hoist the panel-state borrows so the Window builder and the
-            // inner closure capture disjoint fields.
-            let debug_open = &mut egui.debug_open;
-            let scratch = &mut egui.scratch;
-            let filter = &mut egui.filter;
-            let selected_group = &mut egui.selected_group;
+            // Stage M: build one interface frame INSIDE the egui pass
+            // (panels must register against an active pass). draw_ui is pure
+            // (input, state) → commands; execution happens after the pass
+            // closes, through the bus below — one place where intents become
+            // effects, so the console log records exactly that stream.
+            let ui_input = crate::ui::UiInput {
+                probe: probe_snap,
+                probe_cell: self.ui_probe.clone(),
+                fps,
+                instances: self.scene.instance_count(),
+            };
             let full_output = egui_ctx.run_ui(raw_input, |root_ui| {
-                // K1 leftover REMOVED (stage-k fix): the empty
-                // `CentralPanel::default()` paints an OPAQUE full-viewport
-                // panel_fill rect that blanketed the 3D scene — "background
-                // layer" only affects input order, not fill. With real
-                // windows present it is vestigial; no CentralPanel is needed
-                // (egui::Window shows fine without one).
-                // K3: the Debug window. Every scene-facing call below is the
-                // exact API the CLI ops use — verb buttons parse CLI-literal
-                // strings through crate::parse_verb and call
-                // SceneLike::apply_verb; the determinism chain never learns
-                // egui exists.
-                egui::Window::new("Debug")
-                    .id(egui::Id::new("stage_k_debug_panel"))
-                    .open(debug_open)
-                    .show(root_ui.ctx(), |ui| {
-                        ui.label(format!("FPS: {fps:.1}"));
-                        match &probe_snap {
-                            Some(snap) => {
-                                let mode = match snap.camera_mode {
-                                    Some(crate::glyph_scene::CameraMode::Front { zoom }) => {
-                                        format!("Front(zoom {zoom:.2})")
-                                    }
-                                    Some(crate::glyph_scene::CameraMode::Orbit) => {
-                                        "Orbit".to_string()
-                                    }
-                                    Some(crate::glyph_scene::CameraMode::Fly) => "Fly".to_string(),
-                                    None => "—".to_string(),
-                                };
-                                ui.label(format!(
-                                    "camera: {mode} eye=({:.2},{:.2},{:.2}) yaw={:.3} pitch={:.3}",
-                                    snap.eye[0], snap.eye[1], snap.eye[2], snap.yaw, snap.pitch,
-                                ));
-                                ui.label(
-                                    snap.last_pick
-                                        .as_deref()
-                                        .unwrap_or("pick: (none yet — left-click a glyph)"),
-                                );
-                            }
-                            None => {
-                                ui.label("camera/pick: n/a (demo scene has no probe)");
-                            }
-                        }
-                        ui.separator();
-                        ui.label("verbs (same strings --verb parses):");
-                        ui.horizontal_wrapped(|ui| {
-                            for spec in PANEL_VERBS {
-                                if ui.button(*spec).clicked() {
-                                    let verb = crate::parse_verb(spec)
-                                        .expect("panel verb literal must parse like the CLI");
-                                    if let Some(line) = self.scene.apply_verb(ctx, &verb) {
-                                        println!("{line}");
-                                    }
-                                }
-                            }
-                        });
-                        // K4: live cull/LOD tuning — the slider writes the
-                        // shared probe cell; GlyphScene::render applies it to
-                        // CullState's Cell before culling (same frame). The
-                        // readouts are the sums GLYPH_CULL_DEBUG prints.
-                        if let (Some(snap), Some(cell)) = (&probe_snap, &self.ui_probe) {
-                            ui.separator();
-                            ui.label("cull/LOD — live, windowed only (offscreen keeps consts):");
-                            // Range brackets the const default (1.0 px/em) with
-                            // ~2 octaves each way; logarithmic because the
-                            // threshold is a perceptual scale.
-                            ui.add(
-                                egui::Slider::new(&mut cell.borrow_mut().lod_min_px, 0.25..=16.0)
-                                    .logarithmic(true)
-                                    .text("LOD_MIN_PX px/em (const 1.0)"),
-                            );
-                            ui.label(format!(
-                                "cull: {} draw ranges, {} instances | {} backdrops",
-                                snap.cull_ranges, snap.cull_instances, snap.cull_backdrops
-                            ));
-                        }
-                        ui.separator();
-                        ui.label("K2 typing test — WASD/h/g/t/x here must not move the scene:");
-                        ui.text_edit_singleline(scratch);
-                        // K5: group browser — FLAT virtualized list
-                        // (ScrollArea::show_rows builds only the visible
-                        // rows; a CollapsingHeader-per-directory tree is NOT
-                        // virtualized and would be the classic egui
-                        // large-list trap at ~1.3k files). Vanilla egui — no
-                        // new deps (fence 2). Row click = select + fly-to
-                        // via the exact --cam-pose API (set_cam_pose);
-                        // framing mirrors camera_eye_target's Front formula.
-                        if let Some(snap) = &probe_snap {
-                            if !snap.files.is_empty() {
-                                ui.separator();
-                                ui.label(format!(
-                                    "files: {} (click = select + fly to file)",
-                                    snap.files.len()
-                                ));
-                                ui.horizontal(|ui| {
-                                    ui.label("filter:");
-                                    ui.text_edit_singleline(filter);
-                                });
-                                let needle = filter.to_lowercase();
-                                let idxs: Vec<usize> = snap
-                                    .files
-                                    .iter()
-                                    .enumerate()
-                                    .filter(|(_, r)| {
-                                        needle.is_empty()
-                                            || r.rel_path.to_lowercase().contains(&needle)
-                                    })
-                                    .map(|(i, _)| i)
-                                    .collect();
-                                let row_h = ui.text_style_height(&egui::TextStyle::Body);
-                                let viewport_aspect =
-                                    self.config.width as f32 / self.config.height.max(1) as f32;
-                                egui::ScrollArea::vertical()
-                                    .max_height(280.0)
-                                    .show_rows(ui, row_h, idxs.len(), |ui, range| {
-                                        for &i in &idxs[range] {
-                                            let row = &snap.files[i];
-                                            let dynst =
-                                                snap.file_dyn.get(i).copied().unwrap_or_default();
-                                            let depth = row.rel_path.matches('/').count();
-                                            ui.horizontal(|ui| {
-                                                // Tint swatch drawn, not
-                                                // typeset (no font-glyph
-                                                // dependency).
-                                                let (rect, _) = ui.allocate_exact_size(
-                                                    egui::vec2(10.0, 10.0),
-                                                    egui::Sense::hover(),
-                                                );
-                                                ui.painter().rect_filled(
-                                                    rect,
-                                                    2.0,
-                                                    egui::Color32::from_rgb(
-                                                        dynst.tint[0],
-                                                        dynst.tint[1],
-                                                        dynst.tint[2],
-                                                    ),
-                                                );
-                                                let label = format!(
-                                                    "{}{}{}",
-                                                    "  ".repeat(depth),
-                                                    row.rel_path,
-                                                    if dynst.hidden { "  (hidden)" } else { "" },
-                                                );
-                                                let resp = ui.selectable_label(
-                                                    *selected_group == Some(row.group_id),
-                                                    label,
-                                                );
-                                                if resp.clicked() {
-                                                    *selected_group = Some(row.group_id);
-                                                    // Front-camera framing
-                                                    // (camera_eye_target):
-                                                    // fit the AABB, margin
-                                                    // 1.08 + 2.0, text plane
-                                                    // faces +Z.
-                                                    let half_h_needed = dynst
-                                                        .half[1]
-                                                        .max(dynst.half[0] / viewport_aspect);
-                                                    let dist = half_h_needed
-                                                        / (crate::glyph_scene::FOV_Y
-                                                            .to_radians()
-                                                            * 0.5)
-                                                            .tan()
-                                                        * 1.08
-                                                        + 2.0;
-                                                    self.scene.set_cam_pose(
-                                                        [dynst.center[0], dynst.center[1], dist],
-                                                        0.0,
-                                                        0.0,
-                                                    );
-                                                }
-                                            });
-                                        }
-                                    });
-                            }
-                        }
-                    });
+                commands = crate::ui::draw_ui(root_ui, &ui_input, &mut egui.ui_state);
             });
             let egui::FullOutput {
                 platform_output,
@@ -630,6 +451,15 @@ impl WindowState {
             egui_textures_delta = Some(textures_delta);
             egui_wants_input =
                 egui.ctx.egui_wants_pointer_input() || egui.ctx.egui_wants_keyboard_input();
+        }
+
+        // Stage M: run the frame's commands. The egui block held &mut self's
+        // egui field; here, after the pass closes and before queue.submit,
+        // verb buffer-writes land in this frame's submission — the same
+        // record→write→submit ordering K3's in-closure buttons had.
+        #[cfg(feature = "egui-ui")]
+        for cmd in commands.drain(..) {
+            self.execute(ctx, cmd);
         }
 
         // Stage K (K2): UI focus and the mouse-look grab cannot coexist —
@@ -726,6 +556,106 @@ impl WindowState {
         }
     }
 
+    /// Stage M: the command-bus executor — the single place where user
+    /// intents become effects. Every scene-facing branch calls the exact API
+    /// the CLI op-stream uses; the console log records the echo plus the
+    /// same result line the CLI op prints, so console and stdout tell one
+    /// story (and panel ⇔ CLI equivalence stays checkable by eye).
+    #[cfg(feature = "egui-ui")]
+    fn execute(&mut self, ctx: &GpuContext, cmd: crate::ui::Command) {
+        use crate::ui::{format_command, help_text, Command, LogKind, PanelId};
+        let echo = format_command(&cmd);
+        let (result, error): (Option<String>, Option<String>) = match cmd {
+            Command::Verb(v) => (self.scene.apply_verb(ctx, &v), None),
+            Command::PickRowCol { file, row, col } => (
+                self.scene.apply_pick(
+                    ctx,
+                    &crate::glyph_scene::PickCommand::RowCol { file, row, col },
+                ),
+                None,
+            ),
+            Command::FlyFile(substr) => match self.fly_to_file(&substr) {
+                Ok(line) => (Some(line), None),
+                Err(e) => (None, Some(e)),
+            },
+            Command::FlyFileBox { center, half } => {
+                let aspect = self.config.width as f32 / self.config.height.max(1) as f32;
+                let (eye, yaw, pitch) = crate::ui::fly_to_framing(center, half, aspect);
+                self.scene.set_cam_pose(eye, yaw, pitch);
+                (
+                    Some(format!(
+                        "camera: framed ({:.1}, {:.1}) at dist {:.1}",
+                        center[0], center[1], eye[2]
+                    )),
+                    None,
+                )
+            }
+            Command::Screenshot => {
+                self.capture_pending = Some(windowed_shot_path());
+                (None, None)
+            }
+            Command::TogglePanel(p) => match self.egui.as_mut() {
+                Some(egui) => {
+                    let flag = match p {
+                        PanelId::Files => &mut egui.ui_state.files_open,
+                        PanelId::Inspector => &mut egui.ui_state.inspector_open,
+                        PanelId::Console => &mut egui.ui_state.console_open,
+                    };
+                    *flag = !*flag;
+                    (Some(format!("panel {}: now {}", p.name(), *flag)), None)
+                }
+                None => (None, None),
+            },
+            Command::Help => {
+                if let Some(egui) = self.egui.as_mut() {
+                    for line in help_text().split('\n') {
+                        egui.ui_state.log(LogKind::Info, line);
+                    }
+                }
+                (None, None)
+            }
+            Command::ClearLog => {
+                if let Some(egui) = self.egui.as_mut() {
+                    egui.ui_state.log.clear();
+                }
+                (None, None)
+            }
+        };
+        if let Some(egui) = self.egui.as_mut() {
+            egui.ui_state.log(LogKind::Cmd, echo);
+            if let Some(line) = result {
+                println!("{line}");
+                egui.ui_state.log(LogKind::Result, line);
+            }
+            if let Some(e) = error {
+                egui.ui_state.log(LogKind::Error, e);
+            }
+        }
+    }
+
+    /// Resolve `fly <substr>` against the probe's group table and frame the
+    /// first match with the K5 formula (live viewport aspect).
+    #[cfg(feature = "egui-ui")]
+    fn fly_to_file(&mut self, substr: &str) -> Result<String, String> {
+        let Some(probe) = self.ui_probe.as_ref() else {
+            return Err("fly: no group table (demo scene has no files)".to_string());
+        };
+        let probe = probe.borrow();
+        let Some(idx) = probe.files.iter().position(|r| r.rel_path.contains(substr)) else {
+            return Err(format!("fly: no file matches {substr:?}"));
+        };
+        let rel = probe.files[idx].rel_path.clone();
+        let dynst = probe.file_dyn.get(idx).copied().unwrap_or_default();
+        // End the RefCell borrow before touching the scene — the K4 slider
+        // holds borrow_muts only inside the egui pass, but keeping shared
+        // borrows short is the rule that makes that safe.
+        drop(probe);
+        let aspect = self.config.width as f32 / self.config.height.max(1) as f32;
+        let (eye, yaw, pitch) = crate::ui::fly_to_framing(dynst.center, dynst.half, aspect);
+        self.scene.set_cam_pose(eye, yaw, pitch);
+        Ok(format!("camera: fly {rel} (dist {:.1})", eye[2]))
+    }
+
     /// Wall-clock animation time (windowed mode is not determinism-bound).
     fn time(&self) -> f32 {
         self.start.elapsed().as_secs_f32()
@@ -758,7 +688,7 @@ impl ApplicationHandler for App<'_> {
             event_loop
                 .create_window(
                     Window::default_attributes()
-                        .with_title("glyph3d-native — Stage F (fly camera + GPU cull/LOD)")
+                        .with_title("glyph3d-native — glyph field + interface shell")
                         .with_inner_size(winit::dpi::LogicalSize::new(1600.0, 1000.0)),
                 )
                 .expect("window creation failed"),
@@ -830,10 +760,16 @@ impl ApplicationHandler for App<'_> {
                 ctx: egui_ctx,
                 state,
                 renderer,
-                scratch: String::new(),
-                debug_open: true,
-                filter: String::new(),
-                selected_group: None,
+                // Seed the log so the console is never a blank void on first
+                // open — it teaches the two entry points and `help`.
+                ui_state: {
+                    let mut s = crate::ui::UiState::default();
+                    s.log(
+                        crate::ui::LogKind::Info,
+                        "shell ready — F1 toggle · ⌘K palette · type help below",
+                    );
+                    s
+                },
             })
         } else {
             None
@@ -866,7 +802,10 @@ impl ApplicationHandler for App<'_> {
         );
         #[cfg(feature = "egui-ui")]
         if self.ui {
-            println!("debug panel: F1 toggles the egui Debug window (sliders tune LOD_MIN_PX live)");
+            println!(
+                "ui shell: F1 toggle | Cmd/Ctrl-K palette | panels: files · inspector · console | \
+                 verbs via palette buttons or the console input (help lists the grammar)"
+            );
         }
         println!("screenshot: F2 saves the next presented frame to out/windowed-shot-<timestamp>.png");
 
@@ -897,6 +836,7 @@ impl ApplicationHandler for App<'_> {
             grabbed: false,
             saw_device_delta: false,
             cursor: (0.0, 0.0),
+            modifiers: winit::keyboard::ModifiersState::empty(),
             last_frame: Instant::now(),
             frames_total: 0,
             shot_at_frame: self.shot.clone(),
@@ -933,14 +873,18 @@ impl ApplicationHandler for App<'_> {
         let egui_consumed = false;
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
+            // Tracked BEFORE the egui-consumed arm: egui_winit also reads
+            // ModifiersChanged, but our tracker must never miss an update.
+            WindowEvent::ModifiersChanged(m) => state.modifiers = m.state(),
             WindowEvent::Resized(size) => {
                 state.resize(&self.ctx, size.width, size.height);
                 state.scene.set_viewport(size.width, size.height);
             }
             WindowEvent::RedrawRequested => state.render(&self.ctx),
-            // Stage K (K6): F2 = capture the next presented frame to PNG.
-            // App-level hotkey that must work REGARDLESS of egui focus (e.g.
-            // while typing in the scratch field), so it matches ABOVE the
+            // Stage K (K6)/Stage M: F2 = capture the next presented frame to
+            // PNG (the console `shot` command lands here too). App-level
+            // hotkey that must work REGARDLESS of egui focus (e.g. while
+            // typing in the console input), so it matches ABOVE the
             // egui-consumed arm — unlike F1, which deliberately yields to a
             // focused field. egui still saw the event first (the feed at the
             // top); it ignores F2.
@@ -948,16 +892,26 @@ impl ApplicationHandler for App<'_> {
                 if event.state == ElementState::Pressed
                     && matches!(event.physical_key, PhysicalKey::Code(KeyCode::F2)) =>
             {
-                // Anchor at the repo root's out/ (CARGO_MANIFEST_DIR is
-                // native/), not the process cwd — running from native/ used
-                // to scatter shots into native/out/.
-                state.capture_pending = Some(std::path::PathBuf::from(concat!(
-                    env!("CARGO_MANIFEST_DIR"),
-                    "/../out"
-                )).join(format!(
-                    "windowed-shot-{}.png",
-                    utc_stamp(std::time::SystemTime::now())
-                )));
+                state.capture_pending = Some(windowed_shot_path());
+            }
+            // Stage M: Cmd/Ctrl-K toggles the palette — app-level like F2 so
+            // it fires even from a focused text field (a chord never types).
+            // Opening the palette also un-hides the shell: a palette over a
+            // bare field is the web app's CommandBar posture.
+            WindowEvent::KeyboardInput { event, .. }
+                if event.state == ElementState::Pressed
+                    && matches!(event.physical_key, PhysicalKey::Code(KeyCode::KeyK))
+                    && (state.modifiers.super_key() || state.modifiers.control_key()) =>
+            {
+                if let Some(egui) = state.egui.as_mut() {
+                    egui.ui_state.palette_open = !egui.ui_state.palette_open;
+                    if egui.ui_state.palette_open {
+                        egui.ui_state.shell_open = true;
+                    } else {
+                        egui.ui_state.palette_query.clear();
+                        egui.ui_state.palette_selected = 0;
+                    }
+                }
             }
             // Stage K (K2): right-RELEASE always ungrabs, even when egui
             // consumed the event (e.g. the release landed on a panel).
@@ -973,13 +927,17 @@ impl ApplicationHandler for App<'_> {
             WindowEvent::KeyboardInput { event, .. } => {
                 if let PhysicalKey::Code(code) = event.physical_key {
                     let pressed = event.state == ElementState::Pressed;
-                    // Stage K (K4): F1 toggles the Debug window — never scene
-                    // input. (With the scratch field focused, egui consumes
-                    // F1 first; release focus with Esc, then F1.)
+                    // Stage M: F1 toggles the whole interface shell (the K3
+                    // Debug window's content lives on inside the panels).
+                    // Never scene input. (With a text field focused, egui
+                    // consumes F1 first; release focus with Esc, then F1.)
                     #[cfg(feature = "egui-ui")]
                     if code == KeyCode::F1 && pressed {
                         if let Some(egui) = state.egui.as_mut() {
-                            egui.debug_open = !egui.debug_open;
+                            egui.ui_state.shell_open = !egui.ui_state.shell_open;
+                            if !egui.ui_state.shell_open {
+                                egui.ui_state.palette_open = false;
+                            }
                         }
                         return;
                     }
@@ -1072,6 +1030,16 @@ impl ApplicationHandler for App<'_> {
             state.window.request_redraw(); // continuous render loop
         }
     }
+}
+
+/// Stage M: the F2 / console `shot` destination — repo-root out/ (the K6
+/// anchoring rule: CARGO_MANIFEST_DIR is native/, and running from native/
+/// used to scatter shots into native/out/), utc-stamped.
+fn windowed_shot_path() -> std::path::PathBuf {
+    std::path::PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../out")).join(format!(
+        "windowed-shot-{}.png",
+        utc_stamp(std::time::SystemTime::now())
+    ))
 }
 
 /// Stage K (K6): `yyyymmdd-hhmmss` UTC stamp for shot filenames (no chrono

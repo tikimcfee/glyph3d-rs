@@ -18,6 +18,9 @@
 //!          baseline views moved onto the immutable fixtures/baseline-view.txt.
 //! Stage K: egui 0.36 overlay on the windowed renderer (K1: deps + plumbing
 //!          with an empty UI; `--no-ui` gives exact pre-K windowed behavior).
+//! Stage M: the interface shell (`ui.rs`) — command bus, docked panels
+//!          (HUD/files/inspector/console), ⌘K palette; F1 toggles the shell.
+//!          Offscreen is untouched (the byte-equality oracle for this too).
 //!
 //! Run modes:
 //!   (default) [--render-file <path>] [--copies N]
@@ -35,6 +38,8 @@ mod offscreen;
 mod repo;
 mod scene;
 mod text;
+#[cfg(feature = "egui-ui")]
+mod ui;
 mod windowed;
 
 use std::path::{Path, PathBuf};
@@ -202,8 +207,9 @@ VERBS (--verb \"V [ARGS]\", repeatable; applies to the most recent pick):
 WINDOWED MODE:
   fly camera — WASD move, E|R up, Q|F down, RIGHT-drag look, scroll = speed,
   Esc releases | interact: LEFT click = pick glyph, h highlight line,
-  g grab file (mouse drags, scroll scales), t tint, x hide |
-  F1 toggle Debug panel, F2 save screenshot (out/windowed-shot-*.png) |
+  g grab file (mouse drags, scroll scales), t tint, x hide/show |
+  F1 toggle the UI shell (HUD/files/inspector/console), Cmd/Ctrl-K palette,
+  F2 save screenshot (out/windowed-shot-*.png) |
   --screenshot-frame N --screenshot-out PATH: scripted capture, keeps running";
 
 /// Stage H: clap-derive CLI. Semantics (flags, defaults, op-stream order) are
@@ -360,7 +366,9 @@ fn set_pick_row_col(ops: &mut Vec<Op>, row: Option<u32>, col: Option<u32>) {
 ///   move-group dx dy dz         scale-group s
 ///   tint-group rrggbb           tint-cycle
 ///   hide-group | show-group | toggle-hidden
-fn parse_verb(s: &str) -> Result<Verb, String> {
+/// Stage M: also the grammar of the UI shell (console/palette/panels) — one
+/// parser, so panel ⇔ CLI equivalence is by construction.
+pub(crate) fn parse_verb(s: &str) -> Result<Verb, String> {
     let t: Vec<&str> = s.split_whitespace().collect();
     let usage = format!(
         "unknown/malformed --verb {s:?} — expected recolor-glyph|recolor-line|\
