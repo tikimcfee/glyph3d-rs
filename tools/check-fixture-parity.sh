@@ -14,6 +14,12 @@
 #   Rust: glyph3d-native --fixture-manifest
 #   Mojo: engine/fixture_manifest.mojo
 #
+# Plus the trie rebuild (--fixture-trie, stage 1): every fixture's trie rebuilt
+# from its own BYTES by the ported GlyphTrie and compared through the wire-order
+# serializer against the trie the oracle stored. Not a round trip — nothing of
+# the stored trie's structure is handed back to the builder, so block layout,
+# insertion ORDER and the decoder choice are all under test.
+#
 # Plus the corpus diff (--fixture-diff): text.rs's CPU fold laid against every
 # fixture inside its domain and compared BIT-EXACT to the oracle's own expected
 # lanes. That half fails if NOTHING was in domain, because a differ that
@@ -51,6 +57,12 @@ else
     echo "FAIL  parse parity — the two loaders disagree:"
     diff -u "$MOJO" "$RUST" | head -20
     FAIL=1
+fi
+
+if OUT=$("$BIN" --fixture-trie "${FIX[@]}" 2>&1); then
+    echo "PASS  trie rebuild — $(echo "$OUT" | tail -1)"
+else
+    echo "FAIL  trie rebuild:"; echo "$OUT" | tail -20; FAIL=1
 fi
 
 if OUT=$("$BIN" --fixture-diff "${FIX[@]}" 2>&1); then

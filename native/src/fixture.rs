@@ -26,6 +26,7 @@
 use std::fmt::Write as _;
 use std::path::Path;
 
+use crate::glyph_trie::{build_glyph_trie, GlyphMetrics, BLOCK_SHIFT, ENTRY_LANES};
 use crate::text::{ResolveGlyph, WorldEntry};
 
 /// 'G3DF' — a pipeline fixture.
@@ -210,9 +211,6 @@ pub struct FixtureTrie {
     /// identity + bitfield, 2 per entry: [GLYPH_ID, FLAGS]
     pub blocks_c: Vec<u32>,
 }
-
-/// Must match BLOCK_SHIFT in glyph_pipeline.mojo.
-const BLOCK_SHIFT: u32 = 8;
 
 impl ResolveGlyph for FixtureTrie {
     /// The same two dependent loads as `TrieTable::lookup`, including the
@@ -801,6 +799,164 @@ pub fn diff_against_reference_layout(fx: &PipeFixture) -> DiffOutcome {
         skipped: None,
         records: glyphs.len(),
         compared_lanes: positions.len() * (REF_MEASURE_LANES.len() + REF_COUNT_LANES.len()),
+        bad,
+    }
+}
+
+// ── Stage 1: rebuilding a fixture's trie from its own bytes ───────────────
+//
+// THE RECIPE lives in engine/fixtures/gen.mjs, which is vendored in this tree,
+// so the whole input is reconstructible here: the codepoint set comes from the
+// fixture's own bytes and the metrics are a pure function of the codepoint.
+// That makes this a real acceptance test rather than a round trip — the input
+// is raw bytes and the expected output is the oracle's trie, with nothing of
+// the trie's own structure handed back to the builder.
+
+/// `MISSING_ADVANCE` / `MISSING_HEIGHT` from gen.mjs — `Math.fround(0.61)` and
+/// `Math.fround(1.25)`, which are these f32 literals.
+pub const FIXTURE_MISSING_ADVANCE: f32 = 0.61;
+pub const FIXTURE_MISSING_HEIGHT: f32 = 1.25;
+
+/// gen.mjs's `metricsFor`: synthetic metrics with awkward f32 mantissas, so
+/// every advance-sum exercises real rounding. `'@'` is deliberately unmapped
+/// (the F_MISSING path) and emoji advance is doubled (the "x is a lookup, not a
+/// multiply" case).
+///
+/// FLOAT DISCIPLINE: `Math.fround(expr)` evaluates `expr` in f64 and narrows
+/// ONCE. Writing these in f32 throughout would round at every operator and
+/// diverge — the same hazard as landmine 2, one layer earlier.
+pub fn fixture_metrics(cp: u32) -> Option<GlyphMetrics> {
+    if cp == 0x40 {
+        return None; // '@'
+    }
+    let emoji = cp >= 0x1F300;
+    let advance = ((0.6 + (cp % 13) as f64 * 0.0173) * if emoji { 2.0 } else { 1.0 }) as f32;
+    let height = (1.2 + (cp % 7) as f64 * 0.031) as f32;
+    Some(GlyphMetrics {
+        glyph_id: (cp % 4093) + 1,
+        advance,
+        height,
+    })
+}
+
+/// The codepoints gen.mjs would feed the builder, IN ORDER.
+///
+/// Order is load-bearing (landmine 1), and this is where it comes from: gen.mjs
+/// decodes with `new TextDecoder('utf-8', {fatal: false})` and collects into a
+/// JS `Set`, which preserves first-insertion order.
+///
+/// `from_utf8_lossy` is the right counterpart precisely BECAUSE it is the
+/// conformant WHATWG replacement decoder, unlike the engine's lenient
+/// classifier — it is deriving the trie's key set, not folding text. The two
+/// decoders must not be confused for each other, and `malformed.pipe.bin`
+/// (stray continuations, an invalid byte, a truncated sequence) is what proves
+/// this one is right.
+///
+/// gen.mjs adds U+FFFD to the set and then deletes it; skipping it here is the
+/// same net effect, including for a literal U+FFFD in the source.
+pub fn fixture_codepoints(bytes: &[u8]) -> Vec<u32> {
+    let text = String::from_utf8_lossy(bytes);
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for ch in text.chars() {
+        let cp = ch as u32;
+        if cp == 0xFFFD {
+            continue;
+        }
+        if seen.insert(cp) {
+            out.push(cp);
+        }
+    }
+    out
+}
+
+/// What a rebuild found, for reporting.
+pub struct TrieRebuild {
+    pub entries: usize,
+    pub block_count: usize,
+    pub mapped: usize,
+    pub bad: Vec<String>,
+}
+
+/// Rebuild this fixture's trie from its BYTES and diff against the trie the
+/// oracle stored.
+///
+/// The comparison goes through `wire_value`, not through the storage arrays
+/// directly. That is deliberate: the fixture format IS wire order
+/// ([GLYPH_ID, ADVANCE, HEIGHT, FLAGS]) and `wire_value` is the single place
+/// that mapping lives, so a transposed lane in the serializer fails here.
+/// Comparing the split arrays element-wise would have skipped the mapping
+/// entirely — checking the values while assuming the thing that orders them.
+///
+/// Widening the fixture's side to f64 is lossless (f32 and u32 both fit
+/// exactly), so no rounding is introduced by the comparison itself.
+pub fn rebuild_trie_and_diff(fx: &PipeFixture) -> TrieRebuild {
+    let built = build_glyph_trie(
+        fixture_codepoints(&fx.bytes),
+        fixture_metrics,
+        FIXTURE_MISSING_ADVANCE,
+        FIXTURE_MISSING_HEIGHT,
+    );
+    let mut bad = Vec::new();
+    let entries = fx.trie.blocks_c.len() / 2;
+
+    if built.block_index.len() != fx.trie.block_index.len() {
+        bad.push(format!(
+            "block_index length: built {} vs fixture {}",
+            built.block_index.len(),
+            fx.trie.block_index.len()
+        ));
+    } else {
+        for (b, (&g, &e)) in built
+            .block_index
+            .iter()
+            .zip(fx.trie.block_index.iter())
+            .enumerate()
+        {
+            if g != e {
+                bad.push(format!(
+                    "block_index[{b}] (cp {:#x}..): built {g} vs fixture {e}",
+                    b << BLOCK_SHIFT
+                ));
+            }
+        }
+    }
+
+    if built.wire_len() != entries * ENTRY_LANES {
+        bad.push(format!(
+            "entry count: built {} vs fixture {entries}",
+            built.wire_len() / ENTRY_LANES
+        ));
+        return TrieRebuild {
+            entries: 0,
+            block_count: built.block_count,
+            mapped: built.mapped,
+            bad,
+        };
+    }
+
+    for i in 0..entries * ENTRY_LANES {
+        let e = i / ENTRY_LANES;
+        let want: f64 = match i % ENTRY_LANES {
+            0 => fx.trie.blocks_c[e * 2] as f64,
+            1 => fx.trie.blocks_m[e * 2] as f64,
+            2 => fx.trie.blocks_m[e * 2 + 1] as f64,
+            _ => fx.trie.blocks_c[e * 2 + 1] as f64,
+        };
+        let got = built.wire_value(i);
+        if got.to_bits() != want.to_bits() {
+            bad.push(format!(
+                "entry {e} lane {} ({}): built {got} vs fixture {want}",
+                i % ENTRY_LANES,
+                ["GLYPH_ID", "ADVANCE", "HEIGHT", "FLAGS"][i % ENTRY_LANES],
+            ));
+        }
+    }
+
+    TrieRebuild {
+        entries,
+        block_count: built.block_count,
+        mapped: built.mapped,
         bad,
     }
 }

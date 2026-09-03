@@ -30,6 +30,7 @@
 mod atlas;
 mod engine;
 mod fixture;
+mod glyph_trie;
 mod gpu;
 mod glyph_scene;
 mod offscreen;
@@ -264,6 +265,10 @@ struct Cli {
     /// BIT-EXACT against the oracle's own expected lanes, then exit.
     #[arg(long, value_name = "PATH", num_args = 1..)]
     fixture_diff: Vec<PathBuf>,
+    /// Stage 1: rebuild each .pipe.bin's trie from its own bytes with the
+    /// ported GlyphTrie and diff against the trie the oracle stored, then exit.
+    #[arg(long, value_name = "PATH", num_args = 1..)]
+    fixture_trie: Vec<PathBuf>,
     /// Stage E2: load a whole repository as a field of code pages
     #[arg(long, value_name = "DIR")]
     load_repo: Option<PathBuf>,
@@ -589,6 +594,50 @@ fn run_fixture_manifest(paths: &[PathBuf]) -> ! {
     std::process::exit(0);
 }
 
+/// Stage 1: rebuild every fixture's trie from its bytes and diff it against the
+/// one the oracle stored.
+///
+/// NOT a round trip: the input is the fixture's raw BYTES plus gen.mjs's pure
+/// metrics function, and nothing about the stored trie's structure is handed
+/// back to the builder. So the block layout, the content dedup and — the part
+/// that matters — the INSERTION ORDER are all under test.
+fn run_fixture_trie(paths: &[PathBuf]) -> ! {
+    let mut entries = 0usize;
+    let mut failed = 0usize;
+    for p in paths {
+        let fx = match fixture::load_pipe_fixture(p) {
+            Ok(fx) => fx,
+            Err(e) => {
+                eprintln!("fixture-trie FAIL: {e}");
+                std::process::exit(1);
+            }
+        };
+        let r = fixture::rebuild_trie_and_diff(&fx);
+        if r.bad.is_empty() {
+            println!(
+                "  PASS {:<26} {} entries / {} blocks / {} mapped cps — value-identical",
+                fx.name, r.entries, r.block_count, r.mapped
+            );
+            entries += r.entries;
+        } else {
+            failed += 1;
+            println!("  FAIL {:<26} {} disagreement(s)", fx.name, r.bad.len());
+            for line in r.bad.iter().take(8) {
+                println!("       {line}");
+            }
+        }
+    }
+    if failed > 0 {
+        eprintln!("fixture-trie FAIL: {failed}/{} fixtures differ", paths.len());
+        std::process::exit(1);
+    }
+    println!(
+        "fixture-trie PASS: {} fixture(s), {entries} trie entries rebuilt from bytes",
+        paths.len()
+    );
+    std::process::exit(0);
+}
+
 /// Stage 0: hold text.rs's CPU fold to the fixture corpus, bit-exact.
 ///
 /// Out-of-domain fixtures are SKIPPED WITH A REASON rather than silently
@@ -658,6 +707,9 @@ fn main() {
     }
     if !cli.fixture_diff.is_empty() {
         run_fixture_diff(&cli.fixture_diff);
+    }
+    if !cli.fixture_trie.is_empty() {
+        run_fixture_trie(&cli.fixture_trie);
     }
 
     // Stage E1: engine ↔ CPU-reference cross-check — no GPU involved.

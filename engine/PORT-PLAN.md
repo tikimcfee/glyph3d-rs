@@ -40,7 +40,7 @@ instead of a promise.
 | stage | work | acceptance | risk |
 |---|---|---|---|
 | **0** ✅ | Rust `.pipe.bin` reader + bit-exact differ | reads all 14 fixtures; counts agree with `engine/fixture_io.mojo` | none, pure plumbing |
-| **1** | `GlyphTrie` -> Rust | rebuilds a fixture's trie BYTES | the ordering landmine |
+| **1** ✅ | `GlyphTrie` -> Rust | rebuilds a fixture's trie BYTES | the ordering landmine |
 | **2** | serial fold -> Rust | fixture expected measures BIT-EXACT | the float discipline |
 | **3** | scan form -> Rust | tiered agreement with stage 2 | monoid associativity |
 | **4** | bake -> Rust | the 8 `.bake.bin` fixtures | lowest |
@@ -71,7 +71,33 @@ Two things fell out that stage 2 inherits:
    code that can trip it gets written.
 
 The domain is a PREDICATE (`out_of_domain`), not a file list, so widening the
-fold in stage 2 automatically widens what it is held to. Six mutations were run
+fold in stage 2 automatically widens what it is held to.
+
+**Stage 1 is DONE** (2026-09-03). `native/src/glyph_trie.rs` is the port;
+`--fixture-trie` rebuilds every fixture's trie from its own BYTES and compares
+through `wire_value`, the single place wire order lives — so a transposed lane
+in the serializer fails, which comparing the split arrays element-wise would
+have missed. **14 fixtures, 11520 entries, 45 blocks** including `real-kernels`
+at 7, where insertion order genuinely bites.
+
+The input recipe is reconstructible in-tree because `gen.mjs` is vendored: the
+codepoint set comes from the fixture's own bytes and the metrics are a pure
+function of the codepoint. Two things that recipe pinned down:
+
+- **The codepoint derivation uses the CONFORMANT decoder**, not the engine's
+  lenient classifier — `gen.mjs` collects from
+  `new TextDecoder('utf-8', {fatal:false})`, so `String::from_utf8_lossy` is the
+  Rust counterpart. The two must not be confused: swapping in the lenient
+  classifier reddens `malformed.pipe.bin` (it yields U+20A2 from a truncated
+  3-byte sequence where WHATWG yields U+FFFD, which is then dropped). That
+  fixture resolving to exactly 5 mapped codepoints is the WHATWG answer.
+- **`Math.fround(expr)` narrows ONCE**, after an f64 evaluation. Writing
+  `metricsFor` in stepwise f32 reddens ADVANCE at
+  0.7384000420570374 vs 0.7383999824523926 — the same hazard as landmine 2, one
+  layer earlier.
+
+Eight mutations were run; seven reddened and the eighth found the dedup ceiling
+above. Six mutations were run
 against gate 9 — swapped item fields, swapped carrier split, a reordered
 section of identical size, a dropped trailing section, the f32 `line_adv`, and
 every fixture forced out of domain — and all six reddened.
@@ -99,6 +125,28 @@ map.
 Second half of the same landmine: the content-dedup key in JS is a STRING,
 `` `${e.join(',')}|${m.join(',')}` `` — number-to-string formatting Rust cannot
 reproduce and should not try. Key on the raw bit patterns instead.
+
+**RESOLVED in stage 1** (`native/src/glyph_trie.rs`, 2026-09-03). Three findings
+worth carrying forward:
+
+- The grouping is a `Vec` plus an index `HashMap` — insertion-ordered by
+  construction, and NO new dependency in a repo whose gates are byte-exact.
+  `indexmap` was not needed. The `seen` dedup map is a plain `HashMap` because it
+  is never iterated: slots come from `built.len()` at insertion, so its order
+  cannot reach the output. `block_storage_order_follows_codepoint_order` pins the
+  distinction so a future "tidy-up" to a `HashMap`/`BTreeMap` grouping fails
+  there, with a reason, instead of as fourteen unreadable fixture diffs.
+- The bit-pattern key is **strictly finer** than the JS string key: JS renders
+  +0.0 and -0.0 both as `"0"` and would merge two blocks differing only in a
+  zero's sign. No fixture contains a signed-zero measure, so they agree here —
+  but that is the direction of the difference if one ever does.
+- **The corpus cannot discriminate content dedup AT ALL.** Disabling it leaves
+  all 14 fixtures value-identical, because `metricsFor` derives glyph_id from
+  `cp % 4093` and advance/height from `cp % 13` / `cp % 7` — functions of the
+  whole codepoint — so two distinct blocks can never agree. The branch is
+  structurally unreachable for this generator, not merely unexercised, and
+  `identical_blocks_share_one_slot` is the only check covering it. Recorded at
+  the dedup site too; do not read the corpus gate's green as evidence there.
 
 ## LANDMINE 2 — the float discipline is HYBRID, on purpose
 
