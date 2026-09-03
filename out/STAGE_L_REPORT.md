@@ -11,12 +11,12 @@ and the O1/O2 opportunistic steals await explicit approval).
 
 ## Result
 
-**Phase L1 landed (commit `67e93d3`, 2026-09-03):** `GlyphScene`'s
-`CameraUniform` is now `FrameUniform` — 104 B carrying view_proj (pinned at
-offset 0, unchanged 64 B), eye, viewport, px_scale, time, and a reserved
-flags lane — binding to the UNCHANGED WGSL `Camera` block via the
-minimum-binding-size rule. Zero WGSL bytes moved; all eight gates green,
-including the new encase layout pins. L2 next.
+**Phases L1 and L2 landed** (L1 `67e93d3` + report `534e1dd`; L2 `94ee788`;
+2026-09-03): `FrameUniform` carries the frame's values behind the unchanged
+WGSL block, and the draw lists are phase-partitioned (`enum Phase { Backdrop,
+Glyphs }` + `PhaseDraws`) with byte-identical output on BOTH the culled and
+legacy `--no-cull` paths. Owner-approved scope (L1+L2) is complete; L3/L4 and
+O1/O2 await explicit approval.
 
 ---
 
@@ -115,3 +115,70 @@ Cargo.lock untouched.
   `first_instance` fix, DeviceCaps tiers re-run if wasm is greenlit,
   descriptor-keyed pipeline pool past ~8 pipelines, CpuWriteGpuReadBelt if
   uploads reach MBs).
+
+---
+
+## Phase L2 as-executed (commit `94ee788`, glyph_scene.rs +135/−86)
+
+### What moved
+
+- **`enum Phase { Backdrop, Glyphs }`** (near `CullView`, glyph_scene.rs) —
+  re_renderer's DrawPhase borrow: flat enum, per-phase work lists, no render
+  graph. No `Selection`/`Overlay` variants (they arrive WITH their phases;
+  Stage J's no-dead-code rule).
+- **`struct PhaseDraws { backdrops: Vec<BackdropInst>, glyph_ranges:
+  Vec<(u32, Range<u32>) }`** — one frame's draw work, partitioned by phase.
+- **`cull_segments` returns `PhaseDraws` directly** (handoff-literal: the
+  phase lists are built during cull). The per-chunk `Vec<Vec<Range>>` is
+  still constructed inside (the segment loop is chunk-splitting), then
+  flattened **chunk-major** — ascending chunk, arena-ascending ranges within
+  a chunk. This ordering is load-bearing: within-pixel alpha blend order
+  follows record order, and the flat list's record order is identical to the
+  pre-L2 loops. (A segment-major flatten would have reordered draws across
+  chunks and risked blend-order divergence — avoided by construction.)
+- **`render()` recording** iterates `[Phase::Backdrop, Phase::Glyphs]` and
+  matches the phase. Empty phases record nothing: the legacy `--no-cull`
+  branch builds `glyph_ranges` straight from `chunk_counts` (one full range
+  per chunk — identical draw sequence to the pre-L2 loop, bind group set per
+  chunk exactly once) and its empty `backdrops` skips the Backdrop phase just
+  as the pre-L2 legacy branch had no backdrop stream. In the culled path the
+  bind group is re-set only on chunk change; range-less chunks set none
+  (pre-L2: `continue`). Profiler query names unchanged: "glyph field pass",
+  "backdrop stream", "glyph stream".
+- **K4 seams preserved**: `CullView`/`CullState::lod_min_px` untouched; the
+  `GLYPH_CULL_DEBUG` t=0 counters and the Debug-panel probe readouts compute
+  the SAME sums from the flat lists (`glyph_ranges.len()`, range-length sum,
+  `backdrops.len()`).
+- Module header gained an L2 paragraph (and a doc-lint trip: a line starting
+  with `+` parses as a markdown list item under `doc_lazy_continuation` —
+  reworded).
+
+### Acceptance evidence
+
+- `check-all.sh`: **ALL GATES GREEN** (8 gates; four-view A/B byte-equal).
+- **Cull counters identical to STEP 0**: `CULLDBG glyph draws=4
+  instances=10857 | backdrops=0` — the partition did not perturb cull
+  outputs.
+- **Both render paths byte-equal vs pre-L2 captures** (pre-L2 PNGs captured
+  from `67e93d3`'s binary into `out/tooling-ab/stagel-base/` before editing):
+  `cull-pre-l2.png` vs `cull-post-l2.png` BYTE-EQUAL; `nocull-pre-l2.png` vs
+  `nocull-post-l2.png` BYTE-EQUAL.
+- **Verb smoke pair byte-equal vs STEP 0** (`out/tooling-ab/stagel-l2/`):
+  `verb-glyph.png` and `verb-group.png` both `cmp`-clean, with the same
+  pick/verb log lines as STEP 0.
+- `cargo tree -d`: 18 duplicate entries, identical to post-L1 — zero new
+  deps; Cargo.lock untouched.
+
+### Deviations
+
+None. The handoff's shape mapped onto the code without a fight; the only
+judgment call was WHERE the chunk-major flatten happens (inside
+`cull_segments`, keeping its per-chunk construction — the handoff's "built
+during cull_segments" taken literally).
+
+## Files (stage total so far)
+
+| File | +/- | Content |
+|---|---|---|
+| `native/src/glyph_scene.rs` | +199/−92 | L1 FrameUniform + L2 phase lists |
+| `out/STAGE_L_REPORT.md` | new | this report |
