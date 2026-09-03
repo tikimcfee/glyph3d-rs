@@ -10,7 +10,8 @@
 //! and every profiling call site is an `Option` no-op.
 //!
 //! Stage L (O1): `device.on_uncaptured_error` gets a dedup tracker — see
-//! `ErrorTracker` below.
+//! `ErrorTracker` below. (O1 follow-up, owner review: every emitted line
+//! carries the greppable `[GPU-ERROR]` marker token.)
 
 use std::cell::RefCell;
 
@@ -63,6 +64,24 @@ fn is_count_milestone(n: u64) -> bool {
     p == n
 }
 
+/// Stage L (O1 follow-up, owner review): render the log line for a track
+/// decision — pure, so the exact wording is unit-tested. Every line carries
+/// the greppable `[GPU-ERROR]` marker; the first-occurrence line says how
+/// repeats are handled so a lone line can't hide a storm.
+fn render_log_line(kind: ErrorKind, desc: &str, decision: &TrackDecision) -> Option<String> {
+    match decision {
+        TrackDecision::First => Some(format!(
+            "[GPU-ERROR] wgpu {kind:?} error (first occurrence — repeats are counted \
+             and summarized at 10/100/1000…x, not spammed): {desc}"
+        )),
+        TrackDecision::Repeat(n) if is_count_milestone(*n) => Some(format!(
+            "[GPU-ERROR] wgpu {kind:?} error has now occurred {n}x (summary; see the \
+             first-occurrence line above for the full context): {desc}"
+        )),
+        TrackDecision::Repeat(_) => None,
+    }
+}
+
 /// Dedup state for uncaptured wgpu errors. Pure: no GPU types inside.
 #[derive(Default)]
 struct ErrorTracker {
@@ -99,18 +118,12 @@ impl ErrorTracker {
             }
             wgpu::Error::OutOfMemory { .. } => (ErrorKind::OutOfMemory, err.to_string()),
         };
-        match tracker
+        let decision = tracker
             .lock()
             .expect("ErrorTracker mutex poisoned")
-            .track(kind, &desc)
-        {
-            TrackDecision::First => log::error!(
-                "wgpu {kind:?} error (first occurrence; repeats are counted, not spammed): {desc}"
-            ),
-            TrackDecision::Repeat(n) if is_count_milestone(n) => {
-                log::error!("wgpu {kind:?} error has now occurred {n} times: {desc}")
-            }
-            TrackDecision::Repeat(_) => {}
+            .track(kind, &desc);
+        if let Some(line) = render_log_line(kind, &desc, &decision) {
+            log::error!("{line}");
         }
     }
 }
@@ -390,5 +403,27 @@ mod error_tracker_tests {
         assert!(is_count_milestone(100));
         assert!(!is_count_milestone(999));
         assert!(is_count_milestone(1_000));
+    }
+
+    #[test]
+    fn log_lines_carry_the_gpu_error_marker() {
+        // O1 follow-up (owner review): the emitted line must be unmistakable
+        // and greppable; the first-occurrence line must say how repeats are
+        // handled.
+        let first = render_log_line(ErrorKind::Validation, "bad buffer", &TrackDecision::First)
+            .expect("first occurrence logs");
+        assert!(first.starts_with("[GPU-ERROR] wgpu Validation error"), "{first}");
+        assert!(first.contains("first occurrence"), "{first}");
+        assert!(first.contains("summarized"), "{first}");
+        assert!(first.contains("bad buffer"), "{first}");
+
+        // Ordinary repeats stay silent; milestones log with the count.
+        assert!(render_log_line(ErrorKind::Validation, "bad buffer", &TrackDecision::Repeat(2))
+            .is_none());
+        let milestone =
+            render_log_line(ErrorKind::Validation, "bad buffer", &TrackDecision::Repeat(100))
+                .expect("milestone logs");
+        assert!(milestone.starts_with("[GPU-ERROR]"), "{milestone}");
+        assert!(milestone.contains("100x"), "{milestone}");
     }
 }
