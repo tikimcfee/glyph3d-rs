@@ -387,11 +387,23 @@ pub fn reference_layout(
                     | (byte_at(id + 3) & 0x3F)
             }
         };
-        assert!(
-            cp <= 0x10FFFF,
-            "reference_layout: codepoint {cp:#x} beyond the trie's block index \
-             (the engine's decode assumes well-formed UTF-8 leads)"
-        );
+        // OUT-OF-RANGE CODEPOINT -> the shared missing block, matching the
+        // engine. This decode is a LENIENT classifier that never validates
+        // continuation bytes, so lead bytes 0xF5-0xF7 (and 0xF4 with a
+        // continuation above 0x8F) produce values past the last Unicode scalar.
+        //
+        // This used to `assert!(cp <= 0x10FFFF)`, which was wrong in an
+        // interesting way: not because panicking is harsh, but because the ENGINE
+        // did something ELSE — an unchecked read off the end of its block index,
+        // yielding a plausible glyph. The two implementations disagreed on real
+        // input and no corpus contained the bytes that would show it, so the
+        // bit-exact gate between them had nothing to compare.
+        //
+        // Contract (2026-09-02): resolve it like any unmapped codepoint. The
+        // guard lives in TrieTable::lookup so every caller gets it, not just
+        // this one — block 0 is the shared missing block by construction, so it
+        // comes back FLAG_MISSING with the missing advance and still occupies
+        // its width.
         let e = trie.lookup(cp);
         let advance = fu_to_world(e.advance_fu, em);
         let height = fu_to_world(e.height_fu, em);

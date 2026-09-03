@@ -89,6 +89,14 @@ step "6/8 engine-check (bit-exact vs CPU oracle)"
 OUT=$(cd native && ./target/release/glyph3d-native --engine-check src/main.rs 2>&1 | tail -1)
 echo "$OUT"
 grep -q "engine-check PASS" <<<"$OUT" && echo "PASS  engine-check" || { echo "FAIL  engine-check"; FAIL=1; }
+# The SAME gate on malformed leads. src/main.rs is well-formed UTF-8 by
+# construction (rustc enforces it), so the out-of-range decode path could never
+# appear in it — and that path is where the two implementations DISAGREED until
+# 2026-09-02: Mojo read off the end of its block index, Rust asserted. This
+# fixture is the only input in the tree that reaches it.
+OUT=$(cd native && ./target/release/glyph3d-native --engine-check fixtures/overflow-leads.txt 2>&1 | tail -1)
+echo "$OUT"
+grep -q "engine-check PASS" <<<"$OUT" && echo "PASS  engine-check (overflow leads)" || { echo "FAIL  engine-check (overflow leads)"; FAIL=1; }
 
 step "7/8 check-stage-g.sh (pick correctness vs python oracle)"
 if bash tools/check-stage-g.sh > /tmp/check-stage-g.log 2>&1 && tail -1 /tmp/check-stage-g.log | grep -q "ALL PASS"; then

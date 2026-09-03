@@ -95,8 +95,23 @@ impl TrieTable {
     }
 
     /// Codepoint → trie entry (the two dependent loads of FORMAT.md).
+    /// Resolve a codepoint. OUT-OF-RANGE values resolve through the shared
+    /// missing block (storage block 0), matching `decode_and_resolve` in
+    /// glyph_pipeline.mojo exactly — including which entry of that block is
+    /// read (`cp & 0xFF`), which does not change the VALUE since every entry in
+    /// the missing block is identical, but does keep the two implementations
+    /// literally the same computation.
+    ///
+    /// The engine's decode is a LENIENT classifier that never validates
+    /// continuation bytes, so lead bytes 0xF5-0xF7 (and 0xF4 with a continuation
+    /// above 0x8F) produce codepoints past the last Unicode scalar. Guarding
+    /// here rather than at one call site means every caller gets the contract.
     pub fn lookup(&self, cp: u32) -> TrieEntry {
-        let block = self.block_index[(cp >> self.block_shift) as usize];
+        let block = if cp <= 0x10FFFF {
+            self.block_index[(cp >> self.block_shift) as usize]
+        } else {
+            0
+        };
         let e = ((block << self.block_shift) | (cp & 0xFF)) as usize * self.entry_stride as usize;
         TrieEntry {
             glyph_id: self.blocks[e],

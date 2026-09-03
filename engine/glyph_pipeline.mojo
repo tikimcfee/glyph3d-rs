@@ -56,6 +56,9 @@ comptime NEWLINE = 0x0A
 
 # ── Trie (GlyphTrie.js) ─────────────────────────────────────────────────────
 comptime BLOCK_SHIFT = 8
+# The last Unicode scalar. A lenient decoder can exceed it; see the
+# out-of-range branch in decode_and_resolve for the contract.
+comptime MAX_CODEPOINT = 0x10FFFF
 comptime BLOCK_MASK = 255
 # The trie's OWN container, split by carrier like everything downstream of it
 # (2026-08-31, the GLYPH_ID settlement): two genuine measures in f32, an
@@ -481,7 +484,8 @@ def decode_codepoint_at[o: ImmOrigin](bytes: Span[UInt8, o], id: Int, n: Int) ->
 def trie_lookup_entry(trie: Trie, cp: Int) -> Int:
     """The exact two-load sequence the shader runs; returns the ENTRY INDEX
     (stride-free — callers go through the Trie accessors per carrier)."""
-    var block = Int(trie.block_index[cp >> BLOCK_SHIFT])
+    # Same out-of-range contract as the hot path in decode_and_resolve.
+    var block = Int(trie.block_index[cp >> BLOCK_SHIFT]) if cp <= MAX_CODEPOINT else 0
     return (block << BLOCK_SHIFT) | (cp & BLOCK_MASK)
 
 
@@ -539,8 +543,30 @@ def decode_and_resolve[o: ImmOrigin](
     var block: Int
     if cp < 256:
         block = Int(bp[unsafe_offset=0])
-    else:
+    elif cp <= MAX_CODEPOINT:
         block = Int(bp[unsafe_offset = cp >> BLOCK_SHIFT])
+    else:
+        # OUT-OF-RANGE CODEPOINT -> the shared missing block (storage block 0).
+        #
+        # decode_codepoint_at is a LENIENT classifier: it picks the sequence
+        # length from the lead byte's own bits and never validates the
+        # continuation bytes. So lead bytes 0xF5-0xF7 — and 0xF4 followed by a
+        # continuation above 0x8F — yield values past the last Unicode scalar.
+        # 0xF7 0xBF 0xBF 0xBF decodes to 0x1FFFFF, whose block index is 8191
+        # against a block_index of length 4352.
+        #
+        # This read was UNCHECKED and walked off the end of the index, handing
+        # back whatever integer followed it and then indexing the blocks array
+        # with it — a plausible glyph for a byte that has none, silently. The
+        # Rust reference disagreed in the other direction, asserting instead, so
+        # the two implementations did not merely both misbehave, they
+        # DISAGREED — and no corpus contains these bytes, so nothing said.
+        #
+        # Contract (2026-09-02, both sides): out of range resolves like any
+        # unmapped codepoint. Block 0 is the shared missing block by
+        # construction, so this yields FLAG_MISSING and the missing advance, and
+        # the glyph still occupies its width like every other miss.
+        block = 0
     var entry = (block << BLOCK_SHIFT) | (cp & BLOCK_MASK)
 
     # TWO 8-byte loads (independent, pipelineable) since the settlement split the
