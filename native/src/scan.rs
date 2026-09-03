@@ -75,12 +75,12 @@ pub struct ScanElem {
     pub wrap: i64,
 }
 
-fn scan_identity() -> ScanElem {
+pub(crate) fn scan_identity() -> ScanElem {
     ScanElem::default()
 }
 
 /// One byte's monoid element, from its decoded facts alone.
-fn scan_leaf_value(
+pub(crate) fn scan_leaf_value(
     is_newline: bool,
     advance: f32,
     is_leader: bool,
@@ -109,7 +109,7 @@ fn scan_leaf_value(
 
 /// `combine(accumulator, next)` — the accumulator's interval followed by
 /// `next`'s. Associative; `next.reset` absorbs.
-fn scan_combine(accumulator: &mut ScanElem, next: &ScanElem) {
+pub(crate) fn scan_combine(accumulator: &mut ScanElem, next: &ScanElem) {
     if next.reset != 0 {
         *accumulator = *next;
         accumulator.reset = 1;
@@ -152,14 +152,14 @@ fn scan_combine(accumulator: &mut ScanElem, next: &ScanElem) {
 
 /// A leader's exact lanes from its EXCLUSIVE prefix — the O(1) query that
 /// replaces walking the line.
-struct PrefixLanes {
-    row: i64,
-    col: i64,
-    line_advance: f32,
-    ord: i64,
+pub(crate) struct PrefixLanes {
+    pub row: i64,
+    pub col: i64,
+    pub line_advance: f32,
+    pub ord: i64,
 }
 
-fn lanes_from_prefix(prefix: &ScanElem, wrap: i64) -> PrefixLanes {
+pub(crate) fn lanes_from_prefix(prefix: &ScanElem, wrap: i64) -> PrefixLanes {
     let col = prefix.tail_len;
     let closed = if prefix.newlines > 0 {
         rows_for_line(prefix.head_len, wrap) + prefix.rows

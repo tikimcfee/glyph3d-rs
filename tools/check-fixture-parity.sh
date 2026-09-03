@@ -32,6 +32,12 @@
 # associativity checked in situ. It fails if no leader was held to the BIT-exact
 # tier, since that is the tier carrying the claim.
 #
+# Plus the bake (--fixture-bake, stage 4): the streaming record AND the seed
+# protocol it ships — checkpoint-seeded prefixAt, lanesFromPrefix, rowsUnderWrap
+# — replayed against the 8 .bake.bin fixtures and diffed bit-exact. It fails if
+# no query ran, since the query half is what a whole-file record comparison
+# cannot see.
+#
 # Plus the corpus diff (--fixture-diff): text.rs's CPU fold laid against every
 # fixture inside its domain and compared BIT-EXACT to the oracle's own expected
 # lanes. That half fails if NOTHING was in domain, because a differ that
@@ -44,6 +50,9 @@ FAIL=0
 
 [ -x "$BIN" ] || { echo "FAIL  $BIN not built (cargo build --release)"; exit 1; }
 [ "${#FIX[@]}" -gt 0 ] || { echo "FAIL  no fixtures found — this gate would pass vacuously"; exit 1; }
+
+BAKE=(engine/fixtures/*.bake.bin)
+[ "${#BAKE[@]}" -gt 0 ] || { echo "FAIL  no bake fixtures found"; exit 1; }
 
 RUST=$(mktemp -t fixparity-rust)
 MOJO=$(mktemp -t fixparity-mojo)
@@ -87,6 +96,12 @@ if OUT=$("$BIN" --fixture-scan "${FIX[@]}" 2>&1); then
     echo "PASS  scan form — $(echo "$OUT" | tail -1)"
 else
     echo "FAIL  scan form:"; echo "$OUT" | tail -20; FAIL=1
+fi
+
+if OUT=$("$BIN" --fixture-bake "${BAKE[@]}" 2>&1); then
+    echo "PASS  bake — $(echo "$OUT" | tail -1)"
+else
+    echo "FAIL  bake:"; echo "$OUT" | tail -20; FAIL=1
 fi
 
 if OUT=$("$BIN" --fixture-diff "${FIX[@]}" 2>&1); then

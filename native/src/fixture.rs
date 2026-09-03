@@ -118,13 +118,13 @@ fn trunc_nonneg(v: f64) -> i64 {
 /// Little-endian packed reader. Every read is bounds-checked and reports the
 /// offset it wanted, so a truncated or misparsed file names its own failure
 /// instead of panicking somewhere downstream.
-struct Reader<'a> {
+pub(crate) struct Reader<'a> {
     data: &'a [u8],
-    at: usize,
+    pub(crate) at: usize,
 }
 
 impl<'a> Reader<'a> {
-    fn new(data: &'a [u8]) -> Self {
+    pub(crate) fn new(data: &'a [u8]) -> Self {
         Self { data, at: 0 }
     }
 
@@ -142,24 +142,24 @@ impl<'a> Reader<'a> {
         }
     }
 
-    fn u32(&mut self) -> Result<u32, String> {
+    pub(crate) fn u32(&mut self) -> Result<u32, String> {
         self.need(4, "u32")?;
         let v = u32::from_le_bytes(self.data[self.at..self.at + 4].try_into().unwrap());
         self.at += 4;
         Ok(v)
     }
 
-    fn u64(&mut self) -> Result<u64, String> {
+    pub(crate) fn u64(&mut self) -> Result<u64, String> {
         let lo = self.u32()? as u64;
         let hi = self.u32()? as u64;
         Ok(lo | (hi << 32))
     }
 
-    fn f64(&mut self) -> Result<f64, String> {
+    pub(crate) fn f64(&mut self) -> Result<f64, String> {
         Ok(f64::from_bits(self.u64()?))
     }
 
-    fn take_bytes(&mut self, n: usize) -> Result<Vec<u8>, String> {
+    pub(crate) fn take_bytes(&mut self, n: usize) -> Result<Vec<u8>, String> {
         self.need(n, "byte block")?;
         let v = self.data[self.at..self.at + n].to_vec();
         self.at += n;

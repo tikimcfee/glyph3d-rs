@@ -43,7 +43,7 @@ instead of a promise.
 | **1** ✅ | `GlyphTrie` -> Rust | rebuilds a fixture's trie BYTES | the ordering landmine |
 | **2** ✅ | serial fold -> Rust | fixture expected measures BIT-EXACT | the float discipline |
 | **3** ✅ | scan form -> Rust | tiered agreement with stage 2 | monoid associativity |
-| **4** | bake -> Rust | the 8 `.bake.bin` fixtures | lowest |
+| **4** ✅ | bake -> Rust | the 8 `.bake.bin` fixtures | lowest |
 
 **Stage 0 is DONE** (2026-09-02). `native/src/fixture.rs` mirrors
 `engine/fixture_io.mojo` section for section, including its carrier split, and
@@ -210,7 +210,51 @@ stronger than the contract and make the tolerant tier look like slack.
   Swapping `next.wrap` for `accumulator.wrap` at the junction changes nothing,
   because `accumulator.wrap = next.wrap` executes ABOVE the branch — the two are
   already the same value. Not a corpus ceiling and not a test gap; a mutation
-  reading the same number twice. Recorded at the site so it is not re-run. Six mutations were run
+  reading the same number twice. Recorded at the site so it is not re-run.
+
+**Stage 4 is DONE** (2026-09-03), and with it the port. `native/src/bake.rs` is
+the streaming pass plus the SEED PROTOCOL it ships: `prefix_at` (checkpoint-
+seeded random access to any byte's exclusive prefix), `lanes_from_prefix`, and
+`rows_under_wrap` (exact rows at any wrap, from the line histogram, without
+re-reading a byte).
+
+`--fixture-bake` replays all 8 `.bake.bin` fixtures and diffs the record AND
+every query bit-exact: **26,101 leaders, 167 checkpoints, 265 seed-protocol
+queries**. It fails if no query ran, because the query half is precisely what a
+whole-file record comparison cannot see — a bake with subtly wrong checkpoints
+answers every total correctly and every random-access question wrongly.
+
+14 mutations, **all 14 reddened**. Two of them (a checkpoint stored one slot
+high, `prefix_at` seeding one slot high) redden as a bounds PANIC rather than a
+comparison, which is Rust's index check doing the detection; both were confirmed
+to panic at the mutated line rather than somewhere incidental.
+
+Three tests cover what the corpus cannot:
+
+- `a_non_positive_line_height_is_refused` — no fixture can carry an invalid line
+  height. Writing the guard as `line_height <= 0.0` ACCEPTS NaN, and the corpus
+  is blind to it; only this test fails. The guard names NaN explicitly now.
+- `a_seeded_prefix_equals_a_full_fold_at_every_byte` — the fixtures sample ~33
+  byte indices; this checks EVERY index in all 8 fixtures against a full fold
+  from zero, including bit-equality of `tail_advance`. It independently catches
+  a real checkpoint bug (boundaries landing on continuation bytes).
+- `rows_under_wrap_zero_agrees_with_total_rows` — an invariant the fixture
+  format never states: at wrap 0 the histogram plus the open tail must reproduce
+  a `total_rows` the bake derived by a completely different route.
+
+**The checkpoint index is a ONE-SIDED error**, which is worth knowing before
+anyone optimizes it: seeding from an EARLIER checkpoint is always correct (it
+just folds more bytes), while a later one skips a prefix. Clamping one low
+passes the entire corpus and every test — a performance mutation, not a
+correctness one. Clamping one high reads off the end. Recorded at `prefix_at`.
+
+## Where this leaves the port
+
+All five stages land. `--fixture-parity` is one command covering six halves:
+parse parity (Rust vs Mojo, 14 fixtures), the trie rebuilt from bytes (11,520
+entries), the serial fold (1,807,512 lanes), the scan form (112 cases across 8
+tunings), the bake (265 queries), and the original `reference_layout` corpus
+diff. No JS runs in any of it. Six mutations were run
 against gate 9 — swapped item fields, swapped carrier split, a reordered
 section of identical size, a dropped trailing section, the f32 `line_adv`, and
 every fixture forced out of domain — and all six reddened.

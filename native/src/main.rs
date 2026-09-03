@@ -28,6 +28,7 @@
 //!                                    timing, exit 0. Deterministic (fixed virtual clock).
 
 mod atlas;
+mod bake;
 mod engine;
 mod fixture;
 mod fold;
@@ -280,6 +281,10 @@ struct Cli {
     /// exit. Invariance across the tunings is associativity in situ.
     #[arg(long, value_name = "PATH", num_args = 1..)]
     fixture_scan: Vec<PathBuf>,
+    /// Stage 4: replay each .bake.bin through the ported bake and diff the
+    /// record AND every seed-protocol query bit-exact, then exit.
+    #[arg(long, value_name = "PATH", num_args = 1..)]
+    fixture_bake: Vec<PathBuf>,
     /// Stage E2: load a whole repository as a field of code pages
     #[arg(long, value_name = "DIR")]
     load_repo: Option<PathBuf>,
@@ -605,6 +610,57 @@ fn run_fixture_manifest(paths: &[PathBuf]) -> ! {
     std::process::exit(0);
 }
 
+/// Stage 4: the bake and its seed protocol against the .bake.bin corpus.
+fn run_fixture_bake(paths: &[PathBuf]) -> ! {
+    let mut leaders = 0usize;
+    let mut checkpoints = 0usize;
+    let mut queries = 0usize;
+    let mut failed = 0usize;
+    for p in paths {
+        let fx = match bake::load_bake_fixture(p) {
+            Ok(fx) => fx,
+            Err(e) => {
+                eprintln!("fixture-bake FAIL: {e}");
+                std::process::exit(1);
+            }
+        };
+        let d = bake::diff_bake(&fx);
+        if d.bad.is_empty() {
+            println!(
+                "  PASS {:<28} {} leaders / {} checkpoints / {} prefix + {} wrap queries",
+                fx.name, d.leaders, d.checkpoints, d.prefix_queries, d.wrap_queries
+            );
+            leaders += d.leaders;
+            checkpoints += d.checkpoints;
+            queries += d.prefix_queries + d.wrap_queries;
+        } else {
+            failed += 1;
+            println!("  FAIL {:<28} {} disagreement(s)", fx.name, d.bad.len());
+            for line in d.bad.iter().take(8) {
+                println!("       {line}");
+            }
+        }
+    }
+    if failed > 0 {
+        eprintln!("fixture-bake FAIL: {failed}/{} fixtures differ", paths.len());
+        std::process::exit(1);
+    }
+    // ANTI-VACUITY. The QUERY half is what distinguishes this from a second
+    // whole-file record comparison: a bake with subtly wrong checkpoints answers
+    // every total correctly and every random-access question wrongly. A run with
+    // no queries would be reporting only the half that cannot see that.
+    if queries == 0 {
+        eprintln!("fixture-bake FAIL: no seed-protocol query was exercised");
+        std::process::exit(1);
+    }
+    println!(
+        "fixture-bake PASS: {} fixture(s), {leaders} leaders, {checkpoints} checkpoints, \
+         {queries} seed-protocol queries bit-exact",
+        paths.len()
+    );
+    std::process::exit(0);
+}
+
 /// The tunings stage 3 sweeps: (chunk_size, group_size, shards).
 ///
 /// The Mojo suite runs two — the default and one awkward pair. Being serial
@@ -854,6 +910,9 @@ fn main() {
     }
     if !cli.fixture_scan.is_empty() {
         run_fixture_scan(&cli.fixture_scan);
+    }
+    if !cli.fixture_bake.is_empty() {
+        run_fixture_bake(&cli.fixture_bake);
     }
 
     // Stage E1: engine ↔ CPU-reference cross-check — no GPU involved.

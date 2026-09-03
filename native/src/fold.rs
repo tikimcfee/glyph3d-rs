@@ -231,7 +231,7 @@ pub(crate) fn sequence_length(bytes: &[u8], index: usize) -> usize {
 /// decoder — `str::from_utf8`, `chars()` and `from_utf8_lossy` all implement the
 /// conformant one and diverge here. See `fixture::fixture_codepoints`, which
 /// wants the conformant decoder for a different job, and do not confuse them.
-fn decode_codepoint_at(bytes: &[u8], slot: usize, sequence_len: usize) -> u32 {
+pub(crate) fn decode_codepoint_at(bytes: &[u8], slot: usize, sequence_len: usize) -> u32 {
     let byte_or_zero = |index: usize| -> u32 {
         if index < bytes.len() {
             bytes[index] as u32
