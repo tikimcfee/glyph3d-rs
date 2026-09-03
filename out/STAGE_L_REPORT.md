@@ -116,12 +116,11 @@ Cargo.lock untouched.
 
 - L4 (selection mask pass) — awaits owner approval.
 - O1/O2 — landed (see the steals section).
-- **Live windowed re-verification of L3** — environment-blocked this
-  session (display occluded; see the L3 section); FPS band + live K6
-  composite eyeball pending a human with an awake display.
-- **Occlusion busy-spin** (discovered during L3, pre-existing): an occluded
-  window spins `request_redraw` at ~100% CPU. Not fixed here (out of scope);
-  the fix is a one-line backoff in `about_to_wait`/`render`.
+- **Live windowed re-verification of L3** — CLOSED (display woke; FPS band
+  back-to-back + live composite eyeball in "Post-L3 fixes" below).
+- **Occlusion busy-spin** (discovered during L3, pre-existing) — FIXED in
+  `c567d51` (2 Hz throttle while occluded); human lid close/open pass
+  remains.
 - Handoff's watchlist items stand (GPU cull+indirect on the wgpu Metal
   `first_instance` fix, DeviceCaps tiers re-run if wasm is greenlit,
   descriptor-keyed pipeline pool past ~8 pipelines — L3 puts us at 5,
@@ -351,14 +350,15 @@ path live — empirically confirming the by-construction claim.
 
 ### Environment block + discovered issue (honest)
 
-- **Live windowed verification was impossible this session**: the display
-  is occluded (locked/asleep), and wgpu 30 reports
+- **Live windowed verification was impossible at L3 time**: the display
+  was occluded (locked/asleep), and wgpu 30 reports
   `CurrentSurfaceTexture::Occluded`, so `render()` skips every frame — the
   app LOOKS hung (no FPS lines) but is spinning. Probe evidence: ~250,000
   occlusion-skips/second at pre-L3 HEAD too (8b17941) — **predates and is
-  unrelated to L3**. The windowed ≥30-frame FPS band and the live K6
-  composite.png eyeball are deferred to the human pass with the display
-  awake. Expected cost: one extra fullscreen pass ≈ 0.1–0.3 ms.
+  unrelated to L3**. (Update: the display woke later that day and the
+  deferred items landed — FPS band back-to-back comparison and the live
+  composite eyeball — see "Post-L3 fixes" below. The occlusion busy-spin
+  itself was fixed in `c567d51`.)
 - **Discovered issue (pre-existing, out of L3 scope, recorded):** on
   occlusion the event loop busy-spins `request_redraw` at ~100% CPU with no
   backoff. A future fix (skip `request_redraw` while acquires report
@@ -372,3 +372,70 @@ path live — empirically confirming the by-construction claim.
   work, resize re-creates the pool (no crash, correct framing after).
 - Deviations from the handoff: none beyond the two recorded above
   (COPY_DST addition; the environment block).
+
+---
+
+## Post-L3 fixes (stage-adjacent hygiene, owner-sanctioned)
+
+### Fix 1 — O1 log visibility (`2c60d84`, gpu.rs)
+
+The owner ratified O1's log-once-and-continue semantics but required the
+line to be unmistakable. Every emitted line now starts with the bracketed,
+greppable **`[GPU-ERROR]`** token; the first-occurrence line says repeats
+are counted and summarized at 10/100/1000…x (a lone line can't hide a
+storm); milestone summaries carry the running count and point back to the
+first line. Formatting moved into the pure `render_log_line()` and is
+unit-pinned (new test: marker / first-occurrence / milestone / silent-repeat
+strings — 34+1 tests green). The marker token is documented in gpu.rs's
+module header. Gates: ALL GATES GREEN.
+
+### Fix 2 — occlusion busy-spin (`c567d51`, windowed.rs)
+
+**The bug** (pre-existing; found during L3): with the window fully occluded
+(macOS display sleep / fully covered), wgpu 30 reports
+`CurrentSurfaceTexture::Occluded`, `render()` skips the frame — and
+`about_to_wait` kept calling `request_redraw()` unconditionally, spinning at
+~100% CPU. Measured pre-fix (temporary probe at pre-L3 HEAD `8b17941`):
+**~250,000 occlusion-skips/s**, zero FPS lines, multi-MB log flood.
+
+**Mechanism chosen: throttled fallback (~2 Hz), NOT event-driven.** winit
+0.30 evidence (winit-0.30.13 `src/event.rs`): `WindowEvent::Occluded` is
+documented iOS-only ("Others: Unsupported" — macOS included), and
+`RedrawRequested` fires only on OS invalidation (e.g. resize) or an explicit
+`request_redraw` — so once we stop requesting, no wake is guaranteed and a
+purely event-driven wait could strand the window blank. Implementation:
+`WindowState.occluded` (set on `Cst::Occluded`, cleared on successful
+present and on `Resized`); while set, `about_to_wait` requests a redraw at
+most every 500 ms and parks the loop with `ControlFlow::WaitUntil(deadline)`
+between retries; not occluded → `ControlFlow::Wait` restored every pass.
+`Timeout` keeps today's cadence (transient acquire contention, not
+occlusion). Non-occluded behavior is byte-identical (same continuous redraw,
+same tick) — and offscreen is untouched (four PNGs byte-equal).
+
+**Spin numbers, before/after:** ~250k skips/s pre-fix (probe evidence from
+L3) → post-fix in the then-occluded environment: one `surface occluded —
+throttling redraws to ~2 Hz until visible` line and an idle loop; when the
+display woke mid-run the app **recovered on its own** via the 2 Hz retry
+(FPS lines resumed, CPU 13.7% = normal render load) — the recovery path
+exercised live. Human pass remaining: laptop lid close/open and window
+fully covered — confirm the single log line, idle CPU while occluded,
+recovery within ~0.5 s.
+
+### Bonus: L3's environment-deferred windowed items, closed
+
+The display came awake mid-session, so the deferred checks landed after all:
+
+- **FPS band**: back-to-back 15 s windowed runs — pre-L3 (`8b17941`)
+  54–60, current 54–58; alternating offscreen profiles overlap (pre
+  3.66–6.38 ms, cur 4.20–5.91 ms glyph pass). The morning's apparent gap
+  (5.27 vs 5.92 ms, 60.0 vs ~52 fps) was **machine-state noise, not an L3
+  regression** — the composite's cost is inside the noise (≤ the expected
+  0.1–0.3 ms/pass).
+- **Live windowed composite eyeball**:
+  `out/tooling-ab/stagel-l3/composite-windowed.png` (K6
+  `--screenshot-frame 90`, 3200×2000): the Debug window (FPS 55.5, camera
+  readout, verb buttons, LOD slider, cull counters, scratch field, file
+  browser with tint swatches + indented `sub/deep.py`) composited OVER the
+  correct glyph field (three text pages, wide.txt, group labels), background
+  the correct dark blue-gray. The windowed shader-composite path produces
+  exactly the expected composed frame.
