@@ -317,6 +317,39 @@ fn word_color(word: &str) -> [u8; 3] {
 use crate::atlas::TrieTable;
 use crate::engine::GlyphRecord;
 
+/// A codepoint resolver in WORLD units — the fold's only view of a trie.
+///
+/// TWO SOURCES, one fold. The app atlas (`atlas::TrieTable`) stores FONT UNITS
+/// and converts here; a `.pipe.bin` fixture stores world units already, as f64
+/// VALUES narrowed once by its loader. Before this trait, `reference_layout`
+/// could only be pointed at the atlas, so the fixture corpus — the only
+/// artifacts with direct JS-oracle provenance — could not reach it at all.
+pub trait WorldTrie {
+    fn resolve(&self, cp: u32) -> WorldEntry;
+}
+
+/// A resolved codepoint in world units.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct WorldEntry {
+    pub glyph_id: u32,
+    pub advance: f32,
+    pub height: f32,
+    pub flags: u32,
+}
+
+impl WorldTrie for TrieTable {
+    fn resolve(&self, cp: u32) -> WorldEntry {
+        let e = self.lookup(cp);
+        let em = self.metrics.em_height_fu;
+        WorldEntry {
+            glyph_id: e.glyph_id,
+            advance: fu_to_world(e.advance_fu, em),
+            height: fu_to_world(e.height_fu, em),
+            flags: e.flags,
+        }
+    }
+}
+
 /// One expected engine record, computed the CPU way. Field order mirrors the
 /// 32 B wire record ([X Y Z ADVANCE HEIGHT][GLYPH_ID ROW COL]).
 #[derive(Clone, Copy, Debug)]
@@ -344,13 +377,12 @@ fn fu_to_world(fu: i32, em_height_fu: u32) -> f32 {
 /// sequence length, continuation/invalid bytes are non-leaders (no record),
 /// and the codepoint assembles from masked payload bits WITHOUT validating
 /// the continuation bytes (bounds-checked reads return 0 past the end).
-pub fn reference_layout(
-    trie: &TrieTable,
+pub fn reference_layout<T: WorldTrie + ?Sized>(
+    trie: &T,
     bytes: &[u8],
     origin: [f64; 3],
     line_height: f64,
 ) -> Vec<RefGlyph> {
-    let em = trie.metrics.em_height_fu;
     let mut out = Vec::new();
     let mut line_adv: f64 = 0.0; // f64 chain — the oracle's truth-layer prefix
     let mut row: u32 = 0;
@@ -404,9 +436,9 @@ pub fn reference_layout(
         // this one — block 0 is the shared missing block by construction, so it
         // comes back FLAG_MISSING with the missing advance and still occupies
         // its width.
-        let e = trie.lookup(cp);
-        let advance = fu_to_world(e.advance_fu, em);
-        let height = fu_to_world(e.height_fu, em);
+        let e = trie.resolve(cp);
+        let advance = e.advance;
+        let height = e.height;
         out.push(RefGlyph {
             // Same narrowing points as the fold: f32(x + ox), f32(-row*lh + oy).
             x: (line_adv + origin[0]) as f32,

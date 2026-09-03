@@ -39,19 +39,42 @@ instead of a promise.
 
 | stage | work | acceptance | risk |
 |---|---|---|---|
-| **0** | Rust `.pipe.bin` reader + bit-exact differ | reads all 14 fixtures; counts agree with `engine/fixture_io.mojo` | none, pure plumbing |
+| **0** ✅ | Rust `.pipe.bin` reader + bit-exact differ | reads all 14 fixtures; counts agree with `engine/fixture_io.mojo` | none, pure plumbing |
 | **1** | `GlyphTrie` -> Rust | rebuilds a fixture's trie BYTES | the ordering landmine |
 | **2** | serial fold -> Rust | fixture expected measures BIT-EXACT | the float discipline |
 | **3** | scan form -> Rust | tiered agreement with stage 2 | monoid associativity |
 | **4** | bake -> Rust | the 8 `.bake.bin` fixtures | lowest |
 
-**Stage 0 goes first and alone.** The first line of ported code should land
-against a working differ, not before one — the same "baseline before the
-feature" rule the rest of this repo runs on. Rust has NO `.pipe.bin` parser
-today; it only passes fixture PATHS through to Mojo's `load_trie_auto`. Mirror
-`engine/fixture_io.mojo`, whose `PipeFixture` carries `byte_len`, `item_count`,
-the items, `exp_measures` (f64 VALUES), `exp_counts` (u32) and
-`exp_item_bounds` (u64 bit patterns).
+**Stage 0 is DONE** (2026-09-02). `native/src/fixture.rs` mirrors
+`engine/fixture_io.mojo` section for section, including its carrier split, and
+refuses any parse that does not consume the whole file. Gate 9,
+`tools/check-fixture-parity.sh`, is its acceptance test and has two halves:
+
+- **Parse parity.** Both loaders emit FNV-1a checksums over their PARSED, TYPED
+  values (`--fixture-manifest` / `engine/fixture_manifest.mojo`) and the lines
+  are diffed. Hashing the FILE would have proved nothing — that is the one thing
+  both sides are guaranteed to agree on. All 14 fixtures, 11 sections each.
+- **Corpus diff.** `text.rs::reference_layout` is laid against every fixture
+  inside its domain and diffed BIT-EXACT against the oracle's own expected
+  lanes: 4 fixtures, 5332 records, 47988 lanes, 7 of 8 measure lanes plus ROW
+  and COL. LINE_ADV is the fold's witness lane and `RefGlyph` does not carry
+  it — stated in the code rather than quietly omitted.
+
+Two things fell out that stage 2 inherits:
+
+1. **`WorldTrie`** (`text.rs`) is the new seam. The fold used to take
+   `&TrieTable` — font units, atlas only — so the fixture corpus could not
+   reach it at all. Both tries now implement one trait and the fold is generic.
+2. **The float discipline is now DETECTABLE.** Mutating `line_adv` to
+   accumulate in f32 reddens the corpus diff with one-ulp X/BASE_X divergences,
+   named by lane and byte. Landmine 2 below has a gate watching it BEFORE the
+   code that can trip it gets written.
+
+The domain is a PREDICATE (`out_of_domain`), not a file list, so widening the
+fold in stage 2 automatically widens what it is held to. Six mutations were run
+against gate 9 — swapped item fields, swapped carrier split, a reordered
+section of identical size, a dropped trailing section, the f32 `line_adv`, and
+every fixture forced out of domain — and all six reddened.
 
 **Stage 2 alone unblocks wasm.** If that is the priority, 0+1+2 is the
 deliverable and 3+4 can trail.

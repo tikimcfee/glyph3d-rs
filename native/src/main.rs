@@ -29,6 +29,7 @@
 
 mod atlas;
 mod engine;
+mod fixture;
 mod gpu;
 mod glyph_scene;
 mod offscreen;
@@ -252,6 +253,17 @@ struct Cli {
     /// Stage E1: render engine records through the Slug renderer
     #[arg(long, value_name = "PATH")]
     engine_render: Option<PathBuf>,
+    /// Stage 0 (reference port): print the canonical parse manifest for each
+    /// .pipe.bin fixture and exit. tools/check-fixture-parity.sh diffs these
+    /// lines against the ones engine/fixture_manifest.mojo emits from the Mojo
+    /// loader — two independent parsers agreeing on checksums over their PARSED
+    /// values, not on the file's bytes.
+    #[arg(long, value_name = "PATH", num_args = 1..)]
+    fixture_manifest: Vec<PathBuf>,
+    /// Stage 0: lay each .pipe.bin with the CPU reference fold and diff
+    /// BIT-EXACT against the oracle's own expected lanes, then exit.
+    #[arg(long, value_name = "PATH", num_args = 1..)]
+    fixture_diff: Vec<PathBuf>,
     /// Stage E2: load a whole repository as a field of code pages
     #[arg(long, value_name = "DIR")]
     load_repo: Option<PathBuf>,
@@ -563,6 +575,72 @@ fn run_engine_check(file: &Path, trie_path: Option<&Path>) -> ! {
     }
 }
 
+/// Stage 0: emit the canonical parse manifest, one line per fixture.
+fn run_fixture_manifest(paths: &[PathBuf]) -> ! {
+    for p in paths {
+        match fixture::load_pipe_fixture(p) {
+            Ok(fx) => println!("{}", fx.manifest()),
+            Err(e) => {
+                eprintln!("fixture-manifest FAIL: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
+    std::process::exit(0);
+}
+
+/// Stage 0: hold text.rs's CPU fold to the fixture corpus, bit-exact.
+///
+/// Out-of-domain fixtures are SKIPPED WITH A REASON rather than silently
+/// dropped, and a run in which nothing was in domain FAILS. Both halves matter:
+/// this gate's whole job is comparing, and a comparison that compared nothing
+/// is the loudest-passing thing there is.
+fn run_fixture_diff(paths: &[PathBuf]) -> ! {
+    let mut compared = 0usize;
+    let mut records = 0usize;
+    let mut lanes = 0usize;
+    let mut failed = 0usize;
+    for p in paths {
+        let fx = match fixture::load_pipe_fixture(p) {
+            Ok(fx) => fx,
+            Err(e) => {
+                eprintln!("fixture-diff FAIL: {e}");
+                std::process::exit(1);
+            }
+        };
+        let outcome = fixture::diff_against_reference_layout(&fx);
+        if let Some(why) = outcome.skipped {
+            println!("  SKIP {:<26} out of reference_layout domain: {why}", fx.name);
+            continue;
+        }
+        compared += 1;
+        records += outcome.records;
+        lanes += outcome.compared_lanes;
+        if outcome.bad.is_empty() {
+            println!(
+                "  PASS {:<26} {} records, {} lanes bit-exact",
+                fx.name, outcome.records, outcome.compared_lanes
+            );
+        } else {
+            failed += 1;
+            print!("  FAIL {}", fixture::report(&fx, &outcome.bad, 10));
+        }
+    }
+    if compared == 0 {
+        eprintln!("fixture-diff FAIL: no fixture was in domain — nothing was compared");
+        std::process::exit(1);
+    }
+    if failed > 0 {
+        eprintln!("fixture-diff FAIL: {failed}/{compared} fixtures differ");
+        std::process::exit(1);
+    }
+    println!(
+        "fixture-diff PASS: {compared} fixture(s), {records} records, {lanes} lanes bit-exact \
+         vs the oracle's expected values"
+    );
+    std::process::exit(0);
+}
+
 fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     let cli = parse_cli();
@@ -572,6 +650,14 @@ fn main() {
         let mut cmd = Cli::command();
         clap_complete::generate(shell, &mut cmd, "glyph3d-native", &mut std::io::stdout());
         return;
+    }
+
+    // Stage 0 (reference port): fixture parse manifest / corpus diff — no GPU.
+    if !cli.fixture_manifest.is_empty() {
+        run_fixture_manifest(&cli.fixture_manifest);
+    }
+    if !cli.fixture_diff.is_empty() {
+        run_fixture_diff(&cli.fixture_diff);
     }
 
     // Stage E1: engine ↔ CPU-reference cross-check — no GPU involved.

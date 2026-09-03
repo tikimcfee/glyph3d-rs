@@ -19,6 +19,12 @@
 #   7. tools/check-stage-g.sh       — pick correctness vs python oracle
 #   8. four-view byte-equal A/B     — demo/text/repo-zoom/repo-wide re-rendered
 #                                     and cmp'd against out/tooling-ab/baseline/
+#   9. fixture parity + corpus diff — stage 0 of the reference port. Rust's new
+#                                     .pipe.bin reader and Mojo's fixture_io
+#                                     agree on checksums over their PARSED
+#                                     values, and text.rs's CPU fold is held
+#                                     bit-exact to the oracle's own expected
+#                                     lanes on every fixture in its domain.
 #
 # text.png renders native/fixtures/baseline-view.txt (immutable fixture —
 # editing it is a conscious re-baseline act, see out/STAGE_I_REPORT.md).
@@ -34,7 +40,7 @@ FAIL=0
 step() { echo; echo "── $*"; }
 warn_count() { grep -cE "^warning" <<<"$1" || true; }
 
-step "1/8 generators reproduce their committed outputs (byte-identical)"
+step "1/9 generators reproduce their committed outputs (byte-identical)"
 G_OK=1
 for g in "tools/gen_real_trie.py --verify-only" "tools/gen_schema.py --check" "tools/vendor-manifest.py --check"; do
   # No pipe: the exit code must be the GENERATOR's, not a tail's.
@@ -61,7 +67,7 @@ else
 fi
 rm -rf "$A_TMP"
 
-step "2/8 engine/check.sh (fifteen Mojo conformance suites, CPU + GPU)"
+step "2/9 engine/check.sh (fifteen Mojo conformance suites, CPU + GPU)"
 if OUT=$(./engine/check.sh 2>&1); then
   echo "$OUT" | tail -2
   echo "PASS  engine suites"
@@ -69,23 +75,23 @@ else
   echo "$OUT" | tail -8; echo "FAIL  engine suites"; FAIL=1
 fi
 
-step "3/8 cargo build --release (house rule: zero warnings)"
+step "3/9 cargo build --release (house rule: zero warnings)"
 LOG=$(cd native && cargo build --release 2>&1) || { echo "$LOG"; echo "FAIL  build errored"; exit 1; }
 W=$(warn_count "$LOG")
 if [ "$W" = 0 ]; then echo "PASS  build — 0 warnings"; else echo "$LOG" | grep -E "^warning" -A4; echo "FAIL  build — $W warnings"; FAIL=1; fi
 
-step "4/8 cargo clippy --release (zero warnings)"
+step "4/9 cargo clippy --release (zero warnings)"
 LOG=$(cd native && cargo clippy --release 2>&1) || { echo "$LOG"; echo "FAIL  clippy errored"; exit 1; }
 W=$(warn_count "$LOG")
 if [ "$W" = 0 ]; then echo "PASS  clippy — 0 warnings"; else echo "$LOG" | grep -E "^warning" -A4; echo "FAIL  clippy — $W warnings"; FAIL=1; fi
 
-step "5/8 cargo test"
+step "5/9 cargo test"
 LOG=$(cd native && cargo test --release 2>&1); RC=$?
 echo "$LOG" | grep "test result"
 PASSED=$(grep -c "test result: ok" <<<"$LOG" || true)
 if [ $RC = 0 ] && [ "$PASSED" -ge 2 ]; then echo "PASS  tests green"; else echo "FAIL  cargo test (rc=$RC)"; FAIL=1; fi
 
-step "6/8 engine-check (bit-exact vs CPU oracle)"
+step "6/9 engine-check (bit-exact vs CPU oracle)"
 OUT=$(cd native && ./target/release/glyph3d-native --engine-check src/main.rs 2>&1 | tail -1)
 echo "$OUT"
 grep -q "engine-check PASS" <<<"$OUT" && echo "PASS  engine-check" || { echo "FAIL  engine-check"; FAIL=1; }
@@ -98,7 +104,7 @@ OUT=$(cd native && ./target/release/glyph3d-native --engine-check fixtures/overf
 echo "$OUT"
 grep -q "engine-check PASS" <<<"$OUT" && echo "PASS  engine-check (overflow leads)" || { echo "FAIL  engine-check (overflow leads)"; FAIL=1; }
 
-step "7/8 check-stage-g.sh (pick correctness vs python oracle)"
+step "7/9 check-stage-g.sh (pick correctness vs python oracle)"
 if bash tools/check-stage-g.sh > /tmp/check-stage-g.log 2>&1 && tail -1 /tmp/check-stage-g.log | grep -q "ALL PASS"; then
   echo "PASS  stage-g ALL PASS"
 else
@@ -107,7 +113,7 @@ fi
 # stage-g rewrites its scratch proofs; keep tracked artifacts pristine.
 git checkout -- out/g-check-*.png 2>/dev/null || true
 
-step "8/8 four-view byte-equal A/B vs $BASE"
+step "8/9 four-view byte-equal A/B vs $BASE"
 mkdir -p "$SWEEP"
 (cd native && \
   ./target/release/glyph3d-native --demo --frames 2 --screenshot ../$SWEEP/demo.png >/dev/null 2>&1 && \
@@ -123,6 +129,13 @@ for v in demo text repo-zoom repo-wide; do
     FAIL=1
   fi
 done
+
+step "9/9 fixture parse parity (Rust vs Mojo) + corpus diff vs the JS oracle"
+if OUT=$(tools/check-fixture-parity.sh 2>&1); then
+  echo "$OUT"
+else
+  echo "$OUT"; FAIL=1
+fi
 
 echo
 if [ "$FAIL" = 0 ]; then echo "CHECK-ALL: ALL GATES GREEN"; else echo "CHECK-ALL: FAILURES — see above"; exit 1; fi

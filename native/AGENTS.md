@@ -26,22 +26,28 @@ cp ../../../engine/bench/bench.bin engine/bench/   # optional; benches only
 
 Setup details and the toolchain's live constraints: `engine/TOOLCHAIN.md`.
 
-EIGHT gates since 2026-09-02 (was six). Two run FIRST — inputs before
+NINE gates since 2026-09-02 (was six). Two run FIRST — inputs before
 consumers: (1) three generators plus the atlas exporter each rebuild their
 committed output and require **byte-identity** (`engine-trie.bin`,
 `engine/glyph_schema.mojo`, the 16-file vendor manifest, the four
 `assets/atlas/*.bin`); (2) `engine/check.sh` — **16 Mojo conformance suites**
 (11 CPU + 5 GPU on Metal) plus a compile pass over all six benches. Then the
 original six: (3) `cargo build --release` with **zero warnings**, (4)
-`cargo clippy --release` zero warnings, (5) `cargo test` all green (26 tests:
+`cargo clippy --release` zero warnings, (5) `cargo test` all green (37 tests:
 naga WGSL validation, clap CLI parity, encase layout assertions, ItemParams
-validation), (6)
+validation, and the fixture reader + differ), (6)
 `--engine-check src/main.rs` — bit-exact Mojo engine vs the text.rs CPU
 oracle, (7) `tools/check-stage-g.sh` — scripted picks cross-checked against
 an independent python fold oracle, (8) four-view **byte-equal** A/B:
 demo / text / repo-zoom / repo-wide re-rendered into `out/tooling-ab/sweep/`
 and `cmp`'d against `out/tooling-ab/baseline/`. Any divergence means the
-commit is wrong — revert or fix, never re-baseline casually.
+commit is wrong — revert or fix, never re-baseline casually. And (9)
+`tools/check-fixture-parity.sh` — stage 0 of the reference port: Rust's
+`.pipe.bin` reader (`native/src/fixture.rs`) and Mojo's `fixture_io` agree on
+FNV-1a checksums over their **parsed** values across all 14 fixtures, and
+`text.rs`'s CPU fold is diffed **bit-exact** against the oracle's own expected
+lanes on every fixture inside its domain (4 today, 5332 records). It fails if
+nothing was in domain.
 
 ## The determinism chain (why the gates can be this strict)
 
