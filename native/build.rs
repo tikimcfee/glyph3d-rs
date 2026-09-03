@@ -39,6 +39,27 @@ fn main() {
             dylib.display()
         );
     }
+    // A STALE dylib links with a raw "Undefined symbols for architecture arm64",
+    // which is a cryptic failure for a one-command fix. The engine gained
+    // glyph_engine_fp_probe on 2026-09-02 (engine.rs asserts the FP contract
+    // through it), so a dylib built before that predates the Rust side it is
+    // being linked against. Searching the file for the exported symbol name is
+    // crude but needs no tooling, and turns the linker error into an instruction.
+    let stale = std::fs::read(&dylib)
+        .map(|b| !b
+            .windows(b"glyph_engine_fp_probe".len())
+            .any(|w| w == b"glyph_engine_fp_probe"))
+        .unwrap_or(false);
+    if stale {
+        panic!(
+            "libglyph_engine.dylib at {} is STALE — it does not export \
+             glyph_engine_fp_probe, so it was built before 2026-09-02 and predates \
+             the Rust code linking against it.\n\
+             Rebuild it:  pixi run build-engine",
+            dylib.display()
+        );
+    }
+
     assert!(
         mojo_runtime_lib.join("libKGENCompilerRTShared.dylib").exists(),
         "Mojo runtime dylib missing under {} — is the pixi env installed?",
