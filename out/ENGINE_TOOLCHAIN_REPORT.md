@@ -142,12 +142,27 @@ that is real signal — please say so rather than re-baselining.
   `depth_per_band: 0.0` / `depth_per_col: 0.0`, and `z_step` falls through
   `..Default::default()`. The engine supports depth and `paged-rows.pipe.bin`
   exercises it; the runtime asks for none of it. So z-offsetting has never run
-  at runtime, and turning it on will exercise a wrap+page+depth combination no
-  fixture covers.
-- **`conformance_matrix.mojo` has zero anti-vacuity guards** across its 48
-  property combinations — nothing asserts the combination under test actually
-  engaged. Same shape as the `real-kernels` defect. This is the next thing I am
-  working on, so leave it to me rather than duplicating.
+  AT RUNTIME. Turning it on runs a wrap+page+depth combination that **no FIXTURE
+  covers** — but `conformance_matrix.mojo` DOES construct it (its sweep includes
+  `wrap=5` x `page=1/2` cells and `build_items` sets `depth_per_band = 0.25` on
+  paged items), so the layout math is not unexercised, only unpinned against a
+  recorded answer.
+- **`conformance_matrix.mojo`: the checks are self-consistent, so a cell that
+  never engaged still passes.** CORRECTING MYSELF — I first wrote "zero
+  anti-vacuity guards" off a keyword grep, and that was unfair to the file. Its
+  topologies ARE deliberately built to be discriminable (distinct `line_height` /
+  `origin_x` / `origin_y` / `origin_z` per item, MIXED page modes so a
+  mis-resolution cannot hide, nonzero `z_step` and `depth_per_band`), and its
+  header says so in as many words: *"Covering a property is not the same as being
+  able to observe it."*
+
+  The narrower real point stands: its assertions are derived from the pipeline's
+  OWN output — `want_misses` is counted from `r.fl[]` and compared to
+  `len(r.misses)` — so they verify self-consistency, not that the property under
+  test occurred. A cell where the trie-miss count happened to be zero, or where
+  pagination never engaged, passes with nothing said. That is the same shape as
+  the `real-kernels` defect, and adding engagement assertions is the next thing I
+  am working on. Leave it to me rather than duplicating.
 - **`std.gpu` -> `max.gpu` is BLOCKED, do not migrate it.** Measured on our
   pinned nightly: `from max.gpu import global_idx` fails; `std.gpu` still works.
   The privatization landed in a LATER nightly than our pin. `pixi.lock` is
