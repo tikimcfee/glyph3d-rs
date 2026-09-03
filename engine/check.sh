@@ -33,7 +33,7 @@ TMPBIN=$(mktemp -t glyph3d-bench-probe)
 PIPE=(engine/fixtures/*.pipe.bin)
 BAKE=(engine/fixtures/*.bake.bin)
 
-CPU=(conformance conformance_scan ordinal_invariant conformance_record conformance_resume conformance_elide)
+CPU=(conformance conformance_scan ordinal_invariant conformance_record conformance_resume conformance_elide conformance_invariants)
 # gaps and matrix take ONE fixture (for its trie) and build their own topologies
 GAPS=engine/fixtures/repo-file.pipe.bin
 GPU=(gpu_decode gpu_scan gpu_paginate gpu_bounds gpu_pipeline)
@@ -94,8 +94,8 @@ for s in ${list[@]+"${list[@]}"}; do run "$s" "${PIPE[@]}"; done
     $(find native/src tools -name '*.rs' -o -name '*.py' 2>/dev/null | sort | head -60)
 [[ "${1:-all}" == "gpu" ]] || run conformance_bake "${BAKE[@]}"
 case "${1:-all}" in
-    cpu) echo "all 10 CPU suites green (fp contraction disabled); GPU suites NOT RUN" ;;
+    cpu) echo "all 11 CPU suites green (fp contraction disabled); GPU suites NOT RUN" ;;
     bench) echo "all bench files compile (they are not RUN: bench.bin is untracked)" ;;
     gpu) echo "all 5 GPU suites green (fp contraction disabled)" ;;
-    *)   echo "all 15 suites green + benches compile, CPU + GPU (fp contraction disabled)" ;;
+    *)   echo "all 16 suites green + benches compile, CPU + GPU (fp contraction disabled)" ;;
 esac

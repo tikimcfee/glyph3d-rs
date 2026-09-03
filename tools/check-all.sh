@@ -7,7 +7,7 @@
 #                                     validation rules run (the tier check; it had
 #                                     no home in this tree until 2026-09-02). The
 #                                     atlas gate also keeps tools/vendor/ref honest.
-#   2. engine/check.sh            — all fifteen Mojo conformance suites, CPU
+#   2. engine/check.sh            — all sixteen Mojo conformance suites, CPU
 #                                     AND GPU. The five GPU suites run on Metal
 #                                     since `max` became a real dependency
 #                                     (pixi.toml) on 2026-09-02.
