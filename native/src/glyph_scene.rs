@@ -291,10 +291,26 @@ pub fn seg_tint(instances: &[GlyphInstance], width: f32, height: f32) -> [f32; 4
     ]
 }
 
+/// Stage L (L1): the frame uniform — was CameraUniform (just view_proj).
+/// re_renderer's FrameUniformBuffer borrow: everything a frame needs behind
+/// the one reserved binding. `view_proj` stays at offset 0, byte-for-byte
+/// the same 64 B; the appended lanes bind to the UNCHANGED WGSL uniform
+/// block (glyph_field.wgsl `struct Camera` = 64 B minimum binding size ≤
+/// this 104 B buffer — no shader bytes move; the extra lanes are consumed by
+/// a future stage that changes the shader anyway). `flags` bit 0 is reserved
+/// `deterministic_rendering` (re_renderer's RenderMode::Deterministic idea);
+/// 0 everywhere today — nothing consumes it yet.
 #[repr(C)]
-#[derive(Clone, Copy, Pod, Zeroable)]
-struct CameraUniform {
+#[derive(Clone, Copy, Pod, Zeroable, encase::ShaderType)]
+struct FrameUniform {
     view_proj: [f32; 16],
+    eye: [f32; 3],
+    _pad0: f32,
+    viewport: [f32; 2],
+    px_scale: f32,
+    time: f32,
+    flags: u32,
+    _pad1: u32,
 }
 
 /// GlyphField.js GLYPH_LOD_DEFAULTS + group count, one uniform block.
@@ -967,8 +983,10 @@ impl GlyphScene {
         );
 
         let camera_buf = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("camera uniform"),
-            size: std::mem::size_of::<CameraUniform>() as u64,
+            // Stage L (L1): the widened FrameUniform buffer (104 B) — binds to
+            // the unchanged 64 B WGSL block via the minimum-binding-size rule.
+            label: Some("frame uniform"),
+            size: std::mem::size_of::<FrameUniform>() as u64,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -2322,8 +2340,21 @@ impl SceneLike for GlyphScene {
             cull.lod_min_px.set(probe.borrow().lod_min_px);
         }
 
-        let cam = CameraUniform {
+        // Stage L (L1): fill every lane of the widened frame uniform from
+        // values already computed here. px_scale is computed once and shared
+        // with the cull block below (it was CullView-local before L1 — the
+        // uniform needs it even under --no-cull). flags bit 0
+        // (deterministic_rendering) stays 0 — reserved.
+        let px_scale = height as f32 / (2.0 * (FOV_Y.to_radians() * 0.5).tan());
+        let cam = FrameUniform {
             view_proj: frame.view_proj.to_cols_array(),
+            eye: frame.eye.to_array(),
+            _pad0: 0.0,
+            viewport: [width as f32, height as f32],
+            px_scale,
+            time: t,
+            flags: 0,
+            _pad1: 0,
         };
         ctx.queue
             .write_buffer(&self.camera_buf, 0, bytemuck::bytes_of(&cam));
@@ -2338,7 +2369,7 @@ impl SceneLike for GlyphScene {
             let view = CullView {
                 planes: frustum_planes(&frame.view_proj),
                 eye: frame.eye,
-                px_scale: height as f32 / (2.0 * (FOV_Y.to_radians() * 0.5).tan()),
+                px_scale,
                 lod_min_px: cull.lod_min_px.get(),
             };
             let (draws, backdrops) = cull_segments(
@@ -2571,6 +2602,33 @@ mod layout_tests {
         assert_eq!(<GroupRow as ShaderSize>::SHADER_SIZE.get(), 80, "GROUP_STRIDE=5 vec4s");
         assert_eq!(std::mem::size_of::<GroupRow>(), 80);
         assert_eq!(GroupRow::METADATA.offset(0), 0, "cols offset");
+    }
+
+    /// Stage L (L1): the widened frame uniform. `view_proj` is pinned at
+    /// 0..64 — the unchanged WGSL `Camera` block binds those first 64 B, and
+    /// the minimum-binding-size rule lets the larger buffer carry the
+    /// appended lanes without a shader edit. NOTE: repr(C) arrays are
+    /// align-4 in Rust (no GPU vec alignment), so there is NO tail padding —
+    /// Rust and encase agree at 104 B.
+    #[test]
+    fn frame_uniform_size_and_offsets() {
+        assert_eq!(std::mem::size_of::<FrameUniform>(), 104, "repr(C) size (align-4 arrays: no tail pad)");
+        let expected = [
+            ("view_proj", 0),
+            ("eye", 64),
+            ("_pad0", 76),
+            ("viewport", 80),
+            ("px_scale", 88),
+            ("time", 92),
+            ("flags", 96),
+            ("_pad1", 100),
+        ];
+        for (i, (name, off)) in expected.iter().enumerate() {
+            assert_eq!(FrameUniform::METADATA.offset(i), *off as u64, "field {name} offset");
+        }
+        // Encase uniform-space size agrees with repr(C); both are ≥ the WGSL
+        // block's 64 B minimum binding size.
+        assert_eq!(<FrameUniform as ShaderSize>::SHADER_SIZE.get(), 104);
     }
 
     /// Decisive check: encase's serialization must be byte-identical to the
