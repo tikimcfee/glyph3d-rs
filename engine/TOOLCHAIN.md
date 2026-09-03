@@ -158,3 +158,27 @@ not `stdout`.** The suites report pass/fail on stdout, so a raise now leaves by 
 different door. `check.sh` captures `2>&1`, so it is covered — but a future runner
 that does not would read green while the failure went somewhere nothing was
 looking.
+
+## Working in a worktree (and why you probably should)
+
+`tools/check-all.sh` reads the WORKING TREE, not HEAD. With a second thread
+active in the same repo, their uncommitted edits fail your gates and tell you
+nothing about your change — this happened on 2026-09-02, where an in-flight
+`PhaseDraws` refactor in `glyph_scene.rs` reddened a gate run for a commit that
+touched one `.mojo` file. Isolate first, then the red is yours.
+
+A worktree is NOT free here, because three things it needs are untracked:
+
+| untracked | consequence | fix |
+|---|---|---|
+| `.pixi/` | no mojo, no max | `pixi install` (~1 min) |
+| `native/libglyph_engine.dylib` | link error, though `build.rs` names it | `pixi run build-engine` |
+| `engine/bench/bench.bin` | benches cannot RUN (they still COMPILE) | copy it from another tree |
+
+```bash
+git worktree add .claude/worktrees/<name> -b worktree-<name>
+cd .claude/worktrees/<name>
+pixi install && pixi run build-engine
+cp ../../../engine/bench/bench.bin engine/bench/    # optional
+./tools/check-all.sh
+```

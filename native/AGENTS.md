@@ -10,12 +10,35 @@ not by argument.
 bash tools/check-all.sh        # from the repo root; exit 0 = all green
 ```
 
-Six gates: (1) `cargo build --release` with **zero warnings**, (2)
-`cargo clippy --release` zero warnings, (3) `cargo test` all green (19 tests:
-naga WGSL validation, clap CLI parity, encase layout assertions), (4)
+**Run them in a WORKTREE if anyone else is working in this repo.** `check-all`
+reads the WORKING TREE, not HEAD, so a second thread's uncommitted edits will
+fail your gates and tell you nothing about your own change. That has already
+happened once. A fresh worktree is not free — `.pixi/`, the dylib and
+`engine/bench/bench.bin` are all untracked, so it needs:
+
+```bash
+git worktree add .claude/worktrees/<name> -b worktree-<name>
+cd .claude/worktrees/<name>
+pixi install                                   # ~1 min, .pixi is untracked
+pixi run build-engine                          # the dylib is untracked too
+cp ../../../engine/bench/bench.bin engine/bench/   # optional; benches only
+```
+
+Setup details and the toolchain's live constraints: `engine/TOOLCHAIN.md`.
+
+EIGHT gates since 2026-09-02 (was six). Two run FIRST — inputs before
+consumers: (1) three generators plus the atlas exporter each rebuild their
+committed output and require **byte-identity** (`engine-trie.bin`,
+`engine/glyph_schema.mojo`, the 16-file vendor manifest, the four
+`assets/atlas/*.bin`); (2) `engine/check.sh` — **16 Mojo conformance suites**
+(11 CPU + 5 GPU on Metal) plus a compile pass over all six benches. Then the
+original six: (3) `cargo build --release` with **zero warnings**, (4)
+`cargo clippy --release` zero warnings, (5) `cargo test` all green (26 tests:
+naga WGSL validation, clap CLI parity, encase layout assertions, ItemParams
+validation), (6)
 `--engine-check src/main.rs` — bit-exact Mojo engine vs the text.rs CPU
-oracle, (5) `tools/check-stage-g.sh` — scripted picks cross-checked against
-an independent python fold oracle, (6) four-view **byte-equal** A/B:
+oracle, (7) `tools/check-stage-g.sh` — scripted picks cross-checked against
+an independent python fold oracle, (8) four-view **byte-equal** A/B:
 demo / text / repo-zoom / repo-wide re-rendered into `out/tooling-ab/sweep/`
 and `cmp`'d against `out/tooling-ab/baseline/`. Any divergence means the
 commit is wrong — revert or fix, never re-baseline casually.
@@ -27,7 +50,11 @@ culling/picking (no GPU-dependent traversal order), and a fixed atlas. So a
 given commit + given input ⇒ byte-identical PNG. Everything that could break
 this is fenced:
 
-- `engine/` — READ-ONLY. The Mojo engine is built by pixi/mojo, not cargo.
+- `engine/` — not cargo's. The Mojo engine is built by pixi/mojo
+  (`pixi run build-engine`), never by the Rust build. It is no longer READ-ONLY
+  as this file once said — engine work happens here — but a change to it is
+  gated by `engine/check.sh` (16 suites) AND must leave the four render
+  baselines byte-equal. If an engine change moves a PNG, the change is wrong.
 - `assets/atlas/` — READ-ONLY. Atlas binaries define the glyph geometry.
 - `native/src/shaders/*.wgsl` — READ-ONLY without a dedicated stage; the naga
   test pins the shader *set*, encase tests pin the lane maps.
