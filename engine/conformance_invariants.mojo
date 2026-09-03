@@ -141,6 +141,63 @@ def idempotence(
     return (bad, paged)
 
 
+def build_topologies(n: Int) -> List[List[Item]]:
+    """Constructed item sets, because the FIXTURES are thin where these two
+    properties are thickest.
+
+    Idempotence needs PAGED items and the whole .pipe.bin corpus carries four —
+    enough that the anti-vacuity guard cannot go quiet, nowhere near enough to
+    trust a property that gates the entire page fan. Containment wants
+    wrap+page+depth together, which NO fixture has: real-kernels.pipe.bin is the
+    one that claims it and its page bag is typo'd inert (`rows`/`gapX` where the
+    oracle reads `pageRows`/`pageGapX`).
+
+    Neither property needs an oracle — that is the whole point of them — so
+    constructing topologies costs nothing but the writing. Items get DISTINCT
+    origins and MIXED page modes for the same reason conformance_matrix does it:
+    same-origin items make a wrong item resolution a no-op.
+    """
+    var out = List[List[Item]]()
+    var counts: List[Int] = [1, 3]
+    var wraps: List[Int] = [0, 7]
+    var modes: List[Int] = [1, 2]        # 1 row-paged, 2 column-paged
+    for ci in range(len(counts)):
+        var count = counts[ci]
+        for wi in range(len(wraps)):
+            for mi in range(len(modes)):
+                for si in range(2):
+                    var items = List[Item]()
+                    var per = n // count
+                    for i in range(count):
+                        var it = Item()
+                        it.byte_start = i * per
+                        it.byte_count = per if i < count - 1 else n - i * per
+                        it.line_height = 1.0 + Float64(i) * 0.25
+                        it.origin_x = Float64(i) * 11.0
+                        it.origin_y = Float64(i) * 101.0
+                        it.origin_z = Float64(i) * 3.0
+                        it.wrap_width = wraps[wi]
+                        it.z_step = 0.5
+                        # EVERY item paged here, unlike conformance_matrix's odd-only
+                        # rule: this sweep exists to feed idempotence, and an unpaged
+                        # item contributes nothing to it. Mixture is covered there.
+                        it.has_page = True
+                        it.pages_wide = 2
+                        it.page_gap_x = 1.0
+                        it.band_stride_y = 2.0
+                        it.depth_per_band = 0.25
+                        if modes[mi] == 1:
+                            it.page_rows = 4
+                        else:
+                            it.page_cols = 6
+                            it.depth_per_col = 0.125
+                        if si == 1:
+                            it.scroll_rows = 2
+                        items.append(it^)
+                    out.append(items^)
+    return out^
+
+
 def main() raises:
     var args = argv()
     if len(args) < 2:
@@ -159,6 +216,20 @@ def main() raises:
         var d = idempotence(name, fx.bytes, fx.trie, fx.items)
         bad += d[0]
         total_paged += d[1]
+
+        # Constructed topologies on this fixture's bytes and trie. No oracle is
+        # involved, so these cost nothing to invent and they are where the paged
+        # coverage actually comes from.
+        if a == 1:
+            var tops = build_topologies(len(fx.bytes))
+            for t in range(len(tops)):
+                var tname = path + " [topology " + String(t) + "]"
+                var tc = containment(tname, fx.bytes, fx.trie, tops[t])
+                bad += tc[0]
+                total_quads += tc[1]
+                var td = idempotence(tname, fx.bytes, fx.trie, tops[t])
+                bad += td[0]
+                total_paged += td[1]
 
     # ANTI-VACUITY. Both properties are "nothing went wrong" shapes, which pass
     # loudest when nothing happened at all. real-kernels.pipe.bin is the standing
