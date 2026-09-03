@@ -57,37 +57,71 @@ reference pipeline — so they were outside every gate entirely. `engine/check.s
 now COMPILES every bench file (`check.sh bench`, and in the default `all` path).
 Mutation-proved: restoring the old spelling fails the gate at parse.
 
-## 3. `TaskGroup` — ALREADY MIGRATED, ONTO A PRIVATE MODULE. Unresolved.
+## 3. `TaskGroup` — RESOLVED FROM SOURCE (2026-09-02). Migration scoped, not done.
 
-15 `TaskGroup()` constructions across 4 files are the entire CPU parallel driver.
-This tree already had to move, and moved to:
+Mojo is open source and the tree is at `viz-native/modular/`, so this stopped
+being a measurement question and became a reading one.
+
+**`std.algorithm.map` is NOT the replacement.** Its whole body is:
 
 ```mojo
-from std.runtime import parallelism_level          # correct, and permanent
-from std.runtime._asyncrt import TaskGroup         # PRIVATE MODULE
+for i in range(size):
+    func(i)
 ```
 
-`parallelism_level()` moving up a level is settled and right. `TaskGroup` is the
-open one: the nightly `std/runtime` docs say the async primitives live in the
-private `_asyncrt` module, that Mojo's async support is unfinished and carries no
-stability guarantees, and — in as many words — *do not build async patterns on
-it yet*. A nightly search for `TaskGroup` returns zero hits.
+(`Mojo/stdlib/std/algorithm/backend/cpu/map.mojo`). A serial loop. Rewriting 15
+sites onto it would have silently turned the parallel driver into a sequential
+one — the ledger's 2.7x quietly becoming 1x, with every conformance suite still
+green because the RESULTS are identical. Exactly the failure shape this repo
+keeps catching, and it was one plausible-looking doc sentence away.
 
-So the parallel driver rests on an API with no stability promise and no
-deprecation path: private modules do not get one. It works on the pinned build.
-It can vanish in any nightly.
+**There is no public `TaskGroup`.** Confirmed twice: `max/mojo/max/runtime/asyncrt.mojo`
+does not define one, and a build probe on the pinned nightly answers
+`module 'asyncrt' does not contain 'TaskGroup'`. `std.runtime._asyncrt` is the
+only one, and it is private.
 
-**The candidate replacement exists here but is unverified.** `std.algorithm.map`
-imports cleanly on this build and is shaped exactly like the shard loops (a
-unified closure over `[0, size)`). But the docs do not state that it is parallel,
-and `parallelize` returns zero hits in both stable and nightly.
+**The public parallel primitive is `max.algorithm.parallelize`** — the same
+consolidation as `std.gpu` -> `max.gpu`, and in a package this repo ALREADY
+depends on. `max/mojo/max/algorithm/__init__.mojo` exports `parallelize`,
+`parallelize_over_rows` and `sync_parallelize`. Verified running on the pinned
+build, not just importable:
 
-**Do not rewrite 15 sites on that hope — measure first.**
-`engine/bench/split_bench.mojo` already carries the shard harness that can tell a
-parallel `map` from a serial one in a single run, and the README's ledger records
-what the current driver buys (2.7x). A silent fall to serial would show up as a
-regression in that number rather than as an error, which is precisely the
-green-that-lies shape this repo keeps catching. The measurement is the gate.
+```
+workers: 4  results: 0 9 49        # parallelize(body, 8) over i*i
+```
+
+It does not use `_asyncrt` at all: it goes through `DeviceContext(api="cpu")`,
+`enqueue_cpu_range`, `synchronize()`.
+
+**All 15 sites are the same shape**, which makes the migration mechanical:
+
+```mojo
+var tg = TaskGroup()                      def body(w: Int) {imm ...}:
+for w in range(workers):                      var a = shard_lo(0, n, workers, w)
+    var a = shard_lo(0, n, workers, w)        var b = shard_lo(0, n, workers, w + 1)
+    var b = shard_lo(0, n, workers, w+1)      _shard(..., w, a, b)
+    tg.create_task(_shard(..., w, a, b))  parallelize(body, workers)
+tg.wait()
+```
+
+No nesting, no inter-task dependencies, no task results — every one of the 15 is
+`create_task` in a `for w in range(workers)` loop followed by `wait()`.
+
+**Why it is scoped and not done here.** Three reasons, in order:
+
+1. **The 2.7x must be re-measured, not assumed.** `parallelize` creates and
+   synchronizes a `DeviceContext` per call; `glyph_scan.mojo` alone opens EIGHT
+   groups per run. The `ctx` parameter exists precisely so one context can be
+   reused across them, and whether that matters is a measurement.
+   `bench/split_bench.mojo` is the harness.
+2. **It touches the two most-shared files.** `glyph_pipeline.mojo` and
+   `glyph_scan.mojo` are otherwise near-byte-identical to the web tree; 15 edits
+   there is a deliberate widening of the fork, not a drive-by.
+3. Nothing is on fire. The private import works on a tracked, pinned lock, and
+   `check.sh` fails loudly at parse if a `pixi update` ever moves past it.
+
+So: a scoped change of its own, with split_bench as its gate — not a bullet in
+this file's margin.
 
 ## Checked and clear on this channel
 
