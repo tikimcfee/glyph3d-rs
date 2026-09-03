@@ -71,10 +71,10 @@ def check_case(path: String, chunk_size: Int, group_size: Int) raises -> Int:
         print("  misses count:", len(got.misses), "expected", len(fx.exp_misses))
         bad += 1
     for i2 in range(fx.byte_len):
-        if got.ord_to_byte[i2] != fx.exp_ord[i2]:
+        if got.ord_to_byte[i2] != fx.exp_ord_to_byte[i2]:
             bad += 1
             if printed < MAX_PRINTED:
-                print("  ordToByte[", i2, "]:", got.ord_to_byte[i2], "expected", fx.exp_ord[i2])
+                print("  ordToByte[", i2, "]:", got.ord_to_byte[i2], "expected", fx.exp_ord_to_byte[i2])
                 printed += 1
 
     for slot in range(fx.byte_len):

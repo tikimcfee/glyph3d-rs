@@ -26,6 +26,7 @@
 use std::fmt::Write as _;
 use std::path::Path;
 
+use crate::fold::{run_pipeline, Item};
 use crate::glyph_trie::{build_glyph_trie, GlyphMetrics, BLOCK_SHIFT, ENTRY_LANES};
 use crate::text::{ResolveGlyph, WorldEntry};
 
@@ -165,39 +166,6 @@ impl<'a> Reader<'a> {
     }
 }
 
-/// One item: a byte range plus layout params.
-///
-/// FIELD ORDER MATTERS and is `Item` in glyph_pipeline.mojo, because
-/// `manifest()` hashes these in declaration order and the Mojo emitter hashes
-/// its own struct the same way. Reordering here silently breaks the parity
-/// gate — which is the point.
-///
-/// The five integer page-geometry params are `i64` and truncate at load, not
-/// at read: that is the 2026-08-31 kind correction, where params declared
-/// 'measure' only because the table holding them was NAMED measures were
-/// re-declared as the counts they are.
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub struct Item {
-    pub byte_start: i64,
-    pub byte_count: i64,
-    pub origin_x: f64,
-    pub origin_y: f64,
-    pub origin_z: f64,
-    pub wrap_width: i64,
-    pub z_step: f64,
-    pub line_height: f64,
-    pub has_page: bool,
-    pub page_rows: i64,
-    pub page_cols: i64,
-    pub scroll_rows: i64,
-    pub pages_wide: i64,
-    pub page_gap_x: f64,
-    pub band_stride_y: f64,
-    pub depth_per_band: f64,
-    pub depth_per_col: f64,
-    pub page_line_height: f64,
-}
-
 /// The fixture's own trie, in the carriers this layer realizes.
 ///
 /// On disk a v3 fixture stores blocks as f64 VALUES in entry-major lane order
@@ -243,7 +211,7 @@ pub struct PipeFixture {
     pub items: Vec<Item>,
     pub exp_leaders: u32,
     pub exp_misses: Vec<u32>,
-    pub exp_ord: Vec<u32>,
+    pub exp_ord_to_byte: Vec<u32>,
     /// VALUES (f64 carrier) — narrowed to f32 at COMPARISON, once.
     pub exp_measures: Vec<f64>,
     /// EXACT — counts have no carrier question.
@@ -335,9 +303,9 @@ fn load_pipe_bytes(raw: &[u8], name: String) -> Result<PipeFixture, String> {
     for _ in 0..miss_count {
         exp_misses.push(r.u32()?);
     }
-    let mut exp_ord = Vec::with_capacity(byte_len);
+    let mut exp_ord_to_byte = Vec::with_capacity(byte_len);
     for _ in 0..byte_len {
-        exp_ord.push(r.u32()?);
+        exp_ord_to_byte.push(r.u32()?);
     }
     let mut exp_measures = Vec::with_capacity(byte_len * FIXTURE_MEASURE_STRIDE);
     for _ in 0..byte_len * FIXTURE_MEASURE_STRIDE {
@@ -382,7 +350,7 @@ fn load_pipe_bytes(raw: &[u8], name: String) -> Result<PipeFixture, String> {
         items,
         exp_leaders,
         exp_misses,
-        exp_ord,
+        exp_ord_to_byte,
         exp_measures,
         exp_counts,
         exp_item_bounds,
@@ -490,9 +458,9 @@ impl PipeFixture {
         for &v in &self.exp_misses {
             h_miss.u32(v);
         }
-        let mut h_ord = Fnv::default();
-        for &v in &self.exp_ord {
-            h_ord.u32(v);
+        let mut h_otb = Fnv::default();
+        for &v in &self.exp_ord_to_byte {
+            h_otb.u32(v);
         }
         let mut h_meas = Fnv::default();
         for &v in &self.exp_measures {
@@ -525,14 +493,14 @@ impl PipeFixture {
         );
         let _ = write!(
             s,
-            " h.bytes={} h.tindex={} h.tm={} h.tc={} h.items={} h.miss={} h.ord={} h.meas={} h.cnt={} h.bnds={} h.batch={}",
+            " h.bytes={} h.tindex={} h.tm={} h.tc={} h.items={} h.miss={} h.otb={} h.meas={} h.cnt={} h.bnds={} h.batch={}",
             h_bytes.hex(),
             h_tindex.hex(),
             h_tm.hex(),
             h_tc.hex(),
             h_items.hex(),
             h_miss.hex(),
-            h_ord.hex(),
+            h_otb.hex(),
             h_meas.hex(),
             h_cnt.hex(),
             h_bnds.hex(),
@@ -957,6 +925,158 @@ pub fn rebuild_trie_and_diff(fx: &PipeFixture) -> TrieRebuild {
         entries,
         block_count: built.block_count,
         mapped: built.mapped,
+        bad,
+    }
+}
+
+// ── Stage 2: the whole fold against the whole corpus ─────────────────────
+
+/// What a full-fold comparison found.
+pub struct FoldDiff {
+    pub bytes: usize,
+    pub leaders: usize,
+    /// Per-byte lanes compared: 8 measure + 4 count.
+    pub lanes: usize,
+    pub bad: Vec<String>,
+}
+
+/// The number of per-byte lanes this comparison covers. All of them — stage 0
+/// could not produce BASE_X's twin LINE_ADV or the FLAGS/ORD witness lanes, and
+/// stage 2 has no such gap, so nothing here is "compared where convenient."
+const FOLD_MEASURE_LANES: usize = FIXTURE_MEASURE_STRIDE;
+const FOLD_COUNT_LANES: usize = FIXTURE_COUNT_STRIDE;
+
+/// Run the ported fold over a fixture and compare EVERY lane of EVERY byte,
+/// plus the miss list, leader count, per-item boxes and batch union.
+///
+/// Non-leader bytes are compared too, not skipped: zero is their DEFINED state
+/// (decode zeroes their static lanes, the fold zeroes their positional ones,
+/// the gap sweep covers bytes no item claims), so a port that left them dirty
+/// must fail. Skipping them would have quietly excused a whole third of the
+/// coverage contract.
+pub fn diff_full_fold(fx: &PipeFixture) -> FoldDiff {
+    let r = run_pipeline(&fx.bytes, &fx.trie, &fx.items);
+    let mut bad = Vec::new();
+
+    if r.leaders != fx.exp_leaders as usize {
+        bad.push(format!("leaders: got {} vs fixture {}", r.leaders, fx.exp_leaders));
+    }
+    if r.misses != fx.exp_misses {
+        bad.push(format!(
+            "miss list: got {} entries vs fixture {} (first divergence at {:?})",
+            r.misses.len(),
+            fx.exp_misses.len(),
+            r.misses
+                .iter()
+                .zip(fx.exp_misses.iter())
+                .position(|(a, b)| a != b)
+        ));
+    }
+
+    for id in 0..fx.byte_len {
+        for lane in 0..FOLD_MEASURE_LANES {
+            let exp = fx.exp_measures[id * FIXTURE_MEASURE_STRIDE + lane];
+            if lane == FIX_M_GLYPH_ID {
+                // GLYPH_ID IS EXACT. The Mojo's `m_at` deliberately REFUSES to
+                // return an f32 view of this lane — "a checker must carry it the
+                // way the pipeline does" — so it is compared as u32 here. An f32
+                // comparison would be a second carrier with its own rounding,
+                // and the whole reason this lane moved out of a float array is
+                // that a container's mistake travels to everything it feeds.
+                let got = r.slots.gi[id];
+                let want = exp as u32;
+                if got != want {
+                    bad.push(format!("byte {id} GLYPH_ID: got {got} vs fixture {want}"));
+                }
+                continue;
+            }
+            // The narrowing point: the fixture carries f64 VALUES, the engine
+            // carries f32, so the expectation narrows ONCE and the comparison
+            // is on BITS.
+            let got = match lane {
+                FIX_M_X => r.slots.x(id),
+                FIX_M_Y => r.slots.y(id),
+                FIX_M_Z => r.slots.z(id),
+                FIX_M_ADVANCE => r.slots.advance(id),
+                FIX_M_HEIGHT => r.slots.height(id),
+                FIX_M_BASE_X => r.slots.base_x(id),
+                _ => r.slots.wm[id], // LINE_ADV, the witness lane
+            };
+            let want = exp as f32;
+            if got.to_bits() != want.to_bits() {
+                bad.push(format!(
+                    "byte {id} lane {lane} ({}): got {:#010x} ({got}) vs fixture {:#010x} ({want})",
+                    measure_lane_name(lane),
+                    got.to_bits(),
+                    want.to_bits()
+                ));
+            }
+        }
+        for lane in 0..FOLD_COUNT_LANES {
+            let want = fx.exp_counts[id * FIXTURE_COUNT_STRIDE + lane];
+            let got = match lane {
+                FIX_C_ROW => r.slots.lc[id * 2],
+                FIX_C_COL => r.slots.lc[id * 2 + 1],
+                FIX_C_FLAGS => r.slots.fl[id],
+                _ => r.slots.wc[id], // ORD, the witness lane
+            };
+            if got != want {
+                bad.push(format!(
+                    "byte {id} lane {lane} ({}): got {got} vs fixture {want}",
+                    count_lane_name(lane)
+                ));
+            }
+        }
+        // ordToByte is the INVERSE map (ord -> byte), not a second copy of the
+        // ORD lane. It is indexed by `byte_start + ord` within each item, and
+        // the fold fills only that prefix — the tail stays zero, which is why
+        // the array is zero-initialized rather than left uninitialized.
+        //
+        // Comparing it to the ORD lane is what the first version of this check
+        // did, on the strength of the loader field being named `exp_ord`. Every
+        // multi-byte fixture reddened and the FIX_C_ORD lane beside it passed,
+        // which is what named the mistake. The field is `exp_ord_to_byte` now.
+        if r.slots.ord_to_byte[id] != fx.exp_ord_to_byte[id] {
+            bad.push(format!(
+                "byte {id} ordToByte: got {} vs fixture {}",
+                r.slots.ord_to_byte[id], fx.exp_ord_to_byte[id]
+            ));
+        }
+    }
+
+    // Boxes and the batch union arrive as u64 BIT PATTERNS, so they compare as
+    // bits — which also means an infinity or a NaN is caught like any other
+    // value rather than slipping through a float compare.
+    for (i, &want_bits) in fx.exp_item_bounds.iter().enumerate() {
+        let got = r.item_bounds[i];
+        if got.to_bits() != want_bits {
+            bad.push(format!(
+                "item {} box lane {}: got {} ({:#018x}) vs fixture {} ({:#018x})",
+                i / 8,
+                i % 8,
+                got,
+                got.to_bits(),
+                f64::from_bits(want_bits),
+                want_bits
+            ));
+        }
+    }
+    for (l, &want_bits) in fx.exp_batch.iter().enumerate() {
+        let got = r.batch_bounds[l];
+        if got.to_bits() != want_bits {
+            bad.push(format!(
+                "batch lane {l}: got {got} ({:#018x}) vs fixture {} ({:#018x})",
+                got.to_bits(),
+                f64::from_bits(want_bits),
+                want_bits
+            ));
+        }
+    }
+
+    FoldDiff {
+        bytes: fx.byte_len,
+        leaders: r.leaders,
+        lanes: fx.byte_len * (FOLD_MEASURE_LANES + FOLD_COUNT_LANES),
         bad,
     }
 }

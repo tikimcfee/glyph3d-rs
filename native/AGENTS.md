@@ -33,7 +33,7 @@ committed output and require **byte-identity** (`engine-trie.bin`,
 `assets/atlas/*.bin`); (2) `engine/check.sh` — **16 Mojo conformance suites**
 (11 CPU + 5 GPU on Metal) plus a compile pass over all six benches. Then the
 original six: (3) `cargo build --release` with **zero warnings**, (4)
-`cargo clippy --release` zero warnings, (5) `cargo test` all green (44 tests:
+`cargo clippy --release` zero warnings, (5) `cargo test` all green (48 tests:
 naga WGSL validation, clap CLI parity, encase layout assertions, ItemParams
 validation, and the fixture reader + differ), (6)
 `--engine-check src/main.rs` — bit-exact Mojo engine vs the text.rs CPU
@@ -49,7 +49,11 @@ FNV-1a checksums over their **parsed** values across all 14 fixtures, and
 lanes on every fixture inside its domain (4 today, 5332 records). It fails if
 nothing was in domain. Stage 1 added a third half: every fixture's trie rebuilt
 from its own BYTES by the ported `GlyphTrie` (`native/src/glyph_trie.rs`) and
-compared through the wire-order serializer — 14 fixtures, 11520 entries.
+compared through the wire-order serializer — 14 fixtures, 11520 entries. Stage 2
+added a fourth: the ported serial fold (`native/src/fold.rs`) run over the whole
+corpus with **every lane of every byte** compared bit-exact, plus `ordToByte`,
+misses, leaders, per-item boxes and the batch union — 14 fixtures, 149,767
+leaders, 1,807,512 lanes.
 
 ## The determinism chain (why the gates can be this strict)
 

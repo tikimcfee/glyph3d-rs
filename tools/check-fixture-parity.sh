@@ -20,6 +20,12 @@
 # the stored trie's structure is handed back to the builder, so block layout,
 # insertion ORDER and the decoder choice are all under test.
 #
+# Plus the full fold (--fixture-fold, stage 2): the ported serial fold run over
+# every fixture with EVERY lane of EVERY byte compared bit-exact, plus the miss
+# list, leader count, per-item boxes and batch union. Non-leader bytes are
+# compared too — zero is their defined state, so a port that leaves them dirty
+# must fail.
+#
 # Plus the corpus diff (--fixture-diff): text.rs's CPU fold laid against every
 # fixture inside its domain and compared BIT-EXACT to the oracle's own expected
 # lanes. That half fails if NOTHING was in domain, because a differ that
@@ -63,6 +69,12 @@ if OUT=$("$BIN" --fixture-trie "${FIX[@]}" 2>&1); then
     echo "PASS  trie rebuild — $(echo "$OUT" | tail -1)"
 else
     echo "FAIL  trie rebuild:"; echo "$OUT" | tail -20; FAIL=1
+fi
+
+if OUT=$("$BIN" --fixture-fold "${FIX[@]}" 2>&1); then
+    echo "PASS  full fold — $(echo "$OUT" | tail -1)"
+else
+    echo "FAIL  full fold:"; echo "$OUT" | tail -20; FAIL=1
 fi
 
 if OUT=$("$BIN" --fixture-diff "${FIX[@]}" 2>&1); then

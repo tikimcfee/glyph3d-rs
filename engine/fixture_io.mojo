@@ -68,7 +68,7 @@ struct PipeFixture(Movable):
     var items: List[Item]
     var exp_leaders: Int
     var exp_misses: List[UInt32]
-    var exp_ord: List[UInt32]
+    var exp_ord_to_byte: List[UInt32]
     var exp_measures: List[Float64]  # VALUES (f64 carrier)
     var exp_counts: List[UInt32]     # EXACT — counts have no carrier question
     var exp_item_bounds: List[UInt64]
@@ -82,7 +82,7 @@ struct PipeFixture(Movable):
         self.items = List[Item]()
         self.exp_leaders = 0
         self.exp_misses = List[UInt32]()
-        self.exp_ord = List[UInt32]()
+        self.exp_ord_to_byte = List[UInt32]()
         self.exp_measures = List[Float64]()
         self.exp_counts = List[UInt32]()
         self.exp_item_bounds = List[UInt64]()
@@ -159,7 +159,7 @@ def load_pipe_fixture(path: String) raises -> PipeFixture:
     for _ in range(miss_count):
         fx.exp_misses.append(r.u32())
     for _ in range(fx.byte_len):
-        fx.exp_ord.append(r.u32())
+        fx.exp_ord_to_byte.append(r.u32())
     for _ in range(fx.byte_len * FIXTURE_MEASURE_STRIDE):
         fx.exp_measures.append(r.f64())
     for _ in range(fx.byte_len * FIXTURE_COUNT_STRIDE):

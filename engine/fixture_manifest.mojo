@@ -122,9 +122,9 @@ def main() raises:
         var h_miss = Fnv()
         for i in range(len(fx.exp_misses)):
             h_miss.u32(fx.exp_misses[i])
-        var h_ord = Fnv()
-        for i in range(len(fx.exp_ord)):
-            h_ord.u32(fx.exp_ord[i])
+        var h_otb = Fnv()
+        for i in range(len(fx.exp_ord_to_byte)):
+            h_otb.u32(fx.exp_ord_to_byte[i])
         var h_meas = Fnv()
         for i in range(len(fx.exp_measures)):
             h_meas.f64(fx.exp_measures[i])
@@ -157,7 +157,7 @@ def main() raises:
             "h.tc=" + hex16(h_tc.h),
             "h.items=" + hex16(h_items.h),
             "h.miss=" + hex16(h_miss.h),
-            "h.ord=" + hex16(h_ord.h),
+            "h.otb=" + hex16(h_otb.h),
             "h.meas=" + hex16(h_meas.h),
             "h.cnt=" + hex16(h_cnt.h),
             "h.bnds=" + hex16(h_bnds.h),

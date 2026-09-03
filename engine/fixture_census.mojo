@@ -19,33 +19,47 @@ from glyph_schema import FIXTURE_COUNT_STRIDE as COUNT_STRIDE, FIX_C_FLAGS as C_
 
 
 struct Range(Copyable, Movable):
+    """Distinct-value detector, with NaN as a value in its own right.
+
+    NaN IS SEGREGATED, and that is not fussiness. The first version let NaN into
+    lo/hi, where it poisoned them permanently: every later comparison against a
+    NaN bound is false, so lo and hi stayed NaN no matter what followed, and the
+    field reported UNIFORM. That is a verification instrument reporting a blind
+    spot that is not there — found 2026-09-03 when it claimed
+    `page_line_height always nan` for a corpus whose five paged fixtures carry
+    1.0, 1.1, 1.2 and 1.3. Same family as everything else this file hunts: the
+    checker had a fault the checked did not."""
+
     var lo: Float64
     var hi: Float64
-    var seen: Bool
+    var n_seen: Int
+    var nan_seen: Bool
 
     def __init__(out self):
         self.lo = 0
         self.hi = 0
-        self.seen = False
+        self.n_seen = 0
+        self.nan_seen = False
 
     def add(mut self, v: Float64):
-        if not self.seen:
+        if v != v:
+            self.nan_seen = True
+            return
+        if self.n_seen == 0:
             self.lo = v
             self.hi = v
-            self.seen = True
         else:
             if v < self.lo:
                 self.lo = v
             if v > self.hi:
                 self.hi = v
+        self.n_seen += 1
 
     def uniform(self) -> Bool:
-        # NaN != NaN, so an all-NaN field reports lo != hi and would look varied.
-        # Treat two NaNs as the same value: for this purpose "always unset" IS
-        # uniform, and is exactly the kind of thing worth reporting.
-        if self.lo != self.lo and self.hi != self.hi:
-            return True
-        return self.lo == self.hi
+        var distinct = 1 if self.nan_seen else 0
+        if self.n_seen > 0:
+            distinct += 1 if self.lo == self.hi else 2
+        return distinct <= 1
 
 
 comptime NFIELD = 16
@@ -250,7 +264,8 @@ def main() raises:
         uniform += 1
     for i in range(NFIELD):
         if f[i].uniform():
-            print("  ", field_name(i), "always", f[i].lo)
+            var val = String("nan") if f[i].n_seen == 0 else String(f[i].lo)
+            print("  ", field_name(i), "always", val)
             uniform += 1
     if miss_r.lo == 0 and miss_r.hi == 0:
         print("  misses          always 0  <-- no fixture exercises a trie miss")

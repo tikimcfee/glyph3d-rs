@@ -41,7 +41,7 @@ instead of a promise.
 |---|---|---|---|
 | **0** ✅ | Rust `.pipe.bin` reader + bit-exact differ | reads all 14 fixtures; counts agree with `engine/fixture_io.mojo` | none, pure plumbing |
 | **1** ✅ | `GlyphTrie` -> Rust | rebuilds a fixture's trie BYTES | the ordering landmine |
-| **2** | serial fold -> Rust | fixture expected measures BIT-EXACT | the float discipline |
+| **2** ✅ | serial fold -> Rust | fixture expected measures BIT-EXACT | the float discipline |
 | **3** | scan form -> Rust | tiered agreement with stage 2 | monoid associativity |
 | **4** | bake -> Rust | the 8 `.bake.bin` fixtures | lowest |
 
@@ -97,7 +97,66 @@ function of the codepoint. Two things that recipe pinned down:
   layer earlier.
 
 Eight mutations were run; seven reddened and the eighth found the dedup ceiling
-above. Six mutations were run
+above.
+
+**Stage 2 is DONE** (2026-09-03). `native/src/fold.rs` is the port: decode ->
+fold -> paginate -> per-item boxes -> batch union, serial. The Mojo shards all
+four of those, but every decomposition is over disjoint ranges or an exact
+min/max, so the parallelism is not part of the contract and nothing here
+reproduces it.
+
+`--fixture-fold` compares **EVERY lane of EVERY byte** — all 8 measure lanes and
+all 4 count lanes — plus `ordToByte`, the miss list, the leader count, every
+per-item box and the batch union. **14 fixtures, 149,767 leaders, 1,807,512
+per-byte lanes, bit-exact.** Non-leader bytes are compared too rather than
+skipped: zero is their defined state, so a port that leaves them dirty fails.
+
+GLYPH_ID is compared as **u32**, not through an f32 view. The Mojo's `m_at`
+refuses to return one for that lane — "a checker must carry it the way the
+pipeline does" — and this comparison honors that.
+
+Two corrections worth carrying:
+
+- **`exp_ord` was a misleading name and it cost a wrong comparison.** The
+  section is `u32[byteLen] ordToByte` (gen.mjs), the INVERSE map, not a second
+  copy of the ORD lane. The first version of the check compared it to ORD on the
+  strength of the field name; every multi-byte fixture reddened while the
+  FIX_C_ORD lane beside it passed, which is what named the mistake. The field is
+  `exp_ord_to_byte` now, in Rust and Mojo alike, and the manifest key is `h.otb`.
+- **`fixture_census.mojo` was inventing a blind spot.** Its `Range` let NaN into
+  `lo`/`hi`, where it poisoned them permanently — every comparison against a NaN
+  bound is false — so any field whose FIRST value was NaN reported UNIFORM. It
+  claimed `page_line_height always nan` for a corpus whose five paged fixtures
+  carry 1.0, 1.1, 1.2 and 1.3. NaN is now segregated and counted as its own
+  value; the census reports "every field varies."
+
+### The corpus ceilings stage 2 found
+
+16 mutations; **14 reddened**. The two that did not are properties of the CORPUS,
+and both are now covered by unit tests in `fold.rs` that were each verified to
+fail under the mutation the corpus lets through:
+
+| mutation | why the corpus cannot see it | covered by |
+|---|---|---|
+| paginate stops skipping non-leader bytes | the only paged fixture with a non-leader (`real-kernels`) has origin_y = origin_z = 0, so remapping a zero row/col/base_x writes zeros back | `paginate_leaves_non_leader_bytes_alone` |
+| paginate consults `page_line_height` | every paged fixture has `page_line_height == line_height` — so the fallback DELETED as unreachable in 4697e3b is unverified by the corpus | `paginate_ignores_page_line_height` |
+
+Two further mutations were **semantically no-ops**, not ceilings, and saying so
+matters because they print identically to a ceiling:
+
+- `screen_row % rows` for `screen_row - y_page * rows` is IDENTICAL for every
+  `screen_row > -rows`, which is the whole corpus (`paged-rows` scrolls 3 against
+  6 rows). Covered anyway by
+  `a_row_scrolled_past_a_whole_page_stays_in_flow`.
+- `write_bounds` forced true for paged items is a dead store: the bounds pass
+  resets lanes 0-5 to ±inf and recomputes them. The flag is an optimization,
+  not a correctness condition.
+
+And one mutation in the first battery **did not land at all** — the `seg_adv`
+f64 attempt only introduced an unused variable, so its green meant "I failed to
+break it," not "the corpus cannot see it." Redone properly it reddens 6
+fixtures. That is the distinction this repo keeps paying for: assert the edit
+changed the ARITHMETIC, not just the text. Six mutations were run
 against gate 9 — swapped item fields, swapped carrier split, a reordered
 section of identical size, a dropped trailing section, the f32 `line_adv`, and
 every fixture forced out of domain — and all six reddened.
@@ -165,6 +224,18 @@ inside one function and the compiler will not tell you which one you got.
 Related: `conformance.mojo` bit-pins X only up to x ~ 3.5k (that is as far as
 `long-line.pipe.bin` reaches). Above that the f64 accumulation is unpinned in
 every layer, so a drift there fails no existing gate.
+
+**RESOLVED in stage 2** (`native/src/fold.rs`, 2026-09-03). BOTH float regimes
+are discriminated by the corpus, verified by mutation:
+
+- `line_adv` in f32 instead of f64 reddens 13 fixtures at one ulp of X/BASE_X
+  (`0x40c8ab37` vs `0x40c8ab36`).
+- `seg_adv` in f64 instead of f32 reddens 6 fixtures, also one ulp
+  (`0x4137e7d5` vs `0x4137e7d6`).
+- Narrowing Y twice instead of once reddens 2 fixtures
+  (`-0.1500001` vs `-0.15`).
+
+The table is reproduced in the Rust source, as this plan asked.
 
 ## Other things known before starting
 
