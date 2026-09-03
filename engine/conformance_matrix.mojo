@@ -35,7 +35,8 @@
 #          engine/fixtures/repo-file.pipe.bin
 
 from std.sys import argv
-from glyph_schema import LC_STRIDE, LC_ROW, LC_COL
+from std.collections import Dict
+from glyph_schema import LC_STRIDE, LC_ROW, LC_COL, LM_STRIDE, LM_Z
 from glyph_pipeline import (
     run_pipeline, Item, Trie, F_LEADER, F_RENDERED, F_MISSING, page_active,
 )
@@ -110,12 +111,13 @@ def build_items(n: Int, count: Int, wrap: Int, page: Int, scroll: Bool) -> List[
 def check(
     name: String, bytes: List[UInt8], trie: Trie, items: List[Item],
     want_wrap: Int, want_page: Int, want_scroll: Bool,
-) -> Int:
+) -> Tuple[Int, Int]:
     """Five invariants that hold for ANY input, plus the engagement check that
     says the cell exercised what its label claims. No oracle required."""
     var n = len(bytes)
     var r = run_pipeline(bytes, trie, items)
     var bad = 0
+    var z_classes = 0
 
     # ── 0. ENGAGEMENT. The five invariants below are SELF-CONSISTENT: they compare
     #      the pipeline's output against itself, so a cell where the property under
@@ -341,7 +343,71 @@ def check(
                 break
             last = row
 
-    return bad
+    # ── 6. Z IS A STEP FUNCTION OF THE INTEGER LANES. Depth is the one output
+    #      nothing in this tree asserts a PROPERTY of: gpu_paginate compares its
+    #      value against the CPU and gpu_bounds folds it into min/max, but no
+    #      suite says what Z must BE. It is also about to matter — the renderer
+    #      passes depth_per_band = depth_per_col = z_step = 0 today, so every z
+    #      term is zero at runtime and turning depth on lights up a path that has
+    #      only ever run in constructed topologies like this one.
+    #
+    #      The invariant, without transcribing the float formula: paginate builds
+    #      Z from `seg`, `band` and `x_page` — all INTEGER quotients of the ROW
+    #      and COL lanes — plus per-item constants. So Z is QUANTIZED: two glyphs
+    #      of one item sharing a (seg, band, x_page) class must carry bit-identical
+    #      Z. This never computes what Z should be, only that it is a pure function
+    #      of the integers, which is what catches an accumulation, a drift, or a Z
+    #      that came to depend on something continuous.
+    for i in range(len(items)):
+        var it = items[i].copy()
+        var rows = it.page_rows if it.has_page else 0
+        var cols = it.page_cols if it.has_page else 0
+        var scroll_n = it.scroll_rows if it.has_page else 0
+        var wide = it.pages_wide if it.pages_wide > 1 else 1
+        var wrap = it.wrap_width
+        var seen = Dict[Int, UInt32]()
+        var distinct_z = Dict[UInt32, Int]()
+        var stop = it.byte_start + it.byte_count
+        for id in range(it.byte_start, stop):
+            if id >= n:
+                break
+            var f = Int(r.fl[id])
+            if (f & F_LEADER) == 0 or (f & F_RENDERED) == 0:
+                continue
+            var row = Int(r.lc[id * LC_STRIDE + LC_ROW])
+            var col = Int(r.lc[id * LC_STRIDE + LC_COL])
+            var screen_row = row - scroll_n
+            var y_page = 0
+            if rows > 0 and screen_row >= rows:
+                y_page = screen_row // rows
+            var x_page = col // cols if cols > 0 else 0
+            var band = y_page // wide
+            var seg = (col // wrap) if wrap > 0 else 0
+            if seg >= 65536 or band >= 65536 or x_page >= 65536:
+                continue          # the packed key would alias; not for this corpus
+            var key = (seg * 65536 + band) * 65536 + x_page
+            var zbits = UInt32(r.lm[id * LM_STRIDE + LM_Z].to_bits())
+            var prior = seen.get(key)
+            if prior:
+                if prior.value() != zbits:
+                    bad += 1
+                    if printed < MAX_PRINTED:
+                        print("  ", name, "item", i, "byte", id,
+                              "Z differs within one (seg,band,x_page) class:",
+                              "seg", seg, "band", band, "x_page", x_page)
+                        printed += 1
+                    break
+            else:
+                seen[key] = zbits
+            distinct_z[zbits] = 1
+        # DISTINCT Z VALUES, not distinct class keys. Counting keys was the first
+        # version and it measures the wrong thing: seg/band/x_page stay diverse
+        # even when their coefficients are all zero, so flattening depth entirely
+        # left the tally unmoved and the anti-vacuity green. Caught by mutation,
+        # not by reading.
+        z_classes += len(distinct_z)
+
+    return (bad, z_classes)
 
 
 def main() raises:
@@ -353,6 +419,7 @@ def main() raises:
     var n = 3000
     var bad = 0
     var cases = 0
+    var total_z_classes = 0
 
     # THE MATRIX. items x wrap x page x scroll x misses — every cell, including the
     # five pairs the corpus never carried together.
@@ -375,16 +442,32 @@ def main() raises:
                         label += " page=" + String(pages[pi])
                         label += " scroll=" + String(1 if scroll else 0)
                         label += " miss=" + String(1 if with_misses else 0)
-                        var b = check(
+                        var res = check(
                             label, bytes, fx.trie, items,
                             wraps[wi], pages[pi], scroll,
                         )
+                        var b = res[0]
+                        total_z_classes += res[1]
                         cases += 1
                         if b != 0:
                             print("FAIL", label, "-", b, "defects")
                         bad += b
 
+    # ANTI-VACUITY for invariant 6. Every item contributes at least one Z class,
+    # so a run where depth NEVER varied yields exactly one per item and the
+    # per-class equality holds trivially over singletons. Anything above the item
+    # count means some item genuinely spanned multiple depth planes and the
+    # invariant had something to compare.
+    var min_classes = 0
+    for ic2 in range(len(item_counts)):
+        min_classes += item_counts[ic2] * 2 * len(pages) * 2 * 2
+    if total_z_classes <= min_classes:
+        print("VACUOUS: Z never varied —", total_z_classes, "distinct Z values over",
+              min_classes, "items; every item sat on a single depth plane")
+        bad += 1
+
     if bad != 0:
         raise Error("matrix conformance failed")
     print("matrix conformance:", cases,
-          "property combinations, all five census gaps covered, invariants hold")
+          "property combinations, all five census gaps covered, invariants hold;",
+          total_z_classes, "distinct Z values over", min_classes, "items")
