@@ -12,9 +12,24 @@
 # rows track glyph count and cross 2^24 at ~16.8MB inside a 44.7MB arena. Measured.
 #
 # So on device the lanes go by KIND, which is also the only form Metal can run:
-#   measures (6 box lanes + MAX_ROW_EXTENT)  f32 via a monotonic ordered key, so
+#   measures (the 6 BOX lanes)               f32 via a monotonic ordered key, so
 #                                            integer atomicMin/Max implements float
 #                                            min/max (the TSL side's own trick)
+#
+# SIX, not seven. This said "6 box lanes + MAX_ROW_EXTENT" until 2026-09-02 and the
+# kernel has only ever reduced six — a reader would have credited lane 7 with GPU
+# verification it does not have. Nor is it an oversight to fix by adding an atomic:
+# MAX_ROW_EXTENT is max(ITEM-RELATIVE x), and this kernel reads LM_X, which is the
+# ABSOLUTE position with the item origin already folded in. The quantity is not
+# recoverable from the inputs the kernel has. The host buffer zeroes lane 7 and
+# check_case does not compare it, which is correct and now says so.
+#
+# Where lane 7 IS checked: conformance_scan compares it serial-vs-scan at 1e-4
+# relative, and that tolerance is right rather than lazy. It is max(x) over the
+# fold's ACCUMULATED f64 line prefix — not, as it looks, an exact selection among
+# independently representable values — so it inherits the tier of the values it
+# maxes over, which the contract puts at eps wherever resolveX does not re-sum.
+# Tightening it to bit-exact was proposed and withdrawn on reading this.
 #   counts   (TOTAL_ROWS)                    a NATIVE u32 atomicMax. No mapping at
 #                                            all, no wall, and 0 is genuinely the
 #                                            identity for max over non-negative u32
