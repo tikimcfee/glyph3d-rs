@@ -36,3 +36,26 @@ fn vs_main(@builtin(vertex_index) vi: u32) -> VsOut {
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     return textureSample(pool_tex, pool_sampler, in.uv);
 }
+
+// ── Stage L (L4): selection tint composite ───────────────────────────────
+// Same fullscreen triangle; additionally samples the selection mask and
+// additively tints the (premultiplied) scene where the mask covers. Runs
+// only when a selection exists (windowed shader path); the no-selection
+// frame keeps the L3 command stream exactly (separate pipeline, so the
+// plain composite's bind group layout is untouched).
+
+struct Tint {
+    color: vec4<f32>, // premultiplied-ready: rgb = tint, a = strength
+};
+
+@group(0) @binding(2) var mask_tex: texture_2d<f32>;
+@group(0) @binding(3) var<uniform> tint: Tint;
+
+@fragment
+fn fs_tint(in: VsOut) -> @location(0) vec4<f32> {
+    let scene = textureSample(pool_tex, pool_sampler, in.uv);
+    let m = textureSample(mask_tex, pool_sampler, in.uv);
+    // Additive coverage-weighted tint; alpha passthrough (the field is
+    // opaque where it matters and the composite overwrites, not blends).
+    return vec4<f32>(scene.rgb + m.a * tint.color.rgb * tint.color.a, scene.a);
+}

@@ -220,8 +220,6 @@ pub struct PickGlyph {
     pub pos: [f32; 3],
     pub advance: f32,
     pub height: f32,
-    /// The staged packed color (for flash restore).
-    pub color: u32,
 }
 
 /// A resolved pick: always the file; the glyph when one is close enough.
@@ -241,8 +239,6 @@ struct PickCacheEntry {
     leaders: Vec<(usize, u32)>,
     /// Source line per record.
     lines: Vec<u32>,
-    /// Staged per-record packed colors (flash restore / recolor basis).
-    colors: Vec<u32>,
     /// Global arena slot per record; u32::MAX for blank/missing (no instance).
     slot_of: Vec<u32>,
 }
@@ -345,13 +341,19 @@ struct BackdropInst {
 /// Stage L (L2): draw phases — re_renderer's DrawPhase borrow (a flat enum
 /// partitioning draw order, per-phase work lists, no render graph).
 /// Recording iterates phases in declaration order: Backdrop first, Glyphs
-/// second — exactly the Stage F order. `Selection`/`Overlay` variants arrive
-/// WITH their phases (L4+); no dead variants (Stage J rule).
+/// second — exactly the Stage F order. Stage L (L4) adds Selection: it
+/// renders selected glyph quads into a separate MASK target after the glyph
+/// field pass — own target ⇒ own pass, so it is not an in-pass arm; the
+/// variant marks the phase ordering (Selection renders after Glyphs) and
+/// gates the mask pass. (`Overlay` arrives WITH its phase; no dead
+/// variants — Stage J rule.)
 enum Phase {
     /// Far-LOD backdrop quads (one instanced draw over the compacted list).
     Backdrop,
     /// The glyph instances (per-chunk range draws).
     Glyphs,
+    /// Stage L (L4): the selection mask (selected segments' glyph quads).
+    Selection,
 }
 
 /// Stage L (L2): one frame's draw work, partitioned by phase. Built during
@@ -913,9 +915,11 @@ pub struct GlyphScene {
     pick: Option<PickContext>,
     /// The last resolved pick (verbs operate on it).
     picked: Option<PickHit>,
-    /// Flash-highlighted glyph: (arena slot, original packed color); the next
-    /// click restores it before flashing the new pick.
-    flash: Option<(u32, u32)>,
+    /// Stage L (L4): the current selection (drives the mask pass). Replaces
+    /// the Stage G click-flash hack (instance-byte write + restore) — no
+    /// buffer writes, nothing to restore; the tint lives entirely in the
+    /// windowed composite path.
+    selection: Option<Selection>,
     /// Geometry overrides from nudge/scale-glyph verbs (slot → pos/advance/
     /// height), so a later recolor-line rebuild preserves them.
     geom_overrides: std::collections::HashMap<u32, ([f32; 3], f32, f32)>,
@@ -994,6 +998,10 @@ struct CompositeState {
     sampler: wgpu::Sampler,
     target: Option<ViewTarget>,
     parity: Cell<u8>,
+    /// Stage L (L4): selection mask/tint machinery — only on the
+    /// shader-composite path (windowed). None when the driver composites by
+    /// copy (offscreen), which therefore never renders selection visuals.
+    selection_fx: Option<SelectionFx>,
 }
 
 /// The per-size half: the ping-pong pair of pool textures (re_renderer's
@@ -1007,7 +1015,58 @@ struct ViewTarget {
     color_views: [wgpu::TextureView; 2],
     depth: wgpu::TextureView,
     bind_groups: [wgpu::BindGroup; 2],
+    /// Stage L (L4): the selection mask target + per-pool-slot tint bind
+    /// groups. Only created on the shader-composite path (windowed) — the
+    /// copy path (offscreen) never renders selection visuals, so offscreen
+    /// stays byte-identical by construction.
+    mask: Option<MaskSet>,
 }
+
+/// Stage L (L4): the mask target for the selection pass. (No texture field:
+/// a wgpu TextureView keeps its texture alive internally.)
+struct MaskSet {
+    view: wgpu::TextureView,
+    /// Tint-pass bind groups, one per pool slot: pool[slot] + mask + tint
+    /// uniform.
+    tint_bgs: [wgpu::BindGroup; 2],
+}
+
+/// Stage L (L4): selection state — replaces the Stage G click-flash hack
+/// (instance-byte write + restore). Set by apply_pick (the exact API the
+/// CLI op-stream and the windowed click share): a glyph pick with a real
+/// slot selects that glyph; a file-level pick (or a blank-glyph pick, which
+/// has no slot) selects the whole segment; a pick MISS clears. Verbs never
+/// touch it. Persistent until the next pick — this closes the "sticky
+/// flash" gap.
+enum Selection {
+    /// One glyph slot (arena-global split into chunk + chunk-local index).
+    Glyph { chunk: u32, local: u32 },
+    /// A whole segment/file (arena slot range; split per chunk at draw).
+    Segment { slot_base: u32, slot_count: u32 },
+}
+
+/// Stage L (L4): the selection tint (warm yellow, 45% additive) — the
+/// flash's bright-yellow legacy, but as a coverage-weighted tint that keeps
+/// the glyph readable underneath.
+const SELECTION_TINT: [f32; 4] = [1.0, 0.85, 0.25, 0.45];
+
+/// Stage L (L4): mask/tint pass resources (windowed shader path only).
+struct SelectionFx {
+    /// Glyph geometry drawn into the mask: same glyph_field.wgsl and the
+    /// same per-chunk bind groups, blend disabled, Rgba8Unorm target.
+    mask_pipeline: wgpu::RenderPipeline,
+    /// composite.wgsl's fs_tint: pool + mask → pool (ping-pong), additive
+    /// tint.
+    tint_pipeline: wgpu::RenderPipeline,
+    tint_bgl: wgpu::BindGroupLayout,
+    /// Static tint uniform (written once at creation).
+    tint_buf: wgpu::Buffer,
+}
+
+/// Stage L (L4): mask target format. Rgba8Unorm (not the sRGB pool format):
+/// the mask is data (coverage in alpha), and the mask pipeline needs a
+/// non-pool format to coexist with the glyph pipeline's sRGB target.
+const MASK_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
 
 impl ViewTarget {
     fn new(
@@ -1016,6 +1075,7 @@ impl ViewTarget {
         height: u32,
         bgl: &wgpu::BindGroupLayout,
         sampler: &wgpu::Sampler,
+        selection_fx: Option<&SelectionFx>,
     ) -> Self {
         assert_eq!(
             SCENE_SAMPLE_COUNT, 1,
@@ -1055,7 +1115,48 @@ impl ViewTarget {
             })
         });
         let depth = crate::scene::create_depth(device, wgpu::TextureFormat::Depth32Float, width, height);
-        Self { width, height, colors, color_views, depth, bind_groups }
+        // Stage L (L4): the selection mask target + tint bind groups
+        // (shader-composite path only — the caller passes the fx only then).
+        let mask = selection_fx.map(|fx| {
+            let mask_texture = device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("selection mask"),
+                size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: MASK_FORMAT,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                    | wgpu::TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            });
+            let view = mask_texture.create_view(&Default::default());
+            let tint_bgs = std::array::from_fn(|i| {
+                device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some(if i == 0 { "tint bg A" } else { "tint bg B" }),
+                    layout: &fx.tint_bgl,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: wgpu::BindingResource::TextureView(&color_views[i]),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: wgpu::BindingResource::Sampler(sampler),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: wgpu::BindingResource::TextureView(&view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 3,
+                            resource: fx.tint_buf.as_entire_binding(),
+                        },
+                    ],
+                })
+            });
+            MaskSet { view, tint_bgs }
+        });
+        Self { width, height, colors, color_views, depth, bind_groups, mask }
     }
 }
 
@@ -1336,6 +1437,47 @@ impl GlyphScene {
             cache: None,
         });
 
+        // Stage L (L4): the selection mask pipeline — same glyph_field.wgsl,
+        // same layout (the per-chunk bind groups work unchanged), only the
+        // target format (MASK_FORMAT — data, not sRGB) and blend (coverage
+        // overwrite) differ. Shader path only: the copy path (offscreen)
+        // never renders selection visuals. `shader`/`layout` above are the
+        // glyph pipeline's — the composite block below shadows those names.
+        let mask_pipeline = (color_format != POOL_FORMAT).then(|| {
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("selection mask pipeline"),
+                layout: Some(&layout),
+                vertex: wgpu::VertexState {
+                    module: &shader,
+                    entry_point: Some("vs_main"),
+                    compilation_options: Default::default(),
+                    buffers: &[],
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &shader,
+                    entry_point: Some("fs_main"),
+                    compilation_options: Default::default(),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: MASK_FORMAT,
+                        blend: None,
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleList,
+                    cull_mode: None,
+                    ..Default::default()
+                },
+                depth_stencil: None, // the mask is flat 2D coverage
+                multisample: wgpu::MultisampleState {
+                    count: SCENE_SAMPLE_COUNT,
+                    ..Default::default()
+                },
+                multiview_mask: None,
+                cache: None,
+            })
+        });
+
         // Camera fit from staged bounds (or the Stage E2 focus-file override).
         let (center, half_w, half_h) = match staged.focus_bounds {
             Some((c, half)) => (
@@ -1468,12 +1610,96 @@ impl GlyphScene {
                 min_filter: wgpu::FilterMode::Linear,
                 ..Default::default()
             });
+            // Stage L (L4): the tint half of the selection machinery
+            // (mask_pipeline was built next to the glyph pipeline, before
+            // this block shadowed `shader`/`layout` with the composite's).
+            // Shader path only.
+            let selection_fx = mask_pipeline.map(|mask_pipeline| {
+                let tint_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                    label: Some("tint bgl"),
+                    entries: &[
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 0,
+                            visibility: wgpu::ShaderStages::FRAGMENT,
+                            ty: wgpu::BindingType::Texture {
+                                multisampled: false,
+                                sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                                view_dimension: wgpu::TextureViewDimension::D2,
+                            },
+                            count: None,
+                        },
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 1,
+                            visibility: wgpu::ShaderStages::FRAGMENT,
+                            ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                            count: None,
+                        },
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 2,
+                            visibility: wgpu::ShaderStages::FRAGMENT,
+                            ty: wgpu::BindingType::Texture {
+                                multisampled: false,
+                                sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                                view_dimension: wgpu::TextureViewDimension::D2,
+                            },
+                            count: None,
+                        },
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 3,
+                            visibility: wgpu::ShaderStages::FRAGMENT,
+                            ty: wgpu::BindingType::Buffer {
+                                ty: wgpu::BufferBindingType::Uniform,
+                                has_dynamic_offset: false,
+                                min_binding_size: None,
+                            },
+                            count: None,
+                        },
+                    ],
+                });
+                let tint_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                    label: Some("tint pl"),
+                    bind_group_layouts: &[Some(&tint_bgl)],
+                    immediate_size: 0,
+                });
+                let tint_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                    label: Some("selection tint pipeline"),
+                    layout: Some(&tint_layout),
+                    vertex: wgpu::VertexState {
+                        module: &shader, // composite.wgsl (this block's `shader`)
+                        entry_point: Some("vs_main"),
+                        compilation_options: Default::default(),
+                        buffers: &[],
+                    },
+                    fragment: Some(wgpu::FragmentState {
+                        module: &shader,
+                        entry_point: Some("fs_tint"),
+                        compilation_options: Default::default(),
+                        targets: &[Some(wgpu::ColorTargetState {
+                            format: POOL_FORMAT, // tints pool A into pool B
+                            blend: None,
+                            write_mask: wgpu::ColorWrites::ALL,
+                        })],
+                    }),
+                    primitive: wgpu::PrimitiveState::default(),
+                    depth_stencil: None,
+                    multisample: wgpu::MultisampleState::default(),
+                    multiview_mask: None,
+                    cache: None,
+                });
+                let tint_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("selection tint"),
+                    contents: bytemuck::cast_slice(&[SELECTION_TINT]),
+                    usage: wgpu::BufferUsages::UNIFORM,
+                });
+                SelectionFx { mask_pipeline, tint_pipeline, tint_bgl, tint_buf }
+            });
             CompositeState {
                 pipeline,
                 bind_group_layout: bgl,
                 sampler,
                 target: None,
                 parity: Cell::new(0),
+                selection_fx,
             }
         };
 
@@ -1501,7 +1727,7 @@ impl GlyphScene {
             groups_cpu,
             pick,
             picked: None,
-            flash: None,
+            selection: None,
             geom_overrides: std::collections::HashMap::new(),
             cache: None,
             grabbed_group: None,
@@ -1661,7 +1887,6 @@ impl GlyphScene {
                 }
             }
         }
-        let colors = crate::text::colorize_leaders(&bytes);
         let mut slot_of = vec![u32::MAX; records.len()];
         let mut k = info.slot_base;
         for (i, r) in records.iter().enumerate() {
@@ -1688,7 +1913,6 @@ impl GlyphScene {
             records,
             leaders,
             lines,
-            colors,
             slot_of,
         });
         true
@@ -1710,7 +1934,6 @@ impl GlyphScene {
             pos: [r.x(), r.y(), r.z()],
             advance: r.advance(),
             height: r.height(),
-            color: c.colors.get(rec).copied().unwrap_or(0xFF_D4D4D4),
         })
     }
 
@@ -1976,12 +2199,41 @@ impl GlyphScene {
         };
         match hit {
             Some(h) => {
+                // Stage L (L4): drive the selection mask. A glyph pick with
+                // a real slot selects that glyph; a file-level pick (or a
+                // blank glyph, which has no slot) selects the whole segment.
+                self.selection = self.selection_from_hit(&h);
                 let line = format_pick(&h);
                 self.picked = Some(h);
                 Some(line)
             }
-            None => Some("pick: MISS (no file under the ray / no path match)".to_string()),
+            None => {
+                // Stage L (L4): a miss CLEARS the selection (click on empty
+                // space = deselect). `picked` is untouched — verb semantics
+                // (act on the most recent pick) are unchanged.
+                self.selection = None;
+                Some("pick: MISS (no file under the ray / no path match)".to_string())
+            }
         }
+    }
+
+    /// Stage L (L4): pick hit → selection mask content.
+    fn selection_from_hit(&self, h: &PickHit) -> Option<Selection> {
+        if let Some(g) = &h.glyph {
+            if let Some(slot) = g.slot {
+                return Some(Selection::Glyph {
+                    chunk: slot / self.chunk_cap,
+                    local: slot % self.chunk_cap,
+                });
+            }
+        }
+        // File-level (or blank-glyph) pick: the whole segment's slot range.
+        self.pick
+            .as_ref()?
+            .files
+            .iter()
+            .find(|f| f.group_id == h.group_id)
+            .map(|f| Selection::Segment { slot_base: f.slot_base, slot_count: f.slot_count })
     }
 
     /// Partial instance-field upload: `data` at byte `field_off` within a
@@ -2276,24 +2528,11 @@ impl GlyphScene {
         );
     }
 
-    /// Windowed click: restore the previous flash, pick at the pixel, flash
-    /// the new glyph (bright yellow), return the pick log line.
+    /// Windowed click: pick at the pixel and return the log line. Stage L
+    /// (L4): the click-flash hack is gone — `apply_pick` now drives the
+    /// selection mask instead (no instance-byte writes, nothing to restore).
     pub fn click_pick(&mut self, ctx: &GpuContext, x: f32, y: f32) -> Option<String> {
-        if let Some((slot, old)) = self.flash.take() {
-            self.write_instance(ctx, slot, 24, &old.to_le_bytes());
-        }
-        let line = self.apply_pick(ctx, &PickCommand::Pixel { x, y });
-        let target = self
-            .picked
-            .as_ref()
-            .and_then(|h| h.glyph.as_ref())
-            .and_then(|g| g.slot.map(|s| (s, g.color)));
-        if let Some((slot, old_color)) = target {
-            let flash_packed: u32 = 255 | 240 << 8 | 120 << 16 | 0xFF00_0000;
-            self.write_instance(ctx, slot, 24, &flash_packed.to_le_bytes());
-            self.flash = Some((slot, old_color));
-        }
-        line
+        self.apply_pick(ctx, &PickCommand::Pixel { x, y })
     }
 
     /// Windowed cursor move: while a group is grabbed (`g`), drag it in the
@@ -2520,8 +2759,14 @@ impl SceneLike for GlyphScene {
             .as_ref()
             .is_none_or(|t| t.width != w || t.height != h);
         if stale && w > 0 && h > 0 {
-            let target =
-                ViewTarget::new(&self.device, w, h, &comp.bind_group_layout, &comp.sampler);
+            let target = ViewTarget::new(
+                &self.device,
+                w,
+                h,
+                &comp.bind_group_layout,
+                &comp.sampler,
+                comp.selection_fx.as_ref(), // Stage L (L4): mask + tint bind groups
+            );
             comp.target = Some(target);
         }
     }
@@ -2804,6 +3049,10 @@ impl SceneLike for GlyphScene {
         // names unchanged ("backdrop stream", "glyph stream").
         for phase in [Phase::Backdrop, Phase::Glyphs] {
             match phase {
+                Phase::Selection => unreachable!(
+                    "L4: the Selection phase renders into its own mask target, \
+                     never inside the glyph field pass"
+                ),
                 Phase::Backdrop => {
                     // Far LOD stream first: one instanced draw over the
                     // compacted backdrop quads (plain draw — no indirect
@@ -2856,6 +3105,107 @@ impl SceneLike for GlyphScene {
             p.borrow().end_query(encoder, q);
         }
 
+        // Stage L (L4): the Selection phase — own mask target ⇒ own pass,
+        // rendered after Glyphs. The variant is constructed here, when a
+        // selection exists (no selection → the L3 command stream is
+        // unchanged). Windowed shader path only: on the copy path
+        // (offscreen) selection_fx/mask are None and this block is skipped,
+        // so offscreen output never carries the tint.
+        let selection_phase = self.selection.is_some().then_some(Phase::Selection);
+        // The pool slot the composite will read: the scene slot, or the
+        // tinted ping-pong partner when a selection was rendered.
+        let mut final_slot = pool_slot;
+        if let (Some(Phase::Selection), Some(fx), Some(mask)) =
+            (selection_phase, &comp.selection_fx, &vt.mask)
+        {
+            let sel = self.selection.as_ref().expect("selection_phase implies selection");
+            // Mask pass: the selected glyph quads into the mask target
+            // (glyph coverage in alpha). Blend disabled; no depth.
+            let mask_query = ctx
+                .profiler
+                .as_ref()
+                .map(|p| p.borrow().begin_pass_query("selection mask pass", encoder));
+            {
+                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("selection mask pass"),
+                    timestamp_writes: mask_query
+                        .as_ref()
+                        .and_then(|q| q.render_pass_timestamp_writes()),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &mask.view,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            // TRANSPARENT, not BLACK: wgpu::Color::BLACK is
+                            // (0,0,0,1) — clearing to alpha=1 blanketed the
+                            // whole mask (uniform tint over the frame; caught
+                            // by the K6 eyeball + a mask-dump probe).
+                            load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                            store: wgpu::StoreOp::Store,
+                        },
+                        depth_slice: None,
+                    })],
+                    depth_stencil_attachment: None,
+                    ..Default::default()
+                });
+                pass.set_pipeline(&fx.mask_pipeline);
+                match sel {
+                    Selection::Glyph { chunk, local } => {
+                        pass.set_bind_group(0, &self.bind_groups[*chunk as usize], &[]);
+                        pass.draw(0..6, *local..*local + 1);
+                    }
+                    Selection::Segment { slot_base, slot_count } => {
+                        // Per-chunk split — the same math cull_segments uses.
+                        let slot_end = slot_base + slot_count;
+                        for c in 0..self.bind_groups.len() as u32 {
+                            let c_lo = c * self.chunk_cap;
+                            let lo = (*slot_base).max(c_lo);
+                            let hi = slot_end.min(c_lo + self.chunk_cap);
+                            if hi > lo {
+                                pass.set_bind_group(0, &self.bind_groups[c as usize], &[]);
+                                pass.draw(0..6, (lo - c_lo)..(hi - c_lo));
+                            }
+                        }
+                    }
+                }
+            }
+            if let (Some(p), Some(q)) = (&ctx.profiler, mask_query) {
+                p.borrow().end_query(encoder, q);
+            }
+            // Tint pass: pool[pool_slot] + mask → pool[1 - pool_slot]
+            // (additive coverage-weighted tint); the composite reads the
+            // tinted slot below.
+            final_slot = 1 - pool_slot;
+            let tint_query = ctx
+                .profiler
+                .as_ref()
+                .map(|p| p.borrow().begin_pass_query("selection tint pass", encoder));
+            {
+                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("selection tint pass"),
+                    timestamp_writes: tint_query
+                        .as_ref()
+                        .and_then(|q| q.render_pass_timestamp_writes()),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &vt.color_views[final_slot],
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                            store: wgpu::StoreOp::Store,
+                        },
+                        depth_slice: None,
+                    })],
+                    depth_stencil_attachment: None,
+                    ..Default::default()
+                });
+                pass.set_pipeline(&fx.tint_pipeline);
+                pass.set_bind_group(0, &mask.tint_bgs[pool_slot], &[]);
+                pass.draw(0..3, 0..1);
+            }
+            if let (Some(p), Some(q)) = (&ctx.profiler, tint_query) {
+                p.borrow().end_query(encoder, q);
+            }
+        }
+
         // Stage L (L3): composite the pooled target into the driver's view.
         if color_format == POOL_FORMAT {
             // Offscreen/oracle path: same format, 1:1, no scaling —
@@ -2867,7 +3217,7 @@ impl SceneLike for GlyphScene {
             );
             encoder.copy_texture_to_texture(
                 wgpu::TexelCopyTextureInfo {
-                    texture: &vt.colors[pool_slot],
+                    texture: &vt.colors[final_slot],
                     mip_level: 0,
                     origin: wgpu::Origin3d::ZERO,
                     aspect: wgpu::TextureAspect::All,
@@ -2908,7 +3258,7 @@ impl SceneLike for GlyphScene {
                     ..Default::default()
                 });
                 pass.set_pipeline(&comp.pipeline);
-                pass.set_bind_group(0, &vt.bind_groups[pool_slot], &[]);
+                pass.set_bind_group(0, &vt.bind_groups[final_slot], &[]);
                 pass.draw(0..3, 0..1);
             }
             if let (Some(p), Some(q)) = (&ctx.profiler, composite_query) {

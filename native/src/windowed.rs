@@ -6,7 +6,7 @@
 //! Stage G: interaction is split between the two mouse buttons so picking and
 //! the fly camera coexist:
 //!   - LEFT click (ungrabbed pointer) = PICK the glyph under the cursor
-//!     (prints file:row:col:char, flash-highlights it);
+//!     (prints file:row:col:char; Stage L/L4: selection-tints it);
 //!   - RIGHT press-and-drag = mouse-look (pointer confined + hidden while
 //!     held; raw DeviceEvent deltas); Esc also releases;
 //!   - verb keys act on the last pick: `h` highlight line, `g` grab/release
