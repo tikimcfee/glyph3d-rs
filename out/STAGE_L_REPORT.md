@@ -11,18 +11,15 @@ and the O1/O2 opportunistic steals await explicit approval).
 
 ## Result
 
-**Phases L1–L3 landed** (L1 `67e93d3` + report `534e1dd`; L2 `94ee788` +
-report `3bf99f2`; steals O1 `c4a62c4` / O2 `1934346` + report `8b17941`; L3
-`a6a45f2` + escape-hatch removal `ec6e4aa`; 2026-09-03): the frame uniform is
-formalized (`FrameUniform`), the draw lists are phase-partitioned
-(`Phase`/`PhaseDraws`), and `GlyphScene` now renders into a pooled
-ping-pong view target and composites into the driver's view — copy on the
-oracle path (bit-exact by construction AND empirically), shader composite
-windowed (proven byte-exact via the `GLYPH_L3_SHADER_COMPOSITE` hook). The
-`--no-composite` A/B hatch was used for the neutrality proof and removed at
-stage end. All eight gates green at every commit; zero new deps; the
-offscreen oracle is byte-identical throughout. L4 (selection mask) awaits
-explicit approval.
+**Stage L COMPLETE — all four phases + both steals landed** (L1 `67e93d3`,
+L2 `94ee788`, O1 `c4a62c4` + follow-up `2c60d84`, O2 `1934346`, L3 `a6a45f2`
++ `ec6e4aa`, post-L3 occlusion fix `c567d51`, L4 `9b029d8`; 2026-09-03/04).
+`FrameUniform` formalized, draw lists phase-partitioned (`Phase { Backdrop,
+Glyphs, Selection }`), pooled ping-pong view target + copy/shader composite,
+and the selection mask pass (windowed tint, offscreen provably untouched).
+All eight gates green at every commit; zero new deps; the oracle is
+byte-identical except where L4 deliberately adds selection visuals — and
+that path needed no re-baseline (the flash was windowed-only).
 
 ---
 
@@ -114,16 +111,14 @@ Cargo.lock untouched.
 
 ## Remaining gaps / watchlist (unchanged from the handoff unless noted)
 
-- L4 (selection mask pass) — awaits owner approval.
-- O1/O2 — landed (see the steals section).
-- **Live windowed re-verification of L3** — CLOSED (display woke; FPS band
-  back-to-back + live composite eyeball in "Post-L3 fixes" below).
-- **Occlusion busy-spin** (discovered during L3, pre-existing) — FIXED in
-  `c567d51` (2 Hz throttle while occluded); human lid close/open pass
-  remains.
+- **Browser row-click → selection mask** — cut in L4 (substring-match
+  concern; needs an exact-match pick variant — follow-up).
+- **Human pass items** (all consolidated in the phase sections): K-matrix
+  interaction pass (Stage K report), lid close/open occlusion check
+  (Fix 2), selection click/deselect/tint-follows-move (L4).
 - Handoff's watchlist items stand (GPU cull+indirect on the wgpu Metal
   `first_instance` fix, DeviceCaps tiers re-run if wasm is greenlit,
-  descriptor-keyed pipeline pool past ~8 pipelines — L3 puts us at 5,
+  descriptor-keyed pipeline pool past ~8 pipelines — L4 puts us at 6,
   CpuWriteGpuReadBelt if uploads reach MBs).
 
 ---
@@ -439,3 +434,102 @@ The display came awake mid-session, so the deferred checks landed after all:
   correct glyph field (three text pages, wide.txt, group labels), background
   the correct dark blue-gray. The windowed shader-composite path produces
   exactly the expected composed frame.
+
+---
+
+## Phase L4 as-executed (commit `9b029d8`) — selection mask pass
+
+### Mechanism
+
+re_renderer's `OutlineMaskProcessor` *shape* (mask target → tint composite;
+machinery NOT borrowed) on the L3 pool:
+
+- `Phase::Selection` joins the L2 enum — its phase exists now. It renders
+  into its own mask target, so it is an own-pass phase rendered after
+  Glyphs (the in-pass loop has an `unreachable!` arm documenting that);
+  the variant is constructed exactly when a selection exists.
+- **Selection state** is scene-side (`GlyphScene.selection`), driven by
+  `apply_pick` — the exact API the CLI op-stream, windowed clicks, and
+  (indirectly) the UI share. The Stage G click-flash hack (instance-byte
+  write + restore) is deleted; `PickGlyph.color` and
+  `PickCacheEntry.colors` were flash-restore-only and are removed with it.
+- **Mask pass** (windowed only): selected quads into an `Rgba8Unorm` mask
+  target through a second pipeline over `glyph_field.wgsl` — same shader,
+  same per-chunk bind groups, blend disabled, no depth; glyph coverage
+  lands in alpha. `Selection::Glyph` draws one slot; `Selection::Segment`
+  draws the file's slot range with the same per-chunk split math
+  cull_segments uses.
+- **Tint pass**: `composite.wgsl` grows `fs_tint` (same pinned file — the
+  naga set list is unchanged): additive coverage-weighted warm-yellow tint
+  (`SELECTION_TINT = (1.0, 0.85, 0.25) @ 45%`) reading pool[slot] + mask,
+  writing pool[1−slot] — the L3 ping-pong pair pays off exactly as
+  designed. The composite then reads the tinted slot. No selection ⇒ the
+  L3 command stream is unchanged (separate tint pipeline; the plain
+  composite's layout is untouched).
+
+### Selection semantics (chosen, documented)
+
+A glyph pick with a real slot selects that glyph; a file-level pick (or a
+blank glyph — no slot) selects the whole segment; a pick MISS clears
+(click empty space = deselect); verbs never touch it; persistent until the
+next pick. This closes Stage G's "sticky flash" gap with the simplest
+behavior that does. `picked` (verb target) semantics are untouched —
+stage-g green.
+
+### The bug the pixel seam caught (the K6 lesson paying off)
+
+The first selection captures were uniformly YELLOW: `wgpu::Color::BLACK`
+is `(0,0,0,1)`, so the mask pass's "clear" wrote alpha=1 across the whole
+mask and the tint lifted every pixel. A mask-dump probe (fs_tint
+temporarily returning `m.a`, run through the `GLYPH_L3_SHADER_COMPOSITE`
+offscreen hook) showed 100% coverage and pinned it in minutes. Fix: clear
+to `Color::TRANSPARENT` (commented — the trap is now written down). The
+composite/tint passes' BLACK clears are harmless (fullscreen overwrite) and
+stay. Evidence after the fix: offscreen hook diff vs baseline = **14 px**,
+all at the picked glyph.
+
+### Verification
+
+- `check-all.sh`: **ALL GATES GREEN** (8 gates). No-selection
+  byte-equality holds by construction (selection-off ⇒ L3-identical
+  command stream) AND empirically.
+- **No re-baseline needed** — the trap was checked first: the tracked
+  stage-g proofs never contained flash pixels (the flash was windowed-only;
+  scripted `apply_pick` never flashed), and offscreen gains no tint
+  (selection machinery exists only on the shader-composite path). Proven:
+  scripted-pick offscreen PNGs (glyph- and file-level) are byte-equal vs
+  pre-L4 references captured from the pre-L4 build; `verb-glyph.png`
+  byte-equal vs STEP 0; `CULLDBG` counters identical
+  (`draws=4 instances=10857 backdrops=0`).
+- **Selection-on screenshot set** (windowed, K6 `--screenshot-frame`,
+  opened and eyeballed):
+  - `out/tooling-ab/stagel-l4/selection-file.png` — the `sub/deep.py` page
+    is warm-tinted edge to edge; the rest of the field and the background
+    are untouched (correct blue-gray); the Debug panel shows the
+    file-level pick line.
+  - `out/tooling-ab/stagel-l4/selection-glyph.png` — pixel-diff vs the L3
+    windowed capture (`stagel-l3/composite-windowed.png`) localizes the
+    change to exactly one glyph (57-px cluster; per-pixel values show the
+    coverage-weighted warm lift, e.g. `[213,198,186] → [255,249,204]`;
+    everything else identical outside the panel's FPS text).
+- FPS with selection active: 53–59 — same band as the pre-L binary measured
+  back-to-back (machine noise dominates; two extra passes are sub-ms).
+- `cargo tree -d` unchanged; zero new deps.
+
+### Cut (recorded)
+
+Browser row-click does NOT join the selection mask — the K5
+substring-match concern stands (`PickCommand::File` is "first path
+containing", so a row click could select the wrong file). Follow-up: an
+exact-match pick variant (`PickCommand::ExactFile` or match by group_id),
+then browser clicks can drive the mask and the inspector together.
+
+### Human-pass additions
+
+- Click a glyph → warm tint appears, persists; click empty space → clears;
+  click another glyph → moves (no restore artifacts — the flash's whole
+  failure mode). Pick a file in the browser and confirm the tint does NOT
+  fire (cut, above). Move a selected group (g) — the tint follows (mask
+  uses live group TRS). Watch the profiler line with GLYPH_PROFILE=1:
+  "selection mask pass" / "selection tint pass" appear only while a
+  selection exists.
