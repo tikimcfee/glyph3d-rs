@@ -15,8 +15,9 @@ and the O1/O2 opportunistic steals await explicit approval).
 2026-09-03): `FrameUniform` carries the frame's values behind the unchanged
 WGSL block, and the draw lists are phase-partitioned (`enum Phase { Backdrop,
 Glyphs }` + `PhaseDraws`) with byte-identical output on BOTH the culled and
-legacy `--no-cull` paths. Owner-approved scope (L1+L2) is complete; L3/L4 and
-O1/O2 await explicit approval.
+legacy `--no-cull` paths. The approved opportunistic steals landed too: O1
+(`c4a62c4`, uncaptured-error dedup) and O2 (`1934346`, debug labels) — see
+the O1/O2 section. L3/L4 await explicit approval.
 
 ---
 
@@ -182,3 +183,68 @@ during cull_segments" taken literally).
 |---|---|---|
 | `native/src/glyph_scene.rs` | +199/−92 | L1 FrameUniform + L2 phase lists |
 | `out/STAGE_L_REPORT.md` | new | this report |
+
+---
+
+## O1/O2 as-executed (opportunistic steals — explicitly NOT Stage L content)
+
+Both landed 2026-09-03, one commit each, gates green after each.
+
+### O1 — uncaptured-error dedup (`c4a62c4`, gpu.rs +169)
+
+**API shape (as landed):** `gpu.rs` gains a pure `ErrorTracker`:
+`HashMap<(ErrorKind, String), u64>` counts per error identity;
+`track(kind, description) -> TrackDecision::{First, Repeat(total)}`; first
+occurrence logs the full description at `error!`, repeats are silent except
+a one-line summary at powers of ten (10, 100, 1_000, …). `init()` installs
+one `Arc` closure via `device.on_uncaptured_error` (wgpu 30 signature
+`Arc<dyn Fn(Error) + Send + Sync>`, verified against the wgpu-30.0.1
+source). re_renderer's `ErrorTracker` contributed the *pattern* (dedup by
+error identity, count, log once) — not its wgpu-core downcasting heuristic
+(we key on (kind, description) directly).
+
+**Deviation with reason (important):** the steal's premise — "a repeating
+validation error would spam per frame" — is wrong for this wgpu line:
+wgpu 30's DEFAULT uncaptured handler **panics** on the first error
+(`default_error_handler`, wgpu-30.0.1 `src/backend/wgpu_core.rs:692`:
+`log::error!("Handling wgpu errors as fatal by default"); panic!(…)`).
+Installing the tracker therefore deliberately changes semantics from
+panic-on-first-error to log-once-and-continue (the rerun-style behavior the
+steal's text specifies). Recorded loudly in the code comment and the commit
+message: any error that moves pixels is still caught by the byte-equal
+gates; restoring fatality = deleting the install. DeviceLost is not routed
+through this handler (wgpu surfaces it via `set_device_lost_callback`) —
+untouched.
+
+**Tested vs inspected:** the dedup logic is unit-tested (4 tests: first-vs-
+repeat transitions, identity = kind+description, milestone sequence exactly
+[10, 100, 1000, 10000], helper edges) — 33+1 tests green. A real GPU
+validation error cannot be triggered on demand cheaply; the wgpu-facing
+callback path is verified by code inspection against the wgpu 30.0.1 source
+only. Inert when no error occurs — zero output change (byte-equal PNGs).
+
+### O2 — debug labels (`1934346`, glyph_scene.rs / offscreen.rs / scene.rs / windowed.rs, +29/−12)
+
+**Label audit result:** the inventory was nearly complete already (all 22
+`create_*` call sites had `Some(label)`). Landed improvements:
+
+- `scene.rs` (demo): prefix unified on the pipeline name — `scene bgl/bg/pl`
+  → `quad field bgl/bg/pl`; `camera uniform` → `quad field camera uniform`
+  (disambiguates from glyph_scene's `frame uniform`).
+- `glyph_scene.rs`: `glyph bgl` → `glyph field bgl`, `glyph pl` →
+  `glyph field pl`; per-chunk bind groups enumerate like the buffers they
+  bind (`glyph bg i/N`; single chunk keeps `glyph bg`).
+- Command encoders were the only unlabeled descriptors left
+  (`Default::default()` ⇒ `label: None`): `windowed frame`, `windowed shot
+  copy` (windowed.rs), `offscreen frame` (offscreen.rs — label-only, within
+  the steal's explicit scope), `debug dump copy` (GLYPH_G_DUMP path).
+
+**Already labeled, untouched:** glyph field/backdrop pipelines and passes,
+group table, frame uniform, glyph params, backdrop instances,
+`glyph instances i/N` arena chunks, atlas textures, depth, offscreen
+target + readback, K6 windowed-shot readback, egui pass. (egui's internal
+GPU resources carry egui-wgpu's own labels.)
+
+Gates after each steal: `check-all.sh` ALL GATES GREEN (four PNGs
+byte-equal — labels and the inert-when-quiet error handler don't touch
+output); zero new deps, Cargo.lock untouched.
