@@ -11,13 +11,18 @@ and the O1/O2 opportunistic steals await explicit approval).
 
 ## Result
 
-**Phases L1 and L2 landed** (L1 `67e93d3` + report `534e1dd`; L2 `94ee788`;
-2026-09-03): `FrameUniform` carries the frame's values behind the unchanged
-WGSL block, and the draw lists are phase-partitioned (`enum Phase { Backdrop,
-Glyphs }` + `PhaseDraws`) with byte-identical output on BOTH the culled and
-legacy `--no-cull` paths. The approved opportunistic steals landed too: O1
-(`c4a62c4`, uncaptured-error dedup) and O2 (`1934346`, debug labels) — see
-the O1/O2 section. L3/L4 await explicit approval.
+**Phases L1–L3 landed** (L1 `67e93d3` + report `534e1dd`; L2 `94ee788` +
+report `3bf99f2`; steals O1 `c4a62c4` / O2 `1934346` + report `8b17941`; L3
+`a6a45f2` + escape-hatch removal `ec6e4aa`; 2026-09-03): the frame uniform is
+formalized (`FrameUniform`), the draw lists are phase-partitioned
+(`Phase`/`PhaseDraws`), and `GlyphScene` now renders into a pooled
+ping-pong view target and composites into the driver's view — copy on the
+oracle path (bit-exact by construction AND empirically), shader composite
+windowed (proven byte-exact via the `GLYPH_L3_SHADER_COMPOSITE` hook). The
+`--no-composite` A/B hatch was used for the neutrality proof and removed at
+stage end. All eight gates green at every commit; zero new deps; the
+offscreen oracle is byte-identical throughout. L4 (selection mask) awaits
+explicit approval.
 
 ---
 
@@ -109,13 +114,18 @@ Cargo.lock untouched.
 
 ## Remaining gaps / watchlist (unchanged from the handoff unless noted)
 
-- L2 (phase enum + per-phase draw lists) — next delegation; acceptance
-  inputs captured above (cull counters, verb smokes).
-- L3/L4, O1/O2 — await owner approval.
+- L4 (selection mask pass) — awaits owner approval.
+- O1/O2 — landed (see the steals section).
+- **Live windowed re-verification of L3** — environment-blocked this
+  session (display occluded; see the L3 section); FPS band + live K6
+  composite eyeball pending a human with an awake display.
+- **Occlusion busy-spin** (discovered during L3, pre-existing): an occluded
+  window spins `request_redraw` at ~100% CPU. Not fixed here (out of scope);
+  the fix is a one-line backoff in `about_to_wait`/`render`.
 - Handoff's watchlist items stand (GPU cull+indirect on the wgpu Metal
   `first_instance` fix, DeviceCaps tiers re-run if wasm is greenlit,
-  descriptor-keyed pipeline pool past ~8 pipelines, CpuWriteGpuReadBelt if
-  uploads reach MBs).
+  descriptor-keyed pipeline pool past ~8 pipelines — L3 puts us at 5,
+  CpuWriteGpuReadBelt if uploads reach MBs).
 
 ---
 
@@ -248,3 +258,117 @@ GPU resources carry egui-wgpu's own labels.)
 Gates after each steal: `check-all.sh` ALL GATES GREEN (four PNGs
 byte-equal — labels and the inert-when-quiet error handler don't touch
 output); zero new deps, Cargo.lock untouched.
+
+---
+
+## Phase L3 as-executed (commits `a6a45f2` + `ec6e4aa`)
+
+### Mechanism
+
+re_renderer's ViewBuilder borrow, `GlyphScene` only (the demo `Scene` keeps
+direct rendering — it is the minimal template by design):
+
+- **`ViewTarget`**: ping-pong pair of `Rgba8UnormSrgb` textures + one
+  `Depth32Float`, `RENDER_ATTACHMENT | COPY_SRC | TEXTURE_BINDING`, created
+  and resized in `set_viewport` (GlyphScene now carries a `wgpu::Device`
+  handle — the trait's `set_viewport` has no ctx param and its shape is
+  fenced). Two textures, not a pool: re_renderer's `DynamicResourcePool`
+  stayed reference material. Parity via `Cell<u8>`.
+- **Pipeline retarget**: the glyph + backdrop pipelines now render into
+  `POOL_FORMAT` (`Rgba8UnormSrgb`); the composite pipeline targets the
+  DRIVER's format. `SCENE_SAMPLE_COUNT = 1` is a named const pinned at both
+  pipeline creations, with an assert in `ViewTarget::new` — the copy
+  composite is invalid on multisample; this assumption was silent before.
+- **`FrameTarget` gained `color_texture` + `color_format`** (scene.rs): the
+  copy needs the texture handle (a `TextureView` can't be a copy endpoint);
+  the copy-vs-shader split keys on the format. The demo Scene ignores both.
+- **Composite step** at the end of `GlyphScene::render`:
+  - driver format == pool format (offscreen oracle) →
+    `encoder.copy_texture_to_texture`, 1:1, bit-exact **by construction**
+    plus a loud `assert_eq!` on the formats;
+  - else (windowed, `Bgra8UnormSrgb`) → fullscreen shader composite through
+    `composite.wgsl` (the ONE new shader fence 2 sanctions; tests/wgsl.rs's
+    pinned shader set updated — that pin is the deliberate friction point).
+    Fullscreen triangle from `vertex_index`, premultiplied passthrough,
+    blend disabled; profiler query `"composite pass"` mirrors the Stage H
+    scheme (offscreen profile output unchanged — the copy is encoder-level).
+- **egui ordering untouched**: scene (pool + composite into the surface
+  view) → egui pass (`LoadOp::Load`) → present. K6's capture still reads
+  the composed frame.
+
+### Copy-vs-shader rationale
+
+The split exists for component-order copy incompatibility: the windowed
+Metal surface is `Bgra8UnormSrgb`, and `copy_texture_to_texture` between
+BGRA and RGBA is invalid. The oracle path must be unfailable, so it copies
+(same format → bit-exact by construction); the windowed path is not
+PNG-gated, so it pays one fullscreen pass. A future scaled/sub-rect
+composite (minimap inset) extends the shader path only. The egui wrinkle is
+recorded, not solved: `register_native_texture` demands `Rgba8Unorm`
+(NON-sRGB) — an egui-hosted view would want its own non-sRGB pool or a
+conversion pass.
+
+### The one bug the gates caught mid-phase
+
+The first L3 run diverged 100% of pixels to `[0,0,0,0]`: the copy
+destination (offscreen target texture) lacked `COPY_DST`, so the composite
+copy was a validation error and the frame never landed. Two notes worth
+keeping: (1) gate 8's byte compare caught it instantly — the process worked
+as designed; (2) O1's new handler logged the validation error cleanly
+("first occurrence; repeats are counted") instead of panicking — the first
+real-world exercise of the O1 semantic change, and a demonstration that the
+byte-equal gates are the true net. Fix: `COPY_DST` added to the offscreen
+target AND the windowed surface config (for non-Metal adapters whose surface
+matches the pool format). After the fix: `text.png` byte-equal with the copy
+path live — empirically confirming the by-construction claim.
+
+### Acceptance evidence
+
+- `check-all.sh` ALL GATES GREEN at both commits (8 gates; four PNGs
+  byte-equal; 33+1 tests).
+- **`--no-composite` A/B (captured before removal, `out/tooling-ab/stagel-l3/nocomposite/`)**:
+  all four views byte-equal vs baseline; composite-on == composite-off
+  (text.png) — the pool draw is neutral. Flag + parity-test entries + the
+  direct path removed in `ec6e4aa`; the report records the removal here.
+- **Cull counters** identical: `CULLDBG glyph draws=4 instances=10857 | backdrops=0`.
+- **Verb smoke pair** byte-equal vs STEP 0 baselines (same log lines).
+- **`GLYPH_G_DUMP`** readback works (slot 3 hex dump present).
+- **Shader composite proven bit-exact WITHOUT a live display**: new dev-only
+  hook `GLYPH_L3_SHADER_COMPOSITE=1` (AGENTS.md) makes the offscreen target
+  `Bgra8UnormSrgb`, forcing `composite.wgsl` under the deterministic oracle
+  driver; the swizzled readback is byte-equal vs baseline for BOTH text.png
+  and repo-wide.png (the sRGB decode/encode round-trip is exact). The proof
+  PNG at `out/tooling-ab/stagel-l3/composite.png` was opened and eyeballed:
+  the fixture glyph field is fully correct (three text pages with
+  white/green/yellow glyph rows, the small wide.txt page, group labels, the
+  correct dark blue-gray background — no BGR swap, no blanket). NOTE: this
+  PNG comes from the oracle driver, so there is no egui Debug window in it —
+  offscreen never has one. Debug-window-over-composited-scene composition
+  was proven live in K6's captures (`out/windowed-shot-*.png`); the L3
+  windowed-path re-check is deferred to the human pass (below).
+- `cargo tree -d`: 18 duplicates, unchanged — zero new deps; Cargo.lock
+  untouched.
+
+### Environment block + discovered issue (honest)
+
+- **Live windowed verification was impossible this session**: the display
+  is occluded (locked/asleep), and wgpu 30 reports
+  `CurrentSurfaceTexture::Occluded`, so `render()` skips every frame — the
+  app LOOKS hung (no FPS lines) but is spinning. Probe evidence: ~250,000
+  occlusion-skips/second at pre-L3 HEAD too (8b17941) — **predates and is
+  unrelated to L3**. The windowed ≥30-frame FPS band and the live K6
+  composite.png eyeball are deferred to the human pass with the display
+  awake. Expected cost: one extra fullscreen pass ≈ 0.1–0.3 ms.
+- **Discovered issue (pre-existing, out of L3 scope, recorded):** on
+  occlusion the event loop busy-spins `request_redraw` at ~100% CPU with no
+  backoff. A future fix (skip `request_redraw` while acquires report
+  Occluded) is its own small change.
+
+### Human-pass additions
+
+- With the display awake: windowed run on `fixtures/g-pick-repo` — FPS
+  band should hold ~60.0 (one extra fullscreen pass), the Debug window
+  draws over the composited scene, F2/`--screenshot-frame` captures still
+  work, resize re-creates the pool (no crash, correct framing after).
+- Deviations from the handoff: none beyond the two recorded above
+  (COPY_DST addition; the environment block).
