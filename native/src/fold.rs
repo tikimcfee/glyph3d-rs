@@ -94,6 +94,15 @@ pub struct Item {
 /// Allocated ZEROED, which subsumes two duties the Mojo performs explicitly: its
 /// gap sweep (bytes no item claims) and the fold's non-leader zeroing. Zero is
 /// the defined state of both, so the OUTPUT is identical; only the writes differ.
+///
+/// THE FIELD NAMES STAY SHORT HERE, and only here. `sm`/`gi`/`fl`/`lm`/`lc`/
+/// `wm`/`wc` are the cross-layer schema's own spellings — they appear under
+/// exactly these names in `engine/glyph_schema.mojo`, in the JS contract, and in
+/// every lane constant (`LM_X`, `LC_ROW`, `SM_ADVANCE`) — so renaming them here
+/// would break the correspondence that lets four layers be checked against each
+/// other. Everything LOCAL is spelled out instead: an abbreviation is a poor
+/// place to hide a carrier distinction, which is what `exp_ord` turned out to be
+/// hiding when it cost stage 2 a wrong comparison.
 pub struct Slots {
     /// 2 per byte: ADVANCE, HEIGHT
     pub sm: Vec<f32>,
@@ -177,18 +186,18 @@ pub struct FoldResult {
 
 /// Bytes the sequence starting at `i` occupies — 0 for a continuation or invalid
 /// byte, which is exactly the "am I a leader" test.
-fn sequence_length(bytes: &[u8], i: usize) -> usize {
-    if i >= bytes.len() {
+fn sequence_length(bytes: &[u8], index: usize) -> usize {
+    if index >= bytes.len() {
         return 0;
     }
-    let b = bytes[i] as u32;
-    if b & 0x80 == 0x00 {
+    let lead = bytes[index] as u32;
+    if lead & 0x80 == 0x00 {
         1
-    } else if b & 0xE0 == 0xC0 {
+    } else if lead & 0xE0 == 0xC0 {
         2
-    } else if b & 0xF0 == 0xE0 {
+    } else if lead & 0xF0 == 0xE0 {
         3
-    } else if b & 0xF8 == 0xF0 {
+    } else if lead & 0xF8 == 0xF0 {
         4
     } else {
         0
@@ -203,24 +212,28 @@ fn sequence_length(bytes: &[u8], i: usize) -> usize {
 /// decoder — `str::from_utf8`, `chars()` and `from_utf8_lossy` all implement the
 /// conformant one and diverge here. See `fixture::fixture_codepoints`, which
 /// wants the conformant decoder for a different job, and do not confuse them.
-fn decode_codepoint_at(bytes: &[u8], id: usize, n: usize) -> u32 {
-    let at = |i: usize| -> u32 {
-        if i < bytes.len() {
-            bytes[i] as u32
+fn decode_codepoint_at(bytes: &[u8], slot: usize, sequence_len: usize) -> u32 {
+    let byte_or_zero = |index: usize| -> u32 {
+        if index < bytes.len() {
+            bytes[index] as u32
         } else {
             0
         }
     };
-    let b0 = bytes[id] as u32;
-    match n {
-        1 => b0,
-        2 => ((b0 & 0x1F) << 6) | (at(id + 1) & 0x3F),
-        3 => ((b0 & 0x0F) << 12) | ((at(id + 1) & 0x3F) << 6) | (at(id + 2) & 0x3F),
+    let lead = bytes[slot] as u32;
+    match sequence_len {
+        1 => lead,
+        2 => ((lead & 0x1F) << 6) | (byte_or_zero(slot + 1) & 0x3F),
+        3 => {
+            ((lead & 0x0F) << 12)
+                | ((byte_or_zero(slot + 1) & 0x3F) << 6)
+                | (byte_or_zero(slot + 2) & 0x3F)
+        }
         _ => {
-            ((b0 & 0x07) << 18)
-                | ((at(id + 1) & 0x3F) << 12)
-                | ((at(id + 2) & 0x3F) << 6)
-                | (at(id + 3) & 0x3F)
+            ((lead & 0x07) << 18)
+                | ((byte_or_zero(slot + 1) & 0x3F) << 12)
+                | ((byte_or_zero(slot + 2) & 0x3F) << 6)
+                | (byte_or_zero(slot + 3) & 0x3F)
         }
     }
 }
@@ -259,8 +272,8 @@ fn decode_and_resolve<T: ResolveGlyph + ?Sized>(
     trie: &T,
     id: usize,
 ) -> Option<u32> {
-    let n = sequence_length(bytes, id);
-    if n == 0 {
+    let sequence_len = sequence_length(bytes, id);
+    if sequence_len == 0 {
         // Non-leader (continuation byte, invalid lead byte). Static lanes zero;
         // the positional lanes are the fold's duty, not decode's.
         slots.sm[id * 2] = 0.0;
@@ -269,24 +282,24 @@ fn decode_and_resolve<T: ResolveGlyph + ?Sized>(
         slots.fl[id] = 0;
         return None;
     }
-    let cp = decode_codepoint_at(bytes, id, n);
+    let codepoint = decode_codepoint_at(bytes, id, sequence_len);
     // The out-of-range contract lives inside `resolve` (see ResolveGlyph impls):
     // a codepoint past the last Unicode scalar resolves through the shared
     // missing block, so it comes back FLAG_MISSING with the missing advance and
     // still occupies its width.
-    let e = trie.resolve(cp);
-    slots.sm[id * 2] = e.advance;
-    slots.sm[id * 2 + 1] = e.height;
-    slots.gi[id] = e.glyph_id;
+    let resolved = trie.resolve(codepoint);
+    slots.sm[id * 2] = resolved.advance;
+    slots.sm[id * 2 + 1] = resolved.height;
+    slots.gi[id] = resolved.glyph_id;
     let mut flags = F_LEADER;
-    if cp == NEWLINE {
+    if codepoint == NEWLINE {
         flags |= F_NEWLINE;
     }
-    if e.flags & TRIE_FLAG_MISSING != 0 {
+    if resolved.flags & TRIE_FLAG_MISSING != 0 {
         flags |= F_MISSING;
     }
     slots.fl[id] = flags;
-    Some(cp)
+    Some(codepoint)
 }
 
 /// THE FOLD — the serial scan over one item's bytes.
@@ -307,30 +320,33 @@ fn layout_item(
     // `paged + wrapped` is a dangerous pair — BASE_X then means something
     // different while paginate still divides the same col by cols for x_page and
     // by wrap for seg. Two query params, two divisors, one lane.
-    let fold: i64 = if wrap > 0 {
+    let fold_unit: i64 = if wrap > 0 {
         wrap
     } else if item.has_page {
         item.page_cols
     } else {
         0
     };
-    let ox = item.origin_x;
-    let oy = item.origin_y;
-    let oz = item.origin_z;
+    let origin_x = item.origin_x;
+    let origin_y = item.origin_y;
+    let origin_z = item.origin_z;
     let z_step = item.z_step;
-    let lh = item.line_height;
+    let line_height = item.line_height;
 
-    let mut bmnx = f64::INFINITY;
-    let mut bmny = f64::INFINITY;
-    let mut bmnz = f64::INFINITY;
-    let mut bmxx = f64::NEG_INFINITY;
-    let mut bmxy = f64::NEG_INFINITY;
-    let mut bmxz = f64::NEG_INFINITY;
+    let mut box_min_x = f64::INFINITY;
+    let mut box_min_y = f64::INFINITY;
+    let mut box_min_z = f64::INFINITY;
+    let mut box_max_x = f64::NEG_INFINITY;
+    let mut box_max_y = f64::NEG_INFINITY;
+    let mut box_max_z = f64::NEG_INFINITY;
 
     let mut base_row: i64 = 0;
     let mut col: i64 = 0;
-    let mut line_adv: f64 = 0.0; // f64 chain — the oracle's truth-layer prefix
-    let mut seg_adv: f32 = 0.0; // genuine f32 — matches the GPU's summation order
+    // Named for the oracle's `lineAdv` and `segAdv` (glyphPipelineReference.js)
+    // and for the LINE_ADV lane, spelled out here because the two carriers are the
+    // entire subject of landmine 2 and an abbreviation is a bad place to hide it.
+    let mut line_advance: f64 = 0.0; // f64 chain — the truth-layer prefix
+    let mut segment_advance: f32 = 0.0; // genuine f32 — the GPU's summation order
     let mut ord: i64 = 0;
 
     let start = item.byte_start as usize;
@@ -346,23 +362,23 @@ fn layout_item(
         let wrap_row = if wrap > 0 { col / wrap } else { 0 };
         let row = base_row + wrap_row;
         // THE CARRIER CHOICE, and the whole of landmine 2 in one line.
-        let x: f64 = if fold > 0 {
-            seg_adv as f64
+        let item_relative_x: f64 = if fold_unit > 0 {
+            segment_advance as f64
         } else {
-            line_adv
+            line_advance
         };
         // X and BASE_X carry the same value at fold time — paginate is what
         // later separates them — so this is one aligned 16-byte store in the
         // Mojo, with the same expressions and the same narrowing points.
-        let pos_x = (x + ox) as f32;
-        slots.lm[id * 4] = pos_x;
-        slots.lm[id * 4 + 1] = (-(row as f64) * lh + oy) as f32;
-        slots.lm[id * 4 + 2] = (-(wrap_row as f64) * z_step + oz) as f32;
-        slots.lm[id * 4 + 3] = pos_x;
+        let position_x = (item_relative_x + origin_x) as f32;
+        slots.lm[id * 4] = position_x;
+        slots.lm[id * 4 + 1] = (-(row as f64) * line_height + origin_y) as f32;
+        slots.lm[id * 4 + 2] = (-(wrap_row as f64) * z_step + origin_z) as f32;
+        slots.lm[id * 4 + 3] = position_x;
         slots.lc[id * 2] = row as u32;
         slots.lc[id * 2 + 1] = col as u32;
         slots.fl[id] |= F_RENDERED;
-        slots.wm[id] = line_adv as f32;
+        slots.wm[id] = line_advance as f32;
         slots.wc[id] = ord as u32;
         slots.ord_to_byte[start + ord as usize] = id as u32;
 
@@ -370,28 +386,28 @@ fn layout_item(
             // Read back the STORED, ROUNDED lanes, never the f64 intermediates
             // — folding the wider values would shift box lanes 0-5 off the
             // oracle.
-            let bx = slots.x(id) as f64;
-            let by = slots.y(id) as f64;
-            let bz = slots.z(id) as f64;
-            let bw = slots.advance(id) as f64;
-            let bh = slots.height(id) as f64;
-            if bx < bmnx {
-                bmnx = bx;
+            let stored_x = slots.x(id) as f64;
+            let stored_y = slots.y(id) as f64;
+            let stored_z = slots.z(id) as f64;
+            let stored_advance = slots.advance(id) as f64;
+            let stored_height = slots.height(id) as f64;
+            if stored_x < box_min_x {
+                box_min_x = stored_x;
             }
-            if by < bmny {
-                bmny = by;
+            if stored_y < box_min_y {
+                box_min_y = stored_y;
             }
-            if bz < bmnz {
-                bmnz = bz;
+            if stored_z < box_min_z {
+                box_min_z = stored_z;
             }
-            if bx + bw > bmxx {
-                bmxx = bx + bw;
+            if stored_x + stored_advance > box_max_x {
+                box_max_x = stored_x + stored_advance;
             }
-            if by + bh > bmxy {
-                bmxy = by + bh;
+            if stored_y + stored_height > box_max_y {
+                box_max_y = stored_y + stored_height;
             }
-            if bz > bmxz {
-                bmxz = bz;
+            if stored_z > box_max_z {
+                box_max_z = stored_z;
             }
         }
         // TOTAL_ROWS and MAX_ROW_EXTENT. Lane 7 accumulates the ITEM-RELATIVE,
@@ -400,35 +416,35 @@ fn layout_item(
         if (row + 1) as f64 > scalars[scalar_base + 6] {
             scalars[scalar_base + 6] = (row + 1) as f64;
         }
-        if x > scalars[scalar_base + 7] {
-            scalars[scalar_base + 7] = x;
+        if item_relative_x > scalars[scalar_base + 7] {
+            scalars[scalar_base + 7] = item_relative_x;
         }
         ord += 1;
         if slots.flags(id) & F_NEWLINE != 0 {
             base_row += rows_for_line(col, wrap);
             col = 0;
-            line_adv = 0.0;
-            seg_adv = 0.0;
+            line_advance = 0.0;
+            segment_advance = 0.0;
         } else {
             col += 1;
-            line_adv += advance as f64;
+            line_advance += advance as f64;
             // `col` is the INCREMENTED column here — a segment closes on the
             // glyph that fills it, not on the one after.
-            if fold > 0 && col % fold == 0 {
-                seg_adv = 0.0;
+            if fold_unit > 0 && col % fold_unit == 0 {
+                segment_advance = 0.0;
             } else {
-                seg_adv += advance;
+                segment_advance += advance;
             }
         }
     }
 
     if write_bounds {
-        scalars[scalar_base] = bmnx;
-        scalars[scalar_base + 1] = bmny;
-        scalars[scalar_base + 2] = bmnz;
-        scalars[scalar_base + 3] = bmxx;
-        scalars[scalar_base + 4] = bmxy;
-        scalars[scalar_base + 5] = bmxz;
+        scalars[scalar_base] = box_min_x;
+        scalars[scalar_base + 1] = box_min_y;
+        scalars[scalar_base + 2] = box_min_z;
+        scalars[scalar_base + 3] = box_max_x;
+        scalars[scalar_base + 4] = box_max_y;
+        scalars[scalar_base + 5] = box_max_z;
     }
 }
 
@@ -461,23 +477,24 @@ fn paginate(slots: &mut Slots, id: usize, item: &Item, page_stride_x: f64) {
     if cols > 0 {
         x_page = col / cols; // exact
     }
-    let wide = if item.pages_wide > 1 { item.pages_wide } else { 1 };
-    let band = y_page / wide;
-    let seg = if item.wrap_width > 0 { col / item.wrap_width } else { 0 };
-    let lh = item.line_height;
+    let pages_wide = if item.pages_wide > 1 { item.pages_wide } else { 1 };
+    let band = y_page / pages_wide;
+    let wrap_segment = if item.wrap_width > 0 { col / item.wrap_width } else { 0 };
+    let line_height = item.line_height;
 
-    slots.lm[id * 4] = (slots.base_x(id) as f64 + (y_page % wide) as f64 * page_stride_x) as f32;
+    slots.lm[id * 4] =
+        (slots.base_x(id) as f64 + (y_page % pages_wide) as f64 * page_stride_x) as f32;
     slots.lm[id * 4 + 1] = (item.origin_y
-        - (screen_row - y_page * rows) as f64 * lh
+        - (screen_row - y_page * rows) as f64 * line_height
         - band as f64 * item.band_stride_y) as f32;
-    slots.lm[id * 4 + 2] = (item.origin_z - seg as f64 * item.z_step
+    slots.lm[id * 4 + 2] = (item.origin_z - wrap_segment as f64 * item.z_step
         + band as f64 * item.depth_per_band
         + x_page as f64 * item.depth_per_col) as f32;
 }
 
 /// Min/max over one byte range, carried in registers and stored once.
 fn bounds_range(slots: &Slots, start: usize, stop: usize) -> [f64; 6] {
-    let mut b = [
+    let mut box_lanes = [
         f64::INFINITY,
         f64::INFINITY,
         f64::INFINITY,
@@ -489,31 +506,31 @@ fn bounds_range(slots: &Slots, start: usize, stop: usize) -> [f64; 6] {
         if slots.flags(id) & F_LEADER == 0 {
             continue;
         }
-        let x = slots.x(id) as f64;
-        let y = slots.y(id) as f64;
-        let z = slots.z(id) as f64;
-        let w = slots.advance(id) as f64;
-        let h = slots.height(id) as f64;
-        if x < b[0] {
-            b[0] = x;
+        let glyph_x = slots.x(id) as f64;
+        let glyph_y = slots.y(id) as f64;
+        let glyph_z = slots.z(id) as f64;
+        let advance = slots.advance(id) as f64;
+        let height = slots.height(id) as f64;
+        if glyph_x < box_lanes[0] {
+            box_lanes[0] = glyph_x;
         }
-        if y < b[1] {
-            b[1] = y;
+        if glyph_y < box_lanes[1] {
+            box_lanes[1] = glyph_y;
         }
-        if z < b[2] {
-            b[2] = z;
+        if glyph_z < box_lanes[2] {
+            box_lanes[2] = glyph_z;
         }
-        if x + w > b[3] {
-            b[3] = x + w;
+        if glyph_x + advance > box_lanes[3] {
+            box_lanes[3] = glyph_x + advance;
         }
-        if y + h > b[4] {
-            b[4] = y + h;
+        if glyph_y + height > box_lanes[4] {
+            box_lanes[4] = glyph_y + height;
         }
-        if z > b[5] {
-            b[5] = z;
+        if glyph_z > box_lanes[5] {
+            box_lanes[5] = glyph_z;
         }
     }
-    b
+    box_lanes
 }
 
 /// The whole pipeline: decode -> fold per item -> paginate the active items with
@@ -524,16 +541,16 @@ pub fn run_pipeline<T: ResolveGlyph + ?Sized>(
     items: &[Item],
 ) -> FoldResult {
     let byte_len = bytes.len();
-    for (i, it) in items.iter().enumerate() {
+    for (index, item) in items.iter().enumerate() {
         // FAIL LOUD AT THE SEAM. An item range outside the buffer is malformed
         // input, and clamping it would turn that into a plausible-looking layout.
         assert!(
-            it.byte_start >= 0
-                && it.byte_count >= 0
-                && (it.byte_start + it.byte_count) as usize <= byte_len,
-            "item {i} covers [{}, {}) of a {byte_len}-byte buffer",
-            it.byte_start,
-            it.byte_start + it.byte_count
+            item.byte_start >= 0
+                && item.byte_count >= 0
+                && (item.byte_start + item.byte_count) as usize <= byte_len,
+            "item {index} covers [{}, {}) of a {byte_len}-byte buffer",
+            item.byte_start,
+            item.byte_start + item.byte_count
         );
     }
     let mut slots = Slots::new(byte_len);
@@ -545,44 +562,44 @@ pub fn run_pipeline<T: ResolveGlyph + ?Sized>(
     let mut misses = Vec::new();
     let mut leaders = 0usize;
     for id in 0..byte_len {
-        if let Some(cp) = decode_and_resolve(bytes, &mut slots, trie, id) {
+        if let Some(codepoint) = decode_and_resolve(bytes, &mut slots, trie, id) {
             leaders += 1;
             if slots.flags(id) & F_MISSING != 0 {
-                misses.push(cp);
+                misses.push(codepoint);
             }
         }
     }
 
     // ── the fold, per item ────────────────────────────────────────────────────
     let mut item_bounds = vec![0.0f64; items.len() * 8];
-    for (i, it) in items.iter().enumerate() {
-        layout_item(&mut slots, it, &mut item_bounds, i * 8, !page_active(it));
+    for (index, item) in items.iter().enumerate() {
+        layout_item(&mut slots, item, &mut item_bounds, index * 8, !page_active(item));
     }
 
     // ── paginate: stride DERIVED from the fold's own scalar 7 ─────────────────
-    for (i, it) in items.iter().enumerate() {
-        if !page_active(it) {
+    for (index, item) in items.iter().enumerate() {
+        if !page_active(item) {
             continue;
         }
-        let stride = derive_stride(item_bounds[i * 8 + 7], it);
-        let start = it.byte_start as usize;
-        let stop = (it.byte_start + it.byte_count) as usize;
+        let stride = derive_stride(item_bounds[index * 8 + 7], item);
+        let start = item.byte_start as usize;
+        let stop = (item.byte_start + item.byte_count) as usize;
         for id in start..stop {
-            paginate(&mut slots, id, it, stride);
+            paginate(&mut slots, id, item, stride);
         }
     }
 
     // ── per-item boxes for the paged items only ───────────────────────────────
     // A non-paged item already has its box from the fold; only the items
     // paginate rewrote need this pass.
-    for (i, it) in items.iter().enumerate() {
-        if !page_active(it) {
+    for (index, item) in items.iter().enumerate() {
+        if !page_active(item) {
             continue;
         }
-        let start = it.byte_start as usize;
-        let stop = (it.byte_start + it.byte_count) as usize;
-        let b = bounds_range(&slots, start, stop);
-        item_bounds[i * 8..i * 8 + 6].copy_from_slice(&b);
+        let start = item.byte_start as usize;
+        let stop = (item.byte_start + item.byte_count) as usize;
+        let box_lanes = bounds_range(&slots, start, stop);
+        item_bounds[index * 8..index * 8 + 6].copy_from_slice(&box_lanes);
     }
 
     // ── batch union: min over 0-2, max over 3-7 (lanes 6/7 included) ──────────
@@ -596,15 +613,15 @@ pub fn run_pipeline<T: ResolveGlyph + ?Sized>(
         0.0,
         0.0,
     ];
-    for i in 0..items.len() {
-        for l in 0..3 {
-            if item_bounds[i * 8 + l] < batch_bounds[l] {
-                batch_bounds[l] = item_bounds[i * 8 + l];
+    for index in 0..items.len() {
+        for lane in 0..3 {
+            if item_bounds[index * 8 + lane] < batch_bounds[lane] {
+                batch_bounds[lane] = item_bounds[index * 8 + lane];
             }
         }
-        for l in 3..8 {
-            if item_bounds[i * 8 + l] > batch_bounds[l] {
-                batch_bounds[l] = item_bounds[i * 8 + l];
+        for lane in 3..8 {
+            if item_bounds[index * 8 + lane] > batch_bounds[lane] {
+                batch_bounds[lane] = item_bounds[index * 8 + lane];
             }
         }
     }
