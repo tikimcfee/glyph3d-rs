@@ -253,3 +253,23 @@ Goal/Result header; per-phase detail (what moved, file:line); verification table
 `--no-composite` A/B, and for L3 the copy-vs-shader rationale); file diffs; remaining gaps
 (watchlist items above + anything discovered). One commit per phase; gates in every commit
 message; O1/O2 land as their own tiny commits whenever convenient.
+
+---
+
+## Addendum 2026-09-03 — Stage L COMPLETE (L1–L4 landed, O1/O2 stolen)
+
+Executed against a post-K tree (the handoff targeted `cb35552`). L1 FrameUniform
+(104 B, zero WGSL edits — bigger buffer binds to the unchanged block); L2 Phase
+enum + per-phase draw lists (chunk-major flatten is load-bearing — blend order
+follows record order); L3 pooled ping-pong view target + composite (copy path
+on the oracle driver, bit-exact by construction AND empirically; `composite.wgsl`
+shader path windowed; `--no-composite` escape hatch proved neutrality then was
+removed); L4 selection mask (`Phase::Selection`; click-flash hack removed —
+pick selects, miss clears, persistent until next pick). O1/O2 steals landed as
+their own commits. Notable deviations recorded in `out/STAGE_L_REPORT.md`:
+wgpu 30's default error handler PANICS (O1 deliberately changed semantics to
+log-once, owner-ratified with a loud `[GPU-ERROR]` marker); `wgpu::Color::BLACK`
+is (0,0,0,1) — a mask "clear" bug the K6 pixel seam caught in minutes; no
+re-baseline was needed anywhere (stage-g proofs never contained flash pixels;
+offscreen has no mask path by construction). Watchlist triggers unchanged
+(pipelines now ~5–6 of the ~8 pool trigger).

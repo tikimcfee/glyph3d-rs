@@ -43,9 +43,19 @@ Per decision record 10: borrow the *shape*, refuse the machinery.
 - **L3** pooled ping-pong view target + composite: `copy_texture_to_texture`
   on the oracle path (bit-exact by construction), new `composite.wgsl`
   fullscreen pass windowed; `--no-composite` proved neutrality, then removed
+- **L4** selection mask pass: `Phase::Selection`, selected glyphs/segments
+  render into a mask target and composite as a warm tint; click-flash hack
+  REMOVED (pick selects, miss clears, persistent until next pick — Stage G's
+  sticky-flash gap closed). The K6 pixel seam caught a real bug in minutes
+  (`wgpu::Color::BLACK` is (0,0,0,1) — a "clear" that wrote opaque alpha).
+  No re-baseline needed: offscreen has no mask path by construction.
 - **O1** uncaptured-error dedup (ErrorTracker pattern) — **paid off within
-  hours**, catching L3's missing-`COPY_DST` validation error cleanly
+  hours**, catching L3's missing-`COPY_DST` validation error cleanly.
+  Owner-ratified semantics + loud `[GPU-ERROR]` marker (`2c60d84`).
 - **O2** debug labels everywhere — GPU captures now read like a book
+- **Post-L3 fix**: occlusion busy-spin (~100 % CPU while the window is
+  occluded) throttled to a 2 Hz retry + parked WaitUntil (`c567d51`);
+  live-verified self-recovery when the display woke
 
 ### Engine merge (parallel workstream, absorbed)
 
@@ -73,11 +83,9 @@ with K/L. Full story: `out/ENGINE_TOOLCHAIN_REPORT.md`.
 
 | Item | What | Cost |
 |---|---|---|
-| **L4 — selection mask** | `Phase::Selection` + mask pass; the principled fix for Stage G's sticky-flash/selection-range gaps. Pixels change *when a selection exists* (gate: no-selection byte-equal) | ~1 phase, gated |
-| **Occlusion busy-spin fix** | Occluded window spins `request_redraw` at ~100 % CPU (pre-existing, found by L3's probe). One backoff line + a gate run | tiny |
 | **BACKDROP_GAIN mini-stage** | store `ink_frac` at staging, apply live gain at backdrop-compaction (zero GPU cost). Needs A/B care — touches staging | mini-stage |
 | **K5 follow-up** | exact-match pick variant so browser row-clicks can flash the right file (substring match could hit wrong file) | small |
-| **Handoff 08 addendum** | record L1–L3 as landed in the handoff + sync back to `glyph3d-integration-notes/` (the 09/K6 pattern) | minutes |
+| ~~Handoff 08 addendum~~ | DONE 2026-09-03 — L1–L4 completion addendum written and synced back to `glyph3d-integration-notes/` | — |
 
 ### Blocked / watchlist (do NOT start — triggers recorded in stage reports)
 
@@ -88,25 +96,35 @@ with K/L. Full story: `out/ENGINE_TOOLCHAIN_REPORT.md`.
 - **wasm port**: audit says plausible (render path is engine-free); re-runs
   the device-tier refusal if greenlit.
 
+## 4. Decisions — RESOLVED by the owner (2026-09-03)
+
+1. **O1 semantics**: log-once-and-continue KEPT, with the loud greppable
+   `[GPU-ERROR]` marker so a first occurrence can't hide in noise.
+2. **Root `AGENTS.md` / `README.md`**: another agent's repo-mapping
+   work-in-progress — left untracked; refine + commit at a natural point.
+3. **Generated schema**: acknowledged — more engine changes coming
+   (simplifications + correctness); schema edits via
+   `schema/glyph-identity.json` + `gen_schema.py` only.
+
+## 5. Where the frontier is now
+
+Notes 07–10's structural program is **fully executed** (K ✓, L1–L4 ✓,
+O1/O2 ✓). The frontier moves to:
+
+- **Labels** (glyphon/cosmic-text, roadmap item 6) — hooks into L2's phase
+  lists; the per-renderable text story is the next real design conversation.
+- **Editing / resizable arena** (Stage G's named gap; its own stage).
+- **BACKDROP_GAIN mini-stage** and the **K5 exact-pick follow-up** as
+  smaller ready items.
+- Engine-side: the parallel session's simplification/correctness work —
+  absorb via the same `pixi install && pixi run build-engine && check-all`
+  path as last time.
+
 ### Human-pass leftovers (organic testing covers most)
 
-- IME preedit with a CJK/dead-key input source (candidate-window quirks are
-  document-only, not fix).
-
-## 4. Decisions awaiting the owner (small but real)
-
-1. **O1 semantics**: wgpu 30's default is panic-on-first-GPU-error; our
-   tracker made it log-once-and-continue (rerun-style, and it already caught
-   a real bug). Keep, or one-line revert to fatal.
-2. **Untracked root `AGENTS.md` / `README.md`** — appeared with the merge
-   window, not ours (likely the parallel session's). Commit, or leave?
-3. **`engine/glyph_schema.mojo` is generated** (gate 1 diffs it): any schema
-   change goes through `schema/glyph-identity.json` + `gen_schema.py`.
-
-## 5. Recommended next move
-
-**L4** closes Stage G's last named UI gaps and completes the L-phase arc the
-decision record scoped; the **occlusion spin** is a nearly-free quality fix
-worth folding in alongside. After L4 the structural program from notes 07–10
-is fully executed, and the roadmap's frontier moves to labels (glyphon,
-roadmap item 6) and the editing/arena work.
+- L4: click→tint appears/persists/moves, click-empty clears, a g-dragged
+  group's tint follows, profiler shows the two selection passes only while
+  a selection exists.
+- Occlusion fix: lid close/open, window fully covered — one log line,
+  idle CPU, ≤0.5 s recovery.
+- IME preedit with a CJK/dead-key input source (document-only quirks).
