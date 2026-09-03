@@ -237,7 +237,9 @@ impl WindowState {
             usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
             mapped_at_creation: false,
         });
-        let mut encoder = ctx.device.create_command_encoder(&Default::default());
+        let mut encoder = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("windowed shot copy"), // Stage L (O2)
+        });
         encoder.copy_texture_to_buffer(
             wgpu::TexelCopyTextureInfo {
                 texture: &frame.texture,
@@ -340,7 +342,9 @@ impl WindowState {
         };
         let view = frame.texture.create_view(&Default::default());
 
-        let mut encoder = ctx.device.create_command_encoder(&Default::default());
+        let mut encoder = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("windowed frame"), // Stage L (O2)
+        });
         self.scene.render(
             ctx,
             &mut encoder,

@@ -1058,7 +1058,7 @@ impl GlyphScene {
             count: None,
         };
         let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("glyph bgl"),
+            label: Some("glyph field bgl"),
             entries: &[
                 wgpu::BindGroupLayoutEntry {
                     binding: 0,
@@ -1104,11 +1104,20 @@ impl GlyphScene {
                 },
             ],
         });
+        // Stage L (O2): enumerate so captures can tell chunk bind groups
+        // apart (mirrors the "glyph instances i/N" buffer labels).
+        let bind_group_count = instance_bufs.len();
         let bind_groups: Vec<wgpu::BindGroup> = instance_bufs
             .iter()
-            .map(|buf| {
+            .enumerate()
+            .map(|(i, buf)| {
+                let label = if bind_group_count == 1 {
+                    "glyph bg".to_string()
+                } else {
+                    format!("glyph bg {i}/{bind_group_count}")
+                };
                 device.create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: Some("glyph bg"),
+                    label: Some(&label),
                     layout: &bgl,
                     entries: &[
                         wgpu::BindGroupEntry {
@@ -1151,7 +1160,7 @@ impl GlyphScene {
 
         let depth_format = wgpu::TextureFormat::Depth32Float;
         let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("glyph pl"),
+            label: Some("glyph field pl"),
             bind_group_layouts: &[Some(&bgl)],
             immediate_size: 0,
         });
@@ -2325,7 +2334,9 @@ impl SceneLike for GlyphScene {
             usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
             mapped_at_creation: false,
         });
-        let mut enc = ctx.device.create_command_encoder(&Default::default());
+        let mut enc = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("debug dump copy"), // Stage L (O2)
+        });
         enc.copy_buffer_to_buffer(&self.instance_bufs[chunk], local * 48, &buf, 0, size);
         ctx.queue.submit([enc.finish()]);
         let slice = buf.slice(..);

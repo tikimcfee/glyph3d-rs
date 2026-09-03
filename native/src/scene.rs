@@ -164,7 +164,7 @@ impl Scene {
 
         // --- camera uniform --------------------------------------------------
         let camera_buf = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("camera uniform"),
+            label: Some("quad field camera uniform"),
             size: std::mem::size_of::<CameraUniform>() as u64,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
@@ -172,7 +172,7 @@ impl Scene {
 
         // --- pipeline ---------------------------------------------------------
         let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("scene bgl"),
+            label: Some("quad field bgl"),
             entries: &[
                 wgpu::BindGroupLayoutEntry {
                     binding: 0,
@@ -197,7 +197,7 @@ impl Scene {
             ],
         });
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("scene bg"),
+            label: Some("quad field bg"),
             layout: &bgl,
             entries: &[
                 wgpu::BindGroupEntry {
@@ -218,7 +218,7 @@ impl Scene {
 
         let depth_format = wgpu::TextureFormat::Depth32Float;
         let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("scene pl"),
+            label: Some("quad field pl"),
             bind_group_layouts: &[Some(&bgl)],
             immediate_size: 0,
         });

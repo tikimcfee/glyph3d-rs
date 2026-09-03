@@ -105,7 +105,9 @@ pub fn run(
     let mut profile_acc = crate::gpu::ProfileAccumulator::default();
     let t0 = std::time::Instant::now();
     for frame in 0..frames {
-        let mut encoder = device.create_command_encoder(&Default::default());
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("offscreen frame"), // Stage L (O2)
+        });
         // Fixed virtual clock step (1/60 s per frame) so screenshots are
         // deterministic regardless of how fast frames actually encode.
         scene.render(
