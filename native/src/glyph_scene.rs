@@ -45,6 +45,11 @@
 //! Culling is visually lossless: a culled segment is entirely outside the
 //! frustum, and the LOD tier only substitutes subpixel glyphs.
 //!
+//! Stage L (L2): the cull output is organized as PHASE LISTS (`enum Phase`
+//! with `PhaseDraws` — re_renderer's DrawPhase borrow). Recording iterates
+//! phases in declaration order (Backdrop, then Glyphs — exactly the order
+//! above); behavior and profiler query names are unchanged.
+//!
 //! WHY CPU + DIRECT DRAWS: the original Stage F design was the standard
 //! WebGPU pattern (compute cull pass → indirect multi-draws). It is
 //! empirically BROKEN in wgpu 30.0.1's Metal backend: any indirect draw with
@@ -337,6 +342,31 @@ struct BackdropInst {
     rgba: [f32; 4],
 }
 
+/// Stage L (L2): draw phases — re_renderer's DrawPhase borrow (a flat enum
+/// partitioning draw order, per-phase work lists, no render graph).
+/// Recording iterates phases in declaration order: Backdrop first, Glyphs
+/// second — exactly the Stage F order. `Selection`/`Overlay` variants arrive
+/// WITH their phases (L4+); no dead variants (Stage J rule).
+enum Phase {
+    /// Far-LOD backdrop quads (one instanced draw over the compacted list).
+    Backdrop,
+    /// The glyph instances (per-chunk range draws).
+    Glyphs,
+}
+
+/// Stage L (L2): one frame's draw work, partitioned by phase. Built during
+/// cull (culled path) or straight from the chunk counts (legacy --no-cull
+/// path).
+struct PhaseDraws {
+    /// Backdrop phase: the compacted far-LOD quads.
+    backdrops: Vec<BackdropInst>,
+    /// Glyphs phase: (chunk, chunk-local slot range), CHUNK-major —
+    /// ascending chunk, arena-ascending ranges within a chunk — so the
+    /// record order (and thus the within-pixel blend order) is identical to
+    /// the pre-L2 per-chunk loops.
+    glyph_ranges: Vec<(u32, std::ops::Range<u32>)>,
+}
+
 /// Per-frame, view-derived cull inputs (everything the segment table doesn't
 /// provide). Bundled so `cull_segments` stays under the argument-count lint.
 struct CullView {
@@ -351,19 +381,20 @@ struct CullView {
 }
 
 /// Stage F — CPU cull: frustum + LOD over the segment table. Returns the
-/// glyph draw list (chunk, chunk_local_base, count — in arena order per
-/// chunk, so blending matches the legacy full draws exactly) and the
-/// compacted backdrop list. See the module header for the contract and for
-/// why this runs on the CPU. Stage G: `hidden` (parallel to `segments`,
-/// empty = nothing hidden) skips user-hidden groups entirely — no glyph
-/// draws AND no backdrop.
+/// frame's draw work as phase lists (Stage L, L2): the Backdrop phase's
+/// compacted quad list and the Glyphs phase's (chunk, chunk-local range)
+/// list — chunk-major, arena-ascending within a chunk, so blending matches
+/// the legacy full draws exactly. See the module header for the contract
+/// and for why this runs on the CPU. Stage G: `hidden` (parallel to
+/// `segments`, empty = nothing hidden) skips user-hidden groups entirely —
+/// no glyph draws AND no backdrop.
 fn cull_segments(
     segments: &[SegCull],
     hidden: &[bool],
     view: &CullView,
     chunk_cap: u32,
     chunk_count: u32,
-) -> (Vec<Vec<std::ops::Range<u32>>>, Vec<BackdropInst>) {
+) -> PhaseDraws {
     let CullView { planes, eye, px_scale, lod_min_px } = *view;
     let mut draws: Vec<Vec<std::ops::Range<u32>>> =
         (0..chunk_count).map(|_| Vec::new()).collect();
@@ -417,7 +448,15 @@ fn cull_segments(
             }
         }
     }
-    (draws, backdrops)
+    // Stage L (L2): flatten chunk-major into the Glyphs phase list — the
+    // per-chunk vectors are already segment/arena-ascending, so the flat
+    // list's record order matches the pre-L2 loops exactly.
+    let glyph_ranges = draws
+        .into_iter()
+        .enumerate()
+        .flat_map(|(c, rs)| rs.into_iter().map(move |r| (c as u32, r)))
+        .collect();
+    PhaseDraws { backdrops, glyph_ranges }
 }
 
 /// Extract the 6 frustum planes from a view-proj matrix (Gribb-Hartmann;
@@ -2359,11 +2398,12 @@ impl SceneLike for GlyphScene {
         ctx.queue
             .write_buffer(&self.camera_buf, 0, bytemuck::bytes_of(&cam));
 
-        // --- Stage F: CPU segment cull (frustum + LOD), then range draws ----
-        // (per-chunk draw ranges for visible segments, compacted backdrop quads)
-        type CulledDraws = (Vec<Vec<std::ops::Range<u32>>>, Vec<BackdropInst>);
-        let mut culled_draws: Option<CulledDraws> = None;
-        if let Some(cull) = &self.cull {
+        // --- Stage F: CPU segment cull (frustum + LOD) ----------------------
+        // Stage L (L2): the cull output IS the phase lists (PhaseDraws). The
+        // legacy --no-cull path builds the Glyphs list straight from the
+        // chunk counts (one full range per chunk — identical draws to the
+        // pre-L2 per-chunk loop) and has no Backdrop phase content.
+        let phase_draws: PhaseDraws = if let Some(cull) = &self.cull {
             // Stage H: CPU scope timing (only when GLYPH_PROFILE=1 built a profiler).
             let cull_t0 = ctx.profiler.as_ref().map(|_| std::time::Instant::now());
             let view = CullView {
@@ -2372,38 +2412,48 @@ impl SceneLike for GlyphScene {
                 px_scale,
                 lod_min_px: cull.lod_min_px.get(),
             };
-            let (draws, backdrops) = cull_segments(
+            let phase_draws = cull_segments(
                 &cull.segments,
                 &cull.hidden,
                 &view,
                 self.chunk_cap,
                 self.bind_groups.len() as u32,
             );
-            if !backdrops.is_empty() {
+            if !phase_draws.backdrops.is_empty() {
                 ctx.queue.write_buffer(
                     &cull.backdrop_insts_buf,
                     0,
-                    bytemuck::cast_slice(&backdrops),
+                    bytemuck::cast_slice(&phase_draws.backdrops),
                 );
             }
             if let Some(t0) = cull_t0 {
                 crate::gpu::record_cpu_scope(ctx, "cull (CPU)", t0.elapsed().as_secs_f64() * 1000.0);
             }
             if std::env::var_os("GLYPH_CULL_DEBUG").is_some() && t == 0.0 {
-                let insts: u64 = draws
+                let insts: u64 = phase_draws
+                    .glyph_ranges
                     .iter()
-                    .flat_map(|c| c.iter())
-                    .map(|r| (r.end - r.start) as u64)
+                    .map(|(_, r)| (r.end - r.start) as u64)
                     .sum();
                 println!(
                     "CULLDBG glyph draws={} instances={} | backdrops={}",
-                    draws.iter().map(|c| c.len()).sum::<usize>(),
+                    phase_draws.glyph_ranges.len(),
                     insts,
-                    backdrops.len(),
+                    phase_draws.backdrops.len(),
                 );
             }
-            culled_draws = Some((draws, backdrops));
-        }
+            phase_draws
+        } else {
+            PhaseDraws {
+                backdrops: Vec::new(),
+                glyph_ranges: self
+                    .chunk_counts
+                    .iter()
+                    .enumerate()
+                    .map(|(c, &n)| (c as u32, 0..n))
+                    .collect(),
+            }
+        };
 
         // Stage K: refresh the windowed debug-UI probe (installed only by
         // windowed runs; offscreen skips this entirely). Camera fields are
@@ -2417,21 +2467,18 @@ impl SceneLike for GlyphScene {
             p.yaw = self.fly.yaw;
             p.pitch = self.fly.pitch;
             p.last_pick = self.picked.as_ref().map(format_pick);
-            match &culled_draws {
-                Some((draws, backdrops)) => {
-                    p.cull_ranges = draws.iter().map(|c| c.len()).sum();
-                    p.cull_instances = draws
-                        .iter()
-                        .flat_map(|c| c.iter())
-                        .map(|r| (r.end - r.start) as u64)
-                        .sum();
-                    p.cull_backdrops = backdrops.len();
-                }
-                None => {
-                    p.cull_ranges = 0;
-                    p.cull_instances = 0;
-                    p.cull_backdrops = 0;
-                }
+            if self.cull.is_some() {
+                p.cull_ranges = phase_draws.glyph_ranges.len();
+                p.cull_instances = phase_draws
+                    .glyph_ranges
+                    .iter()
+                    .map(|(_, r)| (r.end - r.start) as u64)
+                    .sum();
+                p.cull_backdrops = phase_draws.backdrops.len();
+            } else {
+                p.cull_ranges = 0;
+                p.cull_instances = 0;
+                p.cull_backdrops = 0;
             }
             // K5: refresh the browser's dynamic row state (world pose under
             // the live group TRS, hidden, tint). ~1.3k cheap iterations at
@@ -2502,56 +2549,58 @@ impl SceneLike for GlyphScene {
             }),
             ..Default::default()
         });
-        if let (Some(cull), Some((draws, backdrops))) = (&self.cull, &culled_draws) {
-            // Far LOD stream first: one instanced draw over the compacted
-            // backdrop quads (plain draw — no indirect machinery, see the
-            // module header).
-            if !backdrops.is_empty() {
-                let q = ctx
-                    .profiler
-                    .as_ref()
-                    .map(|p| p.borrow().begin_query("backdrop stream", &mut pass));
-                pass.set_pipeline(&cull.backdrop_pipeline);
-                pass.set_bind_group(0, &cull.backdrop_bind_group, &[]);
-                pass.draw(0..6, 0..backdrops.len() as u32);
-                if let (Some(p), Some(q)) = (&ctx.profiler, q) {
-                    p.borrow().end_query(&mut pass, q);
+        // Stage L (L2): record the phase lists in phase order — Backdrop
+        // first, Glyphs second, exactly the Stage F order. Empty phases
+        // record nothing (the legacy --no-cull branch has no Backdrop
+        // content; an all-near-LOD frame has none either). Profiler query
+        // names unchanged ("backdrop stream", "glyph stream").
+        for phase in [Phase::Backdrop, Phase::Glyphs] {
+            match phase {
+                Phase::Backdrop => {
+                    // Far LOD stream first: one instanced draw over the
+                    // compacted backdrop quads (plain draw — no indirect
+                    // machinery, see the module header). The pipeline lives
+                    // in CullState; the legacy branch never reaches in here
+                    // (its backdrops list is empty).
+                    if let Some(cull) = &self.cull {
+                        if !phase_draws.backdrops.is_empty() {
+                            let q = ctx
+                                .profiler
+                                .as_ref()
+                                .map(|p| p.borrow().begin_query("backdrop stream", &mut pass));
+                            pass.set_pipeline(&cull.backdrop_pipeline);
+                            pass.set_bind_group(0, &cull.backdrop_bind_group, &[]);
+                            pass.draw(0..6, 0..phase_draws.backdrops.len() as u32);
+                            if let (Some(p), Some(q)) = (&ctx.profiler, q) {
+                                p.borrow().end_query(&mut pass, q);
+                            }
+                        }
+                    }
                 }
-            }
-            // Glyph stream: one range draw per visible segment per chunk.
-            // Ranges ascend in arena order per chunk, so within-pixel blend
-            // order matches the legacy full draws exactly.
-            let q = ctx
-                .profiler
-                .as_ref()
-                .map(|p| p.borrow().begin_query("glyph stream", &mut pass));
-            pass.set_pipeline(&self.pipeline);
-            for (bg, ranges) in self.bind_groups.iter().zip(draws.iter()) {
-                if ranges.is_empty() {
-                    continue;
+                Phase::Glyphs => {
+                    // Glyph stream: one range draw per entry. The list is
+                    // chunk-major with arena-ascending ranges within a chunk,
+                    // so within-pixel blend order matches the pre-L2 loops
+                    // exactly; the chunk bind group is re-set only on change
+                    // (legacy: one full range per chunk, so every chunk sets
+                    // its bind group exactly once, as before).
+                    let q = ctx
+                        .profiler
+                        .as_ref()
+                        .map(|p| p.borrow().begin_query("glyph stream", &mut pass));
+                    pass.set_pipeline(&self.pipeline);
+                    let mut cur_chunk = u32::MAX;
+                    for (c, r) in &phase_draws.glyph_ranges {
+                        if *c != cur_chunk {
+                            cur_chunk = *c;
+                            pass.set_bind_group(0, &self.bind_groups[*c as usize], &[]);
+                        }
+                        pass.draw(0..6, r.clone());
+                    }
+                    if let (Some(p), Some(q)) = (&ctx.profiler, q) {
+                        p.borrow().end_query(&mut pass, q);
+                    }
                 }
-                pass.set_bind_group(0, bg, &[]);
-                for r in ranges {
-                    pass.draw(0..6, r.clone());
-                }
-            }
-            if let (Some(p), Some(q)) = (&ctx.profiler, q) {
-                p.borrow().end_query(&mut pass, q);
-            }
-        } else {
-            let q = ctx
-                .profiler
-                .as_ref()
-                .map(|p| p.borrow().begin_query("glyph stream", &mut pass));
-            pass.set_pipeline(&self.pipeline);
-            // Legacy: one instanced draw per arena chunk (chunk-local
-            // instance_index). Kept as the no-feature / --no-cull fallback.
-            for (bg, count) in self.bind_groups.iter().zip(self.chunk_counts.iter()) {
-                pass.set_bind_group(0, bg, &[]);
-                pass.draw(0..6, 0..*count);
-            }
-            if let (Some(p), Some(q)) = (&ctx.profiler, q) {
-                p.borrow().end_query(&mut pass, q);
             }
         }
         drop(pass);
