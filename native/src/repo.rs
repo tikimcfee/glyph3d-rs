@@ -173,6 +173,27 @@ pub struct RepoParams {
     pub gap_y: f32,
     /// Target width/height aspect for the page grid.
     pub grid_aspect: f32,
+    /// THE WRAP STAIRCASE. Z step per intra-line wrap segment, as a multiple
+    /// of the em cell height — the web's `zWrapSpacing`
+    /// (`workers/builders/index.js`, default 0.15), and `ItemParams::z_step`
+    /// is this times `CELL_HEIGHT_WORLD`, exactly as `CodeGrid.js:1365`
+    /// computes it.
+    ///
+    /// WHY IT IS A DIAL AND NOT A CONSTANT. This is three-dimensional word
+    /// wrap: when a single logical line runs past `wrap_cols`, the fold rolls
+    /// it to the next row AND steps it back in Z, so a wrapped line reads as
+    /// a staircase receding from the viewer instead of a flat block that
+    /// looks like separate lines. The degenerate case is what proves it — a
+    /// few hundred thousand characters of minified JSON with no newline at
+    /// all becomes a legible wrapped page with visible depth, rather than one
+    /// endless thin rectangle.
+    ///
+    /// The fold has always computed this (`fold.rs`: `wrap_segment = col /
+    /// wrap_width`, then `z = origin_z - wrap_segment * z_step`) and the
+    /// `.pipe.bin` corpus has always gated it. THIS call site was passing 0,
+    /// so every repo render was flat — the algorithm was ported and then
+    /// never wired. Setting it to 0 restores that flatness exactly.
+    pub z_wrap_spacing: f64,
 }
 
 impl Default for RepoParams {
@@ -187,6 +208,7 @@ impl Default for RepoParams {
             gap_x: 2.5,
             gap_y: 6.0,
             grid_aspect: 1.6,
+            z_wrap_spacing: 0.15,
         }
     }
 }
@@ -218,6 +240,13 @@ pub fn file_item_params(p: &RepoParams, byte_len: usize, newline_count: usize) -
         pages_wide: wide,
         page_gap_x: p.page_gap_x,
         band_stride_y: page_h + p.band_gap_y,
+        z_step: text::CELL_HEIGHT_WORLD as f64 * p.z_wrap_spacing,
+        // depth_per_band / depth_per_col are the PAGE-PLANE depth terms, which
+        // the web applies only when the page axis is 'z' (`pageDepth`,
+        // CodeGrid.js:1464). This field fans a file's pages across x and y —
+        // `pages_wide` columns, `band_stride_y` bands — so its page planes are
+        // coplanar by construction and these stay 0. They are a different
+        // feature from the wrap staircase above, not a companion to it.
         depth_per_band: 0.0,
         depth_per_col: 0.0,
         page_line_height: 0.0,
