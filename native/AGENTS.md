@@ -31,11 +31,14 @@ consumers: (1) three generators plus the atlas exporter each rebuild their
 committed output and require **byte-identity** (`engine-trie.bin`,
 `engine/glyph_schema.mojo`, the 16-file vendor manifest, the four
 `assets/atlas/*.bin`); (2) `engine/check.sh` — **16 Mojo conformance suites**
-(11 CPU + 5 GPU on Metal) plus a compile pass over all six benches. Then the
+(11 CPU + 5 GPU on Metal), the two INSTRUMENTS (`fixture_census`,
+`fixture_manifest` — an instrument nothing runs is an absent one, and the
+census was found carrying its own fault), plus a compile pass over all six
+benches. Then the
 original six: (3) `cargo build --release` with **zero warnings**, (4)
-`cargo clippy --release` zero warnings, (5) `cargo test` all green (55 tests:
+`cargo clippy --release` zero warnings, (5) `cargo test` all green (60 tests:
 naga WGSL validation, clap CLI parity, encase layout assertions, ItemParams
-validation, and the fixture reader + differ), (6)
+validation, and the reference port's reader/trie/fold/scan/bake suites), (6)
 `--engine-check src/main.rs` — bit-exact Mojo engine vs the text.rs CPU
 oracle, (7) `tools/check-stage-g.sh` — scripted picks cross-checked against
 an independent python fold oracle, (8) four-view **byte-equal** A/B:
