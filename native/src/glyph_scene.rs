@@ -67,7 +67,7 @@ use std::path::PathBuf;
 use wgpu::util::DeviceExt;
 
 use crate::atlas::Atlas;
-use crate::engine::{GlyphRecord, ItemParams};
+use crate::layout::{GlyphRecord, ItemParams};
 use crate::gpu::GpuContext;
 use crate::scene::SceneLike;
 use crate::text::StagedText;

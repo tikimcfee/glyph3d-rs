@@ -18,8 +18,13 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use crate::engine::{Engine, GlyphRecord, ItemParams};
+use crate::engine::Engine;
 use crate::glyph_scene::{GlyphInstance, GroupRow};
+use crate::layout::{
+    diff_backends, BackendOutput, GlyphArena, GlyphRecord, ItemParams, LayoutGlyphs, LayoutItem,
+    Paint, VerifyLayout,
+};
+use crate::layout_mojo::{MojoLayout, Strategy};
 use crate::text::{self, StagedText};
 
 /// Per-file read cap. Doubles as the ordinal-wall guard (2^24 B = 16 MiB).
@@ -39,10 +44,6 @@ const SOURCE_EXTENSIONS: &[&str] = &[
     "lua", "zig", "ex", "exs", "hs", "ml", "clj", "scala", "php", "pl", "r", "jl",
     "nim", "d", "vue", "svelte",
 ];
-
-/// Packed RGBA8 of palette::DEFAULT ([212,212,212], alpha 255) — the fallback
-/// when a record has no color entry (should not happen; belts-and-braces).
-const DEFAULT_COLOR_PACKED: u32 = 0xFF_D4D4D4;
 
 /// One walked source file.
 pub struct RepoFile {
@@ -251,7 +252,10 @@ pub struct FileView {
 
 pub struct LoadStats {
     pub walk: Duration,
-    pub engine: Duration,
+    /// Time inside the layout seam. Since Stage 0 this INCLUDES compaction and
+    /// the extent reductions — they moved behind the seam, which is the whole
+    /// point — so it is no longer comparable to the pre-seam "engine" number.
+    pub backend: Duration,
     pub stage: Duration,
     pub layout: Duration,
     pub files: usize,
@@ -304,77 +308,6 @@ fn dir_tint(dir: &str) -> [f32; 3] {
         h = h.wrapping_mul(0x0100_0193);
     }
     DIR_TINTS[(h as usize) % DIR_TINTS.len()]
-}
-
-/// Shared context threaded through every `stage_one` call: layout params,
-/// the arena being appended to, and the dropped-blank counter.
-struct StageCtx<'a> {
-    params: &'a RepoParams,
-    instances: &'a mut Vec<GlyphInstance>,
-    blanks: &'a mut usize,
-}
-
-/// Stage one file's engine records into the arena (blanks/missing dropped —
-/// their advance is baked into the survivors' X), returning its FileView.
-fn stage_one(
-    f: &RepoFile,
-    records: &[GlyphRecord],
-    group_id: u32,
-    item: ItemParams,
-    cx: &mut StageCtx<'_>,
-) -> FileView {
-    let params = cx.params;
-    let colors = text::colorize_leaders(&f.bytes);
-    debug_assert_eq!(
-        colors.len(),
-        records.len(),
-        "color/record count mismatch on {}",
-        f.rel_path
-    );
-    let slot_base = cx.instances.len();
-    let mut max_x: f32 = 0.0;
-    let mut min_y: f32 = 0.0;
-    let mut blank = 0usize;
-    for (i, r) in records.iter().enumerate() {
-        let right = r.x() + r.advance();
-        if right > max_x {
-            max_x = right;
-        }
-        if r.y() < min_y {
-            min_y = r.y();
-        }
-        if r.glyph_id() == 0 {
-            blank += 1;
-            continue;
-        }
-        cx.instances.push(GlyphInstance {
-            pos: [r.x(), r.y(), r.z()],
-            glyph_id: r.glyph_id(),
-            row: r.row(),
-            col: r.col(),
-            color: colors.get(i).copied().unwrap_or(DEFAULT_COLOR_PACKED),
-            group_id,
-            advance: r.advance(),
-            height: r.height(),
-            flags: 0, // the wire record carries no flags; the shader reads mode from the glyphmap
-            _pad: 0,
-        });
-    }
-    *cx.blanks += blank;
-    FileView {
-        rel_path: f.rel_path.clone(),
-        dir: f.dir.clone(),
-        group_id,
-        record_count: records.len(),
-        slot_base,
-        slot_count: cx.instances.len() - slot_base,
-        width: max_x,
-        // Paginated footprint: glyph centers run from y=0 down to min_y;
-        // one line pitch of margin covers the bottom row's descenders.
-        height: -min_y + params.line_height as f32,
-        offset: [0.0; 3],
-        item,
-    }
 }
 
 /// Packed SHELF layout, classed by height: files are stably partitioned into
@@ -450,9 +383,14 @@ fn layout(
     )
 }
 
-/// Whole-repo load: walk → engine → stage → grid layout. `batch` selects the
-/// batched FFI (one engine call for the whole corpus) over the per-file loop;
-/// `verify` runs BOTH and diffs every record bit-exact (the standing gate).
+/// Whole-repo load: walk → paint → the layout seam → grid layout.
+///
+/// `batch` selects the Mojo backend's batched FFI strategy over its per-item
+/// one — a backend-internal choice since Stage 0, threaded through only
+/// because the CLI still exposes it. `verify` runs the OTHER strategy as a
+/// second backend and diffs the two AT THE SEAM: placements, instances and
+/// records, all bit-exact. That is the standing gate, and at stage 1 the same
+/// call diffs Mojo against Rust with nothing new written.
 pub fn load_repo(
     root: &Path,
     trie: &Path,
@@ -464,8 +402,6 @@ pub fn load_repo(
     let walk = walk_repo(root);
     let walk_dur = t0.elapsed();
 
-    let mut eng = Engine::new();
-    eng.load_trie_file(trie).expect("failed to load engine trie");
     // Per-file params (pagination sized per file). Newline counts double as
     // the row estimate — one fast byte scan per file.
     let file_params: Vec<ItemParams> = walk
@@ -477,119 +413,119 @@ pub fn load_repo(
         })
         .collect();
 
-    let mut instances: Vec<GlyphInstance> = Vec::new();
-    let mut views: Vec<FileView> = Vec::with_capacity(walk.files.len());
-    let mut engine_dur = Duration::ZERO;
-    let mut stage_dur = Duration::ZERO;
-    let mut total_records = 0usize;
-    let mut total_blanks = 0usize;
-    // With --repo-verify the selected path's full record stream is kept so the
-    // OTHER path can be diffed against it bit-exact afterwards.
-    let mut kept_stream: Option<Vec<GlyphRecord>> = verify.then(Vec::new);
+    // Paint is chosen from the SOURCE BYTES and indexed by RECORD, so it is
+    // computed here and handed across the seam rather than applied to the
+    // instances afterwards: compaction destroys the index that names a byte
+    // (the argument is at `layout::Paint`).
+    let t = Instant::now();
+    let colors: Vec<Vec<u32>> = walk
+        .files
+        .iter()
+        .map(|f| text::colorize_leaders(&f.bytes))
+        .collect();
+    let mut stage_dur = t.elapsed();
 
-    if batch {
-        // One concatenated blob; item boundaries are prefix sums (contiguous,
-        // ascending — the pipeline's documented requirement).
-        let t = Instant::now();
-        let mut blob = Vec::with_capacity(walk.total_bytes);
-        let mut descs = Vec::with_capacity(walk.files.len());
-        for (f, fp) in walk.files.iter().zip(file_params.iter()) {
-            descs.push((blob.len() as u64, f.bytes.len() as u64, *fp));
-            blob.extend_from_slice(&f.bytes);
-        }
-        let counts = eng
-            .load_items(&blob, &descs)
-            .expect("engine load_items failed");
-        let all = eng.records();
-        engine_dur = t.elapsed();
-        assert_eq!(
-            counts.iter().sum::<u64>() as usize,
-            all.len(),
-            "batch per-item counts do not sum to the record count"
-        );
-        let t = Instant::now();
-        let mut cx = StageCtx {
-            params,
-            instances: &mut instances,
-            blanks: &mut total_blanks,
-        };
-        let mut rec_base = 0usize;
-        for (fi, f) in walk.files.iter().enumerate() {
-            let n = counts[fi] as usize;
-            let records = &all[rec_base..rec_base + n];
-            views.push(stage_one(f, records, fi as u32, file_params[fi], &mut cx));
-            rec_base += n;
-            total_records += n;
-        }
-        stage_dur = t.elapsed();
-        if let Some(s) = &mut kept_stream {
-            *s = all;
-        }
+    let items: Vec<LayoutItem<'_>> = walk
+        .files
+        .iter()
+        .enumerate()
+        .map(|(index, f)| LayoutItem {
+            bytes: &f.bytes,
+            params: file_params[index],
+            group_id: index as u32,
+            paint: Paint::PerRecord(&colors[index]),
+        })
+        .collect();
+
+    let strategy = if batch { Strategy::Batched } else { Strategy::PerItem };
+    let mut backend = MojoLayout::new(strategy);
+    backend
+        .load_trie_file(trie)
+        .expect("failed to load engine trie");
+
+    let mut arena = GlyphArena::new();
+    let t = Instant::now();
+    // Under --repo-verify the selected backend also records its wire stream so
+    // the other one can be diffed against it at every granularity. Without it
+    // nothing asks for records at all, which is the seam's entire point.
+    let (placements, records) = if verify {
+        backend
+            .layout_items_recording(&items, &mut arena)
+            .expect("layout failed")
     } else {
-        let mut cx = StageCtx {
-            params,
-            instances: &mut instances,
-            blanks: &mut total_blanks,
-        };
-        for (fi, f) in walk.files.iter().enumerate() {
-            let t = Instant::now();
-            eng.load_item(&f.bytes, &file_params[fi])
-                .expect("engine load_item failed");
-            let records = eng.records();
-            engine_dur += t.elapsed();
-            let t = Instant::now();
-            views.push(stage_one(f, &records, fi as u32, file_params[fi], &mut cx));
-            stage_dur += t.elapsed();
-            total_records += records.len();
-            if let Some(s) = &mut kept_stream {
-                s.extend_from_slice(&records);
-            }
-        }
-    }
+        (
+            backend
+                .layout_items(&items, &mut arena)
+                .expect("layout failed"),
+            Vec::new(),
+        )
+    };
+    let mut backend_dur = t.elapsed();
 
     let mut verified = false;
     if verify {
-        // Cross-check: run the OTHER engine path and diff every record
-        // bit-exact (same discipline as --engine-check).
         let t = Instant::now();
-        let alt = run_engine_path(&walk, &file_params, trie, !batch);
-        let cur = kept_stream.take().expect("verify kept the selected stream");
-        let mut bad = 0usize;
-        let mut first_diff = String::new();
-        if alt.len() != cur.len() {
-            first_diff = format!("record count: {} vs {}", cur.len(), alt.len());
-            bad = 1;
-        } else {
-            for (i, (a, b)) in cur.iter().zip(alt.iter()).enumerate() {
-                let same = a.counts == b.counts
-                    && a
-                        .measures
-                        .iter()
-                        .zip(b.measures.iter())
-                        .all(|(x, y)| x.to_bits() == y.to_bits());
-                if !same {
-                    bad += 1;
-                    if bad <= 5 {
-                        first_diff.push_str(&format!(
-                            "\n  rec[{i}]: selected {:?} vs other {:?}",
-                            a, b
-                        ));
-                    }
-                }
-            }
-        }
-        if bad != 0 {
-            panic!("repo-verify FAIL: {bad} record(s) differ{first_diff}");
-        }
-        engine_dur += t.elapsed(); // honest: verification time is engine time
+        let other = if batch { Strategy::PerItem } else { Strategy::Batched };
+        let mut alt = MojoLayout::new(other);
+        alt.load_trie_file(trie)
+            .expect("failed to load engine trie");
+        let mut alt_arena = GlyphArena::new();
+        let (alt_placements, alt_records) = alt
+            .layout_items_recording(&items, &mut alt_arena)
+            .expect("layout failed");
+        let report = diff_backends(
+            &BackendOutput {
+                name: backend.name(),
+                placements: &placements,
+                instances: arena.instances(),
+                records: &records,
+            },
+            &BackendOutput {
+                name: alt.name(),
+                placements: &alt_placements,
+                instances: alt_arena.instances(),
+                records: &alt_records,
+            },
+        )
+        .unwrap_or_else(|why| panic!("repo-verify FAIL: {why}"));
+        backend_dur += t.elapsed(); // honest: verification time is backend time
         verified = true;
         println!(
-            "repo-verify PASS: {} records bit-exact between {} and {} paths",
-            cur.len(),
-            if batch { "batch" } else { "naive" },
-            if batch { "naive" } else { "batch" },
+            "repo-verify PASS: {} items, {} instances, {} records bit-exact between {} and {}",
+            report.items,
+            report.instances,
+            report.records,
+            backend.name(),
+            alt.name(),
         );
     }
+
+    let t = Instant::now();
+    let mut total_records = 0usize;
+    let mut total_blanks = 0usize;
+    let mut views: Vec<FileView> = Vec::with_capacity(walk.files.len());
+    for (index, f) in walk.files.iter().enumerate() {
+        let placed = &placements[index];
+        total_records += placed.record_count as usize;
+        total_blanks += (placed.record_count - placed.slot_count) as usize;
+        views.push(FileView {
+            rel_path: f.rel_path.clone(),
+            dir: f.dir.clone(),
+            group_id: index as u32,
+            record_count: placed.record_count as usize,
+            slot_base: placed.slot_base as usize,
+            slot_count: placed.slot_count as usize,
+            width: placed.page.right,
+            // Paginated footprint: glyph centers run from y=0 down to the page
+            // bottom; one line pitch of margin covers the bottom row's
+            // descenders.
+            height: -placed.page.bottom + params.line_height as f32,
+            offset: [0.0; 3],
+            item: file_params[index],
+        });
+    }
+    let instances = arena.into_instances();
+    stage_dur += t.elapsed();
 
     let t = Instant::now();
     let (groups, bounds_min, bounds_max) = layout(&mut views, params);
@@ -597,7 +533,7 @@ pub fn load_repo(
 
     let stats = LoadStats {
         walk: walk_dur,
-        engine: engine_dur,
+        backend: backend_dur,
         stage: stage_dur,
         layout: layout_dur,
         files: walk.files.len(),
@@ -641,37 +577,6 @@ pub fn rederive_records(
     eng.load_trie_file(trie).expect("pick: failed to load engine trie");
     eng.load_item(&bytes, item).expect("pick: engine re-run failed");
     Ok((eng.records(), bytes))
-}
-
-/// Run one engine path over the whole corpus and return the full record
-/// stream (used by --repo-verify to diff batch vs naive).
-fn run_engine_path(
-    walk: &WalkResult,
-    file_params: &[ItemParams],
-    trie: &Path,
-    batch: bool,
-) -> Vec<GlyphRecord> {
-    let mut eng = Engine::new();
-    eng.load_trie_file(trie).expect("failed to load engine trie");
-    if batch {
-        let mut blob = Vec::with_capacity(walk.total_bytes);
-        let mut descs = Vec::with_capacity(walk.files.len());
-        for (f, fp) in walk.files.iter().zip(file_params.iter()) {
-            descs.push((blob.len() as u64, f.bytes.len() as u64, *fp));
-            blob.extend_from_slice(&f.bytes);
-        }
-        eng.load_items(&blob, &descs)
-            .expect("engine load_items failed");
-        eng.records()
-    } else {
-        let mut out = Vec::new();
-        for (f, fp) in walk.files.iter().zip(file_params.iter()) {
-            eng.load_item(&f.bytes, fp)
-                .expect("engine load_item failed");
-            out.extend_from_slice(&eng.records());
-        }
-        out
-    }
 }
 
 impl RepoLoad {
@@ -772,22 +677,22 @@ impl RepoLoad {
         );
         println!(
             "repo: {} engine records -> {} glyph instances ({} blank/missing dropped) \
-             | engine path: {}{}",
+             | backend: mojo-cpu/{}{}",
             s.records,
             s.instances,
             s.blanks,
-            if s.batch { "batch" } else { "naive per-file" },
-            if s.verified { " (verified bit-exact vs the other path)" } else { "" },
+            if s.batch { "batched" } else { "per-item" },
+            if s.verified { " (verified bit-exact vs the other strategy)" } else { "" },
         );
         println!(
-            "phases: walk {:.3}s | engine {:.3}s ({:.1} MB/s) | stage {:.3}s | layout {:.3}s \
-             | total {:.3}s",
+            "phases: walk {:.3}s | backend {:.3}s ({:.1} MB/s, compaction included) \
+             | stage {:.3}s | layout {:.3}s | total {:.3}s",
             s.walk.as_secs_f64(),
-            s.engine.as_secs_f64(),
-            mb / s.engine.as_secs_f64().max(1e-9),
+            s.backend.as_secs_f64(),
+            mb / s.backend.as_secs_f64().max(1e-9),
             s.stage.as_secs_f64(),
             s.layout.as_secs_f64(),
-            (s.walk + s.engine + s.stage + s.layout).as_secs_f64(),
+            (s.walk + s.backend + s.stage + s.layout).as_secs_f64(),
         );
     }
 }

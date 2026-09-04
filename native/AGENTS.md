@@ -36,9 +36,10 @@ committed output and require **byte-identity** (`engine-trie.bin`,
 census was found carrying its own fault), plus a compile pass over all six
 benches. Then the
 original six: (3) `cargo build --release` with **zero warnings**, (4)
-`cargo clippy --release` zero warnings, (5) `cargo test` all green (60 tests:
+`cargo clippy --release` zero warnings, (5) `cargo test` all green (72 tests:
 naga WGSL validation, clap CLI parity, encase layout assertions, ItemParams
-validation, and the reference port's reader/trie/fold/scan/bake suites), (6)
+validation, the layout seam's compaction / paint-indexing / extent / differ
+suites, and the reference port's reader/trie/fold/scan/bake suites), (6)
 `--engine-check src/main.rs` — bit-exact Mojo engine vs the text.rs CPU
 oracle, (7) `tools/check-stage-g.sh` — scripted picks cross-checked against
 an independent python fold oracle, (8) four-view **byte-equal** A/B:
@@ -88,6 +89,46 @@ this is fenced:
 - Version pins: wgpu 30.x, winit 0.30, glam 0.33 (see Cargo.toml comments).
   **No dependency bump without its own re-baselined mini-stage** (Stages H/I
   are the template: one dep, full A/B suite, report in out/).
+
+## The layout seam
+
+Everything that lays glyphs out goes through `native/src/layout.rs`
+(Stage 0 of `engine/BACKEND-PLAN.md`). Read that module header before adding
+a backend or a caller; the short version:
+
+- A backend takes `LayoutItem`s (bytes + `ItemParams` + `Paint` + group),
+  appends instances to a caller-owned `GlyphArena`, and returns
+  `ItemPlacement`s — a slot range, three counts, two extents. **No method on
+  `LayoutGlyphs` returns a position.** That is the point: it is what lets a
+  device-resident backend keep the glyphs on the device.
+- A gate that needs the 32 B wire records asks `VerifyLayout`, a SEPARATE
+  trait. Holding a `LayoutGlyphs` makes the 36 B-per-source-byte readback
+  unreachable rather than merely discouraged. Do not widen `LayoutGlyphs` to
+  return records; that is the contract this seam replaced.
+- `ItemParams::validate` runs in `LayoutGlyphs::layout_items`, a PROVIDED
+  method. Implement `layout_validated_items`; a backend cannot forget the
+  guard because it never calls it.
+- Compaction is written once (`layout::compact_records_into`) and shared by
+  every host backend, so two backends can differ about the FOLD — the thing
+  the corpus gates — and cannot differ about blanks, paint indexing, or the
+  extents.
+- **Paint is indexed by RECORD, not by instance.** Compaction destroys the
+  index that names a byte, so paint crosses the seam and is applied during
+  compaction. Indexing it by instance is the tempting mistake and
+  `layout::tests::paint_is_indexed_by_record_so_blanks_consume_an_entry`
+  is what catches it.
+- `--repo-verify` diffs two backends at the seam — placements, instances AND
+  records, all bit-exact (`layout::diff_backends`). It used to compare records
+  only, which cannot see compaction, paint or extents at all. Today it runs
+  the Mojo backend's two FFI strategies against each other; stage 1 points the
+  same call at the Rust backend.
+
+KNOWN CEILING (measured 2026-09-04): the page extent's origin seed is NOT
+covered by the four-view A/B. Seeding it empty instead reddens the unit test
+but leaves all four screenshots byte-equal, because the seed only binds for a
+file with ZERO records and `fixtures/g-pick-repo` has no empty file. Real
+repos do — an empty `.rs` is walked, laid out and staged — so the seed is
+load-bearing in production and unit-tested only.
 
 ## Style discipline
 

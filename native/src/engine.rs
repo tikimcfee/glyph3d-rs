@@ -1,5 +1,12 @@
 //! engine.rs — safe Rust wrapper over the Mojo glyph engine's C ABI (Stage D).
 //!
+//! This is the SUBSTRATE half of the Mojo backend: the extern block, the 128 B
+//! item descriptor, the FP-contract probe, and the handle's lifetime. The
+//! layout CONTRACT it serves — `ItemParams`, `GlyphRecord`, `LayoutError` —
+//! lives in `layout.rs`, because all three backends share it and none of them
+//! is the FFI. The adapter that presents this handle as a `LayoutGlyphs` is
+//! `layout_mojo.rs`.
+//!
 //! The FFI surface (engine/ffi.mojo) is scalars + one opaque handle:
 //! no Mojo types cross the boundary, records are copied into caller memory,
 //! and the f32 lanes cross as raw bits inside the 32 B wire record.
@@ -13,184 +20,15 @@
 use std::ffi::c_void;
 use std::path::Path;
 
-/// One render-read record, exactly the engine's wire format.
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub struct GlyphRecord {
-    /// X, Y, Z, ADVANCE, HEIGHT (render-read measures).
-    pub measures: [f32; 5],
-    /// GLYPH_ID, ROW, COL.
-    pub counts: [u32; 3],
-}
+use crate::layout::{GlyphRecord, ItemParams, LayoutError};
 
-impl GlyphRecord {
-    pub fn x(self) -> f32 {
-        self.measures[0]
-    }
-    pub fn y(self) -> f32 {
-        self.measures[1]
-    }
-    pub fn z(self) -> f32 {
-        self.measures[2]
-    }
-    pub fn advance(self) -> f32 {
-        self.measures[3]
-    }
-    pub fn height(self) -> f32 {
-        self.measures[4]
-    }
-    pub fn glyph_id(self) -> u32 {
-        self.counts[0]
-    }
-    pub fn row(self) -> u32 {
-        self.counts[1]
-    }
-    pub fn col(self) -> u32 {
-        self.counts[2]
-    }
-}
-
-const _: () = assert!(std::mem::size_of::<GlyphRecord>() == 32);
-
-/// Layout params for one item (one text file). Mirrors the engine's `Item`.
-/// f64 fields keep the oracle's float discipline; page geometry is integer.
-#[derive(Clone, Copy, Debug)]
-pub struct ItemParams {
-    pub origin_x: f64,
-    pub origin_y: f64,
-    pub origin_z: f64,
-    pub line_height: f64,
-    pub z_step: f64,
-    /// Fold unit in COLUMNS; 0 = no wrap.
-    pub wrap_width: i32,
-    pub has_page: bool,
-    pub page_rows: i32,
-    pub page_cols: i32,
-    pub scroll_rows: i32,
-    pub pages_wide: i32,
-    pub page_gap_x: f64,
-    pub band_stride_y: f64,
-    pub depth_per_band: f64,
-    pub depth_per_col: f64,
-    pub page_line_height: f64,
-}
-
-impl Default for ItemParams {
-    /// Plain text field: origin at 0, unit line height, no wrap, no pages.
-    fn default() -> Self {
-        Self {
-            origin_x: 0.0,
-            origin_y: 0.0,
-            origin_z: 0.0,
-            line_height: 1.0,
-            z_step: 0.0,
-            wrap_width: 0,
-            has_page: false,
-            page_rows: 0,
-            page_cols: 0,
-            scroll_rows: 0,
-            pages_wide: 0,
-            page_gap_x: 0.0,
-            band_stride_y: 0.0,
-            depth_per_band: 0.0,
-            depth_per_col: 0.0,
-            page_line_height: 0.0,
-        }
-    }
-}
-
-/// Rust-side rejection, raised BEFORE the FFI call — deliberately outside the
-/// engine's status range so it can never be confused with one.
-const GE_BAD_PARAMS: i32 = -1;
-
-impl ItemParams {
-    /// Refuse a layout the engine would silently turn into NaN.
-    ///
-    /// WHY THIS EXISTS. The Mojo engine performs NO input validation:
-    /// `Item.line_height` is a raw `Float64` and `glyph_pipeline.mojo` says in
-    /// as many words that "an unset line_height is NaN here and propagates".
-    /// Every gate in this tree then compares layouts BY BITS — and two NaNs
-    /// compare bit-equal. So a NaN pitch produces a NaN layout that
-    /// `--engine-check`, all fifteen conformance suites, and the byte-equal
-    /// render A/B would every one of them pass. The JS oracle has carried an
-    /// `assertLineHeight` for exactly this since before the port; the native
-    /// side never grew one. (Found 2026-09-02 auditing the JS oracle's tests.)
-    ///
-    /// NaN specifically is not "some invalid float": it is the `.pipe.bin`
-    /// wire encoding for UNSET. Reaching this function means an unset pitch
-    /// travelled all the way to the layout call without anyone resolving it,
-    /// which is a different bug from a corrupt one and says so.
-    ///
-    /// ZERO IS LEGAL, and that is the subtle half. A zero pitch collapses
-    /// every row onto one baseline — a degenerate layout, but a CHOICE, and
-    /// not the same thing as an omission. The idiomatic Rust reflex
-    /// (`if lh == 0.0 { default }`, or `Option::unwrap_or`) quietly conflates
-    /// the two; this does not.
-    pub fn validate(&self, item: usize) -> Result<(), EngineError> {
-        let bad = |what: &str, why: &str| {
-            Err(EngineError {
-                status: GE_BAD_PARAMS,
-                what: format!("item {item}: {what} — {why}"),
-            })
-        };
-        if self.line_height.is_nan() {
-            return bad(
-                "line_height is NaN",
-                "NaN is the wire encoding for UNSET, so an unresolved pitch reached                  the layout call. Every gate here compares by bits and two NaNs are                  bit-equal, so nothing downstream would notice",
-            );
-        }
-        for (name, v) in [
-            ("line_height", self.line_height),
-            ("origin_x", self.origin_x),
-            ("origin_y", self.origin_y),
-            ("origin_z", self.origin_z),
-            ("z_step", self.z_step),
-            ("page_gap_x", self.page_gap_x),
-            ("band_stride_y", self.band_stride_y),
-            ("depth_per_band", self.depth_per_band),
-            ("depth_per_col", self.depth_per_col),
-            ("page_line_height", self.page_line_height),
-        ] {
-            if !v.is_finite() {
-                return bad(
-                    &format!("{name} is {v}"),
-                    "a non-finite measure propagates into every position it touches",
-                );
-            }
-        }
-        for (name, v) in [
-            ("wrap_width", self.wrap_width),
-            ("page_rows", self.page_rows),
-            ("page_cols", self.page_cols),
-            ("scroll_rows", self.scroll_rows),
-            ("pages_wide", self.pages_wide),
-        ] {
-            if v < 0 {
-                return bad(&format!("{name} is {v}"), "page geometry counts are non-negative");
-            }
-        }
-        Ok(())
-    }
-}
+/// Who a `LayoutError` raised here came from.
+pub const MOJO_BACKEND: &str = "mojo";
 
 // Status codes from ffi.mojo.
 const GE_OK: i32 = 0;
 const GE_NO_TRIE: i32 = 2;
 const GE_EMPTY: i32 = 4;
-
-/// Error from an engine call (the C ABI returns status ints, not exceptions).
-#[derive(Debug)]
-pub struct EngineError {
-    pub status: i32,
-    pub what: String,
-}
-
-impl std::fmt::Display for EngineError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{} failed with status {}", self.what, self.status)
-    }
-}
-impl std::error::Error for EngineError {}
 
 extern "C" {
     fn glyph_engine_new() -> *mut c_void;
@@ -339,7 +177,7 @@ impl Engine {
     /// magic — a G3TR blob (`assets/atlas/engine-trie.bin`, the REAL atlas
     /// mapping; the default) or a legacy G3DF .pipe.bin conformance fixture.
     /// The path string crosses the FFI; the engine reads the file itself.
-    pub fn load_trie_file(&mut self, path: &Path) -> Result<(), EngineError> {
+    pub fn load_trie_file(&mut self, path: &Path) -> Result<(), LayoutError> {
         use std::os::unix::ffi::OsStrExt;
         let bytes = path.as_os_str().as_bytes();
         let status = unsafe {
@@ -348,7 +186,8 @@ impl Engine {
         if status == GE_OK {
             Ok(())
         } else {
-            Err(EngineError {
+            Err(LayoutError {
+                backend: MOJO_BACKEND,
                 status,
                 what: format!("glyph_engine_load_trie_file ({})", path.display()),
             })
@@ -357,7 +196,7 @@ impl Engine {
 
     /// Run the pipeline for one text file. Results stay in the handle until
     /// the next load; pull them with [`Engine::records`].
-    pub fn load_item(&mut self, bytes: &[u8], params: &ItemParams) -> Result<u64, EngineError> {
+    pub fn load_item(&mut self, bytes: &[u8], params: &ItemParams) -> Result<u64, LayoutError> {
         params.validate(0)?;
         let status = unsafe {
             glyph_engine_load_item(
@@ -384,7 +223,8 @@ impl Engine {
         };
         match status {
             GE_OK | GE_EMPTY => Ok(self.slot_count()),
-            s => Err(EngineError {
+            s => Err(LayoutError {
+                backend: MOJO_BACKEND,
                 status: s,
                 what: if s == GE_NO_TRIE {
                     "glyph_engine_load_item (no trie loaded)".to_string()
@@ -406,7 +246,7 @@ impl Engine {
         &mut self,
         blob: &[u8],
         items: &[(u64, u64, ItemParams)],
-    ) -> Result<Vec<u64>, EngineError> {
+    ) -> Result<Vec<u64>, LayoutError> {
         // Vec<u64> backing keeps the descriptor array 8-byte aligned.
         let mut desc_words = vec![0u64; items.len() * (ITEM_DESC_SIZE / 8)];
         let desc_bytes: &mut [u8] = bytemuck::cast_slice_mut(&mut desc_words);
@@ -434,7 +274,8 @@ impl Engine {
         };
         match status {
             GE_OK | GE_EMPTY => Ok(counts),
-            s => Err(EngineError {
+            s => Err(LayoutError {
+                backend: MOJO_BACKEND,
                 status: s,
                 what: if s == GE_NO_TRIE {
                     "glyph_engine_load_items (no trie loaded)".to_string()
@@ -474,90 +315,18 @@ impl Drop for Engine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::layout::LAYOUT_BAD_PARAMS;
 
-    fn ok_params() -> ItemParams {
-        ItemParams { line_height: 1.2, ..Default::default() }
-    }
-
-    #[test]
-    fn a_stated_pitch_still_runs() {
-        // THE COUNTERFACTUAL FOR THE GUARD. Without this, `return Err(..)` at
-        // the top of validate() would pass every negative test below.
-        assert!(ok_params().validate(0).is_ok());
-    }
-
-    #[test]
-    fn zero_is_legal_a_degenerate_pitch_is_a_choice() {
-        // Every row on one baseline is a layout, not an omission. The reflex
-        // `if lh == 0.0 { default }` conflates them; we must not.
-        let p = ItemParams { line_height: 0.0, ..Default::default() };
-        assert!(p.validate(0).is_ok(), "zero pitch must be accepted, not defaulted");
-    }
-
-    #[test]
-    fn nan_pitch_is_refused_and_named_as_the_unset_encoding() {
-        let p = ItemParams { line_height: f64::NAN, ..Default::default() };
-        let e = p.validate(3).expect_err("NaN pitch must be refused");
-        assert_eq!(e.status, GE_BAD_PARAMS);
-        assert!(e.what.contains("item 3"), "must name the item: {}", e.what);
-        assert!(e.what.contains("line_height"), "must name the field: {}", e.what);
-        assert!(e.what.contains("UNSET"), "must say NaN means unset: {}", e.what);
-    }
-
-    #[test]
-    fn infinite_pitch_is_refused() {
-        for lh in [f64::INFINITY, f64::NEG_INFINITY] {
-            let p = ItemParams { line_height: lh, ..Default::default() };
-            assert!(p.validate(0).is_err(), "{lh} must be refused");
-        }
-    }
-
-    #[test]
-    fn every_measure_is_checked_not_just_the_pitch() {
-        // A non-finite anywhere propagates into positions. Walk them all so a
-        // newly added measure that skips validate() shows up as a gap here.
-        let mut n = 0;
-        for mutate in [
-            (|p: &mut ItemParams| p.origin_x = f64::NAN) as fn(&mut ItemParams),
-            |p: &mut ItemParams| p.origin_y = f64::INFINITY,
-            |p: &mut ItemParams| p.origin_z = f64::NAN,
-            |p: &mut ItemParams| p.z_step = f64::NAN,
-            |p: &mut ItemParams| p.page_gap_x = f64::NAN,
-            |p: &mut ItemParams| p.band_stride_y = f64::NAN,
-            |p: &mut ItemParams| p.depth_per_band = f64::NAN,
-            |p: &mut ItemParams| p.depth_per_col = f64::NAN,
-            |p: &mut ItemParams| p.page_line_height = f64::NAN,
-        ] {
-            let mut p = ok_params();
-            mutate(&mut p);
-            assert!(p.validate(0).is_err(), "a non-finite measure slipped through");
-            n += 1;
-        }
-        assert_eq!(n, 9, "the sweep must cover every f64 measure but the pitch");
-    }
-
-    #[test]
-    fn negative_page_geometry_is_refused() {
-        let mut n = 0;
-        for mutate in [
-            (|p: &mut ItemParams| p.wrap_width = -1) as fn(&mut ItemParams),
-            |p: &mut ItemParams| p.page_rows = -1,
-            |p: &mut ItemParams| p.page_cols = -1,
-            |p: &mut ItemParams| p.scroll_rows = -1,
-            |p: &mut ItemParams| p.pages_wide = -1,
-        ] {
-            let mut p = ok_params();
-            mutate(&mut p);
-            assert!(p.validate(0).is_err(), "a negative count slipped through");
-            n += 1;
-        }
-        assert_eq!(n, 5, "the sweep must cover every integer count");
-    }
-
-    /// The unit tests above prove `validate()` decides correctly; this proves it
-    /// is actually WIRED to the entry point. Without it the `?` in `load_item`
-    /// would be trusted by inspection, which is the habit this repo keeps
-    /// catching itself in. Uses a live engine + the real atlas trie.
+    /// `ItemParams::validate` is decided and unit-tested on the seam
+    /// (`layout.rs`); this proves it is WIRED to the FFI entry point.
+    ///
+    /// The seam validates too — `LayoutGlyphs::layout_items` is a provided
+    /// method that no backend can forget — so in the render path this guard
+    /// never fires. It stays because `Engine` has callers that are NOT the
+    /// seam: `repo::rederive_records` (the pick re-run) and
+    /// `main::run_engine_smoke` both hold a handle directly. Removing it would
+    /// leave those two paths reaching the FFI unguarded, and the FFI is where a
+    /// NaN actually propagates.
     #[test]
     fn a_nan_pitch_cannot_reach_the_engine_through_load_item() {
         let trie = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -570,14 +339,7 @@ mod tests {
 
         let bad = ItemParams { line_height: f64::NAN, ..Default::default() };
         let e = eng.load_item(b"ab\ncd\n", &bad).expect_err("NaN pitch must be refused AT the seam");
-        assert_eq!(e.status, GE_BAD_PARAMS, "must be the Rust-side refusal, not an engine status");
+        assert_eq!(e.status, LAYOUT_BAD_PARAMS, "must be the host refusal, not an engine status");
         assert!(e.what.contains("UNSET"), "{}", e.what);
-    }
-
-    #[test]
-    fn the_default_params_are_themselves_valid() {
-        // repo.rs and main.rs both build on ..Default::default(); if the default
-        // were invalid every caller would fail at the seam.
-        assert!(ItemParams::default().validate(0).is_ok());
     }
 }

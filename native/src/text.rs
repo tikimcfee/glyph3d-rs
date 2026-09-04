@@ -14,6 +14,7 @@ use std::path::Path;
 
 use crate::atlas::{Atlas, FLAG_BITMAP, FLAG_MISSING};
 use crate::glyph_scene::{seg_tint, GlyphInstance, GroupRow, PickContext, SegCull};
+use crate::layout::{GlyphArena, ItemPlacement};
 
 /// World-space height of one em cell (ascender→descender). Everything scales
 /// from this; only the ratio to the font units matters.
@@ -315,7 +316,7 @@ fn word_color(word: &str) -> [u8; 3] {
 // against an independent implementation bit-for-bit.
 
 use crate::atlas::TrieTable;
-use crate::engine::GlyphRecord;
+use crate::layout::GlyphRecord;
 
 /// Resolve a codepoint to a glyph in WORLD units — the fold's only view of
 /// a trie. The units live in `WorldEntry`, which is the whole point of the
@@ -594,46 +595,24 @@ pub fn diff_records(records: &[GlyphRecord], expected: &[RefGlyph]) -> Result<()
     }
 }
 
-/// Stage engine records as a renderable scene: one instance per record with a
-/// non-blank glyph (slot 0 — missing/blank codepoints — carries no ink; the
-/// layout advance it occupied is already baked into the survivors' X). Bitmap
-/// (emoji) slots are kept: the shader discards them (no emoji atlas), and
-/// keeping them proves the slot ids reach the glyphmap unchanged.
-pub fn stage_records(records: &[GlyphRecord]) -> StagedText {
-    let mut instances = Vec::with_capacity(records.len());
-    let mut blanks = 0usize;
-    for r in records {
-        if r.glyph_id() == 0 {
-            blanks += 1;
-            continue;
-        }
-        instances.push(GlyphInstance {
-            pos: [r.x(), r.y(), r.z()],
-            glyph_id: r.glyph_id(),
-            row: r.row(),
-            col: r.col(),
-            color: pack_rgba8(palette::DEFAULT, 255),
-            group_id: 0,
-            advance: r.advance(),
-            height: r.height(),
-            flags: 0, // the wire record carries no flags; the shader reads mode from the glyphmap
-            _pad: 0,
-        });
-    }
-
-    // Camera-fit bounds from the instance quads themselves.
-    let mut min = [f32::INFINITY; 2];
-    let mut max = [f32::NEG_INFINITY; 2];
-    for g in &instances {
-        min[0] = min[0].min(g.pos[0]);
-        min[1] = min[1].min(g.pos[1] - g.height * 0.5);
-        max[0] = max[0].max(g.pos[0] + g.advance);
-        max[1] = max[1].max(g.pos[1] + g.height * 0.5);
-    }
-    if instances.is_empty() {
-        min = [0.0, 0.0];
-        max = [1.0, 1.0];
-    }
+/// Present one item's staged arena as a renderable scene.
+///
+/// Since Stage 0 the compaction and the extents happen behind the layout seam,
+/// so this does no arithmetic at all: it names which extent the camera frames
+/// and packages the scene. The INK extent is the right one — the quads of the
+/// glyphs that survived, not the page rectangle they were laid out on — and
+/// choosing between them is exactly the kind of policy the seam declines to
+/// have on the caller's behalf.
+///
+/// An item with no ink has no meaningful frame; a unit square is this caller's
+/// answer, unchanged from when the loop lived here.
+pub fn stage_records(arena: GlyphArena, placement: &ItemPlacement) -> StagedText {
+    let (min, max) = if arena.is_empty() {
+        ([0.0, 0.0], [1.0, 1.0])
+    } else {
+        (placement.ink.min, placement.ink.max)
+    };
+    let instances = arena.into_instances();
 
     StagedText {
         glyphs_emitted: instances.len(),
@@ -642,8 +621,8 @@ pub fn stage_records(records: &[GlyphRecord]) -> StagedText {
         instances,
         bounds_min: min,
         bounds_max: max,
-        codepoints_decoded: records.len(),
-        missing_or_bitmap: blanks,
+        codepoints_decoded: placement.record_count as usize,
+        missing_or_bitmap: (placement.record_count - placement.slot_count) as usize,
         focus_bounds: None,
         pick: None,
     }

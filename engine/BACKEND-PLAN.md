@@ -15,8 +15,8 @@ approximately:
 | implementation | where | role today |
 |---|---|---|
 | JS | `viz-web/glyph3d-js` | frozen oracle. Not executed by the engine gates. |
-| Mojo | `engine/*.mojo` | **the runtime.** `engine/ffi.mojo` → `run_pipeline`, CPU, parallel across cores. |
-| Rust | `native/src/{fold,scan,bake,glyph_trie}.rs` | gate-only. **Zero production callers.** |
+| Mojo | `engine/*.mojo` | **the runtime**, reached through `native/src/layout_mojo.rs` since stage 0. `engine/ffi.mojo` → `run_pipeline`, CPU, parallel across cores. |
+| Rust | `native/src/{fold,scan,bake,glyph_trie}.rs` | gate-only. **Zero production callers** — stage 1 gives it the seam. |
 
 Verified 2026-09-04: `grep crate::fold|crate::scan|crate::bake|crate::glyph_trie`
 across `native/src` returns only `fixture.rs` (the gate) and the modules' own
@@ -123,8 +123,8 @@ avoidable mistake here.
 
 | stage | work | acceptance | risk |
 |---|---|---|---|
-| **0** | define the seam: instances + metadata, not `Vec<GlyphRecord>` | today's Mojo-CPU path satisfies it; the four byte-equal screenshots unchanged | low, but it is the hinge |
-| **1** | Rust port behind the seam (slots → instance format) | `--repo-verify` diffs Rust vs Mojo over a real repo, bit-exact | low; the port is already proven |
+| **0** | define the seam: instances + metadata, not `Vec<GlyphRecord>` | today's Mojo-CPU path satisfies it; the four byte-equal screenshots unchanged | **DONE 2026-09-04** |
+| **1** | Rust port behind the seam (slots → instance format) | `--repo-verify` diffs Rust vs Mojo over a real repo, bit-exact | low; the port is already proven, and the seam now carries the gate |
 | **2** | cfg-gate + lib/bin split + wasm target | `cargo check --target wasm32-unknown-unknown --no-default-features` in check-all | medium; audit blockers 2-5 |
 | **3** | device-resident GPU path: compaction + bounds on device, metadata-only return | GPU output bit-equal to CPU; readback no longer in the timed region | high, and the payoff |
 | **4** | honest GPU measurement | same harness, same arena, multi-ITEM, CPU vs GPU | none, but it decides stage 3's worth |
@@ -137,6 +137,84 @@ instances.
 
 **Stage 4 could go first.** It is independent and cheap, and it decides whether
 stage 3 is worth doing at all — see the open question below.
+
+## Stage 0 — DONE, 2026-09-04
+
+`native/src/layout.rs` (the contract) + `native/src/layout_mojo.rs` (the Mojo
+backend). `ItemParams` and `GlyphRecord` moved out of `engine.rs` onto the seam
+— they are the contract all three backends share, and none of them is the FFI.
+
+What crosses it: `LayoutItem` (bytes + params + `Paint` + group) in, a
+caller-owned `&mut GlyphArena` as the destination, `ItemPlacement` (slot range,
+three counts, `PageExtent`, `InkExtent`) out. **No method on `LayoutGlyphs`
+returns a position.** The `Vec<GlyphRecord>` readback survives only behind
+`VerifyLayout`, a separate trait, so it is unreachable from the render path
+rather than merely discouraged.
+
+Four decisions worth keeping:
+
+- **The destination is passed in.** Every call site holds an arena instead of
+  receiving a `Vec`, so stage 3 changes the arena's interior and nothing else.
+- **Validation is a PROVIDED trait method.** Backends implement
+  `layout_validated_items`; they cannot forget `ItemParams::validate` because
+  they never call it. Three implementations of one fold is three chances to
+  omit a guard, and this removes all three.
+- **Compaction is written once** (`compact_records_into`) and shared by every
+  host backend, so two backends can differ about the FOLD — the thing the
+  corpus gates — and cannot differ about blanks, paint or extents.
+- **The batch/per-item split moved below the seam.** It was never a property of
+  loading a repository; it is one backend's answer to "how many times do I
+  cross into Mojo?", and the Rust backend will have no equivalent question.
+
+`--repo-verify` GOT STRONGER, which is the part stage 1 depends on. It compared
+RECORDS only, which cannot see a difference in compaction, in paint indexing,
+or in either extent — every one of which now lives behind the seam and every one
+of which a new backend has to get right. `layout::diff_backends` now compares
+placements, instances AND records, bit-exact, and names where they first differ:
+
+```
+repo-verify PASS: 4 items, 10857 instances, 11168 records bit-exact
+                  between mojo-cpu/per-item and mojo-cpu/batched
+```
+
+**Acceptance.** All nine gates green (21 PASS lines); the four screenshots
+byte-equal; 72 cargo tests (was 60). `--engine-render` is NOT one of the four
+screenshots, so it was A/B'd separately against a stashed pre-change build on
+`fixtures/baseline-view.txt` — byte-equal. (The first attempt at that A/B used
+`src/text.rs` as input, a file the change itself had edited, and reported a
+divergence that was entirely the different input. A red proves nothing until you
+know it failed for the right reason.)
+
+**Proof the greens can go red** — nine mutations, nine reds, each edit asserted
+to have landed before the check ran:
+
+| # | mutation | result |
+|---|---|---|
+| M1 | paint indexed by INSTANCE instead of record | unit RED + repo-wide/repo-zoom diverge |
+| M2 | the paint-length assert removed | unit RED |
+| M3 | `bit_eq` degraded to `PartialEq` | unit RED |
+| M4 | `diff_backends` stops comparing instances | unit RED |
+| M5 | `diff_backends` stops comparing records | unit RED |
+| M6 | page extent seeded empty, not at the origin | unit RED, **screenshots still byte-equal** |
+| M7 | ink extent measures blanks too | unit RED |
+| M8 | the seam's provided validation removed | unit RED |
+| M9 | the two Mojo strategies desynchronised | unit RED + `--repo-verify` RED |
+
+**M6 IS A MEASURED CEILING, NOT A PASS.** The page extent's origin seed only
+binds for an item with ZERO records, and `fixtures/g-pick-repo` contains no
+empty file — so the four-view A/B cannot see that seed at all, and the unit test
+is its only cover. It is not academic: an empty `.rs` in a real repo IS walked,
+laid out and staged (verified 2026-09-04 on a two-file scratch repo), and
+without the seed its page would be an inverted rectangle fed to the shelf
+packer. Closing this would mean adding an empty file to the pick fixture, which
+re-baselines three screenshots — a conscious act, not a stage-0 one.
+
+**What stage 1 now is.** Implement `LayoutGlyphs` over `fold`/`scan`/`bake`,
+emitting the same 32 B `GlyphRecord`s and calling the SAME
+`compact_records_into`. Then point `--repo-verify` at it instead of the second
+Mojo strategy. That is a constructor swap plus the record producer; the differ,
+the validation, the compaction and the extents are already written and already
+proven able to fail.
 
 ## Open questions that want measurement, not argument
 

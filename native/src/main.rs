@@ -33,6 +33,8 @@ mod engine;
 mod fixture;
 mod fold;
 mod glyph_trie;
+mod layout;
+mod layout_mojo;
 mod gpu;
 mod glyph_scene;
 mod offscreen;
@@ -47,6 +49,9 @@ use std::path::{Path, PathBuf};
 use clap::{ArgAction, CommandFactory, FromArgMatches, Parser};
 use glyph_scene::{CameraMode, GlyphScene, PickCommand, Verb};
 use gpu::GpuContext;
+// The seam is used by trait, not by concrete backend: swapping `MojoLayout`
+// for the Rust one at stage 1 changes the constructor and nothing else here.
+use layout::{LayoutGlyphs, VerifyLayout};
 use scene::{Scene, SceneLike};
 
 pub const OFFSCREEN_WIDTH: u32 = 1600;
@@ -84,23 +89,59 @@ pub fn default_engine_trie() -> PathBuf {
 
 /// The engine layout params the renderer/cross-check use: unit cell height
 /// (text::CELL_HEIGHT_WORLD) and the production line pitch. No wrap, no pages.
-pub fn engine_item_params() -> engine::ItemParams {
-    engine::ItemParams {
+pub fn engine_item_params() -> layout::ItemParams {
+    layout::ItemParams {
         line_height: (text::CELL_HEIGHT_WORLD * text::LINE_HEIGHT_FACTOR) as f64,
         ..Default::default()
     }
 }
 
-/// Run the Mojo engine over one file and return its records.
-fn engine_layout(file: &Path, trie: &Path) -> Vec<engine::GlyphRecord> {
+/// The one item `--engine-render` and `--engine-check` each lay out: the whole
+/// file, production line pitch, flat default paint, group 0.
+fn engine_item(bytes: &[u8]) -> layout::LayoutItem<'_> {
+    layout::LayoutItem {
+        bytes,
+        params: engine_item_params(),
+        group_id: 0,
+        paint: layout::Paint::Flat(layout::DEFAULT_COLOR_PACKED),
+    }
+}
+
+fn engine_backend(trie: &Path) -> layout_mojo::MojoLayout {
+    let mut backend = layout_mojo::MojoLayout::new(layout_mojo::Strategy::Batched);
+    backend
+        .load_trie_file(trie)
+        .expect("failed to load engine trie");
+    backend
+}
+
+/// Lay one file out through the seam FOR RENDERING: instances in an arena plus
+/// its placement. No records, no readback — this is the path a frame takes.
+fn engine_layout(file: &Path, trie: &Path) -> (layout::GlyphArena, layout::ItemPlacement) {
     let bytes = std::fs::read(file).expect("failed to read engine input file");
-    let mut eng = engine::Engine::new();
-    eng.load_trie_file(trie).expect("failed to load engine trie");
-    let n = eng
-        .load_item(&bytes, &engine_item_params())
-        .expect("engine load_item failed");
-    let records = eng.records();
-    assert_eq!(records.len() as u64, n, "record copy count mismatch");
+    let mut backend = engine_backend(trie);
+    let mut arena = layout::GlyphArena::new();
+    let placements = backend
+        .layout_items(&[engine_item(&bytes)], &mut arena)
+        .expect("engine layout failed");
+    (arena, placements[0])
+}
+
+/// Lay one file out through the seam FOR VERIFICATION: the wire records, which
+/// `--engine-check` diffs lane by lane against the independent CPU reference.
+/// This is the 36 B-per-source-byte readback the render path above does not
+/// pay, asked for explicitly through `VerifyLayout` — see `layout.rs`.
+fn engine_layout_records(file: &Path, trie: &Path) -> Vec<layout::GlyphRecord> {
+    let bytes = std::fs::read(file).expect("failed to read engine input file");
+    let mut backend = engine_backend(trie);
+    let mut arena = layout::GlyphArena::new();
+    let (placements, records) = backend
+        .layout_items_recording(&[engine_item(&bytes)], &mut arena)
+        .expect("engine layout failed");
+    assert_eq!(
+        records.len() as u32, placements[0].record_count,
+        "record copy count mismatch"
+    );
     records
 }
 
@@ -163,14 +204,14 @@ fn build_scene_impl(
         }
         SceneChoice::EngineText { file, trie } => {
             let atlas = atlas::Atlas::load(ctx);
-            let records = engine_layout(file, trie);
+            let (arena, placement) = engine_layout(file, trie);
             log::info!(
                 "engine-staged {}: {} records ({} blank/missing slots dropped)",
                 file.display(),
-                records.len(),
-                records.iter().filter(|r| r.glyph_id() == 0).count(),
+                placement.record_count,
+                placement.record_count - placement.slot_count,
             );
-            let staged = text::stage_records(&records);
+            let staged = text::stage_records(arena, &placement);
             glyph(GlyphScene::new(ctx, color_format, &atlas, staged, camera_mode, cull))
         }
         SceneChoice::Repo {
@@ -514,7 +555,7 @@ fn run_engine_smoke(file: &Path, trie: Option<&Path>, loops: u32) {
     let mut eng = engine::Engine::new();
     eng.load_trie_file(trie).expect("failed to load engine trie");
 
-    let params = engine::ItemParams::default();
+    let params = layout::ItemParams::default();
     let mut last_count = 0u64;
     let t0 = std::time::Instant::now();
     for _ in 0..loops {
@@ -560,10 +601,10 @@ fn run_engine_check(file: &Path, trie_path: Option<&Path>) -> ! {
     let trie_path = trie_path.unwrap_or(&default_trie);
     let bytes = std::fs::read(file).expect("failed to read --engine-check file");
 
-    let records = engine_layout(file, trie_path);
+    let records = engine_layout_records(file, trie_path);
 
     // The independent side: CPU layout straight from the atlas export,
-    // no engine involvement. Same params as engine_layout.
+    // no engine involvement. Same params as engine_item.
     let trie = atlas::TrieTable::load(&atlas_dir());
     let p = engine_item_params();
     let expected = text::reference_layout(
