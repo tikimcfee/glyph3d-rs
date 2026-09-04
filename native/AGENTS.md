@@ -63,7 +63,10 @@ across tunings is monoid associativity checked in situ. Stage 4 added a sixth:
 the ported bake (`native/src/bake.rs`) replayed against the 8 `.bake.bin`
 fixtures — the streaming record AND the seed protocol (checkpoint-seeded
 `prefix_at`, `lanes_from_prefix`, `rows_under_wrap`), 265 queries bit-exact.
-That completes the reference port; no JS runs in any gate.
+That completes the reference port. No JS runs in gate 9 — but node is NOT gone
+from the repo: gate 1 still runs `tools/export-atlas.mjs`, which needs harfbuzz.
+An earlier commit message overclaimed "no JS runs in any gate"; it was true of
+the gate that had been checked and false of the suite.
 
 ## The determinism chain (why the gates can be this strict)
 

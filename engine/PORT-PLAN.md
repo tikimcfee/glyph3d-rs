@@ -254,7 +254,8 @@ All five stages land. `--fixture-parity` is one command covering six halves:
 parse parity (Rust vs Mojo, 14 fixtures), the trie rebuilt from bytes (11,520
 entries), the serial fold (1,807,512 lanes), the scan form (112 cases across 8
 tunings), the bake (265 queries), and the original `reference_layout` corpus
-diff. No JS runs in any of it. Six mutations were run
+diff. No JS runs in any of THOSE SIX — though `tools/export-atlas.mjs` still
+runs node in gate 1, so the repo is not JS-free. Six mutations were run
 against gate 9 — swapped item fields, swapped carrier split, a reordered
 section of identical size, a dropped trailing section, the f32 `line_adv`, and
 every fixture forced out of domain — and all six reddened.
