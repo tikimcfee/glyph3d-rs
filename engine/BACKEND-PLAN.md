@@ -71,6 +71,56 @@ shaping crates are already compiled in.
 the wasm blockers, and put `cargo check --target wasm32-unknown-unknown` in
 check-all.
 
+## Bounds: the work in flight, in order
+
+Branch `bounds`, off `cc814b3`. WrapBack made this urgent rather than tidy: a
+file's extent is now mostly DEPTH by design, and nothing that reasons about
+where things are knows about z.
+
+The surface is four places (measured 2026-09-04):
+
+| where | today |
+|---|---|
+| `layout.rs:330` `PageExtent` | `right`, `bottom` — no depth |
+| `layout.rs:345` `InkExtent` | `[f32; 2]` x 2 |
+| `glyph_scene.rs:255` `SegCull` | `[f32; 2]` x 2 |
+| `glyph_scene.rs:408,427` | frustum tested at `z = +/-1`; LOD clamps `eye.z` to `+/-1` |
+
+Plus `B_MIN_Z`/`B_MAX_Z`, computed per item by the engine and corpus-gated, with
+no FFI accessor — so the fix has a SOURCE and does not need a new reduction.
+
+**1. Make the cull falsifiable first.** Unit-test `cull_segments` with segments
+at real depth: a segment at z = -50 that the frustum should keep, and one it
+should reject. On today's code these must FAIL — prove that before changing
+anything. A screenshot will not do this job: the offscreen camera fits the whole
+field, so the +/-1 slab may never change what is drawn from that angle, and a
+byte-equal green would mean nothing. This is the empty-file lesson: build the
+thing that can see the defect before fixing the defect.
+
+**2. Widen `PageExtent` and `InkExtent` to carry depth.** One more lane in the
+reduction `compact_records_into` already runs. Output-neutral — nothing reads it
+yet — and gate 8b covers it for free the moment it lands, because `ItemPlacement`
+is what `--repo-verify` diffs across the two FFI paths.
+
+**3. Widen `SegCull`; remove the slab from the frustum and the LOD.** Step 1's
+test goes green. The four screenshots MUST stay byte-equal: if one moves, the
+old cull was dropping or keeping something it should not have, and that is a
+finding to understand before accepting a re-baseline.
+
+**4. Then the FFI accessor, last and only after a comparison.** Expose the
+engine's per-item box and replace the host reduction with it. DO NOT assume they
+agree: the host reduction is seeded at the origin and runs over every record
+including blanks (`layout.rs`, `compact_records_into`); whether the engine's
+`bounds_range` matches that seeding is UNVERIFIED. Compare first, in both
+directions, and treat a disagreement as the interesting result rather than a
+merge conflict to settle.
+
+Two follow-ons named by Ivan, deliberately NOT folded in: the fold pitch
+(`RepoParams::z_wrap_spacing`) has no CLI flag and making it configurable is its
+own small change; runtime wrap-mode toggling is a command-bus question, not a
+layout one, since mode is baked into `ItemParams` at load and toggling means
+re-running the fold (cheap now — 0.04 s for 407k records, measured).
+
 ## Open, and worth deciding before the work that depends on it
 
 - **Does the row/column bookkeeping need to exist?** It is not a layout idea —
