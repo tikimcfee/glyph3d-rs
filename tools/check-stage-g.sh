@@ -31,9 +31,10 @@ OUT=$($BIN --load-repo $FIX --screenshot out/g-check-fixture.png \
   --pick-file alpha.rs --pick-row 0 --pick-col 0 \
   --pick-file alpha.rs --pick-row 0 --pick-col 3 \
   --pick-file alpha.rs --pick-row 4 --pick-col 4 \
-  --pick-file wide.txt --pick-row 1 --pick-col 100 \
-  --pick-file wide.txt --pick-row 2 --pick-col 205 \
+  --pick-file wide.txt --pick-row 1 --pick-col 50 \
   --pick-file wide.txt --pick-row 3 --pick-col 0 \
+  --pick-file wide.txt --pick-row 600 --pick-col 32900 \
+  --pick-file wide.txt --pick-row 2000 --pick-col 52800 \
   --pick-file deep.py  --pick-row 0 --pick-col 5 \
   --pick-file deep.py  --pick-row 2 --pick-col 8 \
   --pick-file long.md  --pick-row 200 --pick-col 5 \
@@ -63,9 +64,16 @@ check() { # file_substr row col
 check alpha.rs 0 0
 check alpha.rs 0 3
 check alpha.rs 4 4
-check wide.txt 1 100
-check wide.txt 2 205
+# wide.txt is the WRAP-DEPTH fixture: one file whose lines escalate from 80
+# chars to 250 000, so a single load spans wrap segment 0 through 2500. `col`
+# is the column within the LOGICAL line, not the screen column, so a deep row
+# needs a large col — row 2000 is col 52800 of line 8, at z = -79.20.
+# The shallow pair still matters (it is the case where z stays 0); the deep
+# pairs are the ones the old 257-byte fixture could not express at all.
+check wide.txt 1 50
 check wide.txt 3 0
+check wide.txt 600 32900
+check wide.txt 2000 52800
 check sub/deep.py 0 5
 check sub/deep.py 2 8
 check long.md 200 5
