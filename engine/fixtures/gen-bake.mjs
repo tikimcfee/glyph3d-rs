@@ -110,7 +110,11 @@ for (const c of CASES) {
     for (const b of qBytes) {
         for (const wrap of qWraps) {
             const P = prefixAt(c.bytes, trie, r, b);
-            const lanes = lanesFromPrefix(P, wrap);
+            // Whether the QUERIED byte is itself a newline decides which row rule
+            // applies to it; the prefix cannot know, it describes everything BEFORE
+            // the byte. 0x0A is single-byte, so the leader test is the byte test.
+            // Mirrors native/src/bake.rs's `terminator`.
+            const lanes = lanesFromPrefix(P, wrap, c.bytes[b] === 0x0A);
             prefixQueries.push({ byteIndex: b, wrap, prefix: elem7(P), lanes });
         }
     }

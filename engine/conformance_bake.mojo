@@ -10,7 +10,7 @@
 
 from std.sys import argv
 from std.memory import bitcast
-from glyph_pipeline import Trie
+from glyph_pipeline import Trie, NEWLINE, sequence_length, decode_codepoint_at
 from glyph_bake import (
     ScanElem,
     BakeRecord,
@@ -202,7 +202,12 @@ def check_case(path: String) raises -> Int:
                 "prefix@" + String(byte_index) + "[" + String(i) + "]",
                 got_p[i], e, bad, printed,
             )
-        var lanes = lanes_from_prefix(p, wrap)
+        # Whether the QUERIED byte is itself a newline decides which row rule
+        # applies to it (wrap_row_of); the prefix describes everything BEFORE
+        # the byte and cannot know.
+        var q_seq = sequence_length(bytes, byte_index)
+        var terminator = q_seq > 0 and decode_codepoint_at(bytes, byte_index, q_seq) == NEWLINE
+        var lanes = lanes_from_prefix(p, wrap, terminator)
         check_int("row@" + String(byte_index) + "w" + String(wrap), lanes.row, Int(r.u32()), bad, printed)
         check_int("col@" + String(byte_index), lanes.col, Int(r.u32()), bad, printed)
         check_int("ord@" + String(byte_index), lanes.ord, Int(r.u32()), bad, printed)

@@ -57,7 +57,7 @@
 import {
     SLOT_STRIDE, S_ADVANCE, S_ROW, S_COL, S_FLAGS, S_LINE_ADV, S_ORD,
     F_LEADER, F_NEWLINE, F_RENDERED,
-    allocSlots, decodeAndResolve, itemForByte, rowsForLine, resolveX, paginate, assertLineHeight,
+    allocSlots, decodeAndResolve, itemForByte, rowsForLine, wrapRowOf, resolveX, paginate, assertLineHeight,
     boundsReduce, deriveStride, normalizeItems, fbits, fval,
 } from './glyphPipelineReference.js';
 
@@ -139,10 +139,10 @@ export function scanCombine(a, b) {
 }
 
 /** A leader's exact lanes from its exclusive prefix — the O(1) query. */
-export function lanesFromPrefix(P, wrap) {
+export function lanesFromPrefix(P, wrap, terminator = false) {
     const col = P.tailLen;
     const closed = P.nl > 0 ? rowsForLine(P.headLen, wrap) + P.rows : 0;
-    const wrapRow = wrap > 0 ? Math.floor(col / wrap) : 0;
+    const wrapRow = wrapRowOf(col, wrap, terminator);
     return { row: closed + wrapRow, col, lineAdv: P.tailAdv, ord: P.glyphs };
 }
 

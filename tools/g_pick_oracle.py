@@ -4,9 +4,33 @@ FOLD) over raw file bytes and answer (file, row, col) -> (char, byte_off,
 line). Used to assert the native binary's pick output independently.
 
 fold conventions: col = raw leader count within the source line;
-row = base_row + col // wrap; newline rides at col == line length.
+row = base_row + wrap_row_of(col, wrap, is_newline); a newline rides at
+col == line length but on the row it CLOSES, and a line covers
+rows_for_line(len, wrap) = ceil(len / wrap) rows, floored at one.
+
+This is an INDEPENDENT oracle — it must state the rule itself rather than
+call into the engine, which is the whole reason gate 7 is worth running. It
+is not, however, licensed to state a DIFFERENT rule: the 2026-09-04
+phantom-row correction is transcribed here deliberately.
 """
 import sys
+
+
+def rows_for_line(length: int, wrap: int) -> int:
+    """Visual rows a line of `length` cells occupies — ceiling, floored at one."""
+    if wrap <= 0 or length <= 0:
+        return 1
+    return (length - 1) // wrap + 1
+
+
+def wrap_row_of(col: int, wrap: int, terminator: bool) -> int:
+    """Line-local row of a cell. A newline is a terminator at one-past-the-last
+    cell, so at an exact wrap multiple it stays on the row it closes."""
+    if wrap <= 0:
+        return 0
+    if terminator:
+        return rows_for_line(col, wrap) - 1
+    return col // wrap
 
 
 def fold_leaders(data: bytes, wrap: int):
@@ -37,10 +61,11 @@ def fold_leaders(data: bytes, wrap: int):
             cp = ((b0 & 0x0F) << 12) | ((at(1) & 0x3F) << 6) | (at(2) & 0x3F)
         else:
             cp = ((b0 & 0x07) << 18) | ((at(1) & 0x3F) << 12) | ((at(2) & 0x3F) << 6) | (at(3) & 0x3F)
-        row = base_row + (col // wrap if wrap > 0 else 0)
+        is_newline = cp == 0x0A
+        row = base_row + wrap_row_of(col, wrap, is_newline)
         out.append((row, col, line, i, cp))
-        if cp == 0x0A:
-            base_row += (col // wrap if wrap > 0 else 0) + 1
+        if is_newline:
+            base_row += rows_for_line(col, wrap)
             col = 0
             line += 1
         else:

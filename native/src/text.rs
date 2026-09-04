@@ -492,8 +492,9 @@ pub type FoldTables = (Vec<(usize, u32)>, Vec<u32>, Vec<u32>, Vec<u32>);
 /// Stage G — decode the UTF-8 leaders of `bytes` and fold them with the
 /// engine's exact conventions (glyph_pipeline.mojo, THE FOLD): COL is the raw
 /// leader count within the source line (NOT col % wrap), ROW is
-/// `base_row + col // wrap`, and the newline rides at column == line length
-/// (`rows_for_line(len, wrap) = len // wrap + 1`). Returns one entry per
+/// `base_row + wrap_row_of(col, wrap, is_newline)`, and the newline rides at
+/// column == line length but on the row it CLOSES, so a line covers
+/// `rows_for_line(len, wrap) = ceil(len / wrap)` rows. Returns one entry per
 /// engine record, in record order: (byte offset, codepoint), folded ROW,
 /// folded COL, source line. Picking uses this to resolve a record to the
 /// actual character in the file bytes, and cross-checks ROW/COL against the
@@ -539,14 +540,18 @@ pub fn fold_leaders(bytes: &[u8], wrap: i32) -> FoldTables {
                     | (byte_at(id + 3) & 0x3F)
             }
         };
-        let wrap_row = col.checked_div(w).unwrap_or(0);
+        // Rows come from the ONE rule (`fold::wrap_row_of` / `rows_for_line`),
+        // not from a second spelling of it here: this table is cross-checked
+        // against the engine's own ROW lane bit-for-bit, so a copy of the
+        // formula that drifted would make the pick oracle agree with nothing.
+        let is_newline = cp == 0x0A;
+        let wrap_row = crate::fold::wrap_row_of(col as i64, w as i64, is_newline) as u32;
         leaders.push((id, cp));
         rows.push(base_row + wrap_row);
         cols.push(col);
         lines.push(line);
-        if cp == 0x0A {
-            // Same col/w as wrap_row above (col is unchanged in this branch).
-            base_row += wrap_row + 1;
+        if is_newline {
+            base_row += crate::fold::rows_for_line(col as i64, w as i64) as u32;
             col = 0;
             line += 1;
         } else {
@@ -733,4 +738,66 @@ pub fn colorize_leaders(bytes: &[u8]) -> Vec<u32> {
         id += 1;
     }
     colors
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::fold::{run_pipeline, Item, F_LEADER};
+    use crate::glyph_trie::{build_glyph_trie, BuiltTrie, GlyphMetrics};
+
+    fn trie() -> BuiltTrie {
+        build_glyph_trie(
+            (0x20u32..0x7Fu32).chain(std::iter::once(0x0A)),
+            |cp| Some(GlyphMetrics { glyph_id: cp + 1, advance: 0.5, height: 1.0 }),
+            0.61,
+            1.25,
+        )
+    }
+
+    /// `fold_leaders` is the PICK path's row/col table and it is cross-checked
+    /// against the engine's own ROW lane bit-for-bit, so it has to fold by the
+    /// same rule the fold does. It used to spell the rule out a second time
+    /// (`base_row += wrap_row + 1`) and carried the phantom row with it; a pick
+    /// oracle that disagreed with the fold would mis-resolve every click below
+    /// an exact-multiple line.
+    ///
+    /// This checks it against `fold::run_pipeline` on input built to hit the
+    /// defect: eight-cell lines at wrap 4, mixed with lines that are not
+    /// multiples so the sweep is not one-sided.
+    #[test]
+    fn fold_leaders_agrees_with_the_fold_on_every_row_and_column() {
+        let t = trie();
+        let bytes: Vec<u8> = b"abcdefgh\nxyz\nABCDEFGHIJKL\n\nqq\nmnopqrst\n".to_vec();
+        for wrap in [4i32, 3, 8, 1, 0] {
+            let item = Item {
+                byte_start: 0,
+                byte_count: bytes.len() as i64,
+                wrap_width: wrap.max(0) as i64,
+                line_height: 1.0,
+                ..Item::default()
+            };
+            let folded = run_pipeline(&bytes, &t, &[item]);
+            let (leaders, rows, cols, _lines) = fold_leaders(&bytes, wrap);
+            assert_eq!(leaders.len(), bytes.len(), "every byte here is a leader");
+            for (index, &(id, _cp)) in leaders.iter().enumerate() {
+                assert_ne!(folded.slots.flags(id) & F_LEADER, 0);
+                assert_eq!(
+                    rows[index] as i64,
+                    folded.slots.row(id),
+                    "byte {id} ROW at wrap {wrap}"
+                );
+                assert_eq!(
+                    cols[index] as i64,
+                    folded.slots.col(id),
+                    "byte {id} COL at wrap {wrap}"
+                );
+            }
+        }
+        // ANTI-VACUITY: at wrap 4 the input must really contain exact-multiple
+        // lines, or this agrees about nothing that used to be wrong.
+        let (_l, rows, _c, _lines) = fold_leaders(&bytes, 4);
+        assert_eq!(rows[8], 1, "the 8-cell line's newline rides its second row");
+        assert_eq!(rows[9], 2, "and the next line starts immediately below");
+    }
 }

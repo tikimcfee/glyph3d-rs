@@ -36,6 +36,7 @@ from glyph_pipeline import (
     decode_codepoint_at,
     sequence_length,
     item_for_byte,
+    wrap_row_of,
     paginate,
     page_active,
     derive_stride,
@@ -214,7 +215,7 @@ def _apply_shard[
             var it_start = items[idx].byte_start
             var in_item = id >= it_start and id < it_start + items[idx].byte_count
             if (flags & F_LEADER) != 0 and in_item:
-                var v = lanes_from_prefix(run, wraps[idx])
+                var v = lanes_from_prefix(run, wraps[idx], (flags & F_NEWLINE) != 0)
                 slots.set_rowcol(id, v.row, v.col)
                 slots.set_flags(id, flags | F_RENDERED)
                 # LINE_ADV/ORD are pure projections of the monoid prefix; the
@@ -319,7 +320,7 @@ def _resolve_x_shard[
             # priced them at ~11.8 B per paged-item byte). paginate reads only
             # BASE_X/ROW/COL, all still written. Observable output is unchanged,
             # which the paged fixtures pin.
-            var wrap_row = (col // wrap) if wrap > 0 else 0
+            var wrap_row = wrap_row_of(col, wrap, (slots.flags(id) & F_NEWLINE) != 0)
             slots.set_x(id, Float32(x + item.origin_x))
             slots.set_y(id, Float32(-Float64(row) * lh + item.origin_y))
             slots.set_z(id, Float32(-Float64(wrap_row) * item.z_step + item.origin_z))

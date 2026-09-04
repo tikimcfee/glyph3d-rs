@@ -357,15 +357,34 @@ export function itemForByte(items, id) {
 }
 
 /**
- * Visual rows a line occupies under `wrap`. `len` counts the line's non-newline glyphs;
- * the newline itself rides at column `len`, so a line whose length is an exact multiple
- * of the wrap width ends with a row holding only the (invisible) newline. Taking that
- * literally rather than special-casing it keeps the fold free of edge cases: EVERY
- * glyph, newline included, sits at `floor(col / wrap)` of its line.
+ * Visual rows a line of `len` cells occupies under `wrap` — a CEILING with a floor of
+ * one, since an empty line still occupies the row it sits on.
+ *
+ * CORRECTED 2026-09-04. This was `floor(len / wrap) + 1`, and the comment here argued
+ * that letting the newline ride at `floor(col / wrap)` like any other glyph "keeps the
+ * fold free of edge cases". It does — and it costs a row. The newline sits at column
+ * `len`, so when `wrap` divides `len` that column rolls onto a fresh row holding
+ * nothing else: the line claimed a blank row and every later line moved down one. The
+ * two rules agree at every other length, which is why it stayed invisible.
+ *
+ * The edge case was real; refusing to name it did not remove it, it moved it into the
+ * output. `wrapRowOf` names it. Note that `glyphBake.rowsUnderWrap` had already written
+ * this ceiling out longhand for its open tail, because the shared helper over-counted
+ * there — the same defect, found and worked around locally instead of fixed.
  */
 export function rowsForLine(len, wrap) {
-    if (!(wrap > 0)) return 1;
-    return Math.floor(len / wrap) + 1;
+    if (!(wrap > 0) || len <= 0) return 1;
+    return Math.floor((len - 1) / wrap) + 1;
+}
+
+/**
+ * The LINE-LOCAL row of a cell at column `col`. An ordinary glyph sits at
+ * `floor(col / wrap)`; a NEWLINE is a terminator riding one past the last cell, so at
+ * an exact multiple it belongs on the last row its line reaches, not the next one.
+ */
+export function wrapRowOf(col, wrap, terminator) {
+    if (!(wrap > 0)) return 0;
+    return terminator ? rowsForLine(col, wrap) - 1 : Math.floor(col / wrap);
 }
 
 /**
@@ -402,7 +421,7 @@ export function layoutItem(slots, itemStart, byteCount, params = {}, ordToByte =
         const o = id * SLOT_STRIDE;
         const flags = slots[o + S_FLAGS];
         if ((flags & F_LEADER) === 0) continue;
-        const wrapRow = wrap > 0 ? Math.floor(col / wrap) : 0;
+        const wrapRow = wrapRowOf(col, wrap, (flags & F_NEWLINE) !== 0);
         const row = baseRow + wrapRow;
         const x = fold > 0 ? segAdv : lineAdv;
         slots[o + S_ROW] = row;
@@ -497,7 +516,9 @@ export function resolveX(slots, id, p, ordToByte, scalars) {
     }
 
     const row = slots[o + S_ROW];
-    const wrapRow = wrap > 0 ? Math.floor(col / wrap) : 0;
+    // Paginate recomputes Z from COL, so it needs the terminator rule too, or a
+    // newline's depth lands one wrap step behind its own row's.
+    const wrapRow = wrapRowOf(col, wrap, (slots[o + S_FLAGS] & F_NEWLINE) !== 0);
     slots[o + S_BASE_X] = fbits(x + (p.origin?.x || 0));
     slots[o + S_X] = fbits(x + (p.origin?.x || 0));
     // Same rule as layoutItem: the ITEM's line height, never the glyph's own.

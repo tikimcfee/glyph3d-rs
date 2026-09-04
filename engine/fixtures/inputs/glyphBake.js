@@ -245,6 +245,8 @@ export function rowsUnderWrap(record, wrap) {
     let rows = 0;
     for (const [len, count] of record.lineHist) rows += rowsForLine(len, wrap) * count;
     const tail = record.total.tailLen;
-    if (tail > 0) rows += (wrap > 0 ? Math.floor((tail - 1) / wrap) : 0) + 1;
+    // Was written out longhand here because the shared helper over-counted by one;
+    // rowsForLine IS this ceiling now, so the special case collapses into it.
+    if (tail > 0) rows += rowsForLine(tail, wrap);
     return rows;
 }

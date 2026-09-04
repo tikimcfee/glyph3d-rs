@@ -39,7 +39,7 @@
 
 use crate::fold::{
     batch_union, bounds_range, decode_all, derive_stride, page_active, paginate, rows_for_line,
-    FoldResult, Item, Slots, F_LEADER, F_NEWLINE, F_RENDERED,
+    wrap_row_of, FoldResult, Item, Slots, F_LEADER, F_NEWLINE, F_RENDERED,
 };
 use crate::text::ResolveGlyph;
 
@@ -159,16 +159,19 @@ pub(crate) struct PrefixLanes {
     pub ord: i64,
 }
 
-pub(crate) fn lanes_from_prefix(prefix: &ScanElem, wrap: i64) -> PrefixLanes {
+/// `terminator` is whether the byte being queried is itself a NEWLINE. It rides
+/// at one-past-the-last cell of its line, so at an exact wrap multiple it stays
+/// on the row it closes — the same distinction `fold::wrap_row_of` makes, which
+/// is why both forms call that one function rather than each spelling the rule.
+pub(crate) fn lanes_from_prefix(prefix: &ScanElem, wrap: i64, terminator: bool) -> PrefixLanes {
     let col = prefix.tail_len;
     let closed = if prefix.newlines > 0 {
         rows_for_line(prefix.head_len, wrap) + prefix.rows
     } else {
         0
     };
-    let wrap_row = if wrap > 0 { col / wrap } else { 0 };
     PrefixLanes {
-        row: closed + wrap_row,
+        row: closed + wrap_row_of(col, wrap, terminator),
         col,
         line_advance: prefix.tail_advance,
         ord: prefix.glyphs,
@@ -281,7 +284,7 @@ fn apply_chunk(
         let in_item =
             byte_index >= item.byte_start && byte_index < item.byte_start + item.byte_count;
         if flags & F_LEADER != 0 && in_item {
-            let lanes = lanes_from_prefix(&run, wraps[index]);
+            let lanes = lanes_from_prefix(&run, wraps[index], flags & F_NEWLINE != 0);
             slots.lc[id * 2] = lanes.row as u32;
             slots.lc[id * 2 + 1] = lanes.col as u32;
             slots.fl[id] = flags | F_RENDERED;
@@ -388,7 +391,7 @@ fn resolve_x_shard(
             // params, so for a page-active item paginate writes X/Y/Z for every
             // leader — these three stores were dead the moment it ran. paginate
             // reads only BASE_X/ROW/COL, all still written.
-            let wrap_row = if wrap > 0 { col / wrap } else { 0 };
+            let wrap_row = wrap_row_of(col, wrap, slots.flags(id) & F_NEWLINE != 0);
             slots.set_position(
                 id,
                 (item_relative_x + item.origin_x) as f32,
@@ -646,7 +649,12 @@ mod tests {
     fn the_monoid_is_associative_on_every_integer_field() {
         let mut checked = 0usize;
         let mut advance_differed = 0usize;
-        for wrap in [0i64, 1, 3, 7] {
+        // Six regimes, not four: `elements` builds lines of 1..9 cells, so
+        // wraps 1, 2 and 4 DIVIDE some of them and wraps 3 and 7 mostly do not.
+        // The corrected `rows_for_line` changes value exactly on the multiples,
+        // so a sweep that never hit one would be testing associativity of the
+        // old rule in the new rule's clothing.
+        for wrap in [0i64, 1, 2, 3, 4, 7] {
         let sample = elements(60, wrap);
         for a in sample.iter().take(15) {
             for b in sample.iter().skip(15).take(15) {
@@ -684,7 +692,7 @@ mod tests {
             }
         }
         }
-        assert_eq!(checked, 4 * 15 * 15 * 15, "the triple sweep must actually run");
+        assert_eq!(checked, 6 * 15 * 15 * 15, "the triple sweep must actually run");
         // ANTI-VACUITY on the claim itself. If regrouping never moved
         // tail_advance on this sample, the test would be silently asserting
         // something stronger than the contract, and the tiered comparison
@@ -867,6 +875,76 @@ mod tests {
                     "BASE_X, {where_}"
                 );
             }
+        }
+    }
+
+    /// THE PHANTOM ROW, in the scan form (2026-09-04).
+    ///
+    /// `scan_and_serial_agree_across_tunings_on_a_wrapped_paged_item` uses lines
+    /// of 10 cells at wrap 7 — never an exact multiple, so it could not see this
+    /// at all. Here every line is exactly 2 * wrap, which is the defect's whole
+    /// domain, and the item is UNPAGED so that the fold's own Z (not paginate's)
+    /// is the one under comparison.
+    ///
+    /// Two claims at once: the scan agrees with the serial fold, AND both of
+    /// them agree with rows counted by hand.
+    #[test]
+    fn scan_and_serial_agree_on_exact_multiple_lines() {
+        let t = trie();
+        // 12 lines of 8 cells each, wrap 4: line k occupies rows 2k and 2k+1.
+        let mut bytes: Vec<u8> = Vec::new();
+        for line in 0..12u8 {
+            bytes.extend_from_slice(&[b'a' + line; 8]);
+            bytes.push(b'\n');
+        }
+        let items = [Item {
+            byte_start: 0,
+            byte_count: bytes.len() as i64,
+            origin_x: 0.25,
+            origin_y: -1.0,
+            origin_z: 0.5,
+            wrap_width: 4,
+            z_step: 0.1,
+            line_height: 1.1,
+            ..Item::default()
+        }];
+        let serial = run_pipeline(&bytes, &t, &items);
+        assert!(!page_active(&items[0]), "unpaged, so the fold writes Z itself");
+
+        // Counted by hand, not derived from the code under test.
+        for line in 0..12usize {
+            let start = line * 9;
+            assert_eq!(serial.slots.row(start), (line * 2) as i64, "line {line} base row");
+            assert_eq!(serial.slots.row(start + 7), (line * 2 + 1) as i64, "line {line} last glyph");
+            assert_eq!(
+                serial.slots.row(start + 8),
+                (line * 2 + 1) as i64,
+                "line {line}'s newline rides the row it closes"
+            );
+        }
+        assert_eq!(serial.item_bounds[6], 24.0, "TOTAL_ROWS = 12 lines * 2 rows");
+
+        for &(chunk, group, shards) in
+            &[(64usize, 256usize, 1usize), (9, 3, 3), (1, 1, 8), (4096, 8, 5), (13, 5, 11)]
+        {
+            let scanned = run_scan_pipeline(&bytes, &t, &items, chunk, group, shards);
+            for id in 0..bytes.len() {
+                let where_ = format!("byte {id} at K={chunk}/G={group}/S={shards}");
+                assert_eq!(scanned.slots.lc[id * 2], serial.slots.lc[id * 2], "ROW, {where_}");
+                assert_eq!(scanned.slots.lc[id * 2 + 1], serial.slots.lc[id * 2 + 1], "COL, {where_}");
+                assert_eq!(scanned.slots.wc[id], serial.slots.wc[id], "ORD, {where_}");
+                assert_eq!(scanned.slots.fl[id], serial.slots.fl[id], "FLAGS, {where_}");
+                // Z is the lane the terminator rule reaches through wrap_row.
+                assert_eq!(
+                    scanned.slots.z(id).to_bits(), serial.slots.z(id).to_bits(),
+                    "Z, {where_}"
+                );
+                assert_eq!(
+                    scanned.slots.y(id).to_bits(), serial.slots.y(id).to_bits(),
+                    "Y, {where_}"
+                );
+            }
+            assert_eq!(scanned.item_bounds, serial.item_bounds, "bounds at K={chunk}/G={group}/S={shards}");
         }
     }
 }

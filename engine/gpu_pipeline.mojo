@@ -91,13 +91,29 @@ struct E(Copyable, Movable):
 
 
 def rows_for(length: Int, wrap: Int) -> Int:
-    """Mirror of rows_for_line. NOT the ceiling form — the newline rides at column
-    `len`, so an exact-multiple line ends with a row holding only the newline. The
-    first attempt here re-derived a ceiling and was off by one on exactly those
-    lines, which is why transcribing beats deriving even for a two-line function."""
-    if wrap <= 0:
+    """Mirror of rows_for_line — TRANSCRIBE it, do not re-derive it.
+
+    A ceiling with a floor of one, as of the 2026-09-04 phantom-row correction.
+    Note the history, because it reads like a contradiction: the FIRST attempt
+    here wrote a bare ceiling `(length + wrap - 1) // wrap` and was off by one —
+    against the then-current `length // wrap + 1`, and also at length 0, where a
+    bare ceiling gives 0 rows for a line that occupies one. The rule moved; the
+    lesson did not. Keep this a transcription of glyph_pipeline.rows_for_line."""
+    if wrap <= 0 or length <= 0:
         return 1
-    return length // wrap + 1
+    return (length - 1) // wrap + 1
+
+
+def wrap_row_of(col: Int, wrap: Int, terminator: Bool) -> Int:
+    """Mirror of glyph_pipeline.wrap_row_of — the line-local row of a cell.
+
+    A NEWLINE is a terminator riding at one-past-the-last cell, so at an exact
+    wrap multiple it stays on the row it closes rather than opening the next."""
+    if wrap <= 0:
+        return 0
+    if terminator:
+        return rows_for(col, wrap) - 1
+    return col // wrap
 
 
 def combine(mut a: E, b: E):
@@ -298,7 +314,7 @@ def k_apply(
             var closed = 0
             if run.nl > 0:
                 closed = rows_for(run.head_len, wrap) + run.rows
-            var wrap_row = (col // wrap) if wrap > 0 else 0
+            var wrap_row = wrap_row_of(col, wrap, (f & F_NEWLINE) != 0)
             var co = id * LC_STRIDE
             lc[unsafe_offset = co + LC_ROW] = UInt32(closed + wrap_row)
             lc[unsafe_offset = co + LC_COL] = UInt32(col)
@@ -361,7 +377,7 @@ def k_resolve_x(
         x = wm[unsafe_offset=id]
 
     var row = Int(lc[unsafe_offset = id * LC_STRIDE + LC_ROW])
-    var wrap_row = (col // wrap) if wrap > 0 else 0
+    var wrap_row = wrap_row_of(col, wrap, (Int(fl[unsafe_offset=id]) & F_NEWLINE) != 0)
     # lineHeight is the ITEM's, never the glyph's — the SIXTH copy of the
     # deleted fallback died here. It survived five sweeps because it is spelled
     # `lh != lh` with I_LINE_HEIGHT, matching none of the greps that found the
@@ -419,7 +435,9 @@ def k_paginate(
     var wide = wide_raw if wide_raw > 1 else 1
     var band = y_page // wide
     var wrap = Int(items_e[unsafe_offset = ie + IE_WRAP_WIDTH])
-    var seg = (col // wrap) if wrap > 0 else 0
+    # The SAME rule the fold's Z used, terminator case included — paginate
+    # recomputes Z from the COL lane.
+    var seg = wrap_row_of(col, wrap, (Int(fl[unsafe_offset=id]) & F_NEWLINE) != 0)
     # The page's own lineHeight is NOT consulted — mirrors 4697e3b. The fallback
     # could only fire on an item with a NaN lineHeight, which the oracle now
     # refuses, so it was reachable solely through malformed input. Proven, not

@@ -30,6 +30,7 @@ from glyph_pipeline import (
     byte_at,
     trie_lookup_entry,
     rows_for_line,
+    wrap_row_of,
     decode_codepoint_at,
 )
 
@@ -137,12 +138,20 @@ struct Lanes(Copyable, Movable):
         self.ord = ord
 
 
-def lanes_from_prefix(p: ScanElem, wrap: Int) -> Lanes:
-    """A leader's exact lanes from its exclusive prefix — the O(1) query."""
+def lanes_from_prefix(p: ScanElem, wrap: Int, terminator: Bool = False) -> Lanes:
+    """A leader's exact lanes from its exclusive prefix — the O(1) query.
+
+    `terminator` is whether the byte being queried is itself a NEWLINE. It rides
+    at one-past-the-last cell of its line, so at an exact wrap multiple it stays
+    on the row it closes — the same distinction `wrap_row_of` makes, which is why
+    both forms call that one function rather than each spelling the rule.
+
+    It DEFAULTS false because `seed_at` resumes only at line starts, where col is
+    0 and the two rules coincide; the apply kernel and the fixture query path
+    pass the byte's real flag."""
     var col = p.tail_len
     var closed = (rows_for_line(p.head_len, wrap) + p.rows) if p.nl > 0 else 0
-    var wrap_row = (col // wrap) if wrap > 0 else 0
-    return Lanes(closed + wrap_row, col, p.tail_adv, p.glyphs)
+    return Lanes(closed + wrap_row_of(col, wrap, terminator), col, p.tail_adv, p.glyphs)
 
 
 def fold_bytes[o: ImmOrigin](
@@ -354,6 +363,11 @@ def rows_under_wrap(record: BakeRecord, wrap: Int) -> Int:
         rows += rows_for_line(record.hist_lens[i], wrap) * record.hist_counts[i]
         i += 1
     var tail = record.total.tail_len
+    # The still-open final line. This USED to spell out `(tail - 1) // wrap + 1`
+    # because the shared helper over-counted a TERMINATED line by one at an exact
+    # multiple — the phantom row, worked around locally instead of fixed. With
+    # `rows_for_line` corrected the two are the same rule: a line covers the rows
+    # its cells reach whether or not a newline closes it.
     if tail > 0:
-        rows += (((tail - 1) // wrap) if wrap > 0 else 0) + 1
+        rows += rows_for_line(tail, wrap)
     return rows

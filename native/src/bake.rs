@@ -289,14 +289,18 @@ pub fn rows_under_wrap(record: &BakeRecord, wrap: i64) -> i64 {
     for (&length, &count) in record.hist_lens.iter().zip(record.hist_counts.iter()) {
         rows += rows_for_line(length, wrap) * count;
     }
-    // The still-open final line, if any. It has no newline, so `rows_for_line`
-    // (which counts the row the newline rides on) would over-count it by one at
-    // an exact multiple — hence `(tail - 1) / wrap + 1` rather than the shared
-    // helper. The two differ ONLY at exact multiples, which is exactly where a
-    // trailing-newline file and a non-terminated one must disagree.
+    // The still-open final line, if any. This USED to spell out `(tail - 1) /
+    // wrap + 1` because the shared helper over-counted a terminated line by one
+    // at an exact multiple — the phantom row, seen from here and worked around
+    // locally in 2026-09-02. With `rows_for_line` corrected the two rules are
+    // the same rule, so the special case is gone: a line covers the rows its
+    // cells reach whether or not a newline closes it. (A file ending in a
+    // newline and one that does not now agree at exact multiples, which is
+    // right — a trailing newline adds no content-bearing row, and at every
+    // NON-multiple length they always did agree.)
     let tail = record.total.tail_len;
     if tail > 0 {
-        rows += if wrap > 0 { (tail - 1) / wrap } else { 0 } + 1;
+        rows += rows_for_line(tail, wrap);
     }
     rows
 }
@@ -624,7 +628,14 @@ pub fn diff_bake(fixture: &BakeFixture) -> BakeDiff {
         {
             check_f64(&format!("prefix@{at}[{lane}]"), got_lane, want_lane, &mut bad);
         }
-        let lanes = crate::scan::lanes_from_prefix(&prefix, query.wrap);
+        // Whether the QUERIED byte is itself a newline decides which row rule
+        // applies to it (`fold::wrap_row_of`), and the prefix cannot know: it
+        // describes everything BEFORE the byte.
+        let terminator = at < fixture.bytes.len()
+            && sequence_length(&fixture.bytes, at) > 0
+            && crate::fold::decode_codepoint_at(&fixture.bytes, at, sequence_length(&fixture.bytes, at))
+                == NEWLINE;
+        let lanes = crate::scan::lanes_from_prefix(&prefix, query.wrap, terminator);
         check_i64(&format!("row@{at}w{}", query.wrap), lanes.row, query.row as i64, &mut bad);
         check_i64(&format!("col@{at}"), lanes.col, query.col as i64, &mut bad);
         check_i64(&format!("ord@{at}"), lanes.ord, query.ord as i64, &mut bad);
@@ -766,5 +777,47 @@ mod tests {
                 fx.name
             );
         }
+    }
+
+    /// THE PHANTOM ROW, seen from the histogram (2026-09-04).
+    ///
+    /// `rows_under_wrap` answers ANY wrap from the line histogram without
+    /// re-reading a byte, so it must land on the same total the fold does. It
+    /// used to spell the tail line's rule out separately BECAUSE the shared
+    /// `rows_for_line` over-counted a terminated line at an exact multiple —
+    /// which is the defect, worked around locally instead of fixed. With one
+    /// rule there is one answer, and this pins it against rows counted by hand.
+    #[test]
+    fn rows_under_wrap_counts_exact_multiple_lines_once() {
+        let t = trie();
+        // Three closed 8-cell lines and an open 8-cell tail. At wrap 4 each is
+        // exactly two rows; at wrap 8 each is exactly one; at wrap 3 each is
+        // three (8 = 3+3+2). None of those is `len/wrap + 1`.
+        let bytes = b"aaaaaaaa\nbbbbbbbb\ncccccccc\ndddddddd".to_vec();
+        let record = bake_file(&bytes, &t, 1.0, 4096).unwrap();
+        assert_eq!(record.hist_lens, vec![8], "three closed lines, all 8 cells");
+        assert_eq!(record.hist_counts, vec![3]);
+        assert_eq!(record.total.tail_len, 8, "and an unterminated 8-cell tail");
+        for (wrap, want) in [(1i64, 32i64), (2, 16), (3, 12), (4, 8), (5, 8), (8, 4), (9, 4), (0, 4)] {
+            assert_eq!(
+                rows_under_wrap(&record, wrap),
+                want,
+                "rows_under_wrap({wrap}) over 4 lines of 8 cells"
+            );
+        }
+
+        // A TERMINATED file and an UNTERMINATED one must now agree — the tail
+        // rule and the closed-line rule are the same rule. They always agreed
+        // at non-multiples; disagreeing only at multiples was the bug.
+        let terminated = bake_file(b"aaaaaaaa\n", &t, 1.0, 4096).unwrap();
+        let open = bake_file(b"aaaaaaaa", &t, 1.0, 4096).unwrap();
+        for wrap in [1i64, 2, 3, 4, 5, 8, 9] {
+            assert_eq!(
+                rows_under_wrap(&terminated, wrap),
+                rows_under_wrap(&open, wrap),
+                "a trailing newline adds no row at wrap {wrap}"
+            );
+        }
+        assert_eq!(rows_under_wrap(&terminated, 4), 2, "8 cells at wrap 4 is two rows");
     }
 }

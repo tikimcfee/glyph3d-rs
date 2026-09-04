@@ -32,8 +32,8 @@ from glyph_schema import (
     IE_PAGES_WIDE, IE_WRAP_WIDTH, IE_HAS_PAGE,
 )
 from glyph_pipeline import (
-    run_pipeline, F_LEADER, trunc_nonneg, derive_stride, Item, Trie,
-    item_for_byte, page_active,
+    run_pipeline, F_LEADER, F_NEWLINE, trunc_nonneg, derive_stride, Item, Trie,
+    item_for_byte, page_active, wrap_row_of,
 )
 from fixture_io import load_pipe_fixture
 
@@ -122,7 +122,9 @@ def paginate_kernel(
     var wide = wide_raw if wide_raw > 1 else 1
     var band = y_page // wide
     var wrap = Int(items_e[unsafe_offset = ie + IE_WRAP_WIDTH])
-    var seg = (col // wrap) if wrap > 0 else 0
+    # The SAME rule the fold's Z used, terminator case included — paginate
+    # recomputes Z from the COL lane, and a newline rides at one-past-the-last.
+    var seg = wrap_row_of(col, wrap, (Int(fl[unsafe_offset=id]) & F_NEWLINE) != 0)
 
     # The page's own lineHeight is NOT consulted — mirrors 4697e3b. The fallback
     # could only fire on an item with a NaN lineHeight, which the oracle now

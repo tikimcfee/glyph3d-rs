@@ -264,13 +264,46 @@ pub(crate) fn decode_codepoint_at(bytes: &[u8], slot: usize, sequence_len: usize
     }
 }
 
-/// Visual rows a line occupies under `wrap`; the newline rides at column `len`,
-/// so an exact-multiple line ends with a row holding only the newline.
+/// Visual rows a line of `length` cells occupies under `wrap` — a CEILING with
+/// a floor of one, since an empty line still occupies the row it sits on.
+///
+/// THE PHANTOM ROW (corrected 2026-09-04). This was `length / wrap + 1`, which
+/// counts the row the terminating newline rides on. The newline rides at column
+/// `length`, so when `wrap` divides `length` that column rolls onto a fresh row
+/// holding nothing else: the line claimed a blank row and every later line moved
+/// down one. The old rule and this one agree for every other length, which is
+/// why the defect was invisible except at exact multiples — on `wide.txt` at
+/// wrap 100 it displaced the 8th line by four rows.
+///
+/// The frozen JS oracle corpus was generated under the old rule, so it SPECIFIES
+/// the phantom; see `engine/delta/phantom-row.md` for the fixtures and lanes
+/// that must be regenerated.
 pub(crate) fn rows_for_line(length: i64, wrap: i64) -> i64 {
-    if wrap <= 0 {
+    if wrap <= 0 || length <= 0 {
         1
     } else {
-        length / wrap + 1
+        (length - 1) / wrap + 1
+    }
+}
+
+/// The LINE-LOCAL row a cell at column `col` occupies under `wrap`.
+///
+/// Two kinds of cell, and they differ at exactly one place. An ordinary glyph
+/// at column `col` sits on `col / wrap`. A NEWLINE is a terminator riding at
+/// one-past-the-last cell (`col == the line's glyph count`), so at an exact
+/// multiple `col / wrap` would roll it onto the next row — a row that holds
+/// nothing else. It belongs on the last row its line reaches.
+///
+/// Every consumer of (col, wrap) -> row goes through here. Deriving the two
+/// cases from one expression is what let the terminator open a phantom row in
+/// the first place, and the special case is worth a name.
+pub(crate) fn wrap_row_of(col: i64, wrap: i64, terminator: bool) -> i64 {
+    if wrap <= 0 {
+        0
+    } else if terminator {
+        rows_for_line(col, wrap) - 1
+    } else {
+        col / wrap
     }
 }
 
@@ -385,7 +418,9 @@ fn layout_item(
             continue;
         }
         let advance = slots.advance(id);
-        let wrap_row = if wrap > 0 { col / wrap } else { 0 };
+        // The newline is a TERMINATOR at one-past-the-last cell, so at an exact
+        // multiple it stays on the row it closes instead of opening the next.
+        let wrap_row = wrap_row_of(col, wrap, slots.flags(id) & F_NEWLINE != 0);
         let row = base_row + wrap_row;
         // THE CARRIER CHOICE, and the whole of landmine 2 in one line.
         let item_relative_x: f64 = if fold_unit > 0 {
@@ -505,7 +540,11 @@ pub(crate) fn paginate(slots: &mut Slots, id: usize, item: &Item, page_stride_x:
     }
     let pages_wide = if item.pages_wide > 1 { item.pages_wide } else { 1 };
     let band = y_page / pages_wide;
-    let wrap_segment = if item.wrap_width > 0 { col / item.wrap_width } else { 0 };
+    // The SAME rule the fold's Z used, terminator case included: paginate
+    // recomputes Z from the COL lane, so a divergence here would put a
+    // newline's depth one wrap step behind its own row's.
+    let wrap_segment =
+        wrap_row_of(col, item.wrap_width, slots.flags(id) & F_NEWLINE != 0);
     let line_height = item.line_height;
 
     slots.lm[id * 4] =
@@ -822,5 +861,270 @@ mod tests {
                 "byte {id}: a row scrolled past a page must stay in flow"
             );
         }
+    }
+
+    // ── The phantom row (2026-09-04) ───────────────────────────────────────
+    //
+    // `rows_for_line` used to be `length / wrap + 1`, which counts the row the
+    // terminating newline rides on. At an exact multiple that column rolls onto
+    // a fresh row holding nothing else, so the line claimed a blank row and
+    // every later line moved down one. These four tests pin the corrected rule
+    // and its two halves; the fixture corpus cannot, because the frozen oracle
+    // has the same defect and therefore SPECIFIES it.
+
+    /// THE RULE, stated as a table rather than as the formula under test.
+    ///
+    /// A line of `n` cells under wrap `w` covers the rows its cells reach and
+    /// no more.
+    #[test]
+    fn rows_for_line_counts_only_rows_a_cell_reaches() {
+        // (length, wrap, rows)
+        let table = [
+            (0i64, 4i64, 1i64), // an empty line still occupies its row
+            (1, 4, 1),
+            (3, 4, 1),
+            (4, 4, 1), // EXACT MULTIPLE — the defect's whole domain
+            (5, 4, 2),
+            (8, 4, 2), // exact multiple
+            (9, 4, 3),
+            (12, 4, 3), // exact multiple
+            (0, 1, 1),  // wrap 1 divides EVERYTHING, so it is all domain
+            (1, 1, 1),
+            (2, 1, 2),
+            (100, 100, 1),
+            (101, 100, 2),
+            (200, 100, 2),
+            (5000, 100, 50),
+            (7, 0, 1), // wrap off: one row, always
+            (0, 0, 1),
+        ];
+        for (length, wrap, want) in table {
+            assert_eq!(rows_for_line(length, wrap), want, "rows_for_line({length}, {wrap})");
+        }
+    }
+
+    /// The terminator's own row: a newline sits on the row it CLOSES, never on
+    /// the one after. Stated as its own table so this and `rows_for_line`
+    /// cannot agree by sharing a bug.
+    #[test]
+    fn a_newline_rides_the_row_it_closes() {
+        // (col == line length, wrap, line-local row of the newline)
+        let table = [
+            (0i64, 4i64, 0i64),
+            (3, 4, 0),
+            (4, 4, 0), // exact multiple: stays on row 0 with its four glyphs
+            (5, 4, 1),
+            (8, 4, 1),
+            (9, 4, 2),
+            (100, 100, 0),
+            (5000, 100, 49),
+        ];
+        for (col, wrap, want) in table {
+            assert_eq!(wrap_row_of(col, wrap, true), want, "newline at col {col}, wrap {wrap}");
+            // An ORDINARY cell at the same column is unaffected: the two rules
+            // differ only for the terminator, and only at a multiple.
+            assert_eq!(wrap_row_of(col, wrap, false), col / wrap, "glyph at col {col}");
+        }
+    }
+
+    /// THE DEFECT, on the fixture it was measured on.
+    ///
+    /// `wide.txt` at wrap 100 has six lines whose glyph counts are exact
+    /// multiples of 100. Under `length / wrap + 1` each claimed one blank row
+    /// too many and shoved everything below it down; the 8th line started at
+    /// row 271 instead of 267, exactly the four exact-multiple lines above it.
+    ///
+    /// The expected rows are LITERALS, not recomputed from the formula: a test
+    /// that re-derives its expectation from the code under test asserts nothing.
+    #[test]
+    fn exact_multiple_lines_do_not_push_later_lines_down() {
+        let path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/g-pick-repo/wide.txt");
+        let bytes = std::fs::read(&path).expect("wide.txt");
+        let t = trie();
+        let item = Item {
+            byte_start: 0,
+            byte_count: bytes.len() as i64,
+            wrap_width: 100,
+            z_step: 0.25,
+            line_height: 1.0,
+            ..Item::default()
+        };
+        let r = run_pipeline(&bytes, &t, &[item]);
+
+        // Byte offset of the first byte of each source line — found by scanning
+        // for newlines, which is not the arithmetic under test.
+        let mut line_starts = vec![0usize];
+        for (id, &b) in bytes.iter().enumerate() {
+            if b == b'\n' {
+                line_starts.push(id + 1);
+            }
+        }
+        // glyph counts: 80, 100, 101, 250, 1000, 5000, 20000, 120000, 250000
+        // rows:          1,   1,   2,   3,   10,   50,   200,   1200,   2500
+        let want_base_row = [0i64, 1, 2, 4, 7, 17, 67, 267, 1467];
+        for (line, &want) in want_base_row.iter().enumerate() {
+            let start = line_starts[line];
+            assert_eq!(
+                r.slots.row(start),
+                want,
+                "line {line} must start at row {want}, not {}",
+                r.slots.row(start)
+            );
+            assert_eq!(r.slots.col(start), 0, "line {line}'s first glyph is column 0");
+        }
+        // ANTI-VACUITY: the sweep must really have reached the wide lines.
+        assert_eq!(line_starts.len(), 10, "wide.txt has 9 newline-terminated lines");
+
+        // TOTAL_ROWS (bounds lane 6) counts the rows the file actually reaches.
+        assert_eq!(r.item_bounds[6], 3967.0, "TOTAL_ROWS: 1467 + 2500 for the last line");
+    }
+
+    /// Self-consistency at the seam the fix has TWO halves for: the newline's
+    /// own lanes and the next line's base row must agree about where the line
+    /// ended. Correcting only `rows_for_line` would leave the newline reporting
+    /// a row that belongs to the following line — and its Y and Z reach the
+    /// item's bounding box from there.
+    #[test]
+    fn a_newline_at_an_exact_multiple_shares_its_last_glyph_s_row_and_depth() {
+        let t = trie();
+        // Two lines of exactly 8 = 2 * wrap cells, then a short one.
+        let bytes = b"aaaaaaaa\nbbbbbbbb\ncc";
+        let item = Item {
+            byte_start: 0,
+            byte_count: bytes.len() as i64,
+            wrap_width: 4,
+            z_step: 0.25,
+            line_height: 1.0,
+            ..Item::default()
+        };
+        let r = run_pipeline(bytes, &t, &[item]);
+
+        let last_glyph = 7; // the 8th 'a'
+        let newline = 8;
+        assert_eq!(r.slots.col(last_glyph), 7);
+        assert_eq!(r.slots.col(newline), 8, "the newline still owns column 8");
+        assert_eq!(
+            r.slots.row(newline),
+            r.slots.row(last_glyph),
+            "the newline must ride the row it closes"
+        );
+        assert_eq!(r.slots.row(newline), 1, "8 cells at wrap 4 end on line-local row 1");
+        assert_eq!(
+            r.slots.y(newline).to_bits(),
+            r.slots.y(last_glyph).to_bits(),
+            "same row means the same Y"
+        );
+        assert_eq!(
+            r.slots.z(newline).to_bits(),
+            r.slots.z(last_glyph).to_bits(),
+            "same wrap segment means the same Z"
+        );
+        // And the second line starts on the row after, not two after.
+        assert_eq!(r.slots.row(9), 2, "line 1 starts immediately below line 0");
+        assert_eq!(r.slots.row(18), 4, "line 2 starts immediately below line 1");
+        // The box's lower edge is the deepest row the file reaches, and the
+        // phantom used to drag it one line_height further.
+        assert_eq!(r.item_bounds[6], 5.0, "TOTAL_ROWS = 2 + 2 + 1");
+        assert_eq!(r.item_bounds[1], -4.0, "box min Y = -(last row) * line_height");
+    }
+
+    /// An EMPTY line still occupies the row it sits on — the floor of one in
+    /// `rows_for_line`, stated where the pipeline can see it.
+    ///
+    /// This exists because of what mutation showed: replacing the rule with a
+    /// bare ceiling `(n + w - 1) / w` reddened only the two lookup tables. Every
+    /// other test compares one form of the fold against another, and both call
+    /// the same function, so a shared-rule mutation moves both sides together
+    /// and the comparison stays green. Absolute row numbers are the only thing
+    /// that can see it from here.
+    #[test]
+    fn an_empty_line_still_occupies_a_row() {
+        let t = trie();
+        // Rows, counted by hand at wrap 4:
+        //   "abcd"  -> row 0            (exact multiple: ONE row)
+        //   ""      -> row 1            (empty: still one row)
+        //   ""      -> row 2
+        //   "efghi" -> rows 3 and 4
+        //   ""      -> row 5
+        //   "j"     -> row 6
+        let bytes = b"abcd\n\n\nefghi\n\nj";
+        let item = Item {
+            byte_start: 0,
+            byte_count: bytes.len() as i64,
+            wrap_width: 4,
+            line_height: 1.0,
+            ..Item::default()
+        };
+        let r = run_pipeline(bytes, &t, &[item]);
+        // (byte, row) for the first cell of each line, plus each bare newline.
+        for (id, want) in [
+            (0usize, 0i64), // 'a'
+            (4, 0),         // the newline closing "abcd" — rides row 0
+            (5, 1),         // the first empty line's newline
+            (6, 2),         // the second empty line's newline
+            (7, 3),         // 'e'
+            (11, 4),        // 'i', wrapped onto row 4
+            (12, 4),        // the newline closing "efghi" — rides row 4
+            (13, 5),        // the third empty line's newline
+            (14, 6),        // 'j'
+        ] {
+            assert_eq!(r.slots.row(id), want, "byte {id} must sit on row {want}");
+        }
+        assert_eq!(r.item_bounds[6], 7.0, "TOTAL_ROWS = 1 + 1 + 1 + 2 + 1 + 1");
+    }
+
+    /// PAGINATE'S Z, which recomputes the wrap segment from the COL lane and so
+    /// needs the terminator rule of its own.
+    ///
+    /// FOUND BY MUTATION, not by reading: reverting paginate's `wrap_segment` to
+    /// a plain `col / wrap` reddened NOTHING. The unpaged tests never reach
+    /// paginate, and the paged tuning sweep uses 10-cell lines at wrap 7 — never
+    /// a multiple. Worse, a scan-vs-fold comparison structurally cannot catch it:
+    /// both forms call the same `paginate`, so the mutation moves both sides
+    /// together. The claim has to be stated against something else, so it is
+    /// stated against the fold's own rule — a newline at an exact multiple sits
+    /// at the depth of the row it closes, not one wrap step behind it.
+    ///
+    /// `depth_per_band` and `depth_per_col` are zero so Z reduces to the wrap
+    /// segment term alone; that is what makes the comparison to the last glyph
+    /// meaningful rather than a coincidence of three cancelling terms.
+    #[test]
+    fn paginate_puts_a_newline_at_its_own_row_s_depth() {
+        let t = trie();
+        let bytes = b"aaaaaaaa\nbb";
+        let item = Item {
+            byte_start: 0,
+            byte_count: bytes.len() as i64,
+            origin_z: 2.0,
+            wrap_width: 4,
+            z_step: 0.5,
+            line_height: 1.0,
+            has_page: true,
+            page_rows: 2,
+            pages_wide: 1,
+            ..Item::default() // depth_per_band / depth_per_col / page_cols all 0
+        };
+        assert!(page_active(&item), "paginate must actually run");
+        let r = run_pipeline(bytes, &t, &[item]);
+
+        let last_glyph = 7usize; // col 7, wrap segment 1
+        let newline = 8usize; // col 8 — the exact multiple
+        assert_eq!(r.slots.col(newline), 8);
+        assert_eq!(
+            r.slots.z(newline).to_bits(),
+            r.slots.z(last_glyph).to_bits(),
+            "a newline at an exact multiple shares its last glyph's depth"
+        );
+        // Stated absolutely too, so it cannot pass by both sides being wrong:
+        // segment 1 of a 0.5 step from origin_z 2.0.
+        assert_eq!(r.slots.z(newline), 1.5, "origin_z - 1 * z_step");
+        // ANTI-VACUITY: Z must really vary with the segment here, or the
+        // equality above is about a constant.
+        assert_eq!(r.slots.z(0), 2.0, "segment 0 sits at origin_z");
+        assert_ne!(r.slots.z(0), r.slots.z(last_glyph), "segments must separate in Z");
+        // And the box's near edge follows: with the phantom, the newline
+        // reached a segment no glyph occupies and dragged min Z with it.
+        assert_eq!(r.item_bounds[2], 1.5, "box min Z = the deepest segment a cell reaches");
     }
 }

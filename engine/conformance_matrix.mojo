@@ -38,7 +38,8 @@ from std.sys import argv
 from std.collections import Dict
 from glyph_schema import LC_STRIDE, LC_ROW, LC_COL, LM_STRIDE, LM_Z
 from glyph_pipeline import (
-    run_pipeline, Item, Trie, F_LEADER, F_RENDERED, F_MISSING, page_active,
+    run_pipeline, Item, Trie, F_LEADER, F_NEWLINE, F_RENDERED, F_MISSING,
+    page_active, wrap_row_of,
 )
 from fixture_io import load_pipe_fixture
 
@@ -382,7 +383,10 @@ def check(
                 y_page = screen_row // rows
             var x_page = col // cols if cols > 0 else 0
             var band = y_page // wide
-            var seg = (col // wrap) if wrap > 0 else 0
+            # Same terminator rule as paginate's Z: a newline rides one-past-the
+            # -last cell, so bucketing it by `col // wrap` would put it in the
+            # NEXT wrap segment and report a false Z disagreement.
+            var seg = wrap_row_of(col, wrap, (f & F_NEWLINE) != 0)
             if seg >= 65536 or band >= 65536 or x_page >= 65536:
                 continue          # the packed key would alias; not for this corpus
             var key = (seg * 65536 + band) * 65536 + x_page

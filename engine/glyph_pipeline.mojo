@@ -601,11 +601,38 @@ def item_for_byte(items: List[Item], id: Int) -> Int:
 
 
 def rows_for_line(length: Int, wrap: Int) -> Int:
-    """Visual rows a line occupies under `wrap`; the newline rides at column `len`,
-    so an exact-multiple line ends with a row holding only the newline."""
-    if wrap <= 0:
+    """Visual rows a line of `length` cells occupies under `wrap` — a CEILING with
+    a floor of one, since an empty line still occupies the row it sits on.
+
+    THE PHANTOM ROW (corrected 2026-09-04). This was `length // wrap + 1`, which
+    counts the row the terminating newline rides on. The newline rides at column
+    `length`, so when `wrap` divides `length` that column rolls onto a fresh row
+    holding nothing else: the line claimed a blank row and every later line moved
+    down one. The two rules agree at every other length, which is why the defect
+    was invisible except at exact multiples.
+
+    The frozen JS oracle corpus was generated under the old rule and therefore
+    SPECIFIES the phantom; see engine/delta/phantom-row.md."""
+    if wrap <= 0 or length <= 0:
         return 1
-    return length // wrap + 1
+    return (length - 1) // wrap + 1
+
+
+def wrap_row_of(col: Int, wrap: Int, terminator: Bool) -> Int:
+    """The LINE-LOCAL row a cell at column `col` occupies under `wrap`.
+
+    An ordinary glyph at column `col` sits on `col // wrap`. A NEWLINE is a
+    terminator riding at one-past-the-last cell (`col` == the line's glyph count),
+    so at an exact multiple `col // wrap` would roll it onto a row that holds
+    nothing else; it belongs on the last row its line reaches.
+
+    Every consumer of (col, wrap) -> row goes through here. Deriving both cases
+    from one expression is what let the terminator open a phantom row."""
+    if wrap <= 0:
+        return 0
+    if terminator:
+        return rows_for_line(col, wrap) - 1
+    return col // wrap
 
 
 def layout_item[ko: Origin[mut=True], witness: Bool = True](
@@ -671,7 +698,9 @@ def layout_item[ko: Origin[mut=True], witness: Bool = True](
             id += 1
             continue
         var advance = slots.advance(id)
-        var wrap_row = (col // wrap) if wrap > 0 else 0
+        # The newline is a TERMINATOR at one-past-the-last cell, so at an exact
+        # multiple it stays on the row it closes instead of opening the next.
+        var wrap_row = wrap_row_of(col, wrap, (flags & F_NEWLINE) != 0)
         var row = base_row + wrap_row
         var x: Float64 = Float64(seg_adv) if fold > 0 else line_adv
         # lineHeight is the ITEM's, never the glyph's. The oracle carried a
@@ -802,7 +831,10 @@ def paginate(
     var band = y_page // wide
 
     var wrap = item.wrap_width
-    var seg = (col // wrap) if wrap > 0 else 0
+    # The SAME rule the fold's Z used, terminator case included: paginate
+    # recomputes Z from the COL lane, so a divergence here would put a newline's
+    # depth one wrap step behind its own row's.
+    var seg = wrap_row_of(col, wrap, (slots.flags(id) & F_NEWLINE) != 0)
     # The page's own lineHeight is NOT consulted. This mirrored the oracle's
     # `resolved[i].lineHeight ?? it.page?.lineHeight`, deleted in 4697e3b as
     # unreachable: assertLineHeight guarantees the item's is finite before paginate
