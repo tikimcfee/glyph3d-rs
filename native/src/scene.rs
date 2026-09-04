@@ -12,8 +12,15 @@ use crate::gpu::GpuContext;
 /// The views a frame draws into, plus their physical-pixel size.
 /// (Stage F: the cull/LOD pass needs the height to convert world units to
 /// on-screen pixels.) Bundled so `SceneLike::render` stays a 4-arg signature.
+///
+/// Stage L (L3): `color_texture` + `color_format` added for the composite
+/// step — the copy path needs the texture handle (a TextureView can't be a
+/// copy endpoint), and the copy-vs-shader split keys on the format
+/// (Rgba8UnormSrgb offscreen → copy; Bgra8UnormSrgb windowed → shader).
 pub struct FrameTarget<'a> {
     pub color_view: &'a wgpu::TextureView,
+    pub color_texture: &'a wgpu::Texture,
+    pub color_format: wgpu::TextureFormat,
     pub depth_view: &'a wgpu::TextureView,
     pub width: u32,
     pub height: u32,
@@ -164,7 +171,7 @@ impl Scene {
 
         // --- camera uniform --------------------------------------------------
         let camera_buf = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("camera uniform"),
+            label: Some("quad field camera uniform"),
             size: std::mem::size_of::<CameraUniform>() as u64,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
@@ -172,7 +179,7 @@ impl Scene {
 
         // --- pipeline ---------------------------------------------------------
         let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("scene bgl"),
+            label: Some("quad field bgl"),
             entries: &[
                 wgpu::BindGroupLayoutEntry {
                     binding: 0,
@@ -197,7 +204,7 @@ impl Scene {
             ],
         });
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("scene bg"),
+            label: Some("quad field bg"),
             layout: &bgl,
             entries: &[
                 wgpu::BindGroupEntry {
@@ -218,7 +225,7 @@ impl Scene {
 
         let depth_format = wgpu::TextureFormat::Depth32Float;
         let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("scene pl"),
+            label: Some("quad field pl"),
             bind_group_layouts: &[Some(&bgl)],
             immediate_size: 0,
         });
@@ -293,6 +300,9 @@ impl Scene {
             depth_view,
             width,
             height,
+            // Stage L (L3): the demo Scene keeps direct rendering — it never
+            // composites, so the texture handle and format go unused.
+            ..
         } = *target;
         let aspect = width as f32 / height.max(1) as f32;
         let cam = CameraUniform {

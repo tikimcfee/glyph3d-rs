@@ -109,9 +109,14 @@ this is fenced:
 - `GLYPH_G_DUMP=<slot>[,<len>]` — offscreen only: reads back instance bytes
   at `slot` from the glyph arena and prints hex (buffer write-path audits).
 - `GLYPH_K4_SELFTEST=1` — windowed, dev-only (Stage K): at t≈3 s moves the
-  Debug panel's LOD_MIN_PX slider programmatically (1.0 → 64.0) and logs the
+  Debug panel's LOD_MIN_PX slider programmatically (1.0 → 16.0) and logs the
   cull counters before/after — exercises the panel → probe → CullState →
   cull path without a human at the mouse.
+- `GLYPH_L3_SHADER_COMPOSITE=1` — offscreen, dev-only (Stage L): makes the
+  offscreen target Bgra8UnormSrgb, forcing the WINDOWED shader-composite
+  path (composite.wgsl) under the deterministic oracle driver; the readback
+  swizzles BGRA→RGBA so the PNG compares directly against the Rgba
+  baselines. The live-display-free proof of the composite shader.
 
 ## Commit cadence
 

@@ -6,7 +6,7 @@
 //! Stage G: interaction is split between the two mouse buttons so picking and
 //! the fly camera coexist:
 //!   - LEFT click (ungrabbed pointer) = PICK the glyph under the cursor
-//!     (prints file:row:col:char, flash-highlights it);
+//!     (prints file:row:col:char; Stage L/L4: selection-tints it);
 //!   - RIGHT press-and-drag = mouse-look (pointer confined + hidden while
 //!     held; raw DeviceEvent deltas); Esc also releases;
 //!   - verb keys act on the last pick: `h` highlight line, `g` grab/release
@@ -52,7 +52,7 @@ use std::time::Instant;
 
 use winit::application::ApplicationHandler;
 use winit::event::{DeviceEvent, ElementState, MouseButton, MouseScrollDelta, WindowEvent};
-use winit::event_loop::{ActiveEventLoop, EventLoop};
+use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{CursorGrabMode, Window, WindowId};
 
@@ -126,6 +126,17 @@ struct WindowState {
     /// Stage K (K6): capture THIS frame to the path after the final submit
     /// (armed by F2, or by the CLI frame counter).
     capture_pending: Option<std::path::PathBuf>,
+    /// Post-L3 fix: set when the surface reports Occluded (fully covered /
+    /// display asleep). While set, about_to_wait throttles redraw requests
+    /// to ~2 Hz instead of spinning at ~100% CPU (measured pre-fix: ~250k
+    /// occlusion-skips/s). winit 0.30 gives no reliable wake on
+    /// un-occlusion — WindowEvent::Occluded is iOS-only ("Others:
+    /// Unsupported"), and RedrawRequested fires only on OS invalidation or
+    /// an explicit request_redraw — so a purely event-driven wait could
+    /// strand the window blank; the 500 ms retry guarantees recovery.
+    occluded: bool,
+    /// Last time an occluded retry was issued (the 2 Hz throttle).
+    occluded_retry_at: Instant,
     // FPS accounting
     frames: u32,
     fps_window_start: Instant,
@@ -237,7 +248,9 @@ impl WindowState {
             usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
             mapped_at_creation: false,
         });
-        let mut encoder = ctx.device.create_command_encoder(&Default::default());
+        let mut encoder = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("windowed shot copy"), // Stage L (O2)
+        });
         encoder.copy_texture_to_buffer(
             wgpu::TexelCopyTextureInfo {
                 texture: &frame.texture,
@@ -331,8 +344,18 @@ impl WindowState {
                 self.surface.configure(&ctx.device, &self.config);
                 return;
             }
-            // Occluded/Timeout: skip this frame, try again next redraw.
-            Cst::Occluded | Cst::Timeout => return,
+            // Post-L3 fix: occlusion is sticky (fully covered window /
+            // display asleep) — mark it so about_to_wait throttles instead
+            // of spinning. Timeout is transient acquire contention: skip the
+            // frame and keep today's cadence (unchanged).
+            Cst::Occluded => {
+                if !self.occluded {
+                    log::info!("surface occluded — throttling redraws to ~2 Hz until visible");
+                }
+                self.occluded = true;
+                return;
+            }
+            Cst::Timeout => return,
             Cst::Validation => {
                 log::error!("surface validation error on acquire");
                 return;
@@ -340,12 +363,18 @@ impl WindowState {
         };
         let view = frame.texture.create_view(&Default::default());
 
-        let mut encoder = ctx.device.create_command_encoder(&Default::default());
+        let mut encoder = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("windowed frame"), // Stage L (O2)
+        });
         self.scene.render(
             ctx,
             &mut encoder,
             &crate::scene::FrameTarget {
                 color_view: &view,
+                // Stage L (L3): the composite's copy-vs-shader split keys on
+                // the format; the copy path needs the texture handle.
+                color_texture: &frame.texture,
+                color_format: self.config.format,
                 depth_view: &self.depth,
                 width: self.config.width,
                 height: self.config.height,
@@ -676,6 +705,9 @@ impl WindowState {
         // wgpu 30: presentation goes through the queue, not the texture.
         ctx.queue.present(frame);
         self.frames_total += 1;
+        // Post-L3 fix: a successful present clears occlusion (the 2 Hz retry
+        // found the window visible again).
+        self.occluded = false;
 
         // Stage H: close the profiler frame and fold any GPU-completed frame
         // into the running means (non-blocking pump for the query maps).
@@ -791,7 +823,13 @@ impl ApplicationHandler for App<'_> {
         );
         let size = window.inner_size();
         let config = wgpu::SurfaceConfiguration {
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            // Stage K (K6): COPY_SRC = in-window screenshot readback.
+            // Stage L (L3): COPY_DST = the composite's copy path when the
+            // surface format happens to match the pool (non-Metal adapters);
+            // windowed normally composites through the shader (BGRA).
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                | wgpu::TextureUsages::COPY_SRC
+                | wgpu::TextureUsages::COPY_DST,
             format,
             // Auto == sRGB for 8-bit formats; required field in wgpu 30.
             color_space: wgpu::SurfaceColorSpace::Auto,
@@ -901,6 +939,8 @@ impl ApplicationHandler for App<'_> {
             frames_total: 0,
             shot_at_frame: self.shot.clone(),
             capture_pending: None,
+            occluded: false,
+            occluded_retry_at: Instant::now(),
             frames: 0,
             fps_window_start: Instant::now(),
             profile: crate::gpu::ProfileAccumulator::default(),
@@ -934,6 +974,10 @@ impl ApplicationHandler for App<'_> {
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::Resized(size) => {
+                // Post-L3 fix: a resize means the window is being shown —
+                // clear occlusion so the next about_to_wait resumes the
+                // continuous redraw immediately.
+                state.occluded = false;
                 state.resize(&self.ctx, size.width, size.height);
                 state.scene.set_viewport(size.width, size.height);
             }
@@ -1062,8 +1106,29 @@ impl ApplicationHandler for App<'_> {
         }
     }
 
-    fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         if let Some(state) = &mut self.state {
+            // Post-L3 fix: while the surface reports Occluded, do NOT spin
+            // request_redraw (measured pre-fix: ~250k skipped acquires/s,
+            // ~100% CPU). winit 0.30 gives no reliable wake when a fully
+            // occluded macOS window becomes visible again
+            // (WindowEvent::Occluded is iOS-only; RedrawRequested fires on
+            // OS invalidation or an explicit request_redraw), so a purely
+            // event-driven wait could strand the window blank — instead
+            // retry at ~2 Hz via a WaitUntil deadline; recovery takes at
+            // most half a second. Not occluded: restore the default Wait
+            // (the continuous redraw below keeps the loop hot as today).
+            if state.occluded {
+                const RETRY: std::time::Duration = std::time::Duration::from_millis(500);
+                let elapsed = state.occluded_retry_at.elapsed();
+                if elapsed < RETRY {
+                    event_loop.set_control_flow(ControlFlow::WaitUntil(Instant::now() + (RETRY - elapsed)));
+                    return;
+                }
+                state.occluded_retry_at = Instant::now();
+            } else {
+                event_loop.set_control_flow(ControlFlow::Wait);
+            }
             // Fixed-cap dt so a stalled frame (resize, HUD hiccup) doesn't
             // launch the camera.
             let dt = state.last_frame.elapsed().as_secs_f32().min(0.1);
