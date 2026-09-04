@@ -21,6 +21,13 @@
 #   7. tools/check-stage-g.sh       — pick correctness vs python oracle
 #   8. four-view byte-equal A/B     — demo/text/repo-zoom/repo-wide re-rendered
 #                                     and cmp'd against out/tooling-ab/baseline/
+#  8b. --repo-verify               — the two Mojo FFI strategies (per-item and
+#                                     batched) diffed bit-exact at the layout
+#                                     seam, in BOTH wrap modes. A REAL CHECK
+#                                     NOTHING RAN until 2026-09-04, which is how
+#                                     a stale-dylib argument shift reached a
+#                                     branch: it was used as a mutation target
+#                                     and never consulted on its own tree.
 #   9. the reference port           — all five stages, six halves, no JS: parse
 #                                     parity (Rust vs Mojo over PARSED values),
 #                                     the trie rebuilt from bytes, the serial
@@ -191,6 +198,37 @@ for v in demo text repo-zoom repo-wide; do
   else
     echo "FAIL  $v.png diverges from baseline — the renderer changed; the commit is wrong"
     FAIL=1
+  fi
+done
+
+# THE TWO FFI STRATEGIES MUST AGREE. `--repo-verify` diffs the per-item and
+# batched Mojo backends at the layout seam — placements, instances AND records,
+# all bit-exact (layout::diff_backends). It has existed for stages and NOTHING
+# RAN IT: on 2026-09-04 a stale dylib shifted every argument after `wrap_width`
+# in the per-item path, pagination silently switched off, and the only thing that
+# could see it was this command, which no gate invoked. The entry point marshals
+# a descriptor now so that particular shift cannot recur — but the check is the
+# point, not the bug it caught.
+#
+# BOTH MODES, because the per-item and batched paths could differ about
+# `wrap_mode` specifically and mode A would never show it.
+#
+# It costs 0.04 s per mode on fixtures/g-pick-repo (5 files, 0.4 MB, 407,451
+# records) — measured, not estimated — so the full gated fixture is affordable
+# and there is no case for a smaller input.
+step "8b/9 --repo-verify: per-item vs batched FFI, bit-exact, both wrap modes"
+for MODE in down back; do
+  if OUT=$(cd native && ./target/release/glyph3d-native --load-repo fixtures/g-pick-repo \
+        --wrap-mode "$MODE" --repo-verify --repo-scan-only 2>&1); then
+    if grep -q "repo-verify PASS" <<<"$OUT"; then
+      echo "PASS  --wrap-mode $MODE — $(grep 'repo-verify PASS' <<<"$OUT" | head -1)"
+    else
+      echo "FAIL  --wrap-mode $MODE — ran clean but printed no repo-verify PASS line"
+      echo "$OUT" | tail -4; FAIL=1
+    fi
+  else
+    echo "FAIL  --wrap-mode $MODE — the two FFI strategies disagree:"
+    echo "$OUT" | tail -6; FAIL=1
   fi
 done
 

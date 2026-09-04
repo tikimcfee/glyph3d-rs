@@ -286,7 +286,112 @@ That is pagination correctly following the mode, not a divergence.
 The whole repo field shrinks accordingly: `369x382` under `--wrap-mode down`,
 `255x326` under `--wrap-mode back` (`--repo-scan-only`, same three files).
 
+## The FFI seam, after a failure this change caused
+
+`--repo-verify` failed on this branch in the DEFAULT mode and nothing in
+`check-all.sh` ran it. Both halves of that sentence needed fixing.
+
+### Root cause: an arity change in a positional argument list, plus a stale dylib
+
+`glyph_engine_load_item` took its twenty params **positionally**. Adding `wrap_mode`
+between `wrap_width` and `has_page` shifts every argument after it by a register on
+the caller's side. A binary built against the new signature, linked against a dylib
+built from the old source, therefore hands `wrap_mode` to `has_page`, `has_page` to
+`page_rows`, and so on — so `has_page` arrives as 0 and **pagination silently switches
+off**, while the batched path, which marshals a 128 B descriptor block rather than
+registers, stays correct. That asymmetry is exactly what `--repo-verify` reported:
+
+    repo-verify FAIL: item 2 placement differs
+      per-item: page { right: 19.07, bottom:  -373.75 }   <- unpaginated
+      batched:  page { right: 64.15, bottom:  -158.75 }   <- correct
+
+**`cargo build` does not build the dylib.** `native/build.rs` links whatever
+`pixi run build-engine` last produced, which is why `check-all`'s gate 0 rebuilds it
+first. So a stale dylib is a normal state of this tree, not an exotic one, and an
+ad-hoc `cargo build && ./glyph3d-native ...` reaches it easily.
+
+Reproduced deliberately (build `ffi.mojo` at its pre-`wrap_mode` arity, leave the Rust
+side alone) and it matches the report exactly — same item index, same shape — plus two
+symptoms that were reported separately and turn out to be the same cause:
+
+| symptom | stale dylib | rebuilt |
+|---|---|---|
+| `--repo-verify` | FAIL, item 2 placement differs | PASS, 407,451 records bit-exact |
+| `--pick-col 22000` on `one-long-line.txt`, mode back | clamps to `col 99` | resolves `col 22000` |
+| pick oracle's fold cross-check | **FAIL (43,901 of 44,001)** | PASS (0 mismatch) |
+
+### The fix: one marshalling format, so the failure class is gone
+
+Detecting this turned out to be harder than removing it, and **two guards were written,
+measured useless, and thrown away** before the third — that is the part worth keeping:
+
+1. A separate `glyph_engine_abi_probe()` returning a packed constant. **Green under the
+   stale dylib**: its numbers were hand-written declarations, not consequences of the
+   signature, so deleting a parameter left it still reporting the old shape. A guard
+   built on a declaration is worth what the declaration is worth.
+2. The same shape word as the **last positional parameter**, on the theory that an arity
+   change would misalign it. **Also green, measured** — instrumenting the stale callee
+   printed `abi_shape got 268896010 want 268896010` while `has_page` got 0 and
+   `page_rows` got 1. The shift was consumed among the register-passed ints in the
+   *middle* of the list and never reached the tail. A positional list cannot
+   self-describe: a sentinel is either before the insertion point, where it never moves,
+   or after it, where it may not either.
+
+So the per-item entry stopped being positional. `glyph_engine_load_item_desc`
+(`engine/ffi.mojo:203`) takes the **same 128 B descriptor** the batched entry takes,
+both deserialize through one `_item_from_desc` (`engine/ffi.mojo:160`), and Rust's
+`Engine::load_item` (`native/src/engine.rs:252`) marshals it with the same
+`write_item_desc` the batched path uses. Consequences:
+
+- A new item field takes descriptor **pad**; it can never shift an argument again.
+- Two readers of the item params became one, and two readers is precisely how the
+  strategies get to disagree about a field.
+- Both strategies now exercise `write_item_desc`, so `--repo-verify` cross-checks the
+  descriptor round-trip as well as the fold.
+- The block carries `ABI_SHAPE` at a **fixed offset** (108, the remaining pad), which
+  cannot shift by construction. A dylib expecting a different descriptor shape refuses
+  the call with `GE_ABI_MISMATCH` and the remedy printed:
+  *"libglyph_engine.dylib expects a different descriptor shape than this binary writes
+  (shape word 0x8007 at offset 108). … Rebuild: pixi run build-engine"* — measured by
+  building the dylib with `ABI_DESC_I32S` at 6.
+- The entry point was **renamed**, so a dylib predating this change fails to **link**:
+  `Undefined symbols for architecture arm64`. A symbol that does not exist cannot be
+  called wrong. That is the strongest available outcome for the case that actually bit.
+
+`engine/ffi_selftest.mojo` builds its own descriptor now (`_desc_for`), deliberately as
+a third writer of the block: it exists to call the FFI as a foreign caller would, and a
+foreign caller marshals its own. It is **neither run nor compiled by `engine/check.sh`**
+— a third check nothing consults, noted here rather than fixed.
+
+### The gate: `--repo-verify` now runs, in both modes
+
+New **gate 8b** in `tools/check-all.sh`, on `fixtures/g-pick-repo` (5 files, 0.4 MB,
+407,451 records), `--wrap-mode down` and `--wrap-mode back`. **Measured cost: 0.04 s per
+mode**, so the full gated fixture is affordable and there is no case for a smaller input.
+
+Both modes, because the two paths could differ about `wrap_mode` specifically and mode A
+would never show it.
+
+Mutation-tested like the rest — `has_page` forced false in the per-item entry only,
+after the shared read, modelling exactly the class the gate exists for:
+
+| # | mutation | result |
+|---|---|---|
+| M21 | per-item entry zeroes `has_page`; batched path untouched | RED — gate 8b FAILS in **both** modes, "item 2 placement differs" |
+| M22 | dylib expects `ABI_DESC_I32S` 6, binary writes 7 | RED — `GE_ABI_MISMATCH` at the seam, naming the remedy |
+| M23 | dylib predates `glyph_engine_load_item_desc` | RED — **link failure**, `Undefined symbols for architecture arm64` |
+
+Edit landed and reverted-then-rebuilt for each, as with M1–M19.
+
+**Why nothing caught it originally**, which matters as much as the fix: `--repo-verify`
+was used as a mutation TARGET (M7) and never run clean on this branch. A mutation
+reddening a check proves the check works; it does not prove the check was consulted.
+That is the same family as the two holes closed here earlier — `fixture_census` and
+`fixture_manifest` were made instruments that *run* for exactly this reason, and
+`engine/check.sh`'s header already said an instrument nothing runs is an absent one.
+
 ## Gates
 
 `tools/check-all.sh`: **ALL GATES GREEN**, including gate 1b (25 fixtures deleted and
-rebuilt byte-identically) and the four byte-equal screenshots. No baseline moved.
+rebuilt byte-identically), the new gate 8b (`--repo-verify` bit-exact in both wrap
+modes) and the four byte-equal screenshots. No baseline moved.

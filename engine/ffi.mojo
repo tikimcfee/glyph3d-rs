@@ -60,6 +60,54 @@ comptime GE_NULL_HANDLE: c_int = 1
 comptime GE_NO_TRIE: c_int = 2
 comptime GE_RAISED: c_int = 3
 comptime GE_EMPTY: c_int = 4
+comptime GE_ABI_MISMATCH: c_int = 9
+"""The descriptor carries a shape word this dylib does not recognise — the caller
+was built against a different FFI surface. See ABI_SHAPE."""
+
+
+# ── ONE MARSHALLING FORMAT, AND WHY ──────────────────────────────────────────
+#
+# `glyph_engine_load_item` used to take its 20 params POSITIONALLY. Adding one —
+# `wrap_mode`, 2026-09-04 — shifts every argument after it by a register on the
+# caller's side, so a binary built against the new signature and linked against a
+# dylib built from the old source handed `wrap_mode` to `has_page`, `has_page` to
+# `page_rows`, and so on. Pagination silently switched OFF and every paged item
+# laid out somewhere else.
+#
+# THAT IS NOT AN EXOTIC STATE. `cargo build` does not build this dylib —
+# native/build.rs says in as many words that it is built outside cargo, by
+# `pixi run build-engine` — so a stale dylib is a normal condition of the tree.
+# check-all's gate 0 rebuilds it for exactly this reason; an ad-hoc
+# `cargo build && ./glyph3d-native ...` does not. Measured 2026-09-04 by building
+# this file at its pre-wrap-mode arity and leaving the Rust side alone:
+# `--repo-verify` reported "item 2 placement differs", the per-item path
+# unpaginated at ~58,000 rows against the batched path's 127, and the pick
+# oracle's fold cross-check failed on 43,901 of 44,001 records. Loud symptoms,
+# silent cause, all far from the seam that produced them.
+#
+# TWO GUARDS WERE TRIED AND MEASURED USELESS BEFORE THIS ONE, which is the part
+# worth keeping:
+#   1. a separate `glyph_engine_abi_probe()` returning a hand-written constant —
+#      green under the stale dylib, because its numbers were declarations rather
+#      than consequences of the signature;
+#   2. a shape word as the LAST positional parameter, on the theory that an arity
+#      change would misalign it — also green, measured: the shift was consumed
+#      among the register-passed ints in the MIDDLE of the list and the trailing
+#      argument still arrived intact (`abi_shape got 268896010 want 268896010`
+#      while `has_page` got 0 and `page_rows` got 1).
+# A positional argument list cannot self-describe. A sentinel is either before the
+# insertion point, where it never moves, or after it, where it may not either.
+#
+# So the per-item entry stopped being positional. Both load entries now marshal
+# the SAME 128 B descriptor block, and a new field can never shift an argument
+# again — it takes pad. The block carries ABI_SHAPE at a FIXED offset (108), which
+# cannot shift by construction, and the entry point was RENAMED
+# (`glyph_engine_load_item_desc`) so a dylib predating this change fails to LINK
+# rather than being miscalled: a symbol that does not exist cannot be called wrong.
+comptime ABI_DESC_BYTES: Int = 128             # the descriptor block, both entries
+comptime ABI_DESC_I32S: Int = 7                # i32 params inside that block
+comptime ABI_SHAPE_OFFSET: Int = 108           # byte offset of the shape word
+comptime ABI_SHAPE: Int = (ABI_DESC_BYTES << 8) | ABI_DESC_I32S
 
 
 def _state(h: Handle) -> Pointer[EngineState, MutUntrackedOrigin]:
@@ -109,32 +157,63 @@ def glyph_engine_load_trie_file(
         return GE_RAISED
 
 
-@export("glyph_engine_load_item")
-def glyph_engine_load_item(
+def _item_from_desc(
+    base: Pointer[UInt8, MutUntrackedOrigin], byte_start: Int, byte_count: Int
+) -> Item:
+    """Deserialize ONE 128 B descriptor block into an Item.
+
+    THE ONLY PLACE either entry point reads item params from. Two readers is how
+    the per-item and batched paths get to disagree about a field, which is what
+    `--repo-verify` exists to catch and what it did catch on 2026-09-04."""
+    var f64s = base.unsafe_bitcast[Float64]()
+    var i32s = base.unsafe_bitcast[Int32]()
+    var it = Item()
+    it.origin_x = f64s[unsafe_offset = 0]
+    it.origin_y = f64s[unsafe_offset = 1]
+    it.origin_z = f64s[unsafe_offset = 2]
+    it.line_height = f64s[unsafe_offset = 3]
+    it.z_step = f64s[unsafe_offset = 4]
+    it.page_gap_x = f64s[unsafe_offset = 5]
+    it.band_stride_y = f64s[unsafe_offset = 6]
+    it.depth_per_band = f64s[unsafe_offset = 7]
+    it.depth_per_col = f64s[unsafe_offset = 8]
+    it.page_line_height = f64s[unsafe_offset = 9]
+    it.wrap_width = Int(i32s[unsafe_offset = 20])
+    it.has_page = i32s[unsafe_offset = 21] != 0
+    it.page_rows = Int(i32s[unsafe_offset = 22])
+    it.page_cols = Int(i32s[unsafe_offset = 23])
+    it.scroll_rows = Int(i32s[unsafe_offset = 24])
+    it.pages_wide = Int(i32s[unsafe_offset = 25])
+    it.wrap_mode = Int(i32s[unsafe_offset = 26])  # offset 104
+    it.byte_start = byte_start
+    it.byte_count = byte_count
+    return it^
+
+
+def _desc_shape_ok(base: Pointer[UInt8, MutUntrackedOrigin]) -> Bool:
+    """The shape word at a FIXED offset — it cannot shift, which is the whole
+    point after two guards that could."""
+    return (
+        Int(base.unsafe_bitcast[Int32]()[unsafe_offset = ABI_SHAPE_OFFSET // 4])
+        == ABI_SHAPE
+    )
+
+
+@export("glyph_engine_load_item_desc")
+def glyph_engine_load_item_desc(
     h: Handle,
     bytes_ptr: Pointer[UInt8, MutUntrackedOrigin],
     byte_len: c_size_t,
-    origin_x: c_double,
-    origin_y: c_double,
-    origin_z: c_double,
-    line_height: c_double,
-    z_step: c_double,
-    wrap_width: c_int,
-    wrap_mode: c_int,
-    has_page: c_int,
-    page_rows: c_int,
-    page_cols: c_int,
-    scroll_rows: c_int,
-    pages_wide: c_int,
-    page_gap_x: c_double,
-    band_stride_y: c_double,
-    depth_per_band: c_double,
-    depth_per_col: c_double,
-    page_line_height: c_double,
+    desc_ptr: Pointer[UInt8, MutUntrackedOrigin],
 ) abi("C") -> c_int:
     """Run decode → fold → paginate → compact for ONE item (one text file).
-    Results are kept in the handle as 32 B wire records; retrieve with
-    glyph_engine_slot_count / glyph_engine_copy_slots."""
+
+    Params arrive in the SAME 128 B descriptor block the batched entry takes —
+    see the ONE MARSHALLING FORMAT note above for why this stopped being a
+    twenty-argument positional call. Results are kept in the handle as 32 B wire
+    records; retrieve with glyph_engine_slot_count / glyph_engine_copy_slots."""
+    if not _desc_shape_ok(desc_ptr):
+        return GE_ABI_MISMATCH
     initialize_runtime()  # idempotent; guards against free/new reordering
     var s = _state(h)
     if not s[].has_trie:
@@ -146,28 +225,8 @@ def glyph_engine_load_item(
         s[].leaders = 0
         return GE_EMPTY
 
-    var it = Item()
-    it.byte_start = 0
-    it.byte_count = n
-    it.origin_x = origin_x
-    it.origin_y = origin_y
-    it.origin_z = origin_z
-    it.line_height = line_height
-    it.z_step = z_step
-    it.wrap_width = Int(wrap_width)
-    it.wrap_mode = Int(wrap_mode)
-    it.has_page = has_page != 0
-    it.page_rows = Int(page_rows)
-    it.page_cols = Int(page_cols)
-    it.scroll_rows = Int(scroll_rows)
-    it.pages_wide = Int(pages_wide)
-    it.page_gap_x = page_gap_x
-    it.band_stride_y = band_stride_y
-    it.depth_per_band = depth_per_band
-    it.depth_per_col = depth_per_col
-    it.page_line_height = page_line_height
     var items = List[Item]()
-    items.append(it^)
+    items.append(_item_from_desc(desc_ptr, 0, n))
 
     # The span borrows the CALLER's buffer; run_pipeline only reads it, and the
     # Rust side holds the Vec alive for the whole call.
@@ -198,7 +257,8 @@ def glyph_engine_load_item(
 #            page_line_height
 #   80..108  SEVEN i32: wrap_width, has_page, page_rows, page_cols,
 #            scroll_rows, pages_wide, wrap_mode
-#   108..112 pad
+#   108      u32 ABI_SHAPE — a FIXED-offset shape word; it cannot shift, unlike
+#            a positional sentinel (two of which were measured useless first)
 #
 # The wrap mode landed in the pad rather than growing the block: 10 f64 +
 # 7 i32 + 2 u64 is 124 B, so ITEM_DESC_SIZE stays 128 and the Rust side's
@@ -210,7 +270,7 @@ def glyph_engine_load_item(
 # documented requirement). Per-item ordinals stay per item, so the 2^24-byte
 # ordinal wall remains a PER-ITEM bound, not a per-blob one.
 
-comptime ITEM_DESC_SIZE: Int = 128
+comptime ITEM_DESC_SIZE: Int = ABI_DESC_BYTES
 
 
 @export("glyph_engine_load_items")
@@ -225,6 +285,13 @@ def glyph_engine_load_items(
     """Run decode → fold → paginate → compact for N items in ONE call.
     counts_out receives item_count u64s: records (= leaders) per item, in
     descriptor order. Retrieve the stream with glyph_engine_copy_slots."""
+    # Same fixed-offset shape word as the per-item entry, read from the FIRST
+    # descriptor. The batched path was immune to the arity shift that broke the
+    # other one — it always marshalled a block — and that asymmetry is what made
+    # the failure look like a layout bug: the two strategies disagreed because
+    # one of them was fine.
+    if item_count > 0 and not _desc_shape_ok(desc_ptr):
+        return GE_ABI_MISMATCH
     initialize_runtime()
     var s = _state(h)
     if not s[].has_trie:
@@ -240,30 +307,14 @@ def glyph_engine_load_items(
     var items = List[Item]()
     for i in range(m):
         var base = desc_ptr.unsafe_offset(i * ITEM_DESC_SIZE)
-        var f64s = base.unsafe_bitcast[Float64]()
-        var i32s = base.unsafe_bitcast[Int32]()
         var u64s = base.unsafe_bitcast[UInt64]()
-        var it = Item()
-        it.origin_x = f64s[unsafe_offset = 0]
-        it.origin_y = f64s[unsafe_offset = 1]
-        it.origin_z = f64s[unsafe_offset = 2]
-        it.line_height = f64s[unsafe_offset = 3]
-        it.z_step = f64s[unsafe_offset = 4]
-        it.page_gap_x = f64s[unsafe_offset = 5]
-        it.band_stride_y = f64s[unsafe_offset = 6]
-        it.depth_per_band = f64s[unsafe_offset = 7]
-        it.depth_per_col = f64s[unsafe_offset = 8]
-        it.page_line_height = f64s[unsafe_offset = 9]
-        it.wrap_width = Int(i32s[unsafe_offset = 20])
-        it.has_page = i32s[unsafe_offset = 21] != 0
-        it.page_rows = Int(i32s[unsafe_offset = 22])
-        it.page_cols = Int(i32s[unsafe_offset = 23])
-        it.scroll_rows = Int(i32s[unsafe_offset = 24])
-        it.pages_wide = Int(i32s[unsafe_offset = 25])
-        it.wrap_mode = Int(i32s[unsafe_offset = 26])  # offset 104
-        it.byte_start = Int(u64s[unsafe_offset = 14])  # offset 112
-        it.byte_count = Int(u64s[unsafe_offset = 15])  # offset 120
-        items.append(it^)
+        items.append(
+            _item_from_desc(
+                base,
+                Int(u64s[unsafe_offset = 14]),  # offset 112
+                Int(u64s[unsafe_offset = 15]),  # offset 120
+            )
+        )
 
     var span = Span[UInt8, ImmUntrackedOrigin](unsafe_ptr=blob_ptr, length=n)
     var r = run_pipeline[witness=False](span, s[].trie, items)

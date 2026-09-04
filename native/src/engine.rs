@@ -29,6 +29,9 @@ pub const MOJO_BACKEND: &str = "mojo";
 const GE_OK: i32 = 0;
 const GE_NO_TRIE: i32 = 2;
 const GE_EMPTY: i32 = 4;
+/// The descriptor's shape word is not the one this dylib expects — the .dylib on
+/// disk was built from different source than this binary was compiled against.
+const GE_ABI_MISMATCH: i32 = 9;
 
 extern "C" {
     fn glyph_engine_new() -> *mut c_void;
@@ -38,28 +41,18 @@ extern "C" {
         path_ptr: *const u8,
         path_len: usize,
     ) -> i32;
-    #[allow(clippy::too_many_arguments)]
-    fn glyph_engine_load_item(
+    // ONE MARSHALLING FORMAT. This used to be a twenty-argument positional call,
+    // and adding `wrap_mode` to it shifted every argument after it for any caller
+    // linked against a dylib built from older source — silently, into a layout
+    // that looked plausible. See ffi.mojo's ONE MARSHALLING FORMAT note for the
+    // measurement and for the two guards that were tried and did not work.
+    // Renamed on purpose: a stale dylib now fails to LINK rather than being
+    // miscalled.
+    fn glyph_engine_load_item_desc(
         handle: *mut c_void,
         bytes_ptr: *const u8,
         byte_len: usize,
-        origin_x: f64,
-        origin_y: f64,
-        origin_z: f64,
-        line_height: f64,
-        z_step: f64,
-        wrap_width: i32,
-        wrap_mode: i32,
-        has_page: i32,
-        page_rows: i32,
-        page_cols: i32,
-        scroll_rows: i32,
-        pages_wide: i32,
-        page_gap_x: f64,
-        band_stride_y: f64,
-        depth_per_band: f64,
-        depth_per_col: f64,
-        page_line_height: f64,
+        desc_ptr: *const u8,
     ) -> i32;
     fn glyph_engine_fp_probe(a: f32, b: f32, c: f32) -> u32;
     fn glyph_engine_slot_count(handle: *mut c_void) -> u64;
@@ -78,8 +71,25 @@ extern "C" {
     ) -> i32;
 }
 
-/// Byte size of one batch item descriptor (see ffi.mojo's layout comment).
+/// Byte size of one item descriptor (see ffi.mojo's layout comment). BOTH load
+/// entries take one of these; there is no positional form any more.
 pub const ITEM_DESC_SIZE: usize = 128;
+
+/// How many i32 params ride inside the descriptor. Asserted against the actual
+/// array in `write_item_desc`, so the constant cannot drift from the code.
+pub const DESC_I32_COUNT: usize = 7;
+
+/// Byte offset of the descriptor's shape word. FIXED, and that is the point: a
+/// sentinel in a positional argument list can be shifted out of alignment (and
+/// was, measurably — ffi.mojo has the numbers); one at a fixed offset in a
+/// fixed-size block cannot.
+const ABI_SHAPE_OFFSET: usize = 108;
+
+/// The shape word itself, computed from THIS side's declarations. A dylib built
+/// from different source computes a different one and refuses the call.
+const fn abi_shape() -> u32 {
+    ((ITEM_DESC_SIZE as u32) << 8) | DESC_I32_COUNT as u32
+}
 
 /// Serialize one item's params + byte range into a 128 B descriptor block.
 /// Explicit offsets — shared verbatim with the Mojo side, no repr(C) guessing.
@@ -124,6 +134,15 @@ pub fn write_item_desc(block: &mut [u8], params: &ItemParams, byte_start: u64, b
     for (i, v) in i32s.iter().enumerate() {
         block[80 + i * 4..84 + i * 4].copy_from_slice(&v.to_le_bytes());
     }
+    // And the count the shape word reports must be THIS array's length, not a
+    // second opinion about it.
+    assert_eq!(
+        i32s.len(),
+        DESC_I32_COUNT,
+        "DESC_I32_COUNT is out of step with write_item_desc"
+    );
+    block[ABI_SHAPE_OFFSET..ABI_SHAPE_OFFSET + 4]
+        .copy_from_slice(&abi_shape().to_le_bytes());
     block[112..120].copy_from_slice(&byte_start.to_le_bytes());
     block[120..128].copy_from_slice(&byte_count.to_le_bytes());
 }
@@ -167,6 +186,22 @@ fn assert_fp_contract_off() {
     );
 }
 
+/// Name the stale side when the dylib and this binary disagree about the FFI.
+///
+/// `GE_ABI_MISMATCH` is the one status that is never the caller's data's fault:
+/// the .dylib on disk was built from different source than this binary was
+/// compiled against. That is a NORMAL state of this tree — `cargo build` does not
+/// build the dylib (`native/build.rs` links whatever `pixi run build-engine` last
+/// produced) — so it gets the remedy printed with it.
+fn abi_mismatch_message(what: &str) -> String {
+    format!(
+        "{what}: libglyph_engine.dylib expects a different descriptor shape than \
+         this binary writes (shape word {:#06x} at offset {ABI_SHAPE_OFFSET}).\n\
+         The dylib is not built by cargo and is stale. Rebuild:  pixi run build-engine",
+        abi_shape()
+    )
+}
+
 /// A live engine handle. NOT Send/Sync: the Mojo runtime shards work onto its
 /// own thread pool, but the handle itself is plain mutable state — keep it on
 /// one thread (Stage E concern if we ever want N handles).
@@ -208,30 +243,24 @@ impl Engine {
 
     /// Run the pipeline for one text file. Results stay in the handle until
     /// the next load; pull them with [`Engine::records`].
+    ///
+    /// Marshals the SAME 128 B descriptor the batched entry takes. It used to
+    /// pass twenty positional arguments, and `wrap_mode` landing in the middle of
+    /// them is what broke `--repo-verify` on 2026-09-04 against a stale dylib.
+    /// One format means a new field takes descriptor pad instead of shifting a
+    /// register, and means both strategies exercise `write_item_desc`.
     pub fn load_item(&mut self, bytes: &[u8], params: &ItemParams) -> Result<u64, LayoutError> {
         params.validate(0)?;
+        // Vec<u64> backing keeps the block 8-byte aligned, as in `load_items`.
+        let mut desc_words = vec![0u64; ITEM_DESC_SIZE / 8];
+        let desc_bytes: &mut [u8] = bytemuck::cast_slice_mut(&mut desc_words);
+        write_item_desc(desc_bytes, params, 0, bytes.len() as u64);
         let status = unsafe {
-            glyph_engine_load_item(
+            glyph_engine_load_item_desc(
                 self.handle,
                 bytes.as_ptr(),
                 bytes.len(),
-                params.origin_x,
-                params.origin_y,
-                params.origin_z,
-                params.line_height,
-                params.z_step,
-                params.wrap_width,
-                params.wrap_mode.code() as i32,
-                params.has_page as i32,
-                params.page_rows,
-                params.page_cols,
-                params.scroll_rows,
-                params.pages_wide,
-                params.page_gap_x,
-                params.band_stride_y,
-                params.depth_per_band,
-                params.depth_per_col,
-                params.page_line_height,
+                desc_bytes.as_ptr(),
             )
         };
         match status {
@@ -240,9 +269,11 @@ impl Engine {
                 backend: MOJO_BACKEND,
                 status: s,
                 what: if s == GE_NO_TRIE {
-                    "glyph_engine_load_item (no trie loaded)".to_string()
+                    "glyph_engine_load_item_desc (no trie loaded)".to_string()
+                } else if s == GE_ABI_MISMATCH {
+                    abi_mismatch_message("glyph_engine_load_item_desc")
                 } else {
-                    "glyph_engine_load_item".to_string()
+                    "glyph_engine_load_item_desc".to_string()
                 },
             }),
         }
@@ -292,6 +323,8 @@ impl Engine {
                 status: s,
                 what: if s == GE_NO_TRIE {
                     "glyph_engine_load_items (no trie loaded)".to_string()
+                } else if s == GE_ABI_MISMATCH {
+                    abi_mismatch_message("glyph_engine_load_items")
                 } else {
                     "glyph_engine_load_items".to_string()
                 },

@@ -19,14 +19,52 @@ from std.time import perf_counter_ns
 
 from ffi import (
     glyph_engine_new, glyph_engine_free, glyph_engine_load_trie_file,
-    glyph_engine_load_item, glyph_engine_slot_count, glyph_engine_copy_slots,
+    glyph_engine_load_item_desc, glyph_engine_slot_count, glyph_engine_copy_slots,
+    ITEM_DESC_SIZE, ABI_SHAPE, ABI_SHAPE_OFFSET,
 )
-from glyph_pipeline import F_LEADER
+from glyph_pipeline import F_LEADER, Item
 from glyph_schema import (
     FIXTURE_MEASURE_STRIDE, FIXTURE_COUNT_STRIDE,
     FIX_M_X, FIX_M_ADVANCE, FIX_M_GLYPH_ID, FIX_C_ROW, FIX_C_COL, FIX_C_FLAGS,
 )
 from fixture_io import load_pipe_fixture
+
+
+def _desc_for(it: Item, byte_count: Int) -> List[UInt8]:
+    """Serialize one Item into the 128 B descriptor both load entries take.
+
+    A THIRD writer of this block, and that is a real cost — native/src/engine.rs's
+    `write_item_desc` is the one the product uses. It is here because this suite
+    exists to call the FFI the way a foreign caller would, and a foreign caller
+    marshals its own block. If the layout moves, this must move with it; the
+    shape word at ABI_SHAPE_OFFSET is what refuses the call if it does not."""
+    var d = List[UInt8](unsafe_uninit_length=ITEM_DESC_SIZE)
+    for i in range(ITEM_DESC_SIZE):
+        d[i] = 0
+    var f64s = d.unsafe_ptr().unsafe_bitcast[Float64]()
+    var i32s = d.unsafe_ptr().unsafe_bitcast[Int32]()
+    var u64s = d.unsafe_ptr().unsafe_bitcast[UInt64]()
+    f64s[unsafe_offset = 0] = it.origin_x
+    f64s[unsafe_offset = 1] = it.origin_y
+    f64s[unsafe_offset = 2] = it.origin_z
+    f64s[unsafe_offset = 3] = it.line_height
+    f64s[unsafe_offset = 4] = it.z_step
+    f64s[unsafe_offset = 5] = it.page_gap_x
+    f64s[unsafe_offset = 6] = it.band_stride_y
+    f64s[unsafe_offset = 7] = it.depth_per_band
+    f64s[unsafe_offset = 8] = it.depth_per_col
+    f64s[unsafe_offset = 9] = it.page_line_height
+    i32s[unsafe_offset = 20] = Int32(it.wrap_width)
+    i32s[unsafe_offset = 21] = Int32(1 if it.has_page else 0)
+    i32s[unsafe_offset = 22] = Int32(it.page_rows)
+    i32s[unsafe_offset = 23] = Int32(it.page_cols)
+    i32s[unsafe_offset = 24] = Int32(it.scroll_rows)
+    i32s[unsafe_offset = 25] = Int32(it.pages_wide)
+    i32s[unsafe_offset = 26] = Int32(it.wrap_mode)
+    i32s[unsafe_offset = ABI_SHAPE_OFFSET // 4] = Int32(ABI_SHAPE)
+    u64s[unsafe_offset = 14] = UInt64(0)
+    u64s[unsafe_offset = 15] = UInt64(byte_count)
+    return d^
 
 
 def _mut[T: AnyType, o: Origin, //](p: Pointer[T, o]) -> Pointer[T, MutUntrackedOrigin]:
@@ -49,15 +87,9 @@ def check_fixture(path: String) raises -> Int:
         glyph_engine_free(h)
         return 1
 
-    st = glyph_engine_load_item(
-        h, _mut(fx.bytes.unsafe_ptr()), UInt(len(fx.bytes)),
-        it.origin_x, it.origin_y, it.origin_z,
-        it.line_height, it.z_step,
-        Int32(it.wrap_width), Int32(it.wrap_mode), Int32(1 if it.has_page else 0),
-        Int32(it.page_rows), Int32(it.page_cols), Int32(it.scroll_rows),
-        Int32(it.pages_wide),
-        it.page_gap_x, it.band_stride_y, it.depth_per_band, it.depth_per_col,
-        it.page_line_height,
+    var desc_a = _desc_for(it, len(fx.bytes))
+    st = glyph_engine_load_item_desc(
+        h, _mut(fx.bytes.unsafe_ptr()), UInt(len(fx.bytes)), _mut(desc_a.unsafe_ptr())
     )
     if st != 0:
         print("FAIL ", path, ": load_item status", st)
@@ -148,17 +180,12 @@ def main() raises:
         _ = glyph_engine_load_trie_file(h, _mut(path.unsafe_ptr()), UInt(path.byte_length()))
         var cap = fx.byte_len  # leaders <= bytes
         var buf = List[UInt32](unsafe_uninit_length=cap * 8)
+        var desc_b = _desc_for(it, len(fx.bytes))
         var t0 = perf_counter_ns()
         for i in range(1000):
-            var st = glyph_engine_load_item(
+            var st = glyph_engine_load_item_desc(
                 h, _mut(fx.bytes.unsafe_ptr()), UInt(len(fx.bytes)),
-                it.origin_x, it.origin_y, it.origin_z,
-                it.line_height, it.z_step,
-                Int32(it.wrap_width), Int32(it.wrap_mode), Int32(1 if it.has_page else 0),
-                Int32(it.page_rows), Int32(it.page_cols), Int32(it.scroll_rows),
-                Int32(it.pages_wide),
-                it.page_gap_x, it.band_stride_y, it.depth_per_band,
-                it.depth_per_col, it.page_line_height,
+                _mut(desc_b.unsafe_ptr()),
             )
             if st != 0:
                 print("FAIL stress iter", i, "status", st)
