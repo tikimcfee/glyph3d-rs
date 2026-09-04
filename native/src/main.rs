@@ -73,7 +73,23 @@ pub enum SceneChoice {
         batch: bool,
         verify: bool,
         focus: Option<String>,
+        /// How a wrap is spent. `Down` is the default and the four screenshot
+        /// baselines are gated on it staying that way.
+        wrap_mode: fold::WrapMode,
     },
+}
+
+/// `--wrap-mode` -> the layout parameter. clap's `value_parser` has already
+/// refused anything that is not one of the two spellings, so an unknown value
+/// here is a bug in this function rather than in the caller's command line —
+/// which is why it panics instead of falling back to the default. A silent
+/// fallback would render mode A while the operator believed they asked for B.
+fn parse_wrap_mode(s: &str) -> fold::WrapMode {
+    match s {
+        "down" => fold::WrapMode::Down,
+        "back" => fold::WrapMode::Back,
+        other => panic!("--wrap-mode: unknown mode {other:?} (clap should have refused it)"),
+    }
 }
 
 /// The atlas directory shared by every mode (`<crate>/../assets/atlas`).
@@ -219,8 +235,9 @@ fn build_scene_impl(
             batch,
             verify,
             focus,
+            wrap_mode,
         } => {
-            let params = repo::RepoParams::default();
+            let params = repo::RepoParams { wrap_mode: *wrap_mode, ..Default::default() };
             let load = repo::load_repo(dir, &default_engine_trie(), &params, *batch, *verify);
             load.print_stats();
             let atlas = atlas::Atlas::load(ctx);
@@ -336,6 +353,12 @@ struct Cli {
     /// Stage E2: diff batch vs naive bit-exact over the whole repo
     #[arg(long)]
     repo_verify: bool,
+    /// How a wrap is spent on a repo load: `down` advances the visual row (the
+    /// default, and what the byte-equal screenshot baselines are taken under),
+    /// `back` keeps the row and steps the segment back in depth instead — one
+    /// row per source line however long it is.
+    #[arg(long, value_name = "MODE", default_value = "down", value_parser = ["down", "back"])]
+    wrap_mode: String,
     /// Stage E2: frame the first file whose path contains SUBSTR
     #[arg(long, value_name = "SUBSTR")]
     focus_file: Option<String>,
@@ -970,7 +993,7 @@ fn main() {
     // Stage E2 scan-only: full load pipeline without a GPU (measurement path).
     if cli.repo_scan_only {
         let dir = cli.load_repo.as_ref().expect("--repo-scan-only needs --load-repo");
-        let params = repo::RepoParams::default();
+        let params = repo::RepoParams { wrap_mode: parse_wrap_mode(&cli.wrap_mode), ..Default::default() };
         let load = repo::load_repo(
             dir,
             &default_engine_trie(),
@@ -990,6 +1013,7 @@ fn main() {
             batch: cli.repo_engine == "batch",
             verify: cli.repo_verify,
             focus: cli.focus_file.clone(),
+            wrap_mode: parse_wrap_mode(&cli.wrap_mode),
         }
     } else if let Some(file) = &cli.engine_render {
         let trie = cli.engine_trie.unwrap_or_else(default_engine_trie);
@@ -1054,6 +1078,11 @@ mod cli_tests {
         assert!(cli.engine_render.is_none());
         assert!(cli.load_repo.is_none());
         assert_eq!(cli.repo_engine, "naive");
+        // THE DEFAULT THE SCREENSHOT BASELINES DEPEND ON. A change here moves
+        // repo-wide.png and repo-zoom.png, so it is pinned in the CLI layer too
+        // and not only in RepoParams::default.
+        assert_eq!(cli.wrap_mode, "down");
+        assert_eq!(parse_wrap_mode(&cli.wrap_mode), fold::WrapMode::Down);
         assert!(!cli.repo_verify);
         assert!(cli.focus_file.is_none());
         assert!(!cli.repo_scan_only);
@@ -1070,6 +1099,7 @@ mod cli_tests {
             "--screenshot", "out.png", "--frames", "2", "--demo", "--copies", "3", "--zoom",
             "2.5", "--no-cull", "--no-ui", "--engine-loop", "4", "--load-repo", "fixtures/g-pick-repo",
             "--repo-engine", "batch", "--repo-verify", "--focus-file", "alpha",
+            "--wrap-mode", "back",
             "--render-file", "src/main.rs", "--engine-file", "a.rs", "--engine-trie", "t.bin",
             "--engine-check", "b.rs", "--engine-render", "c.rs",
         ]);
@@ -1083,6 +1113,8 @@ mod cli_tests {
         assert_eq!(cli.engine_loop, 4);
         assert_eq!(cli.load_repo, Some(PathBuf::from("fixtures/g-pick-repo")));
         assert_eq!(cli.repo_engine, "batch");
+        assert_eq!(cli.wrap_mode, "back");
+        assert_eq!(parse_wrap_mode(&cli.wrap_mode), fold::WrapMode::Back);
         assert!(cli.repo_verify);
         assert_eq!(cli.focus_file.as_deref(), Some("alpha"));
         assert_eq!(cli.render_file, Some(PathBuf::from("src/main.rs")));
@@ -1090,6 +1122,18 @@ mod cli_tests {
         assert_eq!(cli.engine_trie, Some(PathBuf::from("t.bin")));
         assert_eq!(cli.engine_check, Some(PathBuf::from("b.rs")));
         assert_eq!(cli.engine_render, Some(PathBuf::from("c.rs")));
+    }
+
+    /// An unknown mode is REFUSED at the boundary, not folded to the default.
+    /// A silent fallback would lay out mode A while the operator asked for B,
+    /// and nothing downstream could tell them apart from a correct mode-A run.
+    #[test]
+    fn an_unknown_wrap_mode_is_refused() {
+        let text = match try_parse(&["--wrap-mode", "sideways"]) {
+            Ok(_) => panic!("clap must refuse an unknown wrap mode"),
+            Err(e) => e.to_string(),
+        };
+        assert!(text.contains("sideways"), "the error must name the bad value: {text}");
     }
 
     #[test]

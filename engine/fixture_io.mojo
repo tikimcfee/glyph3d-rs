@@ -8,7 +8,7 @@ from std.memory import bitcast
 # FIXTURE strides, not container strides: the on-disk format is frozen at 8+4
 # per byte regardless of how the engine lays its working buffers.
 from glyph_schema import FIXTURE_MEASURE_STRIDE, FIXTURE_COUNT_STRIDE
-from glyph_pipeline import Trie, Item, trunc_nonneg, BLOCK_SHIFT
+from glyph_pipeline import Trie, Item, trunc_nonneg, BLOCK_SHIFT, WRAP_DOWN, WRAP_BACK
 
 comptime PIPE_MAGIC = 0x46443347
 # NATIVE-PORT (Stage E1): the app's own trie blob — magic 'G3TR'. Spec: the
@@ -97,8 +97,8 @@ def load_pipe_fixture(path: String) raises -> PipeFixture:
 
     if Int(r.u32()) != PIPE_MAGIC:
         raise Error(path + ": bad magic (not a .pipe.bin fixture)")
-    if Int(r.u32()) != 3:
-        raise Error(path + ": unknown fixture version (expected v3 — regenerate)")
+    if Int(r.u32()) != 4:
+        raise Error(path + ": unknown fixture version (expected v4 — regenerate)")
 
     var fx = PipeFixture()
     fx.byte_len = Int(r.u32())
@@ -137,9 +137,20 @@ def load_pipe_fixture(path: String) raises -> PipeFixture:
         it.origin_x = r.f64()
         it.origin_y = r.f64()
         it.origin_z = r.f64()
-        # THE BOUNDARY: v2 carries item params as f64 VALUES; the five integer
+        # THE BOUNDARY: v2+ carries item params as f64 VALUES; the five integer
         # page-geometry params truncate HERE, once, instead of at every read.
         it.wrap_width = trunc_nonneg(r.f64())
+        # v4: the wrap MODE, beside the wrap because it is the same kind of
+        # parameter — item-level, never per line. Refused rather than defaulted:
+        # an out-of-range code is malformed input, and folding it to WRAP_DOWN is
+        # how a generator's typo becomes an invisible layout.
+        var mode_raw = r.f64()
+        it.wrap_mode = Int(mode_raw)
+        if it.wrap_mode != WRAP_DOWN and it.wrap_mode != WRAP_BACK:
+            raise Error(
+                path + ": wrap mode must be 0 (WrapDown) or 1 (WrapBack), got "
+                + String(mode_raw)
+            )
         it.z_step = r.f64()
         it.line_height = r.f64()
         it.has_page = r.f64() > 0.5

@@ -31,6 +31,7 @@ from glyph_pipeline import (
     trie_lookup_entry,
     rows_for_line,
     wrap_row_of,
+    WRAP_DOWN,
     decode_codepoint_at,
 )
 
@@ -58,6 +59,12 @@ struct ScanElem(Copyable, Movable):
     var tail_len: Int
     var tail_adv: Float32
     var wrap: Int
+    # The wrap MODE in force at the interval's right edge. It rides beside `wrap`
+    # for the same reason and with the same caveat: the junction term reads it off
+    # `b`, so combine is not associative across a change of it. TWO item-level
+    # parameters in that term now instead of one — the non-associative surface is
+    # WIDER than it was, not narrower.
+    var mode: Int
 
     def __init__(out self):
         self.reset = 0
@@ -68,6 +75,7 @@ struct ScanElem(Copyable, Movable):
         self.tail_len = 0
         self.tail_adv = 0
         self.wrap = 0
+        self.mode = WRAP_DOWN
 
 
 def scan_identity() -> ScanElem:
@@ -75,14 +83,20 @@ def scan_identity() -> ScanElem:
 
 
 def scan_leaf_value(
-    is_newline: Bool, advance: Float32, is_leader: Bool, wrap: Int, is_item_start: Bool
+    is_newline: Bool,
+    advance: Float32,
+    is_leader: Bool,
+    wrap: Int,
+    is_item_start: Bool,
+    mode: Int = WRAP_DOWN,
 ) -> ScanElem:
     """One byte's monoid element from its decoded facts alone."""
     var e = ScanElem()
     e.reset = 1 if is_item_start else 0
     e.wrap = wrap
+    e.mode = mode
     if not is_leader:
-        return e^  # continuation byte: reset/wrap only
+        return e^  # continuation byte: reset/wrap/mode only
     e.glyphs = 1
     if is_newline:
         e.nl = 1  # head/tail stay 0: the line it closes started before this interval
@@ -105,8 +119,10 @@ def scan_combine(mut a: ScanElem, b: ScanElem):
         a.tail_len = b.tail_len
         a.tail_adv = b.tail_adv
         a.wrap = b.wrap
+        a.mode = b.mode
         return
     a.wrap = b.wrap
+    a.mode = b.mode
     if b.nl == 0:
         a.tail_len += b.tail_len
         a.tail_adv = a.tail_adv + b.tail_adv
@@ -118,7 +134,7 @@ def scan_combine(mut a: ScanElem, b: ScanElem):
             a.rows = b.rows
         else:
             # The junction line: a's tail + b's head, closed by b's first newline.
-            a.rows += rows_for_line(a.tail_len + b.head_len, b.wrap) + b.rows
+            a.rows += rows_for_line(a.tail_len + b.head_len, b.wrap, b.mode) + b.rows
         a.tail_len = b.tail_len
         a.tail_adv = b.tail_adv
     a.nl += b.nl
@@ -138,7 +154,9 @@ struct Lanes(Copyable, Movable):
         self.ord = ord
 
 
-def lanes_from_prefix(p: ScanElem, wrap: Int, terminator: Bool = False) -> Lanes:
+def lanes_from_prefix(
+    p: ScanElem, wrap: Int, terminator: Bool = False, mode: Int = WRAP_DOWN
+) -> Lanes:
     """A leader's exact lanes from its exclusive prefix — the O(1) query.
 
     `terminator` is whether the byte being queried is itself a NEWLINE. It rides
@@ -150,8 +168,10 @@ def lanes_from_prefix(p: ScanElem, wrap: Int, terminator: Bool = False) -> Lanes
     0 and the two rules coincide; the apply kernel and the fixture query path
     pass the byte's real flag."""
     var col = p.tail_len
-    var closed = (rows_for_line(p.head_len, wrap) + p.rows) if p.nl > 0 else 0
-    return Lanes(closed + wrap_row_of(col, wrap, terminator), col, p.tail_adv, p.glyphs)
+    var closed = (rows_for_line(p.head_len, wrap, mode) + p.rows) if p.nl > 0 else 0
+    return Lanes(
+        closed + wrap_row_of(col, wrap, terminator, mode), col, p.tail_adv, p.glyphs
+    )
 
 
 def fold_bytes[o: ImmOrigin](
@@ -167,8 +187,11 @@ def fold_bytes[o: ImmOrigin](
             continue  # continuation byte: identity leaf (skipped, matching the oracle)
         var cp = decode_codepoint_at(bytes, id, n)
         var tb = trie_lookup_entry(trie, cp)
+        # THE BAKE FOLDS AT WRAP 0 AND MODE WRAP_DOWN, and both are inert there:
+        # at wrap 0 rows_for_line is 1 whatever the mode. Stated rather than
+        # defaulted, because a reader has to know the record is mode-free.
         var leaf = scan_leaf_value(
-            cp == NEWLINE, trie.advance_at(tb), True, 0, id == 0
+            cp == NEWLINE, trie.advance_at(tb), True, 0, id == 0, WRAP_DOWN
         )
         scan_combine(acc, leaf)
         id += 1
@@ -287,7 +310,7 @@ def bake_file[o: ImmOrigin](
         if cp == NEWLINE:
             hist[acc.tail_len] = hist.get(acc.tail_len, 0) + 1
 
-        var leaf = scan_leaf_value(cp == NEWLINE, advance, True, 0, id == 0)
+        var leaf = scan_leaf_value(cp == NEWLINE, advance, True, 0, id == 0, WRAP_DOWN)
         scan_combine(acc, leaf)
         id += 1
 
@@ -355,12 +378,18 @@ def prefix_at[o: ImmOrigin](
     return acc^
 
 
-def rows_under_wrap(record: BakeRecord, wrap: Int) -> Int:
-    """Exact visual rows under ANY wrap width, from the histogram + total summary."""
+def rows_under_wrap(record: BakeRecord, wrap: Int, mode: Int = WRAP_DOWN) -> Int:
+    """Exact visual rows under ANY wrap width AND mode, from the histogram + total
+    summary.
+
+    Under WRAP_BACK every line contributes exactly one row, so this counts LINES and
+    the histogram's lengths stop mattering. It still walks the histogram rather than
+    short-circuiting on the count: the per-line rule is one function, asked once per
+    line, and both answers fall out of the same loop."""
     var rows = 0
     var i = 0
     while i < len(record.hist_lens):
-        rows += rows_for_line(record.hist_lens[i], wrap) * record.hist_counts[i]
+        rows += rows_for_line(record.hist_lens[i], wrap, mode) * record.hist_counts[i]
         i += 1
     var tail = record.total.tail_len
     # The still-open final line. This USED to spell out `(tail - 1) // wrap + 1`
@@ -369,5 +398,5 @@ def rows_under_wrap(record: BakeRecord, wrap: Int) -> Int:
     # `rows_for_line` corrected the two are the same rule: a line covers the rows
     # its cells reach whether or not a newline closes it.
     if tail > 0:
-        rows += rows_for_line(tail, wrap)
+        rows += rows_for_line(tail, wrap, mode)
     return rows

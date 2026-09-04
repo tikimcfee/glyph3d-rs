@@ -58,7 +58,7 @@ import {
     SLOT_STRIDE, S_ADVANCE, S_ROW, S_COL, S_FLAGS, S_LINE_ADV, S_ORD,
     F_LEADER, F_NEWLINE, F_RENDERED,
     allocSlots, decodeAndResolve, itemForByte, rowsForLine, wrapRowOf, resolveX, paginate, assertLineHeight,
-    boundsReduce, deriveStride, normalizeItems, fbits, fval,
+    boundsReduce, deriveStride, normalizeItems, fbits, fval, normalizeWrapMode, WRAP_DOWN,
 } from './glyphPipelineReference.js';
 
 /** Chunk width: bytes folded serially per scan thread. */
@@ -68,7 +68,7 @@ export const GROUP_SIZE = 256;
 
 /** The monoid's identity — also the exclusive prefix of an item's first byte. */
 export function scanIdentity() {
-    return { reset: 0, nl: 0, glyphs: 0, rows: 0, headLen: 0, tailLen: 0, tailAdv: 0, wrap: 0 };
+    return { reset: 0, nl: 0, glyphs: 0, rows: 0, headLen: 0, tailLen: 0, tailAdv: 0, wrap: 0, mode: WRAP_DOWN };
 }
 
 /**
@@ -77,11 +77,12 @@ export function scanIdentity() {
  * never allocates slots) both build their leaves HERE, so the element can't drift.
  * `wrap` is the owning item's fold unit; `isItemStart` marks the absorbing reset.
  */
-export function scanLeafValue(isNewline, advance, isLeader, wrap, isItemStart) {
+export function scanLeafValue(isNewline, advance, isLeader, wrap, isItemStart, mode = WRAP_DOWN) {
     const e = scanIdentity();
     e.reset = isItemStart ? 1 : 0;
     e.wrap = wrap;
-    if (!isLeader) return e;                      // continuation byte: reset/wrap only
+    e.mode = mode;
+    if (!isLeader) return e;                      // continuation byte: reset/wrap/mode only
     e.glyphs = 1;
     if (isNewline) {
         e.nl = 1;                                 // head/tail stay 0: the line it closes
@@ -94,13 +95,13 @@ export function scanLeafValue(isNewline, advance, isLeader, wrap, isItemStart) {
 }
 
 /** The leaf for byte `id`, read from the decoded slots. */
-export function scanLeaf(slots, id, wrap, isItemStart) {
+export function scanLeaf(slots, id, wrap, isItemStart, mode = WRAP_DOWN) {
     const o = id * SLOT_STRIDE;
     return scanLeafValue(
         (slots[o + S_FLAGS] & F_NEWLINE) !== 0,
         fval(slots[o + S_ADVANCE]),
         (slots[o + S_FLAGS] & F_LEADER) !== 0,
-        wrap, isItemStart,
+        wrap, isItemStart, mode,
     );
 }
 
@@ -113,10 +114,11 @@ export function scanCombine(a, b) {
     if (b.reset) {
         a.reset = 1; a.nl = b.nl; a.glyphs = b.glyphs; a.rows = b.rows;
         a.headLen = b.headLen; a.tailLen = b.tailLen; a.tailAdv = b.tailAdv;
-        a.wrap = b.wrap;
+        a.wrap = b.wrap; a.mode = b.mode;
         return a;
     }
     a.wrap = b.wrap;
+    a.mode = b.mode;
     if (b.nl === 0) {
         a.tailLen += b.tailLen;
         a.tailAdv = Math.fround(a.tailAdv + b.tailAdv);
@@ -128,7 +130,7 @@ export function scanCombine(a, b) {
         } else {
             // The junction line: a's tail run + b's head run, closed by b's first
             // newline — it starts and ends inside the union, so it joins `rows`.
-            a.rows += rowsForLine(a.tailLen + b.headLen, b.wrap) + b.rows;
+            a.rows += rowsForLine(a.tailLen + b.headLen, b.wrap, b.mode) + b.rows;
         }
         a.tailLen = b.tailLen;
         a.tailAdv = b.tailAdv;
@@ -139,10 +141,10 @@ export function scanCombine(a, b) {
 }
 
 /** A leader's exact lanes from its exclusive prefix — the O(1) query. */
-export function lanesFromPrefix(P, wrap, terminator = false) {
+export function lanesFromPrefix(P, wrap, terminator = false, mode = WRAP_DOWN) {
     const col = P.tailLen;
-    const closed = P.nl > 0 ? rowsForLine(P.headLen, wrap) + P.rows : 0;
-    const wrapRow = wrapRowOf(col, wrap, terminator);
+    const closed = P.nl > 0 ? rowsForLine(P.headLen, wrap, mode) + P.rows : 0;
+    const wrapRow = wrapRowOf(col, wrap, terminator, mode);
     return { row: closed + wrapRow, col, lineAdv: P.tailAdv, ord: P.glyphs };
 }
 
@@ -151,22 +153,22 @@ export function lanesFromPrefix(P, wrap, terminator = false) {
  * binary search once at the range start, then O(1) advances at boundary crossings
  * (the GPU's serial chunk loops do exactly this).
  */
-function itemCursor(items, wraps, startByte) {
+function itemCursor(items, wraps, modes, startByte) {
     let i = itemForByte(items, startByte);
     return {
         at(id) {
             while (i + 1 < items.length && id >= items[i + 1].byteStart) i++;
-            return { index: i, wrap: wraps[i], isStart: id === items[i].byteStart };
+            return { index: i, wrap: wraps[i], mode: modes[i], isStart: id === items[i].byteStart };
         },
     };
 }
 
 /** Serial fold of leaves over [from, to) — the body of chunkReduce and the tail of apply. */
-function foldRange(slots, items, wraps, from, to, acc) {
-    const cursor = itemCursor(items, wraps, from);
+function foldRange(slots, items, wraps, modes, from, to, acc) {
+    const cursor = itemCursor(items, wraps, modes, from);
     for (let id = from; id < to; id++) {
         const c = cursor.at(id);
-        scanCombine(acc, scanLeaf(slots, id, c.wrap, c.isStart));
+        scanCombine(acc, scanLeaf(slots, id, c.wrap, c.isStart, c.mode));
     }
     return acc;
 }
@@ -193,12 +195,17 @@ export function runScanPipeline(bytes, trie, opts = {}, tuning = {}) {
 
     const items = normalizeItems(bytes, opts);
     const wraps = items.map((it) => Math.max(0, Math.trunc(it.wrapWidth ?? opts.wrapWidth ?? 0)));
+    // MODE IS AN ITEM-LEVEL PARAMETER, exactly as wrap is, and the monoid depends on
+    // that: combine's junction term now reads TWO fields of `b` (wrap AND mode), so
+    // its non-associative surface is WIDER than before, not narrower. What keeps it
+    // safe is unchanged and structural — every item boundary emits a resetting leaf.
+    const modes = items.map((it, i) => normalizeWrapMode(it.wrapMode ?? opts.wrapMode ?? 0, `item ${i}`));
 
     // ── dispatch 2: chunkReduce — thread per chunk ──────────────────────────────────
     const numChunks = Math.ceil(n / K);
     const partials = new Array(numChunks);
     for (let c = 0; c < numChunks; c++) {
-        partials[c] = foldRange(slots, items, wraps, c * K, Math.min((c + 1) * K, n), scanIdentity());
+        partials[c] = foldRange(slots, items, wraps, modes, c * K, Math.min((c + 1) * K, n), scanIdentity());
     }
 
     // ── dispatch 3: spineReduce — thread per group ──────────────────────────────────
@@ -235,14 +242,18 @@ export function runScanPipeline(bytes, trie, opts = {}, tuning = {}) {
     for (let c = 0; c < numChunks; c++) {
         const from = c * K, to = Math.min((c + 1) * K, n);
         const R = { ...partialPrefix[c] };
-        const cursor = itemCursor(items, wraps, from);
+        const cursor = itemCursor(items, wraps, modes, from);
         for (let id = from; id < to; id++) {
             const cu = cursor.at(id);
-            if (cu.isStart) Object.assign(R, scanIdentity(), { wrap: cu.wrap });
+            if (cu.isStart) Object.assign(R, scanIdentity(), { wrap: cu.wrap, mode: cu.mode });
             const o = id * SLOT_STRIDE;
             const flags = slots[o + S_FLAGS];
             if ((flags & F_LEADER) !== 0) {
-                const v = lanesFromPrefix(R, cu.wrap);
+                // The terminator flag was NOT passed here when `lanesFromPrefix` grew
+                // it (c9667ec updated the callee and missed this caller); nothing in
+                // this tree runs the JS scan spec, so no gate could say so. Corrected
+                // while the same call learned the mode.
+                const v = lanesFromPrefix(R, cu.wrap, (flags & F_NEWLINE) !== 0, cu.mode);
                 slots[o + S_ROW] = v.row;
                 slots[o + S_COL] = v.col;
                 slots[o + S_LINE_ADV] = fbits(v.lineAdv);
@@ -250,14 +261,14 @@ export function runScanPipeline(bytes, trie, opts = {}, tuning = {}) {
                 slots[o + S_FLAGS] = flags | F_RENDERED;
                 ordToByte[items[cu.index].byteStart + v.ord] = id;
             }
-            scanCombine(R, scanLeaf(slots, id, cu.wrap, cu.isStart));
+            scanCombine(R, scanLeaf(slots, id, cu.wrap, cu.isStart, cu.mode));
         }
     }
 
     // ── dispatch 7: resolveX (shared kernel) + the fold-scalar reduce ───────────────
     const scalarRows = items.map(() => new Float64Array(8));
     const resolveParams = items.map((it, i) => ({
-        itemStart: it.byteStart, wrapWidth: wraps[i],
+        itemStart: it.byteStart, wrapWidth: wraps[i], wrapMode: modes[i],
         pageCols: it.page?.pageCols || 0, origin: it.origin,
         lineHeight: assertLineHeight(it.lineHeight ?? opts.lineHeight, i),
         zStep: it.zStep ?? opts.zStep ?? 0,
@@ -271,7 +282,7 @@ export function runScanPipeline(bytes, trie, opts = {}, tuning = {}) {
     const pageParams = items.map((it, i) => ({
         ...it.page,
         pageStrideX: deriveStride({ maxRowExtent: scalarRows[i][7] }, it.page),
-        wrap: wraps[i], zStep: resolveParams[i].zStep, origin: it.origin,
+        wrap: wraps[i], wrapMode: modes[i], zStep: resolveParams[i].zStep, origin: it.origin,
         // The ITEM's, as in the reference — the page fallback was unreachable. See there.
         lineHeight: resolveParams[i].lineHeight,
     }));

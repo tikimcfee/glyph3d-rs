@@ -120,6 +120,7 @@ def glyph_engine_load_item(
     line_height: c_double,
     z_step: c_double,
     wrap_width: c_int,
+    wrap_mode: c_int,
     has_page: c_int,
     page_rows: c_int,
     page_cols: c_int,
@@ -154,6 +155,7 @@ def glyph_engine_load_item(
     it.line_height = line_height
     it.z_step = z_step
     it.wrap_width = Int(wrap_width)
+    it.wrap_mode = Int(wrap_mode)
     it.has_page = has_page != 0
     it.page_rows = Int(page_rows)
     it.page_cols = Int(page_cols)
@@ -194,9 +196,13 @@ def glyph_engine_load_item(
 #   0..80    ten f64: origin_x, origin_y, origin_z, line_height, z_step,
 #            page_gap_x, band_stride_y, depth_per_band, depth_per_col,
 #            page_line_height
-#   80..104  six i32: wrap_width, has_page, page_rows, page_cols,
-#            scroll_rows, pages_wide
-#   104..112 pad
+#   80..108  SEVEN i32: wrap_width, has_page, page_rows, page_cols,
+#            scroll_rows, pages_wide, wrap_mode
+#   108..112 pad
+#
+# The wrap mode landed in the pad rather than growing the block: 10 f64 +
+# 7 i32 + 2 u64 is 124 B, so ITEM_DESC_SIZE stays 128 and the Rust side's
+# `const _: () = assert!(...)` in write_item_desc pins that it still fits.
 #   112      u64 byte_start
 #   120      u64 byte_count
 #
@@ -254,6 +260,7 @@ def glyph_engine_load_items(
         it.page_cols = Int(i32s[unsafe_offset = 23])
         it.scroll_rows = Int(i32s[unsafe_offset = 24])
         it.pages_wide = Int(i32s[unsafe_offset = 25])
+        it.wrap_mode = Int(i32s[unsafe_offset = 26])  # offset 104
         it.byte_start = Int(u64s[unsafe_offset = 14])  # offset 112
         it.byte_count = Int(u64s[unsafe_offset = 15])  # offset 120
         items.append(it^)

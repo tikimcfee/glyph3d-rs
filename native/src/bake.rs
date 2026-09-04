@@ -24,13 +24,13 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::fixture::Reader;
-use crate::fold::{rows_for_line, sequence_length, TRIE_FLAG_MISSING};
+use crate::fold::{rows_for_line, sequence_length, WrapMode, TRIE_FLAG_MISSING};
 use crate::scan::{scan_combine, scan_identity, scan_leaf_value, ScanElem};
 use crate::text::ResolveGlyph;
 
 /// 'G3DB'.
 const BAKE_MAGIC: u32 = 0x4244_3347;
-const BAKE_VERSION: u32 = 2;
+const BAKE_VERSION: u32 = 3;
 
 /// Default distance between checkpoints, in bytes. A query seeds from the
 /// nearest one and folds at most this many bytes.
@@ -41,9 +41,11 @@ const BAKE_VERSION: u32 = 2;
 #[allow(dead_code)]
 pub const CHECKPOINT_INTERVAL: usize = 4096;
 
-/// One checkpoint: the six carried fields of an exclusive prefix. `reset` and
-/// `wrap` are absent on purpose — a checkpoint is always mid-file, and the bake
-/// folds at wrap 0.
+/// One checkpoint: the six carried fields of an exclusive prefix. `reset`,
+/// `wrap` and `mode` are absent on purpose — a checkpoint is always mid-file,
+/// and the bake folds at wrap 0, where `rows_for_line` is 1 under EITHER mode.
+/// So nothing a checkpoint stores could depend on the mode; the mode is a QUERY
+/// parameter here, exactly as the wrap is.
 pub const CK_STRIDE: usize = 6;
 const CK_NL: usize = 0;
 const CK_GLYPHS: usize = 1;
@@ -184,7 +186,17 @@ pub fn bake_file<T: ResolveGlyph + ?Sized>(
             *histogram.entry(accumulator.tail_len).or_insert(0) += 1;
         }
 
-        let leaf = scan_leaf_value(codepoint == NEWLINE, resolved.advance, true, 0, id == 0);
+        // THE BAKE FOLDS AT WRAP 0 AND MODE Down, and both are inert there: at
+        // wrap 0 `rows_for_line` is 1 whatever the mode. Stated rather than
+        // defaulted, because a reader has to know the record is mode-free.
+        let leaf = scan_leaf_value(
+            codepoint == NEWLINE,
+            resolved.advance,
+            true,
+            0,
+            id == 0,
+            WrapMode::Down,
+        );
         scan_combine(&mut accumulator, &leaf);
     }
 
@@ -251,7 +263,14 @@ fn fold_bytes<T: ResolveGlyph + ?Sized>(
         }
         let codepoint = crate::fold::decode_codepoint_at(bytes, id, sequence_len);
         let resolved = trie.resolve(codepoint);
-        let leaf = scan_leaf_value(codepoint == NEWLINE, resolved.advance, true, 0, id == 0);
+        let leaf = scan_leaf_value(
+            codepoint == NEWLINE,
+            resolved.advance,
+            true,
+            0,
+            id == 0,
+            WrapMode::Down,
+        );
         scan_combine(accumulator, &leaf);
     }
 }
@@ -282,12 +301,17 @@ pub fn prefix_at<T: ResolveGlyph + ?Sized>(
     accumulator
 }
 
-/// Exact visual rows under ANY wrap width, from the histogram plus the open
-/// tail — without re-reading a byte.
-pub fn rows_under_wrap(record: &BakeRecord, wrap: i64) -> i64 {
+/// Exact visual rows under ANY wrap width AND mode, from the histogram plus the
+/// open tail — without re-reading a byte.
+///
+/// Under [`WrapMode::Back`] every line contributes exactly one row, so this
+/// counts LINES and the histogram's lengths stop mattering. It still walks the
+/// histogram rather than short-circuiting on the count: the per-line rule is one
+/// function, asked once per line, and the two answers fall out of the same loop.
+pub fn rows_under_wrap(record: &BakeRecord, wrap: i64, mode: WrapMode) -> i64 {
     let mut rows = 0i64;
     for (&length, &count) in record.hist_lens.iter().zip(record.hist_counts.iter()) {
-        rows += rows_for_line(length, wrap) * count;
+        rows += rows_for_line(length, wrap, mode) * count;
     }
     // The still-open final line, if any. This USED to spell out `(tail - 1) /
     // wrap + 1` because the shared helper over-counted a terminated line by one
@@ -300,7 +324,7 @@ pub fn rows_under_wrap(record: &BakeRecord, wrap: i64) -> i64 {
     // NON-multiple length they always did agree.)
     let tail = record.total.tail_len;
     if tail > 0 {
-        rows += rows_for_line(tail, wrap);
+        rows += rows_for_line(tail, wrap, mode);
     }
     rows
 }
@@ -321,8 +345,8 @@ pub struct BakeFixture {
     pub checkpoint_interval: usize,
     pub expected: BakeRecord,
     pub prefix_queries: Vec<PrefixQuery>,
-    /// (wrap, expected rows)
-    pub wrap_queries: Vec<(i64, i64)>,
+    /// (wrap, mode, expected rows)
+    pub wrap_queries: Vec<(i64, WrapMode, i64)>,
 }
 
 /// One recorded seed-protocol query: what the oracle answered when asked for
@@ -331,6 +355,9 @@ pub struct BakeFixture {
 pub struct PrefixQuery {
     pub byte_index: usize,
     pub wrap: i64,
+    /// v3: the mode the recorded lanes were resolved under. The PREFIX is
+    /// mode-free; the row it resolves to is not.
+    pub mode: WrapMode,
     pub prefix: [f64; 7],
     pub row: u32,
     pub col: u32,
@@ -339,8 +366,8 @@ pub struct PrefixQuery {
 }
 
 /// A ScanElem as the fixture serializes it: reset, nl, glyphs, rows, headLen,
-/// tailLen, tailAdv. The `wrap` field is deliberately absent — it is a query
-/// parameter, not part of a prefix.
+/// tailLen, tailAdv. The `wrap` and `mode` fields are deliberately absent —
+/// they are query parameters, not part of a prefix.
 fn elem_lanes(element: &ScanElem) -> [f64; 7] {
     [
         element.reset as f64,
@@ -432,7 +459,11 @@ fn load_bake_bytes(raw: &[u8], name: String) -> Result<BakeFixture, String> {
         head_len: total[4] as i64,
         tail_len: total[5] as i64,
         tail_advance: total[6] as f32,
+        // Neither is serialized: the fixture's `total` is a PREFIX, and wrap and
+        // mode are query parameters. The bake folds at wrap 0, where the mode
+        // cannot change an answer.
         wrap: 0,
+        mode: WrapMode::Down,
     };
     let checkpoint_count = reader.u32()? as usize;
     expected.checkpoints = Vec::with_capacity(checkpoint_count * CK_STRIDE);
@@ -458,6 +489,7 @@ fn load_bake_bytes(raw: &[u8], name: String) -> Result<BakeFixture, String> {
     for _ in 0..prefix_query_count {
         let byte_index = reader.u32()? as usize;
         let wrap = reader.u32()? as i64;
+        let mode = WrapMode::from_code(reader.u32()? as i64);
         let mut prefix = [0.0f64; 7];
         for lane in prefix.iter_mut() {
             *lane = reader.f64()?;
@@ -469,6 +501,7 @@ fn load_bake_bytes(raw: &[u8], name: String) -> Result<BakeFixture, String> {
         prefix_queries.push(PrefixQuery {
             byte_index,
             wrap,
+            mode,
             prefix,
             row,
             col,
@@ -480,8 +513,9 @@ fn load_bake_bytes(raw: &[u8], name: String) -> Result<BakeFixture, String> {
     let mut wrap_queries = Vec::with_capacity(wrap_query_count);
     for _ in 0..wrap_query_count {
         let wrap = reader.u32()? as i64;
+        let mode = WrapMode::from_code(reader.u32()? as i64);
         let rows = reader.u32()? as i64;
-        wrap_queries.push((wrap, rows));
+        wrap_queries.push((wrap, mode, rows));
     }
 
     // Same structural check the .pipe.bin loader makes: every section length is
@@ -635,16 +669,22 @@ pub fn diff_bake(fixture: &BakeFixture) -> BakeDiff {
             && sequence_length(&fixture.bytes, at) > 0
             && crate::fold::decode_codepoint_at(&fixture.bytes, at, sequence_length(&fixture.bytes, at))
                 == NEWLINE;
-        let lanes = crate::scan::lanes_from_prefix(&prefix, query.wrap, terminator);
-        check_i64(&format!("row@{at}w{}", query.wrap), lanes.row, query.row as i64, &mut bad);
+        let lanes =
+            crate::scan::lanes_from_prefix(&prefix, query.wrap, terminator, query.mode);
+        check_i64(
+            &format!("row@{at}w{}m{}", query.wrap, query.mode.code()),
+            lanes.row,
+            query.row as i64,
+            &mut bad,
+        );
         check_i64(&format!("col@{at}"), lanes.col, query.col as i64, &mut bad);
         check_i64(&format!("ord@{at}"), lanes.ord, query.ord as i64, &mut bad);
         check_f64(&format!("lineAdv@{at}"), lanes.line_advance as f64, query.line_advance, &mut bad);
     }
-    for &(wrap, want_rows) in &fixture.wrap_queries {
+    for &(wrap, mode, want_rows) in &fixture.wrap_queries {
         check_i64(
-            &format!("rowsUnderWrap({wrap})"),
-            rows_under_wrap(&got, wrap),
+            &format!("rowsUnderWrap({wrap}, mode {})", mode.code()),
+            rows_under_wrap(&got, wrap, mode),
             want_rows,
             &mut bad,
         );
@@ -771,9 +811,17 @@ mod tests {
             let record =
                 bake_file(&fx.bytes, &fx.trie, fx.line_height, fx.checkpoint_interval).unwrap();
             assert_eq!(
-                rows_under_wrap(&record, 0),
+                rows_under_wrap(&record, 0, WrapMode::Down),
                 record.total_rows,
                 "{}: histogram+tail and the streamed max row must agree at wrap 0",
+                fx.name
+            );
+            // At wrap 0 nothing folds, so WrapBack must give the SAME answer —
+            // the mode is about how a wrap is spent, and there is no wrap here.
+            assert_eq!(
+                rows_under_wrap(&record, 0, WrapMode::Back),
+                record.total_rows,
+                "{}: at wrap 0 the modes must coincide",
                 fx.name
             );
         }
@@ -800,9 +848,16 @@ mod tests {
         assert_eq!(record.total.tail_len, 8, "and an unterminated 8-cell tail");
         for (wrap, want) in [(1i64, 32i64), (2, 16), (3, 12), (4, 8), (5, 8), (8, 4), (9, 4), (0, 4)] {
             assert_eq!(
-                rows_under_wrap(&record, wrap),
+                rows_under_wrap(&record, wrap, WrapMode::Down),
                 want,
                 "rows_under_wrap({wrap}) over 4 lines of 8 cells"
+            );
+            // WrapBack: four lines, four rows, at EVERY wrap — the answer stops
+            // depending on the wrap at all, which is the whole point of the mode.
+            assert_eq!(
+                rows_under_wrap(&record, wrap, WrapMode::Back),
+                4,
+                "rows_under_wrap({wrap}, Back) counts LINES: 4"
             );
         }
 
@@ -813,11 +868,25 @@ mod tests {
         let open = bake_file(b"aaaaaaaa", &t, 1.0, 4096).unwrap();
         for wrap in [1i64, 2, 3, 4, 5, 8, 9] {
             assert_eq!(
-                rows_under_wrap(&terminated, wrap),
-                rows_under_wrap(&open, wrap),
+                rows_under_wrap(&terminated, wrap, WrapMode::Down),
+                rows_under_wrap(&open, wrap, WrapMode::Down),
                 "a trailing newline adds no row at wrap {wrap}"
             );
+            assert_eq!(
+                rows_under_wrap(&terminated, wrap, WrapMode::Back),
+                rows_under_wrap(&open, wrap, WrapMode::Back),
+                "and the same under WrapBack at wrap {wrap}"
+            );
         }
-        assert_eq!(rows_under_wrap(&terminated, 4), 2, "8 cells at wrap 4 is two rows");
+        assert_eq!(
+            rows_under_wrap(&terminated, 4, WrapMode::Down),
+            2,
+            "8 cells at wrap 4 is two rows"
+        );
+        assert_eq!(
+            rows_under_wrap(&terminated, 4, WrapMode::Back),
+            1,
+            "and one row under WrapBack, with the fold spent in depth"
+        );
     }
 }

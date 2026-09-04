@@ -62,8 +62,8 @@ struct Range(Copyable, Movable):
         return distinct <= 1
 
 
-comptime NFIELD = 16
-comptime NPROP = 5
+comptime NFIELD = 17
+comptime NPROP = 6
 
 
 def item_field(t: Item, i: Int) -> Float64:
@@ -82,7 +82,8 @@ def item_field(t: Item, i: Int) -> Float64:
     if i == 12: return t.origin_x
     if i == 13: return t.origin_y
     if i == 14: return t.origin_z
-    return 1.0 if t.has_page else 0.0
+    if i == 15: return 1.0 if t.has_page else 0.0
+    return Float64(t.wrap_mode)
 
 
 def prop_name(i: Int) -> String:
@@ -90,7 +91,8 @@ def prop_name(i: Int) -> String:
     if i == 1: return "paged"
     if i == 2: return "wrapped"
     if i == 3: return "trie-miss"
-    return "scrolled"
+    if i == 4: return "scrolled"
+    return "wrapback"
 
 
 def field_name(i: Int) -> String:
@@ -109,7 +111,8 @@ def field_name(i: Int) -> String:
     if i == 12: return "origin_x"
     if i == 13: return "origin_y"
     if i == 14: return "origin_z"
-    return "has_page"
+    if i == 15: return "has_page"
+    return "wrap_mode"
 
 
 def main() raises:
@@ -163,6 +166,7 @@ def main() raises:
             f[13].add(t.origin_y)
             f[14].add(t.origin_z)
             f[15].add(1.0 if t.has_page else 0.0)
+            f[16].add(Float64(t.wrap_mode))
             if t.has_page:
                 any_page = True
             if t.wrap_width > 0:
@@ -202,6 +206,7 @@ def main() raises:
             props.append(t2.wrap_width > 0)
             props.append(miss_here)
             props.append(t2.scroll_rows > 0)
+            props.append(t2.wrap_mode != 0)
         var short = path
         var slash = path.rfind("/")
         if slash >= 0:

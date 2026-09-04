@@ -39,6 +39,7 @@ from glyph_schema import (
 )
 from glyph_pipeline import (
     run_pipeline, Item, Trie, F_LEADER, page_active, paginate, derive_stride,
+    WRAP_DOWN, WRAP_BACK,
 )
 from fixture_io import load_pipe_fixture
 
@@ -161,40 +162,47 @@ def build_topologies(n: Int) -> List[List[Item]]:
     var counts: List[Int] = [1, 3]
     var wraps: List[Int] = [0, 7]
     var modes: List[Int] = [1, 2]        # 1 row-paged, 2 column-paged
+    # The WRAP mode, distinct from the page mode above: 0 = WrapDown, 1 = WrapBack.
+    # Containment and paginate-idempotence must hold under both, and WrapBack moves
+    # the ROW lane that paginate's page gate reads — so this is not a decorative
+    # crossing, it changes which page every glyph lands on.
+    var wrap_modes: List[Int] = [WRAP_DOWN, WRAP_BACK]
     for ci in range(len(counts)):
         var count = counts[ci]
         for wi in range(len(wraps)):
             for mi in range(len(modes)):
-                for si in range(2):
-                    var items = List[Item]()
-                    var per = n // count
-                    for i in range(count):
-                        var it = Item()
-                        it.byte_start = i * per
-                        it.byte_count = per if i < count - 1 else n - i * per
-                        it.line_height = 1.0 + Float64(i) * 0.25
-                        it.origin_x = Float64(i) * 11.0
-                        it.origin_y = Float64(i) * 101.0
-                        it.origin_z = Float64(i) * 3.0
-                        it.wrap_width = wraps[wi]
-                        it.z_step = 0.5
-                        # EVERY item paged here, unlike conformance_matrix's odd-only
-                        # rule: this sweep exists to feed idempotence, and an unpaged
-                        # item contributes nothing to it. Mixture is covered there.
-                        it.has_page = True
-                        it.pages_wide = 2
-                        it.page_gap_x = 1.0
-                        it.band_stride_y = 2.0
-                        it.depth_per_band = 0.25
-                        if modes[mi] == 1:
-                            it.page_rows = 4
-                        else:
-                            it.page_cols = 6
-                            it.depth_per_col = 0.125
-                        if si == 1:
-                            it.scroll_rows = 2
-                        items.append(it^)
-                    out.append(items^)
+                for wmi in range(len(wrap_modes)):
+                    for si in range(2):
+                        var items = List[Item]()
+                        var per = n // count
+                        for i in range(count):
+                            var it = Item()
+                            it.byte_start = i * per
+                            it.byte_count = per if i < count - 1 else n - i * per
+                            it.line_height = 1.0 + Float64(i) * 0.25
+                            it.origin_x = Float64(i) * 11.0
+                            it.origin_y = Float64(i) * 101.0
+                            it.origin_z = Float64(i) * 3.0
+                            it.wrap_width = wraps[wi]
+                            it.wrap_mode = wrap_modes[wmi]
+                            it.z_step = 0.5
+                            # EVERY item paged here, unlike conformance_matrix's odd-only
+                            # rule: this sweep exists to feed idempotence, and an unpaged
+                            # item contributes nothing to it. Mixture is covered there.
+                            it.has_page = True
+                            it.pages_wide = 2
+                            it.page_gap_x = 1.0
+                            it.band_stride_y = 2.0
+                            it.depth_per_band = 0.25
+                            if modes[mi] == 1:
+                                it.page_rows = 4
+                            else:
+                                it.page_cols = 6
+                                it.depth_per_col = 0.125
+                            if si == 1:
+                                it.scroll_rows = 2
+                            items.append(it^)
+                        out.append(items^)
     return out^
 
 

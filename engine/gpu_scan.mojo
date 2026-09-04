@@ -23,9 +23,9 @@ from max.gpu.host import DeviceContext
 from glyph_schema import (
     SM_STRIDE, SM_ADVANCE,
     PARTIAL_COUNT_STRIDE, PARTIAL_MEASURE_STRIDE,
-    P_RESET, P_NL, P_GLYPHS, P_ROWS, P_HEAD_LEN, P_TAIL_LEN, P_WRAP, PM_TAIL_ADV,
+    P_RESET, P_NL, P_GLYPHS, P_ROWS, P_HEAD_LEN, P_TAIL_LEN, P_WRAP, P_MODE, PM_TAIL_ADV,
 )
-from glyph_pipeline import run_pipeline, F_LEADER, F_NEWLINE, item_for_byte
+from glyph_pipeline import run_pipeline, F_LEADER, F_NEWLINE, item_for_byte, WRAP_DOWN
 from glyph_bake import ScanElem, scan_identity, scan_leaf_value, scan_combine, rows_for_line
 from fixture_io import load_pipe_fixture
 
@@ -37,6 +37,7 @@ def chunk_reduce_kernel(
     flags: MutPointer[UInt32, MutAnyOrigin],
     advance: MutPointer[Float32, MutAnyOrigin],
     wrap_of: MutPointer[UInt32, MutAnyOrigin],
+    mode_of: MutPointer[UInt32, MutAnyOrigin],
     is_start: MutPointer[UInt32, MutAnyOrigin],
     p_counts: MutPointer[UInt32, MutAnyOrigin],
     p_meas: MutPointer[Float32, MutAnyOrigin],
@@ -60,6 +61,7 @@ def chunk_reduce_kernel(
     var a_tail = 0
     var a_adv = Float32(0)
     var a_wrap = 0
+    var a_mode = WRAP_DOWN
     var seen = False
 
     var id = c * kk
@@ -72,6 +74,7 @@ def chunk_reduce_kernel(
         var leader = (f & F_LEADER) != 0
         var newline = (f & F_NEWLINE) != 0
         var b_wrap = Int(wrap_of[unsafe_offset=id])
+        var b_mode = Int(mode_of[unsafe_offset=id])
         var b_reset = Int(is_start[unsafe_offset=id])
         var b_nl = 0
         var b_glyphs = 0
@@ -97,12 +100,14 @@ def chunk_reduce_kernel(
             a_tail = b_tail
             a_adv = b_adv
             a_wrap = b_wrap
+            a_mode = b_mode
             if not seen:
                 a_reset = b_reset
             seen = True
             id += 1
             continue
         a_wrap = b_wrap
+        a_mode = b_mode
         a_glyphs += b_glyphs
         if b_nl == 0:
             a_tail += b_tail
@@ -114,7 +119,7 @@ def chunk_reduce_kernel(
                 a_head = a_tail
                 a_rows = 0
             else:
-                a_rows += rows_for_line(a_tail, b_wrap)
+                a_rows += rows_for_line(a_tail, b_wrap, b_mode)
             a_nl += b_nl
             a_tail = 0
             a_adv = 0
@@ -128,6 +133,7 @@ def chunk_reduce_kernel(
     p_counts[unsafe_offset = o + P_HEAD_LEN] = UInt32(a_head)
     p_counts[unsafe_offset = o + P_TAIL_LEN] = UInt32(a_tail)
     p_counts[unsafe_offset = o + P_WRAP] = UInt32(a_wrap)
+    p_counts[unsafe_offset = o + P_MODE] = UInt32(a_mode)
     p_meas[unsafe_offset = c * PARTIAL_MEASURE_STRIDE + PM_TAIL_ADV] = a_adv
 
 
@@ -144,10 +150,12 @@ def check_case(path: String, ctx: DeviceContext) raises -> Int:
     # pipeline gets them from itemStarts (the kernel is not the place to binary
     # search an item table).
     var wrap_of = List[UInt32](unsafe_uninit_length=n)
+    var mode_of = List[UInt32](unsafe_uninit_length=n)
     var is_start = List[UInt32](unsafe_uninit_length=n)
     for id in range(n):
         var i = item_for_byte(fx.items, id)
         wrap_of[id] = UInt32(fx.items[i].wrap_width) if i >= 0 else 0
+        mode_of[id] = UInt32(fx.items[i].wrap_mode) if i >= 0 else 0
         is_start[id] = UInt32(1) if (i >= 0 and fx.items[i].byte_start == id) else UInt32(0)
 
     # ── CPU reference: the same monoid the conformance suites already prove ──
@@ -165,6 +173,7 @@ def check_case(path: String, ctx: DeviceContext) raises -> Int:
                 (f & F_LEADER) != 0,
                 Int(wrap_of[id]),
                 is_start[id] != 0,
+                Int(mode_of[id]),
             )
             scan_combine(acc, leaf)
         cpu.append(acc^)
@@ -173,6 +182,7 @@ def check_case(path: String, ctx: DeviceContext) raises -> Int:
     var h_flags = ctx.enqueue_create_host_buffer[DType.uint32](n)
     var h_adv = ctx.enqueue_create_host_buffer[DType.float32](n * SM_STRIDE)
     var h_wrap = ctx.enqueue_create_host_buffer[DType.uint32](n)
+    var h_mode = ctx.enqueue_create_host_buffer[DType.uint32](n)
     var h_start = ctx.enqueue_create_host_buffer[DType.uint32](n)
     var h_pc = ctx.enqueue_create_host_buffer[DType.uint32](n_chunks * PARTIAL_COUNT_STRIDE)
     var h_pm = ctx.enqueue_create_host_buffer[DType.float32](n_chunks * PARTIAL_MEASURE_STRIDE)
@@ -183,17 +193,20 @@ def check_case(path: String, ctx: DeviceContext) raises -> Int:
         h_adv[i] = r.sm[i]
     for i in range(n):
         h_wrap[i] = wrap_of[i]
+        h_mode[i] = mode_of[i]
         h_start[i] = is_start[i]
 
     var d_flags = ctx.enqueue_create_buffer[DType.uint32](n)
     var d_adv = ctx.enqueue_create_buffer[DType.float32](n * SM_STRIDE)
     var d_wrap = ctx.enqueue_create_buffer[DType.uint32](n)
+    var d_mode = ctx.enqueue_create_buffer[DType.uint32](n)
     var d_start = ctx.enqueue_create_buffer[DType.uint32](n)
     var d_pc = ctx.enqueue_create_buffer[DType.uint32](n_chunks * PARTIAL_COUNT_STRIDE)
     var d_pm = ctx.enqueue_create_buffer[DType.float32](n_chunks * PARTIAL_MEASURE_STRIDE)
     ctx.enqueue_copy(dst_buf=d_flags, src_buf=h_flags)
     ctx.enqueue_copy(dst_buf=d_adv, src_buf=h_adv)
     ctx.enqueue_copy(dst_buf=d_wrap, src_buf=h_wrap)
+    ctx.enqueue_copy(dst_buf=d_mode, src_buf=h_mode)
     ctx.enqueue_copy(dst_buf=d_start, src_buf=h_start)
     d_pc.enqueue_fill(0)
     d_pm.enqueue_fill(0.0)
@@ -201,6 +214,7 @@ def check_case(path: String, ctx: DeviceContext) raises -> Int:
     comptime BLOCK = 128
     ctx.enqueue_function[chunk_reduce_kernel](
         d_flags.unsafe_ptr(), d_adv.unsafe_ptr(), d_wrap.unsafe_ptr(),
+        d_mode.unsafe_ptr(),
         d_start.unsafe_ptr(), d_pc.unsafe_ptr(), d_pm.unsafe_ptr(),
         Int32(n), Int32(CHUNK), Int32(n_chunks),
         grid_dim=(n_chunks + BLOCK - 1) // BLOCK,

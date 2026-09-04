@@ -1876,7 +1876,8 @@ impl GlyphScene {
             log::warn!("pick: failed to re-read/re-run {}", info.rel_path);
             return false;
         };
-        let (leaders, rows, cols, lines) = crate::text::fold_leaders(&bytes, info.item.wrap_width);
+        let (leaders, rows, cols, lines) =
+            crate::text::fold_leaders(&bytes, info.item.wrap_width, info.item.wrap_mode);
         let mut mismatch = 0usize;
         if leaders.len() != records.len() {
             mismatch += 1;

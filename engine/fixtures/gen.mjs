@@ -13,7 +13,11 @@
  * the class of bug (grouping-dependent float drift) this rig exists to catch.
  *
  * Format (all little-endian, packed, no alignment):
- *   u32 magic 'G3DF' (0x46443347)   u32 version=3
+ *   u32 magic 'G3DF' (0x46443347)   u32 version=4
+ *
+ * v4: the item record gains WRAP MODE — WrapDown (0, today's behaviour and the
+ * default) or WrapBack (1, where a wrap keeps the row and steps only in depth).
+ * It is an ITEM-level parameter and rides beside wrapWidth for that reason.
  *
  * v2 CARRIER NOTE: float payloads (trie blocks, slots) are stored as f64 VALUES,
  * not as the buffer's current representation. f64 holds every f32 exactly (and
@@ -28,7 +32,8 @@
  *   itemCount × item record:
  *     u32 byteStart  u32 byteCount
  *     f64 originX originY originZ
- *     f64 wrapWidth  f64 zStep  f64 lineHeight (NaN = unset)
+ *     f64 wrapWidth  f64 wrapMode (0 = WrapDown, 1 = WrapBack)
+ *     f64 zStep  f64 lineHeight (NaN = unset)
  *     f64 hasPage (0|1)
  *     f64 pageRows pageCols scrollRows pagesWide pageGapX bandStrideY
  *         depthPerBand depthPerColumn
@@ -215,6 +220,52 @@ const CASES = [
             ],
         };
     })(),
+    // ── WRAP MODE B. Added rather than flipped: every mode-A expectation above
+    //    stays exactly where it was, so a regression in the default cannot hide
+    //    behind a re-baselined fixture.
+    {
+        // The CONTROLLED A/B. Byte-for-byte the `wrap-exact` input with the same
+        // wrap, zStep, lineHeight and origin — the ONLY difference from that
+        // fixture is the mode, so any lane that differs between the two differs
+        // because of the mode and nothing else. Its lines are 4, 8, 2, 12, 0 and 2
+        // cells at wrap 4: three exact multiples, one partial, one empty.
+        name: 'wrapback-mixed',
+        bytes: utf8('abcd\nabcdefgh\nab\nabcdefghijkl\n\nxy'),
+        items: [{
+            origin: { x: -2, y: 4, z: 0.5 }, wrapWidth: 4, wrapMode: 1,
+            zStep: 0.25, lineHeight: 1.1,
+        }],
+    },
+    {
+        // THE CASE THE MODE EXISTS FOR: one 5,212-cell line and no other, at wrap
+        // 40. WrapDown gives it 131 rows; WrapBack gives it ONE, with 131 segments
+        // receding in z. TOTAL_ROWS is the lane that says so.
+        name: 'wrapback-long-line',
+        bytes: utf8(longLine),
+        items: [{ origin: { x: 0, y: 0, z: 0 }, wrapWidth: 40, wrapMode: 1, zStep: 0.3, lineHeight: 1.0 }],
+    },
+    (() => {
+        // MIXED MODES IN ONE ARENA — the shape the monoid's precondition is about.
+        // Three items, modes down/back/down, and the wrap changes across every
+        // boundary too. combine is not associative across either change; what makes
+        // this safe is that each item's first byte emits a RESETTING leaf, so no
+        // interval without a reset ever spans two of these. The scan gate sweeps 8
+        // chunk/group/shard tunings over exactly this file.
+        const a = utf8('down item, wraps at five\nsecond\n');
+        const b = utf8('back item 🚀 wraps at five and stacks in z 🌍\nmore back\n');
+        const c = utf8('tail item down again, wrap seven\nlast\n');
+        const bytes = new Uint8Array(a.length + b.length + c.length);
+        bytes.set(a, 0); bytes.set(b, a.length); bytes.set(c, a.length + b.length);
+        return {
+            name: 'wrapback-items',
+            bytes,
+            items: [
+                { byteStart: 0, byteCount: a.length, origin: { x: 0, y: 0, z: 0 }, wrapWidth: 5, wrapMode: 0, zStep: 0.2, lineHeight: 1.2 },
+                { byteStart: a.length, byteCount: b.length, origin: { x: 10, y: 0, z: -1 }, wrapWidth: 5, wrapMode: 1, zStep: 0.3, lineHeight: 1.0 },
+                { byteStart: a.length + b.length, byteCount: c.length, origin: { x: -8, y: 3, z: 0 }, wrapWidth: 7, wrapMode: 0, zStep: 0.1, lineHeight: 1.1 },
+            ],
+        };
+    })(),
     (() => {
         const a = utf8('ab\n');
         const cont = new Uint8Array([0x80, 0x80, 0x80, 0x80]);   // leaderless item → null bounds
@@ -297,7 +348,7 @@ for (const c of CASES) {
     const r = runPipeline(c.bytes, trie, { items });
 
     const w = new Writer();
-    w.u32(0x46443347); w.u32(3);
+    w.u32(0x46443347); w.u32(4);
     w.u32(c.bytes.length); w.u32(items.length);
     w.u32(trie.blockIndex.length); w.u32(trie.blocks.length);
     w.bytes(c.bytes);
@@ -310,7 +361,8 @@ for (const c of CASES) {
     for (const it of items) {
         w.u32(it.byteStart); w.u32(it.byteCount);
         w.f64(it.origin?.x || 0); w.f64(it.origin?.y || 0); w.f64(it.origin?.z || 0);
-        w.f64(it.wrapWidth ?? 0); w.f64(it.zStep ?? 0); w.f64(it.lineHeight ?? NaN);
+        w.f64(it.wrapWidth ?? 0); w.f64(it.wrapMode ?? 0);
+        w.f64(it.zStep ?? 0); w.f64(it.lineHeight ?? NaN);
         const p = it.page;
         w.f64(p ? 1 : 0);
         w.f64(p?.pageRows || 0); w.f64(p?.pageCols || 0); w.f64(p?.scrollRows || 0);

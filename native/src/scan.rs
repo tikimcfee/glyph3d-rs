@@ -39,7 +39,8 @@
 
 use crate::fold::{
     batch_union, bounds_range, decode_all, derive_stride, page_active, paginate, rows_for_line,
-    wrap_row_of, FoldResult, Item, Slots, F_LEADER, F_NEWLINE, F_RENDERED,
+    wrap_row_of, wrap_segment_of, FoldResult, Item, Slots, WrapMode, F_LEADER, F_NEWLINE,
+    F_RENDERED,
 };
 use crate::text::ResolveGlyph;
 
@@ -73,6 +74,13 @@ pub struct ScanElem {
     pub tail_advance: f32,
     /// The wrap width in force at the interval's right edge.
     pub wrap: i64,
+    /// The wrap MODE in force at the interval's right edge.
+    ///
+    /// It rides beside `wrap` for the same reason and with the same caveat: the
+    /// junction term reads it off `b`, so `combine` is not associative across a
+    /// change of it. Two item-level parameters in that term now instead of one —
+    /// the non-associative surface is WIDER than it was, not narrower.
+    pub mode: WrapMode,
 }
 
 pub(crate) fn scan_identity() -> ScanElem {
@@ -86,14 +94,16 @@ pub(crate) fn scan_leaf_value(
     is_leader: bool,
     wrap: i64,
     is_item_start: bool,
+    mode: WrapMode,
 ) -> ScanElem {
     let mut leaf = ScanElem {
         reset: i64::from(is_item_start),
         wrap,
+        mode,
         ..ScanElem::default()
     };
     if !is_leader {
-        return leaf; // continuation byte: reset/wrap only
+        return leaf; // continuation byte: reset/wrap/mode only
     }
     leaf.glyphs = 1;
     if is_newline {
@@ -116,6 +126,7 @@ pub(crate) fn scan_combine(accumulator: &mut ScanElem, next: &ScanElem) {
         return;
     }
     accumulator.wrap = next.wrap;
+    accumulator.mode = next.mode;
     if next.newlines == 0 {
         accumulator.tail_len += next.tail_len;
         accumulator.tail_advance += next.tail_advance;
@@ -142,7 +153,7 @@ pub(crate) fn scan_combine(accumulator: &mut ScanElem, next: &ScanElem) {
         // could tell. Where the wrap genuinely matters is ACROSS groupings, and
         // that is `mixed_wrap_is_outside_the_monoid_s_domain`.
         accumulator.rows +=
-            rows_for_line(accumulator.tail_len + next.head_len, next.wrap) + next.rows;
+            rows_for_line(accumulator.tail_len + next.head_len, next.wrap, next.mode) + next.rows;
         accumulator.tail_len = next.tail_len;
         accumulator.tail_advance = next.tail_advance;
     }
@@ -163,15 +174,20 @@ pub(crate) struct PrefixLanes {
 /// at one-past-the-last cell of its line, so at an exact wrap multiple it stays
 /// on the row it closes — the same distinction `fold::wrap_row_of` makes, which
 /// is why both forms call that one function rather than each spelling the rule.
-pub(crate) fn lanes_from_prefix(prefix: &ScanElem, wrap: i64, terminator: bool) -> PrefixLanes {
+pub(crate) fn lanes_from_prefix(
+    prefix: &ScanElem,
+    wrap: i64,
+    terminator: bool,
+    mode: WrapMode,
+) -> PrefixLanes {
     let col = prefix.tail_len;
     let closed = if prefix.newlines > 0 {
-        rows_for_line(prefix.head_len, wrap) + prefix.rows
+        rows_for_line(prefix.head_len, wrap, mode) + prefix.rows
     } else {
         0
     };
     PrefixLanes {
-        row: closed + wrap_row_of(col, wrap, terminator),
+        row: closed + wrap_row_of(col, wrap, terminator, mode),
         col,
         line_advance: prefix.tail_advance,
         ord: prefix.glyphs,
@@ -206,7 +222,13 @@ fn cursor_advance(items: &[Item], index: &mut usize, id: usize) {
 
 /// The leaf for byte `id`, read from the decoded STATIC arrays only — which is
 /// what lets chunk_reduce run before anything knows a byte's row or column.
-fn scan_leaf(slots: &Slots, id: usize, wrap: i64, is_item_start: bool) -> ScanElem {
+fn scan_leaf(
+    slots: &Slots,
+    id: usize,
+    wrap: i64,
+    is_item_start: bool,
+    mode: WrapMode,
+) -> ScanElem {
     let flags = slots.flags(id);
     scan_leaf_value(
         flags & F_NEWLINE != 0,
@@ -214,14 +236,17 @@ fn scan_leaf(slots: &Slots, id: usize, wrap: i64, is_item_start: bool) -> ScanEl
         flags & F_LEADER != 0,
         wrap,
         is_item_start,
+        mode,
     )
 }
 
 /// Serial fold of leaves over `[from_byte, to_byte)` — the body of chunk_reduce.
+#[allow(clippy::too_many_arguments)]
 fn fold_range(
     slots: &Slots,
     items: &[Item],
     wraps: &[i64],
+    modes: &[WrapMode],
     from_byte: usize,
     to_byte: usize,
     accumulator: &mut ScanElem,
@@ -232,7 +257,13 @@ fn fold_range(
     let mut index = item_for_byte(items, from_byte);
     for id in from_byte..to_byte {
         cursor_advance(items, &mut index, id);
-        let leaf = scan_leaf(slots, id, wraps[index], id as i64 == items[index].byte_start);
+        let leaf = scan_leaf(
+            slots,
+            id,
+            wraps[index],
+            id as i64 == items[index].byte_start,
+            modes[index],
+        );
         scan_combine(accumulator, &leaf);
     }
 }
@@ -245,6 +276,7 @@ fn apply_chunk(
     slots: &mut Slots,
     items: &[Item],
     wraps: &[i64],
+    modes: &[WrapMode],
     chunk_prefix: &ScanElem,
     byte_len: usize,
     chunk_size: usize,
@@ -264,6 +296,7 @@ fn apply_chunk(
         if is_item_start {
             run = scan_identity();
             run.wrap = wraps[index];
+            run.mode = modes[index];
         }
         let flags = slots.flags(id);
         // THE GAP GUARD. `item_for_byte` does not check ownership, so a byte in a
@@ -284,7 +317,8 @@ fn apply_chunk(
         let in_item =
             byte_index >= item.byte_start && byte_index < item.byte_start + item.byte_count;
         if flags & F_LEADER != 0 && in_item {
-            let lanes = lanes_from_prefix(&run, wraps[index], flags & F_NEWLINE != 0);
+            let lanes =
+                lanes_from_prefix(&run, wraps[index], flags & F_NEWLINE != 0, modes[index]);
             slots.lc[id * 2] = lanes.row as u32;
             slots.lc[id * 2 + 1] = lanes.col as u32;
             slots.fl[id] = flags | F_RENDERED;
@@ -304,7 +338,7 @@ fn apply_chunk(
             slots.wm[id] = 0.0;
             slots.wc[id] = 0;
         }
-        let leaf = scan_leaf(slots, id, wraps[index], is_item_start);
+        let leaf = scan_leaf(slots, id, wraps[index], is_item_start, modes[index]);
         scan_combine(&mut run, &leaf);
     }
 }
@@ -391,12 +425,14 @@ fn resolve_x_shard(
             // params, so for a page-active item paginate writes X/Y/Z for every
             // leader — these three stores were dead the moment it ran. paginate
             // reads only BASE_X/ROW/COL, all still written.
-            let wrap_row = wrap_row_of(col, wrap, slots.flags(id) & F_NEWLINE != 0);
+            // The DEPTH fan's segment index, never the row contribution: under
+            // WrapBack the row is flat and the segments are all z has left.
+            let wrap_segment = wrap_segment_of(col, wrap, slots.flags(id) & F_NEWLINE != 0);
             slots.set_position(
                 id,
                 (item_relative_x + item.origin_x) as f32,
                 (-(row as f64) * line_height + item.origin_y) as f32,
-                (-(wrap_row as f64) * item.z_step + item.origin_z) as f32,
+                (-(wrap_segment as f64) * item.z_step + item.origin_z) as f32,
             );
         }
         if (row + 1) as f64 > row_max {
@@ -457,6 +493,7 @@ pub fn run_scan_pipeline<T: ResolveGlyph + ?Sized>(
         };
     }
     let wraps: Vec<i64> = items.iter().map(|item| item.wrap_width).collect();
+    let modes: Vec<WrapMode> = items.iter().map(|item| item.wrap_mode).collect();
 
     // ── dispatch 2: chunk_reduce — one element per chunk ──────────────────────
     let num_chunks = byte_len.div_ceil(chunk_size);
@@ -465,7 +502,7 @@ pub fn run_scan_pipeline<T: ResolveGlyph + ?Sized>(
         let from_byte = chunk * chunk_size;
         let to_byte = (from_byte + chunk_size).min(byte_len);
         let mut accumulator = scan_identity();
-        fold_range(&slots, items, &wraps, from_byte, to_byte, &mut accumulator);
+        fold_range(&slots, items, &wraps, &modes, from_byte, to_byte, &mut accumulator);
         *partial = accumulator;
     }
 
@@ -510,7 +547,7 @@ pub fn run_scan_pipeline<T: ResolveGlyph + ?Sized>(
     // ── dispatch 6: apply ─────────────────────────────────────────────────────
     // One iteration per chunk IS one GPU thread; the index is the thread id.
     for (chunk, prefix) in chunk_prefix.iter().enumerate() {
-        apply_chunk(&mut slots, items, &wraps, prefix, byte_len, chunk_size, chunk);
+        apply_chunk(&mut slots, items, &wraps, &modes, prefix, byte_len, chunk_size, chunk);
     }
 
     // ── dispatch 7: resolve_x + the fold-scalar reduce ────────────────────────
@@ -604,9 +641,10 @@ mod tests {
     /// A deterministic pseudo-random element generator. Real elements, reachable
     /// by folding real leaves — a hand-built ScanElem could violate invariants
     /// the monoid relies on and "disprove" associativity for the wrong reason.
-    /// `wrap` IS UNIFORM ACROSS THE SAMPLE, and that is a precondition rather
-    /// than a convenience — see `mixed_wrap_is_outside_the_monoid_s_domain`.
-    fn elements(count: usize, wrap: i64) -> Vec<ScanElem> {
+    /// `wrap` AND `mode` ARE UNIFORM ACROSS THE SAMPLE, and that is a
+    /// precondition rather than a convenience — see
+    /// `mixed_wrap_is_outside_the_monoid_s_domain` and its mode twin.
+    fn elements(count: usize, wrap: i64, mode: WrapMode) -> Vec<ScanElem> {
         let mut state = 0x2545_F491_4F6C_DD1Du64;
         let mut next = move || {
             state ^= state >> 12;
@@ -626,6 +664,7 @@ mod tests {
                     roll != 9,                            // is_leader
                     wrap,
                     false,
+                    mode,
                 );
                 scan_combine(&mut accumulator, &leaf);
             }
@@ -649,13 +688,23 @@ mod tests {
     fn the_monoid_is_associative_on_every_integer_field() {
         let mut checked = 0usize;
         let mut advance_differed = 0usize;
-        // Six regimes, not four: `elements` builds lines of 1..9 cells, so
-        // wraps 1, 2 and 4 DIVIDE some of them and wraps 3 and 7 mostly do not.
-        // The corrected `rows_for_line` changes value exactly on the multiples,
-        // so a sweep that never hit one would be testing associativity of the
-        // old rule in the new rule's clothing.
+        // TWELVE regimes: six wraps CROSSED WITH both modes.
+        //
+        // Six wraps, not four: `elements` builds lines of 1..9 cells, so wraps 1,
+        // 2 and 4 DIVIDE some of them and wraps 3 and 7 mostly do not. The
+        // corrected `rows_for_line` changes value exactly on the multiples, so a
+        // sweep that never hit one would be testing associativity of the old rule
+        // in the new rule's clothing.
+        //
+        // Both modes, because `rows_for_line` is a DIFFERENT FUNCTION under each
+        // and sweeping only WrapDown would say nothing about WrapBack's monoid.
+        // That the cross actually discriminates is asserted below, not assumed —
+        // the same lesson as the wrap widening, one parameter over.
+        let mut rows_by_regime: Vec<(i64, WrapMode, Vec<i64>)> = Vec::new();
         for wrap in [0i64, 1, 2, 3, 4, 7] {
-        let sample = elements(60, wrap);
+        for mode in [WrapMode::Down, WrapMode::Back] {
+        let mut regime_rows: Vec<i64> = Vec::new();
+        let sample = elements(60, wrap, mode);
         for a in sample.iter().take(15) {
             for b in sample.iter().skip(15).take(15) {
                 for c in sample.iter().skip(30).take(15) {
@@ -676,6 +725,8 @@ mod tests {
                     assert_eq!(left.head_len, right.head_len, "head_len");
                     assert_eq!(left.tail_len, right.tail_len, "tail_len");
                     assert_eq!(left.wrap, right.wrap, "wrap");
+                    assert_eq!(left.mode, right.mode, "mode");
+                    regime_rows.push(left.rows);
                     let delta = (left.tail_advance - right.tail_advance).abs();
                     assert!(
                         delta <= 1e-4 * left.tail_advance.abs().max(1.0),
@@ -691,8 +742,41 @@ mod tests {
                 }
             }
         }
+        rows_by_regime.push((wrap, mode, regime_rows));
         }
-        assert_eq!(checked, 6 * 15 * 15 * 15, "the triple sweep must actually run");
+        }
+        assert_eq!(checked, 6 * 2 * 15 * 15 * 15, "the triple sweep must actually run");
+        assert_eq!(rows_by_regime.len(), 12, "twelve regimes: six wraps x two modes");
+        // THE REGIMES MUST DISCRIMINATE. A cross that swept the same rule twice
+        // under two names would pass this test while proving associativity of one
+        // mode only — exactly the failure the wrap widening was aimed at, so it is
+        // MEASURED here rather than argued. At every wrap that can fold (> 1),
+        // the two modes must produce different `rows` on this sample.
+        for wrap in [1i64, 2, 3, 4, 7] {
+            let down = &rows_by_regime.iter().find(|r| r.0 == wrap && r.1 == WrapMode::Down).unwrap().2;
+            let back = &rows_by_regime.iter().find(|r| r.0 == wrap && r.1 == WrapMode::Back).unwrap().2;
+            // Compared as a COUNT of differing triples, not with assert_ne! on the
+            // vectors: 3,375 rows each, and a failure that dumps both is unreadable
+            // exactly when someone needs to read it.
+            let differing = down.iter().zip(back.iter()).filter(|(a, b)| a != b).count();
+            assert!(
+                differing > 0,
+                "wrap {wrap}: the two modes agreed on all {} triples — this regime \
+                 cannot tell the modes apart and the cross is decorative there",
+                down.len()
+            );
+        }
+        // And wrap 0 must AGREE, because there is no fold to spend: a mode that
+        // changed something at wrap 0 would be reaching past its own definition.
+        {
+            let down = &rows_by_regime.iter().find(|r| r.0 == 0 && r.1 == WrapMode::Down).unwrap().2;
+            let back = &rows_by_regime.iter().find(|r| r.0 == 0 && r.1 == WrapMode::Back).unwrap().2;
+            let differing = down.iter().zip(back.iter()).filter(|(a, b)| a != b).count();
+            assert_eq!(
+                differing, 0,
+                "at wrap 0 nothing wraps, so the modes must coincide — {differing} triples differ"
+            );
+        }
         // ANTI-VACUITY on the claim itself. If regrouping never moved
         // tail_advance on this sample, the test would be silently asserting
         // something stronger than the contract, and the tiered comparison
@@ -702,6 +786,35 @@ mod tests {
             "no regrouping moved tail_advance — this sample cannot show why the \
              contract needs a tolerant tier"
         );
+    }
+
+    /// A hand-built element for the DOMAIN tests. Deliberately not from
+    /// `elements()`: those two tests need a triple with exactly the shape that
+    /// reaches the junction term (`a.nl > 0, b.nl > 0, c.nl == 0`), and a random
+    /// sample cannot be asked for one.
+    #[allow(clippy::too_many_arguments)]
+    fn domain_elem(
+        newlines: i64, glyphs: i64, rows: i64, head: i64, tail: i64, wrap: i64, mode: WrapMode,
+    ) -> ScanElem {
+        ScanElem {
+            reset: 0, newlines, glyphs, rows, head_len: head, tail_len: tail,
+            tail_advance: 0.0, wrap, mode,
+        }
+    }
+
+    fn group_left_rows(x: &ScanElem, y: &ScanElem, z: &ScanElem) -> i64 {
+        let mut acc = *x;
+        scan_combine(&mut acc, y);
+        scan_combine(&mut acc, z);
+        acc.rows
+    }
+
+    fn group_right_rows(x: &ScanElem, y: &ScanElem, z: &ScanElem) -> i64 {
+        let mut inner = *y;
+        scan_combine(&mut inner, z);
+        let mut acc = *x;
+        scan_combine(&mut acc, &inner);
+        acc.rows
     }
 
     /// `reset` absorbs: an item boundary makes file isolation STRUCTURAL, so no
@@ -726,46 +839,135 @@ mod tests {
     /// regrouping freedom goes with it, and this is where that shows up.
     #[test]
     fn mixed_wrap_is_outside_the_monoid_s_domain() {
-        let build = |newlines: i64, glyphs: i64, rows: i64, head: i64, tail: i64, wrap: i64| ScanElem {
-            reset: 0, newlines, glyphs, rows, head_len: head, tail_len: tail,
-            tail_advance: 0.0, wrap,
-        };
-        let a = build(1, 3, 1, 1, 2, 5);
-        let b = build(1, 4, 1, 3, 1, 5);
-        let c_mixed = build(0, 2, 0, 2, 2, 2); // wrap 2, not 5
-        let c_uniform = build(0, 2, 0, 2, 2, 5);
-
-        let group_left = |x: &ScanElem, y: &ScanElem, z: &ScanElem| {
-            let mut acc = *x;
-            scan_combine(&mut acc, y);
-            scan_combine(&mut acc, z);
-            acc.rows
-        };
-        let group_right = |x: &ScanElem, y: &ScanElem, z: &ScanElem| {
-            let mut inner = *y;
-            scan_combine(&mut inner, z);
-            let mut acc = *x;
-            scan_combine(&mut acc, &inner);
-            acc.rows
-        };
+        let a = domain_elem(1, 3, 1, 1, 2, 5, WrapMode::Down);
+        let b = domain_elem(1, 4, 1, 3, 1, 5, WrapMode::Down);
+        let c_mixed = domain_elem(0, 2, 0, 2, 2, 2, WrapMode::Down); // wrap 2, not 5
+        let c_uniform = domain_elem(0, 2, 0, 2, 2, 5, WrapMode::Down);
 
         assert_ne!(
-            group_left(&a, &b, &c_mixed),
-            group_right(&a, &b, &c_mixed),
+            group_left_rows(&a, &b, &c_mixed),
+            group_right_rows(&a, &b, &c_mixed),
             "a change of wrap with no reset between MUST break associativity — \
              if this ever passes, the precondition has moved and the scan form's \
              regrouping freedom needs re-deriving"
         );
         assert_eq!(
-            group_left(&a, &b, &c_uniform),
-            group_right(&a, &b, &c_uniform),
+            group_left_rows(&a, &b, &c_uniform),
+            group_right_rows(&a, &b, &c_uniform),
             "and under one wrap regime it must hold exactly"
         );
     }
 
+    /// THE MODE TWIN of the test above, and the reason it has to exist.
+    ///
+    /// The junction term is `rows_for_line(a.tail_len + b.head_len, b.wrap,
+    /// b.mode)`. It reads TWO fields of `b` now instead of one, so the surface on
+    /// which `combine` is non-associative got WIDER when the mode landed, not
+    /// narrower: a triple with `a.nl > 0, b.nl > 0, c.nl == 0` evaluates that term
+    /// with `b`'s parameters under the left grouping and `c`'s under the right, and
+    /// EITHER parameter differing is enough to split them.
+    ///
+    /// MEASURED, not argued. Same wrap throughout — 2 — so the only difference
+    /// between `c_mixed` and `c_uniform` is the mode, and the junction line is
+    /// 5 cells: 3 rows under WrapDown, 1 under WrapBack.
+    ///
+    /// It is safe anyway, and safe in exactly the way wrap is: mode is an
+    /// ITEM-LEVEL parameter, every item boundary emits a resetting leaf, and a
+    /// reset absorbs whatever preceded it. So no interval without a reset can span
+    /// two modes, and `mixed_modes_across_an_item_boundary_agree_with_the_serial_fold`
+    /// is the constructive half of that claim. If mode ever becomes per-line or
+    /// per-range, the scan form's regrouping freedom goes with it and this is where
+    /// that shows up.
+    #[test]
+    fn mixed_mode_is_outside_the_monoid_s_domain() {
+        let a = domain_elem(1, 3, 1, 1, 2, 2, WrapMode::Down);
+        let b = domain_elem(1, 4, 1, 3, 1, 2, WrapMode::Down);
+        let c_mixed = domain_elem(0, 2, 0, 2, 2, 2, WrapMode::Back); // mode Back, not Down
+        let c_uniform = domain_elem(0, 2, 0, 2, 2, 2, WrapMode::Down);
+
+        // The junction line is a.tail_len + b.head_len = 5 cells at wrap 2.
+        assert_eq!(crate::fold::rows_for_line(5, 2, WrapMode::Down), 3);
+        assert_eq!(crate::fold::rows_for_line(5, 2, WrapMode::Back), 1);
+
+        let left = group_left_rows(&a, &b, &c_mixed);
+        let right = group_right_rows(&a, &b, &c_mixed);
+        assert_ne!(
+            left, right,
+            "a change of MODE with no reset between MUST break associativity — \
+             mode joined wrap in the junction term, so the domain got NARROWER, \
+             not wider. Measured: {left} vs {right}"
+        );
+        // The exact counterexample, pinned. a.rows + b.rows is 2 either way; the
+        // junction contributes 3 under the left grouping (evaluated with b's
+        // WrapDown) and 1 under the right (evaluated with c's WrapBack).
+        assert_eq!((left, right), (5, 3), "the measured counterexample");
+        assert_eq!(
+            group_left_rows(&a, &b, &c_uniform),
+            group_right_rows(&a, &b, &c_uniform),
+            "and under one mode it must hold exactly"
+        );
+    }
+
+    /// THE CONSTRUCTIVE HALF. Two items in one arena with DIFFERENT modes, run
+    /// through the scan form at chunk/group/shard tunings chosen so intervals
+    /// straddle the boundary — and it agrees with the serial fold on every exact
+    /// lane at every tuning, because the boundary's resetting leaf absorbs the
+    /// prefix before a mode can leak across it.
+    ///
+    /// This is what would go red if item isolation were ever weakened, and it is a
+    /// different claim from the corpus's `wrapback-items` fixture: that one gates
+    /// the ANSWER, this one gates the REGROUPING.
+    #[test]
+    fn mixed_modes_across_an_item_boundary_agree_with_the_serial_fold() {
+        let t = trie();
+        // Lines of 6 cells at wrap 3: two rows each in item A (WrapDown), one row
+        // each in item B (WrapBack).
+        let bytes: Vec<u8> =
+            (0..180).map(|i| if i % 7 == 6 { b'\n' } else { b'a' + (i % 20) as u8 }).collect();
+        let items = [
+            Item {
+                byte_start: 0, byte_count: 90, wrap_width: 3, wrap_mode: WrapMode::Down,
+                z_step: 0.2, line_height: 1.0, ..Item::default()
+            },
+            Item {
+                byte_start: 90, byte_count: 90, wrap_width: 3, wrap_mode: WrapMode::Back,
+                origin_y: 4.0, z_step: 0.2, line_height: 1.0, ..Item::default()
+            },
+        ];
+        let serial = run_pipeline(&bytes, &t, &items);
+        // ANTI-VACUITY: the two items must actually lay out differently, or the
+        // agreement below is about one mode twice.
+        assert!(
+            serial.item_bounds[6] > serial.item_bounds[8 + 6],
+            "item A (WrapDown) must occupy more rows than item B (WrapBack): {} vs {}",
+            serial.item_bounds[6], serial.item_bounds[8 + 6]
+        );
+        for &(chunk, group, shards) in
+            &[(64usize, 256usize, 1usize), (7, 3, 3), (1, 1, 8), (91, 2, 4), (13, 5, 11)]
+        {
+            let scanned = run_scan_pipeline(&bytes, &t, &items, chunk, group, shards);
+            for id in 0..bytes.len() {
+                let where_ = format!("byte {id} at K={chunk}/G={group}/S={shards}");
+                assert_eq!(scanned.slots.lc[id * 2], serial.slots.lc[id * 2], "ROW, {where_}");
+                assert_eq!(
+                    scanned.slots.lc[id * 2 + 1], serial.slots.lc[id * 2 + 1], "COL, {where_}"
+                );
+                assert_eq!(scanned.slots.wc[id], serial.slots.wc[id], "ORD, {where_}");
+                assert_eq!(scanned.slots.fl[id], serial.slots.fl[id], "FLAGS, {where_}");
+                assert_eq!(
+                    scanned.slots.z(id).to_bits(), serial.slots.z(id).to_bits(), "Z, {where_}"
+                );
+                assert_eq!(
+                    scanned.slots.y(id).to_bits(), serial.slots.y(id).to_bits(), "Y, {where_}"
+                );
+            }
+            assert_eq!(scanned.slots.ord_to_byte, serial.slots.ord_to_byte, "ordToByte");
+        }
+    }
+
     #[test]
     fn reset_absorbs_everything_to_its_left() {
-        let sample = elements(8, 4);
+        let sample = elements(8, 4, WrapMode::Down);
         let mut boundary = sample[3];
         boundary.reset = 1;
         for left in &sample {
@@ -839,6 +1041,7 @@ mod tests {
             origin_y: -1.0,
             origin_z: 0.5,
             wrap_width: 7,
+            wrap_mode: WrapMode::Down,
             z_step: 0.1,
             line_height: 1.1,
             has_page: true,

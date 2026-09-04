@@ -33,7 +33,7 @@ use crate::text::{ResolveGlyph, WorldEntry};
 
 /// 'G3DF' — a pipeline fixture.
 const PIPE_MAGIC: u32 = 0x4644_3347;
-const PIPE_VERSION: u32 = 3;
+const PIPE_VERSION: u32 = 4;
 
 /// Fixture lane strides. These are the ON-DISK strides from
 /// `schema/glyph-identity.json` (FIXTURE_MEASURE_STRIDE / FIXTURE_COUNT_STRIDE),
@@ -280,9 +280,13 @@ fn load_pipe_bytes(raw: &[u8], name: String) -> Result<PipeFixture, String> {
             origin_x: r.f64()?,
             origin_y: r.f64()?,
             origin_z: r.f64()?,
-            // THE BOUNDARY: v3 carries item params as f64 VALUES; the five
+            // THE BOUNDARY: v3+ carries item params as f64 VALUES; the five
             // integer page-geometry params truncate HERE, once.
             wrap_width: trunc_nonneg(r.f64()?),
+            // v4: the wrap MODE, beside the wrap because it is the same kind of
+            // parameter — item-level, never per line. An out-of-range code is
+            // refused rather than defaulted (`WrapMode::from_code`).
+            wrap_mode: crate::fold::WrapMode::from_code(r.f64()? as i64),
             z_step: r.f64()?,
             line_height: r.f64()?,
             has_page: r.f64()? > 0.5,
@@ -442,6 +446,7 @@ impl PipeFixture {
             h_items.f64(it.origin_y);
             h_items.f64(it.origin_z);
             h_items.i64(it.wrap_width);
+            h_items.i64(it.wrap_mode.code());
             h_items.f64(it.z_step);
             h_items.f64(it.line_height);
             h_items.u8(u8::from(it.has_page));
@@ -682,6 +687,14 @@ fn out_of_domain(fx: &PipeFixture) -> Option<String> {
     }
     if it.wrap_width != 0 {
         return Some(format!("wrap_width={}", it.wrap_width));
+    }
+    // Out of domain for the independent reference, which folds one row per line
+    // with no wrap at all. wrap_width == 0 already forces mode A's arithmetic —
+    // rows_for_line is 1 either way there — but an item that ASKS for WrapBack
+    // is stating an intent this reference does not model, and silently laying it
+    // out as if it had not is how a domain gap becomes a false green.
+    if it.wrap_mode != crate::fold::WrapMode::Down {
+        return Some("wrap_mode=Back".to_string());
     }
     if it.has_page {
         return Some("paged".to_string());
@@ -1309,7 +1322,10 @@ mod tests {
         // Full consumption is asserted inside the loader, so reaching Ok() here
         // IS the structural check — a wrong stride cannot get this far.
         let paths = all_fixtures();
-        assert_eq!(paths.len(), 14, "corpus size changed — update the expectation deliberately");
+        // 17 since the three WrapBack fixtures landed (was 14). Pinned as a
+        // COUNT rather than a nonzero check: a fixture that stopped being
+        // discovered would otherwise quietly lower coverage instead of failing.
+        assert_eq!(paths.len(), 17, "corpus size changed — update the expectation deliberately");
         for p in &paths {
             let fx = load_pipe_fixture(p).unwrap_or_else(|e| panic!("{}", e));
             assert_eq!(fx.exp_measures.len(), fx.byte_len * FIXTURE_MEASURE_STRIDE);

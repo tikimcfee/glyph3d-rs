@@ -46,11 +46,11 @@ was the file the corpus came from. `node gen.mjs && shasum -c` is that check.
 |---|---|---:|---|:--:|
 | `engine/fixtures/inputs/GlyphTrie.js` | `packages/glyph3d-core/src/compute/GlyphTrie.js` | 9498 | `288dcb3cdac888b7…` | MISMATCH |
 | `engine/fixtures/inputs/foldGeometry.js` | `packages/glyph3d-core/src/core/foldGeometry.js` | 14806 | `c925c6d2c8036f2b…` | yes |
-| `engine/fixtures/inputs/glyphBake.js` | `packages/glyph3d-core/src/compute/glyphBake.js` | 11306 | `2ec10264c462294f…` | MISMATCH |
+| `engine/fixtures/inputs/glyphBake.js` | `packages/glyph3d-core/src/compute/glyphBake.js` | 11761 | `5ba631bdbd6ed5e5…` | MISMATCH |
 | `engine/fixtures/inputs/glyphPipelineKernels.js` | `packages/glyph3d-core/src/compute/glyphPipelineKernels.js` | 90515 | `c785a572091d2f37…` | MISMATCH |
-| `engine/fixtures/inputs/glyphPipelineReference.js` | `packages/glyph3d-core/src/compute/glyphPipelineReference.js` | 40891 | `fcb991dcea4df400…` | MISMATCH |
-| `engine/fixtures/inputs/glyphPipelineScan.js` | `packages/glyph3d-core/src/compute/glyphPipelineScan.js` | 14138 | `eb1e51392f25fd2e…` | MISMATCH |
-| `schema/glyph-identity.json` | `schema/glyph-identity.json` | 18233 | `b27a4f0cb6ae7ecd…` | yes |
+| `engine/fixtures/inputs/glyphPipelineReference.js` | `packages/glyph3d-core/src/compute/glyphPipelineReference.js` | 44125 | `02ca437b084c3e8a…` | MISMATCH |
+| `engine/fixtures/inputs/glyphPipelineScan.js` | `packages/glyph3d-core/src/compute/glyphPipelineScan.js` | 15254 | `4b83b7447b66695e…` | MISMATCH |
+| `schema/glyph-identity.json` | `schema/glyph-identity.json` | 19158 | `b4b838430677b383…` | MISMATCH |
 | `tools/vendor/ref/app/public/slug-core/slug-core.1tstke3lync.bin` | `app/public/slug-core/slug-core.1tstke3lync.bin` | 609569 | `647ccdaba087de1f…` | yes |
 | `tools/vendor/ref/packages/glyph3d-core/src/fonts/Cousine-Regular.ttf` | `packages/glyph3d-core/src/fonts/Cousine-Regular.ttf` | 300208 | `dcd526004fcfec4e…` | yes |
 | `tools/vendor/ref/packages/glyph3d-core/src/fonts/DejaVuSans.ttf` | `packages/glyph3d-core/src/fonts/DejaVuSans.ttf` | 759720 | `6038a160b491e121…` | yes |

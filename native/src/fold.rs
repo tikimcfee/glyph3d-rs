@@ -56,6 +56,57 @@ pub const NEWLINE: u32 = 0x0A;
 /// The trie's own missing bit, distinct from the slot flag above.
 pub const TRIE_FLAG_MISSING: u32 = 1;
 
+/// THE WRAP MODE — an ITEM-LEVEL parameter, never per line and never per range.
+///
+/// | mode | a wrap advances the ROW | rows_for_line(n, wrap) | z |
+/// |---|---|---|---|
+/// | `Down` | yes | `ceil(n / wrap)` | `-segment * z_step` |
+/// | `Back` | NO | `1`, always | `-segment * z_step` |
+///
+/// Under `Back` every wrap segment of a line shares ONE row and the segments stack
+/// in DEPTH instead, so a line's row is just its line index. `col` still counts
+/// within the LOGICAL line, `segment_advance` still resets at every fold boundary
+/// (each segment starts at x = 0), and the wrap SEGMENT index still exists in both
+/// modes — under `Back` it feeds z and no longer feeds row. Picking by (row, col)
+/// still resolves uniquely because col differs between segments.
+///
+/// WHY IT IS ITEM-LEVEL AND MUST STAY THAT WAY: `scan::scan_combine`'s junction term
+/// evaluates `rows_for_line` with `b`'s parameters, so it is not associative across a
+/// change of them. Mode joins wrap in that term, which makes the non-associative
+/// surface WIDER, not narrower. What keeps the scan form safe is structural and
+/// unchanged: an item boundary emits a resetting leaf, so no interval without a reset
+/// spans two items. See `scan::tests::mixed_mode_is_outside_the_monoid_s_domain`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum WrapMode {
+    /// A wrap advances the visual row. Today's behaviour, and the default.
+    #[default]
+    Down,
+    /// A wrap keeps the row and steps only in depth.
+    Back,
+}
+
+impl WrapMode {
+    /// The wire encoding: 0 = Down, 1 = Back. Shared by the `.pipe.bin` item
+    /// record, the FFI descriptor and the device item table.
+    pub const fn code(self) -> i64 {
+        match self {
+            WrapMode::Down => 0,
+            WrapMode::Back => 1,
+        }
+    }
+
+    /// FAIL LOUD AT THE SEAM: an unknown code is malformed input, not a request
+    /// for the default. Folding it silently to `Down` is how a caller's typo
+    /// becomes an invisible layout.
+    pub fn from_code(code: i64) -> Self {
+        match code {
+            0 => WrapMode::Down,
+            1 => WrapMode::Back,
+            other => panic!("wrap mode must be 0 (Down) or 1 (Back), got {other}"),
+        }
+    }
+}
+
 /// One file in the arena: byte range + layout params.
 ///
 /// FIELD ORDER IS LOAD-BEARING — `fixture::PipeFixture::manifest` hashes these
@@ -74,6 +125,8 @@ pub struct Item {
     pub origin_y: f64,
     pub origin_z: f64,
     pub wrap_width: i64,
+    /// Item-level, exactly like `wrap_width`. See [`WrapMode`].
+    pub wrap_mode: WrapMode,
     pub z_step: f64,
     pub line_height: f64,
     pub has_page: bool,
@@ -264,8 +317,11 @@ pub(crate) fn decode_codepoint_at(bytes: &[u8], slot: usize, sequence_len: usize
     }
 }
 
-/// Visual rows a line of `length` cells occupies under `wrap` — a CEILING with
-/// a floor of one, since an empty line still occupies the row it sits on.
+/// Visual rows a line of `length` cells occupies under `wrap` and `mode`.
+///
+/// Under [`WrapMode::Down`] a CEILING with a floor of one, since an empty line
+/// still occupies the row it sits on. Under [`WrapMode::Back`] it is ONE for
+/// every line, whatever the length — that identity is the mode.
 ///
 /// THE PHANTOM ROW (corrected 2026-09-04). This was `length / wrap + 1`, which
 /// counts the row the terminating newline rides on. The newline rides at column
@@ -278,7 +334,12 @@ pub(crate) fn decode_codepoint_at(bytes: &[u8], slot: usize, sequence_len: usize
 /// The frozen JS oracle corpus was generated under the old rule, so it SPECIFIES
 /// the phantom; see `engine/delta/phantom-row.md` for the fixtures and lanes
 /// that must be regenerated.
-pub(crate) fn rows_for_line(length: i64, wrap: i64) -> i64 {
+pub(crate) fn rows_for_line(length: i64, wrap: i64, mode: WrapMode) -> i64 {
+    if mode == WrapMode::Back {
+        // A WrapBack line occupies exactly the row it sits on, whatever its
+        // length: the folds go into depth, and depth costs no rows.
+        return 1;
+    }
     if wrap <= 0 || length <= 0 {
         1
     } else {
@@ -286,24 +347,46 @@ pub(crate) fn rows_for_line(length: i64, wrap: i64) -> i64 {
     }
 }
 
-/// The LINE-LOCAL row a cell at column `col` occupies under `wrap`.
+/// The WRAP SEGMENT index of a cell at column `col` — how many times its line
+/// has already folded before reaching it. MODE-FREE: this is the DEPTH fan's
+/// index and it exists in both modes; only its contribution to the ROW is a
+/// mode question ([`wrap_row_of`]).
 ///
 /// Two kinds of cell, and they differ at exactly one place. An ordinary glyph
-/// at column `col` sits on `col / wrap`. A NEWLINE is a terminator riding at
-/// one-past-the-last cell (`col == the line's glyph count`), so at an exact
-/// multiple `col / wrap` would roll it onto the next row — a row that holds
-/// nothing else. It belongs on the last row its line reaches.
+/// at column `col` sits in segment `col / wrap`. A NEWLINE is a terminator
+/// riding at one-past-the-last cell (`col == the line's glyph count`), so at an
+/// exact multiple `col / wrap` would roll it into a segment that holds nothing
+/// else. It belongs to the last segment its line reaches.
 ///
-/// Every consumer of (col, wrap) -> row goes through here. Deriving the two
+/// Every consumer of (col, wrap) -> segment goes through here. Deriving the two
 /// cases from one expression is what let the terminator open a phantom row in
 /// the first place, and the special case is worth a name.
-pub(crate) fn wrap_row_of(col: i64, wrap: i64, terminator: bool) -> i64 {
+pub(crate) fn wrap_segment_of(col: i64, wrap: i64, terminator: bool) -> i64 {
     if wrap <= 0 {
         0
     } else if terminator {
-        rows_for_line(col, wrap) - 1
+        // `rows_for_line(col, wrap, Down) - 1`, written out so the segment index
+        // cannot pick up a mode through the helper it used to borrow.
+        if col <= 0 {
+            0
+        } else {
+            (col - 1) / wrap
+        }
     } else {
         col / wrap
+    }
+}
+
+/// The LINE-LOCAL ROW CONTRIBUTION of a cell at column `col`.
+///
+/// `Down` delegates to [`wrap_segment_of`] — which is the whole of the
+/// default's proof: mode A's row IS the segment index, byte for byte, as it was
+/// before modes existed. `Back` contributes ZERO, because a wrap does not
+/// advance the row at all in that mode.
+pub(crate) fn wrap_row_of(col: i64, wrap: i64, terminator: bool, mode: WrapMode) -> i64 {
+    match mode {
+        WrapMode::Down => wrap_segment_of(col, wrap, terminator),
+        WrapMode::Back => 0,
     }
 }
 
@@ -375,6 +458,7 @@ fn layout_item(
     write_bounds: bool,
 ) {
     let wrap = item.wrap_width;
+    let mode = item.wrap_mode;
     // The FOLD UNIT: wrap wins over page_cols when both are set, which is why
     // `paged + wrapped` is a dangerous pair — BASE_X then means something
     // different while paginate still divides the same col by cols for x_page and
@@ -418,9 +502,14 @@ fn layout_item(
             continue;
         }
         let advance = slots.advance(id);
-        // The newline is a TERMINATOR at one-past-the-last cell, so at an exact
-        // multiple it stays on the row it closes instead of opening the next.
-        let wrap_row = wrap_row_of(col, wrap, slots.flags(id) & F_NEWLINE != 0);
+        // TWO indices, and under WrapBack they differ. `wrap_segment` is the DEPTH
+        // fan's index and always exists; `wrap_row` is what that segment
+        // contributes to the ROW, which WrapBack makes zero. The newline is a
+        // TERMINATOR at one-past-the-last cell, so at an exact multiple it stays in
+        // the segment it closes instead of opening the next.
+        let terminator = slots.flags(id) & F_NEWLINE != 0;
+        let wrap_segment = wrap_segment_of(col, wrap, terminator);
+        let wrap_row = wrap_row_of(col, wrap, terminator, mode);
         let row = base_row + wrap_row;
         // THE CARRIER CHOICE, and the whole of landmine 2 in one line.
         let item_relative_x: f64 = if fold_unit > 0 {
@@ -434,7 +523,7 @@ fn layout_item(
         let position_x = (item_relative_x + origin_x) as f32;
         slots.lm[id * 4] = position_x;
         slots.lm[id * 4 + 1] = (-(row as f64) * line_height + origin_y) as f32;
-        slots.lm[id * 4 + 2] = (-(wrap_row as f64) * z_step + origin_z) as f32;
+        slots.lm[id * 4 + 2] = (-(wrap_segment as f64) * z_step + origin_z) as f32;
         slots.lm[id * 4 + 3] = position_x;
         slots.lc[id * 2] = row as u32;
         slots.lc[id * 2 + 1] = col as u32;
@@ -482,7 +571,7 @@ fn layout_item(
         }
         ord += 1;
         if slots.flags(id) & F_NEWLINE != 0 {
-            base_row += rows_for_line(col, wrap);
+            base_row += rows_for_line(col, wrap, mode);
             col = 0;
             line_advance = 0.0;
             segment_advance = 0.0;
@@ -543,8 +632,11 @@ pub(crate) fn paginate(slots: &mut Slots, id: usize, item: &Item, page_stride_x:
     // The SAME rule the fold's Z used, terminator case included: paginate
     // recomputes Z from the COL lane, so a divergence here would put a
     // newline's depth one wrap step behind its own row's.
+    // Z is the DEPTH fan, so it reads the SEGMENT index, not the row
+    // contribution — under WrapBack those differ and the segments are all z has
+    // left. The ROW lane it reads above already carries the mode.
     let wrap_segment =
-        wrap_row_of(col, item.wrap_width, slots.flags(id) & F_NEWLINE != 0);
+        wrap_segment_of(col, item.wrap_width, slots.flags(id) & F_NEWLINE != 0);
     let line_height = item.line_height;
 
     slots.lm[id * 4] =
@@ -899,8 +991,25 @@ mod tests {
             (0, 0, 1),
         ];
         for (length, wrap, want) in table {
-            assert_eq!(rows_for_line(length, wrap), want, "rows_for_line({length}, {wrap})");
+            assert_eq!(
+                rows_for_line(length, wrap, WrapMode::Down),
+                want,
+                "rows_for_line({length}, {wrap})"
+            );
+            // THE MODE, on the same table: WrapBack collapses every one of these
+            // to a single row, including the entries where WrapDown counts 50.
+            assert_eq!(
+                rows_for_line(length, wrap, WrapMode::Back),
+                1,
+                "rows_for_line({length}, {wrap}, Back) is one row, always"
+            );
         }
+        // ANTI-VACUITY on that second claim: the table must contain a row where
+        // the two modes actually differ, or "always 1" is agreeing with WrapDown.
+        assert!(
+            table.iter().any(|&(n, w, _)| rows_for_line(n, w, WrapMode::Down) > 1),
+            "the table must contain a line that WrapDown folds"
+        );
     }
 
     /// The terminator's own row: a newline sits on the row it CLOSES, never on
@@ -920,11 +1029,48 @@ mod tests {
             (5000, 100, 49),
         ];
         for (col, wrap, want) in table {
-            assert_eq!(wrap_row_of(col, wrap, true), want, "newline at col {col}, wrap {wrap}");
+            assert_eq!(
+                wrap_row_of(col, wrap, true, WrapMode::Down),
+                want,
+                "newline at col {col}, wrap {wrap}"
+            );
             // An ORDINARY cell at the same column is unaffected: the two rules
             // differ only for the terminator, and only at a multiple.
-            assert_eq!(wrap_row_of(col, wrap, false), col / wrap, "glyph at col {col}");
+            assert_eq!(
+                wrap_row_of(col, wrap, false, WrapMode::Down),
+                col / wrap,
+                "glyph at col {col}"
+            );
+            // THE SEGMENT INDEX IS MODE-FREE, and WrapDown's row IS that index.
+            // Both halves matter: the first is what keeps z alive under WrapBack,
+            // the second is why mode A cannot have moved.
+            assert_eq!(
+                wrap_segment_of(col, wrap, true),
+                wrap_row_of(col, wrap, true, WrapMode::Down),
+                "WrapDown's row is the segment index, terminator at col {col}"
+            );
+            assert_eq!(
+                wrap_segment_of(col, wrap, false),
+                wrap_row_of(col, wrap, false, WrapMode::Down),
+                "WrapDown's row is the segment index, glyph at col {col}"
+            );
+            assert_eq!(
+                wrap_row_of(col, wrap, true, WrapMode::Back),
+                0,
+                "WrapBack spends no row, terminator at col {col}"
+            );
+            assert_eq!(
+                wrap_row_of(col, wrap, false, WrapMode::Back),
+                0,
+                "WrapBack spends no row, glyph at col {col}"
+            );
         }
+        // ANTI-VACUITY: some column in the table must have a NONZERO segment, or
+        // "WrapBack returns 0" is indistinguishable from "so does WrapDown here".
+        assert!(
+            table.iter().any(|&(col, wrap, _)| wrap_segment_of(col, wrap, false) > 0),
+            "the table must contain a column past the first segment"
+        );
     }
 
     /// THE DEFECT, on the fixture it was measured on.

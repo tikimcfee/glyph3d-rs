@@ -194,6 +194,17 @@ pub struct RepoParams {
     /// so every repo render was flat — the algorithm was ported and then
     /// never wired. Setting it to 0 restores that flatness exactly.
     pub z_wrap_spacing: f64,
+    /// HOW A WRAP IS SPENT. `WrapDown` (the default) advances the visual row, so
+    /// a 305,978-character line in a real bundle takes 3,060 rows and pushes
+    /// every later line that far into the distance. `WrapBack` keeps the row and
+    /// spends the wrap in depth instead, so the same line is ONE row and the
+    /// derangement goes into the axis nothing else on the shelf is using.
+    ///
+    /// Measured on `native/fixtures/visual-check/one-long-line.txt`: 440 rows in
+    /// WrapDown, 1 in WrapBack. The DEFAULT MUST STAY `Down` — the four
+    /// screenshot baselines are byte-equal gates, and a moved baseline under the
+    /// default mode is a bug, not a re-baseline.
+    pub wrap_mode: crate::fold::WrapMode,
 }
 
 impl Default for RepoParams {
@@ -209,6 +220,7 @@ impl Default for RepoParams {
             gap_y: 6.0,
             grid_aspect: 1.6,
             z_wrap_spacing: 0.15,
+            wrap_mode: crate::fold::WrapMode::Down,
         }
     }
 }
@@ -233,6 +245,7 @@ pub fn file_item_params(p: &RepoParams, byte_len: usize, newline_count: usize) -
     ItemParams {
         line_height: p.line_height,
         wrap_width: p.wrap_cols,
+        wrap_mode: p.wrap_mode,
         has_page: true,
         page_rows: p.page_rows,
         page_cols: 0,

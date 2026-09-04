@@ -39,7 +39,7 @@ from std.collections import Dict
 from glyph_schema import LC_STRIDE, LC_ROW, LC_COL, LM_STRIDE, LM_Z
 from glyph_pipeline import (
     run_pipeline, Item, Trie, F_LEADER, F_NEWLINE, F_RENDERED, F_MISSING,
-    page_active, wrap_row_of,
+    page_active, wrap_segment_of, WRAP_DOWN, WRAP_BACK,
 )
 from fixture_io import load_pipe_fixture
 
@@ -63,7 +63,9 @@ def build_corpus(n: Int, with_misses: Bool) -> List[UInt8]:
     return b^
 
 
-def build_items(n: Int, count: Int, wrap: Int, page: Int, scroll: Bool) -> List[Item]:
+def build_items(
+    n: Int, count: Int, wrap: Int, page: Int, scroll: Bool, mode: Int = WRAP_DOWN
+) -> List[Item]:
     """`count` items tiling [0, n) with DISTINCT origins and MIXED page modes.
 
     page: 0 none, 1 row-paged, 2 column-paged. When nonzero, only the ODD items
@@ -81,6 +83,7 @@ def build_items(n: Int, count: Int, wrap: Int, page: Int, scroll: Bool) -> List[
         it.origin_y = Float64(i) * 101.0             # distinct
         it.origin_z = Float64(i) * 3.0               # distinct
         it.wrap_width = wrap
+        it.wrap_mode = mode
         it.z_step = 0.5
         # ODD items only, so a run is MIXED and a thread landing on the wrong
         # item crosses a paged/unpaged boundary. But a ONE-item run has no odd
@@ -111,7 +114,7 @@ def build_items(n: Int, count: Int, wrap: Int, page: Int, scroll: Bool) -> List[
 
 def check(
     name: String, bytes: List[UInt8], trie: Trie, items: List[Item],
-    want_wrap: Int, want_page: Int, want_scroll: Bool,
+    want_wrap: Int, want_page: Int, want_scroll: Bool, want_mode: Int = WRAP_DOWN,
 ) -> Tuple[Int, Int]:
     """Five invariants that hold for ANY input, plus the engagement check that
     says the cell exercised what its label claims. No oracle required."""
@@ -176,6 +179,15 @@ def check(
     # signature is arithmetic: a source line of length L occupies L//W + 1 rows,
     # so a wrapped item's maximum ROW exceeds its newline count and an unwrapped
     # item's cannot.
+    #
+    #      UNDER WRAP_BACK THE SIGNATURE INVERTS, and the check has to invert with
+    #      it or it reports every WrapBack cell vacuous. A WrapBack item's maximum
+    #      ROW is exactly its newline count however long its lines are — that
+    #      equality IS the mode — so the row-side evidence of wrapping disappears
+    #      by design and the wrap shows up in COL and Z instead. Two claims per
+    #      cell there: the rows must NOT exceed the newlines (WrapDown's evidence
+    #      must be absent), and some rendered leader must sit at a column past the
+    #      wrap width (the fold must still have folded something).
     if want_wrap > 0:
         var wrapped = False
         var observable = False
@@ -184,6 +196,7 @@ def check(
                 continue          # paginate remaps rows; the count means nothing there
             var newlines = 0
             var max_row = 0
+            var max_col = 0
             var stop = items[i].byte_start + items[i].byte_count
             for id in range(items[i].byte_start, stop):
                 if id >= n:
@@ -196,7 +209,18 @@ def check(
                 var row = Int(r.lc[id * LC_STRIDE + LC_ROW])
                 if row > max_row:
                     max_row = row
-            if max_row > newlines:
+                var col = Int(r.lc[id * LC_STRIDE + LC_COL])
+                if col > max_col:
+                    max_col = col
+            if want_mode == WRAP_BACK:
+                if max_row > newlines:
+                    print("  ", name, "WRAP_BACK item", i, "reached row", max_row,
+                          "past its", newlines, "newlines — a wrap spent a row")
+                    bad += 1
+                if max_col >= want_wrap:
+                    wrapped = True
+                    break
+            elif max_row > newlines:
                 wrapped = True
                 break
             observable = True
@@ -386,7 +410,7 @@ def check(
             # Same terminator rule as paginate's Z: a newline rides one-past-the
             # -last cell, so bucketing it by `col // wrap` would put it in the
             # NEXT wrap segment and report a false Z disagreement.
-            var seg = wrap_row_of(col, wrap, (f & F_NEWLINE) != 0)
+            var seg = wrap_segment_of(col, wrap, (f & F_NEWLINE) != 0)
             if seg >= 65536 or band >= 65536 or x_page >= 65536:
                 continue          # the packed key would alias; not for this corpus
             var key = (seg * 65536 + band) * 65536 + x_page
@@ -430,6 +454,10 @@ def main() raises:
     var item_counts: List[Int] = [1, 3]
     var wraps: List[Int] = [0, 5]
     var pages: List[Int] = [0, 1, 2]
+    # SIX dimensions now: the wrap MODE crosses the whole matrix, so WrapBack meets
+    # multi-item arenas, both page kinds, the scroll conveyor and the trie misses —
+    # combinations no fixture carries and none is going to.
+    var modes: List[Int] = [WRAP_DOWN, WRAP_BACK]
     for mi in range(2):
         var with_misses = mi == 1
         var bytes = build_corpus(n, with_misses)
@@ -437,25 +465,28 @@ def main() raises:
             for wi in range(len(wraps)):
                 for pi in range(len(pages)):
                     for si in range(2):
-                        var scroll = si == 1
-                        var items = build_items(
-                            n, item_counts[ic], wraps[wi], pages[pi], scroll
-                        )
-                        var label = String("items=") + String(item_counts[ic])
-                        label += " wrap=" + String(Int(wraps[wi]))
-                        label += " page=" + String(pages[pi])
-                        label += " scroll=" + String(1 if scroll else 0)
-                        label += " miss=" + String(1 if with_misses else 0)
-                        var res = check(
-                            label, bytes, fx.trie, items,
-                            wraps[wi], pages[pi], scroll,
-                        )
-                        var b = res[0]
-                        total_z_classes += res[1]
-                        cases += 1
-                        if b != 0:
-                            print("FAIL", label, "-", b, "defects")
-                        bad += b
+                        for wm in range(len(modes)):
+                            var scroll = si == 1
+                            var items = build_items(
+                                n, item_counts[ic], wraps[wi], pages[pi], scroll,
+                                modes[wm],
+                            )
+                            var label = String("items=") + String(item_counts[ic])
+                            label += " wrap=" + String(Int(wraps[wi]))
+                            label += " mode=" + String(modes[wm])
+                            label += " page=" + String(pages[pi])
+                            label += " scroll=" + String(1 if scroll else 0)
+                            label += " miss=" + String(1 if with_misses else 0)
+                            var res = check(
+                                label, bytes, fx.trie, items,
+                                wraps[wi], pages[pi], scroll, modes[wm],
+                            )
+                            var b = res[0]
+                            total_z_classes += res[1]
+                            cases += 1
+                            if b != 0:
+                                print("FAIL", label, "-", b, "defects")
+                            bad += b
 
     # ANTI-VACUITY for invariant 6. Every item contributes at least one Z class,
     # so a run where depth NEVER varied yields exactly one per item and the
@@ -464,7 +495,7 @@ def main() raises:
     # invariant had something to compare.
     var min_classes = 0
     for ic2 in range(len(item_counts)):
-        min_classes += item_counts[ic2] * 2 * len(pages) * 2 * 2
+        min_classes += item_counts[ic2] * 2 * len(pages) * 2 * 2 * len(modes)
     if total_z_classes <= min_classes:
         print("VACUOUS: Z never varied —", total_z_classes, "distinct Z values over",
               min_classes, "items; every item sat on a single depth plane")
@@ -473,5 +504,6 @@ def main() raises:
     if bad != 0:
         raise Error("matrix conformance failed")
     print("matrix conformance:", cases,
-          "property combinations, all five census gaps covered, invariants hold;",
+          "property combinations (wrap x MODE x page x scroll x items x misses),",
+          "all five census gaps covered, invariants hold;",
           total_z_classes, "distinct Z values over", min_classes, "items")

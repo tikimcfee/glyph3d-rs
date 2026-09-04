@@ -49,6 +49,7 @@ extern "C" {
         line_height: f64,
         z_step: f64,
         wrap_width: i32,
+        wrap_mode: i32,
         has_page: i32,
         page_rows: i32,
         page_cols: i32,
@@ -66,7 +67,7 @@ extern "C" {
         -> u64;
     // Stage E2: batched load — one call for a whole corpus. Descriptors are
     // 128 B blocks (explicit byte layout documented in ffi.mojo): ten f64
-    // params, six i32 params, then u64 byte_start/byte_count.
+    // params, SEVEN i32 params, then u64 byte_start/byte_count.
     fn glyph_engine_load_items(
         handle: *mut c_void,
         blob_ptr: *const u8,
@@ -101,6 +102,9 @@ pub fn write_item_desc(block: &mut [u8], params: &ItemParams, byte_start: u64, b
     for (i, v) in f64s.iter().enumerate() {
         block[i * 8..i * 8 + 8].copy_from_slice(&v.to_le_bytes());
     }
+    // SEVEN i32s since the wrap mode joined them: 80..108, leaving 108..112 pad.
+    // The block stayed 128 B — 10 f64 + 7 i32 + 2 u64 is 124 — which is why
+    // ITEM_DESC_SIZE did not move. Asserted below rather than trusted.
     let i32s = [
         params.wrap_width,
         params.has_page as i32,
@@ -108,7 +112,15 @@ pub fn write_item_desc(block: &mut [u8], params: &ItemParams, byte_start: u64, b
         params.page_cols,
         params.scroll_rows,
         params.pages_wide,
+        params.wrap_mode.code() as i32,
     ];
+    // Derived from the array, not from a literal: adding an i32 without moving
+    // ITEM_DESC_SIZE would silently overwrite byte_start at 112.
+    assert!(
+        80 + i32s.len() * 4 <= 112,
+        "{} i32 params overrun the descriptor's byte_start at 112",
+        i32s.len()
+    );
     for (i, v) in i32s.iter().enumerate() {
         block[80 + i * 4..84 + i * 4].copy_from_slice(&v.to_le_bytes());
     }
@@ -209,6 +221,7 @@ impl Engine {
                 params.line_height,
                 params.z_step,
                 params.wrap_width,
+                params.wrap_mode.code() as i32,
                 params.has_page as i32,
                 params.page_rows,
                 params.page_cols,

@@ -6,10 +6,15 @@
  * contract the state split ships to clients:
  *   - prefixAt: checkpoint-seeded random access to the exclusive prefix of a byte
  *   - lanesFromPrefix: the O(1) row/col/ord/lineAdv derivation at a given wrap
- *   - rowsUnderWrap: exact visual rows under arbitrary wrap, from the histogram
+ *   - rowsUnderWrap: exact visual rows under arbitrary wrap AND wrap mode, from
+ *     the histogram (WrapBack makes every line one row, so this counts lines)
  *
  * Format 'G3DB' v1 (little-endian, packed):
- *   u32 magic 0x42443347  u32 version=2   (v2: trie blocks are f64 VALUES — see gen.mjs)
+ *   u32 magic 0x42443347  u32 version=3   (v2: trie blocks are f64 VALUES — see
+ *     gen.mjs. v3: both query kinds carry a WRAP MODE beside the wrap, because
+ *     row-valued answers now depend on it. The bake RECORD is mode-free: it folds
+ *     at wrap 0, where rowsForLine is 1 under either mode, so nothing it stores
+ *     could differ — mode is a QUERY parameter here, exactly like wrap.)
  *   u32 byteLen  u32 blockIndexLen  u32 blocksFloatLen
  *   f64 lineHeight  u32 checkpointInterval
  *   u8[byteLen] bytes   u32[] blockIndex   f32[] blocks
@@ -23,10 +28,10 @@
  *     u32 censusCount  u32[] census (sorted)
  *     u32 missingCount  u32[] missing (sorted)
  *   queries:
- *     u32 prefixQueryCount × { u32 byteIndex, u32 wrap,
+ *     u32 prefixQueryCount × { u32 byteIndex, u32 wrap, u32 wrapMode,
  *       f64[7] prefix (reset nl glyphs rows headLen tailLen tailAdv),
  *       u32 row, u32 col, u32 ord, f64 lineAdv }
- *     u32 wrapQueryCount × { u32 wrap, u32 rows }
+ *     u32 wrapQueryCount × { u32 wrap, u32 wrapMode, u32 rows }
  *
  * Run: bun engine/fixtures/gen-bake.mjs   (writes *.bake.bin beside this file)
  */
@@ -106,24 +111,31 @@ for (const c of CASES) {
         Math.floor(n / 2), Math.max(0, n - 1), n,
     ].filter((b) => b >= 0 && b <= n))].sort((a, b) => a - b);
     const qWraps = [0, 3, 80];
+    // BOTH MODES on every wrap. The prefix ITSELF is mode-free (the bake folds at
+    // wrap 0); what the mode changes is the row the prefix RESOLVES TO, and that is
+    // the answer the seed protocol ships.
+    const qModes = [0, 1];
     const prefixQueries = [];
     for (const b of qBytes) {
         for (const wrap of qWraps) {
-            const P = prefixAt(c.bytes, trie, r, b);
-            // Whether the QUERIED byte is itself a newline decides which row rule
-            // applies to it; the prefix cannot know, it describes everything BEFORE
-            // the byte. 0x0A is single-byte, so the leader test is the byte test.
-            // Mirrors native/src/bake.rs's `terminator`.
-            const lanes = lanesFromPrefix(P, wrap, c.bytes[b] === 0x0A);
-            prefixQueries.push({ byteIndex: b, wrap, prefix: elem7(P), lanes });
+            for (const mode of qModes) {
+                const P = prefixAt(c.bytes, trie, r, b);
+                // Whether the QUERIED byte is itself a newline decides which row rule
+                // applies to it; the prefix cannot know, it describes everything BEFORE
+                // the byte. 0x0A is single-byte, so the leader test is the byte test.
+                // Mirrors native/src/bake.rs's `terminator`.
+                const lanes = lanesFromPrefix(P, wrap, c.bytes[b] === 0x0A, mode);
+                prefixQueries.push({ byteIndex: b, wrap, mode, prefix: elem7(P), lanes });
+            }
         }
     }
-    const wrapQueries = [0, 1, 2, 3, 5, 40, 80, 100].map((wrap) => ({
-        wrap, rows: rowsUnderWrap(r, wrap),
-    }));
+    const wrapQueries = [];
+    for (const wrap of [0, 1, 2, 3, 5, 40, 80, 100]) {
+        for (const mode of qModes) wrapQueries.push({ wrap, mode, rows: rowsUnderWrap(r, wrap, mode) });
+    }
 
     const w = new Writer();
-    w.u32(0x42443347); w.u32(2);
+    w.u32(0x42443347); w.u32(3);
     w.u32(n); w.u32(trie.blockIndex.length); w.u32(trie.blocks.length);
     w.f64(c.lineHeight); w.u32(K);
     w.bytes(c.bytes);
@@ -154,13 +166,13 @@ for (const c of CASES) {
 
     w.u32(prefixQueries.length);
     for (const q of prefixQueries) {
-        w.u32(q.byteIndex); w.u32(q.wrap);
+        w.u32(q.byteIndex); w.u32(q.wrap); w.u32(q.mode);
         for (const v of q.prefix) w.f64(v);
         w.u32(q.lanes.row); w.u32(q.lanes.col); w.u32(q.lanes.ord);
         w.f64(q.lanes.lineAdv);
     }
     w.u32(wrapQueries.length);
-    for (const q of wrapQueries) { w.u32(q.wrap); w.u32(q.rows); }
+    for (const q of wrapQueries) { w.u32(q.wrap); w.u32(q.mode); w.u32(q.rows); }
 
     writeFileSync(join(HERE, `${c.name}.bake.bin`), w.done());
     console.log(`${c.name}: ${n} bytes, ${r.leaders} leaders, ${ckCount} checkpoints, ` +

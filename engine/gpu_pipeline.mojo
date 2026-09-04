@@ -34,12 +34,13 @@ from glyph_schema import (
     IM_Z_STEP, IM_BAND_STRIDE_Y, IM_DEPTH_PER_BAND, IM_DEPTH_PER_COL,
     IM_PAGE_STRIDE_X,
     IE_STRIDE, IE_PAGE_ROWS, IE_PAGE_COLS, IE_SCROLL_ROWS, IE_PAGES_WIDE,
-    IE_WRAP_WIDTH, IE_HAS_PAGE,
+    IE_WRAP_WIDTH, IE_WRAP_MODE, IE_HAS_PAGE,
     PARTIAL_COUNT_STRIDE, PARTIAL_MEASURE_STRIDE,
-    P_RESET, P_NL, P_GLYPHS, P_ROWS, P_HEAD_LEN, P_TAIL_LEN, P_WRAP, PM_TAIL_ADV,
+    P_RESET, P_NL, P_GLYPHS, P_ROWS, P_HEAD_LEN, P_TAIL_LEN, P_WRAP, P_MODE, PM_TAIL_ADV,
 )
 from glyph_pipeline import (
     F_LEADER, F_NEWLINE, trunc_nonneg, item_for_byte, derive_stride,
+    WRAP_DOWN, WRAP_BACK,
 )
 
 
@@ -77,6 +78,7 @@ struct E(Copyable, Movable):
     var head_len: Int
     var tail_len: Int
     var wrap: Int
+    var mode: Int
     var tail_adv: Float32
 
     def __init__(out self):
@@ -87,33 +89,50 @@ struct E(Copyable, Movable):
         self.head_len = 0
         self.tail_len = 0
         self.wrap = 0
+        self.mode = WRAP_DOWN
         self.tail_adv = 0
 
 
-def rows_for(length: Int, wrap: Int) -> Int:
+def rows_for(length: Int, wrap: Int, mode: Int = WRAP_DOWN) -> Int:
     """Mirror of rows_for_line — TRANSCRIBE it, do not re-derive it.
 
-    A ceiling with a floor of one, as of the 2026-09-04 phantom-row correction.
+    A ceiling with a floor of one under WRAP_DOWN, as of the 2026-09-04
+    phantom-row correction; ONE row under WRAP_BACK, whatever the length.
     Note the history, because it reads like a contradiction: the FIRST attempt
     here wrote a bare ceiling `(length + wrap - 1) // wrap` and was off by one —
     against the then-current `length // wrap + 1`, and also at length 0, where a
     bare ceiling gives 0 rows for a line that occupies one. The rule moved; the
     lesson did not. Keep this a transcription of glyph_pipeline.rows_for_line."""
+    if mode == WRAP_BACK:
+        return 1
     if wrap <= 0 or length <= 0:
         return 1
     return (length - 1) // wrap + 1
 
 
-def wrap_row_of(col: Int, wrap: Int, terminator: Bool) -> Int:
-    """Mirror of glyph_pipeline.wrap_row_of — the line-local row of a cell.
+def wrap_segment_of(col: Int, wrap: Int, terminator: Bool) -> Int:
+    """Mirror of glyph_pipeline.wrap_segment_of — the DEPTH fan's segment index,
+    mode-free, and what Z reads in both modes.
 
     A NEWLINE is a terminator riding at one-past-the-last cell, so at an exact
-    wrap multiple it stays on the row it closes rather than opening the next."""
+    wrap multiple it stays in the segment it closes rather than opening the next."""
     if wrap <= 0:
         return 0
     if terminator:
-        return rows_for(col, wrap) - 1
+        if col <= 0:
+            return 0
+        return (col - 1) // wrap
     return col // wrap
+
+
+def wrap_row_of(col: Int, wrap: Int, terminator: Bool, mode: Int = WRAP_DOWN) -> Int:
+    """Mirror of glyph_pipeline.wrap_row_of — the ROW CONTRIBUTION of a cell.
+
+    WRAP_DOWN is the segment index; WRAP_BACK is zero, because a wrap does not
+    advance the row in that mode."""
+    if mode == WRAP_BACK:
+        return 0
+    return wrap_segment_of(col, wrap, terminator)
 
 
 def combine(mut a: E, b: E):
@@ -134,8 +153,10 @@ def combine(mut a: E, b: E):
         a.tail_len = b.tail_len
         a.tail_adv = b.tail_adv
         a.wrap = b.wrap
+        a.mode = b.mode
         return
     a.wrap = b.wrap
+    a.mode = b.mode
     if b.nl == 0:
         a.tail_len += b.tail_len
         a.tail_adv = a.tail_adv + b.tail_adv  # f32 per add — exact under regrouping
@@ -147,7 +168,7 @@ def combine(mut a: E, b: E):
             a.rows = b.rows
         else:
             # The junction line: a's tail + b's head, closed by b's first newline.
-            a.rows += rows_for(a.tail_len + b.head_len, b.wrap) + b.rows
+            a.rows += rows_for(a.tail_len + b.head_len, b.wrap, b.mode) + b.rows
         a.tail_len = b.tail_len
         a.tail_adv = b.tail_adv
     a.nl += b.nl
@@ -164,6 +185,7 @@ def p_load(pc: MutPointer[UInt32, MutAnyOrigin], pm: MutPointer[Float32, MutAnyO
     e.head_len = Int(pc[unsafe_offset = o + P_HEAD_LEN])
     e.tail_len = Int(pc[unsafe_offset = o + P_TAIL_LEN])
     e.wrap = Int(pc[unsafe_offset = o + P_WRAP])
+    e.mode = Int(pc[unsafe_offset = o + P_MODE])
     e.tail_adv = pm[unsafe_offset = i * PARTIAL_MEASURE_STRIDE + PM_TAIL_ADV]
     return e^
 
@@ -177,17 +199,20 @@ def p_store(pc: MutPointer[UInt32, MutAnyOrigin], pm: MutPointer[Float32, MutAny
     pc[unsafe_offset = o + P_HEAD_LEN] = UInt32(e.head_len)
     pc[unsafe_offset = o + P_TAIL_LEN] = UInt32(e.tail_len)
     pc[unsafe_offset = o + P_WRAP] = UInt32(e.wrap)
+    pc[unsafe_offset = o + P_MODE] = UInt32(e.mode)
     pm[unsafe_offset = i * PARTIAL_MEASURE_STRIDE + PM_TAIL_ADV] = e.tail_adv
 
 
 def leaf_of(
     fl: MutPointer[UInt32, MutAnyOrigin], sm: MutPointer[Float32, MutAnyOrigin],
-    wrap_of: MutPointer[UInt32, MutAnyOrigin], is_start: MutPointer[UInt32, MutAnyOrigin],
+    wrap_of: MutPointer[UInt32, MutAnyOrigin], mode_of: MutPointer[UInt32, MutAnyOrigin],
+    is_start: MutPointer[UInt32, MutAnyOrigin],
     id: Int,
 ) -> E:
     var e = E()
     e.reset = Int(is_start[unsafe_offset=id])
     e.wrap = Int(wrap_of[unsafe_offset=id])
+    e.mode = Int(mode_of[unsafe_offset=id])
     var f = Int(fl[unsafe_offset=id])
     if (f & F_LEADER) == 0:
         return e^
@@ -204,7 +229,8 @@ def leaf_of(
 # ── dispatch 2: chunkReduce — thread per chunk ──────────────────────────────
 def k_chunk_reduce(
     fl: MutPointer[UInt32, MutAnyOrigin], sm: MutPointer[Float32, MutAnyOrigin],
-    wrap_of: MutPointer[UInt32, MutAnyOrigin], is_start: MutPointer[UInt32, MutAnyOrigin],
+    wrap_of: MutPointer[UInt32, MutAnyOrigin], mode_of: MutPointer[UInt32, MutAnyOrigin],
+    is_start: MutPointer[UInt32, MutAnyOrigin],
     pc: MutPointer[UInt32, MutAnyOrigin], pm: MutPointer[Float32, MutAnyOrigin],
     n_bytes: Int32, k: Int32, n_chunks: Int32,
 ):
@@ -220,7 +246,7 @@ def k_chunk_reduce(
     if to > n:
         to = n
     while id < to:
-        combine(acc, leaf_of(fl, sm, wrap_of, is_start, id))
+        combine(acc, leaf_of(fl, sm, wrap_of, mode_of, is_start, id))
         id += 1
     p_store(pc, pm, c, acc)
 
@@ -284,7 +310,8 @@ def k_partial_scan(
 def k_apply(
     fl: MutPointer[UInt32, MutAnyOrigin], sm: MutPointer[Float32, MutAnyOrigin],
     lm: MutPointer[Float32, MutAnyOrigin], lc: MutPointer[UInt32, MutAnyOrigin],
-    wrap_of: MutPointer[UInt32, MutAnyOrigin], is_start: MutPointer[UInt32, MutAnyOrigin],
+    wrap_of: MutPointer[UInt32, MutAnyOrigin], mode_of: MutPointer[UInt32, MutAnyOrigin],
+    is_start: MutPointer[UInt32, MutAnyOrigin],
     item_start: MutPointer[UInt32, MutAnyOrigin],
     xc: MutPointer[UInt32, MutAnyOrigin], xm: MutPointer[Float32, MutAnyOrigin],
     wm: MutPointer[Float32, MutAnyOrigin], wc: MutPointer[UInt32, MutAnyOrigin],
@@ -306,15 +333,17 @@ def k_apply(
         if Int(is_start[unsafe_offset=id]) != 0:
             run = E()
             run.wrap = Int(wrap_of[unsafe_offset=id])
+            run.mode = Int(mode_of[unsafe_offset=id])
         var f = Int(fl[unsafe_offset=id])
         if (f & F_LEADER) != 0:
             # lanes_from_prefix, inline
             var wrap = Int(wrap_of[unsafe_offset=id])
+            var mode = Int(mode_of[unsafe_offset=id])
             var col = run.tail_len
             var closed = 0
             if run.nl > 0:
-                closed = rows_for(run.head_len, wrap) + run.rows
-            var wrap_row = wrap_row_of(col, wrap, (f & F_NEWLINE) != 0)
+                closed = rows_for(run.head_len, wrap, mode) + run.rows
+            var wrap_row = wrap_row_of(col, wrap, (f & F_NEWLINE) != 0, mode)
             var co = id * LC_STRIDE
             lc[unsafe_offset = co + LC_ROW] = UInt32(closed + wrap_row)
             lc[unsafe_offset = co + LC_COL] = UInt32(col)
@@ -323,7 +352,7 @@ def k_apply(
             wc[unsafe_offset=id] = UInt32(run.glyphs)
             wm[unsafe_offset=id] = run.tail_adv
             otb[unsafe_offset = Int(item_start[unsafe_offset=id]) + run.glyphs] = UInt32(id)
-        combine(run, leaf_of(fl, sm, wrap_of, is_start, id))
+        combine(run, leaf_of(fl, sm, wrap_of, mode_of, is_start, id))
         id += 1
 
 
@@ -377,7 +406,9 @@ def k_resolve_x(
         x = wm[unsafe_offset=id]
 
     var row = Int(lc[unsafe_offset = id * LC_STRIDE + LC_ROW])
-    var wrap_row = wrap_row_of(col, wrap, (Int(fl[unsafe_offset=id]) & F_NEWLINE) != 0)
+    # The DEPTH fan's SEGMENT index, never the row contribution: under WRAP_BACK
+    # they differ and the segments are all z has left. ROW already carries the mode.
+    var seg = wrap_segment_of(col, wrap, (Int(fl[unsafe_offset=id]) & F_NEWLINE) != 0)
     # lineHeight is the ITEM's, never the glyph's — the SIXTH copy of the
     # deleted fallback died here. It survived five sweeps because it is spelled
     # `lh != lh` with I_LINE_HEIGHT, matching none of the greps that found the
@@ -392,7 +423,7 @@ def k_resolve_x(
         Float32(-row) * lh + items[unsafe_offset = io + IM_ORIGIN_Y]
     )
     lm[unsafe_offset = mo + LM_Z] = (
-        Float32(-wrap_row) * items[unsafe_offset = io + IM_Z_STEP]
+        Float32(-seg) * items[unsafe_offset = io + IM_Z_STEP]
         + items[unsafe_offset = io + IM_ORIGIN_Z]
     )
 
@@ -435,9 +466,9 @@ def k_paginate(
     var wide = wide_raw if wide_raw > 1 else 1
     var band = y_page // wide
     var wrap = Int(items_e[unsafe_offset = ie + IE_WRAP_WIDTH])
-    # The SAME rule the fold's Z used, terminator case included — paginate
-    # recomputes Z from the COL lane.
-    var seg = wrap_row_of(col, wrap, (Int(fl[unsafe_offset=id]) & F_NEWLINE) != 0)
+    # The DEPTH fan's SEGMENT index, terminator case included — paginate
+    # recomputes Z from the COL lane, and Z is mode-free.
+    var seg = wrap_segment_of(col, wrap, (Int(fl[unsafe_offset=id]) & F_NEWLINE) != 0)
     # The page's own lineHeight is NOT consulted — mirrors 4697e3b. The fallback
     # could only fire on an item with a NaN lineHeight, which the oracle now
     # refuses, so it was reachable solely through malformed input. Proven, not
@@ -493,6 +524,7 @@ def check_fixture(var fx: PipeFixture, ctx: DeviceContext, bench: Bool = False) 
 
     # Per-byte item facts, as the GPU pipeline gets them from itemStarts.
     var wrap_of = List[UInt32](unsafe_uninit_length=n)
+    var mode_of = List[UInt32](unsafe_uninit_length=n)
     var is_start = List[UInt32](unsafe_uninit_length=n)
     var item_start = List[UInt32](unsafe_uninit_length=n)
     var item_of = List[UInt32](unsafe_uninit_length=n)
@@ -500,6 +532,7 @@ def check_fixture(var fx: PipeFixture, ctx: DeviceContext, bench: Bool = False) 
         var i = item_for_byte(fx.items, id)
         item_of[id] = UInt32(i) if i >= 0 else UInt32(0)
         wrap_of[id] = UInt32(fx.items[i].wrap_width) if i >= 0 else 0
+        mode_of[id] = UInt32(fx.items[i].wrap_mode) if i >= 0 else 0
         is_start[id] = UInt32(1) if (i >= 0 and fx.items[i].byte_start == id) else UInt32(0)
         item_start[id] = UInt32(fx.items[i].byte_start) if i >= 0 else UInt32(0)
 
@@ -509,6 +542,7 @@ def check_fixture(var fx: PipeFixture, ctx: DeviceContext, bench: Bool = False) 
     var h_lm = ctx.enqueue_create_host_buffer[DType.float32](n * LM_STRIDE)
     var h_lc = ctx.enqueue_create_host_buffer[DType.uint32](n * LC_STRIDE)
     var h_w = ctx.enqueue_create_host_buffer[DType.uint32](n)
+    var h_md = ctx.enqueue_create_host_buffer[DType.uint32](n)
     var h_s = ctx.enqueue_create_host_buffer[DType.uint32](n)
     var h_is = ctx.enqueue_create_host_buffer[DType.uint32](n)
     var h_wm = ctx.enqueue_create_host_buffer[DType.float32](n)
@@ -528,6 +562,7 @@ def check_fixture(var fx: PipeFixture, ctx: DeviceContext, bench: Bool = False) 
         h_lc[i] = 0
     for i in range(n):
         h_w[i] = wrap_of[i]
+        h_md[i] = mode_of[i]
         h_s[i] = is_start[i]
         h_is[i] = item_start[i]
         h_wm[i] = 0
@@ -558,6 +593,7 @@ def check_fixture(var fx: PipeFixture, ctx: DeviceContext, bench: Bool = False) 
         h_it[o + IM_DEPTH_PER_BAND] = Float32(t.depth_per_band)
         h_it[o + IM_DEPTH_PER_COL] = Float32(t.depth_per_col)
         h_ie[oe + IE_WRAP_WIDTH] = UInt32(t.wrap_width)
+        h_ie[oe + IE_WRAP_MODE] = UInt32(t.wrap_mode)
         h_ie[oe + IE_PAGE_ROWS] = UInt32(t.page_rows)
         h_ie[oe + IE_PAGE_COLS] = UInt32(t.page_cols)
         h_ie[oe + IE_SCROLL_ROWS] = UInt32(t.scroll_rows)
@@ -574,6 +610,7 @@ def check_fixture(var fx: PipeFixture, ctx: DeviceContext, bench: Bool = False) 
     var d_lm = ctx.enqueue_create_buffer[DType.float32](n * LM_STRIDE)
     var d_lc = ctx.enqueue_create_buffer[DType.uint32](n * LC_STRIDE)
     var d_w = ctx.enqueue_create_buffer[DType.uint32](n)
+    var d_md = ctx.enqueue_create_buffer[DType.uint32](n)
     var d_s = ctx.enqueue_create_buffer[DType.uint32](n)
     var d_is = ctx.enqueue_create_buffer[DType.uint32](n)
     var d_wm = ctx.enqueue_create_buffer[DType.float32](n)
@@ -598,6 +635,7 @@ def check_fixture(var fx: PipeFixture, ctx: DeviceContext, bench: Bool = False) 
     ctx.enqueue_copy(dst_buf=d_lm, src_buf=h_lm)
     ctx.enqueue_copy(dst_buf=d_lc, src_buf=h_lc)
     ctx.enqueue_copy(dst_buf=d_w, src_buf=h_w)
+    ctx.enqueue_copy(dst_buf=d_md, src_buf=h_md)
     ctx.enqueue_copy(dst_buf=d_s, src_buf=h_s)
     ctx.enqueue_copy(dst_buf=d_is, src_buf=h_is)
     ctx.enqueue_copy(dst_buf=d_wm, src_buf=h_wm)
@@ -622,7 +660,8 @@ def check_fixture(var fx: PipeFixture, ctx: DeviceContext, bench: Bool = False) 
     var g0 = perf_counter_ns()
     comptime B = 128
     ctx.enqueue_function[k_chunk_reduce](
-        d_fl.unsafe_ptr(), d_sm.unsafe_ptr(), d_w.unsafe_ptr(), d_s.unsafe_ptr(),
+        d_fl.unsafe_ptr(), d_sm.unsafe_ptr(), d_w.unsafe_ptr(), d_md.unsafe_ptr(),
+        d_s.unsafe_ptr(),
         d_pc.unsafe_ptr(), d_pm.unsafe_ptr(),
         Int32(n), Int32(CHUNK), Int32(n_chunks),
         grid_dim=(n_chunks + B - 1) // B, block_dim=B,
@@ -644,7 +683,7 @@ def check_fixture(var fx: PipeFixture, ctx: DeviceContext, bench: Bool = False) 
     )
     ctx.enqueue_function[k_apply](
         d_fl.unsafe_ptr(), d_sm.unsafe_ptr(), d_lm.unsafe_ptr(), d_lc.unsafe_ptr(),
-        d_w.unsafe_ptr(), d_s.unsafe_ptr(),
+        d_w.unsafe_ptr(), d_md.unsafe_ptr(), d_s.unsafe_ptr(),
         d_is.unsafe_ptr(), d_xc.unsafe_ptr(), d_xm.unsafe_ptr(),
         d_wm.unsafe_ptr(), d_wc.unsafe_ptr(), d_otb.unsafe_ptr(),
         Int32(n), Int32(CHUNK), Int32(n_chunks),
@@ -751,7 +790,10 @@ def check_fixture(var fx: PipeFixture, ctx: DeviceContext, bench: Bool = False) 
     return bad
 
 
-def synthetic_case(trie: Trie, n: Int, wrap: Int, line_len: Int, ctx: DeviceContext) raises -> Int:
+def synthetic_case(
+    trie: Trie, n: Int, wrap: Int, line_len: Int, ctx: DeviceContext,
+    mode: Int = WRAP_DOWN,
+) raises -> Int:
     """A corpus large enough to reach the SPINE's multi-super path.
 
     Every checked-in fixture is under 6KB — 82 chunks, ONE super. With a single
@@ -769,6 +811,7 @@ def synthetic_case(trie: Trie, n: Int, wrap: Int, line_len: Int, ctx: DeviceCont
     it.byte_count = n
     it.line_height = 1
     it.wrap_width = wrap
+    it.wrap_mode = mode
     var items = List[Item]()
     items.append(it^)
     var fx = PipeFixture()
@@ -854,9 +897,15 @@ def main() raises:
         var nb = cases[ci]
         var b1 = synthetic_case(seed.trie, nb, 0, 40, ctx)
         var b2 = synthetic_case(seed.trie, nb, 7, 23, ctx)
+        # WRAP_BACK on the same spine path. Every WrapBack FIXTURE is single-super
+        # (the largest is 5,212 bytes), so without this the mode's junction term
+        # would never meet a chunk-level or super-level combine on device — the
+        # same blind spot this synthetic case was written for, one parameter over.
+        var b3 = synthetic_case(seed.trie, nb, 7, 23, ctx, WRAP_BACK)
         var supers = ((nb + CHUNK - 1) // CHUNK + GROUP - 1) // GROUP
-        print("  ", nb, "bytes,", supers, "supers — unwrapped", b1, "bad, wrapped", b2, "bad")
-        total_bad += b1 + b2
+        print("  ", nb, "bytes,", supers, "supers — unwrapped", b1,
+              "bad, wrapped", b2, "bad, wrapback", b3, "bad")
+        total_bad += b1 + b2 + b3
 
     if total_bad == 0:
         print("gpu pipeline: eight dispatches chained on device — counts exact, positions within 1e-4")

@@ -29,11 +29,11 @@ from glyph_schema import (
     IM_STRIDE, IM_ORIGIN_Y, IM_ORIGIN_Z, IM_LINE_HEIGHT, IM_Z_STEP,
     IM_BAND_STRIDE_Y, IM_DEPTH_PER_BAND, IM_DEPTH_PER_COL, IM_PAGE_STRIDE_X,
     IE_STRIDE, IE_PAGE_ROWS, IE_PAGE_COLS, IE_SCROLL_ROWS,
-    IE_PAGES_WIDE, IE_WRAP_WIDTH, IE_HAS_PAGE,
+    IE_PAGES_WIDE, IE_WRAP_WIDTH, IE_WRAP_MODE, IE_HAS_PAGE,
 )
 from glyph_pipeline import (
     run_pipeline, F_LEADER, F_NEWLINE, trunc_nonneg, derive_stride, Item, Trie,
-    item_for_byte, page_active, wrap_row_of,
+    item_for_byte, page_active, wrap_segment_of,
 )
 from fixture_io import load_pipe_fixture
 
@@ -122,9 +122,10 @@ def paginate_kernel(
     var wide = wide_raw if wide_raw > 1 else 1
     var band = y_page // wide
     var wrap = Int(items_e[unsafe_offset = ie + IE_WRAP_WIDTH])
-    # The SAME rule the fold's Z used, terminator case included — paginate
+    # The DEPTH fan's SEGMENT index — mode-free, and the ROW lane paginate read
+    # above already carries the mode. Terminator case included: paginate
     # recomputes Z from the COL lane, and a newline rides at one-past-the-last.
-    var seg = wrap_row_of(col, wrap, (Int(fl[unsafe_offset=id]) & F_NEWLINE) != 0)
+    var seg = wrap_segment_of(col, wrap, (Int(fl[unsafe_offset=id]) & F_NEWLINE) != 0)
 
     # The page's own lineHeight is NOT consulted — mirrors 4697e3b. The fallback
     # could only fire on an item with a NaN lineHeight, which the oracle now
@@ -245,6 +246,7 @@ def check_items(
         tbe[oe + IE_SCROLL_ROWS] = UInt32(t.scroll_rows)
         tbe[oe + IE_PAGES_WIDE] = UInt32(t.pages_wide)
         tbe[oe + IE_WRAP_WIDTH] = UInt32(t.wrap_width)
+        tbe[oe + IE_WRAP_MODE] = UInt32(t.wrap_mode)
         tbl[o + IM_LINE_HEIGHT] = Float32(t.line_height)
         tbl[o + IM_Z_STEP] = Float32(t.z_step)
         tbl[o + IM_BAND_STRIDE_Y] = Float32(t.band_stride_y)

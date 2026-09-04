@@ -103,8 +103,8 @@ def check_case(path: String) raises -> Int:
     if Int(r.u32()) != MAGIC:
         print(path, ": bad magic")
         return 1
-    if Int(r.u32()) != 2:
-        print(path, ": unknown version")
+    if Int(r.u32()) != 3:
+        print(path, ": unknown version (expected v3 — regenerate)")
         return 1
     var byte_len = Int(r.u32())
     var block_index_len = Int(r.u32())
@@ -194,6 +194,9 @@ def check_case(path: String) raises -> Int:
     for q in range(pq_count):
         var byte_index = Int(r.u32())
         var wrap = Int(r.u32())
+        # v3: the MODE the oracle resolved these lanes under. The prefix itself is
+        # mode-free (the bake folds at wrap 0); the row it resolves to is not.
+        var mode = Int(r.u32())
         var p = prefix_at(bytes, trie, got, byte_index)
         var got_p = elem7(p)
         for i in range(7):
@@ -207,8 +210,11 @@ def check_case(path: String) raises -> Int:
         # the byte and cannot know.
         var q_seq = sequence_length(bytes, byte_index)
         var terminator = q_seq > 0 and decode_codepoint_at(bytes, byte_index, q_seq) == NEWLINE
-        var lanes = lanes_from_prefix(p, wrap, terminator)
-        check_int("row@" + String(byte_index) + "w" + String(wrap), lanes.row, Int(r.u32()), bad, printed)
+        var lanes = lanes_from_prefix(p, wrap, terminator, mode)
+        check_int(
+            "row@" + String(byte_index) + "w" + String(wrap) + "m" + String(mode),
+            lanes.row, Int(r.u32()), bad, printed,
+        )
         check_int("col@" + String(byte_index), lanes.col, Int(r.u32()), bad, printed)
         check_int("ord@" + String(byte_index), lanes.ord, Int(r.u32()), bad, printed)
         check_f64("lineAdv@" + String(byte_index), Float64(lanes.line_adv), r.f64(), bad, printed)
@@ -217,8 +223,12 @@ def check_case(path: String) raises -> Int:
     var wq_count = Int(r.u32())
     for _ in range(wq_count):
         var wrap = Int(r.u32())
+        var mode = Int(r.u32())
         var e_rows = Int(r.u32())
-        check_int("rowsUnderWrap(" + String(wrap) + ")", rows_under_wrap(got, wrap), e_rows, bad, printed)
+        check_int(
+            "rowsUnderWrap(" + String(wrap) + ", mode " + String(mode) + ")",
+            rows_under_wrap(got, wrap, mode), e_rows, bad, printed,
+        )
 
     return bad
 

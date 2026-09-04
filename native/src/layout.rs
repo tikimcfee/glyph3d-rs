@@ -169,6 +169,9 @@ pub struct ItemParams {
     pub z_step: f64,
     /// Fold unit in COLUMNS; 0 = no wrap.
     pub wrap_width: i32,
+    /// How a wrap spends itself: down a row (the default) or back in depth.
+    /// ITEM-LEVEL, exactly like `wrap_width` — see [`crate::fold::WrapMode`].
+    pub wrap_mode: crate::fold::WrapMode,
     pub has_page: bool,
     pub page_rows: i32,
     pub page_cols: i32,
@@ -191,6 +194,7 @@ impl Default for ItemParams {
             line_height: 1.0,
             z_step: 0.0,
             wrap_width: 0,
+            wrap_mode: crate::fold::WrapMode::Down,
             has_page: false,
             page_rows: 0,
             page_cols: 0,

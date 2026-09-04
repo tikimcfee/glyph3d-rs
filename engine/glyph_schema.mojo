@@ -74,7 +74,7 @@ comptime FIX_C_FLAGS = 2
 comptime FIX_C_ORD = 3
 
 # The scan partial (ScanElem) in a GPU buffer — same kind rule.
-comptime PARTIAL_COUNT_STRIDE = 7
+comptime PARTIAL_COUNT_STRIDE = 8
 comptime P_RESET = 0
 comptime P_NL = 1
 comptime P_GLYPHS = 2
@@ -82,6 +82,7 @@ comptime P_ROWS = 3
 comptime P_HEAD_LEN = 4
 comptime P_TAIL_LEN = 5
 comptime P_WRAP = 6
+comptime P_MODE = 7
 
 comptime PARTIAL_MEASURE_STRIDE = 1
 comptime PM_TAIL_ADV = 0
@@ -99,13 +100,14 @@ comptime IM_DEPTH_PER_COL = 6
 comptime IM_PAGE_STRIDE_X = 7
 comptime IM_ORIGIN_X = 8
 
-comptime IE_STRIDE = 6
+comptime IE_STRIDE = 7
 comptime IE_PAGE_ROWS = 0
 comptime IE_PAGE_COLS = 1
 comptime IE_SCROLL_ROWS = 2
 comptime IE_PAGES_WIDE = 3
 comptime IE_WRAP_WIDTH = 4
 comptime IE_HAS_PAGE = 5
+comptime IE_WRAP_MODE = 6
 
 # Per-item bounds + fold scalars. Lane kinds matter on device: Metal has no f64,
 # so counts go to native u32 atomics and measures to f32 ordered keys.

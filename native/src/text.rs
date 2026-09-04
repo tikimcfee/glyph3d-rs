@@ -499,7 +499,7 @@ pub type FoldTables = (Vec<(usize, u32)>, Vec<u32>, Vec<u32>, Vec<u32>);
 /// folded COL, source line. Picking uses this to resolve a record to the
 /// actual character in the file bytes, and cross-checks ROW/COL against the
 /// engine's records bit-for-bit.
-pub fn fold_leaders(bytes: &[u8], wrap: i32) -> FoldTables {
+pub fn fold_leaders(bytes: &[u8], wrap: i32, mode: crate::fold::WrapMode) -> FoldTables {
     let mut leaders: Vec<(usize, u32)> = Vec::new();
     let mut rows: Vec<u32> = Vec::new();
     let mut cols: Vec<u32> = Vec::new();
@@ -545,13 +545,13 @@ pub fn fold_leaders(bytes: &[u8], wrap: i32) -> FoldTables {
         // against the engine's own ROW lane bit-for-bit, so a copy of the
         // formula that drifted would make the pick oracle agree with nothing.
         let is_newline = cp == 0x0A;
-        let wrap_row = crate::fold::wrap_row_of(col as i64, w as i64, is_newline) as u32;
+        let wrap_row = crate::fold::wrap_row_of(col as i64, w as i64, is_newline, mode) as u32;
         leaders.push((id, cp));
         rows.push(base_row + wrap_row);
         cols.push(col);
         lines.push(line);
         if is_newline {
-            base_row += crate::fold::rows_for_line(col as i64, w as i64) as u32;
+            base_row += crate::fold::rows_for_line(col as i64, w as i64, mode) as u32;
             col = 0;
             line += 1;
         } else {
@@ -769,34 +769,45 @@ mod tests {
     fn fold_leaders_agrees_with_the_fold_on_every_row_and_column() {
         let t = trie();
         let bytes: Vec<u8> = b"abcdefgh\nxyz\nABCDEFGHIJKL\n\nqq\nmnopqrst\n".to_vec();
-        for wrap in [4i32, 3, 8, 1, 0] {
-            let item = Item {
-                byte_start: 0,
-                byte_count: bytes.len() as i64,
-                wrap_width: wrap.max(0) as i64,
-                line_height: 1.0,
-                ..Item::default()
-            };
-            let folded = run_pipeline(&bytes, &t, &[item]);
-            let (leaders, rows, cols, _lines) = fold_leaders(&bytes, wrap);
-            assert_eq!(leaders.len(), bytes.len(), "every byte here is a leader");
-            for (index, &(id, _cp)) in leaders.iter().enumerate() {
-                assert_ne!(folded.slots.flags(id) & F_LEADER, 0);
-                assert_eq!(
-                    rows[index] as i64,
-                    folded.slots.row(id),
-                    "byte {id} ROW at wrap {wrap}"
-                );
-                assert_eq!(
-                    cols[index] as i64,
-                    folded.slots.col(id),
-                    "byte {id} COL at wrap {wrap}"
-                );
+        // Both MODES, not just the default: the pick oracle and the fold have to
+        // agree about WrapBack too, and a sweep that never left mode A would say
+        // nothing about the branch the dial can select.
+        for mode in [crate::fold::WrapMode::Down, crate::fold::WrapMode::Back] {
+            for wrap in [4i32, 3, 8, 1, 0] {
+                let item = Item {
+                    byte_start: 0,
+                    byte_count: bytes.len() as i64,
+                    wrap_width: wrap.max(0) as i64,
+                    wrap_mode: mode,
+                    line_height: 1.0,
+                    ..Item::default()
+                };
+                let folded = run_pipeline(&bytes, &t, &[item]);
+                let (leaders, rows, cols, _lines) = fold_leaders(&bytes, wrap, mode);
+                assert_eq!(leaders.len(), bytes.len(), "every byte here is a leader");
+                for (index, &(id, _cp)) in leaders.iter().enumerate() {
+                    assert_ne!(folded.slots.flags(id) & F_LEADER, 0);
+                    assert_eq!(
+                        rows[index] as i64,
+                        folded.slots.row(id),
+                        "byte {id} ROW at wrap {wrap} mode {mode:?}"
+                    );
+                    assert_eq!(
+                        cols[index] as i64,
+                        folded.slots.col(id),
+                        "byte {id} COL at wrap {wrap} mode {mode:?}"
+                    );
+                }
             }
         }
+        // ANTI-VACUITY on the MODE: at wrap 4 the two modes must actually
+        // disagree somewhere, or the loop above swept one rule twice.
+        let (_l, rows_down, _c, _n) = fold_leaders(&bytes, 4, crate::fold::WrapMode::Down);
+        let (_l2, rows_back, _c2, _n2) = fold_leaders(&bytes, 4, crate::fold::WrapMode::Back);
+        assert_ne!(rows_down, rows_back, "the modes must differ on this input");
         // ANTI-VACUITY: at wrap 4 the input must really contain exact-multiple
         // lines, or this agrees about nothing that used to be wrong.
-        let (_l, rows, _c, _lines) = fold_leaders(&bytes, 4);
+        let (_l, rows, _c, _lines) = fold_leaders(&bytes, 4, crate::fold::WrapMode::Down);
         assert_eq!(rows[8], 1, "the 8-cell line's newline rides its second row");
         assert_eq!(rows[9], 2, "and the next line starts immediately below");
     }

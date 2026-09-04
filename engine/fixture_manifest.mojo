@@ -106,6 +106,7 @@ def main() raises:
             h_items.f64(t.origin_y)
             h_items.f64(t.origin_z)
             h_items.i64(t.wrap_width)
+            h_items.i64(t.wrap_mode)
             h_items.f64(t.z_step)
             h_items.f64(t.line_height)
             h_items.u8(UInt8(1) if t.has_page else UInt8(0))

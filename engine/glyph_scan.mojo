@@ -36,7 +36,7 @@ from glyph_pipeline import (
     decode_codepoint_at,
     sequence_length,
     item_for_byte,
-    wrap_row_of,
+    wrap_segment_of,
     paginate,
     page_active,
     derive_stride,
@@ -58,7 +58,7 @@ comptime GROUP_SIZE = 256
 
 
 def scan_leaf(
-    slots: Slots, id: Int, wrap: Int, is_item_start: Bool
+    slots: Slots, id: Int, wrap: Int, is_item_start: Bool, mode: Int
 ) -> ScanElem:
     """The leaf for byte `id`, read from the decoded STATIC arrays only."""
     var flags = slots.flags(id)
@@ -68,6 +68,7 @@ def scan_leaf(
         (flags & F_LEADER) != 0,
         wrap,
         is_item_start,
+        mode,
     )
 
 
@@ -82,6 +83,7 @@ def fold_range(
     slots: Slots,
     items: List[Item],
     wraps: List[Int],
+    modes: List[Int],
     from_byte: Int,
     to_byte: Int,
     mut acc: ScanElem,
@@ -93,7 +95,9 @@ def fold_range(
     var id = from_byte
     while id < to_byte:
         _cursor_advance(items, idx, id)
-        var leaf = scan_leaf(slots, id, wraps[idx], id == items[idx].byte_start)
+        var leaf = scan_leaf(
+            slots, id, wraps[idx], id == items[idx].byte_start, modes[idx]
+        )
         scan_combine(acc, leaf)
         id += 1
 
@@ -102,6 +106,7 @@ def _chunk_reduce_shard[po: Origin[mut=True]](
     slots: Slots,
     items: List[Item],
     wraps: List[Int],
+    modes: List[Int],
     partials: Pointer[ScanElem, po],
     n: Int,
     k: Int,
@@ -113,7 +118,7 @@ def _chunk_reduce_shard[po: Origin[mut=True]](
         var to = (c + 1) * k
         if to > n:
             to = n
-        fold_range(slots, items, wraps, c * k, to, acc)
+        fold_range(slots, items, wraps, modes, c * k, to, acc)
         partials[unsafe_offset = c] = acc^
 
 
@@ -167,6 +172,7 @@ def _apply_shard[
     wtn: Witness,
     items: List[Item],
     wraps: List[Int],
+    modes: List[Int],
     partial_prefix: Pointer[ScanElem, po],
     n: Int,
     k: Int,
@@ -189,6 +195,7 @@ def _apply_shard[
             if is_start:
                 run = scan_identity()
                 run.wrap = wraps[idx]
+                run.mode = modes[idx]
             var flags = slots.flags(id)
             # THE GAP GUARD. item_for_byte returns the largest item whose start <= id
             # and does NOT check ownership, so a byte in a HOLE between two items
@@ -215,7 +222,9 @@ def _apply_shard[
             var it_start = items[idx].byte_start
             var in_item = id >= it_start and id < it_start + items[idx].byte_count
             if (flags & F_LEADER) != 0 and in_item:
-                var v = lanes_from_prefix(run, wraps[idx], (flags & F_NEWLINE) != 0)
+                var v = lanes_from_prefix(
+                    run, wraps[idx], (flags & F_NEWLINE) != 0, modes[idx]
+                )
                 slots.set_rowcol(id, v.row, v.col)
                 slots.set_flags(id, flags | F_RENDERED)
                 # LINE_ADV/ORD are pure projections of the monoid prefix; the
@@ -236,7 +245,7 @@ def _apply_shard[
                 slots.zero_positional(id)
                 wtn.wm[unsafe_offset=id] = 0
                 wtn.wc[unsafe_offset=id] = 0
-            var leaf = scan_leaf(slots, id, wraps[idx], is_start)
+            var leaf = scan_leaf(slots, id, wraps[idx], is_start, modes[idx])
             scan_combine(run, leaf)
             id += 1
 
@@ -320,10 +329,13 @@ def _resolve_x_shard[
             # priced them at ~11.8 B per paged-item byte). paginate reads only
             # BASE_X/ROW/COL, all still written. Observable output is unchanged,
             # which the paged fixtures pin.
-            var wrap_row = wrap_row_of(col, wrap, (slots.flags(id) & F_NEWLINE) != 0)
+            # The DEPTH fan's SEGMENT index, never the row contribution: under
+            # WRAP_BACK the row is flat and the segments are all z has left. The
+            # ROW lane read above already carries the mode.
+            var seg = wrap_segment_of(col, wrap, (slots.flags(id) & F_NEWLINE) != 0)
             slots.set_x(id, Float32(x + item.origin_x))
             slots.set_y(id, Float32(-Float64(row) * lh + item.origin_y))
-            slots.set_z(id, Float32(-Float64(wrap_row) * item.z_step + item.origin_z))
+            slots.set_z(id, Float32(-Float64(seg) * item.z_step + item.origin_z))
         if Float64(row + 1) > row_max:
             row_max = Float64(row + 1)
         if x > x_max:
@@ -383,10 +395,15 @@ def run_scan_pipeline[o: ImmOrigin](
         for k in range(tally[w * 2 + 1]):
             misses.append(miss_scratch[a + k])
 
+    # MODE RIDES BESIDE WRAP, per item, for the reason glyph_pipeline's WRAP_BACK
+    # comment gives: both feed the monoid's junction term, so both are item-level
+    # or the scan form loses its regrouping freedom.
     var wraps = List[Int]()
+    var modes = List[Int]()
     var i = 0
     while i < len(items):
         wraps.append(items[i].wrap_width)
+        modes.append(items[i].wrap_mode)
         i += 1
 
     # ── dispatch 2: chunkReduce — thread per chunk, chunks sharded ────────────
@@ -396,7 +413,7 @@ def run_scan_pipeline[o: ImmOrigin](
         partials.append(scan_identity())
     var pp = partials.unsafe_ptr()
     def _tg2_task(w: Int) {imm}:
-        _chunk_reduce_shard(slots, items, wraps, pp, n, k, shard_lo(0, num_chunks, workers, w),
+        _chunk_reduce_shard(slots, items, wraps, modes, pp, n, k, shard_lo(0, num_chunks, workers, w),
             shard_lo(0, num_chunks, workers, w + 1),
         )
     parallelize(_tg2_task, workers)
@@ -443,7 +460,7 @@ def run_scan_pipeline[o: ImmOrigin](
     unsafe_memset_zero(r.ord_to_byte.unsafe_ptr(), len(r.ord_to_byte))
     var wtn = r.witness()
     def _tg6_task(w: Int) {imm}:
-        _apply_shard(slots, wtn, items, wraps, xp, n, k, shard_lo(0, num_chunks, workers, w),
+        _apply_shard(slots, wtn, items, wraps, modes, xp, n, k, shard_lo(0, num_chunks, workers, w),
             shard_lo(0, num_chunks, workers, w + 1),
         )
     parallelize(_tg6_task, workers)
@@ -540,6 +557,7 @@ def run_scan_pipeline[o: ImmOrigin](
     # run, and the workers read recycled memory. Anchoring after the last wait is
     # the documented idiom; these are not dead code.
     _ = len(wraps)
+    _ = len(modes)
     _ = len(partials)
     _ = len(supers)
     _ = len(super_prefix)

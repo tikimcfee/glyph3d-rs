@@ -357,6 +357,41 @@ export function itemForByte(items, id) {
 }
 
 /**
+ * THE WRAP MODES — an ITEM-LEVEL parameter, never per line and never per range.
+ *
+ *   WRAP_DOWN (0)  a wrap advances the visual ROW. A line of n cells occupies
+ *                  ceil(n / wrap) rows. The original behaviour and the default.
+ *   WRAP_BACK (1)  a wrap does NOT advance the row. Every wrap segment of a line
+ *                  shares ONE row and the segments stack in DEPTH, each `zStep`
+ *                  further back. rowsForLine(n, wrap, WRAP_BACK) == 1 always, so a
+ *                  line's row is just its line index.
+ *
+ * `col` still counts within the LOGICAL line in both modes, `segAdv` still resets at
+ * every fold boundary (so each segment starts at x = 0), and the wrap SEGMENT index
+ * still exists in both — under WrapBack it feeds z and no longer feeds row. Picking by
+ * (row, col) still resolves uniquely because col differs between segments.
+ *
+ * WHY: a 305,978-character line wraps to 3,060 rows under WrapDown and shoves every
+ * later line that far into the distance. Under WrapBack it is one row and the
+ * derangement goes into the axis nothing else is using.
+ */
+export const WRAP_DOWN = 0;
+export const WRAP_BACK = 1;
+
+/**
+ * Refuse an unknown mode at the boundary rather than treating it as WrapDown. An
+ * out-of-range mode is malformed input; silently folding it to the default is how a
+ * caller's typo becomes an invisible layout.
+ */
+export function normalizeWrapMode(v, where = 'item') {
+    const m = Math.trunc(v || 0);
+    if (m !== WRAP_DOWN && m !== WRAP_BACK) {
+        throw new Error(`${where}: wrapMode must be 0 (WrapDown) or 1 (WrapBack), got ${v}`);
+    }
+    return m;
+}
+
+/**
  * Visual rows a line of `len` cells occupies under `wrap` — a CEILING with a floor of
  * one, since an empty line still occupies the row it sits on.
  *
@@ -372,19 +407,39 @@ export function itemForByte(items, id) {
  * this ceiling out longhand for its open tail, because the shared helper over-counted
  * there — the same defect, found and worked around locally instead of fixed.
  */
-export function rowsForLine(len, wrap) {
+export function rowsForLine(len, wrap, mode = WRAP_DOWN) {
+    if (mode === WRAP_BACK) return 1;
     if (!(wrap > 0) || len <= 0) return 1;
     return Math.floor((len - 1) / wrap) + 1;
 }
 
 /**
- * The LINE-LOCAL row of a cell at column `col`. An ordinary glyph sits at
- * `floor(col / wrap)`; a NEWLINE is a terminator riding one past the last cell, so at
- * an exact multiple it belongs on the last row its line reaches, not the next one.
+ * The WRAP SEGMENT index of a cell at column `col` — how many times its line has
+ * already folded before reaching it. MODE-FREE: this is the depth fan's index, and it
+ * exists in both modes. An ordinary glyph sits in segment `floor(col / wrap)`; a
+ * NEWLINE is a terminator riding one past the last cell, so at an exact multiple it
+ * belongs to the last segment its line reaches, not the next one.
+ *
+ * Identical to what `wrapRowOf` returned before wrap modes existed, and that is the
+ * point: WrapDown's row IS this index, so mode A cannot move as long as it delegates.
  */
-export function wrapRowOf(col, wrap, terminator) {
+export function wrapSegmentOf(col, wrap, terminator) {
     if (!(wrap > 0)) return 0;
-    return terminator ? rowsForLine(col, wrap) - 1 : Math.floor(col / wrap);
+    if (!terminator) return Math.floor(col / wrap);
+    return col <= 0 ? 0 : Math.floor((col - 1) / wrap);
+}
+
+/**
+ * The LINE-LOCAL row contribution of a cell at column `col`.
+ *
+ * WrapDown: the segment index — a wrap advances the row.
+ * WrapBack: ZERO — a wrap does not advance the row at all; every segment of a line
+ *   shares one row and the segments stack in depth instead (that depth is still
+ *   `wrapSegmentOf`, which is why the two functions had to come apart).
+ */
+export function wrapRowOf(col, wrap, terminator, mode = WRAP_DOWN) {
+    if (mode === WRAP_BACK) return 0;
+    return wrapSegmentOf(col, wrap, terminator);
 }
 
 /**
@@ -413,6 +468,7 @@ export function wrapRowOf(col, wrap, terminator) {
  */
 export function layoutItem(slots, itemStart, byteCount, params = {}, ordToByte = null, scalars = null) {
     const wrap = Math.max(0, Math.trunc(params.wrapWidth || 0));
+    const mode = normalizeWrapMode(params.wrapMode);
     const fold = wrap > 0 ? wrap : Math.max(0, Math.trunc(params.pageCols || 0));
     const ox = params.origin?.x || 0, oy = params.origin?.y || 0, oz = params.origin?.z || 0;
     const zStep = params.zStep || 0;
@@ -421,7 +477,11 @@ export function layoutItem(slots, itemStart, byteCount, params = {}, ordToByte =
         const o = id * SLOT_STRIDE;
         const flags = slots[o + S_FLAGS];
         if ((flags & F_LEADER) === 0) continue;
-        const wrapRow = wrapRowOf(col, wrap, (flags & F_NEWLINE) !== 0);
+        // TWO indices, and under WrapBack they differ: `seg` is the depth fan's
+        // segment and always exists; `wrapRow` is what the segment contributes to
+        // the ROW, which WrapBack sets to zero.
+        const seg = wrapSegmentOf(col, wrap, (flags & F_NEWLINE) !== 0);
+        const wrapRow = mode === WRAP_BACK ? 0 : seg;
         const row = baseRow + wrapRow;
         const x = fold > 0 ? segAdv : lineAdv;
         slots[o + S_ROW] = row;
@@ -441,7 +501,7 @@ export function layoutItem(slots, itemStart, byteCount, params = {}, ordToByte =
         // Mojo port reproduced the oracle faithfully, which meant the two checked layers
         // agreed with each other and disagreed with the renderer. See the commit.
         slots[o + S_Y] = fbits(-row * params.lineHeight + oy);
-        slots[o + S_Z] = fbits(-wrapRow * zStep + oz);
+        slots[o + S_Z] = fbits(-seg * zStep + oz);
         slots[o + S_FLAGS] = flags | F_RENDERED;
         if (ordToByte) ordToByte[itemStart + ord] = id;
         if (scalars) {
@@ -450,7 +510,7 @@ export function layoutItem(slots, itemStart, byteCount, params = {}, ordToByte =
         }
         ord++;
         if ((flags & F_NEWLINE) !== 0) {
-            baseRow += rowsForLine(col, wrap);
+            baseRow += rowsForLine(col, wrap, mode);
             col = 0;
             lineAdv = 0;
             segAdv = 0;
@@ -516,14 +576,16 @@ export function resolveX(slots, id, p, ordToByte, scalars) {
     }
 
     const row = slots[o + S_ROW];
-    // Paginate recomputes Z from COL, so it needs the terminator rule too, or a
-    // newline's depth lands one wrap step behind its own row's.
-    const wrapRow = wrapRowOf(col, wrap, (slots[o + S_FLAGS] & F_NEWLINE) !== 0);
+    // Z is the DEPTH fan, so it reads the segment index, not the row contribution —
+    // under WrapBack those differ and the segments are the only thing z has left.
+    // The terminator rule rides here too, or a newline's depth lands one wrap step
+    // behind its own row's.
+    const seg = wrapSegmentOf(col, wrap, (slots[o + S_FLAGS] & F_NEWLINE) !== 0);
     slots[o + S_BASE_X] = fbits(x + (p.origin?.x || 0));
     slots[o + S_X] = fbits(x + (p.origin?.x || 0));
     // Same rule as layoutItem: the ITEM's line height, never the glyph's own.
     slots[o + S_Y] = fbits(-row * p.lineHeight + (p.origin?.y || 0));
-    slots[o + S_Z] = fbits(-wrapRow * (p.zStep || 0) + (p.origin?.z || 0));
+    slots[o + S_Z] = fbits(-seg * (p.zStep || 0) + (p.origin?.z || 0));
 
     if (scalars) {
         if (row + 1 > scalars[6]) scalars[6] = row + 1;   // totalRows (pre-conveyor)
@@ -657,8 +719,9 @@ export function runPipeline(bytes, trie, opts = {}) {
     for (let id = 0; id < bytes.length; id++) decodeAndResolve(bytes, slots, trie, id, misses);
 
     const items = normalizeItems(bytes, opts);
-    const resolved = items.map((it) => ({
+    const resolved = items.map((it, i) => ({
         wrapWidth: it.wrapWidth ?? opts.wrapWidth ?? 0,
+        wrapMode: normalizeWrapMode(it.wrapMode ?? opts.wrapMode ?? 0, `item ${i}`),
         zStep: it.zStep ?? opts.zStep ?? 0,
         lineHeight: it.lineHeight ?? opts.lineHeight,
     }));
@@ -674,7 +737,8 @@ export function runPipeline(bytes, trie, opts = {}) {
     for (let i = 0; i < items.length; i++) {
         const it = items[i];
         layoutItem(slots, it.byteStart, it.byteCount, {
-            wrapWidth: resolved[i].wrapWidth, pageCols: it.page?.pageCols || 0,
+            wrapWidth: resolved[i].wrapWidth, wrapMode: resolved[i].wrapMode,
+            pageCols: it.page?.pageCols || 0,
             origin: it.origin, lineHeight: resolved[i].lineHeight, zStep: resolved[i].zStep,
         }, ordToByte, scalarRows[i]);
     }
@@ -685,7 +749,8 @@ export function runPipeline(bytes, trie, opts = {}) {
     const pageParams = items.map((it, i) => ({
         ...it.page,
         pageStrideX: deriveStride({ maxRowExtent: scalarRows[i][7] }, it.page),
-        wrap: resolved[i].wrapWidth, zStep: resolved[i].zStep, origin: it.origin,
+        wrap: resolved[i].wrapWidth, wrapMode: resolved[i].wrapMode,
+        zStep: resolved[i].zStep, origin: it.origin,
         // The ITEM's lineHeight, full stop. This read used to be
         // `resolved[i].lineHeight ?? it.page?.lineHeight`, and the right-hand side became
         // unreachable the moment assertLineHeight started guaranteeing a finite number

@@ -34,7 +34,7 @@
  * the bake tool (tools/bake.mjs), not here.
  */
 
-import { NEWLINE, sequenceLength, rowsForLine } from './glyphPipelineReference.js';
+import { NEWLINE, sequenceLength, rowsForLine, WRAP_DOWN } from './glyphPipelineReference.js';
 import { scanIdentity, scanCombine, scanLeafValue } from './glyphPipelineScan.js';
 import { trieLookup } from './GlyphTrie.js';
 
@@ -114,7 +114,7 @@ export function foldBytes(bytes, trie, from, to, acc) {
         if (n === 0) continue;                    // continuation byte: identity leaf
         const cp = decodeCodepointAt(bytes, id, n);
         const g = trieLookup(trie, cp);
-        scanCombine(acc, scanLeafValue(cp === NEWLINE, g.advance, true, 0, id === 0));
+        scanCombine(acc, scanLeafValue(cp === NEWLINE, g.advance, true, 0, id === 0, WRAP_DOWN));
     }
     return acc;
 }
@@ -202,7 +202,7 @@ export function bakeFile(bytes, trie, opts = {}) {
             lineHist.set(acc.tailLen, (lineHist.get(acc.tailLen) || 0) + 1);
         }
 
-        scanCombine(acc, scanLeafValue(cp === NEWLINE, g.advance, true, 0, id === 0));
+        scanCombine(acc, scanLeafValue(cp === NEWLINE, g.advance, true, 0, id === 0, WRAP_DOWN));
     }
 
     const totalRows = maxRow + 1;
@@ -235,18 +235,24 @@ export function bakeFile(bytes, trie, opts = {}) {
 /**
  * Exact visual rows under ANY wrap width, from the histogram + the total summary —
  * the measure a grid needs before its bytes arrive, for whatever wrap it will use.
- * Every closed line contributes rowsForLine(len, wrap); an open tail line occupies
- * floor((tailLen-1)/wrap)+1 rows (its last glyph's wrap row, inclusive).
+ * Every closed line contributes rowsForLine(len, wrap, mode); an open tail line
+ * occupies floor((tailLen-1)/wrap)+1 rows (its last glyph's wrap row, inclusive).
+ *
+ * UNDER WrapBack EVERY LINE IS ONE ROW, so this counts lines and the histogram's
+ * lengths stop mattering — which is exactly why the histogram must still be consulted
+ * rather than short-circuited: `rowsForLine(len, wrap, WRAP_BACK)` is 1 per line, and
+ * the count comes out of the SAME loop. One rule, two answers.
  *
  * @param {{lineHist:Map<number,number>, total:{tailLen:number}}} record
  * @param {number} wrap - 0 = no wrap
+ * @param {number} [mode] - WRAP_DOWN (default) or WRAP_BACK
  */
-export function rowsUnderWrap(record, wrap) {
+export function rowsUnderWrap(record, wrap, mode = WRAP_DOWN) {
     let rows = 0;
-    for (const [len, count] of record.lineHist) rows += rowsForLine(len, wrap) * count;
+    for (const [len, count] of record.lineHist) rows += rowsForLine(len, wrap, mode) * count;
     const tail = record.total.tailLen;
     // Was written out longhand here because the shared helper over-counted by one;
     // rowsForLine IS this ceiling now, so the special case collapses into it.
-    if (tail > 0) rows += rowsForLine(tail, wrap);
+    if (tail > 0) rows += rowsForLine(tail, wrap, mode);
     return rows;
 }

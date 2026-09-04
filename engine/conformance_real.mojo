@@ -34,6 +34,7 @@
 from std.sys import argv
 from glyph_pipeline import (
     run_pipeline, Item, Trie, F_LEADER, F_RENDERED, PipelineResult, page_active,
+    WRAP_DOWN, WRAP_BACK,
 )
 from glyph_scan import run_scan_pipeline
 from fixture_io import load_pipe_fixture
@@ -41,10 +42,13 @@ from fixture_io import load_pipe_fixture
 comptime MAX_PRINTED = 6
 
 
-def item_for(size: Int) -> Item:
+def item_for(size: Int, mode: Int = WRAP_DOWN) -> Item:
     """Layout params derived from the file's size — deterministic variety.
     size%3 picks the wrap tier, size%2 pages, size%5 scrolls, so a real tree
-    sweeps the combination space without anyone choosing the cases."""
+    sweeps the combination space without anyone choosing the cases. `mode` is the
+    one dimension NOT derived from the size: it is passed in so every file runs
+    under BOTH wrap modes, which is what stops a size distribution from quietly
+    correlating one mode with one wrap tier."""
     var it = Item()
     it.byte_start = 0
     it.byte_count = size
@@ -55,6 +59,7 @@ def item_for(size: Int) -> Item:
     it.z_step = 0.2
     var w = size % 3
     it.wrap_width = 0 if w == 0 else (80 if w == 1 else 120)
+    it.wrap_mode = mode
     if size % 2 == 1:
         it.has_page = True
         it.page_rows = 32
@@ -80,7 +85,7 @@ def rel_close(a: Float32, b: Float32) -> Bool:
     return d <= 1e-4 * (m if m > 1.0 else 1.0)
 
 
-def check_file(path: String, trie: Trie) raises -> Int:
+def check_file(path: String, trie: Trie, mode: Int = WRAP_DOWN) raises -> Int:
     var f = open(path, "r")
     var bytes = f.read_bytes()
     f.close()
@@ -88,7 +93,7 @@ def check_file(path: String, trie: Trie) raises -> Int:
     if n == 0:
         return 0
     var items = List[Item]()
-    items.append(item_for(n))
+    items.append(item_for(n, mode))
     var fold_exact = items[0].wrap_width > 0 or (
         items[0].has_page and items[0].page_cols > 0
     )
@@ -188,7 +193,12 @@ def main() raises:
     var bytes_total = 0
     for i in range(2, len(args)):
         var path = String(args[i])
-        var bad = check_file(path, fx.trie)
+        # EVERY FILE UNDER BOTH MODES. The cross-form agreement is the claim, and
+        # WrapBack changes rows_for_line, which is inside the monoid's junction —
+        # running only the default would leave the scan form's WrapBack path
+        # unexercised on every real file in the tree.
+        var bad = check_file(path, fx.trie, WRAP_DOWN)
+        bad += check_file(path, fx.trie, WRAP_BACK)
         files += 1
         try:
             var f = open(path, "r")
@@ -202,4 +212,5 @@ def main() raises:
     if total_bad != 0:
         raise Error("cross-form disagreement on real corpus")
     print("real-corpus conformance:", files, "files,", bytes_total,
-          "bytes — serial and scan forms agree, witnesses hold, no fixtures needed")
+          "bytes x 2 wrap modes — serial and scan forms agree, witnesses hold,",
+          "no fixtures needed")

@@ -102,6 +102,31 @@ struct Trie(Copyable, Movable):
         return Int(self.blocks_c[entry * TC_STRIDE + TC_FLAGS])
 
 
+# ── THE WRAP MODES ───────────────────────────────────────────────────────────
+# An ITEM-LEVEL parameter, never per line and never per range.
+#
+#   WRAP_DOWN  a wrap advances the visual ROW. A line of n cells occupies
+#              ceil(n / wrap) rows. The original behaviour and the default.
+#   WRAP_BACK  a wrap does NOT advance the row. Every wrap segment of a line
+#              shares ONE row and the segments stack in DEPTH, each z_step
+#              further back, so a line's row is just its line index.
+#
+# `col` still counts within the LOGICAL line in both modes, `seg_adv` still
+# resets at every fold boundary (each segment starts at x = 0), and the wrap
+# SEGMENT index still exists in both — under WRAP_BACK it feeds z and no longer
+# feeds row. Picking by (row, col) still resolves uniquely because col differs
+# between segments.
+#
+# WHY IT MUST STAY ITEM-LEVEL: glyph_bake.scan_combine's junction term evaluates
+# rows_for_line with `b`'s parameters, so it is not associative across a change of
+# them. Mode joins wrap in that term, which makes the non-associative surface
+# WIDER, not narrower. What keeps the scan form safe is structural and unchanged:
+# an item boundary emits a resetting leaf, so no interval without a reset spans two
+# items.
+comptime WRAP_DOWN: Int = 0
+comptime WRAP_BACK: Int = 1
+
+
 struct Item(Copyable, Movable):
     """One file in the arena: byte range + layout params. line_height is REQUIRED —
     a NaN one is malformed input, not a request for a per-glyph fallback."""
@@ -111,6 +136,9 @@ struct Item(Copyable, Movable):
     var origin_y: Float64
     var origin_z: Float64
     var wrap_width: Int   # the fold unit, in COLUMNS — a count (kind-corrected
+    var wrap_mode: Int    # WRAP_DOWN | WRAP_BACK — item-level, exactly like the
+                          # wrap width, and see WRAP_BACK's comment for why that
+                          # is load-bearing rather than incidental.
     var z_step: Float64   # 2026-08-31: five integer page-geometry params were
     var line_height: Float64  # declared 'measure' because the table holding them
     var has_page: Bool        # was NAMED measures; truncation now happens ONCE,
@@ -131,6 +159,7 @@ struct Item(Copyable, Movable):
         self.origin_y = 0
         self.origin_z = 0
         self.wrap_width = 0
+        self.wrap_mode = WRAP_DOWN
         self.z_step = 0
         self.line_height = 0
         self.has_page = False
@@ -600,39 +629,61 @@ def item_for_byte(items: List[Item], id: Int) -> Int:
     return lo
 
 
-def rows_for_line(length: Int, wrap: Int) -> Int:
-    """Visual rows a line of `length` cells occupies under `wrap` — a CEILING with
-    a floor of one, since an empty line still occupies the row it sits on.
+def rows_for_line(length: Int, wrap: Int, mode: Int = WRAP_DOWN) -> Int:
+    """Visual rows a line of `length` cells occupies under `wrap` and `mode`.
 
-    THE PHANTOM ROW (corrected 2026-09-04). This was `length // wrap + 1`, which
-    counts the row the terminating newline rides on. The newline rides at column
-    `length`, so when `wrap` divides `length` that column rolls onto a fresh row
-    holding nothing else: the line claimed a blank row and every later line moved
-    down one. The two rules agree at every other length, which is why the defect
-    was invisible except at exact multiples.
+    Under WRAP_DOWN a CEILING with a floor of one, since an empty line still
+    occupies the row it sits on. Under WRAP_BACK it is ONE for every line, whatever
+    the length — that identity IS the mode: the folds go into depth, and depth
+    costs no rows.
 
-    The frozen JS oracle corpus was generated under the old rule and therefore
-    SPECIFIES the phantom; see engine/delta/phantom-row.md."""
+    THE PHANTOM ROW (corrected 2026-09-04). The WrapDown rule was `length // wrap
+    + 1`, which counts the row the terminating newline rides on. The newline rides
+    at column `length`, so when `wrap` divides `length` that column rolled onto a
+    fresh row holding nothing else: the line claimed a blank row and every later
+    line moved down one. The two rules agree at every other length, which is why
+    the defect was invisible except at exact multiples."""
+    if mode == WRAP_BACK:
+        return 1
     if wrap <= 0 or length <= 0:
         return 1
     return (length - 1) // wrap + 1
 
 
-def wrap_row_of(col: Int, wrap: Int, terminator: Bool) -> Int:
-    """The LINE-LOCAL row a cell at column `col` occupies under `wrap`.
+def wrap_segment_of(col: Int, wrap: Int, terminator: Bool) -> Int:
+    """The WRAP SEGMENT index of a cell at column `col` — how many times its line
+    has already folded before reaching it. MODE-FREE: this is the DEPTH fan's index
+    and it exists in both modes; only its contribution to the ROW is a mode
+    question (wrap_row_of).
 
-    An ordinary glyph at column `col` sits on `col // wrap`. A NEWLINE is a
+    An ordinary glyph at column `col` sits in segment `col // wrap`. A NEWLINE is a
     terminator riding at one-past-the-last cell (`col` == the line's glyph count),
-    so at an exact multiple `col // wrap` would roll it onto a row that holds
-    nothing else; it belongs on the last row its line reaches.
+    so at an exact multiple `col // wrap` would roll it into a segment that holds
+    nothing else; it belongs to the last segment its line reaches.
 
-    Every consumer of (col, wrap) -> row goes through here. Deriving both cases
+    Every consumer of (col, wrap) -> segment goes through here. Deriving both cases
     from one expression is what let the terminator open a phantom row."""
     if wrap <= 0:
         return 0
     if terminator:
-        return rows_for_line(col, wrap) - 1
+        # `rows_for_line(col, wrap, WRAP_DOWN) - 1`, written out so the segment
+        # index cannot pick up a mode through the helper it used to borrow.
+        if col <= 0:
+            return 0
+        return (col - 1) // wrap
     return col // wrap
+
+
+def wrap_row_of(col: Int, wrap: Int, terminator: Bool, mode: Int = WRAP_DOWN) -> Int:
+    """The LINE-LOCAL ROW CONTRIBUTION of a cell at column `col`.
+
+    WRAP_DOWN delegates to wrap_segment_of — which is the whole of the default's
+    proof: mode A's row IS the segment index, byte for byte, as it was before modes
+    existed. WRAP_BACK contributes ZERO, because a wrap does not advance the row at
+    all in that mode; it steps in z instead."""
+    if mode == WRAP_BACK:
+        return 0
+    return wrap_segment_of(col, wrap, terminator)
 
 
 def layout_item[ko: Origin[mut=True], witness: Bool = True](
@@ -655,6 +706,7 @@ def layout_item[ko: Origin[mut=True], witness: Bool = True](
       scalars: f64 reduce, fed the f64 x (NOT the rounded lane)
     """
     var wrap = item.wrap_width
+    var mode = item.wrap_mode
     var fold: Int
     if wrap > 0:
         fold = wrap
@@ -698,9 +750,14 @@ def layout_item[ko: Origin[mut=True], witness: Bool = True](
             id += 1
             continue
         var advance = slots.advance(id)
-        # The newline is a TERMINATOR at one-past-the-last cell, so at an exact
-        # multiple it stays on the row it closes instead of opening the next.
-        var wrap_row = wrap_row_of(col, wrap, (flags & F_NEWLINE) != 0)
+        # TWO indices, and under WRAP_BACK they differ. `wrap_segment` is the DEPTH
+        # fan's index and always exists; `wrap_row` is what that segment contributes
+        # to the ROW, which WRAP_BACK makes zero. The newline is a TERMINATOR at
+        # one-past-the-last cell, so at an exact multiple it stays in the segment it
+        # closes instead of opening the next.
+        var terminator = (flags & F_NEWLINE) != 0
+        var wrap_segment = wrap_segment_of(col, wrap, terminator)
+        var wrap_row = wrap_row_of(col, wrap, terminator, mode)
         var row = base_row + wrap_row
         var x: Float64 = Float64(seg_adv) if fold > 0 else line_adv
         # lineHeight is the ITEM's, never the glyph's. The oracle carried a
@@ -721,7 +778,7 @@ def layout_item[ko: Origin[mut=True], witness: Bool = True](
         slots.set_position(
             id, pos_x,
             Float32(-Float64(row) * lh + oy),
-            Float32(-Float64(wrap_row) * z_step + oz),
+            Float32(-Float64(wrap_segment) * z_step + oz),
             pos_x,
         )
         slots.set_rowcol(id, row, col)
@@ -756,7 +813,7 @@ def layout_item[ko: Origin[mut=True], witness: Bool = True](
             scalars[unsafe_offset = scalar_base + 7] = x  # widest row, ITEM-RELATIVE
         ord += 1
         if (flags & F_NEWLINE) != 0:
-            base_row += rows_for_line(col, wrap)
+            base_row += rows_for_line(col, wrap, mode)
             col = 0
             line_adv = 0
             seg_adv = 0
@@ -831,10 +888,12 @@ def paginate(
     var band = y_page // wide
 
     var wrap = item.wrap_width
-    # The SAME rule the fold's Z used, terminator case included: paginate
-    # recomputes Z from the COL lane, so a divergence here would put a newline's
-    # depth one wrap step behind its own row's.
-    var seg = wrap_row_of(col, wrap, (slots.flags(id) & F_NEWLINE) != 0)
+    # Z is the DEPTH fan, so it reads the SEGMENT index, never the row
+    # contribution — under WRAP_BACK those differ and the segments are all z has
+    # left. The ROW lane it read above already carries the mode. Terminator case
+    # included: paginate recomputes Z from the COL lane, so a divergence here
+    # would put a newline's depth one wrap step behind its own row's.
+    var seg = wrap_segment_of(col, wrap, (slots.flags(id) & F_NEWLINE) != 0)
     # The page's own lineHeight is NOT consulted. This mirrored the oracle's
     # `resolved[i].lineHeight ?? it.page?.lineHeight`, deleted in 4697e3b as
     # unreachable: assertLineHeight guarantees the item's is finite before paginate

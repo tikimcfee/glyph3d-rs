@@ -134,6 +134,7 @@ def run_streaming[o: ImmOrigin](
         sub.origin_y = it.origin_y
         sub.origin_z = it.origin_z
         sub.wrap_width = it.wrap_width
+        sub.wrap_mode = it.wrap_mode
         sub.z_step = it.z_step
         sub.line_height = it.line_height
         sub.has_page = it.has_page
