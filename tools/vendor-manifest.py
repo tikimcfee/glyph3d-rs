@@ -49,7 +49,35 @@ VENDORED = {
     "tools/vendor/ref/app/public/slug-core/slug-core.1tstke3lync.bin": "app/public/slug-core/slug-core.1tstke3lync.bin",
     "engine/fixtures/inputs/foldGeometry.js": "packages/glyph3d-core/src/core/foldGeometry.js",
     "engine/fixtures/inputs/glyphPipelineKernels.js": "packages/glyph3d-core/src/compute/glyphPipelineKernels.js",
+    "engine/fixtures/inputs/glyphPipelineReference.js": "packages/glyph3d-core/src/compute/glyphPipelineReference.js",
+    "engine/fixtures/inputs/glyphPipelineScan.js": "packages/glyph3d-core/src/compute/glyphPipelineScan.js",
+    "engine/fixtures/inputs/glyphBake.js": "packages/glyph3d-core/src/compute/glyphBake.js",
+    "engine/fixtures/inputs/GlyphTrie.js": "packages/glyph3d-core/src/compute/GlyphTrie.js",
     "schema/glyph-identity.json": "schema/glyph-identity.json",
+}
+
+# THE FIXTURE ORACLE IS PINNED PER FILE, NOT TO ONE UPSTREAM HEAD.
+#
+# `engine/fixtures/{gen,gen-bake}.mjs` reproduce the 22 committed fixtures
+# BYTE-FOR-BYTE from these files, and only from these REVISIONS of them. The
+# web repo has moved on: today's `glyphPipelineReference.js` does not even
+# export `FLOAT_LANES` (removed by 3da6542), so today's copy cannot run the
+# generators at all, let alone reproduce their output.
+#
+# The pin is per file because the corpus was not generated in one sitting.
+# `real-kernels.pipe.bin` embeds 90,515 bytes of `glyphPipelineKernels.js`,
+# which is that file at 59a2a44 — while the copy vendored here until
+# 2026-09-04 was 78,567 bytes, a LATER revision that could not have produced
+# it. That copy had a recorded sha256 and passed `--check` every run: the gate
+# proved the file matched its own hash and never asked whether it was the file
+# the corpus came from. Byte-identical regeneration is the check that can fail.
+FIXTURE_ORACLE_PINS = {
+    "engine/fixtures/inputs/glyphPipelineReference.js": "70ce30e",
+    "engine/fixtures/inputs/glyphPipelineScan.js": "70ce30e",
+    "engine/fixtures/inputs/glyphBake.js": "70ce30e",
+    "engine/fixtures/inputs/GlyphTrie.js": "70ce30e",
+    "engine/fixtures/inputs/foldGeometry.js": "70ce30e",
+    "engine/fixtures/inputs/glyphPipelineKernels.js": "59a2a44",
 }
 
 SUMS = ROOT / "tools/vendor/SHA256SUMS"
@@ -107,6 +135,8 @@ def regenerate() -> int:
         sums.append(f"{ls}  {local}")
     SUMS.write_text("\n".join(sums) + "\n")
 
+    pins = "".join(
+        f"  {local:<52} {rev}\n" for local, rev in sorted(FIXTURE_ORACLE_PINS.items()))
     body = "".join(
         f"| `{l}` | `{u}` | {sz} | `{ls[:16]}…` | "
         f"{'yes' if us == ls else ('MISMATCH' if us else 'n/a')} |\n"
@@ -120,6 +150,21 @@ recorded origin is indistinguishable from a local invention six months later.
   upstream repo    viz-web/glyph3d-js
   upstream commit  {upstream}
   regenerated      {date.today().isoformat()}  (tools/vendor-manifest.py)
+
+## The fixture oracle is pinned PER FILE
+
+`engine/fixtures/{{gen,gen-bake}}.mjs` reproduce all 22 committed fixtures
+byte-for-byte, in this tree, with no web repo present — but only from these
+revisions. Today's upstream cannot: `glyphPipelineReference.js` stopped
+exporting `FLOAT_LANES` at 3da6542 and the generators do not even load.
+
+{pins}
+A single "upstream commit" is the wrong model for these files and hid a real
+defect: the `glyphPipelineKernels.js` vendored here until 2026-09-04 was
+78,567 bytes, but `real-kernels.pipe.bin` embeds 90,515 — the file at 59a2a44.
+The old copy matched its own recorded hash on every `--check` run. The gate
+asked whether the file had been edited locally; it could not ask whether it
+was the file the corpus came from. `node gen.mjs && shasum -c` is that check.
 
 ## Verifying
 

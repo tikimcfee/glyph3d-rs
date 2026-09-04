@@ -6,7 +6,28 @@ recorded origin is indistinguishable from a local invention six months later.
 
   upstream repo    viz-web/glyph3d-js
   upstream commit  2ef79b7e762a07ebbf72713f97527a6831b7a839
-  regenerated      2026-09-02  (tools/vendor-manifest.py)
+  regenerated      2026-09-04  (tools/vendor-manifest.py)
+
+## The fixture oracle is pinned PER FILE
+
+`engine/fixtures/{gen,gen-bake}.mjs` reproduce all 22 committed fixtures
+byte-for-byte, in this tree, with no web repo present — but only from these
+revisions. Today's upstream cannot: `glyphPipelineReference.js` stopped
+exporting `FLOAT_LANES` at 3da6542 and the generators do not even load.
+
+  engine/fixtures/inputs/GlyphTrie.js                  70ce30e
+  engine/fixtures/inputs/foldGeometry.js               70ce30e
+  engine/fixtures/inputs/glyphBake.js                  70ce30e
+  engine/fixtures/inputs/glyphPipelineKernels.js       59a2a44
+  engine/fixtures/inputs/glyphPipelineReference.js     70ce30e
+  engine/fixtures/inputs/glyphPipelineScan.js          70ce30e
+
+A single "upstream commit" is the wrong model for these files and hid a real
+defect: the `glyphPipelineKernels.js` vendored here until 2026-09-04 was
+78,567 bytes, but `real-kernels.pipe.bin` embeds 90,515 — the file at 59a2a44.
+The old copy matched its own recorded hash on every `--check` run. The gate
+asked whether the file had been edited locally; it could not ask whether it
+was the file the corpus came from. `node gen.mjs && shasum -c` is that check.
 
 ## Verifying
 
@@ -23,8 +44,12 @@ recorded origin is indistinguishable from a local invention six months later.
 
 | local path | upstream path | bytes | sha256 (local) | upstream matches |
 |---|---|---:|---|:--:|
+| `engine/fixtures/inputs/GlyphTrie.js` | `packages/glyph3d-core/src/compute/GlyphTrie.js` | 9498 | `288dcb3cdac888b7…` | MISMATCH |
 | `engine/fixtures/inputs/foldGeometry.js` | `packages/glyph3d-core/src/core/foldGeometry.js` | 14806 | `c925c6d2c8036f2b…` | yes |
-| `engine/fixtures/inputs/glyphPipelineKernels.js` | `packages/glyph3d-core/src/compute/glyphPipelineKernels.js` | 78567 | `9cd528affba50d7d…` | yes |
+| `engine/fixtures/inputs/glyphBake.js` | `packages/glyph3d-core/src/compute/glyphBake.js` | 11170 | `fb4885322f766442…` | yes |
+| `engine/fixtures/inputs/glyphPipelineKernels.js` | `packages/glyph3d-core/src/compute/glyphPipelineKernels.js` | 90515 | `c785a572091d2f37…` | MISMATCH |
+| `engine/fixtures/inputs/glyphPipelineReference.js` | `packages/glyph3d-core/src/compute/glyphPipelineReference.js` | 39687 | `3bbc5c79b6354091…` | MISMATCH |
+| `engine/fixtures/inputs/glyphPipelineScan.js` | `packages/glyph3d-core/src/compute/glyphPipelineScan.js` | 14112 | `3f240382fec177ef…` | MISMATCH |
 | `schema/glyph-identity.json` | `schema/glyph-identity.json` | 18233 | `b27a4f0cb6ae7ecd…` | yes |
 | `tools/vendor/ref/app/public/slug-core/slug-core.1tstke3lync.bin` | `app/public/slug-core/slug-core.1tstke3lync.bin` | 609569 | `647ccdaba087de1f…` | yes |
 | `tools/vendor/ref/packages/glyph3d-core/src/fonts/Cousine-Regular.ttf` | `packages/glyph3d-core/src/fonts/Cousine-Regular.ttf` | 300208 | `dcd526004fcfec4e…` | yes |

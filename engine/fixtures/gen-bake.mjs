@@ -34,9 +34,9 @@
 import { writeFileSync, readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { bakeFile, prefixAt, rowsUnderWrap, CK_STRIDE } from '../../packages/glyph3d-core/src/compute/glyphBake.js';
-import { lanesFromPrefix } from '../../packages/glyph3d-core/src/compute/glyphPipelineScan.js';
-import { buildGlyphTrie, trieLaneValue } from '../../packages/glyph3d-core/src/compute/GlyphTrie.js';
+import { bakeFile, prefixAt, rowsUnderWrap, CK_STRIDE } from './inputs/glyphBake.js';
+import { lanesFromPrefix } from './inputs/glyphPipelineScan.js';
+import { buildGlyphTrie, trieLaneValue } from './inputs/GlyphTrie.js';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const utf8 = (s) => new TextEncoder().encode(s);
@@ -63,7 +63,7 @@ function buildTrieFor(bytes) {
 }
 
 const repoFile = readFileSync(
-    join(HERE, '../../packages/glyph3d-core/src/compute/glyphPipelineScan.js'),
+    join(HERE, 'inputs/glyphPipelineScan.js'),
 );
 
 const CASES = [

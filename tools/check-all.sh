@@ -70,6 +70,41 @@ else
 fi
 rm -rf "$A_TMP"
 
+# THE CORPUS REGENERATES ITSELF. Until 2026-09-04 `engine/fixtures/gen.mjs`
+# imported its oracle from the WEB repo, so the 14 .pipe.bin + 8 .bake.bin the
+# whole port is gated against could not be rebuilt in this tree at all. The
+# inputs are vendored and revision-PINNED now (tools/vendor/PROVENANCE.md), and
+# this asserts they still produce the committed bytes.
+#
+# It DELETES the fixtures first on purpose. Regenerating over them and hashing
+# cannot distinguish "reproduced exactly" from "the generator failed and I
+# compared the files to themselves" — which is precisely what happened while
+# building this, and is why the exit codes are checked too.
+step "1b/9 the fixture corpus regenerates byte-identically from vendored inputs"
+FX=engine/fixtures
+F_BEFORE=$( (cd $FX && shasum -a 256 *.pipe.bin *.bake.bin) | shasum -a 256 )
+F_COUNT=$(ls $FX/*.pipe.bin $FX/*.bake.bin | wc -l | tr -d ' ')
+rm -f $FX/*.pipe.bin $FX/*.bake.bin
+( cd $FX && node gen.mjs >/dev/null 2>&1 ); G1=$?
+( cd $FX && node gen-bake.mjs >/dev/null 2>&1 ); G2=$?
+F_AFTER_COUNT=$(ls $FX/*.pipe.bin $FX/*.bake.bin 2>/dev/null | wc -l | tr -d ' ')
+F_AFTER=$( (cd $FX && shasum -a 256 *.pipe.bin *.bake.bin 2>/dev/null) | shasum -a 256 )
+if [ $G1 -ne 0 ] || [ $G2 -ne 0 ]; then
+  echo "FAIL  fixture generators errored (gen=$G1 gen-bake=$G2) — the corpus is not rebuildable"; FAIL=1
+elif [ "$F_AFTER_COUNT" != "$F_COUNT" ]; then
+  echo "FAIL  regenerated $F_AFTER_COUNT fixtures, expected $F_COUNT"; FAIL=1
+elif [ "$F_BEFORE" = "$F_AFTER" ]; then
+  echo "PASS  $F_COUNT fixtures deleted and rebuilt BYTE-IDENTICAL from engine/fixtures/inputs/"
+else
+  echo "FAIL  a regenerated fixture differs from the committed one:"
+  git diff --stat -- $FX | tail -8; FAIL=1
+fi
+# Restore the BINARIES only. `git checkout -- $FX` would also revert the
+# generators and the vendored inputs, which silently undoes any uncommitted
+# work in this directory — it wiped a live edit while this gate was being
+# written, and turned three mutation reds into one artifact wearing three hats.
+git checkout -- $FX/*.pipe.bin $FX/*.bake.bin 2>/dev/null || true
+
 step "2/9 engine/check.sh (16 Mojo conformance suites + 2 instruments, CPU + GPU)"
 if OUT=$(./engine/check.sh 2>&1); then
   echo "$OUT" | tail -2

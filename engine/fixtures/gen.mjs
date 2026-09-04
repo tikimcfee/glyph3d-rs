@@ -51,9 +51,9 @@ import { fileURLToPath } from 'node:url';
 import { runPipeline, SLOT_STRIDE, FLOAT_LANES, fval,
     S_GLYPH_ID, S_ADVANCE, S_HEIGHT, S_X, S_Y, S_Z,
     S_ROW, S_COL, S_FLAGS, S_BASE_X, S_LINE_ADV, S_ORD,
-} from '../../packages/glyph3d-core/src/compute/glyphPipelineReference.js';
+} from './inputs/glyphPipelineReference.js';
 import { FIXTURE_MEASURE_STRIDE as MEASURE_STRIDE, FIXTURE_COUNT_STRIDE as COUNT_STRIDE } from '../glyph_schema.mjs';
-import { buildGlyphTrie, trieLaneValue } from '../../packages/glyph3d-core/src/compute/GlyphTrie.js';
+import { buildGlyphTrie, trieLaneValue } from './inputs/GlyphTrie.js';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const utf8 = (s) => new TextEncoder().encode(s);
@@ -85,7 +85,7 @@ function buildTrieFor(bytesList) {
 
 // ── The corpus ──────────────────────────────────────────────────────────────
 const repoFile = readFileSync(
-    join(HERE, '../../packages/glyph3d-core/src/core/foldGeometry.js'),
+    join(HERE, 'inputs/foldGeometry.js'),
 ).subarray(0, 4096);
 
 const longLine = 'const x = ' + 'ab(1, 2.5) + '.repeat(400) + '0;';
@@ -167,7 +167,7 @@ const CASES = [
         // found missing from every polite fixture.
         name: 'real-kernels',
         bytes: new Uint8Array(readFileSync(
-            join(HERE, '../../packages/glyph3d-core/src/compute/glyphPipelineKernels.js'))),
+            join(HERE, 'inputs/glyphPipelineKernels.js'))),
         items: [{
             origin: { x: 0, y: 0, z: 0 }, wrapWidth: 80, zStep: 0.25, lineHeight: 1.2,
             page: { rows: 40, pagesWide: 3, lineHeight: 1.2, gapX: 2 },
