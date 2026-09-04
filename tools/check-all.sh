@@ -43,6 +43,32 @@ FAIL=0
 step() { echo; echo "── $*"; }
 warn_count() { grep -cE "^warning" <<<"$1" || true; }
 
+# ── BUILD, before anything verifies ──────────────────────────────────────
+# check-all VERIFIES artifacts. It must not also be the thing that remembers to
+# BUILD them, and for one artifact it was not even that.
+#
+# Two classes. COMMITTED artifacts (glyph_schema.*, assets/atlas/*.bin,
+# engine-trie.bin, engine/fixtures/*.bin, the baselines) are verified by
+# rebuilding and byte-comparing — gates 1, 1b and 8. UNTRACKED BUILD PRODUCTS
+# just have to be current before anything reads them. Cargo owns its own
+# dependency graph. `native/libglyph_engine.dylib` has none: `native/build.rs`
+# LINKS it and says in its header that it is built outside cargo.
+#
+# So a .mojo edit was compiled by the conformance suites (they build from
+# source) and NOT by the renderer, which links whatever was last built by hand.
+# Not hypothetical: on 2026-09-04 gate 2 failed on a row rule while gate 8
+# rendered byte-equal — the same edit caught and invisible in one run.
+#
+# It costs 0.9 s. There is no case for tracking staleness, and a stale dylib
+# makes every gate below it a statement about the wrong binary, so this exits
+# rather than setting FAIL.
+step "0/9 build libglyph_engine.dylib (cargo owns its graph; this has none)"
+if OUT=$(pixi run build-engine 2>&1); then
+  echo "PASS  dylib rebuilt from engine/*.mojo"
+else
+  echo "$OUT" | tail -6; echo "FAIL  dylib build errored — every gate below would test the wrong binary"; exit 1
+fi
+
 step "1/9 generators reproduce their committed outputs (byte-identical)"
 G_OK=1
 for g in "tools/gen_real_trie.py --verify-only" "tools/gen_schema.py --check" "tools/vendor-manifest.py --check"; do
