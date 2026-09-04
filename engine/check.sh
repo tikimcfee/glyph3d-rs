@@ -93,9 +93,17 @@ for s in ${list[@]+"${list[@]}"}; do run "$s" "${PIPE[@]}"; done
 [[ "${1:-all}" == "gpu" ]] || run conformance_real "$GAPS" \
     $(find native/src tools -name '*.rs' -o -name '*.py' 2>/dev/null | sort | head -60)
 [[ "${1:-all}" == "gpu" ]] || run conformance_bake "${BAKE[@]}"
+# THE INSTRUMENTS, run rather than merely present. fixture_census is a
+# verification instrument and it HAD A FAULT OF ITS OWN — NaN poisoning its
+# Range, so any field whose first value was NaN reported "uniform" and it
+# invented a blind spot (2026-09-03). Nothing executed it, so nothing said. Same
+# argument as compiling the benches: an instrument nothing runs is not a parked
+# instrument, it is an absent one. fixture_manifest is gate 9's Mojo half.
+[[ "${1:-all}" == "gpu" ]] || run fixture_census "${PIPE[@]}"
+[[ "${1:-all}" == "gpu" ]] || run fixture_manifest "${PIPE[@]}"
 case "${1:-all}" in
-    cpu) echo "all 11 CPU suites green (fp contraction disabled); GPU suites NOT RUN" ;;
+    cpu) echo "all 11 CPU suites + 2 instruments green (fp contraction disabled); GPU suites NOT RUN" ;;
     bench) echo "all bench files compile (they are not RUN: bench.bin is untracked)" ;;
     gpu) echo "all 5 GPU suites green (fp contraction disabled)" ;;
-    *)   echo "all 16 suites green + benches compile, CPU + GPU (fp contraction disabled)" ;;
+    *)   echo "all 16 suites green + 2 instruments + benches compile, CPU + GPU (fp contraction disabled)" ;;
 esac

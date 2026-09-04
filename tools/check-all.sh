@@ -8,9 +8,11 @@
 #                                     no home in this tree until 2026-09-02). The
 #                                     atlas gate also keeps tools/vendor/ref honest.
 #   2. engine/check.sh            — all sixteen Mojo conformance suites, CPU
-#                                     AND GPU. The five GPU suites run on Metal
-#                                     since `max` became a real dependency
-#                                     (pixi.toml) on 2026-09-02.
+#                                     AND GPU, plus the two INSTRUMENTS
+#                                     (fixture_census, fixture_manifest). The
+#                                     five GPU suites run on Metal since `max`
+#                                     became a real dependency (pixi.toml) on
+#                                     2026-09-02.
 #   3. cargo build --release        — zero warnings (house rule)
 #   4. cargo clippy --release       — zero warnings
 #   5. cargo test                   — all tests green (19 at Stage J:
@@ -19,12 +21,13 @@
 #   7. tools/check-stage-g.sh       — pick correctness vs python oracle
 #   8. four-view byte-equal A/B     — demo/text/repo-zoom/repo-wide re-rendered
 #                                     and cmp'd against out/tooling-ab/baseline/
-#   9. fixture parity + corpus diff — stage 0 of the reference port. Rust's new
-#                                     .pipe.bin reader and Mojo's fixture_io
-#                                     agree on checksums over their PARSED
-#                                     values, and text.rs's CPU fold is held
-#                                     bit-exact to the oracle's own expected
-#                                     lanes on every fixture in its domain.
+#   9. the reference port           — all five stages, six halves, no JS: parse
+#                                     parity (Rust vs Mojo over PARSED values),
+#                                     the trie rebuilt from bytes, the serial
+#                                     fold over every lane of every byte, the
+#                                     scan form across 8 tunings, the bake and
+#                                     its seed protocol, and the independent
+#                                     text.rs reference over its domain.
 #
 # text.png renders native/fixtures/baseline-view.txt (immutable fixture —
 # editing it is a conscious re-baseline act, see out/STAGE_I_REPORT.md).
@@ -67,7 +70,7 @@ else
 fi
 rm -rf "$A_TMP"
 
-step "2/9 engine/check.sh (fifteen Mojo conformance suites, CPU + GPU)"
+step "2/9 engine/check.sh (16 Mojo conformance suites + 2 instruments, CPU + GPU)"
 if OUT=$(./engine/check.sh 2>&1); then
   echo "$OUT" | tail -2
   echo "PASS  engine suites"
@@ -130,7 +133,7 @@ for v in demo text repo-zoom repo-wide; do
   fi
 done
 
-step "9/9 fixture parse parity (Rust vs Mojo) + corpus diff vs the JS oracle"
+step "9/9 the reference port: parse parity, trie, fold, scan, bake vs the JS oracle"
 if OUT=$(tools/check-fixture-parity.sh 2>&1); then
   echo "$OUT"
 else

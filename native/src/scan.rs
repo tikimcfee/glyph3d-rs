@@ -38,8 +38,8 @@
 //! recurrence — it IS that re-sum, scheduled differently.
 
 use crate::fold::{
-    bounds_range, decode_and_resolve, derive_stride, page_active, paginate, rows_for_line,
-    FoldResult, Item, Slots, F_LEADER, F_MISSING, F_NEWLINE, F_RENDERED,
+    batch_union, bounds_range, decode_all, derive_stride, page_active, paginate, rows_for_line,
+    FoldResult, Item, Slots, F_LEADER, F_NEWLINE, F_RENDERED,
 };
 use crate::text::ResolveGlyph;
 
@@ -433,17 +433,8 @@ pub fn run_scan_pipeline<T: ResolveGlyph + ?Sized>(
     let byte_len = bytes.len();
     let mut slots = Slots::new(byte_len);
 
-    // ── dispatch 1: decode ────────────────────────────────────────────────────
-    let mut misses = Vec::new();
-    let mut leaders = 0usize;
-    for id in 0..byte_len {
-        if let Some(codepoint) = decode_and_resolve(bytes, &mut slots, trie, id) {
-            leaders += 1;
-            if slots.flags(id) & F_MISSING != 0 {
-                misses.push(codepoint);
-            }
-        }
-    }
+    // ── dispatch 1: decode (the same kernel the serial form runs) ─────────────
+    let (misses, leaders) = decode_all(bytes, &mut slots, trie);
     if items.is_empty() {
         return FoldResult {
             slots,
@@ -573,35 +564,14 @@ pub fn run_scan_pipeline<T: ResolveGlyph + ?Sized>(
         item_bounds[index * 8..index * 8 + 6].copy_from_slice(&box_lanes);
     }
 
-    let mut batch_bounds = [
-        f64::INFINITY,
-        f64::INFINITY,
-        f64::INFINITY,
-        f64::NEG_INFINITY,
-        f64::NEG_INFINITY,
-        f64::NEG_INFINITY,
-        0.0,
-        0.0,
-    ];
-    for index in 0..items.len() {
-        for lane in 0..3 {
-            if item_bounds[index * 8 + lane] < batch_bounds[lane] {
-                batch_bounds[lane] = item_bounds[index * 8 + lane];
-            }
-        }
-        for lane in 3..8 {
-            if item_bounds[index * 8 + lane] > batch_bounds[lane] {
-                batch_bounds[lane] = item_bounds[index * 8 + lane];
-            }
-        }
-    }
+    let batch_bounds = batch_union(&item_bounds, items.len());
 
     FoldResult {
         slots,
         misses,
         leaders,
         item_bounds,
-        batch_bounds: batch_bounds.to_vec(),
+        batch_bounds,
     }
 }
 

@@ -267,7 +267,7 @@ struct Cli {
     /// Stage 0: lay each .pipe.bin with the CPU reference fold and diff
     /// BIT-EXACT against the oracle's own expected lanes, then exit.
     #[arg(long, value_name = "PATH", num_args = 1..)]
-    fixture_diff: Vec<PathBuf>,
+    fixture_reference: Vec<PathBuf>,
     /// Stage 1: rebuild each .pipe.bin's trie from its own bytes with the
     /// ported GlyphTrie and diff against the trie the oracle stored, then exit.
     #[arg(long, value_name = "PATH", num_args = 1..)]
@@ -838,7 +838,7 @@ fn run_fixture_trie(paths: &[PathBuf]) -> ! {
 /// dropped, and a run in which nothing was in domain FAILS. Both halves matter:
 /// this gate's whole job is comparing, and a comparison that compared nothing
 /// is the loudest-passing thing there is.
-fn run_fixture_diff(paths: &[PathBuf]) -> ! {
+fn run_fixture_reference(paths: &[PathBuf]) -> ! {
     let mut compared = 0usize;
     let mut records = 0usize;
     let mut lanes = 0usize;
@@ -847,7 +847,7 @@ fn run_fixture_diff(paths: &[PathBuf]) -> ! {
         let fx = match fixture::load_pipe_fixture(p) {
             Ok(fx) => fx,
             Err(e) => {
-                eprintln!("fixture-diff FAIL: {e}");
+                eprintln!("fixture-reference FAIL: {e}");
                 std::process::exit(1);
             }
         };
@@ -870,15 +870,15 @@ fn run_fixture_diff(paths: &[PathBuf]) -> ! {
         }
     }
     if compared == 0 {
-        eprintln!("fixture-diff FAIL: no fixture was in domain — nothing was compared");
+        eprintln!("fixture-reference FAIL: no fixture was in domain — nothing was compared");
         std::process::exit(1);
     }
     if failed > 0 {
-        eprintln!("fixture-diff FAIL: {failed}/{compared} fixtures differ");
+        eprintln!("fixture-reference FAIL: {failed}/{compared} fixtures differ");
         std::process::exit(1);
     }
     println!(
-        "fixture-diff PASS: {compared} fixture(s), {records} records, {lanes} lanes bit-exact \
+        "fixture-reference PASS: {compared} fixture(s), {records} records, {lanes} lanes bit-exact \
          vs the oracle's expected values"
     );
     std::process::exit(0);
@@ -899,8 +899,8 @@ fn main() {
     if !cli.fixture_manifest.is_empty() {
         run_fixture_manifest(&cli.fixture_manifest);
     }
-    if !cli.fixture_diff.is_empty() {
-        run_fixture_diff(&cli.fixture_diff);
+    if !cli.fixture_reference.is_empty() {
+        run_fixture_reference(&cli.fixture_reference);
     }
     if !cli.fixture_trie.is_empty() {
         run_fixture_trie(&cli.fixture_trie);

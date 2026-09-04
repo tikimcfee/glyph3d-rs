@@ -19,6 +19,13 @@
 //!   bounds        per paged item: min/max over the rewritten positions
 //!   batch         union over items
 //!
+//! IT DOES NOT REPLACE `text::reference_layout`, which computes a subset of
+//! what this does. That is deliberate and the reason is at that function: this
+//! file was ported FROM the Mojo, `reference_layout` was written independently
+//! against the TSL kernel, and `--engine-check` is worth running precisely
+//! because its two sides have different lineage. Merging them would leave the
+//! Mojo checked against a port of itself.
+//!
 //! THIS PORT IS SERIAL. The Mojo shards decode, fold, paginate and bounds across
 //! cores; every one of those decompositions is over disjoint ranges or an exact
 //! min/max, so the results are identical and the parallelism is not part of the
@@ -552,6 +559,65 @@ pub(crate) fn bounds_range(slots: &Slots, start: usize, stop: usize) -> [f64; 6]
     box_lanes
 }
 
+/// DISPATCH 1, shared by both forms: decode every byte and collect the miss list.
+///
+/// Deduplicated deliberately, unlike `reference_layout` (see the note there):
+/// this loop carries no verification value as a second copy — the two forms
+/// were byte-identical, so a divergence between them could only ever be a typo,
+/// never a finding.
+///
+/// Misses are collected in BYTE ORDER, one entry per occurrence rather than per
+/// distinct codepoint; the Mojo reaches the same order by concatenating its
+/// shards' lists in shard order, which is byte order.
+pub(crate) fn decode_all<T: ResolveGlyph + ?Sized>(
+    bytes: &[u8],
+    slots: &mut Slots,
+    trie: &T,
+) -> (Vec<u32>, usize) {
+    let mut misses = Vec::new();
+    let mut leaders = 0usize;
+    for id in 0..bytes.len() {
+        if let Some(codepoint) = decode_and_resolve(bytes, slots, trie, id) {
+            leaders += 1;
+            if slots.flags(id) & F_MISSING != 0 {
+                misses.push(codepoint);
+            }
+        }
+    }
+    (misses, leaders)
+}
+
+/// The batch union over per-item boxes: min on lanes 0-2, max on 3-7.
+///
+/// Lanes 6 and 7 (TOTAL_ROWS, MAX_ROW_EXTENT) ride the MAX side with the box's
+/// upper corner — they are not box lanes at all, but the union is a max either
+/// way, and keeping them in one loop is what the reference does.
+pub(crate) fn batch_union(item_bounds: &[f64], item_count: usize) -> Vec<f64> {
+    let mut batch = [
+        f64::INFINITY,
+        f64::INFINITY,
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+        f64::NEG_INFINITY,
+        f64::NEG_INFINITY,
+        0.0,
+        0.0,
+    ];
+    for index in 0..item_count {
+        for lane in 0..3 {
+            if item_bounds[index * 8 + lane] < batch[lane] {
+                batch[lane] = item_bounds[index * 8 + lane];
+            }
+        }
+        for lane in 3..8 {
+            if item_bounds[index * 8 + lane] > batch[lane] {
+                batch[lane] = item_bounds[index * 8 + lane];
+            }
+        }
+    }
+    batch.to_vec()
+}
+
 /// The whole pipeline: decode -> fold per item -> paginate the active items with
 /// the DERIVED fan stride -> per-item boxes -> batch union.
 pub fn run_pipeline<T: ResolveGlyph + ?Sized>(
@@ -575,19 +641,7 @@ pub fn run_pipeline<T: ResolveGlyph + ?Sized>(
     let mut slots = Slots::new(byte_len);
 
     // ── decode ────────────────────────────────────────────────────────────────
-    // Misses are collected in BYTE ORDER, one entry per occurrence rather than
-    // per distinct codepoint — the Mojo reaches the same order by concatenating
-    // its shards' lists in shard order, which is byte order.
-    let mut misses = Vec::new();
-    let mut leaders = 0usize;
-    for id in 0..byte_len {
-        if let Some(codepoint) = decode_and_resolve(bytes, &mut slots, trie, id) {
-            leaders += 1;
-            if slots.flags(id) & F_MISSING != 0 {
-                misses.push(codepoint);
-            }
-        }
-    }
+    let (misses, leaders) = decode_all(bytes, &mut slots, trie);
 
     // ── the fold, per item ────────────────────────────────────────────────────
     let mut item_bounds = vec![0.0f64; items.len() * 8];
@@ -621,36 +675,15 @@ pub fn run_pipeline<T: ResolveGlyph + ?Sized>(
         item_bounds[index * 8..index * 8 + 6].copy_from_slice(&box_lanes);
     }
 
-    // ── batch union: min over 0-2, max over 3-7 (lanes 6/7 included) ──────────
-    let mut batch_bounds = [
-        f64::INFINITY,
-        f64::INFINITY,
-        f64::INFINITY,
-        f64::NEG_INFINITY,
-        f64::NEG_INFINITY,
-        f64::NEG_INFINITY,
-        0.0,
-        0.0,
-    ];
-    for index in 0..items.len() {
-        for lane in 0..3 {
-            if item_bounds[index * 8 + lane] < batch_bounds[lane] {
-                batch_bounds[lane] = item_bounds[index * 8 + lane];
-            }
-        }
-        for lane in 3..8 {
-            if item_bounds[index * 8 + lane] > batch_bounds[lane] {
-                batch_bounds[lane] = item_bounds[index * 8 + lane];
-            }
-        }
-    }
+    // ── batch union ───────────────────────────────────────────────────────────
+    let batch_bounds = batch_union(&item_bounds, items.len());
 
     FoldResult {
         slots,
         misses,
         leaders,
         item_bounds,
-        batch_bounds: batch_bounds.to_vec(),
+        batch_bounds,
     }
 }
 

@@ -38,7 +38,7 @@
 # no query ran, since the query half is what a whole-file record comparison
 # cannot see.
 #
-# Plus the corpus diff (--fixture-diff): text.rs's CPU fold laid against every
+# Plus the corpus diff (--fixture-reference): text.rs's CPU fold laid against every
 # fixture inside its domain and compared BIT-EXACT to the oracle's own expected
 # lanes. That half fails if NOTHING was in domain, because a differ that
 # compared nothing passes loudest.
@@ -104,7 +104,7 @@ else
     echo "FAIL  bake:"; echo "$OUT" | tail -20; FAIL=1
 fi
 
-if OUT=$("$BIN" --fixture-diff "${FIX[@]}" 2>&1); then
+if OUT=$("$BIN" --fixture-reference "${FIX[@]}" 2>&1); then
     echo "PASS  corpus diff — $(echo "$OUT" | tail -1)"
 else
     echo "FAIL  corpus diff:"; echo "$OUT" | tail -20; FAIL=1

@@ -379,6 +379,25 @@ fn fu_to_world(fu: i32, em_height_fu: u32) -> f32 {
 /// sequence length, continuation/invalid bytes are non-leaders (no record),
 /// and the codepoint assembles from masked payload bits WITHOUT validating
 /// the continuation bytes (bounds-checked reads return 0 past the end).
+/// DO NOT MERGE THIS INTO `fold::run_pipeline`, even though that function now
+/// computes a strict superset of it. They look like a dual code path and are
+/// not: their VALUE is that they have different lineage.
+///
+/// `reference_layout` was written independently against the TSL kernel
+/// (Stage E1). `fold.rs` was ported from `engine/glyph_pipeline.mojo`. So
+/// `--engine-check`, which runs the Mojo engine over real source with the real
+/// atlas and diffs it against this, is comparing two implementations that do
+/// NOT share a parent. Point it at `fold.rs` instead and it becomes the Mojo
+/// checked against a port of the Mojo — an oracle sharing a fault with its
+/// port, which is the one failure mode a diff cannot see.
+///
+/// The fixtures cannot cover that gap either: they gate both implementations,
+/// so anything they miss, both miss together. `--engine-check`'s input (40 KB of
+/// this crate's own source, the real atlas trie) is outside the corpus entirely,
+/// and independence is the whole reason it is worth running there.
+///
+/// Same rule, same reason as `to_world` / `fu_to_world`: a formula written twice
+/// on purpose stops being a check the moment it is written once.
 pub fn reference_layout<T: ResolveGlyph + ?Sized>(
     trie: &T,
     bytes: &[u8],

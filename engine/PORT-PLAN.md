@@ -371,6 +371,20 @@ The table is reproduced in the Rust source, as this plan asked.
   `to_world` and `native/src/text.rs::fu_to_world` are the SAME formula written
   twice on purpose, and `--engine-check` diffs them. Merging them turns a check
   into a function compared with itself. The file says so; believe it.
+
+  **`text.rs::reference_layout` is the same case**, and it now looks more
+  temptingly redundant than it is: `fold.rs::run_pipeline` computes a strict
+  superset of it. The point is LINEAGE, not coverage — `reference_layout` was
+  written independently against the TSL kernel, `fold.rs` was ported from the
+  Mojo, and `--engine-check` runs them against each other on 40 KB of real
+  source with the real atlas, input no fixture covers. Merge them and the Mojo
+  is checked against a port of the Mojo.
+
+  **The test for whether two copies may be merged**: could a divergence between
+  them ever be a FINDING, or only a typo? `decode_all` and `batch_union` were
+  byte-identical between `fold.rs` and `scan.rs` and could only ever have
+  diverged by mistake — those were correctly extracted (2026-09-03). A second
+  realization can diverge *meaningfully*, and that is exactly what it is for.
 - **Do not "simplify" the hybrid float discipline.** See landmine 2.
 
 ## Verification habits this repo runs on
