@@ -26,8 +26,16 @@ cp ../../../engine/bench/bench.bin engine/bench/   # optional; benches only
 
 Setup details and the toolchain's live constraints: `engine/TOOLCHAIN.md`.
 
-NINE gates since 2026-09-02 (was six). Two run FIRST — inputs before
-consumers: (1) three generators plus the atlas exporter each rebuild their
+TWELVE gates as of 2026-09-04 (was nine, was six). The step headings still
+read "N/9" — the numbering lies, the list below does not. THREE run before
+anything is verified, and all three were added for checks that already existed
+and were simply never consulted: (0) `pixi run build-engine`, because nothing
+built the dylib and `cargo build` does not — `native/build.rs` only LINKS it, so
+a `.mojo` edit was compiled by the conformance suites and NOT by the renderer;
+(1b) the 25-fixture corpus is DELETED and rebuilt, asserting byte-identity from
+the vendored, revision-pinned inputs in `engine/fixtures/inputs/`; (8b)
+`--repo-verify` diffs the per-item and batched FFI paths bit-exact in BOTH wrap
+modes. Then inputs before consumers: (1) three generators plus the atlas exporter each rebuild their
 committed output and require **byte-identity** (`engine-trie.bin`,
 `engine/glyph_schema.mojo`, the 16-file vendor manifest, the four
 `assets/atlas/*.bin`); (2) `engine/check.sh` — **16 Mojo conformance suites**
@@ -36,10 +44,11 @@ committed output and require **byte-identity** (`engine-trie.bin`,
 census was found carrying its own fault), plus a compile pass over all six
 benches. Then the
 original six: (3) `cargo build --release` with **zero warnings**, (4)
-`cargo clippy --release` zero warnings, (5) `cargo test` all green (72 tests:
+`cargo clippy --release` zero warnings, (5) `cargo test` all green (85 tests:
 naga WGSL validation, clap CLI parity, encase layout assertions, ItemParams
 validation, the layout seam's compaction / paint-indexing / extent / differ
-suites, and the reference port's reader/trie/fold/scan/bake suites), (6)
+suites, the wrap-mode monoid domain tests, and the reference port's
+reader/trie/fold/scan/bake suites), (6)
 `--engine-check src/main.rs` — bit-exact Mojo engine vs the text.rs CPU
 oracle, (7) `tools/check-stage-g.sh` — scripted picks cross-checked against
 an independent python fold oracle, (8) four-view **byte-equal** A/B:
