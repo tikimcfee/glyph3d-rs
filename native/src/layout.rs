@@ -54,10 +54,14 @@
 //!
 //! WHAT IS DELIBERATELY NOT HERE:
 //!
-//! - **The wire record's trip home.** `LayoutGlyphs` cannot produce records at
-//!   all. A gate that needs them asks [`VerifyLayout`], a separate trait, so
-//!   the render path cannot reach the readback by accident — a comment saying
-//!   "don't call this" is advice, a missing method is a fact.
+//! - **A position in the return value.** `LayoutGlyphs` cannot produce records
+//!   at all; a gate that needs them asks [`VerifyLayout`], a separate trait.
+//!   That is what lets a device-resident backend keep glyphs on the device.
+//!   IT IS NOT THE SAME AS DELETING THE READBACK, and this header used to claim
+//!   it was: `MojoLayout::run` calls `engine.records()` unconditionally in both
+//!   strategies, because `compact_records_into` runs on the host and needs
+//!   them. 3.10 GB still crosses the FFI on every load. `VerifyLayout` gates
+//!   the API, not the copy — the copy dies when compaction moves to the data.
 //! - **`text::reference_layout`.** It is a second, independently-derived
 //!   realization of the same layout and its whole value is that it shares no
 //!   lineage with the fold. It stays where it is. See `engine/PORT-PLAN.md`.
