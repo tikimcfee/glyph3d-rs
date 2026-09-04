@@ -6,10 +6,12 @@ cited by path. Claims are marked **[measured]** (someone ran it) or
 
 ## The repo, in ten lines
 
-`glyph3d-native` renders source code as millions of 3D text glyphs. Three
+`glyph3d-native` renders source code as millions of 3D text glyphs. Four
 languages: **Mojo** (`engine/*.mojo`, the compute engine — the runtime layout
-fold), **Rust** (`native/src/`, the renderer, wgpu), and **JS** (vendored, used
-only to generate a conformance corpus). The Mojo compiles to a C-ABI shared
+fold), **Rust** (`native/src/`, the renderer, wgpu), **JS** (vendored, used
+only to generate the conformance corpus), and **Python** (`tools/` — three
+generators plus the independent pick oracle a gate diffs against). The Mojo
+compiles to a C-ABI shared
 library that Rust links. Correctness rests on 25 binary fixtures that every
 implementation is diffed against bit-exactly.
 
@@ -37,9 +39,14 @@ choice, not a layering error.
 | `native/target/release/glyph3d-native` | `cargo build --release` from `native/src/**` | **product** |
 | `out/tooling-ab/baseline/*.png` (4) | the binary, **by hand, deliberately** | committed |
 
-**COMMITTED artifacts** are verified by rebuilding to a scratch location and
-byte-comparing. Every generator already has a `--check` / `--verify-only` mode,
-so this half exists — what is missing is the graph.
+**COMMITTED artifacts** are verified by rebuilding and byte-comparing, and that
+half already exists — but unevenly, which is itself part of the job. THREE of the
+six generators expose a check mode (`gen_schema.py --check`,
+`gen_real_trie.py --verify-only`, `vendor-manifest.py --check`) **[measured]**;
+`export-atlas.mjs`, `gen.mjs` and `gen-bake.mjs` have none, and are verified
+instead by the gate rebuilding them into a temp dir or deleting and regenerating
+them in place. Same guarantee, three different hand-written mechanisms. What is
+missing is the graph, and the uniformity.
 
 **PRODUCTS** are untracked (`.gitignore` has `*.dylib`) and have nothing to
 compare against. They only need to be CURRENT before anything reads them.

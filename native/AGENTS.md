@@ -111,9 +111,14 @@ a backend or a caller; the short version:
   `LayoutGlyphs` returns a position.** That is the point: it is what lets a
   device-resident backend keep the glyphs on the device.
 - A gate that needs the 32 B wire records asks `VerifyLayout`, a SEPARATE
-  trait. Holding a `LayoutGlyphs` makes the 36 B-per-source-byte readback
-  unreachable rather than merely discouraged. Do not widen `LayoutGlyphs` to
-  return records; that is the contract this seam replaced.
+  trait, so no method a caller holds RETURNS a position. That is what would let
+  a device-resident backend keep glyphs on the device. **It does NOT mean the
+  readback is gone** — this file claimed that until 2026-09-04 and it was wrong:
+  `MojoLayout::run` calls `engine.records()` unconditionally
+  (`layout_mojo.rs:78` and `:103`), because host-side `compact_records_into`
+  needs the records. 3.10 GB still crosses the FFI on a 97 MB corpus. The copy
+  dies when compaction moves to the data, not when a trait hides it. Do not
+  widen `LayoutGlyphs` to return records.
 - `ItemParams::validate` runs in `LayoutGlyphs::layout_items`, a PROVIDED
   method. Implement `layout_validated_items`; a backend cannot forget the
   guard because it never calls it.
