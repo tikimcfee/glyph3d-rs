@@ -123,12 +123,15 @@ a backend or a caller; the short version:
   the Mojo backend's two FFI strategies against each other; stage 1 points the
   same call at the Rust backend.
 
-KNOWN CEILING (measured 2026-09-04): the page extent's origin seed is NOT
-covered by the four-view A/B. Seeding it empty instead reddens the unit test
-but leaves all four screenshots byte-equal, because the seed only binds for a
-file with ZERO records and `fixtures/g-pick-repo` has no empty file. Real
-repos do — an empty `.rs` is walked, laid out and staged — so the seed is
-load-bearing in production and unit-tested only.
+`fixtures/g-pick-repo/empty.rs` IS ZERO BYTES ON PURPOSE, and it is the only
+input in the tree that reaches the page extent's origin seed. The seed binds
+only for an item with ZERO records; before that file existed, seeding the
+extent empty instead reddened its unit test and left all four screenshots
+byte-equal, so gate 8 could not see it at all. With the empty file in place
+that same mutation moves `repo-wide.png` (verified 2026-09-04; `repo-zoom` is
+framed on alpha.rs and still cannot see it, which is fine — one gate seeing it
+is the point). Do not "tidy up" the empty file, and if the fixture is ever
+rebuilt, put one back.
 
 ## Style discipline
 

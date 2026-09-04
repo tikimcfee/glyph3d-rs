@@ -195,19 +195,29 @@ to have landed before the check ran:
 | M3 | `bit_eq` degraded to `PartialEq` | unit RED |
 | M4 | `diff_backends` stops comparing instances | unit RED |
 | M5 | `diff_backends` stops comparing records | unit RED |
-| M6 | page extent seeded empty, not at the origin | unit RED, **screenshots still byte-equal** |
+| M6 | page extent seeded empty, not at the origin | unit RED + repo-wide diverges (after the fixture fix below) |
 | M7 | ink extent measures blanks too | unit RED |
 | M8 | the seam's provided validation removed | unit RED |
 | M9 | the two Mojo strategies desynchronised | unit RED + `--repo-verify` RED |
 
-**M6 IS A MEASURED CEILING, NOT A PASS.** The page extent's origin seed only
-binds for an item with ZERO records, and `fixtures/g-pick-repo` contains no
-empty file — so the four-view A/B cannot see that seed at all, and the unit test
-is its only cover. It is not academic: an empty `.rs` in a real repo IS walked,
-laid out and staged (verified 2026-09-04 on a two-file scratch repo), and
-without the seed its page would be an inverted rectangle fed to the shelf
-packer. Closing this would mean adding an empty file to the pick fixture, which
-re-baselines three screenshots — a conscious act, not a stage-0 one.
+**M6 FOUND A CEILING, AND THE CEILING IS NOW CLOSED.** On the first run M6
+reddened its unit test and left all four screenshots byte-equal: the page
+extent's origin seed binds only for an item with ZERO records, and
+`fixtures/g-pick-repo` had no empty file, so gate 8 could not see the seed at
+all. Not academic — an empty `.rs` in a real repo IS walked, laid out and
+staged, and without the seed its page is an inverted rectangle handed to the
+shelf packer.
+
+Fixed rather than documented: `fixtures/g-pick-repo/empty.rs` (zero bytes, and
+it sorts between `alpha.rs` and `long.md` so the zero-length item lands in the
+MIDDLE of the arena, not at a convenient end). Re-running M6 against it now
+moves `repo-wide.png`. `repo-zoom` still cannot see it — it is framed on
+alpha.rs — which is why the mutation was re-run rather than assumed.
+
+Cost of the fix: ONE screenshot re-baselined, not the three I had estimated
+before measuring (`demo`, `text` and `repo-zoom` all came back byte-equal).
+`check-stage-g.sh` stayed green on its own — its assertions are on `byte=` and
+per-file `rec=`, and the empty file shifts only `group=` ids.
 
 **What stage 1 now is.** Implement `LayoutGlyphs` over `fold`/`scan`/`bake`,
 emitting the same 32 B `GlyphRecord`s and calling the SAME
