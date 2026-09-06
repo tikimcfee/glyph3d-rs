@@ -1,5 +1,4 @@
-# `cargo xtask <cmd>` from the repo root. xtask is a standalone crate (see
-# xtask/Cargo.toml for why it is not a workspace member), so the alias names
-# its manifest explicitly.
+# `cargo glyph <verb>` — the one entry point for building, testing and running
+# this project. See glyph/src/main.rs.
 [alias]
-xtask = ["run", "--quiet", "--manifest-path", "xtask/Cargo.toml", "--"]
+glyph = ["run", "--quiet", "--release", "-p", "glyph", "--"]

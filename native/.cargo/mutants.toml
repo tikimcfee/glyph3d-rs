@@ -3,13 +3,21 @@
 #
 # HOW TO RUN IT, and the two ways it bites:
 #
-#   The default copy-to-scratch strategy CANNOT work here. The cargo root is
-#   native/, so cargo-mutants copies only native/ — and build.rs asserts
-#   ../.pixi/envs/default/lib exists, while fixture.rs, bake.rs, atlas.rs and
-#   main.rs all reach ../engine and ../assets through CARGO_MANIFEST_DIR. All of
-#   that escapes the copy. Always --in-place. (A root workspace Cargo.toml would
-#   fix the copy root and relocate native/target, which eight paths depend on —
-#   do not.)
+#   NEEDS RE-MEASUREMENT as of the workspace move (2026-09-06). The measured
+#   finding was: the default copy-to-scratch strategy could not work, because
+#   the cargo root was native/, so cargo-mutants copied only native/ — and
+#   build.rs asserts ../.pixi exists while fixture.rs, bake.rs, atlas.rs and
+#   main.rs all reach ../engine and ../assets through CARGO_MANIFEST_DIR, all of
+#   which escaped the copy. That evaluation also recommended AGAINST a root
+#   workspace because it would relocate native/target. The workspace landed
+#   anyway, for reasons that outweighed it (rust-analyzer saw two disconnected
+#   crates; the build tool could not be built or tested with the thing it
+#   manages), and every dependent path was moved with it.
+#
+#   So the copy root is now the repo root, and copy-to-scratch may simply work.
+#   Nobody has run it since. Until someone does, assume --in-place and the
+#   hazard below; do not assume the default mode is fixed just because the
+#   cause was removed.
 #
 #   --in-place mutates the WORKING TREE, and check-all reads the working tree,
 #   not HEAD. A killed run leaves the mutation behind: measured three times,

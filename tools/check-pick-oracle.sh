@@ -8,7 +8,7 @@
 # the load-bearing contract the runner greps for.)
 set -euo pipefail
 cd "$(dirname "$0")/.."
-BIN=native/target/release/glyph3d-native
+BIN=target/release/glyph3d-native
 # Unlike its siblings this script had no binary guard for most of its life:
 # run out of order it died with a raw shell error instead of a diagnosis.
 [ -x "$BIN" ] || { echo "FAIL  $BIN missing — run: python3 tools/glyph.py build"; exit 1; }

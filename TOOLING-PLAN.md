@@ -25,7 +25,7 @@ a 27-line shim preserving the old output contract.
   pins (`fixture.rs` 17, `bake.rs` 8) stay as an independent second witness.
   [measured: a 17→16 corpus shrink reddens the fixtures gate naming the counts,
   exit 1, committed corpus untouched]
-- **Content-hash product stamps** (`native/target/.glyph-stamps/`), not mtime.
+- **Content-hash product stamps** (`target/.glyph-stamps/`), not mtime.
   This is what actually closes the edge cargo cannot see.
 - **The disagreement with the brief about pixi was correct.** The brief proposed
   pixi as the manifest's home; the author argued that `depends-on` is

@@ -42,8 +42,8 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 MANIFEST = ROOT / "build.toml"
-STAMP_DIR = ROOT / "native" / "target" / ".glyph-stamps"
-BIN = ROOT / "native" / "target" / "release" / "glyph3d-native"
+STAMP_DIR = ROOT / "target" / ".glyph-stamps"
+BIN = ROOT / "target" / "release" / "glyph3d-native"
 BASE = ROOT / "out" / "tooling-ab" / "baseline"
 SWEEP = ROOT / "out" / "tooling-ab" / "sweep"
 
@@ -224,7 +224,7 @@ def verify_golden(name: str, art: dict, views: list[dict]) -> bool:
     SWEEP.mkdir(parents=True, exist_ok=True)
     ok = True
     for v in views:
-        rc, out = run(f"./target/release/glyph3d-native {v['cmd']} --screenshot ../{SWEEP.relative_to(ROOT)}/{v['name']}.png",
+        rc, out = run(f"../target/release/glyph3d-native {v['cmd']} --screenshot ../{SWEEP.relative_to(ROOT)}/{v['name']}.png",
                       cwd=ROOT / "native")
         if rc != 0:
             print(f"FAIL  {name} — {v['name']} render errored")
@@ -395,7 +395,7 @@ def gate_engine_check() -> bool:
     # never reach the out-of-range decode path where the two implementations
     # actually disagreed; overflow-leads.txt is the only input that does.
     for target in ("src/main.rs", "fixtures/overflow-leads.txt"):
-        rc, out = run(f"./target/release/glyph3d-native --engine-check {target}", cwd=ROOT / "native")
+        rc, out = run(f"../target/release/glyph3d-native --engine-check {target}", cwd=ROOT / "native")
         lines = out.strip().splitlines()
         last = lines[-1] if lines else ""
         print(last)
@@ -420,7 +420,7 @@ def gate_repo_verify() -> bool:
     ok = True
     for mode in ("down", "back"):
         rc, out = run(
-            f"./target/release/glyph3d-native --load-repo fixtures/g-pick-repo"
+            f"../target/release/glyph3d-native --load-repo fixtures/g-pick-repo"
             f" --wrap-mode {mode} --repo-verify --repo-scan-only",
             cwd=ROOT / "native")
         passes = [l for l in out.splitlines() if "repo-verify PASS" in l]

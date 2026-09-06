@@ -38,7 +38,7 @@ choice, not a layering error.
 | `assets/atlas/engine-trie.bin` | `tools/gen_real_trie.py` | committed |
 | `engine/fixtures/*.{pipe,bake}.bin` (25) | `engine/fixtures/gen.mjs`, `gen-bake.mjs` from `engine/fixtures/inputs/*.js` | committed |
 | `native/libglyph_engine.dylib` | `pixi run build-engine` from `engine/*.mojo` | **product** |
-| `native/target/release/glyph3d-native` | `cargo build --release` from `native/src/**` | **product** |
+| `target/release/glyph3d-native` | `cargo build --release` from `native/src/**` | **product** |
 | `out/tooling-ab/baseline/*.png` (4) | the binary, **by hand, deliberately** | committed |
 
 **COMMITTED artifacts** are verified by rebuilding and byte-comparing, and that

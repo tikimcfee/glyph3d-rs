@@ -17,7 +17,7 @@ import re
 import subprocess
 import sys
 
-BIN = "native/target/release/glyph3d-native"
+BIN = "target/release/glyph3d-native"
 # Was an absolute path into the web repo; this tree's own source is the corpus now.
 REPO = os.environ.get("GLYPH_JS", os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "native", "src"))

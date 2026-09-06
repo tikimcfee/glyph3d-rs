@@ -79,7 +79,8 @@ mechanism and the two guards that exist because prose was not enough.
 
 ### Running the renderer
 
-All from `native/`, binary is `target/release/glyph3d-native` (full flag set:
+Binary is `target/release/glyph3d-native`; the run commands below are from
+`native/` because their file arguments are relative to it (full flag set:
 `--help`).
 
 | What | Command |

@@ -1,0 +1,16 @@
+[package]
+name = "glyph"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# The build/test tool. `cargo glyph <verb>` from anywhere in the workspace.
+#
+# It is a workspace member on purpose: it is built and tested by the same cargo
+# invocation as the renderer, which means it is subject to the same
+# zero-warning gate and the same test floor as the code it checks. A build tool
+# exempt from its own regime is how tools/glyph.py ended up with no tests.
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"

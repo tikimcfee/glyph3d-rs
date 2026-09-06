@@ -82,7 +82,7 @@ pixi run mojo build --fp-mode contract=off -I engine \
 
 # Rust-side
 cargo build --release --manifest-path native/Cargo.toml
-./native/target/release/glyph3d-native --engine-file <text-file> [--engine-loop N]
+./target/release/glyph3d-native --engine-file <text-file> [--engine-loop N]
 ```
 
 Port note (MOJO-1.1-PORT): Mojo 1.1.0.dev2026083005 made `std.runtime.asyncrt`

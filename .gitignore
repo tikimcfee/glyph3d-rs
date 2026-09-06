@@ -29,5 +29,5 @@ out/tooling-ab/sweep/
 # `git add -A` will otherwise commit them as gitlinks (it did, 289ada8).
 .claude/
 
-# xtask is a standalone crate (not a workspace member), so it has its own target
-xtask/target/
+# one workspace, one target dir (was native/target before 2026-09-06)
+/target/

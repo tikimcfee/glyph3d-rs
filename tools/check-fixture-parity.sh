@@ -44,7 +44,7 @@
 # compared nothing passes loudest.
 set -uo pipefail
 cd "$(dirname "$0")/.."
-BIN=native/target/release/glyph3d-native
+BIN=target/release/glyph3d-native
 FIX=(engine/fixtures/*.pipe.bin)
 FAIL=0
 

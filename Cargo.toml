@@ -1,0 +1,19 @@
+# The workspace root.
+#
+# `native/` (the renderer) and `glyph/` (the build/test tool) were two
+# disconnected crates until 2026-09-06. That cost more than tidiness:
+# rust-analyzer saw two unrelated projects, so neither had the other in scope,
+# and the tool that manages the build could not be built or tested by the same
+# invocation as the thing it manages.
+#
+# One workspace, one target/ directory, one Cargo.lock. The move relocated
+# target/ from native/target to ./target; every path that depended on the old
+# location was updated in the same commit — build.toml, the content-hash stamp
+# dir, the check scripts, and the docs.
+[workspace]
+resolver = "2"
+members = ["native", "glyph"]
+
+[profile.release]
+# Keep debug info in release so future profiling stages stay sane.
+debug = true

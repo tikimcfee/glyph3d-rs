@@ -40,7 +40,7 @@ note = "cargo does NOT build this; native/build.rs only links it. --fp-mode cont
 
 [artifact.renderer]
 class = "product"
-outputs = ["native/target/release/glyph3d-native"]
+outputs = ["target/release/glyph3d-native"]
 inputs = ["native/src/**", "native/build.rs", "native/Cargo.toml", "native/Cargo.lock", "native/libglyph_engine.dylib"]
 build = "cd native && cargo build --release"
 note = "Cargo owns its own dependency graph; the stamp only guards the dylib edge cargo cannot see."
@@ -104,7 +104,7 @@ outputs = [
   "out/tooling-ab/baseline/repo-zoom.png",
   "out/tooling-ab/baseline/repo-wide.png",
 ]
-inputs = ["native/target/release/glyph3d-native", "native/fixtures/baseline-view.txt", "native/fixtures/g-pick-repo/**"]
+inputs = ["target/release/glyph3d-native", "native/fixtures/baseline-view.txt", "native/fixtures/g-pick-repo/**"]
 note = "Blind to everything outside these four frames, and cannot distinguish a regression from an intentional change. empty.rs in g-pick-repo is zero bytes ON PURPOSE (the only input reaching the page-extent origin seed)."
 
 # Per-view render commands (run from native/, screenshot into {scratch}).
