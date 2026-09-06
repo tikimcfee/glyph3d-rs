@@ -101,9 +101,44 @@ for s in ${list[@]+"${list[@]}"}; do run "$s" "${PIPE[@]}"; done
 # instrument, it is an absent one. fixture_manifest is gate 9's Mojo half.
 [[ "${1:-all}" == "gpu" ]] || run fixture_census "${PIPE[@]}"
 [[ "${1:-all}" == "gpu" ]] || run fixture_manifest "${PIPE[@]}"
+
+# ffi_selftest is the ONE suite that does not `mojo run`: it asserts the C ABI,
+# so it links the SHIPPED dylib and calls its exports through external_call —
+# the boundary the product actually crosses. Importing ffi.mojo in-process
+# instead was unsound under this pinned toolchain, not merely weak: executable
+# codegen miscompiles offset-indexed loads through unsafe_bitcast'd pointers at
+# some inlined call sites, per compilation unit (measured 2026-09-06: origin_x
+# read back as a heap address; the same source built as the dylib is bit-exact
+# on every single-item fixture). ffi_selftest.mojo's header has the full story.
+# It covers the 14 single-item pipe fixtures and skips the 3 multi-item ones —
+# the per-item entry takes one item per load by design; the batched entry's
+# coverage lives in check-all's --repo-verify gate.
+if [[ "${1:-all}" != "gpu" ]]; then
+    # The artifact under test must exist and be current — same reason check-all
+    # rebuilds the dylib as its step 0. One definition of the build command:
+    # pixi.toml's build-engine task.
+    printf '%-22s ' "libglyph_engine.dylib"
+    if out=$(pixi run build-engine 2>&1); then
+        echo "built"
+    else
+        echo "FAILED TO BUILD"; echo "$out" | tail -4; exit 1
+    fi
+    printf '%-22s ' ffi_selftest
+    if ! out=$("${MOJO[@]}" build $FP -I engine engine/ffi_selftest.mojo -o "$TMPBIN" \
+        -Xlinker "$PWD/native/libglyph_engine.dylib" \
+        -Xlinker -rpath -Xlinker "$PWD/native" 2>&1); then
+        echo "FAILED TO BUILD"; echo "$out" | tail -4; rm -f "$TMPBIN"; exit 1
+    fi
+    if out=$("$TMPBIN" "${PIPE[@]}" 2>&1); then
+        echo "${out##*$'\n'}"
+    else
+        echo "FAILED"; echo "$out" | tail -5; rm -f "$TMPBIN"; exit 1
+    fi
+    rm -f "$TMPBIN"
+fi
 case "${1:-all}" in
-    cpu) echo "all 11 CPU suites + 2 instruments green (fp contraction disabled); GPU suites NOT RUN" ;;
+    cpu) echo "all 11 CPU suites + ffi_selftest (dylib C ABI, 14 single-item fixtures) + 2 instruments green (fp contraction disabled); GPU suites NOT RUN" ;;
     bench) echo "all bench files compile (they are not RUN: bench.bin is untracked)" ;;
     gpu) echo "all 5 GPU suites green (fp contraction disabled)" ;;
-    *)   echo "all 16 suites green + 2 instruments + benches compile, CPU + GPU (fp contraction disabled)" ;;
+    *)   echo "all 16 suites + ffi_selftest (dylib C ABI) green + 2 instruments + benches compile, CPU + GPU (fp contraction disabled)" ;;
 esac
