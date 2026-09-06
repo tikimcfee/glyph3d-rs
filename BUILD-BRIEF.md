@@ -137,6 +137,19 @@ an account of which ones RUN. Four found in one day, one at a time, by accident.
   else gate 8 cannot see.
 - **Do not weaken a gate to make it fit the graph.** If a gate resists
   generalisation, that is information.
+
+- **The corpus-size pins are not in the gate runner, and are not redundant.**
+  `native/src/fixture.rs` pins 17 `.pipe.bin` and `native/src/bake.rs` pins 8
+  `.bake.bin`, each with "update deliberately" in the message. Everything else
+  that touches fixtures GLOBS — gate 1b `ls`-derives its count, `engine/check.sh`
+  globs into both instruments, and gate 9 reports whatever it was handed. That is
+  fine BECAUSE the two pins exist. Verified 2026-09-06 [measured]: deleting one
+  case from `gen.mjs`'s `CASES` and `git rm`-ing its `.bin` left eleven of twelve
+  gates green — gate 1b printed `PASS 24 fixtures ... BYTE-IDENTICAL` and gate 9
+  printed `16 fixtures` — and the battery went red only at gate 5, on the pin.
+  So when you subsume gate 1b, carry a DECLARED corpus size into the manifest or
+  leave the pins alone; do not retire them as duplicate coverage, and do not
+  copy 1b's habit of asking the tree how big the tree is.
 - **Do not edit `/Users/lugo/localdev/viz-web/glyph3d-js`.** Historical
   reference, read-only.
 - Note `.claude/worktrees/` may hold other agents' in-flight work. Do not touch
