@@ -110,8 +110,13 @@ an account of which ones RUN. Four found in one day, one at a time, by accident.
 ## What to build
 
 1. **One declarative manifest** — artifact, inputs (globs), build command,
-   class. Pixi is the right home (it is already the toolchain boundary and
-   supports `depends-on`), but argue if you disagree.
+   class. **DONE 2026-09-06 (`a3bd22f`), and the brief was wrong about where.**
+   This originally proposed pixi as the home; the author argued that pixi's
+   `depends-on` is task-ordering and cannot express the edge that matters —
+   cargo links a dylib it does not build — so the artifact graph lives in a
+   standalone `build.toml` and pixi got only the edge it can see
+   (`build-native depends-on build-engine`). That argument was right. Do not
+   re-litigate it; see `TOOLING-PLAN.md` for what is actually open.
 2. **Two modes over it.** `build` brings products current and regenerates
    committed artifacts. `verify` rebuilds committed artifacts to a scratch path
    and byte-compares. `check-all` should then assert properties of artifacts
