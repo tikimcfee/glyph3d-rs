@@ -6,12 +6,14 @@ recorded origin is indistinguishable from a local invention six months later.
 
   upstream repo    viz-web/glyph3d-js
   upstream commit  2ef79b7e762a07ebbf72713f97527a6831b7a839
-  regenerated      2026-09-04  (tools/vendor-manifest.py)
+  regenerated      2026-09-06  (tools/vendor-manifest.py)
 
 ## The fixture oracle is pinned PER FILE
 
-`engine/fixtures/{gen,gen-bake}.mjs` reproduce all 22 committed fixtures
-byte-for-byte, in this tree, with no web repo present — but only from these
+`engine/fixtures/{gen,gen-bake}.mjs` reproduce all 25 committed
+fixtures (17 `.pipe.bin` + 8 `.bake.bin`; counts read from
+`build.toml [artifact.fixtures]`) byte-for-byte, in this tree, with no web
+repo present — but only from these
 revisions. Today's upstream cannot: `glyphPipelineReference.js` stopped
 exporting `FLOAT_LANES` at 3da6542 and the generators do not even load.
 
@@ -27,13 +29,16 @@ defect: the `glyphPipelineKernels.js` vendored here until 2026-09-04 was
 78,567 bytes, but `real-kernels.pipe.bin` embeds 90,515 — the file at 59a2a44.
 The old copy matched its own recorded hash on every `--check` run. The gate
 asked whether the file had been edited locally; it could not ask whether it
-was the file the corpus came from. `node gen.mjs && shasum -c` is that check.
+was the file the corpus came from. Byte-identical regeneration of the whole
+corpus from these inputs — run by the battery's fixture gate on every pass —
+is that check.
 
 ## Verifying
 
   LOCAL drift (did someone edit a vendored copy?) — no web repo needed:
       python3 tools/vendor-manifest.py --check
-  This runs as part of `tools/check-all.sh` gate 1.
+  This runs in the battery's generator-reproduction gate (`tools/check-all.sh`
+  step 1; build.toml gate `vendor-hashes`).
 
   UPSTREAM drift (did the web repo move on?) — needs the web repo present:
       python3 tools/vendor-manifest.py     and read the last column.
@@ -65,6 +70,22 @@ was the file the corpus came from. `node gen.mjs && shasum -c` is that check.
 | `tools/vendor/ref/packages/glyph3d-r3f/src/coreRanges.js` | `packages/glyph3d-r3f/src/coreRanges.js` | 2874 | `33dbad8e14c5ecc0…` | yes |
 | `tools/vendor/ref/tools/headlessFontChain.mjs` | `tools/headlessFontChain.mjs` | 3752 | `6f49cde4cc655eb2…` | yes |
 
+## Derived, not copied: `tools/vendor/hb.*`
+
+These two are not upstream mirror entries — each is DERIVED from a vendored
+ref file by the stated transformation, and `--check` re-runs that derivation
+in memory on every pass. The bare hash catches a local edit; the
+re-derivation catches the ref copy and the derived file drifting apart (e.g.
+a refreshed ref with a stale derived twin). They exist because
+`tools/export-atlas.mjs` (:87-91) must `require()` HarfBuzz from Node >= 22,
+which refuses the ref `hb.js` — UMD with a trailing ESM `export default`
+(ERR_AMBIGUOUS_MODULE_SYNTAX; Bun, the web repo's bake runtime, accepts it).
+
+| local path | derived from | transformation | bytes | sha256 (local) | derivation holds |
+|---|---|---|---:|---|:--:|
+| `tools/vendor/hb.cjs` | `tools/vendor/ref/packages/glyph3d-core/src/shaping/vendor/hb.js` | drop the trailing `export default createHarfBuzz;` line | 24491 | `a3550bf1fc195c22…` | yes |
+| `tools/vendor/hb.wasm` | `tools/vendor/ref/packages/glyph3d-core/src/shaping/vendor/hb.wasm` | verbatim copy | 397190 | `ea319787a8efdf90…` | yes |
+
 ## Notes
 
 - `tools/vendor/ref/**` mirrors the web repo's LAYOUT exactly so every file stays
@@ -72,15 +93,14 @@ was the file the corpus came from. `node gen.mjs && shasum -c` is that check.
   these; a vendored file you edited is a fork you did not declare, which is what
   the `--check` gate exists to catch.
 - `engine/fixtures/inputs/foldGeometry.js` and `glyphPipelineKernels.js` are
-  FIXTURE CORPUS inputs, not code. The fixture generators read live web-repo
-  source for these two; `minified-sample.js` was already vendored for exactly
-  this reason and these two complete the set. NOTHING READS THEM YET — the
-  generators cannot run in this tree (they need a `packages/` path that does not
-  exist here, and `engine/glyph_schema.mjs`, which this tree does not emit).
-  They are vendored now so the corpus input is frozen at a known commit rather
-  than drifting until someone gets to the Rust port.
-- The committed fixtures CANNOT be reproduced from these inputs:
-  `glyphPipelineKernels.js` changed upstream in `3da6542` after those fixtures
-  were generated. Regeneration will produce a NEW corpus, deliberately. The old
-  bytes live in git history, which is where superseded evidence belongs.
+  FIXTURE CORPUS inputs, and they ARE read: `engine/fixtures/gen.mjs` loads
+  `inputs/foldGeometry.js` at :93 (the `repo-file` fixture's source bytes) and
+  `inputs/glyphPipelineKernels.js` at :175 (the `real-kernels` fixture). The
+  generators DO run in this tree — `engine/glyph_schema.mjs` is emitted here by
+  `tools/gen_schema.py` — and the battery's fixture gate regenerates the whole
+  corpus from these inputs BYTE-IDENTICALLY on every pass. They are vendored so
+  the corpus input is frozen at the pinned revisions above rather than drifting
+  with upstream: today's upstream `glyphPipelineKernels.js` differs from the
+  59a2a44 pin (`3da6542` landed after it), so an unpinned input would regenerate
+  a DIFFERENT corpus and redden that gate.
 - `schema/glyph-identity.json` is the source of truth for `tools/gen_schema.py`.
