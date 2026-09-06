@@ -20,11 +20,13 @@ for Rust (`native/Cargo.toml` — a leaf, there is no root workspace **[measured
 
 ## Why pixi is above native/, which looks odd and is not
 
-`pixi run build-engine` compiles `engine/*.mojo` into
+`pixi run build-engine` compiles `engine/ffi.mojo` with `-I engine` (so the whole
+directory, the generated schema included, is an input) into
 `native/libglyph_engine.dylib`. `native/build.rs` only **links** whatever file is
 already there — it does not build it, and says so in its header. So cargo's
 output depends on pixi's output; cargo cannot be the outer build. The dylib is
-written *into* `native/` so build.rs finds it by relative path — a placement
+written *into* `native/` so build.rs finds it (via `CARGO_MANIFEST_DIR`, an
+absolute path off the crate root — not a relative one) — a placement
 choice, not a layering error.
 
 ## The artifacts, and the two classes that matter
@@ -60,10 +62,20 @@ script:
 
 ```
 schema/glyph-identity.json
-  -> tools/gen_schema.py    -> engine/glyph_schema.mojo
-  -> pixi run build-engine  (mojo -I engine, so the schema is an INPUT)
-  -> cargo build            (links the dylib)
+  -> tools/gen_schema.py  -> engine/glyph_schema.mojo
+  |                           -> pixi run build-engine  (mojo -I engine: the schema is an INPUT)
+  |                           -> cargo build            (links the dylib)
+  \_______________________ -> engine/glyph_schema.mjs
+                              -> engine/fixtures/gen.mjs  (imports ../glyph_schema.mjs)
+                              -> the 25 fixtures
+                              -> every conformance gate
 ```
+
+TWO edges leave the schema, not one **[measured]** — `gen_schema.py` emits both
+halves and `gen.mjs:60` imports the `.mjs`. So editing the schema
+staleness-invalidates the CORPUS as well as the dylib, and for a document whose
+thesis is "nothing declares a dependency", the second edge is the more
+interesting one.
 
 Edit the schema and nothing knows the dylib is stale. **This class of failure
 has already cost real time here [measured]:** `glyph_engine_load_item` used to
@@ -82,6 +94,10 @@ and was never consulted:
 
 - **gate 0** builds the dylib, because nothing did and `cargo build` does not.
 - **gate 1b** deletes all 25 fixtures and rebuilds them, asserting byte-identity.
+  (Unlike 0 and 8b, this one is not a check that existed and went unconsulted:
+  before `f68b70f` the corpus could not be rebuilt in this tree AT ALL, because
+  `gen.mjs` imported from `../../packages/`. Vendoring the inputs was the work;
+  the gate came with it.)
 - **gate 8b** runs `--repo-verify` (per-item vs batched FFI, bit-exact).
 
 **Still unwired:** `engine/ffi_selftest.mojo` is neither run nor compiled by
@@ -113,8 +129,12 @@ an account of which ones RUN. Four found in one day, one at a time, by accident.
 
 - **A build must never bring `out/tooling-ab/baseline/*.png` current.** They are
   derived, but re-baselining is a deliberate act and those four byte-equal
-  screenshots are the only gate that catches an unintended renderer change. In
-  the manifest they are verified, never built.
+  screenshots are the only PIXEL gate. Not the only thing that catches a
+  renderer change, and the difference matters: the page extent's origin seed was
+  renderer-affecting and all four stayed byte-equal through it — a unit test
+  caught it, and gate 8 can see it today only because a zero-byte fixture was
+  added for it. In the manifest they are verified, never built. And ask what
+  else gate 8 cannot see.
 - **Do not weaken a gate to make it fit the graph.** If a gate resists
   generalisation, that is information.
 - **Do not edit `/Users/lugo/localdev/viz-web/glyph3d-js`.** Historical

@@ -83,7 +83,7 @@ The container is split TWICE, along different axes:
 ```
 slots    40 B per SOURCE BYTE, corpus lifetime   (sm 8 + gi 4 + fl 4 + lm 16 + lc 8)
 witness  12 B per SOURCE BYTE, WITNESSED ONLY    (wm 4 + wc 4 + ord_to_byte 4)
-record   32 B per RENDERED GLYPH                 (measures 6 + counts 2)
+record   32 B per RENDERED GLYPH                 (measures 5 + counts 3)
 ```
 
 `RECORD_MEASURE_STRIDE` / `RECORD_COUNT_STRIDE` are **derived** from which lanes the
@@ -143,8 +143,14 @@ sitting in an f32 array — exempted by a `misplaced` entry that named its own f
 render side), the engine followed (its trie realization split by carrier: measures
 f32, identity + bitfield native u32), and the entry was removed the same day —
 the stale-declaration rule makes an exemption that outlives its deviation a build
-failure, so keeping it was not an option. KNOWN_DEVIATIONS is empty: the system
-has no declared debts for the first time in its existence.
+failure, so keeping it was not an option. That GLYPH_ID entry is gone; the ledger
+is NOT empty. `schema/glyph-identity.json:453-459` still declares one —
+`TOTAL_ROWS`, a count on the host's f64 bounds array, settled by splitting the
+host bounds container by carrier. Gate 1 is green BECAUSE it is declared
+(`tools/gen_schema.py` treats `misplaced` as the declaration mechanism and fails
+the build on an undeclared one). This sentence previously read "KNOWN_DEVIATIONS
+is empty … for the first time in its existence", which was both wrong and
+unfalsifiable: no such list exists in the tree to inspect.
 
 The generator validates and throws: an identity declared with an f32 carrier, a lane
 index past its stride, or a hole in a stride is a build failure, not a review miss.
@@ -519,7 +525,7 @@ run under plain `node`. Anything below that says otherwise predates this repo.
 pixi install
 pixi run mojo --version
 
-# 2. Verify the whole engine in one pass — ALL FIFTEEN suites, with the fp flag
+# 2. Verify the whole engine in one pass — ALL SIXTEEN suites, with the fp flag
 #    the contract requires (--fp-mode contract=off is NOT optional; see the
 #    script's header for why). This is the only entry point that runs everything.
 (cd engine/fixtures && node gen.mjs && node gen-bake.mjs)

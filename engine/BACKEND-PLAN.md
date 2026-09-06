@@ -3,7 +3,7 @@
 One engine that computes the per-glyph data a renderer needs, for two targets,
 using the GPU when the machine has one and the CPU when it doesn't.
 
-Evidence for everything below is in `engine/delta/` (four subsystem reports plus
+Evidence for everything below is in `engine/delta/` (five subsystem reports plus
 a cross-review). This file is the plan; that directory is why.
 
 ## The shape
@@ -21,9 +21,17 @@ all cores, off any frame budget.
 
 ## What holds it together
 
-- **The corpus is ours.** 22 fixtures rebuild byte-identical from vendored,
+- **The corpus is ours.** 25 fixtures rebuild byte-identical from vendored,
   per-file-pinned inputs with no web repo present (gate `1b`). The JS oracle is
   a spent correctness source; the web *target* is served by Rust→wasm.
+- **THE TWO ORACLES HAVE FORKED, deliberately, and this is the record of it.**
+  `c9667ec` corrected `engine/fixtures/inputs/glyphPipelineReference.js` to
+  `floor((len-1)/wrap)+1` and `343c039` gave it a wrap mode. The web repo's copy
+  still returns `floor(len/wrap)+1` with no mode and will not be updated: the JS
+  is a spent correctness source, and the web TARGET is served by Rust→wasm, not
+  by the JS app. Treat a difference between the two as expected, not as drift.
+  (`engine/delta/review.md:338-372` says there is "no live inconsistency" — that
+  report predates the fork and is a record of its moment, not current state.)
 - **Direction of change is fixed:** edit the oracle, regenerate the corpus, let
   it red the port, then fix the port. The reverse makes bit-exactness a
   tautology. The oracle stays serial and unscanned — independence of
@@ -35,12 +43,30 @@ all cores, off any frame budget.
 - **The native scene graph is a harness.** It proved Mojo→FFI→wgpu works. Its
   layout and UI choices carry no authority.
 
+## A note on "Stage N", which this file no longer has
+
+`native/src/layout.rs` and `native/AGENTS.md` refer to "Stage 0 / 1 / 3 of
+`engine/BACKEND-PLAN.md`". Those stages were REMOVED from this file in `b6827fb`
+when it was rewritten as the plan rather than a record of how it changed. The
+hazard is not a dead pointer — it is that the numbered list below is a DIFFERENT
+list, so a reader lands on it and matches up. They do not correspond: old stage 1
+was the Rust backend; item 1 below is the phantom row. Read those references as
+naming the layout seam and the device-resident path by description, not by number.
+
 ## The work, in order
 
-**1. The phantom row.** A line whose glyph count is an exact multiple of the
-wrap width gets a blank row, because the newline owns a column and
-`rows_for_line(n,w) = n/w + 1` counts it. Three fixtures encode it. Remove it,
-oracle first.
+**1. The phantom row — DONE, `c9667ec`.** A line whose glyph count was an exact
+multiple of the wrap width claimed a blank row, because the newline owns a
+column and `rows_for_line(n,w) = n/w + 1` counted it. Corrected to a ceiling
+with the newline placed on the row it closes, oracle first, then the corpus
+regenerated from it, then the port. Kept here because the ORDER is the reusable
+part: oracle -> corpus -> let it red the port -> fix the port. Never the
+reverse, which makes bit-exactness a tautology.
+
+Also landed since: **WrapBack** (`343c039`) — a wrap can cost depth instead of a
+row, per item, default `Down`; and the per-item FFI stopped being positional
+(`cc814b3`), so a stale dylib is now a link error rather than silently disabled
+pagination.
 
 **2. Displacement input.** The fold is a pure function of (bytes, params); an
 arranger authors a per-slot delta table; the kernel adds it as a post-fold

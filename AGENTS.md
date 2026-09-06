@@ -8,7 +8,7 @@ map, the commands, and the fences.
 
 ## Layout
 
-- `engine/` — Mojo/MAX glyph pipeline + FFI + 15 conformance suites + fixtures
+- `engine/` — Mojo/MAX glyph pipeline + FFI + 16 conformance suites + fixtures
   + benches. Built by pixi, not cargo.
 - `native/` — the Rust/wgpu renderer binary; links `native/libglyph_engine.dylib`.
 - `tools/` — the gate scripts, the generators, and repro helpers.
@@ -45,8 +45,8 @@ pixi run build-engine       # → native/libglyph_engine.dylib (gitignored)
 bash tools/check-all.sh     # from the repo root; exit 0 = all green
 ```
 
-Eight steps: generators byte-identical (trie, schema, atlas, vendor manifest) →
-15 Mojo suites (CPU+GPU) → zero-warning build → zero-warning clippy →
+TWELVE steps as of 2026-09-04 — including (0) build the dylib, (1b) rebuild the 25-fixture corpus, (8b) `--repo-verify` across both FFI paths, and (9) the reference port, none of which are listed below; see `native/AGENTS.md` for the current list. Historically eight steps: generators byte-identical (trie, schema, atlas, vendor manifest) →
+16 Mojo suites (CPU+GPU) → zero-warning build → zero-warning clippy →
 `cargo test` → `--engine-check` bit-exact vs CPU oracle → stage-g pick oracle →
 four-view byte-equal A/B vs `out/tooling-ab/baseline/`. **Any byte divergence
 means the commit is wrong — revert or fix; never re-baseline casually.**
@@ -91,9 +91,12 @@ nightly per `pixi.toml`): **no bump without its own re-baselined mini-stage**
 
 ## Gotchas
 
-- `engine/fixtures/gen.mjs` (fixture regeneration) and `engine/bench/gen-bench.mjs`
-  import the JS oracle from the web repo — they do not run in this tree;
-  fixtures are committed.
+- `engine/bench/gen-bench.mjs` imports the JS oracle from the web repo and does
+  NOT run in this tree. `engine/fixtures/gen.mjs` and `gen-bake.mjs` DO: since
+  `f68b70f` they read vendored, revision-pinned inputs under
+  `engine/fixtures/inputs/`, and gate 1b deletes all 25 fixtures and rebuilds
+  them byte-identically on every `check-all`. The conformance corpus is
+  regenerable here; only the bench corpus is not.
 - The atlas exporter's `hb.cjs` is the one knowingly-modified vendored file;
   `SHA256SUMS` covers `tools/vendor/ref/**`, not all of `tools/vendor/`.
 - Mojo uncaught exceptions print to **stderr** — gate scripts capture `2>&1`.
@@ -102,6 +105,7 @@ nightly per `pixi.toml`): **no bump without its own re-baselined mini-stage**
 
 ## Read next
 
-`out/ENGINE_TOOLCHAIN_REPORT.md` (current toolchain state) → the latest stage
+`out/ENGINE_TOOLCHAIN_REPORT.md` (a RECORD of the migration, not current state —
+its "no node is needed" claim is contradicted by gates 1 and 1b) → the latest stage
 report → `engine/README.md` / `README-FFI.md` / `TOOLCHAIN.md` →
 `native/AGENTS.md` → module headers in `native/src/*.rs` (the real contracts).

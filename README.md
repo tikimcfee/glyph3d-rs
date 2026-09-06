@@ -29,7 +29,7 @@ Platform: macOS on Apple Silicon (`osx-arm64`; the GPU suites run on Metal).
  │ engine/  — Mojo/MAX glyph pipeline      │    │ native/  — Rust binary   │
  │ decode → trie resolve → fold →          │◄───│ wgpu + winit + egui      │
  │ paginate → bounds, bit-exact vs the     │dylib│ Slug WGSL renderer,      │
- │ JS oracle; 15 conformance suites        │    │ cull/LOD, pick, cameras  │
+ │ JS oracle; 16 conformance suites        │    │ cull/LOD, pick, cameras  │
  └─────────────────────────────────────────┘    └──────────────────────────┘
         built by pixi (`build-engine`)                 links at build time
         → native/libglyph_engine.dylib          → glyph3d-native binary
@@ -59,7 +59,7 @@ Platform: macOS on Apple Silicon (`osx-arm64`; the GPU suites run on Metal).
 ## Quickstart
 
 Requirements: macOS/Apple Silicon, [pixi](https://pixi.sh), a recent Rust
-toolchain (egui 0.36 sets MSRV 1.95), and Node ≥ 18 (the atlas gate in
+toolchain (egui 0.36 sets MSRV 1.95), and Node ≥ 18 (the atlas gate AND the corpus-regeneration gate 1b in
 `check-all` uses it).
 
 ```sh
@@ -104,9 +104,9 @@ One command, from the repo root, exit 0 means everything is green:
 pixi run check-all     # = ./tools/check-all.sh
 ```
 
-Eight steps: (1) the generators (`gen_real_trie.py`, `gen_schema.py`,
+TWELVE steps as of 2026-09-04 — including (0) build the dylib, (1b) rebuild the 25-fixture corpus, (8b) `--repo-verify` across both FFI paths, and (9) the reference port, none of which are listed below; see `native/AGENTS.md` for the current list. Historically eight steps: (1) the generators (`gen_real_trie.py`, `gen_schema.py`,
 `export-atlas.mjs`, `vendor-manifest.py`) reproduce their committed outputs
-byte-identically; (2) all fifteen Mojo conformance suites, CPU + GPU
+byte-identically; (2) all sixteen Mojo conformance suites, CPU + GPU
 (`engine/check.sh`); (3) `cargo build --release` with zero warnings;
 (4) `cargo clippy --release` zero warnings; (5) `cargo test` green;
 (6) `--engine-check` — Mojo engine bit-exact vs the `text.rs` CPU oracle;
@@ -125,7 +125,7 @@ regenerate those outputs on purpose.
 
 | Path | What it is |
 |---|---|
-| `engine/` | The Mojo glyph pipeline, FFI layer, 15 conformance suites, fixtures (oracle inputs + expected answers), benches. Docs: `README.md`, `README-FFI.md`, `TOOLCHAIN.md` |
+| `engine/` | The Mojo glyph pipeline, FFI layer, 16 conformance suites, fixtures (oracle inputs + expected answers), benches. Docs: `README.md`, `README-FFI.md`, `TOOLCHAIN.md` |
 | `native/` | The Rust/wgpu renderer binary (windowed + deterministic offscreen). Rules: `native/AGENTS.md`; contracts: `src/*.rs` module headers |
 | `tools/` | Gates, generators, and repro helpers (see table below) |
 | `assets/atlas/` | Prebaked glyph-geometry binaries + `engine-trie.bin` + `FORMAT.md` + `preview.png` |
@@ -169,7 +169,11 @@ regenerate those outputs on purpose.
 ## Reading order for a newcomer
 
 1. This README, then `AGENTS.md` (repo-wide working rules).
-2. `out/ENGINE_TOOLCHAIN_REPORT.md` — what's true of the toolchain right now.
+2. `out/ENGINE_TOOLCHAIN_REPORT.md` — a RECORD of the toolchain migration, not
+   current truth (it says so itself at :55). It states "no node is needed to
+   build any engine input any more"; gate 1 runs `node tools/export-atlas.mjs`
+   and gate 1b runs `node gen.mjs`. For current state read root `AGENTS.md` and
+   `native/AGENTS.md`.
 3. `engine/README.md` (the pipeline and its float discipline),
    `engine/README-FFI.md` (the C ABI), `engine/TOOLCHAIN.md`.
 4. `native/AGENTS.md` + the `native/src/*.rs` module headers.

@@ -7,7 +7,7 @@ version = "0.1.0"
 
 [tasks]
 # The engine's own gates. `check.sh cpu` is the default; `all` also tries the
-# five GPU suites, which need `max` in this env (it is not there yet).
+# five GPU suites, which need `max` in this env (a dependency since d0a947b).
 suites = "./engine/check.sh cpu"
 suites-gpu = "./engine/check.sh gpu"
 # Generators: regenerate their committed outputs and prove byte-identity.

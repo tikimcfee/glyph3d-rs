@@ -21,7 +21,9 @@ git worktree add .claude/worktrees/<name> -b worktree-<name>
 cd .claude/worktrees/<name>
 pixi install                                   # ~1 min, .pixi is untracked
 pixi run build-engine                          # the dylib is untracked too
-cp ../../../engine/bench/bench.bin engine/bench/   # optional; benches only
+# NOTE: engine/bench/bench.bin does not exist in this tree; check.sh only
+# COMPILES the benches, so no gate needs it. Regenerate with gen-bench.mjs if
+# you actually want to run one (that script still reaches into the web repo).
 ```
 
 Setup details and the toolchain's live constraints: `engine/TOOLCHAIN.md`.
@@ -37,7 +39,7 @@ the vendored, revision-pinned inputs in `engine/fixtures/inputs/`; (8b)
 `--repo-verify` diffs the per-item and batched FFI paths bit-exact in BOTH wrap
 modes. Then inputs before consumers: (1) three generators plus the atlas exporter each rebuild their
 committed output and require **byte-identity** (`engine-trie.bin`,
-`engine/glyph_schema.mojo`, the 16-file vendor manifest, the four
+`engine/glyph_schema.mojo`, the 20-file vendor manifest, the four
 `assets/atlas/*.bin`); (2) `engine/check.sh` — **16 Mojo conformance suites**
 (11 CPU + 5 GPU on Metal), the two INSTRUMENTS (`fixture_census`,
 `fixture_manifest` — an instrument nothing runs is an absent one, and the
@@ -57,22 +59,22 @@ and `cmp`'d against `out/tooling-ab/baseline/`. Any divergence means the
 commit is wrong — revert or fix, never re-baseline casually. And (9)
 `tools/check-fixture-parity.sh` — stage 0 of the reference port: Rust's
 `.pipe.bin` reader (`native/src/fixture.rs`) and Mojo's `fixture_io` agree on
-FNV-1a checksums over their **parsed** values across all 14 fixtures, and
+FNV-1a checksums over their **parsed** values across all 17 fixtures, and
 `text.rs`'s CPU fold is diffed **bit-exact** against the oracle's own expected
 lanes on every fixture inside its domain (4 today, 5332 records). It fails if
 nothing was in domain. Stage 1 added a third half: every fixture's trie rebuilt
 from its own BYTES by the ported `GlyphTrie` (`native/src/glyph_trie.rs`) and
-compared through the wire-order serializer — 14 fixtures, 11520 entries. Stage 2
+compared through the wire-order serializer — 17 fixtures, 13568 entries. Stage 2
 added a fourth: the ported serial fold (`native/src/fold.rs`) run over the whole
 corpus with **every lane of every byte** compared bit-exact, plus `ordToByte`,
-misses, leaders, per-item boxes and the batch union — 14 fixtures, 149,767
-leaders, 1,807,512 lanes. Stage 3 added a fifth: the ported scan form
-(`native/src/scan.rs`) swept across **8 chunk/group/shard tunings** — 112 cases,
-1,144,944 leader lanes bit-exact — under the tiered contract, where invariance
+misses, leaders, per-item boxes and the batch union — 17 fixtures, 155,136
+leaders, 1,872,012 lanes. Stage 3 added a fifth: the ported scan form
+(`native/src/scan.rs`) swept across **8 chunk/group/shard tunings** — 136 cases,
+1,187,896 leader lanes bit-exact — under the tiered contract, where invariance
 across tunings is monoid associativity checked in situ. Stage 4 added a sixth:
 the ported bake (`native/src/bake.rs`) replayed against the 8 `.bake.bin`
 fixtures — the streaming record AND the seed protocol (checkpoint-seeded
-`prefix_at`, `lanes_from_prefix`, `rows_under_wrap`), 265 queries bit-exact.
+`prefix_at`, `lanes_from_prefix`, `rows_under_wrap`), 530 queries bit-exact.
 That completes the reference port. No JS runs in gate 9 — but node is NOT gone
 from the repo: gate 1 still runs `tools/export-atlas.mjs`, which needs harfbuzz.
 An earlier commit message overclaimed "no JS runs in any gate"; it was true of
@@ -155,7 +157,7 @@ rebuilt, put one back.
 - **Fail-loud panics**: this is a binary, not a library. `expect("...")` /
   `assert!` with a diagnostic message is the documented convention — do NOT
   convert to error-returning style. Bare `unwrap()` only in `#[cfg(test)]`.
-- **`cargo fmt`**: the tree is NOT fmt-clean (≈77 hunks across all src files,
+- **`cargo fmt`**: the tree is NOT fmt-clean (≈234 hunks across all src files,
   mostly long-line wrapping). Do not mass-reformat — the diff/review cost
   exceeds the value. Match the local style of the file you're editing.
 - Comments explain WHY (empirical findings, bug history, invariants), not

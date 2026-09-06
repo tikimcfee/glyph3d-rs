@@ -63,7 +63,7 @@ run() { # name, fixtures...
     fi
 }
 
-# NATIVE-PORT: the default is ALL FIFTEEN. The five GPU suites were briefly
+# NATIVE-PORT: the default is ALL SIXTEEN. The five GPU suites were briefly
 # unbuildable here — gpu_decode failed at parse with "'gpu' does not refer to a
 # nested package" — for the sole reason that pixi.toml pinned `mojo` and not
 # `max`. Adding the dependency was the whole fix: all five then passed on Apple

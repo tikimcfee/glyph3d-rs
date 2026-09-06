@@ -104,7 +104,7 @@ fi
 rm -rf "$A_TMP"
 
 # THE CORPUS REGENERATES ITSELF. Until 2026-09-04 `engine/fixtures/gen.mjs`
-# imported its oracle from the WEB repo, so the 14 .pipe.bin + 8 .bake.bin the
+# imported its oracle from the WEB repo, so the 17 .pipe.bin + 8 .bake.bin the
 # whole port is gated against could not be rebuilt in this tree at all. The
 # inputs are vendored and revision-PINNED now (tools/vendor/PROVENANCE.md), and
 # this asserts they still produce the committed bytes.
