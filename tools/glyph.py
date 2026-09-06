@@ -396,11 +396,19 @@ def gate_engine_check() -> bool:
     # actually disagreed; overflow-leads.txt is the only input that does.
     for target in ("src/main.rs", "fixtures/overflow-leads.txt"):
         rc, out = run(f"./target/release/glyph3d-native --engine-check {target}", cwd=ROOT / "native")
-        last = out.strip().splitlines()[-1] if out.strip() else ""
+        lines = out.strip().splitlines()
+        last = lines[-1] if lines else ""
         print(last)
         if "engine-check PASS" in last:
             print(f"PASS  engine-check ({target})")
         else:
+            # On failure the interesting part is the record diff, not the
+            # summary. Printing only the last line discarded WHY it reddened
+            # before anything downstream — a mutation harness included — could
+            # read it, so a declared `expect` could only ever cite this
+            # runner's own text rather than the tool's finding.
+            for line in lines[-12:-1]:
+                print(f"      {line}")
             print(f"FAIL  engine-check ({target})")
             ok = False
     return ok
@@ -538,17 +546,43 @@ def cmd_mutate(args) -> int:
             fail = True
             continue
 
+        # A mutation that fails to BUILD is not a mutation that was caught. The
+        # gate would redden either way, and the expect-text check might even
+        # pass by coincidence, so a compile error would be recorded as evidence
+        # the gate works. Distinguish the two explicitly.
+        build_broke = False
+        restore_broke = False
         try:
             if mu.get("rebuild"):
-                run(mu["rebuild"])
-            buf = io.StringIO()
-            with contextlib.redirect_stdout(buf):
-                post_ok, _ = run_gate(spec, m)
-            out = buf.getvalue()
+                rc, rout = run(mu["rebuild"])
+                if rc != 0:
+                    build_broke = True
+                    print(f"FAIL  {mu['name']} — the mutated tree does not BUILD, so this")
+                    print("      proves nothing about the gate; a red here is the compiler,")
+                    print("      not the check. Make the mutation semantic, not syntactic.")
+                    print("      " + "\n      ".join(rout.strip().splitlines()[-3:]))
+            if not build_broke:
+                buf = io.StringIO()
+                with contextlib.redirect_stdout(buf):
+                    post_ok, _ = run_gate(spec, m)
+                out = buf.getvalue()
         finally:
             restored = restore_mutation(mu, before)
             if mu.get("rebuild"):
-                run(mu["rebuild"])
+                rc, rout = run(mu["rebuild"])
+                if rc != 0:
+                    # The tree is now inconsistent: sources restored, artifact
+                    # not. Every later gate would test the wrong binary — the
+                    # exact stale-artifact trap this repo has been bitten by.
+                    print(f"FATAL {mu['name']} — restore rebuild FAILED. The tree has original")
+                    print("      sources and a stale artifact. Run: pixi run build-engine")
+                    print("      " + "\n      ".join(rout.strip().splitlines()[-3:]))
+                    restore_broke = True
+        if restore_broke:
+            return 1
+        if build_broke:
+            fail = True
+            continue
 
         if post_ok:
             print(f"FAIL  {mu['name']} — gate {mu['gate']} stayed GREEN under the mutation.")
