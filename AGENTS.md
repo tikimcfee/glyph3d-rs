@@ -274,8 +274,10 @@ a check watches and confirm it reddens. Some of that is now mechanical —
 `python3 tools/glyph.py mutate` applies each mutation declared in `build.toml`,
 requires the named gate to go red for the named reason, and restores byte-exact.
 It reports COVERAGE rather than a pass count, so a gate nobody has proven is
-listed as uncovered instead of being counted as working. Four gates are covered
-today; nine are not. Three times this repo shipped a check
+listed as uncovered instead of being counted as working. Eight mutations cover
+five of the twelve gates today; seven gates are still uncovered — run it and
+read the COVERAGE line rather than trusting this sentence, which has already
+gone stale once. Three times this repo shipped a check
 that could not fail — a gate asserting on float noise, a ceiling constant no test
 protected, and a fixture checksum comparing bytes guaranteed identical before the
 command ran. Every one was caught by execution; not one by inspection.
@@ -286,6 +288,23 @@ identically. Assert the edit applied, then read the result. Equally: a source
 scan is worth exactly what its match set is worth — "no grep match" is not "does
 not exist," which has produced a wrong conclusion here as recently as
 2026-09-06.
+
+There is a THIRD outcome, beyond "landed" and "failed to land": **landed in a
+region nothing reads.** Measured 2026-09-06 — resolving an out-of-range
+codepoint to a real trie block instead of the shared missing block leaves all
+sixteen suites, ffi_selftest and both instruments GREEN, because no fixture in
+the corpus carries an F5–F7 lead byte; the same edit reddens engine-check,
+whose `fixtures/overflow-leads.txt` is the only input in the tree that reaches
+that branch. So a mutation's `why` names the CONSUMER it perturbs, not just the
+defect it stands for, and "the gate stayed green" is a claim about the corpus
+until you have shown the mutated line is on a path the corpus walks.
+
+The same run measured a shared fault. `phantom-row` (the wrap rule counting the
+terminating newline's own row) reddens `conformance` on 3 of 17 fixtures and
+leaves `conformance_real` green: the serial fold and the scan monoid both call
+`rows_for_line`, so the oracle-free cross-form runner cannot see a defect that
+lives inside the function they share. That is its documented blind spot, now
+with a number against it.
 
 ## Fences — generated, vendored, or immutable
 
