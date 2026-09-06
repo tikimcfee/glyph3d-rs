@@ -34,9 +34,20 @@ time.
 
 ```sh
 pixi install                # mojo + max (pins in pixi.toml; pixi.lock is binary — never hand-merge)
-pixi run build-engine       # → native/libglyph_engine.dylib (gitignored)
+pixi run build              # the manifest runner: products current + committed artifacts regenerated
 (cd native && cargo build --release)
 ```
+
+**The dependency graph is declared in `build.toml`** (artifact, input globs,
+build command, class) and executed by `tools/glyph.py`. `pixi run build` brings
+products current (content-hash stamps, not mtimes) and regenerates committed
+artifacts in place — a deliberate, committable act. `pixi run verify` builds
+nothing: it asserts currency and byte-compares every committed artifact against
+a scratch rebuild. The four baseline PNGs are class **golden**: verified,
+never built — the runner refuses. `pixi run build-native` is the one pixi
+`depends-on` edge (cargo after build-engine); the rest of the graph is
+artifact-level and lives in build.toml because pixi cannot see that cargo
+links the dylib.
 
 **`cargo build` does not build the dylib, and this is the trap that has cost the
 most time in this repo.** `native/build.rs` only *links* whatever file already
@@ -63,17 +74,22 @@ GPU work needs Apple Silicon; `pixi.toml` declares `osx-arm64` only.
 ## Verification — what actually runs
 
 ```sh
-bash tools/check-all.sh     # or: pixi run check-all — exit 0 = all green
+bash tools/check-all.sh     # or: pixi run check — exit 0 = all green
 ```
 
-**Twelve steps.** The step headings print `N/9` and the script's own header
-comment omits two of them; the numbering is a fossil from when there were nine,
-and the list below is the current one. Numbers here are labels only — refer to
-these checks by name: the battery was six steps, then nine, now twelve, and one
-of them (`check-stage-g.sh`) has a stage letter fused into its filename by
-coincidence.
+**Twelve gates, with names.** The artifact graph is declared in **`build.toml`**
+(artifact, inputs, build command, class: committed / golden / product) and
+executed by **`tools/glyph.py`**; `check-all.sh` is a thin shim over
+`python3 tools/glyph.py check`, kept because every doc and every pair of hands
+reaches for it. Useful forms: `pixi run build` / `verify` (the build/verify
+split), `python3 tools/glyph.py gate <name>` (one gate alone),
+`... gates` (what each compares and cannot see), `... graph` (the DAG,
+including BOTH edges that leave the schema). Gates used to be numbered
+positions in one shell script (`N/9`, renumbered twice, one with a fossil
+stage letter in its filename); the names below are the live identifiers and
+match `[[gate]] name =` in build.toml.
 
-**Run it in a worktree if anyone else is working in this repo.** `check-all` reads
+**Run it in a worktree if anyone else is working in this repo.** `check` reads
 the WORKING TREE, not HEAD, so another thread's uncommitted edits fail your checks
 and tell you nothing about your own change. This has happened. It is a property of
 the runner, not of any one language's code, so it applies just as much to pure
@@ -83,58 +99,76 @@ For each: what it compares, what makes it red, and **what it cannot see**. The
 last is the part worth reading. A check is a claim about a counterfactual, and a
 check whose blind spot you don't know is a green you can't price.
 
-**0 · Build the dylib.** Compiles `engine/ffi.mojo` via pixi. Red only on a Mojo
-compile error. Blind to whether the result is *correct* — it exists solely so
-that nothing downstream links a stale engine.
+**products-current** (was "0"). The dylib is a *product*: nothing to compare
+against, it only has to be CURRENT. Currency is a content hash of the declared
+inputs (`engine/*.mojo` + the pixi pins), stamped at build time — rebuilt only
+when that hash moved, not on every pass. Red only on a Mojo compile error.
+Blind to whether the result is *correct* — it exists solely so that nothing
+downstream links a stale engine. A failed rebuild is FATAL (the battery stops):
+a stale dylib makes every gate below a statement about the wrong binary.
 
-**1 · The generators reproduce their committed outputs.** Four independent
-rebuild-and-compare checks: the trie (`gen_real_trie.py --verify-only`), the
-schema (`gen_schema.py --check`, which also runs the schema's own tier
-validation), the hashes of 20 vendored files (`vendor-manifest.py --check`), and the
-four atlas bins (`export-atlas.mjs` into a temp dir, `cmp`'d). Red when a
-generated artifact is hand-edited, or a generator changes behaviour. Blind to
+**committed-artifacts** (was "1"). One mechanism per generator, all driven from
+build.toml: the trie (`gen_real_trie.py --verify-only`) and the schema
+(`gen_schema.py --check`, which also runs the schema's own tier validation) use
+generator-native check modes; the four atlas bins are rebuilt by
+`export-atlas.mjs` into a scratch dir and `cmp`'d. Red when a generated
+artifact is hand-edited, or a generator changes behaviour. Blind to
 whether the *inputs* are right: the trie check proves `engine-trie.bin` is a
 faithful derivation of `codepoints.bin`/`glyphs.bin`, not that those are correct.
-The hash check is blind to upstream drift **by design** (a difference there is
-information, not a failure), and blind to a vendored file that matches its own
-recorded hash while being the wrong revision for the fixtures that depend on it
-— which has happened here, and is caught today only by check 1b.
 
-**1b · The fixture corpus regenerates byte-identically.** Deletes all 25
-fixtures (17 `.pipe.bin` + 8 `.bake.bin`), rebuilds them from the revision-pinned
-oracle inputs in `engine/fixtures/inputs/`, and byte-compares. Red when a
-generator or a vendored oracle input produces different bytes, when a generator
-errors, or when the count changes. Blind to whether the oracle is *correct* — it
-proves reproducibility, not truth. Note it derives its expected count with `ls`,
-so it reports whatever size the corpus happens to be; the corpus size itself is
-pinned elsewhere (see below).
+**vendor-hashes** (was part of "1"). The hashes of 22 vendored + derived files
+(`vendor-manifest.py --check`; the two `hb.*` files are additionally re-derived
+from their ref sources and byte-compared — a semantic pin, not just a hash).
+Blind to upstream drift **by design** (a difference there is information, not a
+failure), and blind to a vendored file that matches its own recorded hash while
+being the wrong revision for the fixtures that depend on it — which has
+happened here, and is caught today only by the fixtures gate.
 
-**2 · The Mojo conformance suites.** Sixteen suites — 11 CPU, 5 on Metal — plus a
-compile pass over all six benches (compiled, never run). Each
-loads fixtures and asserts bit-exact agreement; a failure raises and exits
-nonzero. Red on any lane of the ported pipeline disagreeing with its fixture.
-Blind in two specific ways worth knowing: `conformance_real` is **oracle-free**
-— it folds arbitrary real source and checks the serial and scan forms against
-each other, so it catches divergence but never a fault the two forms share
-(its header says so, and names the pinned fixtures as the cover for that case).
-And the two **instruments** run alongside the suites — `fixture_census` and
-`fixture_manifest` — assert nothing here: neither ever raises. They print. A
-census reporting that every field is pinned to a single value would still exit
-zero. Read their output; do not count them as gates.
+**fixtures** (was "1b"; part of the committed-artifacts gate in the runner).
+Rebuilds the corpus in a **scratch copy** of `engine/fixtures` (generators +
+vendored inputs + the `../glyph_schema.mjs` edge) and byte-compares against
+the committed 25 — the old gate deleted the committed fixtures in place and
+restored them with `git checkout`, which needed the restore to be exactly
+right. The expected counts (17 pipe + 8 bake) are **declared in build.toml**,
+never derived from the tree under test: the old gate `ls`-counted the tree it
+was checking, so a deleted fixture lowered both sides of the comparison and
+stayed green (measured 2026-09-06: eleven of twelve gates green on a shrunken
+corpus; only the fixture.rs pin caught it). The Rust-side pins stay — declared
+count in build.toml and hard pin in the test suite are two independent
+witnesses, not duplicate coverage. Blind to whether the oracle is *correct* —
+it proves reproducibility, not truth.
 
-**3 · `cargo build --release`, zero warnings.** Red on any warning rustc emits.
-Blind to anything silenced with `#[allow(...)]`.
+**engine-suites** (was "2"). Sixteen suites — 11 CPU, 5 on Metal — plus
+**ffi_selftest** (wired 2026-09-06; it links the SHIPPED dylib through the real
+C ABI after the pinned toolchain was found to miscompile the in-process import
+— see its header), plus a compile pass over all six benches (compiled, never
+run). Each suite loads fixtures and asserts bit-exact agreement; a failure
+raises and exits nonzero. Red on any lane of the ported pipeline disagreeing
+with its fixture. Blind in two specific ways worth knowing: `conformance_real`
+is **oracle-free** — it folds arbitrary real source and checks the serial and
+scan forms against each other, so it catches divergence but never a fault the
+two forms share (its header says so, and names the pinned fixtures as the
+cover for that case). And the two **instruments** — `fixture_census` and
+`fixture_manifest` — assert nothing: neither ever raises. They print. A census
+reporting that every field is pinned to a single value would still exit zero.
+Read their output; do not count them as gates.
 
-**4 · `cargo clippy --release`, zero warnings.** Same, for lints.
+**cargo-build** (was "3"). `cargo build --release`, zero warnings. Red on any
+warning rustc emits; a build ERROR is fatal (the battery stops). Blind to
+anything silenced with `#[allow(...)]`.
 
-**5 · `cargo test`.** 85 tests: naga WGSL validation, CLI parity, encase lane
-layout, `ItemParams` validation, the layout-seam suites, the wrap-mode monoid
-domain, and the reference-port suites. Red when a test fails, when a whole test
-binary stops reporting, or when **fewer than `TEST_FLOOR` tests actually run**.
-That floor is a ratchet, not an equality: adding tests never reddens it, and when
-the real count rises above it every green run prints a NOTE naming the number to
-raise it to — so it cannot decay into a figure far below reality without saying
-so. Raise it in the same commit that adds the tests.
+**cargo-clippy** (was "4"). `cargo clippy --release`, zero warnings. Same, for
+lints.
+
+**cargo-test** (was "5"). 85+ tests: naga WGSL validation, CLI parity, encase
+lane layout, `ItemParams` validation, the layout-seam suites, the wrap-mode
+monoid domain, and the reference-port suites. Red when a test fails, when a
+whole test binary stops reporting, or when **fewer than `test_floor` tests
+actually run** — the floor lives in `build.toml [settings]` now, not in shell.
+That floor is a ratchet, not an equality: adding tests never reddens it, and
+when the real count rises above it every green run prints a NOTE naming the
+number to raise it to — so it cannot decay into a figure far below reality
+without saying so. Raise it in the same commit that adds the tests.
 
 The floor exists because the previous form could not fail. It counted
 `test result: ok` summary lines and required two; there are exactly two binaries
@@ -151,7 +185,7 @@ the fixture corpus from silently shrinking (`native/src/fixture.rs`, 17 pipe;
 `native/src/bake.rs`, 8 bake — both worded "update deliberately") live inside
 this check. They protect the corpus; nothing yet protects them.
 
-**6 · `--engine-check`, twice.** The Mojo engine through the FFI versus
+**engine-check** (was "6"), twice. The Mojo engine through the FFI versus
 `text::reference_layout`, an independent Rust CPU fold, diffed record-by-record.
 Run on `src/main.rs` and on `fixtures/overflow-leads.txt` — the second because
 `main.rs` is well-formed UTF-8 by construction and can never reach the
@@ -160,40 +194,43 @@ September 2026. Blind to the **per-item** FFI strategy: this hardcodes the
 batched one (`main.rs:127`). Blind to malformed shapes other than the one that
 fixture carries.
 
-**7 · The pick oracle** (`tools/check-stage-g.sh`; the `g` is a fossil stage
-letter, not a position). Scripted picks and pixel-ray round trips from the native
-binary against an independent Python fold oracle. Red on any pick resolving to
-the wrong record. Two mechanical cautions: unlike its sibling it has no
-`[ -x "$BIN" ]` guard, so run out of order it dies with a raw shell error rather
-than a diagnosis; and under `set -euo pipefail` an oracle that exits nonzero
-inside a command substitution aborts the script mid-run. The wrapper still
-reports FAIL, but every check after the abort point silently did not run.
+**pick-oracle** (`tools/check-pick-oracle.sh`; was `check-stage-g.sh` — the `g`
+was a fossil stage letter, not a position). Scripted picks and pixel-ray round
+trips from the native binary against an independent Python fold oracle. Red on
+any pick resolving to the wrong record. One mechanical caution survives the
+rename: under `set -euo pipefail` an oracle that exits nonzero inside a command
+substitution aborts the script mid-run. The wrapper still reports FAIL, but
+every check after the abort point silently did not run. (The missing
+`[ -x "$BIN" ]` guard was added when the file was renamed.)
 
-**8 · The four-view pixel A/B.** `demo`, `text`, `repo-zoom`, `repo-wide`
-re-rendered and byte-compared against `out/tooling-ab/baseline/`. This is the
-**only** check that sees pixels. Red on any change to camera, shading, layout,
+**pixel-ab** (was "8"). `demo`, `text`, `repo-zoom`, `repo-wide` re-rendered
+and byte-compared against `out/tooling-ab/baseline/`. This is the **only**
+check that sees pixels. In build.toml these four PNGs are class **golden**:
+verified, with NO build path — the runner refuses to regenerate them, because
+re-baselining is a human act. Red on any change to camera, shading, layout,
 shaping or culling that reaches those four frames. Blind to everything outside
 them — and it cannot distinguish a regression from an intentional change, which
-is deliberate: re-baselining is a human act. It is also less all-seeing than it
-looks. The page-extent origin seed was renderer-affecting and all four stayed
-byte-equal, because the seed only binds for an item with zero records and no
-fixture had an empty file. It can see that class today only because
-`native/fixtures/g-pick-repo/empty.rs` was added for it. **Do not tidy that file
-away.** Ask what else these four frames cannot see.
+is deliberate. It is also less all-seeing than it looks. The page-extent origin
+seed was renderer-affecting and all four stayed byte-equal, because the seed
+only binds for an item with zero records and no fixture had an empty file. It
+can see that class today only because `native/fixtures/g-pick-repo/empty.rs`
+was added for it. **Do not tidy that file away.** Ask what else these four
+frames cannot see.
 
-**8b · `--repo-verify`, both wrap modes.** The per-item and batched FFI
+**repo-verify** (was "8b"), both wrap modes. The per-item and batched FFI
 strategies diffed bit-exact at the layout seam — placements, instance bytes and
-records — in `down` and `back`. Red when the two paths disagree. Blind to whether
-*either* is right: this is strategy-versus-strategy, so a fault shared by both is
-invisible. Ground truth comes from check 6, and only for the batched path.
+records — in `down` and `back`. Red when the two paths disagree. Blind to
+whether *either* is right: this is strategy-versus-strategy, so a fault shared
+by both is invisible. Ground truth comes from engine-check, and only for the
+batched path.
 
-**9 · The reference port.** Six halves against the JS oracle's recorded answers,
-with the volumes it currently clears — quote these when you change it, because a
-count that quietly drops is how this check would go vacuous without going red:
-parse parity (Rust's fixture loader versus Mojo's over parsed typed values —
-17 fixtures, 11 section checksums each), the trie rebuilt from raw bytes
-(17 fixtures, 13,568 entries), the full serial fold over every lane of every byte
-(155,136 leaders, 1,872,012 lanes), the scan form across 8 tunings
+**reference-port** (was "9"). Six halves against the JS oracle's recorded
+answers, with the volumes it currently clears — quote these when you change it,
+because a count that quietly drops is how this check would go vacuous without
+going red: parse parity (Rust's fixture loader versus Mojo's over parsed typed
+values — 17 fixtures, 11 section checksums each), the trie rebuilt from raw
+bytes (17 fixtures, 13,568 entries), the full serial fold over every lane of
+every byte (155,136 leaders, 1,872,012 lanes), the scan form across 8 tunings
 (17 × 8 = 136 cases, 1,187,896 leader-lanes bit-exact and 53,192 within 1e-4),
 the bake and its seed protocol (8 fixtures, 27,315 leaders, 167 checkpoints,
 530 queries), and `text.rs`'s independent fold over its declared domain
@@ -209,22 +246,26 @@ Worth holding in one place, because each check's blind spot is defensible alone
 and the union is not:
 
 - **Nothing executes the benches.** `engine/bench/*.mojo` is compile-checked only.
-- **`engine/ffi_selftest.mojo` is a complete suite that nothing runs.** It raises
-  on failure and proves the C ABI bit-exact through the boundary plus a 1000-load
-  stress. It is not compiled, not invoked, not in `pixi.toml`. It could have been
-  broken for months. Wire it or delete it with a reason; an instrument nothing
-  runs is an absent one.
+- **`ffi_selftest` only covers the single-item C ABI entry.** It was wired into
+  `engine/check.sh` on 2026-09-06 (it had been red for an unknown time — the
+  pinned toolchain miscompiled the in-process `ffi` import in executable
+  codegen, so it now links the SHIPPED dylib and genuinely crosses the
+  boundary). It skips the three multi-item fixtures by design; batched-entry
+  coverage is repo-verify. The toolchain miscompile class itself is not pinned
+  by anything else: gate engine-check uses a (0,0,0) origin and is blind to
+  exactly the `origin_x` read that broke.
 - **`tools/verify_atlas.py`, `preview_glyphs.py`, `repro_pick_oblique.py`** are
   manual tools, run by **zero** checks. So the atlas bins' structural and semantic
   correctness, and the oblique-pick repro, are exercised by nothing in the battery
   — the atlas is only ever checked for being byte-identical to what it was, which
   says nothing about whether what it was is right.
-- **No check validates committed prose.** `tools/vendor/PROVENANCE.md` is tracked
-  and currently states that `foldGeometry.js` and `glyphPipelineKernels.js` are
-  vendored but that "NOTHING READS THEM YET" — `engine/fixtures/gen.mjs` reads
-  both, at :93 and :175, to build the `repo-file` and `real-kernels` fixtures. The
-  same file says "all 22 committed fixtures"; there are 25. Check 1 runs against
-  that file on every pass and only ever hashes bytes.
+- **PROVENANCE.md's prose is generated but only partially validated.** The stale
+  claims found 2026-09-06 ("NOTHING READS THEM YET" for files `gen.mjs` reads at
+  :93 and :175; "all 22 committed fixtures" when there are 25) are fixed, and the
+  fixture count is now READ FROM build.toml at generation time — the generator
+  refuses to write an unverifiable number. But the rest of the prose is still
+  hand-written inside `tools/vendor-manifest.py` and nothing re-validates it;
+  the vendor-hashes gate only ever compares hashes and re-derivations.
 
 ### Earning a green
 
@@ -253,7 +294,7 @@ not exist," which has produced a wrong conclusion here as recently as
 | `native/src/shaders/*.wgsl` | fenced | the naga test pins the shader *set* — that it compiles and exists, not what it draws. The only thing that sees a pixel change is the four-view A/B, whose blind spots are above. That gap is why edits here need their own re-baselined change rather than an ordinary commit |
 | `native/fixtures/baseline-view.txt` | IMMUTABLE | it is the input to `text.png`; editing it re-baselines that check silently |
 | `native/fixtures/g-pick-repo/empty.rs` | IMMUTABLE, zero bytes | the only input that reaches the page-extent origin seed; deleting it removes a check's ability to see its subject without removing the check |
-| `out/tooling-ab/baseline/` | tracked pixel oracle | changes only on purpose, with a note saying why |
+| `out/tooling-ab/baseline/` | tracked pixel oracle; **golden** in build.toml | changes only on purpose, with a note saying why; the runner refuses to regenerate it |
 | `integration/egui/` | vendored reference | never compiled; the real dependency is from crates.io |
 
 Hand-editing a generated file buys a failure on the next run. Regenerate instead
@@ -296,8 +337,11 @@ single most common way to misread the repo, so:
   `engine/BACKEND-PLAN.md`; that file now carries a warning that its own numbered
   list is a *different* list. Some source comments still reference the dead
   scheme unqualified. Name the thing, not the number.
-- **Check numbers (0–9, 1b, 8b)** are positions in one shell script and have been
-  renumbered twice. Use the names above.
+- **Check numbers (0–9, 1b, 8b)** were positions in one shell script and were
+  renumbered twice before the gates got names (2026-09-06). The live
+  identifiers are the `[[gate]] name =` strings in `build.toml`
+  (products-current … reference-port); `python3 tools/glyph.py gates` lists
+  them. Old reports and comments still use the numbers — map by name.
 
 ## Where work lands
 

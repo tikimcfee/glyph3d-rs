@@ -102,30 +102,38 @@ to `out/windowed-shot-<utc-stamp>.png`. Debug environment variables
 One command, from the repo root; exit 0 means everything is green:
 
 ```sh
-pixi run check-all     # = ./tools/check-all.sh
+pixi run check         # = ./tools/check-all.sh = python3 tools/glyph.py check
 ```
 
-Twelve steps, spanning all four languages: the generators reproduce their
-committed outputs byte-for-byte, the 25-fixture conformance corpus is deleted
-and rebuilt byte-identically, sixteen Mojo suites run on CPU and GPU, the Rust
-side builds and lints warning-free and passes its tests, the engine is diffed
-bit-exact against an independent CPU oracle, picks are cross-checked against an
-independent Python oracle, the two FFI strategies are diffed against each other
-in both wrap modes, the reference port is replayed against the JS oracle's
-recorded answers, and four canonical views are re-rendered and compared pixel
-for pixel.
+The artifact graph is declared in **`build.toml`** (artifact, inputs, build
+command, class) and executed by **`tools/glyph.py`**: `pixi run build` brings
+products current and regenerates committed artifacts, `pixi run verify`
+byte-compares them against scratch rebuilds without building anything, and
+`check` runs the twelve named gates. A dozen gates, spanning all four
+languages: the generators reproduce their committed outputs byte-for-byte, the
+25-fixture conformance corpus is rebuilt byte-identically in a scratch copy
+(counts declared in build.toml, not counted off the tree), sixteen Mojo suites
+plus the dylib-linked ffi_selftest run on CPU and GPU, the Rust side builds
+and lints warning-free and passes its tests under a ratcheted floor, the
+engine is diffed bit-exact against an independent CPU oracle, picks are
+cross-checked against an independent Python oracle, the two FFI strategies are
+diffed against each other in both wrap modes, the reference port is replayed
+against the JS oracle's recorded answers, and four canonical views are
+re-rendered and compared pixel for pixel.
 
-**The authoritative account is `AGENTS.md`**, which lists each check with what
-it compares, what makes it red, and — the part that matters — what it cannot
-see. This section is a summary and will drift; that file is maintained as the
-contract. Anything that diverges from the four pixel baselines in
-`out/tooling-ab/baseline/` means the commit is wrong: fix or revert. Baselines
-change deliberately, never as a side effect.
+**The authoritative account is `AGENTS.md`**, which lists each gate by name
+with what it compares, what makes it red, and — the part that matters — what
+it cannot see. This section is a summary and will drift; that file is
+maintained as the contract. Anything that diverges from the four pixel
+baselines in `out/tooling-ab/baseline/` means the commit is wrong: fix or
+revert. Baselines change deliberately, never as a side effect — they are class
+`golden` in build.toml and the runner has no build path for them.
 
-Narrower entry points (also pixi tasks): `pixi run suites` / `suites-gpu` for
-the Mojo conformance suites alone, `pixi run check-gen` for generator
-byte-identity, `pixi run gen-trie` / `gen-schema` to regenerate those outputs on
-purpose.
+Narrower entry points: `python3 tools/glyph.py gate <name>` runs one gate
+(`glyph.py gates` lists them), `pixi run suites` / `suites-gpu` /
+`suites-all` for the Mojo conformance suites alone, `pixi run check-gen` for
+generator byte-identity, `pixi run gen-trie` / `gen-schema` to regenerate
+those outputs on purpose.
 
 ## Repo map
 
@@ -145,8 +153,10 @@ purpose.
 
 | Tool | Role |
 |---|---|
-| `tools/check-all.sh` | The umbrella check runner (twelve steps; enumerated in `AGENTS.md`) |
-| `tools/check-stage-g.sh` | The pick oracle: scripted picks vs `g_pick_oracle.py`. The `g` is a fossil stage letter, not a position |
+| `build.toml` | The declarative artifact/gate graph — artifact, inputs, build command, class (committed / golden / product) |
+| `tools/glyph.py` | The manifest runner: `build` / `verify` / `check` / `gate <name>` / `gates` / `graph` / `suites` |
+| `tools/check-all.sh` | Thin shim over `glyph.py check`; the umbrella battery (twelve named gates; enumerated in `AGENTS.md`) |
+| `tools/check-pick-oracle.sh` | The pick oracle: scripted picks vs `g_pick_oracle.py` (was `check-stage-g.sh`; the `g` was a fossil stage letter) |
 | `tools/gen_real_trie.py` | Generates `assets/atlas/engine-trie.bin`; `--verify-only` is the gate form |
 | `tools/gen_schema.py` | Validates `schema/glyph-identity.json`, generates `engine/glyph_schema.mojo`; `--check` is the gate form |
 | `tools/export-atlas.mjs` | Re-derives the four atlas bins from `tools/vendor/ref` (web-repo snapshot); re-run + `cmp` is a gate |

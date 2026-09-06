@@ -1,11 +1,17 @@
 #!/bin/bash
-# Stage G pick-correctness gate: scripted picks on the fixture repo and on
-# glyph3d-js, asserted against an INDEPENDENT python fold oracle reading the
+# Pick-correctness gate: scripted picks on the fixture repo and on a live
+# source tree, asserted against an INDEPENDENT python fold oracle reading the
 # actual file bytes. Also pixel-pick round trips (row/col pick → compute the
 # screen pixel analytically → --pick-px must resolve the same record).
+# (Was tools/check-stage-g.sh — the "g" was a fossil stage letter, renamed
+# 2026-09-06 when the gates got names; the final ALL PASS line on stdout is
+# the load-bearing contract the runner greps for.)
 set -euo pipefail
 cd "$(dirname "$0")/.."
 BIN=native/target/release/glyph3d-native
+# Unlike its siblings this script had no binary guard for most of its life:
+# run out of order it died with a raw shell error instead of a diagnosis.
+[ -x "$BIN" ] || { echo "FAIL  $BIN missing — run: python3 tools/glyph.py build"; exit 1; }
 FIX=native/fixtures/g-pick-repo
 ORACLE="python3 tools/g_pick_oracle.py"
 # The "big real repo" corpus. Was an absolute path into the web repo, which made
@@ -147,4 +153,4 @@ js_check glyph_scene.rs 40 11
 js_check gpu.rs 1 0
 
 echo "────────────────────────────────────────────────────────────────"
-[ $FAIL -eq 0 ] && echo "STAGE G PICK CHECK: ALL PASS" || { echo "STAGE G PICK CHECK: FAILURES"; exit 1; }
+[ $FAIL -eq 0 ] && echo "PICK ORACLE CHECK: ALL PASS" || { echo "PICK ORACLE CHECK: FAILURES"; exit 1; }

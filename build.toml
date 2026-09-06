@@ -1,0 +1,218 @@
+# build.toml — the declarative build/verify graph for glyph3d-native.
+#
+# Consumed by tools/glyph.py (`python3 tools/glyph.py --help`). This file is
+# the single account of WHICH artifacts exist, WHAT they are built from, and
+# WHICH instruments run over them — the thing that used to live only as line
+# order in tools/check-all.sh. Root AGENTS.md ("Verification") explains what
+# each gate compares, what makes it red, and what it cannot see; the per-gate
+# `blind_to` lines below are one-line reminders, not the full account.
+#
+# Classes:
+#   committed — tracked in git; verified by rebuilding to a scratch path and
+#               byte-comparing (or by the generator's own check mode). `build`
+#               regenerates them in place; that is a deliberate, committable act.
+#   golden    — committed, but the tool can NEVER build them: the expected bytes
+#               are a golden master that cannot be derived from declared inputs
+#               (re-baselining is a human decision). Verify only.
+#   product   — untracked build output. Nothing to compare against; it only has
+#               to be CURRENT (input-content stamp) before anything reads it.
+#
+# Counts are DECLARED here, never derived from the tree being checked (the
+# old fixture gate `ls`-counted the tree it was checking; a deleted fixture
+# then lowered both sides of the comparison and stayed green).
+
+[settings]
+# Ratchet, NOT an equality: tests are added constantly, so an exact pin would
+# redden on the most common good action in the repo. A green run whose real
+# count exceeds the floor prints a NOTE naming the value to raise it to.
+test_floor = 85
+
+# ── Products ─────────────────────────────────────────────────────────────
+
+[artifact.dylib]
+class = "product"
+outputs = ["native/libglyph_engine.dylib"]
+# `-I engine` makes the whole engine/ directory an input, generated schema
+# included; pixi.toml/pixi.lock pin the toolchain itself.
+inputs = ["engine/*.mojo", "pixi.toml", "pixi.lock"]
+build = "pixi run build-engine"
+note = "cargo does NOT build this; native/build.rs only links it. --fp-mode contract=off is load-bearing (FMA contraction breaks bit-exactness)."
+
+[artifact.renderer]
+class = "product"
+outputs = ["native/target/release/glyph3d-native"]
+inputs = ["native/src/**", "native/build.rs", "native/Cargo.toml", "native/Cargo.lock", "native/libglyph_engine.dylib"]
+build = "cd native && cargo build --release"
+note = "Cargo owns its own dependency graph; the stamp only guards the dylib edge cargo cannot see."
+
+# ── Committed artifacts ──────────────────────────────────────────────────
+# Two edges leave the schema, not one: the .mojo half feeds the dylib
+# (`mojo -I engine`), the .mjs half feeds the fixture generators
+# (engine/fixtures/gen.mjs imports ../glyph_schema.mjs). Editing
+# schema/glyph-identity.json staleness-invalidates the CORPUS as well as
+# the dylib.
+
+[artifact.glyph-schema]
+class = "committed"
+outputs = ["engine/glyph_schema.mojo", "engine/glyph_schema.mjs"]
+inputs = ["schema/glyph-identity.json", "tools/gen_schema.py"]
+build = "python3 tools/gen_schema.py"
+verify_cmd = "python3 tools/gen_schema.py --check"
+note = "Generator-native check mode; also runs the schema's own tier validation."
+
+[artifact.engine-trie]
+class = "committed"
+outputs = ["assets/atlas/engine-trie.bin"]
+inputs = ["assets/atlas/glyphs.bin", "assets/atlas/codepoints.bin", "tools/gen_real_trie.py"]
+build = "python3 tools/gen_real_trie.py"
+verify_cmd = "python3 tools/gen_real_trie.py --verify-only"
+note = "Check mode rebuilds and byte-compares without writing; its own sweeps pin the semantics."
+
+[artifact.atlas]
+class = "committed"
+outputs = ["assets/atlas/curves.bin", "assets/atlas/glyphmap.bin", "assets/atlas/glyphs.bin", "assets/atlas/codepoints.bin"]
+inputs = ["tools/export-atlas.mjs", "tools/vendor/ref/**", "tools/vendor/hb.cjs", "tools/vendor/hb.wasm"]
+build = "node tools/export-atlas.mjs"
+verify_scratch = "node tools/export-atlas.mjs --out {scratch}"
+note = "No generator-native check mode; the runner rebuilds to scratch and cmps. Self-aborts before writing if fonts/ranges drift."
+
+[artifact.fixtures]
+class = "committed"
+outputs = ["engine/fixtures/*.pipe.bin", "engine/fixtures/*.bake.bin"]
+inputs = ["engine/fixtures/gen.mjs", "engine/fixtures/gen-bake.mjs", "engine/fixtures/inputs/**", "engine/glyph_schema.mjs"]
+build = "cd engine/fixtures && node gen.mjs && node gen-bake.mjs"
+# Verified in a scratch COPY of engine/fixtures (+ ../glyph_schema.mjs, which
+# gen.mjs imports) so the committed corpus is never deleted mid-check — the
+# old gate deleted all 25 fixtures in place and restored them with git
+# checkout. Counts are DECLARED, not ls-derived from the tree under test.
+counts = { "pipe" = 17, "bake" = 8 }
+note = "The Rust-side corpus pins (fixture.rs / bake.rs, 'update deliberately') stay; they and these declared counts are two independent witnesses, not duplicates."
+
+# ── Goldens ──────────────────────────────────────────────────────────────
+# Verified, NEVER built. These four byte-equal screenshots are the only
+# PIXEL gate, and the expected bytes cannot be derived from anything —
+# re-rendering after a deliberate renderer change and committing the new
+# PNGs is a human re-baseline act, done by hand, with a note in the commit.
+# The tool refuses to regenerate them: no build command exists for this
+# artifact, by design.
+
+[artifact.pixel-baselines]
+class = "golden"
+outputs = [
+  "out/tooling-ab/baseline/demo.png",
+  "out/tooling-ab/baseline/text.png",
+  "out/tooling-ab/baseline/repo-zoom.png",
+  "out/tooling-ab/baseline/repo-wide.png",
+]
+inputs = ["native/target/release/glyph3d-native", "native/fixtures/baseline-view.txt", "native/fixtures/g-pick-repo/**"]
+note = "Blind to everything outside these four frames, and cannot distinguish a regression from an intentional change. empty.rs in g-pick-repo is zero bytes ON PURPOSE (the only input reaching the page-extent origin seed)."
+
+# Per-view render commands (run from native/, screenshot into {scratch}).
+[[golden_view]]
+name = "demo"
+cmd = "--demo --frames 2"
+[[golden_view]]
+name = "text"
+cmd = "--render-file fixtures/baseline-view.txt --frames 2"
+[[golden_view]]
+name = "repo-wide"
+cmd = "--load-repo fixtures/g-pick-repo --frames 2"
+[[golden_view]]
+name = "repo-zoom"
+cmd = "--load-repo fixtures/g-pick-repo --frames 2 --focus-file alpha.rs --zoom 3"
+
+# ── Gates ────────────────────────────────────────────────────────────────
+# The battery `glyph check` runs, in order. `needs` lists artifacts that must
+# be current/verified first; the runner enforces the order below, which
+# satisfies them. Names, not numbers — positions in this list have been
+# renumbered twice already and a name survives renumbering.
+
+[[gate]]
+name = "products-current"
+kind = "products"
+needs = ["dylib"]
+compare = "dylib input-content stamp vs engine/*.mojo + pixi toolchain"
+blind_to = "whether the result is CORRECT — only that it is current"
+
+[[gate]]
+name = "committed-artifacts"
+kind = "verify-committed"   # glyph-schema, engine-trie, atlas, fixtures
+needs = []
+compare = "each committed artifact rebuilt (scratch or generator check mode) vs its committed bytes"
+blind_to = "whether the INPUTS are right — reproducibility, not truth"
+
+[[gate]]
+name = "vendor-hashes"
+kind = "cmd"
+cmd = "python3 tools/vendor-manifest.py --check"
+needs = []
+compare = "22 vendored+derived files vs tools/vendor/SHA256SUMS; hb.* also re-derived from their ref sources"
+blind_to = "upstream drift (by design) and a wrong-but-self-consistent vendored revision — the fixture corpus gate is the cover for the second"
+
+[[gate]]
+name = "engine-suites"
+kind = "cmd"
+cmd = "./engine/check.sh all"
+needs = ["fixtures"]
+compare = "16 Mojo conformance suites + ffi_selftest + 2 instruments vs the fixture corpus, CPU and Metal"
+blind_to = "faults shared by the serial and scan forms in conformance_real (oracle-free by design); the instruments print but assert nothing"
+
+[[gate]]
+name = "cargo-build"
+kind = "cargo"
+cmd = "build"
+needs = ["dylib"]
+compare = "rustc warning count vs zero"
+
+[[gate]]
+name = "cargo-clippy"
+kind = "cargo"
+cmd = "clippy"
+needs = []
+compare = "clippy warning count vs zero"
+blind_to = "anything silenced with #[allow(...)]"
+
+[[gate]]
+name = "cargo-test"
+kind = "cargo-test"
+needs = []
+compare = "summed tests-actually-ran vs settings.test_floor ratchet; whole-binary dropout check"
+blind_to = "nothing, structurally — that is what the floor is for. Holds the two corpus-size pins."
+
+[[gate]]
+name = "engine-check"
+kind = "engine-check"
+needs = ["renderer", "dylib"]
+compare = "Mojo engine through the FFI vs an independent Rust CPU fold, record by record"
+blind_to = "the per-item FFI strategy (hardcodes batched) and malformed shapes other than overflow-leads"
+
+[[gate]]
+name = "pick-oracle"
+kind = "cmd"
+cmd = "bash tools/check-pick-oracle.sh"
+pass_line = "ALL PASS"
+needs = ["renderer"]
+compare = "scripted picks and pixel-ray round trips vs an independent Python fold oracle"
+blind_to = "pick paths outside the scripted set"
+
+[[gate]]
+name = "pixel-ab"
+kind = "golden-verify"
+needs = ["renderer", "pixel-baselines"]
+compare = "four views re-rendered vs out/tooling-ab/baseline, byte-equal"
+blind_to = "everything outside the four frames; regression vs intentional change (re-baselining is a human act)"
+
+[[gate]]
+name = "repo-verify"
+kind = "repo-verify"
+needs = ["renderer", "dylib"]
+compare = "per-item vs batched FFI strategies, bit-exact at the layout seam, both wrap modes"
+blind_to = "a fault BOTH strategies share — ground truth comes from engine-check, batched path only"
+
+[[gate]]
+name = "reference-port"
+kind = "cmd"
+cmd = "tools/check-fixture-parity.sh"
+needs = ["renderer", "fixtures"]
+compare = "six halves vs the JS oracle's recorded answers: parse parity, trie, fold, scan, bake, text.rs domain"
+blind_to = "a fault shared by both loaders in parse parity; any fixture outside text.rs's domain, silently"

@@ -5,19 +5,35 @@ name = "glyph3d-native"
 platforms = ["osx-arm64"]
 version = "0.1.0"
 
+# The artifact/gate graph is declared in build.toml and executed by
+# tools/glyph.py. These tasks are entry points over it; depends-on is used
+# where pixi can see an edge (it cannot see that cargo links the dylib —
+# build.toml's [artifact.renderer] inputs can).
 [tasks]
-# The engine's own gates. `check.sh cpu` is the default; `all` also tries the
-# five GPU suites, which need `max` in this env (a dependency since d0a947b).
+# Build/verify split over the manifest. `build` brings products current and
+# regenerates committed artifacts (a deliberate, committable act; goldens are
+# refused by design). `verify` asserts and byte-compares. `check` is the battery.
+build = "python3 tools/glyph.py build"
+verify = "python3 tools/glyph.py verify"
+check = "python3 tools/glyph.py check"
+check-all = "./tools/check-all.sh"
+# The engine's own gates. `check.sh cpu` is the default; `all` also runs the
+# five GPU suites, which need `max` in this env (a dependency since d0a947b),
+# and ffi_selftest, which links the shipped dylib.
 suites = "./engine/check.sh cpu"
 suites-gpu = "./engine/check.sh gpu"
-# Generators: regenerate their committed outputs and prove byte-identity.
+suites-all = "./engine/check.sh all"
+# Generators: regenerate their committed outputs in place. `glyph build`
+# drives these same commands through the manifest; the task aliases stay
+# because muscle memory and docs reach for them.
 gen-trie = "python3 tools/gen_real_trie.py"
 gen-schema = "python3 tools/gen_schema.py"
 check-gen = { cmd = "python3 tools/gen_real_trie.py --verify-only && python3 tools/gen_schema.py --check" }
 # Build the FFI dylib. --fp-mode contract=off is LOAD-BEARING; see
-# engine/check.sh's header for why (it is a real file again as of 2026-09-02).
+# engine/check.sh's header for why. The cargo build depends on this task's
+# OUTPUT — that edge is declared here AND in build.toml ([artifact.renderer]).
 build-engine = "pixi run mojo build --fp-mode contract=off -I engine engine/ffi.mojo -o native/libglyph_engine.dylib --emit shared-lib && install_name_tool -id @rpath/libglyph_engine.dylib native/libglyph_engine.dylib"
-check-all = "./tools/check-all.sh"
+build-native = { cmd = "cargo build --release", cwd = "native", depends-on = ["build-engine"] }
 
 [dependencies]
 mojo = ">=1.1.0.dev2026083005,<2"
