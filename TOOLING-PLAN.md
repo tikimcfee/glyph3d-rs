@@ -100,72 +100,143 @@ Two consequences to carry:
 
 ## The rewrite: a toolchain, not scripts
 
-**Goal.** The build/verify tooling becomes a typed, compiled program that can
-guarantee properties of itself. Not because shell is beneath us — because a
-declaration nothing reads, a stale count, and a mid-run abort that silently
-skips later checks are all things a compiler catches for free and a script
-cannot.
+**The thesis, and every step is one move of it: bring the tool inside its own
+regime.** This repo verifies things by breaking them. The build tool is the one
+component exempt from that — nothing checks the checker. `tools/glyph.py` has no
+tests; if it silently stopped running a gate, or ran one whose command had
+rotted, every remaining gate would still print PASS and the battery would end
+`ALL GATES GREEN`. The rewrite is not "shell is bad, types are good". It is:
+make the tool a thing this repo can break on purpose, the way it breaks
+everything else.
+
+That is also the real reason to choose Rust over hardening the Python. A runner
+that lives as an `xtask` crate is compiled by the build it manages and tested by
+`cargo test` — which means it inherits the zero-warning gate, the `TEST_FLOOR`
+ratchet, and the mutation battery below. The tool ends up covered by the
+instruments it runs. `mypy --strict` gets types; it does not get that.
 
 **Non-goals, explicitly.**
 - **The independent oracles stay in their own languages.** `tools/g_pick_oracle.py`
   and the vendored JS oracle inputs are valuable *because* their lineage differs
   from the code they check. Porting them to Rust makes them a second Rust
   implementation that can share a fault with the renderer, weakening the check
-  while it stays green. Python as a second lineage is deliberate and stays.
+  while it stays green. Python as a second lineage is deliberate and stays. The
+  scripts that ORCHESTRATE are in scope; the implementations that ADJUDICATE are
+  not.
 - The generators (`gen_schema.py`, `gen_real_trie.py`, `vendor-manifest.py`) are
   not in scope. They produce committed artifacts verified by byte-comparison;
   rewriting them buys nothing and risks byte drift.
 - Not a re-litigation of `build.toml`'s shape. The manifest is good. It is being
   given a type.
 
-**Order, chosen so each step can fail.**
+### Step 1 — make catching power machine-checkable
 
-1. **Make catching power machine-checkable, before anything moves.** Today
-   "does this gate still catch?" is a human running mutations by hand. A
-   build-system rewrite validated by "it is still green" is validated by the one
-   signal that proves nothing. Deliverable: a mutation battery — per gate, a
-   named defect it must redden on, run as a command. The branch author ran seven
-   such mutations by hand and recorded them [reported]; this step makes that
-   repeatable rather than a one-time act. **This has standalone value even if
-   the rewrite stops here**, and it is the acceptance criterion for every step
-   below.
-2. **Cargo layout, no behaviour change.** There is no workspace today —
-   `native/Cargo.toml` is a leaf [measured]. An `xtask` crate needs a workspace
-   root or a sibling crate, and that touches how `native/` builds. Land it
-   alone: battery still green through `glyph.py`, `cargo xtask` exists and does
-   nothing.
-3. **Typed manifest, read-only commands first.** `build.toml` into serde structs
-   with `#[serde(deny_unknown_fields)]` — a typo becomes a hard error instead of
-   a silently ignored key. Port `graph` and `gates` first; they only read.
-   **`needs` becomes a real DAG with a topological sort**, which is where
-   finding 1 stops being possible.
-4. **Port gates one at a time, both runners side by side.** They must agree on
-   greens *and* on the mutation battery's reds. Disagreement on a failure is
-   more informative than agreement on a pass.
-5. **Absorb the orchestration shells**, hazard-carrying first:
-   `tools/check-pick-oracle.sh` (the `set -e` abort that silently skips every
-   check after the abort point), then `tools/check-fixture-parity.sh`, then
-   `engine/check.sh`. These are the scripts whose complexity is the actual
-   argument for this work.
-6. **Delete `tools/glyph.py`** when the typed runner passes the same battery.
-   Not before.
+*Worth doing whether or not the rest happens, and the acceptance criterion for
+every step that follows.*
+
+**The idea.** A gate's entire value is what it rejects; its green tells you
+nothing you did not already assume. Today the claim "this gate would catch X" is
+established by a human running a mutation once, writing a sentence about it, and
+moving on — the branch author did seven, I did two, there are twelve gates, and
+none of those acts is repeatable. So the claim decays exactly like every other
+unmaintained number in this repo. The battery turns each gate's catching power
+into an executable assertion: for a named defect, mechanically applied, **the
+stated gate must go red for the stated reason** — and it reports which gates have
+no such assertion at all, so uncovered gates are visible rather than assumed.
+
+**Implementation.** Declare mutations next to the gates they exercise, so a gate
+without one is a hole you can see: `[[gate.mutation]]` with a `name`, an `apply`
+(a patch, a byte edit, a file move), the gate it must redden, and a fragment the
+failure text must contain. The runner then enforces five things, each of which
+exists because this repo has been burned by its absence:
+
+1. **Green first.** Confirm the gate passes before mutating. A red on a tree that
+   was already red proves nothing — this is the "used only as a mutation target,
+   never run clean on the branch that broke it" trap.
+2. **Assert the mutation landed.** "I broke it and nothing failed" and "I failed
+   to break it" print identically. A failed `apply` is silent; check the edit is
+   present before believing any result.
+3. **Rebuild what the mutation invalidates**, before running the gate. A harness
+   here once restored source without rebuilding, so the next run tested the
+   previous mutation and produced three unattributable reds.
+4. **The right gate, for the right reason.** A mutation that reddens some *other*
+   gate is not evidence for this one. Match the declared gate and the declared
+   text fragment.
+5. **Restore byte-exact, and prove it.** Apply in a scratch copy where possible;
+   where it must touch the tree, restore by explicit path and assert `git status`
+   is clean afterward. Never `git checkout -- <dir>` — that once reverted the
+   generators and vendored inputs alongside the fixtures and ate a live edit.
+
+Report as coverage, not as a pass count: *"12 gates, N with mutations, M
+uncovered"*. A battery that says "9 mutations passed" repeats the exact error the
+`ls`-derived fixture count made — describing the size of what you did instead of
+the size of what exists.
+
+**Cost, and therefore cadence.** This is not part of `check`. Cheap mutations (a
+byte in a fixture, a declared count, a file moved aside) run in seconds; expensive
+ones (anything reddening `pixel-ab` or `cargo-test`) need a rebuild and run in
+minutes. Tier them, expose `mutate [--gate <name>]`, and run the full battery
+deliberately — before and after any change to the tooling, which is precisely
+when a gate is most likely to quietly stop working.
+
+### Step 2 — put the runner where the instruments can reach it
+
+Land the cargo layout **for the reason above**, not as plumbing. There is no
+workspace today; `native/Cargo.toml` is a leaf [measured], so an `xtask` crate
+means a workspace root or a sibling crate, and that changes how `native/` builds.
+Do it alone, with no behaviour change: battery still green through `glyph.py`,
+`cargo xtask` exists and does nothing. The step is complete when the empty runner
+is already subject to the zero-warning gate and its (zero) tests are counted by
+the ratchet — that is the property being bought.
+
+### Step 3 — make the manifest a checked artifact rather than a document
+
+`build.toml` into serde structs with `#[serde(deny_unknown_fields)]`, so a typo
+is a hard error instead of a silently ignored key. `kind` becomes an enum. And
+**`needs` becomes an executable DAG with a topological sort** — which is the fix
+for review finding 1, and the clearest instance of the thesis: today the graph is
+prose that happens to sit in a data file, and a declaration nothing reads is
+indistinguishable from a comment. Once the runner orders gates *by* `needs`, a
+wrong edge produces a wrong run instead of a wrong impression, and an unread
+field is a `dead_code` warning against a zero-warning gate. Port the read-only
+commands first (`graph`, `gates`); they cannot break a build.
+
+### Step 4 — port gates differentially
+
+One at a time, both runners live, and the differential is itself the check: they
+must agree on greens **and** on every red the step-1 battery produces.
+Disagreement on a failure is worth more than agreement on a pass — it means one
+of them is wrong about what a defect looks like, which is the only thing either
+is for.
+
+### Step 5 — absorb the orchestration shells, hazard first
+
+`tools/check-pick-oracle.sh` leads, because its `set -euo pipefail` mid-run abort
+silently skips every check after the abort point while still reporting a single
+FAIL — a defect that exists *because* it is shell, and the concrete argument for
+this entire plan. Then `tools/check-fixture-parity.sh`, then `engine/check.sh`.
+
+### Step 6 — delete `tools/glyph.py`
+
+When the typed runner passes the same battery. Not before.
 
 **Fold in when convenient:** `compare` and `blind_to` are already data. A
 `cargo xtask docs` that generates the AGENTS.md verification section from them
 closes the drift loop permanently — the failure mode this repo spent 2026-09-06
 fixing by hand stops being possible.
 
-**Costs, priced honestly.** A compiled runner must compile before it can tell
-you why your build is broken; a shell script always runs. `kind` becoming an
-enum means a new gate type is a code change rather than a config line — correct,
-since a genuinely new kind of check *is* new code, but it changes how the tool
-feels to use. And step 2 is a real structural change to the cargo layout, not a
-formality.
+**Costs, priced honestly.** A compiled runner must compile before it can tell you
+why your build is broken; a shell script always runs. A new gate *kind* becomes a
+code change rather than a config line — correct, since a genuinely new kind of
+check is new code, but it changes how the tool feels. And step 2 is a real
+structural change to the cargo layout, not a formality.
 
 **The cheaper alternative, so the choice is deliberate:** keep Python, add
-`mypy --strict` and a schema for `build.toml`. Most of the manifest-validation
-win, no cargo restructure. It does not get the unused-field warning that would
-have caught finding 1, and the orchestration shells survive.
+`mypy --strict` and a schema for `build.toml`, and do step 1 anyway. That gets
+manifest validation and catching-power coverage without the cargo restructure.
+What it does not get is the tool inside its own regime — the runner stays
+untested by the suite it runs, and the unused-field warning that would have
+caught finding 1 never fires.
 
 ## Open
 
