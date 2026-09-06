@@ -1,0 +1,5 @@
+# `cargo xtask <cmd>` from the repo root. xtask is a standalone crate (see
+# xtask/Cargo.toml for why it is not a workspace member), so the alias names
+# its manifest explicitly.
+[alias]
+xtask = ["run", "--quiet", "--manifest-path", "xtask/Cargo.toml", "--"]

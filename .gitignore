@@ -28,3 +28,6 @@ out/tooling-ab/sweep/
 # Agent worktrees — each is its own git repo plus a ~2.5 GB toolchain.
 # `git add -A` will otherwise commit them as gitlinks (it did, 289ada8).
 .claude/
+
+# xtask is a standalone crate (not a workspace member), so it has its own target
+xtask/target/
