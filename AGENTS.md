@@ -129,13 +129,24 @@ Blind to anything silenced with `#[allow(...)]`.
 
 **5 · `cargo test`.** 85 tests: naga WGSL validation, CLI parity, encase lane
 layout, `ItemParams` validation, the layout-seam suites, the wrap-mode monoid
-domain, and the reference-port suites. Red when a test fails. **Its threshold is
-structural and you should know it:** the check requires exit zero *and* at least
-two `test result: ok` lines — and there are exactly two test binaries,
-`unittests src/main.rs` holding 84 and `tests/wgsl.rs` holding **one**. The floor
-of two is therefore met by the existence of a single-test file, no matter what
-happens to the other 84. Deleting them all leaves both binaries printing `ok` and
-this check green. **This matters more than it looks**, because the pins that keep
+domain, and the reference-port suites. Red when a test fails, when a whole test
+binary stops reporting, or when **fewer than `TEST_FLOOR` tests actually run**.
+That floor is a ratchet, not an equality: adding tests never reddens it, and when
+the real count rises above it every green run prints a NOTE naming the number to
+raise it to — so it cannot decay into a figure far below reality without saying
+so. Raise it in the same commit that adds the tests.
+
+The floor exists because the previous form could not fail. It counted
+`test result: ok` summary lines and required two; there are exactly two binaries
+(`unittests src/main.rs` with 84, `tests/wgsl.rs` with 1), so the threshold was
+met by the tree's shape. Verified 2026-09-06: marking three tests `#[ignore]`
+left the old check printing `PASS tests green` and the new one printing
+`FAIL — 82 tests ran, floor is 85`. This is also the check that holds the two
+corpus-size pins (`native/src/fixture.rs`, 17 pipe; `native/src/bake.rs`, 8 bake,
+both worded "update deliberately"), so until now corpus protection rested on
+those tests continuing to run with nothing asserting that they did. The realistic
+loss was never deletion — it is a dropped `mod` declaration or an `#[ignore]`
+that outlives its reason, neither of which rustc says a word about. **This matters more than it looks**, because the pins that keep
 the fixture corpus from silently shrinking (`native/src/fixture.rs`, 17 pipe;
 `native/src/bake.rs`, 8 bake — both worded "update deliberately") live inside
 this check. They protect the corpus; nothing yet protects them.

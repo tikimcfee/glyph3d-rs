@@ -191,14 +191,24 @@ before believing a null result. Specific traps this repo has actually hit
   broke it. A mutation reddening a check proves the check works; it does not
   prove the check was consulted.
 
-One live example, so the standard is not abstract. The `cargo test` step
-passes when the run exits zero **and** prints at least two `test result: ok`
-lines. There are exactly two test binaries, so that floor is satisfied by the
-shape of the tree regardless of what is inside them: 85 tests today, and
-deleting 84 of them would leave this green [measured 2026-09-06]. It is also
-the step that holds the two corpus-size pins. Do not generalise this one into a
-manifest as though it were a working check — either leave it alone or pin a
-real count, but decide it deliberately.
+One worked example, so the standard is not abstract. Until 2026-09-06 the
+`cargo test` step passed on exit-zero plus at least two `test result: ok` lines.
+There are exactly two test binaries, so that threshold was met by the shape of
+the tree no matter what was inside them — 85 tests, and deleting 84 would have
+left it green. It is also the step holding the two corpus-size pins, so corpus
+protection rested on tests continuing to run with nothing asserting they did.
+
+It is now a **ratchet**: the step sums the tests that actually ran and fails
+below `TEST_FLOOR`. Deliberately a floor and not an equality — tests are added
+constantly here, and an exact pin would redden on the most common good action in
+the repo. To keep the floor from decaying into a meaningless number, a green run
+whose real count exceeds it prints a NOTE naming the value to raise it to.
+
+Two things to carry from this, because they generalise past this one step:
+a threshold that equals a structural property of the tree is not a threshold,
+and a pin that depends on someone remembering to maintain it will not be
+maintained — make it tell you [measured 2026-09-06: the old form printed PASS and
+the new one printed FAIL on the same tree, with three tests marked `#[ignore]`].
 
 `tools/check-all.sh` must end `CHECK-ALL: ALL GATES GREEN`, including the four
 byte-equal screenshots, before and after your change.

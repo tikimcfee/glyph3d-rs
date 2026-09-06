@@ -157,10 +157,41 @@ W=$(warn_count "$LOG")
 if [ "$W" = 0 ]; then echo "PASS  clippy — 0 warnings"; else echo "$LOG" | grep -E "^warning" -A4; echo "FAIL  clippy — $W warnings"; FAIL=1; fi
 
 step "5/9 cargo test"
+# The floor is a RATCHET, and it is deliberately not an equality. Tests are
+# added constantly here, so pinning an exact count would redden this step on
+# the most common good action in the repo — friction aimed at exactly the
+# behaviour we want. A floor is free to add tests under and only reddens when
+# coverage DROPS.
+#
+# Why it exists at all: the previous form gated on `>= 2` counted test-result
+# SUMMARY lines, and there are exactly two test binaries (84 tests in
+# unittests, 1 in tests/wgsl.rs). That floor was met by the tree's shape and
+# could not fail — deleting every test but one left it green. It also holds the
+# two corpus-size pins (fixture.rs, bake.rs), so corpus protection rested on
+# tests continuing to RUN with nothing asserting that they did. The realistic
+# loss is not deletion but a dropped `mod` declaration: rustc simply does not
+# compile an unreferenced module, tests included, and says nothing.
+#
+# Structurally maintained: when the real count rises above the floor this
+# prints a NOTE on every green run, so the floor cannot quietly decay into a
+# number far below reality. Raise it in the same commit that adds the tests.
+TEST_FLOOR=85
 LOG=$(cd native && cargo test --release 2>&1); RC=$?
 echo "$LOG" | grep "test result"
-PASSED=$(grep -c "test result: ok" <<<"$LOG" || true)
-if [ $RC = 0 ] && [ "$PASSED" -ge 2 ]; then echo "PASS  tests green"; else echo "FAIL  cargo test (rc=$RC)"; FAIL=1; fi
+BINARIES=$(grep -c "test result: ok" <<<"$LOG" || true)
+TOTAL=$(grep -oE "[0-9]+ passed" <<<"$LOG" | grep -oE "^[0-9]+" | awk "{s+=\$1} END {print s+0}")
+if [ $RC != 0 ]; then
+  echo "FAIL  cargo test (rc=$RC)"; FAIL=1
+elif [ "$BINARIES" -lt 2 ]; then
+  echo "FAIL  cargo test — only $BINARIES test binary reported; a whole binary stopped running"; FAIL=1
+elif [ "$TOTAL" -lt "$TEST_FLOOR" ]; then
+  echo "FAIL  cargo test — $TOTAL tests ran, floor is $TEST_FLOOR. Coverage DROPPED by $((TEST_FLOOR - TOTAL));"
+  echo "      a deleted test, or a module that stopped being compiled. Lower the floor only on purpose."
+  FAIL=1
+else
+  echo "PASS  tests green — $TOTAL tests over $BINARIES binaries (floor $TEST_FLOOR)"
+  [ "$TOTAL" -gt "$TEST_FLOOR" ] && echo "NOTE  the floor is behind: raise TEST_FLOOR to $TOTAL in tools/check-all.sh"
+fi
 
 step "6/9 engine-check (bit-exact vs CPU oracle)"
 OUT=$(cd native && ./target/release/glyph3d-native --engine-check src/main.rs 2>&1 | tail -1)
