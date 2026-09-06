@@ -272,3 +272,61 @@ with = '''    #[test]
     #[ignore]
 '''
 expect = "Coverage DROPPED"
+
+# ── engine-suites and engine-check ───────────────────────────────────────
+# `rebuild` is MANDATORY for anything the dylib is built from: engine/check.sh
+# re-links it mid-gate, so without the post-restore rebuild the tree comes back
+# byte-exact with a MUTATED dylib still sitting at native/libglyph_engine.dylib
+# — cargo does not build that file, so the next gate would test the wrong binary.
+#
+# Each of these was checked against the third outcome, the one that is neither
+# "landed" nor "failed to land": LANDED IN A REGION NOTHING READS. The named
+# consumer is recorded in each `why`.
+
+[[mutation]]
+name = "phantom-row"
+gate = "engine-suites"
+why = "the 2026-09-04 phantom row: a wrap rule that counts the terminating newline's own row steals a blank row whenever wrap divides the line length exactly, and the two rules agree at every other length. CONSUMED BY: wrap-exact (lines of 4/8/12 at wrap 4 — the fixture exists for this), wrap-emoji and real-kernels; 3 of 17 cases, 178,916 mismatches."
+file = "engine/glyph_pipeline.mojo"
+rebuild = "pixi run build-engine"
+op = "replace"
+find = "    return (length - 1) // wrap + 1"
+with = "    return length // wrap + 1"
+expect = "conformance: 3 case(s) failed"
+
+[[mutation]]
+name = "ord-f32-carrier"
+gate = "engine-suites"
+why = "the f32 ordinal wall put back. A CORRELATED fault: both the port and the oracle computed ord exactly and quantized on the store, so past 2^24 they rounded together and the differ said PASS. CONSUMED BY: ordinal_invariant's synthetic 2^24+2 boundary probe ONLY — every one of the 17 fixtures stays green under this, and so do conformance and conformance_scan (verified). This mutation is the reason that suite is not decorative."
+file = "engine/glyph_pipeline.mojo"
+rebuild = "pixi run build-engine"
+op = "replace"
+find = "            w.wc[unsafe_offset=id] = UInt32(ord)"
+with = "            w.wc[unsafe_offset=id] = UInt32(Int(Float32(ord)))"
+expect = "the migration is incomplete"
+
+[[mutation]]
+name = "abi-shape-drift"
+gate = "engine-suites"
+why = "the descriptor's i32 arity moves on the ENGINE side while a foreign caller keeps pinning the old shape — the 2026-09-04 positional-arity incident, the thing ABI_SHAPE exists to refuse. CONSUMED BY: ffi_selftest, which restates the ABI literally instead of importing it and links the SHIPPED dylib; every load_item_desc call is then refused with GE_ABI_MISMATCH (9). Nothing else in the battery crosses the real C ABI for the single-item entry."
+file = "engine/ffi.mojo"
+rebuild = "pixi run build-engine"
+op = "replace"
+find = "comptime ABI_DESC_I32S: Int = 7                # i32 params inside that block"
+with = "comptime ABI_DESC_I32S: Int = 6                # i32 params inside that block"
+expect = "load_item status 9"
+
+[[mutation]]
+name = "out-of-range-block"
+gate = "engine-check"
+why = "an out-of-range codepoint must resolve to the SHARED MISSING BLOCK (storage block 0); resolving it to a real block is the September 2026 disagreement between this engine and the Rust reference, which asserted instead. CONSUMED BY: fixtures/overflow-leads.txt and NOTHING ELSE — 4 of its 15 records differ (GID 189 vs 0). src/main.rs stays green under this mutation, which is exactly why engine-check runs two inputs; so does the whole engine-suites battery, since no fixture carries an F5-F7 lead byte."
+file = "engine/glyph_pipeline.mojo"
+rebuild = "pixi run build-engine"
+op = "replace"
+find = """
+        block = 0
+    var entry"""
+with = """
+        block = 1
+    var entry"""
+expect = "FAIL  engine-check (fixtures/overflow-leads.txt)"
