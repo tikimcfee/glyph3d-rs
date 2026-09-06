@@ -59,8 +59,8 @@ Platform: macOS on Apple Silicon (`osx-arm64`; the GPU suites run on Metal).
 ## Quickstart
 
 Requirements: macOS/Apple Silicon, [pixi](https://pixi.sh), a recent Rust
-toolchain (egui 0.36 sets MSRV 1.95), and Node ≥ 18 (the atlas gate AND the corpus-regeneration gate 1b in
-`check-all` uses it).
+toolchain (egui 0.36 sets MSRV 1.95), and Node ≥ 18 (two of the checks run it: the atlas export and the
+fixture-corpus rebuild).
 
 ```sh
 pixi install                    # mojo + max env (pins in pixi.toml / pixi.lock)
@@ -73,8 +73,9 @@ cargo run --release             # windowed: fly camera, pick, F1 debug panel
 
 If `cargo build` fails at the linker or build.rs panics about a missing or
 **stale dylib**, that is the expected failure mode after engine or toolchain
-changes: re-run `pixi run build-engine`. `out/ENGINE_TOOLCHAIN_REPORT.md` §1
-is the canonical fix-it note.
+changes: re-run `pixi run build-engine`. `cargo build` never builds the dylib
+— it only links whatever is already there. `AGENTS.md` § Build explains the
+mechanism and the two guards that exist because prose was not enough.
 
 ### Running the renderer
 
@@ -96,30 +97,35 @@ to `out/windowed-shot-<utc-stamp>.png`. Debug environment variables
 (`GLYPH_PROFILE`, `GLYPH_PICK_DEBUG`, `GLYPH_CULL_DEBUG`, …) are documented in
 `native/AGENTS.md`.
 
-## Verification — the gates
+## Verification
 
-One command, from the repo root, exit 0 means everything is green:
+One command, from the repo root; exit 0 means everything is green:
 
 ```sh
 pixi run check-all     # = ./tools/check-all.sh
 ```
 
-TWELVE steps as of 2026-09-04 — including (0) build the dylib, (1b) rebuild the 25-fixture corpus, (8b) `--repo-verify` across both FFI paths, and (9) the reference port, none of which are listed below; see `native/AGENTS.md` for the current list. Historically eight steps: (1) the generators (`gen_real_trie.py`, `gen_schema.py`,
-`export-atlas.mjs`, `vendor-manifest.py`) reproduce their committed outputs
-byte-identically; (2) all sixteen Mojo conformance suites, CPU + GPU
-(`engine/check.sh`); (3) `cargo build --release` with zero warnings;
-(4) `cargo clippy --release` zero warnings; (5) `cargo test` green;
-(6) `--engine-check` — Mojo engine bit-exact vs the `text.rs` CPU oracle;
-(7) `tools/check-stage-g.sh` — picks cross-checked against an independent
-Python fold oracle; (8) a four-view byte-equal A/B: `demo` / `text` /
-`repo-zoom` / `repo-wide` re-rendered into `out/tooling-ab/sweep/` and
-`cmp`'d against `out/tooling-ab/baseline/`. Divergence means the commit is
-wrong — fix or revert; baselines are never re-made casually.
+Twelve steps, spanning all four languages: the generators reproduce their
+committed outputs byte-for-byte, the 25-fixture conformance corpus is deleted
+and rebuilt byte-identically, sixteen Mojo suites run on CPU and GPU, the Rust
+side builds and lints warning-free and passes its tests, the engine is diffed
+bit-exact against an independent CPU oracle, picks are cross-checked against an
+independent Python oracle, the two FFI strategies are diffed against each other
+in both wrap modes, the reference port is replayed against the JS oracle's
+recorded answers, and four canonical views are re-rendered and compared pixel
+for pixel.
 
-Narrower entry points (also pixi tasks): `pixi run suites` /
-`suites-gpu` for the engine conformance suites alone, `pixi run check-gen`
-for generator byte-identity, `pixi run gen-trie` / `gen-schema` to
-regenerate those outputs on purpose.
+**The authoritative account is `AGENTS.md`**, which lists each check with what
+it compares, what makes it red, and — the part that matters — what it cannot
+see. This section is a summary and will drift; that file is maintained as the
+contract. Anything that diverges from the four pixel baselines in
+`out/tooling-ab/baseline/` means the commit is wrong: fix or revert. Baselines
+change deliberately, never as a side effect.
+
+Narrower entry points (also pixi tasks): `pixi run suites` / `suites-gpu` for
+the Mojo conformance suites alone, `pixi run check-gen` for generator
+byte-identity, `pixi run gen-trie` / `gen-schema` to regenerate those outputs on
+purpose.
 
 ## Repo map
 
@@ -139,8 +145,8 @@ regenerate those outputs on purpose.
 
 | Tool | Role |
 |---|---|
-| `tools/check-all.sh` | The umbrella gate (8 steps, above) |
-| `tools/check-stage-g.sh` | Pick-correctness gate (step 7); scripted picks vs `g_pick_oracle.py` |
+| `tools/check-all.sh` | The umbrella check runner (twelve steps; enumerated in `AGENTS.md`) |
+| `tools/check-stage-g.sh` | The pick oracle: scripted picks vs `g_pick_oracle.py`. The `g` is a fossil stage letter, not a position |
 | `tools/gen_real_trie.py` | Generates `assets/atlas/engine-trie.bin`; `--verify-only` is the gate form |
 | `tools/gen_schema.py` | Validates `schema/glyph-identity.json`, generates `engine/glyph_schema.mojo`; `--check` is the gate form |
 | `tools/export-atlas.mjs` | Re-derives the four atlas bins from `tools/vendor/ref` (web-repo snapshot); re-run + `cmp` is a gate |
@@ -152,11 +158,12 @@ regenerate those outputs on purpose.
 
 ## Where results live (`out/`)
 
-- **Reports** — `out/STAGE_<X>_REPORT.md` is the unit of landed work (goal,
-  result, gates table, remaining gaps). Start with
-  `out/ENGINE_TOOLCHAIN_REPORT.md` (current toolchain state + the build-fix
-  note), then the latest stage report; `PICK_FIX_REPORT.md` is the picking
-  postmortem.
+- **Reports** — `out/STAGE_<X>_REPORT.md` records a piece of landed work: goal,
+  result, what was run, remaining gaps. They are **history and stay that way**;
+  the lettered stage names are kept on purpose and are not an index of the
+  current system (there has never been one — stages A, B and D have no report at
+  all). `PICK_FIX_REPORT.md` is the picking postmortem. For how things are now,
+  read `AGENTS.md`.
 - **The A/B oracle suite** — `out/tooling-ab/baseline/` holds the four
   canonical views every refactor must reproduce byte-for-byte. It is tracked
   and changes only on purpose; `out/tooling-ab/sweep/` is the regenerated
@@ -168,18 +175,24 @@ regenerate those outputs on purpose.
 
 ## Reading order for a newcomer
 
-1. This README, then `AGENTS.md` (repo-wide working rules).
-2. `out/ENGINE_TOOLCHAIN_REPORT.md` — a RECORD of the toolchain migration, not
-   current truth (it says so itself at :55). It states "no node is needed to
-   build any engine input any more"; gate 1 runs `node tools/export-atlas.mjs`
-   and gate 1b runs `node gen.mjs`. For current state read root `AGENTS.md` and
-   `native/AGENTS.md`.
-3. `engine/README.md` (the pipeline and its float discipline),
+1. This README, then **`AGENTS.md`** — the repo-wide contract: what every check
+   does and cannot see, what is fenced and why, and what the stage/gate
+   vocabulary means. Read it before changing anything.
+2. `engine/README.md` (the pipeline and its float discipline),
    `engine/README-FFI.md` (the C ABI), `engine/TOOLCHAIN.md`.
-4. `native/AGENTS.md` + the `native/src/*.rs` module headers.
+3. `engine/PORT-PLAN.md` — the reference port's stage record, and the only
+   canonical definition of the live `Stage 0`–`4` numbering.
+   `engine/BACKEND-PLAN.md` for the layout seam and what comes next.
+4. `native/AGENTS.md` + the `native/src/*.rs` module headers — the real
+   per-module contracts.
 5. `assets/atlas/FORMAT.md`; `schema/glyph-identity.json` when touching layout.
-6. `integration/notes/` (numbered handoffs; `08` is the pending Stage L
-   view-structure handoff) and `research/` as needed.
+6. `integration/notes/` (numbered handoffs) and `research/` as needed.
+
+Everything under `out/` is a **record of work that landed, not current state.**
+Read a report to learn why a decision was made; do not read one to learn how
+things are now. At least one has been overtaken by events —
+`ENGINE_TOOLCHAIN_REPORT.md` says no node is needed to build any engine input,
+and two checks run node today.
 
 ## Workspace context
 

@@ -117,7 +117,12 @@ an account of which ones RUN. Four found in one day, one at a time, by accident.
    and byte-compares. `check-all` should then assert properties of artifacts
    someone else built, instead of being the thing that remembers to build them.
 3. **Subsume, do not add.** Gates 1, 1b and 8 are three hand-written variants of
-   "rebuild and compare". A fourth variant is a regression.
+   "rebuild and compare", each with its own restore logic, its own way of
+   counting what it covered, and its own failure text. That divergence is
+   already the cost: a fix to one reaches none of the others, and one of the
+   three (1b) counts its own coverage off the tree it is checking while the
+   other two do not. A fourth variant means four places to audit and four
+   places for the next blind spot to sit unnoticed.
 4. **Wire `ffi_selftest.mojo`** into `engine/check.sh`, or delete it with a
    stated reason. An instrument nothing runs is an absent one.
 5. **A testing CLI** the owner has asked for: a single entry point for the
@@ -136,7 +141,14 @@ an account of which ones RUN. Four found in one day, one at a time, by accident.
   added for it. In the manifest they are verified, never built. And ask what
   else gate 8 cannot see.
 - **Do not weaken a gate to make it fit the graph.** If a gate resists
-  generalisation, that is information.
+  generalisation, that is information. The pixel A/B is the worked example: it
+  looks like the other rebuild-and-compare checks and is not one. The others
+  reconstruct an artifact from its inputs and diff the result; this one re-runs
+  the whole renderer and compares against a golden master that **cannot be
+  derived from anything**. Fitting it to a "rebuild from inputs" manifest means
+  either teaching the manifest to rebuild it — which is the forbidden
+  re-baseline — or dropping it. It resists because it is a different kind of
+  check, and the resistance is the signal.
 
 - **The corpus-size pins are not in the gate runner, and are not redundant.**
   `native/src/fixture.rs` pins 17 `.pipe.bin` and `native/src/bake.rs` pins 8
@@ -150,8 +162,14 @@ an account of which ones RUN. Four found in one day, one at a time, by accident.
   So when you subsume gate 1b, carry a DECLARED corpus size into the manifest or
   leave the pins alone; do not retire them as duplicate coverage, and do not
   copy 1b's habit of asking the tree how big the tree is.
-- **Do not edit `/Users/lugo/localdev/viz-web/glyph3d-js`.** Historical
-  reference, read-only.
+- **Do not edit `/Users/lugo/localdev/viz-web/glyph3d-js`.** It is the JS
+  renderer this engine was ported from — the original oracle. Every expected
+  answer in the conformance corpus traces back to it, but by way of
+  **revision-pinned snapshots vendored into this repo** (`tools/vendor/ref/`
+  and `engine/fixtures/inputs/`), and the two have deliberately forked since.
+  Nothing here reads that repo at build time. So an edit there changes no
+  output, is verified by nothing, and silently desynchronises your mental model
+  from the pinned inputs the checks actually use.
 - Note `.claude/worktrees/` may hold other agents' in-flight work. Do not touch
   it; make your own worktree.
 
@@ -173,5 +191,45 @@ before believing a null result. Specific traps this repo has actually hit
   broke it. A mutation reddening a check proves the check works; it does not
   prove the check was consulted.
 
+One live example, so the standard is not abstract. The `cargo test` step
+passes when the run exits zero **and** prints at least two `test result: ok`
+lines. There are exactly two test binaries, so that floor is satisfied by the
+shape of the tree regardless of what is inside them: 85 tests today, and
+deleting 84 of them would leave this green [measured 2026-09-06]. It is also
+the step that holds the two corpus-size pins. Do not generalise this one into a
+manifest as though it were a working check — either leave it alone or pin a
+real count, but decide it deliberately.
+
 `tools/check-all.sh` must end `CHECK-ALL: ALL GATES GREEN`, including the four
 byte-equal screenshots, before and after your change.
+
+## Vocabulary you will meet, and which parts are dead
+
+Three numbering schemes appear in this tree; two are historical and will
+mislead you.
+
+- **Lettered stages (`Stage A`..`Stage L`)** name past batches of work recorded
+  in `out/STAGE_*_REPORT.md`. There is no index and never was — A, B and D have
+  no report. Treat any stage letter outside `out/` as archaeology, including the
+  `g` in `tools/check-stage-g.sh`, which is a fossil letter and not a position
+  (that script is the pick oracle; one caller, cheap to rename if you are
+  touching `check-all.sh` anyway).
+- **`Stage 0`-`4` is ambiguous**: it names both the live reference port
+  (canonically `engine/PORT-PLAN.md`) and a dissolved layout-seam list deleted
+  from `engine/BACKEND-PLAN.md`. Some source comments still use the dead one
+  unqualified.
+- **Check numbers (`gate 1b`, `gate 8b`)** are positions in one shell script,
+  already renumbered twice, printed as `N/9` for twelve steps.
+
+Prefer names over numbers in anything you write. `AGENTS.md` names every check.
+
+## One more thing the manifest could fix
+
+`tools/vendor/PROVENANCE.md` is a **generated, committed** file whose prose is
+hand-written inside `tools/vendor-manifest.py` and never re-validated. It
+currently states that two vendored oracle files have no reader ("NOTHING READS
+THEM YET") when `engine/fixtures/gen.mjs` reads both at `:93` and `:175` to
+build two fixtures, and it says "all 22 committed fixtures" when there are 25.
+The `--check` mode runs on every pass and only ever compares hashes. A generated
+artifact whose *content* is verified and whose *claims* are not is exactly the
+gap a real manifest should close.

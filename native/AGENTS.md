@@ -1,110 +1,55 @@
-# AGENTS.md — house rules for glyph3d-native
+# AGENTS.md — house rules for the `native/` crate
 
-One page. Read this before touching anything. The renderer's output is the
-contract: **every refactor must be provably output-neutral**, proven by gates,
-not by argument.
+**Read the root `AGENTS.md` first.** It is canonical for everything repo-wide:
+what each of the twelve checks compares and what it cannot see, what is fenced
+and why, the build trap (`cargo build` does not build the Mojo dylib), and what
+the stage/gate vocabulary means. That account used to be duplicated here and
+drifted out of sync in both directions; this file no longer restates it.
 
-## The gates — run after EVERY commit
+This file is the Rust crate: the layout seam, style discipline, debug env vars,
+and the module contracts.
 
 ```bash
 bash tools/check-all.sh        # from the repo root; exit 0 = all green
 ```
 
-**Run them in a WORKTREE if anyone else is working in this repo.** `check-all`
-reads the WORKING TREE, not HEAD, so a second thread's uncommitted edits will
-fail your gates and tell you nothing about your own change. That has already
-happened once. A fresh worktree is not free — `.pixi/`, the dylib and
-`engine/bench/bench.bin` are all untracked, so it needs:
+**Run in a WORKTREE if anyone else is working in this repo.** `check-all` reads
+the WORKING TREE, not HEAD, so another thread's uncommitted edits fail your
+checks and tell you nothing about your own change. That has already happened. A
+fresh worktree is not free — `.pixi/`, the dylib and `engine/bench/bench.bin`
+are all untracked:
 
 ```bash
 git worktree add .claude/worktrees/<name> -b worktree-<name>
 cd .claude/worktrees/<name>
 pixi install                                   # ~1 min, .pixi is untracked
 pixi run build-engine                          # the dylib is untracked too
-# NOTE: engine/bench/bench.bin does not exist in this tree; check.sh only
-# COMPILES the benches, so no gate needs it. Regenerate with gen-bench.mjs if
-# you actually want to run one (that script still reaches into the web repo).
+# engine/bench/bench.bin does not exist here; check.sh only COMPILES the
+# benches, so nothing needs it. gen-bench.mjs still reaches into the web repo.
 ```
 
 Setup details and the toolchain's live constraints: `engine/TOOLCHAIN.md`.
 
-TWELVE gates as of 2026-09-04 (was nine, was six). The step headings still
-read "N/9" — the numbering lies, the list below does not. THREE run before
-anything is verified, and all three were added for checks that already existed
-and were simply never consulted: (0) `pixi run build-engine`, because nothing
-built the dylib and `cargo build` does not — `native/build.rs` only LINKS it, so
-a `.mojo` edit was compiled by the conformance suites and NOT by the renderer;
-(1b) the 25-fixture corpus is DELETED and rebuilt, asserting byte-identity from
-the vendored, revision-pinned inputs in `engine/fixtures/inputs/`; (8b)
-`--repo-verify` diffs the per-item and batched FFI paths bit-exact in BOTH wrap
-modes. Then inputs before consumers: (1) three generators plus the atlas exporter each rebuild their
-committed output and require **byte-identity** (`engine-trie.bin`,
-`engine/glyph_schema.mojo`, the 20-file vendor manifest, the four
-`assets/atlas/*.bin`); (2) `engine/check.sh` — **16 Mojo conformance suites**
-(11 CPU + 5 GPU on Metal), the two INSTRUMENTS (`fixture_census`,
-`fixture_manifest` — an instrument nothing runs is an absent one, and the
-census was found carrying its own fault), plus a compile pass over all six
-benches. Then the
-original six: (3) `cargo build --release` with **zero warnings**, (4)
-`cargo clippy --release` zero warnings, (5) `cargo test` all green (85 tests:
-naga WGSL validation, clap CLI parity, encase layout assertions, ItemParams
-validation, the layout seam's compaction / paint-indexing / extent / differ
-suites, the wrap-mode monoid domain tests, and the reference port's
-reader/trie/fold/scan/bake suites), (6)
-`--engine-check src/main.rs` — bit-exact Mojo engine vs the text.rs CPU
-oracle, (7) `tools/check-stage-g.sh` — scripted picks cross-checked against
-an independent python fold oracle, (8) four-view **byte-equal** A/B:
-demo / text / repo-zoom / repo-wide re-rendered into `out/tooling-ab/sweep/`
-and `cmp`'d against `out/tooling-ab/baseline/`. Any divergence means the
-commit is wrong — revert or fix, never re-baseline casually. And (9)
-`tools/check-fixture-parity.sh` — stage 0 of the reference port: Rust's
-`.pipe.bin` reader (`native/src/fixture.rs`) and Mojo's `fixture_io` agree on
-FNV-1a checksums over their **parsed** values across all 17 fixtures, and
-`text.rs`'s CPU fold is diffed **bit-exact** against the oracle's own expected
-lanes on every fixture inside its domain (4 today, 5332 records). It fails if
-nothing was in domain. Stage 1 added a third half: every fixture's trie rebuilt
-from its own BYTES by the ported `GlyphTrie` (`native/src/glyph_trie.rs`) and
-compared through the wire-order serializer — 17 fixtures, 13568 entries. Stage 2
-added a fourth: the ported serial fold (`native/src/fold.rs`) run over the whole
-corpus with **every lane of every byte** compared bit-exact, plus `ordToByte`,
-misses, leaders, per-item boxes and the batch union — 17 fixtures, 155,136
-leaders, 1,872,012 lanes. Stage 3 added a fifth: the ported scan form
-(`native/src/scan.rs`) swept across **8 chunk/group/shard tunings** — 136 cases,
-1,187,896 leader lanes bit-exact — under the tiered contract, where invariance
-across tunings is monoid associativity checked in situ. Stage 4 added a sixth:
-the ported bake (`native/src/bake.rs`) replayed against the 8 `.bake.bin`
-fixtures — the streaming record AND the seed protocol (checkpoint-seeded
-`prefix_at`, `lanes_from_prefix`, `rows_under_wrap`), 530 queries bit-exact.
-That completes the reference port. No JS runs in gate 9 — but node is NOT gone
-from the repo: gate 1 still runs `tools/export-atlas.mjs`, which needs harfbuzz.
-An earlier commit message overclaimed "no JS runs in any gate"; it was true of
-the gate that had been checked and false of the suite.
 
-## The determinism chain (why the gates can be this strict)
+## The determinism chain (why the checks can be this strict)
 
 Offscreen renders use a fixed virtual clock (1/60 s per frame), CPU-side
 culling/picking (no GPU-dependent traversal order), and a fixed atlas. So a
-given commit + given input ⇒ byte-identical PNG. Everything that could break
-this is fenced:
+given commit + given input ⇒ byte-identical PNG. That property is what makes the
+four-view pixel comparison meaningful, and it is a fact about this crate's
+offscreen path.
 
-- `engine/` — not cargo's. The Mojo engine is built by pixi/mojo
-  (`pixi run build-engine`), never by the Rust build. It is no longer READ-ONLY
-  as this file once said — engine work happens here — but a change to it is
-  gated by `engine/check.sh` (16 suites) AND must leave the four render
-  baselines byte-equal. If an engine change moves a PNG, the change is wrong.
-- `assets/atlas/` — READ-ONLY. Atlas binaries define the glyph geometry.
-- `native/src/shaders/*.wgsl` — READ-ONLY without a dedicated stage; the naga
-  test pins the shader *set*, encase tests pin the lane maps.
-- `native/fixtures/baseline-view.txt` — IMMUTABLE. It is the text.png gate's
-  input; editing it silently re-baselines (see out/STAGE_I_REPORT.md).
-- Version pins: wgpu 30.x, winit 0.30, glam 0.33 (see Cargo.toml comments).
-  **No dependency bump without its own re-baselined mini-stage** (Stages H/I
-  are the template: one dep, full A/B suite, report in out/).
+Everything that could break it is fenced, and **the fence table lives in root
+`AGENTS.md`** — it used to be restated here with different reasons and a stale
+claim (`engine/` as READ-ONLY, which it has not been since engine work moved
+into this tree). One correction worth carrying: an engine change is gated by the
+Mojo suites *and* must leave the four baselines byte-equal. If an engine change
+moves a PNG, the change is wrong.
 
 ## The layout seam
 
 Everything that lays glyphs out goes through `native/src/layout.rs`
-(Stage 0 of `engine/BACKEND-PLAN.md`). Read that module header before adding
+(the layout seam; `engine/BACKEND-PLAN.md` no longer numbers it). Read that module header before adding
 a backend or a caller; the short version:
 
 - A backend takes `LayoutItem`s (bytes + `ItemParams` + `Paint` + group),
@@ -136,7 +81,8 @@ a backend or a caller; the short version:
 - `--repo-verify` diffs two backends at the seam — placements, instances AND
   records, all bit-exact (`layout::diff_backends`). It used to compare records
   only, which cannot see compaction, paint or extents at all. Today it runs
-  the Mojo backend's two FFI strategies against each other; stage 1 points the
+  the Mojo backend's two FFI strategies against each other; the Rust backend is
+  next to receive the
   same call at the Rust backend.
 
 `fixtures/g-pick-repo/empty.rs` IS ZERO BYTES ON PURPOSE, and it is the only
@@ -163,7 +109,7 @@ rebuilt, put one back.
 - Comments explain WHY (empirical findings, bug history, invariants), not
   what the code does. Stage-tagged (`// Stage F: ...`) for archaeology.
 
-## Debug env vars (all verified present at Stage J)
+## Debug env vars
 
 - `GLYPH_PROFILE=1` — requests TIMESTAMP_QUERY and builds a wgpu-profiler;
   per-pass GPU timings print (windowed: 1 Hz; offscreen: once per run).
@@ -186,14 +132,20 @@ rebuilt, put one back.
 
 ## Commit cadence
 
-One logical change per commit; run `tools/check-all.sh` after each and put
-the gate results in the commit message. Multi-part work lands as a stage with
-a report in `out/STAGE_<X>_REPORT.md` (goal/result, per-commit detail, gates
-table, file diffs, untouched debt). Untracked scratch (`out/tooling-ab/*`,
+One logical change per commit; run `tools/check-all.sh` before each lands and
+put what you ran in the message. Untracked scratch (`out/tooling-ab/sweep/`,
 proof PNGs) is fine to regenerate; tracked artifacts change only on purpose.
+
+The `out/STAGE_<X>_REPORT.md` convention is **retired** — see root `AGENTS.md`
+§ "Where work lands". Do not open a new letter. Multi-part work still deserves a
+written note in `out/`; it just does not need that template.
 
 ## Read next
 
-`out/` stage reports (A→J) are the design history — read the latest two
-before non-trivial work. Module headers in `src/*.rs` carry the real
-contracts (cull/LOD, pick, FFI wire format, CLI op-stream ordering).
+Module headers in `src/*.rs` carry the real contracts (cull/LOD, pick, FFI wire
+format, CLI op-stream ordering) — they are the most reliable documentation in
+this crate, because they sit next to the code they describe.
+
+`out/` reports are design **history**, not current state; read one to learn why
+a decision was made. For the layout seam and what comes next, `engine/BACKEND-PLAN.md`;
+for the reference port's stage record, `engine/PORT-PLAN.md`.
