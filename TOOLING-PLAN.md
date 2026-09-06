@@ -139,13 +139,41 @@ verified by a knowingly-false mutation, which it correctly refused
 `engine-suites`, `pick-oracle`, `pixel-ab`, `products-current`, `reference-port`,
 `repo-verify`. Extending that list is the remaining work, cheapest first.
 
-Two things learned in the writing, worth keeping. The Rust half of this is not
-bespoke — `cargo-mutants` is an existing tool covering `native/src/**` and the 85
-tests, and adopting it is a separate, evaluable decision that blocks nothing
-(it is not installed; a release-built crate may make it slow). What has no
-off-the-shelf equivalent is the artifact-level half — and that is where every
-finding of 2026-09-06 came from: the `ls`-derived count, the inert `needs`, the
-unfailable test threshold. `cargo-mutants` would have caught none of them.
+**`cargo-mutants`: evaluated, verdict is "occasional, scoped, never in the
+battery".** [measured 2026-09-06] 875 mutants executed, 383 survivors, **one**
+real defect. The reason the ratio is that bad is the finding worth keeping: the
+tool runs ONLY `cargo test`, and cargo test is not this repo's main verification
+surface. `diff_full_fold` / `diff_scan` / `diff_bake` are `pub fn`s driven by the
+BINARY from `tools/check-fixture-parity.sh`; no `#[test]` calls them, so the
+whole 1.87M-lane corpus is invisible to it. Proven rather than argued:
+`Slots::advance -> 0.0` in `fold.rs` is missed by all 85 tests and reddens
+reference-port on 17/17 fixtures. Most survivors are covered code seen through
+the wrong lens.
+
+It also cannot work in its default mode here — the cargo root is `native/`, so
+copy-to-scratch loses `../engine`, `../assets` and `../.pixi`; `--in-place` is
+required, which mutates the working tree that `check-all` reads, and a killed run
+leaves the mutation behind (observed three times). Full crate ≈ 9.3 h serial;
+scoped to `main.rs` / `layout.rs` / `gpu.rs` ≈ 45 min. Config and the full
+rationale live in `native/.cargo/mutants.toml`. The `--in-diff` mode needs
+`--relative` or it silently reports "No mutants to filter" — a green for the
+wrong reason.
+
+**It earned its keep once, and that was worth the whole evaluation.** Seven
+mutations of the hex colour decoder in `parse_verb` survived the entire
+twelve-gate battery, because `verb_defaults_and_forms` asserted two channels of
+one badly-chosen colour: `ff0080`, whose red is `0xFF` (surviving `& -> |`),
+whose green is `0x00` (surviving `>> -> <<`), and whose blue was never read.
+Fixed; the test now asserts all three channels of `0x123456` and exercises the
+explicit-colour arity path, and all four reported mutations are caught
+[measured].
+
+What has no off-the-shelf equivalent is the artifact-level half — and that is
+where every other finding of 2026-09-06 came from: the `ls`-derived count, the
+inert `needs`, the unfailable test threshold. `cargo-mutants` would have caught
+none of those, and `glyph mutate` cannot see what it saw. The two tools are
+disjoint, which is the argument for having both and for keeping each out of the
+other's way.
 
 *Worth doing whether or not the rest happens, and the acceptance criterion for
 every step that follows.*

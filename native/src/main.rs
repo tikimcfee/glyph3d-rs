@@ -1293,9 +1293,31 @@ mod cli_tests {
             parse_verb("move-group 1 2 3").unwrap(),
             Verb::MoveGroup(v) if v == [1.0, 2.0, 3.0]
         ));
+        // Every channel is asserted, and the literal is chosen so that no
+        // channel can be right by accident. `ff0080` could not do this job:
+        // 0xFF survives `& -> |`, 0x00 survives `>> -> <<`, and blue was never
+        // checked at all — seven distinct mutations of the hex decoder hid
+        // behind one badly-chosen colour, all of them invisible to the full
+        // twelve-gate battery. 0x12/0x34/0x56 are distinct, and none is 0 or
+        // 255, so a wrong mask, a wrong shift or a wrong divisor all move a
+        // value this test reads.
+        let Verb::TintGroup(v) = parse_verb("tint-group 123456").unwrap() else {
+            panic!("tint-group did not parse to TintGroup");
+        };
+        assert!((v[0] - 18.0 / 255.0).abs() < 1e-6, "red channel: {v:?}");
+        assert!((v[1] - 52.0 / 255.0).abs() < 1e-6, "green channel: {v:?}");
+        assert!((v[2] - 86.0 / 255.0).abs() < 1e-6, "blue channel: {v:?}");
+
+        // The explicit-colour form, which is what makes the `t.len() > 1`
+        // arity checks falsifiable: with only the bare verb tested, `>` and `<`
+        // both fall through to the default and the check is unobservable.
         assert!(matches!(
-            parse_verb("tint-group ff0080").unwrap(),
-            Verb::TintGroup(v) if (v[0] - 1.0).abs() < 1e-6 && v[1] == 0.0
+            parse_verb("recolor-glyph aabbcc").unwrap(),
+            Verb::RecolorGlyph([0xAA, 0xBB, 0xCC])
+        ));
+        assert!(matches!(
+            parse_verb("recolor-line 0a141e").unwrap(),
+            Verb::RecolorLine([0x0A, 0x14, 0x1E])
         ));
         assert!(matches!(parse_verb("show-group").unwrap(), Verb::SetHidden(false)));
         assert!(matches!(parse_verb("toggle-hidden").unwrap(), Verb::ToggleHidden));

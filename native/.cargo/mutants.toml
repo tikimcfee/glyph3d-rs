@@ -1,0 +1,53 @@
+# cargo-mutants config. ADVISORY ONLY — not a gate, not in check-all.sh, and
+# the tool is not installed by default. Everything here is measured, 2026-09-06.
+#
+# HOW TO RUN IT, and the two ways it bites:
+#
+#   The default copy-to-scratch strategy CANNOT work here. The cargo root is
+#   native/, so cargo-mutants copies only native/ — and build.rs asserts
+#   ../.pixi/envs/default/lib exists, while fixture.rs, bake.rs, atlas.rs and
+#   main.rs all reach ../engine and ../assets through CARGO_MANIFEST_DIR. All of
+#   that escapes the copy. Always --in-place. (A root workspace Cargo.toml would
+#   fix the copy root and relocate native/target, which eight paths depend on —
+#   do not.)
+#
+#   --in-place mutates the WORKING TREE, and check-all reads the working tree,
+#   not HEAD. A killed run leaves the mutation behind: measured three times,
+#   including a live edit inside the UTF-8 decoder. Run it in a throwaway
+#   worktree, and check `git status` afterwards. The marker is greppable:
+#   "~ changed by cargo-mutants ~". Pass -o /tmp/... too, or mutants.out/ lands
+#   in native/ untracked, and this repo has twice had `git add -A` commit things
+#   nobody intended.
+#
+# WHY THE EXCLUSIONS — the finding that decides how much this tool is worth:
+#
+#   cargo-mutants runs ONLY `cargo test`, and cargo test is not this repo's main
+#   verification surface. diff_full_fold / diff_scan / diff_bake are pub fns
+#   driven by the BINARY from tools/check-fixture-parity.sh; no #[test] calls
+#   them. So the whole 1.87M-lane bit-exact corpus is invisible to it.
+#
+#   Measured: `Slots::advance -> 0.0` in fold.rs is missed by all 85 tests and
+#   reddens reference-port on 17/17 fixtures. Same for `/ -> %` in bake.rs's
+#   prefix_at: cargo test green, --fixture-bake red with 42 disagreements.
+#   Survivors in the files below are COVERED CODE SEEN THROUGH THE WRONG LENS,
+#   not test gaps. Excluding them takes the run from ~3350 mutants (~9.3 h,
+#   serial, unparallelisable under --in-place) to ~270 (~45 min) and leaves a
+#   survivor list small enough to triage by hand.
+exclude_globs = [
+  # Covered by the reference-port / repo-verify gates, which cargo test never runs.
+  "src/fold.rs", "src/scan.rs", "src/bake.rs", "src/fixture.rs", "src/text.rs",
+  "src/glyph_trie.rs", "src/engine.rs", "src/layout_mojo.rs",
+  # Zero #[test] in these; only the four-view pixel A/B sees them.
+  # Measured 100% survival — pure noise.
+  "src/glyph_scene.rs", "src/windowed.rs", "src/offscreen.rs",
+  "src/scene.rs", "src/repo.rs", "src/atlas.rs",
+]
+
+# What is LEFT is the narrow slice where cargo test genuinely is the last line
+# of defence: CLI parsing, the layout seam's host-side helpers, encase layouts.
+# It earned its keep there once — seven mutations of the hex colour decoder in
+# parse_verb survived the entire twelve-gate battery because one test asserted
+# two channels of one badly-chosen colour. Fixed 2026-09-06; the test now reads
+# all three channels of 0x123456 and exercises the explicit-colour arity path.
+#
+# Do not grow this list back without re-measuring the survivor ratio.
