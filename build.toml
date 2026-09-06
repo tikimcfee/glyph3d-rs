@@ -216,3 +216,59 @@ cmd = "tools/check-fixture-parity.sh"
 needs = ["renderer", "fixtures"]
 compare = "six halves vs the JS oracle's recorded answers: parse parity, trie, fold, scan, bake, text.rs domain"
 blind_to = "a fault shared by both loaders in parse parity; any fixture outside text.rs's domain, silently"
+
+# ── Declared mutations ───────────────────────────────────────────────────
+# `glyph mutate` applies each of these, requires the named gate to go red
+# with the named text, and restores byte-exact. A gate with no mutation is
+# reported as uncovered — an unproven claim, not a passing one.
+#
+# ops: append (bytes onto the file) - replace (find -> with, first match) -
+#      remove (move the file aside). The original bytes are snapshotted and
+#      written back regardless of op, so restore is uniform and checkable.
+
+[[mutation]]
+name = "corpus-shrink"
+gate = "committed-artifacts"
+why = "a generator case list losing an entry must not lower coverage silently"
+file = "engine/fixtures/gen.mjs"
+op = "replace"
+expect = "declares 17"
+with = ""
+find = '''
+    {
+        name: 'wrap-emoji',
+        bytes: utf8('a🚀b🌍cdef\nxy✨z✨✨\n🎉🎉🎉🎉'),
+        items: [{ origin: { x: 0, y: 0, z: 0 }, wrapWidth: 3, zStep: 0.4, lineHeight: 1.2 }],
+    },
+'''
+
+[[mutation]]
+name = "committed-fixture-byte"
+gate = "committed-artifacts"
+why = "a committed fixture edited in place must not survive a scratch rebuild"
+file = "engine/fixtures/ascii-basic.pipe.bin"
+op = "append"
+arg = " "
+expect = "differs from the committed fixture"
+
+[[mutation]]
+name = "vendored-file-edit"
+gate = "vendor-hashes"
+why = "a vendored oracle input edited in place must break its recorded hash"
+file = "engine/fixtures/inputs/foldGeometry.js"
+op = "append"
+arg = "//m"
+expect = "foldGeometry.js"
+
+[[mutation]]
+name = "tests-silently-ignored"
+gate = "cargo-test"
+why = "tests that stop RUNNING must not read as coverage; #[ignore] is silent to rustc"
+file = "native/src/glyph_trie.rs"
+op = "replace"
+find = '''    #[test]
+'''
+with = '''    #[test]
+    #[ignore]
+'''
+expect = "Coverage DROPPED"

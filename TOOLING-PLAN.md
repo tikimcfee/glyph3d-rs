@@ -131,6 +131,22 @@ instruments it runs. `mypy --strict` gets types; it does not get that.
 
 ### Step 1 — make catching power machine-checkable
 
+**STARTED 2026-09-06.** `glyph mutate` ships with four declared mutations, all
+reddening their gates for their stated reasons [measured]; the harness itself was
+verified by a knowingly-false mutation, which it correctly refused
+(`gate stayed GREEN under the mutation`, exit 1). Coverage today: **12 gates,
+3 with mutations, 9 uncovered** — `cargo-build`, `cargo-clippy`, `engine-check`,
+`engine-suites`, `pick-oracle`, `pixel-ab`, `products-current`, `reference-port`,
+`repo-verify`. Extending that list is the remaining work, cheapest first.
+
+Two things learned in the writing, worth keeping. The Rust half of this is not
+bespoke — `cargo-mutants` is an existing tool covering `native/src/**` and the 85
+tests, and adopting it is a separate, evaluable decision that blocks nothing
+(it is not installed; a release-built crate may make it slow). What has no
+off-the-shelf equivalent is the artifact-level half — and that is where every
+finding of 2026-09-06 came from: the `ls`-derived count, the inert `needs`, the
+unfailable test threshold. `cargo-mutants` would have caught none of them.
+
 *Worth doing whether or not the rest happens, and the acceptance criterion for
 every step that follows.*
 

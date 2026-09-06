@@ -270,7 +270,12 @@ and the union is not:
 ### Earning a green
 
 A pass is a claim about a counterfactual, so test the counterfactual: break what
-a check watches and confirm it reddens. Three times this repo shipped a check
+a check watches and confirm it reddens. Some of that is now mechanical —
+`python3 tools/glyph.py mutate` applies each mutation declared in `build.toml`,
+requires the named gate to go red for the named reason, and restores byte-exact.
+It reports COVERAGE rather than a pass count, so a gate nobody has proven is
+listed as uncovered instead of being counted as working. Four gates are covered
+today; nine are not. Three times this repo shipped a check
 that could not fail — a gate asserting on float noise, a ceiling constant no test
 protected, and a fixture checksum comparing bytes guaranteed identical before the
 command ran. Every one was caught by execution; not one by inspection.

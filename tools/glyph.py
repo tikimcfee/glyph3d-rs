@@ -27,6 +27,8 @@ Counts are declared in build.toml, never derived from the tree under test.
 from __future__ import annotations
 
 import argparse
+import contextlib
+import io
 import hashlib
 import json
 import os
@@ -451,6 +453,128 @@ def run_gate(spec: dict, m: dict) -> tuple[bool, bool]:
     return False, False
 
 
+# ── mutation coverage ────────────────────────────────────────────────────
+# A gate's value is what it REJECTS; its green only repeats what you already
+# assumed. These declared mutations make that an assertion instead of an
+# anecdote: apply a named defect, require the named gate to go red for the
+# named reason, restore, and prove the tree came back.
+#
+# Every guard below exists because its absence cost this repo real time:
+#   green first     — a red on an already-red tree proves nothing
+#   assert applied  — "I broke it and nothing failed" and "I failed to break
+#                     it" print identically; a failed edit is silent
+#   right gate/text — a mutation reddening some OTHER gate is not evidence
+#   restore proven  — byte-compare the snapshot back; never `git checkout` a
+#                     directory, which once reverted generators alongside
+#                     fixtures and ate a live edit
+#
+# Reported as COVERAGE, not as a pass count: "N gates, C covered, U uncovered"
+# — because "9 mutations passed" describes the size of what you ran instead of
+# the size of what exists, which is the mistake the old ls-derived fixture
+# count made.
+
+
+def apply_mutation(mu: dict) -> bytes:
+    """Apply, returning the original bytes. Raises if the edit did not land."""
+    f = ROOT / mu["file"]
+    before = f.read_bytes()
+    op = mu["op"]
+    if op == "append":
+        f.write_bytes(before + mu["arg"].encode())
+    elif op == "replace":
+        text = before.decode()
+        if mu["find"] not in text:
+            raise RuntimeError(f"find-text absent from {mu['file']}; mutation cannot land")
+        f.write_bytes(text.replace(mu["find"], mu.get("with", ""), 1).encode())
+    elif op == "remove":
+        f.rename(f.with_suffix(f.suffix + ".mutaside"))
+    else:
+        raise RuntimeError(f"unknown mutation op {op}")
+    after = f.read_bytes() if f.exists() else b""
+    if after == before:
+        raise RuntimeError(f"mutation {mu['name']} did not change {mu['file']}")
+    return before
+
+
+def restore_mutation(mu: dict, before: bytes) -> bool:
+    f = ROOT / mu["file"]
+    aside = f.with_suffix(f.suffix + ".mutaside")
+    if aside.exists():
+        aside.rename(f)
+    else:
+        f.write_bytes(before)
+    return f.read_bytes() == before
+
+
+def cmd_mutate(args) -> int:
+    m = load_manifest()
+    gates = {g["name"]: g for g in m["gate"]}
+    muts = [mu for mu in m.get("mutation", []) if not args.gate or mu["gate"] == args.gate]
+    covered = {mu["gate"] for mu in m.get("mutation", [])}
+    uncovered = [n for n in gates if n not in covered]
+
+    fail = False
+    for mu in muts:
+        spec = gates.get(mu["gate"])
+        if spec is None:
+            print(f"FAIL  {mu['name']} names gate {mu['gate']}, which does not exist")
+            fail = True
+            continue
+        step(f"mutation: {mu['name']} → {mu['gate']}")
+
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            pre_ok, _ = run_gate(spec, m)
+        if not pre_ok:
+            print(f"FAIL  {mu['name']} — gate {mu['gate']} was ALREADY RED before mutating;")
+            print("      a red here would prove nothing. Fix the tree first.")
+            fail = True
+            continue
+
+        try:
+            before = apply_mutation(mu)
+        except RuntimeError as e:
+            print(f"FAIL  {mu['name']} — {e}")
+            fail = True
+            continue
+
+        try:
+            if mu.get("rebuild"):
+                run(mu["rebuild"])
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                post_ok, _ = run_gate(spec, m)
+            out = buf.getvalue()
+        finally:
+            restored = restore_mutation(mu, before)
+            if mu.get("rebuild"):
+                run(mu["rebuild"])
+
+        if post_ok:
+            print(f"FAIL  {mu['name']} — gate {mu['gate']} stayed GREEN under the mutation.")
+            print(f"      It does not catch what it claims: {mu.get('why', '')}")
+            fail = True
+        elif mu["expect"] not in out:
+            print(f"FAIL  {mu['name']} — {mu['gate']} went red, but for an unstated reason.")
+            print(f"      expected text containing: {mu['expect']!r}")
+            print(f"      got: {out.strip().splitlines()[-1] if out.strip() else '(no output)'}")
+            fail = True
+        else:
+            print(f"PASS  {mu['gate']} reddens on {mu['name']} — {mu['expect']!r}")
+        if not restored:
+            print(f"FAIL  {mu['name']} — {mu['file']} did NOT restore byte-exact")
+            fail = True
+
+    print()
+    print(f"COVERAGE  {len(gates)} gates, {len(covered)} with mutations, {len(uncovered)} uncovered")
+    if uncovered:
+        print(f"          uncovered: {', '.join(sorted(uncovered))}")
+        print("          an uncovered gate is an unproven claim, not a passing one.")
+    print()
+    print("MUTATE: FAILURES — see above" if fail else "MUTATE: every declared mutation reddened its gate")
+    return 1 if fail else 0
+
+
 def cmd_check(args) -> int:
     m = load_manifest()
     fail = False
@@ -546,13 +670,15 @@ def main() -> int:
     p.add_argument("name")
     sub.add_parser("gates", help="list gates: what each compares and cannot see")
     sub.add_parser("graph", help="print the artifact dependency graph")
+    p = sub.add_parser("mutate", help="prove each gate rejects what it claims to")
+    p.add_argument("--gate", help="only mutations targeting this gate")
     p = sub.add_parser("suites", help="engine conformance suites")
     p.add_argument("mode", nargs="?", choices=["cpu", "gpu", "all", "bench"], default="all")
     args = ap.parse_args()
     os.chdir(ROOT)
     return {
         "build": cmd_build, "verify": cmd_verify, "check": cmd_check,
-        "gate": cmd_gate, "gates": cmd_gates, "graph": cmd_graph,
+        "gate": cmd_gate, "gates": cmd_gates, "graph": cmd_graph, "mutate": cmd_mutate,
         "suites": cmd_suites,
     }[args.cmd](args)
 
