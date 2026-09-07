@@ -1,4 +1,21 @@
-# Brief: build the build system
+# Brief: build the build system — **EXECUTED, and this is the record of the ask**
+
+> **DO NOT READ THIS AS CURRENT STATE.** This brief was written on 2026-09-05 to
+> hand a fresh agent the job of building a build system, and that job is done:
+> `build.toml` declares the artifact graph, `cargo glyph` is the one ingress,
+> and `tools/check-all.sh` is an 18-line shim onto it. Everything below is
+> preserved as the ASK and the reasoning behind it, frozen at its date.
+>
+> Consequently, several statements here are now false — deliberately left rather
+> than patched, because a brief that is half-updated is more dangerous than one
+> that is plainly historical. Known-stale as of 2026-09-07: there IS a root
+> workspace (`Cargo.toml`, `members = ["native", "glyph"]`); `check-all.sh` is a
+> shim with no `N/9` headings; gates are named, not numbered; `ffi_selftest` is
+> wired and running; the "still to do" items 4 and 5 are done; the test-binary
+> count has grown; and the PROVENANCE fixture-count bug it cites was fixed.
+>
+> **For current state read `AGENTS.md`, and run `cargo glyph gates`.** That is
+> the one canonical home; this file is not a second one.
 
 For an agent with no prior context on this repo. Everything needed is here or
 cited by path. Claims are marked **[measured]** (someone ran it) or
@@ -215,7 +232,7 @@ and a pin that depends on someone remembering to maintain it will not be
 maintained — make it tell you [measured 2026-09-06: the old form printed PASS and
 the new one printed FAIL on the same tree, with three tests marked `#[ignore]`].
 
-`tools/check-all.sh` must end `CHECK-ALL: ALL GATES GREEN`, including the four
+`tools/check-all.sh` must end `CHECK-ALL: ALL GATES GREEN`, including the
 byte-equal screenshots, before and after your change.
 
 ## Vocabulary you will meet, and which parts are dead

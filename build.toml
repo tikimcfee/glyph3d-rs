@@ -182,6 +182,15 @@ compare = "clippy warning count vs zero"
 blind_to = "anything silenced with #[allow(...)]"
 
 [[gate]]
+name = "cargo-doc"
+scope = "rust"
+kind = "cargo"
+cmd = "doc"
+needs = []
+compare = "rustdoc warning count vs zero — intra-doc links resolve, HTML in prose is closed"
+blind_to = "whether the prose is TRUE; it checks that every symbol a doc comment names still exists, not that the sentence around it is current"
+
+[[gate]]
 name = "cargo-test"
 scope = "rust"
 kind = "cargo-test"
@@ -217,8 +226,8 @@ name = "pixel-ab"
 scope = "render"
 kind = "golden-verify"
 needs = ["renderer", "pixel-baselines"]
-compare = "four views re-rendered vs out/tooling-ab/baseline, byte-equal"
-blind_to = "everything outside the four frames; regression vs intentional change (re-baselining is a human act)"
+compare = "every declared golden_view re-rendered vs out/tooling-ab/baseline, byte-equal"
+blind_to = "everything outside the declared frames; regression vs intentional change (re-baselining is a human act)"
 
 [[gate]]
 name = "repo-verify"
@@ -384,6 +393,17 @@ with = """pub(crate) fn wrap_segment_of(col: i64, wrap: i64, terminator: bool) -
 expect = "cargo-build — 1 warnings"
 
 [[mutation]]
+name = "dead-doc-link"
+gate = "cargo-doc"
+why = "the defect this gate exists for, reproduced: a doc comment naming a symbol that no longer exists. It happened for real — `Engine::records` was renamed to `read_back` on 2026-09-07 and two links kept pointing at the old name through a full green battery, because nothing ran rustdoc. Distinct from every other Rust gate: build and clippy compile the CODE and never read the prose"
+file = "native/src/layout.rs"
+op = "replace"
+find = "/// A layout backend. Bytes and params in, instances into the arena, placements"
+with = "/// A layout backend, see [`GlyphArena::no_such_method`]. Bytes and params in, instances into the arena, placements"
+expect = "FAIL  cargo-doc"
+rebuild = "cargo build --release"
+
+[[mutation]]
 name = "clippy-lint"
 gate = "cargo-clippy"
 why = "same, for clippy: the gate counts lints itself and a counting bug would read as a clean tree"
@@ -418,7 +438,7 @@ rebuild = "cargo build --release"
 [[mutation]]
 name = "coverage-scale"
 gate = "pixel-ab"
-why = "the four baselines are the ONLY pixel check; a shader constant that changes glyph antialiasing must move them. Chosen because it is purely visual — it does not touch the fold, the corpus or CPU-side picking, so a red here is attributable to this gate and no other"
+why = "the golden views are the ONLY pixel check; a shader constant that changes glyph antialiasing must move them. Chosen because it is purely visual — it does not touch the fold, the corpus or CPU-side picking, so a red here is attributable to this gate and no other"
 file = "native/src/shaders/glyph_field.wgsl"
 op = "replace"
 find = "let cov = clamp(coverage * 0.5, 0.0, 1.0);"

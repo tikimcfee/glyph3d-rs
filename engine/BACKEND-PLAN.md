@@ -3,7 +3,7 @@
 One engine that computes the per-glyph data a renderer needs, for two targets,
 using the GPU when the machine has one and the CPU when it doesn't.
 
-Evidence for everything below is in `engine/delta/` (five subsystem reports plus
+Evidence for everything below is in `engine/delta/` (the subsystem reports plus
 a cross-review). This file is the plan; that directory is why.
 
 ## The shape
@@ -45,13 +45,13 @@ all cores, off any frame budget.
 
 ## A note on "Stage N", which this file no longer has
 
-`native/src/layout.rs` and `native/AGENTS.md` refer to "Stage 0 / 1 / 3 of
-`engine/BACKEND-PLAN.md`". Those stages were REMOVED from this file in `b6827fb`
-when it was rewritten as the plan rather than a record of how it changed. The
-hazard is not a dead pointer — it is that the numbered list below is a DIFFERENT
-list, so a reader lands on it and matches up. They do not correspond: old stage 1
-was the Rust backend; item 1 below is the phantom row. Read those references as
-naming the layout seam and the device-resident path by description, not by number.
+Stages were REMOVED in `b6827fb`, when this became the plan rather than a record
+of how it changed. The numbered list below is a DIFFERENT list and does not
+correspond: old stage 1 was the Rust backend, item 1 below is the phantom row.
+So if you meet a "Stage N of BACKEND-PLAN" anywhere — in an old commit message,
+a delta report, a branch — read it as naming a thing by description, not by
+number. The call sites that used to do this in `native/src/layout.rs` and
+`native/AGENTS.md` were fixed; this note stays for the archive, not for them.
 
 ## Ordering — what blocks what
 
@@ -85,8 +85,13 @@ detail.
    lines of per-item arithmetic, and the hop exists to mirror the CPU driver
    for conformance rather than out of necessity. It is a one-kernel map away
    from not existing. Measure around it; do not enshrine it.
-2. **The readback (item 3) — DONE ON THE CPU 2026-09-07, 3.6x on backend.**
-   `Strategy::Direct` removed all three copies at once; details under item 3.
+2. **The readback (item 3) — DONE ON THE CPU 2026-09-07.**
+   `Strategy::Direct` removed all three copies at once. The speedup is stated
+   once, with its date and corpus, under item 3 — not here, because this line
+   was written when the number was 3.6x, the parallel write then made it 5.2x,
+   and the pointer hoist moved it again on the same day. A figure repeated in
+   two places is a figure that will disagree with itself.
+
    The device version is now a smaller step than it was, because the host no
    longer has a detour to remove — only an arena to relocate.
 
@@ -174,26 +179,50 @@ The engine now writes 48 B render instances straight into the caller's arena
 both extents in ONE pass. No wire record is materialized on either side of the
 FFI. `--repo-engine direct`.
 
-**47.1 MB corpus, M2, three samples each: backend ~1.99 s -> ~0.39 s (5.2x);
-whole load 3.133 s -> 0.915 s (3.4x).** The three lanes that were 87% of backend
+**47.1 MB corpus, M2, three isolated samples each, 2026-09-07 as of the pointer
+hoist (`89348fe`): backend ~1.99 s -> 0.301 s (6.6x); whole load 3.133 s ->
+0.837 s (3.7x).** The intermediate figures on the way — 3.6x for the serial
+writer, 5.2x once the write was grained — are in those commits, and are what
+each measured at the time. The three lanes that were 87% of backend
 are gone — `eg_compact`, `read_back` and `compact_records_into` do not run at
 all, and the report prints `n/a` for them rather than `0.000s`, because a zero
 reads exactly like a stage that ran and was fast.
 
 The write itself is **grained and parallel** — count, prefix, scatter, over
-`BOUNDS_GRAIN` ranges rather than items. `eg_direct` 0.505 s -> 0.193 s. Two
-findings from getting there, both measured:
+`BOUNDS_GRAIN` ranges rather than items — and its lane pointers are hoisted out
+of the per-byte loop. `eg_direct` 0.505 s serial -> 0.193 s grained -> 0.112 s
+hoisted, the last with a 1 ms spread. It now runs at 38.7 GB/s against 39.8 for
+a hand-written C kernel of the same traffic shape on the same threads, so it is
+at the memory system's rate rather than its own.
+
+`parallelism_level()` is **4** on an 8-core M2 — the runtime takes the
+performance cores only and no environment knob in the pinned build changes that,
+so price ceilings against 4, not 8. `BOUNDS_GRAIN` is not a lever: flat from
+1 K to 2 M, the only bad point being fewer grains than workers.
+
+Findings from getting there, all measured:
 
 - **Grains, not items.** Item-level decomposition is size-blind and cannot
-  parallelize a single large file at all. On one 8 MB file, `eg_direct` is
-  0.029 s stable against the record path's 0.191 s — **6.6x**, and that case is
-  the one `fold_profile` had already flagged as a ceiling.
+  parallelize a single large file at all, which `fold_profile` had already
+  flagged as a ceiling. Note the denominators: the 6.6x quoted for one 8 MB file
+  is direct-against-the-RECORD-PATH, while 2.6x on the repo corpus was
+  direct-against-direct-SERIAL. Comparing those two produced a "many-item
+  scaling problem" that does not exist — per source byte the pass costs 2.56 ns
+  at 1 item, 2.60 at 2,172 and 2.33 at 47,000.
+- **The pass was indirection-bound, not bandwidth-bound.** `r.fl[id]` is a List
+  indexing that reloads the data pointer, in a loop running once per source
+  byte. Hoisting five pointers out of it was worth 1.74x and is the whole of
+  `89348fe`.
 - **A struct holding Lists in the parallel region cost more than the
   parallelism was worth.** The first grained form measured 0.659 s against the
   serial 0.505 s — SLOWER. Per-grain heap allocation was the whole difference;
   flat `Float32` scratch fixed it. The bounds pass had already learned this and
   said so in a comment; it still had to be rediscovered by measurement, which is
   the argument for measuring rather than reasoning.
+- **Measured and NOT done, so they are not retried:** hoisting the ink extents
+  out of `DirectPlacement`'s Lists buys nothing (inside the spread — those stay
+  in L1 while the lane arrays stream); pre-faulting the arena costs 46 ms to
+  save 10.
 
 **It is gated, not asserted.** `repo-verify-direct` diffs it against the batched
 record path bit-exact on placements and instances, both wrap modes, under TWO
@@ -210,6 +239,28 @@ than returning an empty Vec a gate could read as "nothing differed". The record
 tier stays covered by `repo-verify` and `engine-check` on the other strategies —
 the same relationship `witness` already has with the elided fold: a verification
 form and a production form, with something adjudicating them.
+
+**THE NEXT TARGET IS MEMORY, NOT TIME**, and this is what the perf work
+concluded rather than what it set out to find. Measured 2026-09-07: peak RSS is
+**~95 bytes of RAM per source byte** — lane arrays 40 (fl 4, gi 4, sm 8, lm 16,
+lc 8), arena reserve 48, paint 4, blob 1.
+
+| corpus | peak RSS | B/source byte | the write |
+|---|---|---|---|
+| 8.0 MB | 0.766 GB | 95.7 | 19.6 ms |
+| 47.0 MB | 4.450 GB | 94.7 | 133.9 ms |
+| 97.0 MB | 4.901 GB (capped) | — | **1653 ms** |
+
+At 97 MB demand is ~9.2 GB against a 4.9 GB cap and the write goes **6x
+superlinear**. That is also the variance: CPU co-tenancy costs at most 1.8x,
+while 9 GB held resident costs 2.5-3.1x — precisely the 0.193-to-0.55 s spread
+seen earlier the same day and wrongly blamed on scheduling.
+
+**43% of that peak is the fold's lane arrays, and they are dead the instant the
+write has read them.** A chunked fold-then-write over item groups would cap lane
+memory at the chunk rather than the corpus and roughly halve peak RSS.
+`run_streaming` in `glyph_record.mojo` already prototypes the shape for the
+record path. The loop is worth 1.7x; the cliff is worth 6x.
 
 **Still open here:** the default is still `naive` (per-item). Making `direct`
 the default is a behaviour change and a re-baseline decision, not a refactor.
@@ -236,11 +287,12 @@ the whole. Six corpora, both FFI strategies, `--repo-scan-only`, M2:
 | 61.9 MB | batched | 2.806 s | 39% | 19% | 41% |
 | 1.40 GB | per-item | 84.35 s | 59% | 9% | 32% |
 
-**The readback is 9-22% of backend time. It is not the bottleneck; the fold
-is.** That is the "oopsie" Ivan named on 2026-09-04 — deciding the seam's shape
-against a cost that turns out to be another version of the CPU bottleneck —
-arriving exactly where he predicted it would, which is why the measurement went
-first.
+**The readback is 9-22% of backend time. It is not the bottleneck.** The
+conclusion drawn here on the day — "the fold is" — was WRONG and is corrected
+under item 4: that lane was the whole FFI call, and the fold stage inside it is
+3-13%. The correction is left visible rather than edited away, because the shape
+of the mistake is the reusable part: a name over an aggregate, read as its
+largest hoped-for component.
 
 Read it carefully, though, because it does not say the item is wrong:
 
@@ -248,10 +300,11 @@ Read it carefully, though, because it does not say the item is wrong:
   96,860,762 records x 32 B = 3.10 GB is arithmetic and correct; the 1.40 GB
   corpus moves 44.39 GB. RSS is what OOMs a device, and no ratio above touches
   that.
-- **The ordering matters more than the totals.** The fold's 58-77% is the CPU
-  fold. Move the fold to the device and the remaining costs become the whole of
-  what is left — so the readback is not the bottleneck TODAY and becomes it the
-  moment item 4 succeeds. Measuring in the other order would have hidden this.
+- **The ordering matters more than the totals.** Whatever share the fold holds,
+  it is the CPU fold; move it to the device and the transport becomes the whole
+  of what is left. So the readback was not the bottleneck at the time of this
+  table and becomes one the moment item 4 succeeds. Measuring in the other order
+  would have hidden that.
 - **Compaction is the larger of the two host costs**, 14-41% against the
   readback's 9-22%, and the two are not independent: device-side compaction
   deletes both, because nothing is left to read back.

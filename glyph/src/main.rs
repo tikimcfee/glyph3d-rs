@@ -417,6 +417,12 @@ fn gate_cargo(g: &Gate) -> bool {
     let cmd = match g.cmd.as_deref() {
         Some("build") => "cargo build --release",
         Some("clippy") => "cargo clippy --release",
+        // Doc links are the one rename hazard nothing else in this battery can
+        // see: `[`Engine::records`]` kept pointing at a method that had been
+        // renamed to `read_back`, through a full green run, because rustdoc is
+        // never invoked. Found by an audit 2026-09-07, not by a check.
+        // `--no-deps` keeps it to this crate's own prose.
+        Some("doc") => "cargo doc -p glyph3d-native --no-deps",
         other => {
             println!("FAIL  {} has unknown cargo cmd {other:?}", g.name);
             return false;

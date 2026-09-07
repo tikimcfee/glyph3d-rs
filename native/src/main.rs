@@ -20,7 +20,7 @@
 //!          with an empty UI; `--no-ui` gives exact pre-K windowed behavior).
 //!
 //! Run modes:
-//!   (default) [--render-file <path>] [--copies N]
+//!   (default) `[--render-file <path>] [--copies N]`
 //!                                    windowed: text field, orbiting camera, FPS log.
 //!   --demo                           windowed: Stage A quad-field demo.
 //!   --screenshot <path.png> [--frames N] [--zoom F] [--render-file P] [--copies N] [--demo]
@@ -216,7 +216,7 @@ pub fn build_scene(
 /// Stage K (K3): windowed scene construction. Same scenes as build_scene,
 /// plus a debug-UI probe handle installed on the concrete GlyphScene BEFORE
 /// type erasure — the egui Debug panel's read-back channel (windowed.rs
-/// holds the scene as Box<dyn SceneLike>; fence 4 forbids SceneLike
+/// holds the scene as `Box<dyn SceneLike>`; fence 4 forbids SceneLike
 /// changes). The demo scene has no probe (None).
 pub fn build_scene_probed(
     ctx: &GpuContext,
@@ -385,14 +385,14 @@ struct Cli {
     /// Stage E2: load a whole repository as a field of code pages
     #[arg(long, value_name = "DIR")]
     load_repo: Option<PathBuf>,
-    /// Stage E2: engine path for repo loads (naive measured faster on the
-    /// 97 MB corpus — see out/STAGE_E2_REPORT.md)
     /// Which FFI strategy the Mojo backend uses. `direct` is the one that
     /// writes instances into the arena without materializing a wire record;
     /// the other two go through one and are what `--repo-verify` diffs against.
     #[arg(long, value_name = "MODE", default_value = "naive", value_parser = ["naive", "batch", "direct"])]
     repo_engine: String,
-    /// Stage E2: diff batch vs naive bit-exact over the whole repo
+    /// Diff the chosen strategy against a counterpart, bit-exact over the
+    /// whole repo: placements and instances always, wire records when both
+    /// paths have them (`direct` has none, and the PASS line says so).
     #[arg(long)]
     repo_verify: bool,
     /// How a wrap is spent on a repo load: `down` advances the visual row (the
@@ -494,8 +494,8 @@ fn set_pick_row_col(ops: &mut Vec<Op>, row: Option<u32>, col: Option<u32>) {
 }
 
 /// Parse a `--verb` string into a Verb (clap `value_parser`). Forms:
-///   recolor-glyph [rrggbb]      recolor-line [rrggbb]
-///   nudge-glyph dx dy [dz]      scale-glyph f
+///   recolor-glyph `[rrggbb]`      recolor-line `[rrggbb]`
+///   nudge-glyph dx dy `[dz]`      scale-glyph f
 ///   move-group dx dy dz         scale-group s
 ///   tint-group rrggbb           tint-cycle
 ///   hide-group | show-group | toggle-hidden
@@ -595,7 +595,7 @@ fn build_ops(matches: &clap::ArgMatches, raw: &RawOps) -> Vec<Op> {
     ops
 }
 
-/// Parse argv (including argv[0]) into a Cli, reconstructing the op stream.
+/// Parse argv (including `argv[0]`) into a Cli, reconstructing the op stream.
 fn parse_cli_from(matches: clap::ArgMatches) -> Cli {
     let mut cli = Cli::from_arg_matches(&matches).expect("clap derive round-trip");
     cli.ops = build_ops(&matches, &cli.raw_ops);

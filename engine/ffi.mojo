@@ -3,15 +3,21 @@
 # GOAL: prove the Mojo engine can be linked IN-PROCESS into the Rust+wgpu app.
 # The surface is deliberately scalars + one opaque pointer (ABI-stability
 # discipline): no Mojo types, no exceptions, no ownership transfer of Mojo
-# containers across the boundary. Records are copied OUT into caller memory.
+# containers across the boundary.
+#
+# TWO OUTPUT SHAPES, and which one you get is the entry point you call. The
+# record entries (`load_item`, `load_items`) copy a 32 B wire record per glyph
+# OUT into caller memory; they are the verification form. The direct entry
+# (`load_items_direct`) writes 48 B render instances into an arena the CALLER
+# owns and materializes no record at all — same fold, one pass instead of three.
 #
 # Wire record (32 B per rendered glyph), per schema/glyph-identity.json:
 #   f32 X, Y, Z, ADVANCE, HEIGHT   (20 B — render-read measures)
 #   u32 GLYPH_ID, ROW, COL         (12 B — counts)
 #
 # Portability notes for this toolchain (Mojo 1.1.0.dev2026083005):
-#   - std.runtime.asyncrt went private; the engine copies were patched to
-#     the engine copies moved to max.algorithm.parallelize, the PUBLIC parallel
+#   - std.runtime.asyncrt went private, so the engine copies moved to
+#     max.algorithm.parallelize, the PUBLIC parallel
 #     primitive (tagged MOJO-1.1-PORT). TaskGroup exists only in the private
 #     std.runtime._asyncrt and has no public counterpart.
 #   - std.runtime.initialize_runtime() MUST be called before any parallel

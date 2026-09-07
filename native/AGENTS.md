@@ -60,15 +60,17 @@ a backend or a caller; the short version:
 - A gate that needs the 32 B wire records asks `VerifyLayout`, a SEPARATE
   trait, so no method a caller holds RETURNS a position. That is what would let
   a device-resident backend keep glyphs on the device. **It does NOT mean the
-  readback is gone** — this file claimed that until 2026-09-04 and it was wrong:
-  `MojoLayout::run` calls `engine.read_back()` unconditionally, because
-  host-side `compact_records_into` needs the records. 3.10 GB still crosses the
-  FFI on a 97 MB corpus. The copy dies when compaction moves to the data, not
-  when a trait hides it. Do not widen `LayoutGlyphs` to return records.
-  MEASURED 2026-09-07: that copy is 9-22% of backend time, not the bottleneck
-  — the CPU fold is, at 58-77%. The volume is a memory argument, not a time
-  one. `--repo-scan-only` prints the split; the table is under item 3 of
-  `engine/BACKEND-PLAN.md`.
+  readback is gone** on the strategies that HAVE one — this file claimed
+  otherwise until 2026-09-04 and was wrong, because `VerifyLayout` gates the
+  API, not the copy. Do not widen `LayoutGlyphs` to return records.
+
+  What DID delete the copy is `Strategy::Direct` (2026-09-07): the engine writes
+  instances straight into the caller's arena, and no wire record is materialized
+  on either side of the FFI. The record strategies remain, as the verification
+  form, and `repo-verify-direct` diffs the two against each other. Run
+  `--repo-scan-only --repo-engine direct|batch|naive` for the per-stage split
+  rather than trusting a figure here; measurements and their dates live under
+  items 3 and 4 of `engine/BACKEND-PLAN.md`.
 - `ItemParams::validate` runs in `LayoutGlyphs::layout_items`, a PROVIDED
   method. Implement `layout_validated_items`; a backend cannot forget the
   guard because it never calls it.
@@ -81,12 +83,16 @@ a backend or a caller; the short version:
   compaction. Indexing it by instance is the tempting mistake and
   `layout::tests::paint_is_indexed_by_record_so_blanks_consume_an_entry`
   is what catches it.
-- `--repo-verify` diffs two backends at the seam — placements, instances AND
-  records, all bit-exact (`layout::diff_backends`). It used to compare records
-  only, which cannot see compaction, paint or extents at all. Today it runs
-  the Mojo backend's two FFI strategies against each other; the Rust backend is
-  next to receive the
-  same call at the Rust backend.
+- `--repo-verify` diffs two backends at the seam — placements and instances
+  always, and records when BOTH paths have them (`layout::diff_backends`). It
+  used to compare records only, which cannot see compaction, paint or extents at
+  all. Today it runs the Mojo backend's FFI strategies against each other, in
+  two gates: `repo-verify` pairs the record strategies, `repo-verify-direct`
+  pairs `Direct` against batched and reports `0 records` because the direct path
+  produces none. The Rust backend is next to receive the same call.
+- A verify over ZERO items refuses. Before 2026-09-07 a missing corpus directory
+  printed `PASS: 0 items, 0 instances` and exited 0 — the gate passing having
+  compared nothing.
 
 `fixtures/g-pick-repo/empty.rs` IS ZERO BYTES ON PURPOSE, and it is the only
 input in the tree that reaches the page extent's origin seed. The seed binds

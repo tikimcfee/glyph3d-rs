@@ -1,9 +1,11 @@
 //! Stage E2 — repository-scale loading.
 //!
 //! Walks a repository (source-extension whitelist; VCS/build/dependency dirs
-//! skipped), runs the Mojo engine over every file — either one `load_item`
-//! call per file (naive) or one batched `load_items` call over a concatenated
-//! blob — and stages the records into ONE glyph arena. Each file is a GROUP
+//! skipped), runs the Mojo engine over every file, and fills ONE glyph arena.
+//! HOW it crosses into Mojo is `layout_mojo::Strategy`'s business, not this
+//! file's — the record strategies stage a 32 B wire stream and compact it here,
+//! while `Direct` has the engine write instances into the arena and stages
+//! nothing. `--repo-engine` selects; `--repo-verify` diffs two. Each file is a GROUP
 //! (group_id == file index) placed on a 2D grid of code pages; files are
 //! views {slot_base/count, engine params} into the shared arena — the
 //! web's MegaGlyphField architecture (one arena, files as views).
@@ -795,11 +797,20 @@ impl RepoLoad {
             if s.verified { " (verified bit-exact vs the other strategy)" } else { "" },
         );
         println!(
-            "phases: walk {:.3}s | backend {:.3}s ({:.1} MB/s, compaction included) \
+            "phases: walk {:.3}s | backend {:.3}s ({:.1} MB/s, {}) \
              | stage {:.3}s | layout {:.3}s | total {:.3}s",
             s.walk.as_secs_f64(),
             s.backend.as_secs_f64(),
             mb / s.backend.as_secs_f64().max(1e-9),
+            // Naming what ran, not what usually runs: there is no host
+            // compaction on the direct path, and a fixed parenthetical is the
+            // same "a name that is not what happened" defect the engine line
+            // below was split to fix.
+            if s.strategy.materializes_records() {
+                "compaction included"
+            } else {
+                "instances written in place"
+            },
             s.stage.as_secs_f64(),
             s.layout.as_secs_f64(),
             (s.walk + s.backend + s.stage + s.layout).as_secs_f64(),

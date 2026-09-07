@@ -1,32 +1,35 @@
 //! layout_mojo.rs — the Mojo backend behind the layout seam.
 //!
 //! Adapter, not algorithm: it owns an `Engine` handle (the C ABI wrapper in
-//! `engine.rs`), decides how to hand a corpus to it, and hands the records it
-//! gets back to the seam's one compaction. The fold itself is in Mojo.
+//! `engine.rs`) and decides how to hand a corpus to it. The fold itself is in
+//! Mojo.
 //!
-//! THE BATCH/PER-ITEM CHOICE LIVES HERE, and that is the point of the module.
-//! It used to be a parameter of `load_repo` — `batch: bool` threaded from the
-//! CLI down through the loader — which made an FFI strategy look like a
-//! property of loading a repository. It is not: it is one backend's answer to
-//! "how many times do I cross into Mojo?", invisible above the seam, and the
-//! Rust backend will have no equivalent question. `--repo-verify` still picks
-//! both, because two strategies that must agree bit-for-bit is exactly the
-//! shape `--repo-verify` was built to check — and with the Rust backend the same
-//! machinery diffs Mojo against Rust instead, with nothing new written.
+//! THE STRATEGY CHOICE LIVES HERE, and that is the point of the module. It used
+//! to be a parameter of `load_repo` — `batch: bool` threaded from the CLI down
+//! through the loader — which made an FFI strategy look like a property of
+//! loading a repository. It is not: it is one backend's answer to "how do I
+//! cross into Mojo?", invisible above the seam, and the Rust backend will have
+//! no equivalent question. It stopped being a bool when a third strategy landed;
+//! `Strategy` below is the enumeration and the authority.
 //!
-//! WHAT ITEM 3 OF THE PLAN CHANGES HERE. `layout_validated_items` currently
-//! ends with `engine.read_back()` — the 32 B-per-record readback the seam
-//! exists to delete — followed by a host-side `compact_records_into`. The
-//! device path replaces BOTH with a compaction kernel writing the arena
-//! directly and a bounds kernel filling the extents, and
-//! `layout_validated_items_recording` keeps the readback for the gates that
-//! ask for it. The signatures do not move.
+//! `--repo-verify` picks a counterpart and diffs bit-for-bit, which is the shape
+//! that check was built for — and with the Rust backend the same machinery diffs
+//! Mojo against Rust with nothing new written.
 //!
-//! It replaces both because the measurement says the halves are not worth
-//! separating: 2026-09-07, the readback is 9-22% of backend time and
-//! compaction 14-41%, and killing the copy alone (a borrowing accessor in
-//! place of `vec![default; n]` + `copy_slots`) buys only the half that dies
-//! anyway when compaction moves. `BackendPhases` below is what measured it.
+//! WHAT ITEM 3 OF THE PLAN DID HERE, and it is done on the CPU.
+//! `Strategy::Direct` has the engine write render instances straight into the
+//! caller's arena: no wire record on either side of the FFI, no host
+//! compaction, one pass where there were three. The record strategies remain as
+//! the verification form, because `VerifyLayout` needs a stream and the direct
+//! path has none — it REFUSES that request rather than returning an empty Vec a
+//! gate would read as agreement.
+//!
+//! It took all three copies at once rather than the middle one, because the
+//! measurement said the halves were not worth separating: 2026-09-07, the
+//! readback was 9-22% of backend time and compaction 14-41%, so a borrowing
+//! accessor in place of `vec![default; n]` + `copy_slots` would have bought
+//! only the half that dies anyway when compaction moves. `BackendPhases` below
+//! is what measured it, and `--repo-scan-only` prints it.
 
 use std::path::Path;
 use std::time::{Duration, Instant};

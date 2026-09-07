@@ -185,10 +185,14 @@ with its fixture. Blind in two specific ways worth knowing: `conformance_real`
 is **oracle-free** — it folds arbitrary real source and checks the serial and
 scan forms against each other, so it catches divergence but never a fault the
 two forms share (its header says so, and names the pinned fixtures as the
-cover for that case). And the two **instruments** — `fixture_census` and
-`fixture_manifest` — assert nothing: neither ever raises. They print. A census
-reporting that every field is pinned to a single value would still exit zero.
-Read their output; do not count them as gates.
+cover for that case). The **instruments** — `fixture_census`,
+`fixture_manifest`, `fold_profile` — mostly assert nothing: they print, and a
+census reporting that every field is pinned to a single value would still exit
+zero. Read their output; do not count them as gates. `fold_profile` is the
+partial exception: it asserts that the serial and scan forms agree on the leader
+count, which is not a conformance claim (`conformance_real` owns that) but a
+guard that its two timed runs did the same work. `engine/check.sh` names which
+run and the battery's PASS line counts them.
 
 **cargo-build** (was "3"). `cargo build --release`, zero warnings. Red on any
 warning rustc emits; a build ERROR is fatal (the battery stops). Blind to
@@ -197,9 +201,12 @@ anything silenced with `#[allow(...)]`.
 **cargo-clippy** (was "4"). `cargo clippy --release`, zero warnings. Same, for
 lints.
 
-**cargo-test** (was "5"). 85+ tests: naga WGSL validation, CLI parity, encase
-lane layout, `ItemParams` validation, the layout-seam suites, the wrap-mode
-monoid domain, and the reference-port suites. Red when a test fails, when a
+**cargo-test** (was "5"). naga WGSL validation, CLI parity, encase lane layout,
+`ItemParams` validation, the layout-seam suites (including the direct path's
+arena and item-range guards), the wrap-mode monoid domain, and the reference-port
+suites. The count is deliberately not written here — `cargo glyph test` prints
+it next to the floor on every run, and a number in this paragraph would be one
+more thing to forget. Red when a test fails, when a
 whole test binary stops reporting, or when **fewer than `test_floor` tests
 actually run** — the floor lives in `build.toml [settings]` now, not in shell.
 That floor is a ratchet, not an equality: adding tests never reddens it, and
@@ -208,9 +215,12 @@ number to raise it to — so it cannot decay into a figure far below reality
 without saying so. Raise it in the same commit that adds the tests.
 
 The floor exists because the previous form could not fail. It counted
-`test result: ok` summary lines and required two; there are exactly two binaries
-(`unittests src/main.rs` with 84, `tests/wgsl.rs` with 1), so the threshold was
-met by the tree's shape. Verified 2026-09-06: marking three tests `#[ignore]`
+`test result: ok` summary lines and required two; at the time there were exactly
+two binaries (`unittests src/main.rs` and `tests/wgsl.rs`), so the threshold was
+met by the tree's SHAPE rather than by anything running. That premise is the
+load-bearing part of why the old check could not fail, so it is stated as of
+2026-09-06; the tree has since grown a third binary, which changes the history
+not at all. Verified 2026-09-06: marking three tests `#[ignore]`
 left the old check printing `PASS tests green` and the new one printing
 `FAIL — 82 tests ran, floor is 85`. This is also the check that holds the two
 corpus-size pins (`native/src/fixture.rs`, 17 pipe; `native/src/bake.rs`, 8 bake,
@@ -270,6 +280,24 @@ records — in `down` and `back`. Red when the two paths disagree. Blind to
 whether *either* is right: this is strategy-versus-strategy, so a fault shared
 by both is invisible. Ground truth comes from engine-check, and only for the
 batched path.
+
+**repo-verify-direct**, both wrap modes. `Strategy::Direct` — the path where the
+ENGINE writes render instances straight into the caller's arena, materializing no
+32 B wire record on either side of the FFI — diffed against the batched record
+path, bit-exact on placements and instance bytes. Red when they disagree. Blind
+to the wire-record tier BY CONSTRUCTION: the direct path produces none, so
+`diff_backends` reports `0 records` and the PASS line says so. Record-level
+faults are covered by `repo-verify` and `engine-check` on the other strategies.
+It also refuses a verify over zero items — before 2026-09-07 a missing corpus
+directory printed `PASS: 0 items, 0 instances` and exited 0, which is this gate
+passing having compared nothing.
+
+**cargo-doc**. `cargo doc --no-deps`, zero warnings. Red when a doc comment names
+a symbol that no longer exists, or leaves an HTML tag open. It exists because
+renames are constant here and this was the one class the battery could not see:
+two links to `Engine::records` survived its rename to `read_back` through a full
+green run. Blind to whether the prose is TRUE — it checks that the symbols named
+still exist, not that the sentence around them is current.
 
 **reference-port** (was "9"). Six halves against the JS oracle's recorded
 answers, with the volumes it currently clears — quote these when you change it,
@@ -340,7 +368,7 @@ not exist," which has produced a wrong conclusion here as recently as
 There is a THIRD outcome, beyond "landed" and "failed to land": **landed in a
 region nothing reads.** Measured 2026-09-06 — resolving an out-of-range
 codepoint to a real trie block instead of the shared missing block leaves all
-sixteen suites, ffi_selftest and both instruments GREEN, because no fixture in
+sixteen suites, ffi_selftest and every instrument GREEN, because no fixture in
 the corpus carries an F5–F7 lead byte; the same edit reddens engine-check,
 whose `fixtures/overflow-leads.txt` is the only input in the tree that reaches
 that branch. So a mutation's `why` names the CONSUMER it perturbs, not just the
@@ -363,7 +391,7 @@ with a number against it.
 | `engine/glyph_schema.{mojo,mjs}` | generated | `tools/gen_schema.py` from `schema/glyph-identity.json` — **two** edges leave the schema; editing it invalidates the corpus as well as the dylib |
 | `tools/vendor/` | vendored, hash-pinned | `vendor-manifest.py --check`; upstream drift is information, not failure |
 | `schema/glyph-identity.json` | vendored verbatim | drift means an upstream refresh, not a local edit |
-| `native/src/shaders/*.wgsl` | fenced | the naga test pins the shader *set* — that it compiles and exists, not what it draws. The only thing that sees a pixel change is the four-view A/B, whose blind spots are above. That gap is why edits here need their own re-baselined change rather than an ordinary commit |
+| `native/src/shaders/*.wgsl` | fenced | the naga test pins the shader *set* — that it compiles and exists, not what it draws. The only thing that sees a pixel change is the golden-view A/B, whose blind spots are above. That gap is why edits here need their own re-baselined change rather than an ordinary commit |
 | `native/fixtures/baseline-view.txt` | IMMUTABLE | it is the input to `text.png`; editing it re-baselines that check silently |
 | `native/fixtures/g-pick-repo/empty.rs` | IMMUTABLE, zero bytes | the only input that reaches the page-extent origin seed; deleting it removes a check's ability to see its subject without removing the check |
 | `out/tooling-ab/baseline/` | tracked pixel oracle; **golden** in build.toml | changes only on purpose, with a note saying why; the runner refuses to regenerate it |
@@ -396,7 +424,7 @@ reading — but they agree on less than they look like they do, each having
 reinvented its own structure, so take the invariant and not the format: **one
 dependency per commit, the full battery green before each commit lands** (not
 after, in bulk), the resolved version checked against the published manifest
-rather than against a plan, a call-site sweep, and the four views `cmp`'d into a
+rather than against a plan, a call-site sweep, and the golden views `cmp`'d into a
 named scratch dir. Record what moved and why.
 
 ## Vocabulary — and which numbers are alive

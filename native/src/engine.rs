@@ -7,9 +7,11 @@
 //! is the FFI. The adapter that presents this handle as a `LayoutGlyphs` is
 //! `layout_mojo.rs`.
 //!
-//! The FFI surface (engine/ffi.mojo) is scalars + one opaque handle:
-//! no Mojo types cross the boundary, records are copied into caller memory,
-//! and the f32 lanes cross as raw bits inside the 32 B wire record.
+//! The FFI surface (engine/ffi.mojo) is scalars + one opaque handle: no Mojo
+//! types cross the boundary, and f32 lanes cross as raw bits. There are two
+//! output shapes — the record entries copy a 32 B wire record per glyph into
+//! caller memory, while `load_items_direct` writes 48 B render instances into
+//! an arena the caller owns and materializes no record.
 //!
 //! Wire record (32 B per rendered glyph, schema/glyph-identity.json):
 //!   f32 X Y Z ADVANCE HEIGHT | u32 GLYPH_ID ROW COL
@@ -166,7 +168,7 @@ const fn abi_shape() -> u32 {
 
 /// Serialize one item's params + byte range into a 128 B descriptor block.
 /// Explicit offsets — shared verbatim with the Mojo side, no repr(C) guessing.
-/// The returned Vec<u64> backing keeps the block 8-byte aligned.
+/// The returned `Vec<u64>` backing keeps the block 8-byte aligned.
 pub fn write_item_desc(block: &mut [u8], params: &ItemParams, byte_start: u64, byte_count: u64) {
     assert_eq!(block.len(), ITEM_DESC_SIZE);
     block.fill(0);
@@ -315,7 +317,7 @@ impl Engine {
     }
 
     /// Run the pipeline for one text file. Results stay in the handle until
-    /// the next load; pull them with [`Engine::records`].
+    /// the next load; pull them with [`Engine::read_back`].
     ///
     /// Marshals the SAME 128 B descriptor the batched entry takes. It used to
     /// pass twenty positional arguments, and `wrap_mode` landing in the middle of
@@ -357,7 +359,7 @@ impl Engine {
     /// params) triples — ranges contiguous and ascending (the pipeline's
     /// documented requirement). Each item carries FULL params (per-item
     /// pagination included). Results stay in the handle; pull them with
-    /// [`Engine::records`]. Returns the per-item record counts (= per-item
+    /// [`Engine::read_back`]. Returns the per-item record counts (= per-item
     /// leader counts, computed from the pipeline's flag lanes).
     pub fn load_items(
         &mut self,

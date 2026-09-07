@@ -480,8 +480,8 @@ fn cull_segments(
 }
 
 /// Extract the 6 frustum planes from a view-proj matrix (Gribb-Hartmann;
-/// wgpu clip space has z ∈ [0,w], so the near plane is row2, not row3+row2).
-/// glam's to_cols_array is column-major: row r = (m[r], m[4+r], m[8+r], m[12+r]).
+/// wgpu clip space has z ∈ `[0,w]`, so the near plane is row2, not row3+row2).
+/// glam's to_cols_array is column-major: row r = `(m[r], m[4+r], m[8+r], m[12+r])`.
 fn frustum_planes(vp: &Mat4) -> [[f32; 4]; 6] {
     let m = vp.to_cols_array();
     let row = |r: usize| [m[r], m[4 + r], m[8 + r], m[12 + r]];
@@ -577,7 +577,7 @@ pub struct UiFileDyn {
     /// From the group row's alpha (the same place the hide/show verbs write),
     /// so it is correct even under --no-cull.
     pub hidden: bool,
-    /// Group tint as sRGB bytes (cols[2] is display-space — TintGroup verbs
+    /// Group tint as sRGB bytes (`cols[2]` is display-space — TintGroup verbs
     /// store normalized sRGB there).
     pub tint: [u8; 3],
 }
@@ -1044,7 +1044,7 @@ struct ViewTarget {
 /// a wgpu TextureView keeps its texture alive internally.)
 struct MaskSet {
     view: wgpu::TextureView,
-    /// Tint-pass bind groups, one per pool slot: pool[slot] + mask + tint
+    /// Tint-pass bind groups, one per pool slot: `pool[slot]` + mask + tint
     /// uniform.
     tint_bgs: [wgpu::BindGroup; 2],
 }

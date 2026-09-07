@@ -35,9 +35,12 @@ Platform: macOS on Apple Silicon (`osx-arm64`; the GPU suites run on Metal).
         → native/libglyph_engine.dylib          → glyph3d-native binary
 ```
 
-- **`engine/`** (Mojo) turns UTF-8 bytes + a codepoint→slot trie into one
-  32-byte record per rendered glyph — `[f32 X Y Z ADVANCE HEIGHT]
-  [u32 GLYPH_ID ROW COL]` — with the oracle's exact float discipline (the
+- **`engine/`** (Mojo) turns UTF-8 bytes + a codepoint→slot trie into per-glyph
+  layout — either a 32-byte wire record (`[f32 X Y Z ADVANCE HEIGHT]
+  [u32 GLYPH_ID ROW COL]`, the verification form) or 48-byte render instances
+  written straight into the renderer's arena (`--repo-engine direct`, the fast
+  path, which materializes no record at all) — with the oracle's exact float
+  discipline (the
   `--fp-mode contract=off` build flag exists to preserve it; FMA fusion would
   break bit-exactness). Deep documentation: `engine/README.md`,
   `engine/README-FFI.md` (the C ABI), `engine/TOOLCHAIN.md` (channel state).
@@ -120,7 +123,7 @@ languages: the generators reproduce their committed outputs byte-for-byte, the
 plus the dylib-linked ffi_selftest run on CPU and GPU, the Rust side builds
 and lints warning-free and passes its tests under a ratcheted floor, the
 engine is diffed bit-exact against an independent CPU oracle, picks are
-cross-checked against an independent Python oracle, the two FFI strategies are
+cross-checked against an independent Python oracle, the FFI strategies are
 diffed against each other in both wrap modes, the reference port is replayed
 against the JS oracle's recorded answers, and the golden views are
 re-rendered and compared pixel for pixel.
@@ -128,7 +131,7 @@ re-rendered and compared pixel for pixel.
 **The authoritative account is `AGENTS.md`**, which lists each gate by name
 with what it compares, what makes it red, and — the part that matters — what
 it cannot see. This section is a summary and will drift; that file is
-maintained as the contract. Anything that diverges from the four pixel
+maintained as the contract. Anything that diverges from the golden pixel
 baselines in `out/tooling-ab/baseline/` means the commit is wrong: fix or
 revert. Baselines change deliberately, never as a side effect — they are class
 `golden` in build.toml and the runner has no build path for them.
@@ -179,7 +182,7 @@ those outputs on purpose.
   current system (there has never been one — stages A, B and D have no report at
   all). `PICK_FIX_REPORT.md` is the picking postmortem. For how things are now,
   read `AGENTS.md`.
-- **The A/B oracle suite** — `out/tooling-ab/baseline/` holds the four
+- **The A/B oracle suite** — `out/tooling-ab/baseline/` holds the golden
   canonical views every refactor must reproduce byte-for-byte. It is tracked
   and changes only on purpose; `out/tooling-ab/sweep/` is the regenerated
   comparison output (untracked).

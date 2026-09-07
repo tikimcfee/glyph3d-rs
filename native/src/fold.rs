@@ -331,9 +331,11 @@ pub(crate) fn decode_codepoint_at(bytes: &[u8], slot: usize, sequence_len: usize
 /// why the defect was invisible except at exact multiples — on `wide.txt` at
 /// wrap 100 it displaced the 8th line by four rows.
 ///
-/// The frozen JS oracle corpus was generated under the old rule, so it SPECIFIES
-/// the phantom; see `engine/delta/phantom-row.md` for the fixtures and lanes
-/// that must be regenerated.
+/// The frozen JS oracle corpus was generated under the old rule, so it
+/// SPECIFIED the phantom. Both were corrected in `c9667ec` — oracle first, then
+/// the corpus regenerated from it, then the port — so nothing is outstanding
+/// here. (A `engine/delta/phantom-row.md` was cited for the lane-by-lane
+/// impact; it does not exist. The commit is the record.)
 pub(crate) fn rows_for_line(length: i64, wrap: i64, mode: WrapMode) -> i64 {
     if mode == WrapMode::Back {
         // A WrapBack line occupies exactly the row it sits on, whatever its

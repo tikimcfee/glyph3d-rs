@@ -59,13 +59,15 @@
 //! - **A position in the return value.** `LayoutGlyphs` cannot produce records
 //!   at all; a gate that needs them asks [`VerifyLayout`], a separate trait.
 //!   That is what lets a device-resident backend keep glyphs on the device.
-//!   IT IS NOT THE SAME AS DELETING THE READBACK, and this header used to claim
-//!   it was: `MojoLayout::run` calls `engine.read_back()` unconditionally in
-//!   both strategies, because `compact_records_into` runs on the host and needs
-//!   them. 3.10 GB still crosses the FFI on every load. `VerifyLayout` gates
-//!   the API, not the copy — the copy dies when compaction moves to the data.
-//!   What that copy COSTS is measured (2026-09-07): 9-22% of backend time, so
-//!   the 3.10 GB is a memory argument and not the load's bottleneck.
+//!   IT IS NOT THE SAME AS DELETING THE READBACK, and saying otherwise has now
+//!   been wrong twice in this header. The first version claimed `VerifyLayout`
+//!   put the copy out of reach; it gates the API, not the copy. The second
+//!   said the copy was unconditional in "both strategies" — true when there
+//!   were two. `Strategy::Direct` (2026-09-07) makes none: the engine writes
+//!   instances into the caller's arena and no wire record exists on either side
+//!   of the FFI. The record strategies still copy, and are the verification
+//!   form. Which strategies exist, and what each costs, comes from
+//!   `--repo-scan-only`, not from this comment.
 //! - **`text::reference_layout`.** It is a second, independently-derived
 //!   realization of the same layout and its whole value is that it shares no
 //!   lineage with the fold. It stays where it is. See `engine/PORT-PLAN.md`.
@@ -123,7 +125,7 @@ impl GlyphRecord {
 
 const _: () = assert!(std::mem::size_of::<GlyphRecord>() == 32);
 
-/// Packed RGBA8 of the default text color ([212,212,212], alpha 255) — the one
+/// Packed RGBA8 of the default text color (`212,212,212`, alpha 255) — the one
 /// definition, shared by the flat paint and the per-record fallback. It used to
 /// exist twice (a literal in `repo.rs`, a `pack_rgba8` call in `text.rs`) with
 /// nothing asserting they agreed; they did, and now they cannot disagree.
