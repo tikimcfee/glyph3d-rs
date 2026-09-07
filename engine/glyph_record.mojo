@@ -353,13 +353,19 @@ def count_direct_range(r: PipelineResult, start: Int, stop: Int) -> Tuple[Int, I
     parallelizes too. Two passes over the flag lanes beat one serial pass as
     soon as there is more than one core, which is the same trade the bounds pass
     already made (`BOUNDS_GRAIN`, worth 2.11x on a heavy-tailed batch)."""
+    # HOISTED. `r.fl[id]` is a List indexing: it reloads the List's data
+    # pointer on every byte, and this loop runs once per source byte. Taking the
+    # two pointers before the loop is the whole of the change, and it is worth
+    # 2.4x on this pass alone (47 MB: 24.0 ms -> 10.1 ms, 2026-09-07).
+    var flp = r.fl.unsafe_ptr()
+    var gip = r.gi.unsafe_ptr()
     var rec = 0
     var surv = 0
     for id in range(start, stop):
-        if (Int(r.fl[id]) & F_LEADER) == 0:
+        if (Int(flp[unsafe_offset = id]) & F_LEADER) == 0:
             continue
         rec += 1
-        if r.gi[id] != 0:
+        if gip[unsafe_offset = id] != 0:
             surv += 1
     return (rec, surv)
 
@@ -399,21 +405,44 @@ def write_instances_direct[bo: Origin[mut=True]](
     the reason the blank check happens after the paint lookup would have: the
     host's colorize_leaders emits one colour per leader including blanks, and
     an index that skipped them would tint every glyph after the first blank."""
+    # HOISTED, and this is what makes the pass bandwidth-bound rather than
+    # indirection-bound. Every `r.<lane>[i]` below was a List indexing — a
+    # reload of the List's data pointer per access, in a loop that runs once per
+    # source byte. Taking the five pointers once turns the body into five
+    # strided loads and a 48 B store, which is what the traffic model says it
+    # should be. Measured 2026-09-07 over 47.0 MB, five interleaved samples per
+    # arm: `eg_direct` 204.5 ms -> 117.8 ms median (1.74x), spread 196.7-206.3
+    # against 114.6-122.2. `pass B` alone 180.0 -> 107.3 ms, which is 38.7 GB/s
+    # of read+write traffic against 39.8 GB/s for a hand-written C kernel of the
+    # same shape on four threads — i.e. at the memory system's rate, not above
+    # it and no longer well below it.
+    #
+    # Hoisting the ink extents out of `DirectPlacement`'s two Lists as well was
+    # measured SEPARATELY and is worth nothing (118.6 vs 117.8 ms median, inside
+    # the spread): those Lists are re-read every glyph and stay in L1, while the
+    # lane arrays stream. They are left as they were, because a change that
+    # buys nothing should not be carried as if it did.
+    var flp = r.fl.unsafe_ptr()
+    var gip = r.gi.unsafe_ptr()
+    var lmp = r.lm.unsafe_ptr()
+    var smp = r.sm.unsafe_ptr()
+    var lcp = r.lc.unsafe_ptr()
+
     var p = DirectPlacement()
     var w = out_slot_base
     var rec = paint_base
 
     for id in range(byte_start, byte_stop):
-        if (Int(r.fl[id]) & F_LEADER) == 0:
+        if (Int(flp[unsafe_offset = id]) & F_LEADER) == 0:
             continue
         var lo = id * LM_STRIDE
         var so = id * SM_STRIDE
-        var x = r.lm[lo + 0]
-        var y = r.lm[lo + 1]
-        var z = r.lm[lo + 2]
-        var adv = r.sm[so + 0]
-        var hgt = r.sm[so + 1]
-        var gid = r.gi[id]
+        var x = lmp[unsafe_offset = lo + 0]
+        var y = lmp[unsafe_offset = lo + 1]
+        var z = lmp[unsafe_offset = lo + 2]
+        var adv = smp[unsafe_offset = so + 0]
+        var hgt = smp[unsafe_offset = so + 1]
+        var gid = gip[unsafe_offset = id]
 
         # Page: over ALL records, seeded at the origin.
         var right = x + adv
@@ -453,8 +482,8 @@ def write_instances_direct[bo: Origin[mut=True]](
         out_ptr[unsafe_offset = o + INST_POS_Y] = bitcast[DType.uint32](y)
         out_ptr[unsafe_offset = o + INST_POS_Z] = bitcast[DType.uint32](z)
         out_ptr[unsafe_offset = o + INST_GLYPH_ID] = gid
-        out_ptr[unsafe_offset = o + INST_ROW] = r.lc[co + 0]
-        out_ptr[unsafe_offset = o + INST_COL] = r.lc[co + 1]
+        out_ptr[unsafe_offset = o + INST_ROW] = lcp[unsafe_offset = co + 0]
+        out_ptr[unsafe_offset = o + INST_COL] = lcp[unsafe_offset = co + 1]
         out_ptr[unsafe_offset = o + INST_COLOR] = color
         out_ptr[unsafe_offset = o + INST_GROUP_ID] = group_id
         out_ptr[unsafe_offset = o + INST_ADVANCE] = bitcast[DType.uint32](adv)
