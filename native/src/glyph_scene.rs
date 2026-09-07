@@ -782,9 +782,18 @@ impl CullState {
 
         // --- backdrop render pipeline ----------------------------------------
         // Flat tinted quads for far (subpixel-glyph) segments. Same camera
-        // uniform and same premultiplied blend as the glyph pass; depth test
-        // without write (all glyph-plane content lives at z=0, segments do
-        // not overlap, so draw order between streams is immaterial).
+        // uniform, same premultiplied blend and the SAME depth state as the
+        // glyph pass: test AND write, LessEqual. This used to test without
+        // writing, on the premise that all glyph-plane content lives at z=0
+        // and segments do not overlap, so draw order between streams was
+        // immaterial. `--wrap-mode back` (the default since dde3f82) ended
+        // that premise: a wrapped line steps BACK in z, so a long file's
+        // column recedes behind the pages beside it, and with nothing writing
+        // depth the later-drawn file simply painted over the nearer one —
+        // measured 2026-09-07, wide.txt's column over long.md's pages from a
+        // front-on camera pitched down. LessEqual rather than Less keeps
+        // every coplanar fragment passing, so within a z=0 page the blend
+        // order is exactly what it was.
         let ro_storage = |binding: u32, visibility: wgpu::ShaderStages| wgpu::BindGroupLayoutEntry {
             binding,
             visibility,
@@ -867,8 +876,8 @@ impl CullState {
             },
             depth_stencil: Some(wgpu::DepthStencilState {
                 format: depth_format,
-                depth_write_enabled: Some(false),
-                depth_compare: Some(wgpu::CompareFunction::Less),
+                depth_write_enabled: Some(true),
+                depth_compare: Some(wgpu::CompareFunction::LessEqual),
                 stencil: Default::default(),
                 bias: Default::default(),
             }),
@@ -1441,9 +1450,21 @@ impl GlyphScene {
             },
             depth_stencil: Some(wgpu::DepthStencilState {
                 format: depth_format,
-                // Blended coverage pass: test but don't write depth.
-                depth_write_enabled: Some(false),
-                depth_compare: Some(wgpu::CompareFunction::Less),
+                // Blended coverage pass that WRITES depth. It used to test
+                // only, which made glyph-vs-glyph visibility a fact about
+                // draw order — fine while every glyph sat at z=0, wrong the
+                // moment `--wrap-mode back` put wrapped segments behind the
+                // page plane (see the backdrop pipeline's note above). The
+                // cost of writing: a glyph's ≤1 px coverage fringe also
+                // writes depth, so where a NEARER glyph is drawn before a
+                // farther one, the farther one's ink under that fringe is
+                // rejected rather than blended — a faint halo, at edges,
+                // only where two glyphs at different depths overlap on
+                // screen. The wrong-order alternative was whole glyphs.
+                // LessEqual: coplanar fragments still pass, so a flat page
+                // blends in exactly the order it did before.
+                depth_write_enabled: Some(true),
+                depth_compare: Some(wgpu::CompareFunction::LessEqual),
                 stencil: Default::default(),
                 bias: Default::default(),
             }),

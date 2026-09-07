@@ -300,7 +300,19 @@ to keep the non-default row-per-wrap geometry covered, and was added when the
 default moved, because otherwise making one mode default silently retires pixel
 coverage of the other. `repo-zoom` covers **neither** meaningfully: `alpha.rs`'s
 longest line is 24 columns and never wraps in either mode, so that view is
-pinning a camera angle, not a layout.
+pinning a camera angle, not a layout. `repo-back-oblique` (2026-09-07) is the
+camera pitched down over `wide.txt` so its receding column converges up into
+`long.md`'s pages: the only frame in which a glyph at one depth overlaps a
+glyph at another, and therefore the only one that can see z-ORDER. It was
+added when the glyph pass was found to test depth without writing it, so a
+later-drawn file painted over a nearer one — and `repo-wide` had carried that
+wrong picture in every baseline since `back` became the default, byte-equal
+throughout, because a golden cannot tell a wrong picture from a right one.
+The `depth-write-off` mutation proves the new frame reddens on that class.
+Known cost of the fix, measured: in the dense far region of `repo-down`,
+~1,400 of 1.6M pixels lose a little ink where coplanar quads overlap and the
+later fragment's interpolated depth lands an ulp behind — the price of a
+blended pass writing depth, accepted over draw-order visibility.
 
 It is also less all-seeing than it looks. The page-extent origin seed was
 renderer-affecting and every view stayed byte-equal, because the seed only binds

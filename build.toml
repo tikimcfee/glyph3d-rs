@@ -120,6 +120,7 @@ outputs = [
   "out/tooling-ab/baseline/{gpu}/repo-zoom.png",
   "out/tooling-ab/baseline/{gpu}/repo-wide.png",
   "out/tooling-ab/baseline/{gpu}/repo-down.png",
+  "out/tooling-ab/baseline/{gpu}/repo-back-oblique.png",
 ]
 inputs = ["target/release/glyph3d-native", "native/fixtures/baseline-view.txt", "native/fixtures/g-pick-repo/**"]
 note = "Blind to everything outside these frames, and cannot distinguish a regression from an intentional change. One set per rasterizer ({gpu}); a set only ever proves the renderer on the hardware that made it. empty.rs in g-pick-repo is zero bytes ON PURPOSE (the only input reaching the page-extent origin seed)."
@@ -140,6 +141,15 @@ cmd = "--load-repo fixtures/g-pick-repo --frames 2 --wrap-mode down"
 [[golden_view]]
 name = "repo-zoom"
 cmd = "--load-repo fixtures/g-pick-repo --frames 2 --focus-file alpha.rs --zoom 3"
+# The z-order frame. Front-on views cannot see whether a wrapped column that
+# recedes in `back` mode is occluded by the page beside it — that needs a
+# camera pitched down over wide.txt so its column converges up into long.md.
+# Added 2026-09-07 when exactly that was found wrong (the glyph pass tested
+# depth without writing it, so draw order decided visibility). The
+# `depth-write-off` mutation is what proves this frame sees the class.
+[[golden_view]]
+name = "repo-back-oblique"
+cmd = "--load-repo fixtures/g-pick-repo --frames 2 --cam-pose 30 -120 60 0 -12"
 
 # ── Gates ────────────────────────────────────────────────────────────────
 # `scope` answers "I changed X, what should I run" — the question the CLI is
@@ -460,6 +470,19 @@ op = "replace"
 find = "let cov = clamp(coverage * 0.5, 0.0, 1.0);"
 with = "let cov = clamp(coverage * 0.62, 0.0, 1.0);"
 expect = "text.png diverges from baseline"
+rebuild = "cargo build --release"
+
+[[mutation]]
+name = "depth-write-off"
+gate = "pixel-ab"
+why = "the 2026-09-07 z-order defect put back: the glyph pass testing depth without writing it, so a later-drawn file paints over a nearer one. CONSUMED BY: repo-back-oblique, the frame added for it — and repo-wide, whose front-on column had been painting over long.md's pages in every baseline before that day without anyone seeing it"
+file = "native/src/glyph_scene.rs"
+op = "replace"
+find = """                // blends in exactly the order it did before.
+                depth_write_enabled: Some(true),"""
+with = """                // blends in exactly the order it did before.
+                depth_write_enabled: Some(false),"""
+expect = "repo-back-oblique.png diverges from baseline"
 rebuild = "cargo build --release"
 
 [[mutation]]
