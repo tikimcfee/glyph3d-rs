@@ -90,6 +90,10 @@ a backend or a caller; the short version:
   two gates: `repo-verify` pairs the record strategies, `repo-verify-direct`
   pairs `Direct` against batched and reports `0 records` because the direct path
   produces none. The Rust backend is next to receive the same call.
+- **`direct` is the DEFAULT strategy.** `--repo-engine naive|batch` selects a
+  record strategy when you want one; the gates that name a specific pair pin it
+  explicitly, and the repo golden views deliberately do not, so the default gets
+  pixel coverage.
 - A verify over ZERO items refuses. Before 2026-09-07 a missing corpus directory
   printed `PASS: 0 items, 0 instances` and exited 0 — the gate passing having
   compared nothing.

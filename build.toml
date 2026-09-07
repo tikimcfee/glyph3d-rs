@@ -132,6 +132,12 @@ cmd = "--demo --frames 2"
 [[golden_view]]
 name = "text"
 cmd = "--render-file fixtures/baseline-view.txt --frames 2"
+# The three repo views deliberately do NOT pin --repo-engine: they render on
+# whatever the DEFAULT strategy is, because the default is what ships and the
+# pixels are the only check that sees it end to end. The strategies are
+# bit-exact, so these frames staying byte-equal across a default change is the
+# proof that the change was safe — which is exactly what happened when `direct`
+# became the default.
 [[golden_view]]
 name = "repo-wide"
 cmd = "--load-repo fixtures/g-pick-repo --frames 2"
@@ -261,7 +267,14 @@ scope = "engine"
 kind = "repo-verify"
 # --repo-scan-only is LOAD-BEARING: without it this opens the windowed
 # renderer and never returns. Run per wrap mode; {mode} is substituted.
-cmd = "--load-repo fixtures/g-pick-repo --wrap-mode {mode} --repo-verify --repo-scan-only"
+#
+# --repo-engine naive IS PINNED, and must stay pinned. This gate's whole claim is
+# that the per-item and batched RECORD strategies agree; it used to get per-item
+# by inheriting the default, so when `direct` became the default (2026-09-07)
+# this command would silently have become a second copy of repo-verify-direct
+# and taken the per-item path's only coverage with it. A gate that names a pair
+# must name it, not inherit half of it.
+cmd = "--load-repo fixtures/g-pick-repo --wrap-mode {mode} --repo-engine naive --repo-verify --repo-scan-only"
 modes = ["down", "back"]
 needs = ["renderer", "dylib"]
 compare = "per-item vs batched FFI strategies, bit-exact at the layout seam, both wrap modes"
