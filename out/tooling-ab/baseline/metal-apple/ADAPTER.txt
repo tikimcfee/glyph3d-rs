@@ -1,0 +1,8 @@
+key: metal-apple
+backend: Metal
+vendor: 0x0000 (apple)
+device: 0x0000 Apple M2 (IntegratedGpu)
+driver:  
+host: macos aarch64
+features: multi_draw_indirect_count=false timestamp_query=true
+limits: max_storage_buffer_binding_size=4294967292 max_buffer_size=4294967295

@@ -290,6 +290,17 @@ renders against every OTHER set, reporting differing pixels, max delta, and
 whether the high-delta pixels are isolated (edge flips) or clustered (something
 has a shape). The day that line stops saying "edge noise" is the day to look at
 the shader; until then a cross-vendor difference is expected and uninteresting.
+
+**One frame already says "clustered", and it was looked at (2026-09-07).**
+`repo-back-oblique` drifts metal-apple vs vulkan-nvidia by 8.93% of pixels with
+236 clustered high-delta — every other view is isolated edge flips, 0 clustered.
+Both frames were inspected side by side: identical structure, identical text in
+front of the receding column, difference confined to the dense far band where
+thousands of coplanar quads overlap and the two rasterizers reject depth in a
+different order. That band is the whole point of this view, so it is the frame
+where vendors are LEAST likely to agree, and every numeric gate is bit-exact
+across both. Expected, not a defect — but the instrument was right to make
+someone look, and this note exists so the next person does not look twice.
 What a set proves is the renderer ON THE HARDWARE THAT MADE IT — a green here on
 Linux says nothing about Metal, and `validate` refuses a golden output that is
 not keyed.

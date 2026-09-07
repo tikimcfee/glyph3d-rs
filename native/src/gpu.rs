@@ -191,6 +191,19 @@ impl GpuProfile {
 
     /// PCI vendor id → a name that can be a directory. Unknown vendors get
     /// their hex id so two unknowns never collide on "other".
+    ///
+    /// APPLE REPORTS NO VENDOR ID. Measured on an M2, 2026-09-07: wgpu's Metal
+    /// backend gives `vendor=0x0000 device=0x0000 driver=""`. The id is ABSENT,
+    /// not unknown, so the 0x106b arm below is unreachable on real hardware and
+    /// the key came out `metal-vendor0000` — leaving the `metal-apple` golden
+    /// set unreachable on the very machine that produced it. The name is what
+    /// actually identifies the rasterizer there, so it is the fallback.
+    ///
+    /// Not folded into a blanket "Metal means Apple": Metal also runs on Intel
+    /// Macs with AMD parts, and those are a different rasterizer that must not
+    /// silently adopt this set. An unrecognised Metal adapter keeps
+    /// `vendor0000` and the pixel gate then says it has no baseline, which is
+    /// the honest answer rather than a wrong one.
     pub fn vendor_slug(&self) -> String {
         match self.vendor_id {
             0x10de => "nvidia",
@@ -201,6 +214,11 @@ impl GpuProfile {
             0x5143 => "qualcomm",
             0x1414 => "microsoft",
             0x10005 => "mesa",
+            0 if self.backend == wgpu::Backend::Metal
+                && self.device_name.starts_with("Apple") =>
+            {
+                "apple"
+            }
             other => return format!("vendor{other:04x}"),
         }
         .to_string()
@@ -252,11 +270,16 @@ impl GpuProfile {
 
     #[cfg(test)]
     fn synthetic(backend: wgpu::Backend, vendor_id: u32) -> Self {
+        Self::synthetic_named(backend, vendor_id, "test")
+    }
+
+    #[cfg(test)]
+    fn synthetic_named(backend: wgpu::Backend, vendor_id: u32, device_name: &str) -> Self {
         Self {
             backend,
             vendor_id,
             device_id: 0,
-            device_name: "test".into(),
+            device_name: device_name.into(),
             device_type: wgpu::DeviceType::Other,
             driver: String::new(),
             driver_info: String::new(),
@@ -511,6 +534,28 @@ mod profile_tests {
         assert_eq!(GpuProfile::synthetic(wgpu::Backend::Metal, 0x106b).key(), "metal-apple");
         assert_eq!(GpuProfile::synthetic(wgpu::Backend::Vulkan, 0x10de).key(), "vulkan-nvidia");
         assert_eq!(GpuProfile::synthetic(wgpu::Backend::Vulkan, 0x1002).key(), "vulkan-amd");
+    }
+
+    /// THE SHAPE REAL APPLE HARDWARE REPORTS, which the synthetic 0x106b case
+    /// above does not reach. wgpu's Metal backend gives vendor 0x0000 on an M2,
+    /// so the golden set `metal-apple` was unreachable from the machine that
+    /// made it — the key resolved to `metal-vendor0000` and the pixel gate said
+    /// it had no baseline. The mapping test passed throughout, because it
+    /// asserted the lookup and not the resolution.
+    #[test]
+    fn apple_metal_reports_no_vendor_id_and_still_keys_to_apple() {
+        let real = GpuProfile::synthetic_named(wgpu::Backend::Metal, 0x0000, "Apple M2");
+        assert_eq!(real.key(), "metal-apple");
+    }
+
+    /// The other half of that arm, and the reason it is not "Metal means
+    /// Apple": Metal runs on Intel Macs with AMD parts, a different rasterizer
+    /// that must not inherit Apple's golden set. It keeps the unknown id, and
+    /// the gate then reports honestly that it has no baseline.
+    #[test]
+    fn a_non_apple_metal_adapter_does_not_adopt_apples_set() {
+        let amd = GpuProfile::synthetic_named(wgpu::Backend::Metal, 0x0000, "AMD Radeon Pro 5500M");
+        assert_eq!(amd.key(), "metal-vendor0000");
     }
 
     /// An unknown vendor keeps its id rather than collapsing to a shared
