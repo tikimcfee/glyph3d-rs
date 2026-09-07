@@ -189,8 +189,17 @@ impl GpuProfile {
         }
     }
 
-    /// PCI vendor id → a name that can be a directory. Unknown vendors get
-    /// their hex id so two unknowns never collide on "other".
+    /// PCI vendor id → a name that can be a directory.
+    ///
+    /// AN UNRECOGNISED ID CANNOT STAND ALONE, and this comment used to claim it
+    /// could ("two unknowns never collide on their hex id"). That is true of two
+    /// DIFFERENT unknown ids and false of the one that matters: `0x0000` is not
+    /// an id, it is "the driver declined to answer", so every adapter that
+    /// declines lands on it. Two unrelated parts would then share a golden set,
+    /// and the gate would report DIVERGES — blaming the renderer for what is
+    /// really a hardware mismatch, which is worse than saying nothing. So the
+    /// device NAME joins the key whenever the id is unrecognised: it is the only
+    /// stable identifier left when the numeric one is absent.
     ///
     /// APPLE REPORTS NO VENDOR ID. Measured on an M2, 2026-09-07: wgpu's Metal
     /// backend gives `vendor=0x0000 device=0x0000 driver=""`. The id is ABSENT,
@@ -201,9 +210,9 @@ impl GpuProfile {
     ///
     /// Not folded into a blanket "Metal means Apple": Metal also runs on Intel
     /// Macs with AMD parts, and those are a different rasterizer that must not
-    /// silently adopt this set. An unrecognised Metal adapter keeps
-    /// `vendor0000` and the pixel gate then says it has no baseline, which is
-    /// the honest answer rather than a wrong one.
+    /// silently adopt this set. Such an adapter gets `vendor0000-<its name>`
+    /// and the pixel gate then says it has no baseline — the honest answer
+    /// rather than a wrong one, and a DIFFERENT one per part.
     pub fn vendor_slug(&self) -> String {
         match self.vendor_id {
             0x10de => "nvidia",
@@ -219,9 +228,34 @@ impl GpuProfile {
             {
                 "apple"
             }
-            other => return format!("vendor{other:04x}"),
+            other => {
+                let name = Self::name_slug(&self.device_name);
+                if name.is_empty() {
+                    return format!("vendor{other:04x}");
+                }
+                return format!("vendor{other:04x}-{name}");
+            }
         }
         .to_string()
+    }
+
+    /// A device name reduced to a path-safe slug: lowercase, runs of anything
+    /// else collapsed to one `-`, trimmed, and capped so a chatty driver string
+    /// cannot produce an unwieldy directory. Only used when the vendor id is
+    /// unrecognised, where it is the sole thing separating two adapters.
+    fn name_slug(name: &str) -> String {
+        let mut out = String::new();
+        for c in name.chars() {
+            if c.is_ascii_alphanumeric() {
+                out.push(c.to_ascii_lowercase());
+            } else if !out.ends_with('-') && !out.is_empty() {
+                out.push('-');
+            }
+            if out.len() >= 40 {
+                break;
+            }
+        }
+        out.trim_end_matches('-').to_string()
     }
 
     pub fn backend_slug(&self) -> &'static str {
@@ -550,20 +584,66 @@ mod profile_tests {
 
     /// The other half of that arm, and the reason it is not "Metal means
     /// Apple": Metal runs on Intel Macs with AMD parts, a different rasterizer
-    /// that must not inherit Apple's golden set. It keeps the unknown id, and
-    /// the gate then reports honestly that it has no baseline.
+    /// that must not inherit Apple's golden set. It gets an unidentified key
+    /// carrying its own name, and the gate then reports honestly that it has no
+    /// baseline rather than diffing against Apple's frames.
+    ///
+    /// The assertion is on the PROPERTY, not the exact string: what matters is
+    /// that it is not Apple's key. An earlier version pinned the literal
+    /// `metal-vendor0000` and went red the moment the device name joined the
+    /// key — the test was right to fail, and it was asserting more than it
+    /// cared about.
     #[test]
     fn a_non_apple_metal_adapter_does_not_adopt_apples_set() {
         let amd = GpuProfile::synthetic_named(wgpu::Backend::Metal, 0x0000, "AMD Radeon Pro 5500M");
-        assert_eq!(amd.key(), "metal-vendor0000");
+        let apple = GpuProfile::synthetic_named(wgpu::Backend::Metal, 0x0000, "Apple M2");
+        assert_ne!(amd.key(), apple.key(), "a non-Apple Metal part must not adopt metal-apple");
+        assert_eq!(apple.key(), "metal-apple");
+        assert!(
+            amd.key().starts_with("metal-vendor0000-"),
+            "an unidentified Metal part keeps an unidentified key, got {:?}",
+            amd.key(),
+        );
     }
 
     /// An unknown vendor keeps its id rather than collapsing to a shared
     /// name — two unknowns must not share a golden set by accident.
     #[test]
     fn unknown_vendor_keeps_its_id() {
-        let p = GpuProfile::synthetic(wgpu::Backend::Gl, 0xbeef);
-        assert_eq!(p.key(), "gl-vendorbeef");
+        let p = GpuProfile::synthetic_named(wgpu::Backend::Gl, 0xbeef, "Some Part");
+        assert_eq!(p.key(), "gl-vendorbeef-some-part");
+    }
+
+    /// THE COLLISION 0x0000 CREATES, which the hex-id fallback alone does not
+    /// prevent. `0x0000` is not an id, it is "declined to answer", so it is the
+    /// value every unidentified adapter shares — two unrelated parts would key
+    /// the same and the second would diff its pixels against the first's golden
+    /// set, reporting DIVERGES as if the renderer had changed. The name is what
+    /// separates them.
+    #[test]
+    fn two_adapters_that_report_no_vendor_id_do_not_share_a_key() {
+        let amd = GpuProfile::synthetic_named(wgpu::Backend::Metal, 0, "AMD Radeon Pro 5500M");
+        let intel = GpuProfile::synthetic_named(wgpu::Backend::Metal, 0, "Intel UHD Graphics 630");
+        assert_ne!(amd.key(), intel.key(), "two unidentified adapters must not share a golden set");
+        assert_eq!(amd.key(), "metal-vendor0000-amd-radeon-pro-5500m");
+        assert_eq!(intel.key(), "metal-vendor0000-intel-uhd-graphics-630");
+    }
+
+    /// The slug has to survive being a directory name whatever the driver says.
+    #[test]
+    fn a_hostile_device_name_still_makes_one_safe_path_segment() {
+        let p = GpuProfile::synthetic_named(
+            wgpu::Backend::Vulkan,
+            0,
+            "  llvmpipe (LLVM 17.0.6, 256 bits) /../weird\name  ",
+        );
+        let k = p.key();
+        assert!(
+            k.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-'),
+            "key must be one safe path segment, got {k:?}",
+        );
+        assert!(!k.contains(".."), "key must not contain a traversal, got {k:?}");
+        assert!(k.len() < 80, "key must stay a sane directory name, got {k:?}");
     }
 
     #[test]
