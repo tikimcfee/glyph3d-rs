@@ -69,7 +69,14 @@ and changes results in the last bit, which breaks bit-exactness against the
 oracle the whole corpus is built on. `pixi run build-engine` passes it. Never
 invoke `mojo build` by hand without it.
 
-GPU work needs Apple Silicon; `pixi.toml` declares `osx-arm64` only.
+`pixi.toml` declares `osx-arm64` and, since 2026-09-07, `linux-64`. The engine
+library is `native/libglyph_engine.dylib` on macOS and `.so` on Linux;
+build.toml names it `{dylib}` and the runner, `native/build.rs` and
+`engine/check.sh` each resolve the extension for the host. The linux-64
+Mojo/MAX pin is EXACT (the same nightly the osx-arm64 lock names), so the two
+platforms run the same compiler. The GPU suites run on Metal or, through
+MAX's `DeviceContext`, on an NVIDIA GPU — what has actually been measured on
+the Linux box is recorded in `out/LINUX_BRINGUP.md`, not here.
 
 ## The tool
 

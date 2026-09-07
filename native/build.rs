@@ -19,6 +19,11 @@
 //! rpaths the resulting binary needs at runtime:
 //!   - native/                  for libglyph_engine.dylib itself
 //!   - .pixi/envs/default/lib   for libKGENCompilerRTShared.dylib (Mojo runtime)
+//!
+//! On Linux (added 2026-09-07) both files are `.so`; the extension is chosen
+//! from CARGO_CFG_TARGET_OS below, and `pixi run build-engine` has a linux-64
+//! task that emits the `.so` without install_name_tool (an ELF soname comes
+//! from the filename). Nothing else differs.
 
 use std::path::PathBuf;
 
@@ -26,16 +31,19 @@ fn main() {
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let ws = manifest.parent().expect("native/ has a workspace parent");
     let engine_dir = manifest.to_path_buf(); // the dylib lives beside the crate
-    let dylib = engine_dir.join("libglyph_engine.dylib");
+    let ext = match std::env::var("CARGO_CFG_TARGET_OS").as_deref() {
+        Ok("macos") => "dylib",
+        _ => "so",
+    };
+    let dylib = engine_dir.join(format!("libglyph_engine.{ext}"));
     let mojo_runtime_lib = ws.join(".pixi/envs/default/lib");
 
     if !dylib.exists() {
         panic!(
-            "libglyph_engine.dylib not found at {}.\n\
-             Build it first:\n\
-             \x20 pixi run mojo build --fp-mode contract=off -I engine \\\n\
-             \x20     engine/ffi.mojo -o native/libglyph_engine.dylib --emit shared-lib\n\
-             \x20 install_name_tool -id @rpath/libglyph_engine.dylib native/libglyph_engine.dylib",
+            "libglyph_engine.{ext} not found at {}.\n\
+             Build it first:  pixi run build-engine\n\
+             (mojo build --fp-mode contract=off -I engine engine/ffi.mojo \
+             --emit shared-lib, plus install_name_tool on macOS — see pixi.toml)",
             dylib.display()
         );
     }
@@ -52,7 +60,7 @@ fn main() {
         .unwrap_or(false);
     if stale {
         panic!(
-            "libglyph_engine.dylib at {} is STALE — it does not export \
+            "libglyph_engine.{ext} at {} is STALE — it does not export \
              glyph_engine_fp_probe, so it was built before 2026-09-02 and predates \
              the Rust code linking against it.\n\
              Rebuild it:  pixi run build-engine",
@@ -61,8 +69,8 @@ fn main() {
     }
 
     assert!(
-        mojo_runtime_lib.join("libKGENCompilerRTShared.dylib").exists(),
-        "Mojo runtime dylib missing under {} — is the pixi env installed?",
+        mojo_runtime_lib.join(format!("libKGENCompilerRTShared.{ext}")).exists(),
+        "Mojo runtime libKGENCompilerRTShared.{ext} missing under {} — is the pixi env installed?",
         mojo_runtime_lib.display()
     );
 

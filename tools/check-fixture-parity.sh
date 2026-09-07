@@ -54,8 +54,9 @@ FAIL=0
 BAKE=(engine/fixtures/*.bake.bin)
 [ "${#BAKE[@]}" -gt 0 ] || { echo "FAIL  no bake fixtures found"; exit 1; }
 
-RUST=$(mktemp -t fixparity-rust)
-MOJO=$(mktemp -t fixparity-mojo)
+# Templates carry X's: GNU mktemp refuses a bare `-t name` (BSD accepts it).
+RUST=$(mktemp -t fixparity-rust.XXXXXX)
+MOJO=$(mktemp -t fixparity-mojo.XXXXXX)
 trap 'rm -f "$RUST" "$MOJO"' EXIT
 
 if ! "$BIN" --fixture-manifest "${FIX[@]}" >"$RUST" 2>/dev/null; then

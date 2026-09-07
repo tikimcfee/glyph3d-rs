@@ -29,9 +29,12 @@ test_floor = 93
 
 # ── Products ─────────────────────────────────────────────────────────────
 
+# `{dylib}` is the host's shared-library extension (dylib on macOS, so on
+# Linux), substituted by the runner at load. pixi.toml's build-engine task is
+# per-platform for the same reason.
 [artifact.dylib]
 class = "product"
-outputs = ["native/libglyph_engine.dylib"]
+outputs = ["native/libglyph_engine.{dylib}"]
 # `-I engine` makes the whole engine/ directory an input, generated schema
 # included; pixi.toml/pixi.lock pin the toolchain itself.
 inputs = ["engine/*.mojo", "pixi.toml", "pixi.lock"]
@@ -41,7 +44,7 @@ note = "cargo does NOT build this; native/build.rs only links it. --fp-mode cont
 [artifact.renderer]
 class = "product"
 outputs = ["target/release/glyph3d-native"]
-inputs = ["native/src/**", "native/build.rs", "native/Cargo.toml", "native/Cargo.lock", "native/libglyph_engine.dylib"]
+inputs = ["native/src/**", "native/build.rs", "native/Cargo.toml", "native/Cargo.lock", "native/libglyph_engine.{dylib}"]
 build = "cd native && cargo build --release"
 note = "Cargo owns its own dependency graph; the stamp only guards the dylib edge cargo cannot see."
 

@@ -802,10 +802,26 @@ fn validate(m: &Manifest) -> Vec<String> {
 // "8 mutations passed" describes the size of what ran, not the size of what
 // exists — the mistake the old ls-derived fixture count made.
 
+/// Our own path, read ONCE at startup. Cargo keeps two `glyph` artifacts —
+/// the workspace build and the `-p glyph` build the `cargo glyph` alias makes
+/// resolve different feature sets — and re-points `target/release/glyph` at
+/// whichever was asked for last, without recompiling. The cargo-build gate runs
+/// the workspace build, so mid-`prove` the file this process was started from
+/// is unlinked and replaced. On Linux `current_exe()` then reads
+/// `/proc/self/exe` as `.../glyph (deleted)` and every later spawn fails with
+/// ENOENT — measured 2026-09-07: 5 mutations proved, then 12 straight FAILs
+/// ("could not run gate", then "ALREADY RED" for everything after). macOS
+/// returns the plain path and never saw it. Reading the path before any gate
+/// runs makes the spawn hit whichever artifact is there now, which is built
+/// from the same source.
+fn self_exe() -> &'static Path {
+    static EXE: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    EXE.get_or_init(|| std::env::current_exe().unwrap_or_else(|_| PathBuf::from("glyph")))
+}
+
 /// Runs one gate in a child of ourselves so its output can be read.
 fn gate_output(name: &str) -> (bool, String) {
-    let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("glyph"));
-    let out = Command::new(exe).arg("gate").arg(name).current_dir(root()).output();
+    let out = Command::new(self_exe()).arg("gate").arg(name).current_dir(root()).output();
     match out {
         Ok(o) => {
             let mut s = String::from_utf8_lossy(&o.stdout).into_owned();
@@ -1005,10 +1021,29 @@ enum Cmd {
     Graph,
 }
 
+/// The engine shared library's extension on THIS host: `dylib` on macOS, `so`
+/// on Linux. build.toml names it `native/libglyph_engine.{dylib}` and the
+/// token is resolved here, once, so every path the runner stats or hashes is
+/// the real file. Same idiom as `{scratch}` and `{mode}`.
+fn dylib_ext() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "dylib"
+    } else {
+        "so"
+    }
+}
+
 fn load() -> Result<Manifest, String> {
     let p = root().join("build.toml");
     let text = std::fs::read_to_string(&p).map_err(|e| format!("{}: {e}", p.display()))?;
-    toml::from_str(&text).map_err(|e| format!("build.toml is not valid against the schema:\n{e}"))
+    let mut m: Manifest = toml::from_str(&text)
+        .map_err(|e| format!("build.toml is not valid against the schema:\n{e}"))?;
+    for a in m.artifact.values_mut() {
+        for p in a.outputs.iter_mut().chain(a.inputs.iter_mut()) {
+            *p = p.replace("{dylib}", dylib_ext());
+        }
+    }
+    Ok(m)
 }
 
 fn cmd_test(m: &Manifest, scope: Option<Scope>, frozen: bool) -> bool {
@@ -1029,6 +1064,8 @@ fn cmd_test(m: &Manifest, scope: Option<Scope>, frozen: bool) -> bool {
 }
 
 fn main() -> ExitCode {
+    // Before anything can rebuild us out from under ourselves; see self_exe.
+    let _ = self_exe();
     let cli = Cli::parse();
     let m = match load() {
         Ok(m) => m,

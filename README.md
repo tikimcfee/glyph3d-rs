@@ -13,7 +13,10 @@ offscreen output is byte-deterministic, and a gate suite proves both on every
 commit. Refactors are output-neutral by contract, verified by gates rather
 than by argument.
 
-Platform: macOS on Apple Silicon (`osx-arm64`; the GPU suites run on Metal).
+Platform: macOS on Apple Silicon (`osx-arm64`; the GPU suites run on Metal)
+and, since 2026-09-07, Linux x86_64 (`linux-64`; wgpu on Vulkan). See
+`AGENTS.md` § Build for what differs between them, which is only the shared
+library's extension.
 
 ## How the system is built
 
@@ -61,13 +64,13 @@ Platform: macOS on Apple Silicon (`osx-arm64`; the GPU suites run on Metal).
 
 ## Quickstart
 
-Requirements: macOS/Apple Silicon, [pixi](https://pixi.sh), a recent Rust
+Requirements: macOS/Apple Silicon or Linux x86_64, [pixi](https://pixi.sh), a recent Rust
 toolchain (egui 0.36 sets MSRV 1.95), and Node ≥ 18 (two of the checks run it: the atlas export and the
 fixture-corpus rebuild).
 
 ```sh
 pixi install                    # mojo + max env (pins in pixi.toml / pixi.lock)
-pixi run build-engine           # → native/libglyph_engine.dylib (gitignored)
+pixi run build-engine           # → native/libglyph_engine.dylib (.so on Linux; gitignored)
 
 cd native
 cargo build --release           # the glyph3d-native binary

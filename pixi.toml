@@ -2,7 +2,7 @@
 authors = ["Ivan Lugo <ivan.lugo.dev@pm.me>"]
 channels = ["https://conda.modular.com/max-nightly", "https://conda.modular.com/max", "conda-forge"]
 name = "glyph3d-native"
-platforms = ["osx-arm64"]
+platforms = ["osx-arm64", "linux-64"]
 version = "0.1.0"
 
 # The artifact/gate graph is declared in build.toml and executed by
@@ -25,9 +25,24 @@ suites-all = "./engine/check.sh all"
 gen-trie = "python3 tools/gen_real_trie.py"
 gen-schema = "python3 tools/gen_schema.py"
 check-gen = { cmd = "python3 tools/gen_real_trie.py --verify-only && python3 tools/gen_schema.py --check" }
+# The shared library is `.dylib` on macOS and `.so` on Linux; the build tool
+# and `native/build.rs` resolve the name by platform (see build.toml, `{dylib}`).
+# macOS needs install_name_tool so the binary can find it through @rpath;
+# Linux records the soname from the filename and needs nothing.
 build-engine = "pixi run mojo build --fp-mode contract=off -I engine engine/ffi.mojo -o native/libglyph_engine.dylib --emit shared-lib && install_name_tool -id @rpath/libglyph_engine.dylib native/libglyph_engine.dylib"
 build-native = { cmd = "cargo build --release", cwd = "native", depends-on = ["build-engine"] }
+
+[target.linux-64.tasks]
+build-engine = "pixi run mojo build --fp-mode contract=off -I engine engine/ffi.mojo -o native/libglyph_engine.so --emit shared-lib"
 
 [dependencies]
 mojo = ">=1.1.0.dev2026083005,<2"
 max = ">=26.6.0.dev2026083005,<27"
+
+# linux-64 was added 2026-09-07 and solved fresh; without an exact pin it would
+# have taken the newest nightly, not the build the suites were verified against
+# (engine/TOOLCHAIN.md: a later nightly is expected to break the std.gpu
+# import). Pinned to the same build the osx-arm64 lock already names.
+[target.linux-64.dependencies]
+mojo = "==1.1.0.dev2026083005"
+max = "==26.6.0.dev2026083005"

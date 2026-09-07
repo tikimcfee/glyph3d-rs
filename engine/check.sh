@@ -29,7 +29,12 @@ cd "$(dirname "$0")/.."
 MOJO=(pixi run mojo)
 
 FP="--fp-mode contract=off"
-TMPBIN=$(mktemp -t glyph3d-bench-probe)
+# A template with X's: BSD mktemp accepts `-t name` bare, GNU mktemp refuses it
+# ("too few X's") — found the first time this ran on Linux, 2026-09-07.
+TMPBIN=$(mktemp -t glyph3d-bench-probe.XXXXXX)
+# The shipped engine library: .dylib on macOS, .so on Linux (pixi.toml has a
+# per-platform build-engine task; native/build.rs picks the same extension).
+case "$(uname -s)" in Darwin) DYLIB=native/libglyph_engine.dylib ;; *) DYLIB=native/libglyph_engine.so ;; esac
 PIPE=(engine/fixtures/*.pipe.bin)
 BAKE=(engine/fixtures/*.bake.bin)
 
@@ -126,7 +131,7 @@ if [[ "${1:-all}" != "gpu" ]]; then
     # The artifact under test must exist and be current — same reason check-all
     # rebuilds the dylib as its step 0. One definition of the build command:
     # pixi.toml's build-engine task.
-    printf '%-22s ' "libglyph_engine.dylib"
+    printf '%-22s ' "$(basename "$DYLIB")"
     if out=$(pixi run build-engine 2>&1); then
         echo "built"
     else
@@ -134,7 +139,7 @@ if [[ "${1:-all}" != "gpu" ]]; then
     fi
     printf '%-22s ' ffi_selftest
     if ! out=$("${MOJO[@]}" build $FP -I engine engine/ffi_selftest.mojo -o "$TMPBIN" \
-        -Xlinker "$PWD/native/libglyph_engine.dylib" \
+        -Xlinker "$PWD/$DYLIB" \
         -Xlinker -rpath -Xlinker "$PWD/native" 2>&1); then
         echo "FAILED TO BUILD"; echo "$out" | tail -4; rm -f "$TMPBIN"; exit 1
     fi
