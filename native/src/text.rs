@@ -63,9 +63,10 @@ struct Cell {
 pub struct StagedText {
     pub instances: Vec<GlyphInstance>,
     pub groups: Vec<GroupRow>,
-    /// (min.xy, max.xy) of the laid-out text block(s) in world units.
-    pub bounds_min: [f32; 2],
-    pub bounds_max: [f32; 2],
+    /// (min, max) of the laid-out text block(s) in world units, including
+    /// DEPTH — WrapBack spends wraps in z, so a block's extent is not planar.
+    pub bounds_min: [f32; 3],
+    pub bounds_max: [f32; 3],
     pub codepoints_decoded: usize,
     pub glyphs_emitted: usize,
     pub missing_or_bitmap: usize,
@@ -84,13 +85,12 @@ pub struct StagedText {
 
 /// Stage F: one cull segment covering a whole staged block (the text/engine
 /// scenes don't need per-group granularity — their instance counts are small).
-fn cover_segment(instances: &[GlyphInstance], min: [f32; 2], max: [f32; 2]) -> SegCull {
+fn cover_segment(instances: &[GlyphInstance], min: [f32; 3], max: [f32; 3]) -> SegCull {
     SegCull {
         min,
         max,
         slot_base: 0,
         slot_count: instances.len() as u32,
-        _pad: [0.0; 2],
         tint: seg_tint(instances, max[0] - min[0], max[1] - min[1]),
     }
 }
@@ -276,14 +276,24 @@ pub fn stage_file(atlas: &Atlas, path: &Path, copies: u32) -> StagedText {
     let grid_rows = copies.div_ceil(grid_cols);
     let total_h = grid_rows as f32 * (block_h + gap) - gap;
 
-    let segments = vec![cover_segment(&instances, [0.0, -total_h], [total_w, line_h])];
+    // Depth measured from the instances rather than assumed flat: this path
+    // stages copies of a block, and whether those copies carry z is a property
+    // of how they were laid out, not something to take on faith here.
+    let (z_lo, z_hi) = instances.iter().fold((0.0f32, 0.0f32), |(lo, hi), i| {
+        (lo.min(i.pos[2]), hi.max(i.pos[2]))
+    });
+    let segments = vec![cover_segment(
+        &instances,
+        [0.0, -total_h, z_lo],
+        [total_w, line_h, z_hi],
+    )];
 
     StagedText {
         glyphs_emitted: instances.len(),
         instances,
         groups,
-        bounds_min: [0.0, -total_h],
-        bounds_max: [total_w, line_h],
+        bounds_min: [0.0, -total_h, z_lo],
+        bounds_max: [total_w, line_h, z_hi],
         codepoints_decoded,
         missing_or_bitmap,
         focus_bounds: None,
@@ -613,7 +623,7 @@ pub fn diff_records(records: &[GlyphRecord], expected: &[RefGlyph]) -> Result<()
 /// answer, unchanged from when the loop lived here.
 pub fn stage_records(arena: GlyphArena, placement: &ItemPlacement) -> StagedText {
     let (min, max) = if arena.is_empty() {
-        ([0.0, 0.0], [1.0, 1.0])
+        ([0.0, 0.0, 0.0], [1.0, 1.0, 0.0])
     } else {
         (placement.ink.min, placement.ink.max)
     };

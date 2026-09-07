@@ -243,20 +243,29 @@ struct PickCacheEntry {
     slot_of: Vec<u32>,
 }
 
-/// Stage F — per-segment cull record, 48 B, mirrors `SegCull` in cull.wgsl
-/// (vec4 alignment: the `_pad` lane keeps `tint` at offset 32 on both sides).
-/// One segment per FILE in repo mode; text scenes stage a single segment
-/// covering the whole block. Bounds are WORLD-space xy with the group offset
-/// already applied; all instances live in the z=0 plane (the cull pass tests
-/// z ∈ [-1, 1] as a margin).
+/// Per-segment cull record, 48 B. One segment per FILE in repo mode; text
+/// scenes stage a single segment covering the whole block. Bounds are
+/// WORLD-space with the group offset already applied.
+///
+/// NOT a GPU struct, despite the `Pod` derive and the comment this replaced,
+/// which claimed it mirrored a `SegCull` in cull.wgsl. It does not: that shader
+/// declares only `BackdropInst` and `Camera`, culling is entirely CPU-side
+/// (`cull_segments`), and this type is never uploaded to any buffer — no
+/// `write_buffer`, no `cast_slice`, no test pinning its layout. The derive and
+/// the old `_pad` lane were vestigial.
+///
+/// The z lanes replace that `_pad`, so the struct is still 48 B and `tint` is
+/// still at offset 32. They exist because the old code did not merely lack
+/// depth — it ASSERTED a false one, testing every segment as though it spanned
+/// z ∈ [-1, 1]. That was true while all instances lived in the z=0 plane, and
+/// WrapBack made it false by spending wraps in depth.
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 pub struct SegCull {
-    pub min: [f32; 2],
-    pub max: [f32; 2],
+    pub min: [f32; 3],
+    pub max: [f32; 3],
     pub slot_base: u32,
     pub slot_count: u32,
-    pub _pad: [f32; 2],
     /// rgb = mean LINEAR ink color (sRGB bytes pow-2.2 decoded at staging);
     /// w = effective per-pixel ink coverage E at deep minification
     /// (`ink_frac × BACKDROP_GAIN`, clamped to 1) — the backdrop alpha.
@@ -405,12 +414,15 @@ fn cull_segments(
         if hidden.get(si).copied().unwrap_or(false) {
             continue;
         }
-        // Frustum: positive-vertex test per plane; z margin ±1 (z=0 plane).
+        // Frustum: positive-vertex test per plane, over the segment's real AABB.
+        // The z lane used to be the constant ±1 — true while every instance
+        // lived in the z=0 plane, false since WrapBack began spending wraps in
+        // depth, and wrong in the direction that KEEPS what it should drop.
         let mut visible = true;
         for pl in planes {
             let px = if pl[0] >= 0.0 { seg.max[0] } else { seg.min[0] };
             let py = if pl[1] >= 0.0 { seg.max[1] } else { seg.min[1] };
-            let pz = if pl[2] >= 0.0 { 1.0 } else { -1.0 };
+            let pz = if pl[2] >= 0.0 { seg.max[2] } else { seg.min[2] };
             if pl[0] * px + pl[1] * py + pl[2] * pz + pl[3] < 0.0 {
                 visible = false;
                 break;
@@ -424,7 +436,11 @@ fn cull_segments(
         // CLOSEST glyphs are subpixel).
         let nx = eye.x.clamp(seg.min[0], seg.max[0]);
         let ny = eye.y.clamp(seg.min[1], seg.max[1]);
-        let nz = eye.z.clamp(-1.0, 1.0);
+        // Clamped into the segment, like x and y. Clamping into the old ±1 slab
+        // computed the distance to a place the segment is not, understating it
+        // whenever the content had depth — so far content measured near, and
+        // was drawn at full detail instead of collapsing to a backdrop.
+        let nz = eye.z.clamp(seg.min[2], seg.max[2]);
         let dist = ((eye.x - nx).powi(2) + (eye.y - ny).powi(2) + (eye.z - nz).powi(2))
             .sqrt()
             .max(0.001);
@@ -432,8 +448,10 @@ fn cull_segments(
         if glyph_px < lod_min_px {
             if seg.slot_count > 0 {
                 backdrops.push(BackdropInst {
-                    min: seg.min,
-                    max: seg.max,
+                    // Backdrops are flat quads; BackdropInst IS a GPU struct
+                    // and stays 2D. Only the cull arithmetic needs depth.
+                    min: [seg.min[0], seg.min[1]],
+                    max: [seg.max[0], seg.max[1]],
                     rgba: seg.tint,
                 });
             }
@@ -692,8 +710,8 @@ struct CullState {
     /// Stage G: per-segment LOCAL (pre-TRS) AABBs + the as-staged backdrop
     /// tints + hidden flags — group edits re-sync `segments` from these
     /// (`GlyphScene::sync_segment`).
-    local_min: Vec<[f32; 2]>,
-    local_max: Vec<[f32; 2]>,
+    local_min: Vec<[f32; 3]>,
+    local_max: Vec<[f32; 3]>,
     base_tint: Vec<[f32; 4]>,
     /// Group color rgb at staging time — tint edits scale the backdrop by
     /// pow(new)/pow(orig) so an untouched segment keeps its Stage F tint.
@@ -734,8 +752,8 @@ impl CullState {
                 .get(i)
                 .map(|g| [g.cols[0][0], g.cols[0][1]])
                 .unwrap_or([0.0, 0.0]);
-            local_min.push([seg.min[0] - off[0], seg.min[1] - off[1]]);
-            local_max.push([seg.max[0] - off[0], seg.max[1] - off[1]]);
+            local_min.push([seg.min[0] - off[0], seg.min[1] - off[1], seg.min[2]]);
+            local_max.push([seg.max[0] - off[0], seg.max[1] - off[1], seg.max[2]]);
             base_tint.push(seg.tint);
             orig_group_rgb.push(
                 groups
@@ -1511,11 +1529,10 @@ impl GlyphScene {
             // staging paths always provide one; never ship an empty table to
             // the cull pass).
             segments.push(SegCull {
-                min: [staged.bounds_min[0], staged.bounds_min[1]],
-                max: [staged.bounds_max[0], staged.bounds_max[1]],
+                min: staged.bounds_min,
+                max: staged.bounds_max,
                 slot_base: 0,
                 slot_count: instances.len() as u32,
-                _pad: [0.0; 2],
                 tint: seg_tint(
                     &instances,
                     staged.bounds_max[0] - staged.bounds_min[0],
@@ -2269,13 +2286,18 @@ impl GlyphScene {
         }
         let (ox, oy) = (g.cols[0][0], g.cols[0][1]);
         let (sx, sy) = (g.cols[3][0].max(0.0), g.cols[3][1].max(0.0));
+        // Group TRS is xy only (cols[3] carries no z scale), so depth passes
+        // through untransformed — which is what the old code did implicitly by
+        // having no z lane at all.
         cull.segments[i].min = [
             cull.local_min[i][0] * sx + ox,
             cull.local_min[i][1] * sy + oy,
+            cull.local_min[i][2],
         ];
         cull.segments[i].max = [
             cull.local_max[i][0] * sx + ox,
             cull.local_max[i][1] * sy + oy,
+            cull.local_max[i][2],
         ];
         let bt = cull.base_tint[i];
         let orig = cull.orig_group_rgb[i];
@@ -3374,5 +3396,90 @@ mod layout_tests {
         encase::StorageBuffer::new(&mut buf).write(&row).unwrap();
         assert_eq!(buf.len(), 80);
         assert_eq!(&buf[..], bytemuck::bytes_of(&row), "GroupRow bytes");
+    }
+}
+
+#[cfg(test)]
+mod cull_depth_tests {
+    use super::*;
+
+    /// A segment somewhere in space, with the tint the cull path never reads.
+    fn seg(min: [f32; 3], max: [f32; 3]) -> SegCull {
+        SegCull { min, max, slot_base: 0, slot_count: 16, tint: [0.0; 4] }
+    }
+
+    /// A frustum that keeps everything except what is behind the near plane,
+    /// which here is a plane at z = -10 facing +z. Every other plane is placed
+    /// far enough away to be irrelevant, so a cull decision is attributable to
+    /// depth alone.
+    fn view_clipping_behind_z(near_z: f32, eye: Vec3, lod_min_px: f32) -> CullView {
+        let far = |a: f32, b: f32, c: f32, d: f32| [a, b, c, d];
+        CullView {
+            planes: [
+                far(1.0, 0.0, 0.0, 1.0e6),
+                far(-1.0, 0.0, 0.0, 1.0e6),
+                far(0.0, 1.0, 0.0, 1.0e6),
+                far(0.0, -1.0, 0.0, 1.0e6),
+                // keep z >= near_z
+                [0.0, 0.0, 1.0, -near_z],
+                far(0.0, 0.0, -1.0, 1.0e6),
+            ],
+            eye,
+            px_scale: 1000.0,
+            lod_min_px,
+        }
+    }
+
+    fn drew_glyphs(d: &PhaseDraws) -> bool {
+        d.glyph_ranges.iter().any(|(_, r)| !r.is_empty())
+    }
+
+    /// A segment BEHIND the near plane must be culled.
+    ///
+    /// The old arithmetic tested every segment as though it spanned z ∈ [-1, 1]
+    /// regardless of where it was, so a segment at z = -50 was judged at z ≈ 0 —
+    /// comfortably inside — and drawn. True while everything lived in the z=0
+    /// plane; false since WrapBack started spending wraps in depth.
+    #[test]
+    fn a_segment_behind_the_near_plane_is_culled() {
+        let s = seg([-1.0, -1.0, -50.0], [1.0, 1.0, -49.0]);
+        let v = view_clipping_behind_z(-10.0, Vec3::new(0.0, 0.0, 5.0), 0.0);
+        let d = cull_segments(&[s], &[false], &v, 1024, 1);
+        assert!(
+            !drew_glyphs(&d),
+            "a segment at z=-50, behind a near plane at z=-10, was drawn: the \
+             frustum test is ignoring the segment's depth"
+        );
+    }
+
+    /// ...and one in front of it must survive, so the test above cannot pass by
+    /// culling everything.
+    #[test]
+    fn a_segment_in_front_of_the_near_plane_survives() {
+        let s = seg([-1.0, -1.0, -1.0], [1.0, 1.0, 1.0]);
+        let v = view_clipping_behind_z(-10.0, Vec3::new(0.0, 0.0, 5.0), 0.0);
+        let d = cull_segments(&[s], &[false], &v, 1024, 1);
+        assert!(drew_glyphs(&d), "a segment inside the frustum was culled");
+    }
+
+    /// LOD distance must include depth.
+    ///
+    /// `nz` was `eye.z.clamp(-1.0, 1.0)`, so the nearest point of a segment 50
+    /// units away in z was computed as if it were adjacent: the distance came
+    /// out ~0 instead of ~50, the glyphs measured far larger than a pixel, and
+    /// a segment that should have collapsed to a backdrop quad was drawn in
+    /// full. The error is in the expensive direction — it draws what it should
+    /// have skipped.
+    #[test]
+    fn lod_distance_accounts_for_depth() {
+        let s = seg([-1.0, -1.0, -50.0], [1.0, 1.0, -49.0]);
+        // px_scale/dist at dist≈50 is 20 px/em; ask for 100 so it must drop.
+        let v = view_clipping_behind_z(-1.0e6, Vec3::new(0.0, 0.0, 0.0), 100.0);
+        let d = cull_segments(&[s], &[false], &v, 1024, 1);
+        assert!(
+            !drew_glyphs(&d) && !d.backdrops.is_empty(),
+            "a segment 50 units away in z was drawn at full detail: the LOD \
+             distance is ignoring depth"
+        );
     }
 }

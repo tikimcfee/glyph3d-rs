@@ -332,6 +332,13 @@ pub struct PageExtent {
     pub right: f32,
     /// Lowest `y` over all records, at most 0.
     pub bottom: f32,
+    /// Deepest and shallowest `z` over all records, both at least/at most 0.
+    ///
+    /// Two lanes rather than one because the sign of depth is a layout choice,
+    /// not a fact: `z_step` is a parameter and WrapBack may push either way. A
+    /// single "how deep" lane would silently assume one direction.
+    pub z_min: f32,
+    pub z_max: f32,
 }
 
 /// The inked bounds of one item: min/max over the QUADS of the surviving
@@ -344,8 +351,8 @@ pub struct PageExtent {
 /// question and the seam does not have a policy.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct InkExtent {
-    pub min: [f32; 2],
-    pub max: [f32; 2],
+    pub min: [f32; 3],
+    pub max: [f32; 3],
 }
 
 /// Where one item's glyphs went. This is the entire render-side return value:
@@ -559,9 +566,11 @@ pub(crate) fn compact_records_into(
     // Page: seeded at the origin, over ALL records.
     let mut page_right: f32 = 0.0;
     let mut page_bottom: f32 = 0.0;
+    let mut page_z_min: f32 = 0.0;
+    let mut page_z_max: f32 = 0.0;
     // Ink: seeded empty, over SURVIVORS only.
-    let mut ink_min = [f32::INFINITY; 2];
-    let mut ink_max = [f32::NEG_INFINITY; 2];
+    let mut ink_min = [f32::INFINITY; 3];
+    let mut ink_max = [f32::NEG_INFINITY; 3];
 
     for (index, record) in records.iter().enumerate() {
         let right = record.x() + record.advance();
@@ -571,6 +580,12 @@ pub(crate) fn compact_records_into(
         if record.y() < page_bottom {
             page_bottom = record.y();
         }
+        if record.z() < page_z_min {
+            page_z_min = record.z();
+        }
+        if record.z() > page_z_max {
+            page_z_max = record.z();
+        }
         if record.glyph_id() == 0 {
             continue;
         }
@@ -579,6 +594,10 @@ pub(crate) fn compact_records_into(
         ink_min[1] = ink_min[1].min(record.y() - half_height);
         ink_max[0] = ink_max[0].max(right);
         ink_max[1] = ink_max[1].max(record.y() + half_height);
+        // Depth is a point, not a span: a glyph quad has no thickness. Both
+        // lanes take the same z so the extent stays a real AABB.
+        ink_min[2] = ink_min[2].min(record.z());
+        ink_max[2] = ink_max[2].max(record.z());
 
         arena.push(GlyphInstance {
             pos: [record.x(), record.y(), record.z()],
@@ -601,7 +620,12 @@ pub(crate) fn compact_records_into(
         slot_base: slot_base as u32,
         slot_count: (arena.len() - slot_base) as u32,
         record_count: records.len() as u32,
-        page: PageExtent { right: page_right, bottom: page_bottom },
+        page: PageExtent {
+            right: page_right,
+            bottom: page_bottom,
+            z_min: page_z_min,
+            z_max: page_z_max,
+        },
         ink: InkExtent { min: ink_min, max: ink_max },
     }
 }
@@ -821,6 +845,111 @@ mod tests {
         rows.iter().map(|(m, c)| GlyphRecord { measures: *m, counts: *c }).collect()
     }
 
+    /// Depth reaches the extents, from the records, without a constant.
+    ///
+    /// This is the guard against fixing the cull arithmetic and calling it
+    /// done: `cull_segments` can be made to respect depth while every segment
+    /// handed to it still claims the old flat slab, in which case the unit
+    /// tests pass, the four baselines stay byte-equal, and production is
+    /// exactly as blind as before. The reduction below is the only place a
+    /// record's z becomes an extent, so this is where that shortcut would have
+    /// to hide.
+    #[test]
+    fn extents_carry_depth_from_the_records() {
+        // Two inked glyphs at different depths, and a blank deeper than both.
+        let records: Vec<GlyphRecord> = [
+            ([0.0, 0.0, -2.0, 1.0, 4.0], [7u32, 0, 0]),  // ink, shallow
+            ([1.0, 0.0, -9.5, 1.0, 4.0], [8, 0, 1]),     // ink, deep
+            ([2.0, 0.0, -30.0, 1.0, 4.0], [0, 0, 2]),    // BLANK, deepest
+        ]
+        .iter()
+        .map(|(m, c)| GlyphRecord { measures: *m, counts: *c })
+        .collect();
+
+        let mut arena = GlyphArena::new();
+        let p = compact_records_into(&records, Paint::Flat(0), 0, &mut arena);
+
+        // Page is over ALL records, blanks included — it is the conservative
+        // box, and a cull built from it must not clip a blank's position away.
+        assert_eq!(p.page.z_min, -30.0, "page depth must include blanks");
+        assert_eq!(p.page.z_max, 0.0, "page depth is seeded at the origin");
+
+        // Ink is over survivors only, so the blank's -30 must NOT widen it.
+        assert_eq!(p.ink.min[2], -9.5, "ink depth must span the inked glyphs");
+        assert_eq!(p.ink.max[2], -2.0);
+
+        // And the thing that would betray a constant: none of these is ±1.
+        assert!(
+            p.page.z_min < -1.0 && p.ink.min[2] < -1.0,
+            "depth looks like the old ±1 slab rather than the records"
+        );
+
+        // PAGE CONTAINS INK IN Z, and that is what makes it safe to build the
+        // cull's depth from: a box containing everything drawn can only cost a
+        // draw, while one that does not can drop something visible.
+        assert!(p.page.z_min <= p.ink.min[2] && p.page.z_max >= p.ink.max[2]);
+
+        // It does NOT contain ink in Y, and this assertion is here because I
+        // assumed it did and was wrong. `page.bottom` tracks each record's
+        // BASELINE; `ink` tracks the glyph QUAD, which hangs half a height
+        // below that baseline. So ink reaches outside the page rectangle
+        // vertically — which is why the repo cull's xy carries hand-tuned
+        // margins (-0.5 below, +0.75 above in `repo.rs`) rather than using the
+        // page directly.
+        //
+        // Depth has no such problem because a glyph quad has no thickness: the
+        // z extent is a point per record, so page and ink measure the same
+        // thing in that axis and containment is exact.
+        assert!(p.page.right >= p.ink.max[0], "page is a superset horizontally");
+        assert!(
+            p.page.bottom > p.ink.min[1],
+            "page.bottom tracks baselines, so ink must hang below it"
+        );
+    }
+
+    /// How this reduction relates to the ENGINE's per-item box, which is a
+    /// different computation and deliberately not the same number.
+    ///
+    /// `fold::bounds_range` (mirrored by the Mojo engine, and gate-verified
+    /// against the corpus by `--fixture-fold`) seeds at ±infinity and measures
+    /// only what is there. `page` seeds at the ORIGIN, so it always contains
+    /// (0,0,0) whether or not a glyph does. They therefore disagree by the seed
+    /// for any item whose content does not straddle the origin — which is most
+    /// of them — and that disagreement is correct rather than a defect: the two
+    /// answer different questions. `page` is "what rectangle was this laid out
+    /// on", the engine box is "where did the glyphs actually land".
+    ///
+    /// The consequence worth pinning: `page` CONTAINS the engine box, so a cull
+    /// built from it is conservative with respect to the engine's own answer.
+    #[test]
+    fn page_contains_the_engine_box_and_differs_by_the_seed() {
+        let records: Vec<GlyphRecord> = [
+            ([3.0, -4.0, -8.0, 1.0, 2.0], [7u32, 0, 0]),
+            ([4.0, -6.0, -5.0, 1.0, 2.0], [8, 1, 0]),
+        ]
+        .iter()
+        .map(|(m, c)| GlyphRecord { measures: *m, counts: *c })
+        .collect();
+
+        let mut arena = GlyphArena::new();
+        let p = compact_records_into(&records, Paint::Flat(0), 0, &mut arena);
+
+        // The engine box over the same records: seeded empty, not at origin.
+        let (mut ez_lo, mut ez_hi) = (f32::INFINITY, f32::NEG_INFINITY);
+        for r in &records {
+            ez_lo = ez_lo.min(r.z());
+            ez_hi = ez_hi.max(r.z());
+        }
+        assert_eq!((ez_lo, ez_hi), (-8.0, -5.0));
+
+        // Contained...
+        assert!(p.page.z_min <= ez_lo && p.page.z_max >= ez_hi);
+        // ...and NOT equal, because of the origin seed. If this ever starts
+        // holding, the seeding changed and the cull's conservatism changed
+        // with it.
+        assert_ne!(p.page.z_max, ez_hi, "page must keep its origin seed");
+    }
+
     #[test]
     fn compaction_drops_blanks_and_reports_the_range() {
         let records = sample_records();
@@ -915,8 +1044,8 @@ mod tests {
             slot_base: 0,
             slot_count: 1,
             record_count: 1,
-            page: PageExtent { right: 1.0, bottom: 0.0 },
-            ink: InkExtent { min: [0.0, 0.0], max: [1.0, 1.0] },
+            page: PageExtent { right: 1.0, bottom: 0.0, z_min: 0.0, z_max: 0.0 },
+            ink: InkExtent { min: [0.0, 0.0, 0.0], max: [1.0, 1.0, 0.0] },
         };
         let mut negative_zero = base;
         negative_zero.page.bottom = -0.0;
@@ -998,7 +1127,10 @@ mod tests {
         let placement = compact_records_into(&[], Paint::Flat(0), 0, &mut arena);
         assert_eq!(placement.slot_count, 0);
         assert_eq!(placement.record_count, 0);
-        assert_eq!(placement.page, PageExtent { right: 0.0, bottom: 0.0 });
+        assert_eq!(
+            placement.page,
+            PageExtent { right: 0.0, bottom: 0.0, z_min: 0.0, z_max: 0.0 }
+        );
         assert!(placement.ink.min[0].is_infinite() && placement.ink.min[0] > 0.0);
         assert!(placement.ink.max[0].is_infinite() && placement.ink.max[0] < 0.0);
     }

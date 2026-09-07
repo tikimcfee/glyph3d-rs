@@ -284,6 +284,19 @@ pub struct FileView {
     /// Page size in world units (before the group offset).
     pub width: f32,
     pub height: f32,
+    /// Depth extent of the laid-out page, before the group offset.
+    ///
+    /// From `page`, not `ink`. In Z the two measure the same thing — a glyph
+    /// quad has no thickness, so depth is a point per record — and page runs
+    /// over ALL records while ink runs over survivors, making page a superset.
+    /// A box containing everything drawn only costs a draw; one that does not
+    /// can drop something visible.
+    ///
+    /// This does NOT generalise to Y: `page.bottom` tracks baselines and ink
+    /// hangs half a glyph-height below them, which is why the xy below carries
+    /// hand-tuned margins instead of using the page directly.
+    pub z_min: f32,
+    pub z_max: f32,
     /// Group offset assigned by the grid layout.
     pub offset: [f32; 3],
     /// Stage G: the exact engine params this file was laid out with. A pick
@@ -316,8 +329,8 @@ pub struct RepoLoad {
     pub instances: Vec<GlyphInstance>,
     pub groups: Vec<GroupRow>,
     pub files: Vec<FileView>,
-    pub bounds_min: [f32; 2],
-    pub bounds_max: [f32; 2],
+    pub bounds_min: [f32; 3],
+    pub bounds_max: [f32; 3],
     pub stats: LoadStats,
     /// Stage G: repo root + engine trie — the pick path re-reads/re-runs
     /// individual files from these.
@@ -363,7 +376,7 @@ fn dir_tint(dir: &str) -> [f32; 3] {
 fn layout(
     views: &mut [FileView],
     params: &RepoParams,
-) -> (Vec<GroupRow>, [f32; 2], [f32; 2]) {
+) -> (Vec<GroupRow>, [f32; 3], [f32; 3]) {
     let page_h = params.page_rows as f32 * params.line_height as f32;
     // Class bounds in world units: ≤2 pages tall, ≤16 pages tall, monsters.
     let class_of = |h: f32| -> usize {
@@ -408,8 +421,14 @@ fn layout(
     let min_y = shelf_top - shelf_h;
 
     let mut groups = Vec::with_capacity(views.len());
+    // Scene depth is the union of the placed files' own depth, not a constant.
+    // Seeded at 0 so a wholly planar field still reports a zero-thickness slab
+    // rather than an inverted one.
+    let (mut min_z, mut max_z) = (0.0f32, 0.0f32);
     for (v, off) in views.iter_mut().zip(offsets.iter()) {
         v.offset = *off;
+        min_z = min_z.min(v.offset[2] + v.z_min);
+        max_z = max_z.max(v.offset[2] + v.z_max);
         groups.push(GroupRow::tinted(v.offset, dir_tint(&v.dir)));
     }
     log::info!(
@@ -420,8 +439,8 @@ fn layout(
     );
     (
         groups,
-        [0.0, min_y],
-        [max_x.max(1.0), params.line_height as f32],
+        [0.0, min_y, min_z],
+        [max_x.max(1.0), params.line_height as f32, max_z],
     )
 }
 
@@ -562,6 +581,8 @@ pub fn load_repo(
             // bottom; one line pitch of margin covers the bottom row's
             // descenders.
             height: -placed.page.bottom + params.line_height as f32,
+            z_min: placed.page.z_min,
+            z_max: placed.page.z_max,
             offset: [0.0; 3],
             item: file_params[index],
         });
@@ -644,11 +665,18 @@ impl RepoLoad {
             .map(|v| {
                 let insts = &self.instances[v.slot_base..v.slot_base + v.slot_count];
                 crate::glyph_scene::SegCull {
-                    min: [v.offset[0] - 0.3, v.offset[1] - v.height - 0.5],
-                    max: [v.offset[0] + v.width + 0.6, v.offset[1] + 0.75],
+                    min: [
+                        v.offset[0] - 0.3,
+                        v.offset[1] - v.height - 0.5,
+                        v.offset[2] + v.z_min,
+                    ],
+                    max: [
+                        v.offset[0] + v.width + 0.6,
+                        v.offset[1] + 0.75,
+                        v.offset[2] + v.z_max,
+                    ],
                     slot_base: v.slot_base as u32,
                     slot_count: v.slot_count as u32,
-                    _pad: [0.0; 2],
                     tint: crate::glyph_scene::seg_tint(insts, v.width, v.height),
                 }
             })
