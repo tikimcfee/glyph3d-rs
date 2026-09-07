@@ -7,6 +7,13 @@
 # 2026-09-06 when the gates got names; the final ALL PASS line on stdout is
 # the load-bearing contract the runner greps for.)
 set -euo pipefail
+
+# Screenshots here are throwaway: they exist so the binary has somewhere to
+# write while we read its stdout. They used to go to tracked files in out/ and
+# be restored with `git checkout` afterwards, which left the tree dirty whenever
+# a run died — and check-all reads the working tree.
+SCRATCH="${TMPDIR:-/tmp}/glyph-pick-oracle"
+mkdir -p "$SCRATCH"
 cd "$(dirname "$0")/.."
 BIN=target/release/glyph3d-native
 # Unlike its siblings this script had no binary guard for most of its life:
@@ -33,7 +40,7 @@ assert_char() { # desc, line, expected_char, expected_byte
 }
 
 echo "── fixture repo: deterministic row/col picks ──────────────────"
-OUT=$($BIN --load-repo $FIX --screenshot out/g-check-fixture.png \
+OUT=$($BIN --load-repo $FIX --screenshot "$SCRATCH/fixture.png" \
   --pick-file alpha.rs --pick-row 0 --pick-col 0 \
   --pick-file alpha.rs --pick-row 0 --pick-col 3 \
   --pick-file alpha.rs --pick-row 4 --pick-col 4 \
@@ -98,7 +105,7 @@ echo "── pixel-pick round trips (ray path) ───────────
 pixel_roundtrip() { # focus-file, row, col, expect_rec
     local ff="$1" row="$2" col="$3" erec="$4"
     local out w h lx ly px py
-    out=$($BIN --load-repo $FIX --focus-file "$ff" --pick-file "$ff" --pick-row "$row" --pick-col "$col" --screenshot out/g-check-px.png 2>&1)
+    out=$($BIN --load-repo $FIX --focus-file "$ff" --pick-file "$ff" --pick-row "$row" --pick-col "$col" --screenshot "$SCRATCH/px.png" 2>&1)
     w=$(echo "$out" | grep -oE 'page [0-9.]+x[0-9.]+' | head -1 | sed -E 's/page ([0-9.]+)x([0-9.]+)/\1/')
     h=$(echo "$out" | grep -oE 'page [0-9.]+x[0-9.]+' | head -1 | sed -E 's/page ([0-9.]+)x([0-9.]+)/\2/')
     lx=$(echo "$out" | grep -oE 'pos=\([-0-9.]+,[-0-9.]+' | head -1 | sed -E 's/pos=\(([-0-9.]+),([-0-9.]+)/\1/')
@@ -114,7 +121,7 @@ x_ndc = (cx - hw) * f / (1.6 * d); y_ndc = (cy + hh) * f / d
 print(round((x_ndc+1)*800), round((1-y_ndc)*500))
 ")
     local line2
-    line2=$($BIN --load-repo $FIX --focus-file "$ff" --pick-px "$px" "$py" --screenshot out/g-check-px.png 2>&1 | grep -E "^pick: " | head -1)
+    line2=$($BIN --load-repo $FIX --focus-file "$ff" --pick-px "$px" "$py" --screenshot "$SCRATCH/px.png" 2>&1 | grep -E "^pick: " | head -1)
     if echo "$line2" | grep -qF "rec=$erec "; then
         echo "PASS  px ($px,$py) on $ff — $line2"
     else
@@ -125,7 +132,7 @@ pixel_roundtrip alpha.rs 4 4 50
 pixel_roundtrip long.md 200 5 7205
 
 echo "── native/src: oracle-asserted picks across files/depths ──────"
-OUT=$($BIN --load-repo "$REPO" --screenshot out/g-check-js.png \
+OUT=$($BIN --load-repo "$REPO" --screenshot "$SCRATCH/js.png" \
   --pick-file text.rs --pick-row 0 --pick-col 0 \
   --pick-file text.rs --pick-row 12 --pick-col 7 \
   --pick-file engine.rs --pick-row 5 --pick-col 2 \
