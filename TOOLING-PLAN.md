@@ -282,6 +282,26 @@ What it does not get is the tool inside its own regime — the runner stays
 untested by the suite it runs, and the unused-field warning that would have
 caught finding 1 never fires.
 
+## Measured negatives — do not retry these without new information
+
+**`sccache` does not help here [measured 2026-09-06].** A full `cargo glyph
+prove` is 5:19 without it and 5:21 with it, and the stats say why: 27 compile
+requests, **0 cache hits, 0 misses, 27 non-cacheable** — 18 rejected for
+`crate-type`. sccache caches `lib`/`rlib` and refuses binaries, and everything a
+mutation recompiles here is a `bin`: the renderer, `glyph`, the test binary, the
+build scripts. The third-party dependencies are already built and never
+recompiled, so there is nothing in the expensive path it is willing to cache.
+Installed, wired as an opt-in `RUSTC_WRAPPER`, measured, reverted.
+
+**The cost of `prove` is inherent, and that is why it is not in the loop.**
+~5 minutes wall at ~330% CPU for 14 mutations. Mutation-testing compiled code
+means recompiling it: four mutations declare a renderer rebuild and each runs it
+TWICE (once mutated, once restored), three more target gates that ARE compiles,
+and every gate runs twice per mutation (green-first, then post-mutation) — 28
+gate runs. `glyph test` is 55s and `glyph test <scope>` is 25s; those are the
+loop. Run `prove` deliberately, before and after changing the tooling, which is
+when a check is most likely to have quietly stopped working.
+
 ## Open
 
 - Whether to take the typed rewrite (step 2 onward) or stop after step 1 plus
