@@ -92,24 +92,37 @@ counts = { "pipe" = 17, "bake" = 8 }
 note = "The Rust-side corpus pins (fixture.rs / bake.rs, 'update deliberately') stay; they and these declared counts are two independent witnesses, not duplicates."
 
 # ── Goldens ──────────────────────────────────────────────────────────────
-# Verified, NEVER built. These four byte-equal screenshots are the only
-# PIXEL gate, and the expected bytes cannot be derived from anything —
+# Verified, NEVER built. These byte-equal screenshots are the only PIXEL
+# gate, and the expected bytes cannot be derived from anything —
 # re-rendering after a deliberate renderer change and committing the new
 # PNGs is a human re-baseline act, done by hand, with a note in the commit.
 # The tool refuses to regenerate them: no build command exists for this
 # artifact, by design.
+#
+# ONE SET PER RASTERIZER. `{gpu}` is the key the renderer prints from
+# `--gpu-key` (`<backend>-<vendor>`, e.g. metal-apple, vulkan-nvidia): the
+# first Linux run (2026-09-07) showed NVIDIA's Vulkan rasterizer flips
+# isolated edge pixels against Metal renders while every numeric gate stays
+# bit-exact, so a golden set is a property of the hardware, not of the tree,
+# and matching them across vendors is not a goal. Each set carries an
+# ADAPTER.txt (`--gpu-profile`) naming the device and driver that made it;
+# the gate prints a NOTE when the live adapter disagrees with the record. A
+# host with no set for its key is red with the adoption commands printed —
+# adopting is still by hand. `glyph drift` compares this host's renders
+# against every OTHER set, so a cross-vendor difference that stops looking
+# like edge noise is visible without being a gate.
 
 [artifact.pixel-baselines]
 class = "golden"
 outputs = [
-  "out/tooling-ab/baseline/demo.png",
-  "out/tooling-ab/baseline/text.png",
-  "out/tooling-ab/baseline/repo-zoom.png",
-  "out/tooling-ab/baseline/repo-wide.png",
-  "out/tooling-ab/baseline/repo-down.png",
+  "out/tooling-ab/baseline/{gpu}/demo.png",
+  "out/tooling-ab/baseline/{gpu}/text.png",
+  "out/tooling-ab/baseline/{gpu}/repo-zoom.png",
+  "out/tooling-ab/baseline/{gpu}/repo-wide.png",
+  "out/tooling-ab/baseline/{gpu}/repo-down.png",
 ]
 inputs = ["target/release/glyph3d-native", "native/fixtures/baseline-view.txt", "native/fixtures/g-pick-repo/**"]
-note = "Blind to everything outside these four frames, and cannot distinguish a regression from an intentional change. empty.rs in g-pick-repo is zero bytes ON PURPOSE (the only input reaching the page-extent origin seed)."
+note = "Blind to everything outside these frames, and cannot distinguish a regression from an intentional change. One set per rasterizer ({gpu}); a set only ever proves the renderer on the hardware that made it. empty.rs in g-pick-repo is zero bytes ON PURPOSE (the only input reaching the page-extent origin seed)."
 
 # Per-view render commands (run from native/, screenshot into {scratch}).
 [[golden_view]]
@@ -229,8 +242,8 @@ name = "pixel-ab"
 scope = "render"
 kind = "golden-verify"
 needs = ["renderer", "pixel-baselines"]
-compare = "every declared golden_view re-rendered vs out/tooling-ab/baseline, byte-equal"
-blind_to = "everything outside the declared frames; regression vs intentional change (re-baselining is a human act)"
+compare = "every declared golden_view re-rendered vs out/tooling-ab/baseline/<this host's --gpu-key>, byte-equal"
+blind_to = "everything outside the declared frames; regression vs intentional change (re-baselining is a human act); any rasterizer other than this host's — a set proves nothing about another vendor"
 
 [[gate]]
 name = "repo-verify"

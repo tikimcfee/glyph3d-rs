@@ -258,13 +258,41 @@ every check after the abort point silently did not run. (The missing
 `[ -x "$BIN" ]` guard was added when the file was renamed.)
 
 **pixel-ab** (was "8"). The golden views re-rendered and byte-compared against
-`out/tooling-ab/baseline/` — `cargo glyph graph` lists them, and the count is
-deliberately not repeated here because it has changed. This is the **only**
+`out/tooling-ab/baseline/<key>/` — `cargo glyph graph` lists them, and the count
+is deliberately not repeated here because it has changed. This is the **only**
 check that sees pixels. In build.toml those PNGs are class **golden**: verified,
 with NO build path — the runner refuses to regenerate them, because re-baselining
 is a human act. Red on any change to camera, shading, layout, shaping or culling
 that reaches one of those frames. Blind to everything outside them, and it cannot
 distinguish a regression from an intentional change, which is deliberate.
+
+**One golden set per rasterizer, since 2026-09-07.** `<key>` is what the
+renderer prints from `--gpu-key`: `<backend>-<vendor>` off the adapter wgpu
+actually picked (`metal-apple`, `vulkan-nvidia`), resolved by the runner from
+the `{gpu}` token in build.toml. The first Linux run showed why: against the
+Metal set, NVIDIA's Vulkan rasterizer differs by ~1 level over 1-4% of pixels
+plus a few dozen ISOLATED single-pixel coverage flips at quad edges, while every
+numeric gate — fold, scan, bake, FFI, direct path, picks — is bit-exact. Pixels
+are a property of the rasterizer; the layout is not. Making vendors agree is
+not a goal and nothing here tries. The key is deliberately coarser than the
+hardware (a 5090 and a 4090 share a set until a diff proves otherwise); each set
+carries an `ADAPTER.txt` from `--gpu-profile` naming the exact device and
+driver that made it, and the gate prints a NOTE when the live adapter disagrees
+with the record, so a driver update that moves a pixel explains itself.
+Escalating the key to device level is a change to `GpuProfile::key` alone.
+
+The gate has three states, not two: byte-equal, DIVERGES (the renderer
+changed on this hardware — fix or re-baseline by hand), and **no set for this
+host's key** — red, with the adoption commands printed. Adoption is still by
+hand: look at the frames, run `cargo glyph drift`, copy, record the adapter,
+say why in the commit. `drift` is an INSTRUMENT, not a gate: this host's fresh
+renders against every OTHER set, reporting differing pixels, max delta, and
+whether the high-delta pixels are isolated (edge flips) or clustered (something
+has a shape). The day that line stops saying "edge noise" is the day to look at
+the shader; until then a cross-vendor difference is expected and uninteresting.
+What a set proves is the renderer ON THE HARDWARE THAT MADE IT — a green here on
+Linux says nothing about Metal, and `validate` refuses a golden output that is
+not keyed.
 
 **Which view covers what, because the answer is not uniform.** `repo-wide`
 renders the default wrap mode (`back` — a wrap costs DEPTH); `repo-down` exists
@@ -401,7 +429,7 @@ with a number against it.
 | `native/src/shaders/*.wgsl` | fenced | the naga test pins the shader *set* — that it compiles and exists, not what it draws. The only thing that sees a pixel change is the golden-view A/B, whose blind spots are above. That gap is why edits here need their own re-baselined change rather than an ordinary commit |
 | `native/fixtures/baseline-view.txt` | IMMUTABLE | it is the input to `text.png`; editing it re-baselines that check silently |
 | `native/fixtures/g-pick-repo/empty.rs` | IMMUTABLE, zero bytes | the only input that reaches the page-extent origin seed; deleting it removes a check's ability to see its subject without removing the check |
-| `out/tooling-ab/baseline/` | tracked pixel oracle; **golden** in build.toml | changes only on purpose, with a note saying why; the runner refuses to regenerate it |
+| `out/tooling-ab/baseline/<key>/` | tracked pixel oracle, one set per rasterizer; **golden** in build.toml | changes only on purpose, with a note saying why; the runner refuses to regenerate it. A new host adopts its own set by hand (the gate prints how); it never edits another's |
 | `integration/egui/` | vendored reference | never compiled; the real dependency is from crates.io |
 
 Hand-editing a generated file buys a failure on the next run. Regenerate instead
