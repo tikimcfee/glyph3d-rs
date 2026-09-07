@@ -554,7 +554,25 @@ fn gate_cmd(g: &Gate) -> bool {
             println!("PASS  {}", g.name);
         }
     } else {
-        for l in out.lines().rev().take(12).collect::<Vec<_>>().into_iter().rev() {
+        // Surface the child's OWN result lines on failure too, not just a tail.
+        // Truncating to the last N lines drops the line that names WHICH part
+        // failed whenever the child is chatty afterwards — the same detail loss
+        // as collapsing the success case to one line, and it made a mutation
+        // report "red for an unstated reason" when the reason was printed.
+        let detail: Vec<&str> =
+            out.lines().filter(|l| l.starts_with("PASS ") || l.starts_with("FAIL ")).collect();
+        for l in &detail {
+            println!("  {l}");
+        }
+        // Plus the tail, always. A child's summary line does not necessarily
+        // start with PASS/FAIL — check-pick-oracle.sh ends "PICK ORACLE CHECK:
+        // FAILURES" — and filtering to result-shaped lines alone dropped the
+        // one line that named the outcome.
+        // Always a full tail. Shortening it when detail exists dropped
+        // "conformance: 3 case(s) failed" — a marker that is neither PASS- nor
+        // FAIL-shaped — and broke a mutation that had been passing.
+        let tail = 12;
+        for l in out.lines().rev().take(tail).collect::<Vec<_>>().into_iter().rev() {
             println!("      {l}");
         }
         println!("FAIL  {}", g.name);
@@ -872,10 +890,17 @@ fn cmd_prove(m: &Manifest, only: Option<&str>) -> bool {
                     mu.why.as_deref().unwrap_or("")
                 )
             } else if !out.contains(&mu.expect) {
+                // Say what it DID print. Without this the operator is told the
+                // reason was unstated and given no way to state it.
+                let got = out
+                    .lines()
+                    .rfind(|l| l.starts_with("FAIL"))
+                    .or_else(|| out.lines().next_back())
+                    .unwrap_or("(no output)");
                 format!(
                     "FAIL  {} — {} went red, but for an unstated reason.\n      \
-                     expected text containing: {:?}",
-                    mu.name, mu.gate, mu.expect
+                     expected text containing: {:?}\n      got: {}",
+                    mu.name, mu.gate, mu.expect, got.trim()
                 )
             } else {
                 format!("PASS  {} reddens on {} — {:?}", mu.gate, mu.name, mu.expect)

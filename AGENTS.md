@@ -100,7 +100,8 @@ both are thin doors onto `cargo glyph test`.
 - **`cargo glyph prove`** applies each mutation declared in `build.toml`,
   requires the named check to redden for the named reason, and restores
   byte-exact. It reports COVERAGE — which checks have no mutation and are
-  therefore unproven — not a pass count.
+  therefore unproven — not a pass count. **All eleven are covered as of
+  2026-09-06**; a new check should arrive with the mutation that proves it.
 - **`cargo glyph gates`** prints what each check compares and cannot see;
   **`graph`** the artifact graph; **`validate`** the manifest against its schema.
 

@@ -6,7 +6,14 @@
 # (Was tools/check-stage-g.sh — the "g" was a fossil stage letter, renamed
 # 2026-09-06 when the gates got names; the final ALL PASS line on stdout is
 # the load-bearing contract the runner greps for.)
-set -euo pipefail
+# NOT `set -e`, deliberately. This script already accumulates FAIL and reports
+# every mismatch at the end (see the last line) — but -e killed it at the first
+# nonzero exit inside a command substitution, so a genuine pick mismatch printed
+# two lines, exited 1 with no diagnostic, and silently skipped every remaining
+# check. Measured 2026-09-06 with an off-by-one in pick_row_col: 2 lines out of
+# ~20, no cause named. Its sibling check-fixture-parity.sh has always been
+# written this way; this one now matches.
+set -uo pipefail
 
 # Screenshots here are throwaway: they exist so the binary has somewhere to
 # write while we read its stdout. They used to go to tracked files in out/ and

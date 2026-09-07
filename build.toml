@@ -350,3 +350,93 @@ with = """
         block = 1
     var entry"""
 expect = "FAIL  engine-check (fixtures/overflow-leads.txt)"
+
+[[mutation]]
+name = "unused-binding"
+gate = "cargo-build"
+why = "the zero-warning policy is enforced by our own warn_count parsing, not by rustc; a filter bug would let warnings through silently"
+file = "native/src/fold.rs"
+op = "replace"
+find = """pub(crate) fn wrap_segment_of(col: i64, wrap: i64, terminator: bool) -> i64 {
+"""
+with = """pub(crate) fn wrap_segment_of(col: i64, wrap: i64, terminator: bool) -> i64 {
+    let unread = col;
+"""
+expect = "cargo-build — 1 warnings"
+
+[[mutation]]
+name = "clippy-lint"
+gate = "cargo-clippy"
+why = "same, for clippy: the gate counts lints itself and a counting bug would read as a clean tree"
+file = "native/src/fold.rs"
+op = "replace"
+find = """pub(crate) fn wrap_segment_of(col: i64, wrap: i64, terminator: bool) -> i64 {
+    if wrap <= 0 {
+"""
+with = """pub(crate) fn wrap_segment_of(col: i64, wrap: i64, terminator: bool) -> i64 {
+    let v: Vec<i64> = Vec::new();
+    if v.len() == 0 {}
+    if wrap <= 0 {
+"""
+expect = "cargo-clippy — 2 warnings"
+
+[[mutation]]
+name = "advance-zeroed"
+gate = "reference-port"
+why = "every glyph x-position derives from the atlas advance; zeroing it must break the port's agreement with the JS oracle's recorded lanes. cargo-mutants measured this exact mutant as MISSED by all 85 unit tests"
+file = "native/src/fold.rs"
+op = "replace"
+find = """    pub fn advance(&self, id: usize) -> f32 {
+        self.sm[id * 2]
+    }"""
+with = """    pub fn advance(&self, id: usize) -> f32 {
+        let _ = id;
+        0.0
+    }"""
+expect = "full fold"
+rebuild = "cargo build --release"
+
+[[mutation]]
+name = "coverage-scale"
+gate = "pixel-ab"
+why = "the four baselines are the ONLY pixel check; a shader constant that changes glyph antialiasing must move them. Chosen because it is purely visual — it does not touch the fold, the corpus or CPU-side picking, so a red here is attributable to this gate and no other"
+file = "native/src/shaders/glyph_field.wgsl"
+op = "replace"
+find = "let cov = clamp(coverage * 0.5, 0.0, 1.0);"
+with = "let cov = clamp(coverage * 0.62, 0.0, 1.0);"
+expect = "text.png diverges from baseline"
+rebuild = "cargo build --release"
+
+[[mutation]]
+name = "per-item-group-drift"
+gate = "repo-verify"
+why = "this gate is strategy-vs-strategy: its whole claim is that the per-item and batched FFI paths agree. Perturbing ONE path must break that. The per-item branch is exercised by no other gate (engine-check hardcodes batched), so a red here is attributable to this check alone"
+file = "native/src/layout_mojo.rs"
+op = "replace"
+find = """                    placements.push(compact_records_into(
+                        &records,
+                        item.paint,
+                        item.group_id,
+                        arena,
+                    ));"""
+with = """                    placements.push(compact_records_into(
+                        &records,
+                        item.paint,
+                        item.group_id.wrapping_add(1),
+                        arena,
+                    ));"""
+expect = "FAIL  --wrap-mode down"
+rebuild = "cargo build --release"
+
+[[mutation]]
+name = "pick-off-by-one"
+gate = "pick-oracle"
+why = "an off-by-one in the exact-match is the realistic pick defect: it resolves to the neighbouring glyph, which still looks like a plausible answer. Only an INDEPENDENT oracle can call it wrong, which is what this gate is for"
+file = "native/src/glyph_scene.rs"
+op = "replace"
+find = """            if r.row() == row {
+                if r.col() == col {"""
+with = """            if r.row() == row {
+                if r.col() == col.wrapping_add(1) {"""
+expect = "PICK ORACLE CHECK: FAILURES"
+rebuild = "cargo build --release"
