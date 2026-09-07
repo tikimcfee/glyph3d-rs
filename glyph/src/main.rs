@@ -1040,12 +1040,27 @@ fn main() -> ExitCode {
         }
         Cmd::Test { scope, frozen } => cmd_test(&m, scope, frozen),
         Cmd::Run { args } => {
-            let (ok, out) = sh(
-                &format!("../target/release/glyph3d-native {}", args.join(" ")),
-                &native(),
-            );
-            print!("{out}");
-            ok
+            // Runs in YOUR directory, not native/. A file argument means what
+            // it says relative to where you typed it — anything else would make
+            // `--render-file main.rs` from your own project silently open
+            // native/main.rs. The checks cd to native/ because they pass
+            // native-relative fixture paths on purpose; that is their business,
+            // not yours.
+            //
+            // stdio is inherited rather than captured: this launches a windowed
+            // app, and buffering its output until the window closes is useless.
+            let cwd = std::env::current_dir().unwrap_or_else(|_| root());
+            let exe = root().join("target/release/glyph3d-native");
+            if !exe.exists() {
+                println!("FAIL  {} does not exist — run `cargo glyph build`.", exe.display());
+                return ExitCode::from(1);
+            }
+            Command::new(exe)
+                .args(&args)
+                .current_dir(cwd)
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false)
         }
         Cmd::Prove { gate } => cmd_prove(&m, gate.as_deref()),
         Cmd::Gate { name } => match m.gate.iter().find(|g| g.name == name) {

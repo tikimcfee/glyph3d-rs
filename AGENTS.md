@@ -81,6 +81,13 @@ cargo glyph test --frozen  assert currency instead of building it
 cargo glyph run --demo     launch the renderer; arguments pass through
 ```
 
+`run` executes in YOUR directory, so a file argument means what it says relative
+to where you typed it. The checks `cd` to `native/` because they pass
+native-relative fixture paths deliberately — that is their business, not yours.
+The `cargo glyph` alias is repo-scoped (it lives in `.cargo/config.toml`), so
+from outside the workspace call the binary directly:
+`<repo>/target/release/glyph3d-native --load-repo .`
+
 **Use it rather than the pieces.** Do not hand-run `cargo build`,
 `engine/check.sh`, the `tools/` scripts, or the binary's own `--engine-check` /
 `--repo-verify` flags: the ordering between them is exactly what the tool exists

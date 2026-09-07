@@ -79,8 +79,11 @@ mechanism and the two guards that exist because prose was not enough.
 
 ### Running the renderer
 
-Binary is `target/release/glyph3d-native`; the run commands below are from
-`native/` because their file arguments are relative to it (full flag set:
+Binary is `target/release/glyph3d-native`. `cargo glyph run` executes in your
+current directory, so file arguments mean what they say relative to where you
+are; the table below uses `native/`-relative fixture paths, so run those from
+`native/`. From outside the repo, call the binary directly — the `cargo glyph`
+alias is repo-scoped (full flag set:
 `--help`).
 
 | What | Command |
