@@ -155,6 +155,46 @@ runtime:
   exactly as the plan says, and a single large file folds on one core here
   too.
 
+**After merging main's chunked lane scratch (`9cb5c3f`, 2026-09-07 — the fold
+runs in 4 MiB chunks through one grown-only set of lane arrays), re-measured
+the same way:**
+
+| corpus | MB | direct before | direct after | MB/s | fold | dw_write | peak RSS |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| egui | 5.0 | 0.032 s | 0.033 s | 152 | 0.007 s | 0.014 s | — |
+| glyph3d-js | 11.2 | 0.087 s | 0.091 s | 123 | 0.026 s | 0.028 s | — |
+| nototto | 27.5 | 0.262 s | 0.227 s | 121 | 0.094 s | 0.071 s | 1.78 GB |
+| tmuxai | 58.8 | 0.393 s | 0.313 s | 188 | 0.056 s | 0.159 s | 3.16 GB |
+| python3.14 | 77.3 | 0.520 s | 0.422 s | 183 | 0.083 s | 0.198 s | 4.13 GB |
+
+(`naive` and `batch` unchanged within noise; RSS here is per-run `ru_maxrss`
+of a fresh child — the first pass's RSS column was a running maximum across
+runs and is not quoted.) The two corpora that span many chunks gained
+~25%, and the fold stage on tmuxai went 0.085 → 0.056 s: the reused scratch
+stays warm instead of being first-touched per corpus. Below one chunk
+nothing changes, as it should not. Bit-exact throughout — `engine-check`
+and `repo-verify-direct` green on the merged engine.
+
+**What is left is the arena scatter.** `dw_write` is now ~50% of the direct
+backend: 2.7 GB of 48 B instances in 0.159 s ≈ 17 GB/s of writes plus the
+lane reads that feed them, against the 33 GB/s fill ceiling above. Two
+things that looked like levers on this box are not:
+
+- **`DIRECT_CHUNK_BYTES` is flat from 1 to 16 MiB** (tmuxai 0.311–0.315 s,
+  python 0.430–0.435 s, fold and dw_write unchanged at every size). The
+  hypothesis was that a 1 MiB chunk's ~44 MB of lanes would fit the
+  9950X3D's V-cache CCD where 4 MiB's ~176 MB cannot; it does not show. Same
+  null as BOUNDS_GRAIN on the M2 — recorded so nobody retries it.
+- **Transparent huge pages are already `always`** on this kernel (886 MB of
+  AnonHugePages resident during a run), so the arena's first touch is not
+  paying 4 KiB faults, and the M2's finding that pre-touching is a net loss
+  has no Linux counter-experiment worth running.
+
+So the scatter is bound by the store pattern itself — 48 B instances landing
+across grains — and by the lanes it reads. That is the same conclusion as
+before the merge, one level down: fewer bytes per source byte, or a device
+that has the bandwidth.
+
 `fold_profile` on this box (17 files, 718 KB): serial 109 / 209 / 420 / 623 /
 660 MB/s at 1 / 8 / 64 / 512 / 4,096 items; scan 87 → 2.1 MB/s over the same
 sweep (316x worse at 4,096 items, the plan's "opposite scaling" reproduced).
