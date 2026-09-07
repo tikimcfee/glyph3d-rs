@@ -33,9 +33,13 @@ from std.memory.alloc import alloc, dealloc, Layout
 from std.runtime import initialize_runtime
 from std.time import perf_counter_ns
 
-from glyph_pipeline import Item, Trie, run_pipeline, PipelineResult, F_LEADER, ST_COUNT  # NATIVE-PORT: F_LEADER for load_items per-item counts
+from glyph_pipeline import (
+    Item, Trie, run_pipeline, run_pipeline_into, PipelineResult, F_LEADER,
+    ST_COUNT,
+)  # NATIVE-PORT: F_LEADER for load_items per-item counts
 from glyph_record import (
     RecordSet, compact, direct_write_all, DirectPlacement, INST_U32S,
+    DW_LANES,
 )
 from fixture_io import load_trie_auto  # NATIVE-PORT: G3DF fixture or G3TR blob
 
@@ -73,8 +77,17 @@ struct EngineState(Movable):
 # Engine-side stage lanes: run_pipeline's ST_* first, then this entry's own.
 comptime EG_COMPACT = ST_COUNT       # repack the wire stream into the arena
 comptime EG_COUNTS = ST_COUNT + 1    # per-item record counts — SERIAL O(bytes)
-comptime EG_DIRECT = ST_COUNT + 2    # the direct write: lanes straight to instances
-comptime EG_STAGE_COUNT = ST_COUNT + 3
+# The direct write, SPLIT into its five phases rather than carried as one total.
+# A single `eg_direct` lane was the largest thing on the engine line and said
+# nothing about which part of a count/prefix/scatter it was — the same
+# aggregate-behind-one-name shape that made `fold` unreadable for a day. These
+# five sum to what that lane held, so the engine line still totals the FFI call.
+comptime EG_DIR_BUILD = ST_COUNT + 2
+comptime EG_DIR_COUNT = ST_COUNT + 3
+comptime EG_DIR_PREFIX = ST_COUNT + 4
+comptime EG_DIR_WRITE = ST_COUNT + 5
+comptime EG_DIR_MERGE = ST_COUNT + 6
+comptime EG_STAGE_COUNT = ST_COUNT + 7
 
 comptime Handle = Pointer[NoneType, MutUntrackedOrigin]
 
@@ -103,6 +116,12 @@ comptime GE_PAINT_TOO_SHORT: c_int = 11
 # the write count disagree — which is what GE_ARENA_TOO_SMALL is sized against,
 # so the arena guard is unsound precisely when it is needed.
 comptime GE_BAD_ITEM_RANGE: c_int = 12
+
+# How many source bytes one chunk of the direct path folds before its lanes are
+# reused. Sets peak lane memory (~40 B per byte here) independently of corpus
+# size. Not a correctness knob — every value produces identical output, which
+# `repo-verify-direct` checks against the unchunked batched path.
+comptime DIRECT_CHUNK_BYTES = 4 * 1024 * 1024
 """The descriptor carries a shape word this dylib does not recognise — the caller
 was built against a different FFI surface. See ABI_SHAPE."""
 
@@ -279,7 +298,7 @@ def glyph_engine_load_item_desc(
     s[].leaders = r.leaders
     var _c = perf_counter_ns()
     compact(r, n, r.leaders, s[].records)
-    _record_stages(s[], r, perf_counter_ns() - _c, 0, 0)
+    _record_stages(s[], r, perf_counter_ns() - _c, 0, List[Int](length=DW_LANES, fill=0))
     _ = len(items)
     return GE_OK
 
@@ -319,7 +338,7 @@ comptime ITEM_DESC_SIZE: Int = ABI_DESC_BYTES
 
 def _record_stages(
     mut st: EngineState, r: PipelineResult,
-    compact_ns: Int, counts_ns: Int, direct_ns: Int,
+    compact_ns: Int, counts_ns: Int, direct: List[Int],
 ):
     """Fold run_pipeline's own stage lanes into the handle, then add the three
     this file owns. Kept as one writer so the lane layout has a single author.
@@ -332,7 +351,8 @@ def _record_stages(
         st.stage_ns[i] = r.stage_ns[i]
     st.stage_ns[EG_COMPACT] = compact_ns
     st.stage_ns[EG_COUNTS] = counts_ns
-    st.stage_ns[EG_DIRECT] = direct_ns
+    for i in range(DW_LANES):
+        st.stage_ns[EG_DIR_BUILD + i] = direct[i]
 
 
 @export("glyph_engine_load_items")
@@ -404,7 +424,7 @@ def glyph_engine_load_items(
             it_end = Int(base.unsafe_bitcast[UInt64]()[unsafe_offset = 14]) + Int(base.unsafe_bitcast[UInt64]()[unsafe_offset = 15])
         if (Int(r.fl[id]) & F_LEADER) != 0:
             counts_out[unsafe_offset = it_i] += 1
-    _record_stages(s[], r, compact_ns, perf_counter_ns() - _k, 0)
+    _record_stages(s[], r, compact_ns, perf_counter_ns() - _k, List[Int](length=DW_LANES, fill=0))
     _ = len(items)
     return GE_OK
 
@@ -539,29 +559,88 @@ def glyph_engine_load_items_direct(
     if not _items_tile(items, n):
         return GE_BAD_ITEM_RANGE
 
-    var span = Span[UInt8, ImmUntrackedOrigin](unsafe_ptr=blob_ptr, length=n)
-    var r = run_pipeline[witness=False](span, s[].trie, items)
-    s[].leaders = r.leaders
-    if r.leaders > Int(inst_cap):
-        return GE_ARENA_TOO_SMALL
-
-    var _w = perf_counter_ns()
-    var paint_bad = 0
-    var places = direct_write_all(
-        r, items, group_ids, paint_ptrs, paint_lens, flat_colors, inst_ptr,
-        paint_bad,
-    )
-    if paint_bad != 0:
-        return GE_PAINT_TOO_SHORT
-    # slot_base is re-derived here rather than returned, because the writer's
-    # own prefix is over GRAINS and this one is over items: the same running
-    # sum, read at a different granularity. Deriving it twice from one source
-    # (each item's slot_count) beats carrying a second copy that could drift.
+    # ── CHUNKED: fold a group of items, write their instances, reuse the
+    # lanes, repeat. The per-byte fold lanes are ~40 B per source byte and are
+    # DEAD the instant the write has read them, so holding them for the whole
+    # corpus was 43% of a peak RSS that measured ~95 B per source byte. At 97 MB
+    # that demand exceeds what the machine will give and the write goes 6x
+    # superlinear — the cliff this loop exists to move.
+    #
+    # ONE scratch, reused. `ensure_lanes` only grows, so the first chunk (or the
+    # largest) allocates and the rest cost nothing: freeing per chunk would swap
+    # a memory win for allocator and page-fault churn, which is the very cost
+    # being attacked.
+    #
+    # AN ITEM IS ATOMIC. The fold is sequential within an item, so a chunk is a
+    # GROUP OF ITEMS, never a split one — an item larger than the target is laid
+    # whole. Splitting one further needs the bake's checkpoints (`prefix_at`
+    # resumes mid-file from a saved state, already conformance-proven) and is not
+    # this loop's job. `run_streaming` in glyph_record.mojo is the same shape for
+    # the record path, and is where this came from.
+    var scratch = PipelineResult()
+    var dprof = List[Int](length=DW_LANES, fill=0)
+    var lane_prof = List[Int](length=ST_COUNT, fill=0)
     var slot_base = 0
-    for i in range(m):
-        _write_place(place_out, i * PLACE_U32S, places[i], slot_base)
-        slot_base += places[i].slot_count
-    _record_stages(s[], r, 0, 0, perf_counter_ns() - _w)
+    var total_leaders = 0
+    var at = 0
+    while at < m:
+        # Grow the group until it would exceed the target, always taking at
+        # least one item so a huge item still makes progress.
+        var stop = at
+        var group_bytes = 0
+        while stop < m:
+            var b = items[stop].byte_count
+            if stop > at and group_bytes + b > DIRECT_CHUNK_BYTES:
+                break
+            group_bytes += b
+            stop += 1
+
+        # Items are REBASED onto the chunk: byte_start is a locator into the
+        # lane arrays, and the lanes now span the chunk rather than the corpus.
+        # Nothing else moves — positions come from each item's own params and
+        # its own fold, which is why this is output-neutral and why
+        # `repo-verify-direct` can prove it against the whole-corpus path.
+        var base_byte = items[at].byte_start
+        var sub = List[Item]()
+        for i in range(at, stop):
+            var it = items[i].copy()
+            it.byte_start = it.byte_start - base_byte
+            sub.append(it^)
+
+        var sp = Span[UInt8, ImmUntrackedOrigin](
+            unsafe_ptr=blob_ptr.unsafe_offset(base_byte), length=group_bytes
+        )
+        run_pipeline_into[witness=False](scratch, sp, s[].trie, sub)
+        total_leaders += scratch.leaders
+        if total_leaders > Int(inst_cap):
+            return GE_ARENA_TOO_SMALL
+        for k in range(ST_COUNT):
+            lane_prof[k] += scratch.stage_ns[k]
+
+        var paint_bad = 0
+        var places = direct_write_all(
+            scratch, sub,
+            group_ids.unsafe_offset(at), paint_ptrs.unsafe_offset(at),
+            paint_lens.unsafe_offset(at), flat_colors.unsafe_offset(at),
+            inst_ptr.unsafe_offset(slot_base * INST_U32S),
+            paint_bad, dprof.unsafe_ptr(),
+        )
+        if paint_bad != 0:
+            return GE_PAINT_TOO_SHORT
+
+        # slot_base is re-derived from each item's slot_count rather than
+        # returned, because the writer's own prefix is over GRAINS and this one
+        # is over items — the same running sum at a different granularity, from
+        # one source, so there is no second copy to drift.
+        for i in range(at, stop):
+            _write_place(place_out, i * PLACE_U32S, places[i - at], slot_base)
+            slot_base += places[i - at].slot_count
+        at = stop
+
+    s[].leaders = total_leaders
+    for k in range(ST_COUNT):
+        scratch.stage_ns[k] = lane_prof[k]
+    _record_stages(s[], scratch, 0, 0, dprof)
     _ = len(items)
     return GE_OK
 

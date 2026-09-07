@@ -32,6 +32,7 @@ from glyph_pipeline import (
     Item, Trie, run_pipeline, F_LEADER, PipelineResult, BOUNDS_GRAIN,
 )
 from max.algorithm import parallelize
+from std.time import perf_counter_ns
 
 
 struct RecordSet(Copyable, Movable):
@@ -302,6 +303,16 @@ comptime DP_INK_MIN = 4   # 3 lanes
 comptime DP_INK_MAX = 7   # 3 lanes
 comptime DP_LANES = 10
 
+# The direct write's own phases, ns, written into the caller's lane block. These
+# REPLACE a single `eg_direct` total rather than sitting beside it, so the engine
+# line still sums to the FFI call and `unattributed` stays meaningful.
+comptime DW_BUILD = 0     # decompose items into grains
+comptime DW_COUNT = 1     # pass A, parallel
+comptime DW_PREFIX = 2    # the serial scan over grains
+comptime DW_WRITE = 3     # pass B, parallel — the scatter
+comptime DW_MERGE = 4     # fold grain boxes into item placements
+comptime DW_LANES = 5
+
 comptime INST_U32S = 12          # 48 B / 4
 comptime INST_POS_X = 0
 comptime INST_POS_Y = 1
@@ -502,7 +513,7 @@ def write_instances_direct[bo: Origin[mut=True]](
     return (rec - paint_base, w - out_slot_base)
 
 
-def direct_write_all(
+def direct_write_all[po: Origin[mut=True]](
     r: PipelineResult,
     items: List[Item],
     group_ids: Pointer[UInt32, MutUntrackedOrigin],
@@ -511,6 +522,7 @@ def direct_write_all(
     flat_colors: Pointer[UInt32, MutUntrackedOrigin],
     out_ptr: Pointer[UInt32, MutUntrackedOrigin],
     mut paint_bad: Int,
+    prof: Pointer[Int, po],
 ) -> List[DirectPlacement]:
     """THE DIRECT WRITE, grained and parallel: count, prefix, scatter.
 
@@ -547,6 +559,17 @@ def direct_write_all(
     if item_count == 0:
         return placements^
 
+    # Phase timing is ALWAYS ON, five `perf_counter_ns` calls against a pass that
+    # runs in milliseconds. The lanes ACCUMULATE rather than assign, because the
+    # caller drives this once per CHUNK: assigning made every lane report the
+    # last chunk only, which read as a 30x speedup and left the rest in
+    # `unattributed` — a number meaning something other than its name, found by
+    # the unattributed lane it was hiding in. The alternative considered and rejected was an
+    # env-var profile flag: it would have been a second code path through the
+    # hottest loop in the load, reachable from no verb, and off by default —
+    # which is how an instrument becomes one nobody runs.
+    var _t0 = perf_counter_ns()
+
     # ── grains, in item order so a grain's index locates it in both tables ──
     var gr_at = List[Int]()
     var gr_end = List[Int]()
@@ -571,6 +594,8 @@ def direct_write_all(
             gr_item.append(i)
             at = end
     var n_gr = len(gr_at)
+    prof[unsafe_offset = DW_BUILD] += perf_counter_ns() - _t0
+    var _t = perf_counter_ns()
 
     # ── pass A: count, in parallel ──────────────────────────────────────────
     var gr_rec = List[Int](length=n_gr, fill=0)
@@ -582,6 +607,8 @@ def direct_write_all(
         rp[unsafe_offset = t] = rs[0]
         sp[unsafe_offset = t] = rs[1]
     parallelize(_count_task, n_gr)
+    prof[unsafe_offset = DW_COUNT] += perf_counter_ns() - _t
+    _t = perf_counter_ns()
 
     # ── the prefix: serial over GRAINS, which is O(items + bytes/grain) and
     # not O(bytes). Slots run across the whole corpus; paint indices restart at
@@ -599,6 +626,9 @@ def direct_write_all(
         gr_paint[t] = paint_at
         slot_at += gr_surv[t]
         paint_at += gr_rec[t]
+
+    prof[unsafe_offset = DW_PREFIX] += perf_counter_ns() - _t
+    _t = perf_counter_ns()
 
     # Paint is indexed by RECORD and the host sizes it per item, so the check is
     # per item against the record total the counting pass just produced.
@@ -634,6 +664,8 @@ def direct_write_all(
         )
         wp[unsafe_offset = t] = rs[1]
     parallelize(_write_task, n_gr)
+    prof[unsafe_offset = DW_WRITE] += perf_counter_ns() - _t
+    _t = perf_counter_ns()
     for t in range(n_gr):
         if wrote[t] != gr_surv[t]:
             paint_bad = -(t + 1)   # negative: a scatter fault, not a paint one
@@ -662,4 +694,5 @@ def direct_write_all(
                 placements[i].ink_min[k] = gbox[b + DP_INK_MIN + k]
             if gbox[b + DP_INK_MAX + k] > placements[i].ink_max[k]:
                 placements[i].ink_max[k] = gbox[b + DP_INK_MAX + k]
+    prof[unsafe_offset = DW_MERGE] += perf_counter_ns() - _t
     return placements^

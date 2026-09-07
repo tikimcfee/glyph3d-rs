@@ -141,9 +141,13 @@ pub const PLACEMENT_U32S: usize = 16;
 /// Engine-side stage lanes, in the order `ffi.mojo` writes them: `run_pipeline`'s
 /// seven, then the two the FFI entry owns. Names are the engine's, kept verbatim
 /// so a reader can grep one string across both languages.
-pub const ENGINE_STAGE_NAMES: [&str; 10] = [
+pub const ENGINE_STAGE_NAMES: [&str; 14] = [
     "alloc", "gapsweep", "decode", "misscat", "fold", "paginate", "bounds",
-    "eg_compact", "eg_counts", "eg_direct",
+    "eg_compact", "eg_counts",
+    // The direct write's five phases. They replace a single `eg_direct` total,
+    // which was the largest lane on the line and said nothing about which part
+    // of a count/prefix/scatter it was.
+    "dw_build", "dw_count", "dw_prefix", "dw_write", "dw_merge",
 ];
 
 /// Byte size of one item descriptor (see ffi.mojo's layout comment). BOTH load
