@@ -28,7 +28,9 @@ from std.runtime import initialize_runtime
 from std.time import perf_counter_ns
 
 from glyph_pipeline import Item, Trie, run_pipeline, PipelineResult, F_LEADER, ST_COUNT  # NATIVE-PORT: F_LEADER for load_items per-item counts
-from glyph_record import RecordSet, compact, direct_write_all, INST_U32S
+from glyph_record import (
+    RecordSet, compact, direct_write_all, DirectPlacement, INST_U32S,
+)
 from fixture_io import load_trie_auto  # NATIVE-PORT: G3DF fixture or G3TR blob
 
 
@@ -83,6 +85,11 @@ comptime GE_ABI_MISMATCH: c_int = 9
 # reserves the byte count as the upper bound; this fires only if that bound is
 # ever wrong, which would be a fold defect worth stopping for.
 comptime GE_ARENA_TOO_SMALL: c_int = 10
+# A per-item colour array shorter than that item's record count. The record
+# path asserts the same invariant on the host; the direct path must refuse it in
+# the engine, because here the consequence is an out-of-bounds READ from
+# parallel tasks rather than a wrong colour.
+comptime GE_PAINT_TOO_SHORT: c_int = 11
 """The descriptor carries a shape word this dylib does not recognise — the caller
 was built against a different FFI surface. See ABI_SHAPE."""
 
@@ -414,6 +421,26 @@ def glyph_engine_instance_shape() abi("C") -> UInt64:
     return (UInt64(INST_U32S) << 32) | UInt64(PLACE_U32S)
 
 
+def _write_place[po: Origin[mut=True]](
+    place_out: Pointer[UInt32, po], o: Int, p: DirectPlacement, slot_base: Int
+):
+    """Write one placement block. ONE author, because the empty path and the
+    real path must agree and a second copy is how they would stop agreeing —
+    which is exactly the bug this function was extracted to fix (2026-09-07):
+    the empty early-return skipped the block entirely, so the host decoded its
+    own zeroed buffer and lost the ink seed, which is +/-inf and not zero."""
+    place_out[unsafe_offset = o + PL_SLOT_BASE] = UInt32(slot_base)
+    place_out[unsafe_offset = o + PL_SLOT_COUNT] = UInt32(p.slot_count)
+    place_out[unsafe_offset = o + PL_RECORD_COUNT] = UInt32(p.record_count)
+    place_out[unsafe_offset = o + PL_PAGE_RIGHT] = bitcast[DType.uint32](p.page_right)
+    place_out[unsafe_offset = o + PL_PAGE_BOTTOM] = bitcast[DType.uint32](p.page_bottom)
+    place_out[unsafe_offset = o + PL_PAGE_ZMIN] = bitcast[DType.uint32](p.page_z_min)
+    place_out[unsafe_offset = o + PL_PAGE_ZMAX] = bitcast[DType.uint32](p.page_z_max)
+    for k in range(3):
+        place_out[unsafe_offset = o + PL_INK_MIN + k] = bitcast[DType.uint32](p.ink_min[k])
+        place_out[unsafe_offset = o + PL_INK_MAX + k] = bitcast[DType.uint32](p.ink_max[k])
+
+
 @export("glyph_engine_load_items_direct")
 def glyph_engine_load_items_direct(
     h: Handle,
@@ -424,6 +451,7 @@ def glyph_engine_load_items_direct(
     inst_ptr: Pointer[UInt32, MutUntrackedOrigin],
     inst_cap: c_size_t,
     paint_ptrs: Pointer[Pointer[UInt32, ImmUntrackedOrigin], MutUntrackedOrigin],
+    paint_lens: Pointer[UInt64, MutUntrackedOrigin],
     flat_colors: Pointer[UInt32, MutUntrackedOrigin],
     group_ids: Pointer[UInt32, MutUntrackedOrigin],
     place_out: Pointer[UInt32, MutUntrackedOrigin],
@@ -452,6 +480,13 @@ def glyph_engine_load_items_direct(
     s[].byte_len = n
     if n == 0 or m == 0:
         s[].leaders = 0
+        # EVERY item still gets a block. Returning early without writing left
+        # the host decoding its own zeroed buffer, and a zeroed ink extent is
+        # not an empty one: empty seeds at +/-inf, and zero is a box AT the
+        # origin. The batched path never had this hole because
+        # `compact_records_into` runs its seeds even over an empty slice.
+        for i in range(m):
+            _write_place(place_out, i * PLACE_U32S, DirectPlacement(), 0)
         return GE_EMPTY
 
     var items = List[Item]()
@@ -473,28 +508,21 @@ def glyph_engine_load_items_direct(
         return GE_ARENA_TOO_SMALL
 
     var _w = perf_counter_ns()
+    var paint_bad = 0
     var places = direct_write_all(
-        r, items, group_ids, paint_ptrs, flat_colors, inst_ptr
+        r, items, group_ids, paint_ptrs, paint_lens, flat_colors, inst_ptr,
+        paint_bad,
     )
+    if paint_bad != 0:
+        return GE_PAINT_TOO_SHORT
     # slot_base is re-derived here rather than returned, because the writer's
     # own prefix is over GRAINS and this one is over items: the same running
     # sum, read at a different granularity. Deriving it twice from one source
     # (each item's slot_count) beats carrying a second copy that could drift.
     var slot_base = 0
     for i in range(m):
-        ref p = places[i]
-        var o = i * PLACE_U32S
-        place_out[unsafe_offset = o + PL_SLOT_BASE] = UInt32(slot_base)
-        place_out[unsafe_offset = o + PL_SLOT_COUNT] = UInt32(p.slot_count)
-        place_out[unsafe_offset = o + PL_RECORD_COUNT] = UInt32(p.record_count)
-        place_out[unsafe_offset = o + PL_PAGE_RIGHT] = bitcast[DType.uint32](p.page_right)
-        place_out[unsafe_offset = o + PL_PAGE_BOTTOM] = bitcast[DType.uint32](p.page_bottom)
-        place_out[unsafe_offset = o + PL_PAGE_ZMIN] = bitcast[DType.uint32](p.page_z_min)
-        place_out[unsafe_offset = o + PL_PAGE_ZMAX] = bitcast[DType.uint32](p.page_z_max)
-        for k in range(3):
-            place_out[unsafe_offset = o + PL_INK_MIN + k] = bitcast[DType.uint32](p.ink_min[k])
-            place_out[unsafe_offset = o + PL_INK_MAX + k] = bitcast[DType.uint32](p.ink_max[k])
-        slot_base += p.slot_count
+        _write_place(place_out, i * PLACE_U32S, places[i], slot_base)
+        slot_base += places[i].slot_count
     _record_stages(s[], r, 0, 0, perf_counter_ns() - _w)
     _ = len(items)
     return GE_OK

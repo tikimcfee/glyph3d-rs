@@ -253,6 +253,7 @@ impl MojoLayout {
                 let mut blob = Vec::with_capacity(total_bytes);
                 let mut descs = Vec::with_capacity(items.len());
                 let mut paint_ptrs = Vec::with_capacity(items.len());
+                let mut paint_lens = Vec::with_capacity(items.len());
                 let mut flat_colors = Vec::with_capacity(items.len());
                 let mut group_ids = Vec::with_capacity(items.len());
                 for item in items {
@@ -262,10 +263,12 @@ impl MojoLayout {
                     match item.paint {
                         Paint::Flat(rgba) => {
                             paint_ptrs.push(std::ptr::null());
+                            paint_lens.push(0);
                             flat_colors.push(rgba);
                         }
                         Paint::PerRecord(colors) => {
                             paint_ptrs.push(colors.as_ptr());
+                            paint_lens.push(colors.len() as u64);
                             flat_colors.push(0);
                         }
                     }
@@ -277,6 +280,16 @@ impl MojoLayout {
                 // ASCII and loose for multibyte text; the engine reports what
                 // it actually wrote, and `GE_ARENA_TOO_SMALL` fires loudly if
                 // this reasoning is ever wrong rather than writing past the end.
+                // The engine's prefix is CALL-RELATIVE — it starts each load at
+                // slot 0, because it knows nothing about what the arena already
+                // holds. `compact_records_into` takes `arena.len()` instead, so
+                // its bases are ABSOLUTE. Rebasing here is what makes the two
+                // agree on a second load into the same arena; without it the
+                // instances land correctly appended and every `slot_base` is
+                // low by exactly the arena's prior length. Not reachable from
+                // `load_repo` today (fresh arena, one call), which is precisely
+                // why it needed a test rather than a reader.
+                let base = arena.len() as u32;
                 let (inst_ptr, cap) = arena.uninit_tail(total_bytes);
                 let mut place = vec![0u32; items.len() * PLACEMENT_U32S];
                 let t = Instant::now();
@@ -287,7 +300,8 @@ impl MojoLayout {
                 unsafe {
                     self.engine.load_items_direct(
                         &blob, &descs, inst_ptr as *mut u32, cap,
-                        &paint_ptrs, &flat_colors, &group_ids, &mut place,
+                        &paint_ptrs, &paint_lens, &flat_colors, &group_ids,
+                        &mut place,
                     )?
                 };
                 self.phases.fold += t.elapsed();
@@ -295,7 +309,8 @@ impl MojoLayout {
 
                 let mut written = 0usize;
                 for i in 0..items.len() {
-                    let p = placement_from_lanes(&place[i * PLACEMENT_U32S..]);
+                    let mut p = placement_from_lanes(&place[i * PLACEMENT_U32S..]);
+                    p.slot_base += base;
                     written += p.slot_count as usize;
                     placements.push(p);
                 }
@@ -437,6 +452,96 @@ mod tests {
         assert!(
             batched_places.iter().any(|p| p.record_count > p.slot_count),
             "the samples must contain blanks, or the compaction is untested here",
+        );
+    }
+
+    /// REGRESSION, found 2026-09-07 by an adversarial review and reproduced
+    /// before fixing: a corpus whose TOTAL byte length is zero.
+    ///
+    /// `glyph_engine_load_items_direct` returned `GE_EMPTY` before writing any
+    /// placement block, and the host — which maps `GE_EMPTY` to success —
+    /// decoded its own zeroed buffer as if the engine had filled it. A zeroed
+    /// ink extent is not an empty one: empty seeds at +/-infinity, zero is a box
+    /// AT the origin. The fixture `g-pick-repo` has `empty.rs` in it and could
+    /// never catch this, because ONE empty file among non-empty ones takes the
+    /// normal path and gets the seed correctly.
+    #[test]
+    fn an_all_empty_corpus_agrees_across_strategies() {
+        let colors: Vec<Vec<u32>> = vec![vec![], vec![]];
+        let items: Vec<LayoutItem<'_>> = (0..2)
+            .map(|i| LayoutItem {
+                bytes: b"",
+                params: ItemParams { line_height: 1.25, ..Default::default() },
+                group_id: i,
+                paint: Paint::PerRecord(&colors[i as usize]),
+            })
+            .collect();
+
+        let mut batched = MojoLayout::new(Strategy::Batched);
+        batched.load_trie_file(&trie()).expect("trie");
+        let mut a = GlyphArena::new();
+        let want = batched.layout_items(&items, &mut a).expect("batched");
+
+        let mut direct = MojoLayout::new(Strategy::Direct);
+        direct.load_trie_file(&trie()).expect("trie");
+        let mut b = GlyphArena::new();
+        let got = direct.layout_items(&items, &mut b).expect("direct");
+
+        assert_eq!(want.len(), got.len());
+        for (i, (w, g)) in want.iter().zip(got.iter()).enumerate() {
+            assert!(w.bit_eq(g), "item {i} differs:\n  batched: {w:?}\n  direct:  {g:?}");
+        }
+        // ANTI-VACUITY: if the ink seed were ever changed to zero, the two
+        // would agree trivially and this test would stop meaning anything.
+        assert!(
+            want[0].ink.min[0].is_infinite(),
+            "an empty item's ink must seed at infinity, or this test is vacuous",
+        );
+    }
+
+    /// REGRESSION, same review: a SECOND load into an arena that already holds
+    /// instances.
+    ///
+    /// The engine's prefix is call-relative — it starts every load at slot 0,
+    /// knowing nothing about what the arena already holds — while
+    /// `compact_records_into` takes `arena.len()`, which is absolute. The
+    /// instances land correctly appended either way; only `slot_base` was
+    /// wrong, low by exactly the arena's prior length. Nothing in the battery
+    /// could see it, because `load_repo` enters the arena exactly once — and
+    /// `slot_base` is what the cull and the pick path use to name a file's
+    /// glyph range, so the failure mode is silently picking the wrong file.
+    #[test]
+    fn a_second_load_into_one_arena_agrees_across_strategies() {
+        let colors = sample_colors();
+        let items = sample_items(&colors);
+
+        let mut want: Vec<ItemPlacement> = Vec::new();
+        let mut batched = MojoLayout::new(Strategy::Batched);
+        batched.load_trie_file(&trie()).expect("trie");
+        let mut a = GlyphArena::new();
+        want.extend(batched.layout_items(&items, &mut a).expect("batched 1"));
+        want.extend(batched.layout_items(&items, &mut a).expect("batched 2"));
+
+        let mut got: Vec<ItemPlacement> = Vec::new();
+        let mut direct = MojoLayout::new(Strategy::Direct);
+        direct.load_trie_file(&trie()).expect("trie");
+        let mut b = GlyphArena::new();
+        got.extend(direct.layout_items(&items, &mut b).expect("direct 1"));
+        got.extend(direct.layout_items(&items, &mut b).expect("direct 2"));
+
+        for (i, (w, g)) in want.iter().zip(got.iter()).enumerate() {
+            assert!(w.bit_eq(g), "placement {i} differs:\n  batched: {w:?}\n  direct:  {g:?}");
+        }
+        assert_eq!(
+            bytemuck::cast_slice::<_, u8>(a.instances()),
+            bytemuck::cast_slice::<_, u8>(b.instances()),
+            "arenas differ after two loads",
+        );
+        // ANTI-VACUITY: the second load must actually start past the first, or
+        // the rebase this test guards is never exercised.
+        assert!(
+            want[items.len()].slot_base > 0,
+            "the second load must begin past slot 0",
         );
     }
 

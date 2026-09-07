@@ -478,8 +478,10 @@ def direct_write_all(
     items: List[Item],
     group_ids: Pointer[UInt32, MutUntrackedOrigin],
     paint_ptrs: Pointer[Pointer[UInt32, ImmUntrackedOrigin], MutUntrackedOrigin],
+    paint_lens: Pointer[UInt64, MutUntrackedOrigin],
     flat_colors: Pointer[UInt32, MutUntrackedOrigin],
     out_ptr: Pointer[UInt32, MutUntrackedOrigin],
+    mut paint_bad: Int,
 ) -> List[DirectPlacement]:
     """THE DIRECT WRITE, grained and parallel: count, prefix, scatter.
 
@@ -500,7 +502,17 @@ def direct_write_all(
     Every grain writes its own disjoint scratch and both merges are serial. That
     is not caution about ordering: min/max being exact under regrouping says
     nothing about a concurrent read-modify-write on a shared location, which is
-    a race an earlier form of the bounds pass actually had."""
+    a race an earlier form of the bounds pass actually had.
+
+    PAINT IS BOUNDS-CHECKED HERE, between the count and the scatter, because
+    that is the first moment the record count exists and the last moment before
+    anything reads the caller's colour array. The record path has always
+    asserted this on the host (`compact_records_into`: "a silent fallback here
+    could paint a whole file the wrong colour for a decade"); dropping it on
+    this path would have been worse than what that assert prevents, since here
+    the failure is an out-of-bounds READ from parallel tasks rather than a wrong
+    colour. `paint_bad` comes back set to the offending item + 1; the caller
+    turns it into a status."""
     var item_count = len(items)
     var placements = List[DirectPlacement]()
     if item_count == 0:
@@ -558,6 +570,19 @@ def direct_write_all(
         gr_paint[t] = paint_at
         slot_at += gr_surv[t]
         paint_at += gr_rec[t]
+
+    # Paint is indexed by RECORD and the host sizes it per item, so the check is
+    # per item against the record total the counting pass just produced.
+    for i in range(item_count):
+        if Int(paint_ptrs[unsafe_offset = i]) == 0:
+            continue          # flat colour: no array to overrun
+        var need = 0
+        for t in range(n_gr):
+            if gr_item[t] == i:
+                need += gr_rec[t]
+        if UInt64(need) > paint_lens[unsafe_offset = i]:
+            paint_bad = i + 1
+            return placements^
 
     # ── pass B: scatter, in parallel, into slots nothing else can touch ─────
     var gbox = List[Float32](unsafe_uninit_length=n_gr * DP_LANES)

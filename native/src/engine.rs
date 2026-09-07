@@ -35,6 +35,8 @@ const GE_EMPTY: i32 = 4;
 const GE_ABI_MISMATCH: i32 = 9;
 /// The direct path could not fit its output in the arena the caller sized.
 const GE_ARENA_TOO_SMALL: i32 = 10;
+/// A per-item colour array is shorter than that item's record count.
+const GE_PAINT_TOO_SHORT: i32 = 11;
 
 extern "C" {
     fn glyph_engine_new() -> *mut c_void;
@@ -89,6 +91,7 @@ extern "C" {
         inst_ptr: *mut u32,
         inst_cap: usize,   // in INSTANCES, not bytes
         paint_ptrs: *const *const u32,
+        paint_lens: *const u64,
         flat_colors: *const u32,
         group_ids: *const u32,
         place_out: *mut u32,
@@ -412,6 +415,7 @@ impl Engine {
         inst_ptr: *mut u32,
         inst_cap: usize,
         paint_ptrs: &[*const u32],
+        paint_lens: &[u64],
         flat_colors: &[u32],
         group_ids: &[u32],
         place_out: &mut [u32],
@@ -428,6 +432,7 @@ impl Engine {
                 inst_ptr,
                 inst_cap,
                 paint_ptrs.as_ptr(),
+                paint_lens.as_ptr(),
                 flat_colors.as_ptr(),
                 group_ids.as_ptr(),
                 place_out.as_mut_ptr(),
@@ -441,6 +446,11 @@ impl Engine {
                 what: match s {
                     GE_NO_TRIE => "glyph_engine_load_items_direct (no trie loaded)".to_string(),
                     GE_ABI_MISMATCH => abi_mismatch_message("glyph_engine_load_items_direct"),
+                    GE_PAINT_TOO_SHORT => "glyph_engine_load_items_direct: an \
+                         item's paint array is shorter than its record count. \
+                         Paint is indexed by RECORD, blanks included — a colour \
+                         array built per surviving glyph is the likely cause"
+                        .to_string(),
                     GE_ARENA_TOO_SMALL => format!(
                         "glyph_engine_load_items_direct: the fold produced more \
                          records than the {inst_cap}-slot arena the caller sized. \
