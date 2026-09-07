@@ -28,9 +28,7 @@ from std.runtime import initialize_runtime
 from std.time import perf_counter_ns
 
 from glyph_pipeline import Item, Trie, run_pipeline, PipelineResult, F_LEADER, ST_COUNT  # NATIVE-PORT: F_LEADER for load_items per-item counts
-from glyph_record import (
-    RecordSet, compact, write_instances_direct, INST_U32S,
-)
+from glyph_record import RecordSet, compact, direct_write_all, INST_U32S
 from fixture_io import load_trie_auto  # NATIVE-PORT: G3DF fixture or G3TR blob
 
 
@@ -475,13 +473,16 @@ def glyph_engine_load_items_direct(
         return GE_ARENA_TOO_SMALL
 
     var _w = perf_counter_ns()
+    var places = direct_write_all(
+        r, items, group_ids, paint_ptrs, flat_colors, inst_ptr
+    )
+    # slot_base is re-derived here rather than returned, because the writer's
+    # own prefix is over GRAINS and this one is over items: the same running
+    # sum, read at a different granularity. Deriving it twice from one source
+    # (each item's slot_count) beats carrying a second copy that could drift.
     var slot_base = 0
     for i in range(m):
-        var pp = paint_ptrs[unsafe_offset = i]
-        var p = write_instances_direct(
-            r, items, i, group_ids[unsafe_offset = i], pp,
-            Int(pp) != 0, flat_colors[unsafe_offset = i], inst_ptr, slot_base,
-        )
+        ref p = places[i]
         var o = i * PLACE_U32S
         place_out[unsafe_offset = o + PL_SLOT_BASE] = UInt32(slot_base)
         place_out[unsafe_offset = o + PL_SLOT_COUNT] = UInt32(p.slot_count)

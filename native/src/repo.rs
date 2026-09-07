@@ -791,23 +791,44 @@ impl RepoLoad {
         // The split the plan's item 3 is a decision about. `unattributed` is
         // the part of `backend` these four timers did not claim; it should be
         // near zero, and if it is not, one of them is measuring the wrong span.
+        //
+        // A STAGE THAT DOES NOT EXIST PRINTS `n/a`, NOT `0.000s`. On the direct
+        // path there is no readback and no host compaction at all, and a zero
+        // there reads exactly like a stage that ran and was fast — the same
+        // ambiguity that made `fold` look like the fold for a day. Only the
+        // person who built the path knows which zero is which, and they are not
+        // the person who reads this next.
         let p = s.phases;
         let attributed = p.fold + p.readback() + p.compact;
+        let absent = !s.strategy.materializes_records();
+        let secs = |d: Duration| {
+            if absent { "n/a".to_string() } else { format!("{:.3}s", d.as_secs_f64()) }
+        };
         println!(
-            "  backend: fold {:.3}s | readback {:.3}s (alloc {:.3}s + copy {:.3}s, {:.2} GB) \
-             | compact {:.3}s | unattributed {:.3}s",
+            "  backend: fold {:.3}s | readback {} (alloc {} + copy {}, {}) \
+             | compact {} | unattributed {:.3}s",
             p.fold.as_secs_f64(),
-            p.readback().as_secs_f64(),
-            p.readback_alloc.as_secs_f64(),
-            p.readback_copy.as_secs_f64(),
-            (s.records * 32) as f64 / 1.073_741_824e9,
-            p.compact.as_secs_f64(),
+            secs(p.readback()),
+            secs(p.readback_alloc),
+            secs(p.readback_copy),
+            if absent {
+                "no wire record on this path".to_string()
+            } else {
+                format!("{:.2} GB", (s.records * 32) as f64 / 1.073_741_824e9)
+            },
+            secs(p.compact),
             s.backend.saturating_sub(attributed).as_secs_f64(),
         );
         // `fold` above is the whole FFI call. This is what the engine says it
         // spent inside it — largest lane first, and `unattributed` here catches
         // the part of the call that is neither run_pipeline nor the two stages
         // the FFI entry owns (marshalling, arena reuse, the return trip).
+        //
+        // Zero-valued engine lanes are ELIDED rather than printed as 0.000s,
+        // for the same reason: a lane absent from this line did not run on this
+        // path. `eg_compact`/`eg_counts` belong to the record path and
+        // `eg_direct` to the direct one, so which lanes appear is itself the
+        // statement of which route the load took.
         let ranked = p.engine_ranked();
         let eng_sum: Duration = ranked.iter().map(|(_, d)| *d).sum();
         print!("  engine:");

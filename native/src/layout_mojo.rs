@@ -146,6 +146,15 @@ impl Strategy {
     /// materialized anywhere on its path. Callers ASK — a caller that assumed
     /// and got an empty Vec would read "nothing to diff" as "nothing differed",
     /// which is the vacuous-pass shape this tree has been bitten by before.
+    /// Whether this strategy's load ever materializes a wire record — the
+    /// same fact as [`Strategy::can_record`], asked by the reporting side.
+    /// Named separately because the report is not asking "may I request
+    /// records", it is asking "is a zero in the readback lane an absence or a
+    /// measurement", and conflating those is how a 0.000s gets read as fast.
+    pub fn materializes_records(self) -> bool {
+        self.can_record()
+    }
+
     pub fn can_record(self) -> bool {
         match self {
             Strategy::Batched | Strategy::PerItem => true,

@@ -459,6 +459,17 @@ expect = "FAIL  --wrap-mode down"
 rebuild = "pixi run build-engine"
 
 [[mutation]]
+name = "direct-prefix-counts-records"
+gate = "repo-verify-direct"
+why = "the grained write is a scan/scatter, and its core invariant is that the slot prefix advances by SURVIVORS while the paint prefix advances by RECORDS. Advancing slots by records instead leaves gaps of uninitialized arena between grains — the exact defect grains introduce and the one direct-ink-half-height cannot see, since that mutation reddens under the serial writer too. Distinct from every other mutation here: it perturbs the parallel decomposition, not the arithmetic"
+file = "engine/glyph_record.mojo"
+op = "replace"
+find = "        slot_at += gr_surv[t]"
+with = "        slot_at += gr_rec[t]"
+expect = "FAIL  --wrap-mode down"
+rebuild = "pixi run build-engine"
+
+[[mutation]]
 name = "pick-off-by-one"
 gate = "pick-oracle"
 why = "an off-by-one in the exact-match is the realistic pick defect: it resolves to the neighbouring glyph, which still looks like a plausible answer. Only an INDEPENDENT oracle can call it wrong, which is what this gate is for"

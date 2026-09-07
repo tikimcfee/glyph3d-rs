@@ -174,16 +174,34 @@ The engine now writes 48 B render instances straight into the caller's arena
 both extents in ONE pass. No wire record is materialized on either side of the
 FFI. `--repo-engine direct`.
 
-**47.1 MB corpus, M2: backend 2.510 s -> 0.694 s (3.6x); whole load 3.133 s ->
-1.245 s (2.6x).** The three lanes that were 87% of backend are gone —
-`eg_compact`, `read_back` and `compact_records_into` all read 0.000 s — and what
-remains is one bandwidth-bound write (`eg_direct` 0.505 s for 2.08 GB of
-instances, ~4.1 GB/s).
+**47.1 MB corpus, M2, three samples each: backend ~1.99 s -> ~0.39 s (5.2x);
+whole load 3.133 s -> 0.915 s (3.4x).** The three lanes that were 87% of backend
+are gone — `eg_compact`, `read_back` and `compact_records_into` do not run at
+all, and the report prints `n/a` for them rather than `0.000s`, because a zero
+reads exactly like a stage that ran and was fast.
+
+The write itself is **grained and parallel** — count, prefix, scatter, over
+`BOUNDS_GRAIN` ranges rather than items. `eg_direct` 0.505 s -> 0.193 s. Two
+findings from getting there, both measured:
+
+- **Grains, not items.** Item-level decomposition is size-blind and cannot
+  parallelize a single large file at all. On one 8 MB file, `eg_direct` is
+  0.029 s stable against the record path's 0.191 s — **6.6x**, and that case is
+  the one `fold_profile` had already flagged as a ceiling.
+- **A struct holding Lists in the parallel region cost more than the
+  parallelism was worth.** The first grained form measured 0.659 s against the
+  serial 0.505 s — SLOWER. Per-grain heap allocation was the whole difference;
+  flat `Float32` scratch fixed it. The bounds pass had already learned this and
+  said so in a comment; it still had to be rediscovered by measurement, which is
+  the argument for measuring rather than reasoning.
 
 **It is gated, not asserted.** `repo-verify-direct` diffs it against the batched
-record path bit-exact on placements and instances, both wrap modes, and the
-mutation `direct-ink-half-height` proves that gate reddens on a real defect
-(coverage stays 12/12). At 47.1 MB the two paths agree on **43,424,013
+record path bit-exact on placements and instances, both wrap modes, under TWO
+mutations: `direct-ink-half-height` (the arithmetic) and
+`direct-prefix-counts-records` (the scan/scatter's core invariant — slots
+advance by survivors, paint by records; confusing them leaves uninitialized
+gaps). The second exists because the first reddens under the serial writer too,
+so it could not see the defect class grains introduce. Coverage stays 12/12. At 47.1 MB the two paths agree on **43,424,013
 instances**, byte for byte.
 
 **What it does NOT do, stated because the PASS line says `0 records`:** the

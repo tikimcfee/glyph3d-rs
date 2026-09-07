@@ -28,7 +28,10 @@ from glyph_schema import (
     SM_STRIDE, LM_STRIDE, LC_STRIDE,
     RECORD_MEASURE_STRIDE, RECORD_COUNT_STRIDE, RECORD_BYTES,
 )
-from glyph_pipeline import Item, Trie, run_pipeline, F_LEADER, PipelineResult
+from glyph_pipeline import (
+    Item, Trie, run_pipeline, F_LEADER, PipelineResult, BOUNDS_GRAIN,
+)
+from max.algorithm import parallelize
 
 
 struct RecordSet(Copyable, Movable):
@@ -288,6 +291,17 @@ def seed_at[o: ImmOrigin](
 
 comptime F32_INF = inf[DType.float32]()
 
+# Grain scratch lanes for the direct write's boxes. Flat Float32 rather than a
+# struct per grain: a struct with Lists heap-allocates inside the parallel
+# region, which measured slower than not parallelizing at all.
+comptime DP_PAGE_RIGHT = 0
+comptime DP_PAGE_BOTTOM = 1
+comptime DP_PAGE_ZMIN = 2
+comptime DP_PAGE_ZMAX = 3
+comptime DP_INK_MIN = 4   # 3 lanes
+comptime DP_INK_MAX = 7   # 3 lanes
+comptime DP_LANES = 10
+
 comptime INST_U32S = 12          # 48 B / 4
 comptime INST_POS_X = 0
 comptime INST_POS_Y = 1
@@ -330,19 +344,51 @@ struct DirectPlacement(Copyable, Movable):
         self.ink_max = List[Float32](length=3, fill=-F32_INF)
 
 
-def write_instances_direct(
+def count_direct_range(r: PipelineResult, start: Int, stop: Int) -> Tuple[Int, Int]:
+    """(records, survivors) over the byte range — PASS A of the scan/scatter.
+
+    Counting before writing is what buys the parallel write: a grain cannot know
+    where its instances go until every grain before it has said how many it
+    produces, and that prefix is over grains, not items, so a single big file
+    parallelizes too. Two passes over the flag lanes beat one serial pass as
+    soon as there is more than one core, which is the same trade the bounds pass
+    already made (`BOUNDS_GRAIN`, worth 2.11x on a heavy-tailed batch)."""
+    var rec = 0
+    var surv = 0
+    for id in range(start, stop):
+        if (Int(r.fl[id]) & F_LEADER) == 0:
+            continue
+        rec += 1
+        if r.gi[id] != 0:
+            surv += 1
+    return (rec, surv)
+
+
+def write_instances_direct[bo: Origin[mut=True]](
     r: PipelineResult,
-    items: List[Item],
-    item_index: Int,
     group_id: UInt32,
     paint: Pointer[UInt32, ImmUntrackedOrigin],
     has_paint: Bool,
     flat_color: UInt32,
     out_ptr: Pointer[UInt32, MutUntrackedOrigin],
     out_slot_base: Int,
-) -> DirectPlacement:
-    """One item's records, written as render instances into `out_ptr` starting
-    at instance `out_slot_base`. Returns the counts and both extents.
+    byte_start: Int,
+    byte_stop: Int,
+    paint_base: Int,
+    box_ptr: Pointer[Float32, bo],
+    box_base: Int,
+) -> Tuple[Int, Int]:
+    """One BYTE RANGE's records, written as render instances into `out_ptr`
+    starting at instance `out_slot_base`. Returns the counts and both extents.
+
+    The range is a parameter rather than the item's whole span because the
+    caller decomposes items into grains: a 22.9 MB file and a 1 KB file are both
+    one item, and a writer that took items would put the big one on the critical
+    path while other cores idled — measured on the linux tree, which has 9,584
+    files under 1 KB and one of 22.9 MB.
+
+    `paint_base` is where this range starts in its ITEM's colour array, since
+    paint is indexed per item and a grain is not an item.
 
     THE FILTER IS THE HOST'S, restated: a record whose GLYPH_ID is 0 updates the
     page extent and is then dropped — it occupies a cell but inks nothing. The
@@ -354,12 +400,10 @@ def write_instances_direct(
     host's colorize_leaders emits one colour per leader including blanks, and
     an index that skipped them would tint every glyph after the first blank."""
     var p = DirectPlacement()
-    var start = items[item_index].byte_start
-    var stop = start + items[item_index].byte_count
     var w = out_slot_base
-    var rec = 0
+    var rec = paint_base
 
-    for id in range(start, stop):
+    for id in range(byte_start, byte_stop):
         if (Int(r.fl[id]) & F_LEADER) == 0:
             continue
         var lo = id * LM_STRIDE
@@ -419,6 +463,136 @@ def write_instances_direct(
         out_ptr[unsafe_offset = o + INST_PAD] = 0
         w += 1
 
-    p.slot_count = w - out_slot_base
-    p.record_count = rec
-    return p^
+    box_ptr[unsafe_offset = box_base + DP_PAGE_RIGHT] = p.page_right
+    box_ptr[unsafe_offset = box_base + DP_PAGE_BOTTOM] = p.page_bottom
+    box_ptr[unsafe_offset = box_base + DP_PAGE_ZMIN] = p.page_z_min
+    box_ptr[unsafe_offset = box_base + DP_PAGE_ZMAX] = p.page_z_max
+    for k in range(3):
+        box_ptr[unsafe_offset = box_base + DP_INK_MIN + k] = p.ink_min[k]
+        box_ptr[unsafe_offset = box_base + DP_INK_MAX + k] = p.ink_max[k]
+    return (rec - paint_base, w - out_slot_base)
+
+
+def direct_write_all(
+    r: PipelineResult,
+    items: List[Item],
+    group_ids: Pointer[UInt32, MutUntrackedOrigin],
+    paint_ptrs: Pointer[Pointer[UInt32, ImmUntrackedOrigin], MutUntrackedOrigin],
+    flat_colors: Pointer[UInt32, MutUntrackedOrigin],
+    out_ptr: Pointer[UInt32, MutUntrackedOrigin],
+) -> List[DirectPlacement]:
+    """THE DIRECT WRITE, grained and parallel: count, prefix, scatter.
+
+    The serial form this replaces walked every item in order because each item's
+    `slot_base` depends on how many instances every earlier item produced. That
+    dependency is a prefix sum, not a sequence, and the standard answer is to
+    pay one cheap counting pass to break it — which is also, word for word, what
+    `compact`'s docstring says the GPU form of this is ("a prefix-sum over the
+    leader flag plus a scatter"). Doing it this way on the CPU means the device
+    version is a port rather than a redesign.
+
+    GRAIN, NOT ITEM. Decomposing by item is size-blind, and this tree already
+    measured what that costs (see BOUNDS_GRAIN's note: 2.11x on a heavy-tailed
+    batch). Grains also mean a SINGLE large file parallelizes, which item-level
+    decomposition can never do and which `fold_profile` showed is a real
+    ceiling — 8 MB as one item folds at 164 MB/s against 661 as 64.
+
+    Every grain writes its own disjoint scratch and both merges are serial. That
+    is not caution about ordering: min/max being exact under regrouping says
+    nothing about a concurrent read-modify-write on a shared location, which is
+    a race an earlier form of the bounds pass actually had."""
+    var item_count = len(items)
+    var placements = List[DirectPlacement]()
+    if item_count == 0:
+        return placements^
+
+    # ── grains, in item order so a grain's index locates it in both tables ──
+    var gr_at = List[Int]()
+    var gr_end = List[Int]()
+    var gr_item = List[Int]()
+    for i in range(item_count):
+        var start = items[i].byte_start
+        var stop = start + items[i].byte_count
+        var at = start
+        # An empty item still gets one grain, so every item has a slot_base and
+        # the merge below never reads an empty range.
+        if at >= stop:
+            gr_at.append(at)
+            gr_end.append(at)
+            gr_item.append(i)
+            continue
+        while at < stop:
+            var end = at + BOUNDS_GRAIN
+            if end > stop:
+                end = stop
+            gr_at.append(at)
+            gr_end.append(end)
+            gr_item.append(i)
+            at = end
+    var n_gr = len(gr_at)
+
+    # ── pass A: count, in parallel ──────────────────────────────────────────
+    var gr_rec = List[Int](length=n_gr, fill=0)
+    var gr_surv = List[Int](length=n_gr, fill=0)
+    var rp = gr_rec.unsafe_ptr()
+    var sp = gr_surv.unsafe_ptr()
+    def _count_task(t: Int) {imm}:
+        var rs = count_direct_range(r, gr_at[t], gr_end[t])
+        rp[unsafe_offset = t] = rs[0]
+        sp[unsafe_offset = t] = rs[1]
+    parallelize(_count_task, n_gr)
+
+    # ── the prefix: serial over GRAINS, which is O(items + bytes/grain) and
+    # not O(bytes). Slots run across the whole corpus; paint indices restart at
+    # each item, because the host's colour array is per item.
+    var gr_slot = List[Int](length=n_gr, fill=0)
+    var gr_paint = List[Int](length=n_gr, fill=0)
+    var slot_at = 0
+    var paint_at = 0
+    var prev_item = -1
+    for t in range(n_gr):
+        if gr_item[t] != prev_item:
+            paint_at = 0
+            prev_item = gr_item[t]
+        gr_slot[t] = slot_at
+        gr_paint[t] = paint_at
+        slot_at += gr_surv[t]
+        paint_at += gr_rec[t]
+
+    # ── pass B: scatter, in parallel, into slots nothing else can touch ─────
+    var gbox = List[Float32](unsafe_uninit_length=n_gr * DP_LANES)
+    var bp = gbox.unsafe_ptr()
+    def _write_task(t: Int) {imm}:
+        var i = gr_item[t]
+        var pp = paint_ptrs[unsafe_offset = i]
+        _ = write_instances_direct(
+            r, group_ids[unsafe_offset = i], pp, Int(pp) != 0,
+            flat_colors[unsafe_offset = i], out_ptr, gr_slot[t],
+            gr_at[t], gr_end[t], gr_paint[t], bp, t * DP_LANES,
+        )
+    parallelize(_write_task, n_gr)
+    _ = len(gr_slot)
+    _ = len(gr_paint)
+
+    # ── serial merge: a grain's boxes fold into its item's ──────────────────
+    for _ in range(item_count):
+        placements.append(DirectPlacement())
+    for t in range(n_gr):
+        var i = gr_item[t]
+        var b = t * DP_LANES
+        placements[i].record_count += gr_rec[t]
+        placements[i].slot_count += gr_surv[t]
+        if gbox[b + DP_PAGE_RIGHT] > placements[i].page_right:
+            placements[i].page_right = gbox[b + DP_PAGE_RIGHT]
+        if gbox[b + DP_PAGE_BOTTOM] < placements[i].page_bottom:
+            placements[i].page_bottom = gbox[b + DP_PAGE_BOTTOM]
+        if gbox[b + DP_PAGE_ZMIN] < placements[i].page_z_min:
+            placements[i].page_z_min = gbox[b + DP_PAGE_ZMIN]
+        if gbox[b + DP_PAGE_ZMAX] > placements[i].page_z_max:
+            placements[i].page_z_max = gbox[b + DP_PAGE_ZMAX]
+        for k in range(3):
+            if gbox[b + DP_INK_MIN + k] < placements[i].ink_min[k]:
+                placements[i].ink_min[k] = gbox[b + DP_INK_MIN + k]
+            if gbox[b + DP_INK_MAX + k] > placements[i].ink_max[k]:
+                placements[i].ink_max[k] = gbox[b + DP_INK_MAX + k]
+    return placements^
