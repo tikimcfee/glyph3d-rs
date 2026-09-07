@@ -113,7 +113,7 @@ The artifact graph is declared in **`build.toml`** (artifact, inputs, build
 command, class) and executed by **`glyph`** (`glyph/src/main.rs`): `cargo glyph build` brings
 products current and regenerates committed artifacts, `pixi run verify`
 byte-compares them against scratch rebuilds without building anything, and
-`check` runs the twelve named gates. A dozen gates, spanning all four
+`test` runs the checks, spanning all four
 languages: the generators reproduce their committed outputs byte-for-byte, the
 25-fixture conformance corpus is rebuilt byte-identically in a scratch copy
 (counts declared in build.toml, not counted off the tree), sixteen Mojo suites
@@ -122,7 +122,7 @@ and lints warning-free and passes its tests under a ratcheted floor, the
 engine is diffed bit-exact against an independent CPU oracle, picks are
 cross-checked against an independent Python oracle, the two FFI strategies are
 diffed against each other in both wrap modes, the reference port is replayed
-against the JS oracle's recorded answers, and four canonical views are
+against the JS oracle's recorded answers, and the golden views are
 re-rendered and compared pixel for pixel.
 
 **The authoritative account is `AGENTS.md`**, which lists each gate by name

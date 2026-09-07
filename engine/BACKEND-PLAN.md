@@ -53,6 +53,63 @@ list, so a reader lands on it and matches up. They do not correspond: old stage 
 was the Rust backend; item 1 below is the phantom row. Read those references as
 naming the layout seam and the device-resident path by description, not by number.
 
+## Ordering — what blocks what
+
+The numbered list below is a catalogue, not a queue: several of its items touch
+nothing the others touch. Read this section for the order, that one for the
+detail.
+
+**The spine.** Each of these changes what the next one is deciding about:
+
+1. **Measure the fold (item 4).** Cheap, and it decides whether device-side
+   folding is worth building at all. No honest number exists today — both
+   existing benchmarks measure something other than the fold. Doing this first
+   means the substrate question stops being answered by argument.
+2. **The readback (item 3).** 3.10 GB per load on a 97 MB corpus, for records
+   the renderer does not need. Worth doing whatever item 4 concludes: the copy
+   is waste under either substrate. This is the finding the layout seam was
+   built to make fixable, so it is the thesis coming due.
+3. **Bounds step 4 (the FFI accessor)** — but only after the readback, and this
+   ordering is the correction earned on 2026-09-07. The plan called it "replace
+   the host reduction with the engine box"; they are NOT interchangeable — the
+   host seeds at the origin, the engine at ±infinity, so `page` contains the
+   engine box rather than equalling it. As long as records cross the seam the
+   host reduction rides along nearly free, so this buys a tighter cull and a
+   re-baseline. It becomes NECESSARY, not optional, the moment records stop
+   crossing — which is what the readback work does.
+4. **Displacement input (item 2).** Wants the layout path settled first, since
+   it adds a post-fold stage to it.
+
+**Parallel — independent of the spine and of each other:**
+
+- **Emoji (item 5).** Atlas re-bake plus a varying. Touches the shader and the
+  atlas, neither of which the spine moves. Gated by the instance-payload
+  question below.
+- **The web target (item 6).** Cfg-gating and a split. Orthogonal to layout.
+- **`z_wrap_spacing` has no CLI flag.** Small, self-contained, named by Ivan.
+- **Runtime wrap-mode toggling.** A command-bus question, not a layout one:
+  mode is baked into `ItemParams` at load, so toggling means re-running the fold
+  (cheap — 0.04 s for 407k records, measured).
+- **`engine/check.sh` fails fast rather than accumulating.** One failing suite
+  hides the other fifteen. Its sibling `check-fixture-parity.sh` has always
+  accumulated; this is the same three-line shape as the pick-oracle fix.
+
+**Measurement debts that gate specific work.** Each is cheap and each currently
+blocks a decision by being unmeasured:
+
+- **Instance payload: 32 B or 48 B?** Blocks emoji and highlight both. 40 is
+  unreachable (16-byte alignment), 32 forecloses highlight, 48 keeps `_pad`
+  where highlight would live at zero cost. Also: nothing ties `InstanceSlot`'s
+  layout to `GlyphInstance`'s, so `encase` and `naga` can disagree while the
+  test stays green.
+- **Is f64 already inert on the render path?** Marked "read from source, not
+  measured" — and `cargo glyph prove` now exists to settle exactly this class
+  of question by mutation rather than by reading.
+- **The bare byte offsets** (`write_instance(…, 24, …)`) have no relationship
+  to the struct, and the verbs that use them have **zero pixel coverage**. That
+  gap is closable now: adding a golden view is a known, cheap move since
+  `repo-down` proved the shape.
+
 ## The work, in order
 
 **1. The phantom row — DONE, `c9667ec`.** A line whose glyph count was an exact
@@ -97,7 +154,28 @@ shaping crates are already compiled in.
 the wasm blockers, and put `cargo check --target wasm32-unknown-unknown` in
 check-all.
 
-## Bounds: the work in flight, in order
+## Bounds — steps 1-3 DONE (`d6f33ff`, `dde3f82`), step 4 restated
+
+The cull reads real depth in both the frustum test and the LOD distance;
+`PageExtent`, `InkExtent`, `SegCull`, `FileView` and `StagedText` all carry z;
+`SLAB_Z`, the named placeholder for the old flat assumption, is deleted with
+zero references anywhere, which is the by-construction proof nothing still
+reproduces it. `back` is now the default wrap mode, and a fifth golden view
+(`repo-down`) keeps the non-default geometry under pixel coverage.
+
+**Two things the work found that this plan had wrong.** First: `page` does NOT
+contain `ink` in Y — `page.bottom` tracks baselines, ink tracks the glyph quad
+which hangs half a height below. It contains in Z, because a glyph quad has no
+thickness, which is the axis these fields are used for; the choice was right for
+a reason that was not true as stated. Second: the engine box and the host
+reduction are not interchangeable (see Ordering above).
+
+**Still open here:** the `--engine-check` origin coverage is closed, but
+`repo-zoom` covers neither wrap geometry meaningfully — `alpha.rs`'s longest
+line is 24 columns and never wraps in either mode. That view is pinning a camera
+angle, not a layout.
+
+## Bounds: the original plan, for the record
 
 Branch `bounds`, off `cc814b3`. WrapBack made this urgent rather than tidy: a
 file's extent is now mostly DEPTH by design, and nothing that reasons about

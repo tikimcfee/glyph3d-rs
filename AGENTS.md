@@ -107,8 +107,9 @@ both are thin doors onto `cargo glyph test`.
 - **`cargo glyph prove`** applies each mutation declared in `build.toml`,
   requires the named check to redden for the named reason, and restores
   byte-exact. It reports COVERAGE — which checks have no mutation and are
-  therefore unproven — not a pass count. **All eleven are covered as of
-  2026-09-06**; a new check should arrive with the mutation that proves it.
+  therefore unproven — not a pass count. Every check is covered as of 2026-09-07;
+  `cargo glyph prove` prints the live figure, and a new check should arrive
+  with the mutation that proves it.
 - **`cargo glyph gates`** prints what each check compares and cannot see;
   **`graph`** the artifact graph; **`validate`** the manifest against its schema.
 
@@ -126,7 +127,7 @@ read by nothing at all.
 
 ## What the checks actually do
 
-Eleven, by name — they were numbered positions in one shell script (`N/9`,
+By name — they were numbered positions in one shell script (`N/9`,
 renumbered twice, one with a fossil stage letter still in its filename). For
 each: what it compares, what makes it red, and **what it cannot see**. The last
 is the part worth reading. A check is a claim about a counterfactual, and a
@@ -239,19 +240,29 @@ substitution aborts the script mid-run. The wrapper still reports FAIL, but
 every check after the abort point silently did not run. (The missing
 `[ -x "$BIN" ]` guard was added when the file was renamed.)
 
-**pixel-ab** (was "8"). `demo`, `text`, `repo-zoom`, `repo-wide` re-rendered
-and byte-compared against `out/tooling-ab/baseline/`. This is the **only**
-check that sees pixels. In build.toml these four PNGs are class **golden**:
-verified, with NO build path — the runner refuses to regenerate them, because
-re-baselining is a human act. Red on any change to camera, shading, layout,
-shaping or culling that reaches those four frames. Blind to everything outside
-them — and it cannot distinguish a regression from an intentional change, which
-is deliberate. It is also less all-seeing than it looks. The page-extent origin
-seed was renderer-affecting and all four stayed byte-equal, because the seed
-only binds for an item with zero records and no fixture had an empty file. It
-can see that class today only because `native/fixtures/g-pick-repo/empty.rs`
-was added for it. **Do not tidy that file away.** Ask what else these four
-frames cannot see.
+**pixel-ab** (was "8"). The golden views re-rendered and byte-compared against
+`out/tooling-ab/baseline/` — `cargo glyph graph` lists them, and the count is
+deliberately not repeated here because it has changed. This is the **only**
+check that sees pixels. In build.toml those PNGs are class **golden**: verified,
+with NO build path — the runner refuses to regenerate them, because re-baselining
+is a human act. Red on any change to camera, shading, layout, shaping or culling
+that reaches one of those frames. Blind to everything outside them, and it cannot
+distinguish a regression from an intentional change, which is deliberate.
+
+**Which view covers what, because the answer is not uniform.** `repo-wide`
+renders the default wrap mode (`back` — a wrap costs DEPTH); `repo-down` exists
+to keep the non-default row-per-wrap geometry covered, and was added when the
+default moved, because otherwise making one mode default silently retires pixel
+coverage of the other. `repo-zoom` covers **neither** meaningfully: `alpha.rs`'s
+longest line is 24 columns and never wraps in either mode, so that view is
+pinning a camera angle, not a layout.
+
+It is also less all-seeing than it looks. The page-extent origin seed was
+renderer-affecting and every view stayed byte-equal, because the seed only binds
+for an item with zero records and no fixture had an empty file. It can see that
+class today only because `native/fixtures/g-pick-repo/empty.rs` was added for
+it. **Do not tidy that file away.** Ask what else these frames cannot see —
+`--wrap-mode back` on a repo whose files never wrap is the current example.
 
 **repo-verify** (was "8b"), both wrap modes. The per-item and batched FFI
 strategies diffed bit-exact at the layout seam — placements, instance bytes and
@@ -310,10 +321,11 @@ a check watches and confirm it reddens. Some of that is now mechanical —
 `cargo glyph prove` applies each mutation declared in `build.toml`,
 requires the named gate to go red for the named reason, and restores byte-exact.
 It reports COVERAGE rather than a pass count, so a gate nobody has proven is
-listed as uncovered instead of being counted as working. Eight mutations cover
-five of the twelve gates today; seven gates are still uncovered — run it and
-read the COVERAGE line rather than trusting this sentence, which has already
-gone stale once. Three times this repo shipped a check
+listed as uncovered instead of being counted as working — run it and read that
+line. This paragraph deliberately states no figure: the previous version did,
+went stale, was corrected, gained a caveat saying it had gone stale, and went
+stale again the same week. A number in prose that describes the tree is a
+number that rots; the tool prints the live one. Three times this repo shipped a check
 that could not fail — a gate asserting on float noise, a ceiling constant no test
 protected, and a fixture checksum comparing bytes guaranteed identical before the
 command ran. Every one was caught by execution; not one by inspection.

@@ -1,7 +1,7 @@
 # AGENTS.md — house rules for the `native/` crate
 
 **Read the root `AGENTS.md` first.** It is canonical for everything repo-wide:
-what each of the twelve checks compares and what it cannot see, what is fenced
+what each check compares and what it cannot see, what is fenced
 and why, the build trap (`cargo build` does not build the Mojo dylib), and what
 the stage/gate vocabulary means. That account used to be duplicated here and
 drifted out of sync in both directions; this file no longer restates it.
@@ -36,14 +36,14 @@ Setup details and the toolchain's live constraints: `engine/TOOLCHAIN.md`.
 Offscreen renders use a fixed virtual clock (1/60 s per frame), CPU-side
 culling/picking (no GPU-dependent traversal order), and a fixed atlas. So a
 given commit + given input ⇒ byte-identical PNG. That property is what makes the
-four-view pixel comparison meaningful, and it is a fact about this crate's
+pixel comparison meaningful, and it is a fact about this crate's
 offscreen path.
 
 Everything that could break it is fenced, and **the fence table lives in root
 `AGENTS.md`** — it used to be restated here with different reasons and a stale
 claim (`engine/` as READ-ONLY, which it has not been since engine work moved
 into this tree). One correction worth carrying: an engine change is gated by the
-Mojo suites *and* must leave the four baselines byte-equal. If an engine change
+Mojo suites *and* must leave every pixel baseline byte-equal. If an engine change
 moves a PNG, the change is wrong.
 
 ## The layout seam

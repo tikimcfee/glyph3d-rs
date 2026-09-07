@@ -146,7 +146,7 @@ tool runs ONLY `cargo test`, and cargo test is not this repo's main verification
 surface. `diff_full_fold` / `diff_scan` / `diff_bake` are `pub fn`s driven by the
 BINARY from `tools/check-fixture-parity.sh`; no `#[test]` calls them, so the
 whole 1.87M-lane corpus is invisible to it. Proven rather than argued:
-`Slots::advance -> 0.0` in `fold.rs` is missed by all 85 tests and reddens
+`Slots::advance -> 0.0` in `fold.rs` was missed by all 85 tests [2026-09-06] and reddens
 reference-port on 17/17 fixtures. Most survivors are covered code seen through
 the wrong lens.
 
@@ -161,7 +161,7 @@ wrong reason.
 
 **It earned its keep once, and that was worth the whole evaluation.** Seven
 mutations of the hex colour decoder in `parse_verb` survived the entire
-twelve-gate battery, because `verb_defaults_and_forms` asserted two channels of
+whole battery [2026-09-06], because `verb_defaults_and_forms` asserted two channels of
 one badly-chosen colour: `ff0080`, whose red is `0xFF` (surviving `& -> |`),
 whose green is `0x00` (surviving `>> -> <<`), and whose blue was never read.
 Fixed; the test now asserts all three channels of `0x123456` and exercises the
@@ -181,7 +181,7 @@ every step that follows.*
 **The idea.** A gate's entire value is what it rejects; its green tells you
 nothing you did not already assume. Today the claim "this gate would catch X" is
 established by a human running a mutation once, writing a sentence about it, and
-moving on — the branch author did seven, I did two, there are twelve gates, and
+moving on — the branch author did seven, I did two, and
 none of those acts is repeatable. So the claim decays exactly like every other
 unmaintained number in this repo. The battery turns each gate's catching power
 into an executable assertion: for a named defect, mechanically applied, **the
@@ -283,6 +283,15 @@ untested by the suite it runs, and the unused-field warning that would have
 caught finding 1 never fires.
 
 ## Measured negatives — do not retry these without new information
+
+**A dead-path checker for the docs is not worth building [measured
+2026-09-07].** Docs reference files by paths that are relative to a context the
+checker cannot know — root `AGENTS.md` writes `src/main.rs` meaning the native
+crate, `../glyph_schema.mjs` is relative to `engine/fixtures/`. A scan of six
+docs produced 8 hits of which 6 were false, and a check that cries wolf at that
+rate is ignored inside a week, which is worse than no check. It did find one
+real stale reference (`tools/check-stage-g.sh`, renamed), so the SCAN is worth
+running by hand after a rename — just not wiring in as a gate.
 
 **`sccache` does not help here [measured 2026-09-06].** A full `cargo glyph
 prove` is 5:19 without it and 5:21 with it, and the stats say why: 27 compile

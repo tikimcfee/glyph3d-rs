@@ -88,7 +88,7 @@ registers, and by renaming the symbol so a stale dylib fails to LINK.
 
 ## Instruments that exist; three were wired only on 2026-09-04
 
-`tools/check-all.sh` is the gate runner — twelve gates, though the headings
+`tools/check-all.sh` is the gate runner — though the headings
 still say "N/9" **[measured]**. Recently added, each for a check that existed
 and was never consulted:
 
@@ -131,14 +131,14 @@ an account of which ones RUN. Four found in one day, one at a time, by accident.
 4. **Wire `ffi_selftest.mojo`** into `engine/check.sh`, or delete it with a
    stated reason. An instrument nothing runs is an absent one.
 5. **A testing CLI** the owner has asked for: a single entry point for the
-   flows currently spread across `tools/check-all.sh`, `tools/check-stage-g.sh`,
+   flows currently spread across `tools/check-all.sh`, `tools/check-pick-oracle.sh`,
    `engine/check.sh`, `pixi run suites`, and ad-hoc `--repo-verify` /
    `--engine-check` invocations. Shape is yours to propose.
 
 ## What NOT to do
 
 - **A build must never bring `out/tooling-ab/baseline/*.png` current.** They are
-  derived, but re-baselining is a deliberate act and those four byte-equal
+  derived, but re-baselining is a deliberate act and those byte-equal
   screenshots are the only PIXEL gate. Not the only thing that catches a
   renderer change, and the difference matters: the page extent's origin seed was
   renderer-affecting and all four stayed byte-equal through it — a unit test
@@ -199,7 +199,7 @@ before believing a null result. Specific traps this repo has actually hit
 One worked example, so the standard is not abstract. Until 2026-09-06 the
 `cargo test` step passed on exit-zero plus at least two `test result: ok` lines.
 There are exactly two test binaries, so that threshold was met by the shape of
-the tree no matter what was inside them — 85 tests, and deleting 84 would have
+the tree no matter what was inside them — 85 tests at the time, and deleting 84 would have
 left it green. It is also the step holding the two corpus-size pins, so corpus
 protection rested on tests continuing to run with nothing asserting they did.
 
@@ -226,7 +226,7 @@ mislead you.
 - **Lettered stages (`Stage A`..`Stage L`)** name past batches of work recorded
   in `out/STAGE_*_REPORT.md`. There is no index and never was — A, B and D have
   no report. Treat any stage letter outside `out/` as archaeology, including the
-  `g` in `tools/check-stage-g.sh`, which is a fossil letter and not a position
+  `g` in `tools/check-pick-oracle.sh`, which is a fossil letter and not a position
   (that script is the pick oracle; one caller, cheap to rename if you are
   touching `check-all.sh` anyway).
 - **`Stage 0`-`4` is ambiguous**: it names both the live reference port
