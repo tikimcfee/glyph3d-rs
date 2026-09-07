@@ -233,6 +233,21 @@ compare = "per-item vs batched FFI strategies, bit-exact at the layout seam, bot
 blind_to = "a fault BOTH strategies share — ground truth comes from engine-check, batched path only"
 
 [[gate]]
+name = "repo-verify-direct"
+scope = "engine"
+kind = "repo-verify"
+# The direct path has no wire record, so this diff is placements + instances
+# only — the whole render-visible contract, and the granularity that matters.
+# It is a SEPARATE gate rather than another mode of the one above because it
+# compares a different pair and is blind to different things, and a gate whose
+# `compare` line has to say "and sometimes this other thing" is two gates.
+cmd = "--load-repo fixtures/g-pick-repo --wrap-mode {mode} --repo-engine direct --repo-verify --repo-scan-only"
+modes = ["down", "back"]
+needs = ["renderer", "dylib"]
+compare = "the direct instance writer vs the batched record path, bit-exact on placements and instances, both wrap modes"
+blind_to = "the 32 B wire record tier, which the direct path does not produce — record-level faults are covered by repo-verify and engine-check"
+
+[[gate]]
 name = "reference-port"
 scope = "corpus"
 kind = "cmd"
@@ -431,6 +446,17 @@ with = """                    placements.push(compact_records_into(
                     ));"""
 expect = "FAIL  --wrap-mode down"
 rebuild = "cargo build --release"
+
+[[mutation]]
+name = "direct-ink-half-height"
+gate = "repo-verify-direct"
+why = "the direct writer recomputes the ink extent that compact_records_into computes on the record path — the same arithmetic in a second language, which is exactly the correlated-fault risk this gate exists to close. Perturbing the half-height moves ink and nothing else, so a red is attributable to the extent comparison rather than to instance bytes"
+file = "engine/glyph_record.mojo"
+op = "replace"
+find = "        var half = hgt * 0.5"
+with = "        var half = hgt * 0.4"
+expect = "FAIL  --wrap-mode down"
+rebuild = "pixi run build-engine"
 
 [[mutation]]
 name = "pick-off-by-one"

@@ -446,6 +446,44 @@ impl GlyphArena {
     pub(crate) fn push(&mut self, instance: GlyphInstance) {
         self.instances.push(instance);
     }
+
+    /// Hand a backend the arena's UNINITIALIZED tail so it can write instances
+    /// where they will live, instead of building them somewhere else and
+    /// copying. Returns the write pointer and how many slots are available.
+    ///
+    /// This is the seam's stated purpose arriving: `GlyphArena` is passed in
+    /// precisely so a backend never decides where the glyphs live, and until
+    /// now every backend still built them somewhere else first. Measured
+    /// 2026-09-07, that detour was 87% of a batched load's backend time.
+    ///
+    /// `pub(crate)` and paired with [`GlyphArena::commit`], which is the only
+    /// way the written slots become visible — nothing outside this module can
+    /// reach the tail, and nothing at all can make it readable without saying
+    /// how many slots it actually wrote.
+    pub(crate) fn uninit_tail(&mut self, want: usize) -> (*mut GlyphInstance, usize) {
+        self.instances.reserve(want);
+        let len = self.instances.len();
+        // SAFETY: `reserve` guarantees capacity for `want` past `len`, and the
+        // pointer is only valid until the next mutation — which `commit` is,
+        // and which nothing else can perform on the tail.
+        let ptr = unsafe { self.instances.as_mut_ptr().add(len) };
+        (ptr, want)
+    }
+
+    /// Make `written` slots of the tail visible. Separate from `uninit_tail`
+    /// because only the backend knows how many it filled: the count is not the
+    /// count it was offered (blanks are dropped), and assuming otherwise would
+    /// publish uninitialized memory as glyphs.
+    ///
+    /// # Safety
+    /// `written` slots starting at the pointer from the matching
+    /// [`GlyphArena::uninit_tail`] must have been fully initialized, and
+    /// `written` must not exceed the capacity that call returned.
+    pub(crate) unsafe fn commit(&mut self, written: usize) {
+        let len = self.instances.len();
+        debug_assert!(written <= self.instances.capacity() - len);
+        unsafe { self.instances.set_len(len + written) };
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -713,14 +751,27 @@ pub fn diff_backends(
         ));
     }
 
-    if a.records.len() != b.records.len() {
+    // A backend with no wire stream — `Strategy::Direct` materializes none by
+    // design — contributes no record tier, and the diff says so by reporting
+    // zero records rather than failing on the asymmetry. This is deliberately
+    // NOT `zip`-and-shrug: an EMPTY side means "cannot produce", and the
+    // caller must state the reduced scope in its PASS line, because a pass
+    // that does not say what it compared is a claim without a scope.
+    //
+    // The tiers above are not weakened by this. Instances and placements are
+    // the entire render-visible contract, and they were compared byte for byte
+    // before reaching here.
+    let compare_records = !a.records.is_empty() && !b.records.is_empty();
+    if compare_records && a.records.len() != b.records.len() {
         return Err(format!(
             "record count: {an} {} vs {bn} {}",
             a.records.len(),
             b.records.len()
         ));
     }
-    for (index, (ra, rb)) in a.records.iter().zip(b.records.iter()).enumerate() {
+    let (ra_all, rb_all): (&[GlyphRecord], &[GlyphRecord]) =
+        if compare_records { (a.records, b.records) } else { (&[], &[]) };
+    for (index, (ra, rb)) in ra_all.iter().zip(rb_all.iter()).enumerate() {
         let same = ra.counts == rb.counts
             && ra
                 .measures
@@ -737,7 +788,7 @@ pub fn diff_backends(
     Ok(VerifyReport {
         items: a.placements.len(),
         instances: a.instances.len(),
-        records: a.records.len(),
+        records: ra_all.len(),
     })
 }
 

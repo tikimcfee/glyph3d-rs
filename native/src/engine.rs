@@ -33,6 +33,8 @@ const GE_EMPTY: i32 = 4;
 /// The descriptor's shape word is not the one this dylib expects — the .dylib on
 /// disk was built from different source than this binary was compiled against.
 const GE_ABI_MISMATCH: i32 = 9;
+/// The direct path could not fit its output in the arena the caller sized.
+const GE_ARENA_TOO_SMALL: i32 = 10;
 
 extern "C" {
     fn glyph_engine_new() -> *mut c_void;
@@ -74,14 +76,67 @@ extern "C" {
     // Per-stage nanoseconds for the last load. Returns how many lanes it wrote,
     // so a dylib with fewer lanes reports fewer rather than being assumed.
     fn glyph_engine_stage_ns(handle: *mut c_void, out_ptr: *mut u64, cap: usize) -> usize;
+
+    // The direct path: fold, then write render instances into the CALLER's
+    // arena. No wire record is materialized anywhere.
+    #[allow(clippy::too_many_arguments)]
+    fn glyph_engine_load_items_direct(
+        handle: *mut c_void,
+        blob_ptr: *const u8,
+        blob_len: usize,
+        desc_ptr: *const u8,
+        item_count: usize,
+        inst_ptr: *mut u32,
+        inst_cap: usize,   // in INSTANCES, not bytes
+        paint_ptrs: *const *const u32,
+        flat_colors: *const u32,
+        group_ids: *const u32,
+        place_out: *mut u32,
+    ) -> i32;
+
+    // (instance u32 lanes << 32) | placement u32 lanes.
+    fn glyph_engine_instance_shape() -> u64;
 }
+
+/// Marshal item descriptors into the 128 B blocks the engine reads.
+///
+/// ONE writer of that layout, shared by every entry that takes items. Written
+/// twice it would be the correlated-fault shape this tree keeps finding: two
+/// copies agree with each other and both drift from the engine, and the
+/// descriptor is exactly where that already happened once (`cc814b3`, the
+/// arity shift that broke the per-item entry while the batched one stayed fine).
+///
+/// Returns `Vec<u64>` rather than bytes because the u64 backing is what keeps
+/// the array 8-byte aligned for the engine's bitcast reads.
+fn build_descs(items: &[(u64, u64, ItemParams)]) -> Result<Vec<u64>, LayoutError> {
+    let mut desc_words = vec![0u64; items.len() * (ITEM_DESC_SIZE / 8)];
+    let desc_bytes: &mut [u8] = bytemuck::cast_slice_mut(&mut desc_words);
+    for (i, (start, count, params)) in items.iter().enumerate() {
+        // Per item, and the error names WHICH — with a whole corpus in one
+        // arena, an unnamed refusal is unactionable.
+        params.validate(i)?;
+        write_item_desc(
+            &mut desc_bytes[i * ITEM_DESC_SIZE..(i + 1) * ITEM_DESC_SIZE],
+            params,
+            *start,
+            *count,
+        );
+    }
+    Ok(desc_words)
+}
+
+/// `GlyphInstance` as u32 lanes — 48 B / 4. The engine writes this many per
+/// instance; asserted against the dylib at load rather than assumed.
+pub const INSTANCE_U32S: usize = 12;
+/// Placement block lanes, u32, floats bitcast. 64 B per item.
+pub const PLACEMENT_U32S: usize = 16;
 
 /// Engine-side stage lanes, in the order `ffi.mojo` writes them: `run_pipeline`'s
 /// seven, then the two the FFI entry owns. Names are the engine's, kept verbatim
 /// so a reader can grep one string across both languages.
-pub const ENGINE_STAGE_NAMES: [&str; 9] = [
+pub const ENGINE_STAGE_NAMES: [&str; 10] = [
     "alloc", "gapsweep", "decode", "misscat", "fold", "paginate", "bounds",
-    "eg_compact", "eg_counts",
+    "eg_compact", "eg_counts", "eg_direct",
 ];
 
 /// Byte size of one item descriptor (see ffi.mojo's layout comment). BOTH load
@@ -304,20 +359,8 @@ impl Engine {
         blob: &[u8],
         items: &[(u64, u64, ItemParams)],
     ) -> Result<Vec<u64>, LayoutError> {
-        // Vec<u64> backing keeps the descriptor array 8-byte aligned.
-        let mut desc_words = vec![0u64; items.len() * (ITEM_DESC_SIZE / 8)];
+        let mut desc_words = build_descs(items)?;
         let desc_bytes: &mut [u8] = bytemuck::cast_slice_mut(&mut desc_words);
-        for (i, (start, count, params)) in items.iter().enumerate() {
-            // Per item, and the error names WHICH — with a whole corpus in one
-            // arena, an unnamed refusal is unactionable.
-            params.validate(i)?;
-            write_item_desc(
-                &mut desc_bytes[i * ITEM_DESC_SIZE..(i + 1) * ITEM_DESC_SIZE],
-                params,
-                *start,
-                *count,
-            );
-        }
         let mut counts = vec![0u64; items.len()];
         let status = unsafe {
             glyph_engine_load_items(
@@ -348,6 +391,90 @@ impl Engine {
     /// Records produced by the last [`Engine::load_item`].
     pub fn slot_count(&self) -> u64 {
         unsafe { glyph_engine_slot_count(self.handle) }
+    }
+
+    /// Fold `items` and have the ENGINE write render instances into `inst_ptr`.
+    ///
+    /// The caller owns the destination, sizes it, and learns from the return
+    /// how many slots were actually filled — blanks are dropped by the engine,
+    /// so the count offered and the count written are different numbers and
+    /// conflating them would publish uninitialized memory as glyphs.
+    ///
+    /// # Safety
+    /// `inst_ptr` must be writable for `inst_cap * INSTANCE_U32S` u32s, and
+    /// `place_out` for `items * PLACEMENT_U32S`. Every `paint_ptrs[i]` is
+    /// either null or readable for that item's RECORD count.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn load_items_direct(
+        &mut self,
+        blob: &[u8],
+        items: &[(u64, u64, ItemParams)],
+        inst_ptr: *mut u32,
+        inst_cap: usize,
+        paint_ptrs: &[*const u32],
+        flat_colors: &[u32],
+        group_ids: &[u32],
+        place_out: &mut [u32],
+    ) -> Result<(), LayoutError> {
+        let mut desc_words = build_descs(items)?;
+        let desc_bytes: &mut [u8] = bytemuck::cast_slice_mut(&mut desc_words);
+        let status = unsafe {
+            glyph_engine_load_items_direct(
+                self.handle,
+                blob.as_ptr(),
+                blob.len(),
+                desc_bytes.as_ptr(),
+                items.len(),
+                inst_ptr,
+                inst_cap,
+                paint_ptrs.as_ptr(),
+                flat_colors.as_ptr(),
+                group_ids.as_ptr(),
+                place_out.as_mut_ptr(),
+            )
+        };
+        match status {
+            GE_OK | GE_EMPTY => Ok(()),
+            s => Err(LayoutError {
+                backend: MOJO_BACKEND,
+                status: s,
+                what: match s {
+                    GE_NO_TRIE => "glyph_engine_load_items_direct (no trie loaded)".to_string(),
+                    GE_ABI_MISMATCH => abi_mismatch_message("glyph_engine_load_items_direct"),
+                    GE_ARENA_TOO_SMALL => format!(
+                        "glyph_engine_load_items_direct: the fold produced more \
+                         records than the {inst_cap}-slot arena the caller sized. \
+                         The caller's bound is the byte count and leaders cannot \
+                         exceed bytes, so this is a fold defect, not a sizing one",
+                    ),
+                    _ => "glyph_engine_load_items_direct".to_string(),
+                },
+            }),
+        }
+    }
+
+    /// Assert the dylib agrees with this build about the instance layout.
+    ///
+    /// Called before the first direct load, not at construction: a caller that
+    /// never uses the direct path should not be refused service by a dylib
+    /// that predates it. A disagreement here is the Stage G strided-colour bug
+    /// class — found last time by looking at pixels — so it is a hard error
+    /// with both numbers in it, not a warning.
+    pub fn check_instance_shape() -> Result<(), LayoutError> {
+        let packed = unsafe { glyph_engine_instance_shape() };
+        let (inst, place) = ((packed >> 32) as usize, (packed & 0xffff_ffff) as usize);
+        if inst == INSTANCE_U32S && place == PLACEMENT_U32S {
+            return Ok(());
+        }
+        Err(LayoutError {
+            backend: MOJO_BACKEND,
+            status: GE_ABI_MISMATCH,
+            what: format!(
+                "instance layout disagreement: this build says {INSTANCE_U32S} \
+                 instance lanes and {PLACEMENT_U32S} placement lanes, the engine \
+                 says {inst} and {place}. Rebuild the dylib (`cargo glyph build`)",
+            ),
+        })
     }
 
     /// Per-stage nanoseconds for the last load, engine-side.

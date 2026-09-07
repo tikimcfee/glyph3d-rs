@@ -22,7 +22,8 @@
 # form, and it is what makes streaming edits a range re-run rather than a reload.
 
 from std.collections.span import Span
-from std.memory import unsafe_memcpy
+from std.math import inf
+from std.memory import bitcast, unsafe_memcpy
 from glyph_schema import (
     SM_STRIDE, LM_STRIDE, LC_STRIDE,
     RECORD_MEASURE_STRIDE, RECORD_COUNT_STRIDE, RECORD_BYTES,
@@ -260,3 +261,164 @@ def seed_at[o: ImmOrigin](
     else:
         seed.base_row = lanes.row
     return seed^
+
+
+# ── THE DIRECT WRITE: fold output straight to render instances ───────────────
+#
+# WHY THIS EXISTS. `compact` above materializes a 32 B wire record per glyph in
+# the engine's arena; the host then copies that whole stream across the FFI and
+# repacks it into 48 B instances. Measured 2026-09-07 on a 47.1 MB corpus, those
+# three passes are 87% of a batched load's backend time and the layout
+# computation is 3%. This function is the same filter and the same arithmetic
+# with the intermediate representations removed: one pass, per-byte lanes in,
+# render instances out.
+#
+# It does NOT replace `compact`. The wire record is what the corpus gates and
+# the pick path are written against, so it stays as the verification form —
+# exactly the relationship `witness` already has with the elided fold. Two
+# writers of one truth is a hazard only if nothing adjudicates them; here
+# `--repo-verify` diffs the strategies bit-for-bit at the seam.
+#
+# THE LAYOUT IS THE HOST'S. Twelve 4-byte fields, `GlyphInstance` in
+# glyph_scene.rs, mirroring `InstanceSlot` in glyph_field.wgsl. It is written
+# here as u32 lanes with the float fields bitcast, because the alternative — a
+# struct defined twice — is the correlated-fault shape this tree keeps finding.
+# glyph_engine_instance_shape() lets the caller assert the agreement rather than
+# assume it.
+
+comptime F32_INF = inf[DType.float32]()
+
+comptime INST_U32S = 12          # 48 B / 4
+comptime INST_POS_X = 0
+comptime INST_POS_Y = 1
+comptime INST_POS_Z = 2
+comptime INST_GLYPH_ID = 3
+comptime INST_ROW = 4
+comptime INST_COL = 5
+comptime INST_COLOR = 6
+comptime INST_GROUP_ID = 7
+comptime INST_ADVANCE = 8
+comptime INST_HEIGHT = 9
+comptime INST_FLAGS = 10
+comptime INST_PAD = 11
+
+
+struct DirectPlacement(Copyable, Movable):
+    """What one item's direct write produced — the engine half of
+    `ItemPlacement`. Page is seeded at the ORIGIN over ALL records; ink is
+    seeded EMPTY over survivors only. Those seeds are not interchangeable and
+    the host learned that the hard way (`d6f33ff`), so they are stated here
+    rather than left to whoever reads the loop."""
+
+    var slot_count: Int
+    var record_count: Int
+    var page_right: Float32
+    var page_bottom: Float32
+    var page_z_min: Float32
+    var page_z_max: Float32
+    var ink_min: List[Float32]
+    var ink_max: List[Float32]
+
+    def __init__(out self):
+        self.slot_count = 0
+        self.record_count = 0
+        self.page_right = 0.0
+        self.page_bottom = 0.0
+        self.page_z_min = 0.0
+        self.page_z_max = 0.0
+        self.ink_min = List[Float32](length=3, fill=F32_INF)
+        self.ink_max = List[Float32](length=3, fill=-F32_INF)
+
+
+def write_instances_direct(
+    r: PipelineResult,
+    items: List[Item],
+    item_index: Int,
+    group_id: UInt32,
+    paint: Pointer[UInt32, ImmUntrackedOrigin],
+    has_paint: Bool,
+    flat_color: UInt32,
+    out_ptr: Pointer[UInt32, MutUntrackedOrigin],
+    out_slot_base: Int,
+) -> DirectPlacement:
+    """One item's records, written as render instances into `out_ptr` starting
+    at instance `out_slot_base`. Returns the counts and both extents.
+
+    THE FILTER IS THE HOST'S, restated: a record whose GLYPH_ID is 0 updates the
+    page extent and is then dropped — it occupies a cell but inks nothing. The
+    two extents therefore run over different sets, which is why they are
+    accumulated in one pass rather than derived from each other.
+
+    `paint` is indexed by RECORD, not by surviving instance. That indexing is
+    the reason the blank check happens after the paint lookup would have: the
+    host's colorize_leaders emits one colour per leader including blanks, and
+    an index that skipped them would tint every glyph after the first blank."""
+    var p = DirectPlacement()
+    var start = items[item_index].byte_start
+    var stop = start + items[item_index].byte_count
+    var w = out_slot_base
+    var rec = 0
+
+    for id in range(start, stop):
+        if (Int(r.fl[id]) & F_LEADER) == 0:
+            continue
+        var lo = id * LM_STRIDE
+        var so = id * SM_STRIDE
+        var x = r.lm[lo + 0]
+        var y = r.lm[lo + 1]
+        var z = r.lm[lo + 2]
+        var adv = r.sm[so + 0]
+        var hgt = r.sm[so + 1]
+        var gid = r.gi[id]
+
+        # Page: over ALL records, seeded at the origin.
+        var right = x + adv
+        if right > p.page_right:
+            p.page_right = right
+        if y < p.page_bottom:
+            p.page_bottom = y
+        if z < p.page_z_min:
+            p.page_z_min = z
+        if z > p.page_z_max:
+            p.page_z_max = z
+
+        var color = paint[unsafe_offset = rec] if has_paint else flat_color
+        rec += 1
+        if gid == 0:
+            continue
+
+        # Ink: over SURVIVORS, seeded empty, on the QUAD not the baseline.
+        var half = hgt * 0.5
+        if x < p.ink_min[0]:
+            p.ink_min[0] = x
+        if right > p.ink_max[0]:
+            p.ink_max[0] = right
+        if y - half < p.ink_min[1]:
+            p.ink_min[1] = y - half
+        if y + half > p.ink_max[1]:
+            p.ink_max[1] = y + half
+        # Depth is a point, not a span: a glyph quad has no thickness.
+        if z < p.ink_min[2]:
+            p.ink_min[2] = z
+        if z > p.ink_max[2]:
+            p.ink_max[2] = z
+
+        var co = id * LC_STRIDE
+        var o = w * INST_U32S
+        out_ptr[unsafe_offset = o + INST_POS_X] = bitcast[DType.uint32](x)
+        out_ptr[unsafe_offset = o + INST_POS_Y] = bitcast[DType.uint32](y)
+        out_ptr[unsafe_offset = o + INST_POS_Z] = bitcast[DType.uint32](z)
+        out_ptr[unsafe_offset = o + INST_GLYPH_ID] = gid
+        out_ptr[unsafe_offset = o + INST_ROW] = r.lc[co + 0]
+        out_ptr[unsafe_offset = o + INST_COL] = r.lc[co + 1]
+        out_ptr[unsafe_offset = o + INST_COLOR] = color
+        out_ptr[unsafe_offset = o + INST_GROUP_ID] = group_id
+        out_ptr[unsafe_offset = o + INST_ADVANCE] = bitcast[DType.uint32](adv)
+        out_ptr[unsafe_offset = o + INST_HEIGHT] = bitcast[DType.uint32](hgt)
+        out_ptr[unsafe_offset = o + INST_FLAGS] = 0
+        out_ptr[unsafe_offset = o + INST_PAD] = 0
+        w += 1
+
+    p.slot_count = w - out_slot_base
+    p.record_count = rec
+    return p^

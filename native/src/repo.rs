@@ -325,7 +325,7 @@ pub struct LoadStats {
     pub skipped_large: usize,
     pub skipped_non_utf8: usize,
     pub dirs_visited: usize,
-    pub batch: bool,
+    pub strategy: Strategy,
     pub verified: bool,
 }
 
@@ -450,17 +450,21 @@ fn layout(
 
 /// Whole-repo load: walk → paint → the layout seam → grid layout.
 ///
-/// `batch` selects the Mojo backend's batched FFI strategy over its per-item
-/// one — a backend-internal choice since the layout seam, threaded through only
-/// because the CLI still exposes it. `verify` runs the OTHER strategy as a
-/// second backend and diffs the two AT THE SEAM: placements, instances and
-/// records, all bit-exact. That is the standing check, and with the Rust backend the same
-/// call diffs Mojo against Rust with nothing new written.
+/// `strategy` selects the Mojo backend's FFI strategy — a backend-internal
+/// choice since the layout seam, threaded through only because the CLI still
+/// exposes it. `verify` runs ANOTHER strategy as a second backend and diffs the
+/// two AT THE SEAM: placements, instances and, when both can produce them,
+/// records, all bit-exact. That is the standing check, and with the Rust
+/// backend the same call diffs Mojo against Rust with nothing new written.
+///
+/// It was `batch: bool` until `Direct` landed. A boolean cannot name three
+/// strategies, and the honest fix is the enum the backend already had rather
+/// than a second flag beside the first.
 pub fn load_repo(
     root: &Path,
     trie: &Path,
     params: &RepoParams,
-    batch: bool,
+    strategy: Strategy,
     verify: bool,
 ) -> RepoLoad {
     let t0 = Instant::now();
@@ -502,7 +506,6 @@ pub fn load_repo(
         })
         .collect();
 
-    let strategy = if batch { Strategy::Batched } else { Strategy::PerItem };
     let mut backend = MojoLayout::new(strategy);
     backend
         .load_trie_file(trie)
@@ -510,10 +513,16 @@ pub fn load_repo(
 
     let mut arena = GlyphArena::new();
     let t = Instant::now();
-    // Under --repo-verify the selected backend also records its wire stream so
-    // the other one can be diffed against it at every granularity. Without it
-    // nothing asks for records at all, which is the seam's entire point.
-    let (placements, records) = if verify {
+    // Under --repo-verify the selected backend ALSO records its wire stream,
+    // when it has one, so the other can be diffed against it at every
+    // granularity. Without it nothing asks for records at all, which is the
+    // seam's entire point.
+    //
+    // `Direct` has no wire stream by construction, so under it the diff is
+    // instances and placements only — which is the whole render-visible
+    // contract, and the granularity that matters. `diff_backends` is told the
+    // records are absent rather than being handed an empty slice to interpret.
+    let (placements, records) = if verify && strategy.can_record() {
         backend
             .layout_items_recording(&items, &mut arena)
             .expect("layout failed")
@@ -530,7 +539,13 @@ pub fn load_repo(
     let mut verified = false;
     if verify {
         let t = Instant::now();
-        let other = if batch { Strategy::PerItem } else { Strategy::Batched };
+        // The counterpart to diff against. Direct is checked against Batched
+        // because that is the strategy it replaces; the other two check each
+        // other, which is the pairing that existed before it.
+        let other = match strategy {
+            Strategy::Batched => Strategy::PerItem,
+            Strategy::PerItem | Strategy::Direct => Strategy::Batched,
+        };
         let mut alt = MojoLayout::new(other);
         alt.load_trie_file(trie)
             .expect("failed to load engine trie");
@@ -612,7 +627,7 @@ pub fn load_repo(
         skipped_large: walk.skipped_large,
         skipped_non_utf8: walk.skipped_non_utf8,
         dirs_visited: walk.dirs_visited,
-        batch,
+        strategy,
         verified,
     };
     RepoLoad {
@@ -756,7 +771,11 @@ impl RepoLoad {
             s.records,
             s.instances,
             s.blanks,
-            if s.batch { "batched" } else { "per-item" },
+            match s.strategy {
+                Strategy::Batched => "batched",
+                Strategy::PerItem => "per-item",
+                Strategy::Direct => "direct",
+            },
             if s.verified { " (verified bit-exact vs the other strategy)" } else { "" },
         );
         println!(

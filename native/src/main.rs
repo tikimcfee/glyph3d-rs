@@ -70,7 +70,7 @@ pub enum SceneChoice {
     /// per file, one shared glyph arena, grid layout.
     Repo {
         dir: PathBuf,
-        batch: bool,
+        strategy: layout_mojo::Strategy,
         verify: bool,
         focus: Option<String>,
         /// How a wrap is spent. `Back` is the default: a wrapped line costs
@@ -92,6 +92,20 @@ fn parse_wrap_mode(s: &str) -> fold::WrapMode {
         "down" => fold::WrapMode::Down,
         "back" => fold::WrapMode::Back,
         other => panic!("--wrap-mode: unknown mode {other:?} (clap should have refused it)"),
+    }
+}
+
+/// Panics on an unknown strategy for the same reason `parse_wrap_mode` does:
+/// clap has already refused anything else, so reaching here means the parser
+/// and this match disagree, and silently loading with the wrong strategy would
+/// make a verification run compare something other than what was asked for.
+fn parse_strategy(s: &str) -> layout_mojo::Strategy {
+    use layout_mojo::Strategy;
+    match s {
+        "naive" => Strategy::PerItem,
+        "batch" => Strategy::Batched,
+        "direct" => Strategy::Direct,
+        other => panic!("--repo-engine: unknown mode {other:?} (clap should have refused it)"),
     }
 }
 
@@ -257,13 +271,13 @@ fn build_scene_impl(
         }
         SceneChoice::Repo {
             dir,
-            batch,
+            strategy,
             verify,
             focus,
             wrap_mode,
         } => {
             let params = repo::RepoParams { wrap_mode: *wrap_mode, ..Default::default() };
-            let load = repo::load_repo(dir, &default_engine_trie(), &params, *batch, *verify);
+            let load = repo::load_repo(dir, &default_engine_trie(), &params, *strategy, *verify);
             load.print_stats();
             let atlas = atlas::Atlas::load(ctx);
             let staged = load.into_staged(focus.as_deref());
@@ -373,7 +387,10 @@ struct Cli {
     load_repo: Option<PathBuf>,
     /// Stage E2: engine path for repo loads (naive measured faster on the
     /// 97 MB corpus — see out/STAGE_E2_REPORT.md)
-    #[arg(long, value_name = "MODE", default_value = "naive", value_parser = ["naive", "batch"])]
+    /// Which FFI strategy the Mojo backend uses. `direct` is the one that
+    /// writes instances into the arena without materializing a wire record;
+    /// the other two go through one and are what `--repo-verify` diffs against.
+    #[arg(long, value_name = "MODE", default_value = "naive", value_parser = ["naive", "batch", "direct"])]
     repo_engine: String,
     /// Stage E2: diff batch vs naive bit-exact over the whole repo
     #[arg(long)]
@@ -1022,7 +1039,7 @@ fn main() {
             dir,
             &default_engine_trie(),
             &params,
-            cli.repo_engine == "batch",
+            parse_strategy(&cli.repo_engine),
             cli.repo_verify,
         );
         load.print_stats();
@@ -1034,7 +1051,7 @@ fn main() {
     } else if let Some(dir) = &cli.load_repo {
         SceneChoice::Repo {
             dir: dir.clone(),
-            batch: cli.repo_engine == "batch",
+            strategy: parse_strategy(&cli.repo_engine),
             verify: cli.repo_verify,
             focus: cli.focus_file.clone(),
             wrap_mode: parse_wrap_mode(&cli.wrap_mode),

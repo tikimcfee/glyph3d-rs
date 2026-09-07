@@ -31,10 +31,10 @@
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use crate::engine::{Engine, ENGINE_STAGE_NAMES};
+use crate::engine::{Engine, ENGINE_STAGE_NAMES, PLACEMENT_U32S};
 use crate::layout::{
-    compact_records_into, GlyphArena, GlyphRecord, ItemPlacement, LayoutError, LayoutGlyphs,
-    LayoutItem, VerifyLayout,
+    compact_records_into, GlyphArena, GlyphRecord, InkExtent, ItemPlacement, LayoutError,
+    LayoutGlyphs, LayoutItem, PageExtent, Paint, VerifyLayout,
 };
 
 /// How many times one corpus crosses into Mojo.
@@ -47,6 +47,19 @@ pub enum Strategy {
     /// One `glyph_engine_load_item` call per item. Older, slower, and kept
     /// because two independent routes to the same bits is a gate.
     PerItem,
+    /// One call, and the ENGINE writes render instances into the caller's
+    /// arena. No wire record is materialized on either side of the FFI.
+    ///
+    /// This is the measured answer to 2026-09-07: `Batched` compacts in the
+    /// engine, copies the stream across, then compacts again on the host —
+    /// three walks that were 87% of a batched load's backend time, against 3%
+    /// for computing the layout. `Direct` does the filter and the arithmetic
+    /// once, where the glyphs will live.
+    ///
+    /// It cannot serve `VerifyLayout`: there is no record stream to hand back,
+    /// which is the point. `--repo-verify` diffs it against `Batched` at the
+    /// seam instead, where the comparison is instances and placements.
+    Direct,
 }
 
 /// Where a load's time goes inside the backend, accumulated across items.
@@ -102,6 +115,42 @@ impl BackendPhases {
             .collect();
         v.sort_by_key(|(_, d)| std::cmp::Reverse(*d));
         v
+    }
+}
+
+/// Decode one item's placement block from the engine's u32 lanes.
+///
+/// The lane indices are `PL_*` in `ffi.mojo` and they are duplicated here by
+/// necessity — two languages, one wire format. What keeps that honest is
+/// `Engine::check_instance_shape`, which refuses the load if the two sides
+/// disagree about the block's SIZE, and `--repo-verify`, which would show any
+/// disagreement about its CONTENT as a bit difference against `Batched`.
+fn placement_from_lanes(lanes: &[u32]) -> ItemPlacement {
+    let f = |i: usize| f32::from_bits(lanes[i]);
+    ItemPlacement {
+        slot_base: lanes[0],
+        slot_count: lanes[1],
+        record_count: lanes[2],
+        page: PageExtent { right: f(4), bottom: f(5), z_min: f(6), z_max: f(7) },
+        ink: InkExtent {
+            min: [f(8), f(9), f(10)],
+            max: [f(11), f(12), f(13)],
+        },
+    }
+}
+
+impl Strategy {
+    /// Whether this strategy can hand back the 32 B wire stream.
+    ///
+    /// `Direct` cannot, and that is the feature rather than a gap: no record is
+    /// materialized anywhere on its path. Callers ASK — a caller that assumed
+    /// and got an empty Vec would read "nothing to diff" as "nothing differed",
+    /// which is the vacuous-pass shape this tree has been bitten by before.
+    pub fn can_record(self) -> bool {
+        match self {
+            Strategy::Batched | Strategy::PerItem => true,
+            Strategy::Direct => false,
+        }
     }
 }
 
@@ -175,6 +224,77 @@ impl MojoLayout {
                     *sink = all;
                 }
             }
+            Strategy::Direct => {
+                // No record stream exists on this path, so a caller that asked
+                // for one asked for something this strategy cannot produce.
+                // Refusing beats silently returning an empty Vec that a gate
+                // would read as "nothing differed".
+                if records_out.is_some() {
+                    return Err(LayoutError {
+                        backend: "mojo-cpu/direct",
+                        status: -1,
+                        what: "the direct path materializes no wire records; use \
+                               Batched or PerItem for VerifyLayout"
+                            .to_string(),
+                    });
+                }
+                Engine::check_instance_shape()?;
+
+                let total_bytes: usize = items.iter().map(|i| i.bytes.len()).sum();
+                let mut blob = Vec::with_capacity(total_bytes);
+                let mut descs = Vec::with_capacity(items.len());
+                let mut paint_ptrs = Vec::with_capacity(items.len());
+                let mut flat_colors = Vec::with_capacity(items.len());
+                let mut group_ids = Vec::with_capacity(items.len());
+                for item in items {
+                    descs.push((blob.len() as u64, item.bytes.len() as u64, item.params));
+                    blob.extend_from_slice(item.bytes);
+                    group_ids.push(item.group_id);
+                    match item.paint {
+                        Paint::Flat(rgba) => {
+                            paint_ptrs.push(std::ptr::null());
+                            flat_colors.push(rgba);
+                        }
+                        Paint::PerRecord(colors) => {
+                            paint_ptrs.push(colors.as_ptr());
+                            flat_colors.push(0);
+                        }
+                    }
+                }
+
+                // Leaders cannot exceed bytes — one leader per UTF-8 sequence,
+                // and a sequence is at least one byte — so the byte count is a
+                // sound upper bound without folding first. It is TIGHT for
+                // ASCII and loose for multibyte text; the engine reports what
+                // it actually wrote, and `GE_ARENA_TOO_SMALL` fires loudly if
+                // this reasoning is ever wrong rather than writing past the end.
+                let (inst_ptr, cap) = arena.uninit_tail(total_bytes);
+                let mut place = vec![0u32; items.len() * PLACEMENT_U32S];
+                let t = Instant::now();
+                // SAFETY: `inst_ptr` came from `uninit_tail(cap)` so it is
+                // writable for `cap` instances; `place` is sized per item; each
+                // paint pointer is null or borrows that item's colour slice,
+                // which outlives the call.
+                unsafe {
+                    self.engine.load_items_direct(
+                        &blob, &descs, inst_ptr as *mut u32, cap,
+                        &paint_ptrs, &flat_colors, &group_ids, &mut place,
+                    )?
+                };
+                self.phases.fold += t.elapsed();
+                self.phases.add_engine_stages(self.engine.stage_ns());
+
+                let mut written = 0usize;
+                for i in 0..items.len() {
+                    let p = placement_from_lanes(&place[i * PLACEMENT_U32S..]);
+                    written += p.slot_count as usize;
+                    placements.push(p);
+                }
+                // SAFETY: the engine wrote exactly `written` instances into the
+                // tail, contiguous from its base — the placements it just
+                // reported are how it says so.
+                unsafe { arena.commit(written) };
+            }
             Strategy::PerItem => {
                 for item in items {
                     let t = Instant::now();
@@ -208,6 +328,7 @@ impl LayoutGlyphs for MojoLayout {
         match self.strategy {
             Strategy::Batched => "mojo-cpu/batched",
             Strategy::PerItem => "mojo-cpu/per-item",
+            Strategy::Direct => "mojo-cpu/direct",
         }
     }
 

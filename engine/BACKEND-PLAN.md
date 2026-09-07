@@ -85,8 +85,12 @@ detail.
    lines of per-item arithmetic, and the hop exists to mirror the CPU driver
    for conformance rather than out of necessity. It is a one-kernel map away
    from not existing. Measure around it; do not enshrine it.
-2. **The readback (item 3), as device-side compaction — and now the target is
-   ALL THREE COPIES, not one.** The stage split (table under item 4) shows the
+2. **The readback (item 3) — DONE ON THE CPU 2026-09-07, 3.6x on backend.**
+   `Strategy::Direct` removed all three copies at once; details under item 3.
+   The device version is now a smaller step than it was, because the host no
+   longer has a detour to remove — only an arena to relocate.
+
+   The reasoning that got here, kept because it is the reusable part: The stage split (table under item 4) shows the
    record stream compacted in the engine, copied across the FFI, then compacted
    again on the host: **87% of backend batched, 63% per-item**, against 3-13%
    for the layout computation. So item 3 was understated, not overstated, and a
@@ -163,9 +167,36 @@ Hide is *not* a delta — it needs a visibility lane, and `flags` is its home.
 Land the identity case first: a table of zeros must reproduce today's layout
 bit-exact, which the corpus can check without anyone's eye.
 
-**3. The readback.** `MojoLayout::run` calls `engine.read_back()` unconditionally
-in both strategies. `VerifyLayout` gates the API, not the copy. Compaction has
-to run where the data already is.
+**3. The readback — BUILT 2026-09-07 as `Strategy::Direct`, on the CPU.**
+
+The engine now writes 48 B render instances straight into the caller's arena
+(`GlyphArena::uninit_tail` / `commit`), applying the blank filter, the paint and
+both extents in ONE pass. No wire record is materialized on either side of the
+FFI. `--repo-engine direct`.
+
+**47.1 MB corpus, M2: backend 2.510 s -> 0.694 s (3.6x); whole load 3.133 s ->
+1.245 s (2.6x).** The three lanes that were 87% of backend are gone —
+`eg_compact`, `read_back` and `compact_records_into` all read 0.000 s — and what
+remains is one bandwidth-bound write (`eg_direct` 0.505 s for 2.08 GB of
+instances, ~4.1 GB/s).
+
+**It is gated, not asserted.** `repo-verify-direct` diffs it against the batched
+record path bit-exact on placements and instances, both wrap modes, and the
+mutation `direct-ink-half-height` proves that gate reddens on a real defect
+(coverage stays 12/12). At 47.1 MB the two paths agree on **43,424,013
+instances**, byte for byte.
+
+**What it does NOT do, stated because the PASS line says `0 records`:** the
+direct path produces no 32 B wire stream, so `VerifyLayout` refuses it rather
+than returning an empty Vec a gate could read as "nothing differed". The record
+tier stays covered by `repo-verify` and `engine-check` on the other strategies —
+the same relationship `witness` already has with the elided fold: a verification
+form and a production form, with something adjudicating them.
+
+**Still open here:** the default is still `naive` (per-item). Making `direct`
+the default is a behaviour change and a re-baseline decision, not a refactor.
+And `eg_counts` — the serial O(bytes) per-item record count — survives on the
+batched path; the direct path derives the same counts from the write itself.
 
 **MEASURED 2026-09-07, and the headline is not what this item assumed.** Until
 now the only number here was `stage 1.438s` from `out/g-windowed-smoke.log`

@@ -28,7 +28,9 @@ from std.runtime import initialize_runtime
 from std.time import perf_counter_ns
 
 from glyph_pipeline import Item, Trie, run_pipeline, PipelineResult, F_LEADER, ST_COUNT  # NATIVE-PORT: F_LEADER for load_items per-item counts
-from glyph_record import RecordSet, compact
+from glyph_record import (
+    RecordSet, compact, write_instances_direct, INST_U32S,
+)
 from fixture_io import load_trie_auto  # NATIVE-PORT: G3DF fixture or G3TR blob
 
 
@@ -65,7 +67,8 @@ struct EngineState(Movable):
 # Engine-side stage lanes: run_pipeline's ST_* first, then this entry's own.
 comptime EG_COMPACT = ST_COUNT       # repack the wire stream into the arena
 comptime EG_COUNTS = ST_COUNT + 1    # per-item record counts — SERIAL O(bytes)
-comptime EG_STAGE_COUNT = ST_COUNT + 2
+comptime EG_DIRECT = ST_COUNT + 2    # the direct write: lanes straight to instances
+comptime EG_STAGE_COUNT = ST_COUNT + 3
 
 comptime Handle = Pointer[NoneType, MutUntrackedOrigin]
 
@@ -76,6 +79,12 @@ comptime GE_NO_TRIE: c_int = 2
 comptime GE_RAISED: c_int = 3
 comptime GE_EMPTY: c_int = 4
 comptime GE_ABI_MISMATCH: c_int = 9
+# The direct path's own failure: the caller's arena cannot hold what the fold
+# produced. LOUD, because the alternative is writing past it. The caller sizes
+# from the leader count, which it does not know until the fold has run, so it
+# reserves the byte count as the upper bound; this fires only if that bound is
+# ever wrong, which would be a fold defect worth stopping for.
+comptime GE_ARENA_TOO_SMALL: c_int = 10
 """The descriptor carries a shape word this dylib does not recognise — the caller
 was built against a different FFI surface. See ABI_SHAPE."""
 
@@ -252,7 +261,7 @@ def glyph_engine_load_item_desc(
     s[].leaders = r.leaders
     var _c = perf_counter_ns()
     compact(r, n, r.leaders, s[].records)
-    _record_stages(s[], r, perf_counter_ns() - _c, 0)
+    _record_stages(s[], r, perf_counter_ns() - _c, 0, 0)
     _ = len(items)
     return GE_OK
 
@@ -290,13 +299,22 @@ def glyph_engine_load_item_desc(
 comptime ITEM_DESC_SIZE: Int = ABI_DESC_BYTES
 
 
-def _record_stages(mut st: EngineState, r: PipelineResult, compact_ns: Int, counts_ns: Int):
-    """Fold run_pipeline's own stage lanes into the handle, then add the two
-    this file owns. Kept as one writer so the lane layout has a single author."""
+def _record_stages(
+    mut st: EngineState, r: PipelineResult,
+    compact_ns: Int, counts_ns: Int, direct_ns: Int,
+):
+    """Fold run_pipeline's own stage lanes into the handle, then add the three
+    this file owns. Kept as one writer so the lane layout has a single author.
+
+    The lanes are per-ENTRY, not shared: the record path fills compact+counts
+    and the direct path fills direct. An entry that left them merged would put
+    two different costs under one name, which is the defect this whole
+    instrumentation line exists to stop making."""
     for i in range(ST_COUNT):
         st.stage_ns[i] = r.stage_ns[i]
     st.stage_ns[EG_COMPACT] = compact_ns
     st.stage_ns[EG_COUNTS] = counts_ns
+    st.stage_ns[EG_DIRECT] = direct_ns
 
 
 @export("glyph_engine_load_items")
@@ -365,7 +383,118 @@ def glyph_engine_load_items(
             it_end = Int(base.unsafe_bitcast[UInt64]()[unsafe_offset = 14]) + Int(base.unsafe_bitcast[UInt64]()[unsafe_offset = 15])
         if (Int(r.fl[id]) & F_LEADER) != 0:
             counts_out[unsafe_offset = it_i] += 1
-    _record_stages(s[], r, compact_ns, perf_counter_ns() - _k)
+    _record_stages(s[], r, compact_ns, perf_counter_ns() - _k, 0)
+    _ = len(items)
+    return GE_OK
+
+
+# Placement block, u32 lanes with the float fields bitcast: the engine half of
+# ItemPlacement. 16 rather than the 14 it needs, so the block stays 64 B and a
+# future lane costs no ABI change.
+comptime PLACE_U32S = 16
+comptime PL_SLOT_BASE = 0
+comptime PL_SLOT_COUNT = 1
+comptime PL_RECORD_COUNT = 2
+comptime PL_PAGE_RIGHT = 4
+comptime PL_PAGE_BOTTOM = 5
+comptime PL_PAGE_ZMIN = 6
+comptime PL_PAGE_ZMAX = 7
+comptime PL_INK_MIN = 8   # 3 lanes
+comptime PL_INK_MAX = 11  # 3 lanes
+
+
+@export("glyph_engine_instance_shape")
+def glyph_engine_instance_shape() abi("C") -> UInt64:
+    """(instance u32 lanes << 32) | placement u32 lanes.
+
+    The host asserts this against its own `size_of::<GlyphInstance>()` before
+    handing over an arena pointer. Same discipline as the per-item descriptor's
+    shape word (`cc814b3`): a dylib that disagrees about the layout should be a
+    loud refusal, not a silently mis-strided buffer. The Stage G strided-colour
+    bug is precisely this class, and it was found by pixels rather than by a
+    check."""
+    return (UInt64(INST_U32S) << 32) | UInt64(PLACE_U32S)
+
+
+@export("glyph_engine_load_items_direct")
+def glyph_engine_load_items_direct(
+    h: Handle,
+    blob_ptr: Pointer[UInt8, MutUntrackedOrigin],
+    blob_len: c_size_t,
+    desc_ptr: Pointer[UInt8, MutUntrackedOrigin],
+    item_count: c_size_t,
+    inst_ptr: Pointer[UInt32, MutUntrackedOrigin],
+    inst_cap: c_size_t,
+    paint_ptrs: Pointer[Pointer[UInt32, ImmUntrackedOrigin], MutUntrackedOrigin],
+    flat_colors: Pointer[UInt32, MutUntrackedOrigin],
+    group_ids: Pointer[UInt32, MutUntrackedOrigin],
+    place_out: Pointer[UInt32, MutUntrackedOrigin],
+) abi("C") -> c_int:
+    """Fold N items and write RENDER INSTANCES straight into the caller's arena.
+
+    THE POINT, measured: `glyph_engine_load_items` + `copy_slots` +
+    `compact_records_into` walk the record stream three times and account for
+    87% of a batched load's backend time (2026-09-07, 47.1 MB). This entry does
+    the same filtering and the same arithmetic in ONE pass and never
+    materializes a wire record at all — no engine arena, no FFI copy, no host
+    repack.
+
+    It does not retire the other entries. They are the verification form, and
+    `--repo-verify` diffs this against them bit-for-bit at the seam, which is
+    what makes a second writer of one truth safe rather than a liability."""
+    if item_count > 0 and not _desc_shape_ok(desc_ptr):
+        return GE_ABI_MISMATCH
+    initialize_runtime()
+    var s = _state(h)
+    if not s[].has_trie:
+        return GE_NO_TRIE
+    s[].records.glyphs = 0
+    var n = Int(blob_len)
+    var m = Int(item_count)
+    s[].byte_len = n
+    if n == 0 or m == 0:
+        s[].leaders = 0
+        return GE_EMPTY
+
+    var items = List[Item]()
+    for i in range(m):
+        var base = desc_ptr.unsafe_offset(i * ITEM_DESC_SIZE)
+        var u64s = base.unsafe_bitcast[UInt64]()
+        items.append(
+            _item_from_desc(
+                base,
+                Int(u64s[unsafe_offset = 14]),
+                Int(u64s[unsafe_offset = 15]),
+            )
+        )
+
+    var span = Span[UInt8, ImmUntrackedOrigin](unsafe_ptr=blob_ptr, length=n)
+    var r = run_pipeline[witness=False](span, s[].trie, items)
+    s[].leaders = r.leaders
+    if r.leaders > Int(inst_cap):
+        return GE_ARENA_TOO_SMALL
+
+    var _w = perf_counter_ns()
+    var slot_base = 0
+    for i in range(m):
+        var pp = paint_ptrs[unsafe_offset = i]
+        var p = write_instances_direct(
+            r, items, i, group_ids[unsafe_offset = i], pp,
+            Int(pp) != 0, flat_colors[unsafe_offset = i], inst_ptr, slot_base,
+        )
+        var o = i * PLACE_U32S
+        place_out[unsafe_offset = o + PL_SLOT_BASE] = UInt32(slot_base)
+        place_out[unsafe_offset = o + PL_SLOT_COUNT] = UInt32(p.slot_count)
+        place_out[unsafe_offset = o + PL_RECORD_COUNT] = UInt32(p.record_count)
+        place_out[unsafe_offset = o + PL_PAGE_RIGHT] = bitcast[DType.uint32](p.page_right)
+        place_out[unsafe_offset = o + PL_PAGE_BOTTOM] = bitcast[DType.uint32](p.page_bottom)
+        place_out[unsafe_offset = o + PL_PAGE_ZMIN] = bitcast[DType.uint32](p.page_z_min)
+        place_out[unsafe_offset = o + PL_PAGE_ZMAX] = bitcast[DType.uint32](p.page_z_max)
+        for k in range(3):
+            place_out[unsafe_offset = o + PL_INK_MIN + k] = bitcast[DType.uint32](p.ink_min[k])
+            place_out[unsafe_offset = o + PL_INK_MAX + k] = bitcast[DType.uint32](p.ink_max[k])
+        slot_base += p.slot_count
+    _record_stages(s[], r, 0, 0, perf_counter_ns() - _w)
     _ = len(items)
     return GE_OK
 
