@@ -313,7 +313,15 @@ a 0.4 MB corpus against a 4 MiB chunk — one chunk, boundary never crossed. A
 assertions (it caught its first draft being 2.07 MB and refused), and reddens
 when the chunk rebasing is removed.
 
-**Still open here:** the default is still `naive` (per-item). Making `direct`
+**`direct` IS THE DEFAULT** since 2026-09-07. The flip was safe by evidence, not
+by argument: all five golden views re-rendered BYTE-EQUAL through a completely
+different backend, which is the end-to-end proof that the strategies agree where
+it counts. One trap was found doing it — the `repo-verify` gate had no
+`--repo-engine`, so it took per-item by INHERITING the default and would
+silently have become a second copy of `repo-verify-direct`, deleting the
+per-item path's only coverage. It is pinned now. The three repo golden views
+deliberately still inherit, because the default is what ships and those frames
+are the only check that sees it whole. Making `direct`
 the default is a behaviour change and a re-baseline decision, not a refactor.
 And `eg_counts` — the serial O(bytes) per-item record count — survives on the
 batched path; the direct path derives the same counts from the write itself.

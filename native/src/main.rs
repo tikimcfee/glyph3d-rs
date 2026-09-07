@@ -385,10 +385,14 @@ struct Cli {
     /// Stage E2: load a whole repository as a field of code pages
     #[arg(long, value_name = "DIR")]
     load_repo: Option<PathBuf>,
-    /// Which FFI strategy the Mojo backend uses. `direct` is the one that
-    /// writes instances into the arena without materializing a wire record;
-    /// the other two go through one and are what `--repo-verify` diffs against.
-    #[arg(long, value_name = "MODE", default_value = "naive", value_parser = ["naive", "batch", "direct"])]
+    /// Which FFI strategy the Mojo backend uses. `direct` is the DEFAULT: the
+    /// engine writes render instances straight into the arena, materializing no
+    /// wire record on either side of the FFI — one pass where `naive` and
+    /// `batch` take three, and it folds in chunks so lane memory follows the
+    /// chunk rather than the corpus. The record strategies remain because they
+    /// are the verification form: `VerifyLayout` needs a wire stream, and
+    /// `--repo-verify` diffs whichever pair you name.
+    #[arg(long, value_name = "MODE", default_value = "direct", value_parser = ["naive", "batch", "direct"])]
     repo_engine: String,
     /// Diff the chosen strategy against a counterpart, bit-exact over the
     /// whole repo: placements and instances always, wire records when both
@@ -1118,7 +1122,11 @@ mod cli_tests {
         assert!(cli.engine_check.is_none());
         assert!(cli.engine_render.is_none());
         assert!(cli.load_repo.is_none());
-        assert_eq!(cli.repo_engine, "naive");
+        // The DEFAULT is `direct` since 2026-09-07. This assertion is not
+        // decoration: three golden views and, until it was pinned, the
+        // repo-verify gate all inherit this value, so a change here silently
+        // changes what they exercise.
+        assert_eq!(cli.repo_engine, "direct");
         // THE DEFAULT THE SCREENSHOT BASELINES DEPEND ON. A change here moves
         // repo-wide.png and repo-zoom.png, so it is pinned in the CLI layer too
         // and not only in RepoParams::default.
