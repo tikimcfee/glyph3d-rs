@@ -29,6 +29,7 @@ from std.collections.span import Span
 from std.math import inf
 from std.memory import unsafe_memset_zero
 from std.runtime import parallelism_level
+from std.time import perf_counter_ns
 from max.algorithm import parallelize  # MOJO-1.1-PORT: the PUBLIC parallel
 # primitive. TaskGroup lives only in the private std.runtime._asyncrt; the
 # public surface consolidated under `max` exactly as std.gpu -> max.gpu did.
@@ -369,6 +370,19 @@ struct Witness(Copyable, Movable):
         self.otb = otb
 
 
+# Stage indices into PipelineResult.stage_ns. run_pipeline fills these; the
+# scan form leaves them zero (its stages are a different decomposition, and
+# pretending otherwise would put two meanings in one lane).
+comptime ST_ALLOC = 0      # result Lists + the zeroing the witness tier needs
+comptime ST_GAPSWEEP = 1   # positional zeros for bytes no item claims
+comptime ST_DECODE = 2     # trie decode, sharded across workers
+comptime ST_MISSCAT = 3    # concatenate shard miss lists — SERIAL by contract
+comptime ST_FOLD = 4       # the fold proper: serial per item, items in parallel
+comptime ST_PAGINATE = 5   # page remap, stride derived from the fold scalars
+comptime ST_BOUNDS = 6     # per-item boxes + batch union
+comptime ST_COUNT = 7
+
+
 struct PipelineResult(Copyable, Movable):
     var sm: List[Float32]     # static measures, SM_STRIDE per byte
     var gi: List[UInt32]      # GLYPH_ID, 1 per byte — a native u32 identity
@@ -382,6 +396,10 @@ struct PipelineResult(Copyable, Movable):
     var leaders: Int
     var item_bounds: List[Float64]  # item_count × 8 lanes
     var batch_bounds: List[Float64]  # 8 lanes
+    # Nanoseconds per stage, ST_* indexed. Always filled — seven perf_counter_ns
+    # calls against a fold that runs in milliseconds is not a measurable tax, and
+    # a profile behind a flag is a profile nobody runs (engine/check.sh:100).
+    var stage_ns: List[Int]
 
     def __init__(out self):
         self.sm = List[Float32]()
@@ -396,6 +414,7 @@ struct PipelineResult(Copyable, Movable):
         self.leaders = 0
         self.item_bounds = List[Float64]()
         self.batch_bounds = List[Float64]()
+        self.stage_ns = List[Int](length=ST_COUNT, fill=0)
 
     def slots(mut self) -> Slots:
         # Origin-erased VIEW: the caller owns the Lists and must keep them alive
@@ -1111,6 +1130,7 @@ def run_pipeline[o: ImmOrigin, witness: Bool = True](
     #              SWEEP below zeroes bytes no item claims
     # ord_to_byte's memset STAYS (witnessed only) — the fold fills just
     # [byte_start, +ord), so its tail has no writer.
+    var _t = perf_counter_ns()
     var r = PipelineResult()
     r.sm = List[Float32](unsafe_uninit_length=byte_len * SM_STRIDE)
     r.gi = List[UInt32](unsafe_uninit_length=byte_len * GI_STRIDE)
@@ -1127,6 +1147,9 @@ def run_pipeline[o: ImmOrigin, witness: Bool = True](
         unsafe_memset_zero(r.ord_to_byte.unsafe_ptr(), len(r.ord_to_byte))
     var slots = r.slots()
     var w = r.witness()
+
+    r.stage_ns[ST_ALLOC] = perf_counter_ns() - _t
+    _t = perf_counter_ns()
 
     # ── THE GAP SWEEP: positional zeros for bytes no item claims ─────────────
     # Items arrive sorted ascending by byte_start (every caller builds them so);
@@ -1162,6 +1185,9 @@ def run_pipeline[o: ImmOrigin, witness: Bool = True](
                 w.wm[unsafe_offset=gid] = 0
                 w.wc[unsafe_offset=gid] = 0
 
+    r.stage_ns[ST_GAPSWEEP] = perf_counter_ns() - _t
+    _t = perf_counter_ns()
+
     # ── decode: shards write disjoint slot ranges ────────────────────────────
     var miss_scratch = List[UInt32](unsafe_uninit_length=byte_len if byte_len > 0 else 1)
     var msp = miss_scratch.unsafe_ptr()
@@ -1176,6 +1202,8 @@ def run_pipeline[o: ImmOrigin, witness: Bool = True](
     parallelize(_decode_task, workers)
     _ = len(miss_scratch)
     _ = len(tally)
+    r.stage_ns[ST_DECODE] = perf_counter_ns() - _t
+    _t = perf_counter_ns()
 
     # ── concatenate the shards' miss lists IN SHARD ORDER, which is byte order ──
     var misses = List[UInt32]()
@@ -1186,6 +1214,9 @@ def run_pipeline[o: ImmOrigin, witness: Bool = True](
         for k in range(tally[w * 2 + 1]):
             misses.append(miss_scratch[a + k])
 
+    r.stage_ns[ST_MISSCAT] = perf_counter_ns() - _t
+    _t = perf_counter_ns()
+
     # ── THE FOLD: serial per item, items in parallel (disjoint ranges) ────────
     var item_count = len(items)
     var item_bounds = List[Float64](length=item_count * 8, fill=0)
@@ -1195,6 +1226,8 @@ def run_pipeline[o: ImmOrigin, witness: Bool = True](
             slots, items[i], w, kp, i * 8, not page_active(items[i])
         )
     parallelize(_fold_task, item_count)
+    r.stage_ns[ST_FOLD] = perf_counter_ns() - _t
+    _t = perf_counter_ns()
 
     # ── paginate: stride DERIVED from the fold scalars; inactive items skip ───
     # parallelize takes a FLAT [0, n) index, and this space is 2-D and filtered
@@ -1221,6 +1254,9 @@ def run_pipeline[o: ImmOrigin, witness: Bool = True](
         )
     if len(pag_item) > 0:
         parallelize(_paginate_task, len(pag_item))
+
+    r.stage_ns[ST_PAGINATE] = perf_counter_ns() - _t
+    _t = perf_counter_ns()
 
     # ── per-item boxes: sharded local boxes, exact min/max merge ─────────────
     var batch_bounds = List[Float64](length=8, fill=0)
@@ -1334,6 +1370,7 @@ def run_pipeline[o: ImmOrigin, witness: Bool = True](
 
     r.misses = misses^
     r.leaders = leaders
+    r.stage_ns[ST_BOUNDS] = perf_counter_ns() - _t
     r.item_bounds = item_bounds^
     r.batch_bounds = batch_bounds^
     return r^

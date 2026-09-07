@@ -61,12 +61,12 @@ detail.
 
 **The spine.** Each of these changes what the next one is deciding about:
 
-1. **Measure the fold (item 4).** Cheap, and it decides whether device-side
-   folding is worth building at all. Doing this first means the substrate
-   question stops being answered by argument — and the 2026-09-07 readback
-   measurement raised the stakes rather than settling them: the CPU fold is
-   58-77% of backend time, so it is the fold, not the transport, that the load
-   time is currently made of.
+1. **Measure the fold (item 4) — CPU HALF DONE 2026-09-07, GPU half open.**
+   Doing this first is what stopped the substrate question being answered by
+   argument, and it paid twice: it corrected the readback pass's own claim that
+   "the CPU fold is 58-77%" (that was the whole FFI call; the fold stage is
+   3-13%) and it found a third copy of the record stream nobody had counted,
+   inside the engine. Details and the table are under item 4.
 
    The existing benchmark is `engine/gpu_pipeline.mojo --bench`. It is not
    dishonest — its docstring is explicit that the timed region spans the
@@ -85,13 +85,20 @@ detail.
    lines of per-item arithmetic, and the hop exists to mirror the CPU driver
    for conformance rather than out of necessity. It is a one-kernel map away
    from not existing. Measure around it; do not enshrine it.
-2. **The readback (item 3), as device-side compaction — not as a borrowing
-   accessor.** MEASURED 2026-09-07 (table under item 3): the readback is
-   9-22% of backend time, not the bottleneck. The fold is, at 58-77%. So this
-   stays second, and it stays whole: killing the copy alone buys the smaller
-   half of a cost that dies entirely when compaction moves. The volume claim is
-   untouched — 3.10 GB on a 97 MB corpus is a memory argument, and RSS is what
+2. **The readback (item 3), as device-side compaction — and now the target is
+   ALL THREE COPIES, not one.** The stage split (table under item 4) shows the
+   record stream compacted in the engine, copied across the FFI, then compacted
+   again on the host: **87% of backend batched, 63% per-item**, against 3-13%
+   for the layout computation. So item 3 was understated, not overstated, and a
+   borrowing accessor is still the wrong shape — it removes the middle copy and
+   leaves two compactions doing overlapping filtering work. The volume claim is
+   untouched: 3.10 GB on a 97 MB corpus is a memory argument, and RSS is what
    OOMs a device.
+
+   The engine-side one (`glyph_record.mojo::compact`) is the newly visible
+   piece and the most tractable: serial by construction, and its docstring
+   already says the GPU form is a prefix sum over the leader flag plus a
+   scatter, which the scan machinery computes today.
 3. **Bounds step 4 (the FFI accessor)** — but only after the readback, and this
    ordering is the correction earned on 2026-09-07. The plan called it "replace
    the host reduction with the engine box"; they are NOT interchangeable — the
@@ -213,11 +220,62 @@ compaction**, which takes readback and compact together, and do it after the
 fold measurement (item 4), not before — because that is the change that decides
 how much is left to win.
 
-**4. Measure the fold, then decide the substrate.** No honest number exists:
-native's GPU benchmark times 36 B-per-source-byte of readback inside its timed
-region, and the web's `kernelMs` brackets nine enqueues with no fence. One
-harness, one multi-item arena, both paths, several sizes, discrete card. This is
-cheap and it decides whether device-side folding is worth building at all.
+**4. Measure the fold — CPU SIDE DONE 2026-09-07, and it moved the target.**
+
+`engine/fold_profile.mojo` is the instrument (third one, runs in `check.sh`),
+`run_pipeline` carries seven stage timers, and `glyph_engine_stage_ns` hands
+them across the FFI so a load is attributable end to end.
+
+**THE CORRECTION THIS FORCED.** The 2026-09-07 readback pass reported "the CPU
+fold is 58-77% of backend". That was wrong, by exactly the defect it had just
+diagnosed one layer up: `fold` in `BackendPhases` was not the fold, it was the
+whole `glyph_engine_load_items` call — which also runs a SECOND compaction into
+the engine arena and a serial O(bytes) walk to attribute records to items.
+Naming an aggregate after its largest hoped-for component is how this keeps
+happening; the lane is still called `fold` because it is the FFI call's cost,
+and the engine line under it is what says how much of that is folding.
+
+**47.1 MB corpus, isolated runs, M2.** Per cent of backend:
+
+| lane | batched | per-item |
+|---|---|---|
+| `compact_records_into` (host) | 0.887 s / 42% | 0.285 s / 17% |
+| `eg_compact` (engine arena) | 0.486 s / 23% | 0.550 s / 34% |
+| `read_back` (FFI copy) | 0.469 s / 22% | 0.196 s / 12% |
+| `eg_counts` (serial per-item walk) | 0.090 s / 4% | — |
+| all of `run_pipeline` | 0.196 s / 9% | 0.597 s / 36% |
+| **— the fold stage alone** | **0.069 s / 3.2%** | **0.209 s / 13%** |
+
+**The record stream is copied and repacked THREE times**, and the plan only
+ever named one of them:
+
+1. `compact` in `glyph_record.mojo` — per-byte lanes to 32 B records in the
+   engine's arena. **Serial by construction**, and its own docstring names the
+   fix: "on the GPU this is a prefix-sum over the leader flag plus a scatter,
+   which the scan machinery already computes."
+2. `read_back` — engine arena to a host `Vec`.
+3. `compact_records_into` — host `Vec` to 48 B instances.
+
+Together: **87% of backend batched, 63% per-item.** The layout computation is
+3-13%. Item 3 is therefore understated rather than overstated — but the target
+is all three passes, not the middle one, and the first is inside the engine
+where nobody was looking.
+
+**Two findings from the instrument itself:**
+
+- **`run_pipeline` scales hard with ITEM COUNT**, because `parallelize` is over
+  items: 8 MB as one item is 164 MB/s, as 64 items 661 MB/s. A single large
+  file folds on one core. That is a real ceiling for a big-file view, and it is
+  invisible in any repo-shaped corpus.
+- **The two forms scale OPPOSITELY in item count.** Scan beats serial at one
+  item (0.86x at 675 KB); at 4096 items it is 81x WORSE (5.3 vs 432 MB/s). So
+  `gpu_pipeline.mojo --bench` comparing the device against the SCAN form is
+  doubly misleading — that is not the form the FFI ships, and its item shape
+  (`item_count = 1`) is the one case where the scan form looks good.
+
+**Still open, and unchanged by this:** the GPU side. One harness, both paths,
+several sizes, discrete card — now with the knowledge that a fair CPU baseline
+is `run_pipeline` at realistic item counts, not `run_scan_pipeline` at one.
 
 **5. Emoji.** The atlas already carries 897 colour-bitmap slots with doubled
 advances; what was never exported is the pixel sheet. `emojiCell` is read in the

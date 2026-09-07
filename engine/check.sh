@@ -101,6 +101,15 @@ for s in ${list[@]+"${list[@]}"}; do run "$s" "${PIPE[@]}"; done
 # instrument, it is an absent one. fixture_manifest is gate 9's Mojo half.
 [[ "${1:-all}" == "gpu" ]] || run fixture_census "${PIPE[@]}"
 [[ "${1:-all}" == "gpu" ]] || run fixture_manifest "${PIPE[@]}"
+# fold_profile is the THIRD instrument, added 2026-09-07. It prints where
+# run_pipeline's time goes across five item shapes and compares the serial form
+# against the scan form. It asserts nothing except that the two forms agree on
+# the leader count, which is not a conformance claim (conformance_real owns
+# that) but a guard that the two timed runs did the same work — without it a
+# ratio could be comparing a full run against a broken one. ~0.2 s, so it runs
+# with everything else rather than living in `bench` where nothing would.
+[[ "${1:-all}" == "gpu" ]] || run fold_profile "$GAPS" \
+    $(find native/src -name '*.rs' 2>/dev/null | sort | head -40)
 
 # ffi_selftest is the ONE suite that does not `mojo run`: it asserts the C ABI,
 # so it links the SHIPPED dylib and calls its exports through external_call —
@@ -137,8 +146,8 @@ if [[ "${1:-all}" != "gpu" ]]; then
     rm -f "$TMPBIN"
 fi
 case "${1:-all}" in
-    cpu) echo "all 11 CPU suites + ffi_selftest (dylib C ABI, 14 single-item fixtures) + 2 instruments green (fp contraction disabled); GPU suites NOT RUN" ;;
+    cpu) echo "all 11 CPU suites + ffi_selftest (dylib C ABI, 14 single-item fixtures) + 3 instruments green (fp contraction disabled); GPU suites NOT RUN" ;;
     bench) echo "all bench files compile (they are not RUN: bench.bin is untracked)" ;;
     gpu) echo "all 5 GPU suites green (fp contraction disabled)" ;;
-    *)   echo "all 16 suites + ffi_selftest (dylib C ABI) green + 2 instruments + benches compile, CPU + GPU (fp contraction disabled)" ;;
+    *)   echo "all 16 suites + ffi_selftest (dylib C ABI) green + 3 instruments + benches compile, CPU + GPU (fp contraction disabled)" ;;
 esac

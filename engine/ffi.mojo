@@ -25,8 +25,9 @@ from std.ffi import c_int, c_size_t, c_double
 from std.memory import bitcast, Allocation
 from std.memory.alloc import alloc, dealloc, Layout
 from std.runtime import initialize_runtime
+from std.time import perf_counter_ns
 
-from glyph_pipeline import Item, Trie, run_pipeline, F_LEADER  # NATIVE-PORT: F_LEADER for load_items per-item counts
+from glyph_pipeline import Item, Trie, run_pipeline, PipelineResult, F_LEADER, ST_COUNT  # NATIVE-PORT: F_LEADER for load_items per-item counts
 from glyph_record import RecordSet, compact
 from fixture_io import load_trie_auto  # NATIVE-PORT: G3DF fixture or G3TR blob
 
@@ -43,6 +44,14 @@ struct EngineState(Movable):
     var records: RecordSet
     var byte_len: Int
     var leaders: Int
+    # Nanoseconds for the last load, ST_* indexed, plus two lanes this entry
+    # owns that run_pipeline knows nothing about. They exist because the Rust
+    # side's `fold` timer brackets THIS WHOLE CALL, and the 2026-09-07 numbers
+    # showed most of it is not the fold: `compact` repacks the wire stream into
+    # the engine arena, and EG_COUNTS is a SERIAL O(bytes) walk of the flag
+    # lanes to attribute records to items. Without these lanes, both are
+    # invisible and get read as fold cost.
+    var stage_ns: List[Int]
 
     def __init__(out self):
         self.trie = Trie(List[UInt32](), List[Float32](), List[UInt32]())
@@ -50,7 +59,13 @@ struct EngineState(Movable):
         self.records = RecordSet()
         self.byte_len = 0
         self.leaders = 0
+        self.stage_ns = List[Int](length=EG_STAGE_COUNT, fill=0)
 
+
+# Engine-side stage lanes: run_pipeline's ST_* first, then this entry's own.
+comptime EG_COMPACT = ST_COUNT       # repack the wire stream into the arena
+comptime EG_COUNTS = ST_COUNT + 1    # per-item record counts — SERIAL O(bytes)
+comptime EG_STAGE_COUNT = ST_COUNT + 2
 
 comptime Handle = Pointer[NoneType, MutUntrackedOrigin]
 
@@ -235,7 +250,9 @@ def glyph_engine_load_item_desc(
     # arrays bit-identical to the witnessed form (conformance_elide pins it).
     var r = run_pipeline[witness=False](span, s[].trie, items)
     s[].leaders = r.leaders
+    var _c = perf_counter_ns()
     compact(r, n, r.leaders, s[].records)
+    _record_stages(s[], r, perf_counter_ns() - _c, 0)
     _ = len(items)
     return GE_OK
 
@@ -271,6 +288,15 @@ def glyph_engine_load_item_desc(
 # ordinal wall remains a PER-ITEM bound, not a per-blob one.
 
 comptime ITEM_DESC_SIZE: Int = ABI_DESC_BYTES
+
+
+def _record_stages(mut st: EngineState, r: PipelineResult, compact_ns: Int, counts_ns: Int):
+    """Fold run_pipeline's own stage lanes into the handle, then add the two
+    this file owns. Kept as one writer so the lane layout has a single author."""
+    for i in range(ST_COUNT):
+        st.stage_ns[i] = r.stage_ns[i]
+    st.stage_ns[EG_COMPACT] = compact_ns
+    st.stage_ns[EG_COUNTS] = counts_ns
 
 
 @export("glyph_engine_load_items")
@@ -319,10 +345,13 @@ def glyph_engine_load_items(
     var span = Span[UInt8, ImmUntrackedOrigin](unsafe_ptr=blob_ptr, length=n)
     var r = run_pipeline[witness=False](span, s[].trie, items)
     s[].leaders = r.leaders
+    var _c = perf_counter_ns()
     compact(r, n, r.leaders, s[].records)
+    var compact_ns = perf_counter_ns() - _c
 
     # Per-item record counts: one pass over the flag lanes, advancing the item
     # cursor at descriptor boundaries (items are contiguous + ascending).
+    var _k = perf_counter_ns()
     for i in range(m):
         counts_out[unsafe_offset = i] = 0
     var it_i = 0
@@ -336,8 +365,32 @@ def glyph_engine_load_items(
             it_end = Int(base.unsafe_bitcast[UInt64]()[unsafe_offset = 14]) + Int(base.unsafe_bitcast[UInt64]()[unsafe_offset = 15])
         if (Int(r.fl[id]) & F_LEADER) != 0:
             counts_out[unsafe_offset = it_i] += 1
+    _record_stages(s[], r, compact_ns, perf_counter_ns() - _k)
     _ = len(items)
     return GE_OK
+
+
+@export("glyph_engine_stage_ns")
+def glyph_engine_stage_ns(
+    h: Handle,
+    out_ptr: Pointer[UInt64, MutUntrackedOrigin],
+    cap: c_size_t,
+) abi("C") -> c_size_t:
+    """Per-stage nanoseconds for the LAST load. Writes min(cap, EG_STAGE_COUNT)
+    lanes and returns how many it wrote, so the caller learns the engine's lane
+    count rather than assuming it — a stale dylib then reports fewer lanes
+    instead of scribbling past the buffer.
+
+    This is the engine half of the attribution the Rust side does with
+    BackendPhases. It exists because `fold` on that side brackets this whole
+    call, and measurement showed the fold is the minority of it."""
+    var st = _state(h)
+    var k = Int(cap)
+    if k > EG_STAGE_COUNT:
+        k = EG_STAGE_COUNT
+    for i in range(k):
+        out_ptr[unsafe_offset = i] = UInt64(st[].stage_ns[i])
+    return c_size_t(k)
 
 
 @export("glyph_engine_slot_count")

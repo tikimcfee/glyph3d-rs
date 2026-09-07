@@ -70,7 +70,19 @@ extern "C" {
         item_count: usize,
         counts_out: *mut u64, // per-item record counts (= per-item leaders)
     ) -> i32;
+
+    // Per-stage nanoseconds for the last load. Returns how many lanes it wrote,
+    // so a dylib with fewer lanes reports fewer rather than being assumed.
+    fn glyph_engine_stage_ns(handle: *mut c_void, out_ptr: *mut u64, cap: usize) -> usize;
 }
+
+/// Engine-side stage lanes, in the order `ffi.mojo` writes them: `run_pipeline`'s
+/// seven, then the two the FFI entry owns. Names are the engine's, kept verbatim
+/// so a reader can grep one string across both languages.
+pub const ENGINE_STAGE_NAMES: [&str; 9] = [
+    "alloc", "gapsweep", "decode", "misscat", "fold", "paginate", "bounds",
+    "eg_compact", "eg_counts",
+];
 
 /// Byte size of one item descriptor (see ffi.mojo's layout comment). BOTH load
 /// entries take one of these; there is no positional form any more.
@@ -336,6 +348,19 @@ impl Engine {
     /// Records produced by the last [`Engine::load_item`].
     pub fn slot_count(&self) -> u64 {
         unsafe { glyph_engine_slot_count(self.handle) }
+    }
+
+    /// Per-stage nanoseconds for the last load, engine-side.
+    ///
+    /// The lane COUNT comes from the engine, not from this side: a dylib built
+    /// before a lane was added returns fewer, and the extra entries stay zero
+    /// rather than reading whatever the engine did not write. That is the same
+    /// discipline `cc814b3` established for the per-item descriptor — a stale
+    /// dylib should degrade legibly instead of lying.
+    pub fn stage_ns(&self) -> [u64; ENGINE_STAGE_NAMES.len()] {
+        let mut out = [0u64; ENGINE_STAGE_NAMES.len()];
+        unsafe { glyph_engine_stage_ns(self.handle, out.as_mut_ptr(), out.len()) };
+        out
     }
 
     /// Copy the last load's records out of the engine — THE READBACK the plan

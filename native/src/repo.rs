@@ -785,5 +785,19 @@ impl RepoLoad {
             p.compact.as_secs_f64(),
             s.backend.saturating_sub(attributed).as_secs_f64(),
         );
+        // `fold` above is the whole FFI call. This is what the engine says it
+        // spent inside it — largest lane first, and `unattributed` here catches
+        // the part of the call that is neither run_pipeline nor the two stages
+        // the FFI entry owns (marshalling, arena reuse, the return trip).
+        let ranked = p.engine_ranked();
+        let eng_sum: Duration = ranked.iter().map(|(_, d)| *d).sum();
+        print!("  engine:");
+        for (name, d) in ranked.iter().filter(|(_, d)| !d.is_zero()) {
+            print!(" {} {:.3}s", name, d.as_secs_f64());
+        }
+        println!(
+            " | unattributed {:.3}s",
+            p.fold.saturating_sub(eng_sum).as_secs_f64()
+        );
     }
 }

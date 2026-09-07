@@ -31,7 +31,7 @@
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use crate::engine::Engine;
+use crate::engine::{Engine, ENGINE_STAGE_NAMES};
 use crate::layout::{
     compact_records_into, GlyphArena, GlyphRecord, ItemPlacement, LayoutError, LayoutGlyphs,
     LayoutItem, VerifyLayout,
@@ -71,6 +71,12 @@ pub struct BackendPhases {
     pub readback_copy: Duration,
     /// `compact_records_into`: drop blanks, repack 32 -> 48 B, reduce extents.
     pub compact: Duration,
+    /// `fold`, split by the ENGINE into what it was actually doing — lanes in
+    /// `engine::ENGINE_STAGE_NAMES` order, nanoseconds, summed across calls.
+    /// Without this the whole FFI call reads as fold cost, and it is not:
+    /// `glyph_engine_load_items` also runs a second compaction into the engine
+    /// arena and a SERIAL O(bytes) walk to attribute records to items.
+    pub engine_stages: [u64; ENGINE_STAGE_NAMES.len()],
 }
 
 impl BackendPhases {
@@ -78,6 +84,24 @@ impl BackendPhases {
     /// only one of the two halves that is trustworthy alone.
     pub fn readback(&self) -> Duration {
         self.readback_alloc + self.readback_copy
+    }
+
+    fn add_engine_stages(&mut self, lanes: [u64; ENGINE_STAGE_NAMES.len()]) {
+        for (slot, add) in self.engine_stages.iter_mut().zip(lanes) {
+            *slot += add;
+        }
+    }
+
+    /// The engine lanes as (name, duration), largest first — the order a reader
+    /// wants, since the point of the split is finding where the time went.
+    pub fn engine_ranked(&self) -> Vec<(&'static str, Duration)> {
+        let mut v: Vec<_> = ENGINE_STAGE_NAMES
+            .iter()
+            .zip(self.engine_stages)
+            .map(|(n, ns)| (*n, Duration::from_nanos(ns)))
+            .collect();
+        v.sort_by_key(|(_, d)| std::cmp::Reverse(*d));
+        v
     }
 }
 
@@ -123,6 +147,7 @@ impl MojoLayout {
                 let t = Instant::now();
                 let counts = self.engine.load_items(&blob, &descs)?;
                 self.phases.fold += t.elapsed();
+                self.phases.add_engine_stages(self.engine.stage_ns());
                 let back = self.engine.read_back();
                 self.phases.readback_alloc += back.alloc;
                 self.phases.readback_copy += back.copy;
@@ -155,6 +180,7 @@ impl MojoLayout {
                     let t = Instant::now();
                     self.engine.load_item(item.bytes, &item.params)?;
                     self.phases.fold += t.elapsed();
+                    self.phases.add_engine_stages(self.engine.stage_ns());
                     let back = self.engine.read_back();
                     self.phases.readback_alloc += back.alloc;
                     self.phases.readback_copy += back.copy;

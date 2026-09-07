@@ -161,7 +161,7 @@ scope = "engine"
 kind = "cmd"
 cmd = "./engine/check.sh all"
 needs = ["fixtures"]
-compare = "16 Mojo conformance suites + ffi_selftest + 2 instruments vs the fixture corpus, CPU and Metal"
+compare = "16 Mojo conformance suites + ffi_selftest + 3 instruments vs the fixture corpus, CPU and Metal"
 blind_to = "faults shared by the serial and scan forms in conformance_real (oracle-free by design); the instruments print but assert nothing"
 
 [[gate]]
