@@ -1,4 +1,4 @@
-//! Stage 0 of the reference port — the Rust `.pipe.bin` reader and the
+//! Fixture parity — the Rust `.pipe.bin` reader and the
 //! bit-exact differ everything after it is gated on.
 //!
 //! WHY THIS EXISTS BEFORE ANY PORTED CODE. `engine/PORT-PLAN.md` stages the
@@ -670,7 +670,7 @@ pub struct DiffOutcome {
 /// whole buffer, no wrap, no pagination?
 ///
 /// The reason to state this as a predicate rather than a hardcoded file list:
-/// stage 2 widens the fold, and the set of fixtures it can be held to should
+/// the full fold widens what is checked, and the set of fixtures it can be held to should
 /// widen with it automatically. A list would have to be remembered.
 fn out_of_domain(fx: &PipeFixture) -> Option<String> {
     if fx.item_count != 1 {
@@ -711,7 +711,7 @@ fn out_of_domain(fx: &PipeFixture) -> Option<String> {
 /// Lay the fixture with `text::reference_layout` and diff BIT-EXACT against the
 /// oracle's own expected lanes.
 ///
-/// This is what makes stage 0 more than plumbing. The differ could have been
+/// This is what makes fixture parity more than plumbing. The differ could have been
 /// landed with nothing to point at but the corpus compared to itself — which is
 /// the shape of check this repo has shipped three times and had to go back and
 /// break. Instead it runs against a real implementation on real fixtures the
@@ -785,7 +785,7 @@ pub fn diff_against_reference_layout(fx: &PipeFixture) -> DiffOutcome {
     }
 }
 
-// ── Stage 1: rebuilding a fixture's trie from its own bytes ───────────────
+// ── The trie rebuild: a fixture's trie from its own bytes ────────────────
 //
 // THE RECIPE lives in engine/fixtures/gen.mjs, which is vendored in this tree,
 // so the whole input is reconstructible here: the codepoint set comes from the
@@ -943,7 +943,7 @@ pub fn rebuild_trie_and_diff(fx: &PipeFixture) -> TrieRebuild {
     }
 }
 
-// ── Stage 2: the whole fold against the whole corpus ─────────────────────
+// ── The full fold: against the whole corpus ──────────────────────────────
 
 /// What a full-fold comparison found.
 pub struct FoldDiff {
@@ -954,9 +954,9 @@ pub struct FoldDiff {
     pub bad: Vec<String>,
 }
 
-/// The number of per-byte lanes this comparison covers. All of them — stage 0
+/// The number of per-byte lanes this comparison covers. All of them — parity
 /// could not produce BASE_X's twin LINE_ADV or the FLAGS/ORD witness lanes, and
-/// stage 2 has no such gap, so nothing here is "compared where convenient."
+/// the full fold has no such gap, so nothing here is "compared where convenient."
 const FOLD_MEASURE_LANES: usize = FIXTURE_MEASURE_STRIDE;
 const FOLD_COUNT_LANES: usize = FIXTURE_COUNT_STRIDE;
 
@@ -1095,7 +1095,7 @@ pub fn diff_full_fold(fx: &PipeFixture) -> FoldDiff {
     }
 }
 
-// ── Stage 3: the scan form against the corpus, tiered ────────────────────
+// ── The scan form: against the corpus, tiered ────────────────────────────
 
 /// Relative tolerance for the one tiered lane family.
 const REL_EPS: f64 = 1e-4;
@@ -1187,7 +1187,7 @@ pub fn diff_scan(fx: &PipeFixture, chunk_size: usize, group_size: usize, shards:
         for lane in 0..FIXTURE_MEASURE_STRIDE {
             let expected = fx.exp_measures[slot * FIXTURE_MEASURE_STRIDE + lane];
             if lane == FIX_M_GLYPH_ID {
-                // EXACT, and compared as the u32 it is — same reason as stage 2.
+                // EXACT, and compared as the u32 it is — same reason as the fold.
                 if got.slots.gi[slot] != expected as u32 {
                     bad.push(format!(
                         "slot {slot} GLYPH_ID: got {} vs fixture {}",

@@ -1,8 +1,8 @@
-//! Stage 4 of the reference port — the bake, and the seed protocol it ships.
+//! The bake, and the seed protocol it ships — part of the reference port.
 //!
 //! SOURCES. The oracle is `glyphBake.js` (250 lines); the working reference is
 //! `engine/glyph_bake.mojo`, which also happens to be where the Mojo keeps the
-//! scan monoid. This port keeps the monoid in `scan.rs` (stage 3 needed it
+//! scan monoid. This port keeps the monoid in `scan.rs` (the scan form needed it
 //! first) and imports it here — the same three functions either way.
 //!
 //! WHAT THE BAKE IS FOR. One streaming pass over a file produces a record that

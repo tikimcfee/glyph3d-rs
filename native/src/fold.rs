@@ -1,4 +1,4 @@
-//! Stage 2 of the reference port — the serial fold.
+//! The serial fold — part of the reference port.
 //!
 //! SOURCES. The oracle is `glyphPipelineReference.js` (779 lines, web repo
 //! `packages/glyph3d-core/src/compute/`); the working reference is
@@ -162,7 +162,7 @@ pub struct Item {
 /// would break the correspondence that lets four layers be checked against each
 /// other. Everything LOCAL is spelled out instead: an abbreviation is a poor
 /// place to hide a carrier distinction, which is what `exp_ord` turned out to be
-/// hiding when it cost stage 2 a wrong comparison.
+/// hiding when it cost the fold a wrong comparison.
 pub struct Slots {
     /// 2 per byte: ADVANCE, HEIGHT
     pub sm: Vec<f32>,
@@ -850,7 +850,7 @@ mod tests {
 
     // ── The two corpus ceilings, closed here because the fixtures cannot ────
     //
-    // Stage 2's mutation battery ran 16 mutations; 14 reddened against the
+    // The fold's mutation battery ran 16 mutations; 14 reddened against the
     // corpus and these two did not, for reasons that are properties of the
     // CORPUS rather than of the code. Both are covered here instead. Neither
     // test is decoration: each was verified to fail under the mutation that the

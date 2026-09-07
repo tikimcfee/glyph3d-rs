@@ -602,7 +602,7 @@ pub fn diff_records(records: &[GlyphRecord], expected: &[RefGlyph]) -> Result<()
 
 /// Present one item's staged arena as a renderable scene.
 ///
-/// Since Stage 0 the compaction and the extents happen behind the layout seam,
+/// Since the layout seam landed, compaction and the extents happen behind it,
 /// so this does no arithmetic at all: it names which extent the camera frames
 /// and packages the scene. The INK extent is the right one — the quads of the
 /// glyphs that survived, not the page rectangle they were laid out on — and

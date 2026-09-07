@@ -11,7 +11,7 @@
 //! "how many times do I cross into Mojo?", invisible above the seam, and the
 //! Rust backend will have no equivalent question. `--repo-verify` still picks
 //! both, because two strategies that must agree bit-for-bit is exactly the
-//! shape `--repo-verify` was built to check — and at stage 1 the same
+//! shape `--repo-verify` was built to check — and with the Rust backend the same
 //! machinery diffs Mojo against Rust instead, with nothing new written.
 //!
 //! WHAT STAGE 3 CHANGES HERE. `layout_validated_items` currently ends with

@@ -1,4 +1,4 @@
-//! Stage 1 of the reference port — `GlyphTrie.js` in Rust.
+//! The trie rebuild — `GlyphTrie.js` in Rust, part of the reference port.
 //!
 //! SOURCE, with provenance: `packages/glyph3d-core/src/compute/GlyphTrie.js` in
 //! the web repo, 201 lines, at commit 3da6542 (2026-09-01),

@@ -3,29 +3,30 @@
 #
 # HOW TO RUN IT, and the two ways it bites:
 #
-#   NEEDS RE-MEASUREMENT as of the workspace move (2026-09-06). The measured
-#   finding was: the default copy-to-scratch strategy could not work, because
-#   the cargo root was native/, so cargo-mutants copied only native/ — and
-#   build.rs asserts ../.pixi exists while fixture.rs, bake.rs, atlas.rs and
-#   main.rs all reach ../engine and ../assets through CARGO_MANIFEST_DIR, all of
-#   which escaped the copy. That evaluation also recommended AGAINST a root
-#   workspace because it would relocate native/target. The workspace landed
-#   anyway, for reasons that outweighed it (rust-analyzer saw two disconnected
-#   crates; the build tool could not be built or tested with the thing it
-#   manages), and every dependent path was moved with it.
+#   RE-MEASURED 2026-09-06 after the workspace move, and the answer changed:
+#   the default copy-to-scratch strategy NOW WORKS. Baseline built and tested
+#   cleanly (39s build + 9s test), 15 mutants over layout_mojo.rs in 3m —
+#   2 missed, 9 caught, 4 unviable, the same counts the old --in-place run
+#   produced.
 #
-#   So the copy root is now the repo root, and copy-to-scratch may simply work.
-#   Nobody has run it since. Until someone does, assume --in-place and the
-#   hazard below; do not assume the default mode is fixed just because the
-#   cause was removed.
+#   The previous finding was true of the previous layout: the cargo root was
+#   native/, so a copy took only native/ and lost ../engine, ../assets and
+#   ../.pixi, which build.rs asserts and several files reach through
+#   CARGO_MANIFEST_DIR. The root is now the repo root, so the copy contains
+#   everything. That evaluation had recommended AGAINST the workspace; the
+#   workspace landed for other reasons and removed the objection as a side
+#   effect.
 #
-#   --in-place mutates the WORKING TREE, and check-all reads the working tree,
-#   not HEAD. A killed run leaves the mutation behind: measured three times,
-#   including a live edit inside the UTF-8 decoder. Run it in a throwaway
-#   worktree, and check `git status` afterwards. The marker is greppable:
-#   "~ changed by cargo-mutants ~". Pass -o /tmp/... too, or mutants.out/ lands
-#   in native/ untracked, and this repo has twice had `git add -A` commit things
-#   nobody intended.
+#   USE THE DEFAULT. --in-place is no longer necessary, which retires the real
+#   hazard below.
+#
+#   HISTORICAL, and the reason not to reach for --in-place again: it mutates
+#   the WORKING TREE, and the checks read the working tree, not HEAD. A killed
+#   run leaves the mutation behind — measured three times, including a live edit
+#   inside the UTF-8 decoder. The marker is greppable: "~ changed by
+#   cargo-mutants ~". Still pass -o /tmp/..., or mutants.out/ lands untracked in
+#   the tree, and this repo has twice had `git add -A` commit things nobody
+#   intended.
 #
 # WHY THE EXCLUSIONS — the finding that decides how much this tool is worth:
 #

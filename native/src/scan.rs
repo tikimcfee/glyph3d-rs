@@ -1,4 +1,5 @@
-//! Stage 3 of the reference port — the same fold as a segmented monoid scan.
+//! The scan form — the same fold as a segmented monoid scan, part of the
+//! reference port.
 //!
 //! SOURCES. The oracle is `glyphPipelineScan.js` (313 lines); the working
 //! reference is `engine/glyph_scan.mojo` plus the monoid itself, which lives in

@@ -1,6 +1,7 @@
 //! layout.rs — THE LAYOUT SEAM: one contract, three backends, two targets.
 //!
-//! Stage 0 of `engine/BACKEND-PLAN.md`. Everything that lays glyphs out passes
+//! The layout seam (`engine/BACKEND-PLAN.md` no longer numbers it).
+//! Everything that lays glyphs out passes
 //! through the types here, and the shape of these types is the whole point of
 //! the stage — the stages after it are *implementations* of this contract, so
 //! getting it wrong means writing them twice.
@@ -37,15 +38,16 @@
 //!
 //! The arena is passed IN and owned by the caller, so a backend never decides
 //! where the glyphs live. Today it is a host `Vec<GlyphInstance>`; the point of
-//! naming it a destination rather than a return value is that stage 3 replaces
+//! naming it a destination rather than a return value is that the
+//! device-resident path replaces
 //! its interior with a device buffer without moving a single call site.
 //!
 //! WHO IMPLEMENTS IT (the plan's table, restated as code):
 //!
 //! | backend | module | target | status |
 //! |---|---|---|---|
-//! | Mojo (CPU today, GPU at stage 3) | `layout_mojo.rs` | native | live |
-//! | Rust (`fold`/`scan`/`bake`) | stage 1 | native + wasm | gate-only today |
+//! | Mojo (CPU today, GPU when device-resident) | `layout_mojo.rs` | native | live |
+//! | Rust (`fold`/`scan`/`bake`) | next | native + wasm | gate-only today |
 //! | JS oracle | `viz-web/glyph3d-js` | — | frozen, not executed here |
 //!
 //! All three are gated bit-exact against the same frozen corpus, so cross-
@@ -392,7 +394,7 @@ impl ItemPlacement {
 /// Where laid-out glyphs land. The CALLER owns it and passes it in; a backend
 /// appends and never reads back.
 ///
-/// Today the interior is a host `Vec<GlyphInstance>`. At stage 3 it becomes a
+/// Today the interior is a host `Vec<GlyphInstance>`. Device-resident, it becomes a
 /// device buffer and the compaction kernel writes it directly — and because
 /// every call site already holds an arena rather than receiving a `Vec`, that
 /// change lands here and nowhere else.
@@ -518,7 +520,7 @@ pub trait VerifyLayout: LayoutGlyphs {
 /// Compact one item's records into the arena: drop the blanks, repack 32 B →
 /// 48 B with paint and group, and reduce the two extents in the same pass.
 ///
-/// EVERY host backend calls this — the Mojo one today, the Rust one at stage 1.
+/// EVERY host backend calls this — the Mojo one today, the Rust one next.
 /// That is deliberate: it means the two backends cannot disagree about
 /// compaction, only about the fold, which is the thing the corpus actually
 /// gates. A second hand-written copy of this loop would be a second place for

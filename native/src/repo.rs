@@ -294,7 +294,7 @@ pub struct FileView {
 
 pub struct LoadStats {
     pub walk: Duration,
-    /// Time inside the layout seam. Since Stage 0 this INCLUDES compaction and
+    /// Time inside the layout seam. Since it landed this INCLUDES compaction and
     /// the extent reductions — they moved behind the seam, which is the whole
     /// point — so it is no longer comparable to the pre-seam "engine" number.
     pub backend: Duration,
@@ -428,10 +428,10 @@ fn layout(
 /// Whole-repo load: walk → paint → the layout seam → grid layout.
 ///
 /// `batch` selects the Mojo backend's batched FFI strategy over its per-item
-/// one — a backend-internal choice since Stage 0, threaded through only
+/// one — a backend-internal choice since the layout seam, threaded through only
 /// because the CLI still exposes it. `verify` runs the OTHER strategy as a
 /// second backend and diffs the two AT THE SEAM: placements, instances and
-/// records, all bit-exact. That is the standing gate, and at stage 1 the same
+/// records, all bit-exact. That is the standing check, and with the Rust backend the same
 /// call diffs Mojo against Rust with nothing new written.
 pub fn load_repo(
     root: &Path,

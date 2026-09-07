@@ -50,7 +50,7 @@ use clap::{ArgAction, CommandFactory, FromArgMatches, Parser};
 use glyph_scene::{CameraMode, GlyphScene, PickCommand, Verb};
 use gpu::GpuContext;
 // The seam is used by trait, not by concrete backend: swapping `MojoLayout`
-// for the Rust one at stage 1 changes the constructor and nothing else here.
+// for the Rust one changes the constructor and nothing else here.
 use layout::{LayoutGlyphs, VerifyLayout};
 use scene::{Scene, SceneLike};
 
@@ -105,9 +105,23 @@ pub fn default_engine_trie() -> PathBuf {
 
 /// The engine layout params the renderer/cross-check use: unit cell height
 /// (text::CELL_HEIGHT_WORLD) and the production line pitch. No wrap, no pages.
-pub fn engine_item_params() -> layout::ItemParams {
+/// The same params at a chosen origin.
+///
+/// The origin exists as a parameter because a zero one is a BLIND SPOT. A Mojo
+/// nightly was found miscompiling `ffi.mojo`'s descriptor read when built into
+/// a test executable — an uninitialised read — while the same source built as
+/// the shipping dylib was bit-exact. `ffi_selftest` catches that class, and for
+/// a while it was the ONLY thing that did, because this cross-check laid every
+/// item out at (0,0,0) and so never exercised the `origin_x` read at all: a
+/// garbage value added to zero and compared against zero-plus-the-same-garbage
+/// agrees with itself. One instrument covering a whole failure class is a
+/// single point of failure, so `--engine-check` now runs a non-zero origin too.
+pub fn engine_item_params_at(origin: [f64; 3]) -> layout::ItemParams {
     layout::ItemParams {
         line_height: (text::CELL_HEIGHT_WORLD * text::LINE_HEIGHT_FACTOR) as f64,
+        origin_x: origin[0],
+        origin_y: origin[1],
+        origin_z: origin[2],
         ..Default::default()
     }
 }
@@ -115,9 +129,13 @@ pub fn engine_item_params() -> layout::ItemParams {
 /// The one item `--engine-render` and `--engine-check` each lay out: the whole
 /// file, production line pitch, flat default paint, group 0.
 fn engine_item(bytes: &[u8]) -> layout::LayoutItem<'_> {
+    engine_item_at(bytes, [0.0, 0.0, 0.0])
+}
+
+fn engine_item_at(bytes: &[u8], origin: [f64; 3]) -> layout::LayoutItem<'_> {
     layout::LayoutItem {
         bytes,
-        params: engine_item_params(),
+        params: engine_item_params_at(origin),
         group_id: 0,
         paint: layout::Paint::Flat(layout::DEFAULT_COLOR_PACKED),
     }
@@ -147,12 +165,16 @@ fn engine_layout(file: &Path, trie: &Path) -> (layout::GlyphArena, layout::ItemP
 /// `--engine-check` diffs lane by lane against the independent CPU reference.
 /// This is the 36 B-per-source-byte readback the render path above does not
 /// pay, asked for explicitly through `VerifyLayout` — see `layout.rs`.
-fn engine_layout_records(file: &Path, trie: &Path) -> Vec<layout::GlyphRecord> {
+fn engine_layout_records_at(
+    file: &Path,
+    trie: &Path,
+    origin: [f64; 3],
+) -> Vec<layout::GlyphRecord> {
     let bytes = std::fs::read(file).expect("failed to read engine input file");
     let mut backend = engine_backend(trie);
     let mut arena = layout::GlyphArena::new();
     let (placements, records) = backend
-        .layout_items_recording(&[engine_item(&bytes)], &mut arena)
+        .layout_items_recording(&[engine_item_at(&bytes, origin)], &mut arena)
         .expect("engine layout failed");
     assert_eq!(
         records.len() as u32, placements[0].record_count,
@@ -315,31 +337,31 @@ struct Cli {
     /// Stage E1: render engine records through the Slug renderer
     #[arg(long, value_name = "PATH")]
     engine_render: Option<PathBuf>,
-    /// Stage 0 (reference port): print the canonical parse manifest for each
+    /// Fixture parity (reference port): print the canonical parse manifest for each
     /// .pipe.bin fixture and exit. tools/check-fixture-parity.sh diffs these
     /// lines against the ones engine/fixture_manifest.mojo emits from the Mojo
     /// loader — two independent parsers agreeing on checksums over their PARSED
     /// values, not on the file's bytes.
     #[arg(long, value_name = "PATH", num_args = 1..)]
     fixture_manifest: Vec<PathBuf>,
-    /// Stage 0: lay each .pipe.bin with the CPU reference fold and diff
+    /// Fixture parity: lay each .pipe.bin with the CPU reference fold and diff
     /// BIT-EXACT against the oracle's own expected lanes, then exit.
     #[arg(long, value_name = "PATH", num_args = 1..)]
     fixture_reference: Vec<PathBuf>,
-    /// Stage 1: rebuild each .pipe.bin's trie from its own bytes with the
+    /// Trie rebuild: rebuild each .pipe.bin's trie from its own bytes with the
     /// ported GlyphTrie and diff against the trie the oracle stored, then exit.
     #[arg(long, value_name = "PATH", num_args = 1..)]
     fixture_trie: Vec<PathBuf>,
-    /// Stage 2: run the ported serial fold over each .pipe.bin and compare
+    /// Full fold: run the ported serial fold over each .pipe.bin and compare
     /// EVERY lane of EVERY byte plus boxes and the batch union, then exit.
     #[arg(long, value_name = "PATH", num_args = 1..)]
     fixture_fold: Vec<PathBuf>,
-    /// Stage 3: run the ported scan form over each .pipe.bin at a SWEEP of
+    /// Scan form: run the ported scan form over each .pipe.bin at a SWEEP of
     /// chunk/group/shard tunings and compare under the tiered contract, then
     /// exit. Invariance across the tunings is associativity in situ.
     #[arg(long, value_name = "PATH", num_args = 1..)]
     fixture_scan: Vec<PathBuf>,
-    /// Stage 4: replay each .bake.bin through the ported bake and diff the
+    /// Bake: replay each .bake.bin through the ported bake and diff the
     /// record AND every seed-protocol query bit-exact, then exit.
     #[arg(long, value_name = "PATH", num_args = 1..)]
     fixture_bake: Vec<PathBuf>,
@@ -623,44 +645,43 @@ fn run_engine_check(file: &Path, trie_path: Option<&Path>) -> ! {
     let default_trie = default_engine_trie();
     let trie_path = trie_path.unwrap_or(&default_trie);
     let bytes = std::fs::read(file).expect("failed to read --engine-check file");
-
-    let records = engine_layout_records(file, trie_path);
-
-    // The independent side: CPU layout straight from the atlas export,
-    // no engine involvement. Same params as engine_item.
     let trie = atlas::TrieTable::load(&atlas_dir());
-    let p = engine_item_params();
-    let expected = text::reference_layout(
-        &trie,
-        &bytes,
-        [p.origin_x, p.origin_y, p.origin_z],
-        p.line_height,
-    );
 
-    match text::diff_records(&records, &expected) {
-        Ok(()) => {
-            println!(
-                "engine-check PASS: {} ({} B) — {} records bit-exact vs the CPU reference \
-                 [fp contract=off verified at the dylib] (trie: {})",
-                file.display(),
-                bytes.len(),
-                records.len(),
-                trie_path.display(),
-            );
-            std::process::exit(0);
-        }
-        Err(report) => {
+    // TWO origins, and the non-zero one is the point. At (0,0,0) an
+    // uninitialised origin read is invisible: garbage added to zero on both
+    // sides of the comparison agrees with itself. A Mojo nightly was caught
+    // doing exactly that (see engine_item_params_at), and for a while
+    // ffi_selftest was the only instrument that could see it.
+    for origin in [[0.0, 0.0, 0.0], [-3.5, 11.25, 2.75]] {
+        let records = engine_layout_records_at(file, trie_path, origin);
+        let p = engine_item_params_at(origin);
+        let expected = text::reference_layout(
+            &trie,
+            &bytes,
+            [p.origin_x, p.origin_y, p.origin_z],
+            p.line_height,
+        );
+        if let Err(report) = text::diff_records(&records, &expected) {
             eprintln!(
-                "engine-check FAIL: {} (trie: {})\n{report}",
+                "engine-check FAIL: {} at origin {origin:?} (trie: {})\n{report}",
                 file.display(),
                 trie_path.display(),
             );
             std::process::exit(1);
         }
+        println!(
+            "engine-check PASS: {} ({} B) at origin {origin:?} — {} records bit-exact vs the \
+             CPU reference [fp contract=off verified at the dylib] (trie: {})",
+            file.display(),
+            bytes.len(),
+            records.len(),
+            trie_path.display(),
+        );
     }
+    std::process::exit(0);
 }
 
-/// Stage 0: emit the canonical parse manifest, one line per fixture.
+/// Fixture parity: emit the canonical parse manifest, one line per fixture.
 fn run_fixture_manifest(paths: &[PathBuf]) -> ! {
     for p in paths {
         match fixture::load_pipe_fixture(p) {
@@ -674,7 +695,7 @@ fn run_fixture_manifest(paths: &[PathBuf]) -> ! {
     std::process::exit(0);
 }
 
-/// Stage 4: the bake and its seed protocol against the .bake.bin corpus.
+/// Bake: the bake and its seed protocol against the .bake.bin corpus.
 fn run_fixture_bake(paths: &[PathBuf]) -> ! {
     let mut leaders = 0usize;
     let mut checkpoints = 0usize;
@@ -725,7 +746,7 @@ fn run_fixture_bake(paths: &[PathBuf]) -> ! {
     std::process::exit(0);
 }
 
-/// The tunings stage 3 sweeps: (chunk_size, group_size, shards).
+/// The tunings the scan form sweeps: (chunk_size, group_size, shards).
 ///
 /// The Mojo suite runs two — the default and one awkward pair. Being serial
 /// makes more of them cheap, and each one is a different GROUPING of the same
@@ -748,7 +769,7 @@ const SCAN_TUNINGS: &[(usize, usize, usize)] = &[
     (13, 5, 11),
 ];
 
-/// Stage 3: the scan form against the corpus, swept across tunings.
+/// Scan form: the scan form against the corpus, swept across tunings.
 fn run_fixture_scan(paths: &[PathBuf]) -> ! {
     let mut failed = 0usize;
     let mut strict = 0usize;
@@ -811,7 +832,7 @@ fn run_fixture_scan(paths: &[PathBuf]) -> ! {
     std::process::exit(0);
 }
 
-/// Stage 2: the ported fold against the whole corpus, every lane of every byte.
+/// Full fold: the ported fold against the whole corpus, every lane of every byte.
 fn run_fixture_fold(paths: &[PathBuf]) -> ! {
     let mut lanes = 0usize;
     let mut leaders = 0usize;
@@ -852,7 +873,7 @@ fn run_fixture_fold(paths: &[PathBuf]) -> ! {
     std::process::exit(0);
 }
 
-/// Stage 1: rebuild every fixture's trie from its bytes and diff it against the
+/// Trie rebuild: rebuild every fixture's trie from its bytes and diff it against the
 /// one the oracle stored.
 ///
 /// NOT a round trip: the input is the fixture's raw BYTES plus gen.mjs's pure
@@ -896,7 +917,7 @@ fn run_fixture_trie(paths: &[PathBuf]) -> ! {
     std::process::exit(0);
 }
 
-/// Stage 0: hold text.rs's CPU fold to the fixture corpus, bit-exact.
+/// Fixture parity: hold text.rs's CPU fold to the fixture corpus, bit-exact.
 ///
 /// Out-of-domain fixtures are SKIPPED WITH A REASON rather than silently
 /// dropped, and a run in which nothing was in domain FAILS. Both halves matter:
@@ -959,7 +980,7 @@ fn main() {
         return;
     }
 
-    // Stage 0 (reference port): fixture parse manifest / corpus diff — no GPU.
+    // Fixture parity (reference port): fixture parse manifest / corpus diff — no GPU.
     if !cli.fixture_manifest.is_empty() {
         run_fixture_manifest(&cli.fixture_manifest);
     }
