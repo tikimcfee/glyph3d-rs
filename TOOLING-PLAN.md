@@ -6,7 +6,7 @@ author's account, not independently reproduced here) — do not promote the seco
 
 Current state: the manifest and the testing CLI landed in `a3bd22f`
 (`worktree-build-manifest`, 4 commits). `build.toml` declares the artifact graph
-and twelve named gates; `tools/glyph.py` is the runner (`build` / `verify` /
+and eleven named gates; `glyph` (`glyph/src/main.rs`) is the runner (`build` / `test` /
 `check` / `gate <name>` / `gates` / `graph` / `suites`); `tools/check-all.sh` is
 a 27-line shim preserving the old output contract.
 
@@ -223,7 +223,7 @@ minutes. Tier them, expose `mutate [--gate <name>]`, and run the full battery
 deliberately — before and after any change to the tooling, which is precisely
 when a gate is most likely to quietly stop working.
 
-### Step 2 — put the runner where the instruments can reach it
+### Step 2 — put the runner where the instruments can reach it — DONE 2026-09-06
 
 Land the cargo layout **for the reason above**, not as plumbing. There is no
 workspace today; `native/Cargo.toml` is a leaf [measured], so an `xtask` crate
@@ -233,7 +233,7 @@ Do it alone, with no behaviour change: battery still green through `glyph.py`,
 is already subject to the zero-warning gate and its (zero) tests are counted by
 the ratchet — that is the property being bought.
 
-### Step 3 — make the manifest a checked artifact rather than a document
+### Step 3 — make the manifest a checked artifact rather than a document — DONE 2026-09-06
 
 `build.toml` into serde structs with `#[serde(deny_unknown_fields)]`, so a typo
 is a hard error instead of a silently ignored key. `kind` becomes an enum. And
@@ -245,7 +245,7 @@ wrong edge produces a wrong run instead of a wrong impression, and an unread
 field is a `dead_code` warning against a zero-warning gate. Port the read-only
 commands first (`graph`, `gates`); they cannot break a build.
 
-### Step 4 — port gates differentially
+### Step 4 — port gates differentially — DONE 2026-09-06; it caught four porting bugs, listed in commit 77ea329
 
 One at a time, both runners live, and the differential is itself the check: they
 must agree on greens **and** on every red the step-1 battery produces.
@@ -260,7 +260,7 @@ silently skips every check after the abort point while still reporting a single
 FAIL — a defect that exists *because* it is shell, and the concrete argument for
 this entire plan. Then `tools/check-fixture-parity.sh`, then `engine/check.sh`.
 
-### Step 6 — delete `tools/glyph.py`
+### Step 6 — delete `tools/glyph.py` — DONE 2026-09-06 (721 lines)
 
 When the typed runner passes the same battery. Not before.
 

@@ -103,11 +103,11 @@ to `out/windowed-shot-<utc-stamp>.png`. Debug environment variables
 One command, from the repo root; exit 0 means everything is green:
 
 ```sh
-pixi run check         # = ./tools/check-all.sh = python3 tools/glyph.py check
+cargo glyph test       # = pixi run check = ./tools/check-all.sh
 ```
 
 The artifact graph is declared in **`build.toml`** (artifact, inputs, build
-command, class) and executed by **`tools/glyph.py`**: `pixi run build` brings
+command, class) and executed by **`glyph`** (`glyph/src/main.rs`): `cargo glyph build` brings
 products current and regenerates committed artifacts, `pixi run verify`
 byte-compares them against scratch rebuilds without building anything, and
 `check` runs the twelve named gates. A dozen gates, spanning all four
@@ -130,8 +130,9 @@ baselines in `out/tooling-ab/baseline/` means the commit is wrong: fix or
 revert. Baselines change deliberately, never as a side effect — they are class
 `golden` in build.toml and the runner has no build path for them.
 
-Narrower entry points: `python3 tools/glyph.py gate <name>` runs one gate
-(`glyph.py gates` lists them), `pixi run suites` / `suites-gpu` /
+Narrower entry points: `cargo glyph test <scope>` (engine | rust | render |
+corpus), `cargo glyph gate <name>` runs one check, `cargo glyph gates` lists
+them, `pixi run suites` / `suites-gpu` /
 `suites-all` for the Mojo conformance suites alone, `pixi run check-gen` for
 generator byte-identity, `pixi run gen-trie` / `gen-schema` to regenerate
 those outputs on purpose.
@@ -155,8 +156,8 @@ those outputs on purpose.
 | Tool | Role |
 |---|---|
 | `build.toml` | The declarative artifact/gate graph — artifact, inputs, build command, class (committed / golden / product) |
-| `tools/glyph.py` | The manifest runner: `build` / `verify` / `check` / `gate <name>` / `gates` / `graph` / `suites` |
-| `tools/check-all.sh` | Thin shim over `glyph.py check`; the umbrella battery (twelve named gates; enumerated in `AGENTS.md`) |
+| `glyph/` | The build tool: `build` / `test [scope]` / `run` / `prove` / `gate` / `gates` / `graph` / `validate`. `cargo glyph <verb>` |
+| `tools/check-all.sh` | 18-line shim over `cargo glyph test`, kept for muscle memory and external callers |
 | `tools/check-pick-oracle.sh` | The pick oracle: scripted picks vs `g_pick_oracle.py` (was `check-stage-g.sh`; the `g` was a fossil stage letter) |
 | `tools/gen_real_trie.py` | Generates `assets/atlas/engine-trie.bin`; `--verify-only` is the gate form |
 | `tools/gen_schema.py` | Validates `schema/glyph-identity.json`, generates `engine/glyph_schema.mojo`; `--check` is the gate form |

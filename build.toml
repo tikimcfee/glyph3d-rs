@@ -1,6 +1,6 @@
 # build.toml — the declarative build/verify graph for glyph3d-native.
 #
-# Consumed by tools/glyph.py (`python3 tools/glyph.py --help`). This file is
+# Consumed by `glyph` (glyph/src/main.rs; `cargo glyph --help`). This file is
 # the single account of WHICH artifacts exist, WHAT they are built from, and
 # WHICH instruments run over them — the thing that used to live only as line
 # order in tools/check-all.sh. Root AGENTS.md ("Verification") explains what

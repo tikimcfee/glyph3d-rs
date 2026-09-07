@@ -39,7 +39,7 @@ pixi run build              # the manifest runner: products current + committed 
 ```
 
 **The dependency graph is declared in `build.toml`** (artifact, input globs,
-build command, class) and executed by `tools/glyph.py`. `pixi run build` brings
+build command, class) and executed by `glyph` (`glyph/src/main.rs`). `cargo glyph build` brings
 products current (content-hash stamps, not mtimes) and regenerates committed
 artifacts in place — a deliberate, committable act. `pixi run verify` builds
 nothing: it asserts currency and byte-compares every committed artifact against
@@ -71,36 +71,64 @@ invoke `mojo build` by hand without it.
 
 GPU work needs Apple Silicon; `pixi.toml` declares `osx-arm64` only.
 
-## Verification — what actually runs
+## The tool
 
 ```sh
-bash tools/check-all.sh     # or: pixi run check — exit 0 = all green
+cargo glyph build          bring the binary and the engine dylib up to date
+cargo glyph test           run everything; nonzero if anything is wrong
+cargo glyph test engine    only what you changed: engine | rust | render | corpus
+cargo glyph test --frozen  assert currency instead of building it
+cargo glyph run --demo     launch the renderer; arguments pass through
 ```
 
-**Twelve gates, with names.** The artifact graph is declared in **`build.toml`**
-(artifact, inputs, build command, class: committed / golden / product) and
-executed by **`tools/glyph.py`**; `check-all.sh` is a thin shim over
-`python3 tools/glyph.py check`, kept because every doc and every pair of hands
-reaches for it. Useful forms: `pixi run build` / `verify` (the build/verify
-split), `python3 tools/glyph.py gate <name>` (one gate alone),
-`... gates` (what each compares and cannot see), `... graph` (the DAG,
-including BOTH edges that leave the schema). Gates used to be numbered
-positions in one shell script (`N/9`, renumbered twice, one with a fossil
-stage letter in its filename); the names below are the live identifiers and
-match `[[gate]] name =` in build.toml.
+**Use it rather than the pieces.** Do not hand-run `cargo build`,
+`engine/check.sh`, the `tools/` scripts, or the binary's own `--engine-check` /
+`--repo-verify` flags: the ordering between them is exactly what the tool exists
+to hold for you, and getting it wrong is how a stale dylib made a check test the
+previous engine for a day. `pixi run check` and `tools/check-all.sh` still work;
+both are thin doors onto `cargo glyph test`.
 
-**Run it in a worktree if anyone else is working in this repo.** `check` reads
-the WORKING TREE, not HEAD, so another thread's uncommitted edits fail your checks
-and tell you nothing about your own change. This has happened. It is a property of
-the runner, not of any one language's code, so it applies just as much to pure
+- **Scope is an argument, not a verb.** `glyph test engine` after touching Mojo
+  is ~25s against ~55s for the lot. The scopes answer "I changed X, what should
+  I run": `engine` (engine/*.mojo, the FFI), `rust` (native/src), `render`
+  (layout, shaders, anything that moves a pixel), `corpus` (fixtures,
+  generators, vendored inputs).
+- **`test` builds; `--frozen` refuses to.** Building is the iterating intent,
+  and necessary because `cargo build` does not build the Mojo dylib. `--frozen`
+  is the validating intent: if something is stale, that IS the finding, and a
+  check that silently rebuilds could never report it.
+- **`cargo glyph prove`** applies each mutation declared in `build.toml`,
+  requires the named check to redden for the named reason, and restores
+  byte-exact. It reports COVERAGE — which checks have no mutation and are
+  therefore unproven — not a pass count.
+- **`cargo glyph gates`** prints what each check compares and cannot see;
+  **`graph`** the artifact graph; **`validate`** the manifest against its schema.
+
+**Run it in a worktree if anyone else is working in this repo.** It reads the
+WORKING TREE, not HEAD, so another thread's uncommitted edits fail your checks
+and tell you nothing about your own change. This has happened. It is a property
+of the runner, not of any one language, so it applies just as much to pure
 engine or tooling work — `native/AGENTS.md` has the worktree setup commands.
 
-For each: what it compares, what makes it red, and **what it cannot see**. The
-last is the part worth reading. A check is a claim about a counterfactual, and a
+Everything the tool does is declared in `build.toml` and typed in
+`glyph/src/main.rs`. A key the code does not know is a parse error; a field the
+code does not read is a `dead_code` warning against a zero-warning gate. That is
+deliberate: this repo shipped a manifest whose `needs` edges were declared and
+read by nothing at all.
+
+## What the checks actually do
+
+Eleven, by name — they were numbered positions in one shell script (`N/9`,
+renumbered twice, one with a fossil stage letter still in its filename). For
+each: what it compares, what makes it red, and **what it cannot see**. The last
+is the part worth reading. A check is a claim about a counterfactual, and a
 check whose blind spot you don't know is a green you can't price.
 
-**products-current** (was "0"). The dylib is a *product*: nothing to compare
-against, it only has to be CURRENT. Currency is a content hash of the declared
+**Products — `glyph build`, and the first thing `test` does.** Not a check, and
+it cannot catch anything; it is here because everything below is a statement
+about an artifact, and a stale one makes every statement false. The dylib and
+the renderer are *products*: nothing to compare against, they only have to be
+CURRENT. Currency is a content hash of the declared
 inputs (`engine/*.mojo` + the pixi pins), stamped at build time — rebuilt only
 when that hash moved, not on every pass. Red only on a Mojo compile error.
 Blind to whether the result is *correct* — it exists solely so that nothing
@@ -271,7 +299,7 @@ and the union is not:
 
 A pass is a claim about a counterfactual, so test the counterfactual: break what
 a check watches and confirm it reddens. Some of that is now mechanical —
-`python3 tools/glyph.py mutate` applies each mutation declared in `build.toml`,
+`cargo glyph prove` applies each mutation declared in `build.toml`,
 requires the named gate to go red for the named reason, and restores byte-exact.
 It reports COVERAGE rather than a pass count, so a gate nobody has proven is
 listed as uncovered instead of being counted as working. Eight mutations cover
@@ -324,6 +352,17 @@ with a number against it.
 Hand-editing a generated file buys a failure on the next run. Regenerate instead
 (`pixi run gen-trie` / `gen-schema`, `node tools/export-atlas.mjs`).
 
+**Which language a thing is written in is a correctness decision, not taste.**
+Code that produces or checks an ANSWER stays in its own language, deliberately:
+`tools/g_pick_oracle.py` computes a fold independently and adjudicates the Rust
+against it, and the vendored JS produces the corpus's expected values. Port
+either to Rust and it becomes a second Rust implementation that can share a
+fault with the thing it validates — the check would stay green and stop meaning
+anything. Machinery that merely RUNS things has no such claim on its language:
+the mutation harness edits a file, runs a check and matches a string, so it
+moved from Python into `glyph` without argument. Ask which one you are holding
+before you rewrite it.
+
 **The sibling web repo at `../../viz-web/glyph3d-js` is read-only history.** It is
 the JS oracle this engine was ported from, now retired: `tools/vendor/ref` and
 `engine/fixtures/inputs/` are revision-pinned snapshots of it, and the two have
@@ -364,7 +403,7 @@ single most common way to misread the repo, so:
 - **Check numbers (0–9, 1b, 8b)** were positions in one shell script and were
   renumbered twice before the gates got names (2026-09-06). The live
   identifiers are the `[[gate]] name =` strings in `build.toml`
-  (products-current … reference-port); `python3 tools/glyph.py gates` lists
+  (committed-artifacts … reference-port); `cargo glyph gates` lists
   them. Old reports and comments still use the numbers — map by name.
 
 ## Where work lands

@@ -758,6 +758,178 @@ fn validate(m: &Manifest) -> Vec<String> {
     p
 }
 
+
+// ── prove: break each check, require it to notice ────────────────────────
+//
+// A gate's value is what it REJECTS; its green only repeats what you already
+// assumed. Each guard below exists because its absence has cost this repo real
+// time:
+//   green first     — a red on an already-red tree proves nothing
+//   assert applied  — "I broke it and nothing failed" and "I failed to break
+//                     it" print identically; a failed edit is silent
+//   builds first    — a mutation that does not COMPILE reddens its gate for a
+//                     reason the declaration did not state
+//   right gate/text — a mutation reddening some OTHER gate is not evidence
+//   restore proven  — byte-compare the snapshot back; never `git checkout` a
+//                     directory, which once reverted generators alongside
+//                     fixtures and ate a live edit
+//
+// Reported as COVERAGE, not a pass count: "N gates, C covered, U uncovered".
+// "8 mutations passed" describes the size of what ran, not the size of what
+// exists — the mistake the old ls-derived fixture count made.
+
+/// Runs one gate in a child of ourselves so its output can be read.
+fn gate_output(name: &str) -> (bool, String) {
+    let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("glyph"));
+    let out = Command::new(exe).arg("gate").arg(name).current_dir(root()).output();
+    match out {
+        Ok(o) => {
+            let mut s = String::from_utf8_lossy(&o.stdout).into_owned();
+            s.push_str(&String::from_utf8_lossy(&o.stderr));
+            (o.status.success(), s)
+        }
+        Err(e) => (false, format!("could not run gate {name}: {e}")),
+    }
+}
+
+/// Apply, returning the original bytes. Err if the edit did not land — a failed
+/// replace is silent, and an unapplied mutation looks exactly like a check that
+/// caught nothing.
+fn apply_mutation(mu: &Mutation) -> Result<Vec<u8>, String> {
+    let f = root().join(&mu.file);
+    let before = std::fs::read(&f).map_err(|e| format!("{}: {e}", mu.file))?;
+    match mu.op.as_str() {
+        "append" => {
+            let mut v = before.clone();
+            v.extend_from_slice(mu.arg.as_deref().unwrap_or_default().as_bytes());
+            std::fs::write(&f, &v).map_err(|e| e.to_string())?;
+        }
+        "replace" => {
+            let text = String::from_utf8(before.clone()).map_err(|_| "not UTF-8".to_string())?;
+            let find = mu.find.as_deref().unwrap_or_default();
+            if !text.contains(find) {
+                return Err(format!("find-text absent from {}; mutation cannot land", mu.file));
+            }
+            let with = mu.with_.as_deref().unwrap_or_default();
+            std::fs::write(&f, text.replacen(find, with, 1)).map_err(|e| e.to_string())?;
+        }
+        other => return Err(format!("unknown op {other}")),
+    }
+    if std::fs::read(&f).unwrap_or_default() == before {
+        return Err(format!("mutation did not change {}", mu.file));
+    }
+    Ok(before)
+}
+
+fn cmd_prove(m: &Manifest, only: Option<&str>) -> bool {
+    let covered: BTreeSet<&str> = m.mutation.iter().map(|mu| mu.gate.as_str()).collect();
+    let uncovered: Vec<&str> =
+        m.gate.iter().map(|g| g.name.as_str()).filter(|n| !covered.contains(n)).collect();
+    let mut fail = false;
+
+    for mu in m.mutation.iter().filter(|mu| only.is_none_or(|g| mu.gate == g)) {
+        step(&format!("mutation: {} → {}", mu.name, mu.gate));
+
+        let (pre_ok, _) = gate_output(&mu.gate);
+        if !pre_ok {
+            println!("FAIL  {} — gate {} was ALREADY RED before mutating;", mu.name, mu.gate);
+            println!("      a red here would prove nothing. Fix the tree first.");
+            fail = true;
+            continue;
+        }
+
+        let before = match apply_mutation(mu) {
+            Ok(b) => b,
+            Err(e) => {
+                println!("FAIL  {} — {e}", mu.name);
+                fail = true;
+                continue;
+            }
+        };
+
+        let mut verdict: Option<String> = None;
+        let mut built = true;
+        if let Some(rb) = &mu.rebuild {
+            let (good, out) = sh(rb, &root());
+            if !good {
+                built = false;
+                println!("FAIL  {} — the mutated tree does not BUILD, so this proves", mu.name);
+                println!("      nothing about the gate; a red here is the compiler, not the");
+                println!("      check. Make the mutation semantic, not syntactic.");
+                for l in out.lines().rev().take(3).collect::<Vec<_>>().into_iter().rev() {
+                    println!("      {l}");
+                }
+            }
+        }
+        if built {
+            let (post_ok, out) = gate_output(&mu.gate);
+            verdict = Some(if post_ok {
+                format!(
+                    "FAIL  {} — gate {} stayed GREEN under the mutation.\n      \
+                     It does not catch what it claims: {}",
+                    mu.name,
+                    mu.gate,
+                    mu.why.as_deref().unwrap_or("")
+                )
+            } else if !out.contains(&mu.expect) {
+                format!(
+                    "FAIL  {} — {} went red, but for an unstated reason.\n      \
+                     expected text containing: {:?}",
+                    mu.name, mu.gate, mu.expect
+                )
+            } else {
+                format!("PASS  {} reddens on {} — {:?}", mu.gate, mu.name, mu.expect)
+            });
+        }
+
+        // Restore, always, and prove it came back.
+        let f = root().join(&mu.file);
+        let _ = std::fs::write(&f, &before);
+        let restored = std::fs::read(&f).unwrap_or_default() == before;
+        if let Some(rb) = &mu.rebuild {
+            let (good, out) = sh(rb, &root());
+            if !good {
+                println!("FATAL {} — restore rebuild FAILED. The tree now has original", mu.name);
+                println!("      sources and a stale artifact; every later check would test the");
+                println!("      wrong binary. Run: pixi run build-engine");
+                println!("      {}", out.lines().last().unwrap_or(""));
+                return false;
+            }
+        }
+        match verdict {
+            Some(v) => {
+                println!("{v}");
+                if v.starts_with("FAIL") {
+                    fail = true;
+                }
+            }
+            None => fail = true,
+        }
+        if !restored {
+            println!("FAIL  {} — {} did NOT restore byte-exact", mu.name, mu.file);
+            fail = true;
+        }
+    }
+
+    println!();
+    println!(
+        "COVERAGE  {} gates, {} with mutations, {} uncovered",
+        m.gate.len(),
+        covered.len(),
+        uncovered.len()
+    );
+    if !uncovered.is_empty() {
+        println!("          uncovered: {}", uncovered.join(", "));
+        println!("          an uncovered gate is an unproven claim, not a passing one.");
+    }
+    println!();
+    println!(
+        "{}",
+        if fail { "PROVE: FAILURES — see above" } else { "PROVE: every declared mutation reddened its gate" }
+    );
+    !fail
+}
+
 // ── CLI ──────────────────────────────────────────────────────────────────
 
 #[derive(Parser)]
@@ -792,6 +964,8 @@ enum Cmd {
         #[arg(long)]
         gate: Option<String>,
     },
+    /// Run a single check by name. Used by `prove`, and useful on its own.
+    Gate { name: String },
     /// Check build.toml is internally consistent.
     Validate,
     /// What each check compares, and what it cannot see.
@@ -848,15 +1022,14 @@ fn main() -> ExitCode {
             print!("{out}");
             ok
         }
-        Cmd::Prove { gate } => {
-            // The last un-ported piece. The mutation DECLARATIONS are data in
-            // build.toml and are already typed above; only the apply/restore
-            // machinery still lives in Python. One entry point either way.
-            let g = gate.map(|g| format!(" --gate {g}")).unwrap_or_default();
-            let (ok, out) = sh(&format!("python3 tools/glyph.py mutate{g}"), &root());
-            print!("{out}");
-            ok
-        }
+        Cmd::Prove { gate } => cmd_prove(&m, gate.as_deref()),
+        Cmd::Gate { name } => match m.gate.iter().find(|g| g.name == name) {
+            Some(g) => run_gate(g, &m),
+            None => {
+                println!("FAIL  no gate named {name}");
+                false
+            }
+        },
         Cmd::Validate => {
             let problems = validate(&m);
             if problems.is_empty() {

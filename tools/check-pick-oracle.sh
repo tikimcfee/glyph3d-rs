@@ -18,7 +18,7 @@ cd "$(dirname "$0")/.."
 BIN=target/release/glyph3d-native
 # Unlike its siblings this script had no binary guard for most of its life:
 # run out of order it died with a raw shell error instead of a diagnosis.
-[ -x "$BIN" ] || { echo "FAIL  $BIN missing — run: python3 tools/glyph.py build"; exit 1; }
+[ -x "$BIN" ] || { echo "FAIL  $BIN missing — run: cargo glyph build"; exit 1; }
 FIX=native/fixtures/g-pick-repo
 ORACLE="python3 tools/g_pick_oracle.py"
 # The "big real repo" corpus. Was an absolute path into the web repo, which made
