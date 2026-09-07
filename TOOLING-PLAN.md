@@ -129,9 +129,9 @@ instruments it runs. `mypy --strict` gets types; it does not get that.
 - Not a re-litigation of `build.toml`'s shape. The manifest is good. It is being
   given a type.
 
-### Step 1 — make catching power machine-checkable
+### Step 1 — make catching power machine-checkable — DONE 2026-09-06
 
-**STARTED 2026-09-06.** `glyph mutate` ships with four declared mutations, all
+**All eleven checks are covered; `prove` reports 0 uncovered.** `glyph mutate` ships with four declared mutations, all
 reddening their gates for their stated reasons [measured]; the harness itself was
 verified by a knowingly-false mutation, which it correctly refused
 (`gate stayed GREEN under the mutation`, exit 1). Coverage today: **12 gates,
@@ -304,9 +304,22 @@ when a check is most likely to have quietly stopped working.
 
 ## Open
 
-- Whether to take the typed rewrite (step 2 onward) or stop after step 1 plus
-  the three review fixes. Step 1 is worth doing either way.
+- **Step 5 is the only plan step left, and its urgency dropped.** The defect
+  that motivated it — `check-pick-oracle.sh` aborting mid-run under `set -e` and
+  silently skipping the rest — is FIXED in place, and the fix was three lines
+  rather than a port (the script already had a FAIL accumulator; `-e` was
+  killing it before it could reach it). `check-fixture-parity.sh` was already
+  written that way. What remains is `engine/check.sh`, which orchestrates Mojo
+  and has no equivalent hazard. Absorbing these is now tidiness, not risk —
+  decide it on its merits, not on the plan's momentum.
 - The non-zero-origin case for `--engine-check`, per the miscompile finding.
+  Still the one real gap: `ffi_selftest` is the only witness to a compiler
+  miscompile class, because engine-check lays out at (0,0,0) and never
+  exercises the `origin_x` read that broke.
+- `native/.cargo/mutants.toml` says NEEDS RE-MEASUREMENT. Its finding (copy-to-
+  scratch cannot work, because the cargo root is `native/`) was true of the
+  layout that the workspace move replaced. The cause is gone; nobody has re-run
+  it. A removed cause is not a measured result.
 - The 19 remaining `Stage N` comment sites in `native/src/*.rs` (the four in
   `tools/` are resolved by the `check-pick-oracle.sh` rename). Mechanical,
   zero-risk, unscheduled.
