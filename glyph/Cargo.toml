@@ -12,5 +12,11 @@ publish = false
 # exempt from its own regime is how tools/glyph.py ended up with no tests.
 
 [dependencies]
+# Standard tools rather than hand-rolled equivalents: clap for the CLI surface,
+# serde+toml for the manifest, glob for input expansion, sha2 for the
+# content-hash stamps that tell a product from a stale one.
+clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
+glob = "0.3"
+sha2 = "0.10"

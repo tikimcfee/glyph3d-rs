@@ -122,20 +122,21 @@ name = "repo-zoom"
 cmd = "--load-repo fixtures/g-pick-repo --frames 2 --focus-file alpha.rs --zoom 3"
 
 # ── Gates ────────────────────────────────────────────────────────────────
+# `scope` answers "I changed X, what should I run" — the question the CLI is
+# organised around, rather than the twelve-item list this used to be:
+#   engine  you touched engine/*.mojo or the FFI
+#   rust    you touched native/src
+#   render  you touched layout, shaders, or anything that moves a pixel
+#   corpus  you touched fixtures, generators, or vendored inputs
+# `glyph test` with no scope runs all of them, in the order below.
 # The battery `glyph check` runs, in order. `needs` lists artifacts that must
 # be current/verified first; the runner enforces the order below, which
 # satisfies them. Names, not numbers — positions in this list have been
 # renumbered twice already and a name survives renumbering.
 
 [[gate]]
-name = "products-current"
-kind = "products"
-needs = ["dylib"]
-compare = "dylib input-content stamp vs engine/*.mojo + pixi toolchain"
-blind_to = "whether the result is CORRECT — only that it is current"
-
-[[gate]]
 name = "committed-artifacts"
+scope = "corpus"
 kind = "verify-committed"   # glyph-schema, engine-trie, atlas, fixtures
 needs = []
 compare = "each committed artifact rebuilt (scratch or generator check mode) vs its committed bytes"
@@ -143,6 +144,7 @@ blind_to = "whether the INPUTS are right — reproducibility, not truth"
 
 [[gate]]
 name = "vendor-hashes"
+scope = "corpus"
 kind = "cmd"
 cmd = "python3 tools/vendor-manifest.py --check"
 needs = []
@@ -151,6 +153,7 @@ blind_to = "upstream drift (by design) and a wrong-but-self-consistent vendored 
 
 [[gate]]
 name = "engine-suites"
+scope = "engine"
 kind = "cmd"
 cmd = "./engine/check.sh all"
 needs = ["fixtures"]
@@ -159,6 +162,7 @@ blind_to = "faults shared by the serial and scan forms in conformance_real (orac
 
 [[gate]]
 name = "cargo-build"
+scope = "rust"
 kind = "cargo"
 cmd = "build"
 needs = ["dylib"]
@@ -166,6 +170,7 @@ compare = "rustc warning count vs zero"
 
 [[gate]]
 name = "cargo-clippy"
+scope = "rust"
 kind = "cargo"
 cmd = "clippy"
 needs = []
@@ -174,6 +179,7 @@ blind_to = "anything silenced with #[allow(...)]"
 
 [[gate]]
 name = "cargo-test"
+scope = "rust"
 kind = "cargo-test"
 needs = []
 compare = "summed tests-actually-ran vs settings.test_floor ratchet; whole-binary dropout check"
@@ -181,13 +187,20 @@ blind_to = "nothing, structurally — that is what the floor is for. Holds the t
 
 [[gate]]
 name = "engine-check"
+scope = "engine"
 kind = "engine-check"
+# Two inputs, declared here rather than in the runner. src/main.rs is
+# well-formed UTF-8 by construction and can never reach the out-of-range decode
+# path where the two implementations actually disagreed; overflow-leads.txt is
+# the only input in the tree that does.
+targets = ["src/main.rs", "fixtures/overflow-leads.txt"]
 needs = ["renderer", "dylib"]
 compare = "Mojo engine through the FFI vs an independent Rust CPU fold, record by record"
 blind_to = "the per-item FFI strategy (hardcodes batched) and malformed shapes other than overflow-leads"
 
 [[gate]]
 name = "pick-oracle"
+scope = "render"
 kind = "cmd"
 cmd = "bash tools/check-pick-oracle.sh"
 pass_line = "ALL PASS"
@@ -197,6 +210,7 @@ blind_to = "pick paths outside the scripted set"
 
 [[gate]]
 name = "pixel-ab"
+scope = "render"
 kind = "golden-verify"
 needs = ["renderer", "pixel-baselines"]
 compare = "four views re-rendered vs out/tooling-ab/baseline, byte-equal"
@@ -204,13 +218,19 @@ blind_to = "everything outside the four frames; regression vs intentional change
 
 [[gate]]
 name = "repo-verify"
+scope = "engine"
 kind = "repo-verify"
+# --repo-scan-only is LOAD-BEARING: without it this opens the windowed
+# renderer and never returns. Run per wrap mode; {mode} is substituted.
+cmd = "--load-repo fixtures/g-pick-repo --wrap-mode {mode} --repo-verify --repo-scan-only"
+modes = ["down", "back"]
 needs = ["renderer", "dylib"]
 compare = "per-item vs batched FFI strategies, bit-exact at the layout seam, both wrap modes"
 blind_to = "a fault BOTH strategies share — ground truth comes from engine-check, batched path only"
 
 [[gate]]
 name = "reference-port"
+scope = "corpus"
 kind = "cmd"
 cmd = "tools/check-fixture-parity.sh"
 needs = ["renderer", "fixtures"]

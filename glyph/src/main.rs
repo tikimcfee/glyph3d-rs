@@ -1,25 +1,36 @@
-//! xtask — the typed half of the build/verify tooling.
+//! glyph — build, test and run this project.
 //!
-//! `build.toml` is currently consumed by `tools/glyph.py`, which reads it with
-//! string keys. That means the manifest can declare a field nobody reads and a
-//! reader can look up a field nobody declares, and neither is an error. Both
-//! happened: `needs` and `compare` are declared on every gate and read by
-//! nothing, so gate ordering is still line order wearing a dependency graph's
-//! clothes.
+//! Three verbs, because that is the loop:
 //!
-//! Typing closes both directions at once. The structs below are the single
-//! statement of what a gate IS: `deny_unknown_fields` makes a key the code does
-//! not know a hard parse error, and an unread field is a `dead_code` warning
-//! against a repo that gates on zero warnings. A declaration that nothing
-//! consumes stops being possible to commit rather than merely being discouraged.
+//!     glyph build          bring the runnable binary up to date
+//!     glyph test [scope]   run the checks; nonzero if anything is wrong
+//!     glyph run  [args]    launch the renderer
 //!
-//! This is the read-only half — it parses, validates, and prints. Running gates
-//! stays in glyph.py until each one is ported with its mutation as the
-//! acceptance test.
+//! Scope is an argument, not a family of verbs: `glyph test engine` after
+//! touching Mojo, `glyph test rust` after touching native/src, and so on. The
+//! twelve-item gate list this replaced was organised around the checks; this is
+//! organised around what you just changed. The gates still exist — they are an
+//! implementation detail behind `test`, and `glyph gates` prints them.
+//!
+//! `test` BUILDS what it needs, because that is the iterating intent and
+//! because `cargo build` does not build the Mojo dylib — a stale artifact
+//! silently tests the wrong engine, which has cost this repo a day and a bogus
+//! bisect. `test --frozen` is the other intent: assert everything is already
+//! current and fail if it is not. A check that silently rebuilds can never tell
+//! you your commit was incomplete.
+//!
+//! The manifest (`build.toml`) is parsed into the types below with
+//! `deny_unknown_fields`, so a key the code does not know is a hard error, and
+//! an unread field is a `dead_code` warning against a zero-warning gate. Both
+//! directions matter: this repo shipped a manifest whose `needs` edges were
+//! declared and read by nothing.
 
+use clap::{Parser, Subcommand};
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+use std::process::{Command, ExitCode};
 
 // ── the manifest, as types ───────────────────────────────────────────────
 
@@ -41,8 +52,8 @@ struct Settings {
 }
 
 /// How an artifact is verified is a property of its CLASS, not a per-artifact
-/// choice — which is what stops "verify it by rebuilding it" from being applied
-/// to the pixel baselines, whose expected bytes cannot be derived from anything.
+/// choice — which is what stops "verify by rebuilding" being applied to the
+/// pixel baselines, whose bytes cannot be derived from anything.
 #[derive(Debug, Deserialize, PartialEq, Eq, Clone, Copy)]
 #[serde(rename_all = "lowercase")]
 enum Class {
@@ -78,7 +89,6 @@ struct GoldenView {
 #[derive(Debug, Deserialize, PartialEq, Eq, Clone, Copy)]
 #[serde(rename_all = "kebab-case")]
 enum Kind {
-    Products,
     VerifyCommitted,
     Cmd,
     Cargo,
@@ -88,15 +98,37 @@ enum Kind {
     RepoVerify,
 }
 
+/// What you changed, and therefore what is worth running.
+#[derive(Debug, Deserialize, PartialEq, Eq, Clone, Copy, clap::ValueEnum)]
+#[serde(rename_all = "lowercase")]
+#[clap(rename_all = "lowercase")]
+enum Scope {
+    /// engine/*.mojo and the FFI
+    Engine,
+    /// native/src
+    Rust,
+    /// layout, shaders, anything that moves a pixel
+    Render,
+    /// fixtures, generators, vendored inputs
+    Corpus,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Gate {
     name: String,
+    scope: Scope,
     kind: Kind,
     #[serde(default)]
     needs: Vec<String>,
     cmd: Option<String>,
     pass_line: Option<String>,
+    /// engine-check: the inputs to diff. Declared, not hardcoded in the runner.
+    #[serde(default)]
+    targets: Vec<String>,
+    /// repo-verify: the wrap modes `cmd`'s {mode} is substituted with.
+    #[serde(default)]
+    modes: Vec<String>,
     compare: Option<String>,
     blind_to: Option<String>,
 }
@@ -117,139 +149,548 @@ struct Mutation {
     rebuild: Option<String>,
 }
 
-// ── loading ──────────────────────────────────────────────────────────────
+// ── paths and process ────────────────────────────────────────────────────
 
-fn repo_root() -> PathBuf {
-    // The crate sits at <root>/xtask; it is not a workspace member, so cargo
-    // cannot hand us the repo root and we derive it from the manifest dir.
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .expect("xtask/ must have a parent")
-        .to_path_buf()
+fn root() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap().to_path_buf()
+}
+fn native() -> PathBuf {
+    root().join("native")
+}
+fn stamps() -> PathBuf {
+    root().join("target/.glyph-stamps")
+}
+fn sweep() -> PathBuf {
+    root().join("out/tooling-ab/sweep")
 }
 
-fn load() -> Result<Manifest, String> {
-    let p = repo_root().join("build.toml");
-    let text = std::fs::read_to_string(&p).map_err(|e| format!("{}: {e}", p.display()))?;
-    toml::from_str(&text).map_err(|e| format!("build.toml is not valid against the schema:\n{e}"))
+/// Every external command goes through here so failures look the same.
+fn sh(cmd: &str, cwd: &Path) -> (bool, String) {
+    let out = Command::new("bash").arg("-c").arg(cmd).current_dir(cwd).output();
+    match out {
+        Ok(o) => {
+            let mut s = String::from_utf8_lossy(&o.stdout).into_owned();
+            s.push_str(&String::from_utf8_lossy(&o.stderr));
+            (o.status.success(), s)
+        }
+        Err(e) => (false, format!("could not spawn: {e}")),
+    }
 }
 
-// ── validation: the part that makes `needs` load-bearing ─────────────────
+fn expand(pattern: &str) -> Vec<PathBuf> {
+    let p = root().join(pattern);
+    let mut v: Vec<PathBuf> = glob::glob(&p.to_string_lossy())
+        .map(|g| g.filter_map(Result::ok).filter(|p| p.is_file()).collect())
+        .unwrap_or_default();
+    v.sort();
+    v
+}
 
-/// Which artifacts a gate makes usable by the gates after it.
-///
-/// This is derived from `kind` rather than declared, deliberately: a `provides`
-/// field would be one more thing that can be written and never read, which is
-/// the defect this file exists to remove. The mapping is the actual semantics —
-/// the products gate is what makes products current, the committed gate is what
-/// establishes committed artifacts match their sources, and the golden gate is
-/// the only thing that ever looks at a golden.
-fn provides(kind: Kind, m: &Manifest) -> Vec<&str> {
-    let of_class = |c: Class| {
-        m.artifact
+fn step(msg: &str) {
+    println!("\n── {msg}");
+}
+
+// ── products: current, or not ────────────────────────────────────────────
+
+/// A product's currency is the hash of its inputs' CONTENT, not their mtimes.
+/// mtime is what cargo uses for the dylib edge, and it is why `cargo build`
+/// happily links an engine built from different source.
+fn input_digest(a: &Artifact) -> String {
+    let mut h = Sha256::new();
+    for pat in &a.inputs {
+        for f in expand(pat) {
+            h.update(f.strip_prefix(root()).unwrap_or(&f).to_string_lossy().as_bytes());
+            h.update([0]);
+            h.update(std::fs::read(&f).unwrap_or_default());
+            h.update([0]);
+        }
+    }
+    format!("{:x}", h.finalize())
+}
+
+fn stamp_of(name: &str) -> Option<String> {
+    std::fs::read_to_string(stamps().join(format!("{name}.sha256"))).ok()
+}
+
+fn write_stamp(name: &str, digest: &str) {
+    let _ = std::fs::create_dir_all(stamps());
+    let _ = std::fs::write(stamps().join(format!("{name}.sha256")), digest);
+}
+
+fn is_current(name: &str, a: &Artifact) -> bool {
+    stamp_of(name).as_deref() == Some(input_digest(a).as_str())
+        && a.outputs.iter().all(|o| root().join(o).exists())
+}
+
+/// `build` achieves currency; `--frozen` only asserts it. Keeping those apart
+/// is the whole reason `test` no longer has a gate that quietly rebuilds.
+fn ensure_products(m: &Manifest, frozen: bool) -> bool {
+    let mut ok = true;
+    for (name, a) in m.artifact.iter().filter(|(_, a)| a.class == Class::Product) {
+        if is_current(name, a) {
+            println!("PASS  {name} current (input hash unchanged)");
+            continue;
+        }
+        if frozen {
+            println!("FAIL  {name} is stale or unbuilt — run `glyph build`.");
+            println!("      --frozen asserts currency rather than achieving it, so that a");
+            println!("      commit which forgot to rebuild fails here instead of passing.");
+            ok = false;
+            continue;
+        }
+        let Some(build) = &a.build else {
+            println!("FAIL  {name} has no build command");
+            ok = false;
+            continue;
+        };
+        let (good, out) = sh(build, &root());
+        if !good {
+            println!("FAIL  {name} build errored — every check below would test the wrong artifact");
+            for l in out.lines().rev().take(6).collect::<Vec<_>>().iter().rev() {
+                println!("      {l}");
+            }
+            ok = false;
+            continue;
+        }
+        write_stamp(name, &input_digest(a));
+        println!("PASS  {name} rebuilt");
+    }
+    ok
+}
+
+// ── committed artifacts ──────────────────────────────────────────────────
+
+fn verify_committed(m: &Manifest) -> bool {
+    let mut ok = true;
+    for (name, a) in m.artifact.iter().filter(|(_, a)| a.class == Class::Committed) {
+        if let Some(c) = &a.verify_cmd {
+            let (good, out) = sh(c, &root());
+            let last = out.lines().last().unwrap_or("").to_string();
+            if good {
+                println!("PASS  {name} — {last}");
+            } else {
+                println!("FAIL  {name} — {last}");
+                ok = false;
+            }
+        } else if a.counts.is_some() {
+            ok &= verify_corpus(name, a);
+        } else if let Some(c) = &a.verify_scratch {
+            ok &= verify_scratch(name, a, c);
+        } else {
+            println!("FAIL  {name} declares no way to verify it");
+            ok = false;
+        }
+    }
+    ok
+}
+
+/// Rebuild into a scratch dir and byte-compare. The committed files are never
+/// touched, which is the difference between this and the gate it replaced.
+fn verify_scratch(name: &str, a: &Artifact, cmd: &str) -> bool {
+    let scratch = std::env::temp_dir().join(format!("glyph-verify-{name}"));
+    let _ = std::fs::remove_dir_all(&scratch);
+    if std::fs::create_dir_all(&scratch).is_err() {
+        println!("FAIL  {name} — could not make a scratch dir");
+        return false;
+    }
+    let (good, out) = sh(&cmd.replace("{scratch}", &scratch.to_string_lossy()), &root());
+    if !good {
+        println!("FAIL  {name} — rebuild errored: {}", out.lines().last().unwrap_or(""));
+        return false;
+    }
+    for o in &a.outputs {
+        let file = Path::new(o).file_name().unwrap();
+        let (built, committed) = (scratch.join(file), root().join(o));
+        if std::fs::read(&built).ok() != std::fs::read(&committed).ok() {
+            println!("FAIL  {name} — {} differs from the committed asset", file.to_string_lossy());
+            return false;
+        }
+    }
+    println!("PASS  {name} — {} rebuilt BYTE-IDENTICAL to scratch", a.outputs.len());
+    true
+}
+
+/// The corpus is regenerated in a COPY. The counts it is checked against are
+/// declared in the manifest, never counted off the tree being checked — a
+/// deleted case would otherwise lower both sides and stay green.
+fn verify_corpus(name: &str, a: &Artifact) -> bool {
+    let scratch = std::env::temp_dir().join("glyph-verify-corpus");
+    let _ = std::fs::remove_dir_all(&scratch);
+    let (good, out) = sh(
+        &format!(
+            "mkdir -p {0} && cp -R engine/fixtures {0}/fixtures && cp engine/glyph_schema.mjs {0}/ \
+             && rm -f {0}/fixtures/*.pipe.bin {0}/fixtures/*.bake.bin \
+             && cd {0}/fixtures && node gen.mjs >/dev/null && node gen-bake.mjs >/dev/null",
+            scratch.to_string_lossy()
+        ),
+        &root(),
+    );
+    if !good {
+        println!("FAIL  {name} — a fixture generator errored; the corpus is not rebuildable");
+        println!("      {}", out.lines().last().unwrap_or(""));
+        return false;
+    }
+    let counts = a.counts.as_ref().unwrap();
+    for (ext, want) in counts {
+        let built: Vec<_> = glob::glob(&format!("{}/fixtures/*.{ext}.bin", scratch.to_string_lossy()))
+            .map(|g| g.filter_map(Result::ok).collect())
+            .unwrap_or_default();
+        if built.len() as u32 != *want {
+            println!(
+                "FAIL  {name} — regenerated {} .{ext}.bin, build.toml declares {want} \
+                 (a generator's case list changed; update the count deliberately)",
+                built.len()
+            );
+            return false;
+        }
+        for b in &built {
+            let committed = root().join("engine/fixtures").join(b.file_name().unwrap());
+            if std::fs::read(b).ok() != std::fs::read(&committed).ok() {
+                println!(
+                    "FAIL  {name} — {} differs from the committed fixture",
+                    b.file_name().unwrap().to_string_lossy()
+                );
+                return false;
+            }
+        }
+    }
+    let total: u32 = counts.values().sum();
+    println!(
+        "PASS  {name} — {total} fixtures ({}) regenerated BYTE-IDENTICAL in scratch; \
+         counts declared in build.toml, not ls-derived",
+        counts.iter().map(|(k, v)| format!("{v} {k}")).collect::<Vec<_>>().join(" + ")
+    );
+    true
+}
+
+/// Goldens are re-rendered and compared. There is no build path, by design:
+/// re-baselining is a human decision, and the tool refuses to make it.
+fn verify_golden(m: &Manifest) -> bool {
+    let a = m.artifact.values().find(|a| a.class == Class::Golden).unwrap();
+    let _ = std::fs::create_dir_all(sweep());
+    let mut ok = true;
+    for v in &m.golden_view {
+        let shot = sweep().join(format!("{}.png", v.name));
+        let (good, out) = sh(
+            &format!(
+                "../target/release/glyph3d-native {} --screenshot {}",
+                v.cmd,
+                shot.to_string_lossy()
+            ),
+            &native(),
+        );
+        if !good {
+            println!("FAIL  {} render errored — {}", v.name, out.lines().last().unwrap_or(""));
+            ok = false;
+            continue;
+        }
+        let baseline = a
+            .outputs
             .iter()
-            .filter(|(_, a)| a.class == c)
-            .map(|(n, _)| n.as_str())
-            .collect::<Vec<_>>()
+            .find(|o| o.ends_with(&format!("/{}.png", v.name)))
+            .map(|o| root().join(o));
+        match baseline {
+            Some(b) if std::fs::read(&b).ok() == std::fs::read(&shot).ok() => {
+                println!("PASS  {}.png BYTE-EQUAL", v.name)
+            }
+            Some(_) => {
+                println!("FAIL  {}.png diverges from baseline — the renderer changed.", v.name);
+                println!("      If that was intended, re-baseline by hand and say so in the commit.");
+                ok = false;
+            }
+            None => {
+                println!("FAIL  {} has no committed baseline", v.name);
+                ok = false;
+            }
+        }
+    }
+    ok
+}
+
+// ── the gates ────────────────────────────────────────────────────────────
+
+fn warn_count(out: &str) -> usize {
+    out.lines().filter(|l| l.starts_with("warning") && !l.contains("generated")).count()
+}
+
+fn gate_cargo(g: &Gate) -> bool {
+    let cmd = match g.cmd.as_deref() {
+        Some("build") => "cargo build --release",
+        Some("clippy") => "cargo clippy --release",
+        other => {
+            println!("FAIL  {} has unknown cargo cmd {other:?}", g.name);
+            return false;
+        }
+    };
+    let (good, out) = sh(cmd, &root());
+    if !good {
+        println!("{}", out.lines().rev().take(20).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join("\n"));
+        println!("FAIL  {} errored", g.name);
+        return false;
+    }
+    let w = warn_count(&out);
+    if w == 0 {
+        println!("PASS  {} — 0 warnings", g.name);
+        true
+    } else {
+        for l in out.lines().filter(|l| l.starts_with("warning")) {
+            println!("      {l}");
+        }
+        println!("FAIL  {} — {w} warnings", g.name);
+        false
+    }
+}
+
+/// The floor is a RATCHET, not an equality: tests are added constantly, so an
+/// exact pin would redden on the most common good action in the repo. It exists
+/// because the previous form counted "test result: ok" LINES and required two —
+/// and there are exactly two test binaries, so it could not fail. A green run
+/// above the floor prints the value to raise it to, so it cannot quietly decay.
+fn gate_cargo_test(m: &Manifest) -> bool {
+    let (good, out) = sh("cargo test --release", &root());
+    for l in out.lines().filter(|l| l.contains("test result")) {
+        println!("{l}");
+    }
+    if !good {
+        println!("FAIL  cargo test");
+        return false;
+    }
+    let binaries = out.lines().filter(|l| l.contains("test result: ok")).count();
+    let total: u32 = out
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .windows(2)
+        .filter(|w| w[1].starts_with("passed"))
+        .filter_map(|w| w[0].parse::<u32>().ok())
+        .sum();
+    let floor = m.settings.test_floor;
+    if binaries < 2 {
+        println!("FAIL  cargo test — only {binaries} test binary reported; one stopped running");
+        return false;
+    }
+    if total < floor {
+        println!("FAIL  cargo test — {total} tests ran, floor is {floor}. Coverage DROPPED by {}.", floor - total);
+        println!("      A deleted test, an #[ignore] that outlived its reason, or a module");
+        println!("      that stopped being compiled. Lower the floor only on purpose.");
+        return false;
+    }
+    println!("PASS  cargo test — {total} tests over {binaries} binaries (floor {floor})");
+    if total > floor {
+        println!("NOTE  the floor is behind: raise test_floor to {total} in build.toml");
+    }
+    true
+}
+
+fn gate_engine_check(g: &Gate) -> bool {
+    let mut ok = true;
+    for target in &g.targets {
+        let (_, out) = sh(&format!("../target/release/glyph3d-native --engine-check {target}"), &native());
+        let lines: Vec<&str> = out.lines().collect();
+        let hit = lines.iter().find(|l| l.contains("engine-check PASS")).copied();
+        println!("{}", hit.unwrap_or_else(|| lines.last().copied().unwrap_or("")));
+        if hit.is_some() {
+            println!("PASS  engine-check ({target})");
+        } else {
+            // The record diff is the interesting part on failure; printing only
+            // the summary discarded WHY it reddened before anything could read it.
+            for l in lines.iter().rev().skip(1).take(10).collect::<Vec<_>>().into_iter().rev() {
+                println!("      {l}");
+            }
+            println!("FAIL  engine-check ({target})");
+            ok = false;
+        }
+    }
+    ok
+}
+
+fn gate_repo_verify(g: &Gate) -> bool {
+    let mut ok = true;
+    let template = g.cmd.as_deref().unwrap_or_default();
+    for mode in &g.modes {
+        let (good, out) = sh(
+            &format!(
+                "../target/release/glyph3d-native {}",
+                template.replace("{mode}", mode)
+            ),
+            &native(),
+        );
+        // The result line is not necessarily the last one: the renderer logs
+        // after it. Search, do not assume position.
+        match out.lines().find(|l| l.contains("repo-verify PASS")) {
+            Some(hit) if good => println!("PASS  --wrap-mode {mode} — {}", hit.trim()),
+            _ => {
+                for l in out.lines().rev().take(8).collect::<Vec<_>>().into_iter().rev() {
+                    println!("      {l}");
+                }
+                println!("FAIL  --wrap-mode {mode}");
+                ok = false;
+            }
+        }
+    }
+    ok
+}
+
+fn gate_cmd(g: &Gate) -> bool {
+    let cmd = g.cmd.as_deref().unwrap_or_default();
+    let (good, out) = sh(cmd, &root());
+    let passed = match &g.pass_line {
+        Some(p) => good && out.contains(p.as_str()),
+        None => good,
+    };
+    if passed {
+        // Surface the child's OWN result lines, not just its last one. The
+        // reference-port script reports six halves with their volumes — 17
+        // fixtures, 13568 trie entries, 1872012 lanes, 530 seed queries — and
+        // those counts ARE the claim that the check is not vacuous. Collapsing
+        // them to one line is the same loss a doc review caught earlier today.
+        let detail: Vec<&str> =
+            out.lines().filter(|l| l.starts_with("PASS ") || l.starts_with("FAIL ")).collect();
+        if detail.is_empty() {
+            println!("PASS  {} — {}", g.name, out.lines().last().unwrap_or("").trim());
+        } else {
+            for l in &detail {
+                println!("  {l}");
+            }
+            println!("PASS  {}", g.name);
+        }
+    } else {
+        for l in out.lines().rev().take(12).collect::<Vec<_>>().into_iter().rev() {
+            println!("      {l}");
+        }
+        println!("FAIL  {}", g.name);
+    }
+    passed
+}
+
+/// The prerequisite check, derived from the manifest instead of hand-written
+/// per gate. The Python runner had this same guard copied into three separate
+/// gate implementations, so a gate that declared `needs` and forgot its own
+/// copy was unprotected while looking protected. Here `needs` does the work:
+/// one place, and adding a gate cannot forget it.
+fn needs_met(g: &Gate, m: &Manifest) -> bool {
+    for n in &g.needs {
+        let Some(a) = m.artifact.get(n) else { continue };
+        for o in &a.outputs {
+            // outputs are glob PATTERNS (engine/fixtures/*.pipe.bin), so this
+            // has to expand rather than stat.
+            if expand(o).is_empty() {
+                println!("FAIL  {} needs '{n}', but nothing matches {o} — run `glyph build`.", g.name);
+                return false;
+            }
+        }
+    }
+    true
+}
+
+fn run_gate(g: &Gate, m: &Manifest) -> bool {
+    if !needs_met(g, m) {
+        return false;
+    }
+    match g.kind {
+        Kind::VerifyCommitted => verify_committed(m),
+        Kind::Cmd => gate_cmd(g),
+        Kind::Cargo => gate_cargo(g),
+        Kind::CargoTest => gate_cargo_test(m),
+        Kind::EngineCheck => gate_engine_check(g),
+        Kind::GoldenVerify => verify_golden(m),
+        Kind::RepoVerify => gate_repo_verify(g),
+    }
+}
+
+// ── validation (see `glyph validate`) ────────────────────────────────────
+
+/// Which artifacts a gate makes usable by the gates after it. Derived from
+/// `kind` rather than declared: a `provides` field would be one more thing that
+/// can be written and never read, which is the defect this validation exists
+/// to remove.
+fn provides(kind: Kind, m: &Manifest) -> Vec<&str> {
+    let of = |c: Class| {
+        m.artifact.iter().filter(|(_, a)| a.class == c).map(|(n, _)| n.as_str()).collect::<Vec<_>>()
     };
     match kind {
-        Kind::Products => of_class(Class::Product),
-        Kind::VerifyCommitted => of_class(Class::Committed),
-        Kind::GoldenVerify => of_class(Class::Golden),
+        Kind::VerifyCommitted => of(Class::Committed),
+        Kind::GoldenVerify => of(Class::Golden),
+        // Products are made current by `build`, which runs before any gate.
         _ => vec![],
     }
 }
 
 fn validate(m: &Manifest) -> Vec<String> {
-    let mut problems = Vec::new();
+    let mut p = Vec::new();
     let known: BTreeSet<&str> = m.artifact.keys().map(|s| s.as_str()).collect();
-    let gate_names: BTreeSet<&str> = m.gate.iter().map(|g| g.name.as_str()).collect();
+    let gates: BTreeSet<&str> = m.gate.iter().map(|g| g.name.as_str()).collect();
 
-    // Every artifact must state how it is verified, or be a product.
     for (name, a) in &m.artifact {
         match a.class {
-            Class::Golden => {
-                if a.build.is_some() {
-                    problems.push(format!(
-                        "artifact {name} is golden but declares a build command; a golden \
-                         cannot be derived and must never be regenerated by the tool"
-                    ));
-                }
-            }
+            Class::Golden if a.build.is_some() => p.push(format!(
+                "artifact {name} is golden but declares a build command; a golden cannot be \
+                 derived and must never be regenerated by the tool"
+            )),
             Class::Committed => {
                 if a.verify_cmd.is_none() && a.verify_scratch.is_none() && a.counts.is_none() {
-                    problems.push(format!(
-                        "artifact {name} is committed but declares no way to verify it"
-                    ));
+                    p.push(format!("artifact {name} is committed but declares no way to verify it"));
                 }
                 if a.build.is_none() {
-                    problems.push(format!("artifact {name} is committed but has no build command"));
+                    p.push(format!("artifact {name} is committed but has no build command"));
                 }
             }
             Class::Product => {
                 if a.build.is_none() {
-                    problems.push(format!("artifact {name} is a product with no build command"));
+                    p.push(format!("artifact {name} is a product with no build command"));
                 }
                 if a.inputs.is_empty() {
-                    problems.push(format!(
-                        "artifact {name} is a product with no inputs; its currency stamp \
-                         would hash nothing and always compare equal"
+                    p.push(format!(
+                        "artifact {name} is a product with no inputs; its currency stamp would \
+                         hash nothing and always compare equal"
                     ));
                 }
             }
+            _ => {}
         }
     }
 
-    // `needs` must name real artifacts, and they must be available by the time
-    // the gate runs. Availability comes from an EARLIER gate in the list.
-    //
-    // A gate MAY satisfy its own needs. `needs` carries two relationships that
-    // reading the manifest does not distinguish and implementing it does:
-    // "someone before me must make this ready" (engine-check needs a built
-    // renderer) and "this is the artifact I operate on" (products-current needs
-    // the dylib it is itself responsible for; pixel-ab needs the goldens it is
-    // the only reader of). Both are legitimate. What is NOT legitimate, and is
-    // what this check exists to catch, is needing an artifact that no gate
-    // provides at all, or one that only a LATER gate provides.
-    let mut available: BTreeSet<&str> = BTreeSet::new();
+    // Products are current before any gate runs, so they are available from the
+    // start. A gate may satisfy its own needs — `needs` carries both "someone
+    // before me must make this ready" and "this is what I operate on".
+    let mut avail: BTreeSet<&str> =
+        m.artifact.iter().filter(|(_, a)| a.class == Class::Product).map(|(n, _)| n.as_str()).collect();
     for g in &m.gate {
-        for p in provides(g.kind, m) {
-            available.insert(p);
+        for pr in provides(g.kind, m) {
+            avail.insert(pr);
         }
         for n in &g.needs {
             if !known.contains(n.as_str()) {
-                problems.push(format!(
-                    "gate {} needs '{n}', which is not a declared artifact",
-                    g.name
-                ));
-            } else if !available.contains(n.as_str()) {
-                problems.push(format!(
-                    "gate {} needs '{n}' but no earlier gate provides it — the declared \
+                p.push(format!("gate {} needs '{n}', which is not a declared artifact", g.name));
+            } else if !avail.contains(n.as_str()) {
+                p.push(format!(
+                    "gate {} needs '{n}' but nothing before it provides that — the declared \
                      order does not satisfy the declared dependencies",
                     g.name
                 ));
             }
         }
-    }
-
-    // A gate's command fields must match its kind. `pass_line` without a `cmd`
-    // is a string nothing can compare against.
-    for g in &m.gate {
-        if g.kind == Kind::Cmd && g.cmd.is_none() {
-            problems.push(format!("gate {} is kind=cmd but declares no cmd", g.name));
-        }
-        if g.pass_line.is_some() && g.cmd.is_none() {
-            problems.push(format!(
-                "gate {} declares pass_line but has no cmd whose output it could match",
+        if g.kind == Kind::EngineCheck && g.targets.is_empty() {
+            p.push(format!(
+                "gate {} is kind=engine-check but declares no targets; it would diff \
+                 nothing and report success",
                 g.name
             ));
         }
+        if g.kind == Kind::RepoVerify && (g.cmd.is_none() || g.modes.is_empty()) {
+            p.push(format!(
+                "gate {} is kind=repo-verify but declares no cmd/modes; it would run \
+                 nothing and report success",
+                g.name
+            ));
+        }
+        if g.kind == Kind::Cmd && g.cmd.is_none() {
+            p.push(format!("gate {} is kind=cmd but declares no cmd", g.name));
+        }
+        if g.pass_line.is_some() && g.cmd.is_none() {
+            p.push(format!("gate {} declares pass_line but has no cmd to match it against", g.name));
+        }
     }
 
-    // Every golden view must correspond to a committed baseline, and every
-    // baseline to a view. A view with no baseline renders into nothing; a
-    // baseline with no view is never re-rendered and silently stops being
-    // checked while still looking like coverage.
     if let Some(golden) = m.artifact.values().find(|a| a.class == Class::Golden) {
         let stems: BTreeSet<String> = golden
             .outputs
@@ -258,171 +699,223 @@ fn validate(m: &Manifest) -> Vec<String> {
             .collect();
         let views: BTreeSet<String> = m.golden_view.iter().map(|v| v.name.clone()).collect();
         for v in views.difference(&stems) {
-            problems.push(format!("golden_view '{v}' has no committed baseline image"));
+            p.push(format!("golden_view '{v}' has no committed baseline image"));
         }
         for s in stems.difference(&views) {
-            problems.push(format!(
-                "baseline '{s}' has no golden_view that renders it — it is compared \
-                 against nothing and is not coverage"
+            p.push(format!(
+                "baseline '{s}' has no golden_view that renders it — it is compared against \
+                 nothing and is not coverage"
             ));
         }
         for v in &m.golden_view {
             if v.cmd.trim().is_empty() {
-                problems.push(format!("golden_view '{}' has an empty render command", v.name));
+                p.push(format!("golden_view '{}' has an empty render command", v.name));
             }
         }
     }
 
-    // Mutations must name a real gate, and be internally coherent: an
-    // unrunnable mutation is worse than an absent one, because it is counted
-    // as coverage until the day someone runs it.
     for mu in &m.mutation {
-        if !gate_names.contains(mu.gate.as_str()) {
-            problems.push(format!(
-                "mutation {} targets gate '{}', which does not exist",
-                mu.name, mu.gate
-            ));
+        if !gates.contains(mu.gate.as_str()) {
+            p.push(format!("mutation {} targets gate '{}', which does not exist", mu.name, mu.gate));
         }
-        if !repo_root().join(&mu.file).exists() {
-            problems.push(format!(
-                "mutation {} targets {}, which does not exist",
-                mu.name, mu.file
-            ));
+        if !root().join(&mu.file).exists() {
+            p.push(format!("mutation {} targets {}, which does not exist", mu.name, mu.file));
         }
         if mu.expect.trim().is_empty() {
-            problems.push(format!(
-                "mutation {} declares no expected text; it would accept ANY red, \
-                 including one from an unrelated cause",
+            p.push(format!(
+                "mutation {} declares no expected text; it would accept ANY red, including \
+                 one from an unrelated cause",
                 mu.name
             ));
         }
         match mu.op.as_str() {
             "replace" => {
                 if mu.find.is_none() {
-                    problems.push(format!("mutation {} is op=replace with no find text", mu.name));
+                    p.push(format!("mutation {} is op=replace with no find text", mu.name));
                 } else if mu.find.as_deref() == mu.with_.as_deref() {
-                    problems.push(format!(
-                        "mutation {} replaces text with itself and can never land",
-                        mu.name
-                    ));
+                    p.push(format!("mutation {} replaces text with itself and can never land", mu.name));
                 }
             }
             "append" => {
                 if mu.arg.as_deref().unwrap_or("").is_empty() {
-                    problems.push(format!(
-                        "mutation {} is op=append with nothing to append; it would not \
-                         change the file and the harness would reject it at run time",
-                        mu.name
-                    ));
+                    p.push(format!("mutation {} is op=append with nothing to append", mu.name));
                 }
             }
             "remove" => {}
-            other => problems.push(format!("mutation {} has unknown op '{other}'", mu.name)),
+            other => p.push(format!("mutation {} has unknown op '{other}'", mu.name)),
         }
         if mu.why.as_deref().unwrap_or("").trim().is_empty() {
-            problems.push(format!(
-                "mutation {} has no `why`; a mutation whose motivating defect is \
-                 unstated cannot be judged when it later fails",
+            p.push(format!(
+                "mutation {} has no `why`; a mutation whose motivating defect is unstated \
+                 cannot be judged when it later fails",
                 mu.name
             ));
         }
-        if let Some(r) = &mu.rebuild {
-            if r.trim().is_empty() {
-                problems.push(format!("mutation {} has an empty rebuild command", mu.name));
-            }
+        if mu.rebuild.as_deref().map(str::trim) == Some("") {
+            p.push(format!("mutation {} has an empty rebuild command", mu.name));
         }
     }
-
-    problems
+    p
 }
 
-// ── commands ─────────────────────────────────────────────────────────────
+// ── CLI ──────────────────────────────────────────────────────────────────
 
-fn cmd_graph(m: &Manifest) {
-    println!("artifacts — edges flow inputs → artifact\n");
-    for (name, a) in &m.artifact {
-        println!("  {name}  [{:?}]", a.class);
-        for o in &a.outputs {
-            println!("    out:  {o}");
-        }
-        for i in &a.inputs {
-            println!("    in:   {i}");
-        }
-        if let Some(c) = &a.counts {
-            println!("    declared counts: {c:?}");
-        }
-        if let Some(n) = &a.note {
-            println!("    note: {n}");
-        }
-        println!();
+#[derive(Parser)]
+#[command(name = "glyph", about = "Build, test and run glyph3d-native.", version)]
+struct Cli {
+    #[command(subcommand)]
+    cmd: Cmd,
+}
+
+#[derive(Subcommand)]
+enum Cmd {
+    /// Bring the runnable binary and the engine dylib up to date.
+    Build,
+    /// Run the checks. No scope runs all of them.
+    Test {
+        /// Only what this scope covers: engine, rust, render, corpus.
+        scope: Option<Scope>,
+        /// Assert everything is already current instead of building it.
+        /// Use this to validate a commit: if something is stale, that IS the finding.
+        #[arg(long)]
+        frozen: bool,
+    },
+    /// Launch the renderer. Arguments are passed through.
+    Run {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+    /// Prove the checks can fail: apply each declared mutation, require its
+    /// gate to redden for its stated reason, restore.
+    Prove {
+        /// Only mutations targeting this gate.
+        #[arg(long)]
+        gate: Option<String>,
+    },
+    /// Check build.toml is internally consistent.
+    Validate,
+    /// What each check compares, and what it cannot see.
+    Gates,
+    /// The artifact graph.
+    Graph,
+}
+
+fn load() -> Result<Manifest, String> {
+    let p = root().join("build.toml");
+    let text = std::fs::read_to_string(&p).map_err(|e| format!("{}: {e}", p.display()))?;
+    toml::from_str(&text).map_err(|e| format!("build.toml is not valid against the schema:\n{e}"))
+}
+
+fn cmd_test(m: &Manifest, scope: Option<Scope>, frozen: bool) -> bool {
+    step(if frozen { "products: asserting currency (--frozen)" } else { "products" });
+    let mut ok = ensure_products(m, frozen);
+    if !ok && frozen {
+        // Everything below would test an artifact we just said is wrong.
+        println!("\nCHECK: FAILURES — see above");
+        return false;
     }
-    println!("golden views — rendered to scratch and byte-compared, never rebuilt:\n");
-    for v in &m.golden_view {
-        println!("  {:<12} {}", v.name, v.cmd);
+    for g in m.gate.iter().filter(|g| scope.is_none_or(|s| g.scope == s)) {
+        step(&format!("{} — {}", g.name, g.compare.as_deref().unwrap_or("")));
+        ok &= run_gate(g, m);
     }
     println!();
-    println!("gate order, with what each makes available to the gates after it:\n");
-    for g in &m.gate {
-        let p = provides(g.kind, m);
-        let needs = if g.needs.is_empty() { "—".into() } else { g.needs.join(", ") };
-        let provs = if p.is_empty() { "—".into() } else { p.join(", ") };
-        println!("  {:<20} needs: {:<24} provides: {}", g.name, needs, provs);
-    }
+    println!("{}", if ok { "CHECK-ALL: ALL GATES GREEN" } else { "CHECK-ALL: FAILURES — see above" });
+    ok
 }
 
-fn cmd_gates(m: &Manifest) {
-    for g in &m.gate {
-        println!("  {}", g.name);
-        if let Some(c) = &g.compare {
-            println!("    compares : {c}");
-        }
-        if let Some(b) = &g.blind_to {
-            println!("    blind to : {b}");
-        }
-    }
-    println!("\n  test floor: {} (ratchet)", m.settings.test_floor);
-    println!("  {} golden views, {} declared mutations", m.golden_view.len(), m.mutation.len());
-}
-
-fn cmd_validate(m: &Manifest) -> i32 {
-    let problems = validate(m);
-    if problems.is_empty() {
-        println!("PASS  build.toml is internally consistent");
-        println!("      {} artifacts, {} gates, {} mutations, all `needs` resolved and ordered",
-                 m.artifact.len(), m.gate.len(), m.mutation.len());
-        0
-    } else {
-        for p in &problems {
-            println!("FAIL  {p}");
-        }
-        println!("\n{} problem(s) in build.toml", problems.len());
-        1
-    }
-}
-
-fn main() -> std::process::ExitCode {
-    let arg = std::env::args().nth(1).unwrap_or_else(|| "validate".into());
+fn main() -> ExitCode {
+    let cli = Cli::parse();
     let m = match load() {
         Ok(m) => m,
         Err(e) => {
             eprintln!("FAIL  {e}");
-            return std::process::ExitCode::from(1);
+            return ExitCode::from(1);
         }
     };
-    let rc = match arg.as_str() {
-        "graph" => {
-            cmd_graph(&m);
-            0
+    let ok = match cli.cmd {
+        Cmd::Build => {
+            let mut ok = ensure_products(&m, false);
+            step("committed artifacts");
+            ok &= verify_committed(&m);
+            ok
         }
-        "gates" => {
-            cmd_gates(&m);
-            0
+        Cmd::Test { scope, frozen } => cmd_test(&m, scope, frozen),
+        Cmd::Run { args } => {
+            let (ok, out) = sh(
+                &format!("../target/release/glyph3d-native {}", args.join(" ")),
+                &native(),
+            );
+            print!("{out}");
+            ok
         }
-        "validate" => cmd_validate(&m),
-        other => {
-            eprintln!("unknown command {other}; try: validate | graph | gates");
-            2
+        Cmd::Prove { gate } => {
+            // The last un-ported piece. The mutation DECLARATIONS are data in
+            // build.toml and are already typed above; only the apply/restore
+            // machinery still lives in Python. One entry point either way.
+            let g = gate.map(|g| format!(" --gate {g}")).unwrap_or_default();
+            let (ok, out) = sh(&format!("python3 tools/glyph.py mutate{g}"), &root());
+            print!("{out}");
+            ok
+        }
+        Cmd::Validate => {
+            let problems = validate(&m);
+            if problems.is_empty() {
+                println!("PASS  build.toml is internally consistent");
+                println!(
+                    "      {} artifacts, {} gates, {} mutations, all `needs` resolved and ordered",
+                    m.artifact.len(),
+                    m.gate.len(),
+                    m.mutation.len()
+                );
+                true
+            } else {
+                for p in &problems {
+                    println!("FAIL  {p}");
+                }
+                println!("\n{} problem(s) in build.toml", problems.len());
+                false
+            }
+        }
+        Cmd::Gates => {
+            for g in &m.gate {
+                println!("  {}  [{:?}]", g.name, g.scope);
+                if let Some(c) = &g.compare {
+                    println!("    compares : {c}");
+                }
+                if let Some(b) = &g.blind_to {
+                    println!("    blind to : {b}");
+                }
+            }
+            println!("\n  test floor: {} (ratchet)", m.settings.test_floor);
+            println!("  {} golden views, {} declared mutations", m.golden_view.len(), m.mutation.len());
+            true
+        }
+        Cmd::Graph => {
+            for (name, a) in &m.artifact {
+                println!("  {name}  [{:?}]", a.class);
+                for o in &a.outputs {
+                    println!("    out:  {o}");
+                }
+                for i in &a.inputs {
+                    println!("    in:   {i}");
+                }
+                if let Some(c) = &a.counts {
+                    println!("    declared counts: {c:?}");
+                }
+                if let Some(n) = &a.note {
+                    println!("    note: {n}");
+                }
+                println!();
+            }
+            for v in &m.golden_view {
+                println!("  golden view {:<12} {}", v.name, v.cmd);
+            }
+            true
         }
     };
-    std::process::ExitCode::from(rc as u8)
+    if ok {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(1)
+    }
 }
