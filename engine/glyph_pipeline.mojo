@@ -416,6 +416,51 @@ struct PipelineResult(Copyable, Movable):
         self.batch_bounds = List[Float64]()
         self.stage_ns = List[Int](length=ST_COUNT, fill=0)
 
+    def ensure_lanes[witness: Bool](mut self, byte_len: Int):
+        """Size the per-byte lanes for `byte_len`, REUSING what is already here.
+
+        This is what makes a chunked fold cheap. A driver that processes a
+        corpus in chunks calls this once per chunk with the same result; only
+        the first chunk (or a larger one) allocates, and the rest reuse. Freeing
+        and reallocating per chunk would trade a memory win for allocator and
+        page-fault churn — which is the exact cost the chunking exists to
+        reduce, so it would be self-defeating.
+
+        Lists only GROW: a later smaller chunk keeps the larger buffer. Peak is
+        therefore set by the largest chunk, which is the number the caller
+        chooses, and never by the corpus.
+
+        The lanes are uninitialised on purpose, as they always were — coverage
+        is a three-way contract (decode writes every byte, the fold zeroes
+        non-leaders, the gap sweep zeroes unclaimed bytes), so REUSED memory is
+        no different from fresh memory here: both are fully written before they
+        are read. If that contract ever weakens, this reuse turns a latent bug
+        into a cross-chunk one, and `repo-verify-direct` is what would say so."""
+        var want_sm = byte_len * SM_STRIDE
+        if len(self.sm) < want_sm:
+            self.sm = List[Float32](unsafe_uninit_length=want_sm)
+        var want_gi = byte_len * GI_STRIDE
+        if len(self.gi) < want_gi:
+            self.gi = List[UInt32](unsafe_uninit_length=want_gi)
+        if len(self.fl) < byte_len:
+            self.fl = List[UInt32](unsafe_uninit_length=byte_len)
+        var want_lm = byte_len * LM_STRIDE
+        if len(self.lm) < want_lm:
+            self.lm = List[Float32](unsafe_uninit_length=want_lm)
+        var want_lc = byte_len * LC_STRIDE
+        if len(self.lc) < want_lc:
+            self.lc = List[UInt32](unsafe_uninit_length=want_lc)
+        # The witness tier: full-size only when witnessed. Elided keeps
+        # 1-element Lists so Witness pointers stay valid while every store is
+        # comptime-gated out.
+        var wlen = (byte_len if byte_len > 0 else 1) if witness else 1
+        if len(self.wm) < wlen:
+            self.wm = List[Float32](unsafe_uninit_length=wlen)
+        if len(self.wc) < wlen:
+            self.wc = List[UInt32](unsafe_uninit_length=wlen)
+        if len(self.ord_to_byte) < wlen:
+            self.ord_to_byte = List[UInt32](unsafe_uninit_length=wlen)
+
     def slots(mut self) -> Slots:
         # Origin-erased VIEW: the caller owns the Lists and must keep them alive
         # past every task that holds this (the drivers' `_ = len(...)` anchors).
@@ -1107,6 +1152,21 @@ def shard_lo(start: Int, stop: Int, workers: Int, w: Int) -> Int:
 def run_pipeline[o: ImmOrigin, witness: Bool = True](
     bytes: Span[UInt8, o], trie: Trie, items: List[Item]
 ) -> PipelineResult:
+    """Fold into a FRESH result. The allocating shape, and the one every suite
+    uses; `run_pipeline_into` is the same fold over a result the caller keeps.
+
+    The two are one implementation, not two paths: this allocates and delegates.
+    A chunked driver reusing one scratch across chunks must get bit-identical
+    output to a single whole-corpus call, and the only way to be sure of that is
+    for there to be nothing to diverge."""
+    var r = PipelineResult()
+    run_pipeline_into[witness=witness](r, bytes, trie, items)
+    return r^
+
+
+def run_pipeline_into[o: ImmOrigin, witness: Bool = True](
+    mut r: PipelineResult, bytes: Span[UInt8, o], trie: Trie, items: List[Item]
+):
     """The whole pipeline — the oracle's runPipeline, natively, sharded across
     cores. decode → ordered miss rebuild + leader count → fold per item (items in
     parallel) → paginate with the DERIVED fan stride (inactive items skipped, one
@@ -1131,18 +1191,7 @@ def run_pipeline[o: ImmOrigin, witness: Bool = True](
     # ord_to_byte's memset STAYS (witnessed only) — the fold fills just
     # [byte_start, +ord), so its tail has no writer.
     var _t = perf_counter_ns()
-    var r = PipelineResult()
-    r.sm = List[Float32](unsafe_uninit_length=byte_len * SM_STRIDE)
-    r.gi = List[UInt32](unsafe_uninit_length=byte_len * GI_STRIDE)
-    r.fl = List[UInt32](unsafe_uninit_length=byte_len)
-    r.lm = List[Float32](unsafe_uninit_length=byte_len * LM_STRIDE)
-    r.lc = List[UInt32](unsafe_uninit_length=byte_len * LC_STRIDE)
-    # The witness tier: full-size only when witnessed. Elided keeps 1-element
-    # Lists so Witness pointers are valid while every store is comptime-gated out.
-    var wlen = (byte_len if byte_len > 0 else 1) if witness else 1
-    r.wm = List[Float32](unsafe_uninit_length=wlen)
-    r.wc = List[UInt32](unsafe_uninit_length=wlen)
-    r.ord_to_byte = List[UInt32](unsafe_uninit_length=wlen)
+    r.ensure_lanes[witness=witness](byte_len)
     comptime if witness:
         unsafe_memset_zero(r.ord_to_byte.unsafe_ptr(), len(r.ord_to_byte))
     var slots = r.slots()
@@ -1373,4 +1422,3 @@ def run_pipeline[o: ImmOrigin, witness: Bool = True](
     r.stage_ns[ST_BOUNDS] = perf_counter_ns() - _t
     r.item_bounds = item_bounds^
     r.batch_bounds = batch_bounds^
-    return r^

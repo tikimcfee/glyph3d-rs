@@ -548,6 +548,74 @@ mod tests {
         );
     }
 
+    /// THE CHUNK BOUNDARY, which no gate reaches.
+    ///
+    /// `Strategy::Direct` folds the corpus in chunks of `DIRECT_CHUNK_BYTES`
+    /// (4 MiB, `engine/ffi.mojo`), reusing one set of lane arrays across them so
+    /// peak memory is set by the chunk and not the corpus. `repo-verify-direct`
+    /// runs on `fixtures/g-pick-repo` — 0.4 MB, ONE chunk — so the gate that
+    /// covers this path cannot see the boundary at all. Without this test the
+    /// whole feature is unexercised by anything that runs.
+    ///
+    /// Items are ATOMIC to a chunk, so the shape that matters is several items
+    /// straddling a boundary: this builds nine of them, ~5.4 MB total, which is
+    /// two chunks with the split falling mid-corpus rather than at an edge.
+    #[test]
+    fn a_corpus_larger_than_one_chunk_agrees_across_strategies() {
+        // Varied line lengths and a blank line, so the fold has wraps and the
+        // compaction has something to drop on both sides of the boundary.
+        let unit: Vec<u8> = (0..30_000u32)
+            .flat_map(|i| format!("let x{i} = {i};\n\n").into_bytes())
+            .collect();
+        let bytes: Vec<Vec<u8>> = (0..9).map(|_| unit.clone()).collect();
+        let total: usize = bytes.iter().map(|b| b.len()).sum();
+        assert!(
+            total > 4 * 1024 * 1024,
+            "this corpus must exceed DIRECT_CHUNK_BYTES or the test is vacuous \
+             — {total} bytes",
+        );
+
+        let colors: Vec<Vec<u32>> =
+            bytes.iter().map(|b| crate::text::colorize_leaders(b)).collect();
+        let items: Vec<LayoutItem<'_>> = bytes
+            .iter()
+            .enumerate()
+            .map(|(i, b)| LayoutItem {
+                bytes: b,
+                params: ItemParams { line_height: 1.25, ..Default::default() },
+                group_id: i as u32,
+                paint: Paint::PerRecord(&colors[i]),
+            })
+            .collect();
+
+        let mut batched = MojoLayout::new(Strategy::Batched);
+        batched.load_trie_file(&trie()).expect("trie");
+        let mut a = GlyphArena::new();
+        let want = batched.layout_items(&items, &mut a).expect("batched");
+
+        let mut direct = MojoLayout::new(Strategy::Direct);
+        direct.load_trie_file(&trie()).expect("trie");
+        let mut b = GlyphArena::new();
+        let got = direct.layout_items(&items, &mut b).expect("direct");
+
+        for (i, (w, g)) in want.iter().zip(got.iter()).enumerate() {
+            assert!(w.bit_eq(g), "item {i} differs:\n  batched: {w:?}\n  direct:  {g:?}");
+        }
+        assert_eq!(
+            bytemuck::cast_slice::<_, u8>(a.instances()),
+            bytemuck::cast_slice::<_, u8>(b.instances()),
+            "arenas differ across the chunk boundary",
+        );
+        // ANTI-VACUITY: the corpus must actually produce glyphs, and the later
+        // items must land past the first chunk's worth of slots — otherwise a
+        // silently-truncated second chunk would compare equal to nothing.
+        assert!(!a.is_empty(), "the corpus must produce instances");
+        assert!(
+            want[8].slot_base as usize > total / 2,
+            "the last item must begin well past the first chunk",
+        );
+    }
+
     /// The seam-level twin of `engine::tests::a_nan_pitch_cannot_reach_the_
     /// engine_through_load_item`: proves the trait's PROVIDED validation runs,
     /// which is what makes forgetting impossible for every future backend.

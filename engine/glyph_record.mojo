@@ -560,7 +560,11 @@ def direct_write_all[po: Origin[mut=True]](
         return placements^
 
     # Phase timing is ALWAYS ON, five `perf_counter_ns` calls against a pass that
-    # runs in milliseconds. The alternative considered and rejected was an
+    # runs in milliseconds. The lanes ACCUMULATE rather than assign, because the
+    # caller drives this once per CHUNK: assigning made every lane report the
+    # last chunk only, which read as a 30x speedup and left the rest in
+    # `unattributed` — a number meaning something other than its name, found by
+    # the unattributed lane it was hiding in. The alternative considered and rejected was an
     # env-var profile flag: it would have been a second code path through the
     # hottest loop in the load, reachable from no verb, and off by default —
     # which is how an instrument becomes one nobody runs.
@@ -590,7 +594,7 @@ def direct_write_all[po: Origin[mut=True]](
             gr_item.append(i)
             at = end
     var n_gr = len(gr_at)
-    prof[unsafe_offset = DW_BUILD] = perf_counter_ns() - _t0
+    prof[unsafe_offset = DW_BUILD] += perf_counter_ns() - _t0
     var _t = perf_counter_ns()
 
     # ── pass A: count, in parallel ──────────────────────────────────────────
@@ -603,7 +607,7 @@ def direct_write_all[po: Origin[mut=True]](
         rp[unsafe_offset = t] = rs[0]
         sp[unsafe_offset = t] = rs[1]
     parallelize(_count_task, n_gr)
-    prof[unsafe_offset = DW_COUNT] = perf_counter_ns() - _t
+    prof[unsafe_offset = DW_COUNT] += perf_counter_ns() - _t
     _t = perf_counter_ns()
 
     # ── the prefix: serial over GRAINS, which is O(items + bytes/grain) and
@@ -623,7 +627,7 @@ def direct_write_all[po: Origin[mut=True]](
         slot_at += gr_surv[t]
         paint_at += gr_rec[t]
 
-    prof[unsafe_offset = DW_PREFIX] = perf_counter_ns() - _t
+    prof[unsafe_offset = DW_PREFIX] += perf_counter_ns() - _t
     _t = perf_counter_ns()
 
     # Paint is indexed by RECORD and the host sizes it per item, so the check is
@@ -660,7 +664,7 @@ def direct_write_all[po: Origin[mut=True]](
         )
         wp[unsafe_offset = t] = rs[1]
     parallelize(_write_task, n_gr)
-    prof[unsafe_offset = DW_WRITE] = perf_counter_ns() - _t
+    prof[unsafe_offset = DW_WRITE] += perf_counter_ns() - _t
     _t = perf_counter_ns()
     for t in range(n_gr):
         if wrote[t] != gr_surv[t]:
@@ -690,5 +694,5 @@ def direct_write_all[po: Origin[mut=True]](
                 placements[i].ink_min[k] = gbox[b + DP_INK_MIN + k]
             if gbox[b + DP_INK_MAX + k] > placements[i].ink_max[k]:
                 placements[i].ink_max[k] = gbox[b + DP_INK_MAX + k]
-    prof[unsafe_offset = DW_MERGE] = perf_counter_ns() - _t
+    prof[unsafe_offset = DW_MERGE] += perf_counter_ns() - _t
     return placements^

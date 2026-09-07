@@ -279,10 +279,39 @@ prefix and merge all at noise), and `dw_write` is what first-touches the arena.
 So the memory work and the remaining time are the same target, not two.
 
 **43% of that peak is the fold's lane arrays, and they are dead the instant the
-write has read them.** A chunked fold-then-write over item groups would cap lane
-memory at the chunk rather than the corpus and roughly halve peak RSS.
-`run_streaming` in `glyph_record.mojo` already prototypes the shape for the
-record path. The loop is worth 1.7x; the cliff is worth 6x.
+write has read them.**
+
+**DONE 2026-09-07.** The direct path folds in chunks of `DIRECT_CHUNK_BYTES`
+(4 MiB), reusing ONE set of lane arrays across them — `PipelineResult::
+ensure_lanes` grows and never shrinks, so the first chunk allocates and the rest
+cost nothing. Freeing per chunk would have swapped a memory win for allocator
+and page-fault churn, which is the cost being attacked. An item is ATOMIC to a
+chunk (the fold is sequential within one), so a chunk is a group of items, never
+a split one; `run_streaming` is the same shape for the record path and is where
+it came from.
+
+| corpus | peak RSS before | after | backend before | after |
+|---|---|---|---|---|
+| 15.6 MB | 1.451 GB | 1.033 GB | 0.143 s | 0.112 s |
+| 47.1 MB | 4.088 GB | 2.694 GB (−34%) | 0.530 s | 0.333 s |
+| 151.8 MB | 6.433 GB | 7.467 GB | **4.748 s (32.0 MB/s)** | **1.168 s (130.0 MB/s)** |
+
+**The 151.8 MB row is the cliff, and it reads backwards until you see why.** RSS
+went UP because the old path was thrashing: "maximum resident" under memory
+pressure is what the OS let it keep, not what it asked for. The chunked path
+asks for less, gets to keep more, and runs **4.1x** faster at a throughput that
+no longer degrades with corpus size (130.0 MB/s against 141.3 at 47 MB, where
+the old path fell from 88.8 to 32.0). Below the cliff the win shows up as RSS
+instead; above it, as time. Same cause.
+
+Bit-exact throughout: 43,424,013 instances agree with the batched path at
+47.1 MB, both wrap modes green on the gate fixture.
+
+**The gate could not see this and now a test can.** `repo-verify-direct` runs on
+a 0.4 MB corpus against a 4 MiB chunk — one chunk, boundary never crossed. A
+5.4 MB nine-item test in `layout_mojo` covers it, carries its own anti-vacuity
+assertions (it caught its first draft being 2.07 MB and refused), and reddens
+when the chunk rebasing is removed.
 
 **Still open here:** the default is still `naive` (per-item). Making `direct`
 the default is a behaviour change and a re-baseline decision, not a refactor.
