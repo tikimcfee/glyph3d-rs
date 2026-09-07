@@ -611,7 +611,7 @@ fn run_engine_smoke(file: &Path, trie: Option<&Path>, loops: u32) {
     }
     let dt = t0.elapsed();
 
-    let records = eng.records();
+    let records = eng.read_back().records;
     assert_eq!(records.len() as u64, last_count, "record copy count mismatch");
 
     let total_mb = bytes.len() as f64 * loops as f64 / 1e6;

@@ -61,11 +61,14 @@ a backend or a caller; the short version:
   trait, so no method a caller holds RETURNS a position. That is what would let
   a device-resident backend keep glyphs on the device. **It does NOT mean the
   readback is gone** — this file claimed that until 2026-09-04 and it was wrong:
-  `MojoLayout::run` calls `engine.records()` unconditionally
-  (`layout_mojo.rs:78` and `:103`), because host-side `compact_records_into`
-  needs the records. 3.10 GB still crosses the FFI on a 97 MB corpus. The copy
-  dies when compaction moves to the data, not when a trait hides it. Do not
-  widen `LayoutGlyphs` to return records.
+  `MojoLayout::run` calls `engine.read_back()` unconditionally, because
+  host-side `compact_records_into` needs the records. 3.10 GB still crosses the
+  FFI on a 97 MB corpus. The copy dies when compaction moves to the data, not
+  when a trait hides it. Do not widen `LayoutGlyphs` to return records.
+  MEASURED 2026-09-07: that copy is 9-22% of backend time, not the bottleneck
+  — the CPU fold is, at 58-77%. The volume is a memory argument, not a time
+  one. `--repo-scan-only` prints the split; the table is under item 3 of
+  `engine/BACKEND-PLAN.md`.
 - `ItemParams::validate` runs in `LayoutGlyphs::layout_items`, a PROVIDED
   method. Implement `layout_validated_items`; a backend cannot forget the
   guard because it never calls it.

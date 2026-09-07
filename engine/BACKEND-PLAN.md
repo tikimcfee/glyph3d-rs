@@ -62,13 +62,36 @@ detail.
 **The spine.** Each of these changes what the next one is deciding about:
 
 1. **Measure the fold (item 4).** Cheap, and it decides whether device-side
-   folding is worth building at all. No honest number exists today — both
-   existing benchmarks measure something other than the fold. Doing this first
-   means the substrate question stops being answered by argument.
-2. **The readback (item 3).** 3.10 GB per load on a 97 MB corpus, for records
-   the renderer does not need. Worth doing whatever item 4 concludes: the copy
-   is waste under either substrate. This is the finding the layout seam was
-   built to make fixable, so it is the thesis coming due.
+   folding is worth building at all. Doing this first means the substrate
+   question stops being answered by argument — and the 2026-09-07 readback
+   measurement raised the stakes rather than settling them: the CPU fold is
+   58-77% of backend time, so it is the fold, not the transport, that the load
+   time is currently made of.
+
+   The existing benchmark is `engine/gpu_pipeline.mojo --bench`. It is not
+   dishonest — its docstring is explicit that the timed region spans the
+   dispatches AND the readbacks, "timing only the kernels would flatter the
+   GPU by hiding the part a real caller pays." That was true under the
+   `-> Vec<GlyphRecord>` contract. The seam deleted the thing that made it
+   true, and the CPU side of the same comparison pays no transport at all, so
+   the printed ratio is fold-vs-fold-plus-a-tax-one-side-pays. Two known holes
+   to close when this runs: the timed region needs splitting at the fences, and
+   `bench_scaling` builds `item_count = 1`, which amortizes the mid-chain host
+   round trip (resolveX -> host derives the fan stride -> back to device) over
+   exactly one item when a real load has thousands.
+
+   That mid-chain hop is NOT worth benchmarking as a load test: `derive_stride`
+   (`glyph_pipeline.mojo:838`) is `max_row_extent + item.page_gap_x`, three
+   lines of per-item arithmetic, and the hop exists to mirror the CPU driver
+   for conformance rather than out of necessity. It is a one-kernel map away
+   from not existing. Measure around it; do not enshrine it.
+2. **The readback (item 3), as device-side compaction — not as a borrowing
+   accessor.** MEASURED 2026-09-07 (table under item 3): the readback is
+   9-22% of backend time, not the bottleneck. The fold is, at 58-77%. So this
+   stays second, and it stays whole: killing the copy alone buys the smaller
+   half of a cost that dies entirely when compaction moves. The volume claim is
+   untouched — 3.10 GB on a 97 MB corpus is a memory argument, and RSS is what
+   OOMs a device.
 3. **Bounds step 4 (the FFI accessor)** — but only after the readback, and this
    ordering is the correction earned on 2026-09-07. The plan called it "replace
    the host reduction with the engine box"; they are NOT interchangeable — the
@@ -133,10 +156,62 @@ Hide is *not* a delta — it needs a visibility lane, and `flags` is its home.
 Land the identity case first: a table of zeros must reproduce today's layout
 bit-exact, which the corpus can check without anyone's eye.
 
-**3. The readback.** `MojoLayout::run` calls `engine.records()` unconditionally
-in both strategies — 3.10 GB per load on a 97 MB corpus, 1.44 s of staging,
-8.53 GB peak RSS. `VerifyLayout` gates the API, not the copy. Compaction has to
-run where the data already is.
+**3. The readback.** `MojoLayout::run` calls `engine.read_back()` unconditionally
+in both strategies. `VerifyLayout` gates the API, not the copy. Compaction has
+to run where the data already is.
+
+**MEASURED 2026-09-07, and the headline is not what this item assumed.** Until
+now the only number here was `stage 1.438s` from `out/g-windowed-smoke.log`
+(2026-08-31) — which is PRE-SEAM, on the per-item route, and brackets the fold,
+the readback and compaction together under phase boundaries that no longer
+exist. `backend` is now split at the source (`layout_mojo::BackendPhases`), and
+`unattributed` is printed alongside so the four parts can be checked against
+the whole. Six corpora, both FFI strategies, `--repo-scan-only`, M2:
+
+| source | strategy | backend | fold | readback | compact |
+|---|---|---|---|---|---|
+| 6.5 MB | per-item | 0.299 s | 75% | 10% | 15% |
+| 6.5 MB | batched | 0.185 s | 59% | 21% | 19% |
+| 15.6 MB | per-item | 0.524 s | 70% | 12% | 18% |
+| 15.6 MB | batched | 0.446 s | 59% | 22% | 19% |
+| 47.1 MB | per-item | 1.666 s | 71% | 12% | 17% |
+| 47.1 MB | batched | 1.338 s | 58% | 22% | 20% |
+| 61.9 MB | per-item | 3.347 s | 77% | 9% | 14% |
+| 61.9 MB | batched | 2.806 s | 39% | 19% | 41% |
+| 1.40 GB | per-item | 84.35 s | 59% | 9% | 32% |
+
+**The readback is 9-22% of backend time. It is not the bottleneck; the fold
+is.** That is the "oopsie" Ivan named on 2026-09-04 — deciding the seam's shape
+against a cost that turns out to be another version of the CPU bottleneck —
+arriving exactly where he predicted it would, which is why the measurement went
+first.
+
+Read it carefully, though, because it does not say the item is wrong:
+
+- **The volume claim stands and is a MEMORY argument, not a time one.**
+  96,860,762 records x 32 B = 3.10 GB is arithmetic and correct; the 1.40 GB
+  corpus moves 44.39 GB. RSS is what OOMs a device, and no ratio above touches
+  that.
+- **The ordering matters more than the totals.** The fold's 58-77% is the CPU
+  fold. Move the fold to the device and the remaining costs become the whole of
+  what is left — so the readback is not the bottleneck TODAY and becomes it the
+  moment item 4 succeeds. Measuring in the other order would have hidden this.
+- **Compaction is the larger of the two host costs**, 14-41% against the
+  readback's 9-22%, and the two are not independent: device-side compaction
+  deletes both, because nothing is left to read back.
+- **Batched trades a worse readback for a much faster fold** and wins overall.
+  Same bytes, ~2x the readback cost — one 1.85 GB allocation is worse than 9241
+  small ones. At 61.9 MB its compaction also goes 2.5x (0.463 s -> 1.153 s),
+  which is a cache effect, not more work: per-item compacts records still hot
+  from the copy that just wrote them.
+
+**So the decision this measurement was for:** a borrowing accessor (hand out a
+pointer instead of `vec![default; n]` + `copy_slots`) buys the readback alone —
+9-22% of backend, and it is the half that dies anyway when compaction moves.
+It is not worth building as its own step. **Go straight to device-side
+compaction**, which takes readback and compact together, and do it after the
+fold measurement (item 4), not before — because that is the change that decides
+how much is left to win.
 
 **4. Measure the fold, then decide the substrate.** No honest number exists:
 native's GPU benchmark times 36 B-per-source-byte of readback inside its timed

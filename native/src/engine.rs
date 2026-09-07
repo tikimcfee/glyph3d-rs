@@ -19,6 +19,7 @@
 
 use std::ffi::c_void;
 use std::path::Path;
+use std::time::{Duration, Instant};
 
 use crate::layout::{GlyphRecord, ItemParams, LayoutError};
 
@@ -337,18 +338,48 @@ impl Engine {
         unsafe { glyph_engine_slot_count(self.handle) }
     }
 
-    /// Copy the last load's records out of the engine.
-    pub fn records(&self) -> Vec<GlyphRecord> {
+    /// Copy the last load's records out of the engine — THE READBACK the plan
+    /// (`engine/BACKEND-PLAN.md` item 3) exists to delete.
+    ///
+    /// It returns its own cost split in two, because the plan has always
+    /// reasoned about this as one number and the two halves have different
+    /// fixes. `alloc` is the host `Vec` — allocation plus the zero-fill of
+    /// `n * 32 B` that `copy` then immediately overwrites; it dies if the
+    /// engine hands out a pointer instead of filling a buffer. `copy` is the
+    /// FFI memcpy itself; it dies only when compaction moves to where the data
+    /// already is. Measuring them apart is what decides which fix is worth
+    /// building, so the split is part of the API rather than a probe someone
+    /// has to remember to add.
+    ///
+    /// CAVEAT, and it is the reason `alloc` is reported rather than trusted:
+    /// a large allocation is lazily backed on macOS, so some of the zero-fill
+    /// is paid as page faults DURING `copy`. `alloc` is therefore a floor on
+    /// the buffer's cost, not the whole of it, and `copy` is an inflated
+    /// measure of the memcpy alone. Their SUM is honest; each alone is not.
+    pub fn read_back(&self) -> Readback {
         let n = self.slot_count() as usize;
-        let mut out = vec![GlyphRecord::default(); n];
+        let t = Instant::now();
+        let mut records = vec![GlyphRecord::default(); n];
+        let alloc = t.elapsed();
+        let t = Instant::now();
         if n > 0 {
-            let written =
-                unsafe { glyph_engine_copy_slots(self.handle, out.as_mut_ptr() as *mut u32, n) };
+            let written = unsafe {
+                glyph_engine_copy_slots(self.handle, records.as_mut_ptr() as *mut u32, n)
+            };
             debug_assert_eq!(written as usize, n);
-            out.truncate(written as usize);
+            records.truncate(written as usize);
         }
-        out
+        let copy = t.elapsed();
+        Readback { records, alloc, copy }
     }
+}
+
+/// The readback and what it cost, from [`Engine::read_back`]. The two duration
+/// fields are documented there, including why only their sum is trustworthy.
+pub struct Readback {
+    pub records: Vec<GlyphRecord>,
+    pub alloc: Duration,
+    pub copy: Duration,
 }
 
 impl Drop for Engine {

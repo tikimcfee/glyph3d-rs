@@ -24,7 +24,7 @@ use crate::layout::{
     diff_backends, BackendOutput, GlyphArena, GlyphRecord, ItemParams, LayoutGlyphs, LayoutItem,
     Paint, VerifyLayout,
 };
-use crate::layout_mojo::{MojoLayout, Strategy};
+use crate::layout_mojo::{BackendPhases, MojoLayout, Strategy};
 use crate::text::{self, StagedText};
 
 /// Per-file read cap. Doubles as the ordinal-wall guard (2^24 B = 16 MiB).
@@ -311,6 +311,10 @@ pub struct LoadStats {
     /// the extent reductions — they moved behind the seam, which is the whole
     /// point — so it is no longer comparable to the pre-seam "engine" number.
     pub backend: Duration,
+    /// `backend`, split into the fold, the readback and compaction. The three
+    /// have three different fixes, and item 3 of the plan is a decision
+    /// between two of them, so the sum alone cannot answer it.
+    pub phases: BackendPhases,
     pub stage: Duration,
     pub layout: Duration,
     pub files: usize,
@@ -597,6 +601,7 @@ pub fn load_repo(
     let stats = LoadStats {
         walk: walk_dur,
         backend: backend_dur,
+        phases: backend.phases(),
         stage: stage_dur,
         layout: layout_dur,
         files: walk.files.len(),
@@ -639,7 +644,7 @@ pub fn rederive_records(
     let mut eng = Engine::new();
     eng.load_trie_file(trie).expect("pick: failed to load engine trie");
     eng.load_item(&bytes, item).expect("pick: engine re-run failed");
-    Ok((eng.records(), bytes))
+    Ok((eng.read_back().records, bytes))
 }
 
 impl RepoLoad {
@@ -763,6 +768,22 @@ impl RepoLoad {
             s.stage.as_secs_f64(),
             s.layout.as_secs_f64(),
             (s.walk + s.backend + s.stage + s.layout).as_secs_f64(),
+        );
+        // The split the plan's item 3 is a decision about. `unattributed` is
+        // the part of `backend` these four timers did not claim; it should be
+        // near zero, and if it is not, one of them is measuring the wrong span.
+        let p = s.phases;
+        let attributed = p.fold + p.readback() + p.compact;
+        println!(
+            "  backend: fold {:.3}s | readback {:.3}s (alloc {:.3}s + copy {:.3}s, {:.2} GB) \
+             | compact {:.3}s | unattributed {:.3}s",
+            p.fold.as_secs_f64(),
+            p.readback().as_secs_f64(),
+            p.readback_alloc.as_secs_f64(),
+            p.readback_copy.as_secs_f64(),
+            (s.records * 32) as f64 / 1.073_741_824e9,
+            p.compact.as_secs_f64(),
+            s.backend.saturating_sub(attributed).as_secs_f64(),
         );
     }
 }

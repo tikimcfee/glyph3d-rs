@@ -14,15 +14,22 @@
 //! shape `--repo-verify` was built to check — and with the Rust backend the same
 //! machinery diffs Mojo against Rust instead, with nothing new written.
 //!
-//! WHAT STAGE 3 CHANGES HERE. `layout_validated_items` currently ends with
-//! `engine.records()` — the 36 B-per-source-byte readback the seam exists to
-//! delete — followed by a host-side `compact_records_into`. The device path
-//! replaces both with a compaction kernel writing the arena directly and a
-//! bounds kernel filling the extents, and `layout_validated_items_recording`
-//! keeps the readback for the gates that ask for it. The signatures do not
-//! move.
+//! WHAT ITEM 3 OF THE PLAN CHANGES HERE. `layout_validated_items` currently
+//! ends with `engine.read_back()` — the 32 B-per-record readback the seam
+//! exists to delete — followed by a host-side `compact_records_into`. The
+//! device path replaces BOTH with a compaction kernel writing the arena
+//! directly and a bounds kernel filling the extents, and
+//! `layout_validated_items_recording` keeps the readback for the gates that
+//! ask for it. The signatures do not move.
+//!
+//! It replaces both because the measurement says the halves are not worth
+//! separating: 2026-09-07, the readback is 9-22% of backend time and
+//! compaction 14-41%, and killing the copy alone (a borrowing accessor in
+//! place of `vec![default; n]` + `copy_slots`) buys only the half that dies
+//! anyway when compaction moves. `BackendPhases` below is what measured it.
 
 use std::path::Path;
+use std::time::{Duration, Instant};
 
 use crate::engine::Engine;
 use crate::layout::{
@@ -42,14 +49,53 @@ pub enum Strategy {
     PerItem,
 }
 
+/// Where a load's time goes inside the backend, accumulated across items.
+///
+/// This exists because the plan has been reasoning from ONE number. The
+/// 1.438 s it quotes for staging came from `out/g-windowed-smoke.log`
+/// (2026-08-31, pre-seam, per-item route) and brackets the fold, the readback
+/// and compaction together — three costs with three different fixes. Splitting
+/// them is what decides whether the readback is worth attacking by handing out
+/// a pointer, or only by moving compaction to the device.
+///
+/// The sum of these four is the whole of `backend` in the phases line, so a
+/// gap between them is itself a finding.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct BackendPhases {
+    /// The Mojo fold, across the FFI: `load_items` or `load_item`.
+    pub fold: Duration,
+    /// Host allocation + zero-fill of the readback buffer. See
+    /// [`crate::engine::Engine::read_back`] — lazily backed, so this is a floor.
+    pub readback_alloc: Duration,
+    /// The FFI memcpy of the wire stream.
+    pub readback_copy: Duration,
+    /// `compact_records_into`: drop blanks, repack 32 -> 48 B, reduce extents.
+    pub compact: Duration,
+}
+
+impl BackendPhases {
+    /// What the readback costs in total — the number the plan wants, and the
+    /// only one of the two halves that is trustworthy alone.
+    pub fn readback(&self) -> Duration {
+        self.readback_alloc + self.readback_copy
+    }
+}
+
 pub struct MojoLayout {
     engine: Engine,
     strategy: Strategy,
+    phases: BackendPhases,
 }
 
 impl MojoLayout {
     pub fn new(strategy: Strategy) -> Self {
-        Self { engine: Engine::new(), strategy }
+        Self { engine: Engine::new(), strategy, phases: BackendPhases::default() }
+    }
+
+    /// Where the last load's time went. Accumulates across calls; a caller
+    /// timing one load owns a fresh backend, which every caller today does.
+    pub fn phases(&self) -> BackendPhases {
+        self.phases
     }
 
     /// The one implementation both trait methods delegate to. `records_out`,
@@ -74,13 +120,19 @@ impl MojoLayout {
                     descs.push((blob.len() as u64, item.bytes.len() as u64, item.params));
                     blob.extend_from_slice(item.bytes);
                 }
+                let t = Instant::now();
                 let counts = self.engine.load_items(&blob, &descs)?;
-                let all = self.engine.records();
+                self.phases.fold += t.elapsed();
+                let back = self.engine.read_back();
+                self.phases.readback_alloc += back.alloc;
+                self.phases.readback_copy += back.copy;
+                let all = back.records;
                 assert_eq!(
                     counts.iter().sum::<u64>() as usize,
                     all.len(),
                     "batch per-item counts do not sum to the record count",
                 );
+                let t = Instant::now();
                 let mut record_base = 0usize;
                 for (index, item) in items.iter().enumerate() {
                     let n = counts[index] as usize;
@@ -93,20 +145,28 @@ impl MojoLayout {
                     ));
                     record_base += n;
                 }
+                self.phases.compact += t.elapsed();
                 if let Some(sink) = records_out.as_deref_mut() {
                     *sink = all;
                 }
             }
             Strategy::PerItem => {
                 for item in items {
+                    let t = Instant::now();
                     self.engine.load_item(item.bytes, &item.params)?;
-                    let records = self.engine.records();
+                    self.phases.fold += t.elapsed();
+                    let back = self.engine.read_back();
+                    self.phases.readback_alloc += back.alloc;
+                    self.phases.readback_copy += back.copy;
+                    let records = back.records;
+                    let t = Instant::now();
                     placements.push(compact_records_into(
                         &records,
                         item.paint,
                         item.group_id,
                         arena,
                     ));
+                    self.phases.compact += t.elapsed();
                     if let Some(sink) = records_out.as_deref_mut() {
                         sink.extend_from_slice(&records);
                     }

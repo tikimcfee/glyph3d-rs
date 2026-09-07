@@ -60,10 +60,12 @@
 //!   at all; a gate that needs them asks [`VerifyLayout`], a separate trait.
 //!   That is what lets a device-resident backend keep glyphs on the device.
 //!   IT IS NOT THE SAME AS DELETING THE READBACK, and this header used to claim
-//!   it was: `MojoLayout::run` calls `engine.records()` unconditionally in both
-//!   strategies, because `compact_records_into` runs on the host and needs
+//!   it was: `MojoLayout::run` calls `engine.read_back()` unconditionally in
+//!   both strategies, because `compact_records_into` runs on the host and needs
 //!   them. 3.10 GB still crosses the FFI on every load. `VerifyLayout` gates
 //!   the API, not the copy — the copy dies when compaction moves to the data.
+//!   What that copy COSTS is measured (2026-09-07): 9-22% of backend time, so
+//!   the 3.10 GB is a memory argument and not the load's bottleneck.
 //! - **`text::reference_layout`.** It is a second, independently-derived
 //!   realization of the same layout and its whole value is that it shares no
 //!   lineage with the fold. It stays where it is. See `engine/PORT-PLAN.md`.
