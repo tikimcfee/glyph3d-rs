@@ -394,6 +394,212 @@ mod tests {
     use super::*;
     use crate::layout::{ItemParams, Paint};
 
+    /// HARVESTED from the adversarial audit branch (`57d13b3`,
+    /// `audit/direct-arena-2026-09-07`), which was written against the direct
+    /// path before its defects were fixed and then deleted. Its FINDING tests
+    /// are superseded by the fixed-behaviour ones below; these are the parts
+    /// main never had — the invariants that were repaired without being tested.
+    ///
+    /// Deterministic xorshift so a failure is reproducible from the seed alone;
+    /// a dev-dependency for this would be a dependency for one struct.
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            self.0 = x;
+            x
+        }
+        fn byte(&mut self) -> u8 {
+            (self.next() >> 24) as u8
+        }
+    }
+
+    /// Byte strings built to pull the two UTF-8 walkers apart: the host's
+    /// `colorize_leaders` and the engine's decode. Lone continuations, leads
+    /// with no continuation, truncation at EOF, out-of-Unicode leads, every
+    /// single byte value on its own, and noise.
+    fn adversarial_corpus() -> Vec<Vec<u8>> {
+        let mut out: Vec<Vec<u8>> = vec![
+            b"".to_vec(),
+            b"\n".to_vec(),
+            b"fn main() {\n    let x = 1;\n}\n".to_vec(),
+            b"\xC3AB\n".to_vec(),      // lead, no continuation
+            b"\xE0AB\n".to_vec(),
+            b"\xF0ABC\n".to_vec(),
+            b"ab\xC3".to_vec(),         // truncated at EOF
+            b"ab\xF0\x9F".to_vec(),
+            b"\x80\x80\x80\n".to_vec(),  // lone continuations
+            b"a\xBFb\n".to_vec(),
+            b"\xF7\xBF\xBF\xBF\n".to_vec(), // out-of-Unicode leads (block-0 contract)
+            b"\xF5\xF6\xF7\n".to_vec(),
+            "h\u{e9}llo w\u{f6}rld\n\u{f1}\n\u{1f30d}\u{1f30e}\n".as_bytes().to_vec(),
+            b"a\tb\r\n\0c\n".to_vec(),
+        ];
+        for b in 0u16..=255 {
+            out.push(vec![b as u8]);
+        }
+        let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
+        for len in [1usize, 2, 3, 7, 33, 257, 1024] {
+            for _ in 0..8 {
+                out.push((0..len).map(|_| rng.byte()).collect());
+            }
+        }
+        out
+    }
+
+    /// THE INVARIANT THE PAINT BOUND RESTS ON, which was repaired before it was
+    /// tested. Paint is indexed by RECORD, and the host builds that array with
+    /// `colorize_leaders` while the engine counts records in its own decoder.
+    /// If those two ever disagreed about which bytes are leaders, the direct
+    /// path would read off the end of the caller's colour array — in parallel,
+    /// across grains. `GE_PAINT_TOO_SHORT` refuses that at the boundary now;
+    /// this says the refusal should never have cause to fire.
+    ///
+    /// The audit demonstrated the break: changing `colorize_leaders`'s
+    /// `id += 1` to `id += n`, which is what "make it UTF-8-correct" looks
+    /// like, over-reads on `[c3 41 42 0a]` — three modules from the unsafe read.
+    #[test]
+    fn the_paint_length_and_the_engine_record_count_agree_on_every_byte_string() {
+        let mut backend = MojoLayout::new(Strategy::Batched);
+        backend.load_trie_file(&trie()).expect("trie");
+        let mut multibyte_seen = false;
+        for bytes in adversarial_corpus() {
+            let colors = crate::text::colorize_leaders(&bytes);
+            let items = [LayoutItem {
+                bytes: &bytes,
+                params: ItemParams { line_height: 1.25, ..Default::default() },
+                group_id: 0,
+                paint: Paint::Flat(0),
+            }];
+            let mut arena = GlyphArena::new();
+            let places = backend.layout_items(&items, &mut arena).expect("layout");
+            assert_eq!(
+                places[0].record_count as usize,
+                colors.len(),
+                "record/colour disagreement on {bytes:02x?}",
+            );
+            // The arena bound the direct path sizes against: leaders <= bytes.
+            assert!(
+                places[0].record_count as usize <= bytes.len(),
+                "leaders exceeded bytes on {bytes:02x?}",
+            );
+            assert!(places[0].slot_count <= places[0].record_count);
+            if colors.len() < bytes.len() {
+                multibyte_seen = true;
+            }
+        }
+        // ANTI-VACUITY: if every string were one record per byte, the
+        // interesting half of this claim was never exercised.
+        assert!(multibyte_seen, "the corpus must contain multibyte sequences");
+    }
+
+    /// The whole render-visible contract over the adversarial corpus PLUS a
+    /// ~5-grain item whose blanks are unevenly distributed, so each grain's
+    /// survivor count differs from its record count — which is the scan's core
+    /// invariant (slots advance by survivors, paint by records) under input
+    /// designed to break it. Both wrap modes, wrap on and off.
+    #[test]
+    fn direct_and_batched_agree_bit_for_bit_on_adversarial_items() {
+        use crate::fold::WrapMode;
+        let mut corpus = adversarial_corpus();
+        let target = 5 * 65536 + 977;
+        let mut big = Vec::with_capacity(target);
+        let mut rng = Rng(0xDEAD_BEEF_CAFE_F00D);
+        while big.len() < target {
+            match rng.next() % 8 {
+                0 => big.push(b'\n'),
+                1 => big.extend_from_slice(b"    "),
+                2 => big.extend_from_slice("\u{e9}".as_bytes()),
+                3 => big.push(b'\t'),
+                _ => big.push(b'a' + (rng.byte() % 26)),
+            }
+        }
+        corpus.push(big);
+
+        for mode in [WrapMode::Down, WrapMode::Back] {
+            for wrap in [0i32, 40] {
+                let p = ItemParams {
+                    line_height: 1.25,
+                    wrap_width: wrap,
+                    wrap_mode: mode,
+                    ..Default::default()
+                };
+                let colors: Vec<Vec<u32>> =
+                    corpus.iter().map(|b| crate::text::colorize_leaders(b)).collect();
+                let items: Vec<LayoutItem<'_>> = corpus
+                    .iter()
+                    .enumerate()
+                    .map(|(i, b)| LayoutItem {
+                        bytes: b,
+                        params: p,
+                        group_id: i as u32,
+                        paint: Paint::PerRecord(&colors[i]),
+                    })
+                    .collect();
+
+                let mut direct = MojoLayout::new(Strategy::Direct);
+                direct.load_trie_file(&trie()).expect("trie");
+                let mut da = GlyphArena::new();
+                let dp = direct.layout_items(&items, &mut da).expect("direct");
+
+                let mut batched = MojoLayout::new(Strategy::Batched);
+                batched.load_trie_file(&trie()).expect("trie");
+                let mut ba = GlyphArena::new();
+                let bp = batched.layout_items(&items, &mut ba).expect("batched");
+
+                for (i, (d, b)) in dp.iter().zip(bp.iter()).enumerate() {
+                    assert!(d.bit_eq(b), "{mode:?} wrap {wrap}: item {i}:\n  {d:?}\n  {b:?}");
+                }
+                assert_eq!(
+                    bytemuck::cast_slice::<_, u8>(da.instances()),
+                    bytemuck::cast_slice::<_, u8>(ba.instances()),
+                    "{mode:?} wrap {wrap}: arenas differ",
+                );
+                assert!(!da.is_empty(), "the corpus must produce instances");
+            }
+        }
+    }
+
+    /// The CONTROL for the all-empty regression: one empty item AMONG real ones
+    /// takes the grained path and was always correct. Without this, a fix that
+    /// made every item look empty would satisfy the regression test alone.
+    #[test]
+    fn one_empty_item_among_real_ones_agrees() {
+        let bytes: Vec<Vec<u8>> =
+            vec![b"fn a() {}\n".to_vec(), Vec::new(), b"fn b() {}\n".to_vec()];
+        let colors: Vec<Vec<u32>> =
+            bytes.iter().map(|b| crate::text::colorize_leaders(b)).collect();
+        let items: Vec<LayoutItem<'_>> = bytes
+            .iter()
+            .enumerate()
+            .map(|(i, b)| LayoutItem {
+                bytes: b,
+                params: ItemParams { line_height: 1.25, ..Default::default() },
+                group_id: i as u32,
+                paint: Paint::PerRecord(&colors[i]),
+            })
+            .collect();
+
+        let mut direct = MojoLayout::new(Strategy::Direct);
+        direct.load_trie_file(&trie()).expect("trie");
+        let mut da = GlyphArena::new();
+        let dp = direct.layout_items(&items, &mut da).expect("direct");
+
+        let mut batched = MojoLayout::new(Strategy::Batched);
+        batched.load_trie_file(&trie()).expect("trie");
+        let mut ba = GlyphArena::new();
+        let bp = batched.layout_items(&items, &mut ba).expect("batched");
+
+        for (i, (d, b)) in dp.iter().zip(bp.iter()).enumerate() {
+            assert!(d.bit_eq(b), "item {i}:\n  {d:?}\n  {b:?}");
+        }
+        assert_eq!(dp[1].slot_count, 0, "the middle item must be the empty one");
+        assert!(dp[2].slot_count > 0, "the item after the empty one must still lay out");
+    }
+
     fn trie() -> std::path::PathBuf {
         std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../assets/atlas/engine-trie.bin")
