@@ -36,6 +36,7 @@ from std.time import perf_counter_ns
 from glyph_pipeline import Item, Trie, run_pipeline, PipelineResult, F_LEADER, ST_COUNT  # NATIVE-PORT: F_LEADER for load_items per-item counts
 from glyph_record import (
     RecordSet, compact, direct_write_all, DirectPlacement, INST_U32S,
+    DW_LANES,
 )
 from fixture_io import load_trie_auto  # NATIVE-PORT: G3DF fixture or G3TR blob
 
@@ -73,8 +74,17 @@ struct EngineState(Movable):
 # Engine-side stage lanes: run_pipeline's ST_* first, then this entry's own.
 comptime EG_COMPACT = ST_COUNT       # repack the wire stream into the arena
 comptime EG_COUNTS = ST_COUNT + 1    # per-item record counts — SERIAL O(bytes)
-comptime EG_DIRECT = ST_COUNT + 2    # the direct write: lanes straight to instances
-comptime EG_STAGE_COUNT = ST_COUNT + 3
+# The direct write, SPLIT into its five phases rather than carried as one total.
+# A single `eg_direct` lane was the largest thing on the engine line and said
+# nothing about which part of a count/prefix/scatter it was — the same
+# aggregate-behind-one-name shape that made `fold` unreadable for a day. These
+# five sum to what that lane held, so the engine line still totals the FFI call.
+comptime EG_DIR_BUILD = ST_COUNT + 2
+comptime EG_DIR_COUNT = ST_COUNT + 3
+comptime EG_DIR_PREFIX = ST_COUNT + 4
+comptime EG_DIR_WRITE = ST_COUNT + 5
+comptime EG_DIR_MERGE = ST_COUNT + 6
+comptime EG_STAGE_COUNT = ST_COUNT + 7
 
 comptime Handle = Pointer[NoneType, MutUntrackedOrigin]
 
@@ -279,7 +289,7 @@ def glyph_engine_load_item_desc(
     s[].leaders = r.leaders
     var _c = perf_counter_ns()
     compact(r, n, r.leaders, s[].records)
-    _record_stages(s[], r, perf_counter_ns() - _c, 0, 0)
+    _record_stages(s[], r, perf_counter_ns() - _c, 0, List[Int](length=DW_LANES, fill=0))
     _ = len(items)
     return GE_OK
 
@@ -319,7 +329,7 @@ comptime ITEM_DESC_SIZE: Int = ABI_DESC_BYTES
 
 def _record_stages(
     mut st: EngineState, r: PipelineResult,
-    compact_ns: Int, counts_ns: Int, direct_ns: Int,
+    compact_ns: Int, counts_ns: Int, direct: List[Int],
 ):
     """Fold run_pipeline's own stage lanes into the handle, then add the three
     this file owns. Kept as one writer so the lane layout has a single author.
@@ -332,7 +342,8 @@ def _record_stages(
         st.stage_ns[i] = r.stage_ns[i]
     st.stage_ns[EG_COMPACT] = compact_ns
     st.stage_ns[EG_COUNTS] = counts_ns
-    st.stage_ns[EG_DIRECT] = direct_ns
+    for i in range(DW_LANES):
+        st.stage_ns[EG_DIR_BUILD + i] = direct[i]
 
 
 @export("glyph_engine_load_items")
@@ -404,7 +415,7 @@ def glyph_engine_load_items(
             it_end = Int(base.unsafe_bitcast[UInt64]()[unsafe_offset = 14]) + Int(base.unsafe_bitcast[UInt64]()[unsafe_offset = 15])
         if (Int(r.fl[id]) & F_LEADER) != 0:
             counts_out[unsafe_offset = it_i] += 1
-    _record_stages(s[], r, compact_ns, perf_counter_ns() - _k, 0)
+    _record_stages(s[], r, compact_ns, perf_counter_ns() - _k, List[Int](length=DW_LANES, fill=0))
     _ = len(items)
     return GE_OK
 
@@ -547,9 +558,10 @@ def glyph_engine_load_items_direct(
 
     var _w = perf_counter_ns()
     var paint_bad = 0
+    var dprof = List[Int](length=DW_LANES, fill=0)
     var places = direct_write_all(
         r, items, group_ids, paint_ptrs, paint_lens, flat_colors, inst_ptr,
-        paint_bad,
+        paint_bad, dprof.unsafe_ptr(),
     )
     if paint_bad != 0:
         return GE_PAINT_TOO_SHORT
@@ -561,7 +573,8 @@ def glyph_engine_load_items_direct(
     for i in range(m):
         _write_place(place_out, i * PLACE_U32S, places[i], slot_base)
         slot_base += places[i].slot_count
-    _record_stages(s[], r, 0, 0, perf_counter_ns() - _w)
+    _ = perf_counter_ns() - _w
+    _record_stages(s[], r, 0, 0, dprof)
     _ = len(items)
     return GE_OK
 

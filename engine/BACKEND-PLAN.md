@@ -240,6 +240,23 @@ tier stays covered by `repo-verify` and `engine-check` on the other strategies �
 the same relationship `witness` already has with the elided fold: a verification
 form and a production form, with something adjudicating them.
 
+**Two measurement cautions, kept because they cost real time to find and the
+scaffold that found them was not merged.** A branch (`worktree-direct-perf`,
+`888377a`) carried env-var knobs for profiling this pass; the phase split it
+proved useful became permanent engine lanes (`dw_*`, always on, no flag) and the
+rest was dropped — three of its four knobs had already answered their question,
+and one of those actively lied:
+
+- **A "run it serially" flag is NOT a one-worker baseline on macOS.** The
+  calling thread is the host's main thread and gets scheduled on an EFFICIENCY
+  core while `parallelize`'s workers sit on performance cores, so it reads ~1.6x
+  slow. It claimed 4.7x parallel speedup where the truth is 2.03x. For a real
+  one-worker number, set the grain larger than the largest item — one grain, one
+  task, the same code path through the same scheduler.
+- **`parallelism_level()` is 4 on an 8-core M2**, and no environment variable in
+  the pinned runtime changes it (six were tried; the binaries carry no
+  thread-count knob). Price ceilings against 4.
+
 **THE NEXT TARGET IS MEMORY, NOT TIME**, and this is what the perf work
 concluded rather than what it set out to find. Measured 2026-09-07: peak RSS is
 **~95 bytes of RAM per source byte** — lane arrays 40 (fl 4, gi 4, sm 8, lm 16,
@@ -255,6 +272,11 @@ At 97 MB demand is ~9.2 GB against a 4.9 GB cap and the write goes **6x
 superlinear**. That is also the variance: CPU co-tenancy costs at most 1.8x,
 while 9 GB held resident costs 2.5-3.1x — precisely the 0.193-to-0.55 s spread
 seen earlier the same day and wrongly blamed on scheduling.
+
+The phase split says where inside the pass that lands: **`dw_write` is ~93% of
+it** (0.102-0.129 s against `dw_count` 0.008 s on 47 MB, with grain-build,
+prefix and merge all at noise), and `dw_write` is what first-touches the arena.
+So the memory work and the remaining time are the same target, not two.
 
 **43% of that peak is the fold's lane arrays, and they are dead the instant the
 write has read them.** A chunked fold-then-write over item groups would cap lane
