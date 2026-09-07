@@ -1,4 +1,5 @@
-# glyph_record.mojo — the record format, and the scratch pool it makes possible.
+# glyph_record.mojo — the record format, the scratch pool it makes possible, and
+# the direct write that skips the record entirely.
 #
 # THE PROBLEM. A source byte costs slot lanes held for the corpus's entire
 # lifetime. But the render path reads only the render-read prefixes; BASE_X is
@@ -15,11 +16,21 @@
 # refuses a schema where a render-read lane sorts after an unread one, and pins
 # the wire order as a literal so a container re-layout cannot move the bytes.
 #
-# THE DECOUPLING. Once records exist, slots become a SCRATCH POOL sized to the
-# JOB, not the corpus. run_streaming below proves it: a fixed pool, reused across
-# chunks, with resident cost equal to records alone. Corpus size stops determining
-# arena size — which is a different kind of win from any multiplier on the old
-# form, and it is what makes streaming edits a range re-run rather than a reload.
+# THE DECOUPLING, AND IT IS NO LONGER A DEMONSTRATION. Once records exist, slots
+# become a SCRATCH POOL sized to the JOB, not the corpus. run_streaming below
+# proved it for the record path (and conformance_record runs it). The direct
+# path SHIPS it: `glyph_engine_load_items_direct` folds in chunks through one
+# reused set of lanes, so corpus size stops determining lane memory. Measured
+# 2026-09-07 on 47.1 MB, peak RSS 4.088 -> 2.694 GB; on 151.8 MB, where the old
+# form was thrashing, 32.0 -> 130.0 MB/s. It is also what makes streaming edits
+# a range re-run rather than a reload.
+#
+# THE DIRECT WRITE lives here too, below the record machinery it bypasses:
+# `direct_write_all` is a count/prefix/scatter over grains that turns per-byte
+# fold lanes into 48 B render instances in ONE pass, writing into an arena the
+# CALLER owns. `compact` above is the same filter and the same arithmetic
+# materializing a 32 B wire record first; it remains as the verification form,
+# and `repo-verify-direct` diffs the two.
 
 from std.collections.span import Span
 from std.math import inf

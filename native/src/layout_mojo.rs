@@ -24,6 +24,11 @@
 //! path has none — it REFUSES that request rather than returning an empty Vec a
 //! gate would read as agreement.
 //!
+//! It also folds in CHUNKS through one reused set of lane arrays, so the
+//! per-byte fold lanes — ~40 B per source byte, and dead the instant the write
+//! has read them — cost the chunk rather than the corpus. That is the memory
+//! half of the same change and it is where the large-corpus win comes from.
+//!
 //! It took all three copies at once rather than the middle one, because the
 //! measurement said the halves were not worth separating: 2026-09-07, the
 //! readback was 9-22% of backend time and compaction 14-41%, so a borrowing
