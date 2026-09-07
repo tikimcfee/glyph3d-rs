@@ -129,12 +129,155 @@ impl ErrorTracker {
 }
 
 
+// ── the hardware profile ─────────────────────────────────────────────────
+
+/// What this process is rendering on, resolved ONCE from the adapter wgpu
+/// picked and carried in `GpuContext` so nothing downstream re-derives it.
+///
+/// Two consumers today, and the shape is meant to grow. The golden-view
+/// key (`key()`) selects which byte-exact baseline set the pixel gate
+/// compares against — the baselines were Metal renders, and the first Linux
+/// run (2026-09-07) showed NVIDIA's Vulkan rasterizer flips isolated edge
+/// pixels against them while every numeric gate stays bit-exact, so a golden
+/// set is a property of the rasterizer, not of the tree. `render_text()` is
+/// the provenance record committed beside that set (`ADAPTER.txt`).
+///
+/// The key is DELIBERATELY coarser than the record: `backend-vendor` treats
+/// every NVIDIA card under Vulkan as one rasterizer until a diff proves
+/// otherwise, at which point the record beside the baselines names exactly
+/// which device and driver produced them, and escalating the key to device
+/// level is a change to `key()` alone. Rendering paths that need to branch on
+/// hardware (present mode, indirect-draw support, the Metal
+/// `first_instance` workaround in glyph_scene.rs) should read this struct,
+/// not `cfg!(target_os)`: the OS is the wrong axis for every one of those.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GpuProfile {
+    pub backend: wgpu::Backend,
+    pub vendor_id: u32,
+    pub device_id: u32,
+    pub device_name: String,
+    pub device_type: wgpu::DeviceType,
+    pub driver: String,
+    pub driver_info: String,
+    pub target_os: &'static str,
+    pub target_arch: &'static str,
+    pub multi_draw_indirect_count: bool,
+    pub timestamp_query: bool,
+    pub max_storage_buffer_binding_size: u64,
+    pub max_buffer_size: u64,
+}
+
+impl GpuProfile {
+    pub fn from_adapter(adapter: &wgpu::Adapter) -> Self {
+        let info = adapter.get_info();
+        let feats = adapter.features();
+        let lim = adapter.limits();
+        Self {
+            backend: info.backend,
+            vendor_id: info.vendor,
+            device_id: info.device,
+            device_name: info.name,
+            device_type: info.device_type,
+            driver: info.driver,
+            driver_info: info.driver_info,
+            target_os: std::env::consts::OS,
+            target_arch: std::env::consts::ARCH,
+            multi_draw_indirect_count: feats.contains(wgpu::Features::MULTI_DRAW_INDIRECT_COUNT),
+            timestamp_query: feats.contains(wgpu::Features::TIMESTAMP_QUERY),
+            max_storage_buffer_binding_size: lim.max_storage_buffer_binding_size,
+            max_buffer_size: lim.max_buffer_size,
+        }
+    }
+
+    /// PCI vendor id → a name that can be a directory. Unknown vendors get
+    /// their hex id so two unknowns never collide on "other".
+    pub fn vendor_slug(&self) -> String {
+        match self.vendor_id {
+            0x10de => "nvidia",
+            0x1002 => "amd",
+            0x8086 => "intel",
+            0x106b => "apple",
+            0x13b5 => "arm",
+            0x5143 => "qualcomm",
+            0x1414 => "microsoft",
+            0x10005 => "mesa",
+            other => return format!("vendor{other:04x}"),
+        }
+        .to_string()
+    }
+
+    pub fn backend_slug(&self) -> &'static str {
+        match self.backend {
+            wgpu::Backend::Vulkan => "vulkan",
+            wgpu::Backend::Metal => "metal",
+            wgpu::Backend::Dx12 => "dx12",
+            wgpu::Backend::Gl => "gl",
+            wgpu::Backend::BrowserWebGpu => "webgpu",
+            wgpu::Backend::Noop => "noop",
+        }
+    }
+
+    /// The golden-set key: `<backend>-<vendor>`, filesystem-safe. See the
+    /// struct doc for why this is coarser than the record.
+    pub fn key(&self) -> String {
+        format!("{}-{}", self.backend_slug(), self.vendor_slug())
+    }
+
+    /// The provenance record: one `field: value` per line, key first. This is
+    /// what `--gpu-profile` prints and what lives beside a golden set as
+    /// ADAPTER.txt, so the pixel gate can say "the baselines were made on X,
+    /// you are on Y" when the two differ.
+    pub fn render_text(&self) -> String {
+        format!(
+            "key: {}\nbackend: {:?}\nvendor: 0x{:04x} ({})\ndevice: 0x{:04x} {} ({:?})\n\
+             driver: {} {}\nhost: {} {}\nfeatures: multi_draw_indirect_count={} timestamp_query={}\n\
+             limits: max_storage_buffer_binding_size={} max_buffer_size={}\n",
+            self.key(),
+            self.backend,
+            self.vendor_id,
+            self.vendor_slug(),
+            self.device_id,
+            self.device_name,
+            self.device_type,
+            self.driver,
+            self.driver_info,
+            self.target_os,
+            self.target_arch,
+            self.multi_draw_indirect_count,
+            self.timestamp_query,
+            self.max_storage_buffer_binding_size,
+            self.max_buffer_size,
+        )
+    }
+
+    #[cfg(test)]
+    fn synthetic(backend: wgpu::Backend, vendor_id: u32) -> Self {
+        Self {
+            backend,
+            vendor_id,
+            device_id: 0,
+            device_name: "test".into(),
+            device_type: wgpu::DeviceType::Other,
+            driver: String::new(),
+            driver_info: String::new(),
+            target_os: "test",
+            target_arch: "test",
+            multi_draw_indirect_count: false,
+            timestamp_query: false,
+            max_storage_buffer_binding_size: 0,
+            max_buffer_size: 0,
+        }
+    }
+}
+
 /// Logged adapter identity, kept around for diagnostics.
 pub struct GpuContext {
     pub instance: wgpu::Instance,
     pub adapter: wgpu::Adapter,
     pub device: wgpu::Device,
     pub queue: wgpu::Queue,
+    /// The hardware this context was created on; see `GpuProfile`.
+    pub profile: GpuProfile,
     /// Stage H: per-frame GPU pass profiler. `Some` only when GLYPH_PROFILE=1
     /// AND the adapter supports TIMESTAMP_QUERY. RefCell because scenes render
     /// through `&GpuContext` while the profiler holds per-frame mutable state.
@@ -245,6 +388,8 @@ pub async fn init(compatible_surface: Option<&wgpu::Surface<'_>>) -> GpuContext 
         info.device,
         info.driver_info,
     );
+    let profile = GpuProfile::from_adapter(&adapter);
+    log::info!("gpu profile key: {}", profile.key());
 
     // Stage E2: a repo-scale glyph arena can exceed the default 128 MiB
     // storage binding by an order of magnitude (48 B × tens of millions of
@@ -349,8 +494,38 @@ pub async fn init(compatible_surface: Option<&wgpu::Surface<'_>>) -> GpuContext 
         adapter,
         device,
         queue,
+        profile,
         profiler,
         cpu_scopes: RefCell::new(std::collections::BTreeMap::new()),
+    }
+}
+
+#[cfg(test)]
+mod profile_tests {
+    use super::*;
+
+    /// The key is the directory name a golden set lives under, so it has to
+    /// be stable across machines with the same rasterizer and safe as a path.
+    #[test]
+    fn key_is_backend_dash_vendor() {
+        assert_eq!(GpuProfile::synthetic(wgpu::Backend::Metal, 0x106b).key(), "metal-apple");
+        assert_eq!(GpuProfile::synthetic(wgpu::Backend::Vulkan, 0x10de).key(), "vulkan-nvidia");
+        assert_eq!(GpuProfile::synthetic(wgpu::Backend::Vulkan, 0x1002).key(), "vulkan-amd");
+    }
+
+    /// An unknown vendor keeps its id rather than collapsing to a shared
+    /// name — two unknowns must not share a golden set by accident.
+    #[test]
+    fn unknown_vendor_keeps_its_id() {
+        let p = GpuProfile::synthetic(wgpu::Backend::Gl, 0xbeef);
+        assert_eq!(p.key(), "gl-vendorbeef");
+    }
+
+    #[test]
+    fn key_is_filesystem_safe_and_record_leads_with_it() {
+        let p = GpuProfile::synthetic(wgpu::Backend::Dx12, 0x8086);
+        assert!(p.key().chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-'));
+        assert!(p.render_text().starts_with(&format!("key: {}\n", p.key())));
     }
 }
 

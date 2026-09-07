@@ -118,6 +118,18 @@ rebuilt, put one back.
 - Comments explain WHY (empirical findings, bug history, invariants), not
   what the code does. Stage-tagged (`// Stage F: ...`) for archaeology.
 
+## The hardware profile
+
+`gpu::GpuProfile` is resolved once in `gpu::init` from the adapter wgpu picked
+and carried in `GpuContext`. Anything that must branch on hardware — present
+mode, indirect-draw support, the Metal `first_instance` workaround in
+`glyph_scene.rs` — reads it; `cfg!(target_os)` is the wrong axis for all of
+those and is not used for any of them. `--gpu-key` prints the golden-set key
+(`backend-vendor`), `--gpu-profile` the full record; root `AGENTS.md` § pixel-ab
+says how the build tool uses both. `--present-mode fifo|mailbox|immediate` is
+windowed-only and rides on the FPS line, because under Fifo that figure is the
+display's refresh (75 on the first Linux box) and not a fact about the renderer.
+
 ## Debug env vars
 
 - `GLYPH_PROFILE=1` — requests TIMESTAMP_QUERY and builds a wgpu-profiler;

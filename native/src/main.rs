@@ -424,6 +424,21 @@ struct Cli {
     /// Generate shell completions for SHELL and exit
     #[arg(long, value_name = "SHELL")]
     generate: Option<clap_complete::Shell>,
+    /// Print the golden-set key for the adapter wgpu picks (`backend-vendor`,
+    /// e.g. `vulkan-nvidia`) and exit. The build tool asks this to choose
+    /// which baseline directory the pixel gate compares against.
+    #[arg(long)]
+    gpu_key: bool,
+    /// Print the full hardware profile the renderer resolved and exit — the
+    /// provenance record committed beside a golden set as ADAPTER.txt.
+    #[arg(long)]
+    gpu_profile: bool,
+    /// Windowed only: how frames reach the display. `fifo` (the default) is
+    /// vsync, so the FPS line reads the monitor's refresh; `mailbox` and
+    /// `immediate` uncap it where the surface supports them (else fifo, and
+    /// the log says so). Offscreen renders never present and ignore this.
+    #[arg(long, value_name = "MODE", default_value = "fifo", value_parser = ["fifo", "mailbox", "immediate"])]
+    present_mode: String,
     /// Stage G op-stream flags, captured per-flag by clap and re-interleaved
     /// into `ops` by build_ops().
     #[command(flatten)]
@@ -604,6 +619,15 @@ fn parse_cli_from(matches: clap::ArgMatches) -> Cli {
 
 fn parse_cli() -> Cli {
     parse_cli_from(Cli::command().get_matches())
+}
+
+/// clap has already refused anything outside the three spellings.
+fn parse_present_mode(s: &str) -> wgpu::PresentMode {
+    match s {
+        "mailbox" => wgpu::PresentMode::Mailbox,
+        "immediate" => wgpu::PresentMode::Immediate,
+        _ => wgpu::PresentMode::Fifo,
+    }
 }
 
 fn default_text_file() -> PathBuf {
@@ -1000,6 +1024,19 @@ fn main() {
         return;
     }
 
+    // The hardware profile: init the GPU exactly as a render would, print,
+    // exit. stdout carries only the answer (logs go to stderr), because the
+    // build tool reads it to name a baseline directory.
+    if cli.gpu_key || cli.gpu_profile {
+        let ctx = pollster::block_on(gpu::init(None));
+        if cli.gpu_key {
+            println!("{}", ctx.profile.key());
+        } else {
+            print!("{}", ctx.profile.render_text());
+        }
+        return;
+    }
+
     // Fixture parity (reference port): fixture parse manifest / corpus diff — no GPU.
     if !cli.fixture_manifest.is_empty() {
         run_fixture_manifest(&cli.fixture_manifest);
@@ -1080,7 +1117,15 @@ fn main() {
             // Stage K (K6): scripted in-window capture (windowed only — clap
             // already rejected the combination with --screenshot).
             let shot = cli.screenshot_frame.zip(cli.screenshot_out.clone());
-            windowed::run(ctx, &choice, !cli.no_cull, &cli.ops, !cli.no_ui, shot)
+            windowed::run(
+                ctx,
+                &choice,
+                !cli.no_cull,
+                &cli.ops,
+                !cli.no_ui,
+                shot,
+                parse_present_mode(&cli.present_mode),
+            )
         }
     }
 }
@@ -1134,6 +1179,13 @@ mod cli_tests {
         assert!(cli.screenshot_frame.is_none());
         assert!(cli.screenshot_out.is_none());
         assert!(cli.ops.is_empty());
+        assert!(!cli.gpu_key);
+        assert!(!cli.gpu_profile);
+        // Fifo is the default because it is what every FPS figure before
+        // 2026-09-07 was measured under; changing it would make old numbers
+        // incomparable without saying so.
+        assert_eq!(cli.present_mode, "fifo");
+        assert_eq!(parse_present_mode(&cli.present_mode), wgpu::PresentMode::Fifo);
     }
 
     #[test]
@@ -1145,7 +1197,12 @@ mod cli_tests {
             "--wrap-mode", "back",
             "--render-file", "src/main.rs", "--engine-file", "a.rs", "--engine-trie", "t.bin",
             "--engine-check", "b.rs", "--engine-render", "c.rs",
+            "--present-mode", "mailbox", "--gpu-key", "--gpu-profile",
         ]);
+        assert_eq!(cli.present_mode, "mailbox");
+        assert_eq!(parse_present_mode(&cli.present_mode), wgpu::PresentMode::Mailbox);
+        assert!(cli.gpu_key);
+        assert!(cli.gpu_profile);
         assert_eq!(cli.screenshot, Some(PathBuf::from("out.png")));
         assert_eq!(cli.frames, 2);
         assert!(cli.demo);

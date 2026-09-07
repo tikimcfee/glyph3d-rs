@@ -740,12 +740,15 @@ impl WindowState {
             } else {
                 String::new()
             };
+            // The present mode rides on the line so a figure is never read
+            // without its cap: under Fifo this IS the display's refresh.
             println!(
-                "FPS: {:.1} ({} frames in {:.2?}, {} instances){profile_suffix}",
+                "FPS: {:.1} ({} frames in {:.2?}, {} instances, present={:?}){profile_suffix}",
                 self.frames as f32 / elapsed.as_secs_f32(),
                 self.frames,
                 elapsed,
                 self.scene.instance_count(),
+                self.config.present_mode,
             );
             // Stage K (K3): mirror the same figure for the Debug panel.
             #[cfg(feature = "egui-ui")]
@@ -779,6 +782,10 @@ struct App<'a> {
     /// Stage K (K6): scripted in-window capture (`--screenshot-frame N`
     /// `--screenshot-out PATH`).
     shot: Option<(u64, std::path::PathBuf)>,
+    /// `--present-mode`. Fifo is vsync and caps the FPS line at the display's
+    /// refresh (75 on the first Linux box, 2026-09-07 — a number that says
+    /// nothing about the renderer). Applied only if the surface offers it.
+    present_mode: wgpu::PresentMode,
 }
 
 impl ApplicationHandler for App<'_> {
@@ -822,6 +829,16 @@ impl ApplicationHandler for App<'_> {
             caps.usages
         );
         let size = window.inner_size();
+        let present_mode = if caps.present_modes.contains(&self.present_mode) {
+            self.present_mode
+        } else {
+            log::warn!(
+                "present mode {:?} not offered by this surface (offers {:?}); using Fifo",
+                self.present_mode,
+                caps.present_modes
+            );
+            wgpu::PresentMode::Fifo
+        };
         let config = wgpu::SurfaceConfiguration {
             // Stage K (K6): COPY_SRC = in-window screenshot readback.
             // Stage L (L3): COPY_DST = the composite's copy path when the
@@ -835,7 +852,7 @@ impl ApplicationHandler for App<'_> {
             color_space: wgpu::SurfaceColorSpace::Auto,
             width: size.width,
             height: size.height,
-            present_mode: wgpu::PresentMode::Fifo,
+            present_mode,
             desired_maximum_frame_latency: 2,
             alpha_mode: caps.alpha_modes[0],
             view_formats: vec![],
@@ -1189,6 +1206,7 @@ pub fn run(
     ops: &[Op],
     ui: bool,
     shot: Option<(u64, std::path::PathBuf)>,
+    present_mode: wgpu::PresentMode,
 ) {
     // Without the `egui-ui` feature the overlay is compiled out entirely;
     // the flag is accepted (and ignored) so the CLI is identical either way.
@@ -1205,6 +1223,7 @@ pub fn run(
         #[cfg(feature = "egui-ui")]
         ui,
         shot,
+        present_mode,
     };
     event_loop.run_app(&mut app).expect("event loop error");
 }
