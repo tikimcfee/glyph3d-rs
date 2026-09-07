@@ -220,7 +220,7 @@ impl Default for RepoParams {
             gap_y: 6.0,
             grid_aspect: 1.6,
             z_wrap_spacing: 0.15,
-            wrap_mode: crate::fold::WrapMode::Down,
+            wrap_mode: crate::fold::WrapMode::Back,
         }
     }
 }

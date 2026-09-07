@@ -73,8 +73,11 @@ pub enum SceneChoice {
         batch: bool,
         verify: bool,
         focus: Option<String>,
-        /// How a wrap is spent. `Down` is the default and the four screenshot
-        /// baselines are gated on it staying that way.
+        /// How a wrap is spent. `Back` is the default: a wrapped line costs
+        /// DEPTH rather than a row, which is the layout this renderer is for.
+        /// `repo-wide` and `repo-zoom` are gated on it; `repo-down` keeps the
+        /// other mode covered so making one default cannot silently retire the
+        /// other.
         wrap_mode: fold::WrapMode,
     },
 }
@@ -379,7 +382,7 @@ struct Cli {
     /// default, and what the byte-equal screenshot baselines are taken under),
     /// `back` keeps the row and steps the segment back in depth instead — one
     /// row per source line however long it is.
-    #[arg(long, value_name = "MODE", default_value = "down", value_parser = ["down", "back"])]
+    #[arg(long, value_name = "MODE", default_value = "back", value_parser = ["down", "back"])]
     wrap_mode: String,
     /// Stage E2: frame the first file whose path contains SUBSTR
     #[arg(long, value_name = "SUBSTR")]
@@ -1102,8 +1105,10 @@ mod cli_tests {
         // THE DEFAULT THE SCREENSHOT BASELINES DEPEND ON. A change here moves
         // repo-wide.png and repo-zoom.png, so it is pinned in the CLI layer too
         // and not only in RepoParams::default.
-        assert_eq!(cli.wrap_mode, "down");
-        assert_eq!(parse_wrap_mode(&cli.wrap_mode), fold::WrapMode::Down);
+        assert_eq!(cli.wrap_mode, "back");
+        assert_eq!(parse_wrap_mode(&cli.wrap_mode), fold::WrapMode::Back);
+        // ...and the non-default is still reachable and still spelled the same.
+        assert_eq!(parse_wrap_mode("down"), fold::WrapMode::Down);
         assert!(!cli.repo_verify);
         assert!(cli.focus_file.is_none());
         assert!(!cli.repo_scan_only);

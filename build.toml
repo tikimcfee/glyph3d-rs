@@ -103,6 +103,7 @@ outputs = [
   "out/tooling-ab/baseline/text.png",
   "out/tooling-ab/baseline/repo-zoom.png",
   "out/tooling-ab/baseline/repo-wide.png",
+  "out/tooling-ab/baseline/repo-down.png",
 ]
 inputs = ["target/release/glyph3d-native", "native/fixtures/baseline-view.txt", "native/fixtures/g-pick-repo/**"]
 note = "Blind to everything outside these four frames, and cannot distinguish a regression from an intentional change. empty.rs in g-pick-repo is zero bytes ON PURPOSE (the only input reaching the page-extent origin seed)."
@@ -117,6 +118,9 @@ cmd = "--render-file fixtures/baseline-view.txt --frames 2"
 [[golden_view]]
 name = "repo-wide"
 cmd = "--load-repo fixtures/g-pick-repo --frames 2"
+[[golden_view]]
+name = "repo-down"
+cmd = "--load-repo fixtures/g-pick-repo --frames 2 --wrap-mode down"
 [[golden_view]]
 name = "repo-zoom"
 cmd = "--load-repo fixtures/g-pick-repo --frames 2 --focus-file alpha.rs --zoom 3"

@@ -53,8 +53,8 @@ OUT=$($BIN --load-repo $FIX --screenshot "$SCRATCH/fixture.png" \
   --pick-file alpha.rs --pick-row 4 --pick-col 4 \
   --pick-file wide.txt --pick-row 1 --pick-col 50 \
   --pick-file wide.txt --pick-row 2 --pick-col 0 \
-  --pick-file wide.txt --pick-row 596 --pick-col 32900 \
-  --pick-file wide.txt --pick-row 1995 --pick-col 52800 \
+  --pick-file wide.txt --pick-row 7 --pick-col 32900 \
+  --pick-file wide.txt --pick-row 8 --pick-col 52800 \
   --pick-file deep.py  --pick-row 0 --pick-col 5 \
   --pick-file deep.py  --pick-row 2 --pick-col 8 \
   --pick-file long.md  --pick-row 200 --pick-col 5 \
@@ -64,7 +64,8 @@ echo "$OUT" | grep -E "fold cross-check: FAIL" && { echo "FAIL: fold cross-check
 echo "$OUT" | grep -E "fold cross-check: PASS" | wc -l | xargs echo "fold cross-checks PASS:"
 
 # oracle-derived expectations
-exp() { $ORACLE "$1" "$2" "$3" | sed -E "s/.*char=(.*) byte=([0-9]+).*/\1 \2/"; }
+MODE=back
+exp() { $ORACLE --mode "$MODE" "$1" "$2" "$3" | sed -E "s/.*char=(.*) byte=([0-9]+).*/\1 \2/"; }
 check() { # file_substr row col
     local sub="$1" row="$2" col="$3"
     local line; line=$(echo "$OUT" | grep -E "^pick: \S*$sub" | grep -E " row=$row col=$col " | head -1)
@@ -91,6 +92,13 @@ check alpha.rs 4 4
 # The shallow pair still matters (it is the case where z stays 0); the deep
 # pairs are the ones the old 257-byte fixture could not express at all.
 #
+# THE ROW NUMBERS MOVED AGAIN on 2026-09-07, when `back` became the default:
+# a wrap now costs DEPTH rather than a row, so the hundreds of rows a long line
+# used to occupy do not exist. These probes name the SAME BYTES as before —
+# 59686 and 106178 — at the row their LOGICAL LINE sits on (596 -> 7,
+# 1995 -> 8). The `down` block below still exercises the row-per-wrap geometry,
+# so making one mode default did not retire coverage of the other.
+#
 # THE ROW NUMBERS MOVED on 2026-09-04 (the phantom-row fix, engine/delta/):
 # six of wide.txt's nine lines have glyph counts that are exact multiples of
 # 100, and each used to claim one blank row. These four probes name the SAME
@@ -101,8 +109,8 @@ check alpha.rs 4 4
 # made this gate abort rather than disagree.
 check wide.txt 1 50
 check wide.txt 2 0
-check wide.txt 596 32900
-check wide.txt 1995 52800
+check wide.txt 7 32900
+check wide.txt 8 52800
 check sub/deep.py 0 5
 check sub/deep.py 2 8
 check long.md 200 5
@@ -167,4 +175,18 @@ js_check glyph_scene.rs 40 11
 js_check gpu.rs 1 0
 
 echo "────────────────────────────────────────────────────────────────"
+echo
+echo "── the NON-DEFAULT wrap mode: a wrap costs a row ─────────────"
+# Same fixture, same bytes, the other geometry. Without this, making `back`
+# the default would have silently retired every pick test of row-per-wrap.
+MODE=down
+OUT=$($BIN --load-repo $FIX --wrap-mode down --screenshot "$SCRATCH/down.png" \
+  --pick-file wide.txt --pick-row 596 --pick-col 32900 \
+  --pick-file wide.txt --pick-row 1995 --pick-col 52800 \
+  --pick-file wide.txt --pick-row 1 --pick-col 50 \
+  2>&1)
+check wide.txt 596 32900
+check wide.txt 1995 52800
+check wide.txt 1 50
+
 [ $FAIL -eq 0 ] && echo "PICK ORACLE CHECK: ALL PASS" || { echo "PICK ORACLE CHECK: FAILURES"; exit 1; }

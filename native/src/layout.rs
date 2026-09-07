@@ -196,7 +196,7 @@ impl Default for ItemParams {
             line_height: 1.0,
             z_step: 0.0,
             wrap_width: 0,
-            wrap_mode: crate::fold::WrapMode::Down,
+            wrap_mode: crate::fold::WrapMode::Back,
             has_page: false,
             page_rows: 0,
             page_cols: 0,
