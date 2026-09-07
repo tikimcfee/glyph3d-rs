@@ -481,7 +481,17 @@ impl GlyphArena {
     /// `written` must not exceed the capacity that call returned.
     pub(crate) unsafe fn commit(&mut self, written: usize) {
         let len = self.instances.len();
-        debug_assert!(written <= self.instances.capacity() - len);
+        // assert!, NOT debug_assert!. `[profile.release]` sets only `debug =
+        // true`, so debug assertions are OFF, and every gate in this tree builds
+        // --release — a debug_assert here is a guard that exists in no build we
+        // ship or check. It stands between an over-reported count and a
+        // `set_len` past capacity, which publishes uninitialized memory as
+        // glyphs. One compare per load is not a cost worth that.
+        assert!(
+            written <= self.instances.capacity() - len,
+            "commit({written}) exceeds the {} uncommitted slots reserved",
+            self.instances.capacity() - len,
+        );
         unsafe { self.instances.set_len(len + written) };
     }
 }

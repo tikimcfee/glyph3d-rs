@@ -568,6 +568,22 @@ pub fn load_repo(
             },
         )
         .unwrap_or_else(|why| panic!("repo-verify FAIL: {why}"));
+        // ANTI-VACUITY, and it is not hypothetical: before this guard,
+        //     --load-repo fixtures/does-not-exist --repo-verify
+        // printed "repo-verify PASS: 0 items, 0 instances" and exited 0. The
+        // gate runner greens on that substring, so the direct path's ONLY check
+        // would have passed having compared nothing at all — if the fixture
+        // directory were ever moved, renamed or emptied. A comparison of two
+        // empty things is not a verification, and this is the one check in the
+        // battery whose failure mode was silence rather than noise.
+        if report.items == 0 || report.instances == 0 {
+            panic!(
+                "repo-verify FAIL: nothing to compare — {} items, {} instances. \
+                 A corpus that produces no glyphs cannot verify anything; check \
+                 that the corpus path exists and holds files the walker accepts",
+                report.items, report.instances,
+            );
+        }
         backend_dur += t.elapsed(); // honest: verification time is backend time
         verified = true;
         println!(

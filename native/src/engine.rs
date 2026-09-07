@@ -37,6 +37,8 @@ const GE_ABI_MISMATCH: i32 = 9;
 const GE_ARENA_TOO_SMALL: i32 = 10;
 /// A per-item colour array is shorter than that item's record count.
 const GE_PAINT_TOO_SHORT: i32 = 11;
+/// Items do not tile the blob — a range past its end, or overlapping ranges.
+const GE_BAD_ITEM_RANGE: i32 = 12;
 
 extern "C" {
     fn glyph_engine_new() -> *mut c_void;
@@ -384,6 +386,10 @@ impl Engine {
                     "glyph_engine_load_items (no trie loaded)".to_string()
                 } else if s == GE_ABI_MISMATCH {
                     abi_mismatch_message("glyph_engine_load_items")
+                } else if s == GE_BAD_ITEM_RANGE {
+                    "glyph_engine_load_items: the items do not tile the blob — \
+                     each must be in range, ascending and non-overlapping"
+                        .to_string()
                 } else {
                     "glyph_engine_load_items".to_string()
                 },
@@ -446,6 +452,11 @@ impl Engine {
                 what: match s {
                     GE_NO_TRIE => "glyph_engine_load_items_direct (no trie loaded)".to_string(),
                     GE_ABI_MISMATCH => abi_mismatch_message("glyph_engine_load_items_direct"),
+                    GE_BAD_ITEM_RANGE => "glyph_engine_load_items_direct: the \
+                         items do not tile the blob — each must be in range, \
+                         ascending and non-overlapping. The fold and the arena \
+                         bound both assume it"
+                        .to_string(),
                     GE_PAINT_TOO_SHORT => "glyph_engine_load_items_direct: an \
                          item's paint array is shorter than its record count. \
                          Paint is indexed by RECORD, blanks included — a colour \
@@ -555,6 +566,46 @@ impl Drop for Engine {
 mod tests {
     use super::*;
     use crate::layout::LAYOUT_BAD_PARAMS;
+
+    /// The item ranges are the caller's DATA, and until 2026-09-07 nothing
+    /// checked them. A range past the blob end faulted inside the fold, which
+    /// sizes every per-byte array to the blob and then walks each item's own
+    /// range — a SAFE `pub fn` segfaulting on data it was handed. Overlapping
+    /// ranges were worse than a fault: the leader count is taken over the BLOB
+    /// while the direct writer runs over the ITEMS, so the arena bound computed
+    /// from one does not bound the other, and the guard was unsound exactly
+    /// where it was needed. Found by an adversarial audit, not by a caller.
+    #[test]
+    fn item_ranges_are_refused_rather_than_trusted() {
+        let mut eng = Engine::new();
+        let trie = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../assets/atlas/engine-trie.bin");
+        eng.load_trie_file(&trie).expect("trie");
+        let blob = b"abcdef";
+        let p = ItemParams { line_height: 1.25, ..Default::default() };
+
+        // Past the end.
+        assert!(
+            eng.load_items(blob, &[(0, 99, p)]).is_err(),
+            "a range past the blob end must be refused, not folded",
+        );
+        // Overlapping — the shape that makes the arena bound unsound.
+        assert!(
+            eng.load_items(blob, &[(0, 6, p), (0, 6, p)]).is_err(),
+            "overlapping items must be refused",
+        );
+        // Descending.
+        assert!(
+            eng.load_items(blob, &[(3, 3, p), (0, 3, p)]).is_err(),
+            "descending items must be refused",
+        );
+        // ANTI-VACUITY: the legal tiling must still be accepted, or the three
+        // assertions above would pass against a function that refuses everything.
+        assert!(
+            eng.load_items(blob, &[(0, 3, p), (3, 3, p)]).is_ok(),
+            "a legal tiling must still load",
+        );
+    }
 
     /// `ItemParams::validate` is decided and unit-tested on the seam
     /// (`layout.rs`); this proves it is WIRED to the FFI entry point.

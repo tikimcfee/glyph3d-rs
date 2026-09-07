@@ -587,15 +587,28 @@ def direct_write_all(
     # ── pass B: scatter, in parallel, into slots nothing else can touch ─────
     var gbox = List[Float32](unsafe_uninit_length=n_gr * DP_LANES)
     var bp = gbox.unsafe_ptr()
+    # The scatter's core invariant, ASSERTED rather than assumed: the count pass
+    # and the write pass apply the same predicate over the same immutable range,
+    # so a grain must write exactly the survivors it counted. If it ever writes
+    # fewer, `commit` publishes slots nothing wrote — uninitialized memory as
+    # glyphs. `wrote_bad` carries the first offender out; one integer compare per
+    # grain turns a silent corruption into a refusal.
+    var wrote = List[Int](length=n_gr, fill=0)
+    var wp = wrote.unsafe_ptr()
     def _write_task(t: Int) {imm}:
         var i = gr_item[t]
         var pp = paint_ptrs[unsafe_offset = i]
-        _ = write_instances_direct(
+        var rs = write_instances_direct(
             r, group_ids[unsafe_offset = i], pp, Int(pp) != 0,
             flat_colors[unsafe_offset = i], out_ptr, gr_slot[t],
             gr_at[t], gr_end[t], gr_paint[t], bp, t * DP_LANES,
         )
+        wp[unsafe_offset = t] = rs[1]
     parallelize(_write_task, n_gr)
+    for t in range(n_gr):
+        if wrote[t] != gr_surv[t]:
+            paint_bad = -(t + 1)   # negative: a scatter fault, not a paint one
+            return placements^
     _ = len(gr_slot)
     _ = len(gr_paint)
 

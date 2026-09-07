@@ -90,6 +90,13 @@ comptime GE_ARENA_TOO_SMALL: c_int = 10
 # the engine, because here the consequence is an out-of-bounds READ from
 # parallel tasks rather than a wrong colour.
 comptime GE_PAINT_TOO_SHORT: c_int = 11
+# Items that do not tile the blob: a range past its end, or overlapping ranges.
+# The pipeline has always REQUIRED contiguous ascending items and never checked
+# it. Unchecked, a range past the end faults inside the fold (every per-byte
+# array is sized to the blob), and overlapping ranges make the leader count and
+# the write count disagree — which is what GE_ARENA_TOO_SMALL is sized against,
+# so the arena guard is unsound precisely when it is needed.
+comptime GE_BAD_ITEM_RANGE: c_int = 12
 """The descriptor carries a shape word this dylib does not recognise — the caller
 was built against a different FFI surface. See ABI_SHAPE."""
 
@@ -365,6 +372,9 @@ def glyph_engine_load_items(
             )
         )
 
+    if not _items_tile(items, n):
+        return GE_BAD_ITEM_RANGE
+
     var span = Span[UInt8, ImmUntrackedOrigin](unsafe_ptr=blob_ptr, length=n)
     var r = run_pipeline[witness=False](span, s[].trie, items)
     s[].leaders = r.leaders
@@ -419,6 +429,25 @@ def glyph_engine_instance_shape() abi("C") -> UInt64:
     bug is precisely this class, and it was found by pixels rather than by a
     check."""
     return (UInt64(INST_U32S) << 32) | UInt64(PLACE_U32S)
+
+
+def _items_tile(items: List[Item], blob_len: Int) -> Bool:
+    """Whether the items tile [0, blob_len): ascending, non-overlapping, in
+    range. The pipeline has always documented this as a requirement of its
+    callers and never verified it, which made two guards unsound at once — the
+    fold sizes every per-byte array to the blob and walks each item's own range
+    (so a range past the end faults), and the arena bound is computed from a
+    leader count over the BLOB while the writer runs over the ITEMS (so
+    overlapping items write more than the bound allows). Checked here because
+    this is the boundary: past it, the caller's data has become our pointers."""
+    var at = 0
+    for i in range(len(items)):
+        var start = items[i].byte_start
+        var count = items[i].byte_count
+        if start < at or count < 0 or start > blob_len - count:
+            return False
+        at = start + count
+    return True
 
 
 def _write_place[po: Origin[mut=True]](
@@ -500,6 +529,9 @@ def glyph_engine_load_items_direct(
                 Int(u64s[unsafe_offset = 15]),
             )
         )
+
+    if not _items_tile(items, n):
+        return GE_BAD_ITEM_RANGE
 
     var span = Span[UInt8, ImmUntrackedOrigin](unsafe_ptr=blob_ptr, length=n)
     var r = run_pipeline[witness=False](span, s[].trie, items)
