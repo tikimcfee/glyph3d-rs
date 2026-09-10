@@ -40,10 +40,13 @@ pixi run build              # the manifest runner: products current + committed 
 
 **The dependency graph is declared in `build.toml`** (artifact, input globs,
 build command, class) and executed by `glyph` (`glyph/src/main.rs`). `cargo glyph build` brings
-products current (content-hash stamps, not mtimes) and regenerates committed
-artifacts in place — a deliberate, committable act. `pixi run verify` builds
-nothing: it asserts currency and byte-compares every committed artifact against
-a scratch rebuild. The four baseline PNGs are class **golden**: verified,
+products current (content-hash stamps, not mtimes) and then VERIFIES every
+committed artifact against a scratch rebuild — it does not regenerate them.
+Regenerating a committed artifact is a hand act with its own generator (the
+`build =` line on its artifact in build.toml), in dependency order, and the
+result is committed on purpose. This paragraph said "regenerates committed
+artifacts in place" until 2026-09-10; the code never did. `pixi run verify`
+builds nothing at all: it asserts currency and byte-compares. The four baseline PNGs are class **golden**: verified,
 never built — the runner refuses. `pixi run build-native` is the one pixi
 `depends-on` edge (cargo after build-engine); the rest of the graph is
 artifact-level and lives in build.toml because pixi cannot see that cargo
