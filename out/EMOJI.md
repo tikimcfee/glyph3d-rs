@@ -82,18 +82,38 @@ be ~10.5 MB (the PNG bytes plus a small table), both committed, against a
 29.5 MiB pack today. Accepted for the same reason the fixture inputs are
 vendored: the committed artifact must rebuild byte-for-byte here, offline.
 
-## Step 2 — the sheet generator and container — NEXT
+## Step 2 — the sheet generator and container (2026-09-10) [measured]
 
-`tools/gen_emoji_sheet.py` → `assets/atlas/emoji-sheet.bin`, a committed
-artifact with a `--check` mode, declared in build.toml. Header (magic, cell
-size, layer geometry, counts), the cell table keyed by font glyph id, the
-codepoint → glyph table (1,501), the sequence → glyph table (4,166, carried
-for the shaping pass that does not exist yet), then the PNG bytes verbatim.
+`tools/gen_emoji_sheet.py` → `assets/atlas/emoji-sheet.bin`, magic `G3ES`,
+byte-level format in `assets/atlas/FORMAT.md`. A committed artifact in
+build.toml, verified by its own `--check` on every battery pass, with a
+mutation (`emoji-sheet-byte`) that proves the gate reddens when the file is
+edited in place.
+
+| | |
+|---|---|
+| file | 10,885,128 bytes: 160 B header, 341 KB of tables, 10,543,900 B of PNG verbatim |
+| cells | 3,985 of 136×128, in **2 layers of 8160×4352** (60 cols × 34 rows each; 2.6 % slack against 48 % for two full 8192 layers) |
+| tables | cell (glyph → layer, x, y, PNG range), codepoint → glyph (all 1,501), sequence → glyph (4,166 × fixed stride 11), cell names |
+| provenance | the source font's sha256 is in the header — the sheet names the font it came from |
+| bake | 0.15 s; two bakes byte-identical; `--check` rebuilds in memory, byte-compares, and asserts structure with a reader that shares no variables with the writer |
+
+What the structural assertions hold: glyph ids strictly ascending, every cell
+on the grid inside its layer with no collisions, every PNG a PNG of the
+header's size, PNG lengths summing to the blob, codepoints sorted and in
+range, sequences sorted with zero padding and every target owning a cell, a
+layer never exceeding 8192 px, and no layer empty.
+
+Two decisions made here rather than in the plan: the layer split is
+row-balanced (`ceil(rows/layers)` rows per layer) so the last layer is not
+mostly padding, and the sequence table is FIXED-stride (`2 + seqMax` words)
+rather than variable — 183 KB against ~115 KB, in exchange for random access
+without an index when a consumer arrives.
 
 ## Steps 3–6 — as agreed
 
-3. Append-only re-bake of trie and glyph map; the gate is every existing
-   pixel baseline staying byte-equal.
+3. **NEXT.** Append-only re-bake of trie and glyph map; the gate is every
+   existing pixel baseline staying byte-equal.
 4. Loader and upload with the override flag; load time and memory on both
    boxes.
 5. Shader, a visual-check fixture, an `emoji` golden view, a mutation.

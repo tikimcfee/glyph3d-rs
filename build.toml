@@ -71,6 +71,19 @@ build = "python3 tools/gen_real_trie.py"
 verify_cmd = "python3 tools/gen_real_trie.py --verify-only"
 note = "Check mode rebuilds and byte-compares without writing; its own sweeps pin the semantics."
 
+# The colour-emoji sheet: the vendored font's PNG bytes verbatim plus the
+# tables that name them, keyed by the font's glyph id. Every bitmap the font
+# has is a cell, sequence-only ones included (out/EMOJI.md). Rebuilt from the
+# font alone, offline; the check mode rebuilds in memory, byte-compares, and
+# asserts the structure the renderer relies on.
+[artifact.emoji-sheet]
+class = "committed"
+outputs = ["assets/atlas/emoji-sheet.bin"]
+inputs = ["tools/vendor/third-party/noto-emoji/NotoColorEmoji.ttf", "tools/gen_emoji_sheet.py", "tools/emoji_font.py"]
+build = "pixi run gen-emoji-sheet"
+verify_cmd = "pixi run python tools/gen_emoji_sheet.py --check"
+note = "Generator-native check mode; fontTools lives in the pixi env. The font is pinned by fetch hash in vendor-manifest.py."
+
 [artifact.atlas]
 class = "committed"
 outputs = ["assets/atlas/curves.bin", "assets/atlas/glyphmap.bin", "assets/atlas/glyphs.bin", "assets/atlas/codepoints.bin"]
@@ -337,6 +350,15 @@ file = "engine/fixtures/ascii-basic.pipe.bin"
 op = "append"
 arg = " "
 expect = "differs from the committed fixture"
+
+[[mutation]]
+name = "emoji-sheet-byte"
+gate = "committed-artifacts"
+why = "a committed emoji sheet edited in place must not survive a rebuild from the font; the same class as committed-fixture-byte, for the artifact that is 10 MB of bytes nobody can eyeball"
+file = "assets/atlas/emoji-sheet.bin"
+op = "append"
+arg = " "
+expect = "emoji-sheet.bin differs from a fresh bake"
 
 [[mutation]]
 name = "vendored-file-edit"

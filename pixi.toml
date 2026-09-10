@@ -28,6 +28,7 @@ check-gen = { cmd = "python3 tools/gen_real_trie.py --verify-only && python3 too
 # The emoji tools read the vendored colour font with fontTools, which lives in
 # THIS env (pinned below) rather than whatever the host's python3 has.
 emoji-inventory = "python tools/emoji_inventory.py"
+gen-emoji-sheet = "python tools/gen_emoji_sheet.py"
 # The shared library is `.dylib` on macOS and `.so` on Linux; the build tool
 # and `native/build.rs` resolve the name by platform (see build.toml, `{dylib}`).
 # macOS needs install_name_tool so the binary can find it through @rpath;
