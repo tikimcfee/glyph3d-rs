@@ -919,6 +919,22 @@ fn validate(m: &Manifest) -> Vec<String> {
                          hash nothing and always compare equal"
                     ));
                 }
+                // A non-empty input list can still hash nothing. `input_digest`
+                // filters to FILES, and glob's `**` matches DIRECTORIES, so
+                // `native/src/**` contributed zero bytes — from build.toml's
+                // first commit (598205b) until 2026-09-10, the renderer's
+                // stamp never saw a line of renderer source, and `--frozen`
+                // greened on a stale binary. The empty-list check above was
+                // written for this exact failure and could not see it, because
+                // the list was three patterns long.
+                for pat in a.inputs.iter().filter(|s| s.contains('*')) {
+                    if expand(pat).is_empty() {
+                        p.push(format!(
+                            "artifact {name} input pattern {pat} matches no file; the currency \
+                             stamp ignores everything it was meant to cover"
+                        ));
+                    }
+                }
             }
             _ => {}
         }

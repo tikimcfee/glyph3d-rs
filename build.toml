@@ -44,7 +44,7 @@ note = "cargo does NOT build this; native/build.rs only links it. --fp-mode cont
 [artifact.renderer]
 class = "product"
 outputs = ["target/release/glyph3d-native"]
-inputs = ["native/src/**", "native/build.rs", "native/Cargo.toml", "native/Cargo.lock", "native/libglyph_engine.{dylib}"]
+inputs = ["native/src/**/*", "native/build.rs", "native/Cargo.toml", "native/Cargo.lock", "native/libglyph_engine.{dylib}"]
 build = "cd native && cargo build --release"
 note = "Cargo owns its own dependency graph; the stamp only guards the dylib edge cargo cannot see."
 
@@ -74,7 +74,7 @@ note = "Check mode rebuilds and byte-compares without writing; its own sweeps pi
 [artifact.atlas]
 class = "committed"
 outputs = ["assets/atlas/curves.bin", "assets/atlas/glyphmap.bin", "assets/atlas/glyphs.bin", "assets/atlas/codepoints.bin"]
-inputs = ["tools/export-atlas.mjs", "tools/vendor/ref/**", "tools/vendor/hb.cjs", "tools/vendor/hb.wasm"]
+inputs = ["tools/export-atlas.mjs", "tools/vendor/ref/**/*", "tools/vendor/hb.cjs", "tools/vendor/hb.wasm"]
 build = "node tools/export-atlas.mjs"
 verify_scratch = "node tools/export-atlas.mjs --out {scratch}"
 note = "No generator-native check mode; the runner rebuilds to scratch and cmps. Self-aborts before writing if fonts/ranges drift."
@@ -82,7 +82,7 @@ note = "No generator-native check mode; the runner rebuilds to scratch and cmps.
 [artifact.fixtures]
 class = "committed"
 outputs = ["engine/fixtures/*.pipe.bin", "engine/fixtures/*.bake.bin"]
-inputs = ["engine/fixtures/gen.mjs", "engine/fixtures/gen-bake.mjs", "engine/fixtures/inputs/**", "engine/glyph_schema.mjs"]
+inputs = ["engine/fixtures/gen.mjs", "engine/fixtures/gen-bake.mjs", "engine/fixtures/inputs/**/*", "engine/glyph_schema.mjs"]
 build = "cd engine/fixtures && node gen.mjs && node gen-bake.mjs"
 # Verified in a scratch COPY of engine/fixtures (+ ../glyph_schema.mjs, which
 # gen.mjs imports) so the committed corpus is never deleted mid-check — the
@@ -122,7 +122,7 @@ outputs = [
   "out/tooling-ab/baseline/{gpu}/repo-down.png",
   "out/tooling-ab/baseline/{gpu}/repo-back-oblique.png",
 ]
-inputs = ["target/release/glyph3d-native", "native/fixtures/baseline-view.txt", "native/fixtures/g-pick-repo/**"]
+inputs = ["target/release/glyph3d-native", "native/fixtures/baseline-view.txt", "native/fixtures/g-pick-repo/**/*"]
 note = "Blind to everything outside these frames, and cannot distinguish a regression from an intentional change. One set per rasterizer ({gpu}); a set only ever proves the renderer on the hardware that made it. empty.rs in g-pick-repo is zero bytes ON PURPOSE (the only input reaching the page-extent origin seed)."
 
 # Per-view render commands (run from native/, screenshot into {scratch}).
