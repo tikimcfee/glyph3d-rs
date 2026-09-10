@@ -276,7 +276,7 @@ fn build_scene_impl(
                 placement.record_count,
                 placement.record_count - placement.slot_count,
             );
-            let staged = text::stage_records(arena, &placement);
+            let staged = text::stage_records(arena, &placement, &atlas.slot_ink);
             glyph(GlyphScene::new(ctx, color_format, &atlas, staged, camera_mode, cull))
         }
         SceneChoice::Repo {
@@ -291,7 +291,7 @@ fn build_scene_impl(
             let load = repo::load_repo(dir, &default_engine_trie(), &params, *strategy, *verify);
             load.print_stats();
             let atlas = atlas::Atlas::load(ctx, emoji_sheet);
-            let staged = load.into_staged(focus.as_deref());
+            let staged = load.into_staged(focus.as_deref(), &atlas.slot_ink);
             glyph(GlyphScene::new(ctx, color_format, &atlas, staged, camera_mode, cull))
         }
     }

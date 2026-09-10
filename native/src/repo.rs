@@ -683,7 +683,7 @@ pub fn rederive_records(
 impl RepoLoad {
     /// Convert into the renderer's staged form. `focus` selects one file
     /// (first rel-path containing the substring) for the camera to frame.
-    pub fn into_staged(self, focus: Option<&str>) -> StagedText {
+    pub fn into_staged(self, focus: Option<&str>, slot_ink: &[Option<[f32; 4]>]) -> StagedText {
         log::info!(
             "field bounds: x [0, {:.0}], y [{:.0}, {:.1}] — {:.0}x{:.0} world units",
             self.bounds_max[0],
@@ -715,7 +715,7 @@ impl RepoLoad {
                     ],
                     slot_base: v.slot_base as u32,
                     slot_count: v.slot_count as u32,
-                    tint: crate::glyph_scene::seg_tint(insts, v.width, v.height),
+                    tint: crate::glyph_scene::seg_tint(insts, v.width, v.height, slot_ink),
                 }
             })
             .collect();

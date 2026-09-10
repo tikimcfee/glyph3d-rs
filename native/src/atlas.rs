@@ -65,6 +65,10 @@ pub struct TrieTable {
     /// Informational header fields (mapped codepoint count).
     pub mapped_count: u32,
     pub slot_count: u32,
+    /// Per slot, the emoji sheet cell a bitmap slot draws from (glyphs.bin
+    /// slot record word 3), or `None` for outline/blank slots and for the
+    /// web-era bitmap slots the font has no cell for (NO_CELL).
+    pub emoji_cell: Vec<Option<u32>>,
 }
 
 impl TrieTable {
@@ -79,6 +83,19 @@ impl TrieTable {
             em_height_fu: gl[7],
         };
         let slot_count = gl[4];
+        // Slot records follow the font records (FORMAT.md glyphs.bin): read
+        // each one's emojiCell, which the backdrop tint needs to know what a
+        // bitmap slot's pixels look like.
+        let (font_count, font_rec_words, slot_rec_words) = (gl[3] as usize, gl[8] as usize / 4, gl[9] as usize / 4);
+        let slots_at = 11 + font_count * font_rec_words;
+        const SLOT_FLAG_BITMAP: u32 = 1;
+        const NO_CELL: u32 = 0xFFFF_FFFF;
+        let emoji_cell: Vec<Option<u32>> = (0..slot_count as usize)
+            .map(|s| {
+                let r = &gl[slots_at + s * slot_rec_words..][..slot_rec_words];
+                (r[2] & SLOT_FLAG_BITMAP != 0 && r[3] != NO_CELL).then_some(r[3])
+            })
+            .collect();
 
         let cp = read_words(&dir.join("codepoints.bin"));
         check_magic(&cp, "G3CP", &dir.join("codepoints.bin"));
@@ -98,6 +115,7 @@ impl TrieTable {
             entry_stride,
             mapped_count,
             slot_count,
+            emoji_cell,
         };
         // Sanity: 'A' must resolve to slot 34 / advance 1229 (FORMAT.md worked example).
         let a = t.lookup(0x41);
@@ -140,10 +158,15 @@ pub struct Atlas {
     /// The CPU-side codepoint→slot trie (Stage E1: shared with the engine
     /// cross-check via [`TrieTable`]).
     pub trie: TrieTable,
-    /// The colour-emoji sheet, decoded and resident. Nothing samples it yet
-    /// (step 5 of `out/EMOJI.md` is the shader); it is loaded here so its
-    /// cost is measured before a pixel depends on it.
+    /// The colour-emoji sheet, decoded and resident; the shader's mode-1
+    /// branch samples it.
     pub emoji: EmojiTexture,
+    /// Per SLOT, what a bitmap glyph's pixels average to — linear rgb,
+    /// alpha-weighted, plus its mean alpha — for the far-LOD backdrop tint
+    /// (`glyph_scene::seg_tint`), which otherwise only knows the instance's
+    /// syntax colour, a colour an emoji does not display. `None` for every
+    /// slot that is not a bitmap with a cell.
+    pub slot_ink: Vec<Option<[f32; 4]>>,
 }
 
 // ── the colour-emoji sheet (G3ES) ─────────────────────────────────────────
@@ -300,8 +323,12 @@ impl EmojiSheet {
     /// Decode every cell into per-layer RGBA8 (straight alpha, sRGB-encoded
     /// as the PNGs are). Cells are laid in rows of `cols`; each row of cells
     /// is one contiguous band of the layer buffer, so the bands are handed
-    /// out to threads with no shared writes.
-    pub fn decode_layers(&self) -> Vec<Vec<u8>> {
+    /// out to threads with no shared writes. Also returns, per cell, the
+    /// alpha-weighted mean of its pixels in LINEAR rgb and its mean alpha —
+    /// what the cell looks like from far away, for the backdrop tint.
+    pub fn decode_layers(&self) -> (Vec<Vec<u8>>, Vec<[f32; 4]>) {
+        // sRGB byte → linear, the shader's pow(2.2) decode, tabulated once.
+        let lut: Vec<f32> = (0..256).map(|b| (b as f32 / 255.0).powf(2.2)).collect();
         let (lw, lh, cw, ch) = (self.layer_w as usize, self.layer_h as usize, self.cell_w as usize, self.cell_h as usize);
         let per_layer = (self.cols * self.rows_per_layer) as usize;
         let mut layers: Vec<Vec<u8>> = (0..self.layers).map(|_| vec![0u8; lw * lh * 4]).collect();
@@ -315,6 +342,7 @@ impl EmojiSheet {
         let next = std::sync::atomic::AtomicUsize::new(0);
         let workers = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1).min(bands.len().max(1));
         let bands_ref = std::sync::Mutex::new(bands);
+        let ink: Vec<std::sync::Mutex<[f32; 4]>> = (0..self.cells.len()).map(|_| std::sync::Mutex::new([0.0; 4])).collect();
         std::thread::scope(|s| {
             for _ in 0..workers {
                 s.spawn(|| loop {
@@ -336,14 +364,29 @@ impl EmojiSheet {
                             .into_rgba8();
                         assert_eq!(img.dimensions(), (self.cell_w, self.cell_h), "emoji cell {ci}: size");
                         let x0 = cell.x as usize * 4;
+                        let mut acc = [0f64; 4];
                         for (r, row) in img.as_raw().chunks_exact(cw * 4).enumerate() {
                             band[r * lw * 4 + x0..r * lw * 4 + x0 + cw * 4].copy_from_slice(row);
+                            for px in row.as_chunks::<4>().0 {
+                                let a = px[3] as f64 / 255.0;
+                                acc[0] += lut[px[0] as usize] as f64 * a;
+                                acc[1] += lut[px[1] as usize] as f64 * a;
+                                acc[2] += lut[px[2] as usize] as f64 * a;
+                                acc[3] += a;
+                            }
                         }
+                        let n = (cw * ch) as f64;
+                        let mean = if acc[3] > 0.0 {
+                            [(acc[0] / acc[3]) as f32, (acc[1] / acc[3]) as f32, (acc[2] / acc[3]) as f32, (acc[3] / n) as f32]
+                        } else {
+                            [0.0; 4]
+                        };
+                        *ink[ci].lock().expect("ink mutex") = mean;
                     }
                 });
             }
         });
-        layers
+        (layers, ink.into_iter().map(|m| m.into_inner().expect("ink mutex")).collect())
     }
 }
 
@@ -394,6 +437,9 @@ pub struct EmojiTexture {
     pub mip_levels: u32,
     /// Bytes uploaded across all layers and levels.
     pub texture_bytes: u64,
+    /// Per cell: alpha-weighted mean linear rgb + mean alpha (see
+    /// `EmojiSheet::decode_layers`).
+    pub cell_ink: Vec<[f32; 4]>,
 }
 
 impl EmojiTexture {
@@ -401,7 +447,7 @@ impl EmojiTexture {
         let t0 = std::time::Instant::now();
         let sheet = EmojiSheet::load(path);
         let t_parse = t0.elapsed();
-        let level0 = sheet.decode_layers();
+        let (level0, cell_ink) = sheet.decode_layers();
         let t_decode = t0.elapsed() - t_parse;
         let mip_levels = mip_levels_for(sheet.cell_w, sheet.cell_h);
         let mut levels: Vec<Vec<Vec<u8>>> = Vec::with_capacity(sheet.layers as usize); // [layer][level]
@@ -474,7 +520,7 @@ impl EmojiTexture {
             t_mips.as_secs_f64() * 1e3,
             t_upload.as_secs_f64() * 1e3,
         );
-        Self { texture, sheet, mip_levels, texture_bytes }
+        Self { texture, sheet, mip_levels, texture_bytes, cell_ink }
     }
 }
 
@@ -600,6 +646,16 @@ impl Atlas {
         );
 
         let emoji = EmojiTexture::load(ctx, emoji_sheet);
+        let slot_ink: Vec<Option<[f32; 4]>> = trie
+            .emoji_cell
+            .iter()
+            .map(|c| c.map(|c| emoji.cell_ink[c as usize]))
+            .collect();
+        log::info!(
+            "slot ink: {} of {} slots are bitmap cells with a mean colour for the backdrop",
+            slot_ink.iter().filter(|s| s.is_some()).count(),
+            slot_ink.len()
+        );
 
         Self {
             curves,
@@ -607,6 +663,7 @@ impl Atlas {
             metrics,
             trie,
             emoji,
+            slot_ink,
         }
     }
 
@@ -699,8 +756,17 @@ mod emoji_sheet_tests {
     #[test]
     fn decodes_cells_into_their_layer_positions() {
         let sheet = EmojiSheet::parse(&synthetic(3, b"G3ES"), "synthetic");
-        let layers = sheet.decode_layers();
+        let (layers, ink) = sheet.decode_layers();
         assert_eq!(layers.len(), 1);
+        // Mean over the 2×2: alpha-weighted linear rgb of (red@1, green@.5,
+        // blue@0, white@1) and mean alpha (255+128+0+255)/4/255.
+        let a = [1.0f64, 128.0 / 255.0, 0.0, 1.0];
+        let lin = |b: u8| (b as f64 / 255.0).powf(2.2);
+        let want_r = (lin(255) * a[0] + lin(255) * a[3]) / a.iter().sum::<f64>();
+        assert!((ink[0][0] as f64 - want_r).abs() < 1e-5, "mean r {} vs {want_r}", ink[0][0]);
+        assert!((ink[0][2] as f64 - lin(255) * a[3] / a.iter().sum::<f64>()).abs() < 1e-5, "transparent blue must not count");
+        assert!((ink[0][3] as f64 - a.iter().sum::<f64>() / 4.0).abs() < 1e-6);
+        assert_eq!(ink.len(), 3);
         let l = &layers[0];
         assert_eq!(l.len(), 64 * 2 * 4);
         let texel = |x: usize, y: usize| <[u8; 4]>::try_from(&l[(y * 64 + x) * 4..][..4]).unwrap();

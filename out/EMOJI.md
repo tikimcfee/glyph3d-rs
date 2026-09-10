@@ -238,5 +238,43 @@ change plus a re-baseline of this one frame.
 3. **DONE 2026-09-10 — see below.**
 4. **DONE 2026-09-10 — see below.**
 5. **DONE 2026-09-10 — see below.**
-6. **NEXT.** Correctness sweep: picking on double-advance cells, backdrop
-   tint for emoji-heavy segments, the LOD dither band, the M2's numbers.
+## Step 6 — the correctness sweep (2026-09-10) [measured on Linux]
+
+**Picking.** Row/col picks never see an advance — `col` is a leader count on
+both the renderer and the oracle — so the five probes on `emoji-view.txt`
+(a web-era rocket, an appended rocket, the `d` two leaders after it, a
+flag, a sparkle) agreed with `g_pick_oracle.py` before any change. The ray
+path is the one that could be wrong (a record's rect is `[x, x + advance]`),
+so the pick-oracle gate now round-trips a pixel through the rocket, through
+the `d` after it, and through a web-era slot; all resolve to the record the
+row/col pick named. Nothing in the pick code changed.
+
+**Backdrop tint.** `seg_tint` averaged every instance's colour — for an
+emoji that is the syntax colour, which it does not display. `Atlas` now
+carries `slot_ink`: per slot, the alpha-weighted mean LINEAR rgb of a bitmap
+cell (computed in the decode workers from the same pixels the texture gets,
+through the same pow-2.2 table as the shader) and its mean alpha; the tint
+uses it for bitmap slots and counts them as the two cells their advance
+covers. Outline glyphs sum exactly as before, so **all seven goldens are
+byte-equal** (none has an emoji). Measured on the emoji fixture at 0.02×
+(one backdrop quad): mean backdrop rgb 121/126/123 → 125/129/125 — a few
+levels warmer on a segment that is 593 glyphs, 40 of them emoji. Correct
+direction, small, and nothing gates it: no golden frames a far emoji-heavy
+segment. Recorded as a blind spot rather than papered with a frame that
+would be one tinted rectangle.
+
+**LOD and dither.** The fade band the web had is not ported (the shader
+header has said so since Stage C; it hard-discards at alpha 0), and the LOD
+swap is per SEGMENT in the CPU cull, so emoji and text swap together. Nothing
+emoji-specific to do; the mip cap in `mip_levels_for` is what keeps the
+far end of an emoji clean until the swap.
+
+**Windowed.** `--render-file fixtures/emoji-view.txt` on Wayland: 75 FPS at
+Fifo, frame 30 captured, no GPU errors.
+
+**For the M2, whenever it pulls:** the sheet load (decode + mips + upload) is
+~120 ms and 361 MiB here; expect a few hundred ms and the same bytes there.
+`cargo glyph test` will report `emoji.png` as having no `metal-apple`
+baseline and print the adoption commands; look at the frame first — this is
+the one view where the two rasterizers' FILTERS, not their edge rules, are
+being compared, and `cargo glyph drift` will say more than "edge noise".

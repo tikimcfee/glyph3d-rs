@@ -88,13 +88,13 @@ pub struct StagedText {
 
 /// Stage F: one cull segment covering a whole staged block (the text/engine
 /// scenes don't need per-group granularity — their instance counts are small).
-fn cover_segment(instances: &[GlyphInstance], min: [f32; 3], max: [f32; 3]) -> SegCull {
+fn cover_segment(instances: &[GlyphInstance], min: [f32; 3], max: [f32; 3], slot_ink: &[Option<[f32; 4]>]) -> SegCull {
     SegCull {
         min,
         max,
         slot_base: 0,
         slot_count: instances.len() as u32,
-        tint: seg_tint(instances, max[0] - min[0], max[1] - min[1]),
+        tint: seg_tint(instances, max[0] - min[0], max[1] - min[1], slot_ink),
     }
 }
 
@@ -293,6 +293,7 @@ pub fn stage_file(atlas: &Atlas, path: &Path, copies: u32) -> StagedText {
         &instances,
         [0.0, -total_h, z_lo],
         [total_w, line_h, z_hi],
+        &atlas.slot_ink,
     )];
 
     StagedText {
@@ -629,7 +630,7 @@ pub fn diff_records(records: &[GlyphRecord], expected: &[RefGlyph]) -> Result<()
 ///
 /// An item with no ink has no meaningful frame; a unit square is this caller's
 /// answer, unchanged from when the loop lived here.
-pub fn stage_records(arena: GlyphArena, placement: &ItemPlacement) -> StagedText {
+pub fn stage_records(arena: GlyphArena, placement: &ItemPlacement, slot_ink: &[Option<[f32; 4]>]) -> StagedText {
     let (min, max) = if arena.is_empty() {
         ([0.0, 0.0, 0.0], [1.0, 1.0, 0.0])
     } else {
@@ -640,7 +641,7 @@ pub fn stage_records(arena: GlyphArena, placement: &ItemPlacement) -> StagedText
     StagedText {
         glyphs_emitted: instances.len(),
         groups: vec![GroupRow::identity([0.0; 3])],
-        segments: vec![cover_segment(&instances, min, max)],
+        segments: vec![cover_segment(&instances, min, max, slot_ink)],
         instances,
         bounds_min: min,
         bounds_max: max,

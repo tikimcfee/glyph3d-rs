@@ -254,7 +254,12 @@ fixture carries.
 **pick-oracle** (`tools/check-pick-oracle.sh`; was `check-stage-g.sh` — the `g`
 was a fossil stage letter, not a position). Scripted picks and pixel-ray round
 trips from the native binary against an independent Python fold oracle. Red on
-any pick resolving to the wrong record. One mechanical caution survives the
+any pick resolving to the wrong record. Since 2026-09-10 it also probes
+`native/fixtures/emoji-view.txt`: a row/col pick never sees a glyph's advance
+(col is a leader count on both sides), so the emoji probes are pixel-ray
+round trips on a double-advance cell and on the cell two leaders AFTER it —
+the place a mis-sized rect would put the ray in the wrong glyph. The oracle
+itself knows nothing of advances, which is why it is a witness here. One mechanical caution survives the
 rename: under `set -euo pipefail` an oracle that exits nonzero inside a command
 substitution aborts the script mid-run. The wrapper still reports FAIL, but
 every check after the abort point silently did not run. (The missing
