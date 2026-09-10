@@ -51,6 +51,13 @@ VERSION = 1
 HEADER_WORDS = 40           # 160 bytes; words 26-31 reserved (zero), 32-39 the font sha256
 MAX_LAYER_PX = 8192         # a layer's width and height stay within this
 SHEET_WIDTH_PX = 8192       # cells per row = SHEET_WIDTH_PX // cell_w
+# The layer WIDTH is padded up to a multiple of this so that every mip level's
+# row pitch (width x 4 bytes) is a multiple of wgpu's 256-byte upload
+# alignment: 64 px x 4 B = 256 B at level 0, and halving stays aligned down to
+# level 6. 60 cells x 136 px = 8160 would upload with a 32,640-byte pitch,
+# which is 127.5 x 256 and refused. The renderer reads layerW from the header
+# and allocates exactly that; cells never sit in the padding.
+LAYER_W_ALIGN_PX = 64
 SEQ_MAX = 9                 # longest GSUB sequence in the font, asserted
 SEQ_STRIDE = 2 + SEQ_MAX    # [len, glyph, cp x SEQ_MAX] per sequence record
 CELL_STRIDE = 6             # [glyph, layer, x, y, png_offset, png_len]
@@ -73,6 +80,9 @@ def build(ef: emoji_font.EmojiFont) -> bytes:
                              "carries one set for every cell")
 
     cols = SHEET_WIDTH_PX // cw
+    layer_w = -(-(cols * cw) // LAYER_W_ALIGN_PX) * LAYER_W_ALIGN_PX
+    if layer_w > MAX_LAYER_PX:
+        raise SystemExit(f"padded layer width {layer_w} exceeds {MAX_LAYER_PX}")
     rows_total = -(-len(cells) // cols)
     max_rows = MAX_LAYER_PX // ch
     layers = -(-rows_total // max_rows)
@@ -118,7 +128,7 @@ def build(ef: emoji_font.EmojiFont) -> bytes:
     hdr = [
         MAGIC, VERSION, HEADER_WORDS * 4,
         cw, ch, len(cells),
-        cols, rows_per_layer, layers, cols * cw, rows_per_layer * ch,
+        cols, rows_per_layer, layers, layer_w, rows_per_layer * ch,
         ef.ppem, ef.strike_ascender & 0xFFFFFFFF, ef.strike_descender & 0xFFFFFFFF,
         bx & 0xFFFFFFFF, by & 0xFFFFFFFF, adv,
         ef.upem, ef.ascender & 0xFFFFFFFF, ef.descender & 0xFFFFFFFF, ef.num_glyphs,
@@ -156,7 +166,9 @@ def parse_and_assert(data: bytes) -> dict:
     cw, ch, n = hdr[3], hdr[4], hdr[5]
     cols, rows, layers, lw, lh = hdr[6], hdr[7], hdr[8], hdr[9], hdr[10]
     n_cp, n_seq, seq_max, png_start, png_len = hdr[21], hdr[22], hdr[23], hdr[24], hdr[25]
-    check(lw == cols * cw and lh == rows * ch, "layer geometry disagrees with its factors")
+    check(lw >= cols * cw and lw - cols * cw < LAYER_W_ALIGN_PX and lh == rows * ch,
+          "layer geometry disagrees with its factors")
+    check(lw % LAYER_W_ALIGN_PX == 0, f"layer width is not a multiple of {LAYER_W_ALIGN_PX} px (upload pitch alignment)")
     check(lw <= MAX_LAYER_PX and lh <= MAX_LAYER_PX, f"a layer exceeds {MAX_LAYER_PX} px")
     check(cols * rows * layers >= n, "layers cannot hold every cell")
     check(cols * rows * (layers - 1) < n, "a whole layer would be empty")

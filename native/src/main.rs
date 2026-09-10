@@ -62,10 +62,10 @@ pub enum SceneChoice {
     /// Stage A stress demo (1M colored quads).
     Demo,
     /// Stage C Slug text field: stage `file`, tiled `copies` times.
-    Text { file: PathBuf, copies: u32 },
+    Text { file: PathBuf, copies: u32, emoji_sheet: PathBuf },
     /// Stage E1: lay `file` out with the Mojo engine (real atlas trie) and
     /// render the engine's records through the same Slug glyph renderer.
-    EngineText { file: PathBuf, trie: PathBuf },
+    EngineText { file: PathBuf, trie: PathBuf, emoji_sheet: PathBuf },
     /// Stage E2: load a whole repository as a field of code pages — one group
     /// per file, one shared glyph arena, grid layout.
     Repo {
@@ -79,6 +79,10 @@ pub enum SceneChoice {
         /// other mode covered so making one default cannot silently retire the
         /// other.
         wrap_mode: fold::WrapMode,
+        /// The colour-emoji sheet (`--emoji-sheet`; default the committed
+        /// one). Every glyph scene loads it — the same handle the engine
+        /// trie has, so swapping a sheet is a command-line act.
+        emoji_sheet: PathBuf,
     },
 }
 
@@ -118,6 +122,12 @@ pub fn atlas_dir() -> PathBuf {
 /// `python3 tools/gen_real_trie.py` (not a conformance fixture).
 pub fn default_engine_trie() -> PathBuf {
     atlas_dir().join("engine-trie.bin")
+}
+
+/// The colour-emoji sheet the renderer loads unless `--emoji-sheet` says
+/// otherwise — `assets/atlas/emoji-sheet.bin`, baked by tools/gen_emoji_sheet.py.
+pub fn default_emoji_sheet() -> PathBuf {
+    atlas_dir().join("emoji-sheet.bin")
 }
 
 /// The engine layout params the renderer/cross-check use: unit cell height
@@ -244,8 +254,8 @@ fn build_scene_impl(
     };
     match choice {
         SceneChoice::Demo => (Box::new(Scene::new(ctx, color_format)), None),
-        SceneChoice::Text { file, copies } => {
-            let atlas = atlas::Atlas::load(ctx);
+        SceneChoice::Text { file, copies, emoji_sheet } => {
+            let atlas = atlas::Atlas::load(ctx, emoji_sheet);
             let staged = text::stage_file(&atlas, file, *copies);
             log::info!(
                 "staged {}: {} codepoints → {} glyph instances ({} copies, {} missing/bitmap)",
@@ -257,8 +267,8 @@ fn build_scene_impl(
             );
             glyph(GlyphScene::new(ctx, color_format, &atlas, staged, camera_mode, cull))
         }
-        SceneChoice::EngineText { file, trie } => {
-            let atlas = atlas::Atlas::load(ctx);
+        SceneChoice::EngineText { file, trie, emoji_sheet } => {
+            let atlas = atlas::Atlas::load(ctx, emoji_sheet);
             let (arena, placement) = engine_layout(file, trie);
             log::info!(
                 "engine-staged {}: {} records ({} blank/missing slots dropped)",
@@ -275,11 +285,12 @@ fn build_scene_impl(
             verify,
             focus,
             wrap_mode,
+            emoji_sheet,
         } => {
             let params = repo::RepoParams { wrap_mode: *wrap_mode, ..Default::default() };
             let load = repo::load_repo(dir, &default_engine_trie(), &params, *strategy, *verify);
             load.print_stats();
-            let atlas = atlas::Atlas::load(ctx);
+            let atlas = atlas::Atlas::load(ctx, emoji_sheet);
             let staged = load.into_staged(focus.as_deref());
             glyph(GlyphScene::new(ctx, color_format, &atlas, staged, camera_mode, cull))
         }
@@ -341,6 +352,11 @@ struct Cli {
     /// Stage D: run the Mojo glyph engine in-process on PATH, print records, exit
     #[arg(long, value_name = "PATH")]
     engine_file: Option<PathBuf>,
+    /// The colour-emoji sheet every glyph scene loads (default:
+    /// assets/atlas/emoji-sheet.bin, baked from the vendored Noto Color Emoji).
+    /// Point it at another G3ES file to swap the sheet without a rebuild.
+    #[arg(long, value_name = "PATH")]
+    emoji_sheet: Option<PathBuf>,
     /// Trie for engine modes (default: assets/atlas/engine-trie.bin — the real
     /// atlas mapping; pass a .pipe.bin fixture for the toy one)
     #[arg(long, value_name = "PATH")]
@@ -1087,6 +1103,7 @@ fn main() {
         return;
     }
 
+    let emoji_sheet = cli.emoji_sheet.clone().unwrap_or_else(default_emoji_sheet);
     let choice = if cli.demo {
         SceneChoice::Demo
     } else if let Some(dir) = &cli.load_repo {
@@ -1096,17 +1113,20 @@ fn main() {
             verify: cli.repo_verify,
             focus: cli.focus_file.clone(),
             wrap_mode: parse_wrap_mode(&cli.wrap_mode),
+            emoji_sheet,
         }
     } else if let Some(file) = &cli.engine_render {
         let trie = cli.engine_trie.unwrap_or_else(default_engine_trie);
         SceneChoice::EngineText {
             file: file.clone(),
             trie,
+            emoji_sheet,
         }
     } else {
         SceneChoice::Text {
             file: cli.render_file.unwrap_or_else(default_text_file),
             copies: cli.copies,
+            emoji_sheet,
         }
     };
 
@@ -1163,6 +1183,7 @@ mod cli_tests {
         assert_eq!(cli.zoom, 1.0);
         assert!(cli.engine_file.is_none());
         assert!(cli.engine_trie.is_none());
+        assert!(cli.emoji_sheet.is_none());
         assert_eq!(cli.engine_loop, 1);
         assert!(cli.engine_check.is_none());
         assert!(cli.engine_render.is_none());
@@ -1206,7 +1227,9 @@ mod cli_tests {
             "--render-file", "src/main.rs", "--engine-file", "a.rs", "--engine-trie", "t.bin",
             "--engine-check", "b.rs", "--engine-render", "c.rs",
             "--present-mode", "mailbox", "--gpu-key", "--gpu-profile",
+            "--emoji-sheet", "sheets/other.bin",
         ]);
+        assert_eq!(cli.emoji_sheet, Some(PathBuf::from("sheets/other.bin")));
         assert_eq!(cli.present_mode, "mailbox");
         assert_eq!(parse_present_mode(&cli.present_mode), wgpu::PresentMode::Mailbox);
         assert!(cli.gpu_key);

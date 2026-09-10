@@ -344,7 +344,7 @@ Header — 40 u32 words (160 bytes):
 | 6 | cols | 60 — cells per row (8192 // cellW) |
 | 7 | rowsPerLayer | 34 |
 | 8 | layers | 2 |
-| 9, 10 | layerW, layerH | 8160, 4352 — the texture size per layer; read these, derive nothing |
+| 9, 10 | layerW, layerH | 8192, 4352 — the texture size per layer; read these, derive nothing. `layerW` is `cols × cellW` (8160) padded up to a multiple of 64 px so every mip level's row pitch is a multiple of wgpu's 256-byte upload alignment; the padding holds no cell |
 | 11 | ppem | 109 — the strike |
 | 12, 13 | strikeAscender, strikeDescender | 101, −27 px (i32) |
 | 14, 15, 16 | bearingX, bearingY, advancePx | 0, 101, 136 — one set for every cell |
@@ -379,12 +379,21 @@ Then, in order, all u32 little-endian:
   bytes. Debug/log use only.
 - **PNG blob** — the cells' PNG files, concatenated in cell order, verbatim.
 
-**Renderer contract (step 4, not yet built):** decode each cell at load into
-an `Rgba8UnormSrgb` 2D array texture of `layers` × `layerW` × `layerH`, mipmapped;
-a bitmap instance's quad samples its cell's rect with filtering. The glyph
-map's `emojiCell` (`mode 1` slots) will index the cell table after the
-append-only re-bake of step 3; today those values are the web's dead canvas
-indices and the branch discards.
+**Renderer contract (`native/src/atlas.rs`, `EmojiSheet` / `EmojiTexture`,
+2026-09-10):** every cell is decoded at load (the `image` crate's PNG path;
+the PNGs are palette + tRNS) into an `Rgba8UnormSrgb` 2D-array texture of
+`layers` × `layerW` × `layerH`, **straight alpha**, with `mip_levels_for(cell)`
+levels — 4 for the 136×128 cell: level `k` averages 2^k × 2^k texels and the
+cap is the largest `k` whose footprint still tiles the cell, so no mip bleeds
+a neighbour's colour into a cell's border (below a 17×16-px cell the LOD
+backdrop replaces the segment anyway). Mips are box-filtered in
+**premultiplied** space and un-premultiplied for storage, so a transparent
+texel's arbitrary palette colour cannot bleed into its opaque neighbours'
+average; the shader premultiplies after the sample. The glyph map's
+`emojiCell` (`mode 1` slots) indexes the cell table; `--emoji-sheet PATH`
+points the renderer at another G3ES file. Nothing samples the texture yet
+(step 5); it is loaded so the cost is measured: ~120 ms and 361 MiB on the
+first Linux box.
 
 Cells are square-ish (136×128) at a 2× advance; the layout side of that is
 already in the trie (bitmap entries carry `2 × 1229` fu), which is why no

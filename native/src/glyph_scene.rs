@@ -906,6 +906,11 @@ impl CullState {
 
 pub struct GlyphScene {
     pub pipeline: wgpu::RenderPipeline,
+    /// The colour-emoji sheet, resident for the scene's lifetime (a view keeps
+    /// its texture alive). Underscored because nothing samples it yet — step 5
+    /// of `out/EMOJI.md` binds it; step 4 loads it so the cost is measured
+    /// before a pixel depends on it.
+    _emoji_view: wgpu::TextureView,
     /// Stage E2: one bind group per instance-buffer CHUNK. A repo-scale field
     /// can exceed `max_storage_buffer_binding_size` (48 B × tens of millions
     /// of glyphs), so the arena is split into buffers that each fit the
@@ -1255,6 +1260,17 @@ impl GlyphScene {
             // Stage G: COPY_DST for partial per-row edit uploads (80 B/row).
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
         });
+        let emoji_view = atlas.emoji.texture.create_view(&wgpu::TextureViewDescriptor {
+            label: Some("emoji sheet view"),
+            dimension: Some(wgpu::TextureViewDimension::D2Array),
+            ..Default::default()
+        });
+        log::info!(
+            "emoji sheet resident: {} cells, {} mip levels, {:.1} MiB",
+            atlas.emoji.sheet.cells.len(),
+            atlas.emoji.mip_levels,
+            atlas.emoji.texture_bytes as f64 / (1 << 20) as f64,
+        );
         log::info!(
             "glyph field: {} instances ({} MiB) in {} chunk(s) of ≤{} ({} MiB binding limit), {} groups",
             instances.len(),
@@ -1747,6 +1763,7 @@ impl GlyphScene {
 
         Self {
             pipeline,
+            _emoji_view: emoji_view,
             bind_groups,
             chunk_counts,
             chunk_cap: chunk_cap as u32,

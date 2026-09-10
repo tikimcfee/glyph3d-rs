@@ -93,7 +93,7 @@ edited in place.
 | | |
 |---|---|
 | file | 10,885,128 bytes: 160 B header, 341 KB of tables, 10,543,900 B of PNG verbatim |
-| cells | 3,985 of 136×128, in **2 layers of 8160×4352** (60 cols × 34 rows each; 2.6 % slack against 48 % for two full 8192 layers) |
+| cells | 3,985 of 136×128, in **2 layers of 8192×4352** (60 cols × 34 rows each = 8160 px wide, padded to 8192 so every mip's row pitch is 256-byte aligned for upload; 2.6 % slack against 48 % for two full-height layers) |
 | tables | cell (glyph → layer, x, y, PNG range), codepoint → glyph (all 1,501), sequence → glyph (4,166 × fixed stride 11), cell names |
 | provenance | the source font's sha256 is in the header — the sheet names the font it came from |
 | bake | 0.15 s; two bakes byte-identical; `--check` rebuilds in memory, byte-compares, and asserts structure with a reader that shares no variables with the writer |
@@ -153,10 +153,54 @@ measured starting state. The pick oracle (`g_pick_oracle.py`) does not read
 the trie and knows nothing of double advances; no corpus it runs on contains
 one yet — a blind spot for step 6.
 
-## Steps 4–6 — as agreed
+## Step 4 — the loader and the upload (2026-09-10) [measured on Linux]
+
+`native/src/atlas.rs`: `EmojiSheet` parses the G3ES blob (asserting the
+geometry, the cell table, the PNG ranges and the upload-pitch alignment it
+relies on) and `EmojiTexture` decodes every cell into an `Rgba8UnormSrgb`
+2D-array texture with box-filtered mips and uploads it. `--emoji-sheet PATH`
+is the handle. The glyph scene holds the texture resident; nothing samples it
+yet, which is the point of doing this step alone: **all six pixel baselines
+byte-equal**, and the cost is known before a pixel depends on it.
+
+| | Linux (9950X3D, RTX 5090) |
+|---|---:|
+| parse | 1.6 ms |
+| decode, 3,985 palette PNGs | 15.3 ms on 32 threads (cell-row bands, no shared writes) |
+| mips (3 levels, premultiplied box filter, single-threaded) | 71.7 ms |
+| upload enqueue | 32.6 ms |
+| texture | 2 layers × 8192×4352, 4 levels, **361.2 MiB** |
+| VRAM, windowed repo scene | 2,999 → 3,380 MiB (**+381 MiB**) |
+
+Three decisions made here, each cheap to revisit and each stated so the M2
+run can disagree with numbers:
+
+- **Straight alpha in the texture, premultiply in the shader.** The Slug
+  pass already outputs premultiplied linear (`pow(color, 2.2) * alpha`); an
+  sRGB texture sampled straight and premultiplied after the sample lands in
+  the same space. Premultiplying BEFORE the sRGB decode would be a different
+  (wrong) product.
+- **Mips in premultiplied space, stored straight.** The PNGs are palette +
+  tRNS and a transparent texel's colour is arbitrary; a straight-alpha
+  average bleeds it into the edge. The unit test pins this on a 2×2 image
+  with a transparent blue texel: alpha-weighted gives (204,153,102,160),
+  straight would have put blue at 127.
+- **Four mip levels, capped where the footprint would cross a cell.** Level
+  3 is a 17×16-px cell; smaller than that the LOD backdrop replaces the
+  segment. What this does NOT cover: draw-time bilinear at level 3 still
+  mixes a cell's outermost texel with its neighbour's — a half-texel inset in
+  the UV rect (step 5's job) is the standard cure.
+
+The mip filter is the largest cost and single-threaded; on the M2's four
+performance cores expect decode to be ~4x slower and mips about the same.
+If ~380 MiB matters on 16 GiB shared memory, the levers are renderer-side
+(upload fewer levels, or a half-resolution tier) and the sheet stays the
+font's bytes.
+
+## Steps 5–6 — as agreed
 
 3. **DONE 2026-09-10 — see below.**
-4. **NEXT.** Loader and upload with the override flag; load time and memory
-   on both boxes.
-5. Shader, a visual-check fixture, an `emoji` golden view, a mutation.
+4. **DONE 2026-09-10 — see below.**
+5. **NEXT.** Shader, a visual-check fixture, an `emoji` golden view, a
+   mutation.
 6. Correctness sweep: picking on double-advance cells, backdrop tint, dither.
