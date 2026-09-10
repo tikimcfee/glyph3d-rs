@@ -178,7 +178,13 @@ def main() -> int:
     expect(0x0041, 34, 1229, 0, "'A'      (outline, one cell)")
     expect(0x0020, 1, 1229, 0, "' '      (empty slot, one cell)")
     expect(0x1F400, 3839, 2458, 2, "'RAT'    (bitmap, double advance)")
-    expect(0x1F680, 0, 1229, 1, "'ROCKET' (missing — shared missing block)")
+    # Appended by the emoji sheet (2026-09-10): the rocket was the FORMAT.md
+    # example of a MISSING codepoint until the native slots landed after the
+    # web's 4,431. Slot 4759 is a pin, like RAT's 3839: appended slots are
+    # allocated in codepoint order, so this number moves only if the sheet or
+    # the web prefix does — and that is the point of pinning it.
+    expect(0x1F680, 4759, 2458, 2, "'ROCKET' (bitmap, appended slot, double advance)")
+    expect(0xE0020, 0, 1229, 1, "'TAG SPACE' (missing — shared missing block; the font has no bitmap)")
 
     # invariants over every entry: height is the constant cell height; block 0
     # is the shared missing block; every unmapped index slot points at it.

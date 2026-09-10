@@ -447,7 +447,8 @@ with a number against it.
 
 | Path | Status | Why it is fenced |
 |---|---|---|
-| `assets/atlas/*.bin` | generated | `tools/export-atlas.mjs` from `tools/vendor/ref`; hand-edits are reverted by the next rebuild-and-compare |
+| `assets/atlas/{curves,glyphmap,glyphs,codepoints}.bin` | generated | `tools/export-atlas.mjs` from `tools/vendor/ref` AND `emoji-sheet.bin` (the emoji slots after the web's 4,431); hand-edits are reverted by the next rebuild-and-compare |
+| `assets/atlas/emoji-sheet.bin` | generated | `tools/gen_emoji_sheet.py` from the vendored Noto Color Emoji; regenerate it BEFORE the atlas bins, which read it |
 | `assets/atlas/engine-trie.bin` | generated | `tools/gen_real_trie.py` |
 | `engine/glyph_schema.{mojo,mjs}` | generated | `tools/gen_schema.py` from `schema/glyph-identity.json` — **two** edges leave the schema; editing it invalidates the corpus as well as the dylib |
 | `tools/vendor/` | vendored, hash-pinned | `vendor-manifest.py --check`; upstream drift is information, not failure |

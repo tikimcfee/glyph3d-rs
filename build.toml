@@ -84,13 +84,16 @@ build = "pixi run gen-emoji-sheet"
 verify_cmd = "pixi run python tools/gen_emoji_sheet.py --check"
 note = "Generator-native check mode; fontTools lives in the pixi env. The font is pinned by fetch hash in vendor-manifest.py."
 
+# Regeneration is by hand and ORDERED: emoji-sheet, then atlas (reads the
+# sheet to append the emoji slots), then engine-trie (reads codepoints.bin).
+# `glyph build` verifies these; it does not run the chain.
 [artifact.atlas]
 class = "committed"
 outputs = ["assets/atlas/curves.bin", "assets/atlas/glyphmap.bin", "assets/atlas/glyphs.bin", "assets/atlas/codepoints.bin"]
-inputs = ["tools/export-atlas.mjs", "tools/vendor/ref/**", "tools/vendor/hb.cjs", "tools/vendor/hb.wasm"]
+inputs = ["tools/export-atlas.mjs", "tools/vendor/ref/**", "tools/vendor/hb.cjs", "tools/vendor/hb.wasm", "assets/atlas/emoji-sheet.bin"]
 build = "node tools/export-atlas.mjs"
 verify_scratch = "node tools/export-atlas.mjs --out {scratch}"
-note = "No generator-native check mode; the runner rebuilds to scratch and cmps. Self-aborts before writing if fonts/ranges drift."
+note = "No generator-native check mode; the runner rebuilds to scratch and cmps. Self-aborts before writing if fonts/ranges drift. Slots 0..4430 are the web bake verbatim; the emoji slots after them come from emoji-sheet.bin."
 
 [artifact.fixtures]
 class = "committed"

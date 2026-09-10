@@ -20,6 +20,15 @@
  *      sequence yields the same slot ids — and we ASSERT that against the baked
  *      envelope's encodedIds before writing anything.
  *
+ *   3. APPENDS the native colour-emoji slots (2026-09-10, step 4b below): every
+ *      single-codepoint emoji the vendored Noto Color Emoji sheet can draw and
+ *      no outline font covers gets a bitmap slot AFTER the web's 4,431, so no
+ *      existing slot id moves and every text frame stays byte-equal. The web's
+ *      own 897 bitmap slots keep their ids and get their `emojiCell` re-pointed
+ *      at the sheet (NO_CELL where the font has no bitmap for them — the web's
+ *      canvas indices meant nothing here). Slots 0..4430 of the glyph map are
+ *      still the web's bytes; the tail is ours.
+ *
  * Usage:  node tools/export-atlas.mjs [--out <dir>]
  * Requires: node ≥ 18 (CompressionStream-free; we use zlib). Reference repo must
  * is vendored under tools/vendor/ref (see REF_ROOT below); the web repo is not
@@ -51,6 +60,11 @@ const OUT_DIR = process.argv.includes('--out')
 
 const TEXTURE_WIDTH = 1024;
 const CURVE_TEXELS_PER_CURVE = 2;
+// The committed emoji sheet is an INPUT (build.toml [artifact.atlas] inputs):
+// a scratch rebuild reads the committed one, so regenerate it first.
+const SHEET_PATH = join(HERE, '..', 'assets', 'atlas', 'emoji-sheet.bin');
+const SHEET_MAGIC = 0x53453347; // 'G3ES'
+const SHEET_HEADER_WORDS = 40, SHEET_CELL_STRIDE = 6, SHEET_CP_STRIDE = 2;
 const SLUG_MAGIC = 0x43474c53; // 'SLGC'
 
 // Trie constants (mirror packages/glyph3d-core/src/compute/GlyphTrie.js)
@@ -80,7 +94,7 @@ console.log(`[bake] ${binName}: envelope v${envVer} fmt v${payloadFmt}, ` +
     `${encodedLen} glyphs, ${curveCount} curves, maxGlyphId=${entryCount - 1}`);
 
 const curveHeight = Math.max(1, Math.ceil((curveCount * CURVE_TEXELS_PER_CURVE) / TEXTURE_WIDTH));
-const mapHeight = Math.max(1, Math.ceil(entryCount / TEXTURE_WIDTH));
+const rowsFor = (n) => Math.max(1, Math.ceil(n / TEXTURE_WIDTH));
 
 // ── step 2: reproduce the bake boot (read-only imports from the reference repo) ──
 //
@@ -217,6 +231,79 @@ const primaryEmHeightFu = fontsMeta[0].ascender - fontsMeta[0].descender;
 console.log(`[fonts] primary=${fontsMeta[0].name} upem=${primaryUpem} cellAdvance=${primaryAdvanceFu} emHeight=${primaryEmHeightFu}`);
 for (const f of fontsMeta) console.log(`        ${f.name}: upem=${f.upem} asc=${f.ascender} desc=${f.descender}`);
 
+// ── step 4b: the native emoji slots, appended from the committed sheet ───────
+//
+// Policy, the web's own: a codepoint an outline font draws stays outline (the
+// digits, #, *, ©, ®, ❤ … are emoji in the font and text here); a codepoint
+// nothing draws that the sheet can draw becomes a bitmap slot. Existing web
+// bitmap slots keep their ids. Appended slots are allocated in codepoint
+// order after the web's last slot, so the allocation is a pure function of
+// (web bake, sheet) and the rebuild-and-compare gate stays meaningful.
+const sheetRaw = readFileSync(SHEET_PATH);
+const sheet = new Uint32Array(sheetRaw.buffer.slice(sheetRaw.byteOffset, sheetRaw.byteOffset + (sheetRaw.byteLength & ~3)));
+if (sheet[0] !== SHEET_MAGIC || sheet[1] !== 1) throw new Error(`${SHEET_PATH}: not a G3ES v1 sheet`);
+const sheetCells = sheet[5], sheetCps = sheet[21];
+const cellIndexOfGlyph = new Map();
+for (let i = 0; i < sheetCells; i++) cellIndexOfGlyph.set(sheet[SHEET_HEADER_WORDS + i * SHEET_CELL_STRIDE], i);
+const cpToCell = new Map();   // codepoint → sheet cell index, only where a bitmap exists
+{
+    const o = SHEET_HEADER_WORDS + sheetCells * SHEET_CELL_STRIDE;
+    for (let i = 0; i < sheetCps; i++) {
+        const cp = sheet[o + i * SHEET_CP_STRIDE], g = sheet[o + i * SHEET_CP_STRIDE + 1];
+        if (cellIndexOfGlyph.has(g)) cpToCell.set(cp, cellIndexOfGlyph.get(g));
+    }
+}
+const webSlotCount = slotCount;
+const cpOfSlot = new Map();
+for (const [cp, g] of cpEntries) if (g > 0) cpOfSlot.set(g, cp);
+const cpIndex = new Map(cpEntries.map(([cp], i) => [cp, i]));
+const primaryAdvanceForBitmap = 2 * primaryAdvanceFu;   // FormatMD: bitmap entries carry 2× cell
+
+// (a) the web's bitmap slots: re-point at the sheet, or say there is no cell
+let repointed = 0, noCell = 0;
+for (let s = 0; s < webSlotCount; s++) {
+    const m = slotMeta[s];
+    if (m.fontIdx !== FONTIDX_BITMAP) continue;
+    const cp = cpOfSlot.get(s);
+    const cell = cpToCell.get(cp);
+    m.emojiCell = cell === undefined ? NO_CELL : cell;
+    m.name = cell === undefined ? `<emoji U+${cp.toString(16).toUpperCase().padStart(4, '0')}, no cell>`
+                                : `<emoji U+${cp.toString(16).toUpperCase().padStart(4, '0')}>`;
+    if (cell === undefined) noCell++; else repointed++;
+}
+// (b) append a slot per drawable codepoint nothing else covers
+const appended = [];
+for (const cp of [...cpToCell.keys()].sort((a, b) => a - b)) {
+    const i = cpIndex.get(cp);
+    if (i !== undefined && cpEntries[i][1] > 0) continue;      // outline or web bitmap: keep
+    const slot = slotMeta.length;
+    slotMeta.push({
+        fontIdx: FONTIDX_BITMAP, gid: 0,
+        name: `<emoji U+${cp.toString(16).toUpperCase().padStart(4, '0')}>`,
+        advanceFu: 0, asc: 0, desc: 0, flags: SLOT_FLAG_BITMAP, emojiCell: cpToCell.get(cp),
+        curveStart: 0, curveCount: 0, bbox: [0, 0, 0, 0],
+    });
+    if (i !== undefined) cpEntries[i] = [cp, slot, primaryAdvanceForBitmap];   // was BLANK in a mapped block
+    else cpEntries.push([cp, slot, primaryAdvanceForBitmap]);
+    appended.push(cp);
+}
+cpEntries.sort((a, b) => a[0] - b[0]);
+const slotCountOut = slotMeta.length;
+// (c) the glyph-map texels: the web's prefix verbatim, .w re-pointed for its
+// bitmap slots, then one [0, 0, 1, cell] texel per appended slot.
+const mapHeight = rowsFor(slotCountOut);
+const mapTexelsOut = new Uint32Array(TEXTURE_WIDTH * mapHeight * 4);
+mapTexelsOut.set(mapTexels.subarray(0, webSlotCount * 4));
+for (let s = 0; s < slotCountOut; s++) {
+    const m = slotMeta[s];
+    if (m.fontIdx !== FONTIDX_BITMAP) continue;
+    if (s >= webSlotCount) { mapTexelsOut[s * 4 + 2] = 1; }
+    mapTexelsOut[s * 4 + 3] = m.emojiCell;
+}
+console.log(`[emoji] sheet: ${sheetCells} cells, ${cpToCell.size} single-codepoint; web bitmap slots ` +
+    `${repointed} re-pointed + ${noCell} with no cell; ${appended.length} slots appended ` +
+    `(${webSlotCount} -> ${slotCountOut}); glyph map ${mapHeight} rows`);
+
 // ── step 5: build the codepoint trie (GlyphTrie layout, extended flags) ──────
 
 const missingBlock = new Uint32Array(BLOCK_SIZE * ENTRY_STRIDE);
@@ -246,7 +333,7 @@ for (const [b, cps] of [...byBlock.entries()].sort((a, b2) => a[0] - b2[0])) {
         const o = (cp & BLOCK_MASK) * ENTRY_STRIDE;
         let flags = 0;
         if (g === 0) flags = FLAG_BLANK;
-        else if (chain.isBitmapSlot(g)) flags = FLAG_BITMAP;
+        else if (slotMeta[g].fontIdx === FONTIDX_BITMAP) flags = FLAG_BITMAP;
         block[o + 0] = g;
         block[o + 1] = ax;                 // primary-font units; bitmap slots carry 2× cell
         block[o + 2] = primaryEmHeightFu;  // constant per-glyph height (em box)
@@ -287,18 +374,19 @@ writeU32('curves.bin',
     header(M('G3CV'), 1, [TEXTURE_WIDTH, curveHeight, curveCount, CURVE_TEXELS_PER_CURVE, 0]),
     curveTexels);
 
-// glyphmap.bin — payload is the exact RGBA32Uint texture image (row-aligned).
+// glyphmap.bin — the web's texels for slots 0..webSlotCount-1 (bitmap .w
+// re-pointed), then the appended emoji slots (row-aligned).
 writeU32('glyphmap.bin',
-    header(M('G3GM'), 1, [TEXTURE_WIDTH, mapHeight, entryCount, 0, 0]),
-    mapTexels);
+    header(M('G3GM'), 1, [TEXTURE_WIDTH, mapHeight, slotCountOut, 0, 0]),
+    mapTexelsOut);
 
 // glyphs.bin — font table (64B each) + slot records (56B each) + name table.
 {
     const FONT_REC = 16;             // u32 words: upem, asc, desc, lineGap + name[48] = 4 + 12 words
     const SLOT_REC = 14;             // u32 words (f32 lanes stored via bitcast below)
     const namesBlob = Buffer.concat(slotMeta.map((s) => Buffer.from(s.name, 'utf8')));
-    const nameOffsets = new Uint32Array(slotCount);
-    { let acc = 0; for (let i = 0; i < slotCount; i++) { nameOffsets[i] = acc; acc += Buffer.byteLength(slotMeta[i].name); } }
+    const nameOffsets = new Uint32Array(slotCountOut);
+    { let acc = 0; for (let i = 0; i < slotCountOut; i++) { nameOffsets[i] = acc; acc += Buffer.byteLength(slotMeta[i].name); } }
 
     const f32 = new Float32Array(1); const bits = (x) => { f32[0] = x; return new Uint32Array(f32.buffer)[0]; };
 
@@ -310,7 +398,7 @@ writeU32('glyphmap.bin',
         for (let j = 0; j < nb.length; j++) fontRecs[o + 4 + (j >> 2)] |= nb[j] << ((j & 3) * 8);
     });
 
-    const slotRecs = new Uint32Array(slotCount * SLOT_REC);
+    const slotRecs = new Uint32Array(slotCountOut * SLOT_REC);
     slotMeta.forEach((s, i) => {
         const o = i * SLOT_REC;
         slotRecs[o + 0] = s.fontIdx;
@@ -335,7 +423,7 @@ writeU32('glyphmap.bin',
     namesBlob.copy(Buffer.from(namesWords.buffer, 4));
 
     writeU32('glyphs.bin',
-        header(M('G3GL'), 1, [fontsMeta.length, slotCount, primaryUpem, primaryAdvanceFu, primaryEmHeightFu,
+        header(M('G3GL'), 1, [fontsMeta.length, slotCountOut, primaryUpem, primaryAdvanceFu, primaryEmHeightFu,
             FONT_REC * 4, SLOT_REC * 4, 0]),
         fontRecs, slotRecs, nameOffsets, namesWords);
 }
@@ -349,10 +437,12 @@ writeU32('codepoints.bin',
 // ── step 7: export summary (for the report) ──────────────────────────────────
 
 const a = cpLookup.get(0x41), g = cpLookup.get(0x67), at = cpLookup.get(0x40), hash = cpLookup.get(0x23), sp = cpLookup.get(0x20);
+const rat = cpLookup.get(0x1F400), rocket = cpLookup.get(0x1F680), flagA = cpLookup.get(0x1F1E6);
 console.log('\n[summary] worked-example codepoints:');
-for (const [label, e] of [["'A'", a], ["'g'", g], ["'@'", at], ["'#'", hash], ["' '", sp]]) {
+for (const [label, e] of [["'A'", a], ["'g'", g], ["'@'", at], ["'#'", hash], ["' '", sp], ["'🐀'", rat], ["'🚀'", rocket], ["RI-A", flagA]]) {
     if (!e) { console.log(`  ${label}: NOT MAPPED`); continue; }
     const s = slotMeta[e.g];
-    console.log(`  ${label} → slot ${e.g} (${s.name}), ax=${e.ax} fu, curves=[${s.curveStart}..${s.curveStart + s.curveCount}) flags=${s.flags}`);
+    console.log(`  ${label} → slot ${e.g} (${s.name}), ax=${e.ax} fu, curves=[${s.curveStart}..${s.curveStart + s.curveCount}) flags=${s.flags}` +
+        (s.flags & SLOT_FLAG_BITMAP ? ` cell=${s.emojiCell === NO_CELL ? 'none' : s.emojiCell}` : ''));
 }
 console.log(`\n[done] assets in ${OUT_DIR}`);

@@ -180,8 +180,11 @@ s = slots[gid]
 check(ax == primary_adv and s["curveCount"] == 0 and not (fl & FLAG_MISSING),
       f"space → slot {gid}: zero curves, positive advance, not missing")
 
-gid, ax, ht, fl = trie_lookup(0x1F680)  # 🚀 — outside LARGE_CORE ranges; should be MISSING
-check(fl & FLAG_MISSING and gid == 0, "U+1F680 (🚀, outside core ranges) → missing block, slot 0")
+gid, ax, ht, fl = trie_lookup(0x1F680)  # 🚀 — outside the web's ranges; appended from the emoji sheet
+check(fl & FLAG_BITMAP and gid >= 4431 and ax == 2 * primary_adv,
+      f"U+1F680 (🚀, outside the web's core ranges) → appended bitmap slot {gid}, double advance")
+gid, ax, ht, fl = trie_lookup(0xE0020)  # tag space — the font has no bitmap, nothing draws it
+check(fl & FLAG_MISSING and gid == 0, "U+E0020 (tag space) → missing block, slot 0")
 
 emoji_gid = None
 for cp in range(0x1F400, 0x1F64F + 1):
@@ -193,6 +196,16 @@ check(emoji_gid is not None and emoji_ax == 2 * primary_adv,
       f"emoji U+{emoji_cp:04X} → bitmap slot {emoji_gid} with double-width advance {emoji_ax}")
 check(slots[emoji_gid]["flags"] & SLOT_FLAG_BITMAP and slots[emoji_gid]["emojiCell"] != NO_CELL,
       f"bitmap slot {emoji_gid} carries emoji cell {slots[emoji_gid]['emojiCell']}")
+# Every bitmap slot's cell is either NO_CELL (a web-era slot the font cannot
+# draw) or an index into the committed emoji sheet's cell table.
+sheet_words = read_u32(ATLAS / "emoji-sheet.bin")
+check(sheet_words[0] == 0x53453347, "emoji-sheet.bin magic")
+sheet_cells = sheet_words[5]
+with_cell = [s for s in slots if s["flags"] & SLOT_FLAG_BITMAP and s["emojiCell"] != NO_CELL]
+without = [s for s in slots if s["flags"] & SLOT_FLAG_BITMAP and s["emojiCell"] == NO_CELL]
+check(all(s["emojiCell"] < sheet_cells for s in with_cell),
+      f"every bitmap slot's emojiCell indexes the sheet ({sheet_cells} cells)")
+check(len(with_cell) > 0, f"{len(with_cell)} bitmap slots have a sheet cell, {len(without)} have none")
 
 for cp, want_blank in [(0xFE0F, True), (0x200D, None)]:
     g2, _, _, fl2 = trie_lookup(cp)

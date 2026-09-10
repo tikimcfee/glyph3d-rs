@@ -110,11 +110,53 @@ mostly padding, and the sequence table is FIXED-stride (`2 + seqMax` words)
 rather than variable — 183 KB against ~115 KB, in exchange for random access
 without an index when a consumer arrives.
 
-## Steps 3–6 — as agreed
+## Step 3 — the append-only re-bake (2026-09-10) [measured]
 
-3. **NEXT.** Append-only re-bake of trie and glyph map; the gate is every
-   existing pixel baseline staying byte-equal.
-4. Loader and upload with the override flag; load time and memory on both
-   boxes.
+`export-atlas.mjs` gained step 4b: after the web bake is reproduced and
+asserted against the baked envelope exactly as before, the committed sheet is
+read and one bitmap slot is appended per single-codepoint emoji it can draw
+and no outline font covers, in codepoint order, after the web's last slot.
+The web's own bitmap slots keep their ids and have `emojiCell` re-pointed at
+the sheet's cell table, or set to NO_CELL where the font has no bitmap.
+
+| | before | after |
+|---|---:|---:|
+| slots | 4,431 | **5,261** (+830) |
+| bitmap slots | 897 (all pointing at dead web canvas cells) | 1,727: 513 web slots re-pointed, 384 web slots NO_CELL, 830 appended |
+| kept outline (emoji in the font, text here) | | 117 — digits, `#`, `*`, ©, ®, ❤ … |
+| trie mapped codepoints / blocks | 5,349 / 28 | 6,160 / 39 |
+| glyph-map texture | 1024×5 | 1024×6 |
+| curves.bin | | **byte-identical** |
+
+**The prefix is verbatim, proven by bytes, not argument:** in glyph-map slots
+0..4430 exactly 897 words differ from the committed file, all in lane `.w`
+(`emojiCell`), all in mode-1 slots; every appended texel is `[0, 0, 1, cell]`;
+in the trie, 126 entries inside already-mapped blocks changed — 107 that were
+MISSING and 19 that were BLANK, every one now a bitmap at an appended slot with
+the double advance — and not one OUTLINE or web-bitmap entry moved (5,330
+non-missing entries byte-identical). A scan of every golden
+input, the pick-oracle corpus (`native/src`) and the engine-check inputs found
+no codepoint whose class changed, so **all six pixel baselines stayed
+byte-equal** through a re-bake that moved 830 slots — the gate this step was
+allowed to move nothing else.
+
+Two pins moved on purpose and said so: `gen_real_trie.py`'s self-test expected
+the rocket to be MISSING (it refused the new trie and wrote nothing until the
+expectation was updated to slot 4759 — the pin working); `verify_atlas.py`
+now also asserts every bitmap slot's cell indexes the sheet.
+
+What is deliberately NOT in this step: the 384 web-era slots with no cell
+still discard (as they did); ZWJ still occupies a blank cell (slot 1, advance
+1229) and VS16 maps to slot 1717 — the "trailing codepoints as zero-advance
+blanks" seed is a trie policy for the sequence pass, recorded here as the
+measured starting state. The pick oracle (`g_pick_oracle.py`) does not read
+the trie and knows nothing of double advances; no corpus it runs on contains
+one yet — a blind spot for step 6.
+
+## Steps 4–6 — as agreed
+
+3. **DONE 2026-09-10 — see below.**
+4. **NEXT.** Loader and upload with the override flag; load time and memory
+   on both boxes.
 5. Shader, a visual-check fixture, an `emoji` golden view, a mutation.
 6. Correctness sweep: picking on double-advance cells, backdrop tint, dither.

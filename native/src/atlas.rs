@@ -2,7 +2,7 @@
 //!
 //! Parses the four Stage B export files in `assets/atlas/` per FORMAT.md:
 //!   curves.bin     (G3CV) — Slug curve texture payload, 1024x161 RGBA32Uint
-//!   glyphmap.bin   (G3GM) — glyph-map texture payload,   1024x5   RGBA32Uint
+//!   glyphmap.bin   (G3GM) — glyph-map texture payload,   1024xN   RGBA32Uint (N from the header)
 //!   glyphs.bin     (G3GL) — per-slot metrics (parsed for validation; not uploaded)
 //!   codepoints.bin (G3CP) — codepoint → slot two-level trie (CPU side)
 //!

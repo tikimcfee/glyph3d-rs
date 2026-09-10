@@ -12,8 +12,10 @@ python3 tools/preview_glyphs.py       # visual proof → assets/atlas/preview.pn
 
 ## Provenance (what these bytes ARE)
 
-The curve/glyph-map payloads are the **exact texture images** the web renderer
-uploads, recovered from the build-time baked asset
+The curve payload is the **exact texture image** the web renderer uploads, and
+the glyph map's first 4,431 entries are its exact texels with one lane
+re-pointed (`emojiCell`, see below); the entries after them are the native
+emoji slots (2026-09-10). Both are recovered from the build-time baked asset
 `app/public/slug-core/slug-core.1tstke3lync.bin` in the reference repo (gzip of the
 `SLGC` envelope defined in `packages/glyph3d-core/src/shaping/slugCoreCache.js`,
 payload format `SLUG_BUFFER_FORMAT = 2`).
@@ -105,8 +107,8 @@ The Slug glyph-map texture, verbatim. Same binding convention.
 | 1 | version | 1 |
 | 2 | headerBytes | 32 |
 | 3 | width | 1024 |
-| 4 | height | 5 |
-| 5 | entryCount | 4431 (= maxGlyphId + 1) |
+| 4 | height | 6 |
+| 5 | entryCount | 5261 (= maxGlyphId + 1: the web's 4,431 + 830 appended emoji slots) |
 | 6–7 | reserved | 0 |
 | 8 … | payload | `width × height × 4` u32 texels |
 
@@ -117,10 +119,20 @@ map[g] = [curveStart, curveCount, mode, emojiCell]
   mode 0 = outline: curves [curveStart, curveStart+curveCount) in curves.bin;
            curveCount == 0 ⇒ empty glyph (space…) — discard unless a background
            fill paints the cell.
-  mode 1 = color-emoji bitmap: curveStart/curveCount are 0; emojiCell indexes the
-           emoji atlas grid. The shader must branch on mode BEFORE treating
+  mode 1 = color-emoji bitmap: curveStart/curveCount are 0; emojiCell indexes
+           emoji-sheet.bin's CELL TABLE (0..cellCount-1), or is NO_CELL
+           (0xFFFFFFFF) for a web-era bitmap slot the vendored font has no
+           bitmap for (384 of the web's 897 — mostly U+2Bxx symbols the web let
+           fall to its canvas). The shader must branch on mode BEFORE treating
            curveCount == 0 as "empty", or emoji render invisible.
 ```
+
+**Slots 0–4430 are the web bake; 4431–5260 are appended** (2026-09-10) by
+`export-atlas.mjs` step 4b: one bitmap slot per single-codepoint emoji the
+sheet can draw and no outline font covers, allocated in codepoint order. No
+existing id moved, which is what keeps every text frame byte-equal. The
+policy is the web's own: a codepoint an outline font draws stays outline
+(digits, `#`, `*`, ©, ®, ❤ … are emoji in the font and text here — 117 such).
 
 Slots that exist but were never encoded (holes in the id space) read as
 `[0, 0, 0, 0]`: mode 0, zero curves — rendered blank. Slot 0 (blank) is such an
@@ -136,7 +148,7 @@ Per-slot metrics + the font table + a debug name table.
 | 1 | version | 1 |
 | 2 | headerBytes | 44 |
 | 3 | fontCount | 3 |
-| 4 | slotCount | 4431 |
+| 4 | slotCount | 5261 |
 | 5 | primaryUpem | 2048 (Cousine units-per-em — the layout reference) |
 | 6 | primaryAdvanceFu | 1229 (forced monospace cell advance, primary font units) |
 | 7 | primaryEmHeightFu | 2320 (primary ascender − descender = 1705 + 615) |
@@ -168,7 +180,7 @@ the first font whose cmap covers a codepoint draws it.
 | 0 | u32 | fontIdx — 0..fontCount−1, or `0xFFFFFFFF` = blank slot, `0xFFFFFFFE` = bitmap |
 | 1 | u32 | gid — per-font HarfBuzz glyph id (0 for blank/bitmap) |
 | 2 | u32 | flags — bit0 `BITMAP`, bit1 `EMPTY` (outline mode, no curves) |
-| 3 | u32 | emojiCell — bitmap slots only, else `0xFFFFFFFF` |
+| 3 | u32 | emojiCell — bitmap slots: index into `emoji-sheet.bin`'s cell table, or `0xFFFFFFFF` (no bitmap in the font); else `0xFFFFFFFF` |
 | 4 | i32 | advanceFu — this glyph's advance in **its own font's** units (curve-normalization denominator; NOT the layout advance — layout always uses primaryAdvanceFu, or 2× for bitmap) |
 | 5 | i32 | ascenderFu — own font's ascender (y-normalization range top) |
 | 6 | i32 | descenderFu — own font's descender (negative) |
@@ -184,7 +196,7 @@ the first font whose cmap covers a codepoint draws it.
 
 `slotCount` u32 offsets (relative to the blob start), then `u32 blobBytes`, then
 the blob: concatenated UTF-8 names (HarfBuzz glyph names, e.g. `A`, `numbersign`;
-`.blank` for slot 0, `<emoji cell N>` for bitmap slots), **no terminators** — name
+`.blank` for slot 0, `<emoji U+XXXX>` or `<emoji U+XXXX, no cell>` for bitmap slots), **no terminators** — name
 `i` spans `offsets[i] .. offsets[i+1]` (or blobBytes for the last). Debug/log use
 only.
 
@@ -203,9 +215,9 @@ font units are lossless).
 | 2 | headerBytes | 44 |
 | 3 | blockShift | 8 (block = 256 codepoints) |
 | 4 | blockIndexLength | 4352 (= 0x110000 >> 8) |
-| 5 | blockCount | 28 (content-deduplicated blocks) |
+| 5 | blockCount | 39 (content-deduplicated blocks) |
 | 6 | entryStride | 4 (u32 lanes per entry) |
-| 7 | mappedCount | 5349 (codepoints with a real entry) |
+| 7 | mappedCount | 6160 (codepoints with a real entry) |
 | 8 | missingAdvanceFu | 1229 (advance the missing block carries) |
 | 9 | missingHeightFu | 2320 |
 | 10 | primaryUpem | 2048 |
@@ -267,8 +279,10 @@ trie advance: 2458 fu = 2 × 1229).
 
 More: `' '` (U+0020) → slot 1, `[0, 0, 0, 0]` in the map (empty), trie advance
 1229 (occupies a cell). `'@'` → slot 33, 53 curves. `'🐀'` (U+1F400) → bitmap slot
-3839, map texel `[0, 0, 1, 305]`, trie advance 2458 (double width), flags BITMAP.
-`'🚀'` (U+1F680, outside the baked ranges) → missing block, flags MISSING, slot 0.
+3839, map texel `[0, 0, 1, 487]` (sheet cell 487), trie advance 2458 (double
+width), flags BITMAP. `'🚀'` (U+1F680, outside the web's baked ranges) →
+**appended** bitmap slot 4759, map texel `[0, 0, 1, 958]`, advance 2458.
+`U+E0020` (tag space: known to the font, no bitmap) → missing block, slot 0.
 
 ## File: `engine-trie.bin` (magic `G3TR`) — Stage E1
 
@@ -285,9 +299,9 @@ ADVANCE/HEIGHT **bitcast f32 world units** (not integer font units).
 | 2 | headerBytes | 44 |
 | 3 | blockShift | 8 |
 | 4 | blockIndexLength | 4352 |
-| 5 | blockCount | 28 |
+| 5 | blockCount | 39 |
 | 6 | entryStride | 4 |
-| 7 | mappedCount | 5349 (informational) |
+| 7 | mappedCount | 6160 (informational) |
 | 8 | primaryUpem | 2048 (informational) |
 | 9 | primaryEmHeightFu | 2320 (the conversion denominator) |
 | 10 | cellHeightWorld | 1.0 as f32 bits (the world cell height) |
@@ -383,19 +397,22 @@ engine change is needed.
   the four Stage B bins are the web's runtime canvas indices and mean nothing
   here; step 3 of `out/EMOJI.md` replaces them.
 - **Runtime growth**: codepoints outside `LARGE_CORE_RANGES` (CJK, kana, most of
-  the Nerd-Font PUA, 🚀-class emoji beyond U+1F64F) are MISSING in the trie. The
-  web app grows the atlas live (shape → allocate slot → encode → re-upload); the
-  native port can do the same using the `glyphs.bin` normalization denominators,
-  or ship additional range bakes.
+  the Nerd-Font PUA) are MISSING in the trie. Single-codepoint emoji are NOT a
+  gap any more (every one the vendored font draws has a slot); emoji SEQUENCES
+  are — the trie is one glyph per codepoint. The web app grows the atlas live
+  (shape → allocate slot → encode → re-upload); the native port's answer is
+  append-only re-bakes, never runtime growth.
 - The three TTF font files are NOT copied into this export; they remain in the
   reference repo under `packages/glyph3d-core/src/fonts/` (copy them over if the
   native side wants to do its own HarfBuzz shaping for live growth).
 
 ## Numbers at a glance (as exported)
 
-- 4431 slots: 3511 outline glyphs, 22 empty, 897 bitmap (emoji); slot 0 = blank
+- 5261 slots: 3511 outline glyphs, 22 empty, 1727 bitmap (the web's 897, of
+  which 513 have a sheet cell, + 830 appended, all with one); slot 0 = blank
 - 82239 quadratic curves; curve texture 1024×161 RGBA32Uint (2.5 MiB payload)
-- glyph-map texture 1024×5 RGBA32Uint (80 KiB payload)
-- trie: 5349 mapped codepoints, 28 unique blocks, 4352-entry index (129 KiB)
+- glyph-map texture 1024×6 RGBA32Uint (96 KiB payload)
+- trie: 6160 mapped codepoints, 39 unique blocks, 4352-entry index (173 KiB)
+- emoji sheet: 3985 cells of 136×128 in 2 layers of 8160×4352 (10.9 MB)
 - fonts: Cousine (primary, monospace cell advance 1229/2048 em), MesloLGS NF Mono,
   DejaVu Sans; em height 2320 fu (asc 1705 / desc −615)
