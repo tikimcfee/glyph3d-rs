@@ -137,8 +137,9 @@ outputs = [
   "out/tooling-ab/baseline/{gpu}/repo-wide.png",
   "out/tooling-ab/baseline/{gpu}/repo-down.png",
   "out/tooling-ab/baseline/{gpu}/repo-back-oblique.png",
+  "out/tooling-ab/baseline/{gpu}/emoji.png",
 ]
-inputs = ["target/release/glyph3d-native", "native/fixtures/baseline-view.txt", "native/fixtures/g-pick-repo/**"]
+inputs = ["target/release/glyph3d-native", "native/fixtures/baseline-view.txt", "native/fixtures/emoji-view.txt", "native/fixtures/g-pick-repo/**", "assets/atlas/emoji-sheet.bin"]
 note = "Blind to everything outside these frames, and cannot distinguish a regression from an intentional change. One set per rasterizer ({gpu}); a set only ever proves the renderer on the hardware that made it. empty.rs in g-pick-repo is zero bytes ON PURPOSE (the only input reaching the page-extent origin seed)."
 
 # Per-view render commands (run from native/, screenshot into {scratch}).
@@ -172,6 +173,15 @@ cmd = "--load-repo fixtures/g-pick-repo --frames 2 --focus-file alpha.rs --zoom 
 [[golden_view]]
 name = "repo-back-oblique"
 cmd = "--load-repo fixtures/g-pick-repo --frames 2 --cam-pose 30 -120 60 0 -12"
+# The colour-emoji frame (2026-09-10): every class of bitmap slot the trie has
+# — web-era re-pointed, appended, no-cell, emoji-in-the-font-but-text-here —
+# through the CPU staging path and the shader's mode-1 branch. The only frame
+# that samples the emoji sheet, so the only one that can see it; expect more
+# cross-vendor drift here than on text (filtered sampling is not analytic
+# coverage). `emoji-uv-flip` proves it reddens.
+[[golden_view]]
+name = "emoji"
+cmd = "--render-file fixtures/emoji-view.txt --frames 2 --zoom 1.25"
 
 # ── Gates ────────────────────────────────────────────────────────────────
 # `scope` answers "I changed X, what should I run" — the question the CLI is
@@ -530,6 +540,17 @@ find = """                // blends in exactly the order it did before.
 with = """                // blends in exactly the order it did before.
                 depth_write_enabled: Some(false),"""
 expect = "repo-back-oblique.png diverges from baseline"
+rebuild = "cargo build --release"
+
+[[mutation]]
+name = "emoji-uv-flip"
+gate = "pixel-ab"
+why = "the sheet sampled upside down — the class of defect the emoji frame exists for (a cell placement, inset or flip error), which no numeric gate can see because the layout is untouched. CONSUMED BY: emoji.png and nothing else; every text frame stays byte-equal under it, which is also the proof that no text frame samples the sheet"
+file = "native/src/shaders/glyph_field.wgsl"
+op = "replace"
+find = "        let t = vec2<f32>(c.x, 1.0 - c.y);"
+with = "        let t = vec2<f32>(c.x, c.y);"
+expect = "emoji.png diverges from baseline"
 rebuild = "cargo build --release"
 
 [[mutation]]

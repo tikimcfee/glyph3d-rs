@@ -391,9 +391,18 @@ backdrop replaces the segment anyway). Mips are box-filtered in
 texel's arbitrary palette colour cannot bleed into its opaque neighbours'
 average; the shader premultiplies after the sample. The glyph map's
 `emojiCell` (`mode 1` slots) indexes the cell table; `--emoji-sheet PATH`
-points the renderer at another G3ES file. Nothing samples the texture yet
-(step 5); it is loaded so the cost is measured: ~120 ms and 361 MiB on the
-first Linux box.
+points the renderer at another G3ES file. The shader's `mode 1` branch samples
+it (`glyph_field.wgsl`, whose header states the alpha contract in three lines:
+linear rgb + straight alpha from the sampler, the group tint decoded with the
+same `pow(2.2)` as text, premultiplied output). The cell's UV rect is the cell
+inset half a texel and v-flipped (the quad's v runs up, the PNG's rows run
+down); a cell index of `0xFFFFFFFF` draws nothing. **Emoji are drawn into the
+existing SQUARE quad** (`quad_w = height`, the web's rule), so the 136×128
+cell is squeezed 6 % horizontally and its bitmap baseline (27 px of 128 up)
+sits ~5 % of an em below the text baseline; both are visible in `emoji.png`
+and are the honest starting state — a bearing-aware quad is a later choice
+that moves that frame on purpose. Load cost: ~120 ms and 361 MiB on the first
+Linux box.
 
 Cells are square-ish (136×128) at a 2× advance; the layout side of that is
 already in the trie (bitmap entries carry `2 × 1229` fu), which is why no

@@ -323,6 +323,17 @@ later-drawn file painted over a nearer one — and `repo-wide` had carried that
 wrong picture in every baseline since `back` became the default, byte-equal
 throughout, because a golden cannot tell a wrong picture from a right one.
 The `depth-write-off` mutation proves the new frame reddens on that class.
+`emoji` (2026-09-10) is the only frame that samples the colour-emoji sheet —
+web-era slots re-pointed at it, appended slots, slots the font cannot draw,
+and emoji-in-the-font-that-stay-text, all through the CPU staging path — so
+it is the only frame that can see a cell placement, inset, flip or alpha
+error, none of which any numeric gate can see because the layout is
+untouched. `emoji-uv-flip` proves it reddens. Expect MORE cross-vendor drift
+on it than on text: filtered sampling of a mipmapped sRGB texture is not
+analytic coverage, and two rasterizers' filters need not agree to the bit.
+The alpha contract those pixels rest on is stated once, in the shader header
+of `glyph_field.wgsl`, so a platform whose emoji edges differ while its text
+does not has a checklist.
 Known cost of the fix, measured: in the dense far region of `repo-down`,
 ~1,400 of 1.6M pixels lose a little ink where coplanar quads overlap and the
 later fragment's interpolated depth lands an ulp behind — the price of a
@@ -455,6 +466,7 @@ with a number against it.
 | `schema/glyph-identity.json` | vendored verbatim | drift means an upstream refresh, not a local edit |
 | `native/src/shaders/*.wgsl` | fenced | the naga test pins the shader *set* — that it compiles and exists, not what it draws. The only thing that sees a pixel change is the golden-view A/B, whose blind spots are above. That gap is why edits here need their own re-baselined change rather than an ordinary commit |
 | `native/fixtures/baseline-view.txt` | IMMUTABLE | it is the input to `text.png`; editing it re-baselines that check silently |
+| `native/fixtures/emoji-view.txt` | IMMUTABLE | the input to `emoji.png`, one line per class of bitmap slot the trie carries; same reason |
 | `native/fixtures/g-pick-repo/empty.rs` | IMMUTABLE, zero bytes | the only input that reaches the page-extent origin seed; deleting it removes a check's ability to see its subject without removing the check |
 | `out/tooling-ab/baseline/<key>/` | tracked pixel oracle, one set per rasterizer; **golden** in build.toml | changes only on purpose, with a note saying why; the runner refuses to regenerate it. A new host adopts its own set by hand (the gate prints how); it never edits another's |
 | `integration/egui/` | vendored reference | never compiled; the real dependency is from crates.io |

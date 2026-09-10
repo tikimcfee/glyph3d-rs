@@ -1,0 +1,13 @@
+// emoji-view.txt: the `emoji` golden view's input. IMMUTABLE.
+// One line per class of bitmap slot the trie carries (out/EMOJI.md).
+
+faces   😀 😂 🤔 😴 🙃    web slots, re-pointed
+rocket  🚀 🛸 🪐 🌍 🔥    appended slots
+animals 🐀 🐈 🦀 🐧 🦋    rat = slot 3839, cell 487
+flags   🇦 🇨 🏁 🚩      single glyphs; A C do not pair
+text    # * 0 9 © ® ❤ ✓  emoji in the font, TEXT here
+keycap  #️⃣ 1️⃣            # + VS16 + U+20E3
+joiner  👨‍👩‍👧 🏳️‍🌈          ZWJ sequences as pieces
+skin    👍 👍🏽 👍🏿        modifier as its own swatch
+nocell  ⬝ ⬦ ⬧            web slots the font cannot draw
+mixed   let ok = true; // 🚀 done ✨ 🎉

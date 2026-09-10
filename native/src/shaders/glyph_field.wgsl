@@ -14,8 +14,22 @@
 //   curves: 2 texels/curve: [P0.xy, P1.xy], [P2.xy, _, _], uint16-in-u32,
 //           normalized per-glyph-cell [0,1], y-UP (0=descender, 1=ascender).
 //
+// Colour emoji (2026-09-10, out/EMOJI.md): mode==1 samples the emoji sheet —
+// an Rgba8UnormSrgb 2D-array texture of STRAIGHT-alpha cells (atlas.rs). The
+// alpha contract, stated once so another platform can check its own product:
+//   1. the sampler returns LINEAR rgb (the sRGB decode is the format's) and
+//      straight alpha, mip-filtered from levels that were box-filtered in
+//      PREMULTIPLIED space and stored straight (atlas.rs box_down_straight);
+//   2. the group tint is authored sRGB, decoded here with the same pow(2.2)
+//      the outline path uses, and multiplied in — identity for a white group;
+//   3. output is PREMULTIPLIED, rgb * alpha, into the same ONE/ONE_MINUS_SRC
+//      blend as the outline path. Premultiplying BEFORE the sRGB decode would
+//      be a different product; that is the mistake to look for if emoji edges
+//      differ across platforms while text does not.
+// The per-instance colour is not applied: it is the syntax colour, and an
+// image has its own. Group alpha and the clip/cull rules apply as for text.
+//
 // Skipped vs the web (documented in the Stage C report):
-//   - bitmap emoji pixels (no atlas exported): mode==1 discards
 //   - frame mode (external video grid)
 //   - highlight tint/fill (vAddedColor/vFillAmount)
 //   - stipple-dither LOD fade band (ditherSpan); hard discard at alpha==0
@@ -73,6 +87,14 @@ struct Params {
     soften: f32,       // 0.45 — AA ramp widening factor
     min_lo: f32,       // 0.06 — fuzz onset (footprint)
     min_hi: f32,       // 0.20 — fuzz full  (footprint)
+    // Emoji sheet geometry (G3ES header, atlas.rs). A cell's placement is a
+    // pure function of its index — the same function the generator used —
+    // so no cell table crosses to the GPU.
+    emoji_cell: vec2<u32>,    // cell width, height in texels
+    emoji_cols: u32,          // cells per row
+    emoji_rows: u32,          // rows per layer
+    emoji_layer: vec2<f32>,   // layer width, height in texels (as f32 for UV math)
+    _pad3: vec2<u32>,
 };
 
 @group(0) @binding(0) var<uniform> camera: Camera;
@@ -81,6 +103,12 @@ struct Params {
 @group(0) @binding(3) var glyphmap: texture_2d<u32>;
 @group(0) @binding(4) var curves: texture_2d<u32>;
 @group(0) @binding(5) var<uniform> params: Params;
+@group(0) @binding(6) var emoji_tex: texture_2d_array<f32>;
+@group(0) @binding(7) var emoji_samp: sampler;
+
+// Sentinel in the glyph map's .w for a bitmap slot the sheet has no cell
+// for (a web-era slot the vendored font cannot draw): rendered blank.
+const NO_CELL: u32 = 0xFFFFFFFFu;
 
 struct VsOut {
     @builtin(position) clip: vec4<f32>,
@@ -90,6 +118,12 @@ struct VsOut {
     @location(3) @interpolate(flat) curve_start: u32,
     @location(4) @interpolate(flat) curve_count: u32,
     @location(5) @interpolate(flat) mode: u32,
+    // Emoji: the sheet UV (texels/layer size, already inset half a texel and
+    // flipped so v runs down the PNG's rows) and the layer. group_rgb is the
+    // tint without the instance colour, which an image does not take.
+    @location(6) emoji_uv: vec2<f32>,
+    @location(7) @interpolate(flat) emoji_layer: u32,
+    @location(8) group_rgb: vec3<f32>,
 };
 
 @vertex
@@ -165,6 +199,31 @@ fn vs_main(
     let base_color = icolor * gcolor.rgb;
     let blended = base_color + (gcolor.rgb - base_color) * gscale.w;
 
+    // Emoji cell → sheet UV. Cell i sits at layer i / (cols·rows), row
+    // (i mod cols·rows) / cols, col i mod cols. The sample rect is the cell
+    // inset by half a texel on every side so bilinear filtering never reads
+    // the neighbouring cell's edge texel, at any mip the loader built
+    // (atlas.rs mip_levels_for keeps every level's footprint inside a cell).
+    // v is flipped: glyph_uv.y runs bottom→top, the PNG's rows run top→down.
+    var emoji_uv = vec2<f32>(0.0);
+    var emoji_layer = 0u;
+    if mode == 1u && info.w != NO_CELL {
+        let per_layer = params.emoji_cols * params.emoji_rows;
+        emoji_layer = info.w / per_layer;
+        let r = info.w % per_layer;
+        let cell_xy = vec2<f32>(f32(r % params.emoji_cols), f32(r / params.emoji_cols)) * vec2<f32>(params.emoji_cell);
+        let inset = vec2<f32>(0.5);
+        let span = vec2<f32>(params.emoji_cell) - vec2<f32>(1.0);
+        let t = vec2<f32>(c.x, 1.0 - c.y);
+        emoji_uv = (cell_xy + inset + t * span) / params.emoji_layer;
+    }
+    // A bitmap slot with no cell draws nothing: pass mode 2 so the fragment
+    // stage discards it before the curve path can misread curve_count == 0.
+    var out_mode = mode;
+    if mode == 1u && info.w == NO_CELL {
+        out_mode = 2u;
+    }
+
     var out: VsOut;
     out.clip = clip;
     out.color = blended;
@@ -172,7 +231,10 @@ fn vs_main(
     out.glyph_uv = c;
     out.curve_start = info.x;
     out.curve_count = info.y;
-    out.mode = mode;
+    out.mode = out_mode;
+    out.emoji_uv = emoji_uv;
+    out.emoji_layer = emoji_layer;
+    out.group_rgb = gcolor.rgb;
     return out;
 }
 
@@ -256,10 +318,20 @@ fn compute_coverage(inv_diameter: f32, dilate: f32, p0: vec2<f32>, p1: vec2<f32>
 
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
-    // Bitmap emoji branch: no bitmap atlas was exported — discard (the staging
-    // code also skips emoji slots; this is the belt-and-braces branch so the
-    // mode test precedes the curveCount==0 empty test, as FORMAT.md requires).
+    // Bitmap emoji branch — BEFORE the curveCount==0 empty test, as FORMAT.md
+    // requires (a bitmap slot has zero curves). See the header for the alpha
+    // contract; this is its one implementation.
     if in.mode == 1u {
+        let s = textureSample(emoji_tex, emoji_samp, in.emoji_uv, in.emoji_layer);
+        let alpha = s.a * in.group_alpha;
+        if alpha <= 0.0 {
+            discard;
+        }
+        let rgb = s.rgb * pow(in.group_rgb, vec3<f32>(2.2)) * alpha;
+        return vec4<f32>(rgb, alpha);
+    }
+    // mode 2: a bitmap slot the sheet has no cell for — blank, keeps its cell.
+    if in.mode == 2u {
         discard;
     }
 

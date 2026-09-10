@@ -28,11 +28,12 @@ use crate::gpu::GpuContext;
 /// TEXTURE_WIDTH). Texel `i` lives at `(i % 1024, i / 1024)`.
 pub const ATLAS_TEX_WIDTH: u32 = 1024;
 
-/// Trie entry flags (FORMAT.md, codepoints.bin). FLAG_BLANK (4) — a covered
-/// codepoint resolving to slot 0 — exists in the format but is not yet
-/// consumed here (no growth logic); add it back when a reader lands.
+/// Trie entry flags (FORMAT.md, codepoints.bin). FLAG_BITMAP (2) and
+/// FLAG_BLANK (4) exist in the format and are not read here: the renderer
+/// learns "bitmap" from the glyph map's mode lane (the shader's branch), and
+/// staging drops only MISSING — a bitmap slot is staged like any glyph since
+/// 2026-09-10. Add a constant back when a reader lands.
 pub const FLAG_MISSING: u32 = 1;
-pub const FLAG_BITMAP: u32 = 2;
 
 /// Primary-font layout metrics (glyphs.bin header).
 #[derive(Clone, Copy, Debug)]

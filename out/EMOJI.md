@@ -197,10 +197,46 @@ If ~380 MiB matters on 16 GiB shared memory, the levers are renderer-side
 (upload fewer levels, or a half-resolution tier) and the sheet stays the
 font's bytes.
 
-## Steps 5–6 — as agreed
+## Step 5 — the shader, the fixture, the frame (2026-09-10) [measured on Linux]
+
+`glyph_field.wgsl`'s `mode 1` branch samples the sheet: the vertex stage
+places the cell from its index alone (the same pure function the generator
+used, its geometry in the params uniform, so no cell table crosses to the
+GPU), insets the UV rect half a texel and flips v; the fragment stage
+samples trilinear, multiplies the group tint in, and outputs premultiplied.
+A `NO_CELL` slot becomes mode 2 and discards. The CPU staging path stages
+bitmap slots like any glyph (only MISSING is dropped), so `--render-file`
+shows emoji too — which is what lets the frame live on that path.
+
+**Colour, as decided with Ivan:** the flag is the glyph map's `mode` lane,
+the same place a curve glyph's flags live, and the branch on it is the same
+branch. What differs is what "colour" means once a glyph has its own: the
+per-instance colour is the syntax colour and an image does not take it; the
+group tint is the same multiply every glyph gets, identity for a white
+group. So a flag looks like a flag in an untinted file, a tinted file tints
+its emoji, and the highlight verbs stay uniform. The alpha contract (straight
+in the texture, premultiplied mips, tint after the sRGB decode, premultiplied
+out) is stated ONCE in the shader header so another platform has a checklist
+if its emoji edges differ while its text does not.
+
+`native/fixtures/emoji-view.txt` (IMMUTABLE) is one line per class of slot:
+web-era re-pointed, appended, the rat worked example, regional indicators as
+single glyphs, emoji-in-the-font-that-are-text, keycap and ZWJ sequences as
+their pieces, skin modifiers as swatches, no-cell slots blank. Rendered at
+1.25× as the `emoji` golden view; the `emoji-uv-flip` mutation (sampling the
+sheet upside down) proves it reddens and that no text frame samples the
+sheet. All six earlier baselines byte-equal, again.
+
+What the frame shows that is not yet right, deliberately left for a change
+that moves it on purpose: emoji fill the web's SQUARE quad, so the 136×128
+cell is squeezed 6 % horizontally and the bitmap baseline (27 px of 128 up)
+sits ~5 % of an em below text's. A bearing-aware quad is a one-line vertex
+change plus a re-baseline of this one frame.
+
+## Step 6 — as agreed
 
 3. **DONE 2026-09-10 — see below.**
 4. **DONE 2026-09-10 — see below.**
-5. **NEXT.** Shader, a visual-check fixture, an `emoji` golden view, a
-   mutation.
-6. Correctness sweep: picking on double-advance cells, backdrop tint, dither.
+5. **DONE 2026-09-10 — see below.**
+6. **NEXT.** Correctness sweep: picking on double-advance cells, backdrop
+   tint for emoji-heavy segments, the LOD dither band, the M2's numbers.
