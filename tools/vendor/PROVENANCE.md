@@ -1,12 +1,14 @@
-# Vendored from the web repo — provenance
+# Vendored files — provenance
 
-Everything in this tree that was copied out of `viz-web/glyph3d-js`, with the
-commit it came from and its hash. Recorded because a vendored file with no
-recorded origin is indistinguishable from a local invention six months later.
+Everything in this tree that was copied from somewhere else, with where it
+came from and its hash. Most of it is from `viz-web/glyph3d-js`; the
+colour-emoji font is from its own upstream (see "Third-party" below).
+Recorded because a vendored file with no recorded origin is indistinguishable
+from a local invention six months later.
 
   upstream repo    viz-web/glyph3d-js
-  upstream commit  2ef79b7e762a07ebbf72713f97527a6831b7a839
-  regenerated      2026-09-06  (tools/vendor-manifest.py)
+  upstream commit  2ef79b7e762a07ebbf72713f97527a6831b7a839  (recorded; web repo not present at regeneration on 2026-09-10)
+  regenerated      2026-09-10  (tools/vendor-manifest.py)
 
 ## The fixture oracle is pinned PER FILE
 
@@ -85,6 +87,21 @@ which refuses the ref `hb.js` — UMD with a trailing ESM `export default`
 |---|---|---|---:|---|:--:|
 | `tools/vendor/hb.cjs` | `tools/vendor/ref/packages/glyph3d-core/src/shaping/vendor/hb.js` | drop the trailing `export default createHarfBuzz;` line | 24491 | `a3550bf1fc195c22…` | yes |
 | `tools/vendor/hb.wasm` | `tools/vendor/ref/packages/glyph3d-core/src/shaping/vendor/hb.wasm` | verbatim copy | 397190 | `ea319787a8efdf90…` | yes |
+
+## Third-party: not from the web repo
+
+Copied from another project at a RELEASE TAG and pinned to the commit that tag
+resolved to on the day. There is no "upstream matches" column: a tag does not
+move, and `--check` additionally requires SHA256SUMS to agree with the fetch
+hash recorded in `THIRD_PARTY`, so a re-vendor that forgot the record is caught.
+
+| local path | project | tag | commit | bytes | sha256 | licence |
+|---|---|---|---|---:|---|---|
+| `tools/vendor/third-party/noto-emoji/LICENSE.txt` | googlefonts/noto-emoji | `v2.051` | `6202fe7c20dd` | 4301 | `6a73f9541c2de741…` | the OFL text itself |
+| `tools/vendor/third-party/noto-emoji/NotoColorEmoji.ttf` | googlefonts/noto-emoji | `v2.051` | `6202fe7c20dd` | 10673480 | `72a635cb3d2f3524…` | SIL Open Font License 1.1 (LICENSE.txt beside it, from the same tag) |
+
+- `tools/vendor/third-party/noto-emoji/LICENSE.txt` — the font's licence travels with the font
+- `tools/vendor/third-party/noto-emoji/NotoColorEmoji.ttf` — the colour-emoji bitmap source for assets/atlas/emoji-sheet.bin; CBDT/CBLC, one 109 ppem strike, 3,985 PNG glyphs of 136x128
 
 ## Notes
 

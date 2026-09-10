@@ -184,7 +184,7 @@ scope = "corpus"
 kind = "cmd"
 cmd = "python3 tools/vendor-manifest.py --check"
 needs = []
-compare = "22 vendored+derived files vs tools/vendor/SHA256SUMS; hb.* also re-derived from their ref sources"
+compare = "every file in tools/vendor/SHA256SUMS vs its hash; hb.* also re-derived from their ref sources; third-party files also vs their recorded fetch hash"
 blind_to = "upstream drift (by design) and a wrong-but-self-consistent vendored revision — the fixture corpus gate is the cover for the second"
 
 [[gate]]
@@ -346,6 +346,15 @@ file = "engine/fixtures/inputs/foldGeometry.js"
 op = "append"
 arg = "//m"
 expect = "foldGeometry.js"
+
+[[mutation]]
+name = "third-party-font-edit"
+gate = "vendor-hashes"
+why = "the emoji sheet is rebuilt from this font; a font edited or re-vendored in place must break its recorded hash, or the sheet would be rebuilt from bytes nobody recorded. CONSUMED BY: the THIRD_PARTY set in vendor-manifest.py, which a file can be absent from while sitting on disk"
+file = "tools/vendor/third-party/noto-emoji/NotoColorEmoji.ttf"
+op = "append"
+arg = " "
+expect = "NotoColorEmoji.ttf"
 
 [[mutation]]
 name = "tests-silently-ignored"

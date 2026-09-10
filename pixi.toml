@@ -25,6 +25,9 @@ suites-all = "./engine/check.sh all"
 gen-trie = "python3 tools/gen_real_trie.py"
 gen-schema = "python3 tools/gen_schema.py"
 check-gen = { cmd = "python3 tools/gen_real_trie.py --verify-only && python3 tools/gen_schema.py --check" }
+# The emoji tools read the vendored colour font with fontTools, which lives in
+# THIS env (pinned below) rather than whatever the host's python3 has.
+emoji-inventory = "python tools/emoji_inventory.py"
 # The shared library is `.dylib` on macOS and `.so` on Linux; the build tool
 # and `native/build.rs` resolve the name by platform (see build.toml, `{dylib}`).
 # macOS needs install_name_tool so the binary can find it through @rpath;
@@ -38,6 +41,18 @@ build-engine = "pixi run mojo build --fp-mode contract=off -I engine engine/ffi.
 [dependencies]
 mojo = ">=1.1.0.dev2026083005,<2"
 max = ">=26.6.0.dev2026083005,<27"
+# For tools/emoji_font.py (the CBDT/CBLC walker behind the emoji sheet). Only
+# tables and verbatim PNG bytes are read through it, so its version cannot
+# change an artifact — but it is pinned to a major so a solve stays boring.
+fonttools = ">=4.63,<5"
+
+# Both platforms carry an EXACT mojo/max pin so that adding an unrelated
+# dependency (fonttools, 2026-09-10) re-solves to the same nightly the suites
+# were verified against. The ranges above are what a deliberate `pixi update`
+# moves; these are what an incidental solve may not.
+[target.osx-arm64.dependencies]
+mojo = "==1.1.0.dev2026083005"
+max = "==26.6.0.dev2026083005"
 
 # linux-64 was added 2026-09-07 and solved fresh; without an exact pin it would
 # have taken the newest nightly, not the build the suites were verified against

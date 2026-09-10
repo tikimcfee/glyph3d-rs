@@ -20,3 +20,5 @@ ea319787a8efdf90599ade77e33d1f245d61da390380f6c8299ab3195ff00d6d  tools/vendor/r
 4ef474e7567c2f2a388fc5d990866d4c42df90ded84fb7425a9f8da15fd7ce36  tools/vendor/ref/packages/glyph3d-core/src/shaping/vendor/hbjs.js
 33dbad8e14c5ecc0262c9952491acbee98cb20ec7f21dea5a467f14b72d28cd7  tools/vendor/ref/packages/glyph3d-r3f/src/coreRanges.js
 6f49cde4cc655eb2d41fa303a240fff04d03c47e5836a211bbbaeb848d7bf908  tools/vendor/ref/tools/headlessFontChain.mjs
+6a73f9541c2de74158c0e7cf6b0a58ef774f5a780bf191f2d7ec9cc53efe2bf2  tools/vendor/third-party/noto-emoji/LICENSE.txt
+72a635cb3d2f3524c51620cdde406b217204e8a6a06c6a096ff8ed4b5fd6e27b  tools/vendor/third-party/noto-emoji/NotoColorEmoji.ttf
