@@ -26,11 +26,24 @@ Two different questions, deliberately kept separate:
                   FAILURE: the native tree is trunk and is not obliged to track
                   the web repo. Refreshing is a decision, never a reflex.
 
+A THIRD kind of file (2026-09-10): copies from upstream projects that are not
+the web repo — the colour-emoji font. Those carry a URL, a release tag and the
+commit the tag resolves to, and are hashed like everything else. There is no
+"upstream matches" column for them: a release tag does not move, and if it
+ever did, the hash is the finding.
+
 Run:  python3 tools/vendor-manifest.py            regenerate both files
       python3 tools/vendor-manifest.py --check    verify local hashes only, exit 1 on drift
+
+The web repo is looked for at GLYPH_WEB (env) or the Mac path below. When it
+is ABSENT, regeneration PRESERVES the upstream verdicts recorded in the
+existing PROVENANCE.md instead of resetting them to n/a — before 2026-09-10 a
+regeneration on any machine without that path silently erased the record.
 """
 
 import hashlib
+import os
+import re
 import subprocess
 import sys
 import tomllib
@@ -38,7 +51,7 @@ from datetime import date
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-WEB = Path("/Users/lugo/localdev/viz-web/glyph3d-js")  # only needed to REFRESH
+WEB = Path(os.environ.get("GLYPH_WEB", "/Users/lugo/localdev/viz-web/glyph3d-js"))  # only needed to REFRESH
 BUILD_TOML = ROOT / "build.toml"
 
 # local path in this repo -> path it came from in the web repo
@@ -113,6 +126,36 @@ DERIVED = {
     },
 }
 
+# THIRD-PARTY — copied from a project that is not the web repo, at a release
+# tag, and pinned to the commit that tag resolved to on the day. The font is
+# the input the emoji sheet generator reads (tools/gen_emoji_sheet.py), so
+# it is vendored for the same reason the fixture inputs are: the committed
+# artifact must be rebuildable byte-for-byte in this tree with no network.
+# `sha256` is RECORDED here as well as in SHA256SUMS: SHA256SUMS says "the
+# file has not been edited locally"; this says "the file is the one fetched
+# from that URL", which is the claim a reader six months from now needs.
+THIRD_PARTY = {
+    "tools/vendor/third-party/noto-emoji/NotoColorEmoji.ttf": {
+        "project": "googlefonts/noto-emoji",
+        "url": "https://raw.githubusercontent.com/googlefonts/noto-emoji/v2.051/fonts/NotoColorEmoji.ttf",
+        "tag": "v2.051",
+        "commit": "6202fe7c20dd5e1727a4c3c01604edc176c576da",
+        "sha256": "72a635cb3d2f3524c51620cdde406b217204e8a6a06c6a096ff8ed4b5fd6e27b",
+        "license": "SIL Open Font License 1.1 (LICENSE.txt beside it, from the same tag)",
+        "why": "the colour-emoji bitmap source for assets/atlas/emoji-sheet.bin; "
+               "CBDT/CBLC, one 109 ppem strike, 3,985 PNG glyphs of 136x128",
+    },
+    "tools/vendor/third-party/noto-emoji/LICENSE.txt": {
+        "project": "googlefonts/noto-emoji",
+        "url": "https://raw.githubusercontent.com/googlefonts/noto-emoji/v2.051/fonts/LICENSE",
+        "tag": "v2.051",
+        "commit": "6202fe7c20dd5e1727a4c3c01604edc176c576da",
+        "sha256": "6a73f9541c2de74158c0e7cf6b0a58ef774f5a780bf191f2d7ec9cc53efe2bf2",
+        "license": "the OFL text itself",
+        "why": "the font's licence travels with the font",
+    },
+}
+
 # THE FIXTURE ORACLE IS PINNED PER FILE, NOT TO ONE UPSTREAM HEAD.
 #
 # `engine/fixtures/{gen,gen-bake}.mjs` reproduce the committed fixtures
@@ -181,7 +224,7 @@ def check() -> int:
         if line.strip():
             h, _, path = line.partition("  ")
             want[path] = h
-    tracked = set(VENDORED) | set(DERIVED)
+    tracked = set(VENDORED) | set(DERIVED) | set(THIRD_PARTY)
     missing = sorted(tracked - set(want))
     extra = sorted(set(want) - tracked)
     bad = []
@@ -205,29 +248,76 @@ def check() -> int:
             continue  # the hash loop already reported the MISSING side
         if spec["derive"](sp.read_bytes()) != dp.read_bytes():
             bad.append(f"{path}: no longer matches re-derivation from {spec['source']}")
+    # Third-party pin: the recorded fetch hash must agree with SHA256SUMS. A
+    # file that matches SHA256SUMS but not its fetch hash was re-vendored
+    # without updating the record of where it came from.
+    for path, spec in THIRD_PARTY.items():
+        if path in want and want[path] != spec["sha256"]:
+            bad.append(f"{path}: SHA256SUMS disagrees with the recorded fetch hash "
+                       f"({spec['url']}) — update THIRD_PARTY or re-fetch")
     if bad:
         print("FAIL  vendored-file drift:")
         for b in bad:
             print("        " + b)
         return 1
     print(f"[check] {len(want)} files match tools/vendor/SHA256SUMS "
-          f"({len(DERIVED)} also re-derived from their ref sources)")
+          f"({len(DERIVED)} also re-derived from their ref sources, "
+          f"{len(THIRD_PARTY)} third-party pinned to their fetch hash)")
     return 0
+
+
+def recorded_upstream() -> tuple[str, dict[str, str]]:
+    """What the existing PROVENANCE.md says about the web repo, for the case
+    where it is not present to ask. Returns (commit line, {local: verdict})."""
+    if not PROV.exists():
+        return "unknown (web repo not present)", {}
+    text = PROV.read_text()
+    m = re.search(r"^  upstream commit  (.+)$", text, re.M)
+    commit = m.group(1).strip() if m else "unknown (web repo not present)"
+    verdicts = {}
+    for line in text.splitlines():
+        cells = [c.strip() for c in line.split("|")]
+        # | `local` | `upstream` | bytes | `hash…` | verdict |
+        if len(cells) == 7 and cells[1].startswith("`") and cells[2].startswith("`"):
+            verdicts[cells[1].strip("`")] = cells[5]
+    return commit, verdicts
 
 
 def regenerate() -> int:
     pipe, bake = fixture_counts()  # fail BEFORE writing anything
-    upstream = "unknown (web repo not present)"
-    if (WEB / ".git").exists():
+    web_present = (WEB / ".git").exists()
+    if web_present:
         upstream = subprocess.run(["git", "-C", str(WEB), "rev-parse", "HEAD"],
                                   capture_output=True, text=True).stdout.strip()
-    rows, drows, sum_pairs = [], [], []
+        kept = {}
+    else:
+        # Keep what was recorded rather than erase it: a regeneration on a
+        # machine without the web repo used to reset every verdict to n/a.
+        upstream, kept = recorded_upstream()
+        upstream = re.sub(r"\s*\(recorded.*\)$", "", upstream)
+        upstream += f"  (recorded; web repo not present at regeneration on {date.today().isoformat()})"
+    rows, drows, trows, sum_pairs = [], [], [], []
     for local, up in sorted(VENDORED.items()):
         lp = ROOT / local
         ls = sha(lp)
-        upp = WEB / up
-        us = sha(upp) if upp.exists() else None
-        rows.append((local, up, ls, us, lp.stat().st_size))
+        if web_present:
+            upp = WEB / up
+            verdict = ("yes" if upp.exists() and sha(upp) == ls
+                       else ("MISMATCH" if upp.exists() else "n/a"))
+        else:
+            verdict = kept.get(local, "n/a")
+        rows.append((local, up, ls, verdict, lp.stat().st_size))
+        sum_pairs.append((local, ls))
+    for local, spec in sorted(THIRD_PARTY.items()):
+        lp = ROOT / local
+        ls = sha(lp)
+        if ls != spec["sha256"]:
+            raise SystemExit(
+                f"ERROR  {local}: on-disk sha256 {ls[:16]}… is not the recorded fetch hash "
+                f"{spec['sha256'][:16]}… — re-fetch from {spec['url']} or update THIRD_PARTY; "
+                "refusing to write a manifest that contradicts itself"
+            )
+        trows.append((local, spec, lp.stat().st_size))
         sum_pairs.append((local, ls))
     for local, spec in sorted(DERIVED.items()):
         lp = ROOT / local
@@ -242,18 +332,24 @@ def regenerate() -> int:
     pins = "".join(
         f"  {local:<52} {rev}\n" for local, rev in sorted(FIXTURE_ORACLE_PINS.items()))
     body = "".join(
-        f"| `{l}` | `{u}` | {sz} | `{ls[:16]}…` | "
-        f"{'yes' if us == ls else ('MISMATCH' if us else 'n/a')} |\n"
-        for l, u, ls, us, sz in rows)
+        f"| `{l}` | `{u}` | {sz} | `{ls[:16]}…` | {verdict} |\n"
+        for l, u, ls, verdict, sz in rows)
+    tbody = "".join(
+        f"| `{l}` | {spec['project']} | `{spec['tag']}` | `{spec['commit'][:12]}` | {sz} | "
+        f"`{spec['sha256'][:16]}…` | {spec['license']} |\n"
+        for l, spec, sz in trows)
+    twhy = "".join(f"- `{l}` — {spec['why']}\n" for l, spec, _ in trows)
     dbody = "".join(
         f"| `{l}` | `{s}` | {how} | {sz} | `{ls[:16]}…` | "
         f"{'yes' if ok else 'NO — re-derive'} |\n"
         for l, s, how, why, ls, sz, ok in drows)
-    PROV.write_text(f"""# Vendored from the web repo — provenance
+    PROV.write_text(f"""# Vendored files — provenance
 
-Everything in this tree that was copied out of `viz-web/glyph3d-js`, with the
-commit it came from and its hash. Recorded because a vendored file with no
-recorded origin is indistinguishable from a local invention six months later.
+Everything in this tree that was copied from somewhere else, with where it
+came from and its hash. Most of it is from `viz-web/glyph3d-js`; the
+colour-emoji font is from its own upstream (see "Third-party" below).
+Recorded because a vendored file with no recorded origin is indistinguishable
+from a local invention six months later.
 
   upstream repo    viz-web/glyph3d-js
   upstream commit  {upstream}
@@ -309,6 +405,17 @@ which refuses the ref `hb.js` — UMD with a trailing ESM `export default`
 | local path | derived from | transformation | bytes | sha256 (local) | derivation holds |
 |---|---|---|---:|---|:--:|
 {dbody}
+## Third-party: not from the web repo
+
+Copied from another project at a RELEASE TAG and pinned to the commit that tag
+resolved to on the day. There is no "upstream matches" column: a tag does not
+move, and `--check` additionally requires SHA256SUMS to agree with the fetch
+hash recorded in `THIRD_PARTY`, so a re-vendor that forgot the record is caught.
+
+| local path | project | tag | commit | bytes | sha256 | licence |
+|---|---|---|---|---:|---|---|
+{tbody}
+{twhy}
 ## Notes
 
 - `tools/vendor/ref/**` mirrors the web repo's LAYOUT exactly so every file stays
@@ -328,9 +435,10 @@ which refuses the ref `hb.js` — UMD with a trailing ESM `export default`
   a DIFFERENT corpus and redden that gate.
 - `schema/glyph-identity.json` is the source of truth for `tools/gen_schema.py`.
 """)
-    print(f"[done] {len(rows) + len(drows)} files -> {SUMS.name} + {PROV.name}")
-    mism = [l for l, u, ls, us, sz in rows if us and us != ls]
-    print("upstream mismatches:", ", ".join(mism) if mism else "none")
+    print(f"[done] {len(rows) + len(drows) + len(trows)} files -> {SUMS.name} + {PROV.name}")
+    mism = [l for l, u, ls, verdict, sz in rows if verdict == "MISMATCH"]
+    print("upstream mismatches:", ", ".join(mism) if mism else "none",
+          "" if web_present else "(as recorded; web repo not present)")
     broken = [l for l, s, how, why, ls, sz, ok in drows if not ok]
     if broken:
         print("WARNING  DERIVED re-derivation mismatch:", ", ".join(broken))

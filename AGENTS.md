@@ -40,10 +40,13 @@ pixi run build              # the manifest runner: products current + committed 
 
 **The dependency graph is declared in `build.toml`** (artifact, input globs,
 build command, class) and executed by `glyph` (`glyph/src/main.rs`). `cargo glyph build` brings
-products current (content-hash stamps, not mtimes) and regenerates committed
-artifacts in place — a deliberate, committable act. `pixi run verify` builds
-nothing: it asserts currency and byte-compares every committed artifact against
-a scratch rebuild. The four baseline PNGs are class **golden**: verified,
+products current (content-hash stamps, not mtimes) and then VERIFIES every
+committed artifact against a scratch rebuild — it does not regenerate them.
+Regenerating a committed artifact is a hand act with its own generator (the
+`build =` line on its artifact in build.toml), in dependency order, and the
+result is committed on purpose. This paragraph said "regenerates committed
+artifacts in place" until 2026-09-10; the code never did. `pixi run verify`
+builds nothing at all: it asserts currency and byte-compares. The four baseline PNGs are class **golden**: verified,
 never built — the runner refuses. `pixi run build-native` is the one pixi
 `depends-on` edge (cargo after build-engine); the rest of the graph is
 artifact-level and lives in build.toml because pixi cannot see that cargo
@@ -251,7 +254,12 @@ fixture carries.
 **pick-oracle** (`tools/check-pick-oracle.sh`; was `check-stage-g.sh` — the `g`
 was a fossil stage letter, not a position). Scripted picks and pixel-ray round
 trips from the native binary against an independent Python fold oracle. Red on
-any pick resolving to the wrong record. One mechanical caution survives the
+any pick resolving to the wrong record. Since 2026-09-10 it also probes
+`native/fixtures/emoji-view.txt`: a row/col pick never sees a glyph's advance
+(col is a leader count on both sides), so the emoji probes are pixel-ray
+round trips on a double-advance cell and on the cell two leaders AFTER it —
+the place a mis-sized rect would put the ray in the wrong glyph. The oracle
+itself knows nothing of advances, which is why it is a witness here. One mechanical caution survives the
 rename: under `set -euo pipefail` an oracle that exits nonzero inside a command
 substitution aborts the script mid-run. The wrapper still reports FAIL, but
 every check after the abort point silently did not run. (The missing
@@ -320,6 +328,17 @@ later-drawn file painted over a nearer one — and `repo-wide` had carried that
 wrong picture in every baseline since `back` became the default, byte-equal
 throughout, because a golden cannot tell a wrong picture from a right one.
 The `depth-write-off` mutation proves the new frame reddens on that class.
+`emoji` (2026-09-10) is the only frame that samples the colour-emoji sheet —
+web-era slots re-pointed at it, appended slots, slots the font cannot draw,
+and emoji-in-the-font-that-stay-text, all through the CPU staging path — so
+it is the only frame that can see a cell placement, inset, flip or alpha
+error, none of which any numeric gate can see because the layout is
+untouched. `emoji-uv-flip` proves it reddens. Expect MORE cross-vendor drift
+on it than on text: filtered sampling of a mipmapped sRGB texture is not
+analytic coverage, and two rasterizers' filters need not agree to the bit.
+The alpha contract those pixels rest on is stated once, in the shader header
+of `glyph_field.wgsl`, so a platform whose emoji edges differ while its text
+does not has a checklist.
 Known cost of the fix, measured: in the dense far region of `repo-down`,
 ~1,400 of 1.6M pixels lose a little ink where coplanar quads overlap and the
 later fragment's interpolated depth lands an ulp behind — the price of a
@@ -444,13 +463,15 @@ with a number against it.
 
 | Path | Status | Why it is fenced |
 |---|---|---|
-| `assets/atlas/*.bin` | generated | `tools/export-atlas.mjs` from `tools/vendor/ref`; hand-edits are reverted by the next rebuild-and-compare |
+| `assets/atlas/{curves,glyphmap,glyphs,codepoints}.bin` | generated | `tools/export-atlas.mjs` from `tools/vendor/ref` AND `emoji-sheet.bin` (the emoji slots after the web's 4,431); hand-edits are reverted by the next rebuild-and-compare |
+| `assets/atlas/emoji-sheet.bin` | generated | `tools/gen_emoji_sheet.py` from the vendored Noto Color Emoji; regenerate it BEFORE the atlas bins, which read it |
 | `assets/atlas/engine-trie.bin` | generated | `tools/gen_real_trie.py` |
 | `engine/glyph_schema.{mojo,mjs}` | generated | `tools/gen_schema.py` from `schema/glyph-identity.json` — **two** edges leave the schema; editing it invalidates the corpus as well as the dylib |
 | `tools/vendor/` | vendored, hash-pinned | `vendor-manifest.py --check`; upstream drift is information, not failure |
 | `schema/glyph-identity.json` | vendored verbatim | drift means an upstream refresh, not a local edit |
 | `native/src/shaders/*.wgsl` | fenced | the naga test pins the shader *set* — that it compiles and exists, not what it draws. The only thing that sees a pixel change is the golden-view A/B, whose blind spots are above. That gap is why edits here need their own re-baselined change rather than an ordinary commit |
 | `native/fixtures/baseline-view.txt` | IMMUTABLE | it is the input to `text.png`; editing it re-baselines that check silently |
+| `native/fixtures/emoji-view.txt` | IMMUTABLE | the input to `emoji.png`, one line per class of bitmap slot the trie carries; same reason |
 | `native/fixtures/g-pick-repo/empty.rs` | IMMUTABLE, zero bytes | the only input that reaches the page-extent origin seed; deleting it removes a check's ability to see its subject without removing the check |
 | `out/tooling-ab/baseline/<key>/` | tracked pixel oracle, one set per rasterizer; **golden** in build.toml | changes only on purpose, with a note saying why; the runner refuses to regenerate it. A new host adopts its own set by hand (the gate prints how); it never edits another's |
 | `integration/egui/` | vendored reference | never compiled; the real dependency is from crates.io |

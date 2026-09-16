@@ -146,6 +146,31 @@ print(round((x_ndc+1)*800), round((1-y_ndc)*500))
 pixel_roundtrip alpha.rs 4 4 50
 pixel_roundtrip long.md 200 5 7205
 
+echo "── emoji: double-advance cells, row/col and pixel-ray (2026-09-10) ──"
+# native/fixtures/emoji-view.txt is the emoji golden's input; loaded here as
+# part of its directory. An emoji record's rect is [x, x + 2 cells]: a pick
+# by (row, col) never sees the advance (col is a leader count on both sides),
+# so the ray path is the one that can be wrong — the pixel round trips below
+# hit the rocket itself and the 'd' two leaders AFTER it, which is where a
+# mis-sized rect would put the ray in the wrong cell.
+EMOJI_DIR=native/fixtures
+OUT=$($BIN --load-repo $EMOJI_DIR --focus-file emoji-view.txt --screenshot "$SCRATCH/emoji.png" \
+  --pick-file emoji-view.txt --pick-row 4  --pick-col 8 \
+  --pick-file emoji-view.txt --pick-row 12 --pick-col 26 \
+  --pick-file emoji-view.txt --pick-row 12 --pick-col 28 \
+  --pick-file emoji-view.txt --pick-row 6  --pick-col 12 \
+  2>&1)
+FIX_SAVED=$FIX; FIX=$EMOJI_DIR
+check emoji-view.txt 4 8
+check emoji-view.txt 12 26
+check emoji-view.txt 12 28
+check emoji-view.txt 6 12
+rec_of() { echo "$OUT" | grep -E "^pick: \S*emoji-view.txt" | grep -E " row=$1 col=$2 " | head -1 | sed -E 's/.* rec=([0-9]+) .*/\1/'; }
+pixel_roundtrip emoji-view.txt 12 26 "$(rec_of 12 26)"
+pixel_roundtrip emoji-view.txt 12 28 "$(rec_of 12 28)"
+pixel_roundtrip emoji-view.txt 4 8 "$(rec_of 4 8)"
+FIX=$FIX_SAVED
+
 echo "── native/src: oracle-asserted picks across files/depths ──────"
 OUT=$($BIN --load-repo "$REPO" --screenshot "$SCRATCH/js.png" \
   --pick-file text.rs --pick-row 0 --pick-col 0 \

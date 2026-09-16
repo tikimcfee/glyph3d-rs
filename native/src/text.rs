@@ -12,7 +12,7 @@
 
 use std::path::Path;
 
-use crate::atlas::{Atlas, FLAG_BITMAP, FLAG_MISSING};
+use crate::atlas::{Atlas, FLAG_MISSING};
 use crate::glyph_scene::{seg_tint, GlyphInstance, GroupRow, PickContext, SegCull};
 use crate::layout::{GlyphArena, ItemPlacement};
 
@@ -69,6 +69,9 @@ pub struct StagedText {
     pub bounds_max: [f32; 3],
     pub codepoints_decoded: usize,
     pub glyphs_emitted: usize,
+    /// Codepoints dropped from the instance stream: MISSING in the trie (the
+    /// CPU path) or blank/missing records (the engine paths). Bitmap slots
+    /// stopped being counted here on 2026-09-10; the name predates that.
     pub missing_or_bitmap: usize,
     /// Stage E2: optional camera override — (center.xy, half-extents) of one
     /// file's page, so an offscreen shot can frame a single file instead of
@@ -85,13 +88,13 @@ pub struct StagedText {
 
 /// Stage F: one cull segment covering a whole staged block (the text/engine
 /// scenes don't need per-group granularity — their instance counts are small).
-fn cover_segment(instances: &[GlyphInstance], min: [f32; 3], max: [f32; 3]) -> SegCull {
+fn cover_segment(instances: &[GlyphInstance], min: [f32; 3], max: [f32; 3], slot_ink: &[Option<[f32; 4]>]) -> SegCull {
     SegCull {
         min,
         max,
         slot_base: 0,
         slot_count: instances.len() as u32,
-        tint: seg_tint(instances, max[0] - min[0], max[1] - min[1]),
+        tint: seg_tint(instances, max[0] - min[0], max[1] - min[1], slot_ink),
     }
 }
 
@@ -140,7 +143,11 @@ pub fn stage_file(atlas: &Atlas, path: &Path, copies: u32) -> StagedText {
         let entry = atlas.lookup(ch as u32);
         let advance_cells = (entry.advance_fu.max(0) as u32 + atlas.metrics.advance_fu / 2)
             / atlas.metrics.advance_fu;
-        if entry.flags & (FLAG_MISSING | FLAG_BITMAP) != 0 {
+        // Bitmap (emoji) slots are STAGED like any other glyph since
+        // 2026-09-10: they carry a real slot id and the shader's mode-1 branch
+        // draws them from the sheet. Only MISSING is dropped. `advance_cells`
+        // already yields 2 for them (the trie carries the doubled advance).
+        if entry.flags & FLAG_MISSING != 0 {
             *missing_or_bitmap += 1;
         } else if entry.glyph_id != 0 {
             glyphs.push(Cell {
@@ -286,6 +293,7 @@ pub fn stage_file(atlas: &Atlas, path: &Path, copies: u32) -> StagedText {
         &instances,
         [0.0, -total_h, z_lo],
         [total_w, line_h, z_hi],
+        &atlas.slot_ink,
     )];
 
     StagedText {
@@ -315,7 +323,8 @@ fn word_color(word: &str) -> [u8; 3] {
 // ── Stage E1 — engine-convention paths ──────────────────────────────────────
 //
 // `stage_file` above is the PRODUCTION staging: cell-quantized columns, tab
-// stops, and blank/missing/bitmap glyphs dropped from the instance stream.
+// stops, and blank/missing glyphs dropped from the instance stream (bitmap
+// slots are staged — the shader draws them from the emoji sheet).
 // The Mojo engine (glyph_pipeline.mojo) has different conventions by design:
 // it emits ONE record per UTF-8 leader byte (newlines, blanks, and missing
 // codepoints included), accumulates X as an f64 running sum of the per-glyph
@@ -621,7 +630,7 @@ pub fn diff_records(records: &[GlyphRecord], expected: &[RefGlyph]) -> Result<()
 ///
 /// An item with no ink has no meaningful frame; a unit square is this caller's
 /// answer, unchanged from when the loop lived here.
-pub fn stage_records(arena: GlyphArena, placement: &ItemPlacement) -> StagedText {
+pub fn stage_records(arena: GlyphArena, placement: &ItemPlacement, slot_ink: &[Option<[f32; 4]>]) -> StagedText {
     let (min, max) = if arena.is_empty() {
         ([0.0, 0.0, 0.0], [1.0, 1.0, 0.0])
     } else {
@@ -632,7 +641,7 @@ pub fn stage_records(arena: GlyphArena, placement: &ItemPlacement) -> StagedText
     StagedText {
         glyphs_emitted: instances.len(),
         groups: vec![GroupRow::identity([0.0; 3])],
-        segments: vec![cover_segment(&instances, min, max)],
+        segments: vec![cover_segment(&instances, min, max, slot_ink)],
         instances,
         bounds_min: min,
         bounds_max: max,

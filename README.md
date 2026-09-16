@@ -117,7 +117,8 @@ cargo glyph test       # = pixi run check = ./tools/check-all.sh
 
 The artifact graph is declared in **`build.toml`** (artifact, inputs, build
 command, class) and executed by **`glyph`** (`glyph/src/main.rs`): `cargo glyph build` brings
-products current and regenerates committed artifacts, `pixi run verify`
+products current and verifies committed artifacts (regenerating one is a hand
+act with its generator), `pixi run verify`
 byte-compares them against scratch rebuilds without building anything, and
 `test` runs the checks, spanning all four
 languages: the generators reproduce their committed outputs byte-for-byte, the

@@ -280,18 +280,33 @@ pub const GLYPH_CELL_AREA: f32 = (1229.0 / 2320.0) * 1.25;
 /// Stage F — mean linear ink color + backdrop coverage for a slice of
 /// instances occupying a `width × height` world rect. Shared by the repo
 /// per-file segments and the single-segment text scenes.
-pub fn seg_tint(instances: &[GlyphInstance], width: f32, height: f32) -> [f32; 4] {
+///
+/// `slot_ink` (`Atlas::slot_ink`) says what a BITMAP slot's pixels average
+/// to; an emoji contributes that instead of its instance colour — which is
+/// the syntax colour, a colour it does not display — and counts as the two
+/// cells its advance covers. Outline glyphs are summed exactly as before, so
+/// a segment without emoji tints to the same bits (the goldens hold).
+pub fn seg_tint(instances: &[GlyphInstance], width: f32, height: f32, slot_ink: &[Option<[f32; 4]>]) -> [f32; 4] {
     let mut sum = [0f64; 3];
+    let mut cells = 0usize;
     for g in instances {
+        if let Some(Some(ink)) = slot_ink.get(g.glyph_id as usize) {
+            for (i, s) in sum.iter_mut().enumerate() {
+                *s += ink[i] as f64;
+            }
+            cells += 2;
+            continue;
+        }
         // Match the shader's decode: sRGB display bytes → linear via pow 2.2.
         for (i, s) in sum.iter_mut().enumerate() {
             let byte = ((g.color >> (8 * i)) & 0xFF) as f64 / 255.0;
             *s += byte.powf(2.2);
         }
+        cells += 1;
     }
     let n = instances.len().max(1) as f64;
     let area = (width as f64 * height as f64).max(1e-3);
-    let ink_frac = (instances.len() as f64 * GLYPH_CELL_AREA as f64 / area).min(1.0);
+    let ink_frac = (cells as f64 * GLYPH_CELL_AREA as f64 / area).min(1.0);
     let e = (ink_frac * BACKDROP_GAIN as f64).min(1.0);
     [
         (sum[0] / n) as f32,
@@ -335,6 +350,15 @@ struct Params {
     soften: f32,
     min_lo: f32,
     min_hi: f32,
+    /// Emoji sheet geometry, mirrored from the G3ES header (atlas.rs) so the
+    /// vertex stage can place a cell from its index alone. WGSL `vec2<u32>` /
+    /// `vec2<f32>` are 8-byte aligned; this 32-byte tail keeps the struct at a
+    /// 16-byte multiple (64 B).
+    emoji_cell: [u32; 2],
+    emoji_cols: u32,
+    emoji_rows: u32,
+    emoji_layer: [f32; 2],
+    _pad3: [u32; 2],
 }
 
 /// Stage F — one far-LOD backdrop quad, 32 B, mirrors `BackdropInst` in
@@ -906,6 +930,9 @@ impl CullState {
 
 pub struct GlyphScene {
     pub pipeline: wgpu::RenderPipeline,
+    /// The colour-emoji sheet's view, held so the texture outlives the bind
+    /// groups that sample it (binding 6 of every chunk's bind group).
+    _emoji_view: wgpu::TextureView,
     /// Stage E2: one bind group per instance-buffer CHUNK. A repo-scale field
     /// can exceed `max_storage_buffer_binding_size` (48 B × tens of millions
     /// of glyphs), so the arena is split into buffers that each fit the
@@ -1256,6 +1283,12 @@ impl GlyphScene {
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
         });
         log::info!(
+            "emoji sheet bound: {} cells, {} mip levels, {:.1} MiB",
+            atlas.emoji.sheet.cells.len(),
+            atlas.emoji.mip_levels,
+            atlas.emoji.texture_bytes as f64 / (1 << 20) as f64,
+        );
+        log::info!(
             "glyph field: {} instances ({} MiB) in {} chunk(s) of ≤{} ({} MiB binding limit), {} groups",
             instances.len(),
             (instances.len() * std::mem::size_of::<GlyphInstance>()) >> 20,
@@ -1273,6 +1306,12 @@ impl GlyphScene {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        let emoji_view = atlas.emoji.texture.create_view(&wgpu::TextureViewDescriptor {
+            label: Some("emoji sheet view"),
+            dimension: Some(wgpu::TextureViewDimension::D2Array),
+            ..Default::default()
+        });
+        let sheet = &atlas.emoji.sheet;
         let params = Params {
             max_groups: groups.len() as u32,
             _pad0: 0,
@@ -1283,6 +1322,11 @@ impl GlyphScene {
             soften: 0.45,
             min_lo: 0.06,
             min_hi: 0.20,
+            emoji_cell: [sheet.cell_w, sheet.cell_h],
+            emoji_cols: sheet.cols,
+            emoji_rows: sheet.rows_per_layer,
+            emoji_layer: [sheet.layer_w as f32, sheet.layer_h as f32],
+            _pad3: [0, 0],
         };
         let params_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("glyph params"),
@@ -1346,7 +1390,35 @@ impl GlyphScene {
                     },
                     count: None,
                 },
+                // The emoji sheet: a filterable sRGB 2D array + its sampler.
+                wgpu::BindGroupLayoutEntry {
+                    binding: 6,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2Array,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 7,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
             ],
+        });
+        // Trilinear, clamped: the UV rect is inset half a texel so clamping
+        // never engages inside a cell; it only guards the sheet's padding.
+        let emoji_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("emoji sampler"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::MipmapFilterMode::Linear,
+            ..Default::default()
         });
         // Stage L (O2): enumerate so captures can tell chunk bind groups
         // apart (mirrors the "glyph instances i/N" buffer labels).
@@ -1391,6 +1463,14 @@ impl GlyphScene {
                         wgpu::BindGroupEntry {
                             binding: 5,
                             resource: params_buf.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 6,
+                            resource: wgpu::BindingResource::TextureView(&emoji_view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 7,
+                            resource: wgpu::BindingResource::Sampler(&emoji_sampler),
                         },
                     ],
                 })
@@ -1558,6 +1638,7 @@ impl GlyphScene {
                     &instances,
                     staged.bounds_max[0] - staged.bounds_min[0],
                     staged.bounds_max[1] - staged.bounds_min[1],
+                    &atlas.slot_ink,
                 ),
             });
         }
@@ -1747,6 +1828,7 @@ impl GlyphScene {
 
         Self {
             pipeline,
+            _emoji_view: emoji_view,
             bind_groups,
             chunk_counts,
             chunk_cap: chunk_cap as u32,
