@@ -196,6 +196,18 @@ cmd = "--render-file fixtures/emoji-view.txt --frames 2 --zoom 1.25"
 # satisfies them. Names, not numbers — positions in this list have been
 # renumbered twice already and a name survives renumbering.
 
+# First, because every gate below reads the map this checks. It is the only
+# gate whose subject is build.toml itself: a manifest that lies makes each
+# green beneath it a claim about something other than what it names.
+[[gate]]
+name = "manifest"
+scope = "corpus"
+kind = "cmd"
+cmd = "target/release/glyph validate"
+needs = []
+compare = "build.toml against itself: every `needs` resolves and orders, every gate and mutation names a real target, every golden output is keyed by {gpu}, and every glob in a PRODUCT's inputs matches at least one file"
+blind_to = "whether the declared inputs are the RIGHT ones — it proves a pattern matches something, never that it matches everything that matters"
+
 [[gate]]
 name = "committed-artifacts"
 scope = "corpus"
@@ -338,6 +350,16 @@ blind_to = "a fault shared by both loaders in parse parity; any fixture outside 
 # ops: append (bytes onto the file) - replace (find -> with, first match) -
 #      remove (move the file aside). The original bytes are snapshotted and
 #      written back regardless of op, so restore is uniform and checkable.
+
+[[mutation]]
+name = "dead-input-glob"
+gate = "manifest"
+why = "a product input pattern matching NO file makes the currency stamp hash nothing of what it names, so `build` skips the build and `test --frozen` asserts currency over a stale binary. `native/src/**` was exactly this from 598205b until 2026-09-16 — glob's `**` matches directories, input_digest filters to files. CONSUMED BY: the product-input scan in validate(), and nothing else"
+file = "build.toml"
+op = "replace"
+find = '"native/src/**/*"'
+with = '"native/src/**"'
+expect = "matches no file"
 
 [[mutation]]
 name = "corpus-shrink"
