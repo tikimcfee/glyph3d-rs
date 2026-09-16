@@ -278,3 +278,61 @@ Fifo, frame 30 captured, no GPU errors.
 baseline and print the adoption commands; look at the frame first — this is
 the one view where the two rasterizers' FILTERS, not their edge rules, are
 being compared, and `cargo glyph drift` will say more than "edge noise".
+
+## Step 7 — the M2 pulled (2026-09-16) [measured on macOS/Metal]
+
+Step 6 ended with a note "for the M2, whenever it pulls". It pulled. Every
+prediction in this file held, and the emoji work needed no Metal-specific fix.
+
+| | Linux (9950X3D, RTX 5090) | macOS (M2, Metal) |
+|---|---:|---:|
+| parse | 1.6 ms | 3.2 ms |
+| decode, 3,985 palette PNGs | 15.3 ms / 32 threads | 58.3 ms / 8 threads |
+| mips (3 levels, single-threaded) | 71.7 ms | 85.1 ms |
+| upload enqueue | 32.6 ms | 39.1 ms |
+| total sheet load | ~121 ms | ~186 ms |
+| texture | 361.2 MiB | **361.2 MiB, same bytes** |
+
+Decode is 3.8x slower on four performance cores — step 4 predicted ~4x — and
+mips are within 19 %, also as predicted. Peak RSS rendering the whole
+`native/src` tree (773,346 instances) is 887 MB, of which the sheet is 361 MiB:
+a **fixed floor every scene now pays** on 16 GiB of shared memory. Comfortable
+here, and the levers if it ever stops being comfortable are the renderer-side
+ones step 4 already named.
+
+**The append-only claim held on the other rasterizer.** All six pre-existing
+`metal-apple` baselines byte-equal through a re-bake that appended 830 slots —
+which is the point: that claim is about slot ids, not pixels, so a move there
+would have been a real defect rather than a rasterizer difference.
+
+**The colour-bitmap path is not where the platforms differ.** `glyph drift`,
+metal-apple against vulkan-nvidia:
+
+| view | differing | max delta | >= 16 | clustered |
+|---|---:|---:|---:|---:|
+| emoji | 1.92 % | 3 | 0 | 0 |
+| text | 0.85 % | 3 | 0 | 0 |
+| repo-back-oblique | 8.93 % | 69 | 2,487 | 236 |
+
+Step 5 expected "more cross-vendor drift here than on text (filtered sampling
+is not analytic coverage)". The opposite is what happened: the emoji frame
+drifts *less* than the oblique text frame and sits in the same band as flat
+text. Two rasterizers decoded the sheet to the same texels and only filter
+rounding separates them — which is what committing the font's own PNG bytes
+buys. `Rgba8UnormSrgb` 2D-array, 2 layers of 8192x4352, bound and drew on
+Metal without a complaint; the 8,192 limit that shaped the container in step 1
+was the right thing to design around.
+
+`emoji.png` was adopted as the `metal-apple` baseline after that looking. Both
+generators (`emoji-sheet`, the atlas re-bake) reproduce BYTE-IDENTICAL here
+offline, and the exact `osx-arm64` mojo/max pins added with fonttools did their
+job: the solve stayed on `dev2026083005`.
+
+**Windowed, on Metal:** `--render-file fixtures/emoji-view.txt` draws emoji
+through the swapchain with the egui overlay up, 60 FPS at Fifo, frame 30
+captured, no GPU errors. The gates are all offscreen, so this path is only ever
+covered by hand.
+
+Still open, unchanged by this run and still deliberate: the SQUARE quad (emoji
+squeezed ~6 %, bitmap baseline ~5 % of an em low), sequence shaping, and the
+far emoji-heavy backdrop segment that no golden frames.
