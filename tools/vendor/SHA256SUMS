@@ -22,3 +22,6 @@ ea319787a8efdf90599ade77e33d1f245d61da390380f6c8299ab3195ff00d6d  tools/vendor/r
 6f49cde4cc655eb2d41fa303a240fff04d03c47e5836a211bbbaeb848d7bf908  tools/vendor/ref/tools/headlessFontChain.mjs
 6a73f9541c2de74158c0e7cf6b0a58ef774f5a780bf191f2d7ec9cc53efe2bf2  tools/vendor/third-party/noto-emoji/LICENSE.txt
 72a635cb3d2f3524c51620cdde406b217204e8a6a06c6a096ff8ed4b5fd6e27b  tools/vendor/third-party/noto-emoji/NotoColorEmoji.ttf
+d6b51d1d2ae5c33b451b7ed994b48f1f4dc62b2272a5831e7fd418514a6bae89  tools/vendor/third-party/unicode-ucd/GraphemeBreakProperty.txt
+2cb2bb9455cda83e8481541ecf5b6dfda66a3bb89efa3fa7c5297eccf607b72b  tools/vendor/third-party/unicode-ucd/emoji-data.txt
+e7a93b009565cfce55919a381437ac4db883e9da2126fa28b91d12732bc53d96  tools/vendor/third-party/unicode-ucd/license.txt

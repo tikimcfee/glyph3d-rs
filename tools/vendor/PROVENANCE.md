@@ -7,8 +7,8 @@ Recorded because a vendored file with no recorded origin is indistinguishable
 from a local invention six months later.
 
   upstream repo    viz-web/glyph3d-js
-  upstream commit  2ef79b7e762a07ebbf72713f97527a6831b7a839  (recorded; web repo not present at regeneration on 2026-09-10)
-  regenerated      2026-09-10  (tools/vendor-manifest.py)
+  upstream commit  2ef79b7e762a07ebbf72713f97527a6831b7a839
+  regenerated      2026-09-20  (tools/vendor-manifest.py)
 
 ## The fixture oracle is pinned PER FILE
 
@@ -99,9 +99,15 @@ hash recorded in `THIRD_PARTY`, so a re-vendor that forgot the record is caught.
 |---|---|---|---|---:|---|---|
 | `tools/vendor/third-party/noto-emoji/LICENSE.txt` | googlefonts/noto-emoji | `v2.051` | `6202fe7c20dd` | 4301 | `6a73f9541c2de741…` | the OFL text itself |
 | `tools/vendor/third-party/noto-emoji/NotoColorEmoji.ttf` | googlefonts/noto-emoji | `v2.051` | `6202fe7c20dd` | 10673480 | `72a635cb3d2f3524…` | SIL Open Font License 1.1 (LICENSE.txt beside it, from the same tag) |
+| `tools/vendor/third-party/unicode-ucd/GraphemeBreakProperty.txt` | unicode.org UCD | `17.0.0` | `release-dir` | 99377 | `d6b51d1d2ae5c33b…` | Unicode Terms of Use (license.txt beside it) |
+| `tools/vendor/third-party/unicode-ucd/emoji-data.txt` | unicode.org UCD | `17.0.0` | `release-dir` | 107324 | `2cb2bb9455cda83e…` | Unicode Terms of Use (license.txt beside it) |
+| `tools/vendor/third-party/unicode-ucd/license.txt` | unicode.org UCD | `17.0.0` | `release-dir` | 1995 | `e7a93b009565cfce…` | the Unicode Terms of Use text itself |
 
 - `tools/vendor/third-party/noto-emoji/LICENSE.txt` — the font's licence travels with the font
 - `tools/vendor/third-party/noto-emoji/NotoColorEmoji.ttf` — the colour-emoji bitmap source for assets/atlas/emoji-sheet.bin; CBDT/CBLC, one 109 ppem strike, 3,985 PNG glyphs of 136x128
+- `tools/vendor/third-party/unicode-ucd/GraphemeBreakProperty.txt` — Grapheme_Cluster_Break classes for the cluster-mode segmentation rule — the source tools/gen_cluster_table.py reads
+- `tools/vendor/third-party/unicode-ucd/emoji-data.txt` — Extended_Pictographic / Emoji_Modifier / keycap classes for the same generator — cluster head/trailer candidacy
+- `tools/vendor/third-party/unicode-ucd/license.txt` — the licence travels with the data
 
 ## Notes
 
