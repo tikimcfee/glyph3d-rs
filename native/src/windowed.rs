@@ -108,6 +108,20 @@ const PANEL_VERBS: &[&str] = &[
     "toggle-hidden",
 ];
 
+/// Debug-panel slider ranges, named so the sliders and the self-tests that
+/// drive them (K4, ZSPACE) cannot drift apart. Deliberately wider than any
+/// one machine wants: the LOD low end keeps sub-half-pixel glyphs as real
+/// geometry (a desktop can pay for it), the high end collapses more of a
+/// vast repo onto backdrop quads (a laptop's relief valve), and
+/// z_wrap_spacing's top is four em of pitch per wrap step. These bound the
+/// DIALS only — the values they bracket default elsewhere (LOD_MIN_PX 1.0,
+/// RepoParams::z_wrap_spacing 0.15), and offscreen renders read those
+/// consts, never the panel.
+#[cfg(feature = "egui-ui")]
+const LOD_SLIDER_PX: std::ops::RangeInclusive<f32> = 0.125..=64.0;
+#[cfg(feature = "egui-ui")]
+const Z_WRAP_SPACING_SLIDER: std::ops::RangeInclusive<f64> = 0.0..=4.0;
+
 struct WindowState {
     window: Arc<Window>,
     surface: wgpu::Surface<'static>,
@@ -337,9 +351,10 @@ impl WindowState {
                         "K4SELFTEST before: lod_min_px={:.2} -> ranges={} instances={} backdrops={}",
                         p.lod_min_px, p.cull_ranges, p.cull_instances, p.cull_backdrops
                     );
-                    // The panel slider's range max: at 16 px/em every visible
-                    // fixture segment drops to its backdrop quad.
-                    p.lod_min_px = 16.0;
+                    // The panel slider's range max (LOD_SLIDER_PX), well
+                    // past the ~16 px/em at which every visible fixture
+                    // segment has already dropped to its backdrop quad.
+                    p.lod_min_px = *LOD_SLIDER_PX.end();
                 }
                 self.k4_selftest = 2;
             }
@@ -377,7 +392,7 @@ impl WindowState {
                             "ZSPACE-SELFTEST before: z_wrap_spacing={seed:.2} instances={} z_extent={before_extent:?}",
                             self.scene.instance_count()
                         );
-                        let new = (seed * 2.0).min(1.0);
+                        let new = (seed * 2.0).min(*Z_WRAP_SPACING_SLIDER.end());
                         if let Some(probe) = &self.ui_probe {
                             probe.borrow_mut().z_wrap_spacing = Some(new);
                         }
@@ -553,11 +568,12 @@ impl WindowState {
                         if let (Some(snap), Some(cell)) = (&probe_snap, &self.ui_probe) {
                             ui.separator();
                             ui.label("cull/LOD — live, windowed only (offscreen keeps consts):");
-                            // Range brackets the const default (1.0 px/em) with
-                            // ~2 octaves each way; logarithmic because the
-                            // threshold is a perceptual scale.
+                            // Logarithmic because the threshold is a
+                            // perceptual scale. The range (LOD_SLIDER_PX)
+                            // brackets the const default (1.0 px/em) with
+                            // 3 octaves below and 6 above.
                             ui.add(
-                                egui::Slider::new(&mut cell.borrow_mut().lod_min_px, 0.25..=16.0)
+                                egui::Slider::new(&mut cell.borrow_mut().lod_min_px, LOD_SLIDER_PX)
                                     .logarithmic(true)
                                     .text("LOD_MIN_PX px/em (const 1.0)"),
                             );
@@ -582,7 +598,7 @@ impl WindowState {
                                      pick/selection state resets:",
                                 );
                                 let resp = ui.add(
-                                    egui::Slider::new(spacing, 0.0..=1.0)
+                                    egui::Slider::new(spacing, Z_WRAP_SPACING_SLIDER)
                                         .text("z_wrap_spacing × em (0 = flat, default 0.15)"),
                                 );
                                 if let Some([lo, hi]) = snap.z_extent {
