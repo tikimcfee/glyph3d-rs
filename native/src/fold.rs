@@ -78,7 +78,9 @@ pub const TRIE_FLAG_MISSING: u32 = 1;
 /// spans two items. See `scan::tests::mixed_mode_is_outside_the_monoid_s_domain`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum WrapMode {
-    /// A wrap advances the visual row. Today's behaviour, and the default.
+    /// A wrap advances the visual row. The DERIVE default only because its
+    /// wire code is 0 (see `code`) — the production default is `Back`
+    /// (`ItemParams::default`, `RepoParams::default`, `--wrap-mode`).
     #[default]
     Down,
     /// A wrap keeps the row and steps only in depth.

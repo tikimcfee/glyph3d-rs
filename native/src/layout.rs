@@ -175,7 +175,8 @@ pub struct ItemParams {
     pub z_step: f64,
     /// Fold unit in COLUMNS; 0 = no wrap.
     pub wrap_width: i32,
-    /// How a wrap spends itself: down a row (the default) or back in depth.
+    /// How a wrap spends itself: down a row or back in depth (the default,
+    /// here and in `RepoParams`).
     /// ITEM-LEVEL, exactly like `wrap_width` — see [`crate::fold::WrapMode`].
     pub wrap_mode: crate::fold::WrapMode,
     pub has_page: bool,

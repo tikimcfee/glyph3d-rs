@@ -415,10 +415,11 @@ struct Cli {
     /// paths have them (`direct` has none, and the PASS line says so).
     #[arg(long)]
     repo_verify: bool,
-    /// How a wrap is spent on a repo load: `down` advances the visual row (the
-    /// default, and what the byte-equal screenshot baselines are taken under),
-    /// `back` keeps the row and steps the segment back in depth instead — one
-    /// row per source line however long it is.
+    /// How a wrap is spent on a repo load: `back` (the default, and what the
+    /// `repo-wide`/`repo-zoom` byte-equal screenshot baselines are taken
+    /// under; `repo-down` covers the other) keeps the row and steps the
+    /// segment back in depth instead — one row per source line however long
+    /// it is. `down` advances the visual row per wrap.
     #[arg(long, value_name = "MODE", default_value = "back", value_parser = ["down", "back"])]
     wrap_mode: String,
     /// Stage E2: frame the first file whose path contains SUBSTR
