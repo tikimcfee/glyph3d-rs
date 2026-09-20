@@ -84,6 +84,14 @@ build = "pixi run gen-emoji-sheet"
 verify_cmd = "pixi run python tools/gen_emoji_sheet.py --check"
 note = "Generator-native check mode; fontTools lives in the pixi env. The font is pinned by fetch hash in vendor-manifest.py."
 
+[artifact.cluster-classes]
+class = "committed"
+outputs = ["assets/atlas/cluster-classes.bin"]
+inputs = ["tools/gen_cluster_table.py", "tools/vendor/third-party/unicode-ucd/*.txt"]
+build = "python3 tools/gen_cluster_table.py"
+verify_cmd = "python3 tools/gen_cluster_table.py --check"
+note = "Grapheme-cluster class table, generated from the vendored UCD (never hand-written). The sequence pass's class source; general UAX #29 rides the same table later."
+
 # Regeneration is by hand and ORDERED: emoji-sheet, then atlas (reads the
 # sheet to append the emoji slots), then engine-trie (reads codepoints.bin).
 # `glyph build` verifies these; it does not run the chain.
@@ -385,6 +393,15 @@ file = "engine/fixtures/ascii-basic.pipe.bin"
 op = "append"
 arg = " "
 expect = "differs from the committed fixture"
+
+[[mutation]]
+name = "cluster-classes-byte"
+gate = "committed-artifacts"
+why = "the class table is generated from vendored UCD and a hand-edit must not survive; same class as emoji-sheet-byte, for the artifact every cluster-mode implementation reads"
+file = "assets/atlas/cluster-classes.bin"
+op = "append"
+arg = " "
+expect = "differs from a fresh bake"
 
 [[mutation]]
 name = "emoji-sheet-byte"
