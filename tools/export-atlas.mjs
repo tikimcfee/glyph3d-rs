@@ -28,6 +28,11 @@
  *      at the sheet (NO_CELL where the font has no bitmap for them — the web's
  *      canvas indices meant nothing here). Slots 0..4430 of the glyph map are
  *      still the web's bytes; the tail is ours.
+ *      Step 4c (2026-09-20, the sequence pass) appends one bitmap slot per
+ *      SHEET SEQUENCE after those, in the sheet's sorted table order, so a
+ *      resolved cluster head is an ordinary slot id and the shader needs
+ *      nothing new. Same append-only rule: slot = base + table index, a pure
+ *      function of (web bake, sheet).
  *
  * Usage:  node tools/export-atlas.mjs [--out <dir>]
  * Requires: node ≥ 18 (CompressionStream-free; we use zlib). Reference repo must
@@ -288,6 +293,37 @@ for (const cp of [...cpToCell.keys()].sort((a, b) => a - b)) {
     appended.push(cp);
 }
 cpEntries.sort((a, b) => a[0] - b[0]);
+
+// ── step 4c: the sequence slots — one bitmap slot per sheet sequence ────────
+// The sequence pass's render half: every sequence the sheet draws gets a slot
+// whose glyph-map texel is [0, 0, 1, cell], so a resolved cluster head is just
+// a slot id in the instance stream and the shader needs nothing new. The
+// sheet's sequence table is sorted by codepoint sequence, so the slot id of
+// sequence i is SEQ_SLOT_BASE + i — a pure function of (web bake, sheet), the
+// same append-only rule as 4b. gen_real_trie.py computes the SAME ids from the
+// SAME table when it writes the engine trie's sequence section: no mapping
+// artifact exists to drift.
+const seqCount = sheet[22], seqMax = sheet[23];
+const seqStride = 2 + seqMax;
+const seqTableOff = SHEET_HEADER_WORDS + sheetCells * SHEET_CELL_STRIDE + sheetCps * SHEET_CP_STRIDE;
+const seqSlotBase = slotMeta.length;
+for (let i = 0; i < seqCount; i++) {
+    const o = seqTableOff + i * seqStride;
+    const len = sheet[o], gid = sheet[o + 1];
+    if (len < 2 || len > seqMax) throw new Error(`sequence ${i}: len ${len} out of range`);
+    const cell = cellIndexOfGlyph.get(gid);
+    if (cell === undefined) throw new Error(`sequence ${i} targets glyph ${gid}, which has no cell`);
+    const cps = [];
+    for (let k = 0; k < len; k++) cps.push(sheet[o + 2 + k].toString(16).toUpperCase());
+    slotMeta.push({
+        fontIdx: FONTIDX_BITMAP, gid: 0,
+        name: `<emoji seq ${cps.join('.')}>`,
+        advanceFu: 0, asc: 0, desc: 0, flags: SLOT_FLAG_BITMAP, emojiCell: cell,
+        curveStart: 0, curveCount: 0, bbox: [0, 0, 0, 0],
+    });
+}
+console.log(`[emoji] sequences: ${seqCount} slots appended (${seqSlotBase} -> ${slotMeta.length})`);
+
 const slotCountOut = slotMeta.length;
 // (c) the glyph-map texels: the web's prefix verbatim, .w re-pointed for its
 // bitmap slots, then one [0, 0, 1, cell] texel per appended slot.
@@ -302,7 +338,7 @@ for (let s = 0; s < slotCountOut; s++) {
 }
 console.log(`[emoji] sheet: ${sheetCells} cells, ${cpToCell.size} single-codepoint; web bitmap slots ` +
     `${repointed} re-pointed + ${noCell} with no cell; ${appended.length} slots appended ` +
-    `(${webSlotCount} -> ${slotCountOut}); glyph map ${mapHeight} rows`);
+    `(${webSlotCount} -> ${seqSlotBase}); glyph map ${mapHeight} rows`);
 
 // ── step 5: build the codepoint trie (GlyphTrie layout, extended flags) ──────
 

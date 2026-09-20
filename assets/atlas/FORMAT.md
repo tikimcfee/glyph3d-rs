@@ -108,7 +108,7 @@ The Slug glyph-map texture, verbatim. Same binding convention.
 | 2 | headerBytes | 32 |
 | 3 | width | 1024 |
 | 4 | height | 6 |
-| 5 | entryCount | 5261 (= maxGlyphId + 1: the web's 4,431 + 830 appended emoji slots) |
+| 5 | entryCount | 9427 (= maxGlyphId + 1: the web's 4,431 + 830 appended emoji slots + 4,166 appended sequence slots) |
 | 6–7 | reserved | 0 |
 | 8 … | payload | `width × height × 4` u32 texels |
 
@@ -133,6 +133,16 @@ sheet can draw and no outline font covers, allocated in codepoint order. No
 existing id moved, which is what keeps every text frame byte-equal. The
 policy is the web's own: a codepoint an outline font draws stays outline
 (digits, `#`, `*`, ©, ®, ❤ … are emoji in the font and text here — 117 such).
+
+**Slots 5261–9426 are the sequence slots** (2026-09-20, step 4c): one bitmap
+slot per entry in `emoji-sheet.bin`'s sequence table, allocated in the
+table's own (sorted) order, so a sequence's slot id is `5261 + index` — a
+pure function of the sheet, which is what lets `gen_real_trie.py` compute
+the same ids for the engine trie without a mapping artifact. Each is a
+`[0, 0, 1, cell]` texel like any appended emoji slot; nothing resolves a
+codepoint SEQUENCE to these slots yet (that is the engine-side sequence
+pass). Cluster heads render through the same mode-1 branch and the same
+square quad as any emoji.
 
 Slots that exist but were never encoded (holes in the id space) read as
 `[0, 0, 0, 0]`: mode 0, zero curves — rendered blank. Slot 0 (blank) is such an
@@ -417,7 +427,9 @@ engine change is needed.
 - **Runtime growth**: codepoints outside `LARGE_CORE_RANGES` (CJK, kana, most of
   the Nerd-Font PUA) are MISSING in the trie. Single-codepoint emoji are NOT a
   gap any more (every one the vendored font draws has a slot); emoji SEQUENCES
-  are — the trie is one glyph per codepoint. The web app grows the atlas live
+  have slots as of 2026-09-20 (step 4c above) but the codepoint trie remains
+  one-glyph-per-codepoint — resolving a sequence to its slot is the engine-side
+  sequence pass. The web app grows the atlas live
   (shape → allocate slot → encode → re-upload); the native port's answer is
   append-only re-bakes, never runtime growth.
 - The three TTF font files are NOT copied into this export; they remain in the
@@ -426,11 +438,13 @@ engine change is needed.
 
 ## Numbers at a glance (as exported)
 
-- 5261 slots: 3511 outline glyphs, 22 empty, 1727 bitmap (the web's 897, of
-  which 513 have a sheet cell, + 830 appended, all with one); slot 0 = blank
+- 9427 slots: 3511 outline glyphs, 22 empty, 5893 bitmap (the web's 897, of
+  which 513 have a sheet cell, + 830 appended single-codepoint, + 4,166
+  appended sequence slots, all with one); slot 0 = blank
 - 82239 quadratic curves; curve texture 1024×161 RGBA32Uint (2.5 MiB payload)
-- glyph-map texture 1024×6 RGBA32Uint (96 KiB payload)
+- glyph-map texture 1024×10 RGBA32Uint (160 KiB payload)
 - trie: 6160 mapped codepoints, 39 unique blocks, 4352-entry index (173 KiB)
 - emoji sheet: 3985 cells of 136×128 in 2 layers of 8160×4352 (10.9 MB)
+- cluster classes: 1615 ranges over UCD 17.0 (19.4 KB; generated, not hand-written)
 - fonts: Cousine (primary, monospace cell advance 1229/2048 em), MesloLGS NF Mono,
   DejaVu Sans; em height 2320 fu (asc 1705 / desc −615)
