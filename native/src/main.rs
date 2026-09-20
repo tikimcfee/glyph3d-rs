@@ -79,6 +79,11 @@ pub enum SceneChoice {
         /// other mode covered so making one default cannot silently retire the
         /// other.
         wrap_mode: fold::WrapMode,
+        /// The wrap staircase's pitch (`--z-wrap-spacing`, default 0.15 —
+        /// the web's `zWrapSpacing`). Carried alongside wrap_mode for the
+        /// same reason: the baselines depend on the default, so the CLI
+        /// layer pins it rather than letting RepoParams::default speak alone.
+        z_wrap_spacing: f64,
         /// The colour-emoji sheet (`--emoji-sheet`; default the committed
         /// one). Every glyph scene loads it — the same handle the engine
         /// trie has, so swapping a sheet is a command-line act.
@@ -97,6 +102,25 @@ fn parse_wrap_mode(s: &str) -> fold::WrapMode {
         "back" => fold::WrapMode::Back,
         other => panic!("--wrap-mode: unknown mode {other:?} (clap should have refused it)"),
     }
+}
+
+/// `--z-wrap-spacing` validation, run by clap at parse time. NaN must be
+/// refused HERE, not left to `ItemParams::validate` at the layout seam:
+/// clap's error names the flag and the value; the seam's panic would name
+/// neither. Negative means the staircase steps FORWARD through the page
+/// plane, which no baseline has ever rendered; refuse it rather than gate
+/// nothing on a geometry nobody has looked at. 0 is legitimate — the
+/// documented flat layout (`RepoParams::z_wrap_spacing`).
+fn parse_z_wrap_spacing(s: &str) -> Result<f64, String> {
+    let v: f64 = s
+        .parse()
+        .map_err(|_| format!("--z-wrap-spacing: {s:?} is not a number"))?;
+    if !v.is_finite() || v < 0.0 {
+        return Err(format!(
+            "--z-wrap-spacing: {v} is out of domain (need a finite value >= 0)"
+        ));
+    }
+    Ok(v)
 }
 
 /// Panics on an unknown strategy for the same reason `parse_wrap_mode` does:
@@ -285,9 +309,14 @@ fn build_scene_impl(
             verify,
             focus,
             wrap_mode,
+            z_wrap_spacing,
             emoji_sheet,
         } => {
-            let params = repo::RepoParams { wrap_mode: *wrap_mode, ..Default::default() };
+            let params = repo::RepoParams {
+                wrap_mode: *wrap_mode,
+                z_wrap_spacing: *z_wrap_spacing,
+                ..Default::default()
+            };
             let load = repo::load_repo(dir, &default_engine_trie(), &params, *strategy, *verify);
             load.print_stats();
             let atlas = atlas::Atlas::load(ctx, emoji_sheet);
@@ -422,6 +451,15 @@ struct Cli {
     /// it is. `down` advances the visual row per wrap.
     #[arg(long, value_name = "MODE", default_value = "back", value_parser = ["down", "back"])]
     wrap_mode: String,
+    /// The wrap staircase's pitch: z step per intra-line wrap segment, as a
+    /// multiple of the em cell height (`RepoParams::z_wrap_spacing` — the
+    /// web's `zWrapSpacing`). 0 restores the flat layout exactly
+    /// (repo.rs). The default is what the repo screenshot baselines are
+    /// taken under — same standing as --wrap-mode.
+    // allow_negative_numbers so a negative REACHES the parser and is refused
+    // with the flag named — otherwise clap eats "-0.1" as an unknown flag.
+    #[arg(long, value_name = "F", default_value_t = 0.15, allow_negative_numbers = true, value_parser = parse_z_wrap_spacing)]
+    z_wrap_spacing: f64,
     /// Stage E2: frame the first file whose path contains SUBSTR
     #[arg(long, value_name = "SUBSTR")]
     focus_file: Option<String>,
@@ -1092,7 +1130,11 @@ fn main() {
     // Stage E2 scan-only: full load pipeline without a GPU (measurement path).
     if cli.repo_scan_only {
         let dir = cli.load_repo.as_ref().expect("--repo-scan-only needs --load-repo");
-        let params = repo::RepoParams { wrap_mode: parse_wrap_mode(&cli.wrap_mode), ..Default::default() };
+        let params = repo::RepoParams {
+            wrap_mode: parse_wrap_mode(&cli.wrap_mode),
+            z_wrap_spacing: cli.z_wrap_spacing,
+            ..Default::default()
+        };
         let load = repo::load_repo(
             dir,
             &default_engine_trie(),
@@ -1114,6 +1156,7 @@ fn main() {
             verify: cli.repo_verify,
             focus: cli.focus_file.clone(),
             wrap_mode: parse_wrap_mode(&cli.wrap_mode),
+            z_wrap_spacing: cli.z_wrap_spacing,
             emoji_sheet,
         }
     } else if let Some(file) = &cli.engine_render {
@@ -1201,6 +1244,10 @@ mod cli_tests {
         assert_eq!(parse_wrap_mode(&cli.wrap_mode), fold::WrapMode::Back);
         // ...and the non-default is still reachable and still spelled the same.
         assert_eq!(parse_wrap_mode("down"), fold::WrapMode::Down);
+        // Same standing as wrap_mode: the wrap staircase's pitch moves the
+        // same baselines (repo-wide renders the staircase), so the CLI layer
+        // pins the default too, not only RepoParams::default (repo.rs).
+        assert_eq!(cli.z_wrap_spacing, 0.15);
         assert!(!cli.repo_verify);
         assert!(cli.focus_file.is_none());
         assert!(!cli.repo_scan_only);
@@ -1224,7 +1271,7 @@ mod cli_tests {
             "--screenshot", "out.png", "--frames", "2", "--demo", "--copies", "3", "--zoom",
             "2.5", "--no-cull", "--no-ui", "--engine-loop", "4", "--load-repo", "fixtures/g-pick-repo",
             "--repo-engine", "batch", "--repo-verify", "--focus-file", "alpha",
-            "--wrap-mode", "back",
+            "--wrap-mode", "back", "--z-wrap-spacing", "0.6",
             "--render-file", "src/main.rs", "--engine-file", "a.rs", "--engine-trie", "t.bin",
             "--engine-check", "b.rs", "--engine-render", "c.rs",
             "--present-mode", "mailbox", "--gpu-key", "--gpu-profile",
@@ -1247,6 +1294,7 @@ mod cli_tests {
         assert_eq!(cli.repo_engine, "batch");
         assert_eq!(cli.wrap_mode, "back");
         assert_eq!(parse_wrap_mode(&cli.wrap_mode), fold::WrapMode::Back);
+        assert_eq!(cli.z_wrap_spacing, 0.6);
         assert!(cli.repo_verify);
         assert_eq!(cli.focus_file.as_deref(), Some("alpha"));
         assert_eq!(cli.render_file, Some(PathBuf::from("src/main.rs")));
@@ -1266,6 +1314,26 @@ mod cli_tests {
             Err(e) => e.to_string(),
         };
         assert!(text.contains("sideways"), "the error must name the bad value: {text}");
+    }
+
+    /// Out-of-domain spacing is REFUSED at the boundary with the flag and the
+    /// value named — not passed down to ItemParams::validate, whose panic
+    /// would say "z_step" and nothing about the command line. NaN is the
+    /// dangerous one (two NaN layouts compare bit-equal — see
+    /// ItemParams::validate); negative is a forward staircase no baseline
+    /// has ever rendered.
+    #[test]
+    fn an_out_of_domain_z_wrap_spacing_is_refused() {
+        for bad in ["-0.1", "NaN", "inf", "abc"] {
+            let text = match try_parse(&["--z-wrap-spacing", bad]) {
+                Ok(_) => panic!("clap must refuse --z-wrap-spacing {bad}"),
+                Err(e) => e.to_string(),
+            };
+            assert!(text.contains("--z-wrap-spacing"), "error must name the flag: {text}");
+        }
+        // The boundary itself is in domain: 0 is the documented flat layout.
+        let cli = parse(&["--z-wrap-spacing", "0"]);
+        assert_eq!(cli.z_wrap_spacing, 0.0);
     }
 
     #[test]

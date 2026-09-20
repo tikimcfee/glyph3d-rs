@@ -125,7 +125,11 @@ detail.
   atlas, neither of which the spine moves. Gated by the instance-payload
   question below.
 - **The web target (item 6).** Cfg-gating and a split. Orthogonal to layout.
-- **`z_wrap_spacing` has no CLI flag.** Small, self-contained, named by Ivan.
+- ~~**`z_wrap_spacing` has no CLI flag.**~~ DONE (2026-09-20): `--z-wrap-spacing`
+  on the renderer CLI, validated at parse (finite, ≥ 0; 0 = the documented
+  flat layout), default 0.15 pinned in the CLI tests beside the wrap-mode
+  default. Runtime re-tuning is the same shape of question as wrap-mode
+  toggling below — the value is baked into `ItemParams` at load.
 - **Runtime wrap-mode toggling.** A command-bus question, not a layout one:
   mode is baked into `ItemParams` at load, so toggling means re-running the fold
   (cheap — 0.04 s for 407k records, measured).
@@ -513,11 +517,12 @@ including blanks (`layout.rs`, `compact_records_into`); whether the engine's
 directions, and treat a disagreement as the interesting result rather than a
 merge conflict to settle.
 
-Two follow-ons named by Ivan, deliberately NOT folded in: the fold pitch
-(`RepoParams::z_wrap_spacing`) has no CLI flag and making it configurable is its
-own small change; runtime wrap-mode toggling is a command-bus question, not a
+Two follow-ons named by Ivan, one landed, one open: the fold pitch
+(`RepoParams::z_wrap_spacing`) got its CLI flag (`--z-wrap-spacing`,
+2026-09-20); runtime wrap-mode toggling is a command-bus question, not a
 layout one, since mode is baked into `ItemParams` at load and toggling means
-re-running the fold (cheap now — 0.04 s for 407k records, measured).
+re-running the fold (cheap now — 0.04 s for 407k records, measured). The
+same applies to re-tuning the pitch at runtime.
 
 ## Open, and worth deciding before the work that depends on it
 

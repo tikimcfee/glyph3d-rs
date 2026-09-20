@@ -869,3 +869,25 @@ impl RepoLoad {
         );
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The seam the whole z_wrap_spacing chain hangs on: the CLI flag sets
+    /// RepoParams::z_wrap_spacing, and this is the ONE place it becomes the
+    /// engine's z_step (× CELL_HEIGHT_WORLD, as CodeGrid.js:1365 computes
+    /// it). If this mapping moves, the flag, the field's doc comment, and
+    /// the web's semantics all have to move together.
+    #[test]
+    fn z_wrap_spacing_becomes_z_step_times_cell_height() {
+        let p = RepoParams { z_wrap_spacing: 0.6, ..Default::default() };
+        let item = file_item_params(&p, 10_000, 100);
+        assert_eq!(item.z_step, text::CELL_HEIGHT_WORLD as f64 * 0.6);
+        // 0 is the documented flat layout, in domain — not clamped away.
+        let p = RepoParams { z_wrap_spacing: 0.0, ..Default::default() };
+        assert_eq!(file_item_params(&p, 10_000, 100).z_step, 0.0);
+        // The default pins the web's zWrapSpacing (the baselines render it).
+        assert_eq!(RepoParams::default().z_wrap_spacing, 0.15);
+    }
+}
