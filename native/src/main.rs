@@ -1187,7 +1187,7 @@ fn main() {
             let shot = cli.screenshot_frame.zip(cli.screenshot_out.clone());
             windowed::run(
                 ctx,
-                &choice,
+                choice,
                 !cli.no_cull,
                 &cli.ops,
                 !cli.no_ui,

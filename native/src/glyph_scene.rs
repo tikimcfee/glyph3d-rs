@@ -573,6 +573,19 @@ pub struct UiProbeState {
     pub cull_ranges: usize,
     pub cull_instances: u64,
     pub cull_backdrops: usize,
+    // ── Layout dial (repo scenes): the wrap staircase's pitch. Unlike the
+    // K4 controls this is LAYOUT, not a per-frame cull input — applying it
+    // re-runs load_repo and rebuilds the scene (windowed.rs's
+    // pending_relayout arm), so the panel fires on drag RELEASE, never per
+    // tick (the JS system's `grid.layout` semantics: a discrete refold
+    // command). Seeded at install from the files' actual z_step; written by
+    // the panel's slider; read by nothing per frame. None for non-repo
+    // scenes ⇒ the panel hides the section. ──
+    pub z_wrap_spacing: Option<f64>,
+    /// Field depth extent (world z over the cull segments), refreshed per
+    /// frame — the quantified readout of what the dial did. None under
+    /// --no-cull (no segment table).
+    pub z_extent: Option<[f32; 2]>,
     // ── K5: group-browser data. `files` is STATIC (built once at install;
     // Rc-shared so the panel's per-frame snapshot clones a refcount, not the
     // rows). `file_dyn` is refreshed per frame (world pose under the live
@@ -1886,10 +1899,21 @@ impl GlyphScene {
             })
             .unwrap_or_default();
         let file_dyn = vec![UiFileDyn::default(); files.len()];
+        // The layout dial's seed: every repo file shares one z_step
+        // (repo::file_item_params computes it from the same
+        // RepoParams::z_wrap_spacing), so any file speaks for the field.
+        // Non-repo scenes have no pick context → None → the panel hides
+        // the section.
+        let z_wrap_spacing = self
+            .pick
+            .as_ref()
+            .and_then(|p| p.files.first())
+            .map(|f| f.item.z_step / crate::text::CELL_HEIGHT_WORLD as f64);
         let probe = UiProbe::new(std::cell::RefCell::new(UiProbeState {
             lod_min_px: LOD_MIN_PX,
             files: std::rc::Rc::new(files),
             file_dyn,
+            z_wrap_spacing,
             ..Default::default()
         }));
         self.ui_probe = Some(probe.clone());
@@ -3096,6 +3120,14 @@ impl SceneLike for GlyphScene {
                 p.cull_instances = 0;
                 p.cull_backdrops = 0;
             }
+            // The layout dial's readout: the field's depth extent over the
+            // segment table (per frame, so group z-moves show too). None
+            // under --no-cull — no segment table to measure.
+            p.z_extent = self.cull.as_ref().map(|c| {
+                c.segments.iter().fold([f32::INFINITY, f32::NEG_INFINITY], |[lo, hi], s| {
+                    [lo.min(s.min[2]), hi.max(s.max[2])]
+                })
+            });
             // K5: refresh the browser's dynamic row state (world pose under
             // the live group TRS, hidden, tint). ~1.3k cheap iterations at
             // repo scale; skipped entirely offscreen (no probe installed).

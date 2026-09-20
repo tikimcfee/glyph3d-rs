@@ -46,6 +46,15 @@
 //! pass and the egui pass, so the PNG is the COMPOSED frame — 3D scene AND
 //! the Debug window; that inclusion is the point (pixel-verification seam
 //! for "invisible by construction" UI claims, per the stage erratum).
+//!
+//! Layout dial (repo scenes): the Debug panel's z_wrap_spacing slider
+//! applies on drag RELEASE by rebuilding the scene — re-running
+//! repo::load_repo with the new pitch and swapping the GlyphScene in place
+//! (the pending_relayout arm in window_event). Layout is not a per-frame
+//! input like K4's LOD threshold, and the JS system's `grid.layout` was
+//! likewise a discrete refold command, not a live drag. The camera pose
+//! survives the swap (restored from the old probe); pick/selection/grab
+//! state resets with the scene.
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -159,6 +168,17 @@ struct WindowState {
     /// after-counters next frame). See AGENTS.md debug env vars.
     #[cfg(feature = "egui-ui")]
     k4_selftest: u8,
+    /// The layout dial's apply signal (repo scenes): the panel's
+    /// z_wrap_spacing slider sets Some(new value) on drag release; the
+    /// RedrawRequested arm consumes it and rebuilds the scene between
+    /// frames. Always None on non-repo scenes (the panel hides the dial).
+    #[cfg(feature = "egui-ui")]
+    pending_relayout: Option<f64>,
+    /// Dev-only verification hook state (GLYPH_ZSPACE_SELFTEST=1): same
+    /// 0/1/2 arming as k4_selftest, driving the layout dial through the
+    /// same pending_relayout arm the slider's release uses.
+    #[cfg(feature = "egui-ui")]
+    zspace_selftest: u8,
 }
 
 impl WindowState {
@@ -335,6 +355,56 @@ impl WindowState {
             }
             _ => {}
         }
+        // Dev-only verification hook (GLYPH_ZSPACE_SELFTEST=1): drive the
+        // layout dial programmatically — set the probe's z_wrap_spacing to
+        // 2× its seed and fire the SAME pending_relayout arm the slider's
+        // drag-release sets (consumed after this render, in window_event's
+        // RedrawRequested arm). Logs the instance count (must NOT change —
+        // z_step moves no slot counts) and the field's z extent (must
+        // ~double) before/after the rebuild. States: 1 = fire at t>3 s;
+        // 2 = one quiet frame (the rebuild happened after last frame's
+        // render; THIS frame's scene render refreshes the new probe's
+        // z_extent); 3 = print the after-readout, done. Skips when there is
+        // no dial.
+        #[cfg(feature = "egui-ui")]
+        match self.zspace_selftest {
+            1 if self.time() > 3.0 => {
+                let seed = self.ui_probe.as_ref().and_then(|p| p.borrow().z_wrap_spacing);
+                match seed {
+                    Some(seed) => {
+                        let before_extent = self.ui_probe.as_ref().and_then(|p| p.borrow().z_extent);
+                        println!(
+                            "ZSPACE-SELFTEST before: z_wrap_spacing={seed:.2} instances={} z_extent={before_extent:?}",
+                            self.scene.instance_count()
+                        );
+                        let new = (seed * 2.0).min(1.0);
+                        if let Some(probe) = &self.ui_probe {
+                            probe.borrow_mut().z_wrap_spacing = Some(new);
+                        }
+                        self.pending_relayout = Some(new);
+                        self.zspace_selftest = 2;
+                    }
+                    None => {
+                        println!("ZSPACE-SELFTEST: no layout dial (non-repo scene or --no-ui) — skipping");
+                        self.zspace_selftest = 0;
+                    }
+                }
+            }
+            2 => self.zspace_selftest = 3,
+            3 => {
+                if let Some(probe) = &self.ui_probe {
+                    let p = probe.borrow();
+                    println!(
+                        "ZSPACE-SELFTEST after:  z_wrap_spacing={:?} instances={} z_extent={:?}",
+                        p.z_wrap_spacing,
+                        self.scene.instance_count(),
+                        p.z_extent
+                    );
+                }
+                self.zspace_selftest = 0;
+            }
+            _ => {}
+        }
         // wgpu 30: get_current_texture returns a status enum instead of Result.
         use wgpu::CurrentSurfaceTexture as Cst;
         let frame = match self.surface.get_current_texture() {
@@ -417,6 +487,9 @@ impl WindowState {
             let scratch = &mut egui.scratch;
             let filter = &mut egui.filter;
             let selected_group = &mut egui.selected_group;
+            // The layout dial's apply signal: the panel's slider sets it on
+            // release; the RedrawRequested arm consumes it and rebuilds.
+            let pending_relayout = &mut self.pending_relayout;
             let full_output = egui_ctx.run_ui(raw_input, |root_ui| {
                 // K1 leftover REMOVED (stage-k fix): the empty
                 // `CentralPanel::default()` paints an OPAQUE full-viewport
@@ -492,6 +565,35 @@ impl WindowState {
                                 "cull: {} draw ranges, {} instances | {} backdrops",
                                 snap.cull_ranges, snap.cull_instances, snap.cull_backdrops
                             ));
+                        }
+                        // The layout dial (repo scenes only): the wrap
+                        // staircase's pitch. Unlike K4's cull input this IS
+                        // layout — applying re-runs load_repo and rebuilds
+                        // the scene — so it fires on drag release (or a typed
+                        // commit), never per tick: the JS system's
+                        // `grid.layout` was likewise a discrete refold
+                        // command, not a live drag.
+                        if let (Some(snap), Some(cell)) = (&probe_snap, &self.ui_probe) {
+                            let mut p = cell.borrow_mut();
+                            if let Some(spacing) = &mut p.z_wrap_spacing {
+                                ui.separator();
+                                ui.label(
+                                    "layout (repo) — applies on release; the scene rebuilds, \
+                                     pick/selection state resets:",
+                                );
+                                let resp = ui.add(
+                                    egui::Slider::new(spacing, 0.0..=1.0)
+                                        .text("z_wrap_spacing × em (0 = flat, default 0.15)"),
+                                );
+                                if let Some([lo, hi]) = snap.z_extent {
+                                    ui.label(format!(
+                                        "field depth: z ∈ [{lo:.1}, {hi:.1}] world units"
+                                    ));
+                                }
+                                if resp.drag_stopped() || (resp.changed() && !resp.dragged()) {
+                                    *pending_relayout = Some(*spacing);
+                                }
+                            }
                         }
                         ui.separator();
                         ui.label("K2 typing test — WASD/h/g/t/x here must not move the scene:");
@@ -767,9 +869,63 @@ impl WindowState {
     }
 }
 
+/// The layout dial's apply: re-run the whole repo load with the new pitch
+/// and swap the scene in place. Correct by construction — the one true
+/// layout path rebuilds everything the pitch touches (cull AABBs, per-file
+/// pick params, bounds) — at the cost of a full reload per apply, which is
+/// why the panel fires on release, not per tick. The camera pose survives
+/// via the old probe's last frame; pick/selection/grab state resets with
+/// the scene (a fresh load has none — same as the JS `grid.layout` refold).
+/// A free function, not an App method: the caller already holds
+/// `state: &mut WindowState` borrowed from `self.state`, so `&mut self`
+/// would double-borrow.
+#[cfg(feature = "egui-ui")]
+fn rebuild_repo_scene(
+    ctx: &GpuContext,
+    choice: &mut SceneChoice,
+    cull: bool,
+    ui: bool,
+    state: &mut WindowState,
+    new_z: f64,
+) {
+    let SceneChoice::Repo { z_wrap_spacing, .. } = choice else {
+        // The dial only exists on repo scenes; a stale signal is a no-op.
+        return;
+    };
+    if z_wrap_spacing.to_bits() == new_z.to_bits() {
+        return; // release without a move (a click, a typed repeat) rebuilds nothing
+    }
+    *z_wrap_spacing = new_z;
+    // Snapshot the camera BEFORE the swap: the probe holds last frame's
+    // actual eye/yaw/pitch, and a rebuild that teleports the viewer would
+    // make the dial unusable.
+    let pose = state.ui_probe.as_ref().map(|p| {
+        let p = p.borrow();
+        (p.eye, p.yaw, p.pitch)
+    });
+    let t = Instant::now();
+    let (mut scene, probe) = if ui {
+        crate::build_scene_probed(ctx, state.config.format, choice, CameraMode::Fly, cull)
+    } else {
+        (build_scene(ctx, state.config.format, choice, CameraMode::Fly, cull), None)
+    };
+    scene.set_viewport(state.config.width, state.config.height);
+    if let Some((eye, yaw, pitch)) = pose {
+        scene.set_cam_pose(eye, yaw, pitch);
+    }
+    state.scene = scene;
+    state.ui_probe = probe;
+    println!(
+        "relayout: z_wrap_spacing -> {new_z} (scene rebuilt in {:?}; pick/selection/grab state reset)",
+        t.elapsed()
+    );
+}
+
 struct App<'a> {
     ctx: GpuContext,
-    choice: &'a SceneChoice,
+    /// Owned, not borrowed: the layout dial's rebuild arm mutates the Repo
+    /// variant's z_wrap_spacing in place before rebuilding the scene.
+    choice: SceneChoice,
     cull: bool,
     /// Stage G: scripted picks/verbs applied once at startup (smoke testing
     /// the same code path the windowed verbs use).
@@ -900,12 +1056,12 @@ impl ApplicationHandler for App<'_> {
         // concrete GlyphScene BEFORE type erasure (see build_scene_probed).
         #[cfg(feature = "egui-ui")]
         let (mut scene, ui_probe) = if self.ui {
-            crate::build_scene_probed(&self.ctx, format, self.choice, CameraMode::Fly, self.cull)
+            crate::build_scene_probed(&self.ctx, format, &self.choice, CameraMode::Fly, self.cull)
         } else {
-            (build_scene(&self.ctx, format, self.choice, CameraMode::Fly, self.cull), None)
+            (build_scene(&self.ctx, format, &self.choice, CameraMode::Fly, self.cull), None)
         };
         #[cfg(not(feature = "egui-ui"))]
-        let mut scene = build_scene(&self.ctx, format, self.choice, CameraMode::Fly, self.cull);
+        let mut scene = build_scene(&self.ctx, format, &self.choice, CameraMode::Fly, self.cull);
         let depth = scene::create_depth(&self.ctx.device, scene.depth_format(), config.width, config.height);
         log::info!(
             "surface: {}x{} {:?} present={:?}",
@@ -969,6 +1125,10 @@ impl ApplicationHandler for App<'_> {
             ui_fps: 0.0,
             #[cfg(feature = "egui-ui")]
             k4_selftest: u8::from(std::env::var_os("GLYPH_K4_SELFTEST").is_some()),
+            #[cfg(feature = "egui-ui")]
+            pending_relayout: None,
+            #[cfg(feature = "egui-ui")]
+            zspace_selftest: u8::from(std::env::var_os("GLYPH_ZSPACE_SELFTEST").is_some()),
         });
     }
 
@@ -998,7 +1158,16 @@ impl ApplicationHandler for App<'_> {
                 state.resize(&self.ctx, size.width, size.height);
                 state.scene.set_viewport(size.width, size.height);
             }
-            WindowEvent::RedrawRequested => state.render(&self.ctx),
+            WindowEvent::RedrawRequested => {
+                state.render(&self.ctx);
+                // The layout dial applies BETWEEN frames: the panel set
+                // pending_relayout on slider release during this render;
+                // rebuild now so the next render presents the new spacing.
+                #[cfg(feature = "egui-ui")]
+                if let Some(new_z) = state.pending_relayout.take() {
+                    rebuild_repo_scene(&self.ctx, &mut self.choice, self.cull, self.ui, state, new_z);
+                }
+            }
             // Stage K (K6): F2 = capture the next presented frame to PNG.
             // App-level hotkey that must work REGARDLESS of egui focus (e.g.
             // while typing in the scratch field), so it matches ABOVE the
@@ -1201,7 +1370,10 @@ mod tests {
 
 pub fn run(
     ctx: GpuContext,
-    choice: &SceneChoice,
+    // Owned: the layout dial's rebuild arm mutates the Repo variant's
+    // z_wrap_spacing before rebuilding the scene (windowed.rs's
+    // pending_relayout arm). Offscreen keeps borrowing its own.
+    choice: SceneChoice,
     cull: bool,
     ops: &[Op],
     ui: bool,

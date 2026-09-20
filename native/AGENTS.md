@@ -149,6 +149,12 @@ display's refresh (75 on the first Linux box) and not a fact about the renderer.
   Debug panel's LOD_MIN_PX slider programmatically (1.0 → 16.0) and logs the
   cull counters before/after — exercises the panel → probe → CullState →
   cull path without a human at the mouse.
+- `GLYPH_ZSPACE_SELFTEST=1` — windowed, dev-only: at t≈3 s drives the Debug
+  panel's z_wrap_spacing dial to 2× and fires the SAME scene-rebuild arm the
+  slider's drag-release uses, logging instance count (must not change —
+  z_step moves no slot counts) and the field's z extent (must ~double)
+  before/after. Exercises the panel → probe → pending_relayout → rebuild
+  path without a human.
 - `GLYPH_L3_SHADER_COMPOSITE=1` — offscreen, dev-only (Stage L): makes the
   offscreen target Bgra8UnormSrgb, forcing the WINDOWED shader-composite
   path (composite.wgsl) under the deterministic oracle driver; the readback
