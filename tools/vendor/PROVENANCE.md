@@ -57,7 +57,7 @@ is that check.
 | `engine/fixtures/inputs/glyphPipelineKernels.js` | `packages/glyph3d-core/src/compute/glyphPipelineKernels.js` | 90515 | `c785a572091d2f37…` | MISMATCH |
 | `engine/fixtures/inputs/glyphPipelineReference.js` | `packages/glyph3d-core/src/compute/glyphPipelineReference.js` | 51879 | `dd2bc84bfc3cd1be…` | MISMATCH |
 | `engine/fixtures/inputs/glyphPipelineScan.js` | `packages/glyph3d-core/src/compute/glyphPipelineScan.js` | 15254 | `4b83b7447b66695e…` | MISMATCH |
-| `schema/glyph-identity.json` | `schema/glyph-identity.json` | 19158 | `b4b838430677b383…` | MISMATCH |
+| `schema/glyph-identity.json` | `schema/glyph-identity.json` | 19662 | `ac9e95ec2bfec524…` | MISMATCH |
 | `tools/vendor/ref/app/public/slug-core/slug-core.1tstke3lync.bin` | `app/public/slug-core/slug-core.1tstke3lync.bin` | 609569 | `647ccdaba087de1f…` | yes |
 | `tools/vendor/ref/packages/glyph3d-core/src/fonts/Cousine-Regular.ttf` | `packages/glyph3d-core/src/fonts/Cousine-Regular.ttf` | 300208 | `dcd526004fcfec4e…` | yes |
 | `tools/vendor/ref/packages/glyph3d-core/src/fonts/DejaVuSans.ttf` | `packages/glyph3d-core/src/fonts/DejaVuSans.ttf` | 759720 | `6038a160b491e121…` | yes |

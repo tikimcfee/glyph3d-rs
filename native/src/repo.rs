@@ -208,6 +208,11 @@ pub struct RepoParams {
     /// `repo-down` keeps the other covered, so a default here is pinned by a
     /// golden frame either way (root AGENTS.md, "Which view covers what").
     pub wrap_mode: crate::fold::WrapMode,
+    /// THE SEQUENCE PASS, per item: whether a codepoint sequence the font draws
+    /// as ONE glyph (ZWJ families, RI flags, skin tones, keycaps) resolves to
+    /// its sequence slot, with trailing leaders zeroed. Leader (the default)
+    /// is one glyph per UTF-8 leader — what every golden renders.
+    pub cluster_mode: crate::fold::ClusterMode,
 }
 
 impl Default for RepoParams {
@@ -224,6 +229,7 @@ impl Default for RepoParams {
             grid_aspect: 1.6,
             z_wrap_spacing: 0.15,
             wrap_mode: crate::fold::WrapMode::Back,
+            cluster_mode: crate::fold::ClusterMode::Leader,
         }
     }
 }
@@ -249,6 +255,7 @@ pub fn file_item_params(p: &RepoParams, byte_len: usize, newline_count: usize) -
         line_height: p.line_height,
         wrap_width: p.wrap_cols,
         wrap_mode: p.wrap_mode,
+        cluster_mode: p.cluster_mode,
         has_page: true,
         page_rows: p.page_rows,
         page_cols: 0,

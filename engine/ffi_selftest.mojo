@@ -65,9 +65,9 @@ from fixture_io import load_pipe_fixture
 comptime Handle = Pointer[NoneType, MutUntrackedOrigin]
 
 # ── THE ABI, RESTATED LITERALLY (see header) ─────────────────────────────────
-comptime ITEM_DESC_SIZE: Int = 128
-comptime ABI_SHAPE_OFFSET: Int = 108
-comptime ABI_DESC_I32S: Int = 7
+comptime ITEM_DESC_SIZE: Int = 136
+comptime ABI_SHAPE_OFFSET: Int = 112
+comptime ABI_DESC_I32S: Int = 8
 comptime ABI_SHAPE: Int = (ITEM_DESC_SIZE << 8) | ABI_DESC_I32S
 comptime GE_OK: c_int = 0
 comptime GE_ABI_MISMATCH: c_int = 9
@@ -104,9 +104,10 @@ def _desc_for(it: Item, byte_count: Int) raises -> List[UInt8]:
     i32s[unsafe_offset = 24] = Int32(it.scroll_rows)
     i32s[unsafe_offset = 25] = Int32(it.pages_wide)
     i32s[unsafe_offset = 26] = Int32(it.wrap_mode)
+    i32s[unsafe_offset = 27] = Int32(it.cluster_mode)
     i32s[unsafe_offset = ABI_SHAPE_OFFSET // 4] = Int32(ABI_SHAPE)
-    u64s[unsafe_offset = 14] = UInt64(0)
-    u64s[unsafe_offset = 15] = UInt64(byte_count)
+    u64s[unsafe_offset = 15] = UInt64(0)
+    u64s[unsafe_offset = 16] = UInt64(byte_count)
 
     # MARSHALLING SELF-CHECK, and why it earns its place: this toolchain has
     # already miscompiled the bitcast-pointer access pattern above TWICE in two
@@ -143,7 +144,8 @@ def _desc_for(it: Item, byte_count: Int) raises -> List[UInt8]:
     want_i32.append(Int32(it.scroll_rows))
     want_i32.append(Int32(it.pages_wide))
     want_i32.append(Int32(it.wrap_mode))
-    for j in range(7):
+    want_i32.append(Int32(it.cluster_mode))
+    for j in range(8):
         var bits: UInt32 = 0
         for i in range(4):
             bits |= UInt32(d[80 + j * 4 + i]) << UInt32(8 * i)

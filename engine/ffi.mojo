@@ -165,9 +165,9 @@ was built against a different FFI surface. See ABI_SHAPE."""
 # cannot shift by construction, and the entry point was RENAMED
 # (`glyph_engine_load_item_desc`) so a dylib predating this change fails to LINK
 # rather than being miscalled: a symbol that does not exist cannot be called wrong.
-comptime ABI_DESC_BYTES: Int = 128             # the descriptor block, both entries
-comptime ABI_DESC_I32S: Int = 7                # i32 params inside that block
-comptime ABI_SHAPE_OFFSET: Int = 108           # byte offset of the shape word
+comptime ABI_DESC_BYTES: Int = 136             # the descriptor block, both entries
+comptime ABI_DESC_I32S: Int = 8                # i32 params inside that block
+comptime ABI_SHAPE_OFFSET: Int = 112           # byte offset of the shape word
 comptime ABI_SHAPE: Int = (ABI_DESC_BYTES << 8) | ABI_DESC_I32S
 
 
@@ -246,6 +246,7 @@ def _item_from_desc(
     it.scroll_rows = Int(i32s[unsafe_offset = 24])
     it.pages_wide = Int(i32s[unsafe_offset = 25])
     it.wrap_mode = Int(i32s[unsafe_offset = 26])  # offset 104
+    it.cluster_mode = Int(i32s[unsafe_offset = 27])  # offset 108 — the sequence pass
     it.byte_start = byte_start
     it.byte_count = byte_count
     return it^
@@ -313,21 +314,23 @@ def glyph_engine_load_item_desc(
 # stream plus per-item record counts (computed from the flag lanes, so they
 # are EXACT: one record per leader byte, as compact emits).
 #
-# Descriptor block layout (128 B, little-endian, serialized EXPLICITLY on both
+# Descriptor block layout (136 B, little-endian, serialized EXPLICITLY on both
 # sides — no repr(C) guessing):
 #   0..80    ten f64: origin_x, origin_y, origin_z, line_height, z_step,
 #            page_gap_x, band_stride_y, depth_per_band, depth_per_col,
 #            page_line_height
-#   80..108  SEVEN i32: wrap_width, has_page, page_rows, page_cols,
-#            scroll_rows, pages_wide, wrap_mode
-#   108      u32 ABI_SHAPE — a FIXED-offset shape word; it cannot shift, unlike
+#   80..112  EIGHT i32: wrap_width, has_page, page_rows, page_cols,
+#            scroll_rows, pages_wide, wrap_mode, cluster_mode
+#   112      u32 ABI_SHAPE — a FIXED-offset shape word; it cannot shift, unlike
 #            a positional sentinel (two of which were measured useless first)
 #
-# The wrap mode landed in the pad rather than growing the block: 10 f64 +
-# 7 i32 + 2 u64 is 124 B, so ITEM_DESC_SIZE stays 128 and the Rust side's
-# `const _: () = assert!(...)` in write_item_desc pins that it still fits.
-#   112      u64 byte_start
-#   120      u64 byte_count
+# The wrap mode landed in the pad; the cluster mode could NOT — the block was
+# full at 128 (10 f64 + 7 i32 + 2 u64 = 124), so the block grew to 136 and the
+# shape word moved with it. The one direction this format never takes is a
+# silent one: a caller built against the 128 B layout gets GE_ABI_MISMATCH,
+# never a misparse.
+#   120      u64 byte_start
+#   128      u64 byte_count
 #
 # Items must be contiguous and ascending by byte_start (the pipeline's
 # documented requirement). Per-item ordinals stay per item, so the 2^24-byte
@@ -393,8 +396,8 @@ def glyph_engine_load_items(
         items.append(
             _item_from_desc(
                 base,
-                Int(u64s[unsafe_offset = 14]),  # offset 112
                 Int(u64s[unsafe_offset = 15]),  # offset 120
+                Int(u64s[unsafe_offset = 16]),  # offset 128
             )
         )
 
@@ -414,14 +417,14 @@ def glyph_engine_load_items(
     for i in range(m):
         counts_out[unsafe_offset = i] = 0
     var it_i = 0
-    var it_end = Int(desc_ptr.unsafe_bitcast[UInt64]()[unsafe_offset = 14]) + Int(
-        desc_ptr.unsafe_bitcast[UInt64]()[unsafe_offset = 15]
+    var it_end = Int(desc_ptr.unsafe_bitcast[UInt64]()[unsafe_offset = 15]) + Int(
+        desc_ptr.unsafe_bitcast[UInt64]()[unsafe_offset = 16]
     )
     for id in range(n):
         while id >= it_end and it_i + 1 < m:
             it_i += 1
             var base = desc_ptr.unsafe_offset(it_i * ITEM_DESC_SIZE)
-            it_end = Int(base.unsafe_bitcast[UInt64]()[unsafe_offset = 14]) + Int(base.unsafe_bitcast[UInt64]()[unsafe_offset = 15])
+            it_end = Int(base.unsafe_bitcast[UInt64]()[unsafe_offset = 15]) + Int(base.unsafe_bitcast[UInt64]()[unsafe_offset = 16])
         if (Int(r.fl[id]) & F_LEADER) != 0:
             counts_out[unsafe_offset = it_i] += 1
     _record_stages(s[], r, compact_ns, perf_counter_ns() - _k, List[Int](length=DW_LANES, fill=0))
@@ -551,8 +554,8 @@ def glyph_engine_load_items_direct(
         items.append(
             _item_from_desc(
                 base,
-                Int(u64s[unsafe_offset = 14]),
-                Int(u64s[unsafe_offset = 15]),
+                Int(u64s[unsafe_offset = 15]),  # offset 120 — byte_start
+                Int(u64s[unsafe_offset = 16]),  # offset 128 — byte_count
             )
         )
 

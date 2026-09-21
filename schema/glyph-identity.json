@@ -355,7 +355,7 @@
   },
   "exact": {
    "carrier": "u32",
-   "stride": 7,
+   "stride": 8,
    "lanes": [
     {
      "name": "PAGE_ROWS",
@@ -398,6 +398,12 @@
      "index": 6,
      "kind": "count",
      "realizes": "WRAP_MODE"
+    },
+    {
+     "name": "CLUSTER_MODE",
+     "index": 7,
+     "kind": "count",
+     "realizes": "CLUSTER_MODE"
     }
    ]
   }
@@ -514,6 +520,11 @@
     "name": "WRAP_MODE",
     "kind": "count",
     "note": "how a wrap is spent: 0 = WrapDown (advance the row, the default), 1 = WrapBack (keep the row, step only in depth). ITEM-level like WRAP_WIDTH and for the same reason \u2014 the scan monoid's junction term reads it off one operand, so it is not associative across a change of it, and only an item boundary's resetting leaf makes that safe."
+   },
+   {
+    "name": "CLUSTER_MODE",
+    "kind": "count",
+    "note": "the sequence pass: 0 = leader (one glyph per UTF-8 leader; the default), 1 = cluster (a sequence the font draws as one glyph resolves to its slot; trailing leaders become zero-advance drops). ITEM-level like WRAP_MODE and for the same reason \u2014 the scan monoid's junction term reads item params off one operand."
    },
    {
     "name": "Z_STEP",

@@ -179,6 +179,9 @@ pub struct ItemParams {
     /// here and in `RepoParams`).
     /// ITEM-LEVEL, exactly like `wrap_width` — see [`crate::fold::WrapMode`].
     pub wrap_mode: crate::fold::WrapMode,
+    /// Whether the sequence pass resolves codepoint clusters to single glyphs.
+    /// ITEM-LEVEL, exactly like `wrap_mode` — see [`crate::fold::ClusterMode`].
+    pub cluster_mode: crate::fold::ClusterMode,
     pub has_page: bool,
     pub page_rows: i32,
     pub page_cols: i32,
@@ -202,6 +205,7 @@ impl Default for ItemParams {
             z_step: 0.0,
             wrap_width: 0,
             wrap_mode: crate::fold::WrapMode::Back,
+            cluster_mode: crate::fold::ClusterMode::default(),
             has_page: false,
             page_rows: 0,
             page_cols: 0,
