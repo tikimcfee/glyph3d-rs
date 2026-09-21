@@ -610,6 +610,28 @@ expect = "emoji.png diverges from baseline"
 rebuild = "cargo build --release"
 
 [[mutation]]
+name = "cluster-static-zero-off"
+gate = "pixel-ab"
+why = "the invisible-by-design rule off: ZWJ / variation selectors / tags occupy full cells again — the sequence pass's fallback state moves, which is exactly what the emoji-cluster frame exists to see. CONSUMED BY: emoji-cluster.png's lone-zwj/VS16 line"
+file = "native/src/text.rs"
+op = "replace"
+find = "            if crate::fold::is_static_zero_cp(cp) {"
+with = "            if false && crate::fold::is_static_zero_cp(cp) {"
+expect = "emoji-cluster.png diverges from baseline"
+rebuild = "cargo build --release"
+
+[[mutation]]
+name = "cluster-trailer-advance-one"
+gate = "pixel-ab"
+why = "trailers at advance 1 instead of 0: the cluster's neighbors shift right by one cell per trailer — the fold reading the resolved statics is the thing repo-cluster pins. The binary loads the dylib at runtime by rpath, so the dylib rebuild alone carries the change. CONSUMED BY: repo-cluster.png"
+file = "engine/glyph_cluster.mojo"
+op = "replace"
+find = "                    slots.set_advance(to, Float32(0))"
+with = "                    slots.set_advance(to, Float32(1))"
+expect = "repo-cluster.png diverges from baseline"
+rebuild = "pixi run build-engine"
+
+[[mutation]]
 name = "per-item-group-drift"
 gate = "repo-verify"
 why = "this gate is strategy-vs-strategy: its whole claim is that the per-item and batched FFI paths agree. Perturbing ONE path must break that. The per-item branch is exercised by no other gate (engine-check hardcodes batched), so a red here is attributable to this check alone"

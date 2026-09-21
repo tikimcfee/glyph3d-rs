@@ -130,6 +130,12 @@ detail.
   flat layout), default 0.15 pinned in the CLI tests beside the wrap-mode
   default. Runtime re-tuning is the same shape of question as wrap-mode
   toggling below — the value is baked into `ItemParams` at load.
+- ~~**The sequence pass** (the `out/EMOJI.md` "later")~~ DONE (2026-09-20):
+  cluster mode resolves the font's sequences to single glyphs — the rule in
+  the oracle + engine + Rust twin, `.pipe.bin` v5, the 136 B descriptor,
+  `--cluster-mode`, and the emoji-cluster/repo-cluster golden pair. The GPU
+  kernel and general UAX #29 text clusters ride the proven transition-monoid
+  design when they land; the bake's tail fold learns it at bake v4.
 - **Runtime wrap-mode toggling.** A command-bus question, not a layout one:
   mode is baked into `ItemParams` at load, so toggling means re-running the fold
   (cheap — 0.04 s for 407k records, measured).

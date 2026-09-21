@@ -336,3 +336,47 @@ covered by hand.
 Still open, unchanged by this run and still deliberate: the SQUARE quad (emoji
 squeezed ~6 %, bitmap baseline ~5 % of an em low), sequence shaping, and the
 far emoji-heavy backdrop segment that no golden frames.
+
+## The sequence pass (2026-09-20) — [done]
+
+What steps 1–5 carried, this lands: the sequence table that was "carried so a
+future shaping pass finds its cells already placed" is now READ, and the
+zero-advance-blank policy the step-3 note earmarked is the trailer mechanism.
+
+- **The rule** (one, in four places — oracle, engine, Rust twin, and the
+  golden frames): a serial per-item walk between decode and the fold; a
+  codepoint some sequence starts with probes the table for the longest prefix
+  match; a match gives the head the sequence slot at the bitmap advance and
+  the span's trailing leaders glyph 0 + advance 0 + a trailer flag. RI pairs
+  need no parity state — the skip-past pairs them greedily from the left,
+  exactly GB12/GB13. FE0F is normalized out of the probe key (the font's GSUB
+  strips it); the VS16 leaders ride the trailer span. ZWJ / variation
+  selectors / tag characters never occupy a cell under cluster mode, matched
+  or not.
+- **What does not move**: records stay per leader — ROW/COL, the witness
+  lanes, paint-by-record, the pick cross-check, the ordinal machinery. The
+  fold and the scan monoid read the resolved static lanes exactly as before
+  (posture B from the planning note: a zero advance is an exact no-op in the
+  fold's f32 sums).
+- **The class table is generated, never hand-written** — UCD 17.0.0 vendored
+  under tools/vendor/third-party/unicode-ucd/, `tools/gen_cluster_table.py`
+  bakes `cluster-classes.bin`, and both tries carry it verbatim in their v2
+  sections. (A hand-rolled FSM in the planning experiment broke keycaps; that
+  lesson is why the generator exists.)
+- **The surfaces**: `.pipe.bin` v5 (clusterMode per item + the synthetic
+  sequence payload), the FFI descriptor grown to 136 B (ABI_SHAPE moved; a
+  128 B caller gets GE_ABI_MISMATCH, never a misparse), `--cluster-mode
+  leader|cluster`, the Debug panel's toggle (the rebuild arm), and the two
+  golden views `emoji-cluster` / `repo-cluster` — one per path, both
+  hand-adopted after a look, both byte-gated from here.
+- **Deferred, deliberately**: general UAX #29 text clustering (combining
+  marks, Hangul, Indic — the class table already carries their classes);
+  shaping (Turing-complete; everyone does it CPU-side); the GPU cluster
+  kernel (the device suites skip cluster fixtures with the reason printed —
+  the exact-parallel design for it is proven: the segmentation FSM's
+  transition monoid closes at 16 elements, so the scan form of it is cheap
+  when the device dispatch ships); bake v4 (the tail fold re-derives trie
+  advances today, so conformance_resume skips cluster items, printed).
+- The SQUARE quad note from step 5 stands: cluster heads render through the
+  same mode-1 branch and the same squeeze; a bearing-aware quad is still its
+  own later change.

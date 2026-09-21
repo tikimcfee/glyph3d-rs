@@ -339,6 +339,15 @@ analytic coverage, and two rasterizers' filters need not agree to the bit.
 The alpha contract those pixels rest on is stated once, in the shader header
 of `glyph_field.wgsl`, so a platform whose emoji edges differ while its text
 does not has a checklist.
+`emoji-cluster` and `repo-cluster` (2026-09-20) pin the SEQUENCE PASS — one
+frame per path: the former through `--render-file` (the CPU staging twin),
+the latter through `--load-repo` (the engine end to end). One line per
+sequence class the trie resolves (families, flags, skin tones, keycaps, tag
+flags) plus the fallbacks (unlisted chains stay pieces, ZWJ/VS16 zero-width);
+the `cluster-static-zero-off` and `cluster-trailer-advance-one` mutations
+prove they redden. The `emoji` view keeps pinning LEADER mode — its fixture
+is immutable — so at the default flip its command gains `--cluster-mode
+leader` explicitly and this paragraph's pairing repeats one level up.
 Known cost of the fix, measured: in the dense far region of `repo-down`,
 ~1,400 of 1.6M pixels lose a little ink where coplanar quads overlap and the
 later fragment's interpolated depth lands an ulp behind — the price of a
