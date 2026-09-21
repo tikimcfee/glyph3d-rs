@@ -173,12 +173,17 @@ struct WindowState {
     /// RedrawRequested arm consumes it and rebuilds the scene between
     /// frames. Always None on non-repo scenes (the panel hides the dial).
     #[cfg(feature = "egui-ui")]
-    pending_relayout: Option<f64>,
+    pending_relayout: Option<RelayoutRequest>,
     /// Dev-only verification hook state (GLYPH_ZSPACE_SELFTEST=1): same
     /// 0/1/2 arming as k4_selftest, driving the layout dial through the
     /// same pending_relayout arm the slider's release uses.
     #[cfg(feature = "egui-ui")]
     zspace_selftest: u8,
+    /// Dev-only verification hook state (GLYPH_CLUSTER_SELFTEST=1): same
+    /// 0/1/2/3 arming as zspace_selftest, toggling the cluster mode through
+    /// the same pending_relayout arm the panel's button uses.
+    #[cfg(feature = "egui-ui")]
+    cluster_selftest: u8,
 }
 
 impl WindowState {
@@ -381,7 +386,10 @@ impl WindowState {
                         if let Some(probe) = &self.ui_probe {
                             probe.borrow_mut().z_wrap_spacing = Some(new);
                         }
-                        self.pending_relayout = Some(new);
+                        self.pending_relayout = Some(RelayoutRequest {
+                            z_wrap_spacing: Some(new),
+                            toggle_cluster: false,
+                        });
                         self.zspace_selftest = 2;
                     }
                     None => {
@@ -402,6 +410,48 @@ impl WindowState {
                     );
                 }
                 self.zspace_selftest = 0;
+            }
+            _ => {}
+        }
+        // Dev-only verification hook (GLYPH_CLUSTER_SELFTEST=1): toggle the
+        // cluster mode through the SAME pending_relayout arm the panel's
+        // button fires. Meaningful only on cluster-bearing content (the
+        // g-cluster-repo fixture): instance count must DROP as trailers leave
+        // the arena. States: 1 = fire at t>3 s; 2 = one quiet frame; 3 =
+        // print the after-readout, done.
+        #[cfg(feature = "egui-ui")]
+        match self.cluster_selftest {
+            1 if self.time() > 3.0 => {
+                let has = self.ui_probe.as_ref().and_then(|p| p.borrow().cluster_mode);
+                match has {
+                    Some(on) => {
+                        println!(
+                            "CLUSTER-SELFTEST before: cluster_mode={on} instances={}",
+                            self.scene.instance_count()
+                        );
+                        self.pending_relayout = Some(RelayoutRequest {
+                            z_wrap_spacing: None,
+                            toggle_cluster: true,
+                        });
+                        self.cluster_selftest = 2;
+                    }
+                    None => {
+                        println!("CLUSTER-SELFTEST: no repo scene (no toggle) — skipping");
+                        self.cluster_selftest = 0;
+                    }
+                }
+            }
+            2 => self.cluster_selftest = 3,
+            3 => {
+                if let Some(probe) = &self.ui_probe {
+                    let p = probe.borrow();
+                    println!(
+                        "CLUSTER-SELFTEST after:  cluster_mode={:?} instances={}",
+                        p.cluster_mode,
+                        self.scene.instance_count()
+                    );
+                }
+                self.cluster_selftest = 0;
             }
             _ => {}
         }
@@ -591,7 +641,24 @@ impl WindowState {
                                     ));
                                 }
                                 if resp.drag_stopped() || (resp.changed() && !resp.dragged()) {
-                                    *pending_relayout = Some(*spacing);
+                                    *pending_relayout = Some(RelayoutRequest {
+                                        z_wrap_spacing: Some(*spacing),
+                                        toggle_cluster: false,
+                                    });
+                                }
+                                // The sequence pass toggle — the same rebuild
+                                // arm as the dial. Reads the mode off the
+                                // probe, seeded from the scene's ItemParams.
+                                if let Some(on) = snap.cluster_mode {
+                                    if ui
+                                        .button(if on { "cluster mode: ON" } else { "cluster mode: off" })
+                                        .clicked()
+                                    {
+                                        *pending_relayout = Some(RelayoutRequest {
+                                            z_wrap_spacing: None,
+                                            toggle_cluster: true,
+                                        });
+                                    }
                                 }
                             }
                         }
@@ -869,7 +936,7 @@ impl WindowState {
     }
 }
 
-/// The layout dial's apply: re-run the whole repo load with the new pitch
+/// The layout dial's apply: re-run the whole repo load with the new params
 /// and swap the scene in place. Correct by construction — the one true
 /// layout path rebuilds everything the pitch touches (cull AABBs, per-file
 /// pick params, bounds) — at the cost of a full reload per apply, which is
@@ -886,16 +953,32 @@ fn rebuild_repo_scene(
     cull: bool,
     ui: bool,
     state: &mut WindowState,
-    new_z: f64,
+    req: RelayoutRequest,
 ) {
-    let SceneChoice::Repo { z_wrap_spacing, .. } = choice else {
+    let SceneChoice::Repo { z_wrap_spacing, cluster_mode, .. } = choice else {
         // The dial only exists on repo scenes; a stale signal is a no-op.
         return;
     };
-    if z_wrap_spacing.to_bits() == new_z.to_bits() {
-        return; // release without a move (a click, a typed repeat) rebuilds nothing
+    let mut changed = false;
+    let mut note = String::new();
+    if let Some(new_z) = req.z_wrap_spacing {
+        if z_wrap_spacing.to_bits() != new_z.to_bits() {
+            *z_wrap_spacing = new_z;
+            changed = true;
+            note += &format!("z_wrap_spacing -> {new_z} ");
+        }
     }
-    *z_wrap_spacing = new_z;
+    if req.toggle_cluster {
+        *cluster_mode = match *cluster_mode {
+            crate::fold::ClusterMode::Leader => crate::fold::ClusterMode::Cluster,
+            crate::fold::ClusterMode::Cluster => crate::fold::ClusterMode::Leader,
+        };
+        changed = true;
+        note += &format!("cluster_mode -> {cluster_mode:?} ");
+    }
+    if !changed {
+        return; // a release without a move (a click, a typed repeat) rebuilds nothing
+    }
     // Snapshot the camera BEFORE the swap: the probe holds last frame's
     // actual eye/yaw/pitch, and a rebuild that teleports the viewer would
     // make the dial unusable.
@@ -916,9 +999,18 @@ fn rebuild_repo_scene(
     state.scene = scene;
     state.ui_probe = probe;
     println!(
-        "relayout: z_wrap_spacing -> {new_z} (scene rebuilt in {:?}; pick/selection/grab state reset)",
+        "relayout: {note}(scene rebuilt in {:?}; pick/selection/grab state reset)",
         t.elapsed()
     );
+}
+
+/// What the panel asked the rebuild arm to change. Either field alone may be
+/// set; the arm applies both and rebuilds only if one actually moved.
+#[cfg(feature = "egui-ui")]
+#[derive(Clone, Copy, Default)]
+struct RelayoutRequest {
+    z_wrap_spacing: Option<f64>,
+    toggle_cluster: bool,
 }
 
 struct App<'a> {
@@ -1129,6 +1221,8 @@ impl ApplicationHandler for App<'_> {
             pending_relayout: None,
             #[cfg(feature = "egui-ui")]
             zspace_selftest: u8::from(std::env::var_os("GLYPH_ZSPACE_SELFTEST").is_some()),
+            #[cfg(feature = "egui-ui")]
+            cluster_selftest: u8::from(std::env::var_os("GLYPH_CLUSTER_SELFTEST").is_some()),
         });
     }
 
@@ -1162,10 +1256,10 @@ impl ApplicationHandler for App<'_> {
                 state.render(&self.ctx);
                 // The layout dial applies BETWEEN frames: the panel set
                 // pending_relayout on slider release during this render;
-                // rebuild now so the next render presents the new spacing.
+                // rebuild now so the next render presents the new params.
                 #[cfg(feature = "egui-ui")]
-                if let Some(new_z) = state.pending_relayout.take() {
-                    rebuild_repo_scene(&self.ctx, &mut self.choice, self.cull, self.ui, state, new_z);
+                if let Some(req) = state.pending_relayout.take() {
+                    rebuild_repo_scene(&self.ctx, &mut self.choice, self.cull, self.ui, state, req);
                 }
             }
             // Stage K (K6): F2 = capture the next presented frame to PNG.

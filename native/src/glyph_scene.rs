@@ -586,6 +586,10 @@ pub struct UiProbeState {
     /// frame — the quantified readout of what the dial did. None under
     /// --no-cull (no segment table).
     pub z_extent: Option<[f32; 2]>,
+    /// The scene's cluster mode, for the panel's toggle label. Seeded at
+    /// install from the files' uniform ItemParams (repo scenes); None on
+    /// non-repo scenes ⇒ the panel hides the toggle.
+    pub cluster_mode: Option<bool>,
     // ── K5: group-browser data. `files` is STATIC (built once at install;
     // Rc-shared so the panel's per-frame snapshot clones a refcount, not the
     // rows). `file_dyn` is refreshed per frame (world pose under the live
@@ -1909,11 +1913,19 @@ impl GlyphScene {
             .as_ref()
             .and_then(|p| p.files.first())
             .map(|f| f.item.z_step / crate::text::CELL_HEIGHT_WORLD as f64);
+        // The toggle's seed: the mode the scene was built with, off the same
+        // uniform-per-field params the dial's seed reads.
+        let cluster_mode = self
+            .pick
+            .as_ref()
+            .and_then(|p| p.files.first())
+            .map(|f| f.item.cluster_mode == crate::fold::ClusterMode::Cluster);
         let probe = UiProbe::new(std::cell::RefCell::new(UiProbeState {
             lod_min_px: LOD_MIN_PX,
             files: std::rc::Rc::new(files),
             file_dyn,
             z_wrap_spacing,
+            cluster_mode,
             ..Default::default()
         }));
         self.ui_probe = Some(probe.clone());
