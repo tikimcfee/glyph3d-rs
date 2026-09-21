@@ -62,7 +62,7 @@ pub enum SceneChoice {
     /// Stage A stress demo (1M colored quads).
     Demo,
     /// Stage C Slug text field: stage `file`, tiled `copies` times.
-    Text { file: PathBuf, copies: u32, emoji_sheet: PathBuf },
+    Text { file: PathBuf, copies: u32, emoji_sheet: PathBuf, cluster_mode: fold::ClusterMode },
     /// Stage E1: lay `file` out with the Mojo engine (real atlas trie) and
     /// render the engine's records through the same Slug glyph renderer.
     EngineText { file: PathBuf, trie: PathBuf, emoji_sheet: PathBuf },
@@ -84,6 +84,9 @@ pub enum SceneChoice {
         /// same reason: the baselines depend on the default, so the CLI
         /// layer pins it rather than letting RepoParams::default speak alone.
         z_wrap_spacing: f64,
+        /// The sequence pass on a repo load (`--cluster-mode`, default
+        /// leader). Same standing as wrap_mode: the baselines pin the default.
+        cluster_mode: fold::ClusterMode,
         /// The colour-emoji sheet (`--emoji-sheet`; default the committed
         /// one). Every glyph scene loads it — the same handle the engine
         /// trie has, so swapping a sheet is a command-line act.
@@ -134,6 +137,19 @@ fn parse_strategy(s: &str) -> layout_mojo::Strategy {
         "batch" => Strategy::Batched,
         "direct" => Strategy::Direct,
         other => panic!("--repo-engine: unknown mode {other:?} (clap should have refused it)"),
+    }
+}
+
+/// `--cluster-mode` -> the layout parameter. Same shape as `parse_wrap_mode`:
+/// clap has already refused anything that is not one of the two spellings, so
+/// an unknown value here is a bug in this function rather than in the caller's
+/// command line — a silent fallback would render mode A while the operator
+/// believed they asked for B.
+fn parse_cluster_mode(s: &str) -> fold::ClusterMode {
+    match s {
+        "leader" => fold::ClusterMode::Leader,
+        "cluster" => fold::ClusterMode::Cluster,
+        other => panic!("--cluster-mode: unknown mode {other:?} (clap should have refused it)"),
     }
 }
 
@@ -278,9 +294,9 @@ fn build_scene_impl(
     };
     match choice {
         SceneChoice::Demo => (Box::new(Scene::new(ctx, color_format)), None),
-        SceneChoice::Text { file, copies, emoji_sheet } => {
+        SceneChoice::Text { file, copies, emoji_sheet, cluster_mode } => {
             let atlas = atlas::Atlas::load(ctx, emoji_sheet);
-            let staged = text::stage_file(&atlas, file, *copies);
+            let staged = text::stage_file(&atlas, file, *copies, *cluster_mode);
             log::info!(
                 "staged {}: {} codepoints → {} glyph instances ({} copies, {} missing/bitmap)",
                 file.display(),
@@ -310,11 +326,13 @@ fn build_scene_impl(
             focus,
             wrap_mode,
             z_wrap_spacing,
+            cluster_mode,
             emoji_sheet,
         } => {
             let params = repo::RepoParams {
                 wrap_mode: *wrap_mode,
                 z_wrap_spacing: *z_wrap_spacing,
+                cluster_mode: *cluster_mode,
                 ..Default::default()
             };
             let load = repo::load_repo(dir, &default_engine_trie(), &params, *strategy, *verify);
@@ -460,6 +478,13 @@ struct Cli {
     // with the flag named — otherwise clap eats "-0.1" as an unknown flag.
     #[arg(long, value_name = "F", default_value_t = 0.15, allow_negative_numbers = true, value_parser = parse_z_wrap_spacing)]
     z_wrap_spacing: f64,
+    /// Whether the sequence pass resolves codepoint clusters to single glyphs
+    /// on a repo load (and on --render-file): `leader` (the default) is one
+    /// glyph per UTF-8 leader; `cluster` resolves the font's sequences
+    /// (ZWJ families, RI flags, skin tones, keycaps) to single slots with
+    /// trailing leaders zeroed. The emoji baselines render `leader`.
+    #[arg(long, value_name = "MODE", default_value = "leader", value_parser = ["leader", "cluster"])]
+    cluster_mode: String,
     /// Stage E2: frame the first file whose path contains SUBSTR
     #[arg(long, value_name = "SUBSTR")]
     focus_file: Option<String>,
@@ -1133,6 +1158,7 @@ fn main() {
         let params = repo::RepoParams {
             wrap_mode: parse_wrap_mode(&cli.wrap_mode),
             z_wrap_spacing: cli.z_wrap_spacing,
+            cluster_mode: parse_cluster_mode(&cli.cluster_mode),
             ..Default::default()
         };
         let load = repo::load_repo(
@@ -1157,6 +1183,7 @@ fn main() {
             focus: cli.focus_file.clone(),
             wrap_mode: parse_wrap_mode(&cli.wrap_mode),
             z_wrap_spacing: cli.z_wrap_spacing,
+            cluster_mode: parse_cluster_mode(&cli.cluster_mode),
             emoji_sheet,
         }
     } else if let Some(file) = &cli.engine_render {
@@ -1171,6 +1198,7 @@ fn main() {
             file: cli.render_file.unwrap_or_else(default_text_file),
             copies: cli.copies,
             emoji_sheet,
+            cluster_mode: parse_cluster_mode(&cli.cluster_mode),
         }
     };
 
@@ -1248,6 +1276,11 @@ mod cli_tests {
         // same baselines (repo-wide renders the staircase), so the CLI layer
         // pins the default too, not only RepoParams::default (repo.rs).
         assert_eq!(cli.z_wrap_spacing, 0.15);
+        // The sequence pass: leader is the default every baseline renders;
+        // cluster is the reachable other spelling.
+        assert_eq!(cli.cluster_mode, "leader");
+        assert_eq!(parse_cluster_mode(&cli.cluster_mode), fold::ClusterMode::Leader);
+        assert_eq!(parse_cluster_mode("cluster"), fold::ClusterMode::Cluster);
         assert!(!cli.repo_verify);
         assert!(cli.focus_file.is_none());
         assert!(!cli.repo_scan_only);
@@ -1271,7 +1304,7 @@ mod cli_tests {
             "--screenshot", "out.png", "--frames", "2", "--demo", "--copies", "3", "--zoom",
             "2.5", "--no-cull", "--no-ui", "--engine-loop", "4", "--load-repo", "fixtures/g-pick-repo",
             "--repo-engine", "batch", "--repo-verify", "--focus-file", "alpha",
-            "--wrap-mode", "back", "--z-wrap-spacing", "0.6",
+            "--wrap-mode", "back", "--z-wrap-spacing", "0.6", "--cluster-mode", "cluster",
             "--render-file", "src/main.rs", "--engine-file", "a.rs", "--engine-trie", "t.bin",
             "--engine-check", "b.rs", "--engine-render", "c.rs",
             "--present-mode", "mailbox", "--gpu-key", "--gpu-profile",
@@ -1295,6 +1328,8 @@ mod cli_tests {
         assert_eq!(cli.wrap_mode, "back");
         assert_eq!(parse_wrap_mode(&cli.wrap_mode), fold::WrapMode::Back);
         assert_eq!(cli.z_wrap_spacing, 0.6);
+        assert_eq!(cli.cluster_mode, "cluster");
+        assert_eq!(parse_cluster_mode(&cli.cluster_mode), fold::ClusterMode::Cluster);
         assert!(cli.repo_verify);
         assert_eq!(cli.focus_file.as_deref(), Some("alpha"));
         assert_eq!(cli.render_file, Some(PathBuf::from("src/main.rs")));
@@ -1314,6 +1349,18 @@ mod cli_tests {
             Err(e) => e.to_string(),
         };
         assert!(text.contains("sideways"), "the error must name the bad value: {text}");
+    }
+
+    /// Same rule as the wrap mode's: an unknown cluster mode is REFUSED at the
+    /// boundary, not folded to the default — a silent fallback would render
+    /// mode A while the operator believed they asked for B.
+    #[test]
+    fn an_unknown_cluster_mode_is_refused() {
+        let text = match try_parse(&["--cluster-mode", "grapheme"]) {
+            Ok(_) => panic!("clap must refuse an unknown cluster mode"),
+            Err(e) => e.to_string(),
+        };
+        assert!(text.contains("grapheme"), "the error must name the bad value: {text}");
     }
 
     /// Out-of-domain spacing is REFUSED at the boundary with the flag and the
