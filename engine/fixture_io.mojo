@@ -209,6 +209,16 @@ def load_pipe_fixture(path: String) raises -> PipeFixture:
     return fx^
 
 
+def has_cluster_items(fx: PipeFixture) -> Bool:
+    """True when any item runs the sequence pass. Paths that re-derive trie
+    advances (the bake's tail fold) or run on device (no cluster kernel yet)
+    skip these fixtures WITH THIS PRINTED — a silent skip is a hole."""
+    for i in range(fx.item_count):
+        if fx.items[i].cluster_mode == CLUSTER_CLUSTER:
+            return True
+    return False
+
+
 def load_trie_blob(path: String) raises -> Trie:
     """NATIVE-PORT (Stage E1): load a 'G3TR' trie blob — the app atlas's REAL
     codepoint→slot mapping, written by tools/gen_real_trie.py from
@@ -242,14 +252,13 @@ def load_trie_blob(path: String) raises -> Trie:
     var _em_height_fu = r.u32()  # informational — the conversion denominator
     var _cell_height_world = r.f32()  # informational — the world cell height
     # v2 header words: the sequence pass's section descriptors.
-    var seq_count = 0
     var seq_max = 0
     var seq_words = 0
     var class_words = 0
     var bitmap_advance = Float32(0)
     if version == 2:
         bitmap_advance = r.f32()  # the cluster head's advance — the pass reads it
-        seq_count = Int(r.u32())
+        var seq_count = Int(r.u32())
         seq_max = Int(r.u32())
         _ = r.u32()  # seqOff — the sections are appended in order; the offset is a cross-check
         _ = r.u32()  # classOff — same

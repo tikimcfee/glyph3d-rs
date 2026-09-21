@@ -151,6 +151,10 @@ def run_streaming[o: ImmOrigin](
         sub.origin_z = it.origin_z
         sub.wrap_width = it.wrap_width
         sub.wrap_mode = it.wrap_mode
+        # Every per-item field must move — a hand-copy that drops one is how
+        # this path laid out unclustered while the whole-corpus lay resolved
+        # (caught by conformance_record's stream-vs-whole diff on cluster-zwj).
+        sub.cluster_mode = it.cluster_mode
         sub.z_step = it.z_step
         sub.line_height = it.line_height
         sub.has_page = it.has_page

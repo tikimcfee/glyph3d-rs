@@ -428,6 +428,12 @@ fn load_bake_bytes(raw: &[u8], name: String) -> Result<BakeFixture, String> {
         block_index,
         blocks_m,
         blocks_c,
+        // The bake format has no sequence payload (bake v3 is unchanged) —
+        // the bake path re-derives trie advances and is leader-mode until
+        // bake v4 lands the pass there.
+        seq: Vec::new(),
+        seq_max: 0,
+        bitmap_advance: f32::NAN,
     };
 
     let mut expected = BakeRecord {

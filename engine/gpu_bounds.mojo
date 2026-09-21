@@ -50,7 +50,7 @@ from glyph_schema import (
     B_TOTAL_ROWS, B_MAX_ROW_EXTENT,
 )
 from glyph_pipeline import run_pipeline, F_LEADER, item_for_byte
-from fixture_io import load_pipe_fixture
+from fixture_io import load_pipe_fixture, has_cluster_items
 
 comptime MAX_PRINTED = 8
 comptime EPS = 1e-4
@@ -132,6 +132,11 @@ def check_case(path: String, ctx: DeviceContext) raises -> Int:
     var fx = load_pipe_fixture(path)
     var n = fx.byte_len
     if n == 0 or fx.item_count == 0:
+        return 0
+    # No cluster kernel exists on device yet — skip, printed, so the hole
+    # is named. The CPU forms cover the rule; the device form is its own work.
+    if has_cluster_items(fx):
+        print("SKIP", path, "— cluster mode has no device form yet")
         return 0
     var whole = run_pipeline(fx.bytes, fx.trie, fx.items)
     var ni = fx.item_count

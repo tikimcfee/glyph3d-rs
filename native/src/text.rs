@@ -348,6 +348,14 @@ use crate::layout::GlyphRecord;
 /// artifacts with direct JS-oracle provenance — could not reach it at all.
 pub trait ResolveGlyph {
     fn resolve(&self, cp: u32) -> WorldEntry;
+
+    /// The sequence pass's table: the flat [slot, len, cps..] rows, the entry
+    /// stride's seq_max, and the head's advance. Default None = "no sequences"
+    /// — the rule never fires, which is every existing implementation's
+    /// behavior today. FixtureTrie and the atlas's TrieTable override it.
+    fn cluster_table(&self) -> Option<(&[u32], u32, f32)> {
+        None
+    }
 }
 
 /// A resolved codepoint in world units.

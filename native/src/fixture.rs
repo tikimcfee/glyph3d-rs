@@ -179,6 +179,14 @@ pub struct FixtureTrie {
     pub blocks_m: Vec<f32>,
     /// identity + bitfield, 2 per entry: [GLYPH_ID, FLAGS]
     pub blocks_c: Vec<u32>,
+    /// v5: the sequence payload — the flat [slot, len, cps..] x seq_count table
+    /// a cluster-mode item resolves against. Empty = "no sequences". Rides the
+    /// trie exactly like the v2 blob's sections ride the engine's Trie.
+    pub seq: Vec<u32>,
+    pub seq_max: u32,
+    /// The head advance a resolved sequence carries (NaN when seq is empty —
+    /// the generator's "poison the value that must be absent" rule).
+    pub bitmap_advance: f32,
 }
 
 impl ResolveGlyph for FixtureTrie {
@@ -200,6 +208,15 @@ impl ResolveGlyph for FixtureTrie {
             flags: self.blocks_c[e * 2 + 1],
         }
     }
+
+    /// The v5 payload, on the trie as it is in the Mojo loader.
+    fn cluster_table(&self) -> Option<(&[u32], u32, f32)> {
+        if self.seq.is_empty() {
+            None
+        } else {
+            Some((&self.seq, self.seq_max, self.bitmap_advance))
+        }
+    }
 }
 
 /// One 'G3DF' case: inputs (bytes, trie, items) + the oracle's expected outputs.
@@ -209,13 +226,6 @@ pub struct PipeFixture {
     pub item_count: usize,
     pub bytes: Vec<u8>,
     pub trie: FixtureTrie,
-    /// v5: the sequence payload — the flat [slot, len, cps..] x seq_count table
-    /// a cluster-mode item resolves against. Empty = "no sequences".
-    pub seq: Vec<u32>,
-    pub seq_max: u32,
-    /// The head advance a resolved sequence carries (NaN when seq is empty —
-    /// the generator's "poison the value that must be absent" rule).
-    pub bitmap_advance: f32,
     pub items: Vec<Item>,
     pub exp_leaders: u32,
     pub exp_misses: Vec<u32>,
@@ -378,10 +388,10 @@ fn load_pipe_bytes(raw: &[u8], name: String) -> Result<PipeFixture, String> {
             block_index,
             blocks_m,
             blocks_c,
+            seq,
+            seq_max,
+            bitmap_advance: bitmap_advance as f32,
         },
-        seq,
-        seq_max,
-        bitmap_advance: bitmap_advance as f32,
         items,
         exp_leaders,
         exp_misses,
@@ -474,13 +484,13 @@ impl PipeFixture {
         // sentinel for the NaN that means "no sequences" — two platforms
         // narrowing NaN is not a bit-exact path, so the sentinel replaces it.
         let mut h_seq = Fnv::default();
-        let seq_count = if self.seq.is_empty() { 0 } else { self.seq.len() / (2 + self.seq_max as usize) };
+        let seq_count = if self.trie.seq.is_empty() { 0 } else { self.trie.seq.len() / (2 + self.trie.seq_max as usize) };
         h_seq.u32(seq_count as u32);
-        h_seq.u32(self.seq_max);
-        for &v in &self.seq {
+        h_seq.u32(self.trie.seq_max);
+        for &v in &self.trie.seq {
             h_seq.u32(v);
         }
-        h_seq.u32(if self.bitmap_advance.is_nan() { u32::MAX } else { self.bitmap_advance.to_bits() });
+        h_seq.u32(if self.trie.bitmap_advance.is_nan() { u32::MAX } else { self.trie.bitmap_advance.to_bits() });
         let mut h_items = Fnv::default();
         for it in &self.items {
             h_items.i64(it.byte_start);
@@ -740,6 +750,13 @@ fn out_of_domain(fx: &PipeFixture) -> Option<String> {
     // out as if it had not is how a domain gap becomes a false green.
     if it.wrap_mode != crate::fold::WrapMode::Down {
         return Some("wrap_mode=Back".to_string());
+    }
+    // The sequence pass rewrites the static tier before the fold; this
+    // reference folds straight from the trie. A cluster-mode item is stating
+    // an intent reference_layout does not model until the text.rs twin lands
+    // (phase D) — same reasoning as the wrap-mode line above.
+    if it.cluster_mode != crate::fold::ClusterMode::Leader {
+        return Some("cluster_mode=Cluster".to_string());
     }
     if it.has_page {
         return Some("paged".to_string());
@@ -1367,10 +1384,10 @@ mod tests {
         // Full consumption is asserted inside the loader, so reaching Ok() here
         // IS the structural check — a wrong stride cannot get this far.
         let paths = all_fixtures();
-        // 17 since the three WrapBack fixtures landed (was 14). Pinned as a
+        // 25 since the eight sequence-pass fixtures landed (was 17). Pinned as a
         // COUNT rather than a nonzero check: a fixture that stopped being
         // discovered would otherwise quietly lower coverage instead of failing.
-        assert_eq!(paths.len(), 17, "corpus size changed — update the expectation deliberately");
+        assert_eq!(paths.len(), 25, "corpus size changed — update the expectation deliberately");
         for p in &paths {
             let fx = load_pipe_fixture(p).unwrap_or_else(|e| panic!("{}", e));
             assert_eq!(fx.exp_measures.len(), fx.byte_len * FIXTURE_MEASURE_STRIDE);

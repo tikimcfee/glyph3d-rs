@@ -41,6 +41,7 @@ from glyph_schema import (
     LC_STRIDE, LC_ROW, LC_COL,
     FIXTURE_MEASURE_STRIDE, FIXTURE_COUNT_STRIDE,
 )
+from glyph_cluster import resolve_clusters
 
 # ── Lane layout: GENERATED, six arrays, split twice ─────────────────────────
 # Who WRITES a lane decides where it lives; who READS it decides whether it
@@ -52,6 +53,10 @@ comptime F_LEADER = 1
 comptime F_RENDERED = 2
 comptime F_NEWLINE = 4
 comptime F_MISSING = 8
+# The sequence pass's trailer: the leader keeps its record but its glyph and
+# advance moved into the cluster head. Distinct from F_MISSING: a trailer's
+# content RESOLVED (it is drawn, one cell back); a miss was never found.
+comptime F_CLUSTER_TRAILER = 16
 
 comptime NEWLINE = 0x0A
 
@@ -286,6 +291,12 @@ struct Slots(Copyable, Movable):
     def set_glyph_id(self, id: Int, v: UInt32):
         self.gi[unsafe_offset=id] = v
 
+    def set_advance(self, id: Int, v: Float32):
+        """One f32 store to the ADVANCE lane alone — the sequence pass's
+        head/trailer write (set_static's 8-byte pair would clobber HEIGHT,
+        which the oracle leaves standing)."""
+        self.sm[unsafe_offset = id * SM_STRIDE + SM_ADVANCE] = v
+
     def advance(self, id: Int) -> Float32:
         return self.sm[unsafe_offset = id * SM_STRIDE + SM_ADVANCE]
 
@@ -411,7 +422,11 @@ comptime ST_MISSCAT = 3    # concatenate shard miss lists — SERIAL by contract
 comptime ST_FOLD = 4       # the fold proper: serial per item, items in parallel
 comptime ST_PAGINATE = 5   # page remap, stride derived from the fold scalars
 comptime ST_BOUNDS = 6     # per-item boxes + batch union
-comptime ST_COUNT = 7
+# ST_CLUSTER RUNS between decode and the fold but sits at index 7: appending
+# keeps every existing lane's index stable, and the Rust side's names array
+# mirrors the lane order (engine.rs's ENGINE_STAGE_NAMES).
+comptime ST_CLUSTER = 7    # the sequence pass: per item, decode -> fold
+comptime ST_COUNT = 8
 
 
 struct PipelineResult(Copyable, Movable):
@@ -1295,6 +1310,24 @@ def run_pipeline_into[o: ImmOrigin, witness: Bool = True](
             misses.append(miss_scratch[a + k])
 
     r.stage_ns[ST_MISSCAT] = perf_counter_ns() - _t
+    _t = perf_counter_ns()
+
+    # ── THE SEQUENCE PASS: per item, between decode and the fold, so the
+    #    trailer lanes are rewritten before any advance sum reads them. Serial
+    #    within an item (the rule is a left-to-right walk), items in parallel
+    #    — the same disjoint-range discipline as the fold. No dispatch at all
+    #    when no item opts in: leader-mode runs pay one item scan, not a pass.
+    var any_cluster = False
+    for i in range(len(items)):
+        if items[i].cluster_mode == CLUSTER_CLUSTER:
+            any_cluster = True
+            break
+    if any_cluster:
+        def _cluster_task(i: Int) {imm}:
+            if items[i].cluster_mode == CLUSTER_CLUSTER:
+                resolve_clusters(bytes, slots, trie, items[i])
+        parallelize(_cluster_task, len(items))
+    r.stage_ns[ST_CLUSTER] = perf_counter_ns() - _t
     _t = perf_counter_ns()
 
     # ── THE FOLD: serial per item, items in parallel (disjoint ranges) ────────

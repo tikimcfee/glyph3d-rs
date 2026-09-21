@@ -59,7 +59,7 @@ def ordered_key(v: Float32) -> UInt32:
         return ~b
     return b | 0x80000000
 from glyph_scan import run_scan_pipeline
-from fixture_io import load_pipe_fixture, PipeFixture
+from fixture_io import load_pipe_fixture, has_cluster_items, PipeFixture
 from glyph_pipeline import Item, Trie
 
 comptime MAX_PRINTED = 8
@@ -513,6 +513,11 @@ def check_case(path: String, ctx: DeviceContext) raises -> Int:
 def check_fixture(var fx: PipeFixture, ctx: DeviceContext, bench: Bool = False) raises -> Int:
     var n = fx.byte_len
     if n == 0:
+        return 0
+    # No cluster kernel exists on device yet — skip, printed, so the hole
+    # is named. The CPU forms cover the rule; the device form is its own work.
+    if has_cluster_items(fx):
+        print("SKIP a", fx.byte_len, "byte fixture — cluster mode has no device form yet")
         return 0
     var n_chunks = (n + CHUNK - 1) // CHUNK
     var n_supers = (n_chunks + GROUP - 1) // GROUP

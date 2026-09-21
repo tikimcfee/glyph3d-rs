@@ -39,8 +39,9 @@
 //! recurrence — it IS that re-sum, scheduled differently.
 
 use crate::fold::{
-    batch_union, bounds_range, decode_all, derive_stride, page_active, paginate, rows_for_line,
-    wrap_row_of, wrap_segment_of, FoldResult, Item, Slots, WrapMode, F_LEADER,
+    batch_union, bounds_range, decode_all, derive_stride, page_active, paginate, resolve_clusters,
+    rows_for_line,
+    wrap_row_of, wrap_segment_of, ClusterMode, FoldResult, Item, Slots, WrapMode, F_LEADER,
     F_NEWLINE, F_RENDERED,
 };
 use crate::text::ResolveGlyph;
@@ -475,6 +476,14 @@ pub fn run_scan_pipeline<T: ResolveGlyph + ?Sized>(
 
     // ── dispatch 1: decode (the same kernel the serial form runs) ─────────────
     let (misses, leaders) = decode_all(bytes, &mut slots, trie);
+    // ── the sequence pass, between decode and chunk_reduce — the scan's leaves
+    //    read the resolved static lanes; the monoid never learns what a cluster
+    //    is (the serial form's hook sits at the same point in fold.rs).
+    for item in items {
+        if item.cluster_mode == ClusterMode::Cluster {
+            resolve_clusters(bytes, &mut slots, trie, item);
+        }
+    }
     if items.is_empty() {
         return FoldResult {
             slots,
@@ -619,7 +628,7 @@ pub fn run_scan_pipeline<T: ResolveGlyph + ?Sized>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fold::{run_pipeline, ClusterMode};
+    use crate::fold::run_pipeline;
     use crate::glyph_trie::{build_glyph_trie, BuiltTrie, GlyphMetrics};
 
     fn trie() -> BuiltTrie {

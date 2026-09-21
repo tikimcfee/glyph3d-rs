@@ -300,6 +300,109 @@ const CASES = [
             ],
         };
     })(),
+    // ── THE SEQUENCE PASS (clusterMode 1). Synthetic sequence tables in the
+    //    fixture's own id space (SEQ_SLOT_BASE 50000, so a head/trailer mix-up
+    //    can never hide behind a plausible-looking id); the rule is the
+    //    oracle's resolveClusters. bitmapAdvance carries an awkward mantissa on
+    //    purpose — the f32 chain must move it bit-exactly.
+    (() => {
+        // The controlled A/B: the same content twice, cluster item then leader
+        // item. The diff between the two IS the resolution — anti-vacuity by
+        // construction (if the pass never fired, the items would agree).
+        const a = utf8('🚀\u200D🌍 x\n');
+        const bytes = new Uint8Array(a.length * 2);
+        bytes.set(a, 0); bytes.set(a, a.length);
+        return {
+            name: 'cluster-zwj',
+            bytes,
+            seqs: [[50000, [0x1F680, 0x200D, 0x1F30D]]],
+            bitmapAdvance: Math.fround(1.318),
+            items: [
+                { byteStart: 0, byteCount: a.length, origin: { x: 0, y: 0, z: 0 }, clusterMode: 1, lineHeight: 1.0 },
+                { byteStart: a.length, byteCount: a.length, origin: { x: 0, y: -3, z: 0 }, clusterMode: 0, lineHeight: 1.0 },
+            ],
+        };
+    })(),
+    {
+        // RI pairing, greedy from the left — GB12/GB13 with no parity state:
+        // the table pair (A C) resolves, the lone RI stays single, and a
+        // NON-table pair (A D) stays two singles even though A starts a known
+        // sequence — the fallback is pinned, not assumed.
+        name: 'cluster-flags',
+        bytes: utf8('🇦🇨 🇩 🇦🇩 x\n'),
+        seqs: [[50001, [0x1F1E6, 0x1F1E8]]],
+        bitmapAdvance: Math.fround(1.318),
+        items: [{ origin: { x: 0, y: 0, z: 0 }, clusterMode: 1, lineHeight: 1.0 }],
+    },
+    {
+        // Keycaps, both spellings: '1' FE0F 20E3 and '1' 20E3 resolve to the
+        // SAME slot — the FE0F normalization pin (the font's GSUB strips VS16;
+        // real text carries it).
+        name: 'cluster-keycap',
+        bytes: utf8('1️⃣ 1⃣ x\n'),
+        seqs: [[50002, [0x31, 0x20E3]]],
+        bitmapAdvance: Math.fround(1.318),
+        items: [{ origin: { x: 0, y: 0, z: 0 }, clusterMode: 1, lineHeight: 1.0 }],
+    },
+    {
+        // The fallback: a ZWJ chain the table does NOT have, against a table
+        // that exists but matches nothing here. Pieces render per codepoint
+        // and the ZWJ goes zero-width — the invisible-by-design rule firing
+        // without a match.
+        name: 'cluster-unmatched',
+        bytes: utf8('🚀\u200D🌍 x\n'),
+        seqs: [[50005, [0x1F600, 0x200D, 0x1F601]]],   // a chain this item lacks
+        bitmapAdvance: Math.fround(1.318),
+        items: [{ origin: { x: 0, y: 0, z: 0 }, clusterMode: 1, lineHeight: 1.0 }],
+    },
+    {
+        // Skin tone: the two-codepoint modifier sequence resolves whole.
+        name: 'cluster-skin',
+        bytes: utf8('👍🏽 x\n'),
+        seqs: [[50003, [0x1F44D, 0x1F3FD]]],
+        bitmapAdvance: Math.fround(1.318),
+        items: [{ origin: { x: 0, y: 0, z: 0 }, clusterMode: 1, lineHeight: 1.0 }],
+    },
+    {
+        // The probe stops at a newline (GB4/GB5): the chain is cut by the line
+        // break, so nothing resolves — the pieces render on their own rows and
+        // the ZWJ is zero-width. If a match ever crossed the newline, this
+        // fixture's bounds move.
+        name: 'cluster-newline',
+        bytes: utf8('🚀\u200D\n🌍\n'),
+        seqs: [[50000, [0x1F680, 0x200D, 0x1F30D]]],
+        bitmapAdvance: Math.fround(1.318),
+        items: [{ origin: { x: 0, y: 0, z: 0 }, clusterMode: 1, lineHeight: 1.0 }],
+    },
+    (() => {
+        // LONGEST-MATCH: the table holds both (🚀, ZWJ) and (🚀, ZWJ, 🌍); the
+        // full chain resolves to the longer entry, the cut one to the shorter.
+        // A first-match-wins implementation gets this fixture wrong.
+        const a = utf8('🚀\u200D🌍\n');
+        const b = utf8('🚀\u200D x\n');
+        const bytes = new Uint8Array(a.length + b.length);
+        bytes.set(a, 0); bytes.set(b, a.length);
+        return {
+            name: 'cluster-longest',
+            bytes,
+            seqs: [[50000, [0x1F680, 0x200D, 0x1F30D]], [50004, [0x1F680, 0x200D]]],
+            bitmapAdvance: Math.fround(1.318),
+            items: [
+                { byteStart: 0, byteCount: a.length, origin: { x: 0, y: 0, z: 0 }, clusterMode: 1, lineHeight: 1.0 },
+                { byteStart: a.length, byteCount: b.length, origin: { x: 0, y: -3, z: 0 }, clusterMode: 1, lineHeight: 1.0 },
+            ],
+        };
+    })(),
+    {
+        // A cluster inside a WRAPPED line: row/col count leaders (unchanged),
+        // while the x positions compress — the fold reads the rewritten static
+        // lanes exactly as it always did.
+        name: 'cluster-wrap',
+        bytes: utf8('ab 🚀\u200D🌍 cd ef gh\n'),
+        seqs: [[50000, [0x1F680, 0x200D, 0x1F30D]]],
+        bitmapAdvance: Math.fround(1.318),
+        items: [{ origin: { x: 0, y: 0, z: 0 }, wrapWidth: 4, zStep: 0.2, clusterMode: 1, lineHeight: 1.0 }],
+    },
 ];
 
 

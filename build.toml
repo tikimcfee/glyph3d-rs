@@ -113,7 +113,7 @@ build = "cd engine/fixtures && node gen.mjs && node gen-bake.mjs"
 # gen.mjs imports) so the committed corpus is never deleted mid-check — the
 # old gate deleted all 25 fixtures in place and restored them with git
 # checkout. Counts are DECLARED, not ls-derived from the tree under test.
-counts = { "pipe" = 17, "bake" = 8 }
+counts = { "pipe" = 25, "bake" = 8 }
 note = "The Rust-side corpus pins (fixture.rs / bake.rs, 'update deliberately') stay; they and these declared counts are two independent witnesses, not duplicates."
 
 # ── Goldens ──────────────────────────────────────────────────────────────
