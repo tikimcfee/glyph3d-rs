@@ -16,6 +16,7 @@
 # Run: mojo run -I engine --fp-mode contract=off engine/fixture_manifest.mojo \
 #          engine/fixtures/*.pipe.bin
 
+from std.memory import bitcast
 from std.sys import argv
 from fixture_io import load_pipe_fixture
 from glyph_schema import FIXTURE_MEASURE_STRIDE, FIXTURE_COUNT_STRIDE
@@ -94,6 +95,24 @@ def main() raises:
         for i in range(len(fx.trie.blocks_c)):
             h_tc.u32(fx.trie.blocks_c[i])
 
+        # v5: the sequence payload rides the trie, so its hash sits with the
+        # trie's, in disk order. The advance hashes as its narrowed f32 bits,
+        # with a sentinel for the NaN that means "no sequences" — two platforms
+        # narrowing NaN is not a bit-exact path, so the sentinel replaces it.
+        var h_seq = Fnv()
+        var seq_count = 0
+        if len(fx.trie.seq) > 0:
+            seq_count = len(fx.trie.seq) // (2 + fx.trie.seq_max)
+        h_seq.u32(UInt32(seq_count))
+        h_seq.u32(UInt32(fx.trie.seq_max))
+        for i in range(len(fx.trie.seq)):
+            h_seq.u32(fx.trie.seq[i])
+        var adv = fx.trie.bitmap_advance
+        if adv != adv:
+            h_seq.u32(UInt32(0xFFFFFFFF))
+        else:
+            h_seq.u32(bitcast[DType.uint32](adv))
+
         # FIELD ORDER IS THE STRUCT'S, and the Rust side hashes its own struct
         # in the same declaration order. Reordering either silently breaks this
         # gate, which is the intent.
@@ -107,6 +126,7 @@ def main() raises:
             h_items.f64(t.origin_z)
             h_items.i64(t.wrap_width)
             h_items.i64(t.wrap_mode)
+            h_items.i64(t.cluster_mode)
             h_items.f64(t.z_step)
             h_items.f64(t.line_height)
             h_items.u8(UInt8(1) if t.has_page else UInt8(0))
@@ -156,6 +176,7 @@ def main() raises:
             "h.tindex=" + hex16(h_tindex.h),
             "h.tm=" + hex16(h_tm.h),
             "h.tc=" + hex16(h_tc.h),
+            "h.seq=" + hex16(h_seq.h),
             "h.items=" + hex16(h_items.h),
             "h.miss=" + hex16(h_miss.h),
             "h.otb=" + hex16(h_otb.h),

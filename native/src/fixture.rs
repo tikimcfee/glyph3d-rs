@@ -8,7 +8,7 @@
 //! `load_trie_auto` and never looked inside.
 //!
 //! THE FORMAT is `engine/fixture_io.mojo`, mirrored section for section. It is
-//! frozen on disk (v3) and deliberately independent of any layer's container:
+//! frozen on disk (v5) and deliberately independent of any layer's container:
 //! it carries the oracle's VALUES, and each loader realizes its own carriers.
 //! This one performs the same carrier split the Mojo loader does — trie
 //! measures narrowed f64 -> f32, identity and bitfield to native u32 — because
@@ -33,7 +33,7 @@ use crate::text::{ResolveGlyph, WorldEntry};
 
 /// 'G3DF' — a pipeline fixture.
 const PIPE_MAGIC: u32 = 0x4644_3347;
-const PIPE_VERSION: u32 = 4;
+const PIPE_VERSION: u32 = 5;
 
 /// Fixture lane strides. These are the ON-DISK strides from
 /// `schema/glyph-identity.json` (FIXTURE_MEASURE_STRIDE / FIXTURE_COUNT_STRIDE),
@@ -209,6 +209,13 @@ pub struct PipeFixture {
     pub item_count: usize,
     pub bytes: Vec<u8>,
     pub trie: FixtureTrie,
+    /// v5: the sequence payload — the flat [slot, len, cps..] x seq_count table
+    /// a cluster-mode item resolves against. Empty = "no sequences".
+    pub seq: Vec<u32>,
+    pub seq_max: u32,
+    /// The head advance a resolved sequence carries (NaN when seq is empty —
+    /// the generator's "poison the value that must be absent" rule).
+    pub bitmap_advance: f32,
     pub items: Vec<Item>,
     pub exp_leaders: u32,
     pub exp_misses: Vec<u32>,
@@ -273,6 +280,24 @@ fn load_pipe_bytes(raw: &[u8], name: String) -> Result<PipeFixture, String> {
     }
 
     let mut items = Vec::with_capacity(item_count);
+    // v5: the sequence payload sits between the blocks and the item records.
+    let seq_count = r.u32()? as usize;
+    let seq_max = r.u32()?;
+    let bitmap_advance = r.f64()?;
+    if seq_count == 0 && !bitmap_advance.is_nan() {
+        return Err("seq payload with 0 entries must carry a NaN advance".into());
+    }
+    if seq_count > 0 && bitmap_advance.is_nan() {
+        return Err("seq payload with entries must carry a finite advance".into());
+    }
+    let mut seq = Vec::with_capacity(seq_count * (2 + seq_max as usize));
+    for _ in 0..seq_count {
+        seq.push(r.u32()?); // slot
+        seq.push(r.u32()?); // len
+        for _ in 0..seq_max {
+            seq.push(r.u32()?); // cps (0-padded)
+        }
+    }
     for _ in 0..item_count {
         items.push(Item {
             byte_start: r.u32()? as i64,
@@ -287,6 +312,8 @@ fn load_pipe_bytes(raw: &[u8], name: String) -> Result<PipeFixture, String> {
             // parameter — item-level, never per line. An out-of-range code is
             // refused rather than defaulted (`WrapMode::from_code`).
             wrap_mode: crate::fold::WrapMode::from_code(r.f64()? as i64),
+            // v5: the cluster MODE, beside the wrap mode — same kind, same rule.
+            cluster_mode: crate::fold::ClusterMode::from_code(r.f64()? as i64),
             z_step: r.f64()?,
             line_height: r.f64()?,
             has_page: r.f64()? > 0.5,
@@ -352,6 +379,9 @@ fn load_pipe_bytes(raw: &[u8], name: String) -> Result<PipeFixture, String> {
             blocks_m,
             blocks_c,
         },
+        seq,
+        seq_max,
+        bitmap_advance: bitmap_advance as f32,
         items,
         exp_leaders,
         exp_misses,
@@ -438,6 +468,19 @@ impl PipeFixture {
         for &v in &self.trie.blocks_c {
             h_tc.u32(v);
         }
+        // v5: the sequence payload rides the trie in both loaders, so its hash
+        // sits with the trie's, in disk order. The advance hashes as its
+        // narrowed f32 bits (the parsed carrier, matching h.tm), with a
+        // sentinel for the NaN that means "no sequences" — two platforms
+        // narrowing NaN is not a bit-exact path, so the sentinel replaces it.
+        let mut h_seq = Fnv::default();
+        let seq_count = if self.seq.is_empty() { 0 } else { self.seq.len() / (2 + self.seq_max as usize) };
+        h_seq.u32(seq_count as u32);
+        h_seq.u32(self.seq_max);
+        for &v in &self.seq {
+            h_seq.u32(v);
+        }
+        h_seq.u32(if self.bitmap_advance.is_nan() { u32::MAX } else { self.bitmap_advance.to_bits() });
         let mut h_items = Fnv::default();
         for it in &self.items {
             h_items.i64(it.byte_start);
@@ -447,6 +490,7 @@ impl PipeFixture {
             h_items.f64(it.origin_z);
             h_items.i64(it.wrap_width);
             h_items.i64(it.wrap_mode.code());
+            h_items.i64(it.cluster_mode.code());
             h_items.f64(it.z_step);
             h_items.f64(it.line_height);
             h_items.u8(u8::from(it.has_page));
@@ -499,11 +543,12 @@ impl PipeFixture {
         );
         let _ = write!(
             s,
-            " h.bytes={} h.tindex={} h.tm={} h.tc={} h.items={} h.miss={} h.otb={} h.meas={} h.cnt={} h.bnds={} h.batch={}",
+            " h.bytes={} h.tindex={} h.tm={} h.tc={} h.seq={} h.items={} h.miss={} h.otb={} h.meas={} h.cnt={} h.bnds={} h.batch={}",
             h_bytes.hex(),
             h_tindex.hex(),
             h_tm.hex(),
             h_tc.hex(),
+            h_seq.hex(),
             h_items.hex(),
             h_miss.hex(),
             h_otb.hex(),

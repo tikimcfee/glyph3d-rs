@@ -40,8 +40,8 @@
 
 use crate::fold::{
     batch_union, bounds_range, decode_all, derive_stride, page_active, paginate, rows_for_line,
-    wrap_row_of, wrap_segment_of, FoldResult, Item, Slots, WrapMode, F_LEADER, F_NEWLINE,
-    F_RENDERED,
+    wrap_row_of, wrap_segment_of, FoldResult, Item, Slots, WrapMode, F_LEADER,
+    F_NEWLINE, F_RENDERED,
 };
 use crate::text::ResolveGlyph;
 
@@ -619,7 +619,7 @@ pub fn run_scan_pipeline<T: ResolveGlyph + ?Sized>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fold::run_pipeline;
+    use crate::fold::{run_pipeline, ClusterMode};
     use crate::glyph_trie::{build_glyph_trie, BuiltTrie, GlyphMetrics};
 
     fn trie() -> BuiltTrie {
@@ -928,10 +928,12 @@ mod tests {
         let items = [
             Item {
                 byte_start: 0, byte_count: 90, wrap_width: 3, wrap_mode: WrapMode::Down,
+                cluster_mode: ClusterMode::default(),
                 z_step: 0.2, line_height: 1.0, ..Item::default()
             },
             Item {
                 byte_start: 90, byte_count: 90, wrap_width: 3, wrap_mode: WrapMode::Back,
+                cluster_mode: ClusterMode::default(),
                 origin_y: 4.0, z_step: 0.2, line_height: 1.0, ..Item::default()
             },
         ];
@@ -1043,6 +1045,7 @@ mod tests {
             origin_z: 0.5,
             wrap_width: 7,
             wrap_mode: WrapMode::Down,
+                cluster_mode: ClusterMode::default(),
             z_step: 0.1,
             line_height: 1.1,
             has_page: true,

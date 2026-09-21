@@ -109,6 +109,43 @@ impl WrapMode {
     }
 }
 
+/// THE CLUSTER MODES — an ITEM-LEVEL parameter, exactly like `wrap_mode`.
+///
+/// `Leader` (the default; the corpus pins it): one glyph per UTF-8 leader.
+/// `Cluster`: the sequence pass — a codepoint sequence the font draws as ONE
+/// glyph resolves to its sequence slot, trailing leaders become zero-advance
+/// drops (the blank mechanism), and the invisible-by-design characters (ZWJ,
+/// the variation selectors, the tags) never occupy a cell. Records stay per
+/// leader either way: ROW/COL, the witness lanes, and the pick cross-check do
+/// not move.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum ClusterMode {
+    #[default]
+    Leader,
+    Cluster,
+}
+
+impl ClusterMode {
+    /// The wire encoding: 0 = Leader, 1 = Cluster. Shared by the `.pipe.bin`
+    /// v5 item record and the FFI descriptor — same role as WrapMode::code.
+    pub const fn code(self) -> i64 {
+        match self {
+            ClusterMode::Leader => 0,
+            ClusterMode::Cluster => 1,
+        }
+    }
+
+    /// Same rule as WrapMode::from_code: an unknown code is malformed input,
+    /// refused at the seam rather than defaulted.
+    pub fn from_code(code: i64) -> Self {
+        match code {
+            0 => ClusterMode::Leader,
+            1 => ClusterMode::Cluster,
+            other => panic!("cluster mode must be 0 (Leader) or 1 (Cluster), got {other}"),
+        }
+    }
+}
+
 /// One file in the arena: byte range + layout params.
 ///
 /// FIELD ORDER IS LOAD-BEARING — `fixture::PipeFixture::manifest` hashes these
@@ -129,6 +166,8 @@ pub struct Item {
     pub wrap_width: i64,
     /// Item-level, exactly like `wrap_width`. See [`WrapMode`].
     pub wrap_mode: WrapMode,
+    /// Item-level, exactly like `wrap_mode`. See [`ClusterMode`].
+    pub cluster_mode: ClusterMode,
     pub z_step: f64,
     pub line_height: f64,
     pub has_page: bool,

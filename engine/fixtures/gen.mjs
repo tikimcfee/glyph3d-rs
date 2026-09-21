@@ -13,7 +13,15 @@
  * the class of bug (grouping-dependent float drift) this rig exists to catch.
  *
  * Format (all little-endian, packed, no alignment):
- *   u32 magic 'G3DF' (0x46443347)   u32 version=4
+ *   u32 magic 'G3DF' (0x46443347)   u32 version=5
+ *
+ * v5: the item record gains CLUSTER MODE beside wrapMode — leader (0, today's
+ * behaviour and the default) or cluster (1, the sequence pass) — and the
+ * fixture gains a SEQUENCE PAYLOAD between the blocks and the item records:
+ * the synthetic sequence table a cluster-mode fixture resolves against
+ * ([slot, len, cps..] entries) plus the bitmap advance a resolved head
+ * carries. seqCount 0 with a NaN advance = "no sequences" (the 25 pre-v5
+ * fixtures' shape); the NaN poisons any read of a value that must be absent.
  *
  * v4: the item record gains WRAP MODE — WrapDown (0, today's behaviour and the
  * default) or WrapBack (1, where a wrap keeps the row and steps only in depth).
@@ -28,11 +36,14 @@
  *   u32 byteLen  u32 itemCount  u32 blockIndexLen  u32 blocksFloatLen
  *   u8[byteLen] bytes
  *   u32[blockIndexLen] blockIndex
- *   f32[blocksFloatLen] blocks
- *   itemCount × item record:
+ *   f64[blocksFloatLen] blocks (VALUES — the v2 carrier note above)
+ *   u32 seqCount  u32 seqMax  f64 bitmapAdvance (NaN when seqCount == 0)
+ *   seqCount x { u32 slot  u32 len  u32 cps[seqMax] (0-padded) }   [v5]
+ *   itemCount x item record:
  *     u32 byteStart  u32 byteCount
  *     f64 originX originY originZ
  *     f64 wrapWidth  f64 wrapMode (0 = WrapDown, 1 = WrapBack)
+ *     f64 clusterMode (0 = leader, 1 = cluster)                    [v5]
  *     f64 zStep  f64 lineHeight (NaN = unset)
  *     f64 hasPage (0|1)
  *     f64 pageRows pageCols scrollRows pagesWide pageGapX bandStrideY
@@ -62,6 +73,15 @@ import { buildGlyphTrie, trieLaneValue } from './inputs/GlyphTrie.js';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const utf8 = (s) => new TextEncoder().encode(s);
+
+// ── v5: the sequence payload. A case with `seqs: [[slot, [cps..]], ..]`
+//    resolves them under clusterMode 1; the table is the fixture's whole
+//    synthetic world for the sequence pass. Slots are allocated from 50000 up
+//    — clearly outside the codepoint-derived id space (cp % 4093 + 1), so a
+//    head/trailer mix-up can never hide behind a plausible-looking id.
+//    bitmapAdvance is the head's advance under cluster mode, per fixture; the
+//    awkward mantissa is on purpose (the f32 chain must carry it bit-exactly).
+const SEQ_SLOT_BASE = 50000;
 
 // ── Trie: synthetic metrics with awkward f32 mantissas, so every advance-sum
 //    exercises real rounding. '@' is deliberately unmapped (the F_MISSING path);
@@ -345,10 +365,24 @@ for (const c of CASES) {
         ...it,
     }));
     const trie = buildTrieFor([c.bytes]);
+    // v5: the sequence payload rides the trie the runPipeline sees, exactly
+    // where the engine's Trie carries it. No `seqs` on the case → no table —
+    // resolveClusters early-returns even for cluster items.
+    if (c.seqs && c.seqs.length) {
+        if (!(typeof c.bitmapAdvance === 'number' && Number.isFinite(c.bitmapAdvance))) {
+            throw new Error(`${c.name}: seqs without a finite bitmapAdvance`);
+        }
+        trie.seqMax = Math.max(...c.seqs.map(([, cps]) => cps.length));
+        trie.bitmapAdvance = c.bitmapAdvance;
+        trie.seq = [];
+        for (const [slot, cps] of c.seqs) {
+            trie.seq.push(slot, cps.length, ...cps, ...new Array(trie.seqMax - cps.length).fill(0));
+        }
+    }
     const r = runPipeline(c.bytes, trie, { items });
 
     const w = new Writer();
-    w.u32(0x46443347); w.u32(4);
+    w.u32(0x46443347); w.u32(5);
     w.u32(c.bytes.length); w.u32(items.length);
     w.u32(trie.blockIndex.length); w.u32(trie.blocks.length);
     w.bytes(c.bytes);
@@ -358,10 +392,21 @@ for (const c of CASES) {
     // precisely so a container change leaves the corpus untouched — decoding here
     // is what makes that true.
     for (let i = 0; i < trie.blocks.length; i++) w.f64(trieLaneValue(trie.blocks, i));
+    // v5: the sequence payload, between the blocks and the item records.
+    w.u32(trie.seq ? c.seqs.length : 0);
+    w.u32(trie.seq ? trie.seqMax : 0);
+    w.f64(trie.seq ? trie.bitmapAdvance : NaN);
+    if (trie.seq) {
+        for (const [slot, cps] of c.seqs) {
+            w.u32(slot); w.u32(cps.length);
+            for (let k = 0; k < trie.seqMax; k++) w.u32(cps[k] ?? 0);
+        }
+    }
     for (const it of items) {
         w.u32(it.byteStart); w.u32(it.byteCount);
         w.f64(it.origin?.x || 0); w.f64(it.origin?.y || 0); w.f64(it.origin?.z || 0);
         w.f64(it.wrapWidth ?? 0); w.f64(it.wrapMode ?? 0);
+        w.f64(it.clusterMode ?? 0);
         w.f64(it.zStep ?? 0); w.f64(it.lineHeight ?? NaN);
         const p = it.page;
         w.f64(p ? 1 : 0);

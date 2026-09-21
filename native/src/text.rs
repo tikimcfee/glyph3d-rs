@@ -762,7 +762,7 @@ pub fn colorize_leaders(bytes: &[u8]) -> Vec<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fold::{run_pipeline, Item, F_LEADER};
+    use crate::fold::{run_pipeline, ClusterMode, Item, F_LEADER};
     use crate::glyph_trie::{build_glyph_trie, BuiltTrie, GlyphMetrics};
 
     fn trie() -> BuiltTrie {
@@ -798,6 +798,7 @@ mod tests {
                     byte_count: bytes.len() as i64,
                     wrap_width: wrap.max(0) as i64,
                     wrap_mode: mode,
+                    cluster_mode: ClusterMode::default(),
                     line_height: 1.0,
                     ..Item::default()
                 };

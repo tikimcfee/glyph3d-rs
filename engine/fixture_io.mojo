@@ -9,6 +9,7 @@ from std.memory import bitcast
 # per byte regardless of how the engine lays its working buffers.
 from glyph_schema import FIXTURE_MEASURE_STRIDE, FIXTURE_COUNT_STRIDE
 from glyph_pipeline import Trie, Item, trunc_nonneg, BLOCK_SHIFT, WRAP_DOWN, WRAP_BACK
+from glyph_pipeline import CLUSTER_LEADER, CLUSTER_CLUSTER
 
 comptime PIPE_MAGIC = 0x46443347
 # NATIVE-PORT (Stage E1): the app's own trie blob — magic 'G3TR'. Spec: the
@@ -97,8 +98,8 @@ def load_pipe_fixture(path: String) raises -> PipeFixture:
 
     if Int(r.u32()) != PIPE_MAGIC:
         raise Error(path + ": bad magic (not a .pipe.bin fixture)")
-    if Int(r.u32()) != 4:
-        raise Error(path + ": unknown fixture version (expected v4 — regenerate)")
+    if Int(r.u32()) != 5:
+        raise Error(path + ": unknown fixture version (expected v5 — regenerate)")
 
     var fx = PipeFixture()
     fx.byte_len = Int(r.u32())
@@ -128,7 +129,25 @@ def load_pipe_fixture(path: String) raises -> PipeFixture:
         blocks_m.append(Float32(h))
         blocks_c.append(UInt32(gid))
         blocks_c.append(UInt32(fl))
-    fx.trie = Trie(block_index^, blocks_m^, blocks_c^, List[UInt32](), List[UInt32]())
+    # v5: the sequence payload, between the blocks and the item records. It
+    # rides the Trie, exactly like the v2 blob's sections — one carrier shape
+    # for both sources.
+    var seq_count = Int(r.u32())
+    var seq_max = Int(r.u32())
+    var bitmap_advance = r.f64()
+    if seq_count == 0 and bitmap_advance == bitmap_advance:
+        raise Error(path + ": seq payload with 0 entries must carry a NaN advance")
+    if seq_count > 0 and bitmap_advance != bitmap_advance:
+        raise Error(path + ": seq payload with entries must carry a finite advance")
+    var seq = List[UInt32](capacity=seq_count * (2 + seq_max))
+    for _ in range(seq_count):
+        seq.append(r.u32())  # slot
+        seq.append(r.u32())  # len
+        for _ in range(seq_max):
+            seq.append(r.u32())  # cps, 0-padded
+    fx.trie = Trie(block_index^, blocks_m^, blocks_c^, seq^, List[UInt32]())
+    fx.trie.bitmap_advance = Float32(bitmap_advance)
+    fx.trie.seq_max = seq_max
 
     for _ in range(fx.item_count):
         var it = Item()
@@ -150,6 +169,14 @@ def load_pipe_fixture(path: String) raises -> PipeFixture:
             raise Error(
                 path + ": wrap mode must be 0 (WrapDown) or 1 (WrapBack), got "
                 + String(mode_raw)
+            )
+        # v5: the cluster MODE, beside the wrap mode — same kind, same rule.
+        var cluster_raw = r.f64()
+        it.cluster_mode = Int(cluster_raw)
+        if it.cluster_mode != CLUSTER_LEADER and it.cluster_mode != CLUSTER_CLUSTER:
+            raise Error(
+                path + ": cluster mode must be 0 (leader) or 1 (cluster), got "
+                + String(cluster_raw)
             )
         it.z_step = r.f64()
         it.line_height = r.f64()
@@ -219,8 +246,9 @@ def load_trie_blob(path: String) raises -> Trie:
     var seq_max = 0
     var seq_words = 0
     var class_words = 0
+    var bitmap_advance = Float32(0)
     if version == 2:
-        var _bitmap_advance = r.f32()  # the cluster head's advance — phase C reads it
+        bitmap_advance = r.f32()  # the cluster head's advance — the pass reads it
         seq_count = Int(r.u32())
         seq_max = Int(r.u32())
         _ = r.u32()  # seqOff — the sections are appended in order; the offset is a cross-check
@@ -251,7 +279,10 @@ def load_trie_blob(path: String) raises -> Trie:
     var classes = List[UInt32](capacity=class_words)
     for _ in range(class_words):
         classes.append(r.u32())
-    return Trie(block_index^, blocks_m^, blocks_c^, seq^, classes^)
+    var t = Trie(block_index^, blocks_m^, blocks_c^, seq^, classes^)
+    t.bitmap_advance = bitmap_advance
+    t.seq_max = seq_max
+    return t^
 
 
 def load_trie_auto(path: String) raises -> Trie:

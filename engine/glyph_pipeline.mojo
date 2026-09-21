@@ -89,6 +89,12 @@ struct Trie(Copyable, Movable):
     # glyph_cluster.mojo; these are just the carried bytes.
     var seq: List[UInt32]
     var classes: List[UInt32]
+    # The sequence entry stride is 2 + seq_max; seq_max is 0 when seq is empty.
+    var seq_max: Int
+    # The advance a resolved cluster head carries (the bitmap 2x cell, in this
+    # trie's world units). Meaningful only when seq is non-empty; 0 reads as
+    # "no sequences" because the pass early-returns on an empty table.
+    var bitmap_advance: Float32
 
     def __init__(
         out self, var block_index: List[UInt32],
@@ -100,6 +106,8 @@ struct Trie(Copyable, Movable):
         self.blocks_c = blocks_c^
         self.seq = seq^
         self.classes = classes^
+        self.seq_max = 0
+        self.bitmap_advance = Float32(0)
 
     def advance_at(self, entry: Int) -> Float32:
         return self.blocks_m[entry * TM_STRIDE + TM_ADVANCE]
@@ -138,6 +146,14 @@ struct Trie(Copyable, Movable):
 comptime WRAP_DOWN: Int = 0
 comptime WRAP_BACK: Int = 1
 
+# THE CLUSTER MODES — an ITEM-LEVEL parameter, exactly like the wrap mode.
+# CLUSTER_LEADER (0): one glyph per UTF-8 leader (the corpus's pinned behavior).
+# CLUSTER_CLUSTER (1): the sequence pass — a sequence the font draws as ONE
+# glyph resolves to its slot; trailing leaders become zero-advance drops.
+# Records stay per leader either way: ROW/COL and the witness lanes do not move.
+comptime CLUSTER_LEADER: Int = 0
+comptime CLUSTER_CLUSTER: Int = 1
+
 
 struct Item(Copyable, Movable):
     """One file in the arena: byte range + layout params. line_height is REQUIRED —
@@ -151,6 +167,9 @@ struct Item(Copyable, Movable):
     var wrap_mode: Int    # WRAP_DOWN | WRAP_BACK — item-level, exactly like the
                           # wrap width, and see WRAP_BACK's comment for why that
                           # is load-bearing rather than incidental.
+    var cluster_mode: Int # CLUSTER_LEADER | CLUSTER_CLUSTER — item-level, the
+                          # same kind of parameter again. 2026-09-20, the
+                          # sequence pass.
     var z_step: Float64   # 2026-08-31: five integer page-geometry params were
     var line_height: Float64  # declared 'measure' because the table holding them
     var has_page: Bool        # was NAMED measures; truncation now happens ONCE,
@@ -172,6 +191,7 @@ struct Item(Copyable, Movable):
         self.origin_z = 0
         self.wrap_width = 0
         self.wrap_mode = WRAP_DOWN
+        self.cluster_mode = CLUSTER_LEADER
         self.z_step = 0
         self.line_height = 0
         self.has_page = False
