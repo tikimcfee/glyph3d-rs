@@ -392,7 +392,7 @@ gate = "committed-artifacts"
 why = "a generator case list losing an entry must not lower coverage silently"
 file = "engine/fixtures/gen.mjs"
 op = "replace"
-expect = "declares 17"
+expect = "declares 25"
 with = ""
 find = '''
     {
