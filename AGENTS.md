@@ -155,9 +155,11 @@ downstream links a stale engine. A failed rebuild is FATAL (the battery stops):
 a stale dylib makes every gate below a statement about the wrong binary.
 
 **committed-artifacts** (was "1"). One mechanism per generator, all driven from
-build.toml: the trie (`gen_real_trie.py --verify-only`) and the schema
-(`gen_schema.py --check`, which also runs the schema's own tier validation) use
-generator-native check modes; the four atlas bins are rebuilt by
+build.toml: generator-native check modes for the schema (`gen_schema.py
+--check`, which also runs the schema's own tier validation), the emoji sheet
+(`gen_emoji_sheet.py --check`), the cluster class table (`gen_cluster_table.py
+--check`) and the emoji demo corpus (`gen_emoji_corpus.py --check`); the trie
+uses `gen_real_trie.py --verify-only`; the four atlas bins are rebuilt by
 `export-atlas.mjs` into a scratch dir and `cmp`'d. Red when a generated
 artifact is hand-edited, or a generator changes behaviour. Blind to
 whether the *inputs* are right: the trie check proves `engine-trie.bin` is a
@@ -474,7 +476,9 @@ with a number against it.
 |---|---|---|
 | `assets/atlas/{curves,glyphmap,glyphs,codepoints}.bin` | generated | `tools/export-atlas.mjs` from `tools/vendor/ref` AND `emoji-sheet.bin` (the emoji slots after the web's 4,431); hand-edits are reverted by the next rebuild-and-compare |
 | `assets/atlas/emoji-sheet.bin` | generated | `tools/gen_emoji_sheet.py` from the vendored Noto Color Emoji; regenerate it BEFORE the atlas bins, which read it |
+| `assets/atlas/cluster-classes.bin` | generated | `tools/gen_cluster_table.py` from the vendored UCD — the class table every cluster-mode implementation reads; regenerate BEFORE the atlas bins, which carry it verbatim |
 | `assets/atlas/engine-trie.bin` | generated | `tools/gen_real_trie.py` |
+| `native/fixtures/emoji-corpus-{small,large}.txt` | generated | `tools/gen_emoji_corpus.py` from `codepoints.bin`'s v2 sequence section — the cluster demo corpus; a demo asset, not a golden input |
 | `engine/glyph_schema.{mojo,mjs}` | generated | `tools/gen_schema.py` from `schema/glyph-identity.json` — **two** edges leave the schema; editing it invalidates the corpus as well as the dylib |
 | `tools/vendor/` | vendored, hash-pinned | `vendor-manifest.py --check`; upstream drift is information, not failure |
 | `schema/glyph-identity.json` | vendored verbatim | drift means an upstream refresh, not a local edit |

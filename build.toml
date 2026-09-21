@@ -116,6 +116,14 @@ build = "cd engine/fixtures && node gen.mjs && node gen-bake.mjs"
 counts = { "pipe" = 25, "bake" = 8 }
 note = "The Rust-side corpus pins (fixture.rs / bake.rs, 'update deliberately') stay; they and these declared counts are two independent witnesses, not duplicates."
 
+[artifact.emoji-corpus]
+class = "committed"
+outputs = ["native/fixtures/emoji-corpus-small.txt", "native/fixtures/emoji-corpus-large.txt"]
+inputs = ["tools/gen_emoji_corpus.py", "assets/atlas/codepoints.bin"]
+build = "python3 tools/gen_emoji_corpus.py"
+verify_cmd = "python3 tools/gen_emoji_corpus.py --check"
+note = "The cluster demo corpus, generated from codepoints.bin's v2 sequence section: the large file carries every table sequence exactly once (asserted at bake), the small one is the one-line-per-class quick check. A demo asset, not a golden input — emoji-cluster/repo-cluster pin the mechanism; this pins the corpus against the table moving. --check-render (manual) diffs the renderer's staged counts against the generator's simulator."
+
 # ── Goldens ──────────────────────────────────────────────────────────────
 # Verified, NEVER built. These byte-equal screenshots are the only PIXEL
 # gate, and the expected bytes cannot be derived from anything —
@@ -416,6 +424,15 @@ name = "cluster-classes-byte"
 gate = "committed-artifacts"
 why = "the class table is generated from vendored UCD and a hand-edit must not survive; same class as emoji-sheet-byte, for the artifact every cluster-mode implementation reads"
 file = "assets/atlas/cluster-classes.bin"
+op = "append"
+arg = " "
+expect = "differs from a fresh bake"
+
+[[mutation]]
+name = "emoji-corpus-byte"
+gate = "committed-artifacts"
+why = "the demo corpus is generated from the shipped sequence table; a hand-edit to a corpus file must not survive a fresh bake, or the demo drifts from the table it claims to demonstrate"
+file = "native/fixtures/emoji-corpus-small.txt"
 op = "append"
 arg = " "
 expect = "differs from a fresh bake"
