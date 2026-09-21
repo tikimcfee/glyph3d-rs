@@ -130,7 +130,7 @@ def check_case(path: String) raises -> Int:
         blocks_m.append(Float32(h))
         blocks_c.append(UInt32(gid))
         blocks_c.append(UInt32(flv))
-    var trie = Trie(block_index^, blocks_m^, blocks_c^)
+    var trie = Trie(block_index^, blocks_m^, blocks_c^, List[UInt32](), List[UInt32]())
 
     var got = bake_file(bytes, trie, line_height, interval)
 

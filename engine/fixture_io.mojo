@@ -78,7 +78,7 @@ struct PipeFixture(Movable):
         self.byte_len = 0
         self.item_count = 0
         self.bytes = List[UInt8]()
-        self.trie = Trie(List[UInt32](), List[Float32](), List[UInt32]())
+        self.trie = Trie(List[UInt32](), List[Float32](), List[UInt32](), List[UInt32](), List[UInt32]())
         self.items = List[Item]()
         self.exp_leaders = 0
         self.exp_misses = List[UInt32]()
@@ -128,7 +128,7 @@ def load_pipe_fixture(path: String) raises -> PipeFixture:
         blocks_m.append(Float32(h))
         blocks_c.append(UInt32(gid))
         blocks_c.append(UInt32(fl))
-    fx.trie = Trie(block_index^, blocks_m^, blocks_c^)
+    fx.trie = Trie(block_index^, blocks_m^, blocks_c^, List[UInt32](), List[UInt32]())
 
     for _ in range(fx.item_count):
         var it = Item()
@@ -196,10 +196,14 @@ def load_trie_blob(path: String) raises -> Trie:
 
     if Int(r.u32()) != TRIE_MAGIC:
         raise Error(path + ": bad magic (not a .bin G3TR trie blob)")
-    if Int(r.u32()) != 1:
-        raise Error(path + ": unknown trie blob version (expected 1)")
-    if Int(r.u32()) != 44:
+    var version = Int(r.u32())
+    if version != 1 and version != 2:
+        raise Error(path + ": unknown trie blob version (expected 1 or 2)")
+    var header_bytes = Int(r.u32())
+    if version == 1 and header_bytes != 44:
         raise Error(path + ": unexpected header size (expected 44)")
+    if version == 2 and header_bytes != 68:
+        raise Error(path + ": unexpected v2 header size (expected 68)")
     var block_shift = Int(r.u32())
     var block_index_len = Int(r.u32())
     var block_count = Int(r.u32())
@@ -210,6 +214,19 @@ def load_trie_blob(path: String) raises -> Trie:
     var _primary_upem = r.u32()  # informational
     var _em_height_fu = r.u32()  # informational — the conversion denominator
     var _cell_height_world = r.f32()  # informational — the world cell height
+    # v2 header words: the sequence pass's section descriptors.
+    var seq_count = 0
+    var seq_max = 0
+    var seq_words = 0
+    var class_words = 0
+    if version == 2:
+        var _bitmap_advance = r.f32()  # the cluster head's advance — phase C reads it
+        seq_count = Int(r.u32())
+        seq_max = Int(r.u32())
+        _ = r.u32()  # seqOff — the sections are appended in order; the offset is a cross-check
+        _ = r.u32()  # classOff — same
+        class_words = Int(r.u32())
+        seq_words = seq_count * (2 + seq_max)
 
     var block_index = List[UInt32](capacity=block_index_len)
     for _ in range(block_index_len):
@@ -226,7 +243,15 @@ def load_trie_blob(path: String) raises -> Trie:
         blocks_m.append(h)
         blocks_c.append(gid)
         blocks_c.append(fl)
-    return Trie(block_index^, blocks_m^, blocks_c^)
+    # v2 sections, carried verbatim. v1 leaves them empty, and empty reads as
+    # "no sequences" downstream — exactly the leader behavior.
+    var seq = List[UInt32](capacity=seq_words)
+    for _ in range(seq_words):
+        seq.append(r.u32())
+    var classes = List[UInt32](capacity=class_words)
+    for _ in range(class_words):
+        classes.append(r.u32())
+    return Trie(block_index^, blocks_m^, blocks_c^, seq^, classes^)
 
 
 def load_trie_auto(path: String) raises -> Trie:

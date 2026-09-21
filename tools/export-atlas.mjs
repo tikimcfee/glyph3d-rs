@@ -307,6 +307,7 @@ const seqCount = sheet[22], seqMax = sheet[23];
 const seqStride = 2 + seqMax;
 const seqTableOff = SHEET_HEADER_WORDS + sheetCells * SHEET_CELL_STRIDE + sheetCps * SHEET_CP_STRIDE;
 const seqSlotBase = slotMeta.length;
+const seqEntries = [];   // [codepoints array, slot] — the codepoints.bin v2 section's rows
 for (let i = 0; i < seqCount; i++) {
     const o = seqTableOff + i * seqStride;
     const len = sheet[o], gid = sheet[o + 1];
@@ -314,10 +315,11 @@ for (let i = 0; i < seqCount; i++) {
     const cell = cellIndexOfGlyph.get(gid);
     if (cell === undefined) throw new Error(`sequence ${i} targets glyph ${gid}, which has no cell`);
     const cps = [];
-    for (let k = 0; k < len; k++) cps.push(sheet[o + 2 + k].toString(16).toUpperCase());
+    for (let k = 0; k < len; k++) cps.push(sheet[o + 2 + k]);
+    seqEntries.push([cps, seqSlotBase + i]);
     slotMeta.push({
         fontIdx: FONTIDX_BITMAP, gid: 0,
-        name: `<emoji seq ${cps.join('.')}>`,
+        name: `<emoji seq ${cps.map((c) => c.toString(16).toUpperCase()).join('.')}>`,
         advanceFu: 0, asc: 0, desc: 0, flags: SLOT_FLAG_BITMAP, emojiCell: cell,
         curveStart: 0, curveCount: 0, bbox: [0, 0, 0, 0],
     });
@@ -464,11 +466,56 @@ writeU32('glyphmap.bin',
         fontRecs, slotRecs, nameOffsets, namesWords);
 }
 
-// codepoints.bin — blockIndex + blocks.
-writeU32('codepoints.bin',
-    header(M('G3CP'), 1, [BLOCK_SHIFT, BLOCK_INDEX_LENGTH, built.length, ENTRY_STRIDE, mapped,
-        primaryAdvanceFu, primaryEmHeightFu, primaryUpem]),
-    blockIndex, blocks);
+// codepoints.bin — v2: the v1 trie PLUS the two sections the sequence pass
+// reads. Header grows 44 -> 68 B (words 11..16 below); the blockIndex/blocks
+// layout is unchanged. The two sections are pure u32 data, byte-identical to
+// what gen_real_trie.py re-containers into engine-trie.bin (G3TR v2):
+//   sequence section: sequenceCount x (2 + seqMax) words, [slot, len, cps..],
+//                     sorted by the codepoint sequence (the sheet's own order,
+//                     asserted below) so readers binary-search it.
+//   class section:    cluster-classes.bin VERBATIM (its own 'G3CC' header
+//                     included — self-describing, and byte-equality against the
+//                     committed artifact is the provenance proof).
+{
+    const classRaw = readFileSync(join(HERE, '..', 'assets', 'atlas', 'cluster-classes.bin'));
+    if (classRaw.length % 4) throw new Error('cluster-classes.bin is not a u32 array');
+    const classWords = new Uint32Array(classRaw.buffer.slice(classRaw.byteOffset, classRaw.byteOffset + classRaw.byteLength));
+    if (classWords[0] !== M('G3CC')) throw new Error('cluster-classes.bin: bad magic');
+
+    // the sheet's sequence table is the sort source — verify it IS sorted
+    const seqLt = (a, b) => {
+        for (let k = 0; k < Math.min(a.length, b.length); k++) {
+            if (a[k] !== b[k]) return a[k] < b[k];
+        }
+        return a.length < b.length;
+    };
+    for (let i = 1; i < seqEntries.length; i++) {
+        if (!seqLt(seqEntries[i - 1][0], seqEntries[i][0])) {
+            throw new Error(`sequence table not sorted at row ${i} — the sheet's order changed`);
+        }
+    }
+    const seqStride2 = 2 + seqMax;
+    const seqSection = new Uint32Array(seqEntries.length * seqStride2);
+    seqEntries.forEach(([cps, slot], i) => {
+        const o = i * seqStride2;
+        seqSection[o] = slot;
+        seqSection[o + 1] = cps.length;
+        cps.forEach((cp, k) => { seqSection[o + 2 + k] = cp; });
+    });
+    const seqOff = 17 + blockIndex.length + blocks.length;
+    const classOff = seqOff + seqSection.length;
+    const hdr2 = new Uint32Array(17);
+    hdr2[0] = M('G3CP'); hdr2[1] = 2; hdr2[2] = 68;
+    hdr2.set([BLOCK_SHIFT, BLOCK_INDEX_LENGTH, built.length, ENTRY_STRIDE, mapped,
+        primaryAdvanceFu, primaryEmHeightFu, primaryUpem], 3);
+    hdr2[11] = primaryAdvanceForBitmap;   // the cluster head's advance, fu
+    hdr2[12] = seqEntries.length;
+    hdr2[13] = seqMax;
+    hdr2[14] = seqOff;
+    hdr2[15] = classOff;
+    hdr2[16] = classWords.length;
+    writeU32('codepoints.bin', hdr2, blockIndex, blocks, seqSection, classWords);
+}
 
 // ── step 7: export summary (for the report) ──────────────────────────────────
 

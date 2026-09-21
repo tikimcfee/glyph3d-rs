@@ -66,7 +66,7 @@ struct EngineState(Movable):
     var stage_ns: List[Int]
 
     def __init__(out self):
-        self.trie = Trie(List[UInt32](), List[Float32](), List[UInt32]())
+        self.trie = Trie(List[UInt32](), List[Float32](), List[UInt32](), List[UInt32](), List[UInt32]())
         self.has_trie = False
         self.records = RecordSet()
         self.byte_len = 0

@@ -25,7 +25,7 @@
 # Ratchet, NOT an equality: tests are added constantly, so an exact pin would
 # redden on the most common good action in the repo. A green run whose real
 # count exceeds the floor prints a NOTE naming the value to raise it to.
-test_floor = 111
+test_floor = 113
 
 # ── Products ─────────────────────────────────────────────────────────────
 
@@ -92,13 +92,14 @@ build = "python3 tools/gen_cluster_table.py"
 verify_cmd = "python3 tools/gen_cluster_table.py --check"
 note = "Grapheme-cluster class table, generated from the vendored UCD (never hand-written). The sequence pass's class source; general UAX #29 rides the same table later."
 
-# Regeneration is by hand and ORDERED: emoji-sheet, then atlas (reads the
-# sheet to append the emoji slots), then engine-trie (reads codepoints.bin).
+# Regeneration is by hand and ORDERED: cluster-classes (from the vendored UCD)
+# and emoji-sheet (from the vendored font) first — the atlas reads BOTH — then
+# engine-trie (reads codepoints.bin).
 # `glyph build` verifies these; it does not run the chain.
 [artifact.atlas]
 class = "committed"
 outputs = ["assets/atlas/curves.bin", "assets/atlas/glyphmap.bin", "assets/atlas/glyphs.bin", "assets/atlas/codepoints.bin"]
-inputs = ["tools/export-atlas.mjs", "tools/vendor/ref/**/*", "tools/vendor/hb.cjs", "tools/vendor/hb.wasm", "assets/atlas/emoji-sheet.bin"]
+inputs = ["tools/export-atlas.mjs", "tools/vendor/ref/**/*", "tools/vendor/hb.cjs", "tools/vendor/hb.wasm", "assets/atlas/emoji-sheet.bin", "assets/atlas/cluster-classes.bin"]
 build = "node tools/export-atlas.mjs"
 verify_scratch = "node tools/export-atlas.mjs --out {scratch}"
 note = "No generator-native check mode; the runner rebuilds to scratch and cmps. Self-aborts before writing if fonts/ranges drift. Slots 0..4430 are the web bake verbatim; the emoji slots after them come from emoji-sheet.bin."

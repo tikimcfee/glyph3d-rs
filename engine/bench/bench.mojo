@@ -71,7 +71,7 @@ def load_input() raises -> BenchInput:
         blocks_c.append(w0)
         blocks_c.append(w3)
 
-    return BenchInput(bytes^, Trie(block_index^, blocks_m^, blocks_c^))
+    return BenchInput(bytes^, Trie(block_index^, blocks_m^, blocks_c^, List[UInt32](), List[UInt32]()))
 
 
 def one_item(byte_count: Int, wrap: Int) -> List[Item]:

@@ -158,7 +158,7 @@ Per-slot metrics + the font table + a debug name table.
 | 1 | version | 1 |
 | 2 | headerBytes | 44 |
 | 3 | fontCount | 3 |
-| 4 | slotCount | 5261 |
+| 4 | slotCount | 9427 |
 | 5 | primaryUpem | 2048 (Cousine units-per-em — the layout reference) |
 | 6 | primaryAdvanceFu | 1229 (forced monospace cell advance, primary font units) |
 | 7 | primaryEmHeightFu | 2320 (primary ascender − descender = 1705 + 615) |

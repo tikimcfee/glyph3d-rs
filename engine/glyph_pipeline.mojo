@@ -81,14 +81,25 @@ struct Trie(Copyable, Movable):
     var block_index: List[UInt32]
     var blocks_m: List[Float32]  # TM_STRIDE per entry: ADVANCE, HEIGHT
     var blocks_c: List[UInt32]   # TC_STRIDE per entry: GLYPH_ID, FLAGS
+    # The sequence pass (v2 trie blobs): the sequence section's raw words
+    # ([slot, len, cps..] x sequenceCount, sorted by sequence) and the G3CC
+    # class table VERBATIM (its own header included). Empty for v1 blobs and
+    # every fixture trie — cluster resolution treats empty as "no sequences",
+    # which is exactly the leader behavior. The lookup logic lives in
+    # glyph_cluster.mojo; these are just the carried bytes.
+    var seq: List[UInt32]
+    var classes: List[UInt32]
 
     def __init__(
         out self, var block_index: List[UInt32],
         var blocks_m: List[Float32], var blocks_c: List[UInt32],
+        var seq: List[UInt32], var classes: List[UInt32],
     ):
         self.block_index = block_index^
         self.blocks_m = blocks_m^
         self.blocks_c = blocks_c^
+        self.seq = seq^
+        self.classes = classes^
 
     def advance_at(self, entry: Int) -> Float32:
         return self.blocks_m[entry * TM_STRIDE + TM_ADVANCE]
