@@ -305,7 +305,12 @@ fn build_scene_impl(
                 copies,
                 staged.missing_or_bitmap,
             );
-            glyph(GlyphScene::new(ctx, color_format, &atlas, staged, camera_mode, cull))
+            let mut scene = GlyphScene::new(ctx, color_format, &atlas, staged, camera_mode, cull);
+            // No pick context on this path, so the panel's cluster toggle
+            // seeds from the choice directly — hand it the mode the scene
+            // was staged with.
+            scene.set_probe_cluster_mode(matches!(cluster_mode, fold::ClusterMode::Cluster));
+            glyph(scene)
         }
         SceneChoice::EngineText { file, trie, emoji_sheet } => {
             let atlas = atlas::Atlas::load(ctx, emoji_sheet);

@@ -436,7 +436,7 @@ impl WindowState {
                         self.cluster_selftest = 2;
                     }
                     None => {
-                        println!("CLUSTER-SELFTEST: no repo scene (no toggle) — skipping");
+                        println!("CLUSTER-SELFTEST: scene carries no cluster mode (no toggle) — skipping");
                         self.cluster_selftest = 0;
                     }
                 }
@@ -646,19 +646,28 @@ impl WindowState {
                                         toggle_cluster: false,
                                     });
                                 }
-                                // The sequence pass toggle — the same rebuild
-                                // arm as the dial. Reads the mode off the
-                                // probe, seeded from the scene's ItemParams.
-                                if let Some(on) = snap.cluster_mode {
-                                    if ui
-                                        .button(if on { "cluster mode: ON" } else { "cluster mode: off" })
-                                        .clicked()
-                                    {
-                                        *pending_relayout = Some(RelayoutRequest {
-                                            z_wrap_spacing: None,
-                                            toggle_cluster: true,
-                                        });
-                                    }
+                            }
+                        }
+                        // The sequence pass toggle — repo AND text scenes
+                        // (text scenes seed the probe from the staging
+                        // choice, no pick context needed). The same rebuild
+                        // arm as the dial: a discrete refold per click,
+                        // never a per-tick write.
+                        if let Some(snap) = &probe_snap {
+                            if let Some(on) = snap.cluster_mode {
+                                ui.separator();
+                                ui.label(
+                                    "sequence pass — click toggles; the scene rebuilds, \
+                                     pick/selection state resets:",
+                                );
+                                if ui
+                                    .button(if on { "cluster mode: ON" } else { "cluster mode: off" })
+                                    .clicked()
+                                {
+                                    *pending_relayout = Some(RelayoutRequest {
+                                        z_wrap_spacing: None,
+                                        toggle_cluster: true,
+                                    });
                                 }
                             }
                         }
@@ -936,18 +945,21 @@ impl WindowState {
     }
 }
 
-/// The layout dial's apply: re-run the whole repo load with the new params
-/// and swap the scene in place. Correct by construction — the one true
-/// layout path rebuilds everything the pitch touches (cull AABBs, per-file
-/// pick params, bounds) — at the cost of a full reload per apply, which is
-/// why the panel fires on release, not per tick. The camera pose survives
-/// via the old probe's last frame; pick/selection/grab state resets with
-/// the scene (a fresh load has none — same as the JS `grid.layout` refold).
+/// The relayout arm: mutate the scene choice's layout params, then swap the
+/// scene in place — rebuilt through the same builder startup used, so it is
+/// correct by construction (the one true layout path rebuilds everything the
+/// params touch: cull AABBs, per-file pick params, bounds) at the cost of a
+/// full reload per apply, which is why the panel fires on release/click, not
+/// per tick. The camera pose survives via the old probe's last frame;
+/// pick/selection/grab state resets with the scene (a fresh load has none —
+/// same as the JS `grid.layout` refold). Repo scenes carry the z dial and
+/// the cluster toggle; text scenes carry the toggle only; anything else has
+/// no layout params and a stale signal is a no-op.
 /// A free function, not an App method: the caller already holds
 /// `state: &mut WindowState` borrowed from `self.state`, so `&mut self`
 /// would double-borrow.
 #[cfg(feature = "egui-ui")]
-fn rebuild_repo_scene(
+fn apply_relayout(
     ctx: &GpuContext,
     choice: &mut SceneChoice,
     cull: bool,
@@ -955,26 +967,37 @@ fn rebuild_repo_scene(
     state: &mut WindowState,
     req: RelayoutRequest,
 ) {
-    let SceneChoice::Repo { z_wrap_spacing, cluster_mode, .. } = choice else {
-        // The dial only exists on repo scenes; a stale signal is a no-op.
-        return;
-    };
     let mut changed = false;
     let mut note = String::new();
-    if let Some(new_z) = req.z_wrap_spacing {
-        if z_wrap_spacing.to_bits() != new_z.to_bits() {
-            *z_wrap_spacing = new_z;
-            changed = true;
-            note += &format!("z_wrap_spacing -> {new_z} ");
+    // The z dial exists on repo scenes only.
+    if let SceneChoice::Repo { z_wrap_spacing, .. } = choice {
+        if let Some(new_z) = req.z_wrap_spacing {
+            if z_wrap_spacing.to_bits() != new_z.to_bits() {
+                *z_wrap_spacing = new_z;
+                changed = true;
+                note += &format!("z_wrap_spacing -> {new_z} ");
+            }
         }
     }
+    // The cluster toggle rides any scene whose choice carries the mode —
+    // repo and text alike (SceneChoice::Text has carried it since the pass
+    // landed; the panel seed for text scenes is GlyphScene's
+    // probe_cluster_mode).
     if req.toggle_cluster {
-        *cluster_mode = match *cluster_mode {
-            crate::fold::ClusterMode::Leader => crate::fold::ClusterMode::Cluster,
-            crate::fold::ClusterMode::Cluster => crate::fold::ClusterMode::Leader,
+        let mode = match choice {
+            SceneChoice::Repo { cluster_mode, .. } | SceneChoice::Text { cluster_mode, .. } => {
+                Some(cluster_mode)
+            }
+            _ => None,
         };
-        changed = true;
-        note += &format!("cluster_mode -> {cluster_mode:?} ");
+        if let Some(mode) = mode {
+            *mode = match *mode {
+                crate::fold::ClusterMode::Leader => crate::fold::ClusterMode::Cluster,
+                crate::fold::ClusterMode::Cluster => crate::fold::ClusterMode::Leader,
+            };
+            changed = true;
+            note += &format!("cluster_mode -> {mode:?} ");
+        }
     }
     if !changed {
         return; // a release without a move (a click, a typed repeat) rebuilds nothing
@@ -1254,12 +1277,13 @@ impl ApplicationHandler for App<'_> {
             }
             WindowEvent::RedrawRequested => {
                 state.render(&self.ctx);
-                // The layout dial applies BETWEEN frames: the panel set
-                // pending_relayout on slider release during this render;
-                // rebuild now so the next render presents the new params.
+                // The layout controls apply BETWEEN frames: the panel set
+                // pending_relayout on slider release / toggle click during
+                // this render; rebuild now so the next render presents the
+                // new params.
                 #[cfg(feature = "egui-ui")]
                 if let Some(req) = state.pending_relayout.take() {
-                    rebuild_repo_scene(&self.ctx, &mut self.choice, self.cull, self.ui, state, req);
+                    apply_relayout(&self.ctx, &mut self.choice, self.cull, self.ui, state, req);
                 }
             }
             // Stage K (K6): F2 = capture the next presented frame to PNG.

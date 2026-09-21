@@ -68,7 +68,10 @@ defect, named at the fix.
   them for their named reasons.
 - The Debug panel's cluster toggle rides the scene-rebuild arm;
   `GLYPH_CLUSTER_SELFTEST=1` drives it headlessly (instance count drops as
-  trailers leave the arena: 359 → 345 on the fixture repo).
+  trailers leave the arena: 359 → 345 on the fixture repo, 893 → 801 on
+  `fixtures/emoji-corpus-small.txt`). Repo scenes at landing; text scenes
+  joined when the demo corpus wanted the toggle there — the probe seeds from
+  the staging choice when the scene has no pick context.
 - The `z_wrap_spacing` Debug-panel dial and its `GLYPH_ZSPACE_SELFTEST=1` hook
   landed in the same sitting (0.15 → 0.30 doubles the field's z extent,
   instance count unchanged at 407,133).
