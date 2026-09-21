@@ -500,7 +500,7 @@ pub(crate) fn decode_and_resolve<T: ResolveGlyph + ?Sized>(
 /// The invisible-by-design ranges: the ZERO WIDTH JOINER, the variation
 /// selectors, the tag characters. Under cluster mode they never occupy a cell
 /// — a sequence match claims them as trailers first.
-fn is_static_zero_cp(cp: u32) -> bool {
+pub(crate) fn is_static_zero_cp(cp: u32) -> bool {
     cp == 0x200D || (0xFE00..=0xFE0F).contains(&cp) || (0xE0020..=0xE007F).contains(&cp)
 }
 
