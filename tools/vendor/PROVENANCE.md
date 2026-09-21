@@ -55,7 +55,7 @@ is that check.
 | `engine/fixtures/inputs/foldGeometry.js` | `packages/glyph3d-core/src/core/foldGeometry.js` | 14806 | `c925c6d2c8036f2b…` | yes |
 | `engine/fixtures/inputs/glyphBake.js` | `packages/glyph3d-core/src/compute/glyphBake.js` | 11761 | `5ba631bdbd6ed5e5…` | MISMATCH |
 | `engine/fixtures/inputs/glyphPipelineKernels.js` | `packages/glyph3d-core/src/compute/glyphPipelineKernels.js` | 90515 | `c785a572091d2f37…` | MISMATCH |
-| `engine/fixtures/inputs/glyphPipelineReference.js` | `packages/glyph3d-core/src/compute/glyphPipelineReference.js` | 44125 | `02ca437b084c3e8a…` | MISMATCH |
+| `engine/fixtures/inputs/glyphPipelineReference.js` | `packages/glyph3d-core/src/compute/glyphPipelineReference.js` | 51879 | `dd2bc84bfc3cd1be…` | MISMATCH |
 | `engine/fixtures/inputs/glyphPipelineScan.js` | `packages/glyph3d-core/src/compute/glyphPipelineScan.js` | 15254 | `4b83b7447b66695e…` | MISMATCH |
 | `schema/glyph-identity.json` | `schema/glyph-identity.json` | 19158 | `b4b838430677b383…` | MISMATCH |
 | `tools/vendor/ref/app/public/slug-core/slug-core.1tstke3lync.bin` | `app/public/slug-core/slug-core.1tstke3lync.bin` | 609569 | `647ccdaba087de1f…` | yes |

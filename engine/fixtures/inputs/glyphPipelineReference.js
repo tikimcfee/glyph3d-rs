@@ -295,6 +295,20 @@ export function sequenceLength(bytes, i) {
 const at = (bytes, i) => (i >= 0 && i < bytes.length ? bytes[i] : 0);
 
 /**
+ * Decode the codepoint whose UTF-8 sequence starts at `id` (caller established
+ * n = sequenceLength > 0). Shared by decodeAndResolve and the sequence pass's
+ * re-derivation — one place where the lead-byte math lives.
+ */
+export function codepointAt(bytes, id, n) {
+    const b0 = at(bytes, id);
+    if (n === 1) return b0;                      // ASCII fast path: no further loads
+    const b1 = at(bytes, id + 1), b2 = at(bytes, id + 2), b3 = at(bytes, id + 3);
+    if (n === 2) return ((b0 & 0x1F) << 6) | (b1 & 0x3F);
+    if (n === 3) return ((b0 & 0x0F) << 12) | ((b1 & 0x3F) << 6) | (b2 & 0x3F);
+    return ((b0 & 0x07) << 18) | ((b1 & 0x3F) << 12) | ((b2 & 0x3F) << 6) | (b3 & 0x3F);
+}
+
+/**
  * KERNEL 1 — thread per byte. Decode the codepoint and resolve it through the trie.
  *
  * The decode is pure arithmetic on up to four bytes: no table, no lookup, no dependency
@@ -321,12 +335,7 @@ export function decodeAndResolve(bytes, slots, trie, id, misses) {
         return;
     }
 
-    const b0 = at(bytes, id), b1 = at(bytes, id + 1), b2 = at(bytes, id + 2), b3 = at(bytes, id + 3);
-    let cp;
-    if (n === 1) cp = b0;
-    else if (n === 2) cp = ((b0 & 0x1F) << 6) | (b1 & 0x3F);
-    else if (n === 3) cp = ((b0 & 0x0F) << 12) | ((b1 & 0x3F) << 6) | (b2 & 0x3F);
-    else cp = ((b0 & 0x07) << 18) | ((b1 & 0x3F) << 12) | ((b2 & 0x3F) << 6) | (b3 & 0x3F);
+    const cp = codepointAt(bytes, id, n);
 
     const g = trieLookup(trie, cp);
     const o = id * SLOT_STRIDE;
@@ -440,6 +449,150 @@ export function wrapSegmentOf(col, wrap, terminator) {
 export function wrapRowOf(col, wrap, terminator, mode = WRAP_DOWN) {
     if (mode === WRAP_BACK) return 0;
     return wrapSegmentOf(col, wrap, terminator);
+}
+
+/**
+ * THE CLUSTER MODES — an ITEM-LEVEL parameter, exactly like wrapMode.
+ *
+ *   CLUSTER_LEADER (0)  one glyph per UTF-8 leader byte — the behavior the whole
+ *                       corpus pins.
+ *   CLUSTER_CLUSTER (1) the sequence pass: a codepoint sequence the font draws as
+ *                       ONE glyph (ZWJ families, RI flags, skin tones, keycaps,
+ *                       tag flags) resolves to its single sequence slot; the
+ *                       sequence's trailing leaders become zero-advance trailers
+ *                       (glyph 0, advance 0 — the blank-drop mechanism), and the
+ *                       invisible-by-design characters (ZWJ, the variation
+ *                       selectors, the tag characters) never occupy a cell.
+ *
+ * ROW/COL DO NOT MOVE: col still counts leaders in both modes and a trailer keeps
+ * its record, so the pick cross-check and the ordinal/witness machinery are
+ * untouched. What moves is the static tier: glyph id and advance — the fold reads
+ * them as it always did, and a zero advance is an exact no-op in its f32 sums
+ * (adding 0.0 cannot re-round).
+ *
+ * The rule needs no class table for this increment: a head candidate is any
+ * codepoint SOME sequence starts with (the table's first-member set), and
+ * resolution is a longest-prefix match against the table. RI pairs need no parity
+ * state — the serial skip-past pairs them greedily from the left, which is exactly
+ * GB12/GB13. (General UAX #29 clustering — combining marks, Hangul, Indic — is a
+ * later phase riding the vendored class table; this is the sequence half.)
+ */
+export const CLUSTER_LEADER = 0;
+export const CLUSTER_CLUSTER = 1;
+
+/** A sequence trailer: no glyph, no advance — the blank-drop mechanism re-used. */
+export const F_CLUSTER_TRAILER = 16;
+
+/**
+ * Refuse an unknown mode at the boundary rather than treating it as leader —
+ * an out-of-range mode is malformed input; silently folding it to the default
+ * is how a caller's typo becomes an invisible layout (normalizeWrapMode's rule).
+ */
+export function normalizeClusterMode(v, where = 'item') {
+    const m = Math.trunc(v || 0);
+    if (m !== CLUSTER_LEADER && m !== CLUSTER_CLUSTER) {
+        throw new Error(`${where}: clusterMode must be 0 (leader) or 1 (cluster), got ${v}`);
+    }
+    return m;
+}
+
+/**
+ * The invisible-by-design ranges: the ZERO WIDTH JOINER, the variation
+ * selectors, and the tag characters. Under CLUSTER they never occupy a cell —
+ * a sequence match claims them as trailers first; unmatched, they are zero
+ * width rather than a blank cell at full advance.
+ */
+export function isStaticZeroCp(cp) {
+    return cp === 0x200D || (cp >= 0xFE00 && cp <= 0xFE0F) || (cp >= 0xE0020 && cp <= 0xE007F);
+}
+
+/**
+ * KERNEL — the sequence pass, per item, between decode and the fold. Reads
+ * BYTES (re-deriving codepoints with the same helper decode uses) and writes
+ * ONLY the static lanes (glyph id / advance / the trailer flag) — row/col and
+ * positions belong to the fold, unchanged.
+ *
+ * `trie.seq` is the flat v2 section ([slot, len, cps…] x sequenceCount) and
+ * `trie.bitmapAdvance` the head's advance (the bitmap 2x cell). v1 tries carry
+ * neither — the early return keeps leader behavior by construction.
+ */
+export function resolveClusters(bytes, slots, byteStart, byteCount, trie) {
+    const seq = trie.seq;
+    if (!seq || seq.length === 0) return;
+    const seqMax = trie.seqMax;
+    const stride = 2 + seqMax;
+    const bitmapAdvance = trie.bitmapAdvance;
+    const stop = byteStart + byteCount;
+    // Instant rejection: a codepoint no sequence starts with is never a head.
+    const firstMembers = new Set();
+    for (let i = 0; i < seq.length; i += stride) firstMembers.add(seq[i + 2]);
+
+    let id = byteStart;
+    while (id < stop) {
+        const n = sequenceLength(bytes, id);
+        if (n === 0) { id++; continue; }
+        const cp = codepointAt(bytes, id, n);
+        const o = id * SLOT_STRIDE;
+        if (isStaticZeroCp(cp)) {
+            slots[o + S_GLYPH_ID] = 0;
+            slots[o + S_ADVANCE] = fbits(0);
+            slots[o + S_FLAGS] |= F_CLUSTER_TRAILER;
+            id += n;
+            continue;
+        }
+        if (firstMembers.has(cp)) {
+            // Build the probe: up to seqMax EFFECTIVE codepoints, with VS16
+            // dropped from the key (the font's GSUB strips it; real text
+            // carries it) but riding along as span members. A newline or a
+            // continuation byte ends the candidate; VS15 breaks it (it asks
+            // for text presentation, so honoring the break is what lets text
+            // presentation stay text).
+            const members = [id];
+            const key = [cp];
+            let p = id + n;
+            while (p < stop && key.length < seqMax) {
+                const n2 = sequenceLength(bytes, p);
+                if (n2 === 0) break;
+                const cp2 = codepointAt(bytes, p, n2);
+                if (cp2 === NEWLINE || cp2 === 0xFE0E) break;
+                members.push(p);
+                if (cp2 !== 0xFE0F) key.push(cp2);
+                p += n2;
+            }
+            // The longest table prefix of the key wins.
+            let bestLen = 0, bestSlot = 0;
+            for (let i = 0; i < seq.length; i += stride) {
+                const len = seq[i + 1];
+                if (len < 2 || len > key.length || len <= bestLen) continue;
+                let match = true;
+                for (let k = 0; k < len; k++) {
+                    if (seq[i + 2 + k] !== key[k]) { match = false; break; }
+                }
+                if (match) { bestLen = len; bestSlot = seq[i]; }
+            }
+            if (bestLen > 0) {
+                // The span runs through the leader that contributed the key's
+                // last matched member — count key-consumers, not members, so
+                // the skipped VS16s stay inside the trailer span.
+                let spanMembers = 0, need = bestLen;
+                while (need > 0) {
+                    if (codepointAt(bytes, members[spanMembers], sequenceLength(bytes, members[spanMembers])) !== 0xFE0F) need--;
+                    spanMembers++;
+                }
+                slots[o + S_GLYPH_ID] = bestSlot;
+                slots[o + S_ADVANCE] = fbits(bitmapAdvance);
+                for (let k = 1; k < spanMembers; k++) {
+                    const to = members[k] * SLOT_STRIDE;
+                    slots[to + S_GLYPH_ID] = 0;
+                    slots[to + S_ADVANCE] = fbits(0);
+                    slots[to + S_FLAGS] |= F_CLUSTER_TRAILER;
+                }
+                id = members[spanMembers - 1] + sequenceLength(bytes, members[spanMembers - 1]);
+                continue;
+            }
+        }
+        id += n;
+    }
 }
 
 /**
@@ -722,6 +875,7 @@ export function runPipeline(bytes, trie, opts = {}) {
     const resolved = items.map((it, i) => ({
         wrapWidth: it.wrapWidth ?? opts.wrapWidth ?? 0,
         wrapMode: normalizeWrapMode(it.wrapMode ?? opts.wrapMode ?? 0, `item ${i}`),
+        clusterMode: normalizeClusterMode(it.clusterMode ?? opts.clusterMode ?? 0, `item ${i}`),
         zStep: it.zStep ?? opts.zStep ?? 0,
         lineHeight: it.lineHeight ?? opts.lineHeight,
     }));
@@ -729,6 +883,16 @@ export function runPipeline(bytes, trie, opts = {}) {
     // Not inside layoutItem/resolveX: those run per byte, and a per-glyph check would pay
     // for the whole corpus to state something true of the item.
     resolved.forEach((r, i) => { r.lineHeight = assertLineHeight(r.lineHeight, i); });
+
+    // ── THE SEQUENCE PASS: per item, between decode and the fold, so the
+    //    trailer lanes are rewritten before any advance sum reads them. Reads
+    //    bytes, writes only the static tier. Leader mode (the default) never
+    //    calls it, which is what keeps the existing corpus byte-identical.
+    for (let i = 0; i < items.length; i++) {
+        if (resolved[i].clusterMode === CLUSTER_CLUSTER) {
+            resolveClusters(bytes, slots, items[i].byteStart, items[i].byteCount, trie);
+        }
+    }
 
     // ── THE FOLD: one forward pass per item writes every lane, with the item's
     //    fold-scalar reduce riding along.
