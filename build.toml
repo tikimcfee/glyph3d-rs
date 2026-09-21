@@ -147,6 +147,8 @@ outputs = [
   "out/tooling-ab/baseline/{gpu}/repo-down.png",
   "out/tooling-ab/baseline/{gpu}/repo-back-oblique.png",
   "out/tooling-ab/baseline/{gpu}/emoji.png",
+  "out/tooling-ab/baseline/{gpu}/emoji-cluster.png",
+  "out/tooling-ab/baseline/{gpu}/repo-cluster.png",
 ]
 inputs = ["target/release/glyph3d-native", "native/fixtures/baseline-view.txt", "native/fixtures/emoji-view.txt", "native/fixtures/g-pick-repo/**/*", "assets/atlas/emoji-sheet.bin"]
 note = "Blind to everything outside these frames, and cannot distinguish a regression from an intentional change. One set per rasterizer ({gpu}); a set only ever proves the renderer on the hardware that made it. empty.rs in g-pick-repo is zero bytes ON PURPOSE (the only input reaching the page-extent origin seed)."
@@ -191,6 +193,20 @@ cmd = "--load-repo fixtures/g-pick-repo --frames 2 --cam-pose 30 -120 60 0 -12"
 [[golden_view]]
 name = "emoji"
 cmd = "--render-file fixtures/emoji-view.txt --frames 2 --zoom 1.25"
+# The sequence pass, on the CPU staging path: cluster-mode rendering of every
+# sequence class the trie resolves (families, flags, skin tones, keycaps, tag
+# flags) plus the fallbacks (pieces for unlisted chains, zero-width ZWJ). Its
+# leader twin is emoji.png, which KEEPS pinning leader mode — the fixture is
+# immutable and the mode flag in its cmd is what makes the split explicit at
+# the flip, whenever that comes.
+[[golden_view]]
+name = "emoji-cluster"
+cmd = "--render-file fixtures/emoji-cluster-view.txt --frames 2 --zoom 1.25 --cluster-mode cluster"
+# The engine path twin: a tiny repo whose files carry the same classes through
+# --load-repo (the FFI + engine resolve them end to end).
+[[golden_view]]
+name = "repo-cluster"
+cmd = "--load-repo fixtures/g-cluster-repo --frames 2 --cluster-mode cluster"
 
 # ── Gates ────────────────────────────────────────────────────────────────
 # `scope` answers "I changed X, what should I run" — the question the CLI is

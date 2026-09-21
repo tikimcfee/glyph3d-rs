@@ -1,0 +1,10 @@
+# cluster view — one line per class of SEQUENCE the trie resolves.
+# The leader-mode twin of this classing is emoji-view.txt (immutable).
+family: 👨‍👩‍👧 👨‍👩‍👧‍👦
+flag: 🇦🇨 🇨🇦 🇯🇵 not-a-flag-pair: 🇦🇦
+skin: 👍🏽 👋🏿 lone-modifier: 🏽
+keycap: 1️⃣ #️⃣ 0️⃣ bare: 1⃣
+tag flag (england): 🏴󠁧󠁢󠁥󠁮󠁧󠁿
+zwj with no font sequence: 🚀‍🌍 (pieces, ZWJ zero-width)
+lone zwj and VS16: a‍b a️b
+text and code beside them: fn main() { let x = 1; }
