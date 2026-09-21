@@ -88,6 +88,11 @@ pub struct TrieTable {
     // Read by the sequence pass (phase D); exercised by trie_v2_tests today.
     #[allow(dead_code)]
     pub classes: Vec<u32>,
+    /// The table's first members as a set — the probe's cheap rejection. Built
+    /// once at load from the sequence section itself.
+    // Same phase-D story as `sequences`.
+    #[allow(dead_code)]
+    seq_first: std::collections::HashSet<u32>,
 }
 
 impl TrieTable {
@@ -148,6 +153,11 @@ impl TrieTable {
         let block_index = cp[header_words..header_words + block_index_len].to_vec();
         let block_words = block_count * (1usize << block_shift) * entry_stride as usize;
         let blocks = cp[header_words + block_index_len..header_words + block_index_len + block_words].to_vec();
+        // The probe's rejection set: the sequence table's own first members.
+        let seq_first = sequences
+            .chunks_exact(2 + seq_max as usize)
+            .map(|e| e[2])
+            .collect();
         let t = Self {
             metrics,
             block_shift,
@@ -161,6 +171,7 @@ impl TrieTable {
             sequences,
             seq_max,
             classes,
+            seq_first,
         };
         // Sanity: 'A' must resolve to slot 34 / advance 1229 (FORMAT.md worked example).
         let a = t.lookup(0x41);
@@ -239,6 +250,17 @@ impl TrieTable {
         } else {
             None
         }
+    }
+
+    /// Whether this codepoint starts any sequence in the v2 table — the head
+    /// candidacy test the probe runs before paying for a lookup. The set is
+    /// derived from the table's own first members at load, so it can never
+    /// drift from it.
+    // The sequence pass's probe calls this (stage_file's cluster path);
+    // exercised by trie_v2_tests today.
+    #[allow(dead_code)]
+    pub fn starts_a_sequence(&self, cp: u32) -> bool {
+        self.seq_first.contains(&cp)
     }
 
     /// Codepoint → class bits (the G3CC table embedded in the v2 class

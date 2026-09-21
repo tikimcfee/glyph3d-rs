@@ -12,6 +12,13 @@ This is an INDEPENDENT oracle — it must state the rule itself rather than
 call into the engine, which is the whole reason gate 7 is worth running. It
 is not, however, licensed to state a DIFFERENT rule: the 2026-09-04
 phantom-row correction is transcribed here deliberately.
+
+CLUSTER MODE (2026-09-20): deliberately NOT implemented here. The sequence
+pass moves glyph ids and advances, never ROW/COL — col still counts leaders
+and a trailer keeps its record — so this oracle's answers are identical in
+both modes by construction. What a pixel through a cluster cell resolves to
+(the head's char) is covered by the renderer's pick probes in
+check-pick-oracle.sh, not by this file.
 """
 import sys
 

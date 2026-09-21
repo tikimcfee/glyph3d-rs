@@ -105,7 +105,16 @@ fn is_word_char(ch: char) -> bool {
 /// Stage a UTF-8 text file, tiled `copies` times (each copy its own group,
 /// offset in a grid of blocks — exercises the group table and is the stress
 /// path toward ≥1M instances).
-pub fn stage_file(atlas: &Atlas, path: &Path, copies: u32) -> StagedText {
+///
+/// `cluster_mode` selects the sequence pass on the char stream (the engine's
+/// glyph_cluster.mojo is the same rule over the same table). Leader (the
+/// default) stages one cell per codepoint, as this path always has.
+pub fn stage_file(
+    atlas: &Atlas,
+    path: &Path,
+    copies: u32,
+    cluster_mode: crate::fold::ClusterMode,
+) -> StagedText {
     let text = std::fs::read_to_string(path)
         .unwrap_or_else(|e| panic!("failed to read text file {}: {e}", path.display()));
 
@@ -160,7 +169,81 @@ pub fn stage_file(atlas: &Atlas, path: &Path, copies: u32) -> StagedText {
         advance_cells.max(1)
     };
 
-    for ch in text.chars() {
+    let chars: Vec<char> = text.chars().collect();
+    let mut ci = 0usize;
+    while ci < chars.len() {
+        let ch = chars[ci];
+        // THE SEQUENCE PASS, on the char stream (cluster mode only): a leader
+        // that starts a table sequence resolves to its one slot — the same
+        // longest-prefix rule as the engine's, over the same table (the
+        // engine's is glyph_cluster.mojo; the oracle's is resolveClusters).
+        if cluster_mode == crate::fold::ClusterMode::Cluster {
+            let cp = ch as u32;
+            if crate::fold::is_static_zero_cp(cp) {
+                // ZWJ / variation selectors / tag characters never occupy a cell.
+                prev = ch;
+                ci += 1;
+                continue;
+            }
+            if atlas.trie.starts_a_sequence(cp) {
+                // Probe forward: up to seq_max effective members, VS16 dropped
+                // from the key (the font's GSUB strips it) but riding the span.
+                let mut key = vec![cp];
+                let mut span = 1usize;
+                while ci + span < chars.len() && key.len() < atlas.trie.seq_max as usize {
+                    let c2 = chars[ci + span] as u32;
+                    if c2 == 0x0A || c2 == 0xFE0E {
+                        break;
+                    }
+                    if c2 != 0xFE0F {
+                        key.push(c2);
+                    }
+                    span += 1;
+                }
+                let mut best = None;
+                for len in (2..=key.len()).rev() {
+                    if let Some(slot) = atlas.trie.sequence_lookup(&key[..len]) {
+                        best = Some((len, slot));
+                        break;
+                    }
+                }
+                if let Some((need, slot)) = best {
+                    // The span runs through the char that gave the key's last
+                    // member — count key-consumers, so skipped VS16s stay inside.
+                    let mut covered = 0usize;
+                    let mut need = need;
+                    while need > 0 {
+                        if (chars[ci + covered] as u32) != 0xFE0F {
+                            need -= 1;
+                        }
+                        covered += 1;
+                    }
+                    // Flush an open word exactly like the word-boundary branch.
+                    if !word.is_empty() {
+                        let wc = word_color(&word);
+                        if wc != palette::DEFAULT {
+                            for g in &mut glyphs[word_start..] {
+                                g.color = wc;
+                            }
+                        }
+                        word.clear();
+                    }
+                    let color = if in_comment {
+                        palette::COMMENT
+                    } else if in_string.is_some() {
+                        palette::STRING
+                    } else {
+                        palette::PUNCT
+                    };
+                    glyphs.push(Cell { col, row, slot, color });
+                    codepoints_decoded += covered;
+                    col += 2; // the bitmap advance, in cells
+                    prev = chars[ci + covered - 1];
+                    ci += covered;
+                    continue;
+                }
+            }
+        }
         if ch == '\n' {
             // Flush any open word as keyword/number/plain.
             if !word.is_empty() {
@@ -178,12 +261,14 @@ pub fn stage_file(atlas: &Atlas, path: &Path, copies: u32) -> StagedText {
             col = 0;
             row += 1;
             prev = ch;
+            ci += 1;
             continue;
         }
         if ch == '\t' {
             word.clear();
             col += TAB_CELLS - (col % TAB_CELLS);
             prev = ch;
+            ci += 1;
             continue;
         }
 
@@ -241,6 +326,7 @@ pub fn stage_file(atlas: &Atlas, path: &Path, copies: u32) -> StagedText {
             &mut missing_or_bitmap,
         );
         prev = ch;
+        ci += 1;
     }
     max_col = max_col.max(col);
 
@@ -376,6 +462,21 @@ impl ResolveGlyph for TrieTable {
             advance: fu_to_world(e.advance_fu, em),
             height: fu_to_world(e.height_fu, em),
             flags: e.flags,
+        }
+    }
+
+    /// The v2 sections, on the real atlas. The advance crosses as a WORLD
+    /// value through the same one-narrowing conversion every measure here
+    /// takes — the bits gen_real_trie.py wrote are reproduced, not re-derived.
+    fn cluster_table(&self) -> Option<(&[u32], u32, f32)> {
+        if self.sequences.is_empty() {
+            None
+        } else {
+            Some((
+                &self.sequences,
+                self.seq_max,
+                fu_to_world(self.bitmap_advance_fu, self.metrics.em_height_fu),
+            ))
         }
     }
 }
