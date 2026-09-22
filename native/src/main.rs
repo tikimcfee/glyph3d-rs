@@ -531,6 +531,13 @@ struct RawOps {
     /// Manipulation verb on the most recent pick (repeatable — see VERBS below)
     #[arg(long, value_name = "V [ARGS]", action = ArgAction::Append, value_parser = parse_verb)]
     verb: Vec<Verb>,
+    /// S3 spike (`experiments/zedspike`): apply a Zed-pipeline highlight
+    /// sidecar — `rel_path<TAB>start<TAB>end<TAB>rrggbb` runs, byte offsets
+    /// into each file — to per-glyph instance colors, interleaved with
+    /// picks/verbs before the first frame. Repo scenes; without the flag,
+    /// rendering is byte-identical.
+    #[arg(long, value_name = "PATH", action = ArgAction::Append)]
+    highlight: Vec<PathBuf>,
 }
 
 /// Stage G: one scripted operation (picks and verbs interleave in CLI order).
@@ -540,6 +547,9 @@ pub enum Op {
     /// Scripted Fly-camera pose: eye + yaw/pitch (RADIANS) — repro of
     /// oblique windowed camera states for --pick-px.
     CamPose([f32; 3], f32, f32),
+    /// S3 spike: apply a Zed-sidecar highlight to instance colors (offscreen,
+    /// before the first frame — same op-stream slot as picks/verbs).
+    Highlight(PathBuf),
 }
 
 /// --pick-row/--pick-col upgrade the most recent --pick-file pick into a
@@ -626,6 +636,7 @@ fn build_ops(matches: &clap::ArgMatches, raw: &RawOps) -> Vec<Op> {
         Px(f32, f32),
         CamPose([f32; 3], f32, f32),
         Verb(Verb),
+        Highlight(PathBuf),
     }
     let indices = |id: &str| -> Vec<usize> {
         matches.indices_of(id).map(Iterator::collect).unwrap_or_default()
@@ -653,6 +664,9 @@ fn build_ops(matches: &clap::ArgMatches, raw: &RawOps) -> Vec<Op> {
     for (i, v) in indices("verb").into_iter().zip(raw.verb.iter()) {
         keyed.push((i, Keyed::Verb(v.clone())));
     }
+    for (i, p) in indices("highlight").into_iter().zip(raw.highlight.iter()) {
+        keyed.push((i, Keyed::Highlight(p.clone())));
+    }
     keyed.sort_by_key(|(i, _)| *i);
 
     let mut ops = Vec::new();
@@ -664,6 +678,7 @@ fn build_ops(matches: &clap::ArgMatches, raw: &RawOps) -> Vec<Op> {
             Keyed::Px(x, y) => ops.push(Op::Pick(PickCommand::Pixel { x, y })),
             Keyed::CamPose(p, yaw, pitch) => ops.push(Op::CamPose(p, yaw, pitch)),
             Keyed::Verb(v) => ops.push(Op::Verb(v)),
+            Keyed::Highlight(p) => ops.push(Op::Highlight(p)),
         }
     }
     ops

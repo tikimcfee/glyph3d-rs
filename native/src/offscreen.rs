@@ -77,6 +77,8 @@ pub fn run(
                 scene.set_cam_pose(*eye, *yaw, *pitch);
                 None
             }
+            // S3 spike: Zed-sidecar highlight — one op, applied like a verb.
+            Op::Highlight(p) => scene.apply_highlight_sidecar(ctx, p),
         };
         match line {
             Some(line) => println!("{line}"),

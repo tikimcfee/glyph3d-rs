@@ -1108,6 +1108,7 @@ impl ApplicationHandler for App<'_> {
                     scene.set_cam_pose(*eye, *yaw, *pitch);
                     None
                 }
+                Op::Highlight(p) => scene.apply_highlight_sidecar(&self.ctx, p),
             };
             if let Some(line) = line {
                 println!("{line}");

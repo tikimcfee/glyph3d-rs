@@ -2001,6 +2001,82 @@ impl GlyphScene {
         self.group_trs(gid).is_some_and(|(_, _, _, a)| a <= 0.01)
     }
 
+    /// S3 spike (`experiments/zedspike`): apply a highlight SIDECAR produced by
+    /// Zed's headless language stack to this scene's per-glyph instance colors.
+    /// One run per line — `rel_path<TAB>start<TAB>end<TAB>rrggbb`, byte offsets
+    /// into the file, end exclusive. Records join to runs by their fold-leader
+    /// byte offset (the same leader↔record alignment `ensure_pick_cache`
+    /// validates); each hit is one 4 B partial write at the color field —
+    /// `Verb::RecolorGlyph`'s mechanism, iterated. Reached only via the
+    /// offscreen `--highlight` op: no golden view passes it, so default
+    /// rendering is byte-identical with the flag absent.
+    pub fn apply_highlight_sidecar(&self, ctx: &GpuContext, path: &std::path::Path) -> String {
+        let map = match parse_highlight_sidecar(path) {
+            Ok(map) => map,
+            Err(e) => return format!("highlight: {e}"),
+        };
+        let Some(pctx) = &self.pick else {
+            return "highlight: no pick context (repo scenes only) — ignored".to_string();
+        };
+        let mut files = 0usize;
+        let mut colored = 0usize;
+        let mut unstyled = 0usize;
+        for info in &pctx.files {
+            let Some(runs) = map.get(&info.rel_path) else { continue };
+            files += 1;
+            let Ok((records, bytes)) =
+                crate::repo::rederive_records(&pctx.root, &pctx.trie, &info.rel_path, &info.item)
+            else {
+                log::warn!("highlight: failed to re-derive {}", info.rel_path);
+                continue;
+            };
+            let (leaders, _, _, _) =
+                crate::text::fold_leaders(&bytes, info.item.wrap_width, info.item.wrap_mode);
+            if leaders.len() != records.len() {
+                log::warn!(
+                    "highlight: leader/record count mismatch on {} — file skipped",
+                    info.rel_path
+                );
+                continue;
+            }
+            // Both walks are byte-ascending (records follow the fold), so a
+            // merge pointer finds each record's run in O(runs + records).
+            // Blank records take no slot, exactly as ensure_pick_cache skips
+            // them.
+            let mut run_ix = 0usize;
+            let mut slot = info.slot_base;
+            for (i, r) in records.iter().enumerate() {
+                if r.glyph_id() == 0 {
+                    continue;
+                }
+                let byte = leaders[i].0;
+                while run_ix < runs.len() && runs[run_ix].end <= byte {
+                    run_ix += 1;
+                }
+                // runs[run_ix] is the first run ending past `byte`; it covers
+                // the record iff it also starts at/before it.
+                if let Some(run) = runs.get(run_ix).filter(|run| byte >= run.start) {
+                    let packed = u32::from(run.rgb[0])
+                        | u32::from(run.rgb[1]) << 8
+                        | u32::from(run.rgb[2]) << 16
+                        | 0xFF00_0000;
+                    self.write_instance(ctx, slot, 24, &packed.to_le_bytes());
+                    colored += 1;
+                } else {
+                    unstyled += 1;
+                }
+                slot += 1;
+            }
+        }
+        format!(
+            "highlight: {} file(s), {} glyphs colored, {} left default — {}",
+            files,
+            colored,
+            unstyled,
+            path.display()
+        )
+    }
+
     /// Ensure the one-entry pick cache holds `gid`'s re-derived file data:
     /// records (bit-identical engine re-run) + the CPU byte walks. The fold
     /// cross-check (CPU row/col vs engine ROW/COL lanes, every record) is the
@@ -2829,6 +2905,58 @@ fn ray_aabb(ro: DVec3, rd: DVec3, min: DVec3, max: DVec3) -> Option<f64> {
     Some(t0)
 }
 
+/// One highlight-sidecar run: bytes `[start, end)` of a file, colored `rgb`
+/// (sRGB bytes). Produced by `experiments/zedspike` from Zed's headless
+/// language stack.
+struct HighlightRun {
+    start: usize,
+    end: usize,
+    rgb: [u8; 3],
+}
+
+/// Parse the sidecar: `rel_path<TAB>start<TAB>end<TAB>rrggbb` per line, a
+/// leading `#` on the color tolerated, blank lines skipped, runs kept in file
+/// order. Hand-rolled on purpose — the renderer carries no JSON dependency,
+/// and this format exists to cross the zedspike → renderer seam, not to be a
+/// public contract.
+fn parse_highlight_sidecar(
+    path: &std::path::Path,
+) -> Result<std::collections::HashMap<String, Vec<HighlightRun>>, String> {
+    let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let mut map: std::collections::HashMap<String, Vec<HighlightRun>> =
+        std::collections::HashMap::new();
+    for (n, line) in text.lines().enumerate() {
+        let line = line.trim_end_matches(['\r']);
+        if line.is_empty() {
+            continue;
+        }
+        let bad = |what: &str| format!("{}:{}: {what}", path.display(), n + 1);
+        let mut parts = line.split('\t');
+        let (rel, start, end, rgb) = (
+            parts.next().ok_or_else(|| bad("missing rel_path"))?,
+            parts.next().ok_or_else(|| bad("missing start"))?,
+            parts.next().ok_or_else(|| bad("missing end"))?,
+            parts.next().ok_or_else(|| bad("missing color"))?,
+        );
+        if parts.next().is_some() {
+            return Err(bad("extra field"));
+        }
+        let start: usize = start.trim().parse().map_err(|_| bad("start not a number"))?;
+        let end: usize = end.trim().parse().map_err(|_| bad("end not a number"))?;
+        let hex = rgb.trim().trim_start_matches('#');
+        if hex.len() != 6 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(bad("color not rrggbb hex"));
+        }
+        let rgb = [
+            u8::from_str_radix(&hex[0..2], 16).map_err(|_| bad("color not rrggbb hex"))?,
+            u8::from_str_radix(&hex[2..4], 16).map_err(|_| bad("color not rrggbb hex"))?,
+            u8::from_str_radix(&hex[4..6], 16).map_err(|_| bad("color not rrggbb hex"))?,
+        ];
+        map.entry(rel.to_string()).or_default().push(HighlightRun { start, end, rgb });
+    }
+    Ok(map)
+}
+
 /// One-line pick report: file, group, folded row/col, source line, byte
 /// offset, the actual character, and the arena slot.
 fn format_pick(h: &PickHit) -> String {
@@ -2931,6 +3059,10 @@ impl SceneLike for GlyphScene {
 
     fn apply_verb(&mut self, ctx: &GpuContext, verb: &Verb) -> Option<String> {
         Some(GlyphScene::apply_verb(self, ctx, verb))
+    }
+
+    fn apply_highlight_sidecar(&self, ctx: &GpuContext, path: &std::path::Path) -> Option<String> {
+        Some(GlyphScene::apply_highlight_sidecar(self, ctx, path))
     }
 
     fn debug_dump_instances(&self, ctx: &GpuContext, slot: u64, out: &mut [u32]) {

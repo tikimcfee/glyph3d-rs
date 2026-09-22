@@ -69,6 +69,12 @@ pub trait SceneLike {
     fn apply_verb(&mut self, _ctx: &GpuContext, _verb: &crate::glyph_scene::Verb) -> Option<String> {
         None
     }
+    /// S3 spike (`experiments/zedspike`): apply a Zed-pipeline highlight
+    /// sidecar to per-glyph instance colors (`--highlight`, repo scenes
+    /// only); returns a log line. Default: scene doesn't support it.
+    fn apply_highlight_sidecar(&self, _ctx: &GpuContext, _path: &std::path::Path) -> Option<String> {
+        None
+    }
     /// Stage G debug: read back instance bytes at a global slot (partial-
     /// upload verification). Default no-op.
     fn debug_dump_instances(&self, _ctx: &GpuContext, _slot: u64, _out: &mut [u32]) {}
