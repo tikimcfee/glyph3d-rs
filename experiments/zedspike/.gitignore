@@ -4,3 +4,4 @@ target/
 # grew a required `compressed` trait item that zed's fs_embed debug arm
 # doesn't implement). Keep it in sync with zed's lock when it moves.
 spike-out.html
+s3-out/
