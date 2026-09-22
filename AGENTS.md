@@ -347,9 +347,12 @@ the latter through `--load-repo` (the engine end to end). One line per
 sequence class the trie resolves (families, flags, skin tones, keycaps, tag
 flags) plus the fallbacks (unlisted chains stay pieces, ZWJ/VS16 zero-width);
 the `cluster-static-zero-off` and `cluster-trailer-advance-one` mutations
-prove they redden. The `emoji` view keeps pinning LEADER mode — its fixture
-is immutable — so at the default flip its command gains `--cluster-mode
-leader` explicitly and this paragraph's pairing repeats one level up.
+prove they redden. The `emoji` view pins LEADER mode by hand — its fixture
+is immutable, and the default flipped to cluster on 2026-09-22, so its
+command carries `--cluster-mode leader` explicitly and the pairing now reads
+one level up: the default gets its pixel coverage from the unpinned repo
+views (g-pick-repo carries no sequences — the flip moves no pixel there),
+and leader stays pinned here.
 Known cost of the fix, measured: in the dense far region of `repo-down`,
 ~1,400 of 1.6M pixels lose a little ink where coplanar quads overlap and the
 later fragment's interpolated depth lands an ulp behind — the price of a

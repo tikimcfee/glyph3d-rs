@@ -157,11 +157,13 @@ display's refresh (75 on the first Linux box) and not a fact about the renderer.
   path without a human.
 - `GLYPH_CLUSTER_SELFTEST=1` — windowed, dev-only: toggles the Debug panel's
   cluster-mode button through the SAME rebuild arm, logging the instance
-  count before/after (on cluster-bearing content it must DROP — the trailers
-  leave the arena; measured on fixtures/g-cluster-repo: 359 → 345; on
-  fixtures/emoji-corpus-small.txt, a TEXT scene: 893 → 801). The button
-  shows on repo and text scenes; demo/engine-text scenes carry no mode and
-  hide it.
+  count before/after (on cluster-bearing content the count moves — trailers
+  enter/leave the arena; the DIRECTION follows the starting mode: with
+  cluster the default since 2026-09-22, the hook's toggle goes OFF and the
+  count rises. Measured leader→cluster on fixtures/g-cluster-repo: 359 →
+  345; on fixtures/emoji-corpus-small.txt, a TEXT scene: 893 → 801).
+  The button shows on repo and text scenes; demo/engine-text scenes carry
+  no mode and hide it.
 - `GLYPH_L3_SHADER_COMPOSITE=1` — offscreen, dev-only (Stage L): makes the
   offscreen target Bgra8UnormSrgb, forcing the WINDOWED shader-composite
   path (composite.wgsl) under the deterministic oracle driver; the readback

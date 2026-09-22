@@ -197,10 +197,12 @@ cmd = "--load-repo fixtures/g-pick-repo --frames 2 --cam-pose 30 -120 60 0 -12"
 # through the CPU staging path and the shader's mode-1 branch. The only frame
 # that samples the emoji sheet, so the only one that can see it; expect more
 # cross-vendor drift here than on text (filtered sampling is not analytic
-# coverage). `emoji-uv-flip` proves it reddens.
+# coverage). `emoji-uv-flip` proves it reddens. It pins `--cluster-mode
+# leader` by hand: since the 2026-09-22 default flip, the unpinned views all
+# render cluster mode.
 [[golden_view]]
 name = "emoji"
-cmd = "--render-file fixtures/emoji-view.txt --frames 2 --zoom 1.25"
+cmd = "--render-file fixtures/emoji-view.txt --frames 2 --zoom 1.25 --cluster-mode leader"
 # The sequence pass, on the CPU staging path: cluster-mode rendering of every
 # sequence class the trie resolves (families, flags, skin tones, keycaps, tag
 # flags) plus the fallbacks (pieces for unlisted chains, zero-width ZWJ). Its

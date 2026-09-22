@@ -85,7 +85,8 @@ pub enum SceneChoice {
         /// layer pins it rather than letting RepoParams::default speak alone.
         z_wrap_spacing: f64,
         /// The sequence pass on a repo load (`--cluster-mode`, default
-        /// leader). Same standing as wrap_mode: the baselines pin the default.
+        /// cluster since 2026-09-22). Same standing as wrap_mode: the
+        /// baselines pin the default.
         cluster_mode: fold::ClusterMode,
         /// The colour-emoji sheet (`--emoji-sheet`; default the committed
         /// one). Every glyph scene loads it — the same handle the engine
@@ -484,11 +485,12 @@ struct Cli {
     #[arg(long, value_name = "F", default_value_t = 0.15, allow_negative_numbers = true, value_parser = parse_z_wrap_spacing)]
     z_wrap_spacing: f64,
     /// Whether the sequence pass resolves codepoint clusters to single glyphs
-    /// on a repo load (and on --render-file): `leader` (the default) is one
-    /// glyph per UTF-8 leader; `cluster` resolves the font's sequences
-    /// (ZWJ families, RI flags, skin tones, keycaps) to single slots with
-    /// trailing leaders zeroed. The emoji baselines render `leader`.
-    #[arg(long, value_name = "MODE", default_value = "leader", value_parser = ["leader", "cluster"])]
+    /// on a repo load (and on --render-file): `cluster` (the default, since
+    /// 2026-09-22) resolves the font's sequences (ZWJ families, RI flags, skin
+    /// tones, keycaps) to single slots with trailing leaders zeroed; `leader`
+    /// is one glyph per UTF-8 leader. The emoji baselines pin `leader`
+    /// explicitly.
+    #[arg(long, value_name = "MODE", default_value = "cluster", value_parser = ["leader", "cluster"])]
     cluster_mode: String,
     /// Stage E2: frame the first file whose path contains SUBSTR
     #[arg(long, value_name = "SUBSTR")]
@@ -1281,11 +1283,11 @@ mod cli_tests {
         // same baselines (repo-wide renders the staircase), so the CLI layer
         // pins the default too, not only RepoParams::default (repo.rs).
         assert_eq!(cli.z_wrap_spacing, 0.15);
-        // The sequence pass: leader is the default every baseline renders;
-        // cluster is the reachable other spelling.
-        assert_eq!(cli.cluster_mode, "leader");
-        assert_eq!(parse_cluster_mode(&cli.cluster_mode), fold::ClusterMode::Leader);
-        assert_eq!(parse_cluster_mode("cluster"), fold::ClusterMode::Cluster);
+        // The sequence pass: cluster is the default (since 2026-09-22); leader
+        // is the reachable other spelling, and the emoji view pins it by hand.
+        assert_eq!(cli.cluster_mode, "cluster");
+        assert_eq!(parse_cluster_mode(&cli.cluster_mode), fold::ClusterMode::Cluster);
+        assert_eq!(parse_cluster_mode("leader"), fold::ClusterMode::Leader);
         assert!(!cli.repo_verify);
         assert!(cli.focus_file.is_none());
         assert!(!cli.repo_scan_only);
