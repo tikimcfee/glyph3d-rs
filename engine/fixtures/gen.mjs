@@ -20,7 +20,7 @@
  * fixture gains a SEQUENCE PAYLOAD between the blocks and the item records:
  * the synthetic sequence table a cluster-mode fixture resolves against
  * ([slot, len, cps..] entries) plus the bitmap advance a resolved head
- * carries. seqCount 0 with a NaN advance = "no sequences" (the 25 pre-v5
+ * carries. seqCount 0 with a NaN advance = "no sequences" (the 17 pre-v5
  * fixtures' shape); the NaN poisons any read of a value that must be absent.
  *
  * v4: the item record gains WRAP MODE — WrapDown (0, today's behaviour and the
@@ -58,7 +58,7 @@
  *     maxRowExtent; an item with no leaders is +inf/+inf/+inf/-inf/-inf/-inf/0/0)
  *   f64[8] batch bounds row (same shape/sentinel)
  *
- * Run: bun engine/fixtures/gen.mjs   (writes *.pipe.bin beside this file)
+ * Run: node engine/fixtures/gen.mjs   (writes *.pipe.bin beside this file)
  */
 
 import { mkdirSync, writeFileSync, readFileSync } from 'node:fs';
@@ -81,7 +81,6 @@ const utf8 = (s) => new TextEncoder().encode(s);
 //    head/trailer mix-up can never hide behind a plausible-looking id.
 //    bitmapAdvance is the head's advance under cluster mode, per fixture; the
 //    awkward mantissa is on purpose (the f32 chain must carry it bit-exactly).
-const SEQ_SLOT_BASE = 50000;
 
 // ── Trie: synthetic metrics with awkward f32 mantissas, so every advance-sum
 //    exercises real rounding. '@' is deliberately unmapped (the F_MISSING path);
@@ -301,7 +300,7 @@ const CASES = [
         };
     })(),
     // ── THE SEQUENCE PASS (clusterMode 1). Synthetic sequence tables in the
-    //    fixture's own id space (SEQ_SLOT_BASE 50000, so a head/trailer mix-up
+    //    fixture's own id space (slots from 50000 up, so a head/trailer mix-up
     //    can never hide behind a plausible-looking id); the rule is the
     //    oracle's resolveClusters. bitmapAdvance carries an awkward mantissa on
     //    purpose — the f32 chain must move it bit-exactly.
@@ -420,7 +419,7 @@ const MEASURE_FROM = [S_X, S_Y, S_Z, S_ADVANCE, S_HEIGHT, S_GLYPH_ID, S_BASE_X, 
 const COUNT_FROM = [S_ROW, S_COL, S_FLAGS, S_ORD];
 if (MEASURE_FROM.length !== MEASURE_STRIDE || COUNT_FROM.length !== COUNT_STRIDE) {
     throw new Error(`fixture lane map disagrees with the schema (${MEASURE_FROM.length}/${MEASURE_STRIDE}, `
-        + `${COUNT_FROM.length}/${COUNT_STRIDE}) — run bun tools/gen-schema.mjs`);
+        + `${COUNT_FROM.length}/${COUNT_STRIDE}) — run python3 tools/gen_schema.py`);
 }
 function writeSlotValues(w, slots) {
     const nb = slots.length / SLOT_STRIDE;

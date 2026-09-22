@@ -90,7 +90,7 @@ outputs = ["assets/atlas/cluster-classes.bin"]
 inputs = ["tools/gen_cluster_table.py", "tools/vendor/third-party/unicode-ucd/*.txt"]
 build = "python3 tools/gen_cluster_table.py"
 verify_cmd = "python3 tools/gen_cluster_table.py --check"
-note = "Grapheme-cluster class table, generated from the vendored UCD (never hand-written). The sequence pass's class source; general UAX #29 rides the same table later."
+note = "Grapheme-cluster class table, generated from the vendored UCD (never hand-written). Carried verbatim into both tries for the general UAX #29 phase; the landed sequence pass reads no classes by design — tests are its only readers today."
 
 # Regeneration is by hand and ORDERED: cluster-classes (from the vendored UCD)
 # and emoji-sheet (from the vendored font) first — the atlas reads BOTH — then
@@ -158,7 +158,7 @@ outputs = [
   "out/tooling-ab/baseline/{gpu}/emoji-cluster.png",
   "out/tooling-ab/baseline/{gpu}/repo-cluster.png",
 ]
-inputs = ["target/release/glyph3d-native", "native/fixtures/baseline-view.txt", "native/fixtures/emoji-view.txt", "native/fixtures/g-pick-repo/**/*", "assets/atlas/emoji-sheet.bin"]
+inputs = ["target/release/glyph3d-native", "native/fixtures/baseline-view.txt", "native/fixtures/emoji-view.txt", "native/fixtures/emoji-cluster-view.txt", "native/fixtures/g-pick-repo/**/*", "native/fixtures/g-cluster-repo/**/*", "assets/atlas/emoji-sheet.bin"]
 note = "Blind to everything outside these frames, and cannot distinguish a regression from an intentional change. One set per rasterizer ({gpu}); a set only ever proves the renderer on the hardware that made it. empty.rs in g-pick-repo is zero bytes ON PURPOSE (the only input reaching the page-extent origin seed)."
 
 # Per-view render commands (run from native/, screenshot into {scratch}).
@@ -244,7 +244,7 @@ blind_to = "whether the declared inputs are the RIGHT ones — it proves a patte
 [[gate]]
 name = "committed-artifacts"
 scope = "corpus"
-kind = "verify-committed"   # glyph-schema, engine-trie, atlas, fixtures
+kind = "verify-committed"   # glyph-schema, emoji-sheet, cluster-classes, emoji-corpus, engine-trie, atlas, fixtures
 needs = []
 compare = "each committed artifact rebuilt (scratch or generator check mode) vs its committed bytes"
 blind_to = "whether the INPUTS are right — reproducibility, not truth"

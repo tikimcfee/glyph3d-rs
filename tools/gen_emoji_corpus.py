@@ -20,10 +20,12 @@ Regenerate by hand after a font/table change, like any committed artifact.
 
 Run:  python3 tools/gen_emoji_corpus.py                 bake both fixtures
       python3 tools/gen_emoji_corpus.py --check         rebuild in memory, byte-compare
-      python3 tools/gen_emoji_corpus.py --check-render  render both fixtures in both
-                                                        modes and diff the binary's staged
-                                                        counts against this file's simulator
-                                                        (calibrated on emoji-cluster-view.txt)
+      python3 tools/gen_emoji_corpus.py --check-render  render the calibration fixture and
+                                                        both corpora in both modes; diff the
+                                                        binary's staged counts against this
+                                                        file's simulator (which the run also
+                                                        re-pins against the calibration
+                                                        fixture's known answers)
 """
 
 from __future__ import annotations

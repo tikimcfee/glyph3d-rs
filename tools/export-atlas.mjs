@@ -35,7 +35,7 @@
  *      function of (web bake, sheet).
  *
  * Usage:  node tools/export-atlas.mjs [--out <dir>]
- * Requires: node ≥ 18 (CompressionStream-free; we use zlib). Reference repo must
+ * Requires: node ≥ 18 (CompressionStream-free; we use zlib). The reference repo
  * is vendored under tools/vendor/ref (see REF_ROOT below); the web repo is not
  * read at all any more.
  */
@@ -300,9 +300,9 @@ cpEntries.sort((a, b) => a[0] - b[0]);
 // a slot id in the instance stream and the shader needs nothing new. The
 // sheet's sequence table is sorted by codepoint sequence, so the slot id of
 // sequence i is SEQ_SLOT_BASE + i — a pure function of (web bake, sheet), the
-// same append-only rule as 4b. gen_real_trie.py computes the SAME ids from the
-// SAME table when it writes the engine trie's sequence section: no mapping
-// artifact exists to drift.
+// same append-only rule as 4b. gen_real_trie.py carries this section VERBATIM
+// into engine-trie.bin and cross-checks the slot base against glyphs.bin
+// (gen_real_trie.py:165-173): no mapping artifact exists to drift.
 const seqCount = sheet[22], seqMax = sheet[23];
 const seqStride = 2 + seqMax;
 const seqTableOff = SHEET_HEADER_WORDS + sheetCells * SHEET_CELL_STRIDE + sheetCps * SHEET_CP_STRIDE;

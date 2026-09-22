@@ -5,15 +5,15 @@ The class data for cluster-mode segmentation, GENERATED FROM THE VENDORED UCD
 (tools/vendor/third-party/unicode-ucd/, pinned in tools/vendor-manifest.py) —
 never hand-written. A hand-rolled state machine broke keycaps in the 2026-09-20
 experiment and was caught only because the test expectation was wrong in the
-other direction; the table is the thing four implementations (JS oracle, Mojo
-engine, Rust text.rs, Python pick oracle) will all read, so it is derived from
-Unicode's own files with pins that refuse a moved answer.
+other direction.
 
-Emits assets/atlas/cluster-classes.bin ('G3CC'): a range-compressed class map
-covering the FULL Grapheme_Cluster_Break space plus the emoji-data properties
-the sequence pass needs — general UAX #29 (combining marks, Hangul, Indic) is
-a later phase riding this same table, which is why the table is wider than
-today's rule.
+WHO READS THIS TABLE: the landed sequence pass deliberately reads NO classes
+(engine/glyph_cluster.mojo says why — matching is table-driven, not
+class-driven). The table covers the FULL Grapheme_Cluster_Break space plus the
+emoji-data properties because the general UAX #29 phase (combining marks,
+Hangul, Indic) rides it next — it is baked and carried verbatim into both
+tries now so that phase finds its data already placed; until then the tests
+are its only readers.
 
 Format (little-endian u32 words):
 
@@ -53,8 +53,6 @@ MAGIC = 0x43433347  # 'G3CC'
 VERSION = 1
 HEADER_WORDS = 10
 UCD_MAJOR, UCD_MINOR = 17, 0
-
-GCB = HERE / "..."  # placeholder replaced below — kept out of the format docs
 
 BIT_EXTEND = 0
 BIT_ZWJ = 1
