@@ -507,15 +507,23 @@ def rel_close(a: Float64, b: Float64) -> Bool:
 
 
 def check_case(path: String, ctx: DeviceContext) raises -> Int:
-    return check_fixture(load_pipe_fixture(path), ctx)
+    var fx = load_pipe_fixture(path)
+    # No cluster kernel exists on device yet — skip, printed WITH THE PATH so
+    # a glob run can say which fixture's hole this is (check_fixture keeps its
+    # own guard for the bench path, which names no path). The CPU forms cover
+    # the rule; the device form is its own work.
+    if has_cluster_items(fx):
+        print("SKIP", path, "— cluster mode has no device form yet")
+        return 0
+    return check_fixture(fx^, ctx)
 
 
 def check_fixture(var fx: PipeFixture, ctx: DeviceContext, bench: Bool = False) raises -> Int:
     var n = fx.byte_len
     if n == 0:
         return 0
-    # No cluster kernel exists on device yet — skip, printed, so the hole
-    # is named. The CPU forms cover the rule; the device form is its own work.
+    # The bench path's cluster guard — check_case already skipped with the
+    # fixture's path; a bench reaching here names its fixture at the call site.
     if has_cluster_items(fx):
         print("SKIP a", fx.byte_len, "byte fixture — cluster mode has no device form yet")
         return 0

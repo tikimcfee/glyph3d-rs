@@ -160,9 +160,10 @@ was built against a different FFI surface. See ABI_SHAPE."""
 # insertion point, where it never moves, or after it, where it may not either.
 #
 # So the per-item entry stopped being positional. Both load entries now marshal
-# the SAME 128 B descriptor block, and a new field can never shift an argument
-# again — it takes pad. The block carries ABI_SHAPE at a FIXED offset (108), which
-# cannot shift by construction, and the entry point was RENAMED
+# the SAME 136 B descriptor block, and a new field never shifts an argument —
+# it takes pad, or the block grows and the shape word with it (cluster_mode did
+# exactly that, below). The block carries ABI_SHAPE at a FIXED offset (112),
+# which cannot shift by construction, and the entry point was RENAMED
 # (`glyph_engine_load_item_desc`) so a dylib predating this change fails to LINK
 # rather than being miscalled: a symbol that does not exist cannot be called wrong.
 comptime ABI_DESC_BYTES: Int = 136             # the descriptor block, both entries
@@ -221,7 +222,7 @@ def glyph_engine_load_trie_file(
 def _item_from_desc(
     base: Pointer[UInt8, MutUntrackedOrigin], byte_start: Int, byte_count: Int
 ) -> Item:
-    """Deserialize ONE 128 B descriptor block into an Item.
+    """Deserialize ONE 136 B descriptor block into an Item.
 
     THE ONLY PLACE either entry point reads item params from. Two readers is how
     the per-item and batched paths get to disagree about a field, which is what
@@ -270,7 +271,7 @@ def glyph_engine_load_item_desc(
 ) abi("C") -> c_int:
     """Run decode → fold → paginate → compact for ONE item (one text file).
 
-    Params arrive in the SAME 128 B descriptor block the batched entry takes —
+    Params arrive in the SAME 136 B descriptor block the batched entry takes —
     see the ONE MARSHALLING FORMAT note above for why this stopped being a
     twenty-argument positional call. Results are kept in the handle as 32 B wire
     records; retrieve with glyph_engine_slot_count / glyph_engine_copy_slots."""
@@ -310,7 +311,7 @@ def glyph_engine_load_item_desc(
 # call (~50 MB/s at repo-file sizes); the pipeline itself is built for
 # multi-item arenas (Item list over one byte span), so this entry amortizes
 # ALL per-call overhead: the caller concatenates the corpus into one blob and
-# passes one 128-byte descriptor block per item, and gets back one record
+# passes one 136-byte descriptor block per item, and gets back one record
 # stream plus per-item record counts (computed from the flag lanes, so they
 # are EXACT: one record per leader byte, as compact emits).
 #

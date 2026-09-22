@@ -74,7 +74,7 @@ comptime GE_ABI_MISMATCH: c_int = 9
 
 
 def _desc_for(it: Item, byte_count: Int) raises -> List[UInt8]:
-    """Serialize one Item into the 128 B descriptor both load entries take.
+    """Serialize one Item into the 136 B descriptor the load entries take.
 
     A THIRD writer of this block, and that is a real cost — native/src/engine.rs's
     `write_item_desc` is the one the product uses. It is here because this suite
