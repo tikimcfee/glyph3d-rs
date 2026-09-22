@@ -46,7 +46,7 @@ Regenerating a committed artifact is a hand act with its own generator (the
 `build =` line on its artifact in build.toml), in dependency order, and the
 result is committed on purpose. This paragraph said "regenerates committed
 artifacts in place" until 2026-09-10; the code never did. `pixi run verify`
-builds nothing at all: it asserts currency and byte-compares. The four baseline PNGs are class **golden**: verified,
+builds nothing at all: it asserts currency and byte-compares. The baseline PNGs are class **golden**: verified,
 never built — the runner refuses. `pixi run build-native` is the one pixi
 `depends-on` edge (cargo after build-engine); the rest of the graph is
 artifact-level and lives in build.toml because pixi cannot see that cargo
@@ -176,9 +176,9 @@ happened here, and is caught today only by the fixtures gate.
 **fixtures** (was "1b"; part of the committed-artifacts gate in the runner).
 Rebuilds the corpus in a **scratch copy** of `engine/fixtures` (generators +
 vendored inputs + the `../glyph_schema.mjs` edge) and byte-compares against
-the committed 25 — the old gate deleted the committed fixtures in place and
+the committed 33 — the old gate deleted the committed fixtures in place and
 restored them with `git checkout`, which needed the restore to be exactly
-right. The expected counts (17 pipe + 8 bake) are **declared in build.toml**,
+right. The expected counts (25 pipe + 8 bake) are **declared in build.toml**,
 never derived from the tree under test: the old gate `ls`-counted the tree it
 was checking, so a deleted fixture lowered both sides of the comparison and
 stayed green (measured 2026-09-06: eleven of twelve gates green on a shrunken
@@ -235,12 +235,12 @@ load-bearing part of why the old check could not fail, so it is stated as of
 not at all. Verified 2026-09-06: marking three tests `#[ignore]`
 left the old check printing `PASS tests green` and the new one printing
 `FAIL — 82 tests ran, floor is 85`. This is also the check that holds the two
-corpus-size pins (`native/src/fixture.rs`, 17 pipe; `native/src/bake.rs`, 8 bake,
+corpus-size pins (`native/src/fixture.rs`, 25 pipe; `native/src/bake.rs`, 8 bake,
 both worded "update deliberately"), so until now corpus protection rested on
 those tests continuing to run with nothing asserting that they did. The realistic
 loss was never deletion — it is a dropped `mod` declaration or an `#[ignore]`
 that outlives its reason, neither of which rustc says a word about. **This matters more than it looks**, because the pins that keep
-the fixture corpus from silently shrinking (`native/src/fixture.rs`, 17 pipe;
+the fixture corpus from silently shrinking (`native/src/fixture.rs`, 25 pipe;
 `native/src/bake.rs`, 8 bake — both worded "update deliberately") live inside
 this check. They protect the corpus; nothing yet protects them.
 
@@ -391,10 +391,10 @@ still exist, not that the sentence around them is current.
 answers, with the volumes it currently clears — quote these when you change it,
 because a count that quietly drops is how this check would go vacuous without
 going red: parse parity (Rust's fixture loader versus Mojo's over parsed typed
-values — 17 fixtures, 11 section checksums each), the trie rebuilt from raw
-bytes (17 fixtures, 13,568 entries), the full serial fold over every lane of
-every byte (155,136 leaders, 1,872,012 lanes), the scan form across 8 tunings
-(17 × 8 = 136 cases, 1,187,896 leader-lanes bit-exact and 53,192 within 1e-4),
+values — 25 fixtures, 11 section checksums each), the trie rebuilt from raw
+bytes (25 fixtures, 22,784 entries), the full serial fold over every lane of
+every byte (155,208 leaders, 1,873,836 lanes), the scan form across 8 tunings
+(25 × 8 = 200 cases, 1,188,024 leader-lanes bit-exact and 53,640 within 1e-4),
 the bake and its seed protocol (8 fixtures, 27,315 leaders, 167 checkpoints,
 530 queries), and `text.rs`'s independent fold over its declared domain
 (4 fixtures, 5,332 records, 47,988 lanes). Two of these carry
@@ -413,7 +413,7 @@ and the union is not:
   `engine/check.sh` on 2026-09-06 (it had been red for an unknown time — the
   pinned toolchain miscompiled the in-process `ffi` import in executable
   codegen, so it now links the SHIPPED dylib and genuinely crosses the
-  boundary). It skips the three multi-item fixtures by design; batched-entry
+  boundary). It skips the five multi-item fixtures by design; batched-entry
   coverage is repo-verify. The toolchain miscompile class itself is not pinned
   by anything else: gate engine-check uses a (0,0,0) origin and is blind to
   exactly the `origin_x` read that broke.

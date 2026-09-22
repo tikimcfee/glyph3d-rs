@@ -107,7 +107,7 @@ The Slug glyph-map texture, verbatim. Same binding convention.
 | 1 | version | 1 |
 | 2 | headerBytes | 32 |
 | 3 | width | 1024 |
-| 4 | height | 6 |
+| 4 | height | 10 |
 | 5 | entryCount | 9427 (= maxGlyphId + 1: the web's 4,431 + 830 appended emoji slots + 4,166 appended sequence slots) |
 | 6–7 | reserved | 0 |
 | 8 … | payload | `width × height × 4` u32 texels |
@@ -137,12 +137,12 @@ policy is the web's own: a codepoint an outline font draws stays outline
 **Slots 5261–9426 are the sequence slots** (2026-09-20, step 4c): one bitmap
 slot per entry in `emoji-sheet.bin`'s sequence table, allocated in the
 table's own (sorted) order, so a sequence's slot id is `5261 + index` — a
-pure function of the sheet, which is what lets `gen_real_trie.py` compute
-the same ids for the engine trie without a mapping artifact. Each is a
-`[0, 0, 1, cell]` texel like any appended emoji slot; nothing resolves a
-codepoint SEQUENCE to these slots yet (that is the engine-side sequence
-pass). Cluster heads render through the same mode-1 branch and the same
-square quad as any emoji.
+pure function of the sheet, carried verbatim into the engine trie
+(`gen_real_trie.py` cross-checks the slot base against glyphs.bin). Each is a
+`[0, 0, 1, cell]` texel like any appended emoji slot; the sequence pass
+resolves a cluster head to one of these slots (the trie v2 sections above —
+`--cluster-mode cluster` renders through them today). Cluster heads render
+through the same mode-1 branch and the same square quad as any emoji.
 
 Slots that exist but were never encoded (holes in the id space) read as
 `[0, 0, 0, 0]`: mode 0, zero curves — rendered blank. Slot 0 (blank) is such an
@@ -365,10 +365,10 @@ through Canvas2D at runtime, which this tree cannot reproduce.
 
 **Identity is the font's glyph id**, not a FontChain slot and not a codepoint.
 Every bitmap the font has is a cell — including the ~2,500 that only a
-codepoint SEQUENCE reaches (flags, skin tones, ZWJ families). The pipeline is
-one glyph per leader byte and today addresses only the single-codepoint cells
-through the codepoint table; the sequence table is carried so a future shaping
-pass finds its cells already placed (`out/EMOJI.md`, 2026-09-10).
+codepoint SEQUENCE reaches (flags, skin tones, ZWJ families). Leader mode
+addresses only the single-codepoint cells through the codepoint table; under
+cluster mode the sequence pass resolves a cluster head to its sequence slot
+(the 2026-09-20 sequence pass — `out/EMOJI.md`, `engine/delta/cluster-mode.md`).
 
 Header — 40 u32 words (160 bytes):
 
@@ -407,11 +407,12 @@ Then, in order, all u32 little-endian:
 - **Codepoint table** — `codepointCount × 2`: `[codepoint, glyphId]`, sorted by
   codepoint. EVERY cmap entry, including the 41 whose glyph has no cell (NUL,
   CR, space, ZWJ U+200D, the tag characters U+E0030–E007F): "known to the font,
-  no bitmap" is what a future trie step needs to mark a sequence's trailing
-  codepoints as zero-advance blanks.
+  no bitmap" is what the sequence pass's trailer posture needed to mark a
+  sequence's trailing codepoints as zero-advance blanks.
 - **Sequence table** — `sequenceCount × (2 + seqMax)`: `[len, glyphId, cp₀ … cp₍len−1₎, 0 …]`,
   sorted by the codepoint sequence. Every target glyph has a cell. Read by
-  nothing today; carried on purpose.
+  export-atlas.mjs's step 4c to mint the sequence slots above; the renderer
+  never parses it (the trie's v2 section carries the same rows).
 - **Name table** — `cellCount + 1` offsets then the blob: the font's glyph names
   for the cells (`u1F600`, `u1F1E6_1F1E8`, …), no terminators, padded to 4
   bytes. Debug/log use only.

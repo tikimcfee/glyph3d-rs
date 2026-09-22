@@ -21,8 +21,9 @@ all cores, off any frame budget.
 
 ## What holds it together
 
-- **The corpus is ours.** 25 fixtures rebuild byte-identical from vendored,
-  per-file-pinned inputs with no web repo present (gate `1b`). The JS oracle is
+- **The corpus is ours.** 33 fixtures (25 pipe + 8 bake) rebuild byte-identical
+  from vendored, per-file-pinned inputs with no web repo present (the fixtures
+  gate). The JS oracle is
   a spent correctness source; the web *target* is served by Rust→wasm.
 - **THE TWO ORACLES HAVE FORKED, deliberately, and this is the record of it.**
   `c9667ec` corrected `engine/fixtures/inputs/glyphPipelineReference.js` to
@@ -448,11 +449,13 @@ where nobody was looking.
 several sizes, discrete card — now with the knowledge that a fair CPU baseline
 is `run_pipeline` at realistic item counts, not `run_scan_pipeline` at one.
 
-**5. Emoji.** The atlas already carries 897 colour-bitmap slots with doubled
+**5. Emoji — DONE 2026-09-10 (the sheet + the `emoji` golden, `out/EMOJI.md`);
+the sequence pass followed 2026-09-20 (`engine/delta/cluster-mode.md`).**
+~~The atlas already carries 897 colour-bitmap slots with doubled
 advances; what was never exported is the pixel sheet. `emojiCell` is read in the
 vertex stage and never becomes a varying, so nothing can reach the fragment
 shader. The re-bake has no external dependency — `REF_ROOT` is vendored and the
-shaping crates are already compiled in.
+shaping crates are already compiled in.~~
 
 **6. The web target.** Cfg-gate the Mojo backend out, split lib from bin, clear
 the wasm blockers, and put `cargo check --target wasm32-unknown-unknown` in
