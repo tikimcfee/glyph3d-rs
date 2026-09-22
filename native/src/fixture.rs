@@ -1385,10 +1385,11 @@ mod tests {
         // Full consumption is asserted inside the loader, so reaching Ok() here
         // IS the structural check — a wrong stride cannot get this far.
         let paths = all_fixtures();
-        // 25 since the eight sequence-pass fixtures landed (was 17). Pinned as a
+        // 26 since cluster-overlap landed for the split-form proof (was 25,
+        // 17 before the sequence-pass fixtures). Pinned as a
         // COUNT rather than a nonzero check: a fixture that stopped being
         // discovered would otherwise quietly lower coverage instead of failing.
-        assert_eq!(paths.len(), 25, "corpus size changed — update the expectation deliberately");
+        assert_eq!(paths.len(), 26, "corpus size changed — update the expectation deliberately");
         for p in &paths {
             let fx = load_pipe_fixture(p).unwrap_or_else(|e| panic!("{}", e));
             assert_eq!(fx.exp_measures.len(), fx.byte_len * FIXTURE_MEASURE_STRIDE);

@@ -176,9 +176,9 @@ happened here, and is caught today only by the fixtures gate.
 **fixtures** (was "1b"; part of the committed-artifacts gate in the runner).
 Rebuilds the corpus in a **scratch copy** of `engine/fixtures` (generators +
 vendored inputs + the `../glyph_schema.mjs` edge) and byte-compares against
-the committed 33 — the old gate deleted the committed fixtures in place and
+the committed 34 — the old gate deleted the committed fixtures in place and
 restored them with `git checkout`, which needed the restore to be exactly
-right. The expected counts (25 pipe + 8 bake) are **declared in build.toml**,
+right. The expected counts (26 pipe + 8 bake) are **declared in build.toml**,
 never derived from the tree under test: the old gate `ls`-counted the tree it
 was checking, so a deleted fixture lowered both sides of the comparison and
 stayed green (measured 2026-09-06: eleven of twelve gates green on a shrunken
@@ -235,12 +235,12 @@ load-bearing part of why the old check could not fail, so it is stated as of
 not at all. Verified 2026-09-06: marking three tests `#[ignore]`
 left the old check printing `PASS tests green` and the new one printing
 `FAIL — 82 tests ran, floor is 85`. This is also the check that holds the two
-corpus-size pins (`native/src/fixture.rs`, 25 pipe; `native/src/bake.rs`, 8 bake,
+corpus-size pins (`native/src/fixture.rs`, 26 pipe; `native/src/bake.rs`, 8 bake,
 both worded "update deliberately"), so until now corpus protection rested on
 those tests continuing to run with nothing asserting that they did. The realistic
 loss was never deletion — it is a dropped `mod` declaration or an `#[ignore]`
 that outlives its reason, neither of which rustc says a word about. **This matters more than it looks**, because the pins that keep
-the fixture corpus from silently shrinking (`native/src/fixture.rs`, 25 pipe;
+the fixture corpus from silently shrinking (`native/src/fixture.rs`, 26 pipe;
 `native/src/bake.rs`, 8 bake — both worded "update deliberately") live inside
 this check. They protect the corpus; nothing yet protects them.
 
@@ -391,10 +391,10 @@ still exist, not that the sentence around them is current.
 answers, with the volumes it currently clears — quote these when you change it,
 because a count that quietly drops is how this check would go vacuous without
 going red: parse parity (Rust's fixture loader versus Mojo's over parsed typed
-values — 25 fixtures, 11 section checksums each), the trie rebuilt from raw
-bytes (25 fixtures, 22,784 entries), the full serial fold over every lane of
-every byte (155,208 leaders, 1,873,836 lanes), the scan form across 8 tunings
-(25 × 8 = 200 cases, 1,188,024 leader-lanes bit-exact and 53,640 within 1e-4),
+values — 26 fixtures, 11 section checksums each), the trie rebuilt from raw
+bytes (26 fixtures, 23,552 entries), the full serial fold over every lane of
+every byte (155,222 leaders, 1,874,328 lanes), the scan form across 8 tunings
+(26 × 8 = 208 cases, 1,188,024 leader-lanes bit-exact and 53,752 within 1e-4),
 the bake and its seed protocol (8 fixtures, 27,315 leaders, 167 checkpoints,
 530 queries), and `text.rs`'s independent fold over its declared domain
 (4 fixtures, 5,332 records, 47,988 lanes). Two of these carry

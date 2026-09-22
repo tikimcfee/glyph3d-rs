@@ -334,6 +334,19 @@ const CASES = [
         items: [{ origin: { x: 0, y: 0, z: 0 }, clusterMode: 1, lineHeight: 1.0 }],
     },
     {
+        // OVERLAP: two table pairs that SHARE a letter. 🇦🇨🇦 commits (A C) and
+        // the lone A must survive — the phantom (C A) at position 1 is a
+        // candidate that no commit may fire. This is the case a two-pass
+        // decomposition (probe every position, then commit) gets wrong if its
+        // chain is a windowed OR instead of the greedy skip-past; the serial
+        // rule can never see it, because its walk never visits position 1.
+        name: 'cluster-overlap',
+        bytes: utf8('🇦🇨🇦 🇨🇦🇨 🇦🇨🇨 x\n'),
+        seqs: [[50006, [0x1F1E6, 0x1F1E8]], [50007, [0x1F1E8, 0x1F1E6]]],
+        bitmapAdvance: Math.fround(1.318),
+        items: [{ origin: { x: 0, y: 0, z: 0 }, clusterMode: 1, lineHeight: 1.0 }],
+    },
+    {
         // Keycaps, both spellings: '1' FE0F 20E3 and '1' 20E3 resolve to the
         // SAME slot — the FE0F normalization pin (the font's GSUB strips VS16;
         // real text carries it).

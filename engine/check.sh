@@ -124,7 +124,7 @@ for s in ${list[@]+"${list[@]}"}; do run "$s" "${PIPE[@]}"; done
 # some inlined call sites, per compilation unit (measured 2026-09-06: origin_x
 # read back as a heap address; the same source built as the dylib is bit-exact
 # on every single-item fixture). ffi_selftest.mojo's header has the full story.
-# It covers the 20 single-item pipe fixtures (the six single-item cluster
+# It covers the 21 single-item pipe fixtures (the seven single-item cluster
 # fixtures included — cluster mode marshals through the same ABI) and skips the
 # 5 multi-item ones —
 # the per-item entry takes one item per load by design; the batched entry's
@@ -153,7 +153,7 @@ if [[ "${1:-all}" != "gpu" ]]; then
     rm -f "$TMPBIN"
 fi
 case "${1:-all}" in
-    cpu) echo "all 11 CPU suites + ffi_selftest (dylib C ABI, 20 single-item fixtures) + 3 instruments green (fp contraction disabled); GPU suites NOT RUN" ;;
+    cpu) echo "all 11 CPU suites + ffi_selftest (dylib C ABI, 21 single-item fixtures) + 3 instruments green (fp contraction disabled); GPU suites NOT RUN" ;;
     bench) echo "all bench files compile (they are not RUN: bench.bin is untracked)" ;;
     gpu) echo "all 5 GPU suites green (fp contraction disabled)" ;;
     *)   echo "all 16 suites + ffi_selftest (dylib C ABI) green + 3 instruments + benches compile, CPU + GPU (fp contraction disabled)" ;;

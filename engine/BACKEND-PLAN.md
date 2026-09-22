@@ -21,7 +21,7 @@ all cores, off any frame budget.
 
 ## What holds it together
 
-- **The corpus is ours.** 33 fixtures (25 pipe + 8 bake) rebuild byte-identical
+- **The corpus is ours.** 34 fixtures (26 pipe + 8 bake) rebuild byte-identical
   from vendored, per-file-pinned inputs with no web repo present (the fixtures
   gate). The JS oracle is
   a spent correctness source; the web *target* is served by Rust→wasm.
