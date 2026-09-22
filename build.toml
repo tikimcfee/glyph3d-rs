@@ -264,7 +264,7 @@ scope = "engine"
 kind = "cmd"
 cmd = "./engine/check.sh all"
 needs = ["fixtures"]
-compare = "16 Mojo conformance suites + ffi_selftest + 3 instruments vs the fixture corpus, CPU and Metal"
+compare = "17 Mojo conformance suites + ffi_selftest + 3 instruments vs the fixture corpus, CPU and Metal"
 blind_to = "faults shared by the serial and scan forms in conformance_real (oracle-free by design); the instruments print but assert nothing"
 
 [[gate]]
@@ -488,6 +488,17 @@ expect = "Coverage DROPPED"
 # consumer is recorded in each `why`.
 
 [[mutation]]
+name = "cluster-split-phantom-commit"
+gate = "engine-suites"
+why = "the split form's chain exists to suppress phantom candidates — with (A C) and (C A) both in the table, 🇦🇨🇦 must keep its lone A. Dropping the commit guard turns the chain into a windowed OR, and conformance_split must redden. CONSUMED BY: cluster-overlap.pipe.bin, the fixture that exists for exactly this."
+file = "engine/cluster_split.mojo"
+rebuild = "pixi run build-engine"
+op = "replace"
+find = "        if slot != 0 and id >= commit_end:"
+with = "        if slot != 0:"
+expect = "split-form conformance failed"
+
+[[mutation]]
 name = "phantom-row"
 gate = "engine-suites"
 why = "the 2026-09-04 phantom row: a wrap rule that counts the terminating newline's own row steals a blank row whenever wrap divides the line length exactly, and the two rules agree at every other length. CONSUMED BY: wrap-exact (lines of 4/8/12 at wrap 4 — the fixture exists for this), wrap-emoji and real-kernels; 3 of 17 cases, 178,916 mismatches."
@@ -516,8 +527,8 @@ why = "the descriptor's i32 arity moves on the ENGINE side while a foreign calle
 file = "engine/ffi.mojo"
 rebuild = "pixi run build-engine"
 op = "replace"
-find = "comptime ABI_DESC_I32S: Int = 7                # i32 params inside that block"
-with = "comptime ABI_DESC_I32S: Int = 6                # i32 params inside that block"
+find = "comptime ABI_DESC_I32S: Int = 8                # i32 params inside that block"
+with = "comptime ABI_DESC_I32S: Int = 7                # i32 params inside that block"
 expect = "load_item status 9"
 
 [[mutation]]

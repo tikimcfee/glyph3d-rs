@@ -42,6 +42,7 @@ from glyph_schema import (
     FIXTURE_MEASURE_STRIDE, FIXTURE_COUNT_STRIDE,
 )
 from glyph_cluster import resolve_clusters
+from cluster_split import probe_clusters, chain_clusters
 
 # ── Lane layout: GENERATED, six arrays, split twice ─────────────────────────
 # Who WRITES a lane decides where it lives; who READS it decides whether it
@@ -54,8 +55,9 @@ comptime F_RENDERED = 2
 comptime F_NEWLINE = 4
 comptime F_MISSING = 8
 # The sequence pass's trailer: the leader keeps its record but its glyph and
-# advance moved into the cluster head. Distinct from F_MISSING: a trailer's
-# content RESOLVED (it is drawn, one cell back); a miss was never found.
+# advance moved into the cluster head. Also marks the unmatched
+# invisible-by-design characters (ZWJ/VS/tags) the pass zeroes in place.
+# Distinct from F_MISSING: a trailer's content RESOLVED; a miss was never found.
 comptime F_CLUSTER_TRAILER = 16
 
 comptime NEWLINE = 0x0A
@@ -1195,7 +1197,7 @@ def shard_lo(start: Int, stop: Int, workers: Int, w: Int) -> Int:
     return a if a < stop else stop
 
 
-def run_pipeline[o: ImmOrigin, witness: Bool = True](
+def run_pipeline[o: ImmOrigin, witness: Bool = True, split: Bool = False](
     bytes: Span[UInt8, o], trie: Trie, items: List[Item]
 ) -> PipelineResult:
     """Fold into a FRESH result. The allocating shape, and the one every suite
@@ -1204,13 +1206,18 @@ def run_pipeline[o: ImmOrigin, witness: Bool = True](
     The two are one implementation, not two paths: this allocates and delegates.
     A chunked driver reusing one scratch across chunks must get bit-identical
     output to a single whole-corpus call, and the only way to be sure of that is
-    for there to be nothing to diverge."""
+    for there to be nothing to diverge.
+
+    `split` (comptime, default False — production runs the serial rule) swaps
+    the sequence pass's resolver for the two-pass probe+chain decomposition
+    (cluster_split.mojo), the form the device kernels port. conformance_split
+    proves the swap bit-identical over the whole corpus."""
     var r = PipelineResult()
-    run_pipeline_into[witness=witness](r, bytes, trie, items)
+    run_pipeline_into[witness=witness, split=split](r, bytes, trie, items)
     return r^
 
 
-def run_pipeline_into[o: ImmOrigin, witness: Bool = True](
+def run_pipeline_into[o: ImmOrigin, witness: Bool = True, split: Bool = False](
     mut r: PipelineResult, bytes: Span[UInt8, o], trie: Trie, items: List[Item]
 ):
     """The whole pipeline — the oracle's runPipeline, natively, sharded across
@@ -1323,10 +1330,27 @@ def run_pipeline_into[o: ImmOrigin, witness: Bool = True](
             any_cluster = True
             break
     if any_cluster:
-        def _cluster_task(i: Int) {imm}:
-            if items[i].cluster_mode == CLUSTER_CLUSTER:
-                resolve_clusters(bytes, slots, trie, items[i])
-        parallelize(_cluster_task, len(items))
+        comptime if split:
+            # The two-pass form under test: probe writes candidates, the chain
+            # commits. One shared cand buffer pair — items tile the blob, so
+            # per-item writes never share a byte.
+            var cand_slot = List[UInt32](length=byte_len, fill=0)
+            var cand_end = List[UInt32](length=byte_len, fill=0)
+            var cs = cand_slot.unsafe_ptr().unsafe_origin_cast[MutUntrackedOrigin]()
+            var ce = cand_end.unsafe_ptr().unsafe_origin_cast[MutUntrackedOrigin]()
+
+            def _cluster_task_split(i: Int) {imm}:
+                if items[i].cluster_mode == CLUSTER_CLUSTER:
+                    probe_clusters(bytes, slots, trie, items[i], cs, ce)
+                    chain_clusters(bytes, slots, trie, items[i], cs, ce)
+            parallelize(_cluster_task_split, len(items))
+            _ = len(cand_slot)
+            _ = len(cand_end)
+        else:
+            def _cluster_task(i: Int) {imm}:
+                if items[i].cluster_mode == CLUSTER_CLUSTER:
+                    resolve_clusters(bytes, slots, trie, items[i])
+            parallelize(_cluster_task, len(items))
     r.stage_ns[ST_CLUSTER] = perf_counter_ns() - _t
     _t = perf_counter_ns()
 

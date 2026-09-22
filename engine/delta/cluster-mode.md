@@ -82,7 +82,11 @@ General UAX #29 text clustering (combining marks, Hangul, Indic) — the class
 table already carries their classes; the segmentation FSM for it is proven
 exact under regrouping (the transition monoid closes at 16 elements; a summary
 is one u64). The GPU cluster kernel (the device suites skip cluster fixtures,
-printed; the monoid design is shelved for when the device dispatch ships).
+printed). 2026-09-22: its first step landed — the rule decomposed into a
+per-position probe + a commit chain (cluster_split.mojo), swappable via
+run_pipeline's comptime `split` param and proven bit-exact against the serial
+rule by conformance_split (cluster-overlap.pipe.bin carries the phantom
+case); the monoid design stays shelved, the chain's carry is one integer.
 Bake v4 (the tail fold re-derives trie advances today; `conformance_resume`
 skips cluster items, printed). Shaping — Turing-complete, CPU-side everywhere
 in the industry, and this engine's measured-placement model does not need it

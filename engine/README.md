@@ -8,7 +8,9 @@ oracle (JS)  →  scan spec (JS)  →  TSL kernels (WebGPU)  →  glyph_pipeline
 ```
 
 `glyph_pipeline.mojo` is a native transcription of `glyphPipelineReference.js` — the
-byte-in glyph pipeline (decode → trie resolve → fold → paginate → bounds) with the
+byte-in glyph pipeline (decode → trie resolve → cluster → fold → paginate →
+bounds; the cluster stage is the 2026-09-20 sequence pass, glyph_cluster.mojo,
+a no-op for leader-mode items) with the
 oracle's exact float discipline: f32 slot lanes rounded once per store, f64 `lineAdv`,
 f32-per-add `segAdv`, integer row/col for every discrete decision. It is proven
 **bit-for-bit** against the oracle, not to a tolerance — a tolerance would hide
