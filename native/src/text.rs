@@ -7,8 +7,9 @@
 //! comes from a small syntax-ish tokenizer (keywords / numbers / strings /
 //! comments / punctuation).
 //!
-//! Missing / blank / bitmap (emoji) codepoints occupy their advance but emit no
-//! instance — emoji bitmaps were not exported, so emoji render as blank space.
+//! Missing / blank codepoints occupy their advance but emit no instance; bitmap
+//! (emoji) codepoints stage a real slot from the emoji sheet like any other
+//! glyph — the shader's mode-1 branch draws them (the `emoji` golden pins it).
 
 use std::path::Path;
 
@@ -121,6 +122,13 @@ pub fn stage_file(
     let fu_per_world = atlas.metrics.em_height_fu as f32 / CELL_HEIGHT_WORLD;
     let cell_w = atlas.metrics.advance_fu as f32 / fu_per_world; // world advance
     let line_h = CELL_HEIGHT_WORLD * LINE_HEIGHT_FACTOR;
+    // The cluster head's advance in cells — the same narrowing push_char
+    // applies to the trie's per-codepoint advances (2 by the export rule),
+    // derived from the trie so a baked-advance change moves every twin.
+    let bitmap_cells = ((atlas.trie.bitmap_advance_fu.max(0) as u32
+        + atlas.metrics.advance_fu / 2)
+        / atlas.metrics.advance_fu)
+        .max(1);
 
     // --- lay out one copy on a monospace grid ------------------------------
     let mut glyphs: Vec<Cell> = Vec::new();
@@ -237,7 +245,7 @@ pub fn stage_file(
                     };
                     glyphs.push(Cell { col, row, slot, color });
                     codepoints_decoded += covered;
-                    col += 2; // the bitmap advance, in cells
+                    col += bitmap_cells; // the head advance, derived at staging
                     prev = chars[ci + covered - 1];
                     ci += covered;
                     continue;
@@ -437,8 +445,8 @@ pub trait ResolveGlyph {
 
     /// The sequence pass's table: the flat [slot, len, cps..] rows, the entry
     /// stride's seq_max, and the head's advance. Default None = "no sequences"
-    /// — the rule never fires, which is every existing implementation's
-    /// behavior today. FixtureTrie and the atlas's TrieTable override it.
+    /// — the rule never fires, which is the test trie's behavior (glyph_trie.rs
+    /// does not override). FixtureTrie and the atlas's TrieTable do.
     fn cluster_table(&self) -> Option<(&[u32], u32, f32)> {
         None
     }

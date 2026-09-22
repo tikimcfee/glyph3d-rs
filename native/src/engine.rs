@@ -1,6 +1,6 @@
 //! engine.rs — safe Rust wrapper over the Mojo glyph engine's C ABI (Stage D).
 //!
-//! This is the SUBSTRATE half of the Mojo backend: the extern block, the 128 B
+//! This is the SUBSTRATE half of the Mojo backend: the extern block, the 136 B
 //! item descriptor, the FP-contract probe, and the handle's lifetime. The
 //! layout CONTRACT it serves — `ItemParams`, `GlyphRecord`, `LayoutError` —
 //! lives in `layout.rs`, because all three backends share it and none of them
@@ -68,8 +68,8 @@ extern "C" {
     fn glyph_engine_copy_slots(handle: *mut c_void, out_ptr: *mut u32, out_len: usize)
         -> u64;
     // Stage E2: batched load — one call for a whole corpus. Descriptors are
-    // 128 B blocks (explicit byte layout documented in ffi.mojo): ten f64
-    // params, SEVEN i32 params, then u64 byte_start/byte_count.
+    // 136 B blocks (explicit byte layout documented in ffi.mojo): ten f64
+    // params, EIGHT i32 params, then u64 byte_start/byte_count.
     fn glyph_engine_load_items(
         handle: *mut c_void,
         blob_ptr: *const u8,
@@ -105,7 +105,7 @@ extern "C" {
     fn glyph_engine_instance_shape() -> u64;
 }
 
-/// Marshal item descriptors into the 128 B blocks the engine reads.
+/// Marshal item descriptors into the 136 B blocks the engine reads.
 ///
 /// ONE writer of that layout, shared by every entry that takes items. Written
 /// twice it would be the correlated-fault shape this tree keeps finding: two
@@ -172,7 +172,7 @@ const fn abi_shape() -> u32 {
     ((ITEM_DESC_SIZE as u32) << 8) | DESC_I32_COUNT as u32
 }
 
-/// Serialize one item's params + byte range into a 128 B descriptor block.
+/// Serialize one item's params + byte range into a 136 B descriptor block.
 /// Explicit offsets — shared verbatim with the Mojo side, no repr(C) guessing.
 /// The returned `Vec<u64>` backing keeps the block 8-byte aligned.
 pub fn write_item_desc(block: &mut [u8], params: &ItemParams, byte_start: u64, byte_count: u64) {
@@ -327,7 +327,7 @@ impl Engine {
     /// Run the pipeline for one text file. Results stay in the handle until
     /// the next load; pull them with [`Engine::read_back`].
     ///
-    /// Marshals the SAME 128 B descriptor the batched entry takes. It used to
+    /// Marshals the SAME 136 B descriptor the batched entry takes. It used to
     /// pass twenty positional arguments, and `wrap_mode` landing in the middle of
     /// them is what broke `--repo-verify` on 2026-09-04 against a stale dylib.
     /// One format means a new field takes descriptor pad instead of shifting a

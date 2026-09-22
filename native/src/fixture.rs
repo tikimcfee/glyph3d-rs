@@ -752,9 +752,10 @@ fn out_of_domain(fx: &PipeFixture) -> Option<String> {
         return Some("wrap_mode=Back".to_string());
     }
     // The sequence pass rewrites the static tier before the fold; this
-    // reference folds straight from the trie. A cluster-mode item is stating
-    // an intent reference_layout does not model until the text.rs twin lands
-    // (phase D) — same reasoning as the wrap-mode line above.
+    // reference deliberately folds leader-mode only — the pass lives in the
+    // twins (text.rs's stage_file, the engine), and engine-check feeds this
+    // reference ItemParams::default. A cluster-mode item is out of its
+    // declared domain — same reasoning as the wrap-mode line above.
     if it.cluster_mode != crate::fold::ClusterMode::Leader {
         return Some("cluster_mode=Cluster".to_string());
     }

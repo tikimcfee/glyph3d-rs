@@ -164,7 +164,7 @@ pub const LAYOUT_BAD_PARAMS: i32 = -1;
 /// f64 fields keep the oracle's float discipline; page geometry is integer.
 ///
 /// These are the CONTRACT's params, not the FFI's: all three backends take
-/// them, and `engine.rs`'s 128 B descriptor is one backend's serialization of
+/// them, and `engine.rs`'s 136 B descriptor is one backend's serialization of
 /// them.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ItemParams {

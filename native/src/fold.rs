@@ -52,8 +52,11 @@ pub const F_RENDERED: u32 = 2;
 pub const F_NEWLINE: u32 = 4;
 pub const F_MISSING: u32 = 8;
 /// The sequence pass's trailer: the leader keeps its record but its glyph and
-/// advance moved into the cluster head. Distinct from F_MISSING: a trailer's
-/// content RESOLVED; a miss was never found.
+/// advance moved into the cluster head. Also marks the unmatched
+/// invisible-by-design characters (ZWJ/VS/tags) the pass zeroes in place.
+/// Distinct from F_MISSING: a trailer's content RESOLVED; a miss was never
+/// found. Read by nothing in the renderer — the blank-drop works off
+/// glyph_id == 0; the corpus's FLAGS-lane comparisons are the pin.
 pub const F_CLUSTER_TRAILER: u32 = 16;
 pub const NEWLINE: u32 = 0x0A;
 
@@ -491,12 +494,6 @@ pub(crate) fn decode_and_resolve<T: ResolveGlyph + ?Sized>(
     Some(codepoint)
 }
 
-/// THE FOLD — the serial scan over one item's bytes.
-///
-/// `write_bounds` is false for a paged item (paginate is about to rewrite every
-/// position, so a box computed here would describe the pre-page layout) and for
-/// a RESUMED range (a partial range must not publish a whole item's box).
-#[allow(clippy::too_many_arguments)]
 /// The invisible-by-design ranges: the ZERO WIDTH JOINER, the variation
 /// selectors, the tag characters. Under cluster mode they never occupy a cell
 /// — a sequence match claims them as trailers first.
@@ -623,7 +620,11 @@ pub(crate) fn resolve_clusters<T: ResolveGlyph + ?Sized>(
     }
 }
 
-
+/// THE FOLD — the serial scan over one item's bytes.
+///
+/// `write_bounds` is false for a paged item (paginate is about to rewrite every
+/// position, so a box computed here would describe the pre-page layout) and for
+/// a RESUMED range (a partial range must not publish a whole item's box).
 fn layout_item(
     slots: &mut Slots,
     item: &Item,

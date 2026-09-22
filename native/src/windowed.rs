@@ -168,15 +168,15 @@ struct WindowState {
     /// after-counters next frame). See AGENTS.md debug env vars.
     #[cfg(feature = "egui-ui")]
     k4_selftest: u8,
-    /// The layout dial's apply signal (repo scenes): the panel's
-    /// z_wrap_spacing slider sets Some(new value) on drag release; the
-    /// RedrawRequested arm consumes it and rebuilds the scene between
-    /// frames. Always None on non-repo scenes (the panel hides the dial).
+    /// The relayout signal (repo and text scenes): the panel sets Some(...) on
+    /// the z_wrap_spacing slider's drag release or the cluster toggle's click;
+    /// the RedrawRequested arm consumes it and rebuilds the scene between
+    /// frames. None where no layout params exist (demo/engine-text scenes).
     #[cfg(feature = "egui-ui")]
     pending_relayout: Option<RelayoutRequest>,
     /// Dev-only verification hook state (GLYPH_ZSPACE_SELFTEST=1): same
-    /// 0/1/2 arming as k4_selftest, driving the layout dial through the
-    /// same pending_relayout arm the slider's release uses.
+    /// 0/1/2/3 arming as cluster_selftest below, driving the layout dial
+    /// through the same pending_relayout arm the slider's release uses.
     #[cfg(feature = "egui-ui")]
     zspace_selftest: u8,
     /// Dev-only verification hook state (GLYPH_CLUSTER_SELFTEST=1): same
@@ -416,9 +416,10 @@ impl WindowState {
         // Dev-only verification hook (GLYPH_CLUSTER_SELFTEST=1): toggle the
         // cluster mode through the SAME pending_relayout arm the panel's
         // button fires. Meaningful only on cluster-bearing content (the
-        // g-cluster-repo fixture): instance count must DROP as trailers leave
-        // the arena. States: 1 = fire at t>3 s; 2 = one quiet frame; 3 =
-        // print the after-readout, done.
+        // g-cluster-repo fixture, or a text scene like emoji-corpus-small.txt):
+        // instance count must DROP as trailers leave the arena. States:
+        // 1 = fire at t>3 s; 2 = one quiet frame; 3 = print the
+        // after-readout, done.
         #[cfg(feature = "egui-ui")]
         match self.cluster_selftest {
             1 if self.time() > 3.0 => {
@@ -1038,8 +1039,9 @@ struct RelayoutRequest {
 
 struct App<'a> {
     ctx: GpuContext,
-    /// Owned, not borrowed: the layout dial's rebuild arm mutates the Repo
-    /// variant's z_wrap_spacing in place before rebuilding the scene.
+    /// Owned, not borrowed: the relayout arm mutates the choice's params in
+    /// place (Repo's z_wrap_spacing, Repo/Text cluster_mode) before rebuilding
+    /// the scene.
     choice: SceneChoice,
     cull: bool,
     /// Stage G: scripted picks/verbs applied once at startup (smoke testing
@@ -1488,9 +1490,9 @@ mod tests {
 
 pub fn run(
     ctx: GpuContext,
-    // Owned: the layout dial's rebuild arm mutates the Repo variant's
-    // z_wrap_spacing before rebuilding the scene (windowed.rs's
-    // pending_relayout arm). Offscreen keeps borrowing its own.
+    // Owned: the relayout arm mutates the choice's params (Repo's
+    // z_wrap_spacing, Repo/Text cluster_mode) before rebuilding the scene
+    // (windowed.rs's pending_relayout arm). Offscreen keeps borrowing its own.
     choice: SceneChoice,
     cull: bool,
     ops: &[Op],

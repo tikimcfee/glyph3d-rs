@@ -71,27 +71,26 @@ pub struct TrieTable {
     pub emoji_cell: Vec<Option<u32>>,
     /// v2: the cluster head's advance (the bitmap 2x cell), fu. On a v1 file
     /// this is 2 x the primary advance — the same value by the export rule.
-    // Read by the sequence-pass twins (phase D); trie_v2_tests exercise it today.
-    #[allow(dead_code)]
+    // Read by the sequence pass: ResolveGlyph::cluster_table hands it to the
+    // fold (fold.rs's resolve_clusters) and text.rs reads it for the head cell.
     pub bitmap_advance_fu: i32,
     /// v2: the sequence section's raw words — sequenceCount x (2 + seq_max)
     /// of [slot, len, cps..], sorted by the codepoint sequence (prefix-
     /// lexicographic, length tiebreak). Empty on v1 ("no sequences" — the
     /// leader behavior).
-    // Read by the sequence pass (phase D); exercised by trie_v2_tests today.
-    #[allow(dead_code)]
+    // Read by the sequence pass: sequence_lookup binary-searches it per probe.
     pub sequences: Vec<u32>,
-    /// Same phase-D story as `sequences`.
-    #[allow(dead_code)]
+    /// The probe window's length cap (the section stride is 2 + seq_max).
     pub seq_max: u32,
     /// v2: the G3CC class table verbatim (its own header included). Empty on v1.
-    // Read by the sequence pass (phase D); exercised by trie_v2_tests today.
+    // Carried for the general UAX #29 phase: the landed sequence pass reads no
+    // classes by design (glyph_cluster.mojo says why), so today only
+    // trie_v2_tests exercise it. class_of is its reader.
     #[allow(dead_code)]
     pub classes: Vec<u32>,
     /// The table's first members as a set — the probe's cheap rejection. Built
     /// once at load from the sequence section itself.
-    // Same phase-D story as `sequences`.
-    #[allow(dead_code)]
+    // starts_a_sequence reads it per probe.
     seq_first: std::collections::HashSet<u32>,
 }
 
@@ -211,8 +210,6 @@ impl TrieTable {
     /// shorter-prefix-first) — the sheet's own table order, asserted at bake.
     /// The caller probes with the FE0F-normalized codepoints of a candidate
     /// cluster; None means no such sequence (the fallback is per-codepoint).
-    // The sequence pass's resolution calls this (phase D); trie_v2_tests today.
-    #[allow(dead_code)]
     pub fn sequence_lookup(&self, cps: &[u32]) -> Option<u32> {
         if self.sequences.is_empty() {
             return None;
@@ -256,16 +253,14 @@ impl TrieTable {
     /// candidacy test the probe runs before paying for a lookup. The set is
     /// derived from the table's own first members at load, so it can never
     /// drift from it.
-    // The sequence pass's probe calls this (stage_file's cluster path);
-    // exercised by trie_v2_tests today.
-    #[allow(dead_code)]
     pub fn starts_a_sequence(&self, cp: u32) -> bool {
         self.seq_first.contains(&cp)
     }
 
     /// Codepoint → class bits (the G3CC table embedded in the v2 class
     /// section; range-compressed, binary search by range start). 0 = Other.
-    // The sequence pass's classification calls this (phase D); tests today.
+    // The general UAX #29 phase's reader, carried with the table — the landed
+    // sequence pass reads no classes by design, so tests exercise this today.
     #[allow(dead_code)]
     pub fn class_of(&self, cp: u32) -> u32 {
         if self.classes.is_empty() {
