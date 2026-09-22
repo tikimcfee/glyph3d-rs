@@ -1,0 +1,49 @@
+# zedspike — S0/S1: Zed's language stack, headless, no window.
+#
+# Standalone workspace ON PURPOSE: the empty [workspace] table detaches this
+# crate from the glyph3d-native root workspace, so the repo's zero-warning
+# gates and the tool binary never see it (and it never joins a merge back).
+#
+# Path deps point INTO the Zed checkout at ~/localdev/externalcompute/zed —
+# absolute paths are deliberate: this is an experiments-branch spike tied to
+# this machine's layout, not repo content. Workspace-inherited deps of those
+# crates resolve against Zed's own root Cargo.toml.
+[workspace]
+
+[package]
+name = "zedspike"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1"
+gpui = { path = "/Users/lugo/localdev/externalcompute/zed/crates/gpui", features = ["test-support"] }
+language = { path = "/Users/lugo/localdev/externalcompute/zed/crates/language", features = ["test-support"] }
+grammars = { path = "/Users/lugo/localdev/externalcompute/zed/crates/grammars" }
+# debug-embed: zed's fs_embed! macro otherwise locates grammar assets at
+# runtime by walking up from the EXE for a .git — which finds this worktree's
+# repo, not the zed checkout, and panics "missing config". Embedding at
+# compile time makes the spike binary position-independent.
+util = { path = "/Users/lugo/localdev/externalcompute/zed/crates/util", features = ["debug-embed"] }
+theme = { path = "/Users/lugo/localdev/externalcompute/zed/crates/theme" }
+syntax_theme = { path = "/Users/lugo/localdev/externalcompute/zed/crates/syntax_theme" }
+tree-sitter-rust = "0.24.2"
+
+# Copied from Zed's root [patch.crates-io]: their tree-sitter is a git fork,
+# and these patches keep fork-only APIs (adopt_raw_pid, notify variants,
+# LanguageFn unification) available to crates.io deps. Patches do NOT
+# propagate across workspaces, so a path dep into Zed's tree needs them
+# re-declared here. Only the entries our graph actually reaches (language/
+# gpui/fs); the livekit/webrtc/collab patches are omitted.
+[patch.crates-io]
+tree-sitter-language = { git = "https://github.com/tree-sitter/tree-sitter", rev = "43623ec9bf0eaaf7113285c46e8a09018f181b18" }
+async-process = { git = "https://github.com/zed-industries/async-process.git", rev = "0b6d6713570af61806e1e5cb40e0f757cb93fd9d" }
+# async-task: zed's patch rev (smol-rs b4486cd) is unreachable from a fresh
+# fetch — upstream rewrote history — so this workspace resolves async-task
+# from crates.io. If something in the graph turns out to need the fork's API,
+# vendor the fork instead of pointing at the dead rev.
+notify = { git = "https://github.com/zed-industries/notify", rev = "d842f16b2716bd60f09caf3ae3a894237ab38f54" }
+notify-types = { git = "https://github.com/zed-industries/notify", rev = "d842f16b2716bd60f09caf3ae3a894237ab38f54" }
+
+[profile.dev]
+debug = 0

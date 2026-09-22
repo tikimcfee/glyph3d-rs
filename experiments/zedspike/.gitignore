@@ -1,0 +1,6 @@
+target/
+# NOT ignored: Cargo.lock is seeded from Zed's own lock (their versions are
+# what their code compiles against — a fresh resolve drifts, e.g. rust-embed
+# grew a required `compressed` trait item that zed's fs_embed debug arm
+# doesn't implement). Keep it in sync with zed's lock when it moves.
+spike-out.html
