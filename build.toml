@@ -266,7 +266,7 @@ scope = "engine"
 kind = "cmd"
 cmd = "./engine/check.sh all"
 needs = ["fixtures"]
-compare = "17 Mojo conformance suites + ffi_selftest + 3 instruments vs the fixture corpus, CPU and Metal"
+compare = "18 Mojo conformance suites + ffi_selftest + 3 instruments vs the fixture corpus, CPU and Metal"
 blind_to = "faults shared by the serial and scan forms in conformance_real (oracle-free by design); the instruments print but assert nothing"
 
 [[gate]]
@@ -488,6 +488,17 @@ expect = "Coverage DROPPED"
 # Each of these was checked against the third outcome, the one that is neither
 # "landed" nor "failed to land": LANDED IN A REGION NOTHING READS. The named
 # consumer is recorded in each `why`.
+
+[[mutation]]
+name = "gpu-cluster-phantom-commit"
+gate = "engine-suites"
+why = "the device chain's carry guard is the phantom suppressor, exactly as in the CPU split — dropping it turns the device commit into a windowed OR, and gpu_cluster must redden on cluster-overlap. The device twin of cluster-split-phantom-commit; if only one of the pair ever fires, the two chains have drifted."
+file = "engine/gpu_cluster.mojo"
+rebuild = "pixi run build-engine"
+op = "replace"
+find = "        if slot != 0 and id >= commit_end:"
+with = "        if slot != 0:"
+expect = "gpu cluster diverged"
 
 [[mutation]]
 name = "cluster-split-phantom-commit"

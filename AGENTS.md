@@ -187,7 +187,7 @@ count in build.toml and hard pin in the test suite are two independent
 witnesses, not duplicate coverage. Blind to whether the oracle is *correct* —
 it proves reproducibility, not truth.
 
-**engine-suites** (was "2"). Seventeen suites — 12 CPU, 5 on Metal — plus
+**engine-suites** (was "2"). Eighteen suites — 12 CPU, 6 on Metal — plus
 **ffi_selftest** (wired 2026-09-06; it links the SHIPPED dylib through the real
 C ABI after the pinned toolchain was found to miscompile the in-process import
 — see its header), plus a compile pass over all six benches (compiled, never

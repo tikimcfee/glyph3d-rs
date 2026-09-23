@@ -15,9 +15,9 @@
 #
 # The two functions write the same three lanes resolve_clusters writes (glyph
 # id, advance, flags), bit-exact — conformance_split proves it against the
-# serial rule over the whole corpus. They are the functions the device
-# kernels will port: no allocation, no cross-position state outside the
-# carry, table access by flat reads only.
+# serial rule over the whole corpus. gpu_cluster.mojo carries the device port
+# of both (probe per byte, chain per item); keep these free of allocation and
+# cross-position state outside the carry so the port stays a transcription.
 
 from std.collections import Dict
 from std.collections.span import Span

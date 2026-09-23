@@ -87,6 +87,11 @@ per-position probe + a commit chain (cluster_split.mojo), swappable via
 run_pipeline's comptime `split` param and proven bit-exact against the serial
 rule by conformance_split (cluster-overlap.pipe.bin carries the phantom
 case); the monoid design stays shelved, the chain's carry is one integer.
+And 2026-09-22 later: the device port itself — gpu_cluster.mojo runs
+k_cluster_probe (thread per byte) + k_cluster_chain (thread per item) on
+device, bit-exact against the split on every fixture, with the phantom guard
+mutation mirrored. The device PIPELINE's other stages still skip cluster
+fixtures (printed) until the dispatch lands in gpu_pipeline.mojo.
 Bake v4 (the tail fold re-derives trie advances today; `conformance_resume`
 skips cluster items, printed). Shaping — Turing-complete, CPU-side everywhere
 in the industry, and this engine's measured-placement model does not need it

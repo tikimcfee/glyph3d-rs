@@ -41,7 +41,7 @@ BAKE=(engine/fixtures/*.bake.bin)
 CPU=(conformance conformance_scan ordinal_invariant conformance_record conformance_resume conformance_elide conformance_invariants conformance_split)
 # gaps and matrix take ONE fixture (for its trie) and build their own topologies
 GAPS=engine/fixtures/repo-file.pipe.bin
-GPU=(gpu_decode gpu_scan gpu_paginate gpu_bounds gpu_pipeline)
+GPU=(gpu_decode gpu_scan gpu_paginate gpu_bounds gpu_pipeline gpu_cluster)
 
 # NATIVE-PORT 2026-09-02: the benches are COMPILED here, not run. They cannot run
 # in a fresh tree (engine/bench/bench.bin is untracked and its generator needs the
@@ -68,7 +68,7 @@ run() { # name, fixtures...
     fi
 }
 
-# NATIVE-PORT: the default is ALL SEVENTEEN. The five GPU suites were briefly
+# NATIVE-PORT: the default is ALL EIGHTEEN. The five GPU suites were briefly
 # unbuildable here — gpu_decode failed at parse with "'gpu' does not refer to a
 # nested package" — for the sole reason that pixi.toml pinned `mojo` and not
 # `max`. Adding the dependency was the whole fix: all five then passed on Apple
@@ -155,6 +155,6 @@ fi
 case "${1:-all}" in
     cpu) echo "all 12 CPU suites + ffi_selftest (dylib C ABI, 21 single-item fixtures) + 3 instruments green (fp contraction disabled); GPU suites NOT RUN" ;;
     bench) echo "all bench files compile (they are not RUN: bench.bin is untracked)" ;;
-    gpu) echo "all 5 GPU suites green (fp contraction disabled)" ;;
-    *)   echo "all 17 suites + ffi_selftest (dylib C ABI) green + 3 instruments + benches compile, CPU + GPU (fp contraction disabled)" ;;
+    gpu) echo "all 6 GPU suites green (fp contraction disabled)" ;;
+    *)   echo "all 18 suites + ffi_selftest (dylib C ABI) green + 3 instruments + benches compile, CPU + GPU (fp contraction disabled)" ;;
 esac
