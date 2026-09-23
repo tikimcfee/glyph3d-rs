@@ -21,6 +21,7 @@
 # Run: mojo run -I engine engine/gpu_cluster.mojo engine/fixtures/*.pipe.bin
 
 from std.sys import argv, has_accelerator
+from std.time import perf_counter_ns
 from std.gpu import global_idx
 from std.utils import StaticTuple
 from max.gpu.host import DeviceContext
@@ -382,6 +383,7 @@ def check_case(path: String, ctx: DeviceContext, mut saw_cluster: List[Bool]) ra
     d_cend.enqueue_fill(0)
 
     comptime B = 256
+    var t0 = perf_counter_ns()
     ctx.enqueue_function[k_cluster_probe](
         d_bytes.unsafe_ptr(), d_cof.unsafe_ptr(), d_ceof.unsafe_ptr(),
         d_seq.unsafe_ptr(), d_gi.unsafe_ptr(), d_sm.unsafe_ptr(), d_fl.unsafe_ptr(),
@@ -400,6 +402,11 @@ def check_case(path: String, ctx: DeviceContext, mut saw_cluster: List[Bool]) ra
     ctx.enqueue_copy(dst_buf=h_sm, src_buf=d_sm)
     ctx.enqueue_copy(dst_buf=h_fl, src_buf=d_fl)
     ctx.synchronize()
+    var gpu_ns = perf_counter_ns() - t0
+    # Dispatch + readback timing per fixture — the baseline the fusion
+    # experiments answer to. At fixture sizes this is dispatch latency, not
+    # throughput; the trio's scale numbers come with the pipeline integration.
+    print("  probe+chain:", Float64(gpu_ns) / 1e6, "ms on device")
 
     # ── bit-for-bit against the CPU split form, no tolerance ────────────────
     var bad = 0
