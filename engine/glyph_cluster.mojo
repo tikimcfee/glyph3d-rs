@@ -90,24 +90,55 @@ def resolve_clusters[o: ImmOrigin](
                 if cp2 != 0xFE0F:
                     key.append(cp2)
                 p += n2
-            # The longest table prefix of the key wins.
+            # The longest table prefix of the key wins, found by descending
+            # length with a binary search per length — the section is sorted
+            # elementwise, prefix-first (asserted at bake), which is the order
+            # atlas.rs's sequence_lookup relies on too. ~50 words per probe
+            # instead of the table's whole 12,000; answers identical by
+            # construction (the longest exact prefix is unique).
             var best_len = 0
             var best_slot = 0
-            var i2 = 0
-            while i2 < len(trie.seq):
-                var elen = Int(trie.seq[i2 + 1])
-                if elen >= 2 and elen <= len(key) and elen > best_len:
-                    var is_match = True
+            var ln = min(len(key), seq_max)
+            while ln >= 2 and best_len == 0:
+                var lo = 0
+                var hi = len(trie.seq) // stride
+                while lo < hi:
+                    var mid = (lo + hi) // 2
+                    var o = mid * stride
+                    var elen = Int(trie.seq[o + 1])
+                    var cmp = 0
                     var k = 0
-                    while k < elen:
-                        if Int(trie.seq[i2 + 2 + k]) != key[k]:
-                            is_match = False
+                    var nmin = min(ln, elen)
+                    while k < nmin:
+                        var a = key[k]
+                        var b = Int(trie.seq[o + 2 + k])
+                        if a < b:
+                            cmp = -1
+                            break
+                        if a > b:
+                            cmp = 1
                             break
                         k += 1
-                    if is_match:
-                        best_len = elen
-                        best_slot = Int(trie.seq[i2])
-                i2 += stride
+                    if cmp == 0:
+                        cmp = -1 if ln < elen else (1 if ln > elen else 0)
+                    if cmp > 0:
+                        lo = mid + 1
+                    else:
+                        hi = mid
+                if lo < len(trie.seq) // stride:
+                    var o2 = lo * stride
+                    if Int(trie.seq[o2 + 1]) == ln:
+                        var ok = True
+                        var k2 = 0
+                        while k2 < ln:
+                            if key[k2] != Int(trie.seq[o2 + 2 + k2]):
+                                ok = False
+                                break
+                            k2 += 1
+                        if ok:
+                            best_len = ln
+                            best_slot = Int(trie.seq[o2])
+                ln -= 1
             if best_len > 0:
                 # The span runs through the leader that contributed the key's
                 # last matched member — count key-consumers, not members, so

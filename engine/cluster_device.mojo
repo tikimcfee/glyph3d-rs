@@ -130,25 +130,55 @@ def k_cluster_probe(
             key_len += 1
         p += nb2
 
-    # The longest table prefix of the key wins (the serial scan's order).
+    # The longest table prefix of the key wins, found by descending length
+    # with a binary search per length — the section is sorted elementwise,
+    # prefix-first (asserted at bake). The CPU rule's same move is
+    # glyph_cluster.mojo's; atlas.rs's sequence_lookup is the third writer of
+    # this ordering contract.
     var best_len = 0
     var best_slot = UInt32(0)
     var stride = 2 + Int(seq_max)
-    var i2 = 0
-    while i2 < Int(seq_count) * stride:
-        var elen = Int(seq[unsafe_offset = i2 + 1])
-        if elen >= 2 and elen <= key_len and elen > best_len:
-            var ok = True
+    var ln = min(key_len, Int(seq_max))
+    while ln >= 2 and best_len == 0:
+        var lo = 0
+        var hi = Int(seq_count)
+        while lo < hi:
+            var mid = (lo + hi) // 2
+            var o = mid * stride
+            var elen = Int(seq[unsafe_offset = o + 1])
+            var cmp = 0
             var k = 0
-            while k < elen:
-                if seq[unsafe_offset = i2 + 2 + k] != key[k]:
-                    ok = False
+            var nmin = min(ln, elen)
+            while k < nmin:
+                var a = Int(key[k])
+                var b = Int(seq[unsafe_offset = o + 2 + k])
+                if a < b:
+                    cmp = -1
+                    break
+                if a > b:
+                    cmp = 1
                     break
                 k += 1
-            if ok:
-                best_len = elen
-                best_slot = seq[unsafe_offset = i2]
-        i2 += stride
+            if cmp == 0:
+                cmp = -1 if ln < elen else (1 if ln > elen else 0)
+            if cmp > 0:
+                lo = mid + 1
+            else:
+                hi = mid
+        if lo < Int(seq_count):
+            var o2 = lo * stride
+            if Int(seq[unsafe_offset = o2 + 1]) == ln:
+                var ok = True
+                var k2 = 0
+                while k2 < ln:
+                    if Int(key[k2]) != Int(seq[unsafe_offset = o2 + 2 + k2]):
+                        ok = False
+                        break
+                    k2 += 1
+                if ok:
+                    best_len = ln
+                    best_slot = seq[unsafe_offset = o2]
+        ln -= 1
     if best_len > 0:
         # The span end: re-walk counting key-consumers, so skipped VS16s stay
         # inside the trailer span (within a matched span no break can occur —

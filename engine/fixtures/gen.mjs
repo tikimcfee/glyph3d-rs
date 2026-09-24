@@ -487,6 +487,22 @@ for (const c of CASES) {
         if (!(typeof c.bitmapAdvance === 'number' && Number.isFinite(c.bitmapAdvance))) {
             throw new Error(`${c.name}: seqs without a finite bitmapAdvance`);
         }
+        // v5 tables carry the REAL trie's contract (export-atlas's, asserted at
+        // ITS bake): entries sorted by the codepoint sequence, elementwise,
+        // shorter-prefix-first, no duplicates. The linear rule doesn't care
+        // about the order; the binary search over the section requires it.
+        c.seqs.sort(([, a], [, b]) => {
+            for (let k = 0; k < Math.min(a.length, b.length); k++) {
+                if (a[k] !== b[k]) return a[k] - b[k];
+            }
+            return a.length - b.length;
+        });
+        for (let i = 1; i < c.seqs.length; i++) {
+            const [pa, pb] = [c.seqs[i - 1][1], c.seqs[i][1]];
+            if (pa.length === pb.length && pa.every((v, k) => v === pb[k])) {
+                throw new Error(`${c.name}: duplicate sequence ${pb.map((x) => x.toString(16))}`);
+            }
+        }
         trie.seqMax = Math.max(...c.seqs.map(([, cps]) => cps.length));
         trie.bitmapAdvance = c.bitmapAdvance;
         trie.seq = [];
