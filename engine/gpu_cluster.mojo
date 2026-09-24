@@ -28,7 +28,7 @@ from max.gpu.host import DeviceContext
 from glyph_schema import SM_STRIDE, SM_ADVANCE
 from glyph_pipeline import (
     Item, run_pipeline, CLUSTER_LEADER, CLUSTER_CLUSTER,
-    F_CLUSTER_TRAILER, NEWLINE,
+    F_CLUSTER_TRAILER, NEWLINE, item_for_byte,
 )
 from fixture_io import load_pipe_fixture
 
@@ -276,13 +276,6 @@ def k_cluster_chain(
                 p += nb2
             commit_end = end
         id += nb
-
-
-def item_for_byte(items: List[Item], id: Int) -> Int:
-    for i in range(len(items)):
-        if id >= items[i].byte_start and id < items[i].byte_start + items[i].byte_count:
-            return i
-    return -1
 
 
 def check_case(path: String, ctx: DeviceContext, mut saw_cluster: List[Bool]) raises -> Int:

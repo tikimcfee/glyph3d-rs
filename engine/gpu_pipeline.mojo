@@ -59,7 +59,7 @@ def ordered_key(v: Float32) -> UInt32:
         return ~b
     return b | 0x80000000
 from glyph_scan import run_scan_pipeline
-from fixture_io import load_pipe_fixture, has_cluster_items, PipeFixture
+from fixture_io import load_pipe_fixture, PipeFixture
 from glyph_pipeline import Item, Trie
 
 comptime MAX_PRINTED = 8
@@ -507,25 +507,12 @@ def rel_close(a: Float64, b: Float64) -> Bool:
 
 
 def check_case(path: String, ctx: DeviceContext) raises -> Int:
-    var fx = load_pipe_fixture(path)
-    # No cluster kernel exists on device yet — skip, printed WITH THE PATH so
-    # a glob run can say which fixture's hole this is (check_fixture keeps its
-    # own guard for the bench path, which names no path). The CPU forms cover
-    # the rule; the device form is its own work.
-    if has_cluster_items(fx):
-        print("SKIP", path, "— cluster mode has no device form yet")
-        return 0
-    return check_fixture(fx^, ctx)
+    return check_fixture(load_pipe_fixture(path), ctx)
 
 
 def check_fixture(var fx: PipeFixture, ctx: DeviceContext, bench: Bool = False) raises -> Int:
     var n = fx.byte_len
     if n == 0:
-        return 0
-    # The bench path's cluster guard — check_case already skipped with the
-    # fixture's path; a bench reaching here names its fixture at the call site.
-    if has_cluster_items(fx):
-        print("SKIP a", fx.byte_len, "byte fixture — cluster mode has no device form yet")
         return 0
     var n_chunks = (n + CHUNK - 1) // CHUNK
     var n_supers = (n_chunks + GROUP - 1) // GROUP
