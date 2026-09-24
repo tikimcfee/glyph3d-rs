@@ -9,6 +9,7 @@
 
 from std.gpu import global_idx
 from std.utils import StaticTuple
+from std.atomic import Atomic
 from glyph_schema import SM_STRIDE, SM_ADVANCE
 from glyph_pipeline import F_CLUSTER_TRAILER, NEWLINE, Trie
 
@@ -18,6 +19,12 @@ comptime KEY_CAP = 32
 # (all of today's heads; the builder refuses a table that exceeds the cap —
 # the day one appears, the cap moves deliberately, like KEY_CAP).
 comptime HEAD_BMP_WORDS = 4096
+
+# The block-presence table: one u32 per 128 source bytes, bumped (Atomic.max)
+# by every written candidate. The chain skips empty blocks in one read — its
+# walk costs O(candidate blocks), not O(bytes), which is the whole sparse-text
+# case (measured: the byte walk was the cluster tax there, not the probes).
+comptime BLOCK_LOG2 = 7
 
 
 def build_head_bitmap(trie: Trie) raises -> List[UInt32]:
@@ -53,6 +60,7 @@ def k_cluster_probe(
     fl: MutPointer[UInt32, MutAnyOrigin],
     cand_slot: MutPointer[UInt32, MutAnyOrigin],
     cand_end: MutPointer[UInt32, MutAnyOrigin],
+    cand_blocks: MutPointer[UInt32, MutAnyOrigin],  # presence per 128-byte block
     n_bytes: Int32,
     seq_count: Int32,
     seq_max: Int32,
@@ -256,6 +264,7 @@ def k_cluster_probe(
             p2 += nb3
         cand_slot[unsafe_offset=id] = best_slot
         cand_end[unsafe_offset=id] = UInt32(p2)
+        _ = Atomic.max(cand_blocks + (id >> BLOCK_LOG2), UInt32(1))
 
 
 def k_cluster_chain(
@@ -264,6 +273,7 @@ def k_cluster_chain(
     item_cluster: MutPointer[UInt32, MutAnyOrigin],   # per item: 1 = cluster mode
     cand_slot: MutPointer[UInt32, MutAnyOrigin],
     cand_end: MutPointer[UInt32, MutAnyOrigin],
+    cand_blocks: MutPointer[UInt32, MutAnyOrigin],    # presence per 128-byte block
     gi: MutPointer[UInt32, MutAnyOrigin],
     sm: MutPointer[Float32, MutAnyOrigin],
     fl: MutPointer[UInt32, MutAnyOrigin],
@@ -271,7 +281,10 @@ def k_cluster_chain(
     item_count: Int32,
 ):
     """One thread per ITEM — the split form's commit. The carry is one
-    integer; items tile the blob, so no two threads share a byte."""
+    integer; items tile the blob, so no two threads share a byte. Two skips
+    keep the walk off cold bytes: a block whose presence word is zero holds
+    no candidate (the probe bumped it otherwise), and a committed span's tail
+    is already written by the commit loop, so the walk resumes AT its end."""
     var i = Int(global_idx.x)
     if i >= Int(item_count):
         return
@@ -281,6 +294,11 @@ def k_cluster_chain(
     var id = Int(item_ranges[unsafe_offset = i * 2])
     var stop = Int(item_ranges[unsafe_offset = i * 2 + 1])
     while id < stop:
+        if cand_blocks[unsafe_offset = id >> BLOCK_LOG2] == 0:
+            # No candidate in this 128-byte block — jump it. (A block may span
+            # the item's end; zero there means nothing for either side.)
+            id = min((id & ~127) + 128, stop)
+            continue
         var b0 = Int(bytes[unsafe_offset=id])
         var nb: Int
         if (b0 & 0x80) == 0x00:
@@ -318,5 +336,7 @@ def k_cluster_chain(
                 fl[unsafe_offset=p] = fl[unsafe_offset=p] | UInt32(F_CLUSTER_TRAILER)
                 p += nb2
             commit_end = end
-        id += nb
+            id = end  # the span's members are written; resume past it
+        else:
+            id += nb
 

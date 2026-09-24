@@ -131,6 +131,7 @@ def check_case(path: String, ctx: DeviceContext, mut saw_cluster: List[Bool]) ra
     var d_ic = ctx.enqueue_create_buffer[DType.uint32](item_count)
     var d_cslot = ctx.enqueue_create_buffer[DType.uint32](n)
     var d_cend = ctx.enqueue_create_buffer[DType.uint32](n)
+    var d_cblk = ctx.enqueue_create_buffer[DType.uint32]((n + 127) >> 7)
     ctx.enqueue_copy(dst_buf=d_bytes, src_buf=h_bytes)
     ctx.enqueue_copy(dst_buf=d_gi, src_buf=h_gi)
     ctx.enqueue_copy(dst_buf=d_sm, src_buf=h_sm)
@@ -143,19 +144,20 @@ def check_case(path: String, ctx: DeviceContext, mut saw_cluster: List[Bool]) ra
     ctx.enqueue_copy(dst_buf=d_ic, src_buf=h_ic)
     d_cslot.enqueue_fill(0)
     d_cend.enqueue_fill(0)
+    d_cblk.enqueue_fill(0)
 
     comptime B = 256
     var t0 = perf_counter_ns()
     ctx.enqueue_function[k_cluster_probe](
         d_bytes.unsafe_ptr(), d_cof.unsafe_ptr(), d_ceof.unsafe_ptr(),
         d_seq.unsafe_ptr(), d_bmp.unsafe_ptr(), d_gi.unsafe_ptr(), d_sm.unsafe_ptr(), d_fl.unsafe_ptr(),
-        d_cslot.unsafe_ptr(), d_cend.unsafe_ptr(),
+        d_cslot.unsafe_ptr(), d_cend.unsafe_ptr(), d_cblk.unsafe_ptr(),
         Int32(n), Int32(seq_count), Int32(fx.trie.seq_max),
         grid_dim=(n + B - 1) // B, block_dim=B,
     )
     ctx.enqueue_function[k_cluster_chain](
         d_bytes.unsafe_ptr(), d_ir.unsafe_ptr(), d_ic.unsafe_ptr(),
-        d_cslot.unsafe_ptr(), d_cend.unsafe_ptr(),
+        d_cslot.unsafe_ptr(), d_cend.unsafe_ptr(), d_cblk.unsafe_ptr(),
         d_gi.unsafe_ptr(), d_sm.unsafe_ptr(), d_fl.unsafe_ptr(),
         fx.trie.bitmap_advance, Int32(item_count),
         grid_dim=(item_count + 63) // 64, block_dim=64,

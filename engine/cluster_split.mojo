@@ -162,4 +162,6 @@ def chain_clusters[o: ImmOrigin](
                 slots.set_flags(p, slots.flags(p) | F_CLUSTER_TRAILER)
                 p += n2
             commit_end = end
-        id += n
+            id = end  # the span's members are written; resume past it
+        else:
+            id += n
