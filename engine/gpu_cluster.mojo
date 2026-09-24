@@ -35,7 +35,9 @@ from fixture_io import load_pipe_fixture
 comptime MAX_PRINTED = 8
 # The kernels and their key-buffer cap moved to cluster_device.mojo, shared
 # with gpu_pipeline.mojo — one definition so the harnesses can't drift the rule.
-from cluster_device import KEY_CAP, k_cluster_probe, k_cluster_chain
+from cluster_device import (
+    KEY_CAP, HEAD_BMP_WORDS, build_head_bitmap, k_cluster_probe, k_cluster_chain,
+)
 
 
 
@@ -91,6 +93,7 @@ def check_case(path: String, ctx: DeviceContext, mut saw_cluster: List[Bool]) ra
     var h_sm = ctx.enqueue_create_host_buffer[DType.float32](n * SM_STRIDE)
     var h_fl = ctx.enqueue_create_host_buffer[DType.uint32](n)
     var h_seq = ctx.enqueue_create_host_buffer[DType.uint32](n_seq)
+    var h_bmp = ctx.enqueue_create_host_buffer[DType.uint32](HEAD_BMP_WORDS)
     var h_ceof = ctx.enqueue_create_host_buffer[DType.uint32](n)
     var h_cof = ctx.enqueue_create_host_buffer[DType.uint32](n)
     var h_ir = ctx.enqueue_create_host_buffer[DType.uint32](item_count * 2)
@@ -108,6 +111,9 @@ def check_case(path: String, ctx: DeviceContext, mut saw_cluster: List[Bool]) ra
         h_seq[i] = fx.trie.seq[i]
     if len(fx.trie.seq) == 0:
         h_seq[0] = 0
+    var head_bmp = build_head_bitmap(fx.trie)
+    for i in range(HEAD_BMP_WORDS):
+        h_bmp[i] = head_bmp[i]
     for i in range(item_count * 2):
         h_ir[i] = item_ranges[i]
     for i in range(item_count):
@@ -118,6 +124,7 @@ def check_case(path: String, ctx: DeviceContext, mut saw_cluster: List[Bool]) ra
     var d_sm = ctx.enqueue_create_buffer[DType.float32](n * SM_STRIDE)
     var d_fl = ctx.enqueue_create_buffer[DType.uint32](n)
     var d_seq = ctx.enqueue_create_buffer[DType.uint32](n_seq)
+    var d_bmp = ctx.enqueue_create_buffer[DType.uint32](HEAD_BMP_WORDS)
     var d_ceof = ctx.enqueue_create_buffer[DType.uint32](n)
     var d_cof = ctx.enqueue_create_buffer[DType.uint32](n)
     var d_ir = ctx.enqueue_create_buffer[DType.uint32](item_count * 2)
@@ -129,6 +136,7 @@ def check_case(path: String, ctx: DeviceContext, mut saw_cluster: List[Bool]) ra
     ctx.enqueue_copy(dst_buf=d_sm, src_buf=h_sm)
     ctx.enqueue_copy(dst_buf=d_fl, src_buf=h_fl)
     ctx.enqueue_copy(dst_buf=d_seq, src_buf=h_seq)
+    ctx.enqueue_copy(dst_buf=d_bmp, src_buf=h_bmp)
     ctx.enqueue_copy(dst_buf=d_ceof, src_buf=h_ceof)
     ctx.enqueue_copy(dst_buf=d_cof, src_buf=h_cof)
     ctx.enqueue_copy(dst_buf=d_ir, src_buf=h_ir)
@@ -140,7 +148,7 @@ def check_case(path: String, ctx: DeviceContext, mut saw_cluster: List[Bool]) ra
     var t0 = perf_counter_ns()
     ctx.enqueue_function[k_cluster_probe](
         d_bytes.unsafe_ptr(), d_cof.unsafe_ptr(), d_ceof.unsafe_ptr(),
-        d_seq.unsafe_ptr(), d_gi.unsafe_ptr(), d_sm.unsafe_ptr(), d_fl.unsafe_ptr(),
+        d_seq.unsafe_ptr(), d_bmp.unsafe_ptr(), d_gi.unsafe_ptr(), d_sm.unsafe_ptr(), d_fl.unsafe_ptr(),
         d_cslot.unsafe_ptr(), d_cend.unsafe_ptr(),
         Int32(n), Int32(seq_count), Int32(fx.trie.seq_max),
         grid_dim=(n + B - 1) // B, block_dim=B,

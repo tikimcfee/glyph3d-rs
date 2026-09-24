@@ -10,9 +10,36 @@
 from std.gpu import global_idx
 from std.utils import StaticTuple
 from glyph_schema import SM_STRIDE, SM_ADVANCE
-from glyph_pipeline import F_CLUSTER_TRAILER, NEWLINE
+from glyph_pipeline import F_CLUSTER_TRAILER, NEWLINE, Trie
 
 comptime KEY_CAP = 32
+
+# The candidacy bitmap: 4096 u32 words cover every codepoint below 0x20000
+# (all of today's heads; the builder refuses a table that exceeds the cap —
+# the day one appears, the cap moves deliberately, like KEY_CAP).
+comptime HEAD_BMP_WORDS = 4096
+
+
+def build_head_bitmap(trie: Trie) raises -> List[UInt32]:
+    """The table's first-members set as a bitmap — the probe kernel's one-load
+    candidacy test (the CPU rule's `first` set, flattened for the device).
+    Derived from the table itself, so it can never drift from it."""
+    var bmp = List[UInt32](length=HEAD_BMP_WORDS, fill=0)
+    var stride = 2 + trie.seq_max
+    var i = 0
+    while i < len(trie.seq):
+        var cp = Int(trie.seq[i + 2])
+        # A static-zero head never heads a probe (the kernel zeroes statics
+        # before the candidacy read) — the one such entry in the table is the
+        # font's dead (cancel-tag, black-flag) rule; skip it here.
+        if cp == 0x200D or (cp >= 0xFE00 and cp <= 0xFE0F) or (cp >= 0xE0020 and cp <= 0xE007F):
+            i += stride
+            continue
+        if cp >= 0x20000:
+            raise Error("sequence head at/above 0x20000 — the candidacy bitmap's cap moves deliberately")
+        bmp[cp >> 5] = bmp[cp >> 5] | UInt32(1 << (cp & 31))
+        i += stride
+    return bmp^
 
 
 def k_cluster_probe(
@@ -20,6 +47,7 @@ def k_cluster_probe(
     cluster_of: MutPointer[UInt32, MutAnyOrigin],   # per byte: 1 in a cluster item
     item_end: MutPointer[UInt32, MutAnyOrigin],     # per byte: the item's end offset
     seq: MutPointer[UInt32, MutAnyOrigin],          # the v2 sequence section, verbatim
+    cand_bmp: MutPointer[UInt32, MutAnyOrigin],     # build_head_bitmap: the first members
     gi: MutPointer[UInt32, MutAnyOrigin],
     sm: MutPointer[Float32, MutAnyOrigin],
     fl: MutPointer[UInt32, MutAnyOrigin],
@@ -29,10 +57,10 @@ def k_cluster_probe(
     seq_count: Int32,
     seq_max: Int32,
 ):
-    """One thread per byte — cluster_split.mojo's probe_clusters, ported. The
-    head-candidacy set is skipped on purpose: a codepoint no sequence starts
-    with fails the table search anyway, so the answers are identical and only
-    the work differs (the bitmap belongs to the measured-optimization step)."""
+    """One thread per byte — cluster_split.mojo's probe_clusters, ported.
+    Candidacy is one bitmap load (the table's first members); a codepoint no
+    sequence starts with exits there, never paying for the window or the
+    search."""
     var id = Int(global_idx.x)
     var n = Int(n_bytes)
     if id >= n:
@@ -81,6 +109,15 @@ def k_cluster_probe(
         gi[unsafe_offset=id] = 0
         sm[unsafe_offset = id * SM_STRIDE + SM_ADVANCE] = Float32(0)
         fl[unsafe_offset=id] = fl[unsafe_offset=id] | UInt32(F_CLUSTER_TRAILER)
+        return
+
+    # Candidacy: one bitmap load instead of a search. The bitmap is the
+    # table's own first members (build_head_bitmap), so false negatives are
+    # impossible by construction; above the cap is never a head (the builder
+    # refuses such a table).
+    if cp >= 0x20000:
+        return
+    if (Int(cand_bmp[unsafe_offset = cp >> 5]) & (1 << (cp & 31))) == 0:
         return
 
     # The probe window: up to seq_max EFFECTIVE codepoints, VS16 dropped from

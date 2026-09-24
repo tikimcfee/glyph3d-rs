@@ -59,7 +59,9 @@ def ordered_key(v: Float32) -> UInt32:
         return ~b
     return b | 0x80000000
 from glyph_scan import run_scan_pipeline
-from cluster_device import k_cluster_probe, k_cluster_chain
+from cluster_device import (
+    k_cluster_probe, k_cluster_chain, build_head_bitmap, HEAD_BMP_WORDS,
+)
 from fixture_io import load_pipe_fixture, PipeFixture, load_trie_blob
 from glyph_pipeline import Item, Trie
 
@@ -587,6 +589,7 @@ def check_fixture(var fx: PipeFixture, ctx: DeviceContext, bench: Bool = False) 
     var h_gi = ctx.enqueue_create_host_buffer[DType.uint32](n)
     var n_seq = len(fx.trie.seq) if len(fx.trie.seq) > 0 else 1
     var h_seq = ctx.enqueue_create_host_buffer[DType.uint32](n_seq)
+    var h_bmp = ctx.enqueue_create_host_buffer[DType.uint32](HEAD_BMP_WORDS)
     var h_ceof = ctx.enqueue_create_host_buffer[DType.uint32](n)
     var h_cof = ctx.enqueue_create_host_buffer[DType.uint32](n)
     var h_ir = ctx.enqueue_create_host_buffer[DType.uint32](item_count * 2)
@@ -604,6 +607,9 @@ def check_fixture(var fx: PipeFixture, ctx: DeviceContext, bench: Bool = False) 
         h_seq[i] = fx.trie.seq[i]
     if len(fx.trie.seq) == 0:
         h_seq[0] = 0
+    var head_bmp = build_head_bitmap(fx.trie)
+    for i in range(HEAD_BMP_WORDS):
+        h_bmp[i] = head_bmp[i]
     for i in range(item_count * 2):
         h_ir[i] = item_ranges[i]
     for i in range(item_count):
@@ -685,6 +691,7 @@ def check_fixture(var fx: PipeFixture, ctx: DeviceContext, bench: Bool = False) 
     var d_bytes = ctx.enqueue_create_buffer[DType.uint8](n)
     var d_gi = ctx.enqueue_create_buffer[DType.uint32](n)
     var d_seq = ctx.enqueue_create_buffer[DType.uint32](n_seq)
+    var d_bmp = ctx.enqueue_create_buffer[DType.uint32](HEAD_BMP_WORDS)
     var d_ceof = ctx.enqueue_create_buffer[DType.uint32](n)
     var d_cof = ctx.enqueue_create_buffer[DType.uint32](n)
     var d_ir = ctx.enqueue_create_buffer[DType.uint32](item_count * 2)
@@ -710,6 +717,7 @@ def check_fixture(var fx: PipeFixture, ctx: DeviceContext, bench: Bool = False) 
     ctx.enqueue_copy(dst_buf=d_bytes, src_buf=h_bytes)
     ctx.enqueue_copy(dst_buf=d_gi, src_buf=h_gi)
     ctx.enqueue_copy(dst_buf=d_seq, src_buf=h_seq)
+    ctx.enqueue_copy(dst_buf=d_bmp, src_buf=h_bmp)
     ctx.enqueue_copy(dst_buf=d_ceof, src_buf=h_ceof)
     ctx.enqueue_copy(dst_buf=d_cof, src_buf=h_cof)
     ctx.enqueue_copy(dst_buf=d_ir, src_buf=h_ir)
@@ -734,7 +742,7 @@ def check_fixture(var fx: PipeFixture, ctx: DeviceContext, bench: Bool = False) 
     # the rewritten statics — same order as the CPU's resolve-before-fold.
     ctx.enqueue_function[k_cluster_probe](
         d_bytes.unsafe_ptr(), d_cof.unsafe_ptr(), d_ceof.unsafe_ptr(),
-        d_seq.unsafe_ptr(), d_gi.unsafe_ptr(), d_sm.unsafe_ptr(), d_fl.unsafe_ptr(),
+        d_seq.unsafe_ptr(), d_bmp.unsafe_ptr(), d_gi.unsafe_ptr(), d_sm.unsafe_ptr(), d_fl.unsafe_ptr(),
         d_cslot.unsafe_ptr(), d_cend.unsafe_ptr(),
         Int32(n), Int32(seq_count), Int32(fx.trie.seq_max),
         grid_dim=(n + B - 1) // B, block_dim=B,
