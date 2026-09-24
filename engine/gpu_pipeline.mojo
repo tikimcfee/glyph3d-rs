@@ -60,7 +60,7 @@ def ordered_key(v: Float32) -> UInt32:
     return b | 0x80000000
 from glyph_scan import run_scan_pipeline
 from cluster_device import k_cluster_probe, k_cluster_chain
-from fixture_io import load_pipe_fixture, PipeFixture
+from fixture_io import load_pipe_fixture, PipeFixture, load_trie_blob
 from glyph_pipeline import Item, Trie
 
 comptime MAX_PRINTED = 8
@@ -910,16 +910,18 @@ def synthetic_case(
     return check_fixture(fx^, ctx)
 
 
-def bench_scaling(trie: Trie, path: String, ctx: DeviceContext) raises:
+def bench_scaling(trie: Trie, path: String, ctx: DeviceContext, cluster: Bool = False) raises:
     """Time the SAME chain the conformance suite proves, across corpus sizes.
 
     The GPU timing spans the whole device phase — the dispatches AND the readbacks,
     including the host-side stride derivation between resolveX and paginate. Timing
-    only the kernels would flatter the GPU by hiding the part a real caller pays."""
+    only the kernels would flatter the GPU by hiding the part a real caller pays.
+    `cluster` runs the items under cluster mode (the sequence pass's device form
+    included); leader mode skips the pass's dispatches at the pipeline's own gate."""
     var f = open(path, "r")
     var all_bytes = f.read_bytes()
     f.close()
-    print("corpus:", path, "(", len(all_bytes), "bytes )")
+    print("corpus:", path, "(", len(all_bytes), "bytes )", "cluster" if cluster else "leader")
     print("")
     var sizes = List[Int]()
     sizes.append(65536)
@@ -940,6 +942,7 @@ def bench_scaling(trie: Trie, path: String, ctx: DeviceContext) raises:
         it.byte_start = 0
         it.byte_count = nb
         it.line_height = 1
+        it.cluster_mode = CLUSTER_CLUSTER if cluster else CLUSTER_LEADER
         var items = List[Item]()
         items.append(it^)
         var fx = PipeFixture()
@@ -962,6 +965,13 @@ def main() raises:
     if String(args[1]) == "--bench":
         var seed = load_pipe_fixture(String(args[2]))
         bench_scaling(seed.trie, String(args[3]), ctx)
+        return
+    # --bench-cluster <corpus>: the same sweep under cluster mode against the
+    # REAL atlas trie (the full 4,166-sequence table), so dense emoji content
+    # resolves for real instead of probing a fixture's synthetic table.
+    if String(args[1]) == "--bench-cluster":
+        var real_trie = load_trie_blob(String(args[2]))
+        bench_scaling(real_trie, String(args[3]), ctx, cluster=True)
         return
     var total_bad = 0
     for i in range(1, len(args)):
