@@ -90,8 +90,12 @@ case); the monoid design stays shelved, the chain's carry is one integer.
 And 2026-09-22 later: the device port itself — gpu_cluster.mojo runs
 k_cluster_probe (thread per byte) + k_cluster_chain (thread per item) on
 device, bit-exact against the split on every fixture, with the phantom guard
-mutation mirrored. The device PIPELINE's other stages still skip cluster
-fixtures (printed) until the dispatch lands in gpu_pipeline.mojo.
+mutation mirrored. 2026-09-24: the dispatch landed in gpu_pipeline.mojo —
+cluster_device.mojo shares the kernels between the standalone proof and the
+full-device pipeline, which now computes the pass on device (leader-forced
+decode uploaded, probe+chain rewrite it before the scan) and covers it end
+to end against the resolving CPU reference; the five stage suites' skips
+were measured stale and removed the same day.
 Bake v4 (the tail fold re-derives trie advances today; `conformance_resume`
 skips cluster items, printed). Shaping — Turing-complete, CPU-side everywhere
 in the industry, and this engine's measured-placement model does not need it

@@ -40,7 +40,7 @@ from glyph_schema import (
 )
 from glyph_pipeline import (
     F_LEADER, F_NEWLINE, trunc_nonneg, item_for_byte, derive_stride,
-    WRAP_DOWN, WRAP_BACK,
+    WRAP_DOWN, WRAP_BACK, run_pipeline, CLUSTER_LEADER, CLUSTER_CLUSTER,
 )
 
 
@@ -59,6 +59,7 @@ def ordered_key(v: Float32) -> UInt32:
         return ~b
     return b | 0x80000000
 from glyph_scan import run_scan_pipeline
+from cluster_device import k_cluster_probe, k_cluster_chain
 from fixture_io import load_pipe_fixture, PipeFixture
 from glyph_pipeline import Item, Trie
 
@@ -536,6 +537,36 @@ def check_fixture(var fx: PipeFixture, ctx: DeviceContext, bench: Bool = False) 
         is_start[id] = UInt32(1) if (i >= 0 and fx.items[i].byte_start == id) else UInt32(0)
         item_start[id] = UInt32(fx.items[i].byte_start) if i >= 0 else UInt32(0)
 
+    # The sequence pass runs ON DEVICE here (it used to arrive pre-computed in
+    # the uploaded lanes). The decoded-but-unresolved statics come from a
+    # leader-forced CPU run (decode is proven in gpu_decode); the device
+    # probe+chain dispatches rewrite them before the scan consumes any
+    # advance. The scan reference (cpu, resolving) stays the comparison, so
+    # the device form of the pass is covered end to end.
+    var items_leader = List[Item]()
+    for i in range(len(fx.items)):
+        var t = fx.items[i].copy()
+        t.cluster_mode = CLUSTER_LEADER
+        items_leader.append(t^)
+    var dec = run_pipeline[witness=False](fx.bytes, fx.trie, items_leader^)
+
+    var item_end_of = List[UInt32](unsafe_uninit_length=n)
+    var cluster_of = List[UInt32](unsafe_uninit_length=n)
+    for id in range(n):
+        var i = item_for_byte(fx.items, id)
+        item_end_of[id] = UInt32(fx.items[i].byte_start + fx.items[i].byte_count) if i >= 0 else 0
+        cluster_of[id] = UInt32(1) if (i >= 0 and fx.items[i].cluster_mode == CLUSTER_CLUSTER) else UInt32(0)
+    var item_count = len(fx.items)
+    var item_ranges = List[UInt32](unsafe_uninit_length=item_count * 2)
+    var item_cluster = List[UInt32](unsafe_uninit_length=item_count)
+    for i in range(item_count):
+        item_ranges[i * 2] = UInt32(fx.items[i].byte_start)
+        item_ranges[i * 2 + 1] = UInt32(fx.items[i].byte_start + fx.items[i].byte_count)
+        item_cluster[i] = UInt32(1) if fx.items[i].cluster_mode == CLUSTER_CLUSTER else UInt32(0)
+    var seq_count = 0
+    if fx.trie.seq_max > 0:
+        seq_count = len(fx.trie.seq) // (2 + fx.trie.seq_max)
+
     # ── upload the DECODED lanes (decode itself is proven in gpu_decode) ─────
     var h_fl = ctx.enqueue_create_host_buffer[DType.uint32](n)
     var h_sm = ctx.enqueue_create_host_buffer[DType.float32](n * SM_STRIDE)
@@ -549,13 +580,34 @@ def check_fixture(var fx: PipeFixture, ctx: DeviceContext, bench: Bool = False) 
     var h_wc = ctx.enqueue_create_host_buffer[DType.uint32](n)
     var h_otb = ctx.enqueue_create_host_buffer[DType.uint32](n)
     ctx.synchronize()
-    # Only the DECODE lanes are seeded; ROW/COL/ORD/LINE_ADV are what the device
-    # must produce, so they start zeroed and cannot be accidentally "verified"
-    # against values that were handed to it.
+    # The seeded statics are the LEADER-FORCED decode (unresolved): the pass
+    # itself is what the device must produce, so the resolved form cannot be
+    # handed to it. ROW/COL/ORD/LINE_ADV stay zeroed as before.
+    var h_bytes = ctx.enqueue_create_host_buffer[DType.uint8](n)
+    var h_gi = ctx.enqueue_create_host_buffer[DType.uint32](n)
+    var n_seq = len(fx.trie.seq) if len(fx.trie.seq) > 0 else 1
+    var h_seq = ctx.enqueue_create_host_buffer[DType.uint32](n_seq)
+    var h_ceof = ctx.enqueue_create_host_buffer[DType.uint32](n)
+    var h_cof = ctx.enqueue_create_host_buffer[DType.uint32](n)
+    var h_ir = ctx.enqueue_create_host_buffer[DType.uint32](item_count * 2)
+    var h_ic = ctx.enqueue_create_host_buffer[DType.uint32](item_count)
+    ctx.synchronize()
     for id in range(n):
-        h_fl[id] = cpu.fl[id]
+        h_fl[id] = dec.fl[id]
+        h_gi[id] = dec.gi[id]
+        h_bytes[id] = fx.bytes[id]
+        h_ceof[id] = item_end_of[id]
+        h_cof[id] = cluster_of[id]
     for i in range(n * SM_STRIDE):
-        h_sm[i] = cpu.sm[i]
+        h_sm[i] = dec.sm[i]
+    for i in range(len(fx.trie.seq)):
+        h_seq[i] = fx.trie.seq[i]
+    if len(fx.trie.seq) == 0:
+        h_seq[0] = 0
+    for i in range(item_count * 2):
+        h_ir[i] = item_ranges[i]
+    for i in range(item_count):
+        h_ic[i] = item_cluster[i]
     for i in range(n * LM_STRIDE):
         h_lm[i] = 0
     for i in range(n * LC_STRIDE):
@@ -630,6 +682,15 @@ def check_fixture(var fx: PipeFixture, ctx: DeviceContext, bench: Bool = False) 
     var d_io = ctx.enqueue_create_buffer[DType.uint32](n)
     var d_rmax = ctx.enqueue_create_buffer[DType.uint32](ni)
     var d_xmax = ctx.enqueue_create_buffer[DType.uint32](ni)
+    var d_bytes = ctx.enqueue_create_buffer[DType.uint8](n)
+    var d_gi = ctx.enqueue_create_buffer[DType.uint32](n)
+    var d_seq = ctx.enqueue_create_buffer[DType.uint32](n_seq)
+    var d_ceof = ctx.enqueue_create_buffer[DType.uint32](n)
+    var d_cof = ctx.enqueue_create_buffer[DType.uint32](n)
+    var d_ir = ctx.enqueue_create_buffer[DType.uint32](item_count * 2)
+    var d_ic = ctx.enqueue_create_buffer[DType.uint32](item_count)
+    var d_cslot = ctx.enqueue_create_buffer[DType.uint32](n)
+    var d_cend = ctx.enqueue_create_buffer[DType.uint32](n)
     ctx.enqueue_copy(dst_buf=d_fl, src_buf=h_fl)
     ctx.enqueue_copy(dst_buf=d_sm, src_buf=h_sm)
     ctx.enqueue_copy(dst_buf=d_lm, src_buf=h_lm)
@@ -646,6 +707,15 @@ def check_fixture(var fx: PipeFixture, ctx: DeviceContext, bench: Bool = False) 
     ctx.enqueue_copy(dst_buf=d_io, src_buf=h_io)
     ctx.enqueue_copy(dst_buf=d_rmax, src_buf=h_rmax)
     ctx.enqueue_copy(dst_buf=d_xmax, src_buf=h_xmax)
+    ctx.enqueue_copy(dst_buf=d_bytes, src_buf=h_bytes)
+    ctx.enqueue_copy(dst_buf=d_gi, src_buf=h_gi)
+    ctx.enqueue_copy(dst_buf=d_seq, src_buf=h_seq)
+    ctx.enqueue_copy(dst_buf=d_ceof, src_buf=h_ceof)
+    ctx.enqueue_copy(dst_buf=d_cof, src_buf=h_cof)
+    ctx.enqueue_copy(dst_buf=d_ir, src_buf=h_ir)
+    ctx.enqueue_copy(dst_buf=d_ic, src_buf=h_ic)
+    d_cslot.enqueue_fill(0)
+    d_cend.enqueue_fill(0)
     d_pc.enqueue_fill(0)
     d_uc.enqueue_fill(0)
     d_fc.enqueue_fill(0)
@@ -659,6 +729,23 @@ def check_fixture(var fx: PipeFixture, ctx: DeviceContext, bench: Bool = False) 
     ctx.synchronize()
     var g0 = perf_counter_ns()
     comptime B = 128
+    # THE SEQUENCE PASS, on device: probe (thread per byte) writes candidates,
+    # the chain (thread per item) commits them. The scan's kernels below read
+    # the rewritten statics — same order as the CPU's resolve-before-fold.
+    ctx.enqueue_function[k_cluster_probe](
+        d_bytes.unsafe_ptr(), d_cof.unsafe_ptr(), d_ceof.unsafe_ptr(),
+        d_seq.unsafe_ptr(), d_gi.unsafe_ptr(), d_sm.unsafe_ptr(), d_fl.unsafe_ptr(),
+        d_cslot.unsafe_ptr(), d_cend.unsafe_ptr(),
+        Int32(n), Int32(seq_count), Int32(fx.trie.seq_max),
+        grid_dim=(n + B - 1) // B, block_dim=B,
+    )
+    ctx.enqueue_function[k_cluster_chain](
+        d_bytes.unsafe_ptr(), d_ir.unsafe_ptr(), d_ic.unsafe_ptr(),
+        d_cslot.unsafe_ptr(), d_cend.unsafe_ptr(),
+        d_gi.unsafe_ptr(), d_sm.unsafe_ptr(), d_fl.unsafe_ptr(),
+        fx.trie.bitmap_advance, Int32(item_count),
+        grid_dim=(item_count + 63) // 64, block_dim=64,
+    )
     ctx.enqueue_function[k_chunk_reduce](
         d_fl.unsafe_ptr(), d_sm.unsafe_ptr(), d_w.unsafe_ptr(), d_md.unsafe_ptr(),
         d_s.unsafe_ptr(),
@@ -908,6 +995,6 @@ def main() raises:
         total_bad += b1 + b2 + b3
 
     if total_bad == 0:
-        print("gpu pipeline: eight dispatches chained on device — counts exact, positions within 1e-4")
+        print("gpu pipeline: ten dispatches chained on device — counts exact, positions within 1e-4")
     else:
         raise Error("gpu pipeline diverged")

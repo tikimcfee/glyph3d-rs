@@ -492,13 +492,26 @@ expect = "Coverage DROPPED"
 [[mutation]]
 name = "gpu-cluster-phantom-commit"
 gate = "engine-suites"
-why = "the device chain's carry guard is the phantom suppressor, exactly as in the CPU split — dropping it turns the device commit into a windowed OR, and gpu_cluster must redden on cluster-overlap. The device twin of cluster-split-phantom-commit; if only one of the pair ever fires, the two chains have drifted."
-file = "engine/gpu_cluster.mojo"
+why = "the device chain's carry guard is the phantom suppressor, exactly as in the CPU split — dropping it turns the device commit into a windowed OR, and the phantom fixture reddens the device suites (gpu_pipeline runs before gpu_cluster in the GPU list, so its error surfaces first). The device twin of cluster-split-phantom-commit; if only one of the pair ever fires, the two chains have drifted."
+file = "engine/cluster_device.mojo"
 rebuild = "pixi run build-engine"
 op = "replace"
 find = "        if slot != 0 and id >= commit_end:"
 with = "        if slot != 0:"
-expect = "gpu cluster diverged"
+expect = "gpu pipeline diverged"
+
+[[mutation]]
+name = "gpu-pipeline-probe-zero"
+gate = "engine-suites"
+why = "the anti-vacuity pin for the integration: the probe dispatch must be LIVE in gpu_pipeline's device chain — with candidate writes removed, nothing resolves and the cluster fixtures' resolved lanes never happen. If gpu_pipeline ever reverts to uploading pre-resolved lanes (or the dispatch drops), this is the mutation that says so."
+file = "engine/cluster_device.mojo"
+rebuild = "pixi run build-engine"
+op = "replace"
+find = """        cand_slot[unsafe_offset=id] = best_slot
+        cand_end[unsafe_offset=id] = UInt32(p2)"""
+with = """        cand_slot[unsafe_offset=id] = 0
+        cand_end[unsafe_offset=id] = UInt32(p2)"""
+expect = "gpu pipeline diverged"
 
 [[mutation]]
 name = "cluster-split-phantom-commit"
