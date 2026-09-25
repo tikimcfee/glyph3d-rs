@@ -4,7 +4,7 @@
 # resolve_clusters (glyph_cluster.mojo) is a serial left-to-right walk; the
 # device kernels cannot be one (a thread per leader cannot know whether an
 # earlier match swallowed it). cluster_split.mojo splits the rule into a
-# per-position probe and a commit chain, and run_pipeline's comptime `split`
+# per-position probe and a commit chain, and run_pipeline's comptime `cluster_split`
 # param swaps it in. This suite runs both instantiations over every fixture
 # and diffs every lane — statics (gi, sm, fl) AND the fold's output (lm, lc),
 # so it proves the fold downstream reads identical input, not just that the
@@ -39,7 +39,7 @@ def main() raises:
     for a in range(1, len(args)):
         var fx = load_pipe_fixture(String(args[a]))
         var ser = run_pipeline(fx.bytes, fx.trie, fx.items)
-        var spl = run_pipeline[split=True](fx.bytes, fx.trie, fx.items)
+        var spl = run_pipeline[cluster_split=True](fx.bytes, fx.trie, fx.items)
         var bad = 0
         var printed = 0
         var has_cluster = False

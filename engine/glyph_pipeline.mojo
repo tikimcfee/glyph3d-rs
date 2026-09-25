@@ -1197,7 +1197,7 @@ def shard_lo(start: Int, stop: Int, workers: Int, w: Int) -> Int:
     return a if a < stop else stop
 
 
-def run_pipeline[o: ImmOrigin, witness: Bool = True, split: Bool = False](
+def run_pipeline[o: ImmOrigin, witness: Bool = True, cluster_split: Bool = False](
     bytes: Span[UInt8, o], trie: Trie, items: List[Item]
 ) -> PipelineResult:
     """Fold into a FRESH result. The allocating shape, and the one every suite
@@ -1208,16 +1208,16 @@ def run_pipeline[o: ImmOrigin, witness: Bool = True, split: Bool = False](
     output to a single whole-corpus call, and the only way to be sure of that is
     for there to be nothing to diverge.
 
-    `split` (comptime, default False — production runs the serial rule) swaps
+    `cluster_split` (comptime, default False — production runs the serial rule) swaps
     the sequence pass's resolver for the two-pass probe+chain decomposition
     (cluster_split.mojo), the form the device kernels port. conformance_split
     proves the swap bit-identical over the whole corpus."""
     var r = PipelineResult()
-    run_pipeline_into[witness=witness, split=split](r, bytes, trie, items)
+    run_pipeline_into[witness=witness, cluster_split=cluster_split](r, bytes, trie, items)
     return r^
 
 
-def run_pipeline_into[o: ImmOrigin, witness: Bool = True, split: Bool = False](
+def run_pipeline_into[o: ImmOrigin, witness: Bool = True, cluster_split: Bool = False](
     mut r: PipelineResult, bytes: Span[UInt8, o], trie: Trie, items: List[Item]
 ):
     """The whole pipeline — the oracle's runPipeline, natively, sharded across
@@ -1330,7 +1330,7 @@ def run_pipeline_into[o: ImmOrigin, witness: Bool = True, split: Bool = False](
             any_cluster = True
             break
     if any_cluster:
-        comptime if split:
+        comptime if cluster_split:
             # The two-pass form under test: probe writes candidates, the chain
             # commits. One shared cand buffer pair — items tile the blob, so
             # per-item writes never share a byte.
