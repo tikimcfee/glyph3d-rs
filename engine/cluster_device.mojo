@@ -790,3 +790,215 @@ def k_decode_probe[probe: Bool, walk: Bool = False](
                 cand_slot[unsafe_offset=id] = best_slot
                 cand_end[unsafe_offset=id] = UInt32(p2)
                 _ = Atomic.max(cand_blocks.unsafe_offset(id >> BLOCK_LOG2), UInt32(1))
+
+
+# ── the chain, chunk-parallel ───────────────────────────────────────────────
+# k_cluster_chain is thread-per-ITEM: one thread walks an item's whole byte
+# range, so a single-item corpus runs the commit serially while the device
+# idles (measured 2026-09-25: 90% of the dense-emoji device phase). The three
+# kernels below run the same greedy rule per 128-byte BLOCK (the presence
+# table's own partition) with a one-integer carry stitched between blocks:
+#
+#   k_chain_free   (thread/block) — the greedy walk with a free in-carry;
+#                    out[c] = the last committed span's end iff it crosses the
+#                    block end, else 0.
+#   k_chain_stitch (one thread)   — the carry recurrence r_{c+1} = f_c(r_c):
+#                    r <= block start: free entry, r = out[c]; r inside: the
+#                    block gets r as its in-carry and a bounded re-walk (<= one
+#                    block) computes the new carry; r past the block end: the
+#                    span covers the whole block and passes through, O(1).
+#   k_chain_commit (thread/block) — re-walks with the RESOLVED in-carry and
+#                    writes the commits. The re-walk is required, not
+#                    conservative: a nonzero carry can ENABLE a candidate the
+#                    free walk suppressed (W=[0,10), Y=[5,15), X=[12,14) — the
+#                    free walk commits W and Y; carry 11 skips both and commits
+#                    X), so the committed set genuinely depends on the carry.
+#
+# The walk's whole state is the resume position, which is why one integer is
+# the whole carry. Every block's statics are written ONLY by the block
+# containing the byte (a crossing span's trailers are written by the successor
+# blocks, per leader) — the serial form's race-freedom ("items tile the blob")
+# holds under the new partition. Spans clamp at item ends in the probe, so the
+# carry never crosses an item boundary and the walk needs no item logic at all.
+
+
+def chain_walk[write: Bool](
+    bytes: MutPointer[UInt8, MutAnyOrigin],
+    cand_slot: MutPointer[UInt32, MutAnyOrigin],
+    cand_end: MutPointer[UInt32, MutAnyOrigin],
+    gi: MutPointer[UInt32, MutAnyOrigin],
+    sm: MutPointer[Float32, MutAnyOrigin],
+    fl: MutPointer[UInt32, MutAnyOrigin],
+    bitmap_advance: Float32,
+    start: Int,
+    stop: Int,
+) -> Int:
+    """k_cluster_chain's greedy walk over [start, stop), chunked. Returns the
+    last committed span's end when it crosses `stop`, else 0. With write=True
+    the commits rewrite statics — but only for bytes < stop (the successor
+    block writes the rest of a crossing span: the ownership rule)."""
+    var id = start
+    # Align to the first leader at/after start: a block can start mid-codepoint
+    # (UTF-8 self-synchronizes within 3 bytes).
+    while id < stop and (Int(bytes[unsafe_offset=id]) & 0xC0) == 0x80:
+        id += 1
+    var open_end = 0
+    while id < stop:
+        var b0 = Int(bytes[unsafe_offset=id])
+        var nb: Int
+        if (b0 & 0x80) == 0x00:
+            nb = 1
+        elif (b0 & 0xE0) == 0xC0:
+            nb = 2
+        elif (b0 & 0xF0) == 0xE0:
+            nb = 3
+        elif (b0 & 0xF8) == 0xF0:
+            nb = 4
+        else:
+            nb = 0
+        if nb == 0:
+            id += 1
+            continue
+        var slot = Int(cand_slot[unsafe_offset=id])
+        if slot != 0:
+            var end = Int(cand_end[unsafe_offset=id])
+            comptime if write:
+                gi[unsafe_offset=id] = UInt32(slot)
+                sm[unsafe_offset = id * SM_STRIDE + SM_ADVANCE] = bitmap_advance
+                var p = id + nb
+                var limit = min(end, stop)
+                while p < limit:
+                    var c0 = Int(bytes[unsafe_offset=p])
+                    var nb2: Int
+                    if (c0 & 0x80) == 0x00:
+                        nb2 = 1
+                    elif (c0 & 0xE0) == 0xC0:
+                        nb2 = 2
+                    elif (c0 & 0xF0) == 0xE0:
+                        nb2 = 3
+                    else:
+                        nb2 = 4
+                    gi[unsafe_offset=p] = 0
+                    sm[unsafe_offset = p * SM_STRIDE + SM_ADVANCE] = Float32(0)
+                    fl[unsafe_offset=p] = fl[unsafe_offset=p] | UInt32(F_CLUSTER_TRAILER)
+                    p += nb2
+            open_end = end
+            id = end  # resume past the span — the chunked carry's suppressor
+        else:
+            id += nb
+    return open_end if open_end > stop else 0
+
+
+def k_chain_free(
+    bytes: MutPointer[UInt8, MutAnyOrigin],
+    cand_slot: MutPointer[UInt32, MutAnyOrigin],
+    cand_end: MutPointer[UInt32, MutAnyOrigin],
+    cand_blocks: MutPointer[UInt32, MutAnyOrigin],
+    gi: MutPointer[UInt32, MutAnyOrigin],
+    sm: MutPointer[Float32, MutAnyOrigin],
+    fl: MutPointer[UInt32, MutAnyOrigin],
+    span_out: MutPointer[UInt32, MutAnyOrigin],
+    n_bytes: Int32,
+    n_chunks: Int32,
+):
+    """Thread per 128-byte block: the free greedy walk, publishing out[c]."""
+    var c = Int(global_idx.x)
+    if c >= Int(n_chunks):
+        return
+    var start = c * BLOCK
+    var stop = min(start + BLOCK, Int(n_bytes))
+    if cand_blocks[unsafe_offset=c] == 0:
+        span_out[unsafe_offset=c] = 0
+        return
+    span_out[unsafe_offset=c] = UInt32(
+        chain_walk[False](
+            bytes, cand_slot, cand_end, gi, sm, fl, Float32(0), start, stop
+        )
+    )
+
+
+def k_chain_stitch(
+    bytes: MutPointer[UInt8, MutAnyOrigin],
+    cand_slot: MutPointer[UInt32, MutAnyOrigin],
+    cand_end: MutPointer[UInt32, MutAnyOrigin],
+    gi: MutPointer[UInt32, MutAnyOrigin],
+    sm: MutPointer[Float32, MutAnyOrigin],
+    fl: MutPointer[UInt32, MutAnyOrigin],
+    bitmap_advance: Float32,
+    span_out: MutPointer[UInt32, MutAnyOrigin],
+    resolved: MutPointer[UInt32, MutAnyOrigin],
+    n_bytes: Int32,
+    n_chunks: Int32,
+):
+    """One thread over the blocks: the carry recurrence. Free entry when the
+    carry lands at/before the block start; a bounded re-walk when it lands
+    inside; pass-through when the span covers the whole block (VS16 runs make
+    a span's BYTE length unbounded — the carry crosses whole blocks at O(1)
+    each). Writes each block's resolved in-carry for k_chain_commit."""
+    var n = Int(n_bytes)
+    var r = 0
+    for c in range(Int(n_chunks)):
+        var start = c * BLOCK
+        var stop = min(start + BLOCK, n)
+        if r <= start:
+            resolved[unsafe_offset=c] = 0
+            r = Int(span_out[unsafe_offset=c])
+        else:
+            resolved[unsafe_offset=c] = UInt32(r)
+            if r < stop:
+                r = chain_walk[False](
+                    bytes, cand_slot, cand_end, gi, sm, fl, bitmap_advance, r, stop
+                )
+            # r >= stop: the span covers the whole block — the carry passes
+
+
+def k_chain_commit(
+    bytes: MutPointer[UInt8, MutAnyOrigin],
+    cand_slot: MutPointer[UInt32, MutAnyOrigin],
+    cand_end: MutPointer[UInt32, MutAnyOrigin],
+    cand_blocks: MutPointer[UInt32, MutAnyOrigin],
+    resolved: MutPointer[UInt32, MutAnyOrigin],
+    gi: MutPointer[UInt32, MutAnyOrigin],
+    sm: MutPointer[Float32, MutAnyOrigin],
+    fl: MutPointer[UInt32, MutAnyOrigin],
+    bitmap_advance: Float32,
+    n_bytes: Int32,
+    n_chunks: Int32,
+):
+    """Thread per block: the commit with the resolved in-carry. An incoming
+    span's trailer leaders in [start, min(r, stop)) are zeroed HERE (the
+    ownership rule: every byte's statics are written only by the block
+    containing it), then the greedy walk runs from max(r, start)."""
+    var c = Int(global_idx.x)
+    if c >= Int(n_chunks):
+        return
+    var start = c * BLOCK
+    var stop = min(start + BLOCK, Int(n_bytes))
+    var r = Int(resolved[unsafe_offset=c])
+    if r <= start and cand_blocks[unsafe_offset=c] == 0:
+        return  # free block, no candidates — nothing to write
+    if r > start:
+        var p = start
+        while p < min(r, stop) and (Int(bytes[unsafe_offset=p]) & 0xC0) == 0x80:
+            p += 1
+        var limit = min(r, stop)
+        while p < limit:
+            var c0 = Int(bytes[unsafe_offset=p])
+            var nb2: Int
+            if (c0 & 0x80) == 0x00:
+                nb2 = 1
+            elif (c0 & 0xE0) == 0xC0:
+                nb2 = 2
+            elif (c0 & 0xF0) == 0xE0:
+                nb2 = 3
+            else:
+                nb2 = 4
+            gi[unsafe_offset=p] = 0
+            sm[unsafe_offset = p * SM_STRIDE + SM_ADVANCE] = Float32(0)
+            fl[unsafe_offset=p] = fl[unsafe_offset=p] | UInt32(F_CLUSTER_TRAILER)
+            p += nb2
+    if r < stop:
+        _ = chain_walk[True](
+            bytes, cand_slot, cand_end, gi, sm, fl, bitmap_advance,
+            max(r, start), stop,
+        )

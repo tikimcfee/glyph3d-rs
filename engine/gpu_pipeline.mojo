@@ -70,7 +70,10 @@ def ordered_key(v: Float32) -> UInt32:
     return b | 0x80000000
 from glyph_scan import run_scan_pipeline
 from cluster_device import (
-    k_cluster_probe, k_cluster_chain, k_decode_probe, build_head_bitmap, build_state_table, HEAD_BMP_WORDS, ST_STRIDE,
+    k_cluster_probe, k_cluster_chain, k_decode_probe,
+    k_chain_free, k_chain_stitch, k_chain_commit,
+    build_head_bitmap, build_state_table, HEAD_BMP_WORDS, ST_STRIDE,
+    BLOCK, BLOCK_LOG2,
 )
 from fixture_io import load_pipe_fixture, PipeFixture, load_trie_blob
 from glyph_pipeline import Item, Trie
@@ -584,15 +587,16 @@ def mark(ctx: DeviceContext, mut t_prev: Int, mut stages: List[Int], idx: Int) r
 def check_case(path: String, ctx: DeviceContext) raises -> Int:
     # Every fixture runs mode 0 (CPU-decoded statics, unfused probe), mode 2
     # (fused decode+probe, binary search) AND mode 3 (fused, state walk)
-    # against the same reference — the suite proves every live form on every
-    # run, not just when someone benches it.
+    # against the same reference — plus mode 3 with the CHUNKED chain, so the
+    # carry-stitched commit is proven bit-exact beside the serial one.
     var bad = check_fixture(load_pipe_fixture(path), ctx)
     bad += check_fixture(load_pipe_fixture(path), ctx, mode=2)
     bad += check_fixture(load_pipe_fixture(path), ctx, mode=3)
+    bad += check_fixture(load_pipe_fixture(path), ctx, mode=3, chain=1)
     return bad
 
 
-def check_fixture(var fx: PipeFixture, ctx: DeviceContext, bench: Bool = False, mode: Int = 0, profile: Bool = False) raises -> Int:
+def check_fixture(var fx: PipeFixture, ctx: DeviceContext, bench: Bool = False, mode: Int = 0, profile: Bool = False, chain: Int = 0) raises -> Int:
     """The device chain over one fixture, in one of three statics modes:
     0 — statics decoded on CPU (leader-forced) and uploaded; probe+chain on
         device. The shipped form.
@@ -841,6 +845,10 @@ def check_fixture(var fx: PipeFixture, ctx: DeviceContext, bench: Bool = False, 
     var d_cslot = ctx.enqueue_create_buffer[DType.uint32](n)
     var d_cend = ctx.enqueue_create_buffer[DType.uint32](n)
     var d_cblk = ctx.enqueue_create_buffer[DType.uint32]((n + 127) >> 7)
+    # The chunked chain's carry arrays (chain=1): per-block open span end, and
+    # the stitch's resolved in-carry. Same block count as the presence table.
+    var d_cout = ctx.enqueue_create_buffer[DType.uint32]((n + 127) >> 7)
+    var d_cres = ctx.enqueue_create_buffer[DType.uint32]((n + 127) >> 7)
     if mode == 0:
         ctx.enqueue_copy(dst_buf=d_fl, src_buf=h_fl)
         ctx.enqueue_copy(dst_buf=d_sm, src_buf=h_sm)
@@ -954,13 +962,40 @@ def check_fixture(var fx: PipeFixture, ctx: DeviceContext, bench: Bool = False, 
         )
     if profile:
         mark(ctx, t_prev, stages, 0)
-    ctx.enqueue_function[k_cluster_chain](
-        d_bytes.unsafe_ptr(), d_ir.unsafe_ptr(), d_ic.unsafe_ptr(),
-        d_cslot.unsafe_ptr(), d_cend.unsafe_ptr(), d_cblk.unsafe_ptr(),
-        d_gi.unsafe_ptr(), d_sm.unsafe_ptr(), d_fl.unsafe_ptr(),
-        fx.trie.bitmap_advance, Int32(item_count),
-        grid_dim=(item_count + 63) // 64, block_dim=64,
-    )
+    if chain == 1:
+        # The chunk-parallel chain: free walk per 128B block, one-thread
+        # stitch of the one-integer carry, commit per block with the
+        # resolved in-carry. Item-shape independent — a single-item corpus
+        # stops being a trap.
+        var nc = (n + BLOCK - 1) >> BLOCK_LOG2
+        ctx.enqueue_function[k_chain_free](
+            d_bytes.unsafe_ptr(), d_cslot.unsafe_ptr(), d_cend.unsafe_ptr(), d_cblk.unsafe_ptr(),
+            d_gi.unsafe_ptr(), d_sm.unsafe_ptr(), d_fl.unsafe_ptr(), d_cout.unsafe_ptr(),
+            Int32(n), Int32(nc),
+            grid_dim=(nc + B - 1) // B, block_dim=B,
+        )
+        ctx.enqueue_function[k_chain_stitch](
+            d_bytes.unsafe_ptr(), d_cslot.unsafe_ptr(), d_cend.unsafe_ptr(),
+            d_gi.unsafe_ptr(), d_sm.unsafe_ptr(), d_fl.unsafe_ptr(),
+            fx.trie.bitmap_advance, d_cout.unsafe_ptr(), d_cres.unsafe_ptr(),
+            Int32(n), Int32(nc),
+            grid_dim=1, block_dim=1,
+        )
+        ctx.enqueue_function[k_chain_commit](
+            d_bytes.unsafe_ptr(), d_cslot.unsafe_ptr(), d_cend.unsafe_ptr(), d_cblk.unsafe_ptr(),
+            d_cres.unsafe_ptr(), d_gi.unsafe_ptr(), d_sm.unsafe_ptr(), d_fl.unsafe_ptr(),
+            fx.trie.bitmap_advance,
+            Int32(n), Int32(nc),
+            grid_dim=(nc + B - 1) // B, block_dim=B,
+        )
+    else:
+        ctx.enqueue_function[k_cluster_chain](
+            d_bytes.unsafe_ptr(), d_ir.unsafe_ptr(), d_ic.unsafe_ptr(),
+            d_cslot.unsafe_ptr(), d_cend.unsafe_ptr(), d_cblk.unsafe_ptr(),
+            d_gi.unsafe_ptr(), d_sm.unsafe_ptr(), d_fl.unsafe_ptr(),
+            fx.trie.bitmap_advance, Int32(item_count),
+            grid_dim=(item_count + 63) // 64, block_dim=64,
+        )
     if profile:
         mark(ctx, t_prev, stages, 1)
     ctx.enqueue_function[k_chunk_reduce](
@@ -1051,7 +1086,7 @@ def check_fixture(var fx: PipeFixture, ctx: DeviceContext, bench: Bool = False, 
     if bench:
         var mb = Float64(n) / 1048576.0
         print(
-            "  ", n, "B  mode", mode, "  prep", Float64(prep_ns) / 1e6,
+            "  ", n, "B  mode", mode, " chain", chain, "  prep", Float64(prep_ns) / 1e6,
             "ms   |   cpu(sharded)", Float64(cpu_ns) / 1e6, "ms =",
             mb / (Float64(cpu_ns) / 1e9), "MB/s   |   gpu", Float64(gpu_ns) / 1e6,
             "ms =", mb / (Float64(gpu_ns) / 1e9), "MB/s   |   x",
@@ -1205,20 +1240,21 @@ def bench_scaling(trie: Trie, path: String, ctx: DeviceContext, cluster: Bool = 
         for i in range(nb):
             bytes.append(all_bytes[i])
         for m in range(4):
-            var it = Item()
-            it.byte_start = 0
-            it.byte_count = nb
-            it.line_height = 1
-            it.cluster_mode = CLUSTER_CLUSTER if cluster else CLUSTER_LEADER
-            var items = List[Item]()
-            items.append(it^)
-            var fx = PipeFixture()
-            fx.byte_len = nb
-            fx.item_count = 1
-            fx.bytes = List[UInt8](copy=bytes)
-            fx.trie = trie.copy()
-            fx.items = items^
-            _ = check_fixture(fx^, ctx, True, m, profile)
+            for ch in range(2):
+                var it = Item()
+                it.byte_start = 0
+                it.byte_count = nb
+                it.line_height = 1
+                it.cluster_mode = CLUSTER_CLUSTER if cluster else CLUSTER_LEADER
+                var items = List[Item]()
+                items.append(it^)
+                var fx = PipeFixture()
+                fx.byte_len = nb
+                fx.item_count = 1
+                fx.bytes = List[UInt8](copy=bytes)
+                fx.trie = trie.copy()
+                fx.items = items^
+                _ = check_fixture(fx^, ctx, True, m, profile, ch)
 
 
 def main() raises:
@@ -1277,6 +1313,6 @@ def main() raises:
         total_bad += b1 + b2 + b3
 
     if total_bad == 0:
-        print("gpu pipeline: the device chain, statics modes 0+2+3 — counts exact, statics bit-exact, positions within 1e-4")
+        print("gpu pipeline: the device chain, statics modes 0+2+3 (+mode 3 chunked chain) — counts exact, statics bit-exact, positions within 1e-4")
     else:
         raise Error("gpu pipeline diverged")

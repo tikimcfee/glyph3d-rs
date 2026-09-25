@@ -202,11 +202,17 @@ suite runs `0`, `2` and `3` over every fixture and synthetic case; modes
 statics, so the device decode is pinned end to end rather than assumed from
 `gpu_decode`'s isolated proof. `--bench` runs all four so the A/B attributes
 the deltas: upload elimination (0→1), dispatch fusion (1→2), table form
-(2→3). Measured 2026-09-24→25 (M2, stable toolchain): the fused form cut
-total device-phase time ~1.9x on 25 MB text by eliminating the leader-forced
-CPU decode; the walk then cut the dense-emoji GPU phase a further ~1.4x
-(667→475 ms at 4 MB, the binary searches' ~100 dependent loads per head
-becoming ≤ the sequence length).
+(2→3). The chain has two forms beside them: the serial thread-per-item
+commit (`chain=0`) and the chunk-parallel carry-stitched commit (`chain=1`
+— free walk per 128 B block, one-thread stitch of the one-integer resume
+carry, commit per block with the resolved carry; the suite proves it
+bit-exact beside the serial form). Measured 2026-09-24→25 (M2, stable
+toolchain): the fused form cut total device-phase time ~1.9x on 25 MB
+text by eliminating the leader-forced CPU decode; the walk cut the
+dense-emoji GPU phase a further ~1.4x (667→475 ms at 4 MB); the chunked
+chain cut the remaining serial walk 437→199 ms, putting the device phase
+at 242 ms against the CPU's 276 — **x 1.14, the device wins dense emoji
+outright**.
 
 Counts (`ROW`/`COL`/`ORD`/`ordToByte`) and the `totalRows` fold scalar compare
 **exact**; `LINE_ADV` and the resolved positions at eps. The fan stride is derived
