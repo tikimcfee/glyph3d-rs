@@ -1,0 +1,26 @@
+# fieldzed — P1c: Zed's language stack AND the glyph renderer in ONE binary.
+# The provider thread runs a headless gpui App over real language::Buffers,
+# computes One Dark style runs, and ships seam::SurfaceUpdate envelopes over
+# a channel; the main thread links glyph3d-native, builds the repo scene,
+# applies the envelopes (version law enforced by the renderer), renders
+# offscreen. The sidecar FILE is dead.
+[package]
+name = "fieldzed"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1"
+glyph3d-native = { path = "../../native" }
+pollster = "0.4"
+wgpu = "30"
+gpui = { path = "/Users/lugo/localdev/externalcompute/zed/crates/gpui", features = ["test-support"] }
+language = { path = "/Users/lugo/localdev/externalcompute/zed/crates/language", features = ["test-support"] }
+grammars = { path = "/Users/lugo/localdev/externalcompute/zed/crates/grammars" }
+# debug-embed: features do NOT unify across sibling packages — zedspike
+# enabling it does nothing for THIS binary. Without it, zed's fs_embed!
+# locates grammar assets by walking the EXE's ancestors for a .git (finds
+# this worktree, panics "missing config"). Same landmine, second binary.
+util = { path = "/Users/lugo/localdev/externalcompute/zed/crates/util", features = ["debug-embed"] }
+theme = { path = "/Users/lugo/localdev/externalcompute/zed/crates/theme" }
+tree-sitter-rust = "0.24.2"

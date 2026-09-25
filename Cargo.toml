@@ -13,6 +13,12 @@
 [workspace]
 resolver = "2"
 members = ["native", "glyph"]
+# The Zed-integration experiments are their OWN workspace
+# (experiments/Cargo.toml) where native's deps and Zed's graph unify in one
+# lock seeded from Zed's. `exclude` keeps directory-walking from claiming
+# them (and their Zed-path deps) for THIS workspace — the gated build never
+# sees Zed. See zed_integration_experiments/docs/seam.md.
+exclude = ["experiments"]
 
 [profile.release]
 # Keep debug info in release so future profiling stages stay sane.

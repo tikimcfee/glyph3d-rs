@@ -1,10 +1,24 @@
 # The Zed integration seam — contract, decisions, and ladder
 
-Status: design frozen for P1 (in-process, live buffers) as of 2026-09-25, after
-the S1–S3 spikes landed (`fc6a197` headless chunks + One Dark HTML, `fd1731f`
-`--highlight` op, `8bcb1d8` sidecar emission + demo). This doc is the surface
-the spatial-workspace grammar will be built on; it graduates out of this
-directory only when the integration stops being an experiment.
+Status: P1 LANDED through the one-binary rung (2026-09-25). S1–S3 spikes
+(`fc6a197` chunks + HTML, `fd1731f` `--highlight`, `8bcb1d8` sidecar);
+P1a lib split (`1fd056b`), P1b seam types (`beca711`), P1c renderer consumer
+(`00b6520`) + `experiments/fieldzed` — the ONE-BINARY proof: Zed's stack and
+the renderer linked in one process, provider thread shipping envelopes, no
+sidecar file. The version join is load-bearing in the renderer and
+DEMONSTRATED both ways by fieldzed's run (76,129 glyphs colored, 0 left
+default; a stale-versioned and an unknown-file update both DROPPED, counted,
+never translated). The sidecar path remains as the `--highlight` CLI legacy.
+This doc is the surface the spatial-workspace grammar will be built on; it
+graduates out of this directory only when the integration stops being an
+experiment.
+
+Two link-time landmines P1c added to the record (both pinned in
+experiments/fieldzed comments): `cargo:rustc-link-arg` does NOT propagate to
+dependent packages — a binary linking glyph3d_native needs its own build.rs
+mirroring the engine rpaths — and cargo features do NOT unify across sibling
+packages — each binary that touches zed's `grammars` crate needs its own
+`util/debug-embed` edge or fs_embed walks the EXE's ancestors for a `.git`.
 
 Everything here is *records, not arguments*: each claim cites the commit that
 demonstrated it or names the rung that will.

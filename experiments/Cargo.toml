@@ -1,0 +1,36 @@
+# The experiments workspace root — S0..P1c of the Zed integration.
+#
+# ONE lock where glyph3d-native's deps and Zed's graph unify: zedspike (the
+# headless-chunks spike) and fieldzed (the one-binary experiment — renderer
+# + Zed stack linked, provider thread shipping seam::SurfaceUpdate
+# envelopes) are members here, and the lock below is SEEDED from Zed's own
+# Cargo.lock (their versions are what their code compiles against — a fresh
+# resolve drifts; see the comments on the patch table). The gated repo
+# workspace excludes this directory entirely, so the battery never sees
+# Zed's dependency graph. See zed_integration_experiments/docs/seam.md.
+#
+# Path deps point INTO the Zed checkout at ~/localdev/externalcompute/zed —
+# absolute paths are deliberate: this is an experiments-branch spike tied to
+# this machine's layout, not repo content. Workspace-inherited deps of those
+# crates resolve against Zed's own root Cargo.toml.
+[workspace]
+members = ["zedspike", "fieldzed"]
+
+# Copied from Zed's root [patch.crates-io]: their tree-sitter is a git fork,
+# and these patches keep fork-only APIs (adopt_raw_pid, notify variants,
+# LanguageFn unification) available to crates.io deps. Patches do NOT
+# propagate across workspaces, so a path dep into Zed's tree needs them
+# re-declared here. Only the entries our graph actually reaches (language/
+# gpui/fs); the livekit/webrtc/collab patches are omitted.
+[patch.crates-io]
+tree-sitter-language = { git = "https://github.com/tree-sitter/tree-sitter", rev = "43623ec9bf0eaaf7113285c46e8a09018f181b18" }
+async-process = { git = "https://github.com/zed-industries/async-process.git", rev = "0b6d6713570af61806e1e5cb40e0f757cb93fd9d" }
+# async-task: zed's patch rev (smol-rs b4486cd) is unreachable from a fresh
+# fetch — upstream rewrote history — so this workspace resolves async-task
+# from crates.io. If something in the graph turns out to need the fork's API,
+# vendor the fork instead of pointing at the dead rev.
+notify = { git = "https://github.com/zed-industries/notify", rev = "d842f16b2716bd60f09caf3ae3a894237ab38f54" }
+notify-types = { git = "https://github.com/zed-industries/notify", rev = "d842f16b2716bd60f09caf3ae3a894237ab38f54" }
+
+[profile.dev]
+debug = 0
