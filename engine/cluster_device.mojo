@@ -910,6 +910,7 @@ def k_chain_free(
     cand_blocks: MutPointer[UInt32, MutAnyOrigin],
     ccount: MutPointer[UInt32, MutAnyOrigin],
     clist: MutPointer[UInt32, MutAnyOrigin],
+    czidx: MutPointer[UInt8, MutAnyOrigin],
     span_out: MutPointer[UInt32, MutAnyOrigin],
     n_bytes: Int32,
     n_chunks: Int32,
@@ -954,6 +955,9 @@ def k_chain_free(
         if nb == 0:
             id += 1
             continue
+        # The zone of every leader is the count when it's visited: the first
+        # candidate index with start >= id (its own index when it IS one).
+        czidx[unsafe_offset = c * BLOCK + (id - start)] = UInt8(min(cnt, 255))
         var slot = Int(cand_slot[unsafe_offset=id])
         if slot != 0:
             var end = Int(cand_end[unsafe_offset=id])
@@ -992,26 +996,24 @@ def block_eval(
     bitmap_advance: Float32,
     ccount: MutPointer[UInt32, MutAnyOrigin],
     clist: MutPointer[UInt32, MutAnyOrigin],
+    czidx: MutPointer[UInt8, MutAnyOrigin],
     c: Int,
     r: Int,
     stop: Int,
 ) -> Int:
     """The block's exit carry for an incoming carry r, from the ZONE TABLE:
-    the first candidate with start >= r opens the walk, and its recorded zone
-    out IS the greedy from there — no re-walk. Byte-walk fallback on
-    overflow."""
+    czidx maps the byte offset to the first candidate with start >= r, and
+    that candidate's recorded zone out IS the greedy from there — one load,
+    no scan. Byte-walk fallback on overflow."""
     if Int(ccount[unsafe_offset=c]) == Int(CLIST_OVERFLOW):
         return chain_walk[False](
             bytes, cand_slot, cand_end, gi, sm, fl, bitmap_advance, r, stop
         )
-    var base = c * CLIST_CAP * CLIST_STRIDE
     var cnt = Int(ccount[unsafe_offset=c])
-    var j = 0
-    while j < cnt and Int(clist[unsafe_offset = base + j * CLIST_STRIDE]) < r:
-        j += 1
-    if j == cnt:
+    var j = Int(czidx[unsafe_offset = c * BLOCK + (r - c * BLOCK)])
+    if j >= cnt:
         return 0
-    return Int(clist[unsafe_offset = base + j * CLIST_STRIDE + 3])
+    return Int(clist[unsafe_offset = (c * CLIST_CAP + j) * CLIST_STRIDE + 3])
 
 
 # The stitch, two levels: the carry recurrence over blocks is associative, so
@@ -1034,6 +1036,7 @@ def k_chain_sb_free(
     bitmap_advance: Float32,
     ccount: MutPointer[UInt32, MutAnyOrigin],
     clist: MutPointer[UInt32, MutAnyOrigin],
+    czidx: MutPointer[UInt8, MutAnyOrigin],
     span_out: MutPointer[UInt32, MutAnyOrigin],
     sb_out: MutPointer[UInt32, MutAnyOrigin],
     n_bytes: Int32,
@@ -1058,7 +1061,7 @@ def k_chain_sb_free(
             if r < stop:
                 r = block_eval(
                     bytes, cand_slot, cand_end, gi, sm, fl, bitmap_advance,
-                    ccount, clist, c, r, stop,
+                    ccount, clist, czidx, c, r, stop,
                 )
     sb_out[unsafe_offset=sb] = UInt32(r)
 
@@ -1073,16 +1076,18 @@ def k_chain_sb_stitch(
     bitmap_advance: Float32,
     ccount: MutPointer[UInt32, MutAnyOrigin],
     clist: MutPointer[UInt32, MutAnyOrigin],
+    czidx: MutPointer[UInt8, MutAnyOrigin],
     span_out: MutPointer[UInt32, MutAnyOrigin],
     sb_out: MutPointer[UInt32, MutAnyOrigin],
     sb_resolved: MutPointer[UInt32, MutAnyOrigin],
+    csc: MutPointer[UInt32, MutAnyOrigin],
     n_bytes: Int32,
     n_chunks: Int32,
 ):
     """One thread over the super-blocks: the carry recurrence. Free entry uses
-    the level-1 exit; a carry landing inside evaluates the composed
-    super-block: re-walk the block containing r, then chain the remaining
-    blocks' three-way rules (free out / pass-through / re-walk)."""
+    the level-1 exit; a carry landing inside reads the CASCADED zone out —
+    the composed super-block's exit for that entry, precomputed, one lookup —
+    with the uncascaded chain loop kept for overflow blocks."""
     var n = Int(n_bytes)
     var nsb = (Int(n_chunks) + SB_BLOCKS - 1) // SB_BLOCKS
     var r = 0
@@ -1096,29 +1101,36 @@ def k_chain_sb_stitch(
             sb_resolved[unsafe_offset=sb] = UInt32(r)
             if r < sb_end:
                 var c = min(r // BLOCK, Int(n_chunks) - 1)
-                var stop_c = min((c + 1) * BLOCK, n)
-                var v = r
-                if r < stop_c:
-                    v = block_eval(
-                        bytes, cand_slot, cand_end, gi, sm, fl, bitmap_advance,
-                        ccount, clist, c, r, stop_c,
-                    )
-                var c1 = min((sb + 1) * SB_BLOCKS, Int(n_chunks))
-                var cc = c + 1
-                while cc < c1:
-                    var start_cc = cc * BLOCK
-                    var stop_cc = min(start_cc + BLOCK, n)
-                    if v <= start_cc:
-                        v = Int(span_out[unsafe_offset=cc])
-                    elif v >= stop_cc:
-                        pass
-                    else:
+                var start_c = c * BLOCK
+                if Int(ccount[unsafe_offset=c]) != Int(CLIST_OVERFLOW):
+                    # The cascaded zone out: the super-block's exit for this
+                    # entry, precomputed — ONE lookup, no chain.
+                    var jj = Int(czidx[unsafe_offset = c * BLOCK + (r - start_c)])
+                    r = Int(csc[unsafe_offset = c * (CLIST_CAP + 1) + jj])
+                else:
+                    var stop_c = min((c + 1) * BLOCK, n)
+                    var v = r
+                    if r < stop_c:
                         v = block_eval(
                             bytes, cand_slot, cand_end, gi, sm, fl, bitmap_advance,
-                            ccount, clist, cc, v, stop_cc,
+                            ccount, clist, czidx, c, r, stop_c,
                         )
-                    cc += 1
-                r = v
+                    var c1 = min((sb + 1) * SB_BLOCKS, Int(n_chunks))
+                    var cc = c + 1
+                    while cc < c1:
+                        var start_cc = cc * BLOCK
+                        var stop_cc = min(start_cc + BLOCK, n)
+                        if v <= start_cc:
+                            v = Int(span_out[unsafe_offset=cc])
+                        elif v >= stop_cc:
+                            pass
+                        else:
+                            v = block_eval(
+                                bytes, cand_slot, cand_end, gi, sm, fl, bitmap_advance,
+                                ccount, clist, czidx, cc, v, stop_cc,
+                            )
+                        cc += 1
+                    r = v
             # r >= sb_end: the span covers the whole super-block — pass
 
 
@@ -1132,6 +1144,7 @@ def k_chain_sb_apply(
     bitmap_advance: Float32,
     ccount: MutPointer[UInt32, MutAnyOrigin],
     clist: MutPointer[UInt32, MutAnyOrigin],
+    czidx: MutPointer[UInt8, MutAnyOrigin],
     span_out: MutPointer[UInt32, MutAnyOrigin],
     sb_resolved: MutPointer[UInt32, MutAnyOrigin],
     resolved: MutPointer[UInt32, MutAnyOrigin],
@@ -1159,7 +1172,7 @@ def k_chain_sb_apply(
             if r < stop:
                 r = block_eval(
                     bytes, cand_slot, cand_end, gi, sm, fl, bitmap_advance,
-                    ccount, clist, c, r, stop,
+                    ccount, clist, czidx, c, r, stop,
                 )
 
 
@@ -1258,3 +1271,65 @@ def k_chain_commit(
                         fl[unsafe_offset=p] = fl[unsafe_offset=p] | UInt32(F_CLUSTER_TRAILER)
                         p += nb2
                     ce = e
+
+
+def k_chain_sb_cascade(
+    bytes: MutPointer[UInt8, MutAnyOrigin],
+    cand_slot: MutPointer[UInt32, MutAnyOrigin],
+    cand_end: MutPointer[UInt32, MutAnyOrigin],
+    gi: MutPointer[UInt32, MutAnyOrigin],
+    sm: MutPointer[Float32, MutAnyOrigin],
+    fl: MutPointer[UInt32, MutAnyOrigin],
+    bitmap_advance: Float32,
+    ccount: MutPointer[UInt32, MutAnyOrigin],
+    clist: MutPointer[UInt32, MutAnyOrigin],
+    czidx: MutPointer[UInt8, MutAnyOrigin],
+    span_out: MutPointer[UInt32, MutAnyOrigin],
+    csc: MutPointer[UInt32, MutAnyOrigin],
+    n_bytes: Int32,
+    n_chunks: Int32,
+):
+    """Thread per block: for every zone j (0..cnt), the SUPER-BLOCK's exit
+    carry for an incoming carry in that zone — the block's zone out chained
+    through the rest of the super-block with zone lookups (byte-walk fallback
+    past an overflow block). Zone cnt is "no candidate >= r": the block's
+    re-walk commits nothing and the remaining blocks chain free. Level 2 then
+    reads ONE value per carried super-block instead of cascading."""
+    var c = Int(global_idx.x)
+    if c >= Int(n_chunks):
+        return
+    var n = Int(n_bytes)
+    var sb_end_c = min(((c // SB_BLOCKS) + 1) * SB_BLOCKS, Int(n_chunks))
+    var cnt = Int(ccount[unsafe_offset=c])
+    if cnt == Int(CLIST_OVERFLOW) or cnt == 0:
+        return
+    var base = c * CLIST_CAP * CLIST_STRIDE
+    var j = 0
+    while j <= cnt:
+        var v = 0
+        if j < cnt:
+            v = Int(clist[unsafe_offset = base + j * CLIST_STRIDE + 3])
+        var k = c + 1
+        while k < sb_end_c:
+            var start_k = k * BLOCK
+            var stop_k = min(start_k + BLOCK, n)
+            if v <= start_k:
+                v = Int(span_out[unsafe_offset=k])
+            elif v >= stop_k:
+                pass
+            else:
+                var kcnt = Int(ccount[unsafe_offset=k])
+                if kcnt == Int(CLIST_OVERFLOW):
+                    v = chain_walk[False](
+                        bytes, cand_slot, cand_end, gi, sm, fl, bitmap_advance,
+                        v, stop_k,
+                    )
+                else:
+                    var jj = Int(czidx[unsafe_offset = k * BLOCK + (v - start_k)])
+                    if jj >= kcnt:
+                        v = 0
+                    else:
+                        v = Int(clist[unsafe_offset = (k * CLIST_CAP + jj) * CLIST_STRIDE + 3])
+            k += 1
+        csc[unsafe_offset = c * (CLIST_CAP + 1) + j] = UInt32(v)
+        j += 1

@@ -71,7 +71,7 @@ def ordered_key(v: Float32) -> UInt32:
 from glyph_scan import run_scan_pipeline
 from cluster_device import (
     k_cluster_probe, k_cluster_chain, k_decode_probe,
-    k_chain_free, k_chain_sb_free, k_chain_sb_stitch, k_chain_sb_apply, k_chain_commit,
+    k_chain_free, k_chain_sb_free, k_chain_sb_stitch, k_chain_sb_apply, k_chain_commit, k_chain_sb_cascade,
     build_head_bitmap, build_state_table, HEAD_BMP_WORDS, ST_STRIDE,
     BLOCK, BLOCK_LOG2, CLIST_CAP, CLIST_STRIDE, SB_BLOCKS,
 )
@@ -575,10 +575,12 @@ def stage_name(i: Int) -> String:
     if i == 11:
         return "chain_free"
     if i == 12:
-        return "chain_sb_free"
+        return "chain_sb_cascade"
     if i == 13:
-        return "chain_sb_stitch"
+        return "chain_sb_free"
     if i == 14:
+        return "chain_sb_stitch"
+    if i == 15:
         return "chain_sb_apply"
     return "chain_commit"
 
@@ -865,6 +867,9 @@ def check_fixture(var fx: PipeFixture, ctx: DeviceContext, bench: Bool = False, 
     # The two-level stitch's super-block exits and resolved entries (chain=1).
     var d_sbout = ctx.enqueue_create_buffer[DType.uint32](((n + 127) >> 7) // SB_BLOCKS + 1)
     var d_sbres = ctx.enqueue_create_buffer[DType.uint32](((n + 127) >> 7) // SB_BLOCKS + 1)
+    # The zone-index byte table and the cascaded zone outs (chain=1).
+    var d_czidx = ctx.enqueue_create_buffer[DType.uint8](((n + 127) >> 7) * BLOCK)
+    var d_csc = ctx.enqueue_create_buffer[DType.uint32](((n + 127) >> 7) * (CLIST_CAP + 1))
     if mode == 0:
         ctx.enqueue_copy(dst_buf=d_fl, src_buf=h_fl)
         ctx.enqueue_copy(dst_buf=d_sm, src_buf=h_sm)
@@ -920,7 +925,7 @@ def check_fixture(var fx: PipeFixture, ctx: DeviceContext, bench: Bool = False, 
     ctx.synchronize()
     var g0 = perf_counter_ns()
     var prep_ns = g0 - t_prep
-    var stages = List[Int](length=16, fill=0)
+    var stages = List[Int](length=17, fill=0)
     var t_prev = g0
     comptime B = 128
     # THE SEQUENCE PASS, on device. Mode 0: the probe (thread per byte) writes
@@ -987,42 +992,52 @@ def check_fixture(var fx: PipeFixture, ctx: DeviceContext, bench: Bool = False, 
         var nsb = (nc + SB_BLOCKS - 1) // SB_BLOCKS
         ctx.enqueue_function[k_chain_free](
             d_bytes.unsafe_ptr(), d_cslot.unsafe_ptr(), d_cend.unsafe_ptr(), d_cblk.unsafe_ptr(),
-            d_ccount.unsafe_ptr(), d_clist.unsafe_ptr(), d_cout.unsafe_ptr(),
+            d_ccount.unsafe_ptr(), d_clist.unsafe_ptr(), d_czidx.unsafe_ptr(), d_cout.unsafe_ptr(),
             Int32(n), Int32(nc),
             grid_dim=(nc + B - 1) // B, block_dim=B,
         )
         if profile:
             mark(ctx, t_prev, stages, 11)
+        ctx.enqueue_function[k_chain_sb_cascade](
+            d_bytes.unsafe_ptr(), d_cslot.unsafe_ptr(), d_cend.unsafe_ptr(),
+            d_gi.unsafe_ptr(), d_sm.unsafe_ptr(), d_fl.unsafe_ptr(),
+            fx.trie.bitmap_advance, d_ccount.unsafe_ptr(), d_clist.unsafe_ptr(), d_czidx.unsafe_ptr(),
+            d_cout.unsafe_ptr(), d_csc.unsafe_ptr(),
+            Int32(n), Int32(nc),
+            grid_dim=(nc + B - 1) // B, block_dim=B,
+        )
+        if profile:
+            mark(ctx, t_prev, stages, 12)
         ctx.enqueue_function[k_chain_sb_free](
             d_bytes.unsafe_ptr(), d_cslot.unsafe_ptr(), d_cend.unsafe_ptr(),
             d_gi.unsafe_ptr(), d_sm.unsafe_ptr(), d_fl.unsafe_ptr(),
-            fx.trie.bitmap_advance, d_ccount.unsafe_ptr(), d_clist.unsafe_ptr(),
+            fx.trie.bitmap_advance, d_ccount.unsafe_ptr(), d_clist.unsafe_ptr(), d_czidx.unsafe_ptr(),
             d_cout.unsafe_ptr(), d_sbout.unsafe_ptr(),
             Int32(n), Int32(nc),
             grid_dim=(nsb + B - 1) // B, block_dim=B,
         )
         if profile:
-            mark(ctx, t_prev, stages, 12)
+            mark(ctx, t_prev, stages, 13)
         ctx.enqueue_function[k_chain_sb_stitch](
             d_bytes.unsafe_ptr(), d_cslot.unsafe_ptr(), d_cend.unsafe_ptr(),
             d_gi.unsafe_ptr(), d_sm.unsafe_ptr(), d_fl.unsafe_ptr(),
-            fx.trie.bitmap_advance, d_ccount.unsafe_ptr(), d_clist.unsafe_ptr(),
-            d_cout.unsafe_ptr(), d_sbout.unsafe_ptr(), d_sbres.unsafe_ptr(),
+            fx.trie.bitmap_advance, d_ccount.unsafe_ptr(), d_clist.unsafe_ptr(), d_czidx.unsafe_ptr(),
+            d_cout.unsafe_ptr(), d_sbout.unsafe_ptr(), d_sbres.unsafe_ptr(), d_csc.unsafe_ptr(),
             Int32(n), Int32(nc),
             grid_dim=1, block_dim=1,
         )
         if profile:
-            mark(ctx, t_prev, stages, 13)
+            mark(ctx, t_prev, stages, 14)
         ctx.enqueue_function[k_chain_sb_apply](
             d_bytes.unsafe_ptr(), d_cslot.unsafe_ptr(), d_cend.unsafe_ptr(),
             d_gi.unsafe_ptr(), d_sm.unsafe_ptr(), d_fl.unsafe_ptr(),
-            fx.trie.bitmap_advance, d_ccount.unsafe_ptr(), d_clist.unsafe_ptr(),
+            fx.trie.bitmap_advance, d_ccount.unsafe_ptr(), d_clist.unsafe_ptr(), d_czidx.unsafe_ptr(),
             d_cout.unsafe_ptr(), d_sbres.unsafe_ptr(), d_cres.unsafe_ptr(),
             Int32(n), Int32(nc),
             grid_dim=(nsb + B - 1) // B, block_dim=B,
         )
         if profile:
-            mark(ctx, t_prev, stages, 14)
+            mark(ctx, t_prev, stages, 15)
         ctx.enqueue_function[k_chain_commit](
             d_bytes.unsafe_ptr(), d_cslot.unsafe_ptr(), d_cend.unsafe_ptr(), d_cblk.unsafe_ptr(),
             d_cres.unsafe_ptr(), d_ccount.unsafe_ptr(), d_clist.unsafe_ptr(),
@@ -1032,7 +1047,7 @@ def check_fixture(var fx: PipeFixture, ctx: DeviceContext, bench: Bool = False, 
             grid_dim=(nc + B - 1) // B, block_dim=B,
         )
         if profile:
-            mark(ctx, t_prev, stages, 15)
+            mark(ctx, t_prev, stages, 16)
     else:
         ctx.enqueue_function[k_cluster_chain](
             d_bytes.unsafe_ptr(), d_ir.unsafe_ptr(), d_ic.unsafe_ptr(),
@@ -1138,7 +1153,7 @@ def check_fixture(var fx: PipeFixture, ctx: DeviceContext, bench: Bool = False, 
             Float64(cpu_ns) / Float64(gpu_ns),
         )
         if profile:
-            for i in range(16):
+            for i in range(17):
                 print("      ", stage_name(i), Float64(stages[i]) / 1e6, "ms")
         return 0
 
