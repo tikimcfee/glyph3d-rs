@@ -82,6 +82,18 @@ pub fn joins(folded: BufferVersion, update: &SurfaceUpdate) -> bool {
     folded == update.version
 }
 
+/// Version for FILE-DRIVEN providers: content identity. A within-process
+/// hash (not stable across rustc versions — it never needs to be; the join
+/// happens in the process that folded). For static content, identity IS the
+/// version; live providers use edit counters instead. The join (equality)
+/// works for both.
+pub fn content_hash_version(bytes: &[u8]) -> BufferVersion {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    bytes.hash(&mut h);
+    BufferVersion(h.finish())
+}
+
 /// Structure-plane stages (folds, inlays, blocks) arrive as variants here —
 /// through the same envelope, never a second pipeline. None exist yet; the
 /// empty enum is the "absent" made explicit so later additions are additive.
@@ -163,6 +175,17 @@ mod tests {
     fn tombstone_ends_the_copy() {
         let mut bytes = b"x".to_vec();
         assert!(!ContentDelta::Tombstone.apply(&mut bytes));
+    }
+
+    #[test]
+    fn content_hash_versions_track_content_not_order() {
+        use super::content_hash_version;
+        let a = b"fn main() {}".to_vec();
+        let b = a.clone();
+        assert_eq!(content_hash_version(&a), content_hash_version(&b));
+        let mut c = a.clone();
+        c[0] = b'x';
+        assert_ne!(content_hash_version(&a), content_hash_version(&c));
     }
 
     #[test]

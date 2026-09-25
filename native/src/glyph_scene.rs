@@ -2004,12 +2004,10 @@ impl GlyphScene {
     /// S3 spike (`experiments/zedspike`): apply a highlight SIDECAR produced by
     /// Zed's headless language stack to this scene's per-glyph instance colors.
     /// One run per line — `rel_path<TAB>start<TAB>end<TAB>rrggbb`, byte offsets
-    /// into the file, end exclusive. Records join to runs by their fold-leader
-    /// byte offset (the same leader↔record alignment `ensure_pick_cache`
-    /// validates); each hit is one 4 B partial write at the color field —
-    /// `Verb::RecolorGlyph`'s mechanism, iterated. Reached only via the
-    /// offscreen `--highlight` op: no golden view passes it, so default
-    /// rendering is byte-identical with the flag absent.
+    /// into the file, end exclusive. Legacy spike path: NO version law (the
+    /// sidecar is positional by construction); the CONTRACT path is
+    /// [`Self::apply_surface_updates`], which checks `seam::joins` against the
+    /// re-derived bytes. Reached only via the offscreen `--highlight` op.
     pub fn apply_highlight_sidecar(&self, ctx: &GpuContext, path: &std::path::Path) -> String {
         let map = match parse_highlight_sidecar(path) {
             Ok(map) => map,
@@ -2022,50 +2020,14 @@ impl GlyphScene {
         let mut colored = 0usize;
         let mut unstyled = 0usize;
         for info in &pctx.files {
-            let Some(runs) = map.get(&info.rel_path) else { continue };
-            files += 1;
-            let Ok((records, bytes)) =
-                crate::repo::rederive_records(&pctx.root, &pctx.trie, &info.rel_path, &info.item)
-            else {
-                log::warn!("highlight: failed to re-derive {}", info.rel_path);
-                continue;
-            };
-            let (leaders, _, _, _) =
-                crate::text::fold_leaders(&bytes, info.item.wrap_width, info.item.wrap_mode);
-            if leaders.len() != records.len() {
-                log::warn!(
-                    "highlight: leader/record count mismatch on {} — file skipped",
-                    info.rel_path
-                );
-                continue;
-            }
-            // Both walks are byte-ascending (records follow the fold), so a
-            // merge pointer finds each record's run in O(runs + records).
-            // Blank records take no slot, exactly as ensure_pick_cache skips
-            // them.
-            let mut run_ix = 0usize;
-            let mut slot = info.slot_base;
-            for (i, r) in records.iter().enumerate() {
-                if r.glyph_id() == 0 {
-                    continue;
+            if let Some(runs) = map.get(&info.rel_path) {
+                files += 1;
+                if let FileStyle::Ok { colored: c, unstyled: u } =
+                    self.style_file(ctx, info, runs, None)
+                {
+                    colored += c;
+                    unstyled += u;
                 }
-                let byte = leaders[i].0;
-                while run_ix < runs.len() && runs[run_ix].range.end <= byte {
-                    run_ix += 1;
-                }
-                // runs[run_ix] is the first run ending past `byte`; it covers
-                // the record iff it also starts at/before it.
-                if let Some(run) = runs.get(run_ix).filter(|run| byte >= run.range.start) {
-                    let packed = u32::from(run.rgb[0])
-                        | u32::from(run.rgb[1]) << 8
-                        | u32::from(run.rgb[2]) << 16
-                        | 0xFF00_0000;
-                    self.write_instance(ctx, slot, 24, &packed.to_le_bytes());
-                    colored += 1;
-                } else {
-                    unstyled += 1;
-                }
-                slot += 1;
             }
         }
         format!(
@@ -2075,6 +2037,123 @@ impl GlyphScene {
             unstyled,
             path.display()
         )
+    }
+
+    /// P1c — the seam's CONTRACT consumer: apply provider envelopes
+    /// (`seam::SurfaceUpdate`) to this scene. For each update whose file is in
+    /// the field, the file's bytes are re-derived and hashed; the update is
+    /// applied iff `seam::joins(hash, update)` — the version law, made
+    /// load-bearing in the renderer. Mismatches are DROPPED and counted, never
+    /// translated. Structure/decorations planes are accepted and ignored until
+    /// their stages ship (the anti-sprawl law: one walk, fields arrive later).
+    pub fn apply_surface_updates(
+        &self,
+        ctx: &GpuContext,
+        updates: &[crate::seam::SurfaceUpdate],
+    ) -> String {
+        let Some(pctx) = &self.pick else {
+            return "seam: no pick context (repo scenes only) — ignored".to_string();
+        };
+        let mut files = 0usize;
+        let mut colored = 0usize;
+        let mut unstyled = 0usize;
+        let mut dropped = 0usize;
+        for update in updates {
+            let Some(info) = pctx.files.iter().find(|f| f.rel_path == update.file.0) else {
+                dropped += 1; // not in the field (yet) — the workspace grammar's job later
+                continue;
+            };
+            files += 1;
+            match self.style_file(ctx, info, &update.style, Some(update.version)) {
+                FileStyle::Ok { colored: c, unstyled: u } => {
+                    colored += c;
+                    unstyled += u;
+                }
+                FileStyle::VersionMismatch => dropped += 1,
+                FileStyle::Failed => {}
+            }
+        }
+        format!(
+            "seam: {} file(s), {} glyphs colored, {} left default, {} dropped (version/file) — {} update(s)",
+            files,
+            colored,
+            unstyled,
+            dropped,
+            updates.len()
+        )
+    }
+
+    /// Style one file: re-derive its records + fold leaders (ONE rederive
+    /// serves both the version hash and the walk), check the version if the
+    /// caller has one, then write per-glyph colors — `Verb::RecolorGlyph`'s
+    /// 4 B partial-write mechanism, iterated with a merge pointer
+    /// (O(runs + records); both walks are byte-ascending). Blank records take
+    /// no slot, exactly as `ensure_pick_cache` skips them.
+    fn style_file(
+        &self,
+        ctx: &GpuContext,
+        info: &PickFileInfo,
+        runs: &[crate::seam::StyleRun],
+        expected: Option<crate::seam::BufferVersion>,
+    ) -> FileStyle {
+        let Some(pctx) = &self.pick else {
+            return FileStyle::Failed;
+        };
+        let Ok((records, bytes)) =
+            crate::repo::rederive_records(&pctx.root, &pctx.trie, &info.rel_path, &info.item)
+        else {
+            log::warn!("seam/style: failed to re-derive {}", info.rel_path);
+            return FileStyle::Failed;
+        };
+        if let Some(expected) = expected {
+            // The seam's law (seam::joins is this comparison over a whole
+            // envelope): equality or drop. The folded version here is the
+            // content hash of the re-derived bytes — the file-driven
+            // provider convention (seam::content_hash_version).
+            if crate::seam::content_hash_version(&bytes) != expected {
+                log::warn!(
+                    "seam/style: version mismatch on {} — update dropped, not translated",
+                    info.rel_path
+                );
+                return FileStyle::VersionMismatch;
+            }
+        }
+        let (leaders, _, _, _) =
+            crate::text::fold_leaders(&bytes, info.item.wrap_width, info.item.wrap_mode);
+        if leaders.len() != records.len() {
+            log::warn!(
+                "seam/style: leader/record count mismatch on {} — file skipped",
+                info.rel_path
+            );
+            return FileStyle::Failed;
+        }
+        let mut run_ix = 0usize;
+        let mut slot = info.slot_base;
+        let mut colored = 0usize;
+        let mut unstyled = 0usize;
+        for (i, r) in records.iter().enumerate() {
+            if r.glyph_id() == 0 {
+                continue;
+            }
+            let byte = leaders[i].0;
+            while run_ix < runs.len() && runs[run_ix].range.end <= byte {
+                run_ix += 1;
+            }
+            // runs[run_ix] is the first run ending past `byte`; it covers
+            // the record iff it also starts at/before it.
+            if let Some(run) = runs.get(run_ix).filter(|run| byte >= run.range.start) {
+                let packed = u32::from(run.rgb[0])
+                    | u32::from(run.rgb[1]) << 8
+                    | u32::from(run.rgb[2]) << 16
+                    | 0xFF00_0000;
+                self.write_instance(ctx, slot, 24, &packed.to_le_bytes());
+                colored += 1;
+            } else {
+                unstyled += 1;
+            }
+            slot += 1;
+        }
+        FileStyle::Ok { colored, unstyled }
     }
 
     /// Ensure the one-entry pick cache holds `gid`'s re-derived file data:
@@ -2905,6 +2984,15 @@ fn ray_aabb(ro: DVec3, rd: DVec3, min: DVec3, max: DVec3) -> Option<f64> {
     Some(t0)
 }
 
+/// Outcome of styling one file — `style_file`'s report. `VersionMismatch`
+/// is kept DISTINCT from `Failed` so the envelope consumer's audit line can
+/// say how many updates the seam law dropped.
+enum FileStyle {
+    Ok { colored: usize, unstyled: usize },
+    VersionMismatch,
+    Failed,
+}
+
 /// Parse the sidecar: `rel_path<TAB>start<TAB>end<TAB>rrggbb` per line, a
 /// leading `#` on the color tolerated, blank lines skipped, runs kept in file
 /// order. Emits [`crate::seam::StyleRun`]s — the seam's run type — so the
@@ -3058,6 +3146,14 @@ impl SceneLike for GlyphScene {
 
     fn apply_highlight_sidecar(&self, ctx: &GpuContext, path: &std::path::Path) -> Option<String> {
         Some(GlyphScene::apply_highlight_sidecar(self, ctx, path))
+    }
+
+    fn apply_surface_updates(
+        &self,
+        ctx: &GpuContext,
+        updates: &[crate::seam::SurfaceUpdate],
+    ) -> Option<String> {
+        Some(GlyphScene::apply_surface_updates(self, ctx, updates))
     }
 
     fn debug_dump_instances(&self, ctx: &GpuContext, slot: u64, out: &mut [u32]) {

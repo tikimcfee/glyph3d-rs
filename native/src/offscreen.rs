@@ -21,6 +21,28 @@ pub fn run(
     cull: bool,
     ops: &[Op],
 ) {
+    let shader_composite = std::env::var_os("GLYPH_L3_SHADER_COMPOSITE").is_some();
+    let format = if shader_composite {
+        wgpu::TextureFormat::Bgra8UnormSrgb
+    } else {
+        wgpu::TextureFormat::Rgba8UnormSrgb
+    };
+    let scene = build_scene(ctx, format, choice, CameraMode::Front { zoom }, cull);
+    run_scene(ctx, scene, format, path, frames, ops);
+}
+
+/// Render an ALREADY-BUILT scene offscreen and write the PNG — the P1c entry
+/// (`experiments/fieldzed` builds its scene, applies seam envelopes, then
+/// lands here). Same machinery `run` uses: L3 composite hook, scripted ops,
+/// deterministic 1/60 s virtual clock, padded-row readback.
+pub fn run_scene(
+    ctx: &GpuContext,
+    mut scene: Box<dyn scene::SceneLike>,
+    format: wgpu::TextureFormat,
+    path: &Path,
+    frames: u32,
+    ops: &[Op],
+) {
     let device = &ctx.device;
 
     // Stage L (L3) dev-only verification hook: GLYPH_L3_SHADER_COMPOSITE=1
@@ -33,11 +55,11 @@ pub fn run(
     let shader_composite = std::env::var_os("GLYPH_L3_SHADER_COMPOSITE").is_some();
     // sRGB target so the PNG bytes are display-ready sRGB values straight
     // out of readback (no manual gamma pass needed).
-    let format = if shader_composite {
-        wgpu::TextureFormat::Bgra8UnormSrgb
-    } else {
-        wgpu::TextureFormat::Rgba8UnormSrgb
-    };
+    debug_assert_eq!(
+        shader_composite,
+        matches!(format, wgpu::TextureFormat::Bgra8UnormSrgb),
+        "run_scene: caller must pass the format the L3 hook agrees with"
+    );
     let size = wgpu::Extent3d {
         width: OFFSCREEN_WIDTH,
         height: OFFSCREEN_HEIGHT,
@@ -61,8 +83,6 @@ pub fn run(
     });
     let color_view = texture.create_view(&Default::default());
     let depth_view = scene::create_depth(device, wgpu::TextureFormat::Depth32Float, size.width, size.height);
-
-    let mut scene = build_scene(ctx, format, choice, CameraMode::Front { zoom }, cull);
 
     // Stage G: scripted picks + verbs, applied in CLI order before the first
     // frame. Deterministic: the Front camera + fixed viewport make --pick-px

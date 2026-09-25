@@ -75,6 +75,16 @@ pub trait SceneLike {
     fn apply_highlight_sidecar(&self, _ctx: &GpuContext, _path: &std::path::Path) -> Option<String> {
         None
     }
+    /// P1c: the seam's CONTRACT consumer — apply provider envelopes, with
+    /// the version law enforced against the re-derived bytes. Default:
+    /// scene doesn't support it.
+    fn apply_surface_updates(
+        &self,
+        _ctx: &GpuContext,
+        _updates: &[crate::seam::SurfaceUpdate],
+    ) -> Option<String> {
+        None
+    }
     /// Stage G debug: read back instance bytes at a global slot (partial-
     /// upload verification). Default no-op.
     fn debug_dump_instances(&self, _ctx: &GpuContext, _slot: u64, _out: &mut [u32]) {}
