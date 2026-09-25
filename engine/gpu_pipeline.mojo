@@ -519,6 +519,41 @@ def rel_close(a: Float64, b: Float64) -> Bool:
     return d / m <= EPS
 
 
+def stage_name(i: Int) -> String:
+    if i == 0:
+        return "pass(decode+probe)"
+    if i == 1:
+        return "chain"
+    if i == 2:
+        return "chunkReduce"
+    if i == 3:
+        return "spineReduce"
+    if i == 4:
+        return "spineScan"
+    if i == 5:
+        return "partialScan"
+    if i == 6:
+        return "apply"
+    if i == 7:
+        return "resolveX"
+    if i == 8:
+        return "stride derive (host)"
+    if i == 9:
+        return "paginate"
+    return "final readbacks"
+
+
+def mark(ctx: DeviceContext, mut t_prev: Int, mut stages: List[Int], idx: Int) raises:
+    """Per-dispatch timing: synchronize, then stamp. Profiling only — the
+    extra syncs serialize host and device, so stage times carry launch gaps
+    that overlap in a free-running chain. Read them as per-dispatch shares,
+    not as a sum that must equal gpu_ns."""
+    ctx.synchronize()
+    var t_now = perf_counter_ns()
+    stages[idx] = t_now - t_prev
+    t_prev = t_now
+
+
 def check_case(path: String, ctx: DeviceContext) raises -> Int:
     # Every fixture runs mode 0 (CPU-decoded statics, unfused probe), mode 2
     # (fused decode+probe, binary search) AND mode 3 (fused, state walk)
@@ -530,7 +565,7 @@ def check_case(path: String, ctx: DeviceContext) raises -> Int:
     return bad
 
 
-def check_fixture(var fx: PipeFixture, ctx: DeviceContext, bench: Bool = False, mode: Int = 0) raises -> Int:
+def check_fixture(var fx: PipeFixture, ctx: DeviceContext, bench: Bool = False, mode: Int = 0, profile: Bool = False) raises -> Int:
     """The device chain over one fixture, in one of three statics modes:
     0 — statics decoded on CPU (leader-forced) and uploaded; probe+chain on
         device. The shipped form.
@@ -828,6 +863,8 @@ def check_fixture(var fx: PipeFixture, ctx: DeviceContext, bench: Bool = False, 
     ctx.synchronize()
     var g0 = perf_counter_ns()
     var prep_ns = g0 - t_prep
+    var stages = List[Int](length=11, fill=0)
+    var t_prev = g0
     comptime B = 128
     # THE SEQUENCE PASS, on device. Mode 0: the probe (thread per byte) writes
     # candidates over uploaded statics, the chain (thread per item) commits
@@ -882,6 +919,8 @@ def check_fixture(var fx: PipeFixture, ctx: DeviceContext, bench: Bool = False, 
             Int32(n), Int32(seq_count), Int32(fx.trie.seq_max),
             grid_dim=(n + B - 1) // B, block_dim=B,
         )
+    if profile:
+        mark(ctx, t_prev, stages, 0)
     ctx.enqueue_function[k_cluster_chain](
         d_bytes.unsafe_ptr(), d_ir.unsafe_ptr(), d_ic.unsafe_ptr(),
         d_cslot.unsafe_ptr(), d_cend.unsafe_ptr(), d_cblk.unsafe_ptr(),
@@ -889,6 +928,8 @@ def check_fixture(var fx: PipeFixture, ctx: DeviceContext, bench: Bool = False, 
         fx.trie.bitmap_advance, Int32(item_count),
         grid_dim=(item_count + 63) // 64, block_dim=64,
     )
+    if profile:
+        mark(ctx, t_prev, stages, 1)
     ctx.enqueue_function[k_chunk_reduce](
         d_fl.unsafe_ptr(), d_sm.unsafe_ptr(), d_w.unsafe_ptr(), d_md.unsafe_ptr(),
         d_s.unsafe_ptr(),
@@ -896,21 +937,29 @@ def check_fixture(var fx: PipeFixture, ctx: DeviceContext, bench: Bool = False, 
         Int32(n), Int32(CHUNK), Int32(n_chunks),
         grid_dim=(n_chunks + B - 1) // B, block_dim=B,
     )
+    if profile:
+        mark(ctx, t_prev, stages, 2)
     ctx.enqueue_function[k_spine_reduce](
         d_pc.unsafe_ptr(), d_pm.unsafe_ptr(), d_uc.unsafe_ptr(), d_um.unsafe_ptr(),
         Int32(n_chunks), Int32(GROUP), Int32(n_supers),
         grid_dim=(n_supers + B - 1) // B, block_dim=B,
     )
+    if profile:
+        mark(ctx, t_prev, stages, 3)
     ctx.enqueue_function[k_spine_scan](
         d_uc.unsafe_ptr(), d_um.unsafe_ptr(), d_fc.unsafe_ptr(), d_fm.unsafe_ptr(),
         Int32(n_supers), grid_dim=1, block_dim=1,
     )
+    if profile:
+        mark(ctx, t_prev, stages, 4)
     ctx.enqueue_function[k_partial_scan](
         d_pc.unsafe_ptr(), d_pm.unsafe_ptr(), d_fc.unsafe_ptr(), d_fm.unsafe_ptr(),
         d_xc.unsafe_ptr(), d_xm.unsafe_ptr(),
         Int32(n_chunks), Int32(GROUP), Int32(n_supers),
         grid_dim=(n_supers + B - 1) // B, block_dim=B,
     )
+    if profile:
+        mark(ctx, t_prev, stages, 5)
     ctx.enqueue_function[k_apply](
         d_fl.unsafe_ptr(), d_sm.unsafe_ptr(), d_lm.unsafe_ptr(), d_lc.unsafe_ptr(),
         d_w.unsafe_ptr(), d_md.unsafe_ptr(), d_s.unsafe_ptr(),
@@ -919,6 +968,8 @@ def check_fixture(var fx: PipeFixture, ctx: DeviceContext, bench: Bool = False, 
         Int32(n), Int32(CHUNK), Int32(n_chunks),
         grid_dim=(n_chunks + B - 1) // B, block_dim=B,
     )
+    if profile:
+        mark(ctx, t_prev, stages, 6)
     ctx.enqueue_function[k_resolve_x](
         d_sm.unsafe_ptr(), d_fl.unsafe_ptr(), d_lm.unsafe_ptr(), d_lc.unsafe_ptr(),
         d_it.unsafe_ptr(), d_ie.unsafe_ptr(), d_io.unsafe_ptr(),
@@ -927,6 +978,8 @@ def check_fixture(var fx: PipeFixture, ctx: DeviceContext, bench: Bool = False, 
         d_rmax.unsafe_ptr(), d_xmax.unsafe_ptr(),
         Int32(n), grid_dim=(n + B - 1) // B, block_dim=B,
     )
+    if profile:
+        mark(ctx, t_prev, stages, 7)
     # The fan stride is DERIVED from each item's widest fold row — a fold scalar
     # resolveX just produced. The CPU driver computes it between dispatches too, so
     # this readback mirrors the reference rather than shortcutting it.
@@ -939,12 +992,16 @@ def check_fixture(var fx: PipeFixture, ctx: DeviceContext, bench: Bool = False, 
         h_st[i] = Float32(derive_stride(widest, fx.items[i]))
     var d_st = ctx.enqueue_create_buffer[DType.float32](ni0)
     ctx.enqueue_copy(dst_buf=d_st, src_buf=h_st)
+    if profile:
+        mark(ctx, t_prev, stages, 8)
     ctx.enqueue_function[k_paginate](
         d_lm.unsafe_ptr(), d_fl.unsafe_ptr(), d_lc.unsafe_ptr(),
         d_it.unsafe_ptr(), d_ie.unsafe_ptr(), d_io.unsafe_ptr(),
         d_st.unsafe_ptr(), Int32(n),
         grid_dim=(n + B - 1) // B, block_dim=B,
     )
+    if profile:
+        mark(ctx, t_prev, stages, 9)
     if mode != 0 and not bench:
         # The fused path's statics are device-produced: read them back for the
         # gi/sm comparison tier below. (Bench returns before comparing; the
@@ -957,6 +1014,8 @@ def check_fixture(var fx: PipeFixture, ctx: DeviceContext, bench: Bool = False, 
     ctx.enqueue_copy(dst_buf=h_wc, src_buf=d_wc)
     ctx.enqueue_copy(dst_buf=h_otb, src_buf=d_otb)
     ctx.enqueue_copy(dst_buf=h_rmax, src_buf=d_rmax)
+    if profile:
+        mark(ctx, t_prev, stages, 10)
     ctx.synchronize()
     var gpu_ns = perf_counter_ns() - g0
     if bench:
@@ -968,6 +1027,9 @@ def check_fixture(var fx: PipeFixture, ctx: DeviceContext, bench: Bool = False, 
             "ms =", mb / (Float64(gpu_ns) / 1e9), "MB/s   |   x",
             Float64(cpu_ns) / Float64(gpu_ns),
         )
+        if profile:
+            for i in range(11):
+                print("      ", stage_name(i), Float64(stages[i]) / 1e6, "ms")
         return 0
 
     # ── the tiered comparison ───────────────────────────────────────────────
@@ -1076,7 +1138,7 @@ def synthetic_case(
     return check_fixture(fx^, ctx, mode=smode)
 
 
-def bench_scaling(trie: Trie, path: String, ctx: DeviceContext, cluster: Bool = False) raises:
+def bench_scaling(trie: Trie, path: String, ctx: DeviceContext, cluster: Bool = False, profile: Bool = False) raises:
     """Time the SAME chain the conformance suite proves, across corpus sizes.
 
     The GPU timing spans the whole device phase — the dispatches AND the readbacks,
@@ -1126,7 +1188,7 @@ def bench_scaling(trie: Trie, path: String, ctx: DeviceContext, cluster: Bool = 
             fx.bytes = List[UInt8](copy=bytes)
             fx.trie = trie.copy()
             fx.items = items^
-            _ = check_fixture(fx^, ctx, True, m)
+            _ = check_fixture(fx^, ctx, True, m, profile)
 
 
 def main() raises:
@@ -1139,14 +1201,14 @@ def main() raises:
     print("device:", ctx.name())
     if String(args[1]) == "--bench":
         var seed = load_pipe_fixture(String(args[2]))
-        bench_scaling(seed.trie, String(args[3]), ctx)
+        bench_scaling(seed.trie, String(args[3]), ctx, profile=len(args) > 4 and String(args[4]) == "profile")
         return
     # --bench-cluster <corpus>: the same sweep under cluster mode against the
     # REAL atlas trie (the full 4,166-sequence table), so dense emoji content
     # resolves for real instead of probing a fixture's synthetic table.
     if String(args[1]) == "--bench-cluster":
         var real_trie = load_trie_blob(String(args[2]))
-        bench_scaling(real_trie, String(args[3]), ctx, cluster=True)
+        bench_scaling(real_trie, String(args[3]), ctx, cluster=True, profile=len(args) > 4 and String(args[4]) == "profile")
         return
     var total_bad = 0
     for i in range(1, len(args)):
