@@ -80,3 +80,39 @@ bit-exact (gpu_cluster) and integrated into the full-device pipeline
 (`gpu_pipeline.mojo --bench` / `--bench-cluster`); 2026-09-24 numbers and
 the measured lever list (table caching, device-class search choice, fusion)
 are in the day's commits (6be54a1, 15bf453, bf0a117).
+
+---
+
+## Results — EXECUTED 2026-09-24
+
+The pass landed as written, with one correction: the confirmed break was SIX
+files, not seven — `gpu_cluster.mojo` never imported `global_idx` (it is the
+host-side suite over `cluster_device`'s kernels). The seven-count was module
+membership, not imports; grep is the witness.
+
+- Pins: `mojo ==1.1.0` / `max ==26.6` both platforms; ranges capped inside the
+  family (`>=1.1.0,<1.2` / `>=26.6,<26.7`). The lock resolved the STABLE
+  release builds — published on the max-nightly channel as `-release.conda`,
+  so channel order never came into play. `mojo --version`: `1.1.0 (8189361e)`.
+- Import flip: six files, `from std.gpu import global_idx` →
+  `from max.gpu import global_idx`. No other call-site moved.
+- Gates: full battery green on stable (every golden view byte-equal on
+  metal-apple — the new compiler is bit-identical on this tree); full prove
+  green, 14/14 coverage, every mutation firing.
+- Quirk 1 (two keyword comptime params at one call site): **FIXED in
+  stable.** Probe: the run_pipeline signature shape called with
+  `[witness=False, cluster_split=True]` — parses and evaluates correctly. The
+  `cluster_split` name stays (it reads fine); future call sites may use two
+  kwargs freely.
+- Quirk 2 (two hand-built `Slots` views over function-local `List`s crashing
+  the allocator): **FIXED in stable.** Probe: the conformance_split bring-up
+  shape rebuilt as an executable — both instantiations, `.slots()` on both
+  results, lane-wise diff through the views — bit-exact, no crash. The
+  shipped whole-PipelineResult comparison stays regardless: it is the
+  stronger proof (it covers the fold's output). ffi_selftest keeps linking
+  the shipped dylib for the same reason — stronger, not forced.
+- New surface noted while probing, no action needed: positional `__getitem__`
+  on `Pointer` is deprecated in stable (`use unsafe_offset=`). The engine's
+  accessors already use `unsafe_offset=`; only the probe tripped the warning.
+- Not yet harvested (the bump's payload, queued behind it):
+  `DeviceBuffer.unsafe_host_ptr()`, `is_host_unified()`, `create_event()`.

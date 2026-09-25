@@ -3,14 +3,15 @@
 Companion to the survey in the web repo's `engine/toolchain-migration.md`
 (2026-09-02). That document is correct for the tree it was written against and
 **this tree is on a different channel**, so the three breakages it forecasts are
-in three different states here. Measured 2026-09-02.
+in three different states here. Measured 2026-09-02; section 1 resolved with
+the stable bump on 2026-09-24.
 
 ## The channel split is the whole reason this file exists
 
 | tree | channel | version |
 |---|---|---|
 | `viz-web/glyph3d-js` | pip / `.venv-mojo` | **Mojo 1.0.0** (stable) |
-| `viz-native/glyph3d-native` | pixi / `max-nightly` | **Mojo 1.1.0.dev2026083005** |
+| `viz-native/glyph3d-native` | pixi (max stable since 2026-09-24) | **Mojo 1.1.0** / max 26.6 |
 
 So the migration doc's framing — "the next release, not one you can `pip install`
 yet" — is right for the web tree and already past tense here. The two-line
@@ -18,32 +19,29 @@ yet" — is right for the web tree and already past tense here. The two-line
 tree running ahead by choice; it is the minimum needed to compile on the channel
 it is pinned to.
 
-## 1. `std.gpu` → `max.gpu` — BLOCKED, and we are inside the window
+## 1. `std.gpu` → `max.gpu` — DONE (2026-09-24, the stable bump)
 
-The doc says to replace `from std.gpu import global_idx` with `from max.gpu ...`.
-**Do not do that yet.** Measured on the pinned nightly:
+On the pinned nightly this was blocked in the OTHER direction: `std.gpu`
+resolved and `max.gpu.global_idx` did not yet mirror it. Stable 1.1.0 closed
+the window from the far side — `std.gpu` is now private (`std._gpu`), and
+`max.gpu` carries the surface — so the imports flipped with the bump to
+`mojo ==1.1.0` / `max ==26.6` (recipe: `out/TOOLCHAIN-BUMP-2026-09.md`).
 
-```
-from max.gpu import global_idx
-  -> error: package 'gpu' does not contain 'global_idx'
-```
+SIX files carried `from std.gpu import global_idx` (grep-verified at the
+bump): `gpu_decode`, `gpu_scan`, `gpu_pipeline`, `gpu_paginate`, `gpu_bounds`,
+`cluster_device`. `gpu_cluster.mojo` never had it — it is the host-side suite
+over cluster_device's kernels; the bump note's "seven" counted it by module
+membership, not by import. The `global_idx.x` use sites did not change, and
+`max.gpu.host` was already correct throughout. Full battery green on the
+stable toolchain, all golden views byte-equal.
 
-`std.gpu` still resolves here and all five GPU suites pass; `max.gpu` does not yet
-mirror it. The privatization landed in a nightly AFTER `dev2026083005`. So there
-is a window where neither the old nor the new import is wrong, and only one of
-them works.
-
-**Exit condition:** re-run that probe. When `max.gpu.global_idx` resolves, change
-the five import lines (`gpu_decode`, `gpu_scan`, `gpu_paginate`, `gpu_bounds`,
-`gpu_pipeline` — the 15 `global_idx.x` use sites do not change) and update this
-section. `max.gpu.host` is already correct and unaffected.
-
-**Why the pin is NOT being tightened:** `pixi.lock` is tracked and names
-`mojo-1.1.0.dev2026083005` in nine places, so a fresh clone resolves to the exact
-build these suites were verified against. Only a deliberate `pixi update` moves
-it — and if someone runs one past the privatization, `engine/check.sh` fails
-LOUDLY at parse rather than silently degrading. A working pin plus a loud gate is
-better than a narrower pin that a pruned nightly channel could make unsolvable.
+**The pin IS tightened now.** The old paragraph argued a narrow pin risked an
+unsolvable nightly channel; the stable release does not get pruned, so the
+exact pins name something durable, and the movable ranges are capped inside
+the family (`mojo <1.2`, `max <26.7`) so even a deliberate `pixi update`
+cannot sail to the 26.7/1.2 nightly line (which removes `MutStringSpan` —
+pure churn for this tree). `engine/check.sh` remains the loud gate if
+anything past that moves the import surface again.
 
 ## 2. `memcpy` → `unsafe_memcpy` — DONE, and it was already broken
 

@@ -7,7 +7,7 @@
 # device instead of uploaded). One definition so the two harnesses can never
 # drift the rule between them.
 
-from std.gpu import global_idx
+from max.gpu import global_idx
 from std.utils import StaticTuple
 from std.atomic import Atomic
 from glyph_schema import SM_STRIDE, SM_ADVANCE
