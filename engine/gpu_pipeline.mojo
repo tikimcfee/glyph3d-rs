@@ -49,7 +49,7 @@ from glyph_schema import (
     P_RESET, P_NL, P_GLYPHS, P_ROWS, P_HEAD_LEN, P_TAIL_LEN, P_WRAP, P_MODE, PM_TAIL_ADV,
 )
 from glyph_pipeline import (
-    F_LEADER, F_NEWLINE, item_for_byte, derive_stride,
+    F_LEADER, F_NEWLINE, item_for_byte,
     WRAP_DOWN, WRAP_BACK, run_pipeline, CLUSTER_LEADER, CLUSTER_CLUSTER,
 )
 
@@ -444,6 +444,33 @@ def k_resolve_x(
     _ = Atomic.max(x_max.unsafe_offset(it), ordered_key(x))     # a MEASURE: ordered key
 
 
+# ── dispatch 8b: derive the fan stride ON DEVICE — thread per item ──────────
+def k_derive_stride(
+    x_max: MutPointer[UInt32, MutAnyOrigin],
+    items_e: MutPointer[UInt32, MutAnyOrigin],
+    page_gap_x: MutPointer[Float32, MutAnyOrigin],
+    strides: MutPointer[Float32, MutAnyOrigin],
+    item_count: Int32,
+):
+    """The glyph_pipeline.mojo derive_stride, transcribed: widest row + pageGapX
+    when paged, else 0. This used to be a host round-trip between resolveX and
+    paginate (readback, derive, upload — a full drain mid-chain). The one
+    numerical judgment: device computes f32(xmax) + f32(gap) where the host
+    added in f64 and narrowed — ≤1 ulp of stride, feeding only paginate's X
+    fan, which the suite compares in the 1e-4 position tier. Orders of
+    magnitude inside the contract; no exact lane reads it."""
+    var i = Int(global_idx.x)
+    if i >= Int(item_count):
+        return
+    var ie = i * IE_STRIDE
+    var has_page = items_e[unsafe_offset = ie + IE_HAS_PAGE] != 0
+    var rows = Int(items_e[unsafe_offset = ie + IE_PAGE_ROWS])
+    if not has_page or rows <= 0:
+        strides[unsafe_offset=i] = 0
+        return
+    strides[unsafe_offset=i] = key_to_float(x_max[unsafe_offset=i]) + page_gap_x[unsafe_offset=i]
+
+
 # ── dispatch 8: paginate — thread per byte, pure per-slot remap ────────────
 def k_paginate(
     lm: MutPointer[Float32, MutAnyOrigin], fl: MutPointer[UInt32, MutAnyOrigin],
@@ -736,6 +763,9 @@ def check_fixture(var fx: PipeFixture, ctx: DeviceContext, bench: Bool = False, 
     var h_io = ctx.enqueue_create_host_buffer[DType.uint32](n)
     var h_rmax = ctx.enqueue_create_host_buffer[DType.uint32](ni0)
     var h_xmax = ctx.enqueue_create_host_buffer[DType.uint32](ni0)
+    # pageGapX, per item — the stride derive's one input that never had a
+    # device home (it lived only in the host's between-dispatches derive).
+    var h_pg = ctx.enqueue_create_host_buffer[DType.float32](ni0)
     ctx.synchronize()
     for i in range(ni0 * IM_STRIDE):
         h_it[i] = 0
@@ -760,6 +790,7 @@ def check_fixture(var fx: PipeFixture, ctx: DeviceContext, bench: Bool = False, 
         h_ie[oe + IE_SCROLL_ROWS] = UInt32(t.scroll_rows)
         h_ie[oe + IE_PAGES_WIDE] = UInt32(t.pages_wide)
         h_ie[oe + IE_HAS_PAGE] = UInt32(1) if t.has_page else UInt32(0)
+        h_pg[i] = Float32(t.page_gap_x)
     for i in range(n):
         h_io[i] = item_of[i]
     for i in range(ni0):
@@ -788,6 +819,7 @@ def check_fixture(var fx: PipeFixture, ctx: DeviceContext, bench: Bool = False, 
     var ni = fx.item_count if fx.item_count > 0 else 1
     var d_it = ctx.enqueue_create_buffer[DType.float32](ni * IM_STRIDE)
     var d_ie = ctx.enqueue_create_buffer[DType.uint32](ni * IE_STRIDE)
+    var d_pg = ctx.enqueue_create_buffer[DType.float32](ni)
     var d_io = ctx.enqueue_create_buffer[DType.uint32](n)
     var d_rmax = ctx.enqueue_create_buffer[DType.uint32](ni)
     var d_xmax = ctx.enqueue_create_buffer[DType.uint32](ni)
@@ -833,6 +865,7 @@ def check_fixture(var fx: PipeFixture, ctx: DeviceContext, bench: Bool = False, 
     ctx.enqueue_copy(dst_buf=d_otb, src_buf=h_otb)
     ctx.enqueue_copy(dst_buf=d_it, src_buf=h_it)
     ctx.enqueue_copy(dst_buf=d_ie, src_buf=h_ie)
+    ctx.enqueue_copy(dst_buf=d_pg, src_buf=h_pg)
     ctx.enqueue_copy(dst_buf=d_io, src_buf=h_io)
     ctx.enqueue_copy(dst_buf=d_rmax, src_buf=h_rmax)
     ctx.enqueue_copy(dst_buf=d_xmax, src_buf=h_xmax)
@@ -981,17 +1014,14 @@ def check_fixture(var fx: PipeFixture, ctx: DeviceContext, bench: Bool = False, 
     if profile:
         mark(ctx, t_prev, stages, 7)
     # The fan stride is DERIVED from each item's widest fold row — a fold scalar
-    # resolveX just produced. The CPU driver computes it between dispatches too, so
-    # this readback mirrors the reference rather than shortcutting it.
-    var h_xr = ctx.enqueue_create_host_buffer[DType.uint32](ni0)
-    var h_st = ctx.enqueue_create_host_buffer[DType.float32](ni0)
-    ctx.enqueue_copy(dst_buf=h_xr, src_buf=d_xmax)
-    ctx.synchronize()
-    for i in range(fx.item_count):
-        var widest = Float64(key_to_float(h_xr[i]))
-        h_st[i] = Float32(derive_stride(widest, fx.items[i]))
+    # resolveX just produced. Derived ON DEVICE (k_derive_stride): the mid-chain
+    # readback / host derive / upload and its full drain are gone.
     var d_st = ctx.enqueue_create_buffer[DType.float32](ni0)
-    ctx.enqueue_copy(dst_buf=d_st, src_buf=h_st)
+    ctx.enqueue_function[k_derive_stride](
+        d_xmax.unsafe_ptr(), d_ie.unsafe_ptr(), d_pg.unsafe_ptr(), d_st.unsafe_ptr(),
+        Int32(item_count),
+        grid_dim=(item_count + 63) // 64, block_dim=64,
+    )
     if profile:
         mark(ctx, t_prev, stages, 8)
     ctx.enqueue_function[k_paginate](
