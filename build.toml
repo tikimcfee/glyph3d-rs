@@ -540,12 +540,12 @@ expect = "gpu pipeline diverged"
 [[mutation]]
 name = "gpu-chunk-chain-phantom"
 gate = "engine-suites"
-why = "the chunked chain's phantom suppression is the same resume-past-span as the serial form's, carried through the stitch: dropping the resume in chain_walk re-walks the span and the phantom candidate inside it fires (cluster-overlap). Reddens only the suite's mode-3-chain-1 run — the serial chain's own mutation (gpu-cluster-phantom-commit) keeps its distinct find string, and the two forms' resume comments differ on purpose."
+why = "the chunked chain's phantom suppression is the commit's greedy guard over the compact list: a candidate whose start lies inside the last committed span is never read, exactly the serial rule's resume. Committing unconditionally re-walks the span and the phantom candidate inside it fires (cluster-overlap). Reddens only the suite's mode-3-chain-1 run — the serial chain's own mutation (gpu-cluster-phantom-commit) keeps its distinct find string."
 file = "engine/cluster_device.mojo"
 rebuild = "pixi run build-engine"
 op = "replace"
-find = "            id = end  # resume past the span — the chunked carry's suppressor"
-with = "            id += nb"
+find = "                if s >= ce:"
+with = "                if s >= 0:"
 expect = "gpu pipeline diverged"
 
 [[mutation]]
