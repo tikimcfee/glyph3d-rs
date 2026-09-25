@@ -899,7 +899,7 @@ def chain_walk[write: Bool](
 # back to the byte walk for that block (correct, just slower; unseen in the
 # corpus — 64 candidates needs candidate heads every 2 bytes).
 comptime CLIST_CAP = 64
-comptime CLIST_STRIDE = 3
+comptime CLIST_STRIDE = 4
 comptime CLIST_OVERFLOW = 0xFFFFFFFF
 
 
@@ -915,9 +915,13 @@ def k_chain_free(
     n_chunks: Int32,
 ):
     """Thread per 128-byte block: collect the block's candidates in start
-    order AND compute the free out in one pass. The greedy sim is the serial
-    rule's (a candidate commits iff its start clears the last committed end);
-    the list carries every candidate regardless, for the carry re-walks."""
+    order AND compute the zone table in one pass. Zone j is the greedy from
+    candidate j onward — the out for an incoming carry that suppresses
+    candidates before j. All zone sims ride the single walk (zone j's first
+    commit is candidate j by definition; later candidates commit iff they
+    clear the zone's committed end); zone 0 is the free walk, so span_out is
+    zone_out[0]. The list carries every candidate regardless, for the carry
+    re-walks and the commit."""
     var c = Int(global_idx.x)
     if c >= Int(n_chunks):
         return
@@ -929,8 +933,8 @@ def k_chain_free(
         span_out[unsafe_offset=c] = 0
         return
     var cnt = 0
-    var ce = 0
     var overflow = False
+    var sims = StaticTuple[UInt32, CLIST_CAP](0)
     var id = start
     while id < stop and (Int(bytes[unsafe_offset=id]) & 0xC0) == 0x80:
         id += 1
@@ -953,7 +957,12 @@ def k_chain_free(
         var slot = Int(cand_slot[unsafe_offset=id])
         if slot != 0:
             var end = Int(cand_end[unsafe_offset=id])
+            var lim = min(cnt, CLIST_CAP)
+            for j in range(lim):
+                if id >= Int(sims[j]):
+                    sims[j] = UInt32(end)
             if cnt < CLIST_CAP:
+                sims[cnt] = UInt32(end)
                 var o = base + cnt * CLIST_STRIDE
                 clist[unsafe_offset=o] = UInt32(id)
                 clist[unsafe_offset = o + 1] = UInt32(end)
@@ -961,14 +970,61 @@ def k_chain_free(
             else:
                 overflow = True
             cnt += 1
-            if id >= ce:
-                ce = end
         id += nb
+    if not overflow:
+        for j in range(cnt):
+            clist[unsafe_offset = base + j * CLIST_STRIDE + 3] = (
+                sims[j] if Int(sims[j]) > stop else UInt32(0)
+            )
     ccount[unsafe_offset=c] = CLIST_OVERFLOW if overflow else UInt32(cnt)
-    span_out[unsafe_offset=c] = UInt32(ce) if ce > stop else UInt32(0)
+    span_out[unsafe_offset=c] = (
+        sims[0] if (cnt > 0 and Int(sims[0]) > stop) else UInt32(0)
+    )
 
 
-def k_chain_stitch(
+def block_eval(
+    bytes: MutPointer[UInt8, MutAnyOrigin],
+    cand_slot: MutPointer[UInt32, MutAnyOrigin],
+    cand_end: MutPointer[UInt32, MutAnyOrigin],
+    gi: MutPointer[UInt32, MutAnyOrigin],
+    sm: MutPointer[Float32, MutAnyOrigin],
+    fl: MutPointer[UInt32, MutAnyOrigin],
+    bitmap_advance: Float32,
+    ccount: MutPointer[UInt32, MutAnyOrigin],
+    clist: MutPointer[UInt32, MutAnyOrigin],
+    c: Int,
+    r: Int,
+    stop: Int,
+) -> Int:
+    """The block's exit carry for an incoming carry r, from the ZONE TABLE:
+    the first candidate with start >= r opens the walk, and its recorded zone
+    out IS the greedy from there — no re-walk. Byte-walk fallback on
+    overflow."""
+    if Int(ccount[unsafe_offset=c]) == Int(CLIST_OVERFLOW):
+        return chain_walk[False](
+            bytes, cand_slot, cand_end, gi, sm, fl, bitmap_advance, r, stop
+        )
+    var base = c * CLIST_CAP * CLIST_STRIDE
+    var cnt = Int(ccount[unsafe_offset=c])
+    var j = 0
+    while j < cnt and Int(clist[unsafe_offset = base + j * CLIST_STRIDE]) < r:
+        j += 1
+    if j == cnt:
+        return 0
+    return Int(clist[unsafe_offset = base + j * CLIST_STRIDE + 3])
+
+
+# The stitch, two levels: the carry recurrence over blocks is associative, so
+# blocks group into 32-block super-blocks whose free-entry exits are computed
+# in parallel (level 1); one thread then runs the recurrence over the
+# super-blocks, evaluating a composed super-block on demand when the carry
+# lands inside it (level 2); and each super-block re-stitches internally with
+# the true entry (level 3). Same integer rule in the same order — the flat
+# stitch's carries, bit for bit, with the serial pass 32x shorter.
+comptime SB_BLOCKS = 32
+
+
+def k_chain_sb_free(
     bytes: MutPointer[UInt8, MutAnyOrigin],
     cand_slot: MutPointer[UInt32, MutAnyOrigin],
     cand_end: MutPointer[UInt32, MutAnyOrigin],
@@ -979,18 +1035,120 @@ def k_chain_stitch(
     ccount: MutPointer[UInt32, MutAnyOrigin],
     clist: MutPointer[UInt32, MutAnyOrigin],
     span_out: MutPointer[UInt32, MutAnyOrigin],
+    sb_out: MutPointer[UInt32, MutAnyOrigin],
+    n_bytes: Int32,
+    n_chunks: Int32,
+):
+    """Thread per super-block: the exit carry under free entry — the flat
+    stitch over SB_BLOCKS blocks, in parallel across super-blocks."""
+    var nsb = (Int(n_chunks) + SB_BLOCKS - 1) // SB_BLOCKS
+    var sb = Int(global_idx.x)
+    if sb >= nsb:
+        return
+    var n = Int(n_bytes)
+    var c0 = sb * SB_BLOCKS
+    var c1 = min(c0 + SB_BLOCKS, Int(n_chunks))
+    var r = 0
+    for c in range(c0, c1):
+        var start = c * BLOCK
+        var stop = min(start + BLOCK, n)
+        if r <= start:
+            r = Int(span_out[unsafe_offset=c])
+        else:
+            if r < stop:
+                r = block_eval(
+                    bytes, cand_slot, cand_end, gi, sm, fl, bitmap_advance,
+                    ccount, clist, c, r, stop,
+                )
+    sb_out[unsafe_offset=sb] = UInt32(r)
+
+
+def k_chain_sb_stitch(
+    bytes: MutPointer[UInt8, MutAnyOrigin],
+    cand_slot: MutPointer[UInt32, MutAnyOrigin],
+    cand_end: MutPointer[UInt32, MutAnyOrigin],
+    gi: MutPointer[UInt32, MutAnyOrigin],
+    sm: MutPointer[Float32, MutAnyOrigin],
+    fl: MutPointer[UInt32, MutAnyOrigin],
+    bitmap_advance: Float32,
+    ccount: MutPointer[UInt32, MutAnyOrigin],
+    clist: MutPointer[UInt32, MutAnyOrigin],
+    span_out: MutPointer[UInt32, MutAnyOrigin],
+    sb_out: MutPointer[UInt32, MutAnyOrigin],
+    sb_resolved: MutPointer[UInt32, MutAnyOrigin],
+    n_bytes: Int32,
+    n_chunks: Int32,
+):
+    """One thread over the super-blocks: the carry recurrence. Free entry uses
+    the level-1 exit; a carry landing inside evaluates the composed
+    super-block: re-walk the block containing r, then chain the remaining
+    blocks' three-way rules (free out / pass-through / re-walk)."""
+    var n = Int(n_bytes)
+    var nsb = (Int(n_chunks) + SB_BLOCKS - 1) // SB_BLOCKS
+    var r = 0
+    for sb in range(nsb):
+        var sb_start = sb * SB_BLOCKS * BLOCK
+        var sb_end = min(sb_start + SB_BLOCKS * BLOCK, n)
+        if r <= sb_start:
+            sb_resolved[unsafe_offset=sb] = 0
+            r = Int(sb_out[unsafe_offset=sb])
+        else:
+            sb_resolved[unsafe_offset=sb] = UInt32(r)
+            if r < sb_end:
+                var c = min(r // BLOCK, Int(n_chunks) - 1)
+                var stop_c = min((c + 1) * BLOCK, n)
+                var v = r
+                if r < stop_c:
+                    v = block_eval(
+                        bytes, cand_slot, cand_end, gi, sm, fl, bitmap_advance,
+                        ccount, clist, c, r, stop_c,
+                    )
+                var c1 = min((sb + 1) * SB_BLOCKS, Int(n_chunks))
+                var cc = c + 1
+                while cc < c1:
+                    var start_cc = cc * BLOCK
+                    var stop_cc = min(start_cc + BLOCK, n)
+                    if v <= start_cc:
+                        v = Int(span_out[unsafe_offset=cc])
+                    elif v >= stop_cc:
+                        pass
+                    else:
+                        v = block_eval(
+                            bytes, cand_slot, cand_end, gi, sm, fl, bitmap_advance,
+                            ccount, clist, cc, v, stop_cc,
+                        )
+                    cc += 1
+                r = v
+            # r >= sb_end: the span covers the whole super-block — pass
+
+
+def k_chain_sb_apply(
+    bytes: MutPointer[UInt8, MutAnyOrigin],
+    cand_slot: MutPointer[UInt32, MutAnyOrigin],
+    cand_end: MutPointer[UInt32, MutAnyOrigin],
+    gi: MutPointer[UInt32, MutAnyOrigin],
+    sm: MutPointer[Float32, MutAnyOrigin],
+    fl: MutPointer[UInt32, MutAnyOrigin],
+    bitmap_advance: Float32,
+    ccount: MutPointer[UInt32, MutAnyOrigin],
+    clist: MutPointer[UInt32, MutAnyOrigin],
+    span_out: MutPointer[UInt32, MutAnyOrigin],
+    sb_resolved: MutPointer[UInt32, MutAnyOrigin],
     resolved: MutPointer[UInt32, MutAnyOrigin],
     n_bytes: Int32,
     n_chunks: Int32,
 ):
-    """One thread over the blocks: the carry recurrence. Free entry when the
-    carry lands at/before the block start; a re-walk over the block's COMPACT
-    candidate list when it lands inside (the byte re-walk was the chain's
-    remaining serial cost); pass-through when the span covers the whole block.
-    Writes each block's resolved in-carry for k_chain_commit."""
+    """Thread per super-block: the internal stitch with the TRUE entry carry,
+    writing every block's resolved in-carry for k_chain_commit."""
+    var nsb = (Int(n_chunks) + SB_BLOCKS - 1) // SB_BLOCKS
+    var sb = Int(global_idx.x)
+    if sb >= nsb:
+        return
     var n = Int(n_bytes)
-    var r = 0
-    for c in range(Int(n_chunks)):
+    var c0 = sb * SB_BLOCKS
+    var c1 = min(c0 + SB_BLOCKS, Int(n_chunks))
+    var r = Int(sb_resolved[unsafe_offset=sb])
+    for c in range(c0, c1):
         var start = c * BLOCK
         var stop = min(start + BLOCK, n)
         if r <= start:
@@ -999,20 +1157,10 @@ def k_chain_stitch(
         else:
             resolved[unsafe_offset=c] = UInt32(r)
             if r < stop:
-                var cnt = Int(ccount[unsafe_offset=c])
-                if cnt == Int(CLIST_OVERFLOW):
-                    r = chain_walk[False](
-                        bytes, cand_slot, cand_end, gi, sm, fl, bitmap_advance, r, stop
-                    )
-                else:
-                    var base = c * CLIST_CAP * CLIST_STRIDE
-                    var ce = r
-                    for k in range(cnt):
-                        var o = base + k * CLIST_STRIDE
-                        if Int(clist[unsafe_offset=o]) >= ce:
-                            ce = Int(clist[unsafe_offset = o + 1])
-                    r = ce if ce > stop else 0
-            # r >= stop: the span covers the whole block — the carry passes
+                r = block_eval(
+                    bytes, cand_slot, cand_end, gi, sm, fl, bitmap_advance,
+                    ccount, clist, c, r, stop,
+                )
 
 
 def k_chain_commit(
