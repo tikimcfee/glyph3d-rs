@@ -288,6 +288,15 @@ pub struct Engine {
     handle: *mut c_void,
 }
 
+/// `new()` verbatim — there is no cheap default to derive: a null handle is
+/// precisely what `Engine::new` asserts against at the FFI seam, and the
+/// fp-contract probe belongs to every construction path.
+impl Default for Engine {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Engine {
     pub fn new() -> Self {
         let handle = unsafe { glyph_engine_new() };

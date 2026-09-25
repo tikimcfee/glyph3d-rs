@@ -4,6 +4,13 @@ version = "0.1.0"
 edition = "2021"
 description = "Stage A: native wgpu shell for the million-glyph code-visualization port"
 
+# The lib target exists so the Zed-integration experiment can link the
+# renderer into the experiment workspace (one binary, one lock there — the
+# gated repo build never sees Zed's graph). See
+# zed_integration_experiments/docs/seam.md.
+[lib]
+path = "src/lib.rs"
+
 [dependencies]
 # Latest stable wgpu (v30.x). Let cargo resolve within the major line.
 wgpu = "30"

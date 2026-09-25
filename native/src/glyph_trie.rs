@@ -15,8 +15,10 @@
 //! The shape is ICU's UTrie2, one level shallower: two dependent loads and no
 //! hashing.
 //!
-//!     block = block_index[cp >> 8]
-//!     entry = (block << 8) | (cp & 0xFF)
+//! ```text
+//! block = block_index[cp >> 8]
+//! entry = (block << 8) | (cp & 0xFF)
+//! ```
 //!
 //! A miss is a VALUE, not a failure: unmapped codepoints resolve through the
 //! shared missing block (storage index 0), whose entries carry FLAG_MISSING and
