@@ -514,6 +514,19 @@ with = """        cand_slot[unsafe_offset=id] = 0
 expect = "gpu pipeline diverged"
 
 [[mutation]]
+name = "gpu-fused-probe-zero"
+gate = "engine-suites"
+why = "the fused-path twin of gpu-pipeline-probe-zero: k_decode_probe's candidate writes are what make the fused dispatch LIVE in the suite's mode 2. With them zeroed, mode 0 stays green and only the fused comparison reddens — so the pair together proves BOTH probe forms are wired into the chain. The 12-space indent (inside `comptime if probe:`) is what distinguishes the fused copy from k_cluster_probe's; if the fused dispatch ever drops from the chain while the suite claims modes 0+2, this is the mutation that says so."
+file = "engine/cluster_device.mojo"
+rebuild = "pixi run build-engine"
+op = "replace"
+find = """            cand_slot[unsafe_offset=id] = best_slot
+            cand_end[unsafe_offset=id] = UInt32(p2)"""
+with = """            cand_slot[unsafe_offset=id] = 0
+            cand_end[unsafe_offset=id] = UInt32(p2)"""
+expect = "gpu pipeline diverged"
+
+[[mutation]]
 name = "cluster-split-phantom-commit"
 gate = "engine-suites"
 why = "the chain's phantom suppression is the commit's resume-past-span: with (A C) and (C A) both in the table, 🇦🇨🇦 must keep its lone A. Advancing past the head only re-walks the span, and the phantom candidate inside it fires — conformance_split reddens. CONSUMED BY: cluster-overlap.pipe.bin, the fixture that exists for exactly this. (The first form of this mutation dropped the carry GUARD; the resume's landing made that guard a loop invariant, and the review pass caught the mutation going vacuous — bf0a117 never re-ran prove.)"

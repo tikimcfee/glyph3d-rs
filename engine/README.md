@@ -182,18 +182,31 @@ construction, not by shortfall. See below.
 mojo run -I engine engine/gpu_pipeline.mojo engine/fixtures/*.pipe.bin
 ```
 
-Nine dispatches chained with every intermediate staying in device memory:
+Nine dispatches chained with every intermediate staying in device memory
+(statics mode 0 — modes below):
 
 ```
-clusterProbe -> clusterChain -> chunkReduce -> spineReduce -> spineScan
+(decode+)clusterProbe -> clusterChain -> chunkReduce -> spineReduce -> spineScan
      -> partialScan -> apply -> resolveX -> paginate
 ```
+
+The statics arrive in one of three **modes** (`check_fixture`'s `mode`): `0`
+decodes on CPU and uploads (the shipped form); `1` decodes on device, probe
+unfused; `2` fuses decode+probe into `k_decode_probe` — one dispatch, the
+probe's head in registers, no statics on the bus. The suite runs `0` and `2`
+over every fixture and synthetic case; modes `1`/`2` add a **bit-exact gi/sm
+tier** against the reference's resolved statics, so the device decode is
+pinned end to end rather than assumed from `gpu_decode`'s isolated proof.
+`--bench` runs all three so the A/B attributes the delta (upload elimination
+vs dispatch fusion); measured 2026-09-24, the fused form is never slower and
+cuts total device-phase time ~1.9x on 25 MB text by eliminating the
+leader-forced CPU decode from the harness contract.
 
 Counts (`ROW`/`COL`/`ORD`/`ordToByte`) and the `totalRows` fold scalar compare
 **exact**; `LINE_ADV` and the resolved positions at eps. The fan stride is derived
 from a fold scalar between dispatches, as the CPU driver does. The
 monoid lives in one function that every scan dispatch calls, so seven kernels cannot drift
-the way seven transcriptions would; the two cluster dispatches are
+the way seven transcriptions would; the cluster kernels are
 cluster_device.mojo's, shared with gpu_cluster's standalone proof.
 
 **This found two bugs the five piecewise GPU suites could not**, which is the whole
