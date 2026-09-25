@@ -30,6 +30,7 @@ pub mod offscreen;
 pub mod repo;
 pub mod scan;
 pub mod scene;
+pub mod seam;
 pub mod text;
 pub mod windowed;
 

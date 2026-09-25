@@ -2050,12 +2050,12 @@ impl GlyphScene {
                     continue;
                 }
                 let byte = leaders[i].0;
-                while run_ix < runs.len() && runs[run_ix].end <= byte {
+                while run_ix < runs.len() && runs[run_ix].range.end <= byte {
                     run_ix += 1;
                 }
                 // runs[run_ix] is the first run ending past `byte`; it covers
                 // the record iff it also starts at/before it.
-                if let Some(run) = runs.get(run_ix).filter(|run| byte >= run.start) {
+                if let Some(run) = runs.get(run_ix).filter(|run| byte >= run.range.start) {
                     let packed = u32::from(run.rgb[0])
                         | u32::from(run.rgb[1]) << 8
                         | u32::from(run.rgb[2]) << 16
@@ -2905,25 +2905,17 @@ fn ray_aabb(ro: DVec3, rd: DVec3, min: DVec3, max: DVec3) -> Option<f64> {
     Some(t0)
 }
 
-/// One highlight-sidecar run: bytes `[start, end)` of a file, colored `rgb`
-/// (sRGB bytes). Produced by `experiments/zedspike` from Zed's headless
-/// language stack.
-struct HighlightRun {
-    start: usize,
-    end: usize,
-    rgb: [u8; 3],
-}
-
 /// Parse the sidecar: `rel_path<TAB>start<TAB>end<TAB>rrggbb` per line, a
 /// leading `#` on the color tolerated, blank lines skipped, runs kept in file
-/// order. Hand-rolled on purpose — the renderer carries no JSON dependency,
-/// and this format exists to cross the zedspike → renderer seam, not to be a
-/// public contract.
+/// order. Emits [`crate::seam::StyleRun`]s — the seam's run type — so the
+/// spike path and the envelope path share one law. Hand-rolled on purpose:
+/// the renderer carries no JSON dependency, and this format exists to cross
+/// the zedspike → renderer seam, not to be a public contract.
 fn parse_highlight_sidecar(
     path: &std::path::Path,
-) -> Result<std::collections::HashMap<String, Vec<HighlightRun>>, String> {
+) -> Result<std::collections::HashMap<String, Vec<crate::seam::StyleRun>>, String> {
     let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
-    let mut map: std::collections::HashMap<String, Vec<HighlightRun>> =
+    let mut map: std::collections::HashMap<String, Vec<crate::seam::StyleRun>> =
         std::collections::HashMap::new();
     for (n, line) in text.lines().enumerate() {
         let line = line.trim_end_matches(['\r']);
@@ -2952,7 +2944,10 @@ fn parse_highlight_sidecar(
             u8::from_str_radix(&hex[2..4], 16).map_err(|_| bad("color not rrggbb hex"))?,
             u8::from_str_radix(&hex[4..6], 16).map_err(|_| bad("color not rrggbb hex"))?,
         ];
-        map.entry(rel.to_string()).or_default().push(HighlightRun { start, end, rgb });
+        map.entry(rel.to_string()).or_default().push(crate::seam::StyleRun {
+            range: start..end,
+            rgb,
+        });
     }
     Ok(map)
 }
