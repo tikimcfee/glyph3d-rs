@@ -516,14 +516,25 @@ expect = "gpu pipeline diverged"
 [[mutation]]
 name = "gpu-fused-probe-zero"
 gate = "engine-suites"
-why = "the fused-path twin of gpu-pipeline-probe-zero: k_decode_probe's candidate writes are what make the fused dispatch LIVE in the suite's mode 2. With them zeroed, mode 0 stays green and only the fused comparison reddens — so the pair together proves BOTH probe forms are wired into the chain. The 12-space indent (inside `comptime if probe:`) is what distinguishes the fused copy from k_cluster_probe's; if the fused dispatch ever drops from the chain while the suite claims modes 0+2, this is the mutation that says so."
+why = "the fused-path twin of gpu-pipeline-probe-zero: k_decode_probe's candidate writes are what make the fused dispatch LIVE in the suite's mode 2. With them zeroed, mode 0 stays green and only the fused comparison reddens — so the pair together proves BOTH probe forms are wired into the chain. The 16-space indent (inside `comptime if walk:`'s else branch) is what distinguishes the fused copy from k_cluster_probe's; if the fused dispatch ever drops from the chain while the suite claims modes 0+2, this is the mutation that says so."
 file = "engine/cluster_device.mojo"
 rebuild = "pixi run build-engine"
 op = "replace"
-find = """            cand_slot[unsafe_offset=id] = best_slot
-            cand_end[unsafe_offset=id] = UInt32(p2)"""
-with = """            cand_slot[unsafe_offset=id] = 0
-            cand_end[unsafe_offset=id] = UInt32(p2)"""
+find = """                cand_slot[unsafe_offset=id] = best_slot
+                cand_end[unsafe_offset=id] = UInt32(p2)"""
+with = """                cand_slot[unsafe_offset=id] = 0
+                cand_end[unsafe_offset=id] = UInt32(p2)"""
+expect = "gpu pipeline diverged"
+
+[[mutation]]
+name = "gpu-walk-probe-zero"
+gate = "engine-suites"
+why = "the state walk's anti-vacuity pin: with its candidate writes removed, modes 0 and 2 stay green and only mode 3's comparison reddens — proving the walk dispatch is LIVE in the suite, the twin of gpu-pipeline-probe-zero and gpu-fused-probe-zero. The walk's `last_slot` store is distinct from the search form's `best_slot` store, so the three mutations can never land on each other's copies."
+file = "engine/cluster_device.mojo"
+rebuild = "pixi run build-engine"
+op = "replace"
+find = "                cand_slot[unsafe_offset=id] = last_slot"
+with = "                cand_slot[unsafe_offset=id] = 0"
 expect = "gpu pipeline diverged"
 
 [[mutation]]

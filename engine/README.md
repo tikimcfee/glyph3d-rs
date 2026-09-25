@@ -190,17 +190,23 @@ Nine dispatches chained with every intermediate staying in device memory
      -> partialScan -> apply -> resolveX -> paginate
 ```
 
-The statics arrive in one of three **modes** (`check_fixture`'s `mode`): `0`
+The statics arrive in one of four **modes** (`check_fixture`'s `mode`): `0`
 decodes on CPU and uploads (the shipped form); `1` decodes on device, probe
 unfused; `2` fuses decode+probe into `k_decode_probe` — one dispatch, the
-probe's head in registers, no statics on the bus. The suite runs `0` and `2`
-over every fixture and synthetic case; modes `1`/`2` add a **bit-exact gi/sm
-tier** against the reference's resolved statics, so the device decode is
-pinned end to end rather than assumed from `gpu_decode`'s isolated proof.
-`--bench` runs all three so the A/B attributes the delta (upload elimination
-vs dispatch fusion); measured 2026-09-24, the fused form is never slower and
-cuts total device-phase time ~1.9x on 25 MB text by eliminating the
-leader-forced CPU decode from the harness contract.
+probe's head in registers, no statics on the bus; `3` swaps the probe's table
+form — a (state, cp)→(next, accept) hash walked one codepoint at a time
+(`build_state_table`, built at load from the same section bytes) replaces the
+descending binary searches, and the sequence section stays off the bus. The
+suite runs `0`, `2` and `3` over every fixture and synthetic case; modes
+`1`/`2`/`3` add a **bit-exact gi/sm tier** against the reference's resolved
+statics, so the device decode is pinned end to end rather than assumed from
+`gpu_decode`'s isolated proof. `--bench` runs all four so the A/B attributes
+the deltas: upload elimination (0→1), dispatch fusion (1→2), table form
+(2→3). Measured 2026-09-24→25 (M2, stable toolchain): the fused form cut
+total device-phase time ~1.9x on 25 MB text by eliminating the leader-forced
+CPU decode; the walk then cut the dense-emoji GPU phase a further ~1.4x
+(667→475 ms at 4 MB, the binary searches' ~100 dependent loads per head
+becoming ≤ the sequence length).
 
 Counts (`ROW`/`COL`/`ORD`/`ordToByte`) and the `totalRows` fold scalar compare
 **exact**; `LINE_ADV` and the resolved positions at eps. The fan stride is derived

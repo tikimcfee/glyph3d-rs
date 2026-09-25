@@ -70,7 +70,7 @@ def ordered_key(v: Float32) -> UInt32:
     return b | 0x80000000
 from glyph_scan import run_scan_pipeline
 from cluster_device import (
-    k_cluster_probe, k_cluster_chain, k_decode_probe, build_head_bitmap, HEAD_BMP_WORDS,
+    k_cluster_probe, k_cluster_chain, k_decode_probe, build_head_bitmap, build_state_table, HEAD_BMP_WORDS, ST_STRIDE,
 )
 from fixture_io import load_pipe_fixture, PipeFixture, load_trie_blob
 from glyph_pipeline import Item, Trie
@@ -520,11 +520,13 @@ def rel_close(a: Float64, b: Float64) -> Bool:
 
 
 def check_case(path: String, ctx: DeviceContext) raises -> Int:
-    # Every fixture runs mode 0 (CPU-decoded statics, unfused probe) AND mode 2
-    # (fused decode+probe) against the same reference — the suite proves the
-    # fused form on every run, not just when someone benches it.
+    # Every fixture runs mode 0 (CPU-decoded statics, unfused probe), mode 2
+    # (fused decode+probe, binary search) AND mode 3 (fused, state walk)
+    # against the same reference — the suite proves every live form on every
+    # run, not just when someone benches it.
     var bad = check_fixture(load_pipe_fixture(path), ctx)
     bad += check_fixture(load_pipe_fixture(path), ctx, mode=2)
+    bad += check_fixture(load_pipe_fixture(path), ctx, mode=3)
     return bad
 
 
@@ -535,7 +537,10 @@ def check_fixture(var fx: PipeFixture, ctx: DeviceContext, bench: Bool = False, 
     1 — decode on device (k_decode_probe[False]), probe unfused. Bench-only:
         isolates the upload elimination from the dispatch fusion.
     2 — decode and probe fused (k_decode_probe[True]); chain unchanged.
-    Modes 1/2 additionally compare the device-produced statics (gi, sm)
+    3 — as 2, with the probe's table form swapped: the state walk's hash
+        (build_state_table, built at load from the same section) replaces the
+        descending binary searches.
+    Modes 1/2/3 additionally compare the device-produced statics (gi, sm)
     bit-exact against the reference's RESOLVED statics — the fused decode is
     pinned end to end, not assumed from gpu_decode's separate proof."""
     var n = fx.byte_len
@@ -620,14 +625,28 @@ def check_fixture(var fx: PipeFixture, ctx: DeviceContext, bench: Bool = False, 
     var h_ir = ctx.enqueue_create_host_buffer[DType.uint32](item_count * 2)
     var h_ic = ctx.enqueue_create_host_buffer[DType.uint32](item_count)
     # The decode trie tables, needed only when decode runs on device. Filled
-    # and uploaded solely in modes 1/2; mode 0 never reads them.
+    # and uploaded solely in modes 1/2/3; mode 0 never reads them.
     var n_idx = len(fx.trie.block_index)
     var n_bm = len(fx.trie.blocks_m)
     var n_bc = len(fx.trie.blocks_c)
     var h_index = ctx.enqueue_create_host_buffer[DType.uint32](n_idx)
     var h_bm = ctx.enqueue_create_host_buffer[DType.float32](n_bm)
     var h_bc = ctx.enqueue_create_host_buffer[DType.uint32](n_bc)
+    # The walk form's state table (mode 3): built at load time from the SAME
+    # sequence section the search form reads, so the two table forms share one
+    # source and cannot drift. Mode 3 also leaves the sequence section itself
+    # off the bus — the walk's hash replaces it.
+    var st_tab = List[UInt32]()
+    var st_mask = UInt32(0)
+    if mode == 3:
+        st_tab = build_state_table(fx.trie.seq, seq_count, Int(fx.trie.seq_max))
+        st_mask = UInt32(len(st_tab) // ST_STRIDE - 1)
+    var n_st = len(st_tab) if len(st_tab) > 0 else 1
+    var h_tab = ctx.enqueue_create_host_buffer[DType.uint32](n_st)
     ctx.synchronize()
+    if mode == 3:
+        for i in range(len(st_tab)):
+            h_tab[i] = st_tab[i]
     if mode == 0:
         var items_leader = List[Item]()
         for i in range(len(fx.items)):
@@ -651,10 +670,11 @@ def check_fixture(var fx: PipeFixture, ctx: DeviceContext, bench: Bool = False, 
         h_bytes[id] = fx.bytes[id]
         h_ceof[id] = item_end_of[id]
         h_cof[id] = cluster_of[id]
-    for i in range(len(fx.trie.seq)):
-        h_seq[i] = fx.trie.seq[i]
-    if len(fx.trie.seq) == 0:
-        h_seq[0] = 0
+    if mode != 3:
+        for i in range(len(fx.trie.seq)):
+            h_seq[i] = fx.trie.seq[i]
+        if len(fx.trie.seq) == 0:
+            h_seq[0] = 0
     var head_bmp = build_head_bitmap(fx.trie)
     for i in range(HEAD_BMP_WORDS):
         h_bmp[i] = head_bmp[i]
@@ -738,11 +758,13 @@ def check_fixture(var fx: PipeFixture, ctx: DeviceContext, bench: Bool = False, 
     var d_xmax = ctx.enqueue_create_buffer[DType.uint32](ni)
     var d_bytes = ctx.enqueue_create_buffer[DType.uint8](n)
     var d_gi = ctx.enqueue_create_buffer[DType.uint32](n)
-    # The decode trie tables: uploaded and read only in modes 1/2 (device
+    # The decode trie tables: uploaded and read only in modes 1/2/3 (device
     # decode). In mode 0 they sit unused — allocated, never filled.
     var d_index = ctx.enqueue_create_buffer[DType.uint32](n_idx)
     var d_bm = ctx.enqueue_create_buffer[DType.float32](n_bm)
     var d_bc = ctx.enqueue_create_buffer[DType.uint32](n_bc)
+    # The walk form's state table: uploaded only in mode 3.
+    var d_tab = ctx.enqueue_create_buffer[DType.uint32](n_st)
     var d_seq = ctx.enqueue_create_buffer[DType.uint32](n_seq)
     var d_bmp = ctx.enqueue_create_buffer[DType.uint32](HEAD_BMP_WORDS)
     var d_ceof = ctx.enqueue_create_buffer[DType.uint32](n)
@@ -763,6 +785,8 @@ def check_fixture(var fx: PipeFixture, ctx: DeviceContext, bench: Bool = False, 
         ctx.enqueue_copy(dst_buf=d_index, src_buf=h_index)
         ctx.enqueue_copy(dst_buf=d_bm, src_buf=h_bm)
         ctx.enqueue_copy(dst_buf=d_bc, src_buf=h_bc)
+        if mode == 3:
+            ctx.enqueue_copy(dst_buf=d_tab, src_buf=h_tab)
     ctx.enqueue_copy(dst_buf=d_lm, src_buf=h_lm)
     ctx.enqueue_copy(dst_buf=d_lc, src_buf=h_lc)
     ctx.enqueue_copy(dst_buf=d_w, src_buf=h_w)
@@ -780,7 +804,9 @@ def check_fixture(var fx: PipeFixture, ctx: DeviceContext, bench: Bool = False, 
     ctx.enqueue_copy(dst_buf=d_bytes, src_buf=h_bytes)
     if mode == 0:
         ctx.enqueue_copy(dst_buf=d_gi, src_buf=h_gi)
-    ctx.enqueue_copy(dst_buf=d_seq, src_buf=h_seq)
+    if mode != 3:
+        # The walk form reads its own hash, not the sequence section.
+        ctx.enqueue_copy(dst_buf=d_seq, src_buf=h_seq)
     ctx.enqueue_copy(dst_buf=d_bmp, src_buf=h_bmp)
     ctx.enqueue_copy(dst_buf=d_ceof, src_buf=h_ceof)
     ctx.enqueue_copy(dst_buf=d_cof, src_buf=h_cof)
@@ -808,26 +834,44 @@ def check_fixture(var fx: PipeFixture, ctx: DeviceContext, bench: Bool = False, 
     # them. Mode 1 decodes on device first (upload eliminated, probe unfused).
     # Mode 2 fuses decode+probe into k_decode_probe — one dispatch, and the
     # probe's head arrives in registers instead of being re-walked from bytes.
+    # Mode 3 swaps the probe's table form: the state walk's hash replaces the
+    # descending binary searches (and the sequence section stays off the bus).
     # The scan's kernels below read the rewritten statics — same order as the
     # CPU's resolve-before-fold.
     if mode == 2:
-        ctx.enqueue_function[k_decode_probe[True]](
+        ctx.enqueue_function[k_decode_probe[True, False]](
             d_bytes.unsafe_ptr(), d_index.unsafe_ptr(), d_bm.unsafe_ptr(), d_bc.unsafe_ptr(),
             d_sm.unsafe_ptr(), d_gi.unsafe_ptr(), d_fl.unsafe_ptr(),
             d_cof.unsafe_ptr(), d_ceof.unsafe_ptr(),
             d_seq.unsafe_ptr(), d_bmp.unsafe_ptr(),
             d_cslot.unsafe_ptr(), d_cend.unsafe_ptr(), d_cblk.unsafe_ptr(),
+            # the walk's tab is comptime-eliminated in the search form; any
+            # non-aliased u32 pointer satisfies the signature
+            d_lc.unsafe_ptr(), UInt32(0),
+            Int32(n), Int32(seq_count), Int32(fx.trie.seq_max),
+            grid_dim=(n + B - 1) // B, block_dim=B,
+        )
+    elif mode == 3:
+        ctx.enqueue_function[k_decode_probe[True, True]](
+            d_bytes.unsafe_ptr(), d_index.unsafe_ptr(), d_bm.unsafe_ptr(), d_bc.unsafe_ptr(),
+            d_sm.unsafe_ptr(), d_gi.unsafe_ptr(), d_fl.unsafe_ptr(),
+            d_cof.unsafe_ptr(), d_ceof.unsafe_ptr(),
+            d_seq.unsafe_ptr(), d_bmp.unsafe_ptr(),
+            d_cslot.unsafe_ptr(), d_cend.unsafe_ptr(), d_cblk.unsafe_ptr(),
+            d_tab.unsafe_ptr(), st_mask,
             Int32(n), Int32(seq_count), Int32(fx.trie.seq_max),
             grid_dim=(n + B - 1) // B, block_dim=B,
         )
     else:
         if mode == 1:
-            ctx.enqueue_function[k_decode_probe[False]](
+            ctx.enqueue_function[k_decode_probe[False, False]](
                 d_bytes.unsafe_ptr(), d_index.unsafe_ptr(), d_bm.unsafe_ptr(), d_bc.unsafe_ptr(),
                 d_sm.unsafe_ptr(), d_gi.unsafe_ptr(), d_fl.unsafe_ptr(),
                 d_cof.unsafe_ptr(), d_ceof.unsafe_ptr(),
                 d_seq.unsafe_ptr(), d_bmp.unsafe_ptr(),
                 d_cslot.unsafe_ptr(), d_cend.unsafe_ptr(), d_cblk.unsafe_ptr(),
+                # tab is comptime-eliminated without the walk, as above
+                d_lc.unsafe_ptr(), UInt32(0),
                 Int32(n), Int32(seq_count), Int32(fx.trie.seq_max),
                 grid_dim=(n + B - 1) // B, block_dim=B,
             )
@@ -1042,11 +1086,12 @@ def bench_scaling(trie: Trie, path: String, ctx: DeviceContext, cluster: Bool = 
     included); leader mode pays the pass's dispatches but no-ops inside the
     kernels (per-thread cluster_of/item_cluster early-returns).
 
-    Every size runs the three statics modes: 0 = CPU decode + upload (the
-    shipped form), 1 = device decode, probe unfused, 2 = fused decode+probe.
-    The printed `prep` column is the host fill+upload time the mode pays (mode
-    0's includes a whole leader-forced CPU pipeline run), so the A/B attributes
-    the delta: upload elimination (0→1) vs dispatch fusion (1→2)."""
+    Every size runs the statics modes: 0 = CPU decode + upload (the shipped
+    form), 1 = device decode, probe unfused, 2 = fused decode+probe (binary
+    search), 3 = fused decode+probe (state walk). The printed `prep` column is
+    the host fill+upload time the mode pays (mode 0's includes a whole
+    leader-forced CPU pipeline run), so the A/B attributes the delta: upload
+    elimination (0→1), dispatch fusion (1→2), table form (2→3)."""
     var f = open(path, "r")
     var all_bytes = f.read_bytes()
     f.close()
@@ -1067,7 +1112,7 @@ def bench_scaling(trie: Trie, path: String, ctx: DeviceContext, cluster: Bool = 
         var bytes = List[UInt8](capacity=nb)
         for i in range(nb):
             bytes.append(all_bytes[i])
-        for m in range(3):
+        for m in range(4):
             var it = Item()
             it.byte_start = 0
             it.byte_count = nb
@@ -1140,6 +1185,6 @@ def main() raises:
         total_bad += b1 + b2 + b3
 
     if total_bad == 0:
-        print("gpu pipeline: the device chain, statics modes 0+2 — counts exact, statics bit-exact, positions within 1e-4")
+        print("gpu pipeline: the device chain, statics modes 0+2+3 — counts exact, statics bit-exact, positions within 1e-4")
     else:
         raise Error("gpu pipeline diverged")

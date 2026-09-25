@@ -68,6 +68,113 @@ def build_head_bitmap(trie: Trie) raises -> List[UInt32]:
     return bmp^
 
 
+# ── the state walk's table ─────────────────────────────────────────────────
+# The sequence table as a (state, cp) -> (next_state, accept_slot) hash: the
+# trie of all 4,166 entries flattened for O(1)-per-step walking. Built at load
+# time from the SAME table bytes the binary-search form reads (deterministic
+# insertion order: entries in table order, codepoints in order), so the two
+# forms can never drift. ST_STRIDE fields per slot: [key_state, key_cp,
+# next_state, accept_slot]; accept_slot lives on the edge into the accepting
+# node, which is the node (a trie node has exactly one path).
+comptime ST_STRIDE = 4
+comptime ST_EMPTY = 0xFFFFFFFF
+
+
+def st_mix(s: UInt32, cp: UInt32) -> UInt32:
+    """The one hash, shared by the builder (host) and st_probe (device) — same
+    function both sides, so placement can never disagree with lookup."""
+    var h = s * 0x9E3779B1
+    h ^= cp * 0x85EBCA77
+    h ^= h >> 16
+    return h
+
+
+def build_state_table(seq: List[UInt32], seq_count: Int, seq_max: Int) raises -> List[UInt32]:
+    """Flatten the sorted sequence section into the walk's hash. Runs at load
+    time (host); the kernel never builds. The static-zero-head entry is
+    included verbatim — unreachable, exactly as in the search form, because
+    the kernel's static-zero branch returns before any table read."""
+    var edges = List[UInt32]()      # stride 4: from, cp, to, 0 (accept filled later)
+    var accepts = List[UInt32](length=1, fill=0)  # by node id; node 0 is root
+    var ids = Dict[UInt64, UInt32]()              # (from << 32) | cp -> to
+    var next_id = UInt32(1)
+    var stride = 2 + seq_max
+    for i in range(seq_count):
+        var o = i * stride
+        var ln = Int(seq[o + 1])
+        var slot = seq[o]
+        if ln < 2:
+            # All four implementations floor the match at len >= 2; a len-1
+            # entry is dead in the search form but would go LIVE here (the
+            # root edge would accept at depth 1). The floor moves deliberately.
+            raise Error("sequence entry with len < 2 — the match floor moves deliberately")
+        var s = UInt32(0)
+        for d in range(ln):
+            var cp = seq[o + 2 + d]
+            var key = (UInt64(s) << 32) | UInt64(cp)
+            var ns: UInt32
+            if key in ids:
+                ns = ids[key]
+            else:
+                ns = next_id
+                next_id += 1
+                ids[key] = ns
+                edges.append(s)
+                edges.append(cp)
+                edges.append(ns)
+                edges.append(0)
+                accepts.append(0)
+            if d == ln - 1:
+                if accepts[ns] != 0 and accepts[ns] != slot:
+                    # First-in-sorted-order is today's duplicate semantics;
+                    # a real duplicate moves THAT deliberately too.
+                    raise Error("duplicate sequence with a different slot — the tiebreak moves deliberately")
+                accepts[ns] = slot
+            s = ns
+    var n_edges = len(edges) // ST_STRIDE
+    var size = 1
+    while size < n_edges * 2:
+        size *= 2
+    var tab = List[UInt32](length=size * ST_STRIDE, fill=0)
+    var mask = UInt32(size - 1)
+    for h in range(size):
+        tab[h * ST_STRIDE] = ST_EMPTY
+    for e in range(n_edges):
+        var s = edges[e * ST_STRIDE]
+        var cp = edges[e * ST_STRIDE + 1]
+        var ns = edges[e * ST_STRIDE + 2]
+        var h = st_mix(s, cp) & mask
+        while tab[Int(h) * ST_STRIDE] != ST_EMPTY:
+            h = (h + 1) & mask
+        var o = Int(h) * ST_STRIDE
+        tab[o] = s
+        tab[o + 1] = cp
+        tab[o + 2] = ns
+        tab[o + 3] = accepts[Int(ns)]
+    return tab^
+
+
+def st_probe(
+    tab: MutPointer[UInt32, MutAnyOrigin], mask: UInt32, s: UInt32, cp: UInt32
+) -> StaticTuple[UInt32, 2]:
+    """One table probe: (next_state, accept_slot), or (ST_EMPTY, 0) on a miss.
+    Linear probing; the load factor is <= 1/2 by the builder's sizing."""
+    var h = st_mix(s, cp) & mask
+    while True:
+        var o = Int(h) * ST_STRIDE
+        var ks = tab[unsafe_offset=o]
+        if ks == ST_EMPTY:
+            var miss = StaticTuple[UInt32, 2](0)
+            miss[0] = ST_EMPTY
+            return miss
+        if ks == s and tab[unsafe_offset = o + 1] == cp:
+            var hit = StaticTuple[UInt32, 2](0)
+            hit[0] = tab[unsafe_offset = o + 2]
+            hit[1] = tab[unsafe_offset = o + 3]
+            return hit
+        h = (h + 1) & mask
+
+
 def k_cluster_probe(
     bytes: MutPointer[UInt8, MutAnyOrigin],
     cluster_of: MutPointer[UInt32, MutAnyOrigin],   # per byte: 1 in a cluster item
@@ -360,7 +467,7 @@ def k_cluster_chain(
 
 
 
-def k_decode_probe[probe: Bool](
+def k_decode_probe[probe: Bool, walk: Bool = False](
     bytes: MutPointer[UInt8, MutAnyOrigin],
     block_index: MutPointer[UInt32, MutAnyOrigin],
     blocks_m: MutPointer[Float32, MutAnyOrigin],
@@ -375,6 +482,8 @@ def k_decode_probe[probe: Bool](
     cand_slot: MutPointer[UInt32, MutAnyOrigin],
     cand_end: MutPointer[UInt32, MutAnyOrigin],
     cand_blocks: MutPointer[UInt32, MutAnyOrigin],  # presence per 128-byte block
+    tab: MutPointer[UInt32, MutAnyOrigin],          # build_state_table's hash (walk only)
+    tab_mask: UInt32,
     n_bytes: Int32,
     seq_count: Int32,
     seq_max: Int32,
@@ -475,140 +584,209 @@ def k_decode_probe[probe: Bool](
         if (Int(cand_bmp[unsafe_offset = cp >> 5]) & (1 << (cp & 31))) == 0:
             return
 
-        # The probe window: up to seq_max EFFECTIVE codepoints, VS16 dropped from
-        # the key but riding the span; newline/VS15/continuation/item-end break it.
-        var key = StaticTuple[UInt32, KEY_CAP](0)
-        key[0] = UInt32(cp)
-        var key_len = 1
-        var p = id + nb
-        var stop = Int(item_end[unsafe_offset=id])
-        while p < stop and key_len < Int(seq_max):
-            var c0 = Int(bytes[unsafe_offset=p])
-            var nb2: Int
-            if (c0 & 0x80) == 0x00:
-                nb2 = 1
-            elif (c0 & 0xE0) == 0xC0:
-                nb2 = 2
-            elif (c0 & 0xF0) == 0xE0:
-                nb2 = 3
-            elif (c0 & 0xF8) == 0xF0:
-                nb2 = 4
-            else:
-                nb2 = 0
-            if nb2 == 0:
-                break
-            var d1 = 0
-            var d2 = 0
-            var d3 = 0
-            if p + 1 < n:
-                d1 = Int(bytes[unsafe_offset = p + 1])
-            if p + 2 < n:
-                d2 = Int(bytes[unsafe_offset = p + 2])
-            if p + 3 < n:
-                d3 = Int(bytes[unsafe_offset = p + 3])
-            var cp2: Int
-            if nb2 == 1:
-                cp2 = c0
-            elif nb2 == 2:
-                cp2 = ((c0 & 0x1F) << 6) | (d1 & 0x3F)
-            elif nb2 == 3:
-                cp2 = ((c0 & 0x0F) << 12) | ((d1 & 0x3F) << 6) | (d2 & 0x3F)
-            else:
-                cp2 = ((c0 & 0x07) << 18) | ((d1 & 0x3F) << 12) | ((d2 & 0x3F) << 6) | (d3 & 0x3F)
-            if cp2 == Int(NEWLINE) or cp2 == 0xFE0E:
-                break
-            if cp2 != 0xFE0F:
-                key[key_len] = UInt32(cp2)
-                key_len += 1
-            p += nb2
+        comptime if walk:
+            # The state walk: one table probe per EFFECTIVE codepoint, the last
+            # accepting state IS the longest match — the key array, the
+            # descending searches, and the span re-walk are all gone. The
+            # window and its break/skip rules are the search form's, codepoint
+            # for codepoint; VS16 advances the byte pointer without probing.
+            var r0 = st_probe(tab, tab_mask, 0, UInt32(cp))
+            if r0[0] == ST_EMPTY:
+                return  # unreachable: the bitmap and the table are one source
+            var s = r0[0]
+            var last_slot = r0[1]
+            var last_end = 0
+            if r0[1] != 0:
+                last_end = id + nb
+            var p = id + nb
+            var depth = 1
+            var stop = Int(item_end[unsafe_offset=id])
+            while p < stop and depth < Int(seq_max):
+                var c0 = Int(bytes[unsafe_offset=p])
+                var nb2: Int
+                if (c0 & 0x80) == 0x00:
+                    nb2 = 1
+                elif (c0 & 0xE0) == 0xC0:
+                    nb2 = 2
+                elif (c0 & 0xF0) == 0xE0:
+                    nb2 = 3
+                elif (c0 & 0xF8) == 0xF0:
+                    nb2 = 4
+                else:
+                    nb2 = 0
+                if nb2 == 0:
+                    break
+                var d1 = 0
+                var d2 = 0
+                var d3 = 0
+                if p + 1 < n:
+                    d1 = Int(bytes[unsafe_offset = p + 1])
+                if p + 2 < n:
+                    d2 = Int(bytes[unsafe_offset = p + 2])
+                if p + 3 < n:
+                    d3 = Int(bytes[unsafe_offset = p + 3])
+                var cp2: Int
+                if nb2 == 1:
+                    cp2 = c0
+                elif nb2 == 2:
+                    cp2 = ((c0 & 0x1F) << 6) | (d1 & 0x3F)
+                elif nb2 == 3:
+                    cp2 = ((c0 & 0x0F) << 12) | ((d1 & 0x3F) << 6) | (d2 & 0x3F)
+                else:
+                    cp2 = ((c0 & 0x07) << 18) | ((d1 & 0x3F) << 12) | ((d2 & 0x3F) << 6) | (d3 & 0x3F)
+                if cp2 == Int(NEWLINE) or cp2 == 0xFE0E:
+                    break
+                if cp2 == 0xFE0F:
+                    p += nb2
+                    continue
+                var r = st_probe(tab, tab_mask, s, UInt32(cp2))
+                if r[0] == ST_EMPTY:
+                    break
+                s = r[0]
+                p += nb2
+                depth += 1
+                if r[1] != 0:
+                    last_slot = r[1]
+                    last_end = p
+            if last_slot != 0:
+                cand_slot[unsafe_offset=id] = last_slot
+                cand_end[unsafe_offset=id] = UInt32(last_end)
+                _ = Atomic.max(cand_blocks.unsafe_offset(id >> BLOCK_LOG2), UInt32(1))
+        else:
+            # The probe window: up to seq_max EFFECTIVE codepoints, VS16 dropped from
+            # the key but riding the span; newline/VS15/continuation/item-end break it.
+            var key = StaticTuple[UInt32, KEY_CAP](0)
+            key[0] = UInt32(cp)
+            var key_len = 1
+            var p = id + nb
+            var stop = Int(item_end[unsafe_offset=id])
+            while p < stop and key_len < Int(seq_max):
+                var c0 = Int(bytes[unsafe_offset=p])
+                var nb2: Int
+                if (c0 & 0x80) == 0x00:
+                    nb2 = 1
+                elif (c0 & 0xE0) == 0xC0:
+                    nb2 = 2
+                elif (c0 & 0xF0) == 0xE0:
+                    nb2 = 3
+                elif (c0 & 0xF8) == 0xF0:
+                    nb2 = 4
+                else:
+                    nb2 = 0
+                if nb2 == 0:
+                    break
+                var d1 = 0
+                var d2 = 0
+                var d3 = 0
+                if p + 1 < n:
+                    d1 = Int(bytes[unsafe_offset = p + 1])
+                if p + 2 < n:
+                    d2 = Int(bytes[unsafe_offset = p + 2])
+                if p + 3 < n:
+                    d3 = Int(bytes[unsafe_offset = p + 3])
+                var cp2: Int
+                if nb2 == 1:
+                    cp2 = c0
+                elif nb2 == 2:
+                    cp2 = ((c0 & 0x1F) << 6) | (d1 & 0x3F)
+                elif nb2 == 3:
+                    cp2 = ((c0 & 0x0F) << 12) | ((d1 & 0x3F) << 6) | (d2 & 0x3F)
+                else:
+                    cp2 = ((c0 & 0x07) << 18) | ((d1 & 0x3F) << 12) | ((d2 & 0x3F) << 6) | (d3 & 0x3F)
+                if cp2 == Int(NEWLINE) or cp2 == 0xFE0E:
+                    break
+                if cp2 != 0xFE0F:
+                    key[key_len] = UInt32(cp2)
+                    key_len += 1
+                p += nb2
 
-        # The longest table prefix of the key wins, found by descending length
-        # with a binary search per length — the section is sorted elementwise,
-        # prefix-first (asserted at bake). The CPU rule's same move is
-        # glyph_cluster.mojo's; atlas.rs's sequence_lookup is the third writer of
-        # this ordering contract.
-        var best_len = 0
-        var best_slot = UInt32(0)
-        var stride = 2 + Int(seq_max)
-        var ln = min(key_len, Int(seq_max))
-        while ln >= 2 and best_len == 0:
-            var lo = 0
-            var hi = Int(seq_count)
-            while lo < hi:
-                var mid = (lo + hi) // 2
-                var o = mid * stride
-                var elen = Int(seq[unsafe_offset = o + 1])
-                var cmp = 0
-                var k = 0
-                var nmin = min(ln, elen)
-                while k < nmin:
-                    var a = Int(key[k])
-                    var b = Int(seq[unsafe_offset = o + 2 + k])
-                    if a < b:
-                        cmp = -1
-                        break
-                    if a > b:
-                        cmp = 1
-                        break
-                    k += 1
-                if cmp == 0:
-                    cmp = -1 if ln < elen else (1 if ln > elen else 0)
-                if cmp > 0:
-                    lo = mid + 1
-                else:
-                    hi = mid
-            if lo < Int(seq_count):
-                var o2 = lo * stride
-                if Int(seq[unsafe_offset = o2 + 1]) == ln:
-                    var ok = True
-                    var k2 = 0
-                    while k2 < ln:
-                        if Int(key[k2]) != Int(seq[unsafe_offset = o2 + 2 + k2]):
-                            ok = False
+            # The longest table prefix of the key wins, found by descending length
+            # with a binary search per length — the section is sorted elementwise,
+            # prefix-first (asserted at bake). The CPU rule's same move is
+            # glyph_cluster.mojo's; atlas.rs's sequence_lookup is the third writer of
+            # this ordering contract.
+            var best_len = 0
+            var best_slot = UInt32(0)
+            var stride = 2 + Int(seq_max)
+            var ln = min(key_len, Int(seq_max))
+            while ln >= 2 and best_len == 0:
+                var lo = 0
+                var hi = Int(seq_count)
+                while lo < hi:
+                    var mid = (lo + hi) // 2
+                    var o = mid * stride
+                    var elen = Int(seq[unsafe_offset = o + 1])
+                    var cmp = 0
+                    var k = 0
+                    var nmin = min(ln, elen)
+                    while k < nmin:
+                        var a = Int(key[k])
+                        var b = Int(seq[unsafe_offset = o + 2 + k])
+                        if a < b:
+                            cmp = -1
                             break
-                        k2 += 1
-                    if ok:
-                        best_len = ln
-                        best_slot = seq[unsafe_offset = o2]
-            ln -= 1
-        if best_len > 0:
-            # The span end: re-walk counting key-consumers, so skipped VS16s stay
-            # inside the trailer span (within a matched span no break can occur —
-            # a break would have ended the probe window before the member).
-            var need = best_len
-            var p2 = id
-            while need > 0:
-                var e0 = Int(bytes[unsafe_offset=p2])
-                var nb3: Int
-                if (e0 & 0x80) == 0x00:
-                    nb3 = 1
-                elif (e0 & 0xE0) == 0xC0:
-                    nb3 = 2
-                elif (e0 & 0xF0) == 0xE0:
-                    nb3 = 3
-                else:
-                    nb3 = 4
-                var f1 = 0
-                var f2 = 0
-                var f3 = 0
-                if p2 + 1 < n:
-                    f1 = Int(bytes[unsafe_offset = p2 + 1])
-                if p2 + 2 < n:
-                    f2 = Int(bytes[unsafe_offset = p2 + 2])
-                if p2 + 3 < n:
-                    f3 = Int(bytes[unsafe_offset = p2 + 3])
-                var cp3: Int
-                if nb3 == 1:
-                    cp3 = e0
-                elif nb3 == 2:
-                    cp3 = ((e0 & 0x1F) << 6) | (f1 & 0x3F)
-                elif nb3 == 3:
-                    cp3 = ((e0 & 0x0F) << 12) | ((f1 & 0x3F) << 6) | (f2 & 0x3F)
-                else:
-                    cp3 = ((e0 & 0x07) << 18) | ((f1 & 0x3F) << 12) | ((f2 & 0x3F) << 6) | (f3 & 0x3F)
-                if cp3 != 0xFE0F:
-                    need -= 1
-                p2 += nb3
-            cand_slot[unsafe_offset=id] = best_slot
-            cand_end[unsafe_offset=id] = UInt32(p2)
-            _ = Atomic.max(cand_blocks.unsafe_offset(id >> BLOCK_LOG2), UInt32(1))
+                        if a > b:
+                            cmp = 1
+                            break
+                        k += 1
+                    if cmp == 0:
+                        cmp = -1 if ln < elen else (1 if ln > elen else 0)
+                    if cmp > 0:
+                        lo = mid + 1
+                    else:
+                        hi = mid
+                if lo < Int(seq_count):
+                    var o2 = lo * stride
+                    if Int(seq[unsafe_offset = o2 + 1]) == ln:
+                        var ok = True
+                        var k2 = 0
+                        while k2 < ln:
+                            if Int(key[k2]) != Int(seq[unsafe_offset = o2 + 2 + k2]):
+                                ok = False
+                                break
+                            k2 += 1
+                        if ok:
+                            best_len = ln
+                            best_slot = seq[unsafe_offset = o2]
+                ln -= 1
+            if best_len > 0:
+                # The span end: re-walk counting key-consumers, so skipped VS16s stay
+                # inside the trailer span (within a matched span no break can occur —
+                # a break would have ended the probe window before the member).
+                var need = best_len
+                var p2 = id
+                while need > 0:
+                    var e0 = Int(bytes[unsafe_offset=p2])
+                    var nb3: Int
+                    if (e0 & 0x80) == 0x00:
+                        nb3 = 1
+                    elif (e0 & 0xE0) == 0xC0:
+                        nb3 = 2
+                    elif (e0 & 0xF0) == 0xE0:
+                        nb3 = 3
+                    else:
+                        nb3 = 4
+                    var f1 = 0
+                    var f2 = 0
+                    var f3 = 0
+                    if p2 + 1 < n:
+                        f1 = Int(bytes[unsafe_offset = p2 + 1])
+                    if p2 + 2 < n:
+                        f2 = Int(bytes[unsafe_offset = p2 + 2])
+                    if p2 + 3 < n:
+                        f3 = Int(bytes[unsafe_offset = p2 + 3])
+                    var cp3: Int
+                    if nb3 == 1:
+                        cp3 = e0
+                    elif nb3 == 2:
+                        cp3 = ((e0 & 0x1F) << 6) | (f1 & 0x3F)
+                    elif nb3 == 3:
+                        cp3 = ((e0 & 0x0F) << 12) | ((f1 & 0x3F) << 6) | (f2 & 0x3F)
+                    else:
+                        cp3 = ((e0 & 0x07) << 18) | ((f1 & 0x3F) << 12) | ((f2 & 0x3F) << 6) | (f3 & 0x3F)
+                    if cp3 != 0xFE0F:
+                        need -= 1
+                    p2 += nb3
+                cand_slot[unsafe_offset=id] = best_slot
+                cand_end[unsafe_offset=id] = UInt32(p2)
+                _ = Atomic.max(cand_blocks.unsafe_offset(id >> BLOCK_LOG2), UInt32(1))
