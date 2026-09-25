@@ -210,8 +210,10 @@ pub struct RepoParams {
     pub wrap_mode: crate::fold::WrapMode,
     /// THE SEQUENCE PASS, per item: whether a codepoint sequence the font draws
     /// as ONE glyph (ZWJ families, RI flags, skin tones, keycaps) resolves to
-    /// its sequence slot, with trailing leaders zeroed. Leader (the default)
-    /// is one glyph per UTF-8 leader — what every golden renders.
+    /// its sequence slot, with trailing leaders zeroed. Leader is the
+    /// params-level default (ItemParams agrees — engine-check's reference path
+    /// depends on that); the CLI/product default flipped to cluster on
+    /// 2026-09-22, and the goldens pin their mode explicitly.
     pub cluster_mode: crate::fold::ClusterMode,
 }
 

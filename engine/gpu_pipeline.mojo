@@ -2,21 +2,23 @@
 #
 # decode, chunkReduce, paginate and bounds are each proven in isolation against the
 # CPU port. That is not the same as proving they COMPOSE: every one of them was
-# handed CPU-computed inputs. Nothing yet showed that six dispatches, each feeding
+# handed CPU-computed inputs. Nothing yet showed that nine dispatches, each feeding
 # the next on device with no host round-trip, produce the pipeline's answers.
 #
-# This runs the full raking scan on the GPU —
+# This runs the sequence pass and the full raking scan on the GPU —
 #
-#   decode -> chunkReduce -> spineReduce -> spineScan -> partialScan -> apply
-#          -> resolveX -> paginate
+#   clusterProbe -> clusterChain -> chunkReduce -> spineReduce -> spineScan
+#          -> partialScan -> apply -> resolveX -> paginate
 #
 # — with every intermediate staying in device memory, and compares the FINAL lanes
 # against the CPU scan under the same tiered contract conformance_scan uses:
 #   ROW / COL / ORD / ordToByte   exact (they are counts; nothing may round)
 #   LINE_ADV                      eps    (foldless f64 prefix vs the scan's grouping)
 #
-# The monoid lives in one place (`E` + `combine` below) and every dispatch calls it,
-# so the six kernels cannot drift from each other the way six transcriptions would.
+# The monoid lives in one place (`E` + `combine` below) and every scan dispatch calls
+# it, so the seven kernels cannot drift from each other the way seven
+# transcriptions would. The two cluster dispatches are cluster_device.mojo's,
+# shared with gpu_cluster's standalone proof.
 #
 # Run: mojo run -I engine engine/gpu_pipeline.mojo engine/fixtures/*.pipe.bin
 
@@ -27,7 +29,7 @@ from std.atomic import Atomic
 from std.memory import bitcast
 from max.gpu.host import DeviceContext
 from glyph_schema import (
-    SM_STRIDE, SM_ADVANCE, SM_HEIGHT,
+    SM_STRIDE, SM_ADVANCE,
     LM_STRIDE, LM_X, LM_Y, LM_Z, LM_BASE_X,
     LC_STRIDE, LC_ROW, LC_COL,
     IM_STRIDE, IM_ORIGIN_X, IM_ORIGIN_Y, IM_ORIGIN_Z, IM_LINE_HEIGHT,
@@ -39,7 +41,7 @@ from glyph_schema import (
     P_RESET, P_NL, P_GLYPHS, P_ROWS, P_HEAD_LEN, P_TAIL_LEN, P_WRAP, P_MODE, PM_TAIL_ADV,
 )
 from glyph_pipeline import (
-    F_LEADER, F_NEWLINE, trunc_nonneg, item_for_byte, derive_stride,
+    F_LEADER, F_NEWLINE, item_for_byte, derive_stride,
     WRAP_DOWN, WRAP_BACK, run_pipeline, CLUSTER_LEADER, CLUSTER_CLUSTER,
 )
 
@@ -927,7 +929,8 @@ def bench_scaling(trie: Trie, path: String, ctx: DeviceContext, cluster: Bool = 
     including the host-side stride derivation between resolveX and paginate. Timing
     only the kernels would flatter the GPU by hiding the part a real caller pays.
     `cluster` runs the items under cluster mode (the sequence pass's device form
-    included); leader mode skips the pass's dispatches at the pipeline's own gate."""
+    included); leader mode pays the pass's dispatches but no-ops inside the
+    kernels (per-thread cluster_of/item_cluster early-returns)."""
     var f = open(path, "r")
     var all_bytes = f.read_bytes()
     f.close()
@@ -1015,6 +1018,6 @@ def main() raises:
         total_bad += b1 + b2 + b3
 
     if total_bad == 0:
-        print("gpu pipeline: ten dispatches chained on device — counts exact, positions within 1e-4")
+        print("gpu pipeline: nine dispatches chained on device — counts exact, positions within 1e-4")
     else:
         raise Error("gpu pipeline diverged")

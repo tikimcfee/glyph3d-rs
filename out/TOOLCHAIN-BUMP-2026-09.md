@@ -24,10 +24,12 @@ and consider capping the ranges below 26.7.
 
 `std.gpu` is private in 1.1.0 (`std._gpu`); the import fails with a pointer to
 the new home. Replace `from std.gpu import global_idx` with
-`from max.gpu import global_idx` in SIX files: `engine/gpu_decode.mojo`,
+`from max.gpu import global_idx` in SEVEN files: `engine/gpu_decode.mojo`,
 `engine/gpu_scan.mojo`, `engine/gpu_pipeline.mojo`, `engine/gpu_paginate.mojo`,
-`engine/gpu_bounds.mojo`, `engine/gpu_cluster.mojo`. `engine/TOOLCHAIN.md`'s
-documented exit condition counts five — the sixth (gpu_cluster) landed after
+`engine/gpu_bounds.mojo`, `engine/gpu_cluster.mojo`, `engine/cluster_device.mojo`.
+`engine/TOOLCHAIN.md`'s
+documented exit condition counts five — gpu_cluster.mojo and
+cluster_device.mojo (the kernels' shared module, since b7601fe) landed after
 it was written; update that count while there.
 
 ## What the bump buys (all 26.6/1.1.0, Apple silicon is the theme)

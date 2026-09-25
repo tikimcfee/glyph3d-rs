@@ -492,12 +492,12 @@ expect = "Coverage DROPPED"
 [[mutation]]
 name = "gpu-cluster-phantom-commit"
 gate = "engine-suites"
-why = "the device chain's carry guard is the phantom suppressor, exactly as in the CPU split — dropping it turns the device commit into a windowed OR, and the phantom fixture reddens the device suites (gpu_pipeline runs before gpu_cluster in the GPU list, so its error surfaces first). The device twin of cluster-split-phantom-commit; if only one of the pair ever fires, the two chains have drifted."
+why = "the device chain's phantom suppression is the commit's resume-past-span, exactly as in the CPU split — advancing past the head only re-walks the span and the phantom candidate inside it fires. The device twin of cluster-split-phantom-commit; if only one of the pair ever fires, the two chains have drifted. (gpu_pipeline runs before gpu_cluster in the GPU list, so its error surfaces first.)"
 file = "engine/cluster_device.mojo"
 rebuild = "pixi run build-engine"
 op = "replace"
-find = "        if slot != 0 and id >= commit_end:"
-with = "        if slot != 0:"
+find = "            id = end  # the span's members are written; resume past it"
+with = "            id += nb"
 expect = "gpu pipeline diverged"
 
 [[mutation]]
@@ -516,12 +516,12 @@ expect = "gpu pipeline diverged"
 [[mutation]]
 name = "cluster-split-phantom-commit"
 gate = "engine-suites"
-why = "the split form's chain exists to suppress phantom candidates — with (A C) and (C A) both in the table, 🇦🇨🇦 must keep its lone A. Dropping the commit guard turns the chain into a windowed OR, and conformance_split must redden. CONSUMED BY: cluster-overlap.pipe.bin, the fixture that exists for exactly this."
+why = "the chain's phantom suppression is the commit's resume-past-span: with (A C) and (C A) both in the table, 🇦🇨🇦 must keep its lone A. Advancing past the head only re-walks the span, and the phantom candidate inside it fires — conformance_split reddens. CONSUMED BY: cluster-overlap.pipe.bin, the fixture that exists for exactly this. (The first form of this mutation dropped the carry GUARD; the resume's landing made that guard a loop invariant, and the review pass caught the mutation going vacuous — bf0a117 never re-ran prove.)"
 file = "engine/cluster_split.mojo"
 rebuild = "pixi run build-engine"
 op = "replace"
-find = "        if slot != 0 and id >= commit_end:"
-with = "        if slot != 0:"
+find = "            id = end  # the span's members are written; resume past it"
+with = "            id += n"
 expect = "split-form conformance failed"
 
 [[mutation]]

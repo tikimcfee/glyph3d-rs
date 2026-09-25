@@ -94,7 +94,7 @@ def resolve_clusters[o: ImmOrigin](
             # length with a binary search per length — the section is sorted
             # elementwise, prefix-first (asserted at bake), which is the order
             # atlas.rs's sequence_lookup relies on too. ~50 words per probe
-            # instead of the table's whole 12,000; answers identical by
+            # instead of the table's whole 4,166 entries; answers identical by
             # construction (the longest exact prefix is unique).
             var best_len = 0
             var best_slot = 0

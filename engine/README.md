@@ -160,7 +160,7 @@ Both are mutation-tested.
 
 ## On the GPU
 
-Five GPU suites run real device dispatches (Apple M2, Metal), counts bit-exact
+Six GPU suites run real device dispatches (Apple M2, Metal), counts bit-exact
 against the CPU port with no tolerance:
 
 ```sh
@@ -182,20 +182,21 @@ construction, not by shortfall. See below.
 mojo run -I engine engine/gpu_pipeline.mojo engine/fixtures/*.pipe.bin
 ```
 
-Eight dispatches chained with every intermediate staying in device memory:
+Nine dispatches chained with every intermediate staying in device memory:
 
 ```
-decode -> chunkReduce -> spineReduce -> spineScan -> partialScan -> apply
-       -> resolveX -> paginate
+clusterProbe -> clusterChain -> chunkReduce -> spineReduce -> spineScan
+     -> partialScan -> apply -> resolveX -> paginate
 ```
 
 Counts (`ROW`/`COL`/`ORD`/`ordToByte`) and the `totalRows` fold scalar compare
 **exact**; `LINE_ADV` and the resolved positions at eps. The fan stride is derived
 from a fold scalar between dispatches, as the CPU driver does. The
-monoid lives in one function that every dispatch calls, so six kernels cannot drift
-the way six transcriptions would.
+monoid lives in one function that every scan dispatch calls, so seven kernels cannot drift
+the way seven transcriptions would; the two cluster dispatches are
+cluster_device.mojo's, shared with gpu_cluster's standalone proof.
 
-**This found two bugs the four piecewise GPU suites could not**, which is the whole
+**This found two bugs the five piecewise GPU suites could not**, which is the whole
 argument for it:
 
 - `combine` was written to be "obviously right" for a LEAF `b` — one byte, so
@@ -528,7 +529,7 @@ run under plain `node`. Anything below that says otherwise predates this repo.
 pixi install
 pixi run mojo --version
 
-# 2. Verify the whole engine in one pass — ALL SIXTEEN suites, with the fp flag
+# 2. Verify the whole engine in one pass — ALL EIGHTEEN suites, with the fp flag
 #    the contract requires (--fp-mode contract=off is NOT optional; see the
 #    script's header for why). This is the only entry point that runs everything.
 (cd engine/fixtures && node gen.mjs && node gen-bake.mjs)

@@ -1,34 +1,31 @@
 # gpu_cluster.mojo — the sequence pass on real GPU threads: probe + chain.
 #
-# The two dispatches port cluster_split.mojo's proven split, line for line:
+# The two dispatches live in cluster_device.mojo (shared with gpu_pipeline):
 #
 #   k_cluster_probe — one thread per byte. Leaders of cluster items decode
-#       their codepoint, zero the invisible-by-design ranges in place, and
-#       probe the sequence table (longest prefix, FE0F dropped from the key
-#       but riding the span), writing a candidate (slot, end) per position.
-#       No cross-thread state anywhere.
-#   k_cluster_chain — one thread per ITEM: the greedy commit with its
-#       single-integer carry (the byte offset past the active match). The
-#       phantom case (cluster-overlap) is why a windowed OR is not this.
+#       their codepoint, zero the invisible-by-design ranges in place, gate
+#       on the candidacy bitmap, and probe the sequence table (longest
+#       prefix, FE0F dropped from the key but riding the span), writing a
+#       candidate (slot, end) per position. No cross-thread state anywhere.
+#   k_cluster_chain — one thread per ITEM: the greedy commit; the resume-past-
+#       span IS the phantom suppressor (cluster-overlap is the case).
 #
 # The harness mirrors gpu_decode's discipline: the DECODED lanes are uploaded
 # (decode is proven there), the two dispatches run on device, and the static
-# tier read back is compared bit-for-bit against run_pipeline[split=True] —
-# the CPU split form, itself proven against the serial rule by
-# conformance_split. The fold never touches the static tier, so a
-# post-pipeline reference is a post-resolve reference.
+# tier read back is compared bit-for-bit against run_pipeline[cluster_split=True]
+# — the CPU split form, itself proven against the serial rule by
+# conformance_split. The fold ORs F_RENDERED into fl downstream; the
+# comparison stays exact because both references ran the same fold and the
+# pass never moves F_LEADER.
 #
 # Run: mojo run -I engine engine/gpu_cluster.mojo engine/fixtures/*.pipe.bin
 
 from std.sys import argv, has_accelerator
 from std.time import perf_counter_ns
-from std.gpu import global_idx
-from std.utils import StaticTuple
 from max.gpu.host import DeviceContext
-from glyph_schema import SM_STRIDE, SM_ADVANCE
+from glyph_schema import SM_STRIDE
 from glyph_pipeline import (
-    Item, run_pipeline, CLUSTER_LEADER, CLUSTER_CLUSTER,
-    F_CLUSTER_TRAILER, NEWLINE, item_for_byte,
+    Item, run_pipeline, CLUSTER_LEADER, CLUSTER_CLUSTER, item_for_byte,
 )
 from fixture_io import load_pipe_fixture
 

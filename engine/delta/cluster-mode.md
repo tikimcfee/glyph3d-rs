@@ -5,7 +5,7 @@ SEQUENCE the font draws as one glyph resolves to its single slot — the thing
 `out/EMOJI.md` carried the data for since 2026-09-10 ("the sequence table is
 carried so a future shaping pass finds its cells already placed").
 
-    ClusterMode::Leader   (0, the default)  one glyph per UTF-8 leader.
+    ClusterMode::Leader   (0, the enum/param-level default — the CLI/product default flipped to cluster 2026-09-22)  one glyph per UTF-8 leader.
     ClusterMode::Cluster  (1)               the sequence pass: resolve per item,
                                             between decode and the fold.
 
@@ -84,7 +84,7 @@ exact under regrouping (the transition monoid closes at 16 elements; a summary
 is one u64). The GPU cluster kernel (the device suites skip cluster fixtures,
 printed). 2026-09-22: its first step landed — the rule decomposed into a
 per-position probe + a commit chain (cluster_split.mojo), swappable via
-run_pipeline's comptime `split` param and proven bit-exact against the serial
+run_pipeline's comptime `cluster_split` param and proven bit-exact against the serial
 rule by conformance_split (cluster-overlap.pipe.bin carries the phantom
 case); the monoid design stays shelved, the chain's carry is one integer.
 And 2026-09-22 later: the device port itself — gpu_cluster.mojo runs

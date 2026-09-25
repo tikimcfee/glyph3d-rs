@@ -25,6 +25,7 @@ comptime HEAD_BMP_WORDS = 4096
 # walk costs O(candidate blocks), not O(bytes), which is the whole sparse-text
 # case (measured: the byte walk was the cluster tax there, not the probes).
 comptime BLOCK_LOG2 = 7
+comptime BLOCK = 1 << BLOCK_LOG2
 
 
 def build_head_bitmap(trie: Trie) raises -> List[UInt32]:
@@ -33,6 +34,8 @@ def build_head_bitmap(trie: Trie) raises -> List[UInt32]:
     Derived from the table itself, so it can never drift from it."""
     var bmp = List[UInt32](length=HEAD_BMP_WORDS, fill=0)
     var stride = 2 + trie.seq_max
+    if trie.seq_max > KEY_CAP:
+        raise Error("sequence table's seq_max exceeds the probe kernel's key cap")
     var i = 0
     while i < len(trie.seq):
         var cp = Int(trie.seq[i + 2])
@@ -280,24 +283,24 @@ def k_cluster_chain(
     bitmap_advance: Float32,
     item_count: Int32,
 ):
-    """One thread per ITEM — the split form's commit. The carry is one
-    integer; items tile the blob, so no two threads share a byte. Two skips
-    keep the walk off cold bytes: a block whose presence word is zero holds
-    no candidate (the probe bumped it otherwise), and a committed span's tail
-    is already written by the commit loop, so the walk resumes AT its end."""
+    """One thread per ITEM — the split form's commit. The carry is the resume
+    itself: after a commit the walk jumps past the span, so a phantom
+    candidate inside it is never read — suppression is by construction, and
+    the suite's mutation proves it by removing the resume. Items tile the
+    blob, so no two threads share a byte. The block-presence table skips
+    candidate-free 128-byte blocks in one read."""
     var i = Int(global_idx.x)
     if i >= Int(item_count):
         return
     if item_cluster[unsafe_offset=i] == 0:
         return
-    var commit_end = 0
     var id = Int(item_ranges[unsafe_offset = i * 2])
     var stop = Int(item_ranges[unsafe_offset = i * 2 + 1])
     while id < stop:
         if cand_blocks[unsafe_offset = id >> BLOCK_LOG2] == 0:
             # No candidate in this 128-byte block — jump it. (A block may span
             # the item's end; zero there means nothing for either side.)
-            id = min((id & ~127) + 128, stop)
+            id = min((id & ~(BLOCK - 1)) + BLOCK, stop)
             continue
         var b0 = Int(bytes[unsafe_offset=id])
         var nb: Int
@@ -315,7 +318,7 @@ def k_cluster_chain(
             id += 1
             continue
         var slot = Int(cand_slot[unsafe_offset=id])
-        if slot != 0 and id >= commit_end:
+        if slot != 0:
             gi[unsafe_offset=id] = UInt32(slot)
             sm[unsafe_offset = id * SM_STRIDE + SM_ADVANCE] = bitmap_advance
             var end = Int(cand_end[unsafe_offset=id])
@@ -335,7 +338,6 @@ def k_cluster_chain(
                 sm[unsafe_offset = p * SM_STRIDE + SM_ADVANCE] = Float32(0)
                 fl[unsafe_offset=p] = fl[unsafe_offset=p] | UInt32(F_CLUSTER_TRAILER)
                 p += nb2
-            commit_end = end
             id = end  # the span's members are written; resume past it
         else:
             id += nb

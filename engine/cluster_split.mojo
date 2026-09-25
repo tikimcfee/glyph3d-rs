@@ -39,9 +39,9 @@ def probe_clusters[o: ImmOrigin](
     """PASS 1 — every leader probed independently. Statics are zeroed in place
     (unconditional, exactly as the serial rule); a head whose probe matches
     writes its candidate: the slot and the byte offset PAST its last span
-    member. cand_* must be zeroed by the caller (on device, the kernel writes
-    every position unconditionally). Reads nothing it does not own: the probe
-    window clamps to the item's end, as the serial rule's `stop` does."""
+    member. cand_* must be zeroed by the caller (the device harnesses
+    zero-fill the buffers). Reads nothing it does not own: the probe window
+    clamps to the item's end, as the serial rule's `stop` does."""
     if len(trie.seq) == 0:
         return
     var seq_max = trie.seq_max
@@ -130,15 +130,16 @@ def chain_clusters[o: ImmOrigin](
     cand_slot: Pointer[UInt32, MutUntrackedOrigin],
     cand_end: Pointer[UInt32, MutUntrackedOrigin],
 ):
-    """PASS 2 — the greedy commit. One walk per item, one carry: `commit_end`
-    is the byte offset past the active match. A candidate that starts before
-    it is a phantom — suppressed by construction; its position is already a
-    trailer of the committed span. A candidate at or past it commits: the head
-    gets the sequence slot at the trie's bitmap advance, and every leader in
-    (head, end) is zeroed + flagged — the same set the serial rule's members
-    list carried (statics inside it were already zeroed by the probe; the flag
-    OR is idempotent)."""
-    var commit_end = 0
+    """PASS 2 — the greedy commit. One walk per item, one carry: the byte
+    offset the walk resumes at after a commit. A candidate inside a committed
+    span is a phantom and is never read — the walk jumps from the head past
+    the span, so suppression is by construction (cluster-overlap proves it;
+    the suite's mutation removes the resume line and watches the phantom
+    fire). A candidate the walk reaches commits: the head gets the sequence
+    slot at the trie's bitmap advance, and every leader in (head, end) is
+    zeroed + flagged — the same set the serial rule's members list carried
+    (statics inside it were already zeroed by the probe; the flag OR is
+    idempotent)."""
     var stop = item.byte_start + item.byte_count
     var id = item.byte_start
     while id < stop:
@@ -147,7 +148,7 @@ def chain_clusters[o: ImmOrigin](
             id += 1
             continue
         var slot = Int(cand_slot[unsafe_offset=id])
-        if slot != 0 and id >= commit_end:
+        if slot != 0:
             slots.set_glyph_id(id, UInt32(slot))
             slots.set_advance(id, trie.bitmap_advance)
             var end = Int(cand_end[unsafe_offset=id])
@@ -161,7 +162,6 @@ def chain_clusters[o: ImmOrigin](
                 slots.set_advance(p, Float32(0))
                 slots.set_flags(p, slots.flags(p) | F_CLUSTER_TRAILER)
                 p += n2
-            commit_end = end
             id = end  # the span's members are written; resume past it
         else:
             id += n
