@@ -754,6 +754,44 @@ pub fn rederive_from_bytes(
     Ok(eng.read_back().records)
 }
 
+thread_local! {
+    /// ONE Engine + trie per thread, keyed by trie path, held for the
+    /// thread's lifetime — the hot-path re-deriver. `Engine::new` + trie
+    /// parse is ~120 ms FIXED; the record walk is microseconds. thread_local
+    /// because Engine is !Send AND because the cache must OUTLIVE SCENES:
+    /// the live loop (seam.md, P1) rebuilds a scene per edit, so a
+    /// scene-lifetime cache never amortizes. The engine handle is built for
+    /// exactly this reuse — ffi.mojo resets the arena at every load_item
+    /// ("reuse the arena across loads"). Render thread only.
+    static REDERIVER: std::cell::RefCell<Option<(PathBuf, Engine)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// The CACHED re-derivation: same results as [`rederive_from_bytes`], one
+/// engine amortized across every call on this thread. A trie-path change
+/// (a different checkout/engine build) swaps the cached engine; nothing else
+/// can invalidate it — the fold is a pure function of (bytes, params).
+pub fn rederive_cached(
+    trie: &Path,
+    bytes: &[u8],
+    item: &ItemParams,
+) -> std::io::Result<Vec<GlyphRecord>> {
+    REDERIVER.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        let stale = slot.as_ref().is_some_and(|(t, _)| t != trie);
+        if stale {
+            *slot = None;
+        }
+        let (_, eng) = slot.get_or_insert_with(|| {
+            let mut eng = Engine::new();
+            eng.load_trie_file(trie).expect("pick: failed to load engine trie");
+            (trie.to_path_buf(), eng)
+        });
+        eng.load_item(bytes, item).expect("pick: engine re-run failed");
+        Ok(eng.read_back().records)
+    })
+}
+
 impl RepoLoad {
     /// Convert into the renderer's staged form. `focus` selects one file
     /// (first rel-path containing the substring) for the camera to frame.

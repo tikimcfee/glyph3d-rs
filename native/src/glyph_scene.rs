@@ -2139,25 +2139,18 @@ impl GlyphScene {
         // Bytes' provenance: envelope-owned content first (the bytes the seam
         // folded), disk second (Stage G's original semantics). One code path
         // either way — only the read differs.
-        let (records, bytes) = if let Some(owned) = pctx
+        let bytes: std::sync::Arc<Vec<u8>> = if let Some(owned) = pctx
             .content
             .as_ref()
             .and_then(|m| m.get(&info.rel_path))
             .cloned()
         {
-            match crate::repo::rederive_from_bytes(&pctx.trie, &owned, &info.item) {
-                Ok(records) => (records, owned),
-                Err(_) => {
-                    log::warn!("seam/style: engine re-run failed on {}", info.rel_path);
-                    return FileStyle::Failed;
-                }
-            }
+            owned
         } else {
-            match crate::repo::rederive_records(&pctx.root, &pctx.trie, &info.rel_path, &info.item)
-            {
-                Ok((records, bytes)) => (records, std::sync::Arc::new(bytes)),
+            match std::fs::read(pctx.root.join(&info.rel_path)) {
+                Ok(bytes) => std::sync::Arc::new(bytes),
                 Err(_) => {
-                    log::warn!("seam/style: failed to re-derive {}", info.rel_path);
+                    log::warn!("seam/style: failed to read {}", info.rel_path);
                     return FileStyle::Failed;
                 }
             }
@@ -2175,6 +2168,20 @@ impl GlyphScene {
                 return FileStyle::VersionMismatch;
             }
         }
+        // The engine re-run, on the THREAD-CACHED rederiver (repo::
+        // rederive_cached — one Engine + trie per thread, outliving scenes:
+        // the live loop rebuilds a scene per edit, so a scene-lifetime cache
+        // would never amortize). The FFI resets the arena per load ("reuse
+        // the arena across loads", ffi.mojo). This is the P1-live
+        // measurement's named fix: uncached, this step paid ~120 ms FIXED
+        // (Engine::new + trie parse) per file per apply.
+        let records = match crate::repo::rederive_cached(&pctx.trie, &bytes, &info.item) {
+            Ok(records) => records,
+            Err(_) => {
+                log::warn!("seam/style: engine re-run failed on {}", info.rel_path);
+                return FileStyle::Failed;
+            }
+        };
         let (leaders, _, _, _) =
             crate::text::fold_leaders(&bytes, info.item.wrap_width, info.item.wrap_mode);
         if leaders.len() != records.len() {
@@ -2184,13 +2191,32 @@ impl GlyphScene {
             );
             return FileStyle::Failed;
         }
+        // The walk, COALESCED — the RecolorLine lesson: one queue.write_buffer
+        // per glyph is ~15 µs of validation each, which is where the uncached
+        // style plane's ~130 ms per file actually went (the cached engine was
+        // necessary but not sufficient). Full 48 B instances are rebuilt per
+        // CONTIGUOUS slot run — few writes per file. A record no run covers
+        // is written back at the default color: a re-style after an edit must
+        // not leave the previous version's colors on the glyphs between runs.
+        let mut batches: Vec<(u32, Vec<GlyphInstance>)> = Vec::new();
+        let push = |slot: u32, inst: GlyphInstance, batches: &mut Vec<(u32, Vec<GlyphInstance>)>| {
+            match batches.last_mut() {
+                Some((start, insts))
+                    if *start + insts.len() as u32 == slot
+                        && *start / self.chunk_cap == slot / self.chunk_cap =>
+                {
+                    insts.push(inst);
+                }
+                _ => batches.push((slot, vec![inst])),
+            }
+        };
         let mut run_ix = 0usize;
         let mut slot = info.slot_base;
         let mut colored = 0usize;
         let mut unstyled = 0usize;
         for (i, r) in records.iter().enumerate() {
             if r.glyph_id() == 0 {
-                continue;
+                continue; // blank: no instance slot, exactly as ensure_pick_cache skips
             }
             let byte = leaders[i].0;
             while run_ix < runs.len() && runs[run_ix].range.end <= byte {
@@ -2198,17 +2224,52 @@ impl GlyphScene {
             }
             // runs[run_ix] is the first run ending past `byte`; it covers
             // the record iff it also starts at/before it.
-            if let Some(run) = runs.get(run_ix).filter(|run| byte >= run.range.start) {
-                let packed = u32::from(run.rgb[0])
-                    | u32::from(run.rgb[1]) << 8
-                    | u32::from(run.rgb[2]) << 16
-                    | 0xFF00_0000;
-                self.write_instance(ctx, slot, 24, &packed.to_le_bytes());
+            let (packed, hit) = match runs.get(run_ix).filter(|run| byte >= run.range.start) {
+                Some(run) => (
+                    u32::from(run.rgb[0])
+                        | u32::from(run.rgb[1]) << 8
+                        | u32::from(run.rgb[2]) << 16
+                        | 0xFF00_0000,
+                    true,
+                ),
+                None => (crate::layout::DEFAULT_COLOR_PACKED, false),
+            };
+            if hit {
                 colored += 1;
             } else {
                 unstyled += 1;
             }
+            let (mut pos, mut advance, mut height) =
+                ([r.x(), r.y(), r.z()], r.advance(), r.height());
+            // Preserve earlier nudge/scale-glyph edits on this slot.
+            if let Some((p, a, h)) = self.geom_overrides.get(&slot) {
+                pos = *p;
+                advance = *a;
+                height = *h;
+            }
+            push(
+                slot,
+                GlyphInstance {
+                    pos,
+                    glyph_id: r.glyph_id(),
+                    row: r.row(),
+                    col: r.col(),
+                    color: packed,
+                    group_id: info.group_id,
+                    advance,
+                    height,
+                    flags: 0,
+                    _pad: 0,
+                },
+                &mut batches,
+            );
             slot += 1;
+        }
+        for (start, insts) in &batches {
+            let chunk = (*start / self.chunk_cap) as usize;
+            let local = (*start % self.chunk_cap) as u64;
+            ctx.queue
+                .write_buffer(&self.instance_bufs[chunk], local * 48, bytemuck::cast_slice(insts));
         }
         FileStyle::Ok { colored, unstyled }
     }
