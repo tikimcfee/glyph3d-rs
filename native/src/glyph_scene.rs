@@ -287,6 +287,8 @@ pub const GLYPH_CELL_AREA: f32 = (1229.0 / 2320.0) * 1.25;
 /// cells its advance covers. Outline glyphs are summed exactly as before, so
 /// a segment without emoji tints to the same bits (the goldens hold).
 pub fn seg_tint(instances: &[GlyphInstance], width: f32, height: f32, slot_ink: &[Option<[f32; 4]>]) -> [f32; 4] {
+    static SRGB_TO_LINEAR: std::sync::LazyLock<[f64; 256]> =
+        std::sync::LazyLock::new(|| std::array::from_fn(|k| (k as f64 / 255.0).powf(2.2)));
     let mut sum = [0f64; 3];
     let mut cells = 0usize;
     for g in instances {
@@ -298,9 +300,12 @@ pub fn seg_tint(instances: &[GlyphInstance], width: f32, height: f32, slot_ink: 
             continue;
         }
         // Match the shader's decode: sRGB display bytes → linear via pow 2.2.
+        // Memoized over the whole domain — the input is a BYTE, so 256 table
+        // entries replace 3 powf per glyph (285 M calls on the glyph3d-js repo
+        // load). The table is built with the same f64 powf on the same values
+        // and the sums keep their order, so the tint is bit-identical.
         for (i, s) in sum.iter_mut().enumerate() {
-            let byte = ((g.color >> (8 * i)) & 0xFF) as f64 / 255.0;
-            *s += byte.powf(2.2);
+            *s += SRGB_TO_LINEAR[((g.color >> (8 * i)) & 0xFF) as usize];
         }
         cells += 1;
     }
