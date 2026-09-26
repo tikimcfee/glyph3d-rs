@@ -202,7 +202,11 @@ suite runs `0`, `2` and `3` over every fixture and synthetic case; modes
 statics, so the device decode is pinned end to end rather than assumed from
 `gpu_decode`'s isolated proof. `--bench` runs all four so the A/B attributes
 the deltas: upload elimination (0→1), dispatch fusion (1→2), table form
-(2→3). The chain has two forms beside them: the serial thread-per-item
+(2→3). `--bench-items <trie> <corpus>` instead holds the corpus fixed and
+sweeps ITEM COUNT (1 → 4096 contiguous chunks) — the harness for the
+device-side item-search trade, whose per-byte search cost grows with
+log2(items) while the per-byte facts upload it replaces does not (and which
+`--bench`'s single item cannot see). The chain has two forms beside them: the serial thread-per-item
 commit (`chain=0`) and the chunk-parallel carry-stitched commit (`chain=1`
 — free walk per 128 B block, one-thread stitch of the one-integer resume
 carry, commit per block with the resolved carry; the suite proves it

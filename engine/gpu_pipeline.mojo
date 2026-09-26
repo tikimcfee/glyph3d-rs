@@ -1388,6 +1388,19 @@ def synthetic_case(
     return check_fixture(fx^, ctx, mode=smode)
 
 
+def bench_modes(trie: Trie, bytes: List[UInt8], items: List[Item], ctx: DeviceContext, profile: Bool) raises:
+    """One timing block: modes 0-3 × chain 0/1 over the same (bytes, items)."""
+    for m in range(4):
+        for ch in range(2):
+            var fx = PipeFixture()
+            fx.byte_len = len(bytes)
+            fx.item_count = len(items)
+            fx.bytes = List[UInt8](copy=bytes)
+            fx.trie = trie.copy()
+            fx.items = List[Item](copy=items)
+            _ = check_fixture(fx^, ctx, True, m, profile, ch)
+
+
 def bench_scaling(trie: Trie, path: String, ctx: DeviceContext, cluster: Bool = False, profile: Bool = False) raises:
     """Time the SAME chain the conformance suite proves, across corpus sizes.
 
@@ -1424,22 +1437,57 @@ def bench_scaling(trie: Trie, path: String, ctx: DeviceContext, cluster: Bool = 
         var bytes = List[UInt8](capacity=nb)
         for i in range(nb):
             bytes.append(all_bytes[i])
-        for m in range(4):
-            for ch in range(2):
-                var it = Item()
-                it.byte_start = 0
-                it.byte_count = nb
-                it.line_height = 1
-                it.cluster_mode = CLUSTER_CLUSTER if cluster else CLUSTER_LEADER
-                var items = List[Item]()
-                items.append(it^)
-                var fx = PipeFixture()
-                fx.byte_len = nb
-                fx.item_count = 1
-                fx.bytes = List[UInt8](copy=bytes)
-                fx.trie = trie.copy()
-                fx.items = items^
-                _ = check_fixture(fx^, ctx, True, m, profile, ch)
+        var it = Item()
+        it.byte_start = 0
+        it.byte_count = nb
+        it.line_height = 1
+        it.cluster_mode = CLUSTER_CLUSTER if cluster else CLUSTER_LEADER
+        var items = List[Item]()
+        items.append(it^)
+        bench_modes(trie, bytes, items, ctx, profile)
+
+
+def bench_items(trie: Trie, path: String, ctx: DeviceContext, profile: Bool = False) raises:
+    """Item-count sweep over the FULL corpus — the A/B harness for moving the
+    per-byte item facts (w/md/s/is/io/ceof/cof — 28 B/byte of upload plus the
+    host facts loop) to a device-side binary search over the item ranges.
+
+    bench_scaling holds item_count=1, which blinds exactly the trade that
+    search makes: the search's per-byte cost grows with log2(items); the facts
+    upload it replaces does not depend on items at all. The product case is a
+    repo load — ~1.3k items over ~100 MB — so sweep counts 1 → 4096 and let
+    the crossover show itself. Splits are contiguous equal chunks (the last
+    takes the remainder); boundaries fall where they fall, mid-codepoint
+    included — the timing doesn't care, and the suite owns correctness."""
+    var f = open(path, "r")
+    var all_bytes = f.read_bytes()
+    f.close()
+    var n = len(all_bytes)
+    print("corpus:", path, "(", n, "bytes ) cluster, item-count sweep")
+    print("")
+    var counts = List[Int]()
+    counts.append(1)
+    counts.append(16)
+    counts.append(64)
+    counts.append(256)
+    counts.append(1024)
+    counts.append(4096)
+    for ci in range(len(counts)):
+        var k = counts[ci]
+        var per = n // k
+        if per < 1024:
+            # Below ~1 KB/item it's a pathological case, off the realistic end.
+            continue
+        var items = List[Item]()
+        for i in range(k):
+            var it = Item()
+            it.byte_start = i * per
+            it.byte_count = per if i + 1 < k else n - i * per
+            it.line_height = 1
+            it.cluster_mode = CLUSTER_CLUSTER
+            items.append(it^)
+        print("── items:", k, "( ~", per, "B/item )")
+        bench_modes(trie, all_bytes, items, ctx, profile)
 
 
 def main() raises:
@@ -1460,6 +1508,12 @@ def main() raises:
     if String(args[1]) == "--bench-cluster":
         var real_trie = load_trie_blob(String(args[2]))
         bench_scaling(real_trie, String(args[3]), ctx, cluster=True, profile=len(args) > 4 and String(args[4]) == "profile")
+        return
+    # --bench-items <trie> <corpus> [profile]: the item-count sweep — the A/B
+    # the device-side item search is judged by (see bench_items' docstring).
+    if String(args[1]) == "--bench-items":
+        var real_trie = load_trie_blob(String(args[2]))
+        bench_items(real_trie, String(args[3]), ctx, profile=len(args) > 4 and String(args[4]) == "profile")
         return
     var total_bad = 0
     for i in range(1, len(args)):
