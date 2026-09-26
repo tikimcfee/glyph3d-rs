@@ -166,6 +166,13 @@ pub struct PickContext {
     pub root: PathBuf,
     pub trie: PathBuf,
     pub files: Vec<PickFileInfo>,
+    /// P1-live: envelope-owned content. `None` (the default, and every
+    /// disk-loaded scene) re-derives from `root` on disk as Stage G always
+    /// did. `Some(map)` re-derives from the CALLER's bytes — the ones the
+    /// seam folded — which is what makes the version join meaningful for
+    /// live content: the hash is of the same bytes the fold consumed.
+    /// Injected by the consumer (fieldzed), not by `into_staged`.
+    pub content: Option<std::collections::HashMap<String, std::sync::Arc<Vec<u8>>>>,
 }
 
 /// A pick request — scripted (CLI) or interactive (click).
@@ -2099,11 +2106,31 @@ impl GlyphScene {
         let Some(pctx) = &self.pick else {
             return FileStyle::Failed;
         };
-        let Ok((records, bytes)) =
-            crate::repo::rederive_records(&pctx.root, &pctx.trie, &info.rel_path, &info.item)
-        else {
-            log::warn!("seam/style: failed to re-derive {}", info.rel_path);
-            return FileStyle::Failed;
+        // Bytes' provenance: envelope-owned content first (the bytes the seam
+        // folded), disk second (Stage G's original semantics). One code path
+        // either way — only the read differs.
+        let (records, bytes) = if let Some(owned) = pctx
+            .content
+            .as_ref()
+            .and_then(|m| m.get(&info.rel_path))
+            .cloned()
+        {
+            match crate::repo::rederive_from_bytes(&pctx.trie, &owned, &info.item) {
+                Ok(records) => (records, owned),
+                Err(_) => {
+                    log::warn!("seam/style: engine re-run failed on {}", info.rel_path);
+                    return FileStyle::Failed;
+                }
+            }
+        } else {
+            match crate::repo::rederive_records(&pctx.root, &pctx.trie, &info.rel_path, &info.item)
+            {
+                Ok((records, bytes)) => (records, std::sync::Arc::new(bytes)),
+                Err(_) => {
+                    log::warn!("seam/style: failed to re-derive {}", info.rel_path);
+                    return FileStyle::Failed;
+                }
+            }
         };
         if let Some(expected) = expected {
             // The seam's law (seam::joins is this comparison over a whole

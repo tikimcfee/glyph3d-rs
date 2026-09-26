@@ -135,14 +135,28 @@ exists to drift.
 
 - **P0 (landed):** sidecar file, static, whole-file, offscreen op. `fd1731f`,
   `8bcb1d8`.
-- **P1:** provider module behind a trait (still file-driven) → provider
-  thread + channel envelope (sidecar file dies) → live buffer events →
-  re-derive + re-fold per version (measure whole-file re-fold per keystroke
-  BEFORE building record-splicing; the scan monoid is the eventual shape).
-- **P2:** structure plane (folds first), micro-sidecar golden view.
+- **P1 (landed):** lib split (`1fd056b`), seam types (`beca711`), renderer
+  consumer (`00b6520`), fieldzed one-binary (`f7008a3`).
+- **P1-live (landed):** the edit→reflow pipe. `repo::load_items` +
+  `WalkResult::from_files` fold CALLER-OWNED bytes (the envelope path);
+  `PickContext::content` makes re-derivation read the bytes the seam folded
+  (the version join is meaningful for live content); fieldzed performs a
+  scripted insert/delete/append on a real buffer, ships `Edited` deltas,
+  and the renderer applies the SAME delta through its own splice — two
+  independent applications, joined by hash, **0 dropped across every frame**.
+  THE MEASUREMENT this rung existed for (Tier 0, whole-scene rebuild, 2-file
+  field, 76k instances): **build+re-fold ≈ 21 ms — viable per keystroke, no
+  record-splicing needed at this scale.** The real cost is the style plane:
+  ≈ 120–160 ms FIXED per file, dominated by `Engine::new` + trie load inside
+  every `rederive_from_bytes` call — a cached rederiver is the first
+  optimization when live cadence matters, and the record-walk itself is
+  microseconds. Offscreen frame totals (~0.7 s) include readback wait +
+  PNG encode — not representative of interactive rendering.
+- **P2:** structure plane (folds first), micro-sidecar golden view; cached
+  rederiver if live cadence demands it.
 - **P3:** provider-shape generalization — themes, grammars, extensions as
   interchangeable run-producers.
-- **P4:** round-trip (picks as anchors), decorations, editing.
+- **P4:** round-trip (picks as anchors), decorations, editing UI.
 
 ## Open (not blocking P1)
 

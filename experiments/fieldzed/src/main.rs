@@ -1,27 +1,30 @@
-//! fieldzed — P1c: the one-binary proof.
+//! fieldzed — P1c → P1-live: the edit→reflow pipe, in one binary.
 //!
-//! Zed's language stack and the glyph field LINKED in one process — no
-//! sidecar file, no IPC. The provider thread owns a headless gpui App
-//! (`TestAppContext` for this rung; the production shape is remote_server's
-//! HeadlessProject pattern — see the seam doc's runtime section), lays each
-//! `.rs` file in the target directory out as a REAL `language::Buffer` with
-//! the real Rust grammar and One Dark, and ships one
-//! `seam::SurfaceUpdate` per file over a channel: version =
-//! `seam::content_hash_version` (the file-driven convention — static
-//! content's identity IS its version), style runs over that version's byte
-//! space, content riding ONCE (`Opened`) per the corpus rule.
+//! Zed's language stack and the glyph field linked in one process. The
+//! provider thread runs a headless gpui App over REAL `language::Buffer`s
+//! (Rust grammar, One Dark); the main thread owns the content map, folds it
+//! with the engine, styles it from envelopes, renders offscreen.
 //!
-//! The main thread creates the GPU context, builds the repo scene
-//! (the scene folds the directory from disk — the join catches any
-//! divergence), applies the envelopes — the renderer re-derives each file's
-//! bytes and DROPS any update whose version doesn't match, never translates
-//! — and renders offscreen.
+//! LIVE RUNG: the provider performs a scripted edit sequence on one file's
+//! buffer — insert at top, delete a middle block, append stubs — and after
+//! each edit ships a `seam::SurfaceUpdate` carrying an `Edited` delta (the
+//! corpus rule: bytes cross once, deltas thereafter) plus the re-derived
+//! style runs at the NEW version. The main thread applies each delta to its
+//! OWN copy with `ContentDelta::apply`, re-folds (Tier 0: whole-scene
+//! rebuild — the measurement this rung exists to take), re-styles, and
+//! renders a frame. The version join is then a REAL cross-check: provider
+//! and renderer apply the same delta through two independent code paths
+//! (Zed's buffer vs our splice), and the field only repaints if both landed
+//! on identical bytes — the law verifying the pipeline, not just guarding it.
 //!
-//! Usage: fieldzed <dir> <out.png> [eye_x eye_y eye_z yaw_deg pitch_deg]
+//! Usage: fieldzed <dir> <out_prefix> [eye_x eye_y eye_z yaw_deg pitch_deg]
+//! Writes <out_prefix>edit{0..N}.png — frame 0 is the pre-edit state.
 
-use std::path::PathBuf;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc;
+use std::time::{Duration, Instant};
 
 use anyhow::Context as _;
 use gpui::AppContext as _;
@@ -31,105 +34,149 @@ use glyph3d_native::seam::{
     content_hash_version, BufferVersion, ContentDelta, FileKey, StyleRun, SurfaceUpdate,
 };
 use glyph3d_native::glyph_scene::CameraMode;
-use glyph3d_native::{offscreen, Op, SceneChoice};
+use glyph3d_native::{atlas, offscreen, repo, Op};
 
 fn main() -> anyhow::Result<()> {
     let mut args = std::env::args().skip(1);
     let dir: PathBuf = args
         .next()
         .map(PathBuf::from)
-        .context("usage: fieldzed <dir> <out.png> [eye_x eye_y eye_z yaw_deg pitch_deg]")?;
-    let out: PathBuf = args.next().map(PathBuf::from).context("missing <out.png>")?;
+        .context("usage: fieldzed <dir> <out_prefix> [eye_x eye_y eye_z yaw_deg pitch_deg]")?;
+    let out_prefix: String = args.next().context("missing <out_prefix>")?;
     let mut pose = [30.0f32, -120.0, 60.0, 0.0, -12.0];
     let given: Vec<f32> = args.filter_map(|a| a.parse().ok()).collect();
     if given.len() == 5 {
         pose.copy_from_slice(&given);
     }
 
-    // ── provider thread: Zed's stack, headless ────────────────────────────
+    // ── provider thread: Zed's stack, headless, then a scripted edit run ───
     let (tx, rx) = mpsc::channel::<SurfaceUpdate>();
     let provider_dir = dir.clone();
     let provider = std::thread::spawn(move || provide(provider_dir, tx));
 
-    // ── render thread: the field ──────────────────────────────────────────
     let ctx = pollster::block_on(glyph3d_native::gpu::init(None));
-    let choice = SceneChoice::Repo {
-        dir: dir.clone(),
-        strategy: glyph3d_native::layout_mojo::Strategy::Direct,
-        verify: false,
-        focus: None,
-        wrap_mode: glyph3d_native::fold::WrapMode::Back,
-        z_wrap_spacing: 0.15,
-        emoji_sheet: glyph3d_native::default_emoji_sheet(),
-    };
-    let scene = glyph3d_native::build_scene(
-        &ctx,
-        wgpu::TextureFormat::Rgba8UnormSrgb,
-        &choice,
-        CameraMode::Front { zoom: 1.0 },
-        true,
-    );
+    let trie = glyph3d_native::default_engine_trie();
+    let atlas_load = Instant::now();
+    let atlas = atlas::Atlas::load(&ctx, &glyph3d_native::default_emoji_sheet());
+    let atlas_us = atlas_load.elapsed().as_micros();
 
     let mut updates = Vec::new();
     while let Ok(update) = rx.recv() {
+        let kind = match &update.content {
+            ContentDelta::Opened(b) => format!("opened {}B", b.len()),
+            ContentDelta::Edited { range, text } => {
+                format!("edit {}..{} +{}B", range.start, range.end, text.len())
+            }
+            ContentDelta::Tombstone => "tombstone".to_string(),
+        };
         println!(
-            "provider: {} — {} style runs, version {:016x}{}",
+            "provider: {} — v{:016x} {} runs ({kind})",
             update.file.0,
-            update.style.len(),
             update.version.0,
-            if update.complete { "" } else { " (partial)" }
+            update.style.len(),
         );
         updates.push(update);
     }
-    provider
-        .join()
-        .map_err(|_| anyhow::anyhow!("provider thread panicked"))?;
+    provider.join().map_err(|_| anyhow::anyhow!("provider thread panicked"))?;
 
-    // Negative self-test, same spirit as GLYPH_K4_SELFTEST: one update with
-    // a WRONG version (must be dropped by the join, not translated) and one
-    // for a file the field doesn't hold (the workspace grammar's problem
-    // later). The audit line must report both as dropped while the real
-    // updates still color every glyph.
-    if let Some(first) = updates.first().cloned() {
-        updates.push(seam_bogus_version(first));
-    }
-    updates.push(SurfaceUpdate {
-        file: FileKey("not-in-the-field.rs".into()),
-        version: BufferVersion(1),
-        content: ContentDelta::Tombstone,
-        style: Vec::new(),
-        structure: Vec::new(),
-        decorations: Vec::new(),
-        complete: true,
-    });
-
-    if let Some(line) = scene.apply_surface_updates(&ctx, &updates) {
-        println!("{line}");
-    }
-
+    // ── the live loop: apply delta → re-fold → re-style → render ──────────
+    let mut content: HashMap<String, Arc<Vec<u8>>> = HashMap::new();
+    let params = repo::RepoParams::default();
     let ops = [Op::CamPose(
         [pose[0], pose[1], pose[2]],
         pose[3].to_radians(),
         pose[4].to_radians(),
     )];
-    offscreen::run_scene(&ctx, scene, wgpu::TextureFormat::Rgba8UnormSrgb, &out, 2, &ops);
+
+    for (frame, update) in updates.iter().enumerate() {
+        let t_all = Instant::now();
+        // 1. Content plane: apply the delta to OUR copy (the corpus rule).
+        let entry = content
+            .entry(update.file.0.clone())
+            .or_insert_with(|| Arc::new(Vec::new()));
+        match &update.content {
+            ContentDelta::Opened(bytes) => *entry = Arc::new(bytes.clone()),
+            ContentDelta::Edited { .. } => {
+                // Sole owner in the map: make_mut splices in place, no copy.
+                let bytes = Arc::make_mut(entry);
+                update.content.apply(bytes);
+            }
+            ContentDelta::Tombstone => {
+                content.remove(&update.file.0);
+                continue;
+            }
+        }
+
+        // 2. Re-fold (Tier 0: whole-scene rebuild — THE measurement).
+        let t_build = Instant::now();
+        let files = content
+            .iter()
+            .map(|(rel, bytes)| repo::RepoFile::in_memory(rel.clone(), bytes.as_ref().clone()))
+            .collect::<Vec<_>>();
+        // The walk must be deterministic (path order) — same rule as disk.
+        let mut files = files;
+        files.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
+        let walk = repo::WalkResult::from_files(files);
+        let load = repo::load_items(
+            walk,
+            Duration::ZERO,
+            Path::new("."),
+            &trie,
+            &params,
+            glyph3d_native::layout_mojo::Strategy::Direct,
+            false,
+        );
+        let mut staged = load.into_staged(None, &atlas.slot_ink);
+        // Envelope-owned content: re-derivation (and therefore the version
+        // join) reads THE BYTES WE FOLDED, not disk.
+        if let Some(pick) = &mut staged.pick {
+            pick.content = Some(content.clone());
+        }
+        let scene = glyph3d_native::build_scene_from_staged(
+            &ctx,
+            wgpu::TextureFormat::Rgba8UnormSrgb,
+            &atlas,
+            staged,
+            CameraMode::Front { zoom: 1.0 },
+            true,
+        );
+        let build_us = t_build.elapsed().as_micros();
+
+        // 3. Style plane: the envelope, version-checked against those bytes.
+        let t_style = Instant::now();
+        let audit = scene
+            .apply_surface_updates(&ctx, &[update.clone()])
+            .unwrap_or_default();
+        let style_us = t_style.elapsed().as_micros();
+
+        // 4. Render.
+        let out = format!("{out_prefix}edit{frame}.png");
+        offscreen::run_scene(
+            &ctx,
+            scene,
+            wgpu::TextureFormat::Rgba8UnormSrgb,
+            Path::new(&out),
+            2,
+            &ops,
+        );
+        println!(
+            "frame {frame}: build {build_us}µs | style {style_us}µs | total {}µs | {audit}",
+            t_all.elapsed().as_micros()
+        );
+    }
+    println!("(atlas loaded once in {atlas_us}µs — reused across rebuilds)");
     Ok(())
 }
 
-/// A deliberately-stale copy of a real update: same file, same runs, WRONG
-/// version. The seam's law must drop it — applying it would paint glyphs
-/// with runs computed against different bytes.
-fn seam_bogus_version(mut u: SurfaceUpdate) -> SurfaceUpdate {
-    u.version = BufferVersion(u.version.0.wrapping_add(1));
-    u
-}
-
-/// The provider: one headless App, real buffers, One Dark runs as envelopes.
+/// The provider: one headless App, real buffers, One Dark runs — then a
+/// scripted edit sequence on `zedspike-main.rs`, one envelope per state.
+/// The provider keeps its OWN byte mirror (a Vec<u8>) and applies each edit
+/// to both the Zed buffer and the mirror; the mirror's hash is the version,
+/// and the mirror's deltas are what the renderer applies. Two independent
+/// applications of the same delta, joined by hash — that's the point.
 fn provide(dir: PathBuf, tx: mpsc::Sender<SurfaceUpdate>) {
     let cx = TestAppContext::single();
 
-    // One Dark from Zed's built-in defaults (ThemeRegistry::new inserts
-    // them) — the same SyntaxTheme the editor resolves HighlightIds against.
     struct NoAssets;
     impl gpui::AssetSource for NoAssets {
         fn load(&self, _: &str) -> anyhow::Result<Option<std::borrow::Cow<'static, [u8]>>> {
@@ -152,8 +199,6 @@ fn provide(dir: PathBuf, tx: mpsc::Sender<SurfaceUpdate>) {
             .with_queries(queries)
             .expect("loading rust language queries"),
     );
-    // Theme wiring BEFORE parsing: set_theme builds the grammar's highlight
-    // map, which chunk HighlightIds are indexes into.
     rust.set_theme(&syntax);
 
     let mut files: Vec<PathBuf> = std::fs::read_dir(&dir)
@@ -163,75 +208,171 @@ fn provide(dir: PathBuf, tx: mpsc::Sender<SurfaceUpdate>) {
         .collect();
     files.sort();
 
-    for path in files {
-        let bytes = match std::fs::read(&path) {
-            Ok(b) => b,
-            Err(e) => {
-                eprintln!("provider: skip {}: {e}", path.display());
-                continue;
-            }
-        };
-        let name = path
-            .file_name()
-            .expect("file_name")
-            .to_string_lossy()
-            .into_owned();
-        // Buffers are UTF-8 strings; byte offsets in runs are buffer bytes.
-        // A non-UTF-8 file is skipped, not lossy-converted (a lossy convert
-        // would shift every offset — the version join exists to catch exactly
-        // that class, but there is nothing to render faithfully anyway).
+    const EDITED: &str = "zedspike-main.rs";
+    let mut mirror: Option<Vec<u8>> = None;
+    let mut buffer = None;
+
+    for path in &files {
+        let bytes = std::fs::read(path).expect("read file");
+        let name = path.file_name().unwrap().to_string_lossy().into_owned();
         let Ok(text) = String::from_utf8(bytes.clone()) else {
             eprintln!("provider: skip {name}: not UTF-8");
             continue;
         };
-        let version: BufferVersion = content_hash_version(&bytes);
-
-        let buffer = cx.update(|app| {
-            app.new(|cx| {
-                let mut buffer = language::Buffer::local(text, cx);
-                buffer.set_language(Some(rust.clone()), cx);
-                buffer
-            })
-        });
-        cx.executor().run_until_parked();
-
-        let snapshot = cx.read(|app| buffer.read(app).snapshot());
-        let styling = language::LanguageAwareStyling {
-            tree_sitter: true,
-            diagnostics: false,
-        };
-
-        let mut style: Vec<StyleRun> = Vec::new();
-        let mut off = 0usize;
-        for chunk in snapshot.chunks(0..snapshot.len(), styling) {
-            let rgb = chunk
-                .syntax_highlight_id
-                .and_then(|id| syntax.get(id).copied())
-                .and_then(|s| s.color)
-                .map(hsla_rgb)
-                // Unstyled runs are plain text; the editor gets this color
-                // from UI styles, not the syntax theme — One Dark's editor
-                // foreground as the stand-in (same convention as S2/S3).
-                .unwrap_or([0xab, 0xb2, 0xbf]);
-            let (start, end) = (off, off + chunk.text.len());
-            off = end;
-            match style.last_mut() {
-                Some(last) if last.range.end == start && last.rgb == rgb => last.range.end = end,
-                _ => style.push(StyleRun { range: start..end, rgb }),
-            }
+        if name == EDITED {
+            mirror = Some(bytes.clone());
+            buffer = Some(open_buffer(&cx, text, &rust));
+        } else {
+            // Non-edited files: one Opened envelope, styled. Park BEFORE
+            // styling — chunks read the parse, and an unparked buffer
+            // styles as one gray run (the frame-0 bug this comment replaced).
+            let b = open_buffer(&cx, text, &rust);
+            park(&cx);
+            let runs = style_runs(&cx, &b, &syntax);
+            send(&tx, &name, content_hash_version(&bytes), ContentDelta::Opened(bytes), runs);
         }
-
-        tx.send(SurfaceUpdate {
-            file: FileKey(name),
-            version,
-            content: ContentDelta::Opened(bytes),
-            style,
-            structure: Vec::new(),
-            decorations: Vec::new(),
-            complete: true,
-        })
-        .expect("render thread gone");
     }
+    let Some(mirror) = mirror.as_mut() else {
+        eprintln!("provider: {EDITED} not found in {} — no live demo", dir.display());
+        return;
+    };
+    let buffer = buffer.unwrap();
+
+    // Initial state of the edited file.
+    park(&cx);
+    send(
+        &tx,
+        EDITED,
+        content_hash_version(mirror),
+        ContentDelta::Opened(mirror.clone()),
+        style_runs(&cx, &buffer, &syntax),
+    );
+
+    // The script — three edits, each visible in the field's geometry:
+    //  1. INSERT a 12-line banner at the top (the column grows);
+    //  2. DELETE a ~30-line middle block (it shrinks);
+    //  3. APPEND 16 stub lines at the end (it grows again).
+    let banner = "// ═══════════════════════════════════════════════════════════════\n\
+                  // LIVE REFLOW — this banner was inserted by the provider at\n\
+                  // frame 0's version; every offset below it shifted, and the\n\
+                  // field re-folded from the EDITED delta, not a re-read.\n\
+                  // ═══════════════════════════════════════════════════════════════\n\
+                  // 2\n// 3\n// 4\n// 5\n// 6\n// 7\n// 8\n";
+    let script: Vec<(usize, usize, &str)> = {
+        let text = String::from_utf8_lossy(mirror).into_owned();
+        let lines: Vec<&str> = text.lines().collect();
+        let mut v = vec![(0usize, 0usize, banner)];
+        if lines.len() > 120 {
+            // Delete lines 90..120 (byte range of those lines incl. newlines).
+            let start = byte_of_line(&lines, 90);
+            let end = byte_of_line(&lines, 120);
+            v.push((start + banner.len(), end + banner.len(), ""));
+        }
+        v.push((mirror.len() + banner.len(), mirror.len() + banner.len() + 1, "\n// ── appended stubs ──\nfn stub_a() {}\nfn stub_b() {}\nfn stub_c() {}\nfn stub_d() {}\nfn stub_e() {}\nfn stub_f() {}\nfn stub_g() {}\nfn stub_h() {}\nfn stub_i() {}\nfn stub_j() {}\nfn stub_k() {}\nfn stub_l() {}\n"));
+        v
+    };
+
+    for (i, (start, end, text)) in script.iter().enumerate() {
+        // The script's offsets were computed against the PRE-BANNER bytes +
+        // banner shift for edits 2/3 — apply to BOTH sides identically.
+        let range = *start..*end;
+        let replacement = text.to_string();
+        cx.update(|app| {
+            buffer.update(app, |b, cx| {
+                b.edit([(
+                    range.start.min(b.len())..range.end.min(b.len()),
+                    replacement.as_str(),
+                )], None, cx);
+            });
+        });
+        let delta = ContentDelta::Edited {
+            range,
+            text: replacement.into_bytes(),
+        };
+        delta.apply(mirror); // provider-side application of the same delta
+        park(&cx);
+
+        let version = content_hash_version(mirror);
+        let runs = style_runs(&cx, &buffer, &syntax);
+        eprintln!("provider: edit {i} applied ({} bytes now)", mirror.len());
+        send(&tx, EDITED, version, delta, runs);
+    }
+}
+
+fn open_buffer(
+    cx: &TestAppContext,
+    text: String,
+    rust: &Arc<language::Language>,
+) -> gpui::Entity<language::Buffer> {
+    let rust = rust.clone();
+    cx.update(|app| {
+        app.new(|cx| {
+            let mut buffer = language::Buffer::local(text, cx);
+            buffer.set_language(Some(rust), cx);
+            buffer
+        })
+    })
+}
+
+fn park(cx: &TestAppContext) {
+    cx.executor().run_until_parked();
+}
+
+fn style_runs(
+    cx: &TestAppContext,
+    buffer: &gpui::Entity<language::Buffer>,
+    syntax: &Arc<syntax_theme::SyntaxTheme>,
+) -> Vec<StyleRun> {
+    let snapshot = cx.read(|app| buffer.read(app).snapshot());
+    let styling = language::LanguageAwareStyling {
+        tree_sitter: true,
+        diagnostics: false,
+    };
+    let mut style: Vec<StyleRun> = Vec::new();
+    let mut off = 0usize;
+    for chunk in snapshot.chunks(0..snapshot.len(), styling) {
+        let rgb = chunk
+            .syntax_highlight_id
+            .and_then(|id| syntax.get(id).copied())
+            .and_then(|s| s.color)
+            .map(hsla_rgb)
+            .unwrap_or([0xab, 0xb2, 0xbf]);
+        let (start, end) = (off, off + chunk.text.len());
+        off = end;
+        match style.last_mut() {
+            Some(last) if last.range.end == start && last.rgb == rgb => last.range.end = end,
+            _ => style.push(StyleRun { range: start..end, rgb }),
+        }
+    }
+    style
+}
+
+fn send(
+    tx: &mpsc::Sender<SurfaceUpdate>,
+    file: &str,
+    version: BufferVersion,
+    content: ContentDelta,
+    style: Vec<StyleRun>,
+) {
+    tx.send(SurfaceUpdate {
+        file: FileKey(file.to_string()),
+        version,
+        content,
+        style,
+        structure: Vec::new(),
+        decorations: Vec::new(),
+        complete: true,
+    })
+    .expect("render thread gone");
+}
+
+/// Byte offset of the START of `line_ix` (0-based) in the joined-with-\n text.
+fn byte_of_line(lines: &[&str], line_ix: usize) -> usize {
+    lines
+        .iter()
+        .take(line_ix)
+        .map(|l| l.len() + 1)
+        .sum()
 }
 
 /// HSLA (0..1 components) → sRGB bytes — the run color form. Chroma/hue-

@@ -63,6 +63,37 @@ pub struct WalkResult {
     pub dirs_visited: usize,
 }
 
+impl WalkResult {
+    /// The in-memory walk: content the CALLER owns (P1-live — the seam's
+    /// envelope bytes), not a directory. There are no skip semantics to
+    /// report — the caller already decided what exists — so the counters are
+    /// zero and `dirs_visited` is 1 (the notional root).
+    pub fn from_files(files: Vec<RepoFile>) -> WalkResult {
+        let total_bytes = files.iter().map(|f| f.bytes.len()).sum();
+        WalkResult {
+            files,
+            total_bytes,
+            skipped_large: 0,
+            skipped_non_utf8: 0,
+            dirs_visited: 1,
+        }
+    }
+}
+
+impl RepoFile {
+    /// An in-memory file: `rel_path` as it would appear under a repo root
+    /// (the dir-tint key is its parent, "" at the root — same rule the
+    /// walker derives).
+    pub fn in_memory(rel_path: impl Into<String>, bytes: Vec<u8>) -> RepoFile {
+        let rel_path = rel_path.into();
+        let dir = rel_path
+            .rfind('/')
+            .map(|i| rel_path[..i].to_string())
+            .unwrap_or_default();
+        RepoFile { rel_path, dir, bytes }
+    }
+}
+
 /// Recursive walk, deterministic order (files sorted by relative path).
 pub fn walk_repo(root: &Path) -> WalkResult {
     let mut candidates: Vec<(String, PathBuf)> = Vec::new();
@@ -473,6 +504,26 @@ pub fn load_repo(
     let t0 = Instant::now();
     let walk = walk_repo(root);
     let walk_dur = t0.elapsed();
+    load_items(walk, walk_dur, root, trie, params, strategy, verify)
+}
+
+/// The loader proper — everything past the walk. Split so the SAME pipeline
+/// serves disk walks (`load_repo`) and caller-owned content
+/// (`WalkResult::from_files`, the P1-live envelope path): the fold is a pure
+/// function of (bytes, params) either way, and only the bytes' provenance
+/// differs. `walk_dur` is the caller's honest walk cost (disk I/O for
+/// `load_repo`, ~0 for in-memory) so the phases instrument stays truthful.
+/// `root` is the pick-path fallback — envelope-owned scenes override it per
+/// file by injecting `PickContext::content`.
+pub fn load_items(
+    walk: WalkResult,
+    walk_dur: Duration,
+    root: &Path,
+    trie: &Path,
+    params: &RepoParams,
+    strategy: Strategy,
+    verify: bool,
+) -> RepoLoad {
 
     // Per-file params (pagination sized per file). Newline counts double as
     // the row estimate — one fast byte scan per file.
@@ -675,10 +726,23 @@ pub fn rederive_records(
     item: &ItemParams,
 ) -> std::io::Result<(Vec<GlyphRecord>, Vec<u8>)> {
     let bytes = std::fs::read(root.join(rel_path))?;
+    let records = rederive_from_bytes(trie, &bytes, item)?;
+    Ok((records, bytes))
+}
+
+/// The engine re-run without the disk read — the P1-live form. `rederive_records`
+/// is this plus `fs::read`; envelope-owned scenes call this directly with the
+/// bytes they folded, which is what makes the seam's version join meaningful
+/// for live content (same bytes ⇒ same hash ⇒ the update applies).
+pub fn rederive_from_bytes(
+    trie: &Path,
+    bytes: &[u8],
+    item: &ItemParams,
+) -> std::io::Result<Vec<GlyphRecord>> {
     let mut eng = Engine::new();
     eng.load_trie_file(trie).expect("pick: failed to load engine trie");
-    eng.load_item(&bytes, item).expect("pick: engine re-run failed");
-    Ok((eng.read_back().records, bytes))
+    eng.load_item(bytes, item).expect("pick: engine re-run failed");
+    Ok(eng.read_back().records)
 }
 
 impl RepoLoad {
@@ -768,6 +832,9 @@ impl RepoLoad {
                 root: self.root,
                 trie: self.trie,
                 files: pick_files,
+                // Envelope-owned content is the CALLER's to inject (it owns
+                // the bytes); disk scenes re-derive from root.
+                content: None,
             }),
         }
     }

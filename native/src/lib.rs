@@ -190,6 +190,21 @@ pub fn build_scene(
     build_scene_impl(ctx, color_format, choice, camera_mode, cull, false).0
 }
 
+/// Build a GlyphScene from ALREADY-STAGED content — the P1-live entry for
+/// callers that OWN their content (the seam's envelope path: bytes through
+/// `repo::load_items` + `into_staged`, `PickContext::content` injected by
+/// the caller). No probe: this is the offscreen/linked-embedder shape.
+pub fn build_scene_from_staged(
+    ctx: &GpuContext,
+    color_format: wgpu::TextureFormat,
+    atlas: &atlas::Atlas,
+    staged: text::StagedText,
+    camera_mode: CameraMode,
+    cull: bool,
+) -> Box<dyn SceneLike> {
+    Box::new(GlyphScene::new(ctx, color_format, atlas, staged, camera_mode, cull))
+}
+
 /// Stage K (K3): windowed scene construction. Same scenes as build_scene,
 /// plus a debug-UI probe handle installed on the concrete GlyphScene BEFORE
 /// type erasure — the egui Debug panel's read-back channel (windowed.rs

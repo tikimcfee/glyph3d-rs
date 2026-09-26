@@ -23,4 +23,5 @@ grammars = { path = "/Users/lugo/localdev/externalcompute/zed/crates/grammars" }
 # this worktree, panics "missing config"). Same landmine, second binary.
 util = { path = "/Users/lugo/localdev/externalcompute/zed/crates/util", features = ["debug-embed"] }
 theme = { path = "/Users/lugo/localdev/externalcompute/zed/crates/theme" }
+syntax_theme = { path = "/Users/lugo/localdev/externalcompute/zed/crates/syntax_theme" }
 tree-sitter-rust = "0.24.2"
