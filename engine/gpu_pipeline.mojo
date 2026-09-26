@@ -450,10 +450,8 @@ def k_resolve_x(
 # ── dispatch 8b: derive the fan stride ON DEVICE — thread per item ──────────
 # ── dispatch -1: init — every zero the chain expects, one pass ─────────────
 def k_init_zeros[zero_statics: Bool](
-    lm: MutPointer[Float32, MutAnyOrigin], lc: MutPointer[UInt32, MutAnyOrigin],
-    wm: MutPointer[Float32, MutAnyOrigin], wc: MutPointer[UInt32, MutAnyOrigin],
     otb: MutPointer[UInt32, MutAnyOrigin],
-    cslot: MutPointer[UInt32, MutAnyOrigin], cend: MutPointer[UInt32, MutAnyOrigin],
+    cslot: MutPointer[UInt32, MutAnyOrigin],
     cblk: MutPointer[UInt32, MutAnyOrigin],
     pc: MutPointer[UInt32, MutAnyOrigin], pm: MutPointer[Float32, MutAnyOrigin],
     uc: MutPointer[UInt32, MutAnyOrigin], um: MutPointer[Float32, MutAnyOrigin],
@@ -465,25 +463,28 @@ def k_init_zeros[zero_statics: Bool](
     n_bytes: Int32, n_blocks: Int32, n_chunks: Int32, n_supers: Int32, n_items: Int32,
 ):
     """All of prep's zero-init in one dispatch, at device write bandwidth. This
-    replaces: the host zero-fills of lm/lc/wm/wc/otb/rmax/xmax AND their
-    uploads (the arrays the scan treats as output lanes), plus the eleven
-    enqueue_fill calls on the partial/candidate arrays (each a slow path on
-    this backend — measured 8-14 ms per 128 MB, scaling with n). Zero bits are
-    zero for f32 and u32 alike. statics (fl/gi/sm) zero only when the device
-    decodes (modes 1-3); mode 0 uploads them."""
+    replaces the host zero-fills AND uploads of the zero lanes, plus the
+    eleven enqueue_fill calls (each a slow path on this backend — measured
+    8-14 ms per 128 MB, scaling with n). Zero bits are zero for f32 and u32
+    alike. statics (fl/gi/sm) zero only when the device decodes (modes 1-3);
+    mode 0 uploads them.
+
+    What is NOT here, and why (audited 2026-09-26, consumers read end to
+    end): lm/lc/wm/wc are written by k_apply/k_resolve_x only at LEADER
+    lanes and read only at leader lanes (apply, resolveX, paginate all
+    early-return on non-leaders; the conformance tier compares leader lanes
+    only) — zeroing continuations was 32 B/byte of dead stores. cand_end is
+    read only where cand_slot != 0, and the probe writes the pair together
+    at every site. What stays is load-bearing: cand_slot is the chain's
+    candidacy test (`slot != 0` read at every leader in a present block —
+    garbage there is a phantom candidate); cblk/row_max/x_max are
+    Atomic.max targets (zero is the identity); fl/gi/sm continuation lanes
+    are READ as zero by the chain's every-byte F_LEADER test; otb is
+    compared over all n positions by the suite."""
     var id = Int(global_idx.x)
     if id < Int(n_bytes):
-        var l = id * LM_STRIDE
-        for k in range(LM_STRIDE):
-            lm[unsafe_offset = l + k] = 0
-        var c = id * LC_STRIDE
-        for k in range(LC_STRIDE):
-            lc[unsafe_offset = c + k] = 0
-        wm[unsafe_offset=id] = 0
-        wc[unsafe_offset=id] = 0
         otb[unsafe_offset=id] = 0
         cslot[unsafe_offset=id] = 0
-        cend[unsafe_offset=id] = 0
         if zero_statics:
             fl[unsafe_offset=id] = 0
             gi[unsafe_offset=id] = 0
@@ -1017,9 +1018,8 @@ def check_fixture(var fx: PipeFixture, ctx: DeviceContext, bench: Bool = False, 
     comptime B = 128
     if mode == 0:
         ctx.enqueue_function[k_init_zeros[False]](
-            d_lm.unsafe_ptr(), d_lc.unsafe_ptr(),
-            d_wm.unsafe_ptr(), d_wc.unsafe_ptr(), d_otb.unsafe_ptr(),
-            d_cslot.unsafe_ptr(), d_cend.unsafe_ptr(), d_cblk.unsafe_ptr(),
+            d_otb.unsafe_ptr(),
+            d_cslot.unsafe_ptr(), d_cblk.unsafe_ptr(),
             d_pc.unsafe_ptr(), d_pm.unsafe_ptr(),
             d_uc.unsafe_ptr(), d_um.unsafe_ptr(),
             d_fc.unsafe_ptr(), d_fm.unsafe_ptr(),
@@ -1031,9 +1031,8 @@ def check_fixture(var fx: PipeFixture, ctx: DeviceContext, bench: Bool = False, 
         )
     else:
         ctx.enqueue_function[k_init_zeros[True]](
-            d_lm.unsafe_ptr(), d_lc.unsafe_ptr(),
-            d_wm.unsafe_ptr(), d_wc.unsafe_ptr(), d_otb.unsafe_ptr(),
-            d_cslot.unsafe_ptr(), d_cend.unsafe_ptr(), d_cblk.unsafe_ptr(),
+            d_otb.unsafe_ptr(),
+            d_cslot.unsafe_ptr(), d_cblk.unsafe_ptr(),
             d_pc.unsafe_ptr(), d_pm.unsafe_ptr(),
             d_uc.unsafe_ptr(), d_um.unsafe_ptr(),
             d_fc.unsafe_ptr(), d_fm.unsafe_ptr(),
