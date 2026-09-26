@@ -2247,6 +2247,7 @@ dependencies = [
  "grammars",
  "language",
  "pollster 0.4.0",
+ "syntax_theme",
  "theme",
  "tree-sitter-rust",
  "util",

@@ -15,6 +15,7 @@
 # crates resolve against Zed's own root Cargo.toml.
 [workspace]
 members = ["zedspike", "fieldzed"]
+resolver = "2"
 
 # Copied from Zed's root [patch.crates-io]: their tree-sitter is a git fork,
 # and these patches keep fork-only APIs (adopt_raw_pid, notify variants,

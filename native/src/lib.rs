@@ -209,6 +209,23 @@ pub fn build_scene_from_staged(
     Box::new(GlyphScene::new(ctx, color_format, atlas, staged, camera_mode, cull))
 }
 
+/// The PROBED twin of [`build_scene_from_staged`] — installs the Debug
+/// panel's read-back channel before type erasure, so a live rebuilt scene
+/// keeps its panel (the windowed live loop's shape: rebuild + restyle while
+/// the viewer watches).
+pub fn build_scene_from_staged_probed(
+    ctx: &GpuContext,
+    color_format: wgpu::TextureFormat,
+    atlas: &atlas::Atlas,
+    staged: text::StagedText,
+    camera_mode: CameraMode,
+    cull: bool,
+) -> (Box<dyn SceneLike>, Option<glyph_scene::UiProbe>) {
+    let mut scene = GlyphScene::new(ctx, color_format, atlas, staged, camera_mode, cull);
+    let probe = scene.init_ui_probe();
+    (Box::new(scene), Some(probe))
+}
+
 /// Stage K (K3): windowed scene construction. Same scenes as build_scene,
 /// plus a debug-UI probe handle installed on the concrete GlyphScene BEFORE
 /// type erasure — the egui Debug panel's read-back channel (windowed.rs

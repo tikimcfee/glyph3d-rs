@@ -976,6 +976,129 @@ impl WindowState {
 /// `state: &mut WindowState` borrowed from `self.state`, so `&mut self`
 /// would double-borrow.
 #[cfg(feature = "egui-ui")]
+/// P1-live (seam.md): an envelope-driven content source for the windowed
+/// renderer. When present, the render loop polls `rx` between frames; each
+/// arrival applies its delta to `content` (the corpus rule — `Opened` once,
+/// `Edited` in place), rebuilds the scene FROM THAT CONTENT (Tier 0 —
+/// `repo::load_items` + `build_scene_from_staged_probed`, pose preserved the
+/// relayout arm's way), and re-applies every file's LATEST style runs (a
+/// rebuild resets colors to default; `last_style` is the memory that makes a
+/// rebuild a restyle). The z/cluster dials coexist but rebuild from the
+/// DISK-bound `choice` — after a dial drag, the next live update reclaims
+/// the scene. `last_style` starts empty; the poll fills it.
+pub struct LiveSource {
+    pub rx: std::sync::mpsc::Receiver<crate::seam::SurfaceUpdate>,
+    pub content: std::collections::HashMap<String, std::sync::Arc<Vec<u8>>>,
+    pub params: crate::repo::RepoParams,
+    pub trie: std::path::PathBuf,
+    pub emoji_sheet: std::path::PathBuf,
+    /// Latest style runs per file — the restyle memory. Pub so a linked
+    /// embedder can construct the source; leave it empty.
+    pub last_style: std::collections::HashMap<String, crate::seam::SurfaceUpdate>,
+}
+
+/// P1-live: drain arrived envelopes, apply deltas, rebuild the scene from
+/// the OWNED content, restore the pose, restyle. Called between frames
+/// (beside the relayout arm) — feature-free, inert when the source is quiet.
+fn poll_live(
+    ctx: &GpuContext,
+    cull: bool,
+    ui: bool,
+    live: &mut Option<LiveSource>,
+    state: &mut WindowState,
+) {
+    let Some(src) = live else { return };
+    let mut arrived = Vec::new();
+    while let Ok(update) = src.rx.try_recv() {
+        arrived.push(update);
+    }
+    if arrived.is_empty() {
+        return;
+    }
+    for update in &arrived {
+        let entry = src.content.entry(update.file.0.clone()).or_default();
+        match &update.content {
+            crate::seam::ContentDelta::Opened(bytes) => *entry = Arc::new(bytes.clone()),
+            crate::seam::ContentDelta::Edited { .. } => {
+                let owned = Arc::make_mut(entry);
+                update.content.apply(owned);
+            }
+            crate::seam::ContentDelta::Tombstone => {
+                src.content.remove(&update.file.0);
+                src.last_style.remove(&update.file.0);
+                continue;
+            }
+        }
+        src.last_style.insert(update.file.0.clone(), update.clone());
+    }
+
+    // The relayout arm's rule: a rebuild must not teleport the viewer.
+    let pose = state.ui_probe.as_ref().map(|p| {
+        let p = p.borrow();
+        (p.eye, p.yaw, p.pitch)
+    });
+    let t = Instant::now();
+    let mut files: Vec<crate::repo::RepoFile> = src
+        .content
+        .iter()
+        .map(|(rel, bytes)| crate::repo::RepoFile::in_memory(rel.clone(), bytes.as_ref().clone()))
+        .collect();
+    files.sort_by(|a, b| a.rel_path.cmp(&b.rel_path)); // the walk's determinism rule
+    let load = crate::repo::load_items(
+        crate::repo::WalkResult::from_files(files),
+        std::time::Duration::ZERO,
+        std::path::Path::new("."),
+        &src.trie,
+        &src.params,
+        crate::layout_mojo::Strategy::Direct,
+        false,
+    );
+    let atlas = crate::atlas::Atlas::load(ctx, &src.emoji_sheet);
+    let mut staged = load.into_staged(None, &atlas.slot_ink);
+    if let Some(pick) = &mut staged.pick {
+        pick.content = Some(src.content.clone());
+    }
+    let (mut scene, probe) = if ui {
+        crate::build_scene_from_staged_probed(
+            ctx,
+            state.config.format,
+            &atlas,
+            staged,
+            CameraMode::Fly,
+            cull,
+        )
+    } else {
+        (
+            crate::build_scene_from_staged(
+                ctx,
+                state.config.format,
+                &atlas,
+                staged,
+                CameraMode::Fly,
+                cull,
+            ),
+            None,
+        )
+    };
+    scene.set_viewport(state.config.width, state.config.height);
+    if let Some((eye, yaw, pitch)) = pose {
+        scene.set_cam_pose(eye, yaw, pitch);
+    }
+    state.scene = scene;
+    state.ui_probe = probe;
+    // Restyle: every file's LATEST runs (a rebuild resets colors).
+    for update in src.last_style.values() {
+        if let Some(line) = state.scene.apply_surface_updates(ctx, std::slice::from_ref(update)) {
+            println!("{line}");
+        }
+    }
+    println!(
+        "live: {} update(s) — scene rebuilt in {:?} (camera held; pick state reset)",
+        arrived.len(),
+        t.elapsed()
+    );
+}
+
 fn apply_relayout(
     ctx: &GpuContext,
     choice: &mut SceneChoice,
@@ -1063,6 +1186,9 @@ struct App<'a> {
     /// Stage G: scripted picks/verbs applied once at startup (smoke testing
     /// the same code path the windowed verbs use).
     ops: &'a [Op],
+    /// P1-live: the envelope-driven content source. None in every CLI run;
+    /// the linked embedder (experiments/fieldzed --live) supplies one.
+    live: Option<LiveSource>,
     start: Instant,
     state: Option<WindowState>,
     /// Stage K: build the egui overlay (false under `--no-ui`).
@@ -1304,6 +1430,15 @@ impl ApplicationHandler for App<'_> {
                 if let Some(req) = state.pending_relayout.take() {
                     apply_relayout(&self.ctx, &mut self.choice, self.cull, self.ui, state, req);
                 }
+                // P1-live: envelope-driven content, same between-frames rule
+                // (feature-free — the source may exist without the panel).
+                if self.live.is_some() {
+                    #[cfg(feature = "egui-ui")]
+                    let ui = self.ui;
+                    #[cfg(not(feature = "egui-ui"))]
+                    let ui = false;
+                    poll_live(&self.ctx, self.cull, ui, &mut self.live, state);
+                }
             }
             // Stage K (K6): F2 = capture the next presented frame to PNG.
             // App-level hotkey that must work REGARDLESS of egui focus (e.g.
@@ -1505,6 +1640,7 @@ mod tests {
     }
 }
 
+#[allow(clippy::too_many_arguments)] // the launch surface; one live param too many for the lint, not for the callers
 pub fn run(
     ctx: GpuContext,
     // Owned: the relayout arm mutates the choice's params (Repo's
@@ -1516,6 +1652,7 @@ pub fn run(
     ui: bool,
     shot: Option<(u64, std::path::PathBuf)>,
     present_mode: wgpu::PresentMode,
+    live: Option<LiveSource>,
 ) {
     // Without the `egui-ui` feature the overlay is compiled out entirely;
     // the flag is accepted (and ignored) so the CLI is identical either way.
@@ -1527,6 +1664,7 @@ pub fn run(
         choice,
         cull,
         ops,
+        live,
         start: Instant::now(),
         state: None,
         #[cfg(feature = "egui-ui")]

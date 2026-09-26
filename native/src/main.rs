@@ -931,6 +931,7 @@ fn main() {
                 !cli.no_ui,
                 shot,
                 parse_present_mode(&cli.present_mode),
+                None,
             )
         }
     }

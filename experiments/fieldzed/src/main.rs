@@ -34,31 +34,46 @@ use glyph3d_native::seam::{
     content_hash_version, BufferVersion, ContentDelta, FileKey, StyleRun, SurfaceUpdate,
 };
 use glyph3d_native::glyph_scene::CameraMode;
-use glyph3d_native::{atlas, offscreen, repo, Op};
+use glyph3d_native::{atlas, offscreen, repo, Op, SceneChoice};
 
 fn main() -> anyhow::Result<()> {
-    let mut args = std::env::args().skip(1);
+    let mut argv: Vec<String> = std::env::args().skip(1).collect();
+    // `--live` — the windowed run: the provider paces a LOOPING edit script
+    // (banner in, block deleted, stubs appended, revert; ~1.5 s apart) and
+    // the windowed renderer rebuilds + restyles between frames. The window
+    // is the poking surface: fly (WASD/right-drag), click to pick (the pick
+    // lines stream to THIS stdout), F1 for the Debug panel.
+    let live = argv.first().is_some_and(|a| a == "--live");
+    if live {
+        argv.remove(0);
+    }
+    let mut args = argv.into_iter();
     let dir: PathBuf = args
         .next()
         .map(PathBuf::from)
-        .context("usage: fieldzed <dir> <out_prefix> [eye_x eye_y eye_z yaw_deg pitch_deg]")?;
-    let out_prefix: String = args.next().context("missing <out_prefix>")?;
-    let mut pose = [30.0f32, -120.0, 60.0, 0.0, -12.0];
-    let given: Vec<f32> = args.filter_map(|a| a.parse().ok()).collect();
-    if given.len() == 5 {
-        pose.copy_from_slice(&given);
-    }
+        .context("usage: fieldzed [--live] <dir> <out_prefix> [eye_x eye_y eye_z yaw_deg pitch_deg]")?;
 
-    // ── provider thread: Zed's stack, headless, then a scripted edit run ───
+    // ── provider thread: Zed's stack, headless, then the edit script ──────
     let (tx, rx) = mpsc::channel::<SurfaceUpdate>();
     let provider_dir = dir.clone();
-    let provider = std::thread::spawn(move || provide(provider_dir, tx));
+    let provider = std::thread::spawn(move || provide(provider_dir, tx, live));
 
     let ctx = pollster::block_on(glyph3d_native::gpu::init(None));
     let trie = glyph3d_native::default_engine_trie();
     let atlas_load = Instant::now();
     let atlas = atlas::Atlas::load(&ctx, &glyph3d_native::default_emoji_sheet());
     let atlas_us = atlas_load.elapsed().as_micros();
+
+    if live {
+        return run_live(ctx, rx, dir, trie);
+    }
+
+    let out_prefix: String = args.next().context("missing <out_prefix>")?;
+    let mut pose = [30.0f32, -120.0, 60.0, 0.0, -12.0];
+    let given: Vec<f32> = args.filter_map(|a| a.parse().ok()).collect();
+    if given.len() == 5 {
+        pose.copy_from_slice(&given);
+    }
 
     let mut updates = Vec::new();
     while let Ok(update) = rx.recv() {
@@ -168,13 +183,87 @@ fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The LIVE run: pre-drain the Opened envelopes (the provider sends them
+/// immediately, then paces the script), hand the renderer a LiveSource, and
+/// enter the windowed loop. The provider keeps editing forever; every
+/// envelope rebuilds the scene in place with the camera held.
+fn run_live(
+    ctx: glyph3d_native::gpu::GpuContext,
+    rx: mpsc::Receiver<SurfaceUpdate>,
+    dir: PathBuf,
+    trie: PathBuf,
+) -> anyhow::Result<()> {
+    let mut content: HashMap<String, Arc<Vec<u8>>> = HashMap::new();
+    let deadline = Instant::now() + Duration::from_millis(2500);
+    while Instant::now() < deadline {
+        match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+            Ok(update) => {
+                println!(
+                    "provider: {} — v{:016x} {} runs",
+                    update.file.0,
+                    update.version.0,
+                    update.style.len()
+                );
+                if let ContentDelta::Opened(bytes) = &update.content {
+                    content.insert(update.file.0.clone(), Arc::new(bytes.clone()));
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => break,
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                anyhow::bail!("provider thread exited before opening any files")
+            }
+        }
+    }
+    if content.is_empty() {
+        anyhow::bail!("no Opened envelopes arrived — nothing to render");
+    }
+    println!(
+        "live: {} file(s) staged from envelopes — entering the windowed loop \
+         (WASD fly, right-drag look, click picks, F1 Debug panel; edits arrive ~1.5 s apart)",
+        content.len()
+    );
+    // The disk-bound choice exists for the z/cluster dials; live content
+    // reclaims the scene on every envelope (see LiveSource's doc).
+    let choice = SceneChoice::Repo {
+        dir,
+        strategy: glyph3d_native::layout_mojo::Strategy::Direct,
+        verify: false,
+        focus: None,
+        wrap_mode: glyph3d_native::fold::WrapMode::Back,
+        z_wrap_spacing: 0.15,
+        cluster_mode: glyph3d_native::fold::ClusterMode::Cluster,
+        emoji_sheet: glyph3d_native::default_emoji_sheet(),
+    };
+    let live = glyph3d_native::windowed::LiveSource {
+        rx,
+        content,
+        params: repo::RepoParams::default(),
+        trie,
+        emoji_sheet: glyph3d_native::default_emoji_sheet(),
+        last_style: HashMap::new(),
+    };
+    glyph3d_native::windowed::run(
+        ctx,
+        choice,
+        true,
+        &[],
+        true,
+        None,
+        wgpu::PresentMode::AutoVsync,
+        Some(live),
+    );
+    Ok(())
+}
+
 /// The provider: one headless App, real buffers, One Dark runs — then a
 /// scripted edit sequence on `zedspike-main.rs`, one envelope per state.
 /// The provider keeps its OWN byte mirror (a Vec<u8>) and applies each edit
 /// to both the Zed buffer and the mirror; the mirror's hash is the version,
 /// and the mirror's deltas are what the renderer applies. Two independent
 /// applications of the same delta, joined by hash — that's the point.
-fn provide(dir: PathBuf, tx: mpsc::Sender<SurfaceUpdate>) {
+/// `paced` (the --live run) loops the script forever with ~1.5 s sleeps and
+/// a full-range revert between cycles; the offscreen run is one pass.
+fn provide(dir: PathBuf, tx: mpsc::Sender<SurfaceUpdate>, paced: bool) {
     let cx = TestAppContext::single();
 
     struct NoAssets;
@@ -252,51 +341,101 @@ fn provide(dir: PathBuf, tx: mpsc::Sender<SurfaceUpdate>) {
     //  1. INSERT a 12-line banner at the top (the column grows);
     //  2. DELETE a ~30-line middle block (it shrinks);
     //  3. APPEND 16 stub lines at the end (it grows again).
-    let banner = "// ═══════════════════════════════════════════════════════════════\n\
-                  // LIVE REFLOW — this banner was inserted by the provider at\n\
-                  // frame 0's version; every offset below it shifted, and the\n\
-                  // field re-folded from the EDITED delta, not a re-read.\n\
-                  // ═══════════════════════════════════════════════════════════════\n\
-                  // 2\n// 3\n// 4\n// 5\n// 6\n// 7\n// 8\n";
-    let script: Vec<(usize, usize, &str)> = {
-        let text = String::from_utf8_lossy(mirror).into_owned();
-        let lines: Vec<&str> = text.lines().collect();
-        let mut v = vec![(0usize, 0usize, banner)];
-        if lines.len() > 120 {
-            // Delete lines 90..120 (byte range of those lines incl. newlines).
-            let start = byte_of_line(&lines, 90);
-            let end = byte_of_line(&lines, 120);
-            v.push((start + banner.len(), end + banner.len(), ""));
-        }
-        v.push((mirror.len() + banner.len(), mirror.len() + banner.len() + 1, "\n// ── appended stubs ──\nfn stub_a() {}\nfn stub_b() {}\nfn stub_c() {}\nfn stub_d() {}\nfn stub_e() {}\nfn stub_f() {}\nfn stub_g() {}\nfn stub_h() {}\nfn stub_i() {}\nfn stub_j() {}\nfn stub_k() {}\nfn stub_l() {}\n"));
-        v
-    };
+    // `paced` loops the cycle forever (~1.5 s per step) with a full-range
+    // revert at the end — the windowed demo's heartbeat.
+    let original = mirror.clone();
+    loop {
+        let banner = banner().to_string();
+        let script: Vec<(usize, usize, String)> = {
+            let text = String::from_utf8_lossy(mirror).into_owned();
+            let lines: Vec<&str> = text.lines().collect();
+            let mut v = vec![(0usize, 0usize, banner.clone())];
+            if lines.len() > 120 {
+                // Delete lines 90..120 (byte range of those lines incl. newlines).
+                let start = byte_of_line(&lines, 90);
+                let end = byte_of_line(&lines, 120);
+                v.push((start + banner.len(), end + banner.len(), String::new()));
+            }
+            v.push((
+                mirror.len() + banner.len(),
+                mirror.len() + banner.len() + 1,
+                stubs().to_string(),
+            ));
+            v
+        };
 
-    for (i, (start, end, text)) in script.iter().enumerate() {
-        // The script's offsets were computed against the PRE-BANNER bytes +
-        // banner shift for edits 2/3 — apply to BOTH sides identically.
-        let range = *start..*end;
-        let replacement = text.to_string();
+        for (i, (start, end, text)) in script.iter().enumerate() {
+            // The script's offsets were computed against the PRE-BANNER bytes +
+            // banner shift for edits 2/3 — apply to BOTH sides identically.
+            let range = *start..*end;
+            let replacement = text.clone();
+            let repl_str = replacement.clone();
+            cx.update(|app| {
+                buffer.update(app, |b, cx| {
+                    b.edit(
+                        [(range.start.min(b.len())..range.end.min(b.len()), repl_str.as_str())],
+                        None,
+                        cx,
+                    );
+                });
+            });
+            let delta = ContentDelta::Edited {
+                range,
+                text: replacement.into_bytes(),
+            };
+            delta.apply(mirror); // provider-side application of the same delta
+            park(&cx);
+
+            let version = content_hash_version(mirror);
+            let runs = style_runs(&cx, &buffer, &syntax);
+            eprintln!("provider: edit {i} applied ({} bytes now)", mirror.len());
+            send(&tx, EDITED, version, delta, runs);
+            if paced {
+                std::thread::sleep(Duration::from_millis(1500));
+            }
+        }
+
+        if !paced {
+            break;
+        }
+        // Revert to the original: one full-range replacement. The version
+        // after it hashes the original bytes — a DIFFERENT version than any
+        // before, so the join accepts it as the newest state, never a replay.
+        let range = 0..mirror.len();
+        let text = original.clone();
+        let text_str = String::from_utf8(text.clone()).expect("original was UTF-8 on open");
         cx.update(|app| {
             buffer.update(app, |b, cx| {
-                b.edit([(
-                    range.start.min(b.len())..range.end.min(b.len()),
-                    replacement.as_str(),
-                )], None, cx);
+                b.edit([(0..b.len(), text_str.as_str())], None, cx);
             });
         });
         let delta = ContentDelta::Edited {
             range,
-            text: replacement.into_bytes(),
+            text,
         };
-        delta.apply(mirror); // provider-side application of the same delta
+        delta.apply(mirror);
         park(&cx);
-
         let version = content_hash_version(mirror);
         let runs = style_runs(&cx, &buffer, &syntax);
-        eprintln!("provider: edit {i} applied ({} bytes now)", mirror.len());
+        eprintln!("provider: reverted ({} bytes)", mirror.len());
         send(&tx, EDITED, version, delta, runs);
+        std::thread::sleep(Duration::from_millis(1500));
     }
+}
+
+const BANNER: &str = "// ═══════════════════════════════════════════════════════════════\n\
+      // LIVE REFLOW — this banner was inserted by the provider at\n\
+      // frame 0's version; every offset below it shifted, and the\n\
+      // field re-folded from the EDITED delta, not a re-read.\n\
+      // ═══════════════════════════════════════════════════════════════\n\
+      // 2\n// 3\n// 4\n// 5\n// 6\n// 7\n// 8\n";
+
+fn banner() -> &'static str {
+    BANNER
+}
+
+fn stubs() -> &'static str {
+    "\n// ── appended stubs ──\nfn stub_a() {}\nfn stub_b() {}\nfn stub_c() {}\nfn stub_d() {}\nfn stub_e() {}\nfn stub_f() {}\nfn stub_g() {}\nfn stub_h() {}\nfn stub_i() {}\nfn stub_j() {}\nfn stub_k() {}\nfn stub_l() {}\n"
 }
 
 fn open_buffer(
