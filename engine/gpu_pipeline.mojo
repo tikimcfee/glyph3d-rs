@@ -34,7 +34,7 @@ from std.sys import argv, has_accelerator
 from std.time import perf_counter_ns
 from max.gpu import global_idx
 from std.atomic import Atomic
-from std.memory import bitcast
+from std.memory import bitcast, unsafe_memcpy
 from max.gpu.host import DeviceContext
 from glyph_schema import (
     SM_STRIDE, SM_ADVANCE,
@@ -49,7 +49,7 @@ from glyph_schema import (
     P_RESET, P_NL, P_GLYPHS, P_ROWS, P_HEAD_LEN, P_TAIL_LEN, P_WRAP, P_MODE, PM_TAIL_ADV,
 )
 from glyph_pipeline import (
-    F_LEADER, F_NEWLINE, item_for_byte,
+    F_LEADER, F_NEWLINE,
     WRAP_DOWN, WRAP_BACK, run_pipeline, CLUSTER_LEADER, CLUSTER_CLUSTER,
 )
 
@@ -448,6 +448,67 @@ def k_resolve_x(
 
 
 # ── dispatch 8b: derive the fan stride ON DEVICE — thread per item ──────────
+# ── dispatch -1: init — every zero the chain expects, one pass ─────────────
+def k_init_zeros[zero_statics: Bool](
+    lm: MutPointer[Float32, MutAnyOrigin], lc: MutPointer[UInt32, MutAnyOrigin],
+    wm: MutPointer[Float32, MutAnyOrigin], wc: MutPointer[UInt32, MutAnyOrigin],
+    otb: MutPointer[UInt32, MutAnyOrigin],
+    cslot: MutPointer[UInt32, MutAnyOrigin], cend: MutPointer[UInt32, MutAnyOrigin],
+    cblk: MutPointer[UInt32, MutAnyOrigin],
+    pc: MutPointer[UInt32, MutAnyOrigin], pm: MutPointer[Float32, MutAnyOrigin],
+    uc: MutPointer[UInt32, MutAnyOrigin], um: MutPointer[Float32, MutAnyOrigin],
+    fc: MutPointer[UInt32, MutAnyOrigin], fm: MutPointer[Float32, MutAnyOrigin],
+    xc: MutPointer[UInt32, MutAnyOrigin], xm: MutPointer[Float32, MutAnyOrigin],
+    rmax: MutPointer[UInt32, MutAnyOrigin], xmax: MutPointer[UInt32, MutAnyOrigin],
+    fl: MutPointer[UInt32, MutAnyOrigin], gi: MutPointer[UInt32, MutAnyOrigin],
+    sm: MutPointer[Float32, MutAnyOrigin],
+    n_bytes: Int32, n_blocks: Int32, n_chunks: Int32, n_supers: Int32, n_items: Int32,
+):
+    """All of prep's zero-init in one dispatch, at device write bandwidth. This
+    replaces: the host zero-fills of lm/lc/wm/wc/otb/rmax/xmax AND their
+    uploads (the arrays the scan treats as output lanes), plus the eleven
+    enqueue_fill calls on the partial/candidate arrays (each a slow path on
+    this backend — measured 8-14 ms per 128 MB, scaling with n). Zero bits are
+    zero for f32 and u32 alike. statics (fl/gi/sm) zero only when the device
+    decodes (modes 1-3); mode 0 uploads them."""
+    var id = Int(global_idx.x)
+    if id < Int(n_bytes):
+        var l = id * LM_STRIDE
+        for k in range(LM_STRIDE):
+            lm[unsafe_offset = l + k] = 0
+        var c = id * LC_STRIDE
+        for k in range(LC_STRIDE):
+            lc[unsafe_offset = c + k] = 0
+        wm[unsafe_offset=id] = 0
+        wc[unsafe_offset=id] = 0
+        otb[unsafe_offset=id] = 0
+        cslot[unsafe_offset=id] = 0
+        cend[unsafe_offset=id] = 0
+        if zero_statics:
+            fl[unsafe_offset=id] = 0
+            gi[unsafe_offset=id] = 0
+            var s = id * SM_STRIDE
+            for k in range(SM_STRIDE):
+                sm[unsafe_offset = s + k] = 0
+    if id < Int(n_blocks):
+        cblk[unsafe_offset=id] = 0
+    if id < Int(n_chunks) * PARTIAL_COUNT_STRIDE:
+        pc[unsafe_offset=id] = 0
+        xc[unsafe_offset=id] = 0
+    if id < Int(n_chunks) * PARTIAL_MEASURE_STRIDE:
+        pm[unsafe_offset=id] = 0
+        xm[unsafe_offset=id] = 0
+    if id < Int(n_supers) * PARTIAL_COUNT_STRIDE:
+        uc[unsafe_offset=id] = 0
+        fc[unsafe_offset=id] = 0
+    if id < Int(n_supers) * PARTIAL_MEASURE_STRIDE:
+        um[unsafe_offset=id] = 0
+        fm[unsafe_offset=id] = 0
+    if id < Int(n_items):
+        rmax[unsafe_offset=id] = 0
+        xmax[unsafe_offset=id] = 0
+
+
 def k_derive_stride(
     x_max: MutPointer[UInt32, MutAnyOrigin],
     items_e: MutPointer[UInt32, MutAnyOrigin],
@@ -596,7 +657,7 @@ def mark(ctx: DeviceContext, mut t_prev: Int, mut stages: List[Int], idx: Int) r
     t_prev = t_now
 
 
-comptime PREP_STAGES = 14
+comptime PREP_STAGES = 13
 
 
 def pmark(mut tk: Int, mut pk: List[Int], idx: Int):
@@ -611,31 +672,29 @@ def pmark(mut tk: Int, mut pk: List[Int], idx: Int):
 
 def prep_stage_name(i: Int) -> String:
     if i == 0:
-        return "facts-a"
-    if i == 1:
-        return "facts-b"
-    if i == 2:
         return "item-tabs"
-    if i == 3:
+    if i == 1:
         return "host-bufs-a"
-    if i == 4:
+    if i == 2:
         return "host-bufs-b"
-    if i == 5:
+    if i == 3:
         return "mode0-decode"
-    if i == 6:
+    if i == 4:
         return "trie-tabs"
+    if i == 5:
+        return "item-copy"
+    if i == 6:
+        return "facts-fused"
     if i == 7:
-        return "lane-fills"
-    if i == 8:
         return "host-bufs-c"
-    if i == 9:
+    if i == 8:
         return "item-fills"
-    if i == 10:
+    if i == 9:
         return "device-bufs"
-    if i == 11:
+    if i == 10:
         return "upload-sub"
-    if i == 12:
-        return "dev-fills"
+    if i == 11:
+        return "init-dispatch"
     return "drain"
 
 
@@ -680,21 +739,6 @@ def check_fixture(var fx: PipeFixture, ctx: DeviceContext, bench: Bool = False, 
     var pk = List[Int](length=PREP_STAGES, fill=0)
     var tk = t_prep
 
-    # Per-byte item facts, as the GPU pipeline gets them from itemStarts.
-    var wrap_of = List[UInt32](unsafe_uninit_length=n)
-    var mode_of = List[UInt32](unsafe_uninit_length=n)
-    var is_start = List[UInt32](unsafe_uninit_length=n)
-    var item_start = List[UInt32](unsafe_uninit_length=n)
-    var item_of = List[UInt32](unsafe_uninit_length=n)
-    for id in range(n):
-        var i = item_for_byte(fx.items, id)
-        item_of[id] = UInt32(i) if i >= 0 else UInt32(0)
-        wrap_of[id] = UInt32(fx.items[i].wrap_width) if i >= 0 else 0
-        mode_of[id] = UInt32(fx.items[i].wrap_mode) if i >= 0 else 0
-        is_start[id] = UInt32(1) if (i >= 0 and fx.items[i].byte_start == id) else UInt32(0)
-        item_start[id] = UInt32(fx.items[i].byte_start) if i >= 0 else UInt32(0)
-    pmark(tk, pk, 0)
-
     # The sequence pass runs ON DEVICE here (it used to arrive pre-computed in
     # the uploaded lanes). Mode 0 seeds the decoded-but-unresolved statics from
     # a leader-forced CPU run (the fills below); modes 1/2 decode on device via
@@ -704,13 +748,6 @@ def check_fixture(var fx: PipeFixture, ctx: DeviceContext, bench: Bool = False, 
     # reference (cpu, resolving) stays the comparison either way, so the pass is
     # covered end to end.
 
-    var item_end_of = List[UInt32](unsafe_uninit_length=n)
-    var cluster_of = List[UInt32](unsafe_uninit_length=n)
-    for id in range(n):
-        var i = item_for_byte(fx.items, id)
-        item_end_of[id] = UInt32(fx.items[i].byte_start + fx.items[i].byte_count) if i >= 0 else 0
-        cluster_of[id] = UInt32(1) if (i >= 0 and fx.items[i].cluster_mode == CLUSTER_CLUSTER) else UInt32(0)
-    pmark(tk, pk, 1)
     var item_count = len(fx.items)
     var item_ranges = List[UInt32](unsafe_uninit_length=item_count * 2)
     var item_cluster = List[UInt32](unsafe_uninit_length=item_count)
@@ -721,7 +758,7 @@ def check_fixture(var fx: PipeFixture, ctx: DeviceContext, bench: Bool = False, 
     var seq_count = 0
     if fx.trie.seq_max > 0:
         seq_count = len(fx.trie.seq) // (2 + fx.trie.seq_max)
-    pmark(tk, pk, 2)
+    pmark(tk, pk, 0)
 
     # ── upload the DECODED lanes (decode itself is proven in gpu_decode) ─────
     var h_fl = ctx.enqueue_create_host_buffer[DType.uint32](n)
@@ -735,8 +772,9 @@ def check_fixture(var fx: PipeFixture, ctx: DeviceContext, bench: Bool = False, 
     var h_wm = ctx.enqueue_create_host_buffer[DType.float32](n)
     var h_wc = ctx.enqueue_create_host_buffer[DType.uint32](n)
     var h_otb = ctx.enqueue_create_host_buffer[DType.uint32](n)
+    var h_io = ctx.enqueue_create_host_buffer[DType.uint32](n)
     ctx.synchronize()
-    pmark(tk, pk, 3)
+    pmark(tk, pk, 1)
     # The seeded statics are the LEADER-FORCED decode (unresolved): the pass
     # itself is what the device must produce, so the resolved form cannot be
     # handed to it. ROW/COL/ORD/LINE_ADV stay zeroed as before. Modes 1/2 skip
@@ -771,10 +809,9 @@ def check_fixture(var fx: PipeFixture, ctx: DeviceContext, bench: Bool = False, 
     var n_st = len(st_tab) if len(st_tab) > 0 else 1
     var h_tab = ctx.enqueue_create_host_buffer[DType.uint32](n_st)
     ctx.synchronize()
-    pmark(tk, pk, 4)
-    if mode == 3:
-        for i in range(len(st_tab)):
-            h_tab[i] = st_tab[i]
+    pmark(tk, pk, 2)
+    if mode == 3 and len(st_tab) > 0:
+        unsafe_memcpy(dest=h_tab.unsafe_ptr(), src=st_tab.unsafe_ptr(), count=len(st_tab))
     if mode == 0:
         var items_leader = List[Item]()
         for i in range(len(fx.items)):
@@ -782,61 +819,82 @@ def check_fixture(var fx: PipeFixture, ctx: DeviceContext, bench: Bool = False, 
             t.cluster_mode = CLUSTER_LEADER
             items_leader.append(t^)
         var dec = run_pipeline[witness=False](fx.bytes, fx.trie, items_leader^)
-        for id in range(n):
-            h_fl[id] = dec.fl[id]
-            h_gi[id] = dec.gi[id]
-        for i in range(n * SM_STRIDE):
-            h_sm[i] = dec.sm[i]
-    pmark(tk, pk, 5)
+        unsafe_memcpy(dest=h_fl.unsafe_ptr(), src=dec.fl.unsafe_ptr(), count=n)
+        unsafe_memcpy(dest=h_gi.unsafe_ptr(), src=dec.gi.unsafe_ptr(), count=n)
+        unsafe_memcpy(dest=h_sm.unsafe_ptr(), src=dec.sm.unsafe_ptr(), count=n * SM_STRIDE)
+    pmark(tk, pk, 3)
     if mode != 0:
-        for i in range(n_idx):
-            h_index[i] = fx.trie.block_index[i]
-        for i in range(n_bm):
-            h_bm[i] = fx.trie.blocks_m[i]
-        for i in range(n_bc):
-            h_bc[i] = fx.trie.blocks_c[i]
-    for id in range(n):
-        h_bytes[id] = fx.bytes[id]
-        h_ceof[id] = item_end_of[id]
-        h_cof[id] = cluster_of[id]
+        unsafe_memcpy(dest=h_index.unsafe_ptr(), src=fx.trie.block_index.unsafe_ptr(), count=n_idx)
+        unsafe_memcpy(dest=h_bm.unsafe_ptr(), src=fx.trie.blocks_m.unsafe_ptr(), count=n_bm)
+        unsafe_memcpy(dest=h_bc.unsafe_ptr(), src=fx.trie.blocks_c.unsafe_ptr(), count=n_bc)
+    unsafe_memcpy(dest=h_bytes.unsafe_ptr(), src=fx.bytes.unsafe_ptr(), count=n)
     if mode != 3:
-        for i in range(len(fx.trie.seq)):
-            h_seq[i] = fx.trie.seq[i]
-        if len(fx.trie.seq) == 0:
+        if len(fx.trie.seq) > 0:
+            unsafe_memcpy(dest=h_seq.unsafe_ptr(), src=fx.trie.seq.unsafe_ptr(), count=len(fx.trie.seq))
+        else:
             h_seq[0] = 0
     var head_bmp = build_head_bitmap(fx.trie)
-    for i in range(HEAD_BMP_WORDS):
-        h_bmp[i] = head_bmp[i]
+    unsafe_memcpy(dest=h_bmp.unsafe_ptr(), src=head_bmp.unsafe_ptr(), count=HEAD_BMP_WORDS)
+    pmark(tk, pk, 4)
+    if item_count > 0:
+        unsafe_memcpy(dest=h_ir.unsafe_ptr(), src=item_ranges.unsafe_ptr(), count=item_count * 2)
+        unsafe_memcpy(dest=h_ic.unsafe_ptr(), src=item_cluster.unsafe_ptr(), count=item_count)
+    # The output-lane zeros moved device-side: k_init_zeros (dispatched below)
+    # writes them at device bandwidth, and they no longer cross the bus.
+    pmark(tk, pk, 5)
+    # The per-byte item facts, written straight into the upload buffers in ONE
+    # pass. Items are sorted by byte_start, so a merge-pointer walk answers
+    # "which item owns this byte" in O(n + items) — the form this replaced ran
+    # item_for_byte's binary search twice per byte into seven intermediate
+    # Lists whose only use was the copy into these buffers.
+    if item_count > 0:
+        # Item state rides in registers; the while-step (not an if) is what
+        # keeps stacked byte_starts (empty items) on the binary search's
+        # "largest start <= id" semantics.
+        var ip = 0
+        var cw = UInt32(fx.items[0].wrap_width)
+        var cmd = UInt32(fx.items[0].wrap_mode)
+        var cstart = fx.items[0].byte_start
+        var cend = fx.items[0].byte_start + fx.items[0].byte_count
+        var ccof = UInt32(1) if fx.items[0].cluster_mode == CLUSTER_CLUSTER else UInt32(0)
+        var nxt = fx.items[1].byte_start if item_count > 1 else n
+        for id in range(n):
+            while nxt <= id:
+                ip += 1
+                cw = UInt32(fx.items[ip].wrap_width)
+                cmd = UInt32(fx.items[ip].wrap_mode)
+                cstart = fx.items[ip].byte_start
+                cend = fx.items[ip].byte_start + fx.items[ip].byte_count
+                ccof = UInt32(1) if fx.items[ip].cluster_mode == CLUSTER_CLUSTER else UInt32(0)
+                nxt = fx.items[ip + 1].byte_start if ip + 1 < item_count else n
+            h_w[id] = cw
+            h_md[id] = cmd
+            h_s[id] = UInt32(1) if id == cstart else UInt32(0)
+            h_is[id] = UInt32(cstart)
+            h_ceof[id] = UInt32(cend)
+            h_cof[id] = ccof
+            h_io[id] = UInt32(ip)
+    else:
+        for id in range(n):
+            h_w[id] = 0
+            h_md[id] = 0
+            h_s[id] = 0
+            h_is[id] = 0
+            h_ceof[id] = 0
+            h_cof[id] = 0
+            h_io[id] = 0
     pmark(tk, pk, 6)
-    for i in range(item_count * 2):
-        h_ir[i] = item_ranges[i]
-    for i in range(item_count):
-        h_ic[i] = item_cluster[i]
-    for i in range(n * LM_STRIDE):
-        h_lm[i] = 0
-    for i in range(n * LC_STRIDE):
-        h_lc[i] = 0
-    for i in range(n):
-        h_w[i] = wrap_of[i]
-        h_md[i] = mode_of[i]
-        h_s[i] = is_start[i]
-        h_is[i] = item_start[i]
-        h_wm[i] = 0
-        h_wc[i] = 0
-        h_otb[i] = 0
-    pmark(tk, pk, 7)
 
     var ni0 = fx.item_count if fx.item_count > 0 else 1
     var h_it = ctx.enqueue_create_host_buffer[DType.float32](ni0 * IM_STRIDE)
     var h_ie = ctx.enqueue_create_host_buffer[DType.uint32](ni0 * IE_STRIDE)
-    var h_io = ctx.enqueue_create_host_buffer[DType.uint32](n)
     var h_rmax = ctx.enqueue_create_host_buffer[DType.uint32](ni0)
     var h_xmax = ctx.enqueue_create_host_buffer[DType.uint32](ni0)
     # pageGapX, per item — the stride derive's one input that never had a
     # device home (it lived only in the host's between-dispatches derive).
     var h_pg = ctx.enqueue_create_host_buffer[DType.float32](ni0)
     ctx.synchronize()
-    pmark(tk, pk, 8)
+    pmark(tk, pk, 7)
     for i in range(ni0 * IM_STRIDE):
         h_it[i] = 0
     for i in range(ni0 * IE_STRIDE):
@@ -861,12 +919,7 @@ def check_fixture(var fx: PipeFixture, ctx: DeviceContext, bench: Bool = False, 
         h_ie[oe + IE_PAGES_WIDE] = UInt32(t.pages_wide)
         h_ie[oe + IE_HAS_PAGE] = UInt32(1) if t.has_page else UInt32(0)
         h_pg[i] = Float32(t.page_gap_x)
-    for i in range(n):
-        h_io[i] = item_of[i]
-    for i in range(ni0):
-        h_rmax[i] = 0
-        h_xmax[i] = 0
-    pmark(tk, pk, 9)
+    pmark(tk, pk, 8)
 
     var d_fl = ctx.enqueue_create_buffer[DType.uint32](n)
     var d_sm = ctx.enqueue_create_buffer[DType.float32](n * SM_STRIDE)
@@ -925,35 +978,27 @@ def check_fixture(var fx: PipeFixture, ctx: DeviceContext, bench: Bool = False, 
     # The zone-index byte table and the cascaded zone outs (chain=1).
     var d_czidx = ctx.enqueue_create_buffer[DType.uint8](((n + 127) >> 7) * BLOCK)
     var d_csc = ctx.enqueue_create_buffer[DType.uint32](((n + 127) >> 7) * (CLIST_CAP + 1))
-    pmark(tk, pk, 10)
+    pmark(tk, pk, 9)
     if mode == 0:
         ctx.enqueue_copy(dst_buf=d_fl, src_buf=h_fl)
         ctx.enqueue_copy(dst_buf=d_sm, src_buf=h_sm)
     else:
-        # Device decode writes every leader lane; continuations stay zero.
-        d_fl.enqueue_fill(0)
-        d_sm.enqueue_fill(0.0)
-        d_gi.enqueue_fill(0)
+        # Device decode writes every leader lane; continuations stay zero —
+        # k_init_zeros below owns that zeroing now (one dispatch, not three
+        # fills).
         ctx.enqueue_copy(dst_buf=d_index, src_buf=h_index)
         ctx.enqueue_copy(dst_buf=d_bm, src_buf=h_bm)
         ctx.enqueue_copy(dst_buf=d_bc, src_buf=h_bc)
         if mode == 3:
             ctx.enqueue_copy(dst_buf=d_tab, src_buf=h_tab)
-    ctx.enqueue_copy(dst_buf=d_lm, src_buf=h_lm)
-    ctx.enqueue_copy(dst_buf=d_lc, src_buf=h_lc)
     ctx.enqueue_copy(dst_buf=d_w, src_buf=h_w)
     ctx.enqueue_copy(dst_buf=d_md, src_buf=h_md)
     ctx.enqueue_copy(dst_buf=d_s, src_buf=h_s)
     ctx.enqueue_copy(dst_buf=d_is, src_buf=h_is)
-    ctx.enqueue_copy(dst_buf=d_wm, src_buf=h_wm)
-    ctx.enqueue_copy(dst_buf=d_wc, src_buf=h_wc)
-    ctx.enqueue_copy(dst_buf=d_otb, src_buf=h_otb)
     ctx.enqueue_copy(dst_buf=d_it, src_buf=h_it)
     ctx.enqueue_copy(dst_buf=d_ie, src_buf=h_ie)
     ctx.enqueue_copy(dst_buf=d_pg, src_buf=h_pg)
     ctx.enqueue_copy(dst_buf=d_io, src_buf=h_io)
-    ctx.enqueue_copy(dst_buf=d_rmax, src_buf=h_rmax)
-    ctx.enqueue_copy(dst_buf=d_xmax, src_buf=h_xmax)
     ctx.enqueue_copy(dst_buf=d_bytes, src_buf=h_bytes)
     if mode == 0:
         ctx.enqueue_copy(dst_buf=d_gi, src_buf=h_gi)
@@ -965,28 +1010,48 @@ def check_fixture(var fx: PipeFixture, ctx: DeviceContext, bench: Bool = False, 
     ctx.enqueue_copy(dst_buf=d_cof, src_buf=h_cof)
     ctx.enqueue_copy(dst_buf=d_ir, src_buf=h_ir)
     ctx.enqueue_copy(dst_buf=d_ic, src_buf=h_ic)
+    pmark(tk, pk, 10)
+    # One dispatch writes every zero the chain expects (see k_init_zeros) —
+    # this replaces eleven enqueue_fill calls that each cost like a slow
+    # kernel launch on this backend, plus the zero lanes' host fills+uploads.
+    comptime B = 128
+    if mode == 0:
+        ctx.enqueue_function[k_init_zeros[False]](
+            d_lm.unsafe_ptr(), d_lc.unsafe_ptr(),
+            d_wm.unsafe_ptr(), d_wc.unsafe_ptr(), d_otb.unsafe_ptr(),
+            d_cslot.unsafe_ptr(), d_cend.unsafe_ptr(), d_cblk.unsafe_ptr(),
+            d_pc.unsafe_ptr(), d_pm.unsafe_ptr(),
+            d_uc.unsafe_ptr(), d_um.unsafe_ptr(),
+            d_fc.unsafe_ptr(), d_fm.unsafe_ptr(),
+            d_xc.unsafe_ptr(), d_xm.unsafe_ptr(),
+            d_rmax.unsafe_ptr(), d_xmax.unsafe_ptr(),
+            d_fl.unsafe_ptr(), d_gi.unsafe_ptr(), d_sm.unsafe_ptr(),
+            Int32(n), Int32((n + 127) >> 7), Int32(n_chunks), Int32(n_supers), Int32(ni),
+            grid_dim=(n + B - 1) // B, block_dim=B,
+        )
+    else:
+        ctx.enqueue_function[k_init_zeros[True]](
+            d_lm.unsafe_ptr(), d_lc.unsafe_ptr(),
+            d_wm.unsafe_ptr(), d_wc.unsafe_ptr(), d_otb.unsafe_ptr(),
+            d_cslot.unsafe_ptr(), d_cend.unsafe_ptr(), d_cblk.unsafe_ptr(),
+            d_pc.unsafe_ptr(), d_pm.unsafe_ptr(),
+            d_uc.unsafe_ptr(), d_um.unsafe_ptr(),
+            d_fc.unsafe_ptr(), d_fm.unsafe_ptr(),
+            d_xc.unsafe_ptr(), d_xm.unsafe_ptr(),
+            d_rmax.unsafe_ptr(), d_xmax.unsafe_ptr(),
+            d_fl.unsafe_ptr(), d_gi.unsafe_ptr(), d_sm.unsafe_ptr(),
+            Int32(n), Int32((n + 127) >> 7), Int32(n_chunks), Int32(n_supers), Int32(ni),
+            grid_dim=(n + B - 1) // B, block_dim=B,
+        )
     pmark(tk, pk, 11)
-    d_cslot.enqueue_fill(0)
-    d_cend.enqueue_fill(0)
-    d_cblk.enqueue_fill(0)
-    d_pc.enqueue_fill(0)
-    d_uc.enqueue_fill(0)
-    d_fc.enqueue_fill(0)
-    d_xc.enqueue_fill(0)
-    d_pm.enqueue_fill(0.0)
-    d_um.enqueue_fill(0.0)
-    d_fm.enqueue_fill(0.0)
-    d_xm.enqueue_fill(0.0)
-    pmark(tk, pk, 12)
 
     # ── the chain. Every intermediate stays on device. ──────────────────────
     ctx.synchronize()
     var g0 = perf_counter_ns()
     var prep_ns = g0 - t_prep
-    pmark(tk, pk, 13)
+    pmark(tk, pk, 12)
     var stages = List[Int](length=17, fill=0)
     var t_prev = g0
-    comptime B = 128
     # THE SEQUENCE PASS, on device. Mode 0: the probe (thread per byte) writes
     # candidates over uploaded statics, the chain (thread per item) commits
     # them. Mode 1 decodes on device first (upload eliminated, probe unfused).
