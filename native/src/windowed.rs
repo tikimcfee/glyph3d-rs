@@ -992,6 +992,12 @@ pub struct LiveSource {
     pub params: crate::repo::RepoParams,
     pub trie: std::path::PathBuf,
     pub emoji_sheet: std::path::PathBuf,
+    /// The atlas, loaded ONCE by the embedder and reused across rebuilds —
+    /// content-independent, and the measurement (2026-09-26) showed its
+    /// reload was 96% of the rebuild hitch: ~185 ms atlas vs ~12 ms for
+    /// fold+stage+scene+restyle COMBINED. Construct with
+    /// `atlas::Atlas::load(ctx, &emoji_sheet)`.
+    pub atlas: crate::atlas::Atlas,
     /// Latest style runs per file — the restyle memory. Pub so a linked
     /// embedder can construct the source; leave it empty.
     pub last_style: std::collections::HashMap<String, crate::seam::SurfaceUpdate>,
@@ -1044,7 +1050,7 @@ fn poll_live(
         let p = p.borrow();
         (p.eye, p.yaw, p.pitch)
     });
-    let t = Instant::now();
+    let t_all = Instant::now();
     let mut files: Vec<crate::repo::RepoFile> = src
         .content
         .iter()
@@ -1060,16 +1066,22 @@ fn poll_live(
         crate::layout_mojo::Strategy::Direct,
         false,
     );
-    let atlas = crate::atlas::Atlas::load(ctx, &src.emoji_sheet);
+    let t_fold = t_all.elapsed();
+    let t = Instant::now();
+    let atlas = &src.atlas; // hoisted — loaded once by the embedder; the phase reads ~0µs
+    let t_atlas = t.elapsed();
+    let t = Instant::now();
     let mut staged = load.into_staged(None, &atlas.slot_ink);
     if let Some(pick) = &mut staged.pick {
         pick.content = Some(src.content.clone());
     }
+    let t_stage = t.elapsed();
+    let t = Instant::now();
     let (mut scene, probe) = if ui {
         crate::build_scene_from_staged_probed(
             ctx,
             state.config.format,
-            &atlas,
+            atlas,
             staged,
             CameraMode::Fly,
             cull,
@@ -1079,7 +1091,7 @@ fn poll_live(
             crate::build_scene_from_staged(
                 ctx,
                 state.config.format,
-                &atlas,
+                atlas,
                 staged,
                 CameraMode::Fly,
                 cull,
@@ -1091,18 +1103,26 @@ fn poll_live(
     if let Some((eye, yaw, pitch)) = pose {
         scene.set_cam_pose(eye, yaw, pitch);
     }
+    let t_scene = t.elapsed();
     state.scene = scene;
     state.ui_probe = probe;
     // Restyle: every file's LATEST runs (a rebuild resets colors).
+    let t = Instant::now();
     for update in src.last_style.values() {
         if let Some(line) = state.scene.apply_surface_updates(ctx, std::slice::from_ref(update)) {
             println!("{line}");
         }
     }
+    let t_style = t.elapsed();
     println!(
-        "live: {} update(s) — scene rebuilt in {:?} (camera held; pick state reset)",
+        "live: {} update(s) — rebuilt in {:?} (camera held; pick state reset) | phases: fold {}µs atlas {}µs (hoisted) stage {}µs scene {}µs restyle {}µs",
         arrived.len(),
-        t.elapsed()
+        t_all.elapsed(),
+        t_fold.as_micros(),
+        t_atlas.as_micros(),
+        t_stage.as_micros(),
+        t_scene.as_micros(),
+        t_style.as_micros(),
     );
 }
 

@@ -248,6 +248,9 @@ fn run_live(
         params: repo::RepoParams::default(),
         trie,
         emoji_sheet: glyph3d_native::default_emoji_sheet(),
+        // Loaded ONCE here — the measurement showed a per-reload atlas was
+        // 96% of the rebuild hitch (185 ms of 197).
+        atlas: atlas::Atlas::load(&ctx, &glyph3d_native::default_emoji_sheet()),
         last_style: HashMap::new(),
         backlog,
     };
