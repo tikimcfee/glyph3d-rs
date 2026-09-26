@@ -39,9 +39,10 @@
 //! recurrence — it IS that re-sum, scheduled differently.
 
 use crate::fold::{
-    batch_union, bounds_range, decode_all, derive_stride, page_active, paginate, rows_for_line,
-    wrap_row_of, wrap_segment_of, FoldResult, Item, Slots, WrapMode, F_LEADER, F_NEWLINE,
-    F_RENDERED,
+    batch_union, bounds_range, decode_all, derive_stride, page_active, paginate, resolve_clusters,
+    rows_for_line,
+    wrap_row_of, wrap_segment_of, ClusterMode, FoldResult, Item, Slots, WrapMode, F_LEADER,
+    F_NEWLINE, F_RENDERED,
 };
 use crate::text::ResolveGlyph;
 
@@ -475,6 +476,14 @@ pub fn run_scan_pipeline<T: ResolveGlyph + ?Sized>(
 
     // ── dispatch 1: decode (the same kernel the serial form runs) ─────────────
     let (misses, leaders) = decode_all(bytes, &mut slots, trie);
+    // ── the sequence pass, between decode and chunk_reduce — the scan's leaves
+    //    read the resolved static lanes; the monoid never learns what a cluster
+    //    is (the serial form's hook sits at the same point in fold.rs).
+    for item in items {
+        if item.cluster_mode == ClusterMode::Cluster {
+            resolve_clusters(bytes, &mut slots, trie, item);
+        }
+    }
     if items.is_empty() {
         return FoldResult {
             slots,
@@ -928,10 +937,12 @@ mod tests {
         let items = [
             Item {
                 byte_start: 0, byte_count: 90, wrap_width: 3, wrap_mode: WrapMode::Down,
+                cluster_mode: ClusterMode::default(),
                 z_step: 0.2, line_height: 1.0, ..Item::default()
             },
             Item {
                 byte_start: 90, byte_count: 90, wrap_width: 3, wrap_mode: WrapMode::Back,
+                cluster_mode: ClusterMode::default(),
                 origin_y: 4.0, z_step: 0.2, line_height: 1.0, ..Item::default()
             },
         ];
@@ -1043,6 +1054,7 @@ mod tests {
             origin_z: 0.5,
             wrap_width: 7,
             wrap_mode: WrapMode::Down,
+                cluster_mode: ClusterMode::default(),
             z_step: 0.1,
             line_height: 1.1,
             has_page: true,

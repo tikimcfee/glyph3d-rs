@@ -40,25 +40,31 @@ build-native = { cmd = "cargo build --release", cwd = "native", depends-on = ["b
 build-engine = "pixi run mojo build --fp-mode contract=off -I engine engine/ffi.mojo -o native/libglyph_engine.so --emit shared-lib"
 
 [dependencies]
-mojo = ">=1.1.0.dev2026083005,<2"
-max = ">=26.6.0.dev2026083005,<27"
+# Capped WITHIN the 26.6/1.1 stable family: a deliberate `pixi update` may move
+# inside it but cannot sail to the 26.7/1.2 nightly line (max-nightly is listed
+# first, so an uncapped range resolves there — that line removes MutStringSpan
+# and friends; pure churn for this tree, see out/TOOLCHAIN-BUMP-2026-09.md).
+mojo = ">=1.1.0,<1.2"
+max = ">=26.6,<26.7"
 # For tools/emoji_font.py (the CBDT/CBLC walker behind the emoji sheet). Only
 # tables and verbatim PNG bytes are read through it, so its version cannot
 # change an artifact — but it is pinned to a major so a solve stays boring.
 fonttools = ">=4.63,<5"
 
 # Both platforms carry an EXACT mojo/max pin so that adding an unrelated
-# dependency (fonttools, 2026-09-10) re-solves to the same nightly the suites
+# dependency (fonttools, 2026-09-10) re-solves to the same toolchain the suites
 # were verified against. The ranges above are what a deliberate `pixi update`
 # moves; these are what an incidental solve may not.
+# 2026-09-24: bumped from the dev2026083005 nightly to the stable cut of the
+# same family (out/TOOLCHAIN-BUMP-2026-09.md).
 [target.osx-arm64.dependencies]
-mojo = "==1.1.0.dev2026083005"
-max = "==26.6.0.dev2026083005"
+mojo = "==1.1.0"
+max = "==26.6"
 
 # linux-64 was added 2026-09-07 and solved fresh; without an exact pin it would
 # have taken the newest nightly, not the build the suites were verified against
-# (engine/TOOLCHAIN.md: a later nightly is expected to break the std.gpu
-# import). Pinned to the same build the osx-arm64 lock already names.
+# (engine/TOOLCHAIN.md tracks the import-surface state). Pinned to the same
+# toolchain the osx-arm64 lock names.
 [target.linux-64.dependencies]
-mojo = "==1.1.0.dev2026083005"
-max = "==26.6.0.dev2026083005"
+mojo = "==1.1.0"
+max = "==26.6"

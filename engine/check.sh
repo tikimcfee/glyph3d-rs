@@ -38,10 +38,10 @@ case "$(uname -s)" in Darwin) DYLIB=native/libglyph_engine.dylib ;; *) DYLIB=nat
 PIPE=(engine/fixtures/*.pipe.bin)
 BAKE=(engine/fixtures/*.bake.bin)
 
-CPU=(conformance conformance_scan ordinal_invariant conformance_record conformance_resume conformance_elide conformance_invariants)
+CPU=(conformance conformance_scan ordinal_invariant conformance_record conformance_resume conformance_elide conformance_invariants conformance_split)
 # gaps and matrix take ONE fixture (for its trie) and build their own topologies
 GAPS=engine/fixtures/repo-file.pipe.bin
-GPU=(gpu_decode gpu_scan gpu_paginate gpu_bounds gpu_pipeline)
+GPU=(gpu_decode gpu_scan gpu_paginate gpu_bounds gpu_pipeline gpu_cluster)
 
 # NATIVE-PORT 2026-09-02: the benches are COMPILED here, not run. They cannot run
 # in a fresh tree (engine/bench/bench.bin is untracked and its generator needs the
@@ -68,7 +68,7 @@ run() { # name, fixtures...
     fi
 }
 
-# NATIVE-PORT: the default is ALL SIXTEEN. The five GPU suites were briefly
+# NATIVE-PORT: the default is ALL EIGHTEEN. The five GPU suites were briefly
 # unbuildable here — gpu_decode failed at parse with "'gpu' does not refer to a
 # nested package" — for the sole reason that pixi.toml pinned `mojo` and not
 # `max`. Adding the dependency was the whole fix: all five then passed on Apple
@@ -124,7 +124,9 @@ for s in ${list[@]+"${list[@]}"}; do run "$s" "${PIPE[@]}"; done
 # some inlined call sites, per compilation unit (measured 2026-09-06: origin_x
 # read back as a heap address; the same source built as the dylib is bit-exact
 # on every single-item fixture). ffi_selftest.mojo's header has the full story.
-# It covers the 14 single-item pipe fixtures and skips the 3 multi-item ones —
+# It covers the 21 single-item pipe fixtures (the seven single-item cluster
+# fixtures included — cluster mode marshals through the same ABI) and skips the
+# 5 multi-item ones —
 # the per-item entry takes one item per load by design; the batched entry's
 # coverage lives in check-all's --repo-verify gate.
 if [[ "${1:-all}" != "gpu" ]]; then
@@ -151,8 +153,8 @@ if [[ "${1:-all}" != "gpu" ]]; then
     rm -f "$TMPBIN"
 fi
 case "${1:-all}" in
-    cpu) echo "all 11 CPU suites + ffi_selftest (dylib C ABI, 14 single-item fixtures) + 3 instruments green (fp contraction disabled); GPU suites NOT RUN" ;;
+    cpu) echo "all 12 CPU suites + ffi_selftest (dylib C ABI, 21 single-item fixtures) + 3 instruments green (fp contraction disabled); GPU suites NOT RUN" ;;
     bench) echo "all bench files compile (they are not RUN: bench.bin is untracked)" ;;
-    gpu) echo "all 5 GPU suites green (fp contraction disabled)" ;;
-    *)   echo "all 16 suites + ffi_selftest (dylib C ABI) green + 3 instruments + benches compile, CPU + GPU (fp contraction disabled)" ;;
+    gpu) echo "all 6 GPU suites green (fp contraction disabled)" ;;
+    *)   echo "all 18 suites + ffi_selftest (dylib C ABI) green + 3 instruments + benches compile, CPU + GPU (fp contraction disabled)" ;;
 esac

@@ -154,6 +154,35 @@ THIRD_PARTY = {
         "license": "the OFL text itself",
         "why": "the font's licence travels with the font",
     },
+    "tools/vendor/third-party/unicode-ucd/GraphemeBreakProperty.txt": {
+        "project": "unicode.org UCD",
+        "url": "https://www.unicode.org/Public/17.0.0/ucd/auxiliary/GraphemeBreakProperty.txt",
+        "tag": "17.0.0",
+        "commit": "release-dir",  # unicode.org/Public is the authoritative pin; no VCS commit
+        "sha256": "d6b51d1d2ae5c33b451b7ed994b48f1f4dc62b2272a5831e7fd418514a6bae89",
+        "license": "Unicode Terms of Use (license.txt beside it)",
+        "why": "Grapheme_Cluster_Break classes for the cluster-mode segmentation "
+               "rule — the source tools/gen_cluster_table.py reads",
+    },
+    "tools/vendor/third-party/unicode-ucd/emoji-data.txt": {
+        "project": "unicode.org UCD",
+        "url": "https://www.unicode.org/Public/17.0.0/ucd/emoji/emoji-data.txt",
+        "tag": "17.0.0",
+        "commit": "release-dir",
+        "sha256": "2cb2bb9455cda83e8481541ecf5b6dfda66a3bb89efa3fa7c5297eccf607b72b",
+        "license": "Unicode Terms of Use (license.txt beside it)",
+        "why": "Extended_Pictographic / Emoji_Modifier / keycap classes for the "
+               "same generator — cluster head/trailer candidacy",
+    },
+    "tools/vendor/third-party/unicode-ucd/license.txt": {
+        "project": "unicode.org UCD",
+        "url": "https://www.unicode.org/license.txt",
+        "tag": "17.0.0",
+        "commit": "release-dir",
+        "sha256": "e7a93b009565cfce55919a381437ac4db883e9da2126fa28b91d12732bc53d96",
+        "license": "the Unicode Terms of Use text itself",
+        "why": "the licence travels with the data",
+    },
 }
 
 # THE FIXTURE ORACLE IS PINNED PER FILE, NOT TO ONE UPSTREAM HEAD.

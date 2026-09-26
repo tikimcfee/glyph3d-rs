@@ -593,6 +593,12 @@ pub struct UiProbeState {
     /// frame — the quantified readout of what the dial did. None under
     /// --no-cull (no segment table).
     pub z_extent: Option<[f32; 2]>,
+    /// The scene's cluster mode, for the panel's toggle label. Seeded at
+    /// install — repo scenes from the pick context's uniform ItemParams,
+    /// text scenes from the staging choice (GlyphScene::probe_cluster_mode);
+    /// None where the scene carries no mode (demo, engine-text) ⇒ the panel
+    /// hides the toggle.
+    pub cluster_mode: Option<bool>,
     // ── K5: group-browser data. `files` is STATIC (built once at install;
     // Rc-shared so the panel's per-frame snapshot clones a refcount, not the
     // rows). `file_dyn` is refreshed per frame (world pose under the live
@@ -987,6 +993,11 @@ pub struct GlyphScene {
     groups_cpu: Vec<GroupRow>,
     /// Repo-mode pick context (None for text/engine scenes).
     pick: Option<PickContext>,
+    /// The panel's cluster-toggle seed for scenes WITHOUT a pick context
+    /// (text): the staging choice carries the mode and nothing else on the
+    /// scene remembers it. Repo scenes leave this None — their probe seeds
+    /// from the pick context's uniform ItemParams (the two agree there).
+    probe_cluster_mode: Option<bool>,
     /// The last resolved pick (verbs operate on it).
     picked: Option<PickHit>,
     /// Stage L (L4): the current selection (drives the mask pass). Replaces
@@ -1866,6 +1877,7 @@ impl GlyphScene {
             group_buf,
             groups_cpu,
             pick,
+            probe_cluster_mode: None,
             picked: None,
             selection: None,
             geom_overrides: std::collections::HashMap::new(),
@@ -1878,6 +1890,12 @@ impl GlyphScene {
             device: device.clone(),
             composite,
         }
+    }
+
+    /// Seed for the panel's cluster toggle on scenes without a pick context
+    /// (text). Called by the scene builder between `new` and `init_ui_probe`.
+    pub fn set_probe_cluster_mode(&mut self, on: bool) {
+        self.probe_cluster_mode = Some(on);
     }
 
     /// Stage K: install and return the windowed debug-UI probe. Windowed mode
@@ -1916,11 +1934,23 @@ impl GlyphScene {
             .as_ref()
             .and_then(|p| p.files.first())
             .map(|f| f.item.z_step / crate::text::CELL_HEIGHT_WORLD as f64);
+        // The toggle's seed: the mode the scene was built with. Repo scenes
+        // read it off the pick context's uniform-per-field params (the same
+        // read as the dial's seed); text scenes carry it on
+        // `probe_cluster_mode` instead (no pick context there). Demo and
+        // engine-text scenes: None — the panel hides the toggle.
+        let cluster_mode = self
+            .pick
+            .as_ref()
+            .and_then(|p| p.files.first())
+            .map(|f| f.item.cluster_mode == crate::fold::ClusterMode::Cluster)
+            .or(self.probe_cluster_mode);
         let probe = UiProbe::new(std::cell::RefCell::new(UiProbeState {
             lod_min_px: LOD_MIN_PX,
             files: std::rc::Rc::new(files),
             file_dyn,
             z_wrap_spacing,
+            cluster_mode,
             ..Default::default()
         }));
         self.ui_probe = Some(probe.clone());

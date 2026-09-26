@@ -2,32 +2,42 @@
 #
 # decode, chunkReduce, paginate and bounds are each proven in isolation against the
 # CPU port. That is not the same as proving they COMPOSE: every one of them was
-# handed CPU-computed inputs. Nothing yet showed that six dispatches, each feeding
+# handed CPU-computed inputs. Nothing yet showed that nine dispatches, each feeding
 # the next on device with no host round-trip, produce the pipeline's answers.
 #
-# This runs the full raking scan on the GPU —
+# This runs the sequence pass and the full raking scan on the GPU —
 #
-#   decode -> chunkReduce -> spineReduce -> spineScan -> partialScan -> apply
-#          -> resolveX -> paginate
+#   (decode+)clusterProbe -> clusterChain -> chunkReduce -> spineReduce
+#          -> spineScan -> partialScan -> apply -> resolveX -> paginate
 #
 # — with every intermediate staying in device memory, and compares the FINAL lanes
 # against the CPU scan under the same tiered contract conformance_scan uses:
 #   ROW / COL / ORD / ordToByte   exact (they are counts; nothing may round)
 #   LINE_ADV                      eps    (foldless f64 prefix vs the scan's grouping)
 #
-# The monoid lives in one place (`E` + `combine` below) and every dispatch calls it,
-# so the six kernels cannot drift from each other the way six transcriptions would.
+# The statics arrive in one of three modes (check_fixture's `mode`): 0 decodes on
+# CPU and uploads (the shipped form); 1 decodes on device with the probe unfused;
+# 2 fuses decode+probe into k_decode_probe — the probe's head arrives in registers
+# instead of being re-walked from bytes, and no statics cross the bus at all. The
+# suite runs 0 and 2 over every fixture and synthetic case; modes 1/2 add a
+# bit-exact gi/sm tier against the reference's RESOLVED statics, so the device
+# decode is pinned end to end, not assumed from gpu_decode's isolated proof.
+#
+# The monoid lives in one place (`E` + `combine` below) and every scan dispatch calls
+# it, so the seven kernels cannot drift from each other the way seven
+# transcriptions would. The device kernels are cluster_device.mojo's, shared with
+# gpu_cluster's standalone proof.
 #
 # Run: mojo run -I engine engine/gpu_pipeline.mojo engine/fixtures/*.pipe.bin
 
 from std.sys import argv, has_accelerator
 from std.time import perf_counter_ns
-from std.gpu import global_idx
+from max.gpu import global_idx
 from std.atomic import Atomic
 from std.memory import bitcast
 from max.gpu.host import DeviceContext
 from glyph_schema import (
-    SM_STRIDE, SM_ADVANCE, SM_HEIGHT,
+    SM_STRIDE, SM_ADVANCE,
     LM_STRIDE, LM_X, LM_Y, LM_Z, LM_BASE_X,
     LC_STRIDE, LC_ROW, LC_COL,
     IM_STRIDE, IM_ORIGIN_X, IM_ORIGIN_Y, IM_ORIGIN_Z, IM_LINE_HEIGHT,
@@ -39,8 +49,8 @@ from glyph_schema import (
     P_RESET, P_NL, P_GLYPHS, P_ROWS, P_HEAD_LEN, P_TAIL_LEN, P_WRAP, P_MODE, PM_TAIL_ADV,
 )
 from glyph_pipeline import (
-    F_LEADER, F_NEWLINE, trunc_nonneg, item_for_byte, derive_stride,
-    WRAP_DOWN, WRAP_BACK,
+    F_LEADER, F_NEWLINE, item_for_byte,
+    WRAP_DOWN, WRAP_BACK, run_pipeline, CLUSTER_LEADER, CLUSTER_CLUSTER,
 )
 
 
@@ -59,7 +69,13 @@ def ordered_key(v: Float32) -> UInt32:
         return ~b
     return b | 0x80000000
 from glyph_scan import run_scan_pipeline
-from fixture_io import load_pipe_fixture, PipeFixture
+from cluster_device import (
+    k_cluster_probe, k_cluster_chain, k_decode_probe,
+    k_chain_free, k_chain_sb_free, k_chain_sb_stitch, k_chain_sb_apply, k_chain_commit, k_chain_sb_cascade,
+    build_head_bitmap, build_state_table, HEAD_BMP_WORDS, ST_STRIDE,
+    BLOCK, BLOCK_LOG2, CLIST_CAP, CLIST_STRIDE, SB_BLOCKS,
+)
+from fixture_io import load_pipe_fixture, PipeFixture, load_trie_blob
 from glyph_pipeline import Item, Trie
 
 comptime MAX_PRINTED = 8
@@ -427,8 +443,35 @@ def k_resolve_x(
         + items[unsafe_offset = io + IM_ORIGIN_Z]
     )
 
-    _ = Atomic.max(row_max + it, UInt32(row + 1))     # a COUNT: native u32
-    _ = Atomic.max(x_max + it, ordered_key(x))        # a MEASURE: ordered key
+    _ = Atomic.max(row_max.unsafe_offset(it), UInt32(row + 1))  # a COUNT: native u32
+    _ = Atomic.max(x_max.unsafe_offset(it), ordered_key(x))     # a MEASURE: ordered key
+
+
+# ── dispatch 8b: derive the fan stride ON DEVICE — thread per item ──────────
+def k_derive_stride(
+    x_max: MutPointer[UInt32, MutAnyOrigin],
+    items_e: MutPointer[UInt32, MutAnyOrigin],
+    page_gap_x: MutPointer[Float32, MutAnyOrigin],
+    strides: MutPointer[Float32, MutAnyOrigin],
+    item_count: Int32,
+):
+    """The glyph_pipeline.mojo derive_stride, transcribed: widest row + pageGapX
+    when paged, else 0. This used to be a host round-trip between resolveX and
+    paginate (readback, derive, upload — a full drain mid-chain). The one
+    numerical judgment: device computes f32(xmax) + f32(gap) where the host
+    added in f64 and narrowed — ≤1 ulp of stride, feeding only paginate's X
+    fan, which the suite compares in the 1e-4 position tier. Orders of
+    magnitude inside the contract; no exact lane reads it."""
+    var i = Int(global_idx.x)
+    if i >= Int(item_count):
+        return
+    var ie = i * IE_STRIDE
+    var has_page = items_e[unsafe_offset = ie + IE_HAS_PAGE] != 0
+    var rows = Int(items_e[unsafe_offset = ie + IE_PAGE_ROWS])
+    if not has_page or rows <= 0:
+        strides[unsafe_offset=i] = 0
+        return
+    strides[unsafe_offset=i] = key_to_float(x_max[unsafe_offset=i]) + page_gap_x[unsafe_offset=i]
 
 
 # ── dispatch 8: paginate — thread per byte, pure per-slot remap ────────────
@@ -506,11 +549,78 @@ def rel_close(a: Float64, b: Float64) -> Bool:
     return d / m <= EPS
 
 
+def stage_name(i: Int) -> String:
+    if i == 0:
+        return "pass(decode+probe)"
+    if i == 1:
+        return "chain"
+    if i == 2:
+        return "chunkReduce"
+    if i == 3:
+        return "spineReduce"
+    if i == 4:
+        return "spineScan"
+    if i == 5:
+        return "partialScan"
+    if i == 6:
+        return "apply"
+    if i == 7:
+        return "resolveX"
+    if i == 8:
+        return "stride derive (host)"
+    if i == 9:
+        return "paginate"
+    if i == 10:
+        return "final readbacks"
+    if i == 11:
+        return "chain_free"
+    if i == 12:
+        return "chain_sb_cascade"
+    if i == 13:
+        return "chain_sb_free"
+    if i == 14:
+        return "chain_sb_stitch"
+    if i == 15:
+        return "chain_sb_apply"
+    return "chain_commit"
+
+
+def mark(ctx: DeviceContext, mut t_prev: Int, mut stages: List[Int], idx: Int) raises:
+    """Per-dispatch timing: synchronize, then stamp. Profiling only — the
+    extra syncs serialize host and device, so stage times carry launch gaps
+    that overlap in a free-running chain. Read them as per-dispatch shares,
+    not as a sum that must equal gpu_ns."""
+    ctx.synchronize()
+    var t_now = perf_counter_ns()
+    stages[idx] = t_now - t_prev
+    t_prev = t_now
+
+
 def check_case(path: String, ctx: DeviceContext) raises -> Int:
-    return check_fixture(load_pipe_fixture(path), ctx)
+    # Every fixture runs mode 0 (CPU-decoded statics, unfused probe), mode 2
+    # (fused decode+probe, binary search) AND mode 3 (fused, state walk)
+    # against the same reference — plus mode 3 with the CHUNKED chain, so the
+    # carry-stitched commit is proven bit-exact beside the serial one.
+    var bad = check_fixture(load_pipe_fixture(path), ctx)
+    bad += check_fixture(load_pipe_fixture(path), ctx, mode=2)
+    bad += check_fixture(load_pipe_fixture(path), ctx, mode=3)
+    bad += check_fixture(load_pipe_fixture(path), ctx, mode=3, chain=1)
+    return bad
 
 
-def check_fixture(var fx: PipeFixture, ctx: DeviceContext, bench: Bool = False) raises -> Int:
+def check_fixture(var fx: PipeFixture, ctx: DeviceContext, bench: Bool = False, mode: Int = 0, profile: Bool = False, chain: Int = 0) raises -> Int:
+    """The device chain over one fixture, in one of three statics modes:
+    0 — statics decoded on CPU (leader-forced) and uploaded; probe+chain on
+        device. The shipped form.
+    1 — decode on device (k_decode_probe[False]), probe unfused. Bench-only:
+        isolates the upload elimination from the dispatch fusion.
+    2 — decode and probe fused (k_decode_probe[True]); chain unchanged.
+    3 — as 2, with the probe's table form swapped: the state walk's hash
+        (build_state_table, built at load from the same section) replaces the
+        descending binary searches.
+    Modes 1/2/3 additionally compare the device-produced statics (gi, sm)
+    bit-exact against the reference's RESOLVED statics — the fused decode is
+    pinned end to end, not assumed from gpu_decode's separate proof."""
     var n = fx.byte_len
     if n == 0:
         return 0
@@ -521,6 +631,9 @@ def check_fixture(var fx: PipeFixture, ctx: DeviceContext, bench: Bool = False) 
     var t0 = perf_counter_ns()
     var cpu = run_scan_pipeline(fx.bytes, fx.trie, fx.items, CHUNK, GROUP)
     var cpu_ns = perf_counter_ns() - t0
+    # Everything from here to the first dispatch is the host prep the mode pays
+    # for: mode 0's price includes a whole leader-forced CPU pipeline run.
+    var t_prep = perf_counter_ns()
 
     # Per-byte item facts, as the GPU pipeline gets them from itemStarts.
     var wrap_of = List[UInt32](unsafe_uninit_length=n)
@@ -536,6 +649,32 @@ def check_fixture(var fx: PipeFixture, ctx: DeviceContext, bench: Bool = False) 
         is_start[id] = UInt32(1) if (i >= 0 and fx.items[i].byte_start == id) else UInt32(0)
         item_start[id] = UInt32(fx.items[i].byte_start) if i >= 0 else UInt32(0)
 
+    # The sequence pass runs ON DEVICE here (it used to arrive pre-computed in
+    # the uploaded lanes). Mode 0 seeds the decoded-but-unresolved statics from
+    # a leader-forced CPU run (the fills below); modes 1/2 decode on device via
+    # k_decode_probe (decode's kernel is proven in gpu_decode; the fused form is
+    # pinned by this suite's gi/sm tier). The device probe+chain dispatches
+    # rewrite the statics before the scan consumes any advance. The scan
+    # reference (cpu, resolving) stays the comparison either way, so the pass is
+    # covered end to end.
+
+    var item_end_of = List[UInt32](unsafe_uninit_length=n)
+    var cluster_of = List[UInt32](unsafe_uninit_length=n)
+    for id in range(n):
+        var i = item_for_byte(fx.items, id)
+        item_end_of[id] = UInt32(fx.items[i].byte_start + fx.items[i].byte_count) if i >= 0 else 0
+        cluster_of[id] = UInt32(1) if (i >= 0 and fx.items[i].cluster_mode == CLUSTER_CLUSTER) else UInt32(0)
+    var item_count = len(fx.items)
+    var item_ranges = List[UInt32](unsafe_uninit_length=item_count * 2)
+    var item_cluster = List[UInt32](unsafe_uninit_length=item_count)
+    for i in range(item_count):
+        item_ranges[i * 2] = UInt32(fx.items[i].byte_start)
+        item_ranges[i * 2 + 1] = UInt32(fx.items[i].byte_start + fx.items[i].byte_count)
+        item_cluster[i] = UInt32(1) if fx.items[i].cluster_mode == CLUSTER_CLUSTER else UInt32(0)
+    var seq_count = 0
+    if fx.trie.seq_max > 0:
+        seq_count = len(fx.trie.seq) // (2 + fx.trie.seq_max)
+
     # ── upload the DECODED lanes (decode itself is proven in gpu_decode) ─────
     var h_fl = ctx.enqueue_create_host_buffer[DType.uint32](n)
     var h_sm = ctx.enqueue_create_host_buffer[DType.float32](n * SM_STRIDE)
@@ -549,13 +688,78 @@ def check_fixture(var fx: PipeFixture, ctx: DeviceContext, bench: Bool = False) 
     var h_wc = ctx.enqueue_create_host_buffer[DType.uint32](n)
     var h_otb = ctx.enqueue_create_host_buffer[DType.uint32](n)
     ctx.synchronize()
-    # Only the DECODE lanes are seeded; ROW/COL/ORD/LINE_ADV are what the device
-    # must produce, so they start zeroed and cannot be accidentally "verified"
-    # against values that were handed to it.
+    # The seeded statics are the LEADER-FORCED decode (unresolved): the pass
+    # itself is what the device must produce, so the resolved form cannot be
+    # handed to it. ROW/COL/ORD/LINE_ADV stay zeroed as before. Modes 1/2 skip
+    # this entirely — k_decode_probe decodes on device, so the statics leave
+    # the host as device-side zero-fills instead of an upload.
+    var h_bytes = ctx.enqueue_create_host_buffer[DType.uint8](n)
+    var h_gi = ctx.enqueue_create_host_buffer[DType.uint32](n)
+    var n_seq = len(fx.trie.seq) if len(fx.trie.seq) > 0 else 1
+    var h_seq = ctx.enqueue_create_host_buffer[DType.uint32](n_seq)
+    var h_bmp = ctx.enqueue_create_host_buffer[DType.uint32](HEAD_BMP_WORDS)
+    var h_ceof = ctx.enqueue_create_host_buffer[DType.uint32](n)
+    var h_cof = ctx.enqueue_create_host_buffer[DType.uint32](n)
+    var h_ir = ctx.enqueue_create_host_buffer[DType.uint32](item_count * 2)
+    var h_ic = ctx.enqueue_create_host_buffer[DType.uint32](item_count)
+    # The decode trie tables, needed only when decode runs on device. Filled
+    # and uploaded solely in modes 1/2/3; mode 0 never reads them.
+    var n_idx = len(fx.trie.block_index)
+    var n_bm = len(fx.trie.blocks_m)
+    var n_bc = len(fx.trie.blocks_c)
+    var h_index = ctx.enqueue_create_host_buffer[DType.uint32](n_idx)
+    var h_bm = ctx.enqueue_create_host_buffer[DType.float32](n_bm)
+    var h_bc = ctx.enqueue_create_host_buffer[DType.uint32](n_bc)
+    # The walk form's state table (mode 3): built at load time from the SAME
+    # sequence section the search form reads, so the two table forms share one
+    # source and cannot drift. Mode 3 also leaves the sequence section itself
+    # off the bus — the walk's hash replaces it.
+    var st_tab = List[UInt32]()
+    var st_mask = UInt32(0)
+    if mode == 3:
+        st_tab = build_state_table(fx.trie.seq, seq_count, Int(fx.trie.seq_max))
+        st_mask = UInt32(len(st_tab) // ST_STRIDE - 1)
+    var n_st = len(st_tab) if len(st_tab) > 0 else 1
+    var h_tab = ctx.enqueue_create_host_buffer[DType.uint32](n_st)
+    ctx.synchronize()
+    if mode == 3:
+        for i in range(len(st_tab)):
+            h_tab[i] = st_tab[i]
+    if mode == 0:
+        var items_leader = List[Item]()
+        for i in range(len(fx.items)):
+            var t = fx.items[i].copy()
+            t.cluster_mode = CLUSTER_LEADER
+            items_leader.append(t^)
+        var dec = run_pipeline[witness=False](fx.bytes, fx.trie, items_leader^)
+        for id in range(n):
+            h_fl[id] = dec.fl[id]
+            h_gi[id] = dec.gi[id]
+        for i in range(n * SM_STRIDE):
+            h_sm[i] = dec.sm[i]
+    if mode != 0:
+        for i in range(n_idx):
+            h_index[i] = fx.trie.block_index[i]
+        for i in range(n_bm):
+            h_bm[i] = fx.trie.blocks_m[i]
+        for i in range(n_bc):
+            h_bc[i] = fx.trie.blocks_c[i]
     for id in range(n):
-        h_fl[id] = cpu.fl[id]
-    for i in range(n * SM_STRIDE):
-        h_sm[i] = cpu.sm[i]
+        h_bytes[id] = fx.bytes[id]
+        h_ceof[id] = item_end_of[id]
+        h_cof[id] = cluster_of[id]
+    if mode != 3:
+        for i in range(len(fx.trie.seq)):
+            h_seq[i] = fx.trie.seq[i]
+        if len(fx.trie.seq) == 0:
+            h_seq[0] = 0
+    var head_bmp = build_head_bitmap(fx.trie)
+    for i in range(HEAD_BMP_WORDS):
+        h_bmp[i] = head_bmp[i]
+    for i in range(item_count * 2):
+        h_ir[i] = item_ranges[i]
+    for i in range(item_count):
+        h_ic[i] = item_cluster[i]
     for i in range(n * LM_STRIDE):
         h_lm[i] = 0
     for i in range(n * LC_STRIDE):
@@ -575,6 +779,9 @@ def check_fixture(var fx: PipeFixture, ctx: DeviceContext, bench: Bool = False) 
     var h_io = ctx.enqueue_create_host_buffer[DType.uint32](n)
     var h_rmax = ctx.enqueue_create_host_buffer[DType.uint32](ni0)
     var h_xmax = ctx.enqueue_create_host_buffer[DType.uint32](ni0)
+    # pageGapX, per item — the stride derive's one input that never had a
+    # device home (it lived only in the host's between-dispatches derive).
+    var h_pg = ctx.enqueue_create_host_buffer[DType.float32](ni0)
     ctx.synchronize()
     for i in range(ni0 * IM_STRIDE):
         h_it[i] = 0
@@ -599,6 +806,7 @@ def check_fixture(var fx: PipeFixture, ctx: DeviceContext, bench: Bool = False) 
         h_ie[oe + IE_SCROLL_ROWS] = UInt32(t.scroll_rows)
         h_ie[oe + IE_PAGES_WIDE] = UInt32(t.pages_wide)
         h_ie[oe + IE_HAS_PAGE] = UInt32(1) if t.has_page else UInt32(0)
+        h_pg[i] = Float32(t.page_gap_x)
     for i in range(n):
         h_io[i] = item_of[i]
     for i in range(ni0):
@@ -627,11 +835,54 @@ def check_fixture(var fx: PipeFixture, ctx: DeviceContext, bench: Bool = False) 
     var ni = fx.item_count if fx.item_count > 0 else 1
     var d_it = ctx.enqueue_create_buffer[DType.float32](ni * IM_STRIDE)
     var d_ie = ctx.enqueue_create_buffer[DType.uint32](ni * IE_STRIDE)
+    var d_pg = ctx.enqueue_create_buffer[DType.float32](ni)
     var d_io = ctx.enqueue_create_buffer[DType.uint32](n)
     var d_rmax = ctx.enqueue_create_buffer[DType.uint32](ni)
     var d_xmax = ctx.enqueue_create_buffer[DType.uint32](ni)
-    ctx.enqueue_copy(dst_buf=d_fl, src_buf=h_fl)
-    ctx.enqueue_copy(dst_buf=d_sm, src_buf=h_sm)
+    var d_bytes = ctx.enqueue_create_buffer[DType.uint8](n)
+    var d_gi = ctx.enqueue_create_buffer[DType.uint32](n)
+    # The decode trie tables: uploaded and read only in modes 1/2/3 (device
+    # decode). In mode 0 they sit unused — allocated, never filled.
+    var d_index = ctx.enqueue_create_buffer[DType.uint32](n_idx)
+    var d_bm = ctx.enqueue_create_buffer[DType.float32](n_bm)
+    var d_bc = ctx.enqueue_create_buffer[DType.uint32](n_bc)
+    # The walk form's state table: uploaded only in mode 3.
+    var d_tab = ctx.enqueue_create_buffer[DType.uint32](n_st)
+    var d_seq = ctx.enqueue_create_buffer[DType.uint32](n_seq)
+    var d_bmp = ctx.enqueue_create_buffer[DType.uint32](HEAD_BMP_WORDS)
+    var d_ceof = ctx.enqueue_create_buffer[DType.uint32](n)
+    var d_cof = ctx.enqueue_create_buffer[DType.uint32](n)
+    var d_ir = ctx.enqueue_create_buffer[DType.uint32](item_count * 2)
+    var d_ic = ctx.enqueue_create_buffer[DType.uint32](item_count)
+    var d_cslot = ctx.enqueue_create_buffer[DType.uint32](n)
+    var d_cend = ctx.enqueue_create_buffer[DType.uint32](n)
+    var d_cblk = ctx.enqueue_create_buffer[DType.uint32]((n + 127) >> 7)
+    # The chunked chain's carry arrays (chain=1): per-block open span end, and
+    # the stitch's resolved in-carry. Same block count as the presence table.
+    var d_cout = ctx.enqueue_create_buffer[DType.uint32]((n + 127) >> 7)
+    var d_cres = ctx.enqueue_create_buffer[DType.uint32]((n + 127) >> 7)
+    # The compact candidate lists the stitch/commit walk (chain=1).
+    var d_ccount = ctx.enqueue_create_buffer[DType.uint32]((n + 127) >> 7)
+    var d_clist = ctx.enqueue_create_buffer[DType.uint32](((n + 127) >> 7) * CLIST_CAP * CLIST_STRIDE)
+    # The two-level stitch's super-block exits and resolved entries (chain=1).
+    var d_sbout = ctx.enqueue_create_buffer[DType.uint32](((n + 127) >> 7) // SB_BLOCKS + 1)
+    var d_sbres = ctx.enqueue_create_buffer[DType.uint32](((n + 127) >> 7) // SB_BLOCKS + 1)
+    # The zone-index byte table and the cascaded zone outs (chain=1).
+    var d_czidx = ctx.enqueue_create_buffer[DType.uint8](((n + 127) >> 7) * BLOCK)
+    var d_csc = ctx.enqueue_create_buffer[DType.uint32](((n + 127) >> 7) * (CLIST_CAP + 1))
+    if mode == 0:
+        ctx.enqueue_copy(dst_buf=d_fl, src_buf=h_fl)
+        ctx.enqueue_copy(dst_buf=d_sm, src_buf=h_sm)
+    else:
+        # Device decode writes every leader lane; continuations stay zero.
+        d_fl.enqueue_fill(0)
+        d_sm.enqueue_fill(0.0)
+        d_gi.enqueue_fill(0)
+        ctx.enqueue_copy(dst_buf=d_index, src_buf=h_index)
+        ctx.enqueue_copy(dst_buf=d_bm, src_buf=h_bm)
+        ctx.enqueue_copy(dst_buf=d_bc, src_buf=h_bc)
+        if mode == 3:
+            ctx.enqueue_copy(dst_buf=d_tab, src_buf=h_tab)
     ctx.enqueue_copy(dst_buf=d_lm, src_buf=h_lm)
     ctx.enqueue_copy(dst_buf=d_lc, src_buf=h_lc)
     ctx.enqueue_copy(dst_buf=d_w, src_buf=h_w)
@@ -643,9 +894,24 @@ def check_fixture(var fx: PipeFixture, ctx: DeviceContext, bench: Bool = False) 
     ctx.enqueue_copy(dst_buf=d_otb, src_buf=h_otb)
     ctx.enqueue_copy(dst_buf=d_it, src_buf=h_it)
     ctx.enqueue_copy(dst_buf=d_ie, src_buf=h_ie)
+    ctx.enqueue_copy(dst_buf=d_pg, src_buf=h_pg)
     ctx.enqueue_copy(dst_buf=d_io, src_buf=h_io)
     ctx.enqueue_copy(dst_buf=d_rmax, src_buf=h_rmax)
     ctx.enqueue_copy(dst_buf=d_xmax, src_buf=h_xmax)
+    ctx.enqueue_copy(dst_buf=d_bytes, src_buf=h_bytes)
+    if mode == 0:
+        ctx.enqueue_copy(dst_buf=d_gi, src_buf=h_gi)
+    if mode != 3:
+        # The walk form reads its own hash, not the sequence section.
+        ctx.enqueue_copy(dst_buf=d_seq, src_buf=h_seq)
+    ctx.enqueue_copy(dst_buf=d_bmp, src_buf=h_bmp)
+    ctx.enqueue_copy(dst_buf=d_ceof, src_buf=h_ceof)
+    ctx.enqueue_copy(dst_buf=d_cof, src_buf=h_cof)
+    ctx.enqueue_copy(dst_buf=d_ir, src_buf=h_ir)
+    ctx.enqueue_copy(dst_buf=d_ic, src_buf=h_ic)
+    d_cslot.enqueue_fill(0)
+    d_cend.enqueue_fill(0)
+    d_cblk.enqueue_fill(0)
     d_pc.enqueue_fill(0)
     d_uc.enqueue_fill(0)
     d_fc.enqueue_fill(0)
@@ -658,7 +924,140 @@ def check_fixture(var fx: PipeFixture, ctx: DeviceContext, bench: Bool = False) 
     # ── the chain. Every intermediate stays on device. ──────────────────────
     ctx.synchronize()
     var g0 = perf_counter_ns()
+    var prep_ns = g0 - t_prep
+    var stages = List[Int](length=17, fill=0)
+    var t_prev = g0
     comptime B = 128
+    # THE SEQUENCE PASS, on device. Mode 0: the probe (thread per byte) writes
+    # candidates over uploaded statics, the chain (thread per item) commits
+    # them. Mode 1 decodes on device first (upload eliminated, probe unfused).
+    # Mode 2 fuses decode+probe into k_decode_probe — one dispatch, and the
+    # probe's head arrives in registers instead of being re-walked from bytes.
+    # Mode 3 swaps the probe's table form: the state walk's hash replaces the
+    # descending binary searches (and the sequence section stays off the bus).
+    # The scan's kernels below read the rewritten statics — same order as the
+    # CPU's resolve-before-fold.
+    if mode == 2:
+        ctx.enqueue_function[k_decode_probe[True, False]](
+            d_bytes.unsafe_ptr(), d_index.unsafe_ptr(), d_bm.unsafe_ptr(), d_bc.unsafe_ptr(),
+            d_sm.unsafe_ptr(), d_gi.unsafe_ptr(), d_fl.unsafe_ptr(),
+            d_cof.unsafe_ptr(), d_ceof.unsafe_ptr(),
+            d_seq.unsafe_ptr(), d_bmp.unsafe_ptr(),
+            d_cslot.unsafe_ptr(), d_cend.unsafe_ptr(), d_cblk.unsafe_ptr(),
+            # the walk's tab is comptime-eliminated in the search form; any
+            # non-aliased u32 pointer satisfies the signature
+            d_lc.unsafe_ptr(), UInt32(0),
+            Int32(n), Int32(seq_count), Int32(fx.trie.seq_max),
+            grid_dim=(n + B - 1) // B, block_dim=B,
+        )
+    elif mode == 3:
+        ctx.enqueue_function[k_decode_probe[True, True]](
+            d_bytes.unsafe_ptr(), d_index.unsafe_ptr(), d_bm.unsafe_ptr(), d_bc.unsafe_ptr(),
+            d_sm.unsafe_ptr(), d_gi.unsafe_ptr(), d_fl.unsafe_ptr(),
+            d_cof.unsafe_ptr(), d_ceof.unsafe_ptr(),
+            d_seq.unsafe_ptr(), d_bmp.unsafe_ptr(),
+            d_cslot.unsafe_ptr(), d_cend.unsafe_ptr(), d_cblk.unsafe_ptr(),
+            d_tab.unsafe_ptr(), st_mask,
+            Int32(n), Int32(seq_count), Int32(fx.trie.seq_max),
+            grid_dim=(n + B - 1) // B, block_dim=B,
+        )
+    else:
+        if mode == 1:
+            ctx.enqueue_function[k_decode_probe[False, False]](
+                d_bytes.unsafe_ptr(), d_index.unsafe_ptr(), d_bm.unsafe_ptr(), d_bc.unsafe_ptr(),
+                d_sm.unsafe_ptr(), d_gi.unsafe_ptr(), d_fl.unsafe_ptr(),
+                d_cof.unsafe_ptr(), d_ceof.unsafe_ptr(),
+                d_seq.unsafe_ptr(), d_bmp.unsafe_ptr(),
+                d_cslot.unsafe_ptr(), d_cend.unsafe_ptr(), d_cblk.unsafe_ptr(),
+                # tab is comptime-eliminated without the walk, as above
+                d_lc.unsafe_ptr(), UInt32(0),
+                Int32(n), Int32(seq_count), Int32(fx.trie.seq_max),
+                grid_dim=(n + B - 1) // B, block_dim=B,
+            )
+        ctx.enqueue_function[k_cluster_probe](
+            d_bytes.unsafe_ptr(), d_cof.unsafe_ptr(), d_ceof.unsafe_ptr(),
+            d_seq.unsafe_ptr(), d_bmp.unsafe_ptr(), d_gi.unsafe_ptr(), d_sm.unsafe_ptr(), d_fl.unsafe_ptr(),
+            d_cslot.unsafe_ptr(), d_cend.unsafe_ptr(), d_cblk.unsafe_ptr(),
+            Int32(n), Int32(seq_count), Int32(fx.trie.seq_max),
+            grid_dim=(n + B - 1) // B, block_dim=B,
+        )
+    if profile:
+        mark(ctx, t_prev, stages, 0)
+    if chain == 1:
+        # The chunk-parallel chain: free walk per 128B block, one-thread
+        # stitch of the one-integer carry, commit per block with the
+        # resolved in-carry. Item-shape independent — a single-item corpus
+        # stops being a trap.
+        var nc = (n + BLOCK - 1) >> BLOCK_LOG2
+        var nsb = (nc + SB_BLOCKS - 1) // SB_BLOCKS
+        ctx.enqueue_function[k_chain_free](
+            d_bytes.unsafe_ptr(), d_cslot.unsafe_ptr(), d_cend.unsafe_ptr(), d_cblk.unsafe_ptr(),
+            d_ccount.unsafe_ptr(), d_clist.unsafe_ptr(), d_czidx.unsafe_ptr(), d_cout.unsafe_ptr(),
+            Int32(n), Int32(nc),
+            grid_dim=(nc + B - 1) // B, block_dim=B,
+        )
+        if profile:
+            mark(ctx, t_prev, stages, 11)
+        ctx.enqueue_function[k_chain_sb_cascade](
+            d_bytes.unsafe_ptr(), d_cslot.unsafe_ptr(), d_cend.unsafe_ptr(),
+            d_gi.unsafe_ptr(), d_sm.unsafe_ptr(), d_fl.unsafe_ptr(),
+            fx.trie.bitmap_advance, d_ccount.unsafe_ptr(), d_clist.unsafe_ptr(), d_czidx.unsafe_ptr(),
+            d_cout.unsafe_ptr(), d_csc.unsafe_ptr(),
+            Int32(n), Int32(nc),
+            grid_dim=(nc + B - 1) // B, block_dim=B,
+        )
+        if profile:
+            mark(ctx, t_prev, stages, 12)
+        ctx.enqueue_function[k_chain_sb_free](
+            d_bytes.unsafe_ptr(), d_cslot.unsafe_ptr(), d_cend.unsafe_ptr(),
+            d_gi.unsafe_ptr(), d_sm.unsafe_ptr(), d_fl.unsafe_ptr(),
+            fx.trie.bitmap_advance, d_ccount.unsafe_ptr(), d_clist.unsafe_ptr(), d_czidx.unsafe_ptr(),
+            d_cout.unsafe_ptr(), d_sbout.unsafe_ptr(),
+            Int32(n), Int32(nc),
+            grid_dim=(nsb + B - 1) // B, block_dim=B,
+        )
+        if profile:
+            mark(ctx, t_prev, stages, 13)
+        ctx.enqueue_function[k_chain_sb_stitch](
+            d_bytes.unsafe_ptr(), d_cslot.unsafe_ptr(), d_cend.unsafe_ptr(),
+            d_gi.unsafe_ptr(), d_sm.unsafe_ptr(), d_fl.unsafe_ptr(),
+            fx.trie.bitmap_advance, d_ccount.unsafe_ptr(), d_clist.unsafe_ptr(), d_czidx.unsafe_ptr(),
+            d_cout.unsafe_ptr(), d_sbout.unsafe_ptr(), d_sbres.unsafe_ptr(), d_csc.unsafe_ptr(),
+            Int32(n), Int32(nc),
+            grid_dim=1, block_dim=1,
+        )
+        if profile:
+            mark(ctx, t_prev, stages, 14)
+        ctx.enqueue_function[k_chain_sb_apply](
+            d_bytes.unsafe_ptr(), d_cslot.unsafe_ptr(), d_cend.unsafe_ptr(),
+            d_gi.unsafe_ptr(), d_sm.unsafe_ptr(), d_fl.unsafe_ptr(),
+            fx.trie.bitmap_advance, d_ccount.unsafe_ptr(), d_clist.unsafe_ptr(), d_czidx.unsafe_ptr(),
+            d_cout.unsafe_ptr(), d_sbres.unsafe_ptr(), d_cres.unsafe_ptr(),
+            Int32(n), Int32(nc),
+            grid_dim=(nsb + B - 1) // B, block_dim=B,
+        )
+        if profile:
+            mark(ctx, t_prev, stages, 15)
+        ctx.enqueue_function[k_chain_commit](
+            d_bytes.unsafe_ptr(), d_cslot.unsafe_ptr(), d_cend.unsafe_ptr(), d_cblk.unsafe_ptr(),
+            d_cres.unsafe_ptr(), d_ccount.unsafe_ptr(), d_clist.unsafe_ptr(),
+            d_gi.unsafe_ptr(), d_sm.unsafe_ptr(), d_fl.unsafe_ptr(),
+            fx.trie.bitmap_advance,
+            Int32(n), Int32(nc),
+            grid_dim=(nc + B - 1) // B, block_dim=B,
+        )
+        if profile:
+            mark(ctx, t_prev, stages, 16)
+    else:
+        ctx.enqueue_function[k_cluster_chain](
+            d_bytes.unsafe_ptr(), d_ir.unsafe_ptr(), d_ic.unsafe_ptr(),
+            d_cslot.unsafe_ptr(), d_cend.unsafe_ptr(), d_cblk.unsafe_ptr(),
+            d_gi.unsafe_ptr(), d_sm.unsafe_ptr(), d_fl.unsafe_ptr(),
+            fx.trie.bitmap_advance, Int32(item_count),
+            grid_dim=(item_count + 63) // 64, block_dim=64,
+        )
+    if profile:
+        mark(ctx, t_prev, stages, 1)
     ctx.enqueue_function[k_chunk_reduce](
         d_fl.unsafe_ptr(), d_sm.unsafe_ptr(), d_w.unsafe_ptr(), d_md.unsafe_ptr(),
         d_s.unsafe_ptr(),
@@ -666,21 +1065,29 @@ def check_fixture(var fx: PipeFixture, ctx: DeviceContext, bench: Bool = False) 
         Int32(n), Int32(CHUNK), Int32(n_chunks),
         grid_dim=(n_chunks + B - 1) // B, block_dim=B,
     )
+    if profile:
+        mark(ctx, t_prev, stages, 2)
     ctx.enqueue_function[k_spine_reduce](
         d_pc.unsafe_ptr(), d_pm.unsafe_ptr(), d_uc.unsafe_ptr(), d_um.unsafe_ptr(),
         Int32(n_chunks), Int32(GROUP), Int32(n_supers),
         grid_dim=(n_supers + B - 1) // B, block_dim=B,
     )
+    if profile:
+        mark(ctx, t_prev, stages, 3)
     ctx.enqueue_function[k_spine_scan](
         d_uc.unsafe_ptr(), d_um.unsafe_ptr(), d_fc.unsafe_ptr(), d_fm.unsafe_ptr(),
         Int32(n_supers), grid_dim=1, block_dim=1,
     )
+    if profile:
+        mark(ctx, t_prev, stages, 4)
     ctx.enqueue_function[k_partial_scan](
         d_pc.unsafe_ptr(), d_pm.unsafe_ptr(), d_fc.unsafe_ptr(), d_fm.unsafe_ptr(),
         d_xc.unsafe_ptr(), d_xm.unsafe_ptr(),
         Int32(n_chunks), Int32(GROUP), Int32(n_supers),
         grid_dim=(n_supers + B - 1) // B, block_dim=B,
     )
+    if profile:
+        mark(ctx, t_prev, stages, 5)
     ctx.enqueue_function[k_apply](
         d_fl.unsafe_ptr(), d_sm.unsafe_ptr(), d_lm.unsafe_ptr(), d_lc.unsafe_ptr(),
         d_w.unsafe_ptr(), d_md.unsafe_ptr(), d_s.unsafe_ptr(),
@@ -689,6 +1096,8 @@ def check_fixture(var fx: PipeFixture, ctx: DeviceContext, bench: Bool = False) 
         Int32(n), Int32(CHUNK), Int32(n_chunks),
         grid_dim=(n_chunks + B - 1) // B, block_dim=B,
     )
+    if profile:
+        mark(ctx, t_prev, stages, 6)
     ctx.enqueue_function[k_resolve_x](
         d_sm.unsafe_ptr(), d_fl.unsafe_ptr(), d_lm.unsafe_ptr(), d_lc.unsafe_ptr(),
         d_it.unsafe_ptr(), d_ie.unsafe_ptr(), d_io.unsafe_ptr(),
@@ -697,45 +1106,76 @@ def check_fixture(var fx: PipeFixture, ctx: DeviceContext, bench: Bool = False) 
         d_rmax.unsafe_ptr(), d_xmax.unsafe_ptr(),
         Int32(n), grid_dim=(n + B - 1) // B, block_dim=B,
     )
+    if profile:
+        mark(ctx, t_prev, stages, 7)
     # The fan stride is DERIVED from each item's widest fold row — a fold scalar
-    # resolveX just produced. The CPU driver computes it between dispatches too, so
-    # this readback mirrors the reference rather than shortcutting it.
-    var h_xr = ctx.enqueue_create_host_buffer[DType.uint32](ni0)
-    var h_st = ctx.enqueue_create_host_buffer[DType.float32](ni0)
-    ctx.enqueue_copy(dst_buf=h_xr, src_buf=d_xmax)
-    ctx.synchronize()
-    for i in range(fx.item_count):
-        var widest = Float64(key_to_float(h_xr[i]))
-        h_st[i] = Float32(derive_stride(widest, fx.items[i]))
+    # resolveX just produced. Derived ON DEVICE (k_derive_stride): the mid-chain
+    # readback / host derive / upload and its full drain are gone.
     var d_st = ctx.enqueue_create_buffer[DType.float32](ni0)
-    ctx.enqueue_copy(dst_buf=d_st, src_buf=h_st)
+    ctx.enqueue_function[k_derive_stride](
+        d_xmax.unsafe_ptr(), d_ie.unsafe_ptr(), d_pg.unsafe_ptr(), d_st.unsafe_ptr(),
+        Int32(item_count),
+        grid_dim=(item_count + 63) // 64, block_dim=64,
+    )
+    if profile:
+        mark(ctx, t_prev, stages, 8)
     ctx.enqueue_function[k_paginate](
         d_lm.unsafe_ptr(), d_fl.unsafe_ptr(), d_lc.unsafe_ptr(),
         d_it.unsafe_ptr(), d_ie.unsafe_ptr(), d_io.unsafe_ptr(),
         d_st.unsafe_ptr(), Int32(n),
         grid_dim=(n + B - 1) // B, block_dim=B,
     )
+    if profile:
+        mark(ctx, t_prev, stages, 9)
+    if mode != 0 and not bench:
+        # The fused path's statics are device-produced: read them back for the
+        # gi/sm comparison tier below. (Bench returns before comparing; the
+        # extra copies would tax the timed phase.)
+        ctx.enqueue_copy(dst_buf=h_gi, src_buf=d_gi)
+        ctx.enqueue_copy(dst_buf=h_sm, src_buf=d_sm)
     ctx.enqueue_copy(dst_buf=h_lc, src_buf=d_lc)
     ctx.enqueue_copy(dst_buf=h_lm, src_buf=d_lm)
     ctx.enqueue_copy(dst_buf=h_wm, src_buf=d_wm)
     ctx.enqueue_copy(dst_buf=h_wc, src_buf=d_wc)
     ctx.enqueue_copy(dst_buf=h_otb, src_buf=d_otb)
     ctx.enqueue_copy(dst_buf=h_rmax, src_buf=d_rmax)
+    if profile:
+        mark(ctx, t_prev, stages, 10)
     ctx.synchronize()
     var gpu_ns = perf_counter_ns() - g0
     if bench:
         var mb = Float64(n) / 1048576.0
         print(
-            "  ", n, "B   cpu(sharded)", Float64(cpu_ns) / 1e6, "ms =",
+            "  ", n, "B  mode", mode, " chain", chain, "  prep", Float64(prep_ns) / 1e6,
+            "ms   |   cpu(sharded)", Float64(cpu_ns) / 1e6, "ms =",
             mb / (Float64(cpu_ns) / 1e9), "MB/s   |   gpu", Float64(gpu_ns) / 1e6,
             "ms =", mb / (Float64(gpu_ns) / 1e9), "MB/s   |   x",
             Float64(cpu_ns) / Float64(gpu_ns),
         )
+        if profile:
+            for i in range(17):
+                print("      ", stage_name(i), Float64(stages[i]) / 1e6, "ms")
         return 0
 
     # ── the tiered comparison ───────────────────────────────────────────────
     var bad = 0
     var printed = 0
+    if mode != 0:
+        # Modes 1/2 produce the statics ON DEVICE: pin them bit-exact against
+        # the reference's RESOLVED statics — device decode and the sequence
+        # pass's rewrite are both covered here, per byte, no tolerance.
+        for id in range(n):
+            if h_gi[id] != cpu.gi[id]:
+                bad += 1
+                if printed < MAX_PRINTED:
+                    print("  byte", id, "GLYPH_ID gpu", h_gi[id], "cpu", cpu.gi[id])
+                    printed += 1
+        for i in range(n * SM_STRIDE):
+            if UInt32(h_sm[i].to_bits()) != UInt32(cpu.sm[i].to_bits()):
+                bad += 1
+                if printed < MAX_PRINTED:
+                    print("  static lane", i, "— gpu", h_sm[i], "cpu", cpu.sm[i])
+                    printed += 1
     for id in range(n):
         var co = id * LC_STRIDE
         if (Int(cpu.fl[id]) & F_LEADER) == 0:
@@ -792,7 +1232,7 @@ def check_fixture(var fx: PipeFixture, ctx: DeviceContext, bench: Bool = False) 
 
 def synthetic_case(
     trie: Trie, n: Int, wrap: Int, line_len: Int, ctx: DeviceContext,
-    mode: Int = WRAP_DOWN,
+    mode: Int = WRAP_DOWN, smode: Int = 0,
 ) raises -> Int:
     """A corpus large enough to reach the SPINE's multi-super path.
 
@@ -820,19 +1260,29 @@ def synthetic_case(
     fx.bytes = bytes^
     fx.trie = trie.copy()
     fx.items = items^
-    return check_fixture(fx^, ctx)
+    return check_fixture(fx^, ctx, mode=smode)
 
 
-def bench_scaling(trie: Trie, path: String, ctx: DeviceContext) raises:
+def bench_scaling(trie: Trie, path: String, ctx: DeviceContext, cluster: Bool = False, profile: Bool = False) raises:
     """Time the SAME chain the conformance suite proves, across corpus sizes.
 
     The GPU timing spans the whole device phase — the dispatches AND the readbacks,
     including the host-side stride derivation between resolveX and paginate. Timing
-    only the kernels would flatter the GPU by hiding the part a real caller pays."""
+    only the kernels would flatter the GPU by hiding the part a real caller pays.
+    `cluster` runs the items under cluster mode (the sequence pass's device form
+    included); leader mode pays the pass's dispatches but no-ops inside the
+    kernels (per-thread cluster_of/item_cluster early-returns).
+
+    Every size runs the statics modes: 0 = CPU decode + upload (the shipped
+    form), 1 = device decode, probe unfused, 2 = fused decode+probe (binary
+    search), 3 = fused decode+probe (state walk). The printed `prep` column is
+    the host fill+upload time the mode pays (mode 0's includes a whole
+    leader-forced CPU pipeline run), so the A/B attributes the delta: upload
+    elimination (0→1), dispatch fusion (1→2), table form (2→3)."""
     var f = open(path, "r")
     var all_bytes = f.read_bytes()
     f.close()
-    print("corpus:", path, "(", len(all_bytes), "bytes )")
+    print("corpus:", path, "(", len(all_bytes), "bytes )", "cluster" if cluster else "leader")
     print("")
     var sizes = List[Int]()
     sizes.append(65536)
@@ -849,19 +1299,22 @@ def bench_scaling(trie: Trie, path: String, ctx: DeviceContext) raises:
         var bytes = List[UInt8](capacity=nb)
         for i in range(nb):
             bytes.append(all_bytes[i])
-        var it = Item()
-        it.byte_start = 0
-        it.byte_count = nb
-        it.line_height = 1
-        var items = List[Item]()
-        items.append(it^)
-        var fx = PipeFixture()
-        fx.byte_len = nb
-        fx.item_count = 1
-        fx.bytes = bytes^
-        fx.trie = trie.copy()
-        fx.items = items^
-        _ = check_fixture(fx^, ctx, True)
+        for m in range(4):
+            for ch in range(2):
+                var it = Item()
+                it.byte_start = 0
+                it.byte_count = nb
+                it.line_height = 1
+                it.cluster_mode = CLUSTER_CLUSTER if cluster else CLUSTER_LEADER
+                var items = List[Item]()
+                items.append(it^)
+                var fx = PipeFixture()
+                fx.byte_len = nb
+                fx.item_count = 1
+                fx.bytes = List[UInt8](copy=bytes)
+                fx.trie = trie.copy()
+                fx.items = items^
+                _ = check_fixture(fx^, ctx, True, m, profile, ch)
 
 
 def main() raises:
@@ -874,7 +1327,14 @@ def main() raises:
     print("device:", ctx.name())
     if String(args[1]) == "--bench":
         var seed = load_pipe_fixture(String(args[2]))
-        bench_scaling(seed.trie, String(args[3]), ctx)
+        bench_scaling(seed.trie, String(args[3]), ctx, profile=len(args) > 4 and String(args[4]) == "profile")
+        return
+    # --bench-cluster <corpus>: the same sweep under cluster mode against the
+    # REAL atlas trie (the full 4,166-sequence table), so dense emoji content
+    # resolves for real instead of probing a fixture's synthetic table.
+    if String(args[1]) == "--bench-cluster":
+        var real_trie = load_trie_blob(String(args[2]))
+        bench_scaling(real_trie, String(args[3]), ctx, cluster=True, profile=len(args) > 4 and String(args[4]) == "profile")
         return
     var total_bad = 0
     for i in range(1, len(args)):
@@ -895,19 +1355,24 @@ def main() raises:
     cases.append(70000)
     for ci in range(len(cases)):
         var nb = cases[ci]
+        # Each case in statics modes 0 and 2 — the fused path meets the spine
+        # too (mode 1 is bench-only instrumentation).
         var b1 = synthetic_case(seed.trie, nb, 0, 40, ctx)
+        b1 += synthetic_case(seed.trie, nb, 0, 40, ctx, smode=2)
         var b2 = synthetic_case(seed.trie, nb, 7, 23, ctx)
+        b2 += synthetic_case(seed.trie, nb, 7, 23, ctx, smode=2)
         # WRAP_BACK on the same spine path. Every WrapBack FIXTURE is single-super
         # (the largest is 5,212 bytes), so without this the mode's junction term
         # would never meet a chunk-level or super-level combine on device — the
         # same blind spot this synthetic case was written for, one parameter over.
         var b3 = synthetic_case(seed.trie, nb, 7, 23, ctx, WRAP_BACK)
+        b3 += synthetic_case(seed.trie, nb, 7, 23, ctx, WRAP_BACK, smode=2)
         var supers = ((nb + CHUNK - 1) // CHUNK + GROUP - 1) // GROUP
         print("  ", nb, "bytes,", supers, "supers — unwrapped", b1,
               "bad, wrapped", b2, "bad, wrapback", b3, "bad")
         total_bad += b1 + b2 + b3
 
     if total_bad == 0:
-        print("gpu pipeline: eight dispatches chained on device — counts exact, positions within 1e-4")
+        print("gpu pipeline: the device chain, statics modes 0+2+3 (+mode 3 chunked chain) — counts exact, statics bit-exact, positions within 1e-4")
     else:
         raise Error("gpu pipeline diverged")

@@ -250,7 +250,7 @@ def load() raises -> BenchIn:
         bm.append(bitcast[DType.float32](UInt32(u32_at(raw, at + (i * 4 + 2) * 4))))
         bc.append(UInt32(u32_at(raw, at + (i * 4 + 0) * 4)))
         bc.append(UInt32(u32_at(raw, at + (i * 4 + 3) * 4)))
-    return BenchIn(bytes^, Trie(bi^, bm^, bc^))
+    return BenchIn(bytes^, Trie(bi^, bm^, bc^, List[UInt32](), List[UInt32]()))
 
 
 struct BenchIn(Movable):

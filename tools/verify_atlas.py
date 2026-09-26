@@ -35,11 +35,11 @@ def read_u32(path):
     return list(struct.unpack(f"<{len(data)//4}I", data))
 
 
-def header(words, want_magic):
+def header(words, want_magic, want_versions=(1,)):
     magic = words[0].to_bytes(4, "little").decode("ascii")
     assert magic == want_magic, f"magic {magic!r} != {want_magic!r}"
     version, header_bytes = words[1], words[2]
-    assert version == 1, f"version {version} != 1"
+    assert version in want_versions, f"version {version} not in {want_versions}"
     assert header_bytes == (len(words) - 0) * 0 or True  # checked per-file below
     return version, header_bytes
 
@@ -149,18 +149,46 @@ check(primary_upem == fonts[0]["upem"], "primaryUpem == font[0].upem")
 # ── codepoints.bin ────────────────────────────────────────────────────────────
 print("codepoints.bin")
 w = read_u32(ATLAS / "codepoints.bin")
-header(w, "G3CP")
+ver, _ = header(w, "G3CP", want_versions=(2,))  # v2 = the sequence-pass sections
 block_shift, bi_len, block_count, stride, mapped, miss_adv, miss_h, trie_upem = w[3:11]
 check(block_shift == BLOCK_SHIFT and bi_len == 0x110000 >> BLOCK_SHIFT and stride == ENTRY_STRIDE,
       "trie constants (shift=8, index=4352, stride=4)")
 check(miss_adv == primary_adv and miss_h == primary_emh and trie_upem == primary_upem,
       "trie missing-advance/height/upem match glyphs.bin header")
+bitmap_adv, seq_count, seq_max, seq_off, class_off, class_words = w[11:17]
 o = w[2] // 4
 block_index = w[o: o + bi_len]
-blocks = w[o + bi_len:]
+check(seq_off == o + bi_len + block_count * 256 * ENTRY_STRIDE,
+      "sequence section appended right after the blocks")
+blocks = w[o + bi_len: seq_off]
 check(len(blocks) == block_count * 256 * ENTRY_STRIDE, "blocks length == blockCount*256*4")
 check(max(block_index) < block_count, "blockIndex entries < blockCount")
 check(block_index[0] != 0, "ASCII block 0 is mapped (not the missing block)")
+
+# v2 sections: sequences (sorted, slots = base + index) + classes (the G3CC
+# artifact verbatim — byte-equality with cluster-classes.bin is the provenance).
+check(bitmap_adv == 2 * primary_adv, "bitmapAdvanceFu == 2 x primary advance")
+seq_stride = 2 + seq_max
+check(seq_off + seq_count * seq_stride == class_off, "sequence section spans exactly to the class section")
+seq_rows = []
+for i in range(seq_count):
+    ro = seq_off + i * seq_stride
+    slot, ln = w[ro], w[ro + 1]
+    check(2 <= ln <= seq_max, f"sequence {i}: len {ln} in [2, seqMax]")
+    seq_rows.append((slot, ln, tuple(w[ro + 2: ro + 2 + ln])))
+check(all(seq_rows[i][2] < seq_rows[i + 1][2] for i in range(seq_count - 1)),
+      "sequence section sorted by codepoint sequence")
+check(all(seq_rows[i][0] == seq_rows[0][0] + i for i in range(seq_count)),
+      "sequence slots are base + index (the gen_real_trie.py rule)")
+fam = (0x1F468, 0x200D, 0x1F469, 0x200D, 0x1F467)
+fam_row = [r for r in seq_rows if r[2] == fam]
+check(len(fam_row) == 1 and fam_row[0][0] == 6819,
+      f"the family ZWJ sequence resolves to slot 6819 (got {fam_row}) — the pin from gen_real_trie.py")
+class_sec = w[class_off: class_off + class_words]
+check(class_sec[0] == 0x43433347, "class section is a G3CC table")
+g3cc = (ATLAS / "cluster-classes.bin").read_bytes()
+check(struct.pack(f"<{len(class_sec)}I", *class_sec) == g3cc,
+      "class section is byte-identical to cluster-classes.bin")
 
 
 def trie_lookup(cp):

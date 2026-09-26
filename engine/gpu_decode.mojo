@@ -16,7 +16,7 @@
 # Run: mojo run -I engine engine/gpu_decode.mojo engine/fixtures/*.pipe.bin
 
 from std.sys import argv, has_accelerator
-from std.gpu import global_idx
+from max.gpu import global_idx
 from max.gpu.host import DeviceContext
 from glyph_schema import (
     SM_STRIDE, SM_ADVANCE, SM_HEIGHT,

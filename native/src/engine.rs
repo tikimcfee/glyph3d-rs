@@ -1,6 +1,6 @@
 //! engine.rs — safe Rust wrapper over the Mojo glyph engine's C ABI (Stage D).
 //!
-//! This is the SUBSTRATE half of the Mojo backend: the extern block, the 128 B
+//! This is the SUBSTRATE half of the Mojo backend: the extern block, the 136 B
 //! item descriptor, the FP-contract probe, and the handle's lifetime. The
 //! layout CONTRACT it serves — `ItemParams`, `GlyphRecord`, `LayoutError` —
 //! lives in `layout.rs`, because all three backends share it and none of them
@@ -68,8 +68,8 @@ extern "C" {
     fn glyph_engine_copy_slots(handle: *mut c_void, out_ptr: *mut u32, out_len: usize)
         -> u64;
     // Stage E2: batched load — one call for a whole corpus. Descriptors are
-    // 128 B blocks (explicit byte layout documented in ffi.mojo): ten f64
-    // params, SEVEN i32 params, then u64 byte_start/byte_count.
+    // 136 B blocks (explicit byte layout documented in ffi.mojo): ten f64
+    // params, EIGHT i32 params, then u64 byte_start/byte_count.
     fn glyph_engine_load_items(
         handle: *mut c_void,
         blob_ptr: *const u8,
@@ -105,7 +105,7 @@ extern "C" {
     fn glyph_engine_instance_shape() -> u64;
 }
 
-/// Marshal item descriptors into the 128 B blocks the engine reads.
+/// Marshal item descriptors into the 136 B blocks the engine reads.
 ///
 /// ONE writer of that layout, shared by every entry that takes items. Written
 /// twice it would be the correlated-fault shape this tree keeps finding: two
@@ -152,17 +152,19 @@ pub const ENGINE_STAGE_NAMES: [&str; 14] = [
 
 /// Byte size of one item descriptor (see ffi.mojo's layout comment). BOTH load
 /// entries take one of these; there is no positional form any more.
-pub const ITEM_DESC_SIZE: usize = 128;
+/// 2026-09-20, the sequence pass: 128 -> 136 — the descriptor was FULL, and
+/// cluster_mode (the 8th i32) could not take pad. ABI_SHAPE moved with it.
+pub const ITEM_DESC_SIZE: usize = 136;
 
 /// How many i32 params ride inside the descriptor. Asserted against the actual
 /// array in `write_item_desc`, so the constant cannot drift from the code.
-pub const DESC_I32_COUNT: usize = 7;
+pub const DESC_I32_COUNT: usize = 8;
 
 /// Byte offset of the descriptor's shape word. FIXED, and that is the point: a
 /// sentinel in a positional argument list can be shifted out of alignment (and
 /// was, measurably — ffi.mojo has the numbers); one at a fixed offset in a
 /// fixed-size block cannot.
-const ABI_SHAPE_OFFSET: usize = 108;
+const ABI_SHAPE_OFFSET: usize = 112;
 
 /// The shape word itself, computed from THIS side's declarations. A dylib built
 /// from different source computes a different one and refuses the call.
@@ -170,7 +172,7 @@ const fn abi_shape() -> u32 {
     ((ITEM_DESC_SIZE as u32) << 8) | DESC_I32_COUNT as u32
 }
 
-/// Serialize one item's params + byte range into a 128 B descriptor block.
+/// Serialize one item's params + byte range into a 136 B descriptor block.
 /// Explicit offsets — shared verbatim with the Mojo side, no repr(C) guessing.
 /// The returned `Vec<u64>` backing keeps the block 8-byte aligned.
 pub fn write_item_desc(block: &mut [u8], params: &ItemParams, byte_start: u64, byte_count: u64) {
@@ -191,9 +193,10 @@ pub fn write_item_desc(block: &mut [u8], params: &ItemParams, byte_start: u64, b
     for (i, v) in f64s.iter().enumerate() {
         block[i * 8..i * 8 + 8].copy_from_slice(&v.to_le_bytes());
     }
-    // SEVEN i32s since the wrap mode joined them: 80..108, leaving 108..112 pad.
-    // The block stayed 128 B — 10 f64 + 7 i32 + 2 u64 is 124 — which is why
-    // ITEM_DESC_SIZE did not move. Asserted below rather than trusted.
+    // EIGHT i32s since the cluster mode joined them: 80..112. The block grew
+    // to 136 B for it — the descriptor was full (10 f64 + 7 i32 + 2 u64 = 124),
+    // so the sequence pass could not take pad the way the wrap mode did.
+    // Asserted below rather than trusted.
     let i32s = [
         params.wrap_width,
         params.has_page as i32,
@@ -202,12 +205,13 @@ pub fn write_item_desc(block: &mut [u8], params: &ItemParams, byte_start: u64, b
         params.scroll_rows,
         params.pages_wide,
         params.wrap_mode.code() as i32,
+        params.cluster_mode.code() as i32,
     ];
     // Derived from the array, not from a literal: adding an i32 without moving
-    // ITEM_DESC_SIZE would silently overwrite byte_start at 112.
+    // ITEM_DESC_SIZE would silently overwrite byte_start at 120.
     assert!(
-        80 + i32s.len() * 4 <= 112,
-        "{} i32 params overrun the descriptor's byte_start at 112",
+        80 + i32s.len() * 4 <= ABI_SHAPE_OFFSET,
+        "{} i32 params overrun the descriptor's shape word",
         i32s.len()
     );
     for (i, v) in i32s.iter().enumerate() {
@@ -222,8 +226,8 @@ pub fn write_item_desc(block: &mut [u8], params: &ItemParams, byte_start: u64, b
     );
     block[ABI_SHAPE_OFFSET..ABI_SHAPE_OFFSET + 4]
         .copy_from_slice(&abi_shape().to_le_bytes());
-    block[112..120].copy_from_slice(&byte_start.to_le_bytes());
-    block[120..128].copy_from_slice(&byte_count.to_le_bytes());
+    block[120..128].copy_from_slice(&byte_start.to_le_bytes());
+    block[128..136].copy_from_slice(&byte_count.to_le_bytes());
 }
 
 /// Assert the linked dylib was built with `--fp-mode contract=off`.
@@ -332,7 +336,7 @@ impl Engine {
     /// Run the pipeline for one text file. Results stay in the handle until
     /// the next load; pull them with [`Engine::read_back`].
     ///
-    /// Marshals the SAME 128 B descriptor the batched entry takes. It used to
+    /// Marshals the SAME 136 B descriptor the batched entry takes. It used to
     /// pass twenty positional arguments, and `wrap_mode` landing in the middle of
     /// them is what broke `--repo-verify` on 2026-09-04 against a stale dylib.
     /// One format means a new field takes descriptor pad instead of shifting a

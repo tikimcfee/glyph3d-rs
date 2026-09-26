@@ -21,8 +21,9 @@ all cores, off any frame budget.
 
 ## What holds it together
 
-- **The corpus is ours.** 25 fixtures rebuild byte-identical from vendored,
-  per-file-pinned inputs with no web repo present (gate `1b`). The JS oracle is
+- **The corpus is ours.** 34 fixtures (26 pipe + 8 bake) rebuild byte-identical
+  from vendored, per-file-pinned inputs with no web repo present (the fixtures
+  gate). The JS oracle is
   a spent correctness source; the web *target* is served by Rust→wasm.
 - **THE TWO ORACLES HAVE FORKED, deliberately, and this is the record of it.**
   `c9667ec` corrected `engine/fixtures/inputs/glyphPipelineReference.js` to
@@ -130,6 +131,12 @@ detail.
   flat layout), default 0.15 pinned in the CLI tests beside the wrap-mode
   default. Runtime re-tuning is the same shape of question as wrap-mode
   toggling below — the value is baked into `ItemParams` at load.
+- ~~**The sequence pass** (the `out/EMOJI.md` "later")~~ DONE (2026-09-20):
+  cluster mode resolves the font's sequences to single glyphs — the rule in
+  the oracle + engine + Rust twin, `.pipe.bin` v5, the 136 B descriptor,
+  `--cluster-mode`, and the emoji-cluster/repo-cluster golden pair. The GPU
+  kernel and general UAX #29 text clusters ride the proven transition-monoid
+  design when they land; the bake's tail fold learns it at bake v4.
 - **Runtime wrap-mode toggling.** A command-bus question, not a layout one:
   mode is baked into `ItemParams` at load, so toggling means re-running the fold
   (cheap — 0.04 s for 407k records, measured).
@@ -442,11 +449,13 @@ where nobody was looking.
 several sizes, discrete card — now with the knowledge that a fair CPU baseline
 is `run_pipeline` at realistic item counts, not `run_scan_pipeline` at one.
 
-**5. Emoji.** The atlas already carries 897 colour-bitmap slots with doubled
+**5. Emoji — DONE 2026-09-10 (the sheet + the `emoji` golden, `out/EMOJI.md`);
+the sequence pass followed 2026-09-20 (`engine/delta/cluster-mode.md`).**
+~~The atlas already carries 897 colour-bitmap slots with doubled
 advances; what was never exported is the pixel sheet. `emojiCell` is read in the
 vertex stage and never becomes a varying, so nothing can reach the fragment
 shader. The re-bake has no external dependency — `REF_ROOT` is vendored and the
-shaping crates are already compiled in.
+shaping crates are already compiled in.~~
 
 **6. The web target.** Cfg-gate the Mojo backend out, split lib from bin, clear
 the wasm blockers, and put `cargo check --target wasm32-unknown-unknown` in

@@ -46,7 +46,7 @@ Regenerating a committed artifact is a hand act with its own generator (the
 `build =` line on its artifact in build.toml), in dependency order, and the
 result is committed on purpose. This paragraph said "regenerates committed
 artifacts in place" until 2026-09-10; the code never did. `pixi run verify`
-builds nothing at all: it asserts currency and byte-compares. The four baseline PNGs are class **golden**: verified,
+builds nothing at all: it asserts currency and byte-compares. The baseline PNGs are class **golden**: verified,
 never built — the runner refuses. `pixi run build-native` is the one pixi
 `depends-on` edge (cargo after build-engine); the rest of the graph is
 artifact-level and lives in build.toml because pixi cannot see that cargo
@@ -155,9 +155,11 @@ downstream links a stale engine. A failed rebuild is FATAL (the battery stops):
 a stale dylib makes every gate below a statement about the wrong binary.
 
 **committed-artifacts** (was "1"). One mechanism per generator, all driven from
-build.toml: the trie (`gen_real_trie.py --verify-only`) and the schema
-(`gen_schema.py --check`, which also runs the schema's own tier validation) use
-generator-native check modes; the four atlas bins are rebuilt by
+build.toml: generator-native check modes for the schema (`gen_schema.py
+--check`, which also runs the schema's own tier validation), the emoji sheet
+(`gen_emoji_sheet.py --check`), the cluster class table (`gen_cluster_table.py
+--check`) and the emoji demo corpus (`gen_emoji_corpus.py --check`); the trie
+uses `gen_real_trie.py --verify-only`; the four atlas bins are rebuilt by
 `export-atlas.mjs` into a scratch dir and `cmp`'d. Red when a generated
 artifact is hand-edited, or a generator changes behaviour. Blind to
 whether the *inputs* are right: the trie check proves `engine-trie.bin` is a
@@ -174,9 +176,9 @@ happened here, and is caught today only by the fixtures gate.
 **fixtures** (was "1b"; part of the committed-artifacts gate in the runner).
 Rebuilds the corpus in a **scratch copy** of `engine/fixtures` (generators +
 vendored inputs + the `../glyph_schema.mjs` edge) and byte-compares against
-the committed 25 — the old gate deleted the committed fixtures in place and
+the committed 34 — the old gate deleted the committed fixtures in place and
 restored them with `git checkout`, which needed the restore to be exactly
-right. The expected counts (17 pipe + 8 bake) are **declared in build.toml**,
+right. The expected counts (26 pipe + 8 bake) are **declared in build.toml**,
 never derived from the tree under test: the old gate `ls`-counted the tree it
 was checking, so a deleted fixture lowered both sides of the comparison and
 stayed green (measured 2026-09-06: eleven of twelve gates green on a shrunken
@@ -185,7 +187,7 @@ count in build.toml and hard pin in the test suite are two independent
 witnesses, not duplicate coverage. Blind to whether the oracle is *correct* —
 it proves reproducibility, not truth.
 
-**engine-suites** (was "2"). Sixteen suites — 11 CPU, 5 on Metal — plus
+**engine-suites** (was "2"). Eighteen suites — 12 CPU, 6 on Metal — plus
 **ffi_selftest** (wired 2026-09-06; it links the SHIPPED dylib through the real
 C ABI after the pinned toolchain was found to miscompile the in-process import
 — see its header), plus a compile pass over all six benches (compiled, never
@@ -233,12 +235,12 @@ load-bearing part of why the old check could not fail, so it is stated as of
 not at all. Verified 2026-09-06: marking three tests `#[ignore]`
 left the old check printing `PASS tests green` and the new one printing
 `FAIL — 82 tests ran, floor is 85`. This is also the check that holds the two
-corpus-size pins (`native/src/fixture.rs`, 17 pipe; `native/src/bake.rs`, 8 bake,
+corpus-size pins (`native/src/fixture.rs`, 26 pipe; `native/src/bake.rs`, 8 bake,
 both worded "update deliberately"), so until now corpus protection rested on
 those tests continuing to run with nothing asserting that they did. The realistic
 loss was never deletion — it is a dropped `mod` declaration or an `#[ignore]`
 that outlives its reason, neither of which rustc says a word about. **This matters more than it looks**, because the pins that keep
-the fixture corpus from silently shrinking (`native/src/fixture.rs`, 17 pipe;
+the fixture corpus from silently shrinking (`native/src/fixture.rs`, 26 pipe;
 `native/src/bake.rs`, 8 bake — both worded "update deliberately") live inside
 this check. They protect the corpus; nothing yet protects them.
 
@@ -339,6 +341,18 @@ analytic coverage, and two rasterizers' filters need not agree to the bit.
 The alpha contract those pixels rest on is stated once, in the shader header
 of `glyph_field.wgsl`, so a platform whose emoji edges differ while its text
 does not has a checklist.
+`emoji-cluster` and `repo-cluster` (2026-09-20) pin the SEQUENCE PASS — one
+frame per path: the former through `--render-file` (the CPU staging twin),
+the latter through `--load-repo` (the engine end to end). One line per
+sequence class the trie resolves (families, flags, skin tones, keycaps, tag
+flags) plus the fallbacks (unlisted chains stay pieces, ZWJ/VS16 zero-width);
+the `cluster-static-zero-off` and `cluster-trailer-advance-one` mutations
+prove they redden. The `emoji` view pins LEADER mode by hand — its fixture
+is immutable, and the default flipped to cluster on 2026-09-22, so its
+command carries `--cluster-mode leader` explicitly and the pairing now reads
+one level up: the default gets its pixel coverage from the unpinned repo
+views (g-pick-repo carries no sequences — the flip moves no pixel there),
+and leader stays pinned here.
 Known cost of the fix, measured: in the dense far region of `repo-down`,
 ~1,400 of 1.6M pixels lose a little ink where coplanar quads overlap and the
 later fragment's interpolated depth lands an ulp behind — the price of a
@@ -380,10 +394,10 @@ still exist, not that the sentence around them is current.
 answers, with the volumes it currently clears — quote these when you change it,
 because a count that quietly drops is how this check would go vacuous without
 going red: parse parity (Rust's fixture loader versus Mojo's over parsed typed
-values — 17 fixtures, 11 section checksums each), the trie rebuilt from raw
-bytes (17 fixtures, 13,568 entries), the full serial fold over every lane of
-every byte (155,136 leaders, 1,872,012 lanes), the scan form across 8 tunings
-(17 × 8 = 136 cases, 1,187,896 leader-lanes bit-exact and 53,192 within 1e-4),
+values — 26 fixtures, 11 section checksums each), the trie rebuilt from raw
+bytes (26 fixtures, 23,552 entries), the full serial fold over every lane of
+every byte (155,222 leaders, 1,874,328 lanes), the scan form across 8 tunings
+(26 × 8 = 208 cases, 1,188,024 leader-lanes bit-exact and 53,752 within 1e-4),
 the bake and its seed protocol (8 fixtures, 27,315 leaders, 167 checkpoints,
 530 queries), and `text.rs`'s independent fold over its declared domain
 (4 fixtures, 5,332 records, 47,988 lanes). Two of these carry
@@ -402,7 +416,7 @@ and the union is not:
   `engine/check.sh` on 2026-09-06 (it had been red for an unknown time — the
   pinned toolchain miscompiled the in-process `ffi` import in executable
   codegen, so it now links the SHIPPED dylib and genuinely crosses the
-  boundary). It skips the three multi-item fixtures by design; batched-entry
+  boundary). It skips the five multi-item fixtures by design; batched-entry
   coverage is repo-verify. The toolchain miscompile class itself is not pinned
   by anything else: gate engine-check uses a (0,0,0) origin and is blind to
   exactly the `origin_x` read that broke.
@@ -465,7 +479,9 @@ with a number against it.
 |---|---|---|
 | `assets/atlas/{curves,glyphmap,glyphs,codepoints}.bin` | generated | `tools/export-atlas.mjs` from `tools/vendor/ref` AND `emoji-sheet.bin` (the emoji slots after the web's 4,431); hand-edits are reverted by the next rebuild-and-compare |
 | `assets/atlas/emoji-sheet.bin` | generated | `tools/gen_emoji_sheet.py` from the vendored Noto Color Emoji; regenerate it BEFORE the atlas bins, which read it |
+| `assets/atlas/cluster-classes.bin` | generated | `tools/gen_cluster_table.py` from the vendored UCD — the class table every cluster-mode implementation reads; regenerate BEFORE the atlas bins, which carry it verbatim |
 | `assets/atlas/engine-trie.bin` | generated | `tools/gen_real_trie.py` |
+| `native/fixtures/emoji-corpus-{small,large}.txt` | generated | `tools/gen_emoji_corpus.py` from `codepoints.bin`'s v2 sequence section — the cluster demo corpus; a demo asset, not a golden input |
 | `engine/glyph_schema.{mojo,mjs}` | generated | `tools/gen_schema.py` from `schema/glyph-identity.json` — **two** edges leave the schema; editing it invalidates the corpus as well as the dylib |
 | `tools/vendor/` | vendored, hash-pinned | `vendor-manifest.py --check`; upstream drift is information, not failure |
 | `schema/glyph-identity.json` | vendored verbatim | drift means an upstream refresh, not a local edit |

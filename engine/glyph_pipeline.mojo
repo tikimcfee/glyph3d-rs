@@ -41,6 +41,8 @@ from glyph_schema import (
     LC_STRIDE, LC_ROW, LC_COL,
     FIXTURE_MEASURE_STRIDE, FIXTURE_COUNT_STRIDE,
 )
+from glyph_cluster import resolve_clusters
+from cluster_split import probe_clusters, chain_clusters
 
 # ── Lane layout: GENERATED, six arrays, split twice ─────────────────────────
 # Who WRITES a lane decides where it lives; who READS it decides whether it
@@ -52,6 +54,11 @@ comptime F_LEADER = 1
 comptime F_RENDERED = 2
 comptime F_NEWLINE = 4
 comptime F_MISSING = 8
+# The sequence pass's trailer: the leader keeps its record but its glyph and
+# advance moved into the cluster head. Also marks the unmatched
+# invisible-by-design characters (ZWJ/VS/tags) the pass zeroes in place.
+# Distinct from F_MISSING: a trailer's content RESOLVED; a miss was never found.
+comptime F_CLUSTER_TRAILER = 16
 
 comptime NEWLINE = 0x0A
 
@@ -81,14 +88,33 @@ struct Trie(Copyable, Movable):
     var block_index: List[UInt32]
     var blocks_m: List[Float32]  # TM_STRIDE per entry: ADVANCE, HEIGHT
     var blocks_c: List[UInt32]   # TC_STRIDE per entry: GLYPH_ID, FLAGS
+    # The sequence pass (v2 trie blobs): the sequence section's raw words
+    # ([slot, len, cps..] x sequenceCount, sorted by sequence) and the G3CC
+    # class table VERBATIM (its own header included). Empty for v1 blobs and
+    # every fixture trie — cluster resolution treats empty as "no sequences",
+    # which is exactly the leader behavior. The lookup logic lives in
+    # glyph_cluster.mojo; these are just the carried bytes.
+    var seq: List[UInt32]
+    var classes: List[UInt32]
+    # The sequence entry stride is 2 + seq_max; seq_max is 0 when seq is empty.
+    var seq_max: Int
+    # The advance a resolved cluster head carries (the bitmap 2x cell, in this
+    # trie's world units). Meaningful only when seq is non-empty; 0 reads as
+    # "no sequences" because the pass early-returns on an empty table.
+    var bitmap_advance: Float32
 
     def __init__(
         out self, var block_index: List[UInt32],
         var blocks_m: List[Float32], var blocks_c: List[UInt32],
+        var seq: List[UInt32], var classes: List[UInt32],
     ):
         self.block_index = block_index^
         self.blocks_m = blocks_m^
         self.blocks_c = blocks_c^
+        self.seq = seq^
+        self.classes = classes^
+        self.seq_max = 0
+        self.bitmap_advance = Float32(0)
 
     def advance_at(self, entry: Int) -> Float32:
         return self.blocks_m[entry * TM_STRIDE + TM_ADVANCE]
@@ -127,6 +153,14 @@ struct Trie(Copyable, Movable):
 comptime WRAP_DOWN: Int = 0
 comptime WRAP_BACK: Int = 1
 
+# THE CLUSTER MODES — an ITEM-LEVEL parameter, exactly like the wrap mode.
+# CLUSTER_LEADER (0): one glyph per UTF-8 leader (the corpus's pinned behavior).
+# CLUSTER_CLUSTER (1): the sequence pass — a sequence the font draws as ONE
+# glyph resolves to its slot; trailing leaders become zero-advance drops.
+# Records stay per leader either way: ROW/COL and the witness lanes do not move.
+comptime CLUSTER_LEADER: Int = 0
+comptime CLUSTER_CLUSTER: Int = 1
+
 
 struct Item(Copyable, Movable):
     """One file in the arena: byte range + layout params. line_height is REQUIRED —
@@ -140,6 +174,9 @@ struct Item(Copyable, Movable):
     var wrap_mode: Int    # WRAP_DOWN | WRAP_BACK — item-level, exactly like the
                           # wrap width, and see WRAP_BACK's comment for why that
                           # is load-bearing rather than incidental.
+    var cluster_mode: Int # CLUSTER_LEADER | CLUSTER_CLUSTER — item-level, the
+                          # same kind of parameter again. 2026-09-20, the
+                          # sequence pass.
     var z_step: Float64   # 2026-08-31: five integer page-geometry params were
     var line_height: Float64  # declared 'measure' because the table holding them
     var has_page: Bool        # was NAMED measures; truncation now happens ONCE,
@@ -161,6 +198,7 @@ struct Item(Copyable, Movable):
         self.origin_z = 0
         self.wrap_width = 0
         self.wrap_mode = WRAP_DOWN
+        self.cluster_mode = CLUSTER_LEADER
         self.z_step = 0
         self.line_height = 0
         self.has_page = False
@@ -254,6 +292,12 @@ struct Slots(Copyable, Movable):
 
     def set_glyph_id(self, id: Int, v: UInt32):
         self.gi[unsafe_offset=id] = v
+
+    def set_advance(self, id: Int, v: Float32):
+        """One f32 store to the ADVANCE lane alone — the sequence pass's
+        head/trailer write (set_static's 8-byte pair would clobber HEIGHT,
+        which the oracle leaves standing)."""
+        self.sm[unsafe_offset = id * SM_STRIDE + SM_ADVANCE] = v
 
     def advance(self, id: Int) -> Float32:
         return self.sm[unsafe_offset = id * SM_STRIDE + SM_ADVANCE]
@@ -380,7 +424,11 @@ comptime ST_MISSCAT = 3    # concatenate shard miss lists — SERIAL by contract
 comptime ST_FOLD = 4       # the fold proper: serial per item, items in parallel
 comptime ST_PAGINATE = 5   # page remap, stride derived from the fold scalars
 comptime ST_BOUNDS = 6     # per-item boxes + batch union
-comptime ST_COUNT = 7
+# ST_CLUSTER RUNS between decode and the fold but sits at index 7: appending
+# keeps every existing lane's index stable, and the Rust side's names array
+# mirrors the lane order (engine.rs's ENGINE_STAGE_NAMES).
+comptime ST_CLUSTER = 7    # the sequence pass: per item, decode -> fold
+comptime ST_COUNT = 8
 
 
 struct PipelineResult(Copyable, Movable):
@@ -1149,7 +1197,7 @@ def shard_lo(start: Int, stop: Int, workers: Int, w: Int) -> Int:
     return a if a < stop else stop
 
 
-def run_pipeline[o: ImmOrigin, witness: Bool = True](
+def run_pipeline[o: ImmOrigin, witness: Bool = True, cluster_split: Bool = False](
     bytes: Span[UInt8, o], trie: Trie, items: List[Item]
 ) -> PipelineResult:
     """Fold into a FRESH result. The allocating shape, and the one every suite
@@ -1158,13 +1206,18 @@ def run_pipeline[o: ImmOrigin, witness: Bool = True](
     The two are one implementation, not two paths: this allocates and delegates.
     A chunked driver reusing one scratch across chunks must get bit-identical
     output to a single whole-corpus call, and the only way to be sure of that is
-    for there to be nothing to diverge."""
+    for there to be nothing to diverge.
+
+    `cluster_split` (comptime, default False — production runs the serial rule) swaps
+    the sequence pass's resolver for the two-pass probe+chain decomposition
+    (cluster_split.mojo), the form the device kernels port. conformance_split
+    proves the swap bit-identical over the whole corpus."""
     var r = PipelineResult()
-    run_pipeline_into[witness=witness](r, bytes, trie, items)
+    run_pipeline_into[witness=witness, cluster_split=cluster_split](r, bytes, trie, items)
     return r^
 
 
-def run_pipeline_into[o: ImmOrigin, witness: Bool = True](
+def run_pipeline_into[o: ImmOrigin, witness: Bool = True, cluster_split: Bool = False](
     mut r: PipelineResult, bytes: Span[UInt8, o], trie: Trie, items: List[Item]
 ):
     """The whole pipeline — the oracle's runPipeline, natively, sharded across
@@ -1264,6 +1317,41 @@ def run_pipeline_into[o: ImmOrigin, witness: Bool = True](
             misses.append(miss_scratch[a + k])
 
     r.stage_ns[ST_MISSCAT] = perf_counter_ns() - _t
+    _t = perf_counter_ns()
+
+    # ── THE SEQUENCE PASS: per item, between decode and the fold, so the
+    #    trailer lanes are rewritten before any advance sum reads them. Serial
+    #    within an item (the rule is a left-to-right walk), items in parallel
+    #    — the same disjoint-range discipline as the fold. No dispatch at all
+    #    when no item opts in: leader-mode runs pay one item scan, not a pass.
+    var any_cluster = False
+    for i in range(len(items)):
+        if items[i].cluster_mode == CLUSTER_CLUSTER:
+            any_cluster = True
+            break
+    if any_cluster:
+        comptime if cluster_split:
+            # The two-pass form under test: probe writes candidates, the chain
+            # commits. One shared cand buffer pair — items tile the blob, so
+            # per-item writes never share a byte.
+            var cand_slot = List[UInt32](length=byte_len, fill=0)
+            var cand_end = List[UInt32](length=byte_len, fill=0)
+            var cs = cand_slot.unsafe_ptr().unsafe_origin_cast[MutUntrackedOrigin]()
+            var ce = cand_end.unsafe_ptr().unsafe_origin_cast[MutUntrackedOrigin]()
+
+            def _cluster_task_split(i: Int) {imm}:
+                if items[i].cluster_mode == CLUSTER_CLUSTER:
+                    probe_clusters(bytes, slots, trie, items[i], cs, ce)
+                    chain_clusters(bytes, slots, trie, items[i], cs, ce)
+            parallelize(_cluster_task_split, len(items))
+            _ = len(cand_slot)
+            _ = len(cand_end)
+        else:
+            def _cluster_task(i: Int) {imm}:
+                if items[i].cluster_mode == CLUSTER_CLUSTER:
+                    resolve_clusters(bytes, slots, trie, items[i])
+            parallelize(_cluster_task, len(items))
+    r.stage_ns[ST_CLUSTER] = perf_counter_ns() - _t
     _t = perf_counter_ns()
 
     # ── THE FOLD: serial per item, items in parallel (disjoint ranges) ────────

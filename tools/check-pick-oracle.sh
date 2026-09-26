@@ -174,7 +174,7 @@ FIX=$FIX_SAVED
 echo "── native/src: oracle-asserted picks across files/depths ──────"
 OUT=$($BIN --load-repo "$REPO" --screenshot "$SCRATCH/js.png" \
   --pick-file text.rs --pick-row 0 --pick-col 0 \
-  --pick-file text.rs --pick-row 12 --pick-col 7 \
+  --pick-file text.rs --pick-row 13 --pick-col 7 \
   --pick-file engine.rs --pick-row 5 --pick-col 2 \
   --pick-file glyph_scene.rs --pick-row 40 --pick-col 11 \
   --pick-file gpu.rs --pick-row 1 --pick-col 0 \
@@ -194,7 +194,7 @@ js_check() { # relfile row col
     fi
 }
 js_check text.rs 0 0
-js_check text.rs 12 7
+js_check text.rs 13 7
 js_check engine.rs 5 2
 js_check glyph_scene.rs 40 11
 js_check gpu.rs 1 0

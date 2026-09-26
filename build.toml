@@ -25,7 +25,7 @@
 # Ratchet, NOT an equality: tests are added constantly, so an exact pin would
 # redden on the most common good action in the repo. A green run whose real
 # count exceeds the floor prints a NOTE naming the value to raise it to.
-test_floor = 116
+test_floor = 119
 
 # ── Products ─────────────────────────────────────────────────────────────
 
@@ -84,13 +84,22 @@ build = "pixi run gen-emoji-sheet"
 verify_cmd = "pixi run python tools/gen_emoji_sheet.py --check"
 note = "Generator-native check mode; fontTools lives in the pixi env. The font is pinned by fetch hash in vendor-manifest.py."
 
-# Regeneration is by hand and ORDERED: emoji-sheet, then atlas (reads the
-# sheet to append the emoji slots), then engine-trie (reads codepoints.bin).
+[artifact.cluster-classes]
+class = "committed"
+outputs = ["assets/atlas/cluster-classes.bin"]
+inputs = ["tools/gen_cluster_table.py", "tools/vendor/third-party/unicode-ucd/*.txt"]
+build = "python3 tools/gen_cluster_table.py"
+verify_cmd = "python3 tools/gen_cluster_table.py --check"
+note = "Grapheme-cluster class table, generated from the vendored UCD (never hand-written). Carried verbatim into both tries for the general UAX #29 phase; the landed sequence pass reads no classes by design — tests are its only readers today."
+
+# Regeneration is by hand and ORDERED: cluster-classes (from the vendored UCD)
+# and emoji-sheet (from the vendored font) first — the atlas reads BOTH — then
+# engine-trie (reads codepoints.bin).
 # `glyph build` verifies these; it does not run the chain.
 [artifact.atlas]
 class = "committed"
 outputs = ["assets/atlas/curves.bin", "assets/atlas/glyphmap.bin", "assets/atlas/glyphs.bin", "assets/atlas/codepoints.bin"]
-inputs = ["tools/export-atlas.mjs", "tools/vendor/ref/**/*", "tools/vendor/hb.cjs", "tools/vendor/hb.wasm", "assets/atlas/emoji-sheet.bin"]
+inputs = ["tools/export-atlas.mjs", "tools/vendor/ref/**/*", "tools/vendor/hb.cjs", "tools/vendor/hb.wasm", "assets/atlas/emoji-sheet.bin", "assets/atlas/cluster-classes.bin"]
 build = "node tools/export-atlas.mjs"
 verify_scratch = "node tools/export-atlas.mjs --out {scratch}"
 note = "No generator-native check mode; the runner rebuilds to scratch and cmps. Self-aborts before writing if fonts/ranges drift. Slots 0..4430 are the web bake verbatim; the emoji slots after them come from emoji-sheet.bin."
@@ -104,8 +113,16 @@ build = "cd engine/fixtures && node gen.mjs && node gen-bake.mjs"
 # gen.mjs imports) so the committed corpus is never deleted mid-check — the
 # old gate deleted all 25 fixtures in place and restored them with git
 # checkout. Counts are DECLARED, not ls-derived from the tree under test.
-counts = { "pipe" = 17, "bake" = 8 }
+counts = { "pipe" = 26, "bake" = 8 }
 note = "The Rust-side corpus pins (fixture.rs / bake.rs, 'update deliberately') stay; they and these declared counts are two independent witnesses, not duplicates."
+
+[artifact.emoji-corpus]
+class = "committed"
+outputs = ["native/fixtures/emoji-corpus-small.txt", "native/fixtures/emoji-corpus-large.txt"]
+inputs = ["tools/gen_emoji_corpus.py", "assets/atlas/codepoints.bin"]
+build = "python3 tools/gen_emoji_corpus.py"
+verify_cmd = "python3 tools/gen_emoji_corpus.py --check"
+note = "The cluster demo corpus, generated from codepoints.bin's v2 sequence section: the large file carries every table sequence exactly once (asserted at bake), the small one is the one-line-per-class quick check. A demo asset, not a golden input — emoji-cluster/repo-cluster pin the mechanism; this pins the corpus against the table moving. --check-render (manual) diffs the renderer's staged counts against the generator's simulator."
 
 # ── Goldens ──────────────────────────────────────────────────────────────
 # Verified, NEVER built. These byte-equal screenshots are the only PIXEL
@@ -138,8 +155,10 @@ outputs = [
   "out/tooling-ab/baseline/{gpu}/repo-down.png",
   "out/tooling-ab/baseline/{gpu}/repo-back-oblique.png",
   "out/tooling-ab/baseline/{gpu}/emoji.png",
+  "out/tooling-ab/baseline/{gpu}/emoji-cluster.png",
+  "out/tooling-ab/baseline/{gpu}/repo-cluster.png",
 ]
-inputs = ["target/release/glyph3d-native", "native/fixtures/baseline-view.txt", "native/fixtures/emoji-view.txt", "native/fixtures/g-pick-repo/**/*", "assets/atlas/emoji-sheet.bin"]
+inputs = ["target/release/glyph3d-native", "native/fixtures/baseline-view.txt", "native/fixtures/emoji-view.txt", "native/fixtures/emoji-cluster-view.txt", "native/fixtures/g-pick-repo/**/*", "native/fixtures/g-cluster-repo/**/*", "assets/atlas/emoji-sheet.bin"]
 note = "Blind to everything outside these frames, and cannot distinguish a regression from an intentional change. One set per rasterizer ({gpu}); a set only ever proves the renderer on the hardware that made it. empty.rs in g-pick-repo is zero bytes ON PURPOSE (the only input reaching the page-extent origin seed)."
 
 # Per-view render commands (run from native/, screenshot into {scratch}).
@@ -178,10 +197,26 @@ cmd = "--load-repo fixtures/g-pick-repo --frames 2 --cam-pose 30 -120 60 0 -12"
 # through the CPU staging path and the shader's mode-1 branch. The only frame
 # that samples the emoji sheet, so the only one that can see it; expect more
 # cross-vendor drift here than on text (filtered sampling is not analytic
-# coverage). `emoji-uv-flip` proves it reddens.
+# coverage). `emoji-uv-flip` proves it reddens. It pins `--cluster-mode
+# leader` by hand: since the 2026-09-22 default flip, the unpinned views all
+# render cluster mode.
 [[golden_view]]
 name = "emoji"
-cmd = "--render-file fixtures/emoji-view.txt --frames 2 --zoom 1.25"
+cmd = "--render-file fixtures/emoji-view.txt --frames 2 --zoom 1.25 --cluster-mode leader"
+# The sequence pass, on the CPU staging path: cluster-mode rendering of every
+# sequence class the trie resolves (families, flags, skin tones, keycaps, tag
+# flags) plus the fallbacks (pieces for unlisted chains, zero-width ZWJ). Its
+# leader twin is emoji.png, which KEEPS pinning leader mode — the fixture is
+# immutable and the mode flag in its cmd is what makes the split explicit at
+# the flip, whenever that comes.
+[[golden_view]]
+name = "emoji-cluster"
+cmd = "--render-file fixtures/emoji-cluster-view.txt --frames 2 --zoom 1.25 --cluster-mode cluster"
+# The engine path twin: a tiny repo whose files carry the same classes through
+# --load-repo (the FFI + engine resolve them end to end).
+[[golden_view]]
+name = "repo-cluster"
+cmd = "--load-repo fixtures/g-cluster-repo --frames 2 --cluster-mode cluster"
 
 # ── Gates ────────────────────────────────────────────────────────────────
 # `scope` answers "I changed X, what should I run" — the question the CLI is
@@ -211,7 +246,7 @@ blind_to = "whether the declared inputs are the RIGHT ones — it proves a patte
 [[gate]]
 name = "committed-artifacts"
 scope = "corpus"
-kind = "verify-committed"   # glyph-schema, engine-trie, atlas, fixtures
+kind = "verify-committed"   # glyph-schema, emoji-sheet, cluster-classes, emoji-corpus, engine-trie, atlas, fixtures
 needs = []
 compare = "each committed artifact rebuilt (scratch or generator check mode) vs its committed bytes"
 blind_to = "whether the INPUTS are right — reproducibility, not truth"
@@ -231,7 +266,7 @@ scope = "engine"
 kind = "cmd"
 cmd = "./engine/check.sh all"
 needs = ["fixtures"]
-compare = "16 Mojo conformance suites + ffi_selftest + 3 instruments vs the fixture corpus, CPU and Metal"
+compare = "18 Mojo conformance suites + ffi_selftest + 3 instruments vs the fixture corpus, CPU and Metal"
 blind_to = "faults shared by the serial and scan forms in conformance_real (oracle-free by design); the instruments print but assert nothing"
 
 [[gate]]
@@ -367,7 +402,7 @@ gate = "committed-artifacts"
 why = "a generator case list losing an entry must not lower coverage silently"
 file = "engine/fixtures/gen.mjs"
 op = "replace"
-expect = "declares 17"
+expect = "declares 26"
 with = ""
 find = '''
     {
@@ -385,6 +420,24 @@ file = "engine/fixtures/ascii-basic.pipe.bin"
 op = "append"
 arg = " "
 expect = "differs from the committed fixture"
+
+[[mutation]]
+name = "cluster-classes-byte"
+gate = "committed-artifacts"
+why = "the class table is generated from vendored UCD and a hand-edit must not survive; same class as emoji-sheet-byte, for the artifact every cluster-mode implementation reads"
+file = "assets/atlas/cluster-classes.bin"
+op = "append"
+arg = " "
+expect = "differs from a fresh bake"
+
+[[mutation]]
+name = "emoji-corpus-byte"
+gate = "committed-artifacts"
+why = "the demo corpus is generated from the shipped sequence table; a hand-edit to a corpus file must not survive a fresh bake, or the demo drifts from the table it claims to demonstrate"
+file = "native/fixtures/emoji-corpus-small.txt"
+op = "append"
+arg = " "
+expect = "differs from a fresh bake"
 
 [[mutation]]
 name = "emoji-sheet-byte"
@@ -437,6 +490,76 @@ expect = "Coverage DROPPED"
 # consumer is recorded in each `why`.
 
 [[mutation]]
+name = "gpu-cluster-phantom-commit"
+gate = "engine-suites"
+why = "the device chain's phantom suppression is the commit's resume-past-span, exactly as in the CPU split — advancing past the head only re-walks the span and the phantom candidate inside it fires. The device twin of cluster-split-phantom-commit; if only one of the pair ever fires, the two chains have drifted. (gpu_pipeline runs before gpu_cluster in the GPU list, so its error surfaces first.)"
+file = "engine/cluster_device.mojo"
+rebuild = "pixi run build-engine"
+op = "replace"
+find = "            id = end  # the span's members are written; resume past it"
+with = "            id += nb"
+expect = "gpu pipeline diverged"
+
+[[mutation]]
+name = "gpu-pipeline-probe-zero"
+gate = "engine-suites"
+why = "the anti-vacuity pin for the integration: the probe dispatch must be LIVE in gpu_pipeline's device chain — with candidate writes removed, nothing resolves and the cluster fixtures' resolved lanes never happen. If gpu_pipeline ever reverts to uploading pre-resolved lanes (or the dispatch drops), this is the mutation that says so."
+file = "engine/cluster_device.mojo"
+rebuild = "pixi run build-engine"
+op = "replace"
+find = """        cand_slot[unsafe_offset=id] = best_slot
+        cand_end[unsafe_offset=id] = UInt32(p2)"""
+with = """        cand_slot[unsafe_offset=id] = 0
+        cand_end[unsafe_offset=id] = UInt32(p2)"""
+expect = "gpu pipeline diverged"
+
+[[mutation]]
+name = "gpu-fused-probe-zero"
+gate = "engine-suites"
+why = "the fused-path twin of gpu-pipeline-probe-zero: k_decode_probe's candidate writes are what make the fused dispatch LIVE in the suite's mode 2. With them zeroed, mode 0 stays green and only the fused comparison reddens — so the pair together proves BOTH probe forms are wired into the chain. The 16-space indent (inside `comptime if walk:`'s else branch) is what distinguishes the fused copy from k_cluster_probe's; if the fused dispatch ever drops from the chain while the suite claims modes 0+2, this is the mutation that says so."
+file = "engine/cluster_device.mojo"
+rebuild = "pixi run build-engine"
+op = "replace"
+find = """                cand_slot[unsafe_offset=id] = best_slot
+                cand_end[unsafe_offset=id] = UInt32(p2)"""
+with = """                cand_slot[unsafe_offset=id] = 0
+                cand_end[unsafe_offset=id] = UInt32(p2)"""
+expect = "gpu pipeline diverged"
+
+[[mutation]]
+name = "gpu-walk-probe-zero"
+gate = "engine-suites"
+why = "the state walk's anti-vacuity pin: with its candidate writes removed, modes 0 and 2 stay green and only mode 3's comparison reddens — proving the walk dispatch is LIVE in the suite, the twin of gpu-pipeline-probe-zero and gpu-fused-probe-zero. The walk's `last_slot` store is distinct from the search form's `best_slot` store, so the three mutations can never land on each other's copies."
+file = "engine/cluster_device.mojo"
+rebuild = "pixi run build-engine"
+op = "replace"
+find = "                cand_slot[unsafe_offset=id] = last_slot"
+with = "                cand_slot[unsafe_offset=id] = 0"
+expect = "gpu pipeline diverged"
+
+[[mutation]]
+name = "gpu-chunk-chain-phantom"
+gate = "engine-suites"
+why = "the chunked chain's phantom suppression is the commit's greedy guard over the compact list: a candidate whose start lies inside the last committed span is never read, exactly the serial rule's resume. Committing unconditionally re-walks the span and the phantom candidate inside it fires (cluster-overlap). Reddens only the suite's mode-3-chain-1 run — the serial chain's own mutation (gpu-cluster-phantom-commit) keeps its distinct find string."
+file = "engine/cluster_device.mojo"
+rebuild = "pixi run build-engine"
+op = "replace"
+find = "                if s >= ce:"
+with = "                if s >= 0:"
+expect = "gpu pipeline diverged"
+
+[[mutation]]
+name = "cluster-split-phantom-commit"
+gate = "engine-suites"
+why = "the chain's phantom suppression is the commit's resume-past-span: with (A C) and (C A) both in the table, 🇦🇨🇦 must keep its lone A. Advancing past the head only re-walks the span, and the phantom candidate inside it fires — conformance_split reddens. CONSUMED BY: cluster-overlap.pipe.bin, the fixture that exists for exactly this. (The first form of this mutation dropped the carry GUARD; the resume's landing made that guard a loop invariant, and the review pass caught the mutation going vacuous — bf0a117 never re-ran prove.)"
+file = "engine/cluster_split.mojo"
+rebuild = "pixi run build-engine"
+op = "replace"
+find = "            id = end  # the span's members are written; resume past it"
+with = "            id += n"
+expect = "split-form conformance failed"
+
+[[mutation]]
 name = "phantom-row"
 gate = "engine-suites"
 why = "the 2026-09-04 phantom row: a wrap rule that counts the terminating newline's own row steals a blank row whenever wrap divides the line length exactly, and the two rules agree at every other length. CONSUMED BY: wrap-exact (lines of 4/8/12 at wrap 4 — the fixture exists for this), wrap-emoji and real-kernels; 3 of 17 cases, 178,916 mismatches."
@@ -465,8 +588,8 @@ why = "the descriptor's i32 arity moves on the ENGINE side while a foreign calle
 file = "engine/ffi.mojo"
 rebuild = "pixi run build-engine"
 op = "replace"
-find = "comptime ABI_DESC_I32S: Int = 7                # i32 params inside that block"
-with = "comptime ABI_DESC_I32S: Int = 6                # i32 params inside that block"
+find = "comptime ABI_DESC_I32S: Int = 8                # i32 params inside that block"
+with = "comptime ABI_DESC_I32S: Int = 7                # i32 params inside that block"
 expect = "load_item status 9"
 
 [[mutation]]
@@ -574,6 +697,28 @@ find = "        let t = vec2<f32>(c.x, 1.0 - c.y);"
 with = "        let t = vec2<f32>(c.x, c.y);"
 expect = "emoji.png diverges from baseline"
 rebuild = "cargo build --release"
+
+[[mutation]]
+name = "cluster-static-zero-off"
+gate = "pixel-ab"
+why = "the invisible-by-design rule off: ZWJ / variation selectors / tags occupy full cells again — the sequence pass's fallback state moves, which is exactly what the emoji-cluster frame exists to see. CONSUMED BY: emoji-cluster.png's lone-zwj/VS16 line"
+file = "native/src/text.rs"
+op = "replace"
+find = "            if crate::fold::is_static_zero_cp(cp) {"
+with = "            if false && crate::fold::is_static_zero_cp(cp) {"
+expect = "emoji-cluster.png diverges from baseline"
+rebuild = "cargo build --release"
+
+[[mutation]]
+name = "cluster-trailer-advance-one"
+gate = "pixel-ab"
+why = "trailers at advance 1 instead of 0: the cluster's neighbors shift right by one cell per trailer — the fold reading the resolved statics is the thing repo-cluster pins. The binary loads the dylib at runtime by rpath, so the dylib rebuild alone carries the change. CONSUMED BY: repo-cluster.png"
+file = "engine/glyph_cluster.mojo"
+op = "replace"
+find = "                    slots.set_advance(to, Float32(0))"
+with = "                    slots.set_advance(to, Float32(1))"
+expect = "repo-cluster.png diverges from baseline"
+rebuild = "pixi run build-engine"
 
 [[mutation]]
 name = "per-item-group-drift"

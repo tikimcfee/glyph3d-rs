@@ -8,7 +8,9 @@ oracle (JS)  →  scan spec (JS)  →  TSL kernels (WebGPU)  →  glyph_pipeline
 ```
 
 `glyph_pipeline.mojo` is a native transcription of `glyphPipelineReference.js` — the
-byte-in glyph pipeline (decode → trie resolve → fold → paginate → bounds) with the
+byte-in glyph pipeline (decode → trie resolve → cluster → fold → paginate →
+bounds; the cluster stage is the 2026-09-20 sequence pass, glyph_cluster.mojo,
+a no-op for leader-mode items) with the
 oracle's exact float discipline: f32 slot lanes rounded once per store, f64 `lineAdv`,
 f32-per-add `segAdv`, integer row/col for every discrete decision. It is proven
 **bit-for-bit** against the oracle, not to a tolerance — a tolerance would hide
@@ -158,7 +160,7 @@ Both are mutation-tested.
 
 ## On the GPU
 
-Five GPU suites run real device dispatches (Apple M2, Metal), counts bit-exact
+Six GPU suites run real device dispatches (Apple M2, Metal), counts bit-exact
 against the CPU port with no tolerance:
 
 ```sh
@@ -180,20 +182,46 @@ construction, not by shortfall. See below.
 mojo run -I engine engine/gpu_pipeline.mojo engine/fixtures/*.pipe.bin
 ```
 
-Eight dispatches chained with every intermediate staying in device memory:
+Nine dispatches chained with every intermediate staying in device memory
+(statics mode 0 — modes below):
 
 ```
-decode -> chunkReduce -> spineReduce -> spineScan -> partialScan -> apply
-       -> resolveX -> paginate
+(decode+)clusterProbe -> clusterChain -> chunkReduce -> spineReduce -> spineScan
+     -> partialScan -> apply -> resolveX -> paginate
 ```
+
+The statics arrive in one of four **modes** (`check_fixture`'s `mode`): `0`
+decodes on CPU and uploads (the shipped form); `1` decodes on device, probe
+unfused; `2` fuses decode+probe into `k_decode_probe` — one dispatch, the
+probe's head in registers, no statics on the bus; `3` swaps the probe's table
+form — a (state, cp)→(next, accept) hash walked one codepoint at a time
+(`build_state_table`, built at load from the same section bytes) replaces the
+descending binary searches, and the sequence section stays off the bus. The
+suite runs `0`, `2` and `3` over every fixture and synthetic case; modes
+`1`/`2`/`3` add a **bit-exact gi/sm tier** against the reference's resolved
+statics, so the device decode is pinned end to end rather than assumed from
+`gpu_decode`'s isolated proof. `--bench` runs all four so the A/B attributes
+the deltas: upload elimination (0→1), dispatch fusion (1→2), table form
+(2→3). The chain has two forms beside them: the serial thread-per-item
+commit (`chain=0`) and the chunk-parallel carry-stitched commit (`chain=1`
+— free walk per 128 B block, one-thread stitch of the one-integer resume
+carry, commit per block with the resolved carry; the suite proves it
+bit-exact beside the serial form). Measured 2026-09-24→25 (M2, stable
+toolchain): the fused form cut total device-phase time ~1.9x on 25 MB
+text by eliminating the leader-forced CPU decode; the walk cut the
+dense-emoji GPU phase a further ~1.4x (667→475 ms at 4 MB); the chunked
+chain cut the remaining serial walk 437→199 ms, putting the device phase
+at 242 ms against the CPU's 276 — **x 1.14, the device wins dense emoji
+outright**.
 
 Counts (`ROW`/`COL`/`ORD`/`ordToByte`) and the `totalRows` fold scalar compare
 **exact**; `LINE_ADV` and the resolved positions at eps. The fan stride is derived
 from a fold scalar between dispatches, as the CPU driver does. The
-monoid lives in one function that every dispatch calls, so six kernels cannot drift
-the way six transcriptions would.
+monoid lives in one function that every scan dispatch calls, so seven kernels cannot drift
+the way seven transcriptions would; the cluster kernels are
+cluster_device.mojo's, shared with gpu_cluster's standalone proof.
 
-**This found two bugs the four piecewise GPU suites could not**, which is the whole
+**This found two bugs the five piecewise GPU suites could not**, which is the whole
 argument for it:
 
 - `combine` was written to be "obviously right" for a LEAF `b` — one byte, so
@@ -526,7 +554,7 @@ run under plain `node`. Anything below that says otherwise predates this repo.
 pixi install
 pixi run mojo --version
 
-# 2. Verify the whole engine in one pass — ALL SIXTEEN suites, with the fp flag
+# 2. Verify the whole engine in one pass — ALL EIGHTEEN suites, with the fp flag
 #    the contract requires (--fp-mode contract=off is NOT optional; see the
 #    script's header for why). This is the only entry point that runs everything.
 (cd engine/fixtures && node gen.mjs && node gen-bake.mjs)

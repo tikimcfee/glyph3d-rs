@@ -66,7 +66,7 @@ struct EngineState(Movable):
     var stage_ns: List[Int]
 
     def __init__(out self):
-        self.trie = Trie(List[UInt32](), List[Float32](), List[UInt32]())
+        self.trie = Trie(List[UInt32](), List[Float32](), List[UInt32](), List[UInt32](), List[UInt32]())
         self.has_trie = False
         self.records = RecordSet()
         self.byte_len = 0
@@ -160,14 +160,15 @@ was built against a different FFI surface. See ABI_SHAPE."""
 # insertion point, where it never moves, or after it, where it may not either.
 #
 # So the per-item entry stopped being positional. Both load entries now marshal
-# the SAME 128 B descriptor block, and a new field can never shift an argument
-# again — it takes pad. The block carries ABI_SHAPE at a FIXED offset (108), which
-# cannot shift by construction, and the entry point was RENAMED
+# the SAME 136 B descriptor block, and a new field never shifts an argument —
+# it takes pad, or the block grows and the shape word with it (cluster_mode did
+# exactly that, below). The block carries ABI_SHAPE at a FIXED offset (112),
+# which cannot shift by construction, and the entry point was RENAMED
 # (`glyph_engine_load_item_desc`) so a dylib predating this change fails to LINK
 # rather than being miscalled: a symbol that does not exist cannot be called wrong.
-comptime ABI_DESC_BYTES: Int = 128             # the descriptor block, both entries
-comptime ABI_DESC_I32S: Int = 7                # i32 params inside that block
-comptime ABI_SHAPE_OFFSET: Int = 108           # byte offset of the shape word
+comptime ABI_DESC_BYTES: Int = 136             # the descriptor block, both entries
+comptime ABI_DESC_I32S: Int = 8                # i32 params inside that block
+comptime ABI_SHAPE_OFFSET: Int = 112           # byte offset of the shape word
 comptime ABI_SHAPE: Int = (ABI_DESC_BYTES << 8) | ABI_DESC_I32S
 
 
@@ -221,7 +222,7 @@ def glyph_engine_load_trie_file(
 def _item_from_desc(
     base: Pointer[UInt8, MutUntrackedOrigin], byte_start: Int, byte_count: Int
 ) -> Item:
-    """Deserialize ONE 128 B descriptor block into an Item.
+    """Deserialize ONE 136 B descriptor block into an Item.
 
     THE ONLY PLACE either entry point reads item params from. Two readers is how
     the per-item and batched paths get to disagree about a field, which is what
@@ -246,6 +247,7 @@ def _item_from_desc(
     it.scroll_rows = Int(i32s[unsafe_offset = 24])
     it.pages_wide = Int(i32s[unsafe_offset = 25])
     it.wrap_mode = Int(i32s[unsafe_offset = 26])  # offset 104
+    it.cluster_mode = Int(i32s[unsafe_offset = 27])  # offset 108 — the sequence pass
     it.byte_start = byte_start
     it.byte_count = byte_count
     return it^
@@ -269,7 +271,7 @@ def glyph_engine_load_item_desc(
 ) abi("C") -> c_int:
     """Run decode → fold → paginate → compact for ONE item (one text file).
 
-    Params arrive in the SAME 128 B descriptor block the batched entry takes —
+    Params arrive in the SAME 136 B descriptor block the batched entry takes —
     see the ONE MARSHALLING FORMAT note above for why this stopped being a
     twenty-argument positional call. Results are kept in the handle as 32 B wire
     records; retrieve with glyph_engine_slot_count / glyph_engine_copy_slots."""
@@ -309,25 +311,27 @@ def glyph_engine_load_item_desc(
 # call (~50 MB/s at repo-file sizes); the pipeline itself is built for
 # multi-item arenas (Item list over one byte span), so this entry amortizes
 # ALL per-call overhead: the caller concatenates the corpus into one blob and
-# passes one 128-byte descriptor block per item, and gets back one record
+# passes one 136-byte descriptor block per item, and gets back one record
 # stream plus per-item record counts (computed from the flag lanes, so they
 # are EXACT: one record per leader byte, as compact emits).
 #
-# Descriptor block layout (128 B, little-endian, serialized EXPLICITLY on both
+# Descriptor block layout (136 B, little-endian, serialized EXPLICITLY on both
 # sides — no repr(C) guessing):
 #   0..80    ten f64: origin_x, origin_y, origin_z, line_height, z_step,
 #            page_gap_x, band_stride_y, depth_per_band, depth_per_col,
 #            page_line_height
-#   80..108  SEVEN i32: wrap_width, has_page, page_rows, page_cols,
-#            scroll_rows, pages_wide, wrap_mode
-#   108      u32 ABI_SHAPE — a FIXED-offset shape word; it cannot shift, unlike
+#   80..112  EIGHT i32: wrap_width, has_page, page_rows, page_cols,
+#            scroll_rows, pages_wide, wrap_mode, cluster_mode
+#   112      u32 ABI_SHAPE — a FIXED-offset shape word; it cannot shift, unlike
 #            a positional sentinel (two of which were measured useless first)
 #
-# The wrap mode landed in the pad rather than growing the block: 10 f64 +
-# 7 i32 + 2 u64 is 124 B, so ITEM_DESC_SIZE stays 128 and the Rust side's
-# `const _: () = assert!(...)` in write_item_desc pins that it still fits.
-#   112      u64 byte_start
-#   120      u64 byte_count
+# The wrap mode landed in the pad; the cluster mode could NOT — the block was
+# full at 128 (10 f64 + 7 i32 + 2 u64 = 124), so the block grew to 136 and the
+# shape word moved with it. The one direction this format never takes is a
+# silent one: a caller built against the 128 B layout gets GE_ABI_MISMATCH,
+# never a misparse.
+#   120      u64 byte_start
+#   128      u64 byte_count
 #
 # Items must be contiguous and ascending by byte_start (the pipeline's
 # documented requirement). Per-item ordinals stay per item, so the 2^24-byte
@@ -393,8 +397,8 @@ def glyph_engine_load_items(
         items.append(
             _item_from_desc(
                 base,
-                Int(u64s[unsafe_offset = 14]),  # offset 112
                 Int(u64s[unsafe_offset = 15]),  # offset 120
+                Int(u64s[unsafe_offset = 16]),  # offset 128
             )
         )
 
@@ -414,14 +418,14 @@ def glyph_engine_load_items(
     for i in range(m):
         counts_out[unsafe_offset = i] = 0
     var it_i = 0
-    var it_end = Int(desc_ptr.unsafe_bitcast[UInt64]()[unsafe_offset = 14]) + Int(
-        desc_ptr.unsafe_bitcast[UInt64]()[unsafe_offset = 15]
+    var it_end = Int(desc_ptr.unsafe_bitcast[UInt64]()[unsafe_offset = 15]) + Int(
+        desc_ptr.unsafe_bitcast[UInt64]()[unsafe_offset = 16]
     )
     for id in range(n):
         while id >= it_end and it_i + 1 < m:
             it_i += 1
             var base = desc_ptr.unsafe_offset(it_i * ITEM_DESC_SIZE)
-            it_end = Int(base.unsafe_bitcast[UInt64]()[unsafe_offset = 14]) + Int(base.unsafe_bitcast[UInt64]()[unsafe_offset = 15])
+            it_end = Int(base.unsafe_bitcast[UInt64]()[unsafe_offset = 15]) + Int(base.unsafe_bitcast[UInt64]()[unsafe_offset = 16])
         if (Int(r.fl[id]) & F_LEADER) != 0:
             counts_out[unsafe_offset = it_i] += 1
     _record_stages(s[], r, compact_ns, perf_counter_ns() - _k, List[Int](length=DW_LANES, fill=0))
@@ -551,8 +555,8 @@ def glyph_engine_load_items_direct(
         items.append(
             _item_from_desc(
                 base,
-                Int(u64s[unsafe_offset = 14]),
-                Int(u64s[unsafe_offset = 15]),
+                Int(u64s[unsafe_offset = 15]),  # offset 120 — byte_start
+                Int(u64s[unsafe_offset = 16]),  # offset 128 — byte_count
             )
         )
 

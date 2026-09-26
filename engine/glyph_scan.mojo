@@ -22,11 +22,13 @@ from std.memory import unsafe_memset_zero
 from std.runtime import parallelism_level
 from max.algorithm import parallelize  # MOJO-1.1-PORT: see glyph_pipeline.mojo
 from glyph_schema import SM_STRIDE, LM_STRIDE, LC_STRIDE
+from glyph_cluster import resolve_clusters
 from glyph_pipeline import (
     Trie,
     Item,
     PipelineResult,
     Slots,
+    CLUSTER_CLUSTER,
     F_LEADER,
     F_NEWLINE,
     F_RENDERED,
@@ -394,6 +396,20 @@ def run_scan_pipeline[o: ImmOrigin](
         var a = shard_lo(0, n, workers, w)
         for k in range(tally[w * 2 + 1]):
             misses.append(miss_scratch[a + k])
+
+    # ── THE SEQUENCE PASS: between decode and chunkReduce, so the scan's
+    #    leaves read the resolved static lanes. Per item, exactly the serial
+    #    form's hook — the monoid itself never learns what a cluster is.
+    var any_cluster = False
+    for i in range(len(items)):
+        if items[i].cluster_mode == CLUSTER_CLUSTER:
+            any_cluster = True
+            break
+    if any_cluster:
+        def _cluster_task(i: Int) {imm}:
+            if items[i].cluster_mode == CLUSTER_CLUSTER:
+                resolve_clusters(bytes, slots, trie, items[i])
+        parallelize(_cluster_task, len(items))
 
     # MODE RIDES BESIDE WRAP, per item, for the reason glyph_pipeline's WRAP_BACK
     # comment gives: both feed the monoid's junction term, so both are item-level

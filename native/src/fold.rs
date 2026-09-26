@@ -51,6 +51,13 @@ pub const F_LEADER: u32 = 1;
 pub const F_RENDERED: u32 = 2;
 pub const F_NEWLINE: u32 = 4;
 pub const F_MISSING: u32 = 8;
+/// The sequence pass's trailer: the leader keeps its record but its glyph and
+/// advance moved into the cluster head. Also marks the unmatched
+/// invisible-by-design characters (ZWJ/VS/tags) the pass zeroes in place.
+/// Distinct from F_MISSING: a trailer's content RESOLVED; a miss was never
+/// found. Read by nothing in the renderer — the blank-drop works off
+/// glyph_id == 0; the corpus's FLAGS-lane comparisons are the pin.
+pub const F_CLUSTER_TRAILER: u32 = 16;
 pub const NEWLINE: u32 = 0x0A;
 
 /// The trie's own missing bit, distinct from the slot flag above.
@@ -109,6 +116,43 @@ impl WrapMode {
     }
 }
 
+/// THE CLUSTER MODES — an ITEM-LEVEL parameter, exactly like `wrap_mode`.
+///
+/// `Leader` (the default; the corpus pins it): one glyph per UTF-8 leader.
+/// `Cluster`: the sequence pass — a codepoint sequence the font draws as ONE
+/// glyph resolves to its sequence slot, trailing leaders become zero-advance
+/// drops (the blank mechanism), and the invisible-by-design characters (ZWJ,
+/// the variation selectors, the tags) never occupy a cell. Records stay per
+/// leader either way: ROW/COL, the witness lanes, and the pick cross-check do
+/// not move.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum ClusterMode {
+    #[default]
+    Leader,
+    Cluster,
+}
+
+impl ClusterMode {
+    /// The wire encoding: 0 = Leader, 1 = Cluster. Shared by the `.pipe.bin`
+    /// v5 item record and the FFI descriptor — same role as WrapMode::code.
+    pub const fn code(self) -> i64 {
+        match self {
+            ClusterMode::Leader => 0,
+            ClusterMode::Cluster => 1,
+        }
+    }
+
+    /// Same rule as WrapMode::from_code: an unknown code is malformed input,
+    /// refused at the seam rather than defaulted.
+    pub fn from_code(code: i64) -> Self {
+        match code {
+            0 => ClusterMode::Leader,
+            1 => ClusterMode::Cluster,
+            other => panic!("cluster mode must be 0 (Leader) or 1 (Cluster), got {other}"),
+        }
+    }
+}
+
 /// One file in the arena: byte range + layout params.
 ///
 /// FIELD ORDER IS LOAD-BEARING — `fixture::PipeFixture::manifest` hashes these
@@ -129,6 +173,8 @@ pub struct Item {
     pub wrap_width: i64,
     /// Item-level, exactly like `wrap_width`. See [`WrapMode`].
     pub wrap_mode: WrapMode,
+    /// Item-level, exactly like `wrap_mode`. See [`ClusterMode`].
+    pub cluster_mode: ClusterMode,
     pub z_step: f64,
     pub line_height: f64,
     pub has_page: bool,
@@ -448,12 +494,137 @@ pub(crate) fn decode_and_resolve<T: ResolveGlyph + ?Sized>(
     Some(codepoint)
 }
 
+/// The invisible-by-design ranges: the ZERO WIDTH JOINER, the variation
+/// selectors, the tag characters. Under cluster mode they never occupy a cell
+/// — a sequence match claims them as trailers first.
+pub(crate) fn is_static_zero_cp(cp: u32) -> bool {
+    cp == 0x200D || (0xFE00..=0xFE0F).contains(&cp) || (0xE0020..=0xE007F).contains(&cp)
+}
+
+/// THE SEQUENCE PASS — one item, one serial walk over its leaders, between
+/// decode and the fold. A transcription of the oracle's `resolveClusters`
+/// (engine/fixtures/inputs/glyphPipelineReference.js); engine/glyph_cluster.mojo
+/// is the same rule in the shipped engine. When they disagree the oracle is
+/// wrong only after the c9667ec protocol (fix the oracle, regenerate, let the
+/// ports red).
+///
+/// Longest-prefix match over the trie's sequence table, greedy from the left
+/// (a matched span is consumed whole, which pairs RI runs exactly — GB12/GB13
+/// needs no parity state). FE0F is normalized out of the probe key — the
+/// font's GSUB strips it — while the VS16 leaders ride the trailer span.
+/// Writes ONLY the static lanes (glyph id, advance, the trailer flag);
+/// ROW/COL and the positions belong to the fold, unchanged.
+pub(crate) fn resolve_clusters<T: ResolveGlyph + ?Sized>(
+    bytes: &[u8],
+    slots: &mut Slots,
+    trie: &T,
+    item: &Item,
+) {
+    let Some((seq, seq_max, bitmap_advance)) = trie.cluster_table() else {
+        return;
+    };
+    let stride = 2 + seq_max as usize;
+    let stop = (item.byte_start + item.byte_count) as usize;
+
+    // Instant rejection: a codepoint no sequence starts with is never a head.
+    let mut first = std::collections::HashSet::new();
+    for i in (0..seq.len()).step_by(stride) {
+        first.insert(seq[i + 2]);
+    }
+
+    let mut id = item.byte_start as usize;
+    while id < stop {
+        let n = sequence_length(bytes, id);
+        if n == 0 {
+            id += 1;
+            continue;
+        }
+        let cp = decode_codepoint_at(bytes, id, n);
+        if is_static_zero_cp(cp) {
+            slots.gi[id] = 0;
+            slots.sm[id * 2] = 0.0;
+            slots.fl[id] |= F_CLUSTER_TRAILER;
+            id += n;
+            continue;
+        }
+        if first.contains(&cp) {
+            // Build the probe: up to seq_max EFFECTIVE codepoints, with VS16
+            // dropped from the key but riding the span. A newline or a
+            // continuation byte ends the candidate; VS15 breaks it (text
+            // presentation asked, text presentation honored).
+            let mut members = vec![id];
+            let mut key = vec![cp];
+            let mut p = id + n;
+            while p < stop && key.len() < seq_max as usize {
+                let n2 = sequence_length(bytes, p);
+                if n2 == 0 {
+                    break;
+                }
+                let cp2 = decode_codepoint_at(bytes, p, n2);
+                if cp2 == NEWLINE || cp2 == 0xFE0E {
+                    break;
+                }
+                members.push(p);
+                if cp2 != 0xFE0F {
+                    key.push(cp2);
+                }
+                p += n2;
+            }
+            // The longest table prefix of the key wins.
+            let mut best_len = 0usize;
+            let mut best_slot = 0u32;
+            let mut i2 = 0;
+            while i2 < seq.len() {
+                let elen = seq[i2 + 1] as usize;
+                if elen >= 2 && elen <= key.len() && elen > best_len {
+                    let mut is_match = true;
+                    for k in 0..elen {
+                        if seq[i2 + 2 + k] != key[k] {
+                            is_match = false;
+                            break;
+                        }
+                    }
+                    if is_match {
+                        best_len = elen;
+                        best_slot = seq[i2];
+                    }
+                }
+                i2 += stride;
+            }
+            if best_len > 0 {
+                // The span runs through the leader that contributed the key's
+                // last matched member — count key-consumers, not members, so
+                // the skipped VS16s stay inside the trailer span.
+                let mut span_members = 0;
+                let mut need = best_len;
+                while need > 0 {
+                    let mid = members[span_members];
+                    if decode_codepoint_at(bytes, mid, sequence_length(bytes, mid)) != 0xFE0F {
+                        need -= 1;
+                    }
+                    span_members += 1;
+                }
+                slots.gi[id] = best_slot;
+                slots.sm[id * 2] = bitmap_advance;
+                for &to in &members[1..span_members] {
+                    slots.gi[to] = 0;
+                    slots.sm[to * 2] = 0.0;
+                    slots.fl[to] |= F_CLUSTER_TRAILER;
+                }
+                let last = members[span_members - 1];
+                id = last + sequence_length(bytes, last);
+                continue;
+            }
+        }
+        id += n;
+    }
+}
+
 /// THE FOLD — the serial scan over one item's bytes.
 ///
 /// `write_bounds` is false for a paged item (paginate is about to rewrite every
 /// position, so a box computed here would describe the pre-page layout) and for
 /// a RESUMED range (a partial range must not publish a whole item's box).
-#[allow(clippy::too_many_arguments)]
 fn layout_item(
     slots: &mut Slots,
     item: &Item,
@@ -777,6 +948,15 @@ pub fn run_pipeline<T: ResolveGlyph + ?Sized>(
 
     // ── decode ────────────────────────────────────────────────────────────────
     let (misses, leaders) = decode_all(bytes, &mut slots, trie);
+
+    // ── the sequence pass, per item, between decode and the fold — so the
+    //    trailer lanes are rewritten before any advance sum reads them. The
+    //    Mojo engine's hook sits at the same point in run_pipeline_into.
+    for item in items {
+        if item.cluster_mode == ClusterMode::Cluster {
+            resolve_clusters(bytes, &mut slots, trie, item);
+        }
+    }
 
     // ── the fold, per item ────────────────────────────────────────────────────
     let mut item_bounds = vec![0.0f64; items.len() * 8];

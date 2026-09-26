@@ -22,7 +22,7 @@
 # Run: mojo run -I engine engine/gpu_paginate.mojo engine/fixtures/*.pipe.bin
 
 from std.sys import argv, has_accelerator
-from std.gpu import global_idx
+from max.gpu import global_idx
 from max.gpu.host import DeviceContext
 from glyph_schema import (
     LM_STRIDE, LM_X, LM_Y, LM_Z, LM_BASE_X, LC_STRIDE, LC_ROW, LC_COL,

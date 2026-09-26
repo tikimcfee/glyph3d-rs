@@ -7,8 +7,8 @@ Recorded because a vendored file with no recorded origin is indistinguishable
 from a local invention six months later.
 
   upstream repo    viz-web/glyph3d-js
-  upstream commit  2ef79b7e762a07ebbf72713f97527a6831b7a839  (recorded; web repo not present at regeneration on 2026-09-10)
-  regenerated      2026-09-10  (tools/vendor-manifest.py)
+  upstream commit  2ef79b7e762a07ebbf72713f97527a6831b7a839
+  regenerated      2026-09-20  (tools/vendor-manifest.py)
 
 ## The fixture oracle is pinned PER FILE
 
@@ -55,9 +55,9 @@ is that check.
 | `engine/fixtures/inputs/foldGeometry.js` | `packages/glyph3d-core/src/core/foldGeometry.js` | 14806 | `c925c6d2c8036f2b…` | yes |
 | `engine/fixtures/inputs/glyphBake.js` | `packages/glyph3d-core/src/compute/glyphBake.js` | 11761 | `5ba631bdbd6ed5e5…` | MISMATCH |
 | `engine/fixtures/inputs/glyphPipelineKernels.js` | `packages/glyph3d-core/src/compute/glyphPipelineKernels.js` | 90515 | `c785a572091d2f37…` | MISMATCH |
-| `engine/fixtures/inputs/glyphPipelineReference.js` | `packages/glyph3d-core/src/compute/glyphPipelineReference.js` | 44125 | `02ca437b084c3e8a…` | MISMATCH |
+| `engine/fixtures/inputs/glyphPipelineReference.js` | `packages/glyph3d-core/src/compute/glyphPipelineReference.js` | 51879 | `dd2bc84bfc3cd1be…` | MISMATCH |
 | `engine/fixtures/inputs/glyphPipelineScan.js` | `packages/glyph3d-core/src/compute/glyphPipelineScan.js` | 15254 | `4b83b7447b66695e…` | MISMATCH |
-| `schema/glyph-identity.json` | `schema/glyph-identity.json` | 19158 | `b4b838430677b383…` | MISMATCH |
+| `schema/glyph-identity.json` | `schema/glyph-identity.json` | 19662 | `ac9e95ec2bfec524…` | MISMATCH |
 | `tools/vendor/ref/app/public/slug-core/slug-core.1tstke3lync.bin` | `app/public/slug-core/slug-core.1tstke3lync.bin` | 609569 | `647ccdaba087de1f…` | yes |
 | `tools/vendor/ref/packages/glyph3d-core/src/fonts/Cousine-Regular.ttf` | `packages/glyph3d-core/src/fonts/Cousine-Regular.ttf` | 300208 | `dcd526004fcfec4e…` | yes |
 | `tools/vendor/ref/packages/glyph3d-core/src/fonts/DejaVuSans.ttf` | `packages/glyph3d-core/src/fonts/DejaVuSans.ttf` | 759720 | `6038a160b491e121…` | yes |
@@ -99,9 +99,15 @@ hash recorded in `THIRD_PARTY`, so a re-vendor that forgot the record is caught.
 |---|---|---|---|---:|---|---|
 | `tools/vendor/third-party/noto-emoji/LICENSE.txt` | googlefonts/noto-emoji | `v2.051` | `6202fe7c20dd` | 4301 | `6a73f9541c2de741…` | the OFL text itself |
 | `tools/vendor/third-party/noto-emoji/NotoColorEmoji.ttf` | googlefonts/noto-emoji | `v2.051` | `6202fe7c20dd` | 10673480 | `72a635cb3d2f3524…` | SIL Open Font License 1.1 (LICENSE.txt beside it, from the same tag) |
+| `tools/vendor/third-party/unicode-ucd/GraphemeBreakProperty.txt` | unicode.org UCD | `17.0.0` | `release-dir` | 99377 | `d6b51d1d2ae5c33b…` | Unicode Terms of Use (license.txt beside it) |
+| `tools/vendor/third-party/unicode-ucd/emoji-data.txt` | unicode.org UCD | `17.0.0` | `release-dir` | 107324 | `2cb2bb9455cda83e…` | Unicode Terms of Use (license.txt beside it) |
+| `tools/vendor/third-party/unicode-ucd/license.txt` | unicode.org UCD | `17.0.0` | `release-dir` | 1995 | `e7a93b009565cfce…` | the Unicode Terms of Use text itself |
 
 - `tools/vendor/third-party/noto-emoji/LICENSE.txt` — the font's licence travels with the font
 - `tools/vendor/third-party/noto-emoji/NotoColorEmoji.ttf` — the colour-emoji bitmap source for assets/atlas/emoji-sheet.bin; CBDT/CBLC, one 109 ppem strike, 3,985 PNG glyphs of 136x128
+- `tools/vendor/third-party/unicode-ucd/GraphemeBreakProperty.txt` — Grapheme_Cluster_Break classes for the cluster-mode segmentation rule — the source tools/gen_cluster_table.py reads
+- `tools/vendor/third-party/unicode-ucd/emoji-data.txt` — Extended_Pictographic / Emoji_Modifier / keycap classes for the same generator — cluster head/trailer candidacy
+- `tools/vendor/third-party/unicode-ucd/license.txt` — the licence travels with the data
 
 ## Notes
 

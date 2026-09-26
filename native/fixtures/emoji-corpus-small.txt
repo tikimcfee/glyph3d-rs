@@ -1,0 +1,17 @@
+# emoji corpus — SMALL — the quick cluster check (generated: tools/gen_emoji_corpus.py).
+# cluster mode: every sequence on a resolve line is ONE glyph (a double-width cell).
+# leader mode: the same lines show the pieces. The field: emoji-corpus-large.txt.
+
+family: 👨‍👩‍👧 👨‍👩‍👧‍👦 👨‍👨‍👦 👩‍👩‍👧
+flag: 🇨🇦 🇯🇵 🇺🇸  not-a-flag-pair: 🇦🇦  triplet (flag + lone RI): 🇺🇸🇸
+skin tone: 👍 then its five tones: 👍🏻 👍🏼 👍🏽 👍🏾 👍🏿  lone modifiers (no base — swatches): 🏻🏼🏽🏾🏿
+role + tones: 🧑‍💻 🧑🏻‍💻 🧑🏼‍💻 🧑🏽‍💻 🧑🏾‍💻 🧑🏿‍💻
+keycap: #⃣ *⃣ 0⃣ 1⃣  bare (no VS16, same slot): 1⃣  VS15-broken: 1︎⃣
+tag flags: 🏴󠁧󠁢󠁥󠁮󠁧󠁿 🏴󠁧󠁢󠁳󠁣󠁴󠁿 🏴󠁧󠁢󠁷󠁬󠁳󠁿 🏴󠁿
+couple: 👩‍❤‍👨  heart chain: ❤‍🔥
+VS16 on/off, one slot: ❤‍🔥 ❤️‍🔥
+over-long chain (the full family wins, then a lone girl): 👨‍👩‍👧‍👦‍👧
+unlisted chains, stay pieces: 🐢‍🐍 🎈‍🌵 🏖‍🌮 🦊‍🌎 🐧‍🌭
+lone ZWJ / VS16, zero-width: a‍b a️b
+adjacent clusters, no spaces: 🇨🇦🇯🇵👨‍👩‍👧‍👦👍🏽1⃣
+code beside clusters: fn main() { let f = "👨‍👩‍👧"; } // 🇨🇦 🧑‍💻

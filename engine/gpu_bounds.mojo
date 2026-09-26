@@ -38,7 +38,7 @@
 # Run: mojo run -I engine engine/gpu_bounds.mojo engine/fixtures/*.pipe.bin
 
 from std.sys import argv, has_accelerator
-from std.gpu import global_idx
+from max.gpu import global_idx
 from std.atomic import Atomic
 from std.memory import bitcast
 from max.gpu.host import DeviceContext

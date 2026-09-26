@@ -51,7 +51,7 @@ pub enum SceneChoice {
     /// Stage A stress demo (1M colored quads).
     Demo,
     /// Stage C Slug text field: stage `file`, tiled `copies` times.
-    Text { file: PathBuf, copies: u32, emoji_sheet: PathBuf },
+    Text { file: PathBuf, copies: u32, emoji_sheet: PathBuf, cluster_mode: fold::ClusterMode },
     /// Stage E1: lay `file` out with the Mojo engine (real atlas trie) and
     /// render the engine's records through the same Slug glyph renderer.
     EngineText { file: PathBuf, trie: PathBuf, emoji_sheet: PathBuf },
@@ -73,6 +73,10 @@ pub enum SceneChoice {
         /// same reason: the baselines depend on the default, so the CLI
         /// layer pins it rather than letting RepoParams::default speak alone.
         z_wrap_spacing: f64,
+        /// The sequence pass on a repo load (`--cluster-mode`, default
+        /// cluster since 2026-09-22). Same standing as wrap_mode: the
+        /// baselines pin the default.
+        cluster_mode: fold::ClusterMode,
         /// The colour-emoji sheet (`--emoji-sheet`; default the committed
         /// one). Every glyph scene loads it — the same handle the engine
         /// trie has, so swapping a sheet is a command-line act.
@@ -236,9 +240,9 @@ fn build_scene_impl(
     };
     match choice {
         SceneChoice::Demo => (Box::new(Scene::new(ctx, color_format)), None),
-        SceneChoice::Text { file, copies, emoji_sheet } => {
+        SceneChoice::Text { file, copies, emoji_sheet, cluster_mode } => {
             let atlas = atlas::Atlas::load(ctx, emoji_sheet);
-            let staged = text::stage_file(&atlas, file, *copies);
+            let staged = text::stage_file(&atlas, file, *copies, *cluster_mode);
             log::info!(
                 "staged {}: {} codepoints → {} glyph instances ({} copies, {} missing/bitmap)",
                 file.display(),
@@ -247,7 +251,12 @@ fn build_scene_impl(
                 copies,
                 staged.missing_or_bitmap,
             );
-            glyph(GlyphScene::new(ctx, color_format, &atlas, staged, camera_mode, cull))
+            let mut scene = GlyphScene::new(ctx, color_format, &atlas, staged, camera_mode, cull);
+            // No pick context on this path, so the panel's cluster toggle
+            // seeds from the choice directly — hand it the mode the scene
+            // was staged with.
+            scene.set_probe_cluster_mode(matches!(cluster_mode, fold::ClusterMode::Cluster));
+            glyph(scene)
         }
         SceneChoice::EngineText { file, trie, emoji_sheet } => {
             let atlas = atlas::Atlas::load(ctx, emoji_sheet);
@@ -268,11 +277,13 @@ fn build_scene_impl(
             focus,
             wrap_mode,
             z_wrap_spacing,
+            cluster_mode,
             emoji_sheet,
         } => {
             let params = repo::RepoParams {
                 wrap_mode: *wrap_mode,
                 z_wrap_spacing: *z_wrap_spacing,
+                cluster_mode: *cluster_mode,
                 ..Default::default()
             };
             let load = repo::load_repo(dir, &default_engine_trie(), &params, *strategy, *verify);

@@ -24,7 +24,7 @@ from glyph_pipeline import (
 )
 from glyph_bake import bake_file
 from glyph_record import seed_at, is_line_start
-from fixture_io import load_pipe_fixture
+from fixture_io import load_pipe_fixture, has_cluster_items
 
 comptime MAX_PRINTED = 6
 comptime CK = 64  # small interval so the tail fold is exercised, not bypassed
@@ -33,6 +33,12 @@ comptime CK = 64  # small interval so the tail fold is exercised, not bypassed
 def check_case(path: String) raises -> Int:
     var fx = load_pipe_fixture(path)
     if fx.byte_len == 0:
+        return 0
+    # The bake's tail fold re-derives advances from the TRIE — unresolved by
+    # design until bake v4. A cluster item would red here for the right reason
+    # and mean nothing about resume; skip it, printed, so the hole is named.
+    if has_cluster_items(fx):
+        print("SKIP", path, "— cluster mode: the bake's tail fold has no sequence pass yet (bake v4)")
         return 0
     var bad = 0
     var printed = 0

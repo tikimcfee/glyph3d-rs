@@ -13,7 +13,15 @@
  * the class of bug (grouping-dependent float drift) this rig exists to catch.
  *
  * Format (all little-endian, packed, no alignment):
- *   u32 magic 'G3DF' (0x46443347)   u32 version=4
+ *   u32 magic 'G3DF' (0x46443347)   u32 version=5
+ *
+ * v5: the item record gains CLUSTER MODE beside wrapMode — leader (0, today's
+ * behaviour and the default) or cluster (1, the sequence pass) — and the
+ * fixture gains a SEQUENCE PAYLOAD between the blocks and the item records:
+ * the synthetic sequence table a cluster-mode fixture resolves against
+ * ([slot, len, cps..] entries) plus the bitmap advance a resolved head
+ * carries. seqCount 0 with a NaN advance = "no sequences" (the 17 pre-v5
+ * fixtures' shape); the NaN poisons any read of a value that must be absent.
  *
  * v4: the item record gains WRAP MODE — WrapDown (0, today's behaviour and the
  * default) or WrapBack (1, where a wrap keeps the row and steps only in depth).
@@ -28,11 +36,14 @@
  *   u32 byteLen  u32 itemCount  u32 blockIndexLen  u32 blocksFloatLen
  *   u8[byteLen] bytes
  *   u32[blockIndexLen] blockIndex
- *   f32[blocksFloatLen] blocks
- *   itemCount × item record:
+ *   f64[blocksFloatLen] blocks (VALUES — the v2 carrier note above)
+ *   u32 seqCount  u32 seqMax  f64 bitmapAdvance (NaN when seqCount == 0)
+ *   seqCount x { u32 slot  u32 len  u32 cps[seqMax] (0-padded) }   [v5]
+ *   itemCount x item record:
  *     u32 byteStart  u32 byteCount
  *     f64 originX originY originZ
  *     f64 wrapWidth  f64 wrapMode (0 = WrapDown, 1 = WrapBack)
+ *     f64 clusterMode (0 = leader, 1 = cluster)                    [v5]
  *     f64 zStep  f64 lineHeight (NaN = unset)
  *     f64 hasPage (0|1)
  *     f64 pageRows pageCols scrollRows pagesWide pageGapX bandStrideY
@@ -47,7 +58,7 @@
  *     maxRowExtent; an item with no leaders is +inf/+inf/+inf/-inf/-inf/-inf/0/0)
  *   f64[8] batch bounds row (same shape/sentinel)
  *
- * Run: bun engine/fixtures/gen.mjs   (writes *.pipe.bin beside this file)
+ * Run: node engine/fixtures/gen.mjs   (writes *.pipe.bin beside this file)
  */
 
 import { mkdirSync, writeFileSync, readFileSync } from 'node:fs';
@@ -62,6 +73,14 @@ import { buildGlyphTrie, trieLaneValue } from './inputs/GlyphTrie.js';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const utf8 = (s) => new TextEncoder().encode(s);
+
+// ── v5: the sequence payload. A case with `seqs: [[slot, [cps..]], ..]`
+//    resolves them under clusterMode 1; the table is the fixture's whole
+//    synthetic world for the sequence pass. Slots are allocated from 50000 up
+//    — clearly outside the codepoint-derived id space (cp % 4093 + 1), so a
+//    head/trailer mix-up can never hide behind a plausible-looking id.
+//    bitmapAdvance is the head's advance under cluster mode, per fixture; the
+//    awkward mantissa is on purpose (the f32 chain must carry it bit-exactly).
 
 // ── Trie: synthetic metrics with awkward f32 mantissas, so every advance-sum
 //    exercises real rounding. '@' is deliberately unmapped (the F_MISSING path);
@@ -280,6 +299,122 @@ const CASES = [
             ],
         };
     })(),
+    // ── THE SEQUENCE PASS (clusterMode 1). Synthetic sequence tables in the
+    //    fixture's own id space (slots from 50000 up, so a head/trailer mix-up
+    //    can never hide behind a plausible-looking id); the rule is the
+    //    oracle's resolveClusters. bitmapAdvance carries an awkward mantissa on
+    //    purpose — the f32 chain must move it bit-exactly.
+    (() => {
+        // The controlled A/B: the same content twice, cluster item then leader
+        // item. The diff between the two IS the resolution — anti-vacuity by
+        // construction (if the pass never fired, the items would agree).
+        const a = utf8('🚀\u200D🌍 x\n');
+        const bytes = new Uint8Array(a.length * 2);
+        bytes.set(a, 0); bytes.set(a, a.length);
+        return {
+            name: 'cluster-zwj',
+            bytes,
+            seqs: [[50000, [0x1F680, 0x200D, 0x1F30D]]],
+            bitmapAdvance: Math.fround(1.318),
+            items: [
+                { byteStart: 0, byteCount: a.length, origin: { x: 0, y: 0, z: 0 }, clusterMode: 1, lineHeight: 1.0 },
+                { byteStart: a.length, byteCount: a.length, origin: { x: 0, y: -3, z: 0 }, clusterMode: 0, lineHeight: 1.0 },
+            ],
+        };
+    })(),
+    {
+        // RI pairing, greedy from the left — GB12/GB13 with no parity state:
+        // the table pair (A C) resolves, the lone RI stays single, and a
+        // NON-table pair (A D) stays two singles even though A starts a known
+        // sequence — the fallback is pinned, not assumed.
+        name: 'cluster-flags',
+        bytes: utf8('🇦🇨 🇩 🇦🇩 x\n'),
+        seqs: [[50001, [0x1F1E6, 0x1F1E8]]],
+        bitmapAdvance: Math.fround(1.318),
+        items: [{ origin: { x: 0, y: 0, z: 0 }, clusterMode: 1, lineHeight: 1.0 }],
+    },
+    {
+        // OVERLAP: two table pairs that SHARE a letter. 🇦🇨🇦 commits (A C) and
+        // the lone A must survive — the phantom (C A) at position 1 is a
+        // candidate that no commit may fire. This is the case a two-pass
+        // decomposition (probe every position, then commit) gets wrong if its
+        // chain is a windowed OR instead of the greedy skip-past; the serial
+        // rule can never see it, because its walk never visits position 1.
+        name: 'cluster-overlap',
+        bytes: utf8('🇦🇨🇦 🇨🇦🇨 🇦🇨🇨 x\n'),
+        seqs: [[50006, [0x1F1E6, 0x1F1E8]], [50007, [0x1F1E8, 0x1F1E6]]],
+        bitmapAdvance: Math.fround(1.318),
+        items: [{ origin: { x: 0, y: 0, z: 0 }, clusterMode: 1, lineHeight: 1.0 }],
+    },
+    {
+        // Keycaps, both spellings: '1' FE0F 20E3 and '1' 20E3 resolve to the
+        // SAME slot — the FE0F normalization pin (the font's GSUB strips VS16;
+        // real text carries it).
+        name: 'cluster-keycap',
+        bytes: utf8('1️⃣ 1⃣ x\n'),
+        seqs: [[50002, [0x31, 0x20E3]]],
+        bitmapAdvance: Math.fround(1.318),
+        items: [{ origin: { x: 0, y: 0, z: 0 }, clusterMode: 1, lineHeight: 1.0 }],
+    },
+    {
+        // The fallback: a ZWJ chain the table does NOT have, against a table
+        // that exists but matches nothing here. Pieces render per codepoint
+        // and the ZWJ goes zero-width — the invisible-by-design rule firing
+        // without a match.
+        name: 'cluster-unmatched',
+        bytes: utf8('🚀\u200D🌍 x\n'),
+        seqs: [[50005, [0x1F600, 0x200D, 0x1F601]]],   // a chain this item lacks
+        bitmapAdvance: Math.fround(1.318),
+        items: [{ origin: { x: 0, y: 0, z: 0 }, clusterMode: 1, lineHeight: 1.0 }],
+    },
+    {
+        // Skin tone: the two-codepoint modifier sequence resolves whole.
+        name: 'cluster-skin',
+        bytes: utf8('👍🏽 x\n'),
+        seqs: [[50003, [0x1F44D, 0x1F3FD]]],
+        bitmapAdvance: Math.fround(1.318),
+        items: [{ origin: { x: 0, y: 0, z: 0 }, clusterMode: 1, lineHeight: 1.0 }],
+    },
+    {
+        // The probe stops at a newline (GB4/GB5): the chain is cut by the line
+        // break, so nothing resolves — the pieces render on their own rows and
+        // the ZWJ is zero-width. If a match ever crossed the newline, this
+        // fixture's bounds move.
+        name: 'cluster-newline',
+        bytes: utf8('🚀\u200D\n🌍\n'),
+        seqs: [[50000, [0x1F680, 0x200D, 0x1F30D]]],
+        bitmapAdvance: Math.fround(1.318),
+        items: [{ origin: { x: 0, y: 0, z: 0 }, clusterMode: 1, lineHeight: 1.0 }],
+    },
+    (() => {
+        // LONGEST-MATCH: the table holds both (🚀, ZWJ) and (🚀, ZWJ, 🌍); the
+        // full chain resolves to the longer entry, the cut one to the shorter.
+        // A first-match-wins implementation gets this fixture wrong.
+        const a = utf8('🚀\u200D🌍\n');
+        const b = utf8('🚀\u200D x\n');
+        const bytes = new Uint8Array(a.length + b.length);
+        bytes.set(a, 0); bytes.set(b, a.length);
+        return {
+            name: 'cluster-longest',
+            bytes,
+            seqs: [[50000, [0x1F680, 0x200D, 0x1F30D]], [50004, [0x1F680, 0x200D]]],
+            bitmapAdvance: Math.fround(1.318),
+            items: [
+                { byteStart: 0, byteCount: a.length, origin: { x: 0, y: 0, z: 0 }, clusterMode: 1, lineHeight: 1.0 },
+                { byteStart: a.length, byteCount: b.length, origin: { x: 0, y: -3, z: 0 }, clusterMode: 1, lineHeight: 1.0 },
+            ],
+        };
+    })(),
+    {
+        // A cluster inside a WRAPPED line: row/col count leaders (unchanged),
+        // while the x positions compress — the fold reads the rewritten static
+        // lanes exactly as it always did.
+        name: 'cluster-wrap',
+        bytes: utf8('ab 🚀\u200D🌍 cd ef gh\n'),
+        seqs: [[50000, [0x1F680, 0x200D, 0x1F30D]]],
+        bitmapAdvance: Math.fround(1.318),
+        items: [{ origin: { x: 0, y: 0, z: 0 }, wrapWidth: 4, zStep: 0.2, clusterMode: 1, lineHeight: 1.0 }],
+    },
 ];
 
 
@@ -297,7 +432,7 @@ const MEASURE_FROM = [S_X, S_Y, S_Z, S_ADVANCE, S_HEIGHT, S_GLYPH_ID, S_BASE_X, 
 const COUNT_FROM = [S_ROW, S_COL, S_FLAGS, S_ORD];
 if (MEASURE_FROM.length !== MEASURE_STRIDE || COUNT_FROM.length !== COUNT_STRIDE) {
     throw new Error(`fixture lane map disagrees with the schema (${MEASURE_FROM.length}/${MEASURE_STRIDE}, `
-        + `${COUNT_FROM.length}/${COUNT_STRIDE}) — run bun tools/gen-schema.mjs`);
+        + `${COUNT_FROM.length}/${COUNT_STRIDE}) — run python3 tools/gen_schema.py`);
 }
 function writeSlotValues(w, slots) {
     const nb = slots.length / SLOT_STRIDE;
@@ -345,10 +480,40 @@ for (const c of CASES) {
         ...it,
     }));
     const trie = buildTrieFor([c.bytes]);
+    // v5: the sequence payload rides the trie the runPipeline sees, exactly
+    // where the engine's Trie carries it. No `seqs` on the case → no table —
+    // resolveClusters early-returns even for cluster items.
+    if (c.seqs && c.seqs.length) {
+        if (!(typeof c.bitmapAdvance === 'number' && Number.isFinite(c.bitmapAdvance))) {
+            throw new Error(`${c.name}: seqs without a finite bitmapAdvance`);
+        }
+        // v5 tables carry the REAL trie's contract (export-atlas's, asserted at
+        // ITS bake): entries sorted by the codepoint sequence, elementwise,
+        // shorter-prefix-first, no duplicates. The linear rule doesn't care
+        // about the order; the binary search over the section requires it.
+        c.seqs.sort(([, a], [, b]) => {
+            for (let k = 0; k < Math.min(a.length, b.length); k++) {
+                if (a[k] !== b[k]) return a[k] - b[k];
+            }
+            return a.length - b.length;
+        });
+        for (let i = 1; i < c.seqs.length; i++) {
+            const [pa, pb] = [c.seqs[i - 1][1], c.seqs[i][1]];
+            if (pa.length === pb.length && pa.every((v, k) => v === pb[k])) {
+                throw new Error(`${c.name}: duplicate sequence ${pb.map((x) => x.toString(16))}`);
+            }
+        }
+        trie.seqMax = Math.max(...c.seqs.map(([, cps]) => cps.length));
+        trie.bitmapAdvance = c.bitmapAdvance;
+        trie.seq = [];
+        for (const [slot, cps] of c.seqs) {
+            trie.seq.push(slot, cps.length, ...cps, ...new Array(trie.seqMax - cps.length).fill(0));
+        }
+    }
     const r = runPipeline(c.bytes, trie, { items });
 
     const w = new Writer();
-    w.u32(0x46443347); w.u32(4);
+    w.u32(0x46443347); w.u32(5);
     w.u32(c.bytes.length); w.u32(items.length);
     w.u32(trie.blockIndex.length); w.u32(trie.blocks.length);
     w.bytes(c.bytes);
@@ -358,10 +523,21 @@ for (const c of CASES) {
     // precisely so a container change leaves the corpus untouched — decoding here
     // is what makes that true.
     for (let i = 0; i < trie.blocks.length; i++) w.f64(trieLaneValue(trie.blocks, i));
+    // v5: the sequence payload, between the blocks and the item records.
+    w.u32(trie.seq ? c.seqs.length : 0);
+    w.u32(trie.seq ? trie.seqMax : 0);
+    w.f64(trie.seq ? trie.bitmapAdvance : NaN);
+    if (trie.seq) {
+        for (const [slot, cps] of c.seqs) {
+            w.u32(slot); w.u32(cps.length);
+            for (let k = 0; k < trie.seqMax; k++) w.u32(cps[k] ?? 0);
+        }
+    }
     for (const it of items) {
         w.u32(it.byteStart); w.u32(it.byteCount);
         w.f64(it.origin?.x || 0); w.f64(it.origin?.y || 0); w.f64(it.origin?.z || 0);
         w.f64(it.wrapWidth ?? 0); w.f64(it.wrapMode ?? 0);
+        w.f64(it.clusterMode ?? 0);
         w.f64(it.zStep ?? 0); w.f64(it.lineHeight ?? NaN);
         const p = it.page;
         w.f64(p ? 1 : 0);

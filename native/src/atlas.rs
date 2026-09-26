@@ -69,6 +69,29 @@ pub struct TrieTable {
     /// slot record word 3), or `None` for outline/blank slots and for the
     /// web-era bitmap slots the font has no cell for (NO_CELL).
     pub emoji_cell: Vec<Option<u32>>,
+    /// v2: the cluster head's advance (the bitmap 2x cell), fu. On a v1 file
+    /// this is 2 x the primary advance — the same value by the export rule.
+    // Read by the sequence pass: ResolveGlyph::cluster_table hands it to the
+    // fold (fold.rs's resolve_clusters) and text.rs reads it for the head cell.
+    pub bitmap_advance_fu: i32,
+    /// v2: the sequence section's raw words — sequenceCount x (2 + seq_max)
+    /// of [slot, len, cps..], sorted by the codepoint sequence (prefix-
+    /// lexicographic, length tiebreak). Empty on v1 ("no sequences" — the
+    /// leader behavior).
+    // Read by the sequence pass: sequence_lookup binary-searches it per probe.
+    pub sequences: Vec<u32>,
+    /// The probe window's length cap (the section stride is 2 + seq_max).
+    pub seq_max: u32,
+    /// v2: the G3CC class table verbatim (its own header included). Empty on v1.
+    // Carried for the general UAX #29 phase: the landed sequence pass reads no
+    // classes by design (glyph_cluster.mojo says why), so today only
+    // trie_v2_tests exercise it. class_of is its reader.
+    #[allow(dead_code)]
+    pub classes: Vec<u32>,
+    /// The table's first members as a set — the probe's cheap rejection. Built
+    /// once at load from the sequence section itself.
+    // starts_a_sequence reads it per probe.
+    seq_first: std::collections::HashSet<u32>,
 }
 
 impl TrieTable {
@@ -99,14 +122,41 @@ impl TrieTable {
 
         let cp = read_words(&dir.join("codepoints.bin"));
         check_magic(&cp, "G3CP", &dir.join("codepoints.bin"));
+        // v1: 44 B header, no sections. v2 (the sequence pass): 68 B header
+        // with the section descriptors at words 11..16, and the sequence +
+        // class sections appended after the blocks.
+        let version = cp[1];
+        assert!(version == 1 || version == 2, "codepoints.bin: version {version} (expected 1 or 2)");
+        let header_words = if version == 2 { 17 } else { 11 };
         let block_shift = cp[3];
         let block_index_len = cp[4] as usize;
         let block_count = cp[5] as usize;
         let entry_stride = cp[6];
         let mapped_count = cp[7];
-        let block_index = cp[11..11 + block_index_len].to_vec();
+        let (mut bitmap_advance_fu, mut seq_max, mut sequences, mut classes) =
+            (2 * metrics.advance_fu as i32, 0, Vec::new(), Vec::new());
+        if version == 2 {
+            bitmap_advance_fu = cp[11] as i32;
+            let seq_count = cp[12] as usize;
+            seq_max = cp[13];
+            let seq_off = cp[14] as usize;
+            let class_off = cp[15] as usize;
+            let class_words = cp[16] as usize;
+            let seq_words = seq_count * (2 + seq_max as usize);
+            assert_eq!(seq_off, header_words + block_index_len + block_count * 256 * entry_stride as usize,
+                "codepoints.bin: sequence section is not appended after the blocks");
+            sequences = cp[seq_off..seq_off + seq_words].to_vec();
+            classes = cp[class_off..class_off + class_words].to_vec();
+            assert_eq!(classes[0], u32::from_le_bytes(*b"G3CC"), "codepoints.bin: class section is not a G3CC table");
+        }
+        let block_index = cp[header_words..header_words + block_index_len].to_vec();
         let block_words = block_count * (1usize << block_shift) * entry_stride as usize;
-        let blocks = cp[11 + block_index_len..11 + block_index_len + block_words].to_vec();
+        let blocks = cp[header_words + block_index_len..header_words + block_index_len + block_words].to_vec();
+        // The probe's rejection set: the sequence table's own first members.
+        let seq_first = sequences
+            .chunks_exact(2 + seq_max as usize)
+            .map(|e| e[2])
+            .collect();
         let t = Self {
             metrics,
             block_shift,
@@ -116,6 +166,11 @@ impl TrieTable {
             mapped_count,
             slot_count,
             emoji_cell,
+            bitmap_advance_fu,
+            sequences,
+            seq_max,
+            classes,
+            seq_first,
         };
         // Sanity: 'A' must resolve to slot 34 / advance 1229 (FORMAT.md worked example).
         let a = t.lookup(0x41);
@@ -148,6 +203,88 @@ impl TrieTable {
             height_fu: self.blocks[e + 2] as i32,
             flags: self.blocks[e + 3],
         }
+    }
+
+    /// Sequence → slot, binary search over the v2 sequence section. Entries
+    /// are [slot, len, cps..] sorted by the codepoint sequence (elementwise,
+    /// shorter-prefix-first) — the sheet's own table order, asserted at bake.
+    /// The caller probes with the FE0F-normalized codepoints of a candidate
+    /// cluster; None means no such sequence (the fallback is per-codepoint).
+    pub fn sequence_lookup(&self, cps: &[u32]) -> Option<u32> {
+        if self.sequences.is_empty() {
+            return None;
+        }
+        let stride = 2 + self.seq_max as usize;
+        let n = self.sequences.len() / stride;
+        let entry = |i: usize| -> (u32, &[u32]) {
+            let o = i * stride;
+            let len = self.sequences[o + 1] as usize;
+            (self.sequences[o], &self.sequences[o + 2..o + 2 + len])
+        };
+        // Ordering: compare the live cps elementwise; a strict prefix sorts
+        // first (matches the sheet's table order — the writer asserts it).
+        let cmp = |probe: &[u32], entry_cps: &[u32]| {
+            for k in 0..probe.len().min(entry_cps.len()) {
+                match probe[k].cmp(&entry_cps[k]) {
+                    std::cmp::Ordering::Equal => {}
+                    ord => return ord,
+                }
+            }
+            probe.len().cmp(&entry_cps.len())
+        };
+        let mut lo = 0;
+        let mut hi = n;
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            if cmp(cps, entry(mid).1) == std::cmp::Ordering::Greater {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        if lo < n && cmp(cps, entry(lo).1) == std::cmp::Ordering::Equal {
+            Some(entry(lo).0)
+        } else {
+            None
+        }
+    }
+
+    /// Whether this codepoint starts any sequence in the v2 table — the head
+    /// candidacy test the probe runs before paying for a lookup. The set is
+    /// derived from the table's own first members at load, so it can never
+    /// drift from it.
+    pub fn starts_a_sequence(&self, cp: u32) -> bool {
+        self.seq_first.contains(&cp)
+    }
+
+    /// Codepoint → class bits (the G3CC table embedded in the v2 class
+    /// section; range-compressed, binary search by range start). 0 = Other.
+    // The general UAX #29 phase's reader, carried with the table — the landed
+    // sequence pass reads no classes by design, so tests exercise this today.
+    #[allow(dead_code)]
+    pub fn class_of(&self, cp: u32) -> u32 {
+        if self.classes.is_empty() {
+            return 0;
+        }
+        let w = &self.classes;
+        let header_bytes = w[2] as usize / 4;
+        let n = w[3] as usize;
+        let mut lo = 0;
+        let mut hi = n;
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            let s = w[header_bytes + mid * 3];
+            if s <= cp {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        if lo == 0 {
+            return 0;
+        }
+        let (s, e, b) = (w[header_bytes + (lo - 1) * 3], w[header_bytes + (lo - 1) * 3 + 1], w[header_bytes + (lo - 1) * 3 + 2]);
+        if cp >= s && cp <= e { b } else { 0 }
     }
 }
 
@@ -796,5 +933,49 @@ mod emoji_sheet_tests {
         assert_eq!(mip_levels_for(2, 2), 2);
         assert_eq!(mip_levels_for(7, 7), 1);
         assert_eq!(mip_levels_for(1024, 1024), EMOJI_MAX_MIP_LEVELS);
+    }
+}
+
+/// The v2 sequence/class sections in the committed codepoints.bin — the real
+/// artifact, not a synthetic one, because the thing being pinned is exactly
+/// that the artifact carries what the generator promised.
+#[cfg(test)]
+mod trie_v2_tests {
+    use super::*;
+
+    fn load() -> TrieTable {
+        TrieTable::load(&crate::atlas_dir())
+    }
+
+    #[test]
+    fn family_sequence_resolves_to_its_slot() {
+        let t = load();
+        assert!(!t.sequences.is_empty(), "the v2 sequence section is present");
+        // The gen_real_trie.py pin, checked on this side too: the family's
+        // slot moves only if the sheet's sequence table does.
+        let fam = [0x1F468, 0x200D, 0x1F469, 0x200D, 0x1F467];
+        assert_eq!(t.sequence_lookup(&fam), Some(6819));
+        // A partial prefix is NOT a table entry (longest-match is the rule).
+        assert_eq!(t.sequence_lookup(&fam[..3]), None);
+        // The singleton-codepoint case is not a sequence either.
+        assert_eq!(t.sequence_lookup(&[0x1F600]), None);
+        // A flag pair resolves; an unpaired triple does not.
+        assert!(t.sequence_lookup(&[0x1F1E6, 0x1F1E8]).is_some());
+        assert_eq!(t.sequence_lookup(&[0x1F1E6, 0x1F1E8, 0x1F1E9]), None);
+    }
+
+    #[test]
+    fn class_table_answers_the_named_pins() {
+        let t = load();
+        assert!(!t.classes.is_empty(), "the v2 class section is present");
+        let bit = |b: u32| 1 << b;
+        assert_eq!(t.class_of(0x200D) & bit(1), bit(1), "ZWJ");
+        assert_eq!(t.class_of(0x1F1E6) & bit(2), bit(2), "regional indicator");
+        assert_eq!(t.class_of(0x1F600) & bit(11), bit(11), "extended pictographic");
+        assert_eq!(t.class_of(0xFE0F) & bit(0), bit(0), "VS16 is Extend");
+        assert_eq!(t.class_of(0x1F3FB) & (bit(0) | bit(12)), bit(0) | bit(12), "skin tone is Extend+Modifier");
+        assert_eq!(t.class_of(0x0A) & bit(3), bit(3), "LF is Control");
+        assert_eq!(t.class_of(0x41), 0, "'A' is Other");
+        assert_eq!(t.class_of(0x110000), 0, "past the last scalar is Other");
     }
 }

@@ -100,7 +100,7 @@ comptime IM_DEPTH_PER_COL = 6
 comptime IM_PAGE_STRIDE_X = 7
 comptime IM_ORIGIN_X = 8
 
-comptime IE_STRIDE = 7
+comptime IE_STRIDE = 8
 comptime IE_PAGE_ROWS = 0
 comptime IE_PAGE_COLS = 1
 comptime IE_SCROLL_ROWS = 2
@@ -108,6 +108,7 @@ comptime IE_PAGES_WIDE = 3
 comptime IE_WRAP_WIDTH = 4
 comptime IE_HAS_PAGE = 5
 comptime IE_WRAP_MODE = 6
+comptime IE_CLUSTER_MODE = 7
 
 # Per-item bounds + fold scalars. Lane kinds matter on device: Metal has no f64,
 # so counts go to native u32 atomics and measures to f32 ordered keys.

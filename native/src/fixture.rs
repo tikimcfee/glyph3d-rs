@@ -8,7 +8,7 @@
 //! `load_trie_auto` and never looked inside.
 //!
 //! THE FORMAT is `engine/fixture_io.mojo`, mirrored section for section. It is
-//! frozen on disk (v3) and deliberately independent of any layer's container:
+//! frozen on disk (v5) and deliberately independent of any layer's container:
 //! it carries the oracle's VALUES, and each loader realizes its own carriers.
 //! This one performs the same carrier split the Mojo loader does — trie
 //! measures narrowed f64 -> f32, identity and bitfield to native u32 — because
@@ -33,7 +33,7 @@ use crate::text::{ResolveGlyph, WorldEntry};
 
 /// 'G3DF' — a pipeline fixture.
 const PIPE_MAGIC: u32 = 0x4644_3347;
-const PIPE_VERSION: u32 = 4;
+const PIPE_VERSION: u32 = 5;
 
 /// Fixture lane strides. These are the ON-DISK strides from
 /// `schema/glyph-identity.json` (FIXTURE_MEASURE_STRIDE / FIXTURE_COUNT_STRIDE),
@@ -179,6 +179,14 @@ pub struct FixtureTrie {
     pub blocks_m: Vec<f32>,
     /// identity + bitfield, 2 per entry: [GLYPH_ID, FLAGS]
     pub blocks_c: Vec<u32>,
+    /// v5: the sequence payload — the flat [slot, len, cps..] x seq_count table
+    /// a cluster-mode item resolves against. Empty = "no sequences". Rides the
+    /// trie exactly like the v2 blob's sections ride the engine's Trie.
+    pub seq: Vec<u32>,
+    pub seq_max: u32,
+    /// The head advance a resolved sequence carries (NaN when seq is empty —
+    /// the generator's "poison the value that must be absent" rule).
+    pub bitmap_advance: f32,
 }
 
 impl ResolveGlyph for FixtureTrie {
@@ -198,6 +206,15 @@ impl ResolveGlyph for FixtureTrie {
             advance: self.blocks_m[e * 2],
             height: self.blocks_m[e * 2 + 1],
             flags: self.blocks_c[e * 2 + 1],
+        }
+    }
+
+    /// The v5 payload, on the trie as it is in the Mojo loader.
+    fn cluster_table(&self) -> Option<(&[u32], u32, f32)> {
+        if self.seq.is_empty() {
+            None
+        } else {
+            Some((&self.seq, self.seq_max, self.bitmap_advance))
         }
     }
 }
@@ -273,6 +290,24 @@ fn load_pipe_bytes(raw: &[u8], name: String) -> Result<PipeFixture, String> {
     }
 
     let mut items = Vec::with_capacity(item_count);
+    // v5: the sequence payload sits between the blocks and the item records.
+    let seq_count = r.u32()? as usize;
+    let seq_max = r.u32()?;
+    let bitmap_advance = r.f64()?;
+    if seq_count == 0 && !bitmap_advance.is_nan() {
+        return Err("seq payload with 0 entries must carry a NaN advance".into());
+    }
+    if seq_count > 0 && bitmap_advance.is_nan() {
+        return Err("seq payload with entries must carry a finite advance".into());
+    }
+    let mut seq = Vec::with_capacity(seq_count * (2 + seq_max as usize));
+    for _ in 0..seq_count {
+        seq.push(r.u32()?); // slot
+        seq.push(r.u32()?); // len
+        for _ in 0..seq_max {
+            seq.push(r.u32()?); // cps (0-padded)
+        }
+    }
     for _ in 0..item_count {
         items.push(Item {
             byte_start: r.u32()? as i64,
@@ -287,6 +322,8 @@ fn load_pipe_bytes(raw: &[u8], name: String) -> Result<PipeFixture, String> {
             // parameter — item-level, never per line. An out-of-range code is
             // refused rather than defaulted (`WrapMode::from_code`).
             wrap_mode: crate::fold::WrapMode::from_code(r.f64()? as i64),
+            // v5: the cluster MODE, beside the wrap mode — same kind, same rule.
+            cluster_mode: crate::fold::ClusterMode::from_code(r.f64()? as i64),
             z_step: r.f64()?,
             line_height: r.f64()?,
             has_page: r.f64()? > 0.5,
@@ -351,6 +388,9 @@ fn load_pipe_bytes(raw: &[u8], name: String) -> Result<PipeFixture, String> {
             block_index,
             blocks_m,
             blocks_c,
+            seq,
+            seq_max,
+            bitmap_advance: bitmap_advance as f32,
         },
         items,
         exp_leaders,
@@ -438,6 +478,19 @@ impl PipeFixture {
         for &v in &self.trie.blocks_c {
             h_tc.u32(v);
         }
+        // v5: the sequence payload rides the trie in both loaders, so its hash
+        // sits with the trie's, in disk order. The advance hashes as its
+        // narrowed f32 bits (the parsed carrier, matching h.tm), with a
+        // sentinel for the NaN that means "no sequences" — two platforms
+        // narrowing NaN is not a bit-exact path, so the sentinel replaces it.
+        let mut h_seq = Fnv::default();
+        let seq_count = if self.trie.seq.is_empty() { 0 } else { self.trie.seq.len() / (2 + self.trie.seq_max as usize) };
+        h_seq.u32(seq_count as u32);
+        h_seq.u32(self.trie.seq_max);
+        for &v in &self.trie.seq {
+            h_seq.u32(v);
+        }
+        h_seq.u32(if self.trie.bitmap_advance.is_nan() { u32::MAX } else { self.trie.bitmap_advance.to_bits() });
         let mut h_items = Fnv::default();
         for it in &self.items {
             h_items.i64(it.byte_start);
@@ -447,6 +500,7 @@ impl PipeFixture {
             h_items.f64(it.origin_z);
             h_items.i64(it.wrap_width);
             h_items.i64(it.wrap_mode.code());
+            h_items.i64(it.cluster_mode.code());
             h_items.f64(it.z_step);
             h_items.f64(it.line_height);
             h_items.u8(u8::from(it.has_page));
@@ -499,11 +553,12 @@ impl PipeFixture {
         );
         let _ = write!(
             s,
-            " h.bytes={} h.tindex={} h.tm={} h.tc={} h.items={} h.miss={} h.otb={} h.meas={} h.cnt={} h.bnds={} h.batch={}",
+            " h.bytes={} h.tindex={} h.tm={} h.tc={} h.seq={} h.items={} h.miss={} h.otb={} h.meas={} h.cnt={} h.bnds={} h.batch={}",
             h_bytes.hex(),
             h_tindex.hex(),
             h_tm.hex(),
             h_tc.hex(),
+            h_seq.hex(),
             h_items.hex(),
             h_miss.hex(),
             h_otb.hex(),
@@ -695,6 +750,14 @@ fn out_of_domain(fx: &PipeFixture) -> Option<String> {
     // out as if it had not is how a domain gap becomes a false green.
     if it.wrap_mode != crate::fold::WrapMode::Down {
         return Some("wrap_mode=Back".to_string());
+    }
+    // The sequence pass rewrites the static tier before the fold; this
+    // reference deliberately folds leader-mode only — the pass lives in the
+    // twins (text.rs's stage_file, the engine), and engine-check feeds this
+    // reference ItemParams::default. A cluster-mode item is out of its
+    // declared domain — same reasoning as the wrap-mode line above.
+    if it.cluster_mode != crate::fold::ClusterMode::Leader {
+        return Some("cluster_mode=Cluster".to_string());
     }
     if it.has_page {
         return Some("paged".to_string());
@@ -1322,10 +1385,11 @@ mod tests {
         // Full consumption is asserted inside the loader, so reaching Ok() here
         // IS the structural check — a wrong stride cannot get this far.
         let paths = all_fixtures();
-        // 17 since the three WrapBack fixtures landed (was 14). Pinned as a
+        // 26 since cluster-overlap landed for the split-form proof (was 25,
+        // 17 before the sequence-pass fixtures). Pinned as a
         // COUNT rather than a nonzero check: a fixture that stopped being
         // discovered would otherwise quietly lower coverage instead of failing.
-        assert_eq!(paths.len(), 17, "corpus size changed — update the expectation deliberately");
+        assert_eq!(paths.len(), 26, "corpus size changed — update the expectation deliberately");
         for p in &paths {
             let fx = load_pipe_fixture(p).unwrap_or_else(|e| panic!("{}", e));
             assert_eq!(fx.exp_measures.len(), fx.byte_len * FIXTURE_MEASURE_STRIDE);
