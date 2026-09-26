@@ -596,6 +596,49 @@ def mark(ctx: DeviceContext, mut t_prev: Int, mut stages: List[Int], idx: Int) r
     t_prev = t_now
 
 
+comptime PREP_STAGES = 14
+
+
+def pmark(mut tk: Int, mut pk: List[Int], idx: Int):
+    """Prep-stage timing: stamp into bucket idx, retake the base. Unlike mark
+    there is no synchronize here — prep's dispatches are async submissions, so
+    `upload-sub` measures submission cost and the transfer itself lands in
+    `drain` (the final sync before the chain)."""
+    var t_now = perf_counter_ns()
+    pk[idx] = t_now - tk
+    tk = t_now
+
+
+def prep_stage_name(i: Int) -> String:
+    if i == 0:
+        return "facts-a"
+    if i == 1:
+        return "facts-b"
+    if i == 2:
+        return "item-tabs"
+    if i == 3:
+        return "host-bufs-a"
+    if i == 4:
+        return "host-bufs-b"
+    if i == 5:
+        return "mode0-decode"
+    if i == 6:
+        return "trie-tabs"
+    if i == 7:
+        return "lane-fills"
+    if i == 8:
+        return "host-bufs-c"
+    if i == 9:
+        return "item-fills"
+    if i == 10:
+        return "device-bufs"
+    if i == 11:
+        return "upload-sub"
+    if i == 12:
+        return "dev-fills"
+    return "drain"
+
+
 def check_case(path: String, ctx: DeviceContext) raises -> Int:
     # Every fixture runs mode 0 (CPU-decoded statics, unfused probe), mode 2
     # (fused decode+probe, binary search) AND mode 3 (fused, state walk)
@@ -634,6 +677,8 @@ def check_fixture(var fx: PipeFixture, ctx: DeviceContext, bench: Bool = False, 
     # Everything from here to the first dispatch is the host prep the mode pays
     # for: mode 0's price includes a whole leader-forced CPU pipeline run.
     var t_prep = perf_counter_ns()
+    var pk = List[Int](length=PREP_STAGES, fill=0)
+    var tk = t_prep
 
     # Per-byte item facts, as the GPU pipeline gets them from itemStarts.
     var wrap_of = List[UInt32](unsafe_uninit_length=n)
@@ -648,6 +693,7 @@ def check_fixture(var fx: PipeFixture, ctx: DeviceContext, bench: Bool = False, 
         mode_of[id] = UInt32(fx.items[i].wrap_mode) if i >= 0 else 0
         is_start[id] = UInt32(1) if (i >= 0 and fx.items[i].byte_start == id) else UInt32(0)
         item_start[id] = UInt32(fx.items[i].byte_start) if i >= 0 else UInt32(0)
+    pmark(tk, pk, 0)
 
     # The sequence pass runs ON DEVICE here (it used to arrive pre-computed in
     # the uploaded lanes). Mode 0 seeds the decoded-but-unresolved statics from
@@ -664,6 +710,7 @@ def check_fixture(var fx: PipeFixture, ctx: DeviceContext, bench: Bool = False, 
         var i = item_for_byte(fx.items, id)
         item_end_of[id] = UInt32(fx.items[i].byte_start + fx.items[i].byte_count) if i >= 0 else 0
         cluster_of[id] = UInt32(1) if (i >= 0 and fx.items[i].cluster_mode == CLUSTER_CLUSTER) else UInt32(0)
+    pmark(tk, pk, 1)
     var item_count = len(fx.items)
     var item_ranges = List[UInt32](unsafe_uninit_length=item_count * 2)
     var item_cluster = List[UInt32](unsafe_uninit_length=item_count)
@@ -674,6 +721,7 @@ def check_fixture(var fx: PipeFixture, ctx: DeviceContext, bench: Bool = False, 
     var seq_count = 0
     if fx.trie.seq_max > 0:
         seq_count = len(fx.trie.seq) // (2 + fx.trie.seq_max)
+    pmark(tk, pk, 2)
 
     # ── upload the DECODED lanes (decode itself is proven in gpu_decode) ─────
     var h_fl = ctx.enqueue_create_host_buffer[DType.uint32](n)
@@ -688,6 +736,7 @@ def check_fixture(var fx: PipeFixture, ctx: DeviceContext, bench: Bool = False, 
     var h_wc = ctx.enqueue_create_host_buffer[DType.uint32](n)
     var h_otb = ctx.enqueue_create_host_buffer[DType.uint32](n)
     ctx.synchronize()
+    pmark(tk, pk, 3)
     # The seeded statics are the LEADER-FORCED decode (unresolved): the pass
     # itself is what the device must produce, so the resolved form cannot be
     # handed to it. ROW/COL/ORD/LINE_ADV stay zeroed as before. Modes 1/2 skip
@@ -722,6 +771,7 @@ def check_fixture(var fx: PipeFixture, ctx: DeviceContext, bench: Bool = False, 
     var n_st = len(st_tab) if len(st_tab) > 0 else 1
     var h_tab = ctx.enqueue_create_host_buffer[DType.uint32](n_st)
     ctx.synchronize()
+    pmark(tk, pk, 4)
     if mode == 3:
         for i in range(len(st_tab)):
             h_tab[i] = st_tab[i]
@@ -737,6 +787,7 @@ def check_fixture(var fx: PipeFixture, ctx: DeviceContext, bench: Bool = False, 
             h_gi[id] = dec.gi[id]
         for i in range(n * SM_STRIDE):
             h_sm[i] = dec.sm[i]
+    pmark(tk, pk, 5)
     if mode != 0:
         for i in range(n_idx):
             h_index[i] = fx.trie.block_index[i]
@@ -756,6 +807,7 @@ def check_fixture(var fx: PipeFixture, ctx: DeviceContext, bench: Bool = False, 
     var head_bmp = build_head_bitmap(fx.trie)
     for i in range(HEAD_BMP_WORDS):
         h_bmp[i] = head_bmp[i]
+    pmark(tk, pk, 6)
     for i in range(item_count * 2):
         h_ir[i] = item_ranges[i]
     for i in range(item_count):
@@ -772,6 +824,7 @@ def check_fixture(var fx: PipeFixture, ctx: DeviceContext, bench: Bool = False, 
         h_wm[i] = 0
         h_wc[i] = 0
         h_otb[i] = 0
+    pmark(tk, pk, 7)
 
     var ni0 = fx.item_count if fx.item_count > 0 else 1
     var h_it = ctx.enqueue_create_host_buffer[DType.float32](ni0 * IM_STRIDE)
@@ -783,6 +836,7 @@ def check_fixture(var fx: PipeFixture, ctx: DeviceContext, bench: Bool = False, 
     # device home (it lived only in the host's between-dispatches derive).
     var h_pg = ctx.enqueue_create_host_buffer[DType.float32](ni0)
     ctx.synchronize()
+    pmark(tk, pk, 8)
     for i in range(ni0 * IM_STRIDE):
         h_it[i] = 0
     for i in range(ni0 * IE_STRIDE):
@@ -812,6 +866,7 @@ def check_fixture(var fx: PipeFixture, ctx: DeviceContext, bench: Bool = False, 
     for i in range(ni0):
         h_rmax[i] = 0
         h_xmax[i] = 0
+    pmark(tk, pk, 9)
 
     var d_fl = ctx.enqueue_create_buffer[DType.uint32](n)
     var d_sm = ctx.enqueue_create_buffer[DType.float32](n * SM_STRIDE)
@@ -870,6 +925,7 @@ def check_fixture(var fx: PipeFixture, ctx: DeviceContext, bench: Bool = False, 
     # The zone-index byte table and the cascaded zone outs (chain=1).
     var d_czidx = ctx.enqueue_create_buffer[DType.uint8](((n + 127) >> 7) * BLOCK)
     var d_csc = ctx.enqueue_create_buffer[DType.uint32](((n + 127) >> 7) * (CLIST_CAP + 1))
+    pmark(tk, pk, 10)
     if mode == 0:
         ctx.enqueue_copy(dst_buf=d_fl, src_buf=h_fl)
         ctx.enqueue_copy(dst_buf=d_sm, src_buf=h_sm)
@@ -909,6 +965,7 @@ def check_fixture(var fx: PipeFixture, ctx: DeviceContext, bench: Bool = False, 
     ctx.enqueue_copy(dst_buf=d_cof, src_buf=h_cof)
     ctx.enqueue_copy(dst_buf=d_ir, src_buf=h_ir)
     ctx.enqueue_copy(dst_buf=d_ic, src_buf=h_ic)
+    pmark(tk, pk, 11)
     d_cslot.enqueue_fill(0)
     d_cend.enqueue_fill(0)
     d_cblk.enqueue_fill(0)
@@ -920,11 +977,13 @@ def check_fixture(var fx: PipeFixture, ctx: DeviceContext, bench: Bool = False, 
     d_um.enqueue_fill(0.0)
     d_fm.enqueue_fill(0.0)
     d_xm.enqueue_fill(0.0)
+    pmark(tk, pk, 12)
 
     # ── the chain. Every intermediate stays on device. ──────────────────────
     ctx.synchronize()
     var g0 = perf_counter_ns()
     var prep_ns = g0 - t_prep
+    pmark(tk, pk, 13)
     var stages = List[Int](length=17, fill=0)
     var t_prev = g0
     comptime B = 128
@@ -1155,6 +1214,8 @@ def check_fixture(var fx: PipeFixture, ctx: DeviceContext, bench: Bool = False, 
         if profile:
             for i in range(17):
                 print("      ", stage_name(i), Float64(stages[i]) / 1e6, "ms")
+            for i in range(PREP_STAGES):
+                print("      prep/", prep_stage_name(i), Float64(pk[i]) / 1e6, "ms")
         return 0
 
     # ── the tiered comparison ───────────────────────────────────────────────
