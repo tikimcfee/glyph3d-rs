@@ -995,6 +995,13 @@ pub struct LiveSource {
     /// Latest style runs per file — the restyle memory. Pub so a linked
     /// embedder can construct the source; leave it empty.
     pub last_style: std::collections::HashMap<String, crate::seam::SurfaceUpdate>,
+    /// Arrivals that reached the embedder BEFORE the loop started (its
+    /// staging drain can't apply deltas — the poll's apply logic didn't
+    /// exist yet). The FIRST poll replays them ahead of the channel;
+    /// dropping them instead would desynchronize the content map from the
+    /// provider's mirror, and the version join would then rightly refuse
+    /// every subsequent edit (measured live — that was the 0-glyphs bug).
+    pub backlog: Vec<crate::seam::SurfaceUpdate>,
 }
 
 /// P1-live: drain arrived envelopes, apply deltas, rebuild the scene from
@@ -1008,7 +1015,7 @@ fn poll_live(
     state: &mut WindowState,
 ) {
     let Some(src) = live else { return };
-    let mut arrived = Vec::new();
+    let mut arrived: Vec<crate::seam::SurfaceUpdate> = std::mem::take(&mut src.backlog);
     while let Ok(update) = src.rx.try_recv() {
         arrived.push(update);
     }

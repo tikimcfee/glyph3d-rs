@@ -194,6 +194,7 @@ fn run_live(
     trie: PathBuf,
 ) -> anyhow::Result<()> {
     let mut content: HashMap<String, Arc<Vec<u8>>> = HashMap::new();
+    let mut backlog: Vec<SurfaceUpdate> = Vec::new();
     let deadline = Instant::now() + Duration::from_millis(2500);
     while Instant::now() < deadline {
         match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
@@ -204,8 +205,15 @@ fn run_live(
                     update.version.0,
                     update.style.len()
                 );
+                // Openeds stage now; anything else (the script can start the
+                // moment the Openeds are out — the release provider is fast)
+                // is RETAINED for the first poll. Dropping it desyncs the
+                // content map from the provider's mirror, and the version
+                // join would refuse every edit after (the live-measured bug).
                 if let ContentDelta::Opened(bytes) = &update.content {
                     content.insert(update.file.0.clone(), Arc::new(bytes.clone()));
+                } else {
+                    backlog.push(update);
                 }
             }
             Err(mpsc::RecvTimeoutError::Timeout) => break,
@@ -241,6 +249,7 @@ fn run_live(
         trie,
         emoji_sheet: glyph3d_native::default_emoji_sheet(),
         last_style: HashMap::new(),
+        backlog,
     };
     glyph3d_native::windowed::run(
         ctx,
