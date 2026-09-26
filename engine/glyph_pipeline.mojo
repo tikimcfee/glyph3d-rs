@@ -741,6 +741,39 @@ def item_for_byte(items: List[Item], id: Int) -> Int:
     return lo
 
 
+def item_search_device(
+    ranges: MutPointer[UInt32, MutAnyOrigin], item_count: Int, id: Int
+) -> Int:
+    """item_for_byte over the DEVICE item-ranges array: largest item whose
+    start ≤ id. Same (lo + hi + 1) >> 1, same branch — a transcription, not a
+    re-derivation; gpu_paginate.mojo's item_search is the same line over a
+    starts-only array, this one reads the (start, end) PAIRS the pipeline
+    already uploads, so the start lane is stride 2. The bounded 32-step loop
+    with an early break is gpu_paginate's form (a GPU wants a static trip
+    count; 32 steps covers 2^32 items).
+
+    NO OWNERSHIP CHECK, exactly like the host original and the host facts walk
+    it lets the kernels replace: a byte in a gap between items (or past the
+    last item's end) resolves to the item that most recently STARTED. The
+    consumers' own gates decide whether that read is used — the same contract
+    the uploaded per-byte arrays encoded. item_count ≤ 1 short-circuits: the
+    single-item corpus pays zero search, and the zero-item arena (which the
+    scan reference rejects before any kernel runs) never touches the array."""
+    if item_count <= 1:
+        return 0
+    var lo = 0
+    var hi = item_count - 1
+    for _ in range(32):
+        if lo >= hi:
+            break
+        var mid = (lo + hi + 1) >> 1
+        if Int(ranges[unsafe_offset = mid * 2]) <= id:
+            lo = mid
+        else:
+            hi = mid - 1
+    return lo
+
+
 def rows_for_line(length: Int, wrap: Int, mode: Int = WRAP_DOWN) -> Int:
     """Visual rows a line of `length` cells occupies under `wrap` and `mode`.
 

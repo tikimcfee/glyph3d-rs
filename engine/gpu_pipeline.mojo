@@ -15,13 +15,17 @@
 #   ROW / COL / ORD / ordToByte   exact (they are counts; nothing may round)
 #   LINE_ADV                      eps    (foldless f64 prefix vs the scan's grouping)
 #
-# The statics arrive in one of three modes (check_fixture's `mode`): 0 decodes on
+# The statics arrive in one of four modes (check_fixture's `mode`): 0 decodes on
 # CPU and uploads (the shipped form); 1 decodes on device with the probe unfused;
 # 2 fuses decode+probe into k_decode_probe — the probe's head arrives in registers
-# instead of being re-walked from bytes, and no statics cross the bus at all. The
-# suite runs 0 and 2 over every fixture and synthetic case; modes 1/2 add a
-# bit-exact gi/sm tier against the reference's RESOLVED statics, so the device
-# decode is pinned end to end, not assumed from gpu_decode's isolated proof.
+# instead of being re-walked from bytes, and no statics cross the bus at all; 3
+# swaps the probe's table form for the state walk's hash. The suite runs 0, 2 and
+# 3 over every fixture and synthetic case (plus 3 with the chunked chain); modes
+# 1/2/3 add a bit-exact gi/sm tier against the reference's RESOLVED statics, so
+# the device decode is pinned end to end, not assumed from gpu_decode's isolated
+# proof. The per-byte ITEM facts (wrap/mode/start/cluster, 28 B/byte of upload)
+# are gone entirely: the kernels resolve an item per thread from the item-ranges
+# table on device (ItemWalk / item_search_device).
 #
 # The monoid lives in one place (`E` + `combine` below) and every scan dispatch calls
 # it, so the seven kernels cannot drift from each other the way seven
@@ -51,6 +55,7 @@ from glyph_schema import (
 from glyph_pipeline import (
     F_LEADER, F_NEWLINE,
     WRAP_DOWN, WRAP_BACK, run_pipeline, CLUSTER_LEADER, CLUSTER_CLUSTER,
+    item_search_device,
 )
 
 
@@ -219,16 +224,78 @@ def p_store(pc: MutPointer[UInt32, MutAnyOrigin], pm: MutPointer[Float32, MutAny
     pm[unsafe_offset = i * PARTIAL_MEASURE_STRIDE + PM_TAIL_ADV] = e.tail_adv
 
 
+struct ItemWalk:
+    """The item-facts merge walk, device side. Seed once per thread (one
+    binary search into the item ranges), then step while the next item's
+    start passes the byte — register-resident, replacing the per-byte loads
+    of the w/md/s/is arrays (16 B/byte on the bus) with a walk over an
+    item_count-sized table that rides in cache. The while-step (not an if)
+    keeps stacked byte_starts on item_for_byte's largest-start-≤-id semantics
+    — the host facts walk made the same choice. With an empty item list the
+    seed leaves start=0/wrap=0/mode=WRAP_DOWN and reset_at never fires — the
+    old zero-fill, exactly (unreachable through the harnesses: the scan
+    reference rejects an empty arena before any kernel runs, but a kernel
+    can't see its callers)."""
+    var it: Int      # the owning item
+    var start: Int   # its byte_start
+    var nxt: Int     # the NEXT item's byte_start (n when it is last)
+    var wrap: Int    # its wrap width
+    var mode: Int    # its wrap mode
+    var has: Bool    # item_count > 0
+
+    def __init__(
+        out self,
+        ir: MutPointer[UInt32, MutAnyOrigin],
+        ie: MutPointer[UInt32, MutAnyOrigin],
+        item_count: Int,
+        id: Int,
+        n: Int,
+    ):
+        self.it = 0
+        self.start = 0
+        self.nxt = n
+        self.wrap = 0
+        self.mode = WRAP_DOWN
+        self.has = item_count > 0
+        if self.has:
+            self.it = item_search_device(ir, item_count, id)
+            self.start = Int(ir[unsafe_offset = self.it * 2])
+            self.nxt = Int(ir[unsafe_offset = (self.it + 1) * 2]) if self.it + 1 < item_count else n
+            self.wrap = Int(ie[unsafe_offset = self.it * IE_STRIDE + IE_WRAP_WIDTH])
+            self.mode = Int(ie[unsafe_offset = self.it * IE_STRIDE + IE_WRAP_MODE])
+
+    def step(
+        mut self,
+        ir: MutPointer[UInt32, MutAnyOrigin],
+        ie: MutPointer[UInt32, MutAnyOrigin],
+        item_count: Int,
+        id: Int,
+        n: Int,
+    ):
+        while self.has and self.nxt <= id:
+            self.it += 1
+            self.start = Int(ir[unsafe_offset = self.it * 2])
+            self.nxt = Int(ir[unsafe_offset = (self.it + 1) * 2]) if self.it + 1 < item_count else n
+            self.wrap = Int(ie[unsafe_offset = self.it * IE_STRIDE + IE_WRAP_WIDTH])
+            self.mode = Int(ie[unsafe_offset = self.it * IE_STRIDE + IE_WRAP_MODE])
+
+    def reset_at(self, id: Int) -> Int:
+        return Int(self.has and id == self.start)
+
+
 def leaf_of(
     fl: MutPointer[UInt32, MutAnyOrigin], sm: MutPointer[Float32, MutAnyOrigin],
-    wrap_of: MutPointer[UInt32, MutAnyOrigin], mode_of: MutPointer[UInt32, MutAnyOrigin],
-    is_start: MutPointer[UInt32, MutAnyOrigin],
+    wrap: Int, mode: Int, reset: Int,
     id: Int,
 ) -> E:
+    """The one-byte leaf. The item facts arrive as SCALARS from the caller's
+    merge walk (chunk kernels) or search (byte kernels) — they used to be three
+    per-byte arrays (wrap_of/mode_of/is_start, 12 B/byte on the bus) answering
+    a question that is a function of item_count, not of n."""
     var e = E()
-    e.reset = Int(is_start[unsafe_offset=id])
-    e.wrap = Int(wrap_of[unsafe_offset=id])
-    e.mode = Int(mode_of[unsafe_offset=id])
+    e.reset = reset
+    e.wrap = wrap
+    e.mode = mode
     var f = Int(fl[unsafe_offset=id])
     if (f & F_LEADER) == 0:
         return e^
@@ -245,10 +312,9 @@ def leaf_of(
 # ── dispatch 2: chunkReduce — thread per chunk ──────────────────────────────
 def k_chunk_reduce(
     fl: MutPointer[UInt32, MutAnyOrigin], sm: MutPointer[Float32, MutAnyOrigin],
-    wrap_of: MutPointer[UInt32, MutAnyOrigin], mode_of: MutPointer[UInt32, MutAnyOrigin],
-    is_start: MutPointer[UInt32, MutAnyOrigin],
+    ir: MutPointer[UInt32, MutAnyOrigin], ie: MutPointer[UInt32, MutAnyOrigin],
     pc: MutPointer[UInt32, MutAnyOrigin], pm: MutPointer[Float32, MutAnyOrigin],
-    n_bytes: Int32, k: Int32, n_chunks: Int32,
+    n_bytes: Int32, k: Int32, n_chunks: Int32, item_count: Int32,
 ):
     var c = global_idx.x
     if c >= Int(n_chunks):
@@ -261,8 +327,10 @@ def k_chunk_reduce(
     var to = (c + 1) * Int(k)
     if to > n:
         to = n
+    var w = ItemWalk(ir, ie, Int(item_count), id, n)
     while id < to:
-        combine(acc, leaf_of(fl, sm, wrap_of, mode_of, is_start, id))
+        w.step(ir, ie, Int(item_count), id, n)
+        combine(acc, leaf_of(fl, sm, w.wrap, w.mode, w.reset_at(id), id))
         id += 1
     p_store(pc, pm, c, acc)
 
@@ -326,13 +394,11 @@ def k_partial_scan(
 def k_apply(
     fl: MutPointer[UInt32, MutAnyOrigin], sm: MutPointer[Float32, MutAnyOrigin],
     lm: MutPointer[Float32, MutAnyOrigin], lc: MutPointer[UInt32, MutAnyOrigin],
-    wrap_of: MutPointer[UInt32, MutAnyOrigin], mode_of: MutPointer[UInt32, MutAnyOrigin],
-    is_start: MutPointer[UInt32, MutAnyOrigin],
-    item_start: MutPointer[UInt32, MutAnyOrigin],
+    ir: MutPointer[UInt32, MutAnyOrigin], ie: MutPointer[UInt32, MutAnyOrigin],
     xc: MutPointer[UInt32, MutAnyOrigin], xm: MutPointer[Float32, MutAnyOrigin],
     wm: MutPointer[Float32, MutAnyOrigin], wc: MutPointer[UInt32, MutAnyOrigin],
     otb: MutPointer[UInt32, MutAnyOrigin],
-    n_bytes: Int32, k: Int32, n_chunks: Int32,
+    n_bytes: Int32, k: Int32, n_chunks: Int32, item_count: Int32,
 ):
     var c = global_idx.x
     if c >= Int(n_chunks):
@@ -345,16 +411,19 @@ def k_apply(
     if id >= to:
         return
     var run = p_load(xc, xm, c)
+    var w = ItemWalk(ir, ie, Int(item_count), id, n)
     while id < to:
-        if Int(is_start[unsafe_offset=id]) != 0:
+        w.step(ir, ie, Int(item_count), id, n)
+        var reset = w.reset_at(id)
+        if reset != 0:
             run = E()
-            run.wrap = Int(wrap_of[unsafe_offset=id])
-            run.mode = Int(mode_of[unsafe_offset=id])
+            run.wrap = w.wrap
+            run.mode = w.mode
         var f = Int(fl[unsafe_offset=id])
         if (f & F_LEADER) != 0:
             # lanes_from_prefix, inline
-            var wrap = Int(wrap_of[unsafe_offset=id])
-            var mode = Int(mode_of[unsafe_offset=id])
+            var wrap = w.wrap
+            var mode = w.mode
             var col = run.tail_len
             var closed = 0
             if run.nl > 0:
@@ -367,8 +436,8 @@ def k_apply(
             # own device buffers, mirroring the CPU container exactly.
             wc[unsafe_offset=id] = UInt32(run.glyphs)
             wm[unsafe_offset=id] = run.tail_adv
-            otb[unsafe_offset = Int(item_start[unsafe_offset=id]) + run.glyphs] = UInt32(id)
-        combine(run, leaf_of(fl, sm, wrap_of, mode_of, is_start, id))
+            otb[unsafe_offset = w.start + run.glyphs] = UInt32(id)
+        combine(run, leaf_of(fl, sm, w.wrap, w.mode, reset, id))
         id += 1
 
 
@@ -377,12 +446,11 @@ def k_resolve_x(
     sm: MutPointer[Float32, MutAnyOrigin], fl: MutPointer[UInt32, MutAnyOrigin],
     lm: MutPointer[Float32, MutAnyOrigin], lc: MutPointer[UInt32, MutAnyOrigin],
     items: MutPointer[Float32, MutAnyOrigin],
-    items_e: MutPointer[UInt32, MutAnyOrigin], item_of: MutPointer[UInt32, MutAnyOrigin],
-    item_start: MutPointer[UInt32, MutAnyOrigin],
+    items_e: MutPointer[UInt32, MutAnyOrigin], item_ranges: MutPointer[UInt32, MutAnyOrigin],
     wm: MutPointer[Float32, MutAnyOrigin], wc: MutPointer[UInt32, MutAnyOrigin],
     otb: MutPointer[UInt32, MutAnyOrigin],
     row_max: MutPointer[UInt32, MutAnyOrigin], x_max: MutPointer[UInt32, MutAnyOrigin],
-    n_bytes: Int32,
+    n_bytes: Int32, item_count: Int32,
 ):
     """Resolve x from the EXACT lanes and place the unpaginated position.
 
@@ -398,8 +466,10 @@ def k_resolve_x(
         return
     if (Int(fl[unsafe_offset=id]) & F_LEADER) == 0:
         return
+    if Int(item_count) == 0:
+        return  # unreachable through the harnesses (the scan reference rejects an empty arena first) — a kernel can't see its callers
     var mo = id * LM_STRIDE
-    var it = Int(item_of[unsafe_offset=id])
+    var it = item_search_device(item_ranges, Int(item_count), id)
     var io = it * IM_STRIDE
     var ie = it * IE_STRIDE
 
@@ -415,7 +485,7 @@ def k_resolve_x(
     if fold > 0:
         var k = col % fold
         while k >= 1:
-            var q = Int(otb[unsafe_offset = Int(item_start[unsafe_offset=id]) + ord - k])
+            var q = Int(otb[unsafe_offset = Int(item_ranges[unsafe_offset = it * 2]) + ord - k])
             x = x + sm[unsafe_offset = q * SM_STRIDE + SM_ADVANCE]
             k -= 1
     else:
@@ -541,15 +611,17 @@ def k_paginate(
     lm: MutPointer[Float32, MutAnyOrigin], fl: MutPointer[UInt32, MutAnyOrigin],
     lc: MutPointer[UInt32, MutAnyOrigin],
     items: MutPointer[Float32, MutAnyOrigin],
-    items_e: MutPointer[UInt32, MutAnyOrigin], item_of: MutPointer[UInt32, MutAnyOrigin],
-    strides: MutPointer[Float32, MutAnyOrigin], n_bytes: Int32,
+    items_e: MutPointer[UInt32, MutAnyOrigin], item_ranges: MutPointer[UInt32, MutAnyOrigin],
+    strides: MutPointer[Float32, MutAnyOrigin], n_bytes: Int32, item_count: Int32,
 ):
     var id = global_idx.x
     if id >= Int(n_bytes):
         return
     if (Int(fl[unsafe_offset=id]) & F_LEADER) == 0:
         return
-    var it = Int(item_of[unsafe_offset=id])
+    if Int(item_count) == 0:
+        return  # unreachable through the harnesses — see k_resolve_x
+    var it = item_search_device(item_ranges, Int(item_count), id)
     var io = it * IM_STRIDE
     var ie = it * IE_STRIDE
     var has_page = items_e[unsafe_offset = ie + IE_HAS_PAGE] != 0
@@ -658,7 +730,7 @@ def mark(ctx: DeviceContext, mut t_prev: Int, mut stages: List[Int], idx: Int) r
     t_prev = t_now
 
 
-comptime PREP_STAGES = 13
+comptime PREP_STAGES = 12
 
 
 def pmark(mut tk: Int, mut pk: List[Int], idx: Int):
@@ -685,16 +757,14 @@ def prep_stage_name(i: Int) -> String:
     if i == 5:
         return "item-copy"
     if i == 6:
-        return "facts-fused"
-    if i == 7:
         return "host-bufs-c"
-    if i == 8:
+    if i == 7:
         return "item-fills"
-    if i == 9:
+    if i == 8:
         return "device-bufs"
-    if i == 10:
+    if i == 9:
         return "upload-sub"
-    if i == 11:
+    if i == 10:
         return "init-dispatch"
     return "drain"
 
@@ -766,14 +836,9 @@ def check_fixture(var fx: PipeFixture, ctx: DeviceContext, bench: Bool = False, 
     var h_sm = ctx.enqueue_create_host_buffer[DType.float32](n * SM_STRIDE)
     var h_lm = ctx.enqueue_create_host_buffer[DType.float32](n * LM_STRIDE)
     var h_lc = ctx.enqueue_create_host_buffer[DType.uint32](n * LC_STRIDE)
-    var h_w = ctx.enqueue_create_host_buffer[DType.uint32](n)
-    var h_md = ctx.enqueue_create_host_buffer[DType.uint32](n)
-    var h_s = ctx.enqueue_create_host_buffer[DType.uint32](n)
-    var h_is = ctx.enqueue_create_host_buffer[DType.uint32](n)
     var h_wm = ctx.enqueue_create_host_buffer[DType.float32](n)
     var h_wc = ctx.enqueue_create_host_buffer[DType.uint32](n)
     var h_otb = ctx.enqueue_create_host_buffer[DType.uint32](n)
-    var h_io = ctx.enqueue_create_host_buffer[DType.uint32](n)
     ctx.synchronize()
     pmark(tk, pk, 1)
     # The seeded statics are the LEADER-FORCED decode (unresolved): the pass
@@ -786,8 +851,6 @@ def check_fixture(var fx: PipeFixture, ctx: DeviceContext, bench: Bool = False, 
     var n_seq = len(fx.trie.seq) if len(fx.trie.seq) > 0 else 1
     var h_seq = ctx.enqueue_create_host_buffer[DType.uint32](n_seq)
     var h_bmp = ctx.enqueue_create_host_buffer[DType.uint32](HEAD_BMP_WORDS)
-    var h_ceof = ctx.enqueue_create_host_buffer[DType.uint32](n)
-    var h_cof = ctx.enqueue_create_host_buffer[DType.uint32](n)
     var h_ir = ctx.enqueue_create_host_buffer[DType.uint32](item_count * 2)
     var h_ic = ctx.enqueue_create_host_buffer[DType.uint32](item_count)
     # The decode trie tables, needed only when decode runs on device. Filled
@@ -843,48 +906,10 @@ def check_fixture(var fx: PipeFixture, ctx: DeviceContext, bench: Bool = False, 
     # The output-lane zeros moved device-side: k_init_zeros (dispatched below)
     # writes them at device bandwidth, and they no longer cross the bus.
     pmark(tk, pk, 5)
-    # The per-byte item facts, written straight into the upload buffers in ONE
-    # pass. Items are sorted by byte_start, so a merge-pointer walk answers
-    # "which item owns this byte" in O(n + items) — the form this replaced ran
-    # item_for_byte's binary search twice per byte into seven intermediate
-    # Lists whose only use was the copy into these buffers.
-    if item_count > 0:
-        # Item state rides in registers; the while-step (not an if) is what
-        # keeps stacked byte_starts (empty items) on the binary search's
-        # "largest start <= id" semantics.
-        var ip = 0
-        var cw = UInt32(fx.items[0].wrap_width)
-        var cmd = UInt32(fx.items[0].wrap_mode)
-        var cstart = fx.items[0].byte_start
-        var cend = fx.items[0].byte_start + fx.items[0].byte_count
-        var ccof = UInt32(1) if fx.items[0].cluster_mode == CLUSTER_CLUSTER else UInt32(0)
-        var nxt = fx.items[1].byte_start if item_count > 1 else n
-        for id in range(n):
-            while nxt <= id:
-                ip += 1
-                cw = UInt32(fx.items[ip].wrap_width)
-                cmd = UInt32(fx.items[ip].wrap_mode)
-                cstart = fx.items[ip].byte_start
-                cend = fx.items[ip].byte_start + fx.items[ip].byte_count
-                ccof = UInt32(1) if fx.items[ip].cluster_mode == CLUSTER_CLUSTER else UInt32(0)
-                nxt = fx.items[ip + 1].byte_start if ip + 1 < item_count else n
-            h_w[id] = cw
-            h_md[id] = cmd
-            h_s[id] = UInt32(1) if id == cstart else UInt32(0)
-            h_is[id] = UInt32(cstart)
-            h_ceof[id] = UInt32(cend)
-            h_cof[id] = ccof
-            h_io[id] = UInt32(ip)
-    else:
-        for id in range(n):
-            h_w[id] = 0
-            h_md[id] = 0
-            h_s[id] = 0
-            h_is[id] = 0
-            h_ceof[id] = 0
-            h_cof[id] = 0
-            h_io[id] = 0
-    pmark(tk, pk, 6)
+    # The seven per-byte item-facts arrays (w/md/s/is/io/ceof/cof — 28 B/byte
+    # of upload and the loop that filled them) are GONE: the kernels resolve
+    # an item per byte from d_ir/d_ie/d_ic themselves (ItemWalk in the chunk
+    # kernels, item_search_device in the byte kernels).
 
     var ni0 = fx.item_count if fx.item_count > 0 else 1
     var h_it = ctx.enqueue_create_host_buffer[DType.float32](ni0 * IM_STRIDE)
@@ -895,7 +920,7 @@ def check_fixture(var fx: PipeFixture, ctx: DeviceContext, bench: Bool = False, 
     # device home (it lived only in the host's between-dispatches derive).
     var h_pg = ctx.enqueue_create_host_buffer[DType.float32](ni0)
     ctx.synchronize()
-    pmark(tk, pk, 7)
+    pmark(tk, pk, 6)
     for i in range(ni0 * IM_STRIDE):
         h_it[i] = 0
     for i in range(ni0 * IE_STRIDE):
@@ -920,16 +945,12 @@ def check_fixture(var fx: PipeFixture, ctx: DeviceContext, bench: Bool = False, 
         h_ie[oe + IE_PAGES_WIDE] = UInt32(t.pages_wide)
         h_ie[oe + IE_HAS_PAGE] = UInt32(1) if t.has_page else UInt32(0)
         h_pg[i] = Float32(t.page_gap_x)
-    pmark(tk, pk, 8)
+    pmark(tk, pk, 7)
 
     var d_fl = ctx.enqueue_create_buffer[DType.uint32](n)
     var d_sm = ctx.enqueue_create_buffer[DType.float32](n * SM_STRIDE)
     var d_lm = ctx.enqueue_create_buffer[DType.float32](n * LM_STRIDE)
     var d_lc = ctx.enqueue_create_buffer[DType.uint32](n * LC_STRIDE)
-    var d_w = ctx.enqueue_create_buffer[DType.uint32](n)
-    var d_md = ctx.enqueue_create_buffer[DType.uint32](n)
-    var d_s = ctx.enqueue_create_buffer[DType.uint32](n)
-    var d_is = ctx.enqueue_create_buffer[DType.uint32](n)
     var d_wm = ctx.enqueue_create_buffer[DType.float32](n)
     var d_wc = ctx.enqueue_create_buffer[DType.uint32](n)
     var d_otb = ctx.enqueue_create_buffer[DType.uint32](n)
@@ -945,7 +966,6 @@ def check_fixture(var fx: PipeFixture, ctx: DeviceContext, bench: Bool = False, 
     var d_it = ctx.enqueue_create_buffer[DType.float32](ni * IM_STRIDE)
     var d_ie = ctx.enqueue_create_buffer[DType.uint32](ni * IE_STRIDE)
     var d_pg = ctx.enqueue_create_buffer[DType.float32](ni)
-    var d_io = ctx.enqueue_create_buffer[DType.uint32](n)
     var d_rmax = ctx.enqueue_create_buffer[DType.uint32](ni)
     var d_xmax = ctx.enqueue_create_buffer[DType.uint32](ni)
     var d_bytes = ctx.enqueue_create_buffer[DType.uint8](n)
@@ -959,8 +979,6 @@ def check_fixture(var fx: PipeFixture, ctx: DeviceContext, bench: Bool = False, 
     var d_tab = ctx.enqueue_create_buffer[DType.uint32](n_st)
     var d_seq = ctx.enqueue_create_buffer[DType.uint32](n_seq)
     var d_bmp = ctx.enqueue_create_buffer[DType.uint32](HEAD_BMP_WORDS)
-    var d_ceof = ctx.enqueue_create_buffer[DType.uint32](n)
-    var d_cof = ctx.enqueue_create_buffer[DType.uint32](n)
     var d_ir = ctx.enqueue_create_buffer[DType.uint32](item_count * 2)
     var d_ic = ctx.enqueue_create_buffer[DType.uint32](item_count)
     var d_cslot = ctx.enqueue_create_buffer[DType.uint32](n)
@@ -979,7 +997,7 @@ def check_fixture(var fx: PipeFixture, ctx: DeviceContext, bench: Bool = False, 
     # The zone-index byte table and the cascaded zone outs (chain=1).
     var d_czidx = ctx.enqueue_create_buffer[DType.uint8](((n + 127) >> 7) * BLOCK)
     var d_csc = ctx.enqueue_create_buffer[DType.uint32](((n + 127) >> 7) * (CLIST_CAP + 1))
-    pmark(tk, pk, 9)
+    pmark(tk, pk, 8)
     if mode == 0:
         ctx.enqueue_copy(dst_buf=d_fl, src_buf=h_fl)
         ctx.enqueue_copy(dst_buf=d_sm, src_buf=h_sm)
@@ -992,14 +1010,9 @@ def check_fixture(var fx: PipeFixture, ctx: DeviceContext, bench: Bool = False, 
         ctx.enqueue_copy(dst_buf=d_bc, src_buf=h_bc)
         if mode == 3:
             ctx.enqueue_copy(dst_buf=d_tab, src_buf=h_tab)
-    ctx.enqueue_copy(dst_buf=d_w, src_buf=h_w)
-    ctx.enqueue_copy(dst_buf=d_md, src_buf=h_md)
-    ctx.enqueue_copy(dst_buf=d_s, src_buf=h_s)
-    ctx.enqueue_copy(dst_buf=d_is, src_buf=h_is)
     ctx.enqueue_copy(dst_buf=d_it, src_buf=h_it)
     ctx.enqueue_copy(dst_buf=d_ie, src_buf=h_ie)
     ctx.enqueue_copy(dst_buf=d_pg, src_buf=h_pg)
-    ctx.enqueue_copy(dst_buf=d_io, src_buf=h_io)
     ctx.enqueue_copy(dst_buf=d_bytes, src_buf=h_bytes)
     if mode == 0:
         ctx.enqueue_copy(dst_buf=d_gi, src_buf=h_gi)
@@ -1007,11 +1020,9 @@ def check_fixture(var fx: PipeFixture, ctx: DeviceContext, bench: Bool = False, 
         # The walk form reads its own hash, not the sequence section.
         ctx.enqueue_copy(dst_buf=d_seq, src_buf=h_seq)
     ctx.enqueue_copy(dst_buf=d_bmp, src_buf=h_bmp)
-    ctx.enqueue_copy(dst_buf=d_ceof, src_buf=h_ceof)
-    ctx.enqueue_copy(dst_buf=d_cof, src_buf=h_cof)
     ctx.enqueue_copy(dst_buf=d_ir, src_buf=h_ir)
     ctx.enqueue_copy(dst_buf=d_ic, src_buf=h_ic)
-    pmark(tk, pk, 10)
+    pmark(tk, pk, 9)
     # One dispatch writes every zero the chain expects (see k_init_zeros) —
     # this replaces eleven enqueue_fill calls that each cost like a slow
     # kernel launch on this backend, plus the zero lanes' host fills+uploads.
@@ -1042,13 +1053,13 @@ def check_fixture(var fx: PipeFixture, ctx: DeviceContext, bench: Bool = False, 
             Int32(n), Int32((n + 127) >> 7), Int32(n_chunks), Int32(n_supers), Int32(ni),
             grid_dim=(n + B - 1) // B, block_dim=B,
         )
-    pmark(tk, pk, 11)
+    pmark(tk, pk, 10)
 
     # ── the chain. Every intermediate stays on device. ──────────────────────
     ctx.synchronize()
     var g0 = perf_counter_ns()
     var prep_ns = g0 - t_prep
-    pmark(tk, pk, 12)
+    pmark(tk, pk, 11)
     var stages = List[Int](length=17, fill=0)
     var t_prev = g0
     # THE SEQUENCE PASS, on device. Mode 0: the probe (thread per byte) writes
@@ -1064,24 +1075,24 @@ def check_fixture(var fx: PipeFixture, ctx: DeviceContext, bench: Bool = False, 
         ctx.enqueue_function[k_decode_probe[True, False]](
             d_bytes.unsafe_ptr(), d_index.unsafe_ptr(), d_bm.unsafe_ptr(), d_bc.unsafe_ptr(),
             d_sm.unsafe_ptr(), d_gi.unsafe_ptr(), d_fl.unsafe_ptr(),
-            d_cof.unsafe_ptr(), d_ceof.unsafe_ptr(),
+            d_ir.unsafe_ptr(), d_ic.unsafe_ptr(),
             d_seq.unsafe_ptr(), d_bmp.unsafe_ptr(),
             d_cslot.unsafe_ptr(), d_cend.unsafe_ptr(), d_cblk.unsafe_ptr(),
             # the walk's tab is comptime-eliminated in the search form; any
             # non-aliased u32 pointer satisfies the signature
             d_lc.unsafe_ptr(), UInt32(0),
-            Int32(n), Int32(seq_count), Int32(fx.trie.seq_max),
+            Int32(n), Int32(item_count), Int32(seq_count), Int32(fx.trie.seq_max),
             grid_dim=(n + B - 1) // B, block_dim=B,
         )
     elif mode == 3:
         ctx.enqueue_function[k_decode_probe[True, True]](
             d_bytes.unsafe_ptr(), d_index.unsafe_ptr(), d_bm.unsafe_ptr(), d_bc.unsafe_ptr(),
             d_sm.unsafe_ptr(), d_gi.unsafe_ptr(), d_fl.unsafe_ptr(),
-            d_cof.unsafe_ptr(), d_ceof.unsafe_ptr(),
+            d_ir.unsafe_ptr(), d_ic.unsafe_ptr(),
             d_seq.unsafe_ptr(), d_bmp.unsafe_ptr(),
             d_cslot.unsafe_ptr(), d_cend.unsafe_ptr(), d_cblk.unsafe_ptr(),
             d_tab.unsafe_ptr(), st_mask,
-            Int32(n), Int32(seq_count), Int32(fx.trie.seq_max),
+            Int32(n), Int32(item_count), Int32(seq_count), Int32(fx.trie.seq_max),
             grid_dim=(n + B - 1) // B, block_dim=B,
         )
     else:
@@ -1089,19 +1100,19 @@ def check_fixture(var fx: PipeFixture, ctx: DeviceContext, bench: Bool = False, 
             ctx.enqueue_function[k_decode_probe[False, False]](
                 d_bytes.unsafe_ptr(), d_index.unsafe_ptr(), d_bm.unsafe_ptr(), d_bc.unsafe_ptr(),
                 d_sm.unsafe_ptr(), d_gi.unsafe_ptr(), d_fl.unsafe_ptr(),
-                d_cof.unsafe_ptr(), d_ceof.unsafe_ptr(),
+                d_ir.unsafe_ptr(), d_ic.unsafe_ptr(),
                 d_seq.unsafe_ptr(), d_bmp.unsafe_ptr(),
                 d_cslot.unsafe_ptr(), d_cend.unsafe_ptr(), d_cblk.unsafe_ptr(),
                 # tab is comptime-eliminated without the walk, as above
                 d_lc.unsafe_ptr(), UInt32(0),
-                Int32(n), Int32(seq_count), Int32(fx.trie.seq_max),
+                Int32(n), Int32(item_count), Int32(seq_count), Int32(fx.trie.seq_max),
                 grid_dim=(n + B - 1) // B, block_dim=B,
             )
         ctx.enqueue_function[k_cluster_probe](
-            d_bytes.unsafe_ptr(), d_cof.unsafe_ptr(), d_ceof.unsafe_ptr(),
+            d_bytes.unsafe_ptr(), d_ir.unsafe_ptr(), d_ic.unsafe_ptr(),
             d_seq.unsafe_ptr(), d_bmp.unsafe_ptr(), d_gi.unsafe_ptr(), d_sm.unsafe_ptr(), d_fl.unsafe_ptr(),
             d_cslot.unsafe_ptr(), d_cend.unsafe_ptr(), d_cblk.unsafe_ptr(),
-            Int32(n), Int32(seq_count), Int32(fx.trie.seq_max),
+            Int32(n), Int32(item_count), Int32(seq_count), Int32(fx.trie.seq_max),
             grid_dim=(n + B - 1) // B, block_dim=B,
         )
     if profile:
@@ -1182,10 +1193,9 @@ def check_fixture(var fx: PipeFixture, ctx: DeviceContext, bench: Bool = False, 
     if profile:
         mark(ctx, t_prev, stages, 1)
     ctx.enqueue_function[k_chunk_reduce](
-        d_fl.unsafe_ptr(), d_sm.unsafe_ptr(), d_w.unsafe_ptr(), d_md.unsafe_ptr(),
-        d_s.unsafe_ptr(),
+        d_fl.unsafe_ptr(), d_sm.unsafe_ptr(), d_ir.unsafe_ptr(), d_ie.unsafe_ptr(),
         d_pc.unsafe_ptr(), d_pm.unsafe_ptr(),
-        Int32(n), Int32(CHUNK), Int32(n_chunks),
+        Int32(n), Int32(CHUNK), Int32(n_chunks), Int32(item_count),
         grid_dim=(n_chunks + B - 1) // B, block_dim=B,
     )
     if profile:
@@ -1213,21 +1223,19 @@ def check_fixture(var fx: PipeFixture, ctx: DeviceContext, bench: Bool = False, 
         mark(ctx, t_prev, stages, 5)
     ctx.enqueue_function[k_apply](
         d_fl.unsafe_ptr(), d_sm.unsafe_ptr(), d_lm.unsafe_ptr(), d_lc.unsafe_ptr(),
-        d_w.unsafe_ptr(), d_md.unsafe_ptr(), d_s.unsafe_ptr(),
-        d_is.unsafe_ptr(), d_xc.unsafe_ptr(), d_xm.unsafe_ptr(),
+        d_ir.unsafe_ptr(), d_ie.unsafe_ptr(), d_xc.unsafe_ptr(), d_xm.unsafe_ptr(),
         d_wm.unsafe_ptr(), d_wc.unsafe_ptr(), d_otb.unsafe_ptr(),
-        Int32(n), Int32(CHUNK), Int32(n_chunks),
+        Int32(n), Int32(CHUNK), Int32(n_chunks), Int32(item_count),
         grid_dim=(n_chunks + B - 1) // B, block_dim=B,
     )
     if profile:
         mark(ctx, t_prev, stages, 6)
     ctx.enqueue_function[k_resolve_x](
         d_sm.unsafe_ptr(), d_fl.unsafe_ptr(), d_lm.unsafe_ptr(), d_lc.unsafe_ptr(),
-        d_it.unsafe_ptr(), d_ie.unsafe_ptr(), d_io.unsafe_ptr(),
-        d_is.unsafe_ptr(),
+        d_it.unsafe_ptr(), d_ie.unsafe_ptr(), d_ir.unsafe_ptr(),
         d_wm.unsafe_ptr(), d_wc.unsafe_ptr(), d_otb.unsafe_ptr(),
         d_rmax.unsafe_ptr(), d_xmax.unsafe_ptr(),
-        Int32(n), grid_dim=(n + B - 1) // B, block_dim=B,
+        Int32(n), Int32(item_count), grid_dim=(n + B - 1) // B, block_dim=B,
     )
     if profile:
         mark(ctx, t_prev, stages, 7)
@@ -1244,8 +1252,8 @@ def check_fixture(var fx: PipeFixture, ctx: DeviceContext, bench: Bool = False, 
         mark(ctx, t_prev, stages, 8)
     ctx.enqueue_function[k_paginate](
         d_lm.unsafe_ptr(), d_fl.unsafe_ptr(), d_lc.unsafe_ptr(),
-        d_it.unsafe_ptr(), d_ie.unsafe_ptr(), d_io.unsafe_ptr(),
-        d_st.unsafe_ptr(), Int32(n),
+        d_it.unsafe_ptr(), d_ie.unsafe_ptr(), d_ir.unsafe_ptr(),
+        d_st.unsafe_ptr(), Int32(n), Int32(item_count),
         grid_dim=(n + B - 1) // B, block_dim=B,
     )
     if profile:
@@ -1409,7 +1417,7 @@ def bench_scaling(trie: Trie, path: String, ctx: DeviceContext, cluster: Bool = 
     only the kernels would flatter the GPU by hiding the part a real caller pays.
     `cluster` runs the items under cluster mode (the sequence pass's device form
     included); leader mode pays the pass's dispatches but no-ops inside the
-    kernels (per-thread cluster_of/item_cluster early-returns).
+    kernels (per-thread item_cluster early-returns behind the item search).
 
     Every size runs the statics modes: 0 = CPU decode + upload (the shipped
     form), 1 = device decode, probe unfused, 2 = fused decode+probe (binary
@@ -1448,17 +1456,19 @@ def bench_scaling(trie: Trie, path: String, ctx: DeviceContext, cluster: Bool = 
 
 
 def bench_items(trie: Trie, path: String, ctx: DeviceContext, profile: Bool = False) raises:
-    """Item-count sweep over the FULL corpus — the A/B harness for moving the
-    per-byte item facts (w/md/s/is/io/ceof/cof — 28 B/byte of upload plus the
-    host facts loop) to a device-side binary search over the item ranges.
+    """Item-count sweep over the FULL corpus — the A/B harness for the
+    device-side item search (ItemWalk / item_search_device), which replaced the
+    seven per-byte item-facts arrays (w/md/s/is/io/ceof/cof — 28 B/byte of
+    upload plus the host facts loop) with a per-thread resolve over the item
+    ranges the chain already uploaded.
 
-    bench_scaling holds item_count=1, which blinds exactly the trade that
-    search makes: the search's per-byte cost grows with log2(items); the facts
-    upload it replaces does not depend on items at all. The product case is a
-    repo load — ~1.3k items over ~100 MB — so sweep counts 1 → 4096 and let
-    the crossover show itself. Splits are contiguous equal chunks (the last
-    takes the remainder); boundaries fall where they fall, mid-codepoint
-    included — the timing doesn't care, and the suite owns correctness."""
+    bench_scaling holds item_count=1, which blinds exactly this trade: the
+    search's per-byte cost grows with log2(items); the facts upload it replaced
+    did not depend on items at all. The product case is a repo load — ~1.3k
+    items over ~100 MB — so sweep counts 1 → 4096 and let the crossover show
+    itself. Splits are contiguous equal chunks (the last takes the remainder);
+    boundaries fall where they fall, mid-codepoint included — the timing
+    doesn't care, and the suite owns correctness."""
     var f = open(path, "r")
     var all_bytes = f.read_bytes()
     f.close()

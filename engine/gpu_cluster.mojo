@@ -25,7 +25,7 @@ from std.time import perf_counter_ns
 from max.gpu.host import DeviceContext
 from glyph_schema import SM_STRIDE
 from glyph_pipeline import (
-    Item, run_pipeline, CLUSTER_LEADER, CLUSTER_CLUSTER, item_for_byte,
+    Item, run_pipeline, CLUSTER_LEADER, CLUSTER_CLUSTER,
 )
 from fixture_io import load_pipe_fixture
 
@@ -66,15 +66,9 @@ def check_case(path: String, ctx: DeviceContext, mut saw_cluster: List[Bool]) ra
     var dec = run_pipeline[witness=False](fx.bytes, fx.trie, items_leader^)
     var want = run_pipeline[cluster_split=True](fx.bytes, fx.trie, fx.items)
 
-    # Per-byte facts, the same flattened shape the scan pipeline uploads.
-    var cluster_of = List[UInt32](length=n, fill=0)
-    var item_end = List[UInt32](length=n, fill=0)
-    for id in range(n):
-        var i = item_for_byte(fx.items, id)
-        if i >= 0:
-            item_end[id] = UInt32(fx.items[i].byte_start + fx.items[i].byte_count)
-            cluster_of[id] = UInt32(1) if fx.items[i].cluster_mode == CLUSTER_CLUSTER else UInt32(0)
-
+    # Per-item ranges + cluster flags — the probe resolves an item per byte on
+    # device now (item_search_device), so the per-byte cluster/item-end arrays
+    # this suite used to fill and upload are gone.
     var item_count = len(fx.items)
     var item_ranges = List[UInt32](length=item_count * 2, fill=0)
     var item_cluster = List[UInt32](length=item_count, fill=0)
@@ -91,8 +85,6 @@ def check_case(path: String, ctx: DeviceContext, mut saw_cluster: List[Bool]) ra
     var h_fl = ctx.enqueue_create_host_buffer[DType.uint32](n)
     var h_seq = ctx.enqueue_create_host_buffer[DType.uint32](n_seq)
     var h_bmp = ctx.enqueue_create_host_buffer[DType.uint32](HEAD_BMP_WORDS)
-    var h_ceof = ctx.enqueue_create_host_buffer[DType.uint32](n)
-    var h_cof = ctx.enqueue_create_host_buffer[DType.uint32](n)
     var h_ir = ctx.enqueue_create_host_buffer[DType.uint32](item_count * 2)
     var h_ic = ctx.enqueue_create_host_buffer[DType.uint32](item_count)
     ctx.synchronize()
@@ -100,8 +92,6 @@ def check_case(path: String, ctx: DeviceContext, mut saw_cluster: List[Bool]) ra
         h_bytes[i] = fx.bytes[i]
         h_gi[i] = dec.gi[i]
         h_fl[i] = dec.fl[i]
-        h_ceof[i] = item_end[i]
-        h_cof[i] = cluster_of[i]
     for i in range(n * SM_STRIDE):
         h_sm[i] = dec.sm[i]
     for i in range(len(fx.trie.seq)):
@@ -122,8 +112,6 @@ def check_case(path: String, ctx: DeviceContext, mut saw_cluster: List[Bool]) ra
     var d_fl = ctx.enqueue_create_buffer[DType.uint32](n)
     var d_seq = ctx.enqueue_create_buffer[DType.uint32](n_seq)
     var d_bmp = ctx.enqueue_create_buffer[DType.uint32](HEAD_BMP_WORDS)
-    var d_ceof = ctx.enqueue_create_buffer[DType.uint32](n)
-    var d_cof = ctx.enqueue_create_buffer[DType.uint32](n)
     var d_ir = ctx.enqueue_create_buffer[DType.uint32](item_count * 2)
     var d_ic = ctx.enqueue_create_buffer[DType.uint32](item_count)
     var d_cslot = ctx.enqueue_create_buffer[DType.uint32](n)
@@ -135,8 +123,6 @@ def check_case(path: String, ctx: DeviceContext, mut saw_cluster: List[Bool]) ra
     ctx.enqueue_copy(dst_buf=d_fl, src_buf=h_fl)
     ctx.enqueue_copy(dst_buf=d_seq, src_buf=h_seq)
     ctx.enqueue_copy(dst_buf=d_bmp, src_buf=h_bmp)
-    ctx.enqueue_copy(dst_buf=d_ceof, src_buf=h_ceof)
-    ctx.enqueue_copy(dst_buf=d_cof, src_buf=h_cof)
     ctx.enqueue_copy(dst_buf=d_ir, src_buf=h_ir)
     ctx.enqueue_copy(dst_buf=d_ic, src_buf=h_ic)
     d_cslot.enqueue_fill(0)
@@ -146,10 +132,10 @@ def check_case(path: String, ctx: DeviceContext, mut saw_cluster: List[Bool]) ra
     comptime B = 256
     var t0 = perf_counter_ns()
     ctx.enqueue_function[k_cluster_probe](
-        d_bytes.unsafe_ptr(), d_cof.unsafe_ptr(), d_ceof.unsafe_ptr(),
+        d_bytes.unsafe_ptr(), d_ir.unsafe_ptr(), d_ic.unsafe_ptr(),
         d_seq.unsafe_ptr(), d_bmp.unsafe_ptr(), d_gi.unsafe_ptr(), d_sm.unsafe_ptr(), d_fl.unsafe_ptr(),
         d_cslot.unsafe_ptr(), d_cend.unsafe_ptr(), d_cblk.unsafe_ptr(),
-        Int32(n), Int32(seq_count), Int32(fx.trie.seq_max),
+        Int32(n), Int32(item_count), Int32(seq_count), Int32(fx.trie.seq_max),
         grid_dim=(n + B - 1) // B, block_dim=B,
     )
     ctx.enqueue_function[k_cluster_chain](

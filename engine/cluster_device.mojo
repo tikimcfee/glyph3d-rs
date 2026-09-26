@@ -27,6 +27,7 @@ from glyph_pipeline import (
     F_CLUSTER_TRAILER,
     NEWLINE,
     Trie,
+    item_search_device,
 )
 
 comptime KEY_CAP = 32
@@ -177,8 +178,8 @@ def st_probe(
 
 def k_cluster_probe(
     bytes: MutPointer[UInt8, MutAnyOrigin],
-    cluster_of: MutPointer[UInt32, MutAnyOrigin],   # per byte: 1 in a cluster item
-    item_end: MutPointer[UInt32, MutAnyOrigin],     # per byte: the item's end offset
+    item_ranges: MutPointer[UInt32, MutAnyOrigin],    # 2 per item: byte_start, byte_end
+    item_cluster: MutPointer[UInt32, MutAnyOrigin],   # per item: 1 = cluster mode
     seq: MutPointer[UInt32, MutAnyOrigin],          # the v2 sequence section, verbatim
     cand_bmp: MutPointer[UInt32, MutAnyOrigin],     # build_head_bitmap: the first members
     gi: MutPointer[UInt32, MutAnyOrigin],
@@ -188,18 +189,25 @@ def k_cluster_probe(
     cand_end: MutPointer[UInt32, MutAnyOrigin],
     cand_blocks: MutPointer[UInt32, MutAnyOrigin],  # presence per 128-byte block
     n_bytes: Int32,
+    item_count: Int32,
     seq_count: Int32,
     seq_max: Int32,
 ):
     """One thread per byte — cluster_split.mojo's probe_clusters, ported.
     Candidacy is one bitmap load (the table's first members); a codepoint no
     sequence starts with exits there, never paying for the window or the
-    search."""
+    search. The per-byte cluster/item-end arrays this once read are resolved
+    on device now: one item_search_device per thread over the ranges the
+    chain already uploads (no ownership check — the facts arrays it replaced
+    encoded the same largest-start-≤-id rule)."""
     var id = Int(global_idx.x)
     var n = Int(n_bytes)
     if id >= n:
         return
-    if cluster_of[unsafe_offset=id] == 0:
+    if Int(item_count) == 0:
+        return  # unreachable through the harnesses — see gpu_pipeline's k_resolve_x
+    var it = item_search_device(item_ranges, Int(item_count), id)
+    if item_cluster[unsafe_offset=it] == 0:
         return
     if Int(seq_count) == 0:
         return  # the rule early-returns on an empty table — statics included
@@ -260,7 +268,7 @@ def k_cluster_probe(
     key[0] = UInt32(cp)
     var key_len = 1
     var p = id + nb
-    var stop = Int(item_end[unsafe_offset=id])
+    var stop = Int(item_ranges[unsafe_offset = it * 2 + 1])
     while p < stop and key_len < Int(seq_max):
         var c0 = Int(bytes[unsafe_offset=p])
         var nb2: Int
@@ -475,8 +483,8 @@ def k_decode_probe[probe: Bool, walk: Bool = False](
     sm: MutPointer[Float32, MutAnyOrigin],
     gi: MutPointer[UInt32, MutAnyOrigin],
     fl: MutPointer[UInt32, MutAnyOrigin],
-    cluster_of: MutPointer[UInt32, MutAnyOrigin],   # per byte: 1 in a cluster item
-    item_end: MutPointer[UInt32, MutAnyOrigin],     # per byte: the item's end offset
+    item_ranges: MutPointer[UInt32, MutAnyOrigin],    # 2 per item: byte_start, byte_end
+    item_cluster: MutPointer[UInt32, MutAnyOrigin],   # per item: 1 = cluster mode
     seq: MutPointer[UInt32, MutAnyOrigin],          # the v2 sequence section, verbatim
     cand_bmp: MutPointer[UInt32, MutAnyOrigin],     # build_head_bitmap: the first members
     cand_slot: MutPointer[UInt32, MutAnyOrigin],
@@ -485,6 +493,7 @@ def k_decode_probe[probe: Bool, walk: Bool = False](
     tab: MutPointer[UInt32, MutAnyOrigin],          # build_state_table's hash (walk only)
     tab_mask: UInt32,
     n_bytes: Int32,
+    item_count: Int32,
     seq_count: Int32,
     seq_max: Int32,
 ):
@@ -563,7 +572,10 @@ def k_decode_probe[probe: Bool, walk: Bool = False](
 
     # ── probe (k_cluster_probe, minus the head decode it now inherits) ──────
     comptime if probe:
-        if cluster_of[unsafe_offset=id] == 0:
+        if Int(item_count) == 0:
+            return  # unreachable through the harnesses — see k_cluster_probe
+        var it = item_search_device(item_ranges, Int(item_count), id)
+        if item_cluster[unsafe_offset=it] == 0:
             return
         if Int(seq_count) == 0:
             return  # the rule early-returns on an empty table — statics included
@@ -600,7 +612,7 @@ def k_decode_probe[probe: Bool, walk: Bool = False](
                 last_end = id + nb
             var p = id + nb
             var depth = 1
-            var stop = Int(item_end[unsafe_offset=id])
+            var stop = Int(item_ranges[unsafe_offset = it * 2 + 1])
             while p < stop and depth < Int(seq_max):
                 var c0 = Int(bytes[unsafe_offset=p])
                 var nb2: Int
@@ -659,7 +671,7 @@ def k_decode_probe[probe: Bool, walk: Bool = False](
             key[0] = UInt32(cp)
             var key_len = 1
             var p = id + nb
-            var stop = Int(item_end[unsafe_offset=id])
+            var stop = Int(item_ranges[unsafe_offset = it * 2 + 1])
             while p < stop and key_len < Int(seq_max):
                 var c0 = Int(bytes[unsafe_offset=p])
                 var nb2: Int
