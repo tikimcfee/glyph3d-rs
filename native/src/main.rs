@@ -31,6 +31,7 @@ mod atlas;
 mod bake;
 mod cli;
 mod cubecl_smoke;
+mod cubecl_scan;
 mod engine;
 mod fixture;
 mod fold;
@@ -343,6 +344,11 @@ fn main() {
     if cli.cubecl_smoke {
         let ctx = pollster::block_on(gpu::init(None));
         cubecl_smoke::run(&ctx);
+    }
+    // Dev-only CubeCL scan check (note 16, phase 1).
+    if let Some(path) = &cli.cubecl_scan_check {
+        let ctx = pollster::block_on(gpu::init(None));
+        cubecl_scan::run(&ctx, path);
     }
 
     // Fixture parity (reference port): fixture parse manifest / corpus diff — no GPU.

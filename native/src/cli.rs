@@ -251,6 +251,10 @@ pub(crate) struct Cli {
     /// k_apply shape, print the verdicts, exit. Not wired into the battery.
     #[arg(long)]
     pub(crate) cubecl_smoke: bool,
+    /// Dev-only CubeCL scan check (note 16, phase 1): the chunk_reduce kernel
+    /// over one fixture, chunk partials diffed bit-exact vs scan.rs, exit.
+    #[arg(long, value_name = "PATH")]
+    pub(crate) cubecl_scan_check: Option<PathBuf>,
     /// Windowed only: how frames reach the display. `fifo` (the default) is
     /// vsync, so the FPS line reads the monitor's refresh; `mailbox` and
     /// `immediate` uncap it where the surface supports them (else fifo, and
