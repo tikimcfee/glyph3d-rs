@@ -57,7 +57,10 @@ fn main() -> anyhow::Result<()> {
     // ── provider thread: Zed's stack, headless, then the edit script ──────
     let (tx, rx) = mpsc::channel::<SurfaceUpdate>();
     let provider_dir = dir.clone();
-    let provider = std::thread::spawn(move || provide(provider_dir, tx, live));
+    let (step_tx, step_rx) = mpsc::channel::<glyph3d_native::windowed::LiveStep>();
+    let provider = std::thread::spawn(move || {
+        provide(provider_dir, tx, if live { Some(step_rx) } else { None })
+    });
 
     let ctx = pollster::block_on(glyph3d_native::gpu::init(None));
     let trie = glyph3d_native::default_engine_trie();
@@ -66,7 +69,7 @@ fn main() -> anyhow::Result<()> {
     let atlas_us = atlas_load.elapsed().as_micros();
 
     if live {
-        return run_live(ctx, rx, dir, trie);
+        return run_live(ctx, rx, dir, trie, step_tx);
     }
 
     let out_prefix: String = args.next().context("missing <out_prefix>")?;
@@ -194,6 +197,7 @@ fn run_live(
     rx: mpsc::Receiver<SurfaceUpdate>,
     dir: PathBuf,
     trie: PathBuf,
+    step: mpsc::Sender<glyph3d_native::windowed::LiveStep>,
 ) -> anyhow::Result<()> {
     let mut content: HashMap<String, Arc<Vec<u8>>> = HashMap::new();
     let mut backlog: Vec<SurfaceUpdate> = Vec::new();
@@ -255,6 +259,8 @@ fn run_live(
         atlas: atlas::Atlas::load(&ctx, &glyph3d_native::default_emoji_sheet()),
         last_style: HashMap::new(),
         backlog,
+        step: Some(step),
+        step_count: 9, // the state table's length (state_table below)
     };
     glyph3d_native::windowed::run(
         ctx,
@@ -269,15 +275,55 @@ fn run_live(
     Ok(())
 }
 
-/// The provider: one headless App, real buffers, One Dark runs — then a
-/// scripted edit sequence on `zedspike-main.rs`, one envelope per state.
-/// The provider keeps its OWN byte mirror (a Vec<u8>) and applies each edit
-/// to both the Zed buffer and the mirror; the mirror's hash is the version,
-/// and the mirror's deltas are what the renderer applies. Two independent
-/// applications of the same delta, joined by hash — that's the point.
-/// `paced` (the --live run) loops the script forever with ~1.5 s sleeps and
-/// a full-range revert between cycles; the offscreen run is one pass.
-fn provide(dir: PathBuf, tx: mpsc::Sender<SurfaceUpdate>, paced: bool) {
+/// One named, frozen state of the stepped demo — the testing surface the
+/// timer couldn't be: F3/F4/F5 walk this table, and a defect can be pointed
+/// at by its state name.
+struct LiveState {
+    name: &'static str,
+    bytes: Vec<u8>,
+    folded: bool,
+}
+
+fn state_table(original: &[u8]) -> Vec<LiveState> {
+    let banner = banner().to_string();
+    let with_banner = [banner.as_bytes(), original].concat();
+    let delete = {
+        let text = String::from_utf8_lossy(original).into_owned();
+        let lines: Vec<&str> = text.lines().collect();
+        if lines.len() > 120 {
+            let start = byte_of_line(&lines, 90) + banner.len();
+            let end = byte_of_line(&lines, 120) + banner.len();
+            [&with_banner[..start], &with_banner[end..]].concat()
+        } else {
+            with_banner.clone()
+        }
+    };
+    let appended = [delete.as_slice(), stubs().as_bytes()].concat();
+    vec![
+        LiveState { name: "initial", bytes: original.to_vec(), folded: false },
+        LiveState { name: "fold ON (function bodies)", bytes: original.to_vec(), folded: true },
+        LiveState { name: "fold OFF", bytes: original.to_vec(), folded: false },
+        LiveState { name: "banner insert (+12 lines)", bytes: with_banner, folded: false },
+        LiveState { name: "middle block deleted (-30 lines)", bytes: delete, folded: false },
+        LiveState { name: "stubs appended (+16 lines)", bytes: appended.clone(), folded: false },
+        LiveState { name: "fold ON (with edits present)", bytes: appended.clone(), folded: true },
+        LiveState { name: "fold OFF (with edits present)", bytes: appended.clone(), folded: false },
+        LiveState { name: "reverted to original", bytes: original.to_vec(), folded: false },
+    ]
+}
+
+/// The provider: one headless App, real buffers, One Dark runs — then either
+/// the STEPPED script (windowed: F3/F4/F5 drive named states; no timer) or
+/// the one-pass script (offscreen). The provider keeps its OWN byte mirror
+/// (a Vec<u8>) and applies every transition to both the Zed buffer and the
+/// mirror; the mirror's hash is the version, and the mirror's deltas are
+/// what the renderer applies. Two independent applications of the same
+/// delta, joined by hash — that's the point.
+fn provide(
+    dir: PathBuf,
+    tx: mpsc::Sender<SurfaceUpdate>,
+    steps: Option<mpsc::Receiver<glyph3d_native::windowed::LiveStep>>,
+) {
     let cx = TestAppContext::single();
 
     struct NoAssets;
@@ -366,39 +412,124 @@ fn provide(dir: PathBuf, tx: mpsc::Sender<SurfaceUpdate>, paced: bool) {
     // revert at the end — the windowed demo's heartbeat. P2a-3: fold mode
     // toggles every 2 cycles — the field collapses to signatures and back.
     let original = mirror.clone();
-    let mut cycle = 0usize;
-    let mut folded = false;
-    loop {
-        cycle += 1;
-        let want_folded = paced && (cycle / 2) % 2 == 1;
-        if want_folded != folded {
-            folded = want_folded;
-            eprintln!(
-                "provider: fold mode {}",
-                if folded { "ON — function bodies fold" } else { "OFF — full source" }
-            );
-            // Re-send every NON-edited file at its UNCHANGED version with the
-            // new structure. Content rides as a no-op edit: the corpus rule
-            // (bytes crossed once) holds — a toggle is structure, not content.
-            for (name, b) in &buffers {
-                if name == EDITED {
-                    continue;
-                }
+
+    // ── STEPPED mode: the window's F3/F4/F5 drive named, frozen states ──
+    if let Some(steps) = steps {
+        let states = state_table(&original);
+        println!(
+            "step: [1/{}] initial — press F3/F4/F5 in the window (F5 resets)",
+            states.len()
+        );
+        let mut idx = 0usize;
+        let mut cur = mirror.clone();
+        let mut folded = false;
+        let mut others_folded = false;
+        while let Ok(cmd) = steps.recv() {
+            use glyph3d_native::windowed::LiveStep;
+            let target = match cmd {
+                LiveStep::Next => (idx + 1).min(states.len() - 1),
+                LiveStep::Prev => idx.saturating_sub(1),
+                LiveStep::Reset => 0,
+            };
+            idx = target;
+            let st = &states[idx];
+
+            // Content transition: a full-range Edited when the state's
+            // bytes differ (Prev/Reset jump backwards — the delta is always
+            // "replace everything with the target", one splice, no history).
+            if st.bytes != cur {
+                let text = st.bytes.clone();
+                let text_str = String::from_utf8(text.clone()).expect("states are UTF-8");
+                cx.update(|app| {
+                    buffer.update(app, |b, cx| {
+                        b.edit([(0..b.len(), text_str.as_str())], None, cx);
+                    });
+                });
+                let delta = ContentDelta::Edited { range: 0..cur.len(), text };
+                delta.apply(mirror);
+                cur = mirror.clone();
                 park(&cx);
-                let snapshot = cx.read(|app| b.read(app).snapshot());
-                let runs = style_runs(&cx, b, &syntax);
-                let structure =
-                    if folded { function_body_folds(&snapshot) } else { Vec::new() };
+                let version = content_hash_version(mirror);
+                let runs = style_runs(&cx, buffer, &syntax);
+                let structure = if st.folded {
+                    function_body_folds(&cx.read(|app| buffer.read(app).snapshot()))
+                } else {
+                    Vec::new()
+                };
+                folded = st.folded;
+                println!(
+                    "step: [{}/{}] {} — {} bytes, folded={}",
+                    idx + 1,
+                    states.len(),
+                    st.name,
+                    mirror.len(),
+                    st.folded
+                );
+                send(&tx, EDITED, version, delta, runs, structure);
+            } else if st.folded != folded {
+                // Fold flip on unchanged bytes: runs + structure at the SAME
+                // version; content rides as a no-op edit (the corpus rule).
+                park(&cx);
+                let runs = style_runs(&cx, buffer, &syntax);
+                let structure = if st.folded {
+                    function_body_folds(&cx.read(|app| buffer.read(app).snapshot()))
+                } else {
+                    Vec::new()
+                };
+                folded = st.folded;
+                println!(
+                    "step: [{}/{}] {} (fold flip, bytes unchanged)",
+                    idx + 1,
+                    states.len(),
+                    st.name
+                );
                 send(
                     &tx,
-                    name,
-                    content_hash_version(&originals[name]),
+                    EDITED,
+                    content_hash_version(mirror),
                     ContentDelta::Edited { range: 0..0, text: Vec::new() },
                     runs,
                     structure,
                 );
+            } else {
+                println!(
+                    "step: [{}/{}] {} (no change)",
+                    idx + 1,
+                    states.len(),
+                    st.name
+                );
+            }
+
+            // Fold flips re-send every NON-edited file at its unchanged
+            // version with the new structure (short.rs folds; paginated
+            // files' folds are guarded out downstream).
+            if st.folded != others_folded {
+                others_folded = st.folded;
+                for (name, b) in &buffers {
+                    if name == EDITED {
+                        continue;
+                    }
+                    park(&cx);
+                    let snapshot = cx.read(|app| b.read(app).snapshot());
+                    let runs = style_runs(&cx, b, &syntax);
+                    let structure =
+                        if st.folded { function_body_folds(&snapshot) } else { Vec::new() };
+                    send(
+                        &tx,
+                        name,
+                        content_hash_version(&originals[name]),
+                        ContentDelta::Edited { range: 0..0, text: Vec::new() },
+                        runs,
+                        structure,
+                    );
+                }
             }
         }
+        return;
+    }
+
+    // ── one-pass script (offscreen frames) ───────────────────────────────
+    loop {
         let banner = banner().to_string();
         let script: Vec<(usize, usize, String)> = {
             let text = String::from_utf8_lossy(mirror).into_owned();
@@ -444,21 +575,11 @@ fn provide(dir: PathBuf, tx: mpsc::Sender<SurfaceUpdate>, paced: bool) {
             let runs = style_runs(&cx, buffer, &syntax);
             // Structure at THIS version — fold ranges are byte ranges, and
             // the edit above moved every byte after it.
-            let structure = if folded {
-                function_body_folds(&cx.read(|app| buffer.read(app).snapshot()))
-            } else {
-                Vec::new()
-            };
             eprintln!("provider: edit {i} applied ({} bytes now)", mirror.len());
-            send(&tx, EDITED, version, delta, runs, structure);
-            if paced {
-                std::thread::sleep(Duration::from_millis(1500));
-            }
+            send(&tx, EDITED, version, delta, runs, Vec::new());
         }
 
-        if !paced {
-            break;
-        }
+        break;
         // Revert to the original: one full-range replacement. The version
         // after it hashes the original bytes — a DIFFERENT version than any
         // before, so the join accepts it as the newest state, never a replay.
@@ -478,14 +599,8 @@ fn provide(dir: PathBuf, tx: mpsc::Sender<SurfaceUpdate>, paced: bool) {
         park(&cx);
         let version = content_hash_version(mirror);
         let runs = style_runs(&cx, buffer, &syntax);
-        let structure = if folded {
-            function_body_folds(&cx.read(|app| buffer.read(app).snapshot()))
-        } else {
-            Vec::new()
-        };
         eprintln!("provider: reverted ({} bytes)", mirror.len());
-        send(&tx, EDITED, version, delta, runs, structure);
-        std::thread::sleep(Duration::from_millis(1500));
+        send(&tx, EDITED, version, delta, runs, Vec::new());
     }
 }
 

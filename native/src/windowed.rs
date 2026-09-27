@@ -976,6 +976,16 @@ impl WindowState {
 /// `state: &mut WindowState` borrowed from `self.state`, so `&mut self`
 /// would double-borrow.
 #[cfg(feature = "egui-ui")]
+/// A step command for the live demo's provider — the stepped form of the
+/// P2a fold demo (the timer was replaced at Ivan's request: a frozen,
+/// inspectable state beats a cycling one when naming what broke).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LiveStep {
+    Next,
+    Prev,
+    Reset,
+}
+
 /// P1-live (seam.md): an envelope-driven content source for the windowed
 /// renderer. When present, the render loop polls `rx` between frames; each
 /// arrival applies its delta to `content` (the corpus rule — `Opened` once,
@@ -985,7 +995,9 @@ impl WindowState {
 /// rebuild resets colors to default; `last_style` is the memory that makes a
 /// rebuild a restyle). The z/cluster dials coexist but rebuild from the
 /// DISK-bound `choice` — after a dial drag, the next live update reclaims
-/// the scene. `last_style` starts empty; the poll fills it.
+/// the scene. `last_style` starts empty; the poll fills it. `step` is the
+/// embedder's control line (F3/F4/F5 drive it); `step_count` sizes the
+/// window-title readout.
 pub struct LiveSource {
     pub rx: std::sync::mpsc::Receiver<crate::seam::SurfaceUpdate>,
     pub content: std::collections::HashMap<String, std::sync::Arc<Vec<u8>>>,
@@ -1008,6 +1020,10 @@ pub struct LiveSource {
     /// provider's mirror, and the version join would then rightly refuse
     /// every subsequent edit (measured live — that was the 0-glyphs bug).
     pub backlog: Vec<crate::seam::SurfaceUpdate>,
+    /// The stepper's control line (None = the provider is self-driving).
+    pub step: Option<std::sync::mpsc::Sender<LiveStep>>,
+    /// State count for the window-title readout (0 = just show the index).
+    pub step_count: usize,
 }
 
 /// P1-live: drain arrived envelopes, apply deltas, rebuild the scene from
@@ -1062,6 +1078,25 @@ fn poll_live(
             continue;
         }
         if let Some(bytes) = src.content.get(rel) {
+            // ONE guard, TWO consumers: the pagination boundary must hold
+            // for the loader AND the style walk, from this single map. The
+            // loader has its own copy of the check as defense, but if a
+            // paginated file's folds reach `pick.folds`, the style walk
+            // skips records that DO have slots — misaligned colors, holes
+            // at column heads (the second live-found defect, 2026-09-26).
+            // Same estimate as file_item_params: rows = max(newlines,
+            // bytes/wrap_cols).
+            let rows_est = bytes
+                .iter()
+                .filter(|&&b| b == b'\n')
+                .count()
+                .max(bytes.len() / src.params.wrap_cols.max(1) as usize)
+                .max(1);
+            let paginated =
+                src.params.page_rows > 0 && rows_est > src.params.page_rows as usize;
+            if paginated {
+                continue;
+            }
             let starts = crate::repo::line_starts_of(bytes);
             let lines = crate::seam::normalized_fold_lines(&update.structure, &starts);
             if !lines.is_empty() {
@@ -1236,6 +1271,9 @@ struct App<'a> {
     /// P1-live: the envelope-driven content source. None in every CLI run;
     /// the linked embedder (experiments/fieldzed --live) supplies one.
     live: Option<LiveSource>,
+    /// The stepped demo's display index (the provider owns the real state;
+    /// this only names the window title — F3/F4/F5).
+    live_step_ix: usize,
     start: Instant,
     state: Option<WindowState>,
     /// Stage K: build the egui overlay (false under `--no-ui`).
@@ -1250,7 +1288,34 @@ struct App<'a> {
     present_mode: wgpu::PresentMode,
 }
 
+impl App<'_> {
+    /// Forward a step command to the live provider; returns the state
+    /// readout for the window TITLE (the caller owns the window — a &mut
+    /// self method cannot also take &mut WindowState, which borrows self).
+    /// The provider's state names print to the log.
+    fn live_step_title(&mut self, cmd: LiveStep) -> Option<String> {
+        let live = self.live.as_ref()?;
+        if let Some(step) = &live.step {
+            let _ = step.send(cmd);
+        }
+        let count = live.step_count;
+        self.live_step_ix = match cmd {
+            LiveStep::Next => {
+                if count > 0 { (self.live_step_ix + 1).min(count - 1) } else { 0 }
+            }
+            LiveStep::Prev => self.live_step_ix.saturating_sub(1),
+            LiveStep::Reset => 0,
+        };
+        Some(if count > 0 {
+            format!("fieldzed live — step {}/{}", self.live_step_ix + 1, count)
+        } else {
+            "fieldzed live".to_string()
+        })
+    }
+}
+
 impl ApplicationHandler for App<'_> {
+
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.state.is_some() {
             return;
@@ -1493,20 +1558,55 @@ impl ApplicationHandler for App<'_> {
             // egui-consumed arm — unlike F1, which deliberately yields to a
             // focused field. egui still saw the event first (the feed at the
             // top); it ignores F2.
+            //
+            // P2a stepped live demo: F3/F4/F5 step the provider through its
+            // named states, F5 resetting to state 0 — the timer was replaced
+            // at Ivan's request: a frozen state can be pointed at, a cycling
+            // one can only be described. Same App-level rule as F2.
             WindowEvent::KeyboardInput { event, .. }
                 if event.state == ElementState::Pressed
-                    && matches!(event.physical_key, PhysicalKey::Code(KeyCode::F2)) =>
+                    && matches!(
+                        event.physical_key,
+                        PhysicalKey::Code(KeyCode::F2)
+                            | PhysicalKey::Code(KeyCode::F3)
+                            | PhysicalKey::Code(KeyCode::F4)
+                            | PhysicalKey::Code(KeyCode::F5)
+                    ) =>
             {
-                // Anchor at the repo root's out/ (CARGO_MANIFEST_DIR is
-                // native/), not the process cwd — running from native/ used
-                // to scatter shots into native/out/.
-                state.capture_pending = Some(std::path::PathBuf::from(concat!(
-                    env!("CARGO_MANIFEST_DIR"),
-                    "/../out"
-                )).join(format!(
-                    "windowed-shot-{}.png",
-                    utc_stamp(std::time::SystemTime::now())
-                )));
+                match event.physical_key {
+                    PhysicalKey::Code(KeyCode::F2) => {
+                        // Anchor at the repo root's out/ (CARGO_MANIFEST_DIR is
+                        // native/), not the process cwd — running from native/ used
+                        // to scatter shots into native/out/.
+                        state.capture_pending = Some(std::path::PathBuf::from(concat!(
+                            env!("CARGO_MANIFEST_DIR"),
+                            "/../out"
+                        )).join(format!(
+                            "windowed-shot-{}.png",
+                            utc_stamp(std::time::SystemTime::now())
+                        )));
+                    }
+                    PhysicalKey::Code(KeyCode::F3) => {
+                        // `state` borrows self, so the window Arc comes out
+                        // first — the &mut-self call must not overlap it.
+                        let window = state.window.clone();
+                        if let Some(t) = self.live_step_title(LiveStep::Next) {
+                            window.set_title(&t);
+                        }
+                    }
+                    PhysicalKey::Code(KeyCode::F4) => {
+                        let window = state.window.clone();
+                        if let Some(t) = self.live_step_title(LiveStep::Prev) {
+                            window.set_title(&t);
+                        }
+                    }
+                    _ => {
+                        let window = state.window.clone();
+                        if let Some(t) = self.live_step_title(LiveStep::Reset) {
+                            window.set_title(&t);
+                        }
+                    }
+                }
             }
             // Stage K (K2): right-RELEASE always ungrabs, even when egui
             // consumed the event (e.g. the release landed on a panel).
@@ -1712,6 +1812,7 @@ pub fn run(
         cull,
         ops,
         live,
+        live_step_ix: 0,
         start: Instant::now(),
         state: None,
         #[cfg(feature = "egui-ui")]
