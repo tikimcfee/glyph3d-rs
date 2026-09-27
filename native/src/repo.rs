@@ -690,6 +690,31 @@ pub fn load_items(
             let base = placement.slot_base as usize;
             let count = placement.slot_count as usize;
             let fold_lines = folds.get(&f.rel_path).filter(|v| !v.is_empty());
+            // THE PAGINATION BOUNDARY (found live, 2026-09-26): this repo's
+            // layout fans long files into side-by-side PAGES (page_rows 128,
+            // bands stacked) — y is not a row ladder across pages, so the
+            // renderer-side empirical shift manufactures overlap on
+            // paginated files. Renderer compaction is sound ONLY on
+            // single-page files; a paginated file keeps its folds SKIPPED
+            // and a loud log, until folds become ENGINE-level layout input
+            // (queued: the durable design — pagination, wrapping, everything
+            // recomputes when the fold feeds the layout).
+            let paginated = {
+                let item = &file_params[index];
+                let newlines = f.bytes.iter().filter(|&&b| b == b'\n').count();
+                let rows_est = newlines
+                    .max(f.bytes.len() / item.wrap_width.max(1) as usize)
+                    .max(1);
+                item.page_rows > 0 && rows_est > item.page_rows as usize
+            };
+            let fold_lines = if paginated { None } else { fold_lines };
+            if paginated && folds.contains_key(&f.rel_path) {
+                println!(
+                    "fold: {} SKIPPED — paginated file (renderer compaction is \
+                     single-page only; engine-level fold input is queued)",
+                    f.rel_path
+                );
+            }
             let slice = match fold_lines {
                 None => {
                     let slice = old[base..base + count].to_vec();
@@ -1006,8 +1031,9 @@ pub fn line_starts_of(bytes: &[u8]) -> Vec<usize> {
     starts
 }
 
-/// The line index containing `byte` (the LAST start at/before it).
-fn line_of_byte(byte: usize, line_starts: &[usize]) -> u32 {
+/// The line index containing `byte` (the LAST start at/before it). Pub:
+/// the style walk resolves folded records with it.
+pub fn line_of_byte(byte: usize, line_starts: &[usize]) -> u32 {
     match line_starts.binary_search(&byte) {
         Ok(i) => i as u32,
         Err(0) => 0,
@@ -1103,8 +1129,11 @@ impl RepoLoad {
                 trie: self.trie,
                 files: pick_files,
                 // Envelope-owned content is the CALLER's to inject (it owns
-                // the bytes); disk scenes re-derive from root.
+                // the bytes); disk scenes re-derive from root. Same for the
+                // fold set (P2a) — the loader's compacted field is the
+                // caller's to describe back.
                 content: None,
+                folds: std::collections::HashMap::new(),
             }),
         }
     }

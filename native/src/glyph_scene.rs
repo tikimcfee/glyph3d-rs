@@ -173,6 +173,14 @@ pub struct PickContext {
     /// live content: the hash is of the same bytes the fold consumed.
     /// Injected by the consumer (fieldzed), not by `into_staged`.
     pub content: Option<std::collections::HashMap<String, std::sync::Arc<Vec<u8>>>>,
+    /// P2a: the scene's fold set — normalized LINE ranges per rel_path, the
+    /// same ones `load_items` compacted with. The style walk (and later the
+    /// pick walk) must skip folded records so its slot sequence matches the
+    /// COMPACTED instances; walking uncompacted records against compacted
+    /// slots paints wrong glyphs and runs past the file's slot range (the
+    /// white-glyph state, seen live 2026-09-26). Injected by the consumer
+    /// beside `content`; empty = no folds (the default).
+    pub folds: std::collections::HashMap<String, Vec<std::ops::Range<u32>>>,
 }
 
 /// A pick request — scripted (CLI) or interactive (click).
@@ -2191,6 +2199,21 @@ impl GlyphScene {
             );
             return FileStyle::Failed;
         }
+        // P2a: skip folded records so this walk's slot sequence matches the
+        // COMPACTED instances the loader staged. Walking uncompacted records
+        // against compacted slots painted wrong glyphs and ran past the
+        // file's slot range (the white-glyph state, seen live 2026-09-26).
+        let file_folds = pctx.folds.get(&info.rel_path);
+        let starts = file_folds.map(|_| crate::repo::line_starts_of(&bytes));
+        let folded = |i: usize| -> bool {
+            match (&file_folds, &starts) {
+                (Some(folds), Some(starts)) => {
+                    let line = crate::repo::line_of_byte(leaders[i].0, starts);
+                    folds.iter().any(|f| f.contains(&line))
+                }
+                _ => false,
+            }
+        };
         // The walk, COALESCED — the RecolorLine lesson: one queue.write_buffer
         // per glyph is ~15 µs of validation each, which is where the uncached
         // style plane's ~130 ms per file actually went (the cached engine was
@@ -2215,8 +2238,9 @@ impl GlyphScene {
         let mut colored = 0usize;
         let mut unstyled = 0usize;
         for (i, r) in records.iter().enumerate() {
-            if r.glyph_id() == 0 {
-                continue; // blank: no instance slot, exactly as ensure_pick_cache skips
+            if r.glyph_id() == 0 || folded(i) {
+                continue; // blank: no slot; folded: dropped at compaction —
+                          // either way it takes no slot in THIS field
             }
             let byte = leaders[i].0;
             while run_ix < runs.len() && runs[run_ix].range.end <= byte {

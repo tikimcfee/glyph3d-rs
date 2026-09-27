@@ -1093,6 +1093,7 @@ fn poll_live(
     let mut staged = load.into_staged(None, &atlas.slot_ink);
     if let Some(pick) = &mut staged.pick {
         pick.content = Some(src.content.clone());
+        pick.folds = folds.clone();
     }
     let t_stage = t.elapsed();
     let t = Instant::now();
