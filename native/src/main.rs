@@ -341,7 +341,25 @@ fn build_scene_impl(
                 cluster_mode: *cluster_mode,
                 ..Default::default()
             };
-            let load = repo::load_repo(dir, &default_engine_trie(), &params, *strategy, *verify);
+            let load = {
+                let walk = repo::walk_repo(dir);
+                // The device-resident arena: the FFI writes instances into
+                // the same shared-storage buffer the shader reads. Direct
+                // only (it's the strategy with the tail-write protocol), on
+                // unified memory, when the buffer fits.
+                let arena = if *strategy == layout_mojo::Strategy::Direct
+                    && ctx.profile.backend == wgpu::Backend::Metal
+                    && ctx.profile.mappable_primary_buffers
+                    && walk.total_bytes > 0
+                    && (walk.total_bytes * std::mem::size_of::<glyph_scene::GlyphInstance>()) as u64
+                        <= ctx.profile.max_buffer_size
+                {
+                    glyph_scene::mapped_instance_arena(ctx, walk.total_bytes)
+                } else {
+                    layout::GlyphArena::new()
+                };
+                repo::load_repo_from_walk(dir, walk, &default_engine_trie(), &params, *strategy, *verify, arena)
+            };
             load.print_stats();
             let atlas = atlas::Atlas::load(ctx, emoji_sheet);
             let staged = load.into_staged(focus.as_deref(), &atlas.slot_ink);

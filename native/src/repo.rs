@@ -21,7 +21,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use crate::engine::Engine;
-use crate::glyph_scene::{GlyphInstance, GroupRow};
+use crate::glyph_scene::GroupRow;
 use crate::layout::{
     diff_backends, BackendOutput, GlyphArena, GlyphRecord, ItemParams, LayoutGlyphs, LayoutItem,
     Paint, VerifyLayout,
@@ -342,7 +342,7 @@ pub struct LoadStats {
 }
 
 pub struct RepoLoad {
-    pub instances: Vec<GlyphInstance>,
+    pub arena: GlyphArena,
     pub groups: Vec<GroupRow>,
     pub files: Vec<FileView>,
     pub bounds_min: [f32; 3],
@@ -479,8 +479,23 @@ pub fn load_repo(
     strategy: Strategy,
     verify: bool,
 ) -> RepoLoad {
+    load_repo_from_walk(root, walk_repo(root), trie, params, strategy, verify, GlyphArena::new())
+}
+
+/// `load_repo` with the walk and the arena already in hand: the caller walks
+/// first so it can size the arena to the byte count (the render path's
+/// device-mapped arena exists because of this split — leaders ≤ bytes, so
+/// `walk.total_bytes` is the slot bound the direct path commits against).
+pub fn load_repo_from_walk(
+    root: &Path,
+    walk: WalkResult,
+    trie: &Path,
+    params: &RepoParams,
+    strategy: Strategy,
+    verify: bool,
+    mut arena: GlyphArena,
+) -> RepoLoad {
     let t0 = Instant::now();
-    let walk = walk_repo(root);
     let walk_dur = t0.elapsed();
 
     // Per-file params (pagination sized per file). Newline counts double as
@@ -523,7 +538,6 @@ pub fn load_repo(
         .load_trie_file(trie)
         .expect("failed to load engine trie");
 
-    let mut arena = GlyphArena::new();
     let t = Instant::now();
     // Under --repo-verify the selected backend ALSO records its wire stream,
     // when it has one, so the other can be diffed against it at every
@@ -634,7 +648,7 @@ pub fn load_repo(
             item: file_params[index],
         });
     }
-    let instances = arena.into_instances();
+    let instances_len = arena.len();
     stage_dur += t.elapsed();
 
     let t = Instant::now();
@@ -650,7 +664,7 @@ pub fn load_repo(
         files: walk.files.len(),
         bytes: walk.total_bytes,
         records: total_records,
-        instances: instances.len(),
+        instances: instances_len,
         blanks: total_blanks,
         skipped_large: walk.skipped_large,
         skipped_non_utf8: walk.skipped_non_utf8,
@@ -659,7 +673,7 @@ pub fn load_repo(
         verified,
     };
     RepoLoad {
-        instances,
+        arena,
         groups,
         files: views,
         bounds_min,
@@ -711,7 +725,7 @@ impl RepoLoad {
             .files
             .iter()
             .map(|v| {
-                let insts = &self.instances[v.slot_base..v.slot_base + v.slot_count];
+                let insts = &self.arena.instances()[v.slot_base..v.slot_base + v.slot_count];
                 crate::glyph_scene::SegCull {
                     min: [
                         v.offset[0] - 0.3,
@@ -764,11 +778,11 @@ impl RepoLoad {
             }
         }
         StagedText {
-            glyphs_emitted: self.instances.len(),
+            glyphs_emitted: self.arena.len(),
             codepoints_decoded: self.stats.records,
             missing_or_bitmap: self.stats.blanks,
             segments,
-            instances: self.instances,
+            instances: self.arena,
             groups: self.groups,
             bounds_min: self.bounds_min,
             bounds_max: self.bounds_max,

@@ -62,7 +62,7 @@ struct Cell {
 
 /// The staged result: instances + group rows + world bounds (for camera fit).
 pub struct StagedText {
-    pub instances: Vec<GlyphInstance>,
+    pub instances: crate::layout::GlyphArena,
     pub groups: Vec<GroupRow>,
     /// (min, max) of the laid-out text block(s) in world units, including
     /// DEPTH — WrapBack spends wraps in z, so a block's extent is not planar.
@@ -392,7 +392,7 @@ pub fn stage_file(
 
     StagedText {
         glyphs_emitted: instances.len(),
-        instances,
+        instances: crate::layout::GlyphArena::from_vec(instances),
         groups,
         bounds_min: [0.0, -total_h, z_lo],
         bounds_max: [total_w, line_h, z_hi],
@@ -753,13 +753,14 @@ pub fn stage_records(arena: GlyphArena, placement: &ItemPlacement, slot_ink: &[O
     } else {
         (placement.ink.min, placement.ink.max)
     };
-    let instances = arena.into_instances();
+    let glyphs_emitted = arena.len();
+    let segments = vec![cover_segment(arena.instances(), min, max, slot_ink)];
 
     StagedText {
-        glyphs_emitted: instances.len(),
+        glyphs_emitted,
         groups: vec![GroupRow::identity([0.0; 3])],
-        segments: vec![cover_segment(&instances, min, max, slot_ink)],
-        instances,
+        segments,
+        instances: arena,
         bounds_min: min,
         bounds_max: max,
         codepoints_decoded: placement.record_count as usize,

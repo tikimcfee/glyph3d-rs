@@ -410,47 +410,107 @@ impl ItemPlacement {
 /// Where laid-out glyphs land. The CALLER owns it and passes it in; a backend
 /// appends and never reads back.
 ///
-/// Today the interior is a host `Vec<GlyphInstance>`. Device-resident, it becomes a
-/// device buffer and the compaction kernel writes it directly — and because
-/// every call site already holds an arena rather than receiving a `Vec`, that
-/// change lands here and nowhere else.
+/// Today the interior is a host `Vec<GlyphInstance>` or, on the repo load's
+/// direct path, a GPU-mapped device buffer (`Mapped`). Device-resident, the
+/// compaction kernel writes it directly — and because every call site already
+/// holds an arena rather than receiving a `Vec`, that change lands here and
+/// nowhere else. `Mapped` arrived first at the boundary the seam predicted:
+/// the FFI writes instances into the SAME memory the glyph shader reads, so
+/// the repo load pays one allocation and zero copies.
 #[derive(Default)]
 pub struct GlyphArena {
     instances: Vec<GlyphInstance>,
+    /// Present on the mapped (device-resident) path; `instances` stays empty.
+    mapped: Option<MappedArena>,
 }
+
+/// A device-buffer-backed arena: raw pointer + capacity + the committed
+/// length, owning the `wgpu::Buffer` it maps. The pointer is the buffer's
+/// shared-storage contents (Metal); on Metal, hal's `unmap_buffer` is a
+/// no-op, so the mapping simply lives as long as the buffer — which the
+/// arena owns, so the two never disagree.
+pub struct MappedArena {
+    ptr: *mut GlyphInstance,
+    cap: usize,
+    len: usize,
+    buffer: wgpu::Buffer,
+}
+
+// The raw pointer aliases a shared-storage buffer owned by this struct; the
+// arena is moved between load threads (walk → layout → scene build) but the
+// pointer is only ever written through the FFI call and read through
+// `instances()` — never concurrently.
+unsafe impl Send for MappedArena {}
+unsafe impl Sync for MappedArena {}
 
 impl GlyphArena {
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// Wrap a host Vec (the text/engine-text scenes stage from their own fold).
+    pub fn from_vec(instances: Vec<GlyphInstance>) -> Self {
+        Self { instances, mapped: None }
+    }
+
+    /// The device-resident form: takes ownership of an already-mapped buffer.
+    pub fn from_mapped(ptr: *mut GlyphInstance, cap: usize, buffer: wgpu::Buffer) -> Self {
+        Self {
+            instances: Vec::new(),
+            mapped: Some(MappedArena { ptr, cap, len: 0, buffer }),
+        }
+    }
+
+    /// The device buffer of a mapped arena, for binding.
+    pub fn mapped_buffer(&self) -> Option<&wgpu::Buffer> {
+        self.mapped.as_ref().map(|m| &m.buffer)
+    }
+
     /// Slots written so far — the next item's `slot_base`.
     pub fn len(&self) -> usize {
-        self.instances.len()
+        match &self.mapped {
+            Some(m) => m.len,
+            None => self.instances.len(),
+        }
     }
 
     pub fn is_empty(&self) -> bool {
-        self.instances.is_empty()
+        self.len() == 0
     }
 
     pub fn instances(&self) -> &[GlyphInstance] {
-        &self.instances
-    }
-
-    pub fn into_instances(self) -> Vec<GlyphInstance> {
-        self.instances
+        match &self.mapped {
+            // SAFETY: the buffer outlives the arena (owned field), the pointer
+            // is its contents base, and `len` counts slots the FFI reported
+            // written through `commit` — the only way they become readable.
+            Some(m) => unsafe { std::slice::from_raw_parts(m.ptr, m.len) },
+            None => &self.instances,
+        }
     }
 
     /// Hint the upper bound on slots still to come (records, before blanks are
     /// dropped). A hint only: the real count is lower and the arena grows.
     pub fn reserve(&mut self, records: usize) {
-        self.instances.reserve(records);
+        if let Some(m) = &self.mapped {
+            assert!(
+                m.len + records <= m.cap,
+                "mapped arena reserve: {} slots over the {}-slot buffer",
+                m.len + records - m.cap,
+                m.cap,
+            );
+        } else {
+            self.instances.reserve(records);
+        }
     }
 
     /// Append one instance. `pub(crate)` on purpose: filling the arena is a
     /// BACKEND's job, and a caller that pushes its own instances is a caller
     /// that has smuggled a fourth layout implementation into the tree.
     pub(crate) fn push(&mut self, instance: GlyphInstance) {
+        assert!(
+            self.mapped.is_none(),
+            "push into a mapped arena: only the FFI tail writer fills one"
+        );
         self.instances.push(instance);
     }
 
@@ -468,6 +528,17 @@ impl GlyphArena {
     /// reach the tail, and nothing at all can make it readable without saying
     /// how many slots it actually wrote.
     pub(crate) fn uninit_tail(&mut self, want: usize) -> (*mut GlyphInstance, usize) {
+        if let Some(m) = &self.mapped {
+            assert!(
+                want <= m.cap - m.len,
+                "mapped arena tail: want {want} over the {} slots left",
+                m.cap - m.len,
+            );
+            // SAFETY: the assert keeps the tail inside the buffer; the pointer
+            // is only valid until the next mutation — which `commit` is, and
+            // which nothing else can perform on the tail.
+            return unsafe { (m.ptr.add(m.len), want) };
+        }
         self.instances.reserve(want);
         let len = self.instances.len();
         // SAFETY: `reserve` guarantees capacity for `want` past `len`, and the
@@ -487,6 +558,15 @@ impl GlyphArena {
     /// [`GlyphArena::uninit_tail`] must have been fully initialized, and
     /// `written` must not exceed the capacity that call returned.
     pub(crate) unsafe fn commit(&mut self, written: usize) {
+        if let Some(m) = &mut self.mapped {
+            assert!(
+                written <= m.cap - m.len,
+                "mapped commit({written}) exceeds the {} slots left in the buffer",
+                m.cap - m.len,
+            );
+            m.len += written;
+            return;
+        }
         let len = self.instances.len();
         // assert!, NOT debug_assert!. `[profile.release]` sets only `debug =
         // true`, so debug assertions are OFF, and every gate in this tree builds
@@ -1139,7 +1219,7 @@ mod tests {
         let records = sample_records();
         let mut arena = GlyphArena::new();
         let places = vec![compact_records_into(&records, Paint::Flat(7), 0, &mut arena)];
-        let instances = arena.into_instances();
+        let instances = arena.instances().to_vec();
         let out = |name, p: &[ItemPlacement], i: &[GlyphInstance], r: &[GlyphRecord]| BackendOutput {
             name,
             placements: p.to_vec().leak(),
