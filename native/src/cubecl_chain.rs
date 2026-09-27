@@ -203,13 +203,22 @@ fn combine(a: &mut ChainElem, b: &ChainElem) {
 }
 
 /// leaf_of, transcribed: reset/wrap/mode always; the rest only for leaders.
+/// `fl` is the PACKED flag array — one byte per byte position, four per u32
+/// word (the chain consumes only F_LEADER/F_NEWLINE, both in the low byte;
+/// the full flags live CPU-side for the renderer). fl.len() is WORDS; every
+/// byte-count in the kernels multiplies by 4.
+#[cube]
+fn flags_at(fl: &[u32], i: usize) -> u32 {
+    (fl[i >> 2] >> (((i & 3) * 8) as u32)) & 0xFF
+}
+
 #[cube]
 fn leaf_of(fl: &[u32], sm: &[f32], wrap: i32, mode: i32, reset: i32, id: usize) -> ChainElem {
     let mut e = identity();
     e.reset = reset;
     e.wrap = wrap;
     e.mode = mode;
-    let f = fl[id];
+    let f = flags_at(fl, id);
     if (f & F_LEADER) != 0 {
         e.glyphs = 1;
         if (f & F_NEWLINE) != 0 {
@@ -341,7 +350,7 @@ fn tile_scan(
 ) {
     let tile = CUBE_POS;
     let u = UNIT_POS as usize;
-    let n = fl.len();
+    let n = fl.len() * 4; // packed: words -> bytes
     let item_count = ir.len() / 2;
     let lo = tile * (units * rake) + u * rake;
     let hi = if lo + rake < n { lo + rake } else { n };
@@ -582,7 +591,7 @@ fn apply(
 ) {
     let tile = CUBE_POS;
     let u = UNIT_POS as usize;
-    let n = fl.len();
+    let n = fl.len() * 4; // packed: words -> bytes
     let item_count = ir.len() / 2;
     let lo = tile * (units * rake) + u * rake;
     let hi = if lo + rake < n { lo + rake } else { n };
@@ -736,7 +745,7 @@ fn apply(
                 run.wrap = w_wrap;
                 run.mode = w_mode;
             }
-            let f = fl[id];
+            let f = flags_at(fl, id);
             if (f & F_LEADER) != 0 {
                 // lanes_from_prefix, inline.
                 let col = run.tail_len;
@@ -840,7 +849,7 @@ fn resolve_x(
     #[comptime] span: usize,
 ) {
     let t = ABSOLUTE_POS;
-    let n = fl.len();
+    let n = fl.len() * 4; // packed: words -> bytes
     let item_count = ir.len() / 2;
     let u = UNIT_POS as usize;
     let srow = Shared::<[Atomic<u32>]>::new_slice(RESOLVE_SLOTS);
@@ -893,7 +902,7 @@ fn resolve_x(
                 wrap = ie[it * IE_STRIDE + IE_WRAP_WIDTH] as i32;
                 fold = fold_of(ie, it, wrap);
             }
-            let f = fl[id];
+            let f = flags_at(fl, id);
             if (f & F_LEADER) != 0 && fold > 0 {
                 let col = lc[id * LC_STRIDE + LC_COL] as i32;
                 let head = col % fold == 0;
@@ -976,9 +985,9 @@ fn paginate(
     strides: &[f32],
 ) {
     let id = ABSOLUTE_POS;
-    let n = fl.len();
+    let n = fl.len() * 4; // packed: words -> bytes
     let item_count = ir.len() / 2;
-    if id < n && (fl[id] & F_LEADER) != 0 && item_count > 0 {
+    if id < n && (flags_at(fl, id) & F_LEADER) != 0 && item_count > 0 {
         let it = item_search(ir, item_count, id);
         let io = it * IM_STRIDE;
         let ie_off = it * IE_STRIDE;
@@ -1002,7 +1011,7 @@ fn paginate(
             let wide = if wide_raw > 1 { wide_raw } else { 1 };
             let band = y_page / wide;
             let wrap = ie[ie_off + IE_WRAP_WIDTH] as i32;
-            let seg = wrap_segment_of(col, wrap, (fl[id] & F_NEWLINE) != 0);
+            let seg = wrap_segment_of(col, wrap, (flags_at(fl, id) & F_NEWLINE) != 0);
             let lh = items[io + IM_LINE_HEIGHT];
             let mo = id * LM_STRIDE;
             lm[mo + LM_X] = lm[mo + LM_BASE_X] + (y_page % wide) as f32 * strides[it];
@@ -1052,10 +1061,23 @@ pub fn run(ctx: &GpuContext, fixture_path: &Path) -> ! {
 
     // Uploads: statics from the CPU decode (the bench's mode 0 shape). The
     // measure static is ADVANCE ONLY — the scan never reads height.
-    let mut fl = Vec::with_capacity(n);
+    // Statics: advance (f32/byte) + PACKED flags (u8/byte, four per word —
+    // the chain reads fl three-to-four passes and consumes only the low
+    // byte; the full flags stay CPU-side for the renderer).
+    let n_words = n.div_ceil(4);
+    let mut fl = Vec::with_capacity(n_words);
     let mut sm = Vec::with_capacity(n);
+    for w in 0..n_words {
+        let mut word = 0u32;
+        for b in 0..4 {
+            let i = w * 4 + b;
+            if i < n {
+                word |= (r.slots.flags(i) & 0xFF) << (b * 8);
+            }
+        }
+        fl.push(word);
+    }
     for i in 0..n {
-        fl.push(r.slots.flags(i));
         sm.push(r.slots.advance(i));
     }
     let mut ir = Vec::with_capacity(item_count * 2);
@@ -1153,7 +1175,7 @@ pub fn run(ctx: &GpuContext, fixture_path: &Path) -> ! {
             &client,
             tiles_grid(n_tiles),
             CubeDim::new_1d(units as u32),
-            BufferArg::from_raw_parts(h_fl.clone(), n),
+            BufferArg::from_raw_parts(h_fl.clone(), n_words),
             BufferArg::from_raw_parts(h_sm.clone(), n),
             BufferArg::from_raw_parts(h_ir.clone(), item_count * 2),
             BufferArg::from_raw_parts(h_ie.clone(), item_count * IE_STRIDE),
@@ -1188,7 +1210,7 @@ pub fn run(ctx: &GpuContext, fixture_path: &Path) -> ! {
                 &client,
                 tiles_grid(n_tiles),
                 CubeDim::new_1d(units as u32),
-                BufferArg::from_raw_parts(h_fl.clone(), n),
+                BufferArg::from_raw_parts(h_fl.clone(), n_words),
                 BufferArg::from_raw_parts(h_sm.clone(), n),
                 BufferArg::from_raw_parts(h_lc.clone(), n * LC_STRIDE),
                 BufferArg::from_raw_parts(h_lm.clone(), n * LM_STRIDE),
@@ -1214,7 +1236,7 @@ pub fn run(ctx: &GpuContext, fixture_path: &Path) -> ! {
                 cubes_of(n.div_ceil(rspan)),
                 CubeDim::new_1d(256),
                 BufferArg::from_raw_parts(h_sm.clone(), n),
-                BufferArg::from_raw_parts(h_fl.clone(), n),
+                BufferArg::from_raw_parts(h_fl.clone(), n_words),
                 BufferArg::from_raw_parts(h_lm.clone(), n * LM_STRIDE),
                 BufferArg::from_raw_parts(h_lc.clone(), n * LC_STRIDE),
                 BufferArg::from_raw_parts(h_im.clone(), item_count * IM_STRIDE),
@@ -1245,7 +1267,7 @@ pub fn run(ctx: &GpuContext, fixture_path: &Path) -> ! {
                 cubes_of(n),
                 CubeDim::new_1d(256),
                 BufferArg::from_raw_parts(h_lm.clone(), n * LM_STRIDE),
-                BufferArg::from_raw_parts(h_fl.clone(), n),
+                BufferArg::from_raw_parts(h_fl.clone(), n_words),
                 BufferArg::from_raw_parts(h_lc.clone(), n * LC_STRIDE),
                 BufferArg::from_raw_parts(h_im.clone(), item_count * IM_STRIDE),
                 BufferArg::from_raw_parts(h_ie.clone(), item_count * IE_STRIDE),
@@ -1511,10 +1533,23 @@ pub fn bench(ctx: &GpuContext, corpus_path: &Path) -> ! {
     let r = run_scan_pipeline(&bytes, &trie, &items, DEFAULT_CHUNK_SIZE, DEFAULT_GROUP_SIZE, 1);
     let decode_dt = t_decode.elapsed();
 
-    let mut fl = Vec::with_capacity(n);
+    // Statics: advance (f32/byte) + PACKED flags (u8/byte, four per word —
+    // the chain reads fl three-to-four passes and consumes only the low
+    // byte; the full flags stay CPU-side for the renderer).
+    let n_words = n.div_ceil(4);
+    let mut fl = Vec::with_capacity(n_words);
     let mut sm = Vec::with_capacity(n);
+    for w in 0..n_words {
+        let mut word = 0u32;
+        for b in 0..4 {
+            let i = w * 4 + b;
+            if i < n {
+                word |= (r.slots.flags(i) & 0xFF) << (b * 8);
+            }
+        }
+        fl.push(word);
+    }
     for i in 0..n {
-        fl.push(r.slots.flags(i));
         sm.push(r.slots.advance(i));
     }
     let ir: Vec<u32> = vec![0, n as u32];
@@ -1574,7 +1609,7 @@ pub fn bench(ctx: &GpuContext, corpus_path: &Path) -> ! {
                         &client,
                         tiles_grid(n_tiles),
                         CubeDim::new_1d(units as u32),
-                        BufferArg::from_raw_parts(h_fl.clone(), n),
+                        BufferArg::from_raw_parts(h_fl.clone(), n_words),
                         BufferArg::from_raw_parts(h_sm.clone(), n),
                         BufferArg::from_raw_parts(h_ir.clone(), 2),
                         BufferArg::from_raw_parts(h_ie.clone(), IE_STRIDE),
@@ -1603,7 +1638,7 @@ pub fn bench(ctx: &GpuContext, corpus_path: &Path) -> ! {
                         &client,
                         tiles_grid(n_tiles),
                         CubeDim::new_1d(units as u32),
-                        BufferArg::from_raw_parts(h_fl.clone(), n),
+                        BufferArg::from_raw_parts(h_fl.clone(), n_words),
                         BufferArg::from_raw_parts(h_sm.clone(), n),
                         BufferArg::from_raw_parts(h_lc.clone(), n * LC_STRIDE),
                         BufferArg::from_raw_parts(h_lm.clone(), n * LM_STRIDE),
@@ -1630,7 +1665,7 @@ pub fn bench(ctx: &GpuContext, corpus_path: &Path) -> ! {
                             cubes_of(n.div_ceil(rspan)),
                             CubeDim::new_1d(256),
                             BufferArg::from_raw_parts(h_sm.clone(), n),
-                            BufferArg::from_raw_parts(h_fl.clone(), n),
+                            BufferArg::from_raw_parts(h_fl.clone(), n_words),
                             BufferArg::from_raw_parts(h_lm.clone(), n * LM_STRIDE),
                             BufferArg::from_raw_parts(h_lc.clone(), n * LC_STRIDE),
                             BufferArg::from_raw_parts(h_im.clone(), IM_STRIDE),
@@ -1662,7 +1697,7 @@ pub fn bench(ctx: &GpuContext, corpus_path: &Path) -> ! {
                         cubes_of(n),
                         CubeDim::new_1d(256),
                         BufferArg::from_raw_parts(h_lm.clone(), n * LM_STRIDE),
-                        BufferArg::from_raw_parts(h_fl.clone(), n),
+                        BufferArg::from_raw_parts(h_fl.clone(), n_words),
                         BufferArg::from_raw_parts(h_lc.clone(), n * LC_STRIDE),
                         BufferArg::from_raw_parts(h_im.clone(), IM_STRIDE),
                         BufferArg::from_raw_parts(h_ie.clone(), IE_STRIDE),
