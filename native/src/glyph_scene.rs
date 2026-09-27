@@ -1311,48 +1311,80 @@ impl GlyphScene {
                     | wgpu::BufferUsages::COPY_SRC;
                 let bytes: &[u8] = bytemuck::cast_slice(chunk);
                 if direct_upload {
-                    let buf = device.create_buffer(&wgpu::BufferDescriptor {
-                        label: Some(&label),
-                        size: bytes.len() as u64,
-                        usage: usage | wgpu::BufferUsages::MAP_WRITE,
-                        mapped_at_creation: true,
-                    });
-                    // The copy IS the first touch of the buffer's pages — a
-                    // serial memcpy here measured ~2 s of the repo load behind
-                    // page faults. Shard it: each worker maps its own disjoint
-                    // range (WriteOnly<[u8]> is deliberately !Send upstream, so
-                    // the split happens at the BufferSlice level) and faults it
-                    // in in parallel. Small buffers stay serial (thread spawn
-                    // would cost more than the copy).
+                    // hal-created shared buffer, spiked for the mapped-arena
+                    // work: MAP_READ in the usage makes wgpu-hal pick
+                    // StorageModeShared with the DEFAULT cache mode (MAP_WRITE
+                    // would set write-combining — streaming-friendly for the
+                    // one upload write, but the CPU-side paths that read the
+                    // arena back can't afford uncached reads). The hal map
+                    // hands back the raw pointer wgpu's WriteOnly view
+                    // deliberately withholds, so the sharded first-touch write
+                    // splits on raw disjoint ranges.
+                    use wgpu::hal::Device as HalDevice;
+                    let hal_usage = wgpu::BufferUses::STORAGE_READ_ONLY
+                        | wgpu::BufferUses::COPY_DST
+                        | wgpu::BufferUses::COPY_SRC
+                        | wgpu::BufferUses::MAP_READ;
+                    let hal_dev = unsafe { device.as_hal::<wgpu::hal::api::Metal>() }
+                        .expect("Metal profile behind a non-Metal device");
+                    let size = bytes.len() as u64;
+                    let hal_buf = unsafe {
+                        hal_dev.create_buffer(&wgpu::hal::BufferDescriptor {
+                            label: Some(&label),
+                            size,
+                            usage: hal_usage,
+                            memory_flags: wgpu::hal::MemoryFlags::empty(),
+                        })
+                    }
+                    .expect("hal instance buffer");
+                    let mapping = unsafe { hal_dev.map_buffer(&hal_buf, 0..size) }
+                        .expect("hal instance map");
+                    let base = mapping.ptr.as_ptr() as usize;
+                    // The write IS the first touch of the buffer's pages —
+                    // sharded so each worker faults in its own range (measured
+                    // ~2 s of the repo load serial). Small buffers stay serial.
                     const PARALLEL_COPY_THRESHOLD: usize = 16 << 20;
                     if bytes.len() >= PARALLEL_COPY_THRESHOLD {
                         let workers = std::thread::available_parallelism()
                             .map(|n| n.get())
                             .unwrap_or(1)
                             .min(8);
-                        // Range mapping wants 8-aligned offsets; 48 keeps the
-                        // split on instance boundaries too.
                         let span = bytes.len().div_ceil(workers).next_multiple_of(48);
                         std::thread::scope(|s| {
                             for (i, src) in bytes.chunks(span).enumerate() {
-                                let start = (i * span) as u64;
-                                let end = start + src.len() as u64;
-                                let buf_ref = &buf;
-                                s.spawn(move || {
-                                    buf_ref
-                                        .get_mapped_range_mut(start..end)
-                                        .expect("mapped_at_creation buffer must map")
-                                        .copy_from_slice(src);
+                                let off = i * span;
+                                s.spawn(move || unsafe {
+                                    std::ptr::copy_nonoverlapping(
+                                        src.as_ptr(),
+                                        (base + off) as *mut u8,
+                                        src.len(),
+                                    );
                                 });
                             }
                         });
                     } else {
-                        buf.get_mapped_range_mut(..)
-                            .expect("mapped_at_creation buffer must map")
-                            .copy_from_slice(bytes);
+                        unsafe {
+                            std::ptr::copy_nonoverlapping(
+                                bytes.as_ptr(),
+                                base as *mut u8,
+                                bytes.len(),
+                            );
+                        }
                     }
-                    buf.unmap();
-                    buf
+                    unsafe { hal_dev.unmap_buffer(&hal_buf) };
+                    // SAFETY: same device, desc matches the hal request, every
+                    // byte just written, nonzero size.
+                    unsafe {
+                        device.create_buffer_from_hal::<wgpu::hal::api::Metal>(
+                            hal_buf,
+                            &wgpu::BufferDescriptor {
+                                label: Some(&label),
+                                size,
+                                usage: usage | wgpu::BufferUsages::MAP_READ,
+                                mapped_at_creation: false,
+                            },
+                        )
+                    }
                 } else {
                     device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                         label: Some(&label),
