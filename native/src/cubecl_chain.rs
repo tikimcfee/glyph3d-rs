@@ -517,30 +517,64 @@ fn spine_scan(
     }
 }
 
+/// The fold width in force for item `it`: its wrap width, or its page
+/// columns when it has no wrap. fold==0 means x IS the line-advance lane —
+/// no segment re-sum exists.
+#[cube]
+fn fold_of(ie: &[u32], it: usize, wrap: i32) -> i32 {
+    if wrap > 0 {
+        wrap
+    } else if ie[it * IE_STRIDE + IE_HAS_PAGE] != 0 {
+        ie[it * IE_STRIDE + IE_PAGE_COLS] as i32
+    } else {
+        0
+    }
+}
+
 // ── dispatch 3: apply — rake + Blelloch + per-byte chase ─────────────────────
 //
 // Same tile decomposition as tile_scan (the rake and tree are re-derived —
 // the alternative, publishing per-unit micro prefixes to global memory,
 // costs n/rake elements of write+read against re-reading fl/sm once). Each
 // unit chases its `rake` bytes seeded with combine(global tile prefix, own
-// exclusive micro prefix), emitting the per-byte lanes exactly as the old
-// thread-per-chunk k_apply did — but an 8-deep serial chase per unit at
-// n/(units·rake)·units-way parallelism instead of a 64-deep one.
+// exclusive micro prefix), emitting the per-byte lanes.
+//
+// FOLDLESS ITEMS RESOLVE HERE: for fold==0 the chase already holds
+// everything resolve_x would recompute — x IS run.tail_adv, and the old
+// kernel read ~700MB back (fl, lc, wm, wc, otb) to recover values that were
+// in registers at this exact point. The chase writes their lm lanes and
+// reduces their maxima directly; wm/wc/otb are written ONLY for fold>0
+// items, whose segment re-sum genuinely needs the cross-unit ordinal table,
+// and the resolve_x dispatch is skipped entirely when no item folds. Row
+// maxima reduce here for EVERY item (rows are final in the chase); x maxima
+// only where x is final (fold==0) — resolve_x owns the fold>0 x maxima.
+//
+// `inline_resolve` is COMPTIME (the k_decode_probe[probe,walk] pattern): the
+// inline branch's live state (four item-parameter loads, the lm writes)
+// inflates the whole kernel's register set, and measured on a pure-wrapped
+// corpus that costs 2x on the division-heavy fold>0 path — stalls that the
+// memory-bound foldless path hides. Corpora where EVERY item folds compile
+// the inline branch out entirely; mixed and foldless corpora compile it in.
 #[cube(launch_unchecked)]
 fn apply(
     fl: &[u32],
     sm: &[f32],
     lc: &mut [u32],
+    lm: &mut [f32],
     ir: &[u32],
     ie: &[u32],
+    items: &[f32],
     xc: &[u32],
     xm: &[f32],
     wm: &mut [f32],
     wc: &mut [u32],
     otb: &mut [u32],
+    row_max: &mut [Atomic<u32>],
+    x_max: &mut [Atomic<u32>],
     #[comptime] units: usize,
     #[comptime] rake: usize,
     #[comptime] log: usize,
+    #[comptime] inline_resolve: bool,
 ) {
     let tile = CUBE_POS;
     let u = UNIT_POS as usize;
@@ -548,6 +582,34 @@ fn apply(
     let item_count = ir.len() / 2;
     let lo = tile * (units * rake) + u * rake;
     let hi = if lo + rake < n { lo + rake } else { n };
+    // Maxima-reduction slots, seeded before the tree so its barriers cover
+    // visibility (see resolve_x's header for the slot protocol). The whole
+    // apparatus is compiled out for pure-wrapped corpora: measured there,
+    // the per-leader RMWs cost ~8ms inside apply's division-stalled chase,
+    // while riding FREE inside resolve_x, whose re-sum already dominates —
+    // so resolve_x owns both maxima for that shape (fetch_max idempotence
+    // makes the mixed-corpus double reduction harmless).
+    let srow = Shared::<[Atomic<u32>]>::new_slice(RESOLVE_SLOTS);
+    let sx = Shared::<[Atomic<u32>]>::new_slice(RESOLVE_SLOTS);
+    let mut sbase = Shared::<u32>::new();
+    let tile_lo = tile * (units * rake);
+    let mut it_base = 0usize;
+    if inline_resolve {
+        if u == 0 {
+            let probe = if tile_lo < n { tile_lo } else { n - 1 };
+            let mut b = 0usize;
+            if item_count > 0 {
+                b = item_search(ir, item_count, probe);
+            }
+            *sbase = b as u32;
+        }
+        let mut z = u;
+        while z < RESOLVE_SLOTS {
+            srow[z].store(0u32);
+            sx[z].store(0u32);
+            z += units;
+        }
+    }
     let mut seed = lo;
     if seed >= n {
         seed = n - 1;
@@ -629,17 +691,22 @@ fn apply(
     let mut run = p_load(xc, xm, tile);
     let micro = s_load(&sc, &sf, u);
     combine(&mut run, &micro);
+    if inline_resolve {
+        it_base = *sbase as usize;
+    }
     it = 0usize;
     start = 0usize;
     nxt = n;
     w_wrap = 0i32;
     w_mode = 0i32;
+    let mut w_fold = 0i32;
     if has {
         it = item_search(ir, item_count, lo);
         start = ir[it * 2] as usize;
         nxt = if it + 1 < item_count { ir[(it + 1) * 2] as usize } else { n };
         w_wrap = ie[it * IE_STRIDE + IE_WRAP_WIDTH] as i32;
         w_mode = ie[it * IE_STRIDE + IE_WRAP_MODE] as i32;
+        w_fold = fold_of(ie, it, w_wrap);
     }
     if lo < n {
         let mut id = lo;
@@ -650,6 +717,7 @@ fn apply(
                 nxt = if it + 1 < item_count { ir[(it + 1) * 2] as usize } else { n };
                 w_wrap = ie[it * IE_STRIDE + IE_WRAP_WIDTH] as i32;
                 w_mode = ie[it * IE_STRIDE + IE_WRAP_MODE] as i32;
+                w_fold = fold_of(ie, it, w_wrap);
             }
             let reset = has && id == start;
             if reset {
@@ -673,36 +741,79 @@ fn apply(
                     closed = rows_for(run.head_len, w_wrap, w_mode) + run.rows;
                 }
                 let wr = wrap_row_of(col, w_wrap, (f & F_NEWLINE) != 0, w_mode);
+                let row = closed + wr;
                 let co = id * LC_STRIDE;
-                lc[co + LC_ROW] = (closed + wr) as u32;
+                lc[co + LC_ROW] = row as u32;
                 lc[co + LC_COL] = col as u32;
-                wc[id] = run.glyphs as u32;
-                wm[id] = run.tail_adv;
-                otb[start + run.glyphs as usize] = id as u32;
+                if inline_resolve {
+                    // Rows are final here for every item — reduce them all.
+                    // (Compiled out for pure-wrapped corpora: resolve_x owns
+                    // both maxima there — see the slot-seeding note above.)
+                    let slot = it - it_base;
+                    if slot < RESOLVE_SLOTS {
+                        srow[slot].fetch_max((row + 1) as u32);
+                    } else {
+                        row_max[it].fetch_max((row + 1) as u32);
+                    }
+                }
+                if w_fold > 0 || !inline_resolve {
+                    // The re-sum's inputs: ordinal table + line advance.
+                    wc[id] = run.glyphs as u32;
+                    wm[id] = run.tail_adv;
+                    otb[start + run.glyphs as usize] = id as u32;
+                } else {
+                    // Foldless: x IS the line-advance lane — resolve_x's
+                    // whole per-item computation, in registers, now.
+                    let x = run.tail_adv;
+                    let io = it * IM_STRIDE;
+                    let seg = wrap_segment_of(col, w_wrap, (f & F_NEWLINE) != 0);
+                    let lh = items[io + IM_LINE_HEIGHT];
+                    let mo = id * LM_STRIDE;
+                    let base = x + items[io + IM_ORIGIN_X];
+                    lm[mo + LM_BASE_X] = base;
+                    lm[mo + LM_X] = base;
+                    lm[mo + LM_Y] = (row as f32) * (-lh) + items[io + IM_ORIGIN_Y];
+                    lm[mo + LM_Z] = (seg as f32) * (-items[io + IM_Z_STEP]) + items[io + IM_ORIGIN_Z];
+                    let slot = it - it_base;
+                    if slot < RESOLVE_SLOTS {
+                        sx[slot].fetch_max(ordered_key(x));
+                    } else {
+                        x_max[it].fetch_max(ordered_key(x));
+                    }
+                }
             }
             let leaf = leaf_of(fl, sm, w_wrap, w_mode, if reset { 1i32 } else { 0i32 }, id);
             combine(&mut run, &leaf);
             id += 1;
         }
     }
+    if inline_resolve {
+        sync_cube();
+        if u < RESOLVE_SLOTS {
+            let it2 = it_base + u;
+            if it2 < item_count {
+                row_max[it2].fetch_max(srow[u].load());
+                x_max[it2].fetch_max(sx[u].load());
+            }
+        }
+    }
 }
 
-// ── dispatch 4: resolveX — thread per byte, leaders only ─────────────────────
+// ── dispatch 4: resolveX — the WRAPPED items' x, thread per byte ─────────────
 //
-// The x re-sum is UNCHANGED (measured +0.2ms at wrap=96 — within a line the
-// predecessor advances are contiguous and L1-local — and its serial left-fold
-// order is what holds the fold>0 X lanes' bit-exact tier). What changed is
-// the maxima: the old kernel fired two GLOBAL fetch_max per leader, and with
-// per-item cells that serializes every leader in an item (the bench's single
-// item made all 24M leaders contend on two words — 41.6ms of the 69ms
-// chain). Now each cube reduces its leaders' maxima through SHARED atomics
-// in RESOLVE_SLOTS item-relative slots and flushes one global RMW per
-// touched slot: contention drops from leaders-per-item to
-// cubes-per-item. Cubes spanning more than RESOLVE_SLOTS items (never in
-// practice; items are files and tiles are 2 KB) fall back to the global
-// atomics on the overflow path. An untouched slot flushes 0, which can never
-// beat a real value: rows count from 1 and every x is >= 0, whose ordered
-// keys all exceed 0.
+// SKIPPED ENTIRELY when no item folds (the driver knows): foldless items
+// resolve inside apply's chase, which holds x in a register. This kernel
+// serves the fold>0 items, whose segment re-sum genuinely needs the
+// cross-unit ordinal table apply published. The re-sum is the serial
+// left-fold order that holds the fold>0 X lanes' bit-exact tier — it is the
+// DOMINANT cost of the wrapped shape (~25ms of the ~34ms at wrap=96: every
+// leader independently re-sums its col%fold predecessors, avg ~48 adds +
+// dependent loads per leader; the old '+0.2ms' note measured it in the era
+// when per-leader global atomics masked it). Both maxima reduce here for
+// this shape (apply's are compiled out — the same RMWs cost ~8ms inside its
+// division-stalled chase and ride free here). An untouched slot flushes 0,
+// which cannot beat a real value: rows count from 1 and every x >= 0 has an
+// ordered key above 0.
 #[cube(launch_unchecked)]
 fn resolve_x(
     sm: &[f32],
@@ -712,7 +823,6 @@ fn resolve_x(
     items: &[f32],
     ie: &[u32],
     ir: &[u32],
-    wm: &[f32],
     wc: &[u32],
     otb: &[u32],
     row_max: &mut [Atomic<u32>],
@@ -750,40 +860,35 @@ fn resolve_x(
         let io = it * IM_STRIDE;
         let ie_off = it * IE_STRIDE;
         let wrap = ie[ie_off + IE_WRAP_WIDTH] as i32;
-        let mut fold = wrap;
-        if fold == 0 && ie[ie_off + IE_HAS_PAGE] != 0 {
-            fold = ie[ie_off + IE_PAGE_COLS] as i32;
-        }
-        let col = lc[id * LC_STRIDE + LC_COL] as i32;
-        let ord = wc[id] as i32;
-        let mut x = 0.0f32;
+        let fold = fold_of(ie, it, wrap);
         if fold > 0 {
+            let col = lc[id * LC_STRIDE + LC_COL] as i32;
+            let ord = wc[id] as i32;
             // The forward re-sum from the segment start — the serial segAdv order.
+            let mut x = 0.0f32;
             let mut k = col % fold;
             while k >= 1 {
                 let q = otb[ir[it * 2] as usize + (ord - k) as usize] as usize;
                 x += sm[q];
                 k -= 1;
             }
-        } else {
-            x = wm[id];
-        }
-        let row = lc[id * LC_STRIDE + LC_ROW] as i32;
-        let seg = wrap_segment_of(col, wrap, (fl[id] & F_NEWLINE) != 0);
-        let lh = items[io + IM_LINE_HEIGHT];
-        let mo = id * LM_STRIDE;
-        let base = x + items[io + IM_ORIGIN_X];
-        lm[mo + LM_BASE_X] = base;
-        lm[mo + LM_X] = base;
-        lm[mo + LM_Y] = (row as f32) * (-lh) + items[io + IM_ORIGIN_Y];
-        lm[mo + LM_Z] = (seg as f32) * (-items[io + IM_Z_STEP]) + items[io + IM_ORIGIN_Z];
-        let slot = it - it_base;
-        if slot < RESOLVE_SLOTS {
-            srow[slot].fetch_max((row + 1) as u32);
-            sx[slot].fetch_max(ordered_key(x));
-        } else {
-            row_max[it].fetch_max((row + 1) as u32);
-            x_max[it].fetch_max(ordered_key(x));
+            let row = lc[id * LC_STRIDE + LC_ROW] as i32;
+            let seg = wrap_segment_of(col, wrap, (fl[id] & F_NEWLINE) != 0);
+            let lh = items[io + IM_LINE_HEIGHT];
+            let mo = id * LM_STRIDE;
+            let base = x + items[io + IM_ORIGIN_X];
+            lm[mo + LM_BASE_X] = base;
+            lm[mo + LM_X] = base;
+            lm[mo + LM_Y] = (row as f32) * (-lh) + items[io + IM_ORIGIN_Y];
+            lm[mo + LM_Z] = (seg as f32) * (-items[io + IM_Z_STEP]) + items[io + IM_ORIGIN_Z];
+            let slot = it - it_base;
+            if slot < RESOLVE_SLOTS {
+                srow[slot].fetch_max((row + 1) as u32);
+                sx[slot].fetch_max(ordered_key(x));
+            } else {
+                row_max[it].fetch_max((row + 1) as u32);
+                x_max[it].fetch_max(ordered_key(x));
+            }
         }
     }
     sync_cube();
@@ -975,6 +1080,17 @@ pub fn run(ctx: &GpuContext, fixture_path: &Path) -> ! {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(6);
+    // Foldless corpora never dispatch resolve_x at all — apply's chase
+    // resolves them (x in a register, no ordinal round trip). Pure-wrapped
+    // corpora compile the inline branch out (see apply's header).
+    let needs_resolve = fx.items.iter().any(|it| {
+        it.wrap_width > 0 || (it.has_page && it.page_cols > 0)
+    });
+    let all_fold = fx
+        .items
+        .iter()
+        .all(|it| it.wrap_width > 0 || (it.has_page && it.page_cols > 0));
+    let inline_resolve = !all_fold;
     // One cube per tile (dim = units); the byte-wide kernels stay 256-unit.
     let tiles_grid = |tiles: usize| {
         CubeCount::Static(tiles.min(65535) as u32, tiles.div_ceil(65535) as u32, 1)
@@ -1023,19 +1139,24 @@ pub fn run(ctx: &GpuContext, fixture_path: &Path) -> ! {
                 BufferArg::from_raw_parts(h_fl.clone(), n),
                 BufferArg::from_raw_parts(h_sm.clone(), n),
                 BufferArg::from_raw_parts(h_lc.clone(), n * LC_STRIDE),
+                BufferArg::from_raw_parts(h_lm.clone(), n * LM_STRIDE),
                 BufferArg::from_raw_parts(h_ir.clone(), item_count * 2),
                 BufferArg::from_raw_parts(h_ie.clone(), item_count * IE_STRIDE),
+                BufferArg::from_raw_parts(h_im.clone(), item_count * IM_STRIDE),
                 BufferArg::from_raw_parts(h_xc.clone(), n_tiles * PARTIAL_COUNT_STRIDE),
                 BufferArg::from_raw_parts(h_xm.clone(), n_tiles),
                 BufferArg::from_raw_parts(h_wm.clone(), n),
                 BufferArg::from_raw_parts(h_wc.clone(), n),
                 BufferArg::from_raw_parts(h_otb.clone(), n),
+                BufferArg::from_raw_parts(h_rmax.clone(), item_count),
+                BufferArg::from_raw_parts(h_xmax.clone(), item_count),
                 units,
                 rake,
                 log,
+                inline_resolve,
             );
         }
-        if stages >= 4 {
+        if stages >= 4 && needs_resolve {
             resolve_x::launch_unchecked(
                 &client,
                 cubes_of(n),
@@ -1047,7 +1168,6 @@ pub fn run(ctx: &GpuContext, fixture_path: &Path) -> ! {
                 BufferArg::from_raw_parts(h_im.clone(), item_count * IM_STRIDE),
                 BufferArg::from_raw_parts(h_ie.clone(), item_count * IE_STRIDE),
                 BufferArg::from_raw_parts(h_ir.clone(), item_count * 2),
-                BufferArg::from_raw_parts(h_wm.clone(), n),
                 BufferArg::from_raw_parts(h_wc.clone(), n),
                 BufferArg::from_raw_parts(h_otb.clone(), n),
                 BufferArg::from_raw_parts(h_rmax.clone(), item_count),
@@ -1116,32 +1236,63 @@ pub fn run(ctx: &GpuContext, fixture_path: &Path) -> ! {
     let xmax: &[u32] = bytemuck::cast_slice(&xmax_bytes);
 
     // The item maxima, diffed DIRECTLY against the CPU fold's item_bounds
-    // lanes (TOTAL_ROWS, MAX_ROW_EXTENT) — the shared-atomic reduction in
-    // resolve_x is invisible to the lm lanes on unpaged fixtures, so without
-    // this it would have no witness at all.
+    // lanes (TOTAL_ROWS, MAX_ROW_EXTENT) — apply produces every row maximum
+    // (and the foldless x maxima); resolve_x the folding x maxima, so the x
+    // tier waits for stage 4 only when the corpus folds.
     let host_key_to_float = |k: u32| -> f32 {
         let b = if (k & 0x8000_0000) != 0 { k & 0x7FFF_FFFF } else { !k };
         f32::from_bits(b)
     };
     let mut bad = 0usize;
     let mut max_x_dev = 0.0f64;
-    if stages >= 4 {
-        for i in 0..item_count {
+    if stages >= 3 {
+        for (i, got) in rmax.iter().take(item_count).enumerate() {
             let want_rows = r.item_bounds[i * 8 + 6];
-            if rmax[i] as f64 != want_rows {
+            if *got as f64 != want_rows {
                 if bad < 8 {
-                    println!("  MISMATCH item {i} total_rows: cpu {want_rows} gpu {}", rmax[i]);
+                    println!("  MISMATCH item {i} total_rows: cpu {want_rows} gpu {got}");
                 }
                 bad += 1;
             }
+        }
+    }
+    if stages >= 3 && (!needs_resolve || stages >= 4) {
+        for (i, got) in xmax.iter().take(item_count).enumerate() {
             let want_x = r.item_bounds[i * 8 + 7];
-            let got_x = host_key_to_float(xmax[i]) as f64;
+            let got_x = host_key_to_float(*got) as f64;
             let x_dev = (got_x - want_x).abs() / want_x.abs().max(1.0);
             if x_dev > max_x_dev {
                 max_x_dev = x_dev;
             }
         }
     }
+
+    // Foldless items leave wm/wc/otb unwritten on purpose (apply resolves
+    // them in-register) — the ord/line_adv diffs apply only to folding items.
+    let fold_of_item: Vec<i64> = fx
+        .items
+        .iter()
+        .map(|it| {
+            if it.wrap_width > 0 {
+                it.wrap_width
+            } else if it.has_page && it.page_cols > 0 {
+                it.page_cols
+            } else {
+                0
+            }
+        })
+        .collect();
+    let fold_at = |byte: usize| -> i64 {
+        let mut f = 0i64;
+        for (k, item) in fx.items.iter().enumerate() {
+            if (item.byte_start as usize) <= byte
+                && byte < ((item.byte_start + item.byte_count) as usize)
+            {
+                f = fold_of_item[k];
+            }
+        }
+        f
+    };
 
     // The diff: counts bit-exact; line_advance and positions reported with
     // max deviation and held to the oracle's 1e-4 eps tier (the module
@@ -1154,11 +1305,14 @@ pub fn run(ctx: &GpuContext, fixture_path: &Path) -> ! {
             continue;
         }
         leaders += 1;
-        let checks = [
+        let folds = fold_at(id);
+        let mut checks = vec![
             (r.slots.row(id), lc[id * LC_STRIDE + LC_ROW] as i64, "row"),
             (r.slots.col(id), lc[id * LC_STRIDE + LC_COL] as i64, "col"),
-            (r.slots.wc[id] as i64, wc[id] as i64, "ord"),
         ];
+        if folds > 0 {
+            checks.push((r.slots.wc[id] as i64, wc[id] as i64, "ord"));
+        }
         for (want, got, name) in checks {
             if want != got {
                 if bad < 8 {
@@ -1168,9 +1322,11 @@ pub fn run(ctx: &GpuContext, fixture_path: &Path) -> ! {
             }
         }
         let la_cpu = r.slots.wm[id] as f64;
-        let la_rel = (wm[id] as f64 - la_cpu).abs() / la_cpu.abs().max(1.0);
-        if la_rel > max_line_dev {
-            max_line_dev = la_rel;
+        if folds > 0 {
+            let la_rel = (wm[id] as f64 - la_cpu).abs() / la_cpu.abs().max(1.0);
+            if la_rel > max_line_dev {
+                max_line_dev = la_rel;
+            }
         }
         for (k, acc) in [(LM_X, r.slots.x(id)), (LM_Y, r.slots.y(id)), (LM_Z, r.slots.z(id))] {
             let dev = (lm[id * LM_STRIDE + k] as f64 - acc as f64).abs();
@@ -1273,6 +1429,11 @@ pub fn bench(ctx: &GpuContext, corpus_path: &Path) -> ! {
     };
     let items = [item];
     let trie = crate::atlas::TrieTable::load(&crate::atlas_dir());
+    // The bench item folds iff GLYPH_CHAIN_WRAP is set — foldless runs skip
+    // the resolve_x dispatch entirely (apply resolves them), and pure-wrapped
+    // runs compile apply's inline branch out.
+    let needs_resolve = wrap_width > 0;
+    let inline_resolve = wrap_width == 0;
 
     let t_decode = std::time::Instant::now();
     let r = run_scan_pipeline(&bytes, &trie, &items, DEFAULT_CHUNK_SIZE, DEFAULT_GROUP_SIZE, 1);
@@ -1373,37 +1534,43 @@ pub fn bench(ctx: &GpuContext, corpus_path: &Path) -> ! {
                         BufferArg::from_raw_parts(h_fl.clone(), n),
                         BufferArg::from_raw_parts(h_sm.clone(), n),
                         BufferArg::from_raw_parts(h_lc.clone(), n * LC_STRIDE),
+                        BufferArg::from_raw_parts(h_lm.clone(), n * LM_STRIDE),
                         BufferArg::from_raw_parts(h_ir.clone(), 2),
                         BufferArg::from_raw_parts(h_ie.clone(), IE_STRIDE),
+                        BufferArg::from_raw_parts(h_im.clone(), IM_STRIDE),
                         BufferArg::from_raw_parts(h_xc.clone(), n_tiles * PARTIAL_COUNT_STRIDE),
                         BufferArg::from_raw_parts(h_xm.clone(), n_tiles),
                         BufferArg::from_raw_parts(h_wm.clone(), n),
                         BufferArg::from_raw_parts(h_wc.clone(), n),
                         BufferArg::from_raw_parts(h_otb.clone(), n),
+                        BufferArg::from_raw_parts(h_rmax.clone(), 1),
+                        BufferArg::from_raw_parts(h_xmax.clone(), 1),
                         units,
                         rake,
                         log,
+                        inline_resolve,
                     );
                 }
                 3 => {
-                    resolve_x::launch_unchecked(
-                        &client,
-                        cubes_of(n),
-                        CubeDim::new_1d(256),
-                        BufferArg::from_raw_parts(h_sm.clone(), n),
-                        BufferArg::from_raw_parts(h_fl.clone(), n),
-                        BufferArg::from_raw_parts(h_lm.clone(), n * LM_STRIDE),
-                        BufferArg::from_raw_parts(h_lc.clone(), n * LC_STRIDE),
-                        BufferArg::from_raw_parts(h_im.clone(), IM_STRIDE),
-                        BufferArg::from_raw_parts(h_ie.clone(), IE_STRIDE),
-                        BufferArg::from_raw_parts(h_ir.clone(), 2),
-                        BufferArg::from_raw_parts(h_wm.clone(), n),
-                        BufferArg::from_raw_parts(h_wc.clone(), n),
-                        BufferArg::from_raw_parts(h_otb.clone(), n),
-                        BufferArg::from_raw_parts(h_rmax.clone(), 1),
-                        BufferArg::from_raw_parts(h_xmax.clone(), 1),
-                        256,
-                    );
+                    if needs_resolve {
+                        resolve_x::launch_unchecked(
+                            &client,
+                            cubes_of(n),
+                            CubeDim::new_1d(256),
+                            BufferArg::from_raw_parts(h_sm.clone(), n),
+                            BufferArg::from_raw_parts(h_fl.clone(), n),
+                            BufferArg::from_raw_parts(h_lm.clone(), n * LM_STRIDE),
+                            BufferArg::from_raw_parts(h_lc.clone(), n * LC_STRIDE),
+                            BufferArg::from_raw_parts(h_im.clone(), IM_STRIDE),
+                            BufferArg::from_raw_parts(h_ie.clone(), IE_STRIDE),
+                            BufferArg::from_raw_parts(h_ir.clone(), 2),
+                            BufferArg::from_raw_parts(h_wc.clone(), n),
+                            BufferArg::from_raw_parts(h_otb.clone(), n),
+                            BufferArg::from_raw_parts(h_rmax.clone(), 1),
+                            BufferArg::from_raw_parts(h_xmax.clone(), 1),
+                            256,
+                        );
+                    }
                 }
                 4 => {
                     derive_stride::launch_unchecked(
@@ -1458,6 +1625,11 @@ pub fn bench(ctx: &GpuContext, corpus_path: &Path) -> ! {
     let mut timing_method = String::new();
     for _ in 0..samples {
         for (s, slot) in mins.iter_mut().enumerate() {
+            if s == 3 && !needs_resolve {
+                // Stage 3 is resolve_x; foldless corpora skip the dispatch
+                // (and its window) entirely.
+                continue;
+            }
             let window = client.profile_start().expect("profile_start");
             launch(s);
             let dur = client.profile_end(window).expect("profile_end");
