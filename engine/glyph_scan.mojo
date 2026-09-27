@@ -24,29 +24,13 @@ from max.algorithm import parallelize  # MOJO-1.1-PORT: see glyph_pipeline.mojo
 from glyph_schema import SM_STRIDE, LM_STRIDE, LC_STRIDE
 from glyph_cluster import resolve_clusters
 from glyph_pipeline import (
-    Trie,
-    Item,
-    PipelineResult,
-    Slots,
-    CLUSTER_CLUSTER,
-    F_LEADER,
-    F_NEWLINE,
-    F_RENDERED,
-    F_MISSING,
-    F64_INF,
-    NEWLINE,
-    decode_codepoint_at,
-    sequence_length,
-    item_for_byte,
-    wrap_segment_of,
-    paginate,
-    page_active,
-    derive_stride,
-    shard_lo,
-    _decode_shard,
-    _paginate_shard,
-    _bounds_item, Witness,
+    Item, PipelineResult, Slots, CLUSTER_CLUSTER, F_LEADER, F_NEWLINE,
+    F_RENDERED, F_MISSING, F64_INF, NEWLINE, decode_codepoint_at,
+    sequence_length, item_for_byte, paginate, page_active, derive_stride,
+    shard_lo, _decode_shard, _paginate_shard, _bounds_item, Witness
 )
+from glyph_trie import Trie
+from glyph_wrap import wrap_segment_of
 from glyph_bake import (
     ScanElem,
     scan_identity,

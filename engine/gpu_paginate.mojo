@@ -32,9 +32,11 @@ from glyph_schema import (
     IE_PAGES_WIDE, IE_WRAP_WIDTH, IE_WRAP_MODE, IE_HAS_PAGE,
 )
 from glyph_pipeline import (
-    run_pipeline, F_LEADER, F_NEWLINE, trunc_nonneg, derive_stride, Item, Trie,
-    item_for_byte, page_active, wrap_segment_of,
+    run_pipeline, F_LEADER, F_NEWLINE, trunc_nonneg, derive_stride, Item,
+    item_for_byte, page_active
 )
+from glyph_trie import Trie
+from glyph_wrap import wrap_segment_of
 from fixture_io import load_pipe_fixture
 
 comptime MAX_PRINTED = 8

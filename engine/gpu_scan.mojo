@@ -25,7 +25,8 @@ from glyph_schema import (
     PARTIAL_COUNT_STRIDE, PARTIAL_MEASURE_STRIDE,
     P_RESET, P_NL, P_GLYPHS, P_ROWS, P_HEAD_LEN, P_TAIL_LEN, P_WRAP, P_MODE, PM_TAIL_ADV,
 )
-from glyph_pipeline import run_pipeline, F_LEADER, F_NEWLINE, item_for_byte, WRAP_DOWN
+from glyph_pipeline import run_pipeline, F_LEADER, F_NEWLINE, item_for_byte
+from glyph_wrap import WRAP_DOWN
 from glyph_bake import ScanElem, scan_identity, scan_leaf_value, scan_combine, rows_for_line
 from fixture_io import load_pipe_fixture
 

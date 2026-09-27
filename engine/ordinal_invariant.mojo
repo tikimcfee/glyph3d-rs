@@ -37,7 +37,8 @@
 # Run: mojo run -I engine engine/ordinal_invariant.mojo engine/fixtures/*.pipe.bin
 
 from std.sys import argv
-from glyph_pipeline import run_pipeline, Item, Trie, PipelineResult, F_LEADER
+from glyph_pipeline import run_pipeline, Item, PipelineResult, F_LEADER
+from glyph_trie import Trie
 from fixture_io import load_pipe_fixture
 
 comptime MAX_PRINTED = 6

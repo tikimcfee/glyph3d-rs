@@ -1,9 +1,8 @@
 # glyph_pipeline.mojo — the byte-in glyph pipeline, ported to Mojo.
 #
 # Split 2026-09 (the code-shape refactor): the trie lives in glyph_trie.mojo
-# and the wrap rules in glyph_wrap.mojo; this file re-imports both, so every
-# `from glyph_pipeline import ...` elsewhere keeps resolving (the sweep to
-# direct paths is its own change).
+# and the wrap rules in glyph_wrap.mojo; this file imports the names its own
+# body uses, and every other module imports from the two directly.
 #
 # The FOURTH layer of the pipeline contract (oracle → scan spec → TSL → this):
 # a native transcription of glyphPipelineReference.js, the semantic oracle. It is
@@ -49,7 +48,7 @@ from glyph_schema import (
 from glyph_cluster import resolve_clusters
 from cluster_split import probe_clusters, chain_clusters
 from glyph_trie import (
-    Trie, trie_lookup_entry,
+    Trie,
     BLOCK_SHIFT, BLOCK_MASK, MAX_CODEPOINT,
     TM_STRIDE, TM_ADVANCE, TM_HEIGHT,
     TC_STRIDE, TC_GLYPH_ID, TC_FLAGS, FLAG_MISSING,

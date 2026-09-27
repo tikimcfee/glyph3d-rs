@@ -38,9 +38,11 @@ from std.sys import argv
 from std.collections import Dict
 from glyph_schema import LC_STRIDE, LC_ROW, LC_COL, LM_STRIDE, LM_Z
 from glyph_pipeline import (
-    run_pipeline, Item, Trie, F_LEADER, F_NEWLINE, F_RENDERED, F_MISSING,
-    page_active, wrap_segment_of, WRAP_DOWN, WRAP_BACK,
+    run_pipeline, Item, F_LEADER, F_NEWLINE, F_RENDERED, F_MISSING,
+    page_active
 )
+from glyph_trie import Trie
+from glyph_wrap import wrap_segment_of, WRAP_DOWN, WRAP_BACK
 from fixture_io import load_pipe_fixture
 
 comptime MAX_PRINTED = 6

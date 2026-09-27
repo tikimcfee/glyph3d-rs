@@ -40,8 +40,9 @@ from glyph_schema import (
     RECORD_MEASURE_STRIDE, RECORD_COUNT_STRIDE, RECORD_BYTES,
 )
 from glyph_pipeline import (
-    Item, Trie, run_pipeline, F_LEADER, PipelineResult, BOUNDS_GRAIN,
+    Item, run_pipeline, F_LEADER, PipelineResult, BOUNDS_GRAIN
 )
+from glyph_trie import Trie
 from max.algorithm import parallelize
 from std.time import perf_counter_ns
 
@@ -204,7 +205,7 @@ def run_streaming[o: ImmOrigin](
 
 from glyph_bake import BakeRecord, prefix_at, lanes_from_prefix
 from glyph_pipeline import (
-    LayoutSeed, sequence_length, decode_codepoint_at, NEWLINE,
+    LayoutSeed, sequence_length, decode_codepoint_at, NEWLINE
 )
 
 

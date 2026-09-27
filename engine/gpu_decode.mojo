@@ -22,11 +22,11 @@ from glyph_schema import (
     SM_STRIDE, SM_ADVANCE, SM_HEIGHT,
 )
 from glyph_pipeline import (
-    BLOCK_SHIFT, BLOCK_MASK,
-    TM_STRIDE, TM_ADVANCE, TM_HEIGHT, TC_STRIDE, TC_GLYPH_ID, TC_FLAGS,
-    FLAG_MISSING, F_LEADER, F_NEWLINE, F_MISSING, NEWLINE,
-    decode_and_resolve,
-    Slots,
+    F_LEADER, F_NEWLINE, F_MISSING, NEWLINE, decode_and_resolve, Slots
+)
+from glyph_trie import (
+    BLOCK_SHIFT, BLOCK_MASK, TM_STRIDE, TM_ADVANCE, TM_HEIGHT, TC_STRIDE,
+    TC_GLYPH_ID, TC_FLAGS, FLAG_MISSING
 )
 from fixture_io import load_pipe_fixture
 

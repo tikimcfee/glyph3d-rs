@@ -10,7 +10,8 @@
 
 from std.sys import argv
 from std.memory import bitcast
-from glyph_pipeline import Trie, NEWLINE, sequence_length, decode_codepoint_at
+from glyph_pipeline import NEWLINE, sequence_length, decode_codepoint_at
+from glyph_trie import Trie
 from glyph_bake import (
     ScanElem,
     BakeRecord,

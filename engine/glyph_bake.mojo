@@ -22,18 +22,10 @@
 from std.collections.span import Span
 from std.collections import Set, Dict
 from glyph_pipeline import (
-    Trie,
-    NEWLINE,
-    FLAG_MISSING,
-    F64_INF,
-    sequence_length,
-    byte_at,
-    trie_lookup_entry,
-    rows_for_line,
-    wrap_row_of,
-    WRAP_DOWN,
-    decode_codepoint_at,
+    NEWLINE, F64_INF, sequence_length, byte_at, decode_codepoint_at
 )
+from glyph_trie import Trie, FLAG_MISSING, trie_lookup_entry
+from glyph_wrap import rows_for_line, wrap_row_of, WRAP_DOWN
 
 comptime BAKE_VERSION = 2
 comptime CHECKPOINT_INTERVAL = 4096

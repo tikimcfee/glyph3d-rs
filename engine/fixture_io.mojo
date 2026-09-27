@@ -8,7 +8,9 @@ from std.memory import bitcast
 # FIXTURE strides, not container strides: the on-disk format is frozen at 8+4
 # per byte regardless of how the engine lays its working buffers.
 from glyph_schema import FIXTURE_MEASURE_STRIDE, FIXTURE_COUNT_STRIDE
-from glyph_pipeline import Trie, Item, trunc_nonneg, BLOCK_SHIFT, WRAP_DOWN, WRAP_BACK
+from glyph_pipeline import Item, trunc_nonneg
+from glyph_trie import Trie, BLOCK_SHIFT
+from glyph_wrap import WRAP_DOWN, WRAP_BACK
 from glyph_pipeline import CLUSTER_LEADER, CLUSTER_CLUSTER
 
 comptime PIPE_MAGIC = 0x46443347

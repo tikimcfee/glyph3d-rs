@@ -38,9 +38,10 @@ from glyph_schema import (
     B_MIN_X, B_MIN_Y, B_MIN_Z, B_MAX_X, B_MAX_Y, B_MAX_Z, B_MAX_ROW_EXTENT,
 )
 from glyph_pipeline import (
-    run_pipeline, Item, Trie, F_LEADER, page_active, paginate, derive_stride,
-    WRAP_DOWN, WRAP_BACK,
+    run_pipeline, Item, F_LEADER, page_active, paginate, derive_stride
 )
+from glyph_trie import Trie
+from glyph_wrap import WRAP_DOWN, WRAP_BACK
 from fixture_io import load_pipe_fixture
 
 comptime MAX_PRINTED = 6

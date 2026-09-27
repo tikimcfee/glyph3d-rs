@@ -36,10 +36,11 @@
 from std.sys import argv
 from std.time import perf_counter_ns
 from glyph_pipeline import (
-    run_pipeline, Item, Trie, PipelineResult, WRAP_BACK,
-    ST_ALLOC, ST_GAPSWEEP, ST_DECODE, ST_MISSCAT, ST_FOLD, ST_PAGINATE,
-    ST_BOUNDS, ST_COUNT,
+    run_pipeline, Item, PipelineResult, ST_ALLOC, ST_GAPSWEEP, ST_DECODE,
+    ST_MISSCAT, ST_FOLD, ST_PAGINATE, ST_BOUNDS, ST_COUNT
 )
+from glyph_trie import Trie
+from glyph_wrap import WRAP_BACK
 from glyph_scan import run_scan_pipeline
 from fixture_io import load_pipe_fixture
 

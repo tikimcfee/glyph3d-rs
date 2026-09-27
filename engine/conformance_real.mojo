@@ -33,9 +33,10 @@
 
 from std.sys import argv
 from glyph_pipeline import (
-    run_pipeline, Item, Trie, F_LEADER, F_RENDERED, PipelineResult, page_active,
-    WRAP_DOWN, WRAP_BACK,
+    run_pipeline, Item, F_LEADER, F_RENDERED, PipelineResult, page_active
 )
+from glyph_trie import Trie
+from glyph_wrap import WRAP_DOWN, WRAP_BACK
 from glyph_scan import run_scan_pipeline
 from fixture_io import load_pipe_fixture
 

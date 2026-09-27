@@ -22,9 +22,10 @@
 from std.collections import Dict
 from std.collections.span import Span
 from glyph_pipeline import (
-    Slots, Trie, Item, sequence_length, decode_codepoint_at,
-    F_CLUSTER_TRAILER, NEWLINE,
+    Slots, Item, sequence_length, decode_codepoint_at, F_CLUSTER_TRAILER,
+    NEWLINE
 )
+from glyph_trie import Trie
 from glyph_cluster import is_static_zero_cp
 
 

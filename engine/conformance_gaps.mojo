@@ -20,7 +20,8 @@
 from std.sys import argv
 from glyph_schema import FIXTURE_COUNT_STRIDE, FIX_C_FLAGS
 from glyph_scan import run_scan_pipeline
-from glyph_pipeline import run_pipeline, Item, Trie, F_LEADER, F_MISSING
+from glyph_pipeline import run_pipeline, Item, F_LEADER, F_MISSING
+from glyph_trie import Trie
 from fixture_io import load_pipe_fixture
 
 comptime MAX_PRINTED = 8

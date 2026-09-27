@@ -17,11 +17,8 @@ from glyph_schema import (
     IE_WRAP_WIDTH, IE_WRAP_MODE, IE_HAS_PAGE,
     PARTIAL_COUNT_STRIDE, PARTIAL_MEASURE_STRIDE,
 )
-from glyph_pipeline import (
-    F_LEADER, F_NEWLINE,
-    WRAP_DOWN, WRAP_BACK,
-    item_search_device,
-)
+from glyph_pipeline import F_LEADER, F_NEWLINE, item_search_device
+from glyph_wrap import WRAP_DOWN, WRAP_BACK
 from gpu_monoid import (
     E, combine, p_load, p_store, leaf_of, ordered_key, key_to_float,
     rows_for, wrap_segment_of, wrap_row_of,

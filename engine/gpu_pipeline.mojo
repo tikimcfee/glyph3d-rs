@@ -54,10 +54,11 @@ from glyph_schema import (
     P_RESET, P_NL, P_GLYPHS, P_ROWS, P_HEAD_LEN, P_TAIL_LEN, P_WRAP, P_MODE, PM_TAIL_ADV,
 )
 from glyph_pipeline import (
-    F_LEADER, F_NEWLINE,
-    WRAP_DOWN, WRAP_BACK, run_pipeline, CLUSTER_LEADER, CLUSTER_CLUSTER,
-    item_search_device,
+    F_LEADER, F_NEWLINE, run_pipeline, CLUSTER_LEADER, CLUSTER_CLUSTER,
+    item_search_device
 )
+from glyph_trie import Trie
+from glyph_wrap import WRAP_DOWN, WRAP_BACK
 
 
 from glyph_scan import run_scan_pipeline
@@ -68,7 +69,7 @@ from cluster_device import (
     BLOCK, BLOCK_LOG2, CLIST_CAP, CLIST_STRIDE, SB_BLOCKS,
 )
 from fixture_io import load_pipe_fixture, PipeFixture, load_trie_blob
-from glyph_pipeline import Item, Trie
+from glyph_pipeline import Item
 from gpu_monoid import E, combine, CHUNK, GROUP
 from gpu_kernels import (
     ItemWalk,
