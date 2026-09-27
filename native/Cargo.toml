@@ -30,6 +30,10 @@ glam = { version = "0.33", features = ["approx", "debug-glam-assert", "mint"] }
 clap = { version = "4", features = ["derive"] }
 clap_complete = "4"
 wgpu-profiler = "0.28"
+# CubeCL bring-up (the note-16 spike): GPU compute kernels in Rust sharing
+# our wgpu device. Pre-release pin — 0.11.0-pre.4 is the line whose wgpu dep
+# unifies with our 30.0.1 (the 0.10 line still pins wgpu 29).
+cubecl = { version = "=0.11.0-pre.4", features = ["wgpu"] }
 encase = "0.12"
 # Stage K (K1): egui overlay on the WINDOWED renderer (windowed.rs only;
 # offscreen never touches it). egui-wgpu WITHOUT its `winit` feature — that

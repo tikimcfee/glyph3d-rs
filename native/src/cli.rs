@@ -246,6 +246,11 @@ pub(crate) struct Cli {
     /// provenance record committed beside a golden set as ADAPTER.txt.
     #[arg(long)]
     pub(crate) gpu_profile: bool,
+    /// Dev-only CubeCL bring-up smoke (note 16, phase 0): share the device,
+    /// prove buffer interop both directions, measure float contraction on the
+    /// k_apply shape, print the verdicts, exit. Not wired into the battery.
+    #[arg(long)]
+    pub(crate) cubecl_smoke: bool,
     /// Windowed only: how frames reach the display. `fifo` (the default) is
     /// vsync, so the FPS line reads the monitor's refresh; `mailbox` and
     /// `immediate` uncap it where the surface supports them (else fifo, and

@@ -30,6 +30,7 @@
 mod atlas;
 mod bake;
 mod cli;
+mod cubecl_smoke;
 mod engine;
 mod fixture;
 mod fold;
@@ -336,6 +337,12 @@ fn main() {
             print!("{}", ctx.profile.render_text());
         }
         return;
+    }
+
+    // Dev-only CubeCL bring-up smoke (note 16, phase 0).
+    if cli.cubecl_smoke {
+        let ctx = pollster::block_on(gpu::init(None));
+        cubecl_smoke::run(&ctx);
     }
 
     // Fixture parity (reference port): fixture parse manifest / corpus diff — no GPU.
