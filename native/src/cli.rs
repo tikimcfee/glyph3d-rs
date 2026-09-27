@@ -264,6 +264,10 @@ pub(crate) struct Cli {
     /// a raw file as one item, dispatch/readback timing, exit.
     #[arg(long, value_name = "PATH")]
     pub(crate) cubecl_chain_bench: Option<PathBuf>,
+    /// Dev-only CubeCL decode check (phase 3a): the device decode over one
+    /// fixture — packed flags + advance diffed bit-exact vs fold::decode_all.
+    #[arg(long, value_name = "PATH")]
+    pub(crate) cubecl_decode_check: Option<PathBuf>,
     /// Windowed only: how frames reach the display. `fifo` (the default) is
     /// vsync, so the FPS line reads the monitor's refresh; `mailbox` and
     /// `immediate` uncap it where the surface supports them (else fifo, and

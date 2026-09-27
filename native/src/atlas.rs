@@ -178,6 +178,29 @@ impl TrieTable {
         t
     }
 
+    /// The decode KERNEL's tables, pre-converted to world units: the block
+    /// index, per-entry measures [ADVANCE, HEIGHT], per-entry identity +
+    /// bitfield [GLYPH_ID, FLAGS], and the block shift. The fu→world
+    /// conversion runs through the SAME f64-rounding function the CPU
+    /// resolve uses, computed once here — so the device's advance bits are
+    /// the CPU's advance bits, and no device-side division (with fast-math
+    /// questions attached) ever runs.
+    pub fn device_tables(&self) -> (Vec<u32>, Vec<f32>, Vec<u32>, u32) {
+        let em = self.metrics.em_height_fu;
+        let stride = self.entry_stride as usize;
+        let n = self.blocks.len() / stride;
+        let mut measures = Vec::with_capacity(n * 2);
+        let mut counts = Vec::with_capacity(n * 2);
+        for e in 0..n {
+            let o = e * stride;
+            counts.push(self.blocks[o]);
+            measures.push(crate::text::fu_to_world(self.blocks[o + 1] as i32, em));
+            measures.push(crate::text::fu_to_world(self.blocks[o + 2] as i32, em));
+            counts.push(self.blocks[o + 3]);
+        }
+        (self.block_index.clone(), measures, counts, self.block_shift)
+    }
+
     /// Codepoint → trie entry (the two dependent loads of FORMAT.md).
     /// Resolve a codepoint. OUT-OF-RANGE values resolve through the shared
     /// missing block (storage block 0), matching `decode_and_resolve` in

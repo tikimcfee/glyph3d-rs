@@ -361,6 +361,11 @@ fn main() {
         let ctx = pollster::block_on(gpu::init(None));
         cubecl_chain::bench(&ctx, path);
     }
+    // Dev-only CubeCL decode check (phase 3a).
+    if let Some(path) = &cli.cubecl_decode_check {
+        let ctx = pollster::block_on(gpu::init(None));
+        cubecl_chain::decode_check(&ctx, path);
+    }
 
     // Fixture parity (reference port): fixture parse manifest / corpus diff — no GPU.
     if !cli.fixture_manifest.is_empty() {

@@ -66,6 +66,116 @@ const SM_ADVANCE: usize = 0;
 /// at the cube's first byte. A 2 KB tile spanning more than this many items
 /// (never in practice) takes the global-atomic overflow path instead.
 const RESOLVE_SLOTS: usize = 16;
+/// The trie's missing flag (fold::TRIE_FLAG_MISSING) and the decode's
+/// passthrough lane (fixture::F_MISSING), both in the packed low byte.
+const TRIE_FLAG_MISSING: u32 = 1;
+const F_MISSING: u32 = 8;
+
+// ── dispatch 0: decode — thread per 4-byte word ──────────────────────────────
+//
+// The phase-3a port of fold::decode_all's leader-mode half. Every byte is
+// INDEPENDENT: the lenient classifier reads only the byte's own bits
+// (continuations self-identify, leads declare their length, continuation
+// bytes are never validated — transcribed exactly), the codepoint reads at
+// most three bytes forward, and the resolve is the same two dependent loads
+// as TrieTable::lookup (block_index[cp >> shift], then entry
+// (block<<shift)|(cp & 0xFF)). One thread per WORD so the packed flag word
+// is written whole — four byte-lane writers to one u32 would race.
+//
+// Scope, deliberately: this produces the chain's inputs (packed fl, advance
+// f32) only. gi/height are renderer statics the CPU still owns; the miss
+// list is a CPU product concern; and cluster resolution is the separate
+// phase-3b pass. The tables arrive PRE-CONVERTED to world units (fixtures
+// store world values; the atlas path converts once at upload) so no
+// device-side division — and no fast-math question — ever touches an
+// advance bit.
+#[cube(launch_unchecked)]
+fn decode(
+    bytes: &[u32],
+    block_index: &[u32],
+    blocks_m: &[f32],
+    blocks_c: &[u32],
+    fl: &mut [u32],
+    sm: &mut [f32],
+    #[comptime] block_shift: u32,
+) {
+    let w = ABSOLUTE_POS;
+    let n = bytes.len() * 4;
+    if w < fl.len() {
+        let mut word = 0u32;
+        let mut lane = 0usize;
+        while lane < 4 {
+            let id = w * 4 + lane;
+            if id < n {
+                let b = byte_at(bytes, id, n);
+                // sequence_length, transcribed: the lenient classifier.
+                let len = if b & 0x80u32 == 0u32 {
+                    1u32
+                } else if b & 0xE0u32 == 0xC0u32 {
+                    2u32
+                } else if b & 0xF0u32 == 0xE0u32 {
+                    3u32
+                } else if b & 0xF8u32 == 0xF0u32 {
+                    4u32
+                } else {
+                    0u32
+                };
+                if len > 0u32 {
+                    // decode_codepoint_at, transcribed (reads past the end
+                    // are zero, continuations never validated).
+                    let b1 = byte_at(bytes, id + 1, n);
+                    let b2 = byte_at(bytes, id + 2, n);
+                    let b3 = byte_at(bytes, id + 3, n);
+                    let cp = if len == 1u32 {
+                        b
+                    } else if len == 2u32 {
+                        ((b & 0x1Fu32) << 6u32) | (b1 & 0x3Fu32)
+                    } else if len == 3u32 {
+                        ((b & 0x0Fu32) << 12u32) | ((b1 & 0x3Fu32) << 6u32) | (b2 & 0x3Fu32)
+                    } else {
+                        ((b & 0x07u32) << 18u32) | ((b1 & 0x3Fu32) << 12u32) | ((b2 & 0x3Fu32) << 6u32) | (b3 & 0x3Fu32)
+                    };
+                    let block = if cp <= 0x10FFFFu32 {
+                        block_index[(cp >> block_shift) as usize]
+                    } else {
+                        0u32
+                    };
+                    let e = ((block << block_shift) | (cp & 0xFFu32)) as usize;
+                    sm[id] = blocks_m[e * 2];
+                    let flag = F_LEADER
+                        | (if b == 10u32 {
+                            F_NEWLINE
+                        } else {
+                            0u32
+                        })
+                        | (if blocks_c[e * 2 + 1] & TRIE_FLAG_MISSING != 0 {
+                            F_MISSING
+                        } else {
+                            0u32
+                        });
+                    word |= flag << ((lane as u32) * 8u32);
+                } else {
+                    // decode_and_resolve zeroes the statics of a non-leader.
+                    sm[id] = f32::from_bits(0u32);
+                }
+            }
+            lane += 1;
+        }
+        fl[w] = word;
+    }
+
+}
+
+/// Byte i of the packed corpus, zero past the end (the reference's
+/// bounds-checked read).
+#[cube]
+fn byte_at(bytes: &[u32], i: usize, n: usize) -> u32 {
+    let mut v = (bytes[i >> 2] >> (((i & 3) * 8) as u32)) & 0xFF;
+    if i >= n {
+        v = 0u32;
+    }
+    v
+}
 const LM_STRIDE: usize = 4;
 const LM_X: usize = 0;
 const LM_Y: usize = 1;
@@ -1463,6 +1573,104 @@ pub fn run(ctx: &GpuContext, fixture_path: &Path) -> ! {
     std::process::exit(0);
 }
 
+// ── the decode-check driver ──────────────────────────────────────────────────
+
+/// `--cubecl-decode-check <fixture.pipe.bin>`: the device decode over one
+/// fixture — packed flags and advance lanes diffed BIT-EXACT per byte
+/// against `fold::decode_all` on a fresh Slots (leader mode; cluster
+/// resolution is the separate phase-3b pass and the fixtures' cluster
+/// lanes belong to it, not to decode).
+pub fn decode_check(ctx: &GpuContext, fixture_path: &Path) -> ! {
+    let fx = crate::fixture::load_pipe_fixture(fixture_path).unwrap_or_else(|e| {
+        eprintln!("cubecl-decode-check: {e}");
+        std::process::exit(1);
+    });
+    let n = fx.bytes.len();
+    let mut slots = crate::fold::Slots::new(n);
+    let _ = crate::fold::decode_all(&fx.bytes, &mut slots, &fx.trie);
+
+    let n_words = n.div_ceil(4);
+    let mut packed = vec![0u32; n_words];
+    for (i, &b) in fx.bytes.iter().enumerate() {
+        packed[i >> 2] |= (b as u32) << ((i & 3) * 8);
+    }
+    let setup = WgpuSetup {
+        instance: ctx.instance.clone(),
+        adapter: ctx.adapter.clone(),
+        device: ctx.device.clone(),
+        queue: ctx.queue.clone(),
+        backend: AutoGraphicsApi::backend(),
+    };
+    let cdev = cubecl::wgpu::init_device(setup, Default::default());
+    let client = cubecl::Device::Wgpu(cdev).client();
+    let h_bytes = client.create_from_slice(bytemuck::cast_slice(&packed));
+    let h_bi = client.create_from_slice(bytemuck::cast_slice(&fx.trie.block_index));
+    let h_bm = client.create_from_slice(bytemuck::cast_slice(&fx.trie.blocks_m));
+    let h_bc = client.create_from_slice(bytemuck::cast_slice(&fx.trie.blocks_c));
+    let h_fl = client.empty(n_words * 4);
+    let h_sm = client.empty(n * 4);
+    let cubes_of = |threads: usize| {
+        let cubes = threads.div_ceil(256);
+        CubeCount::Static(cubes.min(65535) as u32, cubes.div_ceil(65535) as u32, 1)
+    };
+    let t0 = std::time::Instant::now();
+    unsafe {
+        decode::launch_unchecked(
+            &client,
+            cubes_of(n_words),
+            CubeDim::new_1d(256),
+            BufferArg::from_raw_parts(h_bytes.clone(), n_words),
+            BufferArg::from_raw_parts(h_bi.clone(), fx.trie.block_index.len()),
+            BufferArg::from_raw_parts(h_bm.clone(), fx.trie.blocks_m.len()),
+            BufferArg::from_raw_parts(h_bc.clone(), fx.trie.blocks_c.len()),
+            BufferArg::from_raw_parts(h_fl.clone(), n_words),
+            BufferArg::from_raw_parts(h_sm.clone(), n),
+            crate::glyph_trie::BLOCK_SHIFT,
+        );
+    }
+    let fl_bytes = client.read_one(h_fl).expect("read fl");
+    let sm_bytes = client.read_one(h_sm).expect("read sm");
+    let dt = t0.elapsed();
+    let flw: &[u32] = bytemuck::cast_slice(&fl_bytes);
+    let sm: &[f32] = bytemuck::cast_slice(&sm_bytes);
+
+    let mut bad = 0usize;
+    for id in 0..n {
+        let want_f = slots.flags(id) & 0xFF;
+        let got_f = (flw[id >> 2] >> (((id & 3) * 8) as u32)) & 0xFF;
+        if want_f != got_f {
+            if bad < 8 {
+                println!("  MISMATCH byte {id} flags: cpu {want_f:#04x} gpu {got_f:#04x}");
+            }
+            bad += 1;
+        }
+        if slots.advance(id).to_bits() != sm[id].to_bits() {
+            if bad < 8 {
+                println!(
+                    "  MISMATCH byte {id} advance: cpu {:e} gpu {:e}",
+                    slots.advance(id),
+                    sm[id]
+                );
+            }
+            bad += 1;
+        }
+    }
+    println!(
+        "cubecl-decode-check: {} ({} B, {} words) — {} lane mismatches; decode+readbacks {:?} (smoke timing only)",
+        fx.name,
+        n,
+        n_words,
+        bad,
+        dt
+    );
+    if bad > 0 {
+        eprintln!("cubecl-decode-check FAIL: {bad} lane mismatches vs decode_all");
+        std::process::exit(1);
+    }
+    println!("cubecl-decode-check PASS: flags + advance bit-exact vs decode_all");
+    std::process::exit(0);
+}
+
 // ── the bench driver ──────────────────────────────────────────────────────────
 
 /// `--cubecl-chain-bench <corpus>`: the chain over a raw file as ONE item.
@@ -1539,30 +1747,16 @@ pub fn bench(ctx: &GpuContext, corpus_path: &Path) -> ! {
     // runs compile apply's inline branch out.
     let needs_resolve = wrap_width > 0;
     let inline_resolve = wrap_width == 0;
+    // GLYPH_CHAIN_DECODE=1: the chain starts from raw BYTES — the device
+    // decode produces fl/sm (phase 3a) and the CPU statics upload dies; the
+    // CPU reference still runs for verification. Decode is stage 1 then, and
+    // GLYPH_CHAIN_STAGES counts it.
+    let decode_mode = std::env::var_os("GLYPH_CHAIN_DECODE").is_some();
 
     let t_decode = std::time::Instant::now();
     let r = run_scan_pipeline(&bytes, &trie, &items, DEFAULT_CHUNK_SIZE, DEFAULT_GROUP_SIZE, 1);
     let decode_dt = t_decode.elapsed();
 
-    // Statics: advance (f32/byte) + PACKED flags (u8/byte, four per word —
-    // the chain reads fl three-to-four passes and consumes only the low
-    // byte; the full flags stay CPU-side for the renderer).
-    let n_words = n.div_ceil(4);
-    let mut fl = Vec::with_capacity(n_words);
-    let mut sm = Vec::with_capacity(n);
-    for w in 0..n_words {
-        let mut word = 0u32;
-        for b in 0..4 {
-            let i = w * 4 + b;
-            if i < n {
-                word |= (r.slots.flags(i) & 0xFF) << (b * 8);
-            }
-        }
-        fl.push(word);
-    }
-    for i in 0..n {
-        sm.push(r.slots.advance(i));
-    }
     let ir: Vec<u32> = vec![0, n as u32];
     let ie: Vec<u32> = vec![0, 0, 0, 1, wrap_width as u32, 0, 0, 0];
     let im: Vec<f32> = vec![0.0, 0.0, 1.25, 2.0, 0.0, 0.0, 0.0, 0.0, 0.0];
@@ -1577,8 +1771,44 @@ pub fn bench(ctx: &GpuContext, corpus_path: &Path) -> ! {
     };
     let cdev = cubecl::wgpu::init_device(setup, Default::default());
     let client = cubecl::Device::Wgpu(cdev).client();
-    let h_fl = client.create_from_slice(bytemuck::cast_slice(&fl));
-    let h_sm = client.create_from_slice(bytemuck::cast_slice(&sm));
+    let n_words = n.div_ceil(4);
+    let (h_fl, h_sm) = if decode_mode {
+        (client.empty(n_words * 4), client.empty(n * 4))
+    } else {
+        // Statics: advance (f32/byte) + PACKED flags (u8/byte, four per word —
+        // the chain reads fl three-to-four passes and consumes only the low
+        // byte; the full flags stay CPU-side for the renderer).
+        let mut fl = Vec::with_capacity(n_words);
+        let mut sm = Vec::with_capacity(n);
+        for w in 0..n_words {
+            let mut word = 0u32;
+            for b in 0..4 {
+                let i = w * 4 + b;
+                if i < n {
+                    word |= (r.slots.flags(i) & 0xFF) << (b * 8);
+                }
+            }
+            fl.push(word);
+        }
+        for i in 0..n {
+            sm.push(r.slots.advance(i));
+        }
+        (
+            client.create_from_slice(bytemuck::cast_slice(&fl)),
+            client.create_from_slice(bytemuck::cast_slice(&sm)),
+        )
+    };
+    // The decode's inputs: the corpus packed four bytes per word, and the
+    // atlas trie's tables pre-converted to world units.
+    let mut packed = vec![0u32; n_words];
+    for (i, &b) in bytes.iter().enumerate() {
+        packed[i >> 2] |= (b as u32) << ((i & 3) * 8);
+    }
+    let (bi, bm, bc, bshift) = trie.device_tables();
+    let h_bytes = client.create_from_slice(bytemuck::cast_slice(&packed));
+    let h_bi = client.create_from_slice(bytemuck::cast_slice(&bi));
+    let h_bm = client.create_from_slice(bytemuck::cast_slice(&bm));
+    let h_bc = client.create_from_slice(bytemuck::cast_slice(&bc));
     let h_ir = client.create_from_slice(bytemuck::cast_slice(&ir));
     let h_ie = client.create_from_slice(bytemuck::cast_slice(&ie));
     let h_im = client.create_from_slice(bytemuck::cast_slice(&im));
@@ -1605,7 +1835,8 @@ pub fn bench(ctx: &GpuContext, corpus_path: &Path) -> ! {
         let cubes = threads.div_ceil(256);
         CubeCount::Static(cubes.min(65535) as u32, cubes.div_ceil(65535) as u32, 1)
     };
-    let stages: usize = std::env::var("GLYPH_CHAIN_STAGES").ok().and_then(|v| v.parse().ok()).unwrap_or(6);
+    let stages: usize = std::env::var("GLYPH_CHAIN_STAGES").ok().and_then(|v| v.parse().ok()).unwrap_or(6)
+        + decode_mode as usize;
     // One cube per tile (dim = units); the byte-wide kernels stay 256-unit.
     let tiles_grid = |tiles: usize| {
         CubeCount::Static(tiles.min(65535) as u32, tiles.div_ceil(65535) as u32, 1)
@@ -1613,8 +1844,26 @@ pub fn bench(ctx: &GpuContext, corpus_path: &Path) -> ! {
     // Timed samples per dispatch; the minimum is reported.
     let samples: usize = std::env::var("GLYPH_CHAIN_LOOP").ok().and_then(|v| v.parse().ok()).unwrap_or(3);
     let launch = |s: usize| {
+        if decode_mode && s == 0 {
+            unsafe {
+                decode::launch_unchecked(
+                    &client,
+                    cubes_of(n_words),
+                    CubeDim::new_1d(256),
+                    BufferArg::from_raw_parts(h_bytes.clone(), n_words),
+                    BufferArg::from_raw_parts(h_bi.clone(), bi.len()),
+                    BufferArg::from_raw_parts(h_bm.clone(), bm.len()),
+                    BufferArg::from_raw_parts(h_bc.clone(), bc.len()),
+                    BufferArg::from_raw_parts(h_fl.clone(), n_words),
+                    BufferArg::from_raw_parts(h_sm.clone(), n),
+                    bshift,
+                );
+            }
+            return;
+        }
+        let t = s - decode_mode as usize;
         unsafe {
-            match s {
+            match t {
                 0 => {
                     tile_scan::launch_unchecked(
                         &client,
@@ -1722,16 +1971,24 @@ pub fn bench(ctx: &GpuContext, corpus_path: &Path) -> ! {
     // The per-dispatch GPU windows. Every stage runs `samples` times; the
     // minimum survives. A window that resolved to no measurement counts as a
     // missing sample, never as a zero.
-    let stage_names = [
+    let mut stage_names: Vec<&'static str> = Vec::new();
+    if decode_mode {
+        stage_names.push("decode");
+    }
+    stage_names.extend([
         "tile_scan",
         "spine_scan",
         "apply",
         "resolve_x",
         "derive_stride",
         "paginate",
-    ];
+    ]);
     let stage_meta = |s: usize| -> (&'static str, usize, u32) {
-        let (cubes, dim) = match s {
+        if decode_mode && s == 0 {
+            return ("decode", n_words.div_ceil(256), 256);
+        }
+        let t = s - decode_mode as usize;
+        let (cubes, dim) = match t {
             0 | 2 => (n_tiles, units as u32),
             1 => (1, units as u32),
             3 => (n.div_ceil(rspan).div_ceil(256), 256),
@@ -1745,8 +2002,8 @@ pub fn bench(ctx: &GpuContext, corpus_path: &Path) -> ! {
     let mut timing_method = String::new();
     for _ in 0..samples {
         for (s, slot) in mins.iter_mut().enumerate() {
-            if s == 3 && !needs_resolve {
-                // Stage 3 is resolve_x; foldless corpora skip the dispatch
+            if s == 3 + decode_mode as usize && !needs_resolve {
+                // The resolve_x slot; foldless corpora skip the dispatch
                 // (and its window) entirely.
                 continue;
             }
@@ -1776,7 +2033,7 @@ pub fn bench(ctx: &GpuContext, corpus_path: &Path) -> ! {
     // Correctness at speed: the bench's whole number is worthless if the fast
     // path is wrong — diff the leader row/col lanes against the CPU reference.
     let lc: &[u32] = bytemuck::cast_slice(&lc_bytes);
-    if stages < 3 {
+    if stages < 3 + decode_mode as usize {
         println!(
             "cubecl-chain-bench: {} ({} B, {} tiles @ {}x{}, wrap {}) stages {} — pre-apply stages only, no verification",
             corpus_path.display(),
