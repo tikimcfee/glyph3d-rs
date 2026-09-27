@@ -552,6 +552,17 @@ fn fold_of(ie: &[u32], it: usize, wrap: i32) -> i32 {
 // unit chases its `rake` bytes seeded with combine(global tile prefix, own
 // exclusive micro prefix), emitting the per-byte lanes.
 //
+// THE TREE ITSELF costs ~2.3-2.6ms per kernel that carries one (measured
+// same day by emptying the loops: tile_scan 5.6 -> 3.3ms), so ~5ms of the
+// ~25.6ms chain — the C6 plane-op restructure's ceiling. It stays parked:
+// plane ops are subgroup intrinsics on the WGSL path (a pinned-naga
+// behavior, absent on weaker backends), they diverge per compute target
+// (the CPU runtime's PLANE_DIM differs), and they are scalar-numeric-only,
+// so this monoid would need a manual shuffle tree with the non-commutative
+// down-swap rebuilt lane by lane. If taken: as a #[comptime] capability-
+// gated variant beside this default, the inline_resolve pattern — never as
+// the foundation.
+//
 // FOLDLESS ITEMS RESOLVE HERE: for fold==0 the chase already holds
 // everything resolve_x would recompute — x IS run.tail_adv, and the old
 // kernel read ~700MB back (fl, lc, wm, wc, otb) to recover values that were
