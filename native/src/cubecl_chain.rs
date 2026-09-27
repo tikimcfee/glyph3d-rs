@@ -533,9 +533,13 @@ fn fold_of(ie: &[u32], it: usize, wrap: i32) -> i32 {
 
 // ── dispatch 3: apply — rake + Blelloch + per-byte chase ─────────────────────
 //
-// Same tile decomposition as tile_scan (the rake and tree are re-derived —
-// the alternative, publishing per-unit micro prefixes to global memory,
-// costs n/rake elements of write+read against re-reading fl/sm once). Each
+// Same tile decomposition as tile_scan (the rake and tree are re-derived).
+// The publish-the-micro-prefixes alternative was BUILT AND MEASURED
+// (2026-09-27) and LOST: apply 21.0 -> 31.4ms, chain 28.6 -> 40.2. The
+// rake's "redundant" re-read of fl/sm rides L1 — the chase re-reads the
+// same 8 bytes it just raked — so it is nearly free, while 36B/unit of
+// published prefixes are cold global traffic, and the tree's 18 barriers
+// are cheap. Reverted; do not re-derive this trade, re-measure it. Each
 // unit chases its `rake` bytes seeded with combine(global tile prefix, own
 // exclusive micro prefix), emitting the per-byte lanes.
 //
