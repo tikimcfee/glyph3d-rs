@@ -660,7 +660,13 @@ pub fn run(ctx: &GpuContext, fixture_path: &Path) -> ! {
     let h_rmax = client.create_from_slice(bytemuck::cast_slice(&zeroes));
     let h_xmax = client.create_from_slice(bytemuck::cast_slice(&zeroes));
 
-    let cubes_of = |threads: usize| CubeCount::Static(threads.div_ceil(256) as u32, 1, 1);
+    // wgpu caps a dispatch's X dimension at 65535 cubes; spill into Y.
+    // ABSOLUTE_POS is the flattened id across axes (topology.rs:271), so the
+    // kernels need no index change.
+    let cubes_of = |threads: usize| {
+        let cubes = threads.div_ceil(256);
+        CubeCount::Static(cubes.min(65535) as u32, cubes.div_ceil(65535) as u32, 1)
+    };
     // GLYPH_CHAIN_STAGES=N runs only the first N dispatches (bisection aid).
     let stages: usize = std::env::var("GLYPH_CHAIN_STAGES")
         .ok()
@@ -864,5 +870,265 @@ pub fn run(ctx: &GpuContext, fixture_path: &Path) -> ! {
         std::process::exit(1);
     }
     println!("cubecl-chain-check PASS: counts + line_advance bit-exact, positions inside 1e-4");
+    std::process::exit(0);
+}
+
+// ── the bench driver ──────────────────────────────────────────────────────────
+
+/// `--cubecl-chain-bench <corpus>`: the chain over a raw file as ONE item,
+/// times like bench_scaling's gpu phase — the dispatches, then the readbacks.
+pub fn bench(ctx: &GpuContext, corpus_path: &Path) -> ! {
+    let bytes = std::fs::read(corpus_path).unwrap_or_else(|e| {
+        eprintln!("cubecl-chain-bench: {e}");
+        std::process::exit(1);
+    });
+    let n = bytes.len();
+    let chunk = DEFAULT_CHUNK_SIZE;
+    let group = DEFAULT_GROUP_SIZE;
+    let n_chunks = n.div_ceil(chunk);
+    let n_supers = n_chunks.div_ceil(group);
+    let item = crate::fold::Item {
+        byte_start: 0,
+        byte_count: n as i64,
+        origin_x: 0.0,
+        origin_y: 0.0,
+        origin_z: 0.0,
+        wrap_width: 0,
+        wrap_mode: WrapMode::Down,
+        cluster_mode: crate::fold::ClusterMode::Leader,
+        z_step: 2.0,
+        line_height: 1.25,
+        has_page: false,
+        page_rows: 0,
+        page_cols: 0,
+        scroll_rows: 0,
+        pages_wide: 1,
+        page_gap_x: 0.0,
+        band_stride_y: 0.0,
+        depth_per_band: 0.0,
+        depth_per_col: 0.0,
+        page_line_height: 1.25,
+    };
+    let items = [item];
+    let trie = crate::atlas::TrieTable::load(&crate::atlas_dir());
+
+    let t_decode = std::time::Instant::now();
+    let r = run_scan_pipeline(&bytes, &trie, &items, chunk, group, 1);
+    let decode_dt = t_decode.elapsed();
+
+    let mut fl = Vec::with_capacity(n);
+    let mut sm = Vec::with_capacity(n * SM_STRIDE);
+    for i in 0..n {
+        fl.push(r.slots.flags(i));
+        sm.push(r.slots.advance(i));
+        sm.push(r.slots.height(i));
+    }
+    let ir: Vec<u32> = vec![0, n as u32];
+    let ie: Vec<u32> = vec![0, 0, 0, 1, 0, 0, 0, 0];
+    let im: Vec<f32> = vec![0.0, 0.0, 1.25, 2.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+    let page_gap_x: Vec<f32> = vec![0.0];
+
+    let setup = WgpuSetup {
+        instance: ctx.instance.clone(),
+        adapter: ctx.adapter.clone(),
+        device: ctx.device.clone(),
+        queue: ctx.queue.clone(),
+        backend: AutoGraphicsApi::backend(),
+    };
+    let cdev = cubecl::wgpu::init_device(setup, Default::default());
+    let client = cubecl::Device::Wgpu(cdev).client();
+    let h_fl = client.create_from_slice(bytemuck::cast_slice(&fl));
+    let h_sm = client.create_from_slice(bytemuck::cast_slice(&sm));
+    let h_ir = client.create_from_slice(bytemuck::cast_slice(&ir));
+    let h_ie = client.create_from_slice(bytemuck::cast_slice(&ie));
+    let h_im = client.create_from_slice(bytemuck::cast_slice(&im));
+    let h_gap = client.create_from_slice(bytemuck::cast_slice(&page_gap_x));
+    let h_pc = client.empty(n_chunks * PARTIAL_COUNT_STRIDE * 4);
+    let h_pm = client.empty(n_chunks * 4);
+    let h_uc = client.empty(n_supers * PARTIAL_COUNT_STRIDE * 4);
+    let h_um = client.empty(n_supers * 4);
+    let h_fc = client.empty(n_supers * PARTIAL_COUNT_STRIDE * 4);
+    let h_fm = client.empty(n_supers * 4);
+    let h_xc = client.empty(n_chunks * PARTIAL_COUNT_STRIDE * 4);
+    let h_xm = client.empty(n_chunks * 4);
+    let h_lc = client.empty(n * LC_STRIDE * 4);
+    let h_wm = client.empty(n * 4);
+    let h_wc = client.empty(n * 4);
+    let h_otb = client.empty(n * 4);
+    let h_lm = client.empty(n * LM_STRIDE * 4);
+    let h_strides = client.empty(4);
+    let h_rmax = client.create_from_slice(bytemuck::cast_slice(&[0u32]));
+    let h_xmax = client.create_from_slice(bytemuck::cast_slice(&[0u32]));
+
+    // wgpu caps a dispatch's X dimension at 65535 cubes; spill into Y.
+    // ABSOLUTE_POS is the flattened id across axes (topology.rs:271), so the
+    // kernels need no index change.
+    let cubes_of = |threads: usize| {
+        let cubes = threads.div_ceil(256);
+        CubeCount::Static(cubes.min(65535) as u32, cubes.div_ceil(65535) as u32, 1)
+    };
+    let stages: usize = std::env::var("GLYPH_CHAIN_STAGES").ok().and_then(|v| v.parse().ok()).unwrap_or(8);
+    // GLYPH_CHAIN_LOOP=K repeats the launch block K times before one flush —
+    // the steady-state dispatch cost (and the answer to "does cubecl dedupe
+    // identical tasks": if K loops cost ~Kx, it does not).
+    let loops: usize = std::env::var("GLYPH_CHAIN_LOOP").ok().and_then(|v| v.parse().ok()).unwrap_or(1);
+    let t0 = std::time::Instant::now();
+    for _iter in 0..loops {
+    unsafe {
+        chunk_reduce::launch_unchecked(
+            &client,
+            cubes_of(n_chunks),
+            CubeDim::new_1d(256),
+            BufferArg::from_raw_parts(h_fl.clone(), n),
+            BufferArg::from_raw_parts(h_sm.clone(), n * SM_STRIDE),
+            BufferArg::from_raw_parts(h_ir.clone(), 2),
+            BufferArg::from_raw_parts(h_ie.clone(), IE_STRIDE),
+            BufferArg::from_raw_parts(h_pc.clone(), n_chunks * PARTIAL_COUNT_STRIDE),
+            BufferArg::from_raw_parts(h_pm.clone(), n_chunks),
+            chunk,
+        );
+        if stages >= 2 {
+            spine_reduce::launch_unchecked(
+            &client,
+            cubes_of(n_supers),
+            CubeDim::new_1d(256),
+            BufferArg::from_raw_parts(h_pc.clone(), n_chunks * PARTIAL_COUNT_STRIDE),
+            BufferArg::from_raw_parts(h_pm.clone(), n_chunks),
+            BufferArg::from_raw_parts(h_uc.clone(), n_supers * PARTIAL_COUNT_STRIDE),
+            BufferArg::from_raw_parts(h_um.clone(), n_supers),
+            group,
+        );
+        }
+        if stages >= 3 {
+            spine_scan::launch_unchecked(
+            &client,
+            CubeCount::new_single(),
+            CubeDim::new_1d(1),
+            BufferArg::from_raw_parts(h_uc.clone(), n_supers * PARTIAL_COUNT_STRIDE),
+            BufferArg::from_raw_parts(h_um.clone(), n_supers),
+            BufferArg::from_raw_parts(h_fc.clone(), n_supers * PARTIAL_COUNT_STRIDE),
+            BufferArg::from_raw_parts(h_fm.clone(), n_supers),
+        );
+        }
+        if stages >= 4 {
+            partial_scan::launch_unchecked(
+            &client,
+            cubes_of(n_supers),
+            CubeDim::new_1d(256),
+            BufferArg::from_raw_parts(h_pc.clone(), n_chunks * PARTIAL_COUNT_STRIDE),
+            BufferArg::from_raw_parts(h_pm.clone(), n_chunks),
+            BufferArg::from_raw_parts(h_fc.clone(), n_supers * PARTIAL_COUNT_STRIDE),
+            BufferArg::from_raw_parts(h_fm.clone(), n_supers),
+            BufferArg::from_raw_parts(h_xc.clone(), n_chunks * PARTIAL_COUNT_STRIDE),
+            BufferArg::from_raw_parts(h_xm.clone(), n_chunks),
+            group,
+        );
+        }
+        if stages >= 5 {
+            k_apply::launch_unchecked(
+            &client,
+            cubes_of(n_chunks),
+            CubeDim::new_1d(256),
+            BufferArg::from_raw_parts(h_fl.clone(), n),
+            BufferArg::from_raw_parts(h_sm.clone(), n * SM_STRIDE),
+            BufferArg::from_raw_parts(h_lc.clone(), n * LC_STRIDE),
+            BufferArg::from_raw_parts(h_ir.clone(), 2),
+            BufferArg::from_raw_parts(h_ie.clone(), IE_STRIDE),
+            BufferArg::from_raw_parts(h_xc.clone(), n_chunks * PARTIAL_COUNT_STRIDE),
+            BufferArg::from_raw_parts(h_xm.clone(), n_chunks),
+            BufferArg::from_raw_parts(h_wm.clone(), n),
+            BufferArg::from_raw_parts(h_wc.clone(), n),
+            BufferArg::from_raw_parts(h_otb.clone(), n),
+            chunk,
+        );
+        }
+        if stages >= 6 {
+            resolve_x::launch_unchecked(
+            &client,
+            cubes_of(n),
+            CubeDim::new_1d(256),
+            BufferArg::from_raw_parts(h_sm.clone(), n * SM_STRIDE),
+            BufferArg::from_raw_parts(h_fl.clone(), n),
+            BufferArg::from_raw_parts(h_lm.clone(), n * LM_STRIDE),
+            BufferArg::from_raw_parts(h_lc.clone(), n * LC_STRIDE),
+            BufferArg::from_raw_parts(h_im.clone(), IM_STRIDE),
+            BufferArg::from_raw_parts(h_ie.clone(), IE_STRIDE),
+            BufferArg::from_raw_parts(h_ir.clone(), 2),
+            BufferArg::from_raw_parts(h_wm.clone(), n),
+            BufferArg::from_raw_parts(h_wc.clone(), n),
+            BufferArg::from_raw_parts(h_otb.clone(), n),
+            BufferArg::from_raw_parts(h_rmax.clone(), 1),
+            BufferArg::from_raw_parts(h_xmax.clone(), 1),
+        );
+        }
+        if stages >= 7 {
+            derive_stride::launch_unchecked(
+            &client,
+            CubeCount::new_single(),
+            CubeDim::new_1d(1),
+            BufferArg::from_raw_parts(h_xmax.clone(), 1),
+            BufferArg::from_raw_parts(h_ie.clone(), IE_STRIDE),
+            BufferArg::from_raw_parts(h_gap.clone(), 1),
+            BufferArg::from_raw_parts(h_strides.clone(), 1),
+        );
+        }
+        if stages >= 8 {
+            paginate::launch_unchecked(
+            &client,
+            cubes_of(n),
+            CubeDim::new_1d(256),
+            BufferArg::from_raw_parts(h_lm.clone(), n * LM_STRIDE),
+            BufferArg::from_raw_parts(h_fl.clone(), n),
+            BufferArg::from_raw_parts(h_lc.clone(), n * LC_STRIDE),
+            BufferArg::from_raw_parts(h_im.clone(), IM_STRIDE),
+            BufferArg::from_raw_parts(h_ie.clone(), IE_STRIDE),
+            BufferArg::from_raw_parts(h_ir.clone(), 2),
+            BufferArg::from_raw_parts(h_strides.clone(), 1),
+        );
+        }
+    }
+    }
+    // Close the dispatch timing with a tiny flush, then the readbacks.
+    let _ = client.read_one(h_strides.clone()).expect("flush");
+    let dispatch_dt = t0.elapsed() / loops as u32;
+    let t1 = std::time::Instant::now();
+    let lc_bytes = client.read_one(h_lc.clone()).expect("read lc");
+    let _wc = client.read_one(h_wc.clone()).expect("read wc");
+    let _wm = client.read_one(h_wm.clone()).expect("read wm");
+    let _lm = client.read_one(h_lm.clone()).expect("read lm");
+    let readback_dt = t1.elapsed();
+    // Correctness at speed: the bench's whole number is worthless if the fast
+    // path is wrong — diff the leader row/col lanes against the CPU reference.
+    let lc: &[u32] = bytemuck::cast_slice(&lc_bytes);
+    if stages < 5 {
+        println!("cubecl-chain-bench: {} ({} B, {} chunks) loops {} — dispatches {:?}/loop (pre-apply stages)", corpus_path.display(), n, n_chunks, loops, dispatch_dt);
+        std::process::exit(0);
+    }
+    let mut bad = 0usize;
+    for id in 0..n {
+        if r.slots.flags(id) & F_LEADER == 0 {
+            continue;
+        }
+        if r.slots.row(id) != lc[id * LC_STRIDE + LC_ROW] as i64
+            || r.slots.col(id) != lc[id * LC_STRIDE + LC_COL] as i64
+        {
+            bad += 1;
+        }
+    }
+    assert_eq!(bad, 0, "bench verification failed: {bad} leader lane mismatches");
+
+    let total = dispatch_dt + readback_dt;
+    println!(
+        "cubecl-chain-bench: {} ({} B, {} chunks) loops {} — cpu decode+scan {:?} | dispatches {:?}/loop readbacks {:?} total {:?} ({:.1} MB/s)",
+        corpus_path.display(),
+        n,
+        n_chunks,
+        loops,
+        decode_dt,
+        dispatch_dt,
+        readback_dt,
+        total,
+        n as f64 / 1e6 / total.as_secs_f64()
+    );
     std::process::exit(0);
 }

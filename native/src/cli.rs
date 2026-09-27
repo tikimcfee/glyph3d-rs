@@ -260,6 +260,10 @@ pub(crate) struct Cli {
     /// positions deviation-reported, exit.
     #[arg(long, value_name = "PATH")]
     pub(crate) cubecl_chain_check: Option<PathBuf>,
+    /// Dev-only CubeCL chain bench (note 16, phase 2): the scan skeleton over
+    /// a raw file as one item, dispatch/readback timing, exit.
+    #[arg(long, value_name = "PATH")]
+    pub(crate) cubecl_chain_bench: Option<PathBuf>,
     /// Windowed only: how frames reach the display. `fifo` (the default) is
     /// vsync, so the FPS line reads the monitor's refresh; `mailbox` and
     /// `immediate` uncap it where the surface supports them (else fifo, and
