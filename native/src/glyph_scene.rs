@@ -91,92 +91,9 @@ use instance::{FrameUniform, Params};
 mod target;
 use target::{CompositeState, Selection, SelectionFx, ViewTarget, MASK_FORMAT, POOL_FORMAT, SCENE_SAMPLE_COUNT, SELECTION_TINT};
 
-// The windowed egui Debug panel (K3) needs read-only scene state, but
-// windowed.rs holds the scene type-erased as `Box<dyn SceneLike>` and fence
-// 4 forbids trait changes. The probe is the channel: a shared cell installed
-// on the CONCRETE GlyphScene before boxing (see build_scene_probed in
-// main.rs), written once per frame by render(), read by the panel.
-// Offscreen never installs one, so the determinism chain never touches it.
-// Single-threaded: winit's event-loop thread owns both writer and reader.
-
-/// Read-only snapshot displayed by the windowed debug panel.
-#[derive(Clone, Default)]
-pub struct UiProbeState {
-    /// None until the first probed frame has rendered.
-    pub camera_mode: Option<CameraMode>,
-    /// The eye position actually used for this frame's cull/projection.
-    pub eye: [f32; 3],
-    /// Fly-camera angles (windowed always runs Fly).
-    pub yaw: f32,
-    pub pitch: f32,
-    /// The last resolved pick, formatted by the same `format_pick` as the
-    /// stdout pick log line.
-    pub last_pick: Option<String>,
-    // ── K4: UI → scene controls. Written by the Debug-panel sliders;
-    // applied by render() before culling. Seeded from the compile-time
-    // consts at install; offscreen never installs a probe, so the consts
-    // rule there. ──
-    /// Live LOD threshold in px/em (const default: LOD_MIN_PX = 1.0).
-    pub lod_min_px: f32,
-    // ── K4: live cull readouts (scene → UI; the same sums GLYPH_CULL_DEBUG
-    // prints). Zero when culling is disabled (--no-cull). ──
-    pub cull_ranges: usize,
-    pub cull_instances: u64,
-    pub cull_backdrops: usize,
-    // ── Layout dial (repo scenes): the wrap staircase's pitch. Unlike the
-    // K4 controls this is LAYOUT, not a per-frame cull input — applying it
-    // re-runs load_repo and rebuilds the scene (windowed.rs's
-    // pending_relayout arm), so the panel fires on drag RELEASE, never per
-    // tick (the JS system's `grid.layout` semantics: a discrete refold
-    // command). Seeded at install from the files' actual z_step; written by
-    // the panel's slider; read by nothing per frame. None for non-repo
-    // scenes ⇒ the panel hides the section. ──
-    pub z_wrap_spacing: Option<f64>,
-    /// Field depth extent (world z over the cull segments), refreshed per
-    /// frame — the quantified readout of what the dial did. None under
-    /// --no-cull (no segment table).
-    pub z_extent: Option<[f32; 2]>,
-    /// The scene's cluster mode, for the panel's toggle label. Seeded at
-    /// install — repo scenes from the pick context's uniform ItemParams,
-    /// text scenes from the staging choice (GlyphScene::probe_cluster_mode);
-    /// None where the scene carries no mode (demo, engine-text) ⇒ the panel
-    /// hides the toggle.
-    pub cluster_mode: Option<bool>,
-    // ── K5: group-browser data. `files` is STATIC (built once at install;
-    // Rc-shared so the panel's per-frame snapshot clones a refcount, not the
-    // rows). `file_dyn` is refreshed per frame (world pose under the live
-    // group TRS, hidden flag, tint) — parallel to `files`. ──
-    pub files: std::rc::Rc<Vec<UiFileRow>>,
-    pub file_dyn: Vec<UiFileDyn>,
-}
-
-/// Stage K (K5): one static group-browser row — file identity + the
-/// local-space (pre-TRS) AABB (same margins as the cull segment; the world
-/// pose derives from the live group TRS each frame, see UiFileDyn).
-#[derive(Clone)]
-pub struct UiFileRow {
-    pub rel_path: String,
-    pub group_id: u32,
-    pub aabb_min: [f32; 2],
-    pub aabb_max: [f32; 2],
-}
-
-/// Stage K (K5): per-frame dynamic row state for the group browser.
-#[derive(Clone, Copy, Default)]
-pub struct UiFileDyn {
-    /// World-space center/half extents under the live group TRS.
-    pub center: [f32; 2],
-    pub half: [f32; 2],
-    /// From the group row's alpha (the same place the hide/show verbs write),
-    /// so it is correct even under --no-cull.
-    pub hidden: bool,
-    /// Group tint as sRGB bytes (`cols[2]` is display-space — TintGroup verbs
-    /// store normalized sRGB there).
-    pub tint: [u8; 3],
-}
-
-/// Shared probe cell: GlyphScene writes, the egui panel reads.
-pub type UiProbe = std::rc::Rc<std::cell::RefCell<UiProbeState>>;
+mod ui_probe;
+pub use ui_probe::UiProbe;
+use ui_probe::UiFileDyn;
 
 pub struct GlyphScene {
     pub pipeline: wgpu::RenderPipeline,
@@ -1092,71 +1009,6 @@ impl GlyphScene {
             device: device.clone(),
             composite,
         }
-    }
-
-    /// Seed for the panel's cluster toggle on scenes without a pick context
-    /// (text). Called by the scene builder between `new` and `init_ui_probe`.
-    pub fn set_probe_cluster_mode(&mut self, on: bool) {
-        self.probe_cluster_mode = Some(on);
-    }
-
-    /// Stage K: install and return the windowed debug-UI probe. Windowed mode
-    /// calls this on the concrete scene BEFORE boxing it as
-    /// `Box<dyn SceneLike>` (build_scene_probed); offscreen never does, so
-    /// the write in render() stays inert there.
-    pub fn init_ui_probe(&mut self) -> UiProbe {
-        // K4: the UI→scene controls are seeded from the compile-time consts,
-        // so a windowed run starts bit-identical to an offscreen one.
-        // K5: the browser's static rows come from the pick context (repo
-        // scenes; empty for text/engine scenes → the panel hides the
-        // browser). Dynamic row state is filled on the first render.
-        let files: Vec<UiFileRow> = self
-            .pick
-            .as_ref()
-            .map(|pctx| {
-                pctx.files
-                    .iter()
-                    .map(|f| UiFileRow {
-                        rel_path: f.rel_path.clone(),
-                        group_id: f.group_id,
-                        aabb_min: f.aabb_min,
-                        aabb_max: f.aabb_max,
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-        let file_dyn = vec![UiFileDyn::default(); files.len()];
-        // The layout dial's seed: every repo file shares one z_step
-        // (repo::file_item_params computes it from the same
-        // RepoParams::z_wrap_spacing), so any file speaks for the field.
-        // Non-repo scenes have no pick context → None → the panel hides
-        // the section.
-        let z_wrap_spacing = self
-            .pick
-            .as_ref()
-            .and_then(|p| p.files.first())
-            .map(|f| f.item.z_step / crate::text::CELL_HEIGHT_WORLD as f64);
-        // The toggle's seed: the mode the scene was built with. Repo scenes
-        // read it off the pick context's uniform-per-field params (the same
-        // read as the dial's seed); text scenes carry it on
-        // `probe_cluster_mode` instead (no pick context there). Demo and
-        // engine-text scenes: None — the panel hides the toggle.
-        let cluster_mode = self
-            .pick
-            .as_ref()
-            .and_then(|p| p.files.first())
-            .map(|f| f.item.cluster_mode == crate::fold::ClusterMode::Cluster)
-            .or(self.probe_cluster_mode);
-        let probe = UiProbe::new(std::cell::RefCell::new(UiProbeState {
-            lod_min_px: LOD_MIN_PX,
-            files: std::rc::Rc::new(files),
-            file_dyn,
-            z_wrap_spacing,
-            cluster_mode,
-            ..Default::default()
-        }));
-        self.ui_probe = Some(probe.clone());
-        probe
     }
 
     /// Camera eye/target for the mode at time `t` — the SINGLE source both
