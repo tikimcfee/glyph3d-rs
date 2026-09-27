@@ -170,10 +170,25 @@ display's refresh (75 on the first Linux box) and not a fact about the renderer.
   swizzles BGRA→RGBA so the PNG compares directly against the Rgba
   baselines. The live-display-free proof of the composite shader.
 
-And one flag, not an env var: `--cubecl-smoke` — the dev-only CubeCL
-bring-up smoke (`cubecl_smoke.rs`, the note-16 phase 0): device-share +
-both-directions buffer interop + the contraction measurement, with
-verdicts printed. Not wired into the battery.
+And the dev-only CubeCL instruments (all exit drivers, none in the
+battery; the state handoff is note 18 in the integration notes):
+
+- `--cubecl-smoke` — bring-up smoke (`cubecl_smoke.rs`, the note-16 phase
+  0): device-share + both-direction buffer interop + the contraction
+  measurement, verdicts printed.
+- `--cubecl-scan-check <fixture>` — phase 1: chunk partials bit-exact.
+- `--cubecl-chain-check <fixture>` — the full chain vs `scan.rs`: counts +
+  rows exact, fold>0 X bit-level, line_adv/positions eps.
+- `--cubecl-chain-bench <corpus>` — per-dispatch GPU-timestamp table.
+- `--cubecl-decode-check <fixture>` — decode vs `decode_all`, bit-exact.
+- `--cubecl-cluster-check <fixture>` — decode + cluster vs `decode_all` +
+  `resolve_clusters`, bit-exact.
+
+Shared env vars: `GLYPH_CHAIN_STAGES` (absolute dispatch count — bisection),
+`GLYPH_CHAIN_LOOP` (samples, minimum reported), `GLYPH_CHAIN_WRAP=<w>`
+(fold>0 shape), `GLYPH_CHAIN_TILE`/`RAKE` (scan shape), `GLYPH_CHAIN_SPAN`
+(resolve worker bytes), `GLYPH_CHAIN_DECODE=1` (bench runs from raw bytes),
+`GLYPH_CHAIN_DEBUG=1` (dumps, incl. the cluster candidate table).
 
 ## Commit cadence
 

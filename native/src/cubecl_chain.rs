@@ -482,11 +482,11 @@ fn flags_at_from_atomic(fl: &mut [Atomic<u32>], i: usize) -> u32 {
 /// bounds-checked read).
 #[cube]
 fn byte_at(bytes: &[u32], i: usize, n: usize) -> u32 {
-    let mut v = (bytes[i >> 2] >> (((i & 3) * 8) as u32)) & 0xFF;
-    if i >= n {
-        v = 0u32;
+    if i < n {
+        (bytes[i >> 2] >> (((i & 3) * 8) as u32)) & 0xFFu32
+    } else {
+        0u32
     }
-    v
 }
 const LM_STRIDE: usize = 4;
 const LM_X: usize = 0;
@@ -1389,7 +1389,7 @@ fn resolve_x(
     }
 }
 
-// ── dispatch 8b: derive the fan stride ON DEVICE — thread per item ───────────
+// ── dispatch 5: derive the fan stride ON DEVICE — thread per item ───────────
 #[cube(launch_unchecked)]
 fn derive_stride(x_max: &[u32], ie: &[u32], page_gap_x: &[f32], strides: &mut [f32]) {
     let i = ABSOLUTE_POS;
@@ -1406,7 +1406,7 @@ fn derive_stride(x_max: &[u32], ie: &[u32], page_gap_x: &[f32], strides: &mut [f
     }
 }
 
-// ── dispatch 8: paginate — thread per byte, leaders only ─────────────────────
+// ── dispatch 6: paginate — thread per byte, leaders only ─────────────────────
 #[cube(launch_unchecked)]
 fn paginate(
     lm: &mut [f32],
@@ -1753,7 +1753,10 @@ pub fn run(ctx: &GpuContext, fixture_path: &Path) -> ! {
     };
     let mut bad = 0usize;
     let mut max_x_dev = 0.0f64;
-    if stages >= 3 {
+    if stages >= 3 && (!all_fold || stages >= 4) {
+        // Pure-wrapped corpora compile apply's row maxima out — their rows
+        // arrive with resolve_x (stage 4). Earlier bisection stages would
+        // fail this diff spuriously.
         for (i, got) in rmax.iter().take(item_count).enumerate() {
             let want_rows = r.item_bounds[i * 8 + 6];
             if *got as f64 != want_rows {
@@ -1838,8 +1841,9 @@ pub fn run(ctx: &GpuContext, fixture_path: &Path) -> ! {
             // fold>0 X is a BIT-tier lane — the segment walk performs the
             // same re-sum adds in the same left-fold order, and this witness
             // holds it to that. (The eps-tier position diff below would hide
-            // an order change; this cannot.)
-            if lm[id * LM_STRIDE + LM_X].to_bits() != r.slots.x(id).to_bits() {
+            // an order change; this cannot.) lm arrives with resolve_x
+            // (stage 4) — partial-stage bisection skips it.
+            if stages >= 4 && lm[id * LM_STRIDE + LM_X].to_bits() != r.slots.x(id).to_bits() {
                 if bad < 8 {
                     println!(
                         "  MISMATCH byte {id} fold_x: cpu {:e} gpu {:e}",
@@ -1850,11 +1854,15 @@ pub fn run(ctx: &GpuContext, fixture_path: &Path) -> ! {
                 bad += 1;
             }
         }
-        for (k, acc) in [(LM_X, r.slots.x(id)), (LM_Y, r.slots.y(id)), (LM_Z, r.slots.z(id))] {
-            let dev = (lm[id * LM_STRIDE + k] as f64 - acc as f64).abs();
-            let rel = dev / (acc as f64).abs().max(1.0);
-            if rel > max_pos_dev {
-                max_pos_dev = rel;
+        // lm lanes exist from resolve_x (stage 4) on — partial-stage
+        // bisection diffs the scan lanes only.
+        if stages >= 4 {
+            for (k, acc) in [(LM_X, r.slots.x(id)), (LM_Y, r.slots.y(id)), (LM_Z, r.slots.z(id))] {
+                let dev = (lm[id * LM_STRIDE + k] as f64 - acc as f64).abs();
+                let rel = dev / (acc as f64).abs().max(1.0);
+                if rel > max_pos_dev {
+                    max_pos_dev = rel;
+                }
             }
         }
     }
@@ -1881,7 +1889,7 @@ pub fn run(ctx: &GpuContext, fixture_path: &Path) -> ! {
         );
         std::process::exit(1);
     }
-    println!("cubecl-chain-check PASS: counts bit-exact, maxima + line_advance + positions inside 1e-4");
+    println!("cubecl-chain-check PASS: counts + rows exact, fold>0 X bit-exact, line_adv + foldless positions inside 1e-4");
     std::process::exit(0);
 }
 
@@ -2033,6 +2041,14 @@ pub fn cluster_check(ctx: &GpuContext, fixture_path: &Path) -> ! {
         Some((s, m, a)) => (s.to_vec(), m, a),
         None => (Vec::new(), 2u32, f32::NAN),
     };
+    // The probe's Shared key scratch is units x seq_max u32 per workgroup;
+    // seq_max is TRIE DATA, so a pathological table could exceed Metal's
+    // 32KB threadgroup budget at pipeline creation. Fail here, loudly,
+    // instead of coupling kernel viability to atlas content.
+    assert!(
+        256 * seq_max as usize * 4 < 32 * 1024,
+        "seq_max {seq_max} would exceed the 32KB shared budget"
+    );
     let (bitmap, ic) = cluster_host_inputs(&seq, seq_max, &fx.items);
     let mut ir = Vec::with_capacity(fx.items.len() * 2);
     for item in &fx.items {
@@ -2335,8 +2351,12 @@ pub fn bench(ctx: &GpuContext, corpus_path: &Path) -> ! {
         let cubes = threads.div_ceil(256);
         CubeCount::Static(cubes.min(65535) as u32, cubes.div_ceil(65535) as u32, 1)
     };
-    let stages: usize = std::env::var("GLYPH_CHAIN_STAGES").ok().and_then(|v| v.parse().ok()).unwrap_or(6)
-        + decode_mode as usize;
+    // GLYPH_CHAIN_STAGES is an ABSOLUTE dispatch count (the check driver's
+    // semantics): with GLYPH_CHAIN_DECODE=1 it counts the decode stage.
+    let stages: usize = match std::env::var("GLYPH_CHAIN_STAGES").ok().and_then(|v| v.parse().ok()) {
+        Some(v) => v,
+        None => 6 + decode_mode as usize,
+    };
     // One cube per tile (dim = units); the byte-wide kernels stay 256-unit.
     let tiles_grid = |tiles: usize| {
         CubeCount::Static(tiles.min(65535) as u32, tiles.div_ceil(65535) as u32, 1)

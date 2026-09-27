@@ -8,8 +8,10 @@
 //! here is fixtures -> scan.rs (Rust, CPU) -> this kernel (Rust, GPU).
 //!
 //! Scope, deliberately: single-item fixtures, decode on CPU (the bench's
-//! "mode 0" shape). Multi-item walks, the spine, and the device decode are
-//! the phase-2 skeleton. Not wired into the battery: it touches a GPU.
+//! "mode 0" shape). A HISTORICAL instrument: the phase-1 first kernel,
+//! kept for its bit-exact chunk-partial witness — the full chain
+//! (multi-item, spine, device decode, cluster) lives in `cubecl_chain.rs`.
+//! Not wired into the battery: it touches a GPU.
 
 use std::path::Path;
 
