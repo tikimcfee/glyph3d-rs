@@ -272,6 +272,8 @@ fn is_static_zero(cp: u32) -> u32 {
 fn cluster_probe(
     bytes: &[u32],
     bitmap: &[u32],
+    sec_off: &[u32],
+    sec_val: &[u32],
     seq: &[u32],
     ir: &[u32],
     ic: &[u32],
@@ -308,6 +310,62 @@ fn cluster_probe(
                         } else {
                             let bit = (bitmap[(cp >> 5u32) as usize] >> (cp & 0x1Fu32)) & 1u32;
                             if bit != 0u32 {
+                                // Pair filter: every reachable table entry
+                                // has effective length >= 2 (the matcher's
+                                // own guard), so a candidate whose SECOND
+                                // effective element cannot follow its first
+                                // in ANY entry can never match. Walk just
+                                // far enough for that second element —
+                                // skipping FE0F riders, stopping at the same
+                                // breakers as the key walk — then one small
+                                // binary search over this first's seconds.
+                                // On source text this is where the keycap
+                                // digits/#/* die: a few loads instead of a
+                                // full key walk plus up to seven table
+                                // searches (measured 42.6ms of the 24MB
+                                // text probe before it).
+                                let mut q = id + len as usize;
+                                let mut second = 0u32;
+                                let mut hunting = 1u32;
+                                while hunting == 1u32 && q < stop {
+                                    let l2 = seq_len_at(bytes, q, n);
+                                    let c2 = cp_at(bytes, q, l2, n);
+                                    let dead2 = if l2 == 0u32 || c2 == 0x0Au32 || c2 == 0xFE0Eu32 {
+                                        1u32
+                                    } else {
+                                        0u32
+                                    };
+                                    if dead2 == 1u32 {
+                                        hunting = 0u32;
+                                    }
+                                    if dead2 == 0u32 {
+                                        if c2 != 0xFE0Fu32 {
+                                            second = c2;
+                                            hunting = 0u32;
+                                        }
+                                        q += l2 as usize;
+                                    }
+                                }
+                                let mut pair_alive = 0u32;
+                                if second != 0u32 {
+                                    let plo = sec_off[cp as usize];
+                                    let phi = sec_off[cp as usize + 1usize];
+                                    let mut lo2 = plo;
+                                    let mut hi2 = phi;
+                                    while lo2 < hi2 {
+                                        let mid = (lo2 + hi2) / 2u32;
+                                        if sec_val[mid as usize] < second {
+                                            lo2 = mid + 1u32;
+                                        }
+                                        if sec_val[mid as usize] >= second {
+                                            hi2 = mid;
+                                        }
+                                    }
+                                    if lo2 < phi && sec_val[lo2 as usize] == second {
+                                        pair_alive = 1u32;
+                                    }
+                                }
+                                if pair_alive == 1u32 {
                                 // Key build: the head's own cp is element 0.
                                 // The scratch is LOCAL to this thread —
                                 // declared here so only candidates pay for it.
@@ -415,6 +473,7 @@ fn cluster_probe(
                                     }
                                     cslot[id] = slot;
                                     cend[id] = send;
+                                }
                                 }
                             }
                         }
@@ -2353,6 +2412,40 @@ pub(crate) fn cluster_host_inputs(
     (bitmap, ic)
 }
 
+/// The probe's second-level filter: for every first codepoint that starts
+/// sequences, the SORTED list of second effective elements that actually
+/// occur. `sec_off` is indexed by cp (0x110002 entries — the +1 read gives
+/// each first's end), `sec_val` the flat seconds grouped by first. Entries
+/// shorter than 2 are skipped: the matcher's own `elen >= 2` guard makes
+/// them unreachable on both sides, so rejecting before the search is
+/// behavior-identical.
+pub(crate) fn cluster_pair_filter(seq: &[u32], seq_max: u32) -> (Vec<u32>, Vec<u32>) {
+    let stride = 2 + seq_max as usize;
+    let mut pairs: Vec<(u32, u32)> = Vec::new();
+    for e in (0..seq.len()).step_by(stride) {
+        if seq[e + 1] >= 2 {
+            pairs.push((seq[e + 2], seq[e + 3]));
+        }
+    }
+    pairs.sort_unstable();
+    pairs.dedup();
+    let mut off = vec![0u32; 0x110000 + 2];
+    for &(first, _) in &pairs {
+        off[first as usize + 1] += 1;
+    }
+    for i in 1..off.len() {
+        off[i] += off[i - 1];
+    }
+    let mut cursor = off.clone();
+    let mut val = vec![0u32; pairs.len()];
+    for &(first, second) in &pairs {
+        let s = cursor[first as usize] as usize;
+        val[s] = second;
+        cursor[first as usize] += 1;
+    }
+    (off, val)
+}
+
 /// `--cubecl-cluster-check <fixture.pipe.bin>`: decode + cluster on device
 /// vs `decode_all` + `resolve_clusters` on CPU — packed flags (low byte,
 /// trailer bit included) and advance diffed BIT-EXACT per byte. Non-cluster
@@ -2411,6 +2504,9 @@ pub fn cluster_check(ctx: &GpuContext, fixture_path: &Path) -> ! {
     let h_bc = client.create_from_slice(bytemuck::cast_slice(&fx.trie.blocks_c));
     let h_seq = client.create_from_slice(bytemuck::cast_slice(&seq));
     let h_bmap = client.create_from_slice(bytemuck::cast_slice(&bitmap));
+    let (poff, pval) = cluster_pair_filter(&seq, seq_max);
+    let h_poff = client.create_from_slice(bytemuck::cast_slice(&poff));
+    let h_pval = client.create_from_slice(bytemuck::cast_slice(&pval));
     let h_ir = client.create_from_slice(bytemuck::cast_slice(&ir));
     let h_ic = client.create_from_slice(bytemuck::cast_slice(&ic));
     let h_fl = client.empty(n_words * 4);
@@ -2456,6 +2552,8 @@ pub fn cluster_check(ctx: &GpuContext, fixture_path: &Path) -> ! {
             CubeDim::new_1d(256),
             BufferArg::from_raw_parts(h_bytes.clone(), n_words),
             BufferArg::from_raw_parts(h_bmap.clone(), bitmap.len()),
+            BufferArg::from_raw_parts(h_poff.clone(), poff.len()),
+            BufferArg::from_raw_parts(h_pval.clone(), pval.len()),
             BufferArg::from_raw_parts(h_seq.clone(), seq.len()),
             BufferArg::from_raw_parts(h_ir.clone(), ir.len()),
             BufferArg::from_raw_parts(h_ic.clone(), ic.len()),
@@ -2830,6 +2928,17 @@ pub fn bench(ctx: &GpuContext, corpus_path: &Path) -> ! {
     let (bitmap, ic) = cluster_host_inputs(&seq, seq_max, &items);
     let h_seq = client.create_from_slice(bytemuck::cast_slice(&seq));
     let h_bmap = client.create_from_slice(bytemuck::cast_slice(&bitmap));
+    // The pair filter computes unconditionally (host-side, trivial); only
+    // its ~4.4MB upload is gated on cluster mode.
+    let (poff, pval) = cluster_pair_filter(&seq, seq_max);
+    let (h_poff, h_pval) = if cluster_mode {
+        (
+            client.create_from_slice(bytemuck::cast_slice(&poff)),
+            client.create_from_slice(bytemuck::cast_slice(&pval)),
+        )
+    } else {
+        (client.empty(0), client.empty(0))
+    };
     let h_ic = client.create_from_slice(bytemuck::cast_slice(&ic));
     let h_cslot = if cluster_mode {
         client.create_from_slice(bytemuck::cast_slice(&vec![0u32; n]))
@@ -2907,6 +3016,8 @@ pub fn bench(ctx: &GpuContext, corpus_path: &Path) -> ! {
                     CubeDim::new_1d(256),
                     BufferArg::from_raw_parts(h_bytes.clone(), n_words),
                     BufferArg::from_raw_parts(h_bmap.clone(), bitmap.len()),
+                    BufferArg::from_raw_parts(h_poff.clone(), poff.len()),
+                    BufferArg::from_raw_parts(h_pval.clone(), pval.len()),
                     BufferArg::from_raw_parts(h_seq.clone(), seq.len()),
                     BufferArg::from_raw_parts(h_ir.clone(), 2),
                     BufferArg::from_raw_parts(h_ic.clone(), ic.len()),
@@ -3002,6 +3113,8 @@ pub fn bench(ctx: &GpuContext, corpus_path: &Path) -> ! {
                     CubeDim::new_1d(256),
                     BufferArg::from_raw_parts(h_bytes.clone(), n_words),
                     BufferArg::from_raw_parts(h_bmap.clone(), bitmap.len()),
+                    BufferArg::from_raw_parts(h_poff.clone(), poff.len()),
+                    BufferArg::from_raw_parts(h_pval.clone(), pval.len()),
                     BufferArg::from_raw_parts(h_seq.clone(), seq.len()),
                     BufferArg::from_raw_parts(h_ir.clone(), 2),
                     BufferArg::from_raw_parts(h_ic.clone(), ic.len()),
