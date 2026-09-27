@@ -721,28 +721,51 @@ impl RepoLoad {
         // the far-LOD backdrop tint derived from the file's own ink.
         // Stage G: the SAME local AABB goes into the pick table (pre-TRS; the
         // pick path applies the live group TRS itself).
-        let segments: Vec<crate::glyph_scene::SegCull> = self
-            .files
-            .iter()
-            .map(|v| {
-                let insts = &self.arena.instances()[v.slot_base..v.slot_base + v.slot_count];
-                crate::glyph_scene::SegCull {
-                    min: [
-                        v.offset[0] - 0.3,
-                        v.offset[1] - v.height - 0.5,
-                        v.offset[2] + v.z_min,
-                    ],
-                    max: [
-                        v.offset[0] + v.width + 0.6,
-                        v.offset[1] + 0.75,
-                        v.offset[2] + v.z_max,
-                    ],
-                    slot_base: v.slot_base as u32,
-                    slot_count: v.slot_count as u32,
-                    tint: crate::glyph_scene::seg_tint(insts, v.width, v.height, slot_ink),
-                }
+        let insts = self.arena.instances();
+        let seg_of = |v: &FileView| {
+            let insts_v = &insts[v.slot_base..v.slot_base + v.slot_count];
+            crate::glyph_scene::SegCull {
+                min: [
+                    v.offset[0] - 0.3,
+                    v.offset[1] - v.height - 0.5,
+                    v.offset[2] + v.z_min,
+                ],
+                max: [
+                    v.offset[0] + v.width + 0.6,
+                    v.offset[1] + 0.75,
+                    v.offset[2] + v.z_max,
+                ],
+                slot_base: v.slot_base as u32,
+                slot_count: v.slot_count as u32,
+                tint: crate::glyph_scene::seg_tint(insts_v, v.width, v.height, slot_ink),
+            }
+        };
+        // seg_tint re-reads the whole arena, one file's slice at a time —
+        // ~500 ms serial on the glyph3d-js repo (1,306 files). Shard by file
+        // range: per-segment sums are independent and the per-worker results
+        // concatenate in file order, so the table is bit-identical. Small
+        // repos stay serial (thread spawn would cost more than the pass).
+        let segments: Vec<crate::glyph_scene::SegCull> = if self.files.len() >= 64 {
+            let workers = std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(1)
+                .min(8);
+            let span = self.files.len().div_ceil(workers);
+            let seg_ref = &seg_of;
+            std::thread::scope(|s| {
+                let handles: Vec<_> = self
+                    .files
+                    .chunks(span)
+                    .map(|range| s.spawn(move || range.iter().map(seg_ref).collect::<Vec<_>>()))
+                    .collect();
+                handles
+                    .into_iter()
+                    .flat_map(|h| h.join().expect("segment worker panicked"))
+                    .collect()
             })
-            .collect();
+        } else {
+            self.files.iter().map(seg_of).collect()
+        };
         let pick_files: Vec<crate::glyph_scene::PickFileInfo> = self
             .files
             .iter()
