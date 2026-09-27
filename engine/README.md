@@ -223,7 +223,7 @@ Counts (`ROW`/`COL`/`ORD`/`ordToByte`) and the `totalRows` fold scalar compare
 from a fold scalar between dispatches, as the CPU driver does. The
 monoid lives in one function that every scan dispatch calls, so seven kernels cannot drift
 the way seven transcriptions would; the cluster kernels are
-cluster_device.mojo's, shared with gpu_cluster's standalone proof.
+cluster_probe.mojo's and cluster_chain.mojo's, shared with gpu_cluster's standalone proof.
 
 **This found two bugs the five piecewise GPU suites could not**, which is the whole
 argument for it:

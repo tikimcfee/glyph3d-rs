@@ -140,7 +140,7 @@ display's refresh (75 on the first Linux box) and not a fact about the renderer.
   per-pass GPU timings print (windowed: 1 Hz; offscreen: once per run).
   Without it the device is created exactly as before (zero-cost Option).
 - `GLYPH_PICK_DEBUG=1` — pick-path diagnostics: pixel ray, AABB hits, local
-  point, candidate records (glyph_scene.rs pick functions).
+  point, candidate records (glyph_scene/pick.rs pick functions).
 - `GLYPH_CULL_DEBUG=1` — at t=0.0 prints cull stats: visible draw ranges,
   instance count, backdrop count.
 - `GLYPH_G_DUMP=<slot>[,<len>]` — offscreen only: reads back instance bytes

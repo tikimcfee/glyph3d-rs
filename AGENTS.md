@@ -250,7 +250,7 @@ Run on `src/main.rs` and on `fixtures/overflow-leads.txt` — the second because
 `main.rs` is well-formed UTF-8 by construction and can never reach the
 out-of-range decode path where the two implementations actually disagreed in
 September 2026. Blind to the **per-item** FFI strategy: this hardcodes the
-batched one (`main.rs:127`). Blind to malformed shapes other than the one that
+batched one (`main.rs:157`). Blind to malformed shapes other than the one that
 fixture carries.
 
 **pick-oracle** (`tools/check-pick-oracle.sh`; was `check-stage-g.sh` — the `g`
