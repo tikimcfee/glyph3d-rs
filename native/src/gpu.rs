@@ -469,6 +469,11 @@ pub async fn init(compatible_surface: Option<&wgpu::Surface<'_>>) -> GpuContext 
         max_storage_buffer_binding_size: supported.max_storage_buffer_binding_size,
         max_buffer_size: supported.max_buffer_size,
         max_storage_buffers_per_shader_stage: supported.max_storage_buffers_per_shader_stage,
+        // Request the adapter's real cap rather than wgpu's default. Measured
+        // on this M2: the ADAPTER itself reports 65535, so this is a no-op
+        // here — the CubeCL chain still spills large grids into Y (see its
+        // cubes_of) — but an adapter with a higher cap gets it automatically.
+        max_compute_workgroups_per_dimension: supported.max_compute_workgroups_per_dimension,
         ..Default::default()
     };
 
@@ -480,23 +485,22 @@ pub async fn init(compatible_surface: Option<&wgpu::Surface<'_>>) -> GpuContext 
         adapter.features().contains(wgpu::Features::MULTI_DRAW_INDIRECT_COUNT)
     );
 
-    // Stage H: opt-in profiling. Request TIMESTAMP_QUERY (+ INSIDE_PASSES for
-    // nested in-pass scopes) ONLY when GLYPH_PROFILE=1 and the adapter
-    // supports it; a missing feature must never break a render.
+    // Stage H: TIMESTAMP_QUERY is requested whenever the adapter has it — the
+    // shared device is what CubeCL's chain bench sees, and its per-dispatch
+    // GPU timing needs the feature present at device creation (cubecl picks
+    // TimingMethod::Device only then). The renderer's own in-pass scopes
+    // (INSIDE_PASSES) stay opt-in behind GLYPH_PROFILE=1; a missing feature
+    // must never break a render.
     let profile_wanted = std::env::var_os("GLYPH_PROFILE").is_some();
     let adapter_features = adapter.features();
     let mut required_features = wgpu::Features::empty();
-    let profiling_supported = profile_wanted
-        && adapter_features.contains(wgpu::Features::TIMESTAMP_QUERY);
-    if profile_wanted {
-        if profiling_supported {
-            required_features |= wgpu::Features::TIMESTAMP_QUERY;
-            if adapter_features.contains(wgpu::Features::TIMESTAMP_QUERY_INSIDE_PASSES) {
-                required_features |= wgpu::Features::TIMESTAMP_QUERY_INSIDE_PASSES;
-            }
-        } else {
-            log::warn!("profiling unavailable: no TIMESTAMP_QUERY (running unprofiled)");
-        }
+    if adapter_features.contains(wgpu::Features::TIMESTAMP_QUERY) {
+        required_features |= wgpu::Features::TIMESTAMP_QUERY;
+    } else {
+        log::warn!("timestamp queries unavailable: CubeCL bench timing falls back to system clock");
+    }
+    if profile_wanted && adapter_features.contains(wgpu::Features::TIMESTAMP_QUERY_INSIDE_PASSES) {
+        required_features |= wgpu::Features::TIMESTAMP_QUERY_INSIDE_PASSES;
     }
     // MAP_WRITE on storage buffers lets the instance upload write the device
     // buffer directly instead of wgpu's zero-fill-then-stage-then-blit path
@@ -538,7 +542,7 @@ pub async fn init(compatible_surface: Option<&wgpu::Surface<'_>>) -> GpuContext 
 
     // Debug groups off: they only label captures and we want the smallest
     // possible footprint on the encode path.
-    let profiler = if profiling_supported {
+    let profiler = if profile_wanted {
         match wgpu_profiler::GpuProfiler::new(
             &device,
             wgpu_profiler::GpuProfilerSettings {

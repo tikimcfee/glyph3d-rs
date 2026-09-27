@@ -660,9 +660,11 @@ pub fn run(ctx: &GpuContext, fixture_path: &Path) -> ! {
     let h_rmax = client.create_from_slice(bytemuck::cast_slice(&zeroes));
     let h_xmax = client.create_from_slice(bytemuck::cast_slice(&zeroes));
 
-    // wgpu caps a dispatch's X dimension at 65535 cubes; spill into Y.
-    // ABSOLUTE_POS is the flattened id across axes (topology.rs:271), so the
-    // kernels need no index change.
+    // This M2's ADAPTER caps workgroups per grid dimension at 65535 (verified
+    // live: a 94075-cube dispatch was rejected) — not a wgpu default to lift.
+    // Spill into Y; ABSOLUTE_POS is the flattened id across axes, so the
+    // kernels need no index change. gpu.rs still requests the adapter's value,
+    // so an adapter with a higher cap takes the plain grid automatically.
     let cubes_of = |threads: usize| {
         let cubes = threads.div_ceil(256);
         CubeCount::Static(cubes.min(65535) as u32, cubes.div_ceil(65535) as u32, 1)
@@ -875,8 +877,22 @@ pub fn run(ctx: &GpuContext, fixture_path: &Path) -> ! {
 
 // ── the bench driver ──────────────────────────────────────────────────────────
 
-/// `--cubecl-chain-bench <corpus>`: the chain over a raw file as ONE item,
-/// times like bench_scaling's gpu phase — the dispatches, then the readbacks.
+/// `--cubecl-chain-bench <corpus>`: the chain over a raw file as ONE item.
+///
+/// Timing is PER-DISPATCH GPU WINDOWS (`profile_start`/`profile_end` — device
+/// timestamps when the shared device carries TIMESTAMP_QUERY, which gpu.rs
+/// requests unconditionally where supported), `GLYPH_CHAIN_LOOP` samples per
+/// dispatch with the MINIMUM kept (the "run it a few times" rule, automated).
+/// Each window flushes, so stages cannot overlap: these are per-dispatch
+/// latencies in the same posture as the Mojo bench's `mark()` table, and the
+/// sum of minima is the chain estimate — the chain is dependency-serialized,
+/// so nothing is lost to that. The old batched wall-clock loop mode is
+/// retired: it measured repeat-overlap, not the chain.
+///
+/// `GLYPH_CHAIN_WRAP=<width>` swaps the single item to wrap_width>0 /
+/// WRAP_DOWN so the segment re-sum in resolve_x actually executes — the plain
+/// shape leaves that path dead at fold==0 and measures only atomic
+/// throughput.
 pub fn bench(ctx: &GpuContext, corpus_path: &Path) -> ! {
     let bytes = std::fs::read(corpus_path).unwrap_or_else(|e| {
         eprintln!("cubecl-chain-bench: {e}");
@@ -887,13 +903,18 @@ pub fn bench(ctx: &GpuContext, corpus_path: &Path) -> ! {
     let group = DEFAULT_GROUP_SIZE;
     let n_chunks = n.div_ceil(chunk);
     let n_supers = n_chunks.div_ceil(group);
+    // The wrapped shape: fold>0 makes resolve_x take the re-sum path.
+    let wrap_width: i64 = std::env::var("GLYPH_CHAIN_WRAP")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
     let item = crate::fold::Item {
         byte_start: 0,
         byte_count: n as i64,
         origin_x: 0.0,
         origin_y: 0.0,
         origin_z: 0.0,
-        wrap_width: 0,
+        wrap_width,
         wrap_mode: WrapMode::Down,
         cluster_mode: crate::fold::ClusterMode::Leader,
         z_step: 2.0,
@@ -924,7 +945,7 @@ pub fn bench(ctx: &GpuContext, corpus_path: &Path) -> ! {
         sm.push(r.slots.height(i));
     }
     let ir: Vec<u32> = vec![0, n as u32];
-    let ie: Vec<u32> = vec![0, 0, 0, 1, 0, 0, 0, 0];
+    let ie: Vec<u32> = vec![0, 0, 0, 1, wrap_width as u32, 0, 0, 0];
     let im: Vec<f32> = vec![0.0, 0.0, 1.25, 2.0, 0.0, 0.0, 0.0, 0.0, 0.0];
     let page_gap_x: Vec<f32> = vec![0.0];
 
@@ -960,137 +981,182 @@ pub fn bench(ctx: &GpuContext, corpus_path: &Path) -> ! {
     let h_rmax = client.create_from_slice(bytemuck::cast_slice(&[0u32]));
     let h_xmax = client.create_from_slice(bytemuck::cast_slice(&[0u32]));
 
-    // wgpu caps a dispatch's X dimension at 65535 cubes; spill into Y.
-    // ABSOLUTE_POS is the flattened id across axes (topology.rs:271), so the
-    // kernels need no index change.
+    // This M2's ADAPTER caps workgroups per grid dimension at 65535 (verified
+    // live: a 94075-cube dispatch was rejected) — not a wgpu default to lift.
+    // Spill into Y; ABSOLUTE_POS is the flattened id across axes, so the
+    // kernels need no index change. gpu.rs still requests the adapter's value,
+    // so an adapter with a higher cap takes the plain grid automatically.
     let cubes_of = |threads: usize| {
         let cubes = threads.div_ceil(256);
         CubeCount::Static(cubes.min(65535) as u32, cubes.div_ceil(65535) as u32, 1)
     };
     let stages: usize = std::env::var("GLYPH_CHAIN_STAGES").ok().and_then(|v| v.parse().ok()).unwrap_or(8);
-    // GLYPH_CHAIN_LOOP=K repeats the launch block K times before one flush —
-    // the steady-state dispatch cost (and the answer to "does cubecl dedupe
-    // identical tasks": if K loops cost ~Kx, it does not).
-    let loops: usize = std::env::var("GLYPH_CHAIN_LOOP").ok().and_then(|v| v.parse().ok()).unwrap_or(1);
-    let t0 = std::time::Instant::now();
-    for _iter in 0..loops {
-    unsafe {
-        chunk_reduce::launch_unchecked(
-            &client,
-            cubes_of(n_chunks),
-            CubeDim::new_1d(256),
-            BufferArg::from_raw_parts(h_fl.clone(), n),
-            BufferArg::from_raw_parts(h_sm.clone(), n * SM_STRIDE),
-            BufferArg::from_raw_parts(h_ir.clone(), 2),
-            BufferArg::from_raw_parts(h_ie.clone(), IE_STRIDE),
-            BufferArg::from_raw_parts(h_pc.clone(), n_chunks * PARTIAL_COUNT_STRIDE),
-            BufferArg::from_raw_parts(h_pm.clone(), n_chunks),
-            chunk,
-        );
-        if stages >= 2 {
-            spine_reduce::launch_unchecked(
-            &client,
-            cubes_of(n_supers),
-            CubeDim::new_1d(256),
-            BufferArg::from_raw_parts(h_pc.clone(), n_chunks * PARTIAL_COUNT_STRIDE),
-            BufferArg::from_raw_parts(h_pm.clone(), n_chunks),
-            BufferArg::from_raw_parts(h_uc.clone(), n_supers * PARTIAL_COUNT_STRIDE),
-            BufferArg::from_raw_parts(h_um.clone(), n_supers),
-            group,
-        );
+    // Timed samples per dispatch; the minimum is reported.
+    let samples: usize = std::env::var("GLYPH_CHAIN_LOOP").ok().and_then(|v| v.parse().ok()).unwrap_or(3);
+    let launch = |s: usize| {
+        unsafe {
+            match s {
+                0 => {
+                    chunk_reduce::launch_unchecked(
+                        &client,
+                        cubes_of(n_chunks),
+                        CubeDim::new_1d(256),
+                        BufferArg::from_raw_parts(h_fl.clone(), n),
+                        BufferArg::from_raw_parts(h_sm.clone(), n * SM_STRIDE),
+                        BufferArg::from_raw_parts(h_ir.clone(), 2),
+                        BufferArg::from_raw_parts(h_ie.clone(), IE_STRIDE),
+                        BufferArg::from_raw_parts(h_pc.clone(), n_chunks * PARTIAL_COUNT_STRIDE),
+                        BufferArg::from_raw_parts(h_pm.clone(), n_chunks),
+                        chunk,
+                    );
+                }
+                1 => {
+                    spine_reduce::launch_unchecked(
+                        &client,
+                        cubes_of(n_supers),
+                        CubeDim::new_1d(256),
+                        BufferArg::from_raw_parts(h_pc.clone(), n_chunks * PARTIAL_COUNT_STRIDE),
+                        BufferArg::from_raw_parts(h_pm.clone(), n_chunks),
+                        BufferArg::from_raw_parts(h_uc.clone(), n_supers * PARTIAL_COUNT_STRIDE),
+                        BufferArg::from_raw_parts(h_um.clone(), n_supers),
+                        group,
+                    );
+                }
+                2 => {
+                    spine_scan::launch_unchecked(
+                        &client,
+                        CubeCount::new_single(),
+                        CubeDim::new_1d(1),
+                        BufferArg::from_raw_parts(h_uc.clone(), n_supers * PARTIAL_COUNT_STRIDE),
+                        BufferArg::from_raw_parts(h_um.clone(), n_supers),
+                        BufferArg::from_raw_parts(h_fc.clone(), n_supers * PARTIAL_COUNT_STRIDE),
+                        BufferArg::from_raw_parts(h_fm.clone(), n_supers),
+                    );
+                }
+                3 => {
+                    partial_scan::launch_unchecked(
+                        &client,
+                        cubes_of(n_supers),
+                        CubeDim::new_1d(256),
+                        BufferArg::from_raw_parts(h_pc.clone(), n_chunks * PARTIAL_COUNT_STRIDE),
+                        BufferArg::from_raw_parts(h_pm.clone(), n_chunks),
+                        BufferArg::from_raw_parts(h_fc.clone(), n_supers * PARTIAL_COUNT_STRIDE),
+                        BufferArg::from_raw_parts(h_fm.clone(), n_supers),
+                        BufferArg::from_raw_parts(h_xc.clone(), n_chunks * PARTIAL_COUNT_STRIDE),
+                        BufferArg::from_raw_parts(h_xm.clone(), n_chunks),
+                        group,
+                    );
+                }
+                4 => {
+                    k_apply::launch_unchecked(
+                        &client,
+                        cubes_of(n_chunks),
+                        CubeDim::new_1d(256),
+                        BufferArg::from_raw_parts(h_fl.clone(), n),
+                        BufferArg::from_raw_parts(h_sm.clone(), n * SM_STRIDE),
+                        BufferArg::from_raw_parts(h_lc.clone(), n * LC_STRIDE),
+                        BufferArg::from_raw_parts(h_ir.clone(), 2),
+                        BufferArg::from_raw_parts(h_ie.clone(), IE_STRIDE),
+                        BufferArg::from_raw_parts(h_xc.clone(), n_chunks * PARTIAL_COUNT_STRIDE),
+                        BufferArg::from_raw_parts(h_xm.clone(), n_chunks),
+                        BufferArg::from_raw_parts(h_wm.clone(), n),
+                        BufferArg::from_raw_parts(h_wc.clone(), n),
+                        BufferArg::from_raw_parts(h_otb.clone(), n),
+                        chunk,
+                    );
+                }
+                5 => {
+                    resolve_x::launch_unchecked(
+                        &client,
+                        cubes_of(n),
+                        CubeDim::new_1d(256),
+                        BufferArg::from_raw_parts(h_sm.clone(), n * SM_STRIDE),
+                        BufferArg::from_raw_parts(h_fl.clone(), n),
+                        BufferArg::from_raw_parts(h_lm.clone(), n * LM_STRIDE),
+                        BufferArg::from_raw_parts(h_lc.clone(), n * LC_STRIDE),
+                        BufferArg::from_raw_parts(h_im.clone(), IM_STRIDE),
+                        BufferArg::from_raw_parts(h_ie.clone(), IE_STRIDE),
+                        BufferArg::from_raw_parts(h_ir.clone(), 2),
+                        BufferArg::from_raw_parts(h_wm.clone(), n),
+                        BufferArg::from_raw_parts(h_wc.clone(), n),
+                        BufferArg::from_raw_parts(h_otb.clone(), n),
+                        BufferArg::from_raw_parts(h_rmax.clone(), 1),
+                        BufferArg::from_raw_parts(h_xmax.clone(), 1),
+                    );
+                }
+                6 => {
+                    derive_stride::launch_unchecked(
+                        &client,
+                        CubeCount::new_single(),
+                        CubeDim::new_1d(1),
+                        BufferArg::from_raw_parts(h_xmax.clone(), 1),
+                        BufferArg::from_raw_parts(h_ie.clone(), IE_STRIDE),
+                        BufferArg::from_raw_parts(h_gap.clone(), 1),
+                        BufferArg::from_raw_parts(h_strides.clone(), 1),
+                    );
+                }
+                _ => {
+                    paginate::launch_unchecked(
+                        &client,
+                        cubes_of(n),
+                        CubeDim::new_1d(256),
+                        BufferArg::from_raw_parts(h_lm.clone(), n * LM_STRIDE),
+                        BufferArg::from_raw_parts(h_fl.clone(), n),
+                        BufferArg::from_raw_parts(h_lc.clone(), n * LC_STRIDE),
+                        BufferArg::from_raw_parts(h_im.clone(), IM_STRIDE),
+                        BufferArg::from_raw_parts(h_ie.clone(), IE_STRIDE),
+                        BufferArg::from_raw_parts(h_ir.clone(), 2),
+                        BufferArg::from_raw_parts(h_strides.clone(), 1),
+                    );
+                }
+            }
         }
-        if stages >= 3 {
-            spine_scan::launch_unchecked(
-            &client,
-            CubeCount::new_single(),
-            CubeDim::new_1d(1),
-            BufferArg::from_raw_parts(h_uc.clone(), n_supers * PARTIAL_COUNT_STRIDE),
-            BufferArg::from_raw_parts(h_um.clone(), n_supers),
-            BufferArg::from_raw_parts(h_fc.clone(), n_supers * PARTIAL_COUNT_STRIDE),
-            BufferArg::from_raw_parts(h_fm.clone(), n_supers),
-        );
-        }
-        if stages >= 4 {
-            partial_scan::launch_unchecked(
-            &client,
-            cubes_of(n_supers),
-            CubeDim::new_1d(256),
-            BufferArg::from_raw_parts(h_pc.clone(), n_chunks * PARTIAL_COUNT_STRIDE),
-            BufferArg::from_raw_parts(h_pm.clone(), n_chunks),
-            BufferArg::from_raw_parts(h_fc.clone(), n_supers * PARTIAL_COUNT_STRIDE),
-            BufferArg::from_raw_parts(h_fm.clone(), n_supers),
-            BufferArg::from_raw_parts(h_xc.clone(), n_chunks * PARTIAL_COUNT_STRIDE),
-            BufferArg::from_raw_parts(h_xm.clone(), n_chunks),
-            group,
-        );
-        }
-        if stages >= 5 {
-            k_apply::launch_unchecked(
-            &client,
-            cubes_of(n_chunks),
-            CubeDim::new_1d(256),
-            BufferArg::from_raw_parts(h_fl.clone(), n),
-            BufferArg::from_raw_parts(h_sm.clone(), n * SM_STRIDE),
-            BufferArg::from_raw_parts(h_lc.clone(), n * LC_STRIDE),
-            BufferArg::from_raw_parts(h_ir.clone(), 2),
-            BufferArg::from_raw_parts(h_ie.clone(), IE_STRIDE),
-            BufferArg::from_raw_parts(h_xc.clone(), n_chunks * PARTIAL_COUNT_STRIDE),
-            BufferArg::from_raw_parts(h_xm.clone(), n_chunks),
-            BufferArg::from_raw_parts(h_wm.clone(), n),
-            BufferArg::from_raw_parts(h_wc.clone(), n),
-            BufferArg::from_raw_parts(h_otb.clone(), n),
-            chunk,
-        );
-        }
-        if stages >= 6 {
-            resolve_x::launch_unchecked(
-            &client,
-            cubes_of(n),
-            CubeDim::new_1d(256),
-            BufferArg::from_raw_parts(h_sm.clone(), n * SM_STRIDE),
-            BufferArg::from_raw_parts(h_fl.clone(), n),
-            BufferArg::from_raw_parts(h_lm.clone(), n * LM_STRIDE),
-            BufferArg::from_raw_parts(h_lc.clone(), n * LC_STRIDE),
-            BufferArg::from_raw_parts(h_im.clone(), IM_STRIDE),
-            BufferArg::from_raw_parts(h_ie.clone(), IE_STRIDE),
-            BufferArg::from_raw_parts(h_ir.clone(), 2),
-            BufferArg::from_raw_parts(h_wm.clone(), n),
-            BufferArg::from_raw_parts(h_wc.clone(), n),
-            BufferArg::from_raw_parts(h_otb.clone(), n),
-            BufferArg::from_raw_parts(h_rmax.clone(), 1),
-            BufferArg::from_raw_parts(h_xmax.clone(), 1),
-        );
-        }
-        if stages >= 7 {
-            derive_stride::launch_unchecked(
-            &client,
-            CubeCount::new_single(),
-            CubeDim::new_1d(1),
-            BufferArg::from_raw_parts(h_xmax.clone(), 1),
-            BufferArg::from_raw_parts(h_ie.clone(), IE_STRIDE),
-            BufferArg::from_raw_parts(h_gap.clone(), 1),
-            BufferArg::from_raw_parts(h_strides.clone(), 1),
-        );
-        }
-        if stages >= 8 {
-            paginate::launch_unchecked(
-            &client,
-            cubes_of(n),
-            CubeDim::new_1d(256),
-            BufferArg::from_raw_parts(h_lm.clone(), n * LM_STRIDE),
-            BufferArg::from_raw_parts(h_fl.clone(), n),
-            BufferArg::from_raw_parts(h_lc.clone(), n * LC_STRIDE),
-            BufferArg::from_raw_parts(h_im.clone(), IM_STRIDE),
-            BufferArg::from_raw_parts(h_ie.clone(), IE_STRIDE),
-            BufferArg::from_raw_parts(h_ir.clone(), 2),
-            BufferArg::from_raw_parts(h_strides.clone(), 1),
-        );
+    };
+    // The per-dispatch GPU windows. Every stage runs `samples` times; the
+    // minimum survives. A window that resolved to no measurement counts as a
+    // missing sample, never as a zero.
+    let stage_names = [
+        "chunk_reduce",
+        "spine_reduce",
+        "spine_scan",
+        "partial_scan",
+        "k_apply",
+        "resolve_x",
+        "derive_stride",
+        "paginate",
+    ];
+    let stage_meta = |s: usize| -> (&'static str, usize, u32) {
+        let threads = match s {
+            0 | 4 => n_chunks,
+            1 | 3 => n_supers,
+            2 | 6 => 1,
+            _ => n,
+        };
+        let cubes = threads.div_ceil(256);
+        (stage_names[s], cubes, 256u32)
+    };
+    let mut mins: Vec<Option<std::time::Duration>> = vec![None; stages];
+    let mut missing_windows = 0usize;
+    let mut timing_method = String::new();
+    for _ in 0..samples {
+        for (s, slot) in mins.iter_mut().enumerate() {
+            let window = client.profile_start().expect("profile_start");
+            launch(s);
+            let dur = client.profile_end(window).expect("profile_end");
+            if timing_method.is_empty() {
+                timing_method = format!("{}", dur.timing_method());
+            }
+            match pollster::block_on(dur.resolve()) {
+                Some(ticks) => {
+                    let d = ticks.duration();
+                    *slot = Some(slot.map_or(d, |cur| cur.min(d)));
+                }
+                None => missing_windows += 1,
+            }
         }
     }
-    }
-    // Close the dispatch timing with a tiny flush, then the readbacks.
-    let _ = client.read_one(h_strides.clone()).expect("flush");
-    let dispatch_dt = t0.elapsed() / loops as u32;
+
+    // Readbacks: host-side, wall clock (the product flow binds instead).
     let t1 = std::time::Instant::now();
     let lc_bytes = client.read_one(h_lc.clone()).expect("read lc");
     let _wc = client.read_one(h_wc.clone()).expect("read wc");
@@ -1101,7 +1167,18 @@ pub fn bench(ctx: &GpuContext, corpus_path: &Path) -> ! {
     // path is wrong — diff the leader row/col lanes against the CPU reference.
     let lc: &[u32] = bytemuck::cast_slice(&lc_bytes);
     if stages < 5 {
-        println!("cubecl-chain-bench: {} ({} B, {} chunks) loops {} — dispatches {:?}/loop (pre-apply stages)", corpus_path.display(), n, n_chunks, loops, dispatch_dt);
+        println!(
+            "cubecl-chain-bench: {} ({} B, {} chunks, wrap {}) stages {} — pre-apply stages only, no verification",
+            corpus_path.display(),
+            n,
+            n_chunks,
+            wrap_width,
+            stages
+        );
+        for (s, m) in mins.iter().enumerate() {
+            let (name, cubes, dim) = stage_meta(s);
+            println!("  {name:<14} cubes={cubes} units={dim} min={m:?}");
+        }
         std::process::exit(0);
     }
     let mut bad = 0usize;
@@ -1117,18 +1194,27 @@ pub fn bench(ctx: &GpuContext, corpus_path: &Path) -> ! {
     }
     assert_eq!(bad, 0, "bench verification failed: {bad} leader lane mismatches");
 
-    let total = dispatch_dt + readback_dt;
+    let chain: std::time::Duration = mins.iter().filter_map(|d| *d).sum();
+    let total = chain + readback_dt;
     println!(
-        "cubecl-chain-bench: {} ({} B, {} chunks) loops {} — cpu decode+scan {:?} | dispatches {:?}/loop readbacks {:?} total {:?} ({:.1} MB/s)",
+        "cubecl-chain-bench: {} ({} B, {} chunks, wrap {}, samples {}) timing={} missing_windows={} — \
+         cpu decode+scan {:?} | chain (sum of per-dispatch minima) {:?} readbacks {:?} total {:?} ({:.1} MB/s)",
         corpus_path.display(),
         n,
         n_chunks,
-        loops,
+        wrap_width,
+        samples,
+        timing_method,
+        missing_windows,
         decode_dt,
-        dispatch_dt,
+        chain,
         readback_dt,
         total,
         n as f64 / 1e6 / total.as_secs_f64()
     );
+    for (s, m) in mins.iter().enumerate() {
+        let (name, cubes, dim) = stage_meta(s);
+        println!("  {name:<14} cubes={cubes:>7} units={dim} min={m:?}");
+    }
     std::process::exit(0);
 }
