@@ -799,21 +799,26 @@ fn apply(
     }
 }
 
-// ── dispatch 4: resolveX — the WRAPPED items' x, thread per byte ─────────────
+// ── dispatch 4: resolveX — the WRAPPED items' x, range workers ────────────────
 //
 // SKIPPED ENTIRELY when no item folds (the driver knows): foldless items
-// resolve inside apply's chase, which holds x in a register. This kernel
-// serves the fold>0 items, whose segment re-sum genuinely needs the
-// cross-unit ordinal table apply published. The re-sum is the serial
-// left-fold order that holds the fold>0 X lanes' bit-exact tier — it is the
-// DOMINANT cost of the wrapped shape (~25ms of the ~34ms at wrap=96: every
-// leader independently re-sums its col%fold predecessors, avg ~48 adds +
-// dependent loads per leader; the old '+0.2ms' note measured it in the era
-// when per-leader global atomics masked it). Both maxima reduce here for
-// this shape (apply's are compiled out — the same RMWs cost ~8ms inside its
-// division-stalled chase and ride free here). An untouched slot flushes 0,
-// which cannot beat a real value: rows count from 1 and every x >= 0 has an
-// ordered key above 0.
+// resolve inside apply's chase, which holds x in a register.
+//
+// Each worker owns a `span`-byte range (apply's unit decomposition without
+// the tree). At the first leader of a segment it enters, the worker walks
+// BACKWARD once — at most fold dependent loads — to compute the entry x;
+// from there it sweeps FORWARD through its range: every leader's x is the
+// running sum, the same additions in the same left-fold order as the old
+// per-leader backward re-sum, so the fold>0 X lanes stay BIT-exact (the
+// check instrument witnesses that lane at bit level). Heads (col % fold ==
+// 0; line and item starts are col==0) re-zero for free. Total backward
+// work drops fold-fold (one entry walk per range, not per leader) and
+// every worker stays busy — the first draft of this kernel gave each
+// SEGMENT to its head and measured 4x WORSE (129ms vs 32): ~2% of threads
+// active on long dependent chains is latency-bound with the machine idle.
+// Both maxima reduce here (apply's are compiled out for this shape). An
+// untouched slot flushes 0, which cannot beat a real value: rows count
+// from 1 and every x >= 0 has an ordered key above 0.
 #[cube(launch_unchecked)]
 fn resolve_x(
     sm: &[f32],
@@ -828,15 +833,16 @@ fn resolve_x(
     row_max: &mut [Atomic<u32>],
     x_max: &mut [Atomic<u32>],
     #[comptime] units: usize,
+    #[comptime] span: usize,
 ) {
-    let id = ABSOLUTE_POS;
+    let t = ABSOLUTE_POS;
     let n = fl.len();
     let item_count = ir.len() / 2;
     let u = UNIT_POS as usize;
     let srow = Shared::<[Atomic<u32>]>::new_slice(RESOLVE_SLOTS);
     let sx = Shared::<[Atomic<u32>]>::new_slice(RESOLVE_SLOTS);
     let mut sbase = Shared::<u32>::new();
-    let cube_lo = CUBE_POS * units;
+    let cube_lo = CUBE_POS * units * span;
     if u == 0 {
         // The item at this cube's first byte anchors the slot numbering.
         let probe = if cube_lo < n { cube_lo } else { n - 1 };
@@ -855,40 +861,76 @@ fn resolve_x(
     sync_cube();
     let it_base = *sbase as usize;
 
-    if id < n && (fl[id] & F_LEADER) != 0 && item_count > 0 {
-        let it = item_search(ir, item_count, id);
-        let io = it * IM_STRIDE;
-        let ie_off = it * IE_STRIDE;
-        let wrap = ie[ie_off + IE_WRAP_WIDTH] as i32;
-        let fold = fold_of(ie, it, wrap);
-        if fold > 0 {
-            let col = lc[id * LC_STRIDE + LC_COL] as i32;
-            let ord = wc[id] as i32;
-            // The forward re-sum from the segment start — the serial segAdv order.
-            let mut x = 0.0f32;
-            let mut k = col % fold;
-            while k >= 1 {
-                let q = otb[ir[it * 2] as usize + (ord - k) as usize] as usize;
-                x += sm[q];
-                k -= 1;
+    let lo = t * span;
+    if lo < n {
+        let hi = if lo + span < n { lo + span } else { n };
+        // The item walk, seeded at the range start.
+        let mut it = 0usize;
+        let mut start = 0usize;
+        let mut nxt = n;
+        let mut wrap = 0i32;
+        let mut fold = 0i32;
+        let has = item_count > 0;
+        if has {
+            it = item_search(ir, item_count, lo);
+            start = ir[it * 2] as usize;
+            nxt = if it + 1 < item_count { ir[(it + 1) * 2] as usize } else { n };
+            wrap = ie[it * IE_STRIDE + IE_WRAP_WIDTH] as i32;
+            fold = fold_of(ie, it, wrap);
+        }
+        let mut x = 0.0f32;
+        let mut in_seg = false;
+        let mut id = lo;
+        while id < hi {
+            while has && nxt <= id {
+                it += 1;
+                start = ir[it * 2] as usize;
+                nxt = if it + 1 < item_count { ir[(it + 1) * 2] as usize } else { n };
+                wrap = ie[it * IE_STRIDE + IE_WRAP_WIDTH] as i32;
+                fold = fold_of(ie, it, wrap);
             }
-            let row = lc[id * LC_STRIDE + LC_ROW] as i32;
-            let seg = wrap_segment_of(col, wrap, (fl[id] & F_NEWLINE) != 0);
-            let lh = items[io + IM_LINE_HEIGHT];
-            let mo = id * LM_STRIDE;
-            let base = x + items[io + IM_ORIGIN_X];
-            lm[mo + LM_BASE_X] = base;
-            lm[mo + LM_X] = base;
-            lm[mo + LM_Y] = (row as f32) * (-lh) + items[io + IM_ORIGIN_Y];
-            lm[mo + LM_Z] = (seg as f32) * (-items[io + IM_Z_STEP]) + items[io + IM_ORIGIN_Z];
-            let slot = it - it_base;
-            if slot < RESOLVE_SLOTS {
-                srow[slot].fetch_max((row + 1) as u32);
-                sx[slot].fetch_max(ordered_key(x));
-            } else {
-                row_max[it].fetch_max((row + 1) as u32);
-                x_max[it].fetch_max(ordered_key(x));
+            let f = fl[id];
+            if (f & F_LEADER) != 0 && fold > 0 {
+                let col = lc[id * LC_STRIDE + LC_COL] as i32;
+                let head = col % fold == 0;
+                if !in_seg || head {
+                    // Entry walk (backward, once per segment entry; free at
+                    // a head where col % fold == 0 empties the loop).
+                    x = 0.0f32;
+                    let ord = wc[id] as i32;
+                    let mut k = col % fold;
+                    while k >= 1 {
+                        let q = otb[start + (ord - k) as usize] as usize;
+                        x += sm[q];
+                        k -= 1;
+                    }
+                    in_seg = true;
+                }
+                let row = lc[id * LC_STRIDE + LC_ROW] as i32;
+                let io = it * IM_STRIDE;
+                let seg = wrap_segment_of(col, wrap, (f & F_NEWLINE) != 0);
+                let lh = items[io + IM_LINE_HEIGHT];
+                let mo = id * LM_STRIDE;
+                let base = x + items[io + IM_ORIGIN_X];
+                lm[mo + LM_BASE_X] = base;
+                lm[mo + LM_X] = base;
+                lm[mo + LM_Y] = (row as f32) * (-lh) + items[io + IM_ORIGIN_Y];
+                lm[mo + LM_Z] = (seg as f32) * (-items[io + IM_Z_STEP]) + items[io + IM_ORIGIN_Z];
+                let slot = it - it_base;
+                if slot < RESOLVE_SLOTS {
+                    srow[slot].fetch_max((row + 1) as u32);
+                    sx[slot].fetch_max(ordered_key(x));
+                } else {
+                    row_max[it].fetch_max((row + 1) as u32);
+                    x_max[it].fetch_max(ordered_key(x));
+                }
+                if (f & F_NEWLINE) == 0 {
+                    // This leader's advance feeds the next x — the same add
+                    // the backward re-sum performed, one step forward.
+                    x += sm[id];
+                }
             }
+            id += 1;
         }
     }
     sync_cube();
@@ -994,6 +1036,12 @@ pub fn run(ctx: &GpuContext, fixture_path: &Path) -> ! {
     assert!(units.is_power_of_two(), "GLYPH_CHAIN_TILE must be a power of two");
     let log = units.ilog2() as usize;
     let n_tiles = n.div_ceil(units * rake).max(1);
+    // resolve_x worker span (bytes per worker; entry walks scale with
+    // worker count, sweeps with span).
+    let rspan: usize = std::env::var("GLYPH_CHAIN_SPAN")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(8);
 
     // The CPU reference — a different tree shape at the (64, 256) tuning.
     let r = run_scan_pipeline(&fx.bytes, &fx.trie, &fx.items, DEFAULT_CHUNK_SIZE, DEFAULT_GROUP_SIZE, 1);
@@ -1159,7 +1207,7 @@ pub fn run(ctx: &GpuContext, fixture_path: &Path) -> ! {
         if stages >= 4 && needs_resolve {
             resolve_x::launch_unchecked(
                 &client,
-                cubes_of(n),
+                cubes_of(n.div_ceil(rspan)),
                 CubeDim::new_1d(256),
                 BufferArg::from_raw_parts(h_sm.clone(), n),
                 BufferArg::from_raw_parts(h_fl.clone(), n),
@@ -1173,6 +1221,7 @@ pub fn run(ctx: &GpuContext, fixture_path: &Path) -> ! {
                 BufferArg::from_raw_parts(h_rmax.clone(), item_count),
                 BufferArg::from_raw_parts(h_xmax.clone(), item_count),
                 256,
+                rspan,
             );
         }
         if stages >= 5 {
@@ -1327,6 +1376,20 @@ pub fn run(ctx: &GpuContext, fixture_path: &Path) -> ! {
             if la_rel > max_line_dev {
                 max_line_dev = la_rel;
             }
+            // fold>0 X is a BIT-tier lane — the segment walk performs the
+            // same re-sum adds in the same left-fold order, and this witness
+            // holds it to that. (The eps-tier position diff below would hide
+            // an order change; this cannot.)
+            if lm[id * LM_STRIDE + LM_X].to_bits() != r.slots.x(id).to_bits() {
+                if bad < 8 {
+                    println!(
+                        "  MISMATCH byte {id} fold_x: cpu {:e} gpu {:e}",
+                        r.slots.x(id),
+                        lm[id * LM_STRIDE + LM_X]
+                    );
+                }
+                bad += 1;
+            }
         }
         for (k, acc) in [(LM_X, r.slots.x(id)), (LM_Y, r.slots.y(id)), (LM_Z, r.slots.z(id))] {
             let dev = (lm[id * LM_STRIDE + k] as f64 - acc as f64).abs();
@@ -1400,6 +1463,11 @@ pub fn bench(ctx: &GpuContext, corpus_path: &Path) -> ! {
     assert!(units.is_power_of_two(), "GLYPH_CHAIN_TILE must be a power of two");
     let log = units.ilog2() as usize;
     let n_tiles = n.div_ceil(units * rake).max(1);
+    // resolve_x worker span (bytes per worker).
+    let rspan: usize = std::env::var("GLYPH_CHAIN_SPAN")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(8);
     // The wrapped shape: fold>0 makes resolve_x take the re-sum path.
     let wrap_width: i64 = std::env::var("GLYPH_CHAIN_WRAP")
         .ok()
@@ -1555,7 +1623,7 @@ pub fn bench(ctx: &GpuContext, corpus_path: &Path) -> ! {
                     if needs_resolve {
                         resolve_x::launch_unchecked(
                             &client,
-                            cubes_of(n),
+                            cubes_of(n.div_ceil(rspan)),
                             CubeDim::new_1d(256),
                             BufferArg::from_raw_parts(h_sm.clone(), n),
                             BufferArg::from_raw_parts(h_fl.clone(), n),
@@ -1569,6 +1637,7 @@ pub fn bench(ctx: &GpuContext, corpus_path: &Path) -> ! {
                             BufferArg::from_raw_parts(h_rmax.clone(), 1),
                             BufferArg::from_raw_parts(h_xmax.clone(), 1),
                             256,
+                            rspan,
                         );
                     }
                 }
@@ -1615,6 +1684,7 @@ pub fn bench(ctx: &GpuContext, corpus_path: &Path) -> ! {
         let (cubes, dim) = match s {
             0 | 2 => (n_tiles, units as u32),
             1 => (1, units as u32),
+            3 => (n.div_ceil(rspan).div_ceil(256), 256),
             4 => (1, 1),
             _ => (n.div_ceil(256), 256),
         };
