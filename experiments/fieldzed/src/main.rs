@@ -140,6 +140,7 @@ fn main() -> anyhow::Result<()> {
             &params,
             glyph3d_native::layout_mojo::Strategy::Direct,
             false,
+            None, // folds: the offscreen frames don't carry structure (yet)
         );
         let mut staged = load.into_staged(None, &atlas.slot_ink);
         // Envelope-owned content: re-derivation (and therefore the version

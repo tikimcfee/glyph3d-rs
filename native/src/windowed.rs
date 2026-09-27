@@ -1051,6 +1051,24 @@ fn poll_live(
         (p.eye, p.yaw, p.pitch)
     });
     let t_all = Instant::now();
+    // P2a: resolve each file's LATEST structure deltas (folds) against its
+    // owned bytes — the envelope's byte ranges become normalized line
+    // ranges for the loader. Structure rides the same update as style, at
+    // the same version; the join has already vouched for the bytes.
+    let mut folds: std::collections::HashMap<String, Vec<std::ops::Range<u32>>> =
+        std::collections::HashMap::new();
+    for (rel, update) in &src.last_style {
+        if update.structure.is_empty() {
+            continue;
+        }
+        if let Some(bytes) = src.content.get(rel) {
+            let starts = crate::repo::line_starts_of(bytes);
+            let lines = crate::seam::normalized_fold_lines(&update.structure, &starts);
+            if !lines.is_empty() {
+                folds.insert(rel.clone(), lines);
+            }
+        }
+    }
     let mut files: Vec<crate::repo::RepoFile> = src
         .content
         .iter()
@@ -1065,6 +1083,7 @@ fn poll_live(
         &src.params,
         crate::layout_mojo::Strategy::Direct,
         false,
+        if folds.is_empty() { None } else { Some(&folds) },
     );
     let t_fold = t_all.elapsed();
     let t = Instant::now();

@@ -23,8 +23,8 @@ use std::time::{Duration, Instant};
 use crate::engine::Engine;
 use crate::glyph_scene::{GlyphInstance, GroupRow};
 use crate::layout::{
-    diff_backends, BackendOutput, GlyphArena, GlyphRecord, ItemParams, LayoutGlyphs, LayoutItem,
-    Paint, VerifyLayout,
+    diff_backends, BackendOutput, GlyphArena, GlyphRecord, InkExtent, ItemParams, LayoutGlyphs,
+    LayoutItem, PageExtent, Paint, VerifyLayout,
 };
 use crate::layout_mojo::{BackendPhases, MojoLayout, Strategy};
 use crate::text::{self, StagedText};
@@ -513,7 +513,7 @@ pub fn load_repo(
     let t0 = Instant::now();
     let walk = walk_repo(root);
     let walk_dur = t0.elapsed();
-    load_items(walk, walk_dur, root, trie, params, strategy, verify)
+    load_items(walk, walk_dur, root, trie, params, strategy, verify, None)
 }
 
 /// The loader proper — everything past the walk. Split so the SAME pipeline
@@ -524,6 +524,16 @@ pub fn load_repo(
 /// `load_repo`, ~0 for in-memory) so the phases instrument stays truthful.
 /// `root` is the pick-path fallback — envelope-owned scenes override it per
 /// file by injecting `PickContext::content`.
+///
+/// `folds` (P2a): per-rel_path NORMALIZED line ranges (from
+/// `seam::normalized_fold_lines`). Folded files' arena slices are rebuilt
+/// from their compacted record streams; placements, extents and slot bases
+/// are fixed in the same pass, so every consumer downstream of the
+/// placement (views, bounds, staging, slot table) sees a consistent field.
+/// KNOWN GAP, deliberate v1: the PICK path re-derives UNCOMPACTED records,
+/// so a pick on a folded file resolves rows against the unfolded stream
+/// until `PickContext` carries the fold set (queued with P2b).
+#[allow(clippy::too_many_arguments)]
 pub fn load_items(
     walk: WalkResult,
     walk_dur: Duration,
@@ -532,6 +542,7 @@ pub fn load_items(
     params: &RepoParams,
     strategy: Strategy,
     verify: bool,
+    folds: Option<&std::collections::HashMap<String, Vec<std::ops::Range<u32>>>>,
 ) -> RepoLoad {
 
     // Per-file params (pagination sized per file). Newline counts double as
@@ -585,7 +596,7 @@ pub fn load_items(
     // instances and placements only — which is the whole render-visible
     // contract, and the granularity that matters. `diff_backends` is told the
     // records are absent rather than being handed an empty slice to interpret.
-    let (placements, records) = if verify && strategy.can_record() {
+    let (mut placements, records) = if verify && strategy.can_record() {
         backend
             .layout_items_recording(&items, &mut arena)
             .expect("layout failed")
@@ -656,6 +667,94 @@ pub fn load_items(
             report.records,
             backend.name(),
             alt.name(),
+        );
+    }
+
+    let t_fold_phase = Instant::now();
+    // ── P2a: fold compaction ────────────────────────────────────────────
+    // Folded files' slices are rebuilt from their compacted record streams
+    // (records re-derived on the cached engine — the fold is a pure function
+    // of bytes, so this re-run is bit-identical to what staged the arena);
+    // the whole arena is then re-spliced with running slot bases so every
+    // item's slice stays contiguous. Unfolded files' slices pass through
+    // untouched. Runs ONLY when at least one file carries folds — the
+    // golden paths never enter this block.
+    if folds.is_some_and(|f| f.values().any(|v| !v.is_empty())) {
+        let folds = folds.unwrap();
+        let mut old = arena.into_instances();
+        let mut rebuilt: Vec<GlyphInstance> = Vec::with_capacity(old.len());
+        let mut running: u32 = 0;
+        let mut dropped_total = 0usize;
+        for (index, f) in walk.files.iter().enumerate() {
+            let placement = &mut placements[index];
+            let base = placement.slot_base as usize;
+            let count = placement.slot_count as usize;
+            let fold_lines = folds.get(&f.rel_path).filter(|v| !v.is_empty());
+            let slice = match fold_lines {
+                None => {
+                    let slice = old[base..base + count].to_vec();
+                    placement.slot_base = running;
+                    running += placement.slot_count;
+                    slice
+                }
+                Some(fold_lines) => {
+                    let item = &file_params[index];
+                    let records =
+                        rederive_cached(trie, &f.bytes, item).expect("fold: re-derive failed");
+                    let (leaders, _, _, _) =
+                        crate::text::fold_leaders(&f.bytes, item.wrap_width, item.wrap_mode);
+                    let starts = line_starts_of(&f.bytes);
+                    let lines: Vec<u32> =
+                        leaders.iter().map(|l| line_of_byte(l.0, &starts)).collect();
+                    let folded = compact_folds(&records, fold_lines, &lines);
+                    let mut slice = Vec::with_capacity(folded.records.len());
+                    for r in &folded.records {
+                        if r.glyph_id() == 0 {
+                            continue; // blank: no slot, exactly as staging skips them
+                        }
+                        slice.push(GlyphInstance {
+                            pos: [r.x(), r.y(), r.z()],
+                            glyph_id: r.glyph_id(),
+                            row: r.row(),
+                            col: r.col(),
+                            color: crate::layout::DEFAULT_COLOR_PACKED,
+                            group_id: index as u32,
+                            advance: r.advance(),
+                            height: r.height(),
+                            flags: 0,
+                            _pad: 0,
+                        });
+                    }
+                    dropped_total += folded.dropped;
+                    placement.slot_base = running;
+                    placement.slot_count = slice.len() as u32;
+                    placement.record_count = folded.records.len() as u32;
+                    placement.page = folded.page;
+                    placement.ink = folded.ink;
+                    running += placement.slot_count;
+                    println!(
+                        "fold: {} — {} line range(s), {} records dropped, {} slots remain",
+                        f.rel_path,
+                        fold_lines.len(),
+                        folded.dropped,
+                        placement.slot_count
+                    );
+                    slice
+                }
+            };
+            rebuilt.extend(slice);
+        }
+        old = rebuilt;
+        arena = GlyphArena::new();
+        arena.reserve(old.len());
+        for inst in old {
+            arena.push(inst);
+        }
+        println!(
+            "fold: {} record(s) dropped across the field; arena re-spliced to {} slots in {:?}",
+            dropped_total,
+            arena.len(),
+            t_fold_phase.elapsed()
         );
     }
 
@@ -790,6 +889,130 @@ pub fn rederive_cached(
         eng.load_item(bytes, item).expect("pick: engine re-run failed");
         Ok(eng.read_back().records)
     })
+}
+
+/// The result of folding one file's record stream: the kept records (rows
+/// renumbered, y shifted up over every fold's span), what was dropped, and
+/// the extents RECOMPUTED from the kept records — the engine's page/ink
+/// lanes are documented as max/min over records, so removing records and
+/// recomputing is exact, not approximate.
+pub struct Folded {
+    pub records: Vec<GlyphRecord>,
+    pub dropped: usize,
+    pub page: PageExtent,
+    pub ink: InkExtent,
+}
+
+/// P2a — the fold compaction, PURE: drop the records on folded lines,
+/// renumber rows, and shift everything below up by each fold's own span.
+///
+/// The shift is MEASURED from the stream, not computed from a pitch: the
+/// vertical pitch a fold occupied is `y(first folded record) − y(first kept
+/// record after the fold)`. That handles Down-mode's multi-row wrapped
+/// lines without assuming y is row-linear, and needs no ItemParams.
+/// LIMITATION (v1, deliberate): a fold whose lines contain NO records at
+/// all (only blank lines) frees pitch this cannot see — nothing shifts for
+/// it. Folding function bodies never hits this; folding blank runs does.
+///
+/// `folds` are NORMALIZED, non-overlapping, ascending LINE ranges (the
+/// output of [`crate::seam::normalized_fold_lines`]); `lines` is the line
+/// index of each record, parallel to `records` (derived from the leader
+/// walk by the caller).
+pub fn compact_folds(
+    records: &[GlyphRecord],
+    folds: &[std::ops::Range<u32>],
+    lines: &[u32],
+) -> Folded {
+    debug_assert_eq!(records.len(), lines.len(), "record/line index parallel");
+    let folded_line = |line: u32| folds.iter().any(|f| f.contains(&line));
+
+    let mut kept: Vec<GlyphRecord> = Vec::with_capacity(records.len());
+    let mut dropped = 0usize;
+    // Accumulated shift, established lazily when the stream passes OUT of a
+    // fold (the first kept record after it names the fold's own pitch).
+    let mut y_shift = 0.0f32;
+    let mut rows_hidden = 0u32;
+    let mut in_fold = false;
+    let mut fold_first_y = 0.0f32;
+    let mut fold_first_row = 0u32;
+    let mut fold_last_row = 0u32;
+
+    let mut page = PageExtent { right: 0.0, bottom: 0.0, z_min: 0.0, z_max: 0.0 };
+    let mut ink_min = [f32::INFINITY; 3];
+    let mut ink_max = [f32::NEG_INFINITY; 3];
+    let mut first_kept = true;
+
+    for (r, &line) in records.iter().zip(lines) {
+        if folded_line(line) {
+            dropped += 1;
+            if !in_fold {
+                in_fold = true;
+                fold_first_y = r.y();
+                fold_first_row = r.row();
+            }
+            fold_last_row = r.row();
+            continue;
+        }
+        if in_fold {
+            // Leaving the fold: this record's ORIGINAL y is the first kept
+            // y below it — the fold's span is what separates the two.
+            y_shift += fold_first_y - r.y();
+            rows_hidden += fold_last_row - fold_first_row + 1;
+            in_fold = false;
+        }
+        let mut r = *r;
+        if y_shift != 0.0 {
+            let [x, y, z, adv, h] = r.measures;
+            r.measures = [x, y + y_shift, z, adv, h];
+        }
+        if rows_hidden > 0 {
+            r.counts[1] = r.row() - rows_hidden;
+        }
+        kept.push(r);
+
+        // Extents over the kept stream — the engine's documented formulas.
+        page.right = page.right.max(r.x() + r.advance());
+        page.bottom = if first_kept { r.y() } else { page.bottom.min(r.y()) };
+        page.z_min = if first_kept { r.z() } else { page.z_min.min(r.z()) };
+        page.z_max = if first_kept { r.z() } else { page.z_max.max(r.z()) };
+        ink_min[0] = ink_min[0].min(r.x());
+        ink_max[0] = ink_max[0].max(r.x() + r.advance());
+        ink_min[1] = ink_min[1].min(r.y() - r.height() * 0.5);
+        ink_max[1] = ink_max[1].max(r.y() + r.height() * 0.5);
+        ink_min[2] = ink_min[2].min(r.z());
+        ink_max[2] = ink_max[2].max(r.z());
+        first_kept = false;
+    }
+    Folded {
+        records: kept,
+        dropped,
+        page,
+        ink: InkExtent { min: ink_min, max: ink_max },
+    }
+}
+
+/// Byte offsets of every line start (0, then one past each `\n`). The
+/// fold-resolving coordinate table — ascending by construction. Pub: the
+/// live loop resolves envelope folds against owned content with it.
+pub fn line_starts_of(bytes: &[u8]) -> Vec<usize> {
+    let mut starts = vec![0usize];
+    starts.extend(
+        bytes
+            .iter()
+            .enumerate()
+            .filter(|(_, &b)| b == b'\n')
+            .map(|(i, _)| i + 1),
+    );
+    starts
+}
+
+/// The line index containing `byte` (the LAST start at/before it).
+fn line_of_byte(byte: usize, line_starts: &[usize]) -> u32 {
+    match line_starts.binary_search(&byte) {
+        Ok(i) => i as u32,
+        Err(0) => 0,
+        Err(i) => (i - 1) as u32,
+    }
 }
 
 impl RepoLoad {
@@ -987,6 +1210,87 @@ impl RepoLoad {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── P2a: the fold compaction ─────────────────────────────────────────
+    // Synthetic records: one glyph per record, y = -row × 2.0 (the pitch the
+    // empirical shift must recover WITHOUT being told), x = col, z = 0.
+
+    fn rec(row: u32, col: u32) -> GlyphRecord {
+        GlyphRecord {
+            measures: [col as f32, -(row as f32) * 2.0, 0.0, 1.0, 2.0],
+            counts: [100 + row + col, row, col],
+        }
+    }
+
+    fn lines_of(rows: &[u32]) -> Vec<u32> {
+        rows.to_vec()
+    }
+
+    #[test]
+    fn fold_drops_its_records_and_shifts_the_rest_by_its_own_span() {
+        // One record per line, lines 0..5. Fold lines 1..=2 (the line range
+        // is exclusive-end: 1..3 drops the records on lines 1 AND 2; lines
+        // 3,4 shift into the freed span).
+        let records: Vec<GlyphRecord> = (0..5).map(|l| rec(l, 0)).collect();
+        let folded = compact_folds(&records, &[1..3], &lines_of(&[0, 1, 2, 3, 4]));
+        assert_eq!(folded.dropped, 2);
+        assert_eq!(folded.records.len(), 3);
+        // Shift = y(line 1) − y(line 3) = −2 − (−6) = +4: line 3's y moves
+        // from −6 to −2 — into the slot line 1 vacated.
+        assert_eq!(folded.records[1].y(), -2.0);
+        assert_eq!(folded.records[2].y(), -4.0);
+        // Rows renumber: 0,3,4 → 0,1,2.
+        assert_eq!(folded.records.iter().map(|r| r.row()).collect::<Vec<_>>(), vec![0, 1, 2]);
+        // Extents recomputed from the KEPT stream: bottom = −4 (was −8).
+        assert_eq!(folded.page.bottom, -4.0);
+        assert_eq!(folded.page.right, 1.0); // x + advance = 0 + 1
+        // Glyph identity survives untouched — folds move, never rewrite.
+        assert_eq!(folded.records[1].glyph_id(), 103);
+    }
+
+    #[test]
+    fn multiple_folds_accumulate_their_spans() {
+        let records: Vec<GlyphRecord> = (0..8).map(|l| rec(l, 0)).collect();
+        let lines = lines_of(&(0..8).collect::<Vec<_>>());
+        // Fold lines 1..2 and 5..6 (exclusive-end line ranges: 1..3, 5..7).
+        let folded = compact_folds(&records, &[1..3, 5..7], &lines);
+        assert_eq!(folded.dropped, 4);
+        // Kept: 0,3,4,7. Fold 1 spans y(1)−y(3) = 4; fold 2 spans y(5)−y(7)
+        // = 4; line 7 accumulates both (shift 8).
+        assert_eq!(folded.records[3].y(), -14.0 + 8.0);
+        assert_eq!(folded.records[3].row(), 3);
+    }
+
+    #[test]
+    fn fold_at_eof_drops_but_shifts_nothing() {
+        let records: Vec<GlyphRecord> = (0..4).map(|l| rec(l, 0)).collect();
+        let folded = compact_folds(&records, &[3..4], &lines_of(&[0, 1, 2, 3]));
+        assert_eq!(folded.dropped, 1);
+        assert_eq!(folded.records.last().unwrap().y(), -4.0); // untouched
+    }
+
+    #[test]
+    fn multi_record_lines_fold_and_shift_as_one_span() {
+        // Lines 0 (2 records), 1 (3 records), 2 (1 record).
+        let records = vec![rec(0, 0), rec(0, 1), rec(1, 0), rec(1, 1), rec(1, 2), rec(2, 0)];
+        let lines = lines_of(&[0, 0, 1, 1, 1, 2]);
+        let folded = compact_folds(&records, &[1..2], &lines);
+        assert_eq!(folded.dropped, 3);
+        assert_eq!(folded.records.len(), 3);
+        // The span is measured line-to-line: y(1)−y(2) = +2, not per record.
+        assert_eq!(folded.records[2].y(), -4.0 + 2.0);
+    }
+
+    #[test]
+    fn a_records_less_fold_is_the_documented_blind_spot() {
+        // No records on line 1 (the stream jumps 0→2): folding it frees
+        // pitch the empirical shift cannot see. Nothing drops, nothing
+        // moves — the v1 limitation, pinned so it can't silently "improve".
+        let records = vec![rec(0, 0), rec(2, 0)];
+        let folded = compact_folds(&records, &[1..2], &lines_of(&[0, 2]));
+        assert_eq!(folded.dropped, 0);
+        assert_eq!(folded.records[1].y(), -4.0);
+    }
 
     /// The seam the whole z_wrap_spacing chain hangs on: the CLI flag sets
     /// RepoParams::z_wrap_spacing, and this is the ONE place it becomes the
