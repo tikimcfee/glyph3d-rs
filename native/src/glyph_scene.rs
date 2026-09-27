@@ -1285,6 +1285,16 @@ impl GlyphScene {
         let chunk_cap = (binding_limit / std::mem::size_of::<GlyphInstance>()).max(1);
         let chunks: Vec<&[GlyphInstance]> = instances.chunks(chunk_cap).collect();
         let chunk_counts: Vec<u32> = chunks.iter().map(|c| c.len() as u32).collect();
+        // Unified-memory upload: with MAPPABLE_PRIMARY_BUFFERS on Metal the
+        // storage buffer is mapped at creation and written straight — wgpu's
+        // default path instead zero-fills a full-size staging buffer AND then
+        // memcpy's into it AND blits on the GPU timeline (measured ~2.4 s of
+        // the glyph3d-js repo load; the zero-fill alone was ~0.7 s). Metal
+        // only: discrete adapters advertise the feature too, but a
+        // host-visible storage buffer pays the saved time back in per-frame
+        // shader reads across the bus.
+        let direct_upload = ctx.profile.backend == wgpu::Backend::Metal
+            && ctx.profile.mappable_primary_buffers;
         let instance_bufs: Vec<wgpu::Buffer> = chunks
             .iter()
             .enumerate()
@@ -1294,15 +1304,62 @@ impl GlyphScene {
                 } else {
                     format!("glyph instances {i}/{}", chunks.len())
                 };
-                device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some(&label),
-                    contents: bytemuck::cast_slice(chunk),
-                    // Stage G: COPY_DST for partial per-slot edit uploads;
-                    // COPY_SRC for the GLYPH_G_DUMP verification readback.
-                    usage: wgpu::BufferUsages::STORAGE
-                        | wgpu::BufferUsages::COPY_DST
-                        | wgpu::BufferUsages::COPY_SRC,
-                })
+                // Stage G: COPY_DST for partial per-slot edit uploads;
+                // COPY_SRC for the GLYPH_G_DUMP verification readback.
+                let usage = wgpu::BufferUsages::STORAGE
+                    | wgpu::BufferUsages::COPY_DST
+                    | wgpu::BufferUsages::COPY_SRC;
+                let bytes: &[u8] = bytemuck::cast_slice(chunk);
+                if direct_upload {
+                    let buf = device.create_buffer(&wgpu::BufferDescriptor {
+                        label: Some(&label),
+                        size: bytes.len() as u64,
+                        usage: usage | wgpu::BufferUsages::MAP_WRITE,
+                        mapped_at_creation: true,
+                    });
+                    // The copy IS the first touch of the buffer's pages — a
+                    // serial memcpy here measured ~2 s of the repo load behind
+                    // page faults. Shard it: each worker maps its own disjoint
+                    // range (WriteOnly<[u8]> is deliberately !Send upstream, so
+                    // the split happens at the BufferSlice level) and faults it
+                    // in in parallel. Small buffers stay serial (thread spawn
+                    // would cost more than the copy).
+                    const PARALLEL_COPY_THRESHOLD: usize = 16 << 20;
+                    if bytes.len() >= PARALLEL_COPY_THRESHOLD {
+                        let workers = std::thread::available_parallelism()
+                            .map(|n| n.get())
+                            .unwrap_or(1)
+                            .min(8);
+                        // Range mapping wants 8-aligned offsets; 48 keeps the
+                        // split on instance boundaries too.
+                        let span = bytes.len().div_ceil(workers).next_multiple_of(48);
+                        std::thread::scope(|s| {
+                            for (i, src) in bytes.chunks(span).enumerate() {
+                                let start = (i * span) as u64;
+                                let end = start + src.len() as u64;
+                                let buf_ref = &buf;
+                                s.spawn(move || {
+                                    buf_ref
+                                        .get_mapped_range_mut(start..end)
+                                        .expect("mapped_at_creation buffer must map")
+                                        .copy_from_slice(src);
+                                });
+                            }
+                        });
+                    } else {
+                        buf.get_mapped_range_mut(..)
+                            .expect("mapped_at_creation buffer must map")
+                            .copy_from_slice(bytes);
+                    }
+                    buf.unmap();
+                    buf
+                } else {
+                    device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                        label: Some(&label),
+                        contents: bytes,
+                        usage,
+                    })
+                }
             })
             .collect();
         let group_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {

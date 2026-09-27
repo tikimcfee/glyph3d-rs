@@ -163,6 +163,12 @@ pub struct GpuProfile {
     pub target_arch: &'static str,
     pub multi_draw_indirect_count: bool,
     pub timestamp_query: bool,
+    /// MAP_WRITE on storage-class buffers (unified-memory direct upload). On
+    /// Metal this is strictly a win (shared storage IS the same DRAM the GPU
+    /// reads); on discrete adapters wgpu still advertises it but a host-visible
+    /// storage buffer trades the one fast upload for slower per-frame shader
+    /// reads, so the upload path reads `backend` as well, not just this flag.
+    pub mappable_primary_buffers: bool,
     pub max_storage_buffer_binding_size: u64,
     pub max_buffer_size: u64,
 }
@@ -184,6 +190,7 @@ impl GpuProfile {
             target_arch: std::env::consts::ARCH,
             multi_draw_indirect_count: feats.contains(wgpu::Features::MULTI_DRAW_INDIRECT_COUNT),
             timestamp_query: feats.contains(wgpu::Features::TIMESTAMP_QUERY),
+            mappable_primary_buffers: feats.contains(wgpu::Features::MAPPABLE_PRIMARY_BUFFERS),
             max_storage_buffer_binding_size: lim.max_storage_buffer_binding_size,
             max_buffer_size: lim.max_buffer_size,
         }
@@ -321,6 +328,7 @@ impl GpuProfile {
             target_arch: "test",
             multi_draw_indirect_count: false,
             timestamp_query: false,
+            mappable_primary_buffers: false,
             max_storage_buffer_binding_size: 0,
             max_buffer_size: 0,
         }
@@ -485,6 +493,13 @@ pub async fn init(compatible_surface: Option<&wgpu::Surface<'_>>) -> GpuContext 
         } else {
             log::warn!("profiling unavailable: no TIMESTAMP_QUERY (running unprofiled)");
         }
+    }
+    // MAP_WRITE on storage buffers lets the instance upload write the device
+    // buffer directly instead of wgpu's zero-fill-then-stage-then-blit path
+    // (~22% of the repo-load profile). Requested wherever the adapter offers
+    // it; the upload path still picks by backend (see GpuProfile's flag).
+    if adapter_features.contains(wgpu::Features::MAPPABLE_PRIMARY_BUFFERS) {
+        required_features |= wgpu::Features::MAPPABLE_PRIMARY_BUFFERS;
     }
 
     let (device, queue) = adapter
