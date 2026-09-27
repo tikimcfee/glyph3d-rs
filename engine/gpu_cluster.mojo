@@ -1,6 +1,7 @@
 # gpu_cluster.mojo — the sequence pass on real GPU threads: probe + chain.
 #
-# The two dispatches live in cluster_device.mojo (shared with gpu_pipeline):
+# The two dispatches live in cluster_probe.mojo / cluster_chain.mojo (shared
+# with gpu_pipeline):
 #
 #   k_cluster_probe — one thread per byte. Leaders of cluster items decode
 #       their codepoint, zero the invisible-by-design ranges in place, gate
@@ -30,11 +31,12 @@ from glyph_pipeline import (
 from fixture_io import load_pipe_fixture
 
 comptime MAX_PRINTED = 8
-# The kernels and their key-buffer cap moved to cluster_device.mojo, shared
-# with gpu_pipeline.mojo — one definition so the harnesses can't drift the rule.
-from cluster_device import (
-    KEY_CAP, HEAD_BMP_WORDS, build_head_bitmap, k_cluster_probe, k_cluster_chain,
-)
+# The kernels and their key-buffer cap live in cluster_probe.mojo /
+# cluster_chain.mojo / cluster_tables.mojo, shared with gpu_pipeline.mojo —
+# one definition so the harnesses can't drift the rule.
+from cluster_tables import KEY_CAP, HEAD_BMP_WORDS, build_head_bitmap
+from cluster_probe import k_cluster_probe
+from cluster_chain import k_cluster_chain
 
 
 

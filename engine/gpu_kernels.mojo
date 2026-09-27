@@ -86,6 +86,7 @@ struct ItemWalk:
 
 
 
+# ── dispatch 2: chunkReduce — thread per chunk ──────────────────────────────
 def k_chunk_reduce(
     fl: MutPointer[UInt32, MutAnyOrigin], sm: MutPointer[Float32, MutAnyOrigin],
     ir: MutPointer[UInt32, MutAnyOrigin], ie: MutPointer[UInt32, MutAnyOrigin],

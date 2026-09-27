@@ -30,8 +30,8 @@
 # The monoid lives in one place (gpu_monoid.mojo's `E` + `combine`) and every
 # scan dispatch calls it, so the kernels cannot drift from each other the way
 # transcriptions would; the chain's kernels live beside it in
-# gpu_kernels.mojo. The device cluster kernels are cluster_device.mojo's,
-# shared with gpu_cluster's standalone proof.
+# gpu_kernels.mojo. The device cluster kernels are cluster_probe.mojo's and
+# cluster_chain.mojo's, shared with gpu_cluster's standalone proof.
 #
 # Run: mojo run -I engine engine/gpu_pipeline.mojo engine/fixtures/*.pipe.bin
 
@@ -62,11 +62,15 @@ from glyph_wrap import WRAP_DOWN, WRAP_BACK
 
 
 from glyph_scan import run_scan_pipeline
-from cluster_device import (
-    k_cluster_probe, k_cluster_chain, k_decode_probe,
-    k_chain_free, k_chain_sb_free, k_chain_sb_stitch, k_chain_sb_apply, k_chain_commit, k_chain_sb_cascade,
+from cluster_tables import (
     build_head_bitmap, build_state_table, HEAD_BMP_WORDS, ST_STRIDE,
-    BLOCK, BLOCK_LOG2, CLIST_CAP, CLIST_STRIDE, SB_BLOCKS,
+    BLOCK, BLOCK_LOG2,
+)
+from cluster_probe import k_cluster_probe, k_decode_probe
+from cluster_chain import (
+    k_cluster_chain,
+    k_chain_free, k_chain_sb_free, k_chain_sb_stitch, k_chain_sb_apply, k_chain_commit, k_chain_sb_cascade,
+    CLIST_CAP, CLIST_STRIDE, SB_BLOCKS,
 )
 from fixture_io import load_pipe_fixture, PipeFixture, load_trie_blob
 from glyph_pipeline import Item
@@ -81,9 +85,6 @@ comptime MAX_PRINTED = 8
 comptime EPS = 1e-4
 
 
-
-
-# ── dispatch 2: chunkReduce — thread per chunk ──────────────────────────────
 def rel_close(a: Float64, b: Float64) -> Bool:
     var d = a - b
     if d < 0:
