@@ -1,5 +1,10 @@
 # glyph_pipeline.mojo — the byte-in glyph pipeline, ported to Mojo.
 #
+# Split 2026-09 (the code-shape refactor): the trie lives in glyph_trie.mojo
+# and the wrap rules in glyph_wrap.mojo; this file re-imports both, so every
+# `from glyph_pipeline import ...` elsewhere keeps resolving (the sweep to
+# direct paths is its own change).
+#
 # The FOURTH layer of the pipeline contract (oracle → scan spec → TSL → this):
 # a native transcription of glyphPipelineReference.js, the semantic oracle. It is
 # required to reproduce the oracle's answers BIT-FOR-BIT — including its float
@@ -43,6 +48,16 @@ from glyph_schema import (
 )
 from glyph_cluster import resolve_clusters
 from cluster_split import probe_clusters, chain_clusters
+from glyph_trie import (
+    Trie, trie_lookup_entry,
+    BLOCK_SHIFT, BLOCK_MASK, MAX_CODEPOINT,
+    TM_STRIDE, TM_ADVANCE, TM_HEIGHT,
+    TC_STRIDE, TC_GLYPH_ID, TC_FLAGS, FLAG_MISSING,
+)
+from glyph_wrap import (
+    WRAP_DOWN, WRAP_BACK,
+    rows_for_line, wrap_segment_of, wrap_row_of,
+)
 
 # ── Lane layout: GENERATED, six arrays, split twice ─────────────────────────
 # Who WRITES a lane decides where it lives; who READS it decides whether it
@@ -62,96 +77,9 @@ comptime F_CLUSTER_TRAILER = 16
 
 comptime NEWLINE = 0x0A
 
-# ── Trie (GlyphTrie.js) ─────────────────────────────────────────────────────
-comptime BLOCK_SHIFT = 8
-# The last Unicode scalar. A lenient decoder can exceed it; see the
-# out-of-range branch in decode_and_resolve for the contract.
-comptime MAX_CODEPOINT = 0x10FFFF
-comptime BLOCK_MASK = 255
-# The trie's OWN container, split by carrier like everything downstream of it
-# (2026-08-31, the GLYPH_ID settlement): two genuine measures in f32, an
-# identity and a bitfield in u32. The upstream JS trie moved first (50fd6b8,
-# one Uint32Array with measures bitcast); this port realizes the same kinds as
-# two homogeneous arrays because its house rule is no bitcasts anywhere.
-comptime TM_STRIDE = 2
-comptime TM_ADVANCE = 0
-comptime TM_HEIGHT = 1
-comptime TC_STRIDE = 2
-comptime TC_GLYPH_ID = 0
-comptime TC_FLAGS = 1
-comptime FLAG_MISSING = 1
 
 comptime F64_INF = inf[DType.float64]()
 
-
-struct Trie(Copyable, Movable):
-    var block_index: List[UInt32]
-    var blocks_m: List[Float32]  # TM_STRIDE per entry: ADVANCE, HEIGHT
-    var blocks_c: List[UInt32]   # TC_STRIDE per entry: GLYPH_ID, FLAGS
-    # The sequence pass (v2 trie blobs): the sequence section's raw words
-    # ([slot, len, cps..] x sequenceCount, sorted by sequence) and the G3CC
-    # class table VERBATIM (its own header included). Empty for v1 blobs and
-    # every fixture trie — cluster resolution treats empty as "no sequences",
-    # which is exactly the leader behavior. The lookup logic lives in
-    # glyph_cluster.mojo; these are just the carried bytes.
-    var seq: List[UInt32]
-    var classes: List[UInt32]
-    # The sequence entry stride is 2 + seq_max; seq_max is 0 when seq is empty.
-    var seq_max: Int
-    # The advance a resolved cluster head carries (the bitmap 2x cell, in this
-    # trie's world units). Meaningful only when seq is non-empty; 0 reads as
-    # "no sequences" because the pass early-returns on an empty table.
-    var bitmap_advance: Float32
-
-    def __init__(
-        out self, var block_index: List[UInt32],
-        var blocks_m: List[Float32], var blocks_c: List[UInt32],
-        var seq: List[UInt32], var classes: List[UInt32],
-    ):
-        self.block_index = block_index^
-        self.blocks_m = blocks_m^
-        self.blocks_c = blocks_c^
-        self.seq = seq^
-        self.classes = classes^
-        self.seq_max = 0
-        self.bitmap_advance = Float32(0)
-
-    def advance_at(self, entry: Int) -> Float32:
-        return self.blocks_m[entry * TM_STRIDE + TM_ADVANCE]
-
-    def height_at(self, entry: Int) -> Float32:
-        return self.blocks_m[entry * TM_STRIDE + TM_HEIGHT]
-
-    def glyph_id_at(self, entry: Int) -> UInt32:
-        return self.blocks_c[entry * TC_STRIDE + TC_GLYPH_ID]
-
-    def flags_at(self, entry: Int) -> Int:
-        return Int(self.blocks_c[entry * TC_STRIDE + TC_FLAGS])
-
-
-# ── THE WRAP MODES ───────────────────────────────────────────────────────────
-# An ITEM-LEVEL parameter, never per line and never per range.
-#
-#   WRAP_DOWN  a wrap advances the visual ROW. A line of n cells occupies
-#              ceil(n / wrap) rows. The original behaviour and the default.
-#   WRAP_BACK  a wrap does NOT advance the row. Every wrap segment of a line
-#              shares ONE row and the segments stack in DEPTH, each z_step
-#              further back, so a line's row is just its line index.
-#
-# `col` still counts within the LOGICAL line in both modes, `seg_adv` still
-# resets at every fold boundary (each segment starts at x = 0), and the wrap
-# SEGMENT index still exists in both — under WRAP_BACK it feeds z and no longer
-# feeds row. Picking by (row, col) still resolves uniquely because col differs
-# between segments.
-#
-# WHY IT MUST STAY ITEM-LEVEL: glyph_bake.scan_combine's junction term evaluates
-# rows_for_line with `b`'s parameters, so it is not associative across a change of
-# them. Mode joins wrap in that term, which makes the non-associative surface
-# WIDER, not narrower. What keeps the scan form safe is structural and unchanged:
-# an item boundary emits a resetting leaf, so no interval without a reset spans two
-# items.
-comptime WRAP_DOWN: Int = 0
-comptime WRAP_BACK: Int = 1
 
 # THE CLUSTER MODES — an ITEM-LEVEL parameter, exactly like the wrap mode.
 # CLUSTER_LEADER (0): one glyph per UTF-8 leader (the corpus's pinned behavior).
@@ -622,14 +550,6 @@ def decode_codepoint_at[o: ImmOrigin](bytes: Span[UInt8, o], id: Int, n: Int) ->
     return ((b0 & 0x07) << 18) | ((b1 & 0x3F) << 12) | ((b2 & 0x3F) << 6) | (b3 & 0x3F)
 
 
-def trie_lookup_entry(trie: Trie, cp: Int) -> Int:
-    """The exact two-load sequence the shader runs; returns the ENTRY INDEX
-    (stride-free — callers go through the Trie accessors per carrier)."""
-    # Same out-of-range contract as the hot path in decode_and_resolve.
-    var block = Int(trie.block_index[cp >> BLOCK_SHIFT]) if cp <= MAX_CODEPOINT else 0
-    return (block << BLOCK_SHIFT) | (cp & BLOCK_MASK)
-
-
 def decode_and_resolve[o: ImmOrigin](
     bytes: Span[UInt8, o],
     slots: Slots,
@@ -772,63 +692,6 @@ def item_search_device(
         else:
             hi = mid - 1
     return lo
-
-
-def rows_for_line(length: Int, wrap: Int, mode: Int = WRAP_DOWN) -> Int:
-    """Visual rows a line of `length` cells occupies under `wrap` and `mode`.
-
-    Under WRAP_DOWN a CEILING with a floor of one, since an empty line still
-    occupies the row it sits on. Under WRAP_BACK it is ONE for every line, whatever
-    the length — that identity IS the mode: the folds go into depth, and depth
-    costs no rows.
-
-    THE PHANTOM ROW (corrected 2026-09-04). The WrapDown rule was `length // wrap
-    + 1`, which counts the row the terminating newline rides on. The newline rides
-    at column `length`, so when `wrap` divides `length` that column rolled onto a
-    fresh row holding nothing else: the line claimed a blank row and every later
-    line moved down one. The two rules agree at every other length, which is why
-    the defect was invisible except at exact multiples."""
-    if mode == WRAP_BACK:
-        return 1
-    if wrap <= 0 or length <= 0:
-        return 1
-    return (length - 1) // wrap + 1
-
-
-def wrap_segment_of(col: Int, wrap: Int, terminator: Bool) -> Int:
-    """The WRAP SEGMENT index of a cell at column `col` — how many times its line
-    has already folded before reaching it. MODE-FREE: this is the DEPTH fan's index
-    and it exists in both modes; only its contribution to the ROW is a mode
-    question (wrap_row_of).
-
-    An ordinary glyph at column `col` sits in segment `col // wrap`. A NEWLINE is a
-    terminator riding at one-past-the-last cell (`col` == the line's glyph count),
-    so at an exact multiple `col // wrap` would roll it into a segment that holds
-    nothing else; it belongs to the last segment its line reaches.
-
-    Every consumer of (col, wrap) -> segment goes through here. Deriving both cases
-    from one expression is what let the terminator open a phantom row."""
-    if wrap <= 0:
-        return 0
-    if terminator:
-        # `rows_for_line(col, wrap, WRAP_DOWN) - 1`, written out so the segment
-        # index cannot pick up a mode through the helper it used to borrow.
-        if col <= 0:
-            return 0
-        return (col - 1) // wrap
-    return col // wrap
-
-
-def wrap_row_of(col: Int, wrap: Int, terminator: Bool, mode: Int = WRAP_DOWN) -> Int:
-    """The LINE-LOCAL ROW CONTRIBUTION of a cell at column `col`.
-
-    WRAP_DOWN delegates to wrap_segment_of — which is the whole of the default's
-    proof: mode A's row IS the segment index, byte for byte, as it was before modes
-    existed. WRAP_BACK contributes ZERO, because a wrap does not advance the row at
-    all in that mode; it steps in z instead."""
-    if mode == WRAP_BACK:
-        return 0
-    return wrap_segment_of(col, wrap, terminator)
 
 
 def layout_item[ko: Origin[mut=True], witness: Bool = True](
