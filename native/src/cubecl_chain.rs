@@ -1,20 +1,43 @@
-//! CubeCL scan skeleton — dev-only (`--cubecl-chain-check`), the note-16 phase 2.
+//! CubeCL scan chain — dev-only (`--cubecl-chain-check`), the standard
+//! parallel structure.
 //!
-//! The full raking scan as CubeCL kernels over the shared device:
+//!   tileScan (rake + workgroup Blelloch) -> spineScan (one cube)
+//!                -> apply (rake + Blelloch + chase) -> resolveX
+//!                -> deriveStride -> paginate
 //!
-//!   chunkReduce -> spineReduce -> spineScan -> partialScan
-//!                -> apply -> resolveX -> deriveStride -> paginate
+//! The note-16 phase-2 skeleton transcribed the Mojo device chain
+//! line-for-line — thread-per-chunk serial 64-byte folds, a single-thread
+//! spine — which proved the monoid but measured transcription quality, not
+//! the algorithm. This is the textbook hierarchical scan instead: each cube
+//! owns a `units x rake`-byte tile; every unit rakes its `rake` bytes into
+//! one monoid element; a workgroup Blelloch scan over the per-unit partials
+//! (shared memory, `sync_cube` between rounds) produces exclusive prefixes;
+//! the spine is one cube doing the same over tile totals; `apply` re-rakes
+//! and chases its bytes seeded with (global tile prefix + own micro prefix).
+//! The CPU reference stays `scan.rs::run_scan_pipeline` — a DIFFERENT tree
+//! shape at a different tuning, so agreement is associativity checked in
+//! situ, the same evidence pattern as scan.rs's own chunk-sweep tests.
 //!
-//! Every kernel is a line-for-line transcription of the Mojo device chain
-//! (`engine/gpu_kernels.mojo` / `gpu_monoid.mojo`), which is itself a
-//! line-for-line mirror of `scan.rs` — and the CPU reference here is
-//! `scan.rs::run_scan_pipeline` at the same (64, 256) tuning, so the
-//! validation chain stays fixtures -> Rust CPU -> Rust GPU with no Mojo in
-//! the loop. Count lanes (lc/wc, otb) diff BIT-EXACT; the f32 line-advance
-//! diffs bit-exact too (same grouping, same add order); positions (lm)
-//! report max deviation against the f64-narrowed CPU lanes (device f32
-//! arithmetic, InstCombinePass included — the phase-0 measurement said ≤1
-//! ulp, and this is where that shows up in situ).
+//! Precision contract, deliberately restated for this structure: integer
+//! lanes (lc/wc/otb) diff BIT-EXACT — the monoid's count lanes are exact and
+//! any order-preserving association agrees. `tail_adv` is f32-per-add and the
+//! Blelloch tree REASSOCIATES those adds within a tile, so line_advance
+//! leaves bit-parity with scan.rs and lands in the ORACLE's existing 1e-4
+//! eps tier (scan-vs-serial-fold was already eps there — only this
+//! instrument's same-tuning bit check is loosened, max deviation reported).
+//! The fold>0 X lanes stay bit-exact: resolve_x still re-sums each wrap
+//! segment serially, in the same left-fold order as the serial recurrence.
+//!
+//! Two tree-specific invariants, both load-bearing:
+//! - PAD elements (tail units of the last tile, empty spine blocks) carry the
+//!   wrap/mode in force at their position, NOT pure identity — combine copies
+//!   wrap/mode off its RIGHT operand unconditionally, and a zero-wrap pad at
+//!   the end of a tile would clobber the tile total's wrap and mis-junction
+//!   every later combine that reads it.
+//! - The exclusive prefix at the tree root is seeded with pure identity; that
+//!   is safe because a prefix element's OWN wrap/mode lanes are never read —
+//!   combine only reads them off the right operand, which is always a real
+//!   leaf or a real-derived element on every path that matters.
 
 use std::path::Path;
 
@@ -35,7 +58,9 @@ const P_HEAD_LEN: usize = 4;
 const P_TAIL_LEN: usize = 5;
 const P_WRAP: usize = 6;
 const P_MODE: usize = 7;
-const SM_STRIDE: usize = 2;
+/// The scan's measure static is ADVANCE ONLY. Height is renderer statics the
+/// scan never reads; carrying it here doubled the per-byte measure traffic.
+const SM_STRIDE: usize = 1;
 const SM_ADVANCE: usize = 0;
 const LM_STRIDE: usize = 4;
 const LM_X: usize = 0;
@@ -258,41 +283,90 @@ fn key_to_float(k: u32) -> f32 {
     f32::from_bits(b)
 }
 
-// ── dispatch 2: chunkReduce — thread per chunk ───────────────────────────────
+/// Load a monoid element from the shared tile arrays (the pc lane layout, i32).
+#[cube]
+fn s_load(sc: &[i32], sf: &[f32], i: usize) -> ChainElem {
+    let o = i * PARTIAL_COUNT_STRIDE;
+    ChainElem {
+        reset: sc[o + P_RESET],
+        nl: sc[o + P_NL],
+        glyphs: sc[o + P_GLYPHS],
+        rows: sc[o + P_ROWS],
+        head_len: sc[o + P_HEAD_LEN],
+        tail_len: sc[o + P_TAIL_LEN],
+        wrap: sc[o + P_WRAP],
+        mode: sc[o + P_MODE],
+        tail_adv: sf[i],
+    }
+}
+
+/// Store a monoid element into the shared tile arrays.
+#[cube]
+fn s_store(sc: &mut [i32], sf: &mut [f32], i: usize, e: &ChainElem) {
+    let o = i * PARTIAL_COUNT_STRIDE;
+    sc[o + P_RESET] = e.reset;
+    sc[o + P_NL] = e.nl;
+    sc[o + P_GLYPHS] = e.glyphs;
+    sc[o + P_ROWS] = e.rows;
+    sc[o + P_HEAD_LEN] = e.head_len;
+    sc[o + P_TAIL_LEN] = e.tail_len;
+    sc[o + P_WRAP] = e.wrap;
+    sc[o + P_MODE] = e.mode;
+    sf[i] = e.tail_adv;
+}
+
+// ── dispatch 1: tileScan — one cube per tile; rake + workgroup Blelloch ──────
+//
+// Each unit rakes its `rake` bytes into one monoid element (a serial,
+// order-preserving micro-fold); the cube Blelloch-scans the `units` partials
+// in shared memory into exclusive micro prefixes; unit units-1 publishes the
+// tile total. The critical path per tile is rake + 2·log(units) combines —
+// against the old thread-per-chunk serial fold's one-thread `chunk`-deep
+// chain with units-fold less parallelism.
 #[cube(launch_unchecked)]
-fn chunk_reduce(
+fn tile_scan(
     fl: &[u32],
     sm: &[f32],
     ir: &[u32],
     ie: &[u32],
-    pc: &mut [u32],
-    pm: &mut [f32],
-    #[comptime] chunk: usize,
+    tc: &mut [u32],
+    tm: &mut [f32],
+    #[comptime] units: usize,
+    #[comptime] rake: usize,
+    #[comptime] log: usize,
 ) {
-    let c = ABSOLUTE_POS;
+    let tile = CUBE_POS;
+    let u = UNIT_POS as usize;
     let n = fl.len();
     let item_count = ir.len() / 2;
-    let lo = c * chunk;
+    let lo = tile * (units * rake) + u * rake;
+    let hi = if lo + rake < n { lo + rake } else { n };
+    // ItemWalk seed. For pad units (lo >= n) the seed clamps to the last byte
+    // so the pad element carries the wrap/mode in force at the tile's end —
+    // see the module header for why a pure-identity pad would poison the
+    // tile total's wrap lanes. (n == 0 makes the clamp wrap; the seed then
+    // feeds only an unused walk, and every ir/ie read stays in bounds.)
+    let mut seed = lo;
+    if seed >= n {
+        seed = n - 1;
+    }
+    let mut it = 0usize;
+    let mut start = 0usize;
+    let mut nxt = n;
+    let mut w_wrap = 0i32;
+    let mut w_mode = 0i32;
+    let has = item_count > 0;
+    if has {
+        it = item_search(ir, item_count, seed);
+        start = ir[it * 2] as usize;
+        nxt = if it + 1 < item_count { ir[(it + 1) * 2] as usize } else { n };
+        w_wrap = ie[it * IE_STRIDE + IE_WRAP_WIDTH] as i32;
+        w_mode = ie[it * IE_STRIDE + IE_WRAP_MODE] as i32;
+    }
+    let mut acc = identity();
     if lo < n {
-        let hi = if lo + chunk < n { lo + chunk } else { n };
-        // ItemWalk seed.
-        let mut it = 0usize;
-        let mut start = 0usize;
-        let mut nxt = n;
-        let mut w_wrap = 0i32;
-        let mut w_mode = 0i32;
-        let has = item_count > 0;
-        if has {
-            it = item_search(ir, item_count, lo);
-            start = ir[it * 2] as usize;
-            nxt = if it + 1 < item_count { ir[(it + 1) * 2] as usize } else { n };
-            w_wrap = ie[it * IE_STRIDE + IE_WRAP_WIDTH] as i32;
-            w_mode = ie[it * IE_STRIDE + IE_WRAP_MODE] as i32;
-        }
-        let mut acc = identity();
         let mut id = lo;
         while id < hi {
-            // ItemWalk step.
             while has && nxt <= id {
                 it += 1;
                 start = ir[it * 2] as usize;
@@ -305,69 +379,151 @@ fn chunk_reduce(
             combine(&mut acc, &leaf);
             id += 1;
         }
-        p_store(pc, pm, c, &acc);
+    } else {
+        acc.wrap = w_wrap;
+        acc.mode = w_mode;
     }
-}
 
-// ── dispatch 3: spineReduce — thread per group ───────────────────────────────
-#[cube(launch_unchecked)]
-fn spine_reduce(pc: &[u32], pm: &[f32], uc: &mut [u32], um: &mut [f32], #[comptime] group: usize) {
-    let sg = ABSOLUTE_POS;
-    let n_chunks = pc.len() / PARTIAL_COUNT_STRIDE;
-    let first = sg * group;
-    if first < n_chunks {
-        let last = if first + group < n_chunks { first + group } else { n_chunks };
-        let mut acc = identity();
-        for c in first..last {
-            let e = p_load(pc, pm, c);
-            combine(&mut acc, &e);
-        }
-        p_store(uc, um, sg, &acc);
-    }
-}
+    let mut sc = Shared::<[i32]>::new_slice(units * PARTIAL_COUNT_STRIDE);
+    let mut sf = Shared::<[f32]>::new_slice(units);
+    s_store(&mut sc, &mut sf, u, &acc);
 
-// ── dispatch 4: spineScan — ONE thread, exclusive scan of the supers ─────────
-#[cube(launch_unchecked)]
-fn spine_scan(uc: &[u32], um: &[f32], fc: &mut [u32], fm: &mut [f32]) {
-    if ABSOLUTE_POS == 0 {
-        let n_supers = uc.len() / PARTIAL_COUNT_STRIDE;
-        let mut acc = identity();
-        for sg in 0..n_supers {
-            p_store(fc, fm, sg, &acc); // exclusive: store BEFORE combining
-            let e = p_load(uc, um, sg);
-            combine(&mut acc, &e);
+    // Up-sweep: x[u] = combine(x[u-s], x[u]) at the ends of 2s-blocks. The
+    // LEFT operand is the lower element — the fold order.
+    #[unroll]
+    for d in 0..log {
+        sync_cube();
+        let s = 1usize << d;
+        if (u + 1) & (2 * s - 1) == 0 {
+            let mut a = s_load(&sc, &sf, u - s);
+            let b = s_load(&sc, &sf, u);
+            combine(&mut a, &b);
+            s_store(&mut sc, &mut sf, u, &a);
         }
     }
+    // Exclusive: hold the total in a register (it publishes below), then seed
+    // the root with identity.
+    sync_cube();
+    if u == units - 1 {
+        let total = s_load(&sc, &sf, u);
+        p_store(tc, tm, tile, &total);
+        let e = identity();
+        s_store(&mut sc, &mut sf, u, &e);
+    }
+    // Down-sweep — NON-COMMUTATIVE form, derived and unit-tested by hand on
+    // n=8: t = x[u]; x[u] = combine(x[u], x[u-s]); x[u-s] = t. The carried
+    // prefix is the LEFT operand and the left child's TOTAL the right; the
+    // commutative textbook form (combine(x[u-s], x[u])) silently scrambles
+    // reset/head/tail lanes.
+    #[unroll]
+    for d in 0..log {
+        sync_cube();
+        let s = units >> (d + 1);
+        if (u + 1) & (2 * s - 1) == 0 {
+            let t = s_load(&sc, &sf, u);
+            let mut a = s_load(&sc, &sf, u);
+            let b = s_load(&sc, &sf, u - s);
+            combine(&mut a, &b);
+            s_store(&mut sc, &mut sf, u, &a);
+            s_store(&mut sc, &mut sf, u - s, &t);
+        }
+    }
+    sync_cube();
 }
 
-// ── dispatch 5: partialScan — thread per group ───────────────────────────────
+// ── dispatch 2: spineScan — ONE cube over the tile totals ────────────────────
+//
+// Each unit owns a CONTIGUOUS block of tile totals (order-preserving for the
+// non-commutative monoid — a strided rake would interleave blocks across
+// units and the workgroup scan could not recompose them), rakes them into
+// one partial, the cube Blelloch-scans the units, then each unit chases its
+// block writing global exclusive tile prefixes. One cube handles
+// units·(tiles/units) tiles by raking deeper; the scaling path beyond that
+// is a second spine level, not built yet.
 #[cube(launch_unchecked)]
-fn partial_scan(
-    pc: &[u32],
-    pm: &[f32],
-    fc: &[u32],
-    fm: &[f32],
+fn spine_scan(
+    tc: &[u32],
+    tm: &[f32],
     xc: &mut [u32],
     xm: &mut [f32],
-    #[comptime] group: usize,
+    #[comptime] units: usize,
+    #[comptime] log: usize,
 ) {
-    let sg = ABSOLUTE_POS;
-    let n_chunks = pc.len() / PARTIAL_COUNT_STRIDE;
-    let first = sg * group;
-    if first < n_chunks {
-        let last = if first + group < n_chunks { first + group } else { n_chunks };
-        let mut acc = p_load(fc, fm, sg);
-        for c in first..last {
-            p_store(xc, xm, c, &acc); // exclusive: store BEFORE combining
-            let e = p_load(pc, pm, c);
+    let u = UNIT_POS as usize;
+    let n_tiles = tc.len() / PARTIAL_COUNT_STRIDE;
+    let per = n_tiles.div_ceil(units);
+    let first = u * per;
+    let last = if first + per < n_tiles { first + per } else { n_tiles };
+    let mut acc = identity();
+    if first < n_tiles {
+        for t in first..last {
+            let e = p_load(tc, tm, t);
             combine(&mut acc, &e);
+        }
+    } else {
+        // Pad: identity counts, the LAST tile's wrap/mode — see module header.
+        let o = (n_tiles - 1) * PARTIAL_COUNT_STRIDE;
+        acc.wrap = tc[o + P_WRAP] as i32;
+        acc.mode = tc[o + P_MODE] as i32;
+    }
+
+    let mut sc = Shared::<[i32]>::new_slice(units * PARTIAL_COUNT_STRIDE);
+    let mut sf = Shared::<[f32]>::new_slice(units);
+    s_store(&mut sc, &mut sf, u, &acc);
+
+    #[unroll]
+    for d in 0..log {
+        sync_cube();
+        let s = 1usize << d;
+        if (u + 1) & (2 * s - 1) == 0 {
+            let mut a = s_load(&sc, &sf, u - s);
+            let b = s_load(&sc, &sf, u);
+            combine(&mut a, &b);
+            s_store(&mut sc, &mut sf, u, &a);
+        }
+    }
+    sync_cube();
+    if u == units - 1 {
+        let e = identity();
+        s_store(&mut sc, &mut sf, u, &e);
+    }
+    #[unroll]
+    for d in 0..log {
+        sync_cube();
+        let s = units >> (d + 1);
+        if (u + 1) & (2 * s - 1) == 0 {
+            let t = s_load(&sc, &sf, u);
+            let mut a = s_load(&sc, &sf, u);
+            let b = s_load(&sc, &sf, u - s);
+            combine(&mut a, &b);
+            s_store(&mut sc, &mut sf, u, &a);
+            s_store(&mut sc, &mut sf, u - s, &t);
+        }
+    }
+    sync_cube();
+
+    // Chase: this unit's block of tiles gets its global exclusive prefixes.
+    let mut pre = s_load(&sc, &sf, u);
+    if first < n_tiles {
+        for t in first..last {
+            p_store(xc, xm, t, &pre);
+            let e = p_load(tc, tm, t);
+            combine(&mut pre, &e);
         }
     }
 }
 
-// ── dispatch 6: apply — thread per chunk, re-fold and write the lanes ────────
+// ── dispatch 3: apply — rake + Blelloch + per-byte chase ─────────────────────
+//
+// Same tile decomposition as tile_scan (the rake and tree are re-derived —
+// the alternative, publishing per-unit micro prefixes to global memory,
+// costs n/rake elements of write+read against re-reading fl/sm once). Each
+// unit chases its `rake` bytes seeded with combine(global tile prefix, own
+// exclusive micro prefix), emitting the per-byte lanes exactly as the old
+// thread-per-chunk k_apply did — but an 8-deep serial chase per unit at
+// n/(units·rake)·units-way parallelism instead of a 64-deep one.
 #[cube(launch_unchecked)]
-fn k_apply(
+fn apply(
     fl: &[u32],
     sm: &[f32],
     lc: &mut [u32],
@@ -378,28 +534,110 @@ fn k_apply(
     wm: &mut [f32],
     wc: &mut [u32],
     otb: &mut [u32],
-    #[comptime] chunk: usize,
+    #[comptime] units: usize,
+    #[comptime] rake: usize,
+    #[comptime] log: usize,
 ) {
-    let c = ABSOLUTE_POS;
+    let tile = CUBE_POS;
+    let u = UNIT_POS as usize;
     let n = fl.len();
     let item_count = ir.len() / 2;
-    let lo = c * chunk;
+    let lo = tile * (units * rake) + u * rake;
+    let hi = if lo + rake < n { lo + rake } else { n };
+    let mut seed = lo;
+    if seed >= n {
+        seed = n - 1;
+    }
+    let mut it = 0usize;
+    let mut start = 0usize;
+    let mut nxt = n;
+    let mut w_wrap = 0i32;
+    let mut w_mode = 0i32;
+    let has = item_count > 0;
+    if has {
+        it = item_search(ir, item_count, seed);
+        start = ir[it * 2] as usize;
+        nxt = if it + 1 < item_count { ir[(it + 1) * 2] as usize } else { n };
+        w_wrap = ie[it * IE_STRIDE + IE_WRAP_WIDTH] as i32;
+        w_mode = ie[it * IE_STRIDE + IE_WRAP_MODE] as i32;
+    }
+    let mut acc = identity();
     if lo < n {
-        let hi = if lo + chunk < n { lo + chunk } else { n };
-        let mut it = 0usize;
-        let mut start = 0usize;
-        let mut nxt = n;
-        let mut w_wrap = 0i32;
-        let mut w_mode = 0i32;
-        let has = item_count > 0;
-        if has {
-            it = item_search(ir, item_count, lo);
-            start = ir[it * 2] as usize;
-            nxt = if it + 1 < item_count { ir[(it + 1) * 2] as usize } else { n };
-            w_wrap = ie[it * IE_STRIDE + IE_WRAP_WIDTH] as i32;
-            w_mode = ie[it * IE_STRIDE + IE_WRAP_MODE] as i32;
+        let mut id = lo;
+        while id < hi {
+            while has && nxt <= id {
+                it += 1;
+                start = ir[it * 2] as usize;
+                nxt = if it + 1 < item_count { ir[(it + 1) * 2] as usize } else { n };
+                w_wrap = ie[it * IE_STRIDE + IE_WRAP_WIDTH] as i32;
+                w_mode = ie[it * IE_STRIDE + IE_WRAP_MODE] as i32;
+            }
+            let reset = if has && id == start { 1i32 } else { 0i32 };
+            let leaf = leaf_of(fl, sm, w_wrap, w_mode, reset, id);
+            combine(&mut acc, &leaf);
+            id += 1;
         }
-        let mut run = p_load(xc, xm, c);
+    } else {
+        acc.wrap = w_wrap;
+        acc.mode = w_mode;
+    }
+
+    let mut sc = Shared::<[i32]>::new_slice(units * PARTIAL_COUNT_STRIDE);
+    let mut sf = Shared::<[f32]>::new_slice(units);
+    s_store(&mut sc, &mut sf, u, &acc);
+
+    #[unroll]
+    for d in 0..log {
+        sync_cube();
+        let s = 1usize << d;
+        if (u + 1) & (2 * s - 1) == 0 {
+            let mut a = s_load(&sc, &sf, u - s);
+            let b = s_load(&sc, &sf, u);
+            combine(&mut a, &b);
+            s_store(&mut sc, &mut sf, u, &a);
+        }
+    }
+    sync_cube();
+    if u == units - 1 {
+        let e = identity();
+        s_store(&mut sc, &mut sf, u, &e);
+    }
+    #[unroll]
+    for d in 0..log {
+        sync_cube();
+        let s = units >> (d + 1);
+        if (u + 1) & (2 * s - 1) == 0 {
+            let t = s_load(&sc, &sf, u);
+            let mut a = s_load(&sc, &sf, u);
+            let b = s_load(&sc, &sf, u - s);
+            combine(&mut a, &b);
+            s_store(&mut sc, &mut sf, u, &a);
+            s_store(&mut sc, &mut sf, u - s, &t);
+        }
+    }
+    sync_cube();
+
+    // The chase: the running prefix at this unit's first byte is the global
+    // tile prefix combined with the exclusive micro prefix from the tree.
+    // The walk is RE-SEEDED first — the rake advanced it past this unit's
+    // range, and each byte's reset/wrap/mode must come from ITS item, not
+    // the range's last one (the multi-item fixtures caught exactly this).
+    let mut run = p_load(xc, xm, tile);
+    let micro = s_load(&sc, &sf, u);
+    combine(&mut run, &micro);
+    it = 0usize;
+    start = 0usize;
+    nxt = n;
+    w_wrap = 0i32;
+    w_mode = 0i32;
+    if has {
+        it = item_search(ir, item_count, lo);
+        start = ir[it * 2] as usize;
+        nxt = if it + 1 < item_count { ir[(it + 1) * 2] as usize } else { n };
+        w_wrap = ie[it * IE_STRIDE + IE_WRAP_WIDTH] as i32;
+        w_mode = ie[it * IE_STRIDE + IE_WRAP_MODE] as i32;
+    }
+    if lo < n {
         let mut id = lo;
         while id < hi {
             while has && nxt <= id {
@@ -580,21 +818,31 @@ pub fn run(ctx: &GpuContext, fixture_path: &Path) -> ! {
     });
     let n = fx.bytes.len();
     let item_count = fx.items.len();
-    let chunk = DEFAULT_CHUNK_SIZE;
-    let group = DEFAULT_GROUP_SIZE;
-    let n_chunks = n.div_ceil(chunk);
-    let n_supers = n_chunks.div_ceil(group);
+    // The tile shape, env-overridable so a (units, rake) sweep runs through
+    // the same instrument — cross-shape agreement with the CPU scan's
+    // (64, 256) chunks is associativity checked in situ.
+    let units: usize = std::env::var("GLYPH_CHAIN_TILE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(256);
+    let rake: usize = std::env::var("GLYPH_CHAIN_RAKE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(8);
+    assert!(units.is_power_of_two(), "GLYPH_CHAIN_TILE must be a power of two");
+    let log = units.ilog2() as usize;
+    let n_tiles = n.div_ceil(units * rake).max(1);
 
-    // The CPU reference at the same tuning.
-    let r = run_scan_pipeline(&fx.bytes, &fx.trie, &fx.items, chunk, group, 1);
+    // The CPU reference — a different tree shape at the (64, 256) tuning.
+    let r = run_scan_pipeline(&fx.bytes, &fx.trie, &fx.items, DEFAULT_CHUNK_SIZE, DEFAULT_GROUP_SIZE, 1);
 
-    // Uploads: statics from the CPU decode (the bench's mode 0 shape).
+    // Uploads: statics from the CPU decode (the bench's mode 0 shape). The
+    // measure static is ADVANCE ONLY — the scan never reads height.
     let mut fl = Vec::with_capacity(n);
-    let mut sm = Vec::with_capacity(n * SM_STRIDE);
+    let mut sm = Vec::with_capacity(n);
     for i in 0..n {
         fl.push(r.slots.flags(i));
         sm.push(r.slots.advance(i));
-        sm.push(r.slots.height(i));
     }
     let mut ir = Vec::with_capacity(item_count * 2);
     let mut ie = Vec::with_capacity(item_count * IE_STRIDE);
@@ -642,14 +890,10 @@ pub fn run(ctx: &GpuContext, fixture_path: &Path) -> ! {
     let h_ie = client.create_from_slice(bytemuck::cast_slice(&ie));
     let h_im = client.create_from_slice(bytemuck::cast_slice(&im));
     let h_gap = client.create_from_slice(bytemuck::cast_slice(&page_gap_x));
-    let h_pc = client.empty(n_chunks * PARTIAL_COUNT_STRIDE * 4);
-    let h_pm = client.empty(n_chunks * 4);
-    let h_uc = client.empty(n_supers * PARTIAL_COUNT_STRIDE * 4);
-    let h_um = client.empty(n_supers * 4);
-    let h_fc = client.empty(n_supers * PARTIAL_COUNT_STRIDE * 4);
-    let h_fm = client.empty(n_supers * 4);
-    let h_xc = client.empty(n_chunks * PARTIAL_COUNT_STRIDE * 4);
-    let h_xm = client.empty(n_chunks * 4);
+    let h_tc = client.empty(n_tiles * PARTIAL_COUNT_STRIDE * 4);
+    let h_tm = client.empty(n_tiles * 4);
+    let h_xc = client.empty(n_tiles * PARTIAL_COUNT_STRIDE * 4);
+    let h_xm = client.empty(n_tiles * 4);
     let h_lc = client.empty(n * LC_STRIDE * 4);
     let h_wm = client.empty(n * 4);
     let h_wc = client.empty(n * 4);
@@ -673,89 +917,73 @@ pub fn run(ctx: &GpuContext, fixture_path: &Path) -> ! {
     let stages: usize = std::env::var("GLYPH_CHAIN_STAGES")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(8);
+        .unwrap_or(6);
+    // One cube per tile (dim = units); the byte-wide kernels stay 256-unit.
+    let tiles_grid = |tiles: usize| {
+        CubeCount::Static(tiles.min(65535) as u32, tiles.div_ceil(65535) as u32, 1)
+    };
     let t0 = std::time::Instant::now();
     unsafe {
-        chunk_reduce::launch_unchecked(
+        tile_scan::launch_unchecked(
             &client,
-            cubes_of(n_chunks),
-            CubeDim::new_1d(256),
+            tiles_grid(n_tiles),
+            CubeDim::new_1d(units as u32),
             BufferArg::from_raw_parts(h_fl.clone(), n),
-            BufferArg::from_raw_parts(h_sm.clone(), n * SM_STRIDE),
+            BufferArg::from_raw_parts(h_sm.clone(), n),
             BufferArg::from_raw_parts(h_ir.clone(), item_count * 2),
             BufferArg::from_raw_parts(h_ie.clone(), item_count * IE_STRIDE),
-            BufferArg::from_raw_parts(h_pc.clone(), n_chunks * PARTIAL_COUNT_STRIDE),
-            BufferArg::from_raw_parts(h_pm.clone(), n_chunks),
-            chunk,
+            BufferArg::from_raw_parts(h_tc.clone(), n_tiles * PARTIAL_COUNT_STRIDE),
+            BufferArg::from_raw_parts(h_tm.clone(), n_tiles),
+            units,
+            rake,
+            log,
         );
         if stages >= 2 {
-            spine_reduce::launch_unchecked(
-                &client,
-                cubes_of(n_supers),
-                CubeDim::new_1d(256),
-                BufferArg::from_raw_parts(h_pc.clone(), n_chunks * PARTIAL_COUNT_STRIDE),
-                BufferArg::from_raw_parts(h_pm.clone(), n_chunks),
-                BufferArg::from_raw_parts(h_uc.clone(), n_supers * PARTIAL_COUNT_STRIDE),
-                BufferArg::from_raw_parts(h_um.clone(), n_supers),
-                group,
-            );
-        }
-        if stages >= 3 {
             spine_scan::launch_unchecked(
                 &client,
                 CubeCount::new_single(),
-                CubeDim::new_1d(1),
-                BufferArg::from_raw_parts(h_uc.clone(), n_supers * PARTIAL_COUNT_STRIDE),
-                BufferArg::from_raw_parts(h_um.clone(), n_supers),
-                BufferArg::from_raw_parts(h_fc.clone(), n_supers * PARTIAL_COUNT_STRIDE),
-                BufferArg::from_raw_parts(h_fm.clone(), n_supers),
+                CubeDim::new_1d(units as u32),
+                BufferArg::from_raw_parts(h_tc.clone(), n_tiles * PARTIAL_COUNT_STRIDE),
+                BufferArg::from_raw_parts(h_tm.clone(), n_tiles),
+                BufferArg::from_raw_parts(h_xc.clone(), n_tiles * PARTIAL_COUNT_STRIDE),
+                BufferArg::from_raw_parts(h_xm.clone(), n_tiles),
+                units,
+                log,
             );
         }
-        if stages >= 4 {
-            partial_scan::launch_unchecked(
-                &client,
-                cubes_of(n_supers),
-                CubeDim::new_1d(256),
-                BufferArg::from_raw_parts(h_pc.clone(), n_chunks * PARTIAL_COUNT_STRIDE),
-                BufferArg::from_raw_parts(h_pm.clone(), n_chunks),
-                BufferArg::from_raw_parts(h_fc.clone(), n_supers * PARTIAL_COUNT_STRIDE),
-                BufferArg::from_raw_parts(h_fm.clone(), n_supers),
-                BufferArg::from_raw_parts(h_xc.clone(), n_chunks * PARTIAL_COUNT_STRIDE),
-                BufferArg::from_raw_parts(h_xm.clone(), n_chunks),
-                group,
-            );
-        }
-        if stages >= 5 {
+        if stages >= 3 {
             if std::env::var_os("GLYPH_CHAIN_DEBUG").is_some() {
-                // Force stages 1-4 to land in their own submission, so a later
-                // batch failing cannot take chunk_reduce's write down with it.
-                let probe = client.read_one(h_pc.clone()).expect("pre-apply probe");
+                // Force stages 1-2 to land in their own submission, so a later
+                // batch failing cannot take tile_scan's write down with it.
+                let probe = client.read_one(h_tc.clone()).expect("pre-apply probe");
                 let pv: &[u32] = bytemuck::cast_slice(&probe);
-                println!("  dbg pre-apply pc[{} {} {} {}]", pv[0], pv[1], pv[2], pv[3]);
+                println!("  dbg pre-apply tc[{} {} {} {}]", pv[0], pv[1], pv[2], pv[3]);
             }
-            k_apply::launch_unchecked(
+            apply::launch_unchecked(
                 &client,
-                cubes_of(n_chunks),
-                CubeDim::new_1d(256),
+                tiles_grid(n_tiles),
+                CubeDim::new_1d(units as u32),
                 BufferArg::from_raw_parts(h_fl.clone(), n),
-                BufferArg::from_raw_parts(h_sm.clone(), n * SM_STRIDE),
+                BufferArg::from_raw_parts(h_sm.clone(), n),
                 BufferArg::from_raw_parts(h_lc.clone(), n * LC_STRIDE),
                 BufferArg::from_raw_parts(h_ir.clone(), item_count * 2),
                 BufferArg::from_raw_parts(h_ie.clone(), item_count * IE_STRIDE),
-                BufferArg::from_raw_parts(h_xc.clone(), n_chunks * PARTIAL_COUNT_STRIDE),
-                BufferArg::from_raw_parts(h_xm.clone(), n_chunks),
+                BufferArg::from_raw_parts(h_xc.clone(), n_tiles * PARTIAL_COUNT_STRIDE),
+                BufferArg::from_raw_parts(h_xm.clone(), n_tiles),
                 BufferArg::from_raw_parts(h_wm.clone(), n),
                 BufferArg::from_raw_parts(h_wc.clone(), n),
                 BufferArg::from_raw_parts(h_otb.clone(), n),
-                chunk,
+                units,
+                rake,
+                log,
             );
         }
-        if stages >= 6 {
+        if stages >= 4 {
             resolve_x::launch_unchecked(
                 &client,
                 cubes_of(n),
                 CubeDim::new_1d(256),
-                BufferArg::from_raw_parts(h_sm.clone(), n * SM_STRIDE),
+                BufferArg::from_raw_parts(h_sm.clone(), n),
                 BufferArg::from_raw_parts(h_fl.clone(), n),
                 BufferArg::from_raw_parts(h_lm.clone(), n * LM_STRIDE),
                 BufferArg::from_raw_parts(h_lc.clone(), n * LC_STRIDE),
@@ -769,7 +997,7 @@ pub fn run(ctx: &GpuContext, fixture_path: &Path) -> ! {
                 BufferArg::from_raw_parts(h_xmax.clone(), item_count),
             );
         }
-        if stages >= 7 {
+        if stages >= 5 {
             derive_stride::launch_unchecked(
                 &client,
                 cubes_of(item_count),
@@ -780,7 +1008,7 @@ pub fn run(ctx: &GpuContext, fixture_path: &Path) -> ! {
                 BufferArg::from_raw_parts(h_strides.clone(), item_count),
             );
         }
-        if stages >= 8 {
+        if stages >= 6 {
             paginate::launch_unchecked(
                 &client,
                 cubes_of(n),
@@ -807,16 +1035,16 @@ pub fn run(ctx: &GpuContext, fixture_path: &Path) -> ! {
             "  dbg fl readback: [{} {} {} {} {} {} {} {}]",
             flb[0], flb[1], flb[2], flb[3], flb[4], flb[5], flb[6], flb[7]
         );
-        let pc_bytes = client.read_one(h_pc).expect("read pc");
+        let tc_bytes = client.read_one(h_tc).expect("read tc");
         let xc_bytes = client.read_one(h_xc).expect("read xc");
-        let pc: &[u32] = bytemuck::cast_slice(&pc_bytes);
+        let tc: &[u32] = bytemuck::cast_slice(&tc_bytes);
         let xc: &[u32] = bytemuck::cast_slice(&xc_bytes);
-        for c in 0..n_chunks.min(3) {
+        for c in 0..n_tiles.min(3) {
             let o = c * PARTIAL_COUNT_STRIDE;
             println!(
-                "  dbg chunk {c} pc[reset={} nl={} glyphs={} rows={} head={} tail={} wrap={} mode={}] xc[same={}]",
-                pc[o], pc[o + 1], pc[o + 2], pc[o + 3], pc[o + 4], pc[o + 5], pc[o + 6], pc[o + 7],
-                xc[o] == pc[o] && xc[o + 2] == pc[o + 2]
+                "  dbg tile {c} tc[reset={} nl={} glyphs={} rows={} head={} tail={} wrap={} mode={}] xc[same={}]",
+                tc[o], tc[o + 1], tc[o + 2], tc[o + 3], tc[o + 4], tc[o + 5], tc[o + 6], tc[o + 7],
+                xc[o] == tc[o] && xc[o + 2] == tc[o + 2]
             );
         }
     }
@@ -825,9 +1053,12 @@ pub fn run(ctx: &GpuContext, fixture_path: &Path) -> ! {
     let wm: &[f32] = bytemuck::cast_slice(&wm_bytes);
     let lm: &[f32] = bytemuck::cast_slice(&lm_bytes);
 
-    // The diff: counts bit-exact, floats reported with max deviation.
+    // The diff: counts bit-exact; line_advance and positions reported with
+    // max deviation and held to the oracle's 1e-4 eps tier (the module
+    // header's contract note — the Blelloch tree reassociates tail_adv).
     let mut bad = 0usize;
     let mut max_pos_dev = 0.0f64;
+    let mut max_line_dev = 0.0f64;
     let mut leaders = 0usize;
     for id in 0..n {
         if r.slots.flags(id) & F_LEADER == 0 {
@@ -847,11 +1078,10 @@ pub fn run(ctx: &GpuContext, fixture_path: &Path) -> ! {
                 bad += 1;
             }
         }
-        if r.slots.wm[id].to_bits() != wm[id].to_bits() {
-            if bad < 8 {
-                println!("  MISMATCH byte {id} line_advance: cpu {:e} gpu {:e}", r.slots.wm[id], wm[id]);
-            }
-            bad += 1;
+        let la_cpu = r.slots.wm[id] as f64;
+        let la_rel = (wm[id] as f64 - la_cpu).abs() / la_cpu.abs().max(1.0);
+        if la_rel > max_line_dev {
+            max_line_dev = la_rel;
         }
         for (k, acc) in [(LM_X, r.slots.x(id)), (LM_Y, r.slots.y(id)), (LM_Z, r.slots.z(id))] {
             let dev = (lm[id * LM_STRIDE + k] as f64 - acc as f64).abs();
@@ -863,15 +1093,26 @@ pub fn run(ctx: &GpuContext, fixture_path: &Path) -> ! {
     }
 
     println!(
-        "cubecl-chain-check: {} ({} B, {} items, {} leaders) — {} count-lane mismatches, \
-         max position deviation {:.2e}; chain+readbacks {:?} (smoke timing only)",
-        fx.name, n, item_count, leaders, bad, max_pos_dev, dt
+        "cubecl-chain-check: {} ({} B, {} items, {} leaders, tile {}x{}) — {} count-lane mismatches, \
+         max line_adv deviation {:.2e}, max position deviation {:.2e}; chain+readbacks {:?} (smoke timing only)",
+        fx.name,
+        n,
+        item_count,
+        leaders,
+        units,
+        rake,
+        bad,
+        max_line_dev,
+        max_pos_dev,
+        dt
     );
-    if bad > 0 || max_pos_dev > 1e-4 {
-        eprintln!("cubecl-chain-check FAIL: {bad} count mismatches, {max_pos_dev:.2e} position deviation");
+    if bad > 0 || max_line_dev > 1e-4 || max_pos_dev > 1e-4 {
+        eprintln!(
+            "cubecl-chain-check FAIL: {bad} count mismatches, {max_line_dev:.2e} line_adv, {max_pos_dev:.2e} position deviation"
+        );
         std::process::exit(1);
     }
-    println!("cubecl-chain-check PASS: counts + line_advance bit-exact, positions inside 1e-4");
+    println!("cubecl-chain-check PASS: counts bit-exact, line_advance + positions inside 1e-4");
     std::process::exit(0);
 }
 
@@ -899,10 +1140,19 @@ pub fn bench(ctx: &GpuContext, corpus_path: &Path) -> ! {
         std::process::exit(1);
     });
     let n = bytes.len();
-    let chunk = DEFAULT_CHUNK_SIZE;
-    let group = DEFAULT_GROUP_SIZE;
-    let n_chunks = n.div_ceil(chunk);
-    let n_supers = n_chunks.div_ceil(group);
+    // The tile shape (the same dials as the check instrument, so a sweep
+    // measures exactly what the fixtures verify).
+    let units: usize = std::env::var("GLYPH_CHAIN_TILE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(256);
+    let rake: usize = std::env::var("GLYPH_CHAIN_RAKE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(8);
+    assert!(units.is_power_of_two(), "GLYPH_CHAIN_TILE must be a power of two");
+    let log = units.ilog2() as usize;
+    let n_tiles = n.div_ceil(units * rake).max(1);
     // The wrapped shape: fold>0 makes resolve_x take the re-sum path.
     let wrap_width: i64 = std::env::var("GLYPH_CHAIN_WRAP")
         .ok()
@@ -934,15 +1184,14 @@ pub fn bench(ctx: &GpuContext, corpus_path: &Path) -> ! {
     let trie = crate::atlas::TrieTable::load(&crate::atlas_dir());
 
     let t_decode = std::time::Instant::now();
-    let r = run_scan_pipeline(&bytes, &trie, &items, chunk, group, 1);
+    let r = run_scan_pipeline(&bytes, &trie, &items, DEFAULT_CHUNK_SIZE, DEFAULT_GROUP_SIZE, 1);
     let decode_dt = t_decode.elapsed();
 
     let mut fl = Vec::with_capacity(n);
-    let mut sm = Vec::with_capacity(n * SM_STRIDE);
+    let mut sm = Vec::with_capacity(n);
     for i in 0..n {
         fl.push(r.slots.flags(i));
         sm.push(r.slots.advance(i));
-        sm.push(r.slots.height(i));
     }
     let ir: Vec<u32> = vec![0, n as u32];
     let ie: Vec<u32> = vec![0, 0, 0, 1, wrap_width as u32, 0, 0, 0];
@@ -964,14 +1213,10 @@ pub fn bench(ctx: &GpuContext, corpus_path: &Path) -> ! {
     let h_ie = client.create_from_slice(bytemuck::cast_slice(&ie));
     let h_im = client.create_from_slice(bytemuck::cast_slice(&im));
     let h_gap = client.create_from_slice(bytemuck::cast_slice(&page_gap_x));
-    let h_pc = client.empty(n_chunks * PARTIAL_COUNT_STRIDE * 4);
-    let h_pm = client.empty(n_chunks * 4);
-    let h_uc = client.empty(n_supers * PARTIAL_COUNT_STRIDE * 4);
-    let h_um = client.empty(n_supers * 4);
-    let h_fc = client.empty(n_supers * PARTIAL_COUNT_STRIDE * 4);
-    let h_fm = client.empty(n_supers * 4);
-    let h_xc = client.empty(n_chunks * PARTIAL_COUNT_STRIDE * 4);
-    let h_xm = client.empty(n_chunks * 4);
+    let h_tc = client.empty(n_tiles * PARTIAL_COUNT_STRIDE * 4);
+    let h_tm = client.empty(n_tiles * 4);
+    let h_xc = client.empty(n_tiles * PARTIAL_COUNT_STRIDE * 4);
+    let h_xm = client.empty(n_tiles * 4);
     let h_lc = client.empty(n * LC_STRIDE * 4);
     let h_wm = client.empty(n * 4);
     let h_wc = client.empty(n * 4);
@@ -990,87 +1235,71 @@ pub fn bench(ctx: &GpuContext, corpus_path: &Path) -> ! {
         let cubes = threads.div_ceil(256);
         CubeCount::Static(cubes.min(65535) as u32, cubes.div_ceil(65535) as u32, 1)
     };
-    let stages: usize = std::env::var("GLYPH_CHAIN_STAGES").ok().and_then(|v| v.parse().ok()).unwrap_or(8);
+    let stages: usize = std::env::var("GLYPH_CHAIN_STAGES").ok().and_then(|v| v.parse().ok()).unwrap_or(6);
+    // One cube per tile (dim = units); the byte-wide kernels stay 256-unit.
+    let tiles_grid = |tiles: usize| {
+        CubeCount::Static(tiles.min(65535) as u32, tiles.div_ceil(65535) as u32, 1)
+    };
     // Timed samples per dispatch; the minimum is reported.
     let samples: usize = std::env::var("GLYPH_CHAIN_LOOP").ok().and_then(|v| v.parse().ok()).unwrap_or(3);
     let launch = |s: usize| {
         unsafe {
             match s {
                 0 => {
-                    chunk_reduce::launch_unchecked(
+                    tile_scan::launch_unchecked(
                         &client,
-                        cubes_of(n_chunks),
-                        CubeDim::new_1d(256),
+                        tiles_grid(n_tiles),
+                        CubeDim::new_1d(units as u32),
                         BufferArg::from_raw_parts(h_fl.clone(), n),
-                        BufferArg::from_raw_parts(h_sm.clone(), n * SM_STRIDE),
+                        BufferArg::from_raw_parts(h_sm.clone(), n),
                         BufferArg::from_raw_parts(h_ir.clone(), 2),
                         BufferArg::from_raw_parts(h_ie.clone(), IE_STRIDE),
-                        BufferArg::from_raw_parts(h_pc.clone(), n_chunks * PARTIAL_COUNT_STRIDE),
-                        BufferArg::from_raw_parts(h_pm.clone(), n_chunks),
-                        chunk,
+                        BufferArg::from_raw_parts(h_tc.clone(), n_tiles * PARTIAL_COUNT_STRIDE),
+                        BufferArg::from_raw_parts(h_tm.clone(), n_tiles),
+                        units,
+                        rake,
+                        log,
                     );
                 }
                 1 => {
-                    spine_reduce::launch_unchecked(
-                        &client,
-                        cubes_of(n_supers),
-                        CubeDim::new_1d(256),
-                        BufferArg::from_raw_parts(h_pc.clone(), n_chunks * PARTIAL_COUNT_STRIDE),
-                        BufferArg::from_raw_parts(h_pm.clone(), n_chunks),
-                        BufferArg::from_raw_parts(h_uc.clone(), n_supers * PARTIAL_COUNT_STRIDE),
-                        BufferArg::from_raw_parts(h_um.clone(), n_supers),
-                        group,
-                    );
-                }
-                2 => {
                     spine_scan::launch_unchecked(
                         &client,
                         CubeCount::new_single(),
-                        CubeDim::new_1d(1),
-                        BufferArg::from_raw_parts(h_uc.clone(), n_supers * PARTIAL_COUNT_STRIDE),
-                        BufferArg::from_raw_parts(h_um.clone(), n_supers),
-                        BufferArg::from_raw_parts(h_fc.clone(), n_supers * PARTIAL_COUNT_STRIDE),
-                        BufferArg::from_raw_parts(h_fm.clone(), n_supers),
+                        CubeDim::new_1d(units as u32),
+                        BufferArg::from_raw_parts(h_tc.clone(), n_tiles * PARTIAL_COUNT_STRIDE),
+                        BufferArg::from_raw_parts(h_tm.clone(), n_tiles),
+                        BufferArg::from_raw_parts(h_xc.clone(), n_tiles * PARTIAL_COUNT_STRIDE),
+                        BufferArg::from_raw_parts(h_xm.clone(), n_tiles),
+                        units,
+                        log,
                     );
                 }
-                3 => {
-                    partial_scan::launch_unchecked(
+                2 => {
+                    apply::launch_unchecked(
                         &client,
-                        cubes_of(n_supers),
-                        CubeDim::new_1d(256),
-                        BufferArg::from_raw_parts(h_pc.clone(), n_chunks * PARTIAL_COUNT_STRIDE),
-                        BufferArg::from_raw_parts(h_pm.clone(), n_chunks),
-                        BufferArg::from_raw_parts(h_fc.clone(), n_supers * PARTIAL_COUNT_STRIDE),
-                        BufferArg::from_raw_parts(h_fm.clone(), n_supers),
-                        BufferArg::from_raw_parts(h_xc.clone(), n_chunks * PARTIAL_COUNT_STRIDE),
-                        BufferArg::from_raw_parts(h_xm.clone(), n_chunks),
-                        group,
-                    );
-                }
-                4 => {
-                    k_apply::launch_unchecked(
-                        &client,
-                        cubes_of(n_chunks),
-                        CubeDim::new_1d(256),
+                        tiles_grid(n_tiles),
+                        CubeDim::new_1d(units as u32),
                         BufferArg::from_raw_parts(h_fl.clone(), n),
-                        BufferArg::from_raw_parts(h_sm.clone(), n * SM_STRIDE),
+                        BufferArg::from_raw_parts(h_sm.clone(), n),
                         BufferArg::from_raw_parts(h_lc.clone(), n * LC_STRIDE),
                         BufferArg::from_raw_parts(h_ir.clone(), 2),
                         BufferArg::from_raw_parts(h_ie.clone(), IE_STRIDE),
-                        BufferArg::from_raw_parts(h_xc.clone(), n_chunks * PARTIAL_COUNT_STRIDE),
-                        BufferArg::from_raw_parts(h_xm.clone(), n_chunks),
+                        BufferArg::from_raw_parts(h_xc.clone(), n_tiles * PARTIAL_COUNT_STRIDE),
+                        BufferArg::from_raw_parts(h_xm.clone(), n_tiles),
                         BufferArg::from_raw_parts(h_wm.clone(), n),
                         BufferArg::from_raw_parts(h_wc.clone(), n),
                         BufferArg::from_raw_parts(h_otb.clone(), n),
-                        chunk,
+                        units,
+                        rake,
+                        log,
                     );
                 }
-                5 => {
+                3 => {
                     resolve_x::launch_unchecked(
                         &client,
                         cubes_of(n),
                         CubeDim::new_1d(256),
-                        BufferArg::from_raw_parts(h_sm.clone(), n * SM_STRIDE),
+                        BufferArg::from_raw_parts(h_sm.clone(), n),
                         BufferArg::from_raw_parts(h_fl.clone(), n),
                         BufferArg::from_raw_parts(h_lm.clone(), n * LM_STRIDE),
                         BufferArg::from_raw_parts(h_lc.clone(), n * LC_STRIDE),
@@ -1084,7 +1313,7 @@ pub fn bench(ctx: &GpuContext, corpus_path: &Path) -> ! {
                         BufferArg::from_raw_parts(h_xmax.clone(), 1),
                     );
                 }
-                6 => {
+                4 => {
                     derive_stride::launch_unchecked(
                         &client,
                         CubeCount::new_single(),
@@ -1116,24 +1345,21 @@ pub fn bench(ctx: &GpuContext, corpus_path: &Path) -> ! {
     // minimum survives. A window that resolved to no measurement counts as a
     // missing sample, never as a zero.
     let stage_names = [
-        "chunk_reduce",
-        "spine_reduce",
+        "tile_scan",
         "spine_scan",
-        "partial_scan",
-        "k_apply",
+        "apply",
         "resolve_x",
         "derive_stride",
         "paginate",
     ];
     let stage_meta = |s: usize| -> (&'static str, usize, u32) {
-        let threads = match s {
-            0 | 4 => n_chunks,
-            1 | 3 => n_supers,
-            2 | 6 => 1,
-            _ => n,
+        let (cubes, dim) = match s {
+            0 | 2 => (n_tiles, units as u32),
+            1 => (1, units as u32),
+            4 => (1, 1),
+            _ => (n.div_ceil(256), 256),
         };
-        let cubes = threads.div_ceil(256);
-        (stage_names[s], cubes, 256u32)
+        (stage_names[s], cubes, dim)
     };
     let mut mins: Vec<Option<std::time::Duration>> = vec![None; stages];
     let mut missing_windows = 0usize;
@@ -1166,12 +1392,14 @@ pub fn bench(ctx: &GpuContext, corpus_path: &Path) -> ! {
     // Correctness at speed: the bench's whole number is worthless if the fast
     // path is wrong — diff the leader row/col lanes against the CPU reference.
     let lc: &[u32] = bytemuck::cast_slice(&lc_bytes);
-    if stages < 5 {
+    if stages < 3 {
         println!(
-            "cubecl-chain-bench: {} ({} B, {} chunks, wrap {}) stages {} — pre-apply stages only, no verification",
+            "cubecl-chain-bench: {} ({} B, {} tiles @ {}x{}, wrap {}) stages {} — pre-apply stages only, no verification",
             corpus_path.display(),
             n,
-            n_chunks,
+            n_tiles,
+            units,
+            rake,
             wrap_width,
             stages
         );
@@ -1197,11 +1425,13 @@ pub fn bench(ctx: &GpuContext, corpus_path: &Path) -> ! {
     let chain: std::time::Duration = mins.iter().filter_map(|d| *d).sum();
     let total = chain + readback_dt;
     println!(
-        "cubecl-chain-bench: {} ({} B, {} chunks, wrap {}, samples {}) timing={} missing_windows={} — \
+        "cubecl-chain-bench: {} ({} B, {} tiles @ {}x{}, wrap {}, samples {}) timing={} missing_windows={} — \
          cpu decode+scan {:?} | chain (sum of per-dispatch minima) {:?} readbacks {:?} total {:?} ({:.1} MB/s)",
         corpus_path.display(),
         n,
-        n_chunks,
+        n_tiles,
+        units,
+        rake,
         wrap_width,
         samples,
         timing_method,
