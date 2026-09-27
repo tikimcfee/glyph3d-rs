@@ -643,3 +643,94 @@ mod tests {
         assert!(e.what.contains("UNSET"), "{}", e.what);
     }
 }
+
+// ── Gate drivers (moved from main.rs in the 2026-09 code-shape refactor) ──
+
+pub fn run_engine_smoke(file: &Path, trie: Option<&Path>, loops: u32) {
+    let default_trie = crate::default_engine_trie();
+    let trie = trie.unwrap_or(&default_trie);
+    let bytes = std::fs::read(file).expect("failed to read --engine-file");
+
+    let mut eng = Engine::new();
+    eng.load_trie_file(trie).expect("failed to load engine trie");
+
+    let params = ItemParams::default();
+    let mut last_count = 0u64;
+    let t0 = std::time::Instant::now();
+    for _ in 0..loops {
+        last_count = eng.load_item(&bytes, &params).expect("engine load_item failed");
+    }
+    let dt = t0.elapsed();
+
+    let records = eng.read_back().records;
+    assert_eq!(records.len() as u64, last_count, "record copy count mismatch");
+
+    let total_mb = bytes.len() as f64 * loops as f64 / 1e6;
+    println!(
+        "engine: {} ({} B) x {} loads -> {} records in {:.3} s ({:.1} MB/s pipeline)",
+        file.display(),
+        bytes.len(),
+        loops,
+        records.len(),
+        dt.as_secs_f64(),
+        total_mb / dt.as_secs_f64(),
+    );
+    for (i, r) in records.iter().take(8).enumerate() {
+        println!(
+            "  rec[{}]: X={} Y={} Z={} ADVANCE={} HEIGHT={} GLYPH_ID={} ROW={} COL={}",
+            i,
+            r.x(),
+            r.y(),
+            r.z(),
+            r.advance(),
+            r.height(),
+            r.glyph_id(),
+            r.row(),
+            r.col(),
+        );
+    }
+}
+
+/// Stage E1 cross-validation: run the engine through the FFI on `file`, then
+/// independently compute the expected records with text.rs's CPU reference
+/// (same atlas trie, engine fold conventions) and diff BIT-EXACT — counts and
+/// measure bit patterns alike, no tolerance. Exit 1 on any divergence.
+pub fn run_engine_check(file: &Path, trie_path: Option<&Path>) -> ! {
+    let default_trie = crate::default_engine_trie();
+    let trie_path = trie_path.unwrap_or(&default_trie);
+    let bytes = std::fs::read(file).expect("failed to read --engine-check file");
+    let trie = crate::atlas::TrieTable::load(&crate::atlas_dir());
+
+    // TWO origins, and the non-zero one is the point. At (0,0,0) an
+    // uninitialised origin read is invisible: garbage added to zero on both
+    // sides of the comparison agrees with itself. A Mojo nightly was caught
+    // doing exactly that (see engine_item_params_at), and for a while
+    // ffi_selftest was the only instrument that could see it.
+    for origin in [[0.0, 0.0, 0.0], [-3.5, 11.25, 2.75]] {
+        let records = crate::engine_layout_records_at(file, trie_path, origin);
+        let p = crate::engine_item_params_at(origin);
+        let expected = crate::text::reference_layout(
+            &trie,
+            &bytes,
+            [p.origin_x, p.origin_y, p.origin_z],
+            p.line_height,
+        );
+        if let Err(report) = crate::text::diff_records(&records, &expected) {
+            eprintln!(
+                "engine-check FAIL: {} at origin {origin:?} (trie: {})\n{report}",
+                file.display(),
+                trie_path.display(),
+            );
+            std::process::exit(1);
+        }
+        println!(
+            "engine-check PASS: {} ({} B) at origin {origin:?} — {} records bit-exact vs the \
+             CPU reference [fp contract=off verified at the dylib] (trie: {})",
+            file.display(),
+            bytes.len(),
+            records.len(),
+            trie_path.display(),
+        );
+    }
+    std::process::exit(0);
+}

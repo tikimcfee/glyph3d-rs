@@ -177,7 +177,7 @@ fn engine_layout(file: &Path, trie: &Path) -> (layout::GlyphArena, layout::ItemP
 /// `--engine-check` diffs lane by lane against the independent CPU reference.
 /// This is the 36 B-per-source-byte readback the render path above does not
 /// pay, asked for explicitly through `VerifyLayout` — see `layout.rs`.
-fn engine_layout_records_at(
+pub(crate) fn engine_layout_records_at(
     file: &Path,
     trie: &Path,
     origin: [f64; 3],
@@ -314,383 +314,6 @@ fn build_scene_impl(
 
 /// Stage D: drive the Mojo glyph engine in-process over one file.
 /// Prints slot count, per-load timing, throughput, and the first records.
-fn run_engine_smoke(file: &Path, trie: Option<&Path>, loops: u32) {
-    let default_trie = default_engine_trie();
-    let trie = trie.unwrap_or(&default_trie);
-    let bytes = std::fs::read(file).expect("failed to read --engine-file");
-
-    let mut eng = engine::Engine::new();
-    eng.load_trie_file(trie).expect("failed to load engine trie");
-
-    let params = layout::ItemParams::default();
-    let mut last_count = 0u64;
-    let t0 = std::time::Instant::now();
-    for _ in 0..loops {
-        last_count = eng.load_item(&bytes, &params).expect("engine load_item failed");
-    }
-    let dt = t0.elapsed();
-
-    let records = eng.read_back().records;
-    assert_eq!(records.len() as u64, last_count, "record copy count mismatch");
-
-    let total_mb = bytes.len() as f64 * loops as f64 / 1e6;
-    println!(
-        "engine: {} ({} B) x {} loads -> {} records in {:.3} s ({:.1} MB/s pipeline)",
-        file.display(),
-        bytes.len(),
-        loops,
-        records.len(),
-        dt.as_secs_f64(),
-        total_mb / dt.as_secs_f64(),
-    );
-    for (i, r) in records.iter().take(8).enumerate() {
-        println!(
-            "  rec[{}]: X={} Y={} Z={} ADVANCE={} HEIGHT={} GLYPH_ID={} ROW={} COL={}",
-            i,
-            r.x(),
-            r.y(),
-            r.z(),
-            r.advance(),
-            r.height(),
-            r.glyph_id(),
-            r.row(),
-            r.col(),
-        );
-    }
-}
-
-/// Stage E1 cross-validation: run the engine through the FFI on `file`, then
-/// independently compute the expected records with text.rs's CPU reference
-/// (same atlas trie, engine fold conventions) and diff BIT-EXACT — counts and
-/// measure bit patterns alike, no tolerance. Exit 1 on any divergence.
-fn run_engine_check(file: &Path, trie_path: Option<&Path>) -> ! {
-    let default_trie = default_engine_trie();
-    let trie_path = trie_path.unwrap_or(&default_trie);
-    let bytes = std::fs::read(file).expect("failed to read --engine-check file");
-    let trie = atlas::TrieTable::load(&atlas_dir());
-
-    // TWO origins, and the non-zero one is the point. At (0,0,0) an
-    // uninitialised origin read is invisible: garbage added to zero on both
-    // sides of the comparison agrees with itself. A Mojo nightly was caught
-    // doing exactly that (see engine_item_params_at), and for a while
-    // ffi_selftest was the only instrument that could see it.
-    for origin in [[0.0, 0.0, 0.0], [-3.5, 11.25, 2.75]] {
-        let records = engine_layout_records_at(file, trie_path, origin);
-        let p = engine_item_params_at(origin);
-        let expected = text::reference_layout(
-            &trie,
-            &bytes,
-            [p.origin_x, p.origin_y, p.origin_z],
-            p.line_height,
-        );
-        if let Err(report) = text::diff_records(&records, &expected) {
-            eprintln!(
-                "engine-check FAIL: {} at origin {origin:?} (trie: {})\n{report}",
-                file.display(),
-                trie_path.display(),
-            );
-            std::process::exit(1);
-        }
-        println!(
-            "engine-check PASS: {} ({} B) at origin {origin:?} — {} records bit-exact vs the \
-             CPU reference [fp contract=off verified at the dylib] (trie: {})",
-            file.display(),
-            bytes.len(),
-            records.len(),
-            trie_path.display(),
-        );
-    }
-    std::process::exit(0);
-}
-
-/// Fixture parity: emit the canonical parse manifest, one line per fixture.
-fn run_fixture_manifest(paths: &[PathBuf]) -> ! {
-    for p in paths {
-        match fixture::load_pipe_fixture(p) {
-            Ok(fx) => println!("{}", fx.manifest()),
-            Err(e) => {
-                eprintln!("fixture-manifest FAIL: {e}");
-                std::process::exit(1);
-            }
-        }
-    }
-    std::process::exit(0);
-}
-
-/// Bake: the bake and its seed protocol against the .bake.bin corpus.
-fn run_fixture_bake(paths: &[PathBuf]) -> ! {
-    let mut leaders = 0usize;
-    let mut checkpoints = 0usize;
-    let mut queries = 0usize;
-    let mut failed = 0usize;
-    for p in paths {
-        let fx = match bake::load_bake_fixture(p) {
-            Ok(fx) => fx,
-            Err(e) => {
-                eprintln!("fixture-bake FAIL: {e}");
-                std::process::exit(1);
-            }
-        };
-        let d = bake::diff_bake(&fx);
-        if d.bad.is_empty() {
-            println!(
-                "  PASS {:<28} {} leaders / {} checkpoints / {} prefix + {} wrap queries",
-                fx.name, d.leaders, d.checkpoints, d.prefix_queries, d.wrap_queries
-            );
-            leaders += d.leaders;
-            checkpoints += d.checkpoints;
-            queries += d.prefix_queries + d.wrap_queries;
-        } else {
-            failed += 1;
-            println!("  FAIL {:<28} {} disagreement(s)", fx.name, d.bad.len());
-            for line in d.bad.iter().take(8) {
-                println!("       {line}");
-            }
-        }
-    }
-    if failed > 0 {
-        eprintln!("fixture-bake FAIL: {failed}/{} fixtures differ", paths.len());
-        std::process::exit(1);
-    }
-    // ANTI-VACUITY. The QUERY half is what distinguishes this from a second
-    // whole-file record comparison: a bake with subtly wrong checkpoints answers
-    // every total correctly and every random-access question wrongly. A run with
-    // no queries would be reporting only the half that cannot see that.
-    if queries == 0 {
-        eprintln!("fixture-bake FAIL: no seed-protocol query was exercised");
-        std::process::exit(1);
-    }
-    println!(
-        "fixture-bake PASS: {} fixture(s), {leaders} leaders, {checkpoints} checkpoints, \
-         {queries} seed-protocol queries bit-exact",
-        paths.len()
-    );
-    std::process::exit(0);
-}
-
-/// The tunings the scan form sweeps: (chunk_size, group_size, shards).
-///
-/// The Mojo suite runs two — the default and one awkward pair. Being serial
-/// makes more of them cheap, and each one is a different GROUPING of the same
-/// monoid, so the sweep is the associativity test. The degenerate ones matter
-/// most: chunk 1 makes every byte its own interval, group 1 removes the spine's
-/// grouping entirely, and a large chunk makes the whole buffer one interval so
-/// nothing is combined at all. `shards` is the dial on resolve_x's segment walk
-/// — with one shard per item the walk NEVER fires, because the first leader of
-/// an item always starts a segment.
-const SCAN_TUNINGS: &[(usize, usize, usize)] = &[
-    // The GPU's own defaults come from scan.rs so the sweep cannot drift from
-    // the tuning the shipped path would use.
-    (scan::DEFAULT_CHUNK_SIZE, scan::DEFAULT_GROUP_SIZE, 1),
-    (scan::DEFAULT_CHUNK_SIZE, scan::DEFAULT_GROUP_SIZE, 4), // resolve_x shards mid-segment
-    (7, 3, 3),      // seams inside multi-byte sequences AND fold units
-    (1, 1, 8),      // every byte its own interval, no grouping
-    (3, 1, 2),
-    (1, 64, 5),
-    (4096, 8, 7),   // one interval: nothing combines, everything shards
-    (13, 5, 11),
-];
-
-/// Scan form: the scan form against the corpus, swept across tunings.
-fn run_fixture_scan(paths: &[PathBuf]) -> ! {
-    let mut failed = 0usize;
-    let mut strict = 0usize;
-    let mut tiered = 0usize;
-    let mut cases = 0usize;
-    for p in paths {
-        let fx = match fixture::load_pipe_fixture(p) {
-            Ok(fx) => fx,
-            Err(e) => {
-                eprintln!("fixture-scan FAIL: {e}");
-                std::process::exit(1);
-            }
-        };
-        let mut worst: Option<fixture::ScanDiff> = None;
-        let mut ok = true;
-        for &(chunk, group, shards) in SCAN_TUNINGS {
-            let d = fixture::diff_scan(&fx, chunk, group, shards);
-            cases += 1;
-            strict += d.bit_exact_leaders;
-            tiered += d.tiered_leaders;
-            if !d.bad.is_empty() {
-                ok = false;
-                if worst.is_none() {
-                    worst = Some(d);
-                }
-            }
-        }
-        if ok {
-            println!("  PASS {:<26} {} tunings within the tiered contract", fx.name, SCAN_TUNINGS.len());
-        } else {
-            failed += 1;
-            let d = worst.unwrap();
-            println!(
-                "  FAIL {:<26} K={}/G={}/S={} — {} mismatch(es)",
-                fx.name, d.chunk_size, d.group_size, d.shards, d.bad.len()
-            );
-            for line in d.bad.iter().take(8) {
-                println!("       {line}");
-            }
-        }
-    }
-    if failed > 0 {
-        eprintln!("fixture-scan FAIL: {failed}/{} fixtures differ", paths.len());
-        std::process::exit(1);
-    }
-    // ANTI-VACUITY. The strict tier is the load-bearing one — it is where the
-    // scan claims BIT equality with the serial fold — so a run that held no
-    // leader to it would be reporting the tolerant tier's green as the whole
-    // result.
-    if strict == 0 {
-        eprintln!("fixture-scan FAIL: no leader was held to the BIT-exact tier");
-        std::process::exit(1);
-    }
-    println!(
-        "fixture-scan PASS: {} fixture(s) x {} tunings = {cases} cases; \
-         {strict} leader-lanes BIT-exact, {tiered} within 1e-4 relative",
-        paths.len(),
-        SCAN_TUNINGS.len(),
-    );
-    std::process::exit(0);
-}
-
-/// Full fold: the ported fold against the whole corpus, every lane of every byte.
-fn run_fixture_fold(paths: &[PathBuf]) -> ! {
-    let mut lanes = 0usize;
-    let mut leaders = 0usize;
-    let mut failed = 0usize;
-    for p in paths {
-        let fx = match fixture::load_pipe_fixture(p) {
-            Ok(fx) => fx,
-            Err(e) => {
-                eprintln!("fixture-fold FAIL: {e}");
-                std::process::exit(1);
-            }
-        };
-        let d = fixture::diff_full_fold(&fx);
-        if d.bad.is_empty() {
-            println!(
-                "  PASS {:<26} {} bytes / {} leaders / {} lanes bit-exact",
-                fx.name, d.bytes, d.leaders, d.lanes
-            );
-            lanes += d.lanes;
-            leaders += d.leaders;
-        } else {
-            failed += 1;
-            println!("  FAIL {:<26} {} disagreement(s)", fx.name, d.bad.len());
-            for line in d.bad.iter().take(8) {
-                println!("       {line}");
-            }
-        }
-    }
-    if failed > 0 {
-        eprintln!("fixture-fold FAIL: {failed}/{} fixtures differ", paths.len());
-        std::process::exit(1);
-    }
-    println!(
-        "fixture-fold PASS: {} fixture(s), {leaders} leaders, {lanes} per-byte lanes \
-         bit-exact vs the JS oracle",
-        paths.len()
-    );
-    std::process::exit(0);
-}
-
-/// Trie rebuild: rebuild every fixture's trie from its bytes and diff it against the
-/// one the oracle stored.
-///
-/// NOT a round trip: the input is the fixture's raw BYTES plus gen.mjs's pure
-/// metrics function, and nothing about the stored trie's structure is handed
-/// back to the builder. So the block layout, the content dedup and — the part
-/// that matters — the INSERTION ORDER are all under test.
-fn run_fixture_trie(paths: &[PathBuf]) -> ! {
-    let mut entries = 0usize;
-    let mut failed = 0usize;
-    for p in paths {
-        let fx = match fixture::load_pipe_fixture(p) {
-            Ok(fx) => fx,
-            Err(e) => {
-                eprintln!("fixture-trie FAIL: {e}");
-                std::process::exit(1);
-            }
-        };
-        let r = fixture::rebuild_trie_and_diff(&fx);
-        if r.bad.is_empty() {
-            println!(
-                "  PASS {:<26} {} entries / {} blocks / {} mapped cps — value-identical",
-                fx.name, r.entries, r.block_count, r.mapped
-            );
-            entries += r.entries;
-        } else {
-            failed += 1;
-            println!("  FAIL {:<26} {} disagreement(s)", fx.name, r.bad.len());
-            for line in r.bad.iter().take(8) {
-                println!("       {line}");
-            }
-        }
-    }
-    if failed > 0 {
-        eprintln!("fixture-trie FAIL: {failed}/{} fixtures differ", paths.len());
-        std::process::exit(1);
-    }
-    println!(
-        "fixture-trie PASS: {} fixture(s), {entries} trie entries rebuilt from bytes",
-        paths.len()
-    );
-    std::process::exit(0);
-}
-
-/// Fixture parity: hold text.rs's CPU fold to the fixture corpus, bit-exact.
-///
-/// Out-of-domain fixtures are SKIPPED WITH A REASON rather than silently
-/// dropped, and a run in which nothing was in domain FAILS. Both halves matter:
-/// this gate's whole job is comparing, and a comparison that compared nothing
-/// is the loudest-passing thing there is.
-fn run_fixture_reference(paths: &[PathBuf]) -> ! {
-    let mut compared = 0usize;
-    let mut records = 0usize;
-    let mut lanes = 0usize;
-    let mut failed = 0usize;
-    for p in paths {
-        let fx = match fixture::load_pipe_fixture(p) {
-            Ok(fx) => fx,
-            Err(e) => {
-                eprintln!("fixture-reference FAIL: {e}");
-                std::process::exit(1);
-            }
-        };
-        let outcome = fixture::diff_against_reference_layout(&fx);
-        if let Some(why) = outcome.skipped {
-            println!("  SKIP {:<26} out of reference_layout domain: {why}", fx.name);
-            continue;
-        }
-        compared += 1;
-        records += outcome.records;
-        lanes += outcome.compared_lanes;
-        if outcome.bad.is_empty() {
-            println!(
-                "  PASS {:<26} {} records, {} lanes bit-exact",
-                fx.name, outcome.records, outcome.compared_lanes
-            );
-        } else {
-            failed += 1;
-            print!("  FAIL {}", fixture::report(&fx, &outcome.bad, 10));
-        }
-    }
-    if compared == 0 {
-        eprintln!("fixture-reference FAIL: no fixture was in domain — nothing was compared");
-        std::process::exit(1);
-    }
-    if failed > 0 {
-        eprintln!("fixture-reference FAIL: {failed}/{compared} fixtures differ");
-        std::process::exit(1);
-    }
-    println!(
-        "fixture-reference PASS: {compared} fixture(s), {records} records, {lanes} lanes bit-exact \
-         vs the oracle's expected values"
-    );
-    std::process::exit(0);
-}
-
 fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     let cli = parse_cli();
@@ -717,32 +340,32 @@ fn main() {
 
     // Fixture parity (reference port): fixture parse manifest / corpus diff — no GPU.
     if !cli.fixture_manifest.is_empty() {
-        run_fixture_manifest(&cli.fixture_manifest);
+        fixture::run_fixture_manifest(&cli.fixture_manifest);
     }
     if !cli.fixture_reference.is_empty() {
-        run_fixture_reference(&cli.fixture_reference);
+        fixture::run_fixture_reference(&cli.fixture_reference);
     }
     if !cli.fixture_trie.is_empty() {
-        run_fixture_trie(&cli.fixture_trie);
+        fixture::run_fixture_trie(&cli.fixture_trie);
     }
     if !cli.fixture_fold.is_empty() {
-        run_fixture_fold(&cli.fixture_fold);
+        fixture::run_fixture_fold(&cli.fixture_fold);
     }
     if !cli.fixture_scan.is_empty() {
-        run_fixture_scan(&cli.fixture_scan);
+        scan::run_fixture_scan(&cli.fixture_scan);
     }
     if !cli.fixture_bake.is_empty() {
-        run_fixture_bake(&cli.fixture_bake);
+        bake::run_fixture_bake(&cli.fixture_bake);
     }
 
     // Stage E1: engine ↔ CPU-reference cross-check — no GPU involved.
     if let Some(file) = &cli.engine_check {
-        run_engine_check(file, cli.engine_trie.as_deref());
+        engine::run_engine_check(file, cli.engine_trie.as_deref());
     }
 
     // Stage D: Mojo engine in-process smoke test — no GPU involved.
     if let Some(file) = &cli.engine_file {
-        run_engine_smoke(file, cli.engine_trie.as_deref(), cli.engine_loop);
+        engine::run_engine_smoke(file, cli.engine_trie.as_deref(), cli.engine_loop);
         return;
     }
 

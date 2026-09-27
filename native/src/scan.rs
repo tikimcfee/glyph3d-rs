@@ -38,6 +38,8 @@
 //! performs the same f32 additions in the same left-fold order as the serial
 //! recurrence — it IS that re-sum, scheduled differently.
 
+use std::path::PathBuf;
+
 use crate::fold::{
     batch_union, bounds_range, decode_all, derive_stride, page_active, paginate, resolve_clusters,
     rows_for_line,
@@ -1163,4 +1165,92 @@ mod tests {
             assert_eq!(scanned.item_bounds, serial.item_bounds, "bounds at K={chunk}/G={group}/S={shards}");
         }
     }
+}
+
+// ── Gate drivers (moved from main.rs in the 2026-09 code-shape refactor) ──
+
+/// The tunings the scan form sweeps: (chunk_size, group_size, shards).
+///
+/// The Mojo suite runs two — the default and one awkward pair. Being serial
+/// makes more of them cheap, and each one is a different GROUPING of the same
+/// monoid, so the sweep is the associativity test. The degenerate ones matter
+/// most: chunk 1 makes every byte its own interval, group 1 removes the spine's
+/// grouping entirely, and a large chunk makes the whole buffer one interval so
+/// nothing is combined at all. `shards` is the dial on resolve_x's segment walk
+/// — with one shard per item the walk NEVER fires, because the first leader of
+/// an item always starts a segment.
+const SCAN_TUNINGS: &[(usize, usize, usize)] = &[
+    // The GPU's own defaults come from scan.rs so the sweep cannot drift from
+    // the tuning the shipped path would use.
+    (DEFAULT_CHUNK_SIZE, DEFAULT_GROUP_SIZE, 1),
+    (DEFAULT_CHUNK_SIZE, DEFAULT_GROUP_SIZE, 4), // resolve_x shards mid-segment
+    (7, 3, 3),      // seams inside multi-byte sequences AND fold units
+    (1, 1, 8),      // every byte its own interval, no grouping
+    (3, 1, 2),
+    (1, 64, 5),
+    (4096, 8, 7),   // one interval: nothing combines, everything shards
+    (13, 5, 11),
+];
+
+/// Scan form: the scan form against the corpus, swept across tunings.
+pub fn run_fixture_scan(paths: &[PathBuf]) -> ! {
+    let mut failed = 0usize;
+    let mut strict = 0usize;
+    let mut tiered = 0usize;
+    let mut cases = 0usize;
+    for p in paths {
+        let fx = match crate::fixture::load_pipe_fixture(p) {
+            Ok(fx) => fx,
+            Err(e) => {
+                eprintln!("fixture-scan FAIL: {e}");
+                std::process::exit(1);
+            }
+        };
+        let mut worst: Option<crate::fixture::ScanDiff> = None;
+        let mut ok = true;
+        for &(chunk, group, shards) in SCAN_TUNINGS {
+            let d = crate::fixture::diff_scan(&fx, chunk, group, shards);
+            cases += 1;
+            strict += d.bit_exact_leaders;
+            tiered += d.tiered_leaders;
+            if !d.bad.is_empty() {
+                ok = false;
+                if worst.is_none() {
+                    worst = Some(d);
+                }
+            }
+        }
+        if ok {
+            println!("  PASS {:<26} {} tunings within the tiered contract", fx.name, SCAN_TUNINGS.len());
+        } else {
+            failed += 1;
+            let d = worst.unwrap();
+            println!(
+                "  FAIL {:<26} K={}/G={}/S={} — {} mismatch(es)",
+                fx.name, d.chunk_size, d.group_size, d.shards, d.bad.len()
+            );
+            for line in d.bad.iter().take(8) {
+                println!("       {line}");
+            }
+        }
+    }
+    if failed > 0 {
+        eprintln!("fixture-scan FAIL: {failed}/{} fixtures differ", paths.len());
+        std::process::exit(1);
+    }
+    // ANTI-VACUITY. The strict tier is the load-bearing one — it is where the
+    // scan claims BIT equality with the serial fold — so a run that held no
+    // leader to it would be reporting the tolerant tier's green as the whole
+    // result.
+    if strict == 0 {
+        eprintln!("fixture-scan FAIL: no leader was held to the BIT-exact tier");
+        std::process::exit(1);
+    }
+    println!(
+        "fixture-scan PASS: {} fixture(s) x {} tunings = {cases} cases; \
+         {strict} leader-lanes BIT-exact, {tiered} within 1e-4 relative",
+        paths.len(),
+        SCAN_TUNINGS.len(),
+    );
+    std::process::exit(0);
 }
