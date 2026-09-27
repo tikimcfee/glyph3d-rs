@@ -917,12 +917,15 @@ pub fn rederive_cached(
 }
 
 /// The result of folding one file's record stream: the kept records (rows
-/// renumbered, y shifted up over every fold's span), what was dropped, and
-/// the extents RECOMPUTED from the kept records — the engine's page/ink
-/// lanes are documented as max/min over records, so removing records and
+/// renumbered, y shifted up over every fold's span), what was dropped, the
+/// ORIGINAL record indices kept (in order — the join key for anything with
+/// parallel per-record data, e.g. the style walk's leader bytes), and the
+/// extents RECOMPUTED from the kept records — the engine's page/ink lanes
+/// are documented as max/min over records, so removing records and
 /// recomputing is exact, not approximate.
 pub struct Folded {
     pub records: Vec<GlyphRecord>,
+    pub kept_ix: Vec<u32>,
     pub dropped: usize,
     pub page: PageExtent,
     pub ink: InkExtent,
@@ -952,6 +955,7 @@ pub fn compact_folds(
     let folded_line = |line: u32| folds.iter().any(|f| f.contains(&line));
 
     let mut kept: Vec<GlyphRecord> = Vec::with_capacity(records.len());
+    let mut kept_ix: Vec<u32> = Vec::with_capacity(records.len());
     let mut dropped = 0usize;
     // Accumulated shift, established lazily when the stream passes OUT of a
     // fold (the first kept record after it names the fold's own pitch).
@@ -967,7 +971,7 @@ pub fn compact_folds(
     let mut ink_max = [f32::NEG_INFINITY; 3];
     let mut first_kept = true;
 
-    for (r, &line) in records.iter().zip(lines) {
+    for (i, (r, &line)) in records.iter().zip(lines).enumerate() {
         if folded_line(line) {
             dropped += 1;
             if !in_fold {
@@ -994,6 +998,7 @@ pub fn compact_folds(
             r.counts[1] = r.row() - rows_hidden;
         }
         kept.push(r);
+        kept_ix.push(i as u32);
 
         // Extents over the kept stream — the engine's documented formulas.
         page.right = page.right.max(r.x() + r.advance());
@@ -1010,6 +1015,7 @@ pub fn compact_folds(
     }
     Folded {
         records: kept,
+        kept_ix,
         dropped,
         page,
         ink: InkExtent { min: ink_min, max: ink_max },
@@ -1273,6 +1279,9 @@ mod tests {
         // Extents recomputed from the KEPT stream: bottom = −4 (was −8).
         assert_eq!(folded.page.bottom, -4.0);
         assert_eq!(folded.page.right, 1.0); // x + advance = 0 + 1
+        // kept_ix: the join key back to parallel per-record data — the
+        // compacted stream's originals, in order.
+        assert_eq!(folded.kept_ix, vec![0, 3, 4]);
         // Glyph identity survives untouched — folds move, never rewrite.
         assert_eq!(folded.records[1].glyph_id(), 103);
     }

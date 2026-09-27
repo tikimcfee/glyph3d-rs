@@ -2199,20 +2199,29 @@ impl GlyphScene {
             );
             return FileStyle::Failed;
         }
-        // P2a: skip folded records so this walk's slot sequence matches the
-        // COMPACTED instances the loader staged. Walking uncompacted records
-        // against compacted slots painted wrong glyphs and ran past the
-        // file's slot range (the white-glyph state, seen live 2026-09-26).
-        let file_folds = pctx.folds.get(&info.rel_path);
-        let starts = file_folds.map(|_| crate::repo::line_starts_of(&bytes));
-        let folded = |i: usize| -> bool {
-            match (&file_folds, &starts) {
-                (Some(folds), Some(starts)) => {
-                    let line = crate::repo::line_of_byte(leaders[i].0, starts);
-                    folds.iter().any(|f| f.contains(&line))
-                }
-                _ => false,
+        // P2a-4 (the FOURTH live-found defect, 2026-09-27): the style walk
+        // consumes the COMPACTED stream, not the raw one. Instances are
+        // rebuilt from record POSITIONS here — walking raw records repainted
+        // every kept glyph at its UNFOLDED y after the loader had collapsed
+        // the column (bodies empty, not collapsed: the compaction dropped,
+        // the restyle un-shifted). Compaction mirrors the loader's exactly
+        // (same folds, same line resolution), so slots, positions and colors
+        // come from one truth; kept_ix joins the compacted stream back to
+        // the leader bytes for the run lookup.
+        let fold_set = pctx.folds.get(&info.rel_path).filter(|f| !f.is_empty());
+        let (records, byte_of): (Vec<crate::layout::GlyphRecord>, Vec<usize>) = match fold_set {
+            Some(folds) => {
+                let starts = crate::repo::line_starts_of(&bytes);
+                let lines: Vec<u32> = leaders
+                    .iter()
+                    .map(|l| crate::repo::line_of_byte(l.0, &starts))
+                    .collect();
+                let compacted = crate::repo::compact_folds(&records, folds, &lines);
+                let bytes_at: Vec<usize> =
+                    compacted.kept_ix.iter().map(|&ix| leaders[ix as usize].0).collect();
+                (compacted.records, bytes_at)
             }
+            None => (records, leaders.iter().map(|l| l.0).collect()),
         };
         // The walk, COALESCED — the RecolorLine lesson: one queue.write_buffer
         // per glyph is ~15 µs of validation each, which is where the uncached
@@ -2238,11 +2247,10 @@ impl GlyphScene {
         let mut colored = 0usize;
         let mut unstyled = 0usize;
         for (i, r) in records.iter().enumerate() {
-            if r.glyph_id() == 0 || folded(i) {
-                continue; // blank: no slot; folded: dropped at compaction —
-                          // either way it takes no slot in THIS field
+            if r.glyph_id() == 0 {
+                continue; // blank: no instance slot, exactly as staging skips
             }
-            let byte = leaders[i].0;
+            let byte = byte_of[i];
             while run_ix < runs.len() && runs[run_ix].range.end <= byte {
                 run_ix += 1;
             }
