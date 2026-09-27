@@ -461,10 +461,14 @@ pub async fn init(compatible_surface: Option<&wgpu::Surface<'_>>) -> GpuContext 
     // glyphs). Request the adapter's FULL headroom; the scene chunks the
     // arena so no single binding exceeds max_storage_buffer_binding_size, so
     // any adapter value works — but the bigger the limit, the fewer chunks.
+    // Same story for max_storage_buffers_per_shader_stage: the CubeCL scan
+    // skeleton's widest kernels bind 10-12 storage buffers (default is 8 —
+    // k_apply's pipeline failed validation on exactly that).
     let supported = adapter.limits();
     let limits = wgpu::Limits {
         max_storage_buffer_binding_size: supported.max_storage_buffer_binding_size,
         max_buffer_size: supported.max_buffer_size,
+        max_storage_buffers_per_shader_stage: supported.max_storage_buffers_per_shader_stage,
         ..Default::default()
     };
 

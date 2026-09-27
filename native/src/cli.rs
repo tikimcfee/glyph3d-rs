@@ -255,6 +255,11 @@ pub(crate) struct Cli {
     /// over one fixture, chunk partials diffed bit-exact vs scan.rs, exit.
     #[arg(long, value_name = "PATH")]
     pub(crate) cubecl_scan_check: Option<PathBuf>,
+    /// Dev-only CubeCL chain check (note 16, phase 2): the full scan skeleton
+    /// over one fixture — counts + line_advance bit-exact vs scan.rs,
+    /// positions deviation-reported, exit.
+    #[arg(long, value_name = "PATH")]
+    pub(crate) cubecl_chain_check: Option<PathBuf>,
     /// Windowed only: how frames reach the display. `fifo` (the default) is
     /// vsync, so the FPS line reads the monitor's refresh; `mailbox` and
     /// `immediate` uncap it where the surface supports them (else fifo, and
