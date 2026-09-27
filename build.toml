@@ -767,7 +767,7 @@ rebuild = "pixi run build-engine"
 name = "pick-off-by-one"
 gate = "pick-oracle"
 why = "an off-by-one in the exact-match is the realistic pick defect: it resolves to the neighbouring glyph, which still looks like a plausible answer. Only an INDEPENDENT oracle can call it wrong, which is what this gate is for"
-file = "native/src/glyph_scene.rs"
+file = "native/src/glyph_scene/pick.rs"
 op = "replace"
 find = """            if r.row() == row {
                 if r.col() == col {"""
