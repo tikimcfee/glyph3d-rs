@@ -24,4 +24,8 @@ grammars = { path = "/Users/lugo/localdev/externalcompute/zed/crates/grammars" }
 util = { path = "/Users/lugo/localdev/externalcompute/zed/crates/util", features = ["debug-embed"] }
 theme = { path = "/Users/lugo/localdev/externalcompute/zed/crates/theme" }
 syntax_theme = { path = "/Users/lugo/localdev/externalcompute/zed/crates/syntax_theme" }
+# MUST be zed's git fork (same rev as the workspace patch table) — the Node
+# type this walks is the fork's; a crates.io tree-sitter would be a second,
+# incompatible crate in the graph.
+tree-sitter = { git = "https://github.com/tree-sitter/tree-sitter", rev = "43623ec9bf0eaaf7113285c46e8a09018f181b18" }
 tree-sitter-rust = "0.24.2"

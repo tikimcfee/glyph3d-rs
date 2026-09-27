@@ -31,7 +31,8 @@ use gpui::AppContext as _;
 use gpui::TestAppContext;
 
 use glyph3d_native::seam::{
-    content_hash_version, BufferVersion, ContentDelta, FileKey, StyleRun, SurfaceUpdate,
+    content_hash_version, BufferVersion, ContentDelta, FileKey, StructureDelta, StyleRun,
+    SurfaceUpdate,
 };
 use glyph3d_native::glyph_scene::CameraMode;
 use glyph3d_native::{atlas, offscreen, repo, Op, SceneChoice};
@@ -312,7 +313,12 @@ fn provide(dir: PathBuf, tx: mpsc::Sender<SurfaceUpdate>, paced: bool) {
 
     const EDITED: &str = "zedspike-main.rs";
     let mut mirror: Option<Vec<u8>> = None;
-    let mut buffer = None;
+    // P2a-3: every buffer stays alive (fold toggles re-send updates at
+    // UNCHANGED versions, recomputing runs and structure from the live
+    // tree), and every file's original bytes stay mirrored (versions for
+    // non-edited files hash those; they never change).
+    let mut buffers: HashMap<String, gpui::Entity<language::Buffer>> = HashMap::new();
+    let mut originals: HashMap<String, Vec<u8>> = HashMap::new();
 
     for path in &files {
         let bytes = std::fs::read(path).expect("read file");
@@ -321,24 +327,25 @@ fn provide(dir: PathBuf, tx: mpsc::Sender<SurfaceUpdate>, paced: bool) {
             eprintln!("provider: skip {name}: not UTF-8");
             continue;
         };
+        let b = open_buffer(&cx, text, &rust);
+        originals.insert(name.clone(), bytes.clone());
+        buffers.insert(name.clone(), b.clone());
         if name == EDITED {
             mirror = Some(bytes.clone());
-            buffer = Some(open_buffer(&cx, text, &rust));
         } else {
             // Non-edited files: one Opened envelope, styled. Park BEFORE
             // styling — chunks read the parse, and an unparked buffer
             // styles as one gray run (the frame-0 bug this comment replaced).
-            let b = open_buffer(&cx, text, &rust);
             park(&cx);
             let runs = style_runs(&cx, &b, &syntax);
-            send(&tx, &name, content_hash_version(&bytes), ContentDelta::Opened(bytes), runs);
+            send(&tx, &name, content_hash_version(&bytes), ContentDelta::Opened(bytes), runs, Vec::new());
         }
     }
     let Some(mirror) = mirror.as_mut() else {
         eprintln!("provider: {EDITED} not found in {} — no live demo", dir.display());
         return;
     };
-    let buffer = buffer.unwrap();
+    let buffer = buffers.get(EDITED).expect("edited buffer kept alive");
 
     // Initial state of the edited file.
     park(&cx);
@@ -347,7 +354,8 @@ fn provide(dir: PathBuf, tx: mpsc::Sender<SurfaceUpdate>, paced: bool) {
         EDITED,
         content_hash_version(mirror),
         ContentDelta::Opened(mirror.clone()),
-        style_runs(&cx, &buffer, &syntax),
+        style_runs(&cx, buffer, &syntax),
+        Vec::new(),
     );
 
     // The script — three edits, each visible in the field's geometry:
@@ -355,9 +363,42 @@ fn provide(dir: PathBuf, tx: mpsc::Sender<SurfaceUpdate>, paced: bool) {
     //  2. DELETE a ~30-line middle block (it shrinks);
     //  3. APPEND 16 stub lines at the end (it grows again).
     // `paced` loops the cycle forever (~1.5 s per step) with a full-range
-    // revert at the end — the windowed demo's heartbeat.
+    // revert at the end — the windowed demo's heartbeat. P2a-3: fold mode
+    // toggles every 2 cycles — the field collapses to signatures and back.
     let original = mirror.clone();
+    let mut cycle = 0usize;
+    let mut folded = false;
     loop {
+        cycle += 1;
+        let want_folded = paced && (cycle / 2) % 2 == 1;
+        if want_folded != folded {
+            folded = want_folded;
+            eprintln!(
+                "provider: fold mode {}",
+                if folded { "ON — function bodies fold" } else { "OFF — full source" }
+            );
+            // Re-send every NON-edited file at its UNCHANGED version with the
+            // new structure. Content rides as a no-op edit: the corpus rule
+            // (bytes crossed once) holds — a toggle is structure, not content.
+            for (name, b) in &buffers {
+                if name == EDITED {
+                    continue;
+                }
+                park(&cx);
+                let snapshot = cx.read(|app| b.read(app).snapshot());
+                let runs = style_runs(&cx, b, &syntax);
+                let structure =
+                    if folded { function_body_folds(&snapshot) } else { Vec::new() };
+                send(
+                    &tx,
+                    name,
+                    content_hash_version(&originals[name]),
+                    ContentDelta::Edited { range: 0..0, text: Vec::new() },
+                    runs,
+                    structure,
+                );
+            }
+        }
         let banner = banner().to_string();
         let script: Vec<(usize, usize, String)> = {
             let text = String::from_utf8_lossy(mirror).into_owned();
@@ -400,9 +441,16 @@ fn provide(dir: PathBuf, tx: mpsc::Sender<SurfaceUpdate>, paced: bool) {
             park(&cx);
 
             let version = content_hash_version(mirror);
-            let runs = style_runs(&cx, &buffer, &syntax);
+            let runs = style_runs(&cx, buffer, &syntax);
+            // Structure at THIS version — fold ranges are byte ranges, and
+            // the edit above moved every byte after it.
+            let structure = if folded {
+                function_body_folds(&cx.read(|app| buffer.read(app).snapshot()))
+            } else {
+                Vec::new()
+            };
             eprintln!("provider: edit {i} applied ({} bytes now)", mirror.len());
-            send(&tx, EDITED, version, delta, runs);
+            send(&tx, EDITED, version, delta, runs, structure);
             if paced {
                 std::thread::sleep(Duration::from_millis(1500));
             }
@@ -429,9 +477,14 @@ fn provide(dir: PathBuf, tx: mpsc::Sender<SurfaceUpdate>, paced: bool) {
         delta.apply(mirror);
         park(&cx);
         let version = content_hash_version(mirror);
-        let runs = style_runs(&cx, &buffer, &syntax);
+        let runs = style_runs(&cx, buffer, &syntax);
+        let structure = if folded {
+            function_body_folds(&cx.read(|app| buffer.read(app).snapshot()))
+        } else {
+            Vec::new()
+        };
         eprintln!("provider: reverted ({} bytes)", mirror.len());
-        send(&tx, EDITED, version, delta, runs);
+        send(&tx, EDITED, version, delta, runs, structure);
         std::thread::sleep(Duration::from_millis(1500));
     }
 }
@@ -505,13 +558,14 @@ fn send(
     version: BufferVersion,
     content: ContentDelta,
     style: Vec<StyleRun>,
+    structure: Vec<StructureDelta>,
 ) {
     tx.send(SurfaceUpdate {
         file: FileKey(file.to_string()),
         version,
         content,
         style,
-        structure: Vec::new(),
+        structure,
         decorations: Vec::new(),
         complete: true,
     })
@@ -525,6 +579,40 @@ fn byte_of_line(lines: &[&str], line_ix: usize) -> usize {
         .take(line_ix)
         .map(|l| l.len() + 1)
         .sum()
+}
+
+/// P2a-3: THE structure-plane demo — fold every function BODY, computed
+/// from tree-sitter at the version being sent. The field's shape becomes
+/// semantic: columns collapse to their signatures.
+///
+/// The range is the block's INSIDE (between the braces), so a folded
+/// function keeps its `fn name(…) { }` outline shape. An empty body makes
+/// `start + 1 > end - 1` — the range vanishes in normalization, exactly
+/// right (nothing to fold). Ranges are raw node spans; the renderer
+/// normalizes to whole lines.
+fn function_body_folds(snapshot: &language::BufferSnapshot) -> Vec<StructureDelta> {
+    let mut folds = Vec::new();
+    for layer in snapshot.syntax_layers() {
+        collect_function_bodies(layer.node(), &mut folds);
+    }
+    folds
+}
+
+fn collect_function_bodies(node: tree_sitter::Node, folds: &mut Vec<StructureDelta>) {
+    if node.kind() == "function_item" {
+        if let Some(body) = node.child_by_field_name("body") {
+            let start = body.start_byte() + 1;
+            let end = body.end_byte() - 1;
+            if start < end {
+                folds.push(StructureDelta::Fold { range: start..end });
+            }
+        }
+    }
+    for i in 0..node.child_count() {
+        if let Some(child) = node.child(i) {
+            collect_function_bodies(child, folds);
+        }
+    }
 }
 
 /// HSLA (0..1 components) → sRGB bytes — the run color form. Chroma/hue-
