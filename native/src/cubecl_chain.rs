@@ -58,10 +58,14 @@ const P_HEAD_LEN: usize = 4;
 const P_TAIL_LEN: usize = 5;
 const P_WRAP: usize = 6;
 const P_MODE: usize = 7;
-/// The scan's measure static is ADVANCE ONLY. Height is renderer statics the
+/// The measure static is ADVANCE ONLY. Height is renderer statics the
 /// scan never reads; carrying it here doubled the per-byte measure traffic.
 const SM_STRIDE: usize = 1;
 const SM_ADVANCE: usize = 0;
+/// resolveX's per-cube shared reduction slots, item-relative from the item
+/// at the cube's first byte. A 2 KB tile spanning more than this many items
+/// (never in practice) takes the global-atomic overflow path instead.
+const RESOLVE_SLOTS: usize = 16;
 const LM_STRIDE: usize = 4;
 const LM_X: usize = 0;
 const LM_Y: usize = 1;
@@ -683,7 +687,22 @@ fn apply(
     }
 }
 
-// ── dispatch 7: resolveX — thread per byte, leaders only ─────────────────────
+// ── dispatch 4: resolveX — thread per byte, leaders only ─────────────────────
+//
+// The x re-sum is UNCHANGED (measured +0.2ms at wrap=96 — within a line the
+// predecessor advances are contiguous and L1-local — and its serial left-fold
+// order is what holds the fold>0 X lanes' bit-exact tier). What changed is
+// the maxima: the old kernel fired two GLOBAL fetch_max per leader, and with
+// per-item cells that serializes every leader in an item (the bench's single
+// item made all 24M leaders contend on two words — 41.6ms of the 69ms
+// chain). Now each cube reduces its leaders' maxima through SHARED atomics
+// in RESOLVE_SLOTS item-relative slots and flushes one global RMW per
+// touched slot: contention drops from leaders-per-item to
+// cubes-per-item. Cubes spanning more than RESOLVE_SLOTS items (never in
+// practice; items are files and tiles are 2 KB) fall back to the global
+// atomics on the overflow path. An untouched slot flushes 0, which can never
+// beat a real value: rows count from 1 and every x is >= 0, whose ordered
+// keys all exceed 0.
 #[cube(launch_unchecked)]
 fn resolve_x(
     sm: &[f32],
@@ -698,10 +717,34 @@ fn resolve_x(
     otb: &[u32],
     row_max: &mut [Atomic<u32>],
     x_max: &mut [Atomic<u32>],
+    #[comptime] units: usize,
 ) {
     let id = ABSOLUTE_POS;
     let n = fl.len();
     let item_count = ir.len() / 2;
+    let u = UNIT_POS as usize;
+    let srow = Shared::<[Atomic<u32>]>::new_slice(RESOLVE_SLOTS);
+    let sx = Shared::<[Atomic<u32>]>::new_slice(RESOLVE_SLOTS);
+    let mut sbase = Shared::<u32>::new();
+    let cube_lo = CUBE_POS * units;
+    if u == 0 {
+        // The item at this cube's first byte anchors the slot numbering.
+        let probe = if cube_lo < n { cube_lo } else { n - 1 };
+        let mut b = 0usize;
+        if item_count > 0 {
+            b = item_search(ir, item_count, probe);
+        }
+        *sbase = b as u32;
+    }
+    let mut z = u;
+    while z < RESOLVE_SLOTS {
+        srow[z].store(0u32);
+        sx[z].store(0u32);
+        z += units;
+    }
+    sync_cube();
+    let it_base = *sbase as usize;
+
     if id < n && (fl[id] & F_LEADER) != 0 && item_count > 0 {
         let it = item_search(ir, item_count, id);
         let io = it * IM_STRIDE;
@@ -719,7 +762,7 @@ fn resolve_x(
             let mut k = col % fold;
             while k >= 1 {
                 let q = otb[ir[it * 2] as usize + (ord - k) as usize] as usize;
-                x += sm[q * SM_STRIDE + SM_ADVANCE];
+                x += sm[q];
                 k -= 1;
             }
         } else {
@@ -734,8 +777,22 @@ fn resolve_x(
         lm[mo + LM_X] = base;
         lm[mo + LM_Y] = (row as f32) * (-lh) + items[io + IM_ORIGIN_Y];
         lm[mo + LM_Z] = (seg as f32) * (-items[io + IM_Z_STEP]) + items[io + IM_ORIGIN_Z];
-        row_max[it].fetch_max((row + 1) as u32);
-        x_max[it].fetch_max(ordered_key(x));
+        let slot = it - it_base;
+        if slot < RESOLVE_SLOTS {
+            srow[slot].fetch_max((row + 1) as u32);
+            sx[slot].fetch_max(ordered_key(x));
+        } else {
+            row_max[it].fetch_max((row + 1) as u32);
+            x_max[it].fetch_max(ordered_key(x));
+        }
+    }
+    sync_cube();
+    if u < RESOLVE_SLOTS {
+        let it = it_base + u;
+        if it < item_count {
+            row_max[it].fetch_max(srow[u].load());
+            x_max[it].fetch_max(sx[u].load());
+        }
     }
 }
 
@@ -995,6 +1052,7 @@ pub fn run(ctx: &GpuContext, fixture_path: &Path) -> ! {
                 BufferArg::from_raw_parts(h_otb.clone(), n),
                 BufferArg::from_raw_parts(h_rmax.clone(), item_count),
                 BufferArg::from_raw_parts(h_xmax.clone(), item_count),
+                256,
             );
         }
         if stages >= 5 {
@@ -1027,6 +1085,8 @@ pub fn run(ctx: &GpuContext, fixture_path: &Path) -> ! {
     let wc_bytes = client.read_one(h_wc).expect("read wc");
     let wm_bytes = client.read_one(h_wm).expect("read wm");
     let lm_bytes = client.read_one(h_lm).expect("read lm");
+    let rmax_bytes = client.read_one(h_rmax).expect("read rmax");
+    let xmax_bytes = client.read_one(h_xmax).expect("read xmax");
     let dt = t0.elapsed();
     if std::env::var_os("GLYPH_CHAIN_DEBUG").is_some() {
         let fl_bytes = client.read_one(h_fl).expect("read fl");
@@ -1052,11 +1112,40 @@ pub fn run(ctx: &GpuContext, fixture_path: &Path) -> ! {
     let wc: &[u32] = bytemuck::cast_slice(&wc_bytes);
     let wm: &[f32] = bytemuck::cast_slice(&wm_bytes);
     let lm: &[f32] = bytemuck::cast_slice(&lm_bytes);
+    let rmax: &[u32] = bytemuck::cast_slice(&rmax_bytes);
+    let xmax: &[u32] = bytemuck::cast_slice(&xmax_bytes);
+
+    // The item maxima, diffed DIRECTLY against the CPU fold's item_bounds
+    // lanes (TOTAL_ROWS, MAX_ROW_EXTENT) — the shared-atomic reduction in
+    // resolve_x is invisible to the lm lanes on unpaged fixtures, so without
+    // this it would have no witness at all.
+    let host_key_to_float = |k: u32| -> f32 {
+        let b = if (k & 0x8000_0000) != 0 { k & 0x7FFF_FFFF } else { !k };
+        f32::from_bits(b)
+    };
+    let mut bad = 0usize;
+    let mut max_x_dev = 0.0f64;
+    if stages >= 4 {
+        for i in 0..item_count {
+            let want_rows = r.item_bounds[i * 8 + 6];
+            if rmax[i] as f64 != want_rows {
+                if bad < 8 {
+                    println!("  MISMATCH item {i} total_rows: cpu {want_rows} gpu {}", rmax[i]);
+                }
+                bad += 1;
+            }
+            let want_x = r.item_bounds[i * 8 + 7];
+            let got_x = host_key_to_float(xmax[i]) as f64;
+            let x_dev = (got_x - want_x).abs() / want_x.abs().max(1.0);
+            if x_dev > max_x_dev {
+                max_x_dev = x_dev;
+            }
+        }
+    }
 
     // The diff: counts bit-exact; line_advance and positions reported with
     // max deviation and held to the oracle's 1e-4 eps tier (the module
     // header's contract note — the Blelloch tree reassociates tail_adv).
-    let mut bad = 0usize;
     let mut max_pos_dev = 0.0f64;
     let mut max_line_dev = 0.0f64;
     let mut leaders = 0usize;
@@ -1094,7 +1183,8 @@ pub fn run(ctx: &GpuContext, fixture_path: &Path) -> ! {
 
     println!(
         "cubecl-chain-check: {} ({} B, {} items, {} leaders, tile {}x{}) — {} count-lane mismatches, \
-         max line_adv deviation {:.2e}, max position deviation {:.2e}; chain+readbacks {:?} (smoke timing only)",
+         max line_adv deviation {:.2e}, max x-extent deviation {:.2e}, max position deviation {:.2e}; \
+         chain+readbacks {:?} (smoke timing only)",
         fx.name,
         n,
         item_count,
@@ -1103,16 +1193,17 @@ pub fn run(ctx: &GpuContext, fixture_path: &Path) -> ! {
         rake,
         bad,
         max_line_dev,
+        max_x_dev,
         max_pos_dev,
         dt
     );
-    if bad > 0 || max_line_dev > 1e-4 || max_pos_dev > 1e-4 {
+    if bad > 0 || max_line_dev > 1e-4 || max_x_dev > 1e-4 || max_pos_dev > 1e-4 {
         eprintln!(
-            "cubecl-chain-check FAIL: {bad} count mismatches, {max_line_dev:.2e} line_adv, {max_pos_dev:.2e} position deviation"
+            "cubecl-chain-check FAIL: {bad} count mismatches, {max_line_dev:.2e} line_adv, {max_x_dev:.2e} x-extent, {max_pos_dev:.2e} position deviation"
         );
         std::process::exit(1);
     }
-    println!("cubecl-chain-check PASS: counts bit-exact, line_advance + positions inside 1e-4");
+    println!("cubecl-chain-check PASS: counts bit-exact, maxima + line_advance + positions inside 1e-4");
     std::process::exit(0);
 }
 
@@ -1311,6 +1402,7 @@ pub fn bench(ctx: &GpuContext, corpus_path: &Path) -> ! {
                         BufferArg::from_raw_parts(h_otb.clone(), n),
                         BufferArg::from_raw_parts(h_rmax.clone(), 1),
                         BufferArg::from_raw_parts(h_xmax.clone(), 1),
+                        256,
                     );
                 }
                 4 => {
