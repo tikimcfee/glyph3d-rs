@@ -170,6 +170,11 @@ display's refresh (75 on the first Linux box) and not a fact about the renderer.
   swizzles BGRA→RGBA so the PNG compares directly against the Rgba
   baselines. The live-display-free proof of the composite shader.
 
+And one flag, not an env var: `--cubecl-smoke` — the dev-only CubeCL
+bring-up smoke (`cubecl_smoke.rs`, the note-16 phase 0): device-share +
+both-directions buffer interop + the contraction measurement, with
+verdicts printed. Not wired into the battery.
+
 ## Commit cadence
 
 One logical change per commit; run `tools/check-all.sh` before each lands and

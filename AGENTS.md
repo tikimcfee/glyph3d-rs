@@ -512,7 +512,7 @@ the JS oracle this engine was ported from, now retired: `tools/vendor/ref` and
 deliberately forked. Edits there are invisible to every check here, so they
 cannot be verified and cannot be trusted.
 
-Dependency pins (wgpu 30, winit 0.30, glam 0.33, egui 0.36, mojo/max per
+Dependency pins (wgpu 30, winit 0.30, glam 0.33, egui 0.36, cubecl =0.11.0-pre.4, mojo/max per
 `pixi.toml`): no bump without its own pass. The past bumps were done as multi-part
 work and their reports (`out/STAGE_H_REPORT.md`, `STAGE_I_REPORT.md`) are worth
 reading — but they agree on less than they look like they do, each having
