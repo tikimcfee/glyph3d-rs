@@ -45,6 +45,7 @@ use cubecl::prelude::*;
 use cubecl::wgpu::{AutoGraphicsApi, GraphicsApi, WgpuSetup};
 
 use crate::fold::WrapMode;
+use crate::text::ResolveGlyph;
 use crate::gpu::GpuContext;
 use crate::scan::{DEFAULT_CHUNK_SIZE, DEFAULT_GROUP_SIZE, run_scan_pipeline};
 
@@ -70,6 +71,10 @@ const RESOLVE_SLOTS: usize = 16;
 /// passthrough lane (fixture::F_MISSING), both in the packed low byte.
 const TRIE_FLAG_MISSING: u32 = 1;
 const F_MISSING: u32 = 8;
+/// The cluster trailer lane (fold::F_CLUSTER_TRAILER) — bit 16, inside the
+/// packed byte lane. Nothing in the chain reads it; the corpus FLAGS
+/// comparison is its only witness, so it rides anyway.
+const F_CLUSTER_TRAILER: u32 = 16;
 
 // ── dispatch 0: decode — thread per 4-byte word ──────────────────────────────
 //
@@ -164,6 +169,313 @@ fn decode(
         fl[w] = word;
     }
 
+}
+
+// ── the cluster pass, phase 3b: probe (parallel) + chain (per item) ───────────
+//
+// Re-derived scan-shaped per the design session: the PROBE is pure per byte
+// (its outcome depends only on the byte's own decode, forward bytes, the
+// tables, and the item end — verified against resolve_clusters), so it runs
+// one thread per WORD like decode. The CONSUMPTION is serial per item with
+// a single integer of state (the resume pointer) — the brief's counterexample
+// killed the naive max-scan: with W=[0,10), Y=[5,15), X=[12,14) the prefix-
+// max sees Y's 15 and suppresses X, which greedy commits. v1 runs the chain
+// one thread per ITEM (the product corpus is 1,306 items — item-parallel);
+// the chunked function-composition form (the Mojo zone tables) is the
+// follow-up only if a dense-single-item measurement demands it.
+//
+// Lookup is DESCENDING-LENGTH BINARY SEARCH over the sorted sequence
+// section (the section order is asserted at bake; the longest exact prefix
+// is unique) — semantics-neutral vs the Mojo st_probe hash by that same
+// argument, and it reuses the item_search pattern already proven here. The
+// comparator re-walks the probe's effective codepoints from the head byte
+// instead of storing a key array: the walk is deterministic, so no local
+// storage exists to spill.
+//
+// GAP-BYTE GUARD: the CPU walks only [start, stop); item_search attributes
+// bytes to the largest start <= id WITHOUT an end check, so every per-byte
+// test here carries its own id < stop guard — no fixture pins this (items
+// tile every fixture's blob), the landmine list does.
+
+/// sequence_length at i: the lenient classifier over the packed corpus.
+#[cube]
+fn seq_len_at(bytes: &[u32], i: usize, n: usize) -> u32 {
+    let b = byte_at(bytes, i, n);
+    if b & 0x80u32 == 0u32 {
+        1u32
+    } else if b & 0xE0u32 == 0xC0u32 {
+        2u32
+    } else if b & 0xF0u32 == 0xE0u32 {
+        3u32
+    } else if b & 0xF8u32 == 0xF0u32 {
+        4u32
+    } else {
+        0u32
+    }
+}
+
+/// decode_codepoint_at at i for a known length.
+#[cube]
+fn cp_at(bytes: &[u32], i: usize, len: u32, n: usize) -> u32 {
+    let b = byte_at(bytes, i, n);
+    let b1 = byte_at(bytes, i + 1, n);
+    let b2 = byte_at(bytes, i + 2, n);
+    let b3 = byte_at(bytes, i + 3, n);
+    if len == 1u32 {
+        b
+    } else if len == 2u32 {
+        ((b & 0x1Fu32) << 6u32) | (b1 & 0x3Fu32)
+    } else if len == 3u32 {
+        ((b & 0x0Fu32) << 12u32) | ((b1 & 0x3Fu32) << 6u32) | (b2 & 0x3Fu32)
+    } else {
+        ((b & 0x07u32) << 18u32) | ((b1 & 0x3Fu32) << 12u32) | ((b2 & 0x3Fu32) << 6u32) | (b3 & 0x3Fu32)
+    }
+}
+
+/// is_static_zero_cp: ZWJ, the variation selectors, the tag characters.
+#[cube]
+// clippy:manual-range-contains allowed here — the cube macro has no
+// RangeInclusive::contains expansion, and this is the spelled-out form it
+// takes on device.
+#[allow(clippy::manual_range_contains)]
+fn is_static_zero(cp: u32) -> u32 {
+    if cp == 0x200Du32 || (cp >= 0xFE00u32 && cp <= 0xFE0Fu32) || (cp >= 0xE0020u32 && cp <= 0xE007Fu32) {
+        1u32
+    } else {
+        0u32
+    }
+}
+
+
+/// The cluster PROBE: thread per word. Static-zero bytes of cluster items
+/// are marked here (unconditionally — match-independent, fold.rs:543-549);
+/// candidates build their EFFECTIVE key into per-unit shared scratch (the
+/// head's own codepoint first, FE0F skipped but riding, newline/VS15/
+/// continuation/item-end breaking) and run a descending-length binary
+/// search over the sorted sequence section — the longest exact prefix is
+/// unique, so this is answer-identical to the CPU's linear scan and the
+/// Mojo's hash probe alike. The span end re-walks counting CONSUMED key
+/// elements, so trailing FE0Fs past the last consumer stay outside.
+///
+/// All of this lives INLINE in the kernel with Shared scratch because the
+/// walk/search shapes only compile in kernel context — loops in HELPERS
+/// break the macro's assign typing (recorded landmine; the deleted helper
+/// drafts are in the commit history).
+#[cube(launch_unchecked)]
+fn cluster_probe(
+    bytes: &[u32],
+    bitmap: &[u32],
+    seq: &[u32],
+    ir: &[u32],
+    ic: &[u32],
+    fl: &mut [u32],
+    sm: &mut [f32],
+    cslot: &mut [u32],
+    cend: &mut [u32],
+    #[comptime] units: usize,
+    #[comptime] seq_max: u32,
+) {
+    let w = ABSOLUTE_POS;
+    let n = bytes.len() * 4;
+    let u = UNIT_POS as usize;
+    let item_count = ir.len() / 2;
+    // Per-unit key scratch: seq_max effective codepoints.
+    let mut skey = Shared::<[u32]>::new_slice(units * seq_max as usize);
+    if w < fl.len() {
+        let mut word = fl[w];
+        let mut lane = 0usize;
+        while lane < 4 {
+            let id = w * 4 + lane;
+            if id < n {
+                let len = seq_len_at(bytes, id, n);
+                if len > 0u32 {
+                    let mut stop = 0usize;
+                    let mut cluster = false;
+                    if item_count > 0 {
+                        let it = item_search(ir, item_count, id);
+                        stop = ir[it * 2 + 1] as usize;
+                        cluster = ic[it] != 0;
+                    }
+                    // The gap-byte guard: only bytes INSIDE the item range.
+                    if cluster && id < stop {
+                        let cp = cp_at(bytes, id, len, n);
+                        if is_static_zero(cp) != 0u32 {
+                            sm[id] = f32::from_bits(0u32);
+                            word |= F_CLUSTER_TRAILER << ((lane as u32) * 8u32);
+                        } else {
+                            let bit = (bitmap[(cp >> 5u32) as usize] >> (cp & 0x1Fu32)) & 1u32;
+                            if bit != 0u32 {
+                                // Key build: the head's own cp is element 0.
+                                let mut klen = 0u32;
+                                let mut p = id;
+                                let mut alive = 1u32;
+                                while alive == 1u32 && p < stop && klen < seq_max {
+                                    let len2 = seq_len_at(bytes, p, n);
+                                    let cp2 = cp_at(bytes, p, len2, n);
+                                    let dead = if len2 == 0u32 || cp2 == 0x0Au32 || cp2 == 0xFE0Eu32 {
+                                        1u32
+                                    } else {
+                                        0u32
+                                    };
+                                    if dead == 1u32 {
+                                        alive = 0u32;
+                                    }
+                                    if dead == 0u32 {
+                                        if cp2 != 0xFE0Fu32 {
+                                            skey[u * seq_max as usize + klen as usize] = cp2;
+                                            klen += 1u32;
+                                        }
+                                        p += len2 as usize;
+                                    }
+                                }
+                                // Descending-length binary search.
+                                let stride = 2u32 + seq_max;
+                                let seq_count = (seq.len() / stride as usize) as u32;
+                                let mut elen = if klen < seq_max { klen } else { seq_max };
+                                let mut slot = 0u32;
+                                let mut need = 0u32;
+                                while elen >= 2u32 && slot == 0u32 {
+                                    let mut lo = 0u32;
+                                    let mut hi = seq_count;
+                                    while lo < hi {
+                                        let mid = (lo + hi) / 2u32;
+                                        let eoff = mid as usize * stride as usize;
+                                        let entry_len = seq[eoff + 1];
+                                        let kmax = if entry_len < elen { entry_len } else { elen };
+                                        let mut ord = 0i32;
+                                        let mut k = 0u32;
+                                        while k < kmax && ord == 0i32 {
+                                            let want = seq[eoff + 2 + k as usize];
+                                            let probe = skey[u * seq_max as usize + k as usize];
+                                            if probe < want {
+                                                ord = -1i32;
+                                            }
+                                            if ord == 0i32 && probe > want {
+                                                ord = 1i32;
+                                            }
+                                            k += 1u32;
+                                        }
+                                        if ord == 0i32 {
+                                            // Shorter-prefix-first order: with equal
+                                            // elements the SHORTER sequence sorts first,
+                                            // so a longer entry is GREATER than the probe.
+                                            if entry_len < elen {
+                                                ord = 1i32;
+                                            }
+                                            if entry_len > elen {
+                                                ord = -1i32;
+                                            }
+                                        }
+                                        if ord < 0i32 {
+                                            hi = mid;
+                                        }
+                                        if ord > 0i32 {
+                                            lo = mid + 1u32;
+                                        }
+                                        if ord == 0i32 {
+                                            slot = seq[eoff];
+                                            need = elen;
+                                            lo = hi;
+                                        }
+                                    }
+                                    elen -= 1u32;
+                                }
+                                if slot != 0u32 {
+                                    // Span end: re-walk, counting consumers.
+                                    let mut got2 = 0u32;
+                                    let mut p2 = id;
+                                    let mut send = id as u32;
+                                    let mut alive2 = 1u32;
+                                    while alive2 == 1u32 && p2 < stop {
+                                        let len3 = seq_len_at(bytes, p2, n);
+                                        let cp3 = cp_at(bytes, p2, len3, n);
+                                        let dead3 = if len3 == 0u32 || cp3 == 0x0Au32 || cp3 == 0xFE0Eu32 {
+                                            1u32
+                                        } else {
+                                            0u32
+                                        };
+                                        if dead3 == 1u32 {
+                                            alive2 = 0u32;
+                                        }
+                                        if dead3 == 0u32 {
+                                            if cp3 != 0xFE0Fu32 {
+                                                got2 += 1u32;
+                                                if got2 == need {
+                                                    send = (p2 + len3 as usize) as u32;
+                                                }
+                                            }
+                                            p2 += len3 as usize;
+                                        }
+                                    }
+                                    cslot[id] = slot;
+                                    cend[id] = send;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            lane += 1usize;
+        }
+        fl[w] = word;
+    }
+}
+
+/// The cluster CHAIN: thread per item, the greedy walk. A candidate commits
+/// iff the walk VISITS it (suppressed candidates never claim their spans —
+/// the overlap fixture's rule); the walk resumes past each committed span.
+/// Trailer marking ORs F_CLUSTER_TRAILER into packed flag words through
+/// atomics — a word can straddle items, so byte-lane writes from different
+/// item threads race otherwise.
+#[cube(launch_unchecked)]
+fn cluster_chain(
+    bytes: &[u32],
+    ir: &[u32],
+    ic: &[u32],
+    cslot: &[u32],
+    cend: &[u32],
+    sm: &mut [f32],
+    fl_atomic: &mut [Atomic<u32>],
+    bitmap_advance: f32,
+) {
+    let it = ABSOLUTE_POS;
+    let item_count = ir.len() / 2;
+    let n = bytes.len() * 4;
+    if it < item_count && ic[it] != 0 {
+        let mut p = ir[it * 2] as usize;
+        let stop = ir[it * 2 + 1] as usize;
+        while p < stop {
+            let slot = cslot[p];
+            if slot != 0u32 {
+                let e = cend[p] as usize;
+                sm[p] = bitmap_advance;
+                let mut t = p + 1usize;
+                while t < e {
+                    if flags_at_from_atomic(fl_atomic, t) & F_LEADER != 0 {
+                        sm[t] = f32::from_bits(0u32);
+                        fl_atomic[t >> 2].fetch_or(F_CLUSTER_TRAILER << (((t & 3) as u32) * 8u32));
+                    }
+                    t += 1usize;
+                }
+                p = e;
+            } else {
+                let len = seq_len_at(bytes, p, n);
+                if len > 0u32 {
+                    p += len as usize;
+                } else {
+                    p += 1usize;
+                }
+            }
+        }
+    }
+}
+
+/// flags_at over the atomic view of the packed flag buffer (the chain reads
+/// leader bits while OR-ing trailer bits into the same words — the fetch_or
+/// never touches bit 0, so reads stay consistent).
+#[cube]
+fn flags_at_from_atomic(fl: &mut [Atomic<u32>], i: usize) -> u32 {
+    fl[i >> 2].load() >> (((i & 3) as u32) * 8u32) & 0xFFu32
 }
 
 /// Byte i of the packed corpus, zero past the end (the reference's
@@ -1668,6 +1980,194 @@ pub fn decode_check(ctx: &GpuContext, fixture_path: &Path) -> ! {
         std::process::exit(1);
     }
     println!("cubecl-decode-check PASS: flags + advance bit-exact vs decode_all");
+    std::process::exit(0);
+}
+
+// ── the cluster-check driver ──────────────────────────────────────────────────
+
+/// Host-side cluster inputs from a flat sequence table: the candidacy
+/// bitmap (one bit per codepoint, set for every sequence's first member)
+/// and the per-item cluster flags.
+pub(crate) fn cluster_host_inputs(
+    seq: &[u32],
+    seq_max: u32,
+    items: &[crate::fold::Item],
+) -> (Vec<u32>, Vec<u32>) {
+    let stride = 2 + seq_max as usize;
+    let mut bitmap = vec![0u32; 0x110000 / 32 + 1];
+    for i in (0..seq.len()).step_by(stride) {
+        let cp = seq[i + 2] as usize;
+        bitmap[cp >> 5] |= 1 << (cp & 31);
+    }
+    let ic = items
+        .iter()
+        .map(|it| u32::from(it.cluster_mode == crate::fold::ClusterMode::Cluster))
+        .collect();
+    (bitmap, ic)
+}
+
+/// `--cubecl-cluster-check <fixture.pipe.bin>`: decode + cluster on device
+/// vs `decode_all` + `resolve_clusters` on CPU — packed flags (low byte,
+/// trailer bit included) and advance diffed BIT-EXACT per byte. Non-cluster
+/// fixtures verify the pass is a no-op for leader items.
+pub fn cluster_check(ctx: &GpuContext, fixture_path: &Path) -> ! {
+    let fx = crate::fixture::load_pipe_fixture(fixture_path).unwrap_or_else(|e| {
+        eprintln!("cubecl-cluster-check: {e}");
+        std::process::exit(1);
+    });
+    let n = fx.bytes.len();
+    let mut slots = crate::fold::Slots::new(n);
+    let _ = crate::fold::decode_all(&fx.bytes, &mut slots, &fx.trie);
+    for item in &fx.items {
+        if item.cluster_mode == crate::fold::ClusterMode::Cluster {
+            crate::fold::resolve_clusters(&fx.bytes, &mut slots, &fx.trie, item);
+        }
+    }
+
+    let n_words = n.div_ceil(4);
+    let mut packed = vec![0u32; n_words];
+    for (i, &b) in fx.bytes.iter().enumerate() {
+        packed[i >> 2] |= (b as u32) << ((i & 3) * 8);
+    }
+    let (seq, seq_max, bitmap_advance) = match fx.trie.cluster_table() {
+        Some((s, m, a)) => (s.to_vec(), m, a),
+        None => (Vec::new(), 2u32, f32::NAN),
+    };
+    let (bitmap, ic) = cluster_host_inputs(&seq, seq_max, &fx.items);
+    let mut ir = Vec::with_capacity(fx.items.len() * 2);
+    for item in &fx.items {
+        ir.push(item.byte_start as u32);
+        ir.push((item.byte_start + item.byte_count) as u32);
+    }
+
+    let setup = WgpuSetup {
+        instance: ctx.instance.clone(),
+        adapter: ctx.adapter.clone(),
+        device: ctx.device.clone(),
+        queue: ctx.queue.clone(),
+        backend: AutoGraphicsApi::backend(),
+    };
+    let cdev = cubecl::wgpu::init_device(setup, Default::default());
+    let client = cubecl::Device::Wgpu(cdev).client();
+    let h_bytes = client.create_from_slice(bytemuck::cast_slice(&packed));
+    let h_bi = client.create_from_slice(bytemuck::cast_slice(&fx.trie.block_index));
+    let h_bm = client.create_from_slice(bytemuck::cast_slice(&fx.trie.blocks_m));
+    let h_bc = client.create_from_slice(bytemuck::cast_slice(&fx.trie.blocks_c));
+    let h_seq = client.create_from_slice(bytemuck::cast_slice(&seq));
+    let h_bmap = client.create_from_slice(bytemuck::cast_slice(&bitmap));
+    let h_ir = client.create_from_slice(bytemuck::cast_slice(&ir));
+    let h_ic = client.create_from_slice(bytemuck::cast_slice(&ic));
+    let h_fl = client.empty(n_words * 4);
+    let h_sm = client.empty(n * 4);
+    let h_cslot = client.create_from_slice(bytemuck::cast_slice(&vec![0u32; n]));
+    let h_cend = client.empty(n * 4);
+    let cubes_of = |threads: usize| {
+        let cubes = threads.div_ceil(256);
+        CubeCount::Static(cubes.min(65535) as u32, cubes.div_ceil(65535) as u32, 1)
+    };
+    let t0 = std::time::Instant::now();
+    unsafe {
+        decode::launch_unchecked(
+            &client,
+            cubes_of(n_words),
+            CubeDim::new_1d(256),
+            BufferArg::from_raw_parts(h_bytes.clone(), n_words),
+            BufferArg::from_raw_parts(h_bi.clone(), fx.trie.block_index.len()),
+            BufferArg::from_raw_parts(h_bm.clone(), fx.trie.blocks_m.len()),
+            BufferArg::from_raw_parts(h_bc.clone(), fx.trie.blocks_c.len()),
+            BufferArg::from_raw_parts(h_fl.clone(), n_words),
+            BufferArg::from_raw_parts(h_sm.clone(), n),
+            crate::glyph_trie::BLOCK_SHIFT,
+        );
+        cluster_probe::launch_unchecked(
+            &client,
+            cubes_of(n_words),
+            CubeDim::new_1d(256),
+            BufferArg::from_raw_parts(h_bytes.clone(), n_words),
+            BufferArg::from_raw_parts(h_bmap.clone(), bitmap.len()),
+            BufferArg::from_raw_parts(h_seq.clone(), seq.len()),
+            BufferArg::from_raw_parts(h_ir.clone(), ir.len()),
+            BufferArg::from_raw_parts(h_ic.clone(), ic.len()),
+            BufferArg::from_raw_parts(h_fl.clone(), n_words),
+            BufferArg::from_raw_parts(h_sm.clone(), n),
+            BufferArg::from_raw_parts(h_cslot.clone(), n),
+            BufferArg::from_raw_parts(h_cend.clone(), n),
+            256,
+            seq_max,
+        );
+        cluster_chain::launch_unchecked(
+            &client,
+            cubes_of(fx.items.len().max(1)),
+            CubeDim::new_1d(256),
+            BufferArg::from_raw_parts(h_bytes.clone(), n_words),
+            BufferArg::from_raw_parts(h_ir.clone(), ir.len()),
+            BufferArg::from_raw_parts(h_ic.clone(), ic.len()),
+            BufferArg::from_raw_parts(h_cslot.clone(), n),
+            BufferArg::from_raw_parts(h_cend.clone(), n),
+            BufferArg::from_raw_parts(h_sm.clone(), n),
+            BufferArg::from_raw_parts(h_fl.clone(), n_words),
+            bitmap_advance,
+        );
+    }
+    let fl_bytes = client.read_one(h_fl).expect("read fl");
+    let sm_bytes = client.read_one(h_sm).expect("read sm");
+    let dt = t0.elapsed();
+    let flw: &[u32] = bytemuck::cast_slice(&fl_bytes);
+    let sm: &[f32] = bytemuck::cast_slice(&sm_bytes);
+    if std::env::var_os("GLYPH_CHAIN_DEBUG").is_some() {
+        let cs = client.read_one(h_cslot).expect("read cslot");
+        let ce = client.read_one(h_cend).expect("read cend");
+        let csv: &[u32] = bytemuck::cast_slice(&cs);
+        let cev: &[u32] = bytemuck::cast_slice(&ce);
+        for i in 0..n {
+            if csv[i] != 0 {
+                println!("  dbg cslot[{i}]={} cend[{i}]={}", csv[i], cev[i]);
+            }
+        }
+        let stride = 2 + seq_max as usize;
+        println!("  dbg seq table stride {stride}, {} entries", seq.len() / stride);
+        for e in 0..(seq.len() / stride).min(4) {
+            let o = e * stride;
+            let l = seq[o + 1] as usize;
+            println!("  dbg entry {e}: slot {} len {} cps {:?}", seq[o], l, &seq[o + 2..o + 2 + l]);
+        }
+    }
+
+    let mut bad = 0usize;
+    for id in 0..n {
+        let want_f = slots.flags(id) & 0xFF;
+        let got_f = (flw[id >> 2] >> (((id & 3) * 8) as u32)) & 0xFF;
+        if want_f != got_f {
+            if bad < 8 {
+                println!("  MISMATCH byte {id} flags: cpu {want_f:#04x} gpu {got_f:#04x}");
+            }
+            bad += 1;
+        }
+        if slots.advance(id).to_bits() != sm[id].to_bits() {
+            if bad < 8 {
+                println!(
+                    "  MISMATCH byte {id} advance: cpu {:e} gpu {:e}",
+                    slots.advance(id),
+                    sm[id]
+                );
+            }
+            bad += 1;
+        }
+    }
+    println!(
+        "cubecl-cluster-check: {} ({} B, {} items, {} seq entries) — {} lane mismatches; decode+cluster+readbacks {:?} (smoke timing only)",
+        fx.name,
+        n,
+        fx.items.len(),
+        seq.len() / (2 + seq_max as usize),
+        bad,
+        dt
+    );
+    if bad > 0 {
+        eprintln!("cubecl-cluster-check FAIL: {bad} lane mismatches vs decode_all + resolve_clusters");
+        std::process::exit(1);
+    }
+    println!("cubecl-cluster-check PASS: flags + advance bit-exact, cluster trailers and head advances included");
     std::process::exit(0);
 }
 
