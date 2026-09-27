@@ -294,21 +294,35 @@ fn cluster_probe(
             if id < n {
                 let len = seq_len_at(bytes, id, n);
                 if len > 0u32 {
+                    let mut start = 0usize;
                     let mut stop = 0usize;
                     let mut cluster = false;
                     if item_count > 0 {
                         let it = item_search(ir, item_count, id);
+                        start = ir[it * 2] as usize;
                         stop = ir[it * 2 + 1] as usize;
                         cluster = ic[it] != 0;
                     }
                     // The gap-byte guard: only bytes INSIDE the item range.
-                    if cluster && id < stop {
+                    // BOTH edges are load-bearing — item_search clamps to
+                    // item 0 for bytes BEFORE the first item (a leading gap
+                    // would otherwise take item 0's static-zero marking,
+                    // which the CPU never applies there).
+                    if cluster && id >= start && id < stop {
                         let cp = cp_at(bytes, id, len, n);
                         if is_static_zero(cp) != 0u32 {
                             sm[id] = f32::from_bits(0u32);
                             word |= F_CLUSTER_TRAILER << ((lane as u32) * 8u32);
                         } else {
-                            let bit = (bitmap[(cp >> 5u32) as usize] >> (cp & 0x1Fu32)) & 1u32;
+                            // cp above 0x10FFFF is malformed decode — the
+                            // bitmap covers real codepoints only; reject
+                            // here rather than lean on the backend's
+                            // OOB-read-is-zero (decode guards this class
+                            // itself).
+                            let mut bit = 0u32;
+                            if cp <= 0x10FFFFu32 {
+                                bit = (bitmap[(cp >> 5u32) as usize] >> (cp & 0x1Fu32)) & 1u32;
+                            }
                             if bit != 0u32 {
                                 // Pair filter: every reachable table entry
                                 // has effective length >= 2 (the matcher's
@@ -817,10 +831,14 @@ fn cluster_mark(
     cend: &[u32],
     sm: &mut [f32],
     fl_atomic: &mut [Atomic<u32>],
-    kmax: u32,
-    stride: u32,
+    #[comptime] kmax: usize,
+    #[comptime] stride: usize,
     bitmap_advance: f32,
 ) {
+    // Comptime on purpose — landmine #7's shape (runtime scalars after
+    // several same-typed slices) misbound rank_step outright before these
+    // were comptime; there is no reason to keep a second instance of the
+    // shape to find out how narrow the trigger is.
     let i = ABSOLUTE_POS;
     let c = c_count[0] as usize;
     let item_count = ir.len() / 2;
@@ -836,13 +854,13 @@ fn cluster_mark(
             if ti <= tr {
                 let mut x = r as u32;
                 let mut rem = tr - ti;
-                let mut k = 0u32;
+                let mut k = 0usize;
                 while k < kmax && rem > 0u32 {
                     if rem & 1u32 == 1u32 {
-                        x = lvl[(k * stride + x) as usize];
+                        x = lvl[k * stride + x as usize];
                     }
                     rem >>= 1u32;
-                    k += 1u32;
+                    k += 1usize;
                 }
                 if x as usize == i {
                     // The trailer walk clamps to the ITEM END — cend can
@@ -2413,14 +2431,27 @@ pub(crate) fn cluster_host_inputs(
 }
 
 /// The probe's second-level filter: for every first codepoint that starts
-/// sequences, the SORTED list of second effective elements that actually
-/// occur. `sec_off` is indexed by cp (0x110002 entries — the +1 read gives
+/// sequences, the SORTED list of second elements that actually occur. The
+/// table stores EFFECTIVE keys (FE0F already stripped — the keycap entry
+/// is `[49, 8419]`), so the recorded seconds are the effective seconds; a
+/// pathological raw-FE0F entry would only yield a dead, over-accept-only
+/// pair. `sec_off` is indexed by cp (0x110002 entries — the +1 read gives
 /// each first's end), `sec_val` the flat seconds grouped by first. Entries
 /// shorter than 2 are skipped: the matcher's own `elen >= 2` guard makes
 /// them unreachable on both sides, so rejecting before the search is
 /// behavior-identical.
 pub(crate) fn cluster_pair_filter(seq: &[u32], seq_max: u32) -> (Vec<u32>, Vec<u32>) {
     let stride = 2 + seq_max as usize;
+    // The kernel's "no second found" sentinel is codepoint 0 — pin that no
+    // entry carries a zero ELEMENT at all (a NUL second would be
+    // indistinguishable from "none" and silently diverge from the CPU,
+    // which keys it). Trie data, checked once, fails loudly.
+    assert!(
+        (0..seq.len())
+            .step_by(stride)
+            .all(|e| (0..seq[e + 1] as usize).all(|k| seq[e + 2 + k] != 0)),
+        "sequence entry with a zero element would break the pair filter's sentinel"
+    );
     let mut pairs: Vec<(u32, u32)> = Vec::new();
     for e in (0..seq.len()).step_by(stride) {
         if seq[e + 1] >= 2 {
@@ -2669,8 +2700,8 @@ pub fn cluster_check(ctx: &GpuContext, fixture_path: &Path) -> ! {
             BufferArg::from_raw_parts(h_cend.clone(), n),
             BufferArg::from_raw_parts(h_sm.clone(), n),
             BufferArg::from_raw_parts(h_fl.clone(), n_words),
-            kmax,
-            stride as u32,
+            kmax as usize,
+            stride,
             bitmap_advance,
         );
     }
@@ -3228,8 +3259,8 @@ pub fn bench(ctx: &GpuContext, corpus_path: &Path) -> ! {
                     BufferArg::from_raw_parts(h_cend.clone(), n),
                     BufferArg::from_raw_parts(h_sm.clone(), n),
                     BufferArg::from_raw_parts(h_fl.clone(), n_words),
-                    kmax,
-                    cstride as u32,
+                    kmax as usize,
+                    cstride,
                     bitmap_advance,
                 );
             }
@@ -3363,6 +3394,13 @@ pub fn bench(ctx: &GpuContext, corpus_path: &Path) -> ! {
         "derive_stride",
         "paginate",
     ]);
+    // The STAGES knob is a bisection count, not a hint — reject past the
+    // dispatched table instead of panicking in the report loops below.
+    assert!(
+        stages <= stage_names.len(),
+        "GLYPH_CHAIN_STAGES={stages} exceeds the {} stages this configuration dispatches",
+        stage_names.len()
+    );
     let stage_meta = |s: usize| -> (&'static str, usize, u32) {
         if decode_mode && s == 0 {
             return ("decode", n_words.div_ceil(256), 256);
