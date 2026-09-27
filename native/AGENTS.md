@@ -188,6 +188,9 @@ Shared env vars: `GLYPH_CHAIN_STAGES` (absolute dispatch count — bisection),
 `GLYPH_CHAIN_LOOP` (samples, minimum reported), `GLYPH_CHAIN_WRAP=<w>`
 (fold>0 shape), `GLYPH_CHAIN_TILE`/`RAKE` (scan shape), `GLYPH_CHAIN_SPAN`
 (resolve worker bytes), `GLYPH_CHAIN_DECODE=1` (bench runs from raw bytes),
+`GLYPH_CHAIN_CLUSTER=1` (bench adds cluster mode — implies DECODE; the
+bench item flips to Cluster, probe/chain are timed as stages 1-2, and
+fl/sm are diffed bit-exact against `decode_all`+`resolve_clusters`),
 `GLYPH_CHAIN_DEBUG=1` (dumps, incl. the cluster candidate table).
 
 ## Commit cadence

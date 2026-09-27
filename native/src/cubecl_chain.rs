@@ -249,7 +249,7 @@ fn is_static_zero(cp: u32) -> u32 {
 
 /// The cluster PROBE: thread per word. Static-zero bytes of cluster items
 /// are marked here (unconditionally — match-independent, fold.rs:543-549);
-/// candidates build their EFFECTIVE key into per-unit shared scratch (the
+/// candidates build their EFFECTIVE key into a per-thread LOCAL array (the
 /// head's own codepoint first, FE0F skipped but riding, newline/VS15/
 /// continuation/item-end breaking) and run a descending-length binary
 /// search over the sorted sequence section — the longest exact prefix is
@@ -257,10 +257,17 @@ fn is_static_zero(cp: u32) -> u32 {
 /// Mojo's hash probe alike. The span end re-walks counting CONSUMED key
 /// elements, so trailing FE0Fs past the last consumer stay outside.
 ///
-/// All of this lives INLINE in the kernel with Shared scratch because the
-/// walk/search shapes only compile in kernel context — loops in HELPERS
-/// break the macro's assign typing (recorded landmine; the deleted helper
-/// drafts are in the commit history).
+/// The key scratch is a LOCAL `Array`, not `Shared`: each unit only ever
+/// touches its own row, so workgroup memory was never doing inter-thread
+/// work — but its allocation (WGSL zero-initializes `var<workgroup>`) cost
+/// every cube 8KB of memset whether or not any candidate ran. Measured
+/// 2026-09-27: 63.9ms of probe time on a 24MB text corpus whose bytes all
+/// bitmap-reject — 2.7µs/cube of pure scratch init.
+///
+/// All of this lives INLINE in the kernel because the walk/search shapes
+/// only compile in kernel context — loops in HELPERS break the macro's
+/// assign typing (recorded landmine; the deleted helper drafts are in the
+/// commit history).
 #[cube(launch_unchecked)]
 fn cluster_probe(
     bytes: &[u32],
@@ -272,15 +279,11 @@ fn cluster_probe(
     sm: &mut [f32],
     cslot: &mut [u32],
     cend: &mut [u32],
-    #[comptime] units: usize,
     #[comptime] seq_max: u32,
 ) {
     let w = ABSOLUTE_POS;
     let n = bytes.len() * 4;
-    let u = UNIT_POS as usize;
     let item_count = ir.len() / 2;
-    // Per-unit key scratch: seq_max effective codepoints.
-    let mut skey = Shared::<[u32]>::new_slice(units * seq_max as usize);
     if w < fl.len() {
         let mut word = fl[w];
         let mut lane = 0usize;
@@ -306,6 +309,9 @@ fn cluster_probe(
                             let bit = (bitmap[(cp >> 5u32) as usize] >> (cp & 0x1Fu32)) & 1u32;
                             if bit != 0u32 {
                                 // Key build: the head's own cp is element 0.
+                                // The scratch is LOCAL to this thread —
+                                // declared here so only candidates pay for it.
+                                let mut skey = Array::<u32>::new(seq_max as usize);
                                 let mut klen = 0u32;
                                 let mut p = id;
                                 let mut alive = 1u32;
@@ -322,7 +328,7 @@ fn cluster_probe(
                                     }
                                     if dead == 0u32 {
                                         if cp2 != 0xFE0Fu32 {
-                                            skey[u * seq_max as usize + klen as usize] = cp2;
+                                            skey[klen as usize] = cp2;
                                             klen += 1u32;
                                         }
                                         p += len2 as usize;
@@ -346,7 +352,7 @@ fn cluster_probe(
                                         let mut k = 0u32;
                                         while k < kmax && ord == 0i32 {
                                             let want = seq[eoff + 2 + k as usize];
-                                            let probe = skey[u * seq_max as usize + k as usize];
+                                            let probe = skey[k as usize];
                                             if probe < want {
                                                 ord = -1i32;
                                             }
@@ -2041,13 +2047,14 @@ pub fn cluster_check(ctx: &GpuContext, fixture_path: &Path) -> ! {
         Some((s, m, a)) => (s.to_vec(), m, a),
         None => (Vec::new(), 2u32, f32::NAN),
     };
-    // The probe's Shared key scratch is units x seq_max u32 per workgroup;
-    // seq_max is TRIE DATA, so a pathological table could exceed Metal's
-    // 32KB threadgroup budget at pipeline creation. Fail here, loudly,
-    // instead of coupling kernel viability to atlas content.
+    // The probe's key scratch is a LOCAL array of seq_max u32 per candidate
+    // thread (it was workgroup memory until 2026-09-27 — WGSL zero-initializes
+    // `var<workgroup>`, which cost every cube 8KB of memset). seq_max is TRIE
+    // DATA, so a pathological table would still bloat the per-thread scratch;
+    // fail here, loudly, instead of coupling kernel viability to atlas content.
     assert!(
-        256 * seq_max as usize * 4 < 32 * 1024,
-        "seq_max {seq_max} would exceed the 32KB shared budget"
+        seq_max <= 64,
+        "seq_max {seq_max} would exceed the local key-scratch budget"
     );
     let (bitmap, ic) = cluster_host_inputs(&seq, seq_max, &fx.items);
     let mut ir = Vec::with_capacity(fx.items.len() * 2);
@@ -2108,7 +2115,6 @@ pub fn cluster_check(ctx: &GpuContext, fixture_path: &Path) -> ! {
             BufferArg::from_raw_parts(h_sm.clone(), n),
             BufferArg::from_raw_parts(h_cslot.clone(), n),
             BufferArg::from_raw_parts(h_cend.clone(), n),
-            256,
             seq_max,
         );
         cluster_chain::launch_unchecked(
@@ -2205,6 +2211,15 @@ pub fn cluster_check(ctx: &GpuContext, fixture_path: &Path) -> ! {
 /// WRAP_DOWN so the segment re-sum in resolve_x actually executes — the plain
 /// shape leaves that path dead at fold==0 and measures only atomic
 /// throughput.
+///
+/// `GLYPH_CHAIN_CLUSTER=1` (implies `GLYPH_CHAIN_DECODE=1`): the bench item
+/// flips to cluster mode and cluster_probe / cluster_chain run as stages 1-2
+/// between decode and tile_scan — the pass order of `--cubecl-cluster-check`.
+/// The bench's one-item-over-the-whole-file shape is cluster_chain's WORST
+/// case (thread-per-item: one thread walks the whole corpus's greedy chain),
+/// which is exactly the number the chunked-chain decision rests on. Flags +
+/// advance are diffed bit-exact against the cluster-resolved reference
+/// whenever the chain stage ran.
 pub fn bench(ctx: &GpuContext, corpus_path: &Path) -> ! {
     let bytes = std::fs::read(corpus_path).unwrap_or_else(|e| {
         eprintln!("cubecl-chain-bench: {e}");
@@ -2234,6 +2249,11 @@ pub fn bench(ctx: &GpuContext, corpus_path: &Path) -> ! {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(0);
+    // GLYPH_CHAIN_CLUSTER=1: cluster mode on top of decode (it implies
+    // GLYPH_CHAIN_DECODE — the cluster stages rewrite the fl/sm the decode
+    // produces). The bench item flips to Cluster so the CPU reference resolves
+    // clusters too, and its lanes witness the device pass at speed.
+    let cluster_mode = std::env::var_os("GLYPH_CHAIN_CLUSTER").is_some();
     let item = crate::fold::Item {
         byte_start: 0,
         byte_count: n as i64,
@@ -2242,7 +2262,11 @@ pub fn bench(ctx: &GpuContext, corpus_path: &Path) -> ! {
         origin_z: 0.0,
         wrap_width,
         wrap_mode: WrapMode::Down,
-        cluster_mode: crate::fold::ClusterMode::Leader,
+        cluster_mode: if cluster_mode {
+            crate::fold::ClusterMode::Cluster
+        } else {
+            crate::fold::ClusterMode::Leader
+        },
         z_step: 2.0,
         line_height: 1.25,
         has_page: false,
@@ -2266,8 +2290,8 @@ pub fn bench(ctx: &GpuContext, corpus_path: &Path) -> ! {
     // GLYPH_CHAIN_DECODE=1: the chain starts from raw BYTES — the device
     // decode produces fl/sm (phase 3a) and the CPU statics upload dies; the
     // CPU reference still runs for verification. Decode is stage 1 then, and
-    // GLYPH_CHAIN_STAGES counts it.
-    let decode_mode = std::env::var_os("GLYPH_CHAIN_DECODE").is_some();
+    // GLYPH_CHAIN_STAGES counts it. GLYPH_CHAIN_CLUSTER implies it.
+    let decode_mode = cluster_mode || std::env::var_os("GLYPH_CHAIN_DECODE").is_some();
 
     let t_decode = std::time::Instant::now();
     let r = run_scan_pipeline(&bytes, &trie, &items, DEFAULT_CHUNK_SIZE, DEFAULT_GROUP_SIZE, 1);
@@ -2325,6 +2349,35 @@ pub fn bench(ctx: &GpuContext, corpus_path: &Path) -> ! {
     let h_bi = client.create_from_slice(bytemuck::cast_slice(&bi));
     let h_bm = client.create_from_slice(bytemuck::cast_slice(&bm));
     let h_bc = client.create_from_slice(bytemuck::cast_slice(&bc));
+    // The cluster stages' inputs: the sequence section, the host-built
+    // candidacy bitmap + per-item mode flags (cluster_host_inputs), and the
+    // probe's scratch. The buffers exist in every mode — the cluster launches
+    // are their only readers — but cslot's zero-fill is gated: that one is a
+    // full-corpus upload the non-cluster runs must not pay.
+    let (seq, seq_max, bitmap_advance) = match trie.cluster_table() {
+        Some((s, m, a)) => (s.to_vec(), m, a),
+        None if cluster_mode => {
+            eprintln!(
+                "cubecl-chain-bench: this atlas carries no sequence section; GLYPH_CHAIN_CLUSTER needs the v2 trie"
+            );
+            std::process::exit(1);
+        }
+        None => (Vec::new(), 2u32, f32::NAN),
+    };
+    assert!(
+        seq_max <= 64,
+        "seq_max {seq_max} would exceed the local key-scratch budget"
+    );
+    let (bitmap, ic) = cluster_host_inputs(&seq, seq_max, &items);
+    let h_seq = client.create_from_slice(bytemuck::cast_slice(&seq));
+    let h_bmap = client.create_from_slice(bytemuck::cast_slice(&bitmap));
+    let h_ic = client.create_from_slice(bytemuck::cast_slice(&ic));
+    let h_cslot = if cluster_mode {
+        client.create_from_slice(bytemuck::cast_slice(&vec![0u32; n]))
+    } else {
+        client.empty(n * 4)
+    };
+    let h_cend = client.empty(n * 4);
     let h_ir = client.create_from_slice(bytemuck::cast_slice(&ir));
     let h_ie = client.create_from_slice(bytemuck::cast_slice(&ie));
     let h_im = client.create_from_slice(bytemuck::cast_slice(&im));
@@ -2352,10 +2405,13 @@ pub fn bench(ctx: &GpuContext, corpus_path: &Path) -> ! {
         CubeCount::Static(cubes.min(65535) as u32, cubes.div_ceil(65535) as u32, 1)
     };
     // GLYPH_CHAIN_STAGES is an ABSOLUTE dispatch count (the check driver's
-    // semantics): with GLYPH_CHAIN_DECODE=1 it counts the decode stage.
+    // semantics): with GLYPH_CHAIN_DECODE=1 it counts the decode stage, and
+    // with GLYPH_CHAIN_CLUSTER=1 (decode + the two cluster stages) it counts
+    // all three prefixes.
+    let pre = decode_mode as usize + 2 * cluster_mode as usize;
     let stages: usize = match std::env::var("GLYPH_CHAIN_STAGES").ok().and_then(|v| v.parse().ok()) {
         Some(v) => v,
-        None => 6 + decode_mode as usize,
+        None => 6 + pre,
     };
     // One cube per tile (dim = units); the byte-wide kernels stay 256-unit.
     let tiles_grid = |tiles: usize| {
@@ -2381,7 +2437,45 @@ pub fn bench(ctx: &GpuContext, corpus_path: &Path) -> ! {
             }
             return;
         }
-        let t = s - decode_mode as usize;
+        if cluster_mode && s == 1 {
+            unsafe {
+                cluster_probe::launch_unchecked(
+                    &client,
+                    cubes_of(n_words),
+                    CubeDim::new_1d(256),
+                    BufferArg::from_raw_parts(h_bytes.clone(), n_words),
+                    BufferArg::from_raw_parts(h_bmap.clone(), bitmap.len()),
+                    BufferArg::from_raw_parts(h_seq.clone(), seq.len()),
+                    BufferArg::from_raw_parts(h_ir.clone(), 2),
+                    BufferArg::from_raw_parts(h_ic.clone(), ic.len()),
+                    BufferArg::from_raw_parts(h_fl.clone(), n_words),
+                    BufferArg::from_raw_parts(h_sm.clone(), n),
+                    BufferArg::from_raw_parts(h_cslot.clone(), n),
+                    BufferArg::from_raw_parts(h_cend.clone(), n),
+                    seq_max,
+                );
+            }
+            return;
+        }
+        if cluster_mode && s == 2 {
+            unsafe {
+                cluster_chain::launch_unchecked(
+                    &client,
+                    cubes_of(items.len().max(1)),
+                    CubeDim::new_1d(256),
+                    BufferArg::from_raw_parts(h_bytes.clone(), n_words),
+                    BufferArg::from_raw_parts(h_ir.clone(), 2),
+                    BufferArg::from_raw_parts(h_ic.clone(), ic.len()),
+                    BufferArg::from_raw_parts(h_cslot.clone(), n),
+                    BufferArg::from_raw_parts(h_cend.clone(), n),
+                    BufferArg::from_raw_parts(h_sm.clone(), n),
+                    BufferArg::from_raw_parts(h_fl.clone(), n_words),
+                    bitmap_advance,
+                );
+            }
+            return;
+        }
+        let t = s - pre;
         unsafe {
             match t {
                 0 => {
@@ -2495,6 +2589,10 @@ pub fn bench(ctx: &GpuContext, corpus_path: &Path) -> ! {
     if decode_mode {
         stage_names.push("decode");
     }
+    if cluster_mode {
+        stage_names.push("cluster_probe");
+        stage_names.push("cluster_chain");
+    }
     stage_names.extend([
         "tile_scan",
         "spine_scan",
@@ -2507,7 +2605,15 @@ pub fn bench(ctx: &GpuContext, corpus_path: &Path) -> ! {
         if decode_mode && s == 0 {
             return ("decode", n_words.div_ceil(256), 256);
         }
-        let t = s - decode_mode as usize;
+        if cluster_mode && s == 1 {
+            return ("cluster_probe", n_words.div_ceil(256), 256);
+        }
+        if cluster_mode && s == 2 {
+            // Thread-per-item: one thread per item walks its greedy chain —
+            // the single-item bench IS this stage's worst case.
+            return ("cluster_chain", items.len().max(1), 256);
+        }
+        let t = s - pre;
         let (cubes, dim) = match t {
             0 | 2 => (n_tiles, units as u32),
             1 => (1, units as u32),
@@ -2522,7 +2628,7 @@ pub fn bench(ctx: &GpuContext, corpus_path: &Path) -> ! {
     let mut timing_method = String::new();
     for _ in 0..samples {
         for (s, slot) in mins.iter_mut().enumerate() {
-            if s == 3 + decode_mode as usize && !needs_resolve {
+            if s == 3 + pre && !needs_resolve {
                 // The resolve_x slot; foldless corpora skip the dispatch
                 // (and its window) entirely.
                 continue;
@@ -2550,10 +2656,43 @@ pub fn bench(ctx: &GpuContext, corpus_path: &Path) -> ! {
     let _wm = client.read_one(h_wm.clone()).expect("read wm");
     let _lm = client.read_one(h_lm.clone()).expect("read lm");
     let readback_dt = t1.elapsed();
+    // The cluster lanes' own witness, whenever the chain stage ran (it is
+    // absolute stage 2, so stages >= 3 — cluster implies decode): packed
+    // flags (low byte, trailer bit included) and advance, bit-exact against
+    // decode_all + resolve_clusters — the same PRE-SCAN reference
+    // --cubecl-cluster-check diffs against. Not run_scan_pipeline's slots:
+    // those carry scan-derived bits (F_RENDERED) the device pass never
+    // writes. The stages after cluster only READ fl/sm, so the end-of-run
+    // readback still sees the pass's output untouched.
+    if cluster_mode && stages >= 3 {
+        let mut cslots = crate::fold::Slots::new(n);
+        let _ = crate::fold::decode_all(&bytes, &mut cslots, &trie);
+        crate::fold::resolve_clusters(&bytes, &mut cslots, &trie, &items[0]);
+        let fl_bytes = client.read_one(h_fl.clone()).expect("read fl");
+        let sm_bytes = client.read_one(h_sm.clone()).expect("read sm");
+        let flw: &[u32] = bytemuck::cast_slice(&fl_bytes);
+        let smv: &[f32] = bytemuck::cast_slice(&sm_bytes);
+        let mut bad = 0usize;
+        for id in 0..n {
+            let want_f = cslots.flags(id) & 0xFF;
+            let got_f = (flw[id >> 2] >> (((id & 3) * 8) as u32)) & 0xFF;
+            if want_f != got_f || cslots.advance(id).to_bits() != smv[id].to_bits() {
+                if bad < 8 {
+                    println!(
+                        "  MISMATCH byte {id} flags: cpu {want_f:#04x} gpu {got_f:#04x} advance: cpu {:e} gpu {:e}",
+                        cslots.advance(id),
+                        smv[id]
+                    );
+                }
+                bad += 1;
+            }
+        }
+        assert_eq!(bad, 0, "bench cluster verification failed: {bad} lane mismatches");
+    }
     // Correctness at speed: the bench's whole number is worthless if the fast
     // path is wrong — diff the leader row/col lanes against the CPU reference.
     let lc: &[u32] = bytemuck::cast_slice(&lc_bytes);
-    if stages < 3 + decode_mode as usize {
+    if stages < 3 + pre {
         println!(
             "cubecl-chain-bench: {} ({} B, {} tiles @ {}x{}, wrap {}) stages {} — pre-apply stages only, no verification",
             corpus_path.display(),
@@ -2586,7 +2725,7 @@ pub fn bench(ctx: &GpuContext, corpus_path: &Path) -> ! {
     let chain: std::time::Duration = mins.iter().filter_map(|d| *d).sum();
     let total = chain + readback_dt;
     println!(
-        "cubecl-chain-bench: {} ({} B, {} tiles @ {}x{}, wrap {}, samples {}) timing={} missing_windows={} — \
+        "cubecl-chain-bench: {} ({} B, {} tiles @ {}x{}, wrap {}, cluster {}, samples {}) timing={} missing_windows={} — \
          cpu decode+scan {:?} | chain (sum of per-dispatch minima) {:?} readbacks {:?} total {:?} ({:.1} MB/s)",
         corpus_path.display(),
         n,
@@ -2594,6 +2733,7 @@ pub fn bench(ctx: &GpuContext, corpus_path: &Path) -> ! {
         units,
         rake,
         wrap_width,
+        cluster_mode,
         samples,
         timing_method,
         missing_windows,
