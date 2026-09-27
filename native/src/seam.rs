@@ -94,11 +94,68 @@ pub fn content_hash_version(bytes: &[u8]) -> BufferVersion {
     BufferVersion(h.finish())
 }
 
-/// Structure-plane stages (folds, inlays, blocks) arrive as variants here —
-/// through the same envelope, never a second pipeline. None exist yet; the
-/// empty enum is the "absent" made explicit so later additions are additive.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum StructureDelta {}
+/// Structure-plane stages arrive as variants here — through the same
+/// envelope, never a second pipeline. The first (P2a):
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum StructureDelta {
+    /// Fold ONE byte range of the file at this version — DROP the records
+    /// whose lines fall inside it and shift everything below up by the
+    /// hidden pitch. v1 has no placeholder row: an ellipsis row is an
+    /// INSERT, i.e. the inlay variant wearing a costume, and drop-then-
+    /// rebuild is the primitive that makes later variants cheap. The
+    /// renderer NORMALIZES each range outward to whole lines (see
+    /// [`normalized_fold_lines`]), so providers may pass raw tree-sitter
+    /// node spans. Overlaps, nesting and duplicates merge.
+    Fold { range: Range<usize> },
+}
+
+/// Resolve fold byte-ranges against a content version's LINE STARTS: each
+/// range expands to the whole lines containing its first and last bytes,
+/// then the resulting line ranges are sorted and merged (overlap, nesting,
+/// adjacency). This is the seam's only structure-side coordinate
+/// conversion — byte space (the envelope's one coordinate system, your
+/// P2a decision) to line space, as a PURE function so the renderer's
+/// geometry never sees an unnormalized fold. `line_starts` is the byte
+/// offset of every line's first byte, ascending, starting 0; empty fold
+/// ranges vanish (they contain no lines).
+pub fn normalized_fold_lines(folds: &[StructureDelta], line_starts: &[usize]) -> Vec<Range<u32>> {
+    let mut lines: Vec<Range<u32>> = Vec::new();
+    for delta in folds {
+        let StructureDelta::Fold { range } = delta;
+        if range.start >= range.end {
+            continue; // empty or inverted — contains no lines
+        }
+        // The line containing a byte: the LAST line start at/before it.
+        // (For range.end the byte that matters is end-1 — exclusive end.)
+        // Bytes past the end clamp to the last line — a provider's span can
+        // name EOF; it must not invent a line beyond it.
+        let last_start = line_starts.last().copied().unwrap_or(0);
+        let line_of = |byte: usize| -> u32 {
+            match line_starts.binary_search(&byte) {
+                Ok(i) => i as u32,
+                Err(0) => 0,
+                Err(i) => (i - 1) as u32,
+            }
+        };
+        let first = line_of(range.start.min(last_start));
+        let last = line_of(range.end.saturating_sub(1).min(last_start));
+        // `last` inclusive → exclusive: fold lines first..=last.
+        lines.push(first..last + 1);
+    }
+    // Sort, then merge overlap/nesting/adjacency — adjacency folds collapse
+    // because two touching hidden line ranges are indistinguishable from
+    // one. (Collection order must not matter: the merge happens entirely
+    // after the sort.)
+    lines.sort_by_key(|r| (r.start, r.end));
+    let mut out: Vec<Range<u32>> = Vec::with_capacity(lines.len());
+    for r in lines {
+        match out.last_mut() {
+            Some(prev) if r.start <= prev.end => prev.end = prev.end.max(r.end),
+            _ => out.push(r),
+        }
+    }
+    out
+}
 
 /// Decoration-plane items (selections, carets, search hits) — P4. Same law
 /// as [`StructureDelta`].
@@ -186,6 +243,55 @@ mod tests {
         let mut c = a.clone();
         c[0] = b'x';
         assert_ne!(content_hash_version(&a), content_hash_version(&c));
+    }
+
+    // ── P2a: folds ────────────────────────────────────────────────────────
+    use super::normalized_fold_lines;
+
+    fn fold(range: Range<usize>) -> StructureDelta {
+        StructureDelta::Fold { range }
+    }
+
+    #[test]
+    fn folds_expand_outward_to_whole_lines() {
+        // 3 lines "abc\nDEFG\nhi\n": starts [0,4,9], len 12.
+        let starts = [0usize, 4, 9];
+        // Bytes 5..7 ("EF", mid-line 1) folds exactly line 1.
+        assert_eq!(normalized_fold_lines(&[fold(5..7)], &starts), vec![1..2]);
+        // Bytes 2..10 (mid-line-0 through mid-line-2) folds whole lines 0..2.
+        assert_eq!(normalized_fold_lines(&[fold(2..10)], &starts), vec![0..3]);
+        // A fold naming byte 0 expands to line 0 (not "before" anything).
+        assert_eq!(normalized_fold_lines(&[fold(0..1)], &starts), vec![0..1]);
+    }
+
+    #[test]
+    fn folds_merge_overlap_nesting_adjacency_regardless_of_order() {
+        // 6 lines of 2 bytes each: starts [0,2,4,6,8,10].
+        let starts = [0usize, 2, 4, 6, 8, 10];
+        // Line 1 (bytes 2..3), line 2 (4..5), line 3 (6..7), given unsorted:
+        // adjacent 1..2 and 2..3 collapse with 3..4 into one 1..4 range.
+        let out = normalized_fold_lines(&[fold(6..7), fold(2..3), fold(4..5)], &starts);
+        assert_eq!(out, vec![1..4]);
+        // Overlap and nesting collapse to the union.
+        let out = normalized_fold_lines(&[fold(4..5), fold(0..9)], &starts);
+        assert_eq!(out, vec![0..5]);
+        // Disjoint stays disjoint, sorted output order.
+        let out = normalized_fold_lines(&[fold(8..9), fold(0..1)], &starts);
+        assert_eq!(out, vec![0..1, 4..5]);
+    }
+
+    #[test]
+    fn degenerate_folds_vanish_or_clamp() {
+        let starts = [0usize, 4];
+        // Empty (and inverted) ranges contain no lines.
+        assert_eq!(
+            normalized_fold_lines(&[fold(3..3), fold(5..2)], &starts),
+            Vec::<Range<u32>>::new()
+        );
+        // A byte past EOF clamps to the LAST line — never invents one.
+        assert_eq!(normalized_fold_lines(&[fold(99..100)], &starts), vec![1..2]);
+        // The final line without a trailing newline still resolves.
+        assert_eq!(normalized_fold_lines(&[fold(5..6)], &starts), vec![1..2]);
     }
 
     #[test]
