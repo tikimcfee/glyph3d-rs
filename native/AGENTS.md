@@ -189,7 +189,9 @@ Shared env vars: `GLYPH_CHAIN_STAGES` (absolute dispatch count — bisection),
 (fold>0 shape), `GLYPH_CHAIN_TILE`/`RAKE` (scan shape), `GLYPH_CHAIN_SPAN`
 (resolve worker bytes), `GLYPH_CHAIN_DECODE=1` (bench runs from raw bytes),
 `GLYPH_CHAIN_CLUSTER=1` (bench adds cluster mode — implies DECODE; the
-bench item flips to Cluster, probe/chain are timed as stages 1-2, and
+bench item flips to Cluster, the ranked chain runs as stages 1-4
+(probe / compact / rank / mark — list ranking over the candidate jump
+graph, note 18 §6c), a 4 B setup readback sizes the level tables, and
 fl/sm are diffed bit-exact against `decode_all`+`resolve_clusters`),
 `GLYPH_CHAIN_DEBUG=1` (dumps, incl. the cluster candidate table).
 

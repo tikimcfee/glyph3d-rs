@@ -427,49 +427,382 @@ fn cluster_probe(
     }
 }
 
-/// The cluster CHAIN: thread per item, the greedy walk. A candidate commits
-/// iff the walk VISITS it (suppressed candidates never claim their spans —
-/// the overlap fixture's rule); the walk resumes past each committed span.
-/// Trailer marking ORs F_CLUSTER_TRAILER into packed flag words through
-/// atomics — a word can straddle items, so byte-lane writes from different
-/// item threads race otherwise.
+/// The cluster CHAIN, scan-shaped: LIST RANKING over the candidate jump
+/// graph. The serial walk's state is MEMORYLESS — the entire state is the
+/// current position — so its committed set is exactly greedy-by-start
+/// interval scheduling: `c1` = first candidate at/after the item start,
+/// `c_{k+1}` = first candidate at/after `cend[c_k]` (plain stepping visits
+/// every codepoint in order, so "first candidate ≥ x" is well-defined).
+/// That makes the commits the ORBIT of each item's first candidate under
+/// `jump`, and orbits in a functional graph are list ranking — pointer
+/// doubling, the textbook primitive. This replaced thread-per-item
+/// cluster_chain (measured 2026-09-27: 5.65s on 24MB text — one GPU thread
+/// stepping every byte; 1.24s on 7MB emoji) with graph work proportional to
+/// MATCHED candidates, which is ~0 on text and ~1/2.5 of codepoints on the
+/// emoji corpus. A chunk+boundary-fixup form was considered and rejected:
+/// on dense corpora the true and assumed walks stay permanently out of
+/// phase (both commit at different phases), so the fixup degrades to the
+/// serial walk.
+///
+/// The stages: compact (count-scan + scatter → sorted head positions hp),
+/// jump_build (`hp[cend]` lower-bound → parent forest, terminal self-loop,
+/// clamped to the candidate's ITEM so a span ending at an item edge can
+/// never jump into the next item), K = ceil(log2(C+1)) rank_steps
+/// (L_{k+1} = L_k∘L_k with depth sums D; level tables stored flat — the
+/// orbit test needs arbitrary lifts), and cluster_mark: candidate i is
+/// committed iff lifting its item's root by exactly `T[root]−T[i]` levels
+/// lands on i. Merging branches (suppressed candidates can share a jump
+/// target) do not fool that test: the lift follows the root's UNIQUE
+/// chain, and equality against i is index-exact.
+///
+/// The marking body is the old chain kernel's, unchanged: head advance,
+/// trailer zeroing gated on the leader bit, packed-flag fetch_or (a span
+/// can straddle threads), and the trailer walk CLAMPED to the item end —
+/// cend can overrun it by up to one codepoint, and the serial side only
+/// ever marks members strictly inside (the Mojo chain's ownership rule).
+///
+/// Scope notes, deliberately recorded: the device chain writes sm/fl
+/// only — the serial `gi` lane (slot / zeroed trailers) has NO device
+/// writer yet, and the check's diff covers flags+advance; the renderer's
+/// consumption of this path (phase 4) must grow one or the diff must
+/// gain the lane. Level tables price at K·(C+1)·4B — ~40MB at the 7MB
+/// emoji corpus (C ≈ 600K), ~126MB at a hypothetical 24MB emoji-dense
+/// worst case; `hp`/`cslot`/`cend` add 4B/byte beside them. Never size
+/// `lvl` worst-case at C=n (2.4GB) — read C once per corpus, as both
+/// drivers here do.
+///
+/// Two instrument-era facts this build paid for, kept because they will
+/// bite again: (1) `rank_step`'s step/stride MUST be `#[comptime]` — as
+/// runtime u32 scalars after five same-typed slice params, the macro's
+/// launch misbound the buffer args outright (sentinel-verified: writes
+/// landed in the wrong buffers, values swapped across statements);
+/// comptime specialization fixed it untouched otherwise. Comptime tuning
+/// scalars are house style for a reason. (2) The depth ping-pong must
+/// NEVER write the d0 seed buffer — a naive two-buffer alternation
+/// writes round 1's depths into d0, and every replay (the bench's sample
+/// loop) seeds itself with the previous run's depths. Single-run drivers
+/// pass with the bug; only repeat sampling exposes it.
 #[cube(launch_unchecked)]
-fn cluster_chain(
-    bytes: &[u32],
+fn count_tile(
+    cslot: &[u32],
+    tc: &mut [u32],
+    up: &mut [u32],
+    #[comptime] units: usize,
+    #[comptime] rake: usize,
+    #[comptime] log: usize,
+) {
+    let tile = CUBE_POS;
+    let u = UNIT_POS as usize;
+    let n = cslot.len();
+    let lo = tile * (units * rake) + u * rake;
+    let hi = if lo + rake < n { lo + rake } else { n };
+    let mut c = 0u32;
+    if lo < n {
+        let mut id = lo;
+        while id < hi {
+            if cslot[id] != 0u32 {
+                c += 1u32;
+            }
+            id += 1usize;
+        }
+    }
+    // The additive little sibling of tile_scan's monoid Blelloch. The load
+    // phase writes EVERY shared slot before any read — naga only inserts
+    // workgroup zero-init when initialization-before-read is unprovable,
+    // and conditional writes (the probe's key scratch, formerly) force it.
+    let mut sc = Shared::<[u32]>::new_slice(units);
+    sc[u] = c;
+    #[unroll]
+    for d in 0..log {
+        sync_cube();
+        let s = 1usize << d;
+        if (u + 1) & (2 * s - 1) == 0 {
+            sc[u] += sc[u - s];
+        }
+    }
+    sync_cube();
+    if u == units - 1 {
+        tc[tile] = sc[u];
+        sc[u] = 0u32;
+    }
+    #[unroll]
+    for d in 0..log {
+        sync_cube();
+        let s = units >> (d + 1);
+        if (u + 1) & (2 * s - 1) == 0 {
+            let t = sc[u];
+            sc[u] += sc[u - s];
+            sc[u - s] = t;
+        }
+    }
+    sync_cube();
+    up[tile * units + u] = sc[u];
+}
+
+/// The compaction spine: one cube Blelloch-scans the tile totals into
+/// exclusive tile prefixes, chasing like spine_scan (contiguous blocks keep
+/// the order for the chase writes). The unit whose block owns the LAST tile
+/// publishes the grand total C — the candidate count the graph stages and
+/// the host both key on (the host reads it once, in setup, to size the
+/// level tables; the timed loop re-derives it on device).
+#[cube(launch_unchecked)]
+fn count_spine(
+    tc: &[u32],
+    xc: &mut [u32],
+    total: &mut [u32],
+    #[comptime] units: usize,
+    #[comptime] log: usize,
+) {
+    let u = UNIT_POS as usize;
+    let n_tiles = tc.len();
+    let per = n_tiles.div_ceil(units);
+    let first = u * per;
+    let last = if first + per < n_tiles { first + per } else { n_tiles };
+    let mut acc = 0u32;
+    if first < n_tiles {
+        let mut t = first;
+        while t < last {
+            acc += tc[t];
+            t += 1usize;
+        }
+    }
+    let mut sc = Shared::<[u32]>::new_slice(units);
+    sc[u] = acc;
+    #[unroll]
+    for d in 0..log {
+        sync_cube();
+        let s = 1usize << d;
+        if (u + 1) & (2 * s - 1) == 0 {
+            sc[u] += sc[u - s];
+        }
+    }
+    sync_cube();
+    if u == units - 1 {
+        sc[u] = 0u32;
+    }
+    #[unroll]
+    for d in 0..log {
+        sync_cube();
+        let s = units >> (d + 1);
+        if (u + 1) & (2 * s - 1) == 0 {
+            let t = sc[u];
+            sc[u] += sc[u - s];
+            sc[u - s] = t;
+        }
+    }
+    sync_cube();
+    let mut pre = sc[u];
+    if first < n_tiles {
+        for t in first..last {
+            xc[t] = pre;
+            pre += tc[t];
+        }
+        if last == n_tiles {
+            total[0] = pre;
+        }
+    }
+}
+
+/// Scatter: unit re-walks its rake seeded with (tile prefix + unit prefix)
+/// and appends candidate head positions — compaction into the sorted hp
+/// array the binary searches ride on.
+#[cube(launch_unchecked)]
+fn cand_scatter(
+    cslot: &[u32],
+    xc: &[u32],
+    up: &[u32],
+    hp: &mut [u32],
+    #[comptime] units: usize,
+    #[comptime] rake: usize,
+) {
+    let tile = CUBE_POS;
+    let u = UNIT_POS as usize;
+    let n = cslot.len();
+    let lo = tile * (units * rake) + u * rake;
+    let hi = if lo + rake < n { lo + rake } else { n };
+    let mut c = xc[tile] + up[tile * units + u];
+    if lo < n {
+        let mut id = lo;
+        while id < hi {
+            if cslot[id] != 0u32 {
+                hp[c as usize] = id as u32;
+                c += 1u32;
+            }
+            id += 1usize;
+        }
+    }
+}
+
+/// The jump graph: `parent[i]` = first candidate at/after `cend[hp[i]]`,
+/// CLAMPED to `hp[i]`'s item (a span ending exactly at an item edge must
+/// never jump into the next item — the serial walk restarts there). Index C
+/// is the terminal: self-loop, written by thread C itself.
+#[cube(launch_unchecked)]
+fn jump_build(
+    hp: &[u32],
+    cend: &[u32],
+    ir: &[u32],
+    c_count: &[u32],
+    parent: &mut [u32],
+) {
+    let i = ABSOLUTE_POS;
+    let c = c_count[0] as usize;
+    if i == c {
+        parent[i] = i as u32;
+    }
+    if i < c {
+        let p = hp[i] as usize;
+        let e = cend[p] as usize;
+        let item_count = ir.len() / 2;
+        let stop = if item_count > 0 {
+            let it = item_search(ir, item_count, p);
+            ir[it * 2 + 1] as usize
+        } else {
+            e
+        };
+        // Lower bound over hp (guarded-if form — the landmine-safe binary
+        // search shape the probe uses).
+        let mut lo = 0u32;
+        let mut hi = c as u32;
+        while lo < hi {
+            let mid = (lo + hi) / 2u32;
+            if (hp[mid as usize] as usize) < e {
+                lo = mid + 1u32;
+            }
+            if (hp[mid as usize] as usize) >= e {
+                hi = mid;
+            }
+        }
+        let j = lo as usize;
+        if j < c && (hp[j] as usize) < stop {
+            parent[i] = j as u32;
+        } else {
+            parent[i] = c as u32;
+        }
+    }
+}
+
+/// One pointer-doubling round: L_{k+1} = L_k∘L_k with depth sums
+/// D_{k+1} = D_k + D_k∘L_k (terminal carries 0, so sums saturate at the
+/// true chain length). Also archives level k's parent table into the flat
+/// lvl store — the orbit test lifts by ARBITRARY distances and needs every
+/// level, not just the saturated end state.
+#[cube(launch_unchecked)]
+fn rank_step(
+    cur_p: &[u32],
+    cur_d: &[u32],
+    nxt_p: &mut [u32],
+    nxt_d: &mut [u32],
+    lvl: &mut [u32],
+    #[comptime] step: usize,
+    #[comptime] stride: usize,
+) {
+    let i = ABSOLUTE_POS;
+    if i < cur_p.len() {
+        let p = cur_p[i] as usize;
+        nxt_p[i] = cur_p[p];
+        nxt_d[i] = cur_d[i] + cur_d[p];
+        lvl[step * stride + i] = cur_p[i];
+    }
+}
+
+/// Per item (cluster items only): the orbit ROOT — first candidate at/after
+/// the item start, or C when the item carries none.
+#[cube(launch_unchecked)]
+fn item_roots(
+    hp: &[u32],
+    c_count: &[u32],
     ir: &[u32],
     ic: &[u32],
-    cslot: &[u32],
-    cend: &[u32],
-    sm: &mut [f32],
-    fl_atomic: &mut [Atomic<u32>],
-    bitmap_advance: f32,
+    roots: &mut [u32],
 ) {
     let it = ABSOLUTE_POS;
     let item_count = ir.len() / 2;
-    let n = bytes.len() * 4;
-    if it < item_count && ic[it] != 0 {
-        let mut p = ir[it * 2] as usize;
+    let c = c_count[0];
+    if it < item_count && ic[it] != 0u32 {
+        let s = ir[it * 2] as usize;
+        let mut lo = 0u32;
+        let mut hi = c;
+        while lo < hi {
+            let mid = (lo + hi) / 2u32;
+            if (hp[mid as usize] as usize) < s {
+                lo = mid + 1u32;
+            }
+            if (hp[mid as usize] as usize) >= s {
+                hi = mid;
+            }
+        }
         let stop = ir[it * 2 + 1] as usize;
-        while p < stop {
-            let slot = cslot[p];
-            if slot != 0u32 {
-                let e = cend[p] as usize;
-                sm[p] = bitmap_advance;
-                let mut t = p + 1usize;
-                while t < e {
-                    if flags_at_from_atomic(fl_atomic, t) & F_LEADER != 0 {
-                        sm[t] = f32::from_bits(0u32);
-                        fl_atomic[t >> 2].fetch_or(F_CLUSTER_TRAILER << (((t & 3) as u32) * 8u32));
+        if lo < c && (hp[lo as usize] as usize) < stop {
+            roots[it] = lo;
+        } else {
+            roots[it] = c;
+        }
+    }
+}
+
+/// The commit: candidate i is committed iff it lies on its item's root
+/// chain — lift the root by exactly `T[root]−T[i]` levels (binary
+/// decomposition over the archived level tables) and compare. The marking
+/// body is the retired serial kernel's, byte for byte: head advance,
+/// trailer zeroing gated on the leader bit, packed-flag fetch_or (spans
+/// straddle threads).
+#[cube(launch_unchecked)]
+fn cluster_mark(
+    hp: &[u32],
+    tdepth: &[u32],
+    lvl: &[u32],
+    c_count: &[u32],
+    roots: &[u32],
+    ir: &[u32],
+    cend: &[u32],
+    sm: &mut [f32],
+    fl_atomic: &mut [Atomic<u32>],
+    kmax: u32,
+    stride: u32,
+    bitmap_advance: f32,
+) {
+    let i = ABSOLUTE_POS;
+    let c = c_count[0] as usize;
+    let item_count = ir.len() / 2;
+    if i < c && item_count > 0 {
+        let p = hp[i] as usize;
+        let it = item_search(ir, item_count, p);
+        let r = roots[it] as usize;
+        if r < c {
+            let tr = tdepth[r];
+            let ti = tdepth[i];
+            // ti == tr is the ROOT itself — distance 0, committed by
+            // definition (the lift loop below then never runs).
+            if ti <= tr {
+                let mut x = r as u32;
+                let mut rem = tr - ti;
+                let mut k = 0u32;
+                while k < kmax && rem > 0u32 {
+                    if rem & 1u32 == 1u32 {
+                        x = lvl[(k * stride + x) as usize];
                     }
-                    t += 1usize;
+                    rem >>= 1u32;
+                    k += 1u32;
                 }
-                p = e;
-            } else {
-                let len = seq_len_at(bytes, p, n);
-                if len > 0u32 {
-                    p += len as usize;
-                } else {
-                    p += 1usize;
+                if x as usize == i {
+                    // The trailer walk clamps to the ITEM END — cend can
+                    // overrun it by up to one codepoint (the span-end walk
+                    // starts a member before stop), and the serial side only
+                    // ever marks members strictly inside the item. The Mojo
+                    // chain's ownership rule, verbatim.
+                    let stop = ir[it * 2 + 1] as usize;
+                    let e = cend[p] as usize;
+                    let lim = if e < stop { e } else { stop };
+                    sm[p] = bitmap_advance;
+                    let mut t = p + 1usize;
+                    while t < lim {
+                        if flags_at_from_atomic(fl_atomic, t) & F_LEADER != 0 {
+                            sm[t] = f32::from_bits(0u32);
+                            fl_atomic[t >> 2].fetch_or(F_CLUSTER_TRAILER << (((t & 3) as u32) * 8u32));
+                        }
+                        t += 1usize;
+                    }
                 }
             }
         }
@@ -2084,9 +2417,24 @@ pub fn cluster_check(ctx: &GpuContext, fixture_path: &Path) -> ! {
     let h_sm = client.empty(n * 4);
     let h_cslot = client.create_from_slice(bytemuck::cast_slice(&vec![0u32; n]));
     let h_cend = client.empty(n * 4);
+    // The ranked chain's buffers. The compaction tiles mirror the scan
+    // chain's 256x8 shape; the graph buffers are sized off C, read back
+    // once after count_spine (fixtures are small — the bench does the same
+    // readback in setup, outside its timing windows).
+    let (units, rake) = (256usize, 8usize);
+    let log = units.ilog2() as usize;
+    let n_tiles = n.div_ceil(units * rake).max(1);
+    let h_tc = client.empty(n_tiles * 4);
+    let h_up = client.empty(n_tiles * units * 4);
+    let h_xc = client.empty(n_tiles * 4);
+    let h_total = client.empty(4);
+    let h_hp = client.empty(n * 4);
     let cubes_of = |threads: usize| {
         let cubes = threads.div_ceil(256);
         CubeCount::Static(cubes.min(65535) as u32, cubes.div_ceil(65535) as u32, 1)
+    };
+    let tiles_grid = |tiles: usize| {
+        CubeCount::Static(tiles.min(65535) as u32, tiles.div_ceil(65535) as u32, 1)
     };
     let t0 = std::time::Instant::now();
     unsafe {
@@ -2117,23 +2465,135 @@ pub fn cluster_check(ctx: &GpuContext, fixture_path: &Path) -> ! {
             BufferArg::from_raw_parts(h_cend.clone(), n),
             seq_max,
         );
-        cluster_chain::launch_unchecked(
+        count_tile::launch_unchecked(
+            &client,
+            tiles_grid(n_tiles),
+            CubeDim::new_1d(units as u32),
+            BufferArg::from_raw_parts(h_cslot.clone(), n),
+            BufferArg::from_raw_parts(h_tc.clone(), n_tiles),
+            BufferArg::from_raw_parts(h_up.clone(), n_tiles * units),
+            units,
+            rake,
+            log,
+        );
+        count_spine::launch_unchecked(
+            &client,
+            CubeCount::new_single(),
+            CubeDim::new_1d(units as u32),
+            BufferArg::from_raw_parts(h_tc.clone(), n_tiles),
+            BufferArg::from_raw_parts(h_xc.clone(), n_tiles),
+            BufferArg::from_raw_parts(h_total.clone(), 1),
+            units,
+            log,
+        );
+    }
+    let total_bytes = client.read_one(h_total.clone()).expect("read candidate count");
+    let c = bytemuck::cast_slice::<u8, u32>(&total_bytes)[0] as usize;
+    // Level tables: K = ceil(log2(C+1)) archived levels, stride C+1.
+    let kmax = ((c as u32 + 1).next_power_of_two().trailing_zeros()) as u32;
+    let stride = c + 1;
+    let h_lvl = client.empty((kmax as usize * (c + 1)).max(1) * 4);
+    let h_parent = client.empty((c + 1) * 4);
+    let h_parent_b = client.empty((c + 1) * 4);
+    let mut d0 = vec![1u32; c + 1];
+    d0[c] = 0;
+    let h_d0 = client.create_from_slice(bytemuck::cast_slice(&d0));
+    let h_d_a = client.empty((c + 1) * 4);
+    let h_d_b = client.empty((c + 1) * 4);
+    let h_roots = client.create_from_slice(bytemuck::cast_slice(&vec![c as u32; fx.items.len()]));
+    // Rotation state for the rank loop. h_d0 (the pristine [1,1,..,0] seed)
+    // is an INPUT forever — the ping-pong alternates between h_d_a/h_d_b and
+    // parent/parent_b, never writing d0. A naive two-buffer ping-pong writes
+    // round 1's depths into d0, and every REPLAY (the bench's sample loop)
+    // would then seed itself with the previous run's depths.
+    let mut sp = h_parent.clone();
+    let mut sd = h_d0.clone();
+    unsafe {
+        cand_scatter::launch_unchecked(
+            &client,
+            tiles_grid(n_tiles),
+            CubeDim::new_1d(units as u32),
+            BufferArg::from_raw_parts(h_cslot.clone(), n),
+            BufferArg::from_raw_parts(h_xc.clone(), n_tiles),
+            BufferArg::from_raw_parts(h_up.clone(), n_tiles * units),
+            BufferArg::from_raw_parts(h_hp.clone(), c),
+            units,
+            rake,
+        );
+        jump_build::launch_unchecked(
+            &client,
+            cubes_of(c + 1),
+            CubeDim::new_1d(256),
+            BufferArg::from_raw_parts(h_hp.clone(), c),
+            BufferArg::from_raw_parts(h_cend.clone(), n),
+            BufferArg::from_raw_parts(h_ir.clone(), ir.len()),
+            BufferArg::from_raw_parts(h_total.clone(), 1),
+            BufferArg::from_raw_parts(h_parent.clone(), c + 1),
+        );
+        for k in 0..kmax {
+            let tp = if k % 2 == 0 { h_parent_b.clone() } else { h_parent.clone() };
+            let td = if k % 2 == 0 { h_d_a.clone() } else { h_d_b.clone() };
+            rank_step::launch_unchecked(
+                &client,
+                cubes_of(c + 1),
+                CubeDim::new_1d(256),
+                BufferArg::from_raw_parts(sp.clone(), c + 1),
+                BufferArg::from_raw_parts(sd.clone(), c + 1),
+                BufferArg::from_raw_parts(tp.clone(), c + 1),
+                BufferArg::from_raw_parts(td.clone(), c + 1),
+                BufferArg::from_raw_parts(h_lvl.clone(), kmax as usize * (c + 1)),
+                k as usize,
+                stride,
+            );
+            sp = tp;
+            sd = td;
+        }
+        item_roots::launch_unchecked(
             &client,
             cubes_of(fx.items.len().max(1)),
             CubeDim::new_1d(256),
-            BufferArg::from_raw_parts(h_bytes.clone(), n_words),
+            BufferArg::from_raw_parts(h_hp.clone(), c),
+            BufferArg::from_raw_parts(h_total.clone(), 1),
             BufferArg::from_raw_parts(h_ir.clone(), ir.len()),
             BufferArg::from_raw_parts(h_ic.clone(), ic.len()),
-            BufferArg::from_raw_parts(h_cslot.clone(), n),
+            BufferArg::from_raw_parts(h_roots.clone(), fx.items.len()),
+        );
+        cluster_mark::launch_unchecked(
+            &client,
+            cubes_of(c.max(1)),
+            CubeDim::new_1d(256),
+            BufferArg::from_raw_parts(h_hp.clone(), c),
+            BufferArg::from_raw_parts(sd.clone(), c + 1),
+            BufferArg::from_raw_parts(h_lvl.clone(), kmax as usize * (c + 1)),
+            BufferArg::from_raw_parts(h_total.clone(), 1),
+            BufferArg::from_raw_parts(h_roots.clone(), fx.items.len()),
+            BufferArg::from_raw_parts(h_ir.clone(), ir.len()),
             BufferArg::from_raw_parts(h_cend.clone(), n),
             BufferArg::from_raw_parts(h_sm.clone(), n),
             BufferArg::from_raw_parts(h_fl.clone(), n_words),
+            kmax,
+            stride as u32,
             bitmap_advance,
         );
     }
     let fl_bytes = client.read_one(h_fl).expect("read fl");
     let sm_bytes = client.read_one(h_sm).expect("read sm");
     let dt = t0.elapsed();
+    if std::env::var_os("GLYPH_CHAIN_DEBUG").is_some() {
+        let hp_b = client.read_one(h_hp.clone()).expect("hp");
+        let pa_b = client.read_one(h_parent.clone()).expect("parent");
+        let lv_b = client.read_one(h_lvl.clone()).expect("lvl");
+        let d_b = client.read_one(sd.clone()).expect("depth");
+        let ro_b = client.read_one(h_roots.clone()).expect("roots");
+        let hpv: &[u32] = bytemuck::cast_slice(&hp_b);
+        let pav: &[u32] = bytemuck::cast_slice(&pa_b);
+        let lv: &[u32] = bytemuck::cast_slice(&lv_b);
+        let dv: &[u32] = bytemuck::cast_slice(&d_b);
+        let rv: &[u32] = bytemuck::cast_slice(&ro_b);
+        println!(
+            "  dbg graph C={c} kmax={kmax} hp={hpv:?} parent={pav:?} T={dv:?} roots={rv:?} lvl={lv:?}"
+        );
+    }
     let flw: &[u32] = bytemuck::cast_slice(&fl_bytes);
     let sm: &[f32] = bytemuck::cast_slice(&sm_bytes);
     if std::env::var_os("GLYPH_CHAIN_DEBUG").is_some() {
@@ -2213,13 +2673,12 @@ pub fn cluster_check(ctx: &GpuContext, fixture_path: &Path) -> ! {
 /// throughput.
 ///
 /// `GLYPH_CHAIN_CLUSTER=1` (implies `GLYPH_CHAIN_DECODE=1`): the bench item
-/// flips to cluster mode and cluster_probe / cluster_chain run as stages 1-2
-/// between decode and tile_scan — the pass order of `--cubecl-cluster-check`.
-/// The bench's one-item-over-the-whole-file shape is cluster_chain's WORST
-/// case (thread-per-item: one thread walks the whole corpus's greedy chain),
-/// which is exactly the number the chunked-chain decision rests on. Flags +
-/// advance are diffed bit-exact against the cluster-resolved reference
-/// whenever the chain stage ran.
+/// flips to cluster mode and the ranked chain runs as stages 1-4 between
+/// decode and tile_scan — probe, compact, rank (jump graph + pointer
+/// doubling), mark; the pass order of `--cubecl-cluster-check`. A 4 B
+/// setup-time readback of the candidate count sizes the level tables,
+/// outside every timing window. Flags + advance are diffed bit-exact
+/// against the cluster-resolved reference whenever the mark stage ran.
 pub fn bench(ctx: &GpuContext, corpus_path: &Path) -> ! {
     let bytes = std::fs::read(corpus_path).unwrap_or_else(|e| {
         eprintln!("cubecl-chain-bench: {e}");
@@ -2406,9 +2865,9 @@ pub fn bench(ctx: &GpuContext, corpus_path: &Path) -> ! {
     };
     // GLYPH_CHAIN_STAGES is an ABSOLUTE dispatch count (the check driver's
     // semantics): with GLYPH_CHAIN_DECODE=1 it counts the decode stage, and
-    // with GLYPH_CHAIN_CLUSTER=1 (decode + the two cluster stages) it counts
-    // all three prefixes.
-    let pre = decode_mode as usize + 2 * cluster_mode as usize;
+    // with GLYPH_CHAIN_CLUSTER=1 (decode + the four ranked-chain stages) it
+    // counts all five prefixes.
+    let pre = decode_mode as usize + 4 * cluster_mode as usize;
     let stages: usize = match std::env::var("GLYPH_CHAIN_STAGES").ok().and_then(|v| v.parse().ok()) {
         Some(v) => v,
         None => 6 + pre,
@@ -2417,9 +2876,107 @@ pub fn bench(ctx: &GpuContext, corpus_path: &Path) -> ! {
     let tiles_grid = |tiles: usize| {
         CubeCount::Static(tiles.min(65535) as u32, tiles.div_ceil(65535) as u32, 1)
     };
+    // The ranked chain's C-dependent state: run decode + probe + the
+    // compaction counts ONCE here — outside every timing window — and read
+    // back the candidate count (4 B) to size the level tables. The timed
+    // loop re-derives C on device each sample; the setup value only sizes
+    // buffers and the host-side rank-round count. C is deterministic in
+    // the corpus, so setup's C equals every timed sample's C.
+    let h_ctc = client.empty(n_tiles * 4);
+    let h_cup = client.empty(n_tiles * units * 4);
+    let h_cxc = client.empty(n_tiles * 4);
+    let h_ctotal = client.empty(4);
+    let (h_hp, h_lvl, h_parent, h_parent_b, h_d0, h_d_a, h_d_b, h_roots, mut rank_out, c_host) =
+        if cluster_mode {
+            unsafe {
+                decode::launch_unchecked(
+                    &client,
+                    cubes_of(n_words),
+                    CubeDim::new_1d(256),
+                    BufferArg::from_raw_parts(h_bytes.clone(), n_words),
+                    BufferArg::from_raw_parts(h_bi.clone(), bi.len()),
+                    BufferArg::from_raw_parts(h_bm.clone(), bm.len()),
+                    BufferArg::from_raw_parts(h_bc.clone(), bc.len()),
+                    BufferArg::from_raw_parts(h_fl.clone(), n_words),
+                    BufferArg::from_raw_parts(h_sm.clone(), n),
+                    bshift,
+                );
+                cluster_probe::launch_unchecked(
+                    &client,
+                    cubes_of(n_words),
+                    CubeDim::new_1d(256),
+                    BufferArg::from_raw_parts(h_bytes.clone(), n_words),
+                    BufferArg::from_raw_parts(h_bmap.clone(), bitmap.len()),
+                    BufferArg::from_raw_parts(h_seq.clone(), seq.len()),
+                    BufferArg::from_raw_parts(h_ir.clone(), 2),
+                    BufferArg::from_raw_parts(h_ic.clone(), ic.len()),
+                    BufferArg::from_raw_parts(h_fl.clone(), n_words),
+                    BufferArg::from_raw_parts(h_sm.clone(), n),
+                    BufferArg::from_raw_parts(h_cslot.clone(), n),
+                    BufferArg::from_raw_parts(h_cend.clone(), n),
+                    seq_max,
+                );
+                count_tile::launch_unchecked(
+                    &client,
+                    tiles_grid(n_tiles),
+                    CubeDim::new_1d(units as u32),
+                    BufferArg::from_raw_parts(h_cslot.clone(), n),
+                    BufferArg::from_raw_parts(h_ctc.clone(), n_tiles),
+                    BufferArg::from_raw_parts(h_cup.clone(), n_tiles * units),
+                    units,
+                    rake,
+                    log,
+                );
+                count_spine::launch_unchecked(
+                    &client,
+                    CubeCount::new_single(),
+                    CubeDim::new_1d(units as u32),
+                    BufferArg::from_raw_parts(h_ctc.clone(), n_tiles),
+                    BufferArg::from_raw_parts(h_cxc.clone(), n_tiles),
+                    BufferArg::from_raw_parts(h_ctotal.clone(), 1),
+                    units,
+                    log,
+                );
+            }
+            let tb = client.read_one(h_ctotal.clone()).expect("setup candidate count");
+            let c = bytemuck::cast_slice::<u8, u32>(&tb)[0] as usize;
+            let k = ((c as u32 + 1).next_power_of_two().trailing_zeros()) as u32;
+            let mut d0 = vec![1u32; c + 1];
+            d0[c] = 0;
+            (
+                client.empty(n * 4),
+                client.empty((k as usize * (c + 1)).max(1) * 4),
+                client.empty((c + 1) * 4),
+                client.empty((c + 1) * 4),
+                client.create_from_slice(bytemuck::cast_slice(&d0)),
+                client.empty((c + 1) * 4),
+                client.empty((c + 1) * 4),
+                client.create_from_slice(bytemuck::cast_slice(&[c as u32])),
+                client.empty((c + 1) * 4),
+                c,
+            )
+        } else {
+            let z = client.empty(0);
+            (
+                z.clone(),
+                z.clone(),
+                z.clone(),
+                z.clone(),
+                z.clone(),
+                z.clone(),
+                z.clone(),
+                z.clone(),
+                z.clone(),
+                0usize,
+            )
+        };
+    let kmax = (c_host as u32 + 1).next_power_of_two().trailing_zeros();
+    let cstride = c_host + 1;
     // Timed samples per dispatch; the minimum is reported.
     let samples: usize = std::env::var("GLYPH_CHAIN_LOOP").ok().and_then(|v| v.parse().ok()).unwrap_or(3);
-    let launch = |s: usize| {
+    // FnMut: the rank arm parks the final depth buffer in `rank_out` for
+    // the mark arm's next call.
+    let mut launch = |s: usize| {
         if decode_mode && s == 0 {
             unsafe {
                 decode::launch_unchecked(
@@ -2459,17 +3016,107 @@ pub fn bench(ctx: &GpuContext, corpus_path: &Path) -> ! {
         }
         if cluster_mode && s == 2 {
             unsafe {
-                cluster_chain::launch_unchecked(
+                count_tile::launch_unchecked(
+                    &client,
+                    tiles_grid(n_tiles),
+                    CubeDim::new_1d(units as u32),
+                    BufferArg::from_raw_parts(h_cslot.clone(), n),
+                    BufferArg::from_raw_parts(h_ctc.clone(), n_tiles),
+                    BufferArg::from_raw_parts(h_cup.clone(), n_tiles * units),
+                    units,
+                    rake,
+                    log,
+                );
+                count_spine::launch_unchecked(
+                    &client,
+                    CubeCount::new_single(),
+                    CubeDim::new_1d(units as u32),
+                    BufferArg::from_raw_parts(h_ctc.clone(), n_tiles),
+                    BufferArg::from_raw_parts(h_cxc.clone(), n_tiles),
+                    BufferArg::from_raw_parts(h_ctotal.clone(), 1),
+                    units,
+                    log,
+                );
+                cand_scatter::launch_unchecked(
+                    &client,
+                    tiles_grid(n_tiles),
+                    CubeDim::new_1d(units as u32),
+                    BufferArg::from_raw_parts(h_cslot.clone(), n),
+                    BufferArg::from_raw_parts(h_cxc.clone(), n_tiles),
+                    BufferArg::from_raw_parts(h_cup.clone(), n_tiles * units),
+                    BufferArg::from_raw_parts(h_hp.clone(), c_host),
+                    units,
+                    rake,
+                );
+            }
+            return;
+        }
+        if cluster_mode && s == 3 {
+            unsafe {
+                jump_build::launch_unchecked(
+                    &client,
+                    cubes_of(c_host + 1),
+                    CubeDim::new_1d(256),
+                    BufferArg::from_raw_parts(h_hp.clone(), c_host),
+                    BufferArg::from_raw_parts(h_cend.clone(), n),
+                    BufferArg::from_raw_parts(h_ir.clone(), 2),
+                    BufferArg::from_raw_parts(h_ctotal.clone(), 1),
+                    BufferArg::from_raw_parts(h_parent.clone(), c_host + 1),
+                );
+                // Fresh level-0 sources each sample — and the rotation
+                // never writes h_d0 (round 1 of a naive ping-pong would,
+                // seeding the next sample with stale depths).
+                let mut sp = h_parent.clone();
+                let mut sd = h_d0.clone();
+                for k in 0..kmax {
+                    let tp = if k % 2 == 0 { h_parent_b.clone() } else { h_parent.clone() };
+                    let td = if k % 2 == 0 { h_d_a.clone() } else { h_d_b.clone() };
+                    rank_step::launch_unchecked(
+                        &client,
+                        cubes_of(c_host + 1),
+                        CubeDim::new_1d(256),
+                        BufferArg::from_raw_parts(sp.clone(), c_host + 1),
+                        BufferArg::from_raw_parts(sd.clone(), c_host + 1),
+                        BufferArg::from_raw_parts(tp.clone(), c_host + 1),
+                        BufferArg::from_raw_parts(td.clone(), c_host + 1),
+                        BufferArg::from_raw_parts(h_lvl.clone(), kmax as usize * (c_host + 1)),
+                        k as usize,
+                        cstride,
+                    );
+                    sp = tp;
+                    sd = td;
+                }
+                rank_out = sd.clone();
+                item_roots::launch_unchecked(
                     &client,
                     cubes_of(items.len().max(1)),
                     CubeDim::new_1d(256),
-                    BufferArg::from_raw_parts(h_bytes.clone(), n_words),
+                    BufferArg::from_raw_parts(h_hp.clone(), c_host),
+                    BufferArg::from_raw_parts(h_ctotal.clone(), 1),
                     BufferArg::from_raw_parts(h_ir.clone(), 2),
                     BufferArg::from_raw_parts(h_ic.clone(), ic.len()),
-                    BufferArg::from_raw_parts(h_cslot.clone(), n),
+                    BufferArg::from_raw_parts(h_roots.clone(), 1),
+                );
+            }
+            return;
+        }
+        if cluster_mode && s == 4 {
+            unsafe {
+                cluster_mark::launch_unchecked(
+                    &client,
+                    cubes_of(c_host.max(1)),
+                    CubeDim::new_1d(256),
+                    BufferArg::from_raw_parts(h_hp.clone(), c_host),
+                    BufferArg::from_raw_parts(rank_out.clone(), c_host + 1),
+                    BufferArg::from_raw_parts(h_lvl.clone(), kmax as usize * (c_host + 1)),
+                    BufferArg::from_raw_parts(h_ctotal.clone(), 1),
+                    BufferArg::from_raw_parts(h_roots.clone(), 1),
+                    BufferArg::from_raw_parts(h_ir.clone(), 2),
                     BufferArg::from_raw_parts(h_cend.clone(), n),
                     BufferArg::from_raw_parts(h_sm.clone(), n),
                     BufferArg::from_raw_parts(h_fl.clone(), n_words),
+                    kmax,
+                    cstride as u32,
                     bitmap_advance,
                 );
             }
@@ -2591,7 +3238,9 @@ pub fn bench(ctx: &GpuContext, corpus_path: &Path) -> ! {
     }
     if cluster_mode {
         stage_names.push("cluster_probe");
-        stage_names.push("cluster_chain");
+        stage_names.push("cluster_compact");
+        stage_names.push("cluster_rank");
+        stage_names.push("cluster_mark");
     }
     stage_names.extend([
         "tile_scan",
@@ -2609,9 +3258,15 @@ pub fn bench(ctx: &GpuContext, corpus_path: &Path) -> ! {
             return ("cluster_probe", n_words.div_ceil(256), 256);
         }
         if cluster_mode && s == 2 {
-            // Thread-per-item: one thread per item walks its greedy chain —
-            // the single-item bench IS this stage's worst case.
-            return ("cluster_chain", items.len().max(1), 256);
+            return ("cluster_compact", n_tiles, units as u32);
+        }
+        if cluster_mode && s == 3 {
+            // 1 + K + 1 dispatches (jump, rank steps, roots) under one
+            // window; the count is the dominant per-dispatch shape.
+            return ("cluster_rank", (c_host + 1).div_ceil(256), 256);
+        }
+        if cluster_mode && s == 4 {
+            return ("cluster_mark", c_host.max(1).div_ceil(256), 256);
         }
         let t = s - pre;
         let (cubes, dim) = match t {
@@ -2656,15 +3311,15 @@ pub fn bench(ctx: &GpuContext, corpus_path: &Path) -> ! {
     let _wm = client.read_one(h_wm.clone()).expect("read wm");
     let _lm = client.read_one(h_lm.clone()).expect("read lm");
     let readback_dt = t1.elapsed();
-    // The cluster lanes' own witness, whenever the chain stage ran (it is
-    // absolute stage 2, so stages >= 3 — cluster implies decode): packed
+    // The cluster lanes' own witness, whenever the mark stage ran (it is
+    // absolute stage 4, so stages >= 5 — cluster implies decode): packed
     // flags (low byte, trailer bit included) and advance, bit-exact against
     // decode_all + resolve_clusters — the same PRE-SCAN reference
     // --cubecl-cluster-check diffs against. Not run_scan_pipeline's slots:
     // those carry scan-derived bits (F_RENDERED) the device pass never
     // writes. The stages after cluster only READ fl/sm, so the end-of-run
     // readback still sees the pass's output untouched.
-    if cluster_mode && stages >= 3 {
+    if cluster_mode && stages >= 5 {
         let mut cslots = crate::fold::Slots::new(n);
         let _ = crate::fold::decode_all(&bytes, &mut cslots, &trie);
         crate::fold::resolve_clusters(&bytes, &mut cslots, &trie, &items[0]);
