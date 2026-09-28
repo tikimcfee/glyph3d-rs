@@ -18,15 +18,44 @@ use crate::layout::{
     ItemPlacement, VerifyLayout,
 };
 use std::path::Path;
+use std::time::{Duration, Instant};
+
+/// The product path's wall-clock decomposition — rung 5's yardstick,
+/// reported through `LoadStats`. The chain's five spans come from
+/// `run_repo_chain`; the three host spans are this backend's own tail
+/// (the record-materialization cost the rung-4 desk note priced as one
+/// lump). Wall clock, always on — a handful of `Instant::now()` calls is
+/// not a load-time cost.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct CubeclPhases {
+    /// Bytes concat + fold::Item building.
+    pub marshal: Duration,
+    /// run_repo_chain's spans (leader scan / tables / device init /
+    /// pack+upload / launches).
+    pub chain: crate::cubecl_chain::ChainPhases,
+    /// The chunked emit + record readback (== the stream's readback_dur).
+    pub emit_readback: Duration,
+    /// Per-item GlyphRecord building + the all_records accumulation.
+    pub convert: Duration,
+    /// compact_records_into across all items.
+    pub compact: Duration,
+}
 
 /// The device-chain backend. Construct and `load_trie_file` like any other;
 /// the atlas tables are loaded per run inside the chain.
 #[derive(Default)]
-pub struct CubeclLayout;
+pub struct CubeclLayout {
+    phases: CubeclPhases,
+}
 
 impl CubeclLayout {
     pub fn new() -> Self {
-        Self
+        Self::default()
+    }
+
+    /// The last run's decomposition; zeroed before the first layout.
+    pub(crate) fn phases(&self) -> CubeclPhases {
+        self.phases
     }
 }
 
@@ -60,6 +89,7 @@ impl VerifyLayout for CubeclLayout {
         items: &[LayoutItem<'_>],
         arena: &mut GlyphArena,
     ) -> Result<(Vec<ItemPlacement>, Vec<GlyphRecord>), LayoutError> {
+        let t_marshal = Instant::now();
         let mut bytes = Vec::new();
         let mut fis = Vec::with_capacity(items.len());
         let mut off = 0usize;
@@ -91,8 +121,11 @@ impl VerifyLayout for CubeclLayout {
             off += item.bytes.len();
         }
 
+        let t_chain = Instant::now();
         let stream = crate::cubecl_chain::run_repo_chain(None, &bytes, &fis);
 
+        let mut convert = Duration::ZERO;
+        let mut compact = Duration::ZERO;
         let mut placements = Vec::with_capacity(items.len());
         let mut all_records = Vec::new();
         let words = &stream.records;
@@ -103,6 +136,7 @@ impl VerifyLayout for CubeclLayout {
                 .get(index + 1)
                 .map(|&b| b as usize)
                 .unwrap_or(stream.total_records as usize);
+            let t = Instant::now();
             let records: Vec<GlyphRecord> = (base..next)
                 .map(|r| {
                     let w = r * 8;
@@ -119,13 +153,23 @@ impl VerifyLayout for CubeclLayout {
                 })
                 .collect();
             all_records.extend_from_slice(&records);
+            convert += t.elapsed();
+            let t = Instant::now();
             placements.push(compact_records_into(
                 &records,
                 item.paint,
                 item.group_id,
                 arena,
             ));
+            compact += t.elapsed();
         }
+        self.phases = CubeclPhases {
+            marshal: t_chain.duration_since(t_marshal),
+            chain: stream.phases,
+            emit_readback: stream.readback_dur,
+            convert,
+            compact,
+        };
         Ok((placements, all_records))
     }
 }

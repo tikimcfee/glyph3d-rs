@@ -4094,6 +4094,29 @@ pub fn bench(ctx: &GpuContext, corpus_path: &Path) -> ! {
 // ItemPlacement.record_count, so the stream alignment itself is part of the
 // fence: a divergent count shifts every later record and the exact lanes
 // catch it wholesale.
+/// The chain's wall-clock decomposition inside run_repo_chain — rung 5's
+/// yardstick. `chain_dur` above is the whole span (and today INCLUDES the
+/// emit/readback loop, which readback_dur reports separately); these five
+/// carve the pre-readback part so a single number never has to answer for
+/// the serial host prelude, the device acquisition, and the launches at
+/// once. Wall clock, not GPU timestamps — the bench instrument owns the
+/// per-dispatch device view; this one answers "where did the load go".
+#[derive(Clone, Copy, Default)]
+pub(crate) struct ChainPhases {
+    /// Serial host prelude: the leader scan + rec_base prefix sums.
+    pub prep: std::time::Duration,
+    /// Atlas trie load + cluster host inputs + pair filter + item tables.
+    pub tables: std::time::Duration,
+    /// Device acquisition + the cubecl client. The product path's SECOND
+    /// device (the rung-4 compromise) shows up here.
+    pub init: std::time::Duration,
+    /// pack_words + buffer allocation + uploads.
+    pub upload: std::time::Duration,
+    /// The launch block's wall time. First-launch kernel JIT hides here on
+    /// a cold process; a cold/warm pair of runs separates it.
+    pub dispatch: std::time::Duration,
+}
+
 /// THE DEVICE LOAD PATH — bytes and per-file items in, the record stream
 /// out. Both `repo_check` (the fence) and `CubeclLayout` (the product)
 /// call THIS function: a second copy of the driver would mean the gate no
@@ -4110,6 +4133,7 @@ pub(crate) struct ChainStream {
     pub candidates: usize,
     pub chain_dur: std::time::Duration,
     pub readback_dur: std::time::Duration,
+    pub phases: ChainPhases,
 }
 
 #[allow(clippy::too_many_lines)]
@@ -4157,6 +4181,7 @@ pub(crate) fn run_repo_chain(
     for &c in &item_leaders {
         total_records += c;
     }
+    let t_tables = std::time::Instant::now();
 
     let (units, rake) = (256usize, 8usize);
     let log = units.ilog2() as usize;
@@ -4204,6 +4229,7 @@ pub(crate) fn run_repo_chain(
         page_gap_x.push(item.page_gap_x as f32);
     }
 
+    let t_init = std::time::Instant::now();
     // Share the caller's device when there is one; the product backend
     // constructs its own (a second device is the rung-4 compromise —
     // rung 5's direct bind merges them).
@@ -4224,6 +4250,7 @@ pub(crate) fn run_repo_chain(
     };
     let cdev = cubecl::wgpu::init_device(setup, Default::default());
     let client = cubecl::Device::Wgpu(cdev).client();
+    let t_upload = std::time::Instant::now();
     let packed = pack_words(bytes);
     let (bi, bm, bc, bshift) = trie.device_tables();
     let h_bytes = client.create_from_slice(bytemuck::cast_slice(&packed));
@@ -4292,6 +4319,7 @@ pub(crate) fn run_repo_chain(
     let tiles_grid = |tiles: usize| {
         CubeCount::Static(tiles.min(65535) as u32, tiles.div_ceil(65535) as u32, 1)
     };
+    let t_dispatch = std::time::Instant::now();
     unsafe {
         decode::launch_unchecked(
             &client,
@@ -4564,6 +4592,13 @@ pub(crate) fn run_repo_chain(
         candidates: c,
         chain_dur: t_chain0.elapsed(),
         readback_dur: t_rb.elapsed(),
+        phases: ChainPhases {
+            prep: t_tables.duration_since(t_chain0),
+            tables: t_init.duration_since(t_tables),
+            init: t_upload.duration_since(t_init),
+            upload: t_dispatch.duration_since(t_upload),
+            dispatch: t_rb.duration_since(t_dispatch),
+        },
     }
 }
 
@@ -4626,6 +4661,7 @@ pub fn repo_check(ctx: &GpuContext, dir: &Path) -> ! {
     let c = stream.candidates;
     let chain_dt = stream.chain_dur;
     let readback_dt = stream.readback_dur;
+    let phases = stream.phases;
     if std::env::var_os("GLYPH_CHAIN_DEBUG").is_some() {
         println!("  dbg recs[0..16] = {:?}", &recs_all[..16]);
     }
@@ -4836,6 +4872,10 @@ pub fn repo_check(ctx: &GpuContext, dir: &Path) -> ! {
         bit_devs,
         max_dev,
         t_all.elapsed()
+    );
+    println!(
+        "  chain spans: prep {:?} | tables {:?} | init {:?} | pack+upload {:?} | dispatch {:?} (wall; cold-process JIT hides in dispatch)",
+        phases.prep, phases.tables, phases.init, phases.upload, phases.dispatch
     );
     if bad > 0 || !count_ok || max_dev > 1e-4 {
         eprintln!(

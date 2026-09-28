@@ -324,6 +324,9 @@ pub struct LoadStats {
     /// have three different fixes, and item 3 of the plan is a decision
     /// between two of them, so the sum alone cannot answer it.
     pub phases: BackendPhases,
+    /// The cubecl backend's own decomposition (rung 5's yardstick); None on
+    /// the Mojo strategies, whose spans live in `phases`.
+    pub cubecl: Option<crate::cubecl_layout::CubeclPhases>,
     pub stage: Duration,
     pub layout: Duration,
     pub files: usize,
@@ -563,12 +566,20 @@ pub fn load_repo_from_walk(
         }
     }
     impl Backend {
-        /// The Mojo backend's phase meter (load stats); the cubecl path
-        /// reports its own timings from the chain stream.
+        /// The Mojo backend's phase meter (load stats). Cubecl reports
+        /// nothing here — its spans are a different shape entirely, and
+        /// zeros in this struct would read as stages that ran fast.
         fn phases(&self) -> BackendPhases {
             match self {
                 Backend::Mojo(b) => b.phases(),
                 Backend::Cubecl(_) => BackendPhases::default(),
+            }
+        }
+        /// The cubecl backend's decomposition (rung 5's yardstick).
+        fn cubecl_phases(&self) -> Option<crate::cubecl_layout::CubeclPhases> {
+            match self {
+                Backend::Mojo(_) => None,
+                Backend::Cubecl(b) => Some(b.phases()),
             }
         }
     }
@@ -713,6 +724,7 @@ pub fn load_repo_from_walk(
         walk: walk_dur,
         backend: backend_dur,
         phases: backend.phases(),
+        cubecl: backend.cubecl_phases(),
         stage: stage_dur,
         layout: layout_dur,
         files: walk.files.len(),
@@ -927,6 +939,41 @@ impl RepoLoad {
         // ambiguity that made `fold` look like the fold for a day. Only the
         // person who built the path knows which zero is which, and they are not
         // the person who reads this next.
+        if let Some(cp) = s.cubecl {
+            // The device chain's stages are a different shape from the
+            // record/direct split below — printing the Mojo block for it
+            // would show zeros for stages that RAN, the exact ambiguity the
+            // n/a rule exists against. Cubecl reports its own spans.
+            let ch = &cp.chain;
+            let accounted = cp.marshal
+                + ch.prep
+                + ch.tables
+                + ch.init
+                + ch.upload
+                + ch.dispatch
+                + cp.emit_readback
+                + cp.convert
+                + cp.compact;
+            println!(
+                "  cubecl chain: prep {:.3}s | tables {:.3}s | init {:.3}s | pack+upload {:.3}s \
+                 | dispatch {:.3}s | emit+readback {:.3}s ({:.2} GB records)",
+                ch.prep.as_secs_f64(),
+                ch.tables.as_secs_f64(),
+                ch.init.as_secs_f64(),
+                ch.upload.as_secs_f64(),
+                ch.dispatch.as_secs_f64(),
+                cp.emit_readback.as_secs_f64(),
+                (s.records * 32) as f64 / 1.073_741_824e9,
+            );
+            println!(
+                "  cubecl host: marshal {:.3}s | convert {:.3}s | compact {:.3}s \
+                 | unattributed {:.3}s",
+                cp.marshal.as_secs_f64(),
+                cp.convert.as_secs_f64(),
+                cp.compact.as_secs_f64(),
+                s.backend.saturating_sub(accounted).as_secs_f64(),
+            );
+        } else {
         let p = s.phases;
         let attributed = p.fold + p.readback() + p.compact;
         let absent = !s.strategy.materializes_records();
@@ -968,6 +1015,7 @@ impl RepoLoad {
             " | unattributed {:.3}s",
             p.fold.saturating_sub(eng_sum).as_secs_f64()
         );
+        }
     }
 }
 
