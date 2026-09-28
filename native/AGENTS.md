@@ -194,10 +194,10 @@ battery; the state handoff is note 18 in the integration notes):
   them (X's page multiplier m, Z's wrap segment, Y's row magnitude): it
   is the instrument that prices the paginate arithmetic fork, and its
   all-zero reading on an exercised corpus is a load-bearing claim, not
-  decoration. Post-closure standing (2026-09-28): Y/Z/adv/hgt read ZERO
-  on glyph3d-js; X carries the stride-value class (the tree-keyed extent
-  is 1-2 ulp off the engine's f64 prefix) until the segment-aware
-  extent walk lands — see cubecl_chain.rs's extent_pair note.
+  decoration. Standing (2026-09-28): glyph3d-js reads ZERO across all
+  484M measure words — the fork is closed. Keep it that way: any X/Y/Z
+  change re-runs this instrument on a corpus exercising m >= 3 and wrap
+  segments >= 3.
 
 Shared env vars: `GLYPH_CHAIN_STAGES` (absolute dispatch count — bisection),
 `GLYPH_CHAIN_LOOP` (samples, minimum reported), `GLYPH_CHAIN_WRAP=<w>`
