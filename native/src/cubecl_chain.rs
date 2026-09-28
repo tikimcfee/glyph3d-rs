@@ -4107,14 +4107,40 @@ pub(crate) struct ChainPhases {
     pub prep: std::time::Duration,
     /// Atlas trie load + cluster host inputs + pair filter + item tables.
     pub tables: std::time::Duration,
-    /// Device acquisition + the cubecl client. The product path's SECOND
-    /// device (the rung-4 compromise) shows up here.
+    /// Device acquisition + the cubecl client. Only the no-caller-device
+    /// fallback pays a construction here (`--repo-scan-only`, GPU-less
+    /// checks); since rung 5a the render path shares the renderer's device
+    /// and this span is near zero.
     pub init: std::time::Duration,
     /// pack_words + buffer allocation + uploads.
     pub upload: std::time::Duration,
     /// The launch block's wall time. First-launch kernel JIT hides here on
     /// a cold process; a cold/warm pair of runs separates it.
     pub dispatch: std::time::Duration,
+}
+
+/// The renderer's own device, handed to the chain so both run on ONE
+/// instance/adapter/device/queue — rung 5a's device merge. The wgpu handles
+/// clone as Arcs, so this is a cheap by-value pass; `run_repo_chain` accepts
+/// `None` and constructs a device of its own for callers that have none
+/// (`--repo-scan-only`, GPU-less checks), which keeps that path exactly as it
+/// was.
+pub(crate) struct SharedDevice {
+    pub instance: wgpu::Instance,
+    pub adapter: wgpu::Adapter,
+    pub device: wgpu::Device,
+    pub queue: wgpu::Queue,
+}
+
+impl SharedDevice {
+    pub(crate) fn from_ctx(ctx: &crate::gpu::GpuContext) -> Self {
+        Self {
+            instance: ctx.instance.clone(),
+            adapter: ctx.adapter.clone(),
+            device: ctx.device.clone(),
+            queue: ctx.queue.clone(),
+        }
+    }
 }
 
 /// THE DEVICE LOAD PATH — bytes and per-file items in, the record stream
@@ -4138,7 +4164,7 @@ pub(crate) struct ChainStream {
 
 #[allow(clippy::too_many_lines)]
 pub(crate) fn run_repo_chain(
-    ctx: Option<&crate::gpu::GpuContext>,
+    device: Option<&SharedDevice>,
     bytes: &[u8],
     items: &[crate::fold::Item],
 ) -> ChainStream {
@@ -4230,22 +4256,24 @@ pub(crate) fn run_repo_chain(
     }
 
     let t_init = std::time::Instant::now();
-    // Share the caller's device when there is one; the product backend
-    // constructs its own (a second device is the rung-4 compromise —
-    // rung 5's direct bind merges them).
+    // One device when the caller has one (the renderer's, shared since rung
+    // 5a — the rung-4 second device is gone from the render path); callers
+    // with no GPU of their own still construct one here.
     let owned_ctx;
-    let ctx_ref = match ctx {
-        Some(c) => c,
+    let owned_dev;
+    let device_ref = match device {
+        Some(d) => d,
         None => {
             owned_ctx = pollster::block_on(crate::gpu::init(None));
-            &owned_ctx
+            owned_dev = SharedDevice::from_ctx(&owned_ctx);
+            &owned_dev
         }
     };
     let setup = WgpuSetup {
-        instance: ctx_ref.instance.clone(),
-        adapter: ctx_ref.adapter.clone(),
-        device: ctx_ref.device.clone(),
-        queue: ctx_ref.queue.clone(),
+        instance: device_ref.instance.clone(),
+        adapter: device_ref.adapter.clone(),
+        device: device_ref.device.clone(),
+        queue: device_ref.queue.clone(),
         backend: AutoGraphicsApi::backend(),
     };
     let cdev = cubecl::wgpu::init_device(setup, Default::default());
@@ -4662,7 +4690,8 @@ pub fn repo_check(ctx: &GpuContext, dir: &Path) -> ! {
     }
 
     // ── the chain side — THE load path, shared with CubeclLayout ────────
-    let stream = run_repo_chain(Some(ctx), &bytes, &fis);
+    let device = SharedDevice::from_ctx(ctx);
+    let stream = run_repo_chain(Some(&device), &bytes, &fis);
     let recs_all = stream.records;
     let total_records = stream.total_records;
     let c = stream.candidates;

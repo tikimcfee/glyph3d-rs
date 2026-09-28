@@ -58,10 +58,16 @@ pub struct WalkResult {
     pub skipped_large: usize,
     pub skipped_non_utf8: usize,
     pub dirs_visited: usize,
+    /// The walk's own wall time, measured where the walk happens. The load's
+    /// `walk` stat reads THIS — the old span inside `load_repo_from_walk`
+    /// timed nothing (the walk arrives already done), which is why it printed
+    /// 0.000s on corpora that take real milliseconds to read.
+    pub walk_dur: std::time::Duration,
 }
 
 /// Recursive walk, deterministic order (files sorted by relative path).
 pub fn walk_repo(root: &Path) -> WalkResult {
+    let t0 = std::time::Instant::now();
     let mut candidates: Vec<(String, PathBuf)> = Vec::new();
     let mut skipped_large = 0usize;
     let mut dirs_visited = 0usize;
@@ -147,6 +153,7 @@ pub fn walk_repo(root: &Path) -> WalkResult {
         skipped_large,
         skipped_non_utf8,
         dirs_visited,
+        walk_dur: t0.elapsed(),
     }
 }
 
@@ -479,13 +486,26 @@ pub fn load_repo(
     strategy: Strategy,
     verify: bool,
 ) -> RepoLoad {
-    load_repo_from_walk(root, walk_repo(root), trie, params, strategy, verify, GlyphArena::new())
+    load_repo_from_walk(
+        root,
+        walk_repo(root),
+        trie,
+        params,
+        strategy,
+        verify,
+        None,
+        GlyphArena::new(),
+    )
 }
 
 /// `load_repo` with the walk and the arena already in hand: the caller walks
 /// first so it can size the arena to the byte count (the render path's
 /// device-mapped arena exists because of this split — leaders ≤ bytes, so
 /// `walk.total_bytes` is the slot bound the direct path commits against).
+/// `gpu` is the renderer's device when one exists — the cubecl backend
+/// shares it (rung 5a) instead of constructing a second; `None` is the
+/// no-GPU door (`--repo-scan-only`), where the chain makes its own.
+#[allow(clippy::too_many_arguments)]
 pub fn load_repo_from_walk(
     root: &Path,
     walk: WalkResult,
@@ -493,10 +513,10 @@ pub fn load_repo_from_walk(
     params: &RepoParams,
     strategy: Strategy,
     verify: bool,
+    gpu: Option<&crate::gpu::GpuContext>,
     mut arena: GlyphArena,
 ) -> RepoLoad {
-    let t0 = Instant::now();
-    let walk_dur = t0.elapsed();
+    let walk_dur = walk.walk_dur;
 
     // Per-file params (pagination sized per file). Newline counts double as
     // the row estimate — one fast byte scan per file.
@@ -596,7 +616,12 @@ pub fn load_repo_from_walk(
         }
     }
     let mut backend = match strategy {
-        Strategy::Cubecl => Backend::Cubecl(crate::cubecl_layout::CubeclLayout::new()),
+        Strategy::Cubecl => Backend::Cubecl(match gpu {
+            Some(ctx) => crate::cubecl_layout::CubeclLayout::with_device(
+                crate::cubecl_chain::SharedDevice::from_ctx(ctx),
+            ),
+            None => crate::cubecl_layout::CubeclLayout::new(),
+        }),
         other => Backend::Mojo(MojoLayout::new(other)),
     };
     backend

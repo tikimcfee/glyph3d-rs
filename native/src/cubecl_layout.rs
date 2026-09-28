@@ -7,11 +7,14 @@
 //! extents, paint and drops are the engine path's own, which is what makes
 //! byte-equal goldens an arithmetic claim rather than a hope.
 //!
-//! Two rung-4 compromises, both named:
+//! Two rung-4 compromises were named here; the second is resolved:
 //! - The records cross to the host (the chunked readback). Rung 5's direct
 //!   bind consumes the device buffers in place and this readback dies.
-//! - `run_repo_chain` constructs its own GPU device when handed no context
-//!   (a second device alongside the renderer's). Also rung 5's business.
+//! - ~~`run_repo_chain` constructs its own GPU device~~ — resolved rung 5a:
+//!   the caller threads the renderer's device (`SharedDevice` through
+//!   `with_device`) and the chain runs on the ONE device that draws.
+//!   `new()` keeps the own-device fallback for callers with none
+//!   (`--repo-scan-only`, GPU-less checks).
 
 use crate::layout::{
     compact_records_into, GlyphArena, GlyphRecord, LayoutError, LayoutGlyphs, LayoutItem,
@@ -45,12 +48,25 @@ pub(crate) struct CubeclPhases {
 /// the atlas tables are loaded per run inside the chain.
 #[derive(Default)]
 pub struct CubeclLayout {
+    /// The renderer's shared device when the caller threaded one (rung 5a's
+    /// device merge); `None` lets the chain construct its own.
+    device: Option<crate::cubecl_chain::SharedDevice>,
     phases: CubeclPhases,
 }
 
 impl CubeclLayout {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Share the caller's (the renderer's) GPU device — rung 5a's merge: the
+    /// chain computes on the same device/queue that draws, and the second
+    /// device of the rung-4 compromise never exists.
+    pub(crate) fn with_device(device: crate::cubecl_chain::SharedDevice) -> Self {
+        Self {
+            device: Some(device),
+            ..Default::default()
+        }
     }
 
     /// The last run's decomposition; zeroed before the first layout.
@@ -122,7 +138,7 @@ impl VerifyLayout for CubeclLayout {
         }
 
         let t_chain = Instant::now();
-        let stream = crate::cubecl_chain::run_repo_chain(None, &bytes, &fis);
+        let stream = crate::cubecl_chain::run_repo_chain(self.device.as_ref(), &bytes, &fis);
 
         let mut convert = Duration::ZERO;
         let mut compact = Duration::ZERO;

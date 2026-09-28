@@ -306,7 +306,16 @@ fn build_scene_impl(
                 } else {
                     layout::GlyphArena::new()
                 };
-                repo::load_repo_from_walk(dir, walk, &default_engine_trie(), &params, *strategy, *verify, arena)
+                repo::load_repo_from_walk(
+                    dir,
+                    walk,
+                    &default_engine_trie(),
+                    &params,
+                    *strategy,
+                    *verify,
+                    Some(ctx),
+                    arena,
+                )
             };
             load.print_stats();
             let atlas = atlas::Atlas::load(ctx, emoji_sheet);
