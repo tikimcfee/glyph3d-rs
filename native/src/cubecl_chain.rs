@@ -953,8 +953,15 @@ fn emit_records(
     hgt: &[f32],
     gi: &[u32],
     recs: &mut [u32],
-    #[comptime] rec_first: usize,
+    win: &[u32],
 ) {
+    // The window base rides a 1-element params BUFFER, not a comptime
+    // scalar: all windows reuse the ONE compiled kernel (a comptime
+    // rec_first cost a fresh JIT specialization per window — ~3.5s cold
+    // across six on the 97MB shape), and a buffer binds positionally like
+    // every other slice, clear of the scalar/info region where landmine 7
+    // lives. 0usize: bare int literals fail expansion (landmine 10).
+    let rec_first = win[0usize] as usize;
     let b = ABSOLUTE_POS;
     let n = wc.len();
     let item_count = ir.len() / 2;
@@ -2496,6 +2503,7 @@ pub fn run(ctx: &GpuContext, fixture_path: &Path) -> ! {
         // Phase 4 rung 2: the record emitter — only when the full chain ran
         // (paginate is the last dispatch; STAGES bisects below it).
         if stages >= 6 {
+            let h_win0 = client.create_from_slice(bytemuck::cast_slice(&[0u32]));
             emit_records::launch_unchecked(
                 &client,
                 cubes_of(n),
@@ -2510,7 +2518,7 @@ pub fn run(ctx: &GpuContext, fixture_path: &Path) -> ! {
                 BufferArg::from_raw_parts(h_hgt.clone(), n),
                 BufferArg::from_raw_parts(h_gi.clone(), n),
                 BufferArg::from_raw_parts(h_recs.clone(), leaders * 8),
-                0,
+                BufferArg::from_raw_parts(h_win0, 1),
             );
         }
     }
@@ -4598,6 +4606,7 @@ pub(crate) fn run_repo_chain(
     let mut first = 0usize;
     while first < total_records as usize {
         let take = chunk_recs.min(total_records as usize - first);
+        let h_win = client.create_from_slice(bytemuck::cast_slice(&[first as u32]));
         unsafe {
             emit_records::launch_unchecked(
                 &client,
@@ -4613,7 +4622,7 @@ pub(crate) fn run_repo_chain(
                 BufferArg::from_raw_parts(h_hgt.clone(), n),
                 BufferArg::from_raw_parts(h_gi.clone(), n),
                 BufferArg::from_raw_parts(h_recs.clone(), take * 8),
-                first,
+                BufferArg::from_raw_parts(h_win, 1),
             );
         }
         let cb = client.read_one(h_recs.clone()).expect("read chunk");

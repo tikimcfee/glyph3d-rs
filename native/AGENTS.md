@@ -216,8 +216,9 @@ fl/sm are diffed bit-exact against `decode_all`+`resolve_clusters`),
 records, default 16,777,216 = a 512MB rolling buffer — the cubecl-fork
 gate sets 60,000 so the standing fixture's 278,470 records cross five
 windows, fencing the chunked emitter's `rec_first` carry on an ordinary
-corpus; each window is a fresh comptime `rec_first` specialization, so
-small values cost JIT compiles, not just dispatches).
+corpus; the window base rides a runtime params buffer, so every window
+shares one compiled kernel — small values cost dispatches and 4-byte
+uploads, nothing else).
 
 ## Commit cadence
 
