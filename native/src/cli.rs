@@ -272,6 +272,11 @@ pub(crate) struct Cli {
     /// vs decode_all + resolve_clusters — flags + advance bit-exact, exit.
     #[arg(long, value_name = "PATH")]
     pub(crate) cubecl_cluster_check: Option<PathBuf>,
+    /// Dev-only CubeCL repo parity driver (phase 4 rung 3): the full chain
+    /// over a real repository, records diffed tier-aware against the
+    /// engine's batched output — the fence the load-path flip rides on.
+    #[arg(long, value_name = "DIR")]
+    pub(crate) cubecl_repo_check: Option<PathBuf>,
     /// Windowed only: how frames reach the display. `fifo` (the default) is
     /// vsync, so the FPS line reads the monitor's refresh; `mailbox` and
     /// `immediate` uncap it where the surface supports them (else fifo, and

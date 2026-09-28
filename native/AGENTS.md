@@ -185,6 +185,10 @@ battery; the state handoff is note 18 in the integration notes):
 - `--cubecl-decode-check <fixture>` — decode vs `decode_all`, bit-exact.
 - `--cubecl-cluster-check <fixture>` — decode + cluster vs `decode_all` +
   `resolve_clusters`, bit-exact.
+- `--cubecl-repo-check <dir>` — the full chain over a real repository,
+  records tier-diffed against the engine's batched output (phase 4 rung
+  3): glyph_id/row/col exact, measures at the f32-reassociation eps
+  tier, counts must match. Parity and timing in the same run.
 
 Shared env vars: `GLYPH_CHAIN_STAGES` (absolute dispatch count — bisection),
 `GLYPH_CHAIN_LOOP` (samples, minimum reported), `GLYPH_CHAIN_WRAP=<w>`

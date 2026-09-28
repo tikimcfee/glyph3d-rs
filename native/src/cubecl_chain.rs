@@ -293,6 +293,7 @@ fn cluster_probe(
     ic: &[u32],
     fl: &mut [u32],
     sm: &mut [f32],
+    gi: &mut [u32],
     cslot: &mut [u32],
     cend: &mut [u32],
     #[comptime] seq_max: u32,
@@ -325,7 +326,12 @@ fn cluster_probe(
                     if cluster && id >= start && id < stop {
                         let cp = cp_at(bytes, id, len, n);
                         if is_static_zero(cp) != 0u32 {
+                            // fold.rs:543-548 zeroes ALL THREE static lanes
+                            // for a static-zero byte in a cluster item — gi
+                            // included. The probe wrote two of them until
+                            // the repo parity driver caught the third.
                             sm[id] = f32::from_bits(0u32);
+                            gi[id] = 0u32;
                             word |= F_CLUSTER_TRAILER << ((lane as u32) * 8u32);
                         } else {
                             // cp above 0x10FFFF is malformed decode — the
@@ -843,7 +849,9 @@ fn cluster_mark(
     roots: &[u32],
     ir: &[u32],
     cend: &[u32],
+    cslot: &[u32],
     sm: &mut [f32],
+    gi: &mut [u32],
     fl_atomic: &mut [Atomic<u32>],
     #[comptime] kmax: usize,
     #[comptime] stride: usize,
@@ -886,10 +894,20 @@ fn cluster_mark(
                     let e = cend[p] as usize;
                     let lim = if e < stop { e } else { stop };
                     sm[p] = bitmap_advance;
+                    // A committed head's glyph IS the sequence's slot —
+                    // the record emitter's GLYPH_ID for cluster heads
+                    // (fold.rs:607's slots.gi[id] = best_slot). The
+                    // consumer is the repo parity driver / phase 4.
+                    gi[p] = cslot[p];
                     let mut t = p + 1usize;
                     while t < lim {
                         if flags_at_from_atomic(fl_atomic, t) & F_LEADER != 0 {
                             sm[t] = f32::from_bits(0u32);
+                            // fold.rs:610-612: a trailer member's gi zeroes
+                            // with its advance — the engine's records carry
+                            // gi 0 for cluster trailers, and the parity
+                            // driver catches exactly this.
+                            gi[t] = 0u32;
                             fl_atomic[t >> 2].fetch_or(F_CLUSTER_TRAILER << (((t & 3) as u32) * 8u32));
                         }
                         t += 1usize;
@@ -935,6 +953,7 @@ fn emit_records(
     hgt: &[f32],
     gi: &[u32],
     recs: &mut [u32],
+    #[comptime] rec_first: usize,
 ) {
     let b = ABSOLUTE_POS;
     let n = wc.len();
@@ -944,17 +963,24 @@ fn emit_records(
             // path): this leader's item-relative ordinal. base is the
             // per-item record offset — together the record stream is
             // item order, ordinal order within items, exactly the
-            // engine's emission order.
+            // engine's emission order. rec_first windows this launch at
+            // one CHUNK of the stream — the record buffer stays a fixed
+            // rolling slice instead of a whole-corpus allocation (the
+            // 97MB repo shape's 3.1GB single buffer was what pushed the
+            // instrument past the machine's memory ceiling).
             let it = item_search(ir, item_count, b);
-            let w = (base[it] + wc[b]) as usize * 8;
-            recs[w] = lm[b * LM_STRIDE + LM_X].to_bits();
-            recs[w + 1] = lm[b * LM_STRIDE + LM_Y].to_bits();
-            recs[w + 2] = lm[b * LM_STRIDE + LM_Z].to_bits();
-            recs[w + 3] = sm[b].to_bits();
-            recs[w + 4] = hgt[b].to_bits();
-            recs[w + 5] = gi[b];
-            recs[w + 6] = lc[b * LC_STRIDE + LC_ROW];
-            recs[w + 7] = lc[b * LC_STRIDE + LC_COL];
+            let o = base[it] + wc[b];
+            if o as usize >= rec_first && (o as usize - rec_first) < recs.len() / 8 {
+                    let w = (o as usize - rec_first) * 8;
+                recs[w] = lm[b * LM_STRIDE + LM_X].to_bits();
+                recs[w + 1] = lm[b * LM_STRIDE + LM_Y].to_bits();
+                recs[w + 2] = lm[b * LM_STRIDE + LM_Z].to_bits();
+                recs[w + 3] = sm[b].to_bits();
+                recs[w + 4] = hgt[b].to_bits();
+                recs[w + 5] = gi[b];
+                recs[w + 6] = lc[b * LC_STRIDE + LC_ROW];
+                recs[w + 7] = lc[b * LC_STRIDE + LC_COL];
+            }
     }
 }
 
@@ -2241,6 +2267,7 @@ pub fn run(ctx: &GpuContext, fixture_path: &Path) -> ! {
                 BufferArg::from_raw_parts(h_hgt.clone(), n),
                 BufferArg::from_raw_parts(h_gi.clone(), n),
                 BufferArg::from_raw_parts(h_recs.clone(), leaders * 8),
+                0,
             );
         }
     }
@@ -2809,6 +2836,7 @@ pub fn cluster_check(ctx: &GpuContext, fixture_path: &Path) -> ! {
             BufferArg::from_raw_parts(h_ic.clone(), ic.len()),
             BufferArg::from_raw_parts(h_fl.clone(), n_words),
             BufferArg::from_raw_parts(h_sm.clone(), n),
+            BufferArg::from_raw_parts(h_gi.clone(), n),
             BufferArg::from_raw_parts(h_cslot.clone(), n),
             BufferArg::from_raw_parts(h_cend.clone(), n),
             seq_max,
@@ -2917,7 +2945,9 @@ pub fn cluster_check(ctx: &GpuContext, fixture_path: &Path) -> ! {
             BufferArg::from_raw_parts(h_roots.clone(), fx.items.len()),
             BufferArg::from_raw_parts(h_ir.clone(), ir.len()),
             BufferArg::from_raw_parts(h_cend.clone(), n),
+            BufferArg::from_raw_parts(h_cslot.clone(), n),
             BufferArg::from_raw_parts(h_sm.clone(), n),
+            BufferArg::from_raw_parts(h_gi.clone(), n),
             BufferArg::from_raw_parts(h_fl.clone(), n_words),
             kmax as usize,
             stride,
@@ -3290,6 +3320,7 @@ pub fn bench(ctx: &GpuContext, corpus_path: &Path) -> ! {
                     BufferArg::from_raw_parts(h_ic.clone(), ic.len()),
                     BufferArg::from_raw_parts(h_fl.clone(), n_words),
                     BufferArg::from_raw_parts(h_sm.clone(), n),
+                    BufferArg::from_raw_parts(h_gi.clone(), n),
                     BufferArg::from_raw_parts(h_cslot.clone(), n),
                     BufferArg::from_raw_parts(h_cend.clone(), n),
                     seq_max,
@@ -3389,6 +3420,7 @@ pub fn bench(ctx: &GpuContext, corpus_path: &Path) -> ! {
                     BufferArg::from_raw_parts(h_ic.clone(), ic.len()),
                     BufferArg::from_raw_parts(h_fl.clone(), n_words),
                     BufferArg::from_raw_parts(h_sm.clone(), n),
+                    BufferArg::from_raw_parts(h_gi.clone(), n),
                     BufferArg::from_raw_parts(h_cslot.clone(), n),
                     BufferArg::from_raw_parts(h_cend.clone(), n),
                     seq_max,
@@ -3495,7 +3527,9 @@ pub fn bench(ctx: &GpuContext, corpus_path: &Path) -> ! {
                     BufferArg::from_raw_parts(h_roots.clone(), 1),
                     BufferArg::from_raw_parts(h_ir.clone(), 2),
                     BufferArg::from_raw_parts(h_cend.clone(), n),
+                    BufferArg::from_raw_parts(h_cslot.clone(), n),
                     BufferArg::from_raw_parts(h_sm.clone(), n),
+                    BufferArg::from_raw_parts(h_gi.clone(), n),
                     BufferArg::from_raw_parts(h_fl.clone(), n_words),
                     kmax as usize,
                     cstride,
@@ -3791,5 +3825,631 @@ pub fn bench(ctx: &GpuContext, corpus_path: &Path) -> ! {
         let (name, cubes, dim) = stage_meta(s);
         println!("  {name:<14} cubes={cubes:>7} units={dim} min={m:?}");
     }
+    std::process::exit(0);
+}
+
+// ── the repo parity driver — phase 4, rung 3 ─────────────────────────────────
+//
+// `--cubecl-repo-check <dir>`: the full chain over a REAL repository — walk,
+// per-file items carrying the engine path's OWN ItemParams (file_item_params,
+// default origins), decode-from-bytes through the ranked cluster pass, the
+// scan, resolve_x (the repo's wrap-back default keeps it live), paginate, and
+// the record emitter — diffed against the ENGINE's batched records for the
+// same items. Tier contract: glyph_id/row/col EXACT; advance/height/X/Y/Z
+// reported as bit-deviation counts and max relative deviation, gated at the
+// 1e-4 tier (the chain's f32 Blelloch reassociation vs the engine's f64
+// running sums is the documented eps tier — scan-vs-fold was already eps
+// there). The per-item record bases come from the ENGINE's own
+// ItemPlacement.record_count, so the stream alignment itself is part of the
+// fence: a divergent count shifts every later record and the exact lanes
+// catch it wholesale.
+pub fn repo_check(ctx: &GpuContext, dir: &Path) -> ! {
+    use crate::layout::{LayoutGlyphs as _, VerifyLayout as _};
+    let t_all = std::time::Instant::now();
+    // The renderer's default shape: wrap BACK, cluster on, the tuned grid
+    // pagination from RepoParams::default().
+    let params = crate::repo::RepoParams {
+        wrap_mode: WrapMode::Back,
+        cluster_mode: crate::fold::ClusterMode::Cluster,
+        ..Default::default()
+    };
+    let walk = crate::repo::walk_repo(dir);
+    let file_params: Vec<crate::layout::ItemParams> = walk
+        .files
+        .iter()
+        .map(|f| {
+            let newlines = f.bytes.iter().filter(|&&b| b == b'\n').count();
+            crate::repo::file_item_params(&params, f.bytes.len(), newlines)
+        })
+        .collect();
+    let item_count = walk.files.len();
+    let n: usize = walk.files.iter().map(|f| f.bytes.len()).sum();
+
+    // ── the chain side ────────────────────────────────────────────────────
+    let t_chain0 = std::time::Instant::now();
+    let mut bytes = Vec::with_capacity(n);
+    let mut fis = Vec::with_capacity(item_count);
+    let mut off = 0usize;
+    for (i, f) in walk.files.iter().enumerate() {
+        let p = &file_params[i];
+        bytes.extend_from_slice(&f.bytes);
+        fis.push(crate::fold::Item {
+            byte_start: off as i64,
+            byte_count: f.bytes.len() as i64,
+            origin_x: p.origin_x,
+            origin_y: p.origin_y,
+            origin_z: p.origin_z,
+            wrap_width: p.wrap_width as i64,
+            wrap_mode: p.wrap_mode,
+            cluster_mode: p.cluster_mode,
+            z_step: p.z_step,
+            line_height: p.line_height,
+            has_page: p.has_page,
+            page_rows: p.page_rows as i64,
+            page_cols: p.page_cols as i64,
+            scroll_rows: p.scroll_rows as i64,
+            pages_wide: p.pages_wide as i64,
+            page_gap_x: p.page_gap_x,
+            band_stride_y: p.band_stride_y,
+            depth_per_band: p.depth_per_band,
+            depth_per_col: p.depth_per_col,
+            page_line_height: p.page_line_height,
+        });
+        off += f.bytes.len();
+    }
+    // Per-item record bases, from a CPU leader scan of the corpus (the
+    // forward ordinal domain). The ENGINE's own per-item counts still fence
+    // the alignment — the diff's counts gate — but running the engine
+    // BEFORE the chain held its records (gigabytes of host memory) alive
+    // across every GPU dispatch, and at the 97MB repo shape that brushed
+    // the machine's ceiling: the failure mode was silently-dead dispatches
+    // (tile totals read back as zeros, deterministically). Chain first,
+    // engine second, diff last — the product path holds none of this.
+    let mut item_leaders = vec![0u32; item_count];
+    {
+        let mut i = 0usize;
+        let mut idx = 0usize;
+        let corpus = bytes.as_slice();
+        while i < n {
+            while idx + 1 < item_count && (fis[idx + 1].byte_start as usize) <= i {
+                idx += 1;
+            }
+            let len = crate::fold::sequence_length(corpus, i);
+            if len > 0 {
+                item_leaders[idx] += 1;
+                i += len;
+            } else {
+                i += 1;
+            }
+        }
+    }
+    let mut rec_base = vec![0u32; item_count];
+    let mut total_records = 0u32;
+    for i in 1..item_count {
+        rec_base[i] = rec_base[i - 1] + item_leaders[i - 1];
+    }
+    for &c in &item_leaders {
+        total_records += c;
+    }
+
+    let (units, rake) = (256usize, 8usize);
+    let log = units.ilog2() as usize;
+    let n_tiles = n.div_ceil(units * rake).max(1);
+    let n_words = n.div_ceil(4);
+    let rspan = 8usize;
+    let trie = crate::atlas::TrieTable::load(&crate::atlas_dir());
+    let (seq, seq_max, bitmap_advance) = match trie.cluster_table() {
+        Some((s, m, a)) => (s.to_vec(), m, a),
+        None => {
+            eprintln!("cubecl-repo-check: atlas carries no sequence section");
+            std::process::exit(1);
+        }
+    };
+    let (bitmap, ic) = cluster_host_inputs(&seq, seq_max, &fis);
+    let (poff, pval) = cluster_pair_filter(&seq, seq_max);
+    let mut ir = Vec::with_capacity(item_count * 2);
+    let mut ie = Vec::with_capacity(item_count * IE_STRIDE);
+    let mut im = Vec::with_capacity(item_count * IM_STRIDE);
+    let mut page_gap_x = Vec::with_capacity(item_count);
+    for item in &fis {
+        ir.push(item.byte_start as u32);
+        ir.push((item.byte_start + item.byte_count) as u32);
+        ie.push(item.page_rows as u32);
+        ie.push(item.page_cols as u32);
+        ie.push(item.scroll_rows as u32);
+        ie.push(item.pages_wide as u32);
+        ie.push(item.wrap_width as u32);
+        ie.push(item.has_page as u32);
+        ie.push(match item.wrap_mode {
+            WrapMode::Down => 0u32,
+            WrapMode::Back => 1,
+        });
+        ie.push(0u32);
+        im.push(item.origin_y as f32);
+        im.push(item.origin_z as f32);
+        im.push(item.line_height as f32);
+        im.push(item.z_step as f32);
+        im.push(item.band_stride_y as f32);
+        im.push(item.depth_per_band as f32);
+        im.push(item.depth_per_col as f32);
+        im.push(0.0f32);
+        im.push(item.origin_x as f32);
+        page_gap_x.push(item.page_gap_x as f32);
+    }
+
+    let setup = WgpuSetup {
+        instance: ctx.instance.clone(),
+        adapter: ctx.adapter.clone(),
+        device: ctx.device.clone(),
+        queue: ctx.queue.clone(),
+        backend: AutoGraphicsApi::backend(),
+    };
+    let cdev = cubecl::wgpu::init_device(setup, Default::default());
+    let client = cubecl::Device::Wgpu(cdev).client();
+    let mut packed = vec![0u32; n_words];
+    for (i, &b) in bytes.iter().enumerate() {
+        packed[i >> 2] |= (b as u32) << ((i & 3) * 8);
+    }
+    let (bi, bm, bc, bshift) = trie.device_tables();
+    let h_bytes = client.create_from_slice(bytemuck::cast_slice(&packed));
+    let h_bi = client.create_from_slice(bytemuck::cast_slice(&bi));
+    let h_bm = client.create_from_slice(bytemuck::cast_slice(&bm));
+    let h_bc = client.create_from_slice(bytemuck::cast_slice(&bc));
+    let h_seq = client.create_from_slice(bytemuck::cast_slice(&seq));
+    let h_bmap = client.create_from_slice(bytemuck::cast_slice(&bitmap));
+    let h_poff = client.create_from_slice(bytemuck::cast_slice(&poff));
+    let h_pval = client.create_from_slice(bytemuck::cast_slice(&pval));
+    let h_ir = client.create_from_slice(bytemuck::cast_slice(&ir));
+    let h_ic = client.create_from_slice(bytemuck::cast_slice(&ic));
+    let h_ie = client.create_from_slice(bytemuck::cast_slice(&ie));
+    let h_im = client.create_from_slice(bytemuck::cast_slice(&im));
+    let h_gap = client.create_from_slice(bytemuck::cast_slice(&page_gap_x));
+    let h_fl = client.empty(n_words * 4);
+    let h_sm = client.empty(n * 4);
+    let h_gi = client.empty(n * 4);
+    let h_hgt = client.empty(n * 4);
+    let h_cslot = client.create_from_slice(bytemuck::cast_slice(&vec![0u32; n]));
+    let h_cend = client.empty(n * 4);
+    let h_tc = client.empty(n_tiles * PARTIAL_COUNT_STRIDE * 4);
+    let h_tm = client.empty(n_tiles * 4);
+    let h_xc = client.empty(n_tiles * PARTIAL_COUNT_STRIDE * 4);
+    let h_xm = client.empty(n_tiles * 4);
+    let h_lc = client.empty(n * LC_STRIDE * 4);
+    let h_wm = client.empty(n * 4);
+    let h_wc = client.empty(n * 4);
+    let h_otb = client.empty(n * 4);
+    let h_lm = client.empty(n * LM_STRIDE * 4);
+    let h_strides = client.empty(item_count * 4);
+    let h_rmax = client.create_from_slice(bytemuck::cast_slice(&vec![0u32; item_count]));
+    let h_xmax = client.create_from_slice(bytemuck::cast_slice(&vec![0u32; item_count]));
+    let h_ctc = client.empty(n_tiles * 4);
+    let h_cup = client.empty(n_tiles * units * 4);
+    let h_cxc = client.empty(n_tiles * 4);
+    let h_ctotal = client.empty(4);
+    let h_hp = client.empty(n * 4);
+    // The record buffer is a fixed 512MB rolling CHUNK, not a whole-corpus
+    // allocation — see the emitter's rec_first note.
+    let chunk_recs = 16_777_216usize.min(total_records as usize).max(1);
+    let h_recs = client.empty(chunk_recs * 8 * 4);
+    let h_base = client.create_from_slice(bytemuck::cast_slice(&rec_base));
+    let cubes_of = |threads: usize| {
+        let cubes = threads.div_ceil(256);
+        CubeCount::Static(cubes.min(65535) as u32, cubes.div_ceil(65535) as u32, 1)
+    };
+    let tiles_grid = |tiles: usize| {
+        CubeCount::Static(tiles.min(65535) as u32, tiles.div_ceil(65535) as u32, 1)
+    };
+    unsafe {
+        decode::launch_unchecked(
+            &client,
+            cubes_of(n_words),
+            CubeDim::new_1d(256),
+            BufferArg::from_raw_parts(h_bytes.clone(), n_words),
+            BufferArg::from_raw_parts(h_bi.clone(), bi.len()),
+            BufferArg::from_raw_parts(h_bm.clone(), bm.len()),
+            BufferArg::from_raw_parts(h_bc.clone(), bc.len()),
+            BufferArg::from_raw_parts(h_fl.clone(), n_words),
+            BufferArg::from_raw_parts(h_sm.clone(), n),
+            BufferArg::from_raw_parts(h_gi.clone(), n),
+            BufferArg::from_raw_parts(h_hgt.clone(), n),
+            bshift,
+        );
+        cluster_probe::launch_unchecked(
+            &client,
+            cubes_of(n_words),
+            CubeDim::new_1d(256),
+            BufferArg::from_raw_parts(h_bytes.clone(), n_words),
+            BufferArg::from_raw_parts(h_bmap.clone(), bitmap.len()),
+            BufferArg::from_raw_parts(h_poff.clone(), poff.len()),
+            BufferArg::from_raw_parts(h_pval.clone(), pval.len()),
+            BufferArg::from_raw_parts(h_seq.clone(), seq.len()),
+            BufferArg::from_raw_parts(h_ir.clone(), ir.len()),
+            BufferArg::from_raw_parts(h_ic.clone(), ic.len()),
+            BufferArg::from_raw_parts(h_fl.clone(), n_words),
+            BufferArg::from_raw_parts(h_sm.clone(), n),
+            BufferArg::from_raw_parts(h_gi.clone(), n),
+            BufferArg::from_raw_parts(h_cslot.clone(), n),
+            BufferArg::from_raw_parts(h_cend.clone(), n),
+            seq_max,
+        );
+        count_tile::launch_unchecked(
+            &client,
+            tiles_grid(n_tiles),
+            CubeDim::new_1d(units as u32),
+            BufferArg::from_raw_parts(h_cslot.clone(), n),
+            BufferArg::from_raw_parts(h_ctc.clone(), n_tiles),
+            BufferArg::from_raw_parts(h_cup.clone(), n_tiles * units),
+            units,
+            rake,
+            log,
+        );
+        count_spine::launch_unchecked(
+            &client,
+            CubeCount::new_single(),
+            CubeDim::new_1d(units as u32),
+            BufferArg::from_raw_parts(h_ctc.clone(), n_tiles),
+            BufferArg::from_raw_parts(h_cxc.clone(), n_tiles),
+            BufferArg::from_raw_parts(h_ctotal.clone(), 1),
+            units,
+            log,
+        );
+    }
+    let tb = client.read_one(h_ctotal.clone()).expect("candidate count");
+    let c = bytemuck::cast_slice::<u8, u32>(&tb)[0] as usize;
+    let kmax = ((c as u32 + 1).next_power_of_two().trailing_zeros()) as usize;
+    let cstride = c + 1;
+    let h_lvl = client.empty((kmax * (c + 1)).max(1) * 4);
+    let h_parent = client.empty((c + 1) * 4);
+    let h_parent_b = client.empty((c + 1) * 4);
+    let mut d0 = vec![1u32; c + 1];
+    d0[c] = 0;
+    let h_d0 = client.create_from_slice(bytemuck::cast_slice(&d0));
+    let h_d_a = client.empty((c + 1) * 4);
+    let h_d_b = client.empty((c + 1) * 4);
+    let h_roots = client.create_from_slice(bytemuck::cast_slice(&vec![c as u32; item_count]));
+    unsafe {
+        cand_scatter::launch_unchecked(
+            &client,
+            tiles_grid(n_tiles),
+            CubeDim::new_1d(units as u32),
+            BufferArg::from_raw_parts(h_cslot.clone(), n),
+            BufferArg::from_raw_parts(h_cxc.clone(), n_tiles),
+            BufferArg::from_raw_parts(h_cup.clone(), n_tiles * units),
+            BufferArg::from_raw_parts(h_hp.clone(), c),
+            units,
+            rake,
+        );
+        jump_build::launch_unchecked(
+            &client,
+            cubes_of(c + 1),
+            CubeDim::new_1d(256),
+            BufferArg::from_raw_parts(h_hp.clone(), c),
+            BufferArg::from_raw_parts(h_cend.clone(), n),
+            BufferArg::from_raw_parts(h_ir.clone(), ir.len()),
+            BufferArg::from_raw_parts(h_ctotal.clone(), 1),
+            BufferArg::from_raw_parts(h_parent.clone(), c + 1),
+        );
+        let mut sp = h_parent.clone();
+        let mut sd = h_d0.clone();
+        for k in 0..kmax {
+            let tp = if k % 2 == 0 { h_parent_b.clone() } else { h_parent.clone() };
+            let td = if k % 2 == 0 { h_d_a.clone() } else { h_d_b.clone() };
+            rank_step::launch_unchecked(
+                &client,
+                cubes_of(c + 1),
+                CubeDim::new_1d(256),
+                BufferArg::from_raw_parts(sp.clone(), c + 1),
+                BufferArg::from_raw_parts(sd.clone(), c + 1),
+                BufferArg::from_raw_parts(tp.clone(), c + 1),
+                BufferArg::from_raw_parts(td.clone(), c + 1),
+                BufferArg::from_raw_parts(h_lvl.clone(), kmax * (c + 1)),
+                k,
+                cstride,
+            );
+            sp = tp;
+            sd = td;
+        }
+        item_roots::launch_unchecked(
+            &client,
+            cubes_of(item_count.max(1)),
+            CubeDim::new_1d(256),
+            BufferArg::from_raw_parts(h_hp.clone(), c),
+            BufferArg::from_raw_parts(h_ctotal.clone(), 1),
+            BufferArg::from_raw_parts(h_ir.clone(), ir.len()),
+            BufferArg::from_raw_parts(h_ic.clone(), ic.len()),
+            BufferArg::from_raw_parts(h_roots.clone(), item_count),
+        );
+        cluster_mark::launch_unchecked(
+            &client,
+            cubes_of(c.max(1)),
+            CubeDim::new_1d(256),
+            BufferArg::from_raw_parts(h_hp.clone(), c),
+            BufferArg::from_raw_parts(sd.clone(), c + 1),
+            BufferArg::from_raw_parts(h_lvl.clone(), kmax * (c + 1)),
+            BufferArg::from_raw_parts(h_ctotal.clone(), 1),
+            BufferArg::from_raw_parts(h_roots.clone(), item_count),
+            BufferArg::from_raw_parts(h_ir.clone(), ir.len()),
+            BufferArg::from_raw_parts(h_cend.clone(), n),
+            BufferArg::from_raw_parts(h_cslot.clone(), n),
+            BufferArg::from_raw_parts(h_sm.clone(), n),
+            BufferArg::from_raw_parts(h_gi.clone(), n),
+            BufferArg::from_raw_parts(h_fl.clone(), n_words),
+            kmax,
+            cstride,
+            bitmap_advance,
+        );
+        tile_scan::launch_unchecked(
+            &client,
+            tiles_grid(n_tiles),
+            CubeDim::new_1d(units as u32),
+            BufferArg::from_raw_parts(h_fl.clone(), n_words),
+            BufferArg::from_raw_parts(h_sm.clone(), n),
+            BufferArg::from_raw_parts(h_ir.clone(), ir.len()),
+            BufferArg::from_raw_parts(h_ie.clone(), ie.len()),
+            BufferArg::from_raw_parts(h_tc.clone(), n_tiles * PARTIAL_COUNT_STRIDE),
+            BufferArg::from_raw_parts(h_tm.clone(), n_tiles),
+            units,
+            rake,
+            log,
+        );
+        spine_scan::launch_unchecked(
+            &client,
+            CubeCount::new_single(),
+            CubeDim::new_1d(units as u32),
+            BufferArg::from_raw_parts(h_tc.clone(), n_tiles * PARTIAL_COUNT_STRIDE),
+            BufferArg::from_raw_parts(h_tm.clone(), n_tiles),
+            BufferArg::from_raw_parts(h_xc.clone(), n_tiles * PARTIAL_COUNT_STRIDE),
+            BufferArg::from_raw_parts(h_xm.clone(), n_tiles),
+            units,
+            log,
+        );
+        apply::launch_unchecked(
+            &client,
+            tiles_grid(n_tiles),
+            CubeDim::new_1d(units as u32),
+            BufferArg::from_raw_parts(h_fl.clone(), n_words),
+            BufferArg::from_raw_parts(h_sm.clone(), n),
+            BufferArg::from_raw_parts(h_lc.clone(), n * LC_STRIDE),
+            BufferArg::from_raw_parts(h_lm.clone(), n * LM_STRIDE),
+            BufferArg::from_raw_parts(h_ir.clone(), ir.len()),
+            BufferArg::from_raw_parts(h_ie.clone(), ie.len()),
+            BufferArg::from_raw_parts(h_im.clone(), item_count * IM_STRIDE),
+            BufferArg::from_raw_parts(h_xc.clone(), n_tiles * PARTIAL_COUNT_STRIDE),
+            BufferArg::from_raw_parts(h_xm.clone(), n_tiles),
+            BufferArg::from_raw_parts(h_wm.clone(), n),
+            BufferArg::from_raw_parts(h_wc.clone(), n),
+            BufferArg::from_raw_parts(h_otb.clone(), n),
+            BufferArg::from_raw_parts(h_rmax.clone(), item_count),
+            BufferArg::from_raw_parts(h_xmax.clone(), item_count),
+            units,
+            rake,
+            log,
+            false,
+        );
+        resolve_x::launch_unchecked(
+            &client,
+            cubes_of(n.div_ceil(rspan)),
+            CubeDim::new_1d(256),
+            BufferArg::from_raw_parts(h_sm.clone(), n),
+            BufferArg::from_raw_parts(h_fl.clone(), n_words),
+            BufferArg::from_raw_parts(h_lm.clone(), n * LM_STRIDE),
+            BufferArg::from_raw_parts(h_lc.clone(), n * LC_STRIDE),
+            BufferArg::from_raw_parts(h_im.clone(), item_count * IM_STRIDE),
+            BufferArg::from_raw_parts(h_ie.clone(), ie.len()),
+            BufferArg::from_raw_parts(h_ir.clone(), ir.len()),
+            BufferArg::from_raw_parts(h_wc.clone(), n),
+            BufferArg::from_raw_parts(h_otb.clone(), n),
+            BufferArg::from_raw_parts(h_rmax.clone(), item_count),
+            BufferArg::from_raw_parts(h_xmax.clone(), item_count),
+            256,
+            rspan,
+        );
+        derive_stride::launch_unchecked(
+            &client,
+            cubes_of(item_count.max(1)),
+            CubeDim::new_1d(256),
+            BufferArg::from_raw_parts(h_xmax.clone(), item_count),
+            BufferArg::from_raw_parts(h_ie.clone(), ie.len()),
+            BufferArg::from_raw_parts(h_gap.clone(), item_count),
+            BufferArg::from_raw_parts(h_strides.clone(), item_count),
+        );
+        paginate::launch_unchecked(
+            &client,
+            cubes_of(n),
+            CubeDim::new_1d(256),
+            BufferArg::from_raw_parts(h_lm.clone(), n * LM_STRIDE),
+            BufferArg::from_raw_parts(h_fl.clone(), n_words),
+            BufferArg::from_raw_parts(h_lc.clone(), n * LC_STRIDE),
+            BufferArg::from_raw_parts(h_im.clone(), item_count * IM_STRIDE),
+            BufferArg::from_raw_parts(h_ie.clone(), ie.len()),
+            BufferArg::from_raw_parts(h_ir.clone(), ir.len()),
+            BufferArg::from_raw_parts(h_strides.clone(), item_count),
+        );
+    }
+    // Chunked emit + readback into the host record stream (the record
+    // buffer is a fixed rolling slice — the emitter's rec_first note).
+    let t_rb = std::time::Instant::now();
+    let mut recs_all: Vec<u32> = Vec::with_capacity(total_records as usize * 8);
+    let mut first = 0usize;
+    while first < total_records as usize {
+        let take = chunk_recs.min(total_records as usize - first);
+        unsafe {
+            emit_records::launch_unchecked(
+                &client,
+                cubes_of(n),
+                CubeDim::new_1d(256),
+                BufferArg::from_raw_parts(h_fl.clone(), n_words),
+                BufferArg::from_raw_parts(h_wc.clone(), n),
+                BufferArg::from_raw_parts(h_ir.clone(), ir.len()),
+                BufferArg::from_raw_parts(h_base.clone(), item_count),
+                BufferArg::from_raw_parts(h_lm.clone(), n * LM_STRIDE),
+                BufferArg::from_raw_parts(h_lc.clone(), n * LC_STRIDE),
+                BufferArg::from_raw_parts(h_sm.clone(), n),
+                BufferArg::from_raw_parts(h_hgt.clone(), n),
+                BufferArg::from_raw_parts(h_gi.clone(), n),
+                BufferArg::from_raw_parts(h_recs.clone(), take * 8),
+                first,
+            );
+        }
+        let cb = client.read_one(h_recs.clone()).expect("read chunk");
+        let csv: &[u32] = bytemuck::cast_slice(&cb);
+        recs_all.extend_from_slice(&csv[..take * 8]);
+        first += take;
+    }
+    if std::env::var_os("GLYPH_CHAIN_DEBUG").is_some() {
+        let st = client.read_one(h_strides.clone()).expect("strides");
+        let stv: &[f32] = bytemuck::cast_slice(&st);
+        let xm = client.read_one(h_xmax.clone()).expect("xmax");
+        let xmv: &[u32] = bytemuck::cast_slice(&xm);
+        println!(
+            "  dbg strides[0..4] = {:?} xmax[0..4] = {:?} (decoded {:?})",
+            &stv[..item_count.min(4)],
+            &xmv[..item_count.min(4)],
+            xmv[..item_count.min(4)].iter().map(|&k| f32::from_bits(k)).collect::<Vec<_>>()
+        );
+        let bb = client.read_one(h_bytes.clone()).expect("bytes");
+        let bbw: &[u32] = bytemuck::cast_slice(&bb);
+        println!("  dbg bytes[0..4] = {:08x} {:08x} {:08x} {:08x}", bbw[0], bbw[1], bbw[2], bbw[3]);
+        let fb = client.read_one(h_fl.clone()).expect("fl");
+        let fbw: &[u32] = bytemuck::cast_slice(&fb);
+        println!("  dbg fl[0..4]    = {:08x} {:08x} {:08x} {:08x}", fbw[0], fbw[1], fbw[2], fbw[3]);
+        let wcb = client.read_one(h_wc.clone()).expect("wc");
+        let wcv: &[u32] = bytemuck::cast_slice(&wcb);
+        println!("  dbg wc[0..16]   = {:?}", &wcv[..16]);
+        let lcb = client.read_one(h_lc.clone()).expect("lc");
+        let lcv: &[u32] = bytemuck::cast_slice(&lcb);
+        println!("  dbg lc[0..8]    = {:?}", &lcv[..8]);
+        let smb = client.read_one(h_sm.clone()).expect("sm");
+        let smv: &[f32] = bytemuck::cast_slice(&smb);
+        println!("  dbg sm[0..8]    = {:?}", &smv[..8]);
+        let tcb = client.read_one(h_tc.clone()).expect("tc");
+        let tcv: &[u32] = bytemuck::cast_slice(&tcb);
+        println!("  dbg tc[0..8]    = {:?}", &tcv[..8]);
+    }
+    // Free every dead buffer BEFORE the record readback — the instrument's
+    // own peak memory, not the chain's: at the 97MB repo shape the live set
+    // (engine records on host + every chain buffer on device + the incoming
+    // readback) brushes a 16GB machine's ceiling, and the failure mode is
+    // silently-zero readbacks, not an error. The product path (rung 5) holds
+    // none of this — it binds instead of reading back.
+    drop((h_bytes, h_bi, h_bm, h_bc, h_seq, h_bmap, h_poff, h_pval, h_ic));
+    drop((h_ir, h_ie, h_im, h_gap, h_fl, h_sm, h_gi, h_hgt));
+    drop((h_cslot, h_cend, h_ctc, h_cup, h_cxc, h_ctotal));
+    drop((h_hp, h_lvl, h_parent, h_parent_b, h_d0, h_d_a, h_d_b, h_roots));
+    drop((h_tc, h_tm, h_xc, h_xm, h_lc, h_wm, h_wc, h_otb));
+    drop((h_lm, h_strides, h_rmax, h_xmax, h_base));
+    drop((packed, bitmap, poff, pval, seq));
+    drop(h_recs);
+    let chain_dt = t_chain0.elapsed();
+    if std::env::var_os("GLYPH_CHAIN_DEBUG").is_some() {
+        println!("  dbg recs[0..16] = {:?}", &recs_all[..16]);
+    }
+    let readback_dt = t_rb.elapsed();
+    let recs: &[u32] = &recs_all;
+
+    // ── the engine side, SECOND — records for the same items, run after the
+    // GPU work so its host-side record stream never overlaps the chain's
+    // dispatches (see the note above the leader scan).
+    let t_eng = std::time::Instant::now();
+    let mut arena = crate::layout::GlyphArena::new();
+    let mut backend = crate::layout_mojo::MojoLayout::new(crate::layout_mojo::Strategy::Batched);
+    backend
+        .load_trie_file(&crate::default_engine_trie())
+        .expect("engine trie");
+    let colors: Vec<Vec<u32>> = walk
+        .files
+        .iter()
+        .map(|f| crate::text::colorize_leaders(&f.bytes))
+        .collect();
+    let eng_items: Vec<crate::layout::LayoutItem<'_>> = walk
+        .files
+        .iter()
+        .enumerate()
+        .map(|(index, f)| crate::layout::LayoutItem {
+            bytes: &f.bytes,
+            params: file_params[index],
+            group_id: index as u32,
+            paint: crate::layout::Paint::PerRecord(&colors[index]),
+        })
+        .collect();
+    let (placements, engine_records) = backend
+        .layout_items_recording(&eng_items, &mut arena)
+        .expect("engine layout failed");
+    let eng_dt = t_eng.elapsed();
+    let engine_total: u32 = placements.iter().map(|p| p.record_count).sum();
+    drop(eng_items);
+    drop((placements, backend, arena, colors));
+
+    // ── the diff ──────────────────────────────────────────────────────────
+    let mut bad = 0usize;
+    let mut bit_devs = 0usize;
+    let mut max_dev = 0.0f64;
+    let total = total_records as usize;
+    for (o, want) in engine_records.iter().take(total).enumerate() {
+        let w = o * 8;
+        let got_gi = recs[w + 5];
+        let got_row = recs[w + 6];
+        let got_col = recs[w + 7];
+        let mut ok = got_gi == want.counts[0] && got_row == want.counts[1] && got_col == want.counts[2];
+        for k in 0..5 {
+            let got = f32::from_bits(recs[w + k]);
+            let wantm = want.measures[k];
+            if got.to_bits() == wantm.to_bits() {
+                continue;
+            }
+            bit_devs += 1;
+            let rel = (got as f64 - wantm as f64).abs() / (wantm as f64).abs().max(1.0);
+            if rel > max_dev {
+                max_dev = rel;
+            }
+            if rel > 1e-4 {
+                ok = false;
+            }
+        }
+        if !ok {
+            if bad < 8 {
+                println!(
+                    "  MISMATCH record {o}: gi {} vs {} row {} vs {} col {} vs {} | x {:e} vs {:e} y {:e} vs {:e} z {:e} vs {:e} adv {:e} vs {:e} hgt {:e} vs {:e}",
+                    got_gi, want.counts[0], got_row, want.counts[1], got_col, want.counts[2],
+                    f32::from_bits(recs[w]), want.measures[0],
+                    f32::from_bits(recs[w + 1]), want.measures[1],
+                    f32::from_bits(recs[w + 2]), want.measures[2],
+                    f32::from_bits(recs[w + 3]), want.measures[3],
+                    f32::from_bits(recs[w + 4]), want.measures[4]
+                );
+            }
+            bad += 1;
+        }
+    }
+    let count_ok = engine_records.len() == total_records as usize
+        && engine_total == total_records;
+    println!(
+        "cubecl-repo-check: {} ({} files, {} B, {} records, {} candidates) — engine {:?} | chain+readback {:?} (readback {:?}) | counts {} — {} record mismatches, {} measure bit-deviations, max {:.2e} (total {:?})",
+        dir.display(),
+        item_count,
+        n,
+        total,
+        c,
+        eng_dt,
+        chain_dt,
+        readback_dt,
+        if count_ok { "MATCH" } else { "DIFFER" },
+        bad,
+        bit_devs,
+        max_dev,
+        t_all.elapsed()
+    );
+    if bad > 0 || !count_ok || max_dev > 1e-4 {
+        eprintln!(
+            "cubecl-repo-check FAIL: {bad} record mismatches, counts {}, max deviation {max_dev:.2e}",
+            if count_ok { "MATCH" } else { "DIFFER" }
+        );
+        std::process::exit(1);
+    }
+    println!(
+        "cubecl-repo-check PASS: glyph_id/row/col exact, measures inside 1e-4 ({} of {} records carry a last-bit f32 deviation — the documented reassociation tier)",
+        bit_devs,
+        total * 5
+    );
     std::process::exit(0);
 }

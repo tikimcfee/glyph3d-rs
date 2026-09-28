@@ -371,6 +371,11 @@ fn main() {
         let ctx = pollster::block_on(gpu::init(None));
         cubecl_chain::cluster_check(&ctx, path);
     }
+    // Dev-only CubeCL repo parity driver (phase 4 rung 3).
+    if let Some(dir) = &cli.cubecl_repo_check {
+        let ctx = pollster::block_on(gpu::init(None));
+        cubecl_chain::repo_check(&ctx, dir);
+    }
 
     // Fixture parity (reference port): fixture parse manifest / corpus diff — no GPU.
     if !cli.fixture_manifest.is_empty() {
