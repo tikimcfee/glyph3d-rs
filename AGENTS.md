@@ -489,6 +489,7 @@ with a number against it.
 | `native/fixtures/baseline-view.txt` | IMMUTABLE | it is the input to `text.png`; editing it re-baselines that check silently |
 | `native/fixtures/emoji-view.txt` | IMMUTABLE | the input to `emoji.png`, one line per class of bitmap slot the trie carries; same reason |
 | `native/fixtures/g-pick-repo/empty.rs` | IMMUTABLE, zero bytes | the only input that reaches the page-extent origin seed; deleting it removes a check's ability to see its subject without removing the check |
+| `native/fixtures/cubecl-fork/` | IMMUTABLE | the cubecl-fork gate's standing corpus — the only committed input exercising paginate's m >= 3 and segment >= 3 classes; editing it re-hollows a bit-exactness gate silently (the strict mode's exercise asserts catch deletion, not weakening) |
 | `out/tooling-ab/baseline/<key>/` | tracked pixel oracle, one set per rasterizer; **golden** in build.toml | changes only on purpose, with a note saying why; the runner refuses to regenerate it. A new host adopts its own set by hand (the gate prints how); it never edits another's |
 | `integration/egui/` | vendored reference | never compiled; the real dependency is from crates.io |
 

@@ -197,7 +197,10 @@ battery; the state handoff is note 18 in the integration notes):
   decoration. Standing (2026-09-28): glyph3d-js reads ZERO across all
   484M measure words — the fork is closed. Keep it that way: any X/Y/Z
   change re-runs this instrument on a corpus exercising m >= 3 and wrap
-  segments >= 3.
+  segments >= 3. STRICT mode (`GLYPH_REPO_CHECK_STRICT=1`, set by the
+  cubecl-fork gate): any measure-word bit-deviation fails, and the census
+  denominators must be nonzero — an unexercised corpus is a FAIL, so the
+  standing fixture cannot quietly stop covering its subject.
 
 Shared env vars: `GLYPH_CHAIN_STAGES` (absolute dispatch count — bisection),
 `GLYPH_CHAIN_LOOP` (samples, minimum reported), `GLYPH_CHAIN_WRAP=<w>`

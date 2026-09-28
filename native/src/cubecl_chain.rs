@@ -4676,6 +4676,15 @@ pub fn repo_check(ctx: &GpuContext, dir: &Path) -> ! {
     drop(eng_items);
     drop((placements, backend, arena, colors));
 
+    // Empty-corpus refusal, always on — the repo-verify-direct lesson:
+    // a PASS over zero items compared nothing.
+    if item_count == 0 || total_records == 0 {
+        eprintln!(
+            "cubecl-repo-check FAIL: refusing to verify an empty corpus ({item_count} items, {total_records} records)"
+        );
+        std::process::exit(1);
+    }
+
     // ── the diff ──────────────────────────────────────────────────────────
     // The FORK CENSUS: bit-deviations bucketed BY LANE and by the integer
     // context that produced them — X's page multiplier m (the paginate
@@ -4696,6 +4705,13 @@ pub fn repo_check(ctx: &GpuContext, dir: &Path) -> ! {
     let mut z_seg = [0usize; 4]; // Z deviations at segment 0, 1, 2, >= 3
     let mut y_big_row = 0usize; // Y deviations at row > 2048
     let total = total_records as usize;
+    // STRICT mode (the fork gate): the claim is BIT-exactness, not the
+    // eps tier — any measure-word deviation fails — and the census's
+    // m>=3 / seg>=3 buckets must be proven EXERCISED by this corpus, so
+    // the gate cannot quietly hollow the way /tmp scratch corpora would.
+    let strict = std::env::var_os("GLYPH_REPO_CHECK_STRICT").is_some();
+    let mut m3_records = 0usize;
+    let mut seg3_records = 0usize;
     let mut shown = 0usize;
     for (o, want) in engine_records.iter().take(total).enumerate() {
         let w = o * 8;
@@ -4704,9 +4720,27 @@ pub fn repo_check(ctx: &GpuContext, dir: &Path) -> ! {
         let got_col = recs[w + 7];
         let mut ok = got_gi == want.counts[0] && got_row == want.counts[1] && got_col == want.counts[2];
         // The record's paginate context, off the engine-side item params.
-        // Computed lazily — most records deviate nowhere, and this only
-        // runs for the ones that do.
+        // Computed lazily for the census, unconditionally for the strict
+        // denominators (the exercise proof).
         let mut ctx: Option<(i64, i64)> = None;
+        if strict && o < item_of.len() {
+            let prm = &file_params[item_of[o] as usize];
+            let rows_s = if prm.has_page { prm.page_rows as i64 } else { 0 };
+            let scroll_s = if prm.has_page { prm.scroll_rows as i64 } else { 0 };
+            let wide_s = prm.pages_wide.max(1) as i64;
+            let screen_row_s = got_row as i64 - scroll_s;
+            let y_page_s = if rows_s > 0 && screen_row_s >= rows_s {
+                screen_row_s / rows_s
+            } else {
+                0
+            };
+            if y_page_s % wide_s >= 3 {
+                m3_records += 1;
+            }
+            if prm.wrap_width > 0 && (got_col as i64 / prm.wrap_width as i64) >= 3 {
+                seg3_records += 1;
+            }
+        }
         for k in 0..5 {
             let got = f32::from_bits(recs[w + k]);
             let wantm = want.measures[k];
@@ -4814,6 +4848,23 @@ pub fn repo_check(ctx: &GpuContext, dir: &Path) -> ! {
             if count_ok { "MATCH" } else { "DIFFER" }
         );
         std::process::exit(1);
+    }
+    if strict {
+        if bit_devs > 0 {
+            eprintln!(
+                "cubecl-repo-check FAIL (strict): {bit_devs} measure bit-deviations — the fork gate claims bit-exactness"
+            );
+            std::process::exit(1);
+        }
+        if m3_records == 0 || seg3_records == 0 {
+            eprintln!(
+                "cubecl-repo-check FAIL (strict): census not exercised — {m3_records} records at m >= 3, {seg3_records} at segment >= 3; the corpus cannot see the fork classes it exists to fence"
+            );
+            std::process::exit(1);
+        }
+        println!(
+            "strict: bit-exact across all lanes; {m3_records} records at m >= 3, {seg3_records} at segment >= 3 (exercised)"
+        );
     }
     // The census line prints on PASS too — it is the instrument that prices
     // the rung-4 fork, and a zero-deviation run is its most important datum.

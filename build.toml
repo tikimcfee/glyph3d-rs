@@ -377,6 +377,26 @@ needs = ["renderer", "fixtures"]
 compare = "six halves vs the JS oracle's recorded answers: parse parity, trie, fold, scan, bake, text.rs domain"
 blind_to = "a fault shared by both loaders in parse parity; any fixture outside text.rs's domain, silently"
 
+[[gate]]
+name = "cubecl-chain"
+scope = "rust"
+kind = "cmd"
+cmd = "bash tools/check-cubecl.sh chain"
+pass_line = "ALL PASS"
+needs = ["renderer"]
+compare = "the device chain vs the CPU scan reference over five fixtures: counts/rows exact, fold>0 X bit-exact, line_adv + positions eps, the records witness tier-diffed"
+blind_to = "corpora outside the five fixtures; the ENGINE (this is chain-vs-CPU-scan — engine parity is the fork gate's claim)"
+
+[[gate]]
+name = "cubecl-fork"
+scope = "rust"
+kind = "cmd"
+cmd = "bash tools/check-cubecl.sh fork"
+pass_line = "ALL PASS"
+needs = ["renderer", "dylib"]
+compare = "the full chain's records vs the ENGINE's batched records on the standing fork fixture, BIT-exact (strict), with the census's m>=3 and seg>=3 buckets proven exercised"
+blind_to = "corpora outside the fixture; a fault the engine and chain both carry (ground truth layers: engine-check, reference-port)"
+
 # ── Declared mutations ───────────────────────────────────────────────────
 # `glyph mutate` applies each of these, requires the named gate to go red
 # with the named text, and restores byte-exact. A gate with no mutation is
@@ -775,3 +795,49 @@ with = """            if r.row() == row {
                 if r.col() == col.wrapping_add(1) {"""
 expect = "PICK ORACLE CHECK: FAILURES"
 rebuild = "cargo build --release"
+
+[[mutation]]
+name = "paginate-tail-last"
+gate = "cubecl-fork"
+why = "the stride's tail must fold INSIDE the dominant term's single rounding — tail-LAST measurably overshoots at exact half-ulp ties (the seg-5 class, 12 records on the wide corpus when it was found). CONSUMED BY: paginate's X write, which every m >= 1 record reads"
+file = "native/src/cubecl_chain.rs"
+rebuild = "cargo build --release"
+op = "replace"
+find = """            let x_with_tail = fma(page_col, stride_reach_tail, lm[mo + LM_BASE_X]);
+            lm[mo + LM_X] = fma(page_col, stride_reach, x_with_tail);"""
+with = """            let x_dominant = fma(page_col, stride_reach, lm[mo + LM_BASE_X]);
+            lm[mo + LM_X] = fma(page_col, stride_reach_tail, x_dominant);"""
+expect = "claims bit-exactness"
+
+[[mutation]]
+name = "z-step-tail-dropped"
+gate = "cubecl-fork"
+why = "the engine multiplies the FULL f64 z_step; the correctly-rounded f32 lane alone diverges at seg >= 3 (the wide-corpus Z class was 1.2k words). CONSUMED BY: paginate's depth staircase, read by every wrapped record"
+file = "native/src/cubecl_chain.rs"
+rebuild = "cargo build --release"
+op = "replace"
+find = "            let z_tail_folded = fma(depth_steps, items[io + IM_Z_STEP_LO], items[io + IM_ORIGIN_Z]);"
+with = "            let z_tail_folded = items[io + IM_ORIGIN_Z];"
+expect = "claims bit-exactness"
+
+[[mutation]]
+name = "extent-segment-reset-dropped"
+gate = "cubecl-fork"
+why = "the extent walk must reset at segment fills — without the reset it sums whole LINES, the stride inflates by every wrapped segment, and every m >= 1 record's X goes wrong (the exact regression the walk's first landing shipped). CONSUMED BY: extent_pair's segment accumulation, the stride's only source. (A tail-lane zero-pad mutation was tried here and dropped: trailing phantom records self-locate past every engine record and take(total) truncates them, so THIS gate genuinely cannot see that class — the pad discipline guards non-Metal backends' out-of-bounds writes, which no Metal gate can express.)"
+file = "native/src/cubecl_chain.rs"
+rebuild = "cargo build --release"
+op = "replace"
+find = "                    if segment_width != 0 && column >= segment_width {"
+with = "                    if segment_width == 1 && column >= segment_width {"
+expect = "max deviation"
+
+[[mutation]]
+name = "emitter-ordinal-zeroed"
+gate = "cubecl-chain"
+why = "the record emitter gathers through the forward ordinal map; zeroing it scatters every record to its item's base, which the records witness must catch as mismatches. CONSUMED BY: emit_records' gather, the witness's only subject"
+file = "native/src/cubecl_chain.rs"
+rebuild = "cargo build --release"
+op = "replace"
+find = "            let o = base[it] + wc[b];"
+with = "        let o = base[it];"
+expect = "record mismatches"
