@@ -1037,6 +1037,223 @@ const F_LEADER: u32 = 1;
 const F_NEWLINE: u32 = 4;
 const WRAP_BACK: i32 = 1;
 
+// ── rung 5b: the instance tail ───────────────────────────────────────────────
+//
+// The survivor pass and the pack kernel — the device replacement for
+// `compact_records_into` (layout.rs). The survivor ordinals come from the
+// SAME integer scan machinery the cluster counter uses (count_tile /
+// count_spine on a plain byte flag — note 13's shape: a separate pass,
+// never a second counter inside the proven monoid). The packer writes the
+// 48 B GlyphInstance wire form and folds the extents with per-item atomics
+// over `ordered_key` — min/max is order-free, so the reduction is
+// deterministic however the atomics interleave, and its lanes are
+// bit-identical to the host loop's by construction: `right = x + advance`
+// is a bare add (nothing to contract), and the half-height lanes multiply
+// by 0.5 — a power of two, exact — so even a forced fma contraction rounds
+// identically to the host's two-step form.
+
+/// Extent lanes per item in the `ext` buffer. Order matches the decode in
+/// run_repo_chain's tail: page right/bottom/z_min/z_max over ALL records,
+/// then ink min-xyz / max-xyz over survivors.
+const EXT_STRIDE: usize = 10;
+
+/// The HOST twins of ordered_key / key_to_float — they seed the extent
+/// lanes and decode their readback, so they must agree bit for bit with
+/// the #[cube] pair (unit-tested together).
+fn ordered_key_host(v: f32) -> u32 {
+    let b = v.to_bits();
+    if (b & 0x8000_0000) != 0 {
+        !b
+    } else {
+        b | 0x8000_0000
+    }
+}
+
+fn key_to_float_host(k: u32) -> f32 {
+    let b = if (k & 0x8000_0000) != 0 {
+        k & 0x7FFF_FFFF
+    } else {
+        !k
+    };
+    f32::from_bits(b)
+}
+
+/// Unpack the leader flag and AND it with glyph-id-resolved into two plain
+/// u32 byte flags — the predicate inputs count_tile/count_spine already
+/// run on (any nonzero byte counts).
+#[cube(launch_unchecked)]
+fn survivor_flags(fl: &[u32], gi: &[u32], lflag: &mut [u32], sflag: &mut [u32]) {
+    let b = ABSOLUTE_POS;
+    let n = lflag.len();
+    if b < n {
+        let lead = if flags_at(fl, b) & F_LEADER != 0u32 { 1u32 } else { 0u32 };
+        let surv = if lead != 0u32 && gi[b] != 0u32 { 1u32 } else { 0u32 };
+        lflag[b] = lead;
+        sflag[b] = surv;
+    }
+}
+
+/// Per-byte EXCLUSIVE leader/survivor ordinals, written at EVERY byte (not
+/// just leaders) so item-boundary reads are well-defined everywhere:
+/// `lv[b]` = leaders strictly before b, `sv[b]` = survivors strictly
+/// before b. Global byte order is walk order, which IS the arena's slot
+/// order — so `sv[b]` is a survivor's global slot index, and lv at an
+/// item's start is
+/// that item's record base. The flag buffers are consumed and overwritten
+/// in the same serial walk (flags read before ordinals written per slot),
+/// which is why lv/sv may alias lflag/sflag.
+#[cube(launch_unchecked)]
+fn ordinal_scatter(
+    lflag: &[u32],
+    sflag: &[u32],
+    lxc: &[u32],
+    sxc: &[u32],
+    lup: &[u32],
+    sup: &[u32],
+    lv: &mut [u32],
+    sv: &mut [u32],
+    #[comptime] units: usize,
+    #[comptime] rake: usize,
+) {
+    let tile = CUBE_POS;
+    let u = UNIT_POS as usize;
+    let n = lflag.len();
+    let lo = tile * (units * rake) + u * rake;
+    let hi = if lo + rake < n { lo + rake } else { n };
+    let mut cl = lxc[tile] + lup[tile * units + u];
+    let mut cs = sxc[tile] + sup[tile * units + u];
+    if lo < n {
+        let mut id = lo;
+        while id < hi {
+            let fl_ = lflag[id];
+            let fs_ = sflag[id];
+            lv[id] = cl;
+            sv[id] = cs;
+            cl += fl_;
+            cs += fs_;
+            id += 1usize;
+        }
+    }
+}
+
+/// Per-item leader and survivor totals from the boundary ordinals:
+/// `tot[it]` = `lv[item_end]` − `lv[item_start]`. An end at the corpus edge
+/// (the last item, or an empty file parked there) closes on the grand
+/// totals from the spines — `lv[n]` is the pad region and unwritten.
+#[cube(launch_unchecked)]
+fn item_totals(
+    ir: &[u32],
+    lv: &[u32],
+    sv: &[u32],
+    ltot: &mut [u32],
+    stot: &mut [u32],
+    lgrand: &[u32],
+    sgrand: &[u32],
+) {
+    let it = ABSOLUTE_POS;
+    let item_count = ir.len() / 2;
+    if it < item_count {
+        let n = lv.len();
+        let s = ir[it * 2] as usize;
+        let e = ir[it * 2 + 1] as usize;
+        let ls = if s < n { lv[s] } else { lgrand[0] };
+        let le = if e < n { lv[e] } else { lgrand[0] };
+        ltot[it] = le - ls;
+        let ss = if s < n { sv[s] } else { sgrand[0] };
+        let se = if e < n { sv[e] } else { sgrand[0] };
+        stot[it] = se - ss;
+    }
+}
+
+/// The instance packer. One thread per byte; every LEADER folds the page
+/// extents (seeds 0.0, over ALL records — blanks carry extents but no
+/// slot, exactly like the host loop); every SURVIVOR (leader AND gi != 0)
+/// additionally writes its 48 B slot at the global survivor ordinal and
+/// folds the ink extents (seeds ±inf). Paint arrives as the two tables of
+/// `InstanceInputs` — jagged per-record colors indexed by the record
+/// ordinal `rbase[it] + wc[b]` (the SAME index emit_records gathers by),
+/// or the per-item flat color. The window base rides the params buffer
+/// (one compiled kernel — the 5b0 pattern); extent folds are gated to
+/// window zero because atomics over the same keys are idempotent and
+/// re-folding per window is pure waste.
+#[cube(launch_unchecked)]
+fn pack_instances(
+    fl: &[u32],
+    wc: &[u32],
+    ir: &[u32],
+    lm: &[f32],
+    lc: &[u32],
+    sm: &[f32],
+    hgt: &[f32],
+    gi: &[u32],
+    pr_colors: &[u32],
+    color_base: &[u32],
+    is_per_record: &[u32],
+    flat_colors: &[u32],
+    groups: &[u32],
+    sv: &[u32],
+    out: &mut [u32],
+    ext: &mut [Atomic<u32>],
+    win: &[u32],
+) {
+    let win_first = win[0usize] as usize;
+    let b = ABSOLUTE_POS;
+    let n = wc.len();
+    let item_count = ir.len() / 2;
+    if b < n && item_count > 0 && flags_at(fl, b) & F_LEADER != 0 {
+        let it = item_search(ir, item_count, b);
+        let x = lm[b * LM_STRIDE + LM_X];
+        let y = lm[b * LM_STRIDE + LM_Y];
+        let z = lm[b * LM_STRIDE + LM_Z];
+        let adv = sm[b];
+        let height = hgt[b];
+        // The host loop's own arithmetic: a bare add (nothing to contract)
+        // and a multiply by 0.5 — exact, so contraction is bit-neutral.
+        let right = x + adv;
+        let half = height * 0.5f32;
+        if win_first == 0 {
+            let e = it * EXT_STRIDE;
+            ext[e].fetch_max(ordered_key(right));
+            ext[e + 1].fetch_min(ordered_key(y));
+            ext[e + 2].fetch_min(ordered_key(z));
+            ext[e + 3].fetch_max(ordered_key(z));
+        }
+        if gi[b] != 0u32 {
+            let slot = sv[b] as usize;
+            if slot >= win_first && (slot - win_first) < out.len() / 12 {
+                let w = (slot - win_first) * 12;
+                out[w] = x.to_bits();
+                out[w + 1] = y.to_bits();
+                out[w + 2] = z.to_bits();
+                out[w + 3] = gi[b];
+                out[w + 4] = lc[b * LC_STRIDE + LC_ROW];
+                out[w + 5] = lc[b * LC_STRIDE + LC_COL];
+                out[w + 6] = if is_per_record[it] != 0u32 {
+                    pr_colors[(color_base[it] + wc[b]) as usize]
+                } else {
+                    flat_colors[it]
+                };
+                out[w + 7] = groups[it];
+                out[w + 8] = adv.to_bits();
+                out[w + 9] = height.to_bits();
+                // flags: the wire record carries none; the shader reads mode
+                // from the glyphmap. _pad: zero.
+                out[w + 10] = 0u32;
+                out[w + 11] = 0u32;
+            }
+            if win_first == 0 {
+                let e = it * EXT_STRIDE;
+                ext[e + 4].fetch_min(ordered_key(x));
+                ext[e + 5].fetch_min(ordered_key(y - half));
+                ext[e + 6].fetch_max(ordered_key(right));
+                ext[e + 7].fetch_max(ordered_key(y + half));
+                ext[e + 8].fetch_min(ordered_key(z));
+                ext[e + 9].fetch_max(ordered_key(z));
+            }
+        }
+    }
+}
+
 // ── the monoid, device-side ──────────────────────────────────────────────────
 
 /// scan.rs's ScanElem, register-resident. i32 lanes where the CPU rides i64:
@@ -4127,6 +4344,42 @@ pub(crate) struct ChainPhases {
     pub dispatch: std::time::Duration,
 }
 
+/// What the chain's TAIL emits. `Records` is the check/verify shape (the
+/// 8-word wire stream, read back chunked); `Instances` is the product
+/// shape (the pack kernel writes 48 B GlyphInstance slots, extents and
+/// totals come back item_count-sized); `Both` runs the two tails in one
+/// driver pass — the fork gate's mode, so the fence sees the product tail
+/// and the record tier against the same dispatches.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ChainMode {
+    Records,
+    Instances,
+    Both,
+}
+
+/// The paint/group tables the instance tail needs — the two lanes
+/// `compact_records_into` folds in on host (layout.rs's `Paint` doc:
+/// compaction destroys the index that names a byte, so paint rides
+/// THROUGH it). PerRecord lengths are host-known (one color per leader by
+/// construction); Flat paint needs no count at all — the kernel picks
+/// `flat_colors[it]` when `is_per_record[it]` is zero. The driver
+/// cross-checks the PerRecord total against the device's own leader
+/// totals and fails loud, the successor of compact's record/colors
+/// length assert.
+pub(crate) struct InstanceInputs {
+    /// Concatenated per-record colors of the PerRecord items, walk order.
+    pub per_record_colors: Vec<u32>,
+    /// Per-item start inside `per_record_colors`.
+    pub color_base: Vec<u32>,
+    /// Per-item 1/0: take the jagged table (indexed by the record ordinal)
+    /// or the flat one.
+    pub is_per_record: Vec<u32>,
+    /// Flat color per item.
+    pub flat_colors: Vec<u32>,
+    /// group_id per item — the renderer's per-file group row key.
+    pub groups: Vec<u32>,
+}
+
 /// The renderer's own device, handed to the chain so both run on ONE
 /// instance/adapter/device/queue — rung 5a's device merge. The wgpu handles
 /// clone as Arcs, so this is a cheap by-value pass; `run_repo_chain` accepts
@@ -4158,11 +4411,22 @@ impl SharedDevice {
 /// the cubecl-fork gate.
 pub(crate) struct ChainStream {
     /// 8 u32 per record (x, y, z, advance, height, gi, row, col), items in
-    /// walk order, ordinal order within items.
+    /// walk order, ordinal order within items. EMPTY unless Records/Both.
     pub records: Vec<u32>,
-    /// Per-item first-record index (the CPU leader scan's prefix sums).
+    /// Per-item first-record index (prefix sums over the DEVICE leader
+    /// totals since rung 5b — the serial CPU scan is gone from every mode).
     pub rec_base: Vec<u32>,
     pub total_records: u32,
+    /// 12 u32 per slot — the GlyphInstance wire form (pos, glyph_id, row,
+    /// col, color, group_id, advance, height, flags, pad), walk order,
+    /// survivor order within items. EMPTY unless Instances/Both.
+    pub instances: Vec<u32>,
+    pub total_slots: u32,
+    /// Per-item placements, decoded from the pack kernel's extent lanes —
+    /// the same reduction `compact_records_into` does on host (page over
+    /// ALL records, ink over survivors, min/max order-free). EMPTY unless
+    /// Instances/Both.
+    pub placements: Vec<crate::layout::ItemPlacement>,
     /// The ranked chain's candidate count (diagnostics).
     pub candidates: usize,
     pub chain_dur: std::time::Duration,
@@ -4175,46 +4439,24 @@ pub(crate) fn run_repo_chain(
     device: Option<&SharedDevice>,
     bytes: &[u8],
     items: &[crate::fold::Item],
+    inputs: &InstanceInputs,
+    mode: ChainMode,
 ) -> ChainStream {
     let item_count = items.len();
     let n: usize = bytes.len();
     let fis = items;
     // ── the chain side ────────────────────────────────────────────────────
     let t_chain0 = std::time::Instant::now();
-    // Per-item record bases, from a CPU leader scan of the corpus (the
-    // forward ordinal domain). The ENGINE's own per-item counts still fence
-    // the alignment — the diff's counts gate — but running the engine
-    // BEFORE the chain held its records (gigabytes of host memory) alive
-    // across every GPU dispatch, and at the 97MB repo shape that brushed
-    // the machine's ceiling: the failure mode was silently-dead dispatches
-    // (tile totals read back as zeros, deterministically). Chain first,
-    // engine second, diff last — the product path holds none of this.
-    let mut item_leaders = vec![0u32; item_count];
-    {
-        let mut i = 0usize;
-        let mut idx = 0usize;
-        let corpus = bytes;
-        while i < n {
-            while idx + 1 < item_count && (fis[idx + 1].byte_start as usize) <= i {
-                idx += 1;
-            }
-            let len = crate::fold::sequence_length(corpus, i);
-            if len > 0 {
-                item_leaders[idx] += 1;
-                i += len;
-            } else {
-                i += 1;
-            }
-        }
-    }
-    let mut rec_base = vec![0u32; item_count];
-    let mut total_records = 0u32;
-    for i in 1..item_count {
-        rec_base[i] = rec_base[i - 1] + item_leaders[i - 1];
-    }
-    for &c in &item_leaders {
-        total_records += c;
-    }
+    // Rung 5b: the serial CPU leader scan is GONE from every mode — the
+    // survivor pass publishes per-item leader AND survivor totals on
+    // device (an item_count-sized readback; prefix sums on host), which
+    // is what feeds rec_base/slot_base and the loop bounds below. The
+    // ENGINE's own per-item counts still fence the alignment in the fork
+    // gate's counts tier. (The ordering lesson that comment used to carry
+    // stands: chain first, engine second, diff last — the product path
+    // holds none of the engine's host memory, and at the 97MB repo shape
+    // gigabytes held across dispatches brushed the machine's ceiling with
+    // deterministically-dead dispatches as the failure mode.)
     let t_tables = std::time::Instant::now();
 
     let (units, rake) = (256usize, 8usize);
@@ -4343,18 +4585,70 @@ pub(crate) fn run_repo_chain(
     let h_cxc = client.empty(n_tiles * 4);
     let h_ctotal = client.empty(4);
     let h_hp = client.empty(n * 4);
-    // The record buffer is a fixed 512MB rolling CHUNK, not a whole-corpus
-    // allocation — see the emitter's rec_first note. GLYPH_RECORD_CHUNK
-    // shrinks the window so the fork gate crosses chunk boundaries on the
-    // standing fixture (the 16.7M default never does): the windowed
-    // emitter's carry arithmetic, fenced on an ordinary corpus.
-    let chunk_cap: usize = std::env::var("GLYPH_RECORD_CHUNK")
+    // ── rung 5b: the survivor pass's buffers ─────────────────────────────
+    // Two byte flags (leader, survivor) that the PROVEN count_tile /
+    // count_spine machinery scans; the ordinal scatter then overwrites
+    // them in place with the per-byte exclusive ordinals (lv/sv — see its
+    // header), so the flags cost no extra resident memory after the pass.
+    let h_lflag = client.empty(n * 4);
+    let h_sflag = client.empty(n * 4);
+    let h_ltc = client.empty(n_tiles * 4);
+    let h_stc = client.empty(n_tiles * 4);
+    let h_lup = client.empty(n_tiles * units * 4);
+    let h_sup = client.empty(n_tiles * units * 4);
+    let h_lxc = client.empty(n_tiles * 4);
+    let h_sxc = client.empty(n_tiles * 4);
+    let h_lgrand = client.empty(4);
+    let h_sgrand = client.empty(4);
+    let h_ltot = client.empty(item_count.max(1) * 4);
+    let h_stot = client.empty(item_count.max(1) * 4);
+    // The extent lanes, SEEDED in key space exactly like the host loop
+    // seeds its accumulators: page at 0.0 (over ALL records), ink at
+    // ±inf (over survivors — an item with none keeps the empty extent).
+    let wants_instances = matches!(mode, ChainMode::Instances | ChainMode::Both);
+    let mut ext_seed = vec![0u32; item_count * EXT_STRIDE];
+    if wants_instances {
+        let zero_k = ordered_key_host(0.0f32);
+        let inf_k = ordered_key_host(f32::INFINITY);
+        let ninf_k = ordered_key_host(f32::NEG_INFINITY);
+        for it in 0..item_count {
+            let e = it * EXT_STRIDE;
+            ext_seed[e] = zero_k;
+            ext_seed[e + 1] = zero_k;
+            ext_seed[e + 2] = zero_k;
+            ext_seed[e + 3] = zero_k;
+            ext_seed[e + 4] = inf_k;
+            ext_seed[e + 5] = inf_k;
+            ext_seed[e + 6] = ninf_k;
+            ext_seed[e + 7] = ninf_k;
+            ext_seed[e + 8] = inf_k;
+            ext_seed[e + 9] = ninf_k;
+        }
+    }
+    let h_ext = client.create_from_slice(bytemuck::cast_slice(&ext_seed));
+    let h_pr_colors = if wants_instances {
+        client.create_from_slice(bytemuck::cast_slice(&inputs.per_record_colors))
+    } else {
+        client.empty(4)
+    };
+    let h_color_base =
+        client.create_from_slice(bytemuck::cast_slice(&inputs.color_base));
+    let h_is_pr = client.create_from_slice(bytemuck::cast_slice(&inputs.is_per_record));
+    let h_flat_colors = client.create_from_slice(bytemuck::cast_slice(&inputs.flat_colors));
+    let h_groups = client.create_from_slice(bytemuck::cast_slice(&inputs.groups));
+    // The record/instance buffers are fixed rolling CHUNKS, not
+    // whole-corpus allocations — see the emitter's rec_first note. Their
+    // sizes bind to the device totals now, so they are allocated in the
+    // tail, after the survivor readback. GLYPH_RECORD_CHUNK shrinks the
+    // windows (units = elements) so the fork gate crosses boundaries on
+    // the standing fixture: the windowed carry arithmetic of BOTH tails,
+    // fenced on an ordinary corpus. Defaults keep each buffer at ~512MB:
+    // 16.7M records × 32 B, 11.18M slots × 48 B.
+    let chunk_env: Option<usize> = std::env::var("GLYPH_RECORD_CHUNK")
         .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(16_777_216);
-    let chunk_recs = chunk_cap.min(total_records as usize).max(1);
-    let h_recs = client.empty(chunk_recs * 8 * 4);
-    let h_base = client.create_from_slice(bytemuck::cast_slice(&rec_base));
+        .and_then(|v| v.parse().ok());
+    let chunk_recs_cap = chunk_env.unwrap_or(16_777_216);
+    let chunk_slots_cap = chunk_env.unwrap_or(536_870_912 / 48);
     let cubes_of = |threads: usize| {
         let cubes = threads.div_ceil(256);
         CubeCount::Static(cubes.min(65535) as u32, cubes.div_ceil(65535) as u32, 1)
@@ -4598,41 +4892,251 @@ pub(crate) fn run_repo_chain(
             BufferArg::from_raw_parts(h_ir.clone(), ir.len()),
             BufferArg::from_raw_parts(h_strides.clone(), item_count * 2),
         );
+        // ── rung 5b: the survivor pass ──────────────────────────────────
+        // The proven cluster-counter machinery (count_tile/count_spine) on
+        // the two byte flags, then the ordinal scatter overwrites the flags
+        // with per-byte exclusive ordinals, then per-item totals from the
+        // boundaries. Runs in EVERY mode — rec_base itself comes from here
+        // now (the CPU leader scan is gone).
+        survivor_flags::launch_unchecked(
+            &client,
+            cubes_of(n),
+            CubeDim::new_1d(256),
+            BufferArg::from_raw_parts(h_fl.clone(), n_words),
+            BufferArg::from_raw_parts(h_gi.clone(), n),
+            BufferArg::from_raw_parts(h_lflag.clone(), n),
+            BufferArg::from_raw_parts(h_sflag.clone(), n),
+        );
+        count_tile::launch_unchecked(
+            &client,
+            tiles_grid(n_tiles),
+            CubeDim::new_1d(units as u32),
+            BufferArg::from_raw_parts(h_lflag.clone(), n),
+            BufferArg::from_raw_parts(h_ltc.clone(), n_tiles),
+            BufferArg::from_raw_parts(h_lup.clone(), n_tiles * units),
+            units,
+            rake,
+            log,
+        );
+        count_spine::launch_unchecked(
+            &client,
+            CubeCount::new_single(),
+            CubeDim::new_1d(units as u32),
+            BufferArg::from_raw_parts(h_ltc.clone(), n_tiles),
+            BufferArg::from_raw_parts(h_lxc.clone(), n_tiles),
+            BufferArg::from_raw_parts(h_lgrand.clone(), 1),
+            units,
+            log,
+        );
+        count_tile::launch_unchecked(
+            &client,
+            tiles_grid(n_tiles),
+            CubeDim::new_1d(units as u32),
+            BufferArg::from_raw_parts(h_sflag.clone(), n),
+            BufferArg::from_raw_parts(h_stc.clone(), n_tiles),
+            BufferArg::from_raw_parts(h_sup.clone(), n_tiles * units),
+            units,
+            rake,
+            log,
+        );
+        count_spine::launch_unchecked(
+            &client,
+            CubeCount::new_single(),
+            CubeDim::new_1d(units as u32),
+            BufferArg::from_raw_parts(h_stc.clone(), n_tiles),
+            BufferArg::from_raw_parts(h_sxc.clone(), n_tiles),
+            BufferArg::from_raw_parts(h_sgrand.clone(), 1),
+            units,
+            log,
+        );
+        ordinal_scatter::launch_unchecked(
+            &client,
+            tiles_grid(n_tiles),
+            CubeDim::new_1d(units as u32),
+            BufferArg::from_raw_parts(h_lflag.clone(), n),
+            BufferArg::from_raw_parts(h_sflag.clone(), n),
+            BufferArg::from_raw_parts(h_lxc.clone(), n_tiles),
+            BufferArg::from_raw_parts(h_sxc.clone(), n_tiles),
+            BufferArg::from_raw_parts(h_lup.clone(), n_tiles * units),
+            BufferArg::from_raw_parts(h_sup.clone(), n_tiles * units),
+            BufferArg::from_raw_parts(h_lflag.clone(), n),
+            BufferArg::from_raw_parts(h_sflag.clone(), n),
+            units,
+            rake,
+        );
+        item_totals::launch_unchecked(
+            &client,
+            cubes_of(item_count.max(1)),
+            CubeDim::new_1d(256),
+            BufferArg::from_raw_parts(h_ir.clone(), ir.len()),
+            BufferArg::from_raw_parts(h_lflag.clone(), n),
+            BufferArg::from_raw_parts(h_sflag.clone(), n),
+            BufferArg::from_raw_parts(h_ltot.clone(), item_count),
+            BufferArg::from_raw_parts(h_stot.clone(), item_count),
+            BufferArg::from_raw_parts(h_lgrand.clone(), 1),
+            BufferArg::from_raw_parts(h_sgrand.clone(), 1),
+        );
     }
-    // Chunked emit + readback into the host record stream (the record
-    // buffer is a fixed rolling slice — the emitter's rec_first note).
+    // ── the tail: totals, then the mode's emission loops ─────────────────
     let t_rb = std::time::Instant::now();
-    let mut recs_all: Vec<u32> = Vec::with_capacity(total_records as usize * 8);
-    let mut first = 0usize;
-    while first < total_records as usize {
-        let take = chunk_recs.min(total_records as usize - first);
-        let h_win = client.create_from_slice(bytemuck::cast_slice(&[first as u32]));
-        unsafe {
-            emit_records::launch_unchecked(
-                &client,
-                cubes_of(n),
-                CubeDim::new_1d(256),
-                BufferArg::from_raw_parts(h_fl.clone(), n_words),
-                BufferArg::from_raw_parts(h_wc.clone(), n),
-                BufferArg::from_raw_parts(h_ir.clone(), ir.len()),
-                BufferArg::from_raw_parts(h_base.clone(), item_count),
-                BufferArg::from_raw_parts(h_lm.clone(), n * LM_STRIDE),
-                BufferArg::from_raw_parts(h_lc.clone(), n * LC_STRIDE),
-                BufferArg::from_raw_parts(h_sm.clone(), n),
-                BufferArg::from_raw_parts(h_hgt.clone(), n),
-                BufferArg::from_raw_parts(h_gi.clone(), n),
-                BufferArg::from_raw_parts(h_recs.clone(), take * 8),
-                BufferArg::from_raw_parts(h_win, 1),
-            );
+    // The survivor pass's tiny readbacks — per-item leader/survivor totals,
+    // prefix-summed on host into rec_base/slot_base and the loop bounds.
+    // This is the CPU leader scan's replacement (its 0.195s at the 97MB
+    // shape is what `prep` used to report).
+    let tb_l = client.read_one(h_ltot.clone()).expect("leader totals");
+    let ltot: Vec<u32> = bytemuck::cast_slice(&tb_l)[..item_count].to_vec();
+    let tb_s = client.read_one(h_stot.clone()).expect("survivor totals");
+    let stot: Vec<u32> = bytemuck::cast_slice(&tb_s)[..item_count].to_vec();
+    let mut rec_base = vec![0u32; item_count];
+    let mut slot_base = vec![0u32; item_count];
+    let mut total_records = 0u32;
+    let mut total_slots = 0u32;
+    for i in 0..item_count {
+        rec_base[i] = total_records;
+        slot_base[i] = total_slots;
+        total_records += ltot[i];
+        total_slots += stot[i];
+    }
+    // The paint/record alignment cross-check — compact's loud assert's
+    // successor: the HOST colorize counts must line up with the DEVICE
+    // leader totals, item by item, or the paint table would silently paint
+    // the wrong records.
+    if wants_instances {
+        let mut expect = 0u32;
+        for (it, &is_pr) in inputs.is_per_record.iter().enumerate() {
+            if is_pr != 0 {
+                assert_eq!(
+                    inputs.color_base[it], expect,
+                    "paint/record misalignment at item {it}: colors start at {} but the records say {expect}",
+                    inputs.color_base[it],
+                );
+                expect += ltot[it];
+            }
         }
-        let cb = client.read_one(h_recs.clone()).expect("read chunk");
-        let csv: &[u32] = bytemuck::cast_slice(&cb);
-        recs_all.extend_from_slice(&csv[..take * 8]);
-        first += take;
-    }    ChainStream {
+        assert_eq!(
+            inputs.per_record_colors.len(),
+            expect as usize,
+            "paint is indexed by record: {} colors for {} records",
+            inputs.per_record_colors.len(),
+            expect,
+        );
+    }
+    let h_base = client.create_from_slice(bytemuck::cast_slice(&rec_base));
+    let mut recs_all: Vec<u32> = Vec::new();
+    if matches!(mode, ChainMode::Records | ChainMode::Both) {
+        recs_all.reserve(total_records as usize * 8);
+        let chunk_recs = chunk_recs_cap.min(total_records as usize).max(1);
+        let h_recs = client.empty(chunk_recs * 8 * 4);
+        let mut first = 0usize;
+        while first < total_records as usize {
+            let take = chunk_recs.min(total_records as usize - first);
+            let h_win = client.create_from_slice(bytemuck::cast_slice(&[first as u32]));
+            unsafe {
+                emit_records::launch_unchecked(
+                    &client,
+                    cubes_of(n),
+                    CubeDim::new_1d(256),
+                    BufferArg::from_raw_parts(h_fl.clone(), n_words),
+                    BufferArg::from_raw_parts(h_wc.clone(), n),
+                    BufferArg::from_raw_parts(h_ir.clone(), ir.len()),
+                    BufferArg::from_raw_parts(h_base.clone(), item_count),
+                    BufferArg::from_raw_parts(h_lm.clone(), n * LM_STRIDE),
+                    BufferArg::from_raw_parts(h_lc.clone(), n * LC_STRIDE),
+                    BufferArg::from_raw_parts(h_sm.clone(), n),
+                    BufferArg::from_raw_parts(h_hgt.clone(), n),
+                    BufferArg::from_raw_parts(h_gi.clone(), n),
+                    BufferArg::from_raw_parts(h_recs.clone(), take * 8),
+                    BufferArg::from_raw_parts(h_win, 1),
+                );
+            }
+            let cb = client.read_one(h_recs.clone()).expect("read chunk");
+            let csv: &[u32] = bytemuck::cast_slice(&cb);
+            recs_all.extend_from_slice(&csv[..take * 8]);
+            first += take;
+        }
+    }
+    let mut inst_all: Vec<u32> = Vec::new();
+    let mut placements: Vec<crate::layout::ItemPlacement> = Vec::new();
+    if wants_instances {
+        // Exact capacity: the caller takes this allocation over as the
+        // Vec-arena's storage (GlyphArena::from_vec, zero copies) — the
+        // readback hop must touch these pages exactly once.
+        inst_all.reserve_exact(total_slots as usize * 12);
+        let chunk_slots = chunk_slots_cap.min(total_slots as usize).max(1);
+        let h_out = client.empty(chunk_slots * 12 * 4);
+        let mut first = 0usize;
+        while first < total_slots as usize {
+            let take = chunk_slots.min(total_slots as usize - first);
+            let h_win = client.create_from_slice(bytemuck::cast_slice(&[first as u32]));
+            unsafe {
+                pack_instances::launch_unchecked(
+                    &client,
+                    cubes_of(n),
+                    CubeDim::new_1d(256),
+                    BufferArg::from_raw_parts(h_fl.clone(), n_words),
+                    BufferArg::from_raw_parts(h_wc.clone(), n),
+                    BufferArg::from_raw_parts(h_ir.clone(), ir.len()),
+                    BufferArg::from_raw_parts(h_lm.clone(), n * LM_STRIDE),
+                    BufferArg::from_raw_parts(h_lc.clone(), n * LC_STRIDE),
+                    BufferArg::from_raw_parts(h_sm.clone(), n),
+                    BufferArg::from_raw_parts(h_hgt.clone(), n),
+                    BufferArg::from_raw_parts(h_gi.clone(), n),
+                    BufferArg::from_raw_parts(h_pr_colors.clone(), inputs.per_record_colors.len()),
+                    BufferArg::from_raw_parts(h_color_base.clone(), item_count),
+                    BufferArg::from_raw_parts(h_is_pr.clone(), item_count),
+                    BufferArg::from_raw_parts(h_flat_colors.clone(), item_count),
+                    BufferArg::from_raw_parts(h_groups.clone(), item_count),
+                    BufferArg::from_raw_parts(h_sflag.clone(), n),
+                    BufferArg::from_raw_parts(h_out.clone(), take * 12),
+                    BufferArg::from_raw_parts(h_ext.clone(), item_count * EXT_STRIDE),
+                    BufferArg::from_raw_parts(h_win, 1),
+                );
+            }
+            let cb = client.read_one(h_out.clone()).expect("read instance chunk");
+            let csv: &[u32] = bytemuck::cast_slice(&cb);
+            inst_all.extend_from_slice(&csv[..take * 12]);
+            first += take;
+        }
+        // Placements from the extent lanes — the same reduction the host
+        // compaction performs (page over ALL records, ink over survivors),
+        // decoded from key space.
+        let tb_e = client.read_one(h_ext.clone()).expect("extent lanes");
+        let ev: &[u32] = bytemuck::cast_slice(&tb_e);
+        placements.reserve(item_count);
+        for it in 0..item_count {
+            let e = it * EXT_STRIDE;
+            placements.push(crate::layout::ItemPlacement {
+                slot_base: slot_base[it],
+                slot_count: stot[it],
+                record_count: ltot[it],
+                page: crate::layout::PageExtent {
+                    right: key_to_float_host(ev[e]),
+                    bottom: key_to_float_host(ev[e + 1]),
+                    z_min: key_to_float_host(ev[e + 2]),
+                    z_max: key_to_float_host(ev[e + 3]),
+                },
+                ink: crate::layout::InkExtent {
+                    min: [
+                        key_to_float_host(ev[e + 4]),
+                        key_to_float_host(ev[e + 5]),
+                        key_to_float_host(ev[e + 8]),
+                    ],
+                    max: [
+                        key_to_float_host(ev[e + 6]),
+                        key_to_float_host(ev[e + 7]),
+                        key_to_float_host(ev[e + 9]),
+                    ],
+                },
+            });
+        }
+    }
+    ChainStream {
         records: recs_all,
         rec_base,
         total_records,
+        instances: inst_all,
+        total_slots,
+        placements,
         candidates: c,
         chain_dur: t_chain0.elapsed(),
         readback_dur: t_rb.elapsed(),
@@ -4699,8 +5203,41 @@ pub fn repo_check(ctx: &GpuContext, dir: &Path) -> ! {
     }
 
     // ── the chain side — THE load path, shared with CubeclLayout ────────
+    // BOTH tails: the fence sees the product's instance/placement output
+    // AND the record tier against the same dispatches. The paint tables are
+    // the SAME colorize_leaders output the engine side paints with, so the
+    // instance tier compares like against like. (Peak-memory note: Both
+    // holds four streams at the big-corpus shape — records and instances,
+    // engine and chain. The fork gate's standing fixture is small by
+    // design; a manual big-corpus run that brushes the machine ceiling can
+    // set GLYPH_REPO_CHECK_TAIL=records to drop the instance tier.)
+    let colors: Vec<Vec<u32>> = walk
+        .files
+        .iter()
+        .map(|f| crate::text::colorize_leaders(&f.bytes))
+        .collect();
+    let mut per_record_colors: Vec<u32> = Vec::new();
+    let mut color_base = vec![0u32; item_count];
+    let mut groups = Vec::with_capacity(item_count);
+    for (index, c) in colors.iter().enumerate() {
+        color_base[index] = per_record_colors.len() as u32;
+        per_record_colors.extend_from_slice(c);
+        groups.push(index as u32);
+    }
+    let inputs = InstanceInputs {
+        per_record_colors,
+        color_base,
+        is_per_record: vec![1u32; item_count],
+        flat_colors: vec![0u32; item_count],
+        groups,
+    };
+    let mode = if std::env::var("GLYPH_REPO_CHECK_TAIL").as_deref() == Ok("records") {
+        ChainMode::Records
+    } else {
+        ChainMode::Both
+    };
     let device = SharedDevice::from_ctx(ctx);
-    let stream = run_repo_chain(Some(&device), &bytes, &fis);
+    let stream = run_repo_chain(Some(&device), &bytes, &fis, &inputs, mode);
     let recs_all = stream.records;
     let total_records = stream.total_records;
     let c = stream.candidates;
@@ -4714,18 +5251,17 @@ pub fn repo_check(ctx: &GpuContext, dir: &Path) -> ! {
 
     // ── the engine side, SECOND — records for the same items, run after the
     // GPU work so its host-side record stream never overlaps the chain's
-    // dispatches (see the note above the leader scan).
+    // dispatches (see the note above the leader scan). The arena and the
+    // placements stay LIVE past the diff now: the instance and placement
+    // tiers compare against them (the arena IS the engine's instance
+    // output; the records tier only needs `engine_records` and runs after
+    // the instance tiers have dropped the arena).
     let t_eng = std::time::Instant::now();
     let mut arena = crate::layout::GlyphArena::new();
     let mut backend = crate::layout_mojo::MojoLayout::new(crate::layout_mojo::Strategy::Batched);
     backend
         .load_trie_file(&crate::default_engine_trie())
         .expect("engine trie");
-    let colors: Vec<Vec<u32>> = walk
-        .files
-        .iter()
-        .map(|f| crate::text::colorize_leaders(&f.bytes))
-        .collect();
     let eng_items: Vec<crate::layout::LayoutItem<'_>> = walk
         .files
         .iter()
@@ -4750,7 +5286,6 @@ pub fn repo_check(ctx: &GpuContext, dir: &Path) -> ! {
         item_of.extend(std::iter::repeat_n(idx as u32, p.record_count as usize));
     }
     drop(eng_items);
-    drop((placements, backend, arena, colors));
 
     // Empty-corpus refusal, always on — the repo-verify-direct lesson:
     // a PASS over zero items compared nothing.
@@ -4759,6 +5294,58 @@ pub fn repo_check(ctx: &GpuContext, dir: &Path) -> ! {
             "cubecl-repo-check FAIL: refusing to verify an empty corpus ({item_count} items, {total_records} records)"
         );
         std::process::exit(1);
+    }
+
+    // ── the instance and placement tiers (rung 5b) ────────────────────────
+    // The PRODUCT tail's own claims: the packed slots byte-equal against
+    // the engine-batched arena (the same comparison repo-verify makes of
+    // the host backends), and the placements bit-equal — which fences the
+    // pack kernel's extent folds (order-free atomics, but the seeds and
+    // the lane arithmetic must match compact_records_into exactly).
+    let mut inst_bad = 0usize;
+    let mut place_bad = 0usize;
+    if mode != ChainMode::Records {
+        let eng_words: &[u32] = bytemuck::cast_slice(arena.instances());
+        let chain_words: &[u32] = &stream.instances;
+        if eng_words.len() != chain_words.len() {
+            inst_bad += 1;
+            println!(
+                "  INSTANCE LENGTH MISMATCH: engine {} slots, chain {} slots",
+                eng_words.len() / 12,
+                chain_words.len() / 12
+            );
+        } else {
+            for (i, (a, b)) in eng_words.iter().zip(chain_words.iter()).enumerate() {
+                if a != b {
+                    inst_bad += 1;
+                    if inst_bad <= 4 {
+                        println!(
+                            "  INSTANCE MISMATCH slot {} word {}: chain {:#x} engine {:#x}",
+                            i / 12,
+                            i % 12,
+                            b,
+                            a
+                        );
+                    }
+                }
+            }
+        }
+        for (idx, (gp, cp)) in placements.iter().zip(stream.placements.iter()).enumerate() {
+            if !gp.bit_eq(cp) {
+                place_bad += 1;
+                if place_bad <= 4 {
+                    println!(
+                        "  PLACEMENT MISMATCH item {}: engine (base {} cnt {} rec {} right {:e} bottom {:e}) chain (base {} cnt {} rec {} right {:e} bottom {:e})",
+                        idx,
+                        gp.slot_base, gp.slot_count, gp.record_count, gp.page.right, gp.page.bottom,
+                        cp.slot_base, cp.slot_count, cp.record_count, cp.page.right, cp.page.bottom
+                    );
+                }
+            }
+        }
+        drop(arena);
+        drop(stream.instances);
+        drop(stream.placements);
     }
 
     // ── the diff ──────────────────────────────────────────────────────────
@@ -4922,6 +5509,12 @@ pub fn repo_check(ctx: &GpuContext, dir: &Path) -> ! {
         "  chain spans: prep {:?} | tables {:?} | init {:?} | pack+upload {:?} | dispatch {:?} (wall; cold-process JIT hides in dispatch)",
         phases.prep, phases.tables, phases.init, phases.upload, phases.dispatch
     );
+    if inst_bad > 0 || place_bad > 0 {
+        eprintln!(
+            "cubecl-repo-check FAIL: {inst_bad} instance mismatch words, {place_bad} placement mismatches"
+        );
+        std::process::exit(1);
+    }
     if bad > 0 || !count_ok || max_dev > 1e-4 {
         eprintln!(
             "cubecl-repo-check FAIL: {bad} record mismatches, counts {}, max deviation {max_dev:.2e}",
@@ -4980,6 +5573,12 @@ pub fn repo_check(ctx: &GpuContext, dir: &Path) -> ! {
         bit_devs,
         total * 5
     );
+    if mode != ChainMode::Records {
+        println!(
+            "instance tier: {} slots byte-equal, {} placements bit-equal (the pack kernel vs the engine-batched arena)",
+            stream.total_slots, item_count
+        );
+    }
     std::process::exit(0);
 }
 
@@ -5006,5 +5605,41 @@ mod tests {
         );
         // Empty input: no words at all (the pre-helper behavior).
         assert!(super::pack_words(&[]).is_empty());
+    }
+
+    /// The extent lanes' key encoding — the HOST half that seeds the lanes
+    /// and decodes their readback. Roundtrip (the seeds decode back to the
+    /// floats that made them) and MONOTONICITY (the per-item
+    /// fetch_max/fetch_min reductions are only correct if the key preserves
+    /// float order — that property, not the bit pattern, is what makes the
+    /// order-free atomics deterministic). The #[cube] twin is the same bit
+    /// logic; the fork gate's instance and placement tiers fence the
+    /// device reduction end to end.
+    #[test]
+    fn ordered_key_host_roundtrip_and_monotonic() {
+        let vals = [
+            0.0f32,
+            -0.0,
+            1.0,
+            -1.0,
+            0.5,
+            -0.5,
+            3.178_448_2e0,
+            -1.337_5e2,
+            f32::MIN_POSITIVE,
+            -f32::MIN_POSITIVE,
+            f32::MAX,
+            f32::MIN,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+        ];
+        for &v in &vals {
+            assert_eq!(super::key_to_float_host(super::ordered_key_host(v)), v);
+        }
+        let mut sorted = vals;
+        sorted.sort_by(f32::total_cmp);
+        for w in sorted.windows(2) {
+            assert!(super::ordered_key_host(w[0]) <= super::ordered_key_host(w[1]));
+        }
     }
 }

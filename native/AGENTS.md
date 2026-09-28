@@ -212,13 +212,16 @@ bench item flips to Cluster, the ranked chain runs as stages 1-4
 graph, note 18 §6c), a 4 B setup readback sizes the level tables, and
 fl/sm are diffed bit-exact against `decode_all`+`resolve_clusters`),
 `GLYPH_CHAIN_DEBUG=1` (dumps, incl. the cluster candidate table),
-`GLYPH_RECORD_CHUNK=<n>` (the repo chain's record-emit window size in
-records, default 16,777,216 = a 512MB rolling buffer — the cubecl-fork
-gate sets 60,000 so the standing fixture's 278,470 records cross five
-windows, fencing the chunked emitter's `rec_first` carry on an ordinary
-corpus; the window base rides a runtime params buffer, so every window
-shares one compiled kernel — small values cost dispatches and 4-byte
-uploads, nothing else).
+`GLYPH_RECORD_CHUNK=<n>` (the repo chain's emission window size in ELEMENTS
+— records for the record tail (default 16,777,216 = 512 MB), instance slots
+for the pack tail (default 11,184,810 = 512 MB / 48 B) since rung 5b. The
+cubecl-fork gate sets 60,000 so the standing fixture's 278,470 records cross
+five windows, fencing BOTH tails' window carry on an ordinary corpus; the
+window bases ride runtime params buffers, so every window shares one compiled
+kernel — small values cost dispatches and 4-byte uploads, nothing else),
+`GLYPH_REPO_CHECK_TAIL=records` (drops the fork check's instance/placement
+tiers — the big-corpus escape when Both mode's four simultaneous streams
+brush the memory ceiling; the gate never sets it).
 
 ## Commit cadence
 

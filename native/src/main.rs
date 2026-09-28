@@ -291,12 +291,14 @@ fn build_scene_impl(
             };
             let load = {
                 let walk = repo::walk_repo(dir);
-                // The device-resident arena: the FFI writes instances into
-                // the same shared-storage buffer the shader reads. Direct
-                // only (it's the strategy with the tail-write protocol), on
+                // The device-resident arena: the FFI (Direct) or the pack
+                // kernel's readback hop (Cubecl, rung 5b) writes instances
+                // into the same shared-storage buffer the shader reads, on
                 // unified memory, when the buffer fits.
-                let arena = if *strategy == layout_mojo::Strategy::Direct
-                    && ctx.profile.backend == wgpu::Backend::Metal
+                let arena = if matches!(
+                    strategy,
+                    layout_mojo::Strategy::Direct | layout_mojo::Strategy::Cubecl
+                ) && ctx.profile.backend == wgpu::Backend::Metal
                     && ctx.profile.mappable_primary_buffers
                     && walk.total_bytes > 0
                     && (walk.total_bytes * std::mem::size_of::<glyph_scene::GlyphInstance>()) as u64

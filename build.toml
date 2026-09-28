@@ -25,7 +25,7 @@
 # Ratchet, NOT an equality: tests are added constantly, so an exact pin would
 # redden on the most common good action in the repo. A green run whose real
 # count exceeds the floor prints a NOTE naming the value to raise it to.
-test_floor = 115
+test_floor = 116
 
 # ── Products ─────────────────────────────────────────────────────────────
 
@@ -865,4 +865,48 @@ rebuild = "cargo build --release"
 op = "replace"
 find = "                    let w = (o as usize - rec_first) * 8;"
 with = "                    let w = (o as usize) * 8;"
+expect = "cubecl-fork-chunked"
+
+[[mutation]]
+name = "survivor-ordinal-zeroed"
+gate = "cubecl-fork"
+why = "the pack kernel places each instance at its global survivor ordinal (the ordinal scan's per-byte exclusive count); zeroing it collapses every slot write onto window zero's first slot, which the instance tier must catch as word mismatches while the placement tier stays green (extents do not read sv). CONSUMED BY: pack_instances' slot write, the instance tier's only subject"
+file = "native/src/cubecl_chain.rs"
+rebuild = "cargo build --release"
+op = "replace"
+find = "            let slot = sv[b] as usize;"
+with = "            let slot = 0usize;"
+expect = "instance mismatch"
+
+[[mutation]]
+name = "ink-half-height-dropped"
+gate = "cubecl-fork"
+why = "the ink bottom extent folds y − height/2 over survivors (the quads hang half a glyph below the baseline); dropping the half makes it fold the bare baseline, which the placement tier's bit_eq must catch while the instance tier stays green — the two tiers fence disjoint lanes of the same kernel. The multiply is by 0.5, exact, so the mutation is purely the formula. CONSUMED BY: pack_instances' ink min-y lane, decoded into ItemPlacement.ink.min[1]"
+file = "native/src/cubecl_chain.rs"
+rebuild = "cargo build --release"
+op = "replace"
+find = "                ext[e + 5].fetch_min(ordered_key(y - half));"
+with = "                ext[e + 5].fetch_min(ordered_key(y));"
+expect = "placement mismatch"
+
+[[mutation]]
+name = "color-lane-dropped"
+gate = "cubecl-fork"
+why = "the per-record color arrives through the jagged paint table indexed by the record ordinal (color_base[it] + wc[b] — the same index the record emitter gathers by); zeroing the read paints every slot word 6 black, which the instance tier's byte compare must catch. The FLAT lane is deliberately not mutated: the standing corpus paints PerRecord, so a flat-color mutation would land in a region nothing reads — the measured trap. CONSUMED BY: pack_instances' color lane, the instance tier's word 6"
+file = "native/src/cubecl_chain.rs"
+rebuild = "cargo build --release"
+op = "replace"
+find = "                    pr_colors[(color_base[it] + wc[b]) as usize]"
+with = "                    0u32"
+expect = "instance mismatch"
+
+[[mutation]]
+name = "pack-window-offset-dropped"
+gate = "cubecl-fork"
+why = "the pack kernel windows its slot writes the way the emitter windows records; dropping the offset lands later windows' slots outside the rolling buffer (robustness discards them), leaving the chunked pass's later windows unwritten. Only the GLYPH_RECORD_CHUNK=60000 pass can see it — the instance-window twin of emitter-window-offset-dropped, and the proof the slot windows genuinely carry a base. CONSUMED BY: the instance stream's chunk boundaries"
+file = "native/src/cubecl_chain.rs"
+rebuild = "cargo build --release"
+op = "replace"
+find = "                let w = (slot - win_first) * 12;"
+with = "                let w = slot * 12;"
 expect = "cubecl-fork-chunked"
