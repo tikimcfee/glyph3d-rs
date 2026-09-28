@@ -102,7 +102,9 @@ fn decode(
     blocks_c: &[u32],
     fl: &mut [u32],
     sm: &mut [f32],
-    #[comptime] block_shift: u32,
+    gi: &mut [u32],
+    hgt: &mut [f32],
+    block_shift: u32,
 ) {
     let w = ABSOLUTE_POS;
     let n = bytes.len() * 4;
@@ -147,6 +149,14 @@ fn decode(
                     };
                     let e = ((block << block_shift) | (cp & 0xFFu32)) as usize;
                     sm[id] = blocks_m[e * 2];
+                    // gi and height ride the same two-level lookup the
+                    // advance does — blocks_c's low word is the glyph id,
+                    // blocks_m's high word the height (both pre-converted
+                    // to world units by device_tables). The gi lane is the
+                    // record emitter's GLYPH_ID (phase 4 rung 1; the module
+                    // header's "no device writer" gap closes here).
+                    gi[id] = blocks_c[e * 2];
+                    hgt[id] = blocks_m[e * 2 + 1];
                     let flag = F_LEADER
                         | (if b == 10u32 {
                             F_NEWLINE
@@ -160,8 +170,12 @@ fn decode(
                         });
                     word |= flag << ((lane as u32) * 8u32);
                 } else {
-                    // decode_and_resolve zeroes the statics of a non-leader.
+                    // decode_and_resolve zeroes the statics of a non-leader
+                    // — gi and height included (the fold's sm stride-2
+                    // reference zeroes both lanes).
                     sm[id] = f32::from_bits(0u32);
+                    gi[id] = 0u32;
+                    hgt[id] = f32::from_bits(0u32);
                 }
             }
             lane += 1;
@@ -894,6 +908,56 @@ fn flags_at_from_atomic(fl: &mut [Atomic<u32>], i: usize) -> u32 {
     fl[i >> 2].load() >> (((i & 3) as u32) * 8u32) & 0xFFu32
 }
 
+/// The record emitter — phase 4, rung 2. One thread per LEADER ORDINAL
+/// over the otb compaction, gathering the per-byte lanes into the 32 B
+/// wire record stream [X Y Z ADVANCE HEIGHT][GLYPH_ID ROW COL], in byte
+/// order (= item order; otb is the global byte-order compaction and items
+/// tile the corpus). The engine emits one record per leader INCLUDING
+/// newlines, blanks, and missing codepoints — parity means the same
+/// stream, so nothing is dropped here; consumers filter.
+///
+/// Tier contract (the chain-check records diff below): gi/row/col exact,
+/// height/advance bit-exact (their producing lanes are already
+/// bit-fenced elsewhere in the check); X/Y/Z ride the position eps tiers.
+/// The fold>0 X bit-tier stays in the byte-indexed lane diff — THIS diff
+/// witnesses the GATHER, and the gather's own failure mode is a wrong
+/// byte or order, which the ordinal/byte identity check catches exactly
+/// (the reference's own ord_to_byte is the independent compaction).
+#[cube(launch_unchecked)]
+fn emit_records(
+    fl: &[u32],
+    wc: &[u32],
+    ir: &[u32],
+    base: &[u32],
+    lm: &[f32],
+    lc: &[u32],
+    sm: &[f32],
+    hgt: &[f32],
+    gi: &[u32],
+    recs: &mut [u32],
+) {
+    let b = ABSOLUTE_POS;
+    let n = wc.len();
+    let item_count = ir.len() / 2;
+    if b < n && item_count > 0 && flags_at(fl, b) & F_LEADER != 0 {
+            // wc is the FORWARD ordinal map (apply writes it on every
+            // path): this leader's item-relative ordinal. base is the
+            // per-item record offset — together the record stream is
+            // item order, ordinal order within items, exactly the
+            // engine's emission order.
+            let it = item_search(ir, item_count, b);
+            let w = (base[it] + wc[b]) as usize * 8;
+            recs[w] = lm[b * LM_STRIDE + LM_X].to_bits();
+            recs[w + 1] = lm[b * LM_STRIDE + LM_Y].to_bits();
+            recs[w + 2] = lm[b * LM_STRIDE + LM_Z].to_bits();
+            recs[w + 3] = sm[b].to_bits();
+            recs[w + 4] = hgt[b].to_bits();
+            recs[w + 5] = gi[b];
+            recs[w + 6] = lc[b * LC_STRIDE + LC_ROW];
+            recs[w + 7] = lc[b * LC_STRIDE + LC_COL];
+    }
+}
+
 /// Byte i of the packed corpus, zero past the end (the reference's
 /// bounds-checked read).
 #[cube]
@@ -1618,11 +1682,16 @@ fn apply(
                         row_max[it].fetch_max((row + 1) as u32);
                     }
                 }
+                // The forward ordinal map (wc: byte -> item-relative
+                // ordinal) and the inverse table (otb) are written on
+                // EVERY path — the record emitter (phase 4 rung 2)
+                // gathers through wc, and the foldless inline path used
+                // to leave both unwritten. wm stays resolve-only (the
+                // re-sum's line-advance input, diffed where fold>0).
+                wc[id] = run.glyphs as u32;
+                otb[start + run.glyphs as usize] = id as u32;
                 if w_fold > 0 || !inline_resolve {
-                    // The re-sum's inputs: ordinal table + line advance.
-                    wc[id] = run.glyphs as u32;
                     wm[id] = run.tail_adv;
-                    otb[start + run.glyphs as usize] = id as u32;
                 } else {
                     // Foldless: x IS the line-advance lane — resolve_x's
                     // whole per-item computation, in registers, now.
@@ -1929,6 +1998,27 @@ pub fn run(ctx: &GpuContext, fixture_path: &Path) -> ! {
     for i in 0..n {
         sm.push(r.slots.advance(i));
     }
+    // Phase 4 rung 2: the record lanes upload with the statics — gi and
+    // height per byte from the reference decode (bit-identical to the
+    // device decode's lanes, which decode-check fences separately).
+    let mut giv = vec![0u32; n];
+    let mut hgv = vec![0f32; n];
+    let mut leaders = 0usize;
+    let mut item_leaders = vec![0u32; item_count];
+    for (idx, item) in fx.items.iter().enumerate() {
+        let mut c = 0u32;
+        for i in item.byte_start as usize..(item.byte_start + item.byte_count) as usize {
+            if r.slots.flags(i) & F_LEADER != 0 {
+                c += 1;
+            }
+        }
+        item_leaders[idx] = c;
+        leaders += c as usize;
+    }
+    for i in 0..n {
+        giv[i] = r.slots.gi[i];
+        hgv[i] = r.slots.height(i);
+    }
     let mut ir = Vec::with_capacity(item_count * 2);
     let mut ie = Vec::with_capacity(item_count * IE_STRIDE);
     let mut im = Vec::with_capacity(item_count * IM_STRIDE);
@@ -1971,6 +2061,16 @@ pub fn run(ctx: &GpuContext, fixture_path: &Path) -> ! {
 
     let h_fl = client.create_from_slice(bytemuck::cast_slice(&fl));
     let h_sm = client.create_from_slice(bytemuck::cast_slice(&sm));
+    let h_gi = client.create_from_slice(bytemuck::cast_slice(&giv));
+    let h_hgt = client.create_from_slice(bytemuck::cast_slice(&hgv));
+    let h_recs = client.empty(leaders.max(1) * 8 * 4);
+    // Per-item record bases: the record stream is item order, ordinal
+    // order within items — base[it] is where item it's records start.
+    let mut rec_base = vec![0u32; item_count];
+    for i in 1..item_count {
+        rec_base[i] = rec_base[i - 1] + item_leaders[i - 1];
+    }
+    let h_base = client.create_from_slice(bytemuck::cast_slice(&rec_base));
     let h_ir = client.create_from_slice(bytemuck::cast_slice(&ir));
     let h_ie = client.create_from_slice(bytemuck::cast_slice(&ie));
     let h_im = client.create_from_slice(bytemuck::cast_slice(&im));
@@ -2124,6 +2224,25 @@ pub fn run(ctx: &GpuContext, fixture_path: &Path) -> ! {
                 BufferArg::from_raw_parts(h_strides.clone(), item_count),
             );
         }
+        // Phase 4 rung 2: the record emitter — only when the full chain ran
+        // (paginate is the last dispatch; STAGES bisects below it).
+        if stages >= 6 {
+            emit_records::launch_unchecked(
+                &client,
+                cubes_of(n),
+                CubeDim::new_1d(256),
+                BufferArg::from_raw_parts(h_fl.clone(), n_words),
+                BufferArg::from_raw_parts(h_wc.clone(), n),
+                BufferArg::from_raw_parts(h_ir.clone(), item_count * 2),
+                BufferArg::from_raw_parts(h_base.clone(), item_count),
+                BufferArg::from_raw_parts(h_lm.clone(), n * LM_STRIDE),
+                BufferArg::from_raw_parts(h_lc.clone(), n * LC_STRIDE),
+                BufferArg::from_raw_parts(h_sm.clone(), n),
+                BufferArg::from_raw_parts(h_hgt.clone(), n),
+                BufferArg::from_raw_parts(h_gi.clone(), n),
+                BufferArg::from_raw_parts(h_recs.clone(), leaders * 8),
+            );
+        }
     }
     let lc_bytes = client.read_one(h_lc).expect("read lc");
     let wc_bytes = client.read_one(h_wc).expect("read wc");
@@ -2131,6 +2250,11 @@ pub fn run(ctx: &GpuContext, fixture_path: &Path) -> ! {
     let lm_bytes = client.read_one(h_lm).expect("read lm");
     let rmax_bytes = client.read_one(h_rmax).expect("read rmax");
     let xmax_bytes = client.read_one(h_xmax).expect("read xmax");
+    let recs_bytes = if stages >= 6 {
+        Some(client.read_one(h_recs).expect("read recs"))
+    } else {
+        None
+    };
     let dt = t0.elapsed();
     if std::env::var_os("GLYPH_CHAIN_DEBUG").is_some() {
         let fl_bytes = client.read_one(h_fl).expect("read fl");
@@ -2283,8 +2407,67 @@ pub fn run(ctx: &GpuContext, fixture_path: &Path) -> ! {
         }
     }
 
+    // Phase 4 rung 2 — the records witness: the emitter's gather diffed
+    // against a CPU gather over the reference's OWN ordinal compaction
+    // (ord_to_byte), ordinal by ordinal. Tiers: byte identity implied by
+    // the gather point, gi/row/col exact, advance/height bit-exact, X/Y/Z
+    // eps — the fold>0 X bit tier lives in the byte-indexed diff above;
+    // this one watches the GATHER, whose failure mode is a wrong byte or
+    // order.
+    let mut rec_bad = 0usize;
+    let mut max_rec_dev = 0.0f64;
+    if let Some(rb) = &recs_bytes {
+        let recs: &[u32] = bytemuck::cast_slice(rb);
+        // Byte-driven mirror of the emitter: every leader's record index
+        // is base[item] + the reference's own ordinal lane (wc), so the
+        // diff checks the same gather the kernel performs.
+        let mut leader_item: Vec<(usize, usize)> = Vec::with_capacity(leaders);
+        for (idx, item) in fx.items.iter().enumerate() {
+            let mut i = item.byte_start as usize;
+            let stop = (item.byte_start + item.byte_count) as usize;
+            while i < stop {
+                if r.slots.flags(i) & F_LEADER != 0 {
+                    leader_item.push((i, idx));
+                }
+                i += 1;
+            }
+        }
+        for &(b, it) in &leader_item {
+            let w = (rec_base[it] as usize + r.slots.wc[b] as usize) * 8;
+            let xf = f32::from_bits(recs[w]);
+            let yf = f32::from_bits(recs[w + 1]);
+            let zf = f32::from_bits(recs[w + 2]);
+            let af = f32::from_bits(recs[w + 3]);
+            let hf = f32::from_bits(recs[w + 4]);
+            let mut ok = recs[w + 5] == r.slots.gi[b]
+                && recs[w + 6] == r.slots.lc[b * 2]
+                && recs[w + 7] == r.slots.lc[b * 2 + 1]
+                && af.to_bits() == r.slots.advance(b).to_bits()
+                && hf.to_bits() == r.slots.height(b).to_bits();
+            for (got, want) in [(xf, r.slots.x(b)), (yf, r.slots.y(b)), (zf, r.slots.z(b))] {
+                let rel = (got as f64 - want as f64).abs() / (want as f64).abs().max(1.0);
+                if rel > max_rec_dev {
+                    max_rec_dev = rel;
+                }
+                if rel > 1e-4 {
+                    ok = false;
+                }
+            }
+            if !ok {
+                if rec_bad < 8 {
+                    println!(
+                        "  MISMATCH record @byte {b}: gi {} row {} col {} x {:e} y {:e} z {:e}",
+                        recs[w + 5], recs[w + 6], recs[w + 7], xf, yf, zf
+                    );
+                }
+                rec_bad += 1;
+            }
+        }
+    }
+
     println!(
         "cubecl-chain-check: {} ({} B, {} items, {} leaders, tile {}x{}) — {} count-lane mismatches, \
+         {} record mismatches (max position deviation {:.2e}), \
          max line_adv deviation {:.2e}, max x-extent deviation {:.2e}, max position deviation {:.2e}; \
          chain+readbacks {:?} (smoke timing only)",
         fx.name,
@@ -2294,18 +2477,26 @@ pub fn run(ctx: &GpuContext, fixture_path: &Path) -> ! {
         units,
         rake,
         bad,
+        rec_bad,
+        max_rec_dev,
         max_line_dev,
         max_x_dev,
         max_pos_dev,
         dt
     );
-    if bad > 0 || max_line_dev > 1e-4 || max_x_dev > 1e-4 || max_pos_dev > 1e-4 {
+    if bad > 0
+        || rec_bad > 0
+        || max_rec_dev > 1e-4
+        || max_line_dev > 1e-4
+        || max_x_dev > 1e-4
+        || max_pos_dev > 1e-4
+    {
         eprintln!(
-            "cubecl-chain-check FAIL: {bad} count mismatches, {max_line_dev:.2e} line_adv, {max_x_dev:.2e} x-extent, {max_pos_dev:.2e} position deviation"
+            "cubecl-chain-check FAIL: {bad} count mismatches, {rec_bad} record mismatches ({max_rec_dev:.2e}), {max_line_dev:.2e} line_adv, {max_x_dev:.2e} x-extent, {max_pos_dev:.2e} position deviation"
         );
         std::process::exit(1);
     }
-    println!("cubecl-chain-check PASS: counts + rows exact, fold>0 X bit-exact, line_adv + foldless positions inside 1e-4");
+    println!("cubecl-chain-check PASS: counts + rows exact, fold>0 X bit-exact, line_adv + foldless positions inside 1e-4, records gathered tier-correct");
     std::process::exit(0);
 }
 
@@ -2345,6 +2536,8 @@ pub fn decode_check(ctx: &GpuContext, fixture_path: &Path) -> ! {
     let h_bc = client.create_from_slice(bytemuck::cast_slice(&fx.trie.blocks_c));
     let h_fl = client.empty(n_words * 4);
     let h_sm = client.empty(n * 4);
+    let h_gi = client.empty(n * 4);
+    let h_hgt = client.empty(n * 4);
     let cubes_of = |threads: usize| {
         let cubes = threads.div_ceil(256);
         CubeCount::Static(cubes.min(65535) as u32, cubes.div_ceil(65535) as u32, 1)
@@ -2361,14 +2554,20 @@ pub fn decode_check(ctx: &GpuContext, fixture_path: &Path) -> ! {
             BufferArg::from_raw_parts(h_bc.clone(), fx.trie.blocks_c.len()),
             BufferArg::from_raw_parts(h_fl.clone(), n_words),
             BufferArg::from_raw_parts(h_sm.clone(), n),
+            BufferArg::from_raw_parts(h_gi.clone(), n),
+            BufferArg::from_raw_parts(h_hgt.clone(), n),
             crate::glyph_trie::BLOCK_SHIFT,
         );
     }
     let fl_bytes = client.read_one(h_fl).expect("read fl");
     let sm_bytes = client.read_one(h_sm).expect("read sm");
+    let gi_bytes = client.read_one(h_gi).expect("read gi");
+    let hgt_bytes = client.read_one(h_hgt).expect("read hgt");
     let dt = t0.elapsed();
     let flw: &[u32] = bytemuck::cast_slice(&fl_bytes);
     let sm: &[f32] = bytemuck::cast_slice(&sm_bytes);
+    let giv: &[u32] = bytemuck::cast_slice(&gi_bytes);
+    let hgv: &[f32] = bytemuck::cast_slice(&hgt_bytes);
 
     let mut bad = 0usize;
     for id in 0..n {
@@ -2386,6 +2585,22 @@ pub fn decode_check(ctx: &GpuContext, fixture_path: &Path) -> ! {
                     "  MISMATCH byte {id} advance: cpu {:e} gpu {:e}",
                     slots.advance(id),
                     sm[id]
+                );
+            }
+            bad += 1;
+        }
+        if slots.gi[id] != giv[id] {
+            if bad < 8 {
+                println!("  MISMATCH byte {id} gi: cpu {} gpu {}", slots.gi[id], giv[id]);
+            }
+            bad += 1;
+        }
+        if slots.height(id).to_bits() != hgv[id].to_bits() {
+            if bad < 8 {
+                println!(
+                    "  MISMATCH byte {id} height: cpu {:e} gpu {:e}",
+                    slots.height(id),
+                    hgv[id]
                 );
             }
             bad += 1;
@@ -2542,6 +2757,8 @@ pub fn cluster_check(ctx: &GpuContext, fixture_path: &Path) -> ! {
     let h_ic = client.create_from_slice(bytemuck::cast_slice(&ic));
     let h_fl = client.empty(n_words * 4);
     let h_sm = client.empty(n * 4);
+    let h_gi = client.empty(n * 4);
+    let h_hgt = client.empty(n * 4);
     let h_cslot = client.create_from_slice(bytemuck::cast_slice(&vec![0u32; n]));
     let h_cend = client.empty(n * 4);
     // The ranked chain's buffers. The compaction tiles mirror the scan
@@ -2575,6 +2792,8 @@ pub fn cluster_check(ctx: &GpuContext, fixture_path: &Path) -> ! {
             BufferArg::from_raw_parts(h_bc.clone(), fx.trie.blocks_c.len()),
             BufferArg::from_raw_parts(h_fl.clone(), n_words),
             BufferArg::from_raw_parts(h_sm.clone(), n),
+            BufferArg::from_raw_parts(h_gi.clone(), n),
+            BufferArg::from_raw_parts(h_hgt.clone(), n),
             crate::glyph_trie::BLOCK_SHIFT,
         );
         cluster_probe::launch_unchecked(
@@ -2900,8 +3119,13 @@ pub fn bench(ctx: &GpuContext, corpus_path: &Path) -> ! {
     let cdev = cubecl::wgpu::init_device(setup, Default::default());
     let client = cubecl::Device::Wgpu(cdev).client();
     let n_words = n.div_ceil(4);
-    let (h_fl, h_sm) = if decode_mode {
-        (client.empty(n_words * 4), client.empty(n * 4))
+    let (h_fl, h_sm, h_gi, h_hgt) = if decode_mode {
+        (
+            client.empty(n_words * 4),
+            client.empty(n * 4),
+            client.empty(n * 4),
+            client.empty(n * 4),
+        )
     } else {
         // Statics: advance (f32/byte) + PACKED flags (u8/byte, four per word —
         // the chain reads fl three-to-four passes and consumes only the low
@@ -2921,9 +3145,19 @@ pub fn bench(ctx: &GpuContext, corpus_path: &Path) -> ! {
         for i in 0..n {
             sm.push(r.slots.advance(i));
         }
+        // gi/height ride only the decode path (rung 1); the CPU-statics
+        // upload mode never reads them.
+        let mut giv = vec![0u32; n];
+        let mut hgv = vec![0f32; n];
+        for i in 0..n {
+            giv[i] = r.slots.gi[i];
+            hgv[i] = r.slots.height(i);
+        }
         (
             client.create_from_slice(bytemuck::cast_slice(&fl)),
             client.create_from_slice(bytemuck::cast_slice(&sm)),
+            client.create_from_slice(bytemuck::cast_slice(&giv)),
+            client.create_from_slice(bytemuck::cast_slice(&hgv)),
         )
     };
     // The decode's inputs: the corpus packed four bytes per word, and the
@@ -3039,6 +3273,8 @@ pub fn bench(ctx: &GpuContext, corpus_path: &Path) -> ! {
                     BufferArg::from_raw_parts(h_bc.clone(), bc.len()),
                     BufferArg::from_raw_parts(h_fl.clone(), n_words),
                     BufferArg::from_raw_parts(h_sm.clone(), n),
+                    BufferArg::from_raw_parts(h_gi.clone(), n),
+                    BufferArg::from_raw_parts(h_hgt.clone(), n),
                     bshift,
                 );
                 cluster_probe::launch_unchecked(
@@ -3131,6 +3367,8 @@ pub fn bench(ctx: &GpuContext, corpus_path: &Path) -> ! {
                     BufferArg::from_raw_parts(h_bc.clone(), bc.len()),
                     BufferArg::from_raw_parts(h_fl.clone(), n_words),
                     BufferArg::from_raw_parts(h_sm.clone(), n),
+                    BufferArg::from_raw_parts(h_gi.clone(), n),
+                    BufferArg::from_raw_parts(h_hgt.clone(), n),
                     bshift,
                 );
             }

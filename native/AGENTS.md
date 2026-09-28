@@ -178,7 +178,9 @@ battery; the state handoff is note 18 in the integration notes):
   measurement, verdicts printed.
 - `--cubecl-scan-check <fixture>` — phase 1: chunk partials bit-exact.
 - `--cubecl-chain-check <fixture>` — the full chain vs `scan.rs`: counts +
-  rows exact, fold>0 X bit-level, line_adv/positions eps.
+  rows exact, fold>0 X bit-level, line_adv/positions eps, and (phase 4
+  rung 2) the emitted 32 B record stream tier-diffed per leader:
+  gi/row/col exact, advance/height bit-exact, X/Y/Z eps.
 - `--cubecl-chain-bench <corpus>` — per-dispatch GPU-timestamp table.
 - `--cubecl-decode-check <fixture>` — decode vs `decode_all`, bit-exact.
 - `--cubecl-cluster-check <fixture>` — decode + cluster vs `decode_all` +
