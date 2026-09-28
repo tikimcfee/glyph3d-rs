@@ -1002,7 +1002,7 @@ const LM_BASE_X: usize = 3;
 const LC_STRIDE: usize = 2;
 const LC_ROW: usize = 0;
 const LC_COL: usize = 1;
-const IM_STRIDE: usize = 9;
+const IM_STRIDE: usize = 10;
 const IM_ORIGIN_Y: usize = 0;
 const IM_ORIGIN_Z: usize = 1;
 const IM_LINE_HEIGHT: usize = 2;
@@ -1011,6 +1011,12 @@ const IM_BAND_STRIDE_Y: usize = 4;
 const IM_DEPTH_PER_BAND: usize = 5;
 const IM_DEPTH_PER_COL: usize = 6;
 const IM_ORIGIN_X: usize = 8;
+/// The z_step's f64 tail as a second f32 — the engine multiplies the FULL
+/// f64 param and the correctly-rounded lane alone measurably diverges at
+/// seg >= 3 (the wide-repo Z class: fl(3·0.15000000596) vs the engine's
+/// fl(3·0.1499999999999999944), one ulp apart). The outer fma folds this
+/// tail back in; see paginate's fma note.
+const IM_Z_STEP_LO: usize = 9;
 const IE_STRIDE: usize = 8;
 const IE_PAGE_ROWS: usize = 0;
 const IE_PAGE_COLS: usize = 1;
@@ -1091,6 +1097,36 @@ fn wrap_row_of(col: i32, wrap: i32, terminator: bool, mode: i32) -> i32 {
         wrap_segment_of(col, wrap, terminator)
     }
 }
+
+// ── double-single arithmetic ─────────────────────────────────────────────
+// The engine's position lanes are f64 expressions narrowed ONCE at store
+// (fold.rs's contract table): integer × param products are exact in f64,
+// and only the store rounds. WGSL has no f64 — but every value these lanes
+// hold is text-magnitude with multipliers bounded by pages_wide and wrap
+// counts, so the exact results need well under 48 significant bits, and a
+// two-f32 pair carries 48. Two-sums are exact regardless of association;
+// Veltkamp-Dekker products are exact without FMA (cubecl's mul_add is
+// RELAXED — it may lower to a*b+c — so the split-based product is used).
+// Each write site folds the pair into ONE final add: the single rounding,
+// like the engine's `as f32`. The repo-check census is the proof burden —
+// the X (m ≥ 1) and Z (seg ≥ 3) deviation buckets must read ZERO.
+
+/// acc += v, compensated: `acc0` is the plain sum, `acc1` collects the
+/// rounding errors. Every step is anchored on an fma the optimizer cannot
+/// see through — the Knuth/Veltkamp forms die on Metal, where large
+/// kernels collapse `x - (x - y)` locally (measured on paginate: the
+/// correction terms went dead, a systematic 1-ulp bias); here `n` is
+/// opaque, so `n - acc` and `(n - acc) - v` have no algebraic identity to
+/// collapse, and both subtractions are Sterbenz-exact anyway (the
+/// operands differ by less than a factor of two).
+#[cube]
+fn ds_opaque_add(acc0: &mut f32, acc1: &mut f32, v: f32) {
+    let n = fma(1.0f32, v, *acc0);
+    let dv = n - *acc0;
+    *acc1 += dv - v;
+    *acc0 = n;
+}
+
 
 /// scan_combine, transcribed line-for-line — the GENERAL form (spine-grade:
 /// b may carry rows and a real head line, not just a leaf's).
@@ -1729,8 +1765,17 @@ fn apply(
                     let base = x + items[io + IM_ORIGIN_X];
                     lm[mo + LM_BASE_X] = base;
                     lm[mo + LM_X] = base;
-                    lm[mo + LM_Y] = (row as f32) * (-lh) + items[io + IM_ORIGIN_Y];
-                    lm[mo + LM_Z] = (seg as f32) * (-items[io + IM_Z_STEP]) + items[io + IM_ORIGIN_Z];
+                    // Y/Z: one OPAQUE fma each — the engine's f64
+                    // two-term expressions narrowed once, bit-exact (see
+                    // paginate's fma note for why opaque); Z folds the
+                    // z_step tail through the second fma.
+                    lm[mo + LM_Y] = fma(-(row as f32), lh, items[io + IM_ORIGIN_Y]);
+                    let zseed = fma(
+                        -(seg as f32),
+                        items[io + IM_Z_STEP_LO],
+                        items[io + IM_ORIGIN_Z],
+                    );
+                    lm[mo + LM_Z] = fma(-(seg as f32), items[io + IM_Z_STEP], zseed);
                     let slot = it - it_base;
                     if slot < RESOLVE_SLOTS {
                         sx[slot].fetch_max(ordered_key(x));
@@ -1871,8 +1916,16 @@ fn resolve_x(
                 let base = x + items[io + IM_ORIGIN_X];
                 lm[mo + LM_BASE_X] = base;
                 lm[mo + LM_X] = base;
-                lm[mo + LM_Y] = (row as f32) * (-lh) + items[io + IM_ORIGIN_Y];
-                lm[mo + LM_Z] = (seg as f32) * (-items[io + IM_Z_STEP]) + items[io + IM_ORIGIN_Z];
+                // Y/Z: one OPAQUE fma each — the engine's two-term f64
+                // expressions narrowed once (paginate's fma note); Z's
+                // second fma folds the z_step tail.
+                lm[mo + LM_Y] = fma(-(row as f32), lh, items[io + IM_ORIGIN_Y]);
+                let zseed = fma(
+                    -(seg as f32),
+                    items[io + IM_Z_STEP_LO],
+                    items[io + IM_ORIGIN_Z],
+                );
+                lm[mo + LM_Z] = fma(-(seg as f32), items[io + IM_Z_STEP], zseed);
                 let slot = it - it_base;
                 if slot < RESOLVE_SLOTS {
                     srow[slot].fetch_max((row + 1) as u32);
@@ -1900,9 +1953,82 @@ fn resolve_x(
     }
 }
 
-// ── dispatch 5: derive the fan stride ON DEVICE — thread per item ───────────
+// ── the extent's lo word ─────────────────────────────────────────────────
+// x_max carries only the f32 HIGH word of the widest row's advance sum —
+// the engine's stride input is the UNNARROWED f64 prefix (fold.rs
+// scalars[7]), and that tail is exactly the X-at-m1 fork the census names
+// (46,849 words on glyph3d-js). The engine's prefix is an EXACT sum
+// (f64, text magnitudes — it cannot round), and exact sums are
+// order-independent, so this kernel re-derives it as a double-single row
+// walk: one thread per item, forward over its bytes, accumulating each
+// row's advances exactly and keeping the lexicographic max pair. The
+// winner's hi word is the value x_max already holds (the census proved the
+// tree's stored x lands on the same bits); only the lo word is new.
+//
+// The walk is serial per item, parallel across items — bounded by the
+// widest single file, ~tens of ms on a minified mega-line. Fine for the
+// checks and for rung 4's readback path; a split-walk combine is the
+// rung-5 ladder's business if the bench ever says so.
 #[cube(launch_unchecked)]
-fn derive_stride(x_max: &[u32], ie: &[u32], page_gap_x: &[f32], strides: &mut [f32]) {
+fn extent_pair(sm: &[f32], fl: &[u32], ir: &[u32], x_lo: &mut [u32]) {
+    let it = ABSOLUTE_POS;
+    let item_count = ir.len() / 2;
+    if it < item_count {
+        let start = ir[it * 2] as usize;
+        let stop = ir[it * 2 + 1] as usize;
+        let mut best_hi = 0.0f32;
+        let mut best_lo = 0.0f32;
+        let mut row_hi = 0.0f32;
+        let mut row_lo = 0.0f32;
+        let mut id = start;
+        while id < stop {
+            if (flags_at(fl, id) & F_LEADER) != 0 {
+                if (flags_at(fl, id) & F_NEWLINE) != 0 {
+                    // The terminator's own advance never joins the row
+                    // (the fold reads line_advance BEFORE it, then resets).
+                    if row_hi > best_hi || (row_hi == best_hi && row_lo > best_lo) {
+                        best_hi = row_hi;
+                        best_lo = row_lo;
+                    }
+                    row_hi = 0.0;
+                    row_lo = 0.0;
+                } else {
+                    ds_opaque_add(&mut row_hi, &mut row_lo, sm[id]);
+                }
+            }
+            id += 1;
+        }
+        // The last row before EOF (no terminator) is a candidate too.
+        if row_hi > best_hi || (row_hi == best_hi && row_lo > best_lo) {
+            best_hi = row_hi;
+            best_lo = row_lo;
+        }
+        // The hi word's whole job is the lexicographic compare; only the
+        // lo ships (x_max keeps the tree-keyed value — see below).
+        let _ = best_hi;
+        // The lo word only: x_max keeps the tree-keyed value. A
+        // segment-aware walk that owns BOTH words — the engine's extent is
+        // the SEGMENT-local prefix (fold_unit = wrap, reset when the
+        // incremented col fills it, filler's advance never joining) — is
+        // the named open item: in this kernel's six-slice shape the ie
+        // buffer's reads come back zeroed (the unit lane never sees the
+        // wrap width, the reset never fires), a cousin of landmine 7.
+        x_lo[it] = ordered_key(best_lo);
+    }
+}
+
+// ── dispatch 5: derive the fan stride ON DEVICE — thread per item ───────────
+// The stride is a PAIR now: extent + gap summed exactly like the engine's
+// f64 add, so paginate's m·stride product can carry the tail the single-f32
+// stride was losing at m == 1. Strides are [hi, lo] per item.
+#[cube(launch_unchecked)]
+fn derive_stride(
+    x_max: &[u32],
+    x_lo: &[u32],
+    ie: &[u32],
+    page_gap_x: &[f32],
+    strides: &mut [f32],
+) {
     let i = ABSOLUTE_POS;
     let item_count = ie.len() / IE_STRIDE;
     if i < item_count {
@@ -1910,9 +2036,16 @@ fn derive_stride(x_max: &[u32], ie: &[u32], page_gap_x: &[f32], strides: &mut [f
         let has_page = ie[ie_off + IE_HAS_PAGE] != 0;
         let rows = ie[ie_off + IE_PAGE_ROWS] as i32;
         if has_page && rows > 0 {
-            strides[i] = key_to_float(x_max[i]) + page_gap_x[i];
+            // exact: (hi + lo) + gap, compensated opaquely — the tail is
+            // the X-at-m1/m2 fork the census names.
+            let mut s0 = key_to_float(x_max[i]);
+            let mut s1 = key_to_float(x_lo[i]);
+            ds_opaque_add(&mut s0, &mut s1, page_gap_x[i]);
+            strides[i * 2] = s0;
+            strides[i * 2 + 1] = s1;
         } else {
-            strides[i] = 0.0;
+            strides[i * 2] = 0.0;
+            strides[i * 2 + 1] = 0.0;
         }
     }
 }
@@ -1958,14 +2091,38 @@ fn paginate(
             let seg = wrap_segment_of(col, wrap, (flags_at(fl, id) & F_NEWLINE) != 0);
             let lh = items[io + IM_LINE_HEIGHT];
             let mo = id * LM_STRIDE;
-            lm[mo + LM_X] = lm[mo + LM_BASE_X] + (y_page % wide) as f32 * strides[it];
-            lm[mo + LM_Y] = items[io + IM_ORIGIN_Y]
-                - (screen_row - y_page * rows) as f32 * lh
-                - band as f32 * items[io + IM_BAND_STRIDE_Y];
-            lm[mo + LM_Z] = items[io + IM_ORIGIN_Z]
-                - seg as f32 * items[io + IM_Z_STEP]
-                + band as f32 * items[io + IM_DEPTH_PER_BAND]
-                + x_page as f32 * items[io + IM_DEPTH_PER_COL];
+            // X/Y/Z through NESTED OPAQUE FMAs, one rounding per term —
+            // the engine's f64 expressions narrowed once per store. The
+            // double-single accumulator that stood here first was
+            // ALGEBRAICALLY COLLAPSED by Metal's shader optimizer on
+            // large kernels (measured: `s - (s - a)` simplified away, the
+            // correction terms dead, a systematic 1-ulp bias at m >= 3;
+            // the same helpers survived in a small probe kernel — a
+            // function-size-dependent optimization). `fma` is a builtin
+            // and opaque to that pass, so the rounding structure rides
+            // inside it: fma(m, s_hi, base) IS fl_32(base + m·s exactly),
+            // the engine's own arithmetic for the dominant term, with
+            // the stride's lo word folded by the outer fma.
+            let m = (y_page % wide) as f32;
+            let xseed = fma(m, strides[it * 2 + 1], lm[mo + LM_BASE_X]);
+            lm[mo + LM_X] = fma(m, strides[it * 2], xseed);
+            // Y: origin − r·line_height − band·band_stride_y
+            let r = (screen_row - y_page * rows) as f32;
+            let yin = fma(-r, lh, items[io + IM_ORIGIN_Y]);
+            lm[mo + LM_Y] = fma(-(band as f32), items[io + IM_BAND_STRIDE_Y], yin);
+            // Z: origin − seg·z_step + band·depth_per_band + x_page·depth_per_col
+            // — TAIL-FIRST fmas: the z_step's f64 tail folds INSIDE the
+            // dominant term's single rounding. Tail-LAST measurably
+            // pushed records OFF the engine's value at exact half-ulp
+            // ties (seg 5 on the wide corpus: the inner fma ties to
+            // even, the outer fold then overshoots one ulp); tail-first
+            // carries the correction through the one rounding that
+            // matters, and under a large origin it vanishes under the
+            // same ulp that swallows it in the engine's f64 store.
+            let zseed = fma(-(seg as f32), items[io + IM_Z_STEP_LO], items[io + IM_ORIGIN_Z]);
+            let zin = fma(-(seg as f32), items[io + IM_Z_STEP], zseed);
+            let zin2 = fma(band as f32, items[io + IM_DEPTH_PER_BAND], zin);
+            lm[mo + LM_Z] = fma(x_page as f32, items[io + IM_DEPTH_PER_COL], zin2);
         }
     }
 }
@@ -2072,6 +2229,8 @@ pub fn run(ctx: &GpuContext, fixture_path: &Path) -> ! {
         im.push(item.depth_per_col as f32);
         im.push(0.0f32); // IM_PAGE_STRIDE_X: the device chain derives it on device
         im.push(item.origin_x as f32);
+        // The z_step pair's tail: the f64 param minus its f32 high word.
+        im.push((item.z_step - item.z_step as f32 as f64) as f32);
         page_gap_x.push(item.page_gap_x as f32);
     }
 
@@ -2110,10 +2269,14 @@ pub fn run(ctx: &GpuContext, fixture_path: &Path) -> ! {
     let h_wc = client.empty(n * 4);
     let h_otb = client.empty(n * 4);
     let h_lm = client.empty(n * LM_STRIDE * 4);
-    let h_strides = client.empty(item_count * 4);
+    let h_strides = client.empty(item_count * 8);
     let zeroes = vec![0u32; item_count];
     let h_rmax = client.create_from_slice(bytemuck::cast_slice(&zeroes));
     let h_xmax = client.create_from_slice(bytemuck::cast_slice(&zeroes));
+    // The extent's lo word, keyed-zero: raw 0u32 would decode as NaN
+    // (key_to_float(0) — see the ordered_key pair for why).
+    let zero_keys = vec![0x8000_0000u32; item_count];
+    let h_xlo = client.create_from_slice(bytemuck::cast_slice(&zero_keys));
 
     // This M2's ADAPTER caps workgroups per grid dimension at 65535 (verified
     // live: a 94075-cube dispatch was rejected) — not a wgpu default to lift.
@@ -2226,14 +2389,24 @@ pub fn run(ctx: &GpuContext, fixture_path: &Path) -> ! {
             );
         }
         if stages >= 5 {
+            extent_pair::launch_unchecked(
+                &client,
+                cubes_of(item_count),
+                CubeDim::new_1d(256),
+                BufferArg::from_raw_parts(h_sm.clone(), n),
+                BufferArg::from_raw_parts(h_fl.clone(), n_words),
+                BufferArg::from_raw_parts(h_ir.clone(), item_count * 2),
+                BufferArg::from_raw_parts(h_xlo.clone(), item_count),
+            );
             derive_stride::launch_unchecked(
                 &client,
                 cubes_of(item_count),
                 CubeDim::new_1d(256),
                 BufferArg::from_raw_parts(h_xmax.clone(), item_count),
+                BufferArg::from_raw_parts(h_xlo.clone(), item_count),
                 BufferArg::from_raw_parts(h_ie.clone(), item_count * IE_STRIDE),
                 BufferArg::from_raw_parts(h_gap.clone(), item_count),
-                BufferArg::from_raw_parts(h_strides.clone(), item_count),
+                BufferArg::from_raw_parts(h_strides.clone(), item_count * 2),
             );
         }
         if stages >= 6 {
@@ -2247,7 +2420,7 @@ pub fn run(ctx: &GpuContext, fixture_path: &Path) -> ! {
                 BufferArg::from_raw_parts(h_im.clone(), item_count * IM_STRIDE),
                 BufferArg::from_raw_parts(h_ie.clone(), item_count * IE_STRIDE),
                 BufferArg::from_raw_parts(h_ir.clone(), item_count * 2),
-                BufferArg::from_raw_parts(h_strides.clone(), item_count),
+                BufferArg::from_raw_parts(h_strides.clone(), item_count * 2),
             );
         }
         // Phase 4 rung 2: the record emitter — only when the full chain ran
@@ -3154,7 +3327,7 @@ pub fn bench(ctx: &GpuContext, corpus_path: &Path) -> ! {
 
     let ir: Vec<u32> = vec![0, n as u32];
     let ie: Vec<u32> = vec![0, 0, 0, 1, wrap_width as u32, 0, 0, 0];
-    let im: Vec<f32> = vec![0.0, 0.0, 1.25, 2.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+    let im: Vec<f32> = vec![0.0, 0.0, 1.25, 2.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
     let page_gap_x: Vec<f32> = vec![0.0];
 
     let setup = WgpuSetup {
@@ -3275,9 +3448,12 @@ pub fn bench(ctx: &GpuContext, corpus_path: &Path) -> ! {
     let h_wc = client.empty(n * 4);
     let h_otb = client.empty(n * 4);
     let h_lm = client.empty(n * LM_STRIDE * 4);
-    let h_strides = client.empty(4);
+    let h_strides = client.empty(8);
     let h_rmax = client.create_from_slice(bytemuck::cast_slice(&[0u32]));
     let h_xmax = client.create_from_slice(bytemuck::cast_slice(&[0u32]));
+    // Keyed zero (the lo word of extent 0.0), not raw 0 — key_to_float(0)
+    // is NaN.
+    let h_xlo = client.create_from_slice(bytemuck::cast_slice(&[0x8000_0000u32]));
 
     // This M2's ADAPTER caps workgroups per grid dimension at 65535 (verified
     // live: a 94075-cube dispatch was rejected) — not a wgpu default to lift.
@@ -3639,14 +3815,26 @@ pub fn bench(ctx: &GpuContext, corpus_path: &Path) -> ! {
                     }
                 }
                 4 => {
+                    // extent_pair + derive_stride share this window (the rank
+                    // stages set the precedent for merged dispatches).
+                    extent_pair::launch_unchecked(
+                        &client,
+                        CubeCount::new_single(),
+                        CubeDim::new_1d(1),
+                        BufferArg::from_raw_parts(h_sm.clone(), n),
+                        BufferArg::from_raw_parts(h_fl.clone(), n_words),
+                        BufferArg::from_raw_parts(h_ir.clone(), 2),
+                        BufferArg::from_raw_parts(h_xlo.clone(), 1),
+                    );
                     derive_stride::launch_unchecked(
                         &client,
                         CubeCount::new_single(),
                         CubeDim::new_1d(1),
                         BufferArg::from_raw_parts(h_xmax.clone(), 1),
+                        BufferArg::from_raw_parts(h_xlo.clone(), 1),
                         BufferArg::from_raw_parts(h_ie.clone(), IE_STRIDE),
                         BufferArg::from_raw_parts(h_gap.clone(), 1),
-                        BufferArg::from_raw_parts(h_strides.clone(), 1),
+                        BufferArg::from_raw_parts(h_strides.clone(), 2),
                     );
                 }
                 _ => {
@@ -3660,7 +3848,7 @@ pub fn bench(ctx: &GpuContext, corpus_path: &Path) -> ! {
                         BufferArg::from_raw_parts(h_im.clone(), IM_STRIDE),
                         BufferArg::from_raw_parts(h_ie.clone(), IE_STRIDE),
                         BufferArg::from_raw_parts(h_ir.clone(), 2),
-                        BufferArg::from_raw_parts(h_strides.clone(), 1),
+                        BufferArg::from_raw_parts(h_strides.clone(), 2),
                     );
                 }
             }
@@ -3995,6 +4183,7 @@ pub fn repo_check(ctx: &GpuContext, dir: &Path) -> ! {
         im.push(item.depth_per_col as f32);
         im.push(0.0f32);
         im.push(item.origin_x as f32);
+        im.push((item.z_step - item.z_step as f32 as f64) as f32);
         page_gap_x.push(item.page_gap_x as f32);
     }
 
@@ -4043,9 +4232,11 @@ pub fn repo_check(ctx: &GpuContext, dir: &Path) -> ! {
     let h_wc = client.empty(n * 4);
     let h_otb = client.empty(n * 4);
     let h_lm = client.empty(n * LM_STRIDE * 4);
-    let h_strides = client.empty(item_count * 4);
+    let h_strides = client.empty(item_count * 8);
     let h_rmax = client.create_from_slice(bytemuck::cast_slice(&vec![0u32; item_count]));
     let h_xmax = client.create_from_slice(bytemuck::cast_slice(&vec![0u32; item_count]));
+    // Keyed zero (the lo word of extent 0.0) — key_to_float(0) is NaN.
+    let h_xlo = client.create_from_slice(bytemuck::cast_slice(&vec![0x8000_0000u32; item_count]));
     let h_ctc = client.empty(n_tiles * 4);
     let h_cup = client.empty(n_tiles * units * 4);
     let h_cxc = client.empty(n_tiles * 4);
@@ -4268,14 +4459,24 @@ pub fn repo_check(ctx: &GpuContext, dir: &Path) -> ! {
             256,
             rspan,
         );
+        extent_pair::launch_unchecked(
+            &client,
+            cubes_of(item_count.max(1)),
+            CubeDim::new_1d(256),
+            BufferArg::from_raw_parts(h_sm.clone(), n),
+            BufferArg::from_raw_parts(h_fl.clone(), n_words),
+            BufferArg::from_raw_parts(h_ir.clone(), ir.len()),
+            BufferArg::from_raw_parts(h_xlo.clone(), item_count),
+        );
         derive_stride::launch_unchecked(
             &client,
             cubes_of(item_count.max(1)),
             CubeDim::new_1d(256),
             BufferArg::from_raw_parts(h_xmax.clone(), item_count),
+            BufferArg::from_raw_parts(h_xlo.clone(), item_count),
             BufferArg::from_raw_parts(h_ie.clone(), ie.len()),
             BufferArg::from_raw_parts(h_gap.clone(), item_count),
-            BufferArg::from_raw_parts(h_strides.clone(), item_count),
+            BufferArg::from_raw_parts(h_strides.clone(), item_count * 2),
         );
         paginate::launch_unchecked(
             &client,
@@ -4287,7 +4488,7 @@ pub fn repo_check(ctx: &GpuContext, dir: &Path) -> ! {
             BufferArg::from_raw_parts(h_im.clone(), item_count * IM_STRIDE),
             BufferArg::from_raw_parts(h_ie.clone(), ie.len()),
             BufferArg::from_raw_parts(h_ir.clone(), ir.len()),
-            BufferArg::from_raw_parts(h_strides.clone(), item_count),
+            BufferArg::from_raw_parts(h_strides.clone(), item_count * 2),
         );
     }
     // Chunked emit + readback into the host record stream (the record
@@ -4361,6 +4562,13 @@ pub fn repo_check(ctx: &GpuContext, dir: &Path) -> ! {
     drop((h_cslot, h_cend, h_ctc, h_cup, h_cxc, h_ctotal));
     drop((h_hp, h_lvl, h_parent, h_parent_b, h_d0, h_d_a, h_d_b, h_roots));
     drop((h_tc, h_tm, h_xc, h_xm, h_lc, h_wm, h_wc, h_otb));
+    if std::env::var_os("GLYPH_CHAIN_DEBUG").is_some() {
+        let sb = client.read_one(h_strides.clone()).expect("read strides");
+        let sf: &[f32] = bytemuck::cast_slice(&sb);
+        for i in 0..sf.len() / 2 {
+            println!("  dbg stride[{i}] = hi {:e} ({:#x}) lo {:e} ({:#x})", sf[i * 2], sf[i * 2].to_bits(), sf[i * 2 + 1], sf[i * 2 + 1].to_bits());
+        }
+    }
     drop((h_lm, h_strides, h_rmax, h_xmax, h_base));
     drop((packed, bitmap, poff, pval, seq));
     drop(h_recs);
@@ -4401,20 +4609,47 @@ pub fn repo_check(ctx: &GpuContext, dir: &Path) -> ! {
         .expect("engine layout failed");
     let eng_dt = t_eng.elapsed();
     let engine_total: u32 = placements.iter().map(|p| p.record_count).sum();
+    // The owning item of every record, from the ENGINE's own placement
+    // counts — the fork census below needs each record's page geometry to
+    // attribute a deviation to the arithmetic that produced it.
+    let mut item_of: Vec<u32> = Vec::with_capacity(engine_total as usize);
+    for (idx, p) in placements.iter().enumerate() {
+        item_of.extend(std::iter::repeat_n(idx as u32, p.record_count as usize));
+    }
     drop(eng_items);
     drop((placements, backend, arena, colors));
 
     // ── the diff ──────────────────────────────────────────────────────────
+    // The FORK CENSUS: bit-deviations bucketed BY LANE and by the integer
+    // context that produced them — X's page multiplier m (the paginate
+    // stride product), Z's wrap segment (the base-Z product), Y's row
+    // magnitude (the base-Y product), and X at m == 0 (the line_adv scan
+    // tree, which paginate never touches). The one aggregate number that
+    // stood here could not tell those classes apart, and the rung-4
+    // arithmetic-fork decision turns on exactly this decomposition: each
+    // class has a different fix, and one of them (the scan tree) is not
+    // fixable in paginate at all.
     let mut bad = 0usize;
     let mut bit_devs = 0usize;
     let mut max_dev = 0.0f64;
+    let mut lane_devs = [0usize; 5];
+    let mut lane_far = [0usize; 5]; // deviations farther than 1 ulp
+    let mut lane_max = [0.0f64; 5];
+    let mut x_m = [0usize; 4]; // X deviations at m == 0, 1, 2, >= 3
+    let mut z_seg = [0usize; 4]; // Z deviations at segment 0, 1, 2, >= 3
+    let mut y_big_row = 0usize; // Y deviations at row > 2048
     let total = total_records as usize;
+    let mut shown = 0usize;
     for (o, want) in engine_records.iter().take(total).enumerate() {
         let w = o * 8;
         let got_gi = recs[w + 5];
         let got_row = recs[w + 6];
         let got_col = recs[w + 7];
         let mut ok = got_gi == want.counts[0] && got_row == want.counts[1] && got_col == want.counts[2];
+        // The record's paginate context, off the engine-side item params.
+        // Computed lazily — most records deviate nowhere, and this only
+        // runs for the ones that do.
+        let mut ctx: Option<(i64, i64)> = None;
         for k in 0..5 {
             let got = f32::from_bits(recs[w + k]);
             let wantm = want.measures[k];
@@ -4422,9 +4657,62 @@ pub fn repo_check(ctx: &GpuContext, dir: &Path) -> ! {
                 continue;
             }
             bit_devs += 1;
+            lane_devs[k] += 1;
+            if shown < 4 && std::env::var_os("GLYPH_CHAIN_DEBUG").is_some() {
+                println!(
+                    "  dbg dev record {o} lane {k}: chain {:e} ({:#x}) engine {:e} ({:#x}) row {} col {}",
+                    got,
+                    recs[w + k],
+                    wantm,
+                    wantm.to_bits(),
+                    got_row,
+                    got_col
+                );
+                shown += 1;
+            }
             let rel = (got as f64 - wantm as f64).abs() / (wantm as f64).abs().max(1.0);
             if rel > max_dev {
                 max_dev = rel;
+            }
+            if rel > lane_max[k] {
+                lane_max[k] = rel;
+            }
+            // Same-sign f32s order by bit pattern, so the bit distance IS
+            // the ulp distance; a cross-sign pair lands absurdly far and
+            // counts as far, which is the right verdict for a position.
+            let bd = (recs[w + k] as i64)
+                .wrapping_sub(wantm.to_bits() as i64)
+                .abs();
+            if bd > 1 {
+                lane_far[k] += 1;
+            }
+            if k < 3 && ctx.is_none() && o < item_of.len() {
+                let prm = &file_params[item_of[o] as usize];
+                let rows = if prm.has_page { prm.page_rows as i64 } else { 0 };
+                let scroll = if prm.has_page { prm.scroll_rows as i64 } else { 0 };
+                let wide = prm.pages_wide.max(1) as i64;
+                let screen_row = got_row as i64 - scroll;
+                let y_page = if rows > 0 && screen_row >= rows {
+                    screen_row / rows
+                } else {
+                    0
+                };
+                let seg = if prm.wrap_width > 0 {
+                    got_col as i64 / prm.wrap_width as i64
+                } else {
+                    0
+                };
+                ctx = Some((y_page % wide, seg));
+            }
+            match k {
+                0 => x_m[ctx.map(|(m, _)| m).unwrap_or(0).min(3) as usize] += 1,
+                1 => {
+                    if got_row > 2048 {
+                        y_big_row += 1;
+                    }
+                }
+                2 => z_seg[ctx.map(|(_, s)| s).unwrap_or(0).min(3) as usize] += 1,
+                _ => {}
             }
             if rel > 1e-4 {
                 ok = false;
@@ -4470,8 +4758,37 @@ pub fn repo_check(ctx: &GpuContext, dir: &Path) -> ! {
         );
         std::process::exit(1);
     }
+    // The census line prints on PASS too — it is the instrument that prices
+    // the rung-4 fork, and a zero-deviation run is its most important datum.
     println!(
-        "cubecl-repo-check PASS: glyph_id/row/col exact, measures inside 1e-4 ({} of {} records carry a last-bit f32 deviation — the documented reassociation tier)",
+        "cubecl-repo-check census: \
+         X {} (max {:.2e}, {} >1ulp; m0 {} m1 {} m2 {} m3+ {}) | \
+         Y {} (max {:.2e}, {} >1ulp, {} at row>2048) | \
+         Z {} (max {:.2e}, {} >1ulp; seg0 {} seg1 {} seg2 {} seg3+ {}) | \
+         adv {} | hgt {}",
+        lane_devs[0],
+        lane_max[0],
+        lane_far[0],
+        x_m[0],
+        x_m[1],
+        x_m[2],
+        x_m[3],
+        lane_devs[1],
+        lane_max[1],
+        lane_far[1],
+        y_big_row,
+        lane_devs[2],
+        lane_max[2],
+        lane_far[2],
+        z_seg[0],
+        z_seg[1],
+        z_seg[2],
+        z_seg[3],
+        lane_devs[3],
+        lane_devs[4],
+    );
+    println!(
+        "cubecl-repo-check PASS: glyph_id/row/col exact, measures inside 1e-4 ({} of {} measure words carry a last-bit f32 deviation — the documented reassociation tier)",
         bit_devs,
         total * 5
     );

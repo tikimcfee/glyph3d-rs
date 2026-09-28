@@ -188,7 +188,16 @@ battery; the state handoff is note 18 in the integration notes):
 - `--cubecl-repo-check <dir>` — the full chain over a real repository,
   records tier-diffed against the engine's batched output (phase 4 rung
   3): glyph_id/row/col exact, measures at the f32-reassociation eps
-  tier, counts must match. Parity and timing in the same run.
+  tier, counts must match. Parity and timing in the same run. The PASS
+  block is followed by a FORK CENSUS line — bit-deviations bucketed by
+  lane (X/Y/Z/advance/height) and by the integer context that produced
+  them (X's page multiplier m, Z's wrap segment, Y's row magnitude): it
+  is the instrument that prices the paginate arithmetic fork, and its
+  all-zero reading on an exercised corpus is a load-bearing claim, not
+  decoration. Post-closure standing (2026-09-28): Y/Z/adv/hgt read ZERO
+  on glyph3d-js; X carries the stride-value class (the tree-keyed extent
+  is 1-2 ulp off the engine's f64 prefix) until the segment-aware
+  extent walk lands — see cubecl_chain.rs's extent_pair note.
 
 Shared env vars: `GLYPH_CHAIN_STAGES` (absolute dispatch count — bisection),
 `GLYPH_CHAIN_LOOP` (samples, minimum reported), `GLYPH_CHAIN_WRAP=<w>`
