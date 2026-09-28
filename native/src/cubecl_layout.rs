@@ -167,7 +167,10 @@ pub(crate) fn hand_off(words: Vec<u32>, slots: usize, on_device: bool, arena: &m
         "the instance tail writes from slot 0 — a pre-filled arena would need the rebase the direct path carries"
     );
     if on_device {
-        debug_assert!(arena.mapped_buffer().is_some());
+        assert!(
+            arena.is_mapped(),
+            "the device copy landed in the arena's buffers — an unmapped arena has none"
+        );
         unsafe { arena.commit(slots) };
         return;
     }
@@ -177,20 +180,19 @@ pub(crate) fn hand_off(words: Vec<u32>, slots: usize, on_device: bool, arena: &m
     }
     let byte_len = slots * std::mem::size_of::<crate::glyph_scene::GlyphInstance>();
     debug_assert_eq!(words.len() * 4, byte_len);
-    if arena.mapped_buffer().is_some() {
-        let (dst, _cap) = arena.uninit_tail(slots);
-        unsafe {
-            std::ptr::copy_nonoverlapping(words.as_ptr() as *const u8, dst.cast::<u8>(), byte_len);
-        }
+    if arena.is_mapped() {
+        // One host write, split across chunk buffers where they meet.
+        arena.write_bytes_at(0, bytemuck::cast_slice(&words[..slots * 12]));
         unsafe { arena.commit(slots) };
     } else {
         debug_assert!(words.capacity() >= words.len());
         let cap_words = words.capacity();
         let ptr = words.as_mut_ptr();
         std::mem::forget(words);
-        // Same allocation, retyped 12 u32 → one 48 B slot. The capacity in
-        // slots can only understate the true allocation (it divides by 12
-        // with truncation), never overstate it.
+        // Same allocation, retyped 12 u32 → one 48 B slot. Sound because the
+        // driver reserve_exact's slots*12 words upstream: capacity ≡ 0 mod 12
+        // makes the dealloc layout match the alloc layout EXACTLY, and the
+        // chunked windows fill every word (len is only ever slots).
         let inst: Vec<crate::glyph_scene::GlyphInstance> = unsafe {
             Vec::from_raw_parts(
                 ptr as *mut crate::glyph_scene::GlyphInstance,
@@ -233,7 +235,7 @@ impl LayoutGlyphs for CubeclLayout {
             &fis,
             &inputs,
             crate::cubecl_chain::ChainMode::Instances,
-            arena.mapped_buffer(),
+            arena.mapped_target(),
         );
         // The arena hand-off — see `hand_off`: the copy hop's commit, one
         // memcpy on the mapped readback path, an allocation hand-over on
@@ -275,7 +277,7 @@ impl VerifyLayout for CubeclLayout {
             &fis,
             &inputs,
             crate::cubecl_chain::ChainMode::Both,
-            arena.mapped_buffer(),
+            arena.mapped_target(),
         );
         hand_off(
             stream.instances,

@@ -4445,7 +4445,7 @@ pub(crate) fn run_repo_chain(
     items: &[crate::fold::Item],
     inputs: &InstanceInputs,
     mode: ChainMode,
-    mapped: Option<&wgpu::Buffer>,
+    mapped: Option<crate::layout::MappedTarget>,
 ) -> ChainStream {
     let item_count = items.len();
     let n: usize = bytes.len();
@@ -5112,7 +5112,7 @@ pub(crate) fn run_repo_chain(
                     BufferArg::from_raw_parts(h_win, 1),
                 );
             }
-            if let Some(dst_buf) = mapped {
+            if let Some(target) = &mapped {
                 let res = client
                     .get_resource::<WgpuServer<AutoCompiler>>(h_out.clone())
                     .expect("instance window resource");
@@ -5122,13 +5122,23 @@ pub(crate) fn run_repo_chain(
                         label: Some("glyph instance window"),
                     },
                 );
-                enc.copy_buffer_to_buffer(
-                    &r.buffer,
-                    r.offset,
-                    dst_buf,
-                    (first * 48) as u64,
-                    (take * 48) as u64,
-                );
+                // The window lands across the arena's chunk buffers — one
+                // copy per chunk intersection (chunk boundaries do not in
+                // general coincide with window boundaries).
+                let mut s = first;
+                while s < first + take {
+                    let k = s / target.chunk_slots;
+                    let in_chunk = s - k * target.chunk_slots;
+                    let here = (target.chunk_slots - in_chunk).min(first + take - s);
+                    enc.copy_buffer_to_buffer(
+                        &r.buffer,
+                        r.offset + ((s - first) * 48) as u64,
+                        &target.buffers[k],
+                        (in_chunk * 48) as u64,
+                        (here * 48) as u64,
+                    );
+                    s += here;
+                }
                 device_ref.queue.submit([enc.finish()]);
             } else {
                 let cb = client.read_one(h_out.clone()).expect("read instance chunk");
@@ -5308,7 +5318,7 @@ pub fn repo_check(ctx: &GpuContext, dir: &Path) -> ! {
         &fis,
         &inputs,
         mode,
-        chain_arena.mapped_buffer(),
+        chain_arena.mapped_target(),
     );
     crate::cubecl_layout::hand_off(
         stream.instances,

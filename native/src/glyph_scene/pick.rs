@@ -492,22 +492,16 @@ impl GlyphScene {
             .map(|f| Selection::Segment { slot_base: f.slot_base, slot_count: f.slot_count })
     }
 
-    /// The device buffer holding instance `chunk` — the ONE arena buffer in
-    /// arena-backed scenes, the chunk's own buffer otherwise.
+    /// The device buffer holding instance `chunk` — the chunk's own buffer
+    /// (the arena holds one buffer per chunk since the chunked mapped form).
     pub(super) fn chunk_buf(&self, chunk: usize) -> &wgpu::Buffer {
-        match &self.instance_arena {
-            Some(buf) => buf,
-            None => &self.instance_bufs[chunk],
-        }
+        &self.instance_bufs[chunk]
     }
 
-    /// Byte offset of `local` within the chunk's data — arena scenes add the
-    /// chunk's base offset inside the one shared buffer.
-    pub(super) fn chunk_off(&self, chunk: usize, local: u64) -> u64 {
-        match &self.instance_arena {
-            Some(_) => chunk as u64 * self.chunk_cap as u64 * 48 + local,
-            None => local,
-        }
+    /// Byte offset of `local` within the chunk's data — every chunk buffer
+    /// starts at its own index 0.
+    pub(super) fn chunk_off(&self, _chunk: usize, local: u64) -> u64 {
+        local
     }
 
     /// Partial instance-field upload: `data` at byte `field_off` within a

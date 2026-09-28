@@ -669,17 +669,22 @@ pub fn load_repo_from_walk(
         let (alt_placements, alt_records) = alt
             .layout_items_recording(&items, &mut alt_arena)
             .expect("layout failed");
+        // The instances may live in several chunk buffers (the chunked
+        // mapped arena); verify paths pay the flatten when so. Free for the
+        // host and single-buffer forms.
+        let arena_flat = arena.instances_cow();
+        let alt_flat = alt_arena.instances_cow();
         let report = diff_backends(
             &BackendOutput {
                 name: backend.name(),
                 placements: &placements,
-                instances: arena.instances(),
+                instances: &arena_flat,
                 records: &records,
             },
             &BackendOutput {
                 name: alt.name(),
                 placements: &alt_placements,
-                instances: alt_arena.instances(),
+                instances: &alt_flat,
                 records: &alt_records,
             },
         )
@@ -812,9 +817,22 @@ impl RepoLoad {
         // the far-LOD backdrop tint derived from the file's own ink.
         // Stage G: the SAME local AABB goes into the pick table (pre-TRS; the
         // pick path applies the live group TRS itself).
-        let insts = self.arena.instances();
+        let chunks = self.arena.instance_chunks();
         let seg_of = |v: &FileView| {
-            let insts_v = &insts[v.slot_base..v.slot_base + v.slot_count];
+            // The file's slot range folded in arena order: chunk slices
+            // ascend and concatenate exactly, so a range that straddles a
+            // chunk boundary tints bit-identically to the contiguous fold.
+            let mut tint = crate::glyph_scene::SegTintAccum::new(slot_ink);
+            let want = v.slot_base..v.slot_base + v.slot_count;
+            let mut base = 0usize;
+            for chunk in &chunks {
+                let lo = want.start.max(base);
+                let hi = want.end.min(base + chunk.len());
+                if lo < hi {
+                    tint.add(&chunk[lo - base..hi - base]);
+                }
+                base += chunk.len();
+            }
             crate::glyph_scene::SegCull {
                 min: [
                     v.offset[0] - 0.3,
@@ -828,7 +846,7 @@ impl RepoLoad {
                 ],
                 slot_base: v.slot_base as u32,
                 slot_count: v.slot_count as u32,
-                tint: crate::glyph_scene::seg_tint(insts_v, v.width, v.height, slot_ink),
+                tint: tint.finish(v.slot_count, v.width, v.height),
             }
         };
         // seg_tint re-reads the whole arena, one file's slice at a time —
