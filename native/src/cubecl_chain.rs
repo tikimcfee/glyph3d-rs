@@ -1111,20 +1111,41 @@ fn wrap_row_of(col: i32, wrap: i32, terminator: bool, mode: i32) -> i32 {
 // like the engine's `as f32`. The repo-check census is the proof burden —
 // the X (m ≥ 1) and Z (seg ≥ 3) deviation buckets must read ZERO.
 
-/// acc += v, compensated: `acc0` is the plain sum, `acc1` collects the
-/// rounding errors. Every step is anchored on an fma the optimizer cannot
-/// see through — the Knuth/Veltkamp forms die on Metal, where large
-/// kernels collapse `x - (x - y)` locally (measured on paginate: the
-/// correction terms went dead, a systematic 1-ulp bias); here `n` is
-/// opaque, so `n - acc` and `(n - acc) - v` have no algebraic identity to
-/// collapse, and both subtractions are Sterbenz-exact anyway (the
-/// operands differ by less than a factor of two).
+/// Advance -> u32 fixed-point at scale 2^-24: the mantissa (with
+/// implicit bit) shifted by the exponent. Every advance >= 0.5 converts
+/// EXACTLY (its lowest mantissa bit lands on the grid); smaller ones
+/// round below 2^-24, which nothing downstream can see. Integer adds
+/// are then exact and reassociation-proof BY CONSTRUCTION — the
+/// optimizer cannot break what has no rounding to break. (WGSL has no
+/// int64 here — the scale is chosen so segment sums of up to ~2^31.6
+/// fit u32: a hundred 4-unit advances is the ceiling, far past any
+/// real wrap segment.) This is the final form of the extent walk:
+/// every float error-extraction scheme measured dead on device with
+/// faithful WGSL (landmine 9 and cousins), and the magnitude-split
+/// pair that replaced them was unnormalized and cost 86M deviations.
 #[cube]
-fn ds_opaque_add(acc0: &mut f32, acc1: &mut f32, v: f32) {
-    let n = fma(1.0f32, v, *acc0);
-    let dv = n - *acc0;
-    *acc1 += dv - v;
-    *acc0 = n;
+fn advance_fixed(v: f32) -> u32 {
+    let b = v.to_bits();
+    let mant = (b & 0x007F_FFFFu32) | 0x0080_0000u32;
+    let biased = (b >> 23u32) & 0xFFu32;
+    if biased >= 126u32 {
+        mant << (biased - 126u32)
+    } else {
+        mant >> (126u32 - biased)
+    }
+}
+
+/// The exact fixed-point sum as a (value, tail) pair: the top bits as
+/// an exact f32, the low 8 fixed-point bits as a small tail. Both
+/// conversions are exact; the pair sums to the true value. The tail is
+/// coarse in stride terms (~2^-16), but the consumers fold it FIRST,
+/// into the base's much finer grid, where it lands whole and the
+/// dominant term's single fma rounding is all that remains.
+#[cube]
+fn fixed_pair(fixed: u32, hi: &mut f32, tail: &mut f32) {
+    // The scale constants are the exact powers 2^-16 and 2^-24 by bits.
+    *hi = ((fixed >> 8u32) as f32) * f32::from_bits(0x3780_0000u32);
+    *tail = ((fixed & 0xFFu32) as f32) * f32::from_bits(0x3380_0000u32);
 }
 
 
@@ -1955,80 +1976,74 @@ fn resolve_x(
     }
 }
 
-// ── the extent's lo word ─────────────────────────────────────────────────
-// x_max carries only the f32 HIGH word of the widest row's advance sum —
-// the engine's stride input is the UNNARROWED f64 prefix (fold.rs
-// scalars[7]), and that tail is exactly the X-at-m1 fork the census names
-// (46,849 words on glyph3d-js). The engine's prefix is an EXACT sum
-// (f64, text magnitudes — it cannot round), and exact sums are
-// order-independent, so this kernel re-derives it as a double-single row
-// walk: one thread per item, forward over its bytes, accumulating each
-// row's advances exactly and keeping the lexicographic max pair. The
-// winner's hi word is the value x_max already holds (the census proved the
-// tree's stored x lands on the same bits); only the lo word is new.
+// ── the extent walk ─────────────────────────────────────────────────────
+// The page stride's input: the WIDEST wrap segment's exact advance sum
+// as a (sum, tail) pair. The engine reads the unrounded f64 prefix
+// (fold.rs scalars[7]); the scan tree's keyed value is per-step-rounded
+// and 1-2 ulp short — the census's X-at-m2 class (deviations at exact
+// doublings, which only a wrong stride value produces). One thread per
+// item mirrors the engine's own walk: a glyph's stored x is the segment
+// sum BEFORE its own advance; the segment resets when the incremented
+// column fills it, and the filling glyph's advance never joins the
+// segment it closes (fold.rs:758); terminators reset both.
 //
-// The walk is serial per item, parallel across items — bounded by the
-// widest single file, ~tens of ms on a minified mega-line. Fine for the
-// checks and for rung 4's readback path; a split-walk combine is the
-// rung-5 ladder's business if the bench ever says so.
+// The segment width arrives pre-resolved in the walk plan (host-packed
+// [start, stop, width] per item — fold.rs's rule: wrap if wrapped, else
+// page columns if paged, else 0 = whole-line sums). It does NOT ride the
+// ie buffer: a six-slice kernel shape misbinds that read (landmine 7's
+// cousin, 2026-09-28 — the width came back zeroed, the reset never
+// fired). Four slices, one mutable output.
 #[cube(launch_unchecked)]
-fn extent_pair(sm: &[f32], fl: &[u32], ir: &[u32], x_lo: &mut [u32]) {
-    let it = ABSOLUTE_POS;
-    let item_count = ir.len() / 2;
-    if it < item_count {
-        let start = ir[it * 2] as usize;
-        let stop = ir[it * 2 + 1] as usize;
+fn extent_pair(sm: &[f32], fl: &[u32], walk_plan: &[u32], extent_words: &mut [u32]) {
+    let item = ABSOLUTE_POS;
+    let item_count = walk_plan.len() / 3;
+    if item < item_count {
+        let start = walk_plan[item * 3] as usize;
+        let stop = walk_plan[item * 3 + 1] as usize;
+        let segment_width = walk_plan[item * 3 + 2] as usize;
+        // The engine's extent input is the f32 SERIAL segment sum —
+        // fold.rs's segment_advance, "genuine f32, the GPU's summation
+        // order" — measured: the engine's stride at item 0 equals the
+        // serial bits exactly, NOT the exact f64 sum (18 ulps below on
+        // that item). A sequential loop accumulator is safe from the
+        // optimizer by data dependence: every add consumes the last.
         let mut widest_sum = 0.0f32;
-        let mut widest_tail = 0.0f32;
         let mut seg_sum = 0.0f32;
-        let mut seg_tail = 0.0f32;
+        let mut column = 0usize;
         let mut id = start;
         while id < stop {
             if (flags_at(fl, id) & F_LEADER) != 0 {
+                // The stored x of THIS glyph is the running sum before
+                // its own advance — the compare set is exactly those.
+                if seg_sum > widest_sum {
+                    widest_sum = seg_sum;
+                }
                 if (flags_at(fl, id) & F_NEWLINE) != 0 {
-                    // The terminator's own advance never joins the row
-                    // (the fold reads line_advance BEFORE it, then resets).
-                    if seg_sum > widest_sum
-                        || (seg_sum == widest_sum && seg_tail > widest_tail)
-                    {
-                        widest_sum = seg_sum;
-                        widest_tail = seg_tail;
-                    }
-                    seg_sum = 0.0;
-                    seg_tail = 0.0;
+                    seg_sum = 0.0f32;
+                    column = 0usize;
                 } else {
-                    ds_opaque_add(&mut seg_sum, &mut seg_tail, sm[id]);
+                    column += 1usize;
+                    if segment_width != 0 && column >= segment_width {
+                        // The filler's advance never joins (fold.rs:758).
+                        seg_sum = 0.0f32;
+                        column = 0usize;
+                    } else {
+                        seg_sum += sm[id];
+                    }
                 }
             }
-            id += 1;
+            id += 1usize;
         }
-        // The last row before EOF (no terminator) is a candidate too.
-        if seg_sum > widest_sum || (seg_sum == widest_sum && seg_tail > widest_tail) {
-            widest_sum = seg_sum;
-            widest_tail = seg_tail;
-        }
-        // The sum word's whole job is the lexicographic compare; only the
-        // tail ships (x_max keeps the tree-keyed value — see below).
-        let _ = widest_sum;
-        // The lo word only: x_max keeps the tree-keyed value. A
-        // segment-aware walk that owns BOTH words — the engine's extent is
-        // the SEGMENT-local prefix (fold_unit = wrap, reset when the
-        // incremented col fills it, filler's advance never joining) — is
-        // the named open item: in this kernel's six-slice shape the ie
-        // buffer's reads come back zeroed (the unit lane never sees the
-        // wrap width, the reset never fires), a cousin of landmine 7.
-        x_lo[it] = ordered_key(widest_tail);
+        // The tail word is zero: the extent IS an f32 value; the gap's
+        // exact fold happens in derive_stride's fixed-point.
+        extent_words[item * 2] = ordered_key(widest_sum);
+        extent_words[item * 2 + 1] = ordered_key(0.0f32);
     }
 }
 
-// ── dispatch 5: derive the fan stride ON DEVICE — thread per item ───────────
-// The stride is a PAIR now: extent + gap summed exactly like the engine's
-// f64 add, so paginate's m·stride product can carry the tail the single-f32
-// stride was losing at m == 1. Strides are [hi, lo] per item.
 #[cube(launch_unchecked)]
 fn derive_stride(
-    x_max: &[u32],
-    x_lo: &[u32],
+    extent_words: &[u32],
     ie: &[u32],
     page_gap_x: &[f32],
     strides: &mut [f32],
@@ -2040,11 +2055,16 @@ fn derive_stride(
         let has_page = ie[ie_off + IE_HAS_PAGE] != 0;
         let rows = ie[ie_off + IE_PAGE_ROWS] as i32;
         if has_page && rows > 0 {
-            // exact: (hi + lo) + gap, compensated opaquely — the tail is
-            // the X-at-m1/m2 fork the census names.
-            let mut stride_sum = key_to_float(x_max[i]);
-            let mut stride_tail = key_to_float(x_lo[i]);
-            ds_opaque_add(&mut stride_sum, &mut stride_tail, page_gap_x[i]);
+            // The gap folds EXACTLY in fixed-point — the engine holds
+            // extent+gap as an f64 (an f32 value plus a small constant,
+            // exact in f64), and the f32 add would round it whenever the
+            // sum crosses a binade. The decode splits the exact value
+            // into (fl(stride), sub-ulp tail) for paginate's fmas.
+            let exact = advance_fixed(key_to_float(extent_words[i * 2]))
+                + advance_fixed(page_gap_x[i]);
+            let mut stride_sum = 0.0f32;
+            let mut stride_tail = 0.0f32;
+            fixed_pair(exact, &mut stride_sum, &mut stride_tail);
             strides[i * 2] = stride_sum;
             strides[i * 2 + 1] = stride_tail;
         } else {
@@ -2277,10 +2297,28 @@ pub fn run(ctx: &GpuContext, fixture_path: &Path) -> ! {
     let zeroes = vec![0u32; item_count];
     let h_rmax = client.create_from_slice(bytemuck::cast_slice(&zeroes));
     let h_xmax = client.create_from_slice(bytemuck::cast_slice(&zeroes));
-    // The extent's lo word, keyed-zero: raw 0u32 would decode as NaN
-    // (key_to_float(0) — see the ordered_key pair for why).
-    let zero_keys = vec![0x8000_0000u32; item_count];
-    let h_xlo = client.create_from_slice(bytemuck::cast_slice(&zero_keys));
+    // The extent pair (sum, tail), keyed-zero: raw 0u32 would decode as
+    // NaN (key_to_float(0) — see the ordered_key pair for why).
+    let zero_keys = vec![0x8000_0000u32; item_count * 2];
+    let h_extent = client.create_from_slice(bytemuck::cast_slice(&zero_keys));
+    // The extent walk's plan: [start, stop, segment_width] per item, the
+    // width pre-resolved by fold.rs's rule (wrap if wrapped, else page
+    // columns if paged, else 0) — see extent_pair's header for why this
+    // rides its own buffer and not ie.
+    let mut walk_plan: Vec<u32> = Vec::with_capacity(item_count * 3);
+    for item in &fx.items {
+        let width = if item.wrap_width > 0 {
+            item.wrap_width
+        } else if item.has_page {
+            item.page_cols
+        } else {
+            0
+        };
+        walk_plan.push(item.byte_start as u32);
+        walk_plan.push((item.byte_start + item.byte_count) as u32);
+        walk_plan.push(width as u32);
+    }
+    let h_plan = client.create_from_slice(bytemuck::cast_slice(&walk_plan));
 
     // This M2's ADAPTER caps workgroups per grid dimension at 65535 (verified
     // live: a 94075-cube dispatch was rejected) — not a wgpu default to lift.
@@ -2399,15 +2437,14 @@ pub fn run(ctx: &GpuContext, fixture_path: &Path) -> ! {
                 CubeDim::new_1d(256),
                 BufferArg::from_raw_parts(h_sm.clone(), n),
                 BufferArg::from_raw_parts(h_fl.clone(), n_words),
-                BufferArg::from_raw_parts(h_ir.clone(), item_count * 2),
-                BufferArg::from_raw_parts(h_xlo.clone(), item_count),
+                BufferArg::from_raw_parts(h_plan.clone(), item_count * 3),
+                BufferArg::from_raw_parts(h_extent.clone(), item_count * 2),
             );
             derive_stride::launch_unchecked(
                 &client,
                 cubes_of(item_count),
                 CubeDim::new_1d(256),
-                BufferArg::from_raw_parts(h_xmax.clone(), item_count),
-                BufferArg::from_raw_parts(h_xlo.clone(), item_count),
+                BufferArg::from_raw_parts(h_extent.clone(), item_count * 2),
                 BufferArg::from_raw_parts(h_ie.clone(), item_count * IE_STRIDE),
                 BufferArg::from_raw_parts(h_gap.clone(), item_count),
                 BufferArg::from_raw_parts(h_strides.clone(), item_count * 2),
@@ -3330,6 +3367,7 @@ pub fn bench(ctx: &GpuContext, corpus_path: &Path) -> ! {
     let decode_dt = t_decode.elapsed();
 
     let ir: Vec<u32> = vec![0, n as u32];
+    let walk_plan: Vec<u32> = vec![0, n as u32, wrap_width.max(0) as u32];
     let ie: Vec<u32> = vec![0, 0, 0, 1, wrap_width as u32, 0, 0, 0];
     let im: Vec<f32> = vec![0.0, 0.0, 1.25, 2.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
     let page_gap_x: Vec<f32> = vec![0.0];
@@ -3455,9 +3493,10 @@ pub fn bench(ctx: &GpuContext, corpus_path: &Path) -> ! {
     let h_strides = client.empty(8);
     let h_rmax = client.create_from_slice(bytemuck::cast_slice(&[0u32]));
     let h_xmax = client.create_from_slice(bytemuck::cast_slice(&[0u32]));
-    // Keyed zero (the lo word of extent 0.0), not raw 0 — key_to_float(0)
-    // is NaN.
-    let h_xlo = client.create_from_slice(bytemuck::cast_slice(&[0x8000_0000u32]));
+    // The extent pair + walk plan for the single bench item.
+    let h_extent =
+        client.create_from_slice(bytemuck::cast_slice(&[0x8000_0000u32, 0x8000_0000u32]));
+    let h_plan = client.create_from_slice(bytemuck::cast_slice(&walk_plan));
 
     // This M2's ADAPTER caps workgroups per grid dimension at 65535 (verified
     // live: a 94075-cube dispatch was rejected) — not a wgpu default to lift.
@@ -3827,15 +3866,14 @@ pub fn bench(ctx: &GpuContext, corpus_path: &Path) -> ! {
                         CubeDim::new_1d(1),
                         BufferArg::from_raw_parts(h_sm.clone(), n),
                         BufferArg::from_raw_parts(h_fl.clone(), n_words),
-                        BufferArg::from_raw_parts(h_ir.clone(), 2),
-                        BufferArg::from_raw_parts(h_xlo.clone(), 1),
+                        BufferArg::from_raw_parts(h_plan.clone(), 3),
+                        BufferArg::from_raw_parts(h_extent.clone(), 2),
                     );
                     derive_stride::launch_unchecked(
                         &client,
                         CubeCount::new_single(),
                         CubeDim::new_1d(1),
-                        BufferArg::from_raw_parts(h_xmax.clone(), 1),
-                        BufferArg::from_raw_parts(h_xlo.clone(), 1),
+                        BufferArg::from_raw_parts(h_extent.clone(), 2),
                         BufferArg::from_raw_parts(h_ie.clone(), IE_STRIDE),
                         BufferArg::from_raw_parts(h_gap.clone(), 1),
                         BufferArg::from_raw_parts(h_strides.clone(), 2),
@@ -4239,8 +4277,24 @@ pub fn repo_check(ctx: &GpuContext, dir: &Path) -> ! {
     let h_strides = client.empty(item_count * 8);
     let h_rmax = client.create_from_slice(bytemuck::cast_slice(&vec![0u32; item_count]));
     let h_xmax = client.create_from_slice(bytemuck::cast_slice(&vec![0u32; item_count]));
-    // Keyed zero (the lo word of extent 0.0) — key_to_float(0) is NaN.
-    let h_xlo = client.create_from_slice(bytemuck::cast_slice(&vec![0x8000_0000u32; item_count]));
+    // The extent pair + walk plan (the width pre-resolved by fold.rs's
+    // rule — see extent_pair's header).
+    let h_extent =
+        client.create_from_slice(bytemuck::cast_slice(&vec![0x8000_0000u32; item_count * 2]));
+    let mut walk_plan: Vec<u32> = Vec::with_capacity(item_count * 3);
+    for (i, prm) in file_params.iter().enumerate() {
+        let width = if prm.wrap_width > 0 {
+            prm.wrap_width
+        } else if prm.has_page {
+            prm.page_cols
+        } else {
+            0
+        };
+        walk_plan.push(ir[i * 2]);
+        walk_plan.push(ir[i * 2 + 1]);
+        walk_plan.push(width as u32);
+    }
+    let h_plan = client.create_from_slice(bytemuck::cast_slice(&walk_plan));
     let h_ctc = client.empty(n_tiles * 4);
     let h_cup = client.empty(n_tiles * units * 4);
     let h_cxc = client.empty(n_tiles * 4);
@@ -4469,15 +4523,14 @@ pub fn repo_check(ctx: &GpuContext, dir: &Path) -> ! {
             CubeDim::new_1d(256),
             BufferArg::from_raw_parts(h_sm.clone(), n),
             BufferArg::from_raw_parts(h_fl.clone(), n_words),
-            BufferArg::from_raw_parts(h_ir.clone(), ir.len()),
-            BufferArg::from_raw_parts(h_xlo.clone(), item_count),
+            BufferArg::from_raw_parts(h_plan.clone(), walk_plan.len()),
+            BufferArg::from_raw_parts(h_extent.clone(), item_count * 2),
         );
         derive_stride::launch_unchecked(
             &client,
             cubes_of(item_count.max(1)),
             CubeDim::new_1d(256),
-            BufferArg::from_raw_parts(h_xmax.clone(), item_count),
-            BufferArg::from_raw_parts(h_xlo.clone(), item_count),
+            BufferArg::from_raw_parts(h_extent.clone(), item_count * 2),
             BufferArg::from_raw_parts(h_ie.clone(), ie.len()),
             BufferArg::from_raw_parts(h_gap.clone(), item_count),
             BufferArg::from_raw_parts(h_strides.clone(), item_count * 2),
