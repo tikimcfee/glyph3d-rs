@@ -855,3 +855,14 @@ find = """    for i in bytes.len()..(n_words * 4) {
 """
 with = ""
 expect = "pack_words_fills_tail_lanes"
+
+[[mutation]]
+name = "emitter-window-offset-dropped"
+gate = "cubecl-fork"
+why = "the chunked emitter windows its writes by rec_first; dropping the offset lands every later window's records outside the rolling buffer, discarded by robustness — only the chunk-crossing pass (GLYPH_RECORD_CHUNK=60000, five windows) can see it, since the 16.7M default never leaves window zero on the standing fixture. CONSUMED BY: the record stream's chunk boundaries — the product readback's shape at the 97MB corpus scale"
+file = "native/src/cubecl_chain.rs"
+rebuild = "cargo build --release"
+op = "replace"
+find = "                    let w = (o as usize - rec_first) * 8;"
+with = "                    let w = (o as usize) * 8;"
+expect = "cubecl-fork-chunked"

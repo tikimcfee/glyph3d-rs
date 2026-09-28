@@ -4308,8 +4308,15 @@ pub(crate) fn run_repo_chain(
     let h_ctotal = client.empty(4);
     let h_hp = client.empty(n * 4);
     // The record buffer is a fixed 512MB rolling CHUNK, not a whole-corpus
-    // allocation — see the emitter's rec_first note.
-    let chunk_recs = 16_777_216usize.min(total_records as usize).max(1);
+    // allocation — see the emitter's rec_first note. GLYPH_RECORD_CHUNK
+    // shrinks the window so the fork gate crosses chunk boundaries on the
+    // standing fixture (the 16.7M default never does): the windowed
+    // emitter's carry arithmetic, fenced on an ordinary corpus.
+    let chunk_cap: usize = std::env::var("GLYPH_RECORD_CHUNK")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(16_777_216);
+    let chunk_recs = chunk_cap.min(total_records as usize).max(1);
     let h_recs = client.empty(chunk_recs * 8 * 4);
     let h_base = client.create_from_slice(bytemuck::cast_slice(&rec_base));
     let cubes_of = |threads: usize| {

@@ -38,12 +38,30 @@ fork)
     if out=$("$BIN" --cubecl-repo-check native/fixtures/cubecl-fork 2>&1); then
         echo "$out" | grep -q "cubecl-repo-check PASS" \
             && echo "$out" | grep -q "strict: bit-exact" \
-            && echo "ALL PASS" \
+            && echo "PASS  cubecl-fork (default chunk)" \
             || { echo "FAIL — PASS/strict lines missing"; echo "$out" | tail -5; exit 1; }
     else
         echo "$out" | tail -5
         exit 1
     fi
+    # The chunked emitter, fenced: shrink the record window so the standing
+    # fixture (278,470 records) crosses five chunk boundaries — the 16.7M
+    # default never leaves window zero here, so the window arithmetic
+    # (rec_first carry, rolling buffer reuse) was otherwise exercised only
+    # by manual 97MB runs. Each window is a fresh comptime rec_first
+    # specialization, so this also pays five small JIT compiles: seconds,
+    # not minutes.
+    if out=$(GLYPH_RECORD_CHUNK=60000 "$BIN" --cubecl-repo-check native/fixtures/cubecl-fork 2>&1); then
+        echo "$out" | grep -q "cubecl-repo-check PASS" \
+            && echo "$out" | grep -q "strict: bit-exact" \
+            && echo "PASS  cubecl-fork-chunked (GLYPH_RECORD_CHUNK=60000, five windows)" \
+            || { echo "FAIL  cubecl-fork-chunked — PASS/strict lines missing"; echo "$out" | tail -5; exit 1; }
+    else
+        echo "FAIL  cubecl-fork-chunked — exited nonzero"
+        echo "$out" | tail -5
+        exit 1
+    fi
+    echo "ALL PASS"
     ;;
 *)
     echo "usage: $0 chain|fork" >&2

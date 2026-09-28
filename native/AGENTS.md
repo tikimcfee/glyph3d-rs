@@ -211,7 +211,13 @@ bench item flips to Cluster, the ranked chain runs as stages 1-4
 (probe / compact / rank / mark — list ranking over the candidate jump
 graph, note 18 §6c), a 4 B setup readback sizes the level tables, and
 fl/sm are diffed bit-exact against `decode_all`+`resolve_clusters`),
-`GLYPH_CHAIN_DEBUG=1` (dumps, incl. the cluster candidate table).
+`GLYPH_CHAIN_DEBUG=1` (dumps, incl. the cluster candidate table),
+`GLYPH_RECORD_CHUNK=<n>` (the repo chain's record-emit window size in
+records, default 16,777,216 = a 512MB rolling buffer — the cubecl-fork
+gate sets 60,000 so the standing fixture's 278,470 records cross five
+windows, fencing the chunked emitter's `rec_first` carry on an ordinary
+corpus; each window is a fresh comptime `rec_first` specialization, so
+small values cost JIT compiles, not just dispatches).
 
 ## Commit cadence
 
