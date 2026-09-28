@@ -152,17 +152,26 @@ fn marshal(
     (bytes, fis, inputs)
 }
 
-/// The arena hand-off. Mapped arena: the slots memcpy into its tail and
-/// `commit` publishes them (rung 5c replaces this hop with a device-side
-/// copy and the crossing dies). Vec arena: the readback's own allocation
-/// BECOMES the arena (`GlyphArena::from_vec`) — zero copies, the pages
-/// touched exactly once (the readback write). The single-touch property is
-/// why the driver builds the instance Vec with `reserve_exact`.
-fn hand_off(mut words: Vec<u32>, slots: usize, arena: &mut GlyphArena) {
+/// The arena hand-off. Copy hop (`on_device`, rung 5c): the driver already
+/// landed the windows in the mapped arena GPU-side — only the `commit`
+/// remains, and no slot byte ever crossed to host. Readback hop otherwise:
+/// mapped arena takes one memcpy into its tail; Vec arena TAKES the
+/// readback's own allocation over (`GlyphArena::from_vec`) — zero copies,
+/// the pages touched exactly once (the readback write; hence the driver's
+/// `reserve_exact`). pub(crate): repo_check hands its own chain-side arena
+/// off the same way, so the fence's instance tier compares arena against
+/// arena whichever hop ran.
+pub(crate) fn hand_off(words: Vec<u32>, slots: usize, on_device: bool, arena: &mut GlyphArena) {
     assert!(
         arena.is_empty(),
         "the instance tail writes from slot 0 — a pre-filled arena would need the rebase the direct path carries"
     );
+    if on_device {
+        debug_assert!(arena.mapped_buffer().is_some());
+        unsafe { arena.commit(slots) };
+        return;
+    }
+    let mut words = words;
     if slots == 0 {
         return;
     }
@@ -224,10 +233,17 @@ impl LayoutGlyphs for CubeclLayout {
             &fis,
             &inputs,
             crate::cubecl_chain::ChainMode::Instances,
+            arena.mapped_buffer(),
         );
-        // The arena hand-off — see `hand_off`: one memcpy on the mapped
-        // path, an allocation hand-over on the Vec path.
-        hand_off(stream.instances, stream.total_slots as usize, arena);
+        // The arena hand-off — see `hand_off`: the copy hop's commit, one
+        // memcpy on the mapped readback path, an allocation hand-over on
+        // the Vec path.
+        hand_off(
+            stream.instances,
+            stream.total_slots as usize,
+            stream.instances_on_device,
+            arena,
+        );
         self.phases = CubeclPhases {
             marshal: marshal_dur,
             chain: stream.phases,
@@ -259,8 +275,14 @@ impl VerifyLayout for CubeclLayout {
             &fis,
             &inputs,
             crate::cubecl_chain::ChainMode::Both,
+            arena.mapped_buffer(),
         );
-        hand_off(stream.instances, stream.total_slots as usize, arena);
+        hand_off(
+            stream.instances,
+            stream.total_slots as usize,
+            stream.instances_on_device,
+            arena,
+        );
         // The records tier's materialization — the rung-4 convert loop,
         // now a verify-only cost.
         let mut convert = Duration::ZERO;

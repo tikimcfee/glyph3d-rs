@@ -42,7 +42,7 @@
 use std::path::Path;
 
 use cubecl::prelude::*;
-use cubecl::wgpu::{AutoGraphicsApi, GraphicsApi, WgpuSetup};
+use cubecl::wgpu::{AutoCompiler, AutoGraphicsApi, GraphicsApi, WgpuServer, WgpuSetup};
 
 use crate::fold::WrapMode;
 use crate::text::ResolveGlyph;
@@ -4427,6 +4427,10 @@ pub(crate) struct ChainStream {
     /// ALL records, ink over survivors, min/max order-free). EMPTY unless
     /// Instances/Both.
     pub placements: Vec<crate::layout::ItemPlacement>,
+    /// True when the copy hop filled the caller's MAPPED ARENA directly
+    /// (rung 5c): `instances` is empty by design and the arena only needs
+    /// its `commit` — the slots never crossed to host.
+    pub instances_on_device: bool,
     /// The ranked chain's candidate count (diagnostics).
     pub candidates: usize,
     pub chain_dur: std::time::Duration,
@@ -4441,6 +4445,7 @@ pub(crate) fn run_repo_chain(
     items: &[crate::fold::Item],
     inputs: &InstanceInputs,
     mode: ChainMode,
+    mapped: Option<&wgpu::Buffer>,
 ) -> ChainStream {
     let item_count = items.len();
     let n: usize = bytes.len();
@@ -5057,11 +5062,26 @@ pub(crate) fn run_repo_chain(
     }
     let mut inst_all: Vec<u32> = Vec::new();
     let mut placements: Vec<crate::layout::ItemPlacement> = Vec::new();
+    let mut instances_on_device = false;
     if wants_instances {
-        // Exact capacity: the caller takes this allocation over as the
-        // Vec-arena's storage (GlyphArena::from_vec, zero copies) — the
-        // readback hop must touch these pages exactly once.
-        inst_all.reserve_exact(total_slots as usize * 12);
+        // The COPY HOP (rung 5c): with a mapped arena handed in, no slot
+        // byte ever crosses to host — each window is flushed out of
+        // cubecl's stream by `get_resource` (the flush IS the handoff),
+        // then one encoder copy lands it in the arena's shared storage,
+        // in queue order after the pack that filled it and before the
+        // next window's pack overwrites the rolling buffer. One final
+        // Wait-poll makes the bytes visible before the caller's staging
+        // reads the pointer. Without a mapped arena (non-Metal,
+        // GPU-less), the readback hop stands — measured the cheaper
+        // product everywhere it can run.
+        let copy_hop = mapped.is_some();
+        instances_on_device = copy_hop;
+        if !copy_hop {
+            // Exact capacity: the caller takes this allocation over as the
+            // Vec-arena's storage (GlyphArena::from_vec, zero copies) — the
+            // readback hop must touch these pages exactly once.
+            inst_all.reserve_exact(total_slots as usize * 12);
+        }
         let chunk_slots = chunk_slots_cap.min(total_slots as usize).max(1);
         let h_out = client.empty(chunk_slots * 12 * 4);
         let mut first = 0usize;
@@ -5092,10 +5112,39 @@ pub(crate) fn run_repo_chain(
                     BufferArg::from_raw_parts(h_win, 1),
                 );
             }
-            let cb = client.read_one(h_out.clone()).expect("read instance chunk");
-            let csv: &[u32] = bytemuck::cast_slice(&cb);
-            inst_all.extend_from_slice(&csv[..take * 12]);
+            if let Some(dst_buf) = mapped {
+                let res = client
+                    .get_resource::<WgpuServer<AutoCompiler>>(h_out.clone())
+                    .expect("instance window resource");
+                let r = res.resource();
+                let mut enc = device_ref.device.create_command_encoder(
+                    &wgpu::CommandEncoderDescriptor {
+                        label: Some("glyph instance window"),
+                    },
+                );
+                enc.copy_buffer_to_buffer(
+                    &r.buffer,
+                    r.offset,
+                    dst_buf,
+                    (first * 48) as u64,
+                    (take * 48) as u64,
+                );
+                device_ref.queue.submit([enc.finish()]);
+            } else {
+                let cb = client.read_one(h_out.clone()).expect("read instance chunk");
+                let csv: &[u32] = bytemuck::cast_slice(&cb);
+                inst_all.extend_from_slice(&csv[..take * 12]);
+            }
             first += take;
+        }
+        if copy_hop {
+            device_ref
+                .device
+                .poll(wgpu::PollType::Wait {
+                    submission_index: None,
+                    timeout: None,
+                })
+                .expect("device poll after instance windows");
         }
         // Placements from the extent lanes — the same reduction the host
         // compaction performs (page over ALL records, ink over survivors),
@@ -5137,6 +5186,7 @@ pub(crate) fn run_repo_chain(
         instances: inst_all,
         total_slots,
         placements,
+        instances_on_device,
         candidates: c,
         chain_dur: t_chain0.elapsed(),
         readback_dur: t_rb.elapsed(),
@@ -5237,7 +5287,35 @@ pub fn repo_check(ctx: &GpuContext, dir: &Path) -> ! {
         ChainMode::Both
     };
     let device = SharedDevice::from_ctx(ctx);
-    let stream = run_repo_chain(Some(&device), &bytes, &fis, &inputs, mode);
+    // The copy hop's own tier: where the renderer's mapped-arena gate
+    // passes (Metal, mappable, fits), the check's CHAIN side runs the SAME
+    // hop — the fence follows the path the renderer runs. Other hosts
+    // fence the readback hop instead: each host fences what it runs, the
+    // mapped_instance_arena pattern.
+    let mut chain_arena = if ctx.profile.backend == wgpu::Backend::Metal
+        && ctx.profile.mappable_primary_buffers
+        && n > 0
+        && (n * std::mem::size_of::<crate::glyph_scene::GlyphInstance>()) as u64
+            <= ctx.profile.max_buffer_size
+    {
+        crate::glyph_scene::mapped_instance_arena(ctx, n)
+    } else {
+        crate::layout::GlyphArena::new()
+    };
+    let stream = run_repo_chain(
+        Some(&device),
+        &bytes,
+        &fis,
+        &inputs,
+        mode,
+        chain_arena.mapped_buffer(),
+    );
+    crate::cubecl_layout::hand_off(
+        stream.instances,
+        stream.total_slots as usize,
+        stream.instances_on_device,
+        &mut chain_arena,
+    );
     let recs_all = stream.records;
     let total_records = stream.total_records;
     let c = stream.candidates;
@@ -5305,8 +5383,12 @@ pub fn repo_check(ctx: &GpuContext, dir: &Path) -> ! {
     let mut inst_bad = 0usize;
     let mut place_bad = 0usize;
     if mode != ChainMode::Records {
+        // Arena against arena: the chain side's slots live in
+        // `chain_arena` whichever hop filled it (device copy or readback
+        // hand-off), the engine side's in its own — the same comparison
+        // repo-verify makes of the host backends.
         let eng_words: &[u32] = bytemuck::cast_slice(arena.instances());
-        let chain_words: &[u32] = &stream.instances;
+        let chain_words: &[u32] = bytemuck::cast_slice(chain_arena.instances());
         if eng_words.len() != chain_words.len() {
             inst_bad += 1;
             println!(
@@ -5344,7 +5426,7 @@ pub fn repo_check(ctx: &GpuContext, dir: &Path) -> ! {
             }
         }
         drop(arena);
-        drop(stream.instances);
+        drop(chain_arena);
         drop(stream.placements);
     }
 

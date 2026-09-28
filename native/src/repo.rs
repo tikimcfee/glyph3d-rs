@@ -931,7 +931,7 @@ impl RepoLoad {
                 Strategy::Batched => "mojo-cpu/batched",
                 Strategy::PerItem => "mojo-cpu/per-item",
                 Strategy::Direct => "mojo-cpu/direct",
-                Strategy::Cubecl => "device/cubecl (rung 4: readback path)",
+                Strategy::Cubecl => "device/cubecl (rung 5: instance tail)",
             },
             if s.verified { " (verified bit-exact vs the other strategy)" } else { "" },
         );
