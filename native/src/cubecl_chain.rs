@@ -1759,7 +1759,7 @@ fn apply(
                     // whole per-item computation, in registers, now.
                     let x = run.tail_adv;
                     let io = it * IM_STRIDE;
-                    let seg = wrap_segment_of(col, w_wrap, (f & F_NEWLINE) != 0);
+                    let wrap_segment = wrap_segment_of(col, w_wrap, (f & F_NEWLINE) != 0);
                     let lh = items[io + IM_LINE_HEIGHT];
                     let mo = id * LM_STRIDE;
                     let base = x + items[io + IM_ORIGIN_X];
@@ -1770,12 +1770,13 @@ fn apply(
                     // paginate's fma note for why opaque); Z folds the
                     // z_step tail through the second fma.
                     lm[mo + LM_Y] = fma(-(row as f32), lh, items[io + IM_ORIGIN_Y]);
-                    let zseed = fma(
-                        -(seg as f32),
+                    let depth_steps = -(wrap_segment as f32);
+                    let z_tail_folded = fma(
+                        depth_steps,
                         items[io + IM_Z_STEP_LO],
                         items[io + IM_ORIGIN_Z],
                     );
-                    lm[mo + LM_Z] = fma(-(seg as f32), items[io + IM_Z_STEP], zseed);
+                    lm[mo + LM_Z] = fma(depth_steps, items[io + IM_Z_STEP], z_tail_folded);
                     let slot = it - it_base;
                     if slot < RESOLVE_SLOTS {
                         sx[slot].fetch_max(ordered_key(x));
@@ -1910,7 +1911,7 @@ fn resolve_x(
                 }
                 let row = lc[id * LC_STRIDE + LC_ROW] as i32;
                 let io = it * IM_STRIDE;
-                let seg = wrap_segment_of(col, wrap, (f & F_NEWLINE) != 0);
+                let wrap_segment = wrap_segment_of(col, wrap, (f & F_NEWLINE) != 0);
                 let lh = items[io + IM_LINE_HEIGHT];
                 let mo = id * LM_STRIDE;
                 let base = x + items[io + IM_ORIGIN_X];
@@ -1920,12 +1921,13 @@ fn resolve_x(
                 // expressions narrowed once (paginate's fma note); Z's
                 // second fma folds the z_step tail.
                 lm[mo + LM_Y] = fma(-(row as f32), lh, items[io + IM_ORIGIN_Y]);
-                let zseed = fma(
-                    -(seg as f32),
+                let depth_steps = -(wrap_segment as f32);
+                let z_tail_folded = fma(
+                    depth_steps,
                     items[io + IM_Z_STEP_LO],
                     items[io + IM_ORIGIN_Z],
                 );
-                lm[mo + LM_Z] = fma(-(seg as f32), items[io + IM_Z_STEP], zseed);
+                lm[mo + LM_Z] = fma(depth_steps, items[io + IM_Z_STEP], z_tail_folded);
                 let slot = it - it_base;
                 if slot < RESOLVE_SLOTS {
                     srow[slot].fetch_max((row + 1) as u32);
@@ -1976,36 +1978,38 @@ fn extent_pair(sm: &[f32], fl: &[u32], ir: &[u32], x_lo: &mut [u32]) {
     if it < item_count {
         let start = ir[it * 2] as usize;
         let stop = ir[it * 2 + 1] as usize;
-        let mut best_hi = 0.0f32;
-        let mut best_lo = 0.0f32;
-        let mut row_hi = 0.0f32;
-        let mut row_lo = 0.0f32;
+        let mut widest_sum = 0.0f32;
+        let mut widest_tail = 0.0f32;
+        let mut seg_sum = 0.0f32;
+        let mut seg_tail = 0.0f32;
         let mut id = start;
         while id < stop {
             if (flags_at(fl, id) & F_LEADER) != 0 {
                 if (flags_at(fl, id) & F_NEWLINE) != 0 {
                     // The terminator's own advance never joins the row
                     // (the fold reads line_advance BEFORE it, then resets).
-                    if row_hi > best_hi || (row_hi == best_hi && row_lo > best_lo) {
-                        best_hi = row_hi;
-                        best_lo = row_lo;
+                    if seg_sum > widest_sum
+                        || (seg_sum == widest_sum && seg_tail > widest_tail)
+                    {
+                        widest_sum = seg_sum;
+                        widest_tail = seg_tail;
                     }
-                    row_hi = 0.0;
-                    row_lo = 0.0;
+                    seg_sum = 0.0;
+                    seg_tail = 0.0;
                 } else {
-                    ds_opaque_add(&mut row_hi, &mut row_lo, sm[id]);
+                    ds_opaque_add(&mut seg_sum, &mut seg_tail, sm[id]);
                 }
             }
             id += 1;
         }
         // The last row before EOF (no terminator) is a candidate too.
-        if row_hi > best_hi || (row_hi == best_hi && row_lo > best_lo) {
-            best_hi = row_hi;
-            best_lo = row_lo;
+        if seg_sum > widest_sum || (seg_sum == widest_sum && seg_tail > widest_tail) {
+            widest_sum = seg_sum;
+            widest_tail = seg_tail;
         }
-        // The hi word's whole job is the lexicographic compare; only the
-        // lo ships (x_max keeps the tree-keyed value — see below).
-        let _ = best_hi;
+        // The sum word's whole job is the lexicographic compare; only the
+        // tail ships (x_max keeps the tree-keyed value — see below).
+        let _ = widest_sum;
         // The lo word only: x_max keeps the tree-keyed value. A
         // segment-aware walk that owns BOTH words — the engine's extent is
         // the SEGMENT-local prefix (fold_unit = wrap, reset when the
@@ -2013,7 +2017,7 @@ fn extent_pair(sm: &[f32], fl: &[u32], ir: &[u32], x_lo: &mut [u32]) {
         // the named open item: in this kernel's six-slice shape the ie
         // buffer's reads come back zeroed (the unit lane never sees the
         // wrap width, the reset never fires), a cousin of landmine 7.
-        x_lo[it] = ordered_key(best_lo);
+        x_lo[it] = ordered_key(widest_tail);
     }
 }
 
@@ -2038,11 +2042,11 @@ fn derive_stride(
         if has_page && rows > 0 {
             // exact: (hi + lo) + gap, compensated opaquely — the tail is
             // the X-at-m1/m2 fork the census names.
-            let mut s0 = key_to_float(x_max[i]);
-            let mut s1 = key_to_float(x_lo[i]);
-            ds_opaque_add(&mut s0, &mut s1, page_gap_x[i]);
-            strides[i * 2] = s0;
-            strides[i * 2 + 1] = s1;
+            let mut stride_sum = key_to_float(x_max[i]);
+            let mut stride_tail = key_to_float(x_lo[i]);
+            ds_opaque_add(&mut stride_sum, &mut stride_tail, page_gap_x[i]);
+            strides[i * 2] = stride_sum;
+            strides[i * 2 + 1] = stride_tail;
         } else {
             strides[i * 2] = 0.0;
             strides[i * 2 + 1] = 0.0;
@@ -2084,45 +2088,45 @@ fn paginate(
             if cols > 0 {
                 x_page = col / cols;
             }
-            let wide_raw = ie[ie_off + IE_PAGES_WIDE] as i32;
-            let wide = if wide_raw > 1 { wide_raw } else { 1 };
-            let band = y_page / wide;
+            let pages_wide_raw = ie[ie_off + IE_PAGES_WIDE] as i32;
+            let pages_wide = if pages_wide_raw > 1 { pages_wide_raw } else { 1 };
+            let band = y_page / pages_wide;
             let wrap = ie[ie_off + IE_WRAP_WIDTH] as i32;
-            let seg = wrap_segment_of(col, wrap, (flags_at(fl, id) & F_NEWLINE) != 0);
-            let lh = items[io + IM_LINE_HEIGHT];
+            let wrap_segment = wrap_segment_of(col, wrap, (flags_at(fl, id) & F_NEWLINE) != 0);
+            let line_height = items[io + IM_LINE_HEIGHT];
             let mo = id * LM_STRIDE;
-            // X/Y/Z through NESTED OPAQUE FMAs, one rounding per term —
-            // the engine's f64 expressions narrowed once per store. The
-            // double-single accumulator that stood here first was
-            // ALGEBRAICALLY COLLAPSED by Metal's shader optimizer on
-            // large kernels (measured: `s - (s - a)` simplified away, the
-            // correction terms dead, a systematic 1-ulp bias at m >= 3;
-            // the same helpers survived in a small probe kernel — a
-            // function-size-dependent optimization). `fma` is a builtin
-            // and opaque to that pass, so the rounding structure rides
-            // inside it: fma(m, s_hi, base) IS fl_32(base + m·s exactly),
-            // the engine's own arithmetic for the dominant term, with
-            // the stride's lo word folded by the outer fma.
-            let m = (y_page % wide) as f32;
-            let xseed = fma(m, strides[it * 2 + 1], lm[mo + LM_BASE_X]);
-            lm[mo + LM_X] = fma(m, strides[it * 2], xseed);
-            // Y: origin − r·line_height − band·band_stride_y
-            let r = (screen_row - y_page * rows) as f32;
-            let yin = fma(-r, lh, items[io + IM_ORIGIN_Y]);
-            lm[mo + LM_Y] = fma(-(band as f32), items[io + IM_BAND_STRIDE_Y], yin);
-            // Z: origin − seg·z_step + band·depth_per_band + x_page·depth_per_col
-            // — TAIL-FIRST fmas: the z_step's f64 tail folds INSIDE the
-            // dominant term's single rounding. Tail-LAST measurably
-            // pushed records OFF the engine's value at exact half-ulp
-            // ties (seg 5 on the wide corpus: the inner fma ties to
-            // even, the outer fold then overshoots one ulp); tail-first
-            // carries the correction through the one rounding that
-            // matters, and under a large origin it vanishes under the
-            // same ulp that swallows it in the engine's f64 store.
-            let zseed = fma(-(seg as f32), items[io + IM_Z_STEP_LO], items[io + IM_ORIGIN_Z]);
-            let zin = fma(-(seg as f32), items[io + IM_Z_STEP], zseed);
-            let zin2 = fma(band as f32, items[io + IM_DEPTH_PER_BAND], zin);
-            lm[mo + LM_Z] = fma(x_page as f32, items[io + IM_DEPTH_PER_COL], zin2);
+            // The three position formulas, one nested OPAQUE fma per
+            // term, folded TAIL-FIRST — the tiny correction words ride
+            // INSIDE the dominant term's single rounding, which is the
+            // engine's f64-store discipline reproduced in f32. Why fma
+            // and not plain arithmetic: Metal's optimizer collapses
+            // correction identities (`s - (s - a)` → a) on large kernels
+            // and cubecl contracts loose mul+add into fma anyway
+            // (landmines 8-9) — the builtin is the only shape that
+            // survives with its rounding structure intact.
+            //
+            // X = column position + page column × page stride:
+            //   which page column of the band this row lands on, times
+            //   how far one page column reaches (the stride pair).
+            let page_col = (y_page % pages_wide) as f32;
+            let stride_reach_tail = strides[it * 2 + 1];
+            let stride_reach = strides[it * 2];
+            let x_with_tail = fma(page_col, stride_reach_tail, lm[mo + LM_BASE_X]);
+            lm[mo + LM_X] = fma(page_col, stride_reach, x_with_tail);
+            // Y = page top − row-in-page × line height − band × band stride.
+            let row_in_page = (screen_row - y_page * rows) as f32;
+            let y_row_folded = fma(-row_in_page, line_height, items[io + IM_ORIGIN_Y]);
+            lm[mo + LM_Y] = fma(-(band as f32), items[io + IM_BAND_STRIDE_Y], y_row_folded);
+            // Z = depth origin − wrap segment × depth step
+            //       + band × band depth + page column × column depth.
+            // The last two terms are zero in repo mode; the depth step
+            // carries an f64 tail lane (IM_Z_STEP_LO) because the engine
+            // multiplies the full f64 param.
+            let depth_steps = -(wrap_segment as f32);
+            let z_tail_folded = fma(depth_steps, items[io + IM_Z_STEP_LO], items[io + IM_ORIGIN_Z]);
+            let z_stepped = fma(depth_steps, items[io + IM_Z_STEP], z_tail_folded);
+            let z_banded = fma(band as f32, items[io + IM_DEPTH_PER_BAND], z_stepped);
+            lm[mo + LM_Z] = fma(x_page as f32, items[io + IM_DEPTH_PER_COL], z_banded);
         }
     }
 }
@@ -4697,21 +4701,21 @@ pub fn repo_check(ctx: &GpuContext, dir: &Path) -> ! {
                 } else {
                     0
                 };
-                let seg = if prm.wrap_width > 0 {
+                let wrap_segment = if prm.wrap_width > 0 {
                     got_col as i64 / prm.wrap_width as i64
                 } else {
                     0
                 };
-                ctx = Some((y_page % wide, seg));
+                ctx = Some((y_page % wide, wrap_segment));
             }
             match k {
-                0 => x_m[ctx.map(|(m, _)| m).unwrap_or(0).min(3) as usize] += 1,
+                0 => x_m[ctx.map(|(page_col, _)| page_col).unwrap_or(0).min(3) as usize] += 1,
                 1 => {
                     if got_row > 2048 {
                         y_big_row += 1;
                     }
                 }
-                2 => z_seg[ctx.map(|(_, s)| s).unwrap_or(0).min(3) as usize] += 1,
+                2 => z_seg[ctx.map(|(_, seg_idx)| seg_idx).unwrap_or(0).min(3) as usize] += 1,
                 _ => {}
             }
             if rel > 1e-4 {
