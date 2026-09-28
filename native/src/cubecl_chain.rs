@@ -2153,6 +2153,35 @@ fn paginate(
 
 // ── the driver ────────────────────────────────────────────────────────────────
 
+/// The corpus packed four bytes per u32 word for the device decode, tail
+/// lanes of the final word filled with 0x80 — a CONTINUATION lead, which the
+/// lenient classifier reads as a non-leader. Zero pads instead classify as
+/// phantom 1-byte NUL leaders with a resolved advance: every byte-indexed
+/// kernel bounds itself by the rounded-UP word count, so scan totals inflate
+/// and phantom statics writes land past buffers sized by the real n —
+/// discarded by WGSL's robustness on Metal (why every gate stayed green
+/// through the bug), real out-of-bounds writes on non-robust backends.
+/// Found by the rung-4 grounding review.
+///
+/// The fill is a SEPARATE pass because the first landing guarded it with
+/// `if i < n` inside the loop over the real bytes — a branch that can never
+/// fire — and every gate stayed green through the no-op: trailing phantom
+/// records self-truncate past `total_records`, so no device gate can see the
+/// class (the fork gate's attempted mutation was dropped for exactly this).
+/// The reddening witness is the unit test in this file; the classifier's
+/// continuation rule itself is fenced by the real-byte flags diffs.
+fn pack_words(bytes: &[u8]) -> Vec<u32> {
+    let n_words = bytes.len().div_ceil(4);
+    let mut packed = vec![0u32; n_words];
+    for (i, &b) in bytes.iter().enumerate() {
+        packed[i >> 2] |= (b as u32) << ((i & 3) * 8);
+    }
+    for i in bytes.len()..(n_words * 4) {
+        packed[i >> 2] |= 0x80u32 << ((i & 3) * 8);
+    }
+    packed
+}
+
 pub fn run(ctx: &GpuContext, fixture_path: &Path) -> ! {
     let fx = crate::fixture::load_pipe_fixture(fixture_path).unwrap_or_else(|e| {
         eprintln!("cubecl-chain-check: {e}");
@@ -2758,19 +2787,7 @@ pub fn decode_check(ctx: &GpuContext, fixture_path: &Path) -> ! {
     let _ = crate::fold::decode_all(&fx.bytes, &mut slots, &fx.trie);
 
     let n_words = n.div_ceil(4);
-    // Tail-lane padding: any byte past the corpus in the last word packs as
-    // 0x80 — a CONTINUATION lead, which the lenient classifier reads as a
-    // non-leader. Packing them as zero instead made each one a phantom
-    // 1-byte NUL leader with a resolved advance: every byte-indexed kernel
-    // bounds itself by the rounded-UP word count, so the scan totals
-    // inflated and the phantom statics writes landed past buffers sized by
-    // the real n — discarded by WGSL's robustness, real OOB on other
-    // backends. Found by the rung-4 grounding review.
-    let mut packed = vec![0u32; n_words];
-    for (i, &b) in fx.bytes.iter().enumerate() {
-        let lane = if i < n { b as u32 } else { 0x80u32 };
-        packed[i >> 2] |= lane << ((i & 3) * 8);
-    }
+    let packed = pack_words(&fx.bytes);
     let setup = WgpuSetup {
         instance: ctx.instance.clone(),
         adapter: ctx.adapter.clone(),
@@ -2961,19 +2978,7 @@ pub fn cluster_check(ctx: &GpuContext, fixture_path: &Path) -> ! {
     }
 
     let n_words = n.div_ceil(4);
-    // Tail-lane padding: any byte past the corpus in the last word packs as
-    // 0x80 — a CONTINUATION lead, which the lenient classifier reads as a
-    // non-leader. Packing them as zero instead made each one a phantom
-    // 1-byte NUL leader with a resolved advance: every byte-indexed kernel
-    // bounds itself by the rounded-UP word count, so the scan totals
-    // inflated and the phantom statics writes landed past buffers sized by
-    // the real n — discarded by WGSL's robustness, real OOB on other
-    // backends. Found by the rung-4 grounding review.
-    let mut packed = vec![0u32; n_words];
-    for (i, &b) in fx.bytes.iter().enumerate() {
-        let lane = if i < n { b as u32 } else { 0x80u32 };
-        packed[i >> 2] |= lane << ((i & 3) * 8);
-    }
+    let packed = pack_words(&fx.bytes);
     let (seq, seq_max, bitmap_advance) = match fx.trie.cluster_table() {
         Some((s, m, a)) => (s.to_vec(), m, a),
         None => (Vec::new(), 2u32, f32::NAN),
@@ -3423,15 +3428,10 @@ pub fn bench(ctx: &GpuContext, corpus_path: &Path) -> ! {
             client.create_from_slice(bytemuck::cast_slice(&hgv)),
         )
     };
-    // The decode's inputs: the corpus packed four bytes per word, and the
-    // atlas trie's tables pre-converted to world units.
-    // Tail lanes pack as 0x80 (continuation = non-leader), not zero —
-    // see decode_check's padding note. Zero pads made phantom NUL leaders.
-    let mut packed = vec![0u32; n_words];
-    for (i, &b) in bytes.iter().enumerate() {
-        let lane = if i < n { b as u32 } else { 0x80u32 };
-        packed[i >> 2] |= lane << ((i & 3) * 8);
-    }
+    // The decode's inputs: the corpus packed four bytes per word (tail lanes
+    // 0x80 — see pack_words), and the atlas trie's tables pre-converted to
+    // world units.
+    let packed = pack_words(&bytes);
     let (bi, bm, bc, bshift) = trie.device_tables();
     let h_bytes = client.create_from_slice(bytemuck::cast_slice(&packed));
     let h_bi = client.create_from_slice(bytemuck::cast_slice(&bi));
@@ -4224,13 +4224,7 @@ pub(crate) fn run_repo_chain(
     };
     let cdev = cubecl::wgpu::init_device(setup, Default::default());
     let client = cubecl::Device::Wgpu(cdev).client();
-    // Tail lanes pack as 0x80 (continuation = non-leader), not zero —
-    // see decode_check's padding note. Zero pads made phantom NUL leaders.
-    let mut packed = vec![0u32; n_words];
-    for (i, &b) in bytes.iter().enumerate() {
-        let lane = if i < n { b as u32 } else { 0x80u32 };
-        packed[i >> 2] |= lane << ((i & 3) * 8);
-    }
+    let packed = pack_words(bytes);
     let (bi, bm, bc, bshift) = trie.device_tables();
     let h_bytes = client.create_from_slice(bytemuck::cast_slice(&packed));
     let h_bi = client.create_from_slice(bytemuck::cast_slice(&bi));
@@ -4902,4 +4896,30 @@ pub fn repo_check(ctx: &GpuContext, dir: &Path) -> ! {
         total * 5
     );
     std::process::exit(0);
+}
+
+#[cfg(test)]
+mod tests {
+    /// The phantom-tail class (see pack_words): a non-word-aligned corpus
+    /// must fill the final word's tail lanes with 0x80 continuation leads —
+    /// zero pads decode on device as phantom NUL leaders. This test is the
+    /// reddening witness for the `tail-pads-zero` mutation: the device gates
+    /// cannot carry it (trailing phantom records self-truncate past the
+    /// record count, so the cubecl gates stay green through the bug — the
+    /// fork gate's attempted mutation was dropped for exactly that), while
+    /// the classifier's continuation rule they DO fence is only half the
+    /// class. Three of the five cubecl-chain gate fixtures are
+    /// non-word-aligned; the standing fork corpus's 278,470 bytes are too.
+    #[test]
+    fn pack_words_fills_tail_lanes() {
+        assert_eq!(super::pack_words(&[0x41]), vec![0x8080_8041u32]);
+        assert_eq!(super::pack_words(&[0x41, 0x42]), vec![0x8080_4241u32]);
+        // Word-aligned input: no fill, the words carry exactly the bytes.
+        assert_eq!(
+            super::pack_words(&[0x41, 0x42, 0x43, 0x44]),
+            vec![0x4443_4241u32]
+        );
+        // Empty input: no words at all (the pre-helper behavior).
+        assert!(super::pack_words(&[]).is_empty());
+    }
 }

@@ -686,6 +686,12 @@ fn gate_cargo_test(m: &Manifest) -> bool {
         println!("{l}");
     }
     if !good {
+        // Name the failing tests — the engine-check gate's failure path
+        // carries the same note: printing only the summary discards WHY it
+        // reddened, and a mutation's `expect` needs the reason in the text.
+        for l in out.lines().filter(|l| l.contains("FAILED") || l.starts_with("panicked")) {
+            println!("      {l}");
+        }
         println!("FAIL  cargo test");
         return false;
     }

@@ -25,7 +25,7 @@
 # Ratchet, NOT an equality: tests are added constantly, so an exact pin would
 # redden on the most common good action in the repo. A green run whose real
 # count exceeds the floor prints a NOTE naming the value to raise it to.
-test_floor = 114
+test_floor = 115
 
 # ── Products ─────────────────────────────────────────────────────────────
 
@@ -841,3 +841,17 @@ op = "replace"
 find = "            let o = base[it] + wc[b];"
 with = "        let o = base[it];"
 expect = "record mismatches"
+
+[[mutation]]
+name = "tail-pads-zero"
+gate = "cargo-test"
+why = "the packed corpus's tail lanes must be 0x80 continuation leads; zero pads decode on device as phantom NUL leaders with a resolved advance, and every byte-indexed kernel inherits the rounded-up word bound. Invisible to every device gate (trailing phantom records self-truncate past total_records — the fork gate's attempted mutation was dropped for exactly this), real OOB writes on non-robust backends, so the reddening witness is the host unit test. CONSUMED BY: decode's flags lane, which every byte-indexed kernel reads"
+file = "native/src/cubecl_chain.rs"
+rebuild = "cargo build --release"
+op = "replace"
+find = """    for i in bytes.len()..(n_words * 4) {
+        packed[i >> 2] |= 0x80u32 << ((i & 3) * 8);
+    }
+"""
+with = ""
+expect = "pack_words_fills_tail_lanes"
