@@ -406,6 +406,31 @@ fails if nothing was in domain — which is the right pattern. Blind to a fault
 shared by both loaders in parse parity (there is no third parser), and blind,
 silently, to any fixture outside `text.rs`'s domain.
 
+**cubecl-chain** (2026-09-28). The CubeCL device chain versus the CPU scan
+reference (`scan.rs`) over five fixtures (wrapback-long-line, paged-rows,
+paged-cols, multi-item, cluster-flags): counts and rows exact, fold>0 X
+bit-exact, line_adv and positions at the 1e-4 eps tier, the emitted record
+stream tier-diffed per leader. Red on divergence. Blind to everything outside
+the five fixtures, to the ENGINE (this is chain-vs-CPU-scan; engine parity is
+the fork gate's claim), and to the device decode and cluster stages — this
+driver uploads CPU-computed statics, so no packed byte is ever classified on
+device here. The phantom-tail class is therefore fenced by `pack_words`' unit
+test (the `tail-pads-zero` mutation), not by any device gate.
+
+**cubecl-fork** (2026-09-28). `--cubecl-repo-check` in STRICT mode over the
+standing fork fixture (`native/fixtures/cubecl-fork`, IMMUTABLE): the full
+from-bytes chain's records versus the ENGINE's batched records, BIT-exact,
+with the fork census's m >= 3 and seg >= 3 buckets proven exercised — an
+unexercised corpus is a FAIL, so the fixture cannot quietly stop covering the
+paginate arithmetic classes. The gate runs the fixture TWICE: at the default
+chunk and at `GLYPH_RECORD_CHUNK=60000` (five emit windows), so the chunked
+emitter's `rec_first` carry is fenced on an ordinary corpus; the
+`emitter-window-offset-dropped` mutation reddens only through the chunked
+pass. Blind to corpora outside the fixture, to a fault the engine and chain
+share (ground truth layers: engine-check, reference-port), and to non-robust
+backend behavior (Metal discards the phantom-class writes; see the mutation's
+`why`).
+
 ### What the whole battery cannot see
 
 Worth holding in one place, because each check's blind spot is defensible alone
