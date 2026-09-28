@@ -22,10 +22,7 @@ use std::time::{Duration, Instant};
 
 use crate::engine::Engine;
 use crate::glyph_scene::GroupRow;
-use crate::layout::{
-    diff_backends, BackendOutput, GlyphArena, GlyphRecord, ItemParams, LayoutGlyphs, LayoutItem,
-    Paint, VerifyLayout,
-};
+use crate::layout::{BackendOutput, GlyphArena, GlyphRecord, ItemParams, ItemPlacement, LayoutError, LayoutGlyphs, LayoutItem, Paint, VerifyLayout, diff_backends};
 use crate::layout_mojo::{BackendPhases, MojoLayout, Strategy};
 use crate::text::{self, StagedText};
 
@@ -533,7 +530,64 @@ pub fn load_repo_from_walk(
         })
         .collect();
 
-    let mut backend = MojoLayout::new(strategy);
+    // The seam's one branch point: Cubecl crosses into the device chain,
+    // everything else into Mojo. A local enum rather than a second
+    // code path per call site — the recording/verify flow below is the
+    // backend's OWN contract either way.
+    enum Backend {
+        Mojo(MojoLayout),
+        Cubecl(crate::cubecl_layout::CubeclLayout),
+    }
+    impl LayoutGlyphs for Backend {
+        fn name(&self) -> &'static str {
+            match self {
+                Backend::Mojo(b) => b.name(),
+                Backend::Cubecl(b) => b.name(),
+            }
+        }
+        fn load_trie_file(&mut self, path: &Path) -> Result<(), LayoutError> {
+            match self {
+                Backend::Mojo(b) => b.load_trie_file(path),
+                Backend::Cubecl(b) => b.load_trie_file(path),
+            }
+        }
+        fn layout_validated_items(
+            &mut self,
+            items: &[LayoutItem<'_>],
+            arena: &mut GlyphArena,
+        ) -> Result<Vec<ItemPlacement>, LayoutError> {
+            match self {
+                Backend::Mojo(b) => b.layout_validated_items(items, arena),
+                Backend::Cubecl(b) => b.layout_validated_items(items, arena),
+            }
+        }
+    }
+    impl Backend {
+        /// The Mojo backend's phase meter (load stats); the cubecl path
+        /// reports its own timings from the chain stream.
+        fn phases(&self) -> BackendPhases {
+            match self {
+                Backend::Mojo(b) => b.phases(),
+                Backend::Cubecl(_) => BackendPhases::default(),
+            }
+        }
+    }
+    impl VerifyLayout for Backend {
+        fn layout_validated_items_recording(
+            &mut self,
+            items: &[LayoutItem<'_>],
+            arena: &mut GlyphArena,
+        ) -> Result<(Vec<ItemPlacement>, Vec<GlyphRecord>), LayoutError> {
+            match self {
+                Backend::Mojo(b) => b.layout_validated_items_recording(items, arena),
+                Backend::Cubecl(b) => b.layout_validated_items_recording(items, arena),
+            }
+        }
+    }
+    let mut backend = match strategy {
+        Strategy::Cubecl => Backend::Cubecl(crate::cubecl_layout::CubeclLayout::new()),
+        other => Backend::Mojo(MojoLayout::new(other)),
+    };
     backend
         .load_trie_file(trie)
         .expect("failed to load engine trie");
@@ -570,7 +624,7 @@ pub fn load_repo_from_walk(
         // other, which is the pairing that existed before it.
         let other = match strategy {
             Strategy::Batched => Strategy::PerItem,
-            Strategy::PerItem | Strategy::Direct => Strategy::Batched,
+            Strategy::PerItem | Strategy::Direct | Strategy::Cubecl => Strategy::Batched,
         };
         let mut alt = MojoLayout::new(other);
         alt.load_trie_file(trie)
@@ -832,14 +886,15 @@ impl RepoLoad {
         );
         println!(
             "repo: {} engine records -> {} glyph instances ({} blank/missing dropped) \
-             | backend: mojo-cpu/{}{}",
+             | backend: {}{}",
             s.records,
             s.instances,
             s.blanks,
             match s.strategy {
-                Strategy::Batched => "batched",
-                Strategy::PerItem => "per-item",
-                Strategy::Direct => "direct",
+                Strategy::Batched => "mojo-cpu/batched",
+                Strategy::PerItem => "mojo-cpu/per-item",
+                Strategy::Direct => "mojo-cpu/direct",
+                Strategy::Cubecl => "device/cubecl (rung 4: readback path)",
             },
             if s.verified { " (verified bit-exact vs the other strategy)" } else { "" },
         );

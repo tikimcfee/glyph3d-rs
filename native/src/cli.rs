@@ -54,6 +54,7 @@ pub(crate) fn parse_strategy(s: &str) -> layout_mojo::Strategy {
         "naive" => Strategy::PerItem,
         "batch" => Strategy::Batched,
         "direct" => Strategy::Direct,
+        "cubecl" => Strategy::Cubecl,
         other => panic!("--repo-engine: unknown mode {other:?} (clap should have refused it)"),
     }
 }
@@ -183,7 +184,7 @@ pub(crate) struct Cli {
     /// chunk rather than the corpus. The record strategies remain because they
     /// are the verification form: `VerifyLayout` needs a wire stream, and
     /// `--repo-verify` diffs whichever pair you name.
-    #[arg(long, value_name = "MODE", default_value = "direct", value_parser = ["naive", "batch", "direct"])]
+    #[arg(long, value_name = "MODE", default_value = "direct", value_parser = ["naive", "batch", "direct", "cubecl"])]
     pub(crate) repo_engine: String,
     /// Diff the chosen strategy against a counterpart, bit-exact over the
     /// whole repo: placements and instances always, wire records when both

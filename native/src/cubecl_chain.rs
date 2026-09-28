@@ -4094,60 +4094,35 @@ pub fn bench(ctx: &GpuContext, corpus_path: &Path) -> ! {
 // ItemPlacement.record_count, so the stream alignment itself is part of the
 // fence: a divergent count shifts every later record and the exact lanes
 // catch it wholesale.
-pub fn repo_check(ctx: &GpuContext, dir: &Path) -> ! {
-    use crate::layout::{LayoutGlyphs as _, VerifyLayout as _};
-    let t_all = std::time::Instant::now();
-    // The renderer's default shape: wrap BACK, cluster on, the tuned grid
-    // pagination from RepoParams::default().
-    let params = crate::repo::RepoParams {
-        wrap_mode: WrapMode::Back,
-        cluster_mode: crate::fold::ClusterMode::Cluster,
-        ..Default::default()
-    };
-    let walk = crate::repo::walk_repo(dir);
-    let file_params: Vec<crate::layout::ItemParams> = walk
-        .files
-        .iter()
-        .map(|f| {
-            let newlines = f.bytes.iter().filter(|&&b| b == b'\n').count();
-            crate::repo::file_item_params(&params, f.bytes.len(), newlines)
-        })
-        .collect();
-    let item_count = walk.files.len();
-    let n: usize = walk.files.iter().map(|f| f.bytes.len()).sum();
+/// THE DEVICE LOAD PATH — bytes and per-file items in, the record stream
+/// out. Both `repo_check` (the fence) and `CubeclLayout` (the product)
+/// call THIS function: a second copy of the driver would mean the gate no
+/// longer fences the path the renderer runs, which is the entire point of
+/// the cubecl-fork gate.
+pub(crate) struct ChainStream {
+    /// 8 u32 per record (x, y, z, advance, height, gi, row, col), items in
+    /// walk order, ordinal order within items.
+    pub records: Vec<u32>,
+    /// Per-item first-record index (the CPU leader scan's prefix sums).
+    pub rec_base: Vec<u32>,
+    pub total_records: u32,
+    /// The ranked chain's candidate count (diagnostics).
+    pub candidates: usize,
+    pub chain_dur: std::time::Duration,
+    pub readback_dur: std::time::Duration,
+}
 
+#[allow(clippy::too_many_lines)]
+pub(crate) fn run_repo_chain(
+    ctx: Option<&crate::gpu::GpuContext>,
+    bytes: &[u8],
+    items: &[crate::fold::Item],
+) -> ChainStream {
+    let item_count = items.len();
+    let n: usize = bytes.len();
+    let fis = items;
     // ── the chain side ────────────────────────────────────────────────────
     let t_chain0 = std::time::Instant::now();
-    let mut bytes = Vec::with_capacity(n);
-    let mut fis = Vec::with_capacity(item_count);
-    let mut off = 0usize;
-    for (i, f) in walk.files.iter().enumerate() {
-        let p = &file_params[i];
-        bytes.extend_from_slice(&f.bytes);
-        fis.push(crate::fold::Item {
-            byte_start: off as i64,
-            byte_count: f.bytes.len() as i64,
-            origin_x: p.origin_x,
-            origin_y: p.origin_y,
-            origin_z: p.origin_z,
-            wrap_width: p.wrap_width as i64,
-            wrap_mode: p.wrap_mode,
-            cluster_mode: p.cluster_mode,
-            z_step: p.z_step,
-            line_height: p.line_height,
-            has_page: p.has_page,
-            page_rows: p.page_rows as i64,
-            page_cols: p.page_cols as i64,
-            scroll_rows: p.scroll_rows as i64,
-            pages_wide: p.pages_wide as i64,
-            page_gap_x: p.page_gap_x,
-            band_stride_y: p.band_stride_y,
-            depth_per_band: p.depth_per_band,
-            depth_per_col: p.depth_per_col,
-            page_line_height: p.page_line_height,
-        });
-        off += f.bytes.len();
-    }
     // Per-item record bases, from a CPU leader scan of the corpus (the
     // forward ordinal domain). The ENGINE's own per-item counts still fence
     // the alignment — the diff's counts gate — but running the engine
@@ -4160,7 +4135,7 @@ pub fn repo_check(ctx: &GpuContext, dir: &Path) -> ! {
     {
         let mut i = 0usize;
         let mut idx = 0usize;
-        let corpus = bytes.as_slice();
+        let corpus = bytes;
         while i < n {
             while idx + 1 < item_count && (fis[idx + 1].byte_start as usize) <= i {
                 idx += 1;
@@ -4196,13 +4171,13 @@ pub fn repo_check(ctx: &GpuContext, dir: &Path) -> ! {
             std::process::exit(1);
         }
     };
-    let (bitmap, ic) = cluster_host_inputs(&seq, seq_max, &fis);
+    let (bitmap, ic) = cluster_host_inputs(&seq, seq_max, fis);
     let (poff, pval) = cluster_pair_filter(&seq, seq_max);
     let mut ir = Vec::with_capacity(item_count * 2);
     let mut ie = Vec::with_capacity(item_count * IE_STRIDE);
     let mut im = Vec::with_capacity(item_count * IM_STRIDE);
     let mut page_gap_x = Vec::with_capacity(item_count);
-    for item in &fis {
+    for item in fis {
         ir.push(item.byte_start as u32);
         ir.push((item.byte_start + item.byte_count) as u32);
         ie.push(item.page_rows as u32);
@@ -4229,11 +4204,22 @@ pub fn repo_check(ctx: &GpuContext, dir: &Path) -> ! {
         page_gap_x.push(item.page_gap_x as f32);
     }
 
+    // Share the caller's device when there is one; the product backend
+    // constructs its own (a second device is the rung-4 compromise —
+    // rung 5's direct bind merges them).
+    let owned_ctx;
+    let ctx_ref = match ctx {
+        Some(c) => c,
+        None => {
+            owned_ctx = pollster::block_on(crate::gpu::init(None));
+            &owned_ctx
+        }
+    };
     let setup = WgpuSetup {
-        instance: ctx.instance.clone(),
-        adapter: ctx.adapter.clone(),
-        device: ctx.device.clone(),
-        queue: ctx.queue.clone(),
+        instance: ctx_ref.instance.clone(),
+        adapter: ctx_ref.adapter.clone(),
+        device: ctx_ref.device.clone(),
+        queue: ctx_ref.queue.clone(),
         backend: AutoGraphicsApi::backend(),
     };
     let cdev = cubecl::wgpu::init_device(setup, Default::default());
@@ -4282,11 +4268,11 @@ pub fn repo_check(ctx: &GpuContext, dir: &Path) -> ! {
     let h_extent =
         client.create_from_slice(bytemuck::cast_slice(&vec![0x8000_0000u32; item_count * 2]));
     let mut walk_plan: Vec<u32> = Vec::with_capacity(item_count * 3);
-    for (i, prm) in file_params.iter().enumerate() {
-        let width = if prm.wrap_width > 0 {
-            prm.wrap_width
-        } else if prm.has_page {
-            prm.page_cols
+    for (i, item) in fis.iter().enumerate() {
+        let width = if item.wrap_width > 0 {
+            item.wrap_width
+        } else if item.has_page {
+            item.page_cols
         } else {
             0
         };
@@ -4577,63 +4563,78 @@ pub fn repo_check(ctx: &GpuContext, dir: &Path) -> ! {
         let csv: &[u32] = bytemuck::cast_slice(&cb);
         recs_all.extend_from_slice(&csv[..take * 8]);
         first += take;
+    }    ChainStream {
+        records: recs_all,
+        rec_base,
+        total_records,
+        candidates: c,
+        chain_dur: t_chain0.elapsed(),
+        readback_dur: t_rb.elapsed(),
     }
-    if std::env::var_os("GLYPH_CHAIN_DEBUG").is_some() {
-        let st = client.read_one(h_strides.clone()).expect("strides");
-        let stv: &[f32] = bytemuck::cast_slice(&st);
-        let xm = client.read_one(h_xmax.clone()).expect("xmax");
-        let xmv: &[u32] = bytemuck::cast_slice(&xm);
-        println!(
-            "  dbg strides[0..4] = {:?} xmax[0..4] = {:?} (decoded {:?})",
-            &stv[..item_count.min(4)],
-            &xmv[..item_count.min(4)],
-            xmv[..item_count.min(4)].iter().map(|&k| f32::from_bits(k)).collect::<Vec<_>>()
-        );
-        let bb = client.read_one(h_bytes.clone()).expect("bytes");
-        let bbw: &[u32] = bytemuck::cast_slice(&bb);
-        println!("  dbg bytes[0..4] = {:08x} {:08x} {:08x} {:08x}", bbw[0], bbw[1], bbw[2], bbw[3]);
-        let fb = client.read_one(h_fl.clone()).expect("fl");
-        let fbw: &[u32] = bytemuck::cast_slice(&fb);
-        println!("  dbg fl[0..4]    = {:08x} {:08x} {:08x} {:08x}", fbw[0], fbw[1], fbw[2], fbw[3]);
-        let wcb = client.read_one(h_wc.clone()).expect("wc");
-        let wcv: &[u32] = bytemuck::cast_slice(&wcb);
-        println!("  dbg wc[0..16]   = {:?}", &wcv[..16]);
-        let lcb = client.read_one(h_lc.clone()).expect("lc");
-        let lcv: &[u32] = bytemuck::cast_slice(&lcb);
-        println!("  dbg lc[0..8]    = {:?}", &lcv[..8]);
-        let smb = client.read_one(h_sm.clone()).expect("sm");
-        let smv: &[f32] = bytemuck::cast_slice(&smb);
-        println!("  dbg sm[0..8]    = {:?}", &smv[..8]);
-        let tcb = client.read_one(h_tc.clone()).expect("tc");
-        let tcv: &[u32] = bytemuck::cast_slice(&tcb);
-        println!("  dbg tc[0..8]    = {:?}", &tcv[..8]);
+}
+
+pub fn repo_check(ctx: &GpuContext, dir: &Path) -> ! {
+    use crate::layout::{LayoutGlyphs as _, VerifyLayout as _};
+    let t_all = std::time::Instant::now();
+    // The renderer's default shape: wrap BACK, cluster on, the tuned grid
+    // pagination from RepoParams::default().
+    let params = crate::repo::RepoParams {
+        wrap_mode: WrapMode::Back,
+        cluster_mode: crate::fold::ClusterMode::Cluster,
+        ..Default::default()
+    };
+    let walk = crate::repo::walk_repo(dir);
+    let file_params: Vec<crate::layout::ItemParams> = walk
+        .files
+        .iter()
+        .map(|f| {
+            let newlines = f.bytes.iter().filter(|&&b| b == b'\n').count();
+            crate::repo::file_item_params(&params, f.bytes.len(), newlines)
+        })
+        .collect();
+    let item_count = walk.files.len();
+    let n: usize = walk.files.iter().map(|f| f.bytes.len()).sum();
+    let mut bytes = Vec::with_capacity(n);
+    let mut fis = Vec::with_capacity(item_count);
+    let mut off = 0usize;
+    for (i, f) in walk.files.iter().enumerate() {
+        let p = &file_params[i];
+        bytes.extend_from_slice(&f.bytes);
+        fis.push(crate::fold::Item {
+            byte_start: off as i64,
+            byte_count: f.bytes.len() as i64,
+            origin_x: p.origin_x,
+            origin_y: p.origin_y,
+            origin_z: p.origin_z,
+            wrap_width: p.wrap_width as i64,
+            wrap_mode: p.wrap_mode,
+            cluster_mode: p.cluster_mode,
+            z_step: p.z_step,
+            line_height: p.line_height,
+            has_page: p.has_page,
+            page_rows: p.page_rows as i64,
+            page_cols: p.page_cols as i64,
+            scroll_rows: p.scroll_rows as i64,
+            pages_wide: p.pages_wide as i64,
+            page_gap_x: p.page_gap_x,
+            band_stride_y: p.band_stride_y,
+            depth_per_band: p.depth_per_band,
+            depth_per_col: p.depth_per_col,
+            page_line_height: p.page_line_height,
+        });
+        off += f.bytes.len();
     }
-    // Free every dead buffer BEFORE the record readback — the instrument's
-    // own peak memory, not the chain's: at the 97MB repo shape the live set
-    // (engine records on host + every chain buffer on device + the incoming
-    // readback) brushes a 16GB machine's ceiling, and the failure mode is
-    // silently-zero readbacks, not an error. The product path (rung 5) holds
-    // none of this — it binds instead of reading back.
-    drop((h_bytes, h_bi, h_bm, h_bc, h_seq, h_bmap, h_poff, h_pval, h_ic));
-    drop((h_ir, h_ie, h_im, h_gap, h_fl, h_sm, h_gi, h_hgt));
-    drop((h_cslot, h_cend, h_ctc, h_cup, h_cxc, h_ctotal));
-    drop((h_hp, h_lvl, h_parent, h_parent_b, h_d0, h_d_a, h_d_b, h_roots));
-    drop((h_tc, h_tm, h_xc, h_xm, h_lc, h_wm, h_wc, h_otb));
-    if std::env::var_os("GLYPH_CHAIN_DEBUG").is_some() {
-        let sb = client.read_one(h_strides.clone()).expect("read strides");
-        let sf: &[f32] = bytemuck::cast_slice(&sb);
-        for i in 0..sf.len() / 2 {
-            println!("  dbg stride[{i}] = hi {:e} ({:#x}) lo {:e} ({:#x})", sf[i * 2], sf[i * 2].to_bits(), sf[i * 2 + 1], sf[i * 2 + 1].to_bits());
-        }
-    }
-    drop((h_lm, h_strides, h_rmax, h_xmax, h_base));
-    drop((packed, bitmap, poff, pval, seq));
-    drop(h_recs);
-    let chain_dt = t_chain0.elapsed();
+
+    // ── the chain side — THE load path, shared with CubeclLayout ────────
+    let stream = run_repo_chain(Some(ctx), &bytes, &fis);
+    let recs_all = stream.records;
+    let total_records = stream.total_records;
+    let c = stream.candidates;
+    let chain_dt = stream.chain_dur;
+    let readback_dt = stream.readback_dur;
     if std::env::var_os("GLYPH_CHAIN_DEBUG").is_some() {
         println!("  dbg recs[0..16] = {:?}", &recs_all[..16]);
     }
-    let readback_dt = t_rb.elapsed();
     let recs: &[u32] = &recs_all;
 
     // ── the engine side, SECOND — records for the same items, run after the

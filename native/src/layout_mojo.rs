@@ -68,6 +68,11 @@ pub enum Strategy {
     /// which is the point. `--repo-verify` diffs it against `Batched` at the
     /// seam instead, where the comparison is instances and placements.
     Direct,
+    /// Zero crossings into Mojo: the CubeCL device chain, records read back
+    /// and compacted on host (rung 4's flip — rung 5 binds the buffers
+    /// directly and the readback dies). CAN record: the stream exists until
+    /// the compaction consumes it.
+    Cubecl,
 }
 
 /// Where a load's time goes inside the backend, accumulated across items.
@@ -165,7 +170,7 @@ impl Strategy {
 
     pub fn can_record(self) -> bool {
         match self {
-            Strategy::Batched | Strategy::PerItem => true,
+            Strategy::Batched | Strategy::PerItem | Strategy::Cubecl => true,
             Strategy::Direct => false,
         }
     }
@@ -202,6 +207,9 @@ impl MojoLayout {
     ) -> Result<Vec<ItemPlacement>, LayoutError> {
         let mut placements = Vec::with_capacity(items.len());
         match self.strategy {
+            // The Cubecl variant never reaches MojoLayout (the seam routes
+            // it to CubeclLayout); the arm exists for exhaustiveness.
+            Strategy::Cubecl => unreachable!("CubeclLayout owns the cubecl strategy"),
             Strategy::Batched => {
                 let total_bytes = items.iter().map(|i| i.bytes.len()).sum();
                 let mut blob = Vec::with_capacity(total_bytes);
@@ -361,6 +369,10 @@ impl LayoutGlyphs for MojoLayout {
             Strategy::Batched => "mojo-cpu/batched",
             Strategy::PerItem => "mojo-cpu/per-item",
             Strategy::Direct => "mojo-cpu/direct",
+            // Cubecl never runs ON MojoLayout — the seam routes it to
+            // CubeclLayout — but the enum is shared, so the arm must say
+            // what it would be. Unreachable in practice.
+            Strategy::Cubecl => "cubecl",
         }
     }
 

@@ -33,6 +33,7 @@ mod cli;
 mod cubecl_smoke;
 mod cubecl_scan;
 mod cubecl_chain;
+mod cubecl_layout;
 mod engine;
 mod fixture;
 mod fold;
