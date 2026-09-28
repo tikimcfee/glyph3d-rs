@@ -2544,9 +2544,18 @@ pub fn decode_check(ctx: &GpuContext, fixture_path: &Path) -> ! {
     let _ = crate::fold::decode_all(&fx.bytes, &mut slots, &fx.trie);
 
     let n_words = n.div_ceil(4);
+    // Tail-lane padding: any byte past the corpus in the last word packs as
+    // 0x80 — a CONTINUATION lead, which the lenient classifier reads as a
+    // non-leader. Packing them as zero instead made each one a phantom
+    // 1-byte NUL leader with a resolved advance: every byte-indexed kernel
+    // bounds itself by the rounded-UP word count, so the scan totals
+    // inflated and the phantom statics writes landed past buffers sized by
+    // the real n — discarded by WGSL's robustness, real OOB on other
+    // backends. Found by the rung-4 grounding review.
     let mut packed = vec![0u32; n_words];
     for (i, &b) in fx.bytes.iter().enumerate() {
-        packed[i >> 2] |= (b as u32) << ((i & 3) * 8);
+        let lane = if i < n { b as u32 } else { 0x80u32 };
+        packed[i >> 2] |= lane << ((i & 3) * 8);
     }
     let setup = WgpuSetup {
         instance: ctx.instance.clone(),
@@ -2738,9 +2747,18 @@ pub fn cluster_check(ctx: &GpuContext, fixture_path: &Path) -> ! {
     }
 
     let n_words = n.div_ceil(4);
+    // Tail-lane padding: any byte past the corpus in the last word packs as
+    // 0x80 — a CONTINUATION lead, which the lenient classifier reads as a
+    // non-leader. Packing them as zero instead made each one a phantom
+    // 1-byte NUL leader with a resolved advance: every byte-indexed kernel
+    // bounds itself by the rounded-UP word count, so the scan totals
+    // inflated and the phantom statics writes landed past buffers sized by
+    // the real n — discarded by WGSL's robustness, real OOB on other
+    // backends. Found by the rung-4 grounding review.
     let mut packed = vec![0u32; n_words];
     for (i, &b) in fx.bytes.iter().enumerate() {
-        packed[i >> 2] |= (b as u32) << ((i & 3) * 8);
+        let lane = if i < n { b as u32 } else { 0x80u32 };
+        packed[i >> 2] |= lane << ((i & 3) * 8);
     }
     let (seq, seq_max, bitmap_advance) = match fx.trie.cluster_table() {
         Some((s, m, a)) => (s.to_vec(), m, a),
@@ -3192,9 +3210,12 @@ pub fn bench(ctx: &GpuContext, corpus_path: &Path) -> ! {
     };
     // The decode's inputs: the corpus packed four bytes per word, and the
     // atlas trie's tables pre-converted to world units.
+    // Tail lanes pack as 0x80 (continuation = non-leader), not zero —
+    // see decode_check's padding note. Zero pads made phantom NUL leaders.
     let mut packed = vec![0u32; n_words];
     for (i, &b) in bytes.iter().enumerate() {
-        packed[i >> 2] |= (b as u32) << ((i & 3) * 8);
+        let lane = if i < n { b as u32 } else { 0x80u32 };
+        packed[i >> 2] |= lane << ((i & 3) * 8);
     }
     let (bi, bm, bc, bshift) = trie.device_tables();
     let h_bytes = client.create_from_slice(bytemuck::cast_slice(&packed));
@@ -3986,9 +4007,12 @@ pub fn repo_check(ctx: &GpuContext, dir: &Path) -> ! {
     };
     let cdev = cubecl::wgpu::init_device(setup, Default::default());
     let client = cubecl::Device::Wgpu(cdev).client();
+    // Tail lanes pack as 0x80 (continuation = non-leader), not zero —
+    // see decode_check's padding note. Zero pads made phantom NUL leaders.
     let mut packed = vec![0u32; n_words];
     for (i, &b) in bytes.iter().enumerate() {
-        packed[i >> 2] |= (b as u32) << ((i & 3) * 8);
+        let lane = if i < n { b as u32 } else { 0x80u32 };
+        packed[i >> 2] |= lane << ((i & 3) * 8);
     }
     let (bi, bm, bc, bshift) = trie.device_tables();
     let h_bytes = client.create_from_slice(bytemuck::cast_slice(&packed));
