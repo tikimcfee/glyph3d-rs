@@ -121,5 +121,3 @@ pub(super) fn byte_at(bytes: &[u32], i: usize, n: usize) -> u32 {
         0u32
     }
 }
-
-pub(super) use self::decode::launch_unchecked;
