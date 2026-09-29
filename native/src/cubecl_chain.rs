@@ -5085,8 +5085,10 @@ pub(crate) fn run_repo_chain(
         let chunk_slots = chunk_slots_cap.min(total_slots as usize).max(1);
         let h_out = client.empty(chunk_slots * 12 * 4);
         let mut first = 0usize;
+        let tail_debug = std::env::var_os("GLYPH_CHAIN_DEBUG").is_some();
         while first < total_slots as usize {
             let take = chunk_slots.min(total_slots as usize - first);
+            let t_win = std::time::Instant::now();
             let h_win = client.create_from_slice(bytemuck::cast_slice(&[first as u32]));
             unsafe {
                 pack_instances::launch_unchecked(
@@ -5113,9 +5115,13 @@ pub(crate) fn run_repo_chain(
                 );
             }
             if let Some(target) = &mapped {
+                let pack_wall = t_win.elapsed();
+                let t_flush = std::time::Instant::now();
                 let res = client
                     .get_resource::<WgpuServer<AutoCompiler>>(h_out.clone())
                     .expect("instance window resource");
+                let flush_wall = t_flush.elapsed();
+                let t_copy = std::time::Instant::now();
                 let r = res.resource();
                 let mut enc = device_ref.device.create_command_encoder(
                     &wgpu::CommandEncoderDescriptor {
@@ -5140,6 +5146,12 @@ pub(crate) fn run_repo_chain(
                     s += here;
                 }
                 device_ref.queue.submit([enc.finish()]);
+                if tail_debug {
+                    println!(
+                        "  tail window {first} (take {take}): pack+submit {pack_wall:?} | flush {flush_wall:?} | copy+submit {:?}",
+                        t_copy.elapsed()
+                    );
+                }
             } else {
                 let cb = client.read_one(h_out.clone()).expect("read instance chunk");
                 let csv: &[u32] = bytemuck::cast_slice(&cb);
@@ -5148,6 +5160,7 @@ pub(crate) fn run_repo_chain(
             first += take;
         }
         if copy_hop {
+            let t_wait = std::time::Instant::now();
             device_ref
                 .device
                 .poll(wgpu::PollType::Wait {
@@ -5155,6 +5168,9 @@ pub(crate) fn run_repo_chain(
                     timeout: None,
                 })
                 .expect("device poll after instance windows");
+            if tail_debug {
+                println!("  tail final wait: {:?}", t_wait.elapsed());
+            }
         }
         // Placements from the extent lanes — the same reduction the host
         // compaction performs (page over ALL records, ink over survivors),
