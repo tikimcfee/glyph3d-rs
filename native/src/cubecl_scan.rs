@@ -10,7 +10,7 @@
 //! Scope, deliberately: single-item fixtures, decode on CPU (the bench's
 //! "mode 0" shape). A HISTORICAL instrument: the phase-1 first kernel,
 //! kept for its bit-exact chunk-partial witness — the full chain
-//! (multi-item, spine, device decode, cluster) lives in `cubecl_chain.rs`.
+//! (multi-item, spine, device decode, cluster) lives in `cubecl_chain/`.
 //! Not wired into the battery: it touches a GPU.
 
 use std::path::Path;
