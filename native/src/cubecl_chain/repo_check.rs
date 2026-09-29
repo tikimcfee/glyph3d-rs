@@ -186,6 +186,7 @@ pub fn repo_check(ctx: &GpuContext, dir: &Path) -> ! {
     // the lane arithmetic must match compact_records_into exactly).
     let mut inst_bad = 0usize;
     let mut place_bad = 0usize;
+    let mut lane_bad = 0usize;
     if mode != ChainMode::Records {
         // Arena against arena: the chain side's slots live in
         // `chain_arena` whichever hop filled it (device copy or readback
@@ -221,6 +222,38 @@ pub fn repo_check(ctx: &GpuContext, dir: &Path) -> ! {
                         }
                     }
                     idx += 1;
+                }
+            }
+        }
+        // ── the LANE tier (note 23, E1): the endpoint's 32 B scatter vs
+        // the engine's 48 B arena, FIELD-wise. The slot word map drops
+        // row/col (records-fenced), flags and _pad: scatter [0..3] pos,
+        // [3] gi, [4] color, [5] group, [6] adv, [7] height against engine
+        // [0..3], [3], [6], [7], [8], [9]. This is the product form's
+        // fence BEFORE the renderer binds it (E2).
+        if !stream.slots.is_empty() {
+            const MAP: [usize; 8] = [0, 1, 2, 3, 6, 7, 8, 9];
+            if stream.slots.len() * 3 != eng_words.len() * 2 {
+                lane_bad += 1;
+                println!(
+                    "  LANE LENGTH MISMATCH: engine {} slots, scatter {} slots",
+                    eng_words.len() / 12,
+                    stream.slots.len() / 8
+                );
+            } else {
+                for s in 0..stream.slots.len() / 8 {
+                    for (f, &e) in MAP.iter().enumerate() {
+                        let a = eng_words[s * 12 + e];
+                        let b = stream.slots[s * 8 + f];
+                        if a != b {
+                            lane_bad += 1;
+                            if lane_bad <= 4 {
+                                println!(
+                                    "  LANE MISMATCH slot {s} field {f}: scatter {b:#x} engine {a:#x}"
+                                );
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -403,9 +436,9 @@ pub fn repo_check(ctx: &GpuContext, dir: &Path) -> ! {
         "  chain spans: prep {:?} | tables {:?} | init {:?} | pack+upload {:?} | dispatch {:?} (wall; cold-process JIT hides in dispatch)",
         phases.prep, phases.tables, phases.init, phases.upload, phases.dispatch
     );
-    if inst_bad > 0 || place_bad > 0 {
+    if inst_bad > 0 || place_bad > 0 || lane_bad > 0 {
         eprintln!(
-            "cubecl-repo-check FAIL: {inst_bad} instance mismatch words, {place_bad} placement mismatches"
+            "cubecl-repo-check FAIL: {inst_bad} instance mismatch words, {place_bad} placement mismatches, {lane_bad} lane mismatch words"
         );
         std::process::exit(1);
     }
@@ -471,6 +504,10 @@ pub fn repo_check(ctx: &GpuContext, dir: &Path) -> ! {
         println!(
             "instance tier: {} slots byte-equal, {} placements bit-equal (the pack kernel vs the engine-batched arena)",
             stream.total_slots, item_count
+        );
+        println!(
+            "lane tier: {} slots field-equal (the 8-word scatter vs the engine arena — the endpoint form, note 23 E1)",
+            stream.slots.len() / 8
         );
     }
     std::process::exit(0);

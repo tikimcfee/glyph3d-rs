@@ -13,7 +13,7 @@ use super::position::{derive_stride, extent_pair, paginate, resolve_x};
 use super::scan::{apply, spine_scan, tile_scan};
 use super::tail::{
     EXT_STRIDE, emit_records, item_totals, key_to_float_host, ordinal_scatter, ordered_key_host,
-    pack_instances, survivor_flags,
+    pack_instances, scatter_slots, survivor_flags,
 };
 use super::{IE_STRIDE, IM_STRIDE, LC_STRIDE, LM_STRIDE, PARTIAL_COUNT_STRIDE, pack_words};
 
@@ -144,6 +144,12 @@ pub(crate) struct ChainStream {
     /// (rung 5c): `instances` is empty by design and the arena only needs
     /// its `commit` — the slots never crossed to host.
     pub instances_on_device: bool,
+    /// 8 u32 per slot — the endpoint's 32 B form (pos, glyph_id, color,
+    /// group_id, advance, height; note 23's E1), walk order, survivor
+    /// order within items, written UNSLOT-WINDOWED at the global survivor
+    /// ordinal. EMPTY unless Both (E1 fences it in the gate; E2 makes it
+    /// the product form and retires `instances`).
+    pub slots: Vec<u32>,
     /// The ranked chain's candidate count (diagnostics).
     pub candidates: usize,
     pub chain_dur: std::time::Duration,
@@ -838,6 +844,7 @@ pub(crate) fn run_repo_chain(
         }
     }
     let mut inst_all: Vec<u32> = Vec::new();
+    let mut slots_all: Vec<u32> = Vec::new();
     let mut placements: Vec<crate::layout::ItemPlacement> = Vec::new();
     let mut instances_on_device = false;
     if wants_instances {
@@ -925,7 +932,6 @@ pub(crate) fn run_repo_chain(
                     BufferArg::from_raw_parts(h_groups.clone(), item_count),
                     BufferArg::from_raw_parts(h_sflag.clone(), n),
                     BufferArg::from_raw_parts(h_out.clone(), take * 12),
-                    BufferArg::from_raw_parts(h_ext.clone(), item_count * EXT_STRIDE),
                     BufferArg::from_raw_parts(h_win, 1),
                 );
             }
@@ -997,6 +1003,52 @@ pub(crate) fn run_repo_chain(
             }
             drop(sp_drain);
         }
+        // ── E1 (note 23): the endpoint's 32 B slot scatter AND the sole
+        // extent folder (the packer's duplicate folds MASKED a mutation —
+        // idempotent min/max repaired the wrong answer — so there is one
+        // folder). Both mode takes the real slot stream for the fork
+        // gate's lane tier; Instances mode runs the same kernel with a
+        // 1-word dummy `out` — the extents the placements decode from,
+        // every slot write discarded by the whole-extent guard.
+        {
+            let _sp_scatter = tracing::info_span!("tail.scatter").entered();
+            let wants_slots = matches!(mode, ChainMode::Both);
+            let h_slots = alloc_empty(if wants_slots {
+                total_slots as usize * 8 * 4
+            } else {
+                4
+            });
+            unsafe {
+                scatter_slots::launch_unchecked(
+                    &client,
+                    cubes_of(n),
+                    CubeDim::new_1d(256),
+                    BufferArg::from_raw_parts(h_fl.clone(), n_words),
+                    BufferArg::from_raw_parts(h_wc.clone(), n),
+                    BufferArg::from_raw_parts(h_ir.clone(), ir.len()),
+                    BufferArg::from_raw_parts(h_lm.clone(), n * LM_STRIDE),
+                    BufferArg::from_raw_parts(h_sm.clone(), n),
+                    BufferArg::from_raw_parts(h_hgt.clone(), n),
+                    BufferArg::from_raw_parts(h_gi.clone(), n),
+                    BufferArg::from_raw_parts(h_pr_colors.clone(), inputs.per_record_colors.len()),
+                    BufferArg::from_raw_parts(h_color_base.clone(), item_count),
+                    BufferArg::from_raw_parts(h_is_pr.clone(), item_count),
+                    BufferArg::from_raw_parts(h_flat_colors.clone(), item_count),
+                    BufferArg::from_raw_parts(h_groups.clone(), item_count),
+                    BufferArg::from_raw_parts(h_sflag.clone(), n),
+                    BufferArg::from_raw_parts(
+                        h_slots.clone(),
+                        if wants_slots { total_slots as usize * 8 } else { 1 },
+                    ),
+                    BufferArg::from_raw_parts(h_ext.clone(), item_count * EXT_STRIDE),
+                );
+            }
+            if wants_slots {
+                let sb = client.read_one(h_slots.clone()).expect("read slot scatter");
+                slots_all =
+                    bytemuck::cast_slice::<u8, u32>(&sb)[..total_slots as usize * 8].to_vec();
+            }
+        }
         // Placements from the extent lanes — the same reduction the host
         // compaction performs (page over ALL records, ink over survivors),
         // decoded from key space.
@@ -1039,6 +1091,7 @@ pub(crate) fn run_repo_chain(
         total_slots,
         placements,
         instances_on_device,
+        slots: slots_all,
         candidates: c,
         chain_dur: t_chain0.elapsed(),
         readback_dur: t_rb.elapsed(),

@@ -196,17 +196,16 @@ pub(super) fn item_totals(
     }
 }
 
-/// The instance packer. One thread per byte; every LEADER folds the page
-/// extents (seeds 0.0, over ALL records — blanks carry extents but no
-/// slot, exactly like the host loop); every SURVIVOR (leader AND gi != 0)
-/// additionally writes its 48 B slot at the global survivor ordinal and
-/// folds the ink extents (seeds ±inf). Paint arrives as the two tables of
-/// `InstanceInputs` — jagged per-record colors indexed by the record
-/// ordinal `rbase[it] + wc[b]` (the SAME index emit_records gathers by),
-/// or the per-item flat color. The window base rides the params buffer
-/// (one compiled kernel — the 5b0 pattern); extent folds are gated to
-/// window zero because atomics over the same keys are idempotent and
-/// re-folding per window is pure waste.
+/// The instance packer. One thread per byte; every SURVIVOR (leader AND
+/// gi != 0) writes its 48 B slot at the global survivor ordinal. Paint
+/// arrives as the two tables of `InstanceInputs` — jagged per-record
+/// colors indexed by the record ordinal `rbase[it] + wc[b]` (the SAME
+/// index emit_records gathers by), or the per-item flat color. The window
+/// base rides the params buffer (one compiled kernel — the 5b0 pattern).
+/// The EXTENT folds live in `scatter_slots` since E1 (note 23): two
+/// tails folding the same idempotent min/max lanes made the packer's
+/// folds a MASK — a mutation in them stayed green because the scatter's
+/// correct fold repaired the answer — so there is exactly one folder.
 #[cube(launch_unchecked)]
 pub(super) fn pack_instances(
     fl: &[u32],
@@ -224,10 +223,76 @@ pub(super) fn pack_instances(
     groups: &[u32],
     sv: &[u32],
     out: &mut [u32],
-    ext: &mut [Atomic<u32>],
     win: &[u32],
 ) {
     let win_first = win[0usize] as usize;
+    let b = ABSOLUTE_POS;
+    let n = wc.len();
+    let item_count = ir.len() / 2;
+    if b < n && item_count > 0 && flags_at(fl, b) & F_LEADER != 0 && gi[b] != 0u32 {
+        let it = item_search(ir, item_count, b);
+        let slot = sv[b] as usize;
+        if slot >= win_first && (slot - win_first) < out.len() / 12 {
+            let w = (slot - win_first) * 12;
+            out[w] = lm[b * LM_STRIDE + LM_X].to_bits();
+            out[w + 1] = lm[b * LM_STRIDE + LM_Y].to_bits();
+            out[w + 2] = lm[b * LM_STRIDE + LM_Z].to_bits();
+            out[w + 3] = gi[b];
+            out[w + 4] = lc[b * LC_STRIDE + LC_ROW];
+            out[w + 5] = lc[b * LC_STRIDE + LC_COL];
+            out[w + 6] = if is_per_record[it] != 0u32 {
+                pr_colors[(color_base[it] + wc[b]) as usize]
+            } else {
+                flat_colors[it]
+            };
+            out[w + 7] = groups[it];
+            out[w + 8] = sm[b].to_bits();
+            out[w + 9] = hgt[b].to_bits();
+            // flags: the wire record carries none; the shader reads mode
+            // from the glyphmap. _pad: zero.
+            out[w + 10] = 0u32;
+            out[w + 11] = 0u32;
+        }
+    }
+}
+
+/// The 32 B slot scatter — the endpoint's product form (note 23, E1),
+/// fenced lane-vs-engine by the fork gate before the renderer binds it
+/// (E2). One thread per byte, writing the 8-word slot at the global
+/// survivor ordinal DIRECTLY at its final address — no window base, no
+/// rolling chunk: the output buffer is meant to BE the renderer's
+/// storage, so there is no hop and no copy. The dropped lanes (row/col,
+/// flags, _pad) are proven dead readers by note 22's sweep (the shader
+/// never reads them; pick/verbs ride the engine cache; row/col stay
+/// fenced by the records tier).
+///
+/// THE SOLE EXTENT FOLDER. The packer folded extents until E1's prove
+/// caught the duplication masking a mutation (min/max atomics are
+/// idempotent, so the scatter's correct fold silently repaired the
+/// packer's mutated one — a second reducer is a MASK, not just waste).
+/// Now: page lanes over ALL records (seeds 0.0), ink lanes over
+/// survivors (seeds ±inf), identical arithmetic to the host loop's.
+/// The Instances mode calls this with a 1-word dummy `out` — extents
+/// only, every slot write discarded by the whole-extent guard — so the
+/// product path's placements ride the fenced kernel all along.
+#[cube(launch_unchecked)]
+pub(super) fn scatter_slots(
+    fl: &[u32],
+    wc: &[u32],
+    ir: &[u32],
+    lm: &[f32],
+    sm: &[f32],
+    hgt: &[f32],
+    gi: &[u32],
+    pr_colors: &[u32],
+    color_base: &[u32],
+    is_per_record: &[u32],
+    flat_colors: &[u32],
+    groups: &[u32],
+    sv: &[u32],
+    out: &mut [u32],
+    ext: &mut [Atomic<u32>],
+) {
     let b = ABSOLUTE_POS;
     let n = wc.len();
     let item_count = ir.len() / 2;
@@ -238,49 +303,40 @@ pub(super) fn pack_instances(
         let z = lm[b * LM_STRIDE + LM_Z];
         let adv = sm[b];
         let height = hgt[b];
-        // The host loop's own arithmetic: a bare add (nothing to contract)
-        // and a multiply by 0.5 — exact, so contraction is bit-neutral.
+        // The same single-rounding shapes as the packer: a bare add and a
+        // power-of-two multiply — contraction-neutral by construction.
         let right = x + adv;
         let half = height * 0.5f32;
-        if win_first == 0 {
-            let e = it * EXT_STRIDE;
-            ext[e].fetch_max(ordered_key(right));
-            ext[e + 1].fetch_min(ordered_key(y));
-            ext[e + 2].fetch_min(ordered_key(z));
-            ext[e + 3].fetch_max(ordered_key(z));
-        }
+        let e = it * EXT_STRIDE;
+        ext[e].fetch_max(ordered_key(right));
+        ext[e + 1].fetch_min(ordered_key(y));
+        ext[e + 2].fetch_min(ordered_key(z));
+        ext[e + 3].fetch_max(ordered_key(z));
         if gi[b] != 0u32 {
-            let slot = sv[b] as usize;
-            if slot >= win_first && (slot - win_first) < out.len() / 12 {
-                let w = (slot - win_first) * 12;
+            let w = sv[b] as usize * 8;
+            // Whole-extent guard, not just the start: the 1-word dummy
+            // `out` of the extents-only Instances form must discard
+            // EVERY slot write, including the zeroth.
+            if w + 8 <= out.len() {
                 out[w] = x.to_bits();
                 out[w + 1] = y.to_bits();
                 out[w + 2] = z.to_bits();
                 out[w + 3] = gi[b];
-                out[w + 4] = lc[b * LC_STRIDE + LC_ROW];
-                out[w + 5] = lc[b * LC_STRIDE + LC_COL];
-                out[w + 6] = if is_per_record[it] != 0u32 {
+                out[w + 4] = if is_per_record[it] != 0u32 {
                     pr_colors[(color_base[it] + wc[b]) as usize]
                 } else {
                     flat_colors[it]
                 };
-                out[w + 7] = groups[it];
-                out[w + 8] = adv.to_bits();
-                out[w + 9] = height.to_bits();
-                // flags: the wire record carries none; the shader reads mode
-                // from the glyphmap. _pad: zero.
-                out[w + 10] = 0u32;
-                out[w + 11] = 0u32;
+                out[w + 5] = groups[it];
+                out[w + 6] = adv.to_bits();
+                out[w + 7] = height.to_bits();
             }
-            if win_first == 0 {
-                let e = it * EXT_STRIDE;
-                ext[e + 4].fetch_min(ordered_key(x));
-                ext[e + 5].fetch_min(ordered_key(y - half));
-                ext[e + 6].fetch_max(ordered_key(right));
-                ext[e + 7].fetch_max(ordered_key(y + half));
-                ext[e + 8].fetch_min(ordered_key(z));
-                ext[e + 9].fetch_max(ordered_key(z));
-            }
+            ext[e + 4].fetch_min(ordered_key(x));
+            ext[e + 5].fetch_min(ordered_key(y - half));
+            ext[e + 6].fetch_max(ordered_key(right));
+            ext[e + 7].fetch_max(ordered_key(y + half));
+            ext[e + 8].fetch_min(ordered_key(z));
+            ext[e + 9].fetch_max(ordered_key(z));
         }
     }
 }

@@ -879,6 +879,28 @@ with = "            slot += 0;"
 expect = "instance mismatch words"
 
 [[mutation]]
+name = "scatter-ordinal-zeroed"
+gate = "cubecl-fork"
+why = "the scatter (note 23 E1, the endpoint's product form) places each 8-word slot at the global survivor ordinal sv[b]; zeroing it collapses every write onto slot 0 and leaves slots 1+ zeroed — glyph_id (field 3) mismatches everywhere, since a zeroed slot's gi=0 can never equal a survivor's. CONSUMED BY: the lane tier's field-wise compare, the only reader of the scatter stream"
+file = "native/src/cubecl_chain/tail.rs"
+rebuild = "cargo build --release"
+op = "replace"
+find = "            let w = sv[b] as usize * 8;"
+with = "            let w = 0usize;"
+expect = "lane mismatch words"
+
+[[mutation]]
+name = "scatter-group-lane-dropped"
+gate = "cubecl-fork"
+why = "the slot's group lane comes from the per-item table (groups[it]); zeroing it leaves every slot claiming group 0 — only items past the first can see it, and the fork fixture carries 2 (a one-item fixture would keep this GREEN, which is why the census's exercise asserts exist). CONSUMED BY: the lane tier's field-wise compare at field 5"
+file = "native/src/cubecl_chain/tail.rs"
+rebuild = "cargo build --release"
+op = "replace"
+find = "                out[w + 5] = groups[it];"
+with = "                out[w + 5] = 0u32;"
+expect = "lane mismatch words"
+
+[[mutation]]
 name = "emitter-window-offset-dropped"
 gate = "cubecl-fork"
 why = "the chunked emitter windows its writes by rec_first; dropping the offset lands every later window's records outside the rolling buffer, discarded by robustness — only the chunk-crossing pass (GLYPH_RECORD_CHUNK=60000, five windows) can see it, since the 16.7M default never leaves window zero on the standing fixture. CONSUMED BY: the record stream's chunk boundaries — the product readback's shape at the 97MB corpus scale"
@@ -896,19 +918,19 @@ why = "the pack kernel places each instance at its global survivor ordinal (the 
 file = "native/src/cubecl_chain/tail.rs"
 rebuild = "cargo build --release"
 op = "replace"
-find = "            let slot = sv[b] as usize;"
-with = "            let slot = 0usize;"
+find = "        let slot = sv[b] as usize;"
+with = "        let slot = 0usize;"
 expect = "instance mismatch"
 
 [[mutation]]
 name = "ink-half-height-dropped"
 gate = "cubecl-fork"
-why = "the ink bottom extent folds y − height/2 over survivors (the quads hang half a glyph below the baseline); dropping the half makes it fold the bare baseline, which the placement tier's bit_eq must catch while the instance tier stays green — the two tiers fence disjoint lanes of the same kernel. The multiply is by 0.5, exact, so the mutation is purely the formula. CONSUMED BY: pack_instances' ink min-y lane, decoded into ItemPlacement.ink.min[1]"
+why = "the ink bottom extent folds y − height/2 over survivors (the quads hang half a glyph below the baseline); dropping the half makes it fold the bare baseline, which the placement tier's bit_eq must catch while the instance tier stays green — the two tiers fence disjoint lanes of the same kernel. The multiply is by 0.5, exact, so the mutation is purely the formula. CONSUMED BY: scatter_slots' ink min-y lane (THE SOLE extent folder since E1 — the packer's duplicate folds were deleted because idempotent min/max made them a mutation MASK), decoded into ItemPlacement.ink.min[1]"
 file = "native/src/cubecl_chain/tail.rs"
 rebuild = "cargo build --release"
 op = "replace"
-find = "                ext[e + 5].fetch_min(ordered_key(y - half));"
-with = "                ext[e + 5].fetch_min(ordered_key(y));"
+find = "            ext[e + 5].fetch_min(ordered_key(y - half));"
+with = "            ext[e + 5].fetch_min(ordered_key(y));"
 expect = "placement mismatch"
 
 [[mutation]]
@@ -929,8 +951,8 @@ why = "the pack kernel windows its slot writes the way the emitter windows recor
 file = "native/src/cubecl_chain/tail.rs"
 rebuild = "cargo build --release"
 op = "replace"
-find = "                let w = (slot - win_first) * 12;"
-with = "                let w = slot * 12;"
+find = "            let w = (slot - win_first) * 12;"
+with = "            let w = slot * 12;"
 expect = "cubecl-fork-chunked"
 
 [[mutation]]
