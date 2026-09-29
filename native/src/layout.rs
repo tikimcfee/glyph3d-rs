@@ -445,6 +445,9 @@ pub struct MappedArena {
 
 struct MappedChunk {
     ptr: *mut GlyphInstance,
+    /// This chunk's capacity in slots — `chunk_slots` except possibly the
+    /// last chunk, which is sized to the remainder.
+    cap: usize,
     buffer: wgpu::Buffer,
 }
 
@@ -457,10 +460,10 @@ pub struct MappedTarget {
 }
 
 impl MappedArena {
-    /// Total capacity across all chunk buffers (the last over-allocates,
-    /// like the single form's byte-count estimate always did).
+    /// Total capacity across all chunk buffers (the last may be sized to
+    /// the remainder, like the single form's byte-count estimate always did).
     fn cap(&self) -> usize {
-        self.chunks.len() * self.chunk_slots
+        self.chunks.iter().map(|c| c.cap).sum()
     }
 }
 
@@ -481,15 +484,37 @@ impl GlyphArena {
         Self { instances, mapped: None }
     }
 
-    /// The device-resident form, single-buffer: takes ownership of an
-    /// already-mapped buffer. The FFI tail writer needs this form — its
-    /// write is one contiguous region.
-    pub fn from_mapped(ptr: *mut GlyphInstance, cap: usize, buffer: wgpu::Buffer) -> Self {
+    /// The chunked device-resident form: one already-mapped buffer per draw
+    /// chunk. `parts` carries (base pointer, capacity, buffer) per chunk;
+    /// every chunk but the last must be exactly `chunk_slots` (the slot math
+    /// strides uniformly), and the last may be smaller.
+    pub fn from_mapped_chunks(
+        parts: Vec<(*mut GlyphInstance, usize, wgpu::Buffer)>,
+        chunk_slots: usize,
+    ) -> Self {
+        assert!(
+            !parts.is_empty() && chunk_slots > 0,
+            "a chunked arena needs at least one buffer and a nonzero chunk size"
+        );
+        for (k, &(_, cap, _)) in parts.iter().enumerate() {
+            let want = if k + 1 == parts.len() {
+                cap <= chunk_slots
+            } else {
+                cap == chunk_slots
+            };
+            assert!(
+                want,
+                "arena chunk {k} has capacity {cap}, chunk_slots is {chunk_slots}"
+            );
+        }
         Self {
             instances: Vec::new(),
             mapped: Some(MappedArena {
-                chunks: vec![MappedChunk { ptr, buffer }],
-                chunk_slots: cap,
+                chunks: parts
+                    .into_iter()
+                    .map(|(ptr, cap, buffer)| MappedChunk { ptr, cap, buffer })
+                    .collect(),
+                chunk_slots,
                 len: 0,
             }),
         }
@@ -590,12 +615,18 @@ impl GlyphArena {
             bytes.len()
         );
         let m = self.mapped.as_mut().expect("write_bytes_at on a host arena");
+        assert!(
+            start_slot + bytes.len() / slot_size <= m.cap(),
+            "write_bytes_at: {} slots from {start_slot} over the {}-slot capacity",
+            bytes.len() / slot_size,
+            m.cap(),
+        );
         let mut off = 0usize;
         let mut slot = start_slot;
         while off < bytes.len() {
             let k = slot / m.chunk_slots;
             let in_chunk = slot - k * m.chunk_slots;
-            let take = ((m.chunk_slots - in_chunk) * slot_size).min(bytes.len() - off);
+            let take = ((m.chunks[k].cap - in_chunk) * slot_size).min(bytes.len() - off);
             // SAFETY: `take` never crosses the chunk's capacity (computed
             // from it), both pointers are valid for their spans, and the
             // chunks are disjoint buffers.

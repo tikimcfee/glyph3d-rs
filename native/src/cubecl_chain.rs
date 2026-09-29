@@ -5297,18 +5297,17 @@ pub fn repo_check(ctx: &GpuContext, dir: &Path) -> ! {
         ChainMode::Both
     };
     let device = SharedDevice::from_ctx(ctx);
-    // The copy hop's own tier: where the renderer's mapped-arena gate
-    // passes (Metal, mappable, fits), the check's CHAIN side runs the SAME
-    // hop — the fence follows the path the renderer runs. Other hosts
-    // fence the readback hop instead: each host fences what it runs, the
-    // mapped_instance_arena pattern.
+    // The copy hop's own tier: the check's CHAIN side runs the SAME hop the
+    // renderer runs — the fence follows the path. Chunked like the renderer
+    // (one buffer per `arena_chunk_slots`); GLYPH_ARENA_CHUNK_SLOTS forces
+    // small chunks so the gate crosses buffer boundaries on the standing
+    // fixture. Other hosts fence the readback hop instead: each host fences
+    // what it runs.
     let mut chain_arena = if ctx.profile.backend == wgpu::Backend::Metal
         && ctx.profile.mappable_primary_buffers
         && n > 0
-        && (n * std::mem::size_of::<crate::glyph_scene::GlyphInstance>()) as u64
-            <= ctx.profile.max_buffer_size
     {
-        crate::glyph_scene::mapped_instance_arena(ctx, n)
+        crate::glyph_scene::mapped_instance_arena(ctx, n, crate::glyph_scene::arena_chunk_slots(ctx))
     } else {
         crate::layout::GlyphArena::new()
     };
@@ -5395,30 +5394,38 @@ pub fn repo_check(ctx: &GpuContext, dir: &Path) -> ! {
     if mode != ChainMode::Records {
         // Arena against arena: the chain side's slots live in
         // `chain_arena` whichever hop filled it (device copy or readback
-        // hand-off), the engine side's in its own — the same comparison
-        // repo-verify makes of the host backends.
+        // hand-off), possibly across SEVERAL chunk buffers — the compare
+        // walks them in order with a running word index, so a window/chunk
+        // offset slip lands on a named slot either way.
         let eng_words: &[u32] = bytemuck::cast_slice(arena.instances());
-        let chain_words: &[u32] = bytemuck::cast_slice(chain_arena.instances());
-        if eng_words.len() != chain_words.len() {
+        let chain_chunks = chain_arena.instance_chunks();
+        let chain_slots_total: usize = chain_chunks.iter().map(|c| c.len()).sum();
+        if eng_words.len() != chain_slots_total * 12 {
             inst_bad += 1;
             println!(
                 "  INSTANCE LENGTH MISMATCH: engine {} slots, chain {} slots",
                 eng_words.len() / 12,
-                chain_words.len() / 12
+                chain_slots_total
             );
         } else {
-            for (i, (a, b)) in eng_words.iter().zip(chain_words.iter()).enumerate() {
-                if a != b {
-                    inst_bad += 1;
-                    if inst_bad <= 4 {
-                        println!(
-                            "  INSTANCE MISMATCH slot {} word {}: chain {:#x} engine {:#x}",
-                            i / 12,
-                            i % 12,
-                            b,
-                            a
-                        );
+            let mut idx = 0usize;
+            for chunk in &chain_chunks {
+                let cw: &[u32] = bytemuck::cast_slice(chunk);
+                for &b in cw {
+                    let a = eng_words[idx];
+                    if a != b {
+                        inst_bad += 1;
+                        if inst_bad <= 4 {
+                            println!(
+                                "  INSTANCE MISMATCH slot {} word {}: chain {:#x} engine {:#x}",
+                                idx / 12,
+                                idx % 12,
+                                b,
+                                a
+                            );
+                        }
                     }
+                    idx += 1;
                 }
             }
         }

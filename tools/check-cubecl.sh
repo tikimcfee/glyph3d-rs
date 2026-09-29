@@ -61,6 +61,22 @@ fork)
         echo "$out" | tail -5
         exit 1
     fi
+    # The chunked ARENA, fenced: force small chunk buffers AND small emit
+    # windows so window↔buffer intersections multiply on purpose — 275,058
+    # slots over 50,000-slot buffers is six buffers, 60,000-record windows
+    # is five windows, and 50,000 % 60,000 != 0 so the boundaries MISALIGN
+    # (the copy hop's per-intersection split is the only code that runs
+    # there). The instance tier compares per chunk buffer.
+    if out=$(GLYPH_ARENA_CHUNK_SLOTS=50000 GLYPH_RECORD_CHUNK=60000 "$BIN" --cubecl-repo-check native/fixtures/cubecl-fork 2>&1); then
+        echo "$out" | grep -q "cubecl-repo-check PASS" \
+            && echo "$out" | grep -q "strict: bit-exact" \
+            && echo "PASS  cubecl-fork-chunked-arena (GLYPH_ARENA_CHUNK_SLOTS=50000, six buffers)" \
+            || { echo "FAIL  cubecl-fork-chunked-arena — PASS/strict lines missing"; echo "$out" | tail -5; exit 1; }
+    else
+        echo "FAIL  cubecl-fork-chunked-arena — exited nonzero"
+        echo "$out" | tail -5
+        exit 1
+    fi
     echo "ALL PASS"
     ;;
 *)

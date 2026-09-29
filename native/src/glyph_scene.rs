@@ -191,6 +191,27 @@ pub struct GlyphScene {
 // an ink_frac plumbing redesign across staging + sync_segment. Cut from K4;
 // the feasible future seam is recorded in out/STAGE_K_REPORT.md.
 
+/// Slots per arena chunk buffer: the tighter of the storage binding and
+/// whole-buffer limits, in instances — the value the draw path's chunk math
+/// and the arena's chunking must agree on, computed once, here.
+/// GLYPH_ARENA_CHUNK_SLOTS overrides it (the fork gate forces small chunks so
+/// the split paths — copy-hop intersections, tint straddles, multi-buffer
+/// bindings — run on a small corpus).
+pub fn arena_chunk_slots(ctx: &GpuContext) -> usize {
+    let derived = (ctx
+        .device
+        .limits()
+        .max_storage_buffer_binding_size
+        .min(ctx.profile.max_buffer_size) as usize
+        / std::mem::size_of::<GlyphInstance>())
+    .max(1);
+    std::env::var("GLYPH_ARENA_CHUNK_SLOTS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(derived)
+        .max(1)
+}
+
 /// The device-resident arena for the repo load's direct path: ONE
 /// shared-storage buffer the FFI writes instances into and the glyph shader
 /// reads — the write IS the upload, so the load pays one allocation and no
@@ -200,46 +221,62 @@ pub struct GlyphScene {
 /// commits against. Metal only, gated by the caller on the profile: a
 /// discrete adapter would trade the saved copy for slower per-frame shader
 /// reads across the bus.
-pub fn mapped_instance_arena(ctx: &GpuContext, slots: usize) -> crate::layout::GlyphArena {
+///
+/// Chunked since rung 5e: one buffer per `chunk_slots` slots (the last sized
+/// to the remainder), so a corpus whose instance mass exceeds
+/// `max_buffer_size` is chunked instead of refused — the draw path binds one
+/// buffer per chunk regardless.
+pub fn mapped_instance_arena(
+    ctx: &GpuContext,
+    slots: usize,
+    chunk_slots: usize,
+) -> crate::layout::GlyphArena {
     use wgpu::hal::Device as HalDevice;
     let device = &ctx.device;
-    let size = (slots * std::mem::size_of::<GlyphInstance>()) as u64;
     let hal_dev = unsafe { device.as_hal::<wgpu::hal::api::Metal>() }
         .expect("Metal profile behind a non-Metal device");
-    let hal_buf = unsafe {
-        hal_dev.create_buffer(&wgpu::hal::BufferDescriptor {
-            label: Some("glyph arena (mapped)"),
-            size,
-            usage: wgpu::BufferUses::STORAGE_READ_ONLY
-                | wgpu::BufferUses::COPY_DST
-                | wgpu::BufferUses::COPY_SRC
-                | wgpu::BufferUses::MAP_READ,
-            memory_flags: wgpu::hal::MemoryFlags::empty(),
-        })
-    }
-    .expect("hal arena buffer");
-    let mapping = unsafe { hal_dev.map_buffer(&hal_buf, 0..size) }.expect("hal arena map");
-    // On Metal `unmap_buffer` is a no-op — the mapping simply lives as long
-    // as the buffer, which the arena owns (see layout::MappedArena).
-    let ptr = mapping.ptr.as_ptr() as *mut GlyphInstance;
-    // SAFETY: same device, desc matches the hal request, the buffer is
-    // kernel-zeroed (and wgpu's init tracker is born empty regardless),
-    // nonzero size (slots > 0 is a caller gate).
-    let buf = unsafe {
-        device.create_buffer_from_hal::<wgpu::hal::api::Metal>(
-            hal_buf,
-            &wgpu::BufferDescriptor {
-                label: Some("glyph arena (mapped)"),
+    let n_chunks = slots.div_ceil(chunk_slots).max(1);
+    let mut parts = Vec::with_capacity(n_chunks);
+    for k in 0..n_chunks {
+        let cap = chunk_slots.min(slots - k * chunk_slots);
+        let size = (cap * std::mem::size_of::<GlyphInstance>()) as u64;
+        let label = format!("glyph arena (mapped) {k}/{n_chunks}");
+        let hal_buf = unsafe {
+            hal_dev.create_buffer(&wgpu::hal::BufferDescriptor {
+                label: Some(&label),
                 size,
-                usage: wgpu::BufferUsages::STORAGE
-                    | wgpu::BufferUsages::COPY_DST
-                    | wgpu::BufferUsages::COPY_SRC
-                    | wgpu::BufferUsages::MAP_READ,
-                mapped_at_creation: false,
-            },
-        )
-    };
-    crate::layout::GlyphArena::from_mapped(ptr, slots, buf)
+                usage: wgpu::BufferUses::STORAGE_READ_ONLY
+                    | wgpu::BufferUses::COPY_DST
+                    | wgpu::BufferUses::COPY_SRC
+                    | wgpu::BufferUses::MAP_READ,
+                memory_flags: wgpu::hal::MemoryFlags::empty(),
+            })
+        }
+        .expect("hal arena buffer");
+        let mapping = unsafe { hal_dev.map_buffer(&hal_buf, 0..size) }.expect("hal arena map");
+        // On Metal `unmap_buffer` is a no-op — the mapping simply lives as
+        // long as the buffer, which the arena owns (see layout::MappedArena).
+        let ptr = mapping.ptr.as_ptr() as *mut GlyphInstance;
+        // SAFETY: same device, desc matches the hal request, the buffer is
+        // kernel-zeroed (and wgpu's init tracker is born empty regardless),
+        // nonzero size (cap > 0 by the div_ceil above).
+        let buf = unsafe {
+            device.create_buffer_from_hal::<wgpu::hal::api::Metal>(
+                hal_buf,
+                &wgpu::BufferDescriptor {
+                    label: Some(&label),
+                    size,
+                    usage: wgpu::BufferUsages::STORAGE
+                        | wgpu::BufferUsages::COPY_DST
+                        | wgpu::BufferUsages::COPY_SRC
+                        | wgpu::BufferUsages::MAP_READ,
+                    mapped_at_creation: false,
+                },
+            )
+        };
+        parts.push((ptr, cap, buf));
+    }
+    crate::layout::GlyphArena::from_mapped_chunks(parts, chunk_slots)
 }
 
 impl GlyphScene {

@@ -221,7 +221,13 @@ window bases ride runtime params buffers, so every window shares one compiled
 kernel — small values cost dispatches and 4-byte uploads, nothing else),
 `GLYPH_REPO_CHECK_TAIL=records` (drops the fork check's instance/placement
 tiers — the big-corpus escape when Both mode's four simultaneous streams
-brush the memory ceiling; the gate never sets it).
+brush the memory ceiling; the gate never sets it),
+`GLYPH_ARENA_CHUNK_SLOTS=<n>` (the mapped arena's slots per chunk buffer,
+default derived from the tighter of the storage-binding and buffer-size
+limits — the fork gate's third pass sets 50,000 alongside
+GLYPH_RECORD_CHUNK=60,000 so five emit windows cross six arena buffers
+with the boundaries misaligned, fencing the copy hop's window→chunk split
+and the multi-buffer arena forms on a small corpus).
 
 ## Commit cadence
 

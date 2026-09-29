@@ -292,19 +292,31 @@ fn build_scene_impl(
             let load = {
                 let walk = repo::walk_repo(dir);
                 // The device-resident arena: the FFI (Direct) or the pack
-                // kernel's readback hop (Cubecl, rung 5b) writes instances
-                // into the same shared-storage buffer the shader reads, on
-                // unified memory, when the buffer fits.
+                // kernel's hops (Cubecl, rung 5b/5c) write instances into the
+                // same shared-storage the shader reads, on unified memory.
+                // Past max_buffer_size the CUBECL arena chunks (rung 5e: one
+                // buffer per draw chunk); the FFI's write is one contiguous
+                // region, so Direct keeps the host arena there instead.
                 let arena = if matches!(
                     strategy,
                     layout_mojo::Strategy::Direct | layout_mojo::Strategy::Cubecl
                 ) && ctx.profile.backend == wgpu::Backend::Metal
                     && ctx.profile.mappable_primary_buffers
                     && walk.total_bytes > 0
-                    && (walk.total_bytes * std::mem::size_of::<glyph_scene::GlyphInstance>()) as u64
-                        <= ctx.profile.max_buffer_size
                 {
-                    glyph_scene::mapped_instance_arena(ctx, walk.total_bytes)
+                    let single_fits = (walk.total_bytes
+                        * std::mem::size_of::<glyph_scene::GlyphInstance>())
+                        as u64
+                        <= ctx.profile.max_buffer_size;
+                    if single_fits || matches!(strategy, layout_mojo::Strategy::Cubecl) {
+                        glyph_scene::mapped_instance_arena(
+                            ctx,
+                            walk.total_bytes,
+                            glyph_scene::arena_chunk_slots(ctx),
+                        )
+                    } else {
+                        layout::GlyphArena::new()
+                    }
                 } else {
                     layout::GlyphArena::new()
                 };
