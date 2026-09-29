@@ -119,7 +119,13 @@ both are thin doors onto `cargo glyph test`.
   byte-exact. It reports COVERAGE — which checks have no mutation and are
   therefore unproven — not a pass count. Every check is covered as of 2026-09-07;
   `cargo glyph prove` prints the live figure, and a new check should arrive
-  with the mutation that proves it.
+  with the mutation that proves it. Scoped forms for iteration (2026-09-29):
+  `--mutation <name>` (repeatable) proves exactly the named mutations, and
+  `--changed` proves only mutations whose target file differs from HEAD —
+  "prove what you touched" (a mutation you MOVED keeps its name and is
+  selected by its file). A scoped run's verdict names its scope ("a scoped
+  run proves its scope, not the manifest"); the unscoped run remains the
+  landing bar.
 - **`cargo glyph gates`** prints what each check compares and cannot see;
   **`graph`** the artifact graph; **`validate`** the manifest against its schema.
 

@@ -1134,13 +1134,56 @@ fn apply_mutation(mu: &Mutation) -> Result<Vec<u8>, String> {
     Ok(before)
 }
 
-fn cmd_prove(m: &Manifest, only: Option<&str>) -> bool {
+fn cmd_prove(
+    m: &Manifest,
+    only: Option<&str>,
+    only_mutations: &[String],
+    changed: bool,
+) -> bool {
     let covered: BTreeSet<&str> = m.mutation.iter().map(|mu| mu.gate.as_str()).collect();
     let uncovered: Vec<&str> =
         m.gate.iter().map(|g| g.name.as_str()).filter(|n| !covered.contains(n)).collect();
     let mut fail = false;
 
-    for mu in m.mutation.iter().filter(|mu| only.is_none_or(|g| mu.gate == g)) {
+    // --changed: the mutation set whose target files differ from HEAD.
+    // Repo-relative paths on both sides (git runs at the root).
+    let changed_files: Option<std::collections::BTreeSet<String>> = changed.then(|| {
+        let out = Command::new("git")
+            .args(["diff", "--name-only", "HEAD"])
+            .current_dir(root())
+            .output()
+            .expect("git diff --name-only runs");
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .map(|l| l.to_string())
+            .collect()
+    });
+
+    let scoped = only.is_some() || !only_mutations.is_empty() || changed;
+    let selected: Vec<&Mutation> = m
+        .mutation
+        .iter()
+        .filter(|mu| only.is_none_or(|g| mu.gate == g))
+        .filter(|mu| only_mutations.is_empty() || only_mutations.contains(&mu.name))
+        .filter(|mu| {
+            changed_files
+                .as_ref()
+                .is_none_or(|cf| cf.contains(&mu.file))
+        })
+        .collect();
+    if scoped {
+        println!(
+            "prove (scoped: {} of {} mutations{})",
+            selected.len(),
+            m.mutation.len(),
+            if changed { ", files changed vs HEAD" } else { "" },
+        );
+        if selected.is_empty() {
+            println!("  nothing selected — no mutation targets those files/names");
+        }
+    }
+
+    for mu in selected.iter().copied() {
         step(&format!("mutation: {} → {}", mu.name, mu.gate));
 
         let (pre_ok, _) = gate_output(&mu.gate);
@@ -1245,7 +1288,17 @@ fn cmd_prove(m: &Manifest, only: Option<&str>) -> bool {
     println!();
     println!(
         "{}",
-        if fail { "PROVE: FAILURES — see above" } else { "PROVE: every declared mutation reddened its gate" }
+        if fail {
+            "PROVE: FAILURES — see above".to_string()
+        } else if scoped {
+            format!(
+                "PROVE: {} selected mutation{} reddened — a scoped run proves its scope, not the manifest",
+                selected.len(),
+                if selected.len() == 1 { "" } else { "s" },
+            )
+        } else {
+            "PROVE: every declared mutation reddened its gate".to_string()
+        }
     );
     !fail
 }
@@ -1283,6 +1336,14 @@ enum Cmd {
         /// Only mutations targeting this gate.
         #[arg(long)]
         gate: Option<String>,
+        /// Only these mutations (repeatable). The iteration form: prove the
+        /// mutations YOUR change added or moved, not the whole manifest.
+        #[arg(long = "mutation")]
+        mutations: Vec<String>,
+        /// Only mutations whose target file differs from HEAD — "prove what
+        /// I touched". Combines with --gate/--mutation by intersection.
+        #[arg(long)]
+        changed: bool,
     },
     /// Run a single check by name. Used by `prove`, and useful on its own.
     Gate { name: String },
@@ -1423,7 +1484,9 @@ fn main() -> ExitCode {
                 .map(|s| s.success())
                 .unwrap_or(false)
         }
-        Cmd::Prove { gate } => cmd_prove(&m, gate.as_deref()),
+        Cmd::Prove { gate, mutations, changed } => {
+            cmd_prove(&m, gate.as_deref(), &mutations, changed)
+        }
         Cmd::Drift => cmd_drift(&m),
         Cmd::Gate { name } => match m.gate.iter().find(|g| g.name == name) {
             Some(g) => run_gate(g, &m),
