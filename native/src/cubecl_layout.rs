@@ -93,6 +93,7 @@ fn marshal(
     Vec<crate::fold::Item>,
     crate::cubecl_chain::InstanceInputs,
 ) {
+    let _sp = tracing::info_span!("cubecl.marshal", items = items.len()).entered();
     let mut bytes = Vec::new();
     let mut fis = Vec::with_capacity(items.len());
     let mut per_record_colors: Vec<u32> = Vec::new();
@@ -162,6 +163,7 @@ fn marshal(
 /// off the same way, so the fence's instance tier compares arena against
 /// arena whichever hop ran.
 pub(crate) fn hand_off(words: Vec<u32>, slots: usize, on_device: bool, arena: &mut GlyphArena) {
+    let _sp = tracing::info_span!("cubecl.handoff", slots, on_device).entered();
     assert!(
         arena.is_empty(),
         "the instance tail writes from slot 0 — a pre-filled arena would need the rebase the direct path carries"

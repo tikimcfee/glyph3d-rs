@@ -67,6 +67,7 @@ pub struct WalkResult {
 
 /// Recursive walk, deterministic order (files sorted by relative path).
 pub fn walk_repo(root: &Path) -> WalkResult {
+    let _sp = tracing::info_span!("repo.walk", root = %root.display()).entered();
     let t0 = std::time::Instant::now();
     let mut candidates: Vec<(String, PathBuf)> = Vec::new();
     let mut skipped_large = 0usize;
@@ -516,6 +517,14 @@ pub fn load_repo_from_walk(
     gpu: Option<&crate::gpu::GpuContext>,
     mut arena: GlyphArena,
 ) -> RepoLoad {
+    let _load = tracing::info_span!(
+        "repo.load",
+        files = walk.files.len(),
+        bytes = walk.total_bytes,
+        ?strategy,
+        verify,
+    )
+    .entered();
     let walk_dur = walk.walk_dur;
 
     // Per-file params (pagination sized per file). Newline counts double as
@@ -534,12 +543,14 @@ pub fn load_repo_from_walk(
     // instances afterwards: compaction destroys the index that names a byte
     // (the argument is at `layout::Paint`).
     let t = Instant::now();
+    let sp_paint = tracing::info_span!("repo.paint").entered();
     let colors: Vec<Vec<u32>> = walk
         .files
         .iter()
         .map(|f| text::colorize_leaders(&f.bytes))
         .collect();
     let mut stage_dur = t.elapsed();
+    drop(sp_paint);
 
     let items: Vec<LayoutItem<'_>> = walk
         .files
@@ -638,6 +649,7 @@ pub fn load_repo_from_walk(
     // instances and placements only — which is the whole render-visible
     // contract, and the granularity that matters. `diff_backends` is told the
     // records are absent rather than being handed an empty slice to interpret.
+    let sp_backend = tracing::info_span!("repo.backend").entered();
     let (placements, records) = if verify && strategy.can_record() {
         backend
             .layout_items_recording(&items, &mut arena)
@@ -650,10 +662,12 @@ pub fn load_repo_from_walk(
             Vec::new(),
         )
     };
+    drop(sp_backend);
     let mut backend_dur = t.elapsed();
 
     let mut verified = false;
     if verify {
+        let _sp_verify = tracing::info_span!("repo.verify").entered();
         let t = Instant::now();
         // The counterpart to diff against. Direct is checked against Batched
         // because that is the strategy it replaces; the other two check each
@@ -718,6 +732,7 @@ pub fn load_repo_from_walk(
     }
 
     let t = Instant::now();
+    let sp_views = tracing::info_span!("repo.views").entered();
     let mut total_records = 0usize;
     let mut total_blanks = 0usize;
     let mut views: Vec<FileView> = Vec::with_capacity(walk.files.len());
@@ -744,10 +759,13 @@ pub fn load_repo_from_walk(
         });
     }
     let instances_len = arena.len();
+    drop(sp_views);
     stage_dur += t.elapsed();
 
     let t = Instant::now();
+    let sp_grid = tracing::info_span!("repo.layout").entered();
     let (groups, bounds_min, bounds_max) = layout(&mut views, params);
+    drop(sp_grid);
     let layout_dur = t.elapsed();
 
     let stats = LoadStats {
@@ -804,6 +822,7 @@ impl RepoLoad {
     /// Convert into the renderer's staged form. `focus` selects one file
     /// (first rel-path containing the substring) for the camera to frame.
     pub fn into_staged(self, focus: Option<&str>, slot_ink: &[Option<[f32; 4]>]) -> StagedText {
+        let _sp = tracing::info_span!("repo.staged", files = self.files.len()).entered();
         log::info!(
             "field bounds: x [0, {:.0}], y [{:.0}, {:.1}] — {:.0}x{:.0} world units",
             self.bounds_max[0],
@@ -854,6 +873,7 @@ impl RepoLoad {
         // range: per-segment sums are independent and the per-worker results
         // concatenate in file order, so the table is bit-identical. Small
         // repos stay serial (thread spawn would cost more than the pass).
+        let sp_segments = tracing::info_span!("repo.segments").entered();
         let segments: Vec<crate::glyph_scene::SegCull> = if self.files.len() >= 64 {
             let workers = std::thread::available_parallelism()
                 .map(|n| n.get())
@@ -875,6 +895,7 @@ impl RepoLoad {
         } else {
             self.files.iter().map(seg_of).collect()
         };
+        drop(sp_segments);
         let pick_files: Vec<crate::glyph_scene::PickFileInfo> = self
             .files
             .iter()

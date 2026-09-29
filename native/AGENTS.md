@@ -139,6 +139,17 @@ display's refresh (75 on the first Linux box) and not a fact about the renderer.
 - `GLYPH_PROFILE=1` — requests TIMESTAMP_QUERY and builds a wgpu-profiler;
   per-pass GPU timings print (windowed: 1 Hz; offscreen: once per run).
   Without it the device is created exactly as before (zero-cost Option).
+- `GLYPH_TRACE=<filter>` — the load path's span instrument (integration
+  note 22): `repo.{walk,load,paint,backend,verify,views,layout,staged,
+  segments}`, `cubecl.{marshal,handoff}`, `chain.{prep,tables,init,upload,
+  dispatch}` and `tail.{totals,window.{pack,emit,flush,copy,readback},
+  drain,placements}`, printed on span CLOSE with busy/idle times. The
+  filter is a tracing EnvFilter string (fallback `RUST_LOG`; unset = off,
+  one atomic per span). `glyph3d_native=info` is the useful setting — a
+  bare `info` also admits wgpu/cubecl's own tracing records, which is
+  loud. The spans mirror the LoadStats/ChainPhases Instant boundaries
+  exactly so the two can be cross-checked; the prints stay the
+  presentation contract.
 - `GLYPH_PICK_DEBUG=1` — pick-path diagnostics: pixel ray, AABB hits, local
   point, candidate records (glyph_scene/pick.rs pick functions).
 - `GLYPH_CULL_DEBUG=1` — at t=0.0 prints cull stats: visible draw ranges,

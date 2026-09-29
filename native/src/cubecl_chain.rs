@@ -4350,7 +4350,7 @@ pub(crate) struct ChainPhases {
 /// totals come back item_count-sized); `Both` runs the two tails in one
 /// driver pass — the fork gate's mode, so the fence sees the product tail
 /// and the record tier against the same dispatches.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ChainMode {
     Records,
     Instances,
@@ -4451,7 +4451,20 @@ pub(crate) fn run_repo_chain(
     let n: usize = bytes.len();
     let fis = items;
     // ── the chain side ────────────────────────────────────────────────────
+    // The span decomposition mirrors the Instant pairs below exactly —
+    // ChainPhases stays the print contract, the spans are the programmatic
+    // instrument, and reading the same boundaries is what lets the two be
+    // cross-checked before anything collapses onto either.
+    let _chain = tracing::info_span!(
+        "chain",
+        n,
+        items = item_count,
+        ?mode,
+        mapped = mapped.is_some()
+    )
+    .entered();
     let t_chain0 = std::time::Instant::now();
+    let sp_prep = tracing::info_span!("chain.prep").entered();
     // Rung 5b: the serial CPU leader scan is GONE from every mode — the
     // survivor pass publishes per-item leader AND survivor totals on
     // device (an item_count-sized readback; prefix sums on host), which
@@ -4463,6 +4476,8 @@ pub(crate) fn run_repo_chain(
     // gigabytes held across dispatches brushed the machine's ceiling with
     // deterministically-dead dispatches as the failure mode.)
     let t_tables = std::time::Instant::now();
+    drop(sp_prep);
+    let sp_tables = tracing::info_span!("chain.tables").entered();
 
     let (units, rake) = (256usize, 8usize);
     let log = units.ilog2() as usize;
@@ -4511,6 +4526,8 @@ pub(crate) fn run_repo_chain(
     }
 
     let t_init = std::time::Instant::now();
+    drop(sp_tables);
+    let sp_init = tracing::info_span!("chain.init").entered();
     // One device when the caller has one (the renderer's, shared since rung
     // 5a — the rung-4 second device is gone from the render path); callers
     // with no GPU of their own still construct one here.
@@ -4534,43 +4551,59 @@ pub(crate) fn run_repo_chain(
     let cdev = cubecl::wgpu::init_device(setup, Default::default());
     let client = cubecl::Device::Wgpu(cdev).client();
     let t_upload = std::time::Instant::now();
+    drop(sp_init);
+    let span_upload = tracing::info_span!("chain.upload", live_bytes = tracing::field::Empty);
+    let sp_upload = span_upload.enter();
+    // The device-memory ledger: EVERY allocation this function makes passes
+    // through these two doors, so the figure the spans report is the chain's
+    // true semantic live set (cubecl's pool may hold more on top). Cell
+    // because the two closures share it; this function is single-threaded.
+    let live = std::cell::Cell::new(0u64);
+    let alloc_empty = |size: usize| {
+        live.set(live.get() + size as u64);
+        client.empty(size)
+    };
+    let alloc_upload = |bytes: &[u8]| {
+        live.set(live.get() + bytes.len() as u64);
+        client.create_from_slice(bytes)
+    };
     let packed = pack_words(bytes);
     let (bi, bm, bc, bshift) = trie.device_tables();
-    let h_bytes = client.create_from_slice(bytemuck::cast_slice(&packed));
-    let h_bi = client.create_from_slice(bytemuck::cast_slice(&bi));
-    let h_bm = client.create_from_slice(bytemuck::cast_slice(&bm));
-    let h_bc = client.create_from_slice(bytemuck::cast_slice(&bc));
-    let h_seq = client.create_from_slice(bytemuck::cast_slice(&seq));
-    let h_bmap = client.create_from_slice(bytemuck::cast_slice(&bitmap));
-    let h_poff = client.create_from_slice(bytemuck::cast_slice(&poff));
-    let h_pval = client.create_from_slice(bytemuck::cast_slice(&pval));
-    let h_ir = client.create_from_slice(bytemuck::cast_slice(&ir));
-    let h_ic = client.create_from_slice(bytemuck::cast_slice(&ic));
-    let h_ie = client.create_from_slice(bytemuck::cast_slice(&ie));
-    let h_im = client.create_from_slice(bytemuck::cast_slice(&im));
-    let h_gap = client.create_from_slice(bytemuck::cast_slice(&page_gap_x));
-    let h_fl = client.empty(n_words * 4);
-    let h_sm = client.empty(n * 4);
-    let h_gi = client.empty(n * 4);
-    let h_hgt = client.empty(n * 4);
-    let h_cslot = client.create_from_slice(bytemuck::cast_slice(&vec![0u32; n]));
-    let h_cend = client.empty(n * 4);
-    let h_tc = client.empty(n_tiles * PARTIAL_COUNT_STRIDE * 4);
-    let h_tm = client.empty(n_tiles * 4);
-    let h_xc = client.empty(n_tiles * PARTIAL_COUNT_STRIDE * 4);
-    let h_xm = client.empty(n_tiles * 4);
-    let h_lc = client.empty(n * LC_STRIDE * 4);
-    let h_wm = client.empty(n * 4);
-    let h_wc = client.empty(n * 4);
-    let h_otb = client.empty(n * 4);
-    let h_lm = client.empty(n * LM_STRIDE * 4);
-    let h_strides = client.empty(item_count * 8);
-    let h_rmax = client.create_from_slice(bytemuck::cast_slice(&vec![0u32; item_count]));
-    let h_xmax = client.create_from_slice(bytemuck::cast_slice(&vec![0u32; item_count]));
+    let h_bytes = alloc_upload(bytemuck::cast_slice(&packed));
+    let h_bi = alloc_upload(bytemuck::cast_slice(&bi));
+    let h_bm = alloc_upload(bytemuck::cast_slice(&bm));
+    let h_bc = alloc_upload(bytemuck::cast_slice(&bc));
+    let h_seq = alloc_upload(bytemuck::cast_slice(&seq));
+    let h_bmap = alloc_upload(bytemuck::cast_slice(&bitmap));
+    let h_poff = alloc_upload(bytemuck::cast_slice(&poff));
+    let h_pval = alloc_upload(bytemuck::cast_slice(&pval));
+    let h_ir = alloc_upload(bytemuck::cast_slice(&ir));
+    let h_ic = alloc_upload(bytemuck::cast_slice(&ic));
+    let h_ie = alloc_upload(bytemuck::cast_slice(&ie));
+    let h_im = alloc_upload(bytemuck::cast_slice(&im));
+    let h_gap = alloc_upload(bytemuck::cast_slice(&page_gap_x));
+    let h_fl = alloc_empty(n_words * 4);
+    let h_sm = alloc_empty(n * 4);
+    let h_gi = alloc_empty(n * 4);
+    let h_hgt = alloc_empty(n * 4);
+    let h_cslot = alloc_upload(bytemuck::cast_slice(&vec![0u32; n]));
+    let h_cend = alloc_empty(n * 4);
+    let h_tc = alloc_empty(n_tiles * PARTIAL_COUNT_STRIDE * 4);
+    let h_tm = alloc_empty(n_tiles * 4);
+    let h_xc = alloc_empty(n_tiles * PARTIAL_COUNT_STRIDE * 4);
+    let h_xm = alloc_empty(n_tiles * 4);
+    let h_lc = alloc_empty(n * LC_STRIDE * 4);
+    let h_wm = alloc_empty(n * 4);
+    let h_wc = alloc_empty(n * 4);
+    let h_otb = alloc_empty(n * 4);
+    let h_lm = alloc_empty(n * LM_STRIDE * 4);
+    let h_strides = alloc_empty(item_count * 8);
+    let h_rmax = alloc_upload(bytemuck::cast_slice(&vec![0u32; item_count]));
+    let h_xmax = alloc_upload(bytemuck::cast_slice(&vec![0u32; item_count]));
     // The extent pair + walk plan (the width pre-resolved by fold.rs's
     // rule — see extent_pair's header).
     let h_extent =
-        client.create_from_slice(bytemuck::cast_slice(&vec![0x8000_0000u32; item_count * 2]));
+        alloc_upload(bytemuck::cast_slice(&vec![0x8000_0000u32; item_count * 2]));
     let mut walk_plan: Vec<u32> = Vec::with_capacity(item_count * 3);
     for (i, item) in fis.iter().enumerate() {
         let width = if item.wrap_width > 0 {
@@ -4584,29 +4617,29 @@ pub(crate) fn run_repo_chain(
         walk_plan.push(ir[i * 2 + 1]);
         walk_plan.push(width as u32);
     }
-    let h_plan = client.create_from_slice(bytemuck::cast_slice(&walk_plan));
-    let h_ctc = client.empty(n_tiles * 4);
-    let h_cup = client.empty(n_tiles * units * 4);
-    let h_cxc = client.empty(n_tiles * 4);
-    let h_ctotal = client.empty(4);
-    let h_hp = client.empty(n * 4);
+    let h_plan = alloc_upload(bytemuck::cast_slice(&walk_plan));
+    let h_ctc = alloc_empty(n_tiles * 4);
+    let h_cup = alloc_empty(n_tiles * units * 4);
+    let h_cxc = alloc_empty(n_tiles * 4);
+    let h_ctotal = alloc_empty(4);
+    let h_hp = alloc_empty(n * 4);
     // ── rung 5b: the survivor pass's buffers ─────────────────────────────
     // Two byte flags (leader, survivor) that the PROVEN count_tile /
     // count_spine machinery scans; the ordinal scatter then overwrites
     // them in place with the per-byte exclusive ordinals (lv/sv — see its
     // header), so the flags cost no extra resident memory after the pass.
-    let h_lflag = client.empty(n * 4);
-    let h_sflag = client.empty(n * 4);
-    let h_ltc = client.empty(n_tiles * 4);
-    let h_stc = client.empty(n_tiles * 4);
-    let h_lup = client.empty(n_tiles * units * 4);
-    let h_sup = client.empty(n_tiles * units * 4);
-    let h_lxc = client.empty(n_tiles * 4);
-    let h_sxc = client.empty(n_tiles * 4);
-    let h_lgrand = client.empty(4);
-    let h_sgrand = client.empty(4);
-    let h_ltot = client.empty(item_count.max(1) * 4);
-    let h_stot = client.empty(item_count.max(1) * 4);
+    let h_lflag = alloc_empty(n * 4);
+    let h_sflag = alloc_empty(n * 4);
+    let h_ltc = alloc_empty(n_tiles * 4);
+    let h_stc = alloc_empty(n_tiles * 4);
+    let h_lup = alloc_empty(n_tiles * units * 4);
+    let h_sup = alloc_empty(n_tiles * units * 4);
+    let h_lxc = alloc_empty(n_tiles * 4);
+    let h_sxc = alloc_empty(n_tiles * 4);
+    let h_lgrand = alloc_empty(4);
+    let h_sgrand = alloc_empty(4);
+    let h_ltot = alloc_empty(item_count.max(1) * 4);
+    let h_stot = alloc_empty(item_count.max(1) * 4);
     // The extent lanes, SEEDED in key space exactly like the host loop
     // seeds its accumulators: page at 0.0 (over ALL records), ink at
     // ±inf (over survivors — an item with none keeps the empty extent).
@@ -4630,17 +4663,17 @@ pub(crate) fn run_repo_chain(
             ext_seed[e + 9] = ninf_k;
         }
     }
-    let h_ext = client.create_from_slice(bytemuck::cast_slice(&ext_seed));
+    let h_ext = alloc_upload(bytemuck::cast_slice(&ext_seed));
     let h_pr_colors = if wants_instances {
-        client.create_from_slice(bytemuck::cast_slice(&inputs.per_record_colors))
+        alloc_upload(bytemuck::cast_slice(&inputs.per_record_colors))
     } else {
-        client.empty(4)
+        alloc_empty(4)
     };
     let h_color_base =
-        client.create_from_slice(bytemuck::cast_slice(&inputs.color_base));
-    let h_is_pr = client.create_from_slice(bytemuck::cast_slice(&inputs.is_per_record));
-    let h_flat_colors = client.create_from_slice(bytemuck::cast_slice(&inputs.flat_colors));
-    let h_groups = client.create_from_slice(bytemuck::cast_slice(&inputs.groups));
+        alloc_upload(bytemuck::cast_slice(&inputs.color_base));
+    let h_is_pr = alloc_upload(bytemuck::cast_slice(&inputs.is_per_record));
+    let h_flat_colors = alloc_upload(bytemuck::cast_slice(&inputs.flat_colors));
+    let h_groups = alloc_upload(bytemuck::cast_slice(&inputs.groups));
     // The record/instance buffers are fixed rolling CHUNKS, not
     // whole-corpus allocations — see the emitter's rec_first note. Their
     // sizes bind to the device totals now, so they are allocated in the
@@ -4662,6 +4695,13 @@ pub(crate) fn run_repo_chain(
         CubeCount::Static(tiles.min(65535) as u32, tiles.div_ceil(65535) as u32, 1)
     };
     let t_dispatch = std::time::Instant::now();
+    span_upload.record("live_bytes", live.get());
+    drop(sp_upload);
+    // The guard's drop ends the ENTER; the Span handle must drop too or the
+    // span only CLOSEs at function end (spans close at refcount zero), which
+    // would print this phase's close line after the whole tail.
+    drop(span_upload);
+    let sp_dispatch = tracing::info_span!("chain.dispatch").entered();
     unsafe {
         decode::launch_unchecked(
             &client,
@@ -4721,15 +4761,15 @@ pub(crate) fn run_repo_chain(
     let c = bytemuck::cast_slice::<u8, u32>(&tb)[0] as usize;
     let kmax = ((c as u32 + 1).next_power_of_two().trailing_zeros()) as usize;
     let cstride = c + 1;
-    let h_lvl = client.empty((kmax * (c + 1)).max(1) * 4);
-    let h_parent = client.empty((c + 1) * 4);
-    let h_parent_b = client.empty((c + 1) * 4);
+    let h_lvl = alloc_empty((kmax * (c + 1)).max(1) * 4);
+    let h_parent = alloc_empty((c + 1) * 4);
+    let h_parent_b = alloc_empty((c + 1) * 4);
     let mut d0 = vec![1u32; c + 1];
     d0[c] = 0;
-    let h_d0 = client.create_from_slice(bytemuck::cast_slice(&d0));
-    let h_d_a = client.empty((c + 1) * 4);
-    let h_d_b = client.empty((c + 1) * 4);
-    let h_roots = client.create_from_slice(bytemuck::cast_slice(&vec![c as u32; item_count]));
+    let h_d0 = alloc_upload(bytemuck::cast_slice(&d0));
+    let h_d_a = alloc_empty((c + 1) * 4);
+    let h_d_b = alloc_empty((c + 1) * 4);
+    let h_roots = alloc_upload(bytemuck::cast_slice(&vec![c as u32; item_count]));
     unsafe {
         cand_scatter::launch_unchecked(
             &client,
@@ -4984,6 +5024,15 @@ pub(crate) fn run_repo_chain(
     }
     // ── the tail: totals, then the mode's emission loops ─────────────────
     let t_rb = std::time::Instant::now();
+    drop(sp_dispatch);
+    let span_tail = tracing::info_span!(
+        "tail",
+        live_bytes = live.get(),
+        total_records = tracing::field::Empty,
+        total_slots = tracing::field::Empty,
+    );
+    let _sp_tail = span_tail.enter();
+    let sp_totals = tracing::info_span!("tail.totals").entered();
     // The survivor pass's tiny readbacks — per-item leader/survivor totals,
     // prefix-summed on host into rec_base/slot_base and the loop bounds.
     // This is the CPU leader scan's replacement (its 0.195s at the 97MB
@@ -5026,16 +5075,28 @@ pub(crate) fn run_repo_chain(
             expect,
         );
     }
-    let h_base = client.create_from_slice(bytemuck::cast_slice(&rec_base));
+    drop(sp_totals);
+    span_tail.record("total_records", total_records);
+    span_tail.record("total_slots", total_slots);
+    let h_base = alloc_upload(bytemuck::cast_slice(&rec_base));
     let mut recs_all: Vec<u32> = Vec::new();
     if matches!(mode, ChainMode::Records | ChainMode::Both) {
         recs_all.reserve(total_records as usize * 8);
         let chunk_recs = chunk_recs_cap.min(total_records as usize).max(1);
-        let h_recs = client.empty(chunk_recs * 8 * 4);
+        let h_recs = alloc_empty(chunk_recs * 8 * 4);
         let mut first = 0usize;
         while first < total_records as usize {
             let take = chunk_recs.min(total_records as usize - first);
-            let h_win = client.create_from_slice(bytemuck::cast_slice(&[first as u32]));
+            let span_win = tracing::info_span!(
+                "tail.window",
+                tail = "records",
+                first,
+                take,
+                live_bytes = live.get()
+            );
+            let _sp_win = span_win.enter();
+            let h_win = alloc_upload(bytemuck::cast_slice(&[first as u32]));
+            let sp_emit = tracing::info_span!("tail.window.emit").entered();
             unsafe {
                 emit_records::launch_unchecked(
                     &client,
@@ -5054,9 +5115,12 @@ pub(crate) fn run_repo_chain(
                     BufferArg::from_raw_parts(h_win, 1),
                 );
             }
+            drop(sp_emit);
+            let sp_rb = tracing::info_span!("tail.window.readback").entered();
             let cb = client.read_one(h_recs.clone()).expect("read chunk");
             let csv: &[u32] = bytemuck::cast_slice(&cb);
             recs_all.extend_from_slice(&csv[..take * 8]);
+            drop(sp_rb);
             first += take;
         }
     }
@@ -5083,13 +5147,22 @@ pub(crate) fn run_repo_chain(
             inst_all.reserve_exact(total_slots as usize * 12);
         }
         let chunk_slots = chunk_slots_cap.min(total_slots as usize).max(1);
-        let h_out = client.empty(chunk_slots * 12 * 4);
+        let h_out = alloc_empty(chunk_slots * 12 * 4);
         let mut first = 0usize;
         let tail_debug = std::env::var_os("GLYPH_CHAIN_DEBUG").is_some();
         while first < total_slots as usize {
             let take = chunk_slots.min(total_slots as usize - first);
             let t_win = std::time::Instant::now();
-            let h_win = client.create_from_slice(bytemuck::cast_slice(&[first as u32]));
+            let span_win = tracing::info_span!(
+                "tail.window",
+                tail = "instances",
+                first,
+                take,
+                live_bytes = live.get()
+            );
+            let _sp_win = span_win.enter();
+            let h_win = alloc_upload(bytemuck::cast_slice(&[first as u32]));
+            let sp_pack = tracing::info_span!("tail.window.pack").entered();
             unsafe {
                 pack_instances::launch_unchecked(
                     &client,
@@ -5116,11 +5189,15 @@ pub(crate) fn run_repo_chain(
             }
             if let Some(target) = &mapped {
                 let pack_wall = t_win.elapsed();
+                drop(sp_pack);
+                let sp_flush = tracing::info_span!("tail.window.flush").entered();
                 let t_flush = std::time::Instant::now();
                 let res = client
                     .get_resource::<WgpuServer<AutoCompiler>>(h_out.clone())
                     .expect("instance window resource");
                 let flush_wall = t_flush.elapsed();
+                drop(sp_flush);
+                let sp_copy = tracing::info_span!("tail.window.copy").entered();
                 let t_copy = std::time::Instant::now();
                 let r = res.resource();
                 let mut enc = device_ref.device.create_command_encoder(
@@ -5146,6 +5223,7 @@ pub(crate) fn run_repo_chain(
                     s += here;
                 }
                 device_ref.queue.submit([enc.finish()]);
+                drop(sp_copy);
                 if tail_debug {
                     println!(
                         "  tail window {first} (take {take}): pack+submit {pack_wall:?} | flush {flush_wall:?} | copy+submit {:?}",
@@ -5153,13 +5231,17 @@ pub(crate) fn run_repo_chain(
                     );
                 }
             } else {
+                drop(sp_pack);
+                let sp_rb = tracing::info_span!("tail.window.readback").entered();
                 let cb = client.read_one(h_out.clone()).expect("read instance chunk");
                 let csv: &[u32] = bytemuck::cast_slice(&cb);
                 inst_all.extend_from_slice(&csv[..take * 12]);
+                drop(sp_rb);
             }
             first += take;
         }
         if copy_hop {
+            let sp_drain = tracing::info_span!("tail.drain").entered();
             let t_wait = std::time::Instant::now();
             device_ref
                 .device
@@ -5171,10 +5253,12 @@ pub(crate) fn run_repo_chain(
             if tail_debug {
                 println!("  tail final wait: {:?}", t_wait.elapsed());
             }
+            drop(sp_drain);
         }
         // Placements from the extent lanes — the same reduction the host
         // compaction performs (page over ALL records, ink over survivors),
         // decoded from key space.
+        let _sp_placements = tracing::info_span!("tail.placements").entered();
         let tb_e = client.read_one(h_ext.clone()).expect("extent lanes");
         let ev: &[u32] = bytemuck::cast_slice(&tb_e);
         placements.reserve(item_count);
