@@ -849,18 +849,47 @@ pub(crate) fn run_repo_chain(
         // next window's pack overwrites the rolling buffer. One final
         // Wait-poll makes the bytes visible before the caller's staging
         // reads the pointer. Without a mapped arena (non-Metal,
-        // GPU-less), the readback hop stands — measured the cheaper
-        // product everywhere it can run.
-        let copy_hop = mapped.is_some();
+        // GPU-less), the readback hop stands.
+        //
+        // THE FOOTPRINT GATE (note 22 step 2): the copy hop holds the
+        // chain's lanes AND the whole mapped arena live on device through
+        // the window loop; past the driver's working set the copies
+        // throttle ~460x (measured: 64 GB/s under, 0.14 GB/s over, the
+        // cliff between ~10 and ~10.9 GB live on this 16 GB M2 — the
+        // standing 28.5s break at the 12.44 GB flagship). The ledger
+        // makes the estimate EXACT — lanes + rolling chunk here, plus the
+        // arena's slots×48 — so over budget the readback hop runs
+        // instead: the backstop, forever, and the flagship's ~6.75s form.
+        let chunk_slots = chunk_slots_cap.min(total_slots as usize).max(1);
+        let h_out = alloc_empty(chunk_slots * 12 * 4);
+        let copy_hop = match &mapped {
+            Some(_) => {
+                let est = live.get() + total_slots as u64 * 48;
+                let budget = footprint_budget();
+                let fits = est < budget;
+                log::info!(
+                    "footprint gate: {:.2} GB est live ({:.2} lanes+chunk + {:.2} arena) vs {:.2} GB budget — {} hop",
+                    est as f64 / 1e9,
+                    live.get() as f64 / 1e9,
+                    total_slots as f64 * 48.0 / 1e9,
+                    budget as f64 / 1e9,
+                    if fits { "copy" } else { "readback" },
+                );
+                fits
+            }
+            None => false,
+        };
         instances_on_device = copy_hop;
+        // The window loop branches on THIS, not on `mapped`: the gate can
+        // refuse the copy hop with a mapped arena handed in (over budget),
+        // and then the readback arm is what fills `inst_all`.
+        let copy_target = if copy_hop { mapped.as_ref() } else { None };
         if !copy_hop {
             // Exact capacity: the caller takes this allocation over as the
             // Vec-arena's storage (GlyphArena::from_vec, zero copies) — the
             // readback hop must touch these pages exactly once.
             inst_all.reserve_exact(total_slots as usize * 12);
         }
-        let chunk_slots = chunk_slots_cap.min(total_slots as usize).max(1);
-        let h_out = alloc_empty(chunk_slots * 12 * 4);
         let mut first = 0usize;
         let tail_debug = std::env::var_os("GLYPH_CHAIN_DEBUG").is_some();
         while first < total_slots as usize {
@@ -900,7 +929,7 @@ pub(crate) fn run_repo_chain(
                     BufferArg::from_raw_parts(h_win, 1),
                 );
             }
-            if let Some(target) = &mapped {
+            if let Some(target) = copy_target {
                 let pack_wall = t_win.elapsed();
                 drop(sp_pack);
                 let sp_flush = tracing::info_span!("tail.window.flush").entered();
@@ -1021,4 +1050,71 @@ pub(crate) fn run_repo_chain(
             dispatch: t_rb.duration_since(t_dispatch),
         },
     }
+}
+
+/// The copy hop's live-bytes ceiling: a fraction of physical RAM, because
+/// the measured cliff IS the driver's working set (note 22 — Metal's
+/// recommended share runs about 0.66 of RAM, and 0.6 stays under it: a
+/// named heuristic, not a derivation). GLYPH_FOOTPRINT_BUDGET overrides
+/// (bytes) for experiments — 0 forces the readback hop, which is how the
+/// fork gate's fourth pass fences the readback-into-mapped-arena form.
+fn footprint_budget() -> u64 {
+    static BUDGET: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *BUDGET.get_or_init(|| {
+        if let Some(v) = std::env::var("GLYPH_FOOTPRINT_BUDGET")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+        {
+            return v;
+        }
+        (physical_ram_bytes() as f64 * 0.6) as u64
+    })
+}
+
+/// Physical RAM in bytes. No new dependency for one fact: `hw.memsize` on
+/// macOS, `/proc/meminfo` on Linux — the two hosts this crate runs on.
+#[cfg(target_os = "macos")]
+fn physical_ram_bytes() -> u64 {
+    extern "C" {
+        fn sysctlbyname(
+            name: *const std::ffi::c_char,
+            oldp: *mut std::ffi::c_void,
+            oldlenp: *mut usize,
+            newp: *const std::ffi::c_void,
+            newlen: usize,
+        ) -> std::ffi::c_int;
+    }
+    let mut bytes: u64 = 0;
+    let mut len = std::mem::size_of::<u64>();
+    let rc = unsafe {
+        sysctlbyname(
+            c"hw.memsize".as_ptr(),
+            &mut bytes as *mut u64 as *mut std::ffi::c_void,
+            &mut len,
+            std::ptr::null(),
+            0,
+        )
+    };
+    assert!(
+        rc == 0 && len == 8,
+        "sysctlbyname(hw.memsize) failed: rc {rc}, len {len}"
+    );
+    bytes
+}
+
+/// The Linux form — `MemTotal:` is in kB.
+#[cfg(target_os = "linux")]
+fn physical_ram_bytes() -> u64 {
+    let info = std::fs::read_to_string("/proc/meminfo").expect("/proc/meminfo readable");
+    for line in info.lines() {
+        if let Some(rest) = line.strip_prefix("MemTotal:") {
+            let kb: u64 = rest
+                .trim()
+                .strip_suffix("kB")
+                .and_then(|v| v.trim().parse().ok())
+                .expect("MemTotal parses");
+            return kb * 1024;
+        }
+    }
+    panic!("no MemTotal line in /proc/meminfo");
 }

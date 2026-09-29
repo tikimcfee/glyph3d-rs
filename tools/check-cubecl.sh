@@ -77,6 +77,24 @@ fork)
         echo "$out" | tail -5
         exit 1
     fi
+    # The READBACK hop over the mapped arena, fenced: the footprint gate
+    # (note 22 step 2) picks copy vs readback by estimated live bytes, and
+    # GLYPH_FOOTPRINT_BUDGET=0 forces readback — the combination the gate
+    # chooses at the flagship (over budget), where hand_off's
+    # write_bytes_at splits the host instance mass across the arena's
+    # chunk buffers. Same misaligned shapes as the chunked-arena pass so
+    # the split math crosses buffer boundaries; the instance tier compares
+    # per chunk buffer, so a wrong rebase lands exactly where it looks.
+    if out=$(GLYPH_FOOTPRINT_BUDGET=0 GLYPH_ARENA_CHUNK_SLOTS=50000 GLYPH_RECORD_CHUNK=60000 "$BIN" --cubecl-repo-check native/fixtures/cubecl-fork 2>&1); then
+        echo "$out" | grep -q "cubecl-repo-check PASS" \
+            && echo "$out" | grep -q "strict: bit-exact" \
+            && echo "PASS  cubecl-fork-readback-hop (GLYPH_FOOTPRINT_BUDGET=0, six buffers)" \
+            || { echo "FAIL  cubecl-fork-readback-hop — PASS/strict lines missing"; echo "$out" | tail -5; exit 1; }
+    else
+        echo "FAIL  cubecl-fork-readback-hop — exited nonzero"
+        echo "$out" | tail -5
+        exit 1
+    fi
     echo "ALL PASS"
     ;;
 *)

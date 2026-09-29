@@ -394,7 +394,7 @@ kind = "cmd"
 cmd = "bash tools/check-cubecl.sh fork"
 pass_line = "ALL PASS"
 needs = ["renderer", "dylib"]
-compare = "the full chain's records vs the ENGINE's batched records on the standing fork fixture, BIT-exact (strict), with the census's m>=3 and seg>=3 buckets proven exercised; plus the rung-5b tiers: instances byte-equal vs the engine arena, placements bit-equal — three passes: default, chunked emit windows, chunked windows over a chunked arena"
+compare = "the full chain's records vs the ENGINE's batched records on the standing fork fixture, BIT-exact (strict), with the census's m>=3 and seg>=3 buckets proven exercised; plus the rung-5b tiers: instances byte-equal vs the engine arena, placements bit-equal — four passes: default, chunked emit windows, chunked windows over a chunked arena, and the footprint gate's readback hop forced over the chunked arena"
 blind_to = "corpora outside the fixture; a fault the engine and chain both carry (ground truth layers: engine-check, reference-port)"
 
 # ── Declared mutations ───────────────────────────────────────────────────
@@ -865,6 +865,17 @@ rebuild = "cargo build --release"
 op = "replace"
 find = "                        &target.buffers[k],"
 with = "                        &target.buffers[0],"
+expect = "instance mismatch words"
+
+[[mutation]]
+name = "mapped-write-slot-advance-dropped"
+gate = "cubecl-fork"
+why = "write_bytes_at (the readback hop's mapped-arena hand-off) walks slot/off together across the arena's chunk buffers; dropping the slot advance pins every iteration's dst to chunk 0's base (memory-safe: take stays within cap) while the source windows advance — chunk 0 ends holding the LAST window's bytes and buffers 1+ stay zeroed. Only the readback-hop pass (GLYPH_FOOTPRINT_BUDGET=0, six buffers) can see it: the copy-hop passes never call write_bytes_at. Design note: the first form of this mutation pinned the chunk INDEX (`k = 0`), which makes `take` zero at the boundary — an infinite loop that hangs the gate instead of reddening it; mutations must terminate, so break the ADVANCE, not the arithmetic. CONSUMED BY: the instance tier's per-chunk compare"
+file = "native/src/layout.rs"
+rebuild = "cargo build --release"
+op = "replace"
+find = "            slot += take / slot_size;"
+with = "            slot += 0;"
 expect = "instance mismatch words"
 
 [[mutation]]

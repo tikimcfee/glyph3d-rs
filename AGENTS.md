@@ -424,14 +424,18 @@ plus the rung-5b product tiers — instances byte-equal against the engine
 arena, placements bit-equal — with the fork census's m >= 3 and seg >= 3
 buckets proven exercised — an unexercised corpus is a FAIL, so the fixture
 cannot quietly stop covering the paginate arithmetic classes. The gate runs
-the fixture THREE times: default; `GLYPH_RECORD_CHUNK=60000` (five emit
+the fixture FOUR times: default; `GLYPH_RECORD_CHUNK=60000` (five emit
 windows), so the chunked emitter's `rec_first` carry is fenced on an ordinary
-corpus; and `GLYPH_ARENA_CHUNK_SLOTS=50000 GLYPH_RECORD_CHUNK=60000` (six
+corpus; `GLYPH_ARENA_CHUNK_SLOTS=50000 GLYPH_RECORD_CHUNK=60000` (six
 arena buffers, windows misaligned), fencing the copy hop's window→chunk split
-and the multi-buffer arena forms. The `emitter-window-offset-dropped` and
-`arena-chunk-offset-dropped` mutations each redden only through their
-respective chunked passes. Blind to corpora outside the fixture, to a fault
-the engine and chain share (ground truth layers: engine-check,
+and the multi-buffer arena forms; and `GLYPH_FOOTPRINT_BUDGET=0` with the
+same shapes (2026-09-29), forcing the footprint gate's READBACK hop over the
+chunked mapped arena — the combination the gate picks at the flagship, where
+`hand_off`'s `write_bytes_at` splits the host instance mass across chunk
+buffers. The `emitter-window-offset-dropped`, `arena-chunk-offset-dropped`
+and `mapped-write-chunk-offset-dropped` mutations each redden only through
+their respective chunked passes. Blind to corpora outside the fixture, to a
+fault the engine and chain share (ground truth layers: engine-check,
 reference-port), and to non-robust backend behavior (Metal discards the
 phantom-class writes; see the mutation's `why`).
 

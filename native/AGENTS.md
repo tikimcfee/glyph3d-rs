@@ -238,7 +238,13 @@ default derived from the tighter of the storage-binding and buffer-size
 limits — the fork gate's third pass sets 50,000 alongside
 GLYPH_RECORD_CHUNK=60,000 so five emit windows cross six arena buffers
 with the boundaries misaligned, fencing the copy hop's window→chunk split
-and the multi-buffer arena forms on a small corpus).
+and the multi-buffer arena forms on a small corpus),
+`GLYPH_FOOTPRINT_BUDGET=<bytes>` (the footprint gate's live-bytes ceiling,
+default 0.6 × physical RAM — the copy hop runs only when the ledger's
+estimate (chain lanes + rolling chunk + the mapped arena) fits under it;
+0 forces the readback hop, which is how the fork gate's fourth pass
+fences the readback-into-mapped-arena form the flagship rides). The
+gate's decision prints at default info level with the estimate and budget.
 
 ## Commit cadence
 
