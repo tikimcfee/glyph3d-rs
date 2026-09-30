@@ -25,7 +25,8 @@
 //!
 //! EDITS write through to the GPU with PARTIAL uploads only:
 //!   - instance fields (color/pos/advance/height): queue.write_buffer into
-//!     the affected arena chunk at slot granularity (48 B stride, 4-aligned);
+//!     the affected arena chunk at slot granularity (32 B RenderSlot stride,
+//!     4-aligned);
 //!   - group TRS/color/alpha: one 80 B GroupRow write per edit, plus a CPU
 //!     segment-table sync (AABB follows the group; backdrop tint follows the
 //!     group color; hidden groups are skipped by the cull entirely).
@@ -61,6 +62,7 @@
 //! be revisited after a wgpu upgrade.
 
 use glam::{DVec3, Vec3};
+use bytemuck::Zeroable;
 use std::cell::Cell;
 use wgpu::util::DeviceExt;
 
@@ -85,7 +87,7 @@ mod tint;
 pub use tint::{SegTintAccum, seg_tint};
 
 mod instance;
-pub use instance::{GlyphInstance, GroupRow};
+pub use instance::{GlyphInstance, GroupRow, RenderSlot};
 use instance::{FrameUniform, Params};
 
 mod target;
@@ -321,44 +323,27 @@ impl GlyphScene {
         // buffer per chunk, the chunking computed from the same limits at
         // creation, and the draw path follows the arena's own chunk size
         // (they must agree: the cull/pick slot math keys on chunk_cap).
+        //
+        // E2a (note 23): the shader binds the 32 B RenderSlot, so the draw
+        // chunks count in RenderSlot stride and EVERY arena form transcodes
+        // at staging (the 48 B GlyphInstance remains the FFI/engine form —
+        // the values the vertex math reads are unchanged, so the goldens
+        // stay byte-equal by construction). The mapped arena's direct bind
+        // is suspended for the form change; E2b replaces it with the
+        // chain's device-resident slots — no transcode on that path.
         let binding_limit = ctx.device.limits().max_storage_buffer_binding_size as usize;
-        let chunk_cap = (binding_limit / std::mem::size_of::<GlyphInstance>()).max(1);
+        let chunk_cap = (binding_limit / std::mem::size_of::<RenderSlot>()).max(1);
         let instances_len = arena.len();
-        let (chunk_cap, chunk_counts, arena_bufs): (usize, Vec<u32>, Option<Vec<wgpu::Buffer>>) =
-            match arena.mapped_target() {
-                Some(target) => {
-                    let cap = target.chunk_slots;
-                    let mut bufs = target.buffers;
-                    let mut counts: Vec<u32> = bufs
-                        .iter()
-                        .enumerate()
-                        .map(|(k, _)| {
-                            instances_len.saturating_sub(k * cap).min(cap) as u32
-                        })
-                        .collect();
-                    // The capacity estimate can leave an empty tail buffer;
-                    // it gets no binding (nothing draws from it).
-                    while counts.last() == Some(&0) {
-                        counts.pop();
-                    }
-                    if counts.is_empty() {
-                        counts.push(1); // a mapped-empty arena binds its zeroed first slot
-                    }
-                    bufs.truncate(counts.len());
-                    (cap, counts, Some(bufs))
-                }
-                None => {
-                    let counts = {
-                        let insts = arena.instances();
-                        if insts.is_empty() {
-                            vec![1]
-                        } else {
-                            insts.chunks(chunk_cap).map(|c| c.len() as u32).collect()
-                        }
-                    };
-                    (chunk_cap, counts, None)
-                }
-            };
+        let mut chunk_counts: Vec<u32> = (0..instances_len.div_ceil(chunk_cap).max(1))
+            .map(|k| (instances_len.saturating_sub(k * chunk_cap)).min(chunk_cap) as u32)
+            .collect();
+        // The mapped-empty arena binds one zeroed slot (nothing draws, but
+        // the safety-net segment reads slot 0).
+        for c in &mut chunk_counts {
+            if *c == 0 {
+                *c = 1;
+            }
+        }
         // Unified-memory upload: with MAPPABLE_PRIMARY_BUFFERS on Metal the
         // storage buffer is created mapped and written straight — wgpu's
         // default path instead zero-fills a full-size staging buffer AND then
@@ -369,26 +354,51 @@ impl GlyphScene {
         // shader reads across the bus.
         let direct_upload = ctx.profile.backend == wgpu::Backend::Metal
             && ctx.profile.mappable_primary_buffers;
-        let instance_bufs: Vec<wgpu::Buffer> = match arena_bufs {
-            Some(bufs) => bufs,
-            None => {
-            let insts = arena.instances();
-            let chunks: Vec<&[GlyphInstance]> = insts.chunks(chunk_cap).collect();
-            let bufs: Vec<wgpu::Buffer> = chunks
-                .iter()
-                .enumerate()
-                .map(|(i, chunk)| {
-                    let label = if chunks.len() == 1 {
-                        "glyph instances".to_string()
-                    } else {
-                        format!("glyph instances {i}/{}", chunks.len())
-                    };
-                    // Stage G: COPY_DST for partial per-slot edit uploads;
-                    // COPY_SRC for the GLYPH_G_DUMP verification readback.
-                    let usage = wgpu::BufferUsages::STORAGE
-                        | wgpu::BufferUsages::COPY_DST
-                        | wgpu::BufferUsages::COPY_SRC;
-                    let bytes: &[u8] = bytemuck::cast_slice(chunk);
+        // The transcode walk: render chunks (RenderSlot stride) intersect
+        // the arena's own chunks (host Vec or mapped slices) — the two
+        // chunkings do not in general coincide, and a straddling range must
+        // transcode bit-identically to a contiguous one (same values, field
+        // order fixed by From<&GlyphInstance>).
+        let arena_chunks = arena.instance_chunks();
+        let mut ac = 0usize;
+        let mut arena_base = 0usize;
+        let instance_bufs: Vec<wgpu::Buffer> = chunk_counts
+            .iter()
+            .enumerate()
+            .map(|(i, &count)| {
+            let label = if chunk_counts.len() == 1 {
+                "glyph instances".to_string()
+            } else {
+                format!("glyph instances {i}/{}", chunk_counts.len())
+            };
+            // Stage G: COPY_DST for partial per-slot edit uploads;
+            // COPY_SRC for the GLYPH_G_DUMP verification readback.
+            let usage = wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC;
+            let first = i * chunk_cap;
+            let need_end = first + count as usize;
+            let mut slots: Vec<RenderSlot> = Vec::with_capacity(count as usize);
+            while slots.len() < count as usize && ac < arena_chunks.len() {
+                let c = arena_chunks[ac];
+                if arena_base + c.len() <= first {
+                    arena_base += c.len();
+                    ac += 1;
+                    continue;
+                }
+                let lo = first - arena_base;
+                let hi = (need_end - arena_base).min(c.len());
+                slots.extend(c[lo..hi].iter().map(RenderSlot::from));
+                if hi == c.len() {
+                    arena_base += c.len();
+                    ac += 1;
+                }
+            }
+            // The mapped-empty arena has no slices at all — pad the one
+            // zeroed slot; a real under-fill is a walk bug, not padding.
+            debug_assert!(instances_len == 0 || slots.len() == count as usize);
+            slots.resize(count as usize, RenderSlot::zeroed());
+            let bytes: &[u8] = bytemuck::cast_slice(&slots);
                     if direct_upload {
                         // hal-created shared buffer, spiked for the mapped-arena
                         // work: MAP_READ in the usage makes wgpu-hal pick
@@ -428,7 +438,7 @@ impl GlyphScene {
                                 .map(|n| n.get())
                                 .unwrap_or(1)
                                 .min(8);
-                            let span = bytes.len().div_ceil(workers).next_multiple_of(48);
+                            let span = bytes.len().div_ceil(workers).next_multiple_of(32);
                             std::thread::scope(|s| {
                                 for (i, src) in bytes.chunks(span).enumerate() {
                                     let off = i * span;
@@ -471,11 +481,8 @@ impl GlyphScene {
                             usage,
                         })
                     }
-                })
-                .collect();
-            bufs
-            }
-        };
+            })
+            .collect();
         let group_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("group table"),
             contents: bytemuck::cast_slice(&groups),
@@ -491,7 +498,7 @@ impl GlyphScene {
         log::info!(
             "glyph field: {} instances ({} MiB) in {} chunk(s) of ≤{} ({} MiB binding limit), {} groups",
             instances_len,
-            (instances_len * std::mem::size_of::<GlyphInstance>()) >> 20,
+            (instances_len * std::mem::size_of::<RenderSlot>()) >> 20,
             chunk_counts.len(),
             chunk_cap,
             binding_limit >> 20,
@@ -1380,7 +1387,7 @@ impl SceneLike for GlyphScene {
         let mut enc = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("debug dump copy"), // Stage L (O2)
         });
-        let off = self.chunk_off(chunk, local * 48);
+        let off = self.chunk_off(chunk, local * 32);
         enc.copy_buffer_to_buffer(self.chunk_buf(chunk), off, &buf, 0, size);
         ctx.queue.submit([enc.finish()]);
         let slice = buf.slice(..);

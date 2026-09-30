@@ -8,7 +8,7 @@
 use glam::DVec3;
 use std::path::PathBuf;
 
-use super::{CameraMode, GlyphInstance, GlyphScene, GroupRow, Selection, FOV_Y};
+use super::{CameraMode, GlyphScene, GroupRow, RenderSlot, Selection, FOV_Y};
 use crate::gpu::GpuContext;
 use crate::layout::{GlyphRecord, ItemParams};
 
@@ -505,11 +505,12 @@ impl GlyphScene {
     }
 
     /// Partial instance-field upload: `data` at byte `field_off` within a
-    /// slot (48 B stride, 4-aligned offsets — write_buffer's requirement).
+    /// slot (32 B RenderSlot stride, 4-aligned offsets — write_buffer's
+    /// requirement).
     fn write_instance(&self, ctx: &GpuContext, slot: u32, field_off: u64, data: &[u8]) {
         let chunk = (slot / self.chunk_cap) as usize;
         let local = (slot % self.chunk_cap) as u64;
-        let off = self.chunk_off(chunk, local * 48 + field_off);
+        let off = self.chunk_off(chunk, local * 32 + field_off);
         ctx.queue.write_buffer(self.chunk_buf(chunk), off, data);
     }
 
@@ -580,7 +581,7 @@ impl GlyphScene {
                 let Some(slot) = g.slot else {
                     return format!("verb recolor-glyph: {rel} '{}' is blank (no instance)", g.ch);
                 };
-                self.write_instance(ctx, slot, 24, &pack(*rgb).to_le_bytes());
+                self.write_instance(ctx, slot, 16, &pack(*rgb).to_le_bytes());
                 format!(
                     "verb recolor-glyph: {rel} row {} col {} slot {slot} -> #{:02x}{:02x}{:02x} (4 B)",
                     g.row, g.col, rgb[0], rgb[1], rgb[2]
@@ -597,12 +598,12 @@ impl GlyphScene {
                 let c = self.cache.as_ref().expect("cache populated: ensure_pick_cache just returned true");
                 let packed = pack(*rgb);
                 // Collect (slot, record) for the row, coalesce into runs of
-                // CONTIGUOUS SLOTS, then rebuild the full 48 B instance
-                // records for each run from the cache (the color field is
-                // strided 48 B apart — a raw color-only byte range would
-                // stomp neighboring fields; a rebuilt-instance range write
-                // keeps it to ONE write_buffer per run).
-                let mut runs: Vec<(u32, Vec<GlyphInstance>)> = Vec::new();
+                // CONTIGUOUS SLOTS, then rebuild the full 32 B slot for each
+                // run from the cache (the color field is strided 32 B apart —
+                // a raw color-only byte range would stomp neighboring fields;
+                // a rebuilt-slot range write keeps it to ONE write_buffer per
+                // run).
+                let mut runs: Vec<(u32, Vec<RenderSlot>)> = Vec::new();
                 let mut total = 0usize;
                 for (i, r) in c.records.iter().enumerate() {
                     if r.row() != row {
@@ -621,17 +622,13 @@ impl GlyphScene {
                         advance = *a;
                         height = *h;
                     }
-                    let inst = GlyphInstance {
+                    let inst = RenderSlot {
                         pos,
                         glyph_id: r.glyph_id(),
-                        row: r.row(),
-                        col: r.col(),
                         color: packed,
                         group_id: gid,
                         advance,
                         height,
-                        flags: 0,
-                        _pad: 0,
                     };
                     match runs.last_mut() {
                         Some((start, insts))
@@ -647,10 +644,10 @@ impl GlyphScene {
                 for (start, insts) in &runs {
                     let chunk = (*start / self.chunk_cap) as usize;
                     let local = (*start % self.chunk_cap) as u64;
-                    let off = self.chunk_off(chunk, local * 48);
+                    let off = self.chunk_off(chunk, local * 32);
                     ctx.queue
                         .write_buffer(self.chunk_buf(chunk), off, bytemuck::cast_slice(insts));
-                    bytes += insts.len() as u64 * 48;
+                    bytes += insts.len() as u64 * 32;
                 }
                 format!(
                     "verb recolor-line: {rel} row {row} — {total} glyphs in {} run(s), {bytes} B uploaded",
@@ -688,7 +685,7 @@ impl GlyphScene {
                     return format!("verb scale-glyph: {rel} '{}' is blank (no instance)", g.ch);
                 };
                 let new_ah = [g.advance * f, g.height * f];
-                self.write_instance(ctx, slot, 32, bytemuck::cast_slice(&new_ah));
+                self.write_instance(ctx, slot, 24, bytemuck::cast_slice(&new_ah));
                 let ov = self
                     .geom_overrides
                     .entry(slot)

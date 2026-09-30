@@ -4,6 +4,13 @@
 //! `layout_tests`. Extracted from `glyph_scene.rs` in the 2026-09 code-shape
 //! refactor — a pure move; `pub(super)` stands in for the same-module
 //! privacy the uniform types had.
+//!
+//! Since E2a (note 23) the SHADER binds the 32 B `RenderSlot`, not the 48 B
+//! `GlyphInstance`: row/col, flags and _pad have no live readers (note 22's
+//! sweep — the shader never read them, pick/verbs ride the engine cache,
+//! seg_tint wants glyph_id+color only). The FFI/engine paths still produce
+//! `GlyphInstance`; staging transcodes field-wise, so the vertex math reads
+//! the same values and the goldens stay byte-equal by construction.
 
 use bytemuck::{Pod, Zeroable};
 
@@ -25,6 +32,35 @@ pub struct GlyphInstance {
     pub height: f32,
     pub flags: u32,
     pub _pad: u32,
+}
+
+/// The render-bound slot — 32 B, what the shader's `InstanceSlot` has been
+/// since E2a. The CubeCL chain's scatter produces this form on device (the
+/// endpoint, note 23); the 48 B engine paths transcode at staging. Field
+/// order is the shader's read order minus the dead lanes — every value the
+/// vertex math reads is bit-identical to the 48 B form's.
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable, encase::ShaderType)]
+pub struct RenderSlot {
+    pub pos: [f32; 3],
+    pub glyph_id: u32,
+    pub color: u32, // packed RGBA8 (sRGB display values)
+    pub group_id: u32,
+    pub advance: f32,
+    pub height: f32,
+}
+
+impl From<&GlyphInstance> for RenderSlot {
+    fn from(g: &GlyphInstance) -> Self {
+        Self {
+            pos: g.pos,
+            glyph_id: g.glyph_id,
+            color: g.color,
+            group_id: g.group_id,
+            advance: g.advance,
+            height: g.height,
+        }
+    }
 }
 
 /// Group table row — 5 vec4s, 80 B, the web's GROUP_STRIDE=5 schema
@@ -139,6 +175,27 @@ mod layout_tests {
         }
     }
 
+    /// The render-bound slot (E2a): 32 B / 8 lanes, mirrors the shader's
+    /// `InstanceSlot`. vec3's 16-alignment does not pad the following u32
+    /// (roundUp(4, 12) = 12) and the array stride rounds 32 up to 16's
+    /// multiple — 32 — so Rust, encase and WGSL agree exactly.
+    #[test]
+    fn render_slot_size_and_offsets() {
+        assert_eq!(<RenderSlot as ShaderSize>::SHADER_SIZE.get(), 32, "WGSL lane map is 8 x 4 B");
+        assert_eq!(std::mem::size_of::<RenderSlot>(), 32);
+        let expected = [
+            ("pos", 0),
+            ("glyph_id", 12),
+            ("color", 16),
+            ("group_id", 20),
+            ("advance", 24),
+            ("height", 28),
+        ];
+        for (i, (name, off)) in expected.iter().enumerate() {
+            assert_eq!(RenderSlot::METADATA.offset(i), *off as u64, "field {name} offset");
+        }
+    }
+
     #[test]
     fn group_row_size_and_offsets() {
         assert_eq!(<GroupRow as ShaderSize>::SHADER_SIZE.get(), 80, "GROUP_STRIDE=5 vec4s");
@@ -194,6 +251,19 @@ mod layout_tests {
         encase::StorageBuffer::new(&mut buf).write(&inst).unwrap();
         assert_eq!(buf.len(), 48);
         assert_eq!(&buf[..], bytemuck::bytes_of(&inst), "GlyphInstance bytes");
+
+        let slot = RenderSlot {
+            pos: [1.5, -2.25, 3.75],
+            glyph_id: 0xAABBCCDD,
+            color: 0xDEADBEEF,
+            group_id: 7,
+            advance: 0.529_741_4,
+            height: 1.0,
+        };
+        let mut buf = Vec::<u8>::new();
+        encase::StorageBuffer::new(&mut buf).write(&slot).unwrap();
+        assert_eq!(buf.len(), 32);
+        assert_eq!(&buf[..], bytemuck::bytes_of(&slot), "RenderSlot bytes");
 
         let row = GroupRow {
             cols: [
