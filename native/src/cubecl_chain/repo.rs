@@ -224,6 +224,15 @@ pub(crate) fn run_repo_chain(
     let mut im = Vec::with_capacity(item_count * IM_STRIDE);
     let mut page_gap_x = Vec::with_capacity(item_count);
     for item in fis {
+        // Note 24 Q3: apply is compiled inline_resolve=false unconditionally
+        // and resolve_x writes lm only for fold > 0 leaders — a foldless
+        // item would render uninitialized lm with every gate green. No
+        // caller produces one today (repo wrap_cols is fixed at 100, and no
+        // CLI flag reaches it); this keeps a future caller honest.
+        assert!(
+            item.wrap_width > 0,
+            "run_repo_chain requires folded items (wrap_width > 0)"
+        );
         ir.push(item.byte_start as u32);
         ir.push((item.byte_start + item.byte_count) as u32);
         ie.push(item.page_rows as u32);
