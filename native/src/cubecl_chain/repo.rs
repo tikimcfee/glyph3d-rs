@@ -12,8 +12,8 @@ use super::decode::decode;
 use super::position::{derive_stride, extent_pair, paginate, resolve_x};
 use super::scan::{apply, spine_scan, tile_scan};
 use super::tail::{
-    EXT_STRIDE, emit_records, item_totals, key_to_float_host, ordinal_scatter, ordered_key_host,
-    scatter_slots, survivor_flags,
+    EXT_STRIDE, emit_records, extent_fold, item_totals, key_to_float_host, ordinal_scatter,
+    ordered_key_host, scatter_slots, survivor_flags,
 };
 use super::{IE_STRIDE, IM_STRIDE, LC_STRIDE, LM_STRIDE, PARTIAL_COUNT_STRIDE, pack_words};
 
@@ -753,6 +753,26 @@ pub(crate) fn run_repo_chain(
             BufferArg::from_raw_parts(h_strides.clone(), item_count * 2),
         );
         prof!(end "paginate");
+        // THE SOLE EXTENT FOLDER (E4, 2026-09-30): the scatter's per-leader
+        // atomics moved here — one raked pass, one atomic set per item-run.
+        // Needs paginate's final lm; rides the survivor test on gi directly.
+        let rake_e = 32usize;
+        prof!(begin "extent_fold");
+        extent_fold::launch_unchecked(
+            &client,
+            tiles_grid(n.div_ceil(units * rake_e).max(1)),
+            CubeDim::new_1d(units as u32),
+            BufferArg::from_raw_parts(h_fl.clone(), n_words),
+            BufferArg::from_raw_parts(h_lm.clone(), n * LM_STRIDE),
+            BufferArg::from_raw_parts(h_sm.clone(), n),
+            BufferArg::from_raw_parts(h_hgt.clone(), n),
+            BufferArg::from_raw_parts(h_gi.clone(), n),
+            BufferArg::from_raw_parts(h_ir.clone(), ir.len()),
+            BufferArg::from_raw_parts(h_ext.clone(), item_count * EXT_STRIDE),
+            units,
+            rake_e,
+        );
+        prof!(end "extent_fold");
         // ── rung 5b: the survivor pass ──────────────────────────────────
         // The proven cluster-counter machinery (count_tile/count_spine) on
         // the two byte flags, then the ordinal scatter overwrites the flags
@@ -1035,7 +1055,6 @@ pub(crate) fn run_repo_chain(
                 BufferArg::from_raw_parts(h_sflag.clone(), n),
                 BufferArg::from_raw_parts(h_slots.clone(), total_slots.max(1) as usize * 8),
                 BufferArg::from_raw_parts(h_tint.clone(), total_slots.max(1) as usize * 2),
-                BufferArg::from_raw_parts(h_ext.clone(), item_count * EXT_STRIDE),
             );
             prof!(end "scatter_slots");
         }

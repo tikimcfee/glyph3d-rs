@@ -206,12 +206,12 @@ pub(super) fn item_totals(
 /// beside it: (glyph_id, color) per slot in slot order, the one
 /// slot-derived readback — seg_tint's bit-exact fold input.
 ///
-/// THE SOLE EXTENT FOLDER. The packer folded extents until E1's prove
-/// caught the duplication masking a mutation (min/max atomics are
-/// idempotent, so the scatter's correct fold silently repaired the
-/// packer's mutated one — a second reducer is a MASK, not just waste).
-/// Page lanes over ALL records (seeds 0.0), ink lanes over survivors
-/// (seeds ±inf), identical arithmetic to the host loop's.
+/// The scatter is pure streaming writes (slot + tint) — the extent fold
+/// moved to `extent_fold` (2026-09-30): 960M per-leader global atomics onto
+/// 52 KB of lanes cost 263ms of the scatter's 364ms at the flagship, while
+/// the writes alone run at the copy floor. (E1's mask lesson stands: a
+/// duplicate reducer is a MASK — exactly one folder per reduction, now
+/// `extent_fold`.)
 #[cube(launch_unchecked)]
 pub(super) fn scatter_slots(
     fl: &[u32],
@@ -229,7 +229,6 @@ pub(super) fn scatter_slots(
     sv: &[u32],
     out: &mut [u32],
     tint: &mut [u32],
-    ext: &mut [Atomic<u32>],
 ) {
     let b = ABSOLUTE_POS;
     let n = wc.len();
@@ -241,15 +240,6 @@ pub(super) fn scatter_slots(
         let z = lm[b * LM_STRIDE + LM_Z];
         let adv = sm[b];
         let height = hgt[b];
-        // The same single-rounding shapes as the packer: a bare add and a
-        // power-of-two multiply — contraction-neutral by construction.
-        let right = x + adv;
-        let half = height * 0.5f32;
-        let e = it * EXT_STRIDE;
-        ext[e].fetch_max(ordered_key(right));
-        ext[e + 1].fetch_min(ordered_key(y));
-        ext[e + 2].fetch_min(ordered_key(z));
-        ext[e + 3].fetch_max(ordered_key(z));
         if gi[b] != 0u32 {
             let w = sv[b] as usize * 8;
             let color = if is_per_record[it] != 0u32 {
@@ -278,12 +268,149 @@ pub(super) fn scatter_slots(
                 out[w + 6] = adv.to_bits();
                 out[w + 7] = height.to_bits();
             }
-            ext[e + 4].fetch_min(ordered_key(x));
-            ext[e + 5].fetch_min(ordered_key(y - half));
-            ext[e + 6].fetch_max(ordered_key(right));
-            ext[e + 7].fetch_max(ordered_key(y + half));
-            ext[e + 8].fetch_min(ordered_key(z));
-            ext[e + 9].fetch_max(ordered_key(z));
+        }
+    }
+}
+
+/// THE SOLE EXTENT FOLDER (taken off the scatter, 2026-09-30): the scatter's
+/// per-leader global atomics (~960M onto 52 KB of lanes) cost 263ms of its
+/// 364ms at the flagship, while its writes alone run at the copy floor.
+/// Min/max under the ordered key is EXACT and order-free, so any grouping
+/// reproduces the bits — the fold runs at the tile_scan shape instead
+/// (raked units, full occupancy): a thread accumulates its rake in
+/// registers and flushes ONE atomic set per item-run (the item tracking
+/// mirrors tile_scan's `nxt` walk). Page lanes over ALL records (the 0.0
+/// seeds ride the local accumulators — folding the seed again is
+/// idempotent), ink lanes over survivors (±inf), and the scatter's
+/// arithmetic unchanged (a bare add, a power-of-two multiply —
+/// contraction-neutral by construction).
+#[cube(launch_unchecked)]
+pub(super) fn extent_fold(
+    fl: &[u32],
+    lm: &[f32],
+    sm: &[f32],
+    hgt: &[f32],
+    gi: &[u32],
+    ir: &[u32],
+    ext: &mut [Atomic<u32>],
+    #[comptime] units: usize,
+    #[comptime] rake: usize,
+) {
+    let tile = CUBE_POS;
+    let u = UNIT_POS as usize;
+    let n = fl.len() * 4; // packed: words -> bytes
+    let item_count = ir.len() / 2;
+    let lo = tile * (units * rake) + u * rake;
+    let hi = if lo + rake < n { lo + rake } else { n };
+    if lo < n && item_count > 0 {
+        let mut it = item_search(ir, item_count, lo);
+        let mut nxt = if it + 1 < item_count { ir[(it + 1) * 2] as usize } else { n };
+        // The current item-run's accumulators. The any-flags keep
+        // leaderless/survivorless runs silent; the seeds reproduce the
+        // buffer's, so a flush is idempotent against them.
+        let mut pg_rmax = f32::new(0.0f32);
+        let mut pg_ymin = f32::new(0.0f32);
+        let mut pg_zmin = f32::new(0.0f32);
+        let mut pg_zmax = f32::new(0.0f32);
+        // (f32::new of MAX literals, not INFINITY: the guard means these
+        // sentinels never reach an atomic unfolded.)
+        let mut ink_xmin = f32::new(3.4028235e38f32);
+        let mut ink_ymin = f32::new(3.4028235e38f32);
+        let mut ink_rmax = f32::new(-3.4028235e38f32);
+        let mut ink_ymax = f32::new(-3.4028235e38f32);
+        let mut ink_zmin = f32::new(3.4028235e38f32);
+        let mut ink_zmax = f32::new(-3.4028235e38f32);
+        let mut any_leader = false;
+        let mut any_survivor = false;
+        let mut id = lo;
+        while id <= hi {
+            if id == hi || nxt <= id {
+                // The rake's end or an item boundary: flush the run.
+                if any_leader {
+                    let e = it * EXT_STRIDE;
+                    ext[e].fetch_max(ordered_key(pg_rmax));
+                    ext[e + 1].fetch_min(ordered_key(pg_ymin));
+                    ext[e + 2].fetch_min(ordered_key(pg_zmin));
+                    ext[e + 3].fetch_max(ordered_key(pg_zmax));
+                    if any_survivor {
+                        ext[e + 4].fetch_min(ordered_key(ink_xmin));
+                        ext[e + 5].fetch_min(ordered_key(ink_ymin));
+                        ext[e + 6].fetch_max(ordered_key(ink_rmax));
+                        ext[e + 7].fetch_max(ordered_key(ink_ymax));
+                        ext[e + 8].fetch_min(ordered_key(ink_zmin));
+                        ext[e + 9].fetch_max(ordered_key(ink_zmax));
+                    }
+                    pg_rmax = f32::new(0.0f32);
+                    pg_ymin = f32::new(0.0f32);
+                    pg_zmin = f32::new(0.0f32);
+                    pg_zmax = f32::new(0.0f32);
+                    ink_xmin = f32::new(3.4028235e38f32);
+                    ink_ymin = f32::new(3.4028235e38f32);
+                    ink_rmax = f32::new(-3.4028235e38f32);
+                    ink_ymax = f32::new(-3.4028235e38f32);
+                    ink_zmin = f32::new(3.4028235e38f32);
+                    ink_zmax = f32::new(-3.4028235e38f32);
+                    any_leader = false;
+                    any_survivor = false;
+                }
+                if id == hi {
+                    break;
+                }
+                // Advance past the boundary — a WHILE, not an if: empty
+                // items share their start with the next item, and a
+                // single-step advance misassigns the boundary byte's leader
+                // to the empty item's lanes (found by the repo-verify seam
+                // on g-pick-repo's empty.rs — the fork fixture then had no
+                // empty file; it does now).
+                while nxt <= id {
+                    it += 1;
+                    nxt = if it + 1 < item_count { ir[(it + 1) * 2] as usize } else { n };
+                }
+            }
+            if flags_at(fl, id) & F_LEADER != 0 {
+                any_leader = true;
+                let x = lm[id * LM_STRIDE + LM_X];
+                let y = lm[id * LM_STRIDE + LM_Y];
+                let z = lm[id * LM_STRIDE + LM_Z];
+                let right = x + sm[id];
+                if right > pg_rmax {
+                    pg_rmax = right;
+                }
+                if y < pg_ymin {
+                    pg_ymin = y;
+                }
+                if z < pg_zmin {
+                    pg_zmin = z;
+                }
+                if z > pg_zmax {
+                    pg_zmax = z;
+                }
+                if gi[id] != 0u32 {
+                    any_survivor = true;
+                    let half = hgt[id] * 0.5f32;
+                    let y_lo = y - half;
+                    let y_hi = y + half;
+                    if x < ink_xmin {
+                        ink_xmin = x;
+                    }
+                    if y_lo < ink_ymin {
+                        ink_ymin = y_lo;
+                    }
+                    if right > ink_rmax {
+                        ink_rmax = right;
+                    }
+                    if y_hi > ink_ymax {
+                        ink_ymax = y_hi;
+                    }
+                    if z < ink_zmin {
+                        ink_zmin = z;
+                    }
+                    if z > ink_zmax {
+                        ink_zmax = z;
+                    }
+                }
+            }
+            id += 1;
         }
     }
 }

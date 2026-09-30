@@ -892,12 +892,12 @@ expect = "cubecl-fork-chunked"
 [[mutation]]
 name = "ink-half-height-dropped"
 gate = "cubecl-fork"
-why = "the ink bottom extent folds y − height/2 over survivors (the quads hang half a glyph below the baseline); dropping the half makes it fold the bare baseline, which the placement tier's bit_eq must catch while the instance tier stays green — the two tiers fence disjoint lanes of the same kernel. The multiply is by 0.5, exact, so the mutation is purely the formula. CONSUMED BY: scatter_slots' ink min-y lane (THE SOLE extent folder since E1 — the packer's duplicate folds were deleted because idempotent min/max made them a mutation MASK), decoded into ItemPlacement.ink.min[1]"
+why = "the ink bottom extent folds y − height/2 over survivors (the quads hang half a glyph below the baseline); dropping the half makes it fold the bare baseline, which the placement tier's bit_eq must catch while the instance tier stays green — the two tiers fence disjoint lanes. The multiply is by 0.5, exact, so the mutation is purely the formula. CONSUMED BY: extent_fold's ink min-y lane (THE SOLE extent folder — since 2026-09-30 the fold rides its own raked kernel, not the scatter; the packer's duplicate folds were deleted at E1 because idempotent min/max made them a mutation MASK), decoded into ItemPlacement.ink.min[1]"
 file = "native/src/cubecl_chain/tail.rs"
 rebuild = "cargo build --release"
 op = "replace"
-find = "            ext[e + 5].fetch_min(ordered_key(y - half));"
-with = "            ext[e + 5].fetch_min(ordered_key(y));"
+find = "                    let y_lo = y - half;"
+with = "                    let y_lo = y;"
 expect = "placement mismatch"
 
 [[mutation]]
