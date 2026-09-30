@@ -498,10 +498,11 @@ impl GlyphScene {
         &self.instance_bufs[chunk]
     }
 
-    /// Byte offset of `local` within the chunk's data — every chunk buffer
-    /// starts at its own index 0.
-    pub(super) fn chunk_off(&self, _chunk: usize, local: u64) -> u64 {
-        local
+    /// Byte offset of `local` within the chunk's data — the staged buffers
+    /// start at their own index 0; the endpoint's extracted pool slices
+    /// carry their offset in `chunk_offsets`.
+    pub(super) fn chunk_off(&self, chunk: usize, local: u64) -> u64 {
+        self.chunk_offsets[chunk] + local
     }
 
     /// Partial instance-field upload: `data` at byte `field_off` within a

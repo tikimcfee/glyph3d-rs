@@ -59,6 +59,28 @@ impl<'a> SegTintAccum<'a> {
         }
     }
 
+    /// The endpoint's tint-stream form (note 23, E2b): (glyph_id, color)
+    /// per slot in slot order — the SAME fold as `add` reads from the 48 B
+    /// instances, so the tints are bit-identical whichever arena form fed
+    /// the load. Slot order IS arena order (both are survivor order).
+    pub fn add_tint(&mut self, pairs: &[u32]) {
+        static SRGB_TO_LINEAR: std::sync::LazyLock<[f64; 256]> =
+            std::sync::LazyLock::new(|| std::array::from_fn(|k| (k as f64 / 255.0).powf(2.2)));
+        for &[gi, color] in pairs.as_chunks::<2>().0 {
+            if let Some(Some(ink)) = self.slot_ink.get(gi as usize) {
+                for (i, s) in self.sum.iter_mut().enumerate() {
+                    *s += ink[i] as f64;
+                }
+                self.cells += 2;
+                continue;
+            }
+            for (i, s) in self.sum.iter_mut().enumerate() {
+                *s += SRGB_TO_LINEAR[((color >> (8 * i)) & 0xFF) as usize];
+            }
+            self.cells += 1;
+        }
+    }
+
     /// `n` is the range's instance count (the divisor), `width × height` the
     /// file's world rect.
     pub fn finish(self, n: usize, width: f32, height: f32) -> [f32; 4] {

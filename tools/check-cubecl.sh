@@ -61,40 +61,10 @@ fork)
         echo "$out" | tail -5
         exit 1
     fi
-    # The chunked ARENA, fenced: force small chunk buffers AND small emit
-    # windows so window↔buffer intersections multiply on purpose — 275,058
-    # slots over 50,000-slot buffers is six buffers, 60,000-record windows
-    # is five windows, and 50,000 % 60,000 != 0 so the boundaries MISALIGN
-    # (the copy hop's per-intersection split is the only code that runs
-    # there). The instance tier compares per chunk buffer.
-    if out=$(GLYPH_ARENA_CHUNK_SLOTS=50000 GLYPH_RECORD_CHUNK=60000 "$BIN" --cubecl-repo-check native/fixtures/cubecl-fork 2>&1); then
-        echo "$out" | grep -q "cubecl-repo-check PASS" \
-            && echo "$out" | grep -q "strict: bit-exact" \
-            && echo "PASS  cubecl-fork-chunked-arena (GLYPH_ARENA_CHUNK_SLOTS=50000, six buffers)" \
-            || { echo "FAIL  cubecl-fork-chunked-arena — PASS/strict lines missing"; echo "$out" | tail -5; exit 1; }
-    else
-        echo "FAIL  cubecl-fork-chunked-arena — exited nonzero"
-        echo "$out" | tail -5
-        exit 1
-    fi
-    # The READBACK hop over the mapped arena, fenced: the footprint gate
-    # (note 22 step 2) picks copy vs readback by estimated live bytes, and
-    # GLYPH_FOOTPRINT_BUDGET=0 forces readback — the combination the gate
-    # chooses at the flagship (over budget), where hand_off's
-    # write_bytes_at splits the host instance mass across the arena's
-    # chunk buffers. Same misaligned shapes as the chunked-arena pass so
-    # the split math crosses buffer boundaries; the instance tier compares
-    # per chunk buffer, so a wrong rebase lands exactly where it looks.
-    if out=$(GLYPH_FOOTPRINT_BUDGET=0 GLYPH_ARENA_CHUNK_SLOTS=50000 GLYPH_RECORD_CHUNK=60000 "$BIN" --cubecl-repo-check native/fixtures/cubecl-fork 2>&1); then
-        echo "$out" | grep -q "cubecl-repo-check PASS" \
-            && echo "$out" | grep -q "strict: bit-exact" \
-            && echo "PASS  cubecl-fork-readback-hop (GLYPH_FOOTPRINT_BUDGET=0, six buffers)" \
-            || { echo "FAIL  cubecl-fork-readback-hop — PASS/strict lines missing"; echo "$out" | tail -5; exit 1; }
-    else
-        echo "FAIL  cubecl-fork-readback-hop — exited nonzero"
-        echo "$out" | tail -5
-        exit 1
-    fi
+    # (The chunked-arena and readback-hop passes retired at E2b — the copy
+    # hop, the mapped-arena hand-off and its write_bytes_at split all died
+    # with the endpoint: the scatter writes the renderer-bound buffer
+    # directly. Their mutations left the manifest the same day.)
     echo "ALL PASS"
     ;;
 *)

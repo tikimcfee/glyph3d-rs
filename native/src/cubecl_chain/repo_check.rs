@@ -92,33 +92,17 @@ pub fn repo_check(ctx: &GpuContext, dir: &Path) -> ! {
         ChainMode::Both
     };
     let device = SharedDevice::from_ctx(ctx);
-    // The copy hop's own tier: the check's CHAIN side runs the SAME hop the
-    // renderer runs — the fence follows the path. Chunked like the renderer
-    // (one buffer per `arena_chunk_slots`); GLYPH_ARENA_CHUNK_SLOTS forces
-    // small chunks so the gate crosses buffer boundaries on the standing
-    // fixture. Other hosts fence the readback hop instead: each host fences
-    // what it runs.
-    let mut chain_arena = if ctx.profile.backend == wgpu::Backend::Metal
-        && ctx.profile.mappable_primary_buffers
-        && n > 0
-    {
-        crate::glyph_scene::mapped_instance_arena(ctx, n, crate::glyph_scene::arena_chunk_slots(ctx))
-    } else {
-        crate::layout::GlyphArena::new()
-    };
+    // The endpoint (note 23, E2b): the chain's slots live on device in the
+    // renderer-bound buffer; the lane tier reads them back host-side and
+    // compares field-wise against the engine's arena. There is no
+    // chain-side arena to hand off — that machinery (the pack windows, the
+    // hops, the mapped target) retired with the hop it served.
     let stream = run_repo_chain(
         Some(&device),
         &bytes,
         &fis,
         &inputs,
         mode,
-        chain_arena.mapped_target(),
-    );
-    crate::cubecl_layout::hand_off(
-        stream.instances,
-        stream.total_slots as usize,
-        stream.instances_on_device,
-        &mut chain_arena,
     );
     let recs_all = stream.records;
     let total_records = stream.total_records;
@@ -186,55 +170,20 @@ pub fn repo_check(ctx: &GpuContext, dir: &Path) -> ! {
     // the lane arithmetic must match compact_records_into exactly).
     let mut inst_bad = 0usize;
     let mut place_bad = 0usize;
-    let mut lane_bad = 0usize;
+    let mut tint_bad = 0usize;
     if mode != ChainMode::Records {
-        // Arena against arena: the chain side's slots live in
-        // `chain_arena` whichever hop filled it (device copy or readback
-        // hand-off), possibly across SEVERAL chunk buffers — the compare
-        // walks them in order with a running word index, so a window/chunk
-        // offset slip lands on a named slot either way.
+        // ── THE instance tier (note 23, E2b): the endpoint's 32 B slot
+        // stream vs the engine's 48 B arena, FIELD-wise. The slot word map
+        // drops row/col (records-fenced bit-exact below), flags and _pad:
+        // slot [0..3] pos, [3] gi, [4] color, [5] group, [6] adv,
+        // [7] height against engine [0..3], [3], [6], [7], [8], [9]. The
+        // slots are the renderer-bound bytes — this is the fence on the
+        // exact form the shader reads.
         let eng_words: &[u32] = bytemuck::cast_slice(arena.instances());
-        let chain_chunks = chain_arena.instance_chunks();
-        let chain_slots_total: usize = chain_chunks.iter().map(|c| c.len()).sum();
-        if eng_words.len() != chain_slots_total * 12 {
-            inst_bad += 1;
-            println!(
-                "  INSTANCE LENGTH MISMATCH: engine {} slots, chain {} slots",
-                eng_words.len() / 12,
-                chain_slots_total
-            );
-        } else {
-            let mut idx = 0usize;
-            for chunk in &chain_chunks {
-                let cw: &[u32] = bytemuck::cast_slice(chunk);
-                for &b in cw {
-                    let a = eng_words[idx];
-                    if a != b {
-                        inst_bad += 1;
-                        if inst_bad <= 4 {
-                            println!(
-                                "  INSTANCE MISMATCH slot {} word {}: chain {:#x} engine {:#x}",
-                                idx / 12,
-                                idx % 12,
-                                b,
-                                a
-                            );
-                        }
-                    }
-                    idx += 1;
-                }
-            }
-        }
-        // ── the LANE tier (note 23, E1): the endpoint's 32 B scatter vs
-        // the engine's 48 B arena, FIELD-wise. The slot word map drops
-        // row/col (records-fenced), flags and _pad: scatter [0..3] pos,
-        // [3] gi, [4] color, [5] group, [6] adv, [7] height against engine
-        // [0..3], [3], [6], [7], [8], [9]. This is the product form's
-        // fence BEFORE the renderer binds it (E2).
         if !stream.slots.is_empty() {
             const MAP: [usize; 8] = [0, 1, 2, 3, 6, 7, 8, 9];
             if stream.slots.len() * 3 != eng_words.len() * 2 {
-                lane_bad += 1;
+                inst_bad += 1;
                 println!(
                     "  LANE LENGTH MISMATCH: engine {} slots, scatter {} slots",
                     eng_words.len() / 12,
@@ -246,12 +195,44 @@ pub fn repo_check(ctx: &GpuContext, dir: &Path) -> ! {
                         let a = eng_words[s * 12 + e];
                         let b = stream.slots[s * 8 + f];
                         if a != b {
-                            lane_bad += 1;
-                            if lane_bad <= 4 {
+                            inst_bad += 1;
+                            if inst_bad <= 4 {
                                 println!(
                                     "  LANE MISMATCH slot {s} field {f}: scatter {b:#x} engine {a:#x}"
                                 );
                             }
+                        }
+                    }
+                }
+            }
+        }
+        // ── the tint tier (E2b): the tint stream is seg_tint's ONLY input
+        // on the endpoint path, and NO golden view can see it — the
+        // cameras keep all five fixture files near enough that the far-LOD
+        // backdrop substitution (the tint's only pixel reader) never fires
+        // (proven the hard way: scatter-tint-lane-dropped stayed GREEN
+        // under pixel-ab). So the fence is BYTE-level self-consistency
+        // against the engine-fenced slot stream: tint[2s] == slot gi,
+        // tint[2s+1] == slot color. Transitively engine-fenced, by the
+        // tier above.
+        if !stream.slots.is_empty() {
+            if stream.tint.len() * 4 != stream.slots.len() {
+                tint_bad += 1;
+                println!(
+                    "  TINT LENGTH MISMATCH: {} slots, {} tint words",
+                    stream.slots.len() / 8,
+                    stream.tint.len() / 2
+                );
+            } else {
+                for s in 0..stream.slots.len() / 8 {
+                    let (tg, tc) = (stream.tint[s * 2], stream.tint[s * 2 + 1]);
+                    let (sg, sc) = (stream.slots[s * 8 + 3], stream.slots[s * 8 + 4]);
+                    if tg != sg || tc != sc {
+                        tint_bad += 1;
+                        if tint_bad <= 4 {
+                            println!(
+                                "  TINT MISMATCH slot {s}: stream ({tg:#x}, {tc:#x}) vs slot ({sg:#x}, {sc:#x})"
+                            );
                         }
                     }
                 }
@@ -271,7 +252,6 @@ pub fn repo_check(ctx: &GpuContext, dir: &Path) -> ! {
             }
         }
         drop(arena);
-        drop(chain_arena);
         drop(stream.placements);
     }
 
@@ -436,9 +416,9 @@ pub fn repo_check(ctx: &GpuContext, dir: &Path) -> ! {
         "  chain spans: prep {:?} | tables {:?} | init {:?} | pack+upload {:?} | dispatch {:?} (wall; cold-process JIT hides in dispatch)",
         phases.prep, phases.tables, phases.init, phases.upload, phases.dispatch
     );
-    if inst_bad > 0 || place_bad > 0 || lane_bad > 0 {
+    if inst_bad > 0 || place_bad > 0 || tint_bad > 0 {
         eprintln!(
-            "cubecl-repo-check FAIL: {inst_bad} instance mismatch words, {place_bad} placement mismatches, {lane_bad} lane mismatch words"
+            "cubecl-repo-check FAIL: {inst_bad} lane mismatch words, {place_bad} placement mismatches, {tint_bad} tint mismatches"
         );
         std::process::exit(1);
     }
@@ -502,12 +482,9 @@ pub fn repo_check(ctx: &GpuContext, dir: &Path) -> ! {
     );
     if mode != ChainMode::Records {
         println!(
-            "instance tier: {} slots byte-equal, {} placements bit-equal (the pack kernel vs the engine-batched arena)",
-            stream.total_slots, item_count
-        );
-        println!(
-            "lane tier: {} slots field-equal (the 8-word scatter vs the engine arena — the endpoint form, note 23 E1)",
-            stream.slots.len() / 8
+            "instance tier: {} slots field-equal vs the engine arena (the endpoint's 32 B form, note 23), {} placements bit-equal, tint stream consistent",
+            stream.slots.len() / 8,
+            item_count
         );
     }
     std::process::exit(0);

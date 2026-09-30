@@ -89,11 +89,18 @@ a backend or a caller; the short version:
   all. Today it runs the Mojo backend's FFI strategies against each other, in
   two gates: `repo-verify` pairs the record strategies, `repo-verify-direct`
   pairs `Direct` against batched and reports `0 records` because the direct path
-  produces none. The Rust backend is next to receive the same call.
-- **`direct` is the DEFAULT strategy.** `--repo-engine naive|batch` selects a
-  record strategy when you want one; the gates that name a specific pair pin it
-  explicitly, and the repo golden views deliberately do not, so the default gets
-  pixel coverage.
+  produces none. The CubeCL backend answers the same call (its 48 B arena is
+  reconstructed from the records and slot streams — both bit-fenced) — no gate
+  pins that pairing; the cubecl-fork gate is its fence.
+- **`cubecl` is the DEFAULT strategy** since E2b (2026-09-29) — the
+  endpoint is the product path: the chain scatters 32 B slots into the
+  buffer the renderer binds, no hop anywhere. `--repo-engine
+  naive|batch|direct` selects a Mojo strategy when you want one (the
+  gates that name a specific pair pin it explicitly); before the flip
+  `direct` was the default (since 2026-09-07), and the repo golden views
+  deliberately pin no strategy, so the default gets pixel coverage —
+  through the flip they stayed byte-equal (the fork fence proves the
+  chain's output bit-identical to the engine's).
 - A verify over ZERO items refuses. Before 2026-09-07 a missing corpus directory
   printed `PASS: 0 items, 0 instances` and exited 0 — the gate passing having
   compared nothing.
@@ -141,15 +148,16 @@ display's refresh (75 on the first Linux box) and not a fact about the renderer.
   Without it the device is created exactly as before (zero-cost Option).
 - `GLYPH_TRACE=<filter>` — the load path's span instrument (integration
   note 22): `repo.{walk,load,paint,backend,verify,views,layout,staged,
-  segments}`, `cubecl.{marshal,handoff}`, `chain.{prep,tables,init,upload,
-  dispatch}` and `tail.{totals,window.{pack,emit,flush,copy,readback},
-  drain,placements}`, printed on span CLOSE with busy/idle times. The
-  filter is a tracing EnvFilter string (fallback `RUST_LOG`; unset = off,
-  one atomic per span). `glyph3d_native=info` is the useful setting — a
-  bare `info` also admits wgpu/cubecl's own tracing records, which is
-  loud. The spans mirror the LoadStats/ChainPhases Instant boundaries
-  exactly so the two can be cross-checked; the prints stay the
-  presentation contract.
+  segments}`, `cubecl.marshal`, `chain.{prep,tables,init,upload,
+  dispatch}` and `tail.{totals,scatter,tint,window.{emit,readback},
+  placements}` (the window spans are the records emitter's — the
+  instance tail has no windows since E2b), printed on span CLOSE with
+  busy/idle times. The filter is a tracing EnvFilter string (fallback
+  `RUST_LOG`; unset = off, one atomic per span). `glyph3d_native=info`
+  is the useful setting — a bare `info` also admits wgpu/cubecl's own
+  tracing records, which is loud. The spans mirror the
+  LoadStats/ChainPhases Instant boundaries exactly so the two can be
+  cross-checked; the prints stay the presentation contract.
 - `GLYPH_PICK_DEBUG=1` — pick-path diagnostics: pixel ray, AABB hits, local
   point, candidate records (glyph_scene/pick.rs pick functions).
 - `GLYPH_CULL_DEBUG=1` — at t=0.0 prints cull stats: visible draw ranges,
@@ -224,27 +232,22 @@ graph, note 18 §6c), a 4 B setup readback sizes the level tables, and
 fl/sm are diffed bit-exact against `decode_all`+`resolve_clusters`),
 `GLYPH_CHAIN_DEBUG=1` (dumps, incl. the cluster candidate table),
 `GLYPH_RECORD_CHUNK=<n>` (the repo chain's emission window size in ELEMENTS
-— records for the record tail (default 16,777,216 = 512 MB), instance slots
-for the pack tail (default 11,184,810 = 512 MB / 48 B) since rung 5b. The
-cubecl-fork gate sets 60,000 so the standing fixture's 278,470 records cross
-five windows, fencing BOTH tails' window carry on an ordinary corpus; the
-window bases ride runtime params buffers, so every window shares one compiled
-kernel — small values cost dispatches and 4-byte uploads, nothing else),
+— the records tail only (default 16,777,216 = 512 MB); the instance tail
+has NO windows since E2b — the scatter writes the renderer-bound buffer
+directly. The cubecl-fork gate sets 60,000 so the standing fixture's
+278,470 records cross five windows, fencing the emitter's window carry on
+an ordinary corpus; the window bases ride runtime params buffers, so every
+window shares one compiled kernel — small values cost dispatches and
+4-byte uploads, nothing else),
 `GLYPH_REPO_CHECK_TAIL=records` (drops the fork check's instance/placement
 tiers — the big-corpus escape when Both mode's four simultaneous streams
 brush the memory ceiling; the gate never sets it),
 `GLYPH_ARENA_CHUNK_SLOTS=<n>` (the mapped arena's slots per chunk buffer,
 default derived from the tighter of the storage-binding and buffer-size
-limits — the fork gate's third pass sets 50,000 alongside
-GLYPH_RECORD_CHUNK=60,000 so five emit windows cross six arena buffers
-with the boundaries misaligned, fencing the copy hop's window→chunk split
-and the multi-buffer arena forms on a small corpus),
-`GLYPH_FOOTPRINT_BUDGET=<bytes>` (the footprint gate's live-bytes ceiling,
-default 0.6 × physical RAM — the copy hop runs only when the ledger's
-estimate (chain lanes + rolling chunk + the mapped arena) fits under it;
-0 forces the readback hop, which is how the fork gate's fourth pass
-fences the readback-into-mapped-arena form the flagship rides). The
-gate's decision prints at default info level with the estimate and budget.
+limits — the MOJO direct path's knob; the cubecl endpoint allocates its
+own slot buffer and answers to no arena), and the retired
+`GLYPH_FOOTPRINT_BUDGET`/`GLYPH_FOOTPRINT_*` knobs died with the hops at
+E2b (the cliff numbers and the gate's design stay readable in note 22).
 
 ## Commit cadence
 

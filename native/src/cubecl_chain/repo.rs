@@ -13,7 +13,7 @@ use super::position::{derive_stride, extent_pair, paginate, resolve_x};
 use super::scan::{apply, spine_scan, tile_scan};
 use super::tail::{
     EXT_STRIDE, emit_records, item_totals, key_to_float_host, ordinal_scatter, ordered_key_host,
-    pack_instances, scatter_slots, survivor_flags,
+    scatter_slots, survivor_flags,
 };
 use super::{IE_STRIDE, IM_STRIDE, LC_STRIDE, LM_STRIDE, PARTIAL_COUNT_STRIDE, pack_words};
 
@@ -104,6 +104,10 @@ pub(crate) struct SharedDevice {
     pub adapter: wgpu::Adapter,
     pub device: wgpu::Device,
     pub queue: wgpu::Queue,
+    /// The adapter's max_buffer_size — the endpoint's slot buffer asserts
+    /// against it (one buffer holds ≤ 134M slots; chunking past that is the
+    /// named follow-up).
+    pub max_buffer_size: u64,
 }
 
 impl SharedDevice {
@@ -113,8 +117,18 @@ impl SharedDevice {
             adapter: ctx.adapter.clone(),
             device: ctx.device.clone(),
             queue: ctx.queue.clone(),
+            max_buffer_size: ctx.profile.max_buffer_size,
         }
     }
+}
+
+/// The endpoint's render-bound output (note 23, E2b): the 32 B slots on
+/// device, extracted from the chain's allocator, ready to bind as-is. The
+/// guard keeps the pool slice from being handed to a later allocation —
+/// the renderer holds it for the scene's lifetime.
+pub(crate) struct SlotDevice {
+    pub chunk: crate::layout::DeviceSlotChunk,
+    pub keep_alive: Box<dyn std::any::Any + Send>,
 }
 
 /// THE DEVICE LOAD PATH — bytes and per-file items in, the record stream
@@ -130,25 +144,20 @@ pub(crate) struct ChainStream {
     /// totals since rung 5b — the serial CPU scan is gone from every mode).
     pub rec_base: Vec<u32>,
     pub total_records: u32,
-    /// 12 u32 per slot — the GlyphInstance wire form (pos, glyph_id, row,
-    /// col, color, group_id, advance, height, flags, pad), walk order,
-    /// survivor order within items. EMPTY unless Instances/Both.
-    pub instances: Vec<u32>,
     pub total_slots: u32,
-    /// Per-item placements, decoded from the pack kernel's extent lanes —
+    /// Per-item placements, decoded from the scatter's extent lanes —
     /// the same reduction `compact_records_into` does on host (page over
     /// ALL records, ink over survivors, min/max order-free). EMPTY unless
     /// Instances/Both.
     pub placements: Vec<crate::layout::ItemPlacement>,
-    /// True when the copy hop filled the caller's MAPPED ARENA directly
-    /// (rung 5c): `instances` is empty by design and the arena only needs
-    /// its `commit` — the slots never crossed to host.
-    pub instances_on_device: bool,
-    /// 8 u32 per slot — the endpoint's 32 B form (pos, glyph_id, color,
-    /// group_id, advance, height; note 23's E1), walk order, survivor
-    /// order within items, written UNSLOT-WINDOWED at the global survivor
-    /// ordinal. EMPTY unless Both (E1 fences it in the gate; E2 makes it
-    /// the product form and retires `instances`).
+    /// The 32 B slots on device — the endpoint form the renderer binds.
+    /// Some whenever Instances/Both ran and the survivor total is nonzero.
+    pub slot_device: Option<SlotDevice>,
+    /// The tint stream — (glyph_id, color) per slot, slot order, host-side.
+    /// seg_tint's fold input now that no host arena exists. Instances/Both.
+    pub tint: Vec<u32>,
+    /// 8 u32 per slot — the 32 B form READ BACK to host. EMPTY unless Both
+    /// (the fork gate's lane tier reads it; the product never wants it).
     pub slots: Vec<u32>,
     /// The ranked chain's candidate count (diagnostics).
     pub candidates: usize,
@@ -164,7 +173,6 @@ pub(crate) fn run_repo_chain(
     items: &[crate::fold::Item],
     inputs: &InstanceInputs,
     mode: ChainMode,
-    mapped: Option<crate::layout::MappedTarget>,
 ) -> ChainStream {
     let item_count = items.len();
     let n: usize = bytes.len();
@@ -174,14 +182,7 @@ pub(crate) fn run_repo_chain(
     // ChainPhases stays the print contract, the spans are the programmatic
     // instrument, and reading the same boundaries is what lets the two be
     // cross-checked before anything collapses onto either.
-    let _chain = tracing::info_span!(
-        "chain",
-        n,
-        items = item_count,
-        ?mode,
-        mapped = mapped.is_some()
-    )
-    .entered();
+    let _chain = tracing::info_span!("chain", n, items = item_count, ?mode).entered();
     let t_chain0 = std::time::Instant::now();
     let sp_prep = tracing::info_span!("chain.prep").entered();
     // Rung 5b: the serial CPU leader scan is GONE from every mode — the
@@ -398,14 +399,14 @@ pub(crate) fn run_repo_chain(
     // sizes bind to the device totals now, so they are allocated in the
     // tail, after the survivor readback. GLYPH_RECORD_CHUNK shrinks the
     // windows (units = elements) so the fork gate crosses boundaries on
-    // the standing fixture: the windowed carry arithmetic of BOTH tails,
-    // fenced on an ordinary corpus. Defaults keep each buffer at ~512MB:
-    // 16.7M records × 32 B, 11.18M slots × 48 B.
+    // the standing fixture: the emitter's windowed carry arithmetic,
+    // fenced on an ordinary corpus. Default keeps the buffer at ~512MB:
+    // 16.7M records × 32 B. (The instance tail has NO windows since E2b —
+    // the scatter writes the renderer-bound buffer directly.)
     let chunk_env: Option<usize> = std::env::var("GLYPH_RECORD_CHUNK")
         .ok()
         .and_then(|v| v.parse().ok());
     let chunk_recs_cap = chunk_env.unwrap_or(16_777_216);
-    let chunk_slots_cap = chunk_env.unwrap_or(536_870_912 / 48);
     let cubes_of = |threads: usize| {
         let cubes = threads.div_ceil(256);
         CubeCount::Static(cubes.min(65535) as u32, cubes.div_ceil(65535) as u32, 1)
@@ -843,211 +844,91 @@ pub(crate) fn run_repo_chain(
             first += take;
         }
     }
-    let mut inst_all: Vec<u32> = Vec::new();
-    let mut slots_all: Vec<u32> = Vec::new();
     let mut placements: Vec<crate::layout::ItemPlacement> = Vec::new();
-    let mut instances_on_device = false;
+    let mut slots_all: Vec<u32> = Vec::new();
+    let mut tint_all: Vec<u32> = Vec::new();
+    let mut slot_device: Option<SlotDevice> = None;
     if wants_instances {
-        // The COPY HOP (rung 5c): with a mapped arena handed in, no slot
-        // byte ever crosses to host — each window is flushed out of
-        // cubecl's stream by `get_resource` (the flush IS the handoff),
-        // then one encoder copy lands it in the arena's shared storage,
-        // in queue order after the pack that filled it and before the
-        // next window's pack overwrites the rolling buffer. One final
-        // Wait-poll makes the bytes visible before the caller's staging
-        // reads the pointer. Without a mapped arena (non-Metal,
-        // GPU-less), the readback hop stands.
-        //
-        // THE FOOTPRINT GATE (note 22 step 2): the copy hop holds the
-        // chain's lanes AND the whole mapped arena live on device through
-        // the window loop; past the driver's working set the copies
-        // throttle ~460x (measured: 64 GB/s under, 0.14 GB/s over, the
-        // cliff between ~10 and ~10.9 GB live on this 16 GB M2 — the
-        // standing 28.5s break at the 12.44 GB flagship). The ledger
-        // makes the estimate EXACT — lanes + rolling chunk here, plus the
-        // arena's slots×48 — so over budget the readback hop runs
-        // instead: the backstop, forever, and the flagship's ~6.75s form.
-        let chunk_slots = chunk_slots_cap.min(total_slots as usize).max(1);
-        let h_out = alloc_empty(chunk_slots * 12 * 4);
-        let copy_hop = match &mapped {
-            Some(_) => {
-                let est = live.get() + total_slots as u64 * 48;
-                let budget = footprint_budget();
-                let fits = est < budget;
-                log::info!(
-                    "footprint gate: {:.2} GB est live ({:.2} lanes+chunk + {:.2} arena) vs {:.2} GB budget — {} hop",
-                    est as f64 / 1e9,
-                    live.get() as f64 / 1e9,
-                    total_slots as f64 * 48.0 / 1e9,
-                    budget as f64 / 1e9,
-                    if fits { "copy" } else { "readback" },
-                );
-                fits
-            }
-            None => false,
-        };
-        instances_on_device = copy_hop;
-        // The window loop branches on THIS, not on `mapped`: the gate can
-        // refuse the copy hop with a mapped arena handed in (over budget),
-        // and then the readback arm is what fills `inst_all`.
-        let copy_target = if copy_hop { mapped.as_ref() } else { None };
-        if !copy_hop {
-            // Exact capacity: the caller takes this allocation over as the
-            // Vec-arena's storage (GlyphArena::from_vec, zero copies) — the
-            // readback hop must touch these pages exactly once.
-            inst_all.reserve_exact(total_slots as usize * 12);
-        }
-        let mut first = 0usize;
-        let tail_debug = std::env::var_os("GLYPH_CHAIN_DEBUG").is_some();
-        while first < total_slots as usize {
-            let take = chunk_slots.min(total_slots as usize - first);
-            let t_win = std::time::Instant::now();
-            let span_win = tracing::info_span!(
-                "tail.window",
-                tail = "instances",
-                first,
-                take,
-                live_bytes = live.get()
+        // THE ENDPOINT (note 23, E2b): ONE scatter pass writes the 32 B
+        // slots directly into the buffer the renderer will bind — no
+        // windows, no rolling chunk, no hop, no copy; the slots never
+        // cross to host. The pack windows, both hops, and the footprint
+        // gate that chose between them are all gone (the gate's lesson —
+        // the ledger and the cliff numbers — stays in note 22). The
+        // scatter is also the sole extent folder (E1's mask lesson: a
+        // duplicate reducer is a mask, so there is exactly one).
+        let sp_scatter = tracing::info_span!("tail.scatter").entered();
+        assert!(
+            (total_slots as u64) * 32 <= device_ref.max_buffer_size,
+            "the endpoint needs one {} B slot buffer — over this device's \
+             max_buffer_size ({}); chunked slot buffers are the named \
+             follow-up",
+            (total_slots as u64) * 32,
+            device_ref.max_buffer_size,
+        );
+        let h_slots = alloc_empty(total_slots.max(1) as usize * 8 * 4);
+        let h_tint = alloc_empty(total_slots.max(1) as usize * 2 * 4);
+        unsafe {
+            scatter_slots::launch_unchecked(
+                &client,
+                cubes_of(n),
+                CubeDim::new_1d(256),
+                BufferArg::from_raw_parts(h_fl.clone(), n_words),
+                BufferArg::from_raw_parts(h_wc.clone(), n),
+                BufferArg::from_raw_parts(h_ir.clone(), ir.len()),
+                BufferArg::from_raw_parts(h_lm.clone(), n * LM_STRIDE),
+                BufferArg::from_raw_parts(h_sm.clone(), n),
+                BufferArg::from_raw_parts(h_hgt.clone(), n),
+                BufferArg::from_raw_parts(h_gi.clone(), n),
+                BufferArg::from_raw_parts(h_pr_colors.clone(), inputs.per_record_colors.len()),
+                BufferArg::from_raw_parts(h_color_base.clone(), item_count),
+                BufferArg::from_raw_parts(h_is_pr.clone(), item_count),
+                BufferArg::from_raw_parts(h_flat_colors.clone(), item_count),
+                BufferArg::from_raw_parts(h_groups.clone(), item_count),
+                BufferArg::from_raw_parts(h_sflag.clone(), n),
+                BufferArg::from_raw_parts(h_slots.clone(), total_slots.max(1) as usize * 8),
+                BufferArg::from_raw_parts(h_tint.clone(), total_slots.max(1) as usize * 2),
+                BufferArg::from_raw_parts(h_ext.clone(), item_count * EXT_STRIDE),
             );
-            let _sp_win = span_win.enter();
-            let h_win = alloc_upload(bytemuck::cast_slice(&[first as u32]));
-            let sp_pack = tracing::info_span!("tail.window.pack").entered();
-            unsafe {
-                pack_instances::launch_unchecked(
-                    &client,
-                    cubes_of(n),
-                    CubeDim::new_1d(256),
-                    BufferArg::from_raw_parts(h_fl.clone(), n_words),
-                    BufferArg::from_raw_parts(h_wc.clone(), n),
-                    BufferArg::from_raw_parts(h_ir.clone(), ir.len()),
-                    BufferArg::from_raw_parts(h_lm.clone(), n * LM_STRIDE),
-                    BufferArg::from_raw_parts(h_lc.clone(), n * LC_STRIDE),
-                    BufferArg::from_raw_parts(h_sm.clone(), n),
-                    BufferArg::from_raw_parts(h_hgt.clone(), n),
-                    BufferArg::from_raw_parts(h_gi.clone(), n),
-                    BufferArg::from_raw_parts(h_pr_colors.clone(), inputs.per_record_colors.len()),
-                    BufferArg::from_raw_parts(h_color_base.clone(), item_count),
-                    BufferArg::from_raw_parts(h_is_pr.clone(), item_count),
-                    BufferArg::from_raw_parts(h_flat_colors.clone(), item_count),
-                    BufferArg::from_raw_parts(h_groups.clone(), item_count),
-                    BufferArg::from_raw_parts(h_sflag.clone(), n),
-                    BufferArg::from_raw_parts(h_out.clone(), take * 12),
-                    BufferArg::from_raw_parts(h_win, 1),
-                );
-            }
-            if let Some(target) = copy_target {
-                let pack_wall = t_win.elapsed();
-                drop(sp_pack);
-                let sp_flush = tracing::info_span!("tail.window.flush").entered();
-                let t_flush = std::time::Instant::now();
-                let res = client
-                    .get_resource::<WgpuServer<AutoCompiler>>(h_out.clone())
-                    .expect("instance window resource");
-                let flush_wall = t_flush.elapsed();
-                drop(sp_flush);
-                let sp_copy = tracing::info_span!("tail.window.copy").entered();
-                let t_copy = std::time::Instant::now();
+        }
+        drop(sp_scatter);
+        // The one slot-derived readback: the tint stream, seg_tint's
+        // bit-exact fold input — 8 B/slot where the readback hop once
+        // moved 48. The slots themselves stay on device; the queue's
+        // order covers the renderer's later draws, so there is no drain.
+        let sp_tint = tracing::info_span!("tail.tint").entered();
+        let tb = client.read_one(h_tint.clone()).expect("read tint stream");
+        tint_all = bytemuck::cast_slice::<u8, u32>(&tb)[..total_slots as usize * 2].to_vec();
+        drop(sp_tint);
+        // The fork gate's lane tier reads the slot stream host-side.
+        if matches!(mode, ChainMode::Both) {
+            let sb = client.read_one(h_slots.clone()).expect("read slot scatter");
+            slots_all = bytemuck::cast_slice::<u8, u32>(&sb)[..total_slots as usize * 8].to_vec();
+        }
+        // The extraction: the slot buffer becomes the renderer's storage.
+        // get_resource CONSUMES the handle into a ManagedResource whose
+        // binding keeps the pool slice from being re-allocated — so the
+        // guard rides the stream (type-erased) for the scene's lifetime.
+        if total_slots > 0 {
+            let res = client
+                .get_resource::<WgpuServer<AutoCompiler>>(h_slots.clone())
+                .expect("slot buffer resource");
+            let (buffer, offset) = {
                 let r = res.resource();
-                let mut enc = device_ref.device.create_command_encoder(
-                    &wgpu::CommandEncoderDescriptor {
-                        label: Some("glyph instance window"),
-                    },
-                );
-                // The window lands across the arena's chunk buffers — one
-                // copy per chunk intersection (chunk boundaries do not in
-                // general coincide with window boundaries).
-                let mut s = first;
-                while s < first + take {
-                    let k = s / target.chunk_slots;
-                    let in_chunk = s - k * target.chunk_slots;
-                    let here = (target.chunk_slots - in_chunk).min(first + take - s);
-                    enc.copy_buffer_to_buffer(
-                        &r.buffer,
-                        r.offset + ((s - first) * 48) as u64,
-                        &target.buffers[k],
-                        (in_chunk * 48) as u64,
-                        (here * 48) as u64,
-                    );
-                    s += here;
-                }
-                device_ref.queue.submit([enc.finish()]);
-                drop(sp_copy);
-                if tail_debug {
-                    println!(
-                        "  tail window {first} (take {take}): pack+submit {pack_wall:?} | flush {flush_wall:?} | copy+submit {:?}",
-                        t_copy.elapsed()
-                    );
-                }
-            } else {
-                drop(sp_pack);
-                let sp_rb = tracing::info_span!("tail.window.readback").entered();
-                let cb = client.read_one(h_out.clone()).expect("read instance chunk");
-                let csv: &[u32] = bytemuck::cast_slice(&cb);
-                inst_all.extend_from_slice(&csv[..take * 12]);
-                drop(sp_rb);
-            }
-            first += take;
-        }
-        if copy_hop {
-            let sp_drain = tracing::info_span!("tail.drain").entered();
-            let t_wait = std::time::Instant::now();
-            device_ref
-                .device
-                .poll(wgpu::PollType::Wait {
-                    submission_index: None,
-                    timeout: None,
-                })
-                .expect("device poll after instance windows");
-            if tail_debug {
-                println!("  tail final wait: {:?}", t_wait.elapsed());
-            }
-            drop(sp_drain);
-        }
-        // ── E1 (note 23): the endpoint's 32 B slot scatter AND the sole
-        // extent folder (the packer's duplicate folds MASKED a mutation —
-        // idempotent min/max repaired the wrong answer — so there is one
-        // folder). Both mode takes the real slot stream for the fork
-        // gate's lane tier; Instances mode runs the same kernel with a
-        // 1-word dummy `out` — the extents the placements decode from,
-        // every slot write discarded by the whole-extent guard.
-        {
-            let _sp_scatter = tracing::info_span!("tail.scatter").entered();
-            let wants_slots = matches!(mode, ChainMode::Both);
-            let h_slots = alloc_empty(if wants_slots {
-                total_slots as usize * 8 * 4
-            } else {
-                4
+                (r.buffer.clone(), r.offset)
+            };
+            assert!(
+                offset % 16 == 0,
+                "slot buffer's pool offset {offset} breaks the storage binding alignment"
+            );
+            slot_device = Some(SlotDevice {
+                chunk: crate::layout::DeviceSlotChunk {
+                    buffer,
+                    offset,
+                    slots: total_slots,
+                },
+                keep_alive: Box::new(res),
             });
-            unsafe {
-                scatter_slots::launch_unchecked(
-                    &client,
-                    cubes_of(n),
-                    CubeDim::new_1d(256),
-                    BufferArg::from_raw_parts(h_fl.clone(), n_words),
-                    BufferArg::from_raw_parts(h_wc.clone(), n),
-                    BufferArg::from_raw_parts(h_ir.clone(), ir.len()),
-                    BufferArg::from_raw_parts(h_lm.clone(), n * LM_STRIDE),
-                    BufferArg::from_raw_parts(h_sm.clone(), n),
-                    BufferArg::from_raw_parts(h_hgt.clone(), n),
-                    BufferArg::from_raw_parts(h_gi.clone(), n),
-                    BufferArg::from_raw_parts(h_pr_colors.clone(), inputs.per_record_colors.len()),
-                    BufferArg::from_raw_parts(h_color_base.clone(), item_count),
-                    BufferArg::from_raw_parts(h_is_pr.clone(), item_count),
-                    BufferArg::from_raw_parts(h_flat_colors.clone(), item_count),
-                    BufferArg::from_raw_parts(h_groups.clone(), item_count),
-                    BufferArg::from_raw_parts(h_sflag.clone(), n),
-                    BufferArg::from_raw_parts(
-                        h_slots.clone(),
-                        if wants_slots { total_slots as usize * 8 } else { 1 },
-                    ),
-                    BufferArg::from_raw_parts(h_ext.clone(), item_count * EXT_STRIDE),
-                );
-            }
-            if wants_slots {
-                let sb = client.read_one(h_slots.clone()).expect("read slot scatter");
-                slots_all =
-                    bytemuck::cast_slice::<u8, u32>(&sb)[..total_slots as usize * 8].to_vec();
-            }
         }
         // Placements from the extent lanes — the same reduction the host
         // compaction performs (page over ALL records, ink over survivors),
@@ -1087,10 +968,10 @@ pub(crate) fn run_repo_chain(
         records: recs_all,
         rec_base,
         total_records,
-        instances: inst_all,
         total_slots,
         placements,
-        instances_on_device,
+        slot_device,
+        tint: tint_all,
         slots: slots_all,
         candidates: c,
         chain_dur: t_chain0.elapsed(),
@@ -1103,71 +984,4 @@ pub(crate) fn run_repo_chain(
             dispatch: t_rb.duration_since(t_dispatch),
         },
     }
-}
-
-/// The copy hop's live-bytes ceiling: a fraction of physical RAM, because
-/// the measured cliff IS the driver's working set (note 22 — Metal's
-/// recommended share runs about 0.66 of RAM, and 0.6 stays under it: a
-/// named heuristic, not a derivation). GLYPH_FOOTPRINT_BUDGET overrides
-/// (bytes) for experiments — 0 forces the readback hop, which is how the
-/// fork gate's fourth pass fences the readback-into-mapped-arena form.
-fn footprint_budget() -> u64 {
-    static BUDGET: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    *BUDGET.get_or_init(|| {
-        if let Some(v) = std::env::var("GLYPH_FOOTPRINT_BUDGET")
-            .ok()
-            .and_then(|s| s.parse::<u64>().ok())
-        {
-            return v;
-        }
-        (physical_ram_bytes() as f64 * 0.6) as u64
-    })
-}
-
-/// Physical RAM in bytes. No new dependency for one fact: `hw.memsize` on
-/// macOS, `/proc/meminfo` on Linux — the two hosts this crate runs on.
-#[cfg(target_os = "macos")]
-fn physical_ram_bytes() -> u64 {
-    extern "C" {
-        fn sysctlbyname(
-            name: *const std::ffi::c_char,
-            oldp: *mut std::ffi::c_void,
-            oldlenp: *mut usize,
-            newp: *const std::ffi::c_void,
-            newlen: usize,
-        ) -> std::ffi::c_int;
-    }
-    let mut bytes: u64 = 0;
-    let mut len = std::mem::size_of::<u64>();
-    let rc = unsafe {
-        sysctlbyname(
-            c"hw.memsize".as_ptr(),
-            &mut bytes as *mut u64 as *mut std::ffi::c_void,
-            &mut len,
-            std::ptr::null(),
-            0,
-        )
-    };
-    assert!(
-        rc == 0 && len == 8,
-        "sysctlbyname(hw.memsize) failed: rc {rc}, len {len}"
-    );
-    bytes
-}
-
-/// The Linux form — `MemTotal:` is in kB.
-#[cfg(target_os = "linux")]
-fn physical_ram_bytes() -> u64 {
-    let info = std::fs::read_to_string("/proc/meminfo").expect("/proc/meminfo readable");
-    for line in info.lines() {
-        if let Some(rest) = line.strip_prefix("MemTotal:") {
-            let kb: u64 = rest
-                .trim()
-                .strip_suffix("kB")
-                .and_then(|v| v.trim().parse().ok())
-                .expect("MemTotal parses");
-            return kb * 1024;
-        }
-    }
-    panic!("no MemTotal line in /proc/meminfo");
 }

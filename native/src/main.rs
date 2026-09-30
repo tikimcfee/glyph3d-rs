@@ -291,16 +291,14 @@ fn build_scene_impl(
             };
             let load = {
                 let walk = repo::walk_repo(dir);
-                // The device-resident arena: the FFI (Direct) or the pack
-                // kernel's hops (Cubecl, rung 5b/5c) write instances into the
-                // same shared-storage the shader reads, on unified memory.
-                // Past max_buffer_size the CUBECL arena chunks (rung 5e: one
-                // buffer per draw chunk); the FFI's write is one contiguous
-                // region, so Direct keeps the host arena there instead.
-                let arena = if matches!(
-                    strategy,
-                    layout_mojo::Strategy::Direct | layout_mojo::Strategy::Cubecl
-                ) && ctx.profile.backend == wgpu::Backend::Metal
+                // The device-resident arena: the FFI (Direct) writes
+                // instances into the same shared storage the shader reads,
+                // on unified memory. The CUBECL path wants NO arena buffer
+                // at all since E2b — the chain's slot buffer binds directly
+                // (the endpoint, note 23). Past max_buffer_size the DIRECT
+                // arena chunks (one buffer per draw chunk).
+                let arena = if matches!(strategy, layout_mojo::Strategy::Direct)
+                    && ctx.profile.backend == wgpu::Backend::Metal
                     && ctx.profile.mappable_primary_buffers
                     && walk.total_bytes > 0
                 {
@@ -308,7 +306,7 @@ fn build_scene_impl(
                         * std::mem::size_of::<glyph_scene::GlyphInstance>())
                         as u64
                         <= ctx.profile.max_buffer_size;
-                    if single_fits || matches!(strategy, layout_mojo::Strategy::Cubecl) {
+                    if single_fits {
                         glyph_scene::mapped_instance_arena(
                             ctx,
                             walk.total_bytes,

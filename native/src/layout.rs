@@ -410,18 +410,22 @@ impl ItemPlacement {
 /// Where laid-out glyphs land. The CALLER owns it and passes it in; a backend
 /// appends and never reads back.
 ///
-/// Today the interior is a host `Vec<GlyphInstance>` or, on the repo load's
-/// direct path, a GPU-mapped device buffer (`Mapped`). Device-resident, the
-/// compaction kernel writes it directly — and because every call site already
-/// holds an arena rather than receiving a `Vec`, that change lands here and
-/// nowhere else. `Mapped` arrived first at the boundary the seam predicted:
-/// the FFI writes instances into the SAME memory the glyph shader reads, so
-/// the repo load pays one allocation and zero copies.
+/// Three forms: a host `Vec<GlyphInstance>`; a GPU-mapped device buffer the
+/// FFI writes (`Mapped`); and the endpoint form (`Device`, note 23's E2b) —
+/// the CubeCL chain's 32 B slots on device, bound by the renderer directly,
+/// no host copy anywhere. `Mapped` arrived first at the boundary the seam
+/// predicted: the FFI writes instances into the SAME memory the glyph shader
+/// reads, so the repo load pays one allocation and zero copies. `Device` is
+/// the same idea with the language boundary gone.
 #[derive(Default)]
 pub struct GlyphArena {
     instances: Vec<GlyphInstance>,
     /// Present on the mapped (device-resident) path; `instances` stays empty.
     mapped: Option<MappedArena>,
+    /// Present on the ENDPOINT path (note 23, E2b): the chain's 32 B slots
+    /// on device, bound directly — no host copy exists. Mutually exclusive
+    /// with the other two forms; every slice-returning accessor panics on it.
+    device: Option<DeviceSlots>,
 }
 
 /// A device-buffer-backed arena: one entry per CHUNK buffer, each holding up
@@ -448,15 +452,10 @@ struct MappedChunk {
     /// This chunk's capacity in slots — `chunk_slots` except possibly the
     /// last chunk, which is sized to the remainder.
     cap: usize,
+    /// Never read — it OWNS the allocation the pointer aliases; dropping it
+    /// would free the GPU buffer under every outstanding slice.
+    #[allow(dead_code)]
     buffer: wgpu::Buffer,
-}
-
-/// The arena's device form handed to a backend that writes it on device (the
-/// pack hop's copy targets): one cloned handle per chunk buffer, each
-/// `chunk_slots` in capacity. `buffers.len() == 1` is the single form.
-pub struct MappedTarget {
-    pub buffers: Vec<wgpu::Buffer>,
-    pub chunk_slots: usize,
 }
 
 impl MappedArena {
@@ -465,6 +464,32 @@ impl MappedArena {
     fn cap(&self) -> usize {
         self.chunks.iter().map(|c| c.cap).sum()
     }
+}
+
+/// The endpoint's arena form (note 23, E2b): the chain's 32 B RenderSlots
+/// on device, bound directly by the renderer — no host copy exists. The
+/// per-slot tint lanes ride host-side (seg_tint's fold input — the slots
+/// themselves are device-only).
+pub struct DeviceSlots {
+    /// One entry per chunk buffer. `offset` is slot 0's byte address in
+    /// the buffer — 0 for the exclusive-page big forms, nonzero where the
+    /// allocator sliced.
+    pub chunks: Vec<DeviceSlotChunk>,
+    /// Slots per chunk (uniform; the last chunk may hold fewer).
+    pub chunk_slots: usize,
+    pub len: usize,
+    /// (glyph_id, color) per slot, slot order.
+    pub tint: Vec<u32>,
+    /// The cubecl pool bindings that keep the chunks' memory from being
+    /// re-allocated — never read by design; their Drop is the release.
+    #[allow(dead_code)]
+    pub keep_alive: Vec<Box<dyn std::any::Any + Send>>,
+}
+
+pub struct DeviceSlotChunk {
+    pub buffer: wgpu::Buffer,
+    pub offset: u64,
+    pub slots: u32,
 }
 
 // The raw pointers alias shared-storage buffers owned by this struct; the
@@ -481,7 +506,7 @@ impl GlyphArena {
 
     /// Wrap a host Vec (the text/engine-text scenes stage from their own fold).
     pub fn from_vec(instances: Vec<GlyphInstance>) -> Self {
-        Self { instances, mapped: None }
+        Self { instances, mapped: None, device: None }
     }
 
     /// The chunked device-resident form: one already-mapped buffer per draw
@@ -517,6 +542,7 @@ impl GlyphArena {
                 chunk_slots,
                 len: 0,
             }),
+            device: None,
         }
     }
 
@@ -525,18 +551,28 @@ impl GlyphArena {
         self.mapped.is_some()
     }
 
-    /// The arena's device form for a backend that writes it on device (the
-    /// pack hop's copy targets): one cloned handle per chunk buffer, each
-    /// `chunk_slots` in capacity. `buffers.len() == 1` is the single form.
-    pub fn mapped_target(&self) -> Option<MappedTarget> {
-        self.mapped.as_ref().map(|m| MappedTarget {
-            buffers: m.chunks.iter().map(|c| c.buffer.clone()).collect(),
-            chunk_slots: m.chunk_slots,
-        })
+    /// The endpoint form (note 23, E2b): the chain's slots on device.
+    pub fn from_device(device: DeviceSlots) -> Self {
+        assert!(device.len > 0, "a device arena with zero slots is the host form's job");
+        Self { instances: Vec::new(), mapped: None, device: Some(device) }
+    }
+
+    /// True on the endpoint form — 32 B slots on device, bound directly.
+    pub fn is_device(&self) -> bool {
+        self.device.is_some()
+    }
+
+    /// The device slots (buffer + offset per chunk) for the renderer's
+    /// direct bind. None on the host/mapped forms.
+    pub fn device_slots(&self) -> Option<&DeviceSlots> {
+        self.device.as_ref()
     }
 
     /// Slots written so far — the next item's `slot_base`.
     pub fn len(&self) -> usize {
+        if let Some(d) = &self.device {
+            return d.len;
+        }
         match &self.mapped {
             Some(m) => m.len,
             None => self.instances.len(),
@@ -551,6 +587,11 @@ impl GlyphArena {
     /// form that survives chunking. Chunk k's length is derived from the
     /// total committed count (intermediate chunks are full).
     pub fn instance_chunks(&self) -> Vec<&[GlyphInstance]> {
+        assert!(
+            self.device.is_none(),
+            "instance_chunks on a device arena: the slots never exist on host — \
+             the renderer binds the buffers, seg_tint reads the tint lanes"
+        );
         match &self.mapped {
             Some(m) => m
                 .chunks
@@ -573,6 +614,10 @@ impl GlyphArena {
     /// mapped arena — a contiguous slice cannot span buffers; iterate
     /// `instance_chunks` or, on a verify path, `instances_cow`.
     pub fn instances(&self) -> &[GlyphInstance] {
+        assert!(
+            self.device.is_none(),
+            "instances() on a device arena: the slots never exist on host"
+        );
         match &self.mapped {
             Some(m) if m.chunks.len() == 1 => {
                 // SAFETY: as in instance_chunks — owned buffer, base pointer,
@@ -603,45 +648,6 @@ impl GlyphArena {
         }
     }
 
-    /// Write slots from HOST bytes at `start_slot`, splitting across chunk
-    /// buffers at their boundaries (the readback hop's mapped form). Does
-    /// not commit — `commit` publishes the count once the writer says how
-    /// much it actually wrote.
-    pub(crate) fn write_bytes_at(&mut self, start_slot: usize, bytes: &[u8]) {
-        let slot_size = std::mem::size_of::<GlyphInstance>();
-        assert!(
-            bytes.len().is_multiple_of(slot_size),
-            "write_bytes_at: {} bytes is not a whole number of slots",
-            bytes.len()
-        );
-        let m = self.mapped.as_mut().expect("write_bytes_at on a host arena");
-        assert!(
-            start_slot + bytes.len() / slot_size <= m.cap(),
-            "write_bytes_at: {} slots from {start_slot} over the {}-slot capacity",
-            bytes.len() / slot_size,
-            m.cap(),
-        );
-        let mut off = 0usize;
-        let mut slot = start_slot;
-        while off < bytes.len() {
-            let k = slot / m.chunk_slots;
-            let in_chunk = slot - k * m.chunk_slots;
-            let take = ((m.chunks[k].cap - in_chunk) * slot_size).min(bytes.len() - off);
-            // SAFETY: `take` never crosses the chunk's capacity (computed
-            // from it), both pointers are valid for their spans, and the
-            // chunks are disjoint buffers.
-            unsafe {
-                std::ptr::copy_nonoverlapping(
-                    bytes.as_ptr().add(off),
-                    m.chunks[k].ptr.add(in_chunk).cast::<u8>(),
-                    take,
-                )
-            };
-            off += take;
-            slot += take / slot_size;
-        }
-    }
-
     /// Hint the upper bound on slots still to come (records, before blanks are
     /// dropped). A hint only: the real count is lower and the arena grows.
     pub fn reserve(&mut self, records: usize) {
@@ -664,6 +670,10 @@ impl GlyphArena {
         assert!(
             self.mapped.is_none(),
             "push into a mapped arena: only the FFI tail writer fills one"
+        );
+        assert!(
+            self.device.is_none(),
+            "push into a device arena: the chain's scatter fills it on device"
         );
         self.instances.push(instance);
     }

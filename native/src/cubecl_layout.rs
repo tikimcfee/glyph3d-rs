@@ -1,24 +1,26 @@
-//! The CubeCL layout backend — rung 4's flip, rung 5b's instance tail.
+//! The CubeCL layout backend — the endpoint (note 23, E2b).
 //!
 //! Bytes and params through the device chain — the SAME `run_repo_chain`
 //! the cubecl-fork gate fences bit-exactly against the Mojo engine — and
-//! since rung 5b the TAIL is the pack kernel's: instances, placements,
-//! per-item totals all come back from the device (the survivor pass), and
-//! the arena hand-off is one `uninit_tail` + memcpy + `commit`. The
-//! per-item GlyphRecord materialization and `compact_records_into` are
-//! GONE from the product path; they run only under `--repo-verify`, where
-//! the wire stream is the point. Identical bytes in, identical staging
-//! out: the fork gate's instance and placement tiers hold the pack kernel
-//! to the engine-batched arena, word for word.
+//! the tail is the scatter's: ONE pass writes the 32 B slots directly
+//! into the buffer the renderer binds, the placements decode from its
+//! extent lanes, and the tint stream (glyph_id, color per slot) is the
+//! only slot-derived readback. There is no hop, no pack-window loop, no
+//! host instance materialization anywhere on the product path; the
+//! records/48 B forms exist only under `--repo-verify` (reconstructed
+//! from the two fenced streams — the records carry row/col, the slots
+//! the render fields).
 //!
-//! Compromise ledger:
-//! - ~~The records cross to the host (the chunked readback)~~ — HALF
-//!   resolved 5b: no RECORD crosses, but the packed slots still do (the
-//!   readback hop). Rung 5c's copy hop moves even that on device.
-//! - ~~`run_repo_chain` constructs its own GPU device~~ — resolved 5a
+//! Compromise ledger, all resolved:
+//! - ~~The records cross to the host (the chunked readback)~~ — 5b.
+//! - ~~The packed slots cross to the host (the readback hop)~~ — E2b.
+//! - ~~The slots copy on device into a mapped arena (the copy hop)~~ —
+//!   E2b: the scatter writes the renderer-bound buffer directly.
+//! - ~~`run_repo_chain` constructs its own GPU device~~ — 5a
 //!   (`SharedDevice` through `with_device`; `new()` keeps the fallback
 //!   for callers with none).
 
+use crate::glyph_scene::GlyphInstance;
 use crate::layout::{
     GlyphArena, GlyphRecord, LayoutError, LayoutGlyphs, LayoutItem, Paint, VerifyLayout,
     ItemPlacement,
@@ -153,59 +155,6 @@ fn marshal(
     (bytes, fis, inputs)
 }
 
-/// The arena hand-off. Copy hop (`on_device`, rung 5c): the driver already
-/// landed the windows in the mapped arena GPU-side — only the `commit`
-/// remains, and no slot byte ever crossed to host. Readback hop otherwise:
-/// mapped arena takes one memcpy into its tail; Vec arena TAKES the
-/// readback's own allocation over (`GlyphArena::from_vec`) — zero copies,
-/// the pages touched exactly once (the readback write; hence the driver's
-/// `reserve_exact`). pub(crate): repo_check hands its own chain-side arena
-/// off the same way, so the fence's instance tier compares arena against
-/// arena whichever hop ran.
-pub(crate) fn hand_off(words: Vec<u32>, slots: usize, on_device: bool, arena: &mut GlyphArena) {
-    let _sp = tracing::info_span!("cubecl.handoff", slots, on_device).entered();
-    assert!(
-        arena.is_empty(),
-        "the instance tail writes from slot 0 — a pre-filled arena would need the rebase the direct path carries"
-    );
-    if on_device {
-        assert!(
-            arena.is_mapped(),
-            "the device copy landed in the arena's buffers — an unmapped arena has none"
-        );
-        unsafe { arena.commit(slots) };
-        return;
-    }
-    let mut words = words;
-    if slots == 0 {
-        return;
-    }
-    let byte_len = slots * std::mem::size_of::<crate::glyph_scene::GlyphInstance>();
-    debug_assert_eq!(words.len() * 4, byte_len);
-    if arena.is_mapped() {
-        // One host write, split across chunk buffers where they meet.
-        arena.write_bytes_at(0, bytemuck::cast_slice(&words[..slots * 12]));
-        unsafe { arena.commit(slots) };
-    } else {
-        debug_assert!(words.capacity() >= words.len());
-        let cap_words = words.capacity();
-        let ptr = words.as_mut_ptr();
-        std::mem::forget(words);
-        // Same allocation, retyped 12 u32 → one 48 B slot. Sound because the
-        // driver reserve_exact's slots*12 words upstream: capacity ≡ 0 mod 12
-        // makes the dealloc layout match the alloc layout EXACTLY, and the
-        // chunked windows fill every word (len is only ever slots).
-        let inst: Vec<crate::glyph_scene::GlyphInstance> = unsafe {
-            Vec::from_raw_parts(
-                ptr as *mut crate::glyph_scene::GlyphInstance,
-                slots,
-                cap_words / 12,
-            )
-        };
-        *arena = GlyphArena::from_vec(inst);
-    }
-}
-
 impl LayoutGlyphs for CubeclLayout {
     fn name(&self) -> &'static str {
         "cubecl"
@@ -220,9 +169,10 @@ impl LayoutGlyphs for CubeclLayout {
         Ok(())
     }
 
-    /// THE PRODUCT PATH since rung 5b: the instance tail. No record is
-    /// materialized on host; the packed slots move into the arena's tail
-    /// in one memcpy and `commit` publishes them.
+    /// THE PRODUCT PATH since E2b (note 23): the endpoint. One scatter
+    /// pass writes the 32 B slots into the buffer the renderer binds —
+    /// `run_repo_chain` hands the device buffer across and the arena
+    /// becomes it. No host copy, no hop, no pack windows.
     fn layout_validated_items(
         &mut self,
         items: &[LayoutItem<'_>],
@@ -237,17 +187,21 @@ impl LayoutGlyphs for CubeclLayout {
             &fis,
             &inputs,
             crate::cubecl_chain::ChainMode::Instances,
-            arena.mapped_target(),
         );
-        // The arena hand-off — see `hand_off`: the copy hop's commit, one
-        // memcpy on the mapped readback path, an allocation hand-over on
-        // the Vec path.
-        hand_off(
-            stream.instances,
-            stream.total_slots as usize,
-            stream.instances_on_device,
-            arena,
+        assert!(
+            arena.is_empty(),
+            "the instance tail writes from slot 0 — a pre-filled arena would need the rebase the direct path carries"
         );
+        if let Some(sd) = stream.slot_device {
+            let len = sd.chunk.slots as usize;
+            *arena = GlyphArena::from_device(crate::layout::DeviceSlots {
+                chunk_slots: len,
+                len,
+                tint: stream.tint,
+                chunks: vec![sd.chunk],
+                keep_alive: vec![sd.keep_alive],
+            });
+        }
         self.phases = CubeclPhases {
             marshal: marshal_dur,
             chain: stream.phases,
@@ -260,11 +214,12 @@ impl LayoutGlyphs for CubeclLayout {
 }
 
 impl VerifyLayout for CubeclLayout {
-    /// The verify path: BOTH tails. The instance/placement hand-off is the
-    /// product's own, and the wire records are materialized on top so
-    /// `diff_backends` still sees the 32 B stream — the readback and the
-    /// GlyphRecord building are the price of the check, deliberately not
-    /// of the product.
+    /// The verify path: BOTH tails. The arena gets the endpoint's device
+    /// slots exactly as the product path, and the 48 B wire form is
+    /// RECONSTRUCTED on host so `diff_backends` still sees instances:
+    /// the records stream carries row/col (and the blank lanes the slot
+    /// stream drops), the slot stream carries the render fields — both
+    /// bit-fenced against the engine, so their zip is the fenced instance.
     fn layout_validated_items_recording(
         &mut self,
         items: &[LayoutItem<'_>],
@@ -279,16 +234,16 @@ impl VerifyLayout for CubeclLayout {
             &fis,
             &inputs,
             crate::cubecl_chain::ChainMode::Both,
-            arena.mapped_target(),
         );
-        hand_off(
-            stream.instances,
-            stream.total_slots as usize,
-            stream.instances_on_device,
-            arena,
+        assert!(
+            arena.is_empty(),
+            "the instance tail writes from slot 0 — a pre-filled arena would need the rebase the direct path carries"
         );
-        // The records tier's materialization — the rung-4 convert loop,
-        // now a verify-only cost.
+        // The 48 B host arena the seam's diff expects, reconstructed from
+        // the two fenced streams: survivors are the records with gi != 0,
+        // in order (the survivor filter's own definition), zipped with the
+        // slot stream. The device buffer is NOT taken here — verify paths
+        // diff arenas host-side.
         let mut convert = Duration::ZERO;
         let mut all_records =
             Vec::with_capacity(stream.total_records as usize);
@@ -316,6 +271,38 @@ impl VerifyLayout for CubeclLayout {
             }));
             convert += t.elapsed();
         }
+        let mut insts: Vec<GlyphInstance> = Vec::with_capacity(stream.total_slots as usize);
+        let sw = &stream.slots;
+        let mut s = 0usize;
+        for r in &all_records {
+            if r.counts[0] == 0 {
+                continue;
+            }
+            let b = s * 8;
+            insts.push(GlyphInstance {
+                pos: [
+                    f32::from_bits(sw[b]),
+                    f32::from_bits(sw[b + 1]),
+                    f32::from_bits(sw[b + 2]),
+                ],
+                glyph_id: sw[b + 3],
+                row: r.counts[1],
+                col: r.counts[2],
+                color: sw[b + 4],
+                group_id: sw[b + 5],
+                advance: f32::from_bits(sw[b + 6]),
+                height: f32::from_bits(sw[b + 7]),
+                flags: 0,
+                _pad: 0,
+            });
+            s += 1;
+        }
+        assert_eq!(
+            s,
+            stream.total_slots as usize,
+            "record/slot survivor zip drifted — the streams' own tiers should have caught it first"
+        );
+        *arena = GlyphArena::from_vec(insts);
         self.phases = CubeclPhases {
             marshal: marshal_dur,
             chain: stream.phases,

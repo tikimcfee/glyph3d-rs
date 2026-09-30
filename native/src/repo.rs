@@ -836,21 +836,36 @@ impl RepoLoad {
         // the far-LOD backdrop tint derived from the file's own ink.
         // Stage G: the SAME local AABB goes into the pick table (pre-TRS; the
         // pick path applies the live group TRS itself).
-        let chunks = self.arena.instance_chunks();
+        //
+        // The tint fold reads the endpoint's tint STREAM on the Device
+        // path (note 23, E2b — no host instances exist there) and the
+        // arena chunks on the 48 B paths; same values in the same slot
+        // order either way, so the tints are bit-identical.
+        let tint_stream: Option<&[u32]> = self.arena.device_slots().map(|d| d.tint.as_slice());
+        let chunks = if tint_stream.is_none() {
+            self.arena.instance_chunks()
+        } else {
+            Vec::new()
+        };
         let seg_of = |v: &FileView| {
             // The file's slot range folded in arena order: chunk slices
             // ascend and concatenate exactly, so a range that straddles a
             // chunk boundary tints bit-identically to the contiguous fold.
             let mut tint = crate::glyph_scene::SegTintAccum::new(slot_ink);
             let want = v.slot_base..v.slot_base + v.slot_count;
-            let mut base = 0usize;
-            for chunk in &chunks {
-                let lo = want.start.max(base);
-                let hi = want.end.min(base + chunk.len());
-                if lo < hi {
-                    tint.add(&chunk[lo - base..hi - base]);
+            match tint_stream {
+                Some(tp) => tint.add_tint(&tp[want.start * 2..want.end * 2]),
+                None => {
+                    let mut base = 0usize;
+                    for chunk in &chunks {
+                        let lo = want.start.max(base);
+                        let hi = want.end.min(base + chunk.len());
+                        if lo < hi {
+                            tint.add(&chunk[lo - base..hi - base]);
+                        }
+                        base += chunk.len();
+                    }
                 }
-                base += chunk.len();
             }
             crate::glyph_scene::SegCull {
                 min: [
@@ -970,7 +985,7 @@ impl RepoLoad {
                 Strategy::Batched => "mojo-cpu/batched",
                 Strategy::PerItem => "mojo-cpu/per-item",
                 Strategy::Direct => "mojo-cpu/direct",
-                Strategy::Cubecl => "device/cubecl (rung 5: instance tail)",
+                Strategy::Cubecl => "device/cubecl (endpoint)",
             },
             if s.verified { " (verified bit-exact vs the other strategy)" } else { "" },
         );

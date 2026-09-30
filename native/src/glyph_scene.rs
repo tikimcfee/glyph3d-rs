@@ -128,10 +128,13 @@ pub struct GlyphScene {
     cull: Option<CullState>,
     // ── Stage G: picking & live manipulation ────────────────────────────
     /// Arena chunk buffers, kept for partial per-slot uploads (verbs): the
-    /// arena's own buffers when device-mapped (one per chunk), the upload
-    /// buffers otherwise — either way chunk k's slots live in
-    /// `instance_bufs[k]` starting at index 0.
+    /// chain's own slot buffers on the endpoint (Device) path, the upload
+    /// buffers otherwise. `chunk_offsets[k]` is slot 0's byte address in
+    /// `instance_bufs[k]` (0 for staged uploads; the pool slice's start for
+    /// the endpoint's extracted buffers) — chunk_off adds it.
     instance_bufs: Vec<wgpu::Buffer>,
+    /// Per-chunk byte offset of slot 0 inside the buffer (see above).
+    chunk_offsets: Vec<u64>,
     /// Group table buffer, kept for partial per-row uploads (80 B/row).
     group_buf: wgpu::Buffer,
     /// CPU mirror of the group table — the pick path reads the LIVE TRS from
@@ -299,7 +302,7 @@ impl GlyphScene {
 
         // --- instance + group buffers --------------------------------------
         let mut arena = staged.instances;
-        if arena.is_empty() && !arena.is_mapped() {
+        if arena.is_empty() && !arena.is_mapped() && !arena.is_device() {
             arena.push(GlyphInstance {
                 pos: [0.0; 3],
                 glyph_id: 0,
@@ -318,32 +321,42 @@ impl GlyphScene {
             groups.push(GroupRow::identity([0.0; 3]));
         }
 
-        // Chunk the arena so no bound RANGE exceeds the binding limit. A
-        // device-mapped arena arrives ALREADY chunked the same way — one
-        // buffer per chunk, the chunking computed from the same limits at
-        // creation, and the draw path follows the arena's own chunk size
-        // (they must agree: the cull/pick slot math keys on chunk_cap).
+        // Chunk the arena so no bound RANGE exceeds the binding limit.
+        // (the cull/pick slot math keys on chunk_cap, so the renderer's
+        // chunking and the arena's must agree).
         //
-        // E2a (note 23): the shader binds the 32 B RenderSlot, so the draw
-        // chunks count in RenderSlot stride and EVERY arena form transcodes
-        // at staging (the 48 B GlyphInstance remains the FFI/engine form —
-        // the values the vertex math reads are unchanged, so the goldens
-        // stay byte-equal by construction). The mapped arena's direct bind
-        // is suspended for the form change; E2b replaces it with the
-        // chain's device-resident slots — no transcode on that path.
+        // E2a (note 23): the shader binds the 32 B RenderSlot, so HOST and
+        // MAPPED (48 B) arenas transcode at staging — the values the vertex
+        // math reads are unchanged, so the goldens stay byte-equal.
+        // E2b: a DEVICE arena (the endpoint) binds the chain's slot buffers
+        // AS-IS — no upload, no transcode, no copy; each chunk's pool-slice
+        // offset rides its binding.
         let binding_limit = ctx.device.limits().max_storage_buffer_binding_size as usize;
-        let chunk_cap = (binding_limit / std::mem::size_of::<RenderSlot>()).max(1);
         let instances_len = arena.len();
-        let mut chunk_counts: Vec<u32> = (0..instances_len.div_ceil(chunk_cap).max(1))
-            .map(|k| (instances_len.saturating_sub(k * chunk_cap)).min(chunk_cap) as u32)
-            .collect();
-        // The mapped-empty arena binds one zeroed slot (nothing draws, but
-        // the safety-net segment reads slot 0).
-        for c in &mut chunk_counts {
-            if *c == 0 {
-                *c = 1;
+        let (chunk_cap, chunk_counts, instance_bufs, chunk_offsets): (
+            usize,
+            Vec<u32>,
+            Vec<wgpu::Buffer>,
+            Vec<u64>,
+        ) = match arena.device_slots() {
+            Some(dev) => (
+                dev.chunk_slots,
+                dev.chunks.iter().map(|c| c.slots).collect(),
+                dev.chunks.iter().map(|c| c.buffer.clone()).collect(),
+                dev.chunks.iter().map(|c| c.offset).collect(),
+            ),
+            None => {
+            let chunk_cap = (binding_limit / std::mem::size_of::<RenderSlot>()).max(1);
+            let mut chunk_counts: Vec<u32> = (0..instances_len.div_ceil(chunk_cap).max(1))
+                .map(|k| (instances_len.saturating_sub(k * chunk_cap)).min(chunk_cap) as u32)
+                .collect();
+            // The mapped-empty arena binds one zeroed slot (nothing draws, but
+            // the safety-net segment reads slot 0).
+            for c in &mut chunk_counts {
+                if *c == 0 {
+                    *c = 1;
+                }
             }
-        }
         // Unified-memory upload: with MAPPABLE_PRIMARY_BUFFERS on Metal the
         // storage buffer is created mapped and written straight — wgpu's
         // default path instead zero-fills a full-size staging buffer AND then
@@ -483,6 +496,10 @@ impl GlyphScene {
                     }
             })
             .collect();
+            let zero_offsets = vec![0u64; instance_bufs.len()];
+            (chunk_cap, chunk_counts, instance_bufs, zero_offsets)
+            }
+        };
         let group_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("group table"),
             contents: bytemuck::cast_slice(&groups),
@@ -629,13 +646,22 @@ impl GlyphScene {
         });
         // Stage L (O2): enumerate so captures can tell chunk bind groups
         // apart (mirrors the "glyph instances i/N" buffer labels).
-        // The chunk bindings: whole buffers on every path — uploaded chunks
-        // on the Vec path, the arena's own chunk buffers on the mapped path.
-        // Each chunk starts at its own index 0, ≤ the binding limit by
-        // construction (the arena's chunk size derives from the same limit).
+        // The chunk bindings: the chain's slot buffers on the endpoint
+        // (Device) path — each with its pool-slice offset — the staged
+        // uploads otherwise. Each chunk's binding starts at its own index
+        // 0, ≤ the binding limit by construction.
         let chunk_bindings: Vec<wgpu::BufferBinding> = instance_bufs
             .iter()
-            .map(|b| b.as_entire_buffer_binding())
+            .zip(chunk_counts.iter())
+            .zip(chunk_offsets.iter())
+            .map(|((b, &count), &off)| wgpu::BufferBinding {
+                buffer: b,
+                // The endpoint's pool slices start mid-buffer; staged
+                // uploads are offset 0. The binding's size is the chunk's
+                // live slots (never the pool page's padding).
+                offset: off,
+                size: std::num::NonZeroU64::new(count as u64 * 32),
+            })
             .collect();
         let bind_group_count = chunk_bindings.len();
         let bind_groups: Vec<wgpu::BindGroup> = chunk_bindings
@@ -1058,6 +1084,7 @@ impl GlyphScene {
             fly,
             cull,
             instance_bufs,
+            chunk_offsets,
             group_buf,
             groups_cpu,
             pick,

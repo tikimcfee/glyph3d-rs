@@ -369,7 +369,13 @@ renderer-affecting and every view stayed byte-equal, because the seed only binds
 for an item with zero records and no fixture had an empty file. It can see that
 class today only because `native/fixtures/g-pick-repo/empty.rs` was added for
 it. **Do not tidy that file away.** Ask what else these frames cannot see —
-`--wrap-mode back` on a repo whose files never wrap is the current example.
+`--wrap-mode back` on a repo whose files never wrap is the current example,
+and since E2b (2026-09-29) there is a second, proven one: **the far-LOD
+backdrop tint never fires in any golden view** — the cameras keep all five
+`g-pick-repo` files near enough that no segment substitutes its backdrop
+quad, so the seg_tint lane is pixel-invisible (the `scatter-tint-lane-dropped`
+mutation stayed GREEN here and moved to the fork gate's byte-level tint tier,
+which is where a fence for it lives now).
 
 **repo-verify** (was "8b"), both wrap modes. The per-item and batched FFI
 strategies diffed bit-exact at the layout seam — placements, instance bytes and
@@ -423,25 +429,19 @@ driver uploads CPU-computed statics, so no packed byte is ever classified on
 device here. The phantom-tail class is therefore fenced by `pack_words`' unit
 test (the `tail-pads-zero` mutation), not by any device gate.
 
-**cubecl-fork** (2026-09-28). `--cubecl-repo-check` in STRICT mode over the
-standing fork fixture (`native/fixtures/cubecl-fork`, IMMUTABLE): the full
-from-bytes chain's records versus the ENGINE's batched records, BIT-exact,
-plus the rung-5b product tiers — instances byte-equal against the engine
-arena, placements bit-equal — with the fork census's m >= 3 and seg >= 3
-buckets proven exercised — an unexercised corpus is a FAIL, so the fixture
-cannot quietly stop covering the paginate arithmetic classes. The gate runs
-the fixture FOUR times: default; `GLYPH_RECORD_CHUNK=60000` (five emit
-windows), so the chunked emitter's `rec_first` carry is fenced on an ordinary
-corpus; `GLYPH_ARENA_CHUNK_SLOTS=50000 GLYPH_RECORD_CHUNK=60000` (six
-arena buffers, windows misaligned), fencing the copy hop's window→chunk split
-and the multi-buffer arena forms; and `GLYPH_FOOTPRINT_BUDGET=0` with the
-same shapes (2026-09-29), forcing the footprint gate's READBACK hop over the
-chunked mapped arena — the combination the gate picks at the flagship, where
-`hand_off`'s `write_bytes_at` splits the host instance mass across chunk
-buffers. The `emitter-window-offset-dropped`, `arena-chunk-offset-dropped`
-and `mapped-write-chunk-offset-dropped` mutations each redden only through
-their respective chunked passes. Blind to corpora outside the fixture, to a
-fault the engine and chain share (ground truth layers: engine-check,
+**cubecl-fork** (2026-09-28; re-formed at the endpoint, 2026-09-29). `--cubecl-repo-check`
+in STRICT mode over the standing fork fixture (`native/fixtures/cubecl-fork`, IMMUTABLE):
+the full from-bytes chain's records versus the ENGINE's batched records, BIT-exact,
+plus the endpoint tiers — the 32 B slot stream field-equal against the engine arena
+(the renderer-bound form, fenced in the exact shape the shader reads), placements
+bit-equal — with the fork census's m >= 3 and seg >= 3 buckets proven exercised — an
+unexercised corpus is a FAIL, so the fixture cannot quietly stop covering the paginate
+arithmetic classes. The gate runs the fixture twice: default, and
+`GLYPH_RECORD_CHUNK=60000` (five emit windows), so the chunked emitter's `rec_first`
+carry is fenced on an ordinary corpus. The `emitter-window-offset-dropped` mutation
+reddens only through the chunked pass. (The chunked-arena and readback-hop passes and
+their six mutations retired with the hop machinery at E2b.) Blind to corpora outside
+the fixture, to a fault the engine and chain share (ground truth layers: engine-check,
 reference-port), and to non-robust backend behavior (Metal discards the
 phantom-class writes; see the mutation's `why`).
 

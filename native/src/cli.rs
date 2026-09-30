@@ -184,7 +184,7 @@ pub(crate) struct Cli {
     /// chunk rather than the corpus. The record strategies remain because they
     /// are the verification form: `VerifyLayout` needs a wire stream, and
     /// `--repo-verify` diffs whichever pair you name.
-    #[arg(long, value_name = "MODE", default_value = "direct", value_parser = ["naive", "batch", "direct", "cubecl"])]
+    #[arg(long, value_name = "MODE", default_value = "cubecl", value_parser = ["naive", "batch", "direct", "cubecl"])]
     pub(crate) repo_engine: String,
     /// Diff the chosen strategy against a counterpart, bit-exact over the
     /// whole repo: placements and instances always, wire records when both
@@ -513,11 +513,14 @@ mod cli_tests {
         assert!(cli.engine_check.is_none());
         assert!(cli.engine_render.is_none());
         assert!(cli.load_repo.is_none());
-        // The DEFAULT is `direct` since 2026-09-07. This assertion is not
-        // decoration: three golden views and, until it was pinned, the
-        // repo-verify gate all inherit this value, so a change here silently
-        // changes what they exercise.
-        assert_eq!(cli.repo_engine, "direct");
+        // The DEFAULT is `cubecl` since E2b (2026-09-29) — the endpoint is
+        // the product path (note 23). This assertion is not decoration:
+        // three golden views and, until it was pinned, the repo-verify gate
+        // all inherit this value, so a change here silently changes what
+        // they exercise. The flip is safe BECAUSE the fork fence exists:
+        // the chain's output is bit-exact against the engine's, so the
+        // goldens stay byte-equal through it (and now pixel-cover cubecl).
+        assert_eq!(cli.repo_engine, "cubecl");
         // THE DEFAULT THE SCREENSHOT BASELINES DEPEND ON. A change here moves
         // repo-wide.png and repo-zoom.png, so it is pinned in the CLI layer too
         // and not only in RepoParams::default.
