@@ -439,22 +439,36 @@ pub(crate) fn run_repo_chain(
     // would print this phase's close line after the whole tail.
     drop(span_upload);
     let sp_dispatch = tracing::info_span!("chain.dispatch").entered();
-    // GLYPH_CHAIN_PROF=1: the bench's per-stage GPU windows, ported into the
-    // PRODUCT chain (note 24 §A4.2) — every stage fenced and timestamped in
-    // place, so tail.totals' absorbed execution decomposes by name. Fences
-    // serialize the chain: the printed SUM is the pricing table, NOT a load
-    // time (the spans keep the unfused walls). The two internal syncs ride
-    // as wall-clock rows; the tail's ladder/tint/placements stay
-    // span-covered. Single-shot at repo scale; replicate by re-running.
-    let prof = std::env::var_os("GLYPH_CHAIN_PROF").is_some();
+    // GLYPH_CHAIN_PROF=1 (or "stages"): the bench's per-stage GPU windows,
+    // ported into the PRODUCT chain (note 24 §A4.2) — every stage fenced and
+    // timestamped in place, so tail.totals' absorbed execution decomposes by
+    // name. Each stage also gets an `enq:<name>` row: the launch statement's
+    // pure CPU cost (2026-09-30: enqueue is µs per dispatch — the sync waits,
+    // not the launches, hold the chain's wall time). Fences serialize the
+    // chain: the printed SUM is the pricing table, NOT a load time (the spans
+    // keep the unfused walls). The two internal syncs ride as wall-clock rows.
+    // GLYPH_CHAIN_PROF=blocks: NO per-stage fences — one window around each
+    // dispatch block (block1 = decode..cand counts, block2 = cand_scatter..
+    // item_totals). Blocks-vs-stages prices the inter-dispatch gap — measured
+    // 2026-09-30: fused == fenced sum (65ms / 519ms), so the GPU does NOT
+    // stall between dispatches; the sync overshoot lives in the WAIT path.
+    // GLYPH_CHAIN_SYNC=1: the sync WALLS, unprofiled (no fences draining the
+    // queue first) — the instrument that measured the 0.5-1.9s overshoots.
+    let prof_mode = std::env::var("GLYPH_CHAIN_PROF").unwrap_or_default();
+    let prof = !prof_mode.is_empty();
+    let prof_stage_on = matches!(prof_mode.as_str(), "1" | "stages");
+    let prof_blocks = prof_mode == "blocks";
+    let sync_prof = std::env::var_os("GLYPH_CHAIN_SYNC").is_some();
     let mut prof_ok = prof;
-    let mut prof_rows: Vec<(&'static str, std::time::Duration)> = Vec::new();
+    let mut prof_rows: Vec<(String, std::time::Duration)> = Vec::new();
     let mut prof_missing = 0usize;
     let mut prof_timing: Option<String> = None;
+    let mut prof_t0: Vec<std::time::Instant> = Vec::new();
     let mut prof_w;
+    let mut prof_bw;
     macro_rules! prof {
         (begin $name:literal) => {
-            prof_w = if prof_ok {
+            prof_w = if prof_ok && prof_stage_on {
                 match client.profile_start() {
                     Ok(w) => Some(w),
                     Err(e) => {
@@ -468,21 +482,57 @@ pub(crate) fn run_repo_chain(
             } else {
                 None
             };
+            // The enqueue wall starts here; the end arm reads it BEFORE the
+            // resolve, so the launch statement's CPU cost stands alone.
+            prof_t0.push(std::time::Instant::now());
         };
         (end $name:literal) => {
+            let enq = prof_t0.pop().expect("prof end without begin").elapsed();
+            if prof_ok && prof_stage_on {
+                prof_rows.push((format!("enq:{}", $name), enq));
+            }
             if let Some(w) = prof_w.take() {
                 let dur = client.profile_end(w).expect("profile_end");
                 if prof_timing.is_none() {
                     prof_timing = Some(format!("{}", dur.timing_method()));
                 }
                 match pollster::block_on(dur.resolve()) {
-                    Some(ticks) => prof_rows.push(($name, ticks.duration())),
+                    Some(ticks) => prof_rows.push(($name.to_string(), ticks.duration())),
+                    None => prof_missing += 1,
+                }
+            }
+        };
+        (block begin $name:literal) => {
+            prof_bw = if prof_ok && prof_blocks {
+                match client.profile_start() {
+                    Ok(w) => Some(w),
+                    Err(e) => {
+                        eprintln!(
+                            "chain-prof: profile_start failed ({e}); blocks run unwindowed"
+                        );
+                        prof_ok = false;
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+        };
+        (block end $name:literal) => {
+            if let Some(w) = prof_bw.take() {
+                let dur = client.profile_end(w).expect("profile_end");
+                if prof_timing.is_none() {
+                    prof_timing = Some(format!("{}", dur.timing_method()));
+                }
+                match pollster::block_on(dur.resolve()) {
+                    Some(ticks) => prof_rows.push(($name.to_string(), ticks.duration())),
                     None => prof_missing += 1,
                 }
             }
         };
     }
     unsafe {
+        prof!(block begin "block1");
         prof!(begin "decode");
         decode::launch_unchecked(
             &client,
@@ -545,12 +595,16 @@ pub(crate) fn run_repo_chain(
             log,
         );
         prof!(end "cand_count_spine");
+        prof!(block end "block1");
     }
     let t_csync = std::time::Instant::now();
     let tb = client.read_one(h_ctotal.clone()).expect("candidate count");
     let c = bytemuck::cast_slice::<u8, u32>(&tb)[0] as usize;
     if prof_ok {
-        prof_rows.push(("sync:cand_readback", t_csync.elapsed()));
+        prof_rows.push(("sync:cand_readback".to_string(), t_csync.elapsed()));
+    }
+    if sync_prof {
+        eprintln!("chain-sync: candidate readback wall {:?}", t_csync.elapsed());
     }
     let kmax = ((c as u32 + 1).next_power_of_two().trailing_zeros()) as usize;
     let cstride = c + 1;
@@ -564,6 +618,7 @@ pub(crate) fn run_repo_chain(
     let h_d_b = alloc_empty((c + 1) * 4);
     let h_roots = alloc_upload(bytemuck::cast_slice(&vec![c as u32; item_count]));
     unsafe {
+        prof!(block begin "block2");
         prof!(begin "cand_scatter");
         cand_scatter::launch_unchecked(
             &client,
@@ -875,6 +930,7 @@ pub(crate) fn run_repo_chain(
             BufferArg::from_raw_parts(h_sgrand.clone(), 1),
         );
         prof!(end "item_totals");
+        prof!(block end "block2");
     }
     // ── the tail: totals, then the mode's emission loops ─────────────────
     let t_rb = std::time::Instant::now();
@@ -897,7 +953,10 @@ pub(crate) fn run_repo_chain(
     let tb_s = client.read_one(h_stot.clone()).expect("survivor totals");
     let stot: Vec<u32> = bytemuck::cast_slice(&tb_s)[..item_count].to_vec();
     if prof_ok {
-        prof_rows.push(("sync:totals_readback", t_tsync.elapsed()));
+        prof_rows.push(("sync:totals_readback".to_string(), t_tsync.elapsed()));
+    }
+    if sync_prof {
+        eprintln!("chain-sync: totals readback wall {:?}", t_tsync.elapsed());
     }
     let mut rec_base = vec![0u32; item_count];
     let mut slot_base = vec![0u32; item_count];
