@@ -568,18 +568,21 @@ pub fn load_repo_from_walk(
     enum Backend {
         Mojo(MojoLayout),
         Cubecl(crate::cubecl_layout::CubeclLayout),
+        Hyper(crate::layout_hyper::HyperLayout),
     }
     impl LayoutGlyphs for Backend {
         fn name(&self) -> &'static str {
             match self {
                 Backend::Mojo(b) => b.name(),
                 Backend::Cubecl(b) => b.name(),
+                Backend::Hyper(b) => b.name(),
             }
         }
         fn load_trie_file(&mut self, path: &Path) -> Result<(), LayoutError> {
             match self {
                 Backend::Mojo(b) => b.load_trie_file(path),
                 Backend::Cubecl(b) => b.load_trie_file(path),
+                Backend::Hyper(b) => b.load_trie_file(path),
             }
         }
         fn layout_validated_items(
@@ -590,6 +593,7 @@ pub fn load_repo_from_walk(
             match self {
                 Backend::Mojo(b) => b.layout_validated_items(items, arena),
                 Backend::Cubecl(b) => b.layout_validated_items(items, arena),
+                Backend::Hyper(b) => b.layout_validated_items(items, arena),
             }
         }
     }
@@ -600,13 +604,13 @@ pub fn load_repo_from_walk(
         fn phases(&self) -> BackendPhases {
             match self {
                 Backend::Mojo(b) => b.phases(),
-                Backend::Cubecl(_) => BackendPhases::default(),
+                Backend::Cubecl(_) | Backend::Hyper(_) => BackendPhases::default(),
             }
         }
         /// The cubecl backend's decomposition (rung 5's yardstick).
         fn cubecl_phases(&self) -> Option<crate::cubecl_layout::CubeclPhases> {
             match self {
-                Backend::Mojo(_) => None,
+                Backend::Mojo(_) | Backend::Hyper(_) => None,
                 Backend::Cubecl(b) => Some(b.phases()),
             }
         }
@@ -620,6 +624,12 @@ pub fn load_repo_from_walk(
             match self {
                 Backend::Mojo(b) => b.layout_validated_items_recording(items, arena),
                 Backend::Cubecl(b) => b.layout_validated_items_recording(items, arena),
+                Backend::Hyper(_) => Err(LayoutError {
+                    backend: "hyper-rust",
+                    status: -1,
+                    what: "HyperLayout materializes no wire records; use Batched or PerItem for VerifyLayout"
+                        .to_string(),
+                }),
             }
         }
     }
@@ -630,6 +640,7 @@ pub fn load_repo_from_walk(
             ),
             None => crate::cubecl_layout::CubeclLayout::new(),
         }),
+        Strategy::Hyper => Backend::Hyper(crate::layout_hyper::HyperLayout::new()),
         other => Backend::Mojo(MojoLayout::new(other)),
     };
     backend
@@ -671,7 +682,9 @@ pub fn load_repo_from_walk(
         // other, which is the pairing that existed before it.
         let other = match strategy {
             Strategy::Batched => Strategy::PerItem,
-            Strategy::PerItem | Strategy::Direct | Strategy::Cubecl => Strategy::Batched,
+            Strategy::PerItem | Strategy::Direct | Strategy::Cubecl | Strategy::Hyper => {
+                Strategy::Batched
+            }
         };
         let mut alt = MojoLayout::new(other);
         alt.load_trie_file(trie)
@@ -984,6 +997,7 @@ impl RepoLoad {
                 Strategy::PerItem => "mojo-cpu/per-item",
                 Strategy::Direct => "mojo-cpu/direct",
                 Strategy::Cubecl => "device/cubecl (endpoint)",
+                Strategy::Hyper => "hyper-rust (parallel direct)",
             },
             if s.verified { " (verified bit-exact vs the other strategy)" } else { "" },
         );
@@ -1105,46 +1119,8 @@ impl RepoLoad {
 /// `sharded_paint_matches_serial` test fences exactly that; the golden views
 /// only ever run the serial arm). 1.0s -> ~0.24s at the flagship, 2026-09-30.
 fn paint_files(files: &[&[u8]]) -> Vec<Vec<u32>> {
-    if files.len() >= 64 {
-        let workers = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(1)
-            .min(8);
-        let total: usize = files.iter().map(|f| f.len()).sum();
-        let target = total.div_ceil(workers).max(1);
-        let mut ranges: Vec<(usize, usize)> = Vec::with_capacity(workers);
-        let (mut start, mut acc) = (0usize, 0usize);
-        for (i, f) in files.iter().enumerate() {
-            acc += f.len();
-            if acc >= target {
-                ranges.push((start, i + 1));
-                start = i + 1;
-                acc = 0;
-            }
-        }
-        if start < files.len() {
-            ranges.push((start, files.len()));
-        }
-        std::thread::scope(|s| {
-            let handles: Vec<_> = ranges
-                .iter()
-                .map(|&(a, b)| {
-                    s.spawn(move || {
-                        files[a..b]
-                            .iter()
-                            .map(|f| text::colorize_leaders(f))
-                            .collect::<Vec<_>>()
-                    })
-                })
-                .collect();
-            handles
-                .into_iter()
-                .flat_map(|h| h.join().expect("paint worker panicked"))
-                .collect()
-        })
-    } else {
-        files.iter().map(|f| text::colorize_leaders(f)).collect()
-    }
+    use rayon::prelude::*;
+    files.par_iter().map(|f| text::colorize_leaders(f)).collect()
 }
 
 #[cfg(test)]

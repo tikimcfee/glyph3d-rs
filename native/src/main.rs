@@ -39,6 +39,7 @@ mod fixture;
 mod fold;
 mod glyph_trie;
 mod layout;
+pub mod layout_hyper;
 mod layout_mojo;
 mod gpu;
 mod glyph_scene;

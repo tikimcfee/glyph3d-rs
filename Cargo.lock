@@ -2586,6 +2586,7 @@ dependencies = [
  "log",
  "naga",
  "pollster",
+ "rayon",
  "tracing",
  "tracing-subscriber",
  "wgpu",

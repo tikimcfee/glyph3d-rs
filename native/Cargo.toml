@@ -35,6 +35,7 @@ wgpu-profiler = "0.28"
 # unifies with our 30.0.1 (the 0.10 line still pins wgpu 29).
 cubecl = { version = "=0.11.0-pre.4", features = ["wgpu"] }
 encase = "0.12"
+rayon = "1.10"
 # The load path's tracing substrate (note 22): spans over the chain, its
 # tail, and the repo load, so measurements stop being ad-hoc Instant
 # pairs. Both crates are already resolved in the lockfile through wgpu

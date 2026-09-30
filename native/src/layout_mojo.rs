@@ -73,6 +73,8 @@ pub enum Strategy {
     /// directly and the readback dies). CAN record: the stream exists until
     /// the compaction consumes it.
     Cubecl,
+    /// Hyper-fast parallel pure-Rust engine.
+    Hyper,
 }
 
 /// Where a load's time goes inside the backend, accumulated across items.
@@ -171,7 +173,7 @@ impl Strategy {
     pub fn can_record(self) -> bool {
         match self {
             Strategy::Batched | Strategy::PerItem | Strategy::Cubecl => true,
-            Strategy::Direct => false,
+            Strategy::Direct | Strategy::Hyper => false,
         }
     }
 }
@@ -210,6 +212,7 @@ impl MojoLayout {
             // The Cubecl variant never reaches MojoLayout (the seam routes
             // it to CubeclLayout); the arm exists for exhaustiveness.
             Strategy::Cubecl => unreachable!("CubeclLayout owns the cubecl strategy"),
+            Strategy::Hyper => unreachable!("HyperLayout owns the hyper strategy"),
             Strategy::Batched => {
                 let total_bytes = items.iter().map(|i| i.bytes.len()).sum();
                 let mut blob = Vec::with_capacity(total_bytes);
@@ -373,6 +376,7 @@ impl LayoutGlyphs for MojoLayout {
             // CubeclLayout — but the enum is shared, so the arm must say
             // what it would be. Unreachable in practice.
             Strategy::Cubecl => "cubecl",
+            Strategy::Hyper => "hyper-rust",
         }
     }
 
