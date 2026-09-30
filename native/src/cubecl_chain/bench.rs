@@ -614,10 +614,11 @@ pub fn bench(ctx: &GpuContext, corpus_path: &Path) -> ! {
                     // stages set the precedent for merged dispatches).
                     extent_pair::launch_unchecked(
                         &client,
-                        CubeCount::new_single(),
-                        CubeDim::new_1d(1),
+                        cubes_of(n),
+                        CubeDim::new_1d(256),
                         BufferArg::from_raw_parts(h_sm.clone(), n),
                         BufferArg::from_raw_parts(h_fl.clone(), n_words),
+                        BufferArg::from_raw_parts(h_lc.clone(), n * LC_STRIDE),
                         BufferArg::from_raw_parts(h_plan.clone(), 3),
                         BufferArg::from_raw_parts(h_extent.clone(), 2),
                     );

@@ -823,12 +823,12 @@ expect = "lane mismatch words"
 [[mutation]]
 name = "extent-segment-reset-dropped"
 gate = "cubecl-fork"
-why = "the extent walk must reset at segment fills — without the reset it sums whole LINES, the stride inflates by every wrapped segment, and every m >= 1 record's X goes wrong (the exact regression the walk's first landing shipped). CONSUMED BY: extent_pair's segment accumulation, the stride's only source. The INSTANCE tier (the field-wise lane compare since E2b) reddens first — the stride flows into the scattered X — so expect names it. (The tail-lane zero-pad class found its witness at 568d224: the device gates genuinely cannot see it — trailing phantom records self-truncate — so it lives as pack_words' unit test with tail-pads-zero proven against cargo-test.)"
+why = "the segment walk must stop at fills — with the stop one leader late, the filling glyph's advance JOINS the segment it closes, the widest-sum inflates by an advance, and every m >= 1 record's X goes wrong (the exact regression the walk's first landing shipped; the form changed 2026-09-30 to the segment-parallel walk, same rule). CONSUMED BY: extent_pair's segment sums, the stride's only source. The INSTANCE tier (the field-wise lane compare since E2b) reddens first — the stride flows into the scattered X — so expect names it. (The tail-lane zero-pad class found its witness at 568d224: the device gates genuinely cannot see it — trailing phantom records self-truncate — so it lives as pack_words' unit test with tail-pads-zero proven against cargo-test.)"
 file = "native/src/cubecl_chain/position.rs"
 rebuild = "cargo build --release"
 op = "replace"
-find = "                    if segment_width != 0 && column >= segment_width {"
-with = "                    if segment_width == 1 && column >= segment_width {"
+find = "                    if sw != 0 && count >= sw {"
+with = "                    if sw != 0 && count > sw {"
 expect = "lane mismatch words"
 
 [[mutation]]

@@ -301,10 +301,11 @@ pub fn run(ctx: &GpuContext, fixture_path: &Path) -> ! {
         if stages >= 5 {
             extent_pair::launch_unchecked(
                 &client,
-                cubes_of(item_count),
+                cubes_of(n),
                 CubeDim::new_1d(256),
                 BufferArg::from_raw_parts(h_sm.clone(), n),
                 BufferArg::from_raw_parts(h_fl.clone(), n_words),
+                BufferArg::from_raw_parts(h_lc.clone(), n * LC_STRIDE),
                 BufferArg::from_raw_parts(h_plan.clone(), item_count * 3),
                 BufferArg::from_raw_parts(h_extent.clone(), item_count * 2),
             );

@@ -719,10 +719,11 @@ pub(crate) fn run_repo_chain(
         prof!(begin "extent_pair");
         extent_pair::launch_unchecked(
             &client,
-            cubes_of(item_count.max(1)),
+            cubes_of(n),
             CubeDim::new_1d(256),
             BufferArg::from_raw_parts(h_sm.clone(), n),
             BufferArg::from_raw_parts(h_fl.clone(), n_words),
+            BufferArg::from_raw_parts(h_lc.clone(), n * LC_STRIDE),
             BufferArg::from_raw_parts(h_plan.clone(), walk_plan.len()),
             BufferArg::from_raw_parts(h_extent.clone(), item_count * 2),
         );

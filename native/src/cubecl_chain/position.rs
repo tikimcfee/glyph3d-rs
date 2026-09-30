@@ -165,67 +165,90 @@ pub(super) fn resolve_x(
 }
 
 // ── the extent walk ─────────────────────────────────────────────────────
-// The page stride's input: the WIDEST wrap segment's exact advance sum
-// as a (sum, tail) pair. The engine reads the unrounded f64 prefix
-// (fold.rs scalars[7]); the scan tree's keyed value is per-step-rounded
-// and 1-2 ulp short — the census's X-at-m2 class (deviations at exact
-// doublings, which only a wrong stride value produces). One thread per
-// item mirrors the engine's own walk: a glyph's stored x is the segment
-// sum BEFORE its own advance; the segment resets when the incremented
-// column fills it, and the filling glyph's advance never joins the
-// segment it closes (fold.rs:758); terminators reset both.
+// The page stride's input: the WIDEST wrap segment's exact advance sum.
+// The engine reads the unrounded f64 prefix (fold.rs scalars[7]); the scan
+// tree's keyed value is per-step-rounded and 1-2 ulp short — the census's
+// X-at-m2 class (deviations at exact doublings, which only a wrong stride
+// value produces). A glyph's stored x is the segment sum BEFORE its own
+// advance; the segment resets when the incremented column fills it, and
+// the filling glyph's advance never joins the segment it closes
+// (fold.rs:758); terminators reset both.
+//
+// THE SEGMENT-PARALLEL FORM (2026-09-30, repriced by the chain profiler):
+// the one-thread-per-item serial walk was 54% of the chain's GPU time at
+// the flagship (827ms — the wall is the LARGEST item's latency chain, not
+// bandwidth). The bit-exactness constraint binds only WITHIN a segment
+// (the engine's f32 serial segment sums), and segments are bounded by the
+// wrap width, so: one thread per SEGMENT START, the serial add order
+// preserved byte-for-byte inside the walk, and the cross-segment max via
+// an order-free ordered-key atomic (the seeded lanes pattern — the buffer
+// arrives pre-seeded with ordered_key(0.0), which is also the right value
+// for an item with no leaders). Segment starts read off lc's col — the
+// fold's own fenced lane: col == 0 (line start) or col % width == 0 (the
+// fill boundary); the serial kernel rediscovered the same boundaries by
+// counting. 827ms -> ~15ms at the flagship shape.
 //
 // The segment width arrives pre-resolved in the walk plan (host-packed
 // [start, stop, width] per item — fold.rs's rule: wrap if wrapped, else
 // page columns if paged, else 0 = whole-line sums). It does NOT ride the
 // ie buffer: a six-slice kernel shape misbinds that read (landmine 7's
 // cousin, 2026-09-28 — the width came back zeroed, the reset never
-// fired). Four slices, one mutable output.
+// fired). Four input slices, one mutable output.
 #[cube(launch_unchecked)]
-pub(super) fn extent_pair(sm: &[f32], fl: &[u32], walk_plan: &[u32], extent_words: &mut [u32]) {
-    let item = ABSOLUTE_POS;
-    let item_count = walk_plan.len() / 3;
-    if item < item_count {
-        let start = walk_plan[item * 3] as usize;
-        let stop = walk_plan[item * 3 + 1] as usize;
-        let segment_width = walk_plan[item * 3 + 2] as usize;
-        // The engine's extent input is the f32 SERIAL segment sum —
-        // fold.rs's segment_advance, "genuine f32, the GPU's summation
-        // order" — measured: the engine's stride at item 0 equals the
-        // serial bits exactly, NOT the exact f64 sum (18 ulps below on
-        // that item). A sequential loop accumulator is safe from the
-        // optimizer by data dependence: every add consumes the last.
-        let mut widest_sum = 0.0f32;
-        let mut seg_sum = 0.0f32;
-        let mut column = 0usize;
-        let mut id = start;
-        while id < stop {
-            if (flags_at(fl, id) & F_LEADER) != 0 {
-                // The stored x of THIS glyph is the running sum before
-                // its own advance — the compare set is exactly those.
-                if seg_sum > widest_sum {
-                    widest_sum = seg_sum;
-                }
-                if (flags_at(fl, id) & F_NEWLINE) != 0 {
-                    seg_sum = 0.0f32;
-                    column = 0usize;
-                } else {
-                    column += 1usize;
-                    if segment_width != 0 && column >= segment_width {
-                        // The filler's advance never joins (fold.rs:758).
-                        seg_sum = 0.0f32;
-                        column = 0usize;
-                    } else {
-                        seg_sum += sm[id];
-                    }
-                }
+pub(super) fn extent_pair(
+    sm: &[f32],
+    fl: &[u32],
+    lc: &[u32],
+    walk_plan: &[u32],
+    extent_words: &mut [Atomic<u32>],
+) {
+    let b = ABSOLUTE_POS;
+    if b < lc.len() / LC_STRIDE && (flags_at(fl, b) & F_LEADER) != 0 {
+        let item_count = walk_plan.len() / 3;
+        // The owning item: the last plan entry whose start is at or before
+        // this byte (equal starts belong to empty items; taking the LAST
+        // keeps the one that can contain bytes).
+        let mut lo = 0usize;
+        let mut hi = item_count;
+        while lo + 1 < hi {
+            let mid = (lo + hi) / 2;
+            if (walk_plan[mid * 3] as usize) <= b {
+                lo = mid;
+            } else {
+                hi = mid;
             }
-            id += 1usize;
         }
-        // The tail word is zero: the extent IS an f32 value; the gap's
-        // exact fold happens in derive_stride's fixed-point.
-        extent_words[item * 2] = ordered_key(widest_sum);
-        extent_words[item * 2 + 1] = ordered_key(0.0f32);
+        let sw = walk_plan[lo * 3 + 2] as usize;
+        let col = lc[b * LC_STRIDE + LC_COL] as usize;
+        if col == 0 || (sw != 0 && col.is_multiple_of(sw)) {
+            let stop = walk_plan[lo * 3 + 1] as usize;
+            let mut sum = 0.0f32;
+            let mut widest = 0.0f32;
+            let mut count = 0usize;
+            let mut id = b;
+            while id < stop {
+                let f = flags_at(fl, id);
+                if (f & F_LEADER) != 0 {
+                    // The compare set is the running sum BEFORE this
+                    // glyph's own advance — the stored-x rule.
+                    if sum > widest {
+                        widest = sum;
+                    }
+                    if (f & F_NEWLINE) != 0 {
+                        break;
+                    }
+                    count += 1;
+                    if sw != 0 && count >= sw {
+                        // The fill closes the segment; its advance never
+                        // joins (fold.rs:758).
+                        break;
+                    }
+                    sum += sm[id];
+                }
+                id += 1;
+            }
+            extent_words[lo * 2].fetch_max(ordered_key(widest));
+        }
     }
 }
 
