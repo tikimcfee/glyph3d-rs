@@ -45,16 +45,17 @@ fork)
         exit 1
     fi
     # The chunked emitter, fenced: shrink the record window so the standing
-    # fixture (278,470 records) crosses five chunk boundaries — the 16.7M
+    # fixture crosses several chunk boundaries (319,628 records since the
+    # 2026-09-30 cluster extension = six windows) — the 16.7M
     # default never leaves window zero here, so the window arithmetic
     # (rec_first carry, rolling buffer reuse) was otherwise exercised only
     # by manual 97MB runs. The window base rides a runtime params buffer,
-    # so all five windows share ONE compiled kernel — this pass pays
+    # so every window shares ONE compiled kernel — this pass pays
     # dispatches and 4-byte uploads, not JIT compiles.
     if out=$(GLYPH_RECORD_CHUNK=60000 "$BIN" --cubecl-repo-check native/fixtures/cubecl-fork 2>&1); then
         echo "$out" | grep -q "cubecl-repo-check PASS" \
             && echo "$out" | grep -q "strict: bit-exact" \
-            && echo "PASS  cubecl-fork-chunked (GLYPH_RECORD_CHUNK=60000, five windows)" \
+            && echo "PASS  cubecl-fork-chunked (GLYPH_RECORD_CHUNK=60000, six windows)" \
             || { echo "FAIL  cubecl-fork-chunked — PASS/strict lines missing"; echo "$out" | tail -5; exit 1; }
     else
         echo "FAIL  cubecl-fork-chunked — exited nonzero"

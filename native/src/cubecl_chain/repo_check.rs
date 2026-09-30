@@ -443,8 +443,19 @@ pub fn repo_check(ctx: &GpuContext, dir: &Path) -> ! {
             );
             std::process::exit(1);
         }
+        // The cluster-commit bucket: the fixture carries cluster-bearing
+        // content (clusters.txt, 2026-09-30) so the strict tier fences
+        // committed-cluster gi/trailer lanes too — a candidates count of
+        // zero means the corpus cannot see the class it now exists to
+        // cover (the pre-extension corpus was pure ASCII and read 0).
+        if c == 0 {
+            eprintln!(
+                "cubecl-repo-check FAIL (strict): 0 cluster candidates — the corpus cannot fence the cluster-commit path it exists to cover"
+            );
+            std::process::exit(1);
+        }
         println!(
-            "strict: bit-exact across all lanes; {m3_records} records at m >= 3, {seg3_records} at segment >= 3 (exercised)"
+            "strict: bit-exact across all lanes; {m3_records} records at m >= 3, {seg3_records} at segment >= 3, {c} cluster candidates (exercised)"
         );
     }
     // The census line prints on PASS too — it is the instrument that prices

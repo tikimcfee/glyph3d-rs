@@ -218,8 +218,11 @@ battery; the state handoff is note 18 in the integration notes):
   change re-runs this instrument on a corpus exercising m >= 3 and wrap
   segments >= 3. STRICT mode (`GLYPH_REPO_CHECK_STRICT=1`, set by the
   cubecl-fork gate): any measure-word bit-deviation fails, and the census
-  denominators must be nonzero — an unexercised corpus is a FAIL, so the
-  standing fixture cannot quietly stop covering its subject.
+  denominators — m >= 3, seg >= 3, and the cluster candidate count — must
+  be nonzero: an unexercised corpus is a FAIL, so the standing fixture
+  cannot quietly stop covering its subjects (the fork arithmetic classes
+  and, since `fixtures/cubecl-fork/clusters.txt` (2026-09-30), the
+  cluster-commit path).
 
 Shared env vars: `GLYPH_CHAIN_STAGES` (absolute dispatch count — bisection),
 `GLYPH_CHAIN_LOOP` (samples, minimum reported), `GLYPH_CHAIN_WRAP=<w>`
@@ -235,7 +238,8 @@ fl/sm are diffed bit-exact against `decode_all`+`resolve_clusters`),
 — the records tail only (default 16,777,216 = 512 MB); the instance tail
 has NO windows since E2b — the scatter writes the renderer-bound buffer
 directly. The cubecl-fork gate sets 60,000 so the standing fixture's
-278,470 records cross five windows, fencing the emitter's window carry on
+records cross several windows (six at 319,628 records since the
+2026-09-30 cluster extension), fencing the emitter's window carry on
 an ordinary corpus; the window bases ride runtime params buffers, so every
 window shares one compiled kernel — small values cost dispatches and
 4-byte uploads, nothing else),

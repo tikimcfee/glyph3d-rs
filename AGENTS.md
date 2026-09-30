@@ -429,15 +429,20 @@ driver uploads CPU-computed statics, so no packed byte is ever classified on
 device here. The phantom-tail class is therefore fenced by `pack_words`' unit
 test (the `tail-pads-zero` mutation), not by any device gate.
 
-**cubecl-fork** (2026-09-28; re-formed at the endpoint, 2026-09-29). `--cubecl-repo-check`
+**cubecl-fork** (2026-09-28; re-formed at the endpoint, 2026-09-29; fixture extended 2026-09-30). `--cubecl-repo-check`
 in STRICT mode over the standing fork fixture (`native/fixtures/cubecl-fork`, IMMUTABLE):
 the full from-bytes chain's records versus the ENGINE's batched records, BIT-exact,
 plus the endpoint tiers — the 32 B slot stream field-equal against the engine arena
 (the renderer-bound form, fenced in the exact shape the shader reads), placements
 bit-equal — with the fork census's m >= 3 and seg >= 3 buckets proven exercised — an
 unexercised corpus is a FAIL, so the fixture cannot quietly stop covering the paginate
-arithmetic classes. The gate runs the fixture twice: default, and
-`GLYPH_RECORD_CHUNK=60000` (five emit windows), so the chunked emitter's `rec_first`
+arithmetic classes. Since 2026-09-30 the fixture also carries `clusters.txt` (every
+supported cluster class — families, flags, skin tones, roles, keycaps, tag flags,
+VS16 on/off, and the stay-pieces fallbacks — placed at wrap columns, page boundaries,
+line and file edges), and STRICT likewise requires a nonzero cluster candidate count:
+the pre-extension corpus was pure ASCII and read 0, which is exactly the failure the
+bucket now refuses. The gate runs the fixture twice: default, and
+`GLYPH_RECORD_CHUNK=60000` (six emit windows), so the chunked emitter's `rec_first`
 carry is fenced on an ordinary corpus. The `emitter-window-offset-dropped` mutation
 reddens only through the chunked pass. (The chunked-arena and readback-hop passes and
 their six mutations retired with the hop machinery at E2b.) Blind to corpora outside
@@ -528,7 +533,7 @@ with a number against it.
 | `native/fixtures/baseline-view.txt` | IMMUTABLE | it is the input to `text.png`; editing it re-baselines that check silently |
 | `native/fixtures/emoji-view.txt` | IMMUTABLE | the input to `emoji.png`, one line per class of bitmap slot the trie carries; same reason |
 | `native/fixtures/g-pick-repo/empty.rs` | IMMUTABLE, zero bytes | the only input that reaches the page-extent origin seed; deleting it removes a check's ability to see its subject without removing the check |
-| `native/fixtures/cubecl-fork/` | IMMUTABLE | the cubecl-fork gate's standing corpus — the only committed input exercising paginate's m >= 3 and segment >= 3 classes; editing it re-hollows a bit-exactness gate silently (the strict mode's exercise asserts catch deletion, not weakening) |
+| `native/fixtures/cubecl-fork/` | IMMUTABLE | the cubecl-fork gate's standing corpus — the only committed input exercising paginate's m >= 3 / segment >= 3 classes and (since the `clusters.txt` extension, 2026-09-30) the committed-cluster classes at wrap/page boundaries; editing it re-hollows a bit-exactness gate silently (the strict mode's exercise asserts catch deletion, not weakening) |
 | `out/tooling-ab/baseline/<key>/` | tracked pixel oracle, one set per rasterizer; **golden** in build.toml | changes only on purpose, with a note saying why; the runner refuses to regenerate it. A new host adopts its own set by hand (the gate prints how); it never edits another's |
 | `integration/egui/` | vendored reference | never compiled; the real dependency is from crates.io |
 
