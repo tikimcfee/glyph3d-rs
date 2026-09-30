@@ -436,7 +436,51 @@ pub(crate) fn run_repo_chain(
     // would print this phase's close line after the whole tail.
     drop(span_upload);
     let sp_dispatch = tracing::info_span!("chain.dispatch").entered();
+    // GLYPH_CHAIN_PROF=1: the bench's per-stage GPU windows, ported into the
+    // PRODUCT chain (note 24 §A4.2) — every stage fenced and timestamped in
+    // place, so tail.totals' absorbed execution decomposes by name. Fences
+    // serialize the chain: the printed SUM is the pricing table, NOT a load
+    // time (the spans keep the unfused walls). The two internal syncs ride
+    // as wall-clock rows; the tail's ladder/tint/placements stay
+    // span-covered. Single-shot at repo scale; replicate by re-running.
+    let prof = std::env::var_os("GLYPH_CHAIN_PROF").is_some();
+    let mut prof_ok = prof;
+    let mut prof_rows: Vec<(&'static str, std::time::Duration)> = Vec::new();
+    let mut prof_missing = 0usize;
+    let mut prof_timing: Option<String> = None;
+    let mut prof_w;
+    macro_rules! prof {
+        (begin $name:literal) => {
+            prof_w = if prof_ok {
+                match client.profile_start() {
+                    Ok(w) => Some(w),
+                    Err(e) => {
+                        eprintln!(
+                            "chain-prof: profile_start failed ({e}); stages run unwindowed"
+                        );
+                        prof_ok = false;
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+        };
+        (end $name:literal) => {
+            if let Some(w) = prof_w.take() {
+                let dur = client.profile_end(w).expect("profile_end");
+                if prof_timing.is_none() {
+                    prof_timing = Some(format!("{}", dur.timing_method()));
+                }
+                match pollster::block_on(dur.resolve()) {
+                    Some(ticks) => prof_rows.push(($name, ticks.duration())),
+                    None => prof_missing += 1,
+                }
+            }
+        };
+    }
     unsafe {
+        prof!(begin "decode");
         decode::launch_unchecked(
             &client,
             cubes_of(n_words),
@@ -451,6 +495,8 @@ pub(crate) fn run_repo_chain(
             BufferArg::from_raw_parts(h_hgt.clone(), n),
             bshift,
         );
+        prof!(end "decode");
+        prof!(begin "cluster_probe");
         cluster_probe::launch_unchecked(
             &client,
             cubes_of(n_words),
@@ -469,6 +515,8 @@ pub(crate) fn run_repo_chain(
             BufferArg::from_raw_parts(h_cend.clone(), n),
             seq_max,
         );
+        prof!(end "cluster_probe");
+        prof!(begin "cand_count_tile");
         count_tile::launch_unchecked(
             &client,
             tiles_grid(n_tiles),
@@ -480,6 +528,8 @@ pub(crate) fn run_repo_chain(
             rake,
             log,
         );
+        prof!(end "cand_count_tile");
+        prof!(begin "cand_count_spine");
         count_spine::launch_unchecked(
             &client,
             CubeCount::new_single(),
@@ -490,9 +540,14 @@ pub(crate) fn run_repo_chain(
             units,
             log,
         );
+        prof!(end "cand_count_spine");
     }
+    let t_csync = std::time::Instant::now();
     let tb = client.read_one(h_ctotal.clone()).expect("candidate count");
     let c = bytemuck::cast_slice::<u8, u32>(&tb)[0] as usize;
+    if prof_ok {
+        prof_rows.push(("sync:cand_readback", t_csync.elapsed()));
+    }
     let kmax = ((c as u32 + 1).next_power_of_two().trailing_zeros()) as usize;
     let cstride = c + 1;
     let h_lvl = alloc_empty((kmax * (c + 1)).max(1) * 4);
@@ -505,6 +560,7 @@ pub(crate) fn run_repo_chain(
     let h_d_b = alloc_empty((c + 1) * 4);
     let h_roots = alloc_upload(bytemuck::cast_slice(&vec![c as u32; item_count]));
     unsafe {
+        prof!(begin "cand_scatter");
         cand_scatter::launch_unchecked(
             &client,
             tiles_grid(n_tiles),
@@ -516,6 +572,8 @@ pub(crate) fn run_repo_chain(
             units,
             rake,
         );
+        prof!(end "cand_scatter");
+        prof!(begin "jump_build");
         jump_build::launch_unchecked(
             &client,
             cubes_of(c + 1),
@@ -526,6 +584,10 @@ pub(crate) fn run_repo_chain(
             BufferArg::from_raw_parts(h_ctotal.clone(), 1),
             BufferArg::from_raw_parts(h_parent.clone(), c + 1),
         );
+        prof!(end "jump_build");
+        // The K rank steps ride ONE window (the bench's cluster_rank
+        // grouping): same kernel, ping-ponged buffers, K = ceil(log2(c+1)).
+        prof!(begin "cluster_rank");
         let mut sp = h_parent.clone();
         let mut sd = h_d0.clone();
         for k in 0..kmax {
@@ -546,6 +608,8 @@ pub(crate) fn run_repo_chain(
             sp = tp;
             sd = td;
         }
+        prof!(end "cluster_rank");
+        prof!(begin "item_roots");
         item_roots::launch_unchecked(
             &client,
             cubes_of(item_count.max(1)),
@@ -556,6 +620,8 @@ pub(crate) fn run_repo_chain(
             BufferArg::from_raw_parts(h_ic.clone(), ic.len()),
             BufferArg::from_raw_parts(h_roots.clone(), item_count),
         );
+        prof!(end "item_roots");
+        prof!(begin "cluster_mark");
         cluster_mark::launch_unchecked(
             &client,
             cubes_of(c.max(1)),
@@ -575,6 +641,8 @@ pub(crate) fn run_repo_chain(
             cstride,
             bitmap_advance,
         );
+        prof!(end "cluster_mark");
+        prof!(begin "tile_scan");
         tile_scan::launch_unchecked(
             &client,
             tiles_grid(n_tiles),
@@ -589,6 +657,8 @@ pub(crate) fn run_repo_chain(
             rake,
             log,
         );
+        prof!(end "tile_scan");
+        prof!(begin "spine_scan");
         spine_scan::launch_unchecked(
             &client,
             CubeCount::new_single(),
@@ -600,6 +670,8 @@ pub(crate) fn run_repo_chain(
             units,
             log,
         );
+        prof!(end "spine_scan");
+        prof!(begin "apply");
         apply::launch_unchecked(
             &client,
             tiles_grid(n_tiles),
@@ -623,6 +695,8 @@ pub(crate) fn run_repo_chain(
             log,
             false,
         );
+        prof!(end "apply");
+        prof!(begin "resolve_x");
         resolve_x::launch_unchecked(
             &client,
             cubes_of(n.div_ceil(rspan)),
@@ -641,6 +715,8 @@ pub(crate) fn run_repo_chain(
             256,
             rspan,
         );
+        prof!(end "resolve_x");
+        prof!(begin "extent_pair");
         extent_pair::launch_unchecked(
             &client,
             cubes_of(item_count.max(1)),
@@ -650,6 +726,8 @@ pub(crate) fn run_repo_chain(
             BufferArg::from_raw_parts(h_plan.clone(), walk_plan.len()),
             BufferArg::from_raw_parts(h_extent.clone(), item_count * 2),
         );
+        prof!(end "extent_pair");
+        prof!(begin "derive_stride");
         derive_stride::launch_unchecked(
             &client,
             cubes_of(item_count.max(1)),
@@ -659,6 +737,8 @@ pub(crate) fn run_repo_chain(
             BufferArg::from_raw_parts(h_gap.clone(), item_count),
             BufferArg::from_raw_parts(h_strides.clone(), item_count * 2),
         );
+        prof!(end "derive_stride");
+        prof!(begin "paginate");
         paginate::launch_unchecked(
             &client,
             cubes_of(n),
@@ -671,12 +751,14 @@ pub(crate) fn run_repo_chain(
             BufferArg::from_raw_parts(h_ir.clone(), ir.len()),
             BufferArg::from_raw_parts(h_strides.clone(), item_count * 2),
         );
+        prof!(end "paginate");
         // ── rung 5b: the survivor pass ──────────────────────────────────
         // The proven cluster-counter machinery (count_tile/count_spine) on
         // the two byte flags, then the ordinal scatter overwrites the flags
         // with per-byte exclusive ordinals, then per-item totals from the
         // boundaries. Runs in EVERY mode — rec_base itself comes from here
         // now (the CPU leader scan is gone).
+        prof!(begin "survivor_flags");
         survivor_flags::launch_unchecked(
             &client,
             cubes_of(n),
@@ -686,6 +768,8 @@ pub(crate) fn run_repo_chain(
             BufferArg::from_raw_parts(h_lflag.clone(), n),
             BufferArg::from_raw_parts(h_sflag.clone(), n),
         );
+        prof!(end "survivor_flags");
+        prof!(begin "sv_count_tile_l");
         count_tile::launch_unchecked(
             &client,
             tiles_grid(n_tiles),
@@ -697,6 +781,8 @@ pub(crate) fn run_repo_chain(
             rake,
             log,
         );
+        prof!(end "sv_count_tile_l");
+        prof!(begin "sv_count_spine_l");
         count_spine::launch_unchecked(
             &client,
             CubeCount::new_single(),
@@ -707,6 +793,8 @@ pub(crate) fn run_repo_chain(
             units,
             log,
         );
+        prof!(end "sv_count_spine_l");
+        prof!(begin "sv_count_tile_s");
         count_tile::launch_unchecked(
             &client,
             tiles_grid(n_tiles),
@@ -718,6 +806,8 @@ pub(crate) fn run_repo_chain(
             rake,
             log,
         );
+        prof!(end "sv_count_tile_s");
+        prof!(begin "sv_count_spine_s");
         count_spine::launch_unchecked(
             &client,
             CubeCount::new_single(),
@@ -728,6 +818,8 @@ pub(crate) fn run_repo_chain(
             units,
             log,
         );
+        prof!(end "sv_count_spine_s");
+        prof!(begin "ordinal_scatter");
         ordinal_scatter::launch_unchecked(
             &client,
             tiles_grid(n_tiles),
@@ -743,6 +835,8 @@ pub(crate) fn run_repo_chain(
             units,
             rake,
         );
+        prof!(end "ordinal_scatter");
+        prof!(begin "item_totals");
         item_totals::launch_unchecked(
             &client,
             cubes_of(item_count.max(1)),
@@ -755,6 +849,7 @@ pub(crate) fn run_repo_chain(
             BufferArg::from_raw_parts(h_lgrand.clone(), 1),
             BufferArg::from_raw_parts(h_sgrand.clone(), 1),
         );
+        prof!(end "item_totals");
     }
     // ── the tail: totals, then the mode's emission loops ─────────────────
     let t_rb = std::time::Instant::now();
@@ -771,10 +866,14 @@ pub(crate) fn run_repo_chain(
     // prefix-summed on host into rec_base/slot_base and the loop bounds.
     // This is the CPU leader scan's replacement (its 0.195s at the 97MB
     // shape is what `prep` used to report).
+    let t_tsync = std::time::Instant::now();
     let tb_l = client.read_one(h_ltot.clone()).expect("leader totals");
     let ltot: Vec<u32> = bytemuck::cast_slice(&tb_l)[..item_count].to_vec();
     let tb_s = client.read_one(h_stot.clone()).expect("survivor totals");
     let stot: Vec<u32> = bytemuck::cast_slice(&tb_s)[..item_count].to_vec();
+    if prof_ok {
+        prof_rows.push(("sync:totals_readback", t_tsync.elapsed()));
+    }
     let mut rec_base = vec![0u32; item_count];
     let mut slot_base = vec![0u32; item_count];
     let mut total_records = 0u32;
@@ -859,6 +958,7 @@ pub(crate) fn run_repo_chain(
             let h_win = alloc_upload(bytemuck::cast_slice(&[first as u32]));
             let sp_emit = tracing::info_span!("tail.window.emit").entered();
             unsafe {
+                prof!(begin "emit_records");
                 emit_records::launch_unchecked(
                     &client,
                     cubes_of(n),
@@ -875,6 +975,7 @@ pub(crate) fn run_repo_chain(
                     BufferArg::from_raw_parts(h_recs.clone(), take * 8),
                     BufferArg::from_raw_parts(h_win, 1),
                 );
+                prof!(end "emit_records");
             }
             drop(sp_emit);
             let sp_rb = tracing::info_span!("tail.window.readback").entered();
@@ -913,6 +1014,7 @@ pub(crate) fn run_repo_chain(
         let h_slots = alloc_empty(total_slots.max(1) as usize * 8 * 4);
         let h_tint = alloc_empty(total_slots.max(1) as usize * 2 * 4);
         unsafe {
+            prof!(begin "scatter_slots");
             scatter_slots::launch_unchecked(
                 &client,
                 cubes_of(n),
@@ -934,6 +1036,7 @@ pub(crate) fn run_repo_chain(
                 BufferArg::from_raw_parts(h_tint.clone(), total_slots.max(1) as usize * 2),
                 BufferArg::from_raw_parts(h_ext.clone(), item_count * EXT_STRIDE),
             );
+            prof!(end "scatter_slots");
         }
         drop(sp_scatter);
         // The one slot-derived readback: the tint stream, seg_tint's
@@ -1048,6 +1151,22 @@ pub(crate) fn run_repo_chain(
                 },
             });
         }
+    }
+    if prof {
+        if !prof_ok {
+            eprintln!("chain-prof: GPU windows were unavailable — only the sync rows carry timings");
+        }
+        let sum: std::time::Duration = prof_rows.iter().map(|(_, d)| *d).sum();
+        eprintln!(
+            "chain-prof: timing={} — {} rows, {} missing windows (fenced per stage; the SUM is the price table, the spans keep the unfused walls)",
+            prof_timing.as_deref().unwrap_or("none"),
+            prof_rows.len(),
+            prof_missing
+        );
+        for (name, d) in &prof_rows {
+            eprintln!("  {name:<24} {:>9.3}ms", d.as_secs_f64() * 1e3);
+        }
+        eprintln!("  {:<24} {:>9.3}ms", "SUM", sum.as_secs_f64() * 1e3);
     }
     ChainStream {
         records: recs_all,
