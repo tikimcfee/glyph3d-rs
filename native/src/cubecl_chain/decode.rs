@@ -30,6 +30,7 @@ pub(super) fn decode(
     sm: &mut [f32],
     gi: &mut [u32],
     hgt: &mut [f32],
+    cslot: &mut [u32],
     block_shift: u32,
 ) {
     let w = ABSOLUTE_POS;
@@ -40,6 +41,12 @@ pub(super) fn decode(
         while lane < 4 {
             let id = w * 4 + lane;
             if id < n {
+                // The candidate-slot clear rides decode (2026-09-30): the
+                // probe writes cslot only on its deep candidate path, and
+                // count_tile/cand_scatter read it as a predicate over every
+                // byte — so it arrived as a 388 MB upload of zeros. One
+                // store per byte here, where every byte is already touched.
+                cslot[id] = 0u32;
                 let b = byte_at(bytes, id, n);
                 // sequence_length, transcribed: the lenient classifier.
                 let len = if b & 0x80u32 == 0u32 {

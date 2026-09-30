@@ -223,11 +223,10 @@ pub fn bench(ctx: &GpuContext, corpus_path: &Path) -> ! {
         (client.empty(0), client.empty(0))
     };
     let h_ic = client.create_from_slice(bytemuck::cast_slice(&ic));
-    let h_cslot = if cluster_mode {
-        client.create_from_slice(bytemuck::cast_slice(&vec![0u32; n]))
-    } else {
-        client.empty(n * 4)
-    };
+    // The probe writes cslot only on its candidate path and count_tile reads
+    // it as a per-byte predicate — but the zero-fill rides decode's per-byte
+    // store now (2026-09-30), so this is a plain allocation in every mode.
+    let h_cslot = client.empty(n * 4);
     let h_cend = client.empty(n * 4);
     let h_ir = client.create_from_slice(bytemuck::cast_slice(&ir));
     let h_ie = client.create_from_slice(bytemuck::cast_slice(&ie));
@@ -297,6 +296,7 @@ pub fn bench(ctx: &GpuContext, corpus_path: &Path) -> ! {
                     BufferArg::from_raw_parts(h_sm.clone(), n),
                     BufferArg::from_raw_parts(h_gi.clone(), n),
                     BufferArg::from_raw_parts(h_hgt.clone(), n),
+                    BufferArg::from_raw_parts(h_cslot.clone(), n),
                     bshift,
                 );
                 cluster_probe::launch_unchecked(
@@ -392,6 +392,7 @@ pub fn bench(ctx: &GpuContext, corpus_path: &Path) -> ! {
                     BufferArg::from_raw_parts(h_sm.clone(), n),
                     BufferArg::from_raw_parts(h_gi.clone(), n),
                     BufferArg::from_raw_parts(h_hgt.clone(), n),
+                    BufferArg::from_raw_parts(h_cslot.clone(), n),
                     bshift,
                 );
             }

@@ -646,6 +646,9 @@ pub fn decode_check(ctx: &GpuContext, fixture_path: &Path) -> ! {
     let h_sm = client.empty(n * 4);
     let h_gi = client.empty(n * 4);
     let h_hgt = client.empty(n * 4);
+    // decode clears the candidate-slot lane as of 2026-09-30; this driver
+    // never reads it, so a plain allocation rides the launch.
+    let h_cslot = client.empty(n * 4);
     let cubes_of = |threads: usize| {
         let cubes = threads.div_ceil(256);
         CubeCount::Static(cubes.min(65535) as u32, cubes.div_ceil(65535) as u32, 1)
@@ -664,6 +667,7 @@ pub fn decode_check(ctx: &GpuContext, fixture_path: &Path) -> ! {
             BufferArg::from_raw_parts(h_sm.clone(), n),
             BufferArg::from_raw_parts(h_gi.clone(), n),
             BufferArg::from_raw_parts(h_hgt.clone(), n),
+            BufferArg::from_raw_parts(h_cslot.clone(), n),
             crate::glyph_trie::BLOCK_SHIFT,
         );
     }
@@ -831,6 +835,7 @@ pub fn cluster_check(ctx: &GpuContext, fixture_path: &Path) -> ! {
             BufferArg::from_raw_parts(h_sm.clone(), n),
             BufferArg::from_raw_parts(h_gi.clone(), n),
             BufferArg::from_raw_parts(h_hgt.clone(), n),
+            BufferArg::from_raw_parts(h_cslot.clone(), n),
             crate::glyph_trie::BLOCK_SHIFT,
         );
         cluster_probe::launch_unchecked(

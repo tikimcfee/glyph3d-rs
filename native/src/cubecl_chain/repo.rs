@@ -320,7 +320,10 @@ pub(crate) fn run_repo_chain(
     let h_sm = alloc_empty(n * 4);
     let h_gi = alloc_empty(n * 4);
     let h_hgt = alloc_empty(n * 4);
-    let h_cslot = alloc_upload(bytemuck::cast_slice(&vec![0u32; n]));
+    // cslot's zero-fill rides decode's per-byte store (the probe only writes
+    // candidates; count_tile/cand_scatter read it as a predicate over every
+    // byte) — a 388 MB upload of zeros died here, 2026-09-30.
+    let h_cslot = alloc_empty(n * 4);
     let h_cend = alloc_empty(n * 4);
     let h_tc = alloc_empty(n_tiles * PARTIAL_COUNT_STRIDE * 4);
     let h_tm = alloc_empty(n_tiles * 4);
@@ -493,6 +496,7 @@ pub(crate) fn run_repo_chain(
             BufferArg::from_raw_parts(h_sm.clone(), n),
             BufferArg::from_raw_parts(h_gi.clone(), n),
             BufferArg::from_raw_parts(h_hgt.clone(), n),
+            BufferArg::from_raw_parts(h_cslot.clone(), n),
             bshift,
         );
         prof!(end "decode");
