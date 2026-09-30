@@ -216,16 +216,17 @@ pub fn repo_check(ctx: &GpuContext, dir: &Path) -> ! {
         // tint[2s+1] == slot color. Transitively engine-fenced, by the
         // tier above.
         if !stream.slots.is_empty() {
-            if stream.tint.len() * 4 != stream.slots.len() {
+            let tint = stream.tint.as_slice();
+            if tint.len() * 4 != stream.slots.len() {
                 tint_bad += 1;
                 println!(
                     "  TINT LENGTH MISMATCH: {} slots, {} tint words",
                     stream.slots.len() / 8,
-                    stream.tint.len() / 2
+                    tint.len() / 2
                 );
             } else {
                 for s in 0..stream.slots.len() / 8 {
-                    let (tg, tc) = (stream.tint[s * 2], stream.tint[s * 2 + 1]);
+                    let (tg, tc) = (tint[s * 2], tint[s * 2 + 1]);
                     let (sg, sc) = (stream.slots[s * 8 + 3], stream.slots[s * 8 + 4]);
                     if tg != sg || tc != sc {
                         tint_bad += 1;

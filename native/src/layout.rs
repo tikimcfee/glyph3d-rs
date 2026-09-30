@@ -478,8 +478,8 @@ pub struct DeviceSlots {
     /// Slots per chunk (uniform; the last chunk may hold fewer).
     pub chunk_slots: usize,
     pub len: usize,
-    /// (glyph_id, color) per slot, slot order.
-    pub tint: Vec<u32>,
+    /// (glyph_id, color) per slot, slot order — read through `as_slice`.
+    pub tint: TintStore,
     /// The cubecl pool bindings that keep the chunks' memory from being
     /// re-allocated — never read by design; their Drop is the release.
     #[allow(dead_code)]
@@ -491,6 +491,45 @@ pub struct DeviceSlotChunk {
     pub offset: u64,
     pub slots: u32,
 }
+
+/// The tint stream's two homes (note 23, E3b): a host Vec (the gate's Both
+/// mode, and hosts without host-visible storage) or a MAPPED shared buffer
+/// the chain's copy landed (the product on Metal — no staging, no Bytes,
+/// no to_vec; the host reads the pointer). `as_slice` is the only read.
+pub enum TintStore {
+    Host(Vec<u32>),
+    Mapped(TintMapped),
+}
+
+pub struct TintMapped {
+    /// Never read — it OWNS the shared allocation `ptr` aliases; dropping
+    /// it would free the buffer under the fold's reads.
+    #[allow(dead_code)]
+    pub buffer: wgpu::Buffer,
+    pub ptr: *const u32,
+    pub words: usize,
+}
+
+impl TintStore {
+    pub fn as_slice(&self) -> &[u32] {
+        match self {
+            TintStore::Host(v) => v,
+            TintStore::Mapped(m) => {
+                // SAFETY: the buffer outlives the store (owned field), the
+                // pointer is its contents base (Metal shared storage), and
+                // `words` counts what the chain's copy wrote before the
+                // poll published it.
+                unsafe { std::slice::from_raw_parts(m.ptr, m.words) }
+            }
+        }
+    }
+}
+
+// The raw pointer aliases shared storage owned by the `buffer` field; the
+// arena moves between load threads and the slice is only ever READ through
+// as_slice (the tint fold), never written.
+unsafe impl Send for TintMapped {}
+unsafe impl Sync for TintMapped {}
 
 // The raw pointers alias shared-storage buffers owned by this struct; the
 // arena is moved between load threads (walk → layout → scene build) but the

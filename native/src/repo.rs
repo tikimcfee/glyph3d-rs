@@ -841,7 +841,8 @@ impl RepoLoad {
         // path (note 23, E2b — no host instances exist there) and the
         // arena chunks on the 48 B paths; same values in the same slot
         // order either way, so the tints are bit-identical.
-        let tint_stream: Option<&[u32]> = self.arena.device_slots().map(|d| d.tint.as_slice());
+        let tint_stream: Option<&[u32]> =
+            self.arena.device_slots().map(|d| d.tint.as_slice());
         let chunks = if tint_stream.is_none() {
             self.arena.instance_chunks()
         } else {

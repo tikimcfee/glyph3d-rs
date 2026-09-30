@@ -108,6 +108,9 @@ pub(crate) struct SharedDevice {
     /// against it (one buffer holds ≤ 134M slots; chunking past that is the
     /// named follow-up).
     pub max_buffer_size: u64,
+    /// Metal + MAPPABLE_PRIMARY_BUFFERS — the shared-memory forms (the
+    /// tint stream's mapped readback) exist only there.
+    pub host_visible_storage: bool,
 }
 
 impl SharedDevice {
@@ -118,6 +121,8 @@ impl SharedDevice {
             device: ctx.device.clone(),
             queue: ctx.queue.clone(),
             max_buffer_size: ctx.profile.max_buffer_size,
+            host_visible_storage: ctx.profile.backend == wgpu::Backend::Metal
+                && ctx.profile.mappable_primary_buffers,
         }
     }
 }
@@ -153,9 +158,9 @@ pub(crate) struct ChainStream {
     /// The 32 B slots on device — the endpoint form the renderer binds.
     /// Some whenever Instances/Both ran and the survivor total is nonzero.
     pub slot_device: Option<SlotDevice>,
-    /// The tint stream — (glyph_id, color) per slot, slot order, host-side.
+    /// The tint stream — (glyph_id, color) per slot, slot order.
     /// seg_tint's fold input now that no host arena exists. Instances/Both.
-    pub tint: Vec<u32>,
+    pub tint: crate::layout::TintStore,
     /// 8 u32 per slot — the 32 B form READ BACK to host. EMPTY unless Both
     /// (the fork gate's lane tier reads it; the product never wants it).
     pub slots: Vec<u32>,
@@ -798,8 +803,35 @@ pub(crate) fn run_repo_chain(
     drop(sp_totals);
     span_tail.record("total_records", total_records);
     span_tail.record("total_slots", total_slots);
+    // THE LADDER (E3, note 23): every lane whose last reader ran before the
+    // survivor pass drops HERE — the totals readback above is a queue sync,
+    // so nothing in flight reads them when the cleanup reclaims. ~28 B per
+    // corpus byte at the flagship (~2.7 GB), shrinking the tail's live set
+    // to slots + tint + the scatter's reads, back under the working-set
+    // cliff by construction. The records tail keeps lc (its row/col lanes).
+    {
+        let _sp_ladder = tracing::info_span!("tail.ladder").entered();
+        drop((
+            h_bytes, h_bi, h_bm, h_bc, h_seq, h_bmap, h_poff, h_pval, h_ic, h_ie, h_im, h_gap,
+            h_plan, h_strides, h_rmax, h_xmax, h_extent, h_cslot, h_cend, h_tc, h_tm, h_xc, h_xm,
+            h_wm, h_otb, h_hp, h_lvl, h_parent, h_parent_b, h_d0, h_d_a, h_d_b, h_roots, h_lflag,
+            h_ltc, h_stc, h_lup, h_sup, h_lxc, h_sxc, h_lgrand, h_sgrand, h_ltot, h_stot,
+            h_ctotal,
+        ));
+        client.memory_cleanup();
+        let usage = client.memory_usage();
+        tracing::info!(
+            live_bytes = live.get(),
+            bytes_in_use = usage.bytes_in_use,
+            number_allocs = usage.number_allocs,
+            "tail.ladder: post-cleanup pool state"
+        );
+    }
     let h_base = alloc_upload(bytemuck::cast_slice(&rec_base));
     let mut recs_all: Vec<u32> = Vec::new();
+    // h_lc's end splits by mode: the records tail reads it (row/col), the
+    // product tail never does — and Rust's path-sensitivity means the
+    // drop rides each arm of ONE if/else, not two correlated conditions.
     if matches!(mode, ChainMode::Records | ChainMode::Both) {
         recs_all.reserve(total_records as usize * 8);
         let chunk_recs = chunk_recs_cap.min(total_records as usize).max(1);
@@ -843,10 +875,13 @@ pub(crate) fn run_repo_chain(
             drop(sp_rb);
             first += take;
         }
+        drop(h_lc); // the records tail is lc's last reader
+    } else {
+        drop(h_lc); // the product path never reads row/col — it rides the ladder
     }
     let mut placements: Vec<crate::layout::ItemPlacement> = Vec::new();
     let mut slots_all: Vec<u32> = Vec::new();
-    let mut tint_all: Vec<u32> = Vec::new();
+    let mut tint_store = crate::layout::TintStore::Host(Vec::new());
     let mut slot_device: Option<SlotDevice> = None;
     if wants_instances {
         // THE ENDPOINT (note 23, E2b): ONE scatter pass writes the 32 B
@@ -893,12 +928,53 @@ pub(crate) fn run_repo_chain(
         }
         drop(sp_scatter);
         // The one slot-derived readback: the tint stream, seg_tint's
-        // bit-exact fold input — 8 B/slot where the readback hop once
-        // moved 48. The slots themselves stay on device; the queue's
-        // order covers the renderer's later draws, so there is no drain.
+        // fold input. TWO forms (E3b): the gate's Both mode and
+        // non-shared hosts take cubecl's staging pipe; the product on
+        // Metal takes ONE device copy into a hal-mapped shared buffer and
+        // the host reads the pointer — no staging alloc, no Bytes, no
+        // to_vec. (The read_one cascade cost 4.16s of the 12.1s flagship
+        // backend — three 762 MB fault-and-copy passes for one stream.)
         let sp_tint = tracing::info_span!("tail.tint").entered();
-        let tb = client.read_one(h_tint.clone()).expect("read tint stream");
-        tint_all = bytemuck::cast_slice::<u8, u32>(&tb)[..total_slots as usize * 2].to_vec();
+        tint_store = if matches!(mode, ChainMode::Both)
+            || !device_ref.host_visible_storage
+            || total_slots == 0
+        {
+            let tb = client.read_one(h_tint.clone()).expect("read tint stream");
+            crate::layout::TintStore::Host(
+                bytemuck::cast_slice::<u8, u32>(&tb)[..total_slots as usize * 2].to_vec(),
+            )
+        } else {
+            let res = client
+                .get_resource::<WgpuServer<AutoCompiler>>(h_tint.clone())
+                .expect("tint stream resource");
+            let (src, src_off) = {
+                let r = res.resource();
+                (r.buffer.clone(), r.offset)
+            };
+            let bytes = (total_slots as usize * 8) as u64;
+            let (buf, ptr) = mapped_read_buffer(&device_ref.device, bytes.max(4), "tint stream");
+            let mut enc = device_ref
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("tint stream copy"),
+                });
+            enc.copy_buffer_to_buffer(&src, src_off, &buf, 0, bytes.max(4));
+            device_ref.queue.submit([enc.finish()]);
+            device_ref
+                .device
+                .poll(wgpu::PollType::Wait {
+                    submission_index: None,
+                    timeout: None,
+                })
+                .expect("tint copy poll");
+            // `res` drops here — the cubecl tint slice returns to the pool.
+            // Queue order already moved the bytes; nothing pending reads it.
+            crate::layout::TintStore::Mapped(crate::layout::TintMapped {
+                buffer: buf,
+                ptr,
+                words: total_slots as usize * 2,
+            })
+        };
         drop(sp_tint);
         // The fork gate's lane tier reads the slot stream host-side.
         if matches!(mode, ChainMode::Both) {
@@ -971,7 +1047,7 @@ pub(crate) fn run_repo_chain(
         total_slots,
         placements,
         slot_device,
-        tint: tint_all,
+        tint: tint_store,
         slots: slots_all,
         candidates: c,
         chain_dur: t_chain0.elapsed(),
@@ -984,4 +1060,41 @@ pub(crate) fn run_repo_chain(
             dispatch: t_rb.duration_since(t_dispatch),
         },
     }
+}
+
+/// A hal-mapped shared-storage readback target (Metal hosts only — the
+/// caller gates on the profile). MAP_READ makes wgpu-hal pick
+/// StorageModeShared with the DEFAULT cache mode (write-combining is
+/// MAP_WRITE-only), so host reads of the GPU-written bytes stay cached.
+/// The mapping lives as long as the buffer (Metal's unmap is a no-op) —
+/// the same lifecycle as the mapped arena's chunks.
+fn mapped_read_buffer(device: &wgpu::Device, bytes: u64, label: &str) -> (wgpu::Buffer, *const u32) {
+    use wgpu::hal::Device as HalDevice;
+    let hal_dev = unsafe { device.as_hal::<wgpu::hal::api::Metal>() }
+        .expect("host-visible storage behind a non-Metal device");
+    let hal_buf = unsafe {
+        hal_dev.create_buffer(&wgpu::hal::BufferDescriptor {
+            label: Some(label),
+            size: bytes,
+            usage: wgpu::BufferUses::MAP_READ | wgpu::BufferUses::COPY_DST,
+            memory_flags: wgpu::hal::MemoryFlags::empty(),
+        })
+    }
+    .expect("hal readback buffer");
+    let mapping = unsafe { hal_dev.map_buffer(&hal_buf, 0..bytes) }.expect("hal readback map");
+    let ptr = mapping.ptr.as_ptr() as *const u32;
+    // SAFETY: same device, desc matches the hal request, nonzero size, and
+    // every byte is written by the caller's copy before the poll publishes.
+    let buf = unsafe {
+        device.create_buffer_from_hal::<wgpu::hal::api::Metal>(
+            hal_buf,
+            &wgpu::BufferDescriptor {
+                label: Some(label),
+                size: bytes,
+                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            },
+        )
+    };
+    (buf, ptr)
 }
