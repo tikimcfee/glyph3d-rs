@@ -544,11 +544,8 @@ pub fn load_repo_from_walk(
     // (the argument is at `layout::Paint`).
     let t = Instant::now();
     let sp_paint = tracing::info_span!("repo.paint").entered();
-    let colors: Vec<Vec<u32>> = walk
-        .files
-        .iter()
-        .map(|f| text::colorize_leaders(&f.bytes))
-        .collect();
+    let file_bytes: Vec<&[u8]> = walk.files.iter().map(|f| f.bytes.as_slice()).collect();
+    let colors = paint_files(&file_bytes);
     let mut stage_dur = t.elapsed();
     drop(sp_paint);
 
@@ -1099,9 +1096,81 @@ impl RepoLoad {
     }
 }
 
+/// The repo paint pass: per-file `colorize_leaders`, sharded by BYTE-balanced
+/// contiguous file ranges once the corpus is big enough to pay for threads
+/// (the seg_tint precedent, but byte-bound: the flagship's files span
+/// 100 B..2 MB, so a count-based split strands a worker on a bundle).
+/// Per-file colorize state is independent by construction and the ranges
+/// concatenate in file order — bit-identical to the serial map (the
+/// `sharded_paint_matches_serial` test fences exactly that; the golden views
+/// only ever run the serial arm). 1.0s -> ~0.24s at the flagship, 2026-09-30.
+fn paint_files(files: &[&[u8]]) -> Vec<Vec<u32>> {
+    if files.len() >= 64 {
+        let workers = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+            .min(8);
+        let total: usize = files.iter().map(|f| f.len()).sum();
+        let target = total.div_ceil(workers).max(1);
+        let mut ranges: Vec<(usize, usize)> = Vec::with_capacity(workers);
+        let (mut start, mut acc) = (0usize, 0usize);
+        for (i, f) in files.iter().enumerate() {
+            acc += f.len();
+            if acc >= target {
+                ranges.push((start, i + 1));
+                start = i + 1;
+                acc = 0;
+            }
+        }
+        if start < files.len() {
+            ranges.push((start, files.len()));
+        }
+        std::thread::scope(|s| {
+            let handles: Vec<_> = ranges
+                .iter()
+                .map(|&(a, b)| {
+                    s.spawn(move || {
+                        files[a..b]
+                            .iter()
+                            .map(|f| text::colorize_leaders(f))
+                            .collect::<Vec<_>>()
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .flat_map(|h| h.join().expect("paint worker panicked"))
+                .collect()
+        })
+    } else {
+        files.iter().map(|f| text::colorize_leaders(f)).collect()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The sharded paint path (>= 64 files) must reproduce the serial map
+    /// bit-identically — the golden views run the serial path (5 files), so
+    /// without this test nothing exercises the shard cut/order logic.
+    #[test]
+    fn sharded_paint_matches_serial() {
+        let files: Vec<Vec<u8>> = (0..100usize)
+            .map(|i| {
+                format!(
+                    "// comment {i}\nlet s{i} = \"str {i}\" + '🦀'; // 🚀\nfn w{i}_ord(ord) {{ }}\n"
+                )
+                .into_bytes()
+            })
+            .collect();
+        let refs: Vec<&[u8]> = files.iter().map(|f| f.as_slice()).collect();
+        let serial: Vec<Vec<u32>> = refs.iter().map(|b| text::colorize_leaders(b)).collect();
+        assert_eq!(serial, paint_files(&refs));
+        // And below the shard threshold the serial arm answers directly.
+        let few: Vec<&[u8]> = refs[..3].to_vec();
+        assert_eq!(paint_files(&few), serial[..3].to_vec());
+    }
 
     /// The seam the whole z_wrap_spacing chain hangs on: the CLI flag sets
     /// RepoParams::z_wrap_spacing, and this is the ONE place it becomes the
