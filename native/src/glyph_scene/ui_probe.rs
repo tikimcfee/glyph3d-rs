@@ -56,6 +56,8 @@ pub struct UiProbeState {
     /// None where the scene carries no mode (demo, engine-text) ⇒ the panel
     /// hides the toggle.
     pub cluster_mode: Option<bool>,
+    /// Canvas layout arrangement mode (repo scenes): shelf vs carrel. None for non-repo scenes.
+    pub layout_mode: Option<crate::repo::RepoLayoutMode>,
     // ── K5: group-browser data. `files` is STATIC (built once at install;
     // Rc-shared so the panel's per-frame snapshot clones a refcount, not the
     // rows). `file_dyn` is refreshed per frame (world pose under the live
@@ -97,6 +99,12 @@ impl GlyphScene {
     /// (text). Called by the scene builder between `new` and `init_ui_probe`.
     pub fn set_probe_cluster_mode(&mut self, on: bool) {
         self.probe_cluster_mode = Some(on);
+    }
+
+    /// Seed for the panel's layout mode toggle on repo scenes.
+    /// Called by the scene builder between `new` and `init_ui_probe`.
+    pub fn set_probe_layout_mode(&mut self, mode: crate::repo::RepoLayoutMode) {
+        self.probe_layout_mode = Some(mode);
     }
 
     /// Stage K: install and return the windowed debug-UI probe. Windowed mode
@@ -146,12 +154,14 @@ impl GlyphScene {
             .and_then(|p| p.files.first())
             .map(|f| f.item.cluster_mode == crate::fold::ClusterMode::Cluster)
             .or(self.probe_cluster_mode);
+        let layout_mode = self.probe_layout_mode;
         let probe = UiProbe::new(std::cell::RefCell::new(UiProbeState {
             lod_min_px: LOD_MIN_PX,
             files: std::rc::Rc::new(files),
             file_dyn,
             z_wrap_spacing,
             cluster_mode,
+            layout_mode,
             ..Default::default()
         }));
         self.ui_probe = Some(probe.clone());

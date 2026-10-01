@@ -298,6 +298,7 @@ impl WindowState {
                         self.pending_relayout = Some(RelayoutRequest {
                             z_wrap_spacing: Some(new),
                             toggle_cluster: false,
+                            toggle_layout: false,
                         });
                         self.zspace_selftest = 2;
                     }
@@ -342,6 +343,7 @@ impl WindowState {
                         self.pending_relayout = Some(RelayoutRequest {
                             z_wrap_spacing: None,
                             toggle_cluster: true,
+                            toggle_layout: false,
                         });
                         self.cluster_selftest = 2;
                     }
@@ -554,6 +556,7 @@ impl WindowState {
                                     *pending_relayout = Some(RelayoutRequest {
                                         z_wrap_spacing: Some(*spacing),
                                         toggle_cluster: false,
+                                        toggle_layout: false,
                                     });
                                 }
                             }
@@ -577,6 +580,28 @@ impl WindowState {
                                     *pending_relayout = Some(RelayoutRequest {
                                         z_wrap_spacing: None,
                                         toggle_cluster: true,
+                                        toggle_layout: false,
+                                    });
+                                }
+                            }
+                        }
+                        // Canvas layout toggle (shelf vs carrel) — repo scenes only.
+                        if let Some(snap) = &probe_snap {
+                            if let Some(mode) = snap.layout_mode {
+                                ui.separator();
+                                ui.label(
+                                    "canvas layout (F6) — click toggles; the scene rebuilds, \
+                                     pick/selection state resets:",
+                                );
+                                let label = match mode {
+                                    crate::repo::RepoLayoutMode::Shelf => "layout mode: SHELF (click for carrel)",
+                                    crate::repo::RepoLayoutMode::Carrel => "layout mode: CARREL (click for shelf)",
+                                };
+                                if ui.button(label).clicked() {
+                                    *pending_relayout = Some(RelayoutRequest {
+                                        z_wrap_spacing: None,
+                                        toggle_cluster: false,
+                                        toggle_layout: true,
                                     });
                                 }
                             }

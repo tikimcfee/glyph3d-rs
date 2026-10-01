@@ -12,6 +12,7 @@ pub mod glyph_trie;
 pub mod gpu;
 pub mod layout;
 pub mod layout_hyper;
+pub mod layout_stack;
 pub mod offscreen;
 pub mod repo;
 pub mod scan;
@@ -57,6 +58,7 @@ pub enum SceneChoice {
         wrap_mode: fold::WrapMode,
         z_wrap_spacing: f64,
         cluster_mode: fold::ClusterMode,
+        layout_mode: repo::RepoLayoutMode,
         emoji_sheet: PathBuf,
     },
 }
@@ -209,12 +211,14 @@ fn build_scene_impl(
             wrap_mode,
             z_wrap_spacing,
             cluster_mode,
+            layout_mode,
             emoji_sheet,
         } => {
             let params = repo::RepoParams {
                 wrap_mode: *wrap_mode,
                 z_wrap_spacing: *z_wrap_spacing,
                 cluster_mode: *cluster_mode,
+                layout_mode: *layout_mode,
                 ..Default::default()
             };
             let t_visual_start = std::time::Instant::now();
@@ -249,7 +253,8 @@ fn build_scene_impl(
             let staged_dur = t_staged.elapsed();
 
             let t_scene = std::time::Instant::now();
-            let scene = GlyphScene::new(ctx, color_format, &atlas, staged, camera_mode, cull);
+            let mut scene = GlyphScene::new(ctx, color_format, &atlas, staged, camera_mode, cull);
+            scene.set_probe_layout_mode(*layout_mode);
             let scene_dur = t_scene.elapsed();
             let visual_total = t_visual_start.elapsed();
 

@@ -27,6 +27,8 @@ use crate::layout::{
 };
 use crate::text::{self, StagedText};
 
+pub use crate::layout_stack::{LayoutController, LayoutStack, LayoutZone, SpatialLayoutStrategy};
+
 /// Layout engine strategy.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum Strategy {
@@ -302,6 +304,17 @@ pub struct RepoParams {
     /// depends on that); the CLI/product default flipped to cluster on
     /// 2026-09-22, and the goldens pin their mode explicitly.
     pub cluster_mode: crate::fold::ClusterMode,
+    /// Spatial arrangement mode for the repository files across the canvas.
+    pub layout_mode: RepoLayoutMode,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RepoLayoutMode {
+    /// Traditional height-classed shelf packing across the whole repo.
+    #[default]
+    Shelf,
+    /// Hierarchical directory-based neighborhood carrels.
+    Carrel,
 }
 
 impl Default for RepoParams {
@@ -319,6 +332,7 @@ impl Default for RepoParams {
             z_wrap_spacing: 0.15,
             wrap_mode: crate::fold::WrapMode::Back,
             cluster_mode: crate::fold::ClusterMode::Leader,
+            layout_mode: RepoLayoutMode::Shelf,
         }
     }
 }
@@ -462,7 +476,7 @@ pub const DIR_TINTS: &[[f32; 3]] = &[
     [1.00, 0.88, 0.88],
 ];
 
-fn dir_tint(dir: &str) -> [f32; 3] {
+pub(crate) fn dir_tint(dir: &str) -> [f32; 3] {
     // FNV-1a 32-bit over the directory path.
     let mut h: u32 = 0x811C9DC5;
     for b in dir.as_bytes() {
@@ -481,6 +495,22 @@ fn dir_tint(dir: &str) -> [f32; 3] {
 /// 2-3× the field's height. Classing keeps shelf-mates similar in height,
 /// so the field's aspect actually approaches `grid_aspect`.
 fn layout(
+    views: &mut [FileView],
+    params: &RepoParams,
+) -> (Vec<GroupRow>, [f32; 3], [f32; 3]) {
+    let mut controller = crate::layout_stack::LayoutController::from_mode(params.layout_mode, *params);
+    controller.apply(views)
+}
+
+/// Packed SHELF layout, classed by height: files are stably partitioned into
+/// height classes (small / medium / large), each class shelf-packed
+/// left-to-right in path order (consecutive files — same directory — stay
+/// adjacent within a class), classes stacked top to bottom. Shelf packing
+/// alone pays each shelf its tallest member's height; with a real repo's
+/// skewed heights (1-page files next to 400-page lock files) that wastes
+/// 2-3× the field's height. Classing keeps shelf-mates similar in height,
+/// so the field's aspect actually approaches `grid_aspect`.
+pub(crate) fn layout_shelf(
     views: &mut [FileView],
     params: &RepoParams,
 ) -> (Vec<GroupRow>, [f32; 3], [f32; 3]) {
@@ -539,7 +569,7 @@ fn layout(
         groups.push(GroupRow::tinted(v.offset, dir_tint(&v.dir)));
     }
     log::info!(
-        "layout: target_w {:.0}, field {:.0}x{:.0}",
+        "layout [shelf]: target_w {:.0}, field {:.0}x{:.0}",
         target_w,
         max_x.max(1.0),
         -min_y,
@@ -548,6 +578,152 @@ fn layout(
         groups,
         [0.0, min_y, min_z],
         [max_x.max(1.0), params.line_height as f32, max_z],
+    )
+}
+
+/// Hierarchical CARREL layout: files are partitioned by directory into
+/// neighborhood carrels, each carrel laid out locally on shelves, and carrels
+/// arranged across the macro canvas separated by wide avenues.
+pub(crate) fn layout_carrel(
+    views: &mut [FileView],
+    params: &RepoParams,
+) -> (Vec<GroupRow>, [f32; 3], [f32; 3]) {
+    use std::collections::BTreeMap;
+
+    // 1. Group files by directory
+    let mut dir_map: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+    for (i, v) in views.iter().enumerate() {
+        dir_map.entry(v.dir.clone()).or_default().push(i);
+    }
+
+    struct Carrel {
+        files: Vec<usize>,
+        local_offsets: Vec<[f32; 2]>,
+        width: f32,
+        height: f32,
+    }
+
+    let entry_score = |path: &str| -> usize {
+        let name = Path::new(path).file_name().and_then(|n| n.to_str()).unwrap_or("");
+        match name {
+            "lib.rs" | "main.rs" | "index.ts" | "index.js" => 0,
+            "mod.rs" => 1,
+            "README.md" => 2,
+            "Cargo.toml" | "package.json" => 3,
+            _ => 4,
+        }
+    };
+
+    let mut carrels: Vec<Carrel> = Vec::with_capacity(dir_map.len());
+
+    // 2. Pack files within each carrel
+    for (_dir, mut files) in dir_map {
+        files.sort_by(|&a, &b| {
+            let sa = entry_score(&views[a].rel_path);
+            let sb = entry_score(&views[b].rel_path);
+            sa.cmp(&sb).then_with(|| views[a].rel_path.cmp(&views[b].rel_path))
+        });
+
+        let carrel_area: f32 = files
+            .iter()
+            .map(|&i| (views[i].width + params.gap_x) * (views[i].height + params.gap_y))
+            .sum();
+        let max_file_w: f32 = files
+            .iter()
+            .map(|&i| views[i].width)
+            .fold(0.0f32, f32::max);
+
+        // Target aspect for carrel: aim for ~1.33 wide-to-tall block
+        let target_carrel_w = (carrel_area * 1.33).sqrt().max(max_file_w).max(1.0);
+
+        let mut local_offsets: Vec<[f32; 2]> = Vec::with_capacity(files.len());
+        let mut x = 0.0f32;
+        let mut shelf_top = 0.0f32;
+        let mut shelf_h = 0.0f32;
+        let mut max_local_x = 0.0f32;
+
+        for &i in &files {
+            let v = &views[i];
+            if x > 0.0 && (x + v.width > target_carrel_w) {
+                shelf_top -= shelf_h + params.gap_y;
+                x = 0.0;
+                shelf_h = 0.0;
+            }
+            local_offsets.push([x, shelf_top]);
+            x += v.width + params.gap_x;
+            max_local_x = max_local_x.max(x - params.gap_x);
+            shelf_h = shelf_h.max(v.height);
+        }
+
+        let carrel_w = max_local_x.max(1.0);
+        let carrel_h = (-shelf_top + shelf_h).max(params.line_height as f32);
+
+        carrels.push(Carrel {
+            files,
+            local_offsets,
+            width: carrel_w,
+            height: carrel_h,
+        });
+    }
+
+    // 3. Macro packing of carrels across the repository canvas
+    let avenue_gap_x = (params.gap_x * 4.0).max(12.0);
+    let avenue_gap_y = (params.gap_y * 3.0).max(18.0);
+
+    let total_macro_area: f32 = carrels
+        .iter()
+        .map(|c| (c.width + avenue_gap_x) * (c.height + avenue_gap_y))
+        .sum();
+    let target_macro_w = (total_macro_area * params.grid_aspect).sqrt().max(1.0);
+
+    let mut macro_x = 0.0f32;
+    let mut macro_top = 0.0f32;
+    let mut macro_shelf_h = 0.0f32;
+    let mut max_macro_x = 0.0f32;
+
+    for c in &carrels {
+        if macro_x > 0.0 && (macro_x + c.width > target_macro_w) {
+            macro_top -= macro_shelf_h + avenue_gap_y;
+            macro_x = 0.0;
+            macro_shelf_h = 0.0;
+        }
+
+        let carrel_origin_x = macro_x;
+        let carrel_origin_y = macro_top;
+
+        for (file_in_carrel, &file_view_idx) in c.files.iter().enumerate() {
+            let [rel_x, rel_y] = c.local_offsets[file_in_carrel];
+            views[file_view_idx].offset = [
+                carrel_origin_x + rel_x,
+                carrel_origin_y + rel_y,
+                0.0,
+            ];
+        }
+
+        macro_x += c.width + avenue_gap_x;
+        max_macro_x = max_macro_x.max(macro_x - avenue_gap_x);
+        macro_shelf_h = macro_shelf_h.max(c.height);
+    }
+    let min_macro_y = macro_top - macro_shelf_h;
+
+    let mut groups = Vec::with_capacity(views.len());
+    let (mut min_z, mut max_z) = (0.0f32, 0.0f32);
+    for v in views.iter() {
+        min_z = min_z.min(v.offset[2] + v.z_min);
+        max_z = max_z.max(v.offset[2] + v.z_max);
+        groups.push(GroupRow::tinted(v.offset, dir_tint(&v.dir)));
+    }
+    log::info!(
+        "layout [carrel]: {} carrels, target_w {:.0}, field {:.0}x{:.0}",
+        carrels.len(),
+        target_macro_w,
+        max_macro_x.max(1.0),
+        -min_macro_y,
+    );
+    (
+        groups,
+        [0.0, min_macro_y, min_z],
+        [max_macro_x.max(1.0), params.line_height as f32, max_z],
     )
 }
 

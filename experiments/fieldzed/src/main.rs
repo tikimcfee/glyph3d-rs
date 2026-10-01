@@ -246,6 +246,7 @@ fn run_live(
         wrap_mode: glyph3d_native::fold::WrapMode::Back,
         z_wrap_spacing: 0.15,
         cluster_mode: glyph3d_native::fold::ClusterMode::Cluster,
+        layout_mode: glyph3d_native::repo::RepoLayoutMode::Shelf,
         emoji_sheet: glyph3d_native::default_emoji_sheet(),
     };
     let live = glyph3d_native::windowed::LiveSource {

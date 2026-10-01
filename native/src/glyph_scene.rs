@@ -150,6 +150,8 @@ pub struct GlyphScene {
     /// scene remembers it. Repo scenes leave this None — their probe seeds
     /// from the pick context's uniform ItemParams (the two agree there).
     pub(crate) probe_cluster_mode: Option<bool>,
+    /// The panel's layout mode seed for repo scenes.
+    pub(crate) probe_layout_mode: Option<crate::repo::RepoLayoutMode>,
     /// The last resolved pick (verbs operate on it).
     pub(crate) picked: Option<PickHit>,
     /// Stage L (L4): the current selection (drives the mask pass). Replaces
@@ -504,6 +506,7 @@ impl GlyphScene {
             groups_cpu,
             pick,
             probe_cluster_mode: None,
+            probe_layout_mode: None,
             picked: None,
             selection: None,
             geom_overrides: std::collections::HashMap::new(),

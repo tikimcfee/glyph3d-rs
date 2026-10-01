@@ -82,6 +82,15 @@ pub fn parse_cluster_mode(s: &str) -> fold::ClusterMode {
     }
 }
 
+/// `--layout-mode` -> the layout parameter. Same shape as `parse_wrap_mode`:
+pub fn parse_layout_mode(s: &str) -> crate::repo::RepoLayoutMode {
+    match s {
+        "shelf" => crate::repo::RepoLayoutMode::Shelf,
+        "carrel" => crate::repo::RepoLayoutMode::Carrel,
+        other => panic!("--layout-mode: unknown mode {other:?} (clap should have refused it)"),
+    }
+}
+
 
 /// Long-form help tail: the mode summary + verb reference + windowed keys from
 /// the hand-rolled parser's --help (nothing user-facing was dropped).
@@ -216,6 +225,11 @@ pub struct Cli {
     /// explicitly.
     #[arg(long, value_name = "MODE", default_value = "cluster", value_parser = ["leader", "cluster"])]
     pub cluster_mode: String,
+    /// Spatial arrangement mode for the repository files across the canvas:
+    /// `shelf` (default: height-classed shelves across the whole repo) or
+    /// `carrel` (hierarchical directory-based neighborhood carrels).
+    #[arg(long, value_name = "MODE", default_value = "shelf", value_parser = ["shelf", "carrel"])]
+    pub layout_mode: String,
     /// Stage E2: frame the first file whose path contains SUBSTR
     #[arg(long, value_name = "SUBSTR")]
     pub focus_file: Option<String>,
@@ -544,6 +558,9 @@ mod cli_tests {
         assert_eq!(cli.cluster_mode, "cluster");
         assert_eq!(parse_cluster_mode(&cli.cluster_mode), fold::ClusterMode::Cluster);
         assert_eq!(parse_cluster_mode("leader"), fold::ClusterMode::Leader);
+        assert_eq!(cli.layout_mode, "shelf");
+        assert_eq!(parse_layout_mode(&cli.layout_mode), crate::repo::RepoLayoutMode::Shelf);
+        assert_eq!(parse_layout_mode("carrel"), crate::repo::RepoLayoutMode::Carrel);
         assert!(!cli.repo_verify);
         assert!(cli.focus_file.is_none());
         assert!(!cli.repo_scan_only);
@@ -568,6 +585,7 @@ mod cli_tests {
             "2.5", "--no-cull", "--no-ui", "--load-repo", "fixtures/g-pick-repo",
             "--repo-engine", "batch", "--repo-verify", "--focus-file", "alpha",
             "--wrap-mode", "back", "--z-wrap-spacing", "0.6", "--cluster-mode", "cluster",
+            "--layout-mode", "carrel",
             "--render-file", "src/main.rs", "--engine-trie", "t.bin",
             "--engine-render", "c.rs",
             "--present-mode", "mailbox", "--gpu-key", "--gpu-profile",
@@ -592,6 +610,8 @@ mod cli_tests {
         assert_eq!(cli.z_wrap_spacing, 0.6);
         assert_eq!(cli.cluster_mode, "cluster");
         assert_eq!(parse_cluster_mode(&cli.cluster_mode), fold::ClusterMode::Cluster);
+        assert_eq!(cli.layout_mode, "carrel");
+        assert_eq!(parse_layout_mode(&cli.layout_mode), crate::repo::RepoLayoutMode::Carrel);
         assert!(cli.repo_verify);
         assert_eq!(cli.focus_file.as_deref(), Some("alpha"));
         assert_eq!(cli.render_file, Some(PathBuf::from("src/main.rs")));
@@ -621,6 +641,16 @@ mod cli_tests {
             Err(e) => e.to_string(),
         };
         assert!(text.contains("grapheme"), "the error must name the bad value: {text}");
+    }
+
+    /// Same rule: an unknown layout mode is REFUSED at the boundary.
+    #[test]
+    fn an_unknown_layout_mode_is_refused() {
+        let text = match try_parse(&["--layout-mode", "grid"]) {
+            Ok(_) => panic!("clap must refuse an unknown layout mode"),
+            Err(e) => e.to_string(),
+        };
+        assert!(text.contains("grid"), "the error must name the bad value: {text}");
     }
 
     /// Out-of-domain spacing is REFUSED at the boundary with the flag and the

@@ -76,6 +76,16 @@ pub(super) fn apply_relayout(
             note += &format!("cluster_mode -> {mode:?} ");
         }
     }
+    if req.toggle_layout {
+        if let SceneChoice::Repo { layout_mode, .. } = choice {
+            *layout_mode = match *layout_mode {
+                crate::repo::RepoLayoutMode::Shelf => crate::repo::RepoLayoutMode::Carrel,
+                crate::repo::RepoLayoutMode::Carrel => crate::repo::RepoLayoutMode::Shelf,
+            };
+            changed = true;
+            note += &format!("layout_mode -> {:?} ", *layout_mode);
+        }
+    }
     if !changed {
         return; // a release without a move (a click, a typed repeat) rebuilds nothing
     }
@@ -111,6 +121,7 @@ pub(super) fn apply_relayout(
 pub(super) struct RelayoutRequest {
     pub(super) z_wrap_spacing: Option<f64>,
     pub(super) toggle_cluster: bool,
+    pub(super) toggle_layout: bool,
 }
 
 pub(super) struct App<'a> {
@@ -410,6 +421,7 @@ impl ApplicationHandler for App<'_> {
                             | PhysicalKey::Code(KeyCode::F3)
                             | PhysicalKey::Code(KeyCode::F4)
                             | PhysicalKey::Code(KeyCode::F5)
+                            | PhysicalKey::Code(KeyCode::F6)
                     ) =>
             {
                 match event.physical_key {
@@ -438,6 +450,17 @@ impl ApplicationHandler for App<'_> {
                         let window = state.window.clone();
                         if let Some(t) = self.live_step_title(super::LiveStep::Reset) {
                             window.set_title(&t);
+                        }
+                    }
+                    PhysicalKey::Code(KeyCode::F6) => {
+                        #[cfg(feature = "egui-ui")]
+                        {
+                            state.pending_relayout = Some(RelayoutRequest {
+                                z_wrap_spacing: None,
+                                toggle_cluster: false,
+                                toggle_layout: true,
+                            });
+                            state.window.request_redraw();
                         }
                     }
                     _ => {}
