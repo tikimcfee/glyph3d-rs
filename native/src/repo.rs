@@ -22,7 +22,7 @@ use std::time::{Duration, Instant};
 
 use crate::glyph_scene::GroupRow;
 use crate::layout::{
-    BackendOutput, GlyphArena, GlyphRecord, ItemParams, ItemPlacement, LayoutError, LayoutGlyphs,
+    BackendOutput, GlyphArena, GlyphRecord, ItemParams, LayoutGlyphs,
     LayoutItem, Paint, VerifyLayout, diff_backends,
 };
 use crate::text::{self, StagedText};
@@ -169,7 +169,7 @@ pub fn walk_repo(root: &Path) -> WalkResult {
         .into_par_iter()
         .map(|(rel, path)| {
             let bytes = std::fs::read(&path).ok()?;
-            if std::str::from_utf8(&bytes).is_err() {
+            if simdutf8::basic::from_utf8(&bytes).is_err() {
                 return None;
             }
             let dir = rel
@@ -586,7 +586,7 @@ pub fn load_repo_from_walk(
         .files
         .par_iter()
         .map(|f| {
-            let newlines = f.bytes.iter().filter(|&&b| b == b'\n').count();
+            let newlines = memchr::memchr_iter(b'\n', &f.bytes).count();
             file_item_params(params, f.bytes.len(), newlines)
         })
         .collect();
@@ -614,81 +614,20 @@ pub fn load_repo_from_walk(
         })
         .collect();
 
-    // The seam's one branch point: Cubecl crosses into the device chain,
-    // everything else into Mojo. A local enum rather than a second
-    // code path per call site — the recording/verify flow below is the
-    // backend's OWN contract either way.
-    enum Backend {
-        Hyper(crate::layout_hyper::HyperLayout),
-        #[cfg(feature = "cubecl")]
-        Cubecl(crate::cubecl_layout::CubeclLayout),
-    }
-    impl LayoutGlyphs for Backend {
-        fn name(&self) -> &'static str {
-            match self {
-                Backend::Hyper(b) => b.name(),
-                #[cfg(feature = "cubecl")]
-                Backend::Cubecl(b) => b.name(),
-            }
-        }
-        fn load_trie_file(&mut self, path: &Path) -> Result<(), LayoutError> {
-            match self {
-                Backend::Hyper(b) => b.load_trie_file(path),
-                #[cfg(feature = "cubecl")]
-                Backend::Cubecl(b) => b.load_trie_file(path),
-            }
-        }
-        fn layout_validated_items(
-            &mut self,
-            items: &[LayoutItem<'_>],
-            arena: &mut GlyphArena,
-        ) -> Result<Vec<ItemPlacement>, LayoutError> {
-            match self {
-                Backend::Hyper(b) => b.layout_validated_items(items, arena),
-                #[cfg(feature = "cubecl")]
-                Backend::Cubecl(b) => b.layout_validated_items(items, arena),
-            }
-        }
-    }
-    impl Backend {
-        fn phases(&self) -> BackendPhases {
-            BackendPhases::default()
-        }
-        #[cfg(feature = "cubecl")]
-        fn cubecl_phases(&self) -> Option<crate::cubecl_layout::CubeclPhases> {
-            match self {
-                Backend::Hyper(_) => None,
-                Backend::Cubecl(b) => Some(b.phases()),
-            }
-        }
-    }
-    impl VerifyLayout for Backend {
-        fn layout_validated_items_recording(
-            &mut self,
-            items: &[LayoutItem<'_>],
-            arena: &mut GlyphArena,
-        ) -> Result<(Vec<ItemPlacement>, Vec<GlyphRecord>), LayoutError> {
-            match self {
-                Backend::Hyper(b) => b.layout_validated_items_recording(items, arena),
-                #[cfg(feature = "cubecl")]
-                Backend::Cubecl(b) => b.layout_validated_items_recording(items, arena),
-            }
-        }
-    }
     let mut backend = match strategy {
         #[cfg(feature = "cubecl")]
-        Strategy::Cubecl => Backend::Cubecl(match gpu {
-            Some(ctx) => crate::cubecl_layout::CubeclLayout::with_device(
+        Strategy::Cubecl => match gpu {
+            Some(ctx) => crate::layout::LayoutEngine::cubecl_with_device(
                 crate::cubecl_chain::SharedDevice::from_ctx(ctx),
             ),
-            None => crate::cubecl_layout::CubeclLayout::new(),
-        }),
-        _ => Backend::Hyper(match gpu {
-            Some(ctx) => crate::layout_hyper::HyperLayout::with_device(
+            None => crate::layout::LayoutEngine::cubecl(),
+        },
+        _ => match gpu {
+            Some(ctx) => crate::layout::LayoutEngine::hyper_with_device(
                 crate::gpu::SharedDevice::from_ctx(ctx),
             ),
-            None => crate::layout_hyper::HyperLayout::new(),
-        }),
+            None => crate::layout::LayoutEngine::hyper(),
+        },
     };
     backend
         .load_trie_file(trie)

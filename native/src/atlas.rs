@@ -103,16 +103,28 @@ pub struct TrieTable {
     seq_first: std::collections::HashSet<u32>,
     /// Precomputed ASCII fast-path table for single-byte leaders (0..128).
     pub ascii_table: [Option<AsciiFastEntry>; 128],
+    /// Direct 256-entry fast-path table for all single-byte characters.
+    /// Unmapped bytes / multibyte UTF-8 lead/continuation bytes have `glyph_id == u32::MAX`.
+    pub fast_byte_table: [AsciiFastEntry; 256],
 }
 
 /// Precomputed fast-path metadata for single-byte ASCII characters (0x00..=0x7F).
-/// Fits in 16 bytes; the entire 128-entry table is 2 KB and stays L1-resident.
+/// Fits in 16 bytes; the entire 256-entry table is 4 KB and stays L1-resident.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct AsciiFastEntry {
     pub glyph_id: u32,
     pub advance: f32,
     pub height: f32,
     pub is_newline: bool,
+}
+
+impl AsciiFastEntry {
+    pub const SENTINEL: u32 = u32::MAX;
+
+    #[inline(always)]
+    pub fn is_fast(&self) -> bool {
+        self.glyph_id != Self::SENTINEL
+    }
 }
 
 impl TrieTable {
@@ -200,6 +212,12 @@ impl TrieTable {
             classes,
             seq_first,
             ascii_table,
+            fast_byte_table: [AsciiFastEntry {
+                glyph_id: AsciiFastEntry::SENTINEL,
+                advance: 0.0,
+                height: 0.0,
+                is_newline: false,
+            }; 256],
         };
         for b in 0..128u8 {
             let cp = b as u32;
@@ -221,7 +239,19 @@ impl TrieTable {
                 });
             }
         }
+        let mut fast_byte_table = [AsciiFastEntry {
+            glyph_id: AsciiFastEntry::SENTINEL,
+            advance: 0.0,
+            height: 0.0,
+            is_newline: false,
+        }; 256];
+        for b in 0..128u8 {
+            if let Some(entry) = ascii_table[b as usize] {
+                fast_byte_table[b as usize] = entry;
+            }
+        }
         t.ascii_table = ascii_table;
+        t.fast_byte_table = fast_byte_table;
         // Sanity: 'A' must resolve to slot 34 / advance 1229 (FORMAT.md worked example).
         let a = t.lookup(0x41);
         assert_eq!((a.glyph_id, a.advance_fu), (34, 1229), "trie sanity check failed for 'A'");
