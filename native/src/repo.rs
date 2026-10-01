@@ -944,8 +944,8 @@ impl RepoLoad {
                 slot_base: v.slot_base as u32,
                 slot_count: v.slot_count as u32,
                 item: v.item,
-                aabb_min: [-0.3, -v.height - 0.5],
-                aabb_max: [v.width + 0.6, 0.75],
+                aabb_min: [-0.3, -v.height - 0.5, v.z_min - 0.1],
+                aabb_max: [v.width + 0.6, 0.75, v.z_max + 0.1],
             })
             .collect();
         let mut focus_bounds = None;

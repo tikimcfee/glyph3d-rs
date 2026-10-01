@@ -622,9 +622,12 @@ impl GlyphScene {
                 (r * 0.01, r * 20.0)
             }
             CameraMode::Fly => {
-                // Depth is test-only (nothing writes it), so a wide range is
-                // safe; near stays small enough for single-glyph closeups.
-                (0.05, (self.fit * 50.0).max(20_000.0))
+                // Fly depth conditioning: keep near at 0.05 for single-glyph
+                // closeups, while conditioning far to the scene bounds and distance
+                // from the field center to prevent f32 depth precision collapse and Z-fighting.
+                let d_center = (self.fly.eye - self.center).length();
+                let far = (d_center + self.fit * 4.0).clamp(20_000.0, 100_000.0);
+                (0.05, far)
             }
         };
         let (eye, target) = self.camera_eye_target(t, aspect);
@@ -719,6 +722,7 @@ impl GlyphScene {
                 [
                     (i.aabb_min[0] + i.aabb_max[0]) * 0.5,
                     (i.aabb_min[1] + i.aabb_max[1]) * 0.5,
+                    (i.aabb_min[2] + i.aabb_max[2]) * 0.5,
                 ]
             });
         let Some(cl) = center_local else {
@@ -728,7 +732,7 @@ impl GlyphScene {
         let c = DVec3::new(
             cl[0] as f64 * sc.x as f64 + off.x as f64,
             cl[1] as f64 * sc.y as f64 + off.y as f64,
-            off.z as f64,
+            cl[2] as f64 * sc.z as f64 + off.z as f64,
         );
         let hit_plane = |o: DVec3, d: DVec3| -> Option<DVec3> {
             let denom = d.dot(fwd);

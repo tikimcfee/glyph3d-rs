@@ -24,9 +24,9 @@ pub struct PickFileInfo {
     pub slot_count: u32,
     /// The exact engine params this file was laid out with.
     pub item: ItemParams,
-    /// Local-space (pre-TRS) xy AABB, same margins as the cull segment.
-    pub aabb_min: [f32; 2],
-    pub aabb_max: [f32; 2],
+    /// Local-space (pre-TRS) 3D AABB, same margins as the cull segment.
+    pub aabb_min: [f32; 3],
+    pub aabb_max: [f32; 3],
 }
 
 /// Repo-mode pick context (one per staged scene).
@@ -248,16 +248,18 @@ impl GlyphScene {
             let Some((off, sc, _, _)) = self.group_trs(info.group_id) else {
                 continue;
             };
-            let min = DVec3::new(
+            let p0 = DVec3::new(
                 info.aabb_min[0] as f64 * sc.x as f64 + off.x as f64,
                 info.aabb_min[1] as f64 * sc.y as f64 + off.y as f64,
-                off.z as f64 - 1.0,
+                info.aabb_min[2] as f64 * sc.z as f64 + off.z as f64,
             );
-            let max = DVec3::new(
+            let p1 = DVec3::new(
                 info.aabb_max[0] as f64 * sc.x as f64 + off.x as f64,
                 info.aabb_max[1] as f64 * sc.y as f64 + off.y as f64,
-                off.z as f64 + 1.0,
+                info.aabb_max[2] as f64 * sc.z as f64 + off.z as f64,
             );
+            let min = p0.min(p1);
+            let max = p0.max(p1);
             if let Some(t) = ray_aabb(ro, rd, min, max) {
                 if best.is_none_or(|(_, bt)| t < bt) {
                     best = Some((info.group_id, t));
@@ -267,7 +269,7 @@ impl GlyphScene {
         best
     }
 
-    /// Ray pick: nearest file AABB → ray ∩ file plane → nearest record cell.
+    /// Ray pick: nearest file AABB → ray ∩ glyph plane → nearest record cell.
     fn pick_ray(&mut self, x: f32, y: f32) -> Option<PickHit> {
         let dbg = std::env::var_os("GLYPH_PICK_DEBUG").is_some();
         let Some((ro, rd)) = self.pixel_ray(x, y) else {
@@ -294,18 +296,9 @@ impl GlyphScene {
             .rel_path
             .clone();
         let (off, sc, _, _) = self.group_trs(gid)?;
-        // All glyphs live in the z = offset.z plane (group quats are identity).
-        let t = if rd.z.abs() > 1e-12 {
-            (off.z as f64 - ro.z) / rd.z
-        } else {
-            t_aabb
-        };
-        let p = ro + rd * t.max(0.0);
-        let qx = ((p.x - off.x as f64) / (sc.x as f64).max(1e-6)) as f32;
-        let qy = ((p.y - off.y as f64) / (sc.y as f64).max(1e-6)) as f32;
         if dbg {
             println!(
-                "pickdbg: px ({x},{y}) ro=({:.4},{:.4},{:.4}) rd=({:.6},{:.6},{:.6}) t={t:.4} q=({qx:.4},{qy:.4}) file={rel_path}",
+                "pickdbg: px ({x},{y}) ro=({:.4},{:.4},{:.4}) rd=({:.6},{:.6},{:.6}) file={rel_path}",
                 ro.x, ro.y, ro.z, rd.x, rd.y, rd.z
             );
         }
@@ -317,28 +310,107 @@ impl GlyphScene {
             });
         }
         let c = self.cache.as_ref().expect("cache populated: ensure_pick_cache just returned true");
-        // Nearest record cell: 2-D distance from the local point to each
-        // glyph's rect [x, x+advance] × [y−h/2, y+h/2]. O(records of ONE
-        // file) — microseconds for typical files, ~10 ms for a 10 MB monster.
-        let mut best = (f32::MAX, 0usize);
+        if c.records.is_empty() {
+            return Some(PickHit {
+                group_id: gid,
+                rel_path,
+                glyph: None,
+            });
+        }
+
+        // Hit-test glyph records in 3D: for each record r, intersect the ray
+        // with the plane z = r.z() * sc.z + off.z.
+        // Records sharing the same z avoid recomputing the ray-plane intersection.
+        let mut last_z = f32::NAN;
+        let mut cur_t = 0.0f64;
+        let mut cur_qx = 0.0f32;
+        let mut cur_qy = 0.0f32;
+
+        struct HitCandidate {
+            rec: usize,
+            dist_world: f32,
+            t: f64,
+        }
+
+        let mut best_direct: Option<HitCandidate> = None;
+        let mut best_near: Option<HitCandidate> = None;
+        let mut nearest_overall = (f32::MAX, 0usize, 0.0f32);
+
         for (i, r) in c.records.iter().enumerate() {
+            let rz = r.z();
+            if rz != last_z {
+                last_z = rz;
+                let zw = rz as f64 * sc.z as f64 + off.z as f64;
+                cur_t = if rd.z.abs() > 1e-12 {
+                    (zw - ro.z) / rd.z
+                } else {
+                    t_aabb
+                };
+                let p = ro + rd * cur_t.max(0.0);
+                cur_qx = ((p.x - off.x as f64) / (sc.x as f64).max(1e-6)) as f32;
+                cur_qy = ((p.y - off.y as f64) / (sc.y as f64).max(1e-6)) as f32;
+            }
+
             let x0 = r.x();
             let x1 = x0 + r.advance();
             let y0 = r.y() - r.height() * 0.5;
             let y1 = r.y() + r.height() * 0.5;
-            let dx = (x0 - qx).max(0.0).max(qx - x1);
-            let dy = (y0 - qy).max(0.0).max(qy - y1);
+            let dx = (x0 - cur_qx).max(0.0).max(cur_qx - x1);
+            let dy = (y0 - cur_qy).max(0.0).max(cur_qy - y1);
             let d = dx * dx + dy * dy;
-            if d < best.0 {
-                best = (d, i);
+            let dist_world = d.sqrt() * (sc.x + sc.y) * 0.5;
+
+            if d < nearest_overall.0 {
+                nearest_overall = (d, i, dist_world);
+            }
+
+            if dist_world <= 0.8 && cur_t > 0.0 {
+                if d == 0.0 {
+                    match &mut best_direct {
+                        None => {
+                            best_direct = Some(HitCandidate { rec: i, dist_world, t: cur_t });
+                        }
+                        Some(curr) => {
+                            if cur_t < curr.t - 1e-5 {
+                                *curr = HitCandidate { rec: i, dist_world, t: cur_t };
+                            }
+                        }
+                    }
+                } else {
+                    match &mut best_near {
+                        None => {
+                            best_near = Some(HitCandidate { rec: i, dist_world, t: cur_t });
+                        }
+                        Some(curr) => {
+                            let t_diff = cur_t - curr.t;
+                            let replaces = if t_diff.abs() > 0.1 {
+                                (cur_t < curr.t && dist_world <= curr.dist_world + 0.1)
+                                    || (cur_t > curr.t && dist_world + 0.1 < curr.dist_world)
+                            } else {
+                                dist_world < curr.dist_world - 1e-6
+                                    || ((dist_world - curr.dist_world).abs() <= 1e-6 && cur_t < curr.t - 1e-5)
+                            };
+                            if replaces {
+                                *curr = HitCandidate { rec: i, dist_world, t: cur_t };
+                            }
+                        }
+                    }
+                }
             }
         }
-        let dist_world = best.0.sqrt() * (sc.x + sc.y) * 0.5;
-        if dbg && !c.records.is_empty() {
-            let r = c.records[best.1];
+
+        let chosen = best_direct.or(best_near);
+        let (chosen_rec, chosen_dist) = match &chosen {
+            Some(c) => (Some(c.rec), c.dist_world),
+            None => (None, nearest_overall.2),
+        };
+
+        if dbg {
+            let rec_for_dbg = chosen_rec.unwrap_or(nearest_overall.1);
+            let r = c.records[rec_for_dbg];
             println!(
-                "pickdbg: nearest rec={} row={} col={} cell=({:.4},{:.4}) adv={:.4} h={:.4} dist_world={dist_world:.4} (accept ≤ 0.8)",
-                best.1,
+                "pickdbg: nearest rec={} row={} col={} cell=({:.4},{:.4}) adv={:.4} h={:.4} dist_world={chosen_dist:.4} (accept ≤ 0.8)",
+                rec_for_dbg,
                 r.row(),
                 r.col(),
                 r.x(),
@@ -347,12 +419,8 @@ impl GlyphScene {
                 r.height()
             );
         }
-        // Accept within ~3/4 of a cell; further out it's file background.
-        let glyph = if !c.records.is_empty() && dist_world <= 0.8 {
-            self.make_glyph(gid, best.1)
-        } else {
-            None
-        };
+
+        let glyph = chosen_rec.and_then(|rec| self.make_glyph(gid, rec));
         Some(PickHit {
             group_id: gid,
             rel_path,
@@ -536,20 +604,21 @@ impl GlyphScene {
         if i >= cull.segments.len() {
             return;
         }
-        let (ox, oy) = (g.cols[0][0], g.cols[0][1]);
-        let (sx, sy) = (g.cols[3][0].max(0.0), g.cols[3][1].max(0.0));
-        // Group TRS is xy only (cols[3] carries no z scale), so depth passes
-        // through untransformed — which is what the old code did implicitly by
-        // having no z lane at all.
+        let (ox, oy, oz) = (g.cols[0][0], g.cols[0][1], g.cols[0][2]);
+        let (sx, sy, sz) = (
+            g.cols[3][0].max(0.0),
+            g.cols[3][1].max(0.0),
+            g.cols[3][2].max(0.0),
+        );
         cull.segments[i].min = [
             cull.local_min[i][0] * sx + ox,
             cull.local_min[i][1] * sy + oy,
-            cull.local_min[i][2],
+            cull.local_min[i][2] * sz + oz,
         ];
         cull.segments[i].max = [
             cull.local_max[i][0] * sx + ox,
             cull.local_max[i][1] * sy + oy,
-            cull.local_max[i][2],
+            cull.local_max[i][2] * sz + oz,
         ];
         let bt = cull.base_tint[i];
         let orig = cull.orig_group_rgb[i];
@@ -834,4 +903,20 @@ pub(super) fn format_pick(h: &PickHit) -> String {
 
 fn g_alpha(g: Option<&GroupRow>) -> f32 {
     g.map_or(f32::NAN, |g| g.cols[2][3])
+}
+
+#[cfg(test)]
+mod pick_3d_tests {
+    use super::*;
+
+    #[test]
+    fn ray_aabb_3d_depth_box() {
+        let ro = DVec3::new(0.0, 0.0, 10.0);
+        let rd = DVec3::new(0.0, 0.0, -1.0);
+        let min = DVec3::new(-1.0, -1.0, -80.0);
+        let max = DVec3::new(1.0, 1.0, -20.0);
+        let t = ray_aabb(ro, rd, min, max);
+        assert!(t.is_some(), "ray along -Z must pierce 3D depth AABB");
+        assert!((t.unwrap() - 30.0).abs() < 1e-6);
+    }
 }

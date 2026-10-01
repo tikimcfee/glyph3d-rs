@@ -123,16 +123,18 @@ pixel_roundtrip() { # focus-file, row, col, expect_rec
     out=$($BIN --load-repo $FIX --focus-file "$ff" --pick-file "$ff" --pick-row "$row" --pick-col "$col" --screenshot "$SCRATCH/px.png" 2>&1)
     w=$(echo "$out" | grep -oE 'page [0-9.]+x[0-9.]+' | head -1 | sed -E 's/page ([0-9.]+)x([0-9.]+)/\1/')
     h=$(echo "$out" | grep -oE 'page [0-9.]+x[0-9.]+' | head -1 | sed -E 's/page ([0-9.]+)x([0-9.]+)/\2/')
-    lx=$(echo "$out" | grep -oE 'pos=\([-0-9.]+,[-0-9.]+' | head -1 | sed -E 's/pos=\(([-0-9.]+),([-0-9.]+)/\1/')
-    ly=$(echo "$out" | grep -oE 'pos=\([-0-9.]+,[-0-9.]+' | head -1 | sed -E 's/pos=\(([-0-9.]+),([-0-9.]+)/\2/')
+    lx=$(echo "$out" | grep -oE 'pos=\([-0-9.]+,[-0-9.]+,[-0-9.]+' | head -1 | sed -E 's/pos=\(([-0-9.]+),([-0-9.]+),([-0-9.]+)/\1/')
+    ly=$(echo "$out" | grep -oE 'pos=\([-0-9.]+,[-0-9.]+,[-0-9.]+' | head -1 | sed -E 's/pos=\(([-0-9.]+),([-0-9.]+),([-0-9.]+)/\2/')
+    lz=$(echo "$out" | grep -oE 'pos=\([-0-9.]+,[-0-9.]+,[-0-9.]+' | head -1 | sed -E 's/pos=\(([-0-9.]+),([-0-9.]+),([-0-9.]+)/\3/')
     read px py < <(python3 -c "
 import math
-W,H,lx,ly = $w,$h,$lx,$ly
+W,H,lx,ly,lz = $w,$h,$lx,$ly,$lz
 hw, hh = max(W,1)/2, max(H,1)/2
 d = max(hh, hw/1.6)/math.tan(math.radians(20))*1.08 + 2.0
 f = 1/math.tan(math.radians(20))
 cx, cy = lx + 0.26, ly          # cell center-ish (cell left edge + half advance)
-x_ndc = (cx - hw) * f / (1.6 * d); y_ndc = (cy + hh) * f / d
+z_dist = d - lz
+x_ndc = (cx - hw) * f / (1.6 * z_dist); y_ndc = (cy + hh) * f / z_dist
 print(round((x_ndc+1)*800), round((1-y_ndc)*500))
 ")
     local line2

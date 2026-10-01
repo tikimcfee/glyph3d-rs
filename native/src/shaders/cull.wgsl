@@ -30,11 +30,13 @@
 // readback: args were correct), so the draws are CPU-issued. The backdrop
 // shader side is unchanged by that decision.
 
-// 32 B — mirrors BackdropInst in glyph_scene.rs.
+// 48 B — mirrors BackdropInst in glyph_scene/cull.rs.
 struct BackdropInst {
     min_xy: vec2<f32>,
     max_xy: vec2<f32>,
     rgba: vec4<f32>, // rgb linear, a = coverage E
+    z: f32,
+    _pad: vec3<f32>,
 };
 
 struct Camera {
@@ -70,7 +72,7 @@ fn vs_backdrop(
         mix(b.min_xy.y, b.max_xy.y, c.y),
     );
     var out: BackdropVsOut;
-    out.clip = camera.view_proj * vec4<f32>(p, 0.0, 1.0);
+    out.clip = camera.view_proj * vec4<f32>(p, b.z, 1.0);
     out.rgba = b.rgba;
     return out;
 }
