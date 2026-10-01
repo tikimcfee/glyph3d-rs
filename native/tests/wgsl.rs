@@ -50,6 +50,14 @@ fn all_wgsl_shaders_parse_and_validate() {
         validator
             .validate(&module)
             .unwrap_or_else(|e| panic!("WGSL validation error in {}:\n{e}", path.display()));
-        eprintln!("naga OK: {}", path.display());
+        for (_, ty) in module.types.iter() {
+            if let naga::TypeInner::Struct { span, .. } = ty.inner {
+                if let Some(ref name) = ty.name {
+                    if name == "BackdropInst" {
+                        assert_eq!(span, 48, "BackdropInst WGSL struct size must match Rust 48-byte layout");
+                    }
+                }
+            }
+        }
     }
 }

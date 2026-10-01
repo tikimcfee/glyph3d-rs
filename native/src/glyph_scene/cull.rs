@@ -70,8 +70,7 @@ pub(super) struct BackdropInst {
     min: [f32; 2],
     max: [f32; 2],
     rgba: [f32; 4],
-    z: f32,
-    _pad: [f32; 3],
+    depth: [f32; 4],
 }
 
 /// Stage L (L2): draw phases — re_renderer's DrawPhase borrow (a flat enum
@@ -180,8 +179,7 @@ pub(super) fn cull_segments(
                     min: [seg.min[0], seg.min[1]],
                     max: [seg.max[0], seg.max[1]],
                     rgba: seg.tint,
-                    z: seg.min[2],
-                    _pad: [0.0; 3],
+                    depth: [seg.min[2], 0.0, 0.0, 0.0],
                 });
             }
             continue;
@@ -526,12 +524,13 @@ mod cull_depth_tests {
 
     #[test]
     fn backdrop_quad_anchors_to_far_z() {
+        assert_eq!(std::mem::size_of::<BackdropInst>(), 48);
         let s = seg([-1.0, -1.0, -50.0], [1.0, 1.0, -40.0]);
         let v = view_clipping_behind_z(-1.0e6, Vec3::new(0.0, 0.0, 0.0), 100.0);
         let d = cull_segments(&[s], &[false], &v, 1024, 1);
         assert_eq!(d.backdrops.len(), 1);
         assert_eq!(
-            d.backdrops[0].z, -50.0,
+            d.backdrops[0].depth[0], -50.0,
             "backdrop must anchor to seg.min[2] far-z reading surface"
         );
     }
