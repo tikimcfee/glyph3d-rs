@@ -21,7 +21,7 @@ use crate::text::fu_to_world;
 
 pub struct HyperLayout {
     trie: Option<Arc<TrieTable>>,
-    device: Option<crate::cubecl_chain::SharedDevice>,
+    device: Option<crate::gpu::SharedDevice>,
 }
 
 impl Default for HyperLayout {
@@ -38,7 +38,7 @@ impl HyperLayout {
         }
     }
 
-    pub(crate) fn with_device(device: crate::cubecl_chain::SharedDevice) -> Self {
+    pub(crate) fn with_device(device: crate::gpu::SharedDevice) -> Self {
         Self {
             trie: None,
             device: Some(device),

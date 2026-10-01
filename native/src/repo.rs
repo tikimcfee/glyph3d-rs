@@ -666,7 +666,7 @@ pub fn load_repo_from_walk(
         }),
         _ => Backend::Hyper(match gpu {
             Some(ctx) => crate::layout_hyper::HyperLayout::with_device(
-                crate::cubecl_chain::SharedDevice::from_ctx(ctx),
+                crate::gpu::SharedDevice::from_ctx(ctx),
             ),
             None => crate::layout_hyper::HyperLayout::new(),
         }),

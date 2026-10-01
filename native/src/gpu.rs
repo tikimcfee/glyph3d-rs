@@ -352,6 +352,33 @@ pub struct GpuContext {
     pub cpu_scopes: RefCell<std::collections::BTreeMap<String, (f64, u64)>>,
 }
 
+/// The renderer's device context handles passed across layout stages.
+/// The wgpu handles clone as cheap Arcs.
+#[derive(Clone)]
+#[allow(dead_code)]
+pub struct SharedDevice {
+    pub instance: wgpu::Instance,
+    pub adapter: wgpu::Adapter,
+    pub device: wgpu::Device,
+    pub queue: wgpu::Queue,
+    pub max_buffer_size: u64,
+    pub host_visible_storage: bool,
+}
+
+impl SharedDevice {
+    pub fn from_ctx(ctx: &GpuContext) -> Self {
+        Self {
+            instance: ctx.instance.clone(),
+            adapter: ctx.adapter.clone(),
+            device: ctx.device.clone(),
+            queue: ctx.queue.clone(),
+            max_buffer_size: ctx.profile.max_buffer_size,
+            host_visible_storage: ctx.profile.backend == wgpu::Backend::Metal
+                && ctx.profile.mappable_primary_buffers,
+        }
+    }
+}
+
 /// Record one CPU scope sample (ms) — no-op semantics live at the call site
 /// (callers guard on `ctx.profiler.is_some()`).
 pub fn record_cpu_scope(ctx: &GpuContext, label: &str, ms: f64) {
