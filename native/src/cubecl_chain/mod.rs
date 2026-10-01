@@ -53,7 +53,8 @@ mod tail;
 pub use bench::bench;
 pub use checks::{cluster_check, decode_check, run};
 pub use repo_check::repo_check;
-pub(crate) use repo::{ChainMode, ChainPhases, InstanceInputs, SharedDevice, run_repo_chain};
+pub use repo::ChainPhases;
+pub(crate) use repo::{ChainMode, InstanceInputs, SharedDevice, run_repo_chain};
 
 // ── lane layout (glyph-identity.json, hash-pinned) ──────────────────────────
 const PARTIAL_COUNT_STRIDE: usize = 8;

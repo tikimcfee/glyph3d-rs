@@ -40,7 +40,7 @@ use super::{IE_STRIDE, IM_STRIDE, LC_STRIDE, LM_STRIDE, PARTIAL_COUNT_STRIDE, pa
 /// once. Wall clock, not GPU timestamps — the bench instrument owns the
 /// per-dispatch device view; this one answers "where did the load go".
 #[derive(Clone, Copy, Default)]
-pub(crate) struct ChainPhases {
+pub struct ChainPhases {
     /// Serial host prelude: the leader scan + rec_base prefix sums.
     pub prep: std::time::Duration,
     /// Atlas trie load + cluster host inputs + pair filter + item tables.

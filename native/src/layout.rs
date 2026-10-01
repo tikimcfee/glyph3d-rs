@@ -323,7 +323,6 @@ pub enum Paint<'a> {
     /// Must be exactly as long as the item's record stream.
     PerRecord(&'a [u32]),
     /// Non-overlapping byte ranges in ascending order — AST/LSP format.
-    #[allow(dead_code)]
     ByteSpans(&'a [ByteSpan]),
 }
 
@@ -422,60 +421,16 @@ impl ItemPlacement {
 /// Where laid-out glyphs land. The CALLER owns it and passes it in; a backend
 /// appends and never reads back.
 ///
-/// Three forms: a host `Vec<GlyphInstance>`; a GPU-mapped device buffer the
-/// FFI writes (`Mapped`); and the endpoint form (`Device`, note 23's E2b) —
-/// the CubeCL chain's 32 B slots on device, bound by the renderer directly,
-/// no host copy anywhere. `Mapped` arrived first at the boundary the seam
-/// predicted: the FFI writes instances into the SAME memory the glyph shader
-/// reads, so the repo load pays one allocation and zero copies. `Device` is
-/// the same idea with the language boundary gone.
+/// Two forms: a host `Vec<GlyphInstance>`; and the endpoint form (`Device`,
+/// note 23's E2b) — the 32 B slots on device, bound by the renderer directly,
+/// no host copy anywhere.
 #[derive(Default)]
 pub struct GlyphArena {
     instances: Vec<GlyphInstance>,
-    /// Present on the mapped (device-resident) path; `instances` stays empty.
-    mapped: Option<MappedArena>,
     /// Present on the ENDPOINT path (note 23, E2b): the chain's 32 B slots
     /// on device, bound directly — no host copy exists. Mutually exclusive
-    /// with the other two forms; every slice-returning accessor panics on it.
+    /// with the host form; every slice-returning accessor panics on it.
     device: Option<DeviceSlots>,
-}
-
-/// A device-buffer-backed arena: one entry per CHUNK buffer, each holding up
-/// to `chunk_slots` slots so no bound range exceeds the storage binding
-/// limit; the pre-chunking single-buffer form is `chunks.len() == 1`. The
-/// pointers are the buffers' shared-storage contents (Metal); on Metal, hal's
-/// `unmap_buffer` is a no-op, so the mappings simply live as long as the
-/// buffers — which the arena owns, so the two never disagree.
-///
-/// Why chunked: a corpus's instance mass can exceed `max_buffer_size`
-/// (glyph3d-js needs 4.66 GB against this M2's 4.095 GB) — the renderer's
-/// draw path has always chunked bindings at the storage-binding limit, so
-/// the arena simply holds one buffer per draw chunk and the limit stops
-/// being a gate.
-pub struct MappedArena {
-    chunks: Vec<MappedChunk>,
-    chunk_slots: usize,
-    /// Total committed slots across all chunks.
-    len: usize,
-}
-
-struct MappedChunk {
-    ptr: *mut GlyphInstance,
-    /// This chunk's capacity in slots — `chunk_slots` except possibly the
-    /// last chunk, which is sized to the remainder.
-    cap: usize,
-    /// Never read — it OWNS the allocation the pointer aliases; dropping it
-    /// would free the GPU buffer under every outstanding slice.
-    #[allow(dead_code)]
-    buffer: wgpu::Buffer,
-}
-
-impl MappedArena {
-    /// Total capacity across all chunk buffers (the last may be sized to
-    /// the remainder, like the single form's byte-count estimate always did).
-    fn cap(&self) -> usize {
-        self.chunks.iter().map(|c| c.cap).sum()
-    }
 }
 
 /// The endpoint's arena form (note 23, E2b): the chain's 32 B RenderSlots
@@ -490,14 +445,15 @@ pub struct DeviceSlots {
     /// Slots per chunk (uniform; the last chunk may hold fewer).
     pub chunk_slots: usize,
     pub len: usize,
-    /// (glyph_id, color) per slot, slot order — read through `as_slice`.
-    pub tint: TintStore,
-    /// The cubecl pool bindings that keep the chunks' memory from being
-    /// re-allocated — never read by design; their Drop is the release.
-    #[allow(dead_code)]
-    pub keep_alive: Vec<Box<dyn std::any::Any + Send>>,
     /// When mapped in host-visible memory, base pointer to the RenderSlot slice as usize.
     pub mapped_slots: Option<usize>,
+    /// (glyph_id, color) per slot, slot order — read through `as_slice`.
+    #[cfg(feature = "cubecl")]
+    pub tint: TintStore,
+    /// The pool bindings that keep the chunks' memory from being
+    /// re-allocated — never read by design; their Drop is the release.
+    #[cfg(feature = "cubecl")]
+    pub keep_alive: Vec<Box<dyn std::any::Any + Send>>,
 }
 
 pub struct DeviceSlotChunk {
@@ -512,15 +468,14 @@ pub struct DeviceSlotChunk {
 /// no to_vec; the host reads the pointer). `as_slice` is the only read.
 pub enum TintStore {
     Host(Vec<u32>),
-    #[allow(dead_code)]
+    #[cfg(feature = "cubecl")]
     Mapped(TintMapped),
 }
 
-#[allow(dead_code)]
+#[cfg(feature = "cubecl")]
 pub struct TintMapped {
-    /// Never read — it OWNS the shared allocation `ptr` aliases; dropping
+    /// It OWNS the shared allocation `ptr` aliases; dropping
     /// it would free the buffer under the fold's reads.
-    #[allow(dead_code)]
     pub buffer: wgpu::Buffer,
     pub ptr: *const u32,
     pub words: usize,
@@ -530,6 +485,7 @@ impl TintStore {
     pub fn as_slice(&self) -> &[u32] {
         match self {
             TintStore::Host(v) => v,
+            #[cfg(feature = "cubecl")]
             TintStore::Mapped(m) => {
                 // SAFETY: the buffer outlives the store (owned field), the
                 // pointer is its contents base (Metal shared storage), and
@@ -541,18 +497,13 @@ impl TintStore {
     }
 }
 
-// The raw pointer aliases shared storage owned by the `buffer` field; the
+// The raw pointer aliases shared storage owned by the `_buffer` field; the
 // arena moves between load threads and the slice is only ever READ through
 // as_slice (the tint fold), never written.
+#[cfg(feature = "cubecl")]
 unsafe impl Send for TintMapped {}
+#[cfg(feature = "cubecl")]
 unsafe impl Sync for TintMapped {}
-
-// The raw pointers alias shared-storage buffers owned by this struct; the
-// arena is moved between load threads (walk → layout → scene build) but the
-// pointers are only ever written through the backend's fill and read through
-// `instances`/`instance_chunks` — never concurrently.
-unsafe impl Send for MappedArena {}
-unsafe impl Sync for MappedArena {}
 
 impl GlyphArena {
     pub fn new() -> Self {
@@ -561,56 +512,13 @@ impl GlyphArena {
 
     /// Wrap a host Vec (the text/engine-text scenes stage from their own fold).
     pub fn from_vec(instances: Vec<GlyphInstance>) -> Self {
-        Self { instances, mapped: None, device: None }
-    }
-
-    /// The chunked device-resident form: one already-mapped buffer per draw
-    /// chunk. `parts` carries (base pointer, capacity, buffer) per chunk;
-    /// every chunk but the last must be exactly `chunk_slots` (the slot math
-    /// strides uniformly), and the last may be smaller.
-    #[allow(dead_code)]
-    pub fn from_mapped_chunks(
-        parts: Vec<(*mut GlyphInstance, usize, wgpu::Buffer)>,
-        chunk_slots: usize,
-    ) -> Self {
-        assert!(
-            !parts.is_empty() && chunk_slots > 0,
-            "a chunked arena needs at least one buffer and a nonzero chunk size"
-        );
-        for (k, &(_, cap, _)) in parts.iter().enumerate() {
-            let want = if k + 1 == parts.len() {
-                cap <= chunk_slots
-            } else {
-                cap == chunk_slots
-            };
-            assert!(
-                want,
-                "arena chunk {k} has capacity {cap}, chunk_slots is {chunk_slots}"
-            );
-        }
-        Self {
-            instances: Vec::new(),
-            mapped: Some(MappedArena {
-                chunks: parts
-                    .into_iter()
-                    .map(|(ptr, cap, buffer)| MappedChunk { ptr, cap, buffer })
-                    .collect(),
-                chunk_slots,
-                len: 0,
-            }),
-            device: None,
-        }
-    }
-
-    /// True when the arena is device-resident (one buffer or many).
-    pub fn is_mapped(&self) -> bool {
-        self.mapped.is_some()
+        Self { instances, device: None }
     }
 
     /// The endpoint form (note 23, E2b): the chain's slots on device.
     pub fn from_device(device: DeviceSlots) -> Self {
         assert!(device.len > 0, "a device arena with zero slots is the host form's job");
-        Self { instances: Vec::new(), mapped: None, device: Some(device) }
+        Self { instances: Vec::new(), device: Some(device) }
     }
 
     /// True on the endpoint form — 32 B slots on device, bound directly.
@@ -619,7 +527,7 @@ impl GlyphArena {
     }
 
     /// The device slots (buffer + offset per chunk) for the renderer's
-    /// direct bind. None on the host/mapped forms.
+    /// direct bind. None on the host form.
     pub fn device_slots(&self) -> Option<&DeviceSlots> {
         self.device.as_ref()
     }
@@ -627,11 +535,9 @@ impl GlyphArena {
     /// Slots written so far — the next item's `slot_base`.
     pub fn len(&self) -> usize {
         if let Some(d) = &self.device {
-            return d.len;
-        }
-        match &self.mapped {
-            Some(m) => m.len,
-            None => self.instances.len(),
+            d.len
+        } else {
+            self.instances.len()
         }
     }
 
@@ -639,95 +545,41 @@ impl GlyphArena {
         self.len() == 0
     }
 
-    /// Every committed instance as per-chunk slices, in chunk order — the
-    /// form that survives chunking. Chunk k's length is derived from the
-    /// total committed count (intermediate chunks are full).
+    /// Every committed instance as per-chunk slices, in chunk order.
     pub fn instance_chunks(&self) -> Vec<&[GlyphInstance]> {
         assert!(
             self.device.is_none(),
             "instance_chunks on a device arena: the slots never exist on host — \
              the renderer binds the buffers, seg_tint reads the tint lanes"
         );
-        match &self.mapped {
-            Some(m) => m
-                .chunks
-                .iter()
-                .enumerate()
-                .map(|(k, c)| {
-                    let here = m.len.saturating_sub(k * m.chunk_slots).min(m.chunk_slots);
-                    // SAFETY: the buffer outlives the arena (owned field), the
-                    // pointer is its contents base, and `here` counts slots
-                    // the writer reported through `commit` — the only way
-                    // they become readable.
-                    unsafe { std::slice::from_raw_parts(c.ptr, here) }
-                })
-                .collect(),
-            None => vec![&self.instances],
-        }
+        vec![&self.instances]
     }
 
-    /// The committed instances as one slice. Loudly refuses a chunked
-    /// mapped arena — a contiguous slice cannot span buffers; iterate
-    /// `instance_chunks` or, on a verify path, `instances_cow`.
+    /// The committed instances as one slice.
     pub fn instances(&self) -> &[GlyphInstance] {
         assert!(
             self.device.is_none(),
             "instances() on a device arena: the slots never exist on host"
         );
-        match &self.mapped {
-            Some(m) if m.chunks.len() == 1 => {
-                // SAFETY: as in instance_chunks — owned buffer, base pointer,
-                // len committed through `commit`.
-                unsafe { std::slice::from_raw_parts(m.chunks[0].ptr, m.len) }
-            }
-            Some(_) => panic!(
-                "instances() on a chunked mapped arena: a contiguous slice cannot \
-                 span buffers — iterate instance_chunks() instead"
-            ),
-            None => &self.instances,
-        }
+        &self.instances
     }
 
-    /// The committed instances, contiguous. Free for the host and
-    /// single-buffer forms; a chunked arena pays one concatenation, so this
-    /// is for verify paths, never the product load.
+    /// The committed instances, contiguous.
     pub fn instances_cow(&self) -> std::borrow::Cow<'_, [GlyphInstance]> {
-        match &self.mapped {
-            Some(m) if m.chunks.len() > 1 => {
-                let mut flat = Vec::with_capacity(m.len);
-                for c in self.instance_chunks() {
-                    flat.extend_from_slice(c);
-                }
-                std::borrow::Cow::Owned(flat)
-            }
-            _ => std::borrow::Cow::Borrowed(self.instances()),
-        }
+        std::borrow::Cow::Borrowed(self.instances())
     }
 
     /// Hint the upper bound on slots still to come (records, before blanks are
     /// dropped). A hint only: the real count is lower and the arena grows.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn reserve(&mut self, records: usize) {
-        if let Some(m) = &self.mapped {
-            assert!(
-                m.len + records <= m.cap(),
-                "mapped arena reserve: {} slots over the {}-slot capacity",
-                m.len + records - m.cap(),
-                m.cap(),
-            );
-        } else {
-            self.instances.reserve(records);
-        }
+        self.instances.reserve(records);
     }
 
     /// Append one instance. `pub(crate)` on purpose: filling the arena is a
     /// BACKEND's job, and a caller that pushes its own instances is a caller
     /// that has smuggled a fourth layout implementation into the tree.
     pub(crate) fn push(&mut self, instance: GlyphInstance) {
-        assert!(
-            self.mapped.is_none(),
-            "push into a mapped arena: only the FFI tail writer fills one"
-        );
         assert!(
             self.device.is_none(),
             "push into a device arena: the chain's scatter fills it on device"
@@ -738,33 +590,7 @@ impl GlyphArena {
     /// Hand a backend the arena's UNINITIALIZED tail so it can write instances
     /// where they will live, instead of building them somewhere else and
     /// copying. Returns the write pointer and how many slots are available.
-    ///
-    /// This is the seam's stated purpose arriving: `GlyphArena` is passed in
-    /// precisely so a backend never decides where the glyphs live, and until
-    /// now every backend still built them somewhere else first. Measured
-    /// 2026-09-07, that detour was 87% of a batched load's backend time.
-    ///
-    /// `pub(crate)` and paired with [`GlyphArena::commit`], which is the only
-    /// way the written slots become visible — nothing outside this module can
-    /// reach the tail, and nothing at all can make it readable without saying
-    /// how many slots it actually wrote.
     pub(crate) fn uninit_tail(&mut self, want: usize) -> (*mut GlyphInstance, usize) {
-        if let Some(m) = &self.mapped {
-            assert!(
-                m.chunks.len() == 1,
-                "uninit_tail is the contiguous tail write (the FFI's form); \
-                 a chunked arena takes write_bytes_at or the device copy"
-            );
-            assert!(
-                want <= m.cap() - m.len,
-                "mapped arena tail: want {want} over the {} slots left",
-                m.cap() - m.len,
-            );
-            // SAFETY: the assert keeps the tail inside the buffer; the pointer
-            // is only valid until the next mutation — which `commit` is, and
-            // which nothing else can perform on the tail.
-            return unsafe { (m.chunks[0].ptr.add(m.len), want) };
-        }
         self.instances.reserve(want);
         let len = self.instances.len();
         // SAFETY: `reserve` guarantees capacity for `want` past `len`, and the
@@ -774,32 +600,14 @@ impl GlyphArena {
         (ptr, want)
     }
 
-    /// Make `written` slots of the tail visible. Separate from `uninit_tail`
-    /// because only the backend knows how many it filled: the count is not the
-    /// count it was offered (blanks are dropped), and assuming otherwise would
-    /// publish uninitialized memory as glyphs.
+    /// Make `written` slots of the tail visible.
     ///
     /// # Safety
     /// `written` slots starting at the pointer from the matching
     /// [`GlyphArena::uninit_tail`] must have been fully initialized, and
     /// `written` must not exceed the capacity that call returned.
     pub(crate) unsafe fn commit(&mut self, written: usize) {
-        if let Some(m) = &mut self.mapped {
-            assert!(
-                written <= m.cap() - m.len,
-                "mapped commit({written}) exceeds the {} slots left in the arena",
-                m.cap() - m.len,
-            );
-            m.len += written;
-            return;
-        }
         let len = self.instances.len();
-        // assert!, NOT debug_assert!. `[profile.release]` sets only `debug =
-        // true`, so debug assertions are OFF, and every gate in this tree builds
-        // --release — a debug_assert here is a guard that exists in no build we
-        // ship or check. It stands between an over-reported count and a
-        // `set_len` past capacity, which publishes uninitialized memory as
-        // glyphs. One compare per load is not a cost worth that.
         assert!(
             written <= self.instances.capacity() - len,
             "commit({written}) exceeds the {} uncommitted slots reserved",
@@ -903,7 +711,7 @@ pub trait VerifyLayout: LayoutGlyphs {
 /// Blank records (`glyph_id == 0` — missing or whitespace) emit no instance;
 /// their advance is already baked into the surviving records' X by the fold,
 /// so dropping them moves nothing.
-#[allow(dead_code)]
+#[cfg(test)]
 pub(crate) fn compact_records_into(
     records: &[GlyphRecord],
     paint: Paint<'_>,

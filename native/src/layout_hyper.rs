@@ -15,8 +15,10 @@ use crate::fold::{rows_for_line, wrap_row_of, wrap_segment_of};
 use crate::glyph_scene::{GlyphInstance, RenderSlot};
 use crate::layout::{
     DeviceSlotChunk, DeviceSlots, GlyphArena, InkExtent, ItemPlacement, LayoutError, LayoutGlyphs,
-    LayoutItem, PageExtent, Paint, TintStore,
+    LayoutItem, PageExtent, Paint,
 };
+#[cfg(feature = "cubecl")]
+use crate::layout::TintStore;
 use crate::text::fu_to_world;
 
 pub struct HyperLayout {
@@ -70,7 +72,7 @@ fn create_mapped_render_slots(
     let label = "glyph render slots (direct-mapped)";
     let hal_buf = unsafe {
         hal_dev.create_buffer(&wgpu::hal::BufferDescriptor {
-            label: Some(&label),
+            label: Some(label),
             size,
             usage: wgpu::BufferUses::STORAGE_READ_ONLY
                 | wgpu::BufferUses::COPY_DST
@@ -86,7 +88,7 @@ fn create_mapped_render_slots(
         device.create_buffer_from_hal::<wgpu::hal::api::Metal>(
             hal_buf,
             &wgpu::BufferDescriptor {
-                label: Some(&label),
+                label: Some(label),
                 size,
                 usage: wgpu::BufferUsages::STORAGE
                     | wgpu::BufferUsages::COPY_DST
@@ -108,8 +110,6 @@ fn create_mapped_render_slots(
 }
 
 struct ItemPrepass {
-    #[allow(dead_code)]
-    record_count: u32,
     survivor_count: u32,
     max_row_extent: f64,
 }
@@ -322,7 +322,6 @@ impl HyperLayout {
                     0
                 };
 
-                let mut record_count = 0u32;
                 let mut survivor_count = 0u32;
                 let mut col = 0i64;
                 let mut line_adv = 0.0f64;
@@ -354,7 +353,6 @@ impl HyperLayout {
                         max_row_extent = item_rel_x;
                     }
 
-                    record_count += 1;
                     if r.glyph_id != 0 {
                         survivor_count += 1;
                     }
@@ -377,7 +375,6 @@ impl HyperLayout {
                 }
 
                 ItemPrepass {
-                    record_count,
                     survivor_count,
                     max_row_extent,
                 }
@@ -394,7 +391,7 @@ impl HyperLayout {
 
         let can_map_device = allow_device
             && cfg!(target_os = "macos")
-            && self.device.as_ref().map_or(false, |dev| {
+            && self.device.as_ref().is_some_and(|dev| {
                 dev.host_visible_storage
                     && (total_survivors * std::mem::size_of::<RenderSlot>()) as u64
                         <= dev.max_buffer_size
@@ -421,9 +418,11 @@ impl HyperLayout {
                 }],
                 chunk_slots: total_survivors,
                 len: total_survivors,
-                tint: TintStore::Host(Vec::new()),
-                keep_alive: Vec::new(),
                 mapped_slots: Some(mapped_ptr as usize),
+                #[cfg(feature = "cubecl")]
+                tint: TintStore::Host(Vec::new()),
+                #[cfg(feature = "cubecl")]
+                keep_alive: Vec::new(),
             };
             *arena = GlyphArena::from_device(device_slots);
             Ok(placements)

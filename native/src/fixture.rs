@@ -47,35 +47,22 @@ pub const FIXTURE_COUNT_STRIDE: usize = 4;
 // things. LINE_ADV, ORD and F_MISSING have no non-test caller yet — stages 2-4
 // bring them in — and dropping them now would only mean re-deriving them later
 // from the same source.
-#[allow(dead_code)]
 pub const FIX_M_X: usize = 0;
-#[allow(dead_code)]
 pub const FIX_M_Y: usize = 1;
-#[allow(dead_code)]
 pub const FIX_M_Z: usize = 2;
-#[allow(dead_code)]
 pub const FIX_M_ADVANCE: usize = 3;
-#[allow(dead_code)]
 pub const FIX_M_HEIGHT: usize = 4;
-#[allow(dead_code)]
 pub const FIX_M_GLYPH_ID: usize = 5;
-#[allow(dead_code)]
 pub const FIX_M_BASE_X: usize = 6;
-#[allow(dead_code)]
 pub const FIX_M_LINE_ADV: usize = 7;
 
-#[allow(dead_code)]
 pub const FIX_C_ROW: usize = 0;
-#[allow(dead_code)]
 pub const FIX_C_COL: usize = 1;
-#[allow(dead_code)]
 pub const FIX_C_FLAGS: usize = 2;
-#[allow(dead_code)]
 pub const FIX_C_ORD: usize = 3;
 
 /// Fold flags, from `glyph_pipeline.mojo`.
 pub const F_LEADER: u32 = 1;
-#[allow(dead_code)]
 pub const F_MISSING: u32 = 8;
 
 /// FIXTURE lane name for diagnostics — fixture order, not container order.

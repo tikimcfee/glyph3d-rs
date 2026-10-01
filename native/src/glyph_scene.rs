@@ -96,8 +96,6 @@ mod ui_probe;
 pub use ui_probe::UiProbe;
 
 mod buffers;
-#[allow(unused_imports)]
-pub use buffers::{arena_chunk_slots, mapped_instance_arena};
 
 mod pipelines;
 mod render;
@@ -219,7 +217,7 @@ impl GlyphScene {
 
         // --- instance + group buffers --------------------------------------
         let mut arena = staged.instances;
-        if arena.is_empty() && !arena.is_mapped() && !arena.is_device() {
+        if arena.is_empty() && !arena.is_device() {
             arena.push(GlyphInstance {
                 pos: [0.0; 3],
                 glyph_id: 0,

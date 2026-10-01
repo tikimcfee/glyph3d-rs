@@ -1,7 +1,7 @@
 //! The command line: the clap `Cli` struct, the string→enum value parsers,
 //! the op-stream assembly (`Op`, `RawOps`, verb/pick parsing) and the Stage H
 //! parity tests. Extracted from `main.rs` in the 2026-09 code-shape refactor
-//! — a pure move; `pub(crate)` stands in for the crate-root visibility these
+//! — a pure move; `pub` stands in for the crate-root visibility these
 //! items had.
 
 use std::path::{Path, PathBuf};
@@ -16,7 +16,7 @@ use crate::glyph_scene::{PickCommand, Verb};
 /// here is a bug in this function rather than in the caller's command line —
 /// which is why it panics instead of falling back to the default. A silent
 /// fallback would render mode A while the operator believed they asked for B.
-pub(crate) fn parse_wrap_mode(s: &str) -> fold::WrapMode {
+pub fn parse_wrap_mode(s: &str) -> fold::WrapMode {
     match s {
         "down" => fold::WrapMode::Down,
         "back" => fold::WrapMode::Back,
@@ -31,7 +31,7 @@ pub(crate) fn parse_wrap_mode(s: &str) -> fold::WrapMode {
 /// plane, which no baseline has ever rendered; refuse it rather than gate
 /// nothing on a geometry nobody has looked at. 0 is legitimate — the
 /// documented flat layout (`RepoParams::z_wrap_spacing`).
-pub(crate) fn parse_z_wrap_spacing(s: &str) -> Result<f64, String> {
+pub fn parse_z_wrap_spacing(s: &str) -> Result<f64, String> {
     let v: f64 = s
         .parse()
         .map_err(|_| format!("--z-wrap-spacing: {s:?} is not a number"))?;
@@ -47,7 +47,7 @@ pub(crate) fn parse_z_wrap_spacing(s: &str) -> Result<f64, String> {
 /// clap has already refused anything else, so reaching here means the parser
 /// and this match disagree, and silently loading with the wrong strategy would
 /// make a verification run compare something other than what was asked for.
-pub(crate) fn parse_strategy(s: &str) -> crate::repo::Strategy {
+pub fn parse_strategy(s: &str) -> crate::repo::Strategy {
     use crate::repo::Strategy;
     match s {
         "naive" => Strategy::PerItem,
@@ -74,7 +74,7 @@ pub(crate) fn parse_strategy(s: &str) -> crate::repo::Strategy {
 /// an unknown value here is a bug in this function rather than in the caller's
 /// command line — a silent fallback would render mode A while the operator
 /// believed they asked for B.
-pub(crate) fn parse_cluster_mode(s: &str) -> fold::ClusterMode {
+pub fn parse_cluster_mode(s: &str) -> fold::ClusterMode {
     match s {
         "leader" => fold::ClusterMode::Leader,
         "cluster" => fold::ClusterMode::Cluster,
@@ -116,77 +116,77 @@ WINDOWED MODE:
     after_long_help = AFTER_LONG_HELP,
     args_override_self = true,
 )]
-pub(crate) struct Cli {
+pub struct Cli {
     /// Offscreen: render to PATH (PNG), print timing, exit 0
     #[arg(long, value_name = "PATH")]
-    pub(crate) screenshot: Option<PathBuf>,
+    pub screenshot: Option<PathBuf>,
     /// Frames to render offscreen
     #[arg(long, value_name = "N", default_value_t = 1)]
-    pub(crate) frames: u32,
+    pub frames: u32,
     /// Stage A quad-field demo instead of the text field
     #[arg(long)]
-    pub(crate) demo: bool,
+    pub demo: bool,
     /// Text file to stage (UTF-8); default: this crate's main.rs
     #[arg(long, value_name = "PATH")]
-    pub(crate) render_file: Option<PathBuf>,
+    pub render_file: Option<PathBuf>,
     /// Tile the file N times (stress)
     #[arg(long, value_name = "N", default_value_t = 1)]
-    pub(crate) copies: u32,
+    pub copies: u32,
     /// Camera magnification for offscreen
     #[arg(long, value_name = "F", default_value_t = 1.0, allow_negative_numbers = true)]
-    pub(crate) zoom: f32,
+    pub zoom: f32,
     /// Stage D: run the Mojo glyph engine in-process on PATH, print records, exit
     #[arg(long, value_name = "PATH")]
-    pub(crate) engine_file: Option<PathBuf>,
+    pub engine_file: Option<PathBuf>,
     /// The colour-emoji sheet every glyph scene loads (default:
     /// assets/atlas/emoji-sheet.bin, baked from the vendored Noto Color Emoji).
     /// Point it at another G3ES file to swap the sheet without a rebuild.
     #[arg(long, value_name = "PATH")]
-    pub(crate) emoji_sheet: Option<PathBuf>,
+    pub emoji_sheet: Option<PathBuf>,
     /// Trie for engine modes (default: assets/atlas/engine-trie.bin — the real
     /// atlas mapping; pass a .pipe.bin fixture for the toy one)
     #[arg(long, value_name = "PATH")]
-    pub(crate) engine_trie: Option<PathBuf>,
+    pub engine_trie: Option<PathBuf>,
     /// Repeat the --engine-file load N times (leak/stability loop)
     #[arg(long, value_name = "N", default_value_t = 1)]
-    pub(crate) engine_loop: u32,
+    pub engine_loop: u32,
     /// Stage E1: cross-check engine output vs text.rs CPU reference (bit-exact), exit
     #[arg(long, value_name = "PATH")]
-    pub(crate) engine_check: Option<PathBuf>,
+    pub engine_check: Option<PathBuf>,
     /// Stage E1: render engine records through the Slug renderer
     #[arg(long, value_name = "PATH")]
-    pub(crate) engine_render: Option<PathBuf>,
+    pub engine_render: Option<PathBuf>,
     /// Fixture parity (reference port): print the canonical parse manifest for each
     /// .pipe.bin fixture and exit. tools/check-fixture-parity.sh diffs these
     /// lines against the ones engine/fixture_manifest.mojo emits from the Mojo
     /// loader — two independent parsers agreeing on checksums over their PARSED
     /// values, not on the file's bytes.
     #[arg(long, value_name = "PATH", num_args = 1..)]
-    pub(crate) fixture_manifest: Vec<PathBuf>,
+    pub fixture_manifest: Vec<PathBuf>,
     /// Fixture parity: lay each .pipe.bin with the CPU reference fold and diff
     /// BIT-EXACT against the oracle's own expected lanes, then exit.
     #[arg(long, value_name = "PATH", num_args = 1..)]
-    pub(crate) fixture_reference: Vec<PathBuf>,
+    pub fixture_reference: Vec<PathBuf>,
     /// Trie rebuild: rebuild each .pipe.bin's trie from its own bytes with the
     /// ported GlyphTrie and diff against the trie the oracle stored, then exit.
     #[arg(long, value_name = "PATH", num_args = 1..)]
-    pub(crate) fixture_trie: Vec<PathBuf>,
+    pub fixture_trie: Vec<PathBuf>,
     /// Full fold: run the ported serial fold over each .pipe.bin and compare
     /// EVERY lane of EVERY byte plus boxes and the batch union, then exit.
     #[arg(long, value_name = "PATH", num_args = 1..)]
-    pub(crate) fixture_fold: Vec<PathBuf>,
+    pub fixture_fold: Vec<PathBuf>,
     /// Scan form: run the ported scan form over each .pipe.bin at a SWEEP of
     /// chunk/group/shard tunings and compare under the tiered contract, then
     /// exit. Invariance across the tunings is associativity in situ.
     #[arg(long, value_name = "PATH", num_args = 1..)]
-    pub(crate) fixture_scan: Vec<PathBuf>,
+    pub fixture_scan: Vec<PathBuf>,
     /// Bake: replay each .bake.bin through the ported bake and diff the
     /// record AND every seed-protocol query bit-exact, then exit.
     #[arg(long, value_name = "PATH", num_args = 1..)]
-    pub(crate) fixture_bake: Vec<PathBuf>,
+    pub fixture_bake: Vec<PathBuf>,
     /// Stage E2: load a whole repository as a field of code pages
     #[arg(long, value_name = "DIR")]
-    pub(crate) load_repo: Option<PathBuf>,
+    pub load_repo: Option<PathBuf>,
     /// Which FFI strategy the Mojo backend uses. `direct` is the DEFAULT: the
     /// engine writes render instances straight into the arena, materializing no
     /// wire record on either side of the FFI — one pass where `naive` and
@@ -195,19 +195,19 @@ pub(crate) struct Cli {
     /// are the verification form: `VerifyLayout` needs a wire stream, and
     /// `--repo-verify` diffs whichever pair you name.
     #[arg(long, value_name = "MODE", default_value = "hyper", value_parser = ["naive", "batch", "direct", "cubecl", "hyper"])]
-    pub(crate) repo_engine: String,
+    pub repo_engine: String,
     /// Diff the chosen strategy against a counterpart, bit-exact over the
     /// whole repo: placements and instances always, wire records when both
     /// paths have them (`direct` has none, and the PASS line says so).
     #[arg(long)]
-    pub(crate) repo_verify: bool,
+    pub repo_verify: bool,
     /// How a wrap is spent on a repo load: `back` (the default, and what the
     /// `repo-wide`/`repo-zoom` byte-equal screenshot baselines are taken
     /// under; `repo-down` covers the other) keeps the row and steps the
     /// segment back in depth instead — one row per source line however long
     /// it is. `down` advances the visual row per wrap.
     #[arg(long, value_name = "MODE", default_value = "back", value_parser = ["down", "back"])]
-    pub(crate) wrap_mode: String,
+    pub wrap_mode: String,
     /// The wrap staircase's pitch: z step per intra-line wrap segment, as a
     /// multiple of the em cell height (`RepoParams::z_wrap_spacing` — the
     /// web's `zWrapSpacing`). 0 restores the flat layout exactly
@@ -216,7 +216,7 @@ pub(crate) struct Cli {
     // allow_negative_numbers so a negative REACHES the parser and is refused
     // with the flag named — otherwise clap eats "-0.1" as an unknown flag.
     #[arg(long, value_name = "F", default_value_t = 0.15, allow_negative_numbers = true, value_parser = parse_z_wrap_spacing)]
-    pub(crate) z_wrap_spacing: f64,
+    pub z_wrap_spacing: f64,
     /// Whether the sequence pass resolves codepoint clusters to single glyphs
     /// on a repo load (and on --render-file): `cluster` (the default, since
     /// 2026-09-22) resolves the font's sequences (ZWJ families, RI flags, skin
@@ -224,109 +224,109 @@ pub(crate) struct Cli {
     /// is one glyph per UTF-8 leader. The emoji baselines pin `leader`
     /// explicitly.
     #[arg(long, value_name = "MODE", default_value = "cluster", value_parser = ["leader", "cluster"])]
-    pub(crate) cluster_mode: String,
+    pub cluster_mode: String,
     /// Stage E2: frame the first file whose path contains SUBSTR
     #[arg(long, value_name = "SUBSTR")]
-    pub(crate) focus_file: Option<String>,
+    pub focus_file: Option<String>,
     /// Stage E2: walk + engine + stage + stats, then exit (no GPU)
     #[arg(long)]
-    pub(crate) repo_scan_only: bool,
+    pub repo_scan_only: bool,
     /// Stage F: disable the cull/LOD pass (legacy per-chunk draws; debug/A-B)
     #[arg(long)]
-    pub(crate) no_cull: bool,
+    pub no_cull: bool,
     /// Stage K: windowed without the egui UI overlay (exact pre-K behavior)
     #[arg(long)]
-    pub(crate) no_ui: bool,
+    pub no_ui: bool,
     /// Stage K (K6): windowed only — capture the frame after N frames have
     /// rendered (requires --screenshot-out; the app KEEPS RUNNING afterward —
     /// unlike --screenshot it never exits)
     #[arg(long, value_name = "N", requires = "screenshot_out", conflicts_with = "screenshot")]
-    pub(crate) screenshot_frame: Option<u64>,
+    pub screenshot_frame: Option<u64>,
     /// Stage K (K6): windowed only — PNG path for --screenshot-frame
     #[arg(long, value_name = "PATH", requires = "screenshot_frame", conflicts_with = "screenshot")]
-    pub(crate) screenshot_out: Option<PathBuf>,
+    pub screenshot_out: Option<PathBuf>,
     /// Generate shell completions for SHELL and exit
     #[arg(long, value_name = "SHELL")]
-    pub(crate) generate: Option<clap_complete::Shell>,
+    pub generate: Option<clap_complete::Shell>,
     /// Print the golden-set key for the adapter wgpu picks (`backend-vendor`,
     /// e.g. `vulkan-nvidia`) and exit. The build tool asks this to choose
     /// which baseline directory the pixel gate compares against.
     #[arg(long)]
-    pub(crate) gpu_key: bool,
+    pub gpu_key: bool,
     /// Print the full hardware profile the renderer resolved and exit — the
     /// provenance record committed beside a golden set as ADAPTER.txt.
     #[arg(long)]
-    pub(crate) gpu_profile: bool,
+    pub gpu_profile: bool,
     /// Dev-only CubeCL bring-up smoke (note 16, phase 0): share the device,
     /// prove buffer interop both directions, measure float contraction on the
     /// k_apply shape, print the verdicts, exit. Not wired into the battery.
     #[arg(long)]
-    pub(crate) cubecl_smoke: bool,
+    pub cubecl_smoke: bool,
     /// Dev-only CubeCL scan check (note 16, phase 1): the chunk_reduce kernel
     /// over one fixture, chunk partials diffed bit-exact vs scan.rs, exit.
     #[arg(long, value_name = "PATH")]
-    pub(crate) cubecl_scan_check: Option<PathBuf>,
+    pub cubecl_scan_check: Option<PathBuf>,
     /// Dev-only CubeCL chain check (note 16, phase 2): the full scan skeleton
     /// over one fixture — counts + line_advance bit-exact vs scan.rs,
     /// positions deviation-reported, exit.
     #[arg(long, value_name = "PATH")]
-    pub(crate) cubecl_chain_check: Option<PathBuf>,
+    pub cubecl_chain_check: Option<PathBuf>,
     /// Dev-only CubeCL chain bench (note 16, phase 2): the scan skeleton over
     /// a raw file as one item, dispatch/readback timing, exit.
     #[arg(long, value_name = "PATH")]
-    pub(crate) cubecl_chain_bench: Option<PathBuf>,
+    pub cubecl_chain_bench: Option<PathBuf>,
     /// Dev-only CubeCL decode check (phase 3a): the device decode over one
     /// fixture — packed flags + advance diffed bit-exact vs fold::decode_all.
     #[arg(long, value_name = "PATH")]
-    pub(crate) cubecl_decode_check: Option<PathBuf>,
+    pub cubecl_decode_check: Option<PathBuf>,
     /// Dev-only CubeCL cluster check (phase 3b): decode + cluster on device
     /// vs decode_all + resolve_clusters — flags + advance bit-exact, exit.
     #[arg(long, value_name = "PATH")]
-    pub(crate) cubecl_cluster_check: Option<PathBuf>,
+    pub cubecl_cluster_check: Option<PathBuf>,
     /// Dev-only CubeCL repo parity driver (phase 4 rung 3): the full chain
     /// over a real repository, records diffed tier-aware against the
     /// engine's batched output — the fence the load-path flip rides on.
     #[arg(long, value_name = "DIR")]
-    pub(crate) cubecl_repo_check: Option<PathBuf>,
+    pub cubecl_repo_check: Option<PathBuf>,
     /// Windowed only: how frames reach the display. `fifo` (the default) is
     /// vsync, so the FPS line reads the monitor's refresh; `mailbox` and
     /// `immediate` uncap it where the surface supports them (else fifo, and
     /// the log says so). Offscreen renders never present and ignore this.
     #[arg(long, value_name = "MODE", default_value = "fifo", value_parser = ["fifo", "mailbox", "immediate"])]
-    pub(crate) present_mode: String,
+    pub present_mode: String,
     /// Stage G op-stream flags, captured per-flag by clap and re-interleaved
     /// into `ops` by build_ops().
     #[command(flatten)]
-    pub(crate) raw_ops: RawOps,
+    pub raw_ops: RawOps,
     /// Stage G: the interleaved pick/verb script, in CLI order. Verbs apply
     /// to the most recent pick.
     #[arg(skip)]
-    pub(crate) ops: Vec<Op>,
+    pub ops: Vec<Op>,
 }
 
 /// The op-stream flags exactly as clap captures them (per-flag vectors).
 /// `build_ops` restores the true CLI interleaving via occurrence indices.
 #[derive(clap::Args, Default)]
-pub(crate) struct RawOps {
+pub struct RawOps {
     /// Stage G: pick the first file whose path contains SUBSTR
     #[arg(long, value_name = "SUBSTR", action = ArgAction::Append)]
-    pub(crate) pick_file: Vec<String>,
+    pub pick_file: Vec<String>,
     /// With --pick-file: deterministic glyph pick (folded row)
     #[arg(long, value_name = "N", action = ArgAction::Append)]
-    pub(crate) pick_row: Vec<u32>,
+    pub pick_row: Vec<u32>,
     /// With --pick-file: deterministic glyph pick (folded col)
     #[arg(long, value_name = "M", action = ArgAction::Append)]
-    pub(crate) pick_col: Vec<u32>,
+    pub pick_col: Vec<u32>,
     /// Ray pick through physical pixel (X,Y) of the viewport
     #[arg(long, value_names = ["X", "Y"], num_args = 2, action = ArgAction::Append, allow_negative_numbers = true)]
-    pub(crate) pick_px: Vec<f32>,
+    pub pick_px: Vec<f32>,
     /// Scripted Fly-camera pose: eye + yaw/pitch in DEGREES (interleaves with
     /// picks/verbs like --pick-px)
     #[arg(long, value_names = ["X", "Y", "Z", "YAW", "PITCH"], num_args = 5, action = ArgAction::Append, allow_negative_numbers = true)]
-    pub(crate) cam_pose: Vec<f32>,
+    pub cam_pose: Vec<f32>,
     /// Manipulation verb on the most recent pick (repeatable — see VERBS below)
     #[arg(long, value_name = "V [ARGS]", action = ArgAction::Append, value_parser = parse_verb)]
-    pub(crate) verb: Vec<Verb>,
+    pub verb: Vec<Verb>,
 }
 
 /// Stage G: one scripted operation (picks and verbs interleave in CLI order).
@@ -369,7 +369,7 @@ fn set_pick_row_col(ops: &mut Vec<Op>, row: Option<u32>, col: Option<u32>) {
 ///   move-group dx dy dz         scale-group s
 ///   tint-group rrggbb           tint-cycle
 ///   hide-group | show-group | toggle-hidden
-pub(crate) fn parse_verb(s: &str) -> Result<Verb, String> {
+pub fn parse_verb(s: &str) -> Result<Verb, String> {
     let t: Vec<&str> = s.split_whitespace().collect();
     let usage = format!(
         "unknown/malformed --verb {s:?} — expected recolor-glyph|recolor-line|\
@@ -472,12 +472,12 @@ fn parse_cli_from(matches: clap::ArgMatches) -> Cli {
     cli
 }
 
-pub(crate) fn parse_cli() -> Cli {
+pub fn parse_cli() -> Cli {
     parse_cli_from(Cli::command().get_matches())
 }
 
 /// clap has already refused anything outside the three spellings.
-pub(crate) fn parse_present_mode(s: &str) -> wgpu::PresentMode {
+pub fn parse_present_mode(s: &str) -> wgpu::PresentMode {
     match s {
         "mailbox" => wgpu::PresentMode::Mailbox,
         "immediate" => wgpu::PresentMode::Immediate,
@@ -485,7 +485,7 @@ pub(crate) fn parse_present_mode(s: &str) -> wgpu::PresentMode {
     }
 }
 
-pub(crate) fn default_text_file() -> PathBuf {
+pub fn default_text_file() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("src/main.rs")
 }
 

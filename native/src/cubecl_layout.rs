@@ -37,7 +37,7 @@ use std::time::{Duration, Instant};
 /// wire-stream materialization under `--repo-verify`; the product path
 /// reads them as ~0, which is the yardstick claim).
 #[derive(Clone, Copy, Default)]
-pub(crate) struct CubeclPhases {
+pub struct CubeclPhases {
     /// Bytes concat + fold::Item building + the paint tables.
     pub marshal: Duration,
     /// run_repo_chain's spans (the device totals' prefix sums / tables /
