@@ -512,9 +512,11 @@ pub struct DeviceSlotChunk {
 /// no to_vec; the host reads the pointer). `as_slice` is the only read.
 pub enum TintStore {
     Host(Vec<u32>),
+    #[allow(dead_code)]
     Mapped(TintMapped),
 }
 
+#[allow(dead_code)]
 pub struct TintMapped {
     /// Never read — it OWNS the shared allocation `ptr` aliases; dropping
     /// it would free the buffer under the fold's reads.

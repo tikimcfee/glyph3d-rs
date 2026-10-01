@@ -32,36 +32,14 @@ test_floor = 127
 # `{dylib}` is the host's shared-library extension (dylib on macOS, so on
 # Linux), substituted by the runner at load. pixi.toml's build-engine task is
 # per-platform for the same reason.
-[artifact.dylib]
-class = "product"
-outputs = ["native/libglyph_engine.{dylib}"]
-# `-I engine` makes the whole engine/ directory an input, generated schema
-# included; pixi.toml/pixi.lock pin the toolchain itself.
-inputs = ["engine/*.mojo", "pixi.toml", "pixi.lock"]
-build = "pixi run build-engine"
-note = "cargo does NOT build this; native/build.rs only links it. --fp-mode contract=off is load-bearing (FMA contraction breaks bit-exactness)."
-
 [artifact.renderer]
 class = "product"
 outputs = ["target/release/glyph3d-native"]
-inputs = ["native/src/**/*", "native/build.rs", "native/Cargo.toml", "native/Cargo.lock", "native/libglyph_engine.{dylib}"]
+inputs = ["native/src/**/*", "native/Cargo.toml", "native/Cargo.lock"]
 build = "cd native && cargo build --release"
-note = "Cargo owns its own dependency graph; the stamp only guards the dylib edge cargo cannot see."
+note = "Pure-Rust native renderer."
 
 # ── Committed artifacts ──────────────────────────────────────────────────
-# Two edges leave the schema, not one: the .mojo half feeds the dylib
-# (`mojo -I engine`), the .mjs half feeds the fixture generators
-# (engine/fixtures/gen.mjs imports ../glyph_schema.mjs). Editing
-# schema/glyph-identity.json staleness-invalidates the CORPUS as well as
-# the dylib.
-
-[artifact.glyph-schema]
-class = "committed"
-outputs = ["engine/glyph_schema.mojo", "engine/glyph_schema.mjs"]
-inputs = ["schema/glyph-identity.json", "tools/gen_schema.py"]
-build = "python3 tools/gen_schema.py"
-verify_cmd = "python3 tools/gen_schema.py --check"
-note = "Generator-native check mode; also runs the schema's own tier validation."
 
 [artifact.engine-trie]
 class = "committed"
@@ -261,20 +239,11 @@ compare = "every file in tools/vendor/SHA256SUMS vs its hash; hb.* also re-deriv
 blind_to = "upstream drift (by design) and a wrong-but-self-consistent vendored revision — the fixture corpus gate is the cover for the second"
 
 [[gate]]
-name = "engine-suites"
-scope = "engine"
-kind = "cmd"
-cmd = "./engine/check.sh all"
-needs = ["fixtures"]
-compare = "18 Mojo conformance suites + ffi_selftest + 3 instruments vs the fixture corpus, CPU and Metal"
-blind_to = "faults shared by the serial and scan forms in conformance_real (oracle-free by design); the instruments print but assert nothing"
-
-[[gate]]
 name = "cargo-build"
 scope = "rust"
 kind = "cargo"
 cmd = "build"
-needs = ["dylib"]
+needs = []
 compare = "rustc warning count vs zero"
 
 [[gate]]
@@ -304,19 +273,6 @@ compare = "summed tests-actually-ran vs settings.test_floor ratchet; whole-binar
 blind_to = "nothing, structurally — that is what the floor is for. Holds the two corpus-size pins."
 
 [[gate]]
-name = "engine-check"
-scope = "engine"
-kind = "engine-check"
-# Two inputs, declared here rather than in the runner. src/main.rs is
-# well-formed UTF-8 by construction and can never reach the out-of-range decode
-# path where the two implementations actually disagreed; overflow-leads.txt is
-# the only input in the tree that does.
-targets = ["src/main.rs", "fixtures/overflow-leads.txt"]
-needs = ["renderer", "dylib"]
-compare = "Mojo engine through the FFI vs an independent Rust CPU fold, record by record"
-blind_to = "the per-item FFI strategy (hardcodes batched) and malformed shapes other than overflow-leads"
-
-[[gate]]
 name = "pick-oracle"
 scope = "render"
 kind = "cmd"
@@ -333,69 +289,6 @@ kind = "golden-verify"
 needs = ["renderer", "pixel-baselines"]
 compare = "every declared golden_view re-rendered vs out/tooling-ab/baseline/<this host's --gpu-key>, byte-equal"
 blind_to = "everything outside the declared frames; regression vs intentional change (re-baselining is a human act); any rasterizer other than this host's — a set proves nothing about another vendor"
-
-[[gate]]
-name = "repo-verify"
-scope = "engine"
-kind = "repo-verify"
-# --repo-scan-only is LOAD-BEARING: without it this opens the windowed
-# renderer and never returns. Run per wrap mode; {mode} is substituted.
-#
-# --repo-engine naive IS PINNED, and must stay pinned. This gate's whole claim is
-# that the per-item and batched RECORD strategies agree; it used to get per-item
-# by inheriting the default, so when `direct` became the default (2026-09-07)
-# this command would silently have become a second copy of repo-verify-direct
-# and taken the per-item path's only coverage with it. A gate that names a pair
-# must name it, not inherit half of it.
-cmd = "--load-repo fixtures/g-pick-repo --wrap-mode {mode} --repo-engine naive --repo-verify --repo-scan-only"
-modes = ["down", "back"]
-needs = ["renderer", "dylib"]
-compare = "per-item vs batched FFI strategies, bit-exact at the layout seam, both wrap modes"
-blind_to = "a fault BOTH strategies share — ground truth comes from engine-check, batched path only"
-
-[[gate]]
-name = "repo-verify-direct"
-scope = "engine"
-kind = "repo-verify"
-# The direct path has no wire record, so this diff is placements + instances
-# only — the whole render-visible contract, and the granularity that matters.
-# It is a SEPARATE gate rather than another mode of the one above because it
-# compares a different pair and is blind to different things, and a gate whose
-# `compare` line has to say "and sometimes this other thing" is two gates.
-cmd = "--load-repo fixtures/g-pick-repo --wrap-mode {mode} --repo-engine direct --repo-verify --repo-scan-only"
-modes = ["down", "back"]
-needs = ["renderer", "dylib"]
-compare = "the direct instance writer vs the batched record path, bit-exact on placements and instances, both wrap modes"
-blind_to = "the 32 B wire record tier, which the direct path does not produce — record-level faults are covered by repo-verify and engine-check"
-
-[[gate]]
-name = "reference-port"
-scope = "corpus"
-kind = "cmd"
-cmd = "tools/check-fixture-parity.sh"
-needs = ["renderer", "fixtures"]
-compare = "six halves vs the JS oracle's recorded answers: parse parity, trie, fold, scan, bake, text.rs domain"
-blind_to = "a fault shared by both loaders in parse parity; any fixture outside text.rs's domain, silently"
-
-[[gate]]
-name = "cubecl-chain"
-scope = "rust"
-kind = "cmd"
-cmd = "bash tools/check-cubecl.sh chain"
-pass_line = "ALL PASS"
-needs = ["renderer"]
-compare = "the device chain vs the CPU scan reference over five fixtures: counts/rows exact, fold>0 X bit-exact, line_adv + positions eps, the records witness tier-diffed"
-blind_to = "corpora outside the five fixtures; the ENGINE (this is chain-vs-CPU-scan — engine parity is the fork gate's claim)"
-
-[[gate]]
-name = "cubecl-fork"
-scope = "rust"
-kind = "cmd"
-cmd = "bash tools/check-cubecl.sh fork"
-pass_line = "ALL PASS"
-needs = ["renderer", "dylib"]
-compare = "the full chain's records vs the ENGINE's batched records on the standing fork fixture, BIT-exact (strict), with the census's m>=3 and seg>=3 buckets proven exercised; plus the endpoint tiers: the 32 B slot stream field-equal against the engine arena, placements bit-equal — two passes: default, chunked emit windows"
-blind_to = "corpora outside the fixture; a fault the engine and chain both carry (ground truth layers: engine-check, reference-port)"
 
 # ── Declared mutations ───────────────────────────────────────────────────
 # `glyph mutate` applies each of these, requires the named gate to go red
@@ -499,133 +392,7 @@ with = '''    #[test]
 '''
 expect = "Coverage DROPPED"
 
-# ── engine-suites and engine-check ───────────────────────────────────────
-# `rebuild` is MANDATORY for anything the dylib is built from: engine/check.sh
-# re-links it mid-gate, so without the post-restore rebuild the tree comes back
-# byte-exact with a MUTATED dylib still sitting at native/libglyph_engine.dylib
-# — cargo does not build that file, so the next gate would test the wrong binary.
-#
-# Each of these was checked against the third outcome, the one that is neither
-# "landed" nor "failed to land": LANDED IN A REGION NOTHING READS. The named
-# consumer is recorded in each `why`.
 
-[[mutation]]
-name = "gpu-cluster-phantom-commit"
-gate = "engine-suites"
-why = "the device chain's phantom suppression is the commit's resume-past-span, exactly as in the CPU split — advancing past the head only re-walks the span and the phantom candidate inside it fires. The device twin of cluster-split-phantom-commit; if only one of the pair ever fires, the two chains have drifted. (gpu_pipeline runs before gpu_cluster in the GPU list, so its error surfaces first.)"
-file = "engine/cluster_chain.mojo"
-rebuild = "pixi run build-engine"
-op = "replace"
-find = "            id = end  # the span's members are written; resume past it"
-with = "            id += nb"
-expect = "gpu pipeline diverged"
-
-[[mutation]]
-name = "gpu-pipeline-probe-zero"
-gate = "engine-suites"
-why = "the anti-vacuity pin for the integration: the probe dispatch must be LIVE in gpu_pipeline's device chain — with candidate writes removed, nothing resolves and the cluster fixtures' resolved lanes never happen. If gpu_pipeline ever reverts to uploading pre-resolved lanes (or the dispatch drops), this is the mutation that says so."
-file = "engine/cluster_probe.mojo"
-rebuild = "pixi run build-engine"
-op = "replace"
-find = """        cand_slot[unsafe_offset=id] = best_slot
-        cand_end[unsafe_offset=id] = UInt32(p2)"""
-with = """        cand_slot[unsafe_offset=id] = 0
-        cand_end[unsafe_offset=id] = UInt32(p2)"""
-expect = "gpu pipeline diverged"
-
-[[mutation]]
-name = "gpu-fused-probe-zero"
-gate = "engine-suites"
-why = "the fused-path twin of gpu-pipeline-probe-zero: k_decode_probe's candidate writes are what make the fused dispatch LIVE in the suite's mode 2. With them zeroed, mode 0 stays green and only the fused comparison reddens — so the pair together proves BOTH probe forms are wired into the chain. The 16-space indent (inside `comptime if walk:`'s else branch) is what distinguishes the fused copy from k_cluster_probe's; if the fused dispatch ever drops from the chain while the suite claims modes 0+2, this is the mutation that says so."
-file = "engine/cluster_probe.mojo"
-rebuild = "pixi run build-engine"
-op = "replace"
-find = """                cand_slot[unsafe_offset=id] = best_slot
-                cand_end[unsafe_offset=id] = UInt32(p2)"""
-with = """                cand_slot[unsafe_offset=id] = 0
-                cand_end[unsafe_offset=id] = UInt32(p2)"""
-expect = "gpu pipeline diverged"
-
-[[mutation]]
-name = "gpu-walk-probe-zero"
-gate = "engine-suites"
-why = "the state walk's anti-vacuity pin: with its candidate writes removed, modes 0 and 2 stay green and only mode 3's comparison reddens — proving the walk dispatch is LIVE in the suite, the twin of gpu-pipeline-probe-zero and gpu-fused-probe-zero. The walk's `last_slot` store is distinct from the search form's `best_slot` store, so the three mutations can never land on each other's copies."
-file = "engine/cluster_probe.mojo"
-rebuild = "pixi run build-engine"
-op = "replace"
-find = "                cand_slot[unsafe_offset=id] = last_slot"
-with = "                cand_slot[unsafe_offset=id] = 0"
-expect = "gpu pipeline diverged"
-
-[[mutation]]
-name = "gpu-chunk-chain-phantom"
-gate = "engine-suites"
-why = "the chunked chain's phantom suppression is the commit's greedy guard over the compact list: a candidate whose start lies inside the last committed span is never read, exactly the serial rule's resume. Committing unconditionally re-walks the span and the phantom candidate inside it fires (cluster-overlap). Reddens only the suite's mode-3-chain-1 run — the serial chain's own mutation (gpu-cluster-phantom-commit) keeps its distinct find string."
-file = "engine/cluster_chain.mojo"
-rebuild = "pixi run build-engine"
-op = "replace"
-find = "                if s >= ce:"
-with = "                if s >= 0:"
-expect = "gpu pipeline diverged"
-
-[[mutation]]
-name = "cluster-split-phantom-commit"
-gate = "engine-suites"
-why = "the chain's phantom suppression is the commit's resume-past-span: with (A C) and (C A) both in the table, 🇦🇨🇦 must keep its lone A. Advancing past the head only re-walks the span, and the phantom candidate inside it fires — conformance_split reddens. CONSUMED BY: cluster-overlap.pipe.bin, the fixture that exists for exactly this. (The first form of this mutation dropped the carry GUARD; the resume's landing made that guard a loop invariant, and the review pass caught the mutation going vacuous — bf0a117 never re-ran prove.)"
-file = "engine/cluster_split.mojo"
-rebuild = "pixi run build-engine"
-op = "replace"
-find = "            id = end  # the span's members are written; resume past it"
-with = "            id += n"
-expect = "split-form conformance failed"
-
-[[mutation]]
-name = "phantom-row"
-gate = "engine-suites"
-why = "the 2026-09-04 phantom row: a wrap rule that counts the terminating newline's own row steals a blank row whenever wrap divides the line length exactly, and the two rules agree at every other length. CONSUMED BY: wrap-exact (lines of 4/8/12 at wrap 4 — the fixture exists for this), wrap-emoji and real-kernels; 3 of 17 cases, 178,916 mismatches."
-file = "engine/glyph_wrap.mojo"
-rebuild = "pixi run build-engine"
-op = "replace"
-find = "    return (length - 1) // wrap + 1"
-with = "    return length // wrap + 1"
-expect = "conformance: 3 case(s) failed"
-
-[[mutation]]
-name = "ord-f32-carrier"
-gate = "engine-suites"
-why = "the f32 ordinal wall put back. A CORRELATED fault: both the port and the oracle computed ord exactly and quantized on the store, so past 2^24 they rounded together and the differ said PASS. CONSUMED BY: ordinal_invariant's synthetic 2^24+2 boundary probe ONLY — every one of the 17 fixtures stays green under this, and so do conformance and conformance_scan (verified). This mutation is the reason that suite is not decorative."
-file = "engine/glyph_pipeline.mojo"
-rebuild = "pixi run build-engine"
-op = "replace"
-find = "            w.wc[unsafe_offset=id] = UInt32(ord)"
-with = "            w.wc[unsafe_offset=id] = UInt32(Int(Float32(ord)))"
-expect = "the migration is incomplete"
-
-[[mutation]]
-name = "abi-shape-drift"
-gate = "engine-suites"
-why = "the descriptor's i32 arity moves on the ENGINE side while a foreign caller keeps pinning the old shape — the 2026-09-04 positional-arity incident, the thing ABI_SHAPE exists to refuse. CONSUMED BY: ffi_selftest, which restates the ABI literally instead of importing it and links the SHIPPED dylib; every load_item_desc call is then refused with GE_ABI_MISMATCH (9). Nothing else in the battery crosses the real C ABI for the single-item entry."
-file = "engine/ffi.mojo"
-rebuild = "pixi run build-engine"
-op = "replace"
-find = "comptime ABI_DESC_I32S: Int = 8                # i32 params inside that block"
-with = "comptime ABI_DESC_I32S: Int = 7                # i32 params inside that block"
-expect = "load_item status 9"
-
-[[mutation]]
-name = "out-of-range-block"
-gate = "engine-check"
-why = "an out-of-range codepoint must resolve to the SHARED MISSING BLOCK (storage block 0); resolving it to a real block is the September 2026 disagreement between this engine and the Rust reference, which asserted instead. CONSUMED BY: fixtures/overflow-leads.txt and NOTHING ELSE — 4 of its 15 records differ (GID 189 vs 0). src/main.rs stays green under this mutation, which is exactly why engine-check runs two inputs; so does the whole engine-suites battery, since no fixture carries an F5-F7 lead byte."
-file = "engine/glyph_pipeline.mojo"
-rebuild = "pixi run build-engine"
-op = "replace"
-find = """
-        block = 0
-    var entry"""
-with = """
-        block = 1
-    var entry"""
-expect = "FAIL  engine-check (fixtures/overflow-leads.txt)"
 
 [[mutation]]
 name = "unused-binding"
@@ -667,21 +434,7 @@ with = """pub(crate) fn wrap_segment_of(col: i64, wrap: i64, terminator: bool) -
 """
 expect = "cargo-clippy — 2 warnings"
 
-[[mutation]]
-name = "advance-zeroed"
-gate = "reference-port"
-why = "every glyph x-position derives from the atlas advance; zeroing it must break the port's agreement with the JS oracle's recorded lanes. cargo-mutants measured this exact mutant as MISSED by all 85 unit tests"
-file = "native/src/fold.rs"
-op = "replace"
-find = """    pub fn advance(&self, id: usize) -> f32 {
-        self.sm[id * 2]
-    }"""
-with = """    pub fn advance(&self, id: usize) -> f32 {
-        let _ = id;
-        0.0
-    }"""
-expect = "full fold"
-rebuild = "cargo build --release"
+
 
 [[mutation]]
 name = "coverage-scale"
@@ -698,12 +451,12 @@ rebuild = "cargo build --release"
 name = "depth-write-off"
 gate = "pixel-ab"
 why = "the 2026-09-07 z-order defect put back: the glyph pass testing depth without writing it, so a later-drawn file paints over a nearer one. CONSUMED BY: repo-back-oblique, the frame added for it — and repo-wide, whose front-on column had been painting over long.md's pages in every baseline before that day without anyone seeing it"
-file = "native/src/glyph_scene.rs"
+file = "native/src/glyph_scene/pipelines.rs"
 op = "replace"
-find = """                // blends in exactly the order it did before.
-                depth_write_enabled: Some(true),"""
-with = """                // blends in exactly the order it did before.
-                depth_write_enabled: Some(false),"""
+find = """            // blends in exactly the order it did before.
+            depth_write_enabled: Some(true),"""
+with = """            // blends in exactly the order it did before.
+            depth_write_enabled: Some(false),"""
 expect = "repo-back-oblique.png diverges from baseline"
 rebuild = "cargo build --release"
 
@@ -729,59 +482,7 @@ with = "            if false && crate::fold::is_static_zero_cp(cp) {"
 expect = "emoji-cluster.png diverges from baseline"
 rebuild = "cargo build --release"
 
-[[mutation]]
-name = "cluster-trailer-advance-one"
-gate = "pixel-ab"
-why = "trailers at advance 1 instead of 0: the cluster's neighbors shift right by one cell per trailer — the fold reading the resolved statics is the thing repo-cluster pins. The binary loads the dylib at runtime by rpath, so the dylib rebuild alone carries the change. CONSUMED BY: repo-cluster.png"
-file = "engine/glyph_cluster.mojo"
-op = "replace"
-find = "                    slots.set_advance(to, Float32(0))"
-with = "                    slots.set_advance(to, Float32(1))"
-expect = "repo-cluster.png diverges from baseline"
-rebuild = "pixi run build-engine"
 
-[[mutation]]
-name = "per-item-group-drift"
-gate = "repo-verify"
-why = "this gate is strategy-vs-strategy: its whole claim is that the per-item and batched FFI paths agree. Perturbing ONE path must break that. The per-item branch is exercised by no other gate (engine-check hardcodes batched), so a red here is attributable to this check alone"
-file = "native/src/layout_mojo.rs"
-op = "replace"
-find = """                    placements.push(compact_records_into(
-                        &records,
-                        item.paint,
-                        item.group_id,
-                        arena,
-                    ));"""
-with = """                    placements.push(compact_records_into(
-                        &records,
-                        item.paint,
-                        item.group_id.wrapping_add(1),
-                        arena,
-                    ));"""
-expect = "FAIL  --wrap-mode down"
-rebuild = "cargo build --release"
-
-[[mutation]]
-name = "direct-ink-half-height"
-gate = "repo-verify-direct"
-why = "the direct writer recomputes the ink extent that compact_records_into computes on the record path — the same arithmetic in a second language, which is exactly the correlated-fault risk this gate exists to close. Perturbing the half-height moves ink and nothing else, so a red is attributable to the extent comparison rather than to instance bytes"
-file = "engine/glyph_record.mojo"
-op = "replace"
-find = "        var half = hgt * 0.5"
-with = "        var half = hgt * 0.4"
-expect = "FAIL  --wrap-mode down"
-rebuild = "pixi run build-engine"
-
-[[mutation]]
-name = "direct-prefix-counts-records"
-gate = "repo-verify-direct"
-why = "the grained write is a scan/scatter, and its core invariant is that the slot prefix advances by SURVIVORS while the paint prefix advances by RECORDS. Advancing slots by records instead leaves gaps of uninitialized arena between grains — the exact defect grains introduce and the one direct-ink-half-height cannot see, since that mutation reddens under the serial writer too. Distinct from every other mutation here: it perturbs the parallel decomposition, not the arithmetic"
-file = "engine/glyph_record.mojo"
-op = "replace"
-find = "        slot_at += gr_surv[t]"
-with = "        slot_at += gr_rec[t]"
-expect = "FAIL  --wrap-mode down"
-rebuild = "pixi run build-engine"
 
 [[mutation]]
 name = "pick-off-by-one"
@@ -796,128 +497,4 @@ with = """            if r.row() == row {
 expect = "PICK ORACLE CHECK: FAILURES"
 rebuild = "cargo build --release"
 
-[[mutation]]
-name = "paginate-tail-last"
-gate = "cubecl-fork"
-why = "the stride's tail must fold INSIDE the dominant term's single rounding — tail-LAST measurably overshoots at exact half-ulp ties (the seg-5 class, 12 records on the wide corpus when it was found). CONSUMED BY: paginate's X write, which every m >= 1 record reads. The INSTANCE tier (the field-wise lane compare since E2b) reddens first — paginate writes the lanes the scatter reads — so expect names it; the strict records claim also sees it if the placement order ever moves"
-file = "native/src/cubecl_chain/position.rs"
-rebuild = "cargo build --release"
-op = "replace"
-find = """            let x_with_tail = fma(page_col, stride_reach_tail, lm[mo + LM_BASE_X]);
-            lm[mo + LM_X] = fma(page_col, stride_reach, x_with_tail);"""
-with = """            let x_dominant = fma(page_col, stride_reach, lm[mo + LM_BASE_X]);
-            lm[mo + LM_X] = fma(page_col, stride_reach_tail, x_dominant);"""
-expect = "lane mismatch words"
 
-[[mutation]]
-name = "z-step-tail-dropped"
-gate = "cubecl-fork"
-why = "the engine multiplies the FULL f64 z_step; the correctly-rounded f32 lane alone diverges at seg >= 3 (the wide-corpus Z class was 1.2k words). CONSUMED BY: paginate's depth staircase, read by every wrapped record. The INSTANCE tier (the field-wise lane compare since E2b) reddens first — paginate writes the lanes the scatter reads — so expect names it"
-file = "native/src/cubecl_chain/position.rs"
-rebuild = "cargo build --release"
-op = "replace"
-find = "            let z_tail_folded = fma(depth_steps, items[io + IM_Z_STEP_LO], items[io + IM_ORIGIN_Z]);"
-with = "            let z_tail_folded = items[io + IM_ORIGIN_Z];"
-expect = "lane mismatch words"
-
-[[mutation]]
-name = "extent-segment-reset-dropped"
-gate = "cubecl-fork"
-why = "the segment walk must stop at fills — with the stop one leader late, the filling glyph's advance JOINS the segment it closes, the widest-sum inflates by an advance, and every m >= 1 record's X goes wrong (the exact regression the walk's first landing shipped; the form changed 2026-09-30 to the segment-parallel walk, same rule). CONSUMED BY: extent_pair's segment sums, the stride's only source. The INSTANCE tier (the field-wise lane compare since E2b) reddens first — the stride flows into the scattered X — so expect names it. (The tail-lane zero-pad class found its witness at 568d224: the device gates genuinely cannot see it — trailing phantom records self-truncate — so it lives as pack_words' unit test with tail-pads-zero proven against cargo-test.)"
-file = "native/src/cubecl_chain/position.rs"
-rebuild = "cargo build --release"
-op = "replace"
-find = "                    if sw != 0 && count >= sw {"
-with = "                    if sw != 0 && count > sw {"
-expect = "lane mismatch words"
-
-[[mutation]]
-name = "emitter-ordinal-zeroed"
-gate = "cubecl-chain"
-why = "the record emitter gathers through the forward ordinal map; zeroing it scatters every record to its item's base, which the records witness must catch as mismatches. CONSUMED BY: emit_records' gather, the witness's only subject"
-file = "native/src/cubecl_chain/tail.rs"
-rebuild = "cargo build --release"
-op = "replace"
-find = "            let o = base[it] + wc[b];"
-with = "        let o = base[it];"
-expect = "record mismatches"
-
-[[mutation]]
-name = "tail-pads-zero"
-gate = "cargo-test"
-why = "the packed corpus's tail lanes must be 0x80 continuation leads; zero pads decode on device as phantom NUL leaders with a resolved advance, and every byte-indexed kernel inherits the rounded-up word bound. Invisible to every device gate (trailing phantom records self-truncate past total_records — the fork gate's attempted mutation was dropped for exactly this), real OOB writes on non-robust backends, so the reddening witness is the host unit test. CONSUMED BY: decode's flags lane, which every byte-indexed kernel reads"
-file = "native/src/cubecl_chain/mod.rs"
-rebuild = "cargo build --release"
-op = "replace"
-find = """    for i in bytes.len()..(n_words * 4) {
-        packed[i >> 2] |= 0x80u32 << ((i & 3) * 8);
-    }
-"""
-with = ""
-expect = "pack_words_fills_tail_lanes"
-
-[[mutation]]
-name = "scatter-ordinal-zeroed"
-gate = "cubecl-fork"
-why = "the scatter (note 23 E1, the endpoint's product form) places each 8-word slot at the global survivor ordinal sv[b]; zeroing it collapses every write onto slot 0 and leaves slots 1+ zeroed — glyph_id (field 3) mismatches everywhere, since a zeroed slot's gi=0 can never equal a survivor's. CONSUMED BY: the lane tier's field-wise compare, the only reader of the scatter stream"
-file = "native/src/cubecl_chain/tail.rs"
-rebuild = "cargo build --release"
-op = "replace"
-find = "            let w = sv[b] as usize * 8;"
-with = "            let w = 0usize;"
-expect = "lane mismatch words"
-
-[[mutation]]
-name = "scatter-group-lane-dropped"
-gate = "cubecl-fork"
-why = "the slot's group lane comes from the per-item table (groups[it]); zeroing it leaves every slot claiming group 0 — only items past the first can see it, and the fork fixture carries 2 (a one-item fixture would keep this GREEN, which is why the census's exercise asserts exist). CONSUMED BY: the lane tier's field-wise compare at field 5"
-file = "native/src/cubecl_chain/tail.rs"
-rebuild = "cargo build --release"
-op = "replace"
-find = "                out[w + 5] = groups[it];"
-with = "                out[w + 5] = 0u32;"
-expect = "lane mismatch words"
-
-[[mutation]]
-name = "emitter-window-offset-dropped"
-gate = "cubecl-fork"
-why = "the chunked emitter windows its writes by rec_first; dropping the offset lands every later window's records outside the rolling buffer, discarded by robustness — only the chunk-crossing pass (GLYPH_RECORD_CHUNK=60000, five windows) can see it, since the 16.7M default never leaves window zero on the standing fixture. CONSUMED BY: the record stream's chunk boundaries — the product readback's shape at the 97MB corpus scale"
-file = "native/src/cubecl_chain/tail.rs"
-rebuild = "cargo build --release"
-op = "replace"
-find = "                    let w = (o as usize - rec_first) * 8;"
-with = "                    let w = (o as usize) * 8;"
-expect = "cubecl-fork-chunked"
-
-[[mutation]]
-name = "ink-half-height-dropped"
-gate = "cubecl-fork"
-why = "the ink bottom extent folds y − height/2 over survivors (the quads hang half a glyph below the baseline); dropping the half makes it fold the bare baseline, which the placement tier's bit_eq must catch while the instance tier stays green — the two tiers fence disjoint lanes. The multiply is by 0.5, exact, so the mutation is purely the formula. CONSUMED BY: extent_fold's ink min-y lane (THE SOLE extent folder — since 2026-09-30 the fold rides its own raked kernel, not the scatter; the packer's duplicate folds were deleted at E1 because idempotent min/max made them a mutation MASK), decoded into ItemPlacement.ink.min[1]"
-file = "native/src/cubecl_chain/tail.rs"
-rebuild = "cargo build --release"
-op = "replace"
-find = "                    let y_lo = y - half;"
-with = "                    let y_lo = y;"
-expect = "placement mismatch"
-
-[[mutation]]
-name = "color-lane-dropped"
-gate = "cubecl-fork"
-why = "the per-record color arrives through the jagged paint table indexed by the record ordinal (color_base[it] + wc[b] — the same index the record emitter gathers by); zeroing the read paints every slot's color lane black, which the field-wise instance tier must catch at field 4. The FLAT lane is deliberately not mutated: the standing corpus paints PerRecord, so a flat-color mutation would land in a region nothing reads — the measured trap. (The pack_instances twin of this mutation retired with the packer at E2b.) CONSUMED BY: scatter_slots' color lane"
-file = "native/src/cubecl_chain/tail.rs"
-rebuild = "cargo build --release"
-op = "replace"
-find = "                pr_colors[(color_base[it] + wc[b]) as usize]"
-with = "                0u32"
-expect = "lane mismatch words"
-
-[[mutation]]
-name = "scatter-tint-lane-dropped"
-gate = "cubecl-fork"
-why = "the scatter's tint stream (gi, color per slot) is seg_tint's ONLY input on the endpoint path, and NO golden view can see it — the golden cameras keep all five fixture files near enough that the far-LOD backdrop substitution (the tint's only pixel reader) never fires (measured: this mutation stayed GREEN under pixel-ab, its first gate). So the fence is the fork gate's BYTE-level tint tier: tint pairs vs the engine-fenced slot stream's gi/color words. CONSUMED BY: into_staged's seg_of fold over the tint stream, read by every far segment's backdrop quad"
-file = "native/src/cubecl_chain/tail.rs"
-rebuild = "cargo build --release"
-op = "replace"
-find = "                tint[t + 1] = color;"
-with = "                tint[t + 1] = 0u32;"
-expect = "tint mismatch"

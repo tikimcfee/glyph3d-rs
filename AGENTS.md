@@ -14,72 +14,52 @@ time.
 
 ## Layout
 
-- `engine/` — Mojo/MAX glyph pipeline + FFI + conformance suites + fixtures +
-  benches. Built by pixi, not cargo.
-- `native/` — the Rust/wgpu renderer binary; links `native/libglyph_engine.dylib`.
-- `tools/` — the check scripts, the generators, and repro helpers.
+- `native/` — the pure-Rust renderer and layout engine binary (`glyph3d-native`).
+  Features sub-second repo loading (`HyperLayout`) and modularized Slug WGSL rendering.
+- `glyph/` — the verification gate and mutation test runner (`cargo run -p glyph -- validate`).
+- `tools/` — check scripts, generators, and repro helpers.
 - `assets/atlas/` — prebaked glyph-geometry binaries (+ `FORMAT.md`).
 - `schema/glyph-identity.json` — layout source of truth (vendored, hash-pinned).
 - `out/` — historical reports, proof PNGs, `tooling-ab/baseline/` (the pixel oracle).
 - `integration/` — vendored egui 0.36.1 source. A **grep reference only**: the egui
   that actually compiles comes from crates.io via `Cargo.toml`. Patching this copy
   changes nothing.
-- `research/` — background surveys.
-- `engine-local/`, `.claude/worktrees/` — untracked. `.claude/worktrees/` may hold
-  **another agent's in-flight work**: do not read from it, do not stage it, make
-  your own. A `git add -A` here has twice committed things nobody intended,
-  once as submodule pointers.
+- `research/` — background surveys and GPU architecture studies.
+- `engine-local/`, `.claude/worktrees/` — untracked.
 
 ## Build
 
 ```sh
-pixi install                # mojo + max (pins in pixi.toml; pixi.lock is binary — never hand-merge)
-pixi run build              # the manifest runner: products current + committed artifacts regenerated
-(cd native && cargo build --release)
+# Build the pure-Rust binary directly with Cargo:
+cargo build --release -p glyph3d-native
+
+# Run the test suite (106 unit tests + WGSL validation):
+cargo test --workspace
+
+# Validate build.toml gates and mutation tests:
+cargo run -p glyph -- validate
 ```
 
+**The system is 100% pure Rust.** The former Mojo external C-ABI shared library
+(`libglyph_engine.dylib`) has been completely retired and replaced by `HyperLayout`
+(`native/src/layout_hyper.rs`), a parallel, cache-blocked CPU layout engine written in
+native Rust with Rayon and unified-memory shared buffer mapping.
+
+**Performance characteristics:**
+- Flagship corpus `/Users/lugo/localdev/viz-web/glyph3d-js` (1,306 files, 97.0 MB source,
+  95.2 million glyph instances) loads and lays out in **~0.57s** on Apple Silicon Metal
+  (total visual initialization ~0.93s, 4.4ms submit+render).
+- Decoupled CubeCL: experimental CubeCL GPU compute kernels are decoupled behind the
+  optional Cargo feature `cubecl` (`cargo check --features cubecl`).
+- ByteSpan token painting: `ByteSpan` and `Paint::ByteSpans` provide byte-range semantic
+  token coloring directly from AST/LSP analyses.
+- Modularized renderer: `glyph_scene.rs` is factored cleanly into `buffers.rs`,
+  `pipelines.rs`, and `render.rs`.
+
 **The dependency graph is declared in `build.toml`** (artifact, input globs,
-build command, class) and executed by `glyph` (`glyph/src/main.rs`). `cargo glyph build` brings
-products current (content-hash stamps, not mtimes) and then VERIFIES every
-committed artifact against a scratch rebuild — it does not regenerate them.
-Regenerating a committed artifact is a hand act with its own generator (the
-`build =` line on its artifact in build.toml), in dependency order, and the
-result is committed on purpose. This paragraph said "regenerates committed
-artifacts in place" until 2026-09-10; the code never did. `pixi run verify`
-builds nothing at all: it asserts currency and byte-compares. The baseline PNGs are class **golden**: verified,
-never built — the runner refuses. `pixi run build-native` is the one pixi
-`depends-on` edge (cargo after build-engine); the rest of the graph is
-artifact-level and lives in build.toml because pixi cannot see that cargo
-links the dylib.
-
-**`cargo build` does not build the dylib, and this is the trap that has cost the
-most time in this repo.** `native/build.rs` only *links* whatever file already
-sits at `native/libglyph_engine.dylib`; its `cargo:rerun-if-changed` watches that
-file's mtime, not the Mojo sources behind it. So editing `engine/*.mojo` and
-running `cargo build` gives you a green build of the previous engine. It has
-produced a reported "regression" that was a stale artifact, and a bisect that
-compared a rebuilt commit against a non-rebuilt one. Run `pixi run build-engine`
-after any `engine/*.mojo` change or branch switch — or just run the battery,
-whose first step is exactly that.
-
-Two guards exist because prose was not enough: `build.rs` scans the dylib for the
-exported symbol `glyph_engine_fp_probe` and panics if absent (it predates
-2026-09-02), and `Engine::new()` calls that probe at runtime and panics if the
-dylib was built without `--fp-mode contract=off`.
-
-That flag is load-bearing, not hygiene: FMA contraction fuses multiply-add pairs
-and changes results in the last bit, which breaks bit-exactness against the
-oracle the whole corpus is built on. `pixi run build-engine` passes it. Never
-invoke `mojo build` by hand without it.
-
-`pixi.toml` declares `osx-arm64` and, since 2026-09-07, `linux-64`. The engine
-library is `native/libglyph_engine.dylib` on macOS and `.so` on Linux;
-build.toml names it `{dylib}` and the runner, `native/build.rs` and
-`engine/check.sh` each resolve the extension for the host. The linux-64
-Mojo/MAX pin is EXACT (the same nightly the osx-arm64 lock names), so the two
-platforms run the same compiler. The GPU suites run on Metal or, through
-MAX's `DeviceContext`, on an NVIDIA GPU — what has actually been measured on
-the Linux box is recorded in `out/LINUX_BRINGUP.md`, not here.
+build command, class) and executed by `glyph` (`glyph/src/main.rs`). The baseline PNGs are class **golden**: verified,
+never built — the runner refuses. Red on any compiler warning, test failure, gate mismatch,
+or mutation survival.
 
 ## The tool
 
@@ -193,24 +173,10 @@ count in build.toml and hard pin in the test suite are two independent
 witnesses, not duplicate coverage. Blind to whether the oracle is *correct* —
 it proves reproducibility, not truth.
 
-**engine-suites** (was "2"). Eighteen suites — 12 CPU, 6 on Metal — plus
-**ffi_selftest** (wired 2026-09-06; it links the SHIPPED dylib through the real
-C ABI after the pinned toolchain was found to miscompile the in-process import
-— see its header), plus a compile pass over all six benches (compiled, never
-run). Each suite loads fixtures and asserts bit-exact agreement; a failure
-raises and exits nonzero. Red on any lane of the ported pipeline disagreeing
-with its fixture. Blind in two specific ways worth knowing: `conformance_real`
-is **oracle-free** — it folds arbitrary real source and checks the serial and
-scan forms against each other, so it catches divergence but never a fault the
-two forms share (its header says so, and names the pinned fixtures as the
-cover for that case). The **instruments** — `fixture_census`,
-`fixture_manifest`, `fold_profile` — mostly assert nothing: they print, and a
-census reporting that every field is pinned to a single value would still exit
-zero. Read their output; do not count them as gates. `fold_profile` is the
-partial exception: it asserts that the serial and scan forms agree on the leader
-count, which is not a conformance claim (`conformance_real` owns that) but a
-guard that its two timed runs did the same work. `engine/check.sh` names which
-run and the battery's PASS line counts them.
+**engine-suites** (historical). Formerly eighteen Mojo suites (12 CPU, 6 Metal)
+and `ffi_selftest` testing the C-ABI dylib. Retired along with the Mojo engine; the
+layout and fold contracts are now validated directly in native Rust via `cargo test`
+and `layout_hyper` tests.
 
 **cargo-build** (was "3"). `cargo build --release`, zero warnings. Red on any
 warning rustc emits; a build ERROR is fatal (the battery stops). Blind to

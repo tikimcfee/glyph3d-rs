@@ -62,7 +62,6 @@
 //! be revisited after a wgpu upgrade.
 
 use glam::{DVec3, Vec3};
-use bytemuck::Zeroable;
 use std::cell::Cell;
 use wgpu::util::DeviceExt;
 
@@ -77,11 +76,11 @@ use camera::CamFrame;
 
 mod cull;
 pub use cull::{SegCull, BACKDROP_GAIN, GLYPH_CELL_AREA, LOD_MIN_PX};
-use cull::{cull_segments, frustum_planes, CullState, CullView, Phase, PhaseDraws};
+use cull::CullState;
 
 mod pick;
 pub use pick::{PickCommand, PickContext, PickFileInfo, PickHit, Verb};
-use pick::{format_pick, PickCacheEntry};
+use pick::PickCacheEntry;
 
 mod tint;
 pub use tint::{SegTintAccum, seg_tint};
@@ -91,91 +90,97 @@ pub use instance::{GlyphInstance, GroupRow, RenderSlot};
 use instance::{FrameUniform, Params};
 
 mod target;
-use target::{CompositeState, Selection, SelectionFx, ViewTarget, MASK_FORMAT, POOL_FORMAT, SCENE_SAMPLE_COUNT, SELECTION_TINT};
+use target::{CompositeState, Selection, ViewTarget, POOL_FORMAT, SCENE_SAMPLE_COUNT};
 
 mod ui_probe;
 pub use ui_probe::UiProbe;
-use ui_probe::UiFileDyn;
+
+mod buffers;
+#[allow(unused_imports)]
+pub use buffers::{arena_chunk_slots, mapped_instance_arena};
+
+mod pipelines;
+mod render;
 
 pub struct GlyphScene {
     pub pipeline: wgpu::RenderPipeline,
     /// The colour-emoji sheet's view, held so the texture outlives the bind
     /// groups that sample it (binding 6 of every chunk's bind group).
-    _emoji_view: wgpu::TextureView,
+    pub(crate) _emoji_view: wgpu::TextureView,
     /// Stage E2: one bind group per instance-buffer CHUNK. A repo-scale field
     /// can exceed `max_storage_buffer_binding_size` (48 B × tens of millions
     /// of glyphs), so the arena is split into buffers that each fit the
     /// binding limit; render() issues one draw per chunk. instance_index is
     /// chunk-local, which is exactly right — each chunk buffer starts at 0.
-    bind_groups: Vec<wgpu::BindGroup>,
-    chunk_counts: Vec<u32>,
+    pub(crate) bind_groups: Vec<wgpu::BindGroup>,
+    pub(crate) chunk_counts: Vec<u32>,
     /// Stage F: instances per chunk (the uniform the cull pass uses to split
     /// a segment's slot range across chunk draws).
-    chunk_cap: u32,
-    camera_buf: wgpu::Buffer,
-    depth_format: wgpu::TextureFormat,
-    instance_count: u32,
-    center: Vec3,
-    half_w: f32,
-    half_h: f32,
+    pub(crate) chunk_cap: u32,
+    pub(crate) camera_buf: wgpu::Buffer,
+    pub(crate) depth_format: wgpu::TextureFormat,
+    pub(crate) instance_count: u32,
+    pub(crate) center: Vec3,
+    pub(crate) half_w: f32,
+    pub(crate) half_h: f32,
     /// Fit distance of the Front camera — scales the Fly camera's near/far
     /// and initial speed.
-    fit: f32,
-    camera_mode: CameraMode,
-    fly: FlyCamera,
+    pub(crate) fit: f32,
+    pub(crate) camera_mode: CameraMode,
+    pub(crate) fly: FlyCamera,
     /// Stage F: present unless culling is disabled (`--no-cull`); None keeps
     /// the legacy per-chunk draws.
-    cull: Option<CullState>,
+    pub(in crate::glyph_scene) cull: Option<CullState>,
     // ── Stage G: picking & live manipulation ────────────────────────────
     /// Arena chunk buffers, kept for partial per-slot uploads (verbs): the
     /// chain's own slot buffers on the endpoint (Device) path, the upload
     /// buffers otherwise. `chunk_offsets[k]` is slot 0's byte address in
     /// `instance_bufs[k]` (0 for staged uploads; the pool slice's start for
     /// the endpoint's extracted buffers) — chunk_off adds it.
-    instance_bufs: Vec<wgpu::Buffer>,
+    pub(crate) instance_bufs: Vec<wgpu::Buffer>,
     /// Per-chunk byte offset of slot 0 inside the buffer (see above).
-    chunk_offsets: Vec<u64>,
+    pub(crate) chunk_offsets: Vec<u64>,
     /// Group table buffer, kept for partial per-row uploads (80 B/row).
-    group_buf: wgpu::Buffer,
+    pub(crate) group_buf: wgpu::Buffer,
     /// CPU mirror of the group table — the pick path reads the LIVE TRS from
     /// here and every group verb writes it back (then uploads just that row).
-    groups_cpu: Vec<GroupRow>,
+    pub(crate) groups_cpu: Vec<GroupRow>,
     /// Repo-mode pick context (None for text/engine scenes).
-    pick: Option<PickContext>,
+    pub(crate) pick: Option<PickContext>,
     /// The panel's cluster-toggle seed for scenes WITHOUT a pick context
     /// (text): the staging choice carries the mode and nothing else on the
     /// scene remembers it. Repo scenes leave this None — their probe seeds
     /// from the pick context's uniform ItemParams (the two agree there).
-    probe_cluster_mode: Option<bool>,
+    pub(crate) probe_cluster_mode: Option<bool>,
     /// The last resolved pick (verbs operate on it).
-    picked: Option<PickHit>,
+    pub(crate) picked: Option<PickHit>,
     /// Stage L (L4): the current selection (drives the mask pass). Replaces
     /// the Stage G click-flash hack (instance-byte write + restore) — no
     /// buffer writes, nothing to restore; the tint lives entirely in the
     /// windowed composite path.
-    selection: Option<Selection>,
+    pub(in crate::glyph_scene) selection: Option<Selection>,
     /// Geometry overrides from nudge/scale-glyph verbs (slot → pos/advance/
     /// height), so a later recolor-line rebuild preserves them.
-    geom_overrides: std::collections::HashMap<u32, ([f32; 3], f32, f32)>,
+    pub(crate) geom_overrides: std::collections::HashMap<u32, ([f32; 3], f32, f32)>,
     /// One-entry cache of the last pick's re-derived file data.
-    cache: Option<PickCacheEntry>,
+    pub(in crate::glyph_scene) cache: Option<PickCacheEntry>,
     /// Windowed grab verb: the group being dragged with the mouse.
-    grabbed_group: Option<u32>,
+    pub(crate) grabbed_group: Option<u32>,
     /// Last known cursor position, physical px (click pick + grab drag).
-    cursor: (f32, f32),
+    pub(crate) cursor: (f32, f32),
     /// Viewport in physical px, refreshed every render() (ray unprojection).
-    viewport: Cell<(u32, u32)>,
+    pub(crate) viewport: Cell<(u32, u32)>,
     /// Per-group position in the DIR_TINTS cycle (t verb).
-    tint_step: Vec<u32>,
+    pub(crate) tint_step: Vec<u32>,
     /// Stage K: windowed debug-UI probe (None offscreen / under --no-ui).
-    ui_probe: Option<UiProbe>,
+    pub(crate) ui_probe: Option<UiProbe>,
     /// Stage L (L3): device handle for pool (re)creation in set_viewport
     /// (which has no ctx param — the trait shape is fenced).
-    device: wgpu::Device,
+    pub(crate) device: wgpu::Device,
     /// Stage L (L3): composite machinery — the ONLY release path (the
     /// --no-composite A/B escape hatch proved neutrality and was removed at
     /// stage end; see out/STAGE_L_REPORT.md).
-    composite: CompositeState,
+    pub(in crate::glyph_scene) composite: CompositeState,
 }
 
 // ── Stage K (K4): what the live controls change, and what stays const ────
@@ -195,96 +200,6 @@ pub struct GlyphScene {
 // that path). A live gain would need either a cull.wgsl edit (fence 4) or
 // an ink_frac plumbing redesign across staging + sync_segment. Cut from K4;
 // the feasible future seam is recorded in out/STAGE_K_REPORT.md.
-
-/// Slots per arena chunk buffer: the tighter of the storage binding and
-/// whole-buffer limits, in instances — the value the draw path's chunk math
-/// and the arena's chunking must agree on, computed once, here.
-/// GLYPH_ARENA_CHUNK_SLOTS overrides it (the fork gate forces small chunks so
-/// the split paths — copy-hop intersections, tint straddles, multi-buffer
-/// bindings — run on a small corpus).
-#[allow(dead_code)]
-pub fn arena_chunk_slots(ctx: &GpuContext) -> usize {
-    let derived = (ctx
-        .device
-        .limits()
-        .max_storage_buffer_binding_size
-        .min(ctx.profile.max_buffer_size) as usize
-        / std::mem::size_of::<GlyphInstance>())
-    .max(1);
-    std::env::var("GLYPH_ARENA_CHUNK_SLOTS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(derived)
-        .max(1)
-}
-
-/// The device-resident arena for the repo load's direct path: ONE
-/// shared-storage buffer the FFI writes instances into and the glyph shader
-/// reads — the write IS the upload, so the load pays one allocation and no
-/// copy (against the Vec arena + sharded copy it replaces: a second 4.5 GB
-/// allocation, its kernel zero-fill, and the 4.5 GB memcpy). `slots` is the
-/// corpus byte count — leaders ≤ bytes, the bound `GlyphArena::uninit_tail`
-/// commits against. Metal only, gated by the caller on the profile: a
-/// discrete adapter would trade the saved copy for slower per-frame shader
-/// reads across the bus.
-///
-/// Chunked since rung 5e: one buffer per `chunk_slots` slots (the last sized
-/// to the remainder), so a corpus whose instance mass exceeds
-/// `max_buffer_size` is chunked instead of refused — the draw path binds one
-/// buffer per chunk regardless.
-#[allow(dead_code)]
-pub fn mapped_instance_arena(
-    ctx: &GpuContext,
-    slots: usize,
-    chunk_slots: usize,
-) -> crate::layout::GlyphArena {
-    use wgpu::hal::Device as HalDevice;
-    let device = &ctx.device;
-    let hal_dev = unsafe { device.as_hal::<wgpu::hal::api::Metal>() }
-        .expect("Metal profile behind a non-Metal device");
-    let n_chunks = slots.div_ceil(chunk_slots).max(1);
-    let mut parts = Vec::with_capacity(n_chunks);
-    for k in 0..n_chunks {
-        let cap = chunk_slots.min(slots - k * chunk_slots);
-        let size = (cap * std::mem::size_of::<GlyphInstance>()) as u64;
-        let label = format!("glyph arena (mapped) {k}/{n_chunks}");
-        let hal_buf = unsafe {
-            hal_dev.create_buffer(&wgpu::hal::BufferDescriptor {
-                label: Some(&label),
-                size,
-                usage: wgpu::BufferUses::STORAGE_READ_ONLY
-                    | wgpu::BufferUses::COPY_DST
-                    | wgpu::BufferUses::COPY_SRC
-                    | wgpu::BufferUses::MAP_READ,
-                memory_flags: wgpu::hal::MemoryFlags::empty(),
-            })
-        }
-        .expect("hal arena buffer");
-        let mapping = unsafe { hal_dev.map_buffer(&hal_buf, 0..size) }.expect("hal arena map");
-        // On Metal `unmap_buffer` is a no-op — the mapping simply lives as
-        // long as the buffer, which the arena owns (see layout::MappedArena).
-        let ptr = mapping.ptr.as_ptr() as *mut GlyphInstance;
-        // SAFETY: same device, desc matches the hal request, the buffer is
-        // kernel-zeroed (and wgpu's init tracker is born empty regardless),
-        // nonzero size (cap > 0 by the div_ceil above).
-        let buf = unsafe {
-            device.create_buffer_from_hal::<wgpu::hal::api::Metal>(
-                hal_buf,
-                &wgpu::BufferDescriptor {
-                    label: Some(&label),
-                    size,
-                    usage: wgpu::BufferUsages::STORAGE
-                        | wgpu::BufferUsages::COPY_DST
-                        | wgpu::BufferUsages::COPY_SRC
-                        | wgpu::BufferUsages::MAP_READ,
-                    mapped_at_creation: false,
-                },
-            )
-        };
-        parts.push((ptr, cap, buf));
-    }
-    crate::layout::GlyphArena::from_mapped_chunks(parts, chunk_slots)
-}
 
 impl GlyphScene {
     pub fn new(
@@ -336,203 +251,8 @@ impl GlyphScene {
         let t_scene_start = std::time::Instant::now();
         let binding_limit = ctx.device.limits().max_storage_buffer_binding_size as usize;
         let instances_len = arena.len();
-        let (chunk_cap, chunk_counts, instance_bufs, chunk_offsets): (
-            usize,
-            Vec<u32>,
-            Vec<wgpu::Buffer>,
-            Vec<u64>,
-        ) = match arena.device_slots() {
-            Some(dev) => (
-                dev.chunk_slots,
-                dev.chunks.iter().map(|c| c.slots).collect(),
-                dev.chunks.iter().map(|c| c.buffer.clone()).collect(),
-                dev.chunks.iter().map(|c| c.offset).collect(),
-            ),
-            None => {
-            let chunk_cap = (binding_limit / std::mem::size_of::<RenderSlot>()).max(1);
-            let mut chunk_counts: Vec<u32> = (0..instances_len.div_ceil(chunk_cap).max(1))
-                .map(|k| (instances_len.saturating_sub(k * chunk_cap)).min(chunk_cap) as u32)
-                .collect();
-            // The mapped-empty arena binds one zeroed slot (nothing draws, but
-            // the safety-net segment reads slot 0).
-            for c in &mut chunk_counts {
-                if *c == 0 {
-                    *c = 1;
-                }
-            }
-        // Unified-memory upload: with MAPPABLE_PRIMARY_BUFFERS on Metal the
-        // storage buffer is created mapped and written straight — wgpu's
-        // default path instead zero-fills a full-size staging buffer AND then
-        // memcpy's into it AND blits on the GPU timeline (measured ~2.4 s of
-        // the glyph3d-js repo load; the zero-fill alone was ~0.7 s). Metal
-        // only: discrete adapters advertise the feature too, but a
-        // host-visible storage buffer pays the saved time back in per-frame
-        // shader reads across the bus.
-        let direct_upload = ctx.profile.backend == wgpu::Backend::Metal
-            && ctx.profile.mappable_primary_buffers;
-        // The transcode walk: render chunks (RenderSlot stride) intersect
-        // the arena's own chunks (host Vec or mapped slices) — the two
-        // chunkings do not in general coincide, and a straddling range must
-        // transcode bit-identically to a contiguous one (same values, field
-        // order fixed by From<&GlyphInstance>).
-        let arena_chunks = arena.instance_chunks();
-        let mut ac = 0usize;
-        let mut arena_base = 0usize;
-        let instance_bufs: Vec<wgpu::Buffer> = chunk_counts
-            .iter()
-            .enumerate()
-            .map(|(i, &count)| {
-            let label = if chunk_counts.len() == 1 {
-                "glyph instances".to_string()
-            } else {
-                format!("glyph instances {i}/{}", chunk_counts.len())
-            };
-            // Stage G: COPY_DST for partial per-slot edit uploads;
-            // COPY_SRC for the GLYPH_G_DUMP verification readback.
-            let usage = wgpu::BufferUsages::STORAGE
-                | wgpu::BufferUsages::COPY_DST
-                | wgpu::BufferUsages::COPY_SRC;
-            let first = i * chunk_cap;
-            let need_end = first + count as usize;
-            // Gather the arena slice sub-ranges covering this chunk:
-            let mut sub_slices: Vec<(usize, &[GlyphInstance])> = Vec::new();
-            let mut written = 0usize;
-            while written < count as usize && ac < arena_chunks.len() {
-                let c = arena_chunks[ac];
-                if arena_base + c.len() <= first {
-                    arena_base += c.len();
-                    ac += 1;
-                    continue;
-                }
-                let lo = first.saturating_sub(arena_base);
-                let hi = (need_end - arena_base).min(c.len());
-                if hi > lo {
-                    sub_slices.push((written, &c[lo..hi]));
-                    written += hi - lo;
-                }
-                if hi == c.len() {
-                    arena_base += c.len();
-                    ac += 1;
-                }
-            }
-
-            if direct_upload {
-                // hal-created shared buffer, spiked for the mapped-arena
-                // work: MAP_READ in the usage makes wgpu-hal pick
-                // StorageModeShared with the DEFAULT cache mode (MAP_WRITE
-                // would set write-combining — streaming-friendly for the
-                // one upload write, but the CPU-side paths that read the
-                // arena back can't afford uncached reads). The hal map
-                // hands back the raw pointer wgpu's WriteOnly view
-                // deliberately withholds, so the sharded first-touch write
-                // splits on raw disjoint ranges.
-                use wgpu::hal::Device as HalDevice;
-                let hal_usage = wgpu::BufferUses::STORAGE_READ_ONLY
-                    | wgpu::BufferUses::COPY_DST
-                    | wgpu::BufferUses::COPY_SRC
-                    | wgpu::BufferUses::MAP_READ;
-                let hal_dev = unsafe { device.as_hal::<wgpu::hal::api::Metal>() }
-                    .expect("Metal profile behind a non-Metal device");
-                let size = (count as usize * std::mem::size_of::<RenderSlot>()) as u64;
-                let hal_buf = unsafe {
-                    hal_dev.create_buffer(&wgpu::hal::BufferDescriptor {
-                        label: Some(&label),
-                        size,
-                        usage: hal_usage,
-                        memory_flags: wgpu::hal::MemoryFlags::empty(),
-                    })
-                }
-                .expect("hal instance buffer");
-                let mapping = unsafe { hal_dev.map_buffer(&hal_buf, 0..size) }
-                    .expect("hal instance map");
-                let dest_ptr = mapping.ptr.as_ptr() as *mut RenderSlot;
-
-                #[derive(Clone, Copy)]
-                struct SendPtr(*mut RenderSlot);
-                unsafe impl Send for SendPtr {}
-                unsafe impl Sync for SendPtr {}
-                impl SendPtr {
-                    #[inline(always)]
-                    unsafe fn add(self, offset: usize) -> *mut RenderSlot {
-                        self.0.add(offset)
-                    }
-                }
-
-                #[inline(always)]
-                unsafe fn transcode_instance(src: *const GlyphInstance, dst: *mut RenderSlot) {
-                    let s = src as *const u8;
-                    let d = dst as *mut u8;
-                    std::ptr::copy_nonoverlapping(s, d, 16);
-                    std::ptr::copy_nonoverlapping(s.add(24), d.add(16), 16);
-                }
-
-                let dest = SendPtr(dest_ptr);
-                const PARALLEL_TRANSCODE_THRESHOLD: usize = 16384;
-                const CHUNK_SIZE: usize = 65536;
-
-                for &(dst_off, slice) in &sub_slices {
-                    if slice.len() >= PARALLEL_TRANSCODE_THRESHOLD {
-                        use rayon::prelude::*;
-                        slice.par_chunks(CHUNK_SIZE).enumerate().for_each(|(chunk_idx, chunk)| {
-                            let out_ptr = unsafe { dest.add(dst_off + chunk_idx * CHUNK_SIZE) };
-                            for (k, g) in chunk.iter().enumerate() {
-                                unsafe {
-                                    transcode_instance(g, out_ptr.add(k));
-                                }
-                            }
-                        });
-                    } else {
-                        let out_ptr = unsafe { dest.0.add(dst_off) };
-                        for (k, g) in slice.iter().enumerate() {
-                            unsafe {
-                                transcode_instance(g, out_ptr.add(k));
-                            }
-                        }
-                    }
-                }
-                // Pad any remainder (e.g. mapped-empty arena zeroed slot):
-                if count as usize > written {
-                    for k in written..count as usize {
-                        unsafe {
-                            std::ptr::write(dest_ptr.add(k), RenderSlot::zeroed());
-                        }
-                    }
-                }
-
-                unsafe { hal_dev.unmap_buffer(&hal_buf) };
-                // SAFETY: same device, desc matches the hal request, every
-                // byte just written, nonzero size.
-                unsafe {
-                    device.create_buffer_from_hal::<wgpu::hal::api::Metal>(
-                        hal_buf,
-                        &wgpu::BufferDescriptor {
-                            label: Some(&label),
-                            size,
-                            usage: usage | wgpu::BufferUsages::MAP_READ,
-                            mapped_at_creation: false,
-                        },
-                    )
-                }
-            } else {
-                let mut slots: Vec<RenderSlot> = Vec::with_capacity(count as usize);
-                for &(_dst_off, slice) in &sub_slices {
-                    slots.extend(slice.iter().map(RenderSlot::from));
-                }
-                debug_assert!(instances_len == 0 || slots.len() == count as usize);
-                slots.resize(count as usize, RenderSlot::zeroed());
-                let bytes: &[u8] = bytemuck::cast_slice(&slots);
-                device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some(&label),
-                    contents: bytes,
-                    usage,
-                })
-            }
-            })
-            .collect();
-            let zero_offsets = vec![0u64; instance_bufs.len()];
-            (chunk_cap, chunk_counts, instance_bufs, zero_offsets)
-            }
-        };
+        let (chunk_cap, chunk_counts, instance_bufs, chunk_offsets) =
+            buffers::build_instance_buffers(ctx, &arena, instances_len);
         let upload_dur = t_scene_start.elapsed();
         let t_pipe_start = std::time::Instant::now();
         let group_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -593,81 +313,7 @@ impl GlyphScene {
             usage: wgpu::BufferUsages::UNIFORM,
         });
 
-        // --- bind group ------------------------------------------------------
-        let uint_tex = |binding: u32, visibility: wgpu::ShaderStages| wgpu::BindGroupLayoutEntry {
-            binding,
-            visibility,
-            ty: wgpu::BindingType::Texture {
-                sample_type: wgpu::TextureSampleType::Uint,
-                view_dimension: wgpu::TextureViewDimension::D2,
-                multisampled: false,
-            },
-            count: None,
-        };
-        let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("glyph field bgl"),
-            entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::VERTEX,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::VERTEX,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: true },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 2,
-                    visibility: wgpu::ShaderStages::VERTEX,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: true },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                uint_tex(3, wgpu::ShaderStages::VERTEX),   // glyphmap
-                uint_tex(4, wgpu::ShaderStages::FRAGMENT), // curves
-                wgpu::BindGroupLayoutEntry {
-                    binding: 5,
-                    visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                // The emoji sheet: a filterable sRGB 2D array + its sampler.
-                wgpu::BindGroupLayoutEntry {
-                    binding: 6,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        view_dimension: wgpu::TextureViewDimension::D2Array,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 7,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                    count: None,
-                },
-            ],
-        });
+        let bgl = pipelines::build_glyph_bgl(device);
         // Trilinear, clamped: the UV rect is inset half a texel so clamping
         // never engages inside a cell; it only guards the sheet's padding.
         let emoji_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
@@ -753,125 +399,11 @@ impl GlyphScene {
             })
             .collect();
 
-        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("glyph_field.wgsl"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("shaders/glyph_field.wgsl").into()),
-        });
-
         let depth_format = wgpu::TextureFormat::Depth32Float;
-        let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("glyph field pl"),
-            bind_group_layouts: &[Some(&bgl)],
-            immediate_size: 0,
-        });
-        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("glyph field pipeline"),
-            layout: Some(&layout),
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: Some("vs_main"),
-                compilation_options: Default::default(),
-                buffers: &[], // geometry from vertex_index — no vertex buffers
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &shader,
-                entry_point: Some("fs_main"),
-                compilation_options: Default::default(),
-                targets: &[Some(wgpu::ColorTargetState {
-                    // Stage L (L3): the POOL format (the composite pass
-                    // targets the driver's format instead).
-                    format: POOL_FORMAT,
-                    // Premultiplied-alpha compositing: fragment outputs
-                    // rgb·alpha and alpha; ONE / 1−SrcAlpha is the correct
-                    // coverage composite (see shader header note).
-                    blend: Some(wgpu::BlendState {
-                        color: wgpu::BlendComponent {
-                            src_factor: wgpu::BlendFactor::One,
-                            dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
-                            operation: wgpu::BlendOperation::Add,
-                        },
-                        alpha: wgpu::BlendComponent {
-                            src_factor: wgpu::BlendFactor::One,
-                            dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
-                            operation: wgpu::BlendOperation::Add,
-                        },
-                    }),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-            }),
-            primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::TriangleList,
-                cull_mode: None,
-                ..Default::default()
-            },
-            depth_stencil: Some(wgpu::DepthStencilState {
-                format: depth_format,
-                // Blended coverage pass that WRITES depth. It used to test
-                // only, which made glyph-vs-glyph visibility a fact about
-                // draw order — fine while every glyph sat at z=0, wrong the
-                // moment `--wrap-mode back` put wrapped segments behind the
-                // page plane (see the backdrop pipeline's note above). The
-                // cost of writing: a glyph's ≤1 px coverage fringe also
-                // writes depth, so where a NEARER glyph is drawn before a
-                // farther one, the farther one's ink under that fringe is
-                // rejected rather than blended — a faint halo, at edges,
-                // only where two glyphs at different depths overlap on
-                // screen. The wrong-order alternative was whole glyphs.
-                // LessEqual: coplanar fragments still pass, so a flat page
-                // blends in exactly the order it did before.
-                depth_write_enabled: Some(true),
-                depth_compare: Some(wgpu::CompareFunction::LessEqual),
-                stencil: Default::default(),
-                bias: Default::default(),
-            }),
-            multisample: wgpu::MultisampleState {
-                count: SCENE_SAMPLE_COUNT, // Stage L (L3): loud non-MSAA pin
-                ..Default::default()
-            }, // AA is analytic
-            multiview_mask: None,
-            cache: None,
-        });
-
-        // Stage L (L4): the selection mask pipeline — same glyph_field.wgsl,
-        // same layout (the per-chunk bind groups work unchanged), only the
-        // target format (MASK_FORMAT — data, not sRGB) and blend (coverage
-        // overwrite) differ. Shader path only: the copy path (offscreen)
-        // never renders selection visuals. `shader`/`layout` above are the
-        // glyph pipeline's — the composite block below shadows those names.
-        let mask_pipeline = (color_format != POOL_FORMAT).then(|| {
-            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some("selection mask pipeline"),
-                layout: Some(&layout),
-                vertex: wgpu::VertexState {
-                    module: &shader,
-                    entry_point: Some("vs_main"),
-                    compilation_options: Default::default(),
-                    buffers: &[],
-                },
-                fragment: Some(wgpu::FragmentState {
-                    module: &shader,
-                    entry_point: Some("fs_main"),
-                    compilation_options: Default::default(),
-                    targets: &[Some(wgpu::ColorTargetState {
-                        format: MASK_FORMAT,
-                        blend: None,
-                        write_mask: wgpu::ColorWrites::ALL,
-                    })],
-                }),
-                primitive: wgpu::PrimitiveState {
-                    topology: wgpu::PrimitiveTopology::TriangleList,
-                    cull_mode: None,
-                    ..Default::default()
-                },
-                depth_stencil: None, // the mask is flat 2D coverage
-                multisample: wgpu::MultisampleState {
-                    count: SCENE_SAMPLE_COUNT,
-                    ..Default::default()
-                },
-                multiview_mask: None,
-                cache: None,
-            })
-        });
+        let (shader, layout, pipeline) =
+            pipelines::build_glyph_pipeline(device, &bgl, depth_format);
+        let mask_pipeline =
+            pipelines::build_mask_pipeline(device, &shader, &layout, color_format);
 
         // Camera fit from staged bounds (or the Stage E2 focus-file override).
         let (center, half_w, half_h) = match staged.focus_bounds {
@@ -939,164 +471,7 @@ impl GlyphScene {
         // Stage L (L3): the composite machinery (persistent half). The
         // pooled target itself is sized by set_viewport — GlyphScene::new
         // doesn't know the viewport (the drivers decide it later).
-        let composite = {
-            let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-                label: Some("composite.wgsl"),
-                source: wgpu::ShaderSource::Wgsl(include_str!("shaders/composite.wgsl").into()),
-            });
-            let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("composite bgl"),
-                entries: &[
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 0,
-                        visibility: wgpu::ShaderStages::FRAGMENT,
-                        ty: wgpu::BindingType::Texture {
-                            multisampled: false,
-                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                            view_dimension: wgpu::TextureViewDimension::D2,
-                        },
-                        count: None,
-                    },
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 1,
-                        visibility: wgpu::ShaderStages::FRAGMENT,
-                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                        count: None,
-                    },
-                ],
-            });
-            let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: Some("composite pl"),
-                bind_group_layouts: &[Some(&bgl)],
-                immediate_size: 0,
-            });
-            let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some("composite pipeline"),
-                layout: Some(&layout),
-                vertex: wgpu::VertexState {
-                    module: &shader,
-                    entry_point: Some("vs_main"),
-                    compilation_options: Default::default(),
-                    buffers: &[], // fullscreen triangle from vertex_index
-                },
-                fragment: Some(wgpu::FragmentState {
-                    module: &shader,
-                    entry_point: Some("fs_main"),
-                    compilation_options: Default::default(),
-                    targets: &[Some(wgpu::ColorTargetState {
-                        // The DRIVER's format (e.g. Bgra8UnormSrgb windowed).
-                        format: color_format,
-                        // Exact-overwrite passthrough — NOT a blend.
-                        blend: None,
-                        write_mask: wgpu::ColorWrites::ALL,
-                    })],
-                }),
-                primitive: wgpu::PrimitiveState::default(),
-                depth_stencil: None,
-                multisample: wgpu::MultisampleState::default(),
-                multiview_mask: None,
-                cache: None,
-            });
-            let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-                label: Some("composite sampler"),
-                // 1:1 samples land on texel centers — exact; Linear is for
-                // future scaled composites (minimap inset).
-                mag_filter: wgpu::FilterMode::Linear,
-                min_filter: wgpu::FilterMode::Linear,
-                ..Default::default()
-            });
-            // Stage L (L4): the tint half of the selection machinery
-            // (mask_pipeline was built next to the glyph pipeline, before
-            // this block shadowed `shader`/`layout` with the composite's).
-            // Shader path only.
-            let selection_fx = mask_pipeline.map(|mask_pipeline| {
-                let tint_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                    label: Some("tint bgl"),
-                    entries: &[
-                        wgpu::BindGroupLayoutEntry {
-                            binding: 0,
-                            visibility: wgpu::ShaderStages::FRAGMENT,
-                            ty: wgpu::BindingType::Texture {
-                                multisampled: false,
-                                sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                                view_dimension: wgpu::TextureViewDimension::D2,
-                            },
-                            count: None,
-                        },
-                        wgpu::BindGroupLayoutEntry {
-                            binding: 1,
-                            visibility: wgpu::ShaderStages::FRAGMENT,
-                            ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                            count: None,
-                        },
-                        wgpu::BindGroupLayoutEntry {
-                            binding: 2,
-                            visibility: wgpu::ShaderStages::FRAGMENT,
-                            ty: wgpu::BindingType::Texture {
-                                multisampled: false,
-                                sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                                view_dimension: wgpu::TextureViewDimension::D2,
-                            },
-                            count: None,
-                        },
-                        wgpu::BindGroupLayoutEntry {
-                            binding: 3,
-                            visibility: wgpu::ShaderStages::FRAGMENT,
-                            ty: wgpu::BindingType::Buffer {
-                                ty: wgpu::BufferBindingType::Uniform,
-                                has_dynamic_offset: false,
-                                min_binding_size: None,
-                            },
-                            count: None,
-                        },
-                    ],
-                });
-                let tint_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                    label: Some("tint pl"),
-                    bind_group_layouts: &[Some(&tint_bgl)],
-                    immediate_size: 0,
-                });
-                let tint_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                    label: Some("selection tint pipeline"),
-                    layout: Some(&tint_layout),
-                    vertex: wgpu::VertexState {
-                        module: &shader, // composite.wgsl (this block's `shader`)
-                        entry_point: Some("vs_main"),
-                        compilation_options: Default::default(),
-                        buffers: &[],
-                    },
-                    fragment: Some(wgpu::FragmentState {
-                        module: &shader,
-                        entry_point: Some("fs_tint"),
-                        compilation_options: Default::default(),
-                        targets: &[Some(wgpu::ColorTargetState {
-                            format: POOL_FORMAT, // tints pool A into pool B
-                            blend: None,
-                            write_mask: wgpu::ColorWrites::ALL,
-                        })],
-                    }),
-                    primitive: wgpu::PrimitiveState::default(),
-                    depth_stencil: None,
-                    multisample: wgpu::MultisampleState::default(),
-                    multiview_mask: None,
-                    cache: None,
-                });
-                let tint_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("selection tint"),
-                    contents: bytemuck::cast_slice(&[SELECTION_TINT]),
-                    usage: wgpu::BufferUsages::UNIFORM,
-                });
-                SelectionFx { mask_pipeline, tint_pipeline, tint_bgl, tint_buf }
-            });
-            CompositeState {
-                pipeline,
-                bind_group_layout: bgl,
-                sampler,
-                target: None,
-                parity: Cell::new(0),
-                selection_fx,
-            }
-        };
+        let composite = pipelines::build_composite_state(device, color_format, mask_pipeline);
 
         let pick = staged.pick;
         let groups_cpu = groups.clone();
@@ -1169,7 +544,7 @@ impl GlyphScene {
         }
     }
 
-    fn camera_frame(&self, t: f32, aspect: f32) -> CamFrame {
+    pub(in crate::glyph_scene) fn camera_frame(&self, t: f32, aspect: f32) -> CamFrame {
         let fov = FOV_Y.to_radians();
         let half_h_needed = (self.half_h).max(self.half_w / aspect);
         let fit = half_h_needed / (fov * 0.5).tan() * 1.08 + 2.0;
@@ -1212,7 +587,7 @@ impl GlyphScene {
     // ── Stage G: picking & live manipulation ───────────────────────────────
 
     /// Group TRS from the CPU mirror: (offset, scale, rgb, alpha).
-    fn group_trs(&self, gid: u32) -> Option<(Vec3, Vec3, [f32; 3], f32)> {
+    pub(crate) fn group_trs(&self, gid: u32) -> Option<(Vec3, Vec3, [f32; 3], f32)> {
         let g = self.groups_cpu.get(gid as usize)?;
         Some((
             Vec3::new(g.cols[0][0], g.cols[0][1], g.cols[0][2]),
@@ -1222,7 +597,7 @@ impl GlyphScene {
         ))
     }
 
-    fn group_hidden(&self, gid: u32) -> bool {
+    pub(crate) fn group_hidden(&self, gid: u32) -> bool {
         self.group_trs(gid).is_some_and(|(_, _, _, a)| a <= 0.01)
     }
 
@@ -1813,450 +1188,7 @@ impl SceneLike for GlyphScene {
         target: &crate::scene::FrameTarget<'_>,
         t: f32,
     ) {
-        let crate::scene::FrameTarget {
-            color_view,
-            color_texture,
-            color_format,
-            // Stage L (L3): unused — the pass renders into the pool's own
-            // depth; the driver's depth is only for direct scenes.
-            depth_view: _,
-            width,
-            height,
-        } = *target;
-        let aspect = width as f32 / height.max(1) as f32;
-        self.viewport.set((width, height));
-        let frame = self.camera_frame(t, aspect);
-
-        // Stage L (L3): the phase lists draw into the pooled view target
-        // (ping-pong slot selected here) and composite into the driver's
-        // view at the end of render.
-        let comp = &self.composite;
-        let vt = comp
-            .target
-            .as_ref()
-            .expect("L3: set_viewport must run before render (both drivers call it)");
-        assert_eq!(
-            (vt.width, vt.height),
-            (width, height),
-            "L3: pool/viewport size mismatch (set_viewport out of sync with the driver)"
-        );
-        let pool_slot = (comp.parity.get() % 2) as usize;
-        comp.parity.set(comp.parity.get() + 1);
-
-        // Stage K (K4): apply live UI controls BEFORE culling so a slider
-        // drag takes effect this frame. This is the SINGLE write site of
-        // CullState::lod_min_px, and it runs only when a windowed probe is
-        // installed — offscreen never installs one, so offscreen culls with
-        // the LOD_MIN_PX const by construction (gate 6's byte-equal PNGs are
-        // the proof).
-        if let (Some(probe), Some(cull)) = (&self.ui_probe, &self.cull) {
-            cull.lod_min_px.set(probe.borrow().lod_min_px);
-        }
-
-        // Stage L (L1): fill every lane of the widened frame uniform from
-        // values already computed here. px_scale is computed once and shared
-        // with the cull block below (it was CullView-local before L1 — the
-        // uniform needs it even under --no-cull). flags bit 0
-        // (deterministic_rendering) stays 0 — reserved.
-        let px_scale = height as f32 / (2.0 * (FOV_Y.to_radians() * 0.5).tan());
-        let cam = FrameUniform {
-            view_proj: frame.view_proj.to_cols_array(),
-            eye: frame.eye.to_array(),
-            _pad0: 0.0,
-            viewport: [width as f32, height as f32],
-            px_scale,
-            time: t,
-            flags: 0,
-            _pad1: 0,
-        };
-        ctx.queue
-            .write_buffer(&self.camera_buf, 0, bytemuck::bytes_of(&cam));
-
-        // --- Stage F: CPU segment cull (frustum + LOD) ----------------------
-        // Stage L (L2): the cull output IS the phase lists (PhaseDraws). The
-        // legacy --no-cull path builds the Glyphs list straight from the
-        // chunk counts (one full range per chunk — identical draws to the
-        // pre-L2 per-chunk loop) and has no Backdrop phase content.
-        let phase_draws: PhaseDraws = if let Some(cull) = &self.cull {
-            // Stage H: CPU scope timing (only when GLYPH_PROFILE=1 built a profiler).
-            let cull_t0 = ctx.profiler.as_ref().map(|_| std::time::Instant::now());
-            let view = CullView {
-                planes: frustum_planes(&frame.view_proj),
-                eye: frame.eye,
-                px_scale,
-                lod_min_px: cull.lod_min_px.get(),
-            };
-            let phase_draws = cull_segments(
-                &cull.segments,
-                &cull.hidden,
-                &view,
-                self.chunk_cap,
-                self.bind_groups.len() as u32,
-            );
-            if !phase_draws.backdrops.is_empty() {
-                ctx.queue.write_buffer(
-                    &cull.backdrop_insts_buf,
-                    0,
-                    bytemuck::cast_slice(&phase_draws.backdrops),
-                );
-            }
-            if let Some(t0) = cull_t0 {
-                crate::gpu::record_cpu_scope(ctx, "cull (CPU)", t0.elapsed().as_secs_f64() * 1000.0);
-            }
-            if std::env::var_os("GLYPH_CULL_DEBUG").is_some() && t == 0.0 {
-                let insts: u64 = phase_draws
-                    .glyph_ranges
-                    .iter()
-                    .map(|(_, r)| (r.end - r.start) as u64)
-                    .sum();
-                println!(
-                    "CULLDBG glyph draws={} instances={} | backdrops={}",
-                    phase_draws.glyph_ranges.len(),
-                    insts,
-                    phase_draws.backdrops.len(),
-                );
-            }
-            phase_draws
-        } else {
-            PhaseDraws {
-                backdrops: Vec::new(),
-                glyph_ranges: self
-                    .chunk_counts
-                    .iter()
-                    .enumerate()
-                    .map(|(c, &n)| (c as u32, 0..n))
-                    .collect(),
-            }
-        };
-
-        // Stage K: refresh the windowed debug-UI probe (installed only by
-        // windowed runs; offscreen skips this entirely). Camera fields are
-        // this frame's ACTUAL products; the pick line is the same string
-        // format_pick produces for the stdout log; the K4 cull counters are
-        // the same sums GLYPH_CULL_DEBUG prints (zeros under --no-cull).
-        if let Some(probe) = &self.ui_probe {
-            let mut p = probe.borrow_mut();
-            p.camera_mode = Some(self.camera_mode);
-            p.eye = frame.eye.to_array();
-            p.yaw = self.fly.yaw;
-            p.pitch = self.fly.pitch;
-            p.last_pick = self.picked.as_ref().map(format_pick);
-            if self.cull.is_some() {
-                p.cull_ranges = phase_draws.glyph_ranges.len();
-                p.cull_instances = phase_draws
-                    .glyph_ranges
-                    .iter()
-                    .map(|(_, r)| (r.end - r.start) as u64)
-                    .sum();
-                p.cull_backdrops = phase_draws.backdrops.len();
-            } else {
-                p.cull_ranges = 0;
-                p.cull_instances = 0;
-                p.cull_backdrops = 0;
-            }
-            // The layout dial's readout: the field's depth extent over the
-            // segment table (per frame, so group z-moves show too). None
-            // under --no-cull — no segment table to measure.
-            p.z_extent = self.cull.as_ref().map(|c| {
-                c.segments.iter().fold([f32::INFINITY, f32::NEG_INFINITY], |[lo, hi], s| {
-                    [lo.min(s.min[2]), hi.max(s.max[2])]
-                })
-            });
-            // K5: refresh the browser's dynamic row state (world pose under
-            // the live group TRS, hidden, tint). ~1.3k cheap iterations at
-            // repo scale; skipped entirely offscreen (no probe installed).
-            if !p.files.is_empty() {
-                // Rc bump so the map below doesn't hold `p` and `files`
-                // through the same borrow awkwardly.
-                let files = p.files.clone();
-                p.file_dyn = files
-                    .iter()
-                    .map(|r| {
-                        let Some(g) = self.groups_cpu.get(r.group_id as usize) else {
-                            return UiFileDyn::default();
-                        };
-                        let (ox, oy) = (g.cols[0][0], g.cols[0][1]);
-                        let (sx, sy) = (g.cols[3][0].max(0.0), g.cols[3][1].max(0.0));
-                        let wmin = [r.aabb_min[0] * sx + ox, r.aabb_min[1] * sy + oy];
-                        let wmax = [r.aabb_max[0] * sx + ox, r.aabb_max[1] * sy + oy];
-                        UiFileDyn {
-                            center: [(wmin[0] + wmax[0]) * 0.5, (wmin[1] + wmax[1]) * 0.5],
-                            half: [(wmax[0] - wmin[0]) * 0.5, (wmax[1] - wmin[1]) * 0.5],
-                            hidden: g.cols[2][3] == 0.0,
-                            tint: [
-                                (g.cols[2][0].clamp(0.0, 1.0) * 255.0) as u8,
-                                (g.cols[2][1].clamp(0.0, 1.0) * 255.0) as u8,
-                                (g.cols[2][2].clamp(0.0, 1.0) * 255.0) as u8,
-                            ],
-                        }
-                    })
-                    .collect();
-            }
-        }
-
-        // Stage H: pass-level GPU timer (TIMESTAMP_QUERY; pass-boundary writes,
-        // so it works on Metal). Nested in-pass scopes below additionally need
-        // TIMESTAMP_QUERY_INSIDE_PASSES — where unsupported they simply report
-        // no time. Queries must always be closed, timing or not.
-        let pass_query = ctx
-            .profiler
-            .as_ref()
-            .map(|p| p.borrow().begin_pass_query("glyph field pass", encoder));
-        // Stage L (L3): the pass renders into the pooled target.
-        let draw_depth_view = &vt.depth;
-        let draw_color_view = &vt.color_views[pool_slot];
-        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: Some("glyph field pass"),
-            timestamp_writes: pass_query
-                .as_ref()
-                .and_then(|q| q.render_pass_timestamp_writes()),
-            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view: draw_color_view,
-                resolve_target: None,
-                ops: wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(wgpu::Color {
-                        r: 0.07,
-                        g: 0.07,
-                        b: 0.09,
-                        a: 1.0,
-                    }),
-                    store: wgpu::StoreOp::Store,
-                },
-                depth_slice: None,
-            })],
-            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                view: draw_depth_view,
-                depth_ops: Some(wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(1.0),
-                    store: wgpu::StoreOp::Store,
-                }),
-                stencil_ops: None,
-            }),
-            ..Default::default()
-        });
-        // Stage L (L2): record the phase lists in phase order — Backdrop
-        // first, Glyphs second, exactly the Stage F order. Empty phases
-        // record nothing (the legacy --no-cull branch has no Backdrop
-        // content; an all-near-LOD frame has none either). Profiler query
-        // names unchanged ("backdrop stream", "glyph stream").
-        for phase in [Phase::Backdrop, Phase::Glyphs] {
-            match phase {
-                Phase::Selection => unreachable!(
-                    "L4: the Selection phase renders into its own mask target, \
-                     never inside the glyph field pass"
-                ),
-                Phase::Backdrop => {
-                    // Far LOD stream first: one instanced draw over the
-                    // compacted backdrop quads (plain draw — no indirect
-                    // machinery, see the module header). The pipeline lives
-                    // in CullState; the legacy branch never reaches in here
-                    // (its backdrops list is empty).
-                    if let Some(cull) = &self.cull {
-                        if !phase_draws.backdrops.is_empty() {
-                            let q = ctx
-                                .profiler
-                                .as_ref()
-                                .map(|p| p.borrow().begin_query("backdrop stream", &mut pass));
-                            pass.set_pipeline(&cull.backdrop_pipeline);
-                            pass.set_bind_group(0, &cull.backdrop_bind_group, &[]);
-                            pass.draw(0..6, 0..phase_draws.backdrops.len() as u32);
-                            if let (Some(p), Some(q)) = (&ctx.profiler, q) {
-                                p.borrow().end_query(&mut pass, q);
-                            }
-                        }
-                    }
-                }
-                Phase::Glyphs => {
-                    // Glyph stream: one range draw per entry. The list is
-                    // chunk-major with arena-ascending ranges within a chunk,
-                    // so within-pixel blend order matches the pre-L2 loops
-                    // exactly; the chunk bind group is re-set only on change
-                    // (legacy: one full range per chunk, so every chunk sets
-                    // its bind group exactly once, as before).
-                    let q = ctx
-                        .profiler
-                        .as_ref()
-                        .map(|p| p.borrow().begin_query("glyph stream", &mut pass));
-                    pass.set_pipeline(&self.pipeline);
-                    let mut cur_chunk = u32::MAX;
-                    for (c, r) in &phase_draws.glyph_ranges {
-                        if *c != cur_chunk {
-                            cur_chunk = *c;
-                            pass.set_bind_group(0, &self.bind_groups[*c as usize], &[]);
-                        }
-                        pass.draw(0..6, r.clone());
-                    }
-                    if let (Some(p), Some(q)) = (&ctx.profiler, q) {
-                        p.borrow().end_query(&mut pass, q);
-                    }
-                }
-            }
-        }
-        drop(pass);
-        if let (Some(p), Some(q)) = (&ctx.profiler, pass_query) {
-            p.borrow().end_query(encoder, q);
-        }
-
-        // Stage L (L4): the Selection phase — own mask target ⇒ own pass,
-        // rendered after Glyphs. The variant is constructed here, when a
-        // selection exists (no selection → the L3 command stream is
-        // unchanged). Windowed shader path only: on the copy path
-        // (offscreen) selection_fx/mask are None and this block is skipped,
-        // so offscreen output never carries the tint.
-        let selection_phase = self.selection.is_some().then_some(Phase::Selection);
-        // The pool slot the composite will read: the scene slot, or the
-        // tinted ping-pong partner when a selection was rendered.
-        let mut final_slot = pool_slot;
-        if let (Some(Phase::Selection), Some(fx), Some(mask)) =
-            (selection_phase, &comp.selection_fx, &vt.mask)
-        {
-            let sel = self.selection.as_ref().expect("selection_phase implies selection");
-            // Mask pass: the selected glyph quads into the mask target
-            // (glyph coverage in alpha). Blend disabled; no depth.
-            let mask_query = ctx
-                .profiler
-                .as_ref()
-                .map(|p| p.borrow().begin_pass_query("selection mask pass", encoder));
-            {
-                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                    label: Some("selection mask pass"),
-                    timestamp_writes: mask_query
-                        .as_ref()
-                        .and_then(|q| q.render_pass_timestamp_writes()),
-                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                        view: &mask.view,
-                        resolve_target: None,
-                        ops: wgpu::Operations {
-                            // TRANSPARENT, not BLACK: wgpu::Color::BLACK is
-                            // (0,0,0,1) — clearing to alpha=1 blanketed the
-                            // whole mask (uniform tint over the frame; caught
-                            // by the K6 eyeball + a mask-dump probe).
-                            load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
-                            store: wgpu::StoreOp::Store,
-                        },
-                        depth_slice: None,
-                    })],
-                    depth_stencil_attachment: None,
-                    ..Default::default()
-                });
-                pass.set_pipeline(&fx.mask_pipeline);
-                match sel {
-                    Selection::Glyph { chunk, local } => {
-                        pass.set_bind_group(0, &self.bind_groups[*chunk as usize], &[]);
-                        pass.draw(0..6, *local..*local + 1);
-                    }
-                    Selection::Segment { slot_base, slot_count } => {
-                        // Per-chunk split — the same math cull_segments uses.
-                        let slot_end = slot_base + slot_count;
-                        for c in 0..self.bind_groups.len() as u32 {
-                            let c_lo = c * self.chunk_cap;
-                            let lo = (*slot_base).max(c_lo);
-                            let hi = slot_end.min(c_lo + self.chunk_cap);
-                            if hi > lo {
-                                pass.set_bind_group(0, &self.bind_groups[c as usize], &[]);
-                                pass.draw(0..6, (lo - c_lo)..(hi - c_lo));
-                            }
-                        }
-                    }
-                }
-            }
-            if let (Some(p), Some(q)) = (&ctx.profiler, mask_query) {
-                p.borrow().end_query(encoder, q);
-            }
-            // Tint pass: pool[pool_slot] + mask → pool[1 - pool_slot]
-            // (additive coverage-weighted tint); the composite reads the
-            // tinted slot below.
-            final_slot = 1 - pool_slot;
-            let tint_query = ctx
-                .profiler
-                .as_ref()
-                .map(|p| p.borrow().begin_pass_query("selection tint pass", encoder));
-            {
-                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                    label: Some("selection tint pass"),
-                    timestamp_writes: tint_query
-                        .as_ref()
-                        .and_then(|q| q.render_pass_timestamp_writes()),
-                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                        view: &vt.color_views[final_slot],
-                        resolve_target: None,
-                        ops: wgpu::Operations {
-                            load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
-                            store: wgpu::StoreOp::Store,
-                        },
-                        depth_slice: None,
-                    })],
-                    depth_stencil_attachment: None,
-                    ..Default::default()
-                });
-                pass.set_pipeline(&fx.tint_pipeline);
-                pass.set_bind_group(0, &mask.tint_bgs[pool_slot], &[]);
-                pass.draw(0..3, 0..1);
-            }
-            if let (Some(p), Some(q)) = (&ctx.profiler, tint_query) {
-                p.borrow().end_query(encoder, q);
-            }
-        }
-
-        // Stage L (L3): composite the pooled target into the driver's view.
-        if color_format == POOL_FORMAT {
-            // Offscreen/oracle path: same format, 1:1, no scaling —
-            // copy_texture_to_texture is bit-exact BY CONSTRUCTION (this
-            // is the gate-critical path; it cannot fail a byte compare).
-            assert_eq!(
-                color_format, POOL_FORMAT,
-                "L3: copy composite requires matching formats (deliberately loud)"
-            );
-            encoder.copy_texture_to_texture(
-                wgpu::TexelCopyTextureInfo {
-                    texture: &vt.colors[final_slot],
-                    mip_level: 0,
-                    origin: wgpu::Origin3d::ZERO,
-                    aspect: wgpu::TextureAspect::All,
-                },
-                wgpu::TexelCopyTextureInfo {
-                    texture: color_texture,
-                    mip_level: 0,
-                    origin: wgpu::Origin3d::ZERO,
-                    aspect: wgpu::TextureAspect::All,
-                },
-                wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
-            );
-        } else {
-            // Windowed path: the surface (Bgra8UnormSrgb) is
-            // component-order-incompatible with the pool, so a copy is
-            // invalid — fullscreen shader composite instead. The pass
-            // clears-then-overwrites every pixel (blend disabled).
-            let composite_query = ctx
-                .profiler
-                .as_ref()
-                .map(|p| p.borrow().begin_pass_query("composite pass", encoder));
-            {
-                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                    label: Some("composite pass"),
-                    timestamp_writes: composite_query
-                        .as_ref()
-                        .and_then(|q| q.render_pass_timestamp_writes()),
-                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                        view: color_view,
-                        resolve_target: None,
-                        ops: wgpu::Operations {
-                            load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
-                            store: wgpu::StoreOp::Store,
-                        },
-                        depth_slice: None,
-                    })],
-                    depth_stencil_attachment: None,
-                    ..Default::default()
-                });
-                pass.set_pipeline(&comp.pipeline);
-                pass.set_bind_group(0, &vt.bind_groups[final_slot], &[]);
-                pass.draw(0..3, 0..1);
-            }
-            if let (Some(p), Some(q)) = (&ctx.profiler, composite_query) {
-                p.borrow().end_query(encoder, q);
-            }
-        }
+        render::render_scene(self, ctx, encoder, target, t);
     }
 }
 

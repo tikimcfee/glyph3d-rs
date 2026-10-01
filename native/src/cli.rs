@@ -53,7 +53,17 @@ pub fn parse_strategy(s: &str) -> crate::repo::Strategy {
         "naive" => Strategy::PerItem,
         "batch" => Strategy::Batched,
         "direct" => Strategy::Direct,
-        "cubecl" => Strategy::Cubecl,
+        "cubecl" => {
+            #[cfg(feature = "cubecl")]
+            {
+                Strategy::Cubecl
+            }
+            #[cfg(not(feature = "cubecl"))]
+            {
+                eprintln!("error: --repo-engine cubecl was not compiled into this binary (rebuild with `cargo run --features cubecl`)");
+                std::process::exit(1);
+            }
+        }
         "hyper" => Strategy::Hyper,
         other => panic!("--repo-engine: unknown mode {other:?} (clap should have refused it)"),
     }
