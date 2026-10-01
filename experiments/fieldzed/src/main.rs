@@ -142,7 +142,7 @@ fn main() -> anyhow::Result<()> {
             Path::new("."),
             &trie,
             &params,
-            glyph3d_native::layout_mojo::Strategy::Direct,
+            glyph3d_native::repo::Strategy::Hyper,
             false,
             None, // folds: the offscreen frames don't carry structure (yet)
         );
@@ -240,7 +240,7 @@ fn run_live(
     // reclaims the scene on every envelope (see LiveSource's doc).
     let choice = SceneChoice::Repo {
         dir,
-        strategy: glyph3d_native::layout_mojo::Strategy::Direct,
+        strategy: glyph3d_native::repo::Strategy::Hyper,
         verify: false,
         focus: None,
         wrap_mode: glyph3d_native::fold::WrapMode::Back,

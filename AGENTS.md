@@ -119,7 +119,13 @@ both are thin doors onto `cargo glyph test`.
   byte-exact. It reports COVERAGE — which checks have no mutation and are
   therefore unproven — not a pass count. Every check is covered as of 2026-09-07;
   `cargo glyph prove` prints the live figure, and a new check should arrive
-  with the mutation that proves it.
+  with the mutation that proves it. Scoped forms for iteration (2026-09-29):
+  `--mutation <name>` (repeatable) proves exactly the named mutations, and
+  `--changed` proves only mutations whose target file differs from HEAD —
+  "prove what you touched" (a mutation you MOVED keeps its name and is
+  selected by its file). A scoped run's verdict names its scope ("a scoped
+  run proves its scope, not the manifest"); the unscoped run remains the
+  landing bar.
 - **`cargo glyph gates`** prints what each check compares and cannot see;
   **`graph`** the artifact graph; **`validate`** the manifest against its schema.
 
@@ -250,7 +256,7 @@ Run on `src/main.rs` and on `fixtures/overflow-leads.txt` — the second because
 `main.rs` is well-formed UTF-8 by construction and can never reach the
 out-of-range decode path where the two implementations actually disagreed in
 September 2026. Blind to the **per-item** FFI strategy: this hardcodes the
-batched one (`main.rs:127`). Blind to malformed shapes other than the one that
+batched one (`main.rs:157`). Blind to malformed shapes other than the one that
 fixture carries.
 
 **pick-oracle** (`tools/check-pick-oracle.sh`; was `check-stage-g.sh` — the `g`
@@ -363,7 +369,13 @@ renderer-affecting and every view stayed byte-equal, because the seed only binds
 for an item with zero records and no fixture had an empty file. It can see that
 class today only because `native/fixtures/g-pick-repo/empty.rs` was added for
 it. **Do not tidy that file away.** Ask what else these frames cannot see —
-`--wrap-mode back` on a repo whose files never wrap is the current example.
+`--wrap-mode back` on a repo whose files never wrap is the current example,
+and since E2b (2026-09-29) there is a second, proven one: **the far-LOD
+backdrop tint never fires in any golden view** — the cameras keep all five
+`g-pick-repo` files near enough that no segment substitutes its backdrop
+quad, so the seg_tint lane is pixel-invisible (the `scatter-tint-lane-dropped`
+mutation stayed GREEN here and moved to the fork gate's byte-level tint tier,
+which is where a fence for it lives now).
 
 **repo-verify** (was "8b"), both wrap modes. The per-item and batched FFI
 strategies diffed bit-exact at the layout seam — placements, instance bytes and
@@ -405,6 +417,41 @@ explicit anti-vacuity guards — the bake fails if no query ran, the reference
 fails if nothing was in domain — which is the right pattern. Blind to a fault
 shared by both loaders in parse parity (there is no third parser), and blind,
 silently, to any fixture outside `text.rs`'s domain.
+
+**cubecl-chain** (2026-09-28). The CubeCL device chain versus the CPU scan
+reference (`scan.rs`) over five fixtures (wrapback-long-line, paged-rows,
+paged-cols, multi-item, cluster-flags): counts and rows exact, fold>0 X
+bit-exact, line_adv and positions at the 1e-4 eps tier, the emitted record
+stream tier-diffed per leader. Red on divergence. Blind to everything outside
+the five fixtures, to the ENGINE (this is chain-vs-CPU-scan; engine parity is
+the fork gate's claim), and to the device decode and cluster stages — this
+driver uploads CPU-computed statics, so no packed byte is ever classified on
+device here. The phantom-tail class is therefore fenced by `pack_words`' unit
+test (the `tail-pads-zero` mutation), not by any device gate.
+
+**cubecl-fork** (2026-09-28; re-formed at the endpoint, 2026-09-29; fixture extended 2026-09-30). `--cubecl-repo-check`
+in STRICT mode over the standing fork fixture (`native/fixtures/cubecl-fork`, IMMUTABLE):
+the full from-bytes chain's records versus the ENGINE's batched records, BIT-exact,
+plus the endpoint tiers — the 32 B slot stream field-equal against the engine arena
+(the renderer-bound form, fenced in the exact shape the shader reads), placements
+bit-equal — with the fork census's m >= 3 and seg >= 3 buckets proven exercised — an
+unexercised corpus is a FAIL, so the fixture cannot quietly stop covering the paginate
+arithmetic classes. Since 2026-09-30 the fixture also carries `clusters.txt` (every
+supported cluster class — families, flags, skin tones, roles, keycaps, tag flags,
+VS16 on/off, and the stay-pieces fallbacks — placed at wrap columns, page boundaries,
+line and file edges), and STRICT likewise requires a nonzero cluster candidate count:
+the pre-extension corpus was pure ASCII and read 0, which is exactly the failure the
+bucket now refuses. The same extension added a zero-byte `empty.txt` — the empty-item
+placement class (found by the extent_fold boundary bug, 2026-09-30: a one-step item
+advance misassigned the byte after an empty item to the empty item's extent lanes;
+only the pixel gate could see it, through a neighbor's shifted origin). The gate runs the fixture twice: default, and
+`GLYPH_RECORD_CHUNK=60000` (six emit windows), so the chunked emitter's `rec_first`
+carry is fenced on an ordinary corpus. The `emitter-window-offset-dropped` mutation
+reddens only through the chunked pass. (The chunked-arena and readback-hop passes and
+their six mutations retired with the hop machinery at E2b.) Blind to corpora outside
+the fixture, to a fault the engine and chain share (ground truth layers: engine-check,
+reference-port), and to non-robust backend behavior (Metal discards the
+phantom-class writes; see the mutation's `why`).
 
 ### What the whole battery cannot see
 
@@ -489,6 +536,7 @@ with a number against it.
 | `native/fixtures/baseline-view.txt` | IMMUTABLE | it is the input to `text.png`; editing it re-baselines that check silently |
 | `native/fixtures/emoji-view.txt` | IMMUTABLE | the input to `emoji.png`, one line per class of bitmap slot the trie carries; same reason |
 | `native/fixtures/g-pick-repo/empty.rs` | IMMUTABLE, zero bytes | the only input that reaches the page-extent origin seed; deleting it removes a check's ability to see its subject without removing the check |
+| `native/fixtures/cubecl-fork/` | IMMUTABLE | the cubecl-fork gate's standing corpus — the only committed input exercising paginate's m >= 3 / segment >= 3 classes, the committed-cluster classes at wrap/page boundaries, and the empty-item placement class (`clusters.txt` + `empty.txt`, 2026-09-30); editing it re-hollows a bit-exactness gate silently (the strict mode's exercise asserts catch deletion, not weakening) |
 | `out/tooling-ab/baseline/<key>/` | tracked pixel oracle, one set per rasterizer; **golden** in build.toml | changes only on purpose, with a note saying why; the runner refuses to regenerate it. A new host adopts its own set by hand (the gate prints how); it never edits another's |
 | `integration/egui/` | vendored reference | never compiled; the real dependency is from crates.io |
 
@@ -512,7 +560,7 @@ the JS oracle this engine was ported from, now retired: `tools/vendor/ref` and
 deliberately forked. Edits there are invisible to every check here, so they
 cannot be verified and cannot be trusted.
 
-Dependency pins (wgpu 30, winit 0.30, glam 0.33, egui 0.36, mojo/max per
+Dependency pins (wgpu 30, winit 0.30, glam 0.33, egui 0.36, cubecl =0.11.0-pre.4, mojo/max per
 `pixi.toml`): no bump without its own pass. The past bumps were done as multi-part
 work and their reports (`out/STAGE_H_REPORT.md`, `STAGE_I_REPORT.md`) are worth
 reading — but they agree on less than they look like they do, each having

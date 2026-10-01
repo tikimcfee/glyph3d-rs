@@ -18,14 +18,18 @@
 
 pub mod atlas;
 pub mod bake;
-pub mod engine;
+pub mod cli;
+pub mod cubecl_chain;
+pub mod cubecl_layout;
+pub mod cubecl_scan;
+pub mod cubecl_smoke;
 pub mod fixture;
 pub mod fold;
+pub mod glyph_scene;
 pub mod glyph_trie;
 pub mod gpu;
-pub mod glyph_scene;
 pub mod layout;
-pub mod layout_mojo;
+pub mod layout_hyper;
 pub mod offscreen;
 pub mod repo;
 pub mod scan;
@@ -36,7 +40,10 @@ pub mod windowed;
 
 use std::path::{Path, PathBuf};
 
-use glyph_scene::{CameraMode, GlyphScene, PickCommand, Verb};
+pub use cli::Op;
+pub use cli::parse_verb;
+
+use glyph_scene::{CameraMode, GlyphScene};
 use gpu::GpuContext;
 // The seam is used by trait, not by concrete backend: swapping `MojoLayout`
 // for the Rust one changes the constructor and nothing else here.
@@ -59,7 +66,7 @@ pub enum SceneChoice {
     /// per file, one shared glyph arena, grid layout.
     Repo {
         dir: PathBuf,
-        strategy: layout_mojo::Strategy,
+        strategy: repo::Strategy,
         verify: bool,
         focus: Option<String>,
         /// How a wrap is spent. `Back` is the default: a wrapped line costs
@@ -139,19 +146,11 @@ fn engine_item_at(bytes: &[u8], origin: [f64; 3]) -> layout::LayoutItem<'_> {
     }
 }
 
-fn engine_backend(trie: &Path) -> layout_mojo::MojoLayout {
-    let mut backend = layout_mojo::MojoLayout::new(layout_mojo::Strategy::Batched);
-    backend
-        .load_trie_file(trie)
-        .expect("failed to load engine trie");
-    backend
-}
-
 /// Lay one file out through the seam FOR RENDERING: instances in an arena plus
-/// its placement. No records, no readback — this is the path a frame takes.
-pub fn engine_layout(file: &Path, trie: &Path) -> (layout::GlyphArena, layout::ItemPlacement) {
+/// its placement.
+pub fn engine_layout(file: &Path, _trie: &Path) -> (layout::GlyphArena, layout::ItemPlacement) {
     let bytes = std::fs::read(file).expect("failed to read engine input file");
-    let mut backend = engine_backend(trie);
+    let mut backend = layout_hyper::HyperLayout::new();
     let mut arena = layout::GlyphArena::new();
     let placements = backend
         .layout_items(&[engine_item(&bytes)], &mut arena)
@@ -159,17 +158,14 @@ pub fn engine_layout(file: &Path, trie: &Path) -> (layout::GlyphArena, layout::I
     (arena, placements[0])
 }
 
-/// Lay one file out through the seam FOR VERIFICATION: the wire records, which
-/// `--engine-check` diffs lane by lane against the independent CPU reference.
-/// This is the 36 B-per-source-byte readback the render path above does not
-/// pay, asked for explicitly through `VerifyLayout` — see `layout.rs`.
+/// Lay one file out through the seam FOR VERIFICATION: the wire records.
 pub fn engine_layout_records_at(
     file: &Path,
-    trie: &Path,
+    _trie: &Path,
     origin: [f64; 3],
 ) -> Vec<layout::GlyphRecord> {
     let bytes = std::fs::read(file).expect("failed to read engine input file");
-    let mut backend = engine_backend(trie);
+    let mut backend = layout_hyper::HyperLayout::new();
     let mut arena = layout::GlyphArena::new();
     let (placements, records) = backend
         .layout_items_recording(&[engine_item_at(&bytes, origin)], &mut arena)
@@ -303,69 +299,53 @@ fn build_scene_impl(
                 cluster_mode: *cluster_mode,
                 ..Default::default()
             };
-            let load = repo::load_repo(dir, &default_engine_trie(), &params, *strategy, *verify);
+            let t_visual_start = std::time::Instant::now();
+            let device = &ctx.device;
+            let queue = &ctx.queue;
+            let (load, atlas, atlas_wall) = std::thread::scope(|s| {
+                let atlas_handle = s.spawn(|| {
+                    let t = std::time::Instant::now();
+                    let a = atlas::Atlas::load_device(device, queue, emoji_sheet);
+                    (a, t.elapsed())
+                });
+                let walk = repo::walk_repo(dir);
+                // Device-resident backends (Hyper and Cubecl) allocate mapped unified
+                // storage directly for exact survivor counts via the device context.
+                let arena = layout::GlyphArena::new();
+                let l = repo::load_repo_from_walk(
+                    dir,
+                    walk,
+                    &default_engine_trie(),
+                    &params,
+                    *strategy,
+                    *verify,
+                    Some(ctx),
+                    arena,
+                    None,
+                );
+                let (a, dur) = atlas_handle.join().expect("atlas load thread panicked");
+                (l, a, dur)
+            });
             load.print_stats();
-            let atlas = atlas::Atlas::load(ctx, emoji_sheet);
+
+            let t_staged = std::time::Instant::now();
             let staged = load.into_staged(focus.as_deref(), &atlas.slot_ink);
-            glyph(GlyphScene::new(ctx, color_format, &atlas, staged, camera_mode, cull))
+            let staged_dur = t_staged.elapsed();
+
+            let t_scene = std::time::Instant::now();
+            let scene = GlyphScene::new(ctx, color_format, &atlas, staged, camera_mode, cull);
+            let scene_dur = t_scene.elapsed();
+            let visual_total = t_visual_start.elapsed();
+
+            println!(
+                "visual: atlas {:.3}s (concurrent) | staged {:.3}s | scene {:.3}s | total visual init {:.3}s",
+                atlas_wall.as_secs_f64(),
+                staged_dur.as_secs_f64(),
+                scene_dur.as_secs_f64(),
+                visual_total.as_secs_f64(),
+            );
+            glyph(scene)
         }
     }
 }
 
-/// Stage G: one scripted operation (picks and verbs interleave in CLI order).
-pub enum Op {
-    Pick(PickCommand),
-    Verb(Verb),
-    /// Scripted Fly-camera pose: eye + yaw/pitch (RADIANS) — repro of
-    /// oblique windowed camera states for --pick-px.
-    CamPose([f32; 3], f32, f32),
-    /// S3 spike: apply a Zed-sidecar highlight to instance colors (offscreen,
-    /// before the first frame — same op-stream slot as picks/verbs).
-    Highlight(PathBuf),
-}
-
-/// Parse a `--verb` string into a Verb (clap `value_parser`). Forms:
-///   recolor-glyph `[rrggbb]`      recolor-line `[rrggbb]`
-///   nudge-glyph dx dy `[dz]`      scale-glyph f
-///   move-group dx dy dz         scale-group s
-///   tint-group rrggbb           tint-cycle
-///   hide-group | show-group | toggle-hidden
-pub fn parse_verb(s: &str) -> Result<Verb, String> {
-    let t: Vec<&str> = s.split_whitespace().collect();
-    let usage = format!(
-        "unknown/malformed --verb {s:?} — expected recolor-glyph|recolor-line|\
-         nudge-glyph|scale-glyph|move-group|scale-group|tint-group|tint-cycle|\
-         hide-group|show-group|toggle-hidden"
-    );
-    let f = |i: usize| -> Result<f32, String> {
-        t.get(i)
-            .and_then(|v| v.parse().ok())
-            .ok_or_else(|| format!("--verb {s:?}: bad/missing float at position {i}"))
-    };
-    let hex = |i: usize| -> Result<[u8; 3], String> {
-        let h = t
-            .get(i)
-            .ok_or_else(|| format!("--verb {s:?}: missing rrggbb at position {i}"))?
-            .trim_start_matches('#');
-        let v = u32::from_str_radix(h, 16)
-            .map_err(|_| format!("--verb {s:?}: bad hex color {h:?}"))?;
-        Ok([((v >> 16) & 0xFF) as u8, ((v >> 8) & 0xFF) as u8, (v & 0xFF) as u8])
-    };
-    Ok(match t.first().copied().unwrap_or("") {
-        "recolor-glyph" => Verb::RecolorGlyph(if t.len() > 1 { hex(1)? } else { [255, 80, 80] }),
-        "recolor-line" => Verb::RecolorLine(if t.len() > 1 { hex(1)? } else { [255, 213, 79] }),
-        "nudge-glyph" => Verb::NudgeGlyph([f(1)?, f(2)?, if t.len() > 3 { f(3)? } else { 0.0 }]),
-        "scale-glyph" => Verb::ScaleGlyph(f(1)?),
-        "move-group" => Verb::MoveGroup([f(1)?, f(2)?, f(3)?]),
-        "scale-group" => Verb::ScaleGroup(f(1)?),
-        "tint-group" => {
-            let [r, g, b] = hex(1)?;
-            Verb::TintGroup([r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0])
-        }
-        "tint-cycle" => Verb::TintCycle,
-        "hide-group" => Verb::SetHidden(true),
-        "show-group" => Verb::SetHidden(false),
-        "toggle-hidden" => Verb::ToggleHidden,
-        _ => return Err(usage),
-    })
-}

@@ -37,7 +37,20 @@ glam = { version = "0.33", features = ["approx", "debug-glam-assert", "mint"] }
 clap = { version = "4", features = ["derive"] }
 clap_complete = "4"
 wgpu-profiler = "0.28"
+# CubeCL bring-up (the note-16 spike): GPU compute kernels in Rust sharing
+# our wgpu device. Pre-release pin — 0.11.0-pre.4 is the line whose wgpu dep
+# unifies with our 30.0.1 (the 0.10 line still pins wgpu 29).
+cubecl = { version = "=0.11.0-pre.4", features = ["wgpu"] }
 encase = "0.12"
+rayon = "1.10"
+# The load path's tracing substrate (note 22): spans over the chain, its
+# tail, and the repo load, so measurements stop being ad-hoc Instant
+# pairs. Both crates are already resolved in the lockfile through wgpu
+# (tracing 0.1.44 / tracing-subscriber 0.3.23, env-filter's matchers +
+# regex-automata included) — a version-unified add, no new resolution.
+# Default OFF: GLYPH_TRACE (fallback RUST_LOG) names the filter.
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # Stage K (K1): egui overlay on the WINDOWED renderer (windowed.rs only;
 # offscreen never touches it). egui-wgpu WITHOUT its `winit` feature — that
 # pulls in Painter, which owns the surface and clears the frame; we own the

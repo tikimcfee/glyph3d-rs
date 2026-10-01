@@ -24,7 +24,7 @@
 //! carrier splits have been applied, so getting any of them wrong diverges.
 
 use std::fmt::Write as _;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::fold::{run_pipeline, Item};
 use crate::scan::run_scan_pipeline;
@@ -1515,4 +1515,157 @@ mod tests {
             .count();
         assert!(missing > 0, "no miss in utf8-emoji — the miss path is uncompared");
     }
+}
+
+// ── Gate drivers (moved from main.rs in the 2026-09 code-shape refactor) ──
+
+/// Fixture parity: emit the canonical parse manifest, one line per fixture.
+pub fn run_fixture_manifest(paths: &[PathBuf]) -> ! {
+    for p in paths {
+        match load_pipe_fixture(p) {
+            Ok(fx) => println!("{}", fx.manifest()),
+            Err(e) => {
+                eprintln!("fixture-manifest FAIL: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
+    std::process::exit(0);
+}
+
+/// Full fold: the ported fold against the whole corpus, every lane of every byte.
+pub fn run_fixture_fold(paths: &[PathBuf]) -> ! {
+    let mut lanes = 0usize;
+    let mut leaders = 0usize;
+    let mut failed = 0usize;
+    for p in paths {
+        let fx = match load_pipe_fixture(p) {
+            Ok(fx) => fx,
+            Err(e) => {
+                eprintln!("fixture-fold FAIL: {e}");
+                std::process::exit(1);
+            }
+        };
+        let d = diff_full_fold(&fx);
+        if d.bad.is_empty() {
+            println!(
+                "  PASS {:<26} {} bytes / {} leaders / {} lanes bit-exact",
+                fx.name, d.bytes, d.leaders, d.lanes
+            );
+            lanes += d.lanes;
+            leaders += d.leaders;
+        } else {
+            failed += 1;
+            println!("  FAIL {:<26} {} disagreement(s)", fx.name, d.bad.len());
+            for line in d.bad.iter().take(8) {
+                println!("       {line}");
+            }
+        }
+    }
+    if failed > 0 {
+        eprintln!("fixture-fold FAIL: {failed}/{} fixtures differ", paths.len());
+        std::process::exit(1);
+    }
+    println!(
+        "fixture-fold PASS: {} fixture(s), {leaders} leaders, {lanes} per-byte lanes \
+         bit-exact vs the JS oracle",
+        paths.len()
+    );
+    std::process::exit(0);
+}
+
+/// Trie rebuild: rebuild every fixture's trie from its bytes and diff it against the
+/// one the oracle stored.
+///
+/// NOT a round trip: the input is the fixture's raw BYTES plus gen.mjs's pure
+/// metrics function, and nothing about the stored trie's structure is handed
+/// back to the builder. So the block layout, the content dedup and — the part
+/// that matters — the INSERTION ORDER are all under test.
+pub fn run_fixture_trie(paths: &[PathBuf]) -> ! {
+    let mut entries = 0usize;
+    let mut failed = 0usize;
+    for p in paths {
+        let fx = match load_pipe_fixture(p) {
+            Ok(fx) => fx,
+            Err(e) => {
+                eprintln!("fixture-trie FAIL: {e}");
+                std::process::exit(1);
+            }
+        };
+        let r = rebuild_trie_and_diff(&fx);
+        if r.bad.is_empty() {
+            println!(
+                "  PASS {:<26} {} entries / {} blocks / {} mapped cps — value-identical",
+                fx.name, r.entries, r.block_count, r.mapped
+            );
+            entries += r.entries;
+        } else {
+            failed += 1;
+            println!("  FAIL {:<26} {} disagreement(s)", fx.name, r.bad.len());
+            for line in r.bad.iter().take(8) {
+                println!("       {line}");
+            }
+        }
+    }
+    if failed > 0 {
+        eprintln!("fixture-trie FAIL: {failed}/{} fixtures differ", paths.len());
+        std::process::exit(1);
+    }
+    println!(
+        "fixture-trie PASS: {} fixture(s), {entries} trie entries rebuilt from bytes",
+        paths.len()
+    );
+    std::process::exit(0);
+}
+
+/// Fixture parity: hold text.rs's CPU fold to the fixture corpus, bit-exact.
+///
+/// Out-of-domain fixtures are SKIPPED WITH A REASON rather than silently
+/// dropped, and a run in which nothing was in domain FAILS. Both halves matter:
+/// this gate's whole job is comparing, and a comparison that compared nothing
+/// is the loudest-passing thing there is.
+pub fn run_fixture_reference(paths: &[PathBuf]) -> ! {
+    let mut compared = 0usize;
+    let mut records = 0usize;
+    let mut lanes = 0usize;
+    let mut failed = 0usize;
+    for p in paths {
+        let fx = match load_pipe_fixture(p) {
+            Ok(fx) => fx,
+            Err(e) => {
+                eprintln!("fixture-reference FAIL: {e}");
+                std::process::exit(1);
+            }
+        };
+        let outcome = diff_against_reference_layout(&fx);
+        if let Some(why) = outcome.skipped {
+            println!("  SKIP {:<26} out of reference_layout domain: {why}", fx.name);
+            continue;
+        }
+        compared += 1;
+        records += outcome.records;
+        lanes += outcome.compared_lanes;
+        if outcome.bad.is_empty() {
+            println!(
+                "  PASS {:<26} {} records, {} lanes bit-exact",
+                fx.name, outcome.records, outcome.compared_lanes
+            );
+        } else {
+            failed += 1;
+            print!("  FAIL {}", report(&fx, &outcome.bad, 10));
+        }
+    }
+    if compared == 0 {
+        eprintln!("fixture-reference FAIL: no fixture was in domain — nothing was compared");
+        std::process::exit(1);
+    }
+    if failed > 0 {
+        eprintln!("fixture-reference FAIL: {failed}/{compared} fixtures differ");
+        std::process::exit(1);
+    }
+    println!(
+        "fixture-reference PASS: {compared} fixture(s), {records} records, {lanes} lanes bit-exact \
+         vs the oracle's expected values"
+    );
+    std::process::exit(0);
 }

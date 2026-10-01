@@ -47,30 +47,25 @@ const MAX_CURVES: u32 = 256u;
 const TEX_W: i32 = 1024;
 const GROUP_STRIDE: u32 = 5u; // vec4s per group row (glyphVertex.js GROUP_STRIDE)
 
-// Per-instance glyph slot — 48 B / 12 lanes. Deliberately close to the web's
-// stride-11 byte-slot layout (pos xyz + advance/height bitcast lanes + count
-// lanes): the two extra lanes here (color, group_id) are per-instance
+// Per-instance glyph slot — 32 B / 8 lanes, the endpoint form (note 23):
+// what remains of the web's stride-11 byte-slot layout once the dead lanes
+// fell out (row/col, flags, _pad — note 22's sweep found no live reader:
+// pick rides the engine cache, the verbs write by slot offset, the tint
+// fold wants glyph_id+color). color and group_id are per-instance
 // ATTRIBUTES on classic web fields; keeping them inline makes the record
 // self-contained for the native port. Layout:
 //   w0-2  pos.xyz       world anchor: pen origin (left edge), cell-vertical center
 //   w3    glyph_id      FontChain global slot (keys glyphmap)
-//   w4-5  row, col      grid position (Stage D picking/far-texture parity)
-//   w6    color         packed RGBA8 (sRGB display values)
-//   w7    group_id      index into the group table
-//   w8-9  advance, height   world units (advance = cell width; height = cell height)
-//   w10   flags         trie flags (bit0 MISSING, bit1 BITMAP, bit2 BLANK)
-//   w11   _pad
+//   w4    color         packed RGBA8 (sRGB display values)
+//   w5    group_id      index into the group table
+//   w6-7  advance, height   world units (advance = cell width; height = cell height)
 struct InstanceSlot {
     pos: vec3<f32>,
     glyph_id: u32,
-    row: u32,
-    col: u32,
     color: u32,
     group_id: u32,
     advance: f32,
     height: f32,
-    flags: u32,
-    _pad: u32,
 };
 
 struct Camera {

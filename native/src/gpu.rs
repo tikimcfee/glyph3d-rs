@@ -163,6 +163,12 @@ pub struct GpuProfile {
     pub target_arch: &'static str,
     pub multi_draw_indirect_count: bool,
     pub timestamp_query: bool,
+    /// MAP_WRITE on storage-class buffers (unified-memory direct upload). On
+    /// Metal this is strictly a win (shared storage IS the same DRAM the GPU
+    /// reads); on discrete adapters wgpu still advertises it but a host-visible
+    /// storage buffer trades the one fast upload for slower per-frame shader
+    /// reads, so the upload path reads `backend` as well, not just this flag.
+    pub mappable_primary_buffers: bool,
     pub max_storage_buffer_binding_size: u64,
     pub max_buffer_size: u64,
 }
@@ -184,6 +190,7 @@ impl GpuProfile {
             target_arch: std::env::consts::ARCH,
             multi_draw_indirect_count: feats.contains(wgpu::Features::MULTI_DRAW_INDIRECT_COUNT),
             timestamp_query: feats.contains(wgpu::Features::TIMESTAMP_QUERY),
+            mappable_primary_buffers: feats.contains(wgpu::Features::MAPPABLE_PRIMARY_BUFFERS),
             max_storage_buffer_binding_size: lim.max_storage_buffer_binding_size,
             max_buffer_size: lim.max_buffer_size,
         }
@@ -321,6 +328,7 @@ impl GpuProfile {
             target_arch: "test",
             multi_draw_indirect_count: false,
             timestamp_query: false,
+            mappable_primary_buffers: false,
             max_storage_buffer_binding_size: 0,
             max_buffer_size: 0,
         }
@@ -342,6 +350,33 @@ pub struct GpuContext {
     /// Stage H: CPU-side scope times (e.g. the cull pass), merged into the
     /// profile summary. Written by scenes only when `profiler` is `Some`.
     pub cpu_scopes: RefCell<std::collections::BTreeMap<String, (f64, u64)>>,
+}
+
+/// The renderer's device context handles passed across layout stages.
+/// The wgpu handles clone as cheap Arcs.
+#[derive(Clone)]
+#[allow(dead_code)]
+pub struct SharedDevice {
+    pub instance: wgpu::Instance,
+    pub adapter: wgpu::Adapter,
+    pub device: wgpu::Device,
+    pub queue: wgpu::Queue,
+    pub max_buffer_size: u64,
+    pub host_visible_storage: bool,
+}
+
+impl SharedDevice {
+    pub fn from_ctx(ctx: &GpuContext) -> Self {
+        Self {
+            instance: ctx.instance.clone(),
+            adapter: ctx.adapter.clone(),
+            device: ctx.device.clone(),
+            queue: ctx.queue.clone(),
+            max_buffer_size: ctx.profile.max_buffer_size,
+            host_visible_storage: ctx.profile.backend == wgpu::Backend::Metal
+                && ctx.profile.mappable_primary_buffers,
+        }
+    }
 }
 
 /// Record one CPU scope sample (ms) — no-op semantics live at the call site
@@ -453,10 +488,19 @@ pub async fn init(compatible_surface: Option<&wgpu::Surface<'_>>) -> GpuContext 
     // glyphs). Request the adapter's FULL headroom; the scene chunks the
     // arena so no single binding exceeds max_storage_buffer_binding_size, so
     // any adapter value works — but the bigger the limit, the fewer chunks.
+    // Same story for max_storage_buffers_per_shader_stage: the CubeCL scan
+    // skeleton's widest kernels bind 10-12 storage buffers (default is 8 —
+    // k_apply's pipeline failed validation on exactly that).
     let supported = adapter.limits();
     let limits = wgpu::Limits {
         max_storage_buffer_binding_size: supported.max_storage_buffer_binding_size,
         max_buffer_size: supported.max_buffer_size,
+        max_storage_buffers_per_shader_stage: supported.max_storage_buffers_per_shader_stage,
+        // Request the adapter's real cap rather than wgpu's default. Measured
+        // on this M2: the ADAPTER itself reports 65535, so this is a no-op
+        // here — the CubeCL chain still spills large grids into Y (see its
+        // cubes_of) — but an adapter with a higher cap gets it automatically.
+        max_compute_workgroups_per_dimension: supported.max_compute_workgroups_per_dimension,
         ..Default::default()
     };
 
@@ -468,23 +512,29 @@ pub async fn init(compatible_surface: Option<&wgpu::Surface<'_>>) -> GpuContext 
         adapter.features().contains(wgpu::Features::MULTI_DRAW_INDIRECT_COUNT)
     );
 
-    // Stage H: opt-in profiling. Request TIMESTAMP_QUERY (+ INSIDE_PASSES for
-    // nested in-pass scopes) ONLY when GLYPH_PROFILE=1 and the adapter
-    // supports it; a missing feature must never break a render.
+    // Stage H: TIMESTAMP_QUERY is requested whenever the adapter has it — the
+    // shared device is what CubeCL's chain bench sees, and its per-dispatch
+    // GPU timing needs the feature present at device creation (cubecl picks
+    // TimingMethod::Device only then). The renderer's own in-pass scopes
+    // (INSIDE_PASSES) stay opt-in behind GLYPH_PROFILE=1; a missing feature
+    // must never break a render.
     let profile_wanted = std::env::var_os("GLYPH_PROFILE").is_some();
     let adapter_features = adapter.features();
     let mut required_features = wgpu::Features::empty();
-    let profiling_supported = profile_wanted
-        && adapter_features.contains(wgpu::Features::TIMESTAMP_QUERY);
-    if profile_wanted {
-        if profiling_supported {
-            required_features |= wgpu::Features::TIMESTAMP_QUERY;
-            if adapter_features.contains(wgpu::Features::TIMESTAMP_QUERY_INSIDE_PASSES) {
-                required_features |= wgpu::Features::TIMESTAMP_QUERY_INSIDE_PASSES;
-            }
-        } else {
-            log::warn!("profiling unavailable: no TIMESTAMP_QUERY (running unprofiled)");
-        }
+    if adapter_features.contains(wgpu::Features::TIMESTAMP_QUERY) {
+        required_features |= wgpu::Features::TIMESTAMP_QUERY;
+    } else {
+        log::warn!("timestamp queries unavailable: CubeCL bench timing falls back to system clock");
+    }
+    if profile_wanted && adapter_features.contains(wgpu::Features::TIMESTAMP_QUERY_INSIDE_PASSES) {
+        required_features |= wgpu::Features::TIMESTAMP_QUERY_INSIDE_PASSES;
+    }
+    // MAP_WRITE on storage buffers lets the instance upload write the device
+    // buffer directly instead of wgpu's zero-fill-then-stage-then-blit path
+    // (~22% of the repo-load profile). Requested wherever the adapter offers
+    // it; the upload path still picks by backend (see GpuProfile's flag).
+    if adapter_features.contains(wgpu::Features::MAPPABLE_PRIMARY_BUFFERS) {
+        required_features |= wgpu::Features::MAPPABLE_PRIMARY_BUFFERS;
     }
 
     let (device, queue) = adapter
@@ -519,7 +569,7 @@ pub async fn init(compatible_surface: Option<&wgpu::Surface<'_>>) -> GpuContext 
 
     // Debug groups off: they only label captures and we want the smallest
     // possible footprint on the encode path.
-    let profiler = if profiling_supported {
+    let profiler = if profile_wanted {
         match wgpu_profiler::GpuProfiler::new(
             &device,
             wgpu_profiler::GpuProfilerSettings {

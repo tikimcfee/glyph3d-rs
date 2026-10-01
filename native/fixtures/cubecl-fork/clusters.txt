@@ -1,0 +1,450 @@
+👨‍👩‍👧‍👦 byte-zero cluster start — the file's first bytes are a committed sequence
+class inventory — every sequence below is one the trie carries
+families: 👨‍👩‍👧 👨‍👩‍👧‍👦 👨‍👨‍👦 👩‍👩‍👧
+flags: 🇨🇦 🇯🇵 🇺🇸  not-a-pair: 🇦🇦  triplet: 🇺🇸🇸
+skin tones: 👍 then 👍🏻 👍🏼 👍🏽 👍🏾 👍🏿  lone modifiers: 🏻🏼🏽🏾🏿
+roles + tones: 🧑‍💻 🧑🏻‍💻 🧑🏼‍💻 🧑🏽‍💻 🧑🏾‍💻 🧑🏿‍💻
+keycaps: #️⃣ *️⃣ 0️⃣ 1️⃣  bare: 1⃣  vs15-broken: 1︎⃣
+tag flags: 🏴󠁧󠁢󠁥󠁮󠁧󠁿 🏴󠁧󠁢󠁳󠁣󠁴󠁿 🏴󠁧󠁢󠁷󠁬󠁳󠁿 🏴󠁿
+couple: 👩‍❤‍👨  heart chain: ❤‍🔥  vs16 twin: ❤️‍🔥
+heart text/emoji: ❤ ❤️  rainbow: 🏳️‍🌈
+unlisted chain stays pieces: 🚀‍🌍  bare zwj: a‍b  bare vs16: a️
+mixed code: let ok = true; // 🚀 done ✨ 🎉
+clusters mid-word: the👨‍👩‍👧family and a🇯🇵flag
+punctuation adjacency: (🇺🇸) [👍🏽] ❤‍🔥,
+a line of only clusters: 👨‍👩‍👧👨‍👩‍👧‍👦🇨🇦👍🏿1️⃣🏴󠁧󠁢󠁥󠁮󠁧󠁿👩‍❤‍👨
+
+🇯🇵 cluster right after a blank line
+cluster at end of line -> 👍🏽
+👨‍👩‍👧 <- cluster at start of line
+wrap-boundary matrix — clusters at prefix lengths 93 95 97 98 99 100 101 102 105
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx👍🏼
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx👍🏼 tails
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx👍🏼yyyyyyyyyyyyyyyyyyyyyyyyy
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx🏴󠁧󠁢󠁳󠁣󠁴󠁿
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx🏴󠁧󠁢󠁳󠁣󠁴󠁿 tails
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx🏴󠁧󠁢󠁳󠁣󠁴󠁿yyyyyyyyyyyyyyyyyyyyyyyyy
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx❤‍🔥
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx❤‍🔥 tails
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx❤‍🔥yyyyyyyyyyyyyyyyyyyyyyyyy
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx👨‍👩‍👧‍👦
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx👨‍👩‍👧‍👦 tails
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx👨‍👩‍👧‍👦yyyyyyyyyyyyyyyyyyyyyyyyy
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx🇺🇸
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx🇺🇸 tails
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx🇺🇸yyyyyyyyyyyyyyyyyyyyyyyyy
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx👍🏼
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx👍🏼 tails
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx👍🏼yyyyyyyyyyyyyyyyyyyyyyyyy
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx0️⃣
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx0️⃣ tails
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx0️⃣yyyyyyyyyyyyyyyyyyyyyyyyy
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx🏴󠁧󠁢󠁳󠁣󠁴󠁿
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx🏴󠁧󠁢󠁳󠁣󠁴󠁿 tails
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx🏴󠁧󠁢󠁳󠁣󠁴󠁿yyyyyyyyyyyyyyyyyyyyyyyyy
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx👨‍👩‍👧‍👦
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx👨‍👩‍👧‍👦 tails
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx👨‍👩‍👧‍👦yyyyyyyyyyyyyyyyyyyyyyyyy
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx0️⃣
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx0️⃣ tails
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx0️⃣yyyyyyyyyyyyyyyyyyyyyyyyy
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx🧑🏽‍💻
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx🧑🏽‍💻 tails
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx🧑🏽‍💻yyyyyyyyyyyyyyyyyyyyyyyyy
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx👨‍👩‍👧‍👦
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx👨‍👩‍👧‍👦 tails
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx👨‍👩‍👧‍👦yyyyyyyyyyyyyyyyyyyyyyyyy
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx🇺🇸
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx🇺🇸 tails
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx🇺🇸yyyyyyyyyyyyyyyyyyyyyyyyy
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx👍🏼
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx👍🏼 tails
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx👍🏼yyyyyyyyyyyyyyyyyyyyyyyyy
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx0️⃣
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx0️⃣ tails
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx0️⃣yyyyyyyyyyyyyyyyyyyyyyyyy
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx🏴󠁧󠁢󠁳󠁣󠁴󠁿
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx🏴󠁧󠁢󠁳󠁣󠁴󠁿 tails
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx🏴󠁧󠁢󠁳󠁣󠁴󠁿yyyyyyyyyyyyyyyyyyyyyyyyy
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx🧑🏽‍💻
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx🧑🏽‍💻 tails
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx🧑🏽‍💻yyyyyyyyyyyyyyyyyyyyyyyyy
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx🇺🇸
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx🇺🇸 tails
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx🇺🇸yyyyyyyyyyyyyyyyyyyyyyyyy
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx🏴󠁧󠁢󠁳󠁣󠁴󠁿
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx🏴󠁧󠁢󠁳󠁣󠁴󠁿 tails
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx🏴󠁧󠁢󠁳󠁣󠁴󠁿yyyyyyyyyyyyyyyyyyyyyyyyy
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx❤‍🔥
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx❤‍🔥 tails
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx❤‍🔥yyyyyyyyyyyyyyyyyyyyyyyyy
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx🇺🇸
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx🇺🇸 tails
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx🇺🇸yyyyyyyyyyyyyyyyyyyyyyyyy
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx👍🏼
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx👍🏼 tails
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx👍🏼yyyyyyyyyyyyyyyyyyyyyyyyy
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx0️⃣
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx0️⃣ tails
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx0️⃣yyyyyyyyyyyyyyyyyyyyyyyyy
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx🏴󠁧󠁢󠁳󠁣󠁴󠁿
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx🏴󠁧󠁢󠁳󠁣󠁴󠁿 tails
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx🏴󠁧󠁢󠁳󠁣󠁴󠁿yyyyyyyyyyyyyyyyyyyyyyyyy
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx🧑🏽‍💻
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx🧑🏽‍💻 tails
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx🧑🏽‍💻yyyyyyyyyyyyyyyyyyyyyyyyy
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx❤‍🔥
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx❤‍🔥 tails
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx❤‍🔥yyyyyyyyyyyyyyyyyyyyyyyyy
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx👍🏼
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx👍🏼 tails
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx👍🏼yyyyyyyyyyyyyyyyyyyyyyyyy
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx🧑🏽‍💻
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx🧑🏽‍💻 tails
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx🧑🏽‍💻yyyyyyyyyyyyyyyyyyyyyyyyy
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx👨‍👩‍👧‍👦
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx👨‍👩‍👧‍👦 tails
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx👨‍👩‍👧‍👦yyyyyyyyyyyyyyyyyyyyyyyyy
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx👍🏼
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx👍🏼 tails
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx👍🏼yyyyyyyyyyyyyyyyyyyyyyyyy
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx0️⃣
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx0️⃣ tails
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx0️⃣yyyyyyyyyyyyyyyyyyyyyyyyy
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx🏴󠁧󠁢󠁳󠁣󠁴󠁿
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx🏴󠁧󠁢󠁳󠁣󠁴󠁿 tails
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx🏴󠁧󠁢󠁳󠁣󠁴󠁿yyyyyyyyyyyyyyyyyyyyyyyyy
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx🧑🏽‍💻
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx🧑🏽‍💻 tails
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx🧑🏽‍💻yyyyyyyyyyyyyyyyyyyyyyyyy
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx❤‍🔥
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx❤‍🔥 tails
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx❤‍🔥yyyyyyyyyyyyyyyyyyyyyyyyy
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx👨‍👩‍👧‍👦
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx👨‍👩‍👧‍👦 tails
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx👨‍👩‍👧‍👦yyyyyyyyyyyyyyyyyyyyyyyyy
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx0️⃣
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx0️⃣ tails
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx0️⃣yyyyyyyyyyyyyyyyyyyyyyyyy
+cluster runs — the wrap lands inside the run
+run of 2 families: 👨‍👩‍👧👨‍👩‍👧
+run of 3 families: 👨‍👩‍👧👨‍👩‍👧👨‍👩‍👧
+run of 5 families: 👨‍👩‍👧👨‍👩‍👧👨‍👩‍👧👨‍👩‍👧👨‍👩‍👧
+run of 10 families: 👨‍👩‍👧👨‍👩‍👧👨‍👩‍👧👨‍👩‍👧👨‍👩‍👧👨‍👩‍👧👨‍👩‍👧👨‍👩‍👧👨‍👩‍👧👨‍👩‍👧
+run of 25 families: 👨‍👩‍👧👨‍👩‍👧👨‍👩‍👧👨‍👩‍👧👨‍👩‍👧👨‍👩‍👧👨‍👩‍👧👨‍👩‍👧👨‍👩‍👧👨‍👩‍👧👨‍👩‍👧👨‍👩‍👧👨‍👩‍👧👨‍👩‍👧👨‍👩‍👧👨‍👩‍👧👨‍👩‍👧👨‍👩‍👧👨‍👩‍👧👨‍👩‍👧👨‍👩‍👧👨‍👩‍👧👨‍👩‍👧👨‍👩‍👧👨‍👩‍👧
+run of 40 families: 👨‍👩‍👧👨‍👩‍👧👨‍👩‍👧👨‍👩‍👧👨‍👩‍👧👨‍👩‍👧👨‍👩‍👧👨‍👩‍👧👨‍👩‍👧👨‍👩‍👧👨‍👩‍👧👨‍👩‍👧👨‍👩‍👧👨‍👩‍👧👨‍👩‍👧👨‍👩‍👧👨‍👩‍👧👨‍👩‍👧👨‍👩‍👧👨‍👩‍👧👨‍👩‍👧👨‍👩‍👧👨‍👩‍👧👨‍👩‍👧👨‍👩‍👧👨‍👩‍👧👨‍👩‍👧👨‍👩‍👧👨‍👩‍👧👨‍👩‍👧👨‍👩‍👧👨‍👩‍👧👨‍👩‍👧👨‍👩‍👧👨‍👩‍👧👨‍👩‍👧👨‍👩‍👧👨‍👩‍👧👨‍👩‍👧👨‍👩‍👧
+run of 2 flags: 🇨🇦🇨🇦
+run of 3 flags: 🇨🇦🇨🇦🇨🇦
+run of 8 flags: 🇨🇦🇨🇦🇨🇦🇨🇦🇨🇦🇨🇦🇨🇦🇨🇦
+run of all five tones: 👍🏻👍🏼👍🏽👍🏾👍🏿👍🏻👍🏼👍🏽👍🏾👍🏿👍🏻👍🏼👍🏽👍🏾👍🏿👍🏻👍🏼👍🏽👍🏾👍🏿👍🏻👍🏼👍🏽👍🏾👍🏿👍🏻👍🏼👍🏽👍🏾👍🏿
+stride cluster glyph engine wrap quick census page lazy advance fold fox
+record stride cluster glyph engine wrap quick census page lazy advance fold 👨‍👩‍👧‍👦
+paginate record stride cluster glyph engine wrap quick census page lazy advance
+column paginate record stride cluster glyph engine wrap quick census page lazy
+trie column paginate record stride cluster glyph engine wrap quick census page
+chain trie column paginate record stride cluster glyph engine wrap quick census
+segment chain trie column paginate record stride cluster glyph engine wrap quick 🧑🏽‍💻
+scan segment chain trie column paginate record stride cluster glyph engine wrap
+extent scan segment chain trie column paginate record stride cluster glyph engine
+fox extent scan segment chain trie column paginate record stride cluster glyph
+fold fox extent scan segment chain trie column paginate record stride cluster
+advance fold fox extent scan segment chain trie column paginate record stride 0️⃣
+lazy advance fold fox extent scan segment chain trie column paginate record
+page lazy advance fold fox extent scan segment chain trie column paginate
+census page lazy advance fold fox extent scan segment chain trie column
+quick census page lazy advance fold fox extent scan segment chain trie
+wrap quick census page lazy advance fold fox extent scan segment chain 🇺🇸
+engine wrap quick census page lazy advance fold fox extent scan segment
+glyph engine wrap quick census page lazy advance fold fox extent scan
+cluster glyph engine wrap quick census page lazy advance fold fox extent
+stride cluster glyph engine wrap quick census page lazy advance fold fox
+record stride cluster glyph engine wrap quick census page lazy advance fold ❤‍🔥
+paginate record stride cluster glyph engine wrap quick census page lazy advance
+column paginate record stride cluster glyph engine wrap quick census page lazy
+trie column paginate record stride cluster glyph engine wrap quick census page
+chain trie column paginate record stride cluster glyph engine wrap quick census
+segment chain trie column paginate record stride cluster glyph engine wrap quick 🏴󠁧󠁢󠁳󠁣󠁴󠁿
+scan segment chain trie column paginate record stride cluster glyph engine wrap
+extent scan segment chain trie column paginate record stride cluster glyph engine
+fox extent scan segment chain trie column paginate record stride cluster glyph
+fold fox extent scan segment chain trie column paginate record stride cluster
+advance fold fox extent scan segment chain trie column paginate record stride 👍🏼
+lazy advance fold fox extent scan segment chain trie column paginate record
+page lazy advance fold fox extent scan segment chain trie column paginate
+census page lazy advance fold fox extent scan segment chain trie column
+quick census page lazy advance fold fox extent scan segment chain trie
+wrap quick census page lazy advance fold fox extent scan segment chain 👨‍👩‍👧‍👦
+engine wrap quick census page lazy advance fold fox extent scan segment
+glyph engine wrap quick census page lazy advance fold fox extent scan
+cluster glyph engine wrap quick census page lazy advance fold fox extent
+stride cluster glyph engine wrap quick census page lazy advance fold fox
+record stride cluster glyph engine wrap quick census page lazy advance fold 🧑🏽‍💻
+paginate record stride cluster glyph engine wrap quick census page lazy advance
+column paginate record stride cluster glyph engine wrap quick census page lazy
+trie column paginate record stride cluster glyph engine wrap quick census page
+chain trie column paginate record stride cluster glyph engine wrap quick census
+segment chain trie column paginate record stride cluster glyph engine wrap quick 0️⃣
+scan segment chain trie column paginate record stride cluster glyph engine wrap
+extent scan segment chain trie column paginate record stride cluster glyph engine
+fox extent scan segment chain trie column paginate record stride cluster glyph
+fold fox extent scan segment chain trie column paginate record stride cluster
+advance fold fox extent scan segment chain trie column paginate record stride 🇺🇸
+lazy advance fold fox extent scan segment chain trie column paginate record
+page lazy advance fold fox extent scan segment chain trie column paginate
+census page lazy advance fold fox extent scan segment chain trie column
+quick census page lazy advance fold fox extent scan segment chain trie
+wrap quick census page lazy advance fold fox extent scan segment chain ❤‍🔥
+engine wrap quick census page lazy advance fold fox extent scan segment
+glyph engine wrap quick census page lazy advance fold fox extent scan
+cluster glyph engine wrap quick census page lazy advance fold fox extent
+stride cluster glyph engine wrap quick census page lazy advance fold fox
+record stride cluster glyph engine wrap quick census page lazy advance fold 🏴󠁧󠁢󠁳󠁣󠁴󠁿
+paginate record stride cluster glyph engine wrap quick census page lazy advance
+column paginate record stride cluster glyph engine wrap quick census page lazy
+trie column paginate record stride cluster glyph engine wrap quick census page
+chain trie column paginate record stride cluster glyph engine wrap quick census
+segment chain trie column paginate record stride cluster glyph engine wrap quick 👍🏼
+scan segment chain trie column paginate record stride cluster glyph engine wrap
+extent scan segment chain trie column paginate record stride cluster glyph engine
+fox extent scan segment chain trie column paginate record stride cluster glyph
+fold fox extent scan segment chain trie column paginate record stride cluster
+advance fold fox extent scan segment chain trie column paginate record stride 👨‍👩‍👧‍👦
+lazy advance fold fox extent scan segment chain trie column paginate record
+page lazy advance fold fox extent scan segment chain trie column paginate
+census page lazy advance fold fox extent scan segment chain trie column
+quick census page lazy advance fold fox extent scan segment chain trie
+wrap quick census page lazy advance fold fox extent scan segment chain 🧑🏽‍💻
+engine wrap quick census page lazy advance fold fox extent scan segment
+glyph engine wrap quick census page lazy advance fold fox extent scan
+cluster glyph engine wrap quick census page lazy advance fold fox extent
+stride cluster glyph engine wrap quick census page lazy advance fold fox
+record stride cluster glyph engine wrap quick census page lazy advance fold 0️⃣
+paginate record stride cluster glyph engine wrap quick census page lazy advance
+column paginate record stride cluster glyph engine wrap quick census page lazy
+trie column paginate record stride cluster glyph engine wrap quick census page
+chain trie column paginate record stride cluster glyph engine wrap quick census
+segment chain trie column paginate record stride cluster glyph engine wrap quick 🇺🇸
+scan segment chain trie column paginate record stride cluster glyph engine wrap
+extent scan segment chain trie column paginate record stride cluster glyph engine
+fox extent scan segment chain trie column paginate record stride cluster glyph
+fold fox extent scan segment chain trie column paginate record stride cluster
+advance fold fox extent scan segment chain trie column paginate record stride ❤‍🔥
+lazy advance fold fox extent scan segment chain trie column paginate record
+page lazy advance fold fox extent scan segment chain trie column paginate
+census page lazy advance fold fox extent scan segment chain trie column
+quick census page lazy advance fold fox extent scan segment chain trie
+wrap quick census page lazy advance fold fox extent scan segment chain 🏴󠁧󠁢󠁳󠁣󠁴󠁿
+engine wrap quick census page lazy advance fold fox extent scan segment
+glyph engine wrap quick census page lazy advance fold fox extent scan
+cluster glyph engine wrap quick census page lazy advance fold fox extent
+stride cluster glyph engine wrap quick census page lazy advance fold fox
+record stride cluster glyph engine wrap quick census page lazy advance fold 👍🏼
+paginate record stride cluster glyph engine wrap quick census page lazy advance
+column paginate record stride cluster glyph engine wrap quick census page lazy
+trie column paginate record stride cluster glyph engine wrap quick census page
+chain trie column paginate record stride cluster glyph engine wrap quick census
+segment chain trie column paginate record stride cluster glyph engine wrap quick 👨‍👩‍👧‍👦
+scan segment chain trie column paginate record stride cluster glyph engine wrap
+extent scan segment chain trie column paginate record stride cluster glyph engine
+fox extent scan segment chain trie column paginate record stride cluster glyph
+fold fox extent scan segment chain trie column paginate record stride cluster
+advance fold fox extent scan segment chain trie column paginate record stride 🧑🏽‍💻
+lazy advance fold fox extent scan segment chain trie column paginate record
+page lazy advance fold fox extent scan segment chain trie column paginate
+page-boundary row 254: 👨‍👩‍👧‍👦 🇯🇵 👍🏻 🏴󠁧󠁢󠁥󠁮󠁧󠁿 ❤‍🔥 record stride cluster glyph engine wrap
+page-boundary row 255: 👨‍👩‍👧‍👦 🇯🇵 👍🏼 🏴󠁧󠁢󠁳󠁣󠁴󠁿 ❤‍🔥 glyph engine wrap quick census page
+page-boundary row 256: 👨‍👩‍👧‍👦 🇯🇵 👍🏽 🏴󠁧󠁢󠁷󠁬󠁳󠁿 ❤‍🔥 quick census page lazy advance fold
+page-boundary row 257: 👨‍👩‍👧‍👦 🇯🇵 👍🏾 🏴󠁿 ❤‍🔥 lazy advance fold fox extent scan
+page-boundary row 258: 👨‍👩‍👧‍👦 🇯🇵 👍🏿 🏴󠁧󠁢󠁥󠁮󠁧󠁿 ❤‍🔥 fox extent scan segment chain trie
+quick census page lazy advance fold fox extent scan segment chain trie column paginate
+extent scan segment chain trie column paginate record stride cluster glyph engine wrap quick
+record stride cluster glyph engine wrap quick census page lazy advance fold fox extent
+census page lazy advance fold fox extent scan segment chain trie column paginate record
+scan segment chain trie column paginate record stride cluster glyph engine wrap quick census 0️⃣ quick census page
+stride cluster glyph engine wrap quick census page lazy advance fold fox extent scan
+page lazy advance fold fox extent scan segment chain trie column paginate record stride
+segment chain trie column paginate record stride cluster glyph engine wrap quick census page
+cluster glyph engine wrap quick census page lazy advance fold fox extent scan segment
+lazy advance fold fox extent scan segment chain trie column paginate record stride cluster 🇺🇸 stride cluster glyph
+chain trie column paginate record stride cluster glyph engine wrap quick census page lazy
+glyph engine wrap quick census page lazy advance fold fox extent scan segment chain
+advance fold fox extent scan segment chain trie column paginate record stride cluster glyph
+trie column paginate record stride cluster glyph engine wrap quick census page lazy advance
+engine wrap quick census page lazy advance fold fox extent scan segment chain trie ❤‍🔥 chain trie column
+fold fox extent scan segment chain trie column paginate record stride cluster glyph engine
+column paginate record stride cluster glyph engine wrap quick census page lazy advance fold
+wrap quick census page lazy advance fold fox extent scan segment chain trie column
+fox extent scan segment chain trie column paginate record stride cluster glyph engine wrap
+paginate record stride cluster glyph engine wrap quick census page lazy advance fold fox 🏴󠁧󠁢󠁳󠁣󠁴󠁿 fold fox extent
+quick census page lazy advance fold fox extent scan segment chain trie column paginate
+extent scan segment chain trie column paginate record stride cluster glyph engine wrap quick
+record stride cluster glyph engine wrap quick census page lazy advance fold fox extent
+census page lazy advance fold fox extent scan segment chain trie column paginate record
+scan segment chain trie column paginate record stride cluster glyph engine wrap quick census 👍🏼 quick census page
+stride cluster glyph engine wrap quick census page lazy advance fold fox extent scan
+page lazy advance fold fox extent scan segment chain trie column paginate record stride
+segment chain trie column paginate record stride cluster glyph engine wrap quick census page
+cluster glyph engine wrap quick census page lazy advance fold fox extent scan segment
+lazy advance fold fox extent scan segment chain trie column paginate record stride cluster 👨‍👩‍👧‍👦 stride cluster glyph
+chain trie column paginate record stride cluster glyph engine wrap quick census page lazy
+glyph engine wrap quick census page lazy advance fold fox extent scan segment chain
+advance fold fox extent scan segment chain trie column paginate record stride cluster glyph
+trie column paginate record stride cluster glyph engine wrap quick census page lazy advance
+engine wrap quick census page lazy advance fold fox extent scan segment chain trie 🧑🏽‍💻 chain trie column
+fold fox extent scan segment chain trie column paginate record stride cluster glyph engine
+column paginate record stride cluster glyph engine wrap quick census page lazy advance fold
+wrap quick census page lazy advance fold fox extent scan segment chain trie column
+fox extent scan segment chain trie column paginate record stride cluster glyph engine wrap
+paginate record stride cluster glyph engine wrap quick census page lazy advance fold fox 0️⃣ fold fox extent
+quick census page lazy advance fold fox extent scan segment chain trie column paginate
+extent scan segment chain trie column paginate record stride cluster glyph engine wrap quick
+record stride cluster glyph engine wrap quick census page lazy advance fold fox extent
+census page lazy advance fold fox extent scan segment chain trie column paginate record
+scan segment chain trie column paginate record stride cluster glyph engine wrap quick census 🇺🇸 quick census page
+stride cluster glyph engine wrap quick census page lazy advance fold fox extent scan
+page lazy advance fold fox extent scan segment chain trie column paginate record stride
+segment chain trie column paginate record stride cluster glyph engine wrap quick census page
+cluster glyph engine wrap quick census page lazy advance fold fox extent scan segment
+lazy advance fold fox extent scan segment chain trie column paginate record stride cluster ❤‍🔥 stride cluster glyph
+chain trie column paginate record stride cluster glyph engine wrap quick census page lazy
+glyph engine wrap quick census page lazy advance fold fox extent scan segment chain
+advance fold fox extent scan segment chain trie column paginate record stride cluster glyph
+trie column paginate record stride cluster glyph engine wrap quick census page lazy advance
+engine wrap quick census page lazy advance fold fox extent scan segment chain trie 🏴󠁧󠁢󠁳󠁣󠁴󠁿 chain trie column
+fold fox extent scan segment chain trie column paginate record stride cluster glyph engine
+column paginate record stride cluster glyph engine wrap quick census page lazy advance fold
+wrap quick census page lazy advance fold fox extent scan segment chain trie column
+fox extent scan segment chain trie column paginate record stride cluster glyph engine wrap
+paginate record stride cluster glyph engine wrap quick census page lazy advance fold fox 👍🏼 fold fox extent
+quick census page lazy advance fold fox extent scan segment chain trie column paginate
+extent scan segment chain trie column paginate record stride cluster glyph engine wrap quick
+record stride cluster glyph engine wrap quick census page lazy advance fold fox extent
+census page lazy advance fold fox extent scan segment chain trie column paginate record
+scan segment chain trie column paginate record stride cluster glyph engine wrap quick census 👨‍👩‍👧‍👦 quick census page
+stride cluster glyph engine wrap quick census page lazy advance fold fox extent scan
+page lazy advance fold fox extent scan segment chain trie column paginate record stride
+segment chain trie column paginate record stride cluster glyph engine wrap quick census page
+cluster glyph engine wrap quick census page lazy advance fold fox extent scan segment
+lazy advance fold fox extent scan segment chain trie column paginate record stride cluster 🧑🏽‍💻 stride cluster glyph
+chain trie column paginate record stride cluster glyph engine wrap quick census page lazy
+glyph engine wrap quick census page lazy advance fold fox extent scan segment chain
+advance fold fox extent scan segment chain trie column paginate record stride cluster glyph
+trie column paginate record stride cluster glyph engine wrap quick census page lazy advance
+engine wrap quick census page lazy advance fold fox extent scan segment chain trie 0️⃣ chain trie column
+fold fox extent scan segment chain trie column paginate record stride cluster glyph engine
+column paginate record stride cluster glyph engine wrap quick census page lazy advance fold
+wrap quick census page lazy advance fold fox extent scan segment chain trie column
+fox extent scan segment chain trie column paginate record stride cluster glyph engine wrap
+paginate record stride cluster glyph engine wrap quick census page lazy advance fold fox 🇺🇸 fold fox extent
+quick census page lazy advance fold fox extent scan segment chain trie column paginate
+extent scan segment chain trie column paginate record stride cluster glyph engine wrap quick
+record stride cluster glyph engine wrap quick census page lazy advance fold fox extent
+census page lazy advance fold fox extent scan segment chain trie column paginate record
+scan segment chain trie column paginate record stride cluster glyph engine wrap quick census ❤‍🔥 quick census page
+stride cluster glyph engine wrap quick census page lazy advance fold fox extent scan
+page lazy advance fold fox extent scan segment chain trie column paginate record stride
+segment chain trie column paginate record stride cluster glyph engine wrap quick census page
+cluster glyph engine wrap quick census page lazy advance fold fox extent scan segment
+lazy advance fold fox extent scan segment chain trie column paginate record stride cluster 🏴󠁧󠁢󠁳󠁣󠁴󠁿 stride cluster glyph
+chain trie column paginate record stride cluster glyph engine wrap quick census page lazy
+glyph engine wrap quick census page lazy advance fold fox extent scan segment chain
+advance fold fox extent scan segment chain trie column paginate record stride cluster glyph
+trie column paginate record stride cluster glyph engine wrap quick census page lazy advance
+engine wrap quick census page lazy advance fold fox extent scan segment chain trie 👍🏼 chain trie column
+fold fox extent scan segment chain trie column paginate record stride cluster glyph engine
+column paginate record stride cluster glyph engine wrap quick census page lazy advance fold
+wrap quick census page lazy advance fold fox extent scan segment chain trie column
+fox extent scan segment chain trie column paginate record stride cluster glyph engine wrap
+paginate record stride cluster glyph engine wrap quick census page lazy advance fold fox 👨‍👩‍👧‍👦 fold fox extent
+quick census page lazy advance fold fox extent scan segment chain trie column paginate
+extent scan segment chain trie column paginate record stride cluster glyph engine wrap quick
+record stride cluster glyph engine wrap quick census page lazy advance fold fox extent
+census page lazy advance fold fox extent scan segment chain trie column paginate record
+scan segment chain trie column paginate record stride cluster glyph engine wrap quick census 🧑🏽‍💻 quick census page
+stride cluster glyph engine wrap quick census page lazy advance fold fox extent scan
+page lazy advance fold fox extent scan segment chain trie column paginate record stride
+segment chain trie column paginate record stride cluster glyph engine wrap quick census page
+cluster glyph engine wrap quick census page lazy advance fold fox extent scan segment
+lazy advance fold fox extent scan segment chain trie column paginate record stride cluster 0️⃣ stride cluster glyph
+chain trie column paginate record stride cluster glyph engine wrap quick census page lazy
+glyph engine wrap quick census page lazy advance fold fox extent scan segment chain
+advance fold fox extent scan segment chain trie column paginate record stride cluster glyph
+trie column paginate record stride cluster glyph engine wrap quick census page lazy advance
+engine wrap quick census page lazy advance fold fox extent scan segment chain trie 🇺🇸 chain trie column
+fold fox extent scan segment chain trie column paginate record stride cluster glyph engine
+column paginate record stride cluster glyph engine wrap quick census page lazy advance fold
+wrap quick census page lazy advance fold fox extent scan segment chain trie column
+fox extent scan segment chain trie column paginate record stride cluster glyph engine wrap
+paginate record stride cluster glyph engine wrap quick census page lazy advance fold fox ❤‍🔥 fold fox extent
+quick census page lazy advance fold fox extent scan segment chain trie column paginate
+extent scan segment chain trie column paginate record stride cluster glyph engine wrap quick
+record stride cluster glyph engine wrap quick census page lazy advance fold fox extent
+census page lazy advance fold fox extent scan segment chain trie column paginate record
+scan segment chain trie column paginate record stride cluster glyph engine wrap quick census 🏴󠁧󠁢󠁳󠁣󠁴󠁿 quick census page
+stride cluster glyph engine wrap quick census page lazy advance fold fox extent scan
+page lazy advance fold fox extent scan segment chain trie column paginate record stride
+segment chain trie column paginate record stride cluster glyph engine wrap quick census page
+cluster glyph engine wrap quick census page lazy advance fold fox extent scan segment
+lazy advance fold fox extent scan segment chain trie column paginate record stride cluster 👍🏼 stride cluster glyph
+chain trie column paginate record stride cluster glyph engine wrap quick census page lazy
+glyph engine wrap quick census page lazy advance fold fox extent scan segment chain
+advance fold fox extent scan segment chain trie column paginate record stride cluster glyph
+trie column paginate record stride cluster glyph engine wrap quick census page lazy advance
+engine wrap quick census page lazy advance fold fox extent scan segment chain trie 👨‍👩‍👧‍👦 chain trie column
+fold fox extent scan segment chain trie column paginate record stride cluster glyph engine
+column paginate record stride cluster glyph engine wrap quick census page lazy advance fold
+wrap quick census page lazy advance fold fox extent scan segment chain trie column
+fox extent scan segment chain trie column paginate record stride cluster glyph engine wrap
+paginate record stride cluster glyph engine wrap quick census page lazy advance fold fox 🧑🏽‍💻 fold fox extent
+quick census page lazy advance fold fox extent scan segment chain trie column paginate
+extent scan segment chain trie column paginate record stride cluster glyph engine wrap quick
+record stride cluster glyph engine wrap quick census page lazy advance fold fox extent
+census page lazy advance fold fox extent scan segment chain trie column paginate record
+scan segment chain trie column paginate record stride cluster glyph engine wrap quick census 0️⃣ quick census page
+stride cluster glyph engine wrap quick census page lazy advance fold fox extent scan
+page lazy advance fold fox extent scan segment chain trie column paginate record stride
+segment chain trie column paginate record stride cluster glyph engine wrap quick census page
+cluster glyph engine wrap quick census page lazy advance fold fox extent scan segment
+lazy advance fold fox extent scan segment chain trie column paginate record stride cluster 🇺🇸 stride cluster glyph
+chain trie column paginate record stride cluster glyph engine wrap quick census page lazy
+glyph engine wrap quick census page lazy advance fold fox extent scan segment chain
+advance fold fox extent scan segment chain trie column paginate record stride cluster glyph
+trie column paginate record stride cluster glyph engine wrap quick census page lazy advance
+engine wrap quick census page lazy advance fold fox extent scan segment chain trie ❤‍🔥 chain trie column
+fold fox extent scan segment chain trie column paginate record stride cluster glyph engine
+column paginate record stride cluster glyph engine wrap quick census page lazy advance fold
+wrap quick census page lazy advance fold fox extent scan segment chain trie column
+fox extent scan segment chain trie column paginate record stride cluster glyph engine wrap
+paginate record stride cluster glyph engine wrap quick census page lazy advance fold fox 🏴󠁧󠁢󠁳󠁣󠁴󠁿 fold fox extent
+quick census page lazy advance fold fox extent scan segment chain trie column paginate
+extent scan segment chain trie column paginate record stride cluster glyph engine wrap quick
+record stride cluster glyph engine wrap quick census page lazy advance fold fox extent
+census page lazy advance fold fox extent scan segment chain trie column paginate record
+scan segment chain trie column paginate record stride cluster glyph engine wrap quick census 👍🏼 quick census page
+stride cluster glyph engine wrap quick census page lazy advance fold fox extent scan
+page lazy advance fold fox extent scan segment chain trie column paginate record stride
+segment chain trie column paginate record stride cluster glyph engine wrap quick census page
+cluster glyph engine wrap quick census page lazy advance fold fox extent scan segment
+lazy advance fold fox extent scan segment chain trie column paginate record stride cluster 👨‍👩‍👧‍👦 stride cluster glyph
+chain trie column paginate record stride cluster glyph engine wrap quick census page lazy
+glyph engine wrap quick census page lazy advance fold fox extent scan segment chain
+advance fold fox extent scan segment chain trie column paginate record stride cluster glyph
+trie column paginate record stride cluster glyph engine wrap quick census page lazy advance
+engine wrap quick census page lazy advance fold fox extent scan segment chain trie 🧑🏽‍💻 chain trie column
+fold fox extent scan segment chain trie column paginate record stride cluster glyph engine
+column paginate record stride cluster glyph engine wrap quick census page lazy advance fold
+wrap quick census page lazy advance fold fox extent scan segment chain trie column
+fox extent scan segment chain trie column paginate record stride cluster glyph engine wrap
+paginate record stride cluster glyph engine wrap quick census page lazy advance fold fox 0️⃣ fold fox extent
+quick census page lazy advance fold fox extent scan segment chain trie column paginate
+extent scan segment chain trie column paginate record stride cluster glyph engine wrap quick
+record stride cluster glyph engine wrap quick census page lazy advance fold fox extent
+census page lazy advance fold fox extent scan segment chain trie column paginate record
+scan segment chain trie column paginate record stride cluster glyph engine wrap quick census 🇺🇸 quick census page
+stride cluster glyph engine wrap quick census page lazy advance fold fox extent scan
+page lazy advance fold fox extent scan segment chain trie column paginate record stride
+segment chain trie column paginate record stride cluster glyph engine wrap quick census page
+cluster glyph engine wrap quick census page lazy advance fold fox extent scan segment
+lazy advance fold fox extent scan segment chain trie column paginate record stride cluster ❤‍🔥 stride cluster glyph
+chain trie column paginate record stride cluster glyph engine wrap quick census page lazy
+👨‍👩‍👧‍👦

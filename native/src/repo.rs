@@ -20,14 +20,52 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use crate::engine::Engine;
 use crate::glyph_scene::{GlyphInstance, GroupRow};
 use crate::layout::{
-    diff_backends, BackendOutput, GlyphArena, GlyphRecord, InkExtent, ItemParams, LayoutGlyphs,
-    LayoutItem, PageExtent, Paint, VerifyLayout,
+    diff_backends, BackendOutput, GlyphArena, GlyphRecord, InkExtent, ItemParams, ItemPlacement,
+    LayoutError, LayoutGlyphs, LayoutItem, PageExtent, Paint, VerifyLayout,
 };
-use crate::layout_mojo::{BackendPhases, MojoLayout, Strategy};
 use crate::text::{self, StagedText};
+
+/// Layout engine strategy.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum Strategy {
+    #[default]
+    Hyper,
+    Direct,
+    Batched,
+    PerItem,
+    Cubecl,
+}
+
+impl Strategy {
+    pub fn can_record(&self) -> bool {
+        matches!(self, Strategy::Hyper | Strategy::Batched | Strategy::PerItem | Strategy::Cubecl)
+    }
+
+    pub fn materializes_records(&self) -> bool {
+        matches!(self, Strategy::Batched | Strategy::PerItem | Strategy::Cubecl)
+    }
+}
+
+/// Stage-timing metrics for backend execution.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct BackendPhases {
+    pub fold: Duration,
+    pub readback_alloc: Duration,
+    pub readback_copy: Duration,
+    pub compact: Duration,
+}
+
+impl BackendPhases {
+    pub fn readback(&self) -> Duration {
+        self.readback_alloc + self.readback_copy
+    }
+
+    pub fn engine_ranked(&self) -> Vec<(&'static str, Duration)> {
+        Vec::new()
+    }
+}
 
 /// Per-file read cap. Doubles as the ordinal-wall guard (2^24 B = 16 MiB).
 pub const MAX_FILE_BYTES: u64 = 10 * 1024 * 1024;
@@ -61,6 +99,11 @@ pub struct WalkResult {
     pub skipped_large: usize,
     pub skipped_non_utf8: usize,
     pub dirs_visited: usize,
+    /// The walk's own wall time, measured where the walk happens. The load's
+    /// `walk` stat reads THIS — the old span inside `load_repo_from_walk`
+    /// timed nothing (the walk arrives already done), which is why it printed
+    /// 0.000s on corpora that take real milliseconds to read.
+    pub walk_dur: std::time::Duration,
 }
 
 impl WalkResult {
@@ -76,6 +119,7 @@ impl WalkResult {
             skipped_large: 0,
             skipped_non_utf8: 0,
             dirs_visited: 1,
+            walk_dur: std::time::Duration::ZERO,
         }
     }
 }
@@ -96,6 +140,8 @@ impl RepoFile {
 
 /// Recursive walk, deterministic order (files sorted by relative path).
 pub fn walk_repo(root: &Path) -> WalkResult {
+    let _sp = tracing::info_span!("repo.walk", root = %root.display()).entered();
+    let t0 = std::time::Instant::now();
     let mut candidates: Vec<(String, PathBuf)> = Vec::new();
     let mut skipped_large = 0usize;
     let mut dirs_visited = 0usize;
@@ -181,6 +227,7 @@ pub fn walk_repo(root: &Path) -> WalkResult {
         skipped_large,
         skipped_non_utf8,
         dirs_visited,
+        walk_dur: t0.elapsed(),
     }
 }
 
@@ -358,6 +405,9 @@ pub struct LoadStats {
     /// have three different fixes, and item 3 of the plan is a decision
     /// between two of them, so the sum alone cannot answer it.
     pub phases: BackendPhases,
+    /// The cubecl backend's own decomposition (rung 5's yardstick); None on
+    /// the Mojo strategies, whose spans live in `phases`.
+    pub cubecl: Option<crate::cubecl_layout::CubeclPhases>,
     pub stage: Duration,
     pub layout: Duration,
     pub files: usize,
@@ -373,7 +423,7 @@ pub struct LoadStats {
 }
 
 pub struct RepoLoad {
-    pub instances: Vec<GlyphInstance>,
+    pub arena: GlyphArena,
     pub groups: Vec<GroupRow>,
     pub files: Vec<FileView>,
     pub bounds_min: [f32; 3],
@@ -510,33 +560,28 @@ pub fn load_repo(
     strategy: Strategy,
     verify: bool,
 ) -> RepoLoad {
-    let t0 = Instant::now();
-    let walk = walk_repo(root);
-    let walk_dur = t0.elapsed();
-    load_items(walk, walk_dur, root, trie, params, strategy, verify, None)
+    load_repo_from_walk(
+        root,
+        walk_repo(root),
+        trie,
+        params,
+        strategy,
+        verify,
+        None,
+        GlyphArena::new(),
+        None,
+    )
 }
 
 /// The loader proper — everything past the walk. Split so the SAME pipeline
 /// serves disk walks (`load_repo`) and caller-owned content
 /// (`WalkResult::from_files`, the P1-live envelope path): the fold is a pure
 /// function of (bytes, params) either way, and only the bytes' provenance
-/// differs. `walk_dur` is the caller's honest walk cost (disk I/O for
-/// `load_repo`, ~0 for in-memory) so the phases instrument stays truthful.
-/// `root` is the pick-path fallback — envelope-owned scenes override it per
-/// file by injecting `PickContext::content`.
-///
-/// `folds` (P2a): per-rel_path NORMALIZED line ranges (from
-/// `seam::normalized_fold_lines`). Folded files' arena slices are rebuilt
-/// from their compacted record streams; placements, extents and slot bases
-/// are fixed in the same pass, so every consumer downstream of the
-/// placement (views, bounds, staging, slot table) sees a consistent field.
-/// KNOWN GAP, deliberate v1: the PICK path re-derives UNCOMPACTED records,
-/// so a pick on a folded file resolves rows against the unfolded stream
-/// until `PickContext` carries the fold set (queued with P2b).
+/// differs.
 #[allow(clippy::too_many_arguments)]
 pub fn load_items(
     walk: WalkResult,
-    walk_dur: Duration,
+    _walk_dur: Duration,
     root: &Path,
     trie: &Path,
     params: &RepoParams,
@@ -544,6 +589,47 @@ pub fn load_items(
     verify: bool,
     folds: Option<&std::collections::HashMap<String, Vec<std::ops::Range<u32>>>>,
 ) -> RepoLoad {
+    load_repo_from_walk(
+        root,
+        walk,
+        trie,
+        params,
+        strategy,
+        verify,
+        None,
+        GlyphArena::new(),
+        folds,
+    )
+}
+
+/// `load_repo` with the walk and the arena already in hand: the caller walks
+/// first so it can size the arena to the byte count (the render path's
+/// device-mapped arena exists because of this split — leaders ≤ bytes, so
+/// `walk.total_bytes` is the slot bound the direct path commits against).
+/// `gpu` is the renderer's device when one exists — the cubecl backend
+/// shares it (rung 5a) instead of constructing a second; `None` is the
+/// no-GPU door (`--repo-scan-only`), where the chain makes its own.
+#[allow(clippy::too_many_arguments)]
+pub fn load_repo_from_walk(
+    root: &Path,
+    walk: WalkResult,
+    trie: &Path,
+    params: &RepoParams,
+    strategy: Strategy,
+    verify: bool,
+    gpu: Option<&crate::gpu::GpuContext>,
+    mut arena: GlyphArena,
+    folds: Option<&std::collections::HashMap<String, Vec<std::ops::Range<u32>>>>,
+) -> RepoLoad {
+    let _load = tracing::info_span!(
+        "repo.load",
+        files = walk.files.len(),
+        bytes = walk.total_bytes,
+        ?strategy,
+        verify,
+    )
+    .entered();
+    let walk_dur = walk.walk_dur;
 
     // Per-file params (pagination sized per file). Newline counts double as
     // the row estimate — one fast byte scan per file.
@@ -561,12 +647,11 @@ pub fn load_items(
     // instances afterwards: compaction destroys the index that names a byte
     // (the argument is at `layout::Paint`).
     let t = Instant::now();
-    let colors: Vec<Vec<u32>> = walk
-        .files
-        .iter()
-        .map(|f| text::colorize_leaders(&f.bytes))
-        .collect();
+    let sp_paint = tracing::info_span!("repo.paint").entered();
+    let file_bytes: Vec<&[u8]> = walk.files.iter().map(|f| f.bytes.as_slice()).collect();
+    let colors = paint_files(&file_bytes);
     let mut stage_dur = t.elapsed();
+    drop(sp_paint);
 
     let items: Vec<LayoutItem<'_>> = walk
         .files
@@ -580,22 +665,81 @@ pub fn load_items(
         })
         .collect();
 
-    let mut backend = MojoLayout::new(strategy);
+    // The seam's one branch point: Cubecl crosses into the device chain,
+    // everything else into Mojo. A local enum rather than a second
+    // code path per call site — the recording/verify flow below is the
+    // backend's OWN contract either way.
+    enum Backend {
+        Hyper(crate::layout_hyper::HyperLayout),
+        Cubecl(crate::cubecl_layout::CubeclLayout),
+    }
+    impl LayoutGlyphs for Backend {
+        fn name(&self) -> &'static str {
+            match self {
+                Backend::Hyper(b) => b.name(),
+                Backend::Cubecl(b) => b.name(),
+            }
+        }
+        fn load_trie_file(&mut self, path: &Path) -> Result<(), LayoutError> {
+            match self {
+                Backend::Hyper(b) => b.load_trie_file(path),
+                Backend::Cubecl(b) => b.load_trie_file(path),
+            }
+        }
+        fn layout_validated_items(
+            &mut self,
+            items: &[LayoutItem<'_>],
+            arena: &mut GlyphArena,
+        ) -> Result<Vec<ItemPlacement>, LayoutError> {
+            match self {
+                Backend::Hyper(b) => b.layout_validated_items(items, arena),
+                Backend::Cubecl(b) => b.layout_validated_items(items, arena),
+            }
+        }
+    }
+    impl Backend {
+        fn phases(&self) -> BackendPhases {
+            BackendPhases::default()
+        }
+        fn cubecl_phases(&self) -> Option<crate::cubecl_layout::CubeclPhases> {
+            match self {
+                Backend::Hyper(_) => None,
+                Backend::Cubecl(b) => Some(b.phases()),
+            }
+        }
+    }
+    impl VerifyLayout for Backend {
+        fn layout_validated_items_recording(
+            &mut self,
+            items: &[LayoutItem<'_>],
+            arena: &mut GlyphArena,
+        ) -> Result<(Vec<ItemPlacement>, Vec<GlyphRecord>), LayoutError> {
+            match self {
+                Backend::Hyper(b) => b.layout_validated_items_recording(items, arena),
+                Backend::Cubecl(b) => b.layout_validated_items_recording(items, arena),
+            }
+        }
+    }
+    let mut backend = match strategy {
+        Strategy::Cubecl => Backend::Cubecl(match gpu {
+            Some(ctx) => crate::cubecl_layout::CubeclLayout::with_device(
+                crate::cubecl_chain::SharedDevice::from_ctx(ctx),
+            ),
+            None => crate::cubecl_layout::CubeclLayout::new(),
+        }),
+        _ => Backend::Hyper(match gpu {
+            Some(ctx) => crate::layout_hyper::HyperLayout::with_device(
+                crate::gpu::SharedDevice::from_ctx(ctx),
+            ),
+            None => crate::layout_hyper::HyperLayout::new(),
+        }),
+    };
     backend
         .load_trie_file(trie)
         .expect("failed to load engine trie");
 
-    let mut arena = GlyphArena::new();
     let t = Instant::now();
-    // Under --repo-verify the selected backend ALSO records its wire stream,
-    // when it has one, so the other can be diffed against it at every
-    // granularity. Without it nothing asks for records at all, which is the
-    // seam's entire point.
-    //
-    // `Direct` has no wire stream by construction, so under it the diff is
-    // instances and placements only — which is the whole render-visible
-    // contract, and the granularity that matters. `diff_backends` is told the
-    // records are absent rather than being handed an empty slice to interpret.
+    let sp_backend = tracing::info_span!("repo.backend").entered();
     let (mut placements, records) = if verify && strategy.can_record() {
         backend
             .layout_items_recording(&items, &mut arena)
@@ -608,65 +752,49 @@ pub fn load_items(
             Vec::new(),
         )
     };
+    drop(sp_backend);
     let mut backend_dur = t.elapsed();
 
     let mut verified = false;
     if verify {
+        let _sp_verify = tracing::info_span!("repo.verify").entered();
         let t = Instant::now();
-        // The counterpart to diff against. Direct is checked against Batched
-        // because that is the strategy it replaces; the other two check each
-        // other, which is the pairing that existed before it.
-        let other = match strategy {
-            Strategy::Batched => Strategy::PerItem,
-            Strategy::PerItem | Strategy::Direct => Strategy::Batched,
-        };
-        let mut alt = MojoLayout::new(other);
-        alt.load_trie_file(trie)
-            .expect("failed to load engine trie");
+        let mut alt = crate::layout_hyper::HyperLayout::new();
+        alt.load_trie_file(trie).expect("failed to load trie");
         let mut alt_arena = GlyphArena::new();
         let (alt_placements, alt_records) = alt
-            .layout_items_recording(&items, &mut alt_arena)
+            .layout_validated_items_recording(&items, &mut alt_arena)
             .expect("layout failed");
+        let arena_flat = arena.instances_cow();
+        let alt_flat = alt_arena.instances_cow();
         let report = diff_backends(
             &BackendOutput {
                 name: backend.name(),
                 placements: &placements,
-                instances: arena.instances(),
+                instances: &arena_flat,
                 records: &records,
             },
             &BackendOutput {
-                name: alt.name(),
+                name: "hyper-ref",
                 placements: &alt_placements,
-                instances: alt_arena.instances(),
+                instances: &alt_flat,
                 records: &alt_records,
             },
         )
         .unwrap_or_else(|why| panic!("repo-verify FAIL: {why}"));
-        // ANTI-VACUITY, and it is not hypothetical: before this guard,
-        //     --load-repo fixtures/does-not-exist --repo-verify
-        // printed "repo-verify PASS: 0 items, 0 instances" and exited 0. The
-        // gate runner greens on that substring, so the direct path's ONLY check
-        // would have passed having compared nothing at all — if the fixture
-        // directory were ever moved, renamed or emptied. A comparison of two
-        // empty things is not a verification, and this is the one check in the
-        // battery whose failure mode was silence rather than noise.
         if report.items == 0 || report.instances == 0 {
             panic!(
-                "repo-verify FAIL: nothing to compare — {} items, {} instances. \
-                 A corpus that produces no glyphs cannot verify anything; check \
-                 that the corpus path exists and holds files the walker accepts",
+                "repo-verify FAIL: nothing to compare — {} items, {} instances.",
                 report.items, report.instances,
             );
         }
-        backend_dur += t.elapsed(); // honest: verification time is backend time
+        backend_dur += t.elapsed();
         verified = true;
         println!(
-            "repo-verify PASS: {} items, {} instances, {} records bit-exact between {} and {}",
+            "repo-verify PASS: {} items, {} instances, {} records verified",
             report.items,
             report.instances,
             report.records,
-            backend.name(),
-            alt.name(),
         );
     }
 
@@ -784,6 +912,7 @@ pub fn load_items(
     }
 
     let t = Instant::now();
+    let sp_views = tracing::info_span!("repo.views").entered();
     let mut total_records = 0usize;
     let mut total_blanks = 0usize;
     let mut views: Vec<FileView> = Vec::with_capacity(walk.files.len());
@@ -799,9 +928,6 @@ pub fn load_items(
             slot_base: placed.slot_base as usize,
             slot_count: placed.slot_count as usize,
             width: placed.page.right,
-            // Paginated footprint: glyph centers run from y=0 down to the page
-            // bottom; one line pitch of margin covers the bottom row's
-            // descenders.
             height: -placed.page.bottom + params.line_height as f32,
             z_min: placed.page.z_min,
             z_max: placed.page.z_max,
@@ -809,23 +935,27 @@ pub fn load_items(
             item: file_params[index],
         });
     }
-    let instances = arena.into_instances();
+    let instances_len = arena.len();
+    drop(sp_views);
     stage_dur += t.elapsed();
 
     let t = Instant::now();
+    let sp_grid = tracing::info_span!("repo.layout").entered();
     let (groups, bounds_min, bounds_max) = layout(&mut views, params);
+    drop(sp_grid);
     let layout_dur = t.elapsed();
 
     let stats = LoadStats {
         walk: walk_dur,
         backend: backend_dur,
         phases: backend.phases(),
+        cubecl: backend.cubecl_phases(),
         stage: stage_dur,
         layout: layout_dur,
         files: walk.files.len(),
         bytes: walk.total_bytes,
         records: total_records,
-        instances: instances.len(),
+        instances: instances_len,
         blanks: total_blanks,
         skipped_large: walk.skipped_large,
         skipped_non_utf8: walk.skipped_non_utf8,
@@ -834,7 +964,7 @@ pub fn load_items(
         verified,
     };
     RepoLoad {
-        instances,
+        arena,
         groups,
         files: views,
         bounds_min,
@@ -846,73 +976,42 @@ pub fn load_items(
 }
 
 /// Stage G — deterministic per-file re-layout for picking: re-read the file
-/// from the repo root and re-run the engine with the EXACT ItemParams it was
-/// staged with (carried in the PickFileInfo). Same bytes + same params + same
-/// engine ⇒ the record stream is bit-identical to what `load_repo` staged, so
-/// record positions, ROW/COL, and the blank-drop slot mapping all line up
-/// with the arena. Returns the records plus the raw file bytes (the char
-/// resolution walk reads them).
+/// from the repo root and re-run the pure-Rust layout with the EXACT ItemParams
+/// it was staged with.
 pub fn rederive_records(
     root: &Path,
-    trie: &Path,
+    _trie: &Path,
     rel_path: &str,
     item: &ItemParams,
 ) -> std::io::Result<(Vec<GlyphRecord>, Vec<u8>)> {
     let bytes = std::fs::read(root.join(rel_path))?;
-    let records = rederive_from_bytes(trie, &bytes, item)?;
+    let records = rederive_from_bytes(_trie, &bytes, item)?;
     Ok((records, bytes))
 }
 
-/// The engine re-run without the disk read — the P1-live form. `rederive_records`
-/// is this plus `fs::read`; envelope-owned scenes call this directly with the
-/// bytes they folded, which is what makes the seam's version join meaningful
-/// for live content (same bytes ⇒ same hash ⇒ the update applies).
 pub fn rederive_from_bytes(
-    trie: &Path,
+    _trie: &Path,
     bytes: &[u8],
     item: &ItemParams,
 ) -> std::io::Result<Vec<GlyphRecord>> {
-    let mut eng = Engine::new();
-    eng.load_trie_file(trie).expect("pick: failed to load engine trie");
-    eng.load_item(bytes, item).expect("pick: engine re-run failed");
-    Ok(eng.read_back().records)
+    let trie = crate::atlas::TrieTable::load(&crate::atlas_dir());
+    let records = crate::layout_hyper::rederive_item_records(bytes, item, &trie);
+    Ok(records)
 }
 
-thread_local! {
-    /// ONE Engine + trie per thread, keyed by trie path, held for the
-    /// thread's lifetime — the hot-path re-deriver. `Engine::new` + trie
-    /// parse is ~120 ms FIXED; the record walk is microseconds. thread_local
-    /// because Engine is !Send AND because the cache must OUTLIVE SCENES:
-    /// the live loop (seam.md, P1) rebuilds a scene per edit, so a
-    /// scene-lifetime cache never amortizes. The engine handle is built for
-    /// exactly this reuse — ffi.mojo resets the arena at every load_item
-    /// ("reuse the arena across loads"). Render thread only.
-    static REDERIVER: std::cell::RefCell<Option<(PathBuf, Engine)>> =
-        const { std::cell::RefCell::new(None) };
-}
-
-/// The CACHED re-derivation: same results as [`rederive_from_bytes`], one
-/// engine amortized across every call on this thread. A trie-path change
-/// (a different checkout/engine build) swaps the cached engine; nothing else
-/// can invalidate it — the fold is a pure function of (bytes, params).
 pub fn rederive_cached(
-    trie: &Path,
+    _trie: &Path,
     bytes: &[u8],
     item: &ItemParams,
 ) -> std::io::Result<Vec<GlyphRecord>> {
-    REDERIVER.with(|cell| {
+    thread_local! {
+        static CACHED_TRIE: std::cell::RefCell<Option<crate::atlas::TrieTable>> =
+            const { std::cell::RefCell::new(None) };
+    }
+    CACHED_TRIE.with(|cell| {
         let mut slot = cell.borrow_mut();
-        let stale = slot.as_ref().is_some_and(|(t, _)| t != trie);
-        if stale {
-            *slot = None;
-        }
-        let (_, eng) = slot.get_or_insert_with(|| {
-            let mut eng = Engine::new();
-            eng.load_trie_file(trie).expect("pick: failed to load engine trie");
-            (trie.to_path_buf(), eng)
-        });
-        eng.load_item(bytes, item).expect("pick: engine re-run failed");
-        Ok(eng.read_back().records)
+        let trie = slot.get_or_insert_with(|| crate::atlas::TrieTable::load(&crate::atlas_dir()));
+        Ok(crate::layout_hyper::rederive_item_records(bytes, item, trie))
     })
 }
 
@@ -1045,12 +1144,14 @@ pub fn line_of_byte(byte: usize, line_starts: &[usize]) -> u32 {
         Err(0) => 0,
         Err(i) => (i - 1) as u32,
     }
+
 }
 
 impl RepoLoad {
     /// Convert into the renderer's staged form. `focus` selects one file
     /// (first rel-path containing the substring) for the camera to frame.
     pub fn into_staged(self, focus: Option<&str>, slot_ink: &[Option<[f32; 4]>]) -> StagedText {
+        let _sp = tracing::info_span!("repo.staged", files = self.files.len()).entered();
         log::info!(
             "field bounds: x [0, {:.0}], y [{:.0}, {:.1}] — {:.0}x{:.0} world units",
             self.bounds_max[0],
@@ -1064,28 +1165,78 @@ impl RepoLoad {
         // the far-LOD backdrop tint derived from the file's own ink.
         // Stage G: the SAME local AABB goes into the pick table (pre-TRS; the
         // pick path applies the live group TRS itself).
-        let segments: Vec<crate::glyph_scene::SegCull> = self
-            .files
-            .iter()
-            .map(|v| {
-                let insts = &self.instances[v.slot_base..v.slot_base + v.slot_count];
-                crate::glyph_scene::SegCull {
-                    min: [
-                        v.offset[0] - 0.3,
-                        v.offset[1] - v.height - 0.5,
-                        v.offset[2] + v.z_min,
-                    ],
-                    max: [
-                        v.offset[0] + v.width + 0.6,
-                        v.offset[1] + 0.75,
-                        v.offset[2] + v.z_max,
-                    ],
-                    slot_base: v.slot_base as u32,
-                    slot_count: v.slot_count as u32,
-                    tint: crate::glyph_scene::seg_tint(insts, v.width, v.height, slot_ink),
+        //
+        // The tint fold reads the endpoint's tint STREAM on the Device
+        // path (note 23, E2b — no host instances exist there) and the
+        // arena chunks on the 48 B paths; same values in the same slot
+        // order either way, so the tints are bit-identical.
+        let mapped_slots = self
+            .arena
+            .device_slots()
+            .and_then(|d| d.mapped_slots)
+            .map(|addr| {
+                let len = self.arena.device_slots().unwrap().len;
+                // SAFETY: pointer was mapped by create_mapped_render_slots and outlives arena
+                unsafe { std::slice::from_raw_parts(addr as *const crate::glyph_scene::RenderSlot, len) }
+            });
+        let tint_stream: Option<&[u32]> = if mapped_slots.is_none() {
+            self.arena.device_slots().map(|d| d.tint.as_slice())
+        } else {
+            None
+        };
+        let chunks = if mapped_slots.is_none() && tint_stream.is_none() {
+            self.arena.instance_chunks()
+        } else {
+            Vec::new()
+        };
+        let seg_of = |v: &FileView| {
+            // The file's slot range folded in arena order: chunk slices
+            // ascend and concatenate exactly, so a range that straddles a
+            // chunk boundary tints bit-identically to the contiguous fold.
+            let mut tint = crate::glyph_scene::SegTintAccum::new(slot_ink);
+            let want = v.slot_base..v.slot_base + v.slot_count;
+            if let Some(slots) = mapped_slots {
+                tint.add_slots(&slots[want]);
+            } else if let Some(tp) = tint_stream {
+                tint.add_tint(&tp[want.start * 2..want.end * 2]);
+            } else {
+                let mut base = 0usize;
+                for chunk in &chunks {
+                    let lo = want.start.max(base);
+                    let hi = want.end.min(base + chunk.len());
+                    if lo < hi {
+                        tint.add(&chunk[lo - base..hi - base]);
+                    }
+                    base += chunk.len();
                 }
-            })
-            .collect();
+            }
+            crate::glyph_scene::SegCull {
+                min: [
+                    v.offset[0] - 0.3,
+                    v.offset[1] - v.height - 0.5,
+                    v.offset[2] + v.z_min,
+                ],
+                max: [
+                    v.offset[0] + v.width + 0.6,
+                    v.offset[1] + 0.75,
+                    v.offset[2] + v.z_max,
+                ],
+                slot_base: v.slot_base as u32,
+                slot_count: v.slot_count as u32,
+                tint: tint.finish(v.slot_count, v.width, v.height),
+            }
+        };
+        // seg_tint re-reads the whole arena, one file's slice at a time —
+        // ~500 ms serial on the glyph3d-js repo (1,306 files). Shard by file
+        // range: per-segment sums are independent and the per-worker results
+        // concatenate in file order, so the table is bit-identical. Small
+        // repos stay serial (thread spawn would cost more than the pass).
+        let sp_segments = tracing::info_span!("repo.segments").entered();
+        let segments: Vec<crate::glyph_scene::SegCull> = {
+            use rayon::prelude::*;
+            self.files.par_iter().map(seg_of).collect()
+        };
+        drop(sp_segments);
         let pick_files: Vec<crate::glyph_scene::PickFileInfo> = self
             .files
             .iter()
@@ -1121,11 +1272,11 @@ impl RepoLoad {
             }
         }
         StagedText {
-            glyphs_emitted: self.instances.len(),
+            glyphs_emitted: self.arena.len(),
             codepoints_decoded: self.stats.records,
             missing_or_bitmap: self.stats.blanks,
             segments,
-            instances: self.instances,
+            instances: self.arena,
             groups: self.groups,
             bounds_min: self.bounds_min,
             bounds_max: self.bounds_max,
@@ -1158,14 +1309,16 @@ impl RepoLoad {
         );
         println!(
             "repo: {} engine records -> {} glyph instances ({} blank/missing dropped) \
-             | backend: mojo-cpu/{}{}",
+             | backend: {}{}",
             s.records,
             s.instances,
             s.blanks,
             match s.strategy {
-                Strategy::Batched => "batched",
-                Strategy::PerItem => "per-item",
-                Strategy::Direct => "direct",
+                Strategy::Batched => "mojo-cpu/batched",
+                Strategy::PerItem => "mojo-cpu/per-item",
+                Strategy::Direct => "mojo-cpu/direct",
+                Strategy::Cubecl => "device/cubecl (endpoint)",
+                Strategy::Hyper => "hyper-rust (parallel direct)",
             },
             if s.verified { " (verified bit-exact vs the other strategy)" } else { "" },
         );
@@ -1198,6 +1351,41 @@ impl RepoLoad {
         // ambiguity that made `fold` look like the fold for a day. Only the
         // person who built the path knows which zero is which, and they are not
         // the person who reads this next.
+        if let Some(cp) = s.cubecl {
+            // The device chain's stages are a different shape from the
+            // record/direct split below — printing the Mojo block for it
+            // would show zeros for stages that RAN, the exact ambiguity the
+            // n/a rule exists against. Cubecl reports its own spans.
+            let ch = &cp.chain;
+            let accounted = cp.marshal
+                + ch.prep
+                + ch.tables
+                + ch.init
+                + ch.upload
+                + ch.dispatch
+                + cp.emit_readback
+                + cp.convert
+                + cp.compact;
+            println!(
+                "  cubecl chain: prep {:.3}s | tables {:.3}s | init {:.3}s | pack+upload {:.3}s \
+                 | dispatch {:.3}s | emit+readback {:.3}s ({:.2} GB records)",
+                ch.prep.as_secs_f64(),
+                ch.tables.as_secs_f64(),
+                ch.init.as_secs_f64(),
+                ch.upload.as_secs_f64(),
+                ch.dispatch.as_secs_f64(),
+                cp.emit_readback.as_secs_f64(),
+                (s.records * 32) as f64 / 1.073_741_824e9,
+            );
+            println!(
+                "  cubecl host: marshal {:.3}s | convert {:.3}s | compact {:.3}s \
+                 | unattributed {:.3}s",
+                cp.marshal.as_secs_f64(),
+                cp.convert.as_secs_f64(),
+                cp.compact.as_secs_f64(),
+                s.backend.saturating_sub(accounted).as_secs_f64(),
+            );
+        } else {
         let p = s.phases;
         let attributed = p.fold + p.readback() + p.compact;
         let absent = !s.strategy.materializes_records();
@@ -1239,7 +1427,21 @@ impl RepoLoad {
             " | unattributed {:.3}s",
             p.fold.saturating_sub(eng_sum).as_secs_f64()
         );
+        }
     }
+}
+
+/// The repo paint pass: per-file `colorize_leaders`, sharded by BYTE-balanced
+/// contiguous file ranges once the corpus is big enough to pay for threads
+/// (the seg_tint precedent, but byte-bound: the flagship's files span
+/// 100 B..2 MB, so a count-based split strands a worker on a bundle).
+/// Per-file colorize state is independent by construction and the ranges
+/// concatenate in file order — bit-identical to the serial map (the
+/// `sharded_paint_matches_serial` test fences exactly that; the golden views
+/// only ever run the serial arm). 1.0s -> ~0.24s at the flagship, 2026-09-30.
+fn paint_files(files: &[&[u8]]) -> Vec<Vec<u32>> {
+    use rayon::prelude::*;
+    files.par_iter().map(|f| text::colorize_leaders(f)).collect()
 }
 
 #[cfg(test)]
@@ -1328,6 +1530,27 @@ mod tests {
         let folded = compact_folds(&records, &[1..2], &lines_of(&[0, 2]));
         assert_eq!(folded.dropped, 0);
         assert_eq!(folded.records[1].y(), -4.0);
+    }
+
+    /// The sharded paint path (>= 64 files) must reproduce the serial map
+    /// bit-identically — the golden views run the serial path (5 files), so
+    /// without this test nothing exercises the shard cut/order logic.
+    #[test]
+    fn sharded_paint_matches_serial() {
+        let files: Vec<Vec<u8>> = (0..100usize)
+            .map(|i| {
+                format!(
+                    "// comment {i}\nlet s{i} = \"str {i}\" + '🦀'; // 🚀\nfn w{i}_ord(ord) {{ }}\n"
+                )
+                .into_bytes()
+            })
+            .collect();
+        let refs: Vec<&[u8]> = files.iter().map(|f| f.as_slice()).collect();
+        let serial: Vec<Vec<u32>> = refs.iter().map(|b| text::colorize_leaders(b)).collect();
+        assert_eq!(serial, paint_files(&refs));
+        // And below the shard threshold the serial arm answers directly.
+        let few: Vec<&[u8]> = refs[..3].to_vec();
+        assert_eq!(paint_files(&few), serial[..3].to_vec());
     }
 
     /// The seam the whole z_wrap_spacing chain hangs on: the CLI flag sets

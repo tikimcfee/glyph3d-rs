@@ -33,8 +33,16 @@ mod palette {
     pub const STRING: [u8; 3] = [206, 145, 120];
     pub const COMMENT: [u8; 3] = [106, 153, 85];
     pub const PUNCT: [u8; 3] = [128, 128, 128];
+
+    pub const C_DEFAULT: u32 = super::pack_rgba8(DEFAULT, 255);
+    pub const C_KEYWORD: u32 = super::pack_rgba8(KEYWORD, 255);
+    pub const C_NUMBER: u32 = super::pack_rgba8(NUMBER, 255);
+    pub const C_STRING: u32 = super::pack_rgba8(STRING, 255);
+    pub const C_COMMENT: u32 = super::pack_rgba8(COMMENT, 255);
+    pub const C_PUNCT: u32 = super::pack_rgba8(PUNCT, 255);
 }
 
+#[allow(dead_code)]
 const KEYWORDS: &[&str] = &[
     // JS/TS
     "const", "let", "var", "function", "return", "if", "else", "for", "while", "import",
@@ -48,7 +56,7 @@ const KEYWORDS: &[&str] = &[
     "Some", "None", "Ok", "Err",
 ];
 
-fn pack_rgba8(rgb: [u8; 3], a: u8) -> u32 {
+const fn pack_rgba8(rgb: [u8; 3], a: u8) -> u32 {
     rgb[0] as u32 | (rgb[1] as u32) << 8 | (rgb[2] as u32) << 16 | (a as u32) << 24
 }
 
@@ -62,7 +70,7 @@ struct Cell {
 
 /// The staged result: instances + group rows + world bounds (for camera fit).
 pub struct StagedText {
-    pub instances: Vec<GlyphInstance>,
+    pub instances: crate::layout::GlyphArena,
     pub groups: Vec<GroupRow>,
     /// (min, max) of the laid-out text block(s) in world units, including
     /// DEPTH — WrapBack spends wraps in z, so a block's extent is not planar.
@@ -392,7 +400,7 @@ pub fn stage_file(
 
     StagedText {
         glyphs_emitted: instances.len(),
-        instances,
+        instances: crate::layout::GlyphArena::from_vec(instances),
         groups,
         bounds_min: [0.0, -total_h, z_lo],
         bounds_max: [total_w, line_h, z_hi],
@@ -404,10 +412,54 @@ pub fn stage_file(
     }
 }
 
+#[inline]
+fn word_color_packed(word: &[u8]) -> u32 {
+    match word.len() {
+        2 => match word {
+            b"fn" | b"if" | b"of" | b"in" | b"do" | b"Ok" => palette::C_KEYWORD,
+            _ => if word[0].is_ascii_digit() { palette::C_NUMBER } else { palette::C_DEFAULT },
+        },
+        3 => match word {
+            b"let" | b"var" | b"for" | b"new" | b"try" | b"get" | b"set" | b"pub" | b"mod" | b"use" | b"mut" | b"ref" | b"dyn" | b"Err" => palette::C_KEYWORD,
+            _ => if word[0].is_ascii_digit() { palette::C_NUMBER } else { palette::C_DEFAULT },
+        },
+        4 => match word {
+            b"from" | b"this" | b"case" | b"null" | b"true" | b"void" | b"enum" | b"impl" | b"loop" | b"move" | b"self" | b"Self" | b"Some" | b"None" | b"else" => palette::C_KEYWORD,
+            _ => if word[0].is_ascii_digit() { palette::C_NUMBER } else { palette::C_DEFAULT },
+        },
+        5 => match word {
+            b"const" | b"while" | b"class" | b"break" | b"catch" | b"throw" | b"async" | b"await" | b"yield" | b"false" | b"trait" | b"where" | b"match" | b"crate" | b"super" => palette::C_KEYWORD,
+            _ => if word[0].is_ascii_digit() { palette::C_NUMBER } else { palette::C_DEFAULT },
+        },
+        6 => match word {
+            b"return" | b"export" | b"import" | b"typeof" | b"switch" | b"struct" | b"unsafe" | b"static" | b"delete" => palette::C_KEYWORD,
+            _ => if word[0].is_ascii_digit() { palette::C_NUMBER } else { palette::C_DEFAULT },
+        },
+        7 => match word {
+            b"extends" | b"default" | b"finally" => palette::C_KEYWORD,
+            _ => if word[0].is_ascii_digit() { palette::C_NUMBER } else { palette::C_DEFAULT },
+        },
+        8 => match word {
+            b"function" | b"continue" => palette::C_KEYWORD,
+            _ => if word[0].is_ascii_digit() { palette::C_NUMBER } else { palette::C_DEFAULT },
+        },
+        9 => match word {
+            b"undefined" => palette::C_KEYWORD,
+            _ => if word[0].is_ascii_digit() { palette::C_NUMBER } else { palette::C_DEFAULT },
+        },
+        10 => match word {
+            b"instanceof" => palette::C_KEYWORD,
+            _ => if word[0].is_ascii_digit() { palette::C_NUMBER } else { palette::C_DEFAULT },
+        },
+        _ => if !word.is_empty() && word[0].is_ascii_digit() { palette::C_NUMBER } else { palette::C_DEFAULT },
+    }
+}
+
 fn word_color(word: &str) -> [u8; 3] {
-    if KEYWORDS.contains(&word) {
+    let p = word_color_packed(word.as_bytes());
+    if p == palette::C_KEYWORD {
         palette::KEYWORD
-    } else if word.chars().next().is_some_and(|c| c.is_ascii_digit()) {
+    } else if p == palette::C_NUMBER {
         palette::NUMBER
     } else {
         palette::DEFAULT
@@ -506,7 +558,7 @@ pub struct RefGlyph {
 /// The font-units→world conversion, shared with tools/gen_real_trie.py:
 /// `fround(fu * CELL_HEIGHT_WORLD / em_height_fu)`, computed in f64 and
 /// narrowed once — the same bits the generator wrote into engine-trie.bin.
-fn fu_to_world(fu: i32, em_height_fu: u32) -> f32 {
+pub(crate) fn fu_to_world(fu: i32, em_height_fu: u32) -> f32 {
     (fu as f64 * CELL_HEIGHT_WORLD as f64 / em_height_fu as f64) as f32
 }
 
@@ -701,6 +753,7 @@ pub fn fold_leaders(bytes: &[u8], wrap: i32, mode: crate::fold::WrapMode) -> Fol
 /// Diff engine records against the CPU reference. Returns Ok(()) on a
 /// bit-exact match (counts AND measures, compared as bits — the repo's
 /// discipline), or a human-readable first-mismatch report.
+#[allow(dead_code)]
 pub fn diff_records(records: &[GlyphRecord], expected: &[RefGlyph]) -> Result<(), String> {
     if records.len() != expected.len() {
         return Err(format!(
@@ -753,13 +806,14 @@ pub fn stage_records(arena: GlyphArena, placement: &ItemPlacement, slot_ink: &[O
     } else {
         (placement.ink.min, placement.ink.max)
     };
-    let instances = arena.into_instances();
+    let glyphs_emitted = arena.len();
+    let segments = vec![cover_segment(arena.instances(), min, max, slot_ink)];
 
     StagedText {
-        glyphs_emitted: instances.len(),
+        glyphs_emitted,
         groups: vec![GroupRow::identity([0.0; 3])],
-        segments: vec![cover_segment(&instances, min, max, slot_ink)],
-        instances,
+        segments,
+        instances: arena,
         bounds_min: min,
         bounds_max: max,
         codepoints_decoded: placement.record_count as usize,
@@ -777,8 +831,9 @@ pub fn stage_records(arena: GlyphArena, placement: &ItemPlacement, slot_ink: &[O
 /// byte-level logic as `reference_layout`.
 pub fn colorize_leaders(bytes: &[u8]) -> Vec<u32> {
     let mut colors: Vec<u32> = Vec::with_capacity(bytes.len());
-    let mut word = String::new();
-    let mut word_start = 0usize;
+    let mut word_start_byte = usize::MAX;
+    let mut word_end_byte = 0usize;
+    let mut word_start_col = 0usize;
     let mut in_comment = false;
     let mut in_string: Option<char> = None;
     let mut prev = '\0';
@@ -789,87 +844,75 @@ pub fn colorize_leaders(bytes: &[u8]) -> Vec<u32> {
     let mut id = 0usize;
     while id < bytes.len() {
         let b0 = bytes[id] as u32;
-        let n = if b0 & 0x80 == 0x00 {
-            1usize
+        let (n, ch) = if b0 < 0x80 {
+            (1usize, b0 as u8 as char)
         } else if b0 & 0xE0 == 0xC0 {
-            2
+            let cp = ((b0 & 0x1F) << 6) | (byte_at(id + 1) & 0x3F);
+            (2usize, char::from_u32(cp).unwrap_or('\u{FFFD}'))
         } else if b0 & 0xF0 == 0xE0 {
-            3
+            let cp = ((b0 & 0x0F) << 12) | ((byte_at(id + 1) & 0x3F) << 6) | (byte_at(id + 2) & 0x3F);
+            (3usize, char::from_u32(cp).unwrap_or('\u{FFFD}'))
         } else if b0 & 0xF8 == 0xF0 {
-            4
+            let cp = ((b0 & 0x07) << 18)
+                | ((byte_at(id + 1) & 0x3F) << 12)
+                | ((byte_at(id + 2) & 0x3F) << 6)
+                | (byte_at(id + 3) & 0x3F);
+            (4usize, char::from_u32(cp).unwrap_or('\u{FFFD}'))
         } else {
-            0
-        };
-        if n == 0 {
             id += 1; // continuation/invalid byte: no record, no color
             continue;
-        }
-        let cp = match n {
-            1 => b0,
-            2 => ((b0 & 0x1F) << 6) | (byte_at(id + 1) & 0x3F),
-            3 => ((b0 & 0x0F) << 12) | ((byte_at(id + 1) & 0x3F) << 6) | (byte_at(id + 2) & 0x3F),
-            _ => {
-                ((b0 & 0x07) << 18)
-                    | ((byte_at(id + 1) & 0x3F) << 12)
-                    | ((byte_at(id + 2) & 0x3F) << 6)
-                    | (byte_at(id + 3) & 0x3F)
-            }
         };
-        let ch = char::from_u32(cp).unwrap_or('\u{FFFD}');
 
-        let mut color = palette::DEFAULT;
+        let mut color = palette::C_DEFAULT;
         if ch == '\n' {
-            if !word.is_empty() {
-                let wc = word_color(&word);
-                if wc != palette::DEFAULT {
-                    for c in &mut colors[word_start..] {
-                        *c = pack_rgba8(wc, 255);
-                    }
+            if word_start_byte != usize::MAX {
+                let wc = word_color_packed(&bytes[word_start_byte..word_end_byte]);
+                if wc != palette::C_DEFAULT {
+                    colors[word_start_col..].fill(wc);
                 }
-                word.clear();
+                word_start_byte = usize::MAX;
             }
             in_comment = false;
             in_string = None;
         } else if ch == '\t' {
-            word.clear();
+            word_start_byte = usize::MAX;
         } else if in_comment {
-            color = palette::COMMENT;
+            color = palette::C_COMMENT;
         } else if let Some(q) = in_string {
             if ch == q && prev != '\\' {
                 in_string = None;
             }
-            color = palette::STRING;
+            color = palette::C_STRING;
         } else if ch == '/' && prev == '/' {
             in_comment = true;
             // Recolor the preceding '/' too (it was pushed as punctuation).
             if let Some(last) = colors.last_mut() {
-                *last = pack_rgba8(palette::COMMENT, 255);
+                *last = palette::C_COMMENT;
             }
-            color = palette::COMMENT;
+            color = palette::C_COMMENT;
         } else if ch == '"' || ch == '\'' || ch == '`' {
             in_string = Some(ch);
-            color = palette::STRING;
+            color = palette::C_STRING;
         } else if is_word_char(ch) {
-            if word.is_empty() {
-                word_start = colors.len();
+            if word_start_byte == usize::MAX {
+                word_start_byte = id;
+                word_start_col = colors.len();
             }
-            word.push(ch);
-            if word.chars().next().is_some_and(|c| c.is_ascii_digit()) {
-                color = palette::NUMBER;
+            word_end_byte = id + n;
+            if bytes[word_start_byte].is_ascii_digit() {
+                color = palette::C_NUMBER;
             }
         } else {
-            if !word.is_empty() {
-                let wc = word_color(&word);
-                if wc != palette::DEFAULT {
-                    for c in &mut colors[word_start..] {
-                        *c = pack_rgba8(wc, 255);
-                    }
+            if word_start_byte != usize::MAX {
+                let wc = word_color_packed(&bytes[word_start_byte..word_end_byte]);
+                if wc != palette::C_DEFAULT {
+                    colors[word_start_col..].fill(wc);
                 }
-                word.clear();
+                word_start_byte = usize::MAX;
             }
-            color = palette::PUNCT;
+            color = palette::C_PUNCT;
         }
-        colors.push(pack_rgba8(color, 255));
+        colors.push(color);
         prev = ch;
         id += 1;
     }
