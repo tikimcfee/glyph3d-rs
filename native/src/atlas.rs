@@ -603,7 +603,12 @@ pub struct EmojiTexture {
 }
 
 impl EmojiTexture {
+    #[allow(dead_code)]
     pub fn load(ctx: &GpuContext, path: &Path) -> Self {
+        Self::load_device(&ctx.device, &ctx.queue, path)
+    }
+
+    pub fn load_device(device: &wgpu::Device, queue: &wgpu::Queue, path: &Path) -> Self {
         let t0 = std::time::Instant::now();
         let sheet = EmojiSheet::load(path);
         let t_parse = t0.elapsed();
@@ -624,7 +629,7 @@ impl EmojiTexture {
         }
         let t_mips = t0.elapsed() - t_parse - t_decode;
 
-        let texture = ctx.device.create_texture(&wgpu::TextureDescriptor {
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("emoji sheet"),
             size: wgpu::Extent3d { width: sheet.layer_w, height: sheet.layer_h, depth_or_array_layers: sheet.layers },
             mip_level_count: mip_levels,
@@ -639,7 +644,7 @@ impl EmojiTexture {
             let (mut w, mut h) = (sheet.layer_w, sheet.layer_h);
             for (level, data) in chain.iter().enumerate() {
                 assert!((w * 4).is_multiple_of(UPLOAD_PITCH_ALIGN), "emoji mip {level}: pitch {} not aligned", w * 4);
-                ctx.queue.write_texture(
+                queue.write_texture(
                     wgpu::TexelCopyTextureInfo {
                         texture: &texture,
                         mip_level: level as u32,
@@ -710,7 +715,8 @@ fn check_magic(words: &[u32], expected: &str, path: &Path) {
 
 /// Upload a raw u32 texel payload as a 1024-wide Rgba32Uint texture.
 fn upload_uint_texture(
-    ctx: &GpuContext,
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
     label: &str,
     width: u32,
     height: u32,
@@ -721,7 +727,7 @@ fn upload_uint_texture(
         (width * height * 4) as usize,
         "{label}: payload size mismatch"
     );
-    let texture = ctx.device.create_texture(&wgpu::TextureDescriptor {
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
         label: Some(label),
         size: wgpu::Extent3d {
             width,
@@ -735,7 +741,7 @@ fn upload_uint_texture(
         usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
         view_formats: &[],
     });
-    ctx.queue.write_texture(
+    queue.write_texture(
         wgpu::TexelCopyTextureInfo {
             texture: &texture,
             mip_level: 0,
@@ -762,27 +768,37 @@ impl Atlas {
     /// with the emoji sheet at `emoji_sheet` (the `--emoji-sheet` flag; the
     /// default is the committed one beside the other bins).
     pub fn load(ctx: &GpuContext, emoji_sheet: &Path) -> Self {
-        Self::load_from(
-            ctx,
+        Self::load_device(&ctx.device, &ctx.queue, emoji_sheet)
+    }
+
+    pub fn load_device(device: &wgpu::Device, queue: &wgpu::Queue, emoji_sheet: &Path) -> Self {
+        Self::load_from_device(
+            device,
+            queue,
             &PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../assets/atlas"),
             emoji_sheet,
         )
     }
 
+    #[allow(dead_code)]
     pub fn load_from(ctx: &GpuContext, dir: &Path, emoji_sheet: &Path) -> Self {
+        Self::load_from_device(&ctx.device, &ctx.queue, dir, emoji_sheet)
+    }
+
+    pub fn load_from_device(device: &wgpu::Device, queue: &wgpu::Queue, dir: &Path, emoji_sheet: &Path) -> Self {
         // --- curves.bin (G3CV): 8-word header, then width*height*4 texels ---
         let cv = read_words(&dir.join("curves.bin"));
         check_magic(&cv, "G3CV", &dir.join("curves.bin"));
         let (cv_w, cv_h, curve_count) = (cv[3], cv[4], cv[5]);
         assert_eq!(cv_w, ATLAS_TEX_WIDTH);
-        let curves = upload_uint_texture(ctx, "slug curves", cv_w, cv_h, &cv[8..]);
+        let curves = upload_uint_texture(device, queue, "slug curves", cv_w, cv_h, &cv[8..]);
 
         // --- glyphmap.bin (G3GM): 8-word header, then texels ---
         let gm = read_words(&dir.join("glyphmap.bin"));
         check_magic(&gm, "G3GM", &dir.join("glyphmap.bin"));
         let (gm_w, gm_h, entry_count) = (gm[3], gm[4], gm[5]);
         assert_eq!(gm_w, ATLAS_TEX_WIDTH);
-        let glyphmap = upload_uint_texture(ctx, "slug glyphmap", gm_w, gm_h, &gm[8..]);
+        let glyphmap = upload_uint_texture(device, queue, "slug glyphmap", gm_w, gm_h, &gm[8..]);
 
         // --- glyphs.bin (G3GL) + codepoints.bin (G3CP): the CPU-side trie
         //     (Stage E1: shared with the GPU-free cross-check via TrieTable). ---
@@ -805,7 +821,7 @@ impl Atlas {
             metrics.em_height_fu,
         );
 
-        let emoji = EmojiTexture::load(ctx, emoji_sheet);
+        let emoji = EmojiTexture::load_device(device, queue, emoji_sheet);
         let slot_ink: Vec<Option<[f32; 4]>> = trie
             .emoji_cell
             .iter()

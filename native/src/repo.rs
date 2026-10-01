@@ -664,7 +664,12 @@ pub fn load_repo_from_walk(
             ),
             None => crate::cubecl_layout::CubeclLayout::new(),
         }),
-        _ => Backend::Hyper(crate::layout_hyper::HyperLayout::new()),
+        _ => Backend::Hyper(match gpu {
+            Some(ctx) => crate::layout_hyper::HyperLayout::with_device(
+                crate::cubecl_chain::SharedDevice::from_ctx(ctx),
+            ),
+            None => crate::layout_hyper::HyperLayout::new(),
+        }),
     };
     backend
         .load_trie_file(trie)
@@ -832,9 +837,21 @@ impl RepoLoad {
         // path (note 23, E2b — no host instances exist there) and the
         // arena chunks on the 48 B paths; same values in the same slot
         // order either way, so the tints are bit-identical.
-        let tint_stream: Option<&[u32]> =
-            self.arena.device_slots().map(|d| d.tint.as_slice());
-        let chunks = if tint_stream.is_none() {
+        let mapped_slots = self
+            .arena
+            .device_slots()
+            .and_then(|d| d.mapped_slots)
+            .map(|addr| {
+                let len = self.arena.device_slots().unwrap().len;
+                // SAFETY: pointer was mapped by create_mapped_render_slots and outlives arena
+                unsafe { std::slice::from_raw_parts(addr as *const crate::glyph_scene::RenderSlot, len) }
+            });
+        let tint_stream: Option<&[u32]> = if mapped_slots.is_none() {
+            self.arena.device_slots().map(|d| d.tint.as_slice())
+        } else {
+            None
+        };
+        let chunks = if mapped_slots.is_none() && tint_stream.is_none() {
             self.arena.instance_chunks()
         } else {
             Vec::new()
@@ -845,18 +862,19 @@ impl RepoLoad {
             // chunk boundary tints bit-identically to the contiguous fold.
             let mut tint = crate::glyph_scene::SegTintAccum::new(slot_ink);
             let want = v.slot_base..v.slot_base + v.slot_count;
-            match tint_stream {
-                Some(tp) => tint.add_tint(&tp[want.start * 2..want.end * 2]),
-                None => {
-                    let mut base = 0usize;
-                    for chunk in &chunks {
-                        let lo = want.start.max(base);
-                        let hi = want.end.min(base + chunk.len());
-                        if lo < hi {
-                            tint.add(&chunk[lo - base..hi - base]);
-                        }
-                        base += chunk.len();
+            if let Some(slots) = mapped_slots {
+                tint.add_slots(&slots[want]);
+            } else if let Some(tp) = tint_stream {
+                tint.add_tint(&tp[want.start * 2..want.end * 2]);
+            } else {
+                let mut base = 0usize;
+                for chunk in &chunks {
+                    let lo = want.start.max(base);
+                    let hi = want.end.min(base + chunk.len());
+                    if lo < hi {
+                        tint.add(&chunk[lo - base..hi - base]);
                     }
+                    base += chunk.len();
                 }
             }
             crate::glyph_scene::SegCull {

@@ -12,14 +12,16 @@ use rayon::prelude::*;
 
 use crate::atlas::TrieTable;
 use crate::fold::{rows_for_line, wrap_row_of, wrap_segment_of};
-use crate::glyph_scene::GlyphInstance;
+use crate::glyph_scene::{GlyphInstance, RenderSlot};
 use crate::layout::{
-    GlyphArena, InkExtent, ItemPlacement, LayoutError, LayoutGlyphs, LayoutItem, PageExtent, Paint,
+    DeviceSlotChunk, DeviceSlots, GlyphArena, InkExtent, ItemPlacement, LayoutError, LayoutGlyphs,
+    LayoutItem, PageExtent, Paint, TintStore,
 };
 use crate::text::fu_to_world;
 
 pub struct HyperLayout {
     trie: Option<Arc<TrieTable>>,
+    device: Option<crate::cubecl_chain::SharedDevice>,
 }
 
 impl Default for HyperLayout {
@@ -30,12 +32,79 @@ impl Default for HyperLayout {
 
 impl HyperLayout {
     pub fn new() -> Self {
-        Self { trie: None }
+        Self {
+            trie: None,
+            device: None,
+        }
+    }
+
+    pub(crate) fn with_device(device: crate::cubecl_chain::SharedDevice) -> Self {
+        Self {
+            trie: None,
+            device: Some(device),
+        }
     }
 
     pub fn with_trie(trie: Arc<TrieTable>) -> Self {
-        Self { trie: Some(trie) }
+        Self {
+            trie: Some(trie),
+            device: None,
+        }
     }
+}
+
+#[derive(Clone, Copy)]
+struct SendPtr<T>(*mut T);
+unsafe impl<T> Send for SendPtr<T> {}
+unsafe impl<T> Sync for SendPtr<T> {}
+
+#[cfg(target_os = "macos")]
+fn create_mapped_render_slots(
+    device: &wgpu::Device,
+    slots: usize,
+) -> (*mut RenderSlot, wgpu::Buffer) {
+    use wgpu::hal::Device as HalDevice;
+    let hal_dev = unsafe { device.as_hal::<wgpu::hal::api::Metal>() }
+        .expect("Metal profile behind a non-Metal device");
+    let size = (slots * std::mem::size_of::<RenderSlot>()) as u64;
+    let label = "glyph render slots (direct-mapped)";
+    let hal_buf = unsafe {
+        hal_dev.create_buffer(&wgpu::hal::BufferDescriptor {
+            label: Some(&label),
+            size,
+            usage: wgpu::BufferUses::STORAGE_READ_ONLY
+                | wgpu::BufferUses::COPY_DST
+                | wgpu::BufferUses::COPY_SRC
+                | wgpu::BufferUses::MAP_READ,
+            memory_flags: wgpu::hal::MemoryFlags::empty(),
+        })
+    }
+    .expect("hal arena buffer");
+    let mapping = unsafe { hal_dev.map_buffer(&hal_buf, 0..size) }.expect("hal arena map");
+    let ptr = mapping.ptr.as_ptr() as *mut RenderSlot;
+    let buf = unsafe {
+        device.create_buffer_from_hal::<wgpu::hal::api::Metal>(
+            hal_buf,
+            &wgpu::BufferDescriptor {
+                label: Some(&label),
+                size,
+                usage: wgpu::BufferUsages::STORAGE
+                    | wgpu::BufferUsages::COPY_DST
+                    | wgpu::BufferUsages::COPY_SRC
+                    | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            },
+        )
+    };
+    (ptr, buf)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn create_mapped_render_slots(
+    _device: &wgpu::Device,
+    _slots: usize,
+) -> (*mut RenderSlot, wgpu::Buffer) {
+    unreachable!("Metal mapped primary buffers are only available on macOS");
 }
 
 struct ItemPrepass {
@@ -210,6 +279,17 @@ impl LayoutGlyphs for HyperLayout {
         items: &[LayoutItem<'_>],
         arena: &mut GlyphArena,
     ) -> Result<Vec<ItemPlacement>, LayoutError> {
+        self.layout_items_internal(items, arena, true)
+    }
+}
+
+impl HyperLayout {
+    fn layout_items_internal(
+        &mut self,
+        items: &[LayoutItem<'_>],
+        arena: &mut GlyphArena,
+        allow_device: bool,
+    ) -> Result<Vec<ItemPlacement>, LayoutError> {
         let trie = match &self.trie {
             Some(t) => Arc::clone(t),
             None => {
@@ -312,14 +392,275 @@ impl LayoutGlyphs for HyperLayout {
             total_survivors += pre.survivor_count as usize;
         }
 
-        // --- Allocate destination memory once ---
-        let (tail_ptr, capacity) = arena.uninit_tail(total_survivors);
-        assert!(capacity >= total_survivors);
+        let can_map_device = allow_device
+            && cfg!(target_os = "macos")
+            && self.device.as_ref().map_or(false, |dev| {
+                dev.host_visible_storage
+                    && (total_survivors * std::mem::size_of::<RenderSlot>()) as u64
+                        <= dev.max_buffer_size
+                    && total_survivors > 0
+            });
 
-        let dest_addr = tail_ptr as usize;
+        if can_map_device {
+            let dev = self.device.as_ref().unwrap();
+            let (mapped_ptr, wgpu_buf) = create_mapped_render_slots(&dev.device, total_survivors);
+            let placements = Self::layout_pass2_device(
+                items,
+                &prepasses,
+                &slot_bases,
+                &trie,
+                bitmap_adv,
+                em_height_fu,
+                SendPtr(mapped_ptr),
+            );
+            let device_slots = DeviceSlots {
+                chunks: vec![DeviceSlotChunk {
+                    buffer: wgpu_buf,
+                    offset: 0,
+                    slots: total_survivors as u32,
+                }],
+                chunk_slots: total_survivors,
+                len: total_survivors,
+                tint: TintStore::Host(Vec::new()),
+                keep_alive: Vec::new(),
+                mapped_slots: Some(mapped_ptr as usize),
+            };
+            *arena = GlyphArena::from_device(device_slots);
+            Ok(placements)
+        } else {
+            let (tail_ptr, capacity) = arena.uninit_tail(total_survivors);
+            assert!(capacity >= total_survivors);
+            let placements = Self::layout_pass2_host(
+                items,
+                &prepasses,
+                &slot_bases,
+                &trie,
+                bitmap_adv,
+                em_height_fu,
+                SendPtr(tail_ptr),
+            );
+            unsafe {
+                arena.commit(total_survivors);
+            }
+            Ok(placements)
+        }
+    }
 
-        // --- PASS 2 (Parallel): Lay out and write directly into arena slice ---
-        let placements: Vec<ItemPlacement> = items
+    fn layout_pass2_device(
+        items: &[LayoutItem<'_>],
+        prepasses: &[ItemPrepass],
+        slot_bases: &[u32],
+        trie: &TrieTable,
+        bitmap_adv: f32,
+        em_height_fu: u32,
+        dest: SendPtr<RenderSlot>,
+    ) -> Vec<ItemPlacement> {
+        let dest_addr = dest.0 as usize;
+        items
+            .par_iter()
+            .zip(prepasses.par_iter())
+            .zip(slot_bases.par_iter())
+            .map(|((item, pre), &slot_base)| {
+                let bytes = item.bytes;
+                let p = &item.params;
+                let group_id = item.group_id;
+
+                let fold_unit = if p.wrap_width > 0 {
+                    p.wrap_width as i64
+                } else if p.has_page {
+                    p.page_cols as i64
+                } else {
+                    0
+                };
+                let page_stride_x = if p.has_page && p.page_rows > 0 {
+                    pre.max_row_extent + p.page_gap_x
+                } else {
+                    0.0
+                };
+                let page_active = p.has_page && (p.page_rows > 0 || p.page_cols > 0 || p.scroll_rows > 0);
+
+                let mut page_right = 0.0f32;
+                let mut page_bottom = 0.0f32;
+                let mut page_z_min = 0.0f32;
+                let mut page_z_max = 0.0f32;
+
+                let mut ink_min = [f32::INFINITY; 3];
+                let mut ink_max = [f32::NEG_INFINITY; 3];
+
+                let mut base_row = 0i64;
+                let mut col = 0i64;
+                let mut line_adv = 0.0f64;
+                let mut seg_adv = 0.0f32;
+                let mut record_idx = 0usize;
+                let mut survivor_out = 0usize;
+                let mut trailer_until = 0usize;
+
+                let out_ptr = unsafe { (dest_addr as *mut RenderSlot).add(slot_base as usize) };
+
+                let mut pos = 0usize;
+                while pos < bytes.len() {
+                    let lead = bytes[pos];
+                    let seq_len = sequence_length(lead);
+                    if seq_len == 0 {
+                        pos += 1;
+                        continue;
+                    }
+
+                    let r = resolve_leader(
+                        bytes,
+                        pos,
+                        seq_len,
+                        trie,
+                        bitmap_adv,
+                        em_height_fu,
+                        &mut trailer_until,
+                    );
+
+                    let wrap_segment = wrap_segment_of(col, p.wrap_width as i64, r.is_newline);
+                    let wrap_row = wrap_row_of(col, p.wrap_width as i64, r.is_newline, p.wrap_mode);
+                    let row = base_row + wrap_row;
+
+                    let item_rel_x = if fold_unit > 0 { seg_adv as f64 } else { line_adv };
+                    let base_x = (item_rel_x + p.origin_x) as f32;
+                    let base_y = (-(row as f64) * p.line_height + p.origin_y) as f32;
+                    let base_z = (-(wrap_segment as f64) * p.z_step + p.origin_z) as f32;
+
+                    let (pos_x, pos_y, pos_z) = if page_active {
+                        let (y_page, x_page, screen_row) = if p.page_rows > 0 {
+                            let y_page = row / p.page_rows as i64;
+                            let screen_row = row + p.scroll_rows as i64;
+                            let x_page = if p.page_cols > 0 {
+                                col / p.page_cols as i64
+                            } else {
+                                0
+                            };
+                            (y_page, x_page, screen_row)
+                        } else {
+                            (0, 0, row)
+                        };
+                        let pages_wide = (p.pages_wide as i64).max(1);
+                        let band = y_page / pages_wide;
+                        let px = (base_x as f64 + (y_page % pages_wide) as f64 * page_stride_x) as f32;
+                        let py = (p.origin_y
+                            - (screen_row - y_page * p.page_rows as i64) as f64 * p.line_height
+                            - band as f64 * p.band_stride_y) as f32;
+                        let pz = (p.origin_z - wrap_segment as f64 * p.z_step
+                            + band as f64 * p.depth_per_band
+                            + x_page as f64 * p.depth_per_col) as f32;
+                        (px, py, pz)
+                    } else {
+                        (base_x, base_y, base_z)
+                    };
+
+                    let right = pos_x + r.advance;
+                    if right > page_right {
+                        page_right = right;
+                    }
+                    if pos_y < page_bottom {
+                        page_bottom = pos_y;
+                    }
+                    if pos_z < page_z_min {
+                        page_z_min = pos_z;
+                    }
+                    if pos_z > page_z_max {
+                        page_z_max = pos_z;
+                    }
+
+                    let color = match item.paint {
+                        Paint::PerRecord(colors) => {
+                            if record_idx < colors.len() {
+                                colors[record_idx]
+                            } else {
+                                0xFFFF_FFFF
+                            }
+                        }
+                        Paint::Flat(c) => c,
+                    };
+
+                    if r.glyph_id != 0 {
+                        let half = r.height * 0.5;
+                        if pos_x < ink_min[0] {
+                            ink_min[0] = pos_x;
+                        }
+                        if right > ink_max[0] {
+                            ink_max[0] = right;
+                        }
+                        if pos_y - half < ink_min[1] {
+                            ink_min[1] = pos_y - half;
+                        }
+                        if pos_y + half > ink_max[1] {
+                            ink_max[1] = pos_y + half;
+                        }
+                        if pos_z < ink_min[2] {
+                            ink_min[2] = pos_z;
+                        }
+                        if pos_z > ink_max[2] {
+                            ink_max[2] = pos_z;
+                        }
+
+                        unsafe {
+                            *out_ptr.add(survivor_out) = RenderSlot {
+                                pos: [pos_x, pos_y, pos_z],
+                                glyph_id: r.glyph_id,
+                                color,
+                                group_id,
+                                advance: r.advance,
+                                height: r.height,
+                            };
+                        }
+                        survivor_out += 1;
+                    }
+
+                    record_idx += 1;
+
+                    if r.is_newline {
+                        base_row += rows_for_line(col, p.wrap_width as i64, p.wrap_mode);
+                        col = 0;
+                        line_adv = 0.0;
+                        seg_adv = 0.0;
+                    } else {
+                        col += 1;
+                        line_adv += r.advance as f64;
+                        if fold_unit > 0 && col % fold_unit == 0 {
+                            seg_adv = 0.0;
+                        } else {
+                            seg_adv += r.advance;
+                        }
+                    }
+
+                    pos += 1;
+                }
+
+                ItemPlacement {
+                    slot_base,
+                    slot_count: survivor_out as u32,
+                    record_count: record_idx as u32,
+                    page: PageExtent {
+                        right: page_right,
+                        bottom: page_bottom,
+                        z_min: page_z_min,
+                        z_max: page_z_max,
+                    },
+                    ink: InkExtent {
+                        min: ink_min,
+                        max: ink_max,
+                    },
+                }
+            })
+            .collect()
+    }
+
+    fn layout_pass2_host(
+        items: &[LayoutItem<'_>],
+        prepasses: &[ItemPrepass],
+        slot_bases: &[u32],
+        trie: &TrieTable,
+        bitmap_adv: f32,
+        em_height_fu: u32,
+        dest: SendPtr<GlyphInstance>,
+    ) -> Vec<ItemPlacement> {
+        let dest_addr = dest.0 as usize;
+        items
             .par_iter()
             .zip(prepasses.par_iter())
             .zip(slot_bases.par_iter())
@@ -373,7 +714,7 @@ impl LayoutGlyphs for HyperLayout {
                         bytes,
                         pos,
                         seq_len,
-                        &trie,
+                        trie,
                         bitmap_adv,
                         em_height_fu,
                         &mut trailer_until,
@@ -389,16 +730,17 @@ impl LayoutGlyphs for HyperLayout {
                     let base_z = (-(wrap_segment as f64) * p.z_step + p.origin_z) as f32;
 
                     let (pos_x, pos_y, pos_z) = if page_active {
-                        let screen_row = row - p.scroll_rows as i64;
-                        let y_page = if p.page_rows > 0 && screen_row >= p.page_rows as i64 {
-                            screen_row / p.page_rows as i64
+                        let (y_page, x_page, screen_row) = if p.page_rows > 0 {
+                            let y_page = row / p.page_rows as i64;
+                            let screen_row = row + p.scroll_rows as i64;
+                            let x_page = if p.page_cols > 0 {
+                                col / p.page_cols as i64
+                            } else {
+                                0
+                            };
+                            (y_page, x_page, screen_row)
                         } else {
-                            0
-                        };
-                        let x_page = if p.page_cols > 0 {
-                            col / p.page_cols as i64
-                        } else {
-                            0
+                            (0, 0, row)
                         };
                         let pages_wide = (p.pages_wide as i64).max(1);
                         let band = y_page / pages_wide;
@@ -414,7 +756,6 @@ impl LayoutGlyphs for HyperLayout {
                         (base_x, base_y, base_z)
                     };
 
-                    // Page bounds: over all records, seeded at 0
                     let right = pos_x + r.advance;
                     if right > page_right {
                         page_right = right;
@@ -441,7 +782,6 @@ impl LayoutGlyphs for HyperLayout {
                     };
 
                     if r.glyph_id != 0 {
-                        // Ink bounds: over survivors
                         let half = r.height * 0.5;
                         if pos_x < ink_min[0] {
                             ink_min[0] = pos_x;
@@ -515,13 +855,7 @@ impl LayoutGlyphs for HyperLayout {
                     },
                 }
             })
-            .collect();
-
-        unsafe {
-            arena.commit(total_survivors);
-        }
-
-        Ok(placements)
+            .collect()
     }
 }
 
@@ -531,7 +865,7 @@ impl crate::layout::VerifyLayout for HyperLayout {
         items: &[LayoutItem<'_>],
         arena: &mut GlyphArena,
     ) -> Result<(Vec<ItemPlacement>, Vec<crate::layout::GlyphRecord>), LayoutError> {
-        let placements = self.layout_validated_items(items, arena)?;
+        let placements = self.layout_items_internal(items, arena, false)?;
         let trie = match &self.trie {
             Some(t) => Arc::clone(t),
             None => {

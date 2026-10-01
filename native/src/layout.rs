@@ -484,6 +484,8 @@ pub struct DeviceSlots {
     /// re-allocated — never read by design; their Drop is the release.
     #[allow(dead_code)]
     pub keep_alive: Vec<Box<dyn std::any::Any + Send>>,
+    /// When mapped in host-visible memory, base pointer to the RenderSlot slice as usize.
+    pub mapped_slots: Option<usize>,
 }
 
 pub struct DeviceSlotChunk {
@@ -552,6 +554,7 @@ impl GlyphArena {
     /// chunk. `parts` carries (base pointer, capacity, buffer) per chunk;
     /// every chunk but the last must be exactly `chunk_slots` (the slot math
     /// strides uniformly), and the last may be smaller.
+    #[allow(dead_code)]
     pub fn from_mapped_chunks(
         parts: Vec<(*mut GlyphInstance, usize, wgpu::Buffer)>,
         chunk_slots: usize,
@@ -689,6 +692,7 @@ impl GlyphArena {
 
     /// Hint the upper bound on slots still to come (records, before blanks are
     /// dropped). A hint only: the real count is lower and the arena grows.
+    #[allow(dead_code)]
     pub fn reserve(&mut self, records: usize) {
         if let Some(m) = &self.mapped {
             assert!(
@@ -885,6 +889,7 @@ pub trait VerifyLayout: LayoutGlyphs {
 /// Blank records (`glyph_id == 0` — missing or whitespace) emit no instance;
 /// their advance is already baked into the surviving records' X by the fold,
 /// so dropping them moves nothing.
+#[allow(dead_code)]
 pub(crate) fn compact_records_into(
     records: &[GlyphRecord],
     paint: Paint<'_>,

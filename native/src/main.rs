@@ -169,6 +169,7 @@ fn engine_layout(file: &Path, _trie: &Path) -> (layout::GlyphArena, layout::Item
 }
 
 /// Lay one file out through the seam FOR VERIFICATION: the wire records.
+#[allow(dead_code)]
 pub(crate) fn engine_layout_records_at(
     file: &Path,
     _trie: &Path,
@@ -278,36 +279,19 @@ fn build_scene_impl(
                 ..Default::default()
             };
             let t_visual_start = std::time::Instant::now();
-            let load = {
+            let device = &ctx.device;
+            let queue = &ctx.queue;
+            let (load, atlas, atlas_wall) = std::thread::scope(|s| {
+                let atlas_handle = s.spawn(|| {
+                    let t = std::time::Instant::now();
+                    let a = atlas::Atlas::load_device(device, queue, emoji_sheet);
+                    (a, t.elapsed())
+                });
                 let walk = repo::walk_repo(dir);
-                // The device-resident arena: the FFI (Direct) and Hyper write
-                // instances into the same shared storage the shader reads,
-                // on unified memory. The CUBECL path wants NO arena buffer
-                // at all since E2b — the chain's slot buffer binds directly
-                // (the endpoint, note 23). Past max_buffer_size the DIRECT
-                // arena chunks (one buffer per draw chunk).
-                let arena = if matches!(strategy, repo::Strategy::Direct | repo::Strategy::Hyper)
-                    && ctx.profile.backend == wgpu::Backend::Metal
-                    && ctx.profile.mappable_primary_buffers
-                    && walk.total_bytes > 0
-                {
-                    let single_fits = (walk.total_bytes
-                        * std::mem::size_of::<glyph_scene::GlyphInstance>())
-                        as u64
-                        <= ctx.profile.max_buffer_size;
-                    if single_fits {
-                        glyph_scene::mapped_instance_arena(
-                            ctx,
-                            walk.total_bytes,
-                            glyph_scene::arena_chunk_slots(ctx),
-                        )
-                    } else {
-                        layout::GlyphArena::new()
-                    }
-                } else {
-                    layout::GlyphArena::new()
-                };
-                repo::load_repo_from_walk(
+                // Device-resident backends (Hyper and Cubecl) allocate mapped unified
+                // storage directly for exact survivor counts via the device context.
+                let arena = layout::GlyphArena::new();
+                let l = repo::load_repo_from_walk(
                     dir,
                     walk,
                     &default_engine_trie(),
@@ -316,12 +300,11 @@ fn build_scene_impl(
                     *verify,
                     Some(ctx),
                     arena,
-                )
-            };
+                );
+                let (a, dur) = atlas_handle.join().expect("atlas load thread panicked");
+                (l, a, dur)
+            });
             load.print_stats();
-            let t_atlas = std::time::Instant::now();
-            let atlas = atlas::Atlas::load(ctx, emoji_sheet);
-            let atlas_dur = t_atlas.elapsed();
 
             let t_staged = std::time::Instant::now();
             let staged = load.into_staged(focus.as_deref(), &atlas.slot_ink);
@@ -333,8 +316,8 @@ fn build_scene_impl(
             let visual_total = t_visual_start.elapsed();
 
             println!(
-                "visual: atlas {:.3}s | staged {:.3}s | scene {:.3}s | total visual init {:.3}s",
-                atlas_dur.as_secs_f64(),
+                "visual: atlas {:.3}s (concurrent) | staged {:.3}s | scene {:.3}s | total visual init {:.3}s",
+                atlas_wall.as_secs_f64(),
                 staged_dur.as_secs_f64(),
                 scene_dur.as_secs_f64(),
                 visual_total.as_secs_f64(),

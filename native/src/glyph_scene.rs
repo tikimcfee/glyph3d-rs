@@ -202,6 +202,7 @@ pub struct GlyphScene {
 /// GLYPH_ARENA_CHUNK_SLOTS overrides it (the fork gate forces small chunks so
 /// the split paths — copy-hop intersections, tint straddles, multi-buffer
 /// bindings — run on a small corpus).
+#[allow(dead_code)]
 pub fn arena_chunk_slots(ctx: &GpuContext) -> usize {
     let derived = (ctx
         .device
@@ -231,6 +232,7 @@ pub fn arena_chunk_slots(ctx: &GpuContext) -> usize {
 /// to the remainder), so a corpus whose instance mass exceeds
 /// `max_buffer_size` is chunked instead of refused — the draw path binds one
 /// buffer per chunk regardless.
+#[allow(dead_code)]
 pub fn mapped_instance_arena(
     ctx: &GpuContext,
     slots: usize,

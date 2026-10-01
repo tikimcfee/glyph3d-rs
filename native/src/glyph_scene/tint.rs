@@ -2,7 +2,7 @@
 //! instances. Extracted from `glyph_scene.rs` in the 2026-09 code-shape
 //! refactor — a pure move.
 
-use super::{GlyphInstance, BACKDROP_GAIN, GLYPH_CELL_AREA};
+use super::{GlyphInstance, RenderSlot, BACKDROP_GAIN, GLYPH_CELL_AREA};
 
 /// Stage F — mean linear ink color + backdrop coverage for a slice of
 /// instances occupying a `width × height` world rect. Shared by the repo
@@ -94,6 +94,41 @@ impl<'a> SegTintAccum<'a> {
             let c0 = (color & 0xFF) as usize;
             let c1 = ((color >> 8) & 0xFF) as usize;
             let c2 = ((color >> 16) & 0xFF) as usize;
+            s0 += table[c0];
+            s1 += table[c1];
+            s2 += table[c2];
+            cells += 1;
+        }
+        self.sum = [s0, s1, s2];
+        self.cells = cells;
+    }
+
+    /// Direct fold over 32 B RenderSlots (the pure-Rust mapped endpoint path).
+    /// Extracts glyph_id and color directly from the mapped buffer with zero
+    /// intermediate allocations.
+    pub fn add_slots(&mut self, slots: &[RenderSlot]) {
+        static SRGB_TO_LINEAR: std::sync::LazyLock<[f64; 256]> =
+            std::sync::LazyLock::new(|| std::array::from_fn(|k| (k as f64 / 255.0).powf(2.2)));
+        let table = &*SRGB_TO_LINEAR;
+        let slot_ink = self.slot_ink;
+        let mut s0 = self.sum[0];
+        let mut s1 = self.sum[1];
+        let mut s2 = self.sum[2];
+        let mut cells = self.cells;
+        for s in slots {
+            let gid = s.glyph_id as usize;
+            if gid < slot_ink.len() {
+                if let Some(ink) = unsafe { slot_ink.get_unchecked(gid) } {
+                    s0 += ink[0] as f64;
+                    s1 += ink[1] as f64;
+                    s2 += ink[2] as f64;
+                    cells += 2;
+                    continue;
+                }
+            }
+            let c0 = (s.color & 0xFF) as usize;
+            let c1 = ((s.color >> 8) & 0xFF) as usize;
+            let c2 = ((s.color >> 16) & 0xFF) as usize;
             s0 += table[c0];
             s1 += table[c1];
             s2 += table[c2];
