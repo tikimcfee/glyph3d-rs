@@ -33,7 +33,7 @@ wgpu-profiler = "0.28"
 # CubeCL bring-up (the note-16 spike): GPU compute kernels in Rust sharing
 # our wgpu device. Pre-release pin — 0.11.0-pre.4 is the line whose wgpu dep
 # unifies with our 30.0.1 (the 0.10 line still pins wgpu 29).
-cubecl = { version = "=0.11.0-pre.4", features = ["wgpu"] }
+cubecl = { version = "=0.11.0-pre.4", features = ["wgpu"], optional = true }
 encase = "0.12"
 rayon = "1.10"
 # The load path's tracing substrate (note 22): spans over the chain, its
@@ -60,6 +60,7 @@ default = ["egui-ui"]
 # Stage K: build the windowed egui overlay. With the feature off (or `--no-ui`
 # at runtime) windowed behavior is exactly pre-K.
 egui-ui = ["dep:egui", "dep:egui-winit", "dep:egui-wgpu"]
+cubecl = ["dep:cubecl"]
 
 [dev-dependencies]
 # Stage H: validate the hand-written WGSL in `cargo test` with the exact

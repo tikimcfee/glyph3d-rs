@@ -30,9 +30,13 @@
 mod atlas;
 mod bake;
 mod cli;
+#[cfg(feature = "cubecl")]
 mod cubecl_smoke;
+#[cfg(feature = "cubecl")]
 mod cubecl_scan;
+#[cfg(feature = "cubecl")]
 mod cubecl_chain;
+#[cfg(feature = "cubecl")]
 mod cubecl_layout;
 mod fixture;
 mod fold;
@@ -372,39 +376,50 @@ fn main() {
     }
 
     // Dev-only CubeCL bring-up smoke (note 16, phase 0).
-    if cli.cubecl_smoke {
-        let ctx = pollster::block_on(gpu::init(None));
-        cubecl_smoke::run(&ctx);
+    #[cfg(feature = "cubecl")]
+    {
+        if cli.cubecl_smoke {
+            let ctx = pollster::block_on(gpu::init(None));
+            cubecl_smoke::run(&ctx);
+        }
+        if let Some(path) = &cli.cubecl_scan_check {
+            let ctx = pollster::block_on(gpu::init(None));
+            cubecl_scan::run(&ctx, path);
+        }
+        if let Some(path) = &cli.cubecl_chain_check {
+            let ctx = pollster::block_on(gpu::init(None));
+            cubecl_chain::run(&ctx, path);
+        }
+        if let Some(path) = &cli.cubecl_chain_bench {
+            let ctx = pollster::block_on(gpu::init(None));
+            cubecl_chain::bench(&ctx, path);
+        }
+        if let Some(path) = &cli.cubecl_decode_check {
+            let ctx = pollster::block_on(gpu::init(None));
+            cubecl_chain::decode_check(&ctx, path);
+        }
+        if let Some(path) = &cli.cubecl_cluster_check {
+            let ctx = pollster::block_on(gpu::init(None));
+            cubecl_chain::cluster_check(&ctx, path);
+        }
+        if let Some(dir) = &cli.cubecl_repo_check {
+            let ctx = pollster::block_on(gpu::init(None));
+            cubecl_chain::repo_check(&ctx, dir);
+        }
     }
-    // Dev-only CubeCL scan check (note 16, phase 1).
-    if let Some(path) = &cli.cubecl_scan_check {
-        let ctx = pollster::block_on(gpu::init(None));
-        cubecl_scan::run(&ctx, path);
-    }
-    // Dev-only CubeCL chain check (note 16, phase 2).
-    if let Some(path) = &cli.cubecl_chain_check {
-        let ctx = pollster::block_on(gpu::init(None));
-        cubecl_chain::run(&ctx, path);
-    }
-    // Dev-only CubeCL chain bench (note 16, phase 2).
-    if let Some(path) = &cli.cubecl_chain_bench {
-        let ctx = pollster::block_on(gpu::init(None));
-        cubecl_chain::bench(&ctx, path);
-    }
-    // Dev-only CubeCL decode check (phase 3a).
-    if let Some(path) = &cli.cubecl_decode_check {
-        let ctx = pollster::block_on(gpu::init(None));
-        cubecl_chain::decode_check(&ctx, path);
-    }
-    // Dev-only CubeCL cluster check (phase 3b).
-    if let Some(path) = &cli.cubecl_cluster_check {
-        let ctx = pollster::block_on(gpu::init(None));
-        cubecl_chain::cluster_check(&ctx, path);
-    }
-    // Dev-only CubeCL repo parity driver (phase 4 rung 3).
-    if let Some(dir) = &cli.cubecl_repo_check {
-        let ctx = pollster::block_on(gpu::init(None));
-        cubecl_chain::repo_check(&ctx, dir);
+    #[cfg(not(feature = "cubecl"))]
+    {
+        if cli.cubecl_smoke
+            || cli.cubecl_scan_check.is_some()
+            || cli.cubecl_chain_check.is_some()
+            || cli.cubecl_chain_bench.is_some()
+            || cli.cubecl_decode_check.is_some()
+            || cli.cubecl_cluster_check.is_some()
+            || cli.cubecl_repo_check.is_some()
+        {
+            eprintln!("error: cubecl options require building with `--features cubecl`");
+            std::process::exit(1);
+        }
     }
 
     // Fixture parity (reference port): fixture parse manifest / corpus diff — no GPU.

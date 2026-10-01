@@ -375,7 +375,11 @@ pub struct LoadStats {
     pub phases: BackendPhases,
     /// The cubecl backend's own decomposition (rung 5's yardstick); None on
     /// the Mojo strategies, whose spans live in `phases`.
+    #[cfg(feature = "cubecl")]
     pub cubecl: Option<crate::cubecl_layout::CubeclPhases>,
+    #[cfg(not(feature = "cubecl"))]
+    #[allow(dead_code)]
+    pub cubecl: Option<()>,
     pub stage: Duration,
     pub layout: Duration,
     pub files: usize,
@@ -608,18 +612,21 @@ pub fn load_repo_from_walk(
     // backend's OWN contract either way.
     enum Backend {
         Hyper(crate::layout_hyper::HyperLayout),
+        #[cfg(feature = "cubecl")]
         Cubecl(crate::cubecl_layout::CubeclLayout),
     }
     impl LayoutGlyphs for Backend {
         fn name(&self) -> &'static str {
             match self {
                 Backend::Hyper(b) => b.name(),
+                #[cfg(feature = "cubecl")]
                 Backend::Cubecl(b) => b.name(),
             }
         }
         fn load_trie_file(&mut self, path: &Path) -> Result<(), LayoutError> {
             match self {
                 Backend::Hyper(b) => b.load_trie_file(path),
+                #[cfg(feature = "cubecl")]
                 Backend::Cubecl(b) => b.load_trie_file(path),
             }
         }
@@ -630,6 +637,7 @@ pub fn load_repo_from_walk(
         ) -> Result<Vec<ItemPlacement>, LayoutError> {
             match self {
                 Backend::Hyper(b) => b.layout_validated_items(items, arena),
+                #[cfg(feature = "cubecl")]
                 Backend::Cubecl(b) => b.layout_validated_items(items, arena),
             }
         }
@@ -638,11 +646,16 @@ pub fn load_repo_from_walk(
         fn phases(&self) -> BackendPhases {
             BackendPhases::default()
         }
+        #[cfg(feature = "cubecl")]
         fn cubecl_phases(&self) -> Option<crate::cubecl_layout::CubeclPhases> {
             match self {
                 Backend::Hyper(_) => None,
                 Backend::Cubecl(b) => Some(b.phases()),
             }
+        }
+        #[cfg(not(feature = "cubecl"))]
+        fn cubecl_phases(&self) -> Option<()> {
+            None
         }
     }
     impl VerifyLayout for Backend {
@@ -653,11 +666,13 @@ pub fn load_repo_from_walk(
         ) -> Result<(Vec<ItemPlacement>, Vec<GlyphRecord>), LayoutError> {
             match self {
                 Backend::Hyper(b) => b.layout_validated_items_recording(items, arena),
+                #[cfg(feature = "cubecl")]
                 Backend::Cubecl(b) => b.layout_validated_items_recording(items, arena),
             }
         }
     }
     let mut backend = match strategy {
+        #[cfg(feature = "cubecl")]
         Strategy::Cubecl => Backend::Cubecl(match gpu {
             Some(ctx) => crate::cubecl_layout::CubeclLayout::with_device(
                 crate::cubecl_chain::SharedDevice::from_ctx(ctx),
@@ -1012,6 +1027,12 @@ impl RepoLoad {
         // ambiguity that made `fold` look like the fold for a day. Only the
         // person who built the path knows which zero is which, and they are not
         // the person who reads this next.
+        #[cfg(feature = "cubecl")]
+        let has_cubecl = s.cubecl.is_some();
+        #[cfg(not(feature = "cubecl"))]
+        let has_cubecl = false;
+
+        #[cfg(feature = "cubecl")]
         if let Some(cp) = s.cubecl {
             // The device chain's stages are a different shape from the
             // record/direct split below — printing the Mojo block for it
@@ -1046,48 +1067,49 @@ impl RepoLoad {
                 cp.compact.as_secs_f64(),
                 s.backend.saturating_sub(accounted).as_secs_f64(),
             );
-        } else {
-        let p = s.phases;
-        let attributed = p.fold + p.readback() + p.compact;
-        let absent = !s.strategy.materializes_records();
-        let secs = |d: Duration| {
-            if absent { "n/a".to_string() } else { format!("{:.3}s", d.as_secs_f64()) }
-        };
-        println!(
-            "  backend: fold {:.3}s | readback {} (alloc {} + copy {}, {}) \
-             | compact {} | unattributed {:.3}s",
-            p.fold.as_secs_f64(),
-            secs(p.readback()),
-            secs(p.readback_alloc),
-            secs(p.readback_copy),
-            if absent {
-                "no wire record on this path".to_string()
-            } else {
-                format!("{:.2} GB", (s.records * 32) as f64 / 1.073_741_824e9)
-            },
-            secs(p.compact),
-            s.backend.saturating_sub(attributed).as_secs_f64(),
-        );
-        // `fold` above is the whole FFI call. This is what the engine says it
-        // spent inside it — largest lane first, and `unattributed` here catches
-        // the part of the call that is neither run_pipeline nor the two stages
-        // the FFI entry owns (marshalling, arena reuse, the return trip).
-        //
-        // Zero-valued engine lanes are ELIDED rather than printed as 0.000s,
-        // for the same reason: a lane absent from this line did not run on this
-        // path. `eg_compact`/`eg_counts` belong to the record path and
-        // `eg_direct` to the direct one, so which lanes appear is itself the
-        // statement of which route the load took.
-        let ranked = p.engine_ranked();
-        let eng_sum: Duration = ranked.iter().map(|(_, d)| *d).sum();
-        print!("  engine:");
-        for (name, d) in ranked.iter().filter(|(_, d)| !d.is_zero()) {
-            print!(" {} {:.3}s", name, d.as_secs_f64());
         }
-        println!(
-            " | unattributed {:.3}s",
-            p.fold.saturating_sub(eng_sum).as_secs_f64()
-        );
+        if !has_cubecl {
+            let p = s.phases;
+            let attributed = p.fold + p.readback() + p.compact;
+            let absent = !s.strategy.materializes_records();
+            let secs = |d: Duration| {
+                if absent { "n/a".to_string() } else { format!("{:.3}s", d.as_secs_f64()) }
+            };
+            println!(
+                "  backend: fold {:.3}s | readback {} (alloc {} + copy {}, {}) \
+                 | compact {} | unattributed {:.3}s",
+                p.fold.as_secs_f64(),
+                secs(p.readback()),
+                secs(p.readback_alloc),
+                secs(p.readback_copy),
+                if absent {
+                    "no wire record on this path".to_string()
+                } else {
+                    format!("{:.2} GB", (s.records * 32) as f64 / 1.073_741_824e9)
+                },
+                secs(p.compact),
+                s.backend.saturating_sub(attributed).as_secs_f64(),
+            );
+            // `fold` above is the whole FFI call. This is what the engine says it
+            // spent inside it — largest lane first, and `unattributed` here catches
+            // the part of the call that is neither run_pipeline nor the two stages
+            // the FFI entry owns (marshalling, arena reuse, the return trip).
+            //
+            // Zero-valued engine lanes are ELIDED rather than printed as 0.000s,
+            // for the same reason: a lane absent from this line did not run on this
+            // path. `eg_compact`/`eg_counts` belong to the record path and
+            // `eg_direct` to the direct one, so which lanes appear is itself the
+            // statement of which route the load took.
+            let ranked = p.engine_ranked();
+            let eng_sum: Duration = ranked.iter().map(|(_, d)| *d).sum();
+            print!("  engine:");
+            for (name, d) in ranked.iter().filter(|(_, d)| !d.is_zero()) {
+                print!(" {} {:.3}s", name, d.as_secs_f64());
+            }
+            println!(
+                " | unattributed {:.3}s",
+                p.fold.saturating_sub(eng_sum).as_secs_f64()
+            );
         }
     }
 }
