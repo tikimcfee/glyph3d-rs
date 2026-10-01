@@ -202,6 +202,7 @@ impl LayoutGlyphs for CubeclLayout {
                 chunks: vec![sd.chunk],
                 keep_alive: vec![sd.keep_alive],
                 mapped_slots: None,
+                file_tints: Vec::new(),
             });
         }
         self.phases = CubeclPhases {

@@ -437,6 +437,15 @@ pub struct GlyphArena {
 /// on device, bound directly by the renderer — no host copy exists. The
 /// per-slot tint lanes ride host-side (seg_tint's fold input — the slots
 /// themselves are device-only).
+/// Precomputed per-item tint statistics accumulated during layout Pass 2.
+/// Avoids reading back instance buffers from mapped GPU memory.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct FileTintAccum {
+    pub sum: [f64; 3],
+    pub cells: usize,
+    pub has_emoji: bool,
+}
+
 pub struct DeviceSlots {
     /// One entry per chunk buffer. `offset` is slot 0's byte address in
     /// the buffer — 0 for the exclusive-page big forms, nonzero where the
@@ -447,6 +456,8 @@ pub struct DeviceSlots {
     pub len: usize,
     /// When mapped in host-visible memory, base pointer to the RenderSlot slice as usize.
     pub mapped_slots: Option<usize>,
+    /// Precomputed in-flight tint accumulators per item, avoiding 3 GB mapped memory readback.
+    pub file_tints: Vec<FileTintAccum>,
     /// (glyph_id, color) per slot, slot order — read through `as_slice`.
     #[cfg(feature = "cubecl")]
     pub tint: TintStore,

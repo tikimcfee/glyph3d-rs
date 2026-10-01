@@ -1146,27 +1146,38 @@ impl RepoLoad {
         } else {
             Vec::new()
         };
+        let file_tints = self.arena.device_slots().map(|d| &d.file_tints);
         let seg_of = |v: &FileView| {
-            // The file's slot range folded in arena order: chunk slices
-            // ascend and concatenate exactly, so a range that straddles a
-            // chunk boundary tints bit-identically to the contiguous fold.
-            let mut tint = crate::glyph_scene::SegTintAccum::new(slot_ink);
-            let want = v.slot_base..v.slot_base + v.slot_count;
-            if let Some(slots) = mapped_slots {
-                tint.add_slots(&slots[want]);
-            } else if let Some(tp) = tint_stream {
-                tint.add_tint(&tp[want.start * 2..want.end * 2]);
-            } else {
-                let mut base = 0usize;
-                for chunk in &chunks {
-                    let lo = want.start.max(base);
-                    let hi = want.end.min(base + chunk.len());
-                    if lo < hi {
-                        tint.add(&chunk[lo - base..hi - base]);
-                    }
-                    base += chunk.len();
+            let fast_tint = file_tints.and_then(|t| t.get(v.group_id as usize));
+            let tint = match fast_tint {
+                Some(acc) if !acc.has_emoji => {
+                    let accum = crate::glyph_scene::SegTintAccum::from_parts(acc.sum, acc.cells, slot_ink);
+                    accum.finish(v.slot_count, v.width, v.height)
                 }
-            }
+                _ => {
+                    // The file's slot range folded in arena order: chunk slices
+                    // ascend and concatenate exactly, so a range that straddles a
+                    // chunk boundary tints bit-identically to the contiguous fold.
+                    let mut tint = crate::glyph_scene::SegTintAccum::new(slot_ink);
+                    let want = v.slot_base..v.slot_base + v.slot_count;
+                    if let Some(slots) = mapped_slots {
+                        tint.add_slots(&slots[want]);
+                    } else if let Some(tp) = tint_stream {
+                        tint.add_tint(&tp[want.start * 2..want.end * 2]);
+                    } else {
+                        let mut base = 0usize;
+                        for chunk in &chunks {
+                            let lo = want.start.max(base);
+                            let hi = want.end.min(base + chunk.len());
+                            if lo < hi {
+                                tint.add(&chunk[lo - base..hi - base]);
+                            }
+                            base += chunk.len();
+                        }
+                    }
+                    tint.finish(v.slot_count, v.width, v.height)
+                }
+            };
             crate::glyph_scene::SegCull {
                 min: [
                     v.offset[0] - 0.3,
@@ -1180,7 +1191,7 @@ impl RepoLoad {
                 ],
                 slot_base: v.slot_base as u32,
                 slot_count: v.slot_count as u32,
-                tint: tint.finish(v.slot_count, v.width, v.height),
+                tint,
             }
         };
         // seg_tint re-reads the whole arena, one file's slice at a time —

@@ -30,12 +30,21 @@ pub struct SegTintAccum<'a> {
     slot_ink: &'a [Option<[f32; 4]>],
 }
 
+pub fn srgb_to_linear_table() -> &'static [f64; 256] {
+    &SRGB_TO_LINEAR
+}
+
 static SRGB_TO_LINEAR: std::sync::LazyLock<[f64; 256]> =
     std::sync::LazyLock::new(|| std::array::from_fn(|k| (k as f64 / 255.0).powf(2.2)));
 
 impl<'a> SegTintAccum<'a> {
     pub fn new(slot_ink: &'a [Option<[f32; 4]>]) -> Self {
         Self { sum: [0f64; 3], cells: 0, slot_ink }
+    }
+
+    #[inline(always)]
+    pub fn from_parts(sum: [f64; 3], cells: usize, slot_ink: &'a [Option<[f32; 4]>]) -> Self {
+        Self { sum, cells, slot_ink }
     }
 
     pub fn add(&mut self, instances: &[GlyphInstance]) {

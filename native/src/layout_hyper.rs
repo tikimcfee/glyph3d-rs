@@ -434,7 +434,7 @@ impl HyperLayout {
         if can_map_device {
             let dev = self.device.as_ref().unwrap();
             let (mapped_ptr, wgpu_buf) = create_mapped_render_slots(&dev.device, total_survivors);
-            let placements = Self::layout_pass2_device(
+            let (placements, file_tints) = Self::layout_pass2_device(
                 items,
                 &prepasses,
                 &slot_bases,
@@ -452,6 +452,7 @@ impl HyperLayout {
                 chunk_slots: total_survivors,
                 len: total_survivors,
                 mapped_slots: Some(mapped_ptr as usize),
+                file_tints,
                 #[cfg(feature = "cubecl")]
                 tint: TintStore::Host(Vec::new()),
                 #[cfg(feature = "cubecl")]
@@ -486,8 +487,9 @@ impl HyperLayout {
         bitmap_adv: f32,
         em_height_fu: u32,
         dest: SendPtr<RenderSlot>,
-    ) -> Vec<ItemPlacement> {
+    ) -> (Vec<ItemPlacement>, Vec<crate::layout::FileTintAccum>) {
         let dest_addr = dest.0 as usize;
+        let lut = crate::glyph_scene::srgb_to_linear_table();
         items
             .par_iter()
             .zip(prepasses.par_iter())
@@ -530,6 +532,11 @@ impl HyperLayout {
                 let out_ptr = unsafe { (dest_addr as *mut RenderSlot).add(slot_base as usize) };
                 let flat_color = if let Paint::Flat(c) = item.paint { Some(c) } else { None };
                 let per_record_colors = if let Paint::PerRecord(c) = item.paint { Some(c) } else { None };
+                let mut file_s0 = 0.0f64;
+                let mut file_s1 = 0.0f64;
+                let mut file_s2 = 0.0f64;
+                let mut file_cells = 0usize;
+                let mut file_has_emoji = false;
 
                 let wrap_w = p.wrap_width as i64;
                 let is_wrap_back = p.wrap_mode == crate::fold::WrapMode::Back;
@@ -652,6 +659,19 @@ impl HyperLayout {
                             ink_max[2] = pos_z;
                         }
 
+                        let gid = r.glyph_id as usize;
+                        if gid < trie.emoji_cell.len() && trie.emoji_cell[gid].is_some() {
+                            file_has_emoji = true;
+                        } else {
+                            let c0 = (color & 0xFF) as usize;
+                            let c1 = ((color >> 8) & 0xFF) as usize;
+                            let c2 = ((color >> 16) & 0xFF) as usize;
+                            file_s0 += lut[c0];
+                            file_s1 += lut[c1];
+                            file_s2 += lut[c2];
+                            file_cells += 1;
+                        }
+
                         unsafe {
                             *out_ptr.add(survivor_out) = RenderSlot {
                                 pos: [pos_x, pos_y, pos_z],
@@ -685,23 +705,30 @@ impl HyperLayout {
                     pos += 1;
                 }
 
-                ItemPlacement {
-                    slot_base,
-                    slot_count: survivor_out as u32,
-                    record_count: record_idx as u32,
-                    page: PageExtent {
-                        right: page_right,
-                        bottom: page_bottom,
-                        z_min: page_z_min,
-                        z_max: page_z_max,
+                (
+                    ItemPlacement {
+                        slot_base,
+                        slot_count: survivor_out as u32,
+                        record_count: record_idx as u32,
+                        page: PageExtent {
+                            right: page_right,
+                            bottom: page_bottom,
+                            z_min: page_z_min,
+                            z_max: page_z_max,
+                        },
+                        ink: InkExtent {
+                            min: ink_min,
+                            max: ink_max,
+                        },
                     },
-                    ink: InkExtent {
-                        min: ink_min,
-                        max: ink_max,
+                    crate::layout::FileTintAccum {
+                        sum: [file_s0, file_s1, file_s2],
+                        cells: file_cells,
+                        has_emoji: file_has_emoji,
                     },
-                }
+                )
             })
-            .collect()
+            .unzip()
     }
 
     fn layout_pass2_host(

@@ -83,7 +83,7 @@ pub use pick::{PickCommand, PickContext, PickFileInfo, PickHit, Verb};
 use pick::PickCacheEntry;
 
 mod tint;
-pub use tint::{SegTintAccum, seg_tint};
+pub use tint::{SegTintAccum, seg_tint, srgb_to_linear_table};
 
 mod instance;
 pub use instance::{GlyphInstance, GroupRow, RenderSlot};
