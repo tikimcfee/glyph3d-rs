@@ -12,7 +12,9 @@ use winit::window::{CursorGrabMode, Window};
 use crate::gpu::GpuContext;
 use crate::scene::{self, SceneLike};
 
+#[cfg(feature = "egui-ui")]
 use super::app::RelayoutRequest;
+#[cfg(feature = "egui-ui")]
 use super::ui::{EguiUi, PANEL_VERBS};
 
 pub(super) struct WindowState {

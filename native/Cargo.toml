@@ -17,7 +17,6 @@ wgpu = "30"
 winit = "0.30"
 pollster = "0.4"
 bytemuck = { version = "1", features = ["derive"] }
-env_logger = "0.11"
 log = "0.4"
 image = "0.25"
 # Stage I: 0.30 → 0.33 bump (its own gated mini-stage — see out/STAGE_I_REPORT.md).
@@ -43,6 +42,8 @@ wgpu-profiler = "0.28"
 cubecl = { version = "=0.11.0-pre.4", features = ["wgpu"], optional = true }
 encase = "0.12"
 rayon = "1.10"
+memchr = "2"
+simdutf8 = "0.1"
 # The load path's tracing substrate (note 22): spans over the chain, its
 # tail, and the repo load, so measurements stop being ad-hoc Instant
 # pairs. Both crates are already resolved in the lockfile through wgpu

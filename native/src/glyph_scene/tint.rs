@@ -30,14 +30,15 @@ pub struct SegTintAccum<'a> {
     slot_ink: &'a [Option<[f32; 4]>],
 }
 
+static SRGB_TO_LINEAR: std::sync::LazyLock<[f64; 256]> =
+    std::sync::LazyLock::new(|| std::array::from_fn(|k| (k as f64 / 255.0).powf(2.2)));
+
 impl<'a> SegTintAccum<'a> {
     pub fn new(slot_ink: &'a [Option<[f32; 4]>]) -> Self {
         Self { sum: [0f64; 3], cells: 0, slot_ink }
     }
 
     pub fn add(&mut self, instances: &[GlyphInstance]) {
-        static SRGB_TO_LINEAR: std::sync::LazyLock<[f64; 256]> =
-            std::sync::LazyLock::new(|| std::array::from_fn(|k| (k as f64 / 255.0).powf(2.2)));
         let table = &*SRGB_TO_LINEAR;
         let slot_ink = self.slot_ink;
         let mut s0 = self.sum[0];
@@ -72,8 +73,6 @@ impl<'a> SegTintAccum<'a> {
     /// instances, so the tints are bit-identical whichever arena form fed
     /// the load. Slot order IS arena order (both are survivor order).
     pub fn add_tint(&mut self, pairs: &[u32]) {
-        static SRGB_TO_LINEAR: std::sync::LazyLock<[f64; 256]> =
-            std::sync::LazyLock::new(|| std::array::from_fn(|k| (k as f64 / 255.0).powf(2.2)));
         let table = &*SRGB_TO_LINEAR;
         let slot_ink = self.slot_ink;
         let mut s0 = self.sum[0];
@@ -107,8 +106,6 @@ impl<'a> SegTintAccum<'a> {
     /// Extracts glyph_id and color directly from the mapped buffer with zero
     /// intermediate allocations.
     pub fn add_slots(&mut self, slots: &[RenderSlot]) {
-        static SRGB_TO_LINEAR: std::sync::LazyLock<[f64; 256]> =
-            std::sync::LazyLock::new(|| std::array::from_fn(|k| (k as f64 / 255.0).powf(2.2)));
         let table = &*SRGB_TO_LINEAR;
         let slot_ink = self.slot_ink;
         let mut s0 = self.sum[0];

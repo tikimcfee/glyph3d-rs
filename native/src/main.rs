@@ -42,25 +42,24 @@ use glyph3d_native::*;
 /// Stage D: drive the Mojo glyph engine in-process over one file.
 /// Prints slot count, per-load timing, throughput, and the first records.
 fn main() {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
-    // The load path's span instrument (note 22). Span-CLOSE lines carry the
-    // elapsed time; GLYPH_TRACE (fallback RUST_LOG) names the filter, unset
-    // means OFF — a disabled span costs one atomic load. wgpu/cubecl emit
-    // their own `tracing` records through the same pipe, so the useful
-    // setting is `glyph3d_native=info`, not a bare `info`. set_global_default
-    // rather than .init(): the builder's init also installs a `log` bridge
-    // (tracing-log is on via the fmt feature) and env_logger above already
-    // owns the `log` pipe — the two compose, one facade each.
-    let trace_subscriber = tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_env("GLYPH_TRACE")
-                .or_else(|_| tracing_subscriber::EnvFilter::try_from_default_env())
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("off")),
-        )
+    // Unified logging & tracing substrate.
+    // tracing-log automatically captures all log::* records and routes them into tracing.
+    // Filtering precedence:
+    // 1. GLYPH_TRACE (tracing-specific filter, e.g. "glyph3d_native=info,chain=debug")
+    // 2. RUST_LOG (standard environment logging filter)
+    // 3. Default: "glyph3d_native=info,wgpu=info,naga=warn"
+    // (wgpu info is retained for hardware initialization diagnostics across machines).
+    let env_filter = tracing_subscriber::EnvFilter::try_from_env("GLYPH_TRACE")
+        .or_else(|_| tracing_subscriber::EnvFilter::try_from_env("RUST_LOG"))
+        .unwrap_or_else(|_| {
+            tracing_subscriber::EnvFilter::new("glyph3d_native=info,wgpu=info,naga=warn")
+        });
+
+    tracing_subscriber::fmt()
+        .with_env_filter(env_filter)
+        .with_writer(std::io::stderr)
         .with_span_events(tracing_subscriber::fmt::format::FmtSpan::CLOSE)
-        .finish();
-    tracing::subscriber::set_global_default(trace_subscriber)
-        .expect("tracing subscriber installs once, before anything spawns");
+        .init();
     let cli = parse_cli();
 
     // Stage H: shell completions, then exit (no GPU).
@@ -148,17 +147,6 @@ fn main() {
     }
     if !cli.fixture_bake.is_empty() {
         bake::run_fixture_bake(&cli.fixture_bake);
-    }
-
-    // Stage E1: engine check (Mojo engine removed)
-    if let Some(_file) = &cli.engine_check {
-        log::info!("engine-check: Mojo engine removed; use hyper-rust or unit tests");
-    }
-
-    // Stage D: engine file (Mojo engine removed)
-    if let Some(_file) = &cli.engine_file {
-        log::info!("engine-file: Mojo engine removed; use hyper-rust or unit tests");
-        return;
     }
 
     // Stage E2 scan-only: full load pipeline without a GPU (measurement path).

@@ -135,9 +135,6 @@ pub struct Cli {
     /// Camera magnification for offscreen
     #[arg(long, value_name = "F", default_value_t = 1.0, allow_negative_numbers = true)]
     pub zoom: f32,
-    /// Stage D: run the Mojo glyph engine in-process on PATH, print records, exit
-    #[arg(long, value_name = "PATH")]
-    pub engine_file: Option<PathBuf>,
     /// The colour-emoji sheet every glyph scene loads (default:
     /// assets/atlas/emoji-sheet.bin, baked from the vendored Noto Color Emoji).
     /// Point it at another G3ES file to swap the sheet without a rebuild.
@@ -147,12 +144,6 @@ pub struct Cli {
     /// atlas mapping; pass a .pipe.bin fixture for the toy one)
     #[arg(long, value_name = "PATH")]
     pub engine_trie: Option<PathBuf>,
-    /// Repeat the --engine-file load N times (leak/stability loop)
-    #[arg(long, value_name = "N", default_value_t = 1)]
-    pub engine_loop: u32,
-    /// Stage E1: cross-check engine output vs text.rs CPU reference (bit-exact), exit
-    #[arg(long, value_name = "PATH")]
-    pub engine_check: Option<PathBuf>,
     /// Stage E1: render engine records through the Slug renderer
     #[arg(long, value_name = "PATH")]
     pub engine_render: Option<PathBuf>,
@@ -531,11 +522,8 @@ mod cli_tests {
         assert!(cli.render_file.is_none());
         assert_eq!(cli.copies, 1);
         assert_eq!(cli.zoom, 1.0);
-        assert!(cli.engine_file.is_none());
         assert!(cli.engine_trie.is_none());
         assert!(cli.emoji_sheet.is_none());
-        assert_eq!(cli.engine_loop, 1);
-        assert!(cli.engine_check.is_none());
         assert!(cli.engine_render.is_none());
         assert!(cli.load_repo.is_none());
         // The DEFAULT is `hyper` (pure-Rust parallel direct engine).
@@ -577,11 +565,11 @@ mod cli_tests {
     fn scalar_flags_parse() {
         let cli = parse(&[
             "--screenshot", "out.png", "--frames", "2", "--demo", "--copies", "3", "--zoom",
-            "2.5", "--no-cull", "--no-ui", "--engine-loop", "4", "--load-repo", "fixtures/g-pick-repo",
+            "2.5", "--no-cull", "--no-ui", "--load-repo", "fixtures/g-pick-repo",
             "--repo-engine", "batch", "--repo-verify", "--focus-file", "alpha",
             "--wrap-mode", "back", "--z-wrap-spacing", "0.6", "--cluster-mode", "cluster",
-            "--render-file", "src/main.rs", "--engine-file", "a.rs", "--engine-trie", "t.bin",
-            "--engine-check", "b.rs", "--engine-render", "c.rs",
+            "--render-file", "src/main.rs", "--engine-trie", "t.bin",
+            "--engine-render", "c.rs",
             "--present-mode", "mailbox", "--gpu-key", "--gpu-profile",
             "--emoji-sheet", "sheets/other.bin",
         ]);
@@ -597,7 +585,6 @@ mod cli_tests {
         assert_eq!(cli.zoom, 2.5);
         assert!(cli.no_cull);
         assert!(cli.no_ui);
-        assert_eq!(cli.engine_loop, 4);
         assert_eq!(cli.load_repo, Some(PathBuf::from("fixtures/g-pick-repo")));
         assert_eq!(cli.repo_engine, "batch");
         assert_eq!(cli.wrap_mode, "back");
@@ -608,9 +595,7 @@ mod cli_tests {
         assert!(cli.repo_verify);
         assert_eq!(cli.focus_file.as_deref(), Some("alpha"));
         assert_eq!(cli.render_file, Some(PathBuf::from("src/main.rs")));
-        assert_eq!(cli.engine_file, Some(PathBuf::from("a.rs")));
         assert_eq!(cli.engine_trie, Some(PathBuf::from("t.bin")));
-        assert_eq!(cli.engine_check, Some(PathBuf::from("b.rs")));
         assert_eq!(cli.engine_render, Some(PathBuf::from("c.rs")));
     }
 

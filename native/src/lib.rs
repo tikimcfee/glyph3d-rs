@@ -29,10 +29,11 @@ pub mod cubecl_chain;
 #[cfg(feature = "cubecl")]
 pub mod cubecl_layout;
 
+pub use atlas::default_trie;
 pub use cli::{Op, parse_verb};
 pub use glyph_scene::{CameraMode, GlyphScene};
 pub use gpu::GpuContext;
-pub use layout::{LayoutGlyphs, VerifyLayout};
+pub use layout::{LayoutEngine, LayoutGlyphs, VerifyLayout};
 pub use scene::{Scene, SceneLike};
 
 pub const OFFSCREEN_WIDTH: u32 = 1600;
@@ -95,9 +96,10 @@ pub fn engine_item_at(bytes: &[u8], origin: [f64; 3]) -> layout::LayoutItem<'_> 
     }
 }
 
-pub fn engine_layout(file: &Path, _trie: &Path) -> (layout::GlyphArena, layout::ItemPlacement) {
+pub fn engine_layout(file: &Path, trie: &Path) -> (layout::GlyphArena, layout::ItemPlacement) {
     let bytes = std::fs::read(file).expect("failed to read engine input file");
-    let mut backend = layout_hyper::HyperLayout::new();
+    let mut backend = layout::LayoutEngine::hyper();
+    backend.load_trie_file(trie).expect("failed to load trie");
     let mut arena = layout::GlyphArena::new();
     let placements = backend
         .layout_items(&[engine_item(&bytes)], &mut arena)

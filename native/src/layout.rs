@@ -699,6 +699,106 @@ pub trait VerifyLayout: LayoutGlyphs {
 }
 
 // ---------------------------------------------------------------------------
+// The unified layout container
+// ---------------------------------------------------------------------------
+
+/// A unified container for layout engines (pure-Rust HyperLayout, CubeCL GPU compute layout).
+/// Allows versioned or alternative layout engines to be integrated cleanly behind a common interface.
+pub enum LayoutEngine {
+    Hyper(crate::layout_hyper::HyperLayout),
+    #[cfg(feature = "cubecl")]
+    Cubecl(crate::cubecl_layout::CubeclLayout),
+}
+
+impl Default for LayoutEngine {
+    fn default() -> Self {
+        Self::hyper()
+    }
+}
+
+impl LayoutEngine {
+    /// Constructs a HyperLayout engine (parallel Rayon CPU layout).
+    pub fn hyper() -> Self {
+        Self::Hyper(crate::layout_hyper::HyperLayout::new())
+    }
+
+    /// Constructs a HyperLayout engine sharing a GPU context device.
+    pub fn hyper_with_device(device: crate::gpu::SharedDevice) -> Self {
+        Self::Hyper(crate::layout_hyper::HyperLayout::with_device(device))
+    }
+
+    /// Constructs a CubeCL layout engine if the feature is enabled.
+    #[cfg(feature = "cubecl")]
+    pub fn cubecl() -> Self {
+        Self::Cubecl(crate::cubecl_layout::CubeclLayout::new())
+    }
+
+    /// Constructs a CubeCL layout engine sharing a GPU context device.
+    #[cfg(feature = "cubecl")]
+    pub(crate) fn cubecl_with_device(device: crate::cubecl_chain::SharedDevice) -> Self {
+        Self::Cubecl(crate::cubecl_layout::CubeclLayout::with_device(device))
+    }
+
+    /// Retrieve generic backend execution phases.
+    pub fn phases(&self) -> crate::repo::BackendPhases {
+        crate::repo::BackendPhases::default()
+    }
+
+    /// Retrieve CubeCL execution phases if running on CubeCL.
+    #[cfg(feature = "cubecl")]
+    pub fn cubecl_phases(&self) -> Option<crate::cubecl_layout::CubeclPhases> {
+        match self {
+            Self::Hyper(_) => None,
+            Self::Cubecl(c) => Some(c.phases()),
+        }
+    }
+}
+
+impl LayoutGlyphs for LayoutEngine {
+    fn name(&self) -> &'static str {
+        match self {
+            Self::Hyper(b) => b.name(),
+            #[cfg(feature = "cubecl")]
+            Self::Cubecl(b) => b.name(),
+        }
+    }
+
+    fn load_trie_file(&mut self, path: &Path) -> Result<(), LayoutError> {
+        match self {
+            Self::Hyper(b) => b.load_trie_file(path),
+            #[cfg(feature = "cubecl")]
+            Self::Cubecl(b) => b.load_trie_file(path),
+        }
+    }
+
+    fn layout_validated_items(
+        &mut self,
+        items: &[LayoutItem<'_>],
+        arena: &mut GlyphArena,
+    ) -> Result<Vec<ItemPlacement>, LayoutError> {
+        match self {
+            Self::Hyper(b) => b.layout_validated_items(items, arena),
+            #[cfg(feature = "cubecl")]
+            Self::Cubecl(b) => b.layout_validated_items(items, arena),
+        }
+    }
+}
+
+impl VerifyLayout for LayoutEngine {
+    fn layout_validated_items_recording(
+        &mut self,
+        items: &[LayoutItem<'_>],
+        arena: &mut GlyphArena,
+    ) -> Result<(Vec<ItemPlacement>, Vec<GlyphRecord>), LayoutError> {
+        match self {
+            Self::Hyper(b) => b.layout_validated_items_recording(items, arena),
+            #[cfg(feature = "cubecl")]
+            Self::Cubecl(b) => b.layout_validated_items_recording(items, arena),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // The host realization of compaction
 // ---------------------------------------------------------------------------
 

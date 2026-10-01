@@ -10,7 +10,7 @@ use std::path::Path;
 use std::sync::Arc;
 use rayon::prelude::*;
 
-use crate::atlas::TrieTable;
+use crate::atlas::{AsciiFastEntry, TrieTable};
 use crate::fold::{rows_for_line, wrap_row_of, wrap_segment_of};
 use crate::glyph_scene::{GlyphInstance, RenderSlot};
 use crate::layout::{
@@ -152,12 +152,7 @@ fn is_static_zero_cp(cp: u32) -> bool {
     cp == 0x200D || (0xFE00..=0xFE0F).contains(&cp) || (0xE0020..=0xE007F).contains(&cp)
 }
 
-struct ResolvedChar {
-    glyph_id: u32,
-    advance: f32,
-    height: f32,
-    is_newline: bool,
-}
+type ResolvedChar = crate::atlas::AsciiFastEntry;
 
 #[inline(always)]
 fn resolve_leader(
@@ -263,14 +258,36 @@ fn resolve_leader(
     }
 }
 
+#[inline(always)]
+fn resolve_byte_char(
+    bytes: &[u8],
+    pos: usize,
+    trie: &TrieTable,
+    bitmap_adv: f32,
+    em_height_fu: u32,
+    trailer_until: &mut usize,
+) -> Option<ResolvedChar> {
+    let lead = bytes[pos];
+    let fast = trie.fast_byte_table[lead as usize];
+    if fast.glyph_id != AsciiFastEntry::SENTINEL && pos >= *trailer_until {
+        Some(fast)
+    } else {
+        let seq_len = sequence_length(lead);
+        if seq_len == 0 {
+            None
+        } else {
+            Some(resolve_leader(bytes, pos, seq_len, trie, bitmap_adv, em_height_fu, trailer_until))
+        }
+    }
+}
+
 impl LayoutGlyphs for HyperLayout {
     fn name(&self) -> &'static str {
         "hyper-rust"
     }
 
     fn load_trie_file(&mut self, _path: &Path) -> Result<(), LayoutError> {
-        let table = TrieTable::load(&crate::atlas_dir());
-        self.trie = Some(Arc::new(table));
+        self.trie = Some(crate::default_trie());
         Ok(())
     }
 
@@ -293,8 +310,7 @@ impl HyperLayout {
         let trie = match &self.trie {
             Some(t) => Arc::clone(t),
             None => {
-                let table = TrieTable::load(&crate::atlas_dir());
-                let arc = Arc::new(table);
+                let arc = crate::default_trie();
                 self.trie = Some(Arc::clone(&arc));
                 arc
             }
@@ -330,48 +346,65 @@ impl HyperLayout {
                 let mut trailer_until = 0usize;
 
                 let mut pos = 0usize;
-                while pos < bytes.len() {
-                    let lead = bytes[pos];
-                    let seq_len = sequence_length(lead);
-                    if seq_len == 0 {
+                if fold_unit == 0 {
+                    while pos < bytes.len() {
+                        let r = match resolve_byte_char(bytes, pos, &trie, bitmap_adv, em_height_fu, &mut trailer_until) {
+                            Some(r) => r,
+                            None => {
+                                pos += 1;
+                                continue;
+                            }
+                        };
+
+                        if line_adv > max_row_extent {
+                            max_row_extent = line_adv;
+                        }
+
+                        if r.glyph_id != 0 {
+                            survivor_count += 1;
+                        }
+
+                        if r.is_newline {
+                            line_adv = 0.0;
+                        } else {
+                            line_adv += r.advance as f64;
+                        }
+
                         pos += 1;
-                        continue;
                     }
+                } else {
+                    while pos < bytes.len() {
+                        let r = match resolve_byte_char(bytes, pos, &trie, bitmap_adv, em_height_fu, &mut trailer_until) {
+                            Some(r) => r,
+                            None => {
+                                pos += 1;
+                                continue;
+                            }
+                        };
 
-                    let r = resolve_leader(
-                        bytes,
-                        pos,
-                        seq_len,
-                        &trie,
-                        bitmap_adv,
-                        em_height_fu,
-                        &mut trailer_until,
-                    );
+                        let item_rel_x = seg_adv as f64;
+                        if item_rel_x > max_row_extent {
+                            max_row_extent = item_rel_x;
+                        }
 
-                    let item_rel_x = if fold_unit > 0 { seg_adv as f64 } else { line_adv };
-                    if item_rel_x > max_row_extent {
-                        max_row_extent = item_rel_x;
-                    }
+                        if r.glyph_id != 0 {
+                            survivor_count += 1;
+                        }
 
-                    if r.glyph_id != 0 {
-                        survivor_count += 1;
-                    }
-
-                    if r.is_newline {
-                        col = 0;
-                        line_adv = 0.0;
-                        seg_adv = 0.0;
-                    } else {
-                        col += 1;
-                        line_adv += r.advance as f64;
-                        if fold_unit > 0 && col % fold_unit == 0 {
+                        if r.is_newline {
+                            col = 0;
                             seg_adv = 0.0;
                         } else {
-                            seg_adv += r.advance;
+                            col += 1;
+                            if col % fold_unit == 0 {
+                                seg_adv = 0.0;
+                            } else {
+                                seg_adv += r.advance;
+                            }
                         }
-                    }
 
-                    pos += 1;
+                        pos += 1;
+                    }
                 }
 
                 ItemPrepass {
@@ -495,42 +528,53 @@ impl HyperLayout {
                 let mut trailer_until = 0usize;
 
                 let out_ptr = unsafe { (dest_addr as *mut RenderSlot).add(slot_base as usize) };
+                let flat_color = if let Paint::Flat(c) = item.paint { Some(c) } else { None };
+                let per_record_colors = if let Paint::PerRecord(c) = item.paint { Some(c) } else { None };
+
+                let wrap_w = p.wrap_width as i64;
+                let is_wrap_back = p.wrap_mode == crate::fold::WrapMode::Back;
+                let pages_wide = (p.pages_wide as i64).max(1);
+                let page_rows = p.page_rows as i64;
+                let page_cols = p.page_cols as i64;
+                let scroll_rows = p.scroll_rows as i64;
+                let line_height = p.line_height;
+                let band_stride_y = p.band_stride_y;
+                let depth_per_band = p.depth_per_band;
+                let depth_per_col = p.depth_per_col;
+                let z_step = p.z_step;
+                let origin_x = p.origin_x;
+                let origin_y = p.origin_y;
+                let origin_z = p.origin_z;
 
                 let mut pos = 0usize;
                 let mut span_idx = 0usize;
                 while pos < bytes.len() {
-                    let lead = bytes[pos];
-                    let seq_len = sequence_length(lead);
-                    if seq_len == 0 {
-                        pos += 1;
-                        continue;
-                    }
+                    let r = match resolve_byte_char(bytes, pos, trie, bitmap_adv, em_height_fu, &mut trailer_until) {
+                        Some(r) => r,
+                        None => {
+                            pos += 1;
+                            continue;
+                        }
+                    };
 
-                    let r = resolve_leader(
-                        bytes,
-                        pos,
-                        seq_len,
-                        trie,
-                        bitmap_adv,
-                        em_height_fu,
-                        &mut trailer_until,
-                    );
-
-                    let wrap_segment = wrap_segment_of(col, p.wrap_width as i64, r.is_newline);
-                    let wrap_row = wrap_row_of(col, p.wrap_width as i64, r.is_newline, p.wrap_mode);
-                    let row = base_row + wrap_row;
+                    let wrap_segment = wrap_segment_of(col, wrap_w, r.is_newline);
+                    let row = if is_wrap_back {
+                        base_row
+                    } else {
+                        base_row + wrap_row_of(col, wrap_w, r.is_newline, p.wrap_mode)
+                    };
 
                     let item_rel_x = if fold_unit > 0 { seg_adv as f64 } else { line_adv };
-                    let base_x = (item_rel_x + p.origin_x) as f32;
-                    let base_y = (-(row as f64) * p.line_height + p.origin_y) as f32;
-                    let base_z = (-(wrap_segment as f64) * p.z_step + p.origin_z) as f32;
+                    let base_x = (item_rel_x + origin_x) as f32;
+                    let base_y = (-(row as f64) * line_height + origin_y) as f32;
+                    let base_z = (-(wrap_segment as f64) * z_step + origin_z) as f32;
 
                     let (pos_x, pos_y, pos_z) = if page_active {
-                        let (y_page, x_page, screen_row) = if p.page_rows > 0 {
-                            let y_page = row / p.page_rows as i64;
-                            let screen_row = row + p.scroll_rows as i64;
-                            let x_page = if p.page_cols > 0 {
-                                col / p.page_cols as i64
+                        let (y_page, x_page, screen_row) = if page_rows > 0 {
+                            let y_page = row / page_rows;
+                            let screen_row = row + scroll_rows;
+                            let x_page = if page_cols > 0 {
+                                col / page_cols
                             } else {
                                 0
                             };
@@ -538,15 +582,14 @@ impl HyperLayout {
                         } else {
                             (0, 0, row)
                         };
-                        let pages_wide = (p.pages_wide as i64).max(1);
                         let band = y_page / pages_wide;
                         let px = (base_x as f64 + (y_page % pages_wide) as f64 * page_stride_x) as f32;
-                        let py = (p.origin_y
-                            - (screen_row - y_page * p.page_rows as i64) as f64 * p.line_height
-                            - band as f64 * p.band_stride_y) as f32;
-                        let pz = (p.origin_z - wrap_segment as f64 * p.z_step
-                            + band as f64 * p.depth_per_band
-                            + x_page as f64 * p.depth_per_col) as f32;
+                        let py = (origin_y
+                            - (screen_row - y_page * page_rows) as f64 * line_height
+                            - band as f64 * band_stride_y) as f32;
+                        let pz = (origin_z - wrap_segment as f64 * z_step
+                            + band as f64 * depth_per_band
+                            + x_page as f64 * depth_per_col) as f32;
                         (px, py, pz)
                     } else {
                         (base_x, base_y, base_z)
@@ -566,26 +609,26 @@ impl HyperLayout {
                         page_z_max = pos_z;
                     }
 
-                    let color = match item.paint {
-                        Paint::PerRecord(colors) => {
-                            if record_idx < colors.len() {
-                                colors[record_idx]
-                            } else {
-                                0xFFFF_FFFF
-                            }
+                    let color = if let Some(c) = flat_color {
+                        c
+                    } else if let Some(colors) = per_record_colors {
+                        if record_idx < colors.len() {
+                            colors[record_idx]
+                        } else {
+                            0xFFFF_FFFF
                         }
-                        Paint::Flat(c) => c,
-                        Paint::ByteSpans(spans) => {
-                            let p = pos as u32;
-                            while span_idx < spans.len() && p >= spans[span_idx].end {
-                                span_idx += 1;
-                            }
-                            if span_idx < spans.len() && p >= spans[span_idx].start {
-                                spans[span_idx].color
-                            } else {
-                                crate::layout::DEFAULT_COLOR_PACKED
-                            }
+                    } else if let Paint::ByteSpans(spans) = item.paint {
+                        let p = pos as u32;
+                        while span_idx < spans.len() && p >= spans[span_idx].end {
+                            span_idx += 1;
                         }
+                        if span_idx < spans.len() && p >= spans[span_idx].start {
+                            spans[span_idx].color
+                        } else {
+                            crate::layout::DEFAULT_COLOR_PACKED
+                        }
+                    } else {
+                        crate::layout::DEFAULT_COLOR_PACKED
                     };
 
                     if r.glyph_id != 0 {
@@ -711,42 +754,53 @@ impl HyperLayout {
                 let mut trailer_until = 0usize;
 
                 let out_ptr = unsafe { (dest_addr as *mut GlyphInstance).add(slot_base as usize) };
+                let flat_color = if let Paint::Flat(c) = item.paint { Some(c) } else { None };
+                let per_record_colors = if let Paint::PerRecord(c) = item.paint { Some(c) } else { None };
+
+                let wrap_w = p.wrap_width as i64;
+                let is_wrap_back = p.wrap_mode == crate::fold::WrapMode::Back;
+                let pages_wide = (p.pages_wide as i64).max(1);
+                let page_rows = p.page_rows as i64;
+                let page_cols = p.page_cols as i64;
+                let scroll_rows = p.scroll_rows as i64;
+                let line_height = p.line_height;
+                let band_stride_y = p.band_stride_y;
+                let depth_per_band = p.depth_per_band;
+                let depth_per_col = p.depth_per_col;
+                let z_step = p.z_step;
+                let origin_x = p.origin_x;
+                let origin_y = p.origin_y;
+                let origin_z = p.origin_z;
 
                 let mut pos = 0usize;
                 let mut span_idx = 0usize;
                 while pos < bytes.len() {
-                    let lead = bytes[pos];
-                    let seq_len = sequence_length(lead);
-                    if seq_len == 0 {
-                        pos += 1;
-                        continue;
-                    }
+                    let r = match resolve_byte_char(bytes, pos, trie, bitmap_adv, em_height_fu, &mut trailer_until) {
+                        Some(r) => r,
+                        None => {
+                            pos += 1;
+                            continue;
+                        }
+                    };
 
-                    let r = resolve_leader(
-                        bytes,
-                        pos,
-                        seq_len,
-                        trie,
-                        bitmap_adv,
-                        em_height_fu,
-                        &mut trailer_until,
-                    );
-
-                    let wrap_segment = wrap_segment_of(col, p.wrap_width as i64, r.is_newline);
-                    let wrap_row = wrap_row_of(col, p.wrap_width as i64, r.is_newline, p.wrap_mode);
-                    let row = base_row + wrap_row;
+                    let wrap_segment = wrap_segment_of(col, wrap_w, r.is_newline);
+                    let row = if is_wrap_back {
+                        base_row
+                    } else {
+                        base_row + wrap_row_of(col, wrap_w, r.is_newline, p.wrap_mode)
+                    };
 
                     let item_rel_x = if fold_unit > 0 { seg_adv as f64 } else { line_adv };
-                    let base_x = (item_rel_x + p.origin_x) as f32;
-                    let base_y = (-(row as f64) * p.line_height + p.origin_y) as f32;
-                    let base_z = (-(wrap_segment as f64) * p.z_step + p.origin_z) as f32;
+                    let base_x = (item_rel_x + origin_x) as f32;
+                    let base_y = (-(row as f64) * line_height + origin_y) as f32;
+                    let base_z = (-(wrap_segment as f64) * z_step + origin_z) as f32;
 
                     let (pos_x, pos_y, pos_z) = if page_active {
-                        let (y_page, x_page, screen_row) = if p.page_rows > 0 {
-                            let y_page = row / p.page_rows as i64;
-                            let screen_row = row + p.scroll_rows as i64;
-                            let x_page = if p.page_cols > 0 {
-                                col / p.page_cols as i64
+                        let (y_page, x_page, screen_row) = if page_rows > 0 {
+                            let y_page = row / page_rows;
+                            let screen_row = row + scroll_rows;
+                            let x_page = if page_cols > 0 {
+                                col / page_cols
                             } else {
                                 0
                             };
@@ -754,15 +808,14 @@ impl HyperLayout {
                         } else {
                             (0, 0, row)
                         };
-                        let pages_wide = (p.pages_wide as i64).max(1);
                         let band = y_page / pages_wide;
                         let px = (base_x as f64 + (y_page % pages_wide) as f64 * page_stride_x) as f32;
-                        let py = (p.origin_y
-                            - (screen_row - y_page * p.page_rows as i64) as f64 * p.line_height
-                            - band as f64 * p.band_stride_y) as f32;
-                        let pz = (p.origin_z - wrap_segment as f64 * p.z_step
-                            + band as f64 * p.depth_per_band
-                            + x_page as f64 * p.depth_per_col) as f32;
+                        let py = (origin_y
+                            - (screen_row - y_page * page_rows) as f64 * line_height
+                            - band as f64 * band_stride_y) as f32;
+                        let pz = (origin_z - wrap_segment as f64 * z_step
+                            + band as f64 * depth_per_band
+                            + x_page as f64 * depth_per_col) as f32;
                         (px, py, pz)
                     } else {
                         (base_x, base_y, base_z)
@@ -782,26 +835,26 @@ impl HyperLayout {
                         page_z_max = pos_z;
                     }
 
-                    let color = match item.paint {
-                        Paint::PerRecord(colors) => {
-                            if record_idx < colors.len() {
-                                colors[record_idx]
-                            } else {
-                                0xFFFF_FFFF
-                            }
+                    let color = if let Some(c) = flat_color {
+                        c
+                    } else if let Some(colors) = per_record_colors {
+                        if record_idx < colors.len() {
+                            colors[record_idx]
+                        } else {
+                            0xFFFF_FFFF
                         }
-                        Paint::Flat(c) => c,
-                        Paint::ByteSpans(spans) => {
-                            let p = pos as u32;
-                            while span_idx < spans.len() && p >= spans[span_idx].end {
-                                span_idx += 1;
-                            }
-                            if span_idx < spans.len() && p >= spans[span_idx].start {
-                                spans[span_idx].color
-                            } else {
-                                crate::layout::DEFAULT_COLOR_PACKED
-                            }
+                    } else if let Paint::ByteSpans(spans) = item.paint {
+                        let p = pos as u32;
+                        while span_idx < spans.len() && p >= spans[span_idx].end {
+                            span_idx += 1;
                         }
+                        if span_idx < spans.len() && p >= spans[span_idx].start {
+                            spans[span_idx].color
+                        } else {
+                            crate::layout::DEFAULT_COLOR_PACKED
+                        }
+                    } else {
+                        crate::layout::DEFAULT_COLOR_PACKED
                     };
 
                     if r.glyph_id != 0 {
@@ -892,8 +945,7 @@ impl crate::layout::VerifyLayout for HyperLayout {
         let trie = match &self.trie {
             Some(t) => Arc::clone(t),
             None => {
-                let table = TrieTable::load(&crate::atlas_dir());
-                let arc = Arc::new(table);
+                let arc = crate::default_trie();
                 self.trie = Some(Arc::clone(&arc));
                 arc
             }
@@ -931,21 +983,13 @@ pub fn rederive_item_records(
         let mut trailer_until = 0usize;
         let mut pos = 0usize;
         while pos < bytes.len() {
-            let lead = bytes[pos];
-            let seq_len = sequence_length(lead);
-            if seq_len == 0 {
-                pos += 1;
-                continue;
-            }
-            let r = resolve_leader(
-                bytes,
-                pos,
-                seq_len,
-                trie,
-                bitmap_adv,
-                em_height_fu,
-                &mut trailer_until,
-            );
+            let r = match resolve_byte_char(bytes, pos, trie, bitmap_adv, em_height_fu, &mut trailer_until) {
+                Some(r) => r,
+                None => {
+                    pos += 1;
+                    continue;
+                }
+            };
             let item_rel_x = if fold_unit > 0 { seg_adv as f64 } else { line_adv };
             if item_rel_x > max_row_extent {
                 max_row_extent = item_rel_x;
@@ -980,22 +1024,13 @@ pub fn rederive_item_records(
 
     let mut pos = 0usize;
     while pos < bytes.len() {
-        let lead = bytes[pos];
-        let seq_len = sequence_length(lead);
-        if seq_len == 0 {
-            pos += 1;
-            continue;
-        }
-
-        let r = resolve_leader(
-            bytes,
-            pos,
-            seq_len,
-            trie,
-            bitmap_adv,
-            em_height_fu,
-            &mut trailer_until,
-        );
+        let r = match resolve_byte_char(bytes, pos, trie, bitmap_adv, em_height_fu, &mut trailer_until) {
+            Some(r) => r,
+            None => {
+                pos += 1;
+                continue;
+            }
+        };
 
         let wrap_segment = wrap_segment_of(col, p.wrap_width as i64, r.is_newline);
         let wrap_row = wrap_row_of(col, p.wrap_width as i64, r.is_newline, p.wrap_mode);
@@ -1076,7 +1111,7 @@ mod tests {
             .iter()
             .enumerate()
             .map(|(i, bytes)| LayoutItem {
-                bytes: *bytes,
+                bytes,
                 params: ItemParams { line_height: 1.25, ..Default::default() },
                 group_id: i as u32,
                 paint: Paint::PerRecord(&colors[i]),

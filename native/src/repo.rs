@@ -22,8 +22,8 @@ use std::time::{Duration, Instant};
 
 use crate::glyph_scene::{GlyphInstance, GroupRow};
 use crate::layout::{
-    diff_backends, BackendOutput, GlyphArena, GlyphRecord, InkExtent, ItemParams, ItemPlacement,
-    LayoutError, LayoutGlyphs, LayoutItem, PageExtent, Paint, VerifyLayout,
+    diff_backends, BackendOutput, GlyphArena, GlyphRecord, InkExtent, ItemParams, LayoutGlyphs,
+    LayoutItem, PageExtent, Paint, VerifyLayout,
 };
 use crate::text::{self, StagedText};
 
@@ -195,31 +195,40 @@ pub fn walk_repo(root: &Path) -> WalkResult {
     }
     candidates.sort_by(|a, b| a.0.cmp(&b.0));
 
-    let mut files = Vec::with_capacity(candidates.len());
+    use rayon::prelude::*;
+
+    let read_results: Vec<Option<RepoFile>> = candidates
+        .into_par_iter()
+        .map(|(rel, path)| {
+            let bytes = std::fs::read(&path).ok()?;
+            if simdutf8::basic::from_utf8(&bytes).is_err() {
+                return None;
+            }
+            let dir = rel
+                .rsplit_once('/')
+                .map(|(d, _)| d.to_string())
+                .unwrap_or_default();
+            Some(RepoFile {
+                rel_path: rel,
+                dir,
+                bytes,
+            })
+        })
+        .collect();
+
+    let mut files = Vec::with_capacity(read_results.len());
     let mut total_bytes = 0usize;
     let mut skipped_non_utf8 = 0usize;
-    for (rel, path) in candidates {
-        let bytes = match std::fs::read(&path) {
-            Ok(b) => b,
-            Err(_) => continue,
-        };
-        // Valid UTF-8 only: the engine's decode assembles codepoints from lead
-        // bytes WITHOUT validating continuations; well-formed UTF-8 is the
-        // documented precondition for staying inside the trie's block index.
-        if std::str::from_utf8(&bytes).is_err() {
-            skipped_non_utf8 += 1;
-            continue;
+    for res in read_results {
+        match res {
+            Some(f) => {
+                total_bytes += f.bytes.len();
+                files.push(f);
+            }
+            None => {
+                skipped_non_utf8 += 1;
+            }
         }
-        total_bytes += bytes.len();
-        let dir = rel
-            .rsplit_once('/')
-            .map(|(d, _)| d.to_string())
-            .unwrap_or_default();
-        files.push(RepoFile {
-            rel_path: rel,
-            dir,
-            bytes,
-        });
     }
     WalkResult {
         files,
@@ -632,13 +641,15 @@ pub fn load_repo_from_walk(
     .entered();
     let walk_dur = walk.walk_dur;
 
+    use rayon::prelude::*;
+
     // Per-file params (pagination sized per file). Newline counts double as
     // the row estimate — one fast byte scan per file.
     let file_params: Vec<ItemParams> = walk
         .files
-        .iter()
+        .par_iter()
         .map(|f| {
-            let newlines = f.bytes.iter().filter(|&&b| b == b'\n').count();
+            let newlines = memchr::memchr_iter(b'\n', &f.bytes).count();
             file_item_params(params, f.bytes.len(), newlines)
         })
         .collect();
@@ -666,81 +677,20 @@ pub fn load_repo_from_walk(
         })
         .collect();
 
-    // The seam's one branch point: Cubecl crosses into the device chain,
-    // everything else into Mojo. A local enum rather than a second
-    // code path per call site — the recording/verify flow below is the
-    // backend's OWN contract either way.
-    enum Backend {
-        Hyper(crate::layout_hyper::HyperLayout),
-        #[cfg(feature = "cubecl")]
-        Cubecl(crate::cubecl_layout::CubeclLayout),
-    }
-    impl LayoutGlyphs for Backend {
-        fn name(&self) -> &'static str {
-            match self {
-                Backend::Hyper(b) => b.name(),
-                #[cfg(feature = "cubecl")]
-                Backend::Cubecl(b) => b.name(),
-            }
-        }
-        fn load_trie_file(&mut self, path: &Path) -> Result<(), LayoutError> {
-            match self {
-                Backend::Hyper(b) => b.load_trie_file(path),
-                #[cfg(feature = "cubecl")]
-                Backend::Cubecl(b) => b.load_trie_file(path),
-            }
-        }
-        fn layout_validated_items(
-            &mut self,
-            items: &[LayoutItem<'_>],
-            arena: &mut GlyphArena,
-        ) -> Result<Vec<ItemPlacement>, LayoutError> {
-            match self {
-                Backend::Hyper(b) => b.layout_validated_items(items, arena),
-                #[cfg(feature = "cubecl")]
-                Backend::Cubecl(b) => b.layout_validated_items(items, arena),
-            }
-        }
-    }
-    impl Backend {
-        fn phases(&self) -> BackendPhases {
-            BackendPhases::default()
-        }
-        #[cfg(feature = "cubecl")]
-        fn cubecl_phases(&self) -> Option<crate::cubecl_layout::CubeclPhases> {
-            match self {
-                Backend::Hyper(_) => None,
-                Backend::Cubecl(b) => Some(b.phases()),
-            }
-        }
-    }
-    impl VerifyLayout for Backend {
-        fn layout_validated_items_recording(
-            &mut self,
-            items: &[LayoutItem<'_>],
-            arena: &mut GlyphArena,
-        ) -> Result<(Vec<ItemPlacement>, Vec<GlyphRecord>), LayoutError> {
-            match self {
-                Backend::Hyper(b) => b.layout_validated_items_recording(items, arena),
-                #[cfg(feature = "cubecl")]
-                Backend::Cubecl(b) => b.layout_validated_items_recording(items, arena),
-            }
-        }
-    }
     let mut backend = match strategy {
         #[cfg(feature = "cubecl")]
-        Strategy::Cubecl => Backend::Cubecl(match gpu {
-            Some(ctx) => crate::cubecl_layout::CubeclLayout::with_device(
+        Strategy::Cubecl => match gpu {
+            Some(ctx) => crate::layout::LayoutEngine::cubecl_with_device(
                 crate::cubecl_chain::SharedDevice::from_ctx(ctx),
             ),
-            None => crate::cubecl_layout::CubeclLayout::new(),
-        }),
-        _ => Backend::Hyper(match gpu {
-            Some(ctx) => crate::layout_hyper::HyperLayout::with_device(
+            None => crate::layout::LayoutEngine::cubecl(),
+        },
+        _ => match gpu {
+            Some(ctx) => crate::layout::LayoutEngine::hyper_with_device(
                 crate::gpu::SharedDevice::from_ctx(ctx),
             ),
-            None => crate::layout_hyper::HyperLayout::new(),
-        }),
+            None => crate::layout::LayoutEngine::hyper(),
+        },
     };
     backend
         .load_trie_file(trie)
@@ -994,7 +944,8 @@ pub fn rederive_records(
     item: &ItemParams,
 ) -> std::io::Result<(Vec<GlyphRecord>, Vec<u8>)> {
     let bytes = std::fs::read(root.join(rel_path))?;
-    let records = rederive_from_bytes(_trie, &bytes, item)?;
+    let trie = crate::default_trie();
+    let records = crate::layout_hyper::rederive_item_records(&bytes, item, &trie);
     Ok((records, bytes))
 }
 
@@ -1003,7 +954,7 @@ pub fn rederive_from_bytes(
     bytes: &[u8],
     item: &ItemParams,
 ) -> std::io::Result<Vec<GlyphRecord>> {
-    let trie = crate::atlas::TrieTable::load(&crate::atlas_dir());
+    let trie = crate::default_trie();
     let records = crate::layout_hyper::rederive_item_records(bytes, item, &trie);
     Ok(records)
 }
@@ -1013,15 +964,9 @@ pub fn rederive_cached(
     bytes: &[u8],
     item: &ItemParams,
 ) -> std::io::Result<Vec<GlyphRecord>> {
-    thread_local! {
-        static CACHED_TRIE: std::cell::RefCell<Option<crate::atlas::TrieTable>> =
-            const { std::cell::RefCell::new(None) };
-    }
-    CACHED_TRIE.with(|cell| {
-        let mut slot = cell.borrow_mut();
-        let trie = slot.get_or_insert_with(|| crate::atlas::TrieTable::load(&crate::atlas_dir()));
-        Ok(crate::layout_hyper::rederive_item_records(bytes, item, trie))
-    })
+    let trie = crate::default_trie();
+    let records = crate::layout_hyper::rederive_item_records(bytes, item, &trie);
+    Ok(records)
 }
 
 /// The result of folding one file's record stream: the kept records (rows

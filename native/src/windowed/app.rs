@@ -18,6 +18,7 @@ use crate::scene;
 use crate::{build_scene, Op, SceneChoice};
 
 use super::state::WindowState;
+#[cfg(feature = "egui-ui")]
 use super::ui::EguiUi;
 use super::utc_stamp;
 

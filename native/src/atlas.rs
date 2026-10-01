@@ -21,8 +21,18 @@
 //! integer arithmetic, and a unit test pins both on a known 2×2 image.
 
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, OnceLock};
 
 use crate::gpu::GpuContext;
+
+static DEFAULT_TRIE: OnceLock<Arc<TrieTable>> = OnceLock::new();
+
+/// Process-wide global accessor for the immutable font `TrieTable` (including its 2 KB L1-resident ASCII table).
+pub fn default_trie() -> Arc<TrieTable> {
+    DEFAULT_TRIE.get_or_init(|| {
+        Arc::new(TrieTable::load(&crate::atlas_dir()))
+    }).clone()
+}
 
 /// Both Slug textures are row-major, 1024 texels wide (slug-constants.js
 /// TEXTURE_WIDTH). Texel `i` lives at `(i % 1024, i / 1024)`.
@@ -91,14 +101,46 @@ pub struct TrieTable {
     /// once at load from the sequence section itself.
     // starts_a_sequence reads it per probe.
     seq_first: std::collections::HashSet<u32>,
+    /// Precomputed ASCII fast-path table for single-byte leaders (0..128).
+    pub ascii_table: [Option<AsciiFastEntry>; 128],
+    /// Direct 256-entry fast-path table for all single-byte characters.
+    /// Unmapped bytes / multibyte UTF-8 lead/continuation bytes have `glyph_id == u32::MAX`.
+    pub fast_byte_table: [AsciiFastEntry; 256],
+}
+
+/// Precomputed fast-path metadata for single-byte ASCII characters (0x00..=0x7F).
+/// Fits in 16 bytes; the entire 256-entry table is 4 KB and stays L1-resident.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct AsciiFastEntry {
+    pub glyph_id: u32,
+    pub advance: f32,
+    pub height: f32,
+    pub is_newline: bool,
+}
+
+impl AsciiFastEntry {
+    pub const SENTINEL: u32 = u32::MAX;
+
+    #[inline(always)]
+    pub fn is_fast(&self) -> bool {
+        self.glyph_id != Self::SENTINEL
+    }
 }
 
 impl TrieTable {
     /// Parse glyphs.bin (primary metrics) + codepoints.bin (the trie) from an
     /// atlas directory. Pure CPU — no textures.
     pub fn load(dir: &Path) -> Self {
-        let gl = read_words(&dir.join("glyphs.bin"));
-        check_magic(&gl, "G3GL", &dir.join("glyphs.bin"));
+        let (gl, cp) = std::thread::scope(|s| {
+            let h_cp = s.spawn(|| {
+                let cp = read_words(&dir.join("codepoints.bin"));
+                check_magic(&cp, "G3CP", &dir.join("codepoints.bin"));
+                cp
+            });
+            let gl = read_words(&dir.join("glyphs.bin"));
+            check_magic(&gl, "G3GL", &dir.join("glyphs.bin"));
+            (gl, h_cp.join().expect("codepoints read"))
+        });
         let metrics = PrimaryMetrics {
             upem: gl[5],
             advance_fu: gl[6],
@@ -118,9 +160,6 @@ impl TrieTable {
                 (r[2] & SLOT_FLAG_BITMAP != 0 && r[3] != NO_CELL).then_some(r[3])
             })
             .collect();
-
-        let cp = read_words(&dir.join("codepoints.bin"));
-        check_magic(&cp, "G3CP", &dir.join("codepoints.bin"));
         // v1: 44 B header, no sections. v2 (the sequence pass): 68 B header
         // with the section descriptors at words 11..16, and the sequence +
         // class sections appended after the blocks.
@@ -156,7 +195,9 @@ impl TrieTable {
             .chunks_exact(2 + seq_max as usize)
             .map(|e| e[2])
             .collect();
-        let t = Self {
+        let mut ascii_table = [None; 128];
+        let em = metrics.em_height_fu;
+        let mut t = Self {
             metrics,
             block_shift,
             block_index,
@@ -170,7 +211,47 @@ impl TrieTable {
             seq_max,
             classes,
             seq_first,
+            ascii_table,
+            fast_byte_table: [AsciiFastEntry {
+                glyph_id: AsciiFastEntry::SENTINEL,
+                advance: 0.0,
+                height: 0.0,
+                is_newline: false,
+            }; 256],
         };
+        for b in 0..128u8 {
+            let cp = b as u32;
+            if cp == 0x0A {
+                let entry = t.lookup(cp);
+                ascii_table[b as usize] = Some(AsciiFastEntry {
+                    glyph_id: 0,
+                    advance: crate::text::fu_to_world(entry.advance_fu, em),
+                    height: crate::text::fu_to_world(entry.height_fu, em),
+                    is_newline: true,
+                });
+            } else if !t.starts_a_sequence(cp) && !crate::fold::is_static_zero_cp(cp) {
+                let entry = t.lookup(cp);
+                ascii_table[b as usize] = Some(AsciiFastEntry {
+                    glyph_id: entry.glyph_id,
+                    advance: crate::text::fu_to_world(entry.advance_fu, em),
+                    height: crate::text::fu_to_world(entry.height_fu, em),
+                    is_newline: false,
+                });
+            }
+        }
+        let mut fast_byte_table = [AsciiFastEntry {
+            glyph_id: AsciiFastEntry::SENTINEL,
+            advance: 0.0,
+            height: 0.0,
+            is_newline: false,
+        }; 256];
+        for b in 0..128u8 {
+            if let Some(entry) = ascii_table[b as usize] {
+                fast_byte_table[b as usize] = entry;
+            }
+        }
+        t.ascii_table = ascii_table;
+        t.fast_byte_table = fast_byte_table;
         // Sanity: 'A' must resolve to slot 34 / advance 1229 (FORMAT.md worked example).
         let a = t.lookup(0x41);
         assert_eq!((a.glyph_id, a.advance_fu), (34, 1229), "trie sanity check failed for 'A'");
@@ -555,33 +636,57 @@ impl EmojiSheet {
 /// un-premultiplying after keeps the storage format one thing. Integer
 /// arithmetic with round-half-up, so the result is the same on every host.
 pub fn box_down_straight(src: &[u8], w: u32, h: u32) -> Vec<u8> {
+    use rayon::prelude::*;
+
     assert!(w.is_multiple_of(2) && h.is_multiple_of(2), "box filter needs even dimensions, got {w}x{h}");
     let (w, h) = (w as usize, h as usize);
     let (ow, oh) = (w / 2, h / 2);
     let mut out = vec![0u8; ow * oh * 4];
-    for y in 0..oh {
-        for x in 0..ow {
-            let mut pm = [0u32; 4];
-            for (dy, dx) in [(0, 0), (0, 1), (1, 0), (1, 1)] {
-                let i = ((2 * y + dy) * w + 2 * x + dx) * 4;
-                let a = src[i + 3] as u32;
-                pm[0] += src[i] as u32 * a;
-                pm[1] += src[i + 1] as u32 * a;
-                pm[2] += src[i + 2] as u32 * a;
-                pm[3] += a;
-            }
-            let a = (pm[3] + 2) / 4;
-            let o = (y * ow + x) * 4;
-            out[o + 3] = a as u8;
-            if a > 0 {
-                // pm[c] is Σ c·a over four texels; the straight channel of the
-                // average is (Σ c·a / 4) / (Σ a / 4) = Σ c·a / Σ a.
-                for c in 0..3 {
-                    out[o + c] = ((pm[c] + pm[3] / 2) / pm[3]).min(255) as u8;
+    let row_bytes = ow * 4;
+    let src_stride = w * 4;
+    out.par_chunks_exact_mut(row_bytes)
+        .enumerate()
+        .for_each(|(y, out_row)| {
+            let y0 = (2 * y) * src_stride;
+            let y1 = y0 + src_stride;
+            let row0 = &src[y0..y0 + src_stride];
+            let row1 = &src[y1..y1 + src_stride];
+
+            for x in 0..ow {
+                let x8 = x * 8;
+                let a00 = row0[x8 + 3] as u32;
+                let a01 = row0[x8 + 7] as u32;
+                let a10 = row1[x8 + 3] as u32;
+                let a11 = row1[x8 + 7] as u32;
+
+                let pm0 = row0[x8] as u32 * a00
+                    + row0[x8 + 4] as u32 * a01
+                    + row1[x8] as u32 * a10
+                    + row1[x8 + 4] as u32 * a11;
+
+                let pm1 = row0[x8 + 1] as u32 * a00
+                    + row0[x8 + 5] as u32 * a01
+                    + row1[x8 + 1] as u32 * a10
+                    + row1[x8 + 5] as u32 * a11;
+
+                let pm2 = row0[x8 + 2] as u32 * a00
+                    + row0[x8 + 6] as u32 * a01
+                    + row1[x8 + 2] as u32 * a10
+                    + row1[x8 + 6] as u32 * a11;
+
+                let pm3 = a00 + a01 + a10 + a11;
+
+                let a = (pm3 + 2) / 4;
+                let o = x * 4;
+                out_row[o + 3] = a as u8;
+                if a > 0 {
+                    let half = pm3 / 2;
+                    out_row[o] = ((pm0 + half) / pm3).min(255) as u8;
+                    out_row[o + 1] = ((pm1 + half) / pm3).min(255) as u8;
+                    out_row[o + 2] = ((pm2 + half) / pm3).min(255) as u8;
                 }
             }
-        }
-    }
+        });
     out
 }
 
@@ -608,7 +713,7 @@ impl EmojiTexture {
         let (level0, cell_ink) = sheet.decode_layers();
         let t_decode = t0.elapsed() - t_parse;
         let mip_levels = mip_levels_for(sheet.cell_w, sheet.cell_h);
-        let mut levels: Vec<Vec<Vec<u8>>> = Vec::with_capacity(sheet.layers as usize); // [layer][level]
+        let mut levels: Vec<Vec<Vec<u8>>> = Vec::with_capacity(sheet.layers as usize);
         for base in level0 {
             let mut chain = vec![base];
             let (mut w, mut h) = (sheet.layer_w, sheet.layer_h);
@@ -686,8 +791,19 @@ fn read_words(path: &Path) -> Vec<u32> {
     let bytes = std::fs::read(path)
         .unwrap_or_else(|e| panic!("failed to read {}: {e}", path.display()));
     assert!(bytes.len().is_multiple_of(4), "{}: not a u32 array", path.display());
-    // as_chunks is byte-identical to chunks_exact(4) here: the assert above
-    // guarantees no remainder, so both yield every consecutive 4-byte group.
+    #[cfg(target_endian = "little")]
+    {
+        match bytemuck::try_cast_vec(bytes) {
+            Ok(words) => words,
+            Err((_, fallback_bytes)) => fallback_bytes
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|c| u32::from_le_bytes(*c))
+                .collect(),
+        }
+    }
+    #[cfg(not(target_endian = "little"))]
     bytes
         .as_chunks::<4>()
         .0
@@ -774,23 +890,31 @@ impl Atlas {
     }
 
     pub fn load_from_device(device: &wgpu::Device, queue: &wgpu::Queue, dir: &Path, emoji_sheet: &Path) -> Self {
-        // --- curves.bin (G3CV): 8-word header, then width*height*4 texels ---
-        let cv = read_words(&dir.join("curves.bin"));
-        check_magic(&cv, "G3CV", &dir.join("curves.bin"));
+        let ((cv, gm), trie) = std::thread::scope(|s| {
+            let h_bins = s.spawn(|| {
+                std::thread::scope(|s2| {
+                    let h_cv = s2.spawn(|| {
+                        let cv = read_words(&dir.join("curves.bin"));
+                        check_magic(&cv, "G3CV", &dir.join("curves.bin"));
+                        cv
+                    });
+                    let gm = read_words(&dir.join("glyphmap.bin"));
+                    check_magic(&gm, "G3GM", &dir.join("glyphmap.bin"));
+                    (h_cv.join().expect("curves read"), gm)
+                })
+            });
+            let trie = TrieTable::load(dir);
+            (h_bins.join().expect("bins read"), trie)
+        });
+
         let (cv_w, cv_h, curve_count) = (cv[3], cv[4], cv[5]);
         assert_eq!(cv_w, ATLAS_TEX_WIDTH);
         let curves = upload_uint_texture(device, queue, "slug curves", cv_w, cv_h, &cv[8..]);
 
-        // --- glyphmap.bin (G3GM): 8-word header, then texels ---
-        let gm = read_words(&dir.join("glyphmap.bin"));
-        check_magic(&gm, "G3GM", &dir.join("glyphmap.bin"));
         let (gm_w, gm_h, entry_count) = (gm[3], gm[4], gm[5]);
         assert_eq!(gm_w, ATLAS_TEX_WIDTH);
         let glyphmap = upload_uint_texture(device, queue, "slug glyphmap", gm_w, gm_h, &gm[8..]);
 
-        // --- glyphs.bin (G3GL) + codepoints.bin (G3CP): the CPU-side trie
-        //     (Stage E1: shared with the GPU-free cross-check via TrieTable). ---
-        let trie = TrieTable::load(dir);
         let metrics = trie.metrics;
 
         // --- glyphmap/glyphs slot-count agreement --------------------------
@@ -970,8 +1094,23 @@ mod emoji_sheet_tests {
 mod trie_v2_tests {
     use super::*;
 
-    fn load() -> TrieTable {
-        TrieTable::load(&crate::atlas_dir())
+    fn load() -> Arc<TrieTable> {
+        default_trie()
+    }
+
+    #[test]
+    fn ascii_table_matches_trie_lookup() {
+        let t = default_trie();
+        let a_fast = t.ascii_table[b'A' as usize].expect("ASCII 'A' fast entry exists");
+        let a_slow = t.lookup(0x41);
+        let em = t.metrics.em_height_fu;
+        assert_eq!(a_fast.glyph_id, a_slow.glyph_id);
+        assert_eq!(a_fast.advance, crate::text::fu_to_world(a_slow.advance_fu, em));
+        assert!(!a_fast.is_newline);
+
+        let nl_fast = t.ascii_table[b'\n' as usize].expect("Newline fast entry exists");
+        assert_eq!(nl_fast.glyph_id, 0);
+        assert!(nl_fast.is_newline);
     }
 
     #[test]
