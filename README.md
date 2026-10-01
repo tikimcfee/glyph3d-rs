@@ -1,226 +1,117 @@
 # glyph3d-native
 
-A native (Rust + wgpu) port of the glyph3d code-visualization renderer: it lays
-out source code as fields of GPU glyphs — a single file, a stress demo, or an
-entire repository rendered as a navigable grid of code pages — and draws them
-with a Slug-style analytic-coverage renderer. Text layout is computed by a
-Mojo/MAX engine compiled to a C-ABI shared library; rendering, culling,
-picking, and interaction live in the Rust binary.
+A high-performance pure-Rust (Rust + wgpu) implementation of the glyph3d code-visualization
+renderer: it lays out source code as fields of GPU glyphs — a single file, a stress demo, or an
+entire repository rendered as a navigable grid of code pages — and draws them with a Slug-style
+analytic-coverage renderer.
 
-The defining property of this tree is **bit-exactness**: the Mojo engine
-reproduces the JS oracle it was ported from bit-for-bit, the Rust renderer's
-offscreen output is byte-deterministic, and a gate suite proves both on every
-commit. Refactors are output-neutral by contract, verified by gates rather
-than by argument.
+The engine features **sub-second repo load and layout** (~0.57s layout / ~0.93s total visual init
+for 95.2 million glyph instances across 1,306 files on Apple Silicon) via parallel CPU scan/fold
+and direct unified-memory arena streaming (`HyperLayout`), with zero external C-ABI dylib dependencies.
 
-Platform: macOS on Apple Silicon (`osx-arm64`; the GPU suites run on Metal)
-and, since 2026-09-07, Linux x86_64 (`linux-64`; wgpu on Vulkan). See
-`AGENTS.md` § Build for what differs between them, which is only the shared
-library's extension.
+The defining property of this tree is **bit-exactness**: the pure-Rust layout engine reproduces
+canonical layouts bit-for-bit, the Rust renderer's offscreen output is byte-deterministic,
+and a comprehensive gate suite proves both on every commit. Refactors are output-neutral by contract,
+verified by gates and golden SHA-256 screenshot hashes rather than by argument.
 
-## How the system is built
+Platform: macOS on Apple Silicon (`osx-arm64`; Metal) and Linux x86_64 (`linux-64`; Vulkan).
+
+## Architecture
 
 ```
             schema/glyph-identity.json          (vendored, hash-pinned)
                       │ tools/gen_schema.py
                       ▼
- assets/atlas/*.bin   engine/glyph_schema.mojo
-        │                      │
-        │ engine-trie.bin      │
-        ▼                      ▼
- ┌─────────────────────────────────────────┐    ┌──────────────────────────┐
- │ engine/  — Mojo/MAX glyph pipeline      │    │ native/  — Rust binary   │
- │ decode → trie resolve → fold →          │◄───│ wgpu + winit + egui      │
- │ paginate → bounds, bit-exact vs the     │dylib│ Slug WGSL renderer,      │
- │ JS oracle; 16 conformance suites        │    │ cull/LOD, pick, cameras  │
- └─────────────────────────────────────────┘    └──────────────────────────┘
-        built by pixi (`build-engine`)                 links at build time
-        → native/libglyph_engine.dylib          → glyph3d-native binary
+ assets/atlas/*.bin   engine-trie.bin
+        │                    │
+        ▼                    ▼
+ ┌─────────────────────────────────────────────────────────────┐
+ │ native/src/layout_hyper.rs  — High-performance Rust layout  │
+ │ • CPU-parallel fold & survivors via Rayon cache-blocked scan│
+ │ • Zero-copy direct write into mapped Metal shared memory    │
+ │ • Optional CubeCL compute engine (--features cubecl)        │
+ │ • ByteSpan semantic token painting for AST / LSP integration│
+ └──────────────────────────────┬──────────────────────────────┘
+                                │ writes RenderSlot [32B]
+                                ▼
+ ┌─────────────────────────────────────────────────────────────┐
+ │ native/src/glyph_scene/     — Slug WGSL Renderer            │
+ │ • buffers.rs: Mapped instance arena & zero-copy upload      │
+ │ • pipelines.rs: Glyph analytic-coverage & composite pipeline│
+ │ • render.rs: Frustum/LOD CPU culling, multi-pass rendering  │
+ └─────────────────────────────────────────────────────────────┘
 ```
 
-- **`engine/`** (Mojo) turns UTF-8 bytes + a codepoint→slot trie into per-glyph
-  layout — either a 32-byte wire record (`[f32 X Y Z ADVANCE HEIGHT]
-  [u32 GLYPH_ID ROW COL]`, the verification form) or 48-byte render instances
-  written straight into the renderer's arena (`--repo-engine direct`, the fast
-  path, which materializes no record at all) — with the oracle's exact float
-  discipline (the
-  `--fp-mode contract=off` build flag exists to preserve it; FMA fusion would
-  break bit-exactness). Deep documentation: `engine/README.md`,
-  `engine/README-FFI.md` (the C ABI), `engine/TOOLCHAIN.md` (channel state).
-- **`native/`** (Rust, wgpu 30 / winit 0.30 / glam 0.33 / egui 0.36) links
-  the dylib at build time and renders the records as GPU glyph fields:
-  two-level CPU frustum/LOD culling, CPU picking, live glyph/group editing,
-  and an egui debug overlay in windowed mode. House rules for this crate:
-  `native/AGENTS.md`; real per-module contracts are in the `src/*.rs` module
-  headers.
-- **`assets/atlas/`** holds the glyph geometry: four prebaked bins (curves,
-  glyph map, font table, codepoint trie) exported verbatim from the web
-  renderer's Slug atlas, plus `engine-trie.bin` (the same trie in f32 world
-  units, generated by `tools/gen_real_trie.py`). Byte-level format:
-  `assets/atlas/FORMAT.md`.
-- **`schema/glyph-identity.json`** declares how every pipeline value is
-  carried (buffers, lanes, carriers, identities); `tools/gen_schema.py`
-  validates it and generates `engine/glyph_schema.mojo` from it.
+- **`native/src/layout_hyper.rs`** (Rust): Single-pass parallel layout engine. Computes line wrapping,
+  indentation, blank/missing glyph filtering, and coordinates in CPU cache, writing 32-byte `RenderSlot`
+  instances directly into mapped GPU shared memory.
+- **`native/src/glyph_scene/`** (Rust, wgpu 30 / winit 0.30 / glam 0.33 / egui 0.36):
+  Decomposed into modular submodules:
+  - `buffers.rs`: Mapped instance arena allocation (`MTLStorageModeShared`) and unified memory transcoding.
+  - `pipelines.rs`: Slug analytic-coverage render pipelines, selection mask/tint pipelines, and composite state.
+  - `render.rs`: Frame render pass orchestration, two-level CPU frustum/LOD culling, backdrop quad pass,
+    glyph field pass, and fullscreen composite pass.
+- **`native/src/layout/span.rs`**: ByteSpan token painting for AST/LSP integration (`Paint::ByteSpans`),
+  enabling high-performance byte-range syntax colorization without string copies.
+- **`assets/atlas/`**: Prebaked glyph geometry (curves, glyph map, font table, codepoint trie)
+  exported verbatim from the Slug atlas, plus `engine-trie.bin`. Byte format: `assets/atlas/FORMAT.md`.
+- **`build.toml`**: Declarative gate, artifact, and mutation verification graph, executed by `glyph`.
 
 ## Quickstart
 
-Requirements: macOS/Apple Silicon or Linux x86_64, [pixi](https://pixi.sh), a recent Rust
-toolchain (egui 0.36 sets MSRV 1.95), and Node ≥ 18 (two of the checks run it: the atlas export and the
-fixture-corpus rebuild).
+Requirements: macOS/Apple Silicon or Linux x86_64, a recent Rust toolchain (MSRV 1.95).
 
 ```sh
-pixi install                    # mojo + max env (pins in pixi.toml / pixi.lock)
-pixi run build-engine           # → native/libglyph_engine.dylib (.so on Linux; gitignored)
+# Build and run the native binary
+cargo build --release -p glyph3d-native
+cargo run --release -p glyph3d-native
 
-cd native
-cargo build --release           # the glyph3d-native binary
-cargo run --release             # windowed: fly camera, pick, F1 debug panel
+# Optional: enable experimental CubeCL compute kernels
+cargo check --features cubecl
 ```
 
-If `cargo build` fails at the linker or build.rs panics about a missing or
-**stale dylib**, that is the expected failure mode after engine or toolchain
-changes: re-run `pixi run build-engine`. `cargo build` never builds the dylib
-— it only links whatever is already there. `AGENTS.md` § Build explains the
-mechanism and the two guards that exist because prose was not enough.
+### Running the Renderer
 
-### Running the renderer
-
-Binary is `target/release/glyph3d-native`. `cargo glyph run` executes in your
-current directory, so file arguments mean what they say relative to where you
-are; the table below uses `native/`-relative fixture paths, so run those from
-`native/`. From outside the repo, call the binary directly — the `cargo glyph`
-alias is repo-scoped (full flag set:
-`--help`).
+Binary is `target/release/glyph3d-native` (or `cargo run --release -p glyph3d-native -- [ARGS]`).
 
 | What | Command |
 |---|---|
-| Windowed text field (default: this crate's own `main.rs`) | `cargo run --release` |
-| 1M-quad stress demo | `cargo run --release -- --demo` |
-| Render a specific file | `cargo run --release -- --render-file <path>` |
-| A whole repo as a glyph field | `cargo run --release -- --load-repo <dir> [--focus-file <substr>]` |
-| Deterministic offscreen render → PNG | `cargo run --release -- --screenshot ../out/foo.png [--frames N] [--zoom F]` |
-| Engine bit-exactness vs CPU oracle | `cargo run --release -- --engine-check src/main.rs` |
+| Windowed text field (default: this crate's own `main.rs`) | `cargo run --release -p glyph3d-native` |
+| 1M-quad stress demo | `cargo run --release -p glyph3d-native -- --demo` |
+| Render a specific file | `cargo run --release -p glyph3d-native -- --render-file <path>` |
+| A whole repo as a glyph field (default: `HyperLayout`) | `cargo run --release -p glyph3d-native -- --load-repo <dir> [--focus-file <substr>]` |
+| Deterministic offscreen render → PNG | `cargo run --release -p glyph3d-native -- --load-repo <dir> --screenshot out/shot.png` |
 
 Windowed controls: WASD/E/R/Q/F fly camera, right-drag look, left-click pick,
 `h/g/t/x` edit verbs, F1 toggles the egui debug panel, F2 saves a screenshot
-to `out/windowed-shot-<utc-stamp>.png`. Debug environment variables
-(`GLYPH_PROFILE`, `GLYPH_PICK_DEBUG`, `GLYPH_CULL_DEBUG`, …) are documented in
-`native/AGENTS.md`.
+to `out/windowed-shot-<utc-stamp>.png`.
 
 ## Verification
 
-One command, from the repo root; exit 0 means everything is green:
+The test and validation battery:
 
 ```sh
-cargo glyph test       # = pixi run check = ./tools/check-all.sh
+# 1. Run all unit and integration tests (106 tests + WGSL validation)
+cargo test --workspace
+
+# 2. Validate build.toml gates and mutation blocks
+cargo run -p glyph -- validate
+
+# 3. Verify pixel-exact golden rendering on flagship corpus
+cargo run --release -p glyph3d-native -- --load-repo /path/to/glyph3d-js --screenshot /tmp/test.png
+shasum -a 256 /tmp/test.png
+# Expected: 7957dc62b473e64c5e35c9184811554b101d0bf3e40b3b7cdc7f95dab988c6d5
 ```
 
-The artifact graph is declared in **`build.toml`** (artifact, inputs, build
-command, class) and executed by **`glyph`** (`glyph/src/main.rs`): `cargo glyph build` brings
-products current and verifies committed artifacts (regenerating one is a hand
-act with its generator), `pixi run verify`
-byte-compares them against scratch rebuilds without building anything, and
-`test` runs the checks, spanning all four
-languages: the generators reproduce their committed outputs byte-for-byte, the
-25-fixture conformance corpus is rebuilt byte-identically in a scratch copy
-(counts declared in build.toml, not counted off the tree), sixteen Mojo suites
-plus the dylib-linked ffi_selftest run on CPU and GPU, the Rust side builds
-and lints warning-free and passes its tests under a ratcheted floor, the
-engine is diffed bit-exact against an independent CPU oracle, picks are
-cross-checked against an independent Python oracle, the FFI strategies are
-diffed against each other in both wrap modes, the reference port is replayed
-against the JS oracle's recorded answers, and the golden views are
-re-rendered and compared pixel for pixel.
-
-**The authoritative account is `AGENTS.md`**, which lists each gate by name
-with what it compares, what makes it red, and — the part that matters — what
-it cannot see. This section is a summary and will drift; that file is
-maintained as the contract. Anything that diverges from the golden pixel
-baselines in `out/tooling-ab/baseline/` means the commit is wrong: fix or
-revert. Baselines change deliberately, never as a side effect — they are class
-`golden` in build.toml and the runner has no build path for them.
-
-Narrower entry points: `cargo glyph test <scope>` (engine | rust | render |
-corpus), `cargo glyph gate <name>` runs one check, `cargo glyph gates` lists
-them, `pixi run suites` / `suites-gpu` /
-`suites-all` for the Mojo conformance suites alone, `pixi run check-gen` for
-generator byte-identity, `pixi run gen-trie` / `gen-schema` to regenerate
-those outputs on purpose.
-
-## Repo map
+## Repo Map
 
 | Path | What it is |
 |---|---|
-| `engine/` | The Mojo glyph pipeline, FFI layer, 16 conformance suites, fixtures (oracle inputs + expected answers), benches. Docs: `README.md`, `README-FFI.md`, `TOOLCHAIN.md` |
-| `native/` | The Rust/wgpu renderer binary (windowed + deterministic offscreen). Rules: `native/AGENTS.md`; contracts: `src/*.rs` module headers |
-| `tools/` | Gates, generators, and repro helpers (see table below) |
-| `assets/atlas/` | Prebaked glyph-geometry binaries + `engine-trie.bin` + `FORMAT.md` + `preview.png` |
-| `schema/` | `glyph-identity.json` — the single source of truth for buffer/lane layout, vendored from the web repo |
-| `out/` | Stage reports, proof PNGs, and the A/B baseline suites (see below) |
-| `integration/` | Vendored egui 0.36.1 source (read-only API reference), the egui integration study, and numbered handoff notes (`integration/notes/`) |
-| `research/` | Background surveys: rendering-stack comparison, tooling survey, wasm-port audit, rust-to-web notes |
-| `pixi.toml` | Task runner + mojo/max version pins; `pixi.lock` is marked binary — never hand-merge it |
-
-### Tools
-
-| Tool | Role |
-|---|---|
-| `build.toml` | The declarative artifact/gate graph — artifact, inputs, build command, class (committed / golden / product) |
-| `glyph/` | The build tool: `build` / `test [scope]` / `run` / `prove` / `gate` / `gates` / `graph` / `validate`. `cargo glyph <verb>` |
-| `tools/check-all.sh` | 18-line shim over `cargo glyph test`, kept for muscle memory and external callers |
-| `tools/check-pick-oracle.sh` | The pick oracle: scripted picks vs `g_pick_oracle.py` (was `check-stage-g.sh`; the `g` was a fossil stage letter) |
-| `tools/gen_real_trie.py` | Generates `assets/atlas/engine-trie.bin`; `--verify-only` is the gate form |
-| `tools/gen_schema.py` | Validates `schema/glyph-identity.json`, generates `engine/glyph_schema.mojo`; `--check` is the gate form |
-| `tools/export-atlas.mjs` | Re-derives the four atlas bins from `tools/vendor/ref` (web-repo snapshot); re-run + `cmp` is a gate |
-| `tools/vendor-manifest.py` | `--check` guards the vendored tree against local drift; regenerates `SHA256SUMS` + `PROVENANCE.md` |
-| `tools/g_pick_oracle.py` | Independent Python fold oracle used by the stage-g gate |
-| `tools/verify_atlas.py` | Manual structural/semantic checker for the atlas bins |
-| `tools/preview_glyphs.py` | Renders atlas probe glyphs → `assets/atlas/preview.png` (needs matplotlib in its host env) |
-| `tools/repro_pick_oblique.py`, `tools/decode-slug-core.mjs` | One-off debug/repro helpers |
-
-## Where results live (`out/`)
-
-- **Reports** — `out/STAGE_<X>_REPORT.md` records a piece of landed work: goal,
-  result, what was run, remaining gaps. They are **history and stay that way**;
-  the lettered stage names are kept on purpose and are not an index of the
-  current system (there has never been one — stages A, B and D have no report at
-  all). `PICK_FIX_REPORT.md` is the picking postmortem. For how things are now,
-  read `AGENTS.md`.
-- **The A/B oracle suite** — `out/tooling-ab/baseline/` holds the golden
-  canonical views every refactor must reproduce byte-for-byte. It is tracked
-  and changes only on purpose; `out/tooling-ab/sweep/` is the regenerated
-  comparison output (untracked).
-- **Proof PNGs** — the `<stage>-<view>-<state>.png` files are verification
-  evidence cited by the reports, not disposable screenshots; they are added
-  to, not regenerated.
-- Untracked by design: `out/bench-mojo`, `out/ffi_selftest` (built binaries).
-
-## Reading order for a newcomer
-
-1. This README, then **`AGENTS.md`** — the repo-wide contract: what every check
-   does and cannot see, what is fenced and why, and what the stage/gate
-   vocabulary means. Read it before changing anything.
-2. `engine/README.md` (the pipeline and its float discipline),
-   `engine/README-FFI.md` (the C ABI), `engine/TOOLCHAIN.md`.
-3. `engine/PORT-PLAN.md` — the reference port's stage record, and the only
-   canonical definition of the live `Stage 0`–`4` numbering.
-   `engine/BACKEND-PLAN.md` for the layout seam and what comes next.
-4. `native/AGENTS.md` + the `native/src/*.rs` module headers — the real
-   per-module contracts.
-5. `assets/atlas/FORMAT.md`; `schema/glyph-identity.json` when touching layout.
-6. `integration/notes/` (numbered handoffs) and `research/` as needed.
-
-Everything under `out/` is a **record of work that landed, not current state.**
-Read a report to learn why a decision was made; do not read one to learn how
-things are now. At least one has been overtaken by events —
-`ENGINE_TOOLCHAIN_REPORT.md` says no node is needed to build any engine input,
-and two checks run node today.
-
-## Workspace context
-
-This repo lives in a `viz-native/` workspace that also contains research
-references used during the port — `modular/` (Mojo/MAX sources) and `rerun/`
-(an architecture reference) — plus `glyph3d-integration-notes/`, the older
-sibling of `integration/notes/`. They are not part of this build; the
-JS side of the porting contract lives in a separate web repo, of which
-`tools/vendor/ref` is a hash-pinned snapshot.
+| `native/` | The pure-Rust renderer and layout engine binary. Contracts in `native/src/*.rs` |
+| `native/src/layout_hyper.rs` | HyperLayout: sub-second parallel CPU layout into mapped shared memory |
+| `native/src/glyph_scene/` | Modularized Slug WGSL renderer: `buffers.rs`, `pipelines.rs`, `render.rs` |
+| `native/src/cubecl_*.rs` | Decoupled CubeCL GPU compute kernels (gated behind `[features] cubecl`) |
+| `glyph/` | The verification and mutation runner (`cargo run -p glyph -- validate`) |
+| `assets/atlas/` | Prebaked glyph-geometry binaries + `engine-trie.bin` + `FORMAT.md` |
+| `schema/` | `glyph-identity.json` — single source of truth for buffer/lane layouts |
+| `out/` | Golden baselines (`tooling-ab/baseline/`), proof PNGs, and historical stage reports |
