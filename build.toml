@@ -451,12 +451,12 @@ rebuild = "cargo build --release"
 name = "depth-write-off"
 gate = "pixel-ab"
 why = "the 2026-09-07 z-order defect put back: the glyph pass testing depth without writing it, so a later-drawn file paints over a nearer one. CONSUMED BY: repo-back-oblique, the frame added for it — and repo-wide, whose front-on column had been painting over long.md's pages in every baseline before that day without anyone seeing it"
-file = "native/src/glyph_scene.rs"
+file = "native/src/glyph_scene/pipelines.rs"
 op = "replace"
-find = """                // blends in exactly the order it did before.
-                depth_write_enabled: Some(true),"""
-with = """                // blends in exactly the order it did before.
-                depth_write_enabled: Some(false),"""
+find = """            // blends in exactly the order it did before.
+            depth_write_enabled: Some(true),"""
+with = """            // blends in exactly the order it did before.
+            depth_write_enabled: Some(false),"""
 expect = "repo-back-oblique.png diverges from baseline"
 rebuild = "cargo build --release"
 
