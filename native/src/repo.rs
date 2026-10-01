@@ -900,26 +900,9 @@ impl RepoLoad {
         // concatenate in file order, so the table is bit-identical. Small
         // repos stay serial (thread spawn would cost more than the pass).
         let sp_segments = tracing::info_span!("repo.segments").entered();
-        let segments: Vec<crate::glyph_scene::SegCull> = if self.files.len() >= 64 {
-            let workers = std::thread::available_parallelism()
-                .map(|n| n.get())
-                .unwrap_or(1)
-                .min(8);
-            let span = self.files.len().div_ceil(workers);
-            let seg_ref = &seg_of;
-            std::thread::scope(|s| {
-                let handles: Vec<_> = self
-                    .files
-                    .chunks(span)
-                    .map(|range| s.spawn(move || range.iter().map(seg_ref).collect::<Vec<_>>()))
-                    .collect();
-                handles
-                    .into_iter()
-                    .flat_map(|h| h.join().expect("segment worker panicked"))
-                    .collect()
-            })
-        } else {
-            self.files.iter().map(seg_of).collect()
+        let segments: Vec<crate::glyph_scene::SegCull> = {
+            use rayon::prelude::*;
+            self.files.par_iter().map(seg_of).collect()
         };
         drop(sp_segments);
         let pick_files: Vec<crate::glyph_scene::PickFileInfo> = self

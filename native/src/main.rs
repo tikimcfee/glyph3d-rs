@@ -290,15 +290,16 @@ fn build_scene_impl(
                 cluster_mode: *cluster_mode,
                 ..Default::default()
             };
+            let t_visual_start = std::time::Instant::now();
             let load = {
                 let walk = repo::walk_repo(dir);
-                // The device-resident arena: the FFI (Direct) writes
+                // The device-resident arena: the FFI (Direct) and Hyper write
                 // instances into the same shared storage the shader reads,
                 // on unified memory. The CUBECL path wants NO arena buffer
                 // at all since E2b — the chain's slot buffer binds directly
                 // (the endpoint, note 23). Past max_buffer_size the DIRECT
                 // arena chunks (one buffer per draw chunk).
-                let arena = if matches!(strategy, layout_mojo::Strategy::Direct)
+                let arena = if matches!(strategy, layout_mojo::Strategy::Direct | layout_mojo::Strategy::Hyper)
                     && ctx.profile.backend == wgpu::Backend::Metal
                     && ctx.profile.mappable_primary_buffers
                     && walk.total_bytes > 0
@@ -331,9 +332,27 @@ fn build_scene_impl(
                 )
             };
             load.print_stats();
+            let t_atlas = std::time::Instant::now();
             let atlas = atlas::Atlas::load(ctx, emoji_sheet);
+            let atlas_dur = t_atlas.elapsed();
+
+            let t_staged = std::time::Instant::now();
             let staged = load.into_staged(focus.as_deref(), &atlas.slot_ink);
-            glyph(GlyphScene::new(ctx, color_format, &atlas, staged, camera_mode, cull))
+            let staged_dur = t_staged.elapsed();
+
+            let t_scene = std::time::Instant::now();
+            let scene = GlyphScene::new(ctx, color_format, &atlas, staged, camera_mode, cull);
+            let scene_dur = t_scene.elapsed();
+            let visual_total = t_visual_start.elapsed();
+
+            println!(
+                "visual: atlas {:.3}s | staged {:.3}s | scene {:.3}s | total visual init {:.3}s",
+                atlas_dur.as_secs_f64(),
+                staged_dur.as_secs_f64(),
+                scene_dur.as_secs_f64(),
+                visual_total.as_secs_f64(),
+            );
+            glyph(scene)
         }
     }
 }

@@ -38,25 +38,33 @@ impl<'a> SegTintAccum<'a> {
     pub fn add(&mut self, instances: &[GlyphInstance]) {
         static SRGB_TO_LINEAR: std::sync::LazyLock<[f64; 256]> =
             std::sync::LazyLock::new(|| std::array::from_fn(|k| (k as f64 / 255.0).powf(2.2)));
+        let table = &*SRGB_TO_LINEAR;
+        let slot_ink = self.slot_ink;
+        let mut s0 = self.sum[0];
+        let mut s1 = self.sum[1];
+        let mut s2 = self.sum[2];
+        let mut cells = self.cells;
         for g in instances {
-            if let Some(Some(ink)) = self.slot_ink.get(g.glyph_id as usize) {
-                for (i, s) in self.sum.iter_mut().enumerate() {
-                    *s += ink[i] as f64;
+            let gid = g.glyph_id as usize;
+            if gid < slot_ink.len() {
+                if let Some(ink) = unsafe { slot_ink.get_unchecked(gid) } {
+                    s0 += ink[0] as f64;
+                    s1 += ink[1] as f64;
+                    s2 += ink[2] as f64;
+                    cells += 2;
+                    continue;
                 }
-                self.cells += 2;
-                continue;
             }
-            // Match the shader's decode: sRGB display bytes → linear via pow
-            // 2.2. Memoized over the whole domain — the input is a BYTE, so
-            // 256 table entries replace 3 powf per glyph (285 M calls on the
-            // glyph3d-js repo load). The table is built with the same f64
-            // powf on the same values and the sums keep their order, so the
-            // tint is bit-identical.
-            for (i, s) in self.sum.iter_mut().enumerate() {
-                *s += SRGB_TO_LINEAR[((g.color >> (8 * i)) & 0xFF) as usize];
-            }
-            self.cells += 1;
+            let c0 = (g.color & 0xFF) as usize;
+            let c1 = ((g.color >> 8) & 0xFF) as usize;
+            let c2 = ((g.color >> 16) & 0xFF) as usize;
+            s0 += table[c0];
+            s1 += table[c1];
+            s2 += table[c2];
+            cells += 1;
         }
+        self.sum = [s0, s1, s2];
+        self.cells = cells;
     }
 
     /// The endpoint's tint-stream form (note 23, E2b): (glyph_id, color)
@@ -66,19 +74,33 @@ impl<'a> SegTintAccum<'a> {
     pub fn add_tint(&mut self, pairs: &[u32]) {
         static SRGB_TO_LINEAR: std::sync::LazyLock<[f64; 256]> =
             std::sync::LazyLock::new(|| std::array::from_fn(|k| (k as f64 / 255.0).powf(2.2)));
+        let table = &*SRGB_TO_LINEAR;
+        let slot_ink = self.slot_ink;
+        let mut s0 = self.sum[0];
+        let mut s1 = self.sum[1];
+        let mut s2 = self.sum[2];
+        let mut cells = self.cells;
         for &[gi, color] in pairs.as_chunks::<2>().0 {
-            if let Some(Some(ink)) = self.slot_ink.get(gi as usize) {
-                for (i, s) in self.sum.iter_mut().enumerate() {
-                    *s += ink[i] as f64;
+            let gid = gi as usize;
+            if gid < slot_ink.len() {
+                if let Some(ink) = unsafe { slot_ink.get_unchecked(gid) } {
+                    s0 += ink[0] as f64;
+                    s1 += ink[1] as f64;
+                    s2 += ink[2] as f64;
+                    cells += 2;
+                    continue;
                 }
-                self.cells += 2;
-                continue;
             }
-            for (i, s) in self.sum.iter_mut().enumerate() {
-                *s += SRGB_TO_LINEAR[((color >> (8 * i)) & 0xFF) as usize];
-            }
-            self.cells += 1;
+            let c0 = (color & 0xFF) as usize;
+            let c1 = ((color >> 8) & 0xFF) as usize;
+            let c2 = ((color >> 16) & 0xFF) as usize;
+            s0 += table[c0];
+            s1 += table[c1];
+            s2 += table[c2];
+            cells += 1;
         }
+        self.sum = [s0, s1, s2];
+        self.cells = cells;
     }
 
     /// `n` is the range's instance count (the divisor), `width × height` the

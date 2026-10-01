@@ -331,6 +331,7 @@ impl GlyphScene {
         // E2b: a DEVICE arena (the endpoint) binds the chain's slot buffers
         // AS-IS — no upload, no transcode, no copy; each chunk's pool-slice
         // offset rides its binding.
+        let t_scene_start = std::time::Instant::now();
         let binding_limit = ctx.device.limits().max_storage_buffer_binding_size as usize;
         let instances_len = arena.len();
         let (chunk_cap, chunk_counts, instance_bufs, chunk_offsets): (
@@ -391,115 +392,147 @@ impl GlyphScene {
                 | wgpu::BufferUsages::COPY_SRC;
             let first = i * chunk_cap;
             let need_end = first + count as usize;
-            let mut slots: Vec<RenderSlot> = Vec::with_capacity(count as usize);
-            while slots.len() < count as usize && ac < arena_chunks.len() {
+            // Gather the arena slice sub-ranges covering this chunk:
+            let mut sub_slices: Vec<(usize, &[GlyphInstance])> = Vec::new();
+            let mut written = 0usize;
+            while written < count as usize && ac < arena_chunks.len() {
                 let c = arena_chunks[ac];
                 if arena_base + c.len() <= first {
                     arena_base += c.len();
                     ac += 1;
                     continue;
                 }
-                let lo = first - arena_base;
+                let lo = first.saturating_sub(arena_base);
                 let hi = (need_end - arena_base).min(c.len());
-                slots.extend(c[lo..hi].iter().map(RenderSlot::from));
+                if hi > lo {
+                    sub_slices.push((written, &c[lo..hi]));
+                    written += hi - lo;
+                }
                 if hi == c.len() {
                     arena_base += c.len();
                     ac += 1;
                 }
             }
-            // The mapped-empty arena has no slices at all — pad the one
-            // zeroed slot; a real under-fill is a walk bug, not padding.
-            debug_assert!(instances_len == 0 || slots.len() == count as usize);
-            slots.resize(count as usize, RenderSlot::zeroed());
-            let bytes: &[u8] = bytemuck::cast_slice(&slots);
-                    if direct_upload {
-                        // hal-created shared buffer, spiked for the mapped-arena
-                        // work: MAP_READ in the usage makes wgpu-hal pick
-                        // StorageModeShared with the DEFAULT cache mode (MAP_WRITE
-                        // would set write-combining — streaming-friendly for the
-                        // one upload write, but the CPU-side paths that read the
-                        // arena back can't afford uncached reads). The hal map
-                        // hands back the raw pointer wgpu's WriteOnly view
-                        // deliberately withholds, so the sharded first-touch write
-                        // splits on raw disjoint ranges.
-                        use wgpu::hal::Device as HalDevice;
-                        let hal_usage = wgpu::BufferUses::STORAGE_READ_ONLY
-                            | wgpu::BufferUses::COPY_DST
-                            | wgpu::BufferUses::COPY_SRC
-                            | wgpu::BufferUses::MAP_READ;
-                        let hal_dev = unsafe { device.as_hal::<wgpu::hal::api::Metal>() }
-                            .expect("Metal profile behind a non-Metal device");
-                        let size = bytes.len() as u64;
-                        let hal_buf = unsafe {
-                            hal_dev.create_buffer(&wgpu::hal::BufferDescriptor {
-                                label: Some(&label),
-                                size,
-                                usage: hal_usage,
-                                memory_flags: wgpu::hal::MemoryFlags::empty(),
-                            })
-                        }
-                        .expect("hal instance buffer");
-                        let mapping = unsafe { hal_dev.map_buffer(&hal_buf, 0..size) }
-                            .expect("hal instance map");
-                        let base = mapping.ptr.as_ptr() as usize;
-                        // The write IS the first touch of the buffer's pages —
-                        // sharded so each worker faults in its own range (measured
-                        // ~2 s of the repo load serial). Small buffers stay serial.
-                        const PARALLEL_COPY_THRESHOLD: usize = 16 << 20;
-                        if bytes.len() >= PARALLEL_COPY_THRESHOLD {
-                            let workers = std::thread::available_parallelism()
-                                .map(|n| n.get())
-                                .unwrap_or(1)
-                                .min(8);
-                            let span = bytes.len().div_ceil(workers).next_multiple_of(32);
-                            std::thread::scope(|s| {
-                                for (i, src) in bytes.chunks(span).enumerate() {
-                                    let off = i * span;
-                                    s.spawn(move || unsafe {
-                                        std::ptr::copy_nonoverlapping(
-                                            src.as_ptr(),
-                                            (base + off) as *mut u8,
-                                            src.len(),
-                                        );
-                                    });
+
+            if direct_upload {
+                // hal-created shared buffer, spiked for the mapped-arena
+                // work: MAP_READ in the usage makes wgpu-hal pick
+                // StorageModeShared with the DEFAULT cache mode (MAP_WRITE
+                // would set write-combining — streaming-friendly for the
+                // one upload write, but the CPU-side paths that read the
+                // arena back can't afford uncached reads). The hal map
+                // hands back the raw pointer wgpu's WriteOnly view
+                // deliberately withholds, so the sharded first-touch write
+                // splits on raw disjoint ranges.
+                use wgpu::hal::Device as HalDevice;
+                let hal_usage = wgpu::BufferUses::STORAGE_READ_ONLY
+                    | wgpu::BufferUses::COPY_DST
+                    | wgpu::BufferUses::COPY_SRC
+                    | wgpu::BufferUses::MAP_READ;
+                let hal_dev = unsafe { device.as_hal::<wgpu::hal::api::Metal>() }
+                    .expect("Metal profile behind a non-Metal device");
+                let size = (count as usize * std::mem::size_of::<RenderSlot>()) as u64;
+                let hal_buf = unsafe {
+                    hal_dev.create_buffer(&wgpu::hal::BufferDescriptor {
+                        label: Some(&label),
+                        size,
+                        usage: hal_usage,
+                        memory_flags: wgpu::hal::MemoryFlags::empty(),
+                    })
+                }
+                .expect("hal instance buffer");
+                let mapping = unsafe { hal_dev.map_buffer(&hal_buf, 0..size) }
+                    .expect("hal instance map");
+                let dest_ptr = mapping.ptr.as_ptr() as *mut RenderSlot;
+
+                #[derive(Clone, Copy)]
+                struct SendPtr(*mut RenderSlot);
+                unsafe impl Send for SendPtr {}
+                unsafe impl Sync for SendPtr {}
+                impl SendPtr {
+                    #[inline(always)]
+                    unsafe fn add(self, offset: usize) -> *mut RenderSlot {
+                        self.0.add(offset)
+                    }
+                }
+
+                #[inline(always)]
+                unsafe fn transcode_instance(src: *const GlyphInstance, dst: *mut RenderSlot) {
+                    let s = src as *const u8;
+                    let d = dst as *mut u8;
+                    std::ptr::copy_nonoverlapping(s, d, 16);
+                    std::ptr::copy_nonoverlapping(s.add(24), d.add(16), 16);
+                }
+
+                let dest = SendPtr(dest_ptr);
+                const PARALLEL_TRANSCODE_THRESHOLD: usize = 16384;
+                const CHUNK_SIZE: usize = 65536;
+
+                for &(dst_off, slice) in &sub_slices {
+                    if slice.len() >= PARALLEL_TRANSCODE_THRESHOLD {
+                        use rayon::prelude::*;
+                        slice.par_chunks(CHUNK_SIZE).enumerate().for_each(|(chunk_idx, chunk)| {
+                            let out_ptr = unsafe { dest.add(dst_off + chunk_idx * CHUNK_SIZE) };
+                            for (k, g) in chunk.iter().enumerate() {
+                                unsafe {
+                                    transcode_instance(g, out_ptr.add(k));
                                 }
-                            });
-                        } else {
+                            }
+                        });
+                    } else {
+                        let out_ptr = unsafe { dest.0.add(dst_off) };
+                        for (k, g) in slice.iter().enumerate() {
                             unsafe {
-                                std::ptr::copy_nonoverlapping(
-                                    bytes.as_ptr(),
-                                    base as *mut u8,
-                                    bytes.len(),
-                                );
+                                transcode_instance(g, out_ptr.add(k));
                             }
                         }
-                        unsafe { hal_dev.unmap_buffer(&hal_buf) };
-                        // SAFETY: same device, desc matches the hal request, every
-                        // byte just written, nonzero size.
-                        unsafe {
-                            device.create_buffer_from_hal::<wgpu::hal::api::Metal>(
-                                hal_buf,
-                                &wgpu::BufferDescriptor {
-                                    label: Some(&label),
-                                    size,
-                                    usage: usage | wgpu::BufferUsages::MAP_READ,
-                                    mapped_at_creation: false,
-                                },
-                            )
-                        }
-                    } else {
-                        device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                            label: Some(&label),
-                            contents: bytes,
-                            usage,
-                        })
                     }
+                }
+                // Pad any remainder (e.g. mapped-empty arena zeroed slot):
+                if count as usize > written {
+                    for k in written..count as usize {
+                        unsafe {
+                            std::ptr::write(dest_ptr.add(k), RenderSlot::zeroed());
+                        }
+                    }
+                }
+
+                unsafe { hal_dev.unmap_buffer(&hal_buf) };
+                // SAFETY: same device, desc matches the hal request, every
+                // byte just written, nonzero size.
+                unsafe {
+                    device.create_buffer_from_hal::<wgpu::hal::api::Metal>(
+                        hal_buf,
+                        &wgpu::BufferDescriptor {
+                            label: Some(&label),
+                            size,
+                            usage: usage | wgpu::BufferUsages::MAP_READ,
+                            mapped_at_creation: false,
+                        },
+                    )
+                }
+            } else {
+                let mut slots: Vec<RenderSlot> = Vec::with_capacity(count as usize);
+                for &(_dst_off, slice) in &sub_slices {
+                    slots.extend(slice.iter().map(RenderSlot::from));
+                }
+                debug_assert!(instances_len == 0 || slots.len() == count as usize);
+                slots.resize(count as usize, RenderSlot::zeroed());
+                let bytes: &[u8] = bytemuck::cast_slice(&slots);
+                device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some(&label),
+                    contents: bytes,
+                    usage,
+                })
+            }
             })
             .collect();
             let zero_offsets = vec![0u64; instance_bufs.len()];
             (chunk_cap, chunk_counts, instance_bufs, zero_offsets)
             }
         };
+        let upload_dur = t_scene_start.elapsed();
+        let t_pipe_start = std::time::Instant::now();
         let group_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("group table"),
             contents: bytemuck::cast_slice(&groups),
@@ -1066,6 +1099,13 @@ impl GlyphScene {
         let pick = staged.pick;
         let groups_cpu = groups.clone();
         let tint_step = vec![0u32; groups.len()];
+        let pipe_dur = t_pipe_start.elapsed();
+        log::info!(
+            "scene timings: buffer upload {:.3}s | pipeline/cull init {:.3}s | total scene {:.3}s",
+            upload_dur.as_secs_f64(),
+            pipe_dur.as_secs_f64(),
+            (upload_dur + pipe_dur).as_secs_f64(),
+        );
 
         Self {
             pipeline,

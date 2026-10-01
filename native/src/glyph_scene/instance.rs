@@ -51,6 +51,7 @@ pub struct RenderSlot {
 }
 
 impl From<&GlyphInstance> for RenderSlot {
+    #[inline(always)]
     fn from(g: &GlyphInstance) -> Self {
         Self {
             pos: g.pos,
