@@ -10,7 +10,6 @@ use clap::{ArgAction, CommandFactory, FromArgMatches, Parser};
 
 use crate::fold;
 use crate::glyph_scene::{PickCommand, Verb};
-use crate::layout_mojo;
 
 /// `--wrap-mode` -> the layout parameter. clap's `value_parser` has already
 /// refused anything that is not one of the two spellings, so an unknown value
@@ -48,8 +47,8 @@ pub(crate) fn parse_z_wrap_spacing(s: &str) -> Result<f64, String> {
 /// clap has already refused anything else, so reaching here means the parser
 /// and this match disagree, and silently loading with the wrong strategy would
 /// make a verification run compare something other than what was asked for.
-pub(crate) fn parse_strategy(s: &str) -> layout_mojo::Strategy {
-    use layout_mojo::Strategy;
+pub(crate) fn parse_strategy(s: &str) -> crate::repo::Strategy {
+    use crate::repo::Strategy;
     match s {
         "naive" => Strategy::PerItem,
         "batch" => Strategy::Batched,

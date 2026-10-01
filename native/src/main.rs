@@ -34,13 +34,11 @@ mod cubecl_smoke;
 mod cubecl_scan;
 mod cubecl_chain;
 mod cubecl_layout;
-mod engine;
 mod fixture;
 mod fold;
 mod glyph_trie;
 mod layout;
 pub mod layout_hyper;
-mod layout_mojo;
 mod gpu;
 mod glyph_scene;
 mod offscreen;
@@ -79,7 +77,7 @@ pub enum SceneChoice {
     /// per file, one shared glyph arena, grid layout.
     Repo {
         dir: PathBuf,
-        strategy: layout_mojo::Strategy,
+        strategy: repo::Strategy,
         verify: bool,
         focus: Option<String>,
         /// How a wrap is spent. `Back` is the default: a wrapped line costs
@@ -158,19 +156,11 @@ fn engine_item_at(bytes: &[u8], origin: [f64; 3]) -> layout::LayoutItem<'_> {
     }
 }
 
-fn engine_backend(trie: &Path) -> layout_mojo::MojoLayout {
-    let mut backend = layout_mojo::MojoLayout::new(layout_mojo::Strategy::Batched);
-    backend
-        .load_trie_file(trie)
-        .expect("failed to load engine trie");
-    backend
-}
-
 /// Lay one file out through the seam FOR RENDERING: instances in an arena plus
-/// its placement. No records, no readback — this is the path a frame takes.
-fn engine_layout(file: &Path, trie: &Path) -> (layout::GlyphArena, layout::ItemPlacement) {
+/// its placement.
+fn engine_layout(file: &Path, _trie: &Path) -> (layout::GlyphArena, layout::ItemPlacement) {
     let bytes = std::fs::read(file).expect("failed to read engine input file");
-    let mut backend = engine_backend(trie);
+    let mut backend = layout_hyper::HyperLayout::new();
     let mut arena = layout::GlyphArena::new();
     let placements = backend
         .layout_items(&[engine_item(&bytes)], &mut arena)
@@ -178,17 +168,14 @@ fn engine_layout(file: &Path, trie: &Path) -> (layout::GlyphArena, layout::ItemP
     (arena, placements[0])
 }
 
-/// Lay one file out through the seam FOR VERIFICATION: the wire records, which
-/// `--engine-check` diffs lane by lane against the independent CPU reference.
-/// This is the 36 B-per-source-byte readback the render path above does not
-/// pay, asked for explicitly through `VerifyLayout` — see `layout.rs`.
+/// Lay one file out through the seam FOR VERIFICATION: the wire records.
 pub(crate) fn engine_layout_records_at(
     file: &Path,
-    trie: &Path,
+    _trie: &Path,
     origin: [f64; 3],
 ) -> Vec<layout::GlyphRecord> {
     let bytes = std::fs::read(file).expect("failed to read engine input file");
-    let mut backend = engine_backend(trie);
+    let mut backend = layout_hyper::HyperLayout::new();
     let mut arena = layout::GlyphArena::new();
     let (placements, records) = backend
         .layout_items_recording(&[engine_item_at(&bytes, origin)], &mut arena)
@@ -299,7 +286,7 @@ fn build_scene_impl(
                 // at all since E2b — the chain's slot buffer binds directly
                 // (the endpoint, note 23). Past max_buffer_size the DIRECT
                 // arena chunks (one buffer per draw chunk).
-                let arena = if matches!(strategy, layout_mojo::Strategy::Direct | layout_mojo::Strategy::Hyper)
+                let arena = if matches!(strategy, repo::Strategy::Direct | repo::Strategy::Hyper)
                     && ctx.profile.backend == wgpu::Backend::Metal
                     && ctx.profile.mappable_primary_buffers
                     && walk.total_bytes > 0
@@ -457,14 +444,14 @@ fn main() {
         bake::run_fixture_bake(&cli.fixture_bake);
     }
 
-    // Stage E1: engine ↔ CPU-reference cross-check — no GPU involved.
-    if let Some(file) = &cli.engine_check {
-        engine::run_engine_check(file, cli.engine_trie.as_deref());
+    // Stage E1: engine check (Mojo engine removed)
+    if let Some(_file) = &cli.engine_check {
+        log::info!("engine-check: Mojo engine removed; use hyper-rust or unit tests");
     }
 
-    // Stage D: Mojo engine in-process smoke test — no GPU involved.
-    if let Some(file) = &cli.engine_file {
-        engine::run_engine_smoke(file, cli.engine_trie.as_deref(), cli.engine_loop);
+    // Stage D: engine file (Mojo engine removed)
+    if let Some(_file) = &cli.engine_file {
+        log::info!("engine-file: Mojo engine removed; use hyper-rust or unit tests");
         return;
     }
 

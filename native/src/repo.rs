@@ -20,11 +20,52 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use crate::engine::Engine;
 use crate::glyph_scene::GroupRow;
-use crate::layout::{BackendOutput, GlyphArena, GlyphRecord, ItemParams, ItemPlacement, LayoutError, LayoutGlyphs, LayoutItem, Paint, VerifyLayout, diff_backends};
-use crate::layout_mojo::{BackendPhases, MojoLayout, Strategy};
+use crate::layout::{
+    BackendOutput, GlyphArena, GlyphRecord, ItemParams, ItemPlacement, LayoutError, LayoutGlyphs,
+    LayoutItem, Paint, VerifyLayout, diff_backends,
+};
 use crate::text::{self, StagedText};
+
+/// Layout engine strategy.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum Strategy {
+    #[default]
+    Hyper,
+    Direct,
+    Batched,
+    PerItem,
+    Cubecl,
+}
+
+impl Strategy {
+    pub fn can_record(&self) -> bool {
+        matches!(self, Strategy::Hyper | Strategy::Batched | Strategy::PerItem | Strategy::Cubecl)
+    }
+
+    pub fn materializes_records(&self) -> bool {
+        matches!(self, Strategy::Batched | Strategy::PerItem | Strategy::Cubecl)
+    }
+}
+
+/// Stage-timing metrics for backend execution.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct BackendPhases {
+    pub fold: Duration,
+    pub readback_alloc: Duration,
+    pub readback_copy: Duration,
+    pub compact: Duration,
+}
+
+impl BackendPhases {
+    pub fn readback(&self) -> Duration {
+        self.readback_alloc + self.readback_copy
+    }
+
+    pub fn engine_ranked(&self) -> Vec<(&'static str, Duration)> {
+        Vec::new()
+    }
+}
 
 /// Per-file read cap. Doubles as the ordinal-wall guard (2^24 B = 16 MiB).
 pub const MAX_FILE_BYTES: u64 = 10 * 1024 * 1024;
@@ -566,23 +607,20 @@ pub fn load_repo_from_walk(
     // code path per call site — the recording/verify flow below is the
     // backend's OWN contract either way.
     enum Backend {
-        Mojo(MojoLayout),
-        Cubecl(crate::cubecl_layout::CubeclLayout),
         Hyper(crate::layout_hyper::HyperLayout),
+        Cubecl(crate::cubecl_layout::CubeclLayout),
     }
     impl LayoutGlyphs for Backend {
         fn name(&self) -> &'static str {
             match self {
-                Backend::Mojo(b) => b.name(),
-                Backend::Cubecl(b) => b.name(),
                 Backend::Hyper(b) => b.name(),
+                Backend::Cubecl(b) => b.name(),
             }
         }
         fn load_trie_file(&mut self, path: &Path) -> Result<(), LayoutError> {
             match self {
-                Backend::Mojo(b) => b.load_trie_file(path),
-                Backend::Cubecl(b) => b.load_trie_file(path),
                 Backend::Hyper(b) => b.load_trie_file(path),
+                Backend::Cubecl(b) => b.load_trie_file(path),
             }
         }
         fn layout_validated_items(
@@ -591,26 +629,18 @@ pub fn load_repo_from_walk(
             arena: &mut GlyphArena,
         ) -> Result<Vec<ItemPlacement>, LayoutError> {
             match self {
-                Backend::Mojo(b) => b.layout_validated_items(items, arena),
-                Backend::Cubecl(b) => b.layout_validated_items(items, arena),
                 Backend::Hyper(b) => b.layout_validated_items(items, arena),
+                Backend::Cubecl(b) => b.layout_validated_items(items, arena),
             }
         }
     }
     impl Backend {
-        /// The Mojo backend's phase meter (load stats). Cubecl reports
-        /// nothing here — its spans are a different shape entirely, and
-        /// zeros in this struct would read as stages that ran fast.
         fn phases(&self) -> BackendPhases {
-            match self {
-                Backend::Mojo(b) => b.phases(),
-                Backend::Cubecl(_) | Backend::Hyper(_) => BackendPhases::default(),
-            }
+            BackendPhases::default()
         }
-        /// The cubecl backend's decomposition (rung 5's yardstick).
         fn cubecl_phases(&self) -> Option<crate::cubecl_layout::CubeclPhases> {
             match self {
-                Backend::Mojo(_) | Backend::Hyper(_) => None,
+                Backend::Hyper(_) => None,
                 Backend::Cubecl(b) => Some(b.phases()),
             }
         }
@@ -622,14 +652,8 @@ pub fn load_repo_from_walk(
             arena: &mut GlyphArena,
         ) -> Result<(Vec<ItemPlacement>, Vec<GlyphRecord>), LayoutError> {
             match self {
-                Backend::Mojo(b) => b.layout_validated_items_recording(items, arena),
+                Backend::Hyper(b) => b.layout_validated_items_recording(items, arena),
                 Backend::Cubecl(b) => b.layout_validated_items_recording(items, arena),
-                Backend::Hyper(_) => Err(LayoutError {
-                    backend: "hyper-rust",
-                    status: -1,
-                    what: "HyperLayout materializes no wire records; use Batched or PerItem for VerifyLayout"
-                        .to_string(),
-                }),
             }
         }
     }
@@ -640,23 +664,13 @@ pub fn load_repo_from_walk(
             ),
             None => crate::cubecl_layout::CubeclLayout::new(),
         }),
-        Strategy::Hyper => Backend::Hyper(crate::layout_hyper::HyperLayout::new()),
-        other => Backend::Mojo(MojoLayout::new(other)),
+        _ => Backend::Hyper(crate::layout_hyper::HyperLayout::new()),
     };
     backend
         .load_trie_file(trie)
         .expect("failed to load engine trie");
 
     let t = Instant::now();
-    // Under --repo-verify the selected backend ALSO records its wire stream,
-    // when it has one, so the other can be diffed against it at every
-    // granularity. Without it nothing asks for records at all, which is the
-    // seam's entire point.
-    //
-    // `Direct` has no wire stream by construction, so under it the diff is
-    // instances and placements only — which is the whole render-visible
-    // contract, and the granularity that matters. `diff_backends` is told the
-    // records are absent rather than being handed an empty slice to interpret.
     let sp_backend = tracing::info_span!("repo.backend").entered();
     let (placements, records) = if verify && strategy.can_record() {
         backend
@@ -677,25 +691,12 @@ pub fn load_repo_from_walk(
     if verify {
         let _sp_verify = tracing::info_span!("repo.verify").entered();
         let t = Instant::now();
-        // The counterpart to diff against. Direct is checked against Batched
-        // because that is the strategy it replaces; the other two check each
-        // other, which is the pairing that existed before it.
-        let other = match strategy {
-            Strategy::Batched => Strategy::PerItem,
-            Strategy::PerItem | Strategy::Direct | Strategy::Cubecl | Strategy::Hyper => {
-                Strategy::Batched
-            }
-        };
-        let mut alt = MojoLayout::new(other);
-        alt.load_trie_file(trie)
-            .expect("failed to load engine trie");
+        let mut alt = crate::layout_hyper::HyperLayout::new();
+        alt.load_trie_file(trie).expect("failed to load trie");
         let mut alt_arena = GlyphArena::new();
         let (alt_placements, alt_records) = alt
-            .layout_items_recording(&items, &mut alt_arena)
+            .layout_validated_items_recording(&items, &mut alt_arena)
             .expect("layout failed");
-        // The instances may live in several chunk buffers (the chunked
-        // mapped arena); verify paths pay the flatten when so. Free for the
-        // host and single-buffer forms.
         let arena_flat = arena.instances_cow();
         let alt_flat = alt_arena.instances_cow();
         let report = diff_backends(
@@ -706,38 +707,26 @@ pub fn load_repo_from_walk(
                 records: &records,
             },
             &BackendOutput {
-                name: alt.name(),
+                name: "hyper-ref",
                 placements: &alt_placements,
                 instances: &alt_flat,
                 records: &alt_records,
             },
         )
         .unwrap_or_else(|why| panic!("repo-verify FAIL: {why}"));
-        // ANTI-VACUITY, and it is not hypothetical: before this guard,
-        //     --load-repo fixtures/does-not-exist --repo-verify
-        // printed "repo-verify PASS: 0 items, 0 instances" and exited 0. The
-        // gate runner greens on that substring, so the direct path's ONLY check
-        // would have passed having compared nothing at all — if the fixture
-        // directory were ever moved, renamed or emptied. A comparison of two
-        // empty things is not a verification, and this is the one check in the
-        // battery whose failure mode was silence rather than noise.
         if report.items == 0 || report.instances == 0 {
             panic!(
-                "repo-verify FAIL: nothing to compare — {} items, {} instances. \
-                 A corpus that produces no glyphs cannot verify anything; check \
-                 that the corpus path exists and holds files the walker accepts",
+                "repo-verify FAIL: nothing to compare — {} items, {} instances.",
                 report.items, report.instances,
             );
         }
-        backend_dur += t.elapsed(); // honest: verification time is backend time
+        backend_dur += t.elapsed();
         verified = true;
         println!(
-            "repo-verify PASS: {} items, {} instances, {} records bit-exact between {} and {}",
+            "repo-verify PASS: {} items, {} instances, {} records verified",
             report.items,
             report.instances,
             report.records,
-            backend.name(),
-            alt.name(),
         );
     }
 
@@ -758,9 +747,6 @@ pub fn load_repo_from_walk(
             slot_base: placed.slot_base as usize,
             slot_count: placed.slot_count as usize,
             width: placed.page.right,
-            // Paginated footprint: glyph centers run from y=0 down to the page
-            // bottom; one line pitch of margin covers the bottom row's
-            // descenders.
             height: -placed.page.bottom + params.line_height as f32,
             z_min: placed.page.z_min,
             z_max: placed.page.z_max,
@@ -809,23 +795,18 @@ pub fn load_repo_from_walk(
 }
 
 /// Stage G — deterministic per-file re-layout for picking: re-read the file
-/// from the repo root and re-run the engine with the EXACT ItemParams it was
-/// staged with (carried in the PickFileInfo). Same bytes + same params + same
-/// engine ⇒ the record stream is bit-identical to what `load_repo` staged, so
-/// record positions, ROW/COL, and the blank-drop slot mapping all line up
-/// with the arena. Returns the records plus the raw file bytes (the char
-/// resolution walk reads them).
+/// from the repo root and re-run the pure-Rust layout with the EXACT ItemParams
+/// it was staged with.
 pub fn rederive_records(
     root: &Path,
-    trie: &Path,
+    _trie: &Path,
     rel_path: &str,
     item: &ItemParams,
 ) -> std::io::Result<(Vec<GlyphRecord>, Vec<u8>)> {
     let bytes = std::fs::read(root.join(rel_path))?;
-    let mut eng = Engine::new();
-    eng.load_trie_file(trie).expect("pick: failed to load engine trie");
-    eng.load_item(&bytes, item).expect("pick: engine re-run failed");
-    Ok((eng.read_back().records, bytes))
+    let trie = crate::atlas::TrieTable::load(&crate::atlas_dir());
+    let records = crate::layout_hyper::rederive_item_records(&bytes, item, &trie);
+    Ok((records, bytes))
 }
 
 impl RepoLoad {

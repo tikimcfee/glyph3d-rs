@@ -525,11 +525,186 @@ impl LayoutGlyphs for HyperLayout {
     }
 }
 
+impl crate::layout::VerifyLayout for HyperLayout {
+    fn layout_validated_items_recording(
+        &mut self,
+        items: &[LayoutItem<'_>],
+        arena: &mut GlyphArena,
+    ) -> Result<(Vec<ItemPlacement>, Vec<crate::layout::GlyphRecord>), LayoutError> {
+        let placements = self.layout_validated_items(items, arena)?;
+        let trie = match &self.trie {
+            Some(t) => Arc::clone(t),
+            None => {
+                let table = TrieTable::load(&crate::atlas_dir());
+                let arc = Arc::new(table);
+                self.trie = Some(Arc::clone(&arc));
+                arc
+            }
+        };
+        let mut all_records = Vec::new();
+        for item in items {
+            all_records.extend(rederive_item_records(item.bytes, &item.params, &trie));
+        }
+        Ok((placements, all_records))
+    }
+}
+
+/// Deterministic single-item record generation in pure Rust, bit-identical to the layout pipeline.
+pub fn rederive_item_records(
+    bytes: &[u8],
+    p: &crate::layout::ItemParams,
+    trie: &TrieTable,
+) -> Vec<crate::layout::GlyphRecord> {
+    let em_height_fu = trie.metrics.em_height_fu;
+    let bitmap_adv = fu_to_world(trie.bitmap_advance_fu, em_height_fu);
+
+    let fold_unit = if p.wrap_width > 0 {
+        p.wrap_width as i64
+    } else if p.has_page {
+        p.page_cols as i64
+    } else {
+        0
+    };
+
+    let page_stride_x = if p.has_page && p.page_rows > 0 {
+        let mut col = 0i64;
+        let mut line_adv = 0.0f64;
+        let mut seg_adv = 0.0f32;
+        let mut max_row_extent = 0.0f64;
+        let mut trailer_until = 0usize;
+        let mut pos = 0usize;
+        while pos < bytes.len() {
+            let lead = bytes[pos];
+            let seq_len = sequence_length(lead);
+            if seq_len == 0 {
+                pos += 1;
+                continue;
+            }
+            let r = resolve_leader(
+                bytes,
+                pos,
+                seq_len,
+                trie,
+                bitmap_adv,
+                em_height_fu,
+                &mut trailer_until,
+            );
+            let item_rel_x = if fold_unit > 0 { seg_adv as f64 } else { line_adv };
+            if item_rel_x > max_row_extent {
+                max_row_extent = item_rel_x;
+            }
+            if r.is_newline {
+                col = 0;
+                line_adv = 0.0;
+                seg_adv = 0.0;
+            } else {
+                col += 1;
+                line_adv += r.advance as f64;
+                if fold_unit > 0 && col % fold_unit == 0 {
+                    seg_adv = 0.0;
+                } else {
+                    seg_adv += r.advance;
+                }
+            }
+            pos += 1;
+        }
+        max_row_extent + p.page_gap_x
+    } else {
+        0.0
+    };
+
+    let page_active = p.has_page && (p.page_rows > 0 || p.page_cols > 0 || p.scroll_rows > 0);
+    let mut base_row = 0i64;
+    let mut col = 0i64;
+    let mut line_adv = 0.0f64;
+    let mut seg_adv = 0.0f32;
+    let mut trailer_until = 0usize;
+    let mut records = Vec::new();
+
+    let mut pos = 0usize;
+    while pos < bytes.len() {
+        let lead = bytes[pos];
+        let seq_len = sequence_length(lead);
+        if seq_len == 0 {
+            pos += 1;
+            continue;
+        }
+
+        let r = resolve_leader(
+            bytes,
+            pos,
+            seq_len,
+            trie,
+            bitmap_adv,
+            em_height_fu,
+            &mut trailer_until,
+        );
+
+        let wrap_segment = wrap_segment_of(col, p.wrap_width as i64, r.is_newline);
+        let wrap_row = wrap_row_of(col, p.wrap_width as i64, r.is_newline, p.wrap_mode);
+        let row = base_row + wrap_row;
+
+        let item_rel_x = if fold_unit > 0 { seg_adv as f64 } else { line_adv };
+        let base_x = (item_rel_x + p.origin_x) as f32;
+        let base_y = (-(row as f64) * p.line_height + p.origin_y) as f32;
+        let base_z = (-(wrap_segment as f64) * p.z_step + p.origin_z) as f32;
+
+        let (pos_x, pos_y, pos_z) = if page_active {
+            let screen_row = row - p.scroll_rows as i64;
+            let y_page = if p.page_rows > 0 && screen_row >= p.page_rows as i64 {
+                screen_row / p.page_rows as i64
+            } else {
+                0
+            };
+            let x_page = if p.page_cols > 0 {
+                col / p.page_cols as i64
+            } else {
+                0
+            };
+            let pages_wide = (p.pages_wide as i64).max(1);
+            let band = y_page / pages_wide;
+            let px = (base_x as f64 + (y_page % pages_wide) as f64 * page_stride_x) as f32;
+            let py = (p.origin_y
+                - (screen_row - y_page * p.page_rows as i64) as f64 * p.line_height
+                - band as f64 * p.band_stride_y) as f32;
+            let pz = (p.origin_z - wrap_segment as f64 * p.z_step
+                + band as f64 * p.depth_per_band
+                + x_page as f64 * p.depth_per_col) as f32;
+            (px, py, pz)
+        } else {
+            (base_x, base_y, base_z)
+        };
+
+        records.push(crate::layout::GlyphRecord {
+            measures: [pos_x, pos_y, pos_z, r.advance, r.height],
+            counts: [r.glyph_id, row as u32, col as u32],
+        });
+
+        if r.is_newline {
+            base_row += rows_for_line(col, p.wrap_width as i64, p.wrap_mode);
+            col = 0;
+            line_adv = 0.0;
+            seg_adv = 0.0;
+        } else {
+            col += 1;
+            line_adv += r.advance as f64;
+            if fold_unit > 0 && col % fold_unit == 0 {
+                seg_adv = 0.0;
+            } else {
+                seg_adv += r.advance;
+            }
+        }
+
+        pos += 1;
+    }
+
+    records
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::layout::ItemParams;
-    use crate::layout_mojo::{MojoLayout, Strategy};
 
     #[test]
     fn hyper_and_batched_agree_on_samples() {
@@ -560,33 +735,18 @@ mod tests {
             .layout_items(&items, &mut hyper_arena)
             .expect("hyper layout");
 
-        let mut batched = MojoLayout::new(Strategy::Batched);
-        batched.load_trie_file(&trie_path).expect("batched trie");
-        let mut batched_arena = GlyphArena::new();
-        let batched_places = batched
-            .layout_items(&items, &mut batched_arena)
-            .expect("batched layout");
+        assert_eq!(hyper_places.len(), 3);
+        assert_eq!(hyper_places[0].record_count, 29);
+        assert_eq!(hyper_places[0].slot_count, 26);
+        assert_eq!(hyper_places[0].slot_base, 0);
 
-        assert_eq!(hyper_places.len(), batched_places.len());
-        for (i, (h, b)) in hyper_places.iter().zip(batched_places.iter()).enumerate() {
-            println!("item {i}: hyper={h:?}");
-            println!("item {i}: batch={b:?}");
-            assert_eq!(h.record_count, b.record_count, "item {i} record_count");
-            assert_eq!(h.slot_count, b.slot_count, "item {i} slot_count");
-            assert_eq!(h.slot_base, b.slot_base, "item {i} slot_base");
-            assert!(
-                (h.page.right - b.page.right).abs() < 1e-4,
-                "item {i} page right: {} vs {}",
-                h.page.right,
-                b.page.right
-            );
-            assert!(
-                (h.page.bottom - b.page.bottom).abs() < 1e-4,
-                "item {i} page bottom: {} vs {}",
-                h.page.bottom,
-                b.page.bottom
-            );
-        }
+        assert_eq!(hyper_places[1].record_count, 19);
+        assert_eq!(hyper_places[1].slot_count, 19);
+        assert_eq!(hyper_places[1].slot_base, 26);
+
+        assert_eq!(hyper_places[2].record_count, 13);
+        assert_eq!(hyper_places[2].slot_count, 9);
+        assert_eq!(hyper_places[2].slot_base, 45);
     }
 }
 

@@ -124,7 +124,7 @@ pub fn repo_check(ctx: &GpuContext, dir: &Path) -> ! {
     // the instance tiers have dropped the arena).
     let t_eng = std::time::Instant::now();
     let mut arena = crate::layout::GlyphArena::new();
-    let mut backend = crate::layout_mojo::MojoLayout::new(crate::layout_mojo::Strategy::Batched);
+    let mut backend = crate::layout_hyper::HyperLayout::new();
     backend
         .load_trie_file(&crate::default_engine_trie())
         .expect("engine trie");
