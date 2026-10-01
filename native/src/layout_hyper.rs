@@ -1076,7 +1076,7 @@ mod tests {
             .iter()
             .enumerate()
             .map(|(i, bytes)| LayoutItem {
-                bytes: *bytes,
+                bytes,
                 params: ItemParams { line_height: 1.25, ..Default::default() },
                 group_id: i as u32,
                 paint: Paint::PerRecord(&colors[i]),

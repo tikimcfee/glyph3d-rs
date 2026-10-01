@@ -705,6 +705,59 @@ pub fn diff_bake(fixture: &BakeFixture) -> BakeDiff {
     }
 }
 
+// ── Gate drivers (moved from main.rs in the 2026-09 code-shape refactor) ──
+
+/// Bake: the bake and its seed protocol against the .bake.bin corpus.
+pub fn run_fixture_bake(paths: &[PathBuf]) -> ! {
+    let mut leaders = 0usize;
+    let mut checkpoints = 0usize;
+    let mut queries = 0usize;
+    let mut failed = 0usize;
+    for p in paths {
+        let fx = match load_bake_fixture(p) {
+            Ok(fx) => fx,
+            Err(e) => {
+                eprintln!("fixture-bake FAIL: {e}");
+                std::process::exit(1);
+            }
+        };
+        let d = diff_bake(&fx);
+        if d.bad.is_empty() {
+            println!(
+                "  PASS {:<28} {} leaders / {} checkpoints / {} prefix + {} wrap queries",
+                fx.name, d.leaders, d.checkpoints, d.prefix_queries, d.wrap_queries
+            );
+            leaders += d.leaders;
+            checkpoints += d.checkpoints;
+            queries += d.prefix_queries + d.wrap_queries;
+        } else {
+            failed += 1;
+            println!("  FAIL {:<28} {} disagreement(s)", fx.name, d.bad.len());
+            for line in d.bad.iter().take(8) {
+                println!("       {line}");
+            }
+        }
+    }
+    if failed > 0 {
+        eprintln!("fixture-bake FAIL: {failed}/{} fixtures differ", paths.len());
+        std::process::exit(1);
+    }
+    // ANTI-VACUITY. The QUERY half is what distinguishes this from a second
+    // whole-file record comparison: a bake with subtly wrong checkpoints answers
+    // every total correctly and every random-access question wrongly. A run with
+    // no queries would be reporting only the half that cannot see that.
+    if queries == 0 {
+        eprintln!("fixture-bake FAIL: no seed-protocol query was exercised");
+        std::process::exit(1);
+    }
+    println!(
+        "fixture-bake PASS: {} fixture(s), {leaders} leaders, {checkpoints} checkpoints, \
+         {queries} seed-protocol queries bit-exact",
+        paths.len()
+    );
+    std::process::exit(0);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -895,57 +948,4 @@ mod tests {
             "and one row under WrapBack, with the fold spent in depth"
         );
     }
-}
-
-// ── Gate drivers (moved from main.rs in the 2026-09 code-shape refactor) ──
-
-/// Bake: the bake and its seed protocol against the .bake.bin corpus.
-pub fn run_fixture_bake(paths: &[PathBuf]) -> ! {
-    let mut leaders = 0usize;
-    let mut checkpoints = 0usize;
-    let mut queries = 0usize;
-    let mut failed = 0usize;
-    for p in paths {
-        let fx = match load_bake_fixture(p) {
-            Ok(fx) => fx,
-            Err(e) => {
-                eprintln!("fixture-bake FAIL: {e}");
-                std::process::exit(1);
-            }
-        };
-        let d = diff_bake(&fx);
-        if d.bad.is_empty() {
-            println!(
-                "  PASS {:<28} {} leaders / {} checkpoints / {} prefix + {} wrap queries",
-                fx.name, d.leaders, d.checkpoints, d.prefix_queries, d.wrap_queries
-            );
-            leaders += d.leaders;
-            checkpoints += d.checkpoints;
-            queries += d.prefix_queries + d.wrap_queries;
-        } else {
-            failed += 1;
-            println!("  FAIL {:<28} {} disagreement(s)", fx.name, d.bad.len());
-            for line in d.bad.iter().take(8) {
-                println!("       {line}");
-            }
-        }
-    }
-    if failed > 0 {
-        eprintln!("fixture-bake FAIL: {failed}/{} fixtures differ", paths.len());
-        std::process::exit(1);
-    }
-    // ANTI-VACUITY. The QUERY half is what distinguishes this from a second
-    // whole-file record comparison: a bake with subtly wrong checkpoints answers
-    // every total correctly and every random-access question wrongly. A run with
-    // no queries would be reporting only the half that cannot see that.
-    if queries == 0 {
-        eprintln!("fixture-bake FAIL: no seed-protocol query was exercised");
-        std::process::exit(1);
-    }
-    println!(
-        "fixture-bake PASS: {} fixture(s), {leaders} leaders, {checkpoints} checkpoints, \
-         {queries} seed-protocol queries bit-exact",
-        paths.len()
-    );
-    std::process::exit(0);
 }

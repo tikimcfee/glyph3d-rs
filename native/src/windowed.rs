@@ -67,6 +67,7 @@ mod app;
 use app::App;
 
 mod state;
+#[cfg(feature = "egui-ui")]
 mod ui;
 
 /// Stage K (K6): `yyyymmdd-hhmmss` UTC stamp for shot filenames (no chrono
@@ -92,24 +93,6 @@ fn utc_stamp(now: std::time::SystemTime) -> String {
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
     let y = if m <= 2 { y + 1 } else { y };
     format!("{y:04}{m:02}{d:02}-{:02}{:02}{:02}", tod / 3600, tod % 3600 / 60, tod % 60)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::utc_stamp;
-    use std::time::{Duration, UNIX_EPOCH};
-
-    #[test]
-    fn utc_stamp_known_epochs() {
-        // Values pinned against `date -u` (macOS): epoch 0, and the K6 fix
-        // date 2026-09-02 18:21:12 UTC (the bad stamp that exposed the bug
-        // read "202612-89-182112").
-        let at = |s: u64| utc_stamp(UNIX_EPOCH + Duration::from_secs(s));
-        assert_eq!(at(0), "19700101-000000");
-        assert_eq!(at(1788373272), "20260902-182112");
-        assert_eq!(at(951782400), "20000229-000000"); // leap day, era boundary math
-        assert_eq!(at(4102444800), "21000101-000000"); // non-leap century year
-    }
 }
 
 pub fn run(
@@ -142,4 +125,22 @@ pub fn run(
         present_mode,
     };
     event_loop.run_app(&mut app).expect("event loop error");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::utc_stamp;
+    use std::time::{Duration, UNIX_EPOCH};
+
+    #[test]
+    fn utc_stamp_known_epochs() {
+        // Values pinned against `date -u` (macOS): epoch 0, and the K6 fix
+        // date 2026-09-02 18:21:12 UTC (the bad stamp that exposed the bug
+        // read "202612-89-182112").
+        let at = |s: u64| utc_stamp(UNIX_EPOCH + Duration::from_secs(s));
+        assert_eq!(at(0), "19700101-000000");
+        assert_eq!(at(1788373272), "20260902-182112");
+        assert_eq!(at(951782400), "20000229-000000"); // leap day, era boundary math
+        assert_eq!(at(4102444800), "21000101-000000"); // non-leap century year
+    }
 }
