@@ -163,31 +163,40 @@ pub fn walk_repo(root: &Path) -> WalkResult {
     }
     candidates.sort_by(|a, b| a.0.cmp(&b.0));
 
-    let mut files = Vec::with_capacity(candidates.len());
+    use rayon::prelude::*;
+
+    let read_results: Vec<Option<RepoFile>> = candidates
+        .into_par_iter()
+        .map(|(rel, path)| {
+            let bytes = std::fs::read(&path).ok()?;
+            if std::str::from_utf8(&bytes).is_err() {
+                return None;
+            }
+            let dir = rel
+                .rsplit_once('/')
+                .map(|(d, _)| d.to_string())
+                .unwrap_or_default();
+            Some(RepoFile {
+                rel_path: rel,
+                dir,
+                bytes,
+            })
+        })
+        .collect();
+
+    let mut files = Vec::with_capacity(read_results.len());
     let mut total_bytes = 0usize;
     let mut skipped_non_utf8 = 0usize;
-    for (rel, path) in candidates {
-        let bytes = match std::fs::read(&path) {
-            Ok(b) => b,
-            Err(_) => continue,
-        };
-        // Valid UTF-8 only: the engine's decode assembles codepoints from lead
-        // bytes WITHOUT validating continuations; well-formed UTF-8 is the
-        // documented precondition for staying inside the trie's block index.
-        if std::str::from_utf8(&bytes).is_err() {
-            skipped_non_utf8 += 1;
-            continue;
+    for res in read_results {
+        match res {
+            Some(f) => {
+                total_bytes += f.bytes.len();
+                files.push(f);
+            }
+            None => {
+                skipped_non_utf8 += 1;
+            }
         }
-        total_bytes += bytes.len();
-        let dir = rel
-            .rsplit_once('/')
-            .map(|(d, _)| d.to_string())
-            .unwrap_or_default();
-        files.push(RepoFile {
-            rel_path: rel,
-            dir,
-            bytes,
-        });
     }
     WalkResult {
         files,
@@ -569,11 +578,13 @@ pub fn load_repo_from_walk(
     .entered();
     let walk_dur = walk.walk_dur;
 
+    use rayon::prelude::*;
+
     // Per-file params (pagination sized per file). Newline counts double as
     // the row estimate — one fast byte scan per file.
     let file_params: Vec<ItemParams> = walk
         .files
-        .iter()
+        .par_iter()
         .map(|f| {
             let newlines = f.bytes.iter().filter(|&&b| b == b'\n').count();
             file_item_params(params, f.bytes.len(), newlines)

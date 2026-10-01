@@ -93,8 +93,34 @@ fn cover_segment(instances: &[GlyphInstance], min: [f32; 3], max: [f32; 3], slot
     }
 }
 
+const fn make_ascii_word_table() -> [bool; 128] {
+    let mut table = [false; 128];
+    let mut i = 0usize;
+    while i < 128 {
+        let b = i as u8;
+        if (b >= b'a' && b <= b'z')
+            || (b >= b'A' && b <= b'Z')
+            || (b >= b'0' && b <= b'9')
+            || b == b'_'
+            || b == b'$'
+        {
+            table[i] = true;
+        }
+        i += 1;
+    }
+    table
+}
+
+const ASCII_WORD_CHAR: [bool; 128] = make_ascii_word_table();
+
+#[inline(always)]
 fn is_word_char(ch: char) -> bool {
-    ch.is_alphanumeric() || ch == '_' || ch == '$'
+    let u = ch as u32;
+    if u < 128 {
+        ASCII_WORD_CHAR[u as usize]
+    } else {
+        ch.is_alphanumeric() || ch == '_' || ch == '$'
+    }
 }
 
 /// Stage a UTF-8 text file, tiled `copies` times (each copy its own group,

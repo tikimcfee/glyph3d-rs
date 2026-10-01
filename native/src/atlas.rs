@@ -119,8 +119,16 @@ impl TrieTable {
     /// Parse glyphs.bin (primary metrics) + codepoints.bin (the trie) from an
     /// atlas directory. Pure CPU — no textures.
     pub fn load(dir: &Path) -> Self {
-        let gl = read_words(&dir.join("glyphs.bin"));
-        check_magic(&gl, "G3GL", &dir.join("glyphs.bin"));
+        let (gl, cp) = std::thread::scope(|s| {
+            let h_cp = s.spawn(|| {
+                let cp = read_words(&dir.join("codepoints.bin"));
+                check_magic(&cp, "G3CP", &dir.join("codepoints.bin"));
+                cp
+            });
+            let gl = read_words(&dir.join("glyphs.bin"));
+            check_magic(&gl, "G3GL", &dir.join("glyphs.bin"));
+            (gl, h_cp.join().expect("codepoints read"))
+        });
         let metrics = PrimaryMetrics {
             upem: gl[5],
             advance_fu: gl[6],
@@ -140,9 +148,6 @@ impl TrieTable {
                 (r[2] & SLOT_FLAG_BITMAP != 0 && r[3] != NO_CELL).then_some(r[3])
             })
             .collect();
-
-        let cp = read_words(&dir.join("codepoints.bin"));
-        check_magic(&cp, "G3CP", &dir.join("codepoints.bin"));
         // v1: 44 B header, no sections. v2 (the sequence pass): 68 B header
         // with the section descriptors at words 11..16, and the sequence +
         // class sections appended after the blocks.
@@ -601,33 +606,57 @@ impl EmojiSheet {
 /// un-premultiplying after keeps the storage format one thing. Integer
 /// arithmetic with round-half-up, so the result is the same on every host.
 pub fn box_down_straight(src: &[u8], w: u32, h: u32) -> Vec<u8> {
+    use rayon::prelude::*;
+
     assert!(w.is_multiple_of(2) && h.is_multiple_of(2), "box filter needs even dimensions, got {w}x{h}");
     let (w, h) = (w as usize, h as usize);
     let (ow, oh) = (w / 2, h / 2);
     let mut out = vec![0u8; ow * oh * 4];
-    for y in 0..oh {
-        for x in 0..ow {
-            let mut pm = [0u32; 4];
-            for (dy, dx) in [(0, 0), (0, 1), (1, 0), (1, 1)] {
-                let i = ((2 * y + dy) * w + 2 * x + dx) * 4;
-                let a = src[i + 3] as u32;
-                pm[0] += src[i] as u32 * a;
-                pm[1] += src[i + 1] as u32 * a;
-                pm[2] += src[i + 2] as u32 * a;
-                pm[3] += a;
-            }
-            let a = (pm[3] + 2) / 4;
-            let o = (y * ow + x) * 4;
-            out[o + 3] = a as u8;
-            if a > 0 {
-                // pm[c] is Σ c·a over four texels; the straight channel of the
-                // average is (Σ c·a / 4) / (Σ a / 4) = Σ c·a / Σ a.
-                for c in 0..3 {
-                    out[o + c] = ((pm[c] + pm[3] / 2) / pm[3]).min(255) as u8;
+    let row_bytes = ow * 4;
+    let src_stride = w * 4;
+    out.par_chunks_exact_mut(row_bytes)
+        .enumerate()
+        .for_each(|(y, out_row)| {
+            let y0 = (2 * y) * src_stride;
+            let y1 = y0 + src_stride;
+            let row0 = &src[y0..y0 + src_stride];
+            let row1 = &src[y1..y1 + src_stride];
+
+            for x in 0..ow {
+                let x8 = x * 8;
+                let a00 = row0[x8 + 3] as u32;
+                let a01 = row0[x8 + 7] as u32;
+                let a10 = row1[x8 + 3] as u32;
+                let a11 = row1[x8 + 7] as u32;
+
+                let pm0 = row0[x8] as u32 * a00
+                    + row0[x8 + 4] as u32 * a01
+                    + row1[x8] as u32 * a10
+                    + row1[x8 + 4] as u32 * a11;
+
+                let pm1 = row0[x8 + 1] as u32 * a00
+                    + row0[x8 + 5] as u32 * a01
+                    + row1[x8 + 1] as u32 * a10
+                    + row1[x8 + 5] as u32 * a11;
+
+                let pm2 = row0[x8 + 2] as u32 * a00
+                    + row0[x8 + 6] as u32 * a01
+                    + row1[x8 + 2] as u32 * a10
+                    + row1[x8 + 6] as u32 * a11;
+
+                let pm3 = a00 + a01 + a10 + a11;
+
+                let a = (pm3 + 2) / 4;
+                let o = x * 4;
+                out_row[o + 3] = a as u8;
+                if a > 0 {
+                    let half = pm3 / 2;
+                    out_row[o] = ((pm0 + half) / pm3).min(255) as u8;
+                    out_row[o + 1] = ((pm1 + half) / pm3).min(255) as u8;
+                    out_row[o + 2] = ((pm2 + half) / pm3).min(255) as u8;
                 }
             }
-        }
-    }
+        });
     out
 }
 
@@ -654,7 +683,7 @@ impl EmojiTexture {
         let (level0, cell_ink) = sheet.decode_layers();
         let t_decode = t0.elapsed() - t_parse;
         let mip_levels = mip_levels_for(sheet.cell_w, sheet.cell_h);
-        let mut levels: Vec<Vec<Vec<u8>>> = Vec::with_capacity(sheet.layers as usize); // [layer][level]
+        let mut levels: Vec<Vec<Vec<u8>>> = Vec::with_capacity(sheet.layers as usize);
         for base in level0 {
             let mut chain = vec![base];
             let (mut w, mut h) = (sheet.layer_w, sheet.layer_h);
@@ -732,8 +761,19 @@ fn read_words(path: &Path) -> Vec<u32> {
     let bytes = std::fs::read(path)
         .unwrap_or_else(|e| panic!("failed to read {}: {e}", path.display()));
     assert!(bytes.len().is_multiple_of(4), "{}: not a u32 array", path.display());
-    // as_chunks is byte-identical to chunks_exact(4) here: the assert above
-    // guarantees no remainder, so both yield every consecutive 4-byte group.
+    #[cfg(target_endian = "little")]
+    {
+        match bytemuck::try_cast_vec(bytes) {
+            Ok(words) => words,
+            Err((_, fallback_bytes)) => fallback_bytes
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|c| u32::from_le_bytes(*c))
+                .collect(),
+        }
+    }
+    #[cfg(not(target_endian = "little"))]
     bytes
         .as_chunks::<4>()
         .0
@@ -820,23 +860,31 @@ impl Atlas {
     }
 
     pub fn load_from_device(device: &wgpu::Device, queue: &wgpu::Queue, dir: &Path, emoji_sheet: &Path) -> Self {
-        // --- curves.bin (G3CV): 8-word header, then width*height*4 texels ---
-        let cv = read_words(&dir.join("curves.bin"));
-        check_magic(&cv, "G3CV", &dir.join("curves.bin"));
+        let ((cv, gm), trie) = std::thread::scope(|s| {
+            let h_bins = s.spawn(|| {
+                std::thread::scope(|s2| {
+                    let h_cv = s2.spawn(|| {
+                        let cv = read_words(&dir.join("curves.bin"));
+                        check_magic(&cv, "G3CV", &dir.join("curves.bin"));
+                        cv
+                    });
+                    let gm = read_words(&dir.join("glyphmap.bin"));
+                    check_magic(&gm, "G3GM", &dir.join("glyphmap.bin"));
+                    (h_cv.join().expect("curves read"), gm)
+                })
+            });
+            let trie = TrieTable::load(dir);
+            (h_bins.join().expect("bins read"), trie)
+        });
+
         let (cv_w, cv_h, curve_count) = (cv[3], cv[4], cv[5]);
         assert_eq!(cv_w, ATLAS_TEX_WIDTH);
         let curves = upload_uint_texture(device, queue, "slug curves", cv_w, cv_h, &cv[8..]);
 
-        // --- glyphmap.bin (G3GM): 8-word header, then texels ---
-        let gm = read_words(&dir.join("glyphmap.bin"));
-        check_magic(&gm, "G3GM", &dir.join("glyphmap.bin"));
         let (gm_w, gm_h, entry_count) = (gm[3], gm[4], gm[5]);
         assert_eq!(gm_w, ATLAS_TEX_WIDTH);
         let glyphmap = upload_uint_texture(device, queue, "slug glyphmap", gm_w, gm_h, &gm[8..]);
 
-        // --- glyphs.bin (G3GL) + codepoints.bin (G3CP): the CPU-side trie
-        //     (Stage E1: shared with the GPU-free cross-check via TrieTable). ---
-        let trie = TrieTable::load(dir);
         let metrics = trie.metrics;
 
         // --- glyphmap/glyphs slot-count agreement --------------------------

@@ -323,47 +323,104 @@ impl HyperLayout {
                 let mut trailer_until = 0usize;
 
                 let mut pos = 0usize;
-                while pos < bytes.len() {
-                    let lead = bytes[pos];
-                    let r = if lead < 128 && pos >= trailer_until {
-                        if let Some(fast) = trie.ascii_table[lead as usize] {
-                            fast
-                        } else {
-                            resolve_leader(bytes, pos, 1, &trie, bitmap_adv, em_height_fu, &mut trailer_until)
-                        }
-                    } else {
-                        let seq_len = sequence_length(lead);
-                        if seq_len == 0 {
+                if fold_unit == 0 {
+                    while pos < bytes.len() {
+                        if pos < trailer_until {
                             pos += 1;
                             continue;
                         }
-                        resolve_leader(bytes, pos, seq_len, &trie, bitmap_adv, em_height_fu, &mut trailer_until)
-                    };
+                        if pos + 8 <= bytes.len() {
+                            let chunk = u64::from_ne_bytes(bytes[pos..pos + 8].try_into().unwrap());
+                            let high_bits = chunk & 0x8080_8080_8080_8080;
+                            let diff = chunk ^ 0x0A0A_0A0A_0A0A_0A0A;
+                            let has_nl = (diff.wrapping_sub(0x0101_0101_0101_0101) & !diff & 0x8080_8080_8080_8080) != 0;
+                            if high_bits == 0 && !has_nl {
+                                survivor_count += 8;
+                                for &b in &bytes[pos..pos + 8] {
+                                    let fast = unsafe { trie.ascii_table.get_unchecked(b as usize).unwrap_unchecked() };
+                                    if line_adv > max_row_extent {
+                                        max_row_extent = line_adv;
+                                    }
+                                    line_adv += fast.advance as f64;
+                                }
+                                pos += 8;
+                                continue;
+                            }
+                        }
 
-                    let item_rel_x = if fold_unit > 0 { seg_adv as f64 } else { line_adv };
-                    if item_rel_x > max_row_extent {
-                        max_row_extent = item_rel_x;
+                        let lead = bytes[pos];
+                        let r = if lead < 128 {
+                            if let Some(fast) = trie.ascii_table[lead as usize] {
+                                fast
+                            } else {
+                                resolve_leader(bytes, pos, 1, &trie, bitmap_adv, em_height_fu, &mut trailer_until)
+                            }
+                        } else {
+                            let seq_len = sequence_length(lead);
+                            if seq_len == 0 {
+                                pos += 1;
+                                continue;
+                            }
+                            resolve_leader(bytes, pos, seq_len, &trie, bitmap_adv, em_height_fu, &mut trailer_until)
+                        };
+
+                        if line_adv > max_row_extent {
+                            max_row_extent = line_adv;
+                        }
+
+                        if r.glyph_id != 0 {
+                            survivor_count += 1;
+                        }
+
+                        if r.is_newline {
+                            line_adv = 0.0;
+                        } else {
+                            line_adv += r.advance as f64;
+                        }
+
+                        pos += 1;
                     }
+                } else {
+                    while pos < bytes.len() {
+                        let lead = bytes[pos];
+                        let r = if lead < 128 && pos >= trailer_until {
+                            if let Some(fast) = trie.ascii_table[lead as usize] {
+                                fast
+                            } else {
+                                resolve_leader(bytes, pos, 1, &trie, bitmap_adv, em_height_fu, &mut trailer_until)
+                            }
+                        } else {
+                            let seq_len = sequence_length(lead);
+                            if seq_len == 0 {
+                                pos += 1;
+                                continue;
+                            }
+                            resolve_leader(bytes, pos, seq_len, &trie, bitmap_adv, em_height_fu, &mut trailer_until)
+                        };
 
-                    if r.glyph_id != 0 {
-                        survivor_count += 1;
-                    }
+                        let item_rel_x = seg_adv as f64;
+                        if item_rel_x > max_row_extent {
+                            max_row_extent = item_rel_x;
+                        }
 
-                    if r.is_newline {
-                        col = 0;
-                        line_adv = 0.0;
-                        seg_adv = 0.0;
-                    } else {
-                        col += 1;
-                        line_adv += r.advance as f64;
-                        if fold_unit > 0 && col % fold_unit == 0 {
+                        if r.glyph_id != 0 {
+                            survivor_count += 1;
+                        }
+
+                        if r.is_newline {
+                            col = 0;
                             seg_adv = 0.0;
                         } else {
-                            seg_adv += r.advance;
+                            col += 1;
+                            if col % fold_unit == 0 {
+                                seg_adv = 0.0;
+                            } else {
+                                seg_adv += r.advance;
+                            }
                         }
-                    }
 
-                    pos += 1;
+                        pos += 1;
+                    }
                 }
 
                 ItemPrepass {
@@ -487,6 +544,8 @@ impl HyperLayout {
                 let mut trailer_until = 0usize;
 
                 let out_ptr = unsafe { (dest_addr as *mut RenderSlot).add(slot_base as usize) };
+                let flat_color = if let Paint::Flat(c) = item.paint { Some(c) } else { None };
+                let per_record_colors = if let Paint::PerRecord(c) = item.paint { Some(c) } else { None };
 
                 let mut pos = 0usize;
                 let mut span_idx = 0usize;
@@ -557,26 +616,26 @@ impl HyperLayout {
                         page_z_max = pos_z;
                     }
 
-                    let color = match item.paint {
-                        Paint::PerRecord(colors) => {
-                            if record_idx < colors.len() {
-                                colors[record_idx]
-                            } else {
-                                0xFFFF_FFFF
-                            }
+                    let color = if let Some(c) = flat_color {
+                        c
+                    } else if let Some(colors) = per_record_colors {
+                        if record_idx < colors.len() {
+                            colors[record_idx]
+                        } else {
+                            0xFFFF_FFFF
                         }
-                        Paint::Flat(c) => c,
-                        Paint::ByteSpans(spans) => {
-                            let p = pos as u32;
-                            while span_idx < spans.len() && p >= spans[span_idx].end {
-                                span_idx += 1;
-                            }
-                            if span_idx < spans.len() && p >= spans[span_idx].start {
-                                spans[span_idx].color
-                            } else {
-                                crate::layout::DEFAULT_COLOR_PACKED
-                            }
+                    } else if let Paint::ByteSpans(spans) = item.paint {
+                        let p = pos as u32;
+                        while span_idx < spans.len() && p >= spans[span_idx].end {
+                            span_idx += 1;
                         }
+                        if span_idx < spans.len() && p >= spans[span_idx].start {
+                            spans[span_idx].color
+                        } else {
+                            crate::layout::DEFAULT_COLOR_PACKED
+                        }
+                    } else {
+                        crate::layout::DEFAULT_COLOR_PACKED
                     };
 
                     if r.glyph_id != 0 {
@@ -702,6 +761,8 @@ impl HyperLayout {
                 let mut trailer_until = 0usize;
 
                 let out_ptr = unsafe { (dest_addr as *mut GlyphInstance).add(slot_base as usize) };
+                let flat_color = if let Paint::Flat(c) = item.paint { Some(c) } else { None };
+                let per_record_colors = if let Paint::PerRecord(c) = item.paint { Some(c) } else { None };
 
                 let mut pos = 0usize;
                 let mut span_idx = 0usize;
@@ -772,26 +833,26 @@ impl HyperLayout {
                         page_z_max = pos_z;
                     }
 
-                    let color = match item.paint {
-                        Paint::PerRecord(colors) => {
-                            if record_idx < colors.len() {
-                                colors[record_idx]
-                            } else {
-                                0xFFFF_FFFF
-                            }
+                    let color = if let Some(c) = flat_color {
+                        c
+                    } else if let Some(colors) = per_record_colors {
+                        if record_idx < colors.len() {
+                            colors[record_idx]
+                        } else {
+                            0xFFFF_FFFF
                         }
-                        Paint::Flat(c) => c,
-                        Paint::ByteSpans(spans) => {
-                            let p = pos as u32;
-                            while span_idx < spans.len() && p >= spans[span_idx].end {
-                                span_idx += 1;
-                            }
-                            if span_idx < spans.len() && p >= spans[span_idx].start {
-                                spans[span_idx].color
-                            } else {
-                                crate::layout::DEFAULT_COLOR_PACKED
-                            }
+                    } else if let Paint::ByteSpans(spans) = item.paint {
+                        let p = pos as u32;
+                        while span_idx < spans.len() && p >= spans[span_idx].end {
+                            span_idx += 1;
                         }
+                        if span_idx < spans.len() && p >= spans[span_idx].start {
+                            spans[span_idx].color
+                        } else {
+                            crate::layout::DEFAULT_COLOR_PACKED
+                        }
+                    } else {
+                        crate::layout::DEFAULT_COLOR_PACKED
                     };
 
                     if r.glyph_id != 0 {
