@@ -39,7 +39,6 @@ const BAKE_VERSION: u32 = 3;
 /// The fixtures each carry their OWN interval (that is the dial
 /// `bake-repo-small-k` exists to vary), so nothing in the corpus path reads
 /// this; it is the reference's documented default and what the tests bake with.
-#[allow(dead_code)]
 pub const CHECKPOINT_INTERVAL: usize = 4096;
 
 /// One checkpoint: the six carried fields of an exclusive prefix. `reset`,

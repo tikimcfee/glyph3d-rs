@@ -355,7 +355,6 @@ pub struct GpuContext {
 /// The renderer's device context handles passed across layout stages.
 /// The wgpu handles clone as cheap Arcs.
 #[derive(Clone)]
-#[allow(dead_code)]
 pub struct SharedDevice {
     pub instance: wgpu::Instance,
     pub adapter: wgpu::Adapter,

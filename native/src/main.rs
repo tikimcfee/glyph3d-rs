@@ -31,6 +31,7 @@
 //! renderer lives in the library — `src/lib.rs`.
 
 
+
 use clap::CommandFactory;
 use glyph3d_native::cli::{
     default_text_file, parse_cli, parse_cluster_mode, parse_present_mode, parse_strategy,

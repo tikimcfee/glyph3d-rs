@@ -86,7 +86,6 @@ pub struct TrieTable {
     // Carried for the general UAX #29 phase: the landed sequence pass reads no
     // classes by design (glyph_cluster.mojo says why), so today only
     // trie_v2_tests exercise it. class_of is its reader.
-    #[allow(dead_code)]
     pub classes: Vec<u32>,
     /// The table's first members as a set — the probe's cheap rejection. Built
     /// once at load from the sequence section itself.
@@ -284,7 +283,6 @@ impl TrieTable {
     /// section; range-compressed, binary search by range start). 0 = Other.
     // The general UAX #29 phase's reader, carried with the table — the landed
     // sequence pass reads no classes by design, so tests exercise this today.
-    #[allow(dead_code)]
     pub fn class_of(&self, cp: u32) -> u32 {
         if self.classes.is_empty() {
             return 0;
@@ -603,11 +601,6 @@ pub struct EmojiTexture {
 }
 
 impl EmojiTexture {
-    #[allow(dead_code)]
-    pub fn load(ctx: &GpuContext, path: &Path) -> Self {
-        Self::load_device(&ctx.device, &ctx.queue, path)
-    }
-
     pub fn load_device(device: &wgpu::Device, queue: &wgpu::Queue, path: &Path) -> Self {
         let t0 = std::time::Instant::now();
         let sheet = EmojiSheet::load(path);
@@ -778,11 +771,6 @@ impl Atlas {
             &PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../assets/atlas"),
             emoji_sheet,
         )
-    }
-
-    #[allow(dead_code)]
-    pub fn load_from(ctx: &GpuContext, dir: &Path, emoji_sheet: &Path) -> Self {
-        Self::load_from_device(&ctx.device, &ctx.queue, dir, emoji_sheet)
     }
 
     pub fn load_from_device(device: &wgpu::Device, queue: &wgpu::Queue, dir: &Path, emoji_sheet: &Path) -> Self {

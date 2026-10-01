@@ -42,20 +42,6 @@ mod palette {
     pub const C_PUNCT: u32 = super::pack_rgba8(PUNCT, 255);
 }
 
-#[allow(dead_code)]
-const KEYWORDS: &[&str] = &[
-    // JS/TS
-    "const", "let", "var", "function", "return", "if", "else", "for", "while", "import",
-    "export", "from", "class", "extends", "new", "this", "typeof", "instanceof", "switch",
-    "case", "break", "continue", "default", "try", "catch", "finally", "throw", "async",
-    "await", "yield", "of", "in", "do", "null", "undefined", "true", "false", "static",
-    "get", "set", "delete", "void",
-    // Rust
-    "fn", "pub", "mod", "use", "struct", "enum", "impl", "trait", "where", "match",
-    "loop", "move", "mut", "ref", "self", "Self", "crate", "super", "unsafe", "dyn",
-    "Some", "None", "Ok", "Err",
-];
-
 const fn pack_rgba8(rgb: [u8; 3], a: u8) -> u32 {
     rgb[0] as u32 | (rgb[1] as u32) << 8 | (rgb[2] as u32) << 16 | (a as u32) << 24
 }
@@ -481,7 +467,6 @@ fn word_color(word: &str) -> [u8; 3] {
 // against an independent implementation bit-for-bit.
 
 use crate::atlas::TrieTable;
-use crate::layout::GlyphRecord;
 
 /// Resolve a codepoint to a glyph in WORLD units — the fold's only view of
 /// a trie. The units live in `WorldEntry`, which is the whole point of the
@@ -750,44 +735,6 @@ pub fn fold_leaders(bytes: &[u8], wrap: i32, mode: crate::fold::WrapMode) -> Fol
     (leaders, rows, cols, lines)
 }
 
-/// Diff engine records against the CPU reference. Returns Ok(()) on a
-/// bit-exact match (counts AND measures, compared as bits — the repo's
-/// discipline), or a human-readable first-mismatch report.
-#[allow(dead_code)]
-pub fn diff_records(records: &[GlyphRecord], expected: &[RefGlyph]) -> Result<(), String> {
-    if records.len() != expected.len() {
-        return Err(format!(
-            "record count: engine {} vs reference {}",
-            records.len(),
-            expected.len()
-        ));
-    }
-    let mut bad = 0usize;
-    let mut report = String::new();
-    for (i, (r, e)) in records.iter().zip(expected.iter()).enumerate() {
-        let measures_match = r.measures.iter()
-            .zip([e.x, e.y, e.z, e.advance, e.height].iter())
-            .all(|(a, b)| a.to_bits() == b.to_bits());
-        let counts_match = r.counts == [e.glyph_id, e.row, e.col];
-        if !measures_match || !counts_match {
-            bad += 1;
-            if bad <= 10 {
-                report.push_str(&format!(
-                    "  rec[{i}]: engine [X={} Y={} Z={} ADV={} H={} | GID={} ROW={} COL={}]\n\
-                     \x20          expect [X={} Y={} Z={} ADV={} H={} | GID={} ROW={} COL={}]\n",
-                    r.x(), r.y(), r.z(), r.advance(), r.height(),
-                    r.glyph_id(), r.row(), r.col(),
-                    e.x, e.y, e.z, e.advance, e.height, e.glyph_id, e.row, e.col,
-                ));
-            }
-        }
-    }
-    if bad > 0 {
-        Err(format!("{bad}/{} records differ:\n{report}", records.len()))
-    } else {
-        Ok(())
-    }
-}
 
 /// Present one item's staged arena as a renderable scene.
 ///

@@ -409,9 +409,6 @@ pub struct LoadStats {
     /// the Mojo strategies, whose spans live in `phases`.
     #[cfg(feature = "cubecl")]
     pub cubecl: Option<crate::cubecl_layout::CubeclPhases>,
-    #[cfg(not(feature = "cubecl"))]
-    #[allow(dead_code)]
-    pub cubecl: Option<()>,
     pub stage: Duration,
     pub layout: Duration,
     pub files: usize,
@@ -716,10 +713,6 @@ pub fn load_repo_from_walk(
                 Backend::Cubecl(b) => Some(b.phases()),
             }
         }
-        #[cfg(not(feature = "cubecl"))]
-        fn cubecl_phases(&self) -> Option<()> {
-            None
-        }
     }
     impl VerifyLayout for Backend {
         fn layout_validated_items_recording(
@@ -964,6 +957,7 @@ pub fn load_repo_from_walk(
         walk: walk_dur,
         backend: backend_dur,
         phases: backend.phases(),
+        #[cfg(feature = "cubecl")]
         cubecl: backend.cubecl_phases(),
         stage: stage_dur,
         layout: layout_dur,
@@ -1194,11 +1188,14 @@ impl RepoLoad {
                 // SAFETY: pointer was mapped by create_mapped_render_slots and outlives arena
                 unsafe { std::slice::from_raw_parts(addr as *const crate::glyph_scene::RenderSlot, len) }
             });
+        #[cfg(feature = "cubecl")]
         let tint_stream: Option<&[u32]> = if mapped_slots.is_none() {
             self.arena.device_slots().map(|d| d.tint.as_slice())
         } else {
             None
         };
+        #[cfg(not(feature = "cubecl"))]
+        let tint_stream: Option<&[u32]> = None;
         let chunks = if mapped_slots.is_none() && tint_stream.is_none() {
             self.arena.instance_chunks()
         } else {
