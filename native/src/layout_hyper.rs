@@ -152,12 +152,7 @@ fn is_static_zero_cp(cp: u32) -> bool {
     cp == 0x200D || (0xFE00..=0xFE0F).contains(&cp) || (0xE0020..=0xE007F).contains(&cp)
 }
 
-struct ResolvedChar {
-    glyph_id: u32,
-    advance: f32,
-    height: f32,
-    is_newline: bool,
-}
+type ResolvedChar = crate::atlas::AsciiFastEntry;
 
 #[inline(always)]
 fn resolve_leader(
@@ -269,8 +264,7 @@ impl LayoutGlyphs for HyperLayout {
     }
 
     fn load_trie_file(&mut self, _path: &Path) -> Result<(), LayoutError> {
-        let table = TrieTable::load(&crate::atlas_dir());
-        self.trie = Some(Arc::new(table));
+        self.trie = Some(crate::default_trie());
         Ok(())
     }
 
@@ -293,8 +287,7 @@ impl HyperLayout {
         let trie = match &self.trie {
             Some(t) => Arc::clone(t),
             None => {
-                let table = TrieTable::load(&crate::atlas_dir());
-                let arc = Arc::new(table);
+                let arc = crate::default_trie();
                 self.trie = Some(Arc::clone(&arc));
                 arc
             }
@@ -332,21 +325,20 @@ impl HyperLayout {
                 let mut pos = 0usize;
                 while pos < bytes.len() {
                     let lead = bytes[pos];
-                    let seq_len = sequence_length(lead);
-                    if seq_len == 0 {
-                        pos += 1;
-                        continue;
-                    }
-
-                    let r = resolve_leader(
-                        bytes,
-                        pos,
-                        seq_len,
-                        &trie,
-                        bitmap_adv,
-                        em_height_fu,
-                        &mut trailer_until,
-                    );
+                    let r = if lead < 128 && pos >= trailer_until {
+                        if let Some(fast) = trie.ascii_table[lead as usize] {
+                            fast
+                        } else {
+                            resolve_leader(bytes, pos, 1, &trie, bitmap_adv, em_height_fu, &mut trailer_until)
+                        }
+                    } else {
+                        let seq_len = sequence_length(lead);
+                        if seq_len == 0 {
+                            pos += 1;
+                            continue;
+                        }
+                        resolve_leader(bytes, pos, seq_len, &trie, bitmap_adv, em_height_fu, &mut trailer_until)
+                    };
 
                     let item_rel_x = if fold_unit > 0 { seg_adv as f64 } else { line_adv };
                     if item_rel_x > max_row_extent {
@@ -500,21 +492,20 @@ impl HyperLayout {
                 let mut span_idx = 0usize;
                 while pos < bytes.len() {
                     let lead = bytes[pos];
-                    let seq_len = sequence_length(lead);
-                    if seq_len == 0 {
-                        pos += 1;
-                        continue;
-                    }
-
-                    let r = resolve_leader(
-                        bytes,
-                        pos,
-                        seq_len,
-                        trie,
-                        bitmap_adv,
-                        em_height_fu,
-                        &mut trailer_until,
-                    );
+                    let r = if lead < 128 && pos >= trailer_until {
+                        if let Some(fast) = trie.ascii_table[lead as usize] {
+                            fast
+                        } else {
+                            resolve_leader(bytes, pos, 1, trie, bitmap_adv, em_height_fu, &mut trailer_until)
+                        }
+                    } else {
+                        let seq_len = sequence_length(lead);
+                        if seq_len == 0 {
+                            pos += 1;
+                            continue;
+                        }
+                        resolve_leader(bytes, pos, seq_len, trie, bitmap_adv, em_height_fu, &mut trailer_until)
+                    };
 
                     let wrap_segment = wrap_segment_of(col, p.wrap_width as i64, r.is_newline);
                     let wrap_row = wrap_row_of(col, p.wrap_width as i64, r.is_newline, p.wrap_mode);
@@ -716,21 +707,20 @@ impl HyperLayout {
                 let mut span_idx = 0usize;
                 while pos < bytes.len() {
                     let lead = bytes[pos];
-                    let seq_len = sequence_length(lead);
-                    if seq_len == 0 {
-                        pos += 1;
-                        continue;
-                    }
-
-                    let r = resolve_leader(
-                        bytes,
-                        pos,
-                        seq_len,
-                        trie,
-                        bitmap_adv,
-                        em_height_fu,
-                        &mut trailer_until,
-                    );
+                    let r = if lead < 128 && pos >= trailer_until {
+                        if let Some(fast) = trie.ascii_table[lead as usize] {
+                            fast
+                        } else {
+                            resolve_leader(bytes, pos, 1, trie, bitmap_adv, em_height_fu, &mut trailer_until)
+                        }
+                    } else {
+                        let seq_len = sequence_length(lead);
+                        if seq_len == 0 {
+                            pos += 1;
+                            continue;
+                        }
+                        resolve_leader(bytes, pos, seq_len, trie, bitmap_adv, em_height_fu, &mut trailer_until)
+                    };
 
                     let wrap_segment = wrap_segment_of(col, p.wrap_width as i64, r.is_newline);
                     let wrap_row = wrap_row_of(col, p.wrap_width as i64, r.is_newline, p.wrap_mode);
@@ -892,8 +882,7 @@ impl crate::layout::VerifyLayout for HyperLayout {
         let trie = match &self.trie {
             Some(t) => Arc::clone(t),
             None => {
-                let table = TrieTable::load(&crate::atlas_dir());
-                let arc = Arc::new(table);
+                let arc = crate::default_trie();
                 self.trie = Some(Arc::clone(&arc));
                 arc
             }
@@ -932,20 +921,20 @@ pub fn rederive_item_records(
         let mut pos = 0usize;
         while pos < bytes.len() {
             let lead = bytes[pos];
-            let seq_len = sequence_length(lead);
-            if seq_len == 0 {
-                pos += 1;
-                continue;
-            }
-            let r = resolve_leader(
-                bytes,
-                pos,
-                seq_len,
-                trie,
-                bitmap_adv,
-                em_height_fu,
-                &mut trailer_until,
-            );
+            let r = if lead < 128 && pos >= trailer_until {
+                if let Some(fast) = trie.ascii_table[lead as usize] {
+                    fast
+                } else {
+                    resolve_leader(bytes, pos, 1, trie, bitmap_adv, em_height_fu, &mut trailer_until)
+                }
+            } else {
+                let seq_len = sequence_length(lead);
+                if seq_len == 0 {
+                    pos += 1;
+                    continue;
+                }
+                resolve_leader(bytes, pos, seq_len, trie, bitmap_adv, em_height_fu, &mut trailer_until)
+            };
             let item_rel_x = if fold_unit > 0 { seg_adv as f64 } else { line_adv };
             if item_rel_x > max_row_extent {
                 max_row_extent = item_rel_x;
@@ -981,21 +970,20 @@ pub fn rederive_item_records(
     let mut pos = 0usize;
     while pos < bytes.len() {
         let lead = bytes[pos];
-        let seq_len = sequence_length(lead);
-        if seq_len == 0 {
-            pos += 1;
-            continue;
-        }
-
-        let r = resolve_leader(
-            bytes,
-            pos,
-            seq_len,
-            trie,
-            bitmap_adv,
-            em_height_fu,
-            &mut trailer_until,
-        );
+        let r = if lead < 128 && pos >= trailer_until {
+            if let Some(fast) = trie.ascii_table[lead as usize] {
+                fast
+            } else {
+                resolve_leader(bytes, pos, 1, trie, bitmap_adv, em_height_fu, &mut trailer_until)
+            }
+        } else {
+            let seq_len = sequence_length(lead);
+            if seq_len == 0 {
+                pos += 1;
+                continue;
+            }
+            resolve_leader(bytes, pos, seq_len, trie, bitmap_adv, em_height_fu, &mut trailer_until)
+        };
 
         let wrap_segment = wrap_segment_of(col, p.wrap_width as i64, r.is_newline);
         let wrap_row = wrap_row_of(col, p.wrap_width as i64, r.is_newline, p.wrap_mode);
