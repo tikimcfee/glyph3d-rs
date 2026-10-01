@@ -82,6 +82,15 @@ pub fn parse_cluster_mode(s: &str) -> fold::ClusterMode {
     }
 }
 
+/// `--color-mode` -> the repo syntax color mode.
+pub fn parse_color_mode(s: &str) -> crate::repo::ColorMode {
+    match s {
+        "syntax" => crate::repo::ColorMode::Syntax,
+        "flat" => crate::repo::ColorMode::Flat,
+        other => panic!("--color-mode: unknown mode {other:?} (clap should have refused it)"),
+    }
+}
+
 
 /// Long-form help tail: the mode summary + verb reference + windowed keys from
 /// the hand-rolled parser's --help (nothing user-facing was dropped).
@@ -216,6 +225,10 @@ pub struct Cli {
     /// explicitly.
     #[arg(long, value_name = "MODE", default_value = "cluster", value_parser = ["leader", "cluster"])]
     pub cluster_mode: String,
+    /// Syntax color mode on repo load: `syntax` (eager CPU lexer during load)
+    /// or `flat` (fast geometric load with extension-based LOD tint, awaiting external colorization)
+    #[arg(long, value_name = "MODE", default_value = "syntax", value_parser = ["syntax", "flat"])]
+    pub color_mode: String,
     /// Stage E2: frame the first file whose path contains SUBSTR
     #[arg(long, value_name = "SUBSTR")]
     pub focus_file: Option<String>,
@@ -529,6 +542,10 @@ mod cli_tests {
         assert_eq!(cli.cluster_mode, "cluster");
         assert_eq!(parse_cluster_mode(&cli.cluster_mode), fold::ClusterMode::Cluster);
         assert_eq!(parse_cluster_mode("leader"), fold::ClusterMode::Leader);
+        // Syntax color mode: syntax is the default to preserve golden images byte-identically.
+        assert_eq!(cli.color_mode, "syntax");
+        assert_eq!(parse_color_mode(&cli.color_mode), crate::repo::ColorMode::Syntax);
+        assert_eq!(parse_color_mode("flat"), crate::repo::ColorMode::Flat);
         assert!(!cli.repo_verify);
         assert!(cli.focus_file.is_none());
         assert!(!cli.repo_scan_only);
@@ -553,6 +570,7 @@ mod cli_tests {
             "2.5", "--no-cull", "--no-ui", "--load-repo", "fixtures/g-pick-repo",
             "--repo-engine", "batch", "--repo-verify", "--focus-file", "alpha",
             "--wrap-mode", "back", "--z-wrap-spacing", "0.6", "--cluster-mode", "cluster",
+            "--color-mode", "flat",
             "--render-file", "src/main.rs", "--engine-trie", "t.bin",
             "--engine-render", "c.rs",
             "--present-mode", "mailbox", "--gpu-key", "--gpu-profile",
@@ -577,6 +595,8 @@ mod cli_tests {
         assert_eq!(cli.z_wrap_spacing, 0.6);
         assert_eq!(cli.cluster_mode, "cluster");
         assert_eq!(parse_cluster_mode(&cli.cluster_mode), fold::ClusterMode::Cluster);
+        assert_eq!(cli.color_mode, "flat");
+        assert_eq!(parse_color_mode(&cli.color_mode), crate::repo::ColorMode::Flat);
         assert!(cli.repo_verify);
         assert_eq!(cli.focus_file.as_deref(), Some("alpha"));
         assert_eq!(cli.render_file, Some(PathBuf::from("src/main.rs")));
@@ -606,6 +626,16 @@ mod cli_tests {
             Err(e) => e.to_string(),
         };
         assert!(text.contains("grapheme"), "the error must name the bad value: {text}");
+    }
+
+    /// An unknown color mode is REFUSED at the boundary.
+    #[test]
+    fn an_unknown_color_mode_is_refused() {
+        let text = match try_parse(&["--color-mode", "neon"]) {
+            Ok(_) => panic!("clap must refuse an unknown color mode"),
+            Err(e) => e.to_string(),
+        };
+        assert!(text.contains("neon"), "the error must name the bad value: {text}");
     }
 
     /// Out-of-domain spacing is REFUSED at the boundary with the flag and the

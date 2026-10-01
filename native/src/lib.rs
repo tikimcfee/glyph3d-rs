@@ -56,6 +56,7 @@ pub enum SceneChoice {
         wrap_mode: fold::WrapMode,
         z_wrap_spacing: f64,
         cluster_mode: fold::ClusterMode,
+        color_mode: repo::ColorMode,
         emoji_sheet: PathBuf,
     },
 }
@@ -176,12 +177,14 @@ fn build_scene_impl(
             wrap_mode,
             z_wrap_spacing,
             cluster_mode,
+            color_mode,
             emoji_sheet,
         } => {
             let params = repo::RepoParams {
                 wrap_mode: *wrap_mode,
                 z_wrap_spacing: *z_wrap_spacing,
                 cluster_mode: *cluster_mode,
+                color_mode: *color_mode,
                 ..Default::default()
             };
             let t_visual_start = std::time::Instant::now();

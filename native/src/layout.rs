@@ -580,6 +580,34 @@ impl GlyphArena {
         std::borrow::Cow::Borrowed(self.instances())
     }
 
+    /// Update slot colors in-place for host or direct-mapped device slots.
+    /// Returns the number of slots updated.
+    pub fn update_slot_colors(&mut self, slot_base: usize, colors: &[u32]) -> usize {
+        if colors.is_empty() {
+            return 0;
+        }
+        if let Some(d) = &self.device {
+            if let Some(addr) = d.mapped_slots {
+                let count = colors.len().min(d.len.saturating_sub(slot_base));
+                let ptr = addr as *mut crate::glyph_scene::RenderSlot;
+                unsafe {
+                    for (i, &c) in colors.iter().take(count).enumerate() {
+                        (*ptr.add(slot_base + i)).color = c;
+                    }
+                }
+                count
+            } else {
+                0
+            }
+        } else {
+            let count = colors.len().min(self.instances.len().saturating_sub(slot_base));
+            for (i, &c) in colors.iter().take(count).enumerate() {
+                self.instances[slot_base + i].color = c;
+            }
+            count
+        }
+    }
+
     /// Hint the upper bound on slots still to come (records, before blanks are
     /// dropped). A hint only: the real count is lower and the arena grows.
     #[cfg(test)]
