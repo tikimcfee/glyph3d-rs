@@ -21,8 +21,18 @@
 //! integer arithmetic, and a unit test pins both on a known 2×2 image.
 
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, OnceLock};
 
 use crate::gpu::GpuContext;
+
+static DEFAULT_TRIE: OnceLock<Arc<TrieTable>> = OnceLock::new();
+
+/// Process-wide global accessor for the immutable font `TrieTable` (including its 2 KB L1-resident ASCII table).
+pub fn default_trie() -> Arc<TrieTable> {
+    DEFAULT_TRIE.get_or_init(|| {
+        Arc::new(TrieTable::load(&crate::atlas_dir()))
+    }).clone()
+}
 
 /// Both Slug textures are row-major, 1024 texels wide (slug-constants.js
 /// TEXTURE_WIDTH). Texel `i` lives at `(i % 1024, i / 1024)`.
@@ -91,6 +101,18 @@ pub struct TrieTable {
     /// once at load from the sequence section itself.
     // starts_a_sequence reads it per probe.
     seq_first: std::collections::HashSet<u32>,
+    /// Precomputed ASCII fast-path table for single-byte leaders (0..128).
+    pub ascii_table: [Option<AsciiFastEntry>; 128],
+}
+
+/// Precomputed fast-path metadata for single-byte ASCII characters (0x00..=0x7F).
+/// Fits in 16 bytes; the entire 128-entry table is 2 KB and stays L1-resident.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct AsciiFastEntry {
+    pub glyph_id: u32,
+    pub advance: f32,
+    pub height: f32,
+    pub is_newline: bool,
 }
 
 impl TrieTable {
@@ -156,7 +178,9 @@ impl TrieTable {
             .chunks_exact(2 + seq_max as usize)
             .map(|e| e[2])
             .collect();
-        let t = Self {
+        let mut ascii_table = [None; 128];
+        let em = metrics.em_height_fu;
+        let mut t = Self {
             metrics,
             block_shift,
             block_index,
@@ -170,7 +194,29 @@ impl TrieTable {
             seq_max,
             classes,
             seq_first,
+            ascii_table,
         };
+        for b in 0..128u8 {
+            let cp = b as u32;
+            if cp == 0x0A {
+                let entry = t.lookup(cp);
+                ascii_table[b as usize] = Some(AsciiFastEntry {
+                    glyph_id: 0,
+                    advance: crate::text::fu_to_world(entry.advance_fu, em),
+                    height: crate::text::fu_to_world(entry.height_fu, em),
+                    is_newline: true,
+                });
+            } else if !t.starts_a_sequence(cp) && !crate::fold::is_static_zero_cp(cp) {
+                let entry = t.lookup(cp);
+                ascii_table[b as usize] = Some(AsciiFastEntry {
+                    glyph_id: entry.glyph_id,
+                    advance: crate::text::fu_to_world(entry.advance_fu, em),
+                    height: crate::text::fu_to_world(entry.height_fu, em),
+                    is_newline: false,
+                });
+            }
+        }
+        t.ascii_table = ascii_table;
         // Sanity: 'A' must resolve to slot 34 / advance 1229 (FORMAT.md worked example).
         let a = t.lookup(0x41);
         assert_eq!((a.glyph_id, a.advance_fu), (34, 1229), "trie sanity check failed for 'A'");
@@ -970,8 +1016,23 @@ mod emoji_sheet_tests {
 mod trie_v2_tests {
     use super::*;
 
-    fn load() -> TrieTable {
-        TrieTable::load(&crate::atlas_dir())
+    fn load() -> Arc<TrieTable> {
+        default_trie()
+    }
+
+    #[test]
+    fn ascii_table_matches_trie_lookup() {
+        let t = default_trie();
+        let a_fast = t.ascii_table[b'A' as usize].expect("ASCII 'A' fast entry exists");
+        let a_slow = t.lookup(0x41);
+        let em = t.metrics.em_height_fu;
+        assert_eq!(a_fast.glyph_id, a_slow.glyph_id);
+        assert_eq!(a_fast.advance, crate::text::fu_to_world(a_slow.advance_fu, em));
+        assert!(!a_fast.is_newline);
+
+        let nl_fast = t.ascii_table[b'\n' as usize].expect("Newline fast entry exists");
+        assert_eq!(nl_fast.glyph_id, 0);
+        assert!(nl_fast.is_newline);
     }
 
     #[test]

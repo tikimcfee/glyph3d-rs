@@ -818,7 +818,7 @@ pub fn rederive_records(
     item: &ItemParams,
 ) -> std::io::Result<(Vec<GlyphRecord>, Vec<u8>)> {
     let bytes = std::fs::read(root.join(rel_path))?;
-    let trie = crate::atlas::TrieTable::load(&crate::atlas_dir());
+    let trie = crate::default_trie();
     let records = crate::layout_hyper::rederive_item_records(&bytes, item, &trie);
     Ok((records, bytes))
 }

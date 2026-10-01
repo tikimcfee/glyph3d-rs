@@ -28,6 +28,7 @@ pub mod cubecl_chain;
 #[cfg(feature = "cubecl")]
 pub mod cubecl_layout;
 
+pub use atlas::default_trie;
 pub use cli::{Op, parse_verb};
 pub use glyph_scene::{CameraMode, GlyphScene};
 pub use gpu::GpuContext;
