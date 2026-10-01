@@ -138,6 +138,8 @@ pub struct GlyphScene {
     pub(crate) instance_bufs: Vec<wgpu::Buffer>,
     /// Per-chunk byte offset of slot 0 inside the buffer (see above).
     pub(crate) chunk_offsets: Vec<u64>,
+    /// When mapped in host-visible memory, base pointer to the RenderSlot slice as usize.
+    pub(crate) mapped_slots: Option<usize>,
     /// Group table buffer, kept for partial per-row uploads (80 B/row).
     pub(crate) group_buf: wgpu::Buffer,
     /// CPU mirror of the group table — the pick path reads the LIVE TRS from
@@ -251,6 +253,7 @@ impl GlyphScene {
         let t_scene_start = std::time::Instant::now();
         let binding_limit = ctx.device.limits().max_storage_buffer_binding_size as usize;
         let instances_len = arena.len();
+        let mapped_slots = arena.device_slots().and_then(|d| d.mapped_slots);
         let (chunk_cap, chunk_counts, instance_bufs, chunk_offsets) =
             buffers::build_instance_buffers(ctx, &arena, instances_len);
         let upload_dur = t_scene_start.elapsed();
@@ -502,6 +505,7 @@ impl GlyphScene {
             cull,
             instance_bufs,
             chunk_offsets,
+            mapped_slots,
             group_buf,
             groups_cpu,
             pick,
@@ -519,6 +523,68 @@ impl GlyphScene {
             device: device.clone(),
             composite,
         }
+    }
+
+    /// Update slot colors in-place on the GPU.
+    /// If direct-mapped GPU memory is available (e.g. Apple Silicon Metal),
+    /// writes directly into host-visible mapped slots without queue uploads.
+    /// Otherwise, dispatches wgpu queue write_buffer commands.
+    pub fn write_slot_colors(&self, ctx: &GpuContext, slot_base: u32, colors: &[u32]) {
+        if colors.is_empty() {
+            return;
+        }
+        if let Some(addr) = self.mapped_slots {
+            let ptr = addr as *mut RenderSlot;
+            let total = self.instance_count as usize;
+            let base = slot_base as usize;
+            let count = colors.len().min(total.saturating_sub(base));
+            unsafe {
+                for (i, &c) in colors.iter().take(count).enumerate() {
+                    (*ptr.add(base + i)).color = c;
+                }
+            }
+        } else {
+            for (i, &color) in colors.iter().enumerate() {
+                let slot = slot_base + i as u32;
+                if slot >= self.instance_count {
+                    break;
+                }
+                let chunk = (slot / self.chunk_cap) as usize;
+                let local = (slot % self.chunk_cap) as u64;
+                let off = self.chunk_offsets[chunk] + local * 32 + 16;
+                ctx.queue.write_buffer(&self.instance_bufs[chunk], off, bytemuck::bytes_of(&color));
+            }
+        }
+    }
+
+    /// Recolors a file group in-place given its source bytes and AST/LSP byte spans.
+    /// Resolves survivor glyph slots using the provided engine trie and writes colors
+    /// directly to the GPU instance buffers.
+    /// Returns the number of slots recolored.
+    pub fn apply_file_spans(
+        &self,
+        ctx: &GpuContext,
+        group_id: u32,
+        file_bytes: &[u8],
+        spans: &[crate::layout::ByteSpan],
+        trie: &crate::atlas::TrieTable,
+    ) -> usize {
+        let (slot_base, slot_count) = if let Some(pctx) = &self.pick {
+            if let Some(f) = pctx.files.iter().find(|f| f.group_id == group_id) {
+                (f.slot_base, f.slot_count)
+            } else {
+                return 0;
+            }
+        } else if group_id == 0 {
+            (0, self.instance_count)
+        } else {
+            return 0;
+        };
+
+        let colors = crate::layout_hyper::resolve_spans_to_slot_colors(file_bytes, spans, trie);
+        let to_write = colors.len().min(slot_count as usize);
+        self.write_slot_colors(ctx, slot_base, &colors[..to_write]);
+        to_write
     }
 
     /// Camera eye/target for the mode at time `t` — the SINGLE source both
@@ -559,9 +625,12 @@ impl GlyphScene {
                 (r * 0.01, r * 20.0)
             }
             CameraMode::Fly => {
-                // Depth is test-only (nothing writes it), so a wide range is
-                // safe; near stays small enough for single-glyph closeups.
-                (0.05, (self.fit * 50.0).max(20_000.0))
+                // Fly depth conditioning: keep near at 0.05 for single-glyph
+                // closeups, while conditioning far to the scene bounds and distance
+                // from the field center to prevent f32 depth precision collapse and Z-fighting.
+                let d_center = (self.fly.eye - self.center).length();
+                let far = (d_center + self.fit * 4.0).clamp(20_000.0, 100_000.0);
+                (0.05, far)
             }
         };
         let (eye, target) = self.camera_eye_target(t, aspect);
@@ -912,6 +981,7 @@ impl GlyphScene {
                 [
                     (i.aabb_min[0] + i.aabb_max[0]) * 0.5,
                     (i.aabb_min[1] + i.aabb_max[1]) * 0.5,
+                    (i.aabb_min[2] + i.aabb_max[2]) * 0.5,
                 ]
             });
         let Some(cl) = center_local else {
@@ -921,7 +991,7 @@ impl GlyphScene {
         let c = DVec3::new(
             cl[0] as f64 * sc.x as f64 + off.x as f64,
             cl[1] as f64 * sc.y as f64 + off.y as f64,
-            off.z as f64,
+            cl[2] as f64 * sc.z as f64 + off.z as f64,
         );
         let hit_plane = |o: DVec3, d: DVec3| -> Option<DVec3> {
             let denom = d.dot(fwd);

@@ -306,6 +306,8 @@ pub struct RepoParams {
     pub cluster_mode: crate::fold::ClusterMode,
     /// Spatial arrangement mode for the repository files across the canvas.
     pub layout_mode: RepoLayoutMode,
+    /// Colorization strategy during load: `Syntax` (eager CPU lexer) or `Flat` (fast geometric load).
+    pub color_mode: ColorMode,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -315,6 +317,17 @@ pub enum RepoLayoutMode {
     Shelf,
     /// Hierarchical directory-based neighborhood carrels.
     Carrel,
+}
+
+/// Colorization strategy during repo load.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum ColorMode {
+    /// Eager CPU syntax coloring during load via colorize_leaders (default, preserves all goldens).
+    #[default]
+    Syntax,
+    /// Fast geometric ingestion: uniform base color for glyphs, file-extension map for LOD backdrop tint.
+    /// Defers per-glyph syntax coloring to external/asynchronous flows.
+    Flat,
 }
 
 impl Default for RepoParams {
@@ -333,6 +346,7 @@ impl Default for RepoParams {
             wrap_mode: crate::fold::WrapMode::Back,
             cluster_mode: crate::fold::ClusterMode::Leader,
             layout_mode: RepoLayoutMode::Shelf,
+            color_mode: ColorMode::Syntax,
         }
     }
 }
@@ -453,6 +467,7 @@ pub struct RepoLoad {
     pub bounds_min: [f32; 3],
     pub bounds_max: [f32; 3],
     pub stats: LoadStats,
+    pub color_mode: ColorMode,
     /// Stage G: repo root + engine trie — the pick path re-reads/re-runs
     /// individual files from these.
     pub root: PathBuf,
@@ -484,6 +499,29 @@ pub(crate) fn dir_tint(dir: &str) -> [f32; 3] {
         h = h.wrapping_mul(0x0100_0193);
     }
     DIR_TINTS[(h as usize) % DIR_TINTS.len()]
+}
+
+/// O(1) file-extension LOD backdrop tint map (in linear sRGB space).
+pub fn extension_tint(path: &str) -> [f32; 3] {
+    let ext = std::path::Path::new(path)
+        .extension()
+        .and_then(|s| s.to_str())
+        .unwrap_or("");
+    match ext {
+        "rs" => [0.85, 0.40, 0.20],                   // Rust orange
+        "js" | "mjs" | "cjs" => [0.95, 0.85, 0.20],   // JavaScript yellow
+        "ts" | "tsx" => [0.20, 0.50, 0.85],           // TypeScript blue
+        "json" => [0.90, 0.75, 0.30],                 // JSON amber
+        "md" | "markdown" => [0.40, 0.60, 0.80],      // Markdown steel blue
+        "toml" | "yaml" | "yml" => [0.70, 0.40, 0.60],// Config purple
+        "py" => [0.25, 0.65, 0.55],                   // Python teal
+        "c" | "h" | "cpp" | "hpp" | "cc" => [0.35, 0.55, 0.85], // C/C++ navy blue
+        "go" => [0.20, 0.70, 0.85],                   // Go cyan
+        "sh" | "bash" | "zsh" => [0.45, 0.75, 0.45],  // Shell green
+        "html" | "htm" => [0.90, 0.45, 0.25],         // HTML orange-red
+        "css" | "scss" | "less" => [0.30, 0.55, 0.90],// CSS blue
+        _ => [0.75, 0.75, 0.75],                      // Neutral grey
+    }
 }
 
 /// Packed SHELF layout, classed by height: files are stably partitioned into
@@ -834,12 +872,19 @@ pub fn load_repo_from_walk(
     // computed here and handed across the seam rather than applied to the
     // instances afterwards: compaction destroys the index that names a byte
     // (the argument is at `layout::Paint`).
-    let t = Instant::now();
-    let sp_paint = tracing::info_span!("repo.paint").entered();
-    let file_bytes: Vec<&[u8]> = walk.files.iter().map(|f| f.bytes.as_slice()).collect();
-    let colors = paint_files(&file_bytes);
-    let mut stage_dur = t.elapsed();
-    drop(sp_paint);
+    let mut stage_dur = std::time::Duration::ZERO;
+    let colors = match params.color_mode {
+        ColorMode::Syntax => {
+            let t = Instant::now();
+            let sp_paint = tracing::info_span!("repo.paint").entered();
+            let file_bytes: Vec<&[u8]> = walk.files.iter().map(|f| f.bytes.as_slice()).collect();
+            let c = paint_files(&file_bytes);
+            stage_dur += t.elapsed();
+            drop(sp_paint);
+            Some(c)
+        }
+        ColorMode::Flat => None,
+    };
 
     let items: Vec<LayoutItem<'_>> = walk
         .files
@@ -849,7 +894,10 @@ pub fn load_repo_from_walk(
             bytes: &f.bytes,
             params: file_params[index],
             group_id: index as u32,
-            paint: Paint::PerRecord(&colors[index]),
+            paint: match &colors {
+                Some(c) => Paint::PerRecord(&c[index]),
+                None => Paint::Flat(crate::layout::DEFAULT_COLOR_PACKED),
+            },
         })
         .collect();
 
@@ -1105,6 +1153,7 @@ pub fn load_repo_from_walk(
         bounds_min,
         bounds_max,
         stats,
+        color_mode: params.color_mode,
         root: root.to_path_buf(),
         trie: trie.to_path_buf(),
     }
@@ -1322,36 +1371,45 @@ impl RepoLoad {
         } else {
             Vec::new()
         };
+        let is_flat = self.color_mode == ColorMode::Flat;
         let file_tints = self.arena.device_slots().map(|d| &d.file_tints);
         let seg_of = |v: &FileView| {
-            let fast_tint = file_tints.and_then(|t| t.get(v.group_id as usize));
-            let tint = match fast_tint {
-                Some(acc) if !acc.has_emoji => {
-                    let accum = crate::glyph_scene::SegTintAccum::from_parts(acc.sum, acc.cells, slot_ink);
-                    accum.finish(v.slot_count, v.width, v.height)
-                }
-                _ => {
-                    // The file's slot range folded in arena order: chunk slices
-                    // ascend and concatenate exactly, so a range that straddles a
-                    // chunk boundary tints bit-identically to the contiguous fold.
-                    let mut tint = crate::glyph_scene::SegTintAccum::new(slot_ink);
-                    let want = v.slot_base..v.slot_base + v.slot_count;
-                    if let Some(slots) = mapped_slots {
-                        tint.add_slots(&slots[want]);
-                    } else if let Some(tp) = tint_stream {
-                        tint.add_tint(&tp[want.start * 2..want.end * 2]);
-                    } else {
-                        let mut base = 0usize;
-                        for chunk in &chunks {
-                            let lo = want.start.max(base);
-                            let hi = want.end.min(base + chunk.len());
-                            if lo < hi {
-                                tint.add(&chunk[lo - base..hi - base]);
-                            }
-                            base += chunk.len();
-                        }
+            let tint = if is_flat {
+                let area = (v.width as f64 * v.height as f64).max(1e-3);
+                let ink_frac = (v.slot_count as f64 * crate::glyph_scene::GLYPH_CELL_AREA as f64 / area).min(1.0);
+                let e = (ink_frac * crate::glyph_scene::BACKDROP_GAIN as f64).min(1.0);
+                let rgb = extension_tint(&v.rel_path);
+                [rgb[0], rgb[1], rgb[2], e as f32]
+            } else {
+                let fast_tint = file_tints.and_then(|t| t.get(v.group_id as usize));
+                match fast_tint {
+                    Some(acc) if !acc.has_emoji => {
+                        let accum = crate::glyph_scene::SegTintAccum::from_parts(acc.sum, acc.cells, slot_ink);
+                        accum.finish(v.slot_count, v.width, v.height)
                     }
-                    tint.finish(v.slot_count, v.width, v.height)
+                    _ => {
+                        // The file's slot range folded in arena order: chunk slices
+                        // ascend and concatenate exactly, so a range that straddles a
+                        // chunk boundary tints bit-identically to the contiguous fold.
+                        let mut tint = crate::glyph_scene::SegTintAccum::new(slot_ink);
+                        let want = v.slot_base..v.slot_base + v.slot_count;
+                        if let Some(slots) = mapped_slots {
+                            tint.add_slots(&slots[want]);
+                        } else if let Some(tp) = tint_stream {
+                            tint.add_tint(&tp[want.start * 2..want.end * 2]);
+                        } else {
+                            let mut base = 0usize;
+                            for chunk in &chunks {
+                                let lo = want.start.max(base);
+                                let hi = want.end.min(base + chunk.len());
+                                if lo < hi {
+                                    tint.add(&chunk[lo - base..hi - base]);
+                                }
+                                base += chunk.len();
+                            }
+                        }
+                        tint.finish(v.slot_count, v.width, v.height)
+                    }
                 }
             };
             crate::glyph_scene::SegCull {
@@ -1390,8 +1448,8 @@ impl RepoLoad {
                 slot_base: v.slot_base as u32,
                 slot_count: v.slot_count as u32,
                 item: v.item,
-                aabb_min: [-0.3, -v.height - 0.5],
-                aabb_max: [v.width + 0.6, 0.75],
+                aabb_min: [-0.3, -v.height - 0.5, v.z_min - 0.1],
+                aabb_max: [v.width + 0.6, 0.75, v.z_max + 0.1],
             })
             .collect();
         let mut focus_bounds = None;

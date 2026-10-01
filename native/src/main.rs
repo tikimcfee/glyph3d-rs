@@ -34,7 +34,7 @@
 
 use clap::CommandFactory;
 use glyph3d_native::cli::{
-    default_text_file, parse_cli, parse_cluster_mode, parse_layout_mode, parse_present_mode,
+    default_text_file, parse_cli, parse_cluster_mode, parse_color_mode, parse_layout_mode, parse_present_mode,
     parse_strategy, parse_wrap_mode, Cli,
 };
 use glyph3d_native::*;
@@ -156,6 +156,7 @@ fn main() {
             wrap_mode: parse_wrap_mode(&cli.wrap_mode),
             z_wrap_spacing: cli.z_wrap_spacing,
             cluster_mode: parse_cluster_mode(&cli.cluster_mode),
+            color_mode: parse_color_mode(&cli.color_mode),
             ..Default::default()
         };
         let load = repo::load_repo(
@@ -182,6 +183,7 @@ fn main() {
             z_wrap_spacing: cli.z_wrap_spacing,
             cluster_mode: parse_cluster_mode(&cli.cluster_mode),
             layout_mode: parse_layout_mode(&cli.layout_mode),
+            color_mode: parse_color_mode(&cli.color_mode),
             emoji_sheet,
         }
     } else if let Some(file) = &cli.engine_render {

@@ -1120,6 +1120,48 @@ pub fn rederive_item_records(
     records
 }
 
+/// Resolves an AST/LSP byte-span color stream into the exact packed RGBA8 colors
+/// corresponding to survivor glyph slots (non-blank printable characters).
+pub fn resolve_spans_to_slot_colors(
+    bytes: &[u8],
+    spans: &[crate::layout::ByteSpan],
+    trie: &TrieTable,
+) -> Vec<u32> {
+    let em_height_fu = trie.metrics.em_height_fu;
+    let bitmap_adv = fu_to_world(trie.bitmap_advance_fu, em_height_fu);
+    let mut colors = Vec::new();
+    let mut pos = 0usize;
+    let mut span_idx = 0usize;
+    let mut trailer_until = 0usize;
+
+    while pos < bytes.len() {
+        let r = match resolve_byte_char(bytes, pos, trie, bitmap_adv, em_height_fu, &mut trailer_until) {
+            Some(r) => r,
+            None => {
+                pos += 1;
+                continue;
+            }
+        };
+
+        if r.glyph_id != 0 {
+            let p = pos as u32;
+            while span_idx < spans.len() && p >= spans[span_idx].end {
+                span_idx += 1;
+            }
+            let color = if span_idx < spans.len() && p >= spans[span_idx].start {
+                spans[span_idx].color
+            } else {
+                crate::layout::DEFAULT_COLOR_PACKED
+            };
+            colors.push(color);
+        }
+
+        pos += 1;
+    }
+
+    colors
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1198,6 +1240,64 @@ mod tests {
         assert_eq!(instances[1].color, 0x1111_1111);
         // ' ' is dropped/blank, 'm' is default color
         assert_eq!(instances[2].color, crate::layout::DEFAULT_COLOR_PACKED);
+    }
+
+    #[test]
+    fn resolve_spans_and_inplace_update_slot_colors() {
+        use crate::layout::ByteSpan;
+        let text = b"fn main() {\n    let x = 42;\n}\n";
+        let spans = [
+            ByteSpan { start: 0, end: 2, color: 0x1111_1111 },  // "fn"
+            ByteSpan { start: 16, end: 19, color: 0x2222_2222 }, // "let"
+            ByteSpan { start: 24, end: 26, color: 0x3333_3333 }, // "42"
+        ];
+        let trie_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../assets/atlas/engine-trie.bin");
+        let mut hyper = HyperLayout::new();
+        hyper.load_trie_file(&trie_path).expect("hyper trie");
+        let trie = crate::default_trie();
+
+        // 1. Layout directly with Paint::ByteSpans
+        let item_spanned = LayoutItem {
+            bytes: text,
+            params: ItemParams { line_height: 1.25, ..Default::default() },
+            group_id: 0,
+            paint: Paint::ByteSpans(&spans),
+        };
+        let mut arena_spanned = GlyphArena::new();
+        let places_spanned = hyper
+            .layout_items(&[item_spanned], &mut arena_spanned)
+            .expect("layout spanned");
+
+        // 2. Layout with Paint::Flat
+        let item_flat = LayoutItem {
+            bytes: text,
+            params: ItemParams { line_height: 1.25, ..Default::default() },
+            group_id: 0,
+            paint: Paint::Flat(crate::layout::DEFAULT_COLOR_PACKED),
+        };
+        let mut arena_flat = GlyphArena::new();
+        let places_flat = hyper
+            .layout_items(&[item_flat], &mut arena_flat)
+            .expect("layout flat");
+
+        assert_eq!(places_flat[0].slot_count, places_spanned[0].slot_count);
+
+        // 3. Resolve spans to slot colors
+        let resolved = resolve_spans_to_slot_colors(text, &spans, &trie);
+        assert_eq!(resolved.len(), places_flat[0].slot_count as usize);
+
+        // Verify resolved colors exactly match the layout-time Paint::ByteSpans colors
+        let spanned_colors: Vec<u32> = arena_spanned.instances().iter().map(|s| s.color).collect();
+        assert_eq!(resolved, spanned_colors);
+
+        // 4. Update flat arena in-place
+        let updated = arena_flat.update_slot_colors(places_flat[0].slot_base as usize, &resolved);
+        assert_eq!(updated, resolved.len());
+
+        // Verify arena_flat now has identical colors to arena_spanned
+        let flat_updated_colors: Vec<u32> = arena_flat.instances().iter().map(|s| s.color).collect();
+        assert_eq!(flat_updated_colors, spanned_colors);
     }
 }
 

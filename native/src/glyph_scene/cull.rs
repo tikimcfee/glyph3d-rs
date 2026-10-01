@@ -62,14 +62,15 @@ pub struct SegCull {
 /// feeds the backdrop haze alpha, never any layout decision.
 pub const GLYPH_CELL_AREA: f32 = (1229.0 / 2320.0) * 1.25;
 
-/// Stage F — one far-LOD backdrop quad, 32 B, mirrors `BackdropInst` in
-/// cull.wgsl: world rect + premultiplied-ready color (rgb linear, a = E).
+/// Stage F — one far-LOD backdrop quad, 48 B, mirrors `BackdropInst` in
+/// cull.wgsl: world rect + premultiplied-ready color (rgb linear, a = E) + far-Z reading depth.
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 pub(super) struct BackdropInst {
     min: [f32; 2],
     max: [f32; 2],
     rgba: [f32; 4],
+    depth: [f32; 4],
 }
 
 /// Stage L (L2): draw phases — re_renderer's DrawPhase borrow (a flat enum
@@ -173,11 +174,12 @@ pub(super) fn cull_segments(
         if glyph_px < lod_min_px {
             if seg.slot_count > 0 {
                 backdrops.push(BackdropInst {
-                    // Backdrops are flat quads; BackdropInst IS a GPU struct
-                    // and stays 2D. Only the cull arithmetic needs depth.
+                    // Backdrops are flat quads anchored at the file space's
+                    // far-Z reading surface (seg.min[2]).
                     min: [seg.min[0], seg.min[1]],
                     max: [seg.max[0], seg.max[1]],
                     rgba: seg.tint,
+                    depth: [seg.min[2], 0.0, 0.0, 0.0],
                 });
             }
             continue;
@@ -281,10 +283,10 @@ impl CullState {
         for (i, seg) in segments.iter().enumerate() {
             let off = groups
                 .get(i)
-                .map(|g| [g.cols[0][0], g.cols[0][1]])
-                .unwrap_or([0.0, 0.0]);
-            local_min.push([seg.min[0] - off[0], seg.min[1] - off[1], seg.min[2]]);
-            local_max.push([seg.max[0] - off[0], seg.max[1] - off[1], seg.max[2]]);
+                .map(|g| [g.cols[0][0], g.cols[0][1], g.cols[0][2]])
+                .unwrap_or([0.0, 0.0, 0.0]);
+            local_min.push([seg.min[0] - off[0], seg.min[1] - off[1], seg.min[2] - off[2]]);
+            local_max.push([seg.max[0] - off[0], seg.max[1] - off[1], seg.max[2] - off[2]]);
             base_tint.push(seg.tint);
             orig_group_rgb.push(
                 groups
@@ -294,16 +296,17 @@ impl CullState {
             );
         }
 
+        let backdrop_stride = std::mem::size_of::<BackdropInst>() as u64;
         let backdrop_insts_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("backdrop instances"),
-            size: (seg_count.max(1) * 32) as u64,
+            size: seg_count.max(1) as u64 * backdrop_stride,
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
         log::info!(
             "cull: {} segments (CPU frustum+LOD) | backdrop buffer {} B (KB-scale, no instance-sized buffers added)",
             seg_count,
-            seg_count * 32,
+            seg_count as u64 * backdrop_stride,
         );
 
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -516,6 +519,19 @@ mod cull_depth_tests {
             !drew_glyphs(&d) && !d.backdrops.is_empty(),
             "a segment 50 units away in z was drawn at full detail: the LOD \
              distance is ignoring depth"
+        );
+    }
+
+    #[test]
+    fn backdrop_quad_anchors_to_far_z() {
+        assert_eq!(std::mem::size_of::<BackdropInst>(), 48);
+        let s = seg([-1.0, -1.0, -50.0], [1.0, 1.0, -40.0]);
+        let v = view_clipping_behind_z(-1.0e6, Vec3::new(0.0, 0.0, 0.0), 100.0);
+        let d = cull_segments(&[s], &[false], &v, 1024, 1);
+        assert_eq!(d.backdrops.len(), 1);
+        assert_eq!(
+            d.backdrops[0].depth[0], -50.0,
+            "backdrop must anchor to seg.min[2] far-z reading surface"
         );
     }
 }

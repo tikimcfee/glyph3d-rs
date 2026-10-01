@@ -126,8 +126,8 @@ impl GlyphScene {
                     .map(|f| UiFileRow {
                         rel_path: f.rel_path.clone(),
                         group_id: f.group_id,
-                        aabb_min: f.aabb_min,
-                        aabb_max: f.aabb_max,
+                        aabb_min: [f.aabb_min[0], f.aabb_min[1]],
+                        aabb_max: [f.aabb_max[0], f.aabb_max[1]],
                     })
                     .collect()
             })
