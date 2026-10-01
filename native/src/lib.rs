@@ -19,9 +19,13 @@
 pub mod atlas;
 pub mod bake;
 pub mod cli;
+#[cfg(feature = "cubecl")]
 pub mod cubecl_chain;
+#[cfg(feature = "cubecl")]
 pub mod cubecl_layout;
+#[cfg(feature = "cubecl")]
 pub mod cubecl_scan;
+#[cfg(feature = "cubecl")]
 pub mod cubecl_smoke;
 pub mod fixture;
 pub mod fold;
