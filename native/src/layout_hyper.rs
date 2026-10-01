@@ -498,6 +498,7 @@ impl HyperLayout {
                 let out_ptr = unsafe { (dest_addr as *mut RenderSlot).add(slot_base as usize) };
 
                 let mut pos = 0usize;
+                let mut span_idx = 0usize;
                 while pos < bytes.len() {
                     let lead = bytes[pos];
                     let seq_len = sequence_length(lead);
@@ -575,6 +576,17 @@ impl HyperLayout {
                             }
                         }
                         Paint::Flat(c) => c,
+                        Paint::ByteSpans(spans) => {
+                            let p = pos as u32;
+                            while span_idx < spans.len() && p >= spans[span_idx].end {
+                                span_idx += 1;
+                            }
+                            if span_idx < spans.len() && p >= spans[span_idx].start {
+                                spans[span_idx].color
+                            } else {
+                                crate::layout::DEFAULT_COLOR_PACKED
+                            }
+                        }
                     };
 
                     if r.glyph_id != 0 {
@@ -702,6 +714,7 @@ impl HyperLayout {
                 let out_ptr = unsafe { (dest_addr as *mut GlyphInstance).add(slot_base as usize) };
 
                 let mut pos = 0usize;
+                let mut span_idx = 0usize;
                 while pos < bytes.len() {
                     let lead = bytes[pos];
                     let seq_len = sequence_length(lead);
@@ -779,6 +792,17 @@ impl HyperLayout {
                             }
                         }
                         Paint::Flat(c) => c,
+                        Paint::ByteSpans(spans) => {
+                            let p = pos as u32;
+                            while span_idx < spans.len() && p >= spans[span_idx].end {
+                                span_idx += 1;
+                            }
+                            if span_idx < spans.len() && p >= spans[span_idx].start {
+                                spans[span_idx].color
+                            } else {
+                                crate::layout::DEFAULT_COLOR_PACKED
+                            }
+                        }
                     };
 
                     if r.glyph_id != 0 {
@@ -1081,6 +1105,38 @@ mod tests {
         assert_eq!(hyper_places[2].record_count, 13);
         assert_eq!(hyper_places[2].slot_count, 9);
         assert_eq!(hyper_places[2].slot_base, 45);
+    }
+
+    #[test]
+    fn hyper_byte_spans_painting() {
+        use crate::layout::ByteSpan;
+        let text = b"fn main() {\n    let x = 42;\n}\n";
+        let spans = [
+            ByteSpan { start: 0, end: 2, color: 0x1111_1111 },  // "fn"
+            ByteSpan { start: 16, end: 19, color: 0x2222_2222 }, // "let"
+            ByteSpan { start: 24, end: 26, color: 0x3333_3333 }, // "42"
+        ];
+        let item = LayoutItem {
+            bytes: text,
+            params: ItemParams { line_height: 1.25, ..Default::default() },
+            group_id: 0,
+            paint: Paint::ByteSpans(&spans),
+        };
+        let mut hyper = HyperLayout::new();
+        let trie_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../assets/atlas/engine-trie.bin");
+        hyper.load_trie_file(&trie_path).expect("hyper trie");
+        let mut arena = GlyphArena::new();
+        let places = hyper
+            .layout_items(&[item], &mut arena)
+            .expect("hyper layout");
+        assert_eq!(places.len(), 1);
+        let instances = arena.instances();
+        // Instance 0 is 'f', 1 is 'n': color should be 0x1111_1111
+        assert_eq!(instances[0].color, 0x1111_1111);
+        assert_eq!(instances[1].color, 0x1111_1111);
+        // ' ' is dropped/blank, 'm' is default color
+        assert_eq!(instances[2].color, crate::layout::DEFAULT_COLOR_PACKED);
     }
 }
 

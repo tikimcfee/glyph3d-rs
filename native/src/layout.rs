@@ -306,13 +306,25 @@ impl ItemParams {
 /// longer says which record — or which byte — it came from. So a backend
 /// paints during compaction or not at all, and that holds whether the
 /// compaction runs in a `for` loop or in a stream-compaction kernel.
+/// A byte range `[start..end)` painted with a packed RGBA8 color.
+/// Designed for AST (e.g. Tree-sitter) and LSP semantic tokens.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ByteSpan {
+    pub start: u32,
+    pub end: u32,
+    pub color: u32,
+}
+
 #[derive(Clone, Copy)]
 pub enum Paint<'a> {
     /// Every glyph the same packed RGBA8.
     Flat(u32),
-    /// One packed RGBA8 per RECORD, in record order — `colorize_leaders`'s
-    /// output. Must be exactly as long as the item's record stream.
+    /// One packed RGBA8 per RECORD, in record order — legacy format.
+    /// Must be exactly as long as the item's record stream.
     PerRecord(&'a [u32]),
+    /// Non-overlapping byte ranges in ascending order — AST/LSP format.
+    #[allow(dead_code)]
+    ByteSpans(&'a [ByteSpan]),
 }
 
 /// One item to lay out: the bytes, how to lay them out, how to paint them, and
@@ -957,6 +969,7 @@ pub(crate) fn compact_records_into(
             color: match paint {
                 Paint::Flat(rgba) => rgba,
                 Paint::PerRecord(colors) => colors[index],
+                Paint::ByteSpans(_) => DEFAULT_COLOR_PACKED,
             },
             group_id,
             advance: record.advance(),
