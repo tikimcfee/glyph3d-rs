@@ -32,6 +32,10 @@ pub struct UiProbeState {
     // rule there. ──
     /// Live LOD threshold in px/em (const default: LOD_MIN_PX = 1.0).
     pub lod_min_px: f32,
+    /// Live file background cards toggle.
+    pub file_backgrounds: bool,
+    /// Live file background cards color.
+    pub file_bg_color: [f32; 4],
     // ── K4: live cull readouts (scene → UI; the same sums GLYPH_CULL_DEBUG
     // prints). Zero when culling is disabled (--no-cull). ──
     pub cull_ranges: usize,
@@ -146,8 +150,15 @@ impl GlyphScene {
             .and_then(|p| p.files.first())
             .map(|f| f.item.cluster_mode == crate::fold::ClusterMode::Cluster)
             .or(self.probe_cluster_mode);
+        let (file_backgrounds, file_bg_color, lod_min_px) = self
+            .cull
+            .as_ref()
+            .map(|c| (c.file_backgrounds.get(), c.file_bg_color.get(), c.lod_min_px.get()))
+            .unwrap_or((false, crate::DEFAULT_FILE_BG_COLOR, LOD_MIN_PX));
         let probe = UiProbe::new(std::cell::RefCell::new(UiProbeState {
-            lod_min_px: LOD_MIN_PX,
+            lod_min_px,
+            file_backgrounds,
+            file_bg_color,
             files: std::rc::Rc::new(files),
             file_dyn,
             z_wrap_spacing,

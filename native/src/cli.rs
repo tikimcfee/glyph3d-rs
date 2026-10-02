@@ -91,6 +91,21 @@ pub fn parse_color_mode(s: &str) -> crate::repo::ColorMode {
     }
 }
 
+/// Parse comma-separated RGBA float string into `[f32; 4]`
+pub fn parse_rgba(s: &str) -> Result<[f32; 4], String> {
+    let clean = s.trim().trim_start_matches('[').trim_end_matches(']').trim_matches('"');
+    let parts: Vec<&str> = clean.split(',').map(|p| p.trim()).collect();
+    if parts.len() != 4 {
+        return Err(format!("expected 4 comma-separated floats [r,g,b,a], got '{s}'"));
+    }
+    let mut out = [0.0f32; 4];
+    for (i, p) in parts.iter().enumerate() {
+        out[i] = p.parse::<f32>().map_err(|e| format!("invalid float '{p}': {e}"))?;
+    }
+    Ok(out)
+}
+
+
 
 /// Long-form help tail: the mode summary + verb reference + windowed keys from
 /// the hand-rolled parser's --help (nothing user-facing was dropped).
@@ -241,6 +256,18 @@ pub struct Cli {
     /// Stage K: windowed without the egui UI overlay (exact pre-K behavior)
     #[arg(long)]
     pub no_ui: bool,
+    /// Path to launch configuration file (default: looks for launch_config.toml if present)
+    #[arg(long, value_name = "PATH")]
+    pub launch_config: Option<PathBuf>,
+    /// Render file background cards behind glyph fields
+    #[arg(long)]
+    pub file_backgrounds: bool,
+    /// File background card RGBA color (e.g. "0.10,0.10,0.13,0.85")
+    #[arg(long, value_name = "R,G,B,A", value_parser = parse_rgba)]
+    pub file_bg_color: Option<[f32; 4]>,
+    /// Override the initial LOD minimum pixel threshold (default: 1.0)
+    #[arg(long, value_name = "F")]
+    pub lod_min_px: Option<f32>,
     /// Stage K (K6): windowed only — capture the frame after N frames have
     /// rendered (requires --screenshot-out; the app KEEPS RUNNING afterward —
     /// unlike --screenshot it never exits)
@@ -473,6 +500,95 @@ fn build_ops(matches: &clap::ArgMatches, raw: &RawOps) -> Vec<Op> {
 fn parse_cli_from(matches: clap::ArgMatches) -> Cli {
     let mut cli = Cli::from_arg_matches(&matches).expect("clap derive round-trip");
     cli.ops = build_ops(&matches, &cli.raw_ops);
+
+    let config_path = if let Some(path) = &cli.launch_config {
+        Some(path.clone())
+    } else if cli.screenshot.is_none() && Path::new("launch_config.toml").is_file() {
+        Some(PathBuf::from("launch_config.toml"))
+    } else {
+        None
+    };
+
+    if let Some(path) = config_path {
+        match crate::launch_config::LaunchConfig::from_file(&path) {
+            Ok(cfg) => {
+                if matches.value_source("file_backgrounds")
+                    != Some(clap::parser::ValueSource::CommandLine)
+                {
+                    if let Some(fb) = cfg.file_backgrounds {
+                        cli.file_backgrounds = fb;
+                    }
+                }
+                if matches.value_source("file_bg_color")
+                    != Some(clap::parser::ValueSource::CommandLine)
+                {
+                    if let Some(col) = cfg.file_bg_color {
+                        cli.file_bg_color = Some(col);
+                    }
+                }
+                if matches.value_source("lod_min_px")
+                    != Some(clap::parser::ValueSource::CommandLine)
+                {
+                    if let Some(lod) = cfg.lod_min_px {
+                        cli.lod_min_px = Some(lod);
+                    }
+                }
+                if matches.value_source("wrap_mode")
+                    != Some(clap::parser::ValueSource::CommandLine)
+                {
+                    if let Some(wm) = cfg.wrap_mode {
+                        cli.wrap_mode = wm;
+                    }
+                }
+                if matches.value_source("z_wrap_spacing")
+                    != Some(clap::parser::ValueSource::CommandLine)
+                {
+                    if let Some(zw) = cfg.z_wrap_spacing {
+                        cli.z_wrap_spacing = zw;
+                    }
+                }
+                if matches.value_source("cluster_mode")
+                    != Some(clap::parser::ValueSource::CommandLine)
+                {
+                    if let Some(cm) = cfg.cluster_mode {
+                        cli.cluster_mode = cm;
+                    }
+                }
+                if matches.value_source("color_mode")
+                    != Some(clap::parser::ValueSource::CommandLine)
+                {
+                    if let Some(cm) = cfg.color_mode {
+                        cli.color_mode = cm;
+                    }
+                }
+                if matches.value_source("no_cull")
+                    != Some(clap::parser::ValueSource::CommandLine)
+                {
+                    if let Some(nc) = cfg.no_cull {
+                        cli.no_cull = nc;
+                    }
+                }
+                if matches.value_source("no_ui")
+                    != Some(clap::parser::ValueSource::CommandLine)
+                {
+                    if let Some(nu) = cfg.no_ui {
+                        cli.no_ui = nu;
+                    }
+                }
+                if matches.value_source("load_repo")
+                    != Some(clap::parser::ValueSource::CommandLine)
+                {
+                    if let Some(lr) = cfg.load_repo {
+                        cli.load_repo = Some(lr);
+                    }
+                }
+            }
+            Err(e) => {
+                log::warn!("{e}");
+            }
+        }
+    }
+
     cli
 }
 
@@ -551,6 +667,10 @@ mod cli_tests {
         assert!(!cli.repo_scan_only);
         assert!(!cli.no_cull);
         assert!(!cli.no_ui);
+        assert!(cli.launch_config.is_none());
+        assert!(!cli.file_backgrounds);
+        assert!(cli.file_bg_color.is_none());
+        assert!(cli.lod_min_px.is_none());
         assert!(cli.screenshot_frame.is_none());
         assert!(cli.screenshot_out.is_none());
         assert!(cli.ops.is_empty());
@@ -567,7 +687,10 @@ mod cli_tests {
     fn scalar_flags_parse() {
         let cli = parse(&[
             "--screenshot", "out.png", "--frames", "2", "--demo", "--copies", "3", "--zoom",
-            "2.5", "--no-cull", "--no-ui", "--load-repo", "fixtures/g-pick-repo",
+            "2.5", "--no-cull", "--no-ui", "--launch-config", "config.toml",
+            "--file-backgrounds", "--file-bg-color", "0.15,0.15,0.20,0.80",
+            "--lod-min-px", "2.0",
+            "--load-repo", "fixtures/g-pick-repo",
             "--repo-engine", "batch", "--repo-verify", "--focus-file", "alpha",
             "--wrap-mode", "back", "--z-wrap-spacing", "0.6", "--cluster-mode", "cluster",
             "--color-mode", "flat",
@@ -588,6 +711,10 @@ mod cli_tests {
         assert_eq!(cli.zoom, 2.5);
         assert!(cli.no_cull);
         assert!(cli.no_ui);
+        assert_eq!(cli.launch_config, Some(PathBuf::from("config.toml")));
+        assert!(cli.file_backgrounds);
+        assert_eq!(cli.file_bg_color, Some([0.15, 0.15, 0.20, 0.80]));
+        assert_eq!(cli.lod_min_px, Some(2.0));
         assert_eq!(cli.load_repo, Some(PathBuf::from("fixtures/g-pick-repo")));
         assert_eq!(cli.repo_engine, "batch");
         assert_eq!(cli.wrap_mode, "back");
@@ -890,4 +1017,33 @@ mod cli_tests {
             _ => panic!("expected CamPose"),
         }
     }
+
+    #[test]
+    fn launch_config_file_merging() {
+        let tmp = std::env::temp_dir().join(format!("test_launch_cfg_{}.toml", std::process::id()));
+        std::fs::write(
+            &tmp,
+            r#"
+            file_backgrounds = true
+            file_bg_color = [0.2, 0.3, 0.4, 0.9]
+            lod_min_px = 3.5
+            wrap_mode = "down"
+            "#,
+        )
+        .expect("write temp config");
+
+        let cli = parse(&[
+            "--launch-config",
+            tmp.to_str().unwrap(),
+            "--wrap-mode",
+            "back",
+        ]);
+        let _ = std::fs::remove_file(&tmp);
+
+        assert!(cli.file_backgrounds);
+        assert_eq!(cli.file_bg_color, Some([0.2, 0.3, 0.4, 0.9]));
+        assert_eq!(cli.lod_min_px, Some(3.5));
+        assert_eq!(cli.wrap_mode, "back"); // CLI flag overrode TOML config
+    }
 }
+

@@ -101,7 +101,7 @@ pub fn run(
     // z_wrap_spacing, Repo/Text cluster_mode) before rebuilding the scene
     // (windowed.rs's pending_relayout arm). Offscreen keeps borrowing its own.
     choice: SceneChoice,
-    cull: bool,
+    cull_opts: crate::SceneCullOptions,
     ops: &[Op],
     ui: bool,
     shot: Option<(u64, std::path::PathBuf)>,
@@ -115,7 +115,7 @@ pub fn run(
     let mut app = App {
         ctx,
         choice,
-        cull,
+        cull_opts,
         ops,
         start: Instant::now(),
         state: None,

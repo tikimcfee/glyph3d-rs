@@ -54,7 +54,10 @@ pub(super) fn render_scene(
     // the LOD_MIN_PX const by construction (gate 6's byte-equal PNGs are
     // the proof).
     if let (Some(probe), Some(cull)) = (&scene.ui_probe, &scene.cull) {
-        cull.lod_min_px.set(probe.borrow().lod_min_px);
+        let p = probe.borrow();
+        cull.lod_min_px.set(p.lod_min_px);
+        cull.file_backgrounds.set(p.file_backgrounds);
+        cull.file_bg_color.set(p.file_bg_color);
     }
 
     // Stage L (L1): fill every lane of the widened frame uniform from
@@ -89,6 +92,8 @@ pub(super) fn render_scene(
             eye: frame.eye,
             px_scale,
             lod_min_px: cull.lod_min_px.get(),
+            file_backgrounds: cull.file_backgrounds.get(),
+            file_bg_color: cull.file_bg_color.get(),
         };
         let phase_draws = cull_segments(
             &cull.segments,

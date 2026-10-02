@@ -10,6 +10,7 @@ pub mod fold;
 pub mod glyph_scene;
 pub mod glyph_trie;
 pub mod gpu;
+pub mod launch_config;
 pub mod layout;
 pub mod layout_hyper;
 pub mod offscreen;
@@ -107,6 +108,27 @@ pub fn engine_layout(file: &Path, trie: &Path) -> (layout::GlyphArena, layout::I
     (arena, placements[0])
 }
 
+pub const DEFAULT_FILE_BG_COLOR: [f32; 4] = [0.10, 0.10, 0.13, 0.85];
+
+#[derive(Clone, Copy, Debug)]
+pub struct SceneCullOptions {
+    pub cull: bool,
+    pub file_backgrounds: bool,
+    pub file_bg_color: [f32; 4],
+    pub lod_min_px: Option<f32>,
+}
+
+impl Default for SceneCullOptions {
+    fn default() -> Self {
+        Self {
+            cull: true,
+            file_backgrounds: false,
+            file_bg_color: DEFAULT_FILE_BG_COLOR,
+            lod_min_px: None,
+        }
+    }
+}
+
 pub fn build_scene(
     ctx: &GpuContext,
     color_format: wgpu::TextureFormat,
@@ -114,7 +136,24 @@ pub fn build_scene(
     camera_mode: CameraMode,
     cull: bool,
 ) -> Box<dyn SceneLike> {
-    build_scene_impl(ctx, color_format, choice, camera_mode, cull, false).0
+    build_scene_impl(
+        ctx,
+        color_format,
+        choice,
+        camera_mode,
+        SceneCullOptions { cull, ..Default::default() },
+        false,
+    ).0
+}
+
+pub fn build_scene_with_options(
+    ctx: &GpuContext,
+    color_format: wgpu::TextureFormat,
+    choice: &SceneChoice,
+    camera_mode: CameraMode,
+    cull_opts: SceneCullOptions,
+) -> Box<dyn SceneLike> {
+    build_scene_impl(ctx, color_format, choice, camera_mode, cull_opts, false).0
 }
 
 pub fn build_scene_probed(
@@ -122,9 +161,9 @@ pub fn build_scene_probed(
     color_format: wgpu::TextureFormat,
     choice: &SceneChoice,
     camera_mode: CameraMode,
-    cull: bool,
+    cull_opts: SceneCullOptions,
 ) -> (Box<dyn SceneLike>, Option<glyph_scene::UiProbe>) {
-    build_scene_impl(ctx, color_format, choice, camera_mode, cull, true)
+    build_scene_impl(ctx, color_format, choice, camera_mode, cull_opts, true)
 }
 
 fn build_scene_impl(
@@ -132,14 +171,20 @@ fn build_scene_impl(
     color_format: wgpu::TextureFormat,
     choice: &SceneChoice,
     camera_mode: CameraMode,
-    cull: bool,
+    cull_opts: SceneCullOptions,
     probe: bool,
 ) -> (Box<dyn SceneLike>, Option<glyph_scene::UiProbe>) {
     let glyph = |scene: GlyphScene| {
         let mut scene = scene;
+        scene.set_file_backgrounds(cull_opts.file_backgrounds);
+        scene.set_file_bg_color(cull_opts.file_bg_color);
+        if let Some(lod) = cull_opts.lod_min_px {
+            scene.set_lod_min_px(lod);
+        }
         let p = probe.then(|| scene.init_ui_probe());
         (Box::new(scene) as Box<dyn SceneLike>, p)
     };
+    let cull = cull_opts.cull;
     match choice {
         SceneChoice::Demo => (Box::new(Scene::new(ctx, color_format)), None),
         SceneChoice::Text { file, copies, emoji_sheet, cluster_mode } => {

@@ -199,9 +199,16 @@ fn main() {
     // Device/queue/adapter init is shared by both modes (gpu::init).
     let ctx = pollster::block_on(gpu::init(None));
 
+    let cull_opts = SceneCullOptions {
+        cull: !cli.no_cull,
+        file_backgrounds: cli.file_backgrounds,
+        file_bg_color: cli.file_bg_color.unwrap_or(DEFAULT_FILE_BG_COLOR),
+        lod_min_px: cli.lod_min_px,
+    };
+
     match cli.screenshot {
         Some(path) => offscreen::run(
-            &ctx, &choice, &path, cli.frames, cli.zoom, !cli.no_cull, &cli.ops,
+            &ctx, &choice, &path, cli.frames, cli.zoom, cull_opts, &cli.ops,
         ),
         None => {
             // Stage K (K6): scripted in-window capture (windowed only — clap
@@ -210,7 +217,7 @@ fn main() {
             windowed::run(
                 ctx,
                 choice,
-                !cli.no_cull,
+                cull_opts,
                 &cli.ops,
                 !cli.no_ui,
                 shot,

@@ -15,7 +15,7 @@ use winit::window::{Window, WindowId};
 use crate::glyph_scene::CameraMode;
 use crate::gpu::GpuContext;
 use crate::scene;
-use crate::{build_scene, Op, SceneChoice};
+use crate::{Op, SceneChoice};
 
 use super::state::WindowState;
 #[cfg(feature = "egui-ui")]
@@ -39,7 +39,7 @@ use super::utc_stamp;
 pub(super) fn apply_relayout(
     ctx: &GpuContext,
     choice: &mut SceneChoice,
-    cull: bool,
+    cull_opts: crate::SceneCullOptions,
     ui: bool,
     state: &mut WindowState,
     req: RelayoutRequest,
@@ -79,18 +79,28 @@ pub(super) fn apply_relayout(
     if !changed {
         return; // a release without a move (a click, a typed repeat) rebuilds nothing
     }
-    // Snapshot the camera BEFORE the swap: the probe holds last frame's
-    // actual eye/yaw/pitch, and a rebuild that teleports the viewer would
-    // make the dial unusable.
-    let pose = state.ui_probe.as_ref().map(|p| {
+    // Snapshot the camera and live cull settings BEFORE the swap: the probe holds
+    // last frame's actual eye/yaw/pitch and live background/cull settings, and a rebuild
+    // that teleports the viewer or resets the background would make the dial unusable.
+    let (pose, live_cull_opts) = if let Some(p) = state.ui_probe.as_ref() {
         let p = p.borrow();
-        (p.eye, p.yaw, p.pitch)
-    });
+        (
+            Some((p.eye, p.yaw, p.pitch)),
+            crate::SceneCullOptions {
+                cull: cull_opts.cull,
+                file_backgrounds: p.file_backgrounds,
+                file_bg_color: p.file_bg_color,
+                lod_min_px: Some(p.lod_min_px),
+            },
+        )
+    } else {
+        (None, cull_opts)
+    };
     let t = Instant::now();
     let (mut scene, probe) = if ui {
-        crate::build_scene_probed(ctx, state.config.format, choice, CameraMode::Fly, cull)
+        crate::build_scene_probed(ctx, state.config.format, choice, CameraMode::Fly, live_cull_opts)
     } else {
-        (build_scene(ctx, state.config.format, choice, CameraMode::Fly, cull), None)
+        (crate::build_scene_with_options(ctx, state.config.format, choice, CameraMode::Fly, live_cull_opts), None)
     };
     scene.set_viewport(state.config.width, state.config.height);
     if let Some((eye, yaw, pitch)) = pose {
@@ -119,7 +129,7 @@ pub(super) struct App<'a> {
     /// place (Repo's z_wrap_spacing, Repo/Text cluster_mode) before rebuilding
     /// the scene.
     pub(super) choice: SceneChoice,
-    pub(super) cull: bool,
+    pub(super) cull_opts: crate::SceneCullOptions,
     /// Stage G: scripted picks/verbs applied once at startup (smoke testing
     /// the same code path the windowed verbs use).
     pub(super) ops: &'a [Op],
@@ -249,12 +259,12 @@ impl ApplicationHandler for App<'_> {
         // concrete GlyphScene BEFORE type erasure (see build_scene_probed).
         #[cfg(feature = "egui-ui")]
         let (mut scene, ui_probe) = if self.ui {
-            crate::build_scene_probed(&self.ctx, format, &self.choice, CameraMode::Fly, self.cull)
+            crate::build_scene_probed(&self.ctx, format, &self.choice, CameraMode::Fly, self.cull_opts)
         } else {
-            (build_scene(&self.ctx, format, &self.choice, CameraMode::Fly, self.cull), None)
+            (crate::build_scene_with_options(&self.ctx, format, &self.choice, CameraMode::Fly, self.cull_opts), None)
         };
         #[cfg(not(feature = "egui-ui"))]
-        let mut scene = build_scene(&self.ctx, format, &self.choice, CameraMode::Fly, self.cull);
+        let mut scene = crate::build_scene_with_options(&self.ctx, format, &self.choice, CameraMode::Fly, self.cull_opts);
         let depth = scene::create_depth(&self.ctx.device, scene.depth_format(), config.width, config.height);
         log::info!(
             "surface: {}x{} {:?} present={:?}",
@@ -361,7 +371,7 @@ impl ApplicationHandler for App<'_> {
                 // new params.
                 #[cfg(feature = "egui-ui")]
                 if let Some(req) = state.pending_relayout.take() {
-                    apply_relayout(&self.ctx, &mut self.choice, self.cull, self.ui, state, req);
+                    apply_relayout(&self.ctx, &mut self.choice, self.cull_opts, self.ui, state, req);
                 }
             }
             // Stage K (K6): F2 = capture the next presented frame to PNG.

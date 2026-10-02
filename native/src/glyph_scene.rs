@@ -522,6 +522,27 @@ impl GlyphScene {
         }
     }
 
+    /// Configure whether file background bounding quads are emitted behind glyphs when near.
+    pub fn set_file_backgrounds(&mut self, on: bool) {
+        if let Some(cull) = &self.cull {
+            cull.file_backgrounds.set(on);
+        }
+    }
+
+    /// Set the RGBA color for near file background bounding quads.
+    pub fn set_file_bg_color(&mut self, rgba: [f32; 4]) {
+        if let Some(cull) = &self.cull {
+            cull.file_bg_color.set(rgba);
+        }
+    }
+
+    /// Set the LOD minimum pixel threshold.
+    pub fn set_lod_min_px(&mut self, lod: f32) {
+        if let Some(cull) = &self.cull {
+            cull.lod_min_px.set(lod);
+        }
+    }
+
     /// Update slot colors in-place on the GPU.
     /// If direct-mapped GPU memory is available (e.g. Apple Silicon Metal),
     /// writes directly into host-visible mapped slots without queue uploads.

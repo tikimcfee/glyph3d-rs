@@ -9,7 +9,9 @@ use std::path::Path;
 use crate::glyph_scene::CameraMode;
 use crate::gpu::GpuContext;
 use crate::scene;
-use crate::{build_scene, Op, SceneChoice, OFFSCREEN_HEIGHT, OFFSCREEN_WIDTH};
+use crate::{
+    build_scene_with_options, Op, SceneChoice, SceneCullOptions, OFFSCREEN_HEIGHT, OFFSCREEN_WIDTH,
+};
 
 #[allow(clippy::too_many_arguments)]
 pub fn run(
@@ -18,7 +20,7 @@ pub fn run(
     path: &Path,
     frames: u32,
     zoom: f32,
-    cull: bool,
+    cull_opts: SceneCullOptions,
     ops: &[Op],
 ) {
     let device = &ctx.device;
@@ -62,7 +64,8 @@ pub fn run(
     let color_view = texture.create_view(&Default::default());
     let depth_view = scene::create_depth(device, wgpu::TextureFormat::Depth32Float, size.width, size.height);
 
-    let mut scene = build_scene(ctx, format, choice, CameraMode::Front { zoom }, cull);
+    let mut scene =
+        build_scene_with_options(ctx, format, choice, CameraMode::Front { zoom }, cull_opts);
 
     // Stage G: scripted picks + verbs, applied in CLI order before the first
     // frame. Deterministic: the Front camera + fixed viewport make --pick-px

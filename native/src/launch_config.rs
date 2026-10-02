@@ -1,0 +1,145 @@
+//! Launch configuration for Glyph3D.
+//!
+//! Loads startup preferences from a configuration file (e.g. `launch_config.toml`
+//! or a path specified via `--launch-config <path>`).
+
+use std::path::{Path, PathBuf};
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct LaunchConfig {
+    pub file_backgrounds: Option<bool>,
+    pub file_bg_color: Option<[f32; 4]>,
+    pub lod_min_px: Option<f32>,
+    pub wrap_mode: Option<String>,
+    pub z_wrap_spacing: Option<f64>,
+    pub cluster_mode: Option<String>,
+    pub color_mode: Option<String>,
+    pub no_cull: Option<bool>,
+    pub no_ui: Option<bool>,
+    pub load_repo: Option<PathBuf>,
+}
+
+impl LaunchConfig {
+    /// Load from a file path. Returns Err with a message if reading or parsing fails.
+    pub fn from_file(path: &Path) -> Result<Self, String> {
+        let content = std::fs::read_to_string(path)
+            .map_err(|e| format!("failed to read launch config '{}': {e}", path.display()))?;
+        Self::from_toml_str(&content)
+    }
+
+    /// Parse a simple TOML-compatible string into LaunchConfig.
+    pub fn from_toml_str(s: &str) -> Result<Self, String> {
+        let mut cfg = LaunchConfig::default();
+        for (line_idx, line) in s.lines().enumerate() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') || line.starts_with("//") {
+                continue;
+            }
+            let Some((key, val)) = line.split_once('=') else {
+                continue;
+            };
+            let key = key.trim();
+            let val = val.trim();
+            match key {
+                "file_backgrounds" => {
+                    cfg.file_backgrounds = Some(parse_bool(val, line_idx)?);
+                }
+                "file_bg_color" => {
+                    cfg.file_bg_color = Some(parse_color(val, line_idx)?);
+                }
+                "lod_min_px" => {
+                    cfg.lod_min_px = Some(val.parse::<f32>().map_err(|e| {
+                        format!("line {}: invalid float for lod_min_px: {e}", line_idx + 1)
+                    })?);
+                }
+                "wrap_mode" => {
+                    cfg.wrap_mode = Some(strip_quotes(val));
+                }
+                "z_wrap_spacing" => {
+                    cfg.z_wrap_spacing = Some(val.parse::<f64>().map_err(|e| {
+                        format!("line {}: invalid float for z_wrap_spacing: {e}", line_idx + 1)
+                    })?);
+                }
+                "cluster_mode" => {
+                    cfg.cluster_mode = Some(strip_quotes(val));
+                }
+                "color_mode" => {
+                    cfg.color_mode = Some(strip_quotes(val));
+                }
+                "no_cull" => {
+                    cfg.no_cull = Some(parse_bool(val, line_idx)?);
+                }
+                "no_ui" => {
+                    cfg.no_ui = Some(parse_bool(val, line_idx)?);
+                }
+                "load_repo" => {
+                    cfg.load_repo = Some(PathBuf::from(strip_quotes(val)));
+                }
+                _ => {
+                    // Unknown keys are ignored for forward-compatibility
+                }
+            }
+        }
+        Ok(cfg)
+    }
+}
+
+fn strip_quotes(s: &str) -> String {
+    s.trim_matches(|c| c == '"' || c == '\'').to_string()
+}
+
+fn parse_bool(s: &str, line: usize) -> Result<bool, String> {
+    match s.trim().to_lowercase().as_str() {
+        "true" | "1" | "yes" | "on" => Ok(true),
+        "false" | "0" | "no" | "off" => Ok(false),
+        other => Err(format!("line {}: invalid boolean '{other}'", line + 1)),
+    }
+}
+
+fn parse_color(s: &str, line: usize) -> Result<[f32; 4], String> {
+    let clean = s.trim().trim_start_matches('[').trim_end_matches(']').trim_matches('"');
+    let parts: Vec<&str> = clean.split(',').map(|p| p.trim()).collect();
+    if parts.len() != 4 {
+        return Err(format!("line {}: expected 4 floats [r,g,b,a], got '{s}'", line + 1));
+    }
+    let mut out = [0.0f32; 4];
+    for (i, p) in parts.iter().enumerate() {
+        out[i] = p.parse::<f32>().map_err(|e| {
+            format!("line {}: invalid float '{p}': {e}", line + 1)
+        })?;
+    }
+    Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_launch_config_toml() {
+        let toml = r#"
+            # Glyph3D launch config
+            file_backgrounds = true
+            file_bg_color = [0.12, 0.13, 0.18, 0.90]
+            lod_min_px = 1.5
+            wrap_mode = "back"
+            z_wrap_spacing = 0.20
+            cluster_mode = "cluster"
+            color_mode = "flat"
+            no_cull = false
+            no_ui = true
+            load_repo = "/path/to/repo"
+        "#;
+        let cfg = LaunchConfig::from_toml_str(toml).expect("parse failed");
+        assert_eq!(cfg.file_backgrounds, Some(true));
+        assert_eq!(cfg.file_bg_color, Some([0.12, 0.13, 0.18, 0.90]));
+        assert_eq!(cfg.lod_min_px, Some(1.5));
+        assert_eq!(cfg.wrap_mode.as_deref(), Some("back"));
+        assert_eq!(cfg.z_wrap_spacing, Some(0.20));
+        assert_eq!(cfg.cluster_mode.as_deref(), Some("cluster"));
+        assert_eq!(cfg.color_mode.as_deref(), Some("flat"));
+        assert_eq!(cfg.no_cull, Some(false));
+        assert_eq!(cfg.no_ui, Some(true));
+        assert_eq!(cfg.load_repo, Some(PathBuf::from("/path/to/repo")));
+    }
+}
