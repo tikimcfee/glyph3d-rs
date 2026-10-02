@@ -490,6 +490,45 @@ impl WindowState {
                                         .as_deref()
                                         .unwrap_or("pick: (none yet — left-click a glyph)"),
                                 );
+                                if let Some(active_zone) = &snap.active_zone {
+                                    ui.label(format!("carrel / zone: {active_zone}"));
+                                }
+                                if snap.grabbed_zone.is_some() || snap.grabbed_group.is_some() {
+                                    ui.colored_label(
+                                        egui::Color32::from_rgb(255, 200, 80),
+                                        format!(
+                                            "ACTIVE GRAB: {}",
+                                            if let Some(z) = &snap.grabbed_zone {
+                                                format!("Zone '{z}' (move mouse to drag, wheel to scale, C to release)")
+                                            } else if let Some(g) = snap.grabbed_group {
+                                                format!("File group {g} (move mouse to drag, wheel to scale, G to release)")
+                                            } else {
+                                                "".to_string()
+                                            }
+                                        ),
+                                    );
+                                }
+                                ui.horizontal(|ui| {
+                                    if let Some(z) = &snap.grabbed_zone {
+                                        if ui.button(format!("Release Carrel '{z}' (C)")).clicked() {
+                                            self.scene.on_key(ctx, winit::keyboard::KeyCode::KeyC, true);
+                                        }
+                                    } else if snap.active_zone.is_some()
+                                        && ui.button("Grab Entire Carrel (C)").clicked()
+                                    {
+                                        self.scene.on_key(ctx, winit::keyboard::KeyCode::KeyC, true);
+                                    }
+
+                                    if let Some(g) = snap.grabbed_group {
+                                        if ui.button(format!("Release File #{g} (G)")).clicked() {
+                                            self.scene.on_key(ctx, winit::keyboard::KeyCode::KeyG, true);
+                                        }
+                                    } else if snap.last_pick.is_some()
+                                        && ui.button("Grab File (G)").clicked()
+                                    {
+                                        self.scene.on_key(ctx, winit::keyboard::KeyCode::KeyG, true);
+                                    }
+                                });
                             }
                             None => {
                                 ui.label("camera/pick: n/a (demo scene has no probe)");

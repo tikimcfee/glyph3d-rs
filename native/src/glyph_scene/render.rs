@@ -145,6 +145,16 @@ pub(super) fn render_scene(
         p.yaw = scene.fly.yaw;
         p.pitch = scene.fly.pitch;
         p.last_pick = scene.picked.as_ref().map(format_pick);
+        p.grabbed_group = scene.grabbed_group;
+        p.grabbed_zone = scene.grabbed_zone.clone();
+        p.active_zone = scene.picked.as_ref().map(|h| {
+            if let Some(ctrl) = &scene.controller {
+                let dir = h.rel_path.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
+                ctrl.zone_for_file(&h.rel_path, dir)
+            } else {
+                format!("group:{}", h.group_id)
+            }
+        });
         if scene.cull.is_some() {
             p.cull_ranges = phase_draws.glyph_ranges.len();
             p.cull_instances = phase_draws

@@ -79,6 +79,8 @@ pub struct StagedText {
     /// file + repo root/trie for deterministic per-file engine re-runs);
     /// text/engine scenes leave it None (picking unsupported there).
     pub pick: Option<PickContext>,
+    /// Hierarchical layout controller and spatial scene graph (repo mode).
+    pub controller: Option<crate::layout_stack::LayoutController>,
 }
 
 /// Stage F: one cull segment covering a whole staged block (the text/engine
@@ -421,6 +423,7 @@ pub fn stage_file(
         focus_bounds: None,
         segments,
         pick: None,
+        controller: None,
     }
 }
 
@@ -793,6 +796,7 @@ pub fn stage_records(arena: GlyphArena, placement: &ItemPlacement, slot_ink: &[O
         missing_or_bitmap: (placement.record_count - placement.slot_count) as usize,
         focus_bounds: None,
         pick: None,
+        controller: None,
     }
 }
 

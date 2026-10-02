@@ -168,6 +168,10 @@ pub struct GlyphScene {
     pub(in crate::glyph_scene) cache: Option<PickCacheEntry>,
     /// Windowed grab verb: the group being dragged with the mouse.
     pub(crate) grabbed_group: Option<u32>,
+    /// Hierarchical layout controller and spatial scene graph (repo scenes).
+    pub controller: Option<crate::layout_stack::LayoutController>,
+    /// Windowed grab verb: the carrel/zone ID being dragged with the mouse.
+    pub grabbed_zone: Option<String>,
     /// Last known cursor position, physical px (click pick + grab drag).
     pub(crate) cursor: (f32, f32),
     /// Viewport in physical px, refreshed every render() (ray unprojection).
@@ -477,6 +481,7 @@ impl GlyphScene {
         let composite = pipelines::build_composite_state(device, color_format, mask_pipeline);
 
         let pick = staged.pick;
+        let controller = staged.controller;
         let groups_cpu = groups.clone();
         let tint_step = vec![0u32; groups.len()];
         let pipe_dur = t_pipe_start.elapsed();
@@ -516,6 +521,8 @@ impl GlyphScene {
             geom_overrides: std::collections::HashMap::new(),
             cache: None,
             grabbed_group: None,
+            controller,
+            grabbed_zone: None,
             cursor: (0.0, 0.0),
             viewport: Cell::new((1600, 1000)), // refreshed every render()
             tint_step,
@@ -952,15 +959,73 @@ impl GlyphScene {
         self.apply_pick(ctx, &PickCommand::Pixel { x, y })
     }
 
-    /// Windowed cursor move: while a group is grabbed (`g`), drag it in the
-    /// view plane through its AABB center.
+    /// Windowed cursor move: while a group or carrel is grabbed (`g` or `c`),
+    /// drag it in the view plane through its center.
     pub fn cursor_moved(&mut self, ctx: &GpuContext, x: f32, y: f32) {
         let prev = self.cursor;
         self.cursor = (x, y);
-        let Some(gid) = self.grabbed_group else { return };
         if (x - prev.0).abs() + (y - prev.1).abs() < 1e-3 {
             return;
         }
+
+        // Branch 1: Dragging an entire Carrel / LayoutZone (`KeyC`)
+        if let Some(ref zid) = self.grabbed_zone {
+            let (Some((o0, d0)), Some((o1, d1))) =
+                (self.pixel_ray(prev.0, prev.1), self.pixel_ray(x, y))
+            else {
+                return;
+            };
+            let (w, h) = self.viewport.get();
+            let Some((_, fwd)) = self.pixel_ray(w as f32 * 0.5, h as f32 * 0.5) else {
+                return;
+            };
+
+            let zone_center = self
+                .controller
+                .as_ref()
+                .and_then(|c| c.zone_world_bounds(zid))
+                .map(|(min, max)| {
+                    DVec3::new(
+                        (min[0] + max[0]) as f64 * 0.5,
+                        (min[1] + max[1]) as f64 * 0.5,
+                        (min[2] + max[2]) as f64 * 0.5,
+                    )
+                });
+
+            let Some(c) = zone_center else {
+                self.grabbed_zone = None;
+                return;
+            };
+
+            let hit_plane = |o: DVec3, d: DVec3| -> Option<DVec3> {
+                let denom = d.dot(fwd);
+                if denom.abs() < 1e-12 {
+                    None
+                } else {
+                    Some(o + d * ((c - o).dot(fwd) / denom))
+                }
+            };
+            let (Some(p0), Some(p1)) = (hit_plane(o0, d0), hit_plane(o1, d1)) else {
+                return;
+            };
+            let delta = p1 - p0;
+            let d_vec = glam::Vec3::new(delta.x as f32, delta.y as f32, delta.z as f32);
+
+            let zid_str = zid.clone();
+            if let Some(ctrl) = &mut self.controller {
+                if ctrl.move_zone(&zid_str, d_vec) {
+                    let updated_gids = ctrl.sync_gpu_groups(&mut self.groups_cpu);
+                    for gid in updated_gids {
+                        self.write_group_row(ctx, gid);
+                        self.sync_segment(gid);
+                    }
+                }
+            }
+            return;
+        }
+
+        // Branch 2: Dragging an individual file group (`KeyG`)
+        let Some(gid) = self.grabbed_group else { return };
         let (Some((o0, d0)), Some((o1, d1))) =
             (self.pixel_ray(prev.0, prev.1), self.pixel_ray(x, y))
         else {
@@ -1005,21 +1070,61 @@ impl GlyphScene {
             return;
         };
         let delta = p1 - p0;
-        if let Some(g) = self.groups_cpu.get_mut(gid as usize) {
+        let d_vec = glam::Vec3::new(delta.x as f32, delta.y as f32, delta.z as f32);
+
+        if let Some(ctrl) = &mut self.controller {
+            if let Some(&node_id) = ctrl.file_nodes.get(gid as usize) {
+                ctrl.hierarchy.translate(node_id, d_vec);
+                ctrl.hierarchy.update_world_transforms();
+                ctrl.sync_gpu_groups(&mut self.groups_cpu);
+            } else if let Some(g) = self.groups_cpu.get_mut(gid as usize) {
+                g.cols[0][0] += delta.x as f32;
+                g.cols[0][1] += delta.y as f32;
+                g.cols[0][2] += delta.z as f32;
+            }
+        } else if let Some(g) = self.groups_cpu.get_mut(gid as usize) {
             g.cols[0][0] += delta.x as f32;
             g.cols[0][1] += delta.y as f32;
             g.cols[0][2] += delta.z as f32;
         }
+
         self.write_group_row(ctx, gid);
         self.sync_segment(gid);
     }
 
-    /// Windowed scroll: scales the grabbed group; otherwise camera speed.
+    /// Windowed scroll: scales the grabbed carrel or file; otherwise camera speed.
     fn scroll_or_scale(&mut self, ctx: &GpuContext, lines: f32) {
-        if let Some(gid) = self.grabbed_group {
+        if let Some(ref zid) = self.grabbed_zone {
+            let f = 1.1f32.powf(lines);
+            let zid_str = zid.clone();
+            if let Some(ctrl) = &mut self.controller {
+                if ctrl.scale_zone(&zid_str, f) {
+                    let updated_gids = ctrl.sync_gpu_groups(&mut self.groups_cpu);
+                    for gid in updated_gids {
+                        self.write_group_row(ctx, gid);
+                        self.sync_segment(gid);
+                    }
+                    println!("grab carrel: zone '{zid_str}' scaled by factor {f:.3}");
+                }
+            }
+        } else if let Some(gid) = self.grabbed_group {
             let f = 1.1f32.powf(lines);
             let mut s = 0.0;
-            if let Some(g) = self.groups_cpu.get_mut(gid as usize) {
+            if let Some(ctrl) = &mut self.controller {
+                if let Some(&node_id) = ctrl.file_nodes.get(gid as usize) {
+                    ctrl.hierarchy.scale(node_id, f);
+                    ctrl.hierarchy.update_world_transforms();
+                    ctrl.sync_gpu_groups(&mut self.groups_cpu);
+                    if let Some(g) = self.groups_cpu.get(gid as usize) {
+                        s = g.cols[3][0];
+                    }
+                } else if let Some(g) = self.groups_cpu.get_mut(gid as usize) {
+                    for c in 0..3 {
+                        g.cols[3][c] = (g.cols[3][c] * f).clamp(0.001, 100.0);
+                    }
+                    s = g.cols[3][0];
+                }
+            } else if let Some(g) = self.groups_cpu.get_mut(gid as usize) {
                 for c in 0..3 {
                     g.cols[3][c] = (g.cols[3][c] * f).clamp(0.001, 100.0);
                 }
@@ -1033,8 +1138,8 @@ impl GlyphScene {
         }
     }
 
-    /// Windowed verb keys: h highlight line, g grab/release file, t cycle
-    /// tint, x toggle hidden.
+    /// Windowed verb keys: h highlight line, g grab/release file, c grab/release carrel,
+    /// t cycle tint, x toggle hidden.
     fn verb_key(&mut self, ctx: &GpuContext, key: winit::keyboard::KeyCode) {
         use winit::keyboard::KeyCode as K;
         match key {
@@ -1050,22 +1155,51 @@ impl GlyphScene {
                 let line = self.apply_verb(ctx, &Verb::ToggleHidden);
                 println!("{line}");
             }
-            K::KeyG => match self.grabbed_group {
-                Some(gid) => {
-                    self.grabbed_group = None;
-                    println!("grab: released group {gid}");
-                }
-                None => match &self.picked {
-                    Some(h) => {
-                        self.grabbed_group = Some(h.group_id);
-                        println!(
-                            "grab: {} (group {}) — mouse drags it in the view plane, scroll scales, g releases",
-                            h.rel_path, h.group_id
-                        );
+            K::KeyG => {
+                self.grabbed_zone = None;
+                match self.grabbed_group {
+                    Some(gid) => {
+                        self.grabbed_group = None;
+                        println!("grab: released group {gid}");
                     }
-                    None => println!("grab: nothing picked (click a file first)"),
-                },
-            },
+                    None => match &self.picked {
+                        Some(h) => {
+                            self.grabbed_group = Some(h.group_id);
+                            println!(
+                                "grab: {} (group {}) — mouse drags it in the view plane, scroll scales, g releases",
+                                h.rel_path, h.group_id
+                            );
+                        }
+                        None => println!("grab: nothing picked (click a file first)"),
+                    },
+                }
+            }
+            K::KeyC => {
+                self.grabbed_group = None;
+                match &self.grabbed_zone {
+                    Some(zid) => {
+                        let zid_clone = zid.clone();
+                        self.grabbed_zone = None;
+                        println!("grab carrel: released zone '{zid_clone}'");
+                    }
+                    None => match &self.picked {
+                        Some(h) => {
+                            let zid = if let Some(ctrl) = &self.controller {
+                                let dir = h.rel_path.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
+                                ctrl.zone_for_file(&h.rel_path, dir)
+                            } else {
+                                format!("group:{}", h.group_id)
+                            };
+                            println!(
+                                "grab carrel: zone '{zid}' (via {}) — mouse drags the entire carrel in 3D space, scroll scales, c releases",
+                                h.rel_path
+                            );
+                            self.grabbed_zone = Some(zid);
+                        }
+                        None => println!("grab carrel: nothing picked (click a file first)"),
+                    },
+                }
+            }
             _ => {}
         }
     }

@@ -58,6 +58,12 @@ pub struct UiProbeState {
     pub cluster_mode: Option<bool>,
     /// Canvas layout arrangement mode (repo scenes): shelf vs carrel. None for non-repo scenes.
     pub layout_mode: Option<crate::repo::RepoLayoutMode>,
+    /// Currently grabbed group ID (file grab via `KeyG`).
+    pub grabbed_group: Option<u32>,
+    /// Currently grabbed zone / carrel ID (carrel grab via `KeyC`).
+    pub grabbed_zone: Option<String>,
+    /// The carrel / zone ID corresponding to the currently picked file.
+    pub active_zone: Option<String>,
     // ── K5: group-browser data. `files` is STATIC (built once at install;
     // Rc-shared so the panel's per-frame snapshot clones a refcount, not the
     // rows). `file_dyn` is refreshed per frame (world pose under the live

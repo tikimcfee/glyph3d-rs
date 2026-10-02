@@ -200,6 +200,17 @@ impl LayoutController {
         }
     }
 
+    /// Scale a zone by a factor. Automatically propagates down to all children.
+    pub fn scale_zone(&mut self, zone_id: &str, factor: f32) -> bool {
+        if let Some(&node_id) = self.zone_nodes.get(zone_id) {
+            self.hierarchy.scale(node_id, factor);
+            self.hierarchy.update_world_transforms();
+            true
+        } else {
+            false
+        }
+    }
+
     /// Retrieve the world-space bounding box for a zone: [min, max].
     pub fn zone_world_bounds(&self, zone_id: &str) -> Option<([f32; 3], [f32; 3])> {
         let node_id = *self.zone_nodes.get(zone_id)?;
@@ -218,6 +229,37 @@ impl LayoutController {
         self.hierarchy.sync_to_group_rows(groups)
     }
 
+    /// Populate the SpatialHierarchy for Shelf layout mode, so that file nodes
+    /// and the base shelf zone exist for picking, dragging, and bounds queries.
+    pub fn build_shelf_hierarchy(&mut self, views: &[FileView]) {
+        self.hierarchy = SpatialHierarchy::new();
+        self.zone_nodes.clear();
+        self.file_nodes = vec![NodeId(0); views.len()];
+
+        let stack_root = self.hierarchy.create_node("stack_root");
+        let shelf_zone_node = self.hierarchy.create_node("zone:base:shelf");
+        self.hierarchy.attach_child(stack_root, shelf_zone_node);
+        self.zone_nodes.insert("base:shelf".to_string(), shelf_zone_node);
+
+        for (i, v) in views.iter().enumerate() {
+            let file_node = self.hierarchy.create_node(v.rel_path.clone());
+            self.hierarchy.attach_child(shelf_zone_node, file_node);
+            self.hierarchy.set_local_transform(
+                file_node,
+                SpatialTransform::from_xyz(v.offset[0], v.offset[1], v.offset[2]),
+            );
+            self.hierarchy.set_local_bounds(
+                file_node,
+                [0.0, -v.height, v.z_min],
+                [v.width, 0.0, v.z_max],
+            );
+            self.hierarchy.set_group_id(file_node, i as u32);
+            self.hierarchy.set_tint(file_node, crate::repo::dir_tint(&v.dir));
+            self.file_nodes[i] = file_node;
+        }
+        self.hierarchy.update_world_transforms();
+    }
+
     /// Apply the layout stack and control object to place all files on the canvas.
     ///
     /// When in pure Shelf mode without custom zones or file overrides, delegates
@@ -232,18 +274,12 @@ impl LayoutController {
             && self.stack.zones.is_empty()
             && self.stack.file_to_zone.is_empty()
         {
-            return crate::repo::layout_shelf(views, &self.params);
+            let res = crate::repo::layout_shelf(views, &self.params);
+            self.build_shelf_hierarchy(views);
+            return res;
         }
 
-        // Fast-path: pure unmodified carrel layout
-        if self.mode == RepoLayoutMode::Carrel
-            && self.stack.zones.is_empty()
-            && self.stack.file_to_zone.is_empty()
-        {
-            return crate::repo::layout_carrel(views, &self.params);
-        }
-
-        // Dynamic multi-zone layout
+        // Dynamic multi-zone layout (handles Carrel and custom zones)
         self.apply_dynamic_stack(views)
     }
 
@@ -397,17 +433,16 @@ impl LayoutController {
             MacroArrangement::LinearRow => -macro_shelf_h,
         };
 
-        // 4. Update group rows and bounds
+        // 4. Update group rows and bounds in file-index order
         let mut groups = Vec::with_capacity(views.len());
         let (mut min_z, mut max_z) = (0.0f32, 0.0f32);
-        for z in &evaluated_zones {
-            for &file_view_idx in &z.files {
-                let v = &views[file_view_idx];
-                min_z = min_z.min(v.offset[2] + v.z_min);
-                max_z = max_z.max(v.offset[2] + v.z_max);
-                let tint = z.zone.custom_tint.unwrap_or_else(|| dir_tint(&v.dir));
-                groups.push(GroupRow::tinted(v.offset, tint));
-            }
+        for v in views.iter() {
+            min_z = min_z.min(v.offset[2] + v.z_min);
+            max_z = max_z.max(v.offset[2] + v.z_max);
+            let zid = self.zone_for_file(&v.rel_path, &v.dir);
+            let custom_tint = self.stack.zones.iter().find(|z| z.id == zid).and_then(|z| z.custom_tint);
+            let tint = custom_tint.unwrap_or_else(|| dir_tint(&v.dir));
+            groups.push(GroupRow::tinted(v.offset, tint));
         }
 
         log::info!(
@@ -697,5 +732,60 @@ mod tests {
 
         // tests/smoke.rs in the other zone did NOT move
         assert_eq!(groups[2].cols[0], orig_tests_pos);
+    }
+
+    #[test]
+    fn test_scaling_zone_scales_files_in_gpu_groups() {
+        let mut views = make_test_views();
+        let params = RepoParams::default();
+        let mut controller = LayoutController::from_mode(RepoLayoutMode::Carrel, params);
+
+        controller.assign_file("src/main.rs", "desk:scaled");
+        let (mut groups, _, _) = controller.apply(&mut views);
+
+        let scaled = controller.scale_zone("desk:scaled", 2.5);
+        assert!(scaled);
+
+        let updated_gids = controller.sync_gpu_groups(&mut groups);
+        assert!(updated_gids.contains(&0));
+        assert_eq!(groups[0].cols[3][0], 2.5);
+        assert_eq!(groups[0].cols[3][1], 2.5);
+        assert_eq!(groups[0].cols[3][2], 2.5);
+    }
+
+    #[test]
+    fn test_shelf_hierarchy_populated() {
+        let mut views = make_test_views();
+        let params = RepoParams::default();
+        let mut controller = LayoutController::from_mode(RepoLayoutMode::Shelf, params);
+
+        let (groups, _, _) = controller.apply(&mut views);
+        assert_eq!(groups.len(), 3);
+
+        // base:shelf zone must exist
+        assert!(controller.zone_world_bounds("base:shelf").is_some());
+        // file nodes must exist
+        assert_eq!(controller.file_nodes.len(), 3);
+        assert!(controller.file_world_bounds(0).is_some());
+    }
+
+    #[test]
+    fn test_zone_world_bounds_covers_children() {
+        let mut views = make_test_views();
+        let params = RepoParams::default();
+        let mut controller = LayoutController::from_mode(RepoLayoutMode::Carrel, params);
+
+        controller.assign_file("src/main.rs", "desk:combo");
+        controller.assign_file("src/lib.rs", "desk:combo");
+
+        let _ = controller.apply(&mut views);
+
+        let zone_bounds = controller.zone_world_bounds("desk:combo").expect("zone bounds exist");
+        let file0_bounds = controller.file_world_bounds(0).expect("file 0 bounds exist");
+        let file1_bounds = controller.file_world_bounds(1).expect("file 1 bounds exist");
+
+        // Zone bounds must envelope both child file bounds
+        assert!(zone_bounds.0[0] <= file0_bounds.0[0] && zone_bounds.0[0] <= file1_bounds.0[0]);
+        assert!(zone_bounds.1[0] >= file0_bounds.1[0] && zone_bounds.1[0] >= file1_bounds.1[0]);
     }
 }

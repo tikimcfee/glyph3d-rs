@@ -235,6 +235,15 @@ impl SpatialHierarchy {
         self.mark_dirty(id);
     }
 
+    /// Uniformly scale a node relative to its current local scale.
+    pub fn scale(&mut self, id: NodeId, factor: f32) {
+        if let Some(node) = self.get_mut(id) {
+            node.local.scale *= factor;
+            node.dirty = true;
+        }
+        self.mark_dirty(id);
+    }
+
     /// Set local bounding box for a node.
     pub fn set_local_bounds(&mut self, id: NodeId, min: [f32; 3], max: [f32; 3]) {
         if let Some(node) = self.get_mut(id) {
@@ -317,34 +326,47 @@ impl SpatialHierarchy {
         updated
     }
 
-    /// Compute world-space axis-aligned bounding box (AABB) for a node.
+    /// Compute world-space axis-aligned bounding box (AABB) for a node and its subtree.
     pub fn world_bounds(&self, id: NodeId) -> Option<([f32; 3], [f32; 3])> {
         let node = self.get(id)?;
-        let (min, max) = node.local_bounds?;
-        let w = &node.world;
-
-        // Transform all 8 local corners into world space and take union AABB
-        let corners = [
-            Vec3::new(min[0], min[1], min[2]),
-            Vec3::new(max[0], min[1], min[2]),
-            Vec3::new(min[0], max[1], min[2]),
-            Vec3::new(max[0], max[1], min[2]),
-            Vec3::new(min[0], min[1], max[2]),
-            Vec3::new(max[0], min[1], max[2]),
-            Vec3::new(min[0], max[1], max[2]),
-            Vec3::new(max[0], max[1], max[2]),
-        ];
-
         let mut world_min = Vec3::splat(f32::INFINITY);
         let mut world_max = Vec3::splat(f32::NEG_INFINITY);
+        let mut has_bounds = false;
 
-        for c in corners {
-            let wp = w.transform_point(c);
-            world_min = world_min.min(wp);
-            world_max = world_max.max(wp);
+        if let Some((min, max)) = node.local_bounds {
+            let w = &node.world;
+            let corners = [
+                Vec3::new(min[0], min[1], min[2]),
+                Vec3::new(max[0], min[1], min[2]),
+                Vec3::new(min[0], max[1], min[2]),
+                Vec3::new(max[0], max[1], min[2]),
+                Vec3::new(min[0], min[1], max[2]),
+                Vec3::new(max[0], min[1], max[2]),
+                Vec3::new(min[0], max[1], max[2]),
+                Vec3::new(max[0], max[1], max[2]),
+            ];
+
+            for c in corners {
+                let wp = w.transform_point(c);
+                world_min = world_min.min(wp);
+                world_max = world_max.max(wp);
+            }
+            has_bounds = true;
         }
 
-        Some((world_min.to_array(), world_max.to_array()))
+        for &child in &node.children {
+            if let Some((c_min, c_max)) = self.world_bounds(child) {
+                world_min = world_min.min(Vec3::from_array(c_min));
+                world_max = world_max.max(Vec3::from_array(c_max));
+                has_bounds = true;
+            }
+        }
+
+        if has_bounds {
+            Some((world_min.to_array(), world_max.to_array()))
+        } else {
+            None
+        }
     }
 
     /// Synchronize all nodes bound to a `group_id` into the given `GroupRow` buffer.
