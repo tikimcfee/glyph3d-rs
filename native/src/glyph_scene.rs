@@ -75,7 +75,7 @@ pub use camera::{CameraMode, FlyCamera, FOV_Y};
 use camera::CamFrame;
 
 mod cull;
-pub use cull::{SegCull, BACKDROP_GAIN, GLYPH_CELL_AREA, LOD_MIN_PX};
+pub use cull::{BlockCull, SegCull, BACKDROP_GAIN, GLYPH_CELL_AREA, LOD_MIN_PX};
 use cull::CullState;
 
 mod pick;
@@ -458,6 +458,7 @@ impl GlyphScene {
                     staged.bounds_max[1] - staged.bounds_min[1],
                     &atlas.slot_ink,
                 ),
+                blocks: Vec::new(),
             });
         }
         // multi_draw_indirect is core in wgpu 30 — but its Metal backend

@@ -83,13 +83,45 @@ pub struct StagedText {
 
 /// Stage F: one cull segment covering a whole staged block (the text/engine
 /// scenes don't need per-group granularity — their instance counts are small).
+/// Divides into sub-blocks if instance count exceeds 512 for fine-grained culling.
 fn cover_segment(instances: &[GlyphInstance], min: [f32; 3], max: [f32; 3], slot_ink: &[Option<[f32; 4]>]) -> SegCull {
+    const SUBSEG_BLOCK_SIZE: usize = 512;
+    let mut blocks = Vec::new();
+    if instances.len() > SUBSEG_BLOCK_SIZE {
+        for (b_idx, chunk) in instances.chunks(SUBSEG_BLOCK_SIZE).enumerate() {
+            let b_start = b_idx * SUBSEG_BLOCK_SIZE;
+            let mut min_x = f32::INFINITY;
+            let mut min_y = f32::INFINITY;
+            let mut min_z = f32::INFINITY;
+            let mut max_x = f32::NEG_INFINITY;
+            let mut max_y = f32::NEG_INFINITY;
+            let mut max_z = f32::NEG_INFINITY;
+            for s in chunk {
+                let qw = s.advance.max(s.height);
+                min_x = min_x.min(s.pos[0]);
+                max_x = max_x.max(s.pos[0] + qw);
+                min_y = min_y.min(s.pos[1] - 0.5 * s.height);
+                max_y = max_y.max(s.pos[1] + 0.5 * s.height);
+                min_z = min_z.min(s.pos[2]);
+                max_z = max_z.max(s.pos[2]);
+            }
+            if min_x <= max_x && min_y <= max_y {
+                blocks.push(crate::glyph_scene::BlockCull {
+                    min: [min_x - 0.3, min_y - 0.5, min_z],
+                    max: [max_x + 0.6, max_y + 0.75, max_z],
+                    slot_base: b_start as u32,
+                    slot_count: chunk.len() as u32,
+                });
+            }
+        }
+    }
     SegCull {
         min,
         max,
         slot_base: 0,
         slot_count: instances.len() as u32,
         tint: seg_tint(instances, max[0] - min[0], max[1] - min[1], slot_ink),
+        blocks,
     }
 }
 
