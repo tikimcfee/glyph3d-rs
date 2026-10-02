@@ -323,9 +323,22 @@ impl LayoutController {
         Some(format!("deck: toggled mode to {:?}", new_mode))
     }
 
-    /// Spawn an Agent Carrel with Turn Deck and Workdesk for interactive spatial experimentation.
+    /// Spawn or focus an Agent Carrel with Turn Deck and Workdesk for interactive spatial experimentation.
     pub fn spawn_agent_carrel_demo(&mut self) -> String {
         use crate::spatial_scene::{Deck, FileActionKind};
+
+        // If the agent carrel demo already exists, do not duplicate nodes!
+        // Instead, reset the deck active page to 0 in Rolodex mode.
+        if let Some(&_carrel_zone) = self.zone_entities.get("agent:carrel") {
+            if let Some(deck_e) = self.active_deck_entity() {
+                if let Some(mut deck) = self.scene.world.get_mut::<Deck>(deck_e) {
+                    deck.active_index = 0;
+                    deck.mode = crate::spatial_scene::DeckMode::Deck;
+                }
+                self.scene.update_transforms();
+                return "Agent Carrel demo already exists — reset to Turn 0 (Rolodex mode). Use [ / ] or n / p to turn pages, v to splay.".to_string();
+            }
+        }
 
         let carrel_root = self.scene.spawn_root("agent_carrel_root");
         if let Some(mut tf) = self.scene.world.get_mut::<Transform>(carrel_root) {

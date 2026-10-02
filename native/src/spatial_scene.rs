@@ -481,10 +481,8 @@ mod tests {
         assert_eq!(t1.translation, Vec3::ZERO);
         // Card 2 is cascading into -Z
         assert_eq!(t2.translation, Vec3::new(3.0, 5.0, -20.0));
-        // Card 0 is past, tucked to the left/back
-        assert!(t0.translation.x < 0.0);
-        assert!(t0.translation.z > 0.0);
-        assert_ne!(t0.rotation, Quat::IDENTITY);
+        // Card 0 wraps around to the back of the Rolodex cascade
+        assert_eq!(t0.translation, Vec3::new(6.0, 10.0, -40.0));
 
         // Retreat to page 0
         assert!(scene.deck_prev_page(deck_entity));
@@ -527,18 +525,15 @@ mod tests {
         let t2 = scene.world.get::<Transform>(items[2]).unwrap();
 
         // Item 0 is active (lifted along +Z)
-        assert_eq!(t0.translation.x, 0.0);
-        assert_eq!(t0.translation.y, 0.0);
         assert_eq!(t0.translation.z, 8.0); // default splay_lift
-
-        // Item 1 is in same row, displaced across X
-        assert!(t1.translation.x > 50.0);
-        assert_eq!(t1.translation.y, 0.0);
         assert_eq!(t1.translation.z, 0.0);
 
+        // Item 0 and 1 are in same row across X
+        assert_eq!(t0.translation.y, t1.translation.y);
+        assert!(t1.translation.x > t0.translation.x);
+
         // Item 2 is in next row down
-        assert_eq!(t2.translation.x, 0.0);
-        assert!(t2.translation.y < -40.0);
+        assert!(t2.translation.y < t0.translation.y);
     }
 
     #[test]

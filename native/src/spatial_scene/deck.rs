@@ -43,6 +43,8 @@ pub struct Deck {
     pub splay_lift: f32,
     /// Subtle rotation angle (in radians) around Y for turned/past cards in Deck mode.
     pub flip_angle_rad: f32,
+    /// Whether the deck wraps circularly in Deck mode (Rolodex carousel).
+    pub wrap: bool,
 }
 
 impl Default for Deck {
@@ -56,6 +58,7 @@ impl Default for Deck {
             splay_spacing: [15.0, 20.0],
             splay_lift: 8.0,
             flip_angle_rad: 0.12,
+            wrap: true,
         }
     }
 }
@@ -85,6 +88,11 @@ impl Deck {
         self
     }
 
+    pub fn with_wrap(mut self, wrap: bool) -> Self {
+        self.wrap = wrap;
+        self
+    }
+
     /// Advance active page forward in space. Returns true if active page changed.
     pub fn next_page(&mut self, total_items: usize) -> bool {
         if total_items == 0 {
@@ -93,15 +101,21 @@ impl Deck {
         if self.active_index + 1 < total_items {
             self.active_index += 1;
             true
+        } else if self.wrap && total_items > 1 {
+            self.active_index = 0;
+            true
         } else {
             false
         }
     }
 
     /// Retreat active page backward in space. Returns true if active page changed.
-    pub fn prev_page(&mut self) -> bool {
+    pub fn prev_page(&mut self, total_items: usize) -> bool {
         if self.active_index > 0 {
             self.active_index -= 1;
+            true
+        } else if self.wrap && total_items > 1 {
+            self.active_index = total_items - 1;
             true
         } else {
             false
@@ -151,25 +165,21 @@ pub fn compute_deck_layout(
     match deck.mode {
         DeckMode::Deck => {
             for (i, bounds) in child_bounds.iter().enumerate() {
-                let (trans, rot) = if i == active {
-                    (Vec3::ZERO, Quat::IDENTITY)
-                } else if i > active {
-                    let delta = (i - active) as f32;
-                    let pos = Vec3::new(
-                        delta * deck.crest_offset[0],
-                        delta * deck.crest_offset[1],
-                        -delta * deck.z_pitch,
-                    );
-                    (pos, Quat::IDENTITY)
+                let slot = if deck.wrap {
+                    ((i as isize - active as isize).rem_euclid(n as isize)) as usize
+                } else if i >= active {
+                    i - active
                 } else {
-                    let delta = (active - i) as f32;
-                    let tuck_x = -delta * (deck.crest_offset[0] + 12.0);
-                    let tuck_y = delta * deck.crest_offset[1];
-                    let tuck_z = delta * (deck.z_pitch * 0.4);
-                    let pos = Vec3::new(tuck_x, tuck_y, tuck_z);
-                    let rot = Quat::from_rotation_y(-deck.flip_angle_rad * delta.min(4.0));
-                    (pos, rot)
+                    n - 1 - (active - i - 1)
                 };
+
+                let delta = slot as f32;
+                let trans = Vec3::new(
+                    delta * deck.crest_offset[0],
+                    delta * deck.crest_offset[1],
+                    -delta * deck.z_pitch,
+                );
+                let rot = Quat::IDENTITY;
 
                 transforms.push((trans, rot));
 
@@ -202,7 +212,7 @@ pub fn compute_deck_layout(
                 let bias_x = -bounds.0[0];
                 let bias_y = -bounds.1[1];
 
-                let target_x = col as f32 * pitch_x + bias_x;
+                let target_x = ((col as f32) - (cols - 1) as f32 * 0.5) * pitch_x + bias_x - max_w * 0.5;
                 let target_y = -(row as f32 * pitch_y) + bias_y;
                 let target_z = if i == active { deck.splay_lift } else { 0.0 };
 
@@ -367,8 +377,13 @@ impl SpatialScene {
 
     /// Retreat active page in a Deck entity.
     pub fn deck_prev_page(&mut self, deck_entity: Entity) -> bool {
+        let total = self
+            .world
+            .get::<Children>(deck_entity)
+            .map(|c| c.len())
+            .unwrap_or(0);
         if let Some(mut deck) = self.world.get_mut::<Deck>(deck_entity) {
-            deck.prev_page()
+            deck.prev_page(total)
         } else {
             false
         }
