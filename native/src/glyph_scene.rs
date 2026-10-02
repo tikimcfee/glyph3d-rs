@@ -99,6 +99,7 @@ mod buffers;
 
 mod pipelines;
 mod render;
+pub mod mesh;
 
 pub struct GlyphScene {
     pub pipeline: wgpu::RenderPipeline,
@@ -189,6 +190,8 @@ pub struct GlyphScene {
     pub(in crate::glyph_scene) composite: CompositeState,
     pub(in crate::glyph_scene) params_buf: wgpu::Buffer,
     pub(in crate::glyph_scene) params: Cell<Params>,
+    pub(crate) mesh_pipeline: std::cell::RefCell<mesh::MeshPipeline>,
+    pub(crate) mesh_frame_bg: wgpu::BindGroup,
 }
 
 // ── Stage K (K4): what the live controls change, and what stays const ────
@@ -322,6 +325,33 @@ impl GlyphScene {
             contents: bytemuck::bytes_of(&params),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
+
+        let mesh_frame_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("mesh frame bgl"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
+        });
+        let mesh_frame_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("mesh frame bg"),
+            layout: &mesh_frame_bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: camera_buf.as_entire_binding(),
+                },
+            ],
+        });
+        let mesh_pipeline = std::cell::RefCell::new(mesh::MeshPipeline::new(device, POOL_FORMAT, &mesh_frame_bgl));
 
         let bgl = pipelines::build_glyph_bgl(device);
         // Trilinear, clamped: the UV rect is inset half a texel so clamping
@@ -534,6 +564,8 @@ impl GlyphScene {
             composite,
             params_buf,
             params: Cell::new(params),
+            mesh_pipeline,
+            mesh_frame_bg,
         }
     }
 
@@ -719,6 +751,17 @@ impl GlyphScene {
             [g.cols[2][0], g.cols[2][1], g.cols[2][2]],
             g.cols[2][3],
         ))
+    }
+
+    /// Group Affine3A transform from the CPU mirror.
+    pub(crate) fn group_affine(&self, gid: u32) -> Option<glam::Affine3A> {
+        let g = self.groups_cpu.get(gid as usize)?;
+        let t = Vec3::new(g.cols[0][0], g.cols[0][1], g.cols[0][2]);
+        let q = glam::Quat::from_xyzw(g.cols[1][0], g.cols[1][1], g.cols[1][2], g.cols[1][3]);
+        let q = if q.length_squared() > 1e-4 { q.normalize() } else { glam::Quat::IDENTITY };
+        let s = Vec3::new(g.cols[3][0], g.cols[3][1], g.cols[3][2]);
+        let s = if s.length_squared() > 1e-6 { s } else { Vec3::ONE };
+        Some(glam::Affine3A::from_scale_rotation_translation(s, q, t))
     }
 
     pub(crate) fn group_hidden(&self, gid: u32) -> bool {
@@ -1120,9 +1163,11 @@ impl GlyphScene {
         let d_vec = glam::Vec3::new(delta.x as f32, delta.y as f32, delta.z as f32);
 
         if let Some(ctrl) = &mut self.controller {
-            if let Some(&node_id) = ctrl.file_nodes.get(gid as usize) {
-                ctrl.hierarchy.translate(node_id, d_vec);
-                ctrl.hierarchy.update_world_transforms();
+            if let Some(&entity) = ctrl.file_entities.get(gid as usize) {
+                if let Some(mut transform) = ctrl.scene.world.get_mut::<bevy_transform::components::Transform>(entity) {
+                    transform.translation += d_vec;
+                }
+                ctrl.scene.update_transforms();
                 ctrl.sync_gpu_groups(&mut self.groups_cpu);
             } else if let Some(g) = self.groups_cpu.get_mut(gid as usize) {
                 g.cols[0][0] += delta.x as f32;
@@ -1158,9 +1203,11 @@ impl GlyphScene {
             let f = 1.1f32.powf(lines);
             let mut s = 0.0;
             if let Some(ctrl) = &mut self.controller {
-                if let Some(&node_id) = ctrl.file_nodes.get(gid as usize) {
-                    ctrl.hierarchy.scale(node_id, f);
-                    ctrl.hierarchy.update_world_transforms();
+                if let Some(&entity) = ctrl.file_entities.get(gid as usize) {
+                    if let Some(mut transform) = ctrl.scene.world.get_mut::<bevy_transform::components::Transform>(entity) {
+                        transform.scale *= f;
+                    }
+                    ctrl.scene.update_transforms();
                     ctrl.sync_gpu_groups(&mut self.groups_cpu);
                     if let Some(g) = self.groups_cpu.get(gid as usize) {
                         s = g.cols[3][0];

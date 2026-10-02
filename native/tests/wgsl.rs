@@ -34,7 +34,7 @@ fn all_wgsl_shaders_parse_and_validate() {
         names,
         // Stage L (L3): composite.wgsl added — the one new shader fence 2
         // sanctions for the pooled-target composite.
-        ["composite.wgsl", "cull.wgsl", "glyph_field.wgsl", "quad_field.wgsl"],
+        ["composite.wgsl", "cull.wgsl", "glyph_field.wgsl", "mesh.wgsl", "quad_field.wgsl"],
         "shader file set changed — update the test's expected list"
     );
 

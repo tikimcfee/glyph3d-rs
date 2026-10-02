@@ -100,17 +100,13 @@ pub(super) fn render_scene(
             file_backgrounds: cull.file_backgrounds.get(),
             file_bg_color: cull.file_bg_color.get(),
         };
-        let mut phase_draws = cull_segments(
+        let phase_draws = cull_segments(
             &cull.segments,
             &cull.hidden,
             &view,
             scene.chunk_cap,
             scene.bind_groups.len() as u32,
         );
-        if let Some(ctrl) = &scene.controller {
-            let prim_insts = ctrl.hierarchy.collect_primitive_instances();
-            phase_draws.backdrops.extend(prim_insts);
-        }
         if !phase_draws.backdrops.is_empty() {
             let max_cap = (cull.backdrop_insts_buf.size()
                 / std::mem::size_of::<crate::glyph_scene::cull::BackdropInst>() as u64)
@@ -228,6 +224,11 @@ pub(super) fn render_scene(
         }
     }
 
+    let scene_meshes = scene.controller.as_ref().map(|ctrl| ctrl.scene.collect_mesh_instances());
+    if let Some(meshes) = &scene_meshes {
+        scene.mesh_pipeline.borrow_mut().prepare(&ctx.device, &ctx.queue, &meshes.quads, &meshes.cubes);
+    }
+
     // Stage H: pass-level GPU timer (TIMESTAMP_QUERY; pass-boundary writes,
     // so it works on Metal). Nested in-pass scopes below additionally need
     // TIMESTAMP_QUERY_INSIDE_PASSES — where unsupported they simply report
@@ -239,6 +240,9 @@ pub(super) fn render_scene(
     // Stage L (L3): the pass renders into the pooled target.
     let draw_depth_view = &vt.depth;
     let draw_color_view = &vt.color_views[pool_slot];
+    
+    let mp_ref = scene.mesh_pipeline.borrow();
+
     let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
         label: Some("glyph field pass"),
         timestamp_writes: pass_query
@@ -297,6 +301,17 @@ pub(super) fn render_scene(
                         if let (Some(p), Some(q)) = (&ctx.profiler, q) {
                             p.borrow().end_query(&mut pass, q);
                         }
+                    }
+                }
+
+                if let Some(meshes) = &scene_meshes {
+                    let q_len = meshes.quads.len() as u32;
+                    let c_len = meshes.cubes.len() as u32;
+                    if q_len > 0 {
+                        mp_ref.render(&mut pass, crate::glyph_scene::mesh::UnitMesh::Quad, 0..q_len, &scene.mesh_frame_bg);
+                    }
+                    if c_len > 0 {
+                        mp_ref.render(&mut pass, crate::glyph_scene::mesh::UnitMesh::Cube, q_len..(q_len + c_len), &scene.mesh_frame_bg);
                     }
                 }
             }

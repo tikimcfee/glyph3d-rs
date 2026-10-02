@@ -9,7 +9,9 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 use crate::glyph_scene::GroupRow;
 use crate::repo::{dir_tint, FileView, RepoLayoutMode, RepoParams};
-use crate::spatial_hierarchy::{Material, MeshGeometry, NodeId, SpatialHierarchy, SpatialTransform};
+use crate::spatial_scene::SpatialScene;
+use bevy_ecs::entity::Entity;
+use bevy_transform::components::Transform;
 
 /// Strategy for laying out a group of files within its local bounds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -54,8 +56,8 @@ pub struct LayoutZone {
     pub computed_size: [f32; 3],
     /// Computed origin [x, y, z] in world space after macro layout.
     pub computed_origin: [f32; 3],
-    /// Optional bound node in the SpatialHierarchy.
-    pub node_id: Option<NodeId>,
+    /// Optional bound entity in the SpatialScene.
+    pub entity: Option<Entity>,
 }
 
 impl LayoutZone {
@@ -68,7 +70,7 @@ impl LayoutZone {
             custom_tint: None,
             computed_size: [0.0; 3],
             computed_origin: [0.0; 3],
-            node_id: None,
+            entity: None,
         }
     }
 }
@@ -96,14 +98,23 @@ pub struct LayoutStack {
 /// Encapsulates the active layout mode, the layout stack, and repo parameters.
 /// Allows users or agents to dynamically query and modify layout assignments
 /// and re-evaluate file placements across the canvas.
-#[derive(Debug, Clone)]
 pub struct LayoutController {
     pub mode: RepoLayoutMode,
     pub stack: LayoutStack,
     pub params: RepoParams,
-    pub hierarchy: SpatialHierarchy,
-    pub zone_nodes: HashMap<String, NodeId>,
-    pub file_nodes: Vec<NodeId>,
+    pub scene: SpatialScene,
+    pub zone_entities: HashMap<String, Entity>,
+    pub file_entities: Vec<Entity>,
+}
+
+impl std::fmt::Debug for LayoutController {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LayoutController")
+            .field("mode", &self.mode)
+            .field("stack", &self.stack)
+            .field("params", &self.params)
+            .finish()
+    }
 }
 
 impl LayoutController {
@@ -131,9 +142,9 @@ impl LayoutController {
                 avenue_gap_y,
             },
             params,
-            hierarchy: SpatialHierarchy::new(),
-            zone_nodes: HashMap::new(),
-            file_nodes: Vec::new(),
+            scene: SpatialScene::new(),
+            zone_entities: HashMap::new(),
+            file_entities: Vec::new(),
         }
     }
 
@@ -191,9 +202,11 @@ impl LayoutController {
     /// Translate a zone by a delta vector. Automatically propagates down
     /// to all contained files and sheets in that zone.
     pub fn move_zone(&mut self, zone_id: &str, delta: glam::Vec3) -> bool {
-        if let Some(&node_id) = self.zone_nodes.get(zone_id) {
-            self.hierarchy.translate(node_id, delta);
-            self.hierarchy.update_world_transforms();
+        if let Some(&entity) = self.zone_entities.get(zone_id) {
+            if let Some(mut transform) = self.scene.world.get_mut::<Transform>(entity) {
+                transform.translation += delta;
+            }
+            self.scene.update_transforms();
             true
         } else {
             false
@@ -202,9 +215,11 @@ impl LayoutController {
 
     /// Scale a zone by a factor. Automatically propagates down to all children.
     pub fn scale_zone(&mut self, zone_id: &str, factor: f32) -> bool {
-        if let Some(&node_id) = self.zone_nodes.get(zone_id) {
-            self.hierarchy.scale(node_id, factor);
-            self.hierarchy.update_world_transforms();
+        if let Some(&entity) = self.zone_entities.get(zone_id) {
+            if let Some(mut transform) = self.scene.world.get_mut::<Transform>(entity) {
+                transform.scale *= factor;
+            }
+            self.scene.update_transforms();
             true
         } else {
             false
@@ -213,53 +228,52 @@ impl LayoutController {
 
     /// Retrieve the world-space bounding box for a zone: [min, max].
     pub fn zone_world_bounds(&self, zone_id: &str) -> Option<([f32; 3], [f32; 3])> {
-        let node_id = *self.zone_nodes.get(zone_id)?;
-        self.hierarchy.world_bounds(node_id)
+        let entity = *self.zone_entities.get(zone_id)?;
+        self.scene.world_bounds(entity)
     }
 
     /// Retrieve the world-space bounding box for a file view by index: [min, max].
     pub fn file_world_bounds(&self, file_idx: usize) -> Option<([f32; 3], [f32; 3])> {
-        let node_id = *self.file_nodes.get(file_idx)?;
-        self.hierarchy.world_bounds(node_id)
+        let entity = *self.file_entities.get(file_idx)?;
+        self.scene.world_bounds(entity)
     }
 
     /// Synchronize all spatial hierarchy nodes into the GPU GroupRow buffer.
     /// Returns the list of updated group IDs.
-    pub fn sync_gpu_groups(&self, groups: &mut [GroupRow]) -> Vec<u32> {
-        self.hierarchy.sync_to_group_rows(groups)
+    pub fn sync_gpu_groups(&mut self, groups: &mut [GroupRow]) -> Vec<u32> {
+        self.scene.sync_to_group_rows(groups)
     }
 
-    /// Populate the SpatialHierarchy for Shelf layout mode, so that file nodes
+    /// Populate the SpatialScene for Shelf layout mode, so that file nodes
     /// and the base shelf zone exist for picking, dragging, and bounds queries.
     pub fn build_shelf_hierarchy(&mut self, views: &[FileView]) {
-        self.hierarchy = SpatialHierarchy::new();
-        self.zone_nodes.clear();
-        self.file_nodes = vec![NodeId(0); views.len()];
+        self.scene = SpatialScene::new();
+        self.zone_entities.clear();
+        self.file_entities = vec![Entity::PLACEHOLDER; views.len()];
 
-        let stack_root = self.hierarchy.create_node("stack_root");
-        let shelf_zone_node = self.hierarchy.create_node("zone:base:shelf");
-        self.hierarchy.attach_child(stack_root, shelf_zone_node);
-        self.zone_nodes.insert("base:shelf".to_string(), shelf_zone_node);
+        let stack_root = self.scene.spawn_root("stack_root");
+        let shelf_zone_node = self.scene.spawn_zone(
+            stack_root,
+            "base:shelf",
+            "Shelf",
+            Transform::IDENTITY,
+            [0.0, 0.0],
+        );
+        self.zone_entities.insert("base:shelf".to_string(), shelf_zone_node);
 
         for (i, v) in views.iter().enumerate() {
-            let file_node = self.hierarchy.create_node(v.rel_path.clone());
-            self.hierarchy.attach_child(shelf_zone_node, file_node);
-            self.hierarchy.set_local_transform(
-                file_node,
-                SpatialTransform::from_xyz(v.offset[0], v.offset[1], v.offset[2]),
+            let file_node = self.scene.spawn_file_card(
+                shelf_zone_node,
+                v.rel_path.clone(),
+                v.dir.clone(),
+                i as u32,
+                Transform::from_xyz(v.offset[0], v.offset[1], v.offset[2]),
+                ([0.0, -v.height, v.z_min], [v.width, 0.0, v.z_max]),
+                crate::repo::dir_tint(&v.dir),
             );
-            self.hierarchy.set_local_bounds(
-                file_node,
-                [0.0, -v.height, v.z_min],
-                [v.width, 0.0, v.z_max],
-            );
-            self.hierarchy.set_group_id(file_node, i as u32);
-            self.hierarchy.set_tint(file_node, crate::repo::dir_tint(&v.dir));
-            self.hierarchy.set_mesh(file_node, MeshGeometry::Glyphs { group_id: i as u32 });
-            self.hierarchy.set_material(file_node, Material::Slug);
-            self.file_nodes[i] = file_node;
+            self.file_entities[i] = file_node;
         }
-        self.hierarchy.update_world_transforms();
+        self.scene.update_transforms();
     }
 
     /// Apply the layout stack and control object to place all files on the canvas.
@@ -343,11 +357,11 @@ impl LayoutController {
         let mut macro_shelf_h = 0.0f32;
         let mut max_macro_x = 0.0f32;
 
-        // Rebuild spatial hierarchy
-        self.hierarchy = SpatialHierarchy::new();
-        self.zone_nodes.clear();
-        self.file_nodes = vec![NodeId(0); views.len()];
-        let stack_root = self.hierarchy.create_node("stack_root");
+        // Rebuild spatial scene
+        self.scene = SpatialScene::new();
+        self.zone_entities.clear();
+        self.file_entities = vec![Entity::PLACEHOLDER; views.len()];
+        let stack_root = self.scene.spawn_root("stack_root");
 
         for z in &mut evaluated_zones {
             let zone_w = z.zone.computed_size[0];
@@ -388,19 +402,15 @@ impl LayoutController {
 
             z.zone.computed_origin = origin;
 
-            let zone_node = self.hierarchy.create_node(format!("zone:{}", z.zone.id));
-            self.hierarchy.attach_child(stack_root, zone_node);
-            self.hierarchy.set_local_transform(
-                zone_node,
-                SpatialTransform::from_xyz(origin[0], origin[1], origin[2]),
+            let zone_node = self.scene.spawn_zone(
+                stack_root,
+                z.zone.id.clone(),
+                z.zone.title.clone(),
+                Transform::from_xyz(origin[0], origin[1], origin[2]),
+                [zone_w, zone_h],
             );
-            self.hierarchy.set_local_bounds(
-                zone_node,
-                [0.0, -zone_h, 0.0],
-                [zone_w, 0.0, 0.0],
-            );
-            z.zone.node_id = Some(zone_node);
-            self.zone_nodes.insert(z.zone.id.clone(), zone_node);
+            z.zone.entity = Some(zone_node);
+            self.zone_entities.insert(z.zone.id.clone(), zone_node);
 
             // Spawn the zone's container plate as a child entity of zone_node
             let pad = 2.0f32;
@@ -409,15 +419,13 @@ impl LayoutController {
             let tint = custom_tint.unwrap_or_else(|| dir_tint(dir_for_zone));
             let plate_color = [tint[0] * 0.15, tint[1] * 0.15, tint[2] * 0.18, 0.95];
 
-            self.hierarchy.spawn_child(
+            self.scene.spawn_plate(
                 zone_node,
                 format!("plate:{}", z.zone.id),
-                SpatialTransform::from_xyz(-pad, pad, -0.05),
-                MeshGeometry::Quad {
-                    size: [zone_w + pad * 2.0, zone_h + pad * 2.0],
-                    origin: [0.0, -(zone_h + pad * 2.0)],
-                },
-                Material::Flat { color: plate_color },
+                Transform::from_xyz(-pad, pad, -0.05),
+                [zone_w + pad * 2.0, zone_h + pad * 2.0],
+                [0.0, -(zone_h + pad * 2.0)],
+                plate_color,
             );
 
             for (file_in_zone, &file_view_idx) in z.files.iter().enumerate() {
@@ -428,27 +436,21 @@ impl LayoutController {
                     origin[2],
                 ];
 
-                let file_node = self.hierarchy.create_node(views[file_view_idx].rel_path.clone());
-                self.hierarchy.attach_child(zone_node, file_node);
-                self.hierarchy.set_local_transform(
-                    file_node,
-                    SpatialTransform::from_xyz(rel_x, rel_y, 0.0),
-                );
                 let v = &views[file_view_idx];
-                self.hierarchy.set_local_bounds(
-                    file_node,
-                    [0.0, -v.height, v.z_min],
-                    [v.width, 0.0, v.z_max],
-                );
-                self.hierarchy.set_group_id(file_node, file_view_idx as u32);
                 let tint = z.zone.custom_tint.unwrap_or_else(|| dir_tint(&v.dir));
-                self.hierarchy.set_tint(file_node, tint);
-                self.hierarchy.set_mesh(file_node, MeshGeometry::Glyphs { group_id: file_view_idx as u32 });
-                self.hierarchy.set_material(file_node, Material::Slug);
-                self.file_nodes[file_view_idx] = file_node;
+                let file_node = self.scene.spawn_file_card(
+                    zone_node,
+                    views[file_view_idx].rel_path.clone(),
+                    v.dir.clone(),
+                    file_view_idx as u32,
+                    Transform::from_xyz(rel_x, rel_y, 0.0),
+                    ([0.0, -v.height, v.z_min], [v.width, 0.0, v.z_max]),
+                    tint,
+                );
+                self.file_entities[file_view_idx] = file_node;
             }
         }
-        self.hierarchy.update_world_transforms();
+        self.scene.update_transforms();
 
         let min_macro_y = match self.stack.macro_arrangement {
             MacroArrangement::CanvasAvenues | MacroArrangement::LinearColumn => macro_top - macro_shelf_h,
@@ -786,8 +788,8 @@ mod tests {
 
         // base:shelf zone must exist
         assert!(controller.zone_world_bounds("base:shelf").is_some());
-        // file nodes must exist
-        assert_eq!(controller.file_nodes.len(), 3);
+        // file entities must exist
+        assert_eq!(controller.file_entities.len(), 3);
         assert!(controller.file_world_bounds(0).is_some());
     }
 

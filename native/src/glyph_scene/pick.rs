@@ -261,22 +261,31 @@ impl GlyphScene {
             if self.group_hidden(info.group_id) {
                 continue;
             }
-            let Some((off, sc, _, _)) = self.group_trs(info.group_id) else {
+            let Some(affine) = self.group_affine(info.group_id) else {
                 continue;
             };
-            let p0 = DVec3::new(
-                info.aabb_min[0] as f64 * sc.x as f64 + off.x as f64,
-                info.aabb_min[1] as f64 * sc.y as f64 + off.y as f64,
-                info.aabb_min[2] as f64 * sc.z as f64 + off.z as f64,
+            let inv_affine = affine.inverse();
+
+            let ro_f32 = glam::Vec3::new(ro.x as f32, ro.y as f32, ro.z as f32);
+            let rd_f32 = glam::Vec3::new(rd.x as f32, rd.y as f32, rd.z as f32);
+            let ro_local = inv_affine.transform_point3(ro_f32);
+            let rd_local = inv_affine.transform_vector3(rd_f32);
+            let ro_loc_d = DVec3::new(ro_local.x as f64, ro_local.y as f64, ro_local.z as f64);
+            let rd_loc_d = DVec3::new(rd_local.x as f64, rd_local.y as f64, rd_local.z as f64);
+
+            let b_min = DVec3::new(
+                info.aabb_min[0] as f64,
+                info.aabb_min[1] as f64,
+                info.aabb_min[2] as f64,
             );
-            let p1 = DVec3::new(
-                info.aabb_max[0] as f64 * sc.x as f64 + off.x as f64,
-                info.aabb_max[1] as f64 * sc.y as f64 + off.y as f64,
-                info.aabb_max[2] as f64 * sc.z as f64 + off.z as f64,
+            let b_max = DVec3::new(
+                info.aabb_max[0] as f64,
+                info.aabb_max[1] as f64,
+                info.aabb_max[2] as f64,
             );
-            let min = p0.min(p1);
-            let max = p0.max(p1);
-            if let Some(t) = ray_aabb(ro, rd, min, max) {
+            let min = b_min.min(b_max);
+            let max = b_min.max(b_max);
+            if let Some(t) = ray_aabb(ro_loc_d, rd_loc_d, min, max) {
                 if best.is_none_or(|(_, bt)| t < bt) {
                     best = Some((info.group_id, t));
                 }
@@ -311,7 +320,7 @@ impl GlyphScene {
             .find(|f| f.group_id == gid)?
             .rel_path
             .clone();
-        let (off, sc, _, _) = self.group_trs(gid)?;
+        let (_off, sc, _, _) = self.group_trs(gid)?;
         if dbg {
             println!(
                 "pickdbg: px ({x},{y}) ro=({:.4},{:.4},{:.4}) rd=({:.6},{:.6},{:.6}) file={rel_path}",
@@ -334,8 +343,18 @@ impl GlyphScene {
             });
         }
 
+        let affine = self.group_affine(gid)?;
+        let inv_affine = affine.inverse();
+
+        let ro_f32 = glam::Vec3::new(ro.x as f32, ro.y as f32, ro.z as f32);
+        let rd_f32 = glam::Vec3::new(rd.x as f32, rd.y as f32, rd.z as f32);
+        let ro_local = inv_affine.transform_point3(ro_f32);
+        let rd_local = inv_affine.transform_vector3(rd_f32);
+        let ro_loc_d = DVec3::new(ro_local.x as f64, ro_local.y as f64, ro_local.z as f64);
+        let rd_loc_d = DVec3::new(rd_local.x as f64, rd_local.y as f64, rd_local.z as f64);
+
         // Hit-test glyph records in 3D: for each record r, intersect the ray
-        // with the plane z = r.z() * sc.z + off.z.
+        // with the plane z = r.z() in file local space.
         // Records sharing the same z avoid recomputing the ray-plane intersection.
         let mut last_z = f32::NAN;
         let mut cur_t = 0.0f64;
@@ -356,15 +375,14 @@ impl GlyphScene {
             let rz = r.z();
             if rz != last_z {
                 last_z = rz;
-                let zw = rz as f64 * sc.z as f64 + off.z as f64;
-                cur_t = if rd.z.abs() > 1e-12 {
-                    (zw - ro.z) / rd.z
+                cur_t = if rd_loc_d.z.abs() > 1e-12 {
+                    (rz as f64 - ro_loc_d.z) / rd_loc_d.z
                 } else {
                     t_aabb
                 };
-                let p = ro + rd * cur_t.max(0.0);
-                cur_qx = ((p.x - off.x as f64) / (sc.x as f64).max(1e-6)) as f32;
-                cur_qy = ((p.y - off.y as f64) / (sc.y as f64).max(1e-6)) as f32;
+                let p = ro_loc_d + rd_loc_d * cur_t.max(0.0);
+                cur_qx = p.x as f32;
+                cur_qy = p.y as f32;
             }
 
             let x0 = r.x();

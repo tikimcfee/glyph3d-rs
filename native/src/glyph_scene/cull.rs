@@ -320,7 +320,7 @@ impl CullState {
         }
 
         let backdrop_stride = std::mem::size_of::<BackdropInst>() as u64;
-        let max_backdrops = (seg_count * 2 + 512).max(1024) as u64;
+        let max_backdrops = (seg_count * 2).max(64) as u64;
         let backdrop_insts_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("backdrop instances"),
             size: max_backdrops * backdrop_stride,
