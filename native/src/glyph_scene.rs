@@ -181,6 +181,8 @@ pub struct GlyphScene {
     /// --no-composite A/B escape hatch proved neutrality and was removed at
     /// stage end; see out/STAGE_L_REPORT.md).
     pub(in crate::glyph_scene) composite: CompositeState,
+    pub(in crate::glyph_scene) params_buf: wgpu::Buffer,
+    pub(in crate::glyph_scene) params: Cell<Params>,
 }
 
 // ── Stage K (K4): what the live controls change, and what stays const ────
@@ -294,7 +296,7 @@ impl GlyphScene {
         let sheet = &atlas.emoji.sheet;
         let params = Params {
             max_groups: groups.len() as u32,
-            _pad0: 0,
+            greek_mode: 1,
             _pad1: 0,
             _pad2: 0,
             // GLYPH_LOD_DEFAULTS (GlyphField.js)
@@ -306,12 +308,13 @@ impl GlyphScene {
             emoji_cols: sheet.cols,
             emoji_rows: sheet.rows_per_layer,
             emoji_layer: [sheet.layer_w as f32, sheet.layer_h as f32],
-            _pad3: [0, 0],
+            greek_onset_px: 10.0,
+            _pad3: 0,
         };
         let params_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("glyph params"),
             contents: bytemuck::bytes_of(&params),
-            usage: wgpu::BufferUsages::UNIFORM,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
 
         let bgl = pipelines::build_glyph_bgl(device);
@@ -519,6 +522,29 @@ impl GlyphScene {
             ui_probe: None,
             device: device.clone(),
             composite,
+            params_buf,
+            params: Cell::new(params),
+        }
+    }
+
+    /// Configure whether Greeking (anti-Moiré subpixel bars) is enabled.
+    pub fn set_greeking(&self, queue: &wgpu::Queue, on: bool) {
+        let mut p = self.params.get();
+        let mode = if on { 1 } else { 0 };
+        if p.greek_mode != mode {
+            p.greek_mode = mode;
+            self.params.set(p);
+            queue.write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&p));
+        }
+    }
+
+    /// Configure the on-screen glyph height in px/em where Greeking begins (default: 10.0).
+    pub fn set_greek_onset_px(&self, queue: &wgpu::Queue, onset: f32) {
+        let mut p = self.params.get();
+        if (p.greek_onset_px - onset).abs() > 1e-3 {
+            p.greek_onset_px = onset;
+            self.params.set(p);
+            queue.write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&p));
         }
     }
 
@@ -665,7 +691,7 @@ impl GlyphScene {
             }
             _ => glam::camera::rh::view::look_at_mat4(eye, target, Vec3::Y),
         };
-        let proj = glam::camera::rh::proj::directx::perspective(fov, aspect, near, far);
+        let proj = glam::camera::rh::proj::directx::perspective(fov, aspect, far, near);
         CamFrame {
             view_proj: proj * view,
             eye,

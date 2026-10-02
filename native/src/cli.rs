@@ -262,6 +262,12 @@ pub struct Cli {
     /// Render file background cards behind glyph fields
     #[arg(long)]
     pub file_backgrounds: bool,
+    /// Disable Greeking subpixel glyphs into stable horizontal ink bars
+    #[arg(long)]
+    pub no_greeking: bool,
+    /// On-screen glyph height in px/em where Greeking begins (default: 10.0)
+    #[arg(long, value_name = "F")]
+    pub greek_onset_px: Option<f32>,
     /// File background card RGBA color (e.g. "0.10,0.10,0.13,0.85")
     #[arg(long, value_name = "R,G,B,A", value_parser = parse_rgba)]
     pub file_bg_color: Option<[f32; 4]>,
@@ -503,8 +509,10 @@ fn parse_cli_from(matches: clap::ArgMatches) -> Cli {
 
     let config_path = if let Some(path) = &cli.launch_config {
         Some(path.clone())
-    } else if cli.screenshot.is_none() && Path::new("launch_config.toml").is_file() {
+    } else if !cfg!(test) && cli.screenshot.is_none() && Path::new("launch_config.toml").is_file() {
         Some(PathBuf::from("launch_config.toml"))
+    } else if !cfg!(test) && cli.screenshot.is_none() && Path::new("../launch_config.toml").is_file() {
+        Some(PathBuf::from("../launch_config.toml"))
     } else {
         None
     };
@@ -573,6 +581,20 @@ fn parse_cli_from(matches: clap::ArgMatches) -> Cli {
                 {
                     if let Some(nu) = cfg.no_ui {
                         cli.no_ui = nu;
+                    }
+                }
+                if matches.value_source("no_greeking")
+                    != Some(clap::parser::ValueSource::CommandLine)
+                {
+                    if let Some(greek) = cfg.greeking {
+                        cli.no_greeking = !greek;
+                    }
+                }
+                if matches.value_source("greek_onset_px")
+                    != Some(clap::parser::ValueSource::CommandLine)
+                {
+                    if let Some(onset) = cfg.greek_onset_px {
+                        cli.greek_onset_px = Some(onset);
                     }
                 }
                 if matches.value_source("load_repo")
@@ -667,6 +689,8 @@ mod cli_tests {
         assert!(!cli.repo_scan_only);
         assert!(!cli.no_cull);
         assert!(!cli.no_ui);
+        assert!(!cli.no_greeking);
+        assert!(cli.greek_onset_px.is_none());
         assert!(cli.launch_config.is_none());
         assert!(!cli.file_backgrounds);
         assert!(cli.file_bg_color.is_none());
@@ -1028,6 +1052,7 @@ mod cli_tests {
             file_bg_color = [0.2, 0.3, 0.4, 0.9]
             lod_min_px = 3.5
             wrap_mode = "down"
+            greeking = false
             "#,
         )
         .expect("write temp config");
@@ -1043,6 +1068,7 @@ mod cli_tests {
         assert!(cli.file_backgrounds);
         assert_eq!(cli.file_bg_color, Some([0.2, 0.3, 0.4, 0.9]));
         assert_eq!(cli.lod_min_px, Some(3.5));
+        assert!(cli.no_greeking);
         assert_eq!(cli.wrap_mode, "back"); // CLI flag overrode TOML config
     }
 }

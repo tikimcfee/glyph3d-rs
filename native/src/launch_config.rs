@@ -16,6 +16,8 @@ pub struct LaunchConfig {
     pub color_mode: Option<String>,
     pub no_cull: Option<bool>,
     pub no_ui: Option<bool>,
+    pub greeking: Option<bool>,
+    pub greek_onset_px: Option<f32>,
     pub load_repo: Option<PathBuf>,
 }
 
@@ -71,6 +73,14 @@ impl LaunchConfig {
                 }
                 "no_ui" => {
                     cfg.no_ui = Some(parse_bool(val, line_idx)?);
+                }
+                "greeking" => {
+                    cfg.greeking = Some(parse_bool(val, line_idx)?);
+                }
+                "greek_onset_px" => {
+                    cfg.greek_onset_px = Some(val.parse::<f32>().map_err(|e| {
+                        format!("line {}: invalid float for greek_onset_px: {e}", line_idx + 1)
+                    })?);
                 }
                 "load_repo" => {
                     cfg.load_repo = Some(PathBuf::from(strip_quotes(val)));
@@ -128,6 +138,8 @@ mod tests {
             color_mode = "flat"
             no_cull = false
             no_ui = true
+            greeking = true
+            greek_onset_px = 12.0
             load_repo = "/path/to/repo"
         "#;
         let cfg = LaunchConfig::from_toml_str(toml).expect("parse failed");
@@ -140,6 +152,8 @@ mod tests {
         assert_eq!(cfg.color_mode.as_deref(), Some("flat"));
         assert_eq!(cfg.no_cull, Some(false));
         assert_eq!(cfg.no_ui, Some(true));
+        assert_eq!(cfg.greeking, Some(true));
+        assert_eq!(cfg.greek_onset_px, Some(12.0));
         assert_eq!(cfg.load_repo, Some(PathBuf::from("/path/to/repo")));
     }
 }

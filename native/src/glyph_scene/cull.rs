@@ -434,9 +434,13 @@ impl CullState {
             depth_stencil: Some(wgpu::DepthStencilState {
                 format: depth_format,
                 depth_write_enabled: Some(true),
-                depth_compare: Some(wgpu::CompareFunction::LessEqual),
+                depth_compare: Some(wgpu::CompareFunction::GreaterEqual),
                 stencil: Default::default(),
-                bias: Default::default(),
+                bias: wgpu::DepthBiasState {
+                    constant: -100,
+                    slope_scale: -1.5,
+                    clamp: 0.0,
+                },
             }),
             multisample: wgpu::MultisampleState {
                 count: SCENE_SAMPLE_COUNT, // Stage L (L3): loud non-MSAA pin
@@ -466,6 +470,42 @@ impl CullState {
 #[cfg(test)]
 mod cull_depth_tests {
     use super::*;
+
+    #[test]
+    fn reversed_z_math() {
+        let fov = 60f32.to_radians();
+        let aspect = 1.6f32;
+        let near = 0.05f32;
+        let far = 1000.0f32;
+
+        let p_rev = glam::camera::rh::proj::directx::perspective(fov, aspect, far, near);
+        let v_near = p_rev.project_point3(Vec3::new(0.0, 0.0, -near));
+        let v_far = p_rev.project_point3(Vec3::new(0.0, 0.0, -far));
+        assert!((v_near.z - 1.0).abs() < 1e-4, "near z must be 1.0, got {}", v_near.z);
+        assert!((v_far.z - 0.0).abs() < 1e-4, "far z must be 0.0, got {}", v_far.z);
+
+        // Frustum planes check: a point at z = -500 (inside frustum)
+        let planes = frustum_planes(&p_rev);
+        let pt_inside = Vec3::new(0.0, 0.0, -500.0);
+        for (i, pl) in planes.iter().enumerate() {
+            let dist = pl[0] * pt_inside.x + pl[1] * pt_inside.y + pl[2] * pt_inside.z + pl[3];
+            assert!(dist >= 0.0, "plane {} should contain pt_inside, dist = {}", i, dist);
+        }
+
+        // A point behind the camera (z = +10) must be culled
+        let pt_behind = Vec3::new(0.0, 0.0, 10.0);
+        let culled_behind = planes.iter().any(|pl| {
+            pl[0] * pt_behind.x + pl[1] * pt_behind.y + pl[2] * pt_behind.z + pl[3] < 0.0
+        });
+        assert!(culled_behind, "point behind camera must be culled");
+
+        // A point beyond far plane (z = -2000) must be culled
+        let pt_beyond_far = Vec3::new(0.0, 0.0, -2000.0);
+        let culled_far = planes.iter().any(|pl| {
+            pl[0] * pt_beyond_far.x + pl[1] * pt_beyond_far.y + pl[2] * pt_beyond_far.z + pl[3] < 0.0
+        });
+        assert!(culled_far, "point beyond far plane must be culled");
+    }
 
     /// A segment somewhere in space, with the tint the cull path never reads.
     fn seg(min: [f32; 3], max: [f32; 3]) -> SegCull {

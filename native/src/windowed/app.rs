@@ -91,6 +91,8 @@ pub(super) fn apply_relayout(
                 file_backgrounds: p.file_backgrounds,
                 file_bg_color: p.file_bg_color,
                 lod_min_px: Some(p.lod_min_px),
+                greeking: p.greeking,
+                greek_onset_px: Some(p.greek_onset_px),
             },
         )
     } else {

@@ -204,6 +204,8 @@ fn main() {
         file_backgrounds: cli.file_backgrounds,
         file_bg_color: cli.file_bg_color.unwrap_or(DEFAULT_FILE_BG_COLOR),
         lod_min_px: cli.lod_min_px,
+        greeking: !cli.no_greeking,
+        greek_onset_px: cli.greek_onset_px,
     };
 
     match cli.screenshot {

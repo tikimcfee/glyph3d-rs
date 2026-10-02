@@ -74,7 +74,7 @@ struct Camera {
 
 struct Params {
     max_groups: u32,   // group table row count (OOB group ids cull)
-    _pad0: u32,
+    greek_mode: u32,   // 1 = enabled (default), 0 = disabled
     _pad1: u32,
     _pad2: u32,
     // Minification dials — GLYPH_LOD_DEFAULTS (GlyphField.js)
@@ -89,7 +89,8 @@ struct Params {
     emoji_cols: u32,          // cells per row
     emoji_rows: u32,          // rows per layer
     emoji_layer: vec2<f32>,   // layer width, height in texels (as f32 for UV math)
-    _pad3: vec2<u32>,
+    greek_onset_px: f32,      // on-screen glyph px/em onset for Greeking (default 10.0)
+    _pad3: u32,
 };
 
 @group(0) @binding(0) var<uniform> camera: Camera;
@@ -343,28 +344,56 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     var m = clamp((fw_max - params.min_lo) / (params.min_hi - params.min_lo), 0.0, 1.0);
     m = m * m * (3.0 - 2.0 * m);
 
-    // Dilation half-width + softened inverse footprint (identity at m=0).
-    let dilate = m * params.dilate_px;
-    let inv_d = (vec2<f32>(1.0) / fw) * (1.0 - m * params.soften);
-
-    var coverage = 0.0;
-    let n = min(in.curve_count, MAX_CURVES);
-    for (var i = 0u; i < n; i = i + 1u) {
-        // 2 texels per curve: [P0.xy, P1.xy] then [P2.xy, _, _].
-        let ci = (in.curve_start + i) * 2u;
-        let t0 = textureLoad(curves, vec2<i32>(i32(ci % 1024u), i32(ci / 1024u)), 0);
-        let t1 = textureLoad(curves, vec2<i32>(i32((ci + 1u) % 1024u), i32((ci + 1u) / 1024u)), 0);
-
-        // Unpack uint16 → [0,1], translate so the sample point is the origin.
-        let p0 = vec2<f32>(f32(t0.x), f32(t0.y)) / 65535.0 - in.glyph_uv;
-        let p1 = vec2<f32>(f32(t0.z), f32(t0.w)) / 65535.0 - in.glyph_uv;
-        let p2 = vec2<f32>(f32(t1.x), f32(t1.y)) / 65535.0 - in.glyph_uv;
-
-        coverage += compute_coverage(inv_d.x, dilate, p0, p1, p2);
-        coverage += compute_coverage(inv_d.y, dilate, rot90(p0), rot90(p1), rot90(p2));
+    // Greeking: at small/subpixel scale, transition from aliased vector curves
+    // to smooth, energy-conserving horizontal syntax bars.
+    // em_px is the on-screen pixel height of the character cell (1.0 / fw.y).
+    let em_px = 1.0 / max(fw.y, 1e-4);
+    var greek = 0.0;
+    if params.greek_mode != 0u {
+        let onset = params.greek_onset_px;
+        let full = onset * 0.45;
+        let t = clamp((onset - em_px) / max(onset - full, 0.01), 0.0, 1.0);
+        greek = t * t * (3.0 - 2.0 * t);
     }
-    // Average the two rays; fills accumulate positive under y-up normalization.
-    let cov = clamp(coverage * 0.5, 0.0, 1.0);
+
+    var cov = 0.0;
+    if greek < 1.0 {
+        // Dilation half-width + softened inverse footprint (identity at m=0).
+        let dilate = m * params.dilate_px;
+        let inv_d = (vec2<f32>(1.0) / fw) * (1.0 - m * params.soften);
+
+        var coverage = 0.0;
+        let n = min(in.curve_count, MAX_CURVES);
+        for (var i = 0u; i < n; i = i + 1u) {
+            // 2 texels per curve: [P0.xy, P1.xy] then [P2.xy, _, _].
+            let ci = (in.curve_start + i) * 2u;
+            let t0 = textureLoad(curves, vec2<i32>(i32(ci % 1024u), i32(ci / 1024u)), 0);
+            let t1 = textureLoad(curves, vec2<i32>(i32((ci + 1u) % 1024u), i32((ci + 1u) / 1024u)), 0);
+
+            // Unpack uint16 → [0,1], translate so the sample point is the origin.
+            let p0 = vec2<f32>(f32(t0.x), f32(t0.y)) / 65535.0 - in.glyph_uv;
+            let p1 = vec2<f32>(f32(t0.z), f32(t0.w)) / 65535.0 - in.glyph_uv;
+            let p2 = vec2<f32>(f32(t1.x), f32(t1.y)) / 65535.0 - in.glyph_uv;
+
+            coverage += compute_coverage(inv_d.x, dilate, p0, p1, p2);
+            coverage += compute_coverage(inv_d.y, dilate, rot90(p0), rot90(p1), rot90(p2));
+        }
+        cov = clamp(coverage * 0.5, 0.0, 1.0);
+    }
+
+    if greek > 0.0 {
+        // Greeking ink bar: continuous horizontal word bars with analytic AA.
+        // In y: spans baseline (0.20) to cap-height (0.75).
+        // In x: spans full cell [0.0, 1.0] so adjacent word characters connect seamlessly.
+        let dy = max(fw.y, 1e-4);
+        let y_cov = clamp((in.glyph_uv.y - 0.20) / dy + 0.5, 0.0, 1.0)
+                  - clamp((in.glyph_uv.y - 0.75) / dy + 0.5, 0.0, 1.0);
+        let dx = max(fw.x, 1e-4);
+        let x_cov = clamp((in.glyph_uv.x - 0.0) / dx + 0.5, 0.0, 1.0)
+                  - clamp((in.glyph_uv.x - 1.0) / dx + 0.5, 0.0, 1.0);
+        let bar_cov = clamp(x_cov * y_cov, 0.0, 1.0);
+        cov = mix(cov, bar_cov, greek);
+    }
 
     let alpha = cov * in.group_alpha;
     if alpha <= 0.0 {

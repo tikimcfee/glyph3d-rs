@@ -116,6 +116,8 @@ pub struct SceneCullOptions {
     pub file_backgrounds: bool,
     pub file_bg_color: [f32; 4],
     pub lod_min_px: Option<f32>,
+    pub greeking: bool,
+    pub greek_onset_px: Option<f32>,
 }
 
 impl Default for SceneCullOptions {
@@ -125,6 +127,8 @@ impl Default for SceneCullOptions {
             file_backgrounds: false,
             file_bg_color: DEFAULT_FILE_BG_COLOR,
             lod_min_px: None,
+            greeking: true,
+            greek_onset_px: None,
         }
     }
 }
@@ -180,6 +184,10 @@ fn build_scene_impl(
         scene.set_file_bg_color(cull_opts.file_bg_color);
         if let Some(lod) = cull_opts.lod_min_px {
             scene.set_lod_min_px(lod);
+        }
+        scene.set_greeking(&ctx.queue, cull_opts.greeking);
+        if let Some(onset) = cull_opts.greek_onset_px {
+            scene.set_greek_onset_px(&ctx.queue, onset);
         }
         let p = probe.then(|| scene.init_ui_probe());
         (Box::new(scene) as Box<dyn SceneLike>, p)

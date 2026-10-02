@@ -59,6 +59,11 @@ pub(super) fn render_scene(
         cull.file_backgrounds.set(p.file_backgrounds);
         cull.file_bg_color.set(p.file_bg_color);
     }
+    if let Some(probe) = &scene.ui_probe {
+        let p = probe.borrow();
+        scene.set_greeking(&ctx.queue, p.greeking);
+        scene.set_greek_onset_px(&ctx.queue, p.greek_onset_px);
+    }
 
     // Stage L (L1): fill every lane of the widened frame uniform from
     // values already computed here. px_scale is computed once and shared
@@ -234,7 +239,7 @@ pub(super) fn render_scene(
         depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
             view: draw_depth_view,
             depth_ops: Some(wgpu::Operations {
-                load: wgpu::LoadOp::Clear(1.0),
+                load: wgpu::LoadOp::Clear(0.0),
                 store: wgpu::StoreOp::Store,
             }),
             stencil_ops: None,

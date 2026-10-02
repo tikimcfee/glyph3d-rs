@@ -25,7 +25,7 @@
 # Ratchet, NOT an equality: tests are added constantly, so an exact pin would
 # redden on the most common good action in the repo. A green run whose real
 # count exceeds the floor prints a NOTE naming the value to raise it to.
-test_floor = 115
+test_floor = 117
 
 # ── Products ─────────────────────────────────────────────────────────────
 
@@ -442,8 +442,8 @@ gate = "pixel-ab"
 why = "the golden views are the ONLY pixel check; a shader constant that changes glyph antialiasing must move them. Chosen because it is purely visual — it does not touch the fold, the corpus or CPU-side picking, so a red here is attributable to this gate and no other"
 file = "native/src/shaders/glyph_field.wgsl"
 op = "replace"
-find = "let cov = clamp(coverage * 0.5, 0.0, 1.0);"
-with = "let cov = clamp(coverage * 0.62, 0.0, 1.0);"
+find = "cov = clamp(coverage * 0.5, 0.0, 1.0);"
+with = "cov = clamp(coverage * 0.62, 0.0, 1.0);"
 expect = "text.png diverges from baseline"
 rebuild = "cargo build --release"
 

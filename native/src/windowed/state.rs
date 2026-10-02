@@ -526,6 +526,13 @@ impl WindowState {
                                 ui.checkbox(&mut p.file_backgrounds, "File card backgrounds");
                                 ui.color_edit_button_rgba_unmultiplied(&mut p.file_bg_color);
                             });
+                            ui.checkbox(&mut p.greeking, "Glyph greeking (anti-moiré)");
+                            if p.greeking {
+                                ui.add(
+                                    egui::Slider::new(&mut p.greek_onset_px, 2.0..=32.0)
+                                        .text("Greeking onset px/em (default 10.0)"),
+                                );
+                            }
                             ui.label(format!(
                                 "cull: {} draw ranges, {} instances | {} backdrops",
                                 snap.cull_ranges, snap.cull_instances, snap.cull_backdrops
