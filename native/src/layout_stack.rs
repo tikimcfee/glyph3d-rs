@@ -9,7 +9,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 use crate::glyph_scene::GroupRow;
 use crate::repo::{dir_tint, FileView, RepoLayoutMode, RepoParams};
-use crate::spatial_hierarchy::{NodeId, SpatialHierarchy, SpatialTransform};
+use crate::spatial_hierarchy::{Material, MeshGeometry, NodeId, SpatialHierarchy, SpatialTransform};
 
 /// Strategy for laying out a group of files within its local bounds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -255,6 +255,8 @@ impl LayoutController {
             );
             self.hierarchy.set_group_id(file_node, i as u32);
             self.hierarchy.set_tint(file_node, crate::repo::dir_tint(&v.dir));
+            self.hierarchy.set_mesh(file_node, MeshGeometry::Glyphs { group_id: i as u32 });
+            self.hierarchy.set_material(file_node, Material::Slug);
             self.file_nodes[i] = file_node;
         }
         self.hierarchy.update_world_transforms();
@@ -400,6 +402,24 @@ impl LayoutController {
             z.zone.node_id = Some(zone_node);
             self.zone_nodes.insert(z.zone.id.clone(), zone_node);
 
+            // Spawn the zone's container plate as a child entity of zone_node
+            let pad = 2.0f32;
+            let custom_tint = self.stack.zones.iter().find(|zk| zk.id == z.zone.id).and_then(|zk| zk.custom_tint);
+            let dir_for_zone = z.files.first().map(|&idx| views[idx].dir.as_str()).unwrap_or("");
+            let tint = custom_tint.unwrap_or_else(|| dir_tint(dir_for_zone));
+            let plate_color = [tint[0] * 0.15, tint[1] * 0.15, tint[2] * 0.18, 0.95];
+
+            self.hierarchy.spawn_child(
+                zone_node,
+                format!("plate:{}", z.zone.id),
+                SpatialTransform::from_xyz(-pad, pad, -0.05),
+                MeshGeometry::Quad {
+                    size: [zone_w + pad * 2.0, zone_h + pad * 2.0],
+                    origin: [0.0, -(zone_h + pad * 2.0)],
+                },
+                Material::Flat { color: plate_color },
+            );
+
             for (file_in_zone, &file_view_idx) in z.files.iter().enumerate() {
                 let [rel_x, rel_y] = z.local_offsets[file_in_zone];
                 views[file_view_idx].offset = [
@@ -423,6 +443,8 @@ impl LayoutController {
                 self.hierarchy.set_group_id(file_node, file_view_idx as u32);
                 let tint = z.zone.custom_tint.unwrap_or_else(|| dir_tint(&v.dir));
                 self.hierarchy.set_tint(file_node, tint);
+                self.hierarchy.set_mesh(file_node, MeshGeometry::Glyphs { group_id: file_view_idx as u32 });
+                self.hierarchy.set_material(file_node, Material::Slug);
                 self.file_nodes[file_view_idx] = file_node;
             }
         }

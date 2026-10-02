@@ -68,6 +68,32 @@ impl SpatialTransform {
     }
 }
 
+/// Geometric mesh representation of an entity in 3D space.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub enum MeshGeometry {
+    /// Planar rectangular quad: size [width, height], origin offset [ox, oy].
+    Quad { size: [f32; 2], origin: [f32; 2] },
+    /// 3D box: extents [width, height, depth].
+    Box { extents: [f32; 3] },
+    /// Slug glyph vector field bound to a group_id in GPU storage.
+    Glyphs { group_id: u32 },
+    /// Non-visual / organizational transform node.
+    #[default]
+    None,
+}
+
+/// Shading material for an entity.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub enum Material {
+    /// Unlit flat or translucent solid color (linear RGBA).
+    Flat { color: [f32; 4] },
+    /// Analytic vector glyph shader (Slug WGSL).
+    Slug,
+    /// No material.
+    #[default]
+    None,
+}
+
 /// An entity node in the spatial scene graph.
 #[derive(Debug, Clone)]
 pub struct SpatialNode {
@@ -77,6 +103,12 @@ pub struct SpatialNode {
     pub children: Vec<NodeId>,
     pub local: SpatialTransform,
     pub world: SpatialTransform,
+    /// Visual mesh geometry (Quad, Box, Glyphs, None).
+    pub mesh: MeshGeometry,
+    /// Shading material (Flat, Slug, None).
+    pub material: Material,
+    /// Visibility flag.
+    pub visible: bool,
     /// Optional binding to a GPU `GroupRow` table slot (if this node draws glyphs).
     pub group_id: Option<u32>,
     /// Tint color for this node's GroupRow (RGBA)
@@ -97,6 +129,9 @@ impl SpatialNode {
             children: Vec::new(),
             local: SpatialTransform::default(),
             world: SpatialTransform::default(),
+            mesh: MeshGeometry::None,
+            material: Material::None,
+            visible: true,
             group_id: None,
             tint: [1.0, 1.0, 1.0, 1.0],
             local_bounds: None,
@@ -244,6 +279,44 @@ impl SpatialHierarchy {
         self.mark_dirty(id);
     }
 
+    /// Spawn a child entity attached to a parent node with specified transform, mesh, and material.
+    pub fn spawn_child(
+        &mut self,
+        parent: NodeId,
+        name: impl Into<String>,
+        local: SpatialTransform,
+        mesh: MeshGeometry,
+        material: Material,
+    ) -> NodeId {
+        let child = self.create_node(name);
+        self.set_local_transform(child, local);
+        self.set_mesh(child, mesh);
+        self.set_material(child, material);
+        self.attach_child(parent, child);
+        child
+    }
+
+    /// Set mesh geometry for a node.
+    pub fn set_mesh(&mut self, id: NodeId, mesh: MeshGeometry) {
+        if let Some(node) = self.get_mut(id) {
+            node.mesh = mesh;
+        }
+    }
+
+    /// Set shading material for a node.
+    pub fn set_material(&mut self, id: NodeId, material: Material) {
+        if let Some(node) = self.get_mut(id) {
+            node.material = material;
+        }
+    }
+
+    /// Set visibility for a node.
+    pub fn set_visible(&mut self, id: NodeId, visible: bool) {
+        if let Some(node) = self.get_mut(id) {
+            node.visible = visible;
+        }
+    }
+
     /// Set local bounding box for a node.
     pub fn set_local_bounds(&mut self, id: NodeId, min: [f32; 3], max: [f32; 3]) {
         if let Some(node) = self.get_mut(id) {
@@ -333,7 +406,24 @@ impl SpatialHierarchy {
         let mut world_max = Vec3::splat(f32::NEG_INFINITY);
         let mut has_bounds = false;
 
-        if let Some((min, max)) = node.local_bounds {
+        let local_box = if let Some((min, max)) = node.local_bounds {
+            Some((min, max))
+        } else {
+            match &node.mesh {
+                MeshGeometry::Quad { size, origin } => {
+                    Some(([origin[0], origin[1], 0.0], [origin[0] + size[0], origin[1] + size[1], 0.0]))
+                }
+                MeshGeometry::Box { extents } => {
+                    let hx = extents[0] * 0.5;
+                    let hy = extents[1] * 0.5;
+                    let hz = extents[2] * 0.5;
+                    Some(([-hx, -hy, -hz], [hx, hy, hz]))
+                }
+                _ => None,
+            }
+        };
+
+        if let Some((min, max)) = local_box {
             let w = &node.world;
             let corners = [
                 Vec3::new(min[0], min[1], min[2]),
@@ -367,6 +457,73 @@ impl SpatialHierarchy {
         } else {
             None
         }
+    }
+
+    /// Collect GPU render instances for all visible primitive meshes in the hierarchy.
+    pub fn collect_primitive_instances(&self) -> Vec<crate::glyph_scene::BackdropInst> {
+        let mut instances = Vec::new();
+        for node_opt in &self.nodes {
+            let Some(node) = node_opt else { continue };
+            if !node.visible {
+                continue;
+            }
+
+            match (&node.mesh, &node.material) {
+                (MeshGeometry::Quad { size, origin }, Material::Flat { color }) => {
+                    let min_p = Vec3::new(origin[0], origin[1], 0.0);
+                    let max_p = Vec3::new(origin[0] + size[0], origin[1] + size[1], 0.0);
+                    let corners = [
+                        Vec3::new(min_p.x, min_p.y, 0.0),
+                        Vec3::new(max_p.x, min_p.y, 0.0),
+                        Vec3::new(min_p.x, max_p.y, 0.0),
+                        Vec3::new(max_p.x, max_p.y, 0.0),
+                    ];
+                    let mut w_min = Vec3::splat(f32::INFINITY);
+                    let mut w_max = Vec3::splat(f32::NEG_INFINITY);
+                    for c in corners {
+                        let wp = node.world.transform_point(c);
+                        w_min = w_min.min(wp);
+                        w_max = w_max.max(wp);
+                    }
+                    instances.push(crate::glyph_scene::BackdropInst {
+                        min: [w_min.x, w_min.y],
+                        max: [w_max.x, w_max.y],
+                        rgba: *color,
+                        depth: [w_min.z, 0.0, 0.0, 0.0],
+                    });
+                }
+                (MeshGeometry::Box { extents }, Material::Flat { color }) => {
+                    let hx = extents[0] * 0.5;
+                    let hy = extents[1] * 0.5;
+                    let hz = extents[2] * 0.5;
+                    let corners = [
+                        Vec3::new(-hx, -hy, -hz),
+                        Vec3::new(hx, -hy, -hz),
+                        Vec3::new(-hx, hy, -hz),
+                        Vec3::new(hx, hy, -hz),
+                        Vec3::new(-hx, -hy, hz),
+                        Vec3::new(hx, -hy, hz),
+                        Vec3::new(-hx, hy, hz),
+                        Vec3::new(hx, hy, hz),
+                    ];
+                    let mut w_min = Vec3::splat(f32::INFINITY);
+                    let mut w_max = Vec3::splat(f32::NEG_INFINITY);
+                    for c in corners {
+                        let wp = node.world.transform_point(c);
+                        w_min = w_min.min(wp);
+                        w_max = w_max.max(wp);
+                    }
+                    instances.push(crate::glyph_scene::BackdropInst {
+                        min: [w_min.x, w_min.y],
+                        max: [w_max.x, w_max.y],
+                        rgba: *color,
+                        depth: [w_min.z, 0.0, 0.0, 0.0],
+                    });
+                }
+                _ => {}
+            }
+        }
+        instances
     }
 
     /// Synchronize all nodes bound to a `group_id` into the given `GroupRow` buffer.
@@ -496,5 +653,41 @@ mod tests {
         assert_eq!(synced, vec![3]);
         assert_eq!(groups[3].cols[0], [55.0, 18.0, -1.0, 0.0]);
         assert_eq!(groups[3].cols[2], [0.8, 0.2, 0.4, 1.0]);
+    }
+
+    #[test]
+    fn spawn_child_and_collect_primitive_instances() {
+        let mut h = SpatialHierarchy::new();
+        let carrel = h.create_node("carrel:dir:core");
+        h.set_local_transform(carrel, SpatialTransform::from_xyz(100.0, 50.0, -10.0));
+
+        // Spawn a background plate quad as a child entity
+        let plate = h.spawn_child(
+            carrel,
+            "plate:dir:core",
+            SpatialTransform::from_xyz(-2.0, 2.0, -0.05),
+            MeshGeometry::Quad {
+                size: [44.0, 34.0],
+                origin: [0.0, -34.0],
+            },
+            Material::Flat {
+                color: [0.1, 0.2, 0.3, 0.9],
+            },
+        );
+
+        h.update_world_transforms();
+
+        let insts = h.collect_primitive_instances();
+        assert_eq!(insts.len(), 1);
+        assert_eq!(insts[0].min[0], 98.0);
+        assert_eq!(insts[0].max[0], 142.0);
+        assert_eq!(insts[0].min[1], 18.0);
+        assert_eq!(insts[0].max[1], 52.0);
+        assert_eq!(insts[0].depth[0], -10.05);
+        assert_eq!(insts[0].rgba, [0.1, 0.2, 0.3, 0.9]);
+
+        // Hide plate
+        h.set_visible(plate, false);
+        assert!(h.collect_primitive_instances().is_empty());
     }
 }

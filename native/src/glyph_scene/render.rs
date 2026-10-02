@@ -100,18 +100,30 @@ pub(super) fn render_scene(
             file_backgrounds: cull.file_backgrounds.get(),
             file_bg_color: cull.file_bg_color.get(),
         };
-        let phase_draws = cull_segments(
+        let mut phase_draws = cull_segments(
             &cull.segments,
             &cull.hidden,
             &view,
             scene.chunk_cap,
             scene.bind_groups.len() as u32,
         );
+        if let Some(ctrl) = &scene.controller {
+            let prim_insts = ctrl.hierarchy.collect_primitive_instances();
+            phase_draws.backdrops.extend(prim_insts);
+        }
         if !phase_draws.backdrops.is_empty() {
+            let max_cap = (cull.backdrop_insts_buf.size()
+                / std::mem::size_of::<crate::glyph_scene::cull::BackdropInst>() as u64)
+                as usize;
+            let slice_to_write = if phase_draws.backdrops.len() > max_cap {
+                &phase_draws.backdrops[..max_cap]
+            } else {
+                &phase_draws.backdrops[..]
+            };
             ctx.queue.write_buffer(
                 &cull.backdrop_insts_buf,
                 0,
-                bytemuck::cast_slice(&phase_draws.backdrops),
+                bytemuck::cast_slice(slice_to_write),
             );
         }
         if let Some(t0) = cull_t0 {

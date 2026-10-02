@@ -75,7 +75,7 @@ pub use camera::{CameraMode, FlyCamera, FOV_Y};
 use camera::CamFrame;
 
 mod cull;
-pub use cull::{SegCull, BACKDROP_GAIN, GLYPH_CELL_AREA, LOD_MIN_PX};
+pub use cull::{BackdropInst, SegCull, BACKDROP_GAIN, GLYPH_CELL_AREA, LOD_MIN_PX};
 use cull::CullState;
 
 mod pick;

@@ -66,11 +66,11 @@ pub const GLYPH_CELL_AREA: f32 = (1229.0 / 2320.0) * 1.25;
 /// cull.wgsl: world rect + premultiplied-ready color (rgb linear, a = E) + far-Z reading depth.
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
-pub(super) struct BackdropInst {
-    min: [f32; 2],
-    max: [f32; 2],
-    rgba: [f32; 4],
-    depth: [f32; 4],
+pub struct BackdropInst {
+    pub min: [f32; 2],
+    pub max: [f32; 2],
+    pub rgba: [f32; 4],
+    pub depth: [f32; 4],
 }
 
 /// Stage L (L2): draw phases — re_renderer's DrawPhase borrow (a flat enum
@@ -320,9 +320,10 @@ impl CullState {
         }
 
         let backdrop_stride = std::mem::size_of::<BackdropInst>() as u64;
+        let max_backdrops = (seg_count * 2 + 512).max(1024) as u64;
         let backdrop_insts_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("backdrop instances"),
-            size: seg_count.max(1) as u64 * backdrop_stride,
+            size: max_backdrops * backdrop_stride,
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
