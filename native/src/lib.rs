@@ -18,6 +18,7 @@ pub mod repo;
 pub mod scan;
 pub mod scene;
 pub mod seam;
+pub mod spatial_hierarchy;
 pub mod text;
 pub mod windowed;
 

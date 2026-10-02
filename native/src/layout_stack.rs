@@ -9,6 +9,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 use crate::glyph_scene::GroupRow;
 use crate::repo::{dir_tint, FileView, RepoLayoutMode, RepoParams};
+use crate::spatial_hierarchy::{NodeId, SpatialHierarchy, SpatialTransform};
 
 /// Strategy for laying out a group of files within its local bounds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -53,6 +54,8 @@ pub struct LayoutZone {
     pub computed_size: [f32; 3],
     /// Computed origin [x, y, z] in world space after macro layout.
     pub computed_origin: [f32; 3],
+    /// Optional bound node in the SpatialHierarchy.
+    pub node_id: Option<NodeId>,
 }
 
 impl LayoutZone {
@@ -65,6 +68,7 @@ impl LayoutZone {
             custom_tint: None,
             computed_size: [0.0; 3],
             computed_origin: [0.0; 3],
+            node_id: None,
         }
     }
 }
@@ -97,6 +101,9 @@ pub struct LayoutController {
     pub mode: RepoLayoutMode,
     pub stack: LayoutStack,
     pub params: RepoParams,
+    pub hierarchy: SpatialHierarchy,
+    pub zone_nodes: HashMap<String, NodeId>,
+    pub file_nodes: Vec<NodeId>,
 }
 
 impl LayoutController {
@@ -124,6 +131,9 @@ impl LayoutController {
                 avenue_gap_y,
             },
             params,
+            hierarchy: SpatialHierarchy::new(),
+            zone_nodes: HashMap::new(),
+            file_nodes: Vec::new(),
         }
     }
 
@@ -176,6 +186,36 @@ impl LayoutController {
             RepoLayoutMode::Shelf => "base:shelf".to_string(),
             RepoLayoutMode::Carrel => format!("dir:{dir}"),
         }
+    }
+
+    /// Translate a zone by a delta vector. Automatically propagates down
+    /// to all contained files and sheets in that zone.
+    pub fn move_zone(&mut self, zone_id: &str, delta: glam::Vec3) -> bool {
+        if let Some(&node_id) = self.zone_nodes.get(zone_id) {
+            self.hierarchy.translate(node_id, delta);
+            self.hierarchy.update_world_transforms();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Retrieve the world-space bounding box for a zone: [min, max].
+    pub fn zone_world_bounds(&self, zone_id: &str) -> Option<([f32; 3], [f32; 3])> {
+        let node_id = *self.zone_nodes.get(zone_id)?;
+        self.hierarchy.world_bounds(node_id)
+    }
+
+    /// Retrieve the world-space bounding box for a file view by index: [min, max].
+    pub fn file_world_bounds(&self, file_idx: usize) -> Option<([f32; 3], [f32; 3])> {
+        let node_id = *self.file_nodes.get(file_idx)?;
+        self.hierarchy.world_bounds(node_id)
+    }
+
+    /// Synchronize all spatial hierarchy nodes into the GPU GroupRow buffer.
+    /// Returns the list of updated group IDs.
+    pub fn sync_gpu_groups(&self, groups: &mut [GroupRow]) -> Vec<u32> {
+        self.hierarchy.sync_to_group_rows(groups)
     }
 
     /// Apply the layout stack and control object to place all files on the canvas.
@@ -265,6 +305,12 @@ impl LayoutController {
         let mut macro_shelf_h = 0.0f32;
         let mut max_macro_x = 0.0f32;
 
+        // Rebuild spatial hierarchy
+        self.hierarchy = SpatialHierarchy::new();
+        self.zone_nodes.clear();
+        self.file_nodes = vec![NodeId(0); views.len()];
+        let stack_root = self.hierarchy.create_node("stack_root");
+
         for z in &mut evaluated_zones {
             let zone_w = z.zone.computed_size[0];
             let zone_h = z.zone.computed_size[1];
@@ -304,6 +350,20 @@ impl LayoutController {
 
             z.zone.computed_origin = origin;
 
+            let zone_node = self.hierarchy.create_node(format!("zone:{}", z.zone.id));
+            self.hierarchy.attach_child(stack_root, zone_node);
+            self.hierarchy.set_local_transform(
+                zone_node,
+                SpatialTransform::from_xyz(origin[0], origin[1], origin[2]),
+            );
+            self.hierarchy.set_local_bounds(
+                zone_node,
+                [0.0, -zone_h, 0.0],
+                [zone_w, 0.0, 0.0],
+            );
+            z.zone.node_id = Some(zone_node);
+            self.zone_nodes.insert(z.zone.id.clone(), zone_node);
+
             for (file_in_zone, &file_view_idx) in z.files.iter().enumerate() {
                 let [rel_x, rel_y] = z.local_offsets[file_in_zone];
                 views[file_view_idx].offset = [
@@ -311,8 +371,26 @@ impl LayoutController {
                     origin[1] + rel_y,
                     origin[2],
                 ];
+
+                let file_node = self.hierarchy.create_node(views[file_view_idx].rel_path.clone());
+                self.hierarchy.attach_child(zone_node, file_node);
+                self.hierarchy.set_local_transform(
+                    file_node,
+                    SpatialTransform::from_xyz(rel_x, rel_y, 0.0),
+                );
+                let v = &views[file_view_idx];
+                self.hierarchy.set_local_bounds(
+                    file_node,
+                    [0.0, -v.height, v.z_min],
+                    [v.width, 0.0, v.z_max],
+                );
+                self.hierarchy.set_group_id(file_node, file_view_idx as u32);
+                let tint = z.zone.custom_tint.unwrap_or_else(|| dir_tint(&v.dir));
+                self.hierarchy.set_tint(file_node, tint);
+                self.file_nodes[file_view_idx] = file_node;
             }
         }
+        self.hierarchy.update_world_transforms();
 
         let min_macro_y = match self.stack.macro_arrangement {
             MacroArrangement::CanvasAvenues | MacroArrangement::LinearColumn => macro_top - macro_shelf_h,
@@ -579,5 +657,45 @@ mod tests {
         assert_eq!(groups.len(), 3);
         assert!(bounds_max[0] > 0.0);
         assert!(bounds_min[1] < 0.0);
+    }
+
+    #[test]
+    fn test_moving_zone_moves_files_in_gpu_groups() {
+        let mut views = make_test_views();
+        let params = RepoParams::default();
+        let mut controller = LayoutController::from_mode(RepoLayoutMode::Carrel, params);
+
+        // Put src/main.rs and src/lib.rs on desk:active
+        controller.assign_file("src/main.rs", "desk:active");
+        controller.assign_file("src/lib.rs", "desk:active");
+
+        let (mut groups, _, _) = controller.apply(&mut views);
+        let orig_main_pos = groups[0].cols[0];
+        let orig_lib_pos = groups[1].cols[0];
+        let orig_tests_pos = groups[2].cols[0];
+
+        // Bounds are available for the desk zone
+        assert!(controller.zone_world_bounds("desk:active").is_some());
+
+        // Now move the active desk by (100, 50, -10)
+        let moved = controller.move_zone("desk:active", glam::Vec3::new(100.0, 50.0, -10.0));
+        assert!(moved);
+
+        // Synchronize GPU groups
+        let updated_gids = controller.sync_gpu_groups(&mut groups);
+        assert!(updated_gids.contains(&0));
+        assert!(updated_gids.contains(&1));
+
+        // main.rs and lib.rs moved by exactly (100, 50, -10)
+        assert_eq!(groups[0].cols[0][0], orig_main_pos[0] + 100.0);
+        assert_eq!(groups[0].cols[0][1], orig_main_pos[1] + 50.0);
+        assert_eq!(groups[0].cols[0][2], orig_main_pos[2] - 10.0);
+
+        assert_eq!(groups[1].cols[0][0], orig_lib_pos[0] + 100.0);
+        assert_eq!(groups[1].cols[0][1], orig_lib_pos[1] + 50.0);
+        assert_eq!(groups[1].cols[0][2], orig_lib_pos[2] - 10.0);
+
+        // tests/smoke.rs in the other zone did NOT move
+        assert_eq!(groups[2].cols[0], orig_tests_pos);
     }
 }
