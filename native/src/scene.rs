@@ -272,7 +272,7 @@ impl Scene {
             depth_stencil: Some(wgpu::DepthStencilState {
                 format: depth_format,
                 depth_write_enabled: Some(true),
-                depth_compare: Some(wgpu::CompareFunction::Less),
+                depth_compare: Some(wgpu::CompareFunction::Greater),
                 stencil: Default::default(),
                 bias: Default::default(),
             }),
@@ -298,7 +298,7 @@ impl Scene {
         let eye = Vec3::new(radius * angle.cos(), height, radius * angle.sin());
         let view = glam::camera::rh::view::look_at_mat4(eye, Vec3::ZERO, Vec3::Y);
         let proj =
-            glam::camera::rh::proj::directx::perspective(60f32.to_radians(), aspect, 1.0, 5000.0);
+            glam::camera::rh::proj::directx::perspective(60f32.to_radians(), aspect, 5000.0, 1.0);
         proj * view
     }
 
@@ -354,7 +354,7 @@ impl Scene {
             depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                 view: depth_view,
                 depth_ops: Some(wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(1.0),
+                    load: wgpu::LoadOp::Clear(0.0),
                     store: wgpu::StoreOp::Store,
                 }),
                 stencil_ops: None,

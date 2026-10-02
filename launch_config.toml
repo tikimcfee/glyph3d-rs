@@ -1,0 +1,38 @@
+# Glyph3D Launch Configuration
+#
+# Startup defaults for interactive windowed runs.
+# Any CLI flag passed on the command line will override settings in this file.
+
+# Render file card background bounding surfaces behind glyph fields
+file_backgrounds = true
+
+# File card background RGBA color [red, green, blue, alpha] (normalized 0.0 to 1.0)
+file_bg_color = [0.10, 0.10, 0.13, 0.85]
+
+# Macro LOD threshold in on-screen px/em (default: 1.0).
+# Below this threshold, distant files collapse into an LOD backdrop quad.
+lod_min_px = 1.0
+
+# Greeking / Moiré suppression (default: true).
+# Smooths subpixel glyphs (< 5px) into stable horizontal ink bars,
+# eliminating high-frequency sparkling, strobing, and aliasing during flight.
+greeking = true
+
+# Wrap layout mode: "back" (Z-staircase), "down" (vertical columns), etc.
+wrap_mode = "back"
+
+# Z-step spacing between wrapped columns in units of em cell height (default: 0.15)
+z_wrap_spacing = 0.15
+
+# Sequence clustering mode: "cluster" (full grapheme cluster resolution) or "leader"
+cluster_mode = "cluster"
+
+# Syntax color mode on repo load: "syntax" (CPU lexer) or "flat" (geometry only)
+color_mode = "syntax"
+
+# Debug flags
+no_cull = false
+no_ui = false
+
+# Default repository to open if none specified on CLI (optional)
+# load_repo = "fixtures/g-pick-repo"

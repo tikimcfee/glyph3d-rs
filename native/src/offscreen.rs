@@ -9,7 +9,9 @@ use std::path::Path;
 use crate::glyph_scene::CameraMode;
 use crate::gpu::GpuContext;
 use crate::scene;
-use crate::{build_scene, Op, SceneChoice, OFFSCREEN_HEIGHT, OFFSCREEN_WIDTH};
+use crate::{
+    build_scene_with_options, Op, SceneChoice, SceneCullOptions, OFFSCREEN_HEIGHT, OFFSCREEN_WIDTH,
+};
 
 #[allow(clippy::too_many_arguments)]
 pub fn run(
@@ -18,7 +20,7 @@ pub fn run(
     path: &Path,
     frames: u32,
     zoom: f32,
-    cull: bool,
+    cull_opts: SceneCullOptions,
     ops: &[Op],
 ) {
     let shader_composite = std::env::var_os("GLYPH_L3_SHADER_COMPOSITE").is_some();
@@ -27,7 +29,8 @@ pub fn run(
     } else {
         wgpu::TextureFormat::Rgba8UnormSrgb
     };
-    let scene = build_scene(ctx, format, choice, CameraMode::Front { zoom }, cull);
+    let scene =
+        build_scene_with_options(ctx, format, choice, CameraMode::Front { zoom }, cull_opts);
     run_scene(ctx, scene, format, path, frames, ops);
 }
 

@@ -115,6 +115,10 @@ pub(super) struct CullView {
     /// LOD_MIN_PX const read directly) so windowed runs can tune it live;
     /// offscreen always carries the const (see CullState::lod_min_px).
     pub(super) lod_min_px: f32,
+    /// Whether to render file background bounding quads behind glyphs when near.
+    pub(super) file_backgrounds: bool,
+    /// RGBA color for near file background cards.
+    pub(super) file_bg_color: [f32; 4],
 }
 
 /// Stage F — CPU cull: frustum + LOD over the segment table. Returns the
@@ -132,7 +136,14 @@ pub(super) fn cull_segments(
     chunk_cap: u32,
     chunk_count: u32,
 ) -> PhaseDraws {
-    let CullView { planes, eye, px_scale, lod_min_px } = *view;
+    let CullView {
+        planes,
+        eye,
+        px_scale,
+        lod_min_px,
+        file_backgrounds,
+        file_bg_color,
+    } = *view;
     let mut draws: Vec<Vec<std::ops::Range<u32>>> =
         (0..chunk_count).map(|_| Vec::new()).collect();
     let mut backdrops = Vec::new();
@@ -183,6 +194,16 @@ pub(super) fn cull_segments(
                 });
             }
             continue;
+        }
+        // Near reading mode: if file_backgrounds is enabled, push a background quad
+        // behind the glyphs anchored slightly behind far-Z to avoid Z-fighting.
+        if file_backgrounds && seg.slot_count > 0 {
+            backdrops.push(BackdropInst {
+                min: [seg.min[0], seg.min[1]],
+                max: [seg.max[0], seg.max[1]],
+                rgba: file_bg_color,
+                depth: [seg.min[2] - 0.02, 0.0, 0.0, 0.0],
+            });
         }
         // Glyph stream: split the slot range across arena chunks.
         let slot_end = seg.slot_base + seg.slot_count;
@@ -256,6 +277,8 @@ pub(super) struct CullState {
     /// render(), which runs solely when a windowed probe is installed —
     /// offscreen never writes it, so offscreen culls with the const.
     pub(super) lod_min_px: Cell<f32>,
+    pub(super) file_backgrounds: Cell<bool>,
+    pub(super) file_bg_color: Cell<[f32; 4]>,
     /// seg_count × 32 B staging target for the per-frame backdrop list.
     pub(super) backdrop_insts_buf: wgpu::Buffer,
     pub(super) backdrop_pipeline: wgpu::RenderPipeline,
@@ -411,9 +434,13 @@ impl CullState {
             depth_stencil: Some(wgpu::DepthStencilState {
                 format: depth_format,
                 depth_write_enabled: Some(true),
-                depth_compare: Some(wgpu::CompareFunction::LessEqual),
+                depth_compare: Some(wgpu::CompareFunction::GreaterEqual),
                 stencil: Default::default(),
-                bias: Default::default(),
+                bias: wgpu::DepthBiasState {
+                    constant: -100,
+                    slope_scale: -1.5,
+                    clamp: 0.0,
+                },
             }),
             multisample: wgpu::MultisampleState {
                 count: SCENE_SAMPLE_COUNT, // Stage L (L3): loud non-MSAA pin
@@ -431,6 +458,8 @@ impl CullState {
             orig_group_rgb,
             hidden: vec![false; segments.len()],
             lod_min_px: Cell::new(LOD_MIN_PX),
+            file_backgrounds: Cell::new(false),
+            file_bg_color: Cell::new(crate::DEFAULT_FILE_BG_COLOR),
             backdrop_insts_buf,
             backdrop_pipeline,
             backdrop_bind_group,
@@ -441,6 +470,42 @@ impl CullState {
 #[cfg(test)]
 mod cull_depth_tests {
     use super::*;
+
+    #[test]
+    fn reversed_z_math() {
+        let fov = 60f32.to_radians();
+        let aspect = 1.6f32;
+        let near = 0.05f32;
+        let far = 1000.0f32;
+
+        let p_rev = glam::camera::rh::proj::directx::perspective(fov, aspect, far, near);
+        let v_near = p_rev.project_point3(Vec3::new(0.0, 0.0, -near));
+        let v_far = p_rev.project_point3(Vec3::new(0.0, 0.0, -far));
+        assert!((v_near.z - 1.0).abs() < 1e-4, "near z must be 1.0, got {}", v_near.z);
+        assert!((v_far.z - 0.0).abs() < 1e-4, "far z must be 0.0, got {}", v_far.z);
+
+        // Frustum planes check: a point at z = -500 (inside frustum)
+        let planes = frustum_planes(&p_rev);
+        let pt_inside = Vec3::new(0.0, 0.0, -500.0);
+        for (i, pl) in planes.iter().enumerate() {
+            let dist = pl[0] * pt_inside.x + pl[1] * pt_inside.y + pl[2] * pt_inside.z + pl[3];
+            assert!(dist >= 0.0, "plane {} should contain pt_inside, dist = {}", i, dist);
+        }
+
+        // A point behind the camera (z = +10) must be culled
+        let pt_behind = Vec3::new(0.0, 0.0, 10.0);
+        let culled_behind = planes.iter().any(|pl| {
+            pl[0] * pt_behind.x + pl[1] * pt_behind.y + pl[2] * pt_behind.z + pl[3] < 0.0
+        });
+        assert!(culled_behind, "point behind camera must be culled");
+
+        // A point beyond far plane (z = -2000) must be culled
+        let pt_beyond_far = Vec3::new(0.0, 0.0, -2000.0);
+        let culled_far = planes.iter().any(|pl| {
+            pl[0] * pt_beyond_far.x + pl[1] * pt_beyond_far.y + pl[2] * pt_beyond_far.z + pl[3] < 0.0
+        });
+        assert!(culled_far, "point beyond far plane must be culled");
+    }
 
     /// A segment somewhere in space, with the tint the cull path never reads.
     fn seg(min: [f32; 3], max: [f32; 3]) -> SegCull {
@@ -466,6 +531,8 @@ mod cull_depth_tests {
             eye,
             px_scale: 1000.0,
             lod_min_px,
+            file_backgrounds: false,
+            file_bg_color: [0.10, 0.10, 0.13, 0.85],
         }
     }
 
@@ -534,4 +601,25 @@ mod cull_depth_tests {
             "backdrop must anchor to seg.min[2] far-z reading surface"
         );
     }
+
+    #[test]
+    fn file_background_emits_in_near_reading_mode() {
+        let s = seg([-1.0, -1.0, -5.0], [1.0, 1.0, -4.0]);
+        let mut v = view_clipping_behind_z(-10.0, Vec3::new(0.0, 0.0, 0.0), 0.0);
+        v.file_backgrounds = true;
+        v.file_bg_color = [0.2, 0.3, 0.4, 0.5];
+
+        let d = cull_segments(&[s], &[false], &v, 1024, 1);
+        assert!(drew_glyphs(&d), "glyphs must be drawn in near mode");
+        assert_eq!(d.backdrops.len(), 1, "background quad must be emitted behind glyphs");
+        assert_eq!(d.backdrops[0].rgba, [0.2, 0.3, 0.4, 0.5]);
+        assert_eq!(d.backdrops[0].depth[0], -5.0 - 0.02);
+
+        // When disabled, no backdrop is emitted in near mode
+        v.file_backgrounds = false;
+        let d2 = cull_segments(&[s], &[false], &v, 1024, 1);
+        assert!(drew_glyphs(&d2));
+        assert!(d2.backdrops.is_empty());
+    }
 }
+

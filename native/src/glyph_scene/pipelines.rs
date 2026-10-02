@@ -156,7 +156,7 @@ pub(super) fn build_glyph_pipeline(
             // LessEqual: coplanar fragments still pass, so a flat page
             // blends in exactly the order it did before.
             depth_write_enabled: Some(true),
-            depth_compare: Some(wgpu::CompareFunction::LessEqual),
+            depth_compare: Some(wgpu::CompareFunction::GreaterEqual),
             stencil: Default::default(),
             bias: Default::default(),
         }),

@@ -123,7 +123,7 @@ pub(super) struct FrameUniform {
 #[derive(Clone, Copy, Pod, Zeroable)]
 pub(super) struct Params {
     pub(super) max_groups: u32,
-    pub(super) _pad0: u32,
+    pub(super) greek_mode: u32, // 1 = enabled, 0 = disabled
     pub(super) _pad1: u32,
     pub(super) _pad2: u32,
     pub(super) dilate_px: f32,
@@ -138,7 +138,8 @@ pub(super) struct Params {
     pub(super) emoji_cols: u32,
     pub(super) emoji_rows: u32,
     pub(super) emoji_layer: [f32; 2],
-    pub(super) _pad3: [u32; 2],
+    pub(super) greek_onset_px: f32,
+    pub(super) _pad3: u32,
 }
 
 
@@ -279,5 +280,11 @@ mod layout_tests {
         encase::StorageBuffer::new(&mut buf).write(&row).unwrap();
         assert_eq!(buf.len(), 80);
         assert_eq!(&buf[..], bytemuck::bytes_of(&row), "GroupRow bytes");
+    }
+
+    #[test]
+    fn params_size_and_alignment() {
+        assert_eq!(std::mem::size_of::<Params>(), 64, "Params must be 64 B (16-byte multiple)");
+        assert_eq!(std::mem::align_of::<Params>(), 4);
     }
 }
