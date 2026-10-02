@@ -1191,12 +1191,20 @@ fn build_file_blocks(
             let mut max_z = f32::NEG_INFINITY;
             for s in chunk {
                 let qw = s.advance.max(s.height);
-                min_x = min_x.min(s.pos[0]);
-                max_x = max_x.max(s.pos[0] + qw);
-                min_y = min_y.min(s.pos[1] - 0.5 * s.height);
-                max_y = max_y.max(s.pos[1] + 0.5 * s.height);
-                min_z = min_z.min(s.pos[2]);
-                max_z = max_z.max(s.pos[2]);
+                let half_h = 0.5 * s.height;
+                let px = s.pos[0];
+                let py = s.pos[1];
+                let pz = s.pos[2];
+
+                if px < min_x { min_x = px; }
+                let x_hi = px + qw;
+                if x_hi > max_x { max_x = x_hi; }
+                let y_lo = py - half_h;
+                let y_hi = py + half_h;
+                if y_lo < min_y { min_y = y_lo; }
+                if y_hi > max_y { max_y = y_hi; }
+                if pz < min_z { min_z = pz; }
+                if pz > max_z { max_z = pz; }
             }
             if min_x <= max_x && min_y <= max_y {
                 blocks.push(crate::glyph_scene::BlockCull {
@@ -1233,12 +1241,20 @@ fn build_file_blocks(
                     let mut max_z = f32::NEG_INFINITY;
                     for s in chunk {
                         let qw = s.advance.max(s.height);
-                        min_x = min_x.min(s.pos[0]);
-                        max_x = max_x.max(s.pos[0] + qw);
-                        min_y = min_y.min(s.pos[1] - 0.5 * s.height);
-                        max_y = max_y.max(s.pos[1] + 0.5 * s.height);
-                        min_z = min_z.min(s.pos[2]);
-                        max_z = max_z.max(s.pos[2]);
+                        let half_h = 0.5 * s.height;
+                        let px = s.pos[0];
+                        let py = s.pos[1];
+                        let pz = s.pos[2];
+
+                        if px < min_x { min_x = px; }
+                        let x_hi = px + qw;
+                        if x_hi > max_x { max_x = x_hi; }
+                        let y_lo = py - half_h;
+                        let y_hi = py + half_h;
+                        if y_lo < min_y { min_y = y_lo; }
+                        if y_hi > max_y { max_y = y_hi; }
+                        if pz < min_z { min_z = pz; }
+                        if pz > max_z { max_z = pz; }
                     }
                     if min_x <= max_x && min_y <= max_y {
                         blocks.push(crate::glyph_scene::BlockCull {

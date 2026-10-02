@@ -662,6 +662,8 @@ impl HyperLayout {
                         let gid = r.glyph_id as usize;
                         if gid < trie.emoji_cell.len() && trie.emoji_cell[gid].is_some() {
                             file_has_emoji = true;
+                        } else if flat_color.is_some() {
+                            file_cells += 1;
                         } else {
                             let c0 = (color & 0xFF) as usize;
                             let c1 = ((color >> 8) & 0xFF) as usize;
@@ -703,6 +705,17 @@ impl HyperLayout {
                     }
 
                     pos += 1;
+                }
+
+                if let Some(c) = flat_color {
+                    if file_cells > 0 {
+                        let c0 = (c & 0xFF) as usize;
+                        let c1 = ((c >> 8) & 0xFF) as usize;
+                        let c2 = ((c >> 16) & 0xFF) as usize;
+                        file_s0 = lut[c0] * file_cells as f64;
+                        file_s1 = lut[c1] * file_cells as f64;
+                        file_s2 = lut[c2] * file_cells as f64;
+                    }
                 }
 
                 (

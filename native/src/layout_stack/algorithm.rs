@@ -359,7 +359,3 @@ impl LayoutController {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-}

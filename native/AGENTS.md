@@ -2,33 +2,24 @@
 
 **Read the root `AGENTS.md` first.** It is canonical for everything repo-wide:
 what each check compares and what it cannot see, what is fenced
-and why, the build trap (`cargo build` does not build the Mojo dylib), and what
-the stage/gate vocabulary means. That account used to be duplicated here and
-drifted out of sync in both directions; this file no longer restates it.
+and why, and what the stage/gate vocabulary means.
 
 This file is the Rust crate: the layout seam, style discipline, debug env vars,
 and the module contracts.
 
 ```bash
-bash tools/check-all.sh        # from the repo root; exit 0 = all green
+cargo glyph test        # runs the entire verification battery; exit 0 = all green
 ```
 
-**Run in a WORKTREE if anyone else is working in this repo.** `check-all` reads
+**Run in a WORKTREE if anyone else is working in this repo.** `cargo glyph test` reads
 the WORKING TREE, not HEAD, so another thread's uncommitted edits fail your
-checks and tell you nothing about your own change. That has already happened. A
-fresh worktree is not free — `.pixi/`, the dylib and `engine/bench/bench.bin`
-are all untracked:
+checks and tell you nothing about your own change. That has already happened:
 
 ```bash
 git worktree add .claude/worktrees/<name> -b worktree-<name>
 cd .claude/worktrees/<name>
-pixi install                                   # ~1 min, .pixi is untracked
-pixi run build-engine                          # the dylib is untracked too
-# engine/bench/bench.bin does not exist here; check.sh only COMPILES the
-# benches, so nothing needs it. gen-bench.mjs still reaches into the web repo.
+cargo glyph test
 ```
-
-Setup details and the toolchain's live constraints: `engine/TOOLCHAIN.md`.
 
 
 ## The determinism chain (why the checks can be this strict)
@@ -42,9 +33,9 @@ offscreen path.
 Everything that could break it is fenced, and **the fence table lives in root
 `AGENTS.md`** — it used to be restated here with different reasons and a stale
 claim (`engine/` as READ-ONLY, which it has not been since engine work moved
-into this tree). One correction worth carrying: an engine change is gated by the
-Mojo suites *and* must leave every pixel baseline byte-equal. If an engine change
-moves a PNG, the change is wrong.
+into this tree). One invariant worth carrying: any layout or rendering change
+must leave every golden pixel baseline byte-equal. If a change moves a PNG,
+the change is wrong.
 
 ## The layout seam
 
