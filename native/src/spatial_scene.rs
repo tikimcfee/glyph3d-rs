@@ -327,6 +327,26 @@ impl SpatialScene {
 
     /// Extract all visible mesh instances (`Quad` and `Box`) into GPU-ready draw buffers.
     pub fn extract_mesh_instances(&mut self) -> SceneMeshDraws {
+        let mut mesh_changed = false;
+        let mut change_query = self.world.query_filtered::<
+            (),
+            (
+                With<SceneMeshKind>,
+                Or<(
+                    Changed<GlobalTransform>,
+                    Changed<SceneMeshMaterial>,
+                    Changed<Visible>,
+                )>,
+            ),
+        >();
+        if change_query.iter(&self.world).next().is_some() {
+            mesh_changed = true;
+        }
+
+        if !mesh_changed {
+            return self.cached_mesh_draws.clone();
+        }
+
         let mut draws = SceneMeshDraws::default();
 
         let mut query = self.world.query::<(
@@ -380,11 +400,11 @@ impl SpatialScene {
     pub fn sync_to_group_rows(&mut self, groups: &mut [GroupRow]) -> Vec<u32> {
         let mut updated = Vec::new();
 
-        let mut query = self.world.query::<(
+        let mut query = self.world.query_filtered::<(
             &GlobalTransform,
             &GlyphGroupBinding,
             Option<&Visible>,
-        )>();
+        ), Changed<GlobalTransform>>();
 
         for (gtf, binding, vis) in query.iter(&self.world) {
             if let Some(v) = vis {
@@ -404,6 +424,8 @@ impl SpatialScene {
                 updated.push(binding.group_id);
             }
         }
+
+        self.world.clear_trackers();
 
         updated
     }

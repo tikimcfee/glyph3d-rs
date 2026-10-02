@@ -1123,8 +1123,8 @@ impl GlyphScene {
             if let Some(ctrl) = &mut self.controller {
                 if ctrl.move_zone(&zid_str, d_vec) {
                     let updated_gids = ctrl.sync_gpu_groups(&mut self.groups_cpu);
-                    for gid in updated_gids {
-                        self.write_group_row(ctx, gid);
+                    self.write_group_rows(ctx, &updated_gids);
+                    for &gid in &updated_gids {
                         self.sync_segment(gid);
                     }
                 }
@@ -1186,7 +1186,12 @@ impl GlyphScene {
                     transform.translation += d_vec;
                 }
                 ctrl.scene.update_transforms();
-                ctrl.sync_gpu_groups(&mut self.groups_cpu);
+                let updated_gids = ctrl.sync_gpu_groups(&mut self.groups_cpu);
+                self.write_group_rows(ctx, &updated_gids);
+                for &g in &updated_gids {
+                    self.sync_segment(g);
+                }
+                return;
             } else if let Some(g) = self.groups_cpu.get_mut(gid as usize) {
                 g.cols[0][0] += delta.x as f32;
                 g.cols[0][1] += delta.y as f32;
@@ -1210,8 +1215,8 @@ impl GlyphScene {
             if let Some(ctrl) = &mut self.controller {
                 if ctrl.scale_zone(&zid_str, f) {
                     let updated_gids = ctrl.sync_gpu_groups(&mut self.groups_cpu);
-                    for gid in updated_gids {
-                        self.write_group_row(ctx, gid);
+                    self.write_group_rows(ctx, &updated_gids);
+                    for &gid in &updated_gids {
                         self.sync_segment(gid);
                     }
                     println!("grab carrel: zone '{zid_str}' scaled by factor {f:.3}");
@@ -1226,10 +1231,16 @@ impl GlyphScene {
                         transform.scale *= f;
                     }
                     ctrl.scene.update_transforms();
-                    ctrl.sync_gpu_groups(&mut self.groups_cpu);
+                    let updated_gids = ctrl.sync_gpu_groups(&mut self.groups_cpu);
+                    self.write_group_rows(ctx, &updated_gids);
+                    for &g in &updated_gids {
+                        self.sync_segment(g);
+                    }
                     if let Some(g) = self.groups_cpu.get(gid as usize) {
                         s = g.cols[3][0];
                     }
+                    println!("grab: group {gid} scale -> {s:.3}");
+                    return;
                 } else if let Some(g) = self.groups_cpu.get_mut(gid as usize) {
                     for c in 0..3 {
                         g.cols[3][c] = (g.cols[3][c] * f).clamp(0.001, 100.0);

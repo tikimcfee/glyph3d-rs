@@ -625,6 +625,34 @@ impl GlyphScene {
         }
     }
 
+    pub(super) fn write_group_rows(&self, ctx: &GpuContext, gids: &[u32]) {
+        if gids.is_empty() {
+            return;
+        }
+        if gids.len() == 1 {
+            self.write_group_row(ctx, gids[0]);
+            return;
+        }
+        let min_gid = *gids.iter().min().unwrap() as usize;
+        let max_gid = *gids.iter().max().unwrap() as usize;
+        if min_gid >= self.groups_cpu.len() || max_gid >= self.groups_cpu.len() {
+            return;
+        }
+        let span = max_gid.saturating_sub(min_gid) + 1;
+        if span <= gids.len() * 4 || gids.len() > 8 {
+            let slice = &self.groups_cpu[min_gid..=max_gid];
+            ctx.queue.write_buffer(
+                &self.group_buf,
+                min_gid as u64 * 80,
+                bytemuck::cast_slice(slice),
+            );
+        } else {
+            for &gid in gids {
+                self.write_group_row(ctx, gid);
+            }
+        }
+    }
+
     /// Re-derive a cull segment from the live group TRS: the world AABB
     /// follows offset/scale, and the backdrop tint follows the group color
     /// relative to its as-staged value (so untouched segments keep their
