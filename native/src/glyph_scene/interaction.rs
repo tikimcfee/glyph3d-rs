@@ -275,6 +275,57 @@ impl GlyphScene {
                     },
                 }
             }
+            K::BracketRight | K::KeyN => {
+                if let Some(ctrl) = &mut self.controller {
+                    if let Some(msg) = ctrl.deck_next() {
+                        let updated_gids = ctrl.sync_gpu_groups(&mut self.groups_cpu);
+                        self.write_group_rows(ctx, &updated_gids);
+                        for &g in &updated_gids {
+                            self.sync_segment(g);
+                        }
+                        println!("{msg}");
+                    } else {
+                        println!("deck: reached end of deck (or no active deck)");
+                    }
+                }
+            }
+            K::BracketLeft | K::KeyP => {
+                if let Some(ctrl) = &mut self.controller {
+                    if let Some(msg) = ctrl.deck_prev() {
+                        let updated_gids = ctrl.sync_gpu_groups(&mut self.groups_cpu);
+                        self.write_group_rows(ctx, &updated_gids);
+                        for &g in &updated_gids {
+                            self.sync_segment(g);
+                        }
+                        println!("{msg}");
+                    } else {
+                        println!("deck: reached beginning of deck (or no active deck)");
+                    }
+                }
+            }
+            K::KeyV => {
+                if let Some(ctrl) = &mut self.controller {
+                    if let Some(msg) = ctrl.deck_toggle_mode() {
+                        let updated_gids = ctrl.sync_gpu_groups(&mut self.groups_cpu);
+                        self.write_group_rows(ctx, &updated_gids);
+                        for &g in &updated_gids {
+                            self.sync_segment(g);
+                        }
+                        println!("{msg}");
+                    }
+                }
+            }
+            K::KeyD => {
+                if let Some(ctrl) = &mut self.controller {
+                    let msg = ctrl.spawn_agent_carrel_demo();
+                    let updated_gids = ctrl.sync_gpu_groups(&mut self.groups_cpu);
+                    self.write_group_rows(ctx, &updated_gids);
+                    for &g in &updated_gids {
+                        self.sync_segment(g);
+                    }
+                    println!("{msg}");
+                }
+            }
             _ => {}
         }
     }

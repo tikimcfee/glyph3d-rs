@@ -17,10 +17,16 @@ mod query;
 mod spawner;
 mod sync;
 pub mod alignment;
+pub mod deck;
+pub mod turn_card;
+pub mod workdesk;
 
 pub use alignment::{
     AlignmentAxis, HorizontalAlign, SpatialAlignment, VerticalAlign, WrapConstraint,
 };
+pub use deck::{Deck, DeckItem, DeckMode};
+pub use turn_card::{AgentTurnCard, TurnPageKind};
+pub use workdesk::{FileActionKind, FileRevisionCard, FileRevisionStack, Workdesk};
 
 /// Type of 3D primitive geometry for a mesh instance.
 #[derive(Component, Debug, Clone, PartialEq)]
@@ -125,11 +131,17 @@ impl SpatialScene {
         }
     }
 
-    /// Run transform propagation and update pre-extracted mesh draw cache.
-    pub fn update_transforms(&mut self) {
+    /// Run transform propagation with optional delta-time easing for dynamic transitions.
+    pub fn update_transforms_animated(&mut self, dt: Option<f32>) {
         self.apply_spatial_alignments();
+        self.apply_deck_layouts(dt);
         self.transform_schedule.run(&mut self.world);
         self.cached_mesh_draws = self.extract_mesh_instances();
+    }
+
+    /// Run transform propagation and update pre-extracted mesh draw cache (instant snap).
+    pub fn update_transforms(&mut self) {
+        self.update_transforms_animated(None);
     }
 }
 
@@ -425,5 +437,198 @@ mod tests {
         // Row 1 (wrapped: track_y = 0 - 30 - 20 = -50)
         assert_eq!(t2.translation, Vec3::new(0.0, -50.0, 0.0));
         assert_eq!(t3.translation, Vec3::new(60.0, -50.0, 0.0));
+    }
+
+    #[test]
+    fn test_deck_rolodex_cascade_and_paging() {
+        let mut scene = SpatialScene::new();
+        let root = scene.spawn_root("carrel_root");
+        let deck_entity = scene.spawn_deck(
+            root,
+            "agent_deck",
+            Deck::new()
+                .with_z_pitch(20.0)
+                .with_crest_offset(3.0, 5.0),
+        );
+
+        let c0 = scene.spawn_child(deck_entity, Transform::IDENTITY, "card0");
+        scene.world.entity_mut(c0).insert(DeckItem { index: 0 });
+        let c1 = scene.spawn_child(deck_entity, Transform::IDENTITY, "card1");
+        scene.world.entity_mut(c1).insert(DeckItem { index: 1 });
+        let c2 = scene.spawn_child(deck_entity, Transform::IDENTITY, "card2");
+        scene.world.entity_mut(c2).insert(DeckItem { index: 2 });
+
+        scene.update_transforms();
+
+        // Initial state: Card 0 is active (at 0,0,0)
+        let t0 = scene.world.get::<Transform>(c0).unwrap();
+        let t1 = scene.world.get::<Transform>(c1).unwrap();
+        let t2 = scene.world.get::<Transform>(c2).unwrap();
+
+        assert_eq!(t0.translation, Vec3::ZERO);
+        assert_eq!(t1.translation, Vec3::new(3.0, 5.0, -20.0));
+        assert_eq!(t2.translation, Vec3::new(6.0, 10.0, -40.0));
+
+        // Advance to page 1
+        assert!(scene.deck_next_page(deck_entity));
+        scene.update_transforms();
+
+        let t0 = scene.world.get::<Transform>(c0).unwrap();
+        let t1 = scene.world.get::<Transform>(c1).unwrap();
+        let t2 = scene.world.get::<Transform>(c2).unwrap();
+
+        // Card 1 is now active at 0,0,0
+        assert_eq!(t1.translation, Vec3::ZERO);
+        // Card 2 is cascading into -Z
+        assert_eq!(t2.translation, Vec3::new(3.0, 5.0, -20.0));
+        // Card 0 is past, tucked to the left/back
+        assert!(t0.translation.x < 0.0);
+        assert!(t0.translation.z > 0.0);
+        assert_ne!(t0.rotation, Quat::IDENTITY);
+
+        // Retreat to page 0
+        assert!(scene.deck_prev_page(deck_entity));
+        scene.update_transforms();
+
+        let t0 = scene.world.get::<Transform>(c0).unwrap();
+        assert_eq!(t0.translation, Vec3::ZERO);
+    }
+
+    #[test]
+    fn test_deck_splay_mode_unfurl() {
+        let mut scene = SpatialScene::new();
+        let root = scene.spawn_root("carrel_root");
+        let deck_entity = scene.spawn_deck(
+            root,
+            "agent_deck",
+            Deck::new()
+                .with_mode(DeckMode::Splay)
+                .with_splay_columns(2),
+        );
+
+        let items: Vec<Entity> = (0..4)
+            .map(|i| {
+                let e = scene.spawn_child(deck_entity, Transform::IDENTITY, format!("page_{i}"));
+                scene.world.entity_mut(e).insert((
+                    DeckItem { index: i },
+                    LocalBounds {
+                        min: [0.0, -40.0, 0.0],
+                        max: [50.0, 0.0, 0.0],
+                    },
+                ));
+                e
+            })
+            .collect();
+
+        scene.update_transforms();
+
+        let t0 = scene.world.get::<Transform>(items[0]).unwrap();
+        let t1 = scene.world.get::<Transform>(items[1]).unwrap();
+        let t2 = scene.world.get::<Transform>(items[2]).unwrap();
+
+        // Item 0 is active (lifted along +Z)
+        assert_eq!(t0.translation.x, 0.0);
+        assert_eq!(t0.translation.y, 0.0);
+        assert_eq!(t0.translation.z, 8.0); // default splay_lift
+
+        // Item 1 is in same row, displaced across X
+        assert!(t1.translation.x > 50.0);
+        assert_eq!(t1.translation.y, 0.0);
+        assert_eq!(t1.translation.z, 0.0);
+
+        // Item 2 is in next row down
+        assert_eq!(t2.translation.x, 0.0);
+        assert!(t2.translation.y < -40.0);
+    }
+
+    #[test]
+    fn test_agent_turn_card_spawning_and_bounds() {
+        let mut scene = SpatialScene::new();
+        let root = scene.spawn_root("root");
+        let card = scene.spawn_agent_turn_card(
+            root,
+            0,
+            [60.0, 40.0],
+            4.0,
+            "Turn 0: Inspecting repo",
+        );
+
+        scene.update_transforms();
+
+        let turn_comp = scene.world.get::<AgentTurnCard>(card).unwrap();
+        assert_eq!(turn_comp.turn_index, 0);
+        assert_eq!(turn_comp.page_size, [60.0, 40.0]);
+        assert_eq!(turn_comp.spine_gap, 4.0);
+
+        // Check overall bounds enclosing both pages and spine gap:
+        // Width: 2 * 60 + 4 = 124. Min X: -62, Max X: 62. Min Y: -40, Max Y: 0.
+        let bounds = scene.world.get::<LocalBounds>(card).unwrap();
+        assert_eq!(bounds.min, [-62.0, -40.0, 0.0]);
+        assert_eq!(bounds.max, [62.0, 0.0, 0.0]);
+
+        // Check Left Page (Mind)
+        let left_tf = scene.world.get::<Transform>(turn_comp.left_page).unwrap();
+        assert_eq!(left_tf.translation.x, -32.0); // -(30 + 2)
+        let left_kind = scene.world.get::<TurnPageKind>(turn_comp.left_page).unwrap();
+        assert_eq!(*left_kind, TurnPageKind::Mind);
+
+        // Check Right Page (Impact)
+        let right_tf = scene.world.get::<Transform>(turn_comp.right_page).unwrap();
+        assert_eq!(right_tf.translation.x, 32.0); // +(30 + 2)
+        let right_kind = scene.world.get::<TurnPageKind>(turn_comp.right_page).unwrap();
+        assert_eq!(*right_kind, TurnPageKind::Impact);
+    }
+
+    #[test]
+    fn test_workdesk_file_revisions_z_stack() {
+        let mut scene = SpatialScene::new();
+        let root = scene.spawn_root("desk_root");
+        let desk = scene.spawn_workdesk(
+            root,
+            "agent_workdesk",
+            [30.0, 30.0],
+            12.0,
+        );
+
+        // Push 3 revisions to file A
+        let r0 = scene.workdesk_push_revision(
+            desk,
+            "src/main.rs",
+            FileActionKind::Read,
+            [50.0, 30.0],
+            "Initial inspection",
+        );
+        let r1 = scene.workdesk_push_revision(
+            desk,
+            "src/main.rs",
+            FileActionKind::Edit,
+            [50.0, 30.0],
+            "Modify CLI arguments",
+        );
+        let r2 = scene.workdesk_push_revision(
+            desk,
+            "src/main.rs",
+            FileActionKind::Write,
+            [50.0, 30.0],
+            "Save updated main.rs",
+        );
+
+        scene.update_transforms();
+
+        // Revisions r0, r1, r2 must cascade along -Z inside the file stack
+        let t0 = scene.world.get::<Transform>(r0).unwrap();
+        let t1 = scene.world.get::<Transform>(r1).unwrap();
+        let t2 = scene.world.get::<Transform>(r2).unwrap();
+
+        assert_eq!(t0.translation.z, 0.0);
+        assert_eq!(t1.translation.z, -12.0);
+        assert_eq!(t2.translation.z, -24.0);
+
+        // Stack count and active revision should be 3 and 2
+        let desk_comp = scene.world.get::<Workdesk>(desk).unwrap();
+        let stack_e = *desk_comp.file_stacks.get("src/main.rs").unwrap();
+        let stack_comp = scene.world.get::<FileRevisionStack>(stack_e).unwrap();
+        assert_eq!(stack_comp.revision_count, 3);
+        assert_eq!(stack_comp.active_revision, 2);
     }
 }

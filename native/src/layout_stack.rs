@@ -284,6 +284,136 @@ impl LayoutController {
         }
         self.scene.update_transforms();
     }
+
+    /// Check if an active deck exists in the spatial scene. If not, returns None.
+    pub fn active_deck_entity(&mut self) -> Option<Entity> {
+        let mut query = self.scene.world.query::<(Entity, &crate::spatial_scene::Deck)>();
+        query.iter(&self.scene.world).map(|(e, _)| e).next()
+    }
+
+    /// Advance active page in the primary deck. Returns a status message if successful.
+    pub fn deck_next(&mut self) -> Option<String> {
+        let deck_e = self.active_deck_entity()?;
+        if self.scene.deck_next_page(deck_e) {
+            self.scene.update_transforms();
+            let deck = self.scene.world.get::<crate::spatial_scene::Deck>(deck_e)?;
+            Some(format!("deck: turned page to {} in mode {:?}", deck.active_index, deck.mode))
+        } else {
+            None
+        }
+    }
+
+    /// Retreat active page in the primary deck. Returns a status message if successful.
+    pub fn deck_prev(&mut self) -> Option<String> {
+        let deck_e = self.active_deck_entity()?;
+        if self.scene.deck_prev_page(deck_e) {
+            self.scene.update_transforms();
+            let deck = self.scene.world.get::<crate::spatial_scene::Deck>(deck_e)?;
+            Some(format!("deck: turned page to {} in mode {:?}", deck.active_index, deck.mode))
+        } else {
+            None
+        }
+    }
+
+    /// Toggle Deck mode between Rolodex cascade (Deck) and overview grid (Splay).
+    pub fn deck_toggle_mode(&mut self) -> Option<String> {
+        let deck_e = self.active_deck_entity()?;
+        let new_mode = self.scene.deck_toggle_mode(deck_e)?;
+        self.scene.update_transforms();
+        Some(format!("deck: toggled mode to {:?}", new_mode))
+    }
+
+    /// Spawn an Agent Carrel with Turn Deck and Workdesk for interactive spatial experimentation.
+    pub fn spawn_agent_carrel_demo(&mut self) -> String {
+        use crate::spatial_scene::{Deck, FileActionKind};
+
+        let carrel_root = self.scene.spawn_root("agent_carrel_root");
+        if let Some(mut tf) = self.scene.world.get_mut::<Transform>(carrel_root) {
+            tf.translation = glam::Vec3::new(0.0, 50.0, 10.0);
+        }
+        let carrel_zone = self.scene.spawn_zone(
+            carrel_root,
+            "agent:carrel",
+            "Agent Study Carrel",
+            Transform::IDENTITY,
+            [280.0, 160.0],
+        );
+        self.zone_entities.insert("agent:carrel".to_string(), carrel_zone);
+
+        // 1. Deck with 4 2-page Turn Cards
+        let deck = self.scene.spawn_deck(
+            carrel_zone,
+            "turn_deck",
+            Deck::new()
+                .with_z_pitch(22.0)
+                .with_crest_offset(3.0, 4.0)
+                .with_splay_columns(2),
+        );
+
+        let titles = [
+            "Turn 0: Scan repository & plan spatial refactor",
+            "Turn 1: Modularize glyph_scene and spatial_scene",
+            "Turn 2: Implement SpatialAlignment and Splay grid",
+            "Turn 3: Construct Deck and 2-page Turn Cards",
+        ];
+
+        for (i, title) in titles.iter().enumerate() {
+            self.scene.spawn_agent_turn_card(
+                deck,
+                i,
+                [55.0, 36.0],
+                4.0,
+                *title,
+            );
+        }
+
+        // 2. Workdesk for touched files placed adjacent along X
+        let workdesk = self.scene.spawn_workdesk(
+            carrel_zone,
+            "agent_touched_files",
+            [40.0, 40.0],
+            14.0,
+        );
+        if let Some(mut tf) = self.scene.world.get_mut::<Transform>(workdesk) {
+            tf.translation.x = 135.0;
+        }
+
+        // Revisions for main.rs
+        self.scene.workdesk_push_revision(
+            workdesk,
+            "src/main.rs",
+            FileActionKind::Read,
+            [35.0, 24.0],
+            "inspect cli",
+        );
+        self.scene.workdesk_push_revision(
+            workdesk,
+            "src/main.rs",
+            FileActionKind::Edit,
+            [35.0, 24.0],
+            "add deck verbs",
+        );
+
+        // Revisions for spatial_scene.rs
+        self.scene.workdesk_push_revision(
+            workdesk,
+            "src/spatial_scene.rs",
+            FileActionKind::Read,
+            [35.0, 24.0],
+            "review ECS hierarchy",
+        );
+        self.scene.workdesk_push_revision(
+            workdesk,
+            "src/spatial_scene.rs",
+            FileActionKind::Write,
+            [35.0, 24.0],
+            "integrate Deck & TurnCard",
+        );
+
+        self.scene.update_transforms();
+
+        "spawned Agent Carrel demo with 4 Turn Cards and Workdesk (press [ / ] or n / p to turn pages, v to splay grid, c to grab/drag)".to_string()
+    }
 }
 
 #[cfg(test)]
