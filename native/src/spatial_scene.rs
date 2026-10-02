@@ -79,6 +79,7 @@ pub struct Visible(pub bool);
 /// Extracted scene mesh instances ready for GPU dispatch.
 #[derive(Default, Debug, Clone)]
 pub struct SceneMeshDraws {
+    pub revision: u64,
     pub quads: Vec<MeshInstance>,
     pub cubes: Vec<MeshInstance>,
 }
@@ -347,7 +348,10 @@ impl SpatialScene {
             return self.cached_mesh_draws.clone();
         }
 
-        let mut draws = SceneMeshDraws::default();
+        let mut draws = SceneMeshDraws {
+            revision: self.cached_mesh_draws.revision + 1,
+            ..Default::default()
+        };
 
         let mut query = self.world.query::<(
             &GlobalTransform,

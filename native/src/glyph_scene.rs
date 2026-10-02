@@ -1091,14 +1091,8 @@ impl GlyphScene {
             let zone_center = self
                 .controller
                 .as_ref()
-                .and_then(|c| c.zone_world_bounds(zid))
-                .map(|(min, max)| {
-                    DVec3::new(
-                        (min[0] + max[0]) as f64 * 0.5,
-                        (min[1] + max[1]) as f64 * 0.5,
-                        (min[2] + max[2]) as f64 * 0.5,
-                    )
-                });
+                .and_then(|c| c.zone_world_translation(zid))
+                .map(|t| DVec3::new(t[0] as f64, t[1] as f64, t[2] as f64));
 
             let Some(c) = zone_center else {
                 self.grabbed_zone = None;

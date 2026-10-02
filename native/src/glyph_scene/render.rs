@@ -231,9 +231,9 @@ pub(super) fn render_scene(
         }
     }
 
-    let scene_meshes = scene.controller.as_ref().map(|ctrl| ctrl.scene.collect_mesh_instances());
-    if let Some(meshes) = &scene_meshes {
-        scene.mesh_pipeline.borrow_mut().prepare(&ctx.device, &ctx.queue, &meshes.quads, &meshes.cubes);
+    let scene_meshes = scene.controller.as_ref().map(|ctrl| ctrl.scene.mesh_draws());
+    if let Some(meshes) = scene_meshes {
+        scene.mesh_pipeline.borrow_mut().prepare(&ctx.device, &ctx.queue, meshes);
     }
 
     // Stage H: pass-level GPU timer (TIMESTAMP_QUERY; pass-boundary writes,

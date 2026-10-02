@@ -232,6 +232,13 @@ impl LayoutController {
         self.scene.world_bounds(entity)
     }
 
+    /// Retrieve the world-space translation for a zone entity.
+    pub fn zone_world_translation(&self, zone_id: &str) -> Option<[f32; 3]> {
+        let entity = *self.zone_entities.get(zone_id)?;
+        let gtf = self.scene.world.get::<bevy_transform::prelude::GlobalTransform>(entity)?;
+        Some(gtf.translation().into())
+    }
+
     /// Retrieve the world-space bounding box for a file view by index: [min, max].
     pub fn file_world_bounds(&self, file_idx: usize) -> Option<([f32; 3], [f32; 3])> {
         let entity = *self.file_entities.get(file_idx)?;

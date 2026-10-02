@@ -115,6 +115,7 @@ pub struct MeshPipeline {
     cube_indices: std::ops::Range<u32>,
     instance_buffer: wgpu::Buffer,
     instance_capacity: usize,
+    last_revision: u64,
 }
 
 impl MeshPipeline {
@@ -242,6 +243,7 @@ impl MeshPipeline {
             cube_indices: cube_start_idx..cube_end_idx,
             instance_buffer,
             instance_capacity,
+            last_revision: 0,
         }
     }
 
@@ -262,13 +264,20 @@ impl MeshPipeline {
         });
     }
 
-    pub fn prepare(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, quads: &[MeshInstance], cubes: &[MeshInstance]) {
+    pub fn prepare(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, draws: &crate::spatial_scene::SceneMeshDraws) {
+        if self.last_revision == draws.revision && draws.revision != 0 {
+            return;
+        }
+        self.last_revision = draws.revision;
+        let quads = &draws.quads;
+        let cubes = &draws.cubes;
+        
         self.ensure_instance_capacity(device, quads.len() + cubes.len());
         if !quads.is_empty() {
             queue.write_buffer(&self.instance_buffer, 0, bytemuck::cast_slice(quads));
         }
         if !cubes.is_empty() {
-            let offset = std::mem::size_of_val(quads) as u64;
+            let offset = std::mem::size_of_val(quads.as_slice()) as u64;
             queue.write_buffer(&self.instance_buffer, offset, bytemuck::cast_slice(cubes));
         }
     }
