@@ -130,11 +130,10 @@ fn vs_main(
     // Unit quad corners, uv == position: (0,0)=bottom-left … (1,1)=top-right.
     // Matches the web's PlaneGeometry where uv = positionLocal + 0.5 and the
     // v axis runs bottom→top, so NO y-flip against the y-up curve data.
-    var corners = array<vec2<f32>, 6>(
+    // Indexed via shared quad index buffer [0, 1, 2, 0, 2, 3] (33% vertex savings).
+    var corners = array<vec2<f32>, 4>(
         vec2<f32>(0.0, 0.0),
         vec2<f32>(1.0, 0.0),
-        vec2<f32>(1.0, 1.0),
-        vec2<f32>(0.0, 0.0),
         vec2<f32>(1.0, 1.0),
         vec2<f32>(0.0, 1.0),
     );

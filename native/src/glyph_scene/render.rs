@@ -290,13 +290,14 @@ pub(super) fn render_scene(
                     .as_ref()
                     .map(|p| p.borrow().begin_query("glyph stream", &mut pass));
                 pass.set_pipeline(&scene.pipeline);
+                pass.set_index_buffer(scene.quad_index_buf.slice(..), wgpu::IndexFormat::Uint16);
                 let mut cur_chunk = u32::MAX;
                 for (c, r) in &phase_draws.glyph_ranges {
                     if *c != cur_chunk {
                         cur_chunk = *c;
                         pass.set_bind_group(0, &scene.bind_groups[*c as usize], &[]);
                     }
-                    pass.draw(0..6, r.clone());
+                    pass.draw_indexed(0..6, 0, r.clone());
                 }
                 if let (Some(p), Some(q)) = (&ctx.profiler, q) {
                     p.borrow().end_query(&mut pass, q);
@@ -352,10 +353,11 @@ pub(super) fn render_scene(
                 ..Default::default()
             });
             pass.set_pipeline(&fx.mask_pipeline);
+            pass.set_index_buffer(scene.quad_index_buf.slice(..), wgpu::IndexFormat::Uint16);
             match sel {
                 Selection::Glyph { chunk, local } => {
                     pass.set_bind_group(0, &scene.bind_groups[*chunk as usize], &[]);
-                    pass.draw(0..6, *local..*local + 1);
+                    pass.draw_indexed(0..6, 0, *local..*local + 1);
                 }
                 Selection::Segment { slot_base, slot_count } => {
                     // Per-chunk split — the same math cull_segments uses.
@@ -366,7 +368,7 @@ pub(super) fn render_scene(
                         let hi = slot_end.min(c_lo + scene.chunk_cap);
                         if hi > lo {
                             pass.set_bind_group(0, &scene.bind_groups[c as usize], &[]);
-                            pass.draw(0..6, (lo - c_lo)..(hi - c_lo));
+                            pass.draw_indexed(0..6, 0, (lo - c_lo)..(hi - c_lo));
                         }
                     }
                 }

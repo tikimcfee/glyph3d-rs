@@ -116,6 +116,7 @@ pub struct GlyphScene {
     /// a segment's slot range across chunk draws).
     pub(crate) chunk_cap: u32,
     pub(crate) camera_buf: wgpu::Buffer,
+    pub(crate) quad_index_buf: wgpu::Buffer,
     pub(crate) depth_format: wgpu::TextureFormat,
     pub(crate) instance_count: u32,
     pub(crate) center: Vec3,
@@ -287,6 +288,11 @@ impl GlyphScene {
             size: std::mem::size_of::<FrameUniform>() as u64,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
+        });
+        let quad_index_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("quad index buffer"),
+            contents: bytemuck::cast_slice(&[0u16, 1, 2, 0, 2, 3]),
+            usage: wgpu::BufferUsages::INDEX,
         });
         let emoji_view = atlas.emoji.texture.create_view(&wgpu::TextureViewDescriptor {
             label: Some("emoji sheet view"),
@@ -495,6 +501,7 @@ impl GlyphScene {
             chunk_counts,
             chunk_cap: chunk_cap as u32,
             camera_buf,
+            quad_index_buf,
             depth_format,
             instance_count: instances_len as u32,
             center,

@@ -212,7 +212,17 @@ pub(super) fn cull_segments(
             let lo = seg.slot_base.max(c_lo);
             let hi = slot_end.min(c_lo + chunk_cap);
             if hi > lo {
-                draws[c as usize].push((lo - c_lo)..(hi - c_lo));
+                let range = (lo - c_lo)..(hi - c_lo);
+                let chunk_draws = &mut draws[c as usize];
+                if let Some(last) = chunk_draws.last_mut() {
+                    if last.end == range.start {
+                        last.end = range.end;
+                    } else {
+                        chunk_draws.push(range);
+                    }
+                } else {
+                    chunk_draws.push(range);
+                }
             }
         }
     }
@@ -620,6 +630,31 @@ mod cull_depth_tests {
         let d2 = cull_segments(&[s], &[false], &v, 1024, 1);
         assert!(drew_glyphs(&d2));
         assert!(d2.backdrops.is_empty());
+    }
+
+    #[test]
+    fn contiguous_segments_coalesce_into_single_draw_range() {
+        let mut s1 = seg([-1.0, -1.0, -5.0], [1.0, 1.0, -4.0]);
+        s1.slot_base = 0;
+        s1.slot_count = 100;
+
+        let mut s2 = seg([2.0, -1.0, -5.0], [4.0, 1.0, -4.0]);
+        s2.slot_base = 100;
+        s2.slot_count = 150;
+
+        let v = view_clipping_behind_z(-10.0, Vec3::new(0.0, 0.0, 0.0), 0.0);
+        let d = cull_segments(&[s1, s2], &[false, false], &v, 1024, 1);
+        assert_eq!(d.glyph_ranges.len(), 1, "contiguous segments must coalesce");
+        assert_eq!(d.glyph_ranges[0], (0, 0..250));
+
+        // Non-contiguous segments with a gap must NOT coalesce
+        let mut s3 = seg([5.0, -1.0, -5.0], [7.0, 1.0, -4.0]);
+        s3.slot_base = 300;
+        s3.slot_count = 50;
+        let d2 = cull_segments(&[s1, s3], &[false, false], &v, 1024, 1);
+        assert_eq!(d2.glyph_ranges.len(), 2, "gapped segments must remain separate");
+        assert_eq!(d2.glyph_ranges[0], (0, 0..100));
+        assert_eq!(d2.glyph_ranges[1], (0, 300..350));
     }
 }
 
