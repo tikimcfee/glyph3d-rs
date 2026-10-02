@@ -61,7 +61,14 @@ pub(super) fn render_scene(
     }
     if let Some(probe) = &scene.ui_probe {
         let p = probe.borrow();
-        scene.set_greeking(&ctx.queue, p.greeking);
+        let mode = if !p.greeking {
+            0
+        } else if p.greek_pure {
+            2
+        } else {
+            1
+        };
+        scene.set_greek_mode(&ctx.queue, mode);
         scene.set_greek_onset_px(&ctx.queue, p.greek_onset_px);
     }
 

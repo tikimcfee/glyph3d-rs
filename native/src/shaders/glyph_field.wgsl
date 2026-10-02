@@ -74,7 +74,7 @@ struct Camera {
 
 struct Params {
     max_groups: u32,   // group table row count (OOB group ids cull)
-    greek_mode: u32,   // 1 = enabled (default), 0 = disabled
+    greek_mode: u32,   // 0 = disabled, 1 = smooth blend (default), 2 = pure hard bypass
     _pad1: u32,
     _pad2: u32,
     // Minification dials — GLYPH_LOD_DEFAULTS (GlyphField.js)
@@ -338,25 +338,31 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     // Pixel footprint in glyph-UV space, per axis — resolution-independent AA.
     let fw = fwidth(in.glyph_uv);
 
-    // Minification amount m, smoothstep-ramped over [min_lo, min_hi].
-    let fw_max = max(fw.x, fw.y);
-    var m = clamp((fw_max - params.min_lo) / (params.min_hi - params.min_lo), 0.0, 1.0);
-    m = m * m * (3.0 - 2.0 * m);
-
     // Greeking: at small/subpixel scale, transition from aliased vector curves
     // to smooth, energy-conserving horizontal syntax bars.
     // em_px is the on-screen pixel height of the character cell (1.0 / fw.y).
     let em_px = 1.0 / max(fw.y, 1e-4);
     var greek = 0.0;
-    if params.greek_mode != 0u {
+    if params.greek_mode == 1u {
+        // Smooth transition over [full..onset]
         let onset = params.greek_onset_px;
         let full = onset * 0.45;
         let t = clamp((onset - em_px) / max(onset - full, 0.01), 0.0, 1.0);
         greek = t * t * (3.0 - 2.0 * t);
+    } else if params.greek_mode == 2u {
+        // Pure bypass: instant cut below onset, eliminating all Bézier curve ALU & texture loads
+        if em_px <= params.greek_onset_px {
+            greek = 1.0;
+        }
     }
 
     var cov = 0.0;
     if greek < 1.0 {
+        // Minification amount m, smoothstep-ramped over [min_lo, min_hi].
+        let fw_max = max(fw.x, fw.y);
+        var m = clamp((fw_max - params.min_lo) / (params.min_hi - params.min_lo), 0.0, 1.0);
+        m = m * m * (3.0 - 2.0 * m);
+
         // Dilation half-width + softened inverse footprint (identity at m=0).
         let dilate = m * params.dilate_px;
         let inv_d = (vec2<f32>(1.0) / fw) * (1.0 - m * params.soften);

@@ -17,6 +17,8 @@ pub struct LaunchConfig {
     pub no_cull: Option<bool>,
     pub no_ui: Option<bool>,
     pub greeking: Option<bool>,
+    pub greek_pure: Option<bool>,
+    pub greek_smooth: Option<bool>,
     pub greek_onset_px: Option<f32>,
     pub load_repo: Option<PathBuf>,
 }
@@ -76,6 +78,12 @@ impl LaunchConfig {
                 }
                 "greeking" => {
                     cfg.greeking = Some(parse_bool(val, line_idx)?);
+                }
+                "greek_pure" => {
+                    cfg.greek_pure = Some(parse_bool(val, line_idx)?);
+                }
+                "greek_smooth" => {
+                    cfg.greek_smooth = Some(parse_bool(val, line_idx)?);
                 }
                 "greek_onset_px" => {
                     cfg.greek_onset_px = Some(val.parse::<f32>().map_err(|e| {
@@ -139,6 +147,7 @@ mod tests {
             no_cull = false
             no_ui = true
             greeking = true
+            greek_pure = true
             greek_onset_px = 12.0
             load_repo = "/path/to/repo"
         "#;
@@ -153,6 +162,7 @@ mod tests {
         assert_eq!(cfg.no_cull, Some(false));
         assert_eq!(cfg.no_ui, Some(true));
         assert_eq!(cfg.greeking, Some(true));
+        assert_eq!(cfg.greek_pure, Some(true));
         assert_eq!(cfg.greek_onset_px, Some(12.0));
         assert_eq!(cfg.load_repo, Some(PathBuf::from("/path/to/repo")));
     }

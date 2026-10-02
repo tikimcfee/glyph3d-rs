@@ -302,7 +302,7 @@ impl GlyphScene {
         let sheet = &atlas.emoji.sheet;
         let params = Params {
             max_groups: groups.len() as u32,
-            greek_mode: 1,
+            greek_mode: 2,
             _pad1: 0,
             _pad2: 0,
             // GLYPH_LOD_DEFAULTS (GlyphField.js)
@@ -534,15 +534,25 @@ impl GlyphScene {
         }
     }
 
-    /// Configure whether Greeking (anti-Moiré subpixel bars) is enabled.
-    pub fn set_greeking(&self, queue: &wgpu::Queue, on: bool) {
+    /// Configure Greeking mode: 0 = disabled, 1 = smooth fade, 2 = pure hard bypass.
+    pub fn set_greek_mode(&self, queue: &wgpu::Queue, mode: u32) {
         let mut p = self.params.get();
-        let mode = if on { 1 } else { 0 };
         if p.greek_mode != mode {
             p.greek_mode = mode;
             self.params.set(p);
             queue.write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&p));
         }
+    }
+
+    /// Configure whether Greeking (anti-Moiré subpixel bars) is enabled.
+    pub fn set_greeking(&self, queue: &wgpu::Queue, on: bool) {
+        let cur = self.params.get().greek_mode;
+        let mode = if on {
+            if cur == 1 { 1 } else { 2 }
+        } else {
+            0
+        };
+        self.set_greek_mode(queue, mode);
     }
 
     /// Configure the on-screen glyph height in px/em where Greeking begins (default: 10.0).
