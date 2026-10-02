@@ -1,0 +1,12 @@
+{
+  "stop-verify": {
+    "enabled": true,
+    "Stop": [
+      {
+        "type": "command",
+        "command": "python3 ../tools/hooks/stop_final_verify.py",
+        "timeout": 30
+      }
+    ]
+  }
+}

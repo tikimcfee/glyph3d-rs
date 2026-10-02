@@ -25,6 +25,10 @@ node_modules/
 # macOS
 .DS_Store
 out/tooling-ab/sweep/
+out/*.json.gz
+out/*.json.syms.json
+out/*.png
+out/windowed-shot-*.png
 
 # Agent worktrees — each is its own git repo plus a ~2.5 GB toolchain.
 # `git add -A` will otherwise commit them as gitlinks (it did, 289ada8).

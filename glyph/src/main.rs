@@ -318,7 +318,7 @@ fn verify_corpus(name: &str, a: &Artifact) -> bool {
     let _ = std::fs::remove_dir_all(&scratch);
     let (good, out) = sh(
         &format!(
-            "mkdir -p {0} && cp -R engine/fixtures {0}/fixtures && cp engine/glyph_schema.mjs {0}/ \
+            "rm -rf {0} && mkdir -p {0} && cp -R engine/fixtures {0}/fixtures && cp engine/glyph_schema.mjs {0}/ \
              && rm -f {0}/fixtures/*.pipe.bin {0}/fixtures/*.bake.bin \
              && cd {0}/fixtures && node gen.mjs >/dev/null && node gen-bake.mjs >/dev/null",
             scratch.to_string_lossy()

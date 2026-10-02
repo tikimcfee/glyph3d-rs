@@ -1,0 +1,15 @@
+[tools]
+rust = "stable"
+python = "3.12"
+just = "latest"
+cargo-deny = "latest"
+cargo-nextest = "latest"
+naga = "latest"
+
+[env]
+# Define python virtualenv to allow automatic fonttools usage
+# when generators run
+_.python.venv = { path = ".venv", create = true }
+
+[tasks]
+"python:install" = "pip install fonttools"
