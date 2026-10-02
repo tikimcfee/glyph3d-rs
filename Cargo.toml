@@ -23,3 +23,13 @@ exclude = ["experiments"]
 [profile.release]
 # Keep debug info in release so future profiling stages stay sane.
 debug = true
+
+[workspace.lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+unwrap_used = "warn"
+expect_used = "warn"
+panic = "warn"
+todo = "warn"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+module_name_repetitions = "allow"

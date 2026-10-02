@@ -11,6 +11,9 @@ publish = false
 # zero-warning gate and the same test floor as the code it checks. A build tool
 # exempt from its own regime is how tools/glyph.py ended up with no tests.
 
+[lints]
+workspace = true
+
 [dependencies]
 # Standard tools rather than hand-rolled equivalents: clap for the CLI surface,
 # serde+toml for the manifest, glob for input expansion, sha2 for the

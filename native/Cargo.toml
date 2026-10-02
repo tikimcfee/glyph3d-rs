@@ -11,6 +11,9 @@ description = "Stage A: native wgpu shell for the million-glyph code-visualizati
 [lib]
 path = "src/lib.rs"
 
+[lints]
+workspace = true
+
 [dependencies]
 # Latest stable wgpu (v30.x). Let cargo resolve within the major line.
 wgpu = "30"
