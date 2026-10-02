@@ -279,6 +279,12 @@ pub struct Cli {
     /// Disable Greeking subpixel glyphs into stable horizontal ink bars
     #[arg(long)]
     pub no_greeking: bool,
+    /// Force gradual blend for Greeking (default is pure fast bypass)
+    #[arg(long)]
+    pub greek_smooth: bool,
+    /// Enable pure/hard Greeking bypass (active by default)
+    #[arg(long)]
+    pub greek_pure: bool,
     /// On-screen glyph height in px/em where Greeking begins (default: 10.0)
     #[arg(long, value_name = "F")]
     pub greek_onset_px: Option<f32>,
@@ -619,6 +625,20 @@ fn parse_cli_from(matches: clap::ArgMatches) -> Cli {
                         cli.no_greeking = !greek;
                     }
                 }
+                if matches.value_source("greek_pure")
+                    != Some(clap::parser::ValueSource::CommandLine)
+                {
+                    if let Some(pure) = cfg.greek_pure {
+                        cli.greek_pure = pure;
+                    }
+                }
+                if matches.value_source("greek_smooth")
+                    != Some(clap::parser::ValueSource::CommandLine)
+                {
+                    if let Some(smooth) = cfg.greek_smooth {
+                        cli.greek_smooth = smooth;
+                    }
+                }
                 if matches.value_source("greek_onset_px")
                     != Some(clap::parser::ValueSource::CommandLine)
                 {
@@ -722,6 +742,8 @@ mod cli_tests {
         assert!(!cli.no_cull);
         assert!(!cli.no_ui);
         assert!(!cli.no_greeking);
+        assert!(!cli.greek_pure);
+        assert!(!cli.greek_smooth);
         assert!(cli.greek_onset_px.is_none());
         assert!(cli.launch_config.is_none());
         assert!(!cli.file_backgrounds);
@@ -1115,6 +1137,30 @@ mod cli_tests {
         assert_eq!(cli.lod_min_px, Some(3.5));
         assert!(cli.no_greeking);
         assert_eq!(cli.wrap_mode, "back"); // CLI flag overrode TOML config
+    }
+
+    #[test]
+    fn launch_config_greek_pure_merging() {
+        let tmp = std::env::temp_dir().join(format!("test_launch_cfg_pure_{}.toml", std::process::id()));
+        std::fs::write(
+            &tmp,
+            r#"
+            greeking = true
+            greek_pure = true
+            greek_onset_px = 15.0
+            "#,
+        )
+        .expect("write temp config");
+
+        let cli = parse(&[
+            "--launch-config",
+            tmp.to_str().unwrap(),
+        ]);
+        let _ = std::fs::remove_file(&tmp);
+
+        assert!(!cli.no_greeking);
+        assert!(cli.greek_pure);
+        assert_eq!(cli.greek_onset_px, Some(15.0));
     }
 }
 

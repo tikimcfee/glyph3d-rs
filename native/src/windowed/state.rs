@@ -569,6 +569,7 @@ impl WindowState {
                             });
                             ui.checkbox(&mut p.greeking, "Glyph greeking (anti-moiré)");
                             if p.greeking {
+                                ui.checkbox(&mut p.greek_pure, "Pure bypass (hard cutoff, max FPS)");
                                 ui.add(
                                     egui::Slider::new(&mut p.greek_onset_px, 2.0..=32.0)
                                         .text("Greeking onset px/em (default 10.0)"),

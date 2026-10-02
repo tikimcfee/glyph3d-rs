@@ -121,6 +121,7 @@ pub struct SceneCullOptions {
     pub file_bg_color: [f32; 4],
     pub lod_min_px: Option<f32>,
     pub greeking: bool,
+    pub greek_pure: bool,
     pub greek_onset_px: Option<f32>,
 }
 
@@ -132,6 +133,7 @@ impl Default for SceneCullOptions {
             file_bg_color: DEFAULT_FILE_BG_COLOR,
             lod_min_px: None,
             greeking: true,
+            greek_pure: true,
             greek_onset_px: None,
         }
     }
@@ -221,7 +223,14 @@ fn build_scene_impl(
         if let Some(lod) = cull_opts.lod_min_px {
             scene.set_lod_min_px(lod);
         }
-        scene.set_greeking(&ctx.queue, cull_opts.greeking);
+        let mode = if !cull_opts.greeking {
+            0
+        } else if cull_opts.greek_pure {
+            2
+        } else {
+            1
+        };
+        scene.set_greek_mode(&ctx.queue, mode);
         if let Some(onset) = cull_opts.greek_onset_px {
             scene.set_greek_onset_px(&ctx.queue, onset);
         }

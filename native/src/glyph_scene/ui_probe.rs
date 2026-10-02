@@ -38,6 +38,8 @@ pub struct UiProbeState {
     pub file_bg_color: [f32; 4],
     /// Live Greeking (anti-moiré) toggle.
     pub greeking: bool,
+    /// Live Greeking pure bypass (hard cutoff, max FPS) toggle.
+    pub greek_pure: bool,
     /// Live Greeking onset threshold in px/em (default 10.0).
     pub greek_onset_px: f32,
     // ── K4: live cull readouts (scene → UI; the same sums GLYPH_CULL_DEBUG
@@ -174,13 +176,16 @@ impl GlyphScene {
             .as_ref()
             .map(|c| (c.file_backgrounds.get(), c.file_bg_color.get(), c.lod_min_px.get()))
             .unwrap_or((false, crate::DEFAULT_FILE_BG_COLOR, LOD_MIN_PX));
-        let greeking = self.params.get().greek_mode != 0;
+        let mode = self.params.get().greek_mode;
+        let greeking = mode != 0;
+        let greek_pure = mode == 2;
         let greek_onset_px = self.params.get().greek_onset_px;
         let probe = UiProbe::new(std::cell::RefCell::new(UiProbeState {
             lod_min_px,
             file_backgrounds,
             file_bg_color,
             greeking,
+            greek_pure,
             greek_onset_px,
             files: std::rc::Rc::new(files),
             file_dyn,

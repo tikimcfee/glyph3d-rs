@@ -44,8 +44,19 @@ pub const BACKDROP_GAIN: f32 = 0.7;
 /// depth — it ASSERTED a false one, testing every segment as though it spanned
 /// z ∈ [-1, 1]. That was true while all instances lived in the z=0 plane, and
 /// WrapBack made it false by spending wraps in depth.
+/// Stage F: one sub-file block for hierarchical frustum culling.
+/// Divides large files (>512 glyphs) into localized chunks so off-screen lines
+/// are culled on the CPU rather than dispatching tens of thousands of instances to the GPU.
 #[repr(C)]
-#[derive(Clone, Copy, Pod, Zeroable)]
+#[derive(Clone, Copy, Debug, PartialEq, Pod, Zeroable)]
+pub struct BlockCull {
+    pub min: [f32; 3],
+    pub max: [f32; 3],
+    pub slot_base: u32,
+    pub slot_count: u32,
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub struct SegCull {
     pub min: [f32; 3],
     pub max: [f32; 3],
@@ -55,6 +66,8 @@ pub struct SegCull {
     /// w = effective per-pixel ink coverage E at deep minification
     /// (`ink_frac × BACKDROP_GAIN`, clamped to 1) — the backdrop alpha.
     pub tint: [f32; 4],
+    /// Sub-file blocks for large files, allowing fine-grained CPU frustum culling.
+    pub blocks: Vec<BlockCull>,
 }
 
 /// Stage F — world cell footprint used for ink-density estimates: em advance
@@ -152,10 +165,9 @@ pub(super) fn cull_segments(
             continue;
         }
         // Frustum: positive-vertex test per plane, over the segment's real AABB.
-        // The z lane used to be the constant ±1 — true while every instance
-        // lived in the z=0 plane, false since WrapBack began spending wraps in
-        // depth, and wrong in the direction that KEEPS what it should drop.
+        // Also tracks whether the entire file is fully inside the frustum volume.
         let mut visible = true;
+        let mut fully_inside = true;
         for pl in planes {
             let px = if pl[0] >= 0.0 { seg.max[0] } else { seg.min[0] };
             let py = if pl[1] >= 0.0 { seg.max[1] } else { seg.min[1] };
@@ -163,6 +175,14 @@ pub(super) fn cull_segments(
             if pl[0] * px + pl[1] * py + pl[2] * pz + pl[3] < 0.0 {
                 visible = false;
                 break;
+            }
+            if fully_inside {
+                let nx = if pl[0] >= 0.0 { seg.min[0] } else { seg.max[0] };
+                let ny = if pl[1] >= 0.0 { seg.min[1] } else { seg.max[1] };
+                let nz = if pl[2] >= 0.0 { seg.min[2] } else { seg.max[2] };
+                if pl[0] * nx + pl[1] * ny + pl[2] * nz + pl[3] < 0.0 {
+                    fully_inside = false;
+                }
             }
         }
         if !visible {
@@ -205,15 +225,38 @@ pub(super) fn cull_segments(
                 depth: [seg.min[2] - 0.02, 0.0, 0.0, 0.0],
             });
         }
-        // Glyph stream: split the slot range across arena chunks.
-        let slot_end = seg.slot_base + seg.slot_count;
-        for c in 0..chunk_count {
-            let c_lo = c * chunk_cap;
-            let lo = seg.slot_base.max(c_lo);
-            let hi = slot_end.min(c_lo + chunk_cap);
-            if hi > lo {
-                draws[c as usize].push((lo - c_lo)..(hi - c_lo));
+        // Glyph stream: if the file has sub-blocks and crosses the frustum boundary,
+        // perform hierarchical block culling; otherwise add the entire file's slot range.
+        if !seg.blocks.is_empty() && !fully_inside {
+            for block in &seg.blocks {
+                let mut block_visible = true;
+                for pl in planes {
+                    let px = if pl[0] >= 0.0 { block.max[0] } else { block.min[0] };
+                    let py = if pl[1] >= 0.0 { block.max[1] } else { block.min[1] };
+                    let pz = if pl[2] >= 0.0 { block.max[2] } else { block.min[2] };
+                    if pl[0] * px + pl[1] * py + pl[2] * pz + pl[3] < 0.0 {
+                        block_visible = false;
+                        break;
+                    }
+                }
+                if block_visible && block.slot_count > 0 {
+                    add_slot_range(
+                        &mut draws,
+                        block.slot_base,
+                        block.slot_base + block.slot_count,
+                        chunk_cap,
+                        chunk_count,
+                    );
+                }
             }
+        } else if seg.slot_count > 0 {
+            add_slot_range(
+                &mut draws,
+                seg.slot_base,
+                seg.slot_base + seg.slot_count,
+                chunk_cap,
+                chunk_count,
+            );
         }
     }
     // Stage L (L2): flatten chunk-major into the Glyphs phase list — the
@@ -225,6 +268,34 @@ pub(super) fn cull_segments(
         .flat_map(|(c, rs)| rs.into_iter().map(move |r| (c as u32, r)))
         .collect();
     PhaseDraws { backdrops, glyph_ranges }
+}
+
+#[inline]
+fn add_slot_range(
+    draws: &mut [Vec<std::ops::Range<u32>>],
+    slot_base: u32,
+    slot_end: u32,
+    chunk_cap: u32,
+    chunk_count: u32,
+) {
+    for c in 0..chunk_count {
+        let c_lo = c * chunk_cap;
+        let lo = slot_base.max(c_lo);
+        let hi = slot_end.min(c_lo + chunk_cap);
+        if hi > lo {
+            let range = (lo - c_lo)..(hi - c_lo);
+            let chunk_draws = &mut draws[c as usize];
+            if let Some(last) = chunk_draws.last_mut() {
+                if last.end == range.start {
+                    last.end = range.end;
+                } else {
+                    chunk_draws.push(range);
+                }
+            } else {
+                chunk_draws.push(range);
+            }
+        }
+    }
 }
 
 /// Extract the 6 frustum planes from a view-proj matrix (Gribb-Hartmann;
@@ -266,6 +337,7 @@ pub(super) struct CullState {
     /// (`GlyphScene::sync_segment`).
     pub(super) local_min: Vec<[f32; 3]>,
     pub(super) local_max: Vec<[f32; 3]>,
+    pub(super) local_blocks: Vec<Vec<BlockCull>>,
     pub(super) base_tint: Vec<[f32; 4]>,
     /// Group color rgb at staging time — tint edits scale the backdrop by
     /// pow(new)/pow(orig) so an untouched segment keeps its Stage F tint.
@@ -301,6 +373,7 @@ impl CullState {
         // every group is at scale 1, so local = world − group offset.
         let mut local_min = Vec::with_capacity(segments.len());
         let mut local_max = Vec::with_capacity(segments.len());
+        let mut local_blocks = Vec::with_capacity(segments.len());
         let mut base_tint = Vec::with_capacity(segments.len());
         let mut orig_group_rgb = Vec::with_capacity(segments.len());
         for (i, seg) in segments.iter().enumerate() {
@@ -310,6 +383,16 @@ impl CullState {
                 .unwrap_or([0.0, 0.0, 0.0]);
             local_min.push([seg.min[0] - off[0], seg.min[1] - off[1], seg.min[2] - off[2]]);
             local_max.push([seg.max[0] - off[0], seg.max[1] - off[1], seg.max[2] - off[2]]);
+            let mut lblks = Vec::with_capacity(seg.blocks.len());
+            for b in &seg.blocks {
+                lblks.push(BlockCull {
+                    min: [b.min[0] - off[0], b.min[1] - off[1], b.min[2] - off[2]],
+                    max: [b.max[0] - off[0], b.max[1] - off[1], b.max[2] - off[2]],
+                    slot_base: b.slot_base,
+                    slot_count: b.slot_count,
+                });
+            }
+            local_blocks.push(lblks);
             base_tint.push(seg.tint);
             orig_group_rgb.push(
                 groups
@@ -455,6 +538,7 @@ impl CullState {
             segments: segments.to_vec(),
             local_min,
             local_max,
+            local_blocks,
             base_tint,
             orig_group_rgb,
             hidden: vec![false; segments.len()],
@@ -510,7 +594,7 @@ mod cull_depth_tests {
 
     /// A segment somewhere in space, with the tint the cull path never reads.
     fn seg(min: [f32; 3], max: [f32; 3]) -> SegCull {
-        SegCull { min, max, slot_base: 0, slot_count: 16, tint: [0.0; 4] }
+        SegCull { min, max, slot_base: 0, slot_count: 16, tint: [0.0; 4], blocks: Vec::new() }
     }
 
     /// A frustum that keeps everything except what is behind the near plane,
@@ -610,7 +694,7 @@ mod cull_depth_tests {
         v.file_backgrounds = true;
         v.file_bg_color = [0.2, 0.3, 0.4, 0.5];
 
-        let d = cull_segments(&[s], &[false], &v, 1024, 1);
+        let d = cull_segments(&[s.clone()], &[false], &v, 1024, 1);
         assert!(drew_glyphs(&d), "glyphs must be drawn in near mode");
         assert_eq!(d.backdrops.len(), 1, "background quad must be emitted behind glyphs");
         assert_eq!(d.backdrops[0].rgba, [0.2, 0.3, 0.4, 0.5]);
@@ -621,6 +705,148 @@ mod cull_depth_tests {
         let d2 = cull_segments(&[s], &[false], &v, 1024, 1);
         assert!(drew_glyphs(&d2));
         assert!(d2.backdrops.is_empty());
+    }
+
+    #[test]
+    fn contiguous_segments_coalesce_into_single_draw_range() {
+        let mut s1 = seg([-1.0, -1.0, -5.0], [1.0, 1.0, -4.0]);
+        s1.slot_base = 0;
+        s1.slot_count = 100;
+
+        let mut s2 = seg([2.0, -1.0, -5.0], [4.0, 1.0, -4.0]);
+        s2.slot_base = 100;
+        s2.slot_count = 150;
+
+        let v = view_clipping_behind_z(-10.0, Vec3::new(0.0, 0.0, 0.0), 0.0);
+        let d = cull_segments(&[s1.clone(), s2], &[false, false], &v, 1024, 1);
+        assert_eq!(d.glyph_ranges.len(), 1, "contiguous segments must coalesce");
+        assert_eq!(d.glyph_ranges[0], (0, 0..250));
+
+        // Non-contiguous segments with a gap must NOT coalesce
+        let mut s3 = seg([5.0, -1.0, -5.0], [7.0, 1.0, -4.0]);
+        s3.slot_base = 300;
+        s3.slot_count = 50;
+        let d2 = cull_segments(&[s1, s3], &[false, false], &v, 1024, 1);
+        assert_eq!(d2.glyph_ranges.len(), 2, "gapped segments must remain separate");
+        assert_eq!(d2.glyph_ranges[0], (0, 0..100));
+        assert_eq!(d2.glyph_ranges[1], (0, 300..350));
+    }
+
+    #[test]
+    fn hierarchical_sub_blocks_culled_when_offscreen() {
+        // File spans z ∈ [-20, 0]. Near plane is at z = -5.
+        // Block 0: z ∈ [-20, -10] (behind near plane, must be culled)
+        // Block 1: z ∈ [-4, 0] (in front of near plane, must survive)
+        let mut s = seg([-1.0, -1.0, -20.0], [1.0, 1.0, 0.0]);
+        s.slot_base = 0;
+        s.slot_count = 1000;
+        s.blocks = vec![
+            BlockCull {
+                min: [-1.0, -1.0, -20.0],
+                max: [1.0, 1.0, -10.0],
+                slot_base: 0,
+                slot_count: 500,
+            },
+            BlockCull {
+                min: [-1.0, -1.0, -4.0],
+                max: [1.0, 1.0, 0.0],
+                slot_base: 500,
+                slot_count: 500,
+            },
+        ];
+
+        let v = view_clipping_behind_z(-5.0, Vec3::new(0.0, 0.0, 5.0), 0.0);
+        let d = cull_segments(&[s], &[false], &v, 2048, 1);
+        // Only block 1 (slots 500..1000) must be drawn
+        assert_eq!(d.glyph_ranges.len(), 1);
+        assert_eq!(d.glyph_ranges[0], (0, 500..1000));
+    }
+
+    #[test]
+    fn hierarchical_sub_blocks_coalesce_when_contiguous() {
+        // File crosses frustum boundary: Block 0 is culled, Blocks 1 and 2 survive.
+        // Blocks 1 and 2 are contiguous (500..1000 and 1000..1500), so they coalesce into 500..1500.
+        let mut s = seg([-1.0, -1.0, -30.0], [1.0, 1.0, 0.0]);
+        s.slot_base = 0;
+        s.slot_count = 1500;
+        s.blocks = vec![
+            BlockCull {
+                min: [-1.0, -1.0, -30.0],
+                max: [1.0, 1.0, -15.0],
+                slot_base: 0,
+                slot_count: 500,
+            },
+            BlockCull {
+                min: [-1.0, -1.0, -4.0],
+                max: [1.0, 1.0, -2.0],
+                slot_base: 500,
+                slot_count: 500,
+            },
+            BlockCull {
+                min: [-1.0, -1.0, -2.0],
+                max: [1.0, 1.0, 0.0],
+                slot_base: 1000,
+                slot_count: 500,
+            },
+        ];
+
+        let v = view_clipping_behind_z(-5.0, Vec3::new(0.0, 0.0, 5.0), 0.0);
+        let d = cull_segments(&[s], &[false], &v, 2048, 1);
+        assert_eq!(d.glyph_ranges.len(), 1);
+        assert_eq!(d.glyph_ranges[0], (0, 500..1500));
+    }
+
+    #[test]
+    fn hierarchical_file_fully_inside_accepts_all_slots() {
+        // File is completely inside frustum, so even with sub-blocks, all slots are accepted in one range.
+        let mut s = seg([-1.0, -1.0, -2.0], [1.0, 1.0, 0.0]);
+        s.slot_base = 0;
+        s.slot_count = 1000;
+        s.blocks = vec![
+            BlockCull {
+                min: [-1.0, -1.0, -2.0],
+                max: [1.0, 1.0, -1.0],
+                slot_base: 0,
+                slot_count: 500,
+            },
+            BlockCull {
+                min: [-1.0, -1.0, -1.0],
+                max: [1.0, 1.0, 0.0],
+                slot_base: 500,
+                slot_count: 500,
+            },
+        ];
+
+        let v = view_clipping_behind_z(-5.0, Vec3::new(0.0, 0.0, 5.0), 0.0);
+        let d = cull_segments(&[s], &[false], &v, 2048, 1);
+        assert_eq!(d.glyph_ranges.len(), 1);
+        assert_eq!(d.glyph_ranges[0], (0, 0..1000));
+    }
+
+    #[test]
+    fn hierarchical_file_outside_discards_all_blocks() {
+        // Entire file is behind near plane: all blocks are discarded without checking them individually.
+        let mut s = seg([-1.0, -1.0, -50.0], [1.0, 1.0, -20.0]);
+        s.slot_base = 0;
+        s.slot_count = 1000;
+        s.blocks = vec![
+            BlockCull {
+                min: [-1.0, -1.0, -50.0],
+                max: [1.0, 1.0, -35.0],
+                slot_base: 0,
+                slot_count: 500,
+            },
+            BlockCull {
+                min: [-1.0, -1.0, -35.0],
+                max: [1.0, 1.0, -20.0],
+                slot_base: 500,
+                slot_count: 500,
+            },
+        ];
+
+        let v = view_clipping_behind_z(-5.0, Vec3::new(0.0, 0.0, 5.0), 0.0);
+        let d = cull_segments(&[s], &[false], &v, 2048, 1);
+        assert!(!drew_glyphs(&d));
     }
 }
 

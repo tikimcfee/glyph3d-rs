@@ -123,7 +123,7 @@ pub(super) struct FrameUniform {
 #[derive(Clone, Copy, Pod, Zeroable)]
 pub(super) struct Params {
     pub(super) max_groups: u32,
-    pub(super) greek_mode: u32, // 1 = enabled, 0 = disabled
+    pub(super) greek_mode: u32, // 0 = disabled, 1 = smooth blend (default), 2 = pure hard bypass
     pub(super) _pad1: u32,
     pub(super) _pad2: u32,
     pub(super) dilate_px: f32,

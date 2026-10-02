@@ -205,12 +205,14 @@ fn main() {
     // Device/queue/adapter init is shared by both modes (gpu::init).
     let ctx = pollster::block_on(gpu::init(None));
 
+    let greek_pure = !cli.greek_smooth;
     let cull_opts = SceneCullOptions {
         cull: !cli.no_cull,
         file_backgrounds: cli.file_backgrounds,
         file_bg_color: cli.file_bg_color.unwrap_or(DEFAULT_FILE_BG_COLOR),
         lod_min_px: cli.lod_min_px,
         greeking: !cli.no_greeking,
+        greek_pure,
         greek_onset_px: cli.greek_onset_px,
     };
 

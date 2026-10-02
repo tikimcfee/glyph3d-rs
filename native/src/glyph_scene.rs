@@ -75,7 +75,7 @@ pub use camera::{CameraMode, FlyCamera, FOV_Y};
 use camera::CamFrame;
 
 mod cull;
-pub use cull::{BackdropInst, SegCull, BACKDROP_GAIN, GLYPH_CELL_AREA, LOD_MIN_PX};
+pub use cull::{BackdropInst, BlockCull, SegCull, BACKDROP_GAIN, GLYPH_CELL_AREA, LOD_MIN_PX};
 use cull::CullState;
 
 mod pick;
@@ -117,6 +117,7 @@ pub struct GlyphScene {
     /// a segment's slot range across chunk draws).
     pub(crate) chunk_cap: u32,
     pub(crate) camera_buf: wgpu::Buffer,
+    pub(crate) quad_index_buf: wgpu::Buffer,
     pub(crate) depth_format: wgpu::TextureFormat,
     pub(crate) instance_count: u32,
     pub(crate) center: Vec3,
@@ -297,6 +298,11 @@ impl GlyphScene {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        let quad_index_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("quad index buffer"),
+            contents: bytemuck::cast_slice(&[0u16, 1, 2, 0, 2, 3]),
+            usage: wgpu::BufferUsages::INDEX,
+        });
         let emoji_view = atlas.emoji.texture.create_view(&wgpu::TextureViewDescriptor {
             label: Some("emoji sheet view"),
             dimension: Some(wgpu::TextureViewDimension::D2Array),
@@ -305,7 +311,7 @@ impl GlyphScene {
         let sheet = &atlas.emoji.sheet;
         let params = Params {
             max_groups: groups.len() as u32,
-            greek_mode: 1,
+            greek_mode: 2,
             _pad1: 0,
             _pad2: 0,
             // GLYPH_LOD_DEFAULTS (GlyphField.js)
@@ -488,6 +494,7 @@ impl GlyphScene {
                     staged.bounds_max[1] - staged.bounds_min[1],
                     &atlas.slot_ink,
                 ),
+                blocks: Vec::new(),
             });
         }
         // multi_draw_indirect is core in wgpu 30 — but its Metal backend
@@ -532,6 +539,7 @@ impl GlyphScene {
             chunk_counts,
             chunk_cap: chunk_cap as u32,
             camera_buf,
+            quad_index_buf,
             depth_format,
             instance_count: instances_len as u32,
             center,
@@ -569,15 +577,25 @@ impl GlyphScene {
         }
     }
 
-    /// Configure whether Greeking (anti-Moiré subpixel bars) is enabled.
-    pub fn set_greeking(&self, queue: &wgpu::Queue, on: bool) {
+    /// Configure Greeking mode: 0 = disabled, 1 = smooth fade, 2 = pure hard bypass.
+    pub fn set_greek_mode(&self, queue: &wgpu::Queue, mode: u32) {
         let mut p = self.params.get();
-        let mode = if on { 1 } else { 0 };
         if p.greek_mode != mode {
             p.greek_mode = mode;
             self.params.set(p);
             queue.write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&p));
         }
+    }
+
+    /// Configure whether Greeking (anti-Moiré subpixel bars) is enabled.
+    pub fn set_greeking(&self, queue: &wgpu::Queue, on: bool) {
+        let cur = self.params.get().greek_mode;
+        let mode = if on {
+            if cur == 1 { 1 } else { 2 }
+        } else {
+            0
+        };
+        self.set_greek_mode(queue, mode);
     }
 
     /// Configure the on-screen glyph height in px/em where Greeking begins (default: 10.0).
