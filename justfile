@@ -53,5 +53,13 @@ emoji-inventory:
 gen-emoji-sheet:
 	python3 tools/gen_emoji_sheet.py
 
+# Prebake or refresh the derived atlas mip cache
+bake-atlas-cache:
+	@rm -f assets/atlas/emoji-sheet.cache
+	cargo run --release -p glyph3d-native -- --screenshot /tmp/atlas-cache-bake.png
+	@rm -f /tmp/atlas-cache-bake.png
+	@echo "[ok] Baked assets/atlas/emoji-sheet.cache"
+
 build-native:
 	cd native && cargo build --release
+

@@ -705,27 +705,181 @@ pub struct EmojiTexture {
     pub cell_ink: Vec<[f32; 4]>,
 }
 
+const CACHE_MAGIC: &[u8; 4] = b"G3MC"; // Glyph3D Mip Cache
+const CACHE_VERSION: u32 = 1;
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct CacheHeader {
+    magic: [u8; 4],
+    version: u32,
+    source_len: u64,
+    source_mtime_secs: u64,
+    layers: u32,
+    layer_w: u32,
+    layer_h: u32,
+    mip_levels: u32,
+    cell_count: u32,
+    _reserved0: u32,
+    _reserved: [u8; 16],
+}
+
+struct CachedEmoji {
+    levels: Vec<Vec<Vec<u8>>>,
+    cell_ink: Vec<[f32; 4]>,
+}
+
+fn try_load_cache(
+    cache_path: &Path,
+    sheet_path: &Path,
+    sheet: &EmojiSheet,
+    mip_levels: u32,
+) -> Option<CachedEmoji> {
+    use std::io::Read;
+    let meta = std::fs::metadata(sheet_path).ok()?;
+    let source_len = meta.len();
+    let source_mtime_secs = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    let file = std::fs::File::open(cache_path).ok()?;
+    let mut reader = std::io::BufReader::with_capacity(16 * 1024 * 1024, file);
+
+    let mut hdr = CacheHeader {
+        magic: [0; 4],
+        version: 0,
+        source_len: 0,
+        source_mtime_secs: 0,
+        layers: 0,
+        layer_w: 0,
+        layer_h: 0,
+        mip_levels: 0,
+        cell_count: 0,
+        _reserved0: 0,
+        _reserved: [0; 16],
+    };
+    reader.read_exact(bytemuck::bytes_of_mut(&mut hdr)).ok()?;
+
+    if hdr.magic != *CACHE_MAGIC
+        || hdr.version != CACHE_VERSION
+        || hdr.source_len != source_len
+        || hdr.source_mtime_secs != source_mtime_secs
+        || hdr.layers != sheet.layers
+        || hdr.layer_w != sheet.layer_w
+        || hdr.layer_h != sheet.layer_h
+        || hdr.mip_levels != mip_levels
+        || hdr.cell_count as usize != sheet.cells.len()
+    {
+        return None;
+    }
+
+    let mut cell_ink: Vec<[f32; 4]> = vec![[0.0; 4]; hdr.cell_count as usize];
+    reader.read_exact(bytemuck::cast_slice_mut(&mut cell_ink)).ok()?;
+
+    let mut levels: Vec<Vec<Vec<u8>>> = Vec::with_capacity(hdr.layers as usize);
+    for _ in 0..hdr.layers {
+        let mut chain = Vec::with_capacity(hdr.mip_levels as usize);
+        let (mut w, mut h) = (hdr.layer_w, hdr.layer_h);
+        for _ in 0..hdr.mip_levels {
+            let bytes = (w * h * 4) as usize;
+            let mut data = vec![0u8; bytes];
+            reader.read_exact(&mut data).ok()?;
+            chain.push(data);
+            w /= 2;
+            h /= 2;
+        }
+        levels.push(chain);
+    }
+
+    Some(CachedEmoji { levels, cell_ink })
+}
+
+fn save_cache(
+    cache_path: &Path,
+    sheet_path: &Path,
+    sheet: &EmojiSheet,
+    mip_levels: u32,
+    levels: &[Vec<Vec<u8>>],
+    cell_ink: &[[f32; 4]],
+) -> Result<(), std::io::Error> {
+    use std::io::Write;
+    let meta = std::fs::metadata(sheet_path)?;
+    let source_len = meta.len();
+    let source_mtime_secs = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    let hdr = CacheHeader {
+        magic: *CACHE_MAGIC,
+        version: CACHE_VERSION,
+        source_len,
+        source_mtime_secs,
+        layers: sheet.layers,
+        layer_w: sheet.layer_w,
+        layer_h: sheet.layer_h,
+        mip_levels,
+        cell_count: sheet.cells.len() as u32,
+        _reserved0: 0,
+        _reserved: [0; 16],
+    };
+
+    let tmp_path = cache_path.with_extension("cache.tmp");
+    let file = std::fs::File::create(&tmp_path)?;
+    let mut writer = std::io::BufWriter::with_capacity(16 * 1024 * 1024, file);
+    writer.write_all(bytemuck::bytes_of(&hdr))?;
+    writer.write_all(bytemuck::cast_slice(cell_ink))?;
+    for chain in levels {
+        for data in chain {
+            writer.write_all(data)?;
+        }
+    }
+    writer.flush()?;
+    drop(writer);
+    std::fs::rename(&tmp_path, cache_path)?;
+    Ok(())
+}
+
 impl EmojiTexture {
     pub fn load_device(device: &wgpu::Device, queue: &wgpu::Queue, path: &Path) -> Self {
         let t0 = std::time::Instant::now();
         let sheet = EmojiSheet::load(path);
         let t_parse = t0.elapsed();
-        let (level0, cell_ink) = sheet.decode_layers();
-        let t_decode = t0.elapsed() - t_parse;
         let mip_levels = mip_levels_for(sheet.cell_w, sheet.cell_h);
-        let mut levels: Vec<Vec<Vec<u8>>> = Vec::with_capacity(sheet.layers as usize);
-        for base in level0 {
-            let mut chain = vec![base];
-            let (mut w, mut h) = (sheet.layer_w, sheet.layer_h);
-            for _ in 1..mip_levels {
-                let next = box_down_straight(chain.last().unwrap(), w, h);
-                w /= 2;
-                h /= 2;
-                chain.push(next);
+        let cache_path = path.with_extension("cache");
+
+        let (levels, cell_ink, from_cache, t_decode, t_mips) = match try_load_cache(&cache_path, path, &sheet, mip_levels) {
+            Some(cached) => {
+                let t_cache = t0.elapsed() - t_parse;
+                (cached.levels, cached.cell_ink, true, std::time::Duration::ZERO, t_cache)
             }
-            levels.push(chain);
-        }
-        let t_mips = t0.elapsed() - t_parse - t_decode;
+            None => {
+                let (level0, cell_ink) = sheet.decode_layers();
+                let t_decode = t0.elapsed() - t_parse;
+                let mut levels: Vec<Vec<Vec<u8>>> = Vec::with_capacity(sheet.layers as usize);
+                for base in level0 {
+                    let mut chain = vec![base];
+                    let (mut w, mut h) = (sheet.layer_w, sheet.layer_h);
+                    for _ in 1..mip_levels {
+                        let next = box_down_straight(chain.last().unwrap(), w, h);
+                        w /= 2;
+                        h /= 2;
+                        chain.push(next);
+                    }
+                    levels.push(chain);
+                }
+                let t_mips = t0.elapsed() - t_parse - t_decode;
+                if let Err(e) = save_cache(&cache_path, path, &sheet, mip_levels, &levels, &cell_ink) {
+                    log::warn!("failed to write atlas mip cache to {}: {e}", cache_path.display());
+                }
+                (levels, cell_ink, false, t_decode, t_mips)
+            }
+        };
 
         let texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("emoji sheet"),
@@ -762,7 +916,7 @@ impl EmojiTexture {
         log::info!(
             "emoji sheet: {} cells ({}x{}, {} ppem, bearing y {}, advance {} px) in {} layer(s) of {}x{}, \
              {} mip levels, {:.1} MiB of texture; {} codepoints, {} sequences carried; font sha256 {:08x}…; \
-             parse {:.1} ms, decode {:.1} ms on {} threads, mips {:.1} ms, upload enqueue {:.1} ms",
+             parse {:.1} ms, decode {:.1} ms on {} threads, mips {:.1} ms{}, upload enqueue {:.1} ms",
             sheet.cells.len(),
             sheet.cell_w,
             sheet.cell_h,
@@ -781,6 +935,7 @@ impl EmojiTexture {
             t_decode.as_secs_f64() * 1e3,
             std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1),
             t_mips.as_secs_f64() * 1e3,
+            if from_cache { " (cached)" } else { "" },
             t_upload.as_secs_f64() * 1e3,
         );
         Self { texture, sheet, mip_levels, texture_bytes, cell_ink }

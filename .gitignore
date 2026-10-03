@@ -36,3 +36,8 @@ out/windowed-shot-*.png
 
 # one workspace, one target dir (was native/target before 2026-09-06)
 /target/
+
+# Derived atlas mip cache
+assets/atlas/*.cache
+*.cache
+
