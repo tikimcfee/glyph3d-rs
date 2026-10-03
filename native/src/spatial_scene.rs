@@ -11,10 +11,22 @@ use bevy_transform::systems::{
     mark_dirty_trees, propagate_parent_transforms, sync_simple_transforms,
     StaticTransformOptimizations,
 };
-use glam::{Affine3A, Quat, Vec3};
-
 use crate::glyph_scene::mesh::MeshInstance;
-use crate::glyph_scene::GroupRow;
+
+mod query;
+mod spawner;
+mod sync;
+pub mod alignment;
+pub mod deck;
+pub mod turn_card;
+pub mod workdesk;
+
+pub use alignment::{
+    AlignmentAxis, HorizontalAlign, SpatialAlignment, VerticalAlign, WrapConstraint,
+};
+pub use deck::{Deck, DeckItem, DeckMode};
+pub use turn_card::{AgentTurnCard, TurnPageKind};
+pub use workdesk::{FileActionKind, FileRevisionCard, FileRevisionStack, Workdesk};
 
 /// Type of 3D primitive geometry for a mesh instance.
 #[derive(Component, Debug, Clone, PartialEq)]
@@ -119,422 +131,25 @@ impl SpatialScene {
         }
     }
 
-    /// Run transform propagation and update pre-extracted mesh draw cache.
-    pub fn update_transforms(&mut self) {
+    /// Run transform propagation with optional delta-time easing for dynamic transitions.
+    pub fn update_transforms_animated(&mut self, dt: Option<f32>) {
+        self.apply_spatial_alignments();
+        self.apply_deck_layouts(dt);
         self.transform_schedule.run(&mut self.world);
         self.cached_mesh_draws = self.extract_mesh_instances();
     }
 
-    /// Spawn a root organizational transform entity.
-    pub fn spawn_root(&mut self, name: impl Into<String>) -> Entity {
-        self.world
-            .spawn((
-                Transform::IDENTITY,
-                Name::new(name.into()),
-            ))
-            .id()
+    /// Run transform propagation and update pre-extracted mesh draw cache (instant snap).
+    pub fn update_transforms(&mut self) {
+        self.update_transforms_animated(None);
     }
-
-    /// Spawn a child entity parented to `parent`.
-    pub fn spawn_child(
-        &mut self,
-        parent: Entity,
-        transform: Transform,
-        name: impl Into<String>,
-    ) -> Entity {
-        self.world
-            .spawn((
-                transform,
-                ChildOf(parent),
-                Name::new(name.into()),
-            ))
-            .id()
-    }
-
-    /// Spawn a layout container zone entity.
-    pub fn spawn_zone(
-        &mut self,
-        parent: Entity,
-        zone_id: impl Into<String>,
-        title: impl Into<String>,
-        transform: Transform,
-        size: [f32; 2],
-    ) -> Entity {
-        let zid = zone_id.into();
-        self.world
-            .spawn((
-                transform,
-                ChildOf(parent),
-                Name::new(format!("zone:{}", zid)),
-                LayoutZoneEntity {
-                    zone_id: zid,
-                    title: title.into(),
-                },
-                LocalBounds {
-                    min: [0.0, -size[1], 0.0],
-                    max: [size[0], 0.0, 0.0],
-                },
-            ))
-            .id()
-    }
-
-    /// Spawn a background container plate mesh entity.
-    pub fn spawn_plate(
-        &mut self,
-        parent: Entity,
-        name: impl Into<String>,
-        transform: Transform,
-        size: [f32; 2],
-        origin: [f32; 2],
-        color: [f32; 4],
-    ) -> Entity {
-        self.world
-            .spawn((
-                transform,
-                ChildOf(parent),
-                Name::new(name.into()),
-                SceneMeshKind::Quad { size, origin },
-                SceneMeshMaterial {
-                    color,
-                    params: [0.0, 0.0, 0.0, 0.0],
-                },
-                LocalBounds {
-                    min: [origin[0], origin[1], 0.0],
-                    max: [origin[0] + size[0], origin[1] + size[1], 0.0],
-                },
-            ))
-            .id()
-    }
-
-    /// Spawn a code file card entity with glyph group binding.
-    #[allow(clippy::too_many_arguments)]
-    pub fn spawn_file_card(
-        &mut self,
-        parent: Entity,
-        rel_path: impl Into<String>,
-        dir: impl Into<String>,
-        group_id: u32,
-        transform: Transform,
-        local_bounds: ([f32; 3], [f32; 3]),
-        tint: [f32; 3],
-    ) -> Entity {
-        let path_str = rel_path.into();
-        self.world
-            .spawn((
-                transform,
-                ChildOf(parent),
-                Name::new(path_str.clone()),
-                FileCard {
-                    rel_path: path_str,
-                    dir: dir.into(),
-                    group_id,
-                },
-                GlyphGroupBinding {
-                    group_id,
-                    tint: [tint[0], tint[1], tint[2], 1.0],
-                },
-                LocalBounds {
-                    min: local_bounds.0,
-                    max: local_bounds.1,
-                },
-            ))
-            .id()
-    }
-
-    /// Attach an entity as a child of another entity.
-    pub fn attach_child(&mut self, parent: Entity, child: Entity) {
-        if parent == child {
-            log::warn!("spatial_scene: cannot parent entity {:?} to itself", child);
-            return;
-        }
-        self.world.entity_mut(child).insert(ChildOf(parent));
-    }
-
-    /// Detach an entity from its parent.
-    pub fn detach(&mut self, entity: Entity) {
-        self.world.entity_mut(entity).remove::<ChildOf>();
-    }
-
-    /// Compute world-space axis-aligned bounding box (AABB) for an entity and its subtree.
-    pub fn world_bounds(&self, entity: Entity) -> Option<([f32; 3], [f32; 3])> {
-        let gtf = self.world.get::<GlobalTransform>(entity)?;
-        let mut world_min = Vec3::splat(f32::INFINITY);
-        let mut world_max = Vec3::splat(f32::NEG_INFINITY);
-        let mut has_bounds = false;
-
-        let local_bounds = self.world.get::<LocalBounds>(entity).copied().or_else(|| {
-            self.world.get::<SceneMeshKind>(entity).map(|mesh| match mesh {
-                SceneMeshKind::Quad { size, origin } => LocalBounds {
-                    min: [origin[0], origin[1], 0.0],
-                    max: [origin[0] + size[0], origin[1] + size[1], 0.0],
-                },
-                SceneMeshKind::Box { extents } => {
-                    let hx = extents[0] * 0.5;
-                    let hy = extents[1] * 0.5;
-                    let hz = extents[2] * 0.5;
-                    LocalBounds {
-                        min: [-hx, -hy, -hz],
-                        max: [hx, hy, hz],
-                    }
-                }
-            })
-        });
-
-        if let Some(b) = local_bounds {
-            let corners = [
-                Vec3::new(b.min[0], b.min[1], b.min[2]),
-                Vec3::new(b.max[0], b.min[1], b.min[2]),
-                Vec3::new(b.min[0], b.max[1], b.min[2]),
-                Vec3::new(b.max[0], b.max[1], b.min[2]),
-                Vec3::new(b.min[0], b.min[1], b.max[2]),
-                Vec3::new(b.max[0], b.min[1], b.max[2]),
-                Vec3::new(b.min[0], b.max[1], b.max[2]),
-                Vec3::new(b.max[0], b.max[1], b.max[2]),
-            ];
-            for c in corners {
-                let wp = gtf.transform_point(c);
-                world_min = world_min.min(wp);
-                world_max = world_max.max(wp);
-            }
-            has_bounds = true;
-        }
-
-        if let Some(children) = self.world.get::<bevy_ecs::hierarchy::Children>(entity) {
-            for child in children.iter() {
-                if let Some((c_min, c_max)) = self.world_bounds(child) {
-                    world_min = world_min.min(Vec3::from_array(c_min));
-                    world_max = world_max.max(Vec3::from_array(c_max));
-                    has_bounds = true;
-                }
-            }
-        }
-
-        if has_bounds {
-            Some((world_min.to_array(), world_max.to_array()))
-        } else {
-            None
-        }
-    }
-
-    /// Return the pre-extracted scene mesh instances ready for GPU dispatch.
-    pub fn collect_mesh_instances(&self) -> SceneMeshDraws {
-        self.cached_mesh_draws.clone()
-    }
-
-    /// Return a borrowed reference to the pre-extracted scene mesh instances.
-    pub fn mesh_draws(&self) -> &SceneMeshDraws {
-        &self.cached_mesh_draws
-    }
-
-    /// Extract all visible mesh instances (`Quad` and `Box`) into GPU-ready draw buffers.
-    pub fn extract_mesh_instances(&mut self) -> SceneMeshDraws {
-        let mut mesh_changed = false;
-        let mut change_query = self.world.query_filtered::<
-            (),
-            (
-                With<SceneMeshKind>,
-                Or<(
-                    Changed<GlobalTransform>,
-                    Changed<SceneMeshMaterial>,
-                    Changed<Visible>,
-                )>,
-            ),
-        >();
-        if change_query.iter(&self.world).next().is_some() {
-            mesh_changed = true;
-        }
-
-        if !mesh_changed {
-            return self.cached_mesh_draws.clone();
-        }
-
-        let mut draws = SceneMeshDraws {
-            revision: self.cached_mesh_draws.revision + 1,
-            ..Default::default()
-        };
-
-        let mut query = self.world.query::<(
-            &GlobalTransform,
-            &SceneMeshKind,
-            &SceneMeshMaterial,
-            Option<&Visible>,
-        )>();
-
-        for (gtf, mesh_kind, mat, vis) in query.iter(&self.world) {
-            if let Some(v) = vis {
-                if !v.0 {
-                    continue;
-                }
-            }
-
-            let parent_affine = gtf.affine();
-
-            match mesh_kind {
-                SceneMeshKind::Quad { size, origin } => {
-                    let local_affine = Affine3A::from_scale_rotation_translation(
-                        Vec3::new(size[0], size[1], 1.0),
-                        Quat::IDENTITY,
-                        Vec3::new(origin[0] + size[0] * 0.5, origin[1] + size[1] * 0.5, 0.0),
-                    );
-                    let world_affine = parent_affine * local_affine;
-                    draws.quads.push(MeshInstance::from_affine(
-                        world_affine,
-                        mat.color,
-                        mat.params,
-                    ));
-                }
-                SceneMeshKind::Box { extents } => {
-                    let local_affine = Affine3A::from_scale(
-                        Vec3::new(extents[0], extents[1], extents[2]),
-                    );
-                    let world_affine = parent_affine * local_affine;
-                    draws.cubes.push(MeshInstance::from_affine(
-                        world_affine,
-                        mat.color,
-                        mat.params,
-                    ));
-                }
-            }
-        }
-
-        draws
-    }
-
-    /// Synchronize all entities with a `GlyphGroupBinding` into the GPU `GroupRow` buffer.
-    pub fn sync_to_group_rows(&mut self, groups: &mut [GroupRow]) -> Vec<u32> {
-        let mut updated = Vec::new();
-
-        let mut query = self.world.query_filtered::<(
-            &GlobalTransform,
-            &GlyphGroupBinding,
-            Option<&Visible>,
-        ), Changed<GlobalTransform>>();
-
-        for (gtf, binding, vis) in query.iter(&self.world) {
-            if let Some(v) = vis {
-                if !v.0 {
-                    continue;
-                }
-            }
-
-            let idx = binding.group_id as usize;
-            if idx < groups.len() {
-                let (scale, rotation, translation) = gtf.to_scale_rotation_translation();
-                let g = &mut groups[idx];
-                g.cols[0] = [translation.x, translation.y, translation.z, 0.0];
-                g.cols[1] = [rotation.x, rotation.y, rotation.z, rotation.w];
-                g.cols[2] = binding.tint;
-                g.cols[3] = [scale.x, scale.y, scale.z, 0.0];
-                updated.push(binding.group_id);
-            }
-        }
-
-        self.world.clear_trackers();
-
-        updated
-    }
-
-    /// Raycast against all entities with `LocalBounds` using true Oriented Bounding Box (OBB)
-    /// unprojection: unprojects the world ray into entity local space via `world_from_local.inverse()`.
-    /// Returns `Some((Entity, world_hit_t))` for the nearest hit entity in front of the ray.
-    pub fn raycast_obb(
-        &mut self,
-        ro: glam::DVec3,
-        rd: glam::DVec3,
-    ) -> Option<(Entity, f64)> {
-        let mut best: Option<(Entity, f64)> = None;
-
-        let mut query = self.world.query::<(
-            Entity,
-            &GlobalTransform,
-            &LocalBounds,
-            Option<&Visible>,
-        )>();
-
-        for (entity, gtf, bounds, vis) in query.iter(&self.world) {
-            if let Some(v) = vis {
-                if !v.0 {
-                    continue;
-                }
-            }
-
-            let affine = gtf.affine();
-            let inv_affine = affine.inverse();
-
-            // Transform world ray into local space
-            let ro_f32 = Vec3::new(ro.x as f32, ro.y as f32, ro.z as f32);
-            let rd_f32 = Vec3::new(rd.x as f32, rd.y as f32, rd.z as f32);
-
-            let ro_local = inv_affine.transform_point3(ro_f32);
-            let rd_local = inv_affine.transform_vector3(rd_f32);
-
-            let ro_loc_d = glam::DVec3::new(ro_local.x as f64, ro_local.y as f64, ro_local.z as f64);
-            let rd_loc_d = glam::DVec3::new(rd_local.x as f64, rd_local.y as f64, rd_local.z as f64);
-
-            let b_min = glam::DVec3::new(bounds.min[0] as f64, bounds.min[1] as f64, bounds.min[2] as f64);
-            let b_max = glam::DVec3::new(bounds.max[0] as f64, bounds.max[1] as f64, bounds.max[2] as f64);
-
-            let min = b_min.min(b_max);
-            let max = b_min.max(b_max);
-
-            if let Some(t) = ray_aabb_d(ro_loc_d, rd_loc_d, min, max) {
-                if best.is_none_or(|(_, bt)| t < bt) {
-                    best = Some((entity, t));
-                }
-            }
-        }
-
-        best
-    }
-}
-
-/// Ray-AABB intersection in double precision.
-#[inline]
-fn ray_aabb_d(
-    ro: glam::DVec3,
-    rd: glam::DVec3,
-    min: glam::DVec3,
-    max: glam::DVec3,
-) -> Option<f64> {
-    let mut tmin = f64::NEG_INFINITY;
-    let mut tmax = f64::INFINITY;
-
-    for i in 0..3 {
-        let (origin, dir, bmin, bmax) = match i {
-            0 => (ro.x, rd.x, min.x, max.x),
-            1 => (ro.y, rd.y, min.y, max.y),
-            _ => (ro.z, rd.z, min.z, max.z),
-        };
-
-        if dir.abs() < 1e-12 {
-            if origin < bmin || origin > bmax {
-                return None;
-            }
-        } else {
-            let inv_d = 1.0 / dir;
-            let mut t1 = (bmin - origin) * inv_d;
-            let mut t2 = (bmax - origin) * inv_d;
-            if t1 > t2 {
-                core::mem::swap(&mut t1, &mut t2);
-            }
-            tmin = tmin.max(t1);
-            tmax = tmax.min(t2);
-            if tmin > tmax {
-                return None;
-            }
-        }
-    }
-
-    if tmax < 0.0 {
-        return None;
-    }
-
-    Some(if tmin >= 0.0 { tmin } else { tmax })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use glam::{Quat, Vec3};
+    use crate::glyph_scene::GroupRow;
 
     #[test]
     fn test_ecs_hierarchy_propagation() {
@@ -668,5 +283,347 @@ mod tests {
         assert_eq!(synced, vec![3]);
         assert_eq!(groups[3].cols[0], [55.0, 18.0, -1.0, 0.0]);
         assert_eq!(groups[3].cols[2], [0.8, 0.2, 0.4, 1.0]);
+    }
+
+    #[test]
+    fn test_spatial_alignment_row_x() {
+        let mut scene = SpatialScene::new();
+        let container = scene.spawn_root("row_container");
+        scene.world.entity_mut(container).insert(SpatialAlignment::row(10.0));
+
+        let c1 = scene.spawn_child(container, Transform::IDENTITY, "item1");
+        scene.world.entity_mut(c1).insert(LocalBounds {
+            min: [0.0, 0.0, 0.0],
+            max: [20.0, 30.0, 5.0],
+        });
+
+        let c2 = scene.spawn_child(container, Transform::IDENTITY, "item2");
+        scene.world.entity_mut(c2).insert(LocalBounds {
+            min: [0.0, 0.0, 0.0],
+            max: [40.0, 25.0, 5.0],
+        });
+
+        scene.update_transforms();
+
+        let t1 = scene.world.get::<Transform>(c1).unwrap();
+        let t2 = scene.world.get::<Transform>(c2).unwrap();
+
+        assert_eq!(t1.translation, Vec3::new(0.0, 0.0, 0.0));
+        assert_eq!(t2.translation, Vec3::new(30.0, 0.0, 0.0)); // 20.0 + 10.0 spacing
+
+        let container_bounds = scene.world.get::<LocalBounds>(container).unwrap();
+        assert_eq!(container_bounds.min, [0.0, 0.0, 0.0]);
+        assert_eq!(container_bounds.max, [70.0, 30.0, 5.0]);
+    }
+
+    #[test]
+    fn test_spatial_alignment_column_y_upwards() {
+        let mut scene = SpatialScene::new();
+        let container = scene.spawn_root("column_container");
+        scene.world.entity_mut(container).insert(SpatialAlignment::column(5.0, false));
+
+        let c1 = scene.spawn_child(container, Transform::IDENTITY, "item1");
+        scene.world.entity_mut(c1).insert(LocalBounds {
+            min: [0.0, 0.0, 0.0],
+            max: [50.0, 20.0, 0.0],
+        });
+
+        let c2 = scene.spawn_child(container, Transform::IDENTITY, "item2");
+        scene.world.entity_mut(c2).insert(LocalBounds {
+            min: [0.0, 0.0, 0.0],
+            max: [40.0, 15.0, 0.0],
+        });
+
+        scene.update_transforms();
+
+        let t1 = scene.world.get::<Transform>(c1).unwrap();
+        let t2 = scene.world.get::<Transform>(c2).unwrap();
+
+        assert_eq!(t1.translation, Vec3::new(0.0, 0.0, 0.0));
+        assert_eq!(t2.translation, Vec3::new(0.0, 25.0, 0.0)); // 20.0 + 5.0 spacing
+    }
+
+    #[test]
+    fn test_spatial_alignment_column_y_downwards() {
+        let mut scene = SpatialScene::new();
+        let container = scene.spawn_root("doc_column");
+        scene.world.entity_mut(container).insert(SpatialAlignment::column(5.0, true));
+
+        let c1 = scene.spawn_child(container, Transform::IDENTITY, "line1");
+        scene.world.entity_mut(c1).insert(LocalBounds {
+            min: [0.0, 0.0, 0.0],
+            max: [100.0, 10.0, 0.0],
+        });
+
+        let c2 = scene.spawn_child(container, Transform::IDENTITY, "line2");
+        scene.world.entity_mut(c2).insert(LocalBounds {
+            min: [0.0, 0.0, 0.0],
+            max: [80.0, 10.0, 0.0],
+        });
+
+        scene.update_transforms();
+
+        let t1 = scene.world.get::<Transform>(c1).unwrap();
+        let t2 = scene.world.get::<Transform>(c2).unwrap();
+
+        assert_eq!(t1.translation, Vec3::new(0.0, -10.0, 0.0));
+        assert_eq!(t2.translation, Vec3::new(0.0, -25.0, 0.0)); // -10 - 5 - 10
+    }
+
+    #[test]
+    fn test_spatial_alignment_depth_z_cascade() {
+        let mut scene = SpatialScene::new();
+        let container = scene.spawn_root("deck_container");
+        scene.world.entity_mut(container).insert(SpatialAlignment::depth(15.0, 2.0, 3.0));
+
+        let c0 = scene.spawn_child(container, Transform::IDENTITY, "card0");
+        scene.world.entity_mut(c0).insert(LocalBounds {
+            min: [0.0, 0.0, 0.0],
+            max: [100.0, 50.0, 1.0],
+        });
+
+        let c1 = scene.spawn_child(container, Transform::IDENTITY, "card1");
+        scene.world.entity_mut(c1).insert(LocalBounds {
+            min: [0.0, 0.0, 0.0],
+            max: [100.0, 50.0, 1.0],
+        });
+
+        let c2 = scene.spawn_child(container, Transform::IDENTITY, "card2");
+        scene.world.entity_mut(c2).insert(LocalBounds {
+            min: [0.0, 0.0, 0.0],
+            max: [100.0, 50.0, 1.0],
+        });
+
+        scene.update_transforms();
+
+        let t0 = scene.world.get::<Transform>(c0).unwrap();
+        let t1 = scene.world.get::<Transform>(c1).unwrap();
+        let t2 = scene.world.get::<Transform>(c2).unwrap();
+
+        assert_eq!(t0.translation, Vec3::new(0.0, 0.0, 0.0));
+        assert_eq!(t1.translation, Vec3::new(2.0, 3.0, -15.0));
+        assert_eq!(t2.translation, Vec3::new(4.0, 6.0, -30.0));
+    }
+
+    #[test]
+    fn test_spatial_alignment_splay_grid_wrapping() {
+        let mut scene = SpatialScene::new();
+        let container = scene.spawn_root("splay_grid");
+        // 2 items per row, 10px item spacing, 20px row spacing
+        scene.world.entity_mut(container).insert(SpatialAlignment::splay(10.0, 20.0, 2));
+
+        let items: Vec<Entity> = (0..4)
+            .map(|i| {
+                let e = scene.spawn_child(container, Transform::IDENTITY, format!("grid_item_{i}"));
+                scene.world.entity_mut(e).insert(LocalBounds {
+                    min: [0.0, 0.0, 0.0],
+                    max: [50.0, 30.0, 0.0],
+                });
+                e
+            })
+            .collect();
+
+        scene.update_transforms();
+
+        let t0 = scene.world.get::<Transform>(items[0]).unwrap();
+        let t1 = scene.world.get::<Transform>(items[1]).unwrap();
+        let t2 = scene.world.get::<Transform>(items[2]).unwrap();
+        let t3 = scene.world.get::<Transform>(items[3]).unwrap();
+
+        // Row 0 (top track at y=0)
+        assert_eq!(t0.translation, Vec3::new(0.0, 0.0, 0.0));
+        assert_eq!(t1.translation, Vec3::new(60.0, 0.0, 0.0)); // 50 + 10
+
+        // Row 1 (wrapped: track_y = 0 - 30 - 20 = -50)
+        assert_eq!(t2.translation, Vec3::new(0.0, -50.0, 0.0));
+        assert_eq!(t3.translation, Vec3::new(60.0, -50.0, 0.0));
+    }
+
+    #[test]
+    fn test_deck_rolodex_cascade_and_paging() {
+        let mut scene = SpatialScene::new();
+        let root = scene.spawn_root("carrel_root");
+        let deck_entity = scene.spawn_deck(
+            root,
+            "agent_deck",
+            Deck::new()
+                .with_z_pitch(20.0)
+                .with_crest_offset(3.0, 5.0),
+        );
+
+        let c0 = scene.spawn_child(deck_entity, Transform::IDENTITY, "card0");
+        scene.world.entity_mut(c0).insert(DeckItem { index: 0 });
+        let c1 = scene.spawn_child(deck_entity, Transform::IDENTITY, "card1");
+        scene.world.entity_mut(c1).insert(DeckItem { index: 1 });
+        let c2 = scene.spawn_child(deck_entity, Transform::IDENTITY, "card2");
+        scene.world.entity_mut(c2).insert(DeckItem { index: 2 });
+
+        scene.update_transforms();
+
+        // Initial state: Card 0 is active (at 0,0,0)
+        let t0 = scene.world.get::<Transform>(c0).unwrap();
+        let t1 = scene.world.get::<Transform>(c1).unwrap();
+        let t2 = scene.world.get::<Transform>(c2).unwrap();
+
+        assert_eq!(t0.translation, Vec3::ZERO);
+        assert_eq!(t1.translation, Vec3::new(3.0, 5.0, -20.0));
+        assert_eq!(t2.translation, Vec3::new(6.0, 10.0, -40.0));
+
+        // Advance to page 1
+        assert!(scene.deck_next_page(deck_entity));
+        scene.update_transforms();
+
+        let t0 = scene.world.get::<Transform>(c0).unwrap();
+        let t1 = scene.world.get::<Transform>(c1).unwrap();
+        let t2 = scene.world.get::<Transform>(c2).unwrap();
+
+        // Card 1 is now active at 0,0,0
+        assert_eq!(t1.translation, Vec3::ZERO);
+        // Card 2 is cascading into -Z
+        assert_eq!(t2.translation, Vec3::new(3.0, 5.0, -20.0));
+        // Card 0 wraps around to the back of the Rolodex cascade
+        assert_eq!(t0.translation, Vec3::new(6.0, 10.0, -40.0));
+
+        // Retreat to page 0
+        assert!(scene.deck_prev_page(deck_entity));
+        scene.update_transforms();
+
+        let t0 = scene.world.get::<Transform>(c0).unwrap();
+        assert_eq!(t0.translation, Vec3::ZERO);
+    }
+
+    #[test]
+    fn test_deck_splay_mode_unfurl() {
+        let mut scene = SpatialScene::new();
+        let root = scene.spawn_root("carrel_root");
+        let deck_entity = scene.spawn_deck(
+            root,
+            "agent_deck",
+            Deck::new()
+                .with_mode(DeckMode::Splay)
+                .with_splay_columns(2),
+        );
+
+        let items: Vec<Entity> = (0..4)
+            .map(|i| {
+                let e = scene.spawn_child(deck_entity, Transform::IDENTITY, format!("page_{i}"));
+                scene.world.entity_mut(e).insert((
+                    DeckItem { index: i },
+                    LocalBounds {
+                        min: [0.0, -40.0, 0.0],
+                        max: [50.0, 0.0, 0.0],
+                    },
+                ));
+                e
+            })
+            .collect();
+
+        scene.update_transforms();
+
+        let t0 = scene.world.get::<Transform>(items[0]).unwrap();
+        let t1 = scene.world.get::<Transform>(items[1]).unwrap();
+        let t2 = scene.world.get::<Transform>(items[2]).unwrap();
+
+        // Item 0 is active (lifted along +Z)
+        assert_eq!(t0.translation.z, 8.0); // default splay_lift
+        assert_eq!(t1.translation.z, 0.0);
+
+        // Item 0 and 1 are in same row across X
+        assert_eq!(t0.translation.y, t1.translation.y);
+        assert!(t1.translation.x > t0.translation.x);
+
+        // Item 2 is in next row down
+        assert!(t2.translation.y < t0.translation.y);
+    }
+
+    #[test]
+    fn test_agent_turn_card_spawning_and_bounds() {
+        let mut scene = SpatialScene::new();
+        let root = scene.spawn_root("root");
+        let card = scene.spawn_agent_turn_card(
+            root,
+            0,
+            [60.0, 40.0],
+            4.0,
+            "Turn 0: Inspecting repo",
+        );
+
+        scene.update_transforms();
+
+        let turn_comp = scene.world.get::<AgentTurnCard>(card).unwrap();
+        assert_eq!(turn_comp.turn_index, 0);
+        assert_eq!(turn_comp.page_size, [60.0, 40.0]);
+        assert_eq!(turn_comp.spine_gap, 4.0);
+
+        // Check overall bounds enclosing both pages and spine gap:
+        // Width: 2 * 60 + 4 = 124. Min X: -62, Max X: 62. Min Y: -40, Max Y: 0.
+        let bounds = scene.world.get::<LocalBounds>(card).unwrap();
+        assert_eq!(bounds.min, [-62.0, -40.0, 0.0]);
+        assert_eq!(bounds.max, [62.0, 0.0, 0.0]);
+
+        // Check Left Page (Mind)
+        let left_tf = scene.world.get::<Transform>(turn_comp.left_page).unwrap();
+        assert_eq!(left_tf.translation.x, -32.0); // -(30 + 2)
+        let left_kind = scene.world.get::<TurnPageKind>(turn_comp.left_page).unwrap();
+        assert_eq!(*left_kind, TurnPageKind::Mind);
+
+        // Check Right Page (Impact)
+        let right_tf = scene.world.get::<Transform>(turn_comp.right_page).unwrap();
+        assert_eq!(right_tf.translation.x, 32.0); // +(30 + 2)
+        let right_kind = scene.world.get::<TurnPageKind>(turn_comp.right_page).unwrap();
+        assert_eq!(*right_kind, TurnPageKind::Impact);
+    }
+
+    #[test]
+    fn test_workdesk_file_revisions_z_stack() {
+        let mut scene = SpatialScene::new();
+        let root = scene.spawn_root("desk_root");
+        let desk = scene.spawn_workdesk(
+            root,
+            "agent_workdesk",
+            [30.0, 30.0],
+            12.0,
+        );
+
+        // Push 3 revisions to file A
+        let r0 = scene.workdesk_push_revision(
+            desk,
+            "src/main.rs",
+            FileActionKind::Read,
+            [50.0, 30.0],
+            "Initial inspection",
+        );
+        let r1 = scene.workdesk_push_revision(
+            desk,
+            "src/main.rs",
+            FileActionKind::Edit,
+            [50.0, 30.0],
+            "Modify CLI arguments",
+        );
+        let r2 = scene.workdesk_push_revision(
+            desk,
+            "src/main.rs",
+            FileActionKind::Write,
+            [50.0, 30.0],
+            "Save updated main.rs",
+        );
+
+        scene.update_transforms();
+
+        // Revisions r0, r1, r2 must cascade along -Z inside the file stack
+        let t0 = scene.world.get::<Transform>(r0).unwrap();
+        let t1 = scene.world.get::<Transform>(r1).unwrap();
+        let t2 = scene.world.get::<Transform>(r2).unwrap();
+
+        assert_eq!(t0.translation.z, 0.0);
+        assert_eq!(t1.translation.z, -12.0);
+        assert_eq!(t2.translation.z, -24.0);
+
+        // Stack count and active revision should be 3 and 2
+        let desk_comp = scene.world.get::<Workdesk>(desk).unwrap();
+        let stack_e = *desk_comp.file_stacks.get("src/main.rs").unwrap();
+        let stack_comp = scene.world.get::<FileRevisionStack>(stack_e).unwrap();
+        assert_eq!(stack_comp.revision_count, 3);
+        assert_eq!(stack_comp.active_revision, 2);
     }
 }

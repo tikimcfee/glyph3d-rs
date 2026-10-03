@@ -1,0 +1,46 @@
+[advisories]
+vulnerability = "deny"
+unmaintained = "warn"
+notice = "warn"
+ignore = []
+
+[licenses]
+unlicensed = "deny"
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "BSD-3-Clause",
+    "BSD-2-Clause",
+    "ISC",
+    "Zlib",
+    "MPL-2.0"
+]
+copyleft = "deny"
+allow-osi-fsf-free = "neither"
+confidence-threshold = 0.8
+exceptions = []
+
+[bans]
+multiple-versions = "warn"
+wildcards = "allow"
+highlight = "all"
+
+# The native wgpu renderer relies on having exactly one version of these core crates in the tree.
+# Having multiple versions causes compile-time and runtime UB.
+[[bans.deny]]
+crate = "wgpu"
+version = "<30.0"
+
+[[bans.deny]]
+crate = "naga"
+version = "<30.0"
+
+[[bans.deny]]
+crate = "winit"
+version = "<0.30"
+
+[sources]
+unknown-registry = "warn"
+unknown-git = "warn"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
