@@ -331,6 +331,7 @@ impl HyperLayout {
         let bitmap_adv = fu_to_world(trie.bitmap_advance_fu, em_height_fu);
 
         // --- PASS 1 (Parallel): Prepass per item to find counts and max_row_extent ---
+        let sp_pass1 = tracing::info_span!("hyper.pass1").entered();
         let prepasses: Vec<ItemPrepass> = items
             .par_iter()
             .map(|item| {
@@ -345,62 +346,119 @@ impl HyperLayout {
                 };
 
                 let mut survivor_count = 0u32;
-                let mut col = 0i64;
-                let mut line_adv = 0.0f64;
-                let mut seg_adv = 0.0f32;
                 let mut max_row_extent = 0.0f64;
                 let mut trailer_until = 0usize;
 
+                let ascii_adv = fu_to_world(1229, em_height_fu);
                 let mut pos = 0usize;
                 if fold_unit == 0 {
+                    let mut line_adv = 0.0f64;
                     while pos < bytes.len() {
-                        let r = match resolve_byte_char(bytes, pos, &trie, bitmap_adv, em_height_fu, &mut trailer_until) {
-                            Some(r) => r,
-                            None => {
-                                pos += 1;
-                                continue;
-                            }
+                        let nl_pos = match memchr::memchr(b'\n', &bytes[pos..]) {
+                            Some(offset) => pos + offset,
+                            None => bytes.len(),
                         };
-
-                        if line_adv > max_row_extent {
-                            max_row_extent = line_adv;
-                        }
-
-                        if r.glyph_id != 0 {
-                            survivor_count += 1;
-                        }
-
-                        if r.is_newline {
+                        let line = &bytes[pos..nl_pos];
+                        if line.iter().all(|b| (0x20..0x7F).contains(b)) {
+                            let l = line.len();
+                            survivor_count += l as u32;
+                            let end_adv = line_adv + l as f64 * ascii_adv as f64;
+                            if end_adv > max_row_extent {
+                                max_row_extent = end_adv;
+                            }
                             line_adv = 0.0;
-                        } else {
+                            pos = if nl_pos < bytes.len() { nl_pos + 1 } else { nl_pos };
+                            continue;
+                        }
+
+                        for i in pos..nl_pos {
+                            let r = match resolve_byte_char(bytes, i, &trie, bitmap_adv, em_height_fu, &mut trailer_until) {
+                                Some(r) => r,
+                                None => continue,
+                            };
+
+                            if line_adv > max_row_extent {
+                                max_row_extent = line_adv;
+                            }
+
+                            if r.glyph_id != 0 {
+                                survivor_count += 1;
+                            }
+
                             line_adv += r.advance as f64;
                         }
 
-                        pos += 1;
+                        if nl_pos < bytes.len() {
+                            if line_adv > max_row_extent {
+                                max_row_extent = line_adv;
+                            }
+                            line_adv = 0.0;
+                            pos = nl_pos + 1;
+                        } else {
+                            pos = nl_pos;
+                        }
                     }
                 } else {
+                    let mut col = 0i64;
+                    let mut seg_adv = 0.0f32;
+                    let fu = fold_unit as usize;
+                    let mut seg_adv_stack = [0.0f32; 256];
+                    let mut seg_adv_heap = Vec::new();
+                    let seg_adv_table: &[f32] = if fu < 256 {
+                        let mut cur = 0.0f32;
+                        for slot in seg_adv_stack.iter_mut().take(fu + 1) {
+                            *slot = cur;
+                            cur += ascii_adv;
+                        }
+                        &seg_adv_stack[..=fu]
+                    } else {
+                        seg_adv_heap.reserve(fu + 1);
+                        let mut cur = 0.0f32;
+                        for _ in 0..=fu {
+                            seg_adv_heap.push(cur);
+                            cur += ascii_adv;
+                        }
+                        &seg_adv_heap
+                    };
+
                     while pos < bytes.len() {
-                        let r = match resolve_byte_char(bytes, pos, &trie, bitmap_adv, em_height_fu, &mut trailer_until) {
-                            Some(r) => r,
-                            None => {
-                                pos += 1;
-                                continue;
-                            }
+                        let nl_pos = match memchr::memchr(b'\n', &bytes[pos..]) {
+                            Some(offset) => pos + offset,
+                            None => bytes.len(),
                         };
-
-                        let item_rel_x = seg_adv as f64;
-                        if item_rel_x > max_row_extent {
-                            max_row_extent = item_rel_x;
-                        }
-
-                        if r.glyph_id != 0 {
-                            survivor_count += 1;
-                        }
-
-                        if r.is_newline {
+                        let line = &bytes[pos..nl_pos];
+                        if line.iter().all(|b| (0x20..0x7F).contains(b)) {
+                            let l = line.len();
+                            survivor_count += l as u32;
+                            let line_max_seg = if l >= fu {
+                                seg_adv_table[fu - 1]
+                            } else {
+                                seg_adv_table[l]
+                            };
+                            if line_max_seg as f64 > max_row_extent {
+                                max_row_extent = line_max_seg as f64;
+                            }
                             col = 0;
                             seg_adv = 0.0;
-                        } else {
+                            pos = if nl_pos < bytes.len() { nl_pos + 1 } else { nl_pos };
+                            continue;
+                        }
+
+                        for i in pos..nl_pos {
+                            let r = match resolve_byte_char(bytes, i, &trie, bitmap_adv, em_height_fu, &mut trailer_until) {
+                                Some(r) => r,
+                                None => continue,
+                            };
+
+                            let item_rel_x = seg_adv as f64;
+                            if item_rel_x > max_row_extent {
+                                max_row_extent = item_rel_x;
+                            }
+
+                            if r.glyph_id != 0 {
+                                survivor_count += 1;
+                            }
+
                             col += 1;
                             if col % fold_unit == 0 {
                                 seg_adv = 0.0;
@@ -409,7 +467,17 @@ impl HyperLayout {
                             }
                         }
 
-                        pos += 1;
+                        if nl_pos < bytes.len() {
+                            let item_rel_x = seg_adv as f64;
+                            if item_rel_x > max_row_extent {
+                                max_row_extent = item_rel_x;
+                            }
+                            col = 0;
+                            seg_adv = 0.0;
+                            pos = nl_pos + 1;
+                        } else {
+                            pos = nl_pos;
+                        }
                     }
                 }
 
@@ -419,6 +487,7 @@ impl HyperLayout {
                 }
             })
             .collect();
+        drop(sp_pass1);
 
         // --- Prefix Sum of survivor offsets ---
         let mut slot_bases = Vec::with_capacity(item_count);
@@ -440,6 +509,7 @@ impl HyperLayout {
         if can_map_device {
             let dev = self.device.as_ref().unwrap();
             let (mapped_ptr, wgpu_buf) = create_mapped_render_slots(&dev.device, total_survivors);
+            let sp_pass2 = tracing::info_span!("hyper.pass2").entered();
             let pass2_out = Self::layout_pass2_device(
                 items,
                 &prepasses,
@@ -449,6 +519,7 @@ impl HyperLayout {
                 em_height_fu,
                 SendPtr(mapped_ptr),
             );
+            drop(sp_pass2);
             let device_slots = DeviceSlots {
                 chunks: vec![DeviceSlotChunk {
                     buffer: wgpu_buf,
@@ -574,6 +645,13 @@ impl HyperLayout {
                     Vec::new()
                 };
 
+                let mut last_row = i64::MIN;
+                let mut last_wrap_seg = i64::MIN;
+                let mut last_x_page = i64::MIN;
+                let mut cached_page_x_off = 0.0f64;
+                let mut cached_py = 0.0f32;
+                let mut cached_pz = 0.0f32;
+
                 let mut pos = 0usize;
                 let mut span_idx = 0usize;
                 while pos < bytes.len() {
@@ -592,49 +670,57 @@ impl HyperLayout {
                         base_row + wrap_row_of(col, wrap_w, r.is_newline, p.wrap_mode)
                     };
 
+                    let x_page = if page_active && page_cols > 0 { col / page_cols } else { 0 };
+
+                    if row != last_row || wrap_segment != last_wrap_seg || x_page != last_x_page {
+                        last_row = row;
+                        last_wrap_seg = wrap_segment;
+                        last_x_page = x_page;
+
+                        if page_active {
+                            let (y_page, screen_row) = if page_rows > 0 {
+                                (row / page_rows, row + scroll_rows)
+                            } else {
+                                (0, row)
+                            };
+                            let band = y_page / pages_wide;
+                            cached_page_x_off = (y_page % pages_wide) as f64 * page_stride_x;
+                            cached_py = (origin_y
+                                - (screen_row - y_page * page_rows) as f64 * line_height
+                                - band as f64 * band_stride_y) as f32;
+                            cached_pz = (origin_z - wrap_segment as f64 * z_step
+                                + band as f64 * depth_per_band
+                                + x_page as f64 * depth_per_col) as f32;
+                        } else {
+                            cached_page_x_off = 0.0;
+                            cached_py = (-(row as f64) * line_height + origin_y) as f32;
+                            cached_pz = (-(wrap_segment as f64) * z_step + origin_z) as f32;
+                        }
+
+                        if cached_py < page_bottom {
+                            page_bottom = cached_py;
+                        }
+                        if cached_pz < page_z_min {
+                            page_z_min = cached_pz;
+                        }
+                        if cached_pz > page_z_max {
+                            page_z_max = cached_pz;
+                        }
+                    }
+
                     let item_rel_x = if fold_unit > 0 { seg_adv as f64 } else { line_adv };
                     let base_x = (item_rel_x + origin_x) as f32;
-                    let base_y = (-(row as f64) * line_height + origin_y) as f32;
-                    let base_z = (-(wrap_segment as f64) * z_step + origin_z) as f32;
-
-                    let (pos_x, pos_y, pos_z) = if page_active {
-                        let (y_page, x_page, screen_row) = if page_rows > 0 {
-                            let y_page = row / page_rows;
-                            let screen_row = row + scroll_rows;
-                            let x_page = if page_cols > 0 {
-                                col / page_cols
-                            } else {
-                                0
-                            };
-                            (y_page, x_page, screen_row)
-                        } else {
-                            (0, 0, row)
-                        };
-                        let band = y_page / pages_wide;
-                        let px = (base_x as f64 + (y_page % pages_wide) as f64 * page_stride_x) as f32;
-                        let py = (origin_y
-                            - (screen_row - y_page * page_rows) as f64 * line_height
-                            - band as f64 * band_stride_y) as f32;
-                        let pz = (origin_z - wrap_segment as f64 * z_step
-                            + band as f64 * depth_per_band
-                            + x_page as f64 * depth_per_col) as f32;
-                        (px, py, pz)
+                    let pos_x = if page_active {
+                        (base_x as f64 + cached_page_x_off) as f32
                     } else {
-                        (base_x, base_y, base_z)
+                        base_x
                     };
+                    let pos_y = cached_py;
+                    let pos_z = cached_pz;
 
                     let right = pos_x + r.advance;
                     if right > page_right {
                         page_right = right;
-                    }
-                    if pos_y < page_bottom {
-                        page_bottom = pos_y;
-                    }
-                    if pos_z < page_z_min {
-                        page_z_min = pos_z;
-                    }
-                    if pos_z > page_z_max {
-                        page_z_max = pos_z;
                     }
 
                     let color = if let Some(c) = flat_color {
@@ -724,16 +810,8 @@ impl HyperLayout {
                             if cur_blk_count == 512 {
                                 if cur_blk_min_x <= cur_blk_max_x && cur_blk_min_y <= cur_blk_max_y {
                                     local_blocks.push(crate::glyph_scene::BlockCull {
-                                        min: [
-                                            cur_blk_min_x - 0.5,
-                                            cur_blk_min_y - 0.5,
-                                            cur_blk_min_z - 0.2,
-                                        ],
-                                        max: [
-                                            cur_blk_max_x + 0.8,
-                                            cur_blk_max_y + 0.8,
-                                            cur_blk_max_z + 0.2,
-                                        ],
+                                        min: [cur_blk_min_x, cur_blk_min_y, cur_blk_min_z],
+                                        max: [cur_blk_max_x, cur_blk_max_y, cur_blk_max_z],
                                         slot_base: (survivor_out - 512) as u32,
                                         slot_count: 512,
                                     });
@@ -775,16 +853,8 @@ impl HyperLayout {
                     && cur_blk_min_y <= cur_blk_max_y
                 {
                     local_blocks.push(crate::glyph_scene::BlockCull {
-                        min: [
-                            cur_blk_min_x - 0.5,
-                            cur_blk_min_y - 0.5,
-                            cur_blk_min_z - 0.2,
-                        ],
-                        max: [
-                            cur_blk_max_x + 0.8,
-                            cur_blk_max_y + 0.8,
-                            cur_blk_max_z + 0.2,
-                        ],
+                        min: [cur_blk_min_x, cur_blk_min_y, cur_blk_min_z],
+                        max: [cur_blk_max_x, cur_blk_max_y, cur_blk_max_z],
                         slot_base: (survivor_out - cur_blk_count) as u32,
                         slot_count: cur_blk_count as u32,
                     });

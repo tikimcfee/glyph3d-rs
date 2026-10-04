@@ -1373,14 +1373,14 @@ impl RepoLoad {
                 fbs.iter()
                     .map(|lb| crate::glyph_scene::BlockCull {
                         min: [
-                            v.offset[0] + lb.min[0],
-                            v.offset[1] + lb.min[1],
-                            v.offset[2] + lb.min[2],
+                            v.offset[0] + lb.min[0] - 0.5,
+                            v.offset[1] + lb.min[1] - 0.5,
+                            v.offset[2] + lb.min[2] - 0.2,
                         ],
                         max: [
-                            v.offset[0] + lb.max[0],
-                            v.offset[1] + lb.max[1],
-                            v.offset[2] + lb.max[2],
+                            v.offset[0] + lb.max[0] + 0.8,
+                            v.offset[1] + lb.max[1] + 0.8,
+                            v.offset[2] + lb.max[2] + 0.2,
                         ],
                         slot_base: (v.slot_base as u32) + lb.slot_base,
                         slot_count: lb.slot_count,
