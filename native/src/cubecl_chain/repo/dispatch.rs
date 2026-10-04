@@ -550,6 +550,7 @@ pub(crate) fn launch_block2_geometry(
             BufferArg::from_raw_parts(buf.h_plan.as_ref().unwrap().clone(), inputs.walk_plan.len()),
             BufferArg::from_raw_parts(buf.h_extent.as_ref().unwrap().clone(), item_count * 2),
             inputs.min_sw,
+            inputs.uniform_sw,
         );
         prof.end(client, "extent_pair");
 

@@ -274,11 +274,15 @@ pub(super) fn extent_pair(
     walk_plan: &[u32],
     extent_words: &mut [Atomic<u32>],
     min_sw: u32,
+    uniform_sw: u32,
 ) {
     let b = ABSOLUTE_POS;
     if b < lc.len() / LC_STRIDE && (flags_at(fl, b) & F_LEADER) != 0 {
         let col = lc[b * LC_STRIDE + LC_COL] as usize;
-        if col == 0 || col >= (min_sw as usize) {
+        let candidate = col == 0
+            || (col >= (min_sw as usize)
+                && (uniform_sw == 0 || col.is_multiple_of(uniform_sw as usize)));
+        if candidate {
             let item_count = walk_plan.len() / 3;
             // The owning item: the last plan entry whose start is at or before
             // this byte (equal starts belong to empty items; taking the LAST

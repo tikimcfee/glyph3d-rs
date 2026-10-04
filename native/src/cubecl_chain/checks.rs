@@ -284,6 +284,7 @@ pub fn run(ctx: &GpuContext, fixture_path: &Path) -> ! {
                 BufferArg::from_raw_parts(h_plan.clone(), item_count * 3),
                 BufferArg::from_raw_parts(h_extent.clone(), item_count * 2),
                 min_sw,
+                0,
             );
             derive_stride::launch_unchecked(
                 &client,

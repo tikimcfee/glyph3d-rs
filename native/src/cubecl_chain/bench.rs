@@ -602,6 +602,7 @@ pub fn bench(ctx: &GpuContext, corpus_path: &Path) -> ! {
                         BufferArg::from_raw_parts(h_plan.clone(), 3),
                         BufferArg::from_raw_parts(h_extent.clone(), 2),
                         if wrap_width > 0 { wrap_width as u32 } else { u32::MAX },
+                        if wrap_width > 0 { wrap_width as u32 } else { 0 },
                     );
                     derive_stride::launch_unchecked(
                         &client,

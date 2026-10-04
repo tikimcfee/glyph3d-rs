@@ -235,6 +235,15 @@ pub(crate) fn run_repo_chain(
     );
     drop(cluster_allocs);
 
+    launch_block2_geometry(
+        &client,
+        n,
+        item_count,
+        &host_inputs,
+        &buf,
+        &mut prof,
+    );
+
     let t_rb = std::time::Instant::now();
     drop(sp_dispatch);
     let span_tail = tracing::info_span!(
@@ -294,27 +303,10 @@ pub(crate) fn run_repo_chain(
     span_tail.record("total_records", total_records);
     span_tail.record("total_slots", total_slots);
 
-    launch_block2_geometry(
-        &client,
-        n,
-        item_count,
-        &host_inputs,
-        &buf,
-        &mut prof,
-    );
-
     // The Ladder: drop all intermediate lanes whose last reader ran during geometry
     {
         let _sp_ladder = tracing::info_span!("tail.ladder").entered();
         buf.release_pre_survivor();
-        client.memory_cleanup();
-        let usage = client.memory_usage();
-        tracing::info!(
-            live_bytes,
-            bytes_in_use = usage.bytes_in_use,
-            number_allocs = usage.number_allocs,
-            "tail.ladder: post-cleanup pool state"
-        );
     }
 
     let h_base = client.create_from_slice(bytemuck::cast_slice(&rec_base));
