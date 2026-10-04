@@ -178,15 +178,20 @@ pub(crate) fn run_repo_chain(
             &owned_dev
         }
     };
-    let setup = WgpuSetup {
-        instance: device_ref.instance.clone(),
-        adapter: device_ref.adapter.clone(),
-        device: device_ref.device.clone(),
-        queue: device_ref.queue.clone(),
-        backend: AutoGraphicsApi::backend(),
+    let client = match device_ref.cubecl_device {
+        Some(ref cd) => cubecl::Device::Wgpu(cd.clone()).client(),
+        None => {
+            let setup = WgpuSetup {
+                instance: device_ref.instance.clone(),
+                adapter: device_ref.adapter.clone(),
+                device: device_ref.device.clone(),
+                queue: device_ref.queue.clone(),
+                backend: AutoGraphicsApi::backend(),
+            };
+            let cdev = cubecl::wgpu::init_device(setup, Default::default());
+            cubecl::Device::Wgpu(cdev).client()
+        }
     };
-    let cdev = cubecl::wgpu::init_device(setup, Default::default());
-    let client = cubecl::Device::Wgpu(cdev).client();
 
     let t_upload = std::time::Instant::now();
     drop(sp_init);

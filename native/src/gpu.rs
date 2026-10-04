@@ -390,11 +390,25 @@ pub struct SharedDevice {
     pub max_buffer_size: u64,
     pub host_visible_storage: bool,
     pub memory_arch: MemoryArchitecture,
+    #[cfg(feature = "cubecl")]
+    pub cubecl_device: Option<cubecl::wgpu::WgpuDevice>,
 }
 
 impl SharedDevice {
     pub fn from_ctx(ctx: &GpuContext) -> Self {
         let memory_arch = ctx.profile.memory_architecture();
+        #[cfg(feature = "cubecl")]
+        let cubecl_device = {
+            use cubecl::wgpu::GraphicsApi;
+            let setup = cubecl::wgpu::WgpuSetup {
+                instance: ctx.instance.clone(),
+                adapter: ctx.adapter.clone(),
+                device: ctx.device.clone(),
+                queue: ctx.queue.clone(),
+                backend: cubecl::wgpu::AutoGraphicsApi::backend(),
+            };
+            Some(cubecl::wgpu::init_device(setup, Default::default()))
+        };
         Self {
             instance: ctx.instance.clone(),
             adapter: ctx.adapter.clone(),
@@ -404,6 +418,8 @@ impl SharedDevice {
             host_visible_storage: memory_arch == MemoryArchitecture::Unified
                 && ctx.profile.mappable_primary_buffers,
             memory_arch,
+            #[cfg(feature = "cubecl")]
+            cubecl_device,
         }
     }
 
