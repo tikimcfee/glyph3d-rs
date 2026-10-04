@@ -1328,6 +1328,7 @@ impl RepoLoad {
         };
         let is_flat = self.color_mode == ColorMode::Flat;
         let file_tints = self.arena.device_slots().map(|d| &d.file_tints);
+        let file_blocks = self.arena.device_slots().map(|d| &d.file_blocks);
         let seg_of = |v: &FileView| {
             let tint = if is_flat {
                 let area = (v.width as f64 * v.height as f64).max(1e-3);
@@ -1367,7 +1368,27 @@ impl RepoLoad {
                     }
                 }
             };
-            let blocks = build_file_blocks(v, mapped_slots, &chunks);
+            let fast_blocks = file_blocks.and_then(|fb| fb.get(v.group_id as usize));
+            let blocks = if let Some(fbs) = fast_blocks {
+                fbs.iter()
+                    .map(|lb| crate::glyph_scene::BlockCull {
+                        min: [
+                            v.offset[0] + lb.min[0],
+                            v.offset[1] + lb.min[1],
+                            v.offset[2] + lb.min[2],
+                        ],
+                        max: [
+                            v.offset[0] + lb.max[0],
+                            v.offset[1] + lb.max[1],
+                            v.offset[2] + lb.max[2],
+                        ],
+                        slot_base: (v.slot_base as u32) + lb.slot_base,
+                        slot_count: lb.slot_count,
+                    })
+                    .collect()
+            } else {
+                build_file_blocks(v, mapped_slots, &chunks)
+            };
             crate::glyph_scene::SegCull {
                 min: [
                     v.offset[0] - 0.3,
