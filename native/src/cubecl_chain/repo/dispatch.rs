@@ -539,11 +539,12 @@ pub(crate) fn launch_block2_geometry(
         );
         prof.end(client, "apply");
 
+        let rake_ep = 32usize;
         prof.begin(client, "extent_pair");
         extent_pair::launch_unchecked(
             client,
-            cubes_of(n),
-            CubeDim::new_1d(256),
+            tiles_grid(n.div_ceil(units * rake_ep).max(1)),
+            CubeDim::new_1d(units as u32),
             BufferArg::from_raw_parts(buf.h_sm.clone(), n),
             BufferArg::from_raw_parts(buf.h_fl.clone(), n_words),
             BufferArg::from_raw_parts(buf.h_lc.as_ref().unwrap().clone(), n * LC_STRIDE),
@@ -551,6 +552,8 @@ pub(crate) fn launch_block2_geometry(
             BufferArg::from_raw_parts(buf.h_extent.as_ref().unwrap().clone(), item_count * 2),
             inputs.min_sw,
             inputs.uniform_sw,
+            units,
+            rake_ep,
         );
         prof.end(client, "extent_pair");
 

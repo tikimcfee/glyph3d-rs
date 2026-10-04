@@ -274,10 +274,11 @@ pub fn run(ctx: &GpuContext, fixture_path: &Path) -> ! {
             );
         }
         if stages >= 4 {
+            let rake_ep = 32usize;
             extent_pair::launch_unchecked(
                 &client,
-                cubes_of(n),
-                CubeDim::new_1d(256),
+                tiles_grid(n.div_ceil(units * rake_ep).max(1)),
+                CubeDim::new_1d(units as u32),
                 BufferArg::from_raw_parts(h_sm.clone(), n),
                 BufferArg::from_raw_parts(h_fl.clone(), n_words),
                 BufferArg::from_raw_parts(h_lc.clone(), n * LC_STRIDE),
@@ -285,6 +286,8 @@ pub fn run(ctx: &GpuContext, fixture_path: &Path) -> ! {
                 BufferArg::from_raw_parts(h_extent.clone(), item_count * 2),
                 min_sw,
                 0,
+                units,
+                rake_ep,
             );
             derive_stride::launch_unchecked(
                 &client,

@@ -275,68 +275,79 @@ pub(super) fn extent_pair(
     extent_words: &mut [Atomic<u32>],
     min_sw: u32,
     uniform_sw: u32,
+    #[comptime] units: usize,
+    #[comptime] rake: usize,
 ) {
-    let b = ABSOLUTE_POS;
-    if b < lc.len() / LC_STRIDE && (flags_at(fl, b) & F_LEADER) != 0 {
-        let col = lc[b * LC_STRIDE + LC_COL] as usize;
-        let candidate = col == 0
-            || (col >= (min_sw as usize)
-                && (uniform_sw == 0 || col.is_multiple_of(uniform_sw as usize)));
-        if candidate {
-            let item_count = walk_plan.len() / 3;
-            // The owning item: the last plan entry whose start is at or before
-            // this byte (equal starts belong to empty items; taking the LAST
-            // keeps the one that can contain bytes).
-            let mut lo = 0usize;
-            let mut hi = item_count;
-            while lo + 1 < hi {
-                let mid = (lo + hi) / 2;
-                if (walk_plan[mid * 3] as usize) <= b {
-                    lo = mid;
-                } else {
-                    hi = mid;
-                }
-            }
-            let sw = walk_plan[lo * 3 + 2] as usize;
-            if col == 0 || (sw != 0 && col.is_multiple_of(sw)) {
-                let stop = walk_plan[lo * 3 + 1] as usize;
-                let mut sum = 0.0f32;
-                let mut widest = 0.0f32;
-                let mut count = 0usize;
-                let mut id = b;
-                let mut cur_word_idx = id >> 2;
-                let mut fl_word = fl[cur_word_idx];
-                while id < stop {
-                    let word_idx = id >> 2;
-                    if word_idx != cur_word_idx {
-                        fl_word = fl[word_idx];
-                        cur_word_idx = word_idx;
+    let tile = CUBE_POS;
+    let u = UNIT_POS as usize;
+    let n = lc.len() / LC_STRIDE;
+    let tile_lo = tile * (units * rake);
+    let item_count = walk_plan.len() / 3;
+
+    let mut k = 0usize;
+    while k < rake {
+        let b = tile_lo + k * units + u;
+        if b < n && (flags_at(fl, b) & F_LEADER) != 0 {
+            let col = lc[b * LC_STRIDE + LC_COL] as usize;
+            let candidate = col == 0
+                || (col >= (min_sw as usize)
+                    && (uniform_sw == 0 || col.is_multiple_of(uniform_sw as usize)));
+            if candidate {
+                // The owning item: the last plan entry whose start is at or before
+                // this byte (equal starts belong to empty items; taking the LAST
+                // keeps the one that can contain bytes).
+                let mut lo = 0usize;
+                let mut hi = item_count;
+                while lo + 1 < hi {
+                    let mid = (lo + hi) / 2;
+                    if (walk_plan[mid * 3] as usize) <= b {
+                        lo = mid;
+                    } else {
+                        hi = mid;
                     }
-                    let f = (fl_word >> (((id & 3) * 8) as u32)) & 0xFF;
-                    if (f & F_LEADER) != 0 {
-                        // The compare set is the running sum BEFORE this
-                        // glyph's own advance — the stored-x rule.
-                        if sum > widest {
-                            widest = sum;
-                        }
-                        if (f & F_NEWLINE) != 0 {
-                            break;
-                        }
-                        count += 1;
-                        if sw != 0 && count >= sw {
-                            // The fill closes the segment; its advance never
-                            // joins (fold.rs:758).
-                            break;
-                        }
-                        sum += sm[id];
-                    }
-                    id += 1;
                 }
-                if widest > 0.0f32 {
-                    extent_words[lo * 2].fetch_max(ordered_key(widest));
+                let sw = walk_plan[lo * 3 + 2] as usize;
+                if col == 0 || (sw != 0 && col.is_multiple_of(sw)) {
+                    let stop = walk_plan[lo * 3 + 1] as usize;
+                    let mut sum = 0.0f32;
+                    let mut widest = 0.0f32;
+                    let mut count = 0usize;
+                    let mut id = b;
+                    let mut cur_word_idx = id >> 2;
+                    let mut fl_word = fl[cur_word_idx];
+                    while id < stop {
+                        let word_idx = id >> 2;
+                        if word_idx != cur_word_idx {
+                            fl_word = fl[word_idx];
+                            cur_word_idx = word_idx;
+                        }
+                        let f = (fl_word >> (((id & 3) * 8) as u32)) & 0xFF;
+                        if (f & F_LEADER) != 0 {
+                            // The compare set is the running sum BEFORE this
+                            // glyph's own advance — the stored-x rule.
+                            if sum > widest {
+                                widest = sum;
+                            }
+                            if (f & F_NEWLINE) != 0 {
+                                break;
+                            }
+                            count += 1;
+                            if sw != 0 && count >= sw {
+                                // The fill closes the segment; its advance never
+                                // joins (fold.rs:758).
+                                break;
+                            }
+                            sum += sm[id];
+                        }
+                        id += 1;
+                    }
+                    if widest > 0.0f32 {
+                        extent_words[lo * 2].fetch_max(ordered_key(widest));
+                    }
                 }
             }
         }
+        k += 1;
     }
 }
 

@@ -592,10 +592,11 @@ pub fn bench(ctx: &GpuContext, corpus_path: &Path) -> ! {
                 3 => {
                     // extent_pair + derive_stride share this window (the rank
                     // stages set the precedent for merged dispatches).
+                    let rake_ep = 32usize;
                     extent_pair::launch_unchecked(
                         &client,
-                        cubes_of(n),
-                        CubeDim::new_1d(256),
+                        tiles_grid(n.div_ceil(units * rake_ep).max(1)),
+                        CubeDim::new_1d(units as u32),
                         BufferArg::from_raw_parts(h_sm.clone(), n),
                         BufferArg::from_raw_parts(h_fl.clone(), n_words),
                         BufferArg::from_raw_parts(h_lc.clone(), n * LC_STRIDE),
@@ -603,6 +604,8 @@ pub fn bench(ctx: &GpuContext, corpus_path: &Path) -> ! {
                         BufferArg::from_raw_parts(h_extent.clone(), 2),
                         if wrap_width > 0 { wrap_width as u32 } else { u32::MAX },
                         if wrap_width > 0 { wrap_width as u32 } else { 0 },
+                        units,
+                        rake_ep,
                     );
                     derive_stride::launch_unchecked(
                         &client,
