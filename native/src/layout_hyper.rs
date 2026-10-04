@@ -21,6 +21,12 @@ use crate::layout::{
 use crate::layout::TintStore;
 use crate::text::fu_to_world;
 
+pub struct Pass2DeviceOutput {
+    pub placements: Vec<ItemPlacement>,
+    pub file_tints: Vec<crate::layout::FileTintAccum>,
+    pub file_blocks: Vec<Vec<crate::glyph_scene::BlockCull>>,
+}
+
 pub struct HyperLayout {
     trie: Option<Arc<TrieTable>>,
     device: Option<crate::gpu::SharedDevice>,
@@ -434,7 +440,7 @@ impl HyperLayout {
         if can_map_device {
             let dev = self.device.as_ref().unwrap();
             let (mapped_ptr, wgpu_buf) = create_mapped_render_slots(&dev.device, total_survivors);
-            let (placements, file_tints) = Self::layout_pass2_device(
+            let pass2_out = Self::layout_pass2_device(
                 items,
                 &prepasses,
                 &slot_bases,
@@ -452,14 +458,15 @@ impl HyperLayout {
                 chunk_slots: total_survivors,
                 len: total_survivors,
                 mapped_slots: Some(mapped_ptr as usize),
-                file_tints,
+                file_tints: pass2_out.file_tints,
+                file_blocks: pass2_out.file_blocks,
                 #[cfg(feature = "cubecl")]
                 tint: TintStore::Host(Vec::new()),
                 #[cfg(feature = "cubecl")]
                 keep_alive: Vec::new(),
             };
             *arena = GlyphArena::from_device(device_slots);
-            Ok(placements)
+            Ok(pass2_out.placements)
         } else {
             let (tail_ptr, capacity) = arena.uninit_tail(total_survivors);
             assert!(capacity >= total_survivors);
@@ -487,10 +494,10 @@ impl HyperLayout {
         bitmap_adv: f32,
         em_height_fu: u32,
         dest: SendPtr<RenderSlot>,
-    ) -> (Vec<ItemPlacement>, Vec<crate::layout::FileTintAccum>) {
+    ) -> Pass2DeviceOutput {
         let dest_addr = dest.0 as usize;
         let lut = crate::glyph_scene::srgb_to_linear_table();
-        items
+        let results: Vec<_> = items
             .par_iter()
             .zip(prepasses.par_iter())
             .zip(slot_bases.par_iter())
@@ -552,6 +559,20 @@ impl HyperLayout {
                 let origin_x = p.origin_x;
                 let origin_y = p.origin_y;
                 let origin_z = p.origin_z;
+
+                let has_blocks = pre.survivor_count > 512;
+                let mut cur_blk_min_x = f32::INFINITY;
+                let mut cur_blk_min_y = f32::INFINITY;
+                let mut cur_blk_min_z = f32::INFINITY;
+                let mut cur_blk_max_x = f32::NEG_INFINITY;
+                let mut cur_blk_max_y = f32::NEG_INFINITY;
+                let mut cur_blk_max_z = f32::NEG_INFINITY;
+                let mut cur_blk_count = 0usize;
+                let mut local_blocks = if has_blocks {
+                    Vec::with_capacity((pre.survivor_count as usize).div_ceil(512))
+                } else {
+                    Vec::new()
+                };
 
                 let mut pos = 0usize;
                 let mut span_idx = 0usize;
@@ -685,6 +706,47 @@ impl HyperLayout {
                             };
                         }
                         survivor_out += 1;
+
+                        if has_blocks {
+                            let qw = r.advance.max(r.height);
+                            let half_h = 0.5 * r.height;
+                            if pos_x < cur_blk_min_x { cur_blk_min_x = pos_x; }
+                            let x_hi = pos_x + qw;
+                            if x_hi > cur_blk_max_x { cur_blk_max_x = x_hi; }
+                            let y_lo = pos_y - half_h;
+                            let y_hi = pos_y + half_h;
+                            if y_lo < cur_blk_min_y { cur_blk_min_y = y_lo; }
+                            if y_hi > cur_blk_max_y { cur_blk_max_y = y_hi; }
+                            if pos_z < cur_blk_min_z { cur_blk_min_z = pos_z; }
+                            if pos_z > cur_blk_max_z { cur_blk_max_z = pos_z; }
+                            cur_blk_count += 1;
+
+                            if cur_blk_count == 512 {
+                                if cur_blk_min_x <= cur_blk_max_x && cur_blk_min_y <= cur_blk_max_y {
+                                    local_blocks.push(crate::glyph_scene::BlockCull {
+                                        min: [
+                                            cur_blk_min_x - 0.5,
+                                            cur_blk_min_y - 0.5,
+                                            cur_blk_min_z - 0.2,
+                                        ],
+                                        max: [
+                                            cur_blk_max_x + 0.8,
+                                            cur_blk_max_y + 0.8,
+                                            cur_blk_max_z + 0.2,
+                                        ],
+                                        slot_base: (survivor_out - 512) as u32,
+                                        slot_count: 512,
+                                    });
+                                }
+                                cur_blk_min_x = f32::INFINITY;
+                                cur_blk_min_y = f32::INFINITY;
+                                cur_blk_min_z = f32::INFINITY;
+                                cur_blk_max_x = f32::NEG_INFINITY;
+                                cur_blk_max_y = f32::NEG_INFINITY;
+                                cur_blk_max_z = f32::NEG_INFINITY;
+                                cur_blk_count = 0;
+                            }
+                        }
                     }
 
                     record_idx += 1;
@@ -705,6 +767,27 @@ impl HyperLayout {
                     }
 
                     pos += 1;
+                }
+
+                if has_blocks
+                    && cur_blk_count > 0
+                    && cur_blk_min_x <= cur_blk_max_x
+                    && cur_blk_min_y <= cur_blk_max_y
+                {
+                    local_blocks.push(crate::glyph_scene::BlockCull {
+                        min: [
+                            cur_blk_min_x - 0.5,
+                            cur_blk_min_y - 0.5,
+                            cur_blk_min_z - 0.2,
+                        ],
+                        max: [
+                            cur_blk_max_x + 0.8,
+                            cur_blk_max_y + 0.8,
+                            cur_blk_max_z + 0.2,
+                        ],
+                        slot_base: (survivor_out - cur_blk_count) as u32,
+                        slot_count: cur_blk_count as u32,
+                    });
                 }
 
                 if let Some(c) = flat_color {
@@ -739,9 +822,25 @@ impl HyperLayout {
                         cells: file_cells,
                         has_emoji: file_has_emoji,
                     },
+                    local_blocks,
                 )
             })
-            .unzip()
+            .collect();
+
+        let mut placements = Vec::with_capacity(results.len());
+        let mut file_tints = Vec::with_capacity(results.len());
+        let mut file_blocks = Vec::with_capacity(results.len());
+        for (p, t, b) in results {
+            placements.push(p);
+            file_tints.push(t);
+            file_blocks.push(b);
+        }
+
+        Pass2DeviceOutput {
+            placements,
+            file_tints,
+            file_blocks,
+        }
     }
 
     fn layout_pass2_host(

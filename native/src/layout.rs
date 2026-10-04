@@ -458,6 +458,8 @@ pub struct DeviceSlots {
     pub mapped_slots: Option<usize>,
     /// Precomputed in-flight tint accumulators per item, avoiding 3 GB mapped memory readback.
     pub file_tints: Vec<FileTintAccum>,
+    /// Precomputed in-flight local block bounds per item, avoiding 3 GB mapped memory readback in build_file_blocks.
+    pub file_blocks: Vec<Vec<crate::glyph_scene::BlockCull>>,
     /// (glyph_id, color) per slot, slot order — read through `as_slice`.
     #[cfg(feature = "cubecl")]
     pub tint: TintStore,
