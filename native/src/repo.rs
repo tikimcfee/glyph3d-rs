@@ -1166,7 +1166,7 @@ pub fn line_of_byte(byte: usize, line_starts: &[usize]) -> u32 {
     }
 }
 
-const SUBSEG_BLOCK_SIZE: usize = 512;
+use crate::glyph_scene::SUBSEG_BLOCK_SIZE;
 
 fn build_file_blocks(
     v: &FileView,
@@ -1209,14 +1209,14 @@ fn build_file_blocks(
             if min_x <= max_x && min_y <= max_y {
                 blocks.push(crate::glyph_scene::BlockCull {
                     min: [
-                        v.offset[0] + min_x - 0.5,
-                        v.offset[1] + min_y - 0.5,
-                        v.offset[2] + min_z - 0.2,
+                        v.offset[0] + min_x - crate::glyph_scene::BLOCK_CULL_PAD_MIN[0],
+                        v.offset[1] + min_y - crate::glyph_scene::BLOCK_CULL_PAD_MIN[1],
+                        v.offset[2] + min_z - crate::glyph_scene::BLOCK_CULL_PAD_MIN[2],
                     ],
                     max: [
-                        v.offset[0] + max_x + 0.8,
-                        v.offset[1] + max_y + 0.8,
-                        v.offset[2] + max_z + 0.2,
+                        v.offset[0] + max_x + crate::glyph_scene::BLOCK_CULL_PAD_MAX[0],
+                        v.offset[1] + max_y + crate::glyph_scene::BLOCK_CULL_PAD_MAX[1],
+                        v.offset[2] + max_z + crate::glyph_scene::BLOCK_CULL_PAD_MAX[2],
                     ],
                     slot_base: b_start as u32,
                     slot_count: chunk.len() as u32,
@@ -1259,14 +1259,14 @@ fn build_file_blocks(
                     if min_x <= max_x && min_y <= max_y {
                         blocks.push(crate::glyph_scene::BlockCull {
                             min: [
-                                v.offset[0] + min_x - 0.5,
-                                v.offset[1] + min_y - 0.5,
-                                v.offset[2] + min_z - 0.2,
+                                v.offset[0] + min_x - crate::glyph_scene::BLOCK_CULL_PAD_MIN[0],
+                                v.offset[1] + min_y - crate::glyph_scene::BLOCK_CULL_PAD_MIN[1],
+                                v.offset[2] + min_z - crate::glyph_scene::BLOCK_CULL_PAD_MIN[2],
                             ],
                             max: [
-                                v.offset[0] + max_x + 0.8,
-                                v.offset[1] + max_y + 0.8,
-                                v.offset[2] + max_z + 0.2,
+                                v.offset[0] + max_x + crate::glyph_scene::BLOCK_CULL_PAD_MAX[0],
+                                v.offset[1] + max_y + crate::glyph_scene::BLOCK_CULL_PAD_MAX[1],
+                                v.offset[2] + max_z + crate::glyph_scene::BLOCK_CULL_PAD_MAX[2],
                             ],
                             slot_base: b_start as u32,
                             slot_count: chunk.len() as u32,
@@ -1373,14 +1373,14 @@ impl RepoLoad {
                 fbs.iter()
                     .map(|lb| crate::glyph_scene::BlockCull {
                         min: [
-                            v.offset[0] + lb.min[0] - 0.5,
-                            v.offset[1] + lb.min[1] - 0.5,
-                            v.offset[2] + lb.min[2] - 0.2,
+                            v.offset[0] + lb.min[0] - crate::glyph_scene::BLOCK_CULL_PAD_MIN[0],
+                            v.offset[1] + lb.min[1] - crate::glyph_scene::BLOCK_CULL_PAD_MIN[1],
+                            v.offset[2] + lb.min[2] - crate::glyph_scene::BLOCK_CULL_PAD_MIN[2],
                         ],
                         max: [
-                            v.offset[0] + lb.max[0] + 0.8,
-                            v.offset[1] + lb.max[1] + 0.8,
-                            v.offset[2] + lb.max[2] + 0.2,
+                            v.offset[0] + lb.max[0] + crate::glyph_scene::BLOCK_CULL_PAD_MAX[0],
+                            v.offset[1] + lb.max[1] + crate::glyph_scene::BLOCK_CULL_PAD_MAX[1],
+                            v.offset[2] + lb.max[2] + crate::glyph_scene::BLOCK_CULL_PAD_MAX[2],
                         ],
                         slot_base: (v.slot_base as u32) + lb.slot_base,
                         slot_count: lb.slot_count,
@@ -1391,13 +1391,13 @@ impl RepoLoad {
             };
             crate::glyph_scene::SegCull {
                 min: [
-                    v.offset[0] - 0.3,
-                    v.offset[1] - v.height - 0.5,
+                    v.offset[0] - crate::glyph_scene::SEG_CULL_PAD_MIN[0],
+                    v.offset[1] - v.height - crate::glyph_scene::SEG_CULL_PAD_MIN[1],
                     v.offset[2] + v.z_min,
                 ],
                 max: [
-                    v.offset[0] + v.width + 0.6,
-                    v.offset[1] + 0.75,
+                    v.offset[0] + v.width + crate::glyph_scene::SEG_CULL_PAD_MAX[0],
+                    v.offset[1] + crate::glyph_scene::SEG_CULL_PAD_MAX[1],
                     v.offset[2] + v.z_max,
                 ],
                 slot_base: v.slot_base as u32,
@@ -1426,8 +1426,16 @@ impl RepoLoad {
                 slot_base: v.slot_base as u32,
                 slot_count: v.slot_count as u32,
                 item: v.item,
-                aabb_min: [-0.3, -v.height - 0.5, v.z_min - 0.1],
-                aabb_max: [v.width + 0.6, 0.75, v.z_max + 0.1],
+                aabb_min: [
+                    -crate::glyph_scene::SEG_CULL_PAD_MIN[0],
+                    -v.height - crate::glyph_scene::SEG_CULL_PAD_MIN[1],
+                    v.z_min - crate::glyph_scene::PICK_AABB_PAD_Z,
+                ],
+                aabb_max: [
+                    v.width + crate::glyph_scene::SEG_CULL_PAD_MAX[0],
+                    crate::glyph_scene::SEG_CULL_PAD_MAX[1],
+                    v.z_max + crate::glyph_scene::PICK_AABB_PAD_Z,
+                ],
             })
             .collect();
         let mut focus_bounds = None;

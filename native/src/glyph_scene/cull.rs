@@ -47,6 +47,26 @@ pub const BACKDROP_GAIN: f32 = 0.7;
 /// Stage F: one sub-file block for hierarchical frustum culling.
 /// Divides large files (>512 glyphs) into localized chunks so off-screen lines
 /// are culled on the CPU rather than dispatching tens of thousands of instances to the GPU.
+/// Number of glyph instances per sub-segment block cull chunk.
+pub const SUBSEG_BLOCK_SIZE: usize = 512;
+
+/// World-unit safety padding margins applied to `BlockCull` AABBs [min_x, min_y, min_z].
+/// Accommodates glyph visual overhang (italic slant, accents, descenders) past nominal cell bounds
+/// to prevent visual popping or premature frustum clipping.
+pub const BLOCK_CULL_PAD_MIN: [f32; 3] = [0.5, 0.5, 0.2];
+
+/// World-unit safety padding margins applied to `BlockCull` AABBs [max_x, max_y, max_z].
+pub const BLOCK_CULL_PAD_MAX: [f32; 3] = [0.8, 0.8, 0.2];
+
+/// World-unit safety padding margins applied to file-level `SegCull` AABBs [min_x, min_y].
+pub const SEG_CULL_PAD_MIN: [f32; 2] = [0.3, 0.5];
+
+/// World-unit safety padding margins applied to file-level `SegCull` AABBs [max_x, max_y].
+pub const SEG_CULL_PAD_MAX: [f32; 2] = [0.6, 0.75];
+
+/// World-unit depth safety padding applied to file pick AABBs.
+pub const PICK_AABB_PAD_Z: f32 = 0.1;
+
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Pod, Zeroable)]
 pub struct BlockCull {

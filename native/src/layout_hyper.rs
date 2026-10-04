@@ -631,7 +631,7 @@ impl HyperLayout {
                 let origin_y = p.origin_y;
                 let origin_z = p.origin_z;
 
-                let has_blocks = pre.survivor_count > 512;
+                let has_blocks = pre.survivor_count as usize > crate::glyph_scene::SUBSEG_BLOCK_SIZE;
                 let mut cur_blk_min_x = f32::INFINITY;
                 let mut cur_blk_min_y = f32::INFINITY;
                 let mut cur_blk_min_z = f32::INFINITY;
@@ -640,7 +640,7 @@ impl HyperLayout {
                 let mut cur_blk_max_z = f32::NEG_INFINITY;
                 let mut cur_blk_count = 0usize;
                 let mut local_blocks = if has_blocks {
-                    Vec::with_capacity((pre.survivor_count as usize).div_ceil(512))
+                    Vec::with_capacity((pre.survivor_count as usize).div_ceil(crate::glyph_scene::SUBSEG_BLOCK_SIZE))
                 } else {
                     Vec::new()
                 };
@@ -807,13 +807,13 @@ impl HyperLayout {
                             if pos_z > cur_blk_max_z { cur_blk_max_z = pos_z; }
                             cur_blk_count += 1;
 
-                            if cur_blk_count == 512 {
+                            if cur_blk_count == crate::glyph_scene::SUBSEG_BLOCK_SIZE {
                                 if cur_blk_min_x <= cur_blk_max_x && cur_blk_min_y <= cur_blk_max_y {
                                     local_blocks.push(crate::glyph_scene::BlockCull {
                                         min: [cur_blk_min_x, cur_blk_min_y, cur_blk_min_z],
                                         max: [cur_blk_max_x, cur_blk_max_y, cur_blk_max_z],
-                                        slot_base: (survivor_out - 512) as u32,
-                                        slot_count: 512,
+                                        slot_base: (survivor_out - crate::glyph_scene::SUBSEG_BLOCK_SIZE) as u32,
+                                        slot_count: crate::glyph_scene::SUBSEG_BLOCK_SIZE as u32,
                                     });
                                 }
                                 cur_blk_min_x = f32::INFINITY;
