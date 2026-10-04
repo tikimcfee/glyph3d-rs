@@ -44,8 +44,8 @@ encase = "0.12"
 rayon = "1.10"
 memchr = "2"
 simdutf8 = "0.1"
-bevy_ecs = { path = "../../../../../bevy/crates/bevy_ecs", default-features = false, features = ["std"] }
-bevy_transform = { path = "../../../../../bevy/crates/bevy_transform", default-features = false, features = ["std", "bevy-support"] }
+bevy_ecs = { version = "0.20.0-rc.2", default-features = false, features = ["std"] }
+bevy_transform = { version = "0.20.0-rc.2", default-features = false, features = ["std", "bevy-support"] }
 # The load path's tracing substrate (note 22): spans over the chain, its
 # tail, and the repo load, so measurements stop being ad-hoc Instant
 # pairs. Both crates are already resolved in the lockfile through wgpu
