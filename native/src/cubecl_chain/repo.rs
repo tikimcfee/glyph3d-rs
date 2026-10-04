@@ -15,6 +15,8 @@ use prep::prepare_chain_inputs;
 use tail_emit::{emit_records_chunked, package_slot_device, scatter_slots_direct};
 use tail_readback::{decode_placements, read_tint_store};
 
+pub(crate) use dispatch::prewarm_pipelines;
+
 // ── the repo parity driver — phase 4, rung 3 ─────────────────────────────────
 //
 // `--cubecl-repo-check <dir>`: the full chain over a REAL repository — walk,

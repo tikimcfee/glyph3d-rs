@@ -290,13 +290,29 @@ fn build_scene_impl(
             let t_visual_start = std::time::Instant::now();
             let device = &ctx.device;
             let queue = &ctx.queue;
+            #[cfg(feature = "cubecl")]
+            let shared_dev = gpu::SharedDevice::from_ctx(ctx);
             let (load, atlas, atlas_wall) = std::thread::scope(|s| {
                 let atlas_handle = s.spawn(|| {
                     let t = std::time::Instant::now();
                     let a = atlas::Atlas::load_device(device, queue, emoji_sheet);
                     (a, t.elapsed())
                 });
+                #[cfg(feature = "cubecl")]
+                let prewarm_handle = if *strategy == repo::Strategy::Cubecl {
+                    Some(s.spawn(|| {
+                        let t = std::time::Instant::now();
+                        cubecl_chain::prewarm(&shared_dev);
+                        log::info!("cubecl compute pipeline prewarm finished in {:?}", t.elapsed());
+                    }))
+                } else {
+                    None
+                };
                 let walk = repo::walk_repo(dir);
+                #[cfg(feature = "cubecl")]
+                if let Some(h) = prewarm_handle {
+                    h.join().expect("cubecl prewarm thread panicked");
+                }
                 let arena = layout::GlyphArena::new();
                 let load = repo::load_repo_from_walk(
                     dir,

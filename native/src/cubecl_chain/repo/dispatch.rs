@@ -519,3 +519,305 @@ pub(crate) fn launch_block2_geometry(
         prof.block_end(client, "block2_geometry");
     }
 }
+
+/// Pre-warms (compiles and caches) all 16 CubeCL compute shader pipelines
+/// concurrently on a background thread so cold starts pay zero shader JIT latency.
+pub fn prewarm_pipelines(client: &Client) {
+    use super::super::tail::scatter_slots;
+
+    let zeroes = vec![0u32; 256];
+    let zeroes_bytes = bytemuck::cast_slice::<u32, u8>(&zeroes);
+    let b: Vec<_> = (0..25)
+        .map(|_| client.create_from_slice(zeroes_bytes))
+        .collect();
+
+    let dim_256 = CubeDim::new_1d(256);
+
+    let units = 256usize;
+    let rake = 8usize;
+    let log = 8usize;
+    let rspan = std::env::var("GLYPH_CHAIN_SPAN")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(32usize);
+
+    unsafe {
+        // 1. decode_probe
+        decode_probe::launch_unchecked(
+            client,
+            CubeCount::Static(1, 1, 1),
+            dim_256,
+            BufferArg::from_raw_parts(b[0].clone(), 1),
+            BufferArg::from_raw_parts(b[1].clone(), 1),
+            BufferArg::from_raw_parts(b[2].clone(), 2),
+            BufferArg::from_raw_parts(b[3].clone(), 2),
+            BufferArg::from_raw_parts(b[4].clone(), 1),
+            BufferArg::from_raw_parts(b[5].clone(), 1),
+            BufferArg::from_raw_parts(b[6].clone(), 1),
+            BufferArg::from_raw_parts(b[7].clone(), 1),
+            BufferArg::from_raw_parts(b[8].clone(), 2),
+            BufferArg::from_raw_parts(b[9].clone(), 1),
+            BufferArg::from_raw_parts(b[10].clone(), 0),
+            BufferArg::from_raw_parts(b[11].clone(), 1),
+            BufferArg::from_raw_parts(b[12].clone(), 1),
+            BufferArg::from_raw_parts(b[13].clone(), 1),
+            BufferArg::from_raw_parts(b[14].clone(), 1),
+            BufferArg::from_raw_parts(b[15].clone(), 1),
+            8u32,
+            4u32,
+        );
+
+        // 2. count_tile
+        count_tile::launch_unchecked(
+            client,
+            CubeCount::Static(1, 1, 1),
+            dim_256,
+            BufferArg::from_raw_parts(b[0].clone(), 0),
+            BufferArg::from_raw_parts(b[1].clone(), 1),
+            BufferArg::from_raw_parts(b[2].clone(), units),
+            units,
+            rake,
+            log,
+        );
+
+        // 3. count_spine
+        count_spine::launch_unchecked(
+            client,
+            CubeCount::new_single(),
+            dim_256,
+            BufferArg::from_raw_parts(b[0].clone(), 1),
+            BufferArg::from_raw_parts(b[1].clone(), 1),
+            BufferArg::from_raw_parts(b[2].clone(), 1),
+            units,
+            log,
+        );
+
+        // 4. cand_scatter
+        cand_scatter::launch_unchecked(
+            client,
+            CubeCount::Static(1, 1, 1),
+            dim_256,
+            BufferArg::from_raw_parts(b[0].clone(), 0),
+            BufferArg::from_raw_parts(b[1].clone(), 1),
+            BufferArg::from_raw_parts(b[2].clone(), units),
+            BufferArg::from_raw_parts(b[3].clone(), 1),
+            units,
+            rake,
+        );
+
+        // 5. jump_build
+        jump_build::launch_unchecked(
+            client,
+            CubeCount::Static(1, 1, 1),
+            dim_256,
+            BufferArg::from_raw_parts(b[0].clone(), 1),
+            BufferArg::from_raw_parts(b[1].clone(), 1),
+            BufferArg::from_raw_parts(b[2].clone(), 2),
+            BufferArg::from_raw_parts(b[3].clone(), 1),
+            BufferArg::from_raw_parts(b[4].clone(), 256),
+            BufferArg::from_raw_parts(b[5].clone(), 256),
+        );
+
+        // 6. rank_step
+        rank_step::launch_unchecked(
+            client,
+            CubeCount::Static(1, 1, 1),
+            dim_256,
+            BufferArg::from_raw_parts(b[0].clone(), 256),
+            BufferArg::from_raw_parts(b[1].clone(), 256),
+            BufferArg::from_raw_parts(b[2].clone(), 256),
+            BufferArg::from_raw_parts(b[3].clone(), 256),
+            BufferArg::from_raw_parts(b[4].clone(), 256),
+            0,
+            256,
+        );
+
+        // 7. item_roots
+        item_roots::launch_unchecked(
+            client,
+            CubeCount::Static(1, 1, 1),
+            dim_256,
+            BufferArg::from_raw_parts(b[0].clone(), 1),
+            BufferArg::from_raw_parts(b[1].clone(), 1),
+            BufferArg::from_raw_parts(b[2].clone(), 2),
+            BufferArg::from_raw_parts(b[3].clone(), 1),
+            BufferArg::from_raw_parts(b[4].clone(), 1),
+        );
+
+        // 8. cluster_mark
+        cluster_mark::launch_unchecked(
+            client,
+            CubeCount::Static(1, 1, 1),
+            dim_256,
+            BufferArg::from_raw_parts(b[0].clone(), 1),
+            BufferArg::from_raw_parts(b[1].clone(), 1),
+            BufferArg::from_raw_parts(b[2].clone(), 1),
+            BufferArg::from_raw_parts(b[3].clone(), 1),
+            BufferArg::from_raw_parts(b[4].clone(), 1),
+            BufferArg::from_raw_parts(b[5].clone(), 2),
+            BufferArg::from_raw_parts(b[6].clone(), 1),
+            BufferArg::from_raw_parts(b[7].clone(), 1),
+            BufferArg::from_raw_parts(b[8].clone(), 1),
+            BufferArg::from_raw_parts(b[9].clone(), 1),
+            BufferArg::from_raw_parts(b[10].clone(), 1),
+            1,
+            256,
+            0.0f32,
+        );
+
+        // 9. sv_count_tile
+        sv_count_tile::launch_unchecked(
+            client,
+            CubeCount::Static(1, 1, 1),
+            dim_256,
+            BufferArg::from_raw_parts(b[0].clone(), 1),
+            BufferArg::from_raw_parts(b[1].clone(), 0),
+            BufferArg::from_raw_parts(b[2].clone(), 1),
+            BufferArg::from_raw_parts(b[3].clone(), 1),
+            BufferArg::from_raw_parts(b[4].clone(), units),
+            BufferArg::from_raw_parts(b[5].clone(), units),
+            units,
+            rake,
+            log,
+        );
+
+        // 10. sv_count_spine
+        sv_count_spine::launch_unchecked(
+            client,
+            CubeCount::new_single(),
+            dim_256,
+            BufferArg::from_raw_parts(b[0].clone(), 1),
+            BufferArg::from_raw_parts(b[1].clone(), 1),
+            BufferArg::from_raw_parts(b[2].clone(), 1),
+            BufferArg::from_raw_parts(b[3].clone(), 1),
+            BufferArg::from_raw_parts(b[4].clone(), 1),
+            BufferArg::from_raw_parts(b[5].clone(), 1),
+            units,
+            log,
+        );
+
+        // 11. item_totals
+        item_totals::launch_unchecked(
+            client,
+            CubeCount::Static(1, 1, 1),
+            dim_256,
+            BufferArg::from_raw_parts(b[0].clone(), 2),
+            BufferArg::from_raw_parts(b[1].clone(), 1),
+            BufferArg::from_raw_parts(b[2].clone(), 1),
+            BufferArg::from_raw_parts(b[3].clone(), 1),
+            BufferArg::from_raw_parts(b[4].clone(), 1),
+            BufferArg::from_raw_parts(b[5].clone(), units),
+            BufferArg::from_raw_parts(b[6].clone(), units),
+            BufferArg::from_raw_parts(b[7].clone(), 1),
+            BufferArg::from_raw_parts(b[8].clone(), 1),
+            BufferArg::from_raw_parts(b[9].clone(), 2),
+            units,
+            rake,
+        );
+
+        // 12. tile_scan
+        tile_scan::launch_unchecked(
+            client,
+            CubeCount::Static(1, 1, 1),
+            dim_256,
+            BufferArg::from_raw_parts(b[0].clone(), 0),
+            BufferArg::from_raw_parts(b[1].clone(), 1),
+            BufferArg::from_raw_parts(b[2].clone(), 2),
+            BufferArg::from_raw_parts(b[3].clone(), 1),
+            BufferArg::from_raw_parts(b[4].clone(), PARTIAL_COUNT_STRIDE),
+            BufferArg::from_raw_parts(b[5].clone(), 1),
+            units,
+            rake,
+            log,
+        );
+
+        // 13. spine_scan
+        spine_scan::launch_unchecked(
+            client,
+            CubeCount::new_single(),
+            dim_256,
+            BufferArg::from_raw_parts(b[0].clone(), PARTIAL_COUNT_STRIDE),
+            BufferArg::from_raw_parts(b[1].clone(), 1),
+            BufferArg::from_raw_parts(b[2].clone(), PARTIAL_COUNT_STRIDE),
+            BufferArg::from_raw_parts(b[3].clone(), 1),
+            units,
+            log,
+        );
+
+        // 14. apply
+        apply::launch_unchecked(
+            client,
+            CubeCount::Static(1, 1, 1),
+            dim_256,
+            BufferArg::from_raw_parts(b[0].clone(), 1),
+            BufferArg::from_raw_parts(b[1].clone(), 0),
+            BufferArg::from_raw_parts(b[2].clone(), 2),
+            BufferArg::from_raw_parts(b[3].clone(), 4),
+            BufferArg::from_raw_parts(b[4].clone(), 2),
+            BufferArg::from_raw_parts(b[5].clone(), 1),
+            BufferArg::from_raw_parts(b[6].clone(), IM_STRIDE),
+            BufferArg::from_raw_parts(b[7].clone(), PARTIAL_COUNT_STRIDE),
+            BufferArg::from_raw_parts(b[8].clone(), 1),
+            BufferArg::from_raw_parts(b[9].clone(), 1),
+            BufferArg::from_raw_parts(b[10].clone(), 1),
+            BufferArg::from_raw_parts(b[11].clone(), 1),
+            BufferArg::from_raw_parts(b[12].clone(), 1),
+            BufferArg::from_raw_parts(b[13].clone(), 1),
+            units,
+            rake,
+            log,
+            false,
+            true,
+        );
+
+        // 15. resolve_x_fused
+        resolve_x_fused::launch_unchecked(
+            client,
+            CubeCount::Static(1, 1, 1),
+            dim_256,
+            BufferArg::from_raw_parts(b[0].clone(), 1),
+            BufferArg::from_raw_parts(b[1].clone(), 0),
+            BufferArg::from_raw_parts(b[2].clone(), LM_STRIDE),
+            BufferArg::from_raw_parts(b[3].clone(), LC_STRIDE),
+            BufferArg::from_raw_parts(b[4].clone(), IM_STRIDE),
+            BufferArg::from_raw_parts(b[5].clone(), 1),
+            BufferArg::from_raw_parts(b[6].clone(), 2),
+            BufferArg::from_raw_parts(b[7].clone(), 1),
+            BufferArg::from_raw_parts(b[8].clone(), 1),
+            BufferArg::from_raw_parts(b[9].clone(), 1),
+            BufferArg::from_raw_parts(b[10].clone(), 2),
+            BufferArg::from_raw_parts(b[11].clone(), 1),
+            BufferArg::from_raw_parts(b[12].clone(), 1),
+            BufferArg::from_raw_parts(b[13].clone(), 1),
+            BufferArg::from_raw_parts(b[14].clone(), EXT_STRIDE),
+            units,
+            rspan,
+        );
+
+        // 16. scatter_slots
+        scatter_slots::launch_unchecked(
+            client,
+            CubeCount::Static(1, 1, 1),
+            dim_256,
+            BufferArg::from_raw_parts(b[0].clone(), 1),
+            BufferArg::from_raw_parts(b[1].clone(), 0),
+            BufferArg::from_raw_parts(b[2].clone(), 2),
+            BufferArg::from_raw_parts(b[3].clone(), LM_STRIDE),
+            BufferArg::from_raw_parts(b[4].clone(), 1),
+            BufferArg::from_raw_parts(b[5].clone(), 1),
+            BufferArg::from_raw_parts(b[6].clone(), 1),
+            BufferArg::from_raw_parts(b[7].clone(), 1),
+            BufferArg::from_raw_parts(b[8].clone(), 1),
+            BufferArg::from_raw_parts(b[9].clone(), 1),
+            BufferArg::from_raw_parts(b[10].clone(), 1),
+            BufferArg::from_raw_parts(b[11].clone(), 1),
+            BufferArg::from_raw_parts(b[12].clone(), 1),
+            BufferArg::from_raw_parts(b[13].clone(), units),
+            BufferArg::from_raw_parts(b[14].clone(), 1),
+            BufferArg::from_raw_parts(b[15].clone(), 1),
+            units,
+            rake,
+        );
+    }
+}
+

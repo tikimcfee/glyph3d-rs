@@ -56,6 +56,14 @@ pub use repo_check::repo_check;
 pub use repo::ChainPhases;
 pub(crate) use repo::{ChainMode, InstanceInputs, SharedDevice, run_repo_chain};
 
+/// Pre-warms all 16 CubeCL compute pipelines in the background.
+pub fn prewarm(device: &SharedDevice) {
+    if let Some(ref cd) = device.cubecl_device {
+        let client = cubecl::Device::Wgpu(cd.clone()).client();
+        repo::prewarm_pipelines(&client);
+    }
+}
+
 // ── lane layout (glyph-identity.json, hash-pinned) ──────────────────────────
 const PARTIAL_COUNT_STRIDE: usize = 8;
 const P_RESET: usize = 0;
