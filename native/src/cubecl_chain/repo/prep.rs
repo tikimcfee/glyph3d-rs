@@ -26,6 +26,7 @@ pub(crate) struct ChainHostInputs {
     pub im: Vec<f32>,
     pub page_gap_x: Vec<f32>,
     pub walk_plan: Vec<u32>,
+    pub min_sw: u32,
     pub ext_seed: Vec<u32>,
 }
 
@@ -93,6 +94,7 @@ pub(crate) fn prepare_chain_inputs(
     }
 
     let mut walk_plan: Vec<u32> = Vec::with_capacity(item_count * 3);
+    let mut min_sw = u32::MAX;
     for (i, item) in items.iter().enumerate() {
         let width = if item.wrap_width > 0 {
             item.wrap_width
@@ -101,6 +103,9 @@ pub(crate) fn prepare_chain_inputs(
         } else {
             0
         };
+        if width > 0 && (width as u32) < min_sw {
+            min_sw = width as u32;
+        }
         walk_plan.push(ir[i * 2]);
         walk_plan.push(ir[i * 2 + 1]);
         walk_plan.push(width as u32);
@@ -145,6 +150,7 @@ pub(crate) fn prepare_chain_inputs(
         im,
         page_gap_x,
         walk_plan,
+        min_sw,
         ext_seed,
     }
 }

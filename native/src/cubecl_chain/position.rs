@@ -241,53 +241,56 @@ pub(super) fn extent_pair(
     lc: &[u32],
     walk_plan: &[u32],
     extent_words: &mut [Atomic<u32>],
+    min_sw: u32,
 ) {
     let b = ABSOLUTE_POS;
     if b < lc.len() / LC_STRIDE && (flags_at(fl, b) & F_LEADER) != 0 {
-        let item_count = walk_plan.len() / 3;
-        // The owning item: the last plan entry whose start is at or before
-        // this byte (equal starts belong to empty items; taking the LAST
-        // keeps the one that can contain bytes).
-        let mut lo = 0usize;
-        let mut hi = item_count;
-        while lo + 1 < hi {
-            let mid = (lo + hi) / 2;
-            if (walk_plan[mid * 3] as usize) <= b {
-                lo = mid;
-            } else {
-                hi = mid;
-            }
-        }
-        let sw = walk_plan[lo * 3 + 2] as usize;
         let col = lc[b * LC_STRIDE + LC_COL] as usize;
-        if col == 0 || (sw != 0 && col.is_multiple_of(sw)) {
-            let stop = walk_plan[lo * 3 + 1] as usize;
-            let mut sum = 0.0f32;
-            let mut widest = 0.0f32;
-            let mut count = 0usize;
-            let mut id = b;
-            while id < stop {
-                let f = flags_at(fl, id);
-                if (f & F_LEADER) != 0 {
-                    // The compare set is the running sum BEFORE this
-                    // glyph's own advance — the stored-x rule.
-                    if sum > widest {
-                        widest = sum;
-                    }
-                    if (f & F_NEWLINE) != 0 {
-                        break;
-                    }
-                    count += 1;
-                    if sw != 0 && count >= sw {
-                        // The fill closes the segment; its advance never
-                        // joins (fold.rs:758).
-                        break;
-                    }
-                    sum += sm[id];
+        if col == 0 || col >= (min_sw as usize) {
+            let item_count = walk_plan.len() / 3;
+            // The owning item: the last plan entry whose start is at or before
+            // this byte (equal starts belong to empty items; taking the LAST
+            // keeps the one that can contain bytes).
+            let mut lo = 0usize;
+            let mut hi = item_count;
+            while lo + 1 < hi {
+                let mid = (lo + hi) / 2;
+                if (walk_plan[mid * 3] as usize) <= b {
+                    lo = mid;
+                } else {
+                    hi = mid;
                 }
-                id += 1;
             }
-            extent_words[lo * 2].fetch_max(ordered_key(widest));
+            let sw = walk_plan[lo * 3 + 2] as usize;
+            if col == 0 || (sw != 0 && col.is_multiple_of(sw)) {
+                let stop = walk_plan[lo * 3 + 1] as usize;
+                let mut sum = 0.0f32;
+                let mut widest = 0.0f32;
+                let mut count = 0usize;
+                let mut id = b;
+                while id < stop {
+                    let f = flags_at(fl, id);
+                    if (f & F_LEADER) != 0 {
+                        // The compare set is the running sum BEFORE this
+                        // glyph's own advance — the stored-x rule.
+                        if sum > widest {
+                            widest = sum;
+                        }
+                        if (f & F_NEWLINE) != 0 {
+                            break;
+                        }
+                        count += 1;
+                        if sw != 0 && count >= sw {
+                            // The fill closes the segment; its advance never
+                            // joins (fold.rs:758).
+                            break;
+                        }
+                        sum += sm[id];
+                    }
+                    id += 1;
+                }
+                extent_words[lo * 2].fetch_max(ordered_key(widest));
+            }
         }
     }
 }

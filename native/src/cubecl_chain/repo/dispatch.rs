@@ -297,9 +297,9 @@ pub(crate) fn resolve_candidates(
     (c, allocs)
 }
 
-/// Executes Block 2: scan, resolve_x, extent_fold, survivor dual-Blelloch, and item_totals.
+/// Executes Block 2 Part A: candidate resolution (if any), survivor counting (sv_count_tile, sv_count_spine), and item_totals.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn launch_block2(
+pub(crate) fn launch_block2_totals(
     client: &Client,
     n: usize,
     item_count: usize,
@@ -314,10 +314,9 @@ pub(crate) fn launch_block2(
     let units = inputs.units;
     let rake = inputs.rake;
     let log = inputs.log;
-    let rspan = inputs.rspan;
 
     unsafe {
-        prof.block_begin(client, "block2");
+        prof.block_begin(client, "block2_totals");
         if let Some(ca) = cluster_allocs {
             let kmax = ca.kmax;
             let cstride = ca.cstride;
@@ -407,6 +406,81 @@ pub(crate) fn launch_block2(
             prof.end(client, "cluster_mark");
         }
 
+        prof.begin(client, "sv_count_tile");
+        sv_count_tile::launch_unchecked(
+            client,
+            tiles_grid(n_tiles),
+            CubeDim::new_1d(units as u32),
+            BufferArg::from_raw_parts(buf.h_fl.clone(), n_words),
+            BufferArg::from_raw_parts(buf.h_gi.clone(), n),
+            BufferArg::from_raw_parts(buf.h_ltc.as_ref().unwrap().clone(), n_tiles),
+            BufferArg::from_raw_parts(buf.h_stc.as_ref().unwrap().clone(), n_tiles),
+            BufferArg::from_raw_parts(buf.h_lup.as_ref().unwrap().clone(), n_tiles * units),
+            BufferArg::from_raw_parts(buf.h_sup.as_ref().unwrap().clone(), n_tiles * units),
+            units,
+            rake,
+            log,
+        );
+        prof.end(client, "sv_count_tile");
+
+        prof.begin(client, "sv_count_spine");
+        sv_count_spine::launch_unchecked(
+            client,
+            CubeCount::new_single(),
+            CubeDim::new_1d(units as u32),
+            BufferArg::from_raw_parts(buf.h_ltc.as_ref().unwrap().clone(), n_tiles),
+            BufferArg::from_raw_parts(buf.h_stc.as_ref().unwrap().clone(), n_tiles),
+            BufferArg::from_raw_parts(buf.h_lxc.as_ref().unwrap().clone(), n_tiles),
+            BufferArg::from_raw_parts(buf.h_sxc.as_ref().unwrap().clone(), n_tiles),
+            BufferArg::from_raw_parts(buf.h_lgrand.as_ref().unwrap().clone(), 1),
+            BufferArg::from_raw_parts(buf.h_sgrand.as_ref().unwrap().clone(), 1),
+            units,
+            log,
+        );
+        prof.end(client, "sv_count_spine");
+
+        prof.begin(client, "item_totals");
+        item_totals::launch_unchecked(
+            client,
+            cubes_of(item_count.max(1)),
+            CubeDim::new_1d(256),
+            BufferArg::from_raw_parts(buf.h_ir.clone(), inputs.ir.len()),
+            BufferArg::from_raw_parts(buf.h_fl.clone(), n_words),
+            BufferArg::from_raw_parts(buf.h_gi.clone(), n),
+            BufferArg::from_raw_parts(buf.h_lxc.as_ref().unwrap().clone(), n_tiles),
+            BufferArg::from_raw_parts(buf.h_sxc.as_ref().unwrap().clone(), n_tiles),
+            BufferArg::from_raw_parts(buf.h_lup.as_ref().unwrap().clone(), n_tiles * units),
+            BufferArg::from_raw_parts(buf.h_sup.as_ref().unwrap().clone(), n_tiles * units),
+            BufferArg::from_raw_parts(buf.h_lgrand.as_ref().unwrap().clone(), 1),
+            BufferArg::from_raw_parts(buf.h_sgrand.as_ref().unwrap().clone(), 1),
+            BufferArg::from_raw_parts(buf.h_totals.as_ref().unwrap().clone(), item_count * 2),
+            units,
+            rake,
+        );
+        prof.end(client, "item_totals");
+        prof.block_end(client, "block2_totals");
+    }
+}
+
+/// Executes Block 2 Part B: scan, apply, extent_pair, derive_stride, resolve_x, extent_fold, and ordinal_scatter.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn launch_block2_geometry(
+    client: &Client,
+    n: usize,
+    item_count: usize,
+    inputs: &ChainHostInputs,
+    buf: &ChainBuffers,
+    prof: &mut ChainProfiler,
+) {
+    let n_tiles = inputs.n_tiles;
+    let n_words = inputs.n_words;
+    let units = inputs.units;
+    let rake = inputs.rake;
+    let log = inputs.log;
+    let rspan = inputs.rspan;
+
+    unsafe {
+        prof.block_begin(client, "block2_geometry");
         prof.begin(client, "tile_scan");
         tile_scan::launch_unchecked(
             client,
@@ -474,6 +548,7 @@ pub(crate) fn launch_block2(
             BufferArg::from_raw_parts(buf.h_lc.as_ref().unwrap().clone(), n * LC_STRIDE),
             BufferArg::from_raw_parts(buf.h_plan.as_ref().unwrap().clone(), inputs.walk_plan.len()),
             BufferArg::from_raw_parts(buf.h_extent.as_ref().unwrap().clone(), item_count * 2),
+            inputs.min_sw,
         );
         prof.end(client, "extent_pair");
 
@@ -530,39 +605,6 @@ pub(crate) fn launch_block2(
         );
         prof.end(client, "extent_fold");
 
-        prof.begin(client, "sv_count_tile");
-        sv_count_tile::launch_unchecked(
-            client,
-            tiles_grid(n_tiles),
-            CubeDim::new_1d(units as u32),
-            BufferArg::from_raw_parts(buf.h_fl.clone(), n_words),
-            BufferArg::from_raw_parts(buf.h_gi.clone(), n),
-            BufferArg::from_raw_parts(buf.h_ltc.as_ref().unwrap().clone(), n_tiles),
-            BufferArg::from_raw_parts(buf.h_stc.as_ref().unwrap().clone(), n_tiles),
-            BufferArg::from_raw_parts(buf.h_lup.as_ref().unwrap().clone(), n_tiles * units),
-            BufferArg::from_raw_parts(buf.h_sup.as_ref().unwrap().clone(), n_tiles * units),
-            units,
-            rake,
-            log,
-        );
-        prof.end(client, "sv_count_tile");
-
-        prof.begin(client, "sv_count_spine");
-        sv_count_spine::launch_unchecked(
-            client,
-            CubeCount::new_single(),
-            CubeDim::new_1d(units as u32),
-            BufferArg::from_raw_parts(buf.h_ltc.as_ref().unwrap().clone(), n_tiles),
-            BufferArg::from_raw_parts(buf.h_stc.as_ref().unwrap().clone(), n_tiles),
-            BufferArg::from_raw_parts(buf.h_lxc.as_ref().unwrap().clone(), n_tiles),
-            BufferArg::from_raw_parts(buf.h_sxc.as_ref().unwrap().clone(), n_tiles),
-            BufferArg::from_raw_parts(buf.h_lgrand.as_ref().unwrap().clone(), 1),
-            BufferArg::from_raw_parts(buf.h_sgrand.as_ref().unwrap().clone(), 1),
-            units,
-            log,
-        );
-        prof.end(client, "sv_count_spine");
-
         prof.begin(client, "ordinal_scatter");
         ordinal_scatter::launch_unchecked(
             client,
@@ -577,26 +619,6 @@ pub(crate) fn launch_block2(
             rake,
         );
         prof.end(client, "ordinal_scatter");
-
-        prof.begin(client, "item_totals");
-        item_totals::launch_unchecked(
-            client,
-            cubes_of(item_count.max(1)),
-            CubeDim::new_1d(256),
-            BufferArg::from_raw_parts(buf.h_ir.clone(), inputs.ir.len()),
-            BufferArg::from_raw_parts(buf.h_fl.clone(), n_words),
-            BufferArg::from_raw_parts(buf.h_gi.clone(), n),
-            BufferArg::from_raw_parts(buf.h_lxc.as_ref().unwrap().clone(), n_tiles),
-            BufferArg::from_raw_parts(buf.h_sxc.as_ref().unwrap().clone(), n_tiles),
-            BufferArg::from_raw_parts(buf.h_lup.as_ref().unwrap().clone(), n_tiles * units),
-            BufferArg::from_raw_parts(buf.h_sup.as_ref().unwrap().clone(), n_tiles * units),
-            BufferArg::from_raw_parts(buf.h_lgrand.as_ref().unwrap().clone(), 1),
-            BufferArg::from_raw_parts(buf.h_sgrand.as_ref().unwrap().clone(), 1),
-            BufferArg::from_raw_parts(buf.h_totals.as_ref().unwrap().clone(), item_count * 2),
-            units,
-            rake,
-        );
-        prof.end(client, "item_totals");
-        prof.block_end(client, "block2");
+        prof.block_end(client, "block2_geometry");
     }
 }

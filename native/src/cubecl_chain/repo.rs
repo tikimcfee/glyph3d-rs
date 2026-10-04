@@ -7,7 +7,10 @@ mod tail_emit;
 mod tail_readback;
 
 use buffers::allocate_chain_buffers;
-use dispatch::{launch_block1, launch_block2, resolve_candidates, ChainProfiler};
+use dispatch::{
+    launch_block1, launch_block2_geometry, launch_block2_totals, resolve_candidates,
+    ChainProfiler,
+};
 use prep::prepare_chain_inputs;
 use tail_emit::{emit_records_chunked, package_slot_device, scatter_slots_direct};
 use tail_readback::{decode_placements, read_tint_store};
@@ -220,7 +223,7 @@ pub(crate) fn run_repo_chain(
 
     let (c, cluster_allocs) = resolve_candidates(&client, &buf, item_count, &mut prof);
 
-    launch_block2(
+    launch_block2_totals(
         &client,
         n,
         item_count,
@@ -230,6 +233,7 @@ pub(crate) fn run_repo_chain(
         cluster_allocs.as_ref(),
         &mut prof,
     );
+    drop(cluster_allocs);
 
     let t_rb = std::time::Instant::now();
     drop(sp_dispatch);
@@ -290,11 +294,18 @@ pub(crate) fn run_repo_chain(
     span_tail.record("total_records", total_records);
     span_tail.record("total_slots", total_slots);
 
-    // The Ladder: drop all intermediate lanes whose last reader ran before or
-    // during the survivor pass, shrinking tail live set.
+    launch_block2_geometry(
+        &client,
+        n,
+        item_count,
+        &host_inputs,
+        &buf,
+        &mut prof,
+    );
+
+    // The Ladder: drop all intermediate lanes whose last reader ran during geometry
     {
         let _sp_ladder = tracing::info_span!("tail.ladder").entered();
-        drop(cluster_allocs);
         buf.release_pre_survivor();
         client.memory_cleanup();
         let usage = client.memory_usage();

@@ -174,6 +174,7 @@ pub fn run(ctx: &GpuContext, fixture_path: &Path) -> ! {
     // columns if paged, else 0) — see extent_pair's header for why this
     // rides its own buffer and not ie.
     let mut walk_plan: Vec<u32> = Vec::with_capacity(item_count * 3);
+    let mut min_sw = u32::MAX;
     for item in &fx.items {
         let width = if item.wrap_width > 0 {
             item.wrap_width
@@ -182,6 +183,9 @@ pub fn run(ctx: &GpuContext, fixture_path: &Path) -> ! {
         } else {
             0
         };
+        if width > 0 && (width as u32) < min_sw {
+            min_sw = width as u32;
+        }
         walk_plan.push(item.byte_start as u32);
         walk_plan.push((item.byte_start + item.byte_count) as u32);
         walk_plan.push(width as u32);
@@ -278,6 +282,7 @@ pub fn run(ctx: &GpuContext, fixture_path: &Path) -> ! {
                 BufferArg::from_raw_parts(h_lc.clone(), n * LC_STRIDE),
                 BufferArg::from_raw_parts(h_plan.clone(), item_count * 3),
                 BufferArg::from_raw_parts(h_extent.clone(), item_count * 2),
+                min_sw,
             );
             derive_stride::launch_unchecked(
                 &client,
