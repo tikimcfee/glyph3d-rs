@@ -32,7 +32,7 @@ use super::{F_CLUSTER_TRAILER, F_LEADER};
 
 /// sequence_length at i: the lenient classifier over the packed corpus.
 #[cube]
-fn seq_len_at(bytes: &[u32], i: usize, n: usize) -> u32 {
+pub(super) fn seq_len_at(bytes: &[u32], i: usize, n: usize) -> u32 {
     let b = byte_at(bytes, i, n);
     if b & 0x80u32 == 0u32 {
         1u32
@@ -49,7 +49,7 @@ fn seq_len_at(bytes: &[u32], i: usize, n: usize) -> u32 {
 
 /// decode_codepoint_at at i for a known length.
 #[cube]
-fn cp_at(bytes: &[u32], i: usize, len: u32, n: usize) -> u32 {
+pub(super) fn cp_at(bytes: &[u32], i: usize, len: u32, n: usize) -> u32 {
     let b = byte_at(bytes, i, n);
     let b1 = byte_at(bytes, i + 1, n);
     let b2 = byte_at(bytes, i + 2, n);
@@ -71,7 +71,7 @@ fn cp_at(bytes: &[u32], i: usize, len: u32, n: usize) -> u32 {
 // RangeInclusive::contains expansion, and this is the spelled-out form it
 // takes on device.
 #[allow(clippy::manual_range_contains)]
-fn is_static_zero(cp: u32) -> u32 {
+pub(super) fn is_static_zero(cp: u32) -> u32 {
     if cp == 0x200Du32 || (cp >= 0xFE00u32 && cp <= 0xFE0Fu32) || (cp >= 0xE0020u32 && cp <= 0xE007Fu32) {
         1u32
     } else {

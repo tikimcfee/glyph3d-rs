@@ -4,10 +4,10 @@ use cubecl::client::{Client, ProfileWindow};
 use cubecl::prelude::*;
 
 use super::super::cluster::{
-    cand_scatter, cluster_mark, cluster_probe, count_spine, count_tile, item_roots, jump_build,
+    cand_scatter, cluster_mark, count_spine, count_tile, item_roots, jump_build,
     rank_step,
 };
-use super::super::decode::decode;
+use super::super::decode::decode_probe;
 use super::super::position::{extent_pair, resolve_x_fused};
 use super::super::scan::{apply, spine_scan, tile_scan};
 use super::super::tail::{
@@ -173,8 +173,8 @@ pub(crate) fn launch_block1(
 
     unsafe {
         prof.block_begin(client, "block1");
-        prof.begin(client, "decode");
-        decode::launch_unchecked(
+        prof.begin(client, "decode_probe");
+        decode_probe::launch_unchecked(
             client,
             cubes_of(n_words),
             CubeDim::new_1d(256),
@@ -182,21 +182,6 @@ pub(crate) fn launch_block1(
             BufferArg::from_raw_parts(buf.h_bi.as_ref().unwrap().clone(), buf.bi_len),
             BufferArg::from_raw_parts(buf.h_bm.as_ref().unwrap().clone(), buf.bm_len),
             BufferArg::from_raw_parts(buf.h_bc.as_ref().unwrap().clone(), buf.bc_len),
-            BufferArg::from_raw_parts(buf.h_fl.clone(), n_words),
-            BufferArg::from_raw_parts(buf.h_sm.clone(), n),
-            BufferArg::from_raw_parts(buf.h_gi.clone(), n),
-            BufferArg::from_raw_parts(buf.h_hgt.clone(), n),
-            BufferArg::from_raw_parts(buf.h_cslot.as_ref().unwrap().clone(), n),
-            buf.bshift,
-        );
-        prof.end(client, "decode");
-
-        prof.begin(client, "cluster_probe");
-        cluster_probe::launch_unchecked(
-            client,
-            cubes_of(n_words),
-            CubeDim::new_1d(256),
-            BufferArg::from_raw_parts(buf.h_bytes.as_ref().unwrap().clone(), n_words),
             BufferArg::from_raw_parts(buf.h_bmap.as_ref().unwrap().clone(), inputs.bitmap.len()),
             BufferArg::from_raw_parts(buf.h_poff.as_ref().unwrap().clone(), inputs.poff.len()),
             BufferArg::from_raw_parts(buf.h_pval.as_ref().unwrap().clone(), inputs.pval.len()),
@@ -206,11 +191,13 @@ pub(crate) fn launch_block1(
             BufferArg::from_raw_parts(buf.h_fl.clone(), n_words),
             BufferArg::from_raw_parts(buf.h_sm.clone(), n),
             BufferArg::from_raw_parts(buf.h_gi.clone(), n),
+            BufferArg::from_raw_parts(buf.h_hgt.clone(), n),
             BufferArg::from_raw_parts(buf.h_cslot.as_ref().unwrap().clone(), n),
             BufferArg::from_raw_parts(buf.h_cend.as_ref().unwrap().clone(), n),
+            buf.bshift,
             inputs.seq_max,
         );
-        prof.end(client, "cluster_probe");
+        prof.end(client, "decode_probe");
 
         prof.begin(client, "cand_count_tile");
         count_tile::launch_unchecked(
