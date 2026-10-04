@@ -35,6 +35,7 @@ pub fn extract_antigravity_file_action(
 
     let mut old_content = None;
     let mut new_content = None;
+    let mut original_file = None;
     let mut hunks = Vec::new();
 
     match action {
@@ -62,7 +63,8 @@ pub fn extract_antigravity_file_action(
         }
         FileActionKind::Read => {
             if let Some(out) = output {
-                old_content = Some(out.to_string());
+                new_content = Some(out.to_string());
+                original_file = Some(out.to_string());
             }
         }
         _ => {}
@@ -76,6 +78,7 @@ pub fn extract_antigravity_file_action(
         summary,
         old_content,
         new_content,
+        original_file,
         hunks,
     })
 }

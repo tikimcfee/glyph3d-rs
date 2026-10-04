@@ -71,6 +71,7 @@ fn test_revision_engine_multi_edit_sequence() {
         summary: "Write src/counter.rs".to_string(),
         old_content: None,
         new_content: Some("pub struct Counter {\n    count: usize,\n}\n".to_string()),
+        original_file: None,
         hunks: Vec::new(),
     };
     engine.ingest_file_action(0, &a0);
@@ -86,6 +87,7 @@ fn test_revision_engine_multi_edit_sequence() {
             "pub struct Counter {\n    count: usize,\n}\n\nimpl Counter {\n    pub fn new() -> Self {\n        Self { count: 0 }\n    }\n}"
                 .to_string(),
         ),
+        original_file: None,
         hunks: Vec::new(),
     };
     engine.ingest_file_action(1, &a1);
@@ -101,6 +103,7 @@ fn test_revision_engine_multi_edit_sequence() {
             "    pub fn new() -> Self {\n        Self { count: 0 }\n    }\n\n    pub fn inc(&mut self) {\n        self.count += 1;\n    }"
                 .to_string(),
         ),
+        original_file: None,
         hunks: Vec::new(),
     };
     engine.ingest_file_action(2, &a2);
@@ -116,6 +119,7 @@ fn test_revision_engine_multi_edit_sequence() {
             "    pub fn inc(&mut self) {\n        self.count += 1;\n    }\n\n    pub fn dec(&mut self) {\n        self.count = self.count.saturating_sub(1);\n    }"
                 .to_string(),
         ),
+        original_file: None,
         hunks: Vec::new(),
     };
     engine.ingest_file_action(3, &a3);
@@ -131,6 +135,7 @@ fn test_revision_engine_multi_edit_sequence() {
             "        Self { count: 0 }\n    }\n\n    pub fn get(&self) -> usize {\n        self.count\n    }"
                 .to_string(),
         ),
+        original_file: None,
         hunks: Vec::new(),
     };
     engine.ingest_file_action(4, &a4);
@@ -143,6 +148,7 @@ fn test_revision_engine_multi_edit_sequence() {
         summary: "Add doc comments".to_string(),
         old_content: Some("pub struct Counter {".to_string()),
         new_content: Some("/// Thread-safe counter structure.\npub struct Counter {".to_string()),
+        original_file: None,
         hunks: Vec::new(),
     };
     engine.ingest_file_action(5, &a5);
@@ -202,6 +208,7 @@ fn test_backward_reconstruction_via_disk_resolver() {
         summary: "Update println".to_string(),
         old_content: None,
         new_content: None,
+        original_file: None,
         hunks,
     };
 

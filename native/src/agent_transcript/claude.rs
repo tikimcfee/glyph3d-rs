@@ -176,6 +176,7 @@ pub fn extract_file_action(
 
     let mut old_content = None;
     let mut new_content = None;
+    let mut original_file = None;
     let mut hunks = Vec::new();
 
     match action {
@@ -187,13 +188,11 @@ pub fn extract_file_action(
                 new_content = Some(new_s.to_string());
             }
             if let Some(resp) = response {
+                if let Some(orig) = resp.get("originalFile").and_then(|v| v.as_str()) {
+                    original_file = Some(orig.to_string());
+                }
                 if let Some(sp) = resp.get("structuredPatch") {
                     hunks = extract_diff_hunks(sp);
-                }
-                if old_content.is_none() {
-                    if let Some(orig) = resp.get("originalFile").and_then(|v| v.as_str()) {
-                        old_content = Some(orig.to_string());
-                    }
                 }
             }
         }
@@ -207,7 +206,7 @@ pub fn extract_file_action(
             }
             if let Some(resp) = response {
                 if let Some(orig) = resp.get("originalFile").and_then(|v| v.as_str()) {
-                    old_content = Some(orig.to_string());
+                    original_file = Some(orig.to_string());
                 }
                 if let Some(sp) = resp.get("structuredPatch") {
                     hunks = extract_diff_hunks(sp);
@@ -218,8 +217,12 @@ pub fn extract_file_action(
             if let Some(resp) = response {
                 if let Some(file_obj) = resp.get("file") {
                     if let Some(c) = file_obj.get("content").and_then(|v| v.as_str()) {
-                        old_content = Some(c.to_string());
+                        new_content = Some(c.to_string());
+                        original_file = Some(c.to_string());
                     }
+                } else if let Some(c) = resp.get("content").and_then(|v| v.as_str()) {
+                    new_content = Some(c.to_string());
+                    original_file = Some(c.to_string());
                 }
             }
         }
@@ -234,6 +237,7 @@ pub fn extract_file_action(
         summary,
         old_content,
         new_content,
+        original_file,
         hunks,
     })
 }

@@ -96,7 +96,7 @@ impl RevisionEngine {
 
                 let (diff_stats, hunks) = if let Some(latest) = history.latest() {
                     compute_line_diff(&latest.text, &new_text)
-                } else if let Some(ref orig) = action.old_content {
+                } else if let Some(orig) = action.original_file.as_ref().or(action.old_content.as_ref()) {
                     // Pre-existing file overwritten
                     let r0 = FileRevision {
                         revision_index: 0,
@@ -157,15 +157,29 @@ impl RevisionEngine {
                     };
                     history.push_revision(rev);
                 } else {
-                    // No prior revision in history
-                    // 1. Check if old_content is available directly (originalFile snapshot < 10KB)
-                    if let Some(ref orig) = action.old_content {
+                    // No prior revision in history! First time file is encountered in session.
+                    // 1. Check if original_file snapshot was captured in transcript:
+                    let base_opt = action.original_file.clone().or_else(|| {
+                        // 2. Backward reconstruction from disk head state R_N via disk_resolver
+                        self.disk_resolver.as_ref().and_then(|resolver| {
+                            let disk_head = resolver(path)?;
+                            if !action.hunks.is_empty() {
+                                reconstruct_base_from_hunks(&disk_head, &action.hunks).ok()
+                            } else if let (Some(ref old_s), Some(ref new_s)) = (&action.old_content, &action.new_content) {
+                                apply_string_replace(&disk_head, new_s, old_s, false).ok()
+                            } else {
+                                Some(disk_head)
+                            }
+                        })
+                    });
+
+                    if let Some(base_text) = base_opt {
                         let r0 = FileRevision {
                             revision_index: 0,
                             turn_index,
                             action: FileActionKind::Read,
                             summary: format!("Base {path}"),
-                            text: Arc::new(orig.clone()),
+                            text: Arc::new(base_text.clone()),
                             diff_stats: DiffStats::default(),
                             hunks: Vec::new(),
                         };
@@ -174,15 +188,16 @@ impl RevisionEngine {
                         let derived_text = if let (Some(ref old_s), Some(ref new_s)) =
                             (&action.old_content, &action.new_content)
                         {
-                            apply_string_replace(orig, old_s, new_s, false)
-                                .unwrap_or_else(|_| orig.clone())
+                            apply_string_replace(&base_text, old_s, new_s, false)
+                                .unwrap_or_else(|_| base_text.clone())
                         } else if !action.hunks.is_empty() {
-                            apply_hunks(orig, &action.hunks).unwrap_or_else(|_| orig.clone())
+                            apply_hunks(&base_text, &action.hunks)
+                                .unwrap_or_else(|_| base_text.clone())
                         } else {
-                            orig.clone()
+                            base_text.clone()
                         };
 
-                        let (diff_stats, hunks) = compute_line_diff(orig, &derived_text);
+                        let (diff_stats, hunks) = compute_line_diff(&base_text, &derived_text);
                         let r1 = FileRevision {
                             revision_index: 1,
                             turn_index,
@@ -197,61 +212,27 @@ impl RevisionEngine {
                             },
                         };
                         history.push_revision(r1);
-                    } else if let Some(ref resolver) = self.disk_resolver {
-                        // 2. Backward reconstruction from disk head state R_N
-                        if let Some(disk_head) = resolver(path) {
-                            if !action.hunks.is_empty() {
-                                if let Ok(base_text) = reconstruct_base_from_hunks(&disk_head, &action.hunks) {
-                                    let r0 = FileRevision {
-                                        revision_index: 0,
-                                        turn_index,
-                                        action: FileActionKind::Read,
-                                        summary: format!("Base (Reconstructed) {path}"),
-                                        text: Arc::new(base_text),
-                                        diff_stats: DiffStats::default(),
-                                        hunks: Vec::new(),
-                                    };
-                                    history.push_revision(r0);
-                                }
-                            }
-                            let (diff_stats, _) = if let Some(latest) = history.latest() {
-                                compute_line_diff(&latest.text, &disk_head)
-                            } else {
-                                (DiffStats::default(), Vec::new())
-                            };
-                            let r1 = FileRevision {
-                                revision_index: history.count(),
-                                turn_index,
-                                action: FileActionKind::Edit,
-                                summary: action.summary.clone(),
-                                text: Arc::new(disk_head),
-                                diff_stats,
-                                hunks: action.hunks.clone(),
-                            };
-                            history.push_revision(r1);
-                        }
-                    } else {
-                        // 3. Fallback: establish R0 as target content or placeholder
-                        let old_s = action.old_content.clone().unwrap_or_default();
-                        let new_s = action.new_content.clone().unwrap_or_default();
+                    } else if let Some(ref snippet) = action.old_content {
+                        // Minimal snippet fallback only if neither originalFile nor disk was found
                         let r0 = FileRevision {
                             revision_index: 0,
                             turn_index,
                             action: FileActionKind::Read,
-                            summary: format!("Base {path}"),
-                            text: Arc::new(old_s.clone()),
+                            summary: format!("Base (Snippet) {path}"),
+                            text: Arc::new(snippet.clone()),
                             diff_stats: DiffStats::default(),
                             hunks: Vec::new(),
                         };
                         history.push_revision(r0);
 
-                        let (diff_stats, hunks) = compute_line_diff(&old_s, &new_s);
+                        let derived_text = action.new_content.clone().unwrap_or_else(|| snippet.clone());
+                        let (diff_stats, hunks) = compute_line_diff(snippet, &derived_text);
                         let r1 = FileRevision {
                             revision_index: 1,
                             turn_index,
                             action: FileActionKind::Edit,
                             summary: action.summary.clone(),
-                            text: Arc::new(new_s),
+                            text: Arc::new(derived_text),
                             diff_stats,
                             hunks: if !action.hunks.is_empty() {
                                 action.hunks.clone()
@@ -264,13 +245,25 @@ impl RevisionEngine {
                 }
             }
             FileActionKind::Read if history.is_empty() => {
-                if let Some(ref content) = action.old_content {
+                let text = action
+                    .original_file
+                    .as_ref()
+                    .or(action.new_content.as_ref())
+                    .or(action.old_content.as_ref())
+                    .cloned()
+                    .or_else(|| {
+                        self.disk_resolver
+                            .as_ref()
+                            .and_then(|resolver| resolver(path))
+                    });
+
+                if let Some(content) = text {
                     let rev = FileRevision {
                         revision_index: 0,
                         turn_index,
                         action: FileActionKind::Read,
                         summary: action.summary.clone(),
-                        text: Arc::new(content.clone()),
+                        text: Arc::new(content),
                         diff_stats: DiffStats::default(),
                         hunks: Vec::new(),
                     };

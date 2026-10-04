@@ -60,29 +60,14 @@ impl SpatialScene {
         let deck_entity = self.spawn_deck(deck_parent, "turn_deck", deck);
 
         // Spawn 2-page Agent Turn Cards for each turn
-        for (i, turn) in session.turns.iter().enumerate() {
-            let card_entity = self.spawn_agent_turn_card(
+        for turn in &session.turns {
+            self.spawn_agent_turn_card(
                 deck_entity,
                 turn.turn_index,
                 [55.0, 40.0],
                 4.0,
                 turn.summary(),
             );
-
-            let card_group_id = 1 + i as u32;
-            self.world.entity_mut(card_entity).insert(super::GlyphGroupBinding {
-                group_id: card_group_id,
-                tint: [1.0, 1.0, 1.0, 1.0],
-            });
-
-            // Left Page content: Prompt banner
-            if let Some(ref p) = turn.prompt {
-                self.world.spawn((
-                    Transform::from_translation(Vec3::new(0.0, 0.0, 0.2)),
-                    ChildOf(card_entity),
-                    Name::new(format!("prompt:{}", p.chars().take(20).collect::<String>())),
-                ));
-            }
         }
 
         // 3. Workdesk container on the right side
@@ -103,24 +88,17 @@ impl SpatialScene {
         );
 
         // Populate Workdesk with FileRevisionStacks from RevisionEngine
-        let mut next_rev_gid = (turn_count + 1) as u32;
         for path in revision_engine.file_paths() {
             if let Some(history) = revision_engine.history(&path) {
                 for rev in &history.revisions {
                     let card_size = [55.0, 38.0];
-                    let card_e = self.workdesk_push_revision(
+                    self.workdesk_push_revision(
                         workdesk_entity,
                         &path,
                         rev.action,
                         card_size,
                         &rev.summary,
                     );
-                    let rev_group_id = next_rev_gid;
-                    next_rev_gid += 1;
-                    self.world.entity_mut(card_e).insert(super::GlyphGroupBinding {
-                        group_id: rev_group_id,
-                        tint: [1.0, 1.0, 1.0, 1.0],
-                    });
                 }
             }
         }

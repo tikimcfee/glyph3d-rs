@@ -173,6 +173,8 @@ pub struct FileActionRecord {
     pub summary: String,
     pub old_content: Option<String>,
     pub new_content: Option<String>,
+    #[serde(default)]
+    pub original_file: Option<String>,
     pub hunks: Vec<DiffHunkRecord>,
 }
 
