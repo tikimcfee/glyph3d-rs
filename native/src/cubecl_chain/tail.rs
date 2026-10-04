@@ -1,7 +1,7 @@
 use cubecl::prelude::*;
 
 use super::monoid::{flags_at, item_search, ordered_key};
-use super::{F_LEADER, LC_COL, LC_ROW, LC_STRIDE, LM_STRIDE, LM_X, LM_Y, LM_Z};
+use super::{F_LEADER, LC_COL, LC_ROW, LC_STRIDE, LM_STRIDE, LM_X, LM_Y, LM_Z, RESOLVE_SLOTS};
 
 /// The record emitter — phase 4, rung 2. One thread per LEADER ORDINAL
 /// over the otb compaction, gathering the per-byte lanes into the 32 B
@@ -516,20 +516,52 @@ pub(super) fn extent_fold(
     let u = UNIT_POS as usize;
     let n = fl.len() * 4; // packed: words -> bytes
     let item_count = ir.len() / 2;
-    let lo = tile * (units * rake) + u * rake;
-    let hi = if lo + rake < n { lo + rake } else { n };
-    if lo < n && item_count > 0 {
-        let mut it = item_search(ir, item_count, lo);
+    let tile_lo = tile * (units * rake);
+
+    let sext = Shared::<[Atomic<u32>]>::new_slice(RESOLVE_SLOTS * EXT_STRIDE);
+    let sflags = Shared::<[Atomic<u32>]>::new_slice(RESOLVE_SLOTS);
+    let mut sbase = Shared::<u32>::new();
+
+    if u == 0 {
+        let mut b = 0usize;
+        if item_count > 0 && n > 0 {
+            let probe = if tile_lo < n { tile_lo } else { n - 1 };
+            b = item_search(ir, item_count, probe);
+        }
+        *sbase = b as u32;
+    }
+
+    let zero_k = 0x8000_0000u32;
+    let inf_k = 0xFF80_0000u32;
+    let ninf_k = 0x007F_FFFFu32;
+
+    let mut z = u;
+    while z < RESOLVE_SLOTS {
+        sflags[z].store(0u32);
+        let e = z * EXT_STRIDE;
+        sext[e].store(zero_k);
+        sext[e + 1].store(zero_k);
+        sext[e + 2].store(zero_k);
+        sext[e + 3].store(zero_k);
+        sext[e + 4].store(inf_k);
+        sext[e + 5].store(inf_k);
+        sext[e + 6].store(ninf_k);
+        sext[e + 7].store(ninf_k);
+        sext[e + 8].store(inf_k);
+        sext[e + 9].store(ninf_k);
+        z += units;
+    }
+    sync_cube();
+    let it_base = *sbase as usize;
+
+    let first_id = tile_lo + u;
+    if first_id < n && item_count > 0 {
+        let mut it = item_search(ir, item_count, first_id);
         let mut nxt = if it + 1 < item_count { ir[(it + 1) * 2] as usize } else { n };
-        // The current item-run's accumulators. The any-flags keep
-        // leaderless/survivorless runs silent; the seeds reproduce the
-        // buffer's, so a flush is idempotent against them.
         let mut pg_rmax = f32::new(0.0f32);
         let mut pg_ymin = f32::new(0.0f32);
         let mut pg_zmin = f32::new(0.0f32);
         let mut pg_zmax = f32::new(0.0f32);
-        // (f32::new of MAX literals, not INFINITY: the guard means these
-        // sentinels never reach an atomic unfolded.)
         let mut ink_xmin = f32::new(3.4028235e38f32);
         let mut ink_ymin = f32::new(3.4028235e38f32);
         let mut ink_rmax = f32::new(-3.4028235e38f32);
@@ -538,23 +570,45 @@ pub(super) fn extent_fold(
         let mut ink_zmax = f32::new(-3.4028235e38f32);
         let mut any_leader = false;
         let mut any_survivor = false;
-        let mut id = lo;
-        while id <= hi {
-            if id == hi || nxt <= id {
-                // The rake's end or an item boundary: flush the run.
+
+        let mut k = 0usize;
+        while k < rake {
+            let id = tile_lo + k * units + u;
+            if id >= n {
+                break;
+            }
+            if nxt <= id {
                 if any_leader {
-                    let e = it * EXT_STRIDE;
-                    ext[e].fetch_max(ordered_key(pg_rmax));
-                    ext[e + 1].fetch_min(ordered_key(pg_ymin));
-                    ext[e + 2].fetch_min(ordered_key(pg_zmin));
-                    ext[e + 3].fetch_max(ordered_key(pg_zmax));
-                    if any_survivor {
-                        ext[e + 4].fetch_min(ordered_key(ink_xmin));
-                        ext[e + 5].fetch_min(ordered_key(ink_ymin));
-                        ext[e + 6].fetch_max(ordered_key(ink_rmax));
-                        ext[e + 7].fetch_max(ordered_key(ink_ymax));
-                        ext[e + 8].fetch_min(ordered_key(ink_zmin));
-                        ext[e + 9].fetch_max(ordered_key(ink_zmax));
+                    let slot = it - it_base;
+                    if slot < RESOLVE_SLOTS {
+                        sflags[slot].fetch_or(if any_survivor { 3u32 } else { 1u32 });
+                        let e = slot * EXT_STRIDE;
+                        sext[e].fetch_max(ordered_key(pg_rmax));
+                        sext[e + 1].fetch_min(ordered_key(pg_ymin));
+                        sext[e + 2].fetch_min(ordered_key(pg_zmin));
+                        sext[e + 3].fetch_max(ordered_key(pg_zmax));
+                        if any_survivor {
+                            sext[e + 4].fetch_min(ordered_key(ink_xmin));
+                            sext[e + 5].fetch_min(ordered_key(ink_ymin));
+                            sext[e + 6].fetch_max(ordered_key(ink_rmax));
+                            sext[e + 7].fetch_max(ordered_key(ink_ymax));
+                            sext[e + 8].fetch_min(ordered_key(ink_zmin));
+                            sext[e + 9].fetch_max(ordered_key(ink_zmax));
+                        }
+                    } else {
+                        let e = it * EXT_STRIDE;
+                        ext[e].fetch_max(ordered_key(pg_rmax));
+                        ext[e + 1].fetch_min(ordered_key(pg_ymin));
+                        ext[e + 2].fetch_min(ordered_key(pg_zmin));
+                        ext[e + 3].fetch_max(ordered_key(pg_zmax));
+                        if any_survivor {
+                            ext[e + 4].fetch_min(ordered_key(ink_xmin));
+                            ext[e + 5].fetch_min(ordered_key(ink_ymin));
+                            ext[e + 6].fetch_max(ordered_key(ink_rmax));
+                            ext[e + 7].fetch_max(ordered_key(ink_ymax));
+                            ext[e + 8].fetch_min(ordered_key(ink_zmin));
+                            ext[e + 9].fetch_max(ordered_key(ink_zmax));
+                        }
                     }
                     pg_rmax = f32::new(0.0f32);
                     pg_ymin = f32::new(0.0f32);
@@ -569,15 +623,6 @@ pub(super) fn extent_fold(
                     any_leader = false;
                     any_survivor = false;
                 }
-                if id == hi {
-                    break;
-                }
-                // Advance past the boundary — a WHILE, not an if: empty
-                // items share their start with the next item, and a
-                // single-step advance misassigns the boundary byte's leader
-                // to the empty item's lanes (found by the repo-verify seam
-                // on g-pick-repo's empty.rs — the fork fixture then had no
-                // empty file; it does now).
                 while nxt <= id {
                     it += 1;
                     nxt = if it + 1 < item_count { ir[(it + 1) * 2] as usize } else { n };
@@ -626,7 +671,65 @@ pub(super) fn extent_fold(
                     }
                 }
             }
-            id += 1;
+            k += 1;
+        }
+
+        if any_leader {
+            let slot = it - it_base;
+            if slot < RESOLVE_SLOTS {
+                sflags[slot].fetch_or(if any_survivor { 3u32 } else { 1u32 });
+                let e = slot * EXT_STRIDE;
+                sext[e].fetch_max(ordered_key(pg_rmax));
+                sext[e + 1].fetch_min(ordered_key(pg_ymin));
+                sext[e + 2].fetch_min(ordered_key(pg_zmin));
+                sext[e + 3].fetch_max(ordered_key(pg_zmax));
+                if any_survivor {
+                    sext[e + 4].fetch_min(ordered_key(ink_xmin));
+                    sext[e + 5].fetch_min(ordered_key(ink_ymin));
+                    sext[e + 6].fetch_max(ordered_key(ink_rmax));
+                    sext[e + 7].fetch_max(ordered_key(ink_ymax));
+                    sext[e + 8].fetch_min(ordered_key(ink_zmin));
+                    sext[e + 9].fetch_max(ordered_key(ink_zmax));
+                }
+            } else {
+                let e = it * EXT_STRIDE;
+                ext[e].fetch_max(ordered_key(pg_rmax));
+                ext[e + 1].fetch_min(ordered_key(pg_ymin));
+                ext[e + 2].fetch_min(ordered_key(pg_zmin));
+                ext[e + 3].fetch_max(ordered_key(pg_zmax));
+                if any_survivor {
+                    ext[e + 4].fetch_min(ordered_key(ink_xmin));
+                    ext[e + 5].fetch_min(ordered_key(ink_ymin));
+                    ext[e + 6].fetch_max(ordered_key(ink_rmax));
+                    ext[e + 7].fetch_max(ordered_key(ink_ymax));
+                    ext[e + 8].fetch_min(ordered_key(ink_zmin));
+                    ext[e + 9].fetch_max(ordered_key(ink_zmax));
+                }
+            }
+        }
+    }
+
+    sync_cube();
+    if u < RESOLVE_SLOTS {
+        let it = it_base + u;
+        if it < item_count {
+            let flags = sflags[u].load();
+            if (flags & 1u32) != 0 {
+                let se = u * EXT_STRIDE;
+                let e = it * EXT_STRIDE;
+                ext[e].fetch_max(sext[se].load());
+                ext[e + 1].fetch_min(sext[se + 1].load());
+                ext[e + 2].fetch_min(sext[se + 2].load());
+                ext[e + 3].fetch_max(sext[se + 3].load());
+                if (flags & 2u32) != 0 {
+                    ext[e + 4].fetch_min(sext[se + 4].load());
+                    ext[e + 5].fetch_min(sext[se + 5].load());
+                    ext[e + 6].fetch_max(sext[se + 6].load());
+                    ext[e + 7].fetch_max(sext[se + 7].load());
+                    ext[e + 8].fetch_min(sext[se + 8].load());
+                    ext[e + 9].fetch_max(sext[se + 9].load());
+                }
+            }
         }
     }
 }

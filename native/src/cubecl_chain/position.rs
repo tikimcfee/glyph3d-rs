@@ -304,8 +304,15 @@ pub(super) fn extent_pair(
                 let mut widest = 0.0f32;
                 let mut count = 0usize;
                 let mut id = b;
+                let mut cur_word_idx = id >> 2;
+                let mut fl_word = fl[cur_word_idx];
                 while id < stop {
-                    let f = flags_at(fl, id);
+                    let word_idx = id >> 2;
+                    if word_idx != cur_word_idx {
+                        fl_word = fl[word_idx];
+                        cur_word_idx = word_idx;
+                    }
+                    let f = (fl_word >> (((id & 3) * 8) as u32)) & 0xFF;
                     if (f & F_LEADER) != 0 {
                         // The compare set is the running sum BEFORE this
                         // glyph's own advance — the stored-x rule.
@@ -325,7 +332,9 @@ pub(super) fn extent_pair(
                     }
                     id += 1;
                 }
-                extent_words[lo * 2].fetch_max(ordered_key(widest));
+                if widest > 0.0f32 {
+                    extent_words[lo * 2].fetch_max(ordered_key(widest));
+                }
             }
         }
     }
