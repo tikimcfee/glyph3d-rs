@@ -3,21 +3,60 @@
 //! Converts an [`AgentSession`] and its accompanying [`RevisionEngine`]
 //! into a [`StagedText`] package ready for the Slug renderer.
 
-use crate::agent_transcript::AgentSession;
+use crate::agent_transcript::{AgentSession, AgentTurn};
 use crate::atlas::Atlas;
 use crate::glyph_scene::{GlyphInstance, GroupRow};
 use crate::layout::GlyphArena;
 use crate::layout_stack::LayoutController;
 use crate::repo::{RepoLayoutMode, RepoParams};
-use crate::revision::RevisionEngine;
+use crate::revision::{FileRevision, RevisionEngine};
+use crate::spatial_scene::GlyphGroupBinding;
 use crate::text::{cover_segment, pack_rgba8, StagedText, CELL_HEIGHT_WORLD, LINE_HEIGHT_FACTOR};
 
+/// Wrap prose into lines with a maximum column width, breaking at spaces when possible.
+fn wrap_prose(text: &str, max_cols: usize) -> Vec<String> {
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let trimmed = line.trim_end();
+        if trimmed.is_empty() {
+            out.push(String::new());
+            continue;
+        }
+        let mut cur = String::new();
+        for word in trimmed.split_whitespace() {
+            if cur.is_empty() {
+                if word.len() > max_cols {
+                    out.push(word[..max_cols].to_string());
+                    cur = word[max_cols..].to_string();
+                } else {
+                    cur.push_str(word);
+                }
+            } else if cur.len() + 1 + word.len() <= max_cols {
+                cur.push(' ');
+                cur.push_str(word);
+            } else {
+                out.push(cur);
+                if word.len() > max_cols {
+                    out.push(word[..max_cols].to_string());
+                    cur = word[max_cols..].to_string();
+                } else {
+                    cur = word.to_string();
+                }
+            }
+        }
+        if !cur.is_empty() {
+            out.push(cur);
+        }
+    }
+    out
+}
+
+/// Lay out colored text lines into glyph instances.
 #[allow(clippy::too_many_arguments)]
-fn layout_string(
+fn layout_colored_lines(
     atlas: &Atlas,
-    text: &str,
+    lines: &[(String, [u8; 3])],
     start_pos: [f32; 3],
-    color: [u8; 3],
     max_cols: usize,
     max_lines: usize,
     group_id: u32,
@@ -28,8 +67,7 @@ fn layout_string(
     let cell_w = atlas.metrics.advance_fu as f32 / fu_per_world;
     let line_h = CELL_HEIGHT_WORLD * LINE_HEIGHT_FACTOR;
 
-    let mut row = 0;
-    for line in text.lines().take(max_lines) {
+    for (row, (line, color)) in lines.iter().take(max_lines).enumerate() {
         let mut col = 0;
         for ch in line.chars().take(max_cols) {
             *codepoints_decoded += 1;
@@ -48,7 +86,7 @@ fn layout_string(
                     glyph_id: entry.glyph_id,
                     row: row as u32,
                     col: col as u32,
-                    color: pack_rgba8(color, 255),
+                    color: pack_rgba8(*color, 255),
                     group_id,
                     advance: cell_w,
                     height: CELL_HEIGHT_WORLD,
@@ -58,8 +96,254 @@ fn layout_string(
             }
             col += 1;
         }
-        row += 1;
     }
+}
+
+/// Format the Left Page (Mind) of a 2-page Agent Turn Card.
+fn format_turn_left_page(turn: &AgentTurn) -> Vec<(String, [u8; 3])> {
+    let mut lines = Vec::new();
+
+    // 1. Header banner
+    lines.push((
+        format!("TURN {}: {}", turn.turn_index + 1, turn.summary()),
+        [255, 255, 255],
+    ));
+    lines.push((
+        format!(
+            "Mind • {} tool call(s) • {} think block(s)",
+            turn.tool_calls.len(),
+            turn.thinking.len()
+        ),
+        [150, 175, 205],
+    ));
+    lines.push((
+        "─────────────────────────────────────────────────────────────".to_string(),
+        [70, 90, 115],
+    ));
+
+    // 2. User Prompt
+    lines.push(("[ USER PROMPT ]".to_string(), [130, 235, 215]));
+    if let Some(ref prompt) = turn.prompt {
+        for l in wrap_prose(prompt, 72).into_iter().take(11) {
+            lines.push((format!("  {l}"), [215, 225, 235]));
+        }
+    } else {
+        lines.push(("  (No user prompt in this turn)".to_string(), [130, 145, 160]));
+    }
+
+    lines.push((
+        "─────────────────────────────────────────────────────────────".to_string(),
+        [70, 90, 115],
+    ));
+
+    // 3. Reasoning / Chain of Thought
+    lines.push((
+        "[ CHAIN OF THOUGHT / REASONING ]".to_string(),
+        [250, 210, 100],
+    ));
+    let thinking_text = turn.combined_thinking();
+    if !thinking_text.is_empty() {
+        for l in wrap_prose(&thinking_text, 72).into_iter().take(22) {
+            lines.push((format!("  {l}"), [240, 230, 210]));
+        }
+    } else {
+        lines.push((
+            "  (No internal chain-of-thought logged in transcript)".to_string(),
+            [130, 145, 160],
+        ));
+    }
+
+    lines
+}
+
+/// Format the Right Page (Material Impact) of a 2-page Agent Turn Card.
+fn format_turn_right_page(turn: &AgentTurn) -> Vec<(String, [u8; 3])> {
+    let mut lines = Vec::new();
+
+    // 1. Header banner
+    lines.push((
+        format!("TURN {} MATERIAL IMPACT", turn.turn_index + 1),
+        [120, 245, 160],
+    ));
+    lines.push((
+        format!(
+            "Impact • {} file action(s) • {} tool invocation(s)",
+            turn.file_actions.len(),
+            turn.tool_calls.len()
+        ),
+        [140, 185, 160],
+    ));
+    lines.push((
+        "─────────────────────────────────────────────────────────────".to_string(),
+        [70, 90, 115],
+    ));
+
+    // 2. Touched Files
+    lines.push((
+        format!("[ TOUCHED FILES ({}) ]", turn.file_actions.len()),
+        [140, 240, 175],
+    ));
+    if turn.file_actions.is_empty() {
+        lines.push((
+            "  • No file modifications in this turn".to_string(),
+            [130, 145, 160],
+        ));
+    } else {
+        for fa in turn.file_actions.iter().take(6) {
+            let (tag, color) = match fa.action {
+                crate::spatial_scene::workdesk::FileActionKind::Edit => ("Edit", [250, 200, 90]),
+                crate::spatial_scene::workdesk::FileActionKind::Write => ("Write", [120, 240, 150]),
+                crate::spatial_scene::workdesk::FileActionKind::Read => ("Read", [130, 210, 250]),
+                crate::spatial_scene::workdesk::FileActionKind::AstAnalysis => ("Ast", [215, 155, 250]),
+            };
+            let diff_note = if !fa.hunks.is_empty() {
+                let added: usize = fa
+                    .hunks
+                    .iter()
+                    .map(|h| h.lines.iter().filter(|l| l.starts_with('+')).count())
+                    .sum();
+                let removed: usize = fa
+                    .hunks
+                    .iter()
+                    .map(|h| h.lines.iter().filter(|l| l.starts_with('-')).count())
+                    .sum();
+                format!(" (+{added} -{removed})")
+            } else {
+                String::new()
+            };
+            let summary_suffix = if !fa.summary.is_empty() {
+                format!(" — {}", fa.summary)
+            } else {
+                String::new()
+            };
+            lines.push((
+                format!("  • {tag} {}{diff_note}{summary_suffix}", fa.file_path),
+                color,
+            ));
+        }
+    }
+
+    lines.push((
+        "─────────────────────────────────────────────────────────────".to_string(),
+        [70, 90, 115],
+    ));
+
+    // 3. Assistant Response
+    lines.push(("[ ASSISTANT RESPONSE ]".to_string(), [250, 252, 255]));
+    let assistant_text = turn.combined_assistant_text();
+    if !assistant_text.is_empty() {
+        for l in wrap_prose(&assistant_text, 72).into_iter().take(18) {
+            lines.push((format!("  {l}"), [220, 235, 245]));
+        }
+    } else {
+        lines.push((
+            "  (No assistant text message recorded in this turn)".to_string(),
+            [130, 145, 160],
+        ));
+    }
+
+    // 4. Tool Invocations
+    if !turn.tool_calls.is_empty() {
+        lines.push((
+            format!("[ TOOL INVOCATIONS ({}) ]", turn.tool_calls.len()),
+            [130, 205, 245],
+        ));
+        for tc in turn.tool_calls.iter().take(6) {
+            let status = if tc.is_error { "error" } else { "ok" };
+            lines.push((format!("  • {} [{status}]", tc.name), [185, 215, 235]));
+        }
+    }
+
+    lines
+}
+
+/// Format a Workdesk File Revision Card ($R_k$).
+fn format_revision_card(rev: &FileRevision, file_path: &str) -> Vec<(String, [u8; 3])> {
+    let mut lines = Vec::new();
+
+    // 1. Header line
+    let (action_str, color) = match rev.action {
+        crate::spatial_scene::workdesk::FileActionKind::Edit => ("Edit", [250, 195, 80]),
+        crate::spatial_scene::workdesk::FileActionKind::Write => ("Write", [110, 240, 150]),
+        crate::spatial_scene::workdesk::FileActionKind::Read => ("Read", [120, 210, 250]),
+        crate::spatial_scene::workdesk::FileActionKind::AstAnalysis => ("Ast", [210, 155, 250]),
+    };
+    lines.push((
+        format!("R{} • {action_str} • {file_path}", rev.revision_index),
+        color,
+    ));
+
+    // 2. Subheader line
+    lines.push((
+        format!(
+            "Turn {} | {} lines | +{} -{}",
+            rev.turn_index + 1,
+            rev.line_count(),
+            rev.diff_stats.added,
+            rev.diff_stats.removed
+        ),
+        [150, 170, 190],
+    ));
+
+    // 3. Divider
+    lines.push((
+        "─────────────────────────────────────────────────────────────".to_string(),
+        [70, 85, 105],
+    ));
+
+    // 4. Diffs or Snapshot
+    if !rev.hunks.is_empty() {
+        for hunk in &rev.hunks {
+            if lines.len() >= 26 {
+                break;
+            }
+            lines.push((
+                format!(
+                    "@@ -{},{} +{},{} @@",
+                    hunk.old_start, hunk.old_lines, hunk.new_start, hunk.new_lines
+                ),
+                [100, 195, 255],
+            ));
+            for hl in &hunk.lines {
+                if lines.len() >= 26 {
+                    break;
+                }
+                if hl.starts_with('+') {
+                    lines.push((hl.clone(), [120, 245, 140]));
+                } else if hl.starts_with('-') {
+                    lines.push((hl.clone(), [245, 120, 120]));
+                } else {
+                    lines.push((hl.clone(), [200, 210, 220]));
+                }
+            }
+        }
+
+        // Context snapshot after edit if space remains
+        if lines.len() < 20 && !rev.text.is_empty() {
+            lines.push((
+                "── [ Snapshot after edit ] ──────────────────────────────".to_string(),
+                [80, 95, 115],
+            ));
+            let remaining = 26usize.saturating_sub(lines.len());
+            for (line_idx, l) in rev.text.lines().take(remaining).enumerate() {
+                lines.push((format!("{:3} | {}", line_idx + 1, l), [215, 225, 235]));
+            }
+        }
+    } else {
+        // Base / whole-file snapshot
+        if rev.text.is_empty() {
+            lines.push((
+                "  (Empty file or no snapshot captured)".to_string(),
+                [130, 140, 155],
+            ));
+        } else {
+            for (line_idx, l) in rev.text.lines().take(22).enumerate() {
+                lines.push((format!("{:3} | {}", line_idx + 1, l), [225, 230, 240]));
+            }
+        }
+    }
+
+    lines
 }
 
 /// Stage an Agent Session and its Workdesk into a visual 3D scene.
@@ -108,128 +392,132 @@ pub fn stage_agent_session(
     let mut codepoints_decoded = 0;
 
     if let Some(atlas) = atlas {
-        // Lay out text for active turn card and workdesk file stacks
-        if let Some(turn) = session.turns.first() {
-            // Turn title on Left Page (Mind Header)
-            let title = format!("Turn {}: {}", turn.turn_index + 1, turn.summary());
-            layout_string(
-                atlas,
-                &title,
-                [-128.0, -3.8, 0.2],
-                [240, 245, 255],
-                65,
-                1,
-                0,
-                &mut raw_instances,
-                &mut codepoints_decoded,
-            );
+        // 1. Lay out Turn Deck Turn Cards (queried directly from ECS with their bound group_id)
+        let mut turn_query = controller
+            .scene
+            .world
+            .query::<(&crate::spatial_scene::AgentTurnCard, &GlyphGroupBinding)>();
+        let turn_cards: Vec<(crate::spatial_scene::AgentTurnCard, GlyphGroupBinding)> = turn_query
+            .iter(&controller.scene.world)
+            .map(|(c, b)| (c.clone(), b.clone()))
+            .collect();
 
-            // Mind Body: Prompt preview
-            if let Some(ref prompt) = turn.prompt {
-                layout_string(
+        for (card, binding) in turn_cards {
+            if let Some(turn) = session.turns.get(card.turn_index) {
+                // Left Page (Mind)
+                let left_lines = format_turn_left_page(turn);
+                layout_colored_lines(
                     atlas,
-                    prompt,
-                    [-128.0, -7.5, 0.2],
-                    [200, 205, 215],
-                    55,
-                    20,
-                    0,
+                    &left_lines,
+                    [-54.0, -2.8, 0.2],
+                    75,
+                    42,
+                    binding.group_id,
+                    &mut raw_instances,
+                    &mut codepoints_decoded,
+                );
+
+                // Right Page (Impact)
+                let right_lines = format_turn_right_page(turn);
+                layout_colored_lines(
+                    atlas,
+                    &right_lines,
+                    [5.0, -2.8, 0.2],
+                    75,
+                    42,
+                    binding.group_id,
                     &mut raw_instances,
                     &mut codepoints_decoded,
                 );
             }
+        }
 
-            // Right Page (Impact Header)
-            let touched_summary = if turn.file_actions.is_empty() {
-                "Material Impact: No files touched".to_string()
-            } else {
-                format!("Material Impact: {} file(s) touched", turn.file_actions.len())
-            };
-            layout_string(
-                atlas,
-                &touched_summary,
-                [-70.0, -3.8, 0.2],
-                [180, 235, 190],
-                65,
-                1,
-                0,
-                &mut raw_instances,
-                &mut codepoints_decoded,
-            );
+        // 2. Lay out Workdesk Stack Title Labels (queried directly from ECS)
+        let mut stack_query = controller.scene.world.query::<(
+            &crate::spatial_scene::FileRevisionStack,
+            &bevy_transform::prelude::GlobalTransform,
+        )>();
+        let stacks: Vec<(crate::spatial_scene::FileRevisionStack, glam::Vec3)> = stack_query
+            .iter(&controller.scene.world)
+            .map(|(s, g)| (s.clone(), g.translation()))
+            .collect();
 
-            // Right Page Body: Touched files & tool calls
-            let mut impact_lines = Vec::new();
-            for tf in &turn.file_actions {
-                let action_str = match tf.action {
-                    crate::spatial_scene::workdesk::FileActionKind::Write => "Write",
-                    crate::spatial_scene::workdesk::FileActionKind::Edit => "Edit",
-                    crate::spatial_scene::workdesk::FileActionKind::Read => "Read",
-                    crate::spatial_scene::workdesk::FileActionKind::AstAnalysis => "Ast",
-                };
-                let summary_suffix = if !tf.summary.is_empty() {
-                    format!(" — {}", tf.summary)
-                } else {
-                    String::new()
-                };
-                impact_lines.push(format!("• {} {}{}", action_str, tf.file_path, summary_suffix));
-            }
-            if impact_lines.is_empty() && !turn.tool_calls.is_empty() {
-                for tc in turn.tool_calls.iter().take(8) {
-                    impact_lines.push(format!("• Tool: {}", tc.name));
-                }
-            }
-            let impact_text = impact_lines.join("\n");
-            layout_string(
+        for (stack, trans) in stacks {
+            let rev_count = revision_engine
+                .history(&stack.file_path)
+                .map(|h| h.revisions.len())
+                .unwrap_or(stack.revision_count);
+            let label = format!("{} (R{})", stack.file_path, rev_count);
+            layout_colored_lines(
                 atlas,
-                &impact_text,
-                [-70.0, -7.5, 0.2],
-                [200, 210, 220],
+                &[(label, [250, 245, 230])],
+                [trans.x + 1.0, trans.y + 38.0 + 2.0, trans.z + 0.2],
                 55,
-                20,
+                1,
                 0,
                 &mut raw_instances,
                 &mut codepoints_decoded,
             );
         }
 
-        // Workdesk: Label each file stack with its file name and revision indicator
-        let splay_cols = 4;
-        let file_spacing = [60.0, 45.0];
-        let file_paths = revision_engine.file_paths();
-        for (i, path) in file_paths.iter().enumerate() {
-            let col = i % splay_cols;
-            let row = i / splay_cols;
-            let stack_x = 75.0 + col as f32 * file_spacing[0];
-            let stack_y = -(row as f32 * file_spacing[1]);
+        // 3. Lay out Workdesk File Revision Cards (queried directly from ECS with their bound group_id)
+        let mut rev_query = controller
+            .scene
+            .world
+            .query::<(&crate::spatial_scene::FileRevisionCard, &GlyphGroupBinding, &bevy_transform::prelude::GlobalTransform)>();
+        let rev_cards: Vec<(crate::spatial_scene::FileRevisionCard, GlyphGroupBinding, glam::Vec3)> = rev_query
+            .iter(&controller.scene.world)
+            .map(|(c, b, g)| {
+                (c.clone(), b.clone(), g.translation())
+            })
+            .collect();
 
-            // File label above stack
-            let rev_count = revision_engine.history(path).map(|h| h.revisions.len()).unwrap_or(1);
-            let label = format!("{path} (R{})", rev_count);
-            layout_string(
-                atlas,
-                &label,
-                [stack_x - 26.0, stack_y + 2.5, 0.2],
-                [250, 245, 230],
-                45,
-                1,
-                0,
-                &mut raw_instances,
-                &mut codepoints_decoded,
-            );
+        for (card, binding, _trans) in rev_cards {
+            if let Some(history) = revision_engine.history(&card.file_path) {
+                if let Some(rev) = history.get(card.revision_index) {
+                    let rev_lines = format_revision_card(rev, &card.file_path);
+                    layout_colored_lines(
+                        atlas,
+                        &rev_lines,
+                        [2.0, -2.5, 0.2],
+                        80,
+                        26,
+                        binding.group_id,
+                        &mut raw_instances,
+                        &mut codepoints_decoded,
+                    );
+                }
+            }
         }
     }
 
     let glyphs_emitted = raw_instances.len();
-    let segments = vec![cover_segment(
+    let mut cover = cover_segment(
         &raw_instances,
         bounds_min,
         bounds_max,
         slot_ink,
-    )];
+    );
+    // In agent carrel mode, glyph instances belong to dynamic ECS groups whose
+    // world positions are transformed on the GPU via group rows. Sub-block culling
+    // on untransformed local coordinates would falsely reject cards translated away
+    // from the origin. Clearing blocks keeps segment-level culling over the full carrel.
+    cover.blocks.clear();
+    let segments = vec![cover];
     let instances = GlyphArena::from_vec(raw_instances);
 
-    // Ensure at least one identity group exists for GPU group buffer allocation
-    let groups = vec![GroupRow::identity([0.0, 0.0, 0.0])];
+    // Synchronize all ECS groups into the GPU group buffer
+    let max_gid = controller
+        .scene
+        .world
+        .query::<&GlyphGroupBinding>()
+        .iter(&controller.scene.world)
+        .map(|b| b.group_id)
+        .max()
+        .unwrap_or(0);
+    let total_groups = (max_gid + 1) as usize;
+    let mut groups = vec![GroupRow::identity([0.0, 0.0, 0.0]); total_groups.max(1)];
+    controller.scene.sync_all_to_group_rows(&mut groups);
 
     StagedText {
         instances,

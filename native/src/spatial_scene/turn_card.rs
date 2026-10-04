@@ -88,7 +88,7 @@ impl SpatialScene {
             ))
             .id();
 
-        // Left Page Content (Mind): Header band + reasoning bars
+        // Left Page Content (Mind): Header band
         self.world.spawn((
             Transform::from_translation(Vec3::new(0.0, 0.0, 0.1)),
             ChildOf(left_page),
@@ -102,29 +102,6 @@ impl SpatialScene {
                 params: [0.0, 0.0, 0.0, 0.0],
             },
         ));
-
-        let mind_lines = [
-            (page_size[0] - 10.0, -11.0, [0.45, 0.52, 0.68, 0.85]),
-            (page_size[0] - 18.0, -15.5, [0.38, 0.45, 0.58, 0.80]),
-            (page_size[0] - 12.0, -20.0, [0.38, 0.45, 0.58, 0.80]),
-            (page_size[0] - 24.0, -24.5, [0.34, 0.40, 0.52, 0.75]),
-            (page_size[0] - 14.0, -29.0, [0.30, 0.36, 0.48, 0.70]),
-        ];
-        for (w, y, col) in mind_lines {
-            self.world.spawn((
-                Transform::from_translation(Vec3::new(0.0, 0.0, 0.1)),
-                ChildOf(left_page),
-                Name::new("mind_content_line"),
-                SceneMeshKind::Quad {
-                    size: [w, 2.0],
-                    origin: [-half_w + 5.0, y],
-                },
-                SceneMeshMaterial {
-                    color: col,
-                    params: [0.0, 0.0, 0.0, 0.0],
-                },
-            ));
-        }
 
         // 2. Right Page (Material Impact)
         let right_trans = Transform::from_translation(Vec3::new(half_w + half_gap, 0.0, 0.0));
@@ -151,7 +128,7 @@ impl SpatialScene {
             ))
             .id();
 
-        // Right Page Content (Material Impact): Header band + diff lines (green additions, red deletions)
+        // Right Page Content (Material Impact): Header band
         self.world.spawn((
             Transform::from_translation(Vec3::new(0.0, 0.0, 0.1)),
             ChildOf(right_page),
@@ -165,29 +142,6 @@ impl SpatialScene {
                 params: [0.0, 0.0, 0.0, 0.0],
             },
         ));
-
-        let impact_lines = [
-            (page_size[0] - 10.0, -11.0, [0.42, 0.45, 0.50, 0.75]),
-            (page_size[0] - 16.0, -15.5, [0.65, 0.25, 0.25, 0.90]),
-            (page_size[0] -  8.0, -20.0, [0.25, 0.65, 0.35, 0.90]),
-            (page_size[0] - 12.0, -24.5, [0.25, 0.65, 0.35, 0.90]),
-            (page_size[0] - 20.0, -29.0, [0.42, 0.45, 0.50, 0.75]),
-        ];
-        for (w, y, col) in impact_lines {
-            self.world.spawn((
-                Transform::from_translation(Vec3::new(0.0, 0.0, 0.1)),
-                ChildOf(right_page),
-                Name::new("impact_content_line"),
-                SceneMeshKind::Quad {
-                    size: [w, 2.0],
-                    origin: [-half_w + 5.0, y],
-                },
-                SceneMeshMaterial {
-                    color: col,
-                    params: [0.0, 0.0, 0.0, 0.0],
-                },
-            ));
-        }
 
         // 3. Spine separator plate (visual hinge)
         if spine_gap > 0.0 {

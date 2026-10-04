@@ -115,11 +115,37 @@ pub fn parse_antigravity_session(text: &str, session_id: &str) -> AgentSession {
             .and_then(parse_iso_ts);
         update_ts(&mut session, ts);
 
+        if session.cwd.is_none() {
+            if let Some(cwd) = obj.get("cwd").and_then(|v| v.as_str()) {
+                if !cwd.is_empty() {
+                    session.cwd = Some(cwd.to_string());
+                }
+            } else if let Some(uris) = obj.get("workspaceUris").and_then(|v| v.as_array()) {
+                if let Some(first_uri) = uris.first().and_then(|v| v.as_str()) {
+                    let clean = first_uri.strip_prefix("file://").unwrap_or(first_uri);
+                    if !clean.is_empty() {
+                        session.cwd = Some(clean.to_string());
+                    }
+                }
+            }
+        }
+
         match step_type {
             "USER_INPUT" => {
                 let content = obj.get("content").and_then(|v| v.as_str()).unwrap_or("");
                 let trimmed = content.trim();
                 if !trimmed.is_empty() {
+                    if session.cwd.is_none() && trimmed.contains("->") {
+                        for l in trimmed.lines() {
+                            if let Some((left, _)) = l.split_once("->") {
+                                let candidate = left.trim();
+                                if candidate.starts_with('/') && std::path::Path::new(candidate).is_dir() {
+                                    session.cwd = Some(candidate.to_string());
+                                    break;
+                                }
+                            }
+                        }
+                    }
                     if has_emitted_in_turn {
                         session.turns.push(current_turn);
                         current_turn = AgentTurn::new(session.turns.len());

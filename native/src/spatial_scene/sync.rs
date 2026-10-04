@@ -121,4 +121,31 @@ impl SpatialScene {
 
         updated
     }
+
+    /// Populate all entities with a `GlyphGroupBinding` into the GPU `GroupRow` buffer unconditionally.
+    pub fn sync_all_to_group_rows(&mut self, groups: &mut [GroupRow]) {
+        let mut query = self.world.query::<(
+            &GlobalTransform,
+            &GlyphGroupBinding,
+            Option<&Visible>,
+        )>();
+
+        for (gtf, binding, vis) in query.iter(&self.world) {
+            if let Some(v) = vis {
+                if !v.0 {
+                    continue;
+                }
+            }
+
+            let idx = binding.group_id as usize;
+            if idx < groups.len() {
+                let (scale, rotation, translation) = gtf.to_scale_rotation_translation();
+                let g = &mut groups[idx];
+                g.cols[0] = [translation.x, translation.y, translation.z, 0.0];
+                g.cols[1] = [rotation.x, rotation.y, rotation.z, rotation.w];
+                g.cols[2] = binding.tint;
+                g.cols[3] = [scale.x, scale.y, scale.z, 0.0];
+            }
+        }
+    }
 }

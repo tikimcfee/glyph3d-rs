@@ -459,3 +459,60 @@ fn test_stage_agent_session_creates_controller_and_navigates() {
     assert!(jump_msg.contains("jump to turn 2/2"));
 }
 
+#[test]
+fn test_stage_agent_session_formats_and_populates_text() {
+    use super::{parse_claude_session, stage_agent_session};
+    use crate::revision::RevisionEngine;
+
+    let transcript = vec![
+        json!({
+            "type": "user",
+            "message": { "role": "user", "content": [{ "type": "text", "text": "Plan refactor for rendering" }] }
+        }).to_string(),
+        json!({
+            "type": "assistant",
+            "message": {
+                "role": "assistant",
+                "content": [
+                    { "type": "thinking", "thinking": "We should first inspect the scene graph and then apply deltas." },
+                    { "type": "text", "text": "I will inspect the workspace and begin the refactor." },
+                    { "type": "tool_use", "id": "t1", "name": "Write", "input": { "file_path": "main.rs", "content": "fn main() {\n    println!(\"hello\");\n}\n" } }
+                ]
+            }
+        }).to_string(),
+        json!({
+            "type": "user",
+            "toolUseResult": { "type": "create", "filePath": "main.rs", "content": "fn main() {\n    println!(\"hello\");\n}\n" },
+            "message": { "role": "user", "content": [{ "type": "tool_result", "tool_use_id": "t1" }] }
+        }).to_string(),
+        json!({
+            "type": "user",
+            "message": { "role": "user", "content": [{ "type": "text", "text": "Change greeting to hello world" }] }
+        }).to_string(),
+        json!({
+            "type": "assistant",
+            "message": {
+                "role": "assistant",
+                "content": [
+                    { "type": "thinking", "thinking": "Replacing hello with hello world in main.rs." },
+                    { "type": "text", "text": "Replaced greeting." },
+                    { "type": "tool_use", "id": "t2", "name": "Edit", "input": { "file_path": "main.rs", "old_string": "hello", "new_string": "hello world" } }
+                ]
+            }
+        }).to_string(),
+        json!({
+            "type": "user",
+            "toolUseResult": { "filePath": "main.rs", "structuredPatch": [{ "oldStart": 2, "oldLines": 1, "newStart": 2, "newLines": 1, "lines": ["-    println!(\"hello\");", "+    println!(\"hello world\");"] }] },
+            "message": { "role": "user", "content": [{ "type": "tool_result", "tool_use_id": "t2" }] }
+        }).to_string(),
+    ].join("\n");
+
+    let session = parse_claude_session(&transcript, "text_sess");
+    let mut rev_engine = RevisionEngine::new();
+    rev_engine.ingest_session(&session);
+
+    let staged = stage_agent_session(None, &[], session, rev_engine);
+    // Groups allocated for: identity(0) + Turn0(1) + Turn1(2) + Rev0(3) + Rev1(4)
+    assert!(staged.groups.len() >= 5);
+}
+

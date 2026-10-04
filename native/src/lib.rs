@@ -283,7 +283,34 @@ fn build_scene_impl(
                     agent_transcript::AgentSession::new(agent_transcript::HarnessKind::ClaudeCode, session_id)
                 }
             };
-            let mut rev_engine = revision::RevisionEngine::new();
+            let cwd_opt = session.cwd.clone();
+            let cur_dir = std::env::current_dir().ok();
+
+            let mut rev_engine = revision::RevisionEngine::new().with_disk_resolver(move |rel_path: &str| {
+                let p = std::path::Path::new(rel_path);
+                if p.is_absolute() && p.is_file() {
+                    if let Ok(content) = std::fs::read_to_string(p) {
+                        return Some(content);
+                    }
+                }
+                if let Some(ref cwd) = cwd_opt {
+                    let full = std::path::Path::new(cwd).join(rel_path);
+                    if full.is_file() {
+                        if let Ok(content) = std::fs::read_to_string(&full) {
+                            return Some(content);
+                        }
+                    }
+                }
+                if let Some(ref cur) = cur_dir {
+                    let full = cur.join(rel_path);
+                    if full.is_file() {
+                        if let Ok(content) = std::fs::read_to_string(&full) {
+                            return Some(content);
+                        }
+                    }
+                }
+                None
+            });
             rev_engine.ingest_session(&session);
 
             let atlas = atlas::Atlas::load(ctx, emoji_sheet);

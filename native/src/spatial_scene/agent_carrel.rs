@@ -60,7 +60,7 @@ impl SpatialScene {
         let deck_entity = self.spawn_deck(deck_parent, "turn_deck", deck);
 
         // Spawn 2-page Agent Turn Cards for each turn
-        for turn in &session.turns {
+        for (i, turn) in session.turns.iter().enumerate() {
             let card_entity = self.spawn_agent_turn_card(
                 deck_entity,
                 turn.turn_index,
@@ -68,6 +68,12 @@ impl SpatialScene {
                 4.0,
                 turn.summary(),
             );
+
+            let card_group_id = 1 + i as u32;
+            self.world.entity_mut(card_entity).insert(super::GlyphGroupBinding {
+                group_id: card_group_id,
+                tint: [1.0, 1.0, 1.0, 1.0],
+            });
 
             // Left Page content: Prompt banner
             if let Some(ref p) = turn.prompt {
@@ -97,17 +103,24 @@ impl SpatialScene {
         );
 
         // Populate Workdesk with FileRevisionStacks from RevisionEngine
+        let mut next_rev_gid = (turn_count + 1) as u32;
         for path in revision_engine.file_paths() {
             if let Some(history) = revision_engine.history(&path) {
                 for rev in &history.revisions {
                     let card_size = [55.0, 38.0];
-                    self.workdesk_push_revision(
+                    let card_e = self.workdesk_push_revision(
                         workdesk_entity,
                         &path,
                         rev.action,
                         card_size,
                         &rev.summary,
                     );
+                    let rev_group_id = next_rev_gid;
+                    next_rev_gid += 1;
+                    self.world.entity_mut(card_e).insert(super::GlyphGroupBinding {
+                        group_id: rev_group_id,
+                        tint: [1.0, 1.0, 1.0, 1.0],
+                    });
                 }
             }
         }
