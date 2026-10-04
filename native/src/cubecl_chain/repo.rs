@@ -1,23 +1,15 @@
-use cubecl::prelude::*;
-use cubecl::wgpu::{AutoCompiler, AutoGraphicsApi, GraphicsApi, WgpuServer, WgpuSetup};
+use cubecl::wgpu::{AutoGraphicsApi, GraphicsApi, WgpuSetup};
 
-use crate::fold::WrapMode;
-use crate::text::ResolveGlyph;
-
-use super::cluster::{
-    cand_scatter, cluster_host_inputs, cluster_mark, cluster_pair_filter, cluster_probe,
-    count_spine, count_tile, item_roots, jump_build, rank_step,
-};
-use super::decode::decode;
-use super::position::{derive_stride, extent_pair, resolve_x};
-use super::scan::{apply, spine_scan, tile_scan};
-use super::tail::{
-    EXT_STRIDE, emit_records, extent_fold, item_totals, ordinal_scatter,
-    ordered_key_host, scatter_slots, sv_count_spine, sv_count_tile,
-};
-use super::{IE_STRIDE, IM_STRIDE, LC_STRIDE, LM_STRIDE, PARTIAL_COUNT_STRIDE, pack_words};
-
+mod buffers;
+mod dispatch;
+mod prep;
+mod tail_emit;
 mod tail_readback;
+
+use buffers::allocate_chain_buffers;
+use dispatch::{launch_block1, launch_block2, resolve_candidates, ChainProfiler};
+use prep::prepare_chain_inputs;
+use tail_emit::{emit_records_chunked, package_slot_device, scatter_slots_direct};
 use tail_readback::{decode_placements, read_tint_store_host, read_tint_store_unified};
 
 // ── the repo parity driver — phase 4, rung 3 ─────────────────────────────────
@@ -148,7 +140,6 @@ pub(crate) struct ChainStream {
     pub phases: ChainPhases,
 }
 
-#[allow(clippy::too_many_lines)]
 pub(crate) fn run_repo_chain(
     device: Option<&SharedDevice>,
     bytes: &[u8],
@@ -158,90 +149,22 @@ pub(crate) fn run_repo_chain(
 ) -> ChainStream {
     let item_count = items.len();
     let n: usize = bytes.len();
-    let fis = items;
-    // ── the chain side ────────────────────────────────────────────────────
-    // The span decomposition mirrors the Instant pairs below exactly —
-    // ChainPhases stays the print contract, the spans are the programmatic
-    // instrument, and reading the same boundaries is what lets the two be
-    // cross-checked before anything collapses onto either.
     let _chain = tracing::info_span!("chain", n, items = item_count, ?mode).entered();
     let t_chain0 = std::time::Instant::now();
     let sp_prep = tracing::info_span!("chain.prep").entered();
-    // Rung 5b: the serial CPU leader scan is GONE from every mode — the
-    // survivor pass publishes per-item leader AND survivor totals on
-    // device (an item_count-sized readback; prefix sums on host), which
-    // is what feeds rec_base/slot_base and the loop bounds below. The
-    // ENGINE's own per-item counts still fence the alignment in the fork
-    // gate's counts tier. (The ordering lesson that comment used to carry
-    // stands: chain first, engine second, diff last — the product path
-    // holds none of the engine's host memory, and at the 97MB repo shape
-    // gigabytes held across dispatches brushed the machine's ceiling with
-    // deterministically-dead dispatches as the failure mode.)
+
     let t_tables = std::time::Instant::now();
     drop(sp_prep);
     let sp_tables = tracing::info_span!("chain.tables").entered();
 
-    let (units, rake) = (256usize, 8usize);
-    let log = units.ilog2() as usize;
-    let n_tiles = n.div_ceil(units * rake).max(1);
-    let n_words = n.div_ceil(4);
-    let rspan = 8usize;
     let trie = crate::atlas::TrieTable::load(&crate::atlas_dir());
-    let (seq, seq_max, bitmap_advance) = match trie.cluster_table() {
-        Some((s, m, a)) => (s.to_vec(), m, a),
-        None => {
-            eprintln!("cubecl-repo-check: atlas carries no sequence section");
-            std::process::exit(1);
-        }
-    };
-    let (bitmap, ic) = cluster_host_inputs(&seq, seq_max, fis);
-    let (poff, pval) = cluster_pair_filter(&seq, seq_max);
-    let mut ir = Vec::with_capacity(item_count * 2);
-    let mut ie = Vec::with_capacity(item_count * IE_STRIDE);
-    let mut im = Vec::with_capacity(item_count * IM_STRIDE);
-    let mut page_gap_x = Vec::with_capacity(item_count);
-    for item in fis {
-        // Note 24 Q3: apply is compiled inline_resolve=false unconditionally
-        // and resolve_x writes lm only for fold > 0 leaders — a foldless
-        // item would render uninitialized lm with every gate green. No
-        // caller produces one today (repo wrap_cols is fixed at 100, and no
-        // CLI flag reaches it); this keeps a future caller honest.
-        assert!(
-            item.wrap_width > 0,
-            "run_repo_chain requires folded items (wrap_width > 0)"
-        );
-        ir.push(item.byte_start as u32);
-        ir.push((item.byte_start + item.byte_count) as u32);
-        ie.push(item.page_rows as u32);
-        ie.push(item.page_cols as u32);
-        ie.push(item.scroll_rows as u32);
-        ie.push(item.pages_wide as u32);
-        ie.push(item.wrap_width as u32);
-        ie.push(item.has_page as u32);
-        ie.push(match item.wrap_mode {
-            WrapMode::Down => 0u32,
-            WrapMode::Back => 1,
-        });
-        ie.push(0u32);
-        im.push(item.origin_y as f32);
-        im.push(item.origin_z as f32);
-        im.push(item.line_height as f32);
-        im.push(item.z_step as f32);
-        im.push(item.band_stride_y as f32);
-        im.push(item.depth_per_band as f32);
-        im.push(item.depth_per_col as f32);
-        im.push(0.0f32);
-        im.push(item.origin_x as f32);
-        im.push((item.z_step - item.z_step as f32 as f64) as f32);
-        page_gap_x.push(item.page_gap_x as f32);
-    }
+    let wants_instances = matches!(mode, ChainMode::Instances | ChainMode::Both);
+    let host_inputs = prepare_chain_inputs(bytes, items, &trie, wants_instances);
 
     let t_init = std::time::Instant::now();
     drop(sp_tables);
     let sp_init = tracing::info_span!("chain.init").entered();
-    // One device when the caller has one (the renderer's, shared since rung
-    // 5a — the rung-4 second device is gone from the render path); callers
-    // with no GPU of their own still construct one here.
+
     let owned_ctx;
     let owned_dev;
     let device_ref = match device {
@@ -261,646 +184,68 @@ pub(crate) fn run_repo_chain(
     };
     let cdev = cubecl::wgpu::init_device(setup, Default::default());
     let client = cubecl::Device::Wgpu(cdev).client();
+
     let t_upload = std::time::Instant::now();
     drop(sp_init);
     let span_upload = tracing::info_span!("chain.upload", live_bytes = tracing::field::Empty);
     let sp_upload = span_upload.enter();
-    // The device-memory ledger: EVERY allocation this function makes passes
-    // through these two doors, so the figure the spans report is the chain's
-    // true semantic live set (cubecl's pool may hold more on top). Cell
-    // because the two closures share it; this function is single-threaded.
-    let live = std::cell::Cell::new(0u64);
-    let alloc_empty = |size: usize| {
-        live.set(live.get() + size as u64);
-        client.empty(size)
-    };
-    let alloc_upload = |bytes: &[u8]| {
-        live.set(live.get() + bytes.len() as u64);
-        client.create_from_slice(bytes)
-    };
-    let packed = pack_words(bytes);
-    let (bi, bm, bc, bshift) = trie.device_tables();
-    let h_bytes = alloc_upload(bytemuck::cast_slice(&packed));
-    let h_bi = alloc_upload(bytemuck::cast_slice(&bi));
-    let h_bm = alloc_upload(bytemuck::cast_slice(&bm));
-    let h_bc = alloc_upload(bytemuck::cast_slice(&bc));
-    let h_seq = alloc_upload(bytemuck::cast_slice(&seq));
-    let h_bmap = alloc_upload(bytemuck::cast_slice(&bitmap));
-    let h_poff = alloc_upload(bytemuck::cast_slice(&poff));
-    let h_pval = alloc_upload(bytemuck::cast_slice(&pval));
-    let h_ir = alloc_upload(bytemuck::cast_slice(&ir));
-    let h_ic = alloc_upload(bytemuck::cast_slice(&ic));
-    let h_ie = alloc_upload(bytemuck::cast_slice(&ie));
-    let h_im = alloc_upload(bytemuck::cast_slice(&im));
-    let h_gap = alloc_upload(bytemuck::cast_slice(&page_gap_x));
-    let h_fl = alloc_empty(n_words * 4);
-    let h_sm = alloc_empty(n * 4);
-    let h_gi = alloc_empty(n * 4);
-    let h_hgt = alloc_empty(n * 4);
-    // cslot's zero-fill rides decode's per-byte store (the probe only writes
-    // candidates; count_tile/cand_scatter read it as a predicate over every
-    // byte) — a 388 MB upload of zeros died here, 2026-09-30.
-    let h_cslot = alloc_empty(n * 4);
-    let h_cend = alloc_empty(n * 4);
-    let h_tc = alloc_empty(n_tiles * PARTIAL_COUNT_STRIDE * 4);
-    let h_tm = alloc_empty(n_tiles * 4);
-    let h_xc = alloc_empty(n_tiles * PARTIAL_COUNT_STRIDE * 4);
-    let h_xm = alloc_empty(n_tiles * 4);
-    let h_lc = alloc_empty(n * LC_STRIDE * 4);
-    let h_wm = alloc_empty(n * 4);
-    let h_wc = alloc_empty(n * 4);
-    let h_otb = alloc_empty(n * 4);
-    let h_lm = alloc_empty(n * LM_STRIDE * 4);
-    let h_strides = alloc_empty(item_count * 8);
-    let h_rmax = alloc_upload(bytemuck::cast_slice(&vec![0u32; item_count]));
-    let h_xmax = alloc_upload(bytemuck::cast_slice(&vec![0u32; item_count]));
-    // The extent pair + walk plan (the width pre-resolved by fold.rs's
-    // rule — see extent_pair's header).
-    let h_extent =
-        alloc_upload(bytemuck::cast_slice(&vec![0x8000_0000u32; item_count * 2]));
-    let mut walk_plan: Vec<u32> = Vec::with_capacity(item_count * 3);
-    for (i, item) in fis.iter().enumerate() {
-        let width = if item.wrap_width > 0 {
-            item.wrap_width
-        } else if item.has_page {
-            item.page_cols
-        } else {
-            0
-        };
-        walk_plan.push(ir[i * 2]);
-        walk_plan.push(ir[i * 2 + 1]);
-        walk_plan.push(width as u32);
-    }
-    let h_plan = alloc_upload(bytemuck::cast_slice(&walk_plan));
-    let h_ctc = alloc_empty(n_tiles * 4);
-    let h_cup = alloc_empty(n_tiles * units * 4);
-    let h_cxc = alloc_empty(n_tiles * 4);
-    let h_ctotal = alloc_empty(4);
-    let h_hp = alloc_empty(n * 4);
-    // ── rung 5b: the survivor pass's buffers ─────────────────────────────
-    // Dual-Blelloch prefix counts over leaders and survivors directly from
-    // fl and gi. Intermediate byte flags (h_lflag, h_sflag) are eliminated;
-    // only the global survivor ordinal buffer (h_sv) is allocated for scatter_slots.
-    let h_sv = alloc_empty(n * 4);
-    let h_ltc = alloc_empty(n_tiles * 4);
-    let h_stc = alloc_empty(n_tiles * 4);
-    let h_lup = alloc_empty(n_tiles * units * 4);
-    let h_sup = alloc_empty(n_tiles * units * 4);
-    let h_lxc = alloc_empty(n_tiles * 4);
-    let h_sxc = alloc_empty(n_tiles * 4);
-    let h_lgrand = alloc_empty(4);
-    let h_sgrand = alloc_empty(4);
-    let h_totals = alloc_empty(item_count.max(1) * 2 * 4);
-    // The extent lanes, SEEDED in key space exactly like the host loop
-    // seeds its accumulators: page at 0.0 (over ALL records), ink at
-    // ±inf (over survivors — an item with none keeps the empty extent).
-    let wants_instances = matches!(mode, ChainMode::Instances | ChainMode::Both);
-    let mut ext_seed = vec![0u32; item_count * EXT_STRIDE];
-    if wants_instances {
-        let zero_k = ordered_key_host(0.0f32);
-        let inf_k = ordered_key_host(f32::INFINITY);
-        let ninf_k = ordered_key_host(f32::NEG_INFINITY);
-        for it in 0..item_count {
-            let e = it * EXT_STRIDE;
-            ext_seed[e] = zero_k;
-            ext_seed[e + 1] = zero_k;
-            ext_seed[e + 2] = zero_k;
-            ext_seed[e + 3] = zero_k;
-            ext_seed[e + 4] = inf_k;
-            ext_seed[e + 5] = inf_k;
-            ext_seed[e + 6] = ninf_k;
-            ext_seed[e + 7] = ninf_k;
-            ext_seed[e + 8] = inf_k;
-            ext_seed[e + 9] = ninf_k;
-        }
-    }
-    let h_ext = alloc_upload(bytemuck::cast_slice(&ext_seed));
-    let h_pr_colors = if wants_instances {
-        alloc_upload(bytemuck::cast_slice(&inputs.per_record_colors))
-    } else {
-        alloc_empty(4)
-    };
-    let h_color_base =
-        alloc_upload(bytemuck::cast_slice(&inputs.color_base));
-    let h_is_pr = alloc_upload(bytemuck::cast_slice(&inputs.is_per_record));
-    let h_flat_colors = alloc_upload(bytemuck::cast_slice(&inputs.flat_colors));
-    let h_groups = alloc_upload(bytemuck::cast_slice(&inputs.groups));
-    // The record/instance buffers are fixed rolling CHUNKS, not
-    // whole-corpus allocations — see the emitter's rec_first note. Their
-    // sizes bind to the device totals now, so they are allocated in the
-    // tail, after the survivor readback. GLYPH_RECORD_CHUNK shrinks the
-    // windows (units = elements) so the fork gate crosses boundaries on
-    // the standing fixture: the emitter's windowed carry arithmetic,
-    // fenced on an ordinary corpus. Default keeps the buffer at ~512MB:
-    // 16.7M records × 32 B. (The instance tail has NO windows since E2b —
-    // the scatter writes the renderer-bound buffer directly.)
+
+    let buffers::BufferAllocationResult {
+        buffers: mut buf,
+        live_bytes,
+    } = allocate_chain_buffers(
+        &client,
+        bytes,
+        item_count,
+        &host_inputs,
+        inputs,
+        &trie,
+        wants_instances,
+    );
+
     let chunk_env: Option<usize> = std::env::var("GLYPH_RECORD_CHUNK")
         .ok()
         .and_then(|v| v.parse().ok());
     let chunk_recs_cap = chunk_env.unwrap_or(16_777_216);
-    let cubes_of = |threads: usize| {
-        let cubes = threads.div_ceil(256);
-        CubeCount::Static(cubes.min(65535) as u32, cubes.div_ceil(65535) as u32, 1)
-    };
-    let tiles_grid = |tiles: usize| {
-        CubeCount::Static(tiles.min(65535) as u32, tiles.div_ceil(65535) as u32, 1)
-    };
+
     let t_dispatch = std::time::Instant::now();
-    span_upload.record("live_bytes", live.get());
+    span_upload.record("live_bytes", live_bytes);
     drop(sp_upload);
-    // The guard's drop ends the ENTER; the Span handle must drop too or the
-    // span only CLOSEs at function end (spans close at refcount zero), which
-    // would print this phase's close line after the whole tail.
     drop(span_upload);
     let sp_dispatch = tracing::info_span!("chain.dispatch").entered();
-    // GLYPH_CHAIN_PROF=1 (or "stages"): the bench's per-stage GPU windows,
-    // ported into the PRODUCT chain (note 24 §A4.2) — every stage fenced and
-    // timestamped in place, so tail.totals' absorbed execution decomposes by
-    // name. Each stage also gets an `enq:<name>` row: the launch statement's
-    // pure CPU cost (2026-09-30: enqueue is µs per dispatch — the sync waits,
-    // not the launches, hold the chain's wall time). Fences serialize the
-    // chain: the printed SUM is the pricing table, NOT a load time (the spans
-    // keep the unfused walls). The two internal syncs ride as wall-clock rows.
-    // GLYPH_CHAIN_PROF=blocks: NO per-stage fences — one window around each
-    // dispatch block (block1 = decode..cand counts, block2 = cand_scatter..
-    // item_totals). Blocks-vs-stages prices the inter-dispatch gap — measured
-    // 2026-09-30: fused == fenced sum (65ms / 519ms), so the GPU does NOT
-    // stall between dispatches; the sync overshoot lives in the WAIT path.
-    // GLYPH_CHAIN_SYNC=1: the sync WALLS, unprofiled (no fences draining the
-    // queue first) — the instrument that measured the 0.5-1.9s overshoots.
-    let prof_mode = std::env::var("GLYPH_CHAIN_PROF").unwrap_or_default();
-    let prof = !prof_mode.is_empty();
-    let prof_stage_on = matches!(prof_mode.as_str(), "1" | "stages");
-    let prof_blocks = prof_mode == "blocks";
-    let sync_prof = std::env::var_os("GLYPH_CHAIN_SYNC").is_some();
-    let mut prof_ok = prof;
-    let mut prof_rows: Vec<(String, std::time::Duration)> = Vec::new();
-    let mut prof_missing = 0usize;
-    let mut prof_timing: Option<String> = None;
-    let mut prof_t0: Vec<std::time::Instant> = Vec::new();
-    let mut prof_w;
-    let mut prof_bw;
-    macro_rules! prof {
-        (begin $name:literal) => {
-            prof_w = if prof_ok && prof_stage_on {
-                match client.profile_start() {
-                    Ok(w) => Some(w),
-                    Err(e) => {
-                        eprintln!(
-                            "chain-prof: profile_start failed ({e}); stages run unwindowed"
-                        );
-                        prof_ok = false;
-                        None
-                    }
-                }
-            } else {
-                None
-            };
-            // The enqueue wall starts here; the end arm reads it BEFORE the
-            // resolve, so the launch statement's CPU cost stands alone.
-            prof_t0.push(std::time::Instant::now());
-        };
-        (end $name:literal) => {
-            let enq = prof_t0.pop().expect("prof end without begin").elapsed();
-            if prof_ok && prof_stage_on {
-                prof_rows.push((format!("enq:{}", $name), enq));
-            }
-            if let Some(w) = prof_w.take() {
-                let dur = client.profile_end(w).expect("profile_end");
-                if prof_timing.is_none() {
-                    prof_timing = Some(format!("{}", dur.timing_method()));
-                }
-                match pollster::block_on(dur.resolve()) {
-                    Some(ticks) => prof_rows.push(($name.to_string(), ticks.duration())),
-                    None => prof_missing += 1,
-                }
-            }
-        };
-        (block begin $name:literal) => {
-            prof_bw = if prof_ok && prof_blocks {
-                match client.profile_start() {
-                    Ok(w) => Some(w),
-                    Err(e) => {
-                        eprintln!(
-                            "chain-prof: profile_start failed ({e}); blocks run unwindowed"
-                        );
-                        prof_ok = false;
-                        None
-                    }
-                }
-            } else {
-                None
-            };
-        };
-        (block end $name:literal) => {
-            if let Some(w) = prof_bw.take() {
-                let dur = client.profile_end(w).expect("profile_end");
-                if prof_timing.is_none() {
-                    prof_timing = Some(format!("{}", dur.timing_method()));
-                }
-                match pollster::block_on(dur.resolve()) {
-                    Some(ticks) => prof_rows.push(($name.to_string(), ticks.duration())),
-                    None => prof_missing += 1,
-                }
-            }
-        };
-    }
-    unsafe {
-        prof!(block begin "block1");
-        prof!(begin "decode");
-        decode::launch_unchecked(
-            &client,
-            cubes_of(n_words),
-            CubeDim::new_1d(256),
-            BufferArg::from_raw_parts(h_bytes.clone(), n_words),
-            BufferArg::from_raw_parts(h_bi.clone(), bi.len()),
-            BufferArg::from_raw_parts(h_bm.clone(), bm.len()),
-            BufferArg::from_raw_parts(h_bc.clone(), bc.len()),
-            BufferArg::from_raw_parts(h_fl.clone(), n_words),
-            BufferArg::from_raw_parts(h_sm.clone(), n),
-            BufferArg::from_raw_parts(h_gi.clone(), n),
-            BufferArg::from_raw_parts(h_hgt.clone(), n),
-            BufferArg::from_raw_parts(h_cslot.clone(), n),
-            bshift,
-        );
-        prof!(end "decode");
-        prof!(begin "cluster_probe");
-        cluster_probe::launch_unchecked(
-            &client,
-            cubes_of(n_words),
-            CubeDim::new_1d(256),
-            BufferArg::from_raw_parts(h_bytes.clone(), n_words),
-            BufferArg::from_raw_parts(h_bmap.clone(), bitmap.len()),
-            BufferArg::from_raw_parts(h_poff.clone(), poff.len()),
-            BufferArg::from_raw_parts(h_pval.clone(), pval.len()),
-            BufferArg::from_raw_parts(h_seq.clone(), seq.len()),
-            BufferArg::from_raw_parts(h_ir.clone(), ir.len()),
-            BufferArg::from_raw_parts(h_ic.clone(), ic.len()),
-            BufferArg::from_raw_parts(h_fl.clone(), n_words),
-            BufferArg::from_raw_parts(h_sm.clone(), n),
-            BufferArg::from_raw_parts(h_gi.clone(), n),
-            BufferArg::from_raw_parts(h_cslot.clone(), n),
-            BufferArg::from_raw_parts(h_cend.clone(), n),
-            seq_max,
-        );
-        prof!(end "cluster_probe");
-        prof!(begin "cand_count_tile");
-        count_tile::launch_unchecked(
-            &client,
-            tiles_grid(n_tiles),
-            CubeDim::new_1d(units as u32),
-            BufferArg::from_raw_parts(h_cslot.clone(), n),
-            BufferArg::from_raw_parts(h_ctc.clone(), n_tiles),
-            BufferArg::from_raw_parts(h_cup.clone(), n_tiles * units),
-            units,
-            rake,
-            log,
-        );
-        prof!(end "cand_count_tile");
-        prof!(begin "cand_count_spine");
-        count_spine::launch_unchecked(
-            &client,
-            CubeCount::new_single(),
-            CubeDim::new_1d(units as u32),
-            BufferArg::from_raw_parts(h_ctc.clone(), n_tiles),
-            BufferArg::from_raw_parts(h_cxc.clone(), n_tiles),
-            BufferArg::from_raw_parts(h_ctotal.clone(), 1),
-            units,
-            log,
-        );
-        prof!(end "cand_count_spine");
-        prof!(block end "block1");
-    }
-    let t_csync = std::time::Instant::now();
-    let tb = client.read_one(h_ctotal.clone()).expect("candidate count");
-    let c = bytemuck::cast_slice::<u8, u32>(&tb)[0] as usize;
-    if prof_ok {
-        prof_rows.push(("sync:cand_readback".to_string(), t_csync.elapsed()));
-    }
-    if sync_prof {
-        eprintln!("chain-sync: candidate readback wall {:?}", t_csync.elapsed());
-    }
-    let cluster_allocs = if c > 0 {
-        let kmax = ((c as u32 + 1).next_power_of_two().trailing_zeros()) as usize;
-        let cstride = c + 1;
-        let h_lvl = alloc_empty((kmax * (c + 1)).max(1) * 4);
-        let h_parent = alloc_empty((c + 1) * 4);
-        let h_parent_b = alloc_empty((c + 1) * 4);
-        let mut d0 = vec![1u32; c + 1];
-        d0[c] = 0;
-        let h_d0 = alloc_upload(bytemuck::cast_slice(&d0));
-        let h_d_a = alloc_empty((c + 1) * 4);
-        let h_d_b = alloc_empty((c + 1) * 4);
-        let h_roots = alloc_upload(bytemuck::cast_slice(&vec![c as u32; item_count]));
-        Some((h_lvl, h_parent, h_parent_b, h_d0, h_d_a, h_d_b, h_roots, kmax, cstride))
-    } else {
-        None
-    };
 
-    unsafe {
-        prof!(block begin "block2");
-        if let Some((
-            ref h_lvl,
-            ref h_parent,
-            ref h_parent_b,
-            ref h_d0,
-            ref h_d_a,
-            ref h_d_b,
-            ref h_roots,
-            kmax,
-            cstride,
-        )) = cluster_allocs
-        {
-            prof!(begin "cand_scatter");
-            cand_scatter::launch_unchecked(
-                &client,
-                tiles_grid(n_tiles),
-                CubeDim::new_1d(units as u32),
-                BufferArg::from_raw_parts(h_cslot.clone(), n),
-                BufferArg::from_raw_parts(h_cxc.clone(), n_tiles),
-                BufferArg::from_raw_parts(h_cup.clone(), n_tiles * units),
-                BufferArg::from_raw_parts(h_hp.clone(), c),
-                units,
-                rake,
-            );
-            prof!(end "cand_scatter");
-            prof!(begin "jump_build");
-            jump_build::launch_unchecked(
-                &client,
-                cubes_of(c + 1),
-                CubeDim::new_1d(256),
-                BufferArg::from_raw_parts(h_hp.clone(), c),
-                BufferArg::from_raw_parts(h_cend.clone(), n),
-                BufferArg::from_raw_parts(h_ir.clone(), ir.len()),
-                BufferArg::from_raw_parts(h_ctotal.clone(), 1),
-                BufferArg::from_raw_parts(h_parent.clone(), c + 1),
-            );
-            prof!(end "jump_build");
-            // The K rank steps ride ONE window (the bench's cluster_rank
-            // grouping): same kernel, ping-ponged buffers, K = ceil(log2(c+1)).
-            prof!(begin "cluster_rank");
-            let mut sp = h_parent.clone();
-            let mut sd = h_d0.clone();
-            for k in 0..kmax {
-                let tp = if k % 2 == 0 { h_parent_b.clone() } else { h_parent.clone() };
-                let td = if k % 2 == 0 { h_d_a.clone() } else { h_d_b.clone() };
-                rank_step::launch_unchecked(
-                    &client,
-                    cubes_of(c + 1),
-                    CubeDim::new_1d(256),
-                    BufferArg::from_raw_parts(sp.clone(), c + 1),
-                    BufferArg::from_raw_parts(sd.clone(), c + 1),
-                    BufferArg::from_raw_parts(tp.clone(), c + 1),
-                    BufferArg::from_raw_parts(td.clone(), c + 1),
-                    BufferArg::from_raw_parts(h_lvl.clone(), kmax * (c + 1)),
-                    k,
-                    cstride,
-                );
-                sp = tp;
-                sd = td;
-            }
-            prof!(end "cluster_rank");
-            prof!(begin "item_roots");
-            item_roots::launch_unchecked(
-                &client,
-                cubes_of(item_count.max(1)),
-                CubeDim::new_1d(256),
-                BufferArg::from_raw_parts(h_hp.clone(), c),
-                BufferArg::from_raw_parts(h_ctotal.clone(), 1),
-                BufferArg::from_raw_parts(h_ir.clone(), ir.len()),
-                BufferArg::from_raw_parts(h_ic.clone(), ic.len()),
-                BufferArg::from_raw_parts(h_roots.clone(), item_count),
-            );
-            prof!(end "item_roots");
-            prof!(begin "cluster_mark");
-            cluster_mark::launch_unchecked(
-                &client,
-                cubes_of(c.max(1)),
-                CubeDim::new_1d(256),
-                BufferArg::from_raw_parts(h_hp.clone(), c),
-                BufferArg::from_raw_parts(sd.clone(), c + 1),
-                BufferArg::from_raw_parts(h_lvl.clone(), kmax * (c + 1)),
-                BufferArg::from_raw_parts(h_ctotal.clone(), 1),
-                BufferArg::from_raw_parts(h_roots.clone(), item_count),
-                BufferArg::from_raw_parts(h_ir.clone(), ir.len()),
-                BufferArg::from_raw_parts(h_cend.clone(), n),
-                BufferArg::from_raw_parts(h_cslot.clone(), n),
-                BufferArg::from_raw_parts(h_sm.clone(), n),
-                BufferArg::from_raw_parts(h_gi.clone(), n),
-                BufferArg::from_raw_parts(h_fl.clone(), n_words),
-                kmax,
-                cstride,
-                bitmap_advance,
-            );
-            prof!(end "cluster_mark");
-        }
-        prof!(begin "tile_scan");
-        tile_scan::launch_unchecked(
-            &client,
-            tiles_grid(n_tiles),
-            CubeDim::new_1d(units as u32),
-            BufferArg::from_raw_parts(h_fl.clone(), n_words),
-            BufferArg::from_raw_parts(h_sm.clone(), n),
-            BufferArg::from_raw_parts(h_ir.clone(), ir.len()),
-            BufferArg::from_raw_parts(h_ie.clone(), ie.len()),
-            BufferArg::from_raw_parts(h_tc.clone(), n_tiles * PARTIAL_COUNT_STRIDE),
-            BufferArg::from_raw_parts(h_tm.clone(), n_tiles),
-            units,
-            rake,
-            log,
-        );
-        prof!(end "tile_scan");
-        prof!(begin "spine_scan");
-        spine_scan::launch_unchecked(
-            &client,
-            CubeCount::new_single(),
-            CubeDim::new_1d(units as u32),
-            BufferArg::from_raw_parts(h_tc.clone(), n_tiles * PARTIAL_COUNT_STRIDE),
-            BufferArg::from_raw_parts(h_tm.clone(), n_tiles),
-            BufferArg::from_raw_parts(h_xc.clone(), n_tiles * PARTIAL_COUNT_STRIDE),
-            BufferArg::from_raw_parts(h_xm.clone(), n_tiles),
-            units,
-            log,
-        );
-        prof!(end "spine_scan");
-        prof!(begin "apply");
-        apply::launch_unchecked(
-            &client,
-            tiles_grid(n_tiles),
-            CubeDim::new_1d(units as u32),
-            BufferArg::from_raw_parts(h_fl.clone(), n_words),
-            BufferArg::from_raw_parts(h_sm.clone(), n),
-            BufferArg::from_raw_parts(h_lc.clone(), n * LC_STRIDE),
-            BufferArg::from_raw_parts(h_lm.clone(), n * LM_STRIDE),
-            BufferArg::from_raw_parts(h_ir.clone(), ir.len()),
-            BufferArg::from_raw_parts(h_ie.clone(), ie.len()),
-            BufferArg::from_raw_parts(h_im.clone(), item_count * IM_STRIDE),
-            BufferArg::from_raw_parts(h_xc.clone(), n_tiles * PARTIAL_COUNT_STRIDE),
-            BufferArg::from_raw_parts(h_xm.clone(), n_tiles),
-            BufferArg::from_raw_parts(h_wm.clone(), n),
-            BufferArg::from_raw_parts(h_wc.clone(), n),
-            BufferArg::from_raw_parts(h_otb.clone(), n),
-            BufferArg::from_raw_parts(h_rmax.clone(), item_count),
-            BufferArg::from_raw_parts(h_xmax.clone(), item_count),
-            units,
-            rake,
-            log,
-            false,
-        );
-        prof!(end "apply");
-        prof!(begin "extent_pair");
-        extent_pair::launch_unchecked(
-            &client,
-            cubes_of(n),
-            CubeDim::new_1d(256),
-            BufferArg::from_raw_parts(h_sm.clone(), n),
-            BufferArg::from_raw_parts(h_fl.clone(), n_words),
-            BufferArg::from_raw_parts(h_lc.clone(), n * LC_STRIDE),
-            BufferArg::from_raw_parts(h_plan.clone(), walk_plan.len()),
-            BufferArg::from_raw_parts(h_extent.clone(), item_count * 2),
-        );
-        prof!(end "extent_pair");
-        prof!(begin "derive_stride");
-        derive_stride::launch_unchecked(
-            &client,
-            cubes_of(item_count.max(1)),
-            CubeDim::new_1d(256),
-            BufferArg::from_raw_parts(h_extent.clone(), item_count * 2),
-            BufferArg::from_raw_parts(h_ie.clone(), ie.len()),
-            BufferArg::from_raw_parts(h_gap.clone(), item_count),
-            BufferArg::from_raw_parts(h_strides.clone(), item_count * 2),
-        );
-        prof!(end "derive_stride");
-        prof!(begin "resolve_x");
-        resolve_x::launch_unchecked(
-            &client,
-            cubes_of(n.div_ceil(rspan)),
-            CubeDim::new_1d(256),
-            BufferArg::from_raw_parts(h_sm.clone(), n),
-            BufferArg::from_raw_parts(h_fl.clone(), n_words),
-            BufferArg::from_raw_parts(h_lm.clone(), n * LM_STRIDE),
-            BufferArg::from_raw_parts(h_lc.clone(), n * LC_STRIDE),
-            BufferArg::from_raw_parts(h_im.clone(), item_count * IM_STRIDE),
-            BufferArg::from_raw_parts(h_ie.clone(), ie.len()),
-            BufferArg::from_raw_parts(h_ir.clone(), ir.len()),
-            BufferArg::from_raw_parts(h_wc.clone(), n),
-            BufferArg::from_raw_parts(h_otb.clone(), n),
-            BufferArg::from_raw_parts(h_wm.clone(), n),
-            BufferArg::from_raw_parts(h_rmax.clone(), item_count),
-            BufferArg::from_raw_parts(h_xmax.clone(), item_count),
-            BufferArg::from_raw_parts(h_strides.clone(), item_count * 2),
-            256,
-            rspan,
-        );
-        prof!(end "resolve_x");
-        // THE SOLE EXTENT FOLDER (E4, 2026-09-30): the scatter's per-leader
-        // atomics moved here — one raked pass, one atomic set per item-run.
-        // Needs paginate's final lm; rides the survivor test on gi directly.
-        let rake_e = 32usize;
-        prof!(begin "extent_fold");
-        extent_fold::launch_unchecked(
-            &client,
-            tiles_grid(n.div_ceil(units * rake_e).max(1)),
-            CubeDim::new_1d(units as u32),
-            BufferArg::from_raw_parts(h_fl.clone(), n_words),
-            BufferArg::from_raw_parts(h_lm.clone(), n * LM_STRIDE),
-            BufferArg::from_raw_parts(h_sm.clone(), n),
-            BufferArg::from_raw_parts(h_hgt.clone(), n),
-            BufferArg::from_raw_parts(h_gi.clone(), n),
-            BufferArg::from_raw_parts(h_ir.clone(), ir.len()),
-            BufferArg::from_raw_parts(h_ext.clone(), item_count * EXT_STRIDE),
-            units,
-            rake_e,
-        );
-        prof!(end "extent_fold");
-        // ── rung 5b: the survivor pass ──────────────────────────────────
-        // Fused dual-Blelloch counter (sv_count_tile/sv_count_spine) scanning
-        // fl and gi directly without intermediate byte flags, ordinal scatter
-        // writing global survivor slot indices directly to h_sv, and item_totals
-        // deriving per-item totals directly from spine and boundary scan.
-        prof!(begin "sv_count_tile");
-        sv_count_tile::launch_unchecked(
-            &client,
-            tiles_grid(n_tiles),
-            CubeDim::new_1d(units as u32),
-            BufferArg::from_raw_parts(h_fl.clone(), n_words),
-            BufferArg::from_raw_parts(h_gi.clone(), n),
-            BufferArg::from_raw_parts(h_ltc.clone(), n_tiles),
-            BufferArg::from_raw_parts(h_stc.clone(), n_tiles),
-            BufferArg::from_raw_parts(h_lup.clone(), n_tiles * units),
-            BufferArg::from_raw_parts(h_sup.clone(), n_tiles * units),
-            units,
-            rake,
-            log,
-        );
-        prof!(end "sv_count_tile");
-        prof!(begin "sv_count_spine");
-        sv_count_spine::launch_unchecked(
-            &client,
-            CubeCount::new_single(),
-            CubeDim::new_1d(units as u32),
-            BufferArg::from_raw_parts(h_ltc.clone(), n_tiles),
-            BufferArg::from_raw_parts(h_stc.clone(), n_tiles),
-            BufferArg::from_raw_parts(h_lxc.clone(), n_tiles),
-            BufferArg::from_raw_parts(h_sxc.clone(), n_tiles),
-            BufferArg::from_raw_parts(h_lgrand.clone(), 1),
-            BufferArg::from_raw_parts(h_sgrand.clone(), 1),
-            units,
-            log,
-        );
-        prof!(end "sv_count_spine");
-        prof!(begin "ordinal_scatter");
-        ordinal_scatter::launch_unchecked(
-            &client,
-            tiles_grid(n_tiles),
-            CubeDim::new_1d(units as u32),
-            BufferArg::from_raw_parts(h_fl.clone(), n_words),
-            BufferArg::from_raw_parts(h_gi.clone(), n),
-            BufferArg::from_raw_parts(h_sxc.clone(), n_tiles),
-            BufferArg::from_raw_parts(h_sup.clone(), n_tiles * units),
-            BufferArg::from_raw_parts(h_sv.clone(), n),
-            units,
-            rake,
-        );
-        prof!(end "ordinal_scatter");
-        prof!(begin "item_totals");
-        item_totals::launch_unchecked(
-            &client,
-            cubes_of(item_count.max(1)),
-            CubeDim::new_1d(256),
-            BufferArg::from_raw_parts(h_ir.clone(), ir.len()),
-            BufferArg::from_raw_parts(h_fl.clone(), n_words),
-            BufferArg::from_raw_parts(h_gi.clone(), n),
-            BufferArg::from_raw_parts(h_lxc.clone(), n_tiles),
-            BufferArg::from_raw_parts(h_sxc.clone(), n_tiles),
-            BufferArg::from_raw_parts(h_lup.clone(), n_tiles * units),
-            BufferArg::from_raw_parts(h_sup.clone(), n_tiles * units),
-            BufferArg::from_raw_parts(h_lgrand.clone(), 1),
-            BufferArg::from_raw_parts(h_sgrand.clone(), 1),
-            BufferArg::from_raw_parts(h_totals.clone(), item_count * 2),
-            units,
-            rake,
-        );
-        prof!(end "item_totals");
-        prof!(block end "block2");
-    }
-    // ── the tail: totals, then the mode's emission loops ─────────────────
+    let mut prof = ChainProfiler::new();
+
+    launch_block1(&client, n, &host_inputs, &buf, &mut prof);
+
+    let (c, cluster_allocs) = resolve_candidates(&client, &buf, item_count, &mut prof);
+
+    launch_block2(
+        &client,
+        n,
+        item_count,
+        &host_inputs,
+        &buf,
+        c,
+        cluster_allocs.as_ref(),
+        &mut prof,
+    );
+
     let t_rb = std::time::Instant::now();
     drop(sp_dispatch);
     let span_tail = tracing::info_span!(
         "tail",
-        live_bytes = live.get(),
+        live_bytes,
         total_records = tracing::field::Empty,
         total_slots = tracing::field::Empty,
     );
     let _sp_tail = span_tail.enter();
     let sp_totals = tracing::info_span!("tail.totals").entered();
-    // The survivor pass's tiny readbacks — per-item leader/survivor totals,
-    // prefix-summed on host into rec_base/slot_base and the loop bounds.
-    // This is the CPU leader scan's replacement (its 0.195s at the 97MB
-    // shape is what `prep` used to report).
+
     let t_tsync = std::time::Instant::now();
-    let tb = client.read_one(h_totals.clone()).expect("totals readback");
+    let tb = client
+        .read_one(buf.h_totals.as_ref().unwrap().clone())
+        .expect("totals readback");
     let tv: &[u32] = bytemuck::cast_slice(&tb);
     let mut ltot = Vec::with_capacity(item_count);
     let mut stot = Vec::with_capacity(item_count);
@@ -908,12 +253,8 @@ pub(crate) fn run_repo_chain(
         ltot.push(tv[i * 2]);
         stot.push(tv[i * 2 + 1]);
     }
-    if prof_ok {
-        prof_rows.push(("sync:totals_readback".to_string(), t_tsync.elapsed()));
-    }
-    if sync_prof {
-        eprintln!("chain-sync: totals readback wall {:?}", t_tsync.elapsed());
-    }
+    prof.record_sync("sync:totals_readback", t_tsync.elapsed());
+
     let mut rec_base = vec![0u32; item_count];
     let mut slot_base = vec![0u32; item_count];
     let mut total_records = 0u32;
@@ -924,10 +265,7 @@ pub(crate) fn run_repo_chain(
         total_records += ltot[i];
         total_slots += stot[i];
     }
-    // The paint/record alignment cross-check — compact's loud assert's
-    // successor: the HOST colorize counts must line up with the DEVICE
-    // leader totals, item by item, or the paint table would silently paint
-    // the wrong records.
+
     if wants_instances {
         let mut expect = 0u32;
         for (it, &is_pr) in inputs.is_per_record.iter().enumerate() {
@@ -951,98 +289,54 @@ pub(crate) fn run_repo_chain(
     drop(sp_totals);
     span_tail.record("total_records", total_records);
     span_tail.record("total_slots", total_slots);
-    // THE LADDER (E3, note 23): every lane whose last reader ran before the
-    // survivor pass drops HERE — the totals readback above is a queue sync,
-    // so nothing in flight reads them when the cleanup reclaims. ~28 B per
-    // corpus byte at the flagship (~2.7 GB), shrinking the tail's live set
-    // to slots + tint + the scatter's reads, back under the working-set
-    // cliff by construction. The records tail keeps lc (its row/col lanes).
+
+    // The Ladder: drop all intermediate lanes whose last reader ran before or
+    // during the survivor pass, shrinking tail live set.
     {
         let _sp_ladder = tracing::info_span!("tail.ladder").entered();
-        drop((
-            h_bytes, h_bi, h_bm, h_bc, h_seq, h_bmap, h_poff, h_pval, h_ic, h_ie, h_im, h_gap,
-            h_plan, h_strides, h_rmax, h_xmax, h_extent, h_cslot, h_cend, h_tc, h_tm, h_xc, h_xm,
-            h_wm, h_otb, h_hp, cluster_allocs,
-            h_ltc, h_stc, h_lup, h_sup, h_lxc, h_sxc, h_lgrand, h_sgrand, h_totals,
-            h_ctotal,
-        ));
+        drop(cluster_allocs);
+        buf.release_pre_survivor();
         client.memory_cleanup();
         let usage = client.memory_usage();
         tracing::info!(
-            live_bytes = live.get(),
+            live_bytes,
             bytes_in_use = usage.bytes_in_use,
             number_allocs = usage.number_allocs,
             "tail.ladder: post-cleanup pool state"
         );
     }
-    let h_base = alloc_upload(bytemuck::cast_slice(&rec_base));
+
+    let h_base = client.create_from_slice(bytemuck::cast_slice(&rec_base));
     let mut recs_all: Vec<u32> = Vec::new();
-    // h_lc's end splits by mode: the records tail reads it (row/col), the
-    // product tail never does — and Rust's path-sensitivity means the
-    // drop rides each arm of ONE if/else, not two correlated conditions.
     if matches!(mode, ChainMode::Records | ChainMode::Both) {
-        recs_all.reserve(total_records as usize * 8);
-        let chunk_recs = chunk_recs_cap.min(total_records as usize).max(1);
-        let h_recs = alloc_empty(chunk_recs * 8 * 4);
-        let mut first = 0usize;
-        while first < total_records as usize {
-            let take = chunk_recs.min(total_records as usize - first);
-            let span_win = tracing::info_span!(
-                "tail.window",
-                tail = "records",
-                first,
-                take,
-                live_bytes = live.get()
-            );
-            let _sp_win = span_win.enter();
-            let h_win = alloc_upload(bytemuck::cast_slice(&[first as u32]));
-            let sp_emit = tracing::info_span!("tail.window.emit").entered();
-            unsafe {
-                prof!(begin "emit_records");
-                emit_records::launch_unchecked(
-                    &client,
-                    cubes_of(n),
-                    CubeDim::new_1d(256),
-                    BufferArg::from_raw_parts(h_fl.clone(), n_words),
-                    BufferArg::from_raw_parts(h_wc.clone(), n),
-                    BufferArg::from_raw_parts(h_ir.clone(), ir.len()),
-                    BufferArg::from_raw_parts(h_base.clone(), item_count),
-                    BufferArg::from_raw_parts(h_lm.clone(), n * LM_STRIDE),
-                    BufferArg::from_raw_parts(h_lc.clone(), n * LC_STRIDE),
-                    BufferArg::from_raw_parts(h_sm.clone(), n),
-                    BufferArg::from_raw_parts(h_hgt.clone(), n),
-                    BufferArg::from_raw_parts(h_gi.clone(), n),
-                    BufferArg::from_raw_parts(h_recs.clone(), take * 8),
-                    BufferArg::from_raw_parts(h_win, 1),
-                );
-                prof!(end "emit_records");
-            }
-            drop(sp_emit);
-            let sp_rb = tracing::info_span!("tail.window.readback").entered();
-            let cb = client.read_one(h_recs.clone()).expect("read chunk");
-            let csv: &[u32] = bytemuck::cast_slice(&cb);
-            recs_all.extend_from_slice(&csv[..take * 8]);
-            drop(sp_rb);
-            first += take;
-        }
-        drop(h_lc); // the records tail is lc's last reader
+        recs_all = emit_records_chunked(
+            &client,
+            n,
+            host_inputs.n_words,
+            total_records,
+            chunk_recs_cap,
+            host_inputs.ir.len(),
+            item_count,
+            buf.h_fl.clone(),
+            buf.h_wc.clone(),
+            buf.h_ir.clone(),
+            h_base,
+            buf.h_lm.clone(),
+            buf.h_lc.take().unwrap(),
+            buf.h_sm.clone(),
+            buf.h_hgt.clone(),
+            buf.h_gi.clone(),
+            &mut prof,
+        );
     } else {
-        drop(h_lc); // the product path never reads row/col — it rides the ladder
+        buf.h_lc = None;
     }
+
     let mut placements: Vec<crate::layout::ItemPlacement> = Vec::new();
     let mut slots_all: Vec<u32> = Vec::new();
     let mut tint_store = crate::layout::TintStore::Host(Vec::new());
     let mut slot_device: Option<SlotDevice> = None;
     if wants_instances {
-        // THE ENDPOINT (note 23, E2b): ONE scatter pass writes the 32 B
-        // slots directly into the buffer the renderer will bind — no
-        // windows, no rolling chunk, no hop, no copy; the slots never
-        // cross to host. The pack windows, both hops, and the footprint
-        // gate that chose between them are all gone (the gate's lesson —
-        // the ledger and the cliff numbers — stays in note 22). The
-        // scatter is also the sole extent folder (E1's mask lesson: a
-        // duplicate reducer is a mask, so there is exactly one).
-        let sp_scatter = tracing::info_span!("tail.scatter").entered();
         assert!(
             (total_slots as u64) * 32 <= device_ref.max_buffer_size,
             "the endpoint needs one {} B slot buffer — over this device's \
@@ -1051,40 +345,18 @@ pub(crate) fn run_repo_chain(
             (total_slots as u64) * 32,
             device_ref.max_buffer_size,
         );
-        let h_slots = alloc_empty(total_slots.max(1) as usize * 8 * 4);
-        let h_tint = alloc_empty(total_slots.max(1) as usize * 2 * 4);
-        unsafe {
-            prof!(begin "scatter_slots");
-            scatter_slots::launch_unchecked(
-                &client,
-                cubes_of(n),
-                CubeDim::new_1d(256),
-                BufferArg::from_raw_parts(h_fl.clone(), n_words),
-                BufferArg::from_raw_parts(h_wc.clone(), n),
-                BufferArg::from_raw_parts(h_ir.clone(), ir.len()),
-                BufferArg::from_raw_parts(h_lm.clone(), n * LM_STRIDE),
-                BufferArg::from_raw_parts(h_sm.clone(), n),
-                BufferArg::from_raw_parts(h_hgt.clone(), n),
-                BufferArg::from_raw_parts(h_gi.clone(), n),
-                BufferArg::from_raw_parts(h_pr_colors.clone(), inputs.per_record_colors.len()),
-                BufferArg::from_raw_parts(h_color_base.clone(), item_count),
-                BufferArg::from_raw_parts(h_is_pr.clone(), item_count),
-                BufferArg::from_raw_parts(h_flat_colors.clone(), item_count),
-                BufferArg::from_raw_parts(h_groups.clone(), item_count),
-                BufferArg::from_raw_parts(h_sv.clone(), n),
-                BufferArg::from_raw_parts(h_slots.clone(), total_slots.max(1) as usize * 8),
-                BufferArg::from_raw_parts(h_tint.clone(), total_slots.max(1) as usize * 2),
-            );
-            prof!(end "scatter_slots");
-        }
-        drop(sp_scatter);
-        // The one slot-derived readback: the tint stream, seg_tint's
-        // fold input. TWO forms (E3b): the gate's Both mode and
-        // non-shared hosts take cubecl's staging pipe; the product on
-        // Metal takes ONE device copy into a hal-mapped shared buffer and
-        // the host reads the pointer — no staging alloc, no Bytes, no
-        // to_vec. (The read_one cascade cost 4.16s of the 12.1s flagship
-        // backend — three 762 MB fault-and-copy passes for one stream.)
+        let (h_slots, h_tint) = scatter_slots_direct(
+            &client,
+            n,
+            host_inputs.n_words,
+            total_slots,
+            host_inputs.ir.len(),
+            item_count,
+            inputs,
+            &buf,
+            &mut prof,
+        );
+
         let sp_tint = tracing::info_span!("tail.tint").entered();
         tint_store = if matches!(mode, ChainMode::Both)
             || !device_ref.host_visible_storage
@@ -1095,54 +367,25 @@ pub(crate) fn run_repo_chain(
             read_tint_store_unified(&client, device_ref, h_tint.clone(), total_slots)
         };
         drop(sp_tint);
-        // The fork gate's lane tier reads the slot stream host-side.
+
         if matches!(mode, ChainMode::Both) {
             let sb = client.read_one(h_slots.clone()).expect("read slot scatter");
             slots_all = bytemuck::cast_slice::<u8, u32>(&sb)[..total_slots as usize * 8].to_vec();
         }
-        // The extraction: the slot buffer becomes the renderer's storage.
-        // get_resource CONSUMES the handle into a ManagedResource whose
-        // binding keeps the pool slice from being re-allocated — so the
-        // guard rides the stream (type-erased) for the scene's lifetime.
-        if total_slots > 0 {
-            let res = client
-                .get_resource::<WgpuServer<AutoCompiler>>(h_slots.clone())
-                .expect("slot buffer resource");
-            let (buffer, offset) = {
-                let r = res.resource();
-                (r.buffer.clone(), r.offset)
-            };
-            assert!(
-                offset % 16 == 0,
-                "slot buffer's pool offset {offset} breaks the storage binding alignment"
-            );
-            slot_device = Some(SlotDevice {
-                chunk: crate::layout::DeviceSlotChunk {
-                    buffer,
-                    offset,
-                    slots: total_slots,
-                },
-                keep_alive: Box::new(res),
-            });
-        }
-        placements = decode_placements(&client, h_ext.clone(), item_count, &slot_base, &stot, &ltot);
-    }
-    if prof {
-        if !prof_ok {
-            eprintln!("chain-prof: GPU windows were unavailable — only the sync rows carry timings");
-        }
-        let sum: std::time::Duration = prof_rows.iter().map(|(_, d)| *d).sum();
-        eprintln!(
-            "chain-prof: timing={} — {} rows, {} missing windows (fenced per stage; the SUM is the price table, the spans keep the unfused walls)",
-            prof_timing.as_deref().unwrap_or("none"),
-            prof_rows.len(),
-            prof_missing
+
+        slot_device = package_slot_device(&client, h_slots, total_slots);
+        placements = decode_placements(
+            &client,
+            buf.h_ext.clone(),
+            item_count,
+            &slot_base,
+            &stot,
+            &ltot,
         );
-        for (name, d) in &prof_rows {
-            eprintln!("  {name:<24} {:>9.3}ms", d.as_secs_f64() * 1e3);
-        }
-        eprintln!("  {:<24} {:>9.3}ms", "SUM", sum.as_secs_f64() * 1e3);
     }
+
+    prof.print_summary();
+
     ChainStream {
         records: recs_all,
         rec_base,
@@ -1164,4 +407,3 @@ pub(crate) fn run_repo_chain(
         },
     }
 }
-
