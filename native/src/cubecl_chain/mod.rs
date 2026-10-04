@@ -139,13 +139,23 @@ const WRAP_BACK: i32 = 1;
 /// The reddening witness is the unit test in this file; the classifier's
 /// continuation rule itself is fenced by the real-byte flags diffs.
 fn pack_words(bytes: &[u8]) -> Vec<u32> {
-    let n_words = bytes.len().div_ceil(4);
-    let mut packed = vec![0u32; n_words];
-    for (i, &b) in bytes.iter().enumerate() {
-        packed[i >> 2] |= (b as u32) << ((i & 3) * 8);
+    let n = bytes.len();
+    if n == 0 {
+        return Vec::new();
     }
-    for i in bytes.len()..(n_words * 4) {
-        packed[i >> 2] |= 0x80u32 << ((i & 3) * 8);
+    let n_words = n.div_ceil(4);
+    let mut packed = Vec::with_capacity(n_words);
+    let (chunks, remainder) = bytes.as_chunks::<4>();
+    for &chunk in chunks {
+        packed.push(u32::from_le_bytes(chunk));
+    }
+    if !remainder.is_empty() {
+        let mut tail_word = 0x8080_8080u32;
+        for (i, &b) in remainder.iter().enumerate() {
+            let mask = 0xFFu32 << (i * 8);
+            tail_word = (tail_word & !mask) | ((b as u32) << (i * 8));
+        }
+        packed.push(tail_word);
     }
     packed
 }

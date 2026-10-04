@@ -1,14 +1,18 @@
 //! Tail readback utilities: tint stream extraction, mapped shared buffers, and extent placements decoding.
 
+use cubecl::client::Client;
+use cubecl::server::Handle;
 use cubecl::wgpu::{AutoCompiler, WgpuServer};
 use crate::gpu::SharedDevice;
 use crate::layout::{InkExtent, ItemPlacement, PageExtent, TintMapped, TintStore};
 use super::super::tail::{key_to_float_host, EXT_STRIDE};
+use super::ChainMode;
 
+/// Fallback host-staged read of the tint stream via cubecl read_one.
 #[inline]
 pub(crate) fn read_tint_store_host(
-    client: &cubecl::client::Client,
-    h_tint: cubecl::server::Handle,
+    client: &Client,
+    h_tint: Handle,
     total_slots: u32,
 ) -> TintStore {
     let tb = client.read_one(h_tint).expect("read tint stream");
@@ -17,11 +21,13 @@ pub(crate) fn read_tint_store_host(
     )
 }
 
+/// Zero-copy readback on Unified Memory Architectures (Apple Silicon Metal).
+/// Direct mapped storage in unified DRAM without staging buffer hops.
 #[inline]
 pub(crate) fn read_tint_store_unified(
-    client: &cubecl::client::Client,
+    client: &Client,
     device: &SharedDevice,
-    h_tint: cubecl::server::Handle,
+    h_tint: Handle,
     total_slots: u32,
 ) -> TintStore {
     let res = client
@@ -54,6 +60,87 @@ pub(crate) fn read_tint_store_unified(
         ptr,
         words: total_slots as usize * 2,
     })
+}
+
+/// Single-copy host memory staging for Discrete GPU Architectures (NVIDIA RTX 5090, AMD Radeon).
+/// Directly streams VRAM storage into a mapped host staging buffer via PCIe DMA transfer,
+/// avoiding cubecl internal staging reallocations.
+#[inline]
+pub(crate) fn read_tint_store_discrete(
+    client: &Client,
+    device: &SharedDevice,
+    h_tint: Handle,
+    total_slots: u32,
+) -> TintStore {
+    let res = client
+        .get_resource::<WgpuServer<AutoCompiler>>(h_tint)
+        .expect("tint stream resource");
+    let (src, src_off) = {
+        let r = res.resource();
+        (r.buffer.clone(), r.offset)
+    };
+    let bytes = (total_slots as usize * 8) as u64;
+    let staging_buf = device.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("tint stream discrete staging"),
+        size: bytes.max(4),
+        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    let mut enc = device
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("tint stream discrete copy"),
+        });
+    enc.copy_buffer_to_buffer(&src, src_off, &staging_buf, 0, bytes.max(4));
+    device.queue.submit([enc.finish()]);
+
+    let slice = staging_buf.slice(..bytes.max(4));
+    let (tx, rx) = std::sync::mpsc::channel();
+    slice.map_async(wgpu::MapMode::Read, move |res| {
+        tx.send(res).expect("map_async send failed");
+    });
+    device
+        .device
+        .poll(wgpu::PollType::Wait {
+            submission_index: None,
+            timeout: None,
+        })
+        .expect("tint discrete copy poll");
+    rx.recv()
+        .expect("map_async recv failed")
+        .expect("tint discrete staging map failed");
+
+    let mapped = slice.get_mapped_range().expect("tint discrete get_mapped_range failed");
+    let words: &[u32] = bytemuck::cast_slice(&mapped);
+    let result = words[..total_slots as usize * 2].to_vec();
+    drop(mapped);
+    staging_buf.unmap();
+    TintStore::Host(result)
+}
+
+/// Composable multi-architecture tint stream readback router.
+/// Dispatches to unified zero-copy, discrete host staging, or fallback based on device profile.
+#[inline]
+pub(crate) fn read_tint_store(
+    client: &Client,
+    device: &SharedDevice,
+    h_tint: Handle,
+    total_slots: u32,
+    mode: ChainMode,
+) -> TintStore {
+    if total_slots == 0 {
+        return TintStore::Host(Vec::new());
+    }
+    if matches!(mode, ChainMode::Both) {
+        return read_tint_store_host(client, h_tint, total_slots);
+    }
+    if device.is_unified() && device.host_visible_storage {
+        read_tint_store_unified(client, device, h_tint, total_slots)
+    } else if device.is_discrete() {
+        read_tint_store_discrete(client, device, h_tint, total_slots)
+    } else {
+        read_tint_store_host(client, h_tint, total_slots)
+    }
 }
 
 /// A hal-mapped shared-storage readback target (Metal hosts only — the
@@ -95,8 +182,8 @@ pub(crate) fn mapped_read_buffer(device: &wgpu::Device, bytes: u64, label: &str)
 
 /// Decodes item placements from GPU extent lanes in key space.
 pub(crate) fn decode_placements(
-    client: &cubecl::client::Client,
-    h_ext: cubecl::server::Handle,
+    client: &Client,
+    h_ext: Handle,
     item_count: usize,
     slot_base: &[u32],
     stot: &[u32],

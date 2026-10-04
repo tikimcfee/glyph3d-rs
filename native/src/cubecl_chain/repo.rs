@@ -10,7 +10,7 @@ use buffers::allocate_chain_buffers;
 use dispatch::{launch_block1, launch_block2, resolve_candidates, ChainProfiler};
 use prep::prepare_chain_inputs;
 use tail_emit::{emit_records_chunked, package_slot_device, scatter_slots_direct};
-use tail_readback::{decode_placements, read_tint_store_host, read_tint_store_unified};
+use tail_readback::{decode_placements, read_tint_store};
 
 // ── the repo parity driver — phase 4, rung 3 ─────────────────────────────────
 //
@@ -358,14 +358,7 @@ pub(crate) fn run_repo_chain(
         );
 
         let sp_tint = tracing::info_span!("tail.tint").entered();
-        tint_store = if matches!(mode, ChainMode::Both)
-            || !device_ref.host_visible_storage
-            || total_slots == 0
-        {
-            read_tint_store_host(&client, h_tint.clone(), total_slots)
-        } else {
-            read_tint_store_unified(&client, device_ref, h_tint.clone(), total_slots)
-        };
+        tint_store = read_tint_store(&client, device_ref, h_tint.clone(), total_slots, mode);
         drop(sp_tint);
 
         if matches!(mode, ChainMode::Both) {
