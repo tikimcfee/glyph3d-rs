@@ -282,6 +282,7 @@ pub(super) fn apply(
     #[comptime] rake: usize,
     #[comptime] log: usize,
     #[comptime] inline_resolve: bool,
+    #[comptime] skip_wm: bool,
 ) {
     let tile = CUBE_POS;
     let u = UNIT_POS as usize;
@@ -471,9 +472,9 @@ pub(super) fn apply(
                 // re-sum's line-advance input, diffed where fold>0).
                 wc[id] = run.glyphs as u32;
                 otb[start + run.glyphs as usize] = id as u32;
-                if w_fold > 0 || !inline_resolve {
+                if (!skip_wm) && (w_fold > 0 || !inline_resolve) {
                     wm[id] = run.tail_adv;
-                } else {
+                } else if !skip_wm {
                     // Foldless: x IS the line-advance lane — resolve_x's
                     // whole per-item computation, in registers, now.
                     let x = run.tail_adv;

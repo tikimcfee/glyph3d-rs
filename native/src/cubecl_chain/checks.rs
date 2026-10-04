@@ -270,6 +270,7 @@ pub fn run(ctx: &GpuContext, fixture_path: &Path) -> ! {
                 rake,
                 log,
                 inline_resolve,
+                false,
             );
         }
         if stages >= 4 {
@@ -311,7 +312,8 @@ pub fn run(ctx: &GpuContext, fixture_path: &Path) -> ! {
                 BufferArg::from_raw_parts(h_wm.clone(), n),
                 BufferArg::from_raw_parts(h_rmax.clone(), item_count),
                 BufferArg::from_raw_parts(h_xmax.clone(), item_count),
-                BufferArg::from_raw_parts(h_strides.clone(), item_count * 2),
+                BufferArg::from_raw_parts(h_extent.clone(), item_count * 2),
+                BufferArg::from_raw_parts(h_gap.clone(), item_count),
                 256,
                 rspan,
             );

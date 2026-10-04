@@ -586,6 +586,7 @@ pub fn bench(ctx: &GpuContext, corpus_path: &Path) -> ! {
                         rake,
                         log,
                         inline_resolve,
+                        false,
                     );
                 }
                 3 => {
@@ -630,7 +631,8 @@ pub fn bench(ctx: &GpuContext, corpus_path: &Path) -> ! {
                             BufferArg::from_raw_parts(h_wm.clone(), n),
                             BufferArg::from_raw_parts(h_rmax.clone(), 1),
                             BufferArg::from_raw_parts(h_xmax.clone(), 1),
-                            BufferArg::from_raw_parts(h_strides.clone(), 2),
+                            BufferArg::from_raw_parts(h_extent.clone(), 2),
+                            BufferArg::from_raw_parts(h_gap.clone(), 1),
                             256,
                             rspan,
                         );

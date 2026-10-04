@@ -45,7 +45,8 @@ pub(super) fn resolve_x(
     wm: &[f32],
     row_max: &mut [Atomic<u32>],
     x_max: &mut [Atomic<u32>],
-    strides: &[f32],
+    extent_words: &[u32],
+    page_gap_x: &[f32],
     #[comptime] units: usize,
     #[comptime] span: usize,
 ) {
@@ -94,10 +95,26 @@ pub(super) fn resolve_x(
         }
         let mut x = 0.0f32;
         let mut in_seg = false;
+        let mut cur_it = it;
+        let mut loc_row_max = 0u32;
+        let mut loc_x_max = 0u32;
         let mut id = lo;
         while id < hi {
             while has && nxt <= id {
+                if loc_row_max > 0 {
+                    let slot = cur_it - it_base;
+                    if slot < RESOLVE_SLOTS {
+                        srow[slot].fetch_max(loc_row_max);
+                        sx[slot].fetch_max(loc_x_max);
+                    } else {
+                        row_max[cur_it].fetch_max(loc_row_max);
+                        x_max[cur_it].fetch_max(loc_x_max);
+                    }
+                    loc_row_max = 0u32;
+                    loc_x_max = 0u32;
+                }
                 it += 1;
+                cur_it = it;
                 start = ir[it * 2] as usize;
                 nxt = if it + 1 < item_count { ir[(it + 1) * 2] as usize } else { n };
                 wrap = ie[it * IE_STRIDE + IE_WRAP_WIDTH] as i32;
@@ -160,8 +177,13 @@ pub(super) fn resolve_x(
                     let pages_wide = if pages_wide_raw > 1 { pages_wide_raw } else { 1 };
                     let band = y_page / pages_wide;
                     let page_col = (y_page % pages_wide) as f32;
-                    let stride_reach_tail = strides[it * 2 + 1];
-                    let stride_reach = strides[it * 2];
+                    let mut stride_reach = 0.0f32;
+                    let mut stride_reach_tail = 0.0f32;
+                    if has_page && rows > 0 {
+                        let exact = advance_fixed(key_to_float(extent_words[it * 2]))
+                            + advance_fixed(page_gap_x[it]);
+                        fixed_pair(exact, &mut stride_reach, &mut stride_reach_tail);
+                    }
                     let x_with_tail = fma(page_col, stride_reach_tail, base);
                     final_x = fma(page_col, stride_reach, x_with_tail);
                     let row_in_page = (screen_row - y_page * rows) as f32;
@@ -177,13 +199,13 @@ pub(super) fn resolve_x(
                 lm[mo + LM_Y] = final_y;
                 lm[mo + LM_Z] = final_z;
 
-                let slot = it - it_base;
-                if slot < RESOLVE_SLOTS {
-                    srow[slot].fetch_max((row + 1) as u32);
-                    sx[slot].fetch_max(ordered_key(x));
-                } else {
-                    row_max[it].fetch_max((row + 1) as u32);
-                    x_max[it].fetch_max(ordered_key(x));
+                let r = (row + 1) as u32;
+                if r > loc_row_max {
+                    loc_row_max = r;
+                }
+                let k = ordered_key(x);
+                if k > loc_x_max {
+                    loc_x_max = k;
                 }
                 if (f & F_NEWLINE) == 0 && fold > 0 {
                     // This leader's advance feeds the next x — the same add
@@ -192,6 +214,16 @@ pub(super) fn resolve_x(
                 }
             }
             id += 1;
+        }
+        if loc_row_max > 0 {
+            let slot = cur_it - it_base;
+            if slot < RESOLVE_SLOTS {
+                srow[slot].fetch_max(loc_row_max);
+                sx[slot].fetch_max(loc_x_max);
+            } else {
+                row_max[cur_it].fetch_max(loc_row_max);
+                x_max[cur_it].fetch_max(loc_x_max);
+            }
         }
     }
     sync_cube();
@@ -295,6 +327,7 @@ pub(super) fn extent_pair(
     }
 }
 
+#[allow(dead_code)]
 #[cube(launch_unchecked)]
 pub(super) fn derive_stride(
     extent_words: &[u32],

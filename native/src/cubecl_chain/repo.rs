@@ -394,6 +394,9 @@ pub(crate) fn run_repo_chain(
         }
 
         slot_device = package_slot_device(&client, h_slots, total_slots);
+        buf.release_survivor_scan();
+    } else {
+        buf.release_survivor_scan();
     }
 
     prof.print_summary();

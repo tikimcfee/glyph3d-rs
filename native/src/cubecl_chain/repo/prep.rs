@@ -43,7 +43,7 @@ pub(crate) fn prepare_chain_inputs(
     let log = units.ilog2() as usize;
     let n_tiles = n.div_ceil(units * rake).max(1);
     let n_words = n.div_ceil(4);
-    let rspan = 8usize;
+    let rspan = 32usize;
     let (seq, seq_max, bitmap_advance) = match trie.cluster_table() {
         Some((s, m, a)) => (s.to_vec(), m, a),
         None => {

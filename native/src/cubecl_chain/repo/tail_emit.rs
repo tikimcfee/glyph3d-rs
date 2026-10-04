@@ -8,7 +8,7 @@ use cubecl::wgpu::{AutoCompiler, WgpuServer};
 use super::super::tail::{emit_records, scatter_slots};
 use super::super::{LC_STRIDE, LM_STRIDE};
 use super::buffers::ChainBuffers;
-use super::dispatch::{cubes_of, ChainProfiler};
+use super::dispatch::{cubes_of, tiles_grid, ChainProfiler};
 use super::{InstanceInputs, SlotDevice};
 
 /// Emits the 8-word wire stream chunked in rolling windows.
@@ -106,12 +106,14 @@ pub(crate) fn scatter_slots_direct(
         (client.empty(4), 1)
     };
 
+    let (units, rake) = (256usize, 8usize);
+    let n_tiles = n.div_ceil(units * rake).max(1);
     unsafe {
         prof.begin(client, "scatter_slots");
         scatter_slots::launch_unchecked(
             client,
-            cubes_of(n),
-            CubeDim::new_1d(256),
+            tiles_grid(n_tiles),
+            CubeDim::new_1d(units as u32),
             BufferArg::from_raw_parts(buf.h_fl.clone(), n_words),
             BufferArg::from_raw_parts(buf.h_wc.clone(), n),
             BufferArg::from_raw_parts(buf.h_ir.clone(), ir_len),
@@ -124,9 +126,12 @@ pub(crate) fn scatter_slots_direct(
             BufferArg::from_raw_parts(buf.h_is_pr.clone(), item_count),
             BufferArg::from_raw_parts(buf.h_flat_colors.clone(), item_count),
             BufferArg::from_raw_parts(buf.h_groups.clone(), item_count),
-            BufferArg::from_raw_parts(buf.h_sv.clone(), n),
+            BufferArg::from_raw_parts(buf.h_sxc.as_ref().unwrap().clone(), n_tiles),
+            BufferArg::from_raw_parts(buf.h_sup.as_ref().unwrap().clone(), n_tiles * units),
             BufferArg::from_raw_parts(h_slots.clone(), total_slots.max(1) as usize * 8),
             BufferArg::from_raw_parts(h_tint.clone(), tint_words),
+            units,
+            rake,
         );
         prof.end(client, "scatter_slots");
     }

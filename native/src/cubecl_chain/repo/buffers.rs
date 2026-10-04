@@ -25,7 +25,6 @@ pub(crate) struct ChainBuffers {
     pub h_im: Option<Handle>,
     pub h_gap: Option<Handle>,
     pub h_plan: Option<Handle>,
-    pub h_strides: Option<Handle>,
     pub h_rmax: Option<Handle>,
     pub h_xmax: Option<Handle>,
     pub h_extent: Option<Handle>,
@@ -57,7 +56,6 @@ pub(crate) struct ChainBuffers {
     pub h_hp: Option<Handle>,
 
     // Survivor scan buffers
-    pub h_sv: Handle,
     pub h_ltc: Option<Handle>,
     pub h_stc: Option<Handle>,
     pub h_lup: Option<Handle>,
@@ -94,7 +92,6 @@ impl ChainBuffers {
         self.h_im = None;
         self.h_gap = None;
         self.h_plan = None;
-        self.h_strides = None;
         self.h_rmax = None;
         self.h_xmax = None;
         self.h_extent = None;
@@ -114,12 +111,15 @@ impl ChainBuffers {
         self.h_ltc = None;
         self.h_stc = None;
         self.h_lup = None;
-        self.h_sup = None;
         self.h_lxc = None;
-        self.h_sxc = None;
         self.h_lgrand = None;
         self.h_sgrand = None;
         self.h_totals = None;
+    }
+
+    pub(crate) fn release_survivor_scan(&mut self) {
+        self.h_sup = None;
+        self.h_sxc = None;
     }
 }
 
@@ -183,11 +183,10 @@ pub(crate) fn allocate_chain_buffers(
     let h_xc = alloc_empty(n_tiles * PARTIAL_COUNT_STRIDE * 4);
     let h_xm = alloc_empty(n_tiles * 4);
     let h_lc = alloc_empty(n * LC_STRIDE * 4);
-    let h_wm = alloc_empty(n * 4);
+    let h_wm = alloc_empty(4);
     let h_wc = alloc_empty(n * 4);
     let h_otb = alloc_empty(n * 4);
     let h_lm = alloc_empty(n * LM_STRIDE * 4);
-    let h_strides = alloc_empty(item_count * 8);
     let h_rmax = alloc_upload(bytemuck::cast_slice(&vec![0u32; item_count]));
     let h_xmax = alloc_upload(bytemuck::cast_slice(&vec![0u32; item_count]));
     let h_extent = alloc_upload(bytemuck::cast_slice(&vec![0x8000_0000u32; item_count * 2]));
@@ -197,7 +196,6 @@ pub(crate) fn allocate_chain_buffers(
     let h_cxc = alloc_empty(n_tiles * 4);
     let h_ctotal = alloc_empty(4);
     let h_hp = alloc_empty(n * 4);
-    let h_sv = alloc_empty(n * 4);
     let h_ltc = alloc_empty(n_tiles * 4);
     let h_stc = alloc_empty(n_tiles * 4);
     let h_lup = alloc_empty(n_tiles * units * 4);
@@ -234,7 +232,6 @@ pub(crate) fn allocate_chain_buffers(
             h_im: Some(h_im),
             h_gap: Some(h_gap),
             h_plan: Some(h_plan),
-            h_strides: Some(h_strides),
             h_rmax: Some(h_rmax),
             h_xmax: Some(h_xmax),
             h_extent: Some(h_extent),
@@ -262,7 +259,6 @@ pub(crate) fn allocate_chain_buffers(
             h_cxc: Some(h_cxc),
             h_ctotal: Some(h_ctotal),
             h_hp: Some(h_hp),
-            h_sv,
             h_ltc: Some(h_ltc),
             h_stc: Some(h_stc),
             h_lup: Some(h_lup),

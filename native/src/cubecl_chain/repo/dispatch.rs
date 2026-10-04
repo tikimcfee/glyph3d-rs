@@ -9,10 +9,10 @@ use super::super::cluster::{
     rank_step,
 };
 use super::super::decode::decode;
-use super::super::position::{derive_stride, extent_pair, resolve_x};
+use super::super::position::{extent_pair, resolve_x};
 use super::super::scan::{apply, spine_scan, tile_scan};
 use super::super::tail::{
-    extent_fold, item_totals, ordinal_scatter, sv_count_spine, sv_count_tile,
+    extent_fold, item_totals, sv_count_spine, sv_count_tile,
     EXT_STRIDE,
 };
 use super::super::{IM_STRIDE, LC_STRIDE, LM_STRIDE, PARTIAL_COUNT_STRIDE};
@@ -526,7 +526,7 @@ pub(crate) fn launch_block2_geometry(
             BufferArg::from_raw_parts(buf.h_im.as_ref().unwrap().clone(), item_count * IM_STRIDE),
             BufferArg::from_raw_parts(buf.h_xc.as_ref().unwrap().clone(), n_tiles * PARTIAL_COUNT_STRIDE),
             BufferArg::from_raw_parts(buf.h_xm.as_ref().unwrap().clone(), n_tiles),
-            BufferArg::from_raw_parts(buf.h_wm.as_ref().unwrap().clone(), n),
+            BufferArg::from_raw_parts(buf.h_wm.as_ref().unwrap().clone(), 1),
             BufferArg::from_raw_parts(buf.h_wc.clone(), n),
             BufferArg::from_raw_parts(buf.h_otb.as_ref().unwrap().clone(), n),
             BufferArg::from_raw_parts(buf.h_rmax.as_ref().unwrap().clone(), item_count),
@@ -535,6 +535,7 @@ pub(crate) fn launch_block2_geometry(
             rake,
             log,
             false,
+            true,
         );
         prof.end(client, "apply");
 
@@ -552,18 +553,6 @@ pub(crate) fn launch_block2_geometry(
         );
         prof.end(client, "extent_pair");
 
-        prof.begin(client, "derive_stride");
-        derive_stride::launch_unchecked(
-            client,
-            cubes_of(item_count.max(1)),
-            CubeDim::new_1d(256),
-            BufferArg::from_raw_parts(buf.h_extent.as_ref().unwrap().clone(), item_count * 2),
-            BufferArg::from_raw_parts(buf.h_ie.as_ref().unwrap().clone(), inputs.ie.len()),
-            BufferArg::from_raw_parts(buf.h_gap.as_ref().unwrap().clone(), item_count),
-            BufferArg::from_raw_parts(buf.h_strides.as_ref().unwrap().clone(), item_count * 2),
-        );
-        prof.end(client, "derive_stride");
-
         prof.begin(client, "resolve_x");
         resolve_x::launch_unchecked(
             client,
@@ -578,10 +567,11 @@ pub(crate) fn launch_block2_geometry(
             BufferArg::from_raw_parts(buf.h_ir.clone(), inputs.ir.len()),
             BufferArg::from_raw_parts(buf.h_wc.clone(), n),
             BufferArg::from_raw_parts(buf.h_otb.as_ref().unwrap().clone(), n),
-            BufferArg::from_raw_parts(buf.h_wm.as_ref().unwrap().clone(), n),
+            BufferArg::from_raw_parts(buf.h_wm.as_ref().unwrap().clone(), 1),
             BufferArg::from_raw_parts(buf.h_rmax.as_ref().unwrap().clone(), item_count),
             BufferArg::from_raw_parts(buf.h_xmax.as_ref().unwrap().clone(), item_count),
-            BufferArg::from_raw_parts(buf.h_strides.as_ref().unwrap().clone(), item_count * 2),
+            BufferArg::from_raw_parts(buf.h_extent.as_ref().unwrap().clone(), item_count * 2),
+            BufferArg::from_raw_parts(buf.h_gap.as_ref().unwrap().clone(), item_count),
             256,
             rspan,
         );
@@ -604,21 +594,6 @@ pub(crate) fn launch_block2_geometry(
             rake_e,
         );
         prof.end(client, "extent_fold");
-
-        prof.begin(client, "ordinal_scatter");
-        ordinal_scatter::launch_unchecked(
-            client,
-            tiles_grid(n_tiles),
-            CubeDim::new_1d(units as u32),
-            BufferArg::from_raw_parts(buf.h_fl.clone(), n_words),
-            BufferArg::from_raw_parts(buf.h_gi.clone(), n),
-            BufferArg::from_raw_parts(buf.h_sxc.as_ref().unwrap().clone(), n_tiles),
-            BufferArg::from_raw_parts(buf.h_sup.as_ref().unwrap().clone(), n_tiles * units),
-            BufferArg::from_raw_parts(buf.h_sv.clone(), n),
-            units,
-            rake,
-        );
-        prof.end(client, "ordinal_scatter");
         prof.block_end(client, "block2_geometry");
     }
 }
