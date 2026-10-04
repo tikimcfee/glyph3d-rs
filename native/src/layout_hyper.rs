@@ -170,22 +170,24 @@ fn resolve_leader(
     em_height_fu: u32,
     trailer_until: &mut usize,
 ) -> ResolvedChar {
+    let cp = decode_codepoint(bytes, pos, seq_len);
+    let entry = trie.lookup(cp);
+    let height = fu_to_world(entry.height_fu, em_height_fu);
+
     if pos < *trailer_until {
         return ResolvedChar {
             glyph_id: 0,
             advance: 0.0,
-            height: 0.0,
+            height,
             is_newline: false,
         };
     }
 
-    let cp = decode_codepoint(bytes, pos, seq_len);
     if cp == 0x0A {
-        let entry = trie.lookup(cp);
         return ResolvedChar {
             glyph_id: 0,
             advance: fu_to_world(entry.advance_fu, em_height_fu),
-            height: fu_to_world(entry.height_fu, em_height_fu),
+            height,
             is_newline: true,
         };
     }
@@ -194,7 +196,7 @@ fn resolve_leader(
         return ResolvedChar {
             glyph_id: 0,
             advance: 0.0,
-            height: 0.0,
+            height,
             is_newline: false,
         };
     }
@@ -497,29 +499,38 @@ impl HyperLayout {
             total_survivors += pre.survivor_count as usize;
         }
 
-        let can_map_device = allow_device
-            && cfg!(target_os = "macos")
+        let can_use_device = allow_device
             && self.device.as_ref().is_some_and(|dev| {
-                dev.host_visible_storage
-                    && (total_survivors * std::mem::size_of::<RenderSlot>()) as u64
-                        <= dev.max_buffer_size
+                (total_survivors * std::mem::size_of::<RenderSlot>()) as u64 <= dev.max_buffer_size
                     && total_survivors > 0
             });
 
-        if can_map_device {
+        if can_use_device {
             let dev = self.device.as_ref().unwrap();
-            let (mapped_ptr, wgpu_buf) = create_mapped_render_slots(&dev.device, total_survivors);
-            let sp_pass2 = tracing::info_span!("hyper.pass2").entered();
-            let pass2_out = Self::layout_pass2_device(
-                items,
-                &prepasses,
-                &slot_bases,
-                &trie,
-                bitmap_adv,
-                em_height_fu,
-                SendPtr(mapped_ptr),
-            );
-            drop(sp_pass2);
+            let (wgpu_buf, mapped_slots, pass2_out) = if dev.is_unified() && dev.host_visible_storage {
+                Self::layout_device_unified(
+                    dev,
+                    total_survivors,
+                    items,
+                    &prepasses,
+                    &slot_bases,
+                    &trie,
+                    bitmap_adv,
+                    em_height_fu,
+                )
+            } else {
+                Self::layout_device_discrete(
+                    dev,
+                    total_survivors,
+                    items,
+                    &prepasses,
+                    &slot_bases,
+                    &trie,
+                    bitmap_adv,
+                    em_height_fu,
+                )
+            };
+
             let device_slots = DeviceSlots {
                 chunks: vec![DeviceSlotChunk {
                     buffer: wgpu_buf,
@@ -528,7 +539,7 @@ impl HyperLayout {
                 }],
                 chunk_slots: total_survivors,
                 len: total_survivors,
-                mapped_slots: Some(mapped_ptr as usize),
+                mapped_slots,
                 file_tints: pass2_out.file_tints,
                 file_blocks: pass2_out.file_blocks,
                 #[cfg(feature = "cubecl")]
@@ -555,6 +566,105 @@ impl HyperLayout {
             }
             Ok(placements)
         }
+    }
+
+    #[inline]
+    #[allow(clippy::too_many_arguments)]
+    fn layout_device_unified(
+        dev: &crate::gpu::SharedDevice,
+        total_survivors: usize,
+        items: &[LayoutItem<'_>],
+        prepasses: &[ItemPrepass],
+        slot_bases: &[u32],
+        trie: &TrieTable,
+        bitmap_adv: f32,
+        em_height_fu: u32,
+    ) -> (wgpu::Buffer, Option<usize>, Pass2DeviceOutput) {
+        #[cfg(target_os = "macos")]
+        {
+            let (mapped_ptr, buf) = create_mapped_render_slots(&dev.device, total_survivors);
+            let sp_pass2 = tracing::info_span!("hyper.pass2").entered();
+            let pass2_out = Self::layout_pass2_device(
+                items,
+                prepasses,
+                slot_bases,
+                trie,
+                bitmap_adv,
+                em_height_fu,
+                SendPtr(mapped_ptr),
+            );
+            drop(sp_pass2);
+            (buf, Some(mapped_ptr as usize), pass2_out)
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            Self::layout_device_discrete(
+                dev,
+                total_survivors,
+                items,
+                prepasses,
+                slot_bases,
+                trie,
+                bitmap_adv,
+                em_height_fu,
+            )
+        }
+    }
+
+    #[inline]
+    #[allow(clippy::too_many_arguments)]
+    fn layout_device_discrete(
+        dev: &crate::gpu::SharedDevice,
+        total_survivors: usize,
+        items: &[LayoutItem<'_>],
+        prepasses: &[ItemPrepass],
+        slot_bases: &[u32],
+        trie: &TrieTable,
+        bitmap_adv: f32,
+        em_height_fu: u32,
+    ) -> (wgpu::Buffer, Option<usize>, Pass2DeviceOutput) {
+        let size = (total_survivors * std::mem::size_of::<RenderSlot>()) as u64;
+        let staging_buf = dev.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("glyph render slots (staging)"),
+            size,
+            usage: wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: true,
+        });
+        let pass2_out = {
+            let mut mapped = staging_buf
+                .slice(..)
+                .get_mapped_range_mut()
+                .expect("staging mapped range");
+            let mapped_ptr =
+                mapped.slice(..).as_raw_element_ptr().as_ptr() as *mut RenderSlot;
+            let sp_pass2 = tracing::info_span!("hyper.pass2").entered();
+            let out = Self::layout_pass2_device(
+                items,
+                prepasses,
+                slot_bases,
+                trie,
+                bitmap_adv,
+                em_height_fu,
+                SendPtr(mapped_ptr),
+            );
+            drop(sp_pass2);
+            out
+        };
+        staging_buf.unmap();
+        let vram_buf = dev.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("glyph render slots (vram)"),
+            size,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let mut encoder = dev.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("glyph_hyper_staging_copy"),
+        });
+        encoder.copy_buffer_to_buffer(&staging_buf, 0, &vram_buf, 0, size);
+        dev.queue.submit([encoder.finish()]);
+        (vram_buf, None, pass2_out)
     }
 
     fn layout_pass2_device(

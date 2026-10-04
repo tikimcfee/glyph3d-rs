@@ -131,6 +131,23 @@ impl ErrorTracker {
 
 // ── the hardware profile ─────────────────────────────────────────────────
 
+/// Hardware memory architecture of the GPU device.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MemoryArchitecture {
+    /// Unified Memory Architecture (UMA):
+    /// CPU and GPU share the same physical DRAM pool (e.g. Apple Silicon Metal, AMD APUs).
+    /// Direct host-visible storage buffers can be written by CPU and read by GPU shaders
+    /// without PCIe bus transfer or staging buffers.
+    Unified,
+    /// Discrete GPU Architecture (NUMA):
+    /// GPU has dedicated high-bandwidth VRAM (GDDR6/GDDR7/HBM, 1-2 TB/s) connected via PCIe bus
+    /// (e.g. NVIDIA RTX 5090, AMD Radeon discrete).
+    /// High-speed shader execution requires device-local VRAM (`STORAGE | COPY_DST`).
+    /// Host upload coordinates through mapped host staging buffers (`MAP_WRITE | COPY_SRC`)
+    /// followed by PCIe DMA transfers.
+    Discrete,
+}
+
 /// What this process is rendering on, resolved ONCE from the adapter wgpu
 /// picked and carried in `GpuContext` so nothing downstream re-derives it.
 ///
@@ -174,6 +191,16 @@ pub struct GpuProfile {
 }
 
 impl GpuProfile {
+    pub fn memory_architecture(&self) -> MemoryArchitecture {
+        if self.device_type == wgpu::DeviceType::IntegratedGpu
+            || (self.backend == wgpu::Backend::Metal && self.vendor_slug() == "apple")
+        {
+            MemoryArchitecture::Unified
+        } else {
+            MemoryArchitecture::Discrete
+        }
+    }
+
     pub fn from_adapter(adapter: &wgpu::Adapter) -> Self {
         let info = adapter.get_info();
         let feats = adapter.features();
@@ -362,19 +389,32 @@ pub struct SharedDevice {
     pub queue: wgpu::Queue,
     pub max_buffer_size: u64,
     pub host_visible_storage: bool,
+    pub memory_arch: MemoryArchitecture,
 }
 
 impl SharedDevice {
     pub fn from_ctx(ctx: &GpuContext) -> Self {
+        let memory_arch = ctx.profile.memory_architecture();
         Self {
             instance: ctx.instance.clone(),
             adapter: ctx.adapter.clone(),
             device: ctx.device.clone(),
             queue: ctx.queue.clone(),
             max_buffer_size: ctx.profile.max_buffer_size,
-            host_visible_storage: ctx.profile.backend == wgpu::Backend::Metal
+            host_visible_storage: memory_arch == MemoryArchitecture::Unified
                 && ctx.profile.mappable_primary_buffers,
+            memory_arch,
         }
+    }
+
+    #[inline(always)]
+    pub fn is_unified(&self) -> bool {
+        self.memory_arch == MemoryArchitecture::Unified
+    }
+
+    #[inline(always)]
+    pub fn is_discrete(&self) -> bool {
+        self.memory_arch == MemoryArchitecture::Discrete
     }
 }
 

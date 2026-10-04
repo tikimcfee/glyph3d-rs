@@ -13,7 +13,7 @@ use super::cluster::{
     count_spine, count_tile, item_roots, jump_build, rank_step,
 };
 use super::decode::decode;
-use super::position::{derive_stride, extent_pair, paginate, resolve_x};
+use super::position::{derive_stride, extent_pair, resolve_x};
 use super::scan::{apply, spine_scan, tile_scan};
 use super::tail::emit_records;
 use super::{
@@ -201,18 +201,8 @@ pub fn run(ctx: &GpuContext, fixture_path: &Path) -> ! {
     let stages: usize = std::env::var("GLYPH_CHAIN_STAGES")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(6);
-    // Foldless corpora never dispatch resolve_x at all — apply's chase
-    // resolves them (x in a register, no ordinal round trip). Pure-wrapped
-    // corpora compile the inline branch out (see apply's header).
-    let needs_resolve = fx.items.iter().any(|it| {
-        it.wrap_width > 0 || (it.has_page && it.page_cols > 0)
-    });
-    let all_fold = fx
-        .items
-        .iter()
-        .all(|it| it.wrap_width > 0 || (it.has_page && it.page_cols > 0));
-    let inline_resolve = !all_fold;
+        .unwrap_or(5);
+    let inline_resolve = false;
     // One cube per tile (dim = units); the byte-wide kernels stay 256-unit.
     let tiles_grid = |tiles: usize| {
         CubeCount::Static(tiles.min(65535) as u32, tiles.div_ceil(65535) as u32, 1)
@@ -278,27 +268,7 @@ pub fn run(ctx: &GpuContext, fixture_path: &Path) -> ! {
                 inline_resolve,
             );
         }
-        if stages >= 4 && needs_resolve {
-            resolve_x::launch_unchecked(
-                &client,
-                cubes_of(n.div_ceil(rspan)),
-                CubeDim::new_1d(256),
-                BufferArg::from_raw_parts(h_sm.clone(), n),
-                BufferArg::from_raw_parts(h_fl.clone(), n_words),
-                BufferArg::from_raw_parts(h_lm.clone(), n * LM_STRIDE),
-                BufferArg::from_raw_parts(h_lc.clone(), n * LC_STRIDE),
-                BufferArg::from_raw_parts(h_im.clone(), item_count * IM_STRIDE),
-                BufferArg::from_raw_parts(h_ie.clone(), item_count * IE_STRIDE),
-                BufferArg::from_raw_parts(h_ir.clone(), item_count * 2),
-                BufferArg::from_raw_parts(h_wc.clone(), n),
-                BufferArg::from_raw_parts(h_otb.clone(), n),
-                BufferArg::from_raw_parts(h_rmax.clone(), item_count),
-                BufferArg::from_raw_parts(h_xmax.clone(), item_count),
-                256,
-                rspan,
-            );
-        }
-        if stages >= 5 {
+        if stages >= 4 {
             extent_pair::launch_unchecked(
                 &client,
                 cubes_of(n),
@@ -319,23 +289,30 @@ pub fn run(ctx: &GpuContext, fixture_path: &Path) -> ! {
                 BufferArg::from_raw_parts(h_strides.clone(), item_count * 2),
             );
         }
-        if stages >= 6 {
-            paginate::launch_unchecked(
+        if stages >= 5 {
+            resolve_x::launch_unchecked(
                 &client,
-                cubes_of(n),
+                cubes_of(n.div_ceil(rspan)),
                 CubeDim::new_1d(256),
-                BufferArg::from_raw_parts(h_lm.clone(), n * LM_STRIDE),
+                BufferArg::from_raw_parts(h_sm.clone(), n),
                 BufferArg::from_raw_parts(h_fl.clone(), n_words),
+                BufferArg::from_raw_parts(h_lm.clone(), n * LM_STRIDE),
                 BufferArg::from_raw_parts(h_lc.clone(), n * LC_STRIDE),
                 BufferArg::from_raw_parts(h_im.clone(), item_count * IM_STRIDE),
                 BufferArg::from_raw_parts(h_ie.clone(), item_count * IE_STRIDE),
                 BufferArg::from_raw_parts(h_ir.clone(), item_count * 2),
+                BufferArg::from_raw_parts(h_wc.clone(), n),
+                BufferArg::from_raw_parts(h_otb.clone(), n),
+                BufferArg::from_raw_parts(h_wm.clone(), n),
+                BufferArg::from_raw_parts(h_rmax.clone(), item_count),
+                BufferArg::from_raw_parts(h_xmax.clone(), item_count),
                 BufferArg::from_raw_parts(h_strides.clone(), item_count * 2),
+                256,
+                rspan,
             );
         }
         // Phase 4 rung 2: the record emitter — only when the full chain ran
-        // (paginate is the last dispatch; STAGES bisects below it).
-        if stages >= 6 {
+        if stages >= 5 {
             let h_win0 = client.create_from_slice(bytemuck::cast_slice(&[0u32]));
             emit_records::launch_unchecked(
                 &client,
@@ -361,7 +338,7 @@ pub fn run(ctx: &GpuContext, fixture_path: &Path) -> ! {
     let lm_bytes = client.read_one(h_lm).expect("read lm");
     let rmax_bytes = client.read_one(h_rmax).expect("read rmax");
     let xmax_bytes = client.read_one(h_xmax).expect("read xmax");
-    let recs_bytes = if stages >= 6 {
+    let recs_bytes = if stages >= 5 {
         Some(client.read_one(h_recs).expect("read recs"))
     } else {
         None
@@ -395,19 +372,14 @@ pub fn run(ctx: &GpuContext, fixture_path: &Path) -> ! {
     let xmax: &[u32] = bytemuck::cast_slice(&xmax_bytes);
 
     // The item maxima, diffed DIRECTLY against the CPU fold's item_bounds
-    // lanes (TOTAL_ROWS, MAX_ROW_EXTENT) — apply produces every row maximum
-    // (and the foldless x maxima); resolve_x the folding x maxima, so the x
-    // tier waits for stage 4 only when the corpus folds.
+    // lanes (TOTAL_ROWS, MAX_ROW_EXTENT) — both arrive with resolve_x (stage 5).
     let host_key_to_float = |k: u32| -> f32 {
         let b = if (k & 0x8000_0000) != 0 { k & 0x7FFF_FFFF } else { !k };
         f32::from_bits(b)
     };
     let mut bad = 0usize;
     let mut max_x_dev = 0.0f64;
-    if stages >= 3 && (!all_fold || stages >= 4) {
-        // Pure-wrapped corpora compile apply's row maxima out — their rows
-        // arrive with resolve_x (stage 4). Earlier bisection stages would
-        // fail this diff spuriously.
+    if stages >= 5 {
         for (i, got) in rmax.iter().take(item_count).enumerate() {
             let want_rows = r.item_bounds[i * 8 + 6];
             if *got as f64 != want_rows {
@@ -417,8 +389,6 @@ pub fn run(ctx: &GpuContext, fixture_path: &Path) -> ! {
                 bad += 1;
             }
         }
-    }
-    if stages >= 3 && (!needs_resolve || stages >= 4) {
         for (i, got) in xmax.iter().take(item_count).enumerate() {
             let want_x = r.item_bounds[i * 8 + 7];
             let got_x = host_key_to_float(*got) as f64;
@@ -493,8 +463,8 @@ pub fn run(ctx: &GpuContext, fixture_path: &Path) -> ! {
             // same re-sum adds in the same left-fold order, and this witness
             // holds it to that. (The eps-tier position diff below would hide
             // an order change; this cannot.) lm arrives with resolve_x
-            // (stage 4) — partial-stage bisection skips it.
-            if stages >= 4 && lm[id * LM_STRIDE + LM_X].to_bits() != r.slots.x(id).to_bits() {
+            // (stage 5) — partial-stage bisection skips it.
+            if stages >= 5 && lm[id * LM_STRIDE + LM_X].to_bits() != r.slots.x(id).to_bits() {
                 if bad < 8 {
                     println!(
                         "  MISMATCH byte {id} fold_x: cpu {:e} gpu {:e}",
@@ -505,9 +475,9 @@ pub fn run(ctx: &GpuContext, fixture_path: &Path) -> ! {
                 bad += 1;
             }
         }
-        // lm lanes exist from resolve_x (stage 4) on — partial-stage
+        // lm lanes exist from resolve_x (stage 5) on — partial-stage
         // bisection diffs the scan lanes only.
-        if stages >= 4 {
+        if stages >= 5 {
             for (k, acc) in [(LM_X, r.slots.x(id)), (LM_Y, r.slots.y(id)), (LM_Z, r.slots.z(id))] {
                 let dev = (lm[id * LM_STRIDE + k] as f64 - acc as f64).abs();
                 let rel = dev / (acc as f64).abs().max(1.0);

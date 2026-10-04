@@ -13,7 +13,7 @@ use super::cluster::{
     count_spine, count_tile, item_roots, jump_build, rank_step,
 };
 use super::decode::decode;
-use super::position::{derive_stride, extent_pair, paginate, resolve_x};
+use super::position::{derive_stride, extent_pair, resolve_x};
 use super::scan::{apply, spine_scan, tile_scan};
 use super::{
     F_LEADER, IE_STRIDE, IM_STRIDE, LC_COL, LC_ROW, LC_STRIDE, LM_STRIDE, PARTIAL_COUNT_STRIDE,
@@ -265,7 +265,7 @@ pub fn bench(ctx: &GpuContext, corpus_path: &Path) -> ! {
     let pre = decode_mode as usize + 4 * cluster_mode as usize;
     let stages: usize = match std::env::var("GLYPH_CHAIN_STAGES").ok().and_then(|v| v.parse().ok()) {
         Some(v) => v,
-        None => 6 + pre,
+        None => 5 + pre,
     };
     // One cube per tile (dim = units); the byte-wide kernels stay 256-unit.
     let tiles_grid = |tiles: usize| {
@@ -589,28 +589,6 @@ pub fn bench(ctx: &GpuContext, corpus_path: &Path) -> ! {
                     );
                 }
                 3 => {
-                    if needs_resolve {
-                        resolve_x::launch_unchecked(
-                            &client,
-                            cubes_of(n.div_ceil(rspan)),
-                            CubeDim::new_1d(256),
-                            BufferArg::from_raw_parts(h_sm.clone(), n),
-                            BufferArg::from_raw_parts(h_fl.clone(), n_words),
-                            BufferArg::from_raw_parts(h_lm.clone(), n * LM_STRIDE),
-                            BufferArg::from_raw_parts(h_lc.clone(), n * LC_STRIDE),
-                            BufferArg::from_raw_parts(h_im.clone(), IM_STRIDE),
-                            BufferArg::from_raw_parts(h_ie.clone(), IE_STRIDE),
-                            BufferArg::from_raw_parts(h_ir.clone(), 2),
-                            BufferArg::from_raw_parts(h_wc.clone(), n),
-                            BufferArg::from_raw_parts(h_otb.clone(), n),
-                            BufferArg::from_raw_parts(h_rmax.clone(), 1),
-                            BufferArg::from_raw_parts(h_xmax.clone(), 1),
-                            256,
-                            rspan,
-                        );
-                    }
-                }
-                4 => {
                     // extent_pair + derive_stride share this window (the rank
                     // stages set the precedent for merged dispatches).
                     extent_pair::launch_unchecked(
@@ -634,18 +612,28 @@ pub fn bench(ctx: &GpuContext, corpus_path: &Path) -> ! {
                     );
                 }
                 _ => {
-                    paginate::launch_unchecked(
-                        &client,
-                        cubes_of(n),
-                        CubeDim::new_1d(256),
-                        BufferArg::from_raw_parts(h_lm.clone(), n * LM_STRIDE),
-                        BufferArg::from_raw_parts(h_fl.clone(), n_words),
-                        BufferArg::from_raw_parts(h_lc.clone(), n * LC_STRIDE),
-                        BufferArg::from_raw_parts(h_im.clone(), IM_STRIDE),
-                        BufferArg::from_raw_parts(h_ie.clone(), IE_STRIDE),
-                        BufferArg::from_raw_parts(h_ir.clone(), 2),
-                        BufferArg::from_raw_parts(h_strides.clone(), 2),
-                    );
+                    if needs_resolve {
+                        resolve_x::launch_unchecked(
+                            &client,
+                            cubes_of(n.div_ceil(rspan)),
+                            CubeDim::new_1d(256),
+                            BufferArg::from_raw_parts(h_sm.clone(), n),
+                            BufferArg::from_raw_parts(h_fl.clone(), n_words),
+                            BufferArg::from_raw_parts(h_lm.clone(), n * LM_STRIDE),
+                            BufferArg::from_raw_parts(h_lc.clone(), n * LC_STRIDE),
+                            BufferArg::from_raw_parts(h_im.clone(), IM_STRIDE),
+                            BufferArg::from_raw_parts(h_ie.clone(), IE_STRIDE),
+                            BufferArg::from_raw_parts(h_ir.clone(), 2),
+                            BufferArg::from_raw_parts(h_wc.clone(), n),
+                            BufferArg::from_raw_parts(h_otb.clone(), n),
+                            BufferArg::from_raw_parts(h_wm.clone(), n),
+                            BufferArg::from_raw_parts(h_rmax.clone(), 1),
+                            BufferArg::from_raw_parts(h_xmax.clone(), 1),
+                            BufferArg::from_raw_parts(h_strides.clone(), 2),
+                            256,
+                            rspan,
+                        );
+                    }
                 }
             }
         }
@@ -667,9 +655,8 @@ pub fn bench(ctx: &GpuContext, corpus_path: &Path) -> ! {
         "tile_scan",
         "spine_scan",
         "apply",
-        "resolve_x",
         "derive_stride",
-        "paginate",
+        "resolve_x",
     ]);
     // The STAGES knob is a bisection count, not a hint — reject past the
     // dispatched table instead of panicking in the report loops below.
@@ -700,9 +687,8 @@ pub fn bench(ctx: &GpuContext, corpus_path: &Path) -> ! {
         let (cubes, dim) = match t {
             0 | 2 => (n_tiles, units as u32),
             1 => (1, units as u32),
-            3 => (n.div_ceil(rspan).div_ceil(256), 256),
-            4 => (1, 1),
-            _ => (n.div_ceil(256), 256),
+            3 => (1, 1),
+            _ => (n.div_ceil(rspan).div_ceil(256), 256),
         };
         (stage_names[s], cubes, dim)
     };
@@ -711,7 +697,7 @@ pub fn bench(ctx: &GpuContext, corpus_path: &Path) -> ! {
     let mut timing_method = String::new();
     for _ in 0..samples {
         for (s, slot) in mins.iter_mut().enumerate() {
-            if s == 3 + pre && !needs_resolve {
+            if s == 4 + pre && !needs_resolve {
                 // The resolve_x slot; foldless corpora skip the dispatch
                 // (and its window) entirely.
                 continue;

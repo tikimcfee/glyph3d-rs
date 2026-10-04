@@ -9,11 +9,11 @@ use super::cluster::{
     count_spine, count_tile, item_roots, jump_build, rank_step,
 };
 use super::decode::decode;
-use super::position::{derive_stride, extent_pair, paginate, resolve_x};
+use super::position::{derive_stride, extent_pair, resolve_x};
 use super::scan::{apply, spine_scan, tile_scan};
 use super::tail::{
     EXT_STRIDE, emit_records, extent_fold, item_totals, key_to_float_host, ordinal_scatter,
-    ordered_key_host, scatter_slots, survivor_flags,
+    ordered_key_host, scatter_slots, sv_count_spine, sv_count_tile,
 };
 use super::{IE_STRIDE, IM_STRIDE, LC_STRIDE, LM_STRIDE, PARTIAL_COUNT_STRIDE, pack_words};
 
@@ -99,33 +99,7 @@ pub(crate) struct InstanceInputs {
 /// `None` and constructs a device of its own for callers that have none
 /// (`--repo-scan-only`, GPU-less checks), which keeps that path exactly as it
 /// was.
-pub(crate) struct SharedDevice {
-    pub instance: wgpu::Instance,
-    pub adapter: wgpu::Adapter,
-    pub device: wgpu::Device,
-    pub queue: wgpu::Queue,
-    /// The adapter's max_buffer_size — the endpoint's slot buffer asserts
-    /// against it (one buffer holds ≤ 134M slots; chunking past that is the
-    /// named follow-up).
-    pub max_buffer_size: u64,
-    /// Metal + MAPPABLE_PRIMARY_BUFFERS — the shared-memory forms (the
-    /// tint stream's mapped readback) exist only there.
-    pub host_visible_storage: bool,
-}
-
-impl SharedDevice {
-    pub(crate) fn from_ctx(ctx: &crate::gpu::GpuContext) -> Self {
-        Self {
-            instance: ctx.instance.clone(),
-            adapter: ctx.adapter.clone(),
-            device: ctx.device.clone(),
-            queue: ctx.queue.clone(),
-            max_buffer_size: ctx.profile.max_buffer_size,
-            host_visible_storage: ctx.profile.backend == wgpu::Backend::Metal
-                && ctx.profile.mappable_primary_buffers,
-        }
-    }
-}
+pub(crate) use crate::gpu::SharedDevice;
 
 /// The endpoint's render-bound output (note 23, E2b): the 32 B slots on
 /// device, extracted from the chain's allocator, ready to bind as-is. The
@@ -361,12 +335,10 @@ pub(crate) fn run_repo_chain(
     let h_ctotal = alloc_empty(4);
     let h_hp = alloc_empty(n * 4);
     // ── rung 5b: the survivor pass's buffers ─────────────────────────────
-    // Two byte flags (leader, survivor) that the PROVEN count_tile /
-    // count_spine machinery scans; the ordinal scatter then overwrites
-    // them in place with the per-byte exclusive ordinals (lv/sv — see its
-    // header), so the flags cost no extra resident memory after the pass.
-    let h_lflag = alloc_empty(n * 4);
-    let h_sflag = alloc_empty(n * 4);
+    // Dual-Blelloch prefix counts over leaders and survivors directly from
+    // fl and gi. Intermediate byte flags (h_lflag, h_sflag) are eliminated;
+    // only the global survivor ordinal buffer (h_sv) is allocated for scatter_slots.
+    let h_sv = alloc_empty(n * 4);
     let h_ltc = alloc_empty(n_tiles * 4);
     let h_stc = alloc_empty(n_tiles * 4);
     let h_lup = alloc_empty(n_tiles * units * 4);
@@ -375,8 +347,7 @@ pub(crate) fn run_repo_chain(
     let h_sxc = alloc_empty(n_tiles * 4);
     let h_lgrand = alloc_empty(4);
     let h_sgrand = alloc_empty(4);
-    let h_ltot = alloc_empty(item_count.max(1) * 4);
-    let h_stot = alloc_empty(item_count.max(1) * 4);
+    let h_totals = alloc_empty(item_count.max(1) * 2 * 4);
     // The extent lanes, SEEDED in key space exactly like the host loop
     // seeds its accumulators: page at 0.0 (over ALL records), ink at
     // ±inf (over survivors — an item with none keeps the empty extent).
@@ -606,101 +577,120 @@ pub(crate) fn run_repo_chain(
     if sync_prof {
         eprintln!("chain-sync: candidate readback wall {:?}", t_csync.elapsed());
     }
-    let kmax = ((c as u32 + 1).next_power_of_two().trailing_zeros()) as usize;
-    let cstride = c + 1;
-    let h_lvl = alloc_empty((kmax * (c + 1)).max(1) * 4);
-    let h_parent = alloc_empty((c + 1) * 4);
-    let h_parent_b = alloc_empty((c + 1) * 4);
-    let mut d0 = vec![1u32; c + 1];
-    d0[c] = 0;
-    let h_d0 = alloc_upload(bytemuck::cast_slice(&d0));
-    let h_d_a = alloc_empty((c + 1) * 4);
-    let h_d_b = alloc_empty((c + 1) * 4);
-    let h_roots = alloc_upload(bytemuck::cast_slice(&vec![c as u32; item_count]));
+    let cluster_allocs = if c > 0 {
+        let kmax = ((c as u32 + 1).next_power_of_two().trailing_zeros()) as usize;
+        let cstride = c + 1;
+        let h_lvl = alloc_empty((kmax * (c + 1)).max(1) * 4);
+        let h_parent = alloc_empty((c + 1) * 4);
+        let h_parent_b = alloc_empty((c + 1) * 4);
+        let mut d0 = vec![1u32; c + 1];
+        d0[c] = 0;
+        let h_d0 = alloc_upload(bytemuck::cast_slice(&d0));
+        let h_d_a = alloc_empty((c + 1) * 4);
+        let h_d_b = alloc_empty((c + 1) * 4);
+        let h_roots = alloc_upload(bytemuck::cast_slice(&vec![c as u32; item_count]));
+        Some((h_lvl, h_parent, h_parent_b, h_d0, h_d_a, h_d_b, h_roots, kmax, cstride))
+    } else {
+        None
+    };
+
     unsafe {
         prof!(block begin "block2");
-        prof!(begin "cand_scatter");
-        cand_scatter::launch_unchecked(
-            &client,
-            tiles_grid(n_tiles),
-            CubeDim::new_1d(units as u32),
-            BufferArg::from_raw_parts(h_cslot.clone(), n),
-            BufferArg::from_raw_parts(h_cxc.clone(), n_tiles),
-            BufferArg::from_raw_parts(h_cup.clone(), n_tiles * units),
-            BufferArg::from_raw_parts(h_hp.clone(), c),
-            units,
-            rake,
-        );
-        prof!(end "cand_scatter");
-        prof!(begin "jump_build");
-        jump_build::launch_unchecked(
-            &client,
-            cubes_of(c + 1),
-            CubeDim::new_1d(256),
-            BufferArg::from_raw_parts(h_hp.clone(), c),
-            BufferArg::from_raw_parts(h_cend.clone(), n),
-            BufferArg::from_raw_parts(h_ir.clone(), ir.len()),
-            BufferArg::from_raw_parts(h_ctotal.clone(), 1),
-            BufferArg::from_raw_parts(h_parent.clone(), c + 1),
-        );
-        prof!(end "jump_build");
-        // The K rank steps ride ONE window (the bench's cluster_rank
-        // grouping): same kernel, ping-ponged buffers, K = ceil(log2(c+1)).
-        prof!(begin "cluster_rank");
-        let mut sp = h_parent.clone();
-        let mut sd = h_d0.clone();
-        for k in 0..kmax {
-            let tp = if k % 2 == 0 { h_parent_b.clone() } else { h_parent.clone() };
-            let td = if k % 2 == 0 { h_d_a.clone() } else { h_d_b.clone() };
-            rank_step::launch_unchecked(
+        if let Some((
+            ref h_lvl,
+            ref h_parent,
+            ref h_parent_b,
+            ref h_d0,
+            ref h_d_a,
+            ref h_d_b,
+            ref h_roots,
+            kmax,
+            cstride,
+        )) = cluster_allocs
+        {
+            prof!(begin "cand_scatter");
+            cand_scatter::launch_unchecked(
+                &client,
+                tiles_grid(n_tiles),
+                CubeDim::new_1d(units as u32),
+                BufferArg::from_raw_parts(h_cslot.clone(), n),
+                BufferArg::from_raw_parts(h_cxc.clone(), n_tiles),
+                BufferArg::from_raw_parts(h_cup.clone(), n_tiles * units),
+                BufferArg::from_raw_parts(h_hp.clone(), c),
+                units,
+                rake,
+            );
+            prof!(end "cand_scatter");
+            prof!(begin "jump_build");
+            jump_build::launch_unchecked(
                 &client,
                 cubes_of(c + 1),
                 CubeDim::new_1d(256),
-                BufferArg::from_raw_parts(sp.clone(), c + 1),
-                BufferArg::from_raw_parts(sd.clone(), c + 1),
-                BufferArg::from_raw_parts(tp.clone(), c + 1),
-                BufferArg::from_raw_parts(td.clone(), c + 1),
-                BufferArg::from_raw_parts(h_lvl.clone(), kmax * (c + 1)),
-                k,
-                cstride,
+                BufferArg::from_raw_parts(h_hp.clone(), c),
+                BufferArg::from_raw_parts(h_cend.clone(), n),
+                BufferArg::from_raw_parts(h_ir.clone(), ir.len()),
+                BufferArg::from_raw_parts(h_ctotal.clone(), 1),
+                BufferArg::from_raw_parts(h_parent.clone(), c + 1),
             );
-            sp = tp;
-            sd = td;
+            prof!(end "jump_build");
+            // The K rank steps ride ONE window (the bench's cluster_rank
+            // grouping): same kernel, ping-ponged buffers, K = ceil(log2(c+1)).
+            prof!(begin "cluster_rank");
+            let mut sp = h_parent.clone();
+            let mut sd = h_d0.clone();
+            for k in 0..kmax {
+                let tp = if k % 2 == 0 { h_parent_b.clone() } else { h_parent.clone() };
+                let td = if k % 2 == 0 { h_d_a.clone() } else { h_d_b.clone() };
+                rank_step::launch_unchecked(
+                    &client,
+                    cubes_of(c + 1),
+                    CubeDim::new_1d(256),
+                    BufferArg::from_raw_parts(sp.clone(), c + 1),
+                    BufferArg::from_raw_parts(sd.clone(), c + 1),
+                    BufferArg::from_raw_parts(tp.clone(), c + 1),
+                    BufferArg::from_raw_parts(td.clone(), c + 1),
+                    BufferArg::from_raw_parts(h_lvl.clone(), kmax * (c + 1)),
+                    k,
+                    cstride,
+                );
+                sp = tp;
+                sd = td;
+            }
+            prof!(end "cluster_rank");
+            prof!(begin "item_roots");
+            item_roots::launch_unchecked(
+                &client,
+                cubes_of(item_count.max(1)),
+                CubeDim::new_1d(256),
+                BufferArg::from_raw_parts(h_hp.clone(), c),
+                BufferArg::from_raw_parts(h_ctotal.clone(), 1),
+                BufferArg::from_raw_parts(h_ir.clone(), ir.len()),
+                BufferArg::from_raw_parts(h_ic.clone(), ic.len()),
+                BufferArg::from_raw_parts(h_roots.clone(), item_count),
+            );
+            prof!(end "item_roots");
+            prof!(begin "cluster_mark");
+            cluster_mark::launch_unchecked(
+                &client,
+                cubes_of(c.max(1)),
+                CubeDim::new_1d(256),
+                BufferArg::from_raw_parts(h_hp.clone(), c),
+                BufferArg::from_raw_parts(sd.clone(), c + 1),
+                BufferArg::from_raw_parts(h_lvl.clone(), kmax * (c + 1)),
+                BufferArg::from_raw_parts(h_ctotal.clone(), 1),
+                BufferArg::from_raw_parts(h_roots.clone(), item_count),
+                BufferArg::from_raw_parts(h_ir.clone(), ir.len()),
+                BufferArg::from_raw_parts(h_cend.clone(), n),
+                BufferArg::from_raw_parts(h_cslot.clone(), n),
+                BufferArg::from_raw_parts(h_sm.clone(), n),
+                BufferArg::from_raw_parts(h_gi.clone(), n),
+                BufferArg::from_raw_parts(h_fl.clone(), n_words),
+                kmax,
+                cstride,
+                bitmap_advance,
+            );
+            prof!(end "cluster_mark");
         }
-        prof!(end "cluster_rank");
-        prof!(begin "item_roots");
-        item_roots::launch_unchecked(
-            &client,
-            cubes_of(item_count.max(1)),
-            CubeDim::new_1d(256),
-            BufferArg::from_raw_parts(h_hp.clone(), c),
-            BufferArg::from_raw_parts(h_ctotal.clone(), 1),
-            BufferArg::from_raw_parts(h_ir.clone(), ir.len()),
-            BufferArg::from_raw_parts(h_ic.clone(), ic.len()),
-            BufferArg::from_raw_parts(h_roots.clone(), item_count),
-        );
-        prof!(end "item_roots");
-        prof!(begin "cluster_mark");
-        cluster_mark::launch_unchecked(
-            &client,
-            cubes_of(c.max(1)),
-            CubeDim::new_1d(256),
-            BufferArg::from_raw_parts(h_hp.clone(), c),
-            BufferArg::from_raw_parts(sd.clone(), c + 1),
-            BufferArg::from_raw_parts(h_lvl.clone(), kmax * (c + 1)),
-            BufferArg::from_raw_parts(h_ctotal.clone(), 1),
-            BufferArg::from_raw_parts(h_roots.clone(), item_count),
-            BufferArg::from_raw_parts(h_ir.clone(), ir.len()),
-            BufferArg::from_raw_parts(h_cend.clone(), n),
-            BufferArg::from_raw_parts(h_cslot.clone(), n),
-            BufferArg::from_raw_parts(h_sm.clone(), n),
-            BufferArg::from_raw_parts(h_gi.clone(), n),
-            BufferArg::from_raw_parts(h_fl.clone(), n_words),
-            kmax,
-            cstride,
-            bitmap_advance,
-        );
-        prof!(end "cluster_mark");
         prof!(begin "tile_scan");
         tile_scan::launch_unchecked(
             &client,
@@ -755,26 +745,6 @@ pub(crate) fn run_repo_chain(
             false,
         );
         prof!(end "apply");
-        prof!(begin "resolve_x");
-        resolve_x::launch_unchecked(
-            &client,
-            cubes_of(n.div_ceil(rspan)),
-            CubeDim::new_1d(256),
-            BufferArg::from_raw_parts(h_sm.clone(), n),
-            BufferArg::from_raw_parts(h_fl.clone(), n_words),
-            BufferArg::from_raw_parts(h_lm.clone(), n * LM_STRIDE),
-            BufferArg::from_raw_parts(h_lc.clone(), n * LC_STRIDE),
-            BufferArg::from_raw_parts(h_im.clone(), item_count * IM_STRIDE),
-            BufferArg::from_raw_parts(h_ie.clone(), ie.len()),
-            BufferArg::from_raw_parts(h_ir.clone(), ir.len()),
-            BufferArg::from_raw_parts(h_wc.clone(), n),
-            BufferArg::from_raw_parts(h_otb.clone(), n),
-            BufferArg::from_raw_parts(h_rmax.clone(), item_count),
-            BufferArg::from_raw_parts(h_xmax.clone(), item_count),
-            256,
-            rspan,
-        );
-        prof!(end "resolve_x");
         prof!(begin "extent_pair");
         extent_pair::launch_unchecked(
             &client,
@@ -798,20 +768,28 @@ pub(crate) fn run_repo_chain(
             BufferArg::from_raw_parts(h_strides.clone(), item_count * 2),
         );
         prof!(end "derive_stride");
-        prof!(begin "paginate");
-        paginate::launch_unchecked(
+        prof!(begin "resolve_x");
+        resolve_x::launch_unchecked(
             &client,
-            cubes_of(n),
+            cubes_of(n.div_ceil(rspan)),
             CubeDim::new_1d(256),
-            BufferArg::from_raw_parts(h_lm.clone(), n * LM_STRIDE),
+            BufferArg::from_raw_parts(h_sm.clone(), n),
             BufferArg::from_raw_parts(h_fl.clone(), n_words),
+            BufferArg::from_raw_parts(h_lm.clone(), n * LM_STRIDE),
             BufferArg::from_raw_parts(h_lc.clone(), n * LC_STRIDE),
             BufferArg::from_raw_parts(h_im.clone(), item_count * IM_STRIDE),
             BufferArg::from_raw_parts(h_ie.clone(), ie.len()),
             BufferArg::from_raw_parts(h_ir.clone(), ir.len()),
+            BufferArg::from_raw_parts(h_wc.clone(), n),
+            BufferArg::from_raw_parts(h_otb.clone(), n),
+            BufferArg::from_raw_parts(h_wm.clone(), n),
+            BufferArg::from_raw_parts(h_rmax.clone(), item_count),
+            BufferArg::from_raw_parts(h_xmax.clone(), item_count),
             BufferArg::from_raw_parts(h_strides.clone(), item_count * 2),
+            256,
+            rspan,
         );
-        prof!(end "paginate");
+        prof!(end "resolve_x");
         // THE SOLE EXTENT FOLDER (E4, 2026-09-30): the scatter's per-leader
         // atomics moved here — one raked pass, one atomic set per item-run.
         // Needs paginate's final lm; rides the survivor test on gi directly.
@@ -833,85 +811,51 @@ pub(crate) fn run_repo_chain(
         );
         prof!(end "extent_fold");
         // ── rung 5b: the survivor pass ──────────────────────────────────
-        // The proven cluster-counter machinery (count_tile/count_spine) on
-        // the two byte flags, then the ordinal scatter overwrites the flags
-        // with per-byte exclusive ordinals, then per-item totals from the
-        // boundaries. Runs in EVERY mode — rec_base itself comes from here
-        // now (the CPU leader scan is gone).
-        prof!(begin "survivor_flags");
-        survivor_flags::launch_unchecked(
+        // Fused dual-Blelloch counter (sv_count_tile/sv_count_spine) scanning
+        // fl and gi directly without intermediate byte flags, ordinal scatter
+        // writing global survivor slot indices directly to h_sv, and item_totals
+        // deriving per-item totals directly from spine and boundary scan.
+        prof!(begin "sv_count_tile");
+        sv_count_tile::launch_unchecked(
             &client,
-            cubes_of(n),
-            CubeDim::new_1d(256),
+            tiles_grid(n_tiles),
+            CubeDim::new_1d(units as u32),
             BufferArg::from_raw_parts(h_fl.clone(), n_words),
             BufferArg::from_raw_parts(h_gi.clone(), n),
-            BufferArg::from_raw_parts(h_lflag.clone(), n),
-            BufferArg::from_raw_parts(h_sflag.clone(), n),
-        );
-        prof!(end "survivor_flags");
-        prof!(begin "sv_count_tile_l");
-        count_tile::launch_unchecked(
-            &client,
-            tiles_grid(n_tiles),
-            CubeDim::new_1d(units as u32),
-            BufferArg::from_raw_parts(h_lflag.clone(), n),
             BufferArg::from_raw_parts(h_ltc.clone(), n_tiles),
-            BufferArg::from_raw_parts(h_lup.clone(), n_tiles * units),
-            units,
-            rake,
-            log,
-        );
-        prof!(end "sv_count_tile_l");
-        prof!(begin "sv_count_spine_l");
-        count_spine::launch_unchecked(
-            &client,
-            CubeCount::new_single(),
-            CubeDim::new_1d(units as u32),
-            BufferArg::from_raw_parts(h_ltc.clone(), n_tiles),
-            BufferArg::from_raw_parts(h_lxc.clone(), n_tiles),
-            BufferArg::from_raw_parts(h_lgrand.clone(), 1),
-            units,
-            log,
-        );
-        prof!(end "sv_count_spine_l");
-        prof!(begin "sv_count_tile_s");
-        count_tile::launch_unchecked(
-            &client,
-            tiles_grid(n_tiles),
-            CubeDim::new_1d(units as u32),
-            BufferArg::from_raw_parts(h_sflag.clone(), n),
             BufferArg::from_raw_parts(h_stc.clone(), n_tiles),
+            BufferArg::from_raw_parts(h_lup.clone(), n_tiles * units),
             BufferArg::from_raw_parts(h_sup.clone(), n_tiles * units),
             units,
             rake,
             log,
         );
-        prof!(end "sv_count_tile_s");
-        prof!(begin "sv_count_spine_s");
-        count_spine::launch_unchecked(
+        prof!(end "sv_count_tile");
+        prof!(begin "sv_count_spine");
+        sv_count_spine::launch_unchecked(
             &client,
             CubeCount::new_single(),
             CubeDim::new_1d(units as u32),
+            BufferArg::from_raw_parts(h_ltc.clone(), n_tiles),
             BufferArg::from_raw_parts(h_stc.clone(), n_tiles),
+            BufferArg::from_raw_parts(h_lxc.clone(), n_tiles),
             BufferArg::from_raw_parts(h_sxc.clone(), n_tiles),
+            BufferArg::from_raw_parts(h_lgrand.clone(), 1),
             BufferArg::from_raw_parts(h_sgrand.clone(), 1),
             units,
             log,
         );
-        prof!(end "sv_count_spine_s");
+        prof!(end "sv_count_spine");
         prof!(begin "ordinal_scatter");
         ordinal_scatter::launch_unchecked(
             &client,
             tiles_grid(n_tiles),
             CubeDim::new_1d(units as u32),
-            BufferArg::from_raw_parts(h_lflag.clone(), n),
-            BufferArg::from_raw_parts(h_sflag.clone(), n),
-            BufferArg::from_raw_parts(h_lxc.clone(), n_tiles),
+            BufferArg::from_raw_parts(h_fl.clone(), n_words),
+            BufferArg::from_raw_parts(h_gi.clone(), n),
             BufferArg::from_raw_parts(h_sxc.clone(), n_tiles),
-            BufferArg::from_raw_parts(h_lup.clone(), n_tiles * units),
             BufferArg::from_raw_parts(h_sup.clone(), n_tiles * units),
-            BufferArg::from_raw_parts(h_lflag.clone(), n),
-            BufferArg::from_raw_parts(h_sflag.clone(), n),
+            BufferArg::from_raw_parts(h_sv.clone(), n),
             units,
             rake,
         );
@@ -922,12 +866,17 @@ pub(crate) fn run_repo_chain(
             cubes_of(item_count.max(1)),
             CubeDim::new_1d(256),
             BufferArg::from_raw_parts(h_ir.clone(), ir.len()),
-            BufferArg::from_raw_parts(h_lflag.clone(), n),
-            BufferArg::from_raw_parts(h_sflag.clone(), n),
-            BufferArg::from_raw_parts(h_ltot.clone(), item_count),
-            BufferArg::from_raw_parts(h_stot.clone(), item_count),
+            BufferArg::from_raw_parts(h_fl.clone(), n_words),
+            BufferArg::from_raw_parts(h_gi.clone(), n),
+            BufferArg::from_raw_parts(h_lxc.clone(), n_tiles),
+            BufferArg::from_raw_parts(h_sxc.clone(), n_tiles),
+            BufferArg::from_raw_parts(h_lup.clone(), n_tiles * units),
+            BufferArg::from_raw_parts(h_sup.clone(), n_tiles * units),
             BufferArg::from_raw_parts(h_lgrand.clone(), 1),
             BufferArg::from_raw_parts(h_sgrand.clone(), 1),
+            BufferArg::from_raw_parts(h_totals.clone(), item_count * 2),
+            units,
+            rake,
         );
         prof!(end "item_totals");
         prof!(block end "block2");
@@ -948,10 +897,14 @@ pub(crate) fn run_repo_chain(
     // This is the CPU leader scan's replacement (its 0.195s at the 97MB
     // shape is what `prep` used to report).
     let t_tsync = std::time::Instant::now();
-    let tb_l = client.read_one(h_ltot.clone()).expect("leader totals");
-    let ltot: Vec<u32> = bytemuck::cast_slice(&tb_l)[..item_count].to_vec();
-    let tb_s = client.read_one(h_stot.clone()).expect("survivor totals");
-    let stot: Vec<u32> = bytemuck::cast_slice(&tb_s)[..item_count].to_vec();
+    let tb = client.read_one(h_totals.clone()).expect("totals readback");
+    let tv: &[u32] = bytemuck::cast_slice(&tb);
+    let mut ltot = Vec::with_capacity(item_count);
+    let mut stot = Vec::with_capacity(item_count);
+    for i in 0..item_count {
+        ltot.push(tv[i * 2]);
+        stot.push(tv[i * 2 + 1]);
+    }
     if prof_ok {
         prof_rows.push(("sync:totals_readback".to_string(), t_tsync.elapsed()));
     }
@@ -1006,8 +959,8 @@ pub(crate) fn run_repo_chain(
         drop((
             h_bytes, h_bi, h_bm, h_bc, h_seq, h_bmap, h_poff, h_pval, h_ic, h_ie, h_im, h_gap,
             h_plan, h_strides, h_rmax, h_xmax, h_extent, h_cslot, h_cend, h_tc, h_tm, h_xc, h_xm,
-            h_wm, h_otb, h_hp, h_lvl, h_parent, h_parent_b, h_d0, h_d_a, h_d_b, h_roots, h_lflag,
-            h_ltc, h_stc, h_lup, h_sup, h_lxc, h_sxc, h_lgrand, h_sgrand, h_ltot, h_stot,
+            h_wm, h_otb, h_hp, cluster_allocs,
+            h_ltc, h_stc, h_lup, h_sup, h_lxc, h_sxc, h_lgrand, h_sgrand, h_totals,
             h_ctotal,
         ));
         client.memory_cleanup();
@@ -1115,7 +1068,7 @@ pub(crate) fn run_repo_chain(
                 BufferArg::from_raw_parts(h_is_pr.clone(), item_count),
                 BufferArg::from_raw_parts(h_flat_colors.clone(), item_count),
                 BufferArg::from_raw_parts(h_groups.clone(), item_count),
-                BufferArg::from_raw_parts(h_sflag.clone(), n),
+                BufferArg::from_raw_parts(h_sv.clone(), n),
                 BufferArg::from_raw_parts(h_slots.clone(), total_slots.max(1) as usize * 8),
                 BufferArg::from_raw_parts(h_tint.clone(), total_slots.max(1) as usize * 2),
             );
@@ -1134,41 +1087,9 @@ pub(crate) fn run_repo_chain(
             || !device_ref.host_visible_storage
             || total_slots == 0
         {
-            let tb = client.read_one(h_tint.clone()).expect("read tint stream");
-            crate::layout::TintStore::Host(
-                bytemuck::cast_slice::<u8, u32>(&tb)[..total_slots as usize * 2].to_vec(),
-            )
+            read_tint_store_host(&client, h_tint.clone(), total_slots)
         } else {
-            let res = client
-                .get_resource::<WgpuServer<AutoCompiler>>(h_tint.clone())
-                .expect("tint stream resource");
-            let (src, src_off) = {
-                let r = res.resource();
-                (r.buffer.clone(), r.offset)
-            };
-            let bytes = (total_slots as usize * 8) as u64;
-            let (buf, ptr) = mapped_read_buffer(&device_ref.device, bytes.max(4), "tint stream");
-            let mut enc = device_ref
-                .device
-                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                    label: Some("tint stream copy"),
-                });
-            enc.copy_buffer_to_buffer(&src, src_off, &buf, 0, bytes.max(4));
-            device_ref.queue.submit([enc.finish()]);
-            device_ref
-                .device
-                .poll(wgpu::PollType::Wait {
-                    submission_index: None,
-                    timeout: None,
-                })
-                .expect("tint copy poll");
-            // `res` drops here — the cubecl tint slice returns to the pool.
-            // Queue order already moved the bytes; nothing pending reads it.
-            crate::layout::TintStore::Mapped(crate::layout::TintMapped {
-                buffer: buf,
-                ptr,
-                words: total_slots as usize * 2,
-            })
+            read_tint_store_unified(&client, device_ref, h_tint.clone(), total_slots)
         };
         drop(sp_tint);
         // The fork gate's lane tier reads the slot stream host-side.
@@ -1271,6 +1192,57 @@ pub(crate) fn run_repo_chain(
             dispatch: t_rb.duration_since(t_dispatch),
         },
     }
+}
+
+#[inline]
+fn read_tint_store_host(
+    client: &cubecl::client::Client,
+    h_tint: cubecl::server::Handle,
+    total_slots: u32,
+) -> crate::layout::TintStore {
+    let tb = client.read_one(h_tint).expect("read tint stream");
+    crate::layout::TintStore::Host(
+        bytemuck::cast_slice::<u8, u32>(&tb)[..total_slots as usize * 2].to_vec(),
+    )
+}
+
+#[inline]
+fn read_tint_store_unified(
+    client: &cubecl::client::Client,
+    device: &SharedDevice,
+    h_tint: cubecl::server::Handle,
+    total_slots: u32,
+) -> crate::layout::TintStore {
+    let res = client
+        .get_resource::<WgpuServer<AutoCompiler>>(h_tint)
+        .expect("tint stream resource");
+    let (src, src_off) = {
+        let r = res.resource();
+        (r.buffer.clone(), r.offset)
+    };
+    let bytes = (total_slots as usize * 8) as u64;
+    let (buf, ptr) = mapped_read_buffer(&device.device, bytes.max(4), "tint stream");
+    let mut enc = device
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("tint stream copy"),
+        });
+    enc.copy_buffer_to_buffer(&src, src_off, &buf, 0, bytes.max(4));
+    device.queue.submit([enc.finish()]);
+    device
+        .device
+        .poll(wgpu::PollType::Wait {
+            submission_index: None,
+            timeout: None,
+        })
+        .expect("tint copy poll");
+    // `res` drops here — the cubecl tint slice returns to the pool.
+    // Queue order already moved the bytes; nothing pending reads it.
+    crate::layout::TintStore::Mapped(crate::layout::TintMapped {
+        buffer: buf,
+        ptr,
+        words: total_slots as usize * 2,
+    })
 }
 
 /// A hal-mapped shared-storage readback target (Metal hosts only — the

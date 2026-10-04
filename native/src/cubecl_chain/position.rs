@@ -42,8 +42,10 @@ pub(super) fn resolve_x(
     ir: &[u32],
     wc: &[u32],
     otb: &[u32],
+    wm: &[f32],
     row_max: &mut [Atomic<u32>],
     x_max: &mut [Atomic<u32>],
+    strides: &[f32],
     #[comptime] units: usize,
     #[comptime] span: usize,
 ) {
@@ -102,21 +104,25 @@ pub(super) fn resolve_x(
                 fold = fold_of(ie, it, wrap);
             }
             let f = flags_at(fl, id);
-            if (f & F_LEADER) != 0 && fold > 0 {
+            if (f & F_LEADER) != 0 {
                 let col = lc[id * LC_STRIDE + LC_COL] as i32;
-                let head = col % fold == 0;
-                if !in_seg || head {
-                    // Entry walk (backward, once per segment entry; free at
-                    // a head where col % fold == 0 empties the loop).
-                    x = 0.0f32;
-                    let ord = wc[id] as i32;
-                    let mut k = col % fold;
-                    while k >= 1 {
-                        let q = otb[start + (ord - k) as usize] as usize;
-                        x += sm[q];
-                        k -= 1;
+                if fold > 0 {
+                    let head = col % fold == 0;
+                    if !in_seg || head {
+                        // Entry walk (backward, once per segment entry; free at
+                        // a head where col % fold == 0 empties the loop).
+                        x = 0.0f32;
+                        let ord = wc[id] as i32;
+                        let mut k = col % fold;
+                        while k >= 1 {
+                            let q = otb[start + (ord - k) as usize] as usize;
+                            x += sm[q];
+                            k -= 1;
+                        }
+                        in_seg = true;
                     }
-                    in_seg = true;
+                } else {
+                    x = wm[id];
                 }
                 let row = lc[id * LC_STRIDE + LC_ROW] as i32;
                 let io = it * IM_STRIDE;
@@ -124,19 +130,53 @@ pub(super) fn resolve_x(
                 let lh = items[io + IM_LINE_HEIGHT];
                 let mo = id * LM_STRIDE;
                 let base = x + items[io + IM_ORIGIN_X];
-                lm[mo + LM_BASE_X] = base;
-                lm[mo + LM_X] = base;
-                // Y/Z: one OPAQUE fma each — the engine's two-term f64
-                // expressions narrowed once (paginate's fma note); Z's
-                // second fma folds the z_step tail.
-                lm[mo + LM_Y] = fma(-(row as f32), lh, items[io + IM_ORIGIN_Y]);
+
+                let mut final_x = base;
+                let mut final_y = fma(-(row as f32), lh, items[io + IM_ORIGIN_Y]);
                 let depth_steps = -(wrap_segment as f32);
                 let z_tail_folded = fma(
                     depth_steps,
                     items[io + IM_Z_STEP_LO],
                     items[io + IM_ORIGIN_Z],
                 );
-                lm[mo + LM_Z] = fma(depth_steps, items[io + IM_Z_STEP], z_tail_folded);
+                let mut final_z = fma(depth_steps, items[io + IM_Z_STEP], z_tail_folded);
+
+                let ie_off = it * IE_STRIDE;
+                let has_page = ie[ie_off + IE_HAS_PAGE] != 0;
+                let rows = if has_page { ie[ie_off + IE_PAGE_ROWS] as i32 } else { 0 };
+                let cols = if has_page { ie[ie_off + IE_PAGE_COLS] as i32 } else { 0 };
+                let scroll = if has_page { ie[ie_off + IE_SCROLL_ROWS] as i32 } else { 0 };
+                if rows != 0 || cols != 0 || scroll != 0 {
+                    let screen_row = row - scroll;
+                    let mut y_page = 0;
+                    if rows > 0 && screen_row >= rows {
+                        y_page = screen_row / rows;
+                    }
+                    let mut x_page = 0;
+                    if cols > 0 {
+                        x_page = col / cols;
+                    }
+                    let pages_wide_raw = ie[ie_off + IE_PAGES_WIDE] as i32;
+                    let pages_wide = if pages_wide_raw > 1 { pages_wide_raw } else { 1 };
+                    let band = y_page / pages_wide;
+                    let page_col = (y_page % pages_wide) as f32;
+                    let stride_reach_tail = strides[it * 2 + 1];
+                    let stride_reach = strides[it * 2];
+                    let x_with_tail = fma(page_col, stride_reach_tail, base);
+                    final_x = fma(page_col, stride_reach, x_with_tail);
+                    let row_in_page = (screen_row - y_page * rows) as f32;
+                    let y_row_folded = fma(-row_in_page, lh, items[io + IM_ORIGIN_Y]);
+                    final_y = fma(-(band as f32), items[io + IM_BAND_STRIDE_Y], y_row_folded);
+                    let z_stepped = fma(depth_steps, items[io + IM_Z_STEP], z_tail_folded);
+                    let z_banded = fma(band as f32, items[io + IM_DEPTH_PER_BAND], z_stepped);
+                    final_z = fma(x_page as f32, items[io + IM_DEPTH_PER_COL], z_banded);
+                }
+
+                lm[mo + LM_BASE_X] = base;
+                lm[mo + LM_X] = final_x;
+                lm[mo + LM_Y] = final_y;
+                lm[mo + LM_Z] = final_z;
+
                 let slot = it - it_base;
                 if slot < RESOLVE_SLOTS {
                     srow[slot].fetch_max((row + 1) as u32);
@@ -145,7 +185,7 @@ pub(super) fn resolve_x(
                     row_max[it].fetch_max((row + 1) as u32);
                     x_max[it].fetch_max(ordered_key(x));
                 }
-                if (f & F_NEWLINE) == 0 {
+                if (f & F_NEWLINE) == 0 && fold > 0 {
                     // This leader's advance feeds the next x — the same add
                     // the backward re-sum performed, one step forward.
                     x += sm[id];
@@ -285,7 +325,8 @@ pub(super) fn derive_stride(
     }
 }
 
-// ── dispatch 6: paginate — thread per byte, leaders only ─────────────────────
+// ── legacy dispatch: paginate (now fused directly into resolve_x) ────────────
+#[allow(dead_code)]
 #[cube(launch_unchecked)]
 pub(super) fn paginate(
     lm: &mut [f32],

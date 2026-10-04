@@ -112,87 +112,285 @@ pub(super) fn key_to_float_host(k: u32) -> f32 {
 /// Unpack the leader flag and AND it with glyph-id-resolved into two plain
 /// u32 byte flags — the predicate inputs count_tile/count_spine already
 /// run on (any nonzero byte counts).
+/// Fused leader and survivor count per tile — computes both ltc/stc and lup/sup
+/// in a single dual-Blelloch pass directly over `fl` and `gi`. Eliminates the
+/// `survivor_flags` intermediate flags pass and fuses the two separate
+/// count_tile launches into one.
 #[cube(launch_unchecked)]
-pub(super) fn survivor_flags(fl: &[u32], gi: &[u32], lflag: &mut [u32], sflag: &mut [u32]) {
-    let b = ABSOLUTE_POS;
-    let n = lflag.len();
-    if b < n {
-        let lead = if flags_at(fl, b) & F_LEADER != 0u32 { 1u32 } else { 0u32 };
-        let surv = if lead != 0u32 && gi[b] != 0u32 { 1u32 } else { 0u32 };
-        lflag[b] = lead;
-        sflag[b] = surv;
+pub(super) fn sv_count_tile(
+    fl: &[u32],
+    gi: &[u32],
+    ltc: &mut [u32],
+    stc: &mut [u32],
+    lup: &mut [u32],
+    sup: &mut [u32],
+    #[comptime] units: usize,
+    #[comptime] rake: usize,
+    #[comptime] log: usize,
+) {
+    let tile = CUBE_POS;
+    let u = UNIT_POS as usize;
+    let n = gi.len();
+    let lo = tile * (units * rake) + u * rake;
+    let hi = if lo + rake < n { lo + rake } else { n };
+    let mut cl = 0u32;
+    let mut cs = 0u32;
+    if lo < n {
+        let mut id = lo;
+        while id < hi {
+            let lead = if flags_at(fl, id) & F_LEADER != 0u32 { 1u32 } else { 0u32 };
+            cl += lead;
+            if lead != 0u32 && gi[id] != 0u32 {
+                cs += 1u32;
+            }
+            id += 1usize;
+        }
+    }
+    let mut scl = Shared::<[u32]>::new_slice(units);
+    let mut scs = Shared::<[u32]>::new_slice(units);
+    scl[u] = cl;
+    scs[u] = cs;
+    #[unroll]
+    for d in 0..log {
+        sync_cube();
+        let s = 1usize << d;
+        if (u + 1) & (2 * s - 1) == 0 {
+            scl[u] += scl[u - s];
+            scs[u] += scs[u - s];
+        }
+    }
+    sync_cube();
+    if u == units - 1 {
+        ltc[tile] = scl[u];
+        stc[tile] = scs[u];
+        scl[u] = 0u32;
+        scs[u] = 0u32;
+    }
+    #[unroll]
+    for d in 0..log {
+        sync_cube();
+        let s = units >> (d + 1);
+        if (u + 1) & (2 * s - 1) == 0 {
+            let tl = scl[u];
+            scl[u] += scl[u - s];
+            scl[u - s] = tl;
+
+            let ts = scs[u];
+            scs[u] += scs[u - s];
+            scs[u - s] = ts;
+        }
+    }
+    sync_cube();
+    lup[tile * units + u] = scl[u];
+    sup[tile * units + u] = scs[u];
+}
+
+/// Fused leader and survivor spine scan — reduces tile totals from `ltc` and `stc`
+/// across tiles in a single dual-Blelloch pass, writing exclusive tile bases `lxc`/`sxc`
+/// and grand totals `lgrand`/`sgrand`.
+#[cube(launch_unchecked)]
+pub(super) fn sv_count_spine(
+    ltc: &[u32],
+    stc: &[u32],
+    lxc: &mut [u32],
+    sxc: &mut [u32],
+    lgrand: &mut [u32],
+    sgrand: &mut [u32],
+    #[comptime] units: usize,
+    #[comptime] log: usize,
+) {
+    let u = UNIT_POS as usize;
+    let n_tiles = ltc.len();
+    let per = n_tiles.div_ceil(units);
+    let first = u * per;
+    let last = if first + per < n_tiles { first + per } else { n_tiles };
+    let mut accl = 0u32;
+    let mut accs = 0u32;
+    if first < n_tiles {
+        let mut t = first;
+        while t < last {
+            accl += ltc[t];
+            accs += stc[t];
+            t += 1usize;
+        }
+    }
+    let mut scl = Shared::<[u32]>::new_slice(units);
+    let mut scs = Shared::<[u32]>::new_slice(units);
+    scl[u] = accl;
+    scs[u] = accs;
+    #[unroll]
+    for d in 0..log {
+        sync_cube();
+        let s = 1usize << d;
+        if (u + 1) & (2 * s - 1) == 0 {
+            scl[u] += scl[u - s];
+            scs[u] += scs[u - s];
+        }
+    }
+    sync_cube();
+    if u == units - 1 {
+        scl[u] = 0u32;
+        scs[u] = 0u32;
+    }
+    #[unroll]
+    for d in 0..log {
+        sync_cube();
+        let s = units >> (d + 1);
+        if (u + 1) & (2 * s - 1) == 0 {
+            let tl = scl[u];
+            scl[u] += scl[u - s];
+            scl[u - s] = tl;
+
+            let ts = scs[u];
+            scs[u] += scs[u - s];
+            scs[u - s] = ts;
+        }
+    }
+    sync_cube();
+    let mut prel = scl[u];
+    let mut pres = scs[u];
+    if first < n_tiles {
+        for t in first..last {
+            lxc[t] = prel;
+            prel += ltc[t];
+
+            sxc[t] = pres;
+            pres += stc[t];
+        }
+        if last == n_tiles {
+            lgrand[0] = prel;
+            sgrand[0] = pres;
+        }
     }
 }
 
-/// Per-byte EXCLUSIVE leader/survivor ordinals, written at EVERY byte (not
-/// just leaders) so item-boundary reads are well-defined everywhere:
-/// `lv[b]` = leaders strictly before b, `sv[b]` = survivors strictly
-/// before b. Global byte order is walk order, which IS the arena's slot
-/// order — so `sv[b]` is a survivor's global slot index, and lv at an
-/// item's start is
-/// that item's record base. The flag buffers are consumed and overwritten
-/// in the same serial walk (flags read before ordinals written per slot),
-/// which is why lv/sv may alias lflag/sflag.
+/// Global survivor ordinals written at every byte: `sv[id]` = survivors strictly
+/// before `id`. Global byte order is arena slot order, so `sv[id]` is a survivor's
+/// global slot index directly consumed by `scatter_slots`.
 #[cube(launch_unchecked)]
 pub(super) fn ordinal_scatter(
-    lflag: &[u32],
-    sflag: &[u32],
-    lxc: &[u32],
+    fl: &[u32],
+    gi: &[u32],
     sxc: &[u32],
-    lup: &[u32],
     sup: &[u32],
-    lv: &mut [u32],
     sv: &mut [u32],
     #[comptime] units: usize,
     #[comptime] rake: usize,
 ) {
     let tile = CUBE_POS;
     let u = UNIT_POS as usize;
-    let n = lflag.len();
+    let n = sv.len();
     let lo = tile * (units * rake) + u * rake;
     let hi = if lo + rake < n { lo + rake } else { n };
-    let mut cl = lxc[tile] + lup[tile * units + u];
     let mut cs = sxc[tile] + sup[tile * units + u];
     if lo < n {
         let mut id = lo;
         while id < hi {
-            let fl_ = lflag[id];
-            let fs_ = sflag[id];
-            lv[id] = cl;
+            let lead = if flags_at(fl, id) & F_LEADER != 0u32 { 1u32 } else { 0u32 };
+            let surv = if lead != 0u32 && gi[id] != 0u32 { 1u32 } else { 0u32 };
             sv[id] = cs;
-            cl += fl_;
-            cs += fs_;
+            cs += surv;
             id += 1usize;
         }
     }
 }
 
-/// Per-item leader and survivor totals from the boundary ordinals:
-/// `tot[it]` = `lv[item_end]` − `lv[item_start]`. An end at the corpus edge
-/// (the last item, or an empty file parked there) closes on the grand
-/// totals from the spines — `lv[n]` is the pad region and unwritten.
+/// Per-item leader and survivor totals computed directly from the spine + tile prefix
+/// sums and boundary byte scanning (at most `rake` iterations per boundary).
+/// Eliminates the need for any whole-corpus `lv` buffer.
 #[cube(launch_unchecked)]
 pub(super) fn item_totals(
     ir: &[u32],
-    lv: &[u32],
-    sv: &[u32],
-    ltot: &mut [u32],
-    stot: &mut [u32],
+    fl: &[u32],
+    gi: &[u32],
+    lxc: &[u32],
+    sxc: &[u32],
+    lup: &[u32],
+    sup: &[u32],
     lgrand: &[u32],
     sgrand: &[u32],
+    totals: &mut [u32],
+    #[comptime] units: usize,
+    #[comptime] rake: usize,
 ) {
     let it = ABSOLUTE_POS;
     let item_count = ir.len() / 2;
     if it < item_count {
-        let n = lv.len();
+        let n = gi.len();
         let s = ir[it * 2] as usize;
         let e = ir[it * 2 + 1] as usize;
-        let ls = if s < n { lv[s] } else { lgrand[0] };
-        let le = if e < n { lv[e] } else { lgrand[0] };
-        ltot[it] = le - ls;
-        let ss = if s < n { sv[s] } else { sgrand[0] };
-        let se = if e < n { sv[e] } else { sgrand[0] };
-        stot[it] = se - ss;
+
+        // Leader prefix at s and e
+        let ls = if s >= n {
+            lgrand[0]
+        } else {
+            let tile = s / (units * rake);
+            let u = (s % (units * rake)) / rake;
+            let lo = tile * (units * rake) + u * rake;
+            let mut c = lxc[tile] + lup[tile * units + u];
+            let mut id = lo;
+            while id < s {
+                if flags_at(fl, id) & F_LEADER != 0u32 {
+                    c += 1u32;
+                }
+                id += 1usize;
+            }
+            c
+        };
+        let le = if e >= n {
+            lgrand[0]
+        } else {
+            let tile = e / (units * rake);
+            let u = (e % (units * rake)) / rake;
+            let lo = tile * (units * rake) + u * rake;
+            let mut c = lxc[tile] + lup[tile * units + u];
+            let mut id = lo;
+            while id < e {
+                if flags_at(fl, id) & F_LEADER != 0u32 {
+                    c += 1u32;
+                }
+                id += 1usize;
+            }
+            c
+        };
+        totals[it * 2] = le - ls;
+
+        // Survivor prefix at s and e
+        let ss = if s >= n {
+            sgrand[0]
+        } else {
+            let tile = s / (units * rake);
+            let u = (s % (units * rake)) / rake;
+            let lo = tile * (units * rake) + u * rake;
+            let mut c = sxc[tile] + sup[tile * units + u];
+            let mut id = lo;
+            while id < s {
+                let lead = if flags_at(fl, id) & F_LEADER != 0u32 { 1u32 } else { 0u32 };
+                if lead != 0u32 && gi[id] != 0u32 {
+                    c += 1u32;
+                }
+                id += 1usize;
+            }
+            c
+        };
+        let se = if e >= n {
+            sgrand[0]
+        } else {
+            let tile = e / (units * rake);
+            let u = (e % (units * rake)) / rake;
+            let lo = tile * (units * rake) + u * rake;
+            let mut c = sxc[tile] + sup[tile * units + u];
+            let mut id = lo;
+            while id < e {
+                let lead = if flags_at(fl, id) & F_LEADER != 0u32 { 1u32 } else { 0u32 };
+                if lead != 0u32 && gi[id] != 0u32 {
+                    c += 1u32;
+                }
+                id += 1usize;
+            }
+            c
+        };
+        totals[it * 2 + 1] = se - ss;
     }
 }
 
