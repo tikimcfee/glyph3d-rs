@@ -469,6 +469,7 @@ pub fn bench(ctx: &GpuContext, corpus_path: &Path) -> ! {
                     BufferArg::from_raw_parts(h_ir.clone(), 2),
                     BufferArg::from_raw_parts(h_ctotal.clone(), 1),
                     BufferArg::from_raw_parts(h_parent.clone(), c_host + 1),
+                    BufferArg::from_raw_parts(h_d0.clone(), c_host + 1),
                 );
                 // Fresh level-0 sources each sample — and the rotation
                 // never writes h_d0 (round 1 of a naive ping-pong would,

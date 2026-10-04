@@ -54,6 +54,7 @@ pub(crate) struct ChainBuffers {
     pub h_cxc: Option<Handle>,
     pub h_ctotal: Option<Handle>,
     pub h_hp: Option<Handle>,
+    pub cluster_allocs: Option<ClusterCandidateAllocs>,
 
     // Survivor scan buffers
     pub h_ltc: Option<Handle>,
@@ -73,6 +74,20 @@ pub(crate) struct ChainBuffers {
     pub h_is_pr: Handle,
     pub h_flat_colors: Handle,
     pub h_groups: Handle,
+}
+
+#[derive(Clone)]
+pub(crate) struct ClusterCandidateAllocs {
+    pub h_lvl: Handle,
+    pub h_parent: Handle,
+    pub h_parent_b: Handle,
+    pub h_d0: Handle,
+    pub h_d_a: Handle,
+    pub h_d_b: Handle,
+    pub h_roots: Handle,
+    pub c_cap: usize,
+    pub kmax: usize,
+    pub cstride: usize,
 }
 
 impl ChainBuffers {
@@ -107,7 +122,7 @@ impl ChainBuffers {
         self.h_ctc = None;
         self.h_cup = None;
         self.h_cxc = None;
-        self.h_ctotal = None;
+        self.cluster_allocs = None;
         self.h_ltc = None;
         self.h_stc = None;
         self.h_lup = None;
@@ -120,6 +135,7 @@ impl ChainBuffers {
     pub(crate) fn release_survivor_scan(&mut self) {
         self.h_sup = None;
         self.h_sxc = None;
+        self.h_ctotal = None;
     }
 }
 
@@ -215,6 +231,32 @@ pub(crate) fn allocate_chain_buffers(
     let h_is_pr = alloc_upload(bytemuck::cast_slice(&instance_inputs.is_per_record));
     let h_flat_colors = alloc_upload(bytemuck::cast_slice(&instance_inputs.flat_colors));
     let h_groups = alloc_upload(bytemuck::cast_slice(&instance_inputs.groups));
+    let cluster_allocs = if inputs.has_cluster {
+        let c_cap = 16384usize.min(n.max(256));
+        let kmax = ((c_cap as u32 + 1).next_power_of_two().trailing_zeros()) as usize;
+        let cstride = c_cap + 1;
+        let h_lvl = alloc_empty(kmax * cstride * 4);
+        let h_parent = alloc_empty(cstride * 4);
+        let h_parent_b = alloc_empty(cstride * 4);
+        let h_d0 = alloc_empty(cstride * 4);
+        let h_d_a = alloc_empty(cstride * 4);
+        let h_d_b = alloc_empty(cstride * 4);
+        let h_roots = alloc_empty(item_count.max(1) * 4);
+        Some(ClusterCandidateAllocs {
+            h_lvl,
+            h_parent,
+            h_parent_b,
+            h_d0,
+            h_d_a,
+            h_d_b,
+            h_roots,
+            c_cap,
+            kmax,
+            cstride,
+        })
+    } else {
+        None
+    };
 
     BufferAllocationResult {
         buffers: ChainBuffers {
@@ -259,6 +301,7 @@ pub(crate) fn allocate_chain_buffers(
             h_cxc: Some(h_cxc),
             h_ctotal: Some(h_ctotal),
             h_hp: Some(h_hp),
+            cluster_allocs,
             h_ltc: Some(h_ltc),
             h_stc: Some(h_stc),
             h_lup: Some(h_lup),

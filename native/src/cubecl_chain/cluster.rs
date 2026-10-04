@@ -556,40 +556,49 @@ pub(super) fn jump_build(
     ir: &[u32],
     c_count: &[u32],
     parent: &mut [u32],
+    d0: &mut [u32],
 ) {
     let i = ABSOLUTE_POS;
     let c = c_count[0] as usize;
-    if i == c {
-        parent[i] = i as u32;
-    }
-    if i < c {
-        let p = hp[i] as usize;
-        let e = cend[p] as usize;
-        let item_count = ir.len() / 2;
-        let stop = if item_count > 0 {
-            let it = item_search(ir, item_count, p);
-            ir[it * 2 + 1] as usize
-        } else {
-            e
-        };
-        // Lower bound over hp (guarded-if form — the landmine-safe binary
-        // search shape the probe uses).
-        let mut lo = 0u32;
-        let mut hi = c as u32;
-        while lo < hi {
-            let mid = (lo + hi) / 2u32;
-            if (hp[mid as usize] as usize) < e {
-                lo = mid + 1u32;
+    if i < parent.len() {
+        if i == c {
+            parent[i] = i as u32;
+            d0[i] = 0u32;
+        }
+        if i < c {
+            d0[i] = 1u32;
+            let p = hp[i] as usize;
+            let e = cend[p] as usize;
+            let item_count = ir.len() / 2;
+            let stop = if item_count > 0 {
+                let it = item_search(ir, item_count, p);
+                ir[it * 2 + 1] as usize
+            } else {
+                e
+            };
+            // Lower bound over hp (guarded-if form — the landmine-safe binary
+            // search shape the probe uses).
+            let mut lo = 0u32;
+            let mut hi = c as u32;
+            while lo < hi {
+                let mid = (lo + hi) / 2u32;
+                if (hp[mid as usize] as usize) < e {
+                    lo = mid + 1u32;
+                }
+                if (hp[mid as usize] as usize) >= e {
+                    hi = mid;
+                }
             }
-            if (hp[mid as usize] as usize) >= e {
-                hi = mid;
+            let j = lo as usize;
+            if j < c && (hp[j] as usize) < stop {
+                parent[i] = j as u32;
+            } else {
+                parent[i] = c as u32;
             }
         }
-        let j = lo as usize;
-        if j < c && (hp[j] as usize) < stop {
-            parent[i] = j as u32;
-        } else {
+        if i > c {
             parent[i] = c as u32;
+            d0[i] = 0u32;
         }
     }
 }
@@ -631,22 +640,26 @@ pub(super) fn item_roots(
     let it = ABSOLUTE_POS;
     let item_count = ir.len() / 2;
     let c = c_count[0];
-    if it < item_count && ic[it] != 0u32 {
-        let s = ir[it * 2] as usize;
-        let mut lo = 0u32;
-        let mut hi = c;
-        while lo < hi {
-            let mid = (lo + hi) / 2u32;
-            if (hp[mid as usize] as usize) < s {
-                lo = mid + 1u32;
+    if it < item_count {
+        if ic[it] != 0u32 {
+            let s = ir[it * 2] as usize;
+            let mut lo = 0u32;
+            let mut hi = c;
+            while lo < hi {
+                let mid = (lo + hi) / 2u32;
+                if (hp[mid as usize] as usize) < s {
+                    lo = mid + 1u32;
+                }
+                if (hp[mid as usize] as usize) >= s {
+                    hi = mid;
+                }
             }
-            if (hp[mid as usize] as usize) >= s {
-                hi = mid;
+            let stop = ir[it * 2 + 1] as usize;
+            if lo < c && (hp[lo as usize] as usize) < stop {
+                roots[it] = lo;
+            } else {
+                roots[it] = c;
             }
-        }
-        let stop = ir[it * 2 + 1] as usize;
-        if lo < c && (hp[lo as usize] as usize) < stop {
-            roots[it] = lo;
         } else {
             roots[it] = c;
         }

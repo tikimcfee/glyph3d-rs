@@ -8,7 +8,7 @@ mod tail_readback;
 
 use buffers::allocate_chain_buffers;
 use dispatch::{
-    launch_block1, launch_block2_geometry, launch_block2_totals, resolve_candidates,
+    launch_block1, launch_block2_geometry, launch_block2_totals,
     ChainProfiler,
 };
 use prep::prepare_chain_inputs;
@@ -221,19 +221,14 @@ pub(crate) fn run_repo_chain(
 
     launch_block1(&client, n, &host_inputs, &buf, &mut prof);
 
-    let (c, cluster_allocs) = resolve_candidates(&client, &buf, item_count, &mut prof);
-
     launch_block2_totals(
         &client,
         n,
         item_count,
         &host_inputs,
         &buf,
-        c,
-        cluster_allocs.as_ref(),
         &mut prof,
     );
-    drop(cluster_allocs);
 
     launch_block2_geometry(
         &client,
@@ -401,10 +396,15 @@ pub(crate) fn run_repo_chain(
         }
 
         slot_device = package_slot_device(&client, h_slots, total_slots);
-        buf.release_survivor_scan();
-    } else {
-        buf.release_survivor_scan();
     }
+
+    let c = if let Some(ref h_ctotal) = buf.h_ctotal {
+        let tb = client.read_one(h_ctotal.clone()).expect("candidate count");
+        bytemuck::cast_slice::<u8, u32>(&tb)[0] as usize
+    } else {
+        0
+    };
+    buf.release_survivor_scan();
 
     prof.print_summary();
 

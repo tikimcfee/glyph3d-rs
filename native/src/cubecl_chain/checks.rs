@@ -901,6 +901,7 @@ pub fn cluster_check(ctx: &GpuContext, fixture_path: &Path) -> ! {
             BufferArg::from_raw_parts(h_ir.clone(), ir.len()),
             BufferArg::from_raw_parts(h_total.clone(), 1),
             BufferArg::from_raw_parts(h_parent.clone(), c + 1),
+            BufferArg::from_raw_parts(h_d0.clone(), c + 1),
         );
         for k in 0..kmax {
             let tp = if k % 2 == 0 { h_parent_b.clone() } else { h_parent.clone() };

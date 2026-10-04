@@ -38,6 +38,7 @@ pub(crate) struct ChainHostInputs {
     pub slot_base: Vec<u32>,
     pub total_records: u32,
     pub total_slots: u32,
+    pub has_cluster: bool,
 }
 
 pub(crate) struct ItemScan {
@@ -354,5 +355,6 @@ pub(crate) fn prepare_chain_inputs(
         slot_base,
         total_records,
         total_slots,
+        has_cluster: items.iter().any(|it| it.cluster_mode == crate::fold::ClusterMode::Cluster),
     }
 }

@@ -2,7 +2,6 @@
 
 use cubecl::client::{Client, ProfileWindow};
 use cubecl::prelude::*;
-use cubecl::server::Handle;
 
 use super::super::cluster::{
     cand_scatter, cluster_mark, cluster_probe, count_spine, count_tile, item_roots, jump_build,
@@ -28,18 +27,6 @@ pub(crate) fn cubes_of(threads: usize) -> CubeCount {
 #[inline]
 pub(crate) fn tiles_grid(tiles: usize) -> CubeCount {
     CubeCount::Static(tiles.min(65535) as u32, tiles.div_ceil(65535) as u32, 1)
-}
-
-pub(crate) struct ClusterCandidateAllocs {
-    pub h_lvl: Handle,
-    pub h_parent: Handle,
-    pub h_parent_b: Handle,
-    pub h_d0: Handle,
-    pub h_d_a: Handle,
-    pub h_d_b: Handle,
-    pub h_roots: Handle,
-    pub kmax: usize,
-    pub cstride: usize,
 }
 
 /// Profiler instrument for per-stage GPU timing windows.
@@ -255,58 +242,13 @@ pub(crate) fn launch_block1(
     }
 }
 
-/// Reads back candidate count `c` and allocates cluster structures when `c > 0`.
-pub(crate) fn resolve_candidates(
-    client: &Client,
-    buf: &ChainBuffers,
-    item_count: usize,
-    prof: &mut ChainProfiler,
-) -> (usize, Option<ClusterCandidateAllocs>) {
-    let t_csync = std::time::Instant::now();
-    let tb = client.read_one(buf.h_ctotal.as_ref().unwrap().clone()).expect("candidate count");
-    let c = bytemuck::cast_slice::<u8, u32>(&tb)[0] as usize;
-    prof.record_sync("sync:cand_readback", t_csync.elapsed());
-
-    let allocs = if c > 0 {
-        let kmax = ((c as u32 + 1).next_power_of_two().trailing_zeros()) as usize;
-        let cstride = c + 1;
-        let h_lvl = client.empty((kmax * (c + 1)).max(1) * 4);
-        let h_parent = client.empty((c + 1) * 4);
-        let h_parent_b = client.empty((c + 1) * 4);
-        let mut d0 = vec![1u32; c + 1];
-        d0[c] = 0;
-        let h_d0 = client.create_from_slice(bytemuck::cast_slice(&d0));
-        let h_d_a = client.empty((c + 1) * 4);
-        let h_d_b = client.empty((c + 1) * 4);
-        let h_roots = client.create_from_slice(bytemuck::cast_slice(&vec![c as u32; item_count]));
-        Some(ClusterCandidateAllocs {
-            h_lvl,
-            h_parent,
-            h_parent_b,
-            h_d0,
-            h_d_a,
-            h_d_b,
-            h_roots,
-            kmax,
-            cstride,
-        })
-    } else {
-        None
-    };
-
-    (c, allocs)
-}
-
 /// Executes Block 2 Part A: candidate resolution (if any), survivor counting (sv_count_tile, sv_count_spine), and item_totals.
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn launch_block2_totals(
     client: &Client,
     n: usize,
     item_count: usize,
     inputs: &ChainHostInputs,
     buf: &ChainBuffers,
-    c: usize,
-    cluster_allocs: Option<&ClusterCandidateAllocs>,
     prof: &mut ChainProfiler,
 ) {
     let n_tiles = inputs.n_tiles;
@@ -317,9 +259,11 @@ pub(crate) fn launch_block2_totals(
 
     unsafe {
         prof.block_begin(client, "block2_totals");
-        if let Some(ca) = cluster_allocs {
+        if let Some(ref ca) = buf.cluster_allocs {
             let kmax = ca.kmax;
             let cstride = ca.cstride;
+            let c_cap = ca.c_cap;
+
             prof.begin(client, "cand_scatter");
             cand_scatter::launch_unchecked(
                 client,
@@ -328,7 +272,7 @@ pub(crate) fn launch_block2_totals(
                 BufferArg::from_raw_parts(buf.h_cslot.as_ref().unwrap().clone(), n),
                 BufferArg::from_raw_parts(buf.h_cxc.as_ref().unwrap().clone(), n_tiles),
                 BufferArg::from_raw_parts(buf.h_cup.as_ref().unwrap().clone(), n_tiles * units),
-                BufferArg::from_raw_parts(buf.h_hp.as_ref().unwrap().clone(), c),
+                BufferArg::from_raw_parts(buf.h_hp.as_ref().unwrap().clone(), n),
                 units,
                 rake,
             );
@@ -337,13 +281,14 @@ pub(crate) fn launch_block2_totals(
             prof.begin(client, "jump_build");
             jump_build::launch_unchecked(
                 client,
-                cubes_of(c + 1),
+                cubes_of(cstride),
                 CubeDim::new_1d(256),
-                BufferArg::from_raw_parts(buf.h_hp.as_ref().unwrap().clone(), c),
+                BufferArg::from_raw_parts(buf.h_hp.as_ref().unwrap().clone(), n),
                 BufferArg::from_raw_parts(buf.h_cend.as_ref().unwrap().clone(), n),
                 BufferArg::from_raw_parts(buf.h_ir.clone(), inputs.ir.len()),
                 BufferArg::from_raw_parts(buf.h_ctotal.as_ref().unwrap().clone(), 1),
-                BufferArg::from_raw_parts(ca.h_parent.clone(), c + 1),
+                BufferArg::from_raw_parts(ca.h_parent.clone(), cstride),
+                BufferArg::from_raw_parts(ca.h_d0.clone(), cstride),
             );
             prof.end(client, "jump_build");
 
@@ -355,13 +300,13 @@ pub(crate) fn launch_block2_totals(
                 let td = if k % 2 == 0 { ca.h_d_a.clone() } else { ca.h_d_b.clone() };
                 rank_step::launch_unchecked(
                     client,
-                    cubes_of(c + 1),
+                    cubes_of(cstride),
                     CubeDim::new_1d(256),
-                    BufferArg::from_raw_parts(sp.clone(), c + 1),
-                    BufferArg::from_raw_parts(sd.clone(), c + 1),
-                    BufferArg::from_raw_parts(tp.clone(), c + 1),
-                    BufferArg::from_raw_parts(td.clone(), c + 1),
-                    BufferArg::from_raw_parts(ca.h_lvl.clone(), kmax * (c + 1)),
+                    BufferArg::from_raw_parts(sp.clone(), cstride),
+                    BufferArg::from_raw_parts(sd.clone(), cstride),
+                    BufferArg::from_raw_parts(tp.clone(), cstride),
+                    BufferArg::from_raw_parts(td.clone(), cstride),
+                    BufferArg::from_raw_parts(ca.h_lvl.clone(), kmax * cstride),
                     k,
                     cstride,
                 );
@@ -375,24 +320,24 @@ pub(crate) fn launch_block2_totals(
                 client,
                 cubes_of(item_count.max(1)),
                 CubeDim::new_1d(256),
-                BufferArg::from_raw_parts(buf.h_hp.as_ref().unwrap().clone(), c),
+                BufferArg::from_raw_parts(buf.h_hp.as_ref().unwrap().clone(), n),
                 BufferArg::from_raw_parts(buf.h_ctotal.as_ref().unwrap().clone(), 1),
                 BufferArg::from_raw_parts(buf.h_ir.clone(), inputs.ir.len()),
                 BufferArg::from_raw_parts(buf.h_ic.as_ref().unwrap().clone(), inputs.ic.len()),
-                BufferArg::from_raw_parts(ca.h_roots.clone(), item_count),
+                BufferArg::from_raw_parts(ca.h_roots.clone(), item_count.max(1)),
             );
             prof.end(client, "item_roots");
 
             prof.begin(client, "cluster_mark");
             cluster_mark::launch_unchecked(
                 client,
-                cubes_of(c.max(1)),
+                cubes_of(c_cap),
                 CubeDim::new_1d(256),
-                BufferArg::from_raw_parts(buf.h_hp.as_ref().unwrap().clone(), c),
-                BufferArg::from_raw_parts(sd.clone(), c + 1),
-                BufferArg::from_raw_parts(ca.h_lvl.clone(), kmax * (c + 1)),
+                BufferArg::from_raw_parts(buf.h_hp.as_ref().unwrap().clone(), n),
+                BufferArg::from_raw_parts(sd.clone(), cstride),
+                BufferArg::from_raw_parts(ca.h_lvl.clone(), kmax * cstride),
                 BufferArg::from_raw_parts(buf.h_ctotal.as_ref().unwrap().clone(), 1),
-                BufferArg::from_raw_parts(ca.h_roots.clone(), item_count),
+                BufferArg::from_raw_parts(ca.h_roots.clone(), item_count.max(1)),
                 BufferArg::from_raw_parts(buf.h_ir.clone(), inputs.ir.len()),
                 BufferArg::from_raw_parts(buf.h_cend.as_ref().unwrap().clone(), n),
                 BufferArg::from_raw_parts(buf.h_cslot.as_ref().unwrap().clone(), n),
