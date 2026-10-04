@@ -394,4 +394,16 @@ impl SpatialScene {
         let mut deck = self.world.get_mut::<Deck>(deck_entity)?;
         Some(deck.toggle_mode())
     }
+
+    /// Set active page in a Deck entity.
+    pub fn deck_set_active(&mut self, deck_entity: Entity, active_index: usize) {
+        let total = self
+            .world
+            .get::<Children>(deck_entity)
+            .map(|c| c.len())
+            .unwrap_or(0);
+        if let Some(mut deck) = self.world.get_mut::<Deck>(deck_entity) {
+            deck.set_active_page(active_index, total);
+        }
+    }
 }

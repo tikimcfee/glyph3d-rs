@@ -477,3 +477,85 @@ fn test_workdesk_file_revisions_z_stack() {
     assert_eq!(stack_comp.revision_count, 3);
     assert_eq!(stack_comp.active_revision, 2);
 }
+
+#[test]
+fn test_agent_carrel_spawning_and_turn_navigation() {
+    use crate::agent_transcript::claude::parse_claude_session;
+    use crate::revision::RevisionEngine;
+    use serde_json::json;
+
+    let transcript = vec![
+        // Turn 0
+        json!({
+            "type": "user",
+            "message": { "role": "user", "content": [{ "type": "text", "text": "Turn 0 prompt" }] }
+        }).to_string(),
+        json!({
+            "type": "assistant",
+            "message": {
+                "role": "assistant",
+                "content": [
+                    { "type": "tool_use", "id": "t1", "name": "Write", "input": { "file_path": "foo.rs", "content": "base" } }
+                ]
+            }
+        }).to_string(),
+        json!({
+            "type": "user",
+            "toolUseResult": { "type": "create", "filePath": "foo.rs", "content": "base" },
+            "message": { "role": "user", "content": [{ "type": "tool_result", "tool_use_id": "t1" }] }
+        }).to_string(),
+        // Turn 1
+        json!({
+            "type": "user",
+            "message": { "role": "user", "content": [{ "type": "text", "text": "Turn 1 prompt" }] }
+        }).to_string(),
+        json!({
+            "type": "assistant",
+            "message": {
+                "role": "assistant",
+                "content": [
+                    { "type": "tool_use", "id": "t2", "name": "Edit", "input": { "file_path": "foo.rs", "old_string": "base", "new_string": "updated" } }
+                ]
+            }
+        }).to_string(),
+        json!({
+            "type": "user",
+            "toolUseResult": { "filePath": "foo.rs", "structuredPatch": [{ "oldStart": 1, "oldLines": 1, "newStart": 1, "newLines": 1, "lines": ["-base", "+updated"] }] },
+            "message": { "role": "user", "content": [{ "type": "tool_result", "tool_use_id": "t2" }] }
+        }).to_string(),
+    ].join("\n");
+
+    let session = parse_claude_session(&transcript, "carrel_sess");
+    let mut rev_engine = RevisionEngine::new();
+    rev_engine.ingest_session(&session);
+
+    let mut scene = SpatialScene::new();
+    let root = scene.spawn_root("canvas");
+    let carrel = scene.spawn_agent_carrel(root, &session, &rev_engine);
+
+    scene.update_transforms();
+
+    let carrel_comp = scene.world.get::<AgentCarrel>(carrel).unwrap();
+    assert_eq!(carrel_comp.turn_count, 2);
+    assert_eq!(carrel_comp.active_turn, 0);
+
+    // Initial state: turn 0
+    let desk = scene.world.get::<Workdesk>(carrel_comp.workdesk_entity).unwrap();
+    let stack_e = *desk.file_stacks.get("foo.rs").unwrap();
+    let stack = scene.world.get::<FileRevisionStack>(stack_e).unwrap();
+    assert_eq!(stack.active_revision, 0);
+
+    // Advance to turn 1
+    let next = scene.carrel_next_turn(carrel, &session, &rev_engine);
+    assert_eq!(next, 1);
+
+    let stack_after = scene.world.get::<FileRevisionStack>(stack_e).unwrap();
+    assert_eq!(stack_after.active_revision, 1);
+
+    // Navigate back to turn 0
+    let prev = scene.carrel_prev_turn(carrel, &session, &rev_engine);
+    assert_eq!(prev, 0);
+
+    let stack_prev = scene.world.get::<FileRevisionStack>(stack_e).unwrap();
+    assert_eq!(stack_prev.active_revision, 0);
+}

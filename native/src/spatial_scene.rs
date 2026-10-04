@@ -16,11 +16,13 @@ use crate::glyph_scene::mesh::MeshInstance;
 mod query;
 mod spawner;
 mod sync;
+pub mod agent_carrel;
 pub mod alignment;
 pub mod deck;
 pub mod turn_card;
 pub mod workdesk;
 
+pub use agent_carrel::AgentCarrel;
 pub use alignment::{
     AlignmentAxis, HorizontalAlign, SpatialAlignment, VerticalAlign, WrapConstraint,
 };
