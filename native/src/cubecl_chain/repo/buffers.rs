@@ -208,7 +208,7 @@ pub(crate) fn allocate_chain_buffers(
     let h_sgrand = alloc_empty(4);
     let h_totals = alloc_empty(item_count.max(1) * 2 * 4);
     let h_ext = alloc_upload(bytemuck::cast_slice(&inputs.ext_seed));
-    let h_pr_colors = if wants_instances {
+    let h_pr_colors = if wants_instances && !instance_inputs.per_record_colors.is_empty() {
         alloc_upload(bytemuck::cast_slice(&instance_inputs.per_record_colors))
     } else {
         alloc_empty(4)

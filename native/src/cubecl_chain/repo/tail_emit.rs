@@ -111,7 +111,7 @@ pub(crate) fn scatter_slots_direct(
             BufferArg::from_raw_parts(buf.h_sm.clone(), n),
             BufferArg::from_raw_parts(buf.h_hgt.clone(), n),
             BufferArg::from_raw_parts(buf.h_gi.clone(), n),
-            BufferArg::from_raw_parts(buf.h_pr_colors.clone(), inputs.per_record_colors.len()),
+            BufferArg::from_raw_parts(buf.h_pr_colors.clone(), inputs.per_record_colors.len().max(1)),
             BufferArg::from_raw_parts(buf.h_color_base.clone(), item_count),
             BufferArg::from_raw_parts(buf.h_is_pr.clone(), item_count),
             BufferArg::from_raw_parts(buf.h_flat_colors.clone(), item_count),

@@ -111,7 +111,7 @@ fn main() {
         }
         if let Some(dir) = &cli.cubecl_repo_check {
             let ctx = pollster::block_on(gpu::init(None));
-            cubecl_chain::repo_check(&ctx, dir);
+            cubecl_chain::repo_check(&ctx, dir, parse_color_mode(&cli.color_mode));
         }
     }
     #[cfg(not(feature = "cubecl"))]

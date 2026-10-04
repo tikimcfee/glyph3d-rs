@@ -5,7 +5,7 @@ use crate::gpu::GpuContext;
 
 use super::repo::{ChainMode, InstanceInputs, SharedDevice, run_repo_chain};
 
-pub fn repo_check(ctx: &GpuContext, dir: &Path) -> ! {
+pub fn repo_check(ctx: &GpuContext, dir: &Path, color_mode: crate::repo::ColorMode) -> ! {
     use crate::layout::{LayoutGlyphs as _, VerifyLayout as _};
     let t_all = std::time::Instant::now();
     // The renderer's default shape: wrap BACK, cluster on, the tuned grid
@@ -13,6 +13,7 @@ pub fn repo_check(ctx: &GpuContext, dir: &Path) -> ! {
     let params = crate::repo::RepoParams {
         wrap_mode: WrapMode::Back,
         cluster_mode: crate::fold::ClusterMode::Cluster,
+        color_mode,
         ..Default::default()
     };
     let walk = crate::repo::walk_repo(dir);
@@ -66,25 +67,43 @@ pub fn repo_check(ctx: &GpuContext, dir: &Path) -> ! {
     // engine and chain. The fork gate's standing fixture is small by
     // design; a manual big-corpus run that brushes the machine ceiling can
     // set GLYPH_REPO_CHECK_TAIL=records to drop the instance tier.)
-    let colors: Vec<Vec<u32>> = walk
-        .files
-        .iter()
-        .map(|f| crate::text::colorize_leaders(&f.bytes))
-        .collect();
-    let mut per_record_colors: Vec<u32> = Vec::new();
-    let mut color_base = vec![0u32; item_count];
-    let mut groups = Vec::with_capacity(item_count);
-    for (index, c) in colors.iter().enumerate() {
-        color_base[index] = per_record_colors.len() as u32;
-        per_record_colors.extend_from_slice(c);
-        groups.push(index as u32);
-    }
-    let inputs = InstanceInputs {
-        per_record_colors,
-        color_base,
-        is_per_record: vec![1u32; item_count],
-        flat_colors: vec![0u32; item_count],
-        groups,
+    let is_flat = color_mode == crate::repo::ColorMode::Flat;
+    let (colors, inputs) = if is_flat {
+        let mut groups = Vec::with_capacity(item_count);
+        for index in 0..item_count {
+            groups.push(index as u32);
+        }
+        let inputs = InstanceInputs {
+            per_record_colors: Vec::new(),
+            color_base: vec![0u32; item_count],
+            is_per_record: vec![0u32; item_count],
+            flat_colors: vec![crate::layout::DEFAULT_COLOR_PACKED; item_count],
+            groups,
+        };
+        (None, inputs)
+    } else {
+        use rayon::prelude::*;
+        let colors: Vec<Vec<u32>> = walk
+            .files
+            .par_iter()
+            .map(|f| crate::text::colorize_leaders(&f.bytes))
+            .collect();
+        let mut per_record_colors: Vec<u32> = Vec::new();
+        let mut color_base = vec![0u32; item_count];
+        let mut groups = Vec::with_capacity(item_count);
+        for (index, c) in colors.iter().enumerate() {
+            color_base[index] = per_record_colors.len() as u32;
+            per_record_colors.extend_from_slice(c);
+            groups.push(index as u32);
+        }
+        let inputs = InstanceInputs {
+            per_record_colors,
+            color_base,
+            is_per_record: vec![1u32; item_count],
+            flat_colors: vec![0u32; item_count],
+            groups,
+        };
+        (Some(colors), inputs)
     };
     let mode = if std::env::var("GLYPH_REPO_CHECK_TAIL").as_deref() == Ok("records") {
         ChainMode::Records
@@ -132,11 +151,18 @@ pub fn repo_check(ctx: &GpuContext, dir: &Path) -> ! {
         .files
         .iter()
         .enumerate()
-        .map(|(index, f)| crate::layout::LayoutItem {
-            bytes: &f.bytes,
-            params: file_params[index],
-            group_id: index as u32,
-            paint: crate::layout::Paint::PerRecord(&colors[index]),
+        .map(|(index, f)| {
+            let paint = if is_flat {
+                crate::layout::Paint::Flat(crate::layout::DEFAULT_COLOR_PACKED)
+            } else {
+                crate::layout::Paint::PerRecord(&colors.as_ref().unwrap()[index])
+            };
+            crate::layout::LayoutItem {
+                bytes: &f.bytes,
+                params: file_params[index],
+                group_id: index as u32,
+                paint,
+            }
         })
         .collect();
     let (placements, engine_records) = backend

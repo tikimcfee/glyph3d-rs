@@ -104,6 +104,27 @@ fn marshal(
     let mut flat_colors = vec![0u32; items.len()];
     let mut groups = Vec::with_capacity(items.len());
     let mut off = 0usize;
+    use rayon::prelude::*;
+    let syntax_colors: Option<Vec<Option<Vec<u32>>>> = if items
+        .iter()
+        .any(|it| matches!(it.paint, Paint::SyntaxHeuristic))
+    {
+        Some(
+            items
+                .par_iter()
+                .map(|it| {
+                    if matches!(it.paint, Paint::SyntaxHeuristic) {
+                        Some(crate::text::colorize_leaders(it.bytes))
+                    } else {
+                        None
+                    }
+                })
+                .collect(),
+        )
+    } else {
+        None
+    };
+
     for (index, item) in items.iter().enumerate() {
         bytes.extend_from_slice(item.bytes);
         let p = &item.params;
@@ -140,8 +161,16 @@ fn marshal(
                 is_per_record[index] = 1;
                 per_record_colors.extend_from_slice(colors);
             }
+            Paint::SyntaxHeuristic => {
+                if let Some(Some(ref colors)) = syntax_colors.as_ref().map(|v| &v[index]) {
+                    is_per_record[index] = 1;
+                    per_record_colors.extend_from_slice(colors);
+                } else {
+                    flat_colors[index] = crate::layout::DEFAULT_COLOR_PACKED;
+                }
+            }
             Paint::Flat(rgba) => flat_colors[index] = rgba,
-            Paint::ByteSpans(_) | Paint::SyntaxHeuristic => flat_colors[index] = crate::layout::DEFAULT_COLOR_PACKED,
+            Paint::ByteSpans(_) => flat_colors[index] = crate::layout::DEFAULT_COLOR_PACKED,
         }
         groups.push(item.group_id);
         off += item.bytes.len();
