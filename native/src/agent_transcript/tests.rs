@@ -1,0 +1,371 @@
+//! Unit tests for agent transcript ingestion and normalization.
+//!
+//! Includes behavioral parity test against `tools/sessionAdapter.test.mjs`
+//! from `glyph3d-js`.
+
+use super::claude::{parse_claude_session, parse_iso_ts};
+use super::antigravity::parse_antigravity_session;
+use super::types::HarnessKind;
+use crate::spatial_scene::workdesk::FileActionKind;
+use serde_json::json;
+
+#[test]
+fn test_parse_iso_ts() {
+    assert_eq!(parse_iso_ts("1970-01-01T00:00:00.000Z"), Some(0));
+    assert_eq!(parse_iso_ts("1970-01-01T00:00:00Z"), Some(0));
+    assert_eq!(
+        parse_iso_ts("2026-08-01T10:00:00.000Z"),
+        Some(1785578400000)
+    );
+    assert_eq!(
+        parse_iso_ts("2026-08-01T10:00:05.500Z"),
+        Some(1785578405500)
+    );
+    assert_eq!(parse_iso_ts("not a timestamp"), None);
+}
+
+#[test]
+fn test_synthetic_claude_session_parity() {
+    // Exact synthetic session from glyph3d-js/tools/sessionAdapter.test.mjs
+    let t = |s: u32| format!("2026-08-01T10:00:0{s}.000Z");
+
+    let lines = vec![
+        // non-message bookkeeping line → no event
+        json!({ "type": "mode", "mode": "normal" }).to_string(),
+        // malformed line → skipped, parse survives
+        "{this is not json".to_string(),
+        // sidechain line → skipped wholesale: prose, tool_use, cwd must not leak
+        json!({
+            "type": "assistant",
+            "isSidechain": true,
+            "cwd": "/side/land",
+            "timestamp": t(0),
+            "message": {
+                "role": "assistant",
+                "content": [
+                    { "type": "text", "text": "sidechain prose" },
+                    { "type": "tool_use", "id": "tu-side", "name": "Bash", "input": { "command": "rm -rf /" } }
+                ]
+            }
+        }).to_string(),
+        // thinking + text blocks, in block order; first-seen cwd
+        json!({
+            "type": "assistant",
+            "cwd": "/main/repo",
+            "timestamp": t(0),
+            "message": {
+                "role": "assistant",
+                "content": [
+                    { "type": "thinking", "thinking": "let me think" },
+                    { "type": "text", "text": "hello world" }
+                ]
+            }
+        }).to_string(),
+        // whitespace-only text dropped; the tool_use beside it still emits
+        json!({
+            "type": "assistant",
+            "timestamp": t(1),
+            "message": {
+                "role": "assistant",
+                "content": [
+                    { "type": "text", "text": "   \n  " },
+                    { "type": "tool_use", "id": "tu-edit", "name": "Edit", "input": { "file_path": "/main/repo/a.js" } }
+                ]
+            }
+        }).to_string(),
+        json!({
+            "type": "assistant",
+            "timestamp": t(2),
+            "message": {
+                "role": "assistant",
+                "content": [
+                    { "type": "tool_use", "id": "tu-bash", "name": "Bash", "input": { "command": "ls" } }
+                ]
+            }
+        }).to_string(),
+        json!({
+            "type": "assistant",
+            "timestamp": t(3),
+            "message": {
+                "role": "assistant",
+                "content": [
+                    { "type": "tool_use", "id": "tu-grep", "name": "Grep", "input": { "pattern": "x" } }
+                ]
+            }
+        }).to_string(),
+        // no timestamp on this line → ts null; its result never arrives → response null
+        json!({
+            "type": "assistant",
+            "message": {
+                "role": "assistant",
+                "content": [
+                    { "type": "tool_use", "id": "tu-read", "name": "Read", "input": { "file_path": "/main/repo/b.js" } }
+                ]
+            }
+        }).to_string(),
+        // USER prompt: starts a new turn
+        json!({
+            "type": "user",
+            "timestamp": t(5),
+            "message": {
+                "role": "user",
+                "content": [
+                    { "type": "text", "text": "do the thing" }
+                ]
+            }
+        }).to_string(),
+        // structured toolUseResult HAS stdout → kept verbatim, result text NOT merged in
+        json!({
+            "type": "user",
+            "timestamp": t(6),
+            "toolUseResult": { "stdout": "one\ntwo\n", "interrupted": false },
+            "message": {
+                "role": "user",
+                "content": [
+                    { "type": "tool_result", "tool_use_id": "tu-bash", "content": [{ "type": "text", "text": "one" }, { "type": "text", "text": "two" }] }
+                ]
+            }
+        }).to_string(),
+        // no structured object → the plain result text IS the response
+        json!({
+            "type": "user",
+            "timestamp": t(7),
+            "message": {
+                "role": "user",
+                "content": [
+                    { "type": "tool_result", "tool_use_id": "tu-grep", "content": "src/a.js:1:x" }
+                ]
+            }
+        }).to_string(),
+        // pairing across distance: first tool's result lands LAST; structured lacks text field → text merged in as `content`
+        json!({
+            "type": "user",
+            "timestamp": t(8),
+            "toolUseResult": { "structuredPatch": [{ "newStart": 1, "lines": ["+a"] }] },
+            "message": {
+                "role": "user",
+                "content": [
+                    { "type": "tool_result", "tool_use_id": "tu-edit", "content": "The file has been updated" }
+                ]
+            }
+        }).to_string(),
+        // trailing prose after the last tool
+        json!({
+            "type": "assistant",
+            "timestamp": t(9),
+            "message": {
+                "role": "assistant",
+                "content": [
+                    { "type": "text", "text": "all done" }
+                ]
+            }
+        }).to_string(),
+    ];
+
+    let transcript = lines.join("\n") + "\n";
+    let session = parse_claude_session(&transcript, "test_session");
+
+    assert_eq!(session.harness, HarnessKind::ClaudeCode);
+    assert_eq!(session.cwd.as_deref(), Some("/main/repo"));
+    assert_eq!(session.first_ts, parse_iso_ts(&t(0)));
+    assert_eq!(session.last_ts, parse_iso_ts(&t(9)));
+
+    // Total tool invocations across turns: 4 tools (Edit, Bash, Grep, Read)
+    assert_eq!(session.total_tool_calls(), 4);
+
+    // Verify turn structure:
+    // Turn 0: initial thinking, greeting, 4 tools
+    // Turn 1: user prompt "do the thing", trailing prose "all done"
+    assert_eq!(session.turns.len(), 2);
+
+    let turn0 = &session.turns[0];
+    assert_eq!(turn0.thinking, vec!["let me think"]);
+    assert_eq!(turn0.assistant_messages, vec!["hello world"]);
+    assert_eq!(turn0.tool_calls.len(), 4);
+    assert_eq!(turn0.tool_calls[0].name, "Edit");
+    assert_eq!(turn0.tool_calls[1].name, "Bash");
+    assert_eq!(turn0.tool_calls[2].name, "Grep");
+    assert_eq!(turn0.tool_calls[3].name, "Read");
+
+    // Check response merge branches:
+    // 1. Bash: kept verbatim { stdout: "one\ntwo\n", interrupted: false }
+    let bash_resp = turn0.tool_calls[1].response.as_ref().unwrap();
+    assert_eq!(bash_resp["stdout"], "one\ntwo\n");
+    assert_eq!(bash_resp["interrupted"], false);
+
+    // 2. Grep: bare string "src/a.js:1:x"
+    let grep_resp = turn0.tool_calls[2].response.as_ref().unwrap();
+    assert_eq!(grep_resp, "src/a.js:1:x");
+
+    // 3. Edit: structuredPatch with merged "content": "The file has been updated"
+    let edit_resp = turn0.tool_calls[0].response.as_ref().unwrap();
+    assert_eq!(edit_resp["content"], "The file has been updated");
+    assert!(edit_resp.get("structuredPatch").is_some());
+
+    // 4. Read: result never arrived -> response is None
+    assert!(turn0.tool_calls[3].response.is_none());
+
+    // File actions:
+    assert_eq!(turn0.file_actions.len(), 2);
+    assert_eq!(turn0.file_actions[0].action, FileActionKind::Edit);
+    assert_eq!(turn0.file_actions[0].file_path, "/main/repo/a.js");
+    assert_eq!(turn0.file_actions[1].action, FileActionKind::Read);
+    assert_eq!(turn0.file_actions[1].file_path, "/main/repo/b.js");
+
+    let turn1 = &session.turns[1];
+    assert_eq!(turn1.prompt.as_deref(), Some("do the thing"));
+    assert_eq!(turn1.assistant_messages, vec!["all done"]);
+}
+
+#[test]
+fn test_degenerate_inputs() {
+    let empty_session = parse_claude_session("", "empty");
+    assert_eq!(empty_session.turns.len(), 0);
+    assert_eq!(empty_session.cwd, None);
+
+    let garbage = "null\n42\n\"str\"\n{invalid json";
+    let garbage_session = parse_claude_session(garbage, "garbage");
+    assert_eq!(garbage_session.turns.len(), 0);
+    assert_eq!(garbage_session.cwd, None);
+}
+
+#[test]
+fn test_antigravity_transcript_parsing() {
+    let lines = vec![
+        json!({
+            "step_index": 0,
+            "type": "USER_INPUT",
+            "content": "Add a new button component",
+            "created_at": "2026-10-04T12:00:00Z"
+        }).to_string(),
+        json!({
+            "step_index": 1,
+            "type": "PLANNER_RESPONSE",
+            "thinking": "I need to edit Button.rs",
+            "content": "Editing Button.rs now",
+            "tool_calls": [
+                {
+                    "name": "replace_file_content",
+                    "args": {
+                        "TargetFile": "/path/Button.rs",
+                        "TargetContent": "fn old() {}",
+                        "ReplacementContent": "fn new() {}",
+                        "StartLine": 10,
+                        "EndLine": 12
+                    }
+                }
+            ],
+            "created_at": "2026-10-04T12:00:02Z"
+        }).to_string(),
+        json!({
+            "step_index": 2,
+            "type": "GENERIC",
+            "content": "Success replacing content",
+            "created_at": "2026-10-04T12:00:03Z"
+        }).to_string(),
+    ];
+
+    let transcript = lines.join("\n");
+    let session = parse_antigravity_session(&transcript, "ag_session");
+
+    assert_eq!(session.harness, HarnessKind::Antigravity);
+    assert_eq!(session.turns.len(), 1);
+
+    let turn = &session.turns[0];
+    assert_eq!(turn.prompt.as_deref(), Some("Add a new button component"));
+    assert_eq!(turn.thinking, vec!["I need to edit Button.rs"]);
+    assert_eq!(turn.assistant_messages, vec!["Editing Button.rs now"]);
+    assert_eq!(turn.tool_calls.len(), 1);
+    assert_eq!(turn.tool_calls[0].name, "replace_file_content");
+    assert_eq!(turn.tool_calls[0].response.as_ref().unwrap(), "Success replacing content");
+
+    assert_eq!(turn.file_actions.len(), 1);
+    assert_eq!(turn.file_actions[0].action, FileActionKind::Edit);
+    assert_eq!(turn.file_actions[0].file_path, "/path/Button.rs");
+    assert_eq!(turn.file_actions[0].old_content.as_deref(), Some("fn old() {}"));
+    assert_eq!(turn.file_actions[0].new_content.as_deref(), Some("fn new() {}"));
+}
+
+#[test]
+fn test_multi_turn_file_actions() {
+    let lines = vec![
+        // Turn 1: user asks to create file
+        json!({
+            "type": "user",
+            "message": { "role": "user", "content": [{ "type": "text", "text": "Create server.rs" }] }
+        }).to_string(),
+        json!({
+            "type": "assistant",
+            "message": {
+                "role": "assistant",
+                "content": [
+                    { "type": "tool_use", "id": "t1", "name": "Write", "input": { "file_path": "src/server.rs", "content": "fn main() {}" } }
+                ]
+            }
+        }).to_string(),
+        json!({
+            "type": "user",
+            "toolUseResult": { "type": "create", "filePath": "src/server.rs", "content": "fn main() {}" },
+            "message": { "role": "user", "content": [{ "type": "tool_result", "tool_use_id": "t1" }] }
+        }).to_string(),
+        // Turn 2: user asks to add route
+        json!({
+            "type": "user",
+            "message": { "role": "user", "content": [{ "type": "text", "text": "Add route to server.rs" }] }
+        }).to_string(),
+        json!({
+            "type": "assistant",
+            "message": {
+                "role": "assistant",
+                "content": [
+                    { "type": "tool_use", "id": "t2", "name": "Edit", "input": {
+                        "file_path": "src/server.rs",
+                        "old_string": "fn main() {}",
+                        "new_string": "fn main() { route(); }"
+                    } }
+                ]
+            }
+        }).to_string(),
+        json!({
+            "type": "user",
+            "toolUseResult": {
+                "filePath": "src/server.rs",
+                "structuredPatch": [
+                    { "oldStart": 1, "oldLines": 1, "newStart": 1, "newLines": 1, "lines": ["-fn main() {}", "+fn main() { route(); }"] }
+                ]
+            },
+            "message": { "role": "user", "content": [{ "type": "tool_result", "tool_use_id": "t2" }] }
+        }).to_string(),
+    ];
+
+    let session = parse_claude_session(&lines.join("\n"), "multi_turn");
+    assert_eq!(session.turns.len(), 2);
+    assert_eq!(session.touched_files(), vec!["src/server.rs"]);
+    assert_eq!(session.total_file_actions(), 2);
+
+    let t1 = &session.turns[0];
+    assert_eq!(t1.prompt.as_deref(), Some("Create server.rs"));
+    assert_eq!(t1.file_actions[0].action, FileActionKind::Write);
+    assert_eq!(t1.file_actions[0].new_content.as_deref(), Some("fn main() {}"));
+
+    let t2 = &session.turns[1];
+    assert_eq!(t2.prompt.as_deref(), Some("Add route to server.rs"));
+    assert_eq!(t2.file_actions[0].action, FileActionKind::Edit);
+    assert_eq!(t2.file_actions[0].hunks.len(), 1);
+    assert_eq!(t2.file_actions[0].hunks[0].lines, vec!["-fn main() {}", "+fn main() { route(); }"]);
+}
+
+#[test]
+fn test_real_claude_session_if_present() {
+    let home = std::env::var("HOME").unwrap_or_default();
+    let session_path = std::path::PathBuf::from(home)
+        .join(".claude/projects/-Users-lugo-localdev-viz-web-glyph3d-js/61cf579f-ad10-4705-be7b-06926c5f69c3.jsonl");
+
+    if session_path.exists() {
+        let content = std::fs::read_to_string(&session_path).expect("read real session file");
+        let session = parse_claude_session(&content, "61cf579f");
+        assert_eq!(session.harness, HarnessKind::ClaudeCode);
+        assert_eq!(session.session_id, "61cf579f");
+        assert!(session.cwd.is_some());
+    }
+}

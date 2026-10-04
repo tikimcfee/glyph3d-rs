@@ -13,8 +13,10 @@ use super::{
     ChildOf, LocalBounds, SceneMeshKind, SceneMeshMaterial, SpatialScene,
 };
 
+use serde::{Deserialize, Serialize};
+
 /// Type of file action or operation represented on the Workdesk.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum FileActionKind {
     Read,
     Edit,

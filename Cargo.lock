@@ -2858,6 +2858,8 @@ dependencies = [
  "naga",
  "pollster",
  "rayon",
+ "serde",
+ "serde_json",
  "simdutf8",
  "tracing",
  "tracing-subscriber",
