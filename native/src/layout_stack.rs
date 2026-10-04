@@ -105,6 +105,9 @@ pub struct LayoutController {
     pub scene: SpatialScene,
     pub zone_entities: HashMap<String, Entity>,
     pub file_entities: Vec<Entity>,
+    pub active_carrel: Option<Entity>,
+    pub session: Option<crate::agent_transcript::AgentSession>,
+    pub revision_engine: Option<crate::revision::RevisionEngine>,
 }
 
 impl std::fmt::Debug for LayoutController {
@@ -147,6 +150,9 @@ impl LayoutController {
             scene: SpatialScene::new(),
             zone_entities: HashMap::new(),
             file_entities: Vec::new(),
+            active_carrel: None,
+            session: None,
+            revision_engine: None,
         }
     }
 
@@ -426,6 +432,83 @@ impl LayoutController {
         self.scene.update_transforms();
 
         "spawned Agent Carrel demo with 4 Turn Cards and Workdesk (press [ / ] or n / p to turn pages, v to splay grid, c to grab/drag)".to_string()
+    }
+
+    /// Spawn an Agent Carrel into the spatial scene and track it for navigation.
+    pub fn spawn_agent_carrel_session(
+        &mut self,
+        session: crate::agent_transcript::AgentSession,
+        revision_engine: crate::revision::RevisionEngine,
+    ) -> Entity {
+        let carrel_root = self.scene.spawn_root("agent_carrel_root");
+        let carrel_zone = self.scene.spawn_zone(
+            carrel_root,
+            format!("agent:carrel:{}", session.session_id),
+            format!("Agent Carrel: {}", session.session_id),
+            Transform::IDENTITY,
+            [280.0, 160.0],
+        );
+        self.zone_entities.insert("agent:carrel".to_string(), carrel_zone);
+
+        let carrel_e = self.scene.spawn_agent_carrel(carrel_zone, &session, &revision_engine);
+        self.active_carrel = Some(carrel_e);
+        self.session = Some(session);
+        self.revision_engine = Some(revision_engine);
+        self.scene.update_transforms();
+        carrel_e
+    }
+
+    /// Advance active turn in the agent carrel.
+    pub fn carrel_next(&mut self) -> Option<String> {
+        let carrel_e = self.active_carrel?;
+        let session = self.session.as_ref()?;
+        let rev_engine = self.revision_engine.as_ref()?;
+        let next_turn = self.scene.carrel_next_turn(carrel_e, session, rev_engine);
+        self.scene.update_transforms();
+        let total = session.turn_count();
+        let prompt_peek = session
+            .turns
+            .get(next_turn)
+            .and_then(|t| t.prompt.as_deref())
+            .unwrap_or("—");
+        Some(format!(
+            "carrel: turn {}/{} — \"{}\"",
+            next_turn + 1,
+            total,
+            prompt_peek.chars().take(40).collect::<String>()
+        ))
+    }
+
+    /// Retreat active turn in the agent carrel.
+    pub fn carrel_prev(&mut self) -> Option<String> {
+        let carrel_e = self.active_carrel?;
+        let session = self.session.as_ref()?;
+        let rev_engine = self.revision_engine.as_ref()?;
+        let prev_turn = self.scene.carrel_prev_turn(carrel_e, session, rev_engine);
+        self.scene.update_transforms();
+        let total = session.turn_count();
+        let prompt_peek = session
+            .turns
+            .get(prev_turn)
+            .and_then(|t| t.prompt.as_deref())
+            .unwrap_or("—");
+        Some(format!(
+            "carrel: turn {}/{} — \"{}\"",
+            prev_turn + 1,
+            total,
+            prompt_peek.chars().take(40).collect::<String>()
+        ))
+    }
+
+    /// Jump to a specific turn in the agent carrel.
+    pub fn carrel_set_turn(&mut self, turn_index: usize) -> Option<String> {
+        let carrel_e = self.active_carrel?;
+        let session = self.session.as_ref()?;
+        let rev_engine = self.revision_engine.as_ref()?;
+        self.scene.carrel_set_turn(carrel_e, turn_index, session, rev_engine);
+        self.scene.update_transforms();
+        let total = session.turn_count();
+        Some(format!("carrel: jump to turn {}/{}", turn_index + 1, total))
     }
 }
 

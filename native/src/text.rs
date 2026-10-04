@@ -42,7 +42,7 @@ mod palette {
     pub const C_PUNCT: u32 = super::pack_rgba8(PUNCT, 255);
 }
 
-const fn pack_rgba8(rgb: [u8; 3], a: u8) -> u32 {
+pub const fn pack_rgba8(rgb: [u8; 3], a: u8) -> u32 {
     rgb[0] as u32 | (rgb[1] as u32) << 8 | (rgb[2] as u32) << 16 | (a as u32) << 24
 }
 
@@ -86,7 +86,7 @@ pub struct StagedText {
 /// Stage F: one cull segment covering a whole staged block (the text/engine
 /// scenes don't need per-group granularity — their instance counts are small).
 /// Divides into sub-blocks if instance count exceeds 512 for fine-grained culling.
-fn cover_segment(instances: &[GlyphInstance], min: [f32; 3], max: [f32; 3], slot_ink: &[Option<[f32; 4]>]) -> SegCull {
+pub fn cover_segment(instances: &[GlyphInstance], min: [f32; 3], max: [f32; 3], slot_ink: &[Option<[f32; 4]>]) -> SegCull {
     const SUBSEG_BLOCK_SIZE: usize = 512;
     let mut blocks = Vec::new();
     if instances.len() > SUBSEG_BLOCK_SIZE {

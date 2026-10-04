@@ -758,6 +758,41 @@ impl WindowState {
                             }
                         }
                     });
+
+                if let Some(carrel) = probe_snap.as_ref().and_then(|s| s.carrel.as_ref()) {
+                    egui::Window::new(format!("Agent Carrel: {}", carrel.session_id))
+                        .id(egui::Id::new("agent_carrel_hud"))
+                        .default_pos(egui::pos2(20.0, 20.0))
+                        .default_width(380.0)
+                        .show(root_ui.ctx(), |ui| {
+                            ui.horizontal(|ui| {
+                                if ui.button("◀ Prev (P/←)").clicked() {
+                                    self.scene.on_key(ctx, winit::keyboard::KeyCode::KeyP, true);
+                                }
+                                ui.label(egui::RichText::new(format!("Turn {} / {}", carrel.active_turn + 1, carrel.turn_count)).strong());
+                                if ui.button("Next (N/→) ▶").clicked() {
+                                    self.scene.on_key(ctx, winit::keyboard::KeyCode::KeyN, true);
+                                }
+                                ui.separator();
+                                if ui.button("Mode (V)").clicked() {
+                                    self.scene.on_key(ctx, winit::keyboard::KeyCode::KeyV, true);
+                                }
+                            });
+                            ui.separator();
+                            ui.label(egui::RichText::new("Active Turn Prompt:").heading());
+                            ui.label(&carrel.prompt_summary);
+                            if !carrel.touched_files.is_empty() {
+                                ui.separator();
+                                ui.label(egui::RichText::new("Workdesk File Revisions:").heading());
+                                for (path, act, total) in &carrel.touched_files {
+                                    ui.horizontal(|ui| {
+                                        ui.colored_label(egui::Color32::from_rgb(100, 220, 160), "•");
+                                        ui.label(format!("{path} (active: R{act}, total: {total})"));
+                                    });
+                                }
+                            }
+                        });
+                }
             });
             let egui::FullOutput {
                 platform_output,

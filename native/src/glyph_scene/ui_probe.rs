@@ -74,12 +74,24 @@ pub struct UiProbeState {
     pub grabbed_zone: Option<String>,
     /// The carrel / zone ID corresponding to the currently picked file.
     pub active_zone: Option<String>,
+    /// Live snapshot of the active Agent Carrel (if any).
+    pub carrel: Option<UiCarrelState>,
     // ── K5: group-browser data. `files` is STATIC (built once at install;
     // Rc-shared so the panel's per-frame snapshot clones a refcount, not the
     // rows). `file_dyn` is refreshed per frame (world pose under the live
     // group TRS, hidden flag, tint) — parallel to `files`. ──
     pub files: std::rc::Rc<Vec<UiFileRow>>,
     pub file_dyn: Vec<UiFileDyn>,
+}
+
+/// Read-only snapshot of an active Agent Carrel for the egui HUD.
+#[derive(Clone, Debug, Default)]
+pub struct UiCarrelState {
+    pub session_id: String,
+    pub active_turn: usize,
+    pub turn_count: usize,
+    pub prompt_summary: String,
+    pub touched_files: Vec<(String, usize, usize)>, // (path, active_revision, revision_count)
 }
 
 /// Stage K (K5): one static group-browser row — file identity + the

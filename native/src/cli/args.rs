@@ -51,6 +51,9 @@ pub struct Cli {
     /// Text file to stage (UTF-8); default: this crate's main.rs
     #[arg(long, value_name = "PATH")]
     pub render_file: Option<PathBuf>,
+    /// Load an agent transcript session (JSONL from Claude Code or Antigravity) into an Agent Carrel
+    #[arg(long, value_name = "PATH")]
+    pub agent_session: Option<PathBuf>,
     /// Tile the file N times (stress)
     #[arg(long, value_name = "N", default_value_t = 1)]
     pub copies: u32,

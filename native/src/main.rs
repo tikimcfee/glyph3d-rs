@@ -173,6 +173,11 @@ fn main() {
     let emoji_sheet = cli.emoji_sheet.clone().unwrap_or_else(default_emoji_sheet);
     let choice = if cli.demo {
         SceneChoice::Demo
+    } else if let Some(session_path) = &cli.agent_session {
+        SceneChoice::AgentSession {
+            session_path: session_path.clone(),
+            emoji_sheet,
+        }
     } else if let Some(dir) = &cli.load_repo {
         SceneChoice::Repo {
             dir: dir.clone(),

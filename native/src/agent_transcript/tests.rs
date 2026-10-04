@@ -369,3 +369,93 @@ fn test_real_claude_session_if_present() {
         assert!(session.cwd.is_some());
     }
 }
+
+#[test]
+fn test_detect_and_parse_session_claude_and_antigravity() {
+    use super::{detect_and_parse_session, HarnessKind};
+
+    // Claude Code snippet
+    let claude_snippet = json!({
+        "type": "user",
+        "message": { "role": "user", "content": [{ "type": "text", "text": "Claude prompt" }] }
+    }).to_string();
+    let s_claude = detect_and_parse_session(&claude_snippet, "claude_sess");
+    assert_eq!(s_claude.harness, HarnessKind::ClaudeCode);
+    assert_eq!(s_claude.session_id, "claude_sess");
+
+    // Antigravity snippet
+    let antigravity_snippet = json!({
+        "step_index": 0,
+        "type": "USER_INPUT",
+        "content": "Antigravity prompt"
+    }).to_string();
+    let s_antigravity = detect_and_parse_session(&antigravity_snippet, "ag_sess");
+    assert_eq!(s_antigravity.harness, HarnessKind::Antigravity);
+    assert_eq!(s_antigravity.session_id, "ag_sess");
+}
+
+#[test]
+fn test_stage_agent_session_creates_controller_and_navigates() {
+    use super::{stage_agent_session, parse_claude_session};
+    use crate::revision::RevisionEngine;
+
+    let transcript = vec![
+        json!({
+            "type": "user",
+            "message": { "role": "user", "content": [{ "type": "text", "text": "Turn 0 prompt" }] }
+        }).to_string(),
+        json!({
+            "type": "assistant",
+            "message": {
+                "role": "assistant",
+                "content": [
+                    { "type": "tool_use", "id": "t1", "name": "Write", "input": { "file_path": "a.rs", "content": "hello" } }
+                ]
+            }
+        }).to_string(),
+        json!({
+            "type": "user",
+            "toolUseResult": { "type": "create", "filePath": "a.rs", "content": "hello" },
+            "message": { "role": "user", "content": [{ "type": "tool_result", "tool_use_id": "t1" }] }
+        }).to_string(),
+        json!({
+            "type": "user",
+            "message": { "role": "user", "content": [{ "type": "text", "text": "Turn 1 prompt" }] }
+        }).to_string(),
+        json!({
+            "type": "assistant",
+            "message": {
+                "role": "assistant",
+                "content": [
+                    { "type": "tool_use", "id": "t2", "name": "Edit", "input": { "file_path": "a.rs", "old_string": "hello", "new_string": "world" } }
+                ]
+            }
+        }).to_string(),
+        json!({
+            "type": "user",
+            "toolUseResult": { "filePath": "a.rs", "structuredPatch": [{ "oldStart": 1, "oldLines": 1, "newStart": 1, "newLines": 1, "lines": ["-hello", "+world"] }] },
+            "message": { "role": "user", "content": [{ "type": "tool_result", "tool_use_id": "t2" }] }
+        }).to_string(),
+    ].join("\n");
+
+    let session = parse_claude_session(&transcript, "staged_sess");
+    let mut rev_engine = RevisionEngine::new();
+    rev_engine.ingest_session(&session);
+
+    let staged = stage_agent_session(None, &[], session, rev_engine);
+    assert!(staged.controller.is_some());
+
+    let mut ctrl = staged.controller.unwrap();
+    assert!(ctrl.active_carrel.is_some());
+
+    // Navigation checks
+    let next_msg = ctrl.carrel_next().unwrap();
+    assert!(next_msg.contains("turn 2/2"));
+
+    let prev_msg = ctrl.carrel_prev().unwrap();
+    assert!(prev_msg.contains("turn 1/2"));
+
+    let jump_msg = ctrl.carrel_set_turn(1).unwrap();
+    assert!(jump_msg.contains("jump to turn 2/2"));
+}
+

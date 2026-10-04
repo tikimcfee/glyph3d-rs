@@ -11,9 +11,10 @@ use super::patch::{apply_hunks, apply_string_replace, compute_line_diff, reconst
 use super::types::{DiffStats, FileRevision, FileRevisionHistory};
 
 /// Callback type for resolving current on-disk file content.
-pub type DiskResolver = Box<dyn Fn(&str) -> Option<String> + Send + Sync>;
+pub type DiskResolver = Arc<dyn Fn(&str) -> Option<String> + Send + Sync>;
 
 /// Multi-file revision engine tracking $R_0 \dots R_N$ across all agent turns.
+#[derive(Clone)]
 pub struct RevisionEngine {
     histories: HashMap<String, FileRevisionHistory>,
     disk_resolver: Option<DiskResolver>,
@@ -38,7 +39,7 @@ impl RevisionEngine {
         mut self,
         resolver: impl Fn(&str) -> Option<String> + Send + Sync + 'static,
     ) -> Self {
-        self.disk_resolver = Some(Box::new(resolver));
+        self.disk_resolver = Some(Arc::new(resolver));
         self
     }
 

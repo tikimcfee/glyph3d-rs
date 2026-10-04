@@ -275,9 +275,9 @@ impl GlyphScene {
                     },
                 }
             }
-            K::BracketRight | K::KeyN => {
+            K::BracketRight | K::KeyN | K::ArrowRight => {
                 if let Some(ctrl) = &mut self.controller {
-                    if let Some(msg) = ctrl.deck_next() {
+                    if let Some(msg) = ctrl.carrel_next().or_else(|| ctrl.deck_next()) {
                         let updated_gids = ctrl.sync_gpu_groups(&mut self.groups_cpu);
                         self.write_group_rows(ctx, &updated_gids);
                         for &g in &updated_gids {
@@ -289,9 +289,9 @@ impl GlyphScene {
                     }
                 }
             }
-            K::BracketLeft | K::KeyP => {
+            K::BracketLeft | K::KeyP | K::ArrowLeft => {
                 if let Some(ctrl) = &mut self.controller {
-                    if let Some(msg) = ctrl.deck_prev() {
+                    if let Some(msg) = ctrl.carrel_prev().or_else(|| ctrl.deck_prev()) {
                         let updated_gids = ctrl.sync_gpu_groups(&mut self.groups_cpu);
                         self.write_group_rows(ctx, &updated_gids);
                         for &g in &updated_gids {
