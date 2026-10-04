@@ -337,6 +337,15 @@ pub(crate) fn run_repo_chain(
     let mut tint_store = crate::layout::TintStore::Host(Vec::new());
     let mut slot_device: Option<SlotDevice> = None;
     if wants_instances {
+        placements = decode_placements(
+            &client,
+            buf.h_ext.clone(),
+            item_count,
+            &slot_base,
+            &stot,
+            &ltot,
+        );
+
         assert!(
             (total_slots as u64) * 32 <= device_ref.max_buffer_size,
             "the endpoint needs one {} B slot buffer — over this device's \
@@ -374,14 +383,6 @@ pub(crate) fn run_repo_chain(
         }
 
         slot_device = package_slot_device(&client, h_slots, total_slots);
-        placements = decode_placements(
-            &client,
-            buf.h_ext.clone(),
-            item_count,
-            &slot_base,
-            &stot,
-            &ltot,
-        );
     }
 
     prof.print_summary();
