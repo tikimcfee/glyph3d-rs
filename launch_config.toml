@@ -28,7 +28,7 @@ z_wrap_spacing = 0.15
 cluster_mode = "cluster"
 
 # Syntax color mode on repo load: "syntax" (CPU lexer) or "flat" (geometry only)
-color_mode = "syntax"
+color_mode = "flat"
 
 # Debug flags
 no_cull = false
