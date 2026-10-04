@@ -299,18 +299,24 @@ fn build_scene_impl(
                     (a, t.elapsed())
                 });
                 #[cfg(feature = "cubecl")]
-                let prewarm_handle = if *strategy == repo::Strategy::Cubecl {
-                    Some(s.spawn(|| {
-                        let t = std::time::Instant::now();
-                        cubecl_chain::prewarm(&shared_dev);
-                        log::info!("cubecl compute pipeline prewarm finished in {:?}", t.elapsed());
-                    }))
+                let mut prewarm_handle = if *strategy == repo::Strategy::Cubecl {
+                    let mut guard = ctx.prewarm_handle.lock().unwrap();
+                    if guard.is_some() {
+                        guard.take()
+                    } else {
+                        let dev = shared_dev.clone();
+                        Some(std::thread::spawn(move || {
+                            let t = std::time::Instant::now();
+                            cubecl_chain::prewarm(&dev);
+                            log::info!("cubecl compute pipeline prewarm finished in {:?}", t.elapsed());
+                        }))
+                    }
                 } else {
                     None
                 };
                 let walk = repo::walk_repo(dir);
                 #[cfg(feature = "cubecl")]
-                if let Some(h) = prewarm_handle {
+                if let Some(h) = prewarm_handle.take() {
                     h.join().expect("cubecl prewarm thread panicked");
                 }
                 let arena = layout::GlyphArena::new();

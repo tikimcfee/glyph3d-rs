@@ -537,7 +537,9 @@ pub(super) fn cand_scatter(
         let mut id = lo;
         while id < hi {
             if cslot[id] != 0u32 {
-                hp[c as usize] = id as u32;
+                if (c as usize) < hp.len() {
+                    hp[c as usize] = id as u32;
+                }
                 c += 1u32;
             }
             id += 1usize;

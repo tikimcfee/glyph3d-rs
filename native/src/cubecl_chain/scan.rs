@@ -7,7 +7,7 @@ use super::monoid::{
 use super::{
     F_LEADER, F_NEWLINE, IE_HAS_PAGE, IE_PAGE_COLS, IE_STRIDE, IE_WRAP_MODE, IE_WRAP_WIDTH,
     IM_LINE_HEIGHT, IM_ORIGIN_X, IM_ORIGIN_Y, IM_ORIGIN_Z, IM_STRIDE, IM_Z_STEP, IM_Z_STEP_LO,
-    LC_COL, LC_ROW, LC_STRIDE, LM_BASE_X, LM_STRIDE, LM_X, LM_Y, LM_Z, P_MODE, P_WRAP,
+    LC_COL, LC_ROW, LC_STRIDE, LM_STRIDE, LM_X, LM_Y, LM_Z, P_MODE, P_WRAP,
     PARTIAL_COUNT_STRIDE, RESOLVE_SLOTS,
 };
 
@@ -483,7 +483,6 @@ pub(super) fn apply(
                     let lh = items[io + IM_LINE_HEIGHT];
                     let mo = id * LM_STRIDE;
                     let base = x + items[io + IM_ORIGIN_X];
-                    lm[mo + LM_BASE_X] = base;
                     lm[mo + LM_X] = base;
                     // Y/Z: one OPAQUE fma each — the engine's f64
                     // two-term expressions narrowed once, bit-exact (see

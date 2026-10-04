@@ -91,11 +91,10 @@ const F_MISSING: u32 = 8;
 /// comparison is its only witness, so it rides anyway.
 const F_CLUSTER_TRAILER: u32 = 16;
 
-const LM_STRIDE: usize = 4;
+const LM_STRIDE: usize = 3;
 const LM_X: usize = 0;
 const LM_Y: usize = 1;
 const LM_Z: usize = 2;
-const LM_BASE_X: usize = 3;
 const LC_STRIDE: usize = 2;
 const LC_ROW: usize = 0;
 const LC_COL: usize = 1;

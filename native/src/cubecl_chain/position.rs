@@ -8,7 +8,7 @@ use super::{
     F_LEADER, F_NEWLINE, IE_HAS_PAGE, IE_PAGE_COLS, IE_PAGE_ROWS, IE_PAGES_WIDE, IE_SCROLL_ROWS,
     IE_STRIDE, IE_WRAP_WIDTH, IM_BAND_STRIDE_Y, IM_DEPTH_PER_BAND, IM_DEPTH_PER_COL,
     IM_LINE_HEIGHT, IM_ORIGIN_X, IM_ORIGIN_Y, IM_ORIGIN_Z, IM_STRIDE, IM_Z_STEP, IM_Z_STEP_LO,
-    LC_COL, LC_ROW, LC_STRIDE, LM_BASE_X, LM_STRIDE, LM_X, LM_Y, LM_Z, RESOLVE_SLOTS,
+    LC_COL, LC_ROW, LC_STRIDE, LM_STRIDE, LM_X, LM_Y, LM_Z, RESOLVE_SLOTS,
 };
 use super::tail::EXT_STRIDE;
 
@@ -195,7 +195,6 @@ pub(super) fn resolve_x(
                     final_z = fma(x_page as f32, items[io + IM_DEPTH_PER_COL], z_banded);
                 }
 
-                lm[mo + LM_BASE_X] = base;
                 lm[mo + LM_X] = final_x;
                 lm[mo + LM_Y] = final_y;
                 lm[mo + LM_Z] = final_z;
@@ -459,7 +458,6 @@ pub(super) fn resolve_x_fused(
                     final_z = fma(x_page as f32, items[io + IM_DEPTH_PER_COL], z_banded);
                 }
 
-                lm[mo + LM_BASE_X] = base;
                 lm[mo + LM_X] = final_x;
                 lm[mo + LM_Y] = final_y;
                 lm[mo + LM_Z] = final_z;
@@ -826,7 +824,7 @@ pub(super) fn paginate(
             let page_col = (y_page % pages_wide) as f32;
             let stride_reach_tail = strides[it * 2 + 1];
             let stride_reach = strides[it * 2];
-            let x_with_tail = fma(page_col, stride_reach_tail, lm[mo + LM_BASE_X]);
+            let x_with_tail = fma(page_col, stride_reach_tail, lm[mo + LM_X]);
             lm[mo + LM_X] = fma(page_col, stride_reach, x_with_tail);
             // Y = page top − row-in-page × line height − band × band stride.
             let row_in_page = (screen_row - y_page * rows) as f32;

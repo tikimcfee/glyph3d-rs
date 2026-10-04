@@ -211,7 +211,9 @@ pub(crate) fn allocate_chain_buffers(
     let h_cup = alloc_empty(n_tiles * units * 4);
     let h_cxc = alloc_empty(n_tiles * 4);
     let h_ctotal = alloc_empty(4);
-    let h_hp = alloc_empty(n * 4);
+    let c_cap = 16384usize.min(n.max(256));
+    let cstride = c_cap + 1;
+    let h_hp = alloc_empty(cstride * 4);
     let h_ltc = alloc_empty(n_tiles * 4);
     let h_stc = alloc_empty(n_tiles * 4);
     let h_lup = alloc_empty(n_tiles * units * 4);
@@ -232,9 +234,7 @@ pub(crate) fn allocate_chain_buffers(
     let h_flat_colors = alloc_upload(bytemuck::cast_slice(&instance_inputs.flat_colors));
     let h_groups = alloc_upload(bytemuck::cast_slice(&instance_inputs.groups));
     let cluster_allocs = if inputs.has_cluster {
-        let c_cap = 16384usize.min(n.max(256));
         let kmax = ((c_cap as u32 + 1).next_power_of_two().trailing_zeros()) as usize;
-        let cstride = c_cap + 1;
         let h_lvl = alloc_empty(kmax * cstride * 4);
         let h_parent = alloc_empty(cstride * 4);
         let h_parent_b = alloc_empty(cstride * 4);

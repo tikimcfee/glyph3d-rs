@@ -259,7 +259,7 @@ pub(crate) fn launch_block2_totals(
                 BufferArg::from_raw_parts(buf.h_cslot.as_ref().unwrap().clone(), n),
                 BufferArg::from_raw_parts(buf.h_cxc.as_ref().unwrap().clone(), n_tiles),
                 BufferArg::from_raw_parts(buf.h_cup.as_ref().unwrap().clone(), n_tiles * units),
-                BufferArg::from_raw_parts(buf.h_hp.as_ref().unwrap().clone(), n),
+                BufferArg::from_raw_parts(buf.h_hp.as_ref().unwrap().clone(), cstride),
                 units,
                 rake,
             );
@@ -270,7 +270,7 @@ pub(crate) fn launch_block2_totals(
                 client,
                 cubes_of(cstride),
                 CubeDim::new_1d(256),
-                BufferArg::from_raw_parts(buf.h_hp.as_ref().unwrap().clone(), n),
+                BufferArg::from_raw_parts(buf.h_hp.as_ref().unwrap().clone(), cstride),
                 BufferArg::from_raw_parts(buf.h_cend.as_ref().unwrap().clone(), n),
                 BufferArg::from_raw_parts(buf.h_ir.clone(), inputs.ir.len()),
                 BufferArg::from_raw_parts(buf.h_ctotal.as_ref().unwrap().clone(), 1),
@@ -307,7 +307,7 @@ pub(crate) fn launch_block2_totals(
                 client,
                 cubes_of(item_count.max(1)),
                 CubeDim::new_1d(256),
-                BufferArg::from_raw_parts(buf.h_hp.as_ref().unwrap().clone(), n),
+                BufferArg::from_raw_parts(buf.h_hp.as_ref().unwrap().clone(), cstride),
                 BufferArg::from_raw_parts(buf.h_ctotal.as_ref().unwrap().clone(), 1),
                 BufferArg::from_raw_parts(buf.h_ir.clone(), inputs.ir.len()),
                 BufferArg::from_raw_parts(buf.h_ic.as_ref().unwrap().clone(), inputs.ic.len()),
@@ -320,7 +320,7 @@ pub(crate) fn launch_block2_totals(
                 client,
                 cubes_of(c_cap),
                 CubeDim::new_1d(256),
-                BufferArg::from_raw_parts(buf.h_hp.as_ref().unwrap().clone(), n),
+                BufferArg::from_raw_parts(buf.h_hp.as_ref().unwrap().clone(), cstride),
                 BufferArg::from_raw_parts(sd.clone(), cstride),
                 BufferArg::from_raw_parts(ca.h_lvl.clone(), kmax * cstride),
                 BufferArg::from_raw_parts(buf.h_ctotal.as_ref().unwrap().clone(), 1),
@@ -564,7 +564,7 @@ pub fn prewarm_pipelines(client: &Client) {
             BufferArg::from_raw_parts(b[14].clone(), 1),
             BufferArg::from_raw_parts(b[15].clone(), 1),
             8u32,
-            4u32,
+            9u32,
         );
 
         // 2. count_tile
@@ -618,19 +618,21 @@ pub fn prewarm_pipelines(client: &Client) {
             BufferArg::from_raw_parts(b[5].clone(), 256),
         );
 
-        // 6. rank_step
-        rank_step::launch_unchecked(
-            client,
-            CubeCount::Static(1, 1, 1),
-            dim_256,
-            BufferArg::from_raw_parts(b[0].clone(), 256),
-            BufferArg::from_raw_parts(b[1].clone(), 256),
-            BufferArg::from_raw_parts(b[2].clone(), 256),
-            BufferArg::from_raw_parts(b[3].clone(), 256),
-            BufferArg::from_raw_parts(b[4].clone(), 256),
-            0,
-            256,
-        );
+        // 6. rank_step (prewarm all doubling rounds for standard repo capacity)
+        for k in 0..15 {
+            rank_step::launch_unchecked(
+                client,
+                CubeCount::Static(1, 1, 1),
+                dim_256,
+                BufferArg::from_raw_parts(b[0].clone(), 256),
+                BufferArg::from_raw_parts(b[1].clone(), 256),
+                BufferArg::from_raw_parts(b[2].clone(), 256),
+                BufferArg::from_raw_parts(b[3].clone(), 256),
+                BufferArg::from_raw_parts(b[4].clone(), 256),
+                k,
+                16385,
+            );
+        }
 
         // 7. item_roots
         item_roots::launch_unchecked(
@@ -660,9 +662,9 @@ pub fn prewarm_pipelines(client: &Client) {
             BufferArg::from_raw_parts(b[8].clone(), 1),
             BufferArg::from_raw_parts(b[9].clone(), 1),
             BufferArg::from_raw_parts(b[10].clone(), 1),
-            1,
-            256,
-            0.0f32,
+            15,
+            16385,
+            136.0f32,
         );
 
         // 9. sv_count_tile
@@ -819,5 +821,10 @@ pub fn prewarm_pipelines(client: &Client) {
             rake,
         );
     }
+    // Wait for the background queue to execute all prewarm launches so every
+    // compute shader pipeline is fully compiled by Naga and Metal/Vulkan
+    // into the device pipeline cache before prewarm returns.
+    let _ = pollster::block_on(client.sync());
+    let _ = client.read_one(b[14].clone());
 }
 

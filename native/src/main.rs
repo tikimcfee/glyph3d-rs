@@ -205,6 +205,17 @@ fn main() {
     // Device/queue/adapter init is shared by both modes (gpu::init).
     let ctx = pollster::block_on(gpu::init(None));
 
+    #[cfg(feature = "cubecl")]
+    if matches!(&choice, SceneChoice::Repo { strategy: repo::Strategy::Cubecl, .. }) {
+        let shared_dev = gpu::SharedDevice::from_ctx(&ctx);
+        let handle = std::thread::spawn(move || {
+            let t = std::time::Instant::now();
+            cubecl_chain::prewarm(&shared_dev);
+            log::info!("cubecl compute pipeline prewarm finished in {:?}", t.elapsed());
+        });
+        *ctx.prewarm_handle.lock().unwrap() = Some(handle);
+    }
+
     let greek_pure = !cli.greek_smooth;
     let cull_opts = SceneCullOptions {
         cull: !cli.no_cull,

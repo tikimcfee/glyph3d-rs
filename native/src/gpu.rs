@@ -377,6 +377,10 @@ pub struct GpuContext {
     /// Stage H: CPU-side scope times (e.g. the cull pass), merged into the
     /// profile summary. Written by scenes only when `profiler` is `Some`.
     pub cpu_scopes: RefCell<std::collections::BTreeMap<String, (f64, u64)>>,
+    #[cfg(feature = "cubecl")]
+    pub cubecl_device: std::sync::OnceLock<cubecl::wgpu::WgpuDevice>,
+    #[cfg(feature = "cubecl")]
+    pub prewarm_handle: std::sync::Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 
 /// The renderer's device context handles passed across layout stages.
@@ -400,14 +404,17 @@ impl SharedDevice {
         #[cfg(feature = "cubecl")]
         let cubecl_device = {
             use cubecl::wgpu::GraphicsApi;
-            let setup = cubecl::wgpu::WgpuSetup {
-                instance: ctx.instance.clone(),
-                adapter: ctx.adapter.clone(),
-                device: ctx.device.clone(),
-                queue: ctx.queue.clone(),
-                backend: cubecl::wgpu::AutoGraphicsApi::backend(),
-            };
-            Some(cubecl::wgpu::init_device(setup, Default::default()))
+            let cdev = ctx.cubecl_device.get_or_init(|| {
+                let setup = cubecl::wgpu::WgpuSetup {
+                    instance: ctx.instance.clone(),
+                    adapter: ctx.adapter.clone(),
+                    device: ctx.device.clone(),
+                    queue: ctx.queue.clone(),
+                    backend: cubecl::wgpu::AutoGraphicsApi::backend(),
+                };
+                cubecl::wgpu::init_device(setup, Default::default())
+            });
+            Some(cdev.clone())
         };
         Self {
             instance: ctx.instance.clone(),
@@ -659,6 +666,10 @@ pub async fn init(compatible_surface: Option<&wgpu::Surface<'_>>) -> GpuContext 
         profile,
         profiler,
         cpu_scopes: RefCell::new(std::collections::BTreeMap::new()),
+        #[cfg(feature = "cubecl")]
+        cubecl_device: std::sync::OnceLock::new(),
+        #[cfg(feature = "cubecl")]
+        prewarm_handle: std::sync::Mutex::new(None),
     }
 }
 
