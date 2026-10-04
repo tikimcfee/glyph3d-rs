@@ -358,6 +358,23 @@ pub(crate) fn run_repo_chain(
             (total_slots as u64) * 32,
             device_ref.max_buffer_size,
         );
+
+        placements = decode_placements(
+            &client,
+            buf.h_ext.clone(),
+            item_count,
+            &slot_base,
+            &stot,
+            &ltot,
+        );
+
+        let c = if let Some(ref h_ctotal) = buf.h_ctotal {
+            let tb = client.read_one(h_ctotal.clone()).expect("candidate count");
+            bytemuck::cast_slice::<u8, u32>(&tb)[0] as usize
+        } else {
+            0
+        };
+
         let needs_tint = matches!(mode, ChainMode::Both)
             || inputs.is_per_record.iter().any(|&x| x != 0);
         let (h_slots, h_tint) = scatter_slots_direct(
@@ -371,15 +388,6 @@ pub(crate) fn run_repo_chain(
             &buf,
             needs_tint,
             &mut prof,
-        );
-
-        placements = decode_placements(
-            &client,
-            buf.h_ext.clone(),
-            item_count,
-            &slot_base,
-            &stot,
-            &ltot,
         );
 
         let sp_tint = tracing::info_span!("tail.tint").entered();
@@ -396,6 +404,30 @@ pub(crate) fn run_repo_chain(
         }
 
         slot_device = package_slot_device(&client, h_slots, total_slots);
+        buf.release_survivor_scan();
+
+        prof.print_summary();
+
+        return ChainStream {
+            records: recs_all,
+            rec_base,
+            total_records,
+            total_slots,
+            placements,
+            slot_device,
+            tint: tint_store,
+            slots: slots_all,
+            candidates: c,
+            chain_dur: t_chain0.elapsed(),
+            readback_dur: t_rb.elapsed(),
+            phases: ChainPhases {
+                prep: t_tables.duration_since(t_chain0),
+                tables: t_init.duration_since(t_tables),
+                init: t_upload.duration_since(t_init),
+                upload: t_dispatch.duration_since(t_upload),
+                dispatch: t_rb.duration_since(t_dispatch),
+            },
+        };
     }
 
     let c = if let Some(ref h_ctotal) = buf.h_ctotal {
