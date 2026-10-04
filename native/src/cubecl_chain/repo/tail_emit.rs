@@ -92,11 +92,19 @@ pub(crate) fn scatter_slots_direct(
     item_count: usize,
     inputs: &InstanceInputs,
     buf: &ChainBuffers,
+    needs_tint: bool,
     prof: &mut ChainProfiler,
 ) -> (Handle, Handle) {
     let sp_scatter = tracing::info_span!("tail.scatter").entered();
     let h_slots = client.empty(total_slots.max(1) as usize * 8 * 4);
-    let h_tint = client.empty(total_slots.max(1) as usize * 2 * 4);
+    let (h_tint, tint_words) = if needs_tint {
+        (
+            client.empty(total_slots.max(1) as usize * 2 * 4),
+            total_slots.max(1) as usize * 2,
+        )
+    } else {
+        (client.empty(4), 1)
+    };
 
     unsafe {
         prof.begin(client, "scatter_slots");
@@ -118,7 +126,7 @@ pub(crate) fn scatter_slots_direct(
             BufferArg::from_raw_parts(buf.h_groups.clone(), item_count),
             BufferArg::from_raw_parts(buf.h_sv.clone(), n),
             BufferArg::from_raw_parts(h_slots.clone(), total_slots.max(1) as usize * 8),
-            BufferArg::from_raw_parts(h_tint.clone(), total_slots.max(1) as usize * 2),
+            BufferArg::from_raw_parts(h_tint.clone(), tint_words),
         );
         prof.end(client, "scatter_slots");
     }

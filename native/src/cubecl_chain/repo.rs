@@ -345,6 +345,8 @@ pub(crate) fn run_repo_chain(
             (total_slots as u64) * 32,
             device_ref.max_buffer_size,
         );
+        let needs_tint = matches!(mode, ChainMode::Both)
+            || inputs.is_per_record.iter().any(|&x| x != 0);
         let (h_slots, h_tint) = scatter_slots_direct(
             &client,
             n,
@@ -354,11 +356,16 @@ pub(crate) fn run_repo_chain(
             item_count,
             inputs,
             &buf,
+            needs_tint,
             &mut prof,
         );
 
         let sp_tint = tracing::info_span!("tail.tint").entered();
-        tint_store = read_tint_store(&client, device_ref, h_tint.clone(), total_slots, mode);
+        tint_store = if needs_tint {
+            read_tint_store(&client, device_ref, h_tint.clone(), total_slots, mode)
+        } else {
+            crate::layout::TintStore::Host(Vec::new())
+        };
         drop(sp_tint);
 
         if matches!(mode, ChainMode::Both) {
