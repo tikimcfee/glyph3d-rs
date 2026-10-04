@@ -36,6 +36,12 @@ pub(super) fn decode(
     let w = ABSOLUTE_POS;
     let n = bytes.len() * 4;
     if w < fl.len() {
+        let curr_word = bytes[w];
+        let next_word = if w + 1 < bytes.len() {
+            bytes[w + 1]
+        } else {
+            0u32
+        };
         let mut word = 0u32;
         let mut lane = 0usize;
         while lane < 4 {
@@ -47,7 +53,7 @@ pub(super) fn decode(
                 // byte — so it arrived as a 388 MB upload of zeros. One
                 // store per byte here, where every byte is already touched.
                 cslot[id] = 0u32;
-                let b = byte_at(bytes, id, n);
+                let b = byte_from_pair(curr_word, next_word, lane, id, n);
                 // sequence_length, transcribed: the lenient classifier.
                 let len = if b & 0x80u32 == 0u32 {
                     1u32
@@ -63,9 +69,9 @@ pub(super) fn decode(
                 if len > 0u32 {
                     // decode_codepoint_at, transcribed (reads past the end
                     // are zero, continuations never validated).
-                    let b1 = byte_at(bytes, id + 1, n);
-                    let b2 = byte_at(bytes, id + 2, n);
-                    let b3 = byte_at(bytes, id + 3, n);
+                    let b1 = byte_from_pair(curr_word, next_word, lane + 1, id + 1, n);
+                    let b2 = byte_from_pair(curr_word, next_word, lane + 2, id + 2, n);
+                    let b3 = byte_from_pair(curr_word, next_word, lane + 3, id + 3, n);
                     let cp = if len == 1u32 {
                         b
                     } else if len == 2u32 {
@@ -128,3 +134,18 @@ pub(super) fn byte_at(bytes: &[u32], i: usize, n: usize) -> u32 {
         0u32
     }
 }
+
+/// Reads a byte from a register pair of consecutive u32 words without global memory access.
+#[cube]
+pub(super) fn byte_from_pair(curr: u32, next: u32, offset: usize, id: usize, n: usize) -> u32 {
+    if id < n {
+        if offset < 4 {
+            (curr >> ((offset as u32) * 8u32)) & 0xFFu32
+        } else {
+            (next >> (((offset - 4) as u32) * 8u32)) & 0xFFu32
+        }
+    } else {
+        0u32
+    }
+}
+
