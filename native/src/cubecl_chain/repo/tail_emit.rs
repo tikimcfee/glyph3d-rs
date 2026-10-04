@@ -106,7 +106,14 @@ pub(crate) fn scatter_slots_direct(
         (client.empty(4), 1)
     };
 
-    let (units, rake) = (256usize, 8usize);
+    let units = std::env::var("GLYPH_CHAIN_TILE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(256usize);
+    let rake = std::env::var("GLYPH_CHAIN_RAKE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(8usize);
     let n_tiles = n.div_ceil(units * rake).max(1);
     unsafe {
         prof.begin(client, "scatter_slots");
