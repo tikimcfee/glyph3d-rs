@@ -840,7 +840,21 @@ fn format_beat_right_body(
     lines
 }
 
-/// Format the fixed header lines for a Workdesk File Revision Card ($R_k$).
+/// Helper to extract clean shortened path for card display.
+pub fn format_short_file_name(file_path: &str) -> String {
+    let parts: Vec<&str> = file_path.split('/').filter(|s| !s.is_empty()).collect();
+    if parts.len() > 2 {
+        parts[parts.len() - 2..].join("/")
+    } else if let Some(last) = parts.last() {
+        last.to_string()
+    } else {
+        file_path.to_string()
+    }
+}
+
+/// Format the single crisp header line for a Workdesk File Revision Card ($R_k$).
+///
+/// Clean, atomic identifier: no redundant turn numbers, no synthetic summaries, no extra rules.
 fn format_revision_card_header(rev: &FileRevision, file_path: &str) -> Vec<(String, [u8; 3])> {
     let (action_str, color) = match rev.action {
         crate::spatial_scene::workdesk::FileActionKind::Edit => ("Edit", [250, 195, 80]),
@@ -848,36 +862,59 @@ fn format_revision_card_header(rev: &FileRevision, file_path: &str) -> Vec<(Stri
         crate::spatial_scene::workdesk::FileActionKind::Read => ("Read", [120, 210, 250]),
         crate::spatial_scene::workdesk::FileActionKind::AstAnalysis => ("Ast", [210, 155, 250]),
     };
+    let short_name = format_short_file_name(file_path);
     vec![
         (
-            format!("R{} • {action_str} • {file_path}", rev.revision_index),
+            format!("R{} • {action_str} • {short_name}", rev.revision_index),
             color,
-        ),
-        (
-            format!(
-                "Turn {} │ {} lines │ +{} -{}",
-                rev.turn_index + 1,
-                rev.line_count(),
-                rev.diff_stats.added,
-                rev.diff_stats.removed
-            ),
-            [150, 170, 190],
-        ),
-        (
-            "─────────────────────────────────────────────────────────────".to_string(),
-            [70, 85, 105],
         ),
     ]
 }
 
 /// Format the body lines for a Workdesk File Revision Card ($R_k$).
 ///
-/// Contains the whole file text (or all diff hunks) with line numbers and syntax styling.
+/// Whole-chunk singular page: renders the entire file (or read portion)
+/// with edited/added lines highlighted in context (+│ in green/amber ink).
 /// Scaling is applied to the child glyph field to fit wholly within the page.
 fn format_revision_card_body(rev: &FileRevision) -> Vec<(String, [u8; 3])> {
     let mut lines = Vec::new();
 
-    if !rev.hunks.is_empty() {
+    if !rev.text.is_empty() {
+        // Collect line numbers that were added or modified in this revision
+        let mut added_lines = std::collections::HashSet::new();
+        for hunk in &rev.hunks {
+            let mut cur = hunk.new_start;
+            for hl in &hunk.lines {
+                if hl.starts_with('+') {
+                    added_lines.insert(cur);
+                    cur += 1;
+                } else if !hl.starts_with('-') {
+                    cur += 1;
+                }
+            }
+        }
+
+        // Render whole file / chunk with highlighted edits
+        for (line_idx, l) in rev.text.lines().take(5000).enumerate() {
+            let line_no = line_idx + 1;
+            if added_lines.contains(&line_no) {
+                lines.push((format!("{:4} +│ {}", line_no, l), [120, 245, 140]));
+            } else {
+                let trimmed = l.trim_start();
+                let color = if trimmed.starts_with("//")
+                    || trimmed.starts_with('#')
+                    || trimmed.starts_with("/*")
+                    || trimmed.starts_with('*')
+                {
+                    [130, 155, 170]
+                } else {
+                    [220, 230, 240]
+                };
+                lines.push((format!("{:4}  │ {}", line_no, l), color));
+            }
+        }
+    } else if !rev.hunks.is_empty() {
+        // Diff-only fallback if full snapshot text is unavailable
         for hunk in &rev.hunks {
             lines.push((
                 format!(
@@ -896,49 +933,11 @@ fn format_revision_card_body(rev: &FileRevision) -> Vec<(String, [u8; 3])> {
                 }
             }
         }
-
-        // Full context snapshot after edit if text is present
-        if !rev.text.is_empty() {
-            lines.push((
-                "── [ Snapshot after edit ] ──────────────────────────────".to_string(),
-                [80, 95, 115],
-            ));
-            for (line_idx, l) in rev.text.lines().take(5000).enumerate() {
-                let trimmed = l.trim_start();
-                let color = if trimmed.starts_with("//")
-                    || trimmed.starts_with('#')
-                    || trimmed.starts_with("/*")
-                    || trimmed.starts_with('*')
-                {
-                    [130, 155, 170]
-                } else {
-                    [215, 225, 235]
-                };
-                lines.push((format!("{:4} │ {}", line_idx + 1, l), color));
-            }
-        }
     } else {
-        // Base / whole-file snapshot mode
-        if rev.text.is_empty() {
-            lines.push((
-                "  (Empty file or no snapshot captured)".to_string(),
-                [130, 140, 155],
-            ));
-        } else {
-            for (line_idx, l) in rev.text.lines().take(5000).enumerate() {
-                let trimmed = l.trim_start();
-                let color = if trimmed.starts_with("//")
-                    || trimmed.starts_with('#')
-                    || trimmed.starts_with("/*")
-                    || trimmed.starts_with('*')
-                {
-                    [130, 155, 170]
-                } else {
-                    [225, 230, 240]
-                };
-                lines.push((format!("{:4} │ {}", line_idx + 1, l), color));
-            }
-        }
+        lines.push((
+            "  (Empty file)".to_string(),
+            [130, 140, 155],
+        ));
     }
 
     lines
@@ -976,15 +975,9 @@ pub fn stage_agent_session(
         ([-200.0, -160.0, -100.0], [350.0, 40.0, 100.0])
     };
 
-    let center = [
-        (bounds_min[0] + bounds_max[0]) * 0.5,
-        (bounds_min[1] + bounds_max[1]) * 0.5,
-    ];
-    let half_extent = [
-        ((bounds_max[0] - bounds_min[0]) * 0.5).max(10.0),
-        ((bounds_max[1] - bounds_min[1]) * 0.5).max(10.0),
-    ];
-    let focus_bounds = Some((center, half_extent));
+    // Focus camera directly on the active front workstation (Deck on left, Workdesk on right)
+    // rather than the entire deep multi-turn Z-splay.
+    let focus_bounds = Some(([50.0, -10.0], [175.0, 60.0]));
 
     let mut raw_instances = Vec::new();
     let mut codepoints_decoded = 0;
@@ -1166,7 +1159,7 @@ pub fn stage_agent_session(
                 let max_cols = body_lines.iter().map(|(l, _)| l.len()).max().unwrap_or(1);
                 let unscaled_w = (max_cols as f32 * cell_w).max(1.0);
 
-                let s_y = 30.0 / unscaled_h;
+                let s_y = 32.5 / unscaled_h;
                 let s_x = 51.0 / unscaled_w;
                 let scale = s_y.min(s_x).clamp(0.005, 1.0);
 
@@ -1185,7 +1178,7 @@ pub fn stage_agent_session(
                 next_gid += 1;
                 controller.scene.world.spawn((
                     Transform {
-                        translation: Vec3::new(2.0, -6.5, 0.2),
+                        translation: Vec3::new(2.0, -4.5, 0.2),
                         scale: Vec3::new(scale, scale, 1.0),
                         rotation: Quat::IDENTITY,
                     },
@@ -1238,7 +1231,8 @@ pub fn stage_agent_session(
                 .history(&stack.file_path)
                 .map(|h| h.revisions.len())
                 .unwrap_or(stack.revision_count);
-            let label = format!("{} (R{})", stack.file_path, rev_count);
+            let short_name = format_short_file_name(&stack.file_path);
+            let label = format!("{} (R{})", short_name, rev_count);
             layout_colored_lines(
                 atlas,
                 &[(label, [250, 245, 230])],

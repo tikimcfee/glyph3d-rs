@@ -218,26 +218,24 @@ impl SpatialScene {
                 None => return,
             };
 
-            // If the event targets a file, focus that file's revision
+            // If the event targets a file, focus that file's exact revision at this beat
             if let Some(target_file) = event.file_path() {
                 if let Some(&stack_e) = desk_comp.file_stacks.get(target_file) {
                     if let Some(history) = revision_engine.history(target_file) {
-                        if let Some(rev) = history.revision_for_turn(event.turn_index) {
+                        if let Some(rev) = history.revision_for_event(beat_index).or_else(|| history.revision_for_turn(event.turn_index)) {
                             if let Some(mut stack) = self.world.get_mut::<FileRevisionStack>(stack_e) {
                                 stack.active_revision = rev.revision_index;
                             }
                         }
                     }
                 }
-            } else if let Some(turn) = session.turns.get(event.turn_index) {
-                // Otherwise synchronize all files in this turn
-                for action in &turn.file_actions {
-                    if let Some(&stack_e) = desk_comp.file_stacks.get(&action.file_path) {
-                        if let Some(history) = revision_engine.history(&action.file_path) {
-                            if let Some(rev) = history.revision_for_turn(event.turn_index) {
-                                if let Some(mut stack) = self.world.get_mut::<FileRevisionStack>(stack_e) {
-                                    stack.active_revision = rev.revision_index;
-                                }
+            } else {
+                // Otherwise synchronize all files to their state at this beat
+                for (file_path, &stack_e) in &desk_comp.file_stacks {
+                    if let Some(history) = revision_engine.history(file_path) {
+                        if let Some(rev) = history.revision_for_event(beat_index).or_else(|| history.revision_for_turn(event.turn_index)) {
+                            if let Some(mut stack) = self.world.get_mut::<FileRevisionStack>(stack_e) {
+                                stack.active_revision = rev.revision_index;
                             }
                         }
                     }
@@ -289,7 +287,11 @@ impl SpatialScene {
         revision_engine: &RevisionEngine,
     ) {
         let events = session.linearize_events(Some(revision_engine));
-        if let Some(beat_idx) = events.iter().position(|e| e.turn_index == turn_index) {
+        if let Some(beat_idx) = events
+            .iter()
+            .rposition(|e| e.turn_index == turn_index && e.file_path().is_some())
+            .or_else(|| events.iter().position(|e| e.turn_index == turn_index))
+        {
             self.carrel_set_beat(carrel_entity, beat_idx, session, revision_engine);
             return;
         }

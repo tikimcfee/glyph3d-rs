@@ -130,7 +130,7 @@ impl AgentSession {
                         FileActionKind::Edit => {
                             let post_edit = revision_engine
                                 .and_then(|re| re.history(&fa.file_path))
-                                .and_then(|h| h.revision_for_turn(turn.turn_index))
+                                .and_then(|h| h.revision_for_event(event_idx).or_else(|| h.revision_for_turn(turn.turn_index)))
                                 .map(|r| r.text.as_ref().clone())
                                 .or_else(|| fa.new_content.clone());
                             events.push(TranscriptEvent {
@@ -236,7 +236,7 @@ impl AgentSession {
                         FileActionKind::Edit => {
                             let post_edit = revision_engine
                                 .and_then(|re| re.history(&fa.file_path))
-                                .and_then(|h| h.revision_for_turn(turn.turn_index))
+                                .and_then(|h| h.revision_for_event(event_idx).or_else(|| h.revision_for_turn(turn.turn_index)))
                                 .map(|r| r.text.as_ref().clone())
                                 .or_else(|| fa.new_content.clone());
                             events.push(TranscriptEvent {

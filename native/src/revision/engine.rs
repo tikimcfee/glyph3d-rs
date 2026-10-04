@@ -65,10 +65,32 @@ impl RevisionEngine {
         paths
     }
 
-    /// Ingest an entire `AgentSession` with all its turns sequentially.
+    /// Ingest an entire `AgentSession` with all its linearized events and turns.
     pub fn ingest_session(&mut self, session: &AgentSession) {
-        for turn in &session.turns {
-            self.ingest_turn(turn);
+        let events = session.linearize_events(None);
+        let mut file_action_count = 0;
+        for event in &events {
+            match &event.kind {
+                crate::agent_transcript::TranscriptEventKind::FileEdit { action_record, .. } => {
+                    self.ingest_file_action_with_event(event.turn_index, Some(event.index), action_record);
+                    file_action_count += 1;
+                }
+                crate::agent_transcript::TranscriptEventKind::FileRead { action_record, .. } => {
+                    self.ingest_file_action_with_event(event.turn_index, Some(event.index), action_record);
+                    file_action_count += 1;
+                }
+                crate::agent_transcript::TranscriptEventKind::FileWrite { action_record, .. } => {
+                    self.ingest_file_action_with_event(event.turn_index, Some(event.index), action_record);
+                    file_action_count += 1;
+                }
+                _ => {}
+            }
+        }
+
+        if file_action_count == 0 {
+            for turn in &session.turns {
+                self.ingest_turn(turn);
+            }
         }
     }
 
@@ -81,6 +103,16 @@ impl RevisionEngine {
 
     /// Ingest a single file action record into the target file's revision history.
     pub fn ingest_file_action(&mut self, turn_index: usize, action: &FileActionRecord) {
+        self.ingest_file_action_with_event(turn_index, None, action);
+    }
+
+    /// Ingest a single file action record with its associated atomic narrative beat index.
+    pub fn ingest_file_action_with_event(
+        &mut self,
+        turn_index: usize,
+        event_index: Option<usize>,
+        action: &FileActionRecord,
+    ) {
         let path = &action.file_path;
         let history = self
             .histories
@@ -101,6 +133,7 @@ impl RevisionEngine {
                     let r0 = FileRevision {
                         revision_index: 0,
                         turn_index,
+                        event_index,
                         action: FileActionKind::Read,
                         summary: format!("Base {path}"),
                         text: Arc::new(orig.clone()),
@@ -116,6 +149,7 @@ impl RevisionEngine {
                 let rev = FileRevision {
                     revision_index: history.count(),
                     turn_index,
+                    event_index,
                     action: FileActionKind::Write,
                     summary: action.summary.clone(),
                     text: Arc::new(new_text),
@@ -145,6 +179,7 @@ impl RevisionEngine {
                     let rev = FileRevision {
                         revision_index: history.count(),
                         turn_index,
+                        event_index,
                         action: FileActionKind::Edit,
                         summary: action.summary.clone(),
                         text: Arc::new(derived_text),
@@ -177,6 +212,7 @@ impl RevisionEngine {
                         let r0 = FileRevision {
                             revision_index: 0,
                             turn_index,
+                            event_index,
                             action: FileActionKind::Read,
                             summary: format!("Base {path}"),
                             text: Arc::new(base_text.clone()),
@@ -201,6 +237,7 @@ impl RevisionEngine {
                         let r1 = FileRevision {
                             revision_index: 1,
                             turn_index,
+                            event_index,
                             action: FileActionKind::Edit,
                             summary: action.summary.clone(),
                             text: Arc::new(derived_text),
@@ -217,6 +254,7 @@ impl RevisionEngine {
                         let r0 = FileRevision {
                             revision_index: 0,
                             turn_index,
+                            event_index,
                             action: FileActionKind::Read,
                             summary: format!("Base (Snippet) {path}"),
                             text: Arc::new(snippet.clone()),
@@ -230,6 +268,7 @@ impl RevisionEngine {
                         let r1 = FileRevision {
                             revision_index: 1,
                             turn_index,
+                            event_index,
                             action: FileActionKind::Edit,
                             summary: action.summary.clone(),
                             text: Arc::new(derived_text),
@@ -244,7 +283,7 @@ impl RevisionEngine {
                     }
                 }
             }
-            FileActionKind::Read if history.is_empty() => {
+            FileActionKind::Read => {
                 let text = action
                     .original_file
                     .as_ref()
@@ -258,19 +297,36 @@ impl RevisionEngine {
                     });
 
                 if let Some(content) = text {
-                    let rev = FileRevision {
-                        revision_index: 0,
-                        turn_index,
-                        action: FileActionKind::Read,
-                        summary: action.summary.clone(),
-                        text: Arc::new(content),
-                        diff_stats: DiffStats::default(),
-                        hunks: Vec::new(),
-                    };
-                    history.push_revision(rev);
+                    if history.is_empty() {
+                        let rev = FileRevision {
+                            revision_index: 0,
+                            turn_index,
+                            event_index,
+                            action: FileActionKind::Read,
+                            summary: action.summary.clone(),
+                            text: Arc::new(content),
+                            diff_stats: DiffStats::default(),
+                            hunks: Vec::new(),
+                        };
+                        history.push_revision(rev);
+                    } else if history.latest().is_none_or(|lat| lat.text.as_str() != content) {
+                        let rev = FileRevision {
+                            revision_index: history.count(),
+                            turn_index,
+                            event_index,
+                            action: FileActionKind::Read,
+                            summary: action.summary.clone(),
+                            text: Arc::new(content),
+                            diff_stats: DiffStats::default(),
+                            hunks: Vec::new(),
+                        };
+                        history.push_revision(rev);
+                    }
                 }
             }
             _ => {}
         }
     }
 }
+
+

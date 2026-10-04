@@ -31,6 +31,9 @@ pub struct FileRevision {
     pub revision_index: usize,
     /// Which agent turn produced or inspected this revision.
     pub turn_index: usize,
+    /// Which atomic narrative beat / event produced or inspected this revision.
+    #[serde(default)]
+    pub event_index: Option<usize>,
     /// Kind of action that created or observed this revision.
     pub action: FileActionKind,
     /// Brief human-readable summary of the change.
@@ -94,9 +97,18 @@ impl FileRevisionHistory {
         self.revisions.get(revision_index)
     }
 
-    /// Find the revision created or viewed during a specific agent turn index.
+    /// Find the revision active at or immediately before a specific beat/event index.
+    pub fn revision_for_event(&self, event_index: usize) -> Option<&FileRevision> {
+        self.revisions
+            .iter()
+            .rev()
+            .find(|r| r.event_index.is_some_and(|idx| idx <= event_index))
+            .or_else(|| self.revisions.first())
+    }
+
+    /// Find the revision created or viewed during a specific agent turn index (latest in that turn).
     pub fn revision_for_turn(&self, turn_index: usize) -> Option<&FileRevision> {
-        self.revisions.iter().find(|r| r.turn_index == turn_index)
+        self.revisions.iter().rev().find(|r| r.turn_index == turn_index)
     }
 
     /// Push a new revision onto the history, returning its index.
