@@ -48,10 +48,10 @@ fn defaults_match_old_parser() {
     assert_eq!(cli.layout_mode, "shelf");
     assert_eq!(parse_layout_mode(&cli.layout_mode), crate::repo::RepoLayoutMode::Shelf);
     assert_eq!(parse_layout_mode("carrel"), crate::repo::RepoLayoutMode::Carrel);
-    // Syntax color mode: syntax is the default to preserve golden images byte-identically.
-    assert_eq!(cli.color_mode, "syntax");
-    assert_eq!(parse_color_mode(&cli.color_mode), crate::repo::ColorMode::Syntax);
-    assert_eq!(parse_color_mode("flat"), crate::repo::ColorMode::Flat);
+    // Syntax color mode: flat is the default for instant geometric load without unneeded color allocations.
+    assert_eq!(cli.color_mode, "flat");
+    assert_eq!(parse_color_mode(&cli.color_mode), crate::repo::ColorMode::Flat);
+    assert_eq!(parse_color_mode("syntax"), crate::repo::ColorMode::Syntax);
     assert!(!cli.repo_verify);
     assert!(cli.focus_file.is_none());
     assert!(!cli.repo_scan_only);

@@ -141,7 +141,7 @@ fn marshal(
                 per_record_colors.extend_from_slice(colors);
             }
             Paint::Flat(rgba) => flat_colors[index] = rgba,
-            Paint::ByteSpans(_) => flat_colors[index] = crate::layout::DEFAULT_COLOR_PACKED,
+            Paint::ByteSpans(_) | Paint::SyntaxHeuristic => flat_colors[index] = crate::layout::DEFAULT_COLOR_PACKED,
         }
         groups.push(item.group_id);
         off += item.bytes.len();

@@ -346,7 +346,7 @@ impl Default for RepoParams {
             wrap_mode: crate::fold::WrapMode::Back,
             cluster_mode: crate::fold::ClusterMode::Leader,
             layout_mode: RepoLayoutMode::Shelf,
-            color_mode: ColorMode::Syntax,
+            color_mode: ColorMode::Flat,
         }
     }
 }
@@ -713,17 +713,9 @@ pub fn load_repo_from_walk(
     // instances afterwards: compaction destroys the index that names a byte
     // (the argument is at `layout::Paint`).
     let mut stage_dur = std::time::Duration::ZERO;
-    let colors = match params.color_mode {
-        ColorMode::Syntax => {
-            let t = Instant::now();
-            let sp_paint = tracing::info_span!("repo.paint").entered();
-            let file_bytes: Vec<&[u8]> = walk.files.iter().map(|f| f.bytes.as_slice()).collect();
-            let c = paint_files(&file_bytes);
-            stage_dur += t.elapsed();
-            drop(sp_paint);
-            Some(c)
-        }
-        ColorMode::Flat => None,
+    let paint_mode = match params.color_mode {
+        ColorMode::Syntax => Paint::SyntaxHeuristic,
+        ColorMode::Flat => Paint::Flat(crate::layout::DEFAULT_COLOR_PACKED),
     };
 
     let items: Vec<LayoutItem<'_>> = walk
@@ -734,10 +726,7 @@ pub fn load_repo_from_walk(
             bytes: &f.bytes,
             params: file_params[index],
             group_id: index as u32,
-            paint: match &colors {
-                Some(c) => Paint::PerRecord(&c[index]),
-                None => Paint::Flat(crate::layout::DEFAULT_COLOR_PACKED),
-            },
+            paint: paint_mode,
         })
         .collect();
 
@@ -1635,6 +1624,7 @@ impl RepoLoad {
 /// concatenate in file order — bit-identical to the serial map (the
 /// `sharded_paint_matches_serial` test fences exactly that; the golden views
 /// only ever run the serial arm). 1.0s -> ~0.24s at the flagship, 2026-09-30.
+#[cfg(test)]
 fn paint_files(files: &[&[u8]]) -> Vec<Vec<u32>> {
     use rayon::prelude::*;
     files.par_iter().map(|f| text::colorize_leaders(f)).collect()

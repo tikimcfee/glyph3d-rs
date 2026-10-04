@@ -143,9 +143,9 @@ pub struct Cli {
     /// `carrel` (hierarchical directory-based neighborhood carrels).
     #[arg(long, value_name = "MODE", default_value = "shelf", value_parser = ["shelf", "carrel"])]
     pub layout_mode: String,
-    /// Syntax color mode on repo load: `syntax` (eager CPU lexer during load)
-    /// or `flat` (fast geometric load with extension-based LOD tint, awaiting external colorization)
-    #[arg(long, value_name = "MODE", default_value = "syntax", value_parser = ["syntax", "flat"])]
+    /// Syntax color mode on repo load: `flat` (default: fast geometric load with extension-based LOD tint, awaiting external colorization)
+    /// or `syntax` (eager CPU lexer during load)
+    #[arg(long, value_name = "MODE", default_value = "flat", value_parser = ["syntax", "flat"])]
     pub color_mode: String,
     /// Stage E2: frame the first file whose path contains SUBSTR
     #[arg(long, value_name = "SUBSTR")]

@@ -155,13 +155,13 @@ cmd = "--render-file fixtures/baseline-view.txt --frames 2"
 # became the default.
 [[golden_view]]
 name = "repo-wide"
-cmd = "--load-repo fixtures/g-pick-repo --frames 2"
+cmd = "--load-repo fixtures/g-pick-repo --frames 2 --color-mode syntax"
 [[golden_view]]
 name = "repo-down"
-cmd = "--load-repo fixtures/g-pick-repo --frames 2 --wrap-mode down"
+cmd = "--load-repo fixtures/g-pick-repo --frames 2 --wrap-mode down --color-mode syntax"
 [[golden_view]]
 name = "repo-zoom"
-cmd = "--load-repo fixtures/g-pick-repo --frames 2 --focus-file alpha.rs --zoom 3"
+cmd = "--load-repo fixtures/g-pick-repo --frames 2 --focus-file alpha.rs --zoom 3 --color-mode syntax"
 # The z-order frame. Front-on views cannot see whether a wrapped column that
 # recedes in `back` mode is occluded by the page beside it — that needs a
 # camera pitched down over wide.txt so its column converges up into long.md.
@@ -170,7 +170,7 @@ cmd = "--load-repo fixtures/g-pick-repo --frames 2 --focus-file alpha.rs --zoom 
 # `depth-write-off` mutation is what proves this frame sees the class.
 [[golden_view]]
 name = "repo-back-oblique"
-cmd = "--load-repo fixtures/g-pick-repo --frames 2 --cam-pose 30 -120 60 0 -12"
+cmd = "--load-repo fixtures/g-pick-repo --frames 2 --cam-pose 30 -120 60 0 -12 --color-mode syntax"
 # The colour-emoji frame (2026-09-10): every class of bitmap slot the trie has
 # — web-era re-pointed, appended, no-cell, emoji-in-the-font-but-text-here —
 # through the CPU staging path and the shader's mode-1 branch. The only frame
@@ -195,7 +195,7 @@ cmd = "--render-file fixtures/emoji-cluster-view.txt --frames 2 --zoom 1.25 --cl
 # --load-repo (the FFI + engine resolve them end to end).
 [[golden_view]]
 name = "repo-cluster"
-cmd = "--load-repo fixtures/g-cluster-repo --frames 2 --cluster-mode cluster"
+cmd = "--load-repo fixtures/g-cluster-repo --frames 2 --cluster-mode cluster --color-mode syntax"
 
 # ── Gates ────────────────────────────────────────────────────────────────
 # `scope` answers "I changed X, what should I run" — the question the CLI is

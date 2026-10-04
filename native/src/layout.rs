@@ -324,6 +324,8 @@ pub enum Paint<'a> {
     PerRecord(&'a [u32]),
     /// Non-overlapping byte ranges in ascending order — AST/LSP format.
     ByteSpans(&'a [ByteSpan]),
+    /// Compute heuristic syntax colors on-the-fly per item during layout.
+    SyntaxHeuristic,
 }
 
 /// One item to lay out: the bytes, how to lay them out, how to paint them, and
@@ -927,7 +929,7 @@ pub(crate) fn compact_records_into(
             color: match paint {
                 Paint::Flat(rgba) => rgba,
                 Paint::PerRecord(colors) => colors[index],
-                Paint::ByteSpans(_) => DEFAULT_COLOR_PACKED,
+                Paint::ByteSpans(_) | Paint::SyntaxHeuristic => DEFAULT_COLOR_PACKED,
             },
             group_id,
             advance: record.advance(),
