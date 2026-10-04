@@ -255,29 +255,44 @@ pub(crate) fn run_repo_chain(
     let _sp_tail = span_tail.enter();
     let sp_totals = tracing::info_span!("tail.totals").entered();
 
-    let t_tsync = std::time::Instant::now();
-    let tb = client
-        .read_one(buf.h_totals.as_ref().unwrap().clone())
-        .expect("totals readback");
-    let tv: &[u32] = bytemuck::cast_slice(&tb);
-    let mut ltot = Vec::with_capacity(item_count);
-    let mut stot = Vec::with_capacity(item_count);
-    for i in 0..item_count {
-        ltot.push(tv[i * 2]);
-        stot.push(tv[i * 2 + 1]);
-    }
-    prof.record_sync("sync:totals_readback", t_tsync.elapsed());
+    let (ltot, stot, total_records, total_slots, rec_base, slot_base) = {
+        let skip_totals_sync = std::env::var_os("GLYPH_TOTALS_READBACK").is_none();
+        if skip_totals_sync {
+            (
+                host_inputs.ltot.clone(),
+                host_inputs.stot.clone(),
+                host_inputs.total_records,
+                host_inputs.total_slots,
+                host_inputs.rec_base.clone(),
+                host_inputs.slot_base.clone(),
+            )
+        } else {
+            let t_tsync = std::time::Instant::now();
+            let tb = client
+                .read_one(buf.h_totals.as_ref().unwrap().clone())
+                .expect("totals readback");
+            let tv: &[u32] = bytemuck::cast_slice(&tb);
+            let mut ltot = Vec::with_capacity(item_count);
+            let mut stot = Vec::with_capacity(item_count);
+            for i in 0..item_count {
+                ltot.push(tv[i * 2]);
+                stot.push(tv[i * 2 + 1]);
+            }
+            prof.record_sync("sync:totals_readback", t_tsync.elapsed());
 
-    let mut rec_base = vec![0u32; item_count];
-    let mut slot_base = vec![0u32; item_count];
-    let mut total_records = 0u32;
-    let mut total_slots = 0u32;
-    for i in 0..item_count {
-        rec_base[i] = total_records;
-        slot_base[i] = total_slots;
-        total_records += ltot[i];
-        total_slots += stot[i];
-    }
+            let mut rec_base = vec![0u32; item_count];
+            let mut slot_base = vec![0u32; item_count];
+            let mut total_records = 0u32;
+            let mut total_slots = 0u32;
+            for i in 0..item_count {
+                rec_base[i] = total_records;
+                slot_base[i] = total_slots;
+                total_records += ltot[i];
+                total_slots += stot[i];
+            }
+            (ltot, stot, total_records, total_slots, rec_base, slot_base)
+        }
+    };
 
     if wants_instances {
         let mut expect = 0u32;
@@ -340,15 +355,6 @@ pub(crate) fn run_repo_chain(
     let mut tint_store = crate::layout::TintStore::Host(Vec::new());
     let mut slot_device: Option<SlotDevice> = None;
     if wants_instances {
-        placements = decode_placements(
-            &client,
-            buf.h_ext.clone(),
-            item_count,
-            &slot_base,
-            &stot,
-            &ltot,
-        );
-
         assert!(
             (total_slots as u64) * 32 <= device_ref.max_buffer_size,
             "the endpoint needs one {} B slot buffer — over this device's \
@@ -370,6 +376,15 @@ pub(crate) fn run_repo_chain(
             &buf,
             needs_tint,
             &mut prof,
+        );
+
+        placements = decode_placements(
+            &client,
+            buf.h_ext.clone(),
+            item_count,
+            &slot_base,
+            &stot,
+            &ltot,
         );
 
         let sp_tint = tracing::info_span!("tail.tint").entered();

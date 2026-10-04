@@ -10,6 +10,7 @@ use super::{
     IM_LINE_HEIGHT, IM_ORIGIN_X, IM_ORIGIN_Y, IM_ORIGIN_Z, IM_STRIDE, IM_Z_STEP, IM_Z_STEP_LO,
     LC_COL, LC_ROW, LC_STRIDE, LM_BASE_X, LM_STRIDE, LM_X, LM_Y, LM_Z, RESOLVE_SLOTS,
 };
+use super::tail::EXT_STRIDE;
 
 // ── dispatch 4: resolveX — the WRAPPED items' x, range workers ────────────────
 //
@@ -232,6 +233,337 @@ pub(super) fn resolve_x(
         if it < item_count {
             row_max[it].fetch_max(srow[u].load());
             x_max[it].fetch_max(sx[u].load());
+        }
+    }
+}
+
+/// Fused resolveX and extent reduction: computes wrapped X, page layout, and folds
+/// bounding boxes directly in registers, eliminating the separate extent_fold kernel.
+#[cube(launch_unchecked)]
+pub(super) fn resolve_x_fused(
+    sm: &[f32],
+    fl: &[u32],
+    lm: &mut [f32],
+    lc: &[u32],
+    items: &[f32],
+    ie: &[u32],
+    ir: &[u32],
+    wc: &[u32],
+    otb: &[u32],
+    wm: &[f32],
+    extent_words: &[u32],
+    page_gap_x: &[f32],
+    gi: &[u32],
+    hgt: &[f32],
+    ext: &mut [Atomic<u32>],
+    #[comptime] units: usize,
+    #[comptime] span: usize,
+) {
+    let t = ABSOLUTE_POS;
+    let n = fl.len() * 4; // packed: words -> bytes
+    let item_count = ir.len() / 2;
+    let u = UNIT_POS as usize;
+    let sext = Shared::<[Atomic<u32>]>::new_slice(RESOLVE_SLOTS * EXT_STRIDE);
+    let sflags = Shared::<[Atomic<u32>]>::new_slice(RESOLVE_SLOTS);
+    let mut sbase = Shared::<u32>::new();
+    let cube_lo = CUBE_POS * units * span;
+    if u == 0 {
+        let probe = if cube_lo < n { cube_lo } else { n - 1 };
+        let mut b = 0usize;
+        if item_count > 0 {
+            b = item_search(ir, item_count, probe);
+        }
+        *sbase = b as u32;
+    }
+
+    let zero_k = 0x8000_0000u32;
+    let inf_k = 0xFF80_0000u32;
+    let ninf_k = 0x007F_FFFFu32;
+
+    let mut z = u;
+    while z < RESOLVE_SLOTS {
+        sflags[z].store(0u32);
+        let e = z * EXT_STRIDE;
+        sext[e].store(zero_k);
+        sext[e + 1].store(zero_k);
+        sext[e + 2].store(zero_k);
+        sext[e + 3].store(zero_k);
+        sext[e + 4].store(inf_k);
+        sext[e + 5].store(inf_k);
+        sext[e + 6].store(ninf_k);
+        sext[e + 7].store(ninf_k);
+        sext[e + 8].store(inf_k);
+        sext[e + 9].store(ninf_k);
+        z += units;
+    }
+    sync_cube();
+    let it_base = *sbase as usize;
+
+    let lo = t * span;
+    if lo < n {
+        let hi = if lo + span < n { lo + span } else { n };
+        let mut it = 0usize;
+        let mut start = 0usize;
+        let mut nxt = n;
+        let mut wrap = 0i32;
+        let mut fold = 0i32;
+        let has = item_count > 0;
+        if has {
+            it = item_search(ir, item_count, lo);
+            start = ir[it * 2] as usize;
+            nxt = if it + 1 < item_count { ir[(it + 1) * 2] as usize } else { n };
+            wrap = ie[it * IE_STRIDE + IE_WRAP_WIDTH] as i32;
+            fold = fold_of(ie, it, wrap);
+        }
+        let mut x = 0.0f32;
+        let mut in_seg = false;
+        let mut cur_it = it;
+
+        let mut pg_rmax = f32::new(0.0f32);
+        let mut pg_ymin = f32::new(0.0f32);
+        let mut pg_zmin = f32::new(0.0f32);
+        let mut pg_zmax = f32::new(0.0f32);
+        let mut ink_xmin = f32::new(3.4028235e38f32);
+        let mut ink_ymin = f32::new(3.4028235e38f32);
+        let mut ink_rmax = f32::new(-3.4028235e38f32);
+        let mut ink_ymax = f32::new(-3.4028235e38f32);
+        let mut ink_zmin = f32::new(3.4028235e38f32);
+        let mut ink_zmax = f32::new(-3.4028235e38f32);
+        let mut any_leader = false;
+        let mut any_survivor = false;
+
+        let mut id = lo;
+        while id < hi {
+            while has && nxt <= id {
+                if any_leader {
+                    let slot = cur_it - it_base;
+                    if slot < RESOLVE_SLOTS {
+                        sflags[slot].fetch_or(if any_survivor { 3u32 } else { 1u32 });
+                        let e = slot * EXT_STRIDE;
+                        sext[e].fetch_max(ordered_key(pg_rmax));
+                        sext[e + 1].fetch_min(ordered_key(pg_ymin));
+                        sext[e + 2].fetch_min(ordered_key(pg_zmin));
+                        sext[e + 3].fetch_max(ordered_key(pg_zmax));
+                        if any_survivor {
+                            sext[e + 4].fetch_min(ordered_key(ink_xmin));
+                            sext[e + 5].fetch_min(ordered_key(ink_ymin));
+                            sext[e + 6].fetch_max(ordered_key(ink_rmax));
+                            sext[e + 7].fetch_max(ordered_key(ink_ymax));
+                            sext[e + 8].fetch_min(ordered_key(ink_zmin));
+                            sext[e + 9].fetch_max(ordered_key(ink_zmax));
+                        }
+                    } else {
+                        let e = cur_it * EXT_STRIDE;
+                        ext[e].fetch_max(ordered_key(pg_rmax));
+                        ext[e + 1].fetch_min(ordered_key(pg_ymin));
+                        ext[e + 2].fetch_min(ordered_key(pg_zmin));
+                        ext[e + 3].fetch_max(ordered_key(pg_zmax));
+                        if any_survivor {
+                            ext[e + 4].fetch_min(ordered_key(ink_xmin));
+                            ext[e + 5].fetch_min(ordered_key(ink_ymin));
+                            ext[e + 6].fetch_max(ordered_key(ink_rmax));
+                            ext[e + 7].fetch_max(ordered_key(ink_ymax));
+                            ext[e + 8].fetch_min(ordered_key(ink_zmin));
+                            ext[e + 9].fetch_max(ordered_key(ink_zmax));
+                        }
+                    }
+                    pg_rmax = f32::new(0.0f32);
+                    pg_ymin = f32::new(0.0f32);
+                    pg_zmin = f32::new(0.0f32);
+                    pg_zmax = f32::new(0.0f32);
+                    ink_xmin = f32::new(3.4028235e38f32);
+                    ink_ymin = f32::new(3.4028235e38f32);
+                    ink_rmax = f32::new(-3.4028235e38f32);
+                    ink_ymax = f32::new(-3.4028235e38f32);
+                    ink_zmin = f32::new(3.4028235e38f32);
+                    ink_zmax = f32::new(-3.4028235e38f32);
+                    any_leader = false;
+                    any_survivor = false;
+                }
+                it += 1;
+                cur_it = it;
+                start = ir[it * 2] as usize;
+                nxt = if it + 1 < item_count { ir[(it + 1) * 2] as usize } else { n };
+                wrap = ie[it * IE_STRIDE + IE_WRAP_WIDTH] as i32;
+                fold = fold_of(ie, it, wrap);
+            }
+            let f = flags_at(fl, id);
+            if (f & F_LEADER) != 0 {
+                let col = lc[id * LC_STRIDE + LC_COL] as i32;
+                if fold > 0 {
+                    let head = col % fold == 0;
+                    if !in_seg || head {
+                        x = 0.0f32;
+                        let ord = wc[id] as i32;
+                        let mut k = col % fold;
+                        while k >= 1 {
+                            let q = otb[start + (ord - k) as usize] as usize;
+                            x += sm[q];
+                            k -= 1;
+                        }
+                        in_seg = true;
+                    }
+                } else {
+                    x = wm[id];
+                }
+                let row = lc[id * LC_STRIDE + LC_ROW] as i32;
+                let io = it * IM_STRIDE;
+                let wrap_segment = wrap_segment_of(col, wrap, (f & F_NEWLINE) != 0);
+                let lh = items[io + IM_LINE_HEIGHT];
+                let mo = id * LM_STRIDE;
+                let base = x + items[io + IM_ORIGIN_X];
+
+                let mut final_x = base;
+                let mut final_y = fma(-(row as f32), lh, items[io + IM_ORIGIN_Y]);
+                let depth_steps = -(wrap_segment as f32);
+                let z_tail_folded = fma(
+                    depth_steps,
+                    items[io + IM_Z_STEP_LO],
+                    items[io + IM_ORIGIN_Z],
+                );
+                let mut final_z = fma(depth_steps, items[io + IM_Z_STEP], z_tail_folded);
+
+                let ie_off = it * IE_STRIDE;
+                let has_page = ie[ie_off + IE_HAS_PAGE] != 0;
+                let rows = if has_page { ie[ie_off + IE_PAGE_ROWS] as i32 } else { 0 };
+                let cols = if has_page { ie[ie_off + IE_PAGE_COLS] as i32 } else { 0 };
+                let scroll = if has_page { ie[ie_off + IE_SCROLL_ROWS] as i32 } else { 0 };
+                if rows != 0 || cols != 0 || scroll != 0 {
+                    let screen_row = row - scroll;
+                    let mut y_page = 0;
+                    if rows > 0 && screen_row >= rows {
+                        y_page = screen_row / rows;
+                    }
+                    let mut x_page = 0;
+                    if cols > 0 {
+                        x_page = col / cols;
+                    }
+                    let pages_wide_raw = ie[ie_off + IE_PAGES_WIDE] as i32;
+                    let pages_wide = if pages_wide_raw > 1 { pages_wide_raw } else { 1 };
+                    let band = y_page / pages_wide;
+                    let page_col = (y_page % pages_wide) as f32;
+                    let mut stride_reach = 0.0f32;
+                    let mut stride_reach_tail = 0.0f32;
+                    if has_page && rows > 0 {
+                        let exact = advance_fixed(key_to_float(extent_words[it * 2]))
+                            + advance_fixed(page_gap_x[it]);
+                        fixed_pair(exact, &mut stride_reach, &mut stride_reach_tail);
+                    }
+                    let x_with_tail = fma(page_col, stride_reach_tail, base);
+                    final_x = fma(page_col, stride_reach, x_with_tail);
+                    let row_in_page = (screen_row - y_page * rows) as f32;
+                    let y_row_folded = fma(-row_in_page, lh, items[io + IM_ORIGIN_Y]);
+                    final_y = fma(-(band as f32), items[io + IM_BAND_STRIDE_Y], y_row_folded);
+                    let z_stepped = fma(depth_steps, items[io + IM_Z_STEP], z_tail_folded);
+                    let z_banded = fma(band as f32, items[io + IM_DEPTH_PER_BAND], z_stepped);
+                    final_z = fma(x_page as f32, items[io + IM_DEPTH_PER_COL], z_banded);
+                }
+
+                lm[mo + LM_BASE_X] = base;
+                lm[mo + LM_X] = final_x;
+                lm[mo + LM_Y] = final_y;
+                lm[mo + LM_Z] = final_z;
+
+                any_leader = true;
+                let right = final_x + sm[id];
+                if right > pg_rmax {
+                    pg_rmax = right;
+                }
+                if final_y < pg_ymin {
+                    pg_ymin = final_y;
+                }
+                if final_z < pg_zmin {
+                    pg_zmin = final_z;
+                }
+                if final_z > pg_zmax {
+                    pg_zmax = final_z;
+                }
+                if gi[id] != 0u32 {
+                    any_survivor = true;
+                    let half = hgt[id] * 0.5f32;
+                    let y_lo = final_y - half;
+                    let y_hi = final_y + half;
+                    if final_x < ink_xmin {
+                        ink_xmin = final_x;
+                    }
+                    if y_lo < ink_ymin {
+                        ink_ymin = y_lo;
+                    }
+                    if right > ink_rmax {
+                        ink_rmax = right;
+                    }
+                    if y_hi > ink_ymax {
+                        ink_ymax = y_hi;
+                    }
+                    if final_z < ink_zmin {
+                        ink_zmin = final_z;
+                    }
+                    if final_z > ink_zmax {
+                        ink_zmax = final_z;
+                    }
+                }
+
+                if (f & F_NEWLINE) == 0 && fold > 0 {
+                    x += sm[id];
+                }
+            }
+            id += 1;
+        }
+        if any_leader {
+            let slot = cur_it - it_base;
+            if slot < RESOLVE_SLOTS {
+                sflags[slot].fetch_or(if any_survivor { 3u32 } else { 1u32 });
+                let e = slot * EXT_STRIDE;
+                sext[e].fetch_max(ordered_key(pg_rmax));
+                sext[e + 1].fetch_min(ordered_key(pg_ymin));
+                sext[e + 2].fetch_min(ordered_key(pg_zmin));
+                sext[e + 3].fetch_max(ordered_key(pg_zmax));
+                if any_survivor {
+                    sext[e + 4].fetch_min(ordered_key(ink_xmin));
+                    sext[e + 5].fetch_min(ordered_key(ink_ymin));
+                    sext[e + 6].fetch_max(ordered_key(ink_rmax));
+                    sext[e + 7].fetch_max(ordered_key(ink_ymax));
+                    sext[e + 8].fetch_min(ordered_key(ink_zmin));
+                    sext[e + 9].fetch_max(ordered_key(ink_zmax));
+                }
+            } else {
+                let e = cur_it * EXT_STRIDE;
+                ext[e].fetch_max(ordered_key(pg_rmax));
+                ext[e + 1].fetch_min(ordered_key(pg_ymin));
+                ext[e + 2].fetch_min(ordered_key(pg_zmin));
+                ext[e + 3].fetch_max(ordered_key(pg_zmax));
+                if any_survivor {
+                    ext[e + 4].fetch_min(ordered_key(ink_xmin));
+                    ext[e + 5].fetch_min(ordered_key(ink_ymin));
+                    ext[e + 6].fetch_max(ordered_key(ink_rmax));
+                    ext[e + 7].fetch_max(ordered_key(ink_ymax));
+                    ext[e + 8].fetch_min(ordered_key(ink_zmin));
+                    ext[e + 9].fetch_max(ordered_key(ink_zmax));
+                }
+            }
+        }
+    }
+    sync_cube();
+    if u < RESOLVE_SLOTS {
+        let it = it_base + u;
+        if it < item_count {
+            let flags = sflags[u].load();
+            if (flags & 1u32) != 0 {
+                let se = u * EXT_STRIDE;
+                let e = it * EXT_STRIDE;
+                ext[e].fetch_max(sext[se].load());
+                ext[e + 1].fetch_min(sext[se + 1].load());
+                ext[e + 2].fetch_min(sext[se + 2].load());
+                ext[e + 3].fetch_max(sext[se + 3].load());
+                if (flags & 2u32) != 0 {
+                    ext[e + 4].fetch_min(sext[se + 4].load());
+                    ext[e + 5].fetch_min(sext[se + 5].load());
+                    ext[e + 6].fetch_max(sext[se + 6].load());
+                    ext[e + 7].fetch_max(sext[se + 7].load());
+                    ext[e + 8].fetch_min(sext[se + 8].load());
+                    ext[e + 9].fetch_max(sext[se + 9].load());
+                }
+            }
         }
     }
 }

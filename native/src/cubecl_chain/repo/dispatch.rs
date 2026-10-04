@@ -9,10 +9,10 @@ use super::super::cluster::{
     rank_step,
 };
 use super::super::decode::decode;
-use super::super::position::{extent_pair, resolve_x};
+use super::super::position::{extent_pair, resolve_x_fused};
 use super::super::scan::{apply, spine_scan, tile_scan};
 use super::super::tail::{
-    extent_fold, item_totals, sv_count_spine, sv_count_tile,
+    item_totals, sv_count_spine, sv_count_tile,
     EXT_STRIDE,
 };
 use super::super::{IM_STRIDE, LC_STRIDE, LM_STRIDE, PARTIAL_COUNT_STRIDE};
@@ -539,26 +539,29 @@ pub(crate) fn launch_block2_geometry(
         );
         prof.end(client, "apply");
 
-        let rake_ep = 32usize;
-        prof.begin(client, "extent_pair");
-        extent_pair::launch_unchecked(
-            client,
-            tiles_grid(n.div_ceil(units * rake_ep).max(1)),
-            CubeDim::new_1d(units as u32),
-            BufferArg::from_raw_parts(buf.h_sm.clone(), n),
-            BufferArg::from_raw_parts(buf.h_fl.clone(), n_words),
-            BufferArg::from_raw_parts(buf.h_lc.as_ref().unwrap().clone(), n * LC_STRIDE),
-            BufferArg::from_raw_parts(buf.h_plan.as_ref().unwrap().clone(), inputs.walk_plan.len()),
-            BufferArg::from_raw_parts(buf.h_extent.as_ref().unwrap().clone(), item_count * 2),
-            inputs.min_sw,
-            inputs.uniform_sw,
-            units,
-            rake_ep,
-        );
-        prof.end(client, "extent_pair");
+        let skip_extent_pair = std::env::var_os("GLYPH_EXTENT_PAIR_GPU").is_none();
+        if !skip_extent_pair {
+            let rake_ep = 32usize;
+            prof.begin(client, "extent_pair");
+            extent_pair::launch_unchecked(
+                client,
+                tiles_grid(n.div_ceil(units * rake_ep).max(1)),
+                CubeDim::new_1d(units as u32),
+                BufferArg::from_raw_parts(buf.h_sm.clone(), n),
+                BufferArg::from_raw_parts(buf.h_fl.clone(), n_words),
+                BufferArg::from_raw_parts(buf.h_lc.as_ref().unwrap().clone(), n * LC_STRIDE),
+                BufferArg::from_raw_parts(buf.h_plan.as_ref().unwrap().clone(), inputs.walk_plan.len()),
+                BufferArg::from_raw_parts(buf.h_extent.as_ref().unwrap().clone(), item_count * 2),
+                inputs.min_sw,
+                inputs.uniform_sw,
+                units,
+                rake_ep,
+            );
+            prof.end(client, "extent_pair");
+        }
 
         prof.begin(client, "resolve_x");
-        resolve_x::launch_unchecked(
+        resolve_x_fused::launch_unchecked(
             client,
             cubes_of(n.div_ceil(rspan)),
             CubeDim::new_1d(256),
@@ -572,32 +575,15 @@ pub(crate) fn launch_block2_geometry(
             BufferArg::from_raw_parts(buf.h_wc.clone(), n),
             BufferArg::from_raw_parts(buf.h_otb.as_ref().unwrap().clone(), n),
             BufferArg::from_raw_parts(buf.h_wm.as_ref().unwrap().clone(), 1),
-            BufferArg::from_raw_parts(buf.h_rmax.as_ref().unwrap().clone(), item_count),
-            BufferArg::from_raw_parts(buf.h_xmax.as_ref().unwrap().clone(), item_count),
             BufferArg::from_raw_parts(buf.h_extent.as_ref().unwrap().clone(), item_count * 2),
             BufferArg::from_raw_parts(buf.h_gap.as_ref().unwrap().clone(), item_count),
+            BufferArg::from_raw_parts(buf.h_gi.clone(), n),
+            BufferArg::from_raw_parts(buf.h_hgt.clone(), n),
+            BufferArg::from_raw_parts(buf.h_ext.clone(), item_count * EXT_STRIDE),
             256,
             rspan,
         );
         prof.end(client, "resolve_x");
-
-        let rake_e = 32usize;
-        prof.begin(client, "extent_fold");
-        extent_fold::launch_unchecked(
-            client,
-            tiles_grid(n.div_ceil(units * rake_e).max(1)),
-            CubeDim::new_1d(units as u32),
-            BufferArg::from_raw_parts(buf.h_fl.clone(), n_words),
-            BufferArg::from_raw_parts(buf.h_lm.clone(), n * LM_STRIDE),
-            BufferArg::from_raw_parts(buf.h_sm.clone(), n),
-            BufferArg::from_raw_parts(buf.h_hgt.clone(), n),
-            BufferArg::from_raw_parts(buf.h_gi.clone(), n),
-            BufferArg::from_raw_parts(buf.h_ir.clone(), inputs.ir.len()),
-            BufferArg::from_raw_parts(buf.h_ext.clone(), item_count * EXT_STRIDE),
-            units,
-            rake_e,
-        );
-        prof.end(client, "extent_fold");
         prof.block_end(client, "block2_geometry");
     }
 }

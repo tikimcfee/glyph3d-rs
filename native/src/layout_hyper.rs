@@ -23,7 +23,7 @@ use crate::text::fu_to_world;
 mod types;
 pub use types::{ItemPrepass, Pass2DeviceOutput, SendPtr};
 
-mod char_resolve;
+pub(crate) mod char_resolve;
 use char_resolve::resolve_byte_char;
 
 mod device_alloc;

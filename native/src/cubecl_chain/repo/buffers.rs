@@ -189,7 +189,7 @@ pub(crate) fn allocate_chain_buffers(
     let h_lm = alloc_empty(n * LM_STRIDE * 4);
     let h_rmax = alloc_upload(bytemuck::cast_slice(&vec![0u32; item_count]));
     let h_xmax = alloc_upload(bytemuck::cast_slice(&vec![0u32; item_count]));
-    let h_extent = alloc_upload(bytemuck::cast_slice(&vec![0x8000_0000u32; item_count * 2]));
+    let h_extent = alloc_upload(bytemuck::cast_slice(&inputs.extent_words));
     let h_plan = alloc_upload(bytemuck::cast_slice(&inputs.walk_plan));
     let h_ctc = alloc_empty(n_tiles * 4);
     let h_cup = alloc_empty(n_tiles * units * 4);
