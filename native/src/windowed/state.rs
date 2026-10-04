@@ -967,7 +967,7 @@ impl WindowState {
                                             });
                                             ui.label(egui::RichText::new(&s.title).strong());
                                             ui.horizontal(|ui| {
-                                                let prefix = if s.id.len() > 16 { &s.id[..16] } else { &s.id };
+                                                let prefix = crate::agent_transcript::types::truncate_chars(&s.id, 16);
                                                 ui.label(egui::RichText::new(format!("ID: {prefix}…")).weak().small());
                                                 let kb = (s.file_size_bytes as f64) / 1024.0;
                                                 ui.label(egui::RichText::new(format!("{kb:.1} KB")).weak().small());

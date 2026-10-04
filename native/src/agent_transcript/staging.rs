@@ -13,6 +13,7 @@ use crate::spatial_scene::GlyphGroupBinding;
 use crate::text::{cover_segment, pack_rgba8, StagedText, CELL_HEIGHT_WORLD, LINE_HEIGHT_FACTOR};
 
 /// Wrap prose into lines with a maximum column width, breaking at spaces when possible.
+/// Uses character counts and Unicode scalar boundaries rather than byte slicing to avoid panics.
 fn wrap_prose(text: &str, max_cols: usize) -> Vec<String> {
     let mut out = Vec::new();
     for line in text.lines() {
@@ -22,24 +23,58 @@ fn wrap_prose(text: &str, max_cols: usize) -> Vec<String> {
             continue;
         }
         let mut cur = String::new();
+        let mut cur_cols = 0;
         for word in trimmed.split_whitespace() {
+            let word_cols = word.chars().count();
             if cur.is_empty() {
-                if word.len() > max_cols {
-                    out.push(word[..max_cols].to_string());
-                    cur = word[max_cols..].to_string();
+                if word_cols > max_cols {
+                    // Split oversized word across lines safely by characters
+                    let mut chunk = String::new();
+                    let mut chunk_cols = 0;
+                    for ch in word.chars() {
+                        if chunk_cols >= max_cols {
+                            out.push(chunk);
+                            chunk = String::new();
+                            chunk_cols = 0;
+                        }
+                        chunk.push(ch);
+                        chunk_cols += 1;
+                    }
+                    if !chunk.is_empty() {
+                        cur = chunk;
+                        cur_cols = chunk_cols;
+                    }
                 } else {
                     cur.push_str(word);
+                    cur_cols = word_cols;
                 }
-            } else if cur.len() + 1 + word.len() <= max_cols {
+            } else if cur_cols + 1 + word_cols <= max_cols {
                 cur.push(' ');
                 cur.push_str(word);
+                cur_cols += 1 + word_cols;
             } else {
                 out.push(cur);
-                if word.len() > max_cols {
-                    out.push(word[..max_cols].to_string());
-                    cur = word[max_cols..].to_string();
+                cur = String::new();
+                cur_cols = 0;
+                if word_cols > max_cols {
+                    let mut chunk = String::new();
+                    let mut chunk_cols = 0;
+                    for ch in word.chars() {
+                        if chunk_cols >= max_cols {
+                            out.push(chunk);
+                            chunk = String::new();
+                            chunk_cols = 0;
+                        }
+                        chunk.push(ch);
+                        chunk_cols += 1;
+                    }
+                    if !chunk.is_empty() {
+                        cur = chunk;
+                        cur_cols = chunk_cols;
+                    }
                 } else {
-                    cur = word.to_string();
+                    cur.push_str(word);
+                    cur_cols = word_cols;
                 }
             }
         }

@@ -318,6 +318,24 @@ pub struct AgentTurn {
     pub timestamp: Option<i64>,
 }
 
+/// Truncate a string to at most `max_chars` Unicode scalar values, slicing safely on a character boundary.
+pub fn truncate_chars(s: &str, max_chars: usize) -> &str {
+    match s.char_indices().nth(max_chars) {
+        Some((byte_idx, _)) => &s[..byte_idx],
+        None => s,
+    }
+}
+
+/// Truncate a string with an ellipsis ("...") if it exceeds `max_chars` Unicode characters.
+pub fn truncate_with_ellipsis(s: &str, max_chars: usize) -> String {
+    if s.chars().count() > max_chars {
+        let keep = max_chars.saturating_sub(3);
+        format!("{}...", truncate_chars(s, keep))
+    } else {
+        s.to_string()
+    }
+}
+
 impl AgentTurn {
     pub fn new(turn_index: usize) -> Self {
         Self {
@@ -345,22 +363,14 @@ impl AgentTurn {
     pub fn summary(&self) -> String {
         if let Some(ref p) = self.prompt {
             let first_line = p.lines().next().unwrap_or("").trim();
-            if first_line.len() > 60 {
-                format!("{}...", &first_line[..57])
-            } else {
-                first_line.to_string()
-            }
+            truncate_with_ellipsis(first_line, 60)
         } else if let Some(first_action) = self.file_actions.first() {
             format!("{:?} {}", first_action.action, first_action.file_path)
         } else if let Some(first_tool) = self.tool_calls.first() {
             format!("Tool {}", first_tool.name)
         } else if let Some(first_msg) = self.assistant_messages.first() {
             let first_line = first_msg.lines().next().unwrap_or("").trim();
-            if first_line.len() > 60 {
-                format!("{}...", &first_line[..57])
-            } else {
-                first_line.to_string()
-            }
+            truncate_with_ellipsis(first_line, 60)
         } else {
             format!("Turn {}", self.turn_index)
         }
@@ -479,19 +489,11 @@ impl TranscriptEventKind {
         match self {
             Self::UserPrompt { prompt } => {
                 let first = prompt.lines().next().unwrap_or("").trim();
-                if first.len() > 55 {
-                    format!("User: {}...", &first[..52])
-                } else {
-                    format!("User: {first}")
-                }
+                format!("User: {}", truncate_with_ellipsis(first, 55))
             }
             Self::Thinking { thought } => {
                 let first = thought.lines().next().unwrap_or("").trim();
-                if first.len() > 55 {
-                    format!("Thinking: {}...", &first[..52])
-                } else {
-                    format!("Thinking: {first}")
-                }
+                format!("Thinking: {}", truncate_with_ellipsis(first, 55))
             }
             Self::FileRead { file_path, .. } => {
                 let name = std::path::Path::new(file_path)
@@ -536,11 +538,7 @@ impl TranscriptEventKind {
             } => {
                 let first = command_line.lines().next().unwrap_or("").trim();
                 let status = if *is_error { " [err]" } else { "" };
-                if first.len() > 50 {
-                    format!("$ {}...{status}", &first[..47])
-                } else {
-                    format!("$ {first}{status}")
-                }
+                format!("$ {}{status}", truncate_with_ellipsis(first, 50))
             }
             Self::ToolInvocation { name, is_error, .. } => {
                 let status = if *is_error { " [err]" } else { "" };
@@ -548,11 +546,7 @@ impl TranscriptEventKind {
             }
             Self::AssistantResponse { message } => {
                 let first = message.lines().next().unwrap_or("").trim();
-                if first.len() > 55 {
-                    format!("Assistant: {}...", &first[..52])
-                } else {
-                    format!("Assistant: {first}")
-                }
+                format!("Assistant: {}", truncate_with_ellipsis(first, 55))
             }
         }
     }

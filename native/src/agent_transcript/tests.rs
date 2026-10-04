@@ -516,3 +516,54 @@ fn test_stage_agent_session_formats_and_populates_text() {
     assert!(staged.groups.len() >= 5);
 }
 
+#[test]
+fn test_utf8_multibyte_truncation_no_panic() {
+    use super::types::{truncate_chars, truncate_with_ellipsis, TranscriptEventKind, AgentTurn};
+
+    // Construct a string where byte 52 lands in the middle of a 3-byte em-dash '—'
+    // 50 ASCII bytes + '—' (bytes 50, 51, 52) + more text
+    let prefix = "a".repeat(50);
+    let hostile_str = format!("{prefix}—and more text that exceeds the limit");
+
+    // Slicing &hostile_str[..52] would panic!
+    let truncated = truncate_chars(&hostile_str, 51);
+    assert_eq!(truncated, format!("{prefix}—"));
+
+    let with_dots = truncate_with_ellipsis(&hostile_str, 55);
+    assert!(with_dots.ends_with("..."));
+
+    // Test AgentTurn::summary with hostile string
+    let turn = AgentTurn {
+        turn_index: 0,
+        prompt: Some(hostile_str.clone()),
+        thinking: Vec::new(),
+        file_actions: Vec::new(),
+        tool_calls: Vec::new(),
+        assistant_messages: vec![hostile_str.clone()],
+        timestamp: None,
+    };
+    let turn_summary = turn.summary();
+    assert!(!turn_summary.is_empty());
+
+    // Test TranscriptEventKind::summary with hostile string (reproduces the user's exact panic condition)
+    let ev = TranscriptEventKind::AssistantResponse {
+        message: hostile_str.clone(),
+    };
+    let ev_summary = ev.summary();
+    assert!(ev_summary.starts_with("Assistant: "));
+
+    let ev_user = TranscriptEventKind::UserPrompt {
+        prompt: hostile_str.clone(),
+    };
+    assert!(ev_user.summary().starts_with("User: "));
+
+    let ev_cmd = TranscriptEventKind::Command {
+        name: "Bash".to_string(),
+        command_line: hostile_str.clone(),
+        output: None,
+        is_error: false,
+    };
+    assert!(ev_cmd.summary().starts_with("$ "));
+}
+
+

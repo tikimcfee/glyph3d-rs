@@ -195,7 +195,7 @@ fn probe_claude_session(file_path: &Path, project_hint: Option<&str>) -> Option<
     }
 
     let final_title = title.unwrap_or_else(|| {
-        let prefix = if id.len() > 8 { &id[..8] } else { &id };
+        let prefix = crate::agent_transcript::types::truncate_chars(&id, 8);
         format!("Session {prefix}")
     });
 
@@ -304,7 +304,7 @@ fn probe_antigravity_session(conv_id: &str, file_path: &Path) -> Option<Discover
     }
 
     let final_title = title.unwrap_or_else(|| {
-        let prefix = if conv_id.len() > 8 { &conv_id[..8] } else { conv_id };
+        let prefix = crate::agent_transcript::types::truncate_chars(conv_id, 8);
         format!("Conversation {prefix}")
     });
 
