@@ -86,6 +86,21 @@ pub(super) fn resolve_x(
         let mut nxt = n;
         let mut wrap = 0i32;
         let mut fold = 0i32;
+        let mut lh = 0.0f32;
+        let mut origin_x = 0.0f32;
+        let mut origin_y = 0.0f32;
+        let mut origin_z = 0.0f32;
+        let mut z_step = 0.0f32;
+        let mut z_step_lo = 0.0f32;
+        let mut band_stride_y = 0.0f32;
+        let mut depth_per_band = 0.0f32;
+        let mut depth_per_col = 0.0f32;
+        let mut rows = 0i32;
+        let mut cols = 0i32;
+        let mut scroll = 0i32;
+        let mut pages_wide = 1i32;
+        let mut stride_reach = 0.0f32;
+        let mut stride_reach_tail = 0.0f32;
         let has = item_count > 0;
         if has {
             it = item_search(ir, item_count, lo);
@@ -93,6 +108,28 @@ pub(super) fn resolve_x(
             nxt = if it + 1 < item_count { ir[(it + 1) * 2] as usize } else { n };
             wrap = ie[it * IE_STRIDE + IE_WRAP_WIDTH] as i32;
             fold = fold_of(ie, it, wrap);
+            let io = it * IM_STRIDE;
+            lh = items[io + IM_LINE_HEIGHT];
+            origin_x = items[io + IM_ORIGIN_X];
+            origin_y = items[io + IM_ORIGIN_Y];
+            origin_z = items[io + IM_ORIGIN_Z];
+            z_step = items[io + IM_Z_STEP];
+            z_step_lo = items[io + IM_Z_STEP_LO];
+            band_stride_y = items[io + IM_BAND_STRIDE_Y];
+            depth_per_band = items[io + IM_DEPTH_PER_BAND];
+            depth_per_col = items[io + IM_DEPTH_PER_COL];
+            let ie_off = it * IE_STRIDE;
+            let has_page = ie[ie_off + IE_HAS_PAGE] != 0;
+            rows = if has_page { ie[ie_off + IE_PAGE_ROWS] as i32 } else { 0 };
+            cols = if has_page { ie[ie_off + IE_PAGE_COLS] as i32 } else { 0 };
+            scroll = if has_page { ie[ie_off + IE_SCROLL_ROWS] as i32 } else { 0 };
+            let pages_wide_raw = ie[ie_off + IE_PAGES_WIDE] as i32;
+            pages_wide = if pages_wide_raw > 1 { pages_wide_raw } else { 1 };
+            if has_page && rows > 0 {
+                let exact = advance_fixed(key_to_float(extent_words[it * 2]))
+                    + advance_fixed(page_gap_x[it]);
+                fixed_pair(exact, &mut stride_reach, &mut stride_reach_tail);
+            }
         }
         let mut x = 0.0f32;
         let mut in_seg = false;
@@ -120,6 +157,31 @@ pub(super) fn resolve_x(
                 nxt = if it + 1 < item_count { ir[(it + 1) * 2] as usize } else { n };
                 wrap = ie[it * IE_STRIDE + IE_WRAP_WIDTH] as i32;
                 fold = fold_of(ie, it, wrap);
+                let io = it * IM_STRIDE;
+                lh = items[io + IM_LINE_HEIGHT];
+                origin_x = items[io + IM_ORIGIN_X];
+                origin_y = items[io + IM_ORIGIN_Y];
+                origin_z = items[io + IM_ORIGIN_Z];
+                z_step = items[io + IM_Z_STEP];
+                z_step_lo = items[io + IM_Z_STEP_LO];
+                band_stride_y = items[io + IM_BAND_STRIDE_Y];
+                depth_per_band = items[io + IM_DEPTH_PER_BAND];
+                depth_per_col = items[io + IM_DEPTH_PER_COL];
+                let ie_off = it * IE_STRIDE;
+                let has_page = ie[ie_off + IE_HAS_PAGE] != 0;
+                rows = if has_page { ie[ie_off + IE_PAGE_ROWS] as i32 } else { 0 };
+                cols = if has_page { ie[ie_off + IE_PAGE_COLS] as i32 } else { 0 };
+                scroll = if has_page { ie[ie_off + IE_SCROLL_ROWS] as i32 } else { 0 };
+                let pages_wide_raw = ie[ie_off + IE_PAGES_WIDE] as i32;
+                pages_wide = if pages_wide_raw > 1 { pages_wide_raw } else { 1 };
+                if has_page && rows > 0 {
+                    let exact = advance_fixed(key_to_float(extent_words[it * 2]))
+                        + advance_fixed(page_gap_x[it]);
+                    fixed_pair(exact, &mut stride_reach, &mut stride_reach_tail);
+                } else {
+                    stride_reach = 0.0f32;
+                    stride_reach_tail = 0.0f32;
+                }
             }
             let f = flags_at(fl, id);
             if (f & F_LEADER) != 0 {
@@ -143,27 +205,16 @@ pub(super) fn resolve_x(
                     x = wm[id];
                 }
                 let row = lc[id * LC_STRIDE + LC_ROW] as i32;
-                let io = it * IM_STRIDE;
                 let wrap_segment = wrap_segment_of(col, wrap, (f & F_NEWLINE) != 0);
-                let lh = items[io + IM_LINE_HEIGHT];
                 let mo = id * LM_STRIDE;
-                let base = x + items[io + IM_ORIGIN_X];
+                let base = x + origin_x;
 
                 let mut final_x = base;
-                let mut final_y = fma(-(row as f32), lh, items[io + IM_ORIGIN_Y]);
+                let mut final_y = fma(-(row as f32), lh, origin_y);
                 let depth_steps = -(wrap_segment as f32);
-                let z_tail_folded = fma(
-                    depth_steps,
-                    items[io + IM_Z_STEP_LO],
-                    items[io + IM_ORIGIN_Z],
-                );
-                let mut final_z = fma(depth_steps, items[io + IM_Z_STEP], z_tail_folded);
+                let z_tail_folded = fma(depth_steps, z_step_lo, origin_z);
+                let mut final_z = fma(depth_steps, z_step, z_tail_folded);
 
-                let ie_off = it * IE_STRIDE;
-                let has_page = ie[ie_off + IE_HAS_PAGE] != 0;
-                let rows = if has_page { ie[ie_off + IE_PAGE_ROWS] as i32 } else { 0 };
-                let cols = if has_page { ie[ie_off + IE_PAGE_COLS] as i32 } else { 0 };
-                let scroll = if has_page { ie[ie_off + IE_SCROLL_ROWS] as i32 } else { 0 };
                 if rows != 0 || cols != 0 || scroll != 0 {
                     let screen_row = row - scroll;
                     let mut y_page = 0;
@@ -174,25 +225,16 @@ pub(super) fn resolve_x(
                     if cols > 0 {
                         x_page = col / cols;
                     }
-                    let pages_wide_raw = ie[ie_off + IE_PAGES_WIDE] as i32;
-                    let pages_wide = if pages_wide_raw > 1 { pages_wide_raw } else { 1 };
                     let band = y_page / pages_wide;
                     let page_col = (y_page % pages_wide) as f32;
-                    let mut stride_reach = 0.0f32;
-                    let mut stride_reach_tail = 0.0f32;
-                    if has_page && rows > 0 {
-                        let exact = advance_fixed(key_to_float(extent_words[it * 2]))
-                            + advance_fixed(page_gap_x[it]);
-                        fixed_pair(exact, &mut stride_reach, &mut stride_reach_tail);
-                    }
                     let x_with_tail = fma(page_col, stride_reach_tail, base);
                     final_x = fma(page_col, stride_reach, x_with_tail);
                     let row_in_page = (screen_row - y_page * rows) as f32;
-                    let y_row_folded = fma(-row_in_page, lh, items[io + IM_ORIGIN_Y]);
-                    final_y = fma(-(band as f32), items[io + IM_BAND_STRIDE_Y], y_row_folded);
-                    let z_stepped = fma(depth_steps, items[io + IM_Z_STEP], z_tail_folded);
-                    let z_banded = fma(band as f32, items[io + IM_DEPTH_PER_BAND], z_stepped);
-                    final_z = fma(x_page as f32, items[io + IM_DEPTH_PER_COL], z_banded);
+                    let y_row_folded = fma(-row_in_page, lh, origin_y);
+                    final_y = fma(-(band as f32), band_stride_y, y_row_folded);
+                    let z_stepped = fma(depth_steps, z_step, z_tail_folded);
+                    let z_banded = fma(band as f32, depth_per_band, z_stepped);
+                    final_z = fma(x_page as f32, depth_per_col, z_banded);
                 }
 
                 lm[mo + LM_X] = final_x;
