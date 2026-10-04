@@ -20,6 +20,7 @@ pub use discovery::{scan_agent_sessions, DiscoveredSession, SessionHarnessFilter
 pub use staging::stage_agent_session;
 pub use types::{
     AgentSession, AgentTurn, DiffHunkRecord, FileActionRecord, HarnessKind, ToolCallRecord,
+    TranscriptEvent, TranscriptEventKind,
 };
 
 /// Automatically detect transcript format and parse an [`AgentSession`].

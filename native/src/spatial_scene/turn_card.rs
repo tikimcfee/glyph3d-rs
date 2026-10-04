@@ -24,6 +24,7 @@ pub enum TurnPageKind {
 /// Component marking a 2-page Agent Turn Card unit.
 #[derive(Component, Debug, Clone)]
 pub struct AgentTurnCard {
+    pub event_index: usize,
     pub turn_index: usize,
     pub page_size: [f32; 2],
     pub spine_gap: f32,
@@ -32,18 +33,26 @@ pub struct AgentTurnCard {
 }
 
 impl SpatialScene {
-    /// Spawn a 2-page Agent Turn Card container with Left (Mind) and Right (Impact) pages.
+    /// Spawn a 2-page Agent Turn/Beat Card container with Left (Spec) and Right (Artifact) pages.
+    #[allow(clippy::too_many_arguments)]
     pub fn spawn_agent_turn_card(
         &mut self,
         parent: Entity,
+        event_index: usize,
         turn_index: usize,
         page_size: [f32; 2],
         spine_gap: f32,
         title: impl Into<String>,
+        banner_colors: Option<([f32; 4], [f32; 4])>,
     ) -> Entity {
         let title_str = title.into();
         let half_w = page_size[0] * 0.5;
         let half_gap = spine_gap * 0.5;
+
+        let (left_banner_col, right_banner_col) = banner_colors.unwrap_or((
+            [0.20, 0.36, 0.60, 0.95],
+            [0.18, 0.52, 0.35, 0.95],
+        ));
 
         // Container bounds enclose both pages and the spine gap
         let card_bounds = LocalBounds {
@@ -57,13 +66,13 @@ impl SpatialScene {
             .spawn((
                 Transform::IDENTITY,
                 ChildOf(parent),
-                Name::new(format!("turn_card_{turn_index}: {title_str}")),
+                Name::new(format!("beat_{event_index}: {title_str}")),
                 card_bounds,
-                DeckItem { index: turn_index },
+                DeckItem { index: event_index },
             ))
             .id();
 
-        // 1. Left Page (Mind)
+        // 1. Left Page (Spec / Mind)
         let left_trans = Transform::from_translation(Vec3::new(-half_w - half_gap, 0.0, 0.0));
         let left_bounds = LocalBounds {
             min: [-half_w, -page_size[1], 0.0],
@@ -98,12 +107,12 @@ impl SpatialScene {
                 origin: [-half_w + 3.0, -5.5],
             },
             SceneMeshMaterial {
-                color: [0.20, 0.36, 0.60, 0.95],
+                color: left_banner_col,
                 params: [0.0, 0.0, 0.0, 0.0],
             },
         ));
 
-        // 2. Right Page (Material Impact)
+        // 2. Right Page (Artifact / Material Impact)
         let right_trans = Transform::from_translation(Vec3::new(half_w + half_gap, 0.0, 0.0));
         let right_bounds = LocalBounds {
             min: [-half_w, -page_size[1], 0.0],
@@ -138,7 +147,7 @@ impl SpatialScene {
                 origin: [-half_w + 3.0, -5.5],
             },
             SceneMeshMaterial {
-                color: [0.18, 0.52, 0.35, 0.95],
+                color: right_banner_col,
                 params: [0.0, 0.0, 0.0, 0.0],
             },
         ));
@@ -166,6 +175,7 @@ impl SpatialScene {
         }
 
         self.world.entity_mut(card_entity).insert(AgentTurnCard {
+            event_index,
             turn_index,
             page_size,
             spine_gap,

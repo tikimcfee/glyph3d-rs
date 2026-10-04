@@ -86,6 +86,220 @@ impl AgentSession {
         }
         paths
     }
+
+    /// Linearize all turns into an atomic chronological sequence of transcript events.
+    pub fn linearize_events(&self, revision_engine: Option<&crate::revision::RevisionEngine>) -> Vec<TranscriptEvent> {
+        let mut events = Vec::new();
+        let mut event_idx = 0;
+
+        for turn in &self.turns {
+            // 1. User Prompt (if present)
+            if let Some(ref prompt) = turn.prompt {
+                events.push(TranscriptEvent {
+                    index: event_idx,
+                    turn_index: turn.turn_index,
+                    kind: TranscriptEventKind::UserPrompt {
+                        prompt: prompt.clone(),
+                    },
+                    timestamp: turn.timestamp,
+                });
+                event_idx += 1;
+            }
+
+            // 2. Thinking Blocks (each is an atomic event)
+            for thought in &turn.thinking {
+                events.push(TranscriptEvent {
+                    index: event_idx,
+                    turn_index: turn.turn_index,
+                    kind: TranscriptEventKind::Thinking {
+                        thought: thought.clone(),
+                    },
+                    timestamp: turn.timestamp,
+                });
+                event_idx += 1;
+            }
+
+            // 3. Tool Calls (each is an atomic event)
+            let mut matched_file_actions = std::collections::HashSet::new();
+            for tool in &turn.tool_calls {
+                // Match with FileActionRecord if tool_id aligns
+                let fa_opt = turn.file_actions.iter().find(|fa| fa.tool_id == tool.id);
+                if let Some(fa) = fa_opt {
+                    matched_file_actions.insert(fa.tool_id.clone());
+                    match fa.action {
+                        FileActionKind::Edit => {
+                            let post_edit = revision_engine
+                                .and_then(|re| re.history(&fa.file_path))
+                                .and_then(|h| h.revision_for_turn(turn.turn_index))
+                                .map(|r| r.text.as_ref().clone())
+                                .or_else(|| fa.new_content.clone());
+                            events.push(TranscriptEvent {
+                                index: event_idx,
+                                turn_index: turn.turn_index,
+                                kind: TranscriptEventKind::FileEdit {
+                                    file_path: fa.file_path.clone(),
+                                    action_record: fa.clone(),
+                                    post_edit_content: post_edit,
+                                },
+                                timestamp: tool.timestamp.or(turn.timestamp),
+                            });
+                            event_idx += 1;
+                        }
+                        FileActionKind::Read => {
+                            let content = fa
+                                .new_content
+                                .clone()
+                                .or_else(|| {
+                                    revision_engine
+                                        .and_then(|re| re.history(&fa.file_path))
+                                        .and_then(|h| h.get(0))
+                                        .map(|r| r.text.as_ref().clone())
+                                });
+                            events.push(TranscriptEvent {
+                                index: event_idx,
+                                turn_index: turn.turn_index,
+                                kind: TranscriptEventKind::FileRead {
+                                    file_path: fa.file_path.clone(),
+                                    action_record: fa.clone(),
+                                    content,
+                                },
+                                timestamp: tool.timestamp.or(turn.timestamp),
+                            });
+                            event_idx += 1;
+                        }
+                        FileActionKind::Write => {
+                            let content = fa.new_content.clone();
+                            events.push(TranscriptEvent {
+                                index: event_idx,
+                                turn_index: turn.turn_index,
+                                kind: TranscriptEventKind::FileWrite {
+                                    file_path: fa.file_path.clone(),
+                                    action_record: fa.clone(),
+                                    content,
+                                },
+                                timestamp: tool.timestamp.or(turn.timestamp),
+                            });
+                            event_idx += 1;
+                        }
+                        FileActionKind::AstAnalysis => {
+                            let output = extract_output_str(tool.response.as_ref());
+                            events.push(TranscriptEvent {
+                                index: event_idx,
+                                turn_index: turn.turn_index,
+                                kind: TranscriptEventKind::ToolInvocation {
+                                    name: tool.name.clone(),
+                                    input: tool.input.clone(),
+                                    output,
+                                    is_error: tool.is_error,
+                                },
+                                timestamp: tool.timestamp.or(turn.timestamp),
+                            });
+                            event_idx += 1;
+                        }
+                    }
+                } else if is_command_tool(&tool.name) {
+                    let cmd_str = extract_command_str(&tool.input);
+                    let output = extract_output_str(tool.response.as_ref());
+                    events.push(TranscriptEvent {
+                        index: event_idx,
+                        turn_index: turn.turn_index,
+                        kind: TranscriptEventKind::Command {
+                            name: tool.name.clone(),
+                            command_line: cmd_str,
+                            output,
+                            is_error: tool.is_error,
+                        },
+                        timestamp: tool.timestamp.or(turn.timestamp),
+                    });
+                    event_idx += 1;
+                } else {
+                    let output = extract_output_str(tool.response.as_ref());
+                    events.push(TranscriptEvent {
+                        index: event_idx,
+                        turn_index: turn.turn_index,
+                        kind: TranscriptEventKind::ToolInvocation {
+                            name: tool.name.clone(),
+                            input: tool.input.clone(),
+                            output,
+                            is_error: tool.is_error,
+                        },
+                        timestamp: tool.timestamp.or(turn.timestamp),
+                    });
+                    event_idx += 1;
+                }
+            }
+
+            // Unmatched file actions (if any)
+            for fa in &turn.file_actions {
+                if !matched_file_actions.contains(&fa.tool_id) {
+                    match fa.action {
+                        FileActionKind::Edit => {
+                            let post_edit = revision_engine
+                                .and_then(|re| re.history(&fa.file_path))
+                                .and_then(|h| h.revision_for_turn(turn.turn_index))
+                                .map(|r| r.text.as_ref().clone())
+                                .or_else(|| fa.new_content.clone());
+                            events.push(TranscriptEvent {
+                                index: event_idx,
+                                turn_index: turn.turn_index,
+                                kind: TranscriptEventKind::FileEdit {
+                                    file_path: fa.file_path.clone(),
+                                    action_record: fa.clone(),
+                                    post_edit_content: post_edit,
+                                },
+                                timestamp: turn.timestamp,
+                            });
+                            event_idx += 1;
+                        }
+                        FileActionKind::Read => {
+                            let content = fa.new_content.clone();
+                            events.push(TranscriptEvent {
+                                index: event_idx,
+                                turn_index: turn.turn_index,
+                                kind: TranscriptEventKind::FileRead {
+                                    file_path: fa.file_path.clone(),
+                                    action_record: fa.clone(),
+                                    content,
+                                },
+                                timestamp: turn.timestamp,
+                            });
+                            event_idx += 1;
+                        }
+                        FileActionKind::Write => {
+                            let content = fa.new_content.clone();
+                            events.push(TranscriptEvent {
+                                index: event_idx,
+                                turn_index: turn.turn_index,
+                                kind: TranscriptEventKind::FileWrite {
+                                    file_path: fa.file_path.clone(),
+                                    action_record: fa.clone(),
+                                    content,
+                                },
+                                timestamp: turn.timestamp,
+                            });
+                            event_idx += 1;
+                        }
+                        FileActionKind::AstAnalysis => {}
+                    }
+                }
+            }
+
+            // 4. Assistant Messages (each is an atomic event)
+            for msg in &turn.assistant_messages {
+                events.push(TranscriptEvent {
+                    index: event_idx,
+                    turn_index: turn.turn_index,
+                    kind: TranscriptEventKind::AssistantResponse {
+                        message: msg.clone(),
+                    },
+                    timestamp: turn.timestamp,
+                });
+                event_idx += 1;
+            }
+        }
+
+        events
+    }
 }
 
 /// A coherent interactive turn between the user and the agent.
@@ -186,4 +400,254 @@ pub struct DiffHunkRecord {
     pub new_start: usize,
     pub new_lines: usize,
     pub lines: Vec<String>,
+}
+
+/// An atomic narrative beat in the agent session history.
+///
+/// Embodies literal 1:1 event atomicity:
+/// Every card in 3D space corresponds to exactly one event:
+/// - Left Page: Spec & Metadata (Tool name, arguments, line count, status).
+/// - Right Page: Artifact / Payload (Full file with highlighted edits/reads, diff hunks, terminal output, reasoning, or assistant message).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TranscriptEvent {
+    pub index: usize,
+    pub turn_index: usize,
+    pub kind: TranscriptEventKind,
+    pub timestamp: Option<i64>,
+}
+
+impl TranscriptEvent {
+    /// Concise summary for card labels and rolodex/splay HUD.
+    pub fn summary(&self) -> String {
+        self.kind.summary()
+    }
+
+    /// File path target, if this event interacts with a file.
+    pub fn file_path(&self) -> Option<&str> {
+        self.kind.file_path()
+    }
+
+    /// Colors for the Left and Right page header banners: (left_banner_rgba, right_banner_rgba).
+    pub fn banner_colors(&self) -> ([f32; 4], [f32; 4]) {
+        self.kind.banner_colors()
+    }
+}
+
+/// The specific payload and cognitive nature of an atomic narrative beat.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum TranscriptEventKind {
+    UserPrompt {
+        prompt: String,
+    },
+    Thinking {
+        thought: String,
+    },
+    FileRead {
+        file_path: String,
+        action_record: FileActionRecord,
+        content: Option<String>,
+    },
+    FileEdit {
+        file_path: String,
+        action_record: FileActionRecord,
+        post_edit_content: Option<String>,
+    },
+    FileWrite {
+        file_path: String,
+        action_record: FileActionRecord,
+        content: Option<String>,
+    },
+    Command {
+        name: String,
+        command_line: String,
+        output: Option<String>,
+        is_error: bool,
+    },
+    ToolInvocation {
+        name: String,
+        input: serde_json::Value,
+        output: Option<String>,
+        is_error: bool,
+    },
+    AssistantResponse {
+        message: String,
+    },
+}
+
+impl TranscriptEventKind {
+    pub fn summary(&self) -> String {
+        match self {
+            Self::UserPrompt { prompt } => {
+                let first = prompt.lines().next().unwrap_or("").trim();
+                if first.len() > 55 {
+                    format!("User: {}...", &first[..52])
+                } else {
+                    format!("User: {first}")
+                }
+            }
+            Self::Thinking { thought } => {
+                let first = thought.lines().next().unwrap_or("").trim();
+                if first.len() > 55 {
+                    format!("Thinking: {}...", &first[..52])
+                } else {
+                    format!("Thinking: {first}")
+                }
+            }
+            Self::FileRead { file_path, .. } => {
+                let name = std::path::Path::new(file_path)
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or(file_path);
+                format!("Read: {name}")
+            }
+            Self::FileEdit { file_path, action_record, .. } => {
+                let name = std::path::Path::new(file_path)
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or(file_path);
+                let diff_note = if !action_record.hunks.is_empty() {
+                    let added: usize = action_record
+                        .hunks
+                        .iter()
+                        .map(|h| h.lines.iter().filter(|l| l.starts_with('+')).count())
+                        .sum();
+                    let removed: usize = action_record
+                        .hunks
+                        .iter()
+                        .map(|h| h.lines.iter().filter(|l| l.starts_with('-')).count())
+                        .sum();
+                    format!(" (+{added} -{removed})")
+                } else {
+                    String::new()
+                };
+                format!("Edit: {name}{diff_note}")
+            }
+            Self::FileWrite { file_path, .. } => {
+                let name = std::path::Path::new(file_path)
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or(file_path);
+                format!("Write: {name}")
+            }
+            Self::Command {
+                command_line,
+                is_error,
+                ..
+            } => {
+                let first = command_line.lines().next().unwrap_or("").trim();
+                let status = if *is_error { " [err]" } else { "" };
+                if first.len() > 50 {
+                    format!("$ {}...{status}", &first[..47])
+                } else {
+                    format!("$ {first}{status}")
+                }
+            }
+            Self::ToolInvocation { name, is_error, .. } => {
+                let status = if *is_error { " [err]" } else { "" };
+                format!("Tool: {name}{status}")
+            }
+            Self::AssistantResponse { message } => {
+                let first = message.lines().next().unwrap_or("").trim();
+                if first.len() > 55 {
+                    format!("Assistant: {}...", &first[..52])
+                } else {
+                    format!("Assistant: {first}")
+                }
+            }
+        }
+    }
+
+    pub fn file_path(&self) -> Option<&str> {
+        match self {
+            Self::FileRead { file_path, .. }
+            | Self::FileEdit { file_path, .. }
+            | Self::FileWrite { file_path, .. } => Some(file_path.as_str()),
+            _ => None,
+        }
+    }
+
+    pub fn banner_colors(&self) -> ([f32; 4], [f32; 4]) {
+        match self {
+            Self::UserPrompt { .. } => (
+                [0.22, 0.38, 0.65, 0.95], // Slate blue / indigo
+                [0.18, 0.28, 0.48, 0.95],
+            ),
+            Self::Thinking { .. } => (
+                [0.48, 0.36, 0.15, 0.95], // Warm gold / amber
+                [0.38, 0.28, 0.12, 0.95],
+            ),
+            Self::FileRead { .. } => (
+                [0.15, 0.38, 0.58, 0.95], // Cyan / cobalt blue
+                [0.12, 0.30, 0.48, 0.95],
+            ),
+            Self::FileEdit { .. } => (
+                [0.65, 0.38, 0.12, 0.95], // Amber / flame orange
+                [0.55, 0.30, 0.10, 0.95],
+            ),
+            Self::FileWrite { .. } => (
+                [0.15, 0.55, 0.30, 0.95], // Emerald green
+                [0.12, 0.45, 0.25, 0.95],
+            ),
+            Self::Command { .. } => (
+                [0.28, 0.28, 0.32, 0.95], // Terminal dark slate / graphite
+                [0.20, 0.20, 0.24, 0.95],
+            ),
+            Self::ToolInvocation { .. } => (
+                [0.25, 0.35, 0.45, 0.95], // Steel blue
+                [0.18, 0.26, 0.35, 0.95],
+            ),
+            Self::AssistantResponse { .. } => (
+                [0.18, 0.48, 0.38, 0.95], // Deep teal / forest
+                [0.14, 0.38, 0.30, 0.95],
+            ),
+        }
+    }
+}
+
+pub fn is_command_tool(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    lower.contains("bash")
+        || lower.contains("command")
+        || lower.contains("shell")
+        || lower.contains("terminal")
+        || lower.contains("exec")
+        || lower.contains("run_command")
+}
+
+pub fn extract_command_str(input: &serde_json::Value) -> String {
+    if let serde_json::Value::Object(map) = input {
+        if let Some(cmd) = map
+            .get("CommandLine")
+            .or_else(|| map.get("command"))
+            .or_else(|| map.get("cmd"))
+        {
+            if let Some(s) = cmd.as_str() {
+                return s.to_string();
+            }
+        }
+    }
+    serde_json::to_string(input).unwrap_or_default()
+}
+
+pub fn extract_output_str(response: Option<&serde_json::Value>) -> Option<String> {
+    let resp = response?;
+    match resp {
+        serde_json::Value::String(s) => Some(s.clone()),
+        serde_json::Value::Object(map) => {
+            if let Some(out) = map
+                .get("output")
+                .or_else(|| map.get("stdout"))
+                .or_else(|| map.get("result"))
+                .or_else(|| map.get("content"))
+            {
+                if let Some(s) = out.as_str() {
+                    return Some(s.to_string());
+                } else {
+                    return Some(serde_json::to_string_pretty(out).unwrap_or_default());
+                }
+            }
+            Some(serde_json::to_string_pretty(resp).unwrap_or_default())
+        }
+        _ => Some(serde_json::to_string_pretty(resp).unwrap_or_default()),
+    }
 }

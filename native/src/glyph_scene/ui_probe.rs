@@ -90,7 +90,10 @@ pub struct UiCarrelState {
     pub session_id: String,
     pub active_turn: usize,
     pub turn_count: usize,
+    pub active_beat: usize,
+    pub beat_count: usize,
     pub prompt_summary: String,
+    pub beat_summary: String,
     pub touched_files: Vec<(String, usize, usize)>, // (path, active_revision, revision_count)
 }
 

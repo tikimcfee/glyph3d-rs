@@ -450,10 +450,10 @@ fn test_stage_agent_session_creates_controller_and_navigates() {
 
     // Navigation checks
     let next_msg = ctrl.carrel_next().unwrap();
-    assert!(next_msg.contains("turn 2/2"));
+    assert!(next_msg.contains("beat 2/4"));
 
     let prev_msg = ctrl.carrel_prev().unwrap();
-    assert!(prev_msg.contains("turn 1/2"));
+    assert!(prev_msg.contains("beat 1/4"));
 
     let jump_msg = ctrl.carrel_set_turn(1).unwrap();
     assert!(jump_msg.contains("jump to turn 2/2"));

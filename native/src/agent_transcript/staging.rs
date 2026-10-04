@@ -2,7 +2,7 @@ use bevy_ecs::prelude::{ChildOf, Entity};
 use bevy_transform::prelude::Transform;
 use glam::{Quat, Vec3};
 
-use crate::agent_transcript::{AgentSession, AgentTurn};
+use crate::agent_transcript::{AgentSession, AgentTurn, TranscriptEvent, TranscriptEventKind};
 use crate::atlas::Atlas;
 use crate::glyph_scene::{GlyphInstance, GroupRow};
 use crate::layout::GlyphArena;
@@ -268,6 +268,578 @@ fn format_turn_right_body(turn: &AgentTurn) -> Vec<(String, [u8; 3])> {
     lines
 }
 
+/// Format the fixed header lines for the Left Page (Spec / Metadata) of an Atomic Beat Card.
+fn format_beat_left_header(event: &TranscriptEvent) -> Vec<(String, [u8; 3])> {
+    let (tag, subtitle) = match &event.kind {
+        TranscriptEventKind::UserPrompt { .. } => ("USER REQUEST", "Interactive Input • Mind"),
+        TranscriptEventKind::Thinking { .. } => ("INTERNAL REASONING", "Chain of Thought • Mind"),
+        TranscriptEventKind::FileRead { .. } => {
+            ("FILE READ", "Inspection • Workspace Spec")
+        }
+        TranscriptEventKind::FileEdit { .. } => {
+            ("FILE EDIT", "Source Mutation • Spec & Hunks")
+        }
+        TranscriptEventKind::FileWrite { .. } => {
+            ("FILE WRITE", "New File Creation • Workspace Spec")
+        }
+        TranscriptEventKind::Command { .. } => {
+            ("COMMAND CONSOLE", "Shell Execution • Process Spec")
+        }
+        TranscriptEventKind::ToolInvocation { .. } => {
+            ("TOOL INVOCATION", "Agent Action • Invocation Spec")
+        }
+        TranscriptEventKind::AssistantResponse { .. } => {
+            ("ASSISTANT RESPONSE", "Agent Dialogue • Outgoing Message")
+        }
+    };
+
+    vec![
+        (
+            format!("BEAT {}: {tag}", event.index + 1),
+            [255, 255, 255],
+        ),
+        (
+            format!("Turn {} • {subtitle}", event.turn_index + 1),
+            [160, 185, 215],
+        ),
+        (
+            "─────────────────────────────────────────────────────────────".to_string(),
+            [70, 90, 115],
+        ),
+    ]
+}
+
+/// Format the body lines for the Left Page (Spec / Metadata) of an Atomic Beat Card.
+fn format_beat_left_body(event: &TranscriptEvent) -> Vec<(String, [u8; 3])> {
+    let mut lines = Vec::new();
+
+    match &event.kind {
+        TranscriptEventKind::UserPrompt { prompt } => {
+            lines.push(("[ USER REQUEST SPEC ]".to_string(), [130, 235, 215]));
+            lines.push((
+                format!(
+                    "  Length: {} chars │ {} lines",
+                    prompt.len(),
+                    prompt.lines().count()
+                ),
+                [150, 175, 195],
+            ));
+            lines.push((
+                "─────────────────────────────────────────────────────────────".to_string(),
+                [70, 90, 115],
+            ));
+            lines.push(("[ PROMPT OVERVIEW ]".to_string(), [215, 235, 250]));
+            for l in wrap_prose(prompt, 72).into_iter().take(20) {
+                lines.push((format!("  {l}"), [200, 220, 235]));
+            }
+        }
+        TranscriptEventKind::Thinking { thought } => {
+            lines.push(("[ REASONING METRICS ]".to_string(), [250, 210, 100]));
+            let word_count = thought.split_whitespace().count();
+            lines.push((
+                format!(
+                    "  Length: {} chars │ {} words │ {} lines",
+                    thought.len(),
+                    word_count,
+                    thought.lines().count()
+                ),
+                [200, 185, 150],
+            ));
+            lines.push((
+                "─────────────────────────────────────────────────────────────".to_string(),
+                [70, 90, 115],
+            ));
+            lines.push(("[ THOUGHT SUMMARY ]".to_string(), [240, 220, 160]));
+            for l in wrap_prose(thought, 72).into_iter().take(20) {
+                lines.push((format!("  {l}"), [230, 220, 195]));
+            }
+        }
+        TranscriptEventKind::FileRead {
+            file_path,
+            action_record,
+            content,
+        } => {
+            lines.push(("[ FILE READ SPEC ]".to_string(), [120, 210, 250]));
+            lines.push((format!("  Target: {file_path}"), [240, 245, 255]));
+            if !action_record.summary.is_empty() {
+                lines.push((
+                    format!("  Summary: {}", action_record.summary),
+                    [160, 195, 225],
+                ));
+            }
+            if let Some(c) = content {
+                lines.push((
+                    format!(
+                        "  Content Size: {} lines │ {} bytes",
+                        c.lines().count(),
+                        c.len()
+                    ),
+                    [140, 180, 210],
+                ));
+            }
+            lines.push((
+                "─────────────────────────────────────────────────────────────".to_string(),
+                [70, 90, 115],
+            ));
+            lines.push(("[ ACTION METADATA ]".to_string(), [150, 190, 230]));
+            lines.push((
+                format!("  Tool ID: {}", action_record.tool_id),
+                [160, 180, 200],
+            ));
+            lines.push((
+                "  Kind: Inspect / Read whole file into context".to_string(),
+                [140, 160, 180],
+            ));
+        }
+        TranscriptEventKind::FileEdit {
+            file_path,
+            action_record,
+            post_edit_content,
+        } => {
+            lines.push(("[ FILE EDIT SPEC ]".to_string(), [250, 200, 90]));
+            lines.push((format!("  Target: {file_path}"), [255, 245, 230]));
+            if !action_record.summary.is_empty() {
+                lines.push((
+                    format!("  Summary: {}", action_record.summary),
+                    [220, 195, 150],
+                ));
+            }
+            lines.push((
+                "─────────────────────────────────────────────────────────────".to_string(),
+                [70, 90, 115],
+            ));
+            lines.push(("[ DIFF STATISTICS ]".to_string(), [240, 190, 100]));
+            let added: usize = action_record
+                .hunks
+                .iter()
+                .map(|h| h.lines.iter().filter(|l| l.starts_with('+')).count())
+                .sum();
+            let removed: usize = action_record
+                .hunks
+                .iter()
+                .map(|h| h.lines.iter().filter(|l| l.starts_with('-')).count())
+                .sum();
+            lines.push((
+                format!(
+                    "  +{added} additions │ -{removed} deletions │ {} hunks",
+                    action_record.hunks.len()
+                ),
+                [140, 240, 160],
+            ));
+            if let Some(ref post) = post_edit_content {
+                lines.push((
+                    format!(
+                        "  Post-Edit File Size: {} lines │ {} bytes",
+                        post.lines().count(),
+                        post.len()
+                    ),
+                    [180, 200, 220],
+                ));
+            }
+            lines.push((
+                "─────────────────────────────────────────────────────────────".to_string(),
+                [70, 90, 115],
+            ));
+            lines.push(("[ HUNKS OVERVIEW ]".to_string(), [210, 175, 120]));
+            for (hi, hunk) in action_record.hunks.iter().enumerate().take(6) {
+                lines.push((
+                    format!(
+                        "  Hunk #{}: -{},{} +{},{}",
+                        hi + 1,
+                        hunk.old_start,
+                        hunk.old_lines,
+                        hunk.new_start,
+                        hunk.new_lines
+                    ),
+                    [160, 195, 230],
+                ));
+            }
+        }
+        TranscriptEventKind::FileWrite {
+            file_path,
+            action_record,
+            content,
+        } => {
+            lines.push(("[ FILE WRITE SPEC ]".to_string(), [120, 240, 150]));
+            lines.push((format!("  Created: {file_path}"), [240, 255, 240]));
+            if !action_record.summary.is_empty() {
+                lines.push((
+                    format!("  Summary: {}", action_record.summary),
+                    [160, 220, 180],
+                ));
+            }
+            if let Some(c) = content {
+                lines.push((
+                    format!(
+                        "  Size: {} lines │ {} bytes",
+                        c.lines().count(),
+                        c.len()
+                    ),
+                    [150, 210, 175],
+                ));
+            }
+            lines.push((
+                "─────────────────────────────────────────────────────────────".to_string(),
+                [70, 90, 115],
+            ));
+            lines.push(("[ ACTION METADATA ]".to_string(), [140, 210, 170]));
+            lines.push((
+                format!("  Tool ID: {}", action_record.tool_id),
+                [150, 185, 170],
+            ));
+            lines.push((
+                "  Kind: Write new file to workspace".to_string(),
+                [130, 175, 155],
+            ));
+        }
+        TranscriptEventKind::Command {
+            name,
+            command_line,
+            output,
+            is_error,
+        } => {
+            lines.push(("[ COMMAND SPEC ]".to_string(), [220, 225, 235]));
+            lines.push((format!("  Tool: {name}"), [170, 185, 205]));
+            let status_str = if *is_error {
+                "FAILED (Non-zero exit)"
+            } else {
+                "SUCCESS (0)"
+            };
+            let status_color = if *is_error {
+                [250, 110, 110]
+            } else {
+                [110, 235, 140]
+            };
+            lines.push((format!("  Status: {status_str}"), status_color));
+            if let Some(out) = output {
+                lines.push((
+                    format!(
+                        "  Output Captured: {} lines │ {} bytes",
+                        out.lines().count(),
+                        out.len()
+                    ),
+                    [160, 175, 195],
+                ));
+            }
+            lines.push((
+                "─────────────────────────────────────────────────────────────".to_string(),
+                [70, 90, 115],
+            ));
+            lines.push(("[ COMMAND LINE ]".to_string(), [130, 215, 245]));
+            for l in wrap_prose(&format!("$ {command_line}"), 72) {
+                lines.push((format!("  {l}"), [235, 240, 248]));
+            }
+        }
+        TranscriptEventKind::ToolInvocation {
+            name,
+            input,
+            output,
+            is_error,
+        } => {
+            lines.push(("[ TOOL INVOCATION SPEC ]".to_string(), [160, 200, 240]));
+            lines.push((format!("  Tool: {name}"), [240, 245, 255]));
+            let status_str = if *is_error { "ERROR" } else { "SUCCESS" };
+            let status_color = if *is_error {
+                [250, 110, 110]
+            } else {
+                [110, 235, 140]
+            };
+            lines.push((format!("  Status: {status_str}"), status_color));
+            if let Some(out) = output {
+                lines.push((
+                    format!(
+                        "  Response Size: {} lines │ {} bytes",
+                        out.lines().count(),
+                        out.len()
+                    ),
+                    [160, 175, 195],
+                ));
+            }
+            lines.push((
+                "─────────────────────────────────────────────────────────────".to_string(),
+                [70, 90, 115],
+            ));
+            lines.push(("[ INPUT ARGUMENTS ]".to_string(), [180, 210, 240]));
+            let input_str = serde_json::to_string_pretty(input).unwrap_or_default();
+            for l in input_str.lines().take(20) {
+                lines.push((format!("  {l}"), [190, 205, 225]));
+            }
+        }
+        TranscriptEventKind::AssistantResponse { message } => {
+            lines.push(("[ ASSISTANT MESSAGE SPEC ]".to_string(), [140, 220, 200]));
+            lines.push((
+                format!(
+                    "  Length: {} chars │ {} lines",
+                    message.len(),
+                    message.lines().count()
+                ),
+                [160, 195, 185],
+            ));
+            lines.push((
+                "─────────────────────────────────────────────────────────────".to_string(),
+                [70, 90, 115],
+            ));
+            lines.push(("[ MESSAGE SUMMARY ]".to_string(), [190, 240, 220]));
+            for l in wrap_prose(message, 72).into_iter().take(20) {
+                lines.push((format!("  {l}"), [210, 235, 225]));
+            }
+        }
+    }
+
+    lines
+}
+
+/// Format the fixed header lines for the Right Page (Artifact / Payload) of an Atomic Beat Card.
+fn format_beat_right_header(event: &TranscriptEvent) -> Vec<(String, [u8; 3])> {
+    let (tag, subtitle) = match &event.kind {
+        TranscriptEventKind::UserPrompt { .. } => ("USER PROMPT PAYLOAD", "Raw User Prompt Text"),
+        TranscriptEventKind::Thinking { .. } => ("FULL CHAIN OF THOUGHT", "Internal Model Deliberation"),
+        TranscriptEventKind::FileRead { .. } => {
+            ("FILE SNAPSHOT", "Scale-presented whole file")
+        }
+        TranscriptEventKind::FileEdit { .. } => {
+            ("FILE ARTIFACT & DIFF", "Edited lines highlighted in context")
+        }
+        TranscriptEventKind::FileWrite { .. } => {
+            ("CREATED FILE ARTIFACT", "Complete file content")
+        }
+        TranscriptEventKind::Command { .. } => {
+            ("TERMINAL CONSOLE OUTPUT", "Stdout / Stderr Stream Capture")
+        }
+        TranscriptEventKind::ToolInvocation { .. } => {
+            ("TOOL RESULT PAYLOAD", "Execution Output / Response")
+        }
+        TranscriptEventKind::AssistantResponse { .. } => {
+            ("ASSISTANT MESSAGE BODY", "Complete conversational response")
+        }
+    };
+
+    vec![
+        (
+            format!("ARTIFACT: {tag}"),
+            [120, 245, 160],
+        ),
+        (
+            format!("Beat {} • {subtitle}", event.index + 1),
+            [140, 185, 160],
+        ),
+        (
+            "─────────────────────────────────────────────────────────────".to_string(),
+            [70, 90, 115],
+        ),
+    ]
+}
+
+/// Format the body lines for the Right Page (Artifact / Payload) of an Atomic Beat Card.
+fn format_beat_right_body(
+    event: &TranscriptEvent,
+    revision_engine: &RevisionEngine,
+) -> Vec<(String, [u8; 3])> {
+    let mut lines = Vec::new();
+
+    match &event.kind {
+        TranscriptEventKind::UserPrompt { prompt } => {
+            for l in wrap_prose(prompt, 72) {
+                lines.push((l, [225, 235, 245]));
+            }
+        }
+        TranscriptEventKind::Thinking { thought } => {
+            for l in wrap_prose(thought, 72) {
+                lines.push((l, [245, 235, 205]));
+            }
+        }
+        TranscriptEventKind::FileRead {
+            file_path,
+            content,
+            ..
+        } => {
+            let text_opt = content.as_deref().or_else(|| {
+                revision_engine
+                    .history(file_path)
+                    .and_then(|h| h.get(0))
+                    .map(|r| r.text.as_str())
+            });
+            if let Some(text) = text_opt {
+                for (line_idx, l) in text.lines().take(5000).enumerate() {
+                    let trimmed = l.trim_start();
+                    let color = if trimmed.starts_with("//")
+                        || trimmed.starts_with('#')
+                        || trimmed.starts_with("/*")
+                        || trimmed.starts_with('*')
+                    {
+                        [130, 155, 170]
+                    } else {
+                        [225, 230, 240]
+                    };
+                    lines.push((format!("{:4} │ {}", line_idx + 1, l), color));
+                }
+            } else {
+                lines.push((
+                    "  (File content read into agent context)".to_string(),
+                    [140, 160, 180],
+                ));
+            }
+        }
+        TranscriptEventKind::FileEdit {
+            file_path,
+            action_record,
+            post_edit_content,
+        } => {
+            // 1. Diff Hunks
+            if !action_record.hunks.is_empty() {
+                lines.push(("[ UNIFIED DIFF HUNKS ]".to_string(), [100, 205, 255]));
+                for hunk in &action_record.hunks {
+                    lines.push((
+                        format!(
+                            "@@ -{},{} +{},{} @@",
+                            hunk.old_start, hunk.old_lines, hunk.new_start, hunk.new_lines
+                        ),
+                        [120, 195, 255],
+                    ));
+                    for hl in &hunk.lines {
+                        if hl.starts_with('+') {
+                            lines.push((hl.clone(), [120, 245, 140]));
+                        } else if hl.starts_with('-') {
+                            lines.push((hl.clone(), [245, 120, 120]));
+                        } else {
+                            lines.push((hl.clone(), [190, 205, 220]));
+                        }
+                    }
+                }
+                lines.push((
+                    "─────────────────────────────────────────────────────────────".to_string(),
+                    [70, 90, 115],
+                ));
+            }
+
+            // 2. Full post-edit file with edited lines highlighted
+            let text_opt = post_edit_content.as_deref().or_else(|| {
+                revision_engine
+                    .history(file_path)
+                    .and_then(|h| h.revision_for_turn(event.turn_index))
+                    .map(|r| r.text.as_str())
+            });
+
+            if let Some(text) = text_opt {
+                lines.push((
+                    "[ FULL FILE WITH HIGHLIGHTED EDITS ]".to_string(),
+                    [250, 205, 100],
+                ));
+                let mut added_lines = std::collections::HashSet::new();
+                for hunk in &action_record.hunks {
+                    let mut cur = hunk.new_start;
+                    for hl in &hunk.lines {
+                        if hl.starts_with('+') {
+                            added_lines.insert(cur);
+                            cur += 1;
+                        } else if !hl.starts_with('-') {
+                            cur += 1;
+                        }
+                    }
+                }
+
+                for (line_idx, l) in text.lines().take(5000).enumerate() {
+                    let line_no = line_idx + 1;
+                    if added_lines.contains(&line_no) {
+                        lines.push((format!("{:4} +│ {}", line_no, l), [120, 245, 140]));
+                    } else {
+                        let trimmed = l.trim_start();
+                        let color = if trimmed.starts_with("//")
+                            || trimmed.starts_with('#')
+                            || trimmed.starts_with("/*")
+                            || trimmed.starts_with('*')
+                        {
+                            [130, 155, 170]
+                        } else {
+                            [220, 225, 235]
+                        };
+                        lines.push((format!("{:4}  │ {}", line_no, l), color));
+                    }
+                }
+            } else {
+                lines.push((
+                    "  (Post-edit snapshot not recorded)".to_string(),
+                    [140, 155, 170],
+                ));
+            }
+        }
+        TranscriptEventKind::FileWrite {
+            file_path,
+            content,
+            ..
+        } => {
+            let text_opt = content.as_deref().or_else(|| {
+                revision_engine
+                    .history(file_path)
+                    .and_then(|h| h.revision_for_turn(event.turn_index))
+                    .map(|r| r.text.as_str())
+            });
+            if let Some(text) = text_opt {
+                for (line_idx, l) in text.lines().take(5000).enumerate() {
+                    let trimmed = l.trim_start();
+                    let color = if trimmed.starts_with("//")
+                        || trimmed.starts_with('#')
+                        || trimmed.starts_with("/*")
+                        || trimmed.starts_with('*')
+                    {
+                        [130, 155, 170]
+                    } else {
+                        [225, 235, 245]
+                    };
+                    lines.push((format!("{:4} │ {}", line_idx + 1, l), color));
+                }
+            } else {
+                lines.push(("  (Empty file created)".to_string(), [140, 155, 170]));
+            }
+        }
+        TranscriptEventKind::Command {
+            output, is_error, ..
+        } => {
+            if let Some(out) = output {
+                let color = if *is_error {
+                    [250, 130, 130]
+                } else {
+                    [140, 245, 170]
+                };
+                for l in out.lines().take(5000) {
+                    lines.push((l.to_string(), color));
+                }
+            } else {
+                lines.push((
+                    "  (Command produced no stdout/stderr output)".to_string(),
+                    [140, 155, 170],
+                ));
+            }
+        }
+        TranscriptEventKind::ToolInvocation {
+            output, is_error, ..
+        } => {
+            if let Some(out) = output {
+                let color = if *is_error {
+                    [250, 130, 130]
+                } else {
+                    [215, 225, 240]
+                };
+                for l in out.lines().take(5000) {
+                    lines.push((l.to_string(), color));
+                }
+            } else {
+                lines.push((
+                    "  (Tool completed with no response payload)".to_string(),
+                    [140, 155, 170],
+                ));
+            }
+        }
+        TranscriptEventKind::AssistantResponse { message } => {
+            for l in wrap_prose(message, 72) {
+                lines.push((l, [225, 235, 245]));
+            }
+        }
+    }
+
+    lines
+}
+
 /// Format the fixed header lines for a Workdesk File Revision Card ($R_k$).
 fn format_revision_card_header(rev: &FileRevision, file_path: &str) -> Vec<(String, [u8; 3])> {
     let (action_str, color) = match rev.action {
@@ -437,11 +1009,27 @@ pub fn stage_agent_session(
         .map(|(c, e)| (c.clone(), e))
         .collect();
 
+    let events = session.linearize_events(Some(&revision_engine));
+
     for (card, _card_e) in turn_cards {
-        if let Some(turn) = session.turns.get(card.turn_index) {
-            // Left Page (Mind)
-            let left_hdr = format_turn_left_header(turn);
-            let left_body = format_turn_left_body(turn);
+        let (left_hdr, left_body, right_hdr, right_body) =
+            if let Some(event) = events.get(card.event_index) {
+                (
+                    format_beat_left_header(event),
+                    format_beat_left_body(event),
+                    format_beat_right_header(event),
+                    format_beat_right_body(event, &revision_engine),
+                )
+            } else if let Some(turn) = session.turns.get(card.turn_index) {
+                (
+                    format_turn_left_header(turn),
+                    format_turn_left_body(turn),
+                    format_turn_right_header(turn),
+                    format_turn_right_body(turn),
+                )
+            } else {
+                continue;
+            };
 
             let unscaled_h = (left_body.len() as f32 * line_h).max(1.0);
             let max_cols = left_body.iter().map(|(l, _)| l.len()).max().unwrap_or(1);
@@ -499,10 +1087,7 @@ pub fn stage_agent_session(
                 );
             }
 
-            // Right Page (Impact)
-            let right_hdr = format_turn_right_header(turn);
-            let right_body = format_turn_right_body(turn);
-
+            // Right Page
             let unscaled_h = (right_body.len() as f32 * line_h).max(1.0);
             let max_cols = right_body.iter().map(|(l, _)| l.len()).max().unwrap_or(1);
             let unscaled_w = (max_cols as f32 * cell_w).max(1.0);
@@ -559,7 +1144,7 @@ pub fn stage_agent_session(
                 );
             }
         }
-    }
+
 
     // 2. Workdesk File Revision Cards ($R_k$)
     let mut rev_query = controller

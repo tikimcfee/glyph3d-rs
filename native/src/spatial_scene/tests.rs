@@ -394,9 +394,11 @@ fn test_agent_turn_card_spawning_and_bounds() {
     let card = scene.spawn_agent_turn_card(
         root,
         0,
+        0,
         [60.0, 40.0],
         4.0,
         "Turn 0: Inspecting repo",
+        None,
     );
 
     scene.update_transforms();

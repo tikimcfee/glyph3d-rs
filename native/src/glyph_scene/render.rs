@@ -201,11 +201,20 @@ pub(super) fn render_scene(
             } else {
                 Vec::new()
             };
+            let events = session.linearize_events(ctrl.revision_engine.as_ref());
+            let beat_summary = events.get(carrel_comp.active_beat)
+                .map(|e| e.summary())
+                .unwrap_or_else(|| {
+                    session.turns.get(carrel_comp.active_turn).map(|t| t.summary()).unwrap_or_default()
+                });
             Some(crate::glyph_scene::UiCarrelState {
                 session_id: carrel_comp.session_id.clone(),
                 active_turn: carrel_comp.active_turn,
                 turn_count: carrel_comp.turn_count,
+                active_beat: carrel_comp.active_beat,
+                beat_count: carrel_comp.beat_count,
                 prompt_summary: prompt.to_string(),
+                beat_summary,
                 touched_files: touched,
             })
         });

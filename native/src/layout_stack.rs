@@ -380,9 +380,11 @@ impl LayoutController {
             self.scene.spawn_agent_turn_card(
                 deck,
                 i,
+                i,
                 [55.0, 36.0],
                 4.0,
                 *title,
+                None,
             );
         }
 
@@ -458,45 +460,57 @@ impl LayoutController {
         carrel_e
     }
 
-    /// Advance active turn in the agent carrel.
+    /// Advance active atomic beat (or turn) in the agent carrel.
     pub fn carrel_next(&mut self) -> Option<String> {
         let carrel_e = self.active_carrel?;
         let session = self.session.as_ref()?;
         let rev_engine = self.revision_engine.as_ref()?;
-        let next_turn = self.scene.carrel_next_turn(carrel_e, session, rev_engine);
+        let next_beat = self.scene.carrel_next_beat(carrel_e, session, rev_engine);
         self.scene.update_transforms();
-        let total = session.turn_count();
-        let prompt_peek = session
-            .turns
-            .get(next_turn)
-            .and_then(|t| t.prompt.as_deref())
-            .unwrap_or("—");
+        let events = session.linearize_events(Some(rev_engine));
+        let total = events.len().max(session.turn_count());
+        let summary = events
+            .get(next_beat)
+            .map(|e| e.summary())
+            .unwrap_or_else(|| {
+                session
+                    .turns
+                    .get(next_beat)
+                    .map(|t| t.summary())
+                    .unwrap_or_default()
+            });
         Some(format!(
-            "carrel: turn {}/{} — \"{}\"",
-            next_turn + 1,
+            "carrel: beat {}/{} — \"{}\"",
+            next_beat + 1,
             total,
-            prompt_peek.chars().take(40).collect::<String>()
+            summary
         ))
     }
 
-    /// Retreat active turn in the agent carrel.
+    /// Retreat active atomic beat (or turn) in the agent carrel.
     pub fn carrel_prev(&mut self) -> Option<String> {
         let carrel_e = self.active_carrel?;
         let session = self.session.as_ref()?;
         let rev_engine = self.revision_engine.as_ref()?;
-        let prev_turn = self.scene.carrel_prev_turn(carrel_e, session, rev_engine);
+        let prev_beat = self.scene.carrel_prev_beat(carrel_e, session, rev_engine);
         self.scene.update_transforms();
-        let total = session.turn_count();
-        let prompt_peek = session
-            .turns
-            .get(prev_turn)
-            .and_then(|t| t.prompt.as_deref())
-            .unwrap_or("—");
+        let events = session.linearize_events(Some(rev_engine));
+        let total = events.len().max(session.turn_count());
+        let summary = events
+            .get(prev_beat)
+            .map(|e| e.summary())
+            .unwrap_or_else(|| {
+                session
+                    .turns
+                    .get(prev_beat)
+                    .map(|t| t.summary())
+                    .unwrap_or_default()
+            });
         Some(format!(
-            "carrel: turn {}/{} — \"{}\"",
-            prev_turn + 1,
+            "carrel: beat {}/{} — \"{}\"",
+            prev_beat + 1,
             total,
-            prompt_peek.chars().take(40).collect::<String>()
+            summary
         ))
     }
 

@@ -799,7 +799,16 @@ impl WindowState {
                                 if ui.button("◀ Prev (P/←)").clicked() {
                                     self.scene.on_key(ctx, winit::keyboard::KeyCode::KeyP, true);
                                 }
-                                ui.label(egui::RichText::new(format!("Turn {} / {}", carrel.active_turn + 1, carrel.turn_count)).strong());
+                                if carrel.beat_count > 0 {
+                                    ui.label(egui::RichText::new(format!(
+                                        "Beat {} / {} (T{})",
+                                        carrel.active_beat + 1,
+                                        carrel.beat_count,
+                                        carrel.active_turn + 1
+                                    )).strong());
+                                } else {
+                                    ui.label(egui::RichText::new(format!("Turn {} / {}", carrel.active_turn + 1, carrel.turn_count)).strong());
+                                }
                                 if ui.button("Next (N/→) ▶").clicked() {
                                     self.scene.on_key(ctx, winit::keyboard::KeyCode::KeyN, true);
                                 }
@@ -812,8 +821,13 @@ impl WindowState {
                                     *session_browser_open = !*session_browser_open;
                                 }
                             });
+                            if !carrel.beat_summary.is_empty() {
+                                ui.separator();
+                                ui.label(egui::RichText::new("Active Beat:").heading());
+                                ui.colored_label(egui::Color32::from_rgb(250, 220, 120), &carrel.beat_summary);
+                            }
                             ui.separator();
-                            ui.label(egui::RichText::new("Active Turn Prompt:").heading());
+                            ui.label(egui::RichText::new("Turn Prompt:").heading());
                             ui.label(&carrel.prompt_summary);
                             if !carrel.touched_files.is_empty() {
                                 ui.separator();
