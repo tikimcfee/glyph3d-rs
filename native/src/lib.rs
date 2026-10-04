@@ -276,7 +276,11 @@ fn build_scene_impl(
                 Ok(s) => s,
                 Err(e) => {
                     log::error!("Failed to load agent session from {}: {}", session_path.display(), e);
-                    panic!("agent session load error: {e}");
+                    let session_id = session_path
+                        .file_stem()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("empty");
+                    agent_transcript::AgentSession::new(agent_transcript::HarnessKind::ClaudeCode, session_id)
                 }
             };
             let mut rev_engine = revision::RevisionEngine::new();

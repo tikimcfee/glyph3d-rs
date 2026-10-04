@@ -36,3 +36,10 @@ no_ui = false
 
 # Default repository to open if none specified on CLI (optional)
 # load_repo = "fixtures/g-pick-repo"
+
+# Default agent session transcript path to load at startup (optional)
+# agent_session = "~/.gemini/antigravity/brain/3857a1e2-a1c0-4a52-b86c-8f7b82e0bd18/.system_generated/logs/transcript.jsonl"
+
+# Custom directory locations for Claude Code and Antigravity session discovery (optional)
+# claude_projects_dir = "~/.claude/projects"
+# antigravity_brain_dir = "~/.gemini/antigravity/brain"

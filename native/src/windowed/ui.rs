@@ -24,6 +24,14 @@ pub(super) struct EguiUi {
     /// K5: the browser's selected group (highlight only; click also flies
     /// the camera to the file).
     pub(super) selected_group: Option<u32>,
+    /// Agent session browser window visibility (F7 toggles; the window's close button clears it).
+    pub(super) session_browser_open: bool,
+    /// Agent session browser search query.
+    pub(super) session_filter_text: String,
+    /// Agent session browser harness filter tab.
+    pub(super) session_filter_harness: crate::agent_transcript::discovery::SessionHarnessFilter,
+    /// Cached list of discovered agent sessions.
+    pub(super) discovered_sessions: Option<Vec<crate::agent_transcript::discovery::DiscoveredSession>>,
 }
 
 /// Stage K (K3): Debug-panel verb buttons — CLI `--verb` literals parsed

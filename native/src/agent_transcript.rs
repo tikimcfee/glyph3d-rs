@@ -7,6 +7,7 @@
 
 pub mod antigravity;
 pub mod claude;
+pub mod discovery;
 pub mod staging;
 pub mod types;
 
@@ -15,6 +16,7 @@ mod tests;
 
 pub use antigravity::parse_antigravity_session;
 pub use claude::parse_claude_session;
+pub use discovery::{scan_agent_sessions, DiscoveredSession, SessionHarnessFilter};
 pub use staging::stage_agent_session;
 pub use types::{
     AgentSession, AgentTurn, DiffHunkRecord, FileActionRecord, HarnessKind, ToolCallRecord,

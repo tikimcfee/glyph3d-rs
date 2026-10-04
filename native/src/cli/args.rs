@@ -401,11 +401,22 @@ pub fn parse_cli_from(matches: clap::ArgMatches) -> Cli {
                         cli.load_repo = Some(lr);
                     }
                 }
+                if matches.value_source("agent_session")
+                    != Some(clap::parser::ValueSource::CommandLine)
+                {
+                    if let Some(session) = cfg.agent_session {
+                        cli.agent_session = Some(session);
+                    }
+                }
             }
             Err(e) => {
                 log::warn!("{e}");
             }
         }
+    }
+
+    if let Some(session) = &cli.agent_session {
+        cli.agent_session = Some(crate::launch_config::expand_home(session));
     }
 
     cli
