@@ -442,46 +442,67 @@ pub(super) fn scatter_slots(
     if lo < n && item_count > 0 {
         let mut it = item_search(ir, item_count, lo);
         let mut nxt = if it + 1 < item_count { ir[(it + 1) * 2] as usize } else { n };
+        let mut cur_is_pr = is_per_record[it];
+        let mut cur_col_base = color_base[it];
+        let mut cur_flat_color = flat_colors[it];
+        let mut cur_group = groups[it];
+
+        let mut cur_word_idx = (lo >> 2) + 1usize;
+        let mut fl_word = 0u32;
+
         let mut b = lo;
         while b < hi {
-            while nxt <= b {
-                it += 1;
-                nxt = if it + 1 < item_count { ir[(it + 1) * 2] as usize } else { n };
+            if nxt <= b {
+                while nxt <= b {
+                    it += 1;
+                    nxt = if it + 1 < item_count { ir[(it + 1) * 2] as usize } else { n };
+                }
+                cur_is_pr = is_per_record[it];
+                cur_col_base = color_base[it];
+                cur_flat_color = flat_colors[it];
+                cur_group = groups[it];
             }
-            if (flags_at(fl, b) & F_LEADER) != 0 && gi[b] != 0u32 {
+            let word_idx = b >> 2;
+            if word_idx != cur_word_idx {
+                fl_word = fl[word_idx];
+                cur_word_idx = word_idx;
+            }
+            let f = (fl_word >> (((b & 3) * 8) as u32)) & 0xFF;
+            if (f & F_LEADER) != 0 && gi[b] != 0u32 {
                 let w = cs as usize * 8;
-                    let color = if is_per_record[it] != 0u32 {
-                        pr_colors[(color_base[it] + wc[b]) as usize]
-                    } else {
-                        flat_colors[it]
-                    };
-                    // The tint stream: (glyph_id, color) per slot, slot order —
-                    // seg_tint's bit-exact input once no host arena exists (the
-                    // fold's order IS the arena's order, and both are sv order).
-                    let t = cs as usize * 2;
-                    if t + 2 <= tint.len() {
-                        tint[t] = gi[b];
-                        tint[t + 1] = color;
-                    }
-                    // Whole-extent guard, not just the start: the 1-word dummy
-                    // `out` of the extents-only Instances form must discard
-                    // EVERY slot write, including the zeroth.
-                    if w + 8 <= out.len() {
-                        let x = lm[b * LM_STRIDE + LM_X];
-                        let y = lm[b * LM_STRIDE + LM_Y];
-                        let z = lm[b * LM_STRIDE + LM_Z];
-                        let adv = sm[b];
-                        let height = hgt[b];
-                        out[w] = x.to_bits();
-                        out[w + 1] = y.to_bits();
-                        out[w + 2] = z.to_bits();
-                        out[w + 3] = gi[b];
-                        out[w + 4] = color;
-                        out[w + 5] = groups[it];
-                        out[w + 6] = adv.to_bits();
-                        out[w + 7] = height.to_bits();
-                    }
-                    cs += 1u32;
+                let color = if cur_is_pr != 0u32 {
+                    pr_colors[(cur_col_base + wc[b]) as usize]
+                } else {
+                    cur_flat_color
+                };
+                // The tint stream: (glyph_id, color) per slot, slot order —
+                // seg_tint's bit-exact input once no host arena exists (the
+                // fold's order IS the arena's order, and both are sv order).
+                let t = cs as usize * 2;
+                if t + 2 <= tint.len() {
+                    tint[t] = gi[b];
+                    tint[t + 1] = color;
+                }
+                // Whole-extent guard, not just the start: the 1-word dummy
+                // `out` of the extents-only Instances form must discard
+                // EVERY slot write, including the zeroth.
+                if w + 8 <= out.len() {
+                    let mo = b * LM_STRIDE;
+                    let x = lm[mo + LM_X];
+                    let y = lm[mo + LM_Y];
+                    let z = lm[mo + LM_Z];
+                    let adv = sm[b];
+                    let height = hgt[b];
+                    out[w] = x.to_bits();
+                    out[w + 1] = y.to_bits();
+                    out[w + 2] = z.to_bits();
+                    out[w + 3] = gi[b];
+                    out[w + 4] = color;
+                    out[w + 5] = cur_group;
+                    out[w + 6] = adv.to_bits();
+                    out[w + 7] = height.to_bits();
+                }
+                cs += 1u32;
             }
             b += 1usize;
         }

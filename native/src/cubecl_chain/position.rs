@@ -284,6 +284,40 @@ pub(super) fn extent_pair(
     let tile_lo = tile * (units * rake);
     let item_count = walk_plan.len() / 3;
 
+    let sext = Shared::<[Atomic<u32>]>::new_slice(RESOLVE_SLOTS);
+    let mut sbase = Shared::<u32>::new();
+
+    if u == 0 {
+        let mut b = 0usize;
+        if item_count > 0 && n > 0 {
+            let probe = if tile_lo < n { tile_lo } else { n - 1 };
+            let mut lo = 0usize;
+            let mut hi = item_count;
+            while lo + 1 < hi {
+                let mid = (lo + hi) / 2;
+                if (walk_plan[mid * 3] as usize) <= probe {
+                    lo = mid;
+                } else {
+                    hi = mid;
+                }
+            }
+            b = lo;
+        }
+        *sbase = b as u32;
+    }
+
+    let zero_k = 0x8000_0000u32;
+    if u < RESOLVE_SLOTS {
+        sext[u].store(zero_k);
+    }
+    sync_cube();
+    let it_base = *sbase as usize;
+    let nxt_start = if it_base + 1 < item_count {
+        walk_plan[(it_base + 1) * 3] as usize
+    } else {
+        n
+    };
+
     let mut k = 0usize;
     while k < rake {
         let b = tile_lo + k * units + u;
@@ -293,18 +327,19 @@ pub(super) fn extent_pair(
                 || (col >= (min_sw as usize)
                     && (uniform_sw == 0 || col.is_multiple_of(uniform_sw as usize)));
             if candidate {
-                // The owning item: the last plan entry whose start is at or before
-                // this byte (equal starts belong to empty items; taking the LAST
-                // keeps the one that can contain bytes).
-                let mut lo = 0usize;
-                let mut hi = item_count;
-                while lo + 1 < hi {
-                    let mid = (lo + hi) / 2;
-                    if (walk_plan[mid * 3] as usize) <= b {
-                        lo = mid;
-                    } else {
-                        hi = mid;
+                let mut lo = it_base;
+                if b >= nxt_start {
+                    let mut l = it_base;
+                    let mut hi = item_count;
+                    while l + 1 < hi {
+                        let mid = (l + hi) / 2;
+                        if (walk_plan[mid * 3] as usize) <= b {
+                            l = mid;
+                        } else {
+                            hi = mid;
+                        }
                     }
+                    lo = l;
                 }
                 let sw = walk_plan[lo * 3 + 2] as usize;
                 if col == 0 || (sw != 0 && col.is_multiple_of(sw)) {
@@ -342,12 +377,28 @@ pub(super) fn extent_pair(
                         id += 1;
                     }
                     if widest > 0.0f32 {
-                        extent_words[lo * 2].fetch_max(ordered_key(widest));
+                        let key = ordered_key(widest);
+                        let slot = lo - it_base;
+                        if slot < RESOLVE_SLOTS {
+                            sext[slot].fetch_max(key);
+                        } else {
+                            extent_words[lo * 2].fetch_max(key);
+                        }
                     }
                 }
             }
         }
         k += 1;
+    }
+    sync_cube();
+    if u < RESOLVE_SLOTS {
+        let it = it_base + u;
+        if it < item_count {
+            let val = sext[u].load();
+            if val > zero_k {
+                extent_words[it * 2].fetch_max(val);
+            }
+        }
     }
 }
 
