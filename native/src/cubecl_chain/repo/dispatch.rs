@@ -4,8 +4,7 @@ use cubecl::client::{Client, ProfileWindow};
 use cubecl::prelude::*;
 
 use super::super::cluster::{
-    cand_scatter, cluster_mark, count_spine, count_tile, item_roots, jump_build,
-    rank_step,
+    cand_sort, cluster_mark, item_roots, jump_build, rank_step,
 };
 use super::super::decode::decode_probe;
 use super::super::position::{extent_pair, resolve_x_fused};
@@ -166,10 +165,6 @@ pub(crate) fn launch_block1(
     prof: &mut ChainProfiler,
 ) {
     let n_words = inputs.n_words;
-    let n_tiles = inputs.n_tiles;
-    let units = inputs.units;
-    let rake = inputs.rake;
-    let log = inputs.log;
 
     unsafe {
         prof.block_begin(client, "block1");
@@ -192,39 +187,30 @@ pub(crate) fn launch_block1(
             BufferArg::from_raw_parts(buf.h_sm.clone(), n),
             BufferArg::from_raw_parts(buf.h_gi.clone(), n),
             BufferArg::from_raw_parts(buf.h_hgt.clone(), n),
-            BufferArg::from_raw_parts(buf.h_cslot.as_ref().unwrap().clone(), n),
-            BufferArg::from_raw_parts(buf.h_cend.as_ref().unwrap().clone(), n),
+            BufferArg::from_raw_parts(buf.h_hp.as_ref().unwrap().clone(), buf.cstride),
+            BufferArg::from_raw_parts(buf.h_cslot.as_ref().unwrap().clone(), buf.cstride),
+            BufferArg::from_raw_parts(buf.h_cend.as_ref().unwrap().clone(), buf.cstride),
+            BufferArg::from_raw_parts(buf.h_ctotal.as_ref().unwrap().clone(), 1),
             buf.bshift,
             inputs.seq_max,
+            buf.c_cap,
         );
         prof.end(client, "decode_probe");
 
-        prof.begin(client, "cand_count_tile");
-        count_tile::launch_unchecked(
-            client,
-            tiles_grid(n_tiles),
-            CubeDim::new_1d(units as u32),
-            BufferArg::from_raw_parts(buf.h_cslot.as_ref().unwrap().clone(), n),
-            BufferArg::from_raw_parts(buf.h_ctc.as_ref().unwrap().clone(), n_tiles),
-            BufferArg::from_raw_parts(buf.h_cup.as_ref().unwrap().clone(), n_tiles * units),
-            units,
-            rake,
-            log,
-        );
-        prof.end(client, "cand_count_tile");
-
-        prof.begin(client, "cand_count_spine");
-        count_spine::launch_unchecked(
-            client,
-            CubeCount::new_single(),
-            CubeDim::new_1d(units as u32),
-            BufferArg::from_raw_parts(buf.h_ctc.as_ref().unwrap().clone(), n_tiles),
-            BufferArg::from_raw_parts(buf.h_cxc.as_ref().unwrap().clone(), n_tiles),
-            BufferArg::from_raw_parts(buf.h_ctotal.as_ref().unwrap().clone(), 1),
-            units,
-            log,
-        );
-        prof.end(client, "cand_count_spine");
+        if buf.cluster_allocs.is_some() {
+            prof.begin(client, "cand_sort");
+            cand_sort::launch_unchecked(
+                client,
+                CubeCount::new_single(),
+                CubeDim::new_1d(32),
+                BufferArg::from_raw_parts(buf.h_hp.as_ref().unwrap().clone(), buf.cstride),
+                BufferArg::from_raw_parts(buf.h_cslot.as_ref().unwrap().clone(), buf.cstride),
+                BufferArg::from_raw_parts(buf.h_cend.as_ref().unwrap().clone(), buf.cstride),
+                BufferArg::from_raw_parts(buf.h_ctotal.as_ref().unwrap().clone(), 1),
+                buf.c_cap,
+            );
+            prof.end(client, "cand_sort");
+        }
         prof.block_end(client, "block1");
     }
 }
@@ -251,27 +237,13 @@ pub(crate) fn launch_block2_totals(
             let cstride = ca.cstride;
             let c_cap = ca.c_cap;
 
-            prof.begin(client, "cand_scatter");
-            cand_scatter::launch_unchecked(
-                client,
-                tiles_grid(n_tiles),
-                CubeDim::new_1d(units as u32),
-                BufferArg::from_raw_parts(buf.h_cslot.as_ref().unwrap().clone(), n),
-                BufferArg::from_raw_parts(buf.h_cxc.as_ref().unwrap().clone(), n_tiles),
-                BufferArg::from_raw_parts(buf.h_cup.as_ref().unwrap().clone(), n_tiles * units),
-                BufferArg::from_raw_parts(buf.h_hp.as_ref().unwrap().clone(), cstride),
-                units,
-                rake,
-            );
-            prof.end(client, "cand_scatter");
-
             prof.begin(client, "jump_build");
             jump_build::launch_unchecked(
                 client,
                 cubes_of(cstride),
                 CubeDim::new_1d(256),
                 BufferArg::from_raw_parts(buf.h_hp.as_ref().unwrap().clone(), cstride),
-                BufferArg::from_raw_parts(buf.h_cend.as_ref().unwrap().clone(), n),
+                BufferArg::from_raw_parts(buf.h_cend.as_ref().unwrap().clone(), cstride),
                 BufferArg::from_raw_parts(buf.h_ir.clone(), inputs.ir.len()),
                 BufferArg::from_raw_parts(buf.h_ctotal.as_ref().unwrap().clone(), 1),
                 BufferArg::from_raw_parts(ca.h_parent.clone(), cstride),
@@ -326,8 +298,8 @@ pub(crate) fn launch_block2_totals(
                 BufferArg::from_raw_parts(buf.h_ctotal.as_ref().unwrap().clone(), 1),
                 BufferArg::from_raw_parts(ca.h_roots.clone(), item_count.max(1)),
                 BufferArg::from_raw_parts(buf.h_ir.clone(), inputs.ir.len()),
-                BufferArg::from_raw_parts(buf.h_cend.as_ref().unwrap().clone(), n),
-                BufferArg::from_raw_parts(buf.h_cslot.as_ref().unwrap().clone(), n),
+                BufferArg::from_raw_parts(buf.h_cend.as_ref().unwrap().clone(), cstride),
+                BufferArg::from_raw_parts(buf.h_cslot.as_ref().unwrap().clone(), cstride),
                 BufferArg::from_raw_parts(buf.h_sm.clone(), n),
                 BufferArg::from_raw_parts(buf.h_gi.clone(), n),
                 BufferArg::from_raw_parts(buf.h_fl.clone(), n_words),
@@ -563,49 +535,26 @@ pub fn prewarm_pipelines(client: &Client) {
             BufferArg::from_raw_parts(b[13].clone(), 1),
             BufferArg::from_raw_parts(b[14].clone(), 1),
             BufferArg::from_raw_parts(b[15].clone(), 1),
+            BufferArg::from_raw_parts(b[16].clone(), 1),
+            BufferArg::from_raw_parts(b[17].clone(), 1),
             8u32,
             9u32,
+            16384usize,
         );
 
-        // 2. count_tile
-        count_tile::launch_unchecked(
-            client,
-            CubeCount::Static(1, 1, 1),
-            dim_256,
-            BufferArg::from_raw_parts(b[0].clone(), 0),
-            BufferArg::from_raw_parts(b[1].clone(), 1),
-            BufferArg::from_raw_parts(b[2].clone(), units),
-            units,
-            rake,
-            log,
-        );
-
-        // 3. count_spine
-        count_spine::launch_unchecked(
+        // 2. cand_sort
+        cand_sort::launch_unchecked(
             client,
             CubeCount::new_single(),
-            dim_256,
+            CubeDim::new_1d(32),
             BufferArg::from_raw_parts(b[0].clone(), 1),
             BufferArg::from_raw_parts(b[1].clone(), 1),
             BufferArg::from_raw_parts(b[2].clone(), 1),
-            units,
-            log,
-        );
-
-        // 4. cand_scatter
-        cand_scatter::launch_unchecked(
-            client,
-            CubeCount::Static(1, 1, 1),
-            dim_256,
-            BufferArg::from_raw_parts(b[0].clone(), 0),
-            BufferArg::from_raw_parts(b[1].clone(), 1),
-            BufferArg::from_raw_parts(b[2].clone(), units),
             BufferArg::from_raw_parts(b[3].clone(), 1),
-            units,
-            rake,
+            16384usize,
         );
 
-        // 5. jump_build
+        // 3. jump_build
         jump_build::launch_unchecked(
             client,
             CubeCount::Static(1, 1, 1),

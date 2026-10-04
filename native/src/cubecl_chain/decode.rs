@@ -176,10 +176,13 @@ pub(super) fn decode_probe(
     sm: &mut [f32],
     gi: &mut [u32],
     hgt: &mut [f32],
+    hp: &mut [u32],
     cslot: &mut [u32],
     cend: &mut [u32],
+    ctotal: &mut [Atomic<u32>],
     block_shift: u32,
     #[comptime] seq_max: u32,
+    #[comptime] c_cap: usize,
 ) {
     let w = ABSOLUTE_POS;
     let n = bytes.len() * 4;
@@ -196,7 +199,6 @@ pub(super) fn decode_probe(
         while lane < 4 {
             let id = w * 4 + lane;
             if id < n {
-                cslot[id] = 0u32;
                 let b = byte_from_pair(curr_word, next_word, lane, id, n);
                 // sequence_length, transcribed: the lenient classifier.
                 let len = if b & 0x80u32 == 0u32 {
@@ -403,8 +405,12 @@ pub(super) fn decode_probe(
                                                 p2 += len3 as usize;
                                             }
                                         }
-                                        cslot[id] = slot;
-                                        cend[id] = send;
+                                        let idx = ctotal[0].fetch_add(1);
+                                        if (idx as usize) < c_cap {
+                                            hp[idx as usize] = id as u32;
+                                            cslot[idx as usize] = slot;
+                                            cend[idx as usize] = send;
+                                        }
                                     }
                                 }
                             }

@@ -49,11 +49,10 @@ pub(crate) struct ChainBuffers {
     pub h_wc: Handle,
     pub h_otb: Option<Handle>,
     pub h_lm: Handle,
-    pub h_ctc: Option<Handle>,
-    pub h_cup: Option<Handle>,
-    pub h_cxc: Option<Handle>,
     pub h_ctotal: Option<Handle>,
     pub h_hp: Option<Handle>,
+    pub c_cap: usize,
+    pub cstride: usize,
     pub cluster_allocs: Option<ClusterCandidateAllocs>,
 
     // Survivor scan buffers
@@ -119,9 +118,6 @@ impl ChainBuffers {
         self.h_wm = None;
         self.h_otb = None;
         self.h_hp = None;
-        self.h_ctc = None;
-        self.h_cup = None;
-        self.h_cxc = None;
         self.cluster_allocs = None;
         self.h_ltc = None;
         self.h_stc = None;
@@ -192,8 +188,6 @@ pub(crate) fn allocate_chain_buffers(
     let h_sm = alloc_empty(n * 4);
     let h_gi = alloc_empty(n * 4);
     let h_hgt = alloc_empty(n * 4);
-    let h_cslot = alloc_empty(n * 4);
-    let h_cend = alloc_empty(n * 4);
     let h_tc = alloc_empty(n_tiles * PARTIAL_COUNT_STRIDE * 4);
     let h_tm = alloc_empty(n_tiles * 4);
     let h_xc = alloc_empty(n_tiles * PARTIAL_COUNT_STRIDE * 4);
@@ -207,13 +201,12 @@ pub(crate) fn allocate_chain_buffers(
     let h_xmax = alloc_upload(bytemuck::cast_slice(&vec![0u32; item_count]));
     let h_extent = alloc_upload(bytemuck::cast_slice(&inputs.extent_words));
     let h_plan = alloc_upload(bytemuck::cast_slice(&inputs.walk_plan));
-    let h_ctc = alloc_empty(n_tiles * 4);
-    let h_cup = alloc_empty(n_tiles * units * 4);
-    let h_cxc = alloc_empty(n_tiles * 4);
-    let h_ctotal = alloc_empty(4);
     let c_cap = 16384usize.min(n.max(256));
     let cstride = c_cap + 1;
     let h_hp = alloc_empty(cstride * 4);
+    let h_cslot = alloc_empty(cstride * 4);
+    let h_cend = alloc_empty(cstride * 4);
+    let h_ctotal = alloc_upload(&[0u8; 4]);
     let h_ltc = alloc_empty(n_tiles * 4);
     let h_stc = alloc_empty(n_tiles * 4);
     let h_lup = alloc_empty(n_tiles * units * 4);
@@ -296,11 +289,10 @@ pub(crate) fn allocate_chain_buffers(
             h_wc,
             h_otb: Some(h_otb),
             h_lm,
-            h_ctc: Some(h_ctc),
-            h_cup: Some(h_cup),
-            h_cxc: Some(h_cxc),
             h_ctotal: Some(h_ctotal),
             h_hp: Some(h_hp),
+            c_cap,
+            cstride,
             cluster_allocs,
             h_ltc: Some(h_ltc),
             h_stc: Some(h_stc),

@@ -547,7 +547,58 @@ pub(super) fn cand_scatter(
     }
 }
 
-/// The jump graph: `parent[i]` = first candidate at/after `cend[hp[i]]`,
+/// In-place comb sort of candidate positions in `hp` and associated `cslot` / `cend`.
+/// Typically ≤200 candidates in real corpora, executing on thread 0 in <1 microsecond.
+#[allow(clippy::manual_swap)]
+#[cube(launch_unchecked)]
+pub(super) fn cand_sort(
+    hp: &mut [u32],
+    cslot: &mut [u32],
+    cend: &mut [u32],
+    ctotal: &mut [Atomic<u32>],
+    #[comptime] c_cap: usize,
+) {
+    if ABSOLUTE_POS == 0 {
+        let raw_c = ctotal[0].load();
+        let c = if (raw_c as usize) > c_cap { c_cap } else { raw_c as usize };
+        if (raw_c as usize) > c_cap {
+            ctotal[0].store(c_cap as u32);
+        }
+        if c > 1 {
+            let mut gap = c;
+            let mut swapped = true;
+            while gap > 1 || swapped {
+                gap = (gap * 10) / 13;
+                if gap < 1 {
+                    gap = 1;
+                }
+                swapped = false;
+                let mut i = 0usize;
+                while i + gap < c {
+                    let j = i + gap;
+                    if hp[i] > hp[j] {
+                        let t_hp = hp[i];
+                        hp[i] = hp[j];
+                        hp[j] = t_hp;
+
+                        let t_cs = cslot[i];
+                        cslot[i] = cslot[j];
+                        cslot[j] = t_cs;
+
+                        let t_ce = cend[i];
+                        cend[i] = cend[j];
+                        cend[j] = t_ce;
+
+                        swapped = true;
+                    }
+                    i += 1usize;
+                }
+            }
+        }
+    }
+}
+
+/// The jump graph: `parent[i]` = first candidate at/after `cend[i]`,
 /// CLAMPED to `hp[i]`'s item (a span ending exactly at an item edge must
 /// never jump into the next item — the serial walk restarts there). Index C
 /// is the terminal: self-loop, written by thread C itself.
@@ -570,7 +621,7 @@ pub(super) fn jump_build(
         if i < c {
             d0[i] = 1u32;
             let p = hp[i] as usize;
-            let e = cend[p] as usize;
+            let e = cend[i] as usize;
             let item_count = ir.len() / 2;
             let stop = if item_count > 0 {
                 let it = item_search(ir, item_count, p);
@@ -725,14 +776,14 @@ pub(super) fn cluster_mark(
                     // ever marks members strictly inside the item. The Mojo
                     // chain's ownership rule, verbatim.
                     let stop = ir[it * 2 + 1] as usize;
-                    let e = cend[p] as usize;
+                    let e = cend[i] as usize;
                     let lim = if e < stop { e } else { stop };
                     sm[p] = bitmap_advance;
                     // A committed head's glyph IS the sequence's slot —
                     // the record emitter's GLYPH_ID for cluster heads
                     // (fold.rs:607's slots.gi[id] = best_slot). The
                     // consumer is the repo parity driver / phase 4.
-                    gi[p] = cslot[p];
+                    gi[p] = cslot[i];
                     let mut t = p + 1usize;
                     while t < lim {
                         if flags_at_from_atomic(fl_atomic, t) & F_LEADER != 0 {
