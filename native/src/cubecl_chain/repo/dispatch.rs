@@ -7,13 +7,10 @@ use super::super::cluster::{
     cand_sort, cluster_mark, item_roots, jump_build, rank_step,
 };
 use super::super::decode::decode_probe;
-use super::super::position::{extent_pair, resolve_x_fused};
-use super::super::scan::{apply, spine_scan, tile_scan};
-use super::super::tail::{
-    item_totals, sv_count_spine, sv_count_tile,
-    EXT_STRIDE,
-};
-use super::super::{IM_STRIDE, LC_STRIDE, LM_STRIDE, PARTIAL_COUNT_STRIDE};
+use super::super::position::apply_and_emit;
+use super::super::scan::{spine_scan, tile_scan};
+use super::super::tail::EXT_STRIDE;
+use super::super::{ITEM_DESC_STRIDE, PARTIAL_COUNT_STRIDE};
 use super::buffers::ChainBuffers;
 use super::prep::ChainHostInputs;
 
@@ -33,6 +30,7 @@ pub(crate) struct ChainProfiler {
     pub prof_ok: bool,
     pub prof_stage_on: bool,
     pub prof_blocks: bool,
+    #[allow(dead_code)]
     pub sync_prof: bool,
     pub rows: Vec<(String, std::time::Duration)>,
     pub missing: usize,
@@ -90,8 +88,13 @@ impl ChainProfiler {
             if self.timing.is_none() {
                 self.timing = Some(format!("{}", dur.timing_method()));
             }
+            let t_res0 = std::time::Instant::now();
             match pollster::block_on(dur.resolve()) {
-                Some(ticks) => self.rows.push((name.to_string(), ticks.duration())),
+                Some(ticks) => {
+                    let wall = t_res0.elapsed();
+                    self.rows.push((name.to_string(), ticks.duration()));
+                    self.rows.push((format!("wall:{name}"), wall));
+                }
                 None => self.missing += 1,
             }
         }
@@ -126,6 +129,7 @@ impl ChainProfiler {
         }
     }
 
+    #[allow(dead_code)]
     pub fn record_sync(&mut self, name: &'static str, dur: std::time::Duration) {
         if self.prof_ok {
             self.rows.push((name.to_string(), dur));
@@ -174,26 +178,25 @@ pub(crate) fn launch_block1(
             cubes_of(n_words),
             CubeDim::new_1d(256),
             BufferArg::from_raw_parts(buf.h_bytes.as_ref().unwrap().clone(), n_words),
-            BufferArg::from_raw_parts(buf.h_bi.as_ref().unwrap().clone(), buf.bi_len),
-            BufferArg::from_raw_parts(buf.h_bm.as_ref().unwrap().clone(), buf.bm_len),
-            BufferArg::from_raw_parts(buf.h_bc.as_ref().unwrap().clone(), buf.bc_len),
-            BufferArg::from_raw_parts(buf.h_bmap.as_ref().unwrap().clone(), inputs.bitmap.len()),
-            BufferArg::from_raw_parts(buf.h_poff.as_ref().unwrap().clone(), inputs.poff.len()),
-            BufferArg::from_raw_parts(buf.h_pval.as_ref().unwrap().clone(), inputs.pval.len()),
-            BufferArg::from_raw_parts(buf.h_seq.as_ref().unwrap().clone(), inputs.seq.len()),
-            BufferArg::from_raw_parts(buf.h_ir.clone(), inputs.ir.len()),
-            BufferArg::from_raw_parts(buf.h_ic.as_ref().unwrap().clone(), inputs.ic.len()),
-            BufferArg::from_raw_parts(buf.h_fl.clone(), n_words),
-            BufferArg::from_raw_parts(buf.h_sm.clone(), n),
-            BufferArg::from_raw_parts(buf.h_gi.clone(), n),
-            BufferArg::from_raw_parts(buf.h_hgt.clone(), n),
-            BufferArg::from_raw_parts(buf.h_hp.as_ref().unwrap().clone(), buf.cstride),
-            BufferArg::from_raw_parts(buf.h_cslot.as_ref().unwrap().clone(), buf.cstride),
-            BufferArg::from_raw_parts(buf.h_cend.as_ref().unwrap().clone(), buf.cstride),
-            BufferArg::from_raw_parts(buf.h_ctotal.as_ref().unwrap().clone(), 1),
-            buf.bshift,
+            BufferArg::from_raw_parts(buf.h_trie_block_indices.as_ref().unwrap().clone(), buf.trie_block_indices_len),
+            BufferArg::from_raw_parts(buf.h_trie_block_metrics.as_ref().unwrap().clone(), buf.trie_block_metrics_len),
+            BufferArg::from_raw_parts(buf.h_trie_block_codepoints.as_ref().unwrap().clone(), buf.trie_block_codepoints_len),
+            BufferArg::from_raw_parts(buf.h_cluster_bitmap.as_ref().unwrap().clone(), inputs.bitmap.len()),
+            BufferArg::from_raw_parts(buf.h_cluster_secondary_offsets.as_ref().unwrap().clone(), inputs.pair_secondary_offsets.len()),
+            BufferArg::from_raw_parts(buf.h_cluster_secondary_values.as_ref().unwrap().clone(), inputs.pair_secondary_values.len()),
+            BufferArg::from_raw_parts(buf.h_cluster_sequence_table.as_ref().unwrap().clone(), inputs.seq.len()),
+            BufferArg::from_raw_parts(buf.h_item_record_bounds.clone(), inputs.item_record_bounds.len()),
+            BufferArg::from_raw_parts(buf.h_item_cluster_enabled.as_ref().unwrap().clone(), inputs.item_cluster_enabled.len()),
+            BufferArg::from_raw_parts(buf.h_glyph_flags.clone(), n_words),
+            BufferArg::from_raw_parts(buf.h_advance_widths.clone(), n),
+            BufferArg::from_raw_parts(buf.h_glyph_indices.clone(), n),
+            BufferArg::from_raw_parts(buf.h_candidate_head_positions.as_ref().unwrap().clone(), buf.candidate_stride),
+            BufferArg::from_raw_parts(buf.h_candidate_slots.as_ref().unwrap().clone(), buf.candidate_stride),
+            BufferArg::from_raw_parts(buf.h_candidate_end_positions.as_ref().unwrap().clone(), buf.candidate_stride),
+            BufferArg::from_raw_parts(buf.h_candidate_total.as_ref().unwrap().clone(), 1),
+            buf.trie_block_shift,
             inputs.seq_max,
-            buf.c_cap,
+            buf.candidate_capacity,
         );
         prof.end(client, "decode_probe");
 
@@ -203,11 +206,11 @@ pub(crate) fn launch_block1(
                 client,
                 CubeCount::new_single(),
                 CubeDim::new_1d(32),
-                BufferArg::from_raw_parts(buf.h_hp.as_ref().unwrap().clone(), buf.cstride),
-                BufferArg::from_raw_parts(buf.h_cslot.as_ref().unwrap().clone(), buf.cstride),
-                BufferArg::from_raw_parts(buf.h_cend.as_ref().unwrap().clone(), buf.cstride),
-                BufferArg::from_raw_parts(buf.h_ctotal.as_ref().unwrap().clone(), 1),
-                buf.c_cap,
+                BufferArg::from_raw_parts(buf.h_candidate_head_positions.as_ref().unwrap().clone(), buf.candidate_stride),
+                BufferArg::from_raw_parts(buf.h_candidate_slots.as_ref().unwrap().clone(), buf.candidate_stride),
+                BufferArg::from_raw_parts(buf.h_candidate_end_positions.as_ref().unwrap().clone(), buf.candidate_stride),
+                BufferArg::from_raw_parts(buf.h_candidate_total.as_ref().unwrap().clone(), 1),
+                buf.candidate_capacity,
             );
             prof.end(client, "cand_sort");
         }
@@ -224,30 +227,26 @@ pub(crate) fn launch_block2_totals(
     buf: &ChainBuffers,
     prof: &mut ChainProfiler,
 ) {
-    let n_tiles = inputs.n_tiles;
     let n_words = inputs.n_words;
-    let units = inputs.units;
-    let rake = inputs.rake;
-    let log = inputs.log;
 
     unsafe {
         prof.block_begin(client, "block2_totals");
         if let Some(ref ca) = buf.cluster_allocs {
             let kmax = ca.kmax;
-            let cstride = ca.cstride;
-            let c_cap = ca.c_cap;
+            let candidate_stride = ca.candidate_stride;
+            let candidate_capacity = ca.candidate_capacity;
 
             prof.begin(client, "jump_build");
             jump_build::launch_unchecked(
                 client,
-                cubes_of(cstride),
+                cubes_of(candidate_stride),
                 CubeDim::new_1d(256),
-                BufferArg::from_raw_parts(buf.h_hp.as_ref().unwrap().clone(), cstride),
-                BufferArg::from_raw_parts(buf.h_cend.as_ref().unwrap().clone(), cstride),
-                BufferArg::from_raw_parts(buf.h_ir.clone(), inputs.ir.len()),
-                BufferArg::from_raw_parts(buf.h_ctotal.as_ref().unwrap().clone(), 1),
-                BufferArg::from_raw_parts(ca.h_parent.clone(), cstride),
-                BufferArg::from_raw_parts(ca.h_d0.clone(), cstride),
+                BufferArg::from_raw_parts(buf.h_candidate_head_positions.as_ref().unwrap().clone(), candidate_stride),
+                BufferArg::from_raw_parts(buf.h_candidate_end_positions.as_ref().unwrap().clone(), candidate_stride),
+                BufferArg::from_raw_parts(buf.h_item_record_bounds.clone(), inputs.item_record_bounds.len()),
+                BufferArg::from_raw_parts(buf.h_candidate_total.as_ref().unwrap().clone(), 1),
+                BufferArg::from_raw_parts(ca.h_parent.clone(), candidate_stride),
+                BufferArg::from_raw_parts(ca.h_d0.clone(), candidate_stride),
             );
             prof.end(client, "jump_build");
 
@@ -259,15 +258,15 @@ pub(crate) fn launch_block2_totals(
                 let td = if k % 2 == 0 { ca.h_d_a.clone() } else { ca.h_d_b.clone() };
                 rank_step::launch_unchecked(
                     client,
-                    cubes_of(cstride),
+                    cubes_of(candidate_stride),
                     CubeDim::new_1d(256),
-                    BufferArg::from_raw_parts(sp.clone(), cstride),
-                    BufferArg::from_raw_parts(sd.clone(), cstride),
-                    BufferArg::from_raw_parts(tp.clone(), cstride),
-                    BufferArg::from_raw_parts(td.clone(), cstride),
-                    BufferArg::from_raw_parts(ca.h_lvl.clone(), kmax * cstride),
+                    BufferArg::from_raw_parts(sp.clone(), candidate_stride),
+                    BufferArg::from_raw_parts(sd.clone(), candidate_stride),
+                    BufferArg::from_raw_parts(tp.clone(), candidate_stride),
+                    BufferArg::from_raw_parts(td.clone(), candidate_stride),
+                    BufferArg::from_raw_parts(ca.h_lvl.clone(), kmax * candidate_stride),
                     k,
-                    cstride,
+                    candidate_stride,
                 );
                 sp = tp;
                 sd = td;
@@ -279,10 +278,10 @@ pub(crate) fn launch_block2_totals(
                 client,
                 cubes_of(item_count.max(1)),
                 CubeDim::new_1d(256),
-                BufferArg::from_raw_parts(buf.h_hp.as_ref().unwrap().clone(), cstride),
-                BufferArg::from_raw_parts(buf.h_ctotal.as_ref().unwrap().clone(), 1),
-                BufferArg::from_raw_parts(buf.h_ir.clone(), inputs.ir.len()),
-                BufferArg::from_raw_parts(buf.h_ic.as_ref().unwrap().clone(), inputs.ic.len()),
+                BufferArg::from_raw_parts(buf.h_candidate_head_positions.as_ref().unwrap().clone(), candidate_stride),
+                BufferArg::from_raw_parts(buf.h_candidate_total.as_ref().unwrap().clone(), 1),
+                BufferArg::from_raw_parts(buf.h_item_record_bounds.clone(), inputs.item_record_bounds.len()),
+                BufferArg::from_raw_parts(buf.h_item_cluster_enabled.as_ref().unwrap().clone(), inputs.item_cluster_enabled.len()),
                 BufferArg::from_raw_parts(ca.h_roots.clone(), item_count.max(1)),
             );
             prof.end(client, "item_roots");
@@ -290,83 +289,31 @@ pub(crate) fn launch_block2_totals(
             prof.begin(client, "cluster_mark");
             cluster_mark::launch_unchecked(
                 client,
-                cubes_of(c_cap),
+                cubes_of(candidate_capacity),
                 CubeDim::new_1d(256),
-                BufferArg::from_raw_parts(buf.h_hp.as_ref().unwrap().clone(), cstride),
-                BufferArg::from_raw_parts(sd.clone(), cstride),
-                BufferArg::from_raw_parts(ca.h_lvl.clone(), kmax * cstride),
-                BufferArg::from_raw_parts(buf.h_ctotal.as_ref().unwrap().clone(), 1),
+                BufferArg::from_raw_parts(buf.h_candidate_head_positions.as_ref().unwrap().clone(), candidate_stride),
+                BufferArg::from_raw_parts(sd.clone(), candidate_stride),
+                BufferArg::from_raw_parts(ca.h_lvl.clone(), kmax * candidate_stride),
+                BufferArg::from_raw_parts(buf.h_candidate_total.as_ref().unwrap().clone(), 1),
                 BufferArg::from_raw_parts(ca.h_roots.clone(), item_count.max(1)),
-                BufferArg::from_raw_parts(buf.h_ir.clone(), inputs.ir.len()),
-                BufferArg::from_raw_parts(buf.h_cend.as_ref().unwrap().clone(), cstride),
-                BufferArg::from_raw_parts(buf.h_cslot.as_ref().unwrap().clone(), cstride),
-                BufferArg::from_raw_parts(buf.h_sm.clone(), n),
-                BufferArg::from_raw_parts(buf.h_gi.clone(), n),
-                BufferArg::from_raw_parts(buf.h_fl.clone(), n_words),
+                BufferArg::from_raw_parts(buf.h_item_record_bounds.clone(), inputs.item_record_bounds.len()),
+                BufferArg::from_raw_parts(buf.h_candidate_end_positions.as_ref().unwrap().clone(), candidate_stride),
+                BufferArg::from_raw_parts(buf.h_candidate_slots.as_ref().unwrap().clone(), candidate_stride),
+                BufferArg::from_raw_parts(buf.h_advance_widths.clone(), n),
+                BufferArg::from_raw_parts(buf.h_glyph_indices.clone(), n),
+                BufferArg::from_raw_parts(buf.h_glyph_flags.clone(), n_words),
                 kmax,
-                cstride,
+                candidate_stride,
                 inputs.bitmap_advance,
             );
             prof.end(client, "cluster_mark");
         }
 
-        prof.begin(client, "sv_count_tile");
-        sv_count_tile::launch_unchecked(
-            client,
-            tiles_grid(n_tiles),
-            CubeDim::new_1d(units as u32),
-            BufferArg::from_raw_parts(buf.h_fl.clone(), n_words),
-            BufferArg::from_raw_parts(buf.h_gi.clone(), n),
-            BufferArg::from_raw_parts(buf.h_ltc.as_ref().unwrap().clone(), n_tiles),
-            BufferArg::from_raw_parts(buf.h_stc.as_ref().unwrap().clone(), n_tiles),
-            BufferArg::from_raw_parts(buf.h_lup.as_ref().unwrap().clone(), n_tiles * units),
-            BufferArg::from_raw_parts(buf.h_sup.as_ref().unwrap().clone(), n_tiles * units),
-            units,
-            rake,
-            log,
-        );
-        prof.end(client, "sv_count_tile");
-
-        prof.begin(client, "sv_count_spine");
-        sv_count_spine::launch_unchecked(
-            client,
-            CubeCount::new_single(),
-            CubeDim::new_1d(units as u32),
-            BufferArg::from_raw_parts(buf.h_ltc.as_ref().unwrap().clone(), n_tiles),
-            BufferArg::from_raw_parts(buf.h_stc.as_ref().unwrap().clone(), n_tiles),
-            BufferArg::from_raw_parts(buf.h_lxc.as_ref().unwrap().clone(), n_tiles),
-            BufferArg::from_raw_parts(buf.h_sxc.as_ref().unwrap().clone(), n_tiles),
-            BufferArg::from_raw_parts(buf.h_lgrand.as_ref().unwrap().clone(), 1),
-            BufferArg::from_raw_parts(buf.h_sgrand.as_ref().unwrap().clone(), 1),
-            units,
-            log,
-        );
-        prof.end(client, "sv_count_spine");
-
-        prof.begin(client, "item_totals");
-        item_totals::launch_unchecked(
-            client,
-            cubes_of(item_count.max(1)),
-            CubeDim::new_1d(256),
-            BufferArg::from_raw_parts(buf.h_ir.clone(), inputs.ir.len()),
-            BufferArg::from_raw_parts(buf.h_fl.clone(), n_words),
-            BufferArg::from_raw_parts(buf.h_gi.clone(), n),
-            BufferArg::from_raw_parts(buf.h_lxc.as_ref().unwrap().clone(), n_tiles),
-            BufferArg::from_raw_parts(buf.h_sxc.as_ref().unwrap().clone(), n_tiles),
-            BufferArg::from_raw_parts(buf.h_lup.as_ref().unwrap().clone(), n_tiles * units),
-            BufferArg::from_raw_parts(buf.h_sup.as_ref().unwrap().clone(), n_tiles * units),
-            BufferArg::from_raw_parts(buf.h_lgrand.as_ref().unwrap().clone(), 1),
-            BufferArg::from_raw_parts(buf.h_sgrand.as_ref().unwrap().clone(), 1),
-            BufferArg::from_raw_parts(buf.h_totals.as_ref().unwrap().clone(), item_count * 2),
-            units,
-            rake,
-        );
-        prof.end(client, "item_totals");
         prof.block_end(client, "block2_totals");
     }
 }
 
-/// Executes Block 2 Part B: scan, apply, extent_pair, derive_stride, resolve_x, extent_fold, and ordinal_scatter.
+/// Executes Block 2 Part B: tile_scan, spine_scan, and apply_and_emit.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn launch_block2_geometry(
     client: &Client,
@@ -381,7 +328,6 @@ pub(crate) fn launch_block2_geometry(
     let units = inputs.units;
     let rake = inputs.rake;
     let log = inputs.log;
-    let rspan = inputs.rspan;
 
     unsafe {
         prof.block_begin(client, "block2_geometry");
@@ -390,12 +336,11 @@ pub(crate) fn launch_block2_geometry(
             client,
             tiles_grid(n_tiles),
             CubeDim::new_1d(units as u32),
-            BufferArg::from_raw_parts(buf.h_fl.clone(), n_words),
-            BufferArg::from_raw_parts(buf.h_sm.clone(), n),
-            BufferArg::from_raw_parts(buf.h_ir.clone(), inputs.ir.len()),
-            BufferArg::from_raw_parts(buf.h_ie.as_ref().unwrap().clone(), inputs.ie.len()),
-            BufferArg::from_raw_parts(buf.h_tc.as_ref().unwrap().clone(), n_tiles * PARTIAL_COUNT_STRIDE),
-            BufferArg::from_raw_parts(buf.h_tm.as_ref().unwrap().clone(), n_tiles),
+            BufferArg::from_raw_parts(buf.h_glyph_flags.clone(), n_words),
+            BufferArg::from_raw_parts(buf.h_advance_widths.clone(), n),
+            BufferArg::from_raw_parts(buf.h_item_descriptors.as_ref().unwrap().clone(), inputs.item_descriptors.len()),
+            BufferArg::from_raw_parts(buf.h_tile_counts.as_ref().unwrap().clone(), n_tiles * PARTIAL_COUNT_STRIDE),
+            BufferArg::from_raw_parts(buf.h_tile_metrics.as_ref().unwrap().clone(), n_tiles),
             units,
             rake,
             log,
@@ -407,111 +352,59 @@ pub(crate) fn launch_block2_geometry(
             client,
             CubeCount::new_single(),
             CubeDim::new_1d(units as u32),
-            BufferArg::from_raw_parts(buf.h_tc.as_ref().unwrap().clone(), n_tiles * PARTIAL_COUNT_STRIDE),
-            BufferArg::from_raw_parts(buf.h_tm.as_ref().unwrap().clone(), n_tiles),
-            BufferArg::from_raw_parts(buf.h_xc.as_ref().unwrap().clone(), n_tiles * PARTIAL_COUNT_STRIDE),
-            BufferArg::from_raw_parts(buf.h_xm.as_ref().unwrap().clone(), n_tiles),
+            BufferArg::from_raw_parts(buf.h_tile_counts.as_ref().unwrap().clone(), n_tiles * PARTIAL_COUNT_STRIDE),
+            BufferArg::from_raw_parts(buf.h_tile_metrics.as_ref().unwrap().clone(), n_tiles),
+            BufferArg::from_raw_parts(buf.h_spine_counts.as_ref().unwrap().clone(), n_tiles * PARTIAL_COUNT_STRIDE),
+            BufferArg::from_raw_parts(buf.h_spine_metrics.as_ref().unwrap().clone(), n_tiles),
             units,
             log,
         );
         prof.end(client, "spine_scan");
 
-        prof.begin(client, "apply");
-        apply::launch_unchecked(
+        prof.begin(client, "apply_and_emit");
+        apply_and_emit::launch_unchecked(
             client,
             tiles_grid(n_tiles),
             CubeDim::new_1d(units as u32),
-            BufferArg::from_raw_parts(buf.h_fl.clone(), n_words),
-            BufferArg::from_raw_parts(buf.h_sm.clone(), n),
-            BufferArg::from_raw_parts(buf.h_lc.as_ref().unwrap().clone(), n * LC_STRIDE),
-            BufferArg::from_raw_parts(buf.h_lm.clone(), n * LM_STRIDE),
-            BufferArg::from_raw_parts(buf.h_ir.clone(), inputs.ir.len()),
-            BufferArg::from_raw_parts(buf.h_ie.as_ref().unwrap().clone(), inputs.ie.len()),
-            BufferArg::from_raw_parts(buf.h_im.as_ref().unwrap().clone(), item_count * IM_STRIDE),
-            BufferArg::from_raw_parts(buf.h_xc.as_ref().unwrap().clone(), n_tiles * PARTIAL_COUNT_STRIDE),
-            BufferArg::from_raw_parts(buf.h_xm.as_ref().unwrap().clone(), n_tiles),
-            BufferArg::from_raw_parts(buf.h_wm.as_ref().unwrap().clone(), 1),
-            BufferArg::from_raw_parts(buf.h_wc.clone(), n),
-            BufferArg::from_raw_parts(buf.h_otb.as_ref().unwrap().clone(), n),
-            BufferArg::from_raw_parts(buf.h_rmax.as_ref().unwrap().clone(), item_count),
-            BufferArg::from_raw_parts(buf.h_xmax.as_ref().unwrap().clone(), item_count),
+            BufferArg::from_raw_parts(buf.h_glyph_flags.clone(), n_words),
+            BufferArg::from_raw_parts(buf.h_advance_widths.clone(), n),
+            BufferArg::from_raw_parts(buf.h_item_descriptors.as_ref().unwrap().clone(), inputs.item_descriptors.len()),
+            BufferArg::from_raw_parts(buf.h_spine_counts.as_ref().unwrap().clone(), n_tiles * PARTIAL_COUNT_STRIDE),
+            BufferArg::from_raw_parts(buf.h_spine_metrics.as_ref().unwrap().clone(), n_tiles),
+            BufferArg::from_raw_parts(buf.h_max_row_extents.as_ref().unwrap().clone(), item_count * 2),
+            BufferArg::from_raw_parts(buf.h_glyph_indices.clone(), n),
+            BufferArg::from_raw_parts(buf.h_item_extents.clone(), item_count * EXT_STRIDE),
+            BufferArg::from_raw_parts(buf.h_per_record_semantic_colors.clone(), buf.per_record_colors_words),
+            BufferArg::from_raw_parts(buf.h_instance_slots.clone(), buf.slots_words),
+            BufferArg::from_raw_parts(buf.h_instance_tints.clone(), buf.tint_words),
             units,
             rake,
             log,
-            false,
-            true,
         );
-        prof.end(client, "apply");
-
-        let skip_extent_pair = std::env::var_os("GLYPH_EXTENT_PAIR_GPU").is_none();
-        if !skip_extent_pair {
-            let rake_ep = 32usize;
-            prof.begin(client, "extent_pair");
-            extent_pair::launch_unchecked(
-                client,
-                tiles_grid(n.div_ceil(units * rake_ep).max(1)),
-                CubeDim::new_1d(units as u32),
-                BufferArg::from_raw_parts(buf.h_sm.clone(), n),
-                BufferArg::from_raw_parts(buf.h_fl.clone(), n_words),
-                BufferArg::from_raw_parts(buf.h_lc.as_ref().unwrap().clone(), n * LC_STRIDE),
-                BufferArg::from_raw_parts(buf.h_plan.as_ref().unwrap().clone(), inputs.walk_plan.len()),
-                BufferArg::from_raw_parts(buf.h_extent.as_ref().unwrap().clone(), item_count * 2),
-                inputs.min_sw,
-                inputs.uniform_sw,
-                units,
-                rake_ep,
-            );
-            prof.end(client, "extent_pair");
-        }
-
-        prof.begin(client, "resolve_x");
-        resolve_x_fused::launch_unchecked(
-            client,
-            cubes_of(n.div_ceil(rspan)),
-            CubeDim::new_1d(256),
-            BufferArg::from_raw_parts(buf.h_sm.clone(), n),
-            BufferArg::from_raw_parts(buf.h_fl.clone(), n_words),
-            BufferArg::from_raw_parts(buf.h_lm.clone(), n * LM_STRIDE),
-            BufferArg::from_raw_parts(buf.h_lc.as_ref().unwrap().clone(), n * LC_STRIDE),
-            BufferArg::from_raw_parts(buf.h_im.as_ref().unwrap().clone(), item_count * IM_STRIDE),
-            BufferArg::from_raw_parts(buf.h_ie.as_ref().unwrap().clone(), inputs.ie.len()),
-            BufferArg::from_raw_parts(buf.h_ir.clone(), inputs.ir.len()),
-            BufferArg::from_raw_parts(buf.h_wc.clone(), n),
-            BufferArg::from_raw_parts(buf.h_otb.as_ref().unwrap().clone(), n),
-            BufferArg::from_raw_parts(buf.h_wm.as_ref().unwrap().clone(), 1),
-            BufferArg::from_raw_parts(buf.h_extent.as_ref().unwrap().clone(), item_count * 2),
-            BufferArg::from_raw_parts(buf.h_gap.as_ref().unwrap().clone(), item_count),
-            BufferArg::from_raw_parts(buf.h_gi.clone(), n),
-            BufferArg::from_raw_parts(buf.h_hgt.clone(), n),
-            BufferArg::from_raw_parts(buf.h_ext.clone(), item_count * EXT_STRIDE),
-            256,
-            rspan,
-        );
-        prof.end(client, "resolve_x");
+        prof.end(client, "apply_and_emit");
         prof.block_end(client, "block2_geometry");
     }
 }
 
-/// Pre-warms (compiles and caches) all 16 CubeCL compute shader pipelines
+/// Pre-warms (compiles and caches) all 15 CubeCL compute shader pipelines
 /// concurrently on a background thread so cold starts pay zero shader JIT latency.
 pub fn prewarm_pipelines(client: &Client) {
-    use super::super::tail::scatter_slots;
-
     let zeroes = vec![0u32; 256];
     let zeroes_bytes = bytemuck::cast_slice::<u32, u8>(&zeroes);
-    let b: Vec<_> = (0..25)
+    let dummy_buffers: Vec<_> = (0..25)
         .map(|_| client.create_from_slice(zeroes_bytes))
         .collect();
+
+    let dummy = |slot: usize, len: usize| unsafe { BufferArg::from_raw_parts(dummy_buffers[slot].clone(), len) };
 
     let dim_256 = CubeDim::new_1d(256);
 
     let units = 256usize;
-    let rake = 8usize;
-    let log = 8usize;
-    let rspan = std::env::var("GLYPH_CHAIN_SPAN")
+    let rake = std::env::var("GLYPH_CHAIN_RAKE")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(32usize);
+        .unwrap_or(8usize);
+    let log = units.ilog2() as usize;
 
     unsafe {
         // 1. decode_probe
@@ -519,24 +412,23 @@ pub fn prewarm_pipelines(client: &Client) {
             client,
             CubeCount::Static(1, 1, 1),
             dim_256,
-            BufferArg::from_raw_parts(b[0].clone(), 1),
-            BufferArg::from_raw_parts(b[1].clone(), 1),
-            BufferArg::from_raw_parts(b[2].clone(), 2),
-            BufferArg::from_raw_parts(b[3].clone(), 2),
-            BufferArg::from_raw_parts(b[4].clone(), 1),
-            BufferArg::from_raw_parts(b[5].clone(), 1),
-            BufferArg::from_raw_parts(b[6].clone(), 1),
-            BufferArg::from_raw_parts(b[7].clone(), 1),
-            BufferArg::from_raw_parts(b[8].clone(), 2),
-            BufferArg::from_raw_parts(b[9].clone(), 1),
-            BufferArg::from_raw_parts(b[10].clone(), 0),
-            BufferArg::from_raw_parts(b[11].clone(), 1),
-            BufferArg::from_raw_parts(b[12].clone(), 1),
-            BufferArg::from_raw_parts(b[13].clone(), 1),
-            BufferArg::from_raw_parts(b[14].clone(), 1),
-            BufferArg::from_raw_parts(b[15].clone(), 1),
-            BufferArg::from_raw_parts(b[16].clone(), 1),
-            BufferArg::from_raw_parts(b[17].clone(), 1),
+            dummy(0, 1),
+            dummy(1, 1),
+            dummy(2, 2),
+            dummy(3, 2),
+            dummy(4, 1),
+            dummy(5, 1),
+            dummy(6, 1),
+            dummy(7, 1),
+            dummy(8, 2),
+            dummy(9, 1),
+            dummy(10, 0),
+            dummy(11, 1),
+            dummy(12, 1),
+            dummy(13, 1),
+            dummy(14, 1),
+            dummy(15, 1),
+            dummy(16, 1),
             8u32,
             9u32,
             16384usize,
@@ -547,10 +439,10 @@ pub fn prewarm_pipelines(client: &Client) {
             client,
             CubeCount::new_single(),
             CubeDim::new_1d(32),
-            BufferArg::from_raw_parts(b[0].clone(), 1),
-            BufferArg::from_raw_parts(b[1].clone(), 1),
-            BufferArg::from_raw_parts(b[2].clone(), 1),
-            BufferArg::from_raw_parts(b[3].clone(), 1),
+            dummy(0, 1),
+            dummy(1, 1),
+            dummy(2, 1),
+            dummy(3, 1),
             16384usize,
         );
 
@@ -559,12 +451,12 @@ pub fn prewarm_pipelines(client: &Client) {
             client,
             CubeCount::Static(1, 1, 1),
             dim_256,
-            BufferArg::from_raw_parts(b[0].clone(), 1),
-            BufferArg::from_raw_parts(b[1].clone(), 1),
-            BufferArg::from_raw_parts(b[2].clone(), 2),
-            BufferArg::from_raw_parts(b[3].clone(), 1),
-            BufferArg::from_raw_parts(b[4].clone(), 256),
-            BufferArg::from_raw_parts(b[5].clone(), 256),
+            dummy(0, 1),
+            dummy(1, 1),
+            dummy(2, 2),
+            dummy(3, 1),
+            dummy(4, 256),
+            dummy(5, 256),
         );
 
         // 6. rank_step (prewarm all doubling rounds for standard repo capacity)
@@ -573,11 +465,11 @@ pub fn prewarm_pipelines(client: &Client) {
                 client,
                 CubeCount::Static(1, 1, 1),
                 dim_256,
-                BufferArg::from_raw_parts(b[0].clone(), 256),
-                BufferArg::from_raw_parts(b[1].clone(), 256),
-                BufferArg::from_raw_parts(b[2].clone(), 256),
-                BufferArg::from_raw_parts(b[3].clone(), 256),
-                BufferArg::from_raw_parts(b[4].clone(), 256),
+                dummy(0, 256),
+                dummy(1, 256),
+                dummy(2, 256),
+                dummy(3, 256),
+                dummy(4, 256),
                 k,
                 16385,
             );
@@ -588,11 +480,11 @@ pub fn prewarm_pipelines(client: &Client) {
             client,
             CubeCount::Static(1, 1, 1),
             dim_256,
-            BufferArg::from_raw_parts(b[0].clone(), 1),
-            BufferArg::from_raw_parts(b[1].clone(), 1),
-            BufferArg::from_raw_parts(b[2].clone(), 2),
-            BufferArg::from_raw_parts(b[3].clone(), 1),
-            BufferArg::from_raw_parts(b[4].clone(), 1),
+            dummy(0, 1),
+            dummy(1, 1),
+            dummy(2, 2),
+            dummy(3, 1),
+            dummy(4, 1),
         );
 
         // 8. cluster_mark
@@ -600,180 +492,75 @@ pub fn prewarm_pipelines(client: &Client) {
             client,
             CubeCount::Static(1, 1, 1),
             dim_256,
-            BufferArg::from_raw_parts(b[0].clone(), 1),
-            BufferArg::from_raw_parts(b[1].clone(), 1),
-            BufferArg::from_raw_parts(b[2].clone(), 1),
-            BufferArg::from_raw_parts(b[3].clone(), 1),
-            BufferArg::from_raw_parts(b[4].clone(), 1),
-            BufferArg::from_raw_parts(b[5].clone(), 2),
-            BufferArg::from_raw_parts(b[6].clone(), 1),
-            BufferArg::from_raw_parts(b[7].clone(), 1),
-            BufferArg::from_raw_parts(b[8].clone(), 1),
-            BufferArg::from_raw_parts(b[9].clone(), 1),
-            BufferArg::from_raw_parts(b[10].clone(), 1),
+            dummy(0, 1),
+            dummy(1, 1),
+            dummy(2, 1),
+            dummy(3, 1),
+            dummy(4, 1),
+            dummy(5, 2),
+            dummy(6, 1),
+            dummy(7, 1),
+            dummy(8, 1),
+            dummy(9, 1),
+            dummy(10, 1),
             15,
             16385,
             136.0f32,
         );
 
-        // 9. sv_count_tile
-        sv_count_tile::launch_unchecked(
-            client,
-            CubeCount::Static(1, 1, 1),
-            dim_256,
-            BufferArg::from_raw_parts(b[0].clone(), 1),
-            BufferArg::from_raw_parts(b[1].clone(), 0),
-            BufferArg::from_raw_parts(b[2].clone(), 1),
-            BufferArg::from_raw_parts(b[3].clone(), 1),
-            BufferArg::from_raw_parts(b[4].clone(), units),
-            BufferArg::from_raw_parts(b[5].clone(), units),
-            units,
-            rake,
-            log,
-        );
-
-        // 10. sv_count_spine
-        sv_count_spine::launch_unchecked(
-            client,
-            CubeCount::new_single(),
-            dim_256,
-            BufferArg::from_raw_parts(b[0].clone(), 1),
-            BufferArg::from_raw_parts(b[1].clone(), 1),
-            BufferArg::from_raw_parts(b[2].clone(), 1),
-            BufferArg::from_raw_parts(b[3].clone(), 1),
-            BufferArg::from_raw_parts(b[4].clone(), 1),
-            BufferArg::from_raw_parts(b[5].clone(), 1),
-            units,
-            log,
-        );
-
-        // 11. item_totals
-        item_totals::launch_unchecked(
-            client,
-            CubeCount::Static(1, 1, 1),
-            dim_256,
-            BufferArg::from_raw_parts(b[0].clone(), 2),
-            BufferArg::from_raw_parts(b[1].clone(), 1),
-            BufferArg::from_raw_parts(b[2].clone(), 1),
-            BufferArg::from_raw_parts(b[3].clone(), 1),
-            BufferArg::from_raw_parts(b[4].clone(), 1),
-            BufferArg::from_raw_parts(b[5].clone(), units),
-            BufferArg::from_raw_parts(b[6].clone(), units),
-            BufferArg::from_raw_parts(b[7].clone(), 1),
-            BufferArg::from_raw_parts(b[8].clone(), 1),
-            BufferArg::from_raw_parts(b[9].clone(), 2),
-            units,
-            rake,
-        );
-
-        // 12. tile_scan
+        // 9. tile_scan
         tile_scan::launch_unchecked(
             client,
             CubeCount::Static(1, 1, 1),
             dim_256,
-            BufferArg::from_raw_parts(b[0].clone(), 0),
-            BufferArg::from_raw_parts(b[1].clone(), 1),
-            BufferArg::from_raw_parts(b[2].clone(), 2),
-            BufferArg::from_raw_parts(b[3].clone(), 1),
-            BufferArg::from_raw_parts(b[4].clone(), PARTIAL_COUNT_STRIDE),
-            BufferArg::from_raw_parts(b[5].clone(), 1),
+            dummy(0, 0),
+            dummy(1, 1),
+            dummy(2, ITEM_DESC_STRIDE),
+            dummy(3, PARTIAL_COUNT_STRIDE),
+            dummy(4, 1),
             units,
             rake,
             log,
         );
 
-        // 13. spine_scan
+        // 10. spine_scan
         spine_scan::launch_unchecked(
             client,
             CubeCount::new_single(),
             dim_256,
-            BufferArg::from_raw_parts(b[0].clone(), PARTIAL_COUNT_STRIDE),
-            BufferArg::from_raw_parts(b[1].clone(), 1),
-            BufferArg::from_raw_parts(b[2].clone(), PARTIAL_COUNT_STRIDE),
-            BufferArg::from_raw_parts(b[3].clone(), 1),
+            dummy(0, PARTIAL_COUNT_STRIDE),
+            dummy(1, 1),
+            dummy(2, PARTIAL_COUNT_STRIDE),
+            dummy(3, 1),
             units,
             log,
         );
 
-        // 14. apply
-        apply::launch_unchecked(
+        // 11. apply_and_emit (unified scan, position, extents, and direct slot/tint emission)
+        apply_and_emit::launch_unchecked(
             client,
             CubeCount::Static(1, 1, 1),
             dim_256,
-            BufferArg::from_raw_parts(b[0].clone(), 1),
-            BufferArg::from_raw_parts(b[1].clone(), 0),
-            BufferArg::from_raw_parts(b[2].clone(), 2),
-            BufferArg::from_raw_parts(b[3].clone(), 4),
-            BufferArg::from_raw_parts(b[4].clone(), 2),
-            BufferArg::from_raw_parts(b[5].clone(), 1),
-            BufferArg::from_raw_parts(b[6].clone(), IM_STRIDE),
-            BufferArg::from_raw_parts(b[7].clone(), PARTIAL_COUNT_STRIDE),
-            BufferArg::from_raw_parts(b[8].clone(), 1),
-            BufferArg::from_raw_parts(b[9].clone(), 1),
-            BufferArg::from_raw_parts(b[10].clone(), 1),
-            BufferArg::from_raw_parts(b[11].clone(), 1),
-            BufferArg::from_raw_parts(b[12].clone(), 1),
-            BufferArg::from_raw_parts(b[13].clone(), 1),
+            dummy(0, 1),
+            dummy(1, 0),
+            dummy(2, ITEM_DESC_STRIDE),
+            dummy(3, PARTIAL_COUNT_STRIDE),
+            dummy(4, 1),
+            dummy(5, 2),
+            dummy(6, 1),
+            dummy(7, EXT_STRIDE),
+            dummy(8, 1),
+            dummy(9, 8),
+            dummy(10, 2),
             units,
             rake,
             log,
-            false,
-            true,
-        );
-
-        // 15. resolve_x_fused
-        resolve_x_fused::launch_unchecked(
-            client,
-            CubeCount::Static(1, 1, 1),
-            dim_256,
-            BufferArg::from_raw_parts(b[0].clone(), 1),
-            BufferArg::from_raw_parts(b[1].clone(), 0),
-            BufferArg::from_raw_parts(b[2].clone(), LM_STRIDE),
-            BufferArg::from_raw_parts(b[3].clone(), LC_STRIDE),
-            BufferArg::from_raw_parts(b[4].clone(), IM_STRIDE),
-            BufferArg::from_raw_parts(b[5].clone(), 1),
-            BufferArg::from_raw_parts(b[6].clone(), 2),
-            BufferArg::from_raw_parts(b[7].clone(), 1),
-            BufferArg::from_raw_parts(b[8].clone(), 1),
-            BufferArg::from_raw_parts(b[9].clone(), 1),
-            BufferArg::from_raw_parts(b[10].clone(), 2),
-            BufferArg::from_raw_parts(b[11].clone(), 1),
-            BufferArg::from_raw_parts(b[12].clone(), 1),
-            BufferArg::from_raw_parts(b[13].clone(), 1),
-            BufferArg::from_raw_parts(b[14].clone(), EXT_STRIDE),
-            units,
-            rspan,
-        );
-
-        // 16. scatter_slots
-        scatter_slots::launch_unchecked(
-            client,
-            CubeCount::Static(1, 1, 1),
-            dim_256,
-            BufferArg::from_raw_parts(b[0].clone(), 1),
-            BufferArg::from_raw_parts(b[1].clone(), 0),
-            BufferArg::from_raw_parts(b[2].clone(), 2),
-            BufferArg::from_raw_parts(b[3].clone(), LM_STRIDE),
-            BufferArg::from_raw_parts(b[4].clone(), 1),
-            BufferArg::from_raw_parts(b[5].clone(), 1),
-            BufferArg::from_raw_parts(b[6].clone(), 1),
-            BufferArg::from_raw_parts(b[7].clone(), 1),
-            BufferArg::from_raw_parts(b[8].clone(), 1),
-            BufferArg::from_raw_parts(b[9].clone(), 1),
-            BufferArg::from_raw_parts(b[10].clone(), 1),
-            BufferArg::from_raw_parts(b[11].clone(), 1),
-            BufferArg::from_raw_parts(b[12].clone(), 1),
-            BufferArg::from_raw_parts(b[13].clone(), units),
-            BufferArg::from_raw_parts(b[14].clone(), 1),
-            BufferArg::from_raw_parts(b[15].clone(), 1),
-            units,
-            rake,
         );
     }
     // Wait for the background queue to execute all prewarm launches so every
     // compute shader pipeline is fully compiled by Naga and Metal/Vulkan
     // into the device pipeline cache before prewarm returns.
     let _ = pollster::block_on(client.sync());
-    let _ = client.read_one(b[14].clone());
+    let _ = client.read_one(dummy_buffers[15].clone());
 }
 

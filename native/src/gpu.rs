@@ -380,7 +380,7 @@ pub struct GpuContext {
     #[cfg(feature = "cubecl")]
     pub cubecl_device: std::sync::OnceLock<cubecl::wgpu::WgpuDevice>,
     #[cfg(feature = "cubecl")]
-    pub prewarm_handle: std::sync::Mutex<Option<std::thread::JoinHandle<()>>>,
+    pub prewarm_handle: std::sync::Arc<std::sync::Mutex<Option<std::thread::JoinHandle<()>>>>,
 }
 
 /// The renderer's device context handles passed across layout stages.
@@ -394,6 +394,8 @@ pub struct SharedDevice {
     pub max_buffer_size: u64,
     pub host_visible_storage: bool,
     pub memory_arch: MemoryArchitecture,
+    #[cfg(feature = "cubecl")]
+    pub prewarm_handle: std::sync::Arc<std::sync::Mutex<Option<std::thread::JoinHandle<()>>>>,
     #[cfg(feature = "cubecl")]
     pub cubecl_device: Option<cubecl::wgpu::WgpuDevice>,
 }
@@ -425,6 +427,8 @@ impl SharedDevice {
             host_visible_storage: memory_arch == MemoryArchitecture::Unified
                 && ctx.profile.mappable_primary_buffers,
             memory_arch,
+            #[cfg(feature = "cubecl")]
+            prewarm_handle: ctx.prewarm_handle.clone(),
             #[cfg(feature = "cubecl")]
             cubecl_device,
         }
@@ -669,7 +673,7 @@ pub async fn init(compatible_surface: Option<&wgpu::Surface<'_>>) -> GpuContext 
         #[cfg(feature = "cubecl")]
         cubecl_device: std::sync::OnceLock::new(),
         #[cfg(feature = "cubecl")]
-        prewarm_handle: std::sync::Mutex::new(None),
+        prewarm_handle: std::sync::Arc::new(std::sync::Mutex::new(None)),
     }
 }
 

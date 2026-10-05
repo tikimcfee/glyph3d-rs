@@ -16,8 +16,8 @@ use super::decode::decode;
 use super::position::{derive_stride, extent_pair, resolve_x};
 use super::scan::{apply, spine_scan, tile_scan};
 use super::{
-    F_LEADER, IE_STRIDE, IM_STRIDE, LC_COL, LC_ROW, LC_STRIDE, LM_STRIDE, PARTIAL_COUNT_STRIDE,
-    pack_words,
+    F_CLUSTER_TRAILER, F_LEADER, F_SURVIVOR, ITEM_DESC_STRIDE, LC_COL, LC_ROW, LC_STRIDE,
+    LM_STRIDE, PARTIAL_COUNT_STRIDE, pack_words,
 };
 
 // ── the bench driver ──────────────────────────────────────────────────────────
@@ -123,11 +123,48 @@ pub fn bench(ctx: &GpuContext, corpus_path: &Path) -> ! {
     let r = run_scan_pipeline(&bytes, &trie, &items, DEFAULT_CHUNK_SIZE, DEFAULT_GROUP_SIZE, 1);
     let decode_dt = t_decode.elapsed();
 
-    let ir: Vec<u32> = vec![0, n as u32];
+    let item_record_bounds: Vec<u32> = vec![0, n as u32];
     let walk_plan: Vec<u32> = vec![0, n as u32, wrap_width.max(0) as u32];
-    let ie: Vec<u32> = vec![0, 0, 0, 1, wrap_width as u32, 0, 0, 0];
-    let im: Vec<f32> = vec![0.0, 0.0, 1.25, 2.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
-    let page_gap_x: Vec<f32> = vec![0.0];
+    // Consolidated item descriptor: 24 words (96 B, 16-byte aligned)
+    let mut item_descriptors = Vec::with_capacity(ITEM_DESC_STRIDE);
+    // 0..2: Record bounds
+    item_descriptors.push(0);
+    item_descriptors.push(n as u32);
+    // 2..10: Layout configuration
+    item_descriptors.push(0); // page_rows
+    item_descriptors.push(0); // page_cols
+    item_descriptors.push(0); // scroll_rows
+    item_descriptors.push(1); // pages_wide
+    item_descriptors.push(wrap_width as u32);
+    item_descriptors.push(0); // has_page
+    item_descriptors.push(0); // wrap_mode: Down
+    item_descriptors.push(0); // pad
+    // 10..20: Spatial metrics (stored as f32 bits)
+    item_descriptors.push(0.0f32.to_bits()); // origin_y
+    item_descriptors.push(0.0f32.to_bits()); // origin_z
+    item_descriptors.push(1.25f32.to_bits()); // line_height
+    item_descriptors.push(2.0f32.to_bits()); // z_step
+    item_descriptors.push(0.0f32.to_bits()); // band_stride_y
+    item_descriptors.push(0.0f32.to_bits()); // depth_per_band
+    item_descriptors.push(0.0f32.to_bits()); // depth_per_col
+    item_descriptors.push(0.0f32.to_bits()); // metrics pad
+    item_descriptors.push(0.0f32.to_bits()); // origin_x
+    item_descriptors.push(0.0f32.to_bits()); // z_step tail
+    // 20: Page gap X
+    item_descriptors.push(0.0f32.to_bits());
+    // 21..25: Paint configuration (consolidated from former h_paint buffer)
+    item_descriptors.push(0);
+    item_descriptors.push(0);
+    item_descriptors.push(0);
+    item_descriptors.push(0);
+    // 25..32: std430 alignment padding (7 zeros)
+    item_descriptors.push(0);
+    item_descriptors.push(0);
+    item_descriptors.push(0);
+    item_descriptors.push(0);
+    item_descriptors.push(0);
+    item_descriptors.push(0);
+    item_descriptors.push(0);
 
     let setup = WgpuSetup {
         instance: ctx.instance.clone(),
@@ -150,20 +187,24 @@ pub fn bench(ctx: &GpuContext, corpus_path: &Path) -> ! {
         // Statics: advance (f32/byte) + PACKED flags (u8/byte, four per word —
         // the chain reads fl three-to-four passes and consumes only the low
         // byte; the full flags stay CPU-side for the renderer).
-        let mut fl = Vec::with_capacity(n_words);
-        let mut sm = Vec::with_capacity(n);
+        let mut glyph_flags = Vec::with_capacity(n_words);
+        let mut advance_widths = Vec::with_capacity(n);
         for w in 0..n_words {
             let mut word = 0u32;
-            for b in 0..4 {
-                let i = w * 4 + b;
+            for byte_idx in 0..4 {
+                let i = w * 4 + byte_idx;
                 if i < n {
-                    word |= (r.slots.flags(i) & 0xFF) << (b * 8);
+                    let mut f = r.slots.flags(i) & 0xFF;
+                    if r.slots.gi[i] != 0 && (f & F_LEADER) != 0 && (f & F_CLUSTER_TRAILER) == 0 {
+                        f |= F_SURVIVOR;
+                    }
+                    word |= f << (byte_idx * 8);
                 }
             }
-            fl.push(word);
+            glyph_flags.push(word);
         }
         for i in 0..n {
-            sm.push(r.slots.advance(i));
+            advance_widths.push(r.slots.advance(i));
         }
         // gi/height ride only the decode path (rung 1); the CPU-statics
         // upload mode never reads them.
@@ -174,8 +215,8 @@ pub fn bench(ctx: &GpuContext, corpus_path: &Path) -> ! {
             hgv[i] = r.slots.height(i);
         }
         (
-            client.create_from_slice(bytemuck::cast_slice(&fl)),
-            client.create_from_slice(bytemuck::cast_slice(&sm)),
+            client.create_from_slice(bytemuck::cast_slice(&glyph_flags)),
+            client.create_from_slice(bytemuck::cast_slice(&advance_widths)),
             client.create_from_slice(bytemuck::cast_slice(&giv)),
             client.create_from_slice(bytemuck::cast_slice(&hgv)),
         )
@@ -228,16 +269,13 @@ pub fn bench(ctx: &GpuContext, corpus_path: &Path) -> ! {
     // store now (2026-09-30), so this is a plain allocation in every mode.
     let h_cslot = client.empty(n * 4);
     let h_cend = client.empty(n * 4);
-    let h_ir = client.create_from_slice(bytemuck::cast_slice(&ir));
-    let h_ie = client.create_from_slice(bytemuck::cast_slice(&ie));
-    let h_im = client.create_from_slice(bytemuck::cast_slice(&im));
-    let h_gap = client.create_from_slice(bytemuck::cast_slice(&page_gap_x));
+    let h_ir = client.create_from_slice(bytemuck::cast_slice(&item_record_bounds));
+    let h_item_desc = client.create_from_slice(bytemuck::cast_slice(&item_descriptors));
     let h_tc = client.empty(n_tiles * PARTIAL_COUNT_STRIDE * 4);
     let h_tm = client.empty(n_tiles * 4);
     let h_xc = client.empty(n_tiles * PARTIAL_COUNT_STRIDE * 4);
     let h_xm = client.empty(n_tiles * 4);
     let h_lc = client.empty(n * LC_STRIDE * 4);
-    let h_wm = client.empty(n * 4);
     let h_wc = client.empty(n * 4);
     let h_otb = client.empty(n * 4);
     let h_lm = client.empty(n * LM_STRIDE * 4);
@@ -542,8 +580,7 @@ pub fn bench(ctx: &GpuContext, corpus_path: &Path) -> ! {
                         CubeDim::new_1d(units as u32),
                         BufferArg::from_raw_parts(h_fl.clone(), n_words),
                         BufferArg::from_raw_parts(h_sm.clone(), n),
-                        BufferArg::from_raw_parts(h_ir.clone(), 2),
-                        BufferArg::from_raw_parts(h_ie.clone(), IE_STRIDE),
+                        BufferArg::from_raw_parts(h_item_desc.clone(), ITEM_DESC_STRIDE),
                         BufferArg::from_raw_parts(h_tc.clone(), n_tiles * PARTIAL_COUNT_STRIDE),
                         BufferArg::from_raw_parts(h_tm.clone(), n_tiles),
                         units,
@@ -573,12 +610,9 @@ pub fn bench(ctx: &GpuContext, corpus_path: &Path) -> ! {
                         BufferArg::from_raw_parts(h_sm.clone(), n),
                         BufferArg::from_raw_parts(h_lc.clone(), n * LC_STRIDE),
                         BufferArg::from_raw_parts(h_lm.clone(), n * LM_STRIDE),
-                        BufferArg::from_raw_parts(h_ir.clone(), 2),
-                        BufferArg::from_raw_parts(h_ie.clone(), IE_STRIDE),
-                        BufferArg::from_raw_parts(h_im.clone(), IM_STRIDE),
+                        BufferArg::from_raw_parts(h_item_desc.clone(), ITEM_DESC_STRIDE),
                         BufferArg::from_raw_parts(h_xc.clone(), n_tiles * PARTIAL_COUNT_STRIDE),
                         BufferArg::from_raw_parts(h_xm.clone(), n_tiles),
-                        BufferArg::from_raw_parts(h_wm.clone(), n),
                         BufferArg::from_raw_parts(h_wc.clone(), n),
                         BufferArg::from_raw_parts(h_otb.clone(), n),
                         BufferArg::from_raw_parts(h_rmax.clone(), 1),
@@ -587,6 +621,7 @@ pub fn bench(ctx: &GpuContext, corpus_path: &Path) -> ! {
                         rake,
                         log,
                         inline_resolve,
+                        false,
                         false,
                     );
                 }
@@ -613,8 +648,7 @@ pub fn bench(ctx: &GpuContext, corpus_path: &Path) -> ! {
                         CubeCount::new_single(),
                         CubeDim::new_1d(1),
                         BufferArg::from_raw_parts(h_extent.clone(), 2),
-                        BufferArg::from_raw_parts(h_ie.clone(), IE_STRIDE),
-                        BufferArg::from_raw_parts(h_gap.clone(), 1),
+                        BufferArg::from_raw_parts(h_item_desc.clone(), ITEM_DESC_STRIDE),
                         BufferArg::from_raw_parts(h_strides.clone(), 2),
                     );
                 }
@@ -628,16 +662,12 @@ pub fn bench(ctx: &GpuContext, corpus_path: &Path) -> ! {
                             BufferArg::from_raw_parts(h_fl.clone(), n_words),
                             BufferArg::from_raw_parts(h_lm.clone(), n * LM_STRIDE),
                             BufferArg::from_raw_parts(h_lc.clone(), n * LC_STRIDE),
-                            BufferArg::from_raw_parts(h_im.clone(), IM_STRIDE),
-                            BufferArg::from_raw_parts(h_ie.clone(), IE_STRIDE),
-                            BufferArg::from_raw_parts(h_ir.clone(), 2),
+                            BufferArg::from_raw_parts(h_item_desc.clone(), ITEM_DESC_STRIDE),
                             BufferArg::from_raw_parts(h_wc.clone(), n),
                             BufferArg::from_raw_parts(h_otb.clone(), n),
-                            BufferArg::from_raw_parts(h_wm.clone(), n),
                             BufferArg::from_raw_parts(h_rmax.clone(), 1),
                             BufferArg::from_raw_parts(h_xmax.clone(), 1),
                             BufferArg::from_raw_parts(h_extent.clone(), 2),
-                            BufferArg::from_raw_parts(h_gap.clone(), 1),
                             256,
                             rspan,
                         );
@@ -730,7 +760,6 @@ pub fn bench(ctx: &GpuContext, corpus_path: &Path) -> ! {
     let t1 = std::time::Instant::now();
     let lc_bytes = client.read_one(h_lc.clone()).expect("read lc");
     let _wc = client.read_one(h_wc.clone()).expect("read wc");
-    let _wm = client.read_one(h_wm.clone()).expect("read wm");
     let _lm = client.read_one(h_lm.clone()).expect("read lm");
     let readback_dt = t1.elapsed();
     // The cluster lanes' own witness, whenever the mark stage ran (it is
@@ -768,7 +797,7 @@ pub fn bench(ctx: &GpuContext, corpus_path: &Path) -> ! {
     }
     // Correctness at speed: the bench's whole number is worthless if the fast
     // path is wrong — diff the leader row/col lanes against the CPU reference.
-    let lc: &[u32] = bytemuck::cast_slice(&lc_bytes);
+    let line_columns: &[u32] = bytemuck::cast_slice(&lc_bytes);
     if stages < 3 + pre {
         println!(
             "cubecl-chain-bench: {} ({} B, {} tiles @ {}x{}, wrap {}) stages {} — pre-apply stages only, no verification",
@@ -791,8 +820,8 @@ pub fn bench(ctx: &GpuContext, corpus_path: &Path) -> ! {
         if r.slots.flags(id) & F_LEADER == 0 {
             continue;
         }
-        if r.slots.row(id) != lc[id * LC_STRIDE + LC_ROW] as i64
-            || r.slots.col(id) != lc[id * LC_STRIDE + LC_COL] as i64
+        if r.slots.row(id) != line_columns[id * LC_STRIDE + LC_ROW] as i64
+            || r.slots.col(id) != line_columns[id * LC_STRIDE + LC_COL] as i64
         {
             bad += 1;
         }

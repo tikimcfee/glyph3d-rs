@@ -2,7 +2,7 @@ use cubecl::prelude::*;
 
 use super::cluster::{cp_at, is_static_zero, seq_len_at};
 use super::monoid::item_search;
-use super::{F_CLUSTER_TRAILER, F_LEADER, F_MISSING, F_NEWLINE, TRIE_FLAG_MISSING};
+use super::{F_CLUSTER_TRAILER, F_LEADER, F_MISSING, F_NEWLINE, F_SURVIVOR, TRIE_FLAG_MISSING};
 
 // ── dispatch 0: decode — thread per 4-byte word ──────────────────────────────
 //
@@ -28,42 +28,42 @@ pub(super) fn decode(
     block_index: &[u32],
     blocks_m: &[f32],
     blocks_c: &[u32],
-    fl: &mut [u32],
-    sm: &mut [f32],
-    gi: &mut [u32],
-    hgt: &mut [f32],
-    cslot: &mut [u32],
+    glyph_flags: &mut [u32],
+    advance_widths: &mut [f32],
+    glyph_indices: &mut [u32],
+    glyph_heights: &mut [f32],
+    candidate_slots: &mut [u32],
     block_shift: u32,
 ) {
-    let w = ABSOLUTE_POS;
-    let n = bytes.len() * 4;
-    if w < fl.len() {
-        let curr_word = bytes[w];
-        let next_word = if w + 1 < bytes.len() {
-            bytes[w + 1]
+    let word_index = ABSOLUTE_POS;
+    let total_bytes = bytes.len() * 4;
+    if word_index < glyph_flags.len() {
+        let curr_word = bytes[word_index];
+        let next_word = if word_index + 1 < bytes.len() {
+            bytes[word_index + 1]
         } else {
             0u32
         };
-        let mut word = 0u32;
+        let mut packed_word = 0u32;
         let mut lane = 0usize;
         while lane < 4 {
-            let id = w * 4 + lane;
-            if id < n {
+            let byte_index = word_index * 4 + lane;
+            if byte_index < total_bytes {
                 // The candidate-slot clear rides decode (2026-09-30): the
-                // probe writes cslot only on its deep candidate path, and
+                // probe writes candidate_slots only on its deep candidate path, and
                 // count_tile/cand_scatter read it as a predicate over every
                 // byte — so it arrived as a 388 MB upload of zeros. One
                 // store per byte here, where every byte is already touched.
-                cslot[id] = 0u32;
-                let b = byte_from_pair(curr_word, next_word, lane, id, n);
+                candidate_slots[byte_index] = 0u32;
+                let lead_byte = byte_from_pair(curr_word, next_word, lane, byte_index, total_bytes);
                 // sequence_length, transcribed: the lenient classifier.
-                let len = if b & 0x80u32 == 0u32 {
+                let len = if lead_byte & 0x80u32 == 0u32 {
                     1u32
-                } else if b & 0xE0u32 == 0xC0u32 {
+                } else if lead_byte & 0xE0u32 == 0xC0u32 {
                     2u32
-                } else if b & 0xF0u32 == 0xE0u32 {
+                } else if lead_byte & 0xF0u32 == 0xE0u32 {
                     3u32
-                } else if b & 0xF8u32 == 0xF0u32 {
+                } else if lead_byte & 0xF8u32 == 0xF0u32 {
                     4u32
                 } else {
                     0u32
@@ -71,59 +71,64 @@ pub(super) fn decode(
                 if len > 0u32 {
                     // decode_codepoint_at, transcribed (reads past the end
                     // are zero, continuations never validated).
-                    let b1 = byte_from_pair(curr_word, next_word, lane + 1, id + 1, n);
-                    let b2 = byte_from_pair(curr_word, next_word, lane + 2, id + 2, n);
-                    let b3 = byte_from_pair(curr_word, next_word, lane + 3, id + 3, n);
-                    let cp = if len == 1u32 {
-                        b
+                    let byte1 = byte_from_pair(curr_word, next_word, lane + 1, byte_index + 1, total_bytes);
+                    let byte2 = byte_from_pair(curr_word, next_word, lane + 2, byte_index + 2, total_bytes);
+                    let byte3 = byte_from_pair(curr_word, next_word, lane + 3, byte_index + 3, total_bytes);
+                    let codepoint = if len == 1u32 {
+                        lead_byte
                     } else if len == 2u32 {
-                        ((b & 0x1Fu32) << 6u32) | (b1 & 0x3Fu32)
+                        ((lead_byte & 0x1Fu32) << 6u32) | (byte1 & 0x3Fu32)
                     } else if len == 3u32 {
-                        ((b & 0x0Fu32) << 12u32) | ((b1 & 0x3Fu32) << 6u32) | (b2 & 0x3Fu32)
+                        ((lead_byte & 0x0Fu32) << 12u32) | ((byte1 & 0x3Fu32) << 6u32) | (byte2 & 0x3Fu32)
                     } else {
-                        ((b & 0x07u32) << 18u32) | ((b1 & 0x3Fu32) << 12u32) | ((b2 & 0x3Fu32) << 6u32) | (b3 & 0x3Fu32)
+                        ((lead_byte & 0x07u32) << 18u32) | ((byte1 & 0x3Fu32) << 12u32) | ((byte2 & 0x3Fu32) << 6u32) | (byte3 & 0x3Fu32)
                     };
-                    let block = if cp <= 0x10FFFFu32 {
-                        block_index[(cp >> block_shift) as usize]
+                    let block = if codepoint <= 0x10FFFFu32 {
+                        block_index[(codepoint >> block_shift) as usize]
                     } else {
                         0u32
                     };
-                    let e = ((block << block_shift) | (cp & 0xFFu32)) as usize;
-                    sm[id] = blocks_m[e * 2];
-                    // gi and height ride the same two-level lookup the
+                    let entry_offset = ((block << block_shift) | (codepoint & 0xFFu32)) as usize;
+                    advance_widths[byte_index] = blocks_m[entry_offset * 2];
+                    // glyph_indices and height ride the same two-level lookup the
                     // advance does — blocks_c's low word is the glyph id,
                     // blocks_m's high word the height (both pre-converted
-                    // to world units by device_tables). The gi lane is the
+                    // to world units by device_tables). The glyph_indices lane is the
                     // record emitter's GLYPH_ID (phase 4 rung 1; the module
                     // header's "no device writer" gap closes here).
-                    gi[id] = blocks_c[e * 2];
-                    hgt[id] = blocks_m[e * 2 + 1];
+                    let glyph_id = blocks_c[entry_offset * 2];
+                    glyph_indices[byte_index] = glyph_id;
+                    glyph_heights[byte_index] = blocks_m[entry_offset * 2 + 1];
                     let flag = F_LEADER
-                        | (if b == 10u32 {
+                        | (if lead_byte == 10u32 {
                             F_NEWLINE
                         } else {
                             0u32
                         })
-                        | (if blocks_c[e * 2 + 1] & TRIE_FLAG_MISSING != 0 {
+                        | (if blocks_c[entry_offset * 2 + 1] & TRIE_FLAG_MISSING != 0 {
                             F_MISSING
                         } else {
                             0u32
+                        })
+                        | (if glyph_id != 0u32 {
+                            F_SURVIVOR
+                        } else {
+                            0u32
                         });
-                    word |= flag << ((lane as u32) * 8u32);
+                    packed_word |= flag << ((lane as u32) * 8u32);
                 } else {
                     // decode_and_resolve zeroes the statics of a non-leader
-                    // — gi and height included (the fold's sm stride-2
+                    // — glyph_indices and height included (the fold's sm stride-2
                     // reference zeroes both lanes).
-                    sm[id] = f32::from_bits(0u32);
-                    gi[id] = 0u32;
-                    hgt[id] = f32::from_bits(0u32);
+                    advance_widths[byte_index] = f32::from_bits(0u32);
+                    glyph_indices[byte_index] = 0u32;
+                    glyph_heights[byte_index] = f32::from_bits(0u32);
                 }
             }
             lane += 1;
         }
-        fl[w] = word;
+        glyph_flags[word_index] = packed_word;
     }
-
 }
 
 /// Byte i of the packed corpus, zero past the end (the reference's
@@ -167,265 +172,268 @@ pub(super) fn decode_probe(
     blocks_m: &[f32],
     blocks_c: &[u32],
     bitmap: &[u32],
-    sec_off: &[u32],
-    sec_val: &[u32],
-    seq: &[u32],
-    ir: &[u32],
-    ic: &[u32],
-    fl: &mut [u32],
-    sm: &mut [f32],
-    gi: &mut [u32],
-    hgt: &mut [f32],
-    hp: &mut [u32],
-    cslot: &mut [u32],
-    cend: &mut [u32],
-    ctotal: &mut [Atomic<u32>],
+    secondary_offsets: &[u32],
+    secondary_values: &[u32],
+    sequence_table: &[u32],
+    item_record_bounds: &[u32],
+    item_cluster_enabled: &[u32],
+    glyph_flags: &mut [u32],
+    advance_widths: &mut [f32],
+    glyph_indices: &mut [u32],
+    candidate_head_positions: &mut [u32],
+    candidate_slots: &mut [u32],
+    candidate_end_positions: &mut [u32],
+    candidate_total_atomic: &mut [Atomic<u32>],
     block_shift: u32,
     #[comptime] seq_max: u32,
-    #[comptime] c_cap: usize,
+    #[comptime] candidate_capacity: usize,
 ) {
-    let w = ABSOLUTE_POS;
-    let n = bytes.len() * 4;
-    let item_count = ir.len() / 2;
-    if w < fl.len() {
-        let curr_word = bytes[w];
-        let next_word = if w + 1 < bytes.len() {
-            bytes[w + 1]
+    let word_index = ABSOLUTE_POS;
+    let total_bytes = bytes.len() * 4;
+    let item_count = item_record_bounds.len() / 2;
+    if word_index < glyph_flags.len() {
+        let curr_word = bytes[word_index];
+        let next_word = if word_index + 1 < bytes.len() {
+            bytes[word_index + 1]
         } else {
             0u32
         };
-        let mut word = 0u32;
+        let mut packed_word = 0u32;
         let mut lane = 0usize;
         while lane < 4 {
-            let id = w * 4 + lane;
-            if id < n {
-                let b = byte_from_pair(curr_word, next_word, lane, id, n);
+            let byte_index = word_index * 4 + lane;
+            if byte_index < total_bytes {
+                let lead_byte = byte_from_pair(curr_word, next_word, lane, byte_index, total_bytes);
                 // sequence_length, transcribed: the lenient classifier.
-                let len = if b & 0x80u32 == 0u32 {
+                let len = if lead_byte & 0x80u32 == 0u32 {
                     1u32
-                } else if b & 0xE0u32 == 0xC0u32 {
+                } else if lead_byte & 0xE0u32 == 0xC0u32 {
                     2u32
-                } else if b & 0xF0u32 == 0xE0u32 {
+                } else if lead_byte & 0xF0u32 == 0xE0u32 {
                     3u32
-                } else if b & 0xF8u32 == 0xF0u32 {
+                } else if lead_byte & 0xF8u32 == 0xF0u32 {
                     4u32
                 } else {
                     0u32
                 };
                 if len > 0u32 {
-                    let b1 = byte_from_pair(curr_word, next_word, lane + 1, id + 1, n);
-                    let b2 = byte_from_pair(curr_word, next_word, lane + 2, id + 2, n);
-                    let b3 = byte_from_pair(curr_word, next_word, lane + 3, id + 3, n);
-                    let cp = if len == 1u32 {
-                        b
+                    let byte1 = byte_from_pair(curr_word, next_word, lane + 1, byte_index + 1, total_bytes);
+                    let byte2 = byte_from_pair(curr_word, next_word, lane + 2, byte_index + 2, total_bytes);
+                    let byte3 = byte_from_pair(curr_word, next_word, lane + 3, byte_index + 3, total_bytes);
+                    let codepoint = if len == 1u32 {
+                        lead_byte
                     } else if len == 2u32 {
-                        ((b & 0x1Fu32) << 6u32) | (b1 & 0x3Fu32)
+                        ((lead_byte & 0x1Fu32) << 6u32) | (byte1 & 0x3Fu32)
                     } else if len == 3u32 {
-                        ((b & 0x0Fu32) << 12u32) | ((b1 & 0x3Fu32) << 6u32) | (b2 & 0x3Fu32)
+                        ((lead_byte & 0x0Fu32) << 12u32) | ((byte1 & 0x3Fu32) << 6u32) | (byte2 & 0x3Fu32)
                     } else {
-                        ((b & 0x07u32) << 18u32) | ((b1 & 0x3Fu32) << 12u32) | ((b2 & 0x3Fu32) << 6u32) | (b3 & 0x3Fu32)
+                        ((lead_byte & 0x07u32) << 18u32) | ((byte1 & 0x3Fu32) << 12u32) | ((byte2 & 0x3Fu32) << 6u32) | (byte3 & 0x3Fu32)
                     };
-                    let block = if cp <= 0x10FFFFu32 {
-                        block_index[(cp >> block_shift) as usize]
+                    let block = if codepoint <= 0x10FFFFu32 {
+                        block_index[(codepoint >> block_shift) as usize]
                     } else {
                         0u32
                     };
-                    let e = ((block << block_shift) | (cp & 0xFFu32)) as usize;
-                    sm[id] = blocks_m[e * 2];
-                    gi[id] = blocks_c[e * 2];
-                    hgt[id] = blocks_m[e * 2 + 1];
+                    let entry_offset = ((block << block_shift) | (codepoint & 0xFFu32)) as usize;
+                    advance_widths[byte_index] = blocks_m[entry_offset * 2];
+                    let glyph_id = blocks_c[entry_offset * 2];
+                    glyph_indices[byte_index] = glyph_id;
                     let mut flag = F_LEADER
-                        | (if b == 10u32 {
+                        | (if lead_byte == 10u32 {
                             F_NEWLINE
                         } else {
                             0u32
                         })
-                        | (if blocks_c[e * 2 + 1] & TRIE_FLAG_MISSING != 0 {
+                        | (if blocks_c[entry_offset * 2 + 1] & TRIE_FLAG_MISSING != 0 {
                             F_MISSING
+                        } else {
+                            0u32
+                        })
+                        | (if glyph_id != 0u32 {
+                            F_SURVIVOR
                         } else {
                             0u32
                         });
 
-                    let mut start = 0usize;
-                    let mut stop = 0usize;
-                    let mut cluster = false;
+                    let mut item_start_byte = 0usize;
+                    let mut item_end_byte = 0usize;
+                    let mut cluster_enabled = false;
                     if item_count > 0 {
-                        let it = item_search(ir, item_count, id);
-                        start = ir[it * 2] as usize;
-                        stop = ir[it * 2 + 1] as usize;
-                        cluster = ic[it] != 0;
+                        let item_index = item_search(item_record_bounds, item_count, byte_index);
+                        item_start_byte = item_record_bounds[item_index * 2] as usize;
+                        item_end_byte = item_record_bounds[item_index * 2 + 1] as usize;
+                        cluster_enabled = item_cluster_enabled[item_index] != 0;
                     }
-                    if cluster && id >= start && id < stop {
-                        if is_static_zero(cp) != 0u32 {
-                            sm[id] = f32::from_bits(0u32);
-                            gi[id] = 0u32;
-                            flag |= F_CLUSTER_TRAILER;
+                    if cluster_enabled && byte_index >= item_start_byte && byte_index < item_end_byte {
+                        if is_static_zero(codepoint) != 0u32 {
+                            advance_widths[byte_index] = f32::from_bits(0u32);
+                            glyph_indices[byte_index] = 0u32;
+                            flag = (flag & !F_SURVIVOR) | F_CLUSTER_TRAILER;
                         } else {
                             let mut bit = 0u32;
-                            if cp <= 0x10FFFFu32 {
-                                bit = (bitmap[(cp >> 5u32) as usize] >> (cp & 0x1Fu32)) & 1u32;
+                            if codepoint <= 0x10FFFFu32 {
+                                bit = (bitmap[(codepoint >> 5u32) as usize] >> (codepoint & 0x1Fu32)) & 1u32;
                             }
                             if bit != 0u32 {
-                                let mut q = id + len as usize;
-                                let mut second = 0u32;
-                                let mut hunting = 1u32;
-                                while hunting == 1u32 && q < stop {
-                                    let l2 = seq_len_at(bytes, q, n);
-                                    let c2 = cp_at(bytes, q, l2, n);
-                                    let dead2 = if l2 == 0u32 || c2 == 0x0Au32 || c2 == 0xFE0Eu32 {
+                                let mut search_byte_pos = byte_index + len as usize;
+                                let mut second_codepoint = 0u32;
+                                let mut is_hunting = 1u32;
+                                while is_hunting == 1u32 && search_byte_pos < item_end_byte {
+                                    let seq2_len = seq_len_at(bytes, search_byte_pos, total_bytes);
+                                    let seq2_cp = cp_at(bytes, search_byte_pos, seq2_len, total_bytes);
+                                    let seq2_dead = if seq2_len == 0u32 || seq2_cp == 0x0Au32 || seq2_cp == 0xFE0Eu32 {
                                         1u32
                                     } else {
                                         0u32
                                     };
-                                    if dead2 == 1u32 {
-                                        hunting = 0u32;
+                                    if seq2_dead == 1u32 {
+                                        is_hunting = 0u32;
                                     }
-                                    if dead2 == 0u32 {
-                                        if c2 != 0xFE0Fu32 {
-                                            second = c2;
-                                            hunting = 0u32;
+                                    if seq2_dead == 0u32 {
+                                        if seq2_cp != 0xFE0Fu32 {
+                                            second_codepoint = seq2_cp;
+                                            is_hunting = 0u32;
                                         }
-                                        q += l2 as usize;
+                                        search_byte_pos += seq2_len as usize;
                                     }
                                 }
-                                let mut pair_alive = 0u32;
-                                if second != 0u32 {
-                                    let plo = sec_off[cp as usize];
-                                    let phi = sec_off[cp as usize + 1usize];
-                                    let mut lo2 = plo;
-                                    let mut hi2 = phi;
-                                    while lo2 < hi2 {
-                                        let mid = (lo2 + hi2) / 2u32;
-                                        if sec_val[mid as usize] < second {
-                                            lo2 = mid + 1u32;
+                                let mut is_pair_alive = 0u32;
+                                if second_codepoint != 0u32 {
+                                    let sec_start = secondary_offsets[codepoint as usize];
+                                    let sec_end = secondary_offsets[codepoint as usize + 1usize];
+                                    let mut bin_lo = sec_start;
+                                    let mut bin_hi = sec_end;
+                                    while bin_lo < bin_hi {
+                                        let bin_mid = (bin_lo + bin_hi) / 2u32;
+                                        if secondary_values[bin_mid as usize] < second_codepoint {
+                                            bin_lo = bin_mid + 1u32;
                                         }
-                                        if sec_val[mid as usize] >= second {
-                                            hi2 = mid;
+                                        if secondary_values[bin_mid as usize] >= second_codepoint {
+                                            bin_hi = bin_mid;
                                         }
                                     }
-                                    if lo2 < phi && sec_val[lo2 as usize] == second {
-                                        pair_alive = 1u32;
+                                    if bin_lo < sec_end && secondary_values[bin_lo as usize] == second_codepoint {
+                                        is_pair_alive = 1u32;
                                     }
                                 }
-                                if pair_alive == 1u32 {
-                                    let mut skey = Array::<u32>::new(seq_max as usize);
-                                    let mut klen = 0u32;
-                                    let mut p = id;
-                                    let mut alive = 1u32;
-                                    while alive == 1u32 && p < stop && klen < seq_max {
-                                        let len2 = seq_len_at(bytes, p, n);
-                                        let cp2 = cp_at(bytes, p, len2, n);
-                                        let dead = if len2 == 0u32 || cp2 == 0x0Au32 || cp2 == 0xFE0Eu32 {
+                                if is_pair_alive == 1u32 {
+                                    let mut sequence_key = Array::<u32>::new(seq_max as usize);
+                                    let mut key_length = 0u32;
+                                    let mut scan_byte_pos = byte_index;
+                                    let mut is_alive = 1u32;
+                                    while is_alive == 1u32 && scan_byte_pos < item_end_byte && key_length < seq_max {
+                                        let scan_len = seq_len_at(bytes, scan_byte_pos, total_bytes);
+                                        let scan_cp = cp_at(bytes, scan_byte_pos, scan_len, total_bytes);
+                                        let is_dead = if scan_len == 0u32 || scan_cp == 0x0Au32 || scan_cp == 0xFE0Eu32 {
                                             1u32
                                         } else {
                                             0u32
                                         };
-                                        if dead == 1u32 {
-                                            alive = 0u32;
+                                        if is_dead == 1u32 {
+                                            is_alive = 0u32;
                                         }
-                                        if dead == 0u32 {
-                                            if cp2 != 0xFE0Fu32 {
-                                                skey[klen as usize] = cp2;
-                                                klen += 1u32;
+                                        if is_dead == 0u32 {
+                                            if scan_cp != 0xFE0Fu32 {
+                                                sequence_key[key_length as usize] = scan_cp;
+                                                key_length += 1u32;
                                             }
-                                            p += len2 as usize;
+                                            scan_byte_pos += scan_len as usize;
                                         }
                                     }
-                                    let stride = 2u32 + seq_max;
-                                    let seq_count = (seq.len() / stride as usize) as u32;
-                                    let mut elen = if klen < seq_max { klen } else { seq_max };
-                                    let mut slot = 0u32;
-                                    let mut need = 0u32;
-                                    while elen >= 2u32 && slot == 0u32 {
-                                        let mut lo = 0u32;
-                                        let mut hi = seq_count;
-                                        while lo < hi {
-                                            let mid = (lo + hi) / 2u32;
-                                            let eoff = mid as usize * stride as usize;
-                                            let entry_len = seq[eoff + 1];
-                                            let kmax = if entry_len < elen { entry_len } else { elen };
-                                            let mut ord = 0i32;
-                                            let mut k = 0u32;
-                                            while k < kmax && ord == 0i32 {
-                                                let want = seq[eoff + 2 + k as usize];
-                                                let probe = skey[k as usize];
-                                                if probe < want {
-                                                    ord = -1i32;
+                                    let table_stride = 2u32 + seq_max;
+                                    let total_sequences = (sequence_table.len() / table_stride as usize) as u32;
+                                    let mut current_match_len = if key_length < seq_max { key_length } else { seq_max };
+                                    let mut matched_slot = 0u32;
+                                    let mut matched_len = 0u32;
+                                    while current_match_len >= 2u32 && matched_slot == 0u32 {
+                                        let mut seq_search_lo = 0u32;
+                                        let mut seq_search_hi = total_sequences;
+                                        while seq_search_lo < seq_search_hi {
+                                            let seq_search_mid = (seq_search_lo + seq_search_hi) / 2u32;
+                                            let entry_offset = seq_search_mid as usize * table_stride as usize;
+                                            let entry_sequence_len = sequence_table[entry_offset + 1];
+                                            let probe_compare_len = if entry_sequence_len < current_match_len { entry_sequence_len } else { current_match_len };
+                                            let mut comparison_order = 0i32;
+                                            let mut compare_step = 0u32;
+                                            while compare_step < probe_compare_len && comparison_order == 0i32 {
+                                                let target_codepoint = sequence_table[entry_offset + 2 + compare_step as usize];
+                                                let probe_codepoint = sequence_key[compare_step as usize];
+                                                if probe_codepoint < target_codepoint {
+                                                    comparison_order = -1i32;
                                                 }
-                                                if ord == 0i32 && probe > want {
-                                                    ord = 1i32;
+                                                if comparison_order == 0i32 && probe_codepoint > target_codepoint {
+                                                    comparison_order = 1i32;
                                                 }
-                                                k += 1u32;
+                                                compare_step += 1u32;
                                             }
-                                            if ord == 0i32 {
-                                                if entry_len < elen {
-                                                    ord = 1i32;
+                                            if comparison_order == 0i32 {
+                                                if entry_sequence_len < current_match_len {
+                                                    comparison_order = 1i32;
                                                 }
-                                                if entry_len > elen {
-                                                    ord = -1i32;
+                                                if entry_sequence_len > current_match_len {
+                                                    comparison_order = -1i32;
                                                 }
                                             }
-                                            if ord < 0i32 {
-                                                hi = mid;
+                                            if comparison_order < 0i32 {
+                                                seq_search_hi = seq_search_mid;
                                             }
-                                            if ord > 0i32 {
-                                                lo = mid + 1u32;
+                                            if comparison_order > 0i32 {
+                                                seq_search_lo = seq_search_mid + 1u32;
                                             }
-                                            if ord == 0i32 {
-                                                slot = seq[eoff];
-                                                need = elen;
-                                                lo = hi;
+                                            if comparison_order == 0i32 {
+                                                matched_slot = sequence_table[entry_offset];
+                                                matched_len = current_match_len;
+                                                seq_search_lo = seq_search_hi;
                                             }
                                         }
-                                        elen -= 1u32;
+                                        current_match_len -= 1u32;
                                     }
-                                    if slot != 0u32 {
-                                        let mut got2 = 0u32;
-                                        let mut p2 = id;
-                                        let mut send = id as u32;
-                                        let mut alive2 = 1u32;
-                                        while alive2 == 1u32 && p2 < stop {
-                                            let len3 = seq_len_at(bytes, p2, n);
-                                            let cp3 = cp_at(bytes, p2, len3, n);
-                                            let dead3 = if len3 == 0u32 || cp3 == 0x0Au32 || cp3 == 0xFE0Eu32 {
+                                    if matched_slot != 0u32 {
+                                        let mut collected_codepoint_count = 0u32;
+                                        let mut end_scan_byte_pos = byte_index;
+                                        let mut matched_end_byte = byte_index as u32;
+                                        let mut is_end_scan_alive = 1u32;
+                                        while is_end_scan_alive == 1u32 && end_scan_byte_pos < item_end_byte {
+                                            let end_scan_len = seq_len_at(bytes, end_scan_byte_pos, total_bytes);
+                                            let end_scan_cp = cp_at(bytes, end_scan_byte_pos, end_scan_len, total_bytes);
+                                            let is_end_scan_dead = if end_scan_len == 0u32 || end_scan_cp == 0x0Au32 || end_scan_cp == 0xFE0Eu32 {
                                                 1u32
                                             } else {
                                                 0u32
                                             };
-                                            if dead3 == 1u32 {
-                                                alive2 = 0u32;
+                                            if is_end_scan_dead == 1u32 {
+                                                is_end_scan_alive = 0u32;
                                             }
-                                            if dead3 == 0u32 {
-                                                if cp3 != 0xFE0Fu32 {
-                                                    got2 += 1u32;
-                                                    if got2 == need {
-                                                        send = (p2 + len3 as usize) as u32;
+                                            if is_end_scan_dead == 0u32 {
+                                                if end_scan_cp != 0xFE0Fu32 {
+                                                    collected_codepoint_count += 1u32;
+                                                    if collected_codepoint_count == matched_len {
+                                                        matched_end_byte = (end_scan_byte_pos + end_scan_len as usize) as u32;
                                                     }
                                                 }
-                                                p2 += len3 as usize;
+                                                end_scan_byte_pos += end_scan_len as usize;
                                             }
                                         }
-                                        let idx = ctotal[0].fetch_add(1);
-                                        if (idx as usize) < c_cap {
-                                            hp[idx as usize] = id as u32;
-                                            cslot[idx as usize] = slot;
-                                            cend[idx as usize] = send;
+                                        let candidate_index = candidate_total_atomic[0].fetch_add(1);
+                                        if (candidate_index as usize) < candidate_capacity {
+                                            candidate_head_positions[candidate_index as usize] = byte_index as u32;
+                                            candidate_slots[candidate_index as usize] = matched_slot;
+                                            candidate_end_positions[candidate_index as usize] = matched_end_byte;
                                         }
                                     }
                                 }
                             }
                         }
                     }
-                    word |= flag << ((lane as u32) * 8u32);
+                    packed_word |= flag << ((lane as u32) * 8u32);
                 } else {
-                    sm[id] = f32::from_bits(0u32);
-                    gi[id] = 0u32;
-                    hgt[id] = f32::from_bits(0u32);
+                    advance_widths[byte_index] = f32::from_bits(0u32);
+                    glyph_indices[byte_index] = 0u32;
                 }
             }
             lane += 1usize;
         }
-        fl[w] = word;
+        glyph_flags[word_index] = packed_word;
     }
 }
 

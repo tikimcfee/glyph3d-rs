@@ -4,7 +4,7 @@ use std::cell::Cell;
 use cubecl::client::Client;
 use cubecl::server::Handle;
 use crate::atlas::TrieTable;
-use super::super::{pack_words, LC_STRIDE, LM_STRIDE, PARTIAL_COUNT_STRIDE};
+use super::super::{pack_words, PARTIAL_COUNT_STRIDE};
 use super::prep::ChainHostInputs;
 use super::InstanceInputs;
 
@@ -12,67 +12,47 @@ use super::InstanceInputs;
 pub(crate) struct ChainBuffers {
     // Input / constant tables
     pub h_bytes: Option<Handle>,
-    pub h_bi: Option<Handle>,
-    pub h_bm: Option<Handle>,
-    pub h_bc: Option<Handle>,
-    pub h_seq: Option<Handle>,
-    pub h_bmap: Option<Handle>,
-    pub h_poff: Option<Handle>,
-    pub h_pval: Option<Handle>,
-    pub h_ir: Handle,
-    pub h_ic: Option<Handle>,
-    pub h_ie: Option<Handle>,
-    pub h_im: Option<Handle>,
-    pub h_gap: Option<Handle>,
-    pub h_plan: Option<Handle>,
-    pub h_rmax: Option<Handle>,
-    pub h_xmax: Option<Handle>,
-    pub h_extent: Option<Handle>,
-    pub bi_len: usize,
-    pub bm_len: usize,
-    pub bc_len: usize,
-    pub bshift: u32,
+    pub h_trie_block_indices: Option<Handle>,
+    pub h_trie_block_metrics: Option<Handle>,
+    pub h_trie_block_codepoints: Option<Handle>,
+    pub h_cluster_sequence_table: Option<Handle>,
+    pub h_cluster_bitmap: Option<Handle>,
+    pub h_cluster_secondary_offsets: Option<Handle>,
+    pub h_cluster_secondary_values: Option<Handle>,
+    pub h_item_record_bounds: Handle,
+    pub h_item_cluster_enabled: Option<Handle>,
+    pub h_item_descriptors: Option<Handle>,
+    pub h_walk_plan: Option<Handle>,
+    pub h_max_row_extents: Option<Handle>,
+    pub trie_block_indices_len: usize,
+    pub trie_block_metrics_len: usize,
+    pub trie_block_codepoints_len: usize,
+    pub trie_block_shift: u32,
 
     // Intermediate pass buffers
-    pub h_fl: Handle,
-    pub h_sm: Handle,
-    pub h_gi: Handle,
-    pub h_hgt: Handle,
-    pub h_cslot: Option<Handle>,
-    pub h_cend: Option<Handle>,
-    pub h_tc: Option<Handle>,
-    pub h_tm: Option<Handle>,
-    pub h_xc: Option<Handle>,
-    pub h_xm: Option<Handle>,
-    pub h_lc: Option<Handle>,
-    pub h_wm: Option<Handle>,
-    pub h_wc: Handle,
-    pub h_otb: Option<Handle>,
-    pub h_lm: Handle,
-    pub h_ctotal: Option<Handle>,
-    pub h_hp: Option<Handle>,
-    pub c_cap: usize,
-    pub cstride: usize,
+    pub h_glyph_flags: Handle,
+    pub h_advance_widths: Handle,
+    pub h_glyph_indices: Handle,
+    pub h_candidate_slots: Option<Handle>,
+    pub h_candidate_end_positions: Option<Handle>,
+    pub h_tile_counts: Option<Handle>,
+    pub h_tile_metrics: Option<Handle>,
+    pub h_spine_counts: Option<Handle>,
+    pub h_spine_metrics: Option<Handle>,
+    pub h_candidate_total: Option<Handle>,
+    pub h_candidate_head_positions: Option<Handle>,
+    pub candidate_capacity: usize,
+    pub candidate_stride: usize,
     pub cluster_allocs: Option<ClusterCandidateAllocs>,
 
-    // Survivor scan buffers
-    pub h_ltc: Option<Handle>,
-    pub h_stc: Option<Handle>,
-    pub h_lup: Option<Handle>,
-    pub h_sup: Option<Handle>,
-    pub h_lxc: Option<Handle>,
-    pub h_sxc: Option<Handle>,
-    pub h_lgrand: Option<Handle>,
-    pub h_sgrand: Option<Handle>,
-    pub h_totals: Option<Handle>,
-
     // Extent & tail inputs
-    pub h_ext: Handle,
-    pub h_pr_colors: Handle,
-    pub h_color_base: Handle,
-    pub h_is_pr: Handle,
-    pub h_flat_colors: Handle,
-    pub h_groups: Handle,
+    pub h_item_extents: Handle,
+    pub h_per_record_semantic_colors: Handle,
+    pub h_instance_slots: Handle,
+    pub h_instance_tints: Handle,
+    pub per_record_colors_words: usize,
+    pub slots_words: usize,
+    pub tint_words: usize,
 }
 
 #[derive(Clone)]
@@ -84,9 +64,9 @@ pub(crate) struct ClusterCandidateAllocs {
     pub h_d_a: Handle,
     pub h_d_b: Handle,
     pub h_roots: Handle,
-    pub c_cap: usize,
+    pub candidate_capacity: usize,
     pub kmax: usize,
-    pub cstride: usize,
+    pub candidate_stride: usize,
 }
 
 impl ChainBuffers {
@@ -94,44 +74,29 @@ impl ChainBuffers {
     /// This frees ~28 B per corpus byte before slot scatter / records emission.
     pub(crate) fn release_pre_survivor(&mut self) {
         self.h_bytes = None;
-        self.h_bi = None;
-        self.h_bm = None;
-        self.h_bc = None;
-        self.h_seq = None;
-        self.h_bmap = None;
-        self.h_poff = None;
-        self.h_pval = None;
-        self.h_ic = None;
-        self.h_ie = None;
-        self.h_im = None;
-        self.h_gap = None;
-        self.h_plan = None;
-        self.h_rmax = None;
-        self.h_xmax = None;
-        self.h_extent = None;
-        self.h_cslot = None;
-        self.h_cend = None;
-        self.h_tc = None;
-        self.h_tm = None;
-        self.h_xc = None;
-        self.h_xm = None;
-        self.h_wm = None;
-        self.h_otb = None;
-        self.h_hp = None;
+        self.h_trie_block_indices = None;
+        self.h_trie_block_metrics = None;
+        self.h_trie_block_codepoints = None;
+        self.h_cluster_sequence_table = None;
+        self.h_cluster_bitmap = None;
+        self.h_cluster_secondary_offsets = None;
+        self.h_cluster_secondary_values = None;
+        self.h_item_cluster_enabled = None;
+        self.h_item_descriptors = None;
+        self.h_walk_plan = None;
+        self.h_max_row_extents = None;
+        self.h_candidate_slots = None;
+        self.h_candidate_end_positions = None;
+        self.h_tile_counts = None;
+        self.h_tile_metrics = None;
+        self.h_spine_counts = None;
+        self.h_spine_metrics = None;
+        self.h_candidate_head_positions = None;
         self.cluster_allocs = None;
-        self.h_ltc = None;
-        self.h_stc = None;
-        self.h_lup = None;
-        self.h_lxc = None;
-        self.h_lgrand = None;
-        self.h_sgrand = None;
-        self.h_totals = None;
     }
 
     pub(crate) fn release_survivor_scan(&mut self) {
-        self.h_sup = None;
-        self.h_sxc = None;
-        self.h_ctotal = None;
+        self.h_candidate_total = None;
     }
 }
 
@@ -148,12 +113,11 @@ pub(crate) fn allocate_chain_buffers(
     inputs: &ChainHostInputs,
     instance_inputs: &InstanceInputs,
     trie: &TrieTable,
-    wants_instances: bool,
+    needs_tint: bool,
 ) -> BufferAllocationResult {
     let n = bytes.len();
     let n_words = inputs.n_words;
     let n_tiles = inputs.n_tiles;
-    let units = inputs.units;
 
     let live = Cell::new(0u64);
     let alloc_empty = |size: usize| {
@@ -166,74 +130,66 @@ pub(crate) fn allocate_chain_buffers(
     };
 
     let packed = pack_words(bytes);
-    let (bi, bm, bc, bshift) = trie.device_tables();
-    let bi_len = bi.len();
-    let bm_len = bm.len();
-    let bc_len = bc.len();
+    let (trie_block_indices, trie_block_metrics, trie_block_codepoints, trie_block_shift) = trie.device_tables();
+    let trie_block_indices_len = trie_block_indices.len();
+    let trie_block_metrics_len = trie_block_metrics.len();
+    let trie_block_codepoints_len = trie_block_codepoints.len();
 
     let h_bytes = alloc_upload(bytemuck::cast_slice(&packed));
-    let h_bi = alloc_upload(bytemuck::cast_slice(&bi));
-    let h_bm = alloc_upload(bytemuck::cast_slice(&bm));
-    let h_bc = alloc_upload(bytemuck::cast_slice(&bc));
-    let h_seq = alloc_upload(bytemuck::cast_slice(&inputs.seq));
-    let h_bmap = alloc_upload(bytemuck::cast_slice(&inputs.bitmap));
-    let h_poff = alloc_upload(bytemuck::cast_slice(&inputs.poff));
-    let h_pval = alloc_upload(bytemuck::cast_slice(&inputs.pval));
-    let h_ir = alloc_upload(bytemuck::cast_slice(&inputs.ir));
-    let h_ic = alloc_upload(bytemuck::cast_slice(&inputs.ic));
-    let h_ie = alloc_upload(bytemuck::cast_slice(&inputs.ie));
-    let h_im = alloc_upload(bytemuck::cast_slice(&inputs.im));
-    let h_gap = alloc_upload(bytemuck::cast_slice(&inputs.page_gap_x));
-    let h_fl = alloc_empty(n_words * 4);
-    let h_sm = alloc_empty(n * 4);
-    let h_gi = alloc_empty(n * 4);
-    let h_hgt = alloc_empty(n * 4);
-    let h_tc = alloc_empty(n_tiles * PARTIAL_COUNT_STRIDE * 4);
-    let h_tm = alloc_empty(n_tiles * 4);
-    let h_xc = alloc_empty(n_tiles * PARTIAL_COUNT_STRIDE * 4);
-    let h_xm = alloc_empty(n_tiles * 4);
-    let h_lc = alloc_empty(n * LC_STRIDE * 4);
-    let h_wm = alloc_empty(4);
-    let h_wc = alloc_empty(n * 4);
-    let h_otb = alloc_empty(n * 4);
-    let h_lm = alloc_empty(n * LM_STRIDE * 4);
-    let h_rmax = alloc_upload(bytemuck::cast_slice(&vec![0u32; item_count]));
-    let h_xmax = alloc_upload(bytemuck::cast_slice(&vec![0u32; item_count]));
-    let h_extent = alloc_upload(bytemuck::cast_slice(&inputs.extent_words));
-    let h_plan = alloc_upload(bytemuck::cast_slice(&inputs.walk_plan));
-    let c_cap = 16384usize.min(n.max(256));
-    let cstride = c_cap + 1;
-    let h_hp = alloc_empty(cstride * 4);
-    let h_cslot = alloc_empty(cstride * 4);
-    let h_cend = alloc_empty(cstride * 4);
-    let h_ctotal = alloc_upload(&[0u8; 4]);
-    let h_ltc = alloc_empty(n_tiles * 4);
-    let h_stc = alloc_empty(n_tiles * 4);
-    let h_lup = alloc_empty(n_tiles * units * 4);
-    let h_sup = alloc_empty(n_tiles * units * 4);
-    let h_lxc = alloc_empty(n_tiles * 4);
-    let h_sxc = alloc_empty(n_tiles * 4);
-    let h_lgrand = alloc_empty(4);
-    let h_sgrand = alloc_empty(4);
-    let h_totals = alloc_empty(item_count.max(1) * 2 * 4);
-    let h_ext = alloc_upload(bytemuck::cast_slice(&inputs.ext_seed));
-    let h_pr_colors = if wants_instances && !instance_inputs.per_record_colors.is_empty() {
-        alloc_upload(bytemuck::cast_slice(&instance_inputs.per_record_colors))
+    let h_trie_block_indices = alloc_upload(bytemuck::cast_slice(&trie_block_indices));
+    let h_trie_block_metrics = alloc_upload(bytemuck::cast_slice(&trie_block_metrics));
+    let h_trie_block_codepoints = alloc_upload(bytemuck::cast_slice(&trie_block_codepoints));
+    let h_cluster_sequence_table = alloc_upload(bytemuck::cast_slice(&inputs.seq));
+    let h_cluster_bitmap = alloc_upload(bytemuck::cast_slice(&inputs.bitmap));
+    let h_cluster_secondary_offsets = alloc_upload(bytemuck::cast_slice(&inputs.pair_secondary_offsets));
+    let h_cluster_secondary_values = alloc_upload(bytemuck::cast_slice(&inputs.pair_secondary_values));
+    let h_item_record_bounds = alloc_upload(bytemuck::cast_slice(&inputs.item_record_bounds));
+    let h_item_cluster_enabled = alloc_upload(bytemuck::cast_slice(&inputs.item_cluster_enabled));
+    let h_item_descriptors = alloc_upload(bytemuck::cast_slice(&inputs.item_descriptors));
+    let h_glyph_flags = alloc_empty(n_words * 4);
+    let h_advance_widths = alloc_empty(n * 4);
+    let h_glyph_indices = alloc_empty(n * 4);
+    // Note: h_glyph_heights is eliminated; quad height is constant CELL_HEIGHT_WORLD = 1.0.
+    let h_tile_counts = alloc_empty(n_tiles * PARTIAL_COUNT_STRIDE * 4);
+    let h_tile_metrics = alloc_empty(n_tiles * 4);
+    let h_spine_counts = alloc_empty(n_tiles * PARTIAL_COUNT_STRIDE * 4);
+    let h_spine_metrics = alloc_empty(n_tiles * 4);
+    let h_max_row_extents = alloc_upload(bytemuck::cast_slice(&inputs.extent_words));
+    let h_walk_plan = alloc_upload(bytemuck::cast_slice(&inputs.walk_plan));
+    let candidate_capacity = 16384usize.min(n.max(256));
+    let candidate_stride = candidate_capacity + 1;
+    let h_candidate_head_positions = alloc_empty(candidate_stride * 4);
+    let h_candidate_slots = alloc_empty(candidate_stride * 4);
+    let h_candidate_end_positions = alloc_empty(candidate_stride * 4);
+    let h_candidate_total = alloc_upload(&[0u8; 4]);
+    let h_item_extents = alloc_upload(bytemuck::cast_slice(&inputs.ext_seed));
+    let (h_per_record_semantic_colors, per_record_colors_words) = if !instance_inputs.per_record_colors.is_empty() {
+        let len = instance_inputs.per_record_colors.len();
+        (alloc_upload(bytemuck::cast_slice(&instance_inputs.per_record_colors)), len)
     } else {
-        alloc_empty(4)
+        (alloc_empty(4), 1)
     };
-    let h_color_base = alloc_upload(bytemuck::cast_slice(&instance_inputs.color_base));
-    let h_is_pr = alloc_upload(bytemuck::cast_slice(&instance_inputs.is_per_record));
-    let h_flat_colors = alloc_upload(bytemuck::cast_slice(&instance_inputs.flat_colors));
-    let h_groups = alloc_upload(bytemuck::cast_slice(&instance_inputs.groups));
+    let total_slots = inputs.total_slots;
+    let (h_instance_slots, slots_words) = (
+        alloc_empty(total_slots.max(1) as usize * 8 * 4),
+        total_slots.max(1) as usize * 8,
+    );
+    let (h_instance_tints, tint_words) = if needs_tint {
+        (
+            alloc_empty(total_slots.max(1) as usize * 2 * 4),
+            total_slots.max(1) as usize * 2,
+        )
+    } else {
+        (alloc_empty(4), 1)
+    };
     let cluster_allocs = if inputs.has_cluster {
-        let kmax = ((c_cap as u32 + 1).next_power_of_two().trailing_zeros()) as usize;
-        let h_lvl = alloc_empty(kmax * cstride * 4);
-        let h_parent = alloc_empty(cstride * 4);
-        let h_parent_b = alloc_empty(cstride * 4);
-        let h_d0 = alloc_empty(cstride * 4);
-        let h_d_a = alloc_empty(cstride * 4);
-        let h_d_b = alloc_empty(cstride * 4);
+        let kmax = ((candidate_capacity as u32 + 1).next_power_of_two().trailing_zeros()) as usize;
+        let h_lvl = alloc_empty(kmax * candidate_stride * 4);
+        let h_parent = alloc_empty(candidate_stride * 4);
+        let h_parent_b = alloc_empty(candidate_stride * 4);
+        let h_d0 = alloc_empty(candidate_stride * 4);
+        let h_d_a = alloc_empty(candidate_stride * 4);
+        let h_d_b = alloc_empty(candidate_stride * 4);
         let h_roots = alloc_empty(item_count.max(1) * 4);
         Some(ClusterCandidateAllocs {
             h_lvl,
@@ -243,9 +199,9 @@ pub(crate) fn allocate_chain_buffers(
             h_d_a,
             h_d_b,
             h_roots,
-            c_cap,
+            candidate_capacity,
             kmax,
-            cstride,
+            candidate_stride,
         })
     } else {
         None
@@ -254,61 +210,43 @@ pub(crate) fn allocate_chain_buffers(
     BufferAllocationResult {
         buffers: ChainBuffers {
             h_bytes: Some(h_bytes),
-            h_bi: Some(h_bi),
-            h_bm: Some(h_bm),
-            h_bc: Some(h_bc),
-            h_seq: Some(h_seq),
-            h_bmap: Some(h_bmap),
-            h_poff: Some(h_poff),
-            h_pval: Some(h_pval),
-            h_ir,
-            h_ic: Some(h_ic),
-            h_ie: Some(h_ie),
-            h_im: Some(h_im),
-            h_gap: Some(h_gap),
-            h_plan: Some(h_plan),
-            h_rmax: Some(h_rmax),
-            h_xmax: Some(h_xmax),
-            h_extent: Some(h_extent),
-            bi_len,
-            bm_len,
-            bc_len,
-            bshift,
-            h_fl,
-            h_sm,
-            h_gi,
-            h_hgt,
-            h_cslot: Some(h_cslot),
-            h_cend: Some(h_cend),
-            h_tc: Some(h_tc),
-            h_tm: Some(h_tm),
-            h_xc: Some(h_xc),
-            h_xm: Some(h_xm),
-            h_lc: Some(h_lc),
-            h_wm: Some(h_wm),
-            h_wc,
-            h_otb: Some(h_otb),
-            h_lm,
-            h_ctotal: Some(h_ctotal),
-            h_hp: Some(h_hp),
-            c_cap,
-            cstride,
+            h_trie_block_indices: Some(h_trie_block_indices),
+            h_trie_block_metrics: Some(h_trie_block_metrics),
+            h_trie_block_codepoints: Some(h_trie_block_codepoints),
+            h_cluster_sequence_table: Some(h_cluster_sequence_table),
+            h_cluster_bitmap: Some(h_cluster_bitmap),
+            h_cluster_secondary_offsets: Some(h_cluster_secondary_offsets),
+            h_cluster_secondary_values: Some(h_cluster_secondary_values),
+            h_item_record_bounds,
+            h_item_cluster_enabled: Some(h_item_cluster_enabled),
+            h_item_descriptors: Some(h_item_descriptors),
+            h_walk_plan: Some(h_walk_plan),
+            h_max_row_extents: Some(h_max_row_extents),
+            trie_block_indices_len,
+            trie_block_metrics_len,
+            trie_block_codepoints_len,
+            trie_block_shift,
+            h_glyph_flags,
+            h_advance_widths,
+            h_glyph_indices,
+            h_candidate_slots: Some(h_candidate_slots),
+            h_candidate_end_positions: Some(h_candidate_end_positions),
+            h_tile_counts: Some(h_tile_counts),
+            h_tile_metrics: Some(h_tile_metrics),
+            h_spine_counts: Some(h_spine_counts),
+            h_spine_metrics: Some(h_spine_metrics),
+            h_candidate_total: Some(h_candidate_total),
+            h_candidate_head_positions: Some(h_candidate_head_positions),
+            candidate_capacity,
+            candidate_stride,
             cluster_allocs,
-            h_ltc: Some(h_ltc),
-            h_stc: Some(h_stc),
-            h_lup: Some(h_lup),
-            h_sup: Some(h_sup),
-            h_lxc: Some(h_lxc),
-            h_sxc: Some(h_sxc),
-            h_lgrand: Some(h_lgrand),
-            h_sgrand: Some(h_sgrand),
-            h_totals: Some(h_totals),
-            h_ext,
-            h_pr_colors,
-            h_color_base,
-            h_is_pr,
-            h_flat_colors,
-            h_groups,
+            h_item_extents,
+            h_per_record_semantic_colors,
+            h_instance_slots,
+            h_instance_tints,
+            per_record_colors_words,
+            slots_words,
+            tint_words,
         },
         live_bytes: live.get(),
     }

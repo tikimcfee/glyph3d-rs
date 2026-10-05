@@ -95,8 +95,8 @@ fn marshal(
     Vec<crate::fold::Item>,
     crate::cubecl_chain::InstanceInputs,
 ) {
-    let _sp = tracing::info_span!("cubecl.marshal", items = items.len()).entered();
-    let mut bytes = Vec::new();
+    let total_bytes: usize = items.iter().map(|it| it.bytes.len()).sum();
+    let mut bytes = Vec::with_capacity(total_bytes);
     let mut fis = Vec::with_capacity(items.len());
     let mut per_record_colors: Vec<u32> = Vec::new();
     let mut color_base = vec![0u32; items.len()];
@@ -216,7 +216,7 @@ impl LayoutGlyphs for CubeclLayout {
             &bytes,
             &fis,
             &inputs,
-            crate::cubecl_chain::ChainMode::Instances,
+            false,
         );
         assert!(
             arena.is_empty(),
@@ -247,12 +247,9 @@ impl LayoutGlyphs for CubeclLayout {
 }
 
 impl VerifyLayout for CubeclLayout {
-    /// The verify path: BOTH tails. The arena gets the endpoint's device
-    /// slots exactly as the product path, and the 48 B wire form is
-    /// RECONSTRUCTED on host so `diff_backends` still sees instances:
-    /// the records stream carries row/col (and the blank lanes the slot
-    /// stream drops), the slot stream carries the render fields — both
-    /// bit-fenced against the engine, so their zip is the fenced instance.
+    /// The verify path: reconstructs 48 B GlyphInstance on host for diff_backends.
+    /// The 32 B slot stream carries the render fields from GPU, and records
+    /// are rederived on CPU to provide row/col.
     fn layout_validated_items_recording(
         &mut self,
         items: &[LayoutItem<'_>],
@@ -266,72 +263,47 @@ impl VerifyLayout for CubeclLayout {
             &bytes,
             &fis,
             &inputs,
-            crate::cubecl_chain::ChainMode::Both,
+            true,
         );
         assert!(
             arena.is_empty(),
             "the instance tail writes from slot 0 — a pre-filled arena would need the rebase the direct path carries"
         );
-        // The 48 B host arena the seam's diff expects, reconstructed from
-        // the two fenced streams: survivors are the records with gi != 0,
-        // in order (the survivor filter's own definition), zipped with the
-        // slot stream. The device buffer is NOT taken here — verify paths
-        // diff arenas host-side.
-        let mut convert = Duration::ZERO;
-        let mut all_records =
-            Vec::with_capacity(stream.total_records as usize);
-        let words = &stream.records;
-        for index in 0..items.len() {
-            let base = stream.rec_base[index] as usize;
-            let next = stream
-                .rec_base
-                .get(index + 1)
-                .map(|&b| b as usize)
-                .unwrap_or(stream.total_records as usize);
-            let t = Instant::now();
-            all_records.extend((base..next).map(|r| {
-                let w = r * 8;
-                GlyphRecord {
-                    measures: [
-                        f32::from_bits(words[w]),
-                        f32::from_bits(words[w + 1]),
-                        f32::from_bits(words[w + 2]),
-                        f32::from_bits(words[w + 3]),
-                        f32::from_bits(words[w + 4]),
-                    ],
-                    counts: [words[w + 5], words[w + 6], words[w + 7]],
-                }
-            }));
-            convert += t.elapsed();
+        let t_convert = Instant::now();
+        let trie = crate::default_trie();
+        let mut all_records = Vec::new();
+        for item in items {
+            all_records.extend(crate::layout_hyper::rederive_item_records(item.bytes, &item.params, &trie));
         }
+        let convert = t_convert.elapsed();
         let mut insts: Vec<GlyphInstance> = Vec::with_capacity(stream.total_slots as usize);
         let sw = &stream.slots;
-        let mut s = 0usize;
-        for r in &all_records {
-            if r.counts[0] == 0 {
+        let mut slot_index = 0usize;
+        for record in &all_records {
+            if record.counts[0] == 0 {
                 continue;
             }
-            let b = s * 8;
+            let slot_word_offset = slot_index * 8;
             insts.push(GlyphInstance {
                 pos: [
-                    f32::from_bits(sw[b]),
-                    f32::from_bits(sw[b + 1]),
-                    f32::from_bits(sw[b + 2]),
+                    f32::from_bits(sw[slot_word_offset]),
+                    f32::from_bits(sw[slot_word_offset + 1]),
+                    f32::from_bits(sw[slot_word_offset + 2]),
                 ],
-                glyph_id: sw[b + 3],
-                row: r.counts[1],
-                col: r.counts[2],
-                color: sw[b + 4],
-                group_id: sw[b + 5],
-                advance: f32::from_bits(sw[b + 6]),
-                height: f32::from_bits(sw[b + 7]),
+                glyph_id: sw[slot_word_offset + 3],
+                row: record.counts[1],
+                col: record.counts[2],
+                color: sw[slot_word_offset + 4],
+                group_id: sw[slot_word_offset + 5],
+                advance: f32::from_bits(sw[slot_word_offset + 6]),
+                height: f32::from_bits(sw[slot_word_offset + 7]),
                 flags: 0,
                 _pad: 0,
             });
-            s += 1;
+            slot_index += 1;
         }
         assert_eq!(
-            s,
+            slot_index,
             stream.total_slots as usize,
             "record/slot survivor zip drifted — the streams' own tiers should have caught it first"
         );

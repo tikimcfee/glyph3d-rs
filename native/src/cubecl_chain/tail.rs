@@ -20,51 +20,36 @@ use super::{F_LEADER, LC_COL, LC_ROW, LC_STRIDE, LM_STRIDE, LM_X, LM_Y, LM_Z, RE
 /// (the reference's own ord_to_byte is the independent compaction).
 #[cube(launch_unchecked)]
 pub(super) fn emit_records(
-    fl: &[u32],
-    wc: &[u32],
-    ir: &[u32],
-    base: &[u32],
-    lm: &[f32],
-    lc: &[u32],
-    sm: &[f32],
-    hgt: &[f32],
-    gi: &[u32],
-    recs: &mut [u32],
-    win: &[u32],
+    glyph_flags: &[u32],
+    item_record_ordinals: &[u32],
+    item_record_bounds: &[u32],
+    item_record_bases: &[u32],
+    layout_metrics: &[f32],
+    line_columns: &[u32],
+    advance_widths: &[f32],
+    glyph_heights: &[f32],
+    glyph_indices: &[u32],
+    wire_records: &mut [u32],
+    window_params: &[u32],
 ) {
-    // The window base rides a 1-element params BUFFER, not a comptime
-    // scalar: all windows reuse the ONE compiled kernel (a comptime
-    // rec_first cost a fresh JIT specialization per window — ~3.5s cold
-    // across six on the 97MB shape), and a buffer binds positionally like
-    // every other slice, clear of the scalar/info region where landmine 7
-    // lives. 0usize: bare int literals fail expansion (landmine 10).
-    let rec_first = win[0usize] as usize;
-    let b = ABSOLUTE_POS;
-    let n = wc.len();
-    let item_count = ir.len() / 2;
-    if b < n && item_count > 0 && flags_at(fl, b) & F_LEADER != 0 {
-            // wc is the FORWARD ordinal map (apply writes it on every
-            // path): this leader's item-relative ordinal. base is the
-            // per-item record offset — together the record stream is
-            // item order, ordinal order within items, exactly the
-            // engine's emission order. rec_first windows this launch at
-            // one CHUNK of the stream — the record buffer stays a fixed
-            // rolling slice instead of a whole-corpus allocation (the
-            // 97MB repo shape's 3.1GB single buffer was what pushed the
-            // instrument past the machine's memory ceiling).
-            let it = item_search(ir, item_count, b);
-            let o = base[it] + wc[b];
-            if o as usize >= rec_first && (o as usize - rec_first) < recs.len() / 8 {
-                    let w = (o as usize - rec_first) * 8;
-                recs[w] = lm[b * LM_STRIDE + LM_X].to_bits();
-                recs[w + 1] = lm[b * LM_STRIDE + LM_Y].to_bits();
-                recs[w + 2] = lm[b * LM_STRIDE + LM_Z].to_bits();
-                recs[w + 3] = sm[b].to_bits();
-                recs[w + 4] = hgt[b].to_bits();
-                recs[w + 5] = gi[b];
-                recs[w + 6] = lc[b * LC_STRIDE + LC_ROW];
-                recs[w + 7] = lc[b * LC_STRIDE + LC_COL];
-            }
+    let rec_first = window_params[0usize] as usize;
+    let record_index = ABSOLUTE_POS;
+    let total_records = item_record_ordinals.len();
+    let item_count = item_record_bounds.len() / 2;
+    if record_index < total_records && item_count > 0 && flags_at(glyph_flags, record_index) & F_LEADER != 0 {
+        let item_index = item_search(item_record_bounds, item_count, record_index);
+        let global_ordinal = item_record_bases[item_index] + item_record_ordinals[record_index];
+        if global_ordinal as usize >= rec_first && (global_ordinal as usize - rec_first) < wire_records.len() / 8 {
+            let record_offset = (global_ordinal as usize - rec_first) * 8;
+            wire_records[record_offset] = layout_metrics[record_index * LM_STRIDE + LM_X].to_bits();
+            wire_records[record_offset + 1] = layout_metrics[record_index * LM_STRIDE + LM_Y].to_bits();
+            wire_records[record_offset + 2] = layout_metrics[record_index * LM_STRIDE + LM_Z].to_bits();
+            wire_records[record_offset + 3] = advance_widths[record_index].to_bits();
+            wire_records[record_offset + 4] = glyph_heights[record_index].to_bits();
+            wire_records[record_offset + 5] = glyph_indices[record_index];
+            wire_records[record_offset + 6] = line_columns[record_index * LC_STRIDE + LC_ROW];
+            wire_records[record_offset + 7] = line_columns[record_index * LC_STRIDE + LC_COL];
+        }
     }
 }
 
@@ -92,308 +77,24 @@ pub(super) const EXT_STRIDE: usize = 10;
 /// lanes and decode their readback, so they must agree bit for bit with
 /// the #[cube] pair (unit-tested together).
 pub(super) fn ordered_key_host(v: f32) -> u32 {
-    let b = v.to_bits();
-    if (b & 0x8000_0000) != 0 {
-        !b
+    let bit_repr = v.to_bits();
+    if (bit_repr & 0x8000_0000) != 0 {
+        !bit_repr
     } else {
-        b | 0x8000_0000
+        bit_repr | 0x8000_0000
     }
 }
 
 pub(super) fn key_to_float_host(k: u32) -> f32 {
-    let b = if (k & 0x8000_0000) != 0 {
+    let float_bits = if (k & 0x8000_0000) != 0 {
         k & 0x7FFF_FFFF
     } else {
         !k
     };
-    f32::from_bits(b)
+    f32::from_bits(float_bits)
 }
 
-/// Unpack the leader flag and AND it with glyph-id-resolved into two plain
-/// u32 byte flags — the predicate inputs count_tile/count_spine already
-/// run on (any nonzero byte counts).
-/// Fused leader and survivor count per tile — computes both ltc/stc and lup/sup
-/// in a single dual-Blelloch pass directly over `fl` and `gi`. Eliminates the
-/// `survivor_flags` intermediate flags pass and fuses the two separate
-/// count_tile launches into one.
-#[cube(launch_unchecked)]
-pub(super) fn sv_count_tile(
-    fl: &[u32],
-    gi: &[u32],
-    ltc: &mut [u32],
-    stc: &mut [u32],
-    lup: &mut [u32],
-    sup: &mut [u32],
-    #[comptime] units: usize,
-    #[comptime] rake: usize,
-    #[comptime] log: usize,
-) {
-    let tile = CUBE_POS;
-    let u = UNIT_POS as usize;
-    let n = gi.len();
-    let lo = tile * (units * rake) + u * rake;
-    let hi = if lo + rake < n { lo + rake } else { n };
-    let mut cl = 0u32;
-    let mut cs = 0u32;
-    if lo < n {
-        let mut id = lo;
-        while id < hi {
-            let lead = if flags_at(fl, id) & F_LEADER != 0u32 { 1u32 } else { 0u32 };
-            cl += lead;
-            if lead != 0u32 && gi[id] != 0u32 {
-                cs += 1u32;
-            }
-            id += 1usize;
-        }
-    }
-    let mut scl = Shared::<[u32]>::new_slice(units);
-    let mut scs = Shared::<[u32]>::new_slice(units);
-    scl[u] = cl;
-    scs[u] = cs;
-    #[unroll]
-    for d in 0..log {
-        sync_cube();
-        let s = 1usize << d;
-        if (u + 1) & (2 * s - 1) == 0 {
-            scl[u] += scl[u - s];
-            scs[u] += scs[u - s];
-        }
-    }
-    sync_cube();
-    if u == units - 1 {
-        ltc[tile] = scl[u];
-        stc[tile] = scs[u];
-        scl[u] = 0u32;
-        scs[u] = 0u32;
-    }
-    #[unroll]
-    for d in 0..log {
-        sync_cube();
-        let s = units >> (d + 1);
-        if (u + 1) & (2 * s - 1) == 0 {
-            let tl = scl[u];
-            scl[u] += scl[u - s];
-            scl[u - s] = tl;
 
-            let ts = scs[u];
-            scs[u] += scs[u - s];
-            scs[u - s] = ts;
-        }
-    }
-    sync_cube();
-    lup[tile * units + u] = scl[u];
-    sup[tile * units + u] = scs[u];
-}
-
-/// Fused leader and survivor spine scan — reduces tile totals from `ltc` and `stc`
-/// across tiles in a single dual-Blelloch pass, writing exclusive tile bases `lxc`/`sxc`
-/// and grand totals `lgrand`/`sgrand`.
-#[cube(launch_unchecked)]
-pub(super) fn sv_count_spine(
-    ltc: &[u32],
-    stc: &[u32],
-    lxc: &mut [u32],
-    sxc: &mut [u32],
-    lgrand: &mut [u32],
-    sgrand: &mut [u32],
-    #[comptime] units: usize,
-    #[comptime] log: usize,
-) {
-    let u = UNIT_POS as usize;
-    let n_tiles = ltc.len();
-    let per = n_tiles.div_ceil(units);
-    let first = u * per;
-    let last = if first + per < n_tiles { first + per } else { n_tiles };
-    let mut accl = 0u32;
-    let mut accs = 0u32;
-    if first < n_tiles {
-        let mut t = first;
-        while t < last {
-            accl += ltc[t];
-            accs += stc[t];
-            t += 1usize;
-        }
-    }
-    let mut scl = Shared::<[u32]>::new_slice(units);
-    let mut scs = Shared::<[u32]>::new_slice(units);
-    scl[u] = accl;
-    scs[u] = accs;
-    #[unroll]
-    for d in 0..log {
-        sync_cube();
-        let s = 1usize << d;
-        if (u + 1) & (2 * s - 1) == 0 {
-            scl[u] += scl[u - s];
-            scs[u] += scs[u - s];
-        }
-    }
-    sync_cube();
-    if u == units - 1 {
-        scl[u] = 0u32;
-        scs[u] = 0u32;
-    }
-    #[unroll]
-    for d in 0..log {
-        sync_cube();
-        let s = units >> (d + 1);
-        if (u + 1) & (2 * s - 1) == 0 {
-            let tl = scl[u];
-            scl[u] += scl[u - s];
-            scl[u - s] = tl;
-
-            let ts = scs[u];
-            scs[u] += scs[u - s];
-            scs[u - s] = ts;
-        }
-    }
-    sync_cube();
-    let mut prel = scl[u];
-    let mut pres = scs[u];
-    if first < n_tiles {
-        for t in first..last {
-            lxc[t] = prel;
-            prel += ltc[t];
-
-            sxc[t] = pres;
-            pres += stc[t];
-        }
-        if last == n_tiles {
-            lgrand[0] = prel;
-            sgrand[0] = pres;
-        }
-    }
-}
-
-/// Global survivor ordinals written at every byte: `sv[id]` = survivors strictly
-/// before `id`. Global byte order is arena slot order, so `sv[id]` is a survivor's
-/// global slot index directly consumed by `scatter_slots`.
-#[allow(dead_code)]
-#[cube(launch_unchecked)]
-pub(super) fn ordinal_scatter(
-    fl: &[u32],
-    gi: &[u32],
-    sxc: &[u32],
-    sup: &[u32],
-    sv: &mut [u32],
-    #[comptime] units: usize,
-    #[comptime] rake: usize,
-) {
-    let tile = CUBE_POS;
-    let u = UNIT_POS as usize;
-    let n = sv.len();
-    let lo = tile * (units * rake) + u * rake;
-    let hi = if lo + rake < n { lo + rake } else { n };
-    let mut cs = sxc[tile] + sup[tile * units + u];
-    if lo < n {
-        let mut id = lo;
-        while id < hi {
-            let lead = if flags_at(fl, id) & F_LEADER != 0u32 { 1u32 } else { 0u32 };
-            let surv = if lead != 0u32 && gi[id] != 0u32 { 1u32 } else { 0u32 };
-            sv[id] = cs;
-            cs += surv;
-            id += 1usize;
-        }
-    }
-}
-
-/// Per-item leader and survivor totals computed directly from the spine + tile prefix
-/// sums and boundary byte scanning (at most `rake` iterations per boundary).
-/// Eliminates the need for any whole-corpus `lv` buffer.
-#[cube(launch_unchecked)]
-pub(super) fn item_totals(
-    ir: &[u32],
-    fl: &[u32],
-    gi: &[u32],
-    lxc: &[u32],
-    sxc: &[u32],
-    lup: &[u32],
-    sup: &[u32],
-    lgrand: &[u32],
-    sgrand: &[u32],
-    totals: &mut [u32],
-    #[comptime] units: usize,
-    #[comptime] rake: usize,
-) {
-    let it = ABSOLUTE_POS;
-    let item_count = ir.len() / 2;
-    if it < item_count {
-        let n = gi.len();
-        let s = ir[it * 2] as usize;
-        let e = ir[it * 2 + 1] as usize;
-
-        // Leader prefix at s and e
-        let ls = if s >= n {
-            lgrand[0]
-        } else {
-            let tile = s / (units * rake);
-            let u = (s % (units * rake)) / rake;
-            let lo = tile * (units * rake) + u * rake;
-            let mut c = lxc[tile] + lup[tile * units + u];
-            let mut id = lo;
-            while id < s {
-                if flags_at(fl, id) & F_LEADER != 0u32 {
-                    c += 1u32;
-                }
-                id += 1usize;
-            }
-            c
-        };
-        let le = if e >= n {
-            lgrand[0]
-        } else {
-            let tile = e / (units * rake);
-            let u = (e % (units * rake)) / rake;
-            let lo = tile * (units * rake) + u * rake;
-            let mut c = lxc[tile] + lup[tile * units + u];
-            let mut id = lo;
-            while id < e {
-                if flags_at(fl, id) & F_LEADER != 0u32 {
-                    c += 1u32;
-                }
-                id += 1usize;
-            }
-            c
-        };
-        totals[it * 2] = le - ls;
-
-        // Survivor prefix at s and e
-        let ss = if s >= n {
-            sgrand[0]
-        } else {
-            let tile = s / (units * rake);
-            let u = (s % (units * rake)) / rake;
-            let lo = tile * (units * rake) + u * rake;
-            let mut c = sxc[tile] + sup[tile * units + u];
-            let mut id = lo;
-            while id < s {
-                let lead = if flags_at(fl, id) & F_LEADER != 0u32 { 1u32 } else { 0u32 };
-                if lead != 0u32 && gi[id] != 0u32 {
-                    c += 1u32;
-                }
-                id += 1usize;
-            }
-            c
-        };
-        let se = if e >= n {
-            sgrand[0]
-        } else {
-            let tile = e / (units * rake);
-            let u = (e % (units * rake)) / rake;
-            let lo = tile * (units * rake) + u * rake;
-            let mut c = sxc[tile] + sup[tile * units + u];
-            let mut id = lo;
-            while id < e {
-                let lead = if flags_at(fl, id) & F_LEADER != 0u32 { 1u32 } else { 0u32 };
-                if lead != 0u32 && gi[id] != 0u32 {
-                    c += 1u32;
-                }
-                id += 1usize;
-            }
-            c
-        };
-        totals[it * 2 + 1] = se - ss;
-    }
-}
 
 /// The 32 B slot scatter — THE product tail (note 23, E2b). One thread
 /// per byte, writing the 8-word slot at the global survivor ordinal
@@ -413,98 +114,89 @@ pub(super) fn item_totals(
 /// `extent_fold`.)
 #[cube(launch_unchecked)]
 pub(super) fn scatter_slots(
-    fl: &[u32],
-    wc: &[u32],
-    ir: &[u32],
-    lm: &[f32],
-    sm: &[f32],
-    hgt: &[f32],
-    gi: &[u32],
-    pr_colors: &[u32],
-    color_base: &[u32],
-    is_per_record: &[u32],
-    flat_colors: &[u32],
-    groups: &[u32],
-    sxc: &[u32],
-    sup: &[u32],
-    out: &mut [u32],
-    tint: &mut [u32],
+    glyph_flags: &[u32],
+    item_record_ordinals: &[u32],
+    item_record_bounds: &[u32],
+    layout_metrics: &[f32],
+    advance_widths: &[f32],
+    glyph_heights: &[f32],
+    glyph_indices: &[u32],
+    per_record_semantic_colors: &[u32],
+    item_paint: &[u32],
+    survivor_tile_prefixes: &[u32],
+    survivor_unit_prefixes: &[u32],
+    instance_slots: &mut [u32],
+    instance_tints: &mut [u32],
     #[comptime] units: usize,
     #[comptime] rake: usize,
 ) {
     let tile = CUBE_POS;
-    let u = UNIT_POS as usize;
-    let n = wc.len();
-    let item_count = ir.len() / 2;
-    let lo = tile * (units * rake) + u * rake;
-    let hi = if lo + rake < n { lo + rake } else { n };
-    let mut cs = sxc[tile] + sup[tile * units + u];
-    if lo < n && item_count > 0 {
-        let mut it = item_search(ir, item_count, lo);
-        let mut nxt = if it + 1 < item_count { ir[(it + 1) * 2] as usize } else { n };
-        let mut cur_is_pr = is_per_record[it];
-        let mut cur_col_base = color_base[it];
-        let mut cur_flat_color = flat_colors[it];
-        let mut cur_group = groups[it];
+    let unit_pos = UNIT_POS as usize;
+    let total_records = item_record_ordinals.len();
+    let item_count = item_record_bounds.len() / 2;
+    let range_start = tile * (units * rake) + unit_pos * rake;
+    let range_end = if range_start + rake < total_records { range_start + rake } else { total_records };
+    let mut survivor_ordinal = survivor_tile_prefixes[tile] + survivor_unit_prefixes[tile * units + unit_pos];
+    if range_start < total_records && item_count > 0 {
+        let mut item_index = item_search(item_record_bounds, item_count, range_start);
+        let mut next_item_boundary = if item_index + 1 < item_count { item_record_bounds[(item_index + 1) * 2] as usize } else { total_records };
+        let mut cur_col_base = item_paint[item_index * 4];
+        let mut cur_is_pr = item_paint[item_index * 4 + 1];
+        let mut cur_flat_color = item_paint[item_index * 4 + 2];
+        let mut cur_group = item_paint[item_index * 4 + 3];
 
-        let mut cur_word_idx = (lo >> 2) + 1usize;
-        let mut fl_word = 0u32;
+        let mut cur_word_idx = (range_start >> 2) + 1usize;
+        let mut flag_word = 0u32;
 
-        let mut b = lo;
-        while b < hi {
-            if nxt <= b {
-                while nxt <= b {
-                    it += 1;
-                    nxt = if it + 1 < item_count { ir[(it + 1) * 2] as usize } else { n };
+        let mut record_index = range_start;
+        while record_index < range_end {
+            if next_item_boundary <= record_index {
+                while next_item_boundary <= record_index {
+                    item_index += 1;
+                    next_item_boundary = if item_index + 1 < item_count { item_record_bounds[(item_index + 1) * 2] as usize } else { total_records };
                 }
-                cur_is_pr = is_per_record[it];
-                cur_col_base = color_base[it];
-                cur_flat_color = flat_colors[it];
-                cur_group = groups[it];
+                cur_col_base = item_paint[item_index * 4];
+                cur_is_pr = item_paint[item_index * 4 + 1];
+                cur_flat_color = item_paint[item_index * 4 + 2];
+                cur_group = item_paint[item_index * 4 + 3];
             }
-            let word_idx = b >> 2;
+            let word_idx = record_index >> 2;
             if word_idx != cur_word_idx {
-                fl_word = fl[word_idx];
+                flag_word = glyph_flags[word_idx];
                 cur_word_idx = word_idx;
             }
-            let f = (fl_word >> (((b & 3) * 8) as u32)) & 0xFF;
-            if (f & F_LEADER) != 0 && gi[b] != 0u32 {
-                let w = cs as usize * 8;
+            let flag_byte = (flag_word >> (((record_index & 3) * 8) as u32)) & 0xFF;
+            if (flag_byte & F_LEADER) != 0 && glyph_indices[record_index] != 0u32 {
+                let slot_word_offset = survivor_ordinal as usize * 8;
                 let color = if cur_is_pr != 0u32 {
-                    pr_colors[(cur_col_base + wc[b]) as usize]
+                    per_record_semantic_colors[(cur_col_base + item_record_ordinals[record_index]) as usize]
                 } else {
                     cur_flat_color
                 };
-                // The tint stream: (glyph_id, color) per slot, slot order —
-                // seg_tint's bit-exact input once no host arena exists (the
-                // fold's order IS the arena's order, and both are sv order).
-                let t = cs as usize * 2;
-                if t + 2 <= tint.len() {
-                    tint[t] = gi[b];
-                    tint[t + 1] = color;
+                let tint_word_offset = survivor_ordinal as usize * 2;
+                if tint_word_offset + 2 <= instance_tints.len() {
+                    instance_tints[tint_word_offset] = glyph_indices[record_index];
+                    instance_tints[tint_word_offset + 1] = color;
                 }
-                // Whole-extent guard, not just the start: the 1-word dummy
-                // `out` of the extents-only Instances form must discard
-                // EVERY slot write, including the zeroth.
-                if w + 8 <= out.len() {
-                    let mo = b * LM_STRIDE;
-                    let x = lm[mo + LM_X];
-                    let y = lm[mo + LM_Y];
-                    let z = lm[mo + LM_Z];
-                    let adv = sm[b];
-                    let height = hgt[b];
-                    out[w] = x.to_bits();
-                    out[w + 1] = y.to_bits();
-                    out[w + 2] = z.to_bits();
-                    out[w + 3] = gi[b];
-                    out[w + 4] = color;
-                    out[w + 5] = cur_group;
-                    out[w + 6] = adv.to_bits();
-                    out[w + 7] = height.to_bits();
+                if slot_word_offset + 8 <= instance_slots.len() {
+                    let metric_offset = record_index * LM_STRIDE;
+                    let x = layout_metrics[metric_offset + LM_X];
+                    let y = layout_metrics[metric_offset + LM_Y];
+                    let z = layout_metrics[metric_offset + LM_Z];
+                    let adv = advance_widths[record_index];
+                    let height = glyph_heights[record_index];
+                    instance_slots[slot_word_offset] = x.to_bits();
+                    instance_slots[slot_word_offset + 1] = y.to_bits();
+                    instance_slots[slot_word_offset + 2] = z.to_bits();
+                    instance_slots[slot_word_offset + 3] = glyph_indices[record_index];
+                    instance_slots[slot_word_offset + 4] = color;
+                    instance_slots[slot_word_offset + 5] = cur_group;
+                    instance_slots[slot_word_offset + 6] = adv.to_bits();
+                    instance_slots[slot_word_offset + 7] = height.to_bits();
                 }
-                cs += 1u32;
+                survivor_ordinal += 1u32;
             }
-            b += 1usize;
+            record_index += 1usize;
         }
     }
 }
@@ -523,62 +215,62 @@ pub(super) fn scatter_slots(
 /// contraction-neutral by construction).
 #[cube(launch_unchecked)]
 pub(super) fn extent_fold(
-    fl: &[u32],
-    lm: &[f32],
-    sm: &[f32],
-    hgt: &[f32],
-    gi: &[u32],
-    ir: &[u32],
-    ext: &mut [Atomic<u32>],
+    glyph_flags: &[u32],
+    layout_metrics: &[f32],
+    advance_widths: &[f32],
+    glyph_heights: &[f32],
+    glyph_indices: &[u32],
+    item_record_bounds: &[u32],
+    item_extents_atomic: &mut [Atomic<u32>],
     #[comptime] units: usize,
     #[comptime] rake: usize,
 ) {
     let tile = CUBE_POS;
-    let u = UNIT_POS as usize;
-    let n = fl.len() * 4; // packed: words -> bytes
-    let item_count = ir.len() / 2;
-    let tile_lo = tile * (units * rake);
+    let unit_pos = UNIT_POS as usize;
+    let total_records = glyph_flags.len() * 4; // packed: words -> bytes
+    let item_count = item_record_bounds.len() / 2;
+    let tile_start = tile * (units * rake);
 
-    let sext = Shared::<[Atomic<u32>]>::new_slice(RESOLVE_SLOTS * EXT_STRIDE);
-    let sflags = Shared::<[Atomic<u32>]>::new_slice(RESOLVE_SLOTS);
-    let mut sbase = Shared::<u32>::new();
+    let shared_item_extents = Shared::<[Atomic<u32>]>::new_slice(RESOLVE_SLOTS * EXT_STRIDE);
+    let shared_item_flags = Shared::<[Atomic<u32>]>::new_slice(RESOLVE_SLOTS);
+    let mut shared_item_base = Shared::<u32>::new();
 
-    if u == 0 {
-        let mut b = 0usize;
-        if item_count > 0 && n > 0 {
-            let probe = if tile_lo < n { tile_lo } else { n - 1 };
-            b = item_search(ir, item_count, probe);
+    if unit_pos == 0 {
+        let mut probe_item_index = 0usize;
+        if item_count > 0 && total_records > 0 {
+            let probe = if tile_start < total_records { tile_start } else { total_records - 1 };
+            probe_item_index = item_search(item_record_bounds, item_count, probe);
         }
-        *sbase = b as u32;
+        *shared_item_base = probe_item_index as u32;
     }
 
     let zero_k = 0x8000_0000u32;
     let inf_k = 0xFF80_0000u32;
     let ninf_k = 0x007F_FFFFu32;
 
-    let mut z = u;
-    while z < RESOLVE_SLOTS {
-        sflags[z].store(0u32);
-        let e = z * EXT_STRIDE;
-        sext[e].store(zero_k);
-        sext[e + 1].store(zero_k);
-        sext[e + 2].store(zero_k);
-        sext[e + 3].store(zero_k);
-        sext[e + 4].store(inf_k);
-        sext[e + 5].store(inf_k);
-        sext[e + 6].store(ninf_k);
-        sext[e + 7].store(ninf_k);
-        sext[e + 8].store(inf_k);
-        sext[e + 9].store(ninf_k);
-        z += units;
+    let mut init_index = unit_pos;
+    while init_index < RESOLVE_SLOTS {
+        shared_item_flags[init_index].store(0u32);
+        let e = init_index * EXT_STRIDE;
+        shared_item_extents[e].store(zero_k);
+        shared_item_extents[e + 1].store(zero_k);
+        shared_item_extents[e + 2].store(zero_k);
+        shared_item_extents[e + 3].store(zero_k);
+        shared_item_extents[e + 4].store(inf_k);
+        shared_item_extents[e + 5].store(inf_k);
+        shared_item_extents[e + 6].store(ninf_k);
+        shared_item_extents[e + 7].store(ninf_k);
+        shared_item_extents[e + 8].store(inf_k);
+        shared_item_extents[e + 9].store(ninf_k);
+        init_index += units;
     }
     sync_cube();
-    let it_base = *sbase as usize;
+    let tile_item_base = *shared_item_base as usize;
 
-    let first_id = tile_lo + u;
-    if first_id < n && item_count > 0 {
-        let mut it = item_search(ir, item_count, first_id);
-        let mut nxt = if it + 1 < item_count { ir[(it + 1) * 2] as usize } else { n };
+    let first_record_index = tile_start + unit_pos;
+    if first_record_index < total_records && item_count > 0 {
+        let mut item_index = item_search(item_record_bounds, item_count, first_record_index);
+        let mut next_item_boundary = if item_index + 1 < item_count { item_record_bounds[(item_index + 1) * 2] as usize } else { total_records };
         let mut pg_rmax = f32::new(0.0f32);
         let mut pg_ymin = f32::new(0.0f32);
         let mut pg_zmin = f32::new(0.0f32);
@@ -592,43 +284,43 @@ pub(super) fn extent_fold(
         let mut any_leader = false;
         let mut any_survivor = false;
 
-        let mut k = 0usize;
-        while k < rake {
-            let id = tile_lo + k * units + u;
-            if id >= n {
+        let mut rake_step = 0usize;
+        while rake_step < rake {
+            let record_index = tile_start + rake_step * units + unit_pos;
+            if record_index >= total_records {
                 break;
             }
-            if nxt <= id {
+            if next_item_boundary <= record_index {
                 if any_leader {
-                    let slot = it - it_base;
+                    let slot = item_index - tile_item_base;
                     if slot < RESOLVE_SLOTS {
-                        sflags[slot].fetch_or(if any_survivor { 3u32 } else { 1u32 });
+                        shared_item_flags[slot].fetch_or(if any_survivor { 3u32 } else { 1u32 });
                         let e = slot * EXT_STRIDE;
-                        sext[e].fetch_max(ordered_key(pg_rmax));
-                        sext[e + 1].fetch_min(ordered_key(pg_ymin));
-                        sext[e + 2].fetch_min(ordered_key(pg_zmin));
-                        sext[e + 3].fetch_max(ordered_key(pg_zmax));
+                        shared_item_extents[e].fetch_max(ordered_key(pg_rmax));
+                        shared_item_extents[e + 1].fetch_min(ordered_key(pg_ymin));
+                        shared_item_extents[e + 2].fetch_min(ordered_key(pg_zmin));
+                        shared_item_extents[e + 3].fetch_max(ordered_key(pg_zmax));
                         if any_survivor {
-                            sext[e + 4].fetch_min(ordered_key(ink_xmin));
-                            sext[e + 5].fetch_min(ordered_key(ink_ymin));
-                            sext[e + 6].fetch_max(ordered_key(ink_rmax));
-                            sext[e + 7].fetch_max(ordered_key(ink_ymax));
-                            sext[e + 8].fetch_min(ordered_key(ink_zmin));
-                            sext[e + 9].fetch_max(ordered_key(ink_zmax));
+                            shared_item_extents[e + 4].fetch_min(ordered_key(ink_xmin));
+                            shared_item_extents[e + 5].fetch_min(ordered_key(ink_ymin));
+                            shared_item_extents[e + 6].fetch_max(ordered_key(ink_rmax));
+                            shared_item_extents[e + 7].fetch_max(ordered_key(ink_ymax));
+                            shared_item_extents[e + 8].fetch_min(ordered_key(ink_zmin));
+                            shared_item_extents[e + 9].fetch_max(ordered_key(ink_zmax));
                         }
                     } else {
-                        let e = it * EXT_STRIDE;
-                        ext[e].fetch_max(ordered_key(pg_rmax));
-                        ext[e + 1].fetch_min(ordered_key(pg_ymin));
-                        ext[e + 2].fetch_min(ordered_key(pg_zmin));
-                        ext[e + 3].fetch_max(ordered_key(pg_zmax));
+                        let e = item_index * EXT_STRIDE;
+                        item_extents_atomic[e].fetch_max(ordered_key(pg_rmax));
+                        item_extents_atomic[e + 1].fetch_min(ordered_key(pg_ymin));
+                        item_extents_atomic[e + 2].fetch_min(ordered_key(pg_zmin));
+                        item_extents_atomic[e + 3].fetch_max(ordered_key(pg_zmax));
                         if any_survivor {
-                            ext[e + 4].fetch_min(ordered_key(ink_xmin));
-                            ext[e + 5].fetch_min(ordered_key(ink_ymin));
-                            ext[e + 6].fetch_max(ordered_key(ink_rmax));
-                            ext[e + 7].fetch_max(ordered_key(ink_ymax));
-                            ext[e + 8].fetch_min(ordered_key(ink_zmin));
-                            ext[e + 9].fetch_max(ordered_key(ink_zmax));
+                            item_extents_atomic[e + 4].fetch_min(ordered_key(ink_xmin));
+                            item_extents_atomic[e + 5].fetch_min(ordered_key(ink_ymin));
+                            item_extents_atomic[e + 6].fetch_max(ordered_key(ink_rmax));
+                            item_extents_atomic[e + 7].fetch_max(ordered_key(ink_ymax));
+                            item_extents_atomic[e + 8].fetch_min(ordered_key(ink_zmin));
+                            item_extents_atomic[e + 9].fetch_max(ordered_key(ink_zmax));
                         }
                     }
                     pg_rmax = f32::new(0.0f32);
@@ -644,17 +336,17 @@ pub(super) fn extent_fold(
                     any_leader = false;
                     any_survivor = false;
                 }
-                while nxt <= id {
-                    it += 1;
-                    nxt = if it + 1 < item_count { ir[(it + 1) * 2] as usize } else { n };
+                while next_item_boundary <= record_index {
+                    item_index += 1;
+                    next_item_boundary = if item_index + 1 < item_count { item_record_bounds[(item_index + 1) * 2] as usize } else { total_records };
                 }
             }
-            if flags_at(fl, id) & F_LEADER != 0 {
+            if flags_at(glyph_flags, record_index) & F_LEADER != 0 {
                 any_leader = true;
-                let x = lm[id * LM_STRIDE + LM_X];
-                let y = lm[id * LM_STRIDE + LM_Y];
-                let z = lm[id * LM_STRIDE + LM_Z];
-                let right = x + sm[id];
+                let x = layout_metrics[record_index * LM_STRIDE + LM_X];
+                let y = layout_metrics[record_index * LM_STRIDE + LM_Y];
+                let z = layout_metrics[record_index * LM_STRIDE + LM_Z];
+                let right = x + advance_widths[record_index];
                 if right > pg_rmax {
                     pg_rmax = right;
                 }
@@ -667,9 +359,9 @@ pub(super) fn extent_fold(
                 if z > pg_zmax {
                     pg_zmax = z;
                 }
-                if gi[id] != 0u32 {
+                if glyph_indices[record_index] != 0u32 {
                     any_survivor = true;
-                    let half = hgt[id] * 0.5f32;
+                    let half = glyph_heights[record_index] * 0.5f32;
                     let y_lo = y - half;
                     let y_hi = y + half;
                     if x < ink_xmin {
@@ -692,63 +384,63 @@ pub(super) fn extent_fold(
                     }
                 }
             }
-            k += 1;
+            rake_step += 1;
         }
 
         if any_leader {
-            let slot = it - it_base;
+            let slot = item_index - tile_item_base;
             if slot < RESOLVE_SLOTS {
-                sflags[slot].fetch_or(if any_survivor { 3u32 } else { 1u32 });
+                shared_item_flags[slot].fetch_or(if any_survivor { 3u32 } else { 1u32 });
                 let e = slot * EXT_STRIDE;
-                sext[e].fetch_max(ordered_key(pg_rmax));
-                sext[e + 1].fetch_min(ordered_key(pg_ymin));
-                sext[e + 2].fetch_min(ordered_key(pg_zmin));
-                sext[e + 3].fetch_max(ordered_key(pg_zmax));
+                shared_item_extents[e].fetch_max(ordered_key(pg_rmax));
+                shared_item_extents[e + 1].fetch_min(ordered_key(pg_ymin));
+                shared_item_extents[e + 2].fetch_min(ordered_key(pg_zmin));
+                shared_item_extents[e + 3].fetch_max(ordered_key(pg_zmax));
                 if any_survivor {
-                    sext[e + 4].fetch_min(ordered_key(ink_xmin));
-                    sext[e + 5].fetch_min(ordered_key(ink_ymin));
-                    sext[e + 6].fetch_max(ordered_key(ink_rmax));
-                    sext[e + 7].fetch_max(ordered_key(ink_ymax));
-                    sext[e + 8].fetch_min(ordered_key(ink_zmin));
-                    sext[e + 9].fetch_max(ordered_key(ink_zmax));
+                    shared_item_extents[e + 4].fetch_min(ordered_key(ink_xmin));
+                    shared_item_extents[e + 5].fetch_min(ordered_key(ink_ymin));
+                    shared_item_extents[e + 6].fetch_max(ordered_key(ink_rmax));
+                    shared_item_extents[e + 7].fetch_max(ordered_key(ink_ymax));
+                    shared_item_extents[e + 8].fetch_min(ordered_key(ink_zmin));
+                    shared_item_extents[e + 9].fetch_max(ordered_key(ink_zmax));
                 }
             } else {
-                let e = it * EXT_STRIDE;
-                ext[e].fetch_max(ordered_key(pg_rmax));
-                ext[e + 1].fetch_min(ordered_key(pg_ymin));
-                ext[e + 2].fetch_min(ordered_key(pg_zmin));
-                ext[e + 3].fetch_max(ordered_key(pg_zmax));
+                let e = item_index * EXT_STRIDE;
+                item_extents_atomic[e].fetch_max(ordered_key(pg_rmax));
+                item_extents_atomic[e + 1].fetch_min(ordered_key(pg_ymin));
+                item_extents_atomic[e + 2].fetch_min(ordered_key(pg_zmin));
+                item_extents_atomic[e + 3].fetch_max(ordered_key(pg_zmax));
                 if any_survivor {
-                    ext[e + 4].fetch_min(ordered_key(ink_xmin));
-                    ext[e + 5].fetch_min(ordered_key(ink_ymin));
-                    ext[e + 6].fetch_max(ordered_key(ink_rmax));
-                    ext[e + 7].fetch_max(ordered_key(ink_ymax));
-                    ext[e + 8].fetch_min(ordered_key(ink_zmin));
-                    ext[e + 9].fetch_max(ordered_key(ink_zmax));
+                    item_extents_atomic[e + 4].fetch_min(ordered_key(ink_xmin));
+                    item_extents_atomic[e + 5].fetch_min(ordered_key(ink_ymin));
+                    item_extents_atomic[e + 6].fetch_max(ordered_key(ink_rmax));
+                    item_extents_atomic[e + 7].fetch_max(ordered_key(ink_ymax));
+                    item_extents_atomic[e + 8].fetch_min(ordered_key(ink_zmin));
+                    item_extents_atomic[e + 9].fetch_max(ordered_key(ink_zmax));
                 }
             }
         }
     }
 
     sync_cube();
-    if u < RESOLVE_SLOTS {
-        let it = it_base + u;
-        if it < item_count {
-            let flags = sflags[u].load();
+    if unit_pos < RESOLVE_SLOTS {
+        let item_index = tile_item_base + unit_pos;
+        if item_index < item_count {
+            let flags = shared_item_flags[unit_pos].load();
             if (flags & 1u32) != 0 {
-                let se = u * EXT_STRIDE;
-                let e = it * EXT_STRIDE;
-                ext[e].fetch_max(sext[se].load());
-                ext[e + 1].fetch_min(sext[se + 1].load());
-                ext[e + 2].fetch_min(sext[se + 2].load());
-                ext[e + 3].fetch_max(sext[se + 3].load());
+                let se = unit_pos * EXT_STRIDE;
+                let e = item_index * EXT_STRIDE;
+                item_extents_atomic[e].fetch_max(shared_item_extents[se].load());
+                item_extents_atomic[e + 1].fetch_min(shared_item_extents[se + 1].load());
+                item_extents_atomic[e + 2].fetch_min(shared_item_extents[se + 2].load());
+                item_extents_atomic[e + 3].fetch_max(shared_item_extents[se + 3].load());
                 if (flags & 2u32) != 0 {
-                    ext[e + 4].fetch_min(sext[se + 4].load());
-                    ext[e + 5].fetch_min(sext[se + 5].load());
-                    ext[e + 6].fetch_max(sext[se + 6].load());
-                    ext[e + 7].fetch_max(sext[se + 7].load());
-                    ext[e + 8].fetch_min(sext[se + 8].load());
-                    ext[e + 9].fetch_max(sext[se + 9].load());
+                    item_extents_atomic[e + 4].fetch_min(shared_item_extents[se + 4].load());
+                    item_extents_atomic[e + 5].fetch_min(shared_item_extents[se + 5].load());
+                    item_extents_atomic[e + 6].fetch_max(shared_item_extents[se + 6].load());
+                    item_extents_atomic[e + 7].fetch_max(shared_item_extents[se + 7].load());
+                    item_extents_atomic[e + 8].fetch_min(shared_item_extents[se + 8].load());
+                    item_extents_atomic[e + 9].fetch_max(shared_item_extents[se + 9].load());
                 }
             }
         }

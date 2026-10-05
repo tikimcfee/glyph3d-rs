@@ -33,14 +33,14 @@ use super::{F_CLUSTER_TRAILER, F_LEADER};
 /// sequence_length at i: the lenient classifier over the packed corpus.
 #[cube]
 pub(super) fn seq_len_at(bytes: &[u32], i: usize, n: usize) -> u32 {
-    let b = byte_at(bytes, i, n);
-    if b & 0x80u32 == 0u32 {
+    let lead_byte = byte_at(bytes, i, n);
+    if lead_byte & 0x80u32 == 0u32 {
         1u32
-    } else if b & 0xE0u32 == 0xC0u32 {
+    } else if lead_byte & 0xE0u32 == 0xC0u32 {
         2u32
-    } else if b & 0xF0u32 == 0xE0u32 {
+    } else if lead_byte & 0xF0u32 == 0xE0u32 {
         3u32
-    } else if b & 0xF8u32 == 0xF0u32 {
+    } else if lead_byte & 0xF8u32 == 0xF0u32 {
         4u32
     } else {
         0u32
@@ -50,18 +50,18 @@ pub(super) fn seq_len_at(bytes: &[u32], i: usize, n: usize) -> u32 {
 /// decode_codepoint_at at i for a known length.
 #[cube]
 pub(super) fn cp_at(bytes: &[u32], i: usize, len: u32, n: usize) -> u32 {
-    let b = byte_at(bytes, i, n);
-    let b1 = byte_at(bytes, i + 1, n);
-    let b2 = byte_at(bytes, i + 2, n);
-    let b3 = byte_at(bytes, i + 3, n);
+    let lead_byte = byte_at(bytes, i, n);
+    let trail_byte1 = byte_at(bytes, i + 1, n);
+    let trail_byte2 = byte_at(bytes, i + 2, n);
+    let trail_byte3 = byte_at(bytes, i + 3, n);
     if len == 1u32 {
-        b
+        lead_byte
     } else if len == 2u32 {
-        ((b & 0x1Fu32) << 6u32) | (b1 & 0x3Fu32)
+        ((lead_byte & 0x1Fu32) << 6u32) | (trail_byte1 & 0x3Fu32)
     } else if len == 3u32 {
-        ((b & 0x0Fu32) << 12u32) | ((b1 & 0x3Fu32) << 6u32) | (b2 & 0x3Fu32)
+        ((lead_byte & 0x0Fu32) << 12u32) | ((trail_byte1 & 0x3Fu32) << 6u32) | (trail_byte2 & 0x3Fu32)
     } else {
-        ((b & 0x07u32) << 18u32) | ((b1 & 0x3Fu32) << 12u32) | ((b2 & 0x3Fu32) << 6u32) | (b3 & 0x3Fu32)
+        ((lead_byte & 0x07u32) << 18u32) | ((trail_byte1 & 0x3Fu32) << 12u32) | ((trail_byte2 & 0x3Fu32) << 6u32) | (trail_byte3 & 0x3Fu32)
     }
 }
 
@@ -105,53 +105,53 @@ pub(super) fn is_static_zero(cp: u32) -> u32 {
 pub(super) fn cluster_probe(
     bytes: &[u32],
     bitmap: &[u32],
-    sec_off: &[u32],
-    sec_val: &[u32],
-    seq: &[u32],
-    ir: &[u32],
-    ic: &[u32],
-    fl: &mut [u32],
-    sm: &mut [f32],
-    gi: &mut [u32],
-    cslot: &mut [u32],
-    cend: &mut [u32],
+    secondary_offsets: &[u32],
+    secondary_values: &[u32],
+    sequence_table: &[u32],
+    item_record_bounds: &[u32],
+    item_cluster_enabled: &[u32],
+    glyph_flags: &mut [u32],
+    advance_widths: &mut [f32],
+    glyph_indices: &mut [u32],
+    candidate_slots: &mut [u32],
+    candidate_end_positions: &mut [u32],
     #[comptime] seq_max: u32,
 ) {
-    let w = ABSOLUTE_POS;
-    let n = bytes.len() * 4;
-    let item_count = ir.len() / 2;
-    if w < fl.len() {
-        let mut word = fl[w];
+    let word_index = ABSOLUTE_POS;
+    let total_bytes = bytes.len() * 4;
+    let item_count = item_record_bounds.len() / 2;
+    if word_index < glyph_flags.len() {
+        let mut packed_word = glyph_flags[word_index];
         let mut lane = 0usize;
         while lane < 4 {
-            let id = w * 4 + lane;
-            if id < n {
-                let len = seq_len_at(bytes, id, n);
+            let byte_index = word_index * 4 + lane;
+            if byte_index < total_bytes {
+                let len = seq_len_at(bytes, byte_index, total_bytes);
                 if len > 0u32 {
-                    let mut start = 0usize;
-                    let mut stop = 0usize;
-                    let mut cluster = false;
+                    let mut item_start_byte = 0usize;
+                    let mut item_end_byte = 0usize;
+                    let mut cluster_enabled = false;
                     if item_count > 0 {
-                        let it = item_search(ir, item_count, id);
-                        start = ir[it * 2] as usize;
-                        stop = ir[it * 2 + 1] as usize;
-                        cluster = ic[it] != 0;
+                        let item_index = item_search(item_record_bounds, item_count, byte_index);
+                        item_start_byte = item_record_bounds[item_index * 2] as usize;
+                        item_end_byte = item_record_bounds[item_index * 2 + 1] as usize;
+                        cluster_enabled = item_cluster_enabled[item_index] != 0;
                     }
                     // The gap-byte guard: only bytes INSIDE the item range.
                     // BOTH edges are load-bearing — item_search clamps to
                     // item 0 for bytes BEFORE the first item (a leading gap
                     // would otherwise take item 0's static-zero marking,
                     // which the CPU never applies there).
-                    if cluster && id >= start && id < stop {
-                        let cp = cp_at(bytes, id, len, n);
-                        if is_static_zero(cp) != 0u32 {
+                    if cluster_enabled && byte_index >= item_start_byte && byte_index < item_end_byte {
+                        let codepoint = cp_at(bytes, byte_index, len, total_bytes);
+                        if is_static_zero(codepoint) != 0u32 {
                             // fold.rs:543-548 zeroes ALL THREE static lanes
                             // for a static-zero byte in a cluster item — gi
                             // included. The probe wrote two of them until
                             // the repo parity driver caught the third.
-                            sm[id] = f32::from_bits(0u32);
-                            gi[id] = 0u32;
-                            word |= F_CLUSTER_TRAILER << ((lane as u32) * 8u32);
+                            advance_widths[byte_index] = f32::from_bits(0u32);
+                            glyph_indices[byte_index] = 0u32;
+                            packed_word |= F_CLUSTER_TRAILER << ((lane as u32) * 8u32);
                         } else {
                             // cp above 0x10FFFF is malformed decode — the
                             // bitmap covers real codepoints only; reject
@@ -159,8 +159,8 @@ pub(super) fn cluster_probe(
                             // OOB-read-is-zero (decode guards this class
                             // itself).
                             let mut bit = 0u32;
-                            if cp <= 0x10FFFFu32 {
-                                bit = (bitmap[(cp >> 5u32) as usize] >> (cp & 0x1Fu32)) & 1u32;
+                            if codepoint <= 0x10FFFFu32 {
+                                bit = (bitmap[(codepoint >> 5u32) as usize] >> (codepoint & 0x1Fu32)) & 1u32;
                             }
                             if bit != 0u32 {
                                 // Pair filter: every reachable table entry
@@ -177,156 +177,156 @@ pub(super) fn cluster_probe(
                                 // full key walk plus up to seven table
                                 // searches (measured 42.6ms of the 24MB
                                 // text probe before it).
-                                let mut q = id + len as usize;
-                                let mut second = 0u32;
-                                let mut hunting = 1u32;
-                                while hunting == 1u32 && q < stop {
-                                    let l2 = seq_len_at(bytes, q, n);
-                                    let c2 = cp_at(bytes, q, l2, n);
-                                    let dead2 = if l2 == 0u32 || c2 == 0x0Au32 || c2 == 0xFE0Eu32 {
+                                let mut search_byte_pos = byte_index + len as usize;
+                                let mut second_codepoint = 0u32;
+                                let mut is_hunting = 1u32;
+                                while is_hunting == 1u32 && search_byte_pos < item_end_byte {
+                                    let seq2_len = seq_len_at(bytes, search_byte_pos, total_bytes);
+                                    let seq2_cp = cp_at(bytes, search_byte_pos, seq2_len, total_bytes);
+                                    let seq2_dead = if seq2_len == 0u32 || seq2_cp == 0x0Au32 || seq2_cp == 0xFE0Eu32 {
                                         1u32
                                     } else {
                                         0u32
                                     };
-                                    if dead2 == 1u32 {
-                                        hunting = 0u32;
+                                    if seq2_dead == 1u32 {
+                                        is_hunting = 0u32;
                                     }
-                                    if dead2 == 0u32 {
-                                        if c2 != 0xFE0Fu32 {
-                                            second = c2;
-                                            hunting = 0u32;
+                                    if seq2_dead == 0u32 {
+                                        if seq2_cp != 0xFE0Fu32 {
+                                            second_codepoint = seq2_cp;
+                                            is_hunting = 0u32;
                                         }
-                                        q += l2 as usize;
-                                    }
-                                }
-                                let mut pair_alive = 0u32;
-                                if second != 0u32 {
-                                    let plo = sec_off[cp as usize];
-                                    let phi = sec_off[cp as usize + 1usize];
-                                    let mut lo2 = plo;
-                                    let mut hi2 = phi;
-                                    while lo2 < hi2 {
-                                        let mid = (lo2 + hi2) / 2u32;
-                                        if sec_val[mid as usize] < second {
-                                            lo2 = mid + 1u32;
-                                        }
-                                        if sec_val[mid as usize] >= second {
-                                            hi2 = mid;
-                                        }
-                                    }
-                                    if lo2 < phi && sec_val[lo2 as usize] == second {
-                                        pair_alive = 1u32;
+                                        search_byte_pos += seq2_len as usize;
                                     }
                                 }
-                                if pair_alive == 1u32 {
-                                // Key build: the head's own cp is element 0.
-                                // The scratch is LOCAL to this thread —
-                                // declared here so only candidates pay for it.
-                                let mut skey = Array::<u32>::new(seq_max as usize);
-                                let mut klen = 0u32;
-                                let mut p = id;
-                                let mut alive = 1u32;
-                                while alive == 1u32 && p < stop && klen < seq_max {
-                                    let len2 = seq_len_at(bytes, p, n);
-                                    let cp2 = cp_at(bytes, p, len2, n);
-                                    let dead = if len2 == 0u32 || cp2 == 0x0Au32 || cp2 == 0xFE0Eu32 {
-                                        1u32
-                                    } else {
-                                        0u32
-                                    };
-                                    if dead == 1u32 {
-                                        alive = 0u32;
-                                    }
-                                    if dead == 0u32 {
-                                        if cp2 != 0xFE0Fu32 {
-                                            skey[klen as usize] = cp2;
-                                            klen += 1u32;
+                                let mut is_pair_alive = 0u32;
+                                if second_codepoint != 0u32 {
+                                    let sec_start = secondary_offsets[codepoint as usize];
+                                    let sec_end = secondary_offsets[codepoint as usize + 1usize];
+                                    let mut bin_lo = sec_start;
+                                    let mut bin_hi = sec_end;
+                                    while bin_lo < bin_hi {
+                                        let bin_mid = (bin_lo + bin_hi) / 2u32;
+                                        if secondary_values[bin_mid as usize] < second_codepoint {
+                                            bin_lo = bin_mid + 1u32;
                                         }
-                                        p += len2 as usize;
+                                        if secondary_values[bin_mid as usize] >= second_codepoint {
+                                            bin_hi = bin_mid;
+                                        }
+                                    }
+                                    if bin_lo < sec_end && secondary_values[bin_lo as usize] == second_codepoint {
+                                        is_pair_alive = 1u32;
                                     }
                                 }
-                                // Descending-length binary search.
-                                let stride = 2u32 + seq_max;
-                                let seq_count = (seq.len() / stride as usize) as u32;
-                                let mut elen = if klen < seq_max { klen } else { seq_max };
-                                let mut slot = 0u32;
-                                let mut need = 0u32;
-                                while elen >= 2u32 && slot == 0u32 {
-                                    let mut lo = 0u32;
-                                    let mut hi = seq_count;
-                                    while lo < hi {
-                                        let mid = (lo + hi) / 2u32;
-                                        let eoff = mid as usize * stride as usize;
-                                        let entry_len = seq[eoff + 1];
-                                        let kmax = if entry_len < elen { entry_len } else { elen };
-                                        let mut ord = 0i32;
-                                        let mut k = 0u32;
-                                        while k < kmax && ord == 0i32 {
-                                            let want = seq[eoff + 2 + k as usize];
-                                            let probe = skey[k as usize];
-                                            if probe < want {
-                                                ord = -1i32;
-                                            }
-                                            if ord == 0i32 && probe > want {
-                                                ord = 1i32;
-                                            }
-                                            k += 1u32;
-                                        }
-                                        if ord == 0i32 {
-                                            // Shorter-prefix-first order: with equal
-                                            // elements the SHORTER sequence sorts first,
-                                            // so a longer entry is GREATER than the probe.
-                                            if entry_len < elen {
-                                                ord = 1i32;
-                                            }
-                                            if entry_len > elen {
-                                                ord = -1i32;
-                                            }
-                                        }
-                                        if ord < 0i32 {
-                                            hi = mid;
-                                        }
-                                        if ord > 0i32 {
-                                            lo = mid + 1u32;
-                                        }
-                                        if ord == 0i32 {
-                                            slot = seq[eoff];
-                                            need = elen;
-                                            lo = hi;
-                                        }
-                                    }
-                                    elen -= 1u32;
-                                }
-                                if slot != 0u32 {
-                                    // Span end: re-walk, counting consumers.
-                                    let mut got2 = 0u32;
-                                    let mut p2 = id;
-                                    let mut send = id as u32;
-                                    let mut alive2 = 1u32;
-                                    while alive2 == 1u32 && p2 < stop {
-                                        let len3 = seq_len_at(bytes, p2, n);
-                                        let cp3 = cp_at(bytes, p2, len3, n);
-                                        let dead3 = if len3 == 0u32 || cp3 == 0x0Au32 || cp3 == 0xFE0Eu32 {
+                                if is_pair_alive == 1u32 {
+                                    // Key build: the head's own cp is element 0.
+                                    // The scratch is LOCAL to this thread —
+                                    // declared here so only candidates pay for it.
+                                    let mut sequence_key = Array::<u32>::new(seq_max as usize);
+                                    let mut key_length = 0u32;
+                                    let mut scan_byte_pos = byte_index;
+                                    let mut is_alive = 1u32;
+                                    while is_alive == 1u32 && scan_byte_pos < item_end_byte && key_length < seq_max {
+                                        let scan_len = seq_len_at(bytes, scan_byte_pos, total_bytes);
+                                        let scan_cp = cp_at(bytes, scan_byte_pos, scan_len, total_bytes);
+                                        let is_dead = if scan_len == 0u32 || scan_cp == 0x0Au32 || scan_cp == 0xFE0Eu32 {
                                             1u32
                                         } else {
                                             0u32
                                         };
-                                        if dead3 == 1u32 {
-                                            alive2 = 0u32;
+                                        if is_dead == 1u32 {
+                                            is_alive = 0u32;
                                         }
-                                        if dead3 == 0u32 {
-                                            if cp3 != 0xFE0Fu32 {
-                                                got2 += 1u32;
-                                                if got2 == need {
-                                                    send = (p2 + len3 as usize) as u32;
-                                                }
+                                        if is_dead == 0u32 {
+                                            if scan_cp != 0xFE0Fu32 {
+                                                sequence_key[key_length as usize] = scan_cp;
+                                                key_length += 1u32;
                                             }
-                                            p2 += len3 as usize;
+                                            scan_byte_pos += scan_len as usize;
                                         }
                                     }
-                                    cslot[id] = slot;
-                                    cend[id] = send;
-                                }
+                                    // Descending-length binary search.
+                                    let table_stride = 2u32 + seq_max;
+                                    let total_sequences = (sequence_table.len() / table_stride as usize) as u32;
+                                    let mut current_match_len = if key_length < seq_max { key_length } else { seq_max };
+                                    let mut matched_slot = 0u32;
+                                    let mut matched_len = 0u32;
+                                    while current_match_len >= 2u32 && matched_slot == 0u32 {
+                                        let mut seq_search_lo = 0u32;
+                                        let mut seq_search_hi = total_sequences;
+                                        while seq_search_lo < seq_search_hi {
+                                            let seq_search_mid = (seq_search_lo + seq_search_hi) / 2u32;
+                                            let entry_offset = seq_search_mid as usize * table_stride as usize;
+                                            let entry_sequence_len = sequence_table[entry_offset + 1];
+                                            let probe_compare_len = if entry_sequence_len < current_match_len { entry_sequence_len } else { current_match_len };
+                                            let mut comparison_order = 0i32;
+                                            let mut compare_step = 0u32;
+                                            while compare_step < probe_compare_len && comparison_order == 0i32 {
+                                                let target_codepoint = sequence_table[entry_offset + 2 + compare_step as usize];
+                                                let probe_codepoint = sequence_key[compare_step as usize];
+                                                if probe_codepoint < target_codepoint {
+                                                    comparison_order = -1i32;
+                                                }
+                                                if comparison_order == 0i32 && probe_codepoint > target_codepoint {
+                                                    comparison_order = 1i32;
+                                                }
+                                                compare_step += 1u32;
+                                            }
+                                            if comparison_order == 0i32 {
+                                                // Shorter-prefix-first order: with equal
+                                                // elements the SHORTER sequence sorts first,
+                                                // so a longer entry is GREATER than the probe.
+                                                if entry_sequence_len < current_match_len {
+                                                    comparison_order = 1i32;
+                                                }
+                                                if entry_sequence_len > current_match_len {
+                                                    comparison_order = -1i32;
+                                                }
+                                            }
+                                            if comparison_order < 0i32 {
+                                                seq_search_hi = seq_search_mid;
+                                            }
+                                            if comparison_order > 0i32 {
+                                                seq_search_lo = seq_search_mid + 1u32;
+                                            }
+                                            if comparison_order == 0i32 {
+                                                matched_slot = sequence_table[entry_offset];
+                                                matched_len = current_match_len;
+                                                seq_search_lo = seq_search_hi;
+                                            }
+                                        }
+                                        current_match_len -= 1u32;
+                                    }
+                                    if matched_slot != 0u32 {
+                                        // Span end: re-walk, counting consumers.
+                                        let mut collected_codepoint_count = 0u32;
+                                        let mut end_scan_byte_pos = byte_index;
+                                        let mut matched_end_byte = byte_index as u32;
+                                        let mut is_end_scan_alive = 1u32;
+                                        while is_end_scan_alive == 1u32 && end_scan_byte_pos < item_end_byte {
+                                            let end_scan_len = seq_len_at(bytes, end_scan_byte_pos, total_bytes);
+                                            let end_scan_cp = cp_at(bytes, end_scan_byte_pos, end_scan_len, total_bytes);
+                                            let is_end_scan_dead = if end_scan_len == 0u32 || end_scan_cp == 0x0Au32 || end_scan_cp == 0xFE0Eu32 {
+                                                1u32
+                                            } else {
+                                                0u32
+                                            };
+                                            if is_end_scan_dead == 1u32 {
+                                                is_end_scan_alive = 0u32;
+                                            }
+                                            if is_end_scan_dead == 0u32 {
+                                                if end_scan_cp != 0xFE0Fu32 {
+                                                    collected_codepoint_count += 1u32;
+                                                    if collected_codepoint_count == matched_len {
+                                                        matched_end_byte = (end_scan_byte_pos + end_scan_len as usize) as u32;
+                                                    }
+                                                }
+                                                end_scan_byte_pos += end_scan_len as usize;
+                                            }
+                                        }
+                                        candidate_slots[byte_index] = matched_slot;
+                                        candidate_end_positions[byte_index] = matched_end_byte;
+                                    }
                                 }
                             }
                         }
@@ -335,7 +335,7 @@ pub(super) fn cluster_probe(
             }
             lane += 1usize;
         }
-        fl[w] = word;
+        glyph_flags[word_index] = packed_word;
     }
 }
 
@@ -396,59 +396,59 @@ pub(super) fn cluster_probe(
 /// pass with the bug; only repeat sampling exposes it.
 #[cube(launch_unchecked)]
 pub(super) fn count_tile(
-    cslot: &[u32],
-    tc: &mut [u32],
-    up: &mut [u32],
+    candidate_slots: &[u32],
+    tile_counts: &mut [u32],
+    unit_prefixes: &mut [u32],
     #[comptime] units: usize,
     #[comptime] rake: usize,
     #[comptime] log: usize,
 ) {
     let tile = CUBE_POS;
-    let u = UNIT_POS as usize;
-    let n = cslot.len();
-    let lo = tile * (units * rake) + u * rake;
-    let hi = if lo + rake < n { lo + rake } else { n };
-    let mut c = 0u32;
-    if lo < n {
-        let mut id = lo;
-        while id < hi {
-            if cslot[id] != 0u32 {
-                c += 1u32;
+    let unit_pos = UNIT_POS as usize;
+    let total_slots = candidate_slots.len();
+    let range_start = tile * (units * rake) + unit_pos * rake;
+    let range_end = if range_start + rake < total_slots { range_start + rake } else { total_slots };
+    let mut candidate_count = 0u32;
+    if range_start < total_slots {
+        let mut slot_index = range_start;
+        while slot_index < range_end {
+            if candidate_slots[slot_index] != 0u32 {
+                candidate_count += 1u32;
             }
-            id += 1usize;
+            slot_index += 1usize;
         }
     }
     // The additive little sibling of tile_scan's monoid Blelloch. The load
     // phase writes EVERY shared slot before any read — naga only inserts
     // workgroup zero-init when initialization-before-read is unprovable,
     // and conditional writes (the probe's key scratch, formerly) force it.
-    let mut sc = Shared::<[u32]>::new_slice(units);
-    sc[u] = c;
+    let mut shared_counts = Shared::<[u32]>::new_slice(units);
+    shared_counts[unit_pos] = candidate_count;
     #[unroll]
     for d in 0..log {
         sync_cube();
         let s = 1usize << d;
-        if (u + 1) & (2 * s - 1) == 0 {
-            sc[u] += sc[u - s];
+        if (unit_pos + 1) & (2 * s - 1) == 0 {
+            shared_counts[unit_pos] += shared_counts[unit_pos - s];
         }
     }
     sync_cube();
-    if u == units - 1 {
-        tc[tile] = sc[u];
-        sc[u] = 0u32;
+    if unit_pos == units - 1 {
+        tile_counts[tile] = shared_counts[unit_pos];
+        shared_counts[unit_pos] = 0u32;
     }
     #[unroll]
     for d in 0..log {
         sync_cube();
         let s = units >> (d + 1);
-        if (u + 1) & (2 * s - 1) == 0 {
-            let t = sc[u];
-            sc[u] += sc[u - s];
-            sc[u - s] = t;
+        if (unit_pos + 1) & (2 * s - 1) == 0 {
+            let t = shared_counts[unit_pos];
+            shared_counts[unit_pos] += shared_counts[unit_pos - s];
+            shared_counts[unit_pos - s] = t;
         }
     }
     sync_cube();
-    up[tile * units + u] = sc[u];
+    unit_prefixes[tile * units + unit_pos] = shared_counts[unit_pos];
 }
 
 /// The compaction spine: one cube Blelloch-scans the tile totals into
@@ -459,58 +459,58 @@ pub(super) fn count_tile(
 /// level tables; the timed loop re-derives it on device).
 #[cube(launch_unchecked)]
 pub(super) fn count_spine(
-    tc: &[u32],
-    xc: &mut [u32],
-    total: &mut [u32],
+    tile_counts: &[u32],
+    tile_spine_counts: &mut [u32],
+    grand_total: &mut [u32],
     #[comptime] units: usize,
     #[comptime] log: usize,
 ) {
-    let u = UNIT_POS as usize;
-    let n_tiles = tc.len();
+    let unit_pos = UNIT_POS as usize;
+    let n_tiles = tile_counts.len();
     let per = n_tiles.div_ceil(units);
-    let first = u * per;
+    let first = unit_pos * per;
     let last = if first + per < n_tiles { first + per } else { n_tiles };
-    let mut acc = 0u32;
+    let mut accumulated_count = 0u32;
     if first < n_tiles {
         let mut t = first;
         while t < last {
-            acc += tc[t];
+            accumulated_count += tile_counts[t];
             t += 1usize;
         }
     }
-    let mut sc = Shared::<[u32]>::new_slice(units);
-    sc[u] = acc;
+    let mut shared_counts = Shared::<[u32]>::new_slice(units);
+    shared_counts[unit_pos] = accumulated_count;
     #[unroll]
     for d in 0..log {
         sync_cube();
         let s = 1usize << d;
-        if (u + 1) & (2 * s - 1) == 0 {
-            sc[u] += sc[u - s];
+        if (unit_pos + 1) & (2 * s - 1) == 0 {
+            shared_counts[unit_pos] += shared_counts[unit_pos - s];
         }
     }
     sync_cube();
-    if u == units - 1 {
-        sc[u] = 0u32;
+    if unit_pos == units - 1 {
+        shared_counts[unit_pos] = 0u32;
     }
     #[unroll]
     for d in 0..log {
         sync_cube();
         let s = units >> (d + 1);
-        if (u + 1) & (2 * s - 1) == 0 {
-            let t = sc[u];
-            sc[u] += sc[u - s];
-            sc[u - s] = t;
+        if (unit_pos + 1) & (2 * s - 1) == 0 {
+            let t = shared_counts[unit_pos];
+            shared_counts[unit_pos] += shared_counts[unit_pos - s];
+            shared_counts[unit_pos - s] = t;
         }
     }
     sync_cube();
-    let mut pre = sc[u];
+    let mut prefix_count = shared_counts[unit_pos];
     if first < n_tiles {
         for t in first..last {
-            xc[t] = pre;
-            pre += tc[t];
+            tile_spine_counts[t] = prefix_count;
+            prefix_count += tile_counts[t];
         }
         if last == n_tiles {
-            total[0] = pre;
+            grand_total[0] = prefix_count;
         }
     }
 }
@@ -520,52 +520,52 @@ pub(super) fn count_spine(
 /// array the binary searches ride on.
 #[cube(launch_unchecked)]
 pub(super) fn cand_scatter(
-    cslot: &[u32],
-    xc: &[u32],
-    up: &[u32],
-    hp: &mut [u32],
+    candidate_slots: &[u32],
+    tile_spine_counts: &[u32],
+    unit_prefixes: &[u32],
+    candidate_head_positions: &mut [u32],
     #[comptime] units: usize,
     #[comptime] rake: usize,
 ) {
     let tile = CUBE_POS;
-    let u = UNIT_POS as usize;
-    let n = cslot.len();
-    let lo = tile * (units * rake) + u * rake;
-    let hi = if lo + rake < n { lo + rake } else { n };
-    let mut c = xc[tile] + up[tile * units + u];
-    if lo < n {
-        let mut id = lo;
-        while id < hi {
-            if cslot[id] != 0u32 {
-                if (c as usize) < hp.len() {
-                    hp[c as usize] = id as u32;
+    let unit_pos = UNIT_POS as usize;
+    let total_slots = candidate_slots.len();
+    let range_start = tile * (units * rake) + unit_pos * rake;
+    let range_end = if range_start + rake < total_slots { range_start + rake } else { total_slots };
+    let mut scatter_index = tile_spine_counts[tile] + unit_prefixes[tile * units + unit_pos];
+    if range_start < total_slots {
+        let mut slot_index = range_start;
+        while slot_index < range_end {
+            if candidate_slots[slot_index] != 0u32 {
+                if (scatter_index as usize) < candidate_head_positions.len() {
+                    candidate_head_positions[scatter_index as usize] = slot_index as u32;
                 }
-                c += 1u32;
+                scatter_index += 1u32;
             }
-            id += 1usize;
+            slot_index += 1usize;
         }
     }
 }
 
-/// In-place comb sort of candidate positions in `hp` and associated `cslot` / `cend`.
+/// In-place comb sort of candidate positions in `candidate_head_positions` and associated `candidate_slots` / `candidate_end_positions`.
 /// Typically ≤200 candidates in real corpora, executing on thread 0 in <1 microsecond.
 #[allow(clippy::manual_swap)]
 #[cube(launch_unchecked)]
 pub(super) fn cand_sort(
-    hp: &mut [u32],
-    cslot: &mut [u32],
-    cend: &mut [u32],
-    ctotal: &mut [Atomic<u32>],
-    #[comptime] c_cap: usize,
+    candidate_head_positions: &mut [u32],
+    candidate_slots: &mut [u32],
+    candidate_end_positions: &mut [u32],
+    candidate_total_atomic: &mut [Atomic<u32>],
+    #[comptime] candidate_capacity: usize,
 ) {
     if ABSOLUTE_POS == 0 {
-        let raw_c = ctotal[0].load();
-        let c = if (raw_c as usize) > c_cap { c_cap } else { raw_c as usize };
-        if (raw_c as usize) > c_cap {
-            ctotal[0].store(c_cap as u32);
+        let raw_c = candidate_total_atomic[0].load();
+        let candidate_count = if (raw_c as usize) > candidate_capacity { candidate_capacity } else { raw_c as usize };
+        if (raw_c as usize) > candidate_capacity {
+            candidate_total_atomic[0].store(candidate_capacity as u32);
         }
-        if c > 1 {
-            let mut gap = c;
+        if candidate_count > 1 {
+            let mut gap = candidate_count;
             let mut swapped = true;
             while gap > 1 || swapped {
                 gap = (gap * 10) / 13;
@@ -574,20 +574,20 @@ pub(super) fn cand_sort(
                 }
                 swapped = false;
                 let mut i = 0usize;
-                while i + gap < c {
+                while i + gap < candidate_count {
                     let j = i + gap;
-                    if hp[i] > hp[j] {
-                        let t_hp = hp[i];
-                        hp[i] = hp[j];
-                        hp[j] = t_hp;
+                    if candidate_head_positions[i] > candidate_head_positions[j] {
+                        let temp_head_pos = candidate_head_positions[i];
+                        candidate_head_positions[i] = candidate_head_positions[j];
+                        candidate_head_positions[j] = temp_head_pos;
 
-                        let t_cs = cslot[i];
-                        cslot[i] = cslot[j];
-                        cslot[j] = t_cs;
+                        let temp_slot = candidate_slots[i];
+                        candidate_slots[i] = candidate_slots[j];
+                        candidate_slots[j] = temp_slot;
 
-                        let t_ce = cend[i];
-                        cend[i] = cend[j];
-                        cend[j] = t_ce;
+                        let temp_end_pos = candidate_end_positions[i];
+                        candidate_end_positions[i] = candidate_end_positions[j];
+                        candidate_end_positions[j] = temp_end_pos;
 
                         swapped = true;
                     }
@@ -604,54 +604,54 @@ pub(super) fn cand_sort(
 /// is the terminal: self-loop, written by thread C itself.
 #[cube(launch_unchecked)]
 pub(super) fn jump_build(
-    hp: &[u32],
-    cend: &[u32],
-    ir: &[u32],
-    c_count: &[u32],
-    parent: &mut [u32],
-    d0: &mut [u32],
+    candidate_head_positions: &[u32],
+    candidate_end_positions: &[u32],
+    item_record_bounds: &[u32],
+    candidate_count_buffer: &[u32],
+    parent_pointers: &mut [u32],
+    depth_step_zero: &mut [u32],
 ) {
-    let i = ABSOLUTE_POS;
-    let c = c_count[0] as usize;
-    if i < parent.len() {
-        if i == c {
-            parent[i] = i as u32;
-            d0[i] = 0u32;
+    let candidate_index = ABSOLUTE_POS;
+    let candidate_count = candidate_count_buffer[0] as usize;
+    if candidate_index < parent_pointers.len() {
+        if candidate_index == candidate_count {
+            parent_pointers[candidate_index] = candidate_index as u32;
+            depth_step_zero[candidate_index] = 0u32;
         }
-        if i < c {
-            d0[i] = 1u32;
-            let p = hp[i] as usize;
-            let e = cend[i] as usize;
-            let item_count = ir.len() / 2;
-            let stop = if item_count > 0 {
-                let it = item_search(ir, item_count, p);
-                ir[it * 2 + 1] as usize
+        if candidate_index < candidate_count {
+            depth_step_zero[candidate_index] = 1u32;
+            let head_pos = candidate_head_positions[candidate_index] as usize;
+            let end_pos = candidate_end_positions[candidate_index] as usize;
+            let item_count = item_record_bounds.len() / 2;
+            let item_end_boundary = if item_count > 0 {
+                let item_index = item_search(item_record_bounds, item_count, head_pos);
+                item_record_bounds[item_index * 2 + 1] as usize
             } else {
-                e
+                end_pos
             };
-            // Lower bound over hp (guarded-if form — the landmine-safe binary
+            // Lower bound over candidate_head_positions (guarded-if form — the landmine-safe binary
             // search shape the probe uses).
-            let mut lo = 0u32;
-            let mut hi = c as u32;
-            while lo < hi {
-                let mid = (lo + hi) / 2u32;
-                if (hp[mid as usize] as usize) < e {
-                    lo = mid + 1u32;
+            let mut search_lo = 0u32;
+            let mut search_hi = candidate_count as u32;
+            while search_lo < search_hi {
+                let search_mid = (search_lo + search_hi) / 2u32;
+                if (candidate_head_positions[search_mid as usize] as usize) < end_pos {
+                    search_lo = search_mid + 1u32;
                 }
-                if (hp[mid as usize] as usize) >= e {
-                    hi = mid;
+                if (candidate_head_positions[search_mid as usize] as usize) >= end_pos {
+                    search_hi = search_mid;
                 }
             }
-            let j = lo as usize;
-            if j < c && (hp[j] as usize) < stop {
-                parent[i] = j as u32;
+            let target_candidate_index = search_lo as usize;
+            if target_candidate_index < candidate_count && (candidate_head_positions[target_candidate_index] as usize) < item_end_boundary {
+                parent_pointers[candidate_index] = target_candidate_index as u32;
             } else {
-                parent[i] = c as u32;
+                parent_pointers[candidate_index] = candidate_count as u32;
             }
         }
-        if i > c {
-            parent[i] = c as u32;
-            d0[i] = 0u32;
+        if candidate_index > candidate_count {
+            parent_pointers[candidate_index] = candidate_count as u32;
+            depth_step_zero[candidate_index] = 0u32;
         }
     }
 }
@@ -663,20 +663,20 @@ pub(super) fn jump_build(
 /// level, not just the saturated end state.
 #[cube(launch_unchecked)]
 pub(super) fn rank_step(
-    cur_p: &[u32],
-    cur_d: &[u32],
-    nxt_p: &mut [u32],
-    nxt_d: &mut [u32],
-    lvl: &mut [u32],
+    current_parents: &[u32],
+    current_depths: &[u32],
+    next_parents: &mut [u32],
+    next_depths: &mut [u32],
+    level_tables: &mut [u32],
     #[comptime] step: usize,
     #[comptime] stride: usize,
 ) {
-    let i = ABSOLUTE_POS;
-    if i < cur_p.len() {
-        let p = cur_p[i] as usize;
-        nxt_p[i] = cur_p[p];
-        nxt_d[i] = cur_d[i] + cur_d[p];
-        lvl[step * stride + i] = cur_p[i];
+    let candidate_index = ABSOLUTE_POS;
+    if candidate_index < current_parents.len() {
+        let parent_index = current_parents[candidate_index] as usize;
+        next_parents[candidate_index] = current_parents[parent_index];
+        next_depths[candidate_index] = current_depths[candidate_index] + current_depths[parent_index];
+        level_tables[step * stride + candidate_index] = current_parents[candidate_index];
     }
 }
 
@@ -684,37 +684,37 @@ pub(super) fn rank_step(
 /// the item start, or C when the item carries none.
 #[cube(launch_unchecked)]
 pub(super) fn item_roots(
-    hp: &[u32],
-    c_count: &[u32],
-    ir: &[u32],
-    ic: &[u32],
-    roots: &mut [u32],
+    candidate_head_positions: &[u32],
+    candidate_count_buffer: &[u32],
+    item_record_bounds: &[u32],
+    item_cluster_enabled: &[u32],
+    item_root_candidates: &mut [u32],
 ) {
-    let it = ABSOLUTE_POS;
-    let item_count = ir.len() / 2;
-    let c = c_count[0];
-    if it < item_count {
-        if ic[it] != 0u32 {
-            let s = ir[it * 2] as usize;
-            let mut lo = 0u32;
-            let mut hi = c;
-            while lo < hi {
-                let mid = (lo + hi) / 2u32;
-                if (hp[mid as usize] as usize) < s {
-                    lo = mid + 1u32;
+    let item_index = ABSOLUTE_POS;
+    let item_count = item_record_bounds.len() / 2;
+    let candidate_count = candidate_count_buffer[0];
+    if item_index < item_count {
+        if item_cluster_enabled[item_index] != 0u32 {
+            let item_start_byte = item_record_bounds[item_index * 2] as usize;
+            let mut search_lo = 0u32;
+            let mut search_hi = candidate_count;
+            while search_lo < search_hi {
+                let search_mid = (search_lo + search_hi) / 2u32;
+                if (candidate_head_positions[search_mid as usize] as usize) < item_start_byte {
+                    search_lo = search_mid + 1u32;
                 }
-                if (hp[mid as usize] as usize) >= s {
-                    hi = mid;
+                if (candidate_head_positions[search_mid as usize] as usize) >= item_start_byte {
+                    search_hi = search_mid;
                 }
             }
-            let stop = ir[it * 2 + 1] as usize;
-            if lo < c && (hp[lo as usize] as usize) < stop {
-                roots[it] = lo;
+            let item_end_byte = item_record_bounds[item_index * 2 + 1] as usize;
+            if search_lo < candidate_count && (candidate_head_positions[search_lo as usize] as usize) < item_end_byte {
+                item_root_candidates[item_index] = search_lo;
             } else {
-                roots[it] = c;
+                item_root_candidates[item_index] = candidate_count;
             }
         } else {
-            roots[it] = c;
+            item_root_candidates[item_index] = candidate_count;
         }
     }
 }
@@ -727,17 +727,17 @@ pub(super) fn item_roots(
 /// straddle threads).
 #[cube(launch_unchecked)]
 pub(super) fn cluster_mark(
-    hp: &[u32],
-    tdepth: &[u32],
-    lvl: &[u32],
-    c_count: &[u32],
-    roots: &[u32],
-    ir: &[u32],
-    cend: &[u32],
-    cslot: &[u32],
-    sm: &mut [f32],
-    gi: &mut [u32],
-    fl_atomic: &mut [Atomic<u32>],
+    candidate_head_positions: &[u32],
+    total_depths: &[u32],
+    level_tables: &[u32],
+    candidate_count_buffer: &[u32],
+    item_root_candidates: &[u32],
+    item_record_bounds: &[u32],
+    candidate_end_positions: &[u32],
+    candidate_slots: &[u32],
+    advance_widths: &mut [f32],
+    glyph_indices: &mut [u32],
+    glyph_flags_atomic: &mut [Atomic<u32>],
     #[comptime] kmax: usize,
     #[comptime] stride: usize,
     bitmap_advance: f32,
@@ -746,56 +746,56 @@ pub(super) fn cluster_mark(
     // several same-typed slices) misbound rank_step outright before these
     // were comptime; there is no reason to keep a second instance of the
     // shape to find out how narrow the trigger is.
-    let i = ABSOLUTE_POS;
-    let c = c_count[0] as usize;
-    let item_count = ir.len() / 2;
-    if i < c && item_count > 0 {
-        let p = hp[i] as usize;
-        let it = item_search(ir, item_count, p);
-        let r = roots[it] as usize;
-        if r < c {
-            let tr = tdepth[r];
-            let ti = tdepth[i];
-            // ti == tr is the ROOT itself — distance 0, committed by
+    let candidate_index = ABSOLUTE_POS;
+    let candidate_count = candidate_count_buffer[0] as usize;
+    let item_count = item_record_bounds.len() / 2;
+    if candidate_index < candidate_count && item_count > 0 {
+        let head_pos = candidate_head_positions[candidate_index] as usize;
+        let item_index = item_search(item_record_bounds, item_count, head_pos);
+        let root_index = item_root_candidates[item_index] as usize;
+        if root_index < candidate_count {
+            let root_depth = total_depths[root_index];
+            let candidate_depth = total_depths[candidate_index];
+            // candidate_depth == root_depth is the ROOT itself — distance 0, committed by
             // definition (the lift loop below then never runs).
-            if ti <= tr {
-                let mut x = r as u32;
-                let mut rem = tr - ti;
+            if candidate_depth <= root_depth {
+                let mut x = root_index as u32;
+                let mut rem = root_depth - candidate_depth;
                 let mut k = 0usize;
                 while k < kmax && rem > 0u32 {
                     if rem & 1u32 == 1u32 {
-                        x = lvl[k * stride + x as usize];
+                        x = level_tables[k * stride + x as usize];
                     }
                     rem >>= 1u32;
                     k += 1usize;
                 }
-                if x as usize == i {
+                if x as usize == candidate_index {
                     // The trailer walk clamps to the ITEM END — cend can
                     // overrun it by up to one codepoint (the span-end walk
                     // starts a member before stop), and the serial side only
                     // ever marks members strictly inside the item. The Mojo
                     // chain's ownership rule, verbatim.
-                    let stop = ir[it * 2 + 1] as usize;
-                    let e = cend[i] as usize;
-                    let lim = if e < stop { e } else { stop };
-                    sm[p] = bitmap_advance;
+                    let item_end_boundary = item_record_bounds[item_index * 2 + 1] as usize;
+                    let candidate_end = candidate_end_positions[candidate_index] as usize;
+                    let marking_limit = if candidate_end < item_end_boundary { candidate_end } else { item_end_boundary };
+                    advance_widths[head_pos] = bitmap_advance;
                     // A committed head's glyph IS the sequence's slot —
                     // the record emitter's GLYPH_ID for cluster heads
                     // (fold.rs:607's slots.gi[id] = best_slot). The
                     // consumer is the repo parity driver / phase 4.
-                    gi[p] = cslot[i];
-                    let mut t = p + 1usize;
-                    while t < lim {
-                        if flags_at_from_atomic(fl_atomic, t) & F_LEADER != 0 {
-                            sm[t] = f32::from_bits(0u32);
+                    glyph_indices[head_pos] = candidate_slots[candidate_index];
+                    let mut trailer_pos = head_pos + 1usize;
+                    while trailer_pos < marking_limit {
+                        if flags_at_from_atomic(glyph_flags_atomic, trailer_pos) & F_LEADER != 0 {
+                            advance_widths[trailer_pos] = f32::from_bits(0u32);
                             // fold.rs:610-612: a trailer member's gi zeroes
                             // with its advance — the engine's records carry
                             // gi 0 for cluster trailers, and the parity
                             // driver catches exactly this.
-                            gi[t] = 0u32;
-                            fl_atomic[t >> 2].fetch_or(F_CLUSTER_TRAILER << (((t & 3) as u32) * 8u32));
+                            glyph_indices[trailer_pos] = 0u32;
+                            glyph_flags_atomic[trailer_pos >> 2].fetch_or(F_CLUSTER_TRAILER << (((trailer_pos & 3) as u32) * 8u32));
                         }
-                        t += 1usize;
+                        trailer_pos += 1usize;
                     }
                 }
             }
@@ -807,8 +807,8 @@ pub(super) fn cluster_mark(
 /// leader bits while OR-ing trailer bits into the same words — the fetch_or
 /// never touches bit 0, so reads stay consistent).
 #[cube]
-fn flags_at_from_atomic(fl: &mut [Atomic<u32>], i: usize) -> u32 {
-    fl[i >> 2].load() >> (((i & 3) as u32) * 8u32) & 0xFFu32
+fn flags_at_from_atomic(glyph_flags_atomic: &mut [Atomic<u32>], byte_index: usize) -> u32 {
+    glyph_flags_atomic[byte_index >> 2].load() >> (((byte_index & 3) as u32) * 8u32) & 0xFFu32
 }
 
 /// Host-side cluster inputs from a flat sequence table: the candidacy

@@ -54,7 +54,7 @@ pub use bench::bench;
 pub use checks::{cluster_check, decode_check, run};
 pub use repo_check::repo_check;
 pub use repo::ChainPhases;
-pub(crate) use repo::{ChainMode, InstanceInputs, SharedDevice, run_repo_chain};
+pub(crate) use repo::{InstanceInputs, SharedDevice, run_repo_chain};
 
 /// Pre-warms all 16 CubeCL compute pipelines in the background.
 pub fn prewarm(device: &SharedDevice) {
@@ -65,7 +65,7 @@ pub fn prewarm(device: &SharedDevice) {
 }
 
 // ── lane layout (glyph-identity.json, hash-pinned) ──────────────────────────
-const PARTIAL_COUNT_STRIDE: usize = 8;
+const PARTIAL_COUNT_STRIDE: usize = 9;
 const P_RESET: usize = 0;
 const P_NL: usize = 1;
 const P_GLYPHS: usize = 2;
@@ -74,6 +74,7 @@ const P_HEAD_LEN: usize = 4;
 const P_TAIL_LEN: usize = 5;
 const P_WRAP: usize = 6;
 const P_MODE: usize = 7;
+const P_SURVIVORS: usize = 8;
 /// The measure static is ADVANCE ONLY. Height is renderer statics the
 /// scan never reads; carrying it here doubled the per-byte measure traffic.
 const SM_STRIDE: usize = 1;
@@ -98,32 +99,68 @@ const LM_Z: usize = 2;
 const LC_STRIDE: usize = 2;
 const LC_ROW: usize = 0;
 const LC_COL: usize = 1;
-const IM_STRIDE: usize = 10;
-const IM_ORIGIN_Y: usize = 0;
-const IM_ORIGIN_Z: usize = 1;
-const IM_LINE_HEIGHT: usize = 2;
-const IM_Z_STEP: usize = 3;
-const IM_BAND_STRIDE_Y: usize = 4;
-const IM_DEPTH_PER_BAND: usize = 5;
-const IM_DEPTH_PER_COL: usize = 6;
-const IM_ORIGIN_X: usize = 8;
+const ITEM_DESC_STRIDE: usize = 32;
+
+// 0..2: Record bounds (item_record_bounds)
+const ITEM_DESC_BYTE_START: usize = 0;
+#[allow(dead_code)]
+const ITEM_DESC_BYTE_STOP: usize = 1;
+
+// 2..10: Layout configuration (item_layout_configs)
+const ITEM_DESC_PAGE_ROWS: usize = 2;
+const ITEM_DESC_PAGE_COLS: usize = 3;
+const ITEM_DESC_SCROLL_ROWS: usize = 4;
+const ITEM_DESC_PAGES_WIDE: usize = 5;
+const ITEM_DESC_WRAP_WIDTH: usize = 6;
+const ITEM_DESC_HAS_PAGE: usize = 7;
+const ITEM_DESC_WRAP_MODE: usize = 8;
+#[allow(dead_code)]
+const ITEM_DESC_CONFIG_PAD: usize = 9;
+
+// 10..20: Spatial metrics (item_spatial_metrics, stored as f32 bits via to_bits())
+const ITEM_DESC_ORIGIN_Y: usize = 10;
+const ITEM_DESC_ORIGIN_Z: usize = 11;
+const ITEM_DESC_LINE_HEIGHT: usize = 12;
+const ITEM_DESC_Z_STEP: usize = 13;
+const ITEM_DESC_BAND_STRIDE_Y: usize = 14;
+const ITEM_DESC_DEPTH_PER_BAND: usize = 15;
+const ITEM_DESC_DEPTH_PER_COL: usize = 16;
+#[allow(dead_code)]
+const ITEM_DESC_METRICS_PAD: usize = 17;
+const ITEM_DESC_ORIGIN_X: usize = 18;
 /// The z_step's f64 tail as a second f32 — the engine multiplies the FULL
 /// f64 param and the correctly-rounded lane alone measurably diverges at
-/// seg >= 3 (the wide-repo Z class: fl(3·0.15000000596) vs the engine's
-/// fl(3·0.1499999999999999944), one ulp apart). The outer fma folds this
-/// tail back in; see paginate's fma note.
-const IM_Z_STEP_LO: usize = 9;
-const IE_STRIDE: usize = 8;
-const IE_PAGE_ROWS: usize = 0;
-const IE_PAGE_COLS: usize = 1;
-const IE_SCROLL_ROWS: usize = 2;
-const IE_PAGES_WIDE: usize = 3;
-const IE_WRAP_WIDTH: usize = 4;
-const IE_HAS_PAGE: usize = 5;
-const IE_WRAP_MODE: usize = 6;
+/// seg >= 3. The outer fma folds this tail back in; see paginate's fma note.
+const ITEM_DESC_Z_STEP_LO: usize = 19;
+
+// 20: Page gap X (item_page_gap_x, stored as f32 bits via to_bits())
+const ITEM_DESC_PAGE_GAP_X: usize = 20;
+
+// 21..25: Paint configuration (consolidated from former h_paint buffer)
+const ITEM_DESC_COLOR_BASE: usize = 21;
+const ITEM_DESC_IS_PER_RECORD: usize = 22;
+const ITEM_DESC_FLAT_COLOR: usize = 23;
+const ITEM_DESC_GROUP: usize = 24;
+
+// 25..32: std430 16-byte alignment padding (7 zeros -> 32 words total, 128 bytes)
+#[allow(dead_code)]
+const ITEM_DESC_PAD0: usize = 25;
+#[allow(dead_code)]
+const ITEM_DESC_PAD1: usize = 26;
+#[allow(dead_code)]
+const ITEM_DESC_PAD2: usize = 27;
+#[allow(dead_code)]
+const ITEM_DESC_PAD3: usize = 28;
+#[allow(dead_code)]
+const ITEM_DESC_PAD4: usize = 29;
+#[allow(dead_code)]
+const ITEM_DESC_PAD5: usize = 30;
+#[allow(dead_code)]
+const ITEM_DESC_PAD6: usize = 31;
 
 const F_LEADER: u32 = 1;
 const F_NEWLINE: u32 = 4;
+pub(super) const F_SURVIVOR: u32 = 32;
 const WRAP_BACK: i32 = 1;
 
 // ── the driver ────────────────────────────────────────────────────────────────

@@ -7,7 +7,8 @@ use crate::text::ResolveGlyph;
 use rayon::prelude::*;
 use super::super::cluster::{cluster_host_inputs, cluster_pair_filter};
 use super::super::tail::{ordered_key_host, EXT_STRIDE};
-use super::super::{IE_STRIDE, IM_STRIDE};
+use super::super::ITEM_DESC_STRIDE;
+use super::InstanceInputs;
 
 pub(crate) struct ChainHostInputs {
     pub units: usize,
@@ -15,27 +16,22 @@ pub(crate) struct ChainHostInputs {
     pub log: usize,
     pub n_tiles: usize,
     pub n_words: usize,
-    pub rspan: usize,
     pub seq: Vec<u32>,
     pub seq_max: u32,
     pub bitmap_advance: f32,
     pub bitmap: Vec<u32>,
-    pub ic: Vec<u32>,
-    pub poff: Vec<u32>,
-    pub pval: Vec<u32>,
-    pub ir: Vec<u32>,
-    pub ie: Vec<u32>,
-    pub im: Vec<f32>,
-    pub page_gap_x: Vec<f32>,
+    pub item_cluster_enabled: Vec<u32>,
+    pub pair_secondary_offsets: Vec<u32>,
+    pub pair_secondary_values: Vec<u32>,
+    pub item_record_bounds: Vec<u32>,
+    pub item_descriptors: Vec<u32>,
     pub walk_plan: Vec<u32>,
-    pub min_sw: u32,
-    pub uniform_sw: u32,
     pub ext_seed: Vec<u32>,
     pub extent_words: Vec<u32>,
-    pub ltot: Vec<u32>,
-    pub stot: Vec<u32>,
-    pub rec_base: Vec<u32>,
-    pub slot_base: Vec<u32>,
+    pub leader_totals: Vec<u32>,
+    pub survivor_totals: Vec<u32>,
+    pub item_record_bases: Vec<u32>,
+    pub item_slot_bases: Vec<u32>,
     pub total_records: u32,
     pub total_slots: u32,
     pub has_cluster: bool,
@@ -162,6 +158,7 @@ pub(crate) fn prepare_chain_inputs(
     items: &[Item],
     trie: &TrieTable,
     wants_instances: bool,
+    instance_inputs: Option<&InstanceInputs>,
 ) -> ChainHostInputs {
     let item_count = items.len();
     let n = bytes.len();
@@ -176,10 +173,6 @@ pub(crate) fn prepare_chain_inputs(
     let log = units.ilog2() as usize;
     let n_tiles = n.div_ceil(units * rake).max(1);
     let n_words = n.div_ceil(4);
-    let rspan = std::env::var("GLYPH_CHAIN_SPAN")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(32usize);
     let (seq, seq_max, bitmap_advance) = match trie.cluster_table() {
         Some((s, m, a)) => (s.to_vec(), m, a),
         None => {
@@ -187,13 +180,11 @@ pub(crate) fn prepare_chain_inputs(
             std::process::exit(1);
         }
     };
-    let (bitmap, ic) = cluster_host_inputs(&seq, seq_max, items);
-    let (poff, pval) = cluster_pair_filter(&seq, seq_max);
-    let mut ir = Vec::with_capacity(item_count * 2);
-    let mut ie = Vec::with_capacity(item_count * IE_STRIDE);
-    let mut im = Vec::with_capacity(item_count * IM_STRIDE);
-    let mut page_gap_x = Vec::with_capacity(item_count);
-    for item in items {
+    let (bitmap, item_cluster_enabled) = cluster_host_inputs(&seq, seq_max, items);
+    let (pair_secondary_offsets, pair_secondary_values) = cluster_pair_filter(&seq, seq_max);
+    let mut item_record_bounds = Vec::with_capacity(item_count * 2);
+    let mut item_descriptors = Vec::with_capacity(item_count * ITEM_DESC_STRIDE);
+    for (item_idx, item) in items.iter().enumerate() {
         // Note 24 Q3: apply is compiled inline_resolve=false unconditionally
         // and resolve_x writes lm only for fold > 0 leaders — a foldless
         // item would render uninitialized lm with every gate green. No
@@ -203,34 +194,64 @@ pub(crate) fn prepare_chain_inputs(
             item.wrap_width > 0,
             "run_repo_chain requires folded items (wrap_width > 0)"
         );
-        ir.push(item.byte_start as u32);
-        ir.push((item.byte_start + item.byte_count) as u32);
-        ie.push(item.page_rows as u32);
-        ie.push(item.page_cols as u32);
-        ie.push(item.scroll_rows as u32);
-        ie.push(item.pages_wide as u32);
-        ie.push(item.wrap_width as u32);
-        ie.push(item.has_page as u32);
-        ie.push(match item.wrap_mode {
+        item_record_bounds.push(item.byte_start as u32);
+        item_record_bounds.push((item.byte_start + item.byte_count) as u32);
+
+        // Consolidated item descriptor: 32 words (128 B, 16-byte aligned)
+        // 0..2: Record bounds
+        item_descriptors.push(item.byte_start as u32);
+        item_descriptors.push((item.byte_start + item.byte_count) as u32);
+
+        // 2..10: Layout configuration
+        item_descriptors.push(item.page_rows as u32);
+        item_descriptors.push(item.page_cols as u32);
+        item_descriptors.push(item.scroll_rows as u32);
+        item_descriptors.push(item.pages_wide as u32);
+        item_descriptors.push(item.wrap_width as u32);
+        item_descriptors.push(item.has_page as u32);
+        item_descriptors.push(match item.wrap_mode {
             WrapMode::Down => 0u32,
             WrapMode::Back => 1,
         });
-        ie.push(0u32);
-        im.push(item.origin_y as f32);
-        im.push(item.origin_z as f32);
-        im.push(item.line_height as f32);
-        im.push(item.z_step as f32);
-        im.push(item.band_stride_y as f32);
-        im.push(item.depth_per_band as f32);
-        im.push(item.depth_per_col as f32);
-        im.push(0.0f32);
-        im.push(item.origin_x as f32);
-        im.push((item.z_step - item.z_step as f32 as f64) as f32);
-        page_gap_x.push(item.page_gap_x as f32);
+        item_descriptors.push(0u32); // config pad
+
+        // 10..20: Spatial metrics (stored as f32 bits)
+        item_descriptors.push((item.origin_y as f32).to_bits());
+        item_descriptors.push((item.origin_z as f32).to_bits());
+        item_descriptors.push((item.line_height as f32).to_bits());
+        item_descriptors.push((item.z_step as f32).to_bits());
+        item_descriptors.push((item.band_stride_y as f32).to_bits());
+        item_descriptors.push((item.depth_per_band as f32).to_bits());
+        item_descriptors.push((item.depth_per_col as f32).to_bits());
+        item_descriptors.push(0.0f32.to_bits()); // metrics pad
+        item_descriptors.push((item.origin_x as f32).to_bits());
+        item_descriptors.push(((item.z_step - item.z_step as f32 as f64) as f32).to_bits());
+
+        // 20: Page gap X
+        item_descriptors.push((item.page_gap_x as f32).to_bits());
+
+        // 21..25: Paint configuration (consolidated from former h_paint buffer)
+        let (color_base, is_per_record, flat_color, group) = if let Some(inp) = instance_inputs {
+            (inp.color_base[item_idx], inp.is_per_record[item_idx], inp.flat_colors[item_idx], inp.groups[item_idx])
+        } else {
+            (0, 0, 0, 0)
+        };
+        item_descriptors.push(color_base);
+        item_descriptors.push(is_per_record);
+        item_descriptors.push(flat_color);
+        item_descriptors.push(group);
+
+        // 25..32: std430 16-byte alignment padding (7 zeros)
+        item_descriptors.push(0u32);
+        item_descriptors.push(0u32);
+        item_descriptors.push(0u32);
+        item_descriptors.push(0u32);
+        item_descriptors.push(0u32);
+        item_descriptors.push(0u32);
+        item_descriptors.push(0u32);
     }
 
     let mut walk_plan: Vec<u32> = Vec::with_capacity(item_count * 3);
-    let mut min_sw = u32::MAX;
     for (i, item) in items.iter().enumerate() {
         let width = if item.wrap_width > 0 {
             item.wrap_width
@@ -239,27 +260,10 @@ pub(crate) fn prepare_chain_inputs(
         } else {
             0
         };
-        if width > 0 && (width as u32) < min_sw {
-            min_sw = width as u32;
-        }
-        walk_plan.push(ir[i * 2]);
-        walk_plan.push(ir[i * 2 + 1]);
+        walk_plan.push(item_record_bounds[i * 2]);
+        walk_plan.push(item_record_bounds[i * 2 + 1]);
         walk_plan.push(width as u32);
     }
-    let uniform_sw = if min_sw != u32::MAX && items.iter().all(|item| {
-        let width = if item.wrap_width > 0 {
-            item.wrap_width
-        } else if item.has_page {
-            item.page_cols
-        } else {
-            0
-        };
-        width == 0 || (width as u32) == min_sw
-    }) {
-        min_sw
-    } else {
-        0
-    };
 
     let mut ext_seed = vec![0u32; item_count * EXT_STRIDE];
     if wants_instances {
@@ -302,10 +306,10 @@ pub(crate) fn prepare_chain_inputs(
         .collect();
 
     let mut extent_words = Vec::with_capacity(item_count * 2);
-    let mut ltot = Vec::with_capacity(item_count);
-    let mut stot = Vec::with_capacity(item_count);
-    let mut rec_base = Vec::with_capacity(item_count);
-    let mut slot_base = Vec::with_capacity(item_count);
+    let mut leader_totals = Vec::with_capacity(item_count);
+    let mut survivor_totals = Vec::with_capacity(item_count);
+    let mut item_record_bases = Vec::with_capacity(item_count);
+    let mut item_slot_bases = Vec::with_capacity(item_count);
     let mut total_records = 0u32;
     let mut total_slots = 0u32;
 
@@ -318,12 +322,12 @@ pub(crate) fn prepare_chain_inputs(
         extent_words.push(key);
         extent_words.push(0x8000_0000u32);
 
-        rec_base.push(total_records);
-        slot_base.push(total_slots);
+        item_record_bases.push(total_records);
+        item_slot_bases.push(total_slots);
         total_records += scan.leader_count;
         total_slots += scan.survivor_count;
-        ltot.push(scan.leader_count);
-        stot.push(scan.survivor_count);
+        leader_totals.push(scan.leader_count);
+        survivor_totals.push(scan.survivor_count);
     }
 
     ChainHostInputs {
@@ -332,27 +336,22 @@ pub(crate) fn prepare_chain_inputs(
         log,
         n_tiles,
         n_words,
-        rspan,
         seq,
         seq_max,
         bitmap_advance,
         bitmap,
-        ic,
-        poff,
-        pval,
-        ir,
-        ie,
-        im,
-        page_gap_x,
+        item_cluster_enabled,
+        pair_secondary_offsets,
+        pair_secondary_values,
+        item_record_bounds,
+        item_descriptors,
         walk_plan,
-        min_sw,
-        uniform_sw,
         ext_seed,
         extent_words,
-        ltot,
-        stot,
-        rec_base,
-        slot_base,
+        leader_totals,
+        survivor_totals,
+        item_record_bases,
+        item_slot_bases,
         total_records,
         total_slots,
         has_cluster: items.iter().any(|it| it.cluster_mode == crate::fold::ClusterMode::Cluster),

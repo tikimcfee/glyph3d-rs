@@ -13,12 +13,12 @@ use super::cluster::{
     count_spine, count_tile, item_roots, jump_build, rank_step,
 };
 use super::decode::decode;
-use super::position::{derive_stride, extent_pair, resolve_x};
+use super::position::{extent_pair, resolve_x};
 use super::scan::{apply, spine_scan, tile_scan};
 use super::tail::emit_records;
 use super::{
-    F_LEADER, IE_STRIDE, IM_STRIDE, LC_COL, LC_ROW, LC_STRIDE, LM_STRIDE, LM_X, LM_Y, LM_Z,
-    PARTIAL_COUNT_STRIDE, pack_words,
+    F_CLUSTER_TRAILER, F_LEADER, F_SURVIVOR, ITEM_DESC_STRIDE, LC_COL, LC_ROW, LC_STRIDE,
+    LM_STRIDE, LM_X, LM_Y, LM_Z, PARTIAL_COUNT_STRIDE, pack_words,
 };
 
 pub fn run(ctx: &GpuContext, fixture_path: &Path) -> ! {
@@ -58,20 +58,24 @@ pub fn run(ctx: &GpuContext, fixture_path: &Path) -> ! {
     // the chain reads fl three-to-four passes and consumes only the low
     // byte; the full flags stay CPU-side for the renderer).
     let n_words = n.div_ceil(4);
-    let mut fl = Vec::with_capacity(n_words);
-    let mut sm = Vec::with_capacity(n);
+    let mut glyph_flags = Vec::with_capacity(n_words);
+    let mut advance_widths = Vec::with_capacity(n);
     for w in 0..n_words {
         let mut word = 0u32;
         for b in 0..4 {
             let i = w * 4 + b;
             if i < n {
-                word |= (r.slots.flags(i) & 0xFF) << (b * 8);
+                let mut f = r.slots.flags(i) & 0xFF;
+                if r.slots.gi[i] != 0 && (f & F_LEADER) != 0 && (f & F_CLUSTER_TRAILER) == 0 {
+                    f |= F_SURVIVOR;
+                }
+                word |= f << (b * 8);
             }
         }
-        fl.push(word);
+        glyph_flags.push(word);
     }
     for i in 0..n {
-        sm.push(r.slots.advance(i));
+        advance_widths.push(r.slots.advance(i));
     }
     // Phase 4 rung 2: the record lanes upload with the statics — gi and
     // height per byte from the reference decode (bit-identical to the
@@ -94,36 +98,59 @@ pub fn run(ctx: &GpuContext, fixture_path: &Path) -> ! {
         giv[i] = r.slots.gi[i];
         hgv[i] = r.slots.height(i);
     }
-    let mut ir = Vec::with_capacity(item_count * 2);
-    let mut ie = Vec::with_capacity(item_count * IE_STRIDE);
-    let mut im = Vec::with_capacity(item_count * IM_STRIDE);
-    let mut page_gap_x = Vec::with_capacity(item_count);
+    let mut item_record_bounds = Vec::with_capacity(item_count * 2);
+    let mut item_descriptors = Vec::with_capacity(item_count * ITEM_DESC_STRIDE);
     for item in &fx.items {
-        ir.push(item.byte_start as u32);
-        ir.push((item.byte_start + item.byte_count) as u32);
-        ie.push(item.page_rows as u32);
-        ie.push(item.page_cols as u32);
-        ie.push(item.scroll_rows as u32);
-        ie.push(item.pages_wide as u32);
-        ie.push(item.wrap_width as u32);
-        ie.push(item.has_page as u32);
-        ie.push(match item.wrap_mode {
+        item_record_bounds.push(item.byte_start as u32);
+        item_record_bounds.push((item.byte_start + item.byte_count) as u32);
+
+        // 0..2: Record bounds
+        item_descriptors.push(item.byte_start as u32);
+        item_descriptors.push((item.byte_start + item.byte_count) as u32);
+
+        // 2..10: Layout configuration
+        item_descriptors.push(item.page_rows as u32);
+        item_descriptors.push(item.page_cols as u32);
+        item_descriptors.push(item.scroll_rows as u32);
+        item_descriptors.push(item.pages_wide as u32);
+        item_descriptors.push(item.wrap_width as u32);
+        item_descriptors.push(item.has_page as u32);
+        item_descriptors.push(match item.wrap_mode {
             WrapMode::Down => 0u32,
             WrapMode::Back => 1,
         });
-        ie.push(0u32);
-        im.push(item.origin_y as f32);
-        im.push(item.origin_z as f32);
-        im.push(item.line_height as f32);
-        im.push(item.z_step as f32);
-        im.push(item.band_stride_y as f32);
-        im.push(item.depth_per_band as f32);
-        im.push(item.depth_per_col as f32);
-        im.push(0.0f32); // IM_PAGE_STRIDE_X: the device chain derives it on device
-        im.push(item.origin_x as f32);
+        item_descriptors.push(0u32); // config pad
+
+        // 10..20: Spatial metrics (stored as f32 bits)
+        item_descriptors.push((item.origin_y as f32).to_bits());
+        item_descriptors.push((item.origin_z as f32).to_bits());
+        item_descriptors.push((item.line_height as f32).to_bits());
+        item_descriptors.push((item.z_step as f32).to_bits());
+        item_descriptors.push((item.band_stride_y as f32).to_bits());
+        item_descriptors.push((item.depth_per_band as f32).to_bits());
+        item_descriptors.push((item.depth_per_col as f32).to_bits());
+        item_descriptors.push(0.0f32.to_bits()); // metrics pad
+        item_descriptors.push((item.origin_x as f32).to_bits());
         // The z_step pair's tail: the f64 param minus its f32 high word.
-        im.push((item.z_step - item.z_step as f32 as f64) as f32);
-        page_gap_x.push(item.page_gap_x as f32);
+        item_descriptors.push(((item.z_step - item.z_step as f32 as f64) as f32).to_bits());
+
+        // 20: Page gap X
+        item_descriptors.push((item.page_gap_x as f32).to_bits());
+
+        // 21..25: Paint configuration (consolidated from former h_paint buffer)
+        item_descriptors.push(0u32);
+        item_descriptors.push(0u32);
+        item_descriptors.push(0u32);
+        item_descriptors.push(0u32);
+
+        // 25..32: std430 16-byte alignment padding (7 zeros)
+        item_descriptors.push(0u32);
+        item_descriptors.push(0u32);
+        item_descriptors.push(0u32);
+        item_descriptors.push(0u32);
+        item_descriptors.push(0u32);
+        item_descriptors.push(0u32);
+        item_descriptors.push(0u32);
     }
 
     let setup = WgpuSetup {
@@ -136,32 +163,28 @@ pub fn run(ctx: &GpuContext, fixture_path: &Path) -> ! {
     let cdev = cubecl::wgpu::init_device(setup, Default::default());
     let client = cubecl::Device::Wgpu(cdev).client();
 
-    let h_fl = client.create_from_slice(bytemuck::cast_slice(&fl));
-    let h_sm = client.create_from_slice(bytemuck::cast_slice(&sm));
+    let h_fl = client.create_from_slice(bytemuck::cast_slice(&glyph_flags));
+    let h_sm = client.create_from_slice(bytemuck::cast_slice(&advance_widths));
     let h_gi = client.create_from_slice(bytemuck::cast_slice(&giv));
     let h_hgt = client.create_from_slice(bytemuck::cast_slice(&hgv));
     let h_recs = client.empty(leaders.max(1) * 8 * 4);
     // Per-item record bases: the record stream is item order, ordinal
     // order within items — base[it] is where item it's records start.
-    let mut rec_base = vec![0u32; item_count];
+    let mut item_record_bases = vec![0u32; item_count];
     for i in 1..item_count {
-        rec_base[i] = rec_base[i - 1] + item_leaders[i - 1];
+        item_record_bases[i] = item_record_bases[i - 1] + item_leaders[i - 1];
     }
-    let h_base = client.create_from_slice(bytemuck::cast_slice(&rec_base));
-    let h_ir = client.create_from_slice(bytemuck::cast_slice(&ir));
-    let h_ie = client.create_from_slice(bytemuck::cast_slice(&ie));
-    let h_im = client.create_from_slice(bytemuck::cast_slice(&im));
-    let h_gap = client.create_from_slice(bytemuck::cast_slice(&page_gap_x));
+    let h_base = client.create_from_slice(bytemuck::cast_slice(&item_record_bases));
+    let h_ir = client.create_from_slice(bytemuck::cast_slice(&item_record_bounds));
+    let h_item_desc = client.create_from_slice(bytemuck::cast_slice(&item_descriptors));
     let h_tc = client.empty(n_tiles * PARTIAL_COUNT_STRIDE * 4);
     let h_tm = client.empty(n_tiles * 4);
     let h_xc = client.empty(n_tiles * PARTIAL_COUNT_STRIDE * 4);
     let h_xm = client.empty(n_tiles * 4);
     let h_lc = client.empty(n * LC_STRIDE * 4);
-    let h_wm = client.empty(n * 4);
     let h_wc = client.empty(n * 4);
     let h_otb = client.empty(n * 4);
     let h_lm = client.empty(n * LM_STRIDE * 4);
-    let h_strides = client.empty(item_count * 8);
     let zeroes = vec![0u32; item_count];
     let h_rmax = client.create_from_slice(bytemuck::cast_slice(&zeroes));
     let h_xmax = client.create_from_slice(bytemuck::cast_slice(&zeroes));
@@ -219,8 +242,7 @@ pub fn run(ctx: &GpuContext, fixture_path: &Path) -> ! {
             CubeDim::new_1d(units as u32),
             BufferArg::from_raw_parts(h_fl.clone(), n_words),
             BufferArg::from_raw_parts(h_sm.clone(), n),
-            BufferArg::from_raw_parts(h_ir.clone(), item_count * 2),
-            BufferArg::from_raw_parts(h_ie.clone(), item_count * IE_STRIDE),
+            BufferArg::from_raw_parts(h_item_desc.clone(), item_descriptors.len()),
             BufferArg::from_raw_parts(h_tc.clone(), n_tiles * PARTIAL_COUNT_STRIDE),
             BufferArg::from_raw_parts(h_tm.clone(), n_tiles),
             units,
@@ -256,12 +278,9 @@ pub fn run(ctx: &GpuContext, fixture_path: &Path) -> ! {
                 BufferArg::from_raw_parts(h_sm.clone(), n),
                 BufferArg::from_raw_parts(h_lc.clone(), n * LC_STRIDE),
                 BufferArg::from_raw_parts(h_lm.clone(), n * LM_STRIDE),
-                BufferArg::from_raw_parts(h_ir.clone(), item_count * 2),
-                BufferArg::from_raw_parts(h_ie.clone(), item_count * IE_STRIDE),
-                BufferArg::from_raw_parts(h_im.clone(), item_count * IM_STRIDE),
+                BufferArg::from_raw_parts(h_item_desc.clone(), item_descriptors.len()),
                 BufferArg::from_raw_parts(h_xc.clone(), n_tiles * PARTIAL_COUNT_STRIDE),
                 BufferArg::from_raw_parts(h_xm.clone(), n_tiles),
-                BufferArg::from_raw_parts(h_wm.clone(), n),
                 BufferArg::from_raw_parts(h_wc.clone(), n),
                 BufferArg::from_raw_parts(h_otb.clone(), n),
                 BufferArg::from_raw_parts(h_rmax.clone(), item_count),
@@ -270,6 +289,7 @@ pub fn run(ctx: &GpuContext, fixture_path: &Path) -> ! {
                 rake,
                 log,
                 inline_resolve,
+                false,
                 false,
             );
         }
@@ -289,15 +309,6 @@ pub fn run(ctx: &GpuContext, fixture_path: &Path) -> ! {
                 units,
                 rake_ep,
             );
-            derive_stride::launch_unchecked(
-                &client,
-                cubes_of(item_count),
-                CubeDim::new_1d(256),
-                BufferArg::from_raw_parts(h_extent.clone(), item_count * 2),
-                BufferArg::from_raw_parts(h_ie.clone(), item_count * IE_STRIDE),
-                BufferArg::from_raw_parts(h_gap.clone(), item_count),
-                BufferArg::from_raw_parts(h_strides.clone(), item_count * 2),
-            );
         }
         if stages >= 5 {
             resolve_x::launch_unchecked(
@@ -308,16 +319,12 @@ pub fn run(ctx: &GpuContext, fixture_path: &Path) -> ! {
                 BufferArg::from_raw_parts(h_fl.clone(), n_words),
                 BufferArg::from_raw_parts(h_lm.clone(), n * LM_STRIDE),
                 BufferArg::from_raw_parts(h_lc.clone(), n * LC_STRIDE),
-                BufferArg::from_raw_parts(h_im.clone(), item_count * IM_STRIDE),
-                BufferArg::from_raw_parts(h_ie.clone(), item_count * IE_STRIDE),
-                BufferArg::from_raw_parts(h_ir.clone(), item_count * 2),
+                BufferArg::from_raw_parts(h_item_desc.clone(), item_descriptors.len()),
                 BufferArg::from_raw_parts(h_wc.clone(), n),
                 BufferArg::from_raw_parts(h_otb.clone(), n),
-                BufferArg::from_raw_parts(h_wm.clone(), n),
                 BufferArg::from_raw_parts(h_rmax.clone(), item_count),
                 BufferArg::from_raw_parts(h_xmax.clone(), item_count),
                 BufferArg::from_raw_parts(h_extent.clone(), item_count * 2),
-                BufferArg::from_raw_parts(h_gap.clone(), item_count),
                 256,
                 rspan,
             );
@@ -345,7 +352,6 @@ pub fn run(ctx: &GpuContext, fixture_path: &Path) -> ! {
     }
     let lc_bytes = client.read_one(h_lc).expect("read lc");
     let wc_bytes = client.read_one(h_wc).expect("read wc");
-    let wm_bytes = client.read_one(h_wm).expect("read wm");
     let lm_bytes = client.read_one(h_lm).expect("read lm");
     let rmax_bytes = client.read_one(h_rmax).expect("read rmax");
     let xmax_bytes = client.read_one(h_xmax).expect("read xmax");
@@ -375,18 +381,17 @@ pub fn run(ctx: &GpuContext, fixture_path: &Path) -> ! {
             );
         }
     }
-    let lc: &[u32] = bytemuck::cast_slice(&lc_bytes);
-    let wc: &[u32] = bytemuck::cast_slice(&wc_bytes);
-    let wm: &[f32] = bytemuck::cast_slice(&wm_bytes);
-    let lm: &[f32] = bytemuck::cast_slice(&lm_bytes);
+    let line_columns: &[u32] = bytemuck::cast_slice(&lc_bytes);
+    let item_record_ordinals: &[u32] = bytemuck::cast_slice(&wc_bytes);
+    let layout_metrics: &[f32] = bytemuck::cast_slice(&lm_bytes);
     let rmax: &[u32] = bytemuck::cast_slice(&rmax_bytes);
     let xmax: &[u32] = bytemuck::cast_slice(&xmax_bytes);
 
     // The item maxima, diffed DIRECTLY against the CPU fold's item_bounds
     // lanes (TOTAL_ROWS, MAX_ROW_EXTENT) — both arrive with resolve_x (stage 5).
     let host_key_to_float = |k: u32| -> f32 {
-        let b = if (k & 0x8000_0000) != 0 { k & 0x7FFF_FFFF } else { !k };
-        f32::from_bits(b)
+        let float_bits = if (k & 0x8000_0000) != 0 { k & 0x7FFF_FFFF } else { !k };
+        f32::from_bits(float_bits)
     };
     let mut bad = 0usize;
     let mut max_x_dev = 0.0f64;
@@ -441,7 +446,7 @@ pub fn run(ctx: &GpuContext, fixture_path: &Path) -> ! {
     // max deviation and held to the oracle's 1e-4 eps tier (the module
     // header's contract note — the Blelloch tree reassociates tail_adv).
     let mut max_pos_dev = 0.0f64;
-    let mut max_line_dev = 0.0f64;
+    let max_line_dev = 0.0f64;
     let mut leaders = 0usize;
     for id in 0..n {
         if r.slots.flags(id) & F_LEADER == 0 {
@@ -450,11 +455,11 @@ pub fn run(ctx: &GpuContext, fixture_path: &Path) -> ! {
         leaders += 1;
         let folds = fold_at(id);
         let mut checks = vec![
-            (r.slots.row(id), lc[id * LC_STRIDE + LC_ROW] as i64, "row"),
-            (r.slots.col(id), lc[id * LC_STRIDE + LC_COL] as i64, "col"),
+            (r.slots.row(id), line_columns[id * LC_STRIDE + LC_ROW] as i64, "row"),
+            (r.slots.col(id), line_columns[id * LC_STRIDE + LC_COL] as i64, "col"),
         ];
         if folds > 0 {
-            checks.push((r.slots.wc[id] as i64, wc[id] as i64, "ord"));
+            checks.push((r.slots.wc[id] as i64, item_record_ordinals[id] as i64, "ord"));
         }
         for (want, got, name) in checks {
             if want != got {
@@ -464,23 +469,18 @@ pub fn run(ctx: &GpuContext, fixture_path: &Path) -> ! {
                 bad += 1;
             }
         }
-        let la_cpu = r.slots.wm[id] as f64;
         if folds > 0 {
-            let la_rel = (wm[id] as f64 - la_cpu).abs() / la_cpu.abs().max(1.0);
-            if la_rel > max_line_dev {
-                max_line_dev = la_rel;
-            }
             // fold>0 X is a BIT-tier lane — the segment walk performs the
             // same re-sum adds in the same left-fold order, and this witness
             // holds it to that. (The eps-tier position diff below would hide
             // an order change; this cannot.) lm arrives with resolve_x
             // (stage 5) — partial-stage bisection skips it.
-            if stages >= 5 && lm[id * LM_STRIDE + LM_X].to_bits() != r.slots.x(id).to_bits() {
+            if stages >= 5 && layout_metrics[id * LM_STRIDE + LM_X].to_bits() != r.slots.x(id).to_bits() {
                 if bad < 8 {
                     println!(
                         "  MISMATCH byte {id} fold_x: cpu {:e} gpu {:e}",
                         r.slots.x(id),
-                        lm[id * LM_STRIDE + LM_X]
+                        layout_metrics[id * LM_STRIDE + LM_X]
                     );
                 }
                 bad += 1;
@@ -490,7 +490,7 @@ pub fn run(ctx: &GpuContext, fixture_path: &Path) -> ! {
         // bisection diffs the scan lanes only.
         if stages >= 5 {
             for (k, acc) in [(LM_X, r.slots.x(id)), (LM_Y, r.slots.y(id)), (LM_Z, r.slots.z(id))] {
-                let dev = (lm[id * LM_STRIDE + k] as f64 - acc as f64).abs();
+                let dev = (layout_metrics[id * LM_STRIDE + k] as f64 - acc as f64).abs();
                 let rel = dev / (acc as f64).abs().max(1.0);
                 if rel > max_pos_dev {
                     max_pos_dev = rel;
@@ -524,19 +524,19 @@ pub fn run(ctx: &GpuContext, fixture_path: &Path) -> ! {
                 i += 1;
             }
         }
-        for &(b, it) in &leader_item {
-            let w = (rec_base[it] as usize + r.slots.wc[b] as usize) * 8;
+        for &(byte_index, item_idx) in &leader_item {
+            let w = (item_record_bases[item_idx] as usize + r.slots.wc[byte_index] as usize) * 8;
             let xf = f32::from_bits(recs[w]);
             let yf = f32::from_bits(recs[w + 1]);
             let zf = f32::from_bits(recs[w + 2]);
             let af = f32::from_bits(recs[w + 3]);
             let hf = f32::from_bits(recs[w + 4]);
-            let mut ok = recs[w + 5] == r.slots.gi[b]
-                && recs[w + 6] == r.slots.lc[b * 2]
-                && recs[w + 7] == r.slots.lc[b * 2 + 1]
-                && af.to_bits() == r.slots.advance(b).to_bits()
-                && hf.to_bits() == r.slots.height(b).to_bits();
-            for (got, want) in [(xf, r.slots.x(b)), (yf, r.slots.y(b)), (zf, r.slots.z(b))] {
+            let mut ok = recs[w + 5] == r.slots.gi[byte_index]
+                && recs[w + 6] == r.slots.lc[byte_index * 2]
+                && recs[w + 7] == r.slots.lc[byte_index * 2 + 1]
+                && af.to_bits() == r.slots.advance(byte_index).to_bits()
+                && hf.to_bits() == r.slots.height(byte_index).to_bits();
+            for (got, want) in [(xf, r.slots.x(byte_index)), (yf, r.slots.y(byte_index)), (zf, r.slots.z(byte_index))] {
                 let rel = (got as f64 - want as f64).abs() / (want as f64).abs().max(1.0);
                 if rel > max_rec_dev {
                     max_rec_dev = rel;
@@ -548,7 +548,7 @@ pub fn run(ctx: &GpuContext, fixture_path: &Path) -> ! {
             if !ok {
                 if rec_bad < 8 {
                     println!(
-                        "  MISMATCH record @byte {b}: gi {} row {} col {} x {:e} y {:e} z {:e}",
+                        "  MISMATCH record @byte {byte_index}: gi {} row {} col {} x {:e} y {:e} z {:e}",
                         recs[w + 5], recs[w + 6], recs[w + 7], xf, yf, zf
                     );
                 }
@@ -658,26 +658,26 @@ pub fn decode_check(ctx: &GpuContext, fixture_path: &Path) -> ! {
     let hgt_bytes = client.read_one(h_hgt).expect("read hgt");
     let dt = t0.elapsed();
     let flw: &[u32] = bytemuck::cast_slice(&fl_bytes);
-    let sm: &[f32] = bytemuck::cast_slice(&sm_bytes);
+    let advance_widths: &[f32] = bytemuck::cast_slice(&sm_bytes);
     let giv: &[u32] = bytemuck::cast_slice(&gi_bytes);
     let hgv: &[f32] = bytemuck::cast_slice(&hgt_bytes);
 
     let mut bad = 0usize;
     for id in 0..n {
         let want_f = slots.flags(id) & 0xFF;
-        let got_f = (flw[id >> 2] >> (((id & 3) * 8) as u32)) & 0xFF;
+        let got_f = ((flw[id >> 2] >> (((id & 3) * 8) as u32)) & !F_SURVIVOR) & 0xFF;
         if want_f != got_f {
             if bad < 8 {
                 println!("  MISMATCH byte {id} flags: cpu {want_f:#04x} gpu {got_f:#04x}");
             }
             bad += 1;
         }
-        if slots.advance(id).to_bits() != sm[id].to_bits() {
+        if slots.advance(id).to_bits() != advance_widths[id].to_bits() {
             if bad < 8 {
                 println!(
                     "  MISMATCH byte {id} advance: cpu {:e} gpu {:e}",
                     slots.advance(id),
-                    sm[id]
+                    advance_widths[id]
                 );
             }
             bad += 1;
@@ -751,10 +751,10 @@ pub fn cluster_check(ctx: &GpuContext, fixture_path: &Path) -> ! {
         "seq_max {seq_max} would exceed the local key-scratch budget"
     );
     let (bitmap, ic) = cluster_host_inputs(&seq, seq_max, &fx.items);
-    let mut ir = Vec::with_capacity(fx.items.len() * 2);
+    let mut item_record_bounds = Vec::with_capacity(fx.items.len() * 2);
     for item in &fx.items {
-        ir.push(item.byte_start as u32);
-        ir.push((item.byte_start + item.byte_count) as u32);
+        item_record_bounds.push(item.byte_start as u32);
+        item_record_bounds.push((item.byte_start + item.byte_count) as u32);
     }
 
     let setup = WgpuSetup {
@@ -775,7 +775,7 @@ pub fn cluster_check(ctx: &GpuContext, fixture_path: &Path) -> ! {
     let (poff, pval) = cluster_pair_filter(&seq, seq_max);
     let h_poff = client.create_from_slice(bytemuck::cast_slice(&poff));
     let h_pval = client.create_from_slice(bytemuck::cast_slice(&pval));
-    let h_ir = client.create_from_slice(bytemuck::cast_slice(&ir));
+    let h_ir = client.create_from_slice(bytemuck::cast_slice(&item_record_bounds));
     let h_ic = client.create_from_slice(bytemuck::cast_slice(&ic));
     let h_fl = client.empty(n_words * 4);
     let h_sm = client.empty(n * 4);
@@ -828,7 +828,7 @@ pub fn cluster_check(ctx: &GpuContext, fixture_path: &Path) -> ! {
             BufferArg::from_raw_parts(h_poff.clone(), poff.len()),
             BufferArg::from_raw_parts(h_pval.clone(), pval.len()),
             BufferArg::from_raw_parts(h_seq.clone(), seq.len()),
-            BufferArg::from_raw_parts(h_ir.clone(), ir.len()),
+            BufferArg::from_raw_parts(h_ir.clone(), item_record_bounds.len()),
             BufferArg::from_raw_parts(h_ic.clone(), ic.len()),
             BufferArg::from_raw_parts(h_fl.clone(), n_words),
             BufferArg::from_raw_parts(h_sm.clone(), n),
@@ -898,7 +898,7 @@ pub fn cluster_check(ctx: &GpuContext, fixture_path: &Path) -> ! {
             CubeDim::new_1d(256),
             BufferArg::from_raw_parts(h_hp.clone(), c),
             BufferArg::from_raw_parts(h_cend.clone(), n),
-            BufferArg::from_raw_parts(h_ir.clone(), ir.len()),
+            BufferArg::from_raw_parts(h_ir.clone(), item_record_bounds.len()),
             BufferArg::from_raw_parts(h_total.clone(), 1),
             BufferArg::from_raw_parts(h_parent.clone(), c + 1),
             BufferArg::from_raw_parts(h_d0.clone(), c + 1),
@@ -927,7 +927,7 @@ pub fn cluster_check(ctx: &GpuContext, fixture_path: &Path) -> ! {
             CubeDim::new_1d(256),
             BufferArg::from_raw_parts(h_hp.clone(), c),
             BufferArg::from_raw_parts(h_total.clone(), 1),
-            BufferArg::from_raw_parts(h_ir.clone(), ir.len()),
+            BufferArg::from_raw_parts(h_ir.clone(), item_record_bounds.len()),
             BufferArg::from_raw_parts(h_ic.clone(), ic.len()),
             BufferArg::from_raw_parts(h_roots.clone(), fx.items.len()),
         );
@@ -940,7 +940,7 @@ pub fn cluster_check(ctx: &GpuContext, fixture_path: &Path) -> ! {
             BufferArg::from_raw_parts(h_lvl.clone(), kmax as usize * (c + 1)),
             BufferArg::from_raw_parts(h_total.clone(), 1),
             BufferArg::from_raw_parts(h_roots.clone(), fx.items.len()),
-            BufferArg::from_raw_parts(h_ir.clone(), ir.len()),
+            BufferArg::from_raw_parts(h_ir.clone(), item_record_bounds.len()),
             BufferArg::from_raw_parts(h_cend.clone(), n),
             BufferArg::from_raw_parts(h_cslot.clone(), n),
             BufferArg::from_raw_parts(h_sm.clone(), n),
@@ -970,7 +970,7 @@ pub fn cluster_check(ctx: &GpuContext, fixture_path: &Path) -> ! {
         );
     }
     let flw: &[u32] = bytemuck::cast_slice(&fl_bytes);
-    let sm: &[f32] = bytemuck::cast_slice(&sm_bytes);
+    let advance_widths: &[f32] = bytemuck::cast_slice(&sm_bytes);
     if std::env::var_os("GLYPH_CHAIN_DEBUG").is_some() {
         let cs = client.read_one(h_cslot).expect("read cslot");
         let ce = client.read_one(h_cend).expect("read cend");
@@ -993,19 +993,19 @@ pub fn cluster_check(ctx: &GpuContext, fixture_path: &Path) -> ! {
     let mut bad = 0usize;
     for id in 0..n {
         let want_f = slots.flags(id) & 0xFF;
-        let got_f = (flw[id >> 2] >> (((id & 3) * 8) as u32)) & 0xFF;
+        let got_f = ((flw[id >> 2] >> (((id & 3) * 8) as u32)) & !F_SURVIVOR) & 0xFF;
         if want_f != got_f {
             if bad < 8 {
                 println!("  MISMATCH byte {id} flags: cpu {want_f:#04x} gpu {got_f:#04x}");
             }
             bad += 1;
         }
-        if slots.advance(id).to_bits() != sm[id].to_bits() {
+        if slots.advance(id).to_bits() != advance_widths[id].to_bits() {
             if bad < 8 {
                 println!(
                     "  MISMATCH byte {id} advance: cpu {:e} gpu {:e}",
                     slots.advance(id),
-                    sm[id]
+                    advance_widths[id]
                 );
             }
             bad += 1;

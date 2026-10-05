@@ -6,18 +6,17 @@ use cubecl::wgpu::{AutoCompiler, WgpuServer};
 use crate::gpu::SharedDevice;
 use crate::layout::{InkExtent, ItemPlacement, PageExtent, TintMapped, TintStore};
 use super::super::tail::{key_to_float_host, EXT_STRIDE};
-use super::ChainMode;
 
 /// Fallback host-staged read of the tint stream via cubecl read_one.
 #[inline]
 pub(crate) fn read_tint_store_host(
     client: &Client,
-    h_tint: Handle,
+    h_instance_tints: Handle,
     total_slots: u32,
 ) -> TintStore {
-    let tb = client.read_one(h_tint).expect("read tint stream");
+    let tint_bytes = client.read_one(h_instance_tints).expect("read tint stream");
     TintStore::Host(
-        bytemuck::cast_slice::<u8, u32>(&tb)[..total_slots as usize * 2].to_vec(),
+        bytemuck::cast_slice::<u8, u32>(&tint_bytes)[..total_slots as usize * 2].to_vec(),
     )
 }
 
@@ -27,11 +26,11 @@ pub(crate) fn read_tint_store_host(
 pub(crate) fn read_tint_store_unified(
     client: &Client,
     device: &SharedDevice,
-    h_tint: Handle,
+    h_instance_tints: Handle,
     total_slots: u32,
 ) -> TintStore {
     let res = client
-        .get_resource::<WgpuServer<AutoCompiler>>(h_tint)
+        .get_resource::<WgpuServer<AutoCompiler>>(h_instance_tints)
         .expect("tint stream resource");
     let (src, src_off) = {
         let r = res.resource();
@@ -69,11 +68,11 @@ pub(crate) fn read_tint_store_unified(
 pub(crate) fn read_tint_store_discrete(
     client: &Client,
     device: &SharedDevice,
-    h_tint: Handle,
+    h_instance_tints: Handle,
     total_slots: u32,
 ) -> TintStore {
     let res = client
-        .get_resource::<WgpuServer<AutoCompiler>>(h_tint)
+        .get_resource::<WgpuServer<AutoCompiler>>(h_instance_tints)
         .expect("tint stream resource");
     let (src, src_off) = {
         let r = res.resource();
@@ -124,22 +123,22 @@ pub(crate) fn read_tint_store_discrete(
 pub(crate) fn read_tint_store(
     client: &Client,
     device: &SharedDevice,
-    h_tint: Handle,
+    h_instance_tints: Handle,
     total_slots: u32,
-    mode: ChainMode,
+    readback_host: bool,
 ) -> TintStore {
     if total_slots == 0 {
         return TintStore::Host(Vec::new());
     }
-    if matches!(mode, ChainMode::Both) {
-        return read_tint_store_host(client, h_tint, total_slots);
+    if readback_host {
+        return read_tint_store_host(client, h_instance_tints, total_slots);
     }
     if device.is_unified() && device.host_visible_storage {
-        read_tint_store_unified(client, device, h_tint, total_slots)
+        read_tint_store_unified(client, device, h_instance_tints, total_slots)
     } else if device.is_discrete() {
-        read_tint_store_discrete(client, device, h_tint, total_slots)
+        read_tint_store_discrete(client, device, h_instance_tints, total_slots)
     } else {
-        read_tint_store_host(client, h_tint, total_slots)
+        read_tint_store_host(client, h_instance_tints, total_slots)
     }
 }
 
@@ -183,38 +182,78 @@ pub(crate) fn mapped_read_buffer(device: &wgpu::Device, bytes: u64, label: &str)
 /// Decodes item placements from GPU extent lanes in key space.
 pub(crate) fn decode_placements(
     client: &Client,
-    h_ext: Handle,
+    device: &SharedDevice,
+    h_item_extents: Handle,
     item_count: usize,
     slot_base: &[u32],
-    stot: &[u32],
-    ltot: &[u32],
+    survivor_totals: &[u32],
+    leader_totals: &[u32],
 ) -> Vec<ItemPlacement> {
     let _sp_placements = tracing::info_span!("tail.placements").entered();
-    let tb_e = client.read_one(h_ext).expect("extent lanes");
-    let ev: &[u32] = bytemuck::cast_slice(&tb_e);
+    let extent_bytes_opt = if device.is_unified() && device.host_visible_storage {
+        let res = client
+            .get_resource::<WgpuServer<AutoCompiler>>(h_item_extents.clone())
+            .ok();
+        if let Some(res) = res {
+            let (src, src_off) = {
+                let r = res.resource();
+                (r.buffer.clone(), r.offset)
+            };
+            let bytes = (item_count * EXT_STRIDE * 4) as u64;
+            let (buf, ptr) = mapped_read_buffer(&device.device, bytes.max(4), "item extents");
+            let mut enc = device
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("item extents copy"),
+                });
+            enc.copy_buffer_to_buffer(&src, src_off, &buf, 0, bytes.max(4));
+            device.queue.submit([enc.finish()]);
+            device
+                .device
+                .poll(wgpu::PollType::Wait {
+                    submission_index: None,
+                    timeout: None,
+                })
+                .expect("extents copy poll");
+            let slice = unsafe { std::slice::from_raw_parts(ptr, item_count * EXT_STRIDE) };
+            Some((slice.to_vec(), buf))
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    let extent_values_storage;
+    let extent_values: &[u32] = if let Some((ref v, _)) = extent_bytes_opt {
+        v.as_slice()
+    } else {
+        extent_values_storage = client.read_one(h_item_extents).expect("extent lanes");
+        bytemuck::cast_slice(&extent_values_storage)
+    };
     let mut placements = Vec::with_capacity(item_count);
-    for it in 0..item_count {
-        let e = it * EXT_STRIDE;
+    for item_idx in 0..item_count {
+        let e = item_idx * EXT_STRIDE;
         placements.push(ItemPlacement {
-            slot_base: slot_base[it],
-            slot_count: stot[it],
-            record_count: ltot[it],
+            slot_base: slot_base[item_idx],
+            slot_count: survivor_totals[item_idx],
+            record_count: leader_totals[item_idx],
             page: PageExtent {
-                right: key_to_float_host(ev[e]),
-                bottom: key_to_float_host(ev[e + 1]),
-                z_min: key_to_float_host(ev[e + 2]),
-                z_max: key_to_float_host(ev[e + 3]),
+                right: key_to_float_host(extent_values[e]),
+                bottom: key_to_float_host(extent_values[e + 1]),
+                z_min: key_to_float_host(extent_values[e + 2]),
+                z_max: key_to_float_host(extent_values[e + 3]),
             },
             ink: InkExtent {
                 min: [
-                    key_to_float_host(ev[e + 4]),
-                    key_to_float_host(ev[e + 5]),
-                    key_to_float_host(ev[e + 8]),
+                    key_to_float_host(extent_values[e + 4]),
+                    key_to_float_host(extent_values[e + 5]),
+                    key_to_float_host(extent_values[e + 8]),
                 ],
                 max: [
-                    key_to_float_host(ev[e + 6]),
-                    key_to_float_host(ev[e + 7]),
-                    key_to_float_host(ev[e + 9]),
+                    key_to_float_host(extent_values[e + 6]),
+                    key_to_float_host(extent_values[e + 7]),
+                    key_to_float_host(extent_values[e + 9]),
                 ],
             },
         });
