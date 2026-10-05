@@ -287,6 +287,102 @@ fn test_antigravity_transcript_parsing() {
 }
 
 #[test]
+fn test_antigravity_encoded_strings_and_multiline_revisions() {
+    use crate::revision::RevisionEngine;
+
+    // Real-world Antigravity transcript format with double-encoded JSON string args:
+    let lines = vec![
+        json!({
+            "step_index": 0,
+            "type": "USER_INPUT",
+            "content": "Add helper functions to file",
+            "created_at": "2026-10-04T12:00:00Z"
+        }).to_string(),
+        json!({
+            "step_index": 1,
+            "type": "PLANNER_RESPONSE",
+            "thinking": "Viewing file first",
+            "content": "Viewing file now",
+            "tool_calls": [
+                {
+                    "name": "view_file",
+                    "args": {
+                        "AbsolutePath": "\"/virtual/Workspace/file.rs\"",
+                        "StartLine": "1",
+                        "EndLine": "3"
+                    }
+                }
+            ],
+            "created_at": "2026-10-04T12:00:01Z"
+        }).to_string(),
+        json!({
+            "step_index": 2,
+            "type": "GENERIC",
+            "content": "Created At: 2026-10-04T12:00:01Z\nShowing lines 1 to 3\nThe following code has been modified to include line numbers.\n1: fn line_one() {}\n2: fn line_two() {}\n3: fn line_three() {}",
+            "created_at": "2026-10-04T12:00:02Z"
+        }).to_string(),
+        json!({
+            "step_index": 3,
+            "type": "PLANNER_RESPONSE",
+            "thinking": "Editing file now",
+            "content": "Replacing line_two with expanded helper",
+            "tool_calls": [
+                {
+                    "name": "replace_file_content",
+                    "args": {
+                        "TargetFile": "\"/virtual/Workspace/file.rs\"",
+                        "TargetContent": "\"fn line_two() {}\"",
+                        "ReplacementContent": "\"fn line_two() {\\n    println!(\\\"expanded\\\");\\n}\"",
+                        "StartLine": "2",
+                        "EndLine": "2"
+                    }
+                }
+            ],
+            "created_at": "2026-10-04T12:00:03Z"
+        }).to_string(),
+    ];
+
+    let transcript = lines.join("\n");
+    let session = parse_antigravity_session(&transcript, "test_encoded_ag");
+
+    assert_eq!(session.turns.len(), 1);
+    let turn = &session.turns[0];
+    assert_eq!(turn.file_actions.len(), 2);
+
+    // 1. view_file: path cleaned without quotes, content extracted from GENERIC step
+    let read_action = &turn.file_actions[0];
+    assert_eq!(read_action.file_path, "/virtual/Workspace/file.rs");
+    let read_content = read_action.original_file.as_ref().expect("view_file content extracted");
+    assert_eq!(
+        read_content,
+        "fn line_one() {}\nfn line_two() {}\nfn line_three() {}"
+    );
+
+    // 2. replace_file_content: path cleaned, ReplacementContent unescaped with actual newlines
+    let edit_action = &turn.file_actions[1];
+    assert_eq!(edit_action.file_path, "/virtual/Workspace/file.rs");
+    assert_eq!(edit_action.old_content.as_deref(), Some("fn line_two() {}"));
+    assert_eq!(
+        edit_action.new_content.as_deref(),
+        Some("fn line_two() {\n    println!(\"expanded\");\n}")
+    );
+
+    // Ingest into RevisionEngine and verify revisions have real multi-line text
+    let mut engine = RevisionEngine::new();
+    engine.ingest_session(&session);
+
+    let history = engine.history("/virtual/Workspace/file.rs").expect("history exists");
+    assert_eq!(history.count(), 2);
+
+    let r0 = history.get(0).unwrap();
+    assert_eq!(r0.text.lines().count(), 3);
+
+    let r1 = history.get(1).unwrap();
+    // After replacing single line with 3-line function, total lines should be 5
+    assert_eq!(r1.text.lines().count(), 5);
+}
+
+#[test]
 fn test_multi_turn_file_actions() {
     let lines = vec![
         // Turn 1: user asks to create file

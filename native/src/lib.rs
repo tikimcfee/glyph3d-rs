@@ -287,14 +287,16 @@ fn build_scene_impl(
             let cur_dir = std::env::current_dir().ok();
 
             let mut rev_engine = revision::RevisionEngine::new().with_disk_resolver(move |rel_path: &str| {
-                let p = std::path::Path::new(rel_path);
+                let clean = rel_path.trim().trim_matches('"').trim_matches('\'');
+                let path_str = clean.strip_prefix("file://").unwrap_or(clean);
+                let p = std::path::Path::new(path_str);
                 if p.is_absolute() && p.is_file() {
                     if let Ok(content) = std::fs::read_to_string(p) {
                         return Some(content);
                     }
                 }
                 if let Some(ref cwd) = cwd_opt {
-                    let full = std::path::Path::new(cwd).join(rel_path);
+                    let full = std::path::Path::new(cwd).join(path_str);
                     if full.is_file() {
                         if let Ok(content) = std::fs::read_to_string(&full) {
                             return Some(content);
@@ -302,7 +304,7 @@ fn build_scene_impl(
                     }
                 }
                 if let Some(ref cur) = cur_dir {
-                    let full = cur.join(rel_path);
+                    let full = cur.join(path_str);
                     if full.is_file() {
                         if let Ok(content) = std::fs::read_to_string(&full) {
                             return Some(content);

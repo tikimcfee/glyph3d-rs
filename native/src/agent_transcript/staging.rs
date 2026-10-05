@@ -85,6 +85,22 @@ fn wrap_prose(text: &str, max_cols: usize) -> Vec<String> {
     out
 }
 
+/// Normalize text ensuring literal escaped newlines are converted to actual linebreaks.
+pub fn normalize_multiline_text(text: &str) -> std::borrow::Cow<'_, str> {
+    if !text.contains('\n') && text.contains("\\n") {
+        std::borrow::Cow::Owned(
+            text.replace("\\r\\n", "\n")
+                .replace("\\n", "\n")
+                .replace("\\r", "\n")
+                .replace("\\t", "\t")
+                .replace("\\\"", "\"")
+                .replace("\\\\", "\\"),
+        )
+    } else {
+        std::borrow::Cow::Borrowed(text)
+    }
+}
+
 /// Lay out colored text lines into glyph instances.
 #[allow(clippy::too_many_arguments)]
 fn layout_colored_lines(
@@ -694,7 +710,8 @@ fn format_beat_right_body(
                     .and_then(|h| h.get(0))
                     .map(|r| r.text.as_str())
             });
-            if let Some(text) = text_opt {
+            if let Some(raw_text) = text_opt {
+                let text = normalize_multiline_text(raw_text);
                 for (line_idx, l) in text.lines().take(5000).enumerate() {
                     let trimmed = l.trim_start();
                     let color = if trimmed.starts_with("//")
@@ -755,7 +772,8 @@ fn format_beat_right_body(
                     .map(|r| r.text.as_str())
             });
 
-            if let Some(text) = text_opt {
+            if let Some(raw_text) = text_opt {
+                let text = normalize_multiline_text(raw_text);
                 lines.push((
                     "[ FULL FILE WITH HIGHLIGHTED EDITS ]".to_string(),
                     [250, 205, 100],
@@ -809,7 +827,8 @@ fn format_beat_right_body(
                     .and_then(|h| h.revision_for_turn(event.turn_index))
                     .map(|r| r.text.as_str())
             });
-            if let Some(text) = text_opt {
+            if let Some(raw_text) = text_opt {
+                let text = normalize_multiline_text(raw_text);
                 for (line_idx, l) in text.lines().take(5000).enumerate() {
                     let trimmed = l.trim_start();
                     let color = if trimmed.starts_with("//")
@@ -830,7 +849,8 @@ fn format_beat_right_body(
         TranscriptEventKind::Command {
             output, is_error, ..
         } => {
-            if let Some(out) = output {
+            if let Some(raw_out) = output {
+                let out = normalize_multiline_text(raw_out);
                 let color = if *is_error {
                     [250, 130, 130]
                 } else {
@@ -849,7 +869,8 @@ fn format_beat_right_body(
         TranscriptEventKind::ToolInvocation {
             output, is_error, ..
         } => {
-            if let Some(out) = output {
+            if let Some(raw_out) = output {
+                let out = normalize_multiline_text(raw_out);
                 let color = if *is_error {
                     [250, 130, 130]
                 } else {
@@ -914,7 +935,8 @@ fn format_revision_card_header(rev: &FileRevision, file_path: &str) -> Vec<(Stri
 fn format_revision_card_body(rev: &FileRevision) -> Vec<(String, [u8; 3])> {
     let mut lines = Vec::new();
 
-    if !rev.text.is_empty() {
+    let norm_text = normalize_multiline_text(&rev.text);
+    if !norm_text.is_empty() {
         // Collect line numbers that were added or modified in this revision
         let mut added_lines = std::collections::HashSet::new();
         for hunk in &rev.hunks {
@@ -930,7 +952,7 @@ fn format_revision_card_body(rev: &FileRevision) -> Vec<(String, [u8; 3])> {
         }
 
         // Render whole file / chunk with highlighted edits
-        for (line_idx, l) in rev.text.lines().take(5000).enumerate() {
+        for (line_idx, l) in norm_text.lines().take(5000).enumerate() {
             let line_no = line_idx + 1;
             if added_lines.contains(&line_no) {
                 lines.push((format!("{:4} +│ {}", line_no, l), [120, 245, 140]));

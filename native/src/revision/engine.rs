@@ -284,16 +284,17 @@ impl RevisionEngine {
                 }
             }
             FileActionKind::Read => {
-                let text = action
-                    .original_file
+                let text = self
+                    .disk_resolver
                     .as_ref()
-                    .or(action.new_content.as_ref())
-                    .or(action.old_content.as_ref())
-                    .cloned()
+                    .and_then(|resolver| resolver(path))
                     .or_else(|| {
-                        self.disk_resolver
+                        action
+                            .original_file
                             .as_ref()
-                            .and_then(|resolver| resolver(path))
+                            .or(action.new_content.as_ref())
+                            .or(action.old_content.as_ref())
+                            .cloned()
                     });
 
                 if let Some(content) = text {
