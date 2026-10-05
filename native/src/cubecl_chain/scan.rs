@@ -109,34 +109,17 @@ pub(super) fn tile_scan(
             s_store(&mut shared_counts, &mut shared_metrics, unit_idx, &lhs);
         }
     }
-    // Exclusive: hold the total in a register (it publishes below), then seed
-    // the root with identity.
+    // The tile TOTAL is this dispatch's only output: the up-sweep leaves it
+    // at the root. No down-sweep — exclusive prefixes would land in shared
+    // memory that dies with the kernel; apply_and_emit re-rakes the tile and
+    // runs its own Blelloch seeded from the spine. (A down-sweep lived here
+    // until 2026-10-05: eight barriers and ~255 combines per tile whose
+    // results nothing read.)
     sync_cube();
     if unit_idx == units - 1 {
         let total = s_load(&shared_counts, &shared_metrics, unit_idx);
         p_store(tile_counts, tile_metrics, tile_idx, &total);
-        let e = identity();
-        s_store(&mut shared_counts, &mut shared_metrics, unit_idx, &e);
     }
-    // Down-sweep — NON-COMMUTATIVE form, derived and unit-tested by hand on
-    // n=8: t = x[unit_idx]; x[unit_idx] = combine(x[unit_idx], x[unit_idx-s]); x[unit_idx-s] = t. The carried
-    // prefix is the LEFT operand and the left child's TOTAL the right; the
-    // commutative textbook form (combine(x[unit_idx-s], x[unit_idx])) silently scrambles
-    // reset/head/tail lanes.
-    #[unroll]
-    for d in 0..log {
-        sync_cube();
-        let s = units >> (d + 1);
-        if (unit_idx + 1) & (2 * s - 1) == 0 {
-            let temp_carried = s_load(&shared_counts, &shared_metrics, unit_idx);
-            let mut lhs = s_load(&shared_counts, &shared_metrics, unit_idx);
-            let rhs = s_load(&shared_counts, &shared_metrics, unit_idx - s);
-            combine(&mut lhs, &rhs);
-            s_store(&mut shared_counts, &mut shared_metrics, unit_idx, &lhs);
-            s_store(&mut shared_counts, &mut shared_metrics, unit_idx - s, &temp_carried);
-        }
-    }
-    sync_cube();
 }
 
 // ── dispatch 2: spineScan — ONE cube over the tile totals ────────────────────

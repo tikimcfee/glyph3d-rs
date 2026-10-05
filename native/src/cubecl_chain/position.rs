@@ -438,6 +438,11 @@ pub(super) fn apply_and_emit(
         let e = identity();
         s_store(&mut shared_counts, &mut shared_metrics, unit_idx, &e);
     }
+    // Down-sweep — NON-COMMUTATIVE form, derived and unit-tested by hand on
+    // n=8: t = x[unit_idx]; x[unit_idx] = combine(x[unit_idx], x[unit_idx-s]); x[unit_idx-s] = t. The carried
+    // prefix is the LEFT operand and the left child's TOTAL the right; the
+    // commutative textbook form (combine(x[unit_idx-s], x[unit_idx])) silently scrambles
+    // reset/head/tail lanes.
     #[unroll]
     for d in 0..log {
         sync_cube();
