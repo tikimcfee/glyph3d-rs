@@ -18,6 +18,50 @@ use super::{
 };
 use super::tail::EXT_STRIDE;
 
+/// Barrier rounds of apply_and_emit's segment-entry chain: an entry x travels
+/// one unit (`rake` bytes) per round, so a wrap segment shorter than
+/// `SEGMENT_CHAIN_ROUNDS * rake` bytes resolves entirely in shared memory.
+/// A fixed count keeps every `sync_cube` in uniform control flow; units the
+/// rounds do not reach fall back to the backward walk, so any value is exact.
+const SEGMENT_CHAIN_ROUNDS: usize = 16;
+
+/// The entry x of a wrap segment entered at `entry_byte` with
+/// `segment_column` leaders of it already behind: walk back to the segment
+/// head, then add those leaders' advances left to right from 0.0 — the f32
+/// order every fold>0 X lane is pinned to. Bounded by byte 0 on the way back
+/// and by `entry_byte` on the way forward.
+#[cube]
+fn segment_entry_walk(
+    glyph_flags: &[u32],
+    advance_widths: &[f32],
+    entry_byte: usize,
+    segment_column: i32,
+) -> f32 {
+    let mut entry_advance_x = 0.0f32;
+    if segment_column > 0 {
+        let mut backward_column = segment_column;
+        let mut segment_head_index = entry_byte as i32 - 1;
+        while backward_column >= 1 && segment_head_index >= 0 {
+            if (flags_at(glyph_flags, segment_head_index as usize) & F_LEADER) != 0 {
+                backward_column -= 1;
+            }
+            if backward_column >= 1 {
+                segment_head_index -= 1;
+            }
+        }
+        if segment_head_index >= 0 {
+            let mut forward_index = segment_head_index as usize;
+            while forward_index < entry_byte {
+                if (flags_at(glyph_flags, forward_index) & F_LEADER) != 0 {
+                    entry_advance_x += advance_widths[forward_index];
+                }
+                forward_index += 1;
+            }
+        }
+    }
+    entry_advance_x
+}
+
 // ── dispatch 4: resolveX — the WRAPPED items' x, range workers ────────────────
 //
 // SKIPPED ENTIRELY when no item folds (the driver knows): foldless items
@@ -469,6 +513,164 @@ pub(super) fn apply_and_emit(
     }
     sync_cube();
 
+    // Phase 3b: the segment-entry chain. A unit's ENTRY x is the running
+    // left-to-right f32 sum of the leaders between the current wrap
+    // segment's head and its range start; its EXIT x is that sum carried
+    // through its own bytes. A unit whose bytes hold a reset point (a
+    // segment head, a newline, an item start) knows its exit without its
+    // predecessor ("exit ready"); otherwise exit = entry + its leaders'
+    // advances, added one at a time — never a pre-summed partial, so the
+    // f32 association is exactly the backward walk's. Entries propagate one
+    // unit per barrier round; a unit still unresolved after the last round
+    // falls back to the backward walk below. Unit 0's entry crosses the tile
+    // boundary and is walked once in global memory.
+    let unit_range_live = range_start < total_bytes;
+    let mut exit_ready = !unit_range_live;
+    let mut exit_advance_x = 0.0f32;
+    let mut first_leader_needs_entry = false;
+    // The unit's item state at range_start, held only through this phase so
+    // the chase's own copy is not live across the rounds.
+    let mut entry_item_start = 0usize;
+    let mut entry_fold_unit = 0i32;
+    let mut entry_item_index = 0usize;
+    if has_items {
+        entry_item_index = item_search_desc(item_descriptors, item_count, range_start);
+        entry_item_start = item_descriptors[entry_item_index * ITEM_DESC_STRIDE + ITEM_DESC_BYTE_START] as usize;
+        let entry_wrap_width = item_descriptors[entry_item_index * ITEM_DESC_STRIDE + ITEM_DESC_WRAP_WIDTH] as i32;
+        entry_fold_unit = fold_of(item_descriptors, entry_item_index, entry_wrap_width);
+    }
+    if unit_range_live {
+        let mut chain_item_index = entry_item_index;
+        let mut chain_item_start = entry_item_start;
+        let mut chain_next_item_boundary = if has_items && entry_item_index + 1 < item_count {
+            item_descriptors[(entry_item_index + 1) * ITEM_DESC_STRIDE + ITEM_DESC_BYTE_START] as usize
+        } else {
+            total_bytes
+        };
+        let mut chain_fold_unit = entry_fold_unit;
+        // Leaders until the next segment head (col % fold == 0): one modulo
+        // per unit instead of one per leader.
+        let mut leaders_until_head = 0i32;
+        if chain_fold_unit > 0 {
+            let entry_remainder = run.tail_len % chain_fold_unit;
+            if entry_remainder > 0 {
+                leaders_until_head = chain_fold_unit - entry_remainder;
+            }
+        }
+        let mut chain_leader_seen = false;
+        let mut chain_byte_index = range_start;
+        while chain_byte_index < range_end {
+            while has_items && chain_next_item_boundary <= chain_byte_index && chain_item_index + 1 < item_count {
+                chain_item_index += 1;
+                chain_item_start = item_descriptors[chain_item_index * ITEM_DESC_STRIDE + ITEM_DESC_BYTE_START] as usize;
+                chain_next_item_boundary = if chain_item_index + 1 < item_count {
+                    item_descriptors[(chain_item_index + 1) * ITEM_DESC_STRIDE + ITEM_DESC_BYTE_START] as usize
+                } else {
+                    total_bytes
+                };
+                let chain_wrap_width = item_descriptors[chain_item_index * ITEM_DESC_STRIDE + ITEM_DESC_WRAP_WIDTH] as i32;
+                chain_fold_unit = fold_of(item_descriptors, chain_item_index, chain_wrap_width);
+            }
+            if has_items && chain_byte_index == chain_item_start {
+                leaders_until_head = 0;
+                exit_ready = true;
+                exit_advance_x = 0.0f32;
+            }
+            let chain_local_index = chain_byte_index - tile_byte_start;
+            let chain_flag = (shared_tile_flags[chain_local_index >> 2] >> (((chain_local_index & 3) * 8) as u32)) & 0xFF;
+            if (chain_flag & F_LEADER) != 0 {
+                let chain_is_head = chain_fold_unit > 0 && leaders_until_head == 0;
+                if !chain_leader_seen && !exit_ready && chain_fold_unit > 0 && !chain_is_head {
+                    first_leader_needs_entry = true;
+                }
+                chain_leader_seen = true;
+                if chain_is_head {
+                    exit_ready = true;
+                    exit_advance_x = 0.0f32;
+                }
+                if (chain_flag & F_NEWLINE) != 0 {
+                    exit_ready = true;
+                    exit_advance_x = 0.0f32;
+                    leaders_until_head = 0;
+                } else {
+                    exit_advance_x += f32::from_bits(shared_counts[chain_local_index] as u32);
+                    leaders_until_head = if leaders_until_head == 0 { chain_fold_unit - 1 } else { leaders_until_head - 1 };
+                }
+            }
+            chain_byte_index += 1;
+        }
+        // A foldless item never reads a chained x (it uses run.tail_adv), and
+        // the next item starts with a reset, so its exit value is moot.
+        if chain_fold_unit == 0 {
+            exit_ready = true;
+        }
+    }
+
+    let mut entry_ready = false;
+    let mut entry_advance_x = 0.0f32;
+    if unit_idx == 0 {
+        entry_ready = true;
+        let range_starts_item = has_items && range_start == entry_item_start;
+        if unit_range_live && (first_leader_needs_entry || !exit_ready) && !range_starts_item && entry_fold_unit > 0 {
+            entry_advance_x = segment_entry_walk(glyph_flags, advance_widths, range_start, run.tail_len % entry_fold_unit);
+        }
+        if !exit_ready {
+            // No reset point in this range: exit = entry + each leader, in order.
+            let mut carried_advance_x = entry_advance_x;
+            let mut carry_byte_index = range_start;
+            while carry_byte_index < range_end {
+                let carry_local_index = carry_byte_index - tile_byte_start;
+                let carry_flag = (shared_tile_flags[carry_local_index >> 2] >> (((carry_local_index & 3) * 8) as u32)) & 0xFF;
+                if (carry_flag & F_LEADER) != 0 {
+                    carried_advance_x += f32::from_bits(shared_counts[carry_local_index] as u32);
+                }
+                carry_byte_index += 1;
+            }
+            exit_advance_x = carried_advance_x;
+            exit_ready = true;
+        }
+    }
+
+    // Ping-pong halves: round r reads half (r & 1) and writes the other, so a
+    // read never races a write within one barrier interval.
+    let chain_not_ready = 0xFFFF_FFFFu32;
+    let mut chain_exit_bits = Shared::<[u32]>::new_slice(2 * units);
+    chain_exit_bits[unit_idx] = if exit_ready { exit_advance_x.to_bits() } else { chain_not_ready };
+    sync_cube();
+    for round in 0..SEGMENT_CHAIN_ROUNDS {
+        let read_half = (round & 1) * units;
+        let write_half = units - read_half;
+        if !entry_ready && unit_idx > 0 {
+            let predecessor_exit_bits = chain_exit_bits[read_half + unit_idx - 1];
+            if predecessor_exit_bits != chain_not_ready {
+                entry_ready = true;
+                entry_advance_x = f32::from_bits(predecessor_exit_bits);
+                if !exit_ready {
+                    let mut carried_advance_x = entry_advance_x;
+                    let mut carry_byte_index = range_start;
+                    while carry_byte_index < range_end {
+                        let carry_local_index = carry_byte_index - tile_byte_start;
+                        let carry_flag = (shared_tile_flags[carry_local_index >> 2] >> (((carry_local_index & 3) * 8) as u32)) & 0xFF;
+                        if (carry_flag & F_LEADER) != 0 {
+                            carried_advance_x += f32::from_bits(shared_counts[carry_local_index] as u32);
+                        }
+                        carry_byte_index += 1;
+                    }
+                    exit_advance_x = carried_advance_x;
+                    exit_ready = true;
+                }
+            }
+        }
+        chain_exit_bits[write_half + unit_idx] = if exit_ready { exit_advance_x.to_bits() } else { chain_not_ready };
+        sync_cube();
+    }
+    // Fallback for segments longer than the rounds reach. A first leader that
+    // needs an entry has no reset point before it in this range, so its
+    // column and fold are the ones at range_start.
+    if first_leader_needs_entry && !entry_ready {
+        entry_advance_x = segment_entry_walk(glyph_flags, advance_widths, range_start, run.tail_len % entry_fold_unit);
+    }
+
     let cube_item_base = *shared_item_base as usize;
 
     let mut survivor_ordinal = run.survivors as u32;
@@ -504,6 +706,8 @@ pub(super) fn apply_and_emit(
         active_wrap_mode = item_descriptors[item_index * ITEM_DESC_STRIDE + ITEM_DESC_WRAP_MODE] as i32;
         fold_unit = fold_of(item_descriptors, item_index, active_wrap_width);
     }
+
+
     let mut current_advance_x = 0.0f32;
     let mut in_segment = false;
     let mut current_item_index = item_index;
@@ -599,53 +803,10 @@ pub(super) fn apply_and_emit(
                 if !in_segment || is_segment_head {
                     current_advance_x = 0.0f32;
                     if fold_unit > 0 && segment_column > 0 {
-                        let mut backward_column = segment_column;
-                        let mut start_byte_index = id as i32 - 1;
-                        let tile_byte_start_i32 = tile_byte_start as i32;
-
-                        // Fast branch-free walk in on-chip SRAM while inside the current tile
-                        while backward_column >= 1 && start_byte_index >= tile_byte_start_i32 {
-                            let local_idx = start_byte_index as usize - tile_byte_start;
-                            let flag = (shared_tile_flags[local_idx >> 2] >> (((local_idx & 3) * 8) as u32)) & 0xFF;
-                            if (flag & F_LEADER) != 0 {
-                                backward_column -= 1;
-                            }
-                            if backward_column >= 1 {
-                                start_byte_index -= 1;
-                            }
-                        }
-
-                        // Rare fallback: only if the segment crossed before the tile boundary
-                        while backward_column >= 1 && start_byte_index >= 0 {
-                            if (flags_at(glyph_flags, start_byte_index as usize) & F_LEADER) != 0 {
-                                backward_column -= 1;
-                            }
-                            if backward_column >= 1 {
-                                start_byte_index -= 1;
-                            }
-                        }
-
-                        // Fast forward accumulation
-                        if start_byte_index >= tile_byte_start_i32 {
-                            let local_start = start_byte_index as usize - tile_byte_start;
-                            let local_end = id - tile_byte_start;
-                            let mut local_idx = local_start;
-                            while local_idx < local_end {
-                                let flag = (shared_tile_flags[local_idx >> 2] >> (((local_idx & 3) * 8) as u32)) & 0xFF;
-                                if (flag & F_LEADER) != 0 {
-                                    current_advance_x += f32::from_bits(shared_counts[local_idx] as u32);
-                                }
-                                local_idx += 1;
-                            }
-                        } else {
-                            let mut forward_index = start_byte_index as usize;
-                            while forward_index < id {
-                                if (flags_at(glyph_flags, forward_index) & F_LEADER) != 0 {
-                                    current_advance_x += advance_widths[forward_index];
-                                }
-                                forward_index += 1;
-                            }
-                        }
+                        // Only a unit's first leader enters a segment mid-way
+                        // (an item start or newline makes col 0): its entry x
+                        // was resolved before the chase, by chain or walk.
+                        current_advance_x = entry_advance_x;
                     } else if fold_unit == 0 {
                         current_advance_x = run.tail_adv;
                     }
