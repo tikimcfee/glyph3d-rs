@@ -48,6 +48,7 @@ pub(crate) struct ChainBuffers {
     // Extent & tail inputs
     pub h_item_extents: Handle,
     pub h_per_record_semantic_colors: Handle,
+    pub h_segment_entry_advances: Handle,
     pub h_instance_slots: Handle,
     pub h_instance_tints: Handle,
     pub per_record_colors_words: usize,
@@ -169,6 +170,7 @@ pub(crate) fn allocate_chain_buffers(
     } else {
         (alloc_empty(4), 1)
     };
+    let h_segment_entry_advances = alloc_upload(bytemuck::cast_slice(&inputs.segment_entry_advances));
     let total_slots = inputs.total_slots;
     let (h_instance_slots, slots_words) = (
         alloc_empty(total_slots.max(1) as usize * 8 * 4),
@@ -242,6 +244,7 @@ pub(crate) fn allocate_chain_buffers(
             cluster_allocs,
             h_item_extents,
             h_per_record_semantic_colors,
+            h_segment_entry_advances,
             h_instance_slots,
             h_instance_tints,
             per_record_colors_words,

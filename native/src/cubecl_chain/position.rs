@@ -8,7 +8,7 @@ use super::monoid::{
 use super::scan::fold_of;
 use super::{
     F_LEADER, F_NEWLINE,
-    ITEM_DESC_BAND_STRIDE_Y, ITEM_DESC_BYTE_START, ITEM_DESC_COLOR_BASE, ITEM_DESC_DEPTH_PER_BAND,
+    ITEM_DESC_BAND_STRIDE_Y, ITEM_DESC_BYTE_START, ITEM_DESC_CELL_ADVANCE, ITEM_DESC_COLOR_BASE, ITEM_DESC_DEPTH_PER_BAND,
     ITEM_DESC_DEPTH_PER_COL, ITEM_DESC_FLAT_COLOR, ITEM_DESC_GROUP, ITEM_DESC_HAS_PAGE,
     ITEM_DESC_IS_PER_RECORD, ITEM_DESC_LINE_HEIGHT, ITEM_DESC_ORIGIN_X, ITEM_DESC_ORIGIN_Y,
     ITEM_DESC_ORIGIN_Z, ITEM_DESC_PAGE_COLS, ITEM_DESC_PAGE_GAP_X, ITEM_DESC_PAGE_ROWS,
@@ -300,6 +300,7 @@ pub(super) fn apply_and_emit(
     glyph_indices: &[u32],
     item_extents: &mut [Atomic<u32>],
     per_record_semantic_colors: &[u32],
+    segment_entry_advances: &[f32],
     instance_slots: &mut [u32],
     instance_tints: &mut [u32],
     #[comptime] units: usize,
@@ -377,6 +378,7 @@ pub(super) fn apply_and_emit(
     let mut next_item_boundary = total_bytes;
     let mut active_wrap_width = 0i32;
     let mut active_wrap_mode = 0i32;
+    let mut active_cell_advance_bits = 0u32;
     let has_items = item_count > 0;
     if has_items {
         item_index = item_search_desc(item_descriptors, item_count, range_start);
@@ -388,6 +390,7 @@ pub(super) fn apply_and_emit(
         };
         active_wrap_width = item_descriptors[item_index * ITEM_DESC_STRIDE + ITEM_DESC_WRAP_WIDTH] as i32;
         active_wrap_mode = item_descriptors[item_index * ITEM_DESC_STRIDE + ITEM_DESC_WRAP_MODE] as i32;
+        active_cell_advance_bits = item_descriptors[item_index * ITEM_DESC_STRIDE + ITEM_DESC_CELL_ADVANCE];
     }
     if range_start < total_bytes {
         let mut id = range_start;
@@ -402,9 +405,10 @@ pub(super) fn apply_and_emit(
                 };
                 active_wrap_width = item_descriptors[item_index * ITEM_DESC_STRIDE + ITEM_DESC_WRAP_WIDTH] as i32;
                 active_wrap_mode = item_descriptors[item_index * ITEM_DESC_STRIDE + ITEM_DESC_WRAP_MODE] as i32;
+                active_cell_advance_bits = item_descriptors[item_index * ITEM_DESC_STRIDE + ITEM_DESC_CELL_ADVANCE];
             }
             let reset = if has_items && id == start { 1i32 } else { 0i32 };
-            let leaf = leaf_of(glyph_flags, advance_widths, active_wrap_width, active_wrap_mode, reset, id);
+            let leaf = leaf_of(glyph_flags, advance_widths, active_wrap_width, active_wrap_mode, reset, active_cell_advance_bits, id);
             combine(&mut accumulator, &leaf);
             id += 1;
         }
@@ -491,6 +495,7 @@ pub(super) fn apply_and_emit(
     next_item_boundary = total_bytes;
     active_wrap_width = 0i32;
     active_wrap_mode = 0i32;
+    active_cell_advance_bits = 0u32;
     let mut fold_unit = 0i32;
     if has_items {
         item_index = item_search_desc(item_descriptors, item_count, range_start);
@@ -502,6 +507,7 @@ pub(super) fn apply_and_emit(
         };
         active_wrap_width = item_descriptors[item_index * ITEM_DESC_STRIDE + ITEM_DESC_WRAP_WIDTH] as i32;
         active_wrap_mode = item_descriptors[item_index * ITEM_DESC_STRIDE + ITEM_DESC_WRAP_MODE] as i32;
+        active_cell_advance_bits = item_descriptors[item_index * ITEM_DESC_STRIDE + ITEM_DESC_CELL_ADVANCE];
         fold_unit = fold_of(item_descriptors, item_index, active_wrap_width);
     }
     let mut current_advance_x = 0.0f32;
@@ -567,6 +573,7 @@ pub(super) fn apply_and_emit(
                 };
                 active_wrap_width = item_descriptors[item_index * ITEM_DESC_STRIDE + ITEM_DESC_WRAP_WIDTH] as i32;
                 active_wrap_mode = item_descriptors[item_index * ITEM_DESC_STRIDE + ITEM_DESC_WRAP_MODE] as i32;
+                active_cell_advance_bits = item_descriptors[item_index * ITEM_DESC_STRIDE + ITEM_DESC_CELL_ADVANCE];
                 fold_unit = fold_of(item_descriptors, item_index, active_wrap_width);
                 in_segment = false;
             }
@@ -579,6 +586,8 @@ pub(super) fn apply_and_emit(
                 run.head_len = 0;
                 run.tail_len = 0;
                 run.tail_adv = 0.0;
+                run.clean_len = 0;
+                run.clean_break = 1;
                 run.wrap = active_wrap_width;
                 run.mode = active_wrap_mode;
                 in_segment = false;
@@ -598,7 +607,18 @@ pub(super) fn apply_and_emit(
                 let is_segment_head = segment_column == 0;
                 if !in_segment || is_segment_head {
                     current_advance_x = 0.0f32;
-                    if fold_unit > 0 && segment_column > 0 {
+                    // The segment's `segment_column` leaders behind this one are
+                    // exactly the `segment_column` leaders immediately before it
+                    // (a newline or item reset would have zeroed col). When the
+                    // clean run covers them all, each is one cell and the walk's
+                    // left-to-right re-sum is the table entry, bit for bit.
+                    let entry_is_clean = fold_unit > 0
+                        && segment_column > 0
+                        && run.clean_len >= segment_column
+                        && (segment_column as usize) < segment_entry_advances.len();
+                    if entry_is_clean {
+                        current_advance_x = segment_entry_advances[segment_column as usize];
+                    } else if fold_unit > 0 && segment_column > 0 {
                         let mut backward_column = segment_column;
                         let mut start_byte_index = id as i32 - 1;
                         let tile_byte_start_i32 = tile_byte_start as i32;
@@ -784,7 +804,7 @@ pub(super) fn apply_and_emit(
                     current_advance_x += glyph_advance;
                 }
             }
-            let leaf = leaf_of(glyph_flags, advance_widths, active_wrap_width, active_wrap_mode, if reset { 1i32 } else { 0i32 }, id);
+            let leaf = leaf_of(glyph_flags, advance_widths, active_wrap_width, active_wrap_mode, if reset { 1i32 } else { 0i32 }, active_cell_advance_bits, id);
             combine(&mut run, &leaf);
             id += 1;
         }

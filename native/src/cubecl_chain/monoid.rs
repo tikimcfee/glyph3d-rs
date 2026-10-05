@@ -2,7 +2,8 @@ use cubecl::prelude::*;
 
 use super::{
     F_CLUSTER_TRAILER, F_LEADER, F_NEWLINE, F_SURVIVOR, ITEM_DESC_BYTE_START, ITEM_DESC_STRIDE,
-    P_GLYPHS, P_HEAD_LEN, P_MODE, P_NL, P_RESET, P_ROWS, P_SURVIVORS, P_TAIL_LEN, P_WRAP,
+    P_CLEAN_BREAK, P_CLEAN_LEN, P_GLYPHS, P_HEAD_LEN, P_MODE, P_NL, P_RESET, P_ROWS, P_SURVIVORS,
+    P_TAIL_LEN, P_WRAP,
     PARTIAL_COUNT_STRIDE, SM_ADVANCE, SM_STRIDE, WRAP_BACK,
 };
 
@@ -21,6 +22,18 @@ pub(super) struct ChainElem {
     pub(super) wrap: i32,
     pub(super) mode: i32,
     pub(super) survivors: i32,
+    /// Leaders since the last CLEAN BREAK — a newline, an item reset, or a
+    /// leader whose advance is not exactly one cell (`ITEM_DESC_CELL_ADVANCE`:
+    /// a double-width bitmap head, a zero-advance cluster trailer). The
+    /// classic last-run-length monoid, integer and therefore exactly
+    /// associative in any tree. apply_and_emit reads it at a segment entry:
+    /// when every leader back to the segment head is one cell, the entry x
+    /// is the host table's left-to-right sum of that many cells — the same
+    /// f32 adds in the same order as the backward walk, with no walk.
+    pub(super) clean_len: i32,
+    /// 1 when the element contains a clean break (clean_len then counts
+    /// only the leaders after its last one).
+    pub(super) clean_break: i32,
     pub(super) tail_adv: f32,
 }
 
@@ -36,6 +49,8 @@ pub(super) fn identity() -> ChainElem {
         wrap: 0,
         mode: 0,
         survivors: 0,
+        clean_len: 0,
+        clean_break: 0,
         tail_adv: 0.0,
     }
 }
@@ -142,7 +157,15 @@ pub(super) fn combine(lhs: &mut ChainElem, rhs: &ChainElem) {
         lhs.wrap = rhs.wrap;
         lhs.mode = rhs.mode;
         lhs.survivors += rhs.survivors;
+        lhs.clean_len = rhs.clean_len;
+        lhs.clean_break = 1;
     } else {
+        if rhs.clean_break != 0 {
+            lhs.clean_len = rhs.clean_len;
+            lhs.clean_break = 1;
+        } else {
+            lhs.clean_len += rhs.clean_len;
+        }
         lhs.wrap = rhs.wrap;
         lhs.mode = rhs.mode;
         if rhs.nl == 0 {
@@ -189,12 +212,16 @@ pub(super) fn leaf_of(
     wrap_width: i32,
     wrap_mode: i32,
     is_item_reset: i32,
+    cell_advance_bits: u32,
     byte_index: usize,
 ) -> ChainElem {
     let mut element = identity();
     element.reset = is_item_reset;
     element.wrap = wrap_width;
     element.mode = wrap_mode;
+    // An item reset is a clean break BEFORE this byte: a clean leader here
+    // still starts the new run with length 1.
+    element.clean_break = is_item_reset;
     let glyph_flag = flags_at(glyph_flags, byte_index);
     if (glyph_flag & F_LEADER) != 0 {
         element.glyphs = 1;
@@ -203,10 +230,17 @@ pub(super) fn leaf_of(
         }
         if (glyph_flag & F_NEWLINE) != 0 {
             element.nl = 1;
+            element.clean_break = 1;
         } else {
             element.head_len = 1;
             element.tail_len = 1;
-            element.tail_adv = advance_widths[byte_index * SM_STRIDE + SM_ADVANCE];
+            let leader_advance = advance_widths[byte_index * SM_STRIDE + SM_ADVANCE];
+            element.tail_adv = leader_advance;
+            if leader_advance.to_bits() == cell_advance_bits {
+                element.clean_len = 1;
+            } else {
+                element.clean_break = 1;
+            }
         }
     }
     element
@@ -225,6 +259,8 @@ pub(super) fn p_load(partial_counts: &[u32], partial_metrics: &[f32], i: usize) 
         wrap: partial_counts[offset + P_WRAP] as i32,
         mode: partial_counts[offset + P_MODE] as i32,
         survivors: partial_counts[offset + P_SURVIVORS] as i32,
+        clean_len: partial_counts[offset + P_CLEAN_LEN] as i32,
+        clean_break: partial_counts[offset + P_CLEAN_BREAK] as i32,
         tail_adv: partial_metrics[i],
     }
 }
@@ -241,6 +277,8 @@ pub(super) fn p_store(partial_counts: &mut [u32], partial_metrics: &mut [f32], i
     partial_counts[offset + P_WRAP] = element.wrap as u32;
     partial_counts[offset + P_MODE] = element.mode as u32;
     partial_counts[offset + P_SURVIVORS] = element.survivors as u32;
+    partial_counts[offset + P_CLEAN_LEN] = element.clean_len as u32;
+    partial_counts[offset + P_CLEAN_BREAK] = element.clean_break as u32;
     partial_metrics[i] = element.tail_adv;
 }
 
@@ -309,6 +347,8 @@ pub(super) fn s_load(shared_counts: &[i32], shared_metrics: &[f32], i: usize) ->
         wrap: shared_counts[offset + P_WRAP],
         mode: shared_counts[offset + P_MODE],
         survivors: shared_counts[offset + P_SURVIVORS],
+        clean_len: shared_counts[offset + P_CLEAN_LEN],
+        clean_break: shared_counts[offset + P_CLEAN_BREAK],
         tail_adv: shared_metrics[i],
     }
 }
@@ -326,5 +366,7 @@ pub(super) fn s_store(shared_counts: &mut [i32], shared_metrics: &mut [f32], i: 
     shared_counts[offset + P_WRAP] = element.wrap;
     shared_counts[offset + P_MODE] = element.mode;
     shared_counts[offset + P_SURVIVORS] = element.survivors;
+    shared_counts[offset + P_CLEAN_LEN] = element.clean_len;
+    shared_counts[offset + P_CLEAN_BREAK] = element.clean_break;
     shared_metrics[i] = element.tail_adv;
 }

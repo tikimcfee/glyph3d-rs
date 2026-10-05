@@ -65,7 +65,7 @@ pub fn prewarm(device: &SharedDevice) {
 }
 
 // ── lane layout (glyph-identity.json, hash-pinned) ──────────────────────────
-const PARTIAL_COUNT_STRIDE: usize = 9;
+const PARTIAL_COUNT_STRIDE: usize = 11;
 const P_RESET: usize = 0;
 const P_NL: usize = 1;
 const P_GLYPHS: usize = 2;
@@ -75,6 +75,10 @@ const P_TAIL_LEN: usize = 5;
 const P_WRAP: usize = 6;
 const P_MODE: usize = 7;
 const P_SURVIVORS: usize = 8;
+/// The clean-run lanes (monoid.rs `ChainElem::clean_len`): device-only,
+/// appended after the schema's nine — no CPU-side fold reads them.
+const P_CLEAN_LEN: usize = 9;
+const P_CLEAN_BREAK: usize = 10;
 /// The measure static is ADVANCE ONLY. Height is renderer statics the
 /// scan never reads; carrying it here doubled the per-byte measure traffic.
 const SM_STRIDE: usize = 1;
@@ -142,9 +146,12 @@ const ITEM_DESC_IS_PER_RECORD: usize = 22;
 const ITEM_DESC_FLAT_COLOR: usize = 23;
 const ITEM_DESC_GROUP: usize = 24;
 
-// 25..32: std430 16-byte alignment padding (7 zeros -> 32 words total, 128 bytes)
-#[allow(dead_code)]
-const ITEM_DESC_PAD0: usize = 25;
+// 25: The one-cell advance, f32 bits (fu_to_world(primary advance_fu)) —
+// leaf_of's clean-leader test. A descriptor that leaves it zero only makes
+// every leader a clean break, so apply_and_emit walks as before.
+const ITEM_DESC_CELL_ADVANCE: usize = 25;
+
+// 26..32: std430 16-byte alignment padding (6 zeros -> 32 words total, 128 bytes)
 #[allow(dead_code)]
 const ITEM_DESC_PAD1: usize = 26;
 #[allow(dead_code)]

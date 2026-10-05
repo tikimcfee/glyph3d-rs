@@ -25,6 +25,9 @@ pub(crate) struct ChainHostInputs {
     pub pair_secondary_values: Vec<u32>,
     pub item_record_bounds: Vec<u32>,
     pub item_descriptors: Vec<u32>,
+    /// `segment_entry_advances[k]`: k one-cell advances summed left to right
+    /// from 0.0 in f32 — apply_and_emit's O(1) entry x for a clean segment.
+    pub segment_entry_advances: Vec<f32>,
     pub walk_plan: Vec<u32>,
     pub ext_seed: Vec<u32>,
     pub extent_words: Vec<u32>,
@@ -184,6 +187,22 @@ pub(crate) fn prepare_chain_inputs(
     let (pair_secondary_offsets, pair_secondary_values) = cluster_pair_filter(&seq, seq_max);
     let mut item_record_bounds = Vec::with_capacity(item_count * 2);
     let mut item_descriptors = Vec::with_capacity(item_count * ITEM_DESC_STRIDE);
+    // The one-cell advance, in the same conversion decode writes per byte,
+    // and its left-to-right running sums out to the widest fold: the exact
+    // f32 sequence the backward walk re-adds for an all-one-cell segment.
+    let cell_advance = crate::text::fu_to_world(trie.metrics.advance_fu as i32, trie.metrics.em_height_fu);
+    let widest_fold = items
+        .iter()
+        .map(|item| if item.wrap_width > 0 { item.wrap_width as usize } else if item.has_page { item.page_cols as usize } else { 0 })
+        .max()
+        .unwrap_or(0);
+    let mut segment_entry_advances = Vec::with_capacity(widest_fold + 1);
+    let mut running_advance = 0.0f32;
+    segment_entry_advances.push(running_advance);
+    for _ in 0..widest_fold {
+        running_advance += cell_advance;
+        segment_entry_advances.push(running_advance);
+    }
     for (item_idx, item) in items.iter().enumerate() {
         // Note 24 Q3: apply is compiled inline_resolve=false unconditionally
         // and resolve_x writes lm only for fold > 0 leaders — a foldless
@@ -241,8 +260,10 @@ pub(crate) fn prepare_chain_inputs(
         item_descriptors.push(flat_color);
         item_descriptors.push(group);
 
-        // 25..32: std430 16-byte alignment padding (7 zeros)
-        item_descriptors.push(0u32);
+        // 25: the one-cell advance (leaf_of's clean-leader test)
+        item_descriptors.push(cell_advance.to_bits());
+
+        // 26..32: std430 16-byte alignment padding (6 zeros)
         item_descriptors.push(0u32);
         item_descriptors.push(0u32);
         item_descriptors.push(0u32);
@@ -345,6 +366,7 @@ pub(crate) fn prepare_chain_inputs(
         pair_secondary_values,
         item_record_bounds,
         item_descriptors,
+        segment_entry_advances,
         walk_plan,
         ext_seed,
         extent_words,

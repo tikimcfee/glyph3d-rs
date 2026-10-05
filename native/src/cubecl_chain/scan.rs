@@ -6,7 +6,7 @@ use super::monoid::{
 };
 use super::{
     F_LEADER, F_NEWLINE,
-    ITEM_DESC_BYTE_START, ITEM_DESC_HAS_PAGE, ITEM_DESC_LINE_HEIGHT, ITEM_DESC_ORIGIN_X,
+    ITEM_DESC_BYTE_START, ITEM_DESC_CELL_ADVANCE, ITEM_DESC_HAS_PAGE, ITEM_DESC_LINE_HEIGHT, ITEM_DESC_ORIGIN_X,
     ITEM_DESC_ORIGIN_Y, ITEM_DESC_ORIGIN_Z, ITEM_DESC_PAGE_COLS, ITEM_DESC_STRIDE,
     ITEM_DESC_WRAP_MODE, ITEM_DESC_WRAP_WIDTH, ITEM_DESC_Z_STEP, ITEM_DESC_Z_STEP_LO,
     LC_COL, LC_ROW, LC_STRIDE, LM_STRIDE, LM_X, LM_Y, LM_Z, P_MODE, P_WRAP,
@@ -52,6 +52,7 @@ pub(super) fn tile_scan(
     let mut next_item_boundary = total_bytes;
     let mut active_wrap_width = 0i32;
     let mut active_wrap_mode = 0i32;
+    let mut active_cell_advance_bits = 0u32;
     let has_items = item_count > 0;
     if has_items {
         item_index = item_search_desc(item_descriptors, item_count, seed);
@@ -63,6 +64,7 @@ pub(super) fn tile_scan(
         };
         active_wrap_width = item_descriptors[item_index * ITEM_DESC_STRIDE + ITEM_DESC_WRAP_WIDTH] as i32;
         active_wrap_mode = item_descriptors[item_index * ITEM_DESC_STRIDE + ITEM_DESC_WRAP_MODE] as i32;
+        active_cell_advance_bits = item_descriptors[item_index * ITEM_DESC_STRIDE + ITEM_DESC_CELL_ADVANCE];
     }
     let mut accumulator = identity();
     if range_start < total_bytes {
@@ -78,9 +80,10 @@ pub(super) fn tile_scan(
                 };
                 active_wrap_width = item_descriptors[item_index * ITEM_DESC_STRIDE + ITEM_DESC_WRAP_WIDTH] as i32;
                 active_wrap_mode = item_descriptors[item_index * ITEM_DESC_STRIDE + ITEM_DESC_WRAP_MODE] as i32;
+                active_cell_advance_bits = item_descriptors[item_index * ITEM_DESC_STRIDE + ITEM_DESC_CELL_ADVANCE];
             }
             let reset = if has_items && id == start { 1i32 } else { 0i32 };
-            let leaf = leaf_of(glyph_flags, advance_widths, active_wrap_width, active_wrap_mode, reset, id);
+            let leaf = leaf_of(glyph_flags, advance_widths, active_wrap_width, active_wrap_mode, reset, active_cell_advance_bits, id);
             combine(&mut accumulator, &leaf);
             id += 1;
         }
@@ -334,6 +337,7 @@ pub(super) fn apply(
     let mut next_item_boundary = total_bytes;
     let mut active_wrap_width = 0i32;
     let mut active_wrap_mode = 0i32;
+    let mut active_cell_advance_bits = 0u32;
     let has_items = item_count > 0;
     if has_items {
         item_index = item_search_desc(item_descriptors, item_count, seed);
@@ -345,6 +349,7 @@ pub(super) fn apply(
         };
         active_wrap_width = item_descriptors[item_index * ITEM_DESC_STRIDE + ITEM_DESC_WRAP_WIDTH] as i32;
         active_wrap_mode = item_descriptors[item_index * ITEM_DESC_STRIDE + ITEM_DESC_WRAP_MODE] as i32;
+        active_cell_advance_bits = item_descriptors[item_index * ITEM_DESC_STRIDE + ITEM_DESC_CELL_ADVANCE];
     }
     let mut accumulator = identity();
     if range_start < total_bytes {
@@ -360,9 +365,10 @@ pub(super) fn apply(
                 };
                 active_wrap_width = item_descriptors[item_index * ITEM_DESC_STRIDE + ITEM_DESC_WRAP_WIDTH] as i32;
                 active_wrap_mode = item_descriptors[item_index * ITEM_DESC_STRIDE + ITEM_DESC_WRAP_MODE] as i32;
+                active_cell_advance_bits = item_descriptors[item_index * ITEM_DESC_STRIDE + ITEM_DESC_CELL_ADVANCE];
             }
             let reset = if has_items && id == start { 1i32 } else { 0i32 };
-            let leaf = leaf_of(glyph_flags, advance_widths, active_wrap_width, active_wrap_mode, reset, id);
+            let leaf = leaf_of(glyph_flags, advance_widths, active_wrap_width, active_wrap_mode, reset, active_cell_advance_bits, id);
             combine(&mut accumulator, &leaf);
             id += 1;
         }
@@ -422,6 +428,7 @@ pub(super) fn apply(
     next_item_boundary = total_bytes;
     active_wrap_width = 0i32;
     active_wrap_mode = 0i32;
+    active_cell_advance_bits = 0u32;
     let mut active_fold_width = 0i32;
     if has_items {
         item_index = item_search_desc(item_descriptors, item_count, range_start);
@@ -433,6 +440,7 @@ pub(super) fn apply(
         };
         active_wrap_width = item_descriptors[item_index * ITEM_DESC_STRIDE + ITEM_DESC_WRAP_WIDTH] as i32;
         active_wrap_mode = item_descriptors[item_index * ITEM_DESC_STRIDE + ITEM_DESC_WRAP_MODE] as i32;
+        active_cell_advance_bits = item_descriptors[item_index * ITEM_DESC_STRIDE + ITEM_DESC_CELL_ADVANCE];
         active_fold_width = fold_of(item_descriptors, item_index, active_wrap_width);
     }
     if range_start < total_bytes {
@@ -448,6 +456,7 @@ pub(super) fn apply(
                 };
                 active_wrap_width = item_descriptors[item_index * ITEM_DESC_STRIDE + ITEM_DESC_WRAP_WIDTH] as i32;
                 active_wrap_mode = item_descriptors[item_index * ITEM_DESC_STRIDE + ITEM_DESC_WRAP_MODE] as i32;
+                active_cell_advance_bits = item_descriptors[item_index * ITEM_DESC_STRIDE + ITEM_DESC_CELL_ADVANCE];
                 active_fold_width = fold_of(item_descriptors, item_index, active_wrap_width);
             }
             let reset = has_items && id == start;
@@ -534,7 +543,7 @@ pub(super) fn apply(
                     }
                 }
             }
-            let leaf = leaf_of(glyph_flags, advance_widths, active_wrap_width, active_wrap_mode, if reset { 1i32 } else { 0i32 }, id);
+            let leaf = leaf_of(glyph_flags, advance_widths, active_wrap_width, active_wrap_mode, if reset { 1i32 } else { 0i32 }, active_cell_advance_bits, id);
             combine(&mut run, &leaf);
             id += 1;
         }
