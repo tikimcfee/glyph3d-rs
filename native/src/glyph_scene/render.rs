@@ -207,6 +207,24 @@ pub(super) fn render_scene(
                 .unwrap_or_else(|| {
                     session.turns.get(carrel_comp.active_turn).map(|t| t.summary()).unwrap_or_default()
                 });
+
+            let total_items = if !events.is_empty() { carrel_comp.beat_count } else { carrel_comp.turn_count };
+            let limit = carrel_comp.layout_options.deck_window_limit.max(1);
+            let max_deck_scroll = total_items.saturating_sub(limit);
+            let k = carrel_comp.layout_options.deck_scroll_offset.min(max_deck_scroll);
+            let m = limit.min(total_items.saturating_sub(k));
+            let window_item_range = if total_items > 0 && m > 0 {
+                let newest = total_items - k;
+                let oldest = total_items - k - m + 1;
+                (oldest, newest)
+            } else {
+                (0, 0)
+            };
+
+            let max_desk_scroll = ctrl.revision_engine.as_ref().map(|re| {
+                re.all_histories().values().map(|h| h.revisions.len().saturating_sub(carrel_comp.layout_options.desk_revision_limit.max(1))).max().unwrap_or(0)
+            }).unwrap_or(0);
+
             Some(crate::glyph_scene::UiCarrelState {
                 session_id: carrel_comp.session_id.clone(),
                 active_turn: carrel_comp.active_turn,
@@ -216,6 +234,10 @@ pub(super) fn render_scene(
                 prompt_summary: prompt.to_string(),
                 beat_summary,
                 touched_files: touched,
+                layout_options: carrel_comp.layout_options,
+                window_item_range,
+                max_deck_scroll,
+                max_desk_scroll,
             })
         });
         if scene.cull.is_some() {

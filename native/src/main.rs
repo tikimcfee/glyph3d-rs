@@ -177,6 +177,13 @@ fn main() {
         SceneChoice::AgentSession {
             session_path: session_path.clone(),
             emoji_sheet,
+            layout_options: spatial_scene::CarrelLayoutOptions {
+                deck_window_limit: cli.deck_window_limit,
+                deck_scroll_offset: cli.deck_scroll_offset,
+                desk_revision_limit: cli.desk_revision_limit,
+                desk_scroll_offset: 0,
+                max_file_stacks: 20,
+            },
         }
     } else if let Some(dir) = &cli.load_repo {
         SceneChoice::Repo {

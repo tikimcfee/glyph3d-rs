@@ -24,6 +24,7 @@ pub enum TurnPageKind {
 /// Component marking a 2-page Agent Turn Card unit.
 #[derive(Component, Debug, Clone)]
 pub struct AgentTurnCard {
+    pub deck_slot: usize,
     pub event_index: usize,
     pub turn_index: usize,
     pub page_size: [f32; 2],
@@ -38,6 +39,7 @@ impl SpatialScene {
     pub fn spawn_agent_turn_card(
         &mut self,
         parent: Entity,
+        deck_slot: usize,
         event_index: usize,
         turn_index: usize,
         page_size: [f32; 2],
@@ -68,7 +70,7 @@ impl SpatialScene {
                 ChildOf(parent),
                 Name::new(format!("beat_{event_index}: {title_str}")),
                 card_bounds,
-                DeckItem { index: event_index },
+                DeckItem { index: deck_slot },
             ))
             .id();
 
@@ -175,6 +177,7 @@ impl SpatialScene {
         }
 
         self.world.entity_mut(card_entity).insert(AgentTurnCard {
+            deck_slot,
             event_index,
             turn_index,
             page_size,

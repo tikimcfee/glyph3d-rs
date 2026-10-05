@@ -1000,12 +1000,13 @@ fn format_revision_card_body(rev: &FileRevision) -> Vec<(String, [u8; 3])> {
     lines
 }
 
-/// Stage an Agent Session and its Workdesk into a visual 3D scene.
-pub fn stage_agent_session(
+/// Stage an Agent Session and its Workdesk into a visual 3D scene with custom layout options.
+pub fn stage_agent_session_with_options(
     atlas: Option<&Atlas>,
     slot_ink: &[Option<[f32; 4]>],
     session: AgentSession,
     revision_engine: RevisionEngine,
+    layout_options: crate::spatial_scene::CarrelLayoutOptions,
 ) -> StagedText {
     let params = RepoParams {
         layout_mode: RepoLayoutMode::Carrel,
@@ -1013,7 +1014,7 @@ pub fn stage_agent_session(
     };
     let mut controller = LayoutController::new(params);
 
-    controller.spawn_agent_carrel_session(session.clone(), revision_engine.clone());
+    controller.spawn_agent_carrel_session_with_options(session.clone(), revision_engine.clone(), layout_options);
 
     // Dynamic bounding volume enclosing the carrel (Deck + Workdesk):
     let (bounds_min, bounds_max) = if let Some(carrel_e) = controller.active_carrel {
@@ -1347,4 +1348,20 @@ pub fn stage_agent_session(
         pick: None,
         controller: Some(controller),
     }
+}
+
+/// Stage an Agent Session and its Workdesk into a visual 3D scene with default options.
+pub fn stage_agent_session(
+    atlas: Option<&Atlas>,
+    slot_ink: &[Option<[f32; 4]>],
+    session: AgentSession,
+    revision_engine: RevisionEngine,
+) -> StagedText {
+    stage_agent_session_with_options(
+        atlas,
+        slot_ink,
+        session,
+        revision_engine,
+        crate::spatial_scene::CarrelLayoutOptions::default(),
+    )
 }

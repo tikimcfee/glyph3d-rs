@@ -381,6 +381,7 @@ impl LayoutController {
                 deck,
                 i,
                 i,
+                i,
                 [55.0, 36.0],
                 4.0,
                 *title,
@@ -436,11 +437,12 @@ impl LayoutController {
         "spawned Agent Carrel demo with 4 Turn Cards and Workdesk (press [ / ] or n / p to turn pages, v to splay grid, c to grab/drag)".to_string()
     }
 
-    /// Spawn an Agent Carrel into the spatial scene and track it for navigation.
-    pub fn spawn_agent_carrel_session(
+    /// Spawn an Agent Carrel into the spatial scene with custom options and track it for navigation.
+    pub fn spawn_agent_carrel_session_with_options(
         &mut self,
         session: crate::agent_transcript::AgentSession,
         revision_engine: crate::revision::RevisionEngine,
+        options: crate::spatial_scene::CarrelLayoutOptions,
     ) -> Entity {
         let carrel_root = self.scene.spawn_root("agent_carrel_root");
         let carrel_zone = self.scene.spawn_zone(
@@ -452,12 +454,25 @@ impl LayoutController {
         );
         self.zone_entities.insert("agent:carrel".to_string(), carrel_zone);
 
-        let carrel_e = self.scene.spawn_agent_carrel(carrel_zone, &session, &revision_engine);
+        let carrel_e = self.scene.spawn_agent_carrel_with_options(carrel_zone, &session, &revision_engine, options);
         self.active_carrel = Some(carrel_e);
         self.session = Some(session);
         self.revision_engine = Some(revision_engine);
         self.scene.update_transforms();
         carrel_e
+    }
+
+    /// Spawn an Agent Carrel into the spatial scene and track it for navigation.
+    pub fn spawn_agent_carrel_session(
+        &mut self,
+        session: crate::agent_transcript::AgentSession,
+        revision_engine: crate::revision::RevisionEngine,
+    ) -> Entity {
+        self.spawn_agent_carrel_session_with_options(
+            session,
+            revision_engine,
+            crate::spatial_scene::CarrelLayoutOptions::default(),
+        )
     }
 
     /// Advance active atomic beat (or turn) in the agent carrel.

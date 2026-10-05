@@ -95,6 +95,10 @@ pub struct UiCarrelState {
     pub prompt_summary: String,
     pub beat_summary: String,
     pub touched_files: Vec<(String, usize, usize)>, // (path, active_revision, revision_count)
+    pub layout_options: crate::spatial_scene::CarrelLayoutOptions,
+    pub window_item_range: (usize, usize), // (oldest_index_in_window + 1, newest_index_in_window + 1)
+    pub max_deck_scroll: usize,
+    pub max_desk_scroll: usize,
 }
 
 /// Stage K (K5): one static group-browser row — file identity + the

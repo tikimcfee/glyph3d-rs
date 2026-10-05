@@ -16,6 +16,66 @@ use super::{
     ChildOf, SpatialScene,
 };
 
+use serde::{Deserialize, Serialize};
+
+/// Layout configuration and sliding window limits for an Agent Carrel.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CarrelLayoutOptions {
+    /// Maximum number of turn / beat cards visible in the sliding window (default 20).
+    pub deck_window_limit: usize,
+    /// Number of turns/beats scrolled backward in time from the latest ($K$, default 0).
+    pub deck_scroll_offset: usize,
+    /// Maximum number of file revisions visible in each file stack sliding window (default 20).
+    pub desk_revision_limit: usize,
+    /// Number of revisions scrolled backward in time for file stacks (default 0).
+    pub desk_scroll_offset: usize,
+    /// Maximum number of file stacks placed on the workdesk (default 20).
+    pub max_file_stacks: usize,
+}
+
+impl Default for CarrelLayoutOptions {
+    fn default() -> Self {
+        Self {
+            deck_window_limit: 20,
+            deck_scroll_offset: 0,
+            desk_revision_limit: 20,
+            desk_scroll_offset: 0,
+            max_file_stacks: 20,
+        }
+    }
+}
+
+impl CarrelLayoutOptions {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn with_deck_limit(mut self, limit: usize) -> Self {
+        self.deck_window_limit = limit.max(1);
+        self
+    }
+
+    pub fn with_deck_scroll(mut self, scroll: usize) -> Self {
+        self.deck_scroll_offset = scroll;
+        self
+    }
+
+    pub fn with_desk_limit(mut self, limit: usize) -> Self {
+        self.desk_revision_limit = limit.max(1);
+        self
+    }
+
+    pub fn with_desk_scroll(mut self, scroll: usize) -> Self {
+        self.desk_scroll_offset = scroll;
+        self
+    }
+
+    pub fn with_max_file_stacks(mut self, max: usize) -> Self {
+        self.max_file_stacks = max.max(1);
+        self
+    }
+}
+
 /// Component marking an Agent Carrel workstation container.
 #[derive(Component, Debug, Clone)]
 pub struct AgentCarrel {
@@ -26,18 +86,21 @@ pub struct AgentCarrel {
     pub turn_count: usize,
     pub active_beat: usize,
     pub beat_count: usize,
+    pub layout_options: CarrelLayoutOptions,
+    pub slot_to_beat: Vec<usize>,
 }
 
 impl SpatialScene {
-    /// Spawn an Agent Carrel containing an AgentTurnCard Deck and a Workdesk.
-    pub fn spawn_agent_carrel(
+    /// Spawn an Agent Carrel containing an AgentTurnCard Deck and a Workdesk with custom layout options.
+    pub fn spawn_agent_carrel_with_options(
         &mut self,
         parent: Entity,
         session: &AgentSession,
         revision_engine: &RevisionEngine,
+        options: CarrelLayoutOptions,
     ) -> Entity {
         let events = session.linearize_events(Some(revision_engine));
-        let beat_count = events.len();
+        let total_events = events.len();
         let turn_count = session.turn_count();
 
         // 1. Root Carrel container
@@ -60,33 +123,51 @@ impl SpatialScene {
             ))
             .id();
 
-        let deck = Deck::default().with_mode(DeckMode::Deck);
+        let deck = Deck::default()
+            .with_mode(DeckMode::Deck)
+            .with_window_limit(options.deck_window_limit)
+            .with_scroll_offset(options.deck_scroll_offset);
         let deck_entity = self.spawn_deck(deck_parent, "turn_deck", deck);
 
-        // Spawn 2-page Agent Turn Cards for each atomic narrative beat
-        if events.is_empty() {
-            for turn in &session.turns {
-                self.spawn_agent_turn_card(
-                    deck_entity,
-                    turn.turn_index,
-                    turn.turn_index,
-                    [55.0, 40.0],
-                    4.0,
-                    turn.summary(),
-                    None,
-                );
-            }
-        } else {
-            for event in &events {
-                self.spawn_agent_turn_card(
-                    deck_entity,
-                    event.index,
-                    event.turn_index,
-                    [55.0, 40.0],
-                    4.0,
-                    event.summary(),
-                    Some(event.banner_colors()),
-                );
+        // Spawn 2-page Agent Turn Cards using sliding window
+        // The newest item is always first in the stack (position 0 / slot 0)
+        let total_items = if total_events > 0 { total_events } else { turn_count };
+        let mut slot_to_beat = Vec::new();
+
+        if total_items > 0 {
+            let limit = options.deck_window_limit.max(1);
+            let max_scroll = total_items.saturating_sub(limit);
+            let scroll_k = options.deck_scroll_offset.min(max_scroll);
+            let window_size = limit.min(total_items.saturating_sub(scroll_k));
+
+            for slot in 0..window_size {
+                let chrono_idx = (total_items - 1 - scroll_k) - slot;
+                slot_to_beat.push(chrono_idx);
+                if !events.is_empty() {
+                    let event = &events[chrono_idx];
+                    self.spawn_agent_turn_card(
+                        deck_entity,
+                        slot,
+                        event.index,
+                        event.turn_index,
+                        [55.0, 40.0],
+                        4.0,
+                        event.summary(),
+                        Some(event.banner_colors()),
+                    );
+                } else {
+                    let turn = &session.turns[chrono_idx];
+                    self.spawn_agent_turn_card(
+                        deck_entity,
+                        slot,
+                        turn.turn_index,
+                        turn.turn_index,
+                        [55.0, 40.0],
+                        4.0,
+                        turn.summary(),
+                        None,
+                    );
+                }
             }
         }
 
@@ -107,14 +188,39 @@ impl SpatialScene {
             15.0,
         );
 
-        // Populate Workdesk with FileRevisionStacks from RevisionEngine
-        for path in revision_engine.file_paths() {
+        // Populate Workdesk with FileRevisionStacks from RevisionEngine using sliding window
+        let mut all_files = revision_engine.file_paths();
+        all_files.sort_by_key(|path| {
+            let last_ev = revision_engine
+                .history(path)
+                .and_then(|h| h.revisions.last())
+                .and_then(|r| r.event_index)
+                .unwrap_or(0);
+            std::cmp::Reverse(last_ev)
+        });
+
+        let file_limit = options.max_file_stacks.max(1);
+        let desk_rev_limit = options.desk_revision_limit.max(1);
+
+        for path in all_files.into_iter().take(file_limit) {
             if let Some(history) = revision_engine.history(&path) {
-                for rev in &history.revisions {
+                let total_revs = history.revisions.len();
+                if total_revs == 0 {
+                    continue;
+                }
+                let max_rev_scroll = total_revs.saturating_sub(desk_rev_limit);
+                let rev_scroll = options.desk_scroll_offset.min(max_rev_scroll);
+                let rev_window_size = desk_rev_limit.min(total_revs.saturating_sub(rev_scroll));
+
+                // Spawn cards in descending chronological order: latest revision in window pushed FIRST (at z=0)
+                for s_rev in 0..rev_window_size {
+                    let rev_idx = (total_revs - 1 - rev_scroll) - s_rev;
+                    let rev = &history.revisions[rev_idx];
                     let card_size = [55.0, 38.0];
-                    self.workdesk_push_revision(
+                    self.workdesk_push_revision_card(
                         workdesk_entity,
                         &path,
+                        rev.revision_index,
                         rev.action,
                         card_size,
                         &rev.summary,
@@ -124,24 +230,48 @@ impl SpatialScene {
         }
 
         // 4. Attach AgentCarrel component to root
+        let initial_beat = slot_to_beat.first().copied().unwrap_or(0);
+        let initial_turn = if !events.is_empty() {
+            events.get(initial_beat).map(|e| e.turn_index).unwrap_or(0)
+        } else {
+            initial_beat
+        };
+
         self.world.entity_mut(carrel_entity).insert(AgentCarrel {
             session_id: session.session_id.clone(),
             deck_entity,
             workdesk_entity,
-            active_turn: 0,
+            active_turn: initial_turn,
             turn_count,
-            active_beat: 0,
-            beat_count,
+            active_beat: initial_beat,
+            beat_count: total_events,
+            layout_options: options,
+            slot_to_beat: slot_to_beat.clone(),
         });
 
         // Initialize active beat/turn state
-        if beat_count > 0 {
-            self.carrel_set_beat(carrel_entity, 0, session, revision_engine);
+        if total_events > 0 {
+            self.carrel_set_beat(carrel_entity, initial_beat, session, revision_engine);
         } else {
-            self.carrel_set_turn(carrel_entity, 0, session, revision_engine);
+            self.carrel_set_turn(carrel_entity, initial_turn, session, revision_engine);
         }
 
         carrel_entity
+    }
+
+    /// Spawn an Agent Carrel containing an AgentTurnCard Deck and a Workdesk with default options.
+    pub fn spawn_agent_carrel(
+        &mut self,
+        parent: Entity,
+        session: &AgentSession,
+        revision_engine: &RevisionEngine,
+    ) -> Entity {
+        self.spawn_agent_carrel_with_options(
+            parent,
+            session,
+            revision_engine,
+            CarrelLayoutOptions::default(),
+        )
     }
 
     /// Advance the carrel to the next atomic beat, wrapping around.
@@ -151,18 +281,16 @@ impl SpatialScene {
         session: &AgentSession,
         revision_engine: &RevisionEngine,
     ) -> usize {
-        let (next_idx, deck_e) = if let Some(carrel) = self.world.get::<AgentCarrel>(carrel_entity) {
-            let next = if carrel.beat_count == 0 {
+        let next_idx = if let Some(carrel) = self.world.get::<AgentCarrel>(carrel_entity) {
+            if carrel.beat_count == 0 {
                 0
             } else {
                 (carrel.active_beat + 1) % carrel.beat_count
-            };
-            (next, carrel.deck_entity)
+            }
         } else {
             return 0;
         };
 
-        self.deck_set_active(deck_e, next_idx);
         self.carrel_set_beat(carrel_entity, next_idx, session, revision_engine);
         next_idx
     }
@@ -174,18 +302,16 @@ impl SpatialScene {
         session: &AgentSession,
         revision_engine: &RevisionEngine,
     ) -> usize {
-        let (prev_idx, deck_e) = if let Some(carrel) = self.world.get::<AgentCarrel>(carrel_entity) {
-            let prev = if carrel.beat_count == 0 {
+        let prev_idx = if let Some(carrel) = self.world.get::<AgentCarrel>(carrel_entity) {
+            if carrel.beat_count == 0 {
                 0
             } else {
                 (carrel.active_beat + carrel.beat_count - 1) % carrel.beat_count
-            };
-            (prev, carrel.deck_entity)
+            }
         } else {
             return 0;
         };
 
-        self.deck_set_active(deck_e, prev_idx);
         self.carrel_set_beat(carrel_entity, prev_idx, session, revision_engine);
         prev_idx
     }
@@ -198,14 +324,20 @@ impl SpatialScene {
         session: &AgentSession,
         revision_engine: &RevisionEngine,
     ) {
-        let (deck_e, workdesk_e) = if let Some(mut carrel) = self.world.get_mut::<AgentCarrel>(carrel_entity) {
+        let (deck_e, workdesk_e, slot_opt) = if let Some(mut carrel) = self.world.get_mut::<AgentCarrel>(carrel_entity) {
             carrel.active_beat = beat_index;
-            (carrel.deck_entity, carrel.workdesk_entity)
+            let slot = carrel.slot_to_beat.iter().position(|&b| b == beat_index);
+            (carrel.deck_entity, carrel.workdesk_entity, slot)
         } else {
             return;
         };
 
-        self.deck_set_active(deck_e, beat_index);
+        if let Some(slot) = slot_opt {
+            let total = self.world.get::<AgentCarrel>(carrel_entity).map(|c| c.slot_to_beat.len()).unwrap_or(1);
+            if let Some(mut deck) = self.world.get_mut::<Deck>(deck_e) {
+                deck.set_active_page(slot, total);
+            }
+        }
 
         let events = session.linearize_events(Some(revision_engine));
         if let Some(event) = events.get(beat_index) {
@@ -303,7 +435,12 @@ impl SpatialScene {
             return;
         };
 
-        self.deck_set_active(deck_e, turn_index);
+        if let Some(slot) = self.world.get::<AgentCarrel>(carrel_entity).and_then(|c| c.slot_to_beat.iter().position(|&t| t == turn_index)) {
+            let total = self.world.get::<AgentCarrel>(carrel_entity).map(|c| c.slot_to_beat.len()).unwrap_or(1);
+            if let Some(mut deck) = self.world.get_mut::<Deck>(deck_e) {
+                deck.set_active_page(slot, total);
+            }
+        }
 
         // Find file revisions produced or observed in this turn
         if let Some(turn) = session.turns.get(turn_index) {

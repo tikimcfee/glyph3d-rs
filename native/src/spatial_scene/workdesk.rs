@@ -51,7 +51,10 @@ pub struct FileRevisionStack {
     pub file_path: String,
     pub revision_count: usize,
     pub active_revision: usize,
+    pub visible_revisions: Vec<usize>,
     pub z_pitch: f32,
+    pub window_limit: usize,
+    pub scroll_offset: usize,
 }
 
 /// Component marking a specific revision/diff card in a file stack.
@@ -120,7 +123,10 @@ impl SpatialScene {
                     file_path: path_str.clone(),
                     revision_count: 0,
                     active_revision: 0,
+                    visible_revisions: Vec::new(),
                     z_pitch,
+                    window_limit: 20,
+                    scroll_offset: 0,
                 },
                 SpatialAlignment::depth(z_pitch, 0.0, 2.0),
             ))
@@ -133,7 +139,58 @@ impl SpatialScene {
         stack_entity
     }
 
-    /// Push a new revision/diff card onto the file's revision stack.
+    /// Push a revision card with an explicit revision index onto the file's revision stack.
+    pub fn workdesk_push_revision_card(
+        &mut self,
+        workdesk_entity: Entity,
+        file_path: &str,
+        revision_index: usize,
+        action: FileActionKind,
+        card_size: [f32; 2],
+        summary: impl Into<String>,
+    ) -> Entity {
+        let stack_entity = self.workdesk_get_or_create_stack(workdesk_entity, file_path);
+
+        if let Some(mut stack) = self.world.get_mut::<FileRevisionStack>(stack_entity) {
+            stack.visible_revisions.push(revision_index);
+            if revision_index >= stack.revision_count {
+                stack.revision_count = revision_index + 1;
+            }
+            if stack.visible_revisions.len() == 1 {
+                stack.active_revision = revision_index;
+            }
+        }
+
+        let summary_str = summary.into();
+        let card_bounds = LocalBounds {
+            min: [0.0, -card_size[1], 0.0],
+            max: [card_size[0], 0.0, 0.5],
+        };
+
+        self.world
+            .spawn((
+                Transform::IDENTITY,
+                ChildOf(stack_entity),
+                Name::new(format!("{file_path}#r{revision_index}: {summary_str}")),
+                FileRevisionCard {
+                    file_path: file_path.to_string(),
+                    revision_index,
+                    action,
+                },
+                card_bounds,
+                SceneMeshKind::Quad {
+                    size: card_size,
+                    origin: [0.0, -card_size[1]],
+                },
+                SceneMeshMaterial {
+                    color: action.accent_color(),
+                    params: [0.0, 0.0, 0.0, 0.0],
+                },
+            ))
+            .id()
+    }
+
+    /// Push a new revision/diff card onto the file's revision stack with auto-incremented index.
     pub fn workdesk_push_revision(
         &mut self,
         workdesk_entity: Entity,
@@ -153,35 +210,13 @@ impl SpatialScene {
             0
         };
 
-        let summary_str = summary.into();
-        let card_bounds = LocalBounds {
-            min: [0.0, -card_size[1], 0.0],
-            max: [card_size[0], 0.0, 0.5],
-        };
-
-        let card_entity = self
-            .world
-            .spawn((
-                Transform::IDENTITY,
-                ChildOf(stack_entity),
-                Name::new(format!("{file_path}#r{rev_index}: {summary_str}")),
-                FileRevisionCard {
-                    file_path: file_path.to_string(),
-                    revision_index: rev_index,
-                    action,
-                },
-                card_bounds,
-                SceneMeshKind::Quad {
-                    size: card_size,
-                    origin: [0.0, -card_size[1]],
-                },
-                SceneMeshMaterial {
-                    color: action.accent_color(),
-                    params: [0.0, 0.0, 0.0, 0.0],
-                },
-            ))
-            .id();
-
-        card_entity
+        self.workdesk_push_revision_card(
+            workdesk_entity,
+            file_path,
+            rev_index,
+            action,
+            card_size,
+            summary,
+        )
     }
 }

@@ -45,6 +45,10 @@ pub struct Deck {
     pub flip_angle_rad: f32,
     /// Whether the deck wraps circularly in Deck mode (Rolodex carousel).
     pub wrap: bool,
+    /// Maximum number of cards visible in the sliding window.
+    pub window_limit: usize,
+    /// Number of items scrolled backward in time ($K$).
+    pub scroll_offset: usize,
 }
 
 impl Default for Deck {
@@ -59,6 +63,8 @@ impl Default for Deck {
             splay_lift: 8.0,
             flip_angle_rad: 0.12,
             wrap: true,
+            window_limit: 20,
+            scroll_offset: 0,
         }
     }
 }
@@ -90,6 +96,16 @@ impl Deck {
 
     pub fn with_wrap(mut self, wrap: bool) -> Self {
         self.wrap = wrap;
+        self
+    }
+
+    pub fn with_window_limit(mut self, limit: usize) -> Self {
+        self.window_limit = limit.max(1);
+        self
+    }
+
+    pub fn with_scroll_offset(mut self, offset: usize) -> Self {
+        self.scroll_offset = offset;
         self
     }
 

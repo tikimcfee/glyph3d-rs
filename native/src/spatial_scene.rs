@@ -22,7 +22,7 @@ pub mod deck;
 pub mod turn_card;
 pub mod workdesk;
 
-pub use agent_carrel::AgentCarrel;
+pub use agent_carrel::{AgentCarrel, CarrelLayoutOptions};
 pub use alignment::{
     AlignmentAxis, HorizontalAlign, SpatialAlignment, VerticalAlign, WrapConstraint,
 };

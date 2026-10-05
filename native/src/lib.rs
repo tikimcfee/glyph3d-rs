@@ -53,7 +53,11 @@ pub enum SceneChoice {
     /// Stage E1: lay `file` out with the engine and render through Slug glyph renderer.
     EngineText { file: PathBuf, trie: PathBuf, emoji_sheet: PathBuf },
     /// Agent Session: 3D Agent Carrel with Turn Deck and Workdesk.
-    AgentSession { session_path: PathBuf, emoji_sheet: PathBuf },
+    AgentSession {
+        session_path: PathBuf,
+        emoji_sheet: PathBuf,
+        layout_options: spatial_scene::CarrelLayoutOptions,
+    },
     /// Stage E2: load a whole repository as a field of code pages — one group
     /// per file, one shared glyph arena, grid layout.
     Repo {
@@ -271,7 +275,7 @@ fn build_scene_impl(
             let staged = text::stage_records(arena, &placement, &atlas.slot_ink);
             glyph(GlyphScene::new(ctx, color_format, &atlas, staged, camera_mode, cull))
         }
-        SceneChoice::AgentSession { session_path, emoji_sheet } => {
+        SceneChoice::AgentSession { session_path, emoji_sheet, layout_options } => {
             let session = match agent_transcript::load_session_from_path(session_path) {
                 Ok(s) => s,
                 Err(e) => {
@@ -316,7 +320,13 @@ fn build_scene_impl(
             rev_engine.ingest_session(&session);
 
             let atlas = atlas::Atlas::load(ctx, emoji_sheet);
-            let staged = agent_transcript::stage_agent_session(Some(&atlas), &atlas.slot_ink, session, rev_engine);
+            let staged = agent_transcript::stage_agent_session_with_options(
+                Some(&atlas),
+                &atlas.slot_ink,
+                session,
+                rev_engine,
+                *layout_options,
+            );
             let scene = GlyphScene::new(ctx, color_format, &atlas, staged, camera_mode, cull);
             glyph(scene)
         }

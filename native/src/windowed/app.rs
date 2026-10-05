@@ -58,9 +58,19 @@ pub(super) fn apply_relayout(
         *choice = SceneChoice::AgentSession {
             session_path: session_path.clone(),
             emoji_sheet,
+            layout_options: crate::spatial_scene::CarrelLayoutOptions::default(),
         };
         changed = true;
         note += &format!("switch_agent_session -> {} ", session_path.display());
+    }
+    if let SceneChoice::AgentSession { layout_options, .. } = choice {
+        if let Some(new_opts) = req.carrel_options {
+            if *layout_options != new_opts {
+                *layout_options = new_opts;
+                changed = true;
+                note += &format!("carrel_options -> limit: {}, scroll: {} ", new_opts.deck_window_limit, new_opts.deck_scroll_offset);
+            }
+        }
     }
     // The z dial exists on repo scenes only.
     if let SceneChoice::Repo { z_wrap_spacing, .. } = choice {
@@ -154,6 +164,7 @@ pub(super) struct RelayoutRequest {
     pub(super) toggle_cluster: bool,
     pub(super) toggle_layout: bool,
     pub(super) switch_agent_session: Option<std::path::PathBuf>,
+    pub(super) carrel_options: Option<crate::spatial_scene::CarrelLayoutOptions>,
 }
 
 pub(super) struct App<'a> {
@@ -497,6 +508,7 @@ impl ApplicationHandler for App<'_> {
                                 toggle_cluster: false,
                                 toggle_layout: true,
                                 switch_agent_session: None,
+                                carrel_options: None,
                             });
                             state.window.request_redraw();
                         }
@@ -546,6 +558,42 @@ impl ApplicationHandler for App<'_> {
                             state.ungrab();
                         } else {
                             state.grab();
+                        }
+                    } else if let SceneChoice::AgentSession { layout_options, .. } = &self.choice {
+                        #[cfg(feature = "egui-ui")]
+                        {
+                            let max_k = state
+                                .ui_probe
+                                .as_ref()
+                                .and_then(|p| p.borrow().carrel.as_ref().map(|c| c.max_deck_scroll))
+                                .unwrap_or(0);
+                            let mut new_opts = *layout_options;
+                            let mut handled = false;
+                            if pressed && code == KeyCode::Comma {
+                                new_opts.deck_scroll_offset = (new_opts.deck_scroll_offset + 1).min(max_k);
+                                handled = true;
+                            } else if pressed && code == KeyCode::Period {
+                                new_opts.deck_scroll_offset = new_opts.deck_scroll_offset.saturating_sub(1);
+                                handled = true;
+                            } else if pressed && code == KeyCode::Home {
+                                new_opts.deck_scroll_offset = 0;
+                                handled = true;
+                            } else if pressed && code == KeyCode::End {
+                                new_opts.deck_scroll_offset = max_k;
+                                handled = true;
+                            }
+                            if handled && new_opts != *layout_options {
+                                state.pending_relayout = Some(RelayoutRequest {
+                                    carrel_options: Some(new_opts),
+                                    ..Default::default()
+                                });
+                            } else {
+                                state.scene.on_key(&self.ctx, code, pressed);
+                            }
+                        }
+                        #[cfg(not(feature = "egui-ui"))]
+                        {
+                            state.scene.on_key(&self.ctx, code, pressed);
                         }
                     } else {
                         state.scene.on_key(&self.ctx, code, pressed);

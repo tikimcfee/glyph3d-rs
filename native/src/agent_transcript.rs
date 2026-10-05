@@ -17,7 +17,7 @@ mod tests;
 pub use antigravity::parse_antigravity_session;
 pub use claude::parse_claude_session;
 pub use discovery::{scan_agent_sessions, DiscoveredSession, SessionHarnessFilter};
-pub use staging::stage_agent_session;
+pub use staging::{stage_agent_session, stage_agent_session_with_options};
 pub use types::{
     AgentSession, AgentTurn, DiffHunkRecord, FileActionRecord, HarnessKind, ToolCallRecord,
     TranscriptEvent, TranscriptEventKind,

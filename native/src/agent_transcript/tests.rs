@@ -544,12 +544,12 @@ fn test_stage_agent_session_creates_controller_and_navigates() {
     let mut ctrl = staged.controller.unwrap();
     assert!(ctrl.active_carrel.is_some());
 
-    // Navigation checks
-    let next_msg = ctrl.carrel_next().unwrap();
-    assert!(next_msg.contains("beat 2/4"));
-
+    // Navigation checks: carrel starts at latest beat (4/4)
     let prev_msg = ctrl.carrel_prev().unwrap();
-    assert!(prev_msg.contains("beat 1/4"));
+    assert!(prev_msg.contains("beat 3/4"));
+
+    let next_msg = ctrl.carrel_next().unwrap();
+    assert!(next_msg.contains("beat 4/4"));
 
     let jump_msg = ctrl.carrel_set_turn(1).unwrap();
     assert!(jump_msg.contains("jump to turn 2/2"));

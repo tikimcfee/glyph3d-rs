@@ -314,6 +314,7 @@ impl WindowState {
                             toggle_cluster: false,
                             toggle_layout: false,
                             switch_agent_session: None,
+                            carrel_options: None,
                         });
                         self.zspace_selftest = 2;
                     }
@@ -360,6 +361,7 @@ impl WindowState {
                             toggle_cluster: true,
                             toggle_layout: false,
                             switch_agent_session: None,
+                            carrel_options: None,
                         });
                         self.cluster_selftest = 2;
                     }
@@ -630,6 +632,7 @@ impl WindowState {
                                         toggle_cluster: false,
                                         toggle_layout: false,
                                         switch_agent_session: None,
+                                        carrel_options: None,
                                     });
                                 }
                             }
@@ -655,6 +658,7 @@ impl WindowState {
                                         toggle_cluster: true,
                                         toggle_layout: false,
                                         switch_agent_session: None,
+                                        carrel_options: None,
                                     });
                                 }
                             }
@@ -677,6 +681,7 @@ impl WindowState {
                                         toggle_cluster: false,
                                         toggle_layout: true,
                                         switch_agent_session: None,
+                                        carrel_options: None,
                                     });
                                 }
                             }
@@ -821,6 +826,106 @@ impl WindowState {
                                     *session_browser_open = !*session_browser_open;
                                 }
                             });
+
+                            // Timeline & Window Information
+                            ui.separator();
+                            let total_beats = carrel.beat_count.max(carrel.turn_count);
+                            let (w_old, w_new) = carrel.window_item_range;
+                            ui.horizontal(|ui| {
+                                ui.label(egui::RichText::new(format!(
+                                    "Window: [{}..{}] of {}",
+                                    w_old, w_new, total_beats
+                                )).strong());
+                                if carrel.layout_options.deck_scroll_offset > 0 {
+                                    ui.colored_label(
+                                        egui::Color32::from_rgb(255, 180, 80),
+                                        format!("(-{} back)", carrel.layout_options.deck_scroll_offset),
+                                    );
+                                } else {
+                                    ui.colored_label(
+                                        egui::Color32::from_rgb(100, 240, 140),
+                                        "(LIVE / LATEST)",
+                                    );
+                                }
+                            });
+
+                            // Time Travel Buttons
+                            ui.horizontal(|ui| {
+                                if ui.button("⏮ Oldest (End)").clicked() {
+                                    let mut opts = carrel.layout_options;
+                                    opts.deck_scroll_offset = carrel.max_deck_scroll;
+                                    *pending_relayout = Some(RelayoutRequest {
+                                        carrel_options: Some(opts),
+                                        ..Default::default()
+                                    });
+                                }
+                                if ui.button("◀ Back (<)").clicked() {
+                                    let mut opts = carrel.layout_options;
+                                    opts.deck_scroll_offset = (opts.deck_scroll_offset + 1).min(carrel.max_deck_scroll);
+                                    *pending_relayout = Some(RelayoutRequest {
+                                        carrel_options: Some(opts),
+                                        ..Default::default()
+                                    });
+                                }
+                                if ui.button("Fwd (>) ▶").clicked() {
+                                    let mut opts = carrel.layout_options;
+                                    opts.deck_scroll_offset = opts.deck_scroll_offset.saturating_sub(1);
+                                    *pending_relayout = Some(RelayoutRequest {
+                                        carrel_options: Some(opts),
+                                        ..Default::default()
+                                    });
+                                }
+                                if ui.button("Latest ⏭ (Home)").clicked() {
+                                    let mut opts = carrel.layout_options;
+                                    opts.deck_scroll_offset = 0;
+                                    *pending_relayout = Some(RelayoutRequest {
+                                        carrel_options: Some(opts),
+                                        ..Default::default()
+                                    });
+                                }
+                            });
+
+                            // Collapsible Sliders for limits and offsets
+                            let mut current_opts = carrel.layout_options;
+                            let mut opts_changed = false;
+                            ui.collapsing("Window Limits & Time Travel", |ui| {
+                                ui.horizontal(|ui| {
+                                    ui.label("Deck Window Limit:");
+                                    let resp = ui.add(egui::Slider::new(&mut current_opts.deck_window_limit, 5..=100).text("cards"));
+                                    if resp.drag_stopped() || resp.lost_focus() {
+                                        opts_changed = true;
+                                    }
+                                });
+                                ui.horizontal(|ui| {
+                                    ui.label("Time Scroll (K):");
+                                    let max_k = carrel.max_deck_scroll;
+                                    let resp = ui.add(egui::Slider::new(&mut current_opts.deck_scroll_offset, 0..=max_k).text("turns back"));
+                                    if resp.drag_stopped() || resp.lost_focus() {
+                                        opts_changed = true;
+                                    }
+                                });
+                                ui.horizontal(|ui| {
+                                    ui.label("Desk Revision Limit:");
+                                    let resp = ui.add(egui::Slider::new(&mut current_opts.desk_revision_limit, 3..=50).text("revs/file"));
+                                    if resp.drag_stopped() || resp.lost_focus() {
+                                        opts_changed = true;
+                                    }
+                                });
+                                ui.horizontal(|ui| {
+                                    ui.label("Max File Stacks:");
+                                    let resp = ui.add(egui::Slider::new(&mut current_opts.max_file_stacks, 5..=50).text("files"));
+                                    if resp.drag_stopped() || resp.lost_focus() {
+                                        opts_changed = true;
+                                    }
+                                });
+                            });
+
+                            if opts_changed && current_opts != carrel.layout_options {
+                                *pending_relayout = Some(RelayoutRequest {
+                                    carrel_options: Some(current_opts),
+                                    ..Default::default()
+                                });
+                            }
                             if !carrel.beat_summary.is_empty() {
                                 ui.separator();
                                 ui.label(egui::RichText::new("Active Beat:").heading());
@@ -956,6 +1061,7 @@ impl WindowState {
                                                             toggle_cluster: false,
                                                             toggle_layout: false,
                                                             switch_agent_session: Some(s.path.clone()),
+                                                            carrel_options: None,
                                                         });
                                                     }
                                                     if let Some(m) = s.modified {

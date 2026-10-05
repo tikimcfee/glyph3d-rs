@@ -395,6 +395,7 @@ fn test_agent_turn_card_spawning_and_bounds() {
         root,
         0,
         0,
+        0,
         [60.0, 40.0],
         4.0,
         "Turn 0: Inspecting repo",
@@ -539,20 +540,13 @@ fn test_agent_carrel_spawning_and_turn_navigation() {
 
     let carrel_comp = scene.world.get::<AgentCarrel>(carrel).unwrap();
     assert_eq!(carrel_comp.turn_count, 2);
-    assert_eq!(carrel_comp.active_turn, 0);
+    // Initial state: latest turn is at front/slot 0
+    assert_eq!(carrel_comp.active_turn, 1);
 
-    // Initial state: turn 0
     let desk = scene.world.get::<Workdesk>(carrel_comp.workdesk_entity).unwrap();
     let stack_e = *desk.file_stacks.get("foo.rs").unwrap();
     let stack = scene.world.get::<FileRevisionStack>(stack_e).unwrap();
-    assert_eq!(stack.active_revision, 0);
-
-    // Advance to turn 1
-    let next = scene.carrel_next_turn(carrel, &session, &rev_engine);
-    assert_eq!(next, 1);
-
-    let stack_after = scene.world.get::<FileRevisionStack>(stack_e).unwrap();
-    assert_eq!(stack_after.active_revision, 1);
+    assert_eq!(stack.active_revision, 1);
 
     // Navigate back to turn 0
     let prev = scene.carrel_prev_turn(carrel, &session, &rev_engine);
@@ -560,4 +554,86 @@ fn test_agent_carrel_spawning_and_turn_navigation() {
 
     let stack_prev = scene.world.get::<FileRevisionStack>(stack_e).unwrap();
     assert_eq!(stack_prev.active_revision, 0);
+
+    // Advance to turn 1
+    let next = scene.carrel_next_turn(carrel, &session, &rev_engine);
+    assert_eq!(next, 1);
+
+    let stack_after = scene.world.get::<FileRevisionStack>(stack_e).unwrap();
+    assert_eq!(stack_after.active_revision, 1);
+}
+
+#[test]
+fn test_agent_carrel_sliding_window_and_time_scroll() {
+    use crate::agent_transcript::claude::parse_claude_session;
+    use crate::revision::RevisionEngine;
+    use crate::spatial_scene::agent_carrel::CarrelLayoutOptions;
+    use serde_json::json;
+
+    // Build a session with 10 turns
+    let mut turns_json = Vec::new();
+    for i in 0..10 {
+        turns_json.push(json!({
+            "type": "user",
+            "message": { "role": "user", "content": [{ "type": "text", "text": format!("Turn {i} prompt") }] }
+        }).to_string());
+        turns_json.push(json!({
+            "type": "assistant",
+            "message": {
+                "role": "assistant",
+                "content": [
+                    { "type": "tool_use", "id": format!("t{i}"), "name": "Write", "input": { "file_path": "a.rs", "content": format!("v{i}") } }
+                ]
+            }
+        }).to_string());
+        turns_json.push(json!({
+            "type": "user",
+            "toolUseResult": { "type": "create", "filePath": "a.rs", "content": format!("v{i}") },
+            "message": { "role": "user", "content": [{ "type": "tool_result", "tool_use_id": format!("t{i}") }] }
+        }).to_string());
+    }
+
+    let session = parse_claude_session(&turns_json.join("\n"), "sliding_sess");
+    let mut rev_engine = RevisionEngine::new();
+    rev_engine.ingest_session(&session);
+
+    let mut scene = SpatialScene::new();
+    let root = scene.spawn_root("canvas");
+
+    // Test with window limit = 4, scroll offset K = 0 (latest)
+    let opts = CarrelLayoutOptions {
+        deck_window_limit: 4,
+        deck_scroll_offset: 0,
+        desk_revision_limit: 4,
+        desk_scroll_offset: 0,
+        max_file_stacks: 10,
+    };
+
+    let carrel = scene.spawn_agent_carrel_with_options(root, &session, &rev_engine, opts);
+    let carrel_comp = scene.world.get::<AgentCarrel>(carrel).unwrap();
+
+    // 1. Sliding window should contain exactly 4 cards
+    assert_eq!(carrel_comp.slot_to_beat.len(), 4);
+    // 2. Slot 0 must be the newest beat (beat index 19 out of 20)
+    assert_eq!(carrel_comp.slot_to_beat[0], 19);
+    assert_eq!(carrel_comp.slot_to_beat[1], 18);
+    assert_eq!(carrel_comp.slot_to_beat[2], 17);
+    assert_eq!(carrel_comp.slot_to_beat[3], 16);
+
+    // 3. Test scrolling back in time: K = 2 (scroll 2 beats back)
+    let opts_scrolled = CarrelLayoutOptions {
+        deck_window_limit: 4,
+        deck_scroll_offset: 2,
+        desk_revision_limit: 4,
+        desk_scroll_offset: 0,
+        max_file_stacks: 10,
+    };
+    let carrel_scrolled = scene.spawn_agent_carrel_with_options(root, &session, &rev_engine, opts_scrolled);
+    let scrolled_comp = scene.world.get::<AgentCarrel>(carrel_scrolled).unwrap();
+    assert_eq!(scrolled_comp.slot_to_beat.len(), 4);
+    // Beats 19 and 18 are popped off; newest is now 19 - 2 = 17!
+    assert_eq!(scrolled_comp.slot_to_beat[0], 17);
+    assert_eq!(scrolled_comp.slot_to_beat[1], 16);
+    assert_eq!(scrolled_comp.slot_to_beat[2], 15);
+    assert_eq!(scrolled_comp.slot_to_beat[3], 14);
 }
