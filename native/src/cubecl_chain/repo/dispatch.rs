@@ -35,9 +35,23 @@ pub(crate) struct ChainProfiler {
     pub rows: Vec<(String, std::time::Duration)>,
     pub missing: usize,
     pub timing: Option<String>,
+    /// `GLYPH_GPU_ISOLATE_MS`: idle gap placed before and after every stage,
+    /// with a `gpu-mark:` line (wall-clock ns) at each edge. Only effective
+    /// with `GLYPH_CHAIN_PROF=stages`, whose `end` already blocks on the
+    /// stage's GPU completion, so the gap is real GPU idle time. This is the
+    /// attribution contract for timeline samplers (tools/gpu_profile).
+    isolate_gap: Option<std::time::Duration>,
     t0: Vec<std::time::Instant>,
     w: Option<ProfileWindow>,
     bw: Option<ProfileWindow>,
+}
+
+/// Wall-clock nanoseconds since the Unix epoch, for `gpu-mark:` lines.
+fn unix_nanos() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0)
 }
 
 impl ChainProfiler {
@@ -47,6 +61,11 @@ impl ChainProfiler {
         let prof_stage_on = matches!(prof_mode.as_str(), "1" | "stages");
         let prof_blocks = prof_mode == "blocks";
         let sync_prof = std::env::var_os("GLYPH_CHAIN_SYNC").is_some();
+        let isolate_gap = std::env::var("GLYPH_GPU_ISOLATE_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|ms| *ms > 0 && prof_stage_on)
+            .map(std::time::Duration::from_millis);
         Self {
             prof_ok: prof,
             prof_stage_on,
@@ -55,6 +74,7 @@ impl ChainProfiler {
             rows: Vec::new(),
             missing: 0,
             timing: None,
+            isolate_gap,
             t0: Vec::new(),
             w: None,
             bw: None,
@@ -62,7 +82,10 @@ impl ChainProfiler {
     }
 
     pub fn begin(&mut self, client: &Client, name: &'static str) {
-        let _ = name;
+        if let Some(gap) = self.isolate_gap {
+            std::thread::sleep(gap);
+            eprintln!("gpu-mark: begin {name} {}", unix_nanos());
+        }
         self.w = if self.prof_ok && self.prof_stage_on {
             match client.profile_start() {
                 Ok(w) => Some(w),
@@ -94,9 +117,16 @@ impl ChainProfiler {
                     let wall = t_res0.elapsed();
                     self.rows.push((name.to_string(), ticks.duration()));
                     self.rows.push((format!("wall:{name}"), wall));
+                    if self.isolate_gap.is_some() {
+                        eprintln!("gpu-mark: gpu_ns {name} {}", ticks.duration().as_nanos());
+                    }
                 }
                 None => self.missing += 1,
             }
+        }
+        if let Some(gap) = self.isolate_gap {
+            eprintln!("gpu-mark: end {name} {}", unix_nanos());
+            std::thread::sleep(gap);
         }
     }
 
