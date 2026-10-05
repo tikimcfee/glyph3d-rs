@@ -33,8 +33,11 @@ fn all_wgsl_shaders_parse_and_validate() {
     assert_eq!(
         names,
         // Stage L (L3): composite.wgsl added — the one new shader fence 2
-        // sanctions for the pooled-target composite.
-        ["composite.wgsl", "cull.wgsl", "glyph_field.wgsl", "mesh.wgsl", "quad_field.wgsl"],
+        // sanctions for the pooled-target composite. 2026-10: glyph_field.wgsl
+        // moved byte-identically into crates/glyph-field-instanced/shaders
+        // (the Instanced field mode owns it; that crate's tests/wgsl.rs
+        // validates it and pins its own set).
+        ["composite.wgsl", "cull.wgsl", "mesh.wgsl", "quad_field.wgsl"],
         "shader file set changed — update the test's expected list"
     );
 

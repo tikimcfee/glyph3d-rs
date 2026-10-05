@@ -56,6 +56,7 @@ fn defaults_match_old_parser() {
     assert!(cli.focus_file.is_none());
     assert!(!cli.repo_scan_only);
     assert!(!cli.no_cull);
+    assert_eq!(cli.field_mode, glyph_field::GlyphFieldMode::Instanced);
     assert!(!cli.no_ui);
     assert!(!cli.no_greeking);
     assert!(!cli.greek_pure);
@@ -170,6 +171,20 @@ fn an_unknown_color_mode_is_refused() {
         Err(e) => e.to_string(),
     };
     assert!(text.contains("neon"), "the error must name the bad value: {text}");
+}
+
+/// The field mode parses both spellings at the boundary (the refusal of
+/// `derived` until it ships is main's, not clap's — the enum is real) and an
+/// unknown mode is REFUSED with the value named.
+#[test]
+fn field_mode_parses_and_refuses_unknown() {
+    assert_eq!(parse(&["--field-mode", "derived"]).field_mode, glyph_field::GlyphFieldMode::Derived);
+    assert_eq!(parse(&["--field-mode", "instanced"]).field_mode, glyph_field::GlyphFieldMode::Instanced);
+    let text = match try_parse(&["--field-mode", "vertexy"]) {
+        Ok(_) => panic!("clap must refuse an unknown field mode"),
+        Err(e) => e.to_string(),
+    };
+    assert!(text.contains("vertexy"), "the error must name the bad value: {text}");
 }
 
 /// Out-of-domain spacing is REFUSED at the boundary with the flag and the

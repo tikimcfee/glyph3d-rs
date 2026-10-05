@@ -104,6 +104,7 @@ pub(super) fn apply_relayout(
                 greeking: p.greeking,
                 greek_pure: p.greek_pure,
                 greek_onset_px: Some(p.greek_onset_px),
+                field_mode: cull_opts.field_mode,
             },
         )
     } else {

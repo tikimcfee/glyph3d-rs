@@ -93,13 +93,13 @@ mod instance;
 pub use instance::{GlyphInstance, GroupRow, RenderSlot};
 use instance::Params;
 
+pub use glyph_field::{GlyphField, GlyphFieldMode, GlyphPlacement};
+
 mod target;
 use target::{CompositeState, Selection, ViewTarget, SCENE_SAMPLE_COUNT};
 
 mod ui_probe;
 pub use ui_probe::UiProbe;
-
-mod buffers;
 
 mod interaction;
 mod style;
@@ -109,24 +109,18 @@ mod render;
 pub mod mesh;
 
 pub struct GlyphScene {
-    pub pipeline: wgpu::RenderPipeline,
+    /// The glyph field: per-glyph slot storage, the pipeline that draws it,
+    /// and the single-glyph verbs — behind the mode-neutral contract, so the
+    /// scene never touches a slot's bytes or knows which mode it holds
+    /// (2026-10 field-mode split; see `crates/glyph-field`). Storage is
+    /// chunked (a repo-scale field exceeds one storage binding); the cull and
+    /// pick slot math key on `field.chunk_capacity()`.
+    pub(crate) field: Box<dyn GlyphField>,
     /// The colour-emoji sheet's view, held so the texture outlives the bind
     /// groups that sample it (binding 6 of every chunk's bind group).
     pub(crate) _emoji_view: wgpu::TextureView,
-    /// Stage E2: one bind group per instance-buffer CHUNK. A repo-scale field
-    /// can exceed `max_storage_buffer_binding_size` (48 B × tens of millions
-    /// of glyphs), so the arena is split into buffers that each fit the
-    /// binding limit; render() issues one draw per chunk. instance_index is
-    /// chunk-local, which is exactly right — each chunk buffer starts at 0.
-    pub(crate) bind_groups: Vec<wgpu::BindGroup>,
-    pub(crate) chunk_counts: Vec<u32>,
-    /// Stage F: instances per chunk (the uniform the cull pass uses to split
-    /// a segment's slot range across chunk draws).
-    pub(crate) chunk_cap: u32,
     pub(crate) camera_buf: wgpu::Buffer,
-    pub(crate) quad_index_buf: wgpu::Buffer,
     pub(crate) depth_format: wgpu::TextureFormat,
-    pub(crate) instance_count: u32,
     pub(crate) center: Vec3,
     pub(crate) half_w: f32,
     pub(crate) half_h: f32,
@@ -139,16 +133,6 @@ pub struct GlyphScene {
     /// the legacy per-chunk draws.
     pub(in crate::glyph_scene) cull: Option<CullState>,
     // ── Stage G: picking & live manipulation ────────────────────────────
-    /// Arena chunk buffers, kept for partial per-slot uploads (verbs): the
-    /// chain's own slot buffers on the endpoint (Device) path, the upload
-    /// buffers otherwise. `chunk_offsets[k]` is slot 0's byte address in
-    /// `instance_bufs[k]` (0 for staged uploads; the pool slice's start for
-    /// the endpoint's extracted buffers) — chunk_off adds it.
-    pub(crate) instance_bufs: Vec<wgpu::Buffer>,
-    /// Per-chunk byte offset of slot 0 inside the buffer (see above).
-    pub(crate) chunk_offsets: Vec<u64>,
-    /// When mapped in host-visible memory, base pointer to the RenderSlot slice as usize.
-    pub(crate) mapped_slots: Option<usize>,
     /// Group table buffer, kept for partial per-row uploads (80 B/row).
     pub(crate) group_buf: wgpu::Buffer,
     /// CPU mirror of the group table — the pick path reads the LIVE TRS from
@@ -326,7 +310,7 @@ impl SceneLike for GlyphScene {
     }
 
     fn instance_count(&self) -> u32 {
-        self.instance_count
+        self.field.glyph_count()
     }
 
     fn on_key(&mut self, ctx: &GpuContext, key: winit::keyboard::KeyCode, pressed: bool) {
@@ -407,37 +391,7 @@ impl SceneLike for GlyphScene {
     }
 
     fn debug_dump_instances(&self, ctx: &GpuContext, slot: u64, out: &mut [u32]) {
-        let chunk = (slot as u32 / self.chunk_cap) as usize;
-        let local = (slot as u32 % self.chunk_cap) as u64;
-        let size = (out.len() * 4) as u64;
-        let buf = ctx.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("debug dump"),
-            size,
-            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-            mapped_at_creation: false,
-        });
-        let mut enc = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("debug dump copy"), // Stage L (O2)
-        });
-        let off = self.chunk_off(chunk, local * 32);
-        enc.copy_buffer_to_buffer(self.chunk_buf(chunk), off, &buf, 0, size);
-        ctx.queue.submit([enc.finish()]);
-        let slice = buf.slice(..);
-        let (tx, rx) = std::sync::mpsc::channel();
-        slice.map_async(wgpu::MapMode::Read, move |r| {
-            let _ = tx.send(r);
-        });
-        ctx.device
-            .poll(wgpu::PollType::Wait {
-                submission_index: None,
-                timeout: None,
-            })
-            .expect("debug dump poll failed");
-        rx.recv().expect("dump cb dropped").expect("dump map failed");
-        let data = slice.get_mapped_range().expect("dump range");
-        out.copy_from_slice(bytemuck::cast_slice(&data[..size as usize]));
-        drop(data);
-        buf.unmap();
+        self.field.read_slot_words(&ctx.device, &ctx.queue, slot as u32, out);
     }
 
     fn tick(&mut self, dt: f32) {

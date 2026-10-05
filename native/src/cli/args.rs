@@ -156,6 +156,12 @@ pub struct Cli {
     /// Stage F: disable the cull/LOD pass (legacy per-chunk draws; debug/A-B)
     #[arg(long)]
     pub no_cull: bool,
+    /// Glyph field render mode: `instanced` (default: one full 32 B placement
+    /// record per glyph, read as-is by the vertex stage) or `derived` (compact
+    /// record, placement derived in the vertex stage — not implemented yet;
+    /// refused at startup). Fixed for the scene's lifetime.
+    #[arg(long, value_name = "MODE", default_value = "instanced")]
+    pub field_mode: glyph_field::GlyphFieldMode,
     /// Stage K: windowed without the egui UI overlay (exact pre-K behavior)
     #[arg(long)]
     pub no_ui: bool,

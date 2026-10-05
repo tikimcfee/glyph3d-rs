@@ -216,6 +216,16 @@ fn main() {
         *ctx.prewarm_handle.lock().unwrap() = Some(handle);
     }
 
+    // The field-mode enum is real, its second implementation is not yet:
+    // refuse it here, before any GPU work, rather than deep in scene setup.
+    if cli.field_mode != glyph_scene::GlyphFieldMode::Instanced {
+        eprintln!(
+            "--field-mode {}: not implemented yet (only `instanced` is available)",
+            cli.field_mode
+        );
+        std::process::exit(2);
+    }
+
     let greek_pure = !cli.greek_smooth;
     let cull_opts = SceneCullOptions {
         cull: !cli.no_cull,
@@ -225,6 +235,7 @@ fn main() {
         greeking: !cli.no_greeking,
         greek_pure,
         greek_onset_px: cli.greek_onset_px,
+        field_mode: cli.field_mode,
     };
 
     match cli.screenshot {

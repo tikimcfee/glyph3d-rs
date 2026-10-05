@@ -1,9 +1,14 @@
-//! The GPU wire types: the 48 B glyph instance, the 80 B group row, and the
-//! per-frame uniform blocks, each repr(C) mirrors of the WGSL layouts with
-//! the encase-derived assertions pinned against bytemuck's bytes in
-//! `layout_tests`. Extracted from `glyph_scene.rs` in the 2026-09 code-shape
-//! refactor — a pure move; `pub(super)` stands in for the same-module
-//! privacy the uniform types had.
+//! The GPU wire types: the per-frame uniform blocks, repr(C) mirrors of the
+//! WGSL layouts with the encase-derived assertions pinned against bytemuck's
+//! bytes in `layout_tests`. Extracted from `glyph_scene.rs` in the 2026-09
+//! code-shape refactor — a pure move; `pub(super)` stands in for the
+//! same-module privacy the uniform types had.
+//!
+//! Since the 2026-10 field-mode split the glyph RECORDS live in their crates
+//! and are re-exported here under their old paths, so every producer keeps
+//! compiling unchanged: the 48 B `GlyphInstance` and 80 B `GroupRow` in the
+//! mode-neutral contract (`glyph-field`), the 32 B `RenderSlot` in the
+//! Instanced mode (`glyph-field-instanced`), each with its layout pins.
 //!
 //! Since E2a (note 23) the SHADER binds the 32 B `RenderSlot`, not the 48 B
 //! `GlyphInstance`: row/col, flags and _pad have no live readers (note 22's
@@ -14,87 +19,8 @@
 
 use bytemuck::{Pod, Zeroable};
 
-/// Per-instance glyph slot — 48 B, mirrors `InstanceSlot` in glyph_field.wgsl.
-/// (Layout rationale is documented in the shader header.)
-/// Stage H: encase ShaderType derive — generated WGSL-layout size/offsets,
-/// asserted against the bytemuck wire format in `layout_tests` below (the
-/// Stage G strided-color bug class, caught at compile/test time).
-#[repr(C)]
-#[derive(Clone, Copy, Pod, Zeroable, encase::ShaderType)]
-pub struct GlyphInstance {
-    pub pos: [f32; 3],
-    pub glyph_id: u32,
-    pub row: u32,
-    pub col: u32,
-    pub color: u32, // packed RGBA8 (sRGB display values)
-    pub group_id: u32,
-    pub advance: f32,
-    pub height: f32,
-    pub flags: u32,
-    pub _pad: u32,
-}
-
-/// The render-bound slot — 32 B, what the shader's `InstanceSlot` has been
-/// since E2a. The CubeCL chain's scatter produces this form on device (the
-/// endpoint, note 23); the 48 B engine paths transcode at staging. Field
-/// order is the shader's read order minus the dead lanes — every value the
-/// vertex math reads is bit-identical to the 48 B form's.
-#[repr(C)]
-#[derive(Clone, Copy, Pod, Zeroable, encase::ShaderType)]
-pub struct RenderSlot {
-    pub pos: [f32; 3],
-    pub glyph_id: u32,
-    pub color: u32, // packed RGBA8 (sRGB display values)
-    pub group_id: u32,
-    pub advance: f32,
-    pub height: f32,
-}
-
-impl From<&GlyphInstance> for RenderSlot {
-    #[inline(always)]
-    fn from(g: &GlyphInstance) -> Self {
-        Self {
-            pos: g.pos,
-            glyph_id: g.glyph_id,
-            color: g.color,
-            group_id: g.group_id,
-            advance: g.advance,
-            height: g.height,
-        }
-    }
-}
-
-/// Group table row — 5 vec4s, 80 B, the web's GROUP_STRIDE=5 schema
-/// (glyphVertex.js): offset / quat / color+alpha / scale+colorBlend / clip.
-#[repr(C)]
-#[derive(Clone, Copy, Pod, Zeroable, encase::ShaderType)]
-pub struct GroupRow {
-    pub cols: [[f32; 4]; 5],
-}
-
-impl GroupRow {
-    /// Identity pose at `offset`: unit quat, white opaque color, unit scale,
-    /// colorBlend 0 (multiply), clip disabled.
-    pub fn identity(offset: [f32; 3]) -> Self {
-        Self {
-            cols: [
-                [offset[0], offset[1], offset[2], 0.0],
-                [0.0, 0.0, 0.0, 1.0],
-                [1.0, 1.0, 1.0, 1.0],
-                [1.0, 1.0, 1.0, 0.0],
-                [0.0, 0.0, 0.0, 0.0],
-            ],
-        }
-    }
-
-    /// Stage E2: identity pose with a color tint (multiplied with per-instance
-    /// colors; colorBlend 0 = multiply, alpha 1).
-    pub fn tinted(offset: [f32; 3], rgb: [f32; 3]) -> Self {
-        let mut g = Self::identity(offset);
-        g.cols[2] = [rgb[0], rgb[1], rgb[2], 1.0];
-        g
-    }
-}
+pub use glyph_field::{GlyphInstance, GroupRow};
+pub use glyph_field_instanced::RenderSlot;
 
 /// Stage L (L1): the frame uniform — was CameraUniform (just view_proj).
 /// re_renderer's FrameUniformBuffer borrow: everything a frame needs behind
@@ -142,7 +68,6 @@ pub(super) struct Params {
     pub(super) _pad3: u32,
 }
 
-
 // vec4s) are mirrored by hand in the repr(C) structs above — the Stage G
 // strided-color bug came from exactly this mirroring. encase's derive computes
 // WGSL-layout size/offsets independently; these tests pin the two
@@ -153,57 +78,6 @@ pub(super) struct Params {
 mod layout_tests {
     use super::*;
     use encase::{ShaderSize, ShaderType};
-
-    #[test]
-    fn glyph_instance_size_and_offsets() {
-        assert_eq!(<GlyphInstance as ShaderSize>::SHADER_SIZE.get(), 48, "WGSL lane map is 12 x 4 B");
-        assert_eq!(std::mem::size_of::<GlyphInstance>(), 48);
-        // Lane map from the glyph_field.wgsl header (offset in bytes).
-        // (Metadata is by-value; METADATA is a const, so re-instantiate it.)
-        let expected = [
-            ("pos", 0),
-            ("glyph_id", 12),
-            ("row", 16),
-            ("col", 20),
-            ("color", 24),
-            ("group_id", 28),
-            ("advance", 32),
-            ("height", 36),
-            ("flags", 40),
-            ("_pad", 44),
-        ];
-        for (i, (name, off)) in expected.iter().enumerate() {
-            assert_eq!(GlyphInstance::METADATA.offset(i), *off as u64, "field {name} offset");
-        }
-    }
-
-    /// The render-bound slot (E2a): 32 B / 8 lanes, mirrors the shader's
-    /// `InstanceSlot`. vec3's 16-alignment does not pad the following u32
-    /// (roundUp(4, 12) = 12) and the array stride rounds 32 up to 16's
-    /// multiple — 32 — so Rust, encase and WGSL agree exactly.
-    #[test]
-    fn render_slot_size_and_offsets() {
-        assert_eq!(<RenderSlot as ShaderSize>::SHADER_SIZE.get(), 32, "WGSL lane map is 8 x 4 B");
-        assert_eq!(std::mem::size_of::<RenderSlot>(), 32);
-        let expected = [
-            ("pos", 0),
-            ("glyph_id", 12),
-            ("color", 16),
-            ("group_id", 20),
-            ("advance", 24),
-            ("height", 28),
-        ];
-        for (i, (name, off)) in expected.iter().enumerate() {
-            assert_eq!(RenderSlot::METADATA.offset(i), *off as u64, "field {name} offset");
-        }
-    }
-
-    #[test]
-    fn group_row_size_and_offsets() {
-        assert_eq!(<GroupRow as ShaderSize>::SHADER_SIZE.get(), 80, "GROUP_STRIDE=5 vec4s");
-        assert_eq!(std::mem::size_of::<GroupRow>(), 80);
-        assert_eq!(GroupRow::METADATA.offset(0), 0, "cols offset");
-    }
 
     /// Stage L (L1): the widened frame uniform. `view_proj` is pinned at
     /// 0..64 — the unchanged WGSL `Camera` block binds those first 64 B, and
@@ -230,56 +104,6 @@ mod layout_tests {
         // Encase uniform-space size agrees with repr(C); both are ≥ the WGSL
         // block's 64 B minimum binding size.
         assert_eq!(<FrameUniform as ShaderSize>::SHADER_SIZE.get(), 104);
-    }
-
-    /// Decisive check: encase's serialization must be byte-identical to the
-    /// bytemuck wire format for distinctive bit patterns — if this holds, the
-    /// write paths can never diverge silently.
-    #[test]
-    fn encase_bytes_match_bytemuck() {
-        let inst = GlyphInstance {
-            pos: [1.5, -2.25, 3.75],
-            glyph_id: 0xAABBCCDD,
-            row: 0x11223344,
-            col: 0x55667788,
-            color: 0xDEADBEEF,
-            group_id: 7,
-            advance: 0.529_741_4,
-            height: 1.0,
-            flags: 0x80000001,
-            _pad: 0x42424242,
-        };
-        let mut buf = Vec::<u8>::new();
-        encase::StorageBuffer::new(&mut buf).write(&inst).unwrap();
-        assert_eq!(buf.len(), 48);
-        assert_eq!(&buf[..], bytemuck::bytes_of(&inst), "GlyphInstance bytes");
-
-        let slot = RenderSlot {
-            pos: [1.5, -2.25, 3.75],
-            glyph_id: 0xAABBCCDD,
-            color: 0xDEADBEEF,
-            group_id: 7,
-            advance: 0.529_741_4,
-            height: 1.0,
-        };
-        let mut buf = Vec::<u8>::new();
-        encase::StorageBuffer::new(&mut buf).write(&slot).unwrap();
-        assert_eq!(buf.len(), 32);
-        assert_eq!(&buf[..], bytemuck::bytes_of(&slot), "RenderSlot bytes");
-
-        let row = GroupRow {
-            cols: [
-                [1.0, 2.0, 3.0, 4.0],
-                [0.0, 0.0, 0.0, 1.0],
-                [0.25, 0.5, 0.75, 1.0],
-                [2.0, 2.0, 2.0, 0.0],
-                [-1.0, -2.0, 1e10, f32::MIN_POSITIVE],
-            ],
-        };
-        let mut buf = Vec::<u8>::new();
-        encase::StorageBuffer::new(&mut buf).write(&row).unwrap();
-        assert_eq!(buf.len(), 80);
-        assert_eq!(&buf[..], bytemuck::bytes_of(&row), "GroupRow bytes");
     }
 
     #[test]

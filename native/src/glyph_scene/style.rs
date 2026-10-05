@@ -1,6 +1,5 @@
 use crate::gpu::GpuContext;
-use super::instance::RenderSlot;
-use super::{GlyphScene, pick::PickFileInfo};
+use super::{GlyphPlacement, GlyphScene, pick::PickFileInfo};
 
 pub enum FileStyle {
     Ok { colored: usize, unstyled: usize },
@@ -9,32 +8,12 @@ pub enum FileStyle {
 }
 
 impl GlyphScene {
+    /// Update slot colors in-place on the GPU. The field takes the fast
+    /// path where it has one: with direct-mapped GPU memory (e.g. Apple
+    /// Silicon Metal) it writes host-visible slots without queue uploads;
+    /// otherwise it issues queue write_buffer commands.
     pub fn write_slot_colors(&self, ctx: &GpuContext, slot_base: u32, colors: &[u32]) {
-        if colors.is_empty() {
-            return;
-        }
-        if let Some(addr) = self.mapped_slots {
-            let ptr = addr as *mut RenderSlot;
-            let total = self.instance_count as usize;
-            let base = slot_base as usize;
-            let count = colors.len().min(total.saturating_sub(base));
-            unsafe {
-                for (i, &c) in colors.iter().take(count).enumerate() {
-                    (*ptr.add(base + i)).color = c;
-                }
-            }
-        } else {
-            for (i, &color) in colors.iter().enumerate() {
-                let slot = slot_base + i as u32;
-                if slot >= self.instance_count {
-                    break;
-                }
-                let chunk = (slot / self.chunk_cap) as usize;
-                let local = (slot % self.chunk_cap) as u64;
-                let off = self.chunk_offsets[chunk] + local * 32 + 16;
-                ctx.queue.write_buffer(&self.instance_bufs[chunk], off, bytemuck::bytes_of(&color));
-            }
-        }
+        self.field.write_colors(&ctx.queue, slot_base, colors);
     }
 
     /// Recolors a file group in-place given its source bytes and AST/LSP byte spans.
@@ -56,7 +35,7 @@ impl GlyphScene {
                 return 0;
             }
         } else if group_id == 0 {
-            (0, self.instance_count)
+            (0, self.field.glyph_count())
         } else {
             return 0;
         };
@@ -247,12 +226,13 @@ impl GlyphScene {
         // CONTIGUOUS slot run — few writes per file. A record no run covers
         // is written back at the default color: a re-style after an edit must
         // not leave the previous version's colors on the glyphs between runs.
-        let mut batches: Vec<(u32, Vec<RenderSlot>)> = Vec::new();
-        let push = |slot: u32, inst: RenderSlot, batches: &mut Vec<(u32, Vec<RenderSlot>)>| {
+        let chunk_capacity = self.field.chunk_capacity();
+        let mut batches: Vec<(u32, Vec<GlyphPlacement>)> = Vec::new();
+        let push = |slot: u32, inst: GlyphPlacement, batches: &mut Vec<(u32, Vec<GlyphPlacement>)>| {
             match batches.last_mut() {
                 Some((start, insts))
                     if *start + insts.len() as u32 == slot
-                        && *start / self.chunk_cap == slot / self.chunk_cap =>
+                        && *start / chunk_capacity == slot / chunk_capacity =>
                 {
                     insts.push(inst);
                 }
@@ -298,8 +278,8 @@ impl GlyphScene {
             }
             push(
                 slot,
-                RenderSlot {
-                    pos,
+                GlyphPlacement {
+                    position: pos,
                     glyph_id: r.glyph_id(),
                     color: packed,
                     group_id: info.group_id,
@@ -311,11 +291,7 @@ impl GlyphScene {
             slot += 1;
         }
         for (start, insts) in &batches {
-            let chunk = (*start / self.chunk_cap) as usize;
-            let local = (*start % self.chunk_cap) as u64;
-            let off = self.chunk_off(chunk, local * 32);
-            ctx.queue
-                .write_buffer(self.chunk_buf(chunk), off, bytemuck::cast_slice(insts));
+            self.field.write_placements(&ctx.queue, *start, insts);
         }
         FileStyle::Ok { colored, unstyled }
     }

@@ -1,0 +1,20 @@
+[package]
+name = "glyph-field-instanced"
+version = "0.1.0"
+edition = "2021"
+description = "The Instanced glyph field: one full 32 B RenderSlot per glyph, read as-is by glyph_field.wgsl."
+
+[dependencies]
+glyph-field = { path = "../glyph-field" }
+# Same pins as native/Cargo.toml so the workspace resolves one wgpu. The
+# Metal direct-upload path reaches `wgpu::hal` (wgpu's default features carry
+# the Metal backend on macOS, exactly as native relies on).
+wgpu = "30"
+bytemuck = { version = "1", features = ["derive"] }
+encase = "0.12"
+rayon = "1.10"
+
+[dev-dependencies]
+# Validate this crate's WGSL with the compiler wgpu 30 bundles (as
+# native/tests/wgsl.rs does for native/src/shaders).
+naga = { version = "30", features = ["wgsl-in"] }

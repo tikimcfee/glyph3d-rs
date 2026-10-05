@@ -5,14 +5,16 @@ use wgpu::util::DeviceExt;
 use crate::atlas::Atlas;
 use crate::gpu::GpuContext;
 use crate::text::StagedText;
+use glyph_field::{FieldResources, FieldTargets, GlyphField, GlyphFieldMode, SlotSource};
+use glyph_field_instanced::InstancedField;
 use super::{
     CameraMode, CullState, FlyCamera, GlyphScene,
     cull::SegCull,
     instance::{FrameUniform, Params, RenderSlot, GlyphInstance, GroupRow},
-    target::POOL_FORMAT,
+    target::{MASK_FORMAT, POOL_FORMAT, SCENE_SAMPLE_COUNT},
     camera::FOV_Y,
     tint::seg_tint,
-    buffers, pipelines, mesh
+    pipelines, mesh
 };
 
 impl GlyphScene {
@@ -23,6 +25,7 @@ impl GlyphScene {
         staged: StagedText,
         camera_mode: CameraMode,
         cull_enabled: bool,
+        field_mode: GlyphFieldMode,
     ) -> Self {
         let device = &ctx.device;
 
@@ -52,24 +55,9 @@ impl GlyphScene {
             groups.push(GroupRow::identity([0.0; 3]));
         }
 
-        // Chunk the arena so no bound RANGE exceeds the binding limit.
-        // (the cull/pick slot math keys on chunk_cap, so the renderer's
-        // chunking and the arena's must agree).
-        //
-        // E2a (note 23): the shader binds the 32 B RenderSlot, so HOST and
-        // MAPPED (48 B) arenas transcode at staging — the values the vertex
-        // math reads are unchanged, so the goldens stay byte-equal.
-        // E2b: a DEVICE arena (the endpoint) binds the chain's slot buffers
-        // AS-IS — no upload, no transcode, no copy; each chunk's pool-slice
-        // offset rides its binding.
         let t_scene_start = std::time::Instant::now();
         let binding_limit = ctx.device.limits().max_storage_buffer_binding_size as usize;
         let instances_len = arena.len();
-        let mapped_slots = arena.device_slots().and_then(|d| d.mapped_slots);
-        let (chunk_cap, chunk_counts, instance_bufs, chunk_offsets) =
-            buffers::build_instance_buffers(ctx, &arena, instances_len);
-        let upload_dur = t_scene_start.elapsed();
-        let t_pipe_start = std::time::Instant::now();
         let group_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("group table"),
             contents: bytemuck::cast_slice(&groups),
@@ -82,16 +70,6 @@ impl GlyphScene {
             atlas.emoji.mip_levels,
             atlas.emoji.texture_bytes as f64 / (1 << 20) as f64,
         );
-        log::info!(
-            "glyph field: {} instances ({} MiB) in {} chunk(s) of ≤{} ({} MiB binding limit), {} groups",
-            instances_len,
-            (instances_len * std::mem::size_of::<RenderSlot>()) >> 20,
-            chunk_counts.len(),
-            chunk_cap,
-            binding_limit >> 20,
-            groups.len(),
-        );
-
         let camera_buf = device.create_buffer(&wgpu::BufferDescriptor {
             // Stage L (L1): the widened FrameUniform buffer (104 B) — binds to
             // the unchanged 64 B WGSL block via the minimum-binding-size rule.
@@ -99,11 +77,6 @@ impl GlyphScene {
             size: std::mem::size_of::<FrameUniform>() as u64,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
-        });
-        let quad_index_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("quad index buffer"),
-            contents: bytemuck::cast_slice(&[0u16, 1, 2, 0, 2, 3]),
-            usage: wgpu::BufferUsages::INDEX,
         });
         let emoji_view = atlas.emoji.texture.create_view(&wgpu::TextureViewDescriptor {
             label: Some("emoji sheet view"),
@@ -161,7 +134,6 @@ impl GlyphScene {
         });
         let mesh_pipeline = std::cell::RefCell::new(mesh::MeshPipeline::new(device, POOL_FORMAT, &mesh_frame_bgl));
 
-        let bgl = pipelines::build_glyph_bgl(device);
         // Trilinear, clamped: the UV rect is inset half a texel so clamping
         // never engages inside a cell; it only guards the sheet's padding.
         let emoji_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
@@ -173,85 +145,71 @@ impl GlyphScene {
             mipmap_filter: wgpu::MipmapFilterMode::Linear,
             ..Default::default()
         });
-        // Stage L (O2): enumerate so captures can tell chunk bind groups
-        // apart (mirrors the "glyph instances i/N" buffer labels).
-        // The chunk bindings: the chain's slot buffers on the endpoint
-        // (Device) path — each with its pool-slice offset — the staged
-        // uploads otherwise. Each chunk's binding starts at its own index
-        // 0, ≤ the binding limit by construction.
-        let chunk_bindings: Vec<wgpu::BufferBinding> = instance_bufs
-            .iter()
-            .zip(chunk_counts.iter())
-            .zip(chunk_offsets.iter())
-            .map(|((b, &count), &off)| wgpu::BufferBinding {
-                buffer: b,
-                // The endpoint's pool slices start mid-buffer; staged
-                // uploads are offset 0. The binding's size is the chunk's
-                // live slots (never the pool page's padding).
-                offset: off,
-                size: std::num::NonZeroU64::new(count as u64 * 32),
-            })
-            .collect();
-        let bind_group_count = chunk_bindings.len();
-        let bind_groups: Vec<wgpu::BindGroup> = chunk_bindings
-            .iter()
-            .enumerate()
-            .map(|(i, chunk_binding)| {
-                let label = if bind_group_count == 1 {
-                    "glyph bg".to_string()
-                } else {
-                    format!("glyph bg {i}/{bind_group_count}")
-                };
-                device.create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: Some(&label),
-                    layout: &bgl,
-                    entries: &[
-                        wgpu::BindGroupEntry {
-                            binding: 0,
-                            resource: camera_buf.as_entire_binding(),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 1,
-                            resource: wgpu::BindingResource::Buffer(chunk_binding.clone()),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 2,
-                            resource: group_buf.as_entire_binding(),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 3,
-                            resource: wgpu::BindingResource::TextureView(
-                                &atlas.glyphmap.create_view(&Default::default()),
-                            ),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 4,
-                            resource: wgpu::BindingResource::TextureView(
-                                &atlas.curves.create_view(&Default::default()),
-                            ),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 5,
-                            resource: params_buf.as_entire_binding(),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 6,
-                            resource: wgpu::BindingResource::TextureView(&emoji_view),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 7,
-                            resource: wgpu::BindingResource::Sampler(&emoji_sampler),
-                        },
-                    ],
-                })
-            })
-            .collect();
-
+        let glyph_map_view = atlas.glyphmap.create_view(&Default::default());
+        let curves_view = atlas.curves.create_view(&Default::default());
+        let resources = FieldResources {
+            frame_uniform: &camera_buf,
+            group_table: &group_buf,
+            glyph_map: &glyph_map_view,
+            curves: &curves_view,
+            params: &params_buf,
+            emoji_sheet: &emoji_view,
+            emoji_sampler: &emoji_sampler,
+        };
         let depth_format = wgpu::TextureFormat::Depth32Float;
-        let (shader, layout, pipeline) =
-            pipelines::build_glyph_pipeline(device, &bgl, depth_format);
-        let mask_pipeline =
-            pipelines::build_mask_pipeline(device, &shader, &layout, color_format);
+        let targets = FieldTargets {
+            // Stage L (L3): the glyph pipeline renders into the POOL format.
+            color_format: POOL_FORMAT,
+            depth_format,
+            sample_count: SCENE_SAMPLE_COUNT,
+        };
+        // The arena's two forms map onto the field's two sources. A DEVICE
+        // arena (the endpoint, E2b) is already slots in the Instanced format,
+        // chunked by its producer; a HOST arena is the engine's neutral
+        // records, which the mode converts and uploads. Unified-memory direct
+        // upload is a property of the adapter, decided here (Metal +
+        // MAPPABLE_PRIMARY_BUFFERS — see glyph_field_instanced::upload).
+        let source = match arena.device_slots() {
+            Some(dev) => SlotSource::Device {
+                chunk_capacity: dev.chunk_slots,
+                chunks: &dev.chunks,
+                glyph_count: instances_len,
+                mapped_base: dev.mapped_slots,
+            },
+            None => SlotSource::Host {
+                slices: arena.instance_chunks(),
+                glyph_count: instances_len,
+                direct_host_upload: ctx.profile.backend == wgpu::Backend::Metal
+                    && ctx.profile.mappable_primary_buffers,
+            },
+        };
+        let field: Box<dyn GlyphField> = match field_mode {
+            GlyphFieldMode::Instanced => {
+                Box::new(InstancedField::new(device, &ctx.queue, source, &resources, targets))
+            }
+            // The CLI refuses `derived` until the mode ships, so no caller
+            // reaches this arm; a library caller that does gets told plainly.
+            GlyphFieldMode::Derived => panic!(
+                "glyph field mode 'derived' is not implemented yet — build with GlyphFieldMode::Instanced"
+            ),
+        };
+        let field_dur = t_scene_start.elapsed();
+        let t_pipe_start = std::time::Instant::now();
+        log::info!(
+            "glyph field ({}): {} instances ({} MiB) in {} chunk(s) of ≤{} ({} MiB binding limit), {} groups",
+            field.mode(),
+            instances_len,
+            (instances_len * std::mem::size_of::<RenderSlot>()) >> 20,
+            field.chunk_count(),
+            field.chunk_capacity(),
+            binding_limit >> 20,
+            groups.len(),
+        );
+        // Stage L (L4): the selection mask only exists on the shader path —
+        // the copy path (offscreen, color_format == POOL_FORMAT) never
+        // renders selection visuals.
+        let mask_pipeline = (color_format != POOL_FORMAT)
+            .then(|| field.create_mask_pipeline(device, MASK_FORMAT, SCENE_SAMPLE_COUNT));
 
         // Camera fit from staged bounds (or the Stage E2 focus-file override).
         let (center, half_w, half_h) = match staged.focus_bounds {
@@ -328,22 +286,17 @@ impl GlyphScene {
         let tint_step = vec![0u32; groups.len()];
         let pipe_dur = t_pipe_start.elapsed();
         log::info!(
-            "scene timings: buffer upload {:.3}s | pipeline/cull init {:.3}s | total scene {:.3}s",
-            upload_dur.as_secs_f64(),
+            "scene timings: field build (upload + glyph pipeline) {:.3}s | cull/composite init {:.3}s | total scene {:.3}s",
+            field_dur.as_secs_f64(),
             pipe_dur.as_secs_f64(),
-            (upload_dur + pipe_dur).as_secs_f64(),
+            (field_dur + pipe_dur).as_secs_f64(),
         );
 
         Self {
-            pipeline,
+            field,
             _emoji_view: emoji_view,
-            bind_groups,
-            chunk_counts,
-            chunk_cap: chunk_cap as u32,
             camera_buf,
-            quad_index_buf,
             depth_format,
-            instance_count: instances_len as u32,
             center,
             half_w,
             half_h,
@@ -351,9 +304,6 @@ impl GlyphScene {
             camera_mode,
             fly,
             cull,
-            instance_bufs,
-            chunk_offsets,
-            mapped_slots,
             group_buf,
             groups_cpu,
             pick,

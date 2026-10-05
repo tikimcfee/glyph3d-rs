@@ -2838,6 +2838,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "glyph-field"
+version = "0.1.0"
+dependencies = [
+ "bytemuck",
+ "encase",
+ "wgpu",
+]
+
+[[package]]
+name = "glyph-field-instanced"
+version = "0.1.0"
+dependencies = [
+ "bytemuck",
+ "encase",
+ "glyph-field",
+ "naga",
+ "rayon",
+ "wgpu",
+]
+
+[[package]]
 name = "glyph3d-native"
 version = "0.1.0"
 dependencies = [
@@ -2852,6 +2873,8 @@ dependencies = [
  "egui-winit",
  "encase",
  "glam",
+ "glyph-field",
+ "glyph-field-instanced",
  "image",
  "log",
  "memchr",

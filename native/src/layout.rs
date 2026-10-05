@@ -471,11 +471,9 @@ pub struct DeviceSlots {
     pub keep_alive: Vec<Box<dyn std::any::Any + Send>>,
 }
 
-pub struct DeviceSlotChunk {
-    pub buffer: wgpu::Buffer,
-    pub offset: u64,
-    pub slots: u32,
-}
+/// One chunk of device slots — the field contract's [`glyph_field::SlotChunk`]
+/// (buffer, slot-0 byte offset, live slots), named for its producer role here.
+pub use glyph_field::SlotChunk as DeviceSlotChunk;
 
 /// The tint stream's two homes (note 23, E3b): a host Vec (the gate's Both
 /// mode, and hosts without host-visible storage) or a MAPPED shared buffer

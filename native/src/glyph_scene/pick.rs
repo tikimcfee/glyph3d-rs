@@ -8,7 +8,7 @@
 use glam::DVec3;
 use std::path::PathBuf;
 
-use super::{CameraMode, GlyphScene, GroupRow, RenderSlot, Selection, FOV_Y};
+use super::{CameraMode, GlyphPlacement, GlyphScene, GroupRow, Selection, FOV_Y};
 use crate::gpu::GpuContext;
 use crate::layout::{GlyphRecord, ItemParams};
 
@@ -579,9 +579,10 @@ impl GlyphScene {
     fn selection_from_hit(&self, h: &PickHit) -> Option<Selection> {
         if let Some(g) = &h.glyph {
             if let Some(slot) = g.slot {
+                let chunk_capacity = self.field.chunk_capacity();
                 return Some(Selection::Glyph {
-                    chunk: slot / self.chunk_cap,
-                    local: slot % self.chunk_cap,
+                    chunk: slot / chunk_capacity,
+                    local: slot % chunk_capacity,
                 });
             }
         }
@@ -592,29 +593,6 @@ impl GlyphScene {
             .iter()
             .find(|f| f.group_id == h.group_id)
             .map(|f| Selection::Segment { slot_base: f.slot_base, slot_count: f.slot_count })
-    }
-
-    /// The device buffer holding instance `chunk` — the chunk's own buffer
-    /// (the arena holds one buffer per chunk since the chunked mapped form).
-    pub(super) fn chunk_buf(&self, chunk: usize) -> &wgpu::Buffer {
-        &self.instance_bufs[chunk]
-    }
-
-    /// Byte offset of `local` within the chunk's data — the staged buffers
-    /// start at their own index 0; the endpoint's extracted pool slices
-    /// carry their offset in `chunk_offsets`.
-    pub(super) fn chunk_off(&self, chunk: usize, local: u64) -> u64 {
-        self.chunk_offsets[chunk] + local
-    }
-
-    /// Partial instance-field upload: `data` at byte `field_off` within a
-    /// slot (32 B RenderSlot stride, 4-aligned offsets — write_buffer's
-    /// requirement).
-    fn write_instance(&self, ctx: &GpuContext, slot: u32, field_off: u64, data: &[u8]) {
-        let chunk = (slot / self.chunk_cap) as usize;
-        let local = (slot % self.chunk_cap) as u64;
-        let off = self.chunk_off(chunk, local * 32 + field_off);
-        ctx.queue.write_buffer(self.chunk_buf(chunk), off, data);
     }
 
     /// Upload one edited group row (80 B) — never the whole table.
@@ -729,7 +707,7 @@ impl GlyphScene {
                 let Some(slot) = g.slot else {
                     return format!("verb recolor-glyph: {rel} '{}' is blank (no instance)", g.ch);
                 };
-                self.write_instance(ctx, slot, 16, &pack(*rgb).to_le_bytes());
+                self.field.write_color(&ctx.queue, slot, pack(*rgb));
                 format!(
                     "verb recolor-glyph: {rel} row {} col {} slot {slot} -> #{:02x}{:02x}{:02x} (4 B)",
                     g.row, g.col, rgb[0], rgb[1], rgb[2]
@@ -746,12 +724,13 @@ impl GlyphScene {
                 let c = self.cache.as_ref().expect("cache populated: ensure_pick_cache just returned true");
                 let packed = pack(*rgb);
                 // Collect (slot, record) for the row, coalesce into runs of
-                // CONTIGUOUS SLOTS, then rebuild the full 32 B slot for each
-                // run from the cache (the color field is strided 32 B apart —
-                // a raw color-only byte range would stomp neighboring fields;
-                // a rebuilt-slot range write keeps it to ONE write_buffer per
-                // run).
-                let mut runs: Vec<(u32, Vec<RenderSlot>)> = Vec::new();
+                // CONTIGUOUS SLOTS, then rebuild the full placement for each
+                // run from the cache (the color field is strided apart in
+                // slot storage — a raw color-only byte range would stomp
+                // neighboring fields; a rebuilt-placement range write keeps
+                // it to ONE write per run, per chunk).
+                let chunk_capacity = self.field.chunk_capacity();
+                let mut runs: Vec<(u32, Vec<GlyphPlacement>)> = Vec::new();
                 let mut total = 0usize;
                 for (i, r) in c.records.iter().enumerate() {
                     if r.row() != row {
@@ -770,8 +749,8 @@ impl GlyphScene {
                         advance = *a;
                         height = *h;
                     }
-                    let inst = RenderSlot {
-                        pos,
+                    let inst = GlyphPlacement {
+                        position: pos,
                         glyph_id: r.glyph_id(),
                         color: packed,
                         group_id: gid,
@@ -781,7 +760,7 @@ impl GlyphScene {
                     match runs.last_mut() {
                         Some((start, insts))
                             if *start + insts.len() as u32 == s
-                                && *start / self.chunk_cap == s / self.chunk_cap =>
+                                && *start / chunk_capacity == s / chunk_capacity =>
                         {
                             insts.push(inst);
                         }
@@ -790,12 +769,8 @@ impl GlyphScene {
                 }
                 let mut bytes = 0u64;
                 for (start, insts) in &runs {
-                    let chunk = (*start / self.chunk_cap) as usize;
-                    let local = (*start % self.chunk_cap) as u64;
-                    let off = self.chunk_off(chunk, local * 32);
-                    ctx.queue
-                        .write_buffer(self.chunk_buf(chunk), off, bytemuck::cast_slice(insts));
-                    bytes += insts.len() as u64 * 32;
+                    self.field.write_placements(&ctx.queue, *start, insts);
+                    bytes += insts.len() as u64 * u64::from(self.field.slot_bytes());
                 }
                 format!(
                     "verb recolor-line: {rel} row {row} — {total} glyphs in {} run(s), {bytes} B uploaded",
@@ -810,7 +785,7 @@ impl GlyphScene {
                     return format!("verb nudge-glyph: {rel} '{}' is blank (no instance)", g.ch);
                 };
                 let new = [g.pos[0] + d[0], g.pos[1] + d[1], g.pos[2] + d[2]];
-                self.write_instance(ctx, slot, 0, bytemuck::cast_slice(&new));
+                self.field.write_position(&ctx.queue, slot, new);
                 self.geom_overrides
                     .entry(slot)
                     .or_insert((new, g.advance, g.height))
@@ -833,7 +808,7 @@ impl GlyphScene {
                     return format!("verb scale-glyph: {rel} '{}' is blank (no instance)", g.ch);
                 };
                 let new_ah = [g.advance * f, g.height * f];
-                self.write_instance(ctx, slot, 24, bytemuck::cast_slice(&new_ah));
+                self.field.write_extent(&ctx.queue, slot, new_ah[0], new_ah[1]);
                 let ov = self
                     .geom_overrides
                     .entry(slot)

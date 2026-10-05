@@ -17,6 +17,10 @@ time.
 - `native/` — the pure-Rust renderer and layout engine binary (`glyph3d-native`).
   Features sub-second repo loading (`HyperLayout`) and modularized Slug WGSL rendering.
 - `glyph/` — the verification gate and mutation test runner (`cargo run -p glyph -- validate`).
+- `crates/` — the glyph field, split by render mode (2026-10): `glyph-field` is the
+  mode-neutral contract (`GlyphField` trait, `GlyphFieldMode`, the shared records and
+  binding map); `glyph-field-instanced` is the Instanced mode (32 B `RenderSlot`, its
+  upload path, pipelines and `glyph_field.wgsl`). Chosen at load with `--field-mode`.
 - `tools/` — check scripts, generators, and repro helpers.
 - `assets/atlas/` — prebaked glyph-geometry binaries (+ `FORMAT.md`).
 - `schema/glyph-identity.json` — layout source of truth (vendored, hash-pinned).
@@ -53,8 +57,10 @@ native Rust with Rayon and unified-memory shared buffer mapping.
   optional Cargo feature `cubecl` (`cargo check --features cubecl`).
 - ByteSpan token painting: `ByteSpan` and `Paint::ByteSpans` provide byte-range semantic
   token coloring directly from AST/LSP analyses.
-- Modularized renderer: `glyph_scene.rs` is factored cleanly into `buffers.rs`,
-  `pipelines.rs`, and `render.rs`.
+- Modularized renderer: `glyph_scene.rs` is factored into `setup.rs`, `pipelines.rs`
+  (composite) and `render.rs`; the glyph field itself — slot storage, upload, glyph
+  pipeline, WGSL — lives behind the `GlyphField` trait in `crates/` (one crate per
+  render mode, chosen with `--field-mode`; the scene never touches slot bytes).
 
 **The dependency graph is declared in `build.toml`** (artifact, input globs,
 build command, class) and executed by `glyph` (`glyph/src/main.rs`). The baseline PNGs are class **golden**: verified,
@@ -498,7 +504,7 @@ with a number against it.
 | `engine/glyph_schema.{mojo,mjs}` | generated | `tools/gen_schema.py` from `schema/glyph-identity.json` — **two** edges leave the schema; editing it invalidates the corpus as well as the dylib |
 | `tools/vendor/` | vendored, hash-pinned | `vendor-manifest.py --check`; upstream drift is information, not failure |
 | `schema/glyph-identity.json` | vendored verbatim | drift means an upstream refresh, not a local edit |
-| `native/src/shaders/*.wgsl` | fenced | the naga test pins the shader *set* — that it compiles and exists, not what it draws. The only thing that sees a pixel change is the golden-view A/B, whose blind spots are above. That gap is why edits here need their own re-baselined change rather than an ordinary commit |
+| `native/src/shaders/*.wgsl`, `crates/*/shaders/*.wgsl` | fenced | the naga tests (`native/tests/wgsl.rs`, and each field-mode crate's own `tests/wgsl.rs`) pin the shader *set* — that it compiles and exists, not what it draws. The only thing that sees a pixel change is the golden-view A/B, whose blind spots are above. That gap is why edits here need their own re-baselined change rather than an ordinary commit. `glyph_field.wgsl` moved byte-identically (git mv) into `crates/glyph-field-instanced/shaders/` on 2026-10-05 when the glyph field split into render modes; a move is not an edit, and the goldens are the proof |
 | `native/fixtures/baseline-view.txt` | IMMUTABLE | it is the input to `text.png`; editing it re-baselines that check silently |
 | `native/fixtures/emoji-view.txt` | IMMUTABLE | the input to `emoji.png`, one line per class of bitmap slot the trie carries; same reason |
 | `native/fixtures/g-pick-repo/empty.rs` | IMMUTABLE, zero bytes | the only input that reaches the page-extent origin seed; deleting it removes a check's ability to see its subject without removing the check |
