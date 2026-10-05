@@ -183,6 +183,7 @@ fn main() {
                 desk_revision_limit: cli.desk_revision_limit,
                 desk_scroll_offset: 0,
                 max_file_stacks: 20,
+                active_beat: None,
             },
         }
     } else if let Some(dir) = &cli.load_repo {

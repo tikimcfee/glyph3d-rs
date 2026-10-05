@@ -31,6 +31,8 @@ pub struct CarrelLayoutOptions {
     pub desk_scroll_offset: usize,
     /// Maximum number of file stacks placed on the workdesk (default 20).
     pub max_file_stacks: usize,
+    /// Optional active beat index to focus immediately on layout (defaults to newest slot 0).
+    pub active_beat: Option<usize>,
 }
 
 impl Default for CarrelLayoutOptions {
@@ -41,6 +43,7 @@ impl Default for CarrelLayoutOptions {
             desk_revision_limit: 20,
             desk_scroll_offset: 0,
             max_file_stacks: 20,
+            active_beat: None,
         }
     }
 }
@@ -72,6 +75,11 @@ impl CarrelLayoutOptions {
 
     pub fn with_max_file_stacks(mut self, max: usize) -> Self {
         self.max_file_stacks = max.max(1);
+        self
+    }
+
+    pub fn with_active_beat(mut self, beat: Option<usize>) -> Self {
+        self.active_beat = beat;
         self
     }
 }
@@ -230,7 +238,10 @@ impl SpatialScene {
         }
 
         // 4. Attach AgentCarrel component to root
-        let initial_beat = slot_to_beat.first().copied().unwrap_or(0);
+        let initial_beat = options
+            .active_beat
+            .filter(|&b| slot_to_beat.contains(&b))
+            .unwrap_or_else(|| slot_to_beat.first().copied().unwrap_or(0));
         let initial_turn = if !events.is_empty() {
             events.get(initial_beat).map(|e| e.turn_index).unwrap_or(0)
         } else {

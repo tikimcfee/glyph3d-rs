@@ -446,6 +446,7 @@ impl ApplicationHandler for App<'_> {
                 #[cfg(feature = "egui-ui")]
                 if let Some(req) = state.pending_relayout.take() {
                     apply_relayout(&self.ctx, &mut self.choice, self.cull_opts, self.ui, state, req);
+                    state.window.request_redraw();
                 }
                 if self.live.is_some() {
                     #[cfg(feature = "egui-ui")]
@@ -562,32 +563,84 @@ impl ApplicationHandler for App<'_> {
                     } else if let SceneChoice::AgentSession { layout_options, .. } = &self.choice {
                         #[cfg(feature = "egui-ui")]
                         {
-                            let max_k = state
+                            let carrel_snap = state
                                 .ui_probe
                                 .as_ref()
-                                .and_then(|p| p.borrow().carrel.as_ref().map(|c| c.max_deck_scroll))
-                                .unwrap_or(0);
-                            let mut new_opts = *layout_options;
+                                .and_then(|p| p.borrow().carrel.clone());
+
                             let mut handled = false;
-                            if pressed && code == KeyCode::Comma {
-                                new_opts.deck_scroll_offset = (new_opts.deck_scroll_offset + 1).min(max_k);
-                                handled = true;
-                            } else if pressed && code == KeyCode::Period {
-                                new_opts.deck_scroll_offset = new_opts.deck_scroll_offset.saturating_sub(1);
-                                handled = true;
-                            } else if pressed && code == KeyCode::Home {
-                                new_opts.deck_scroll_offset = 0;
-                                handled = true;
-                            } else if pressed && code == KeyCode::End {
-                                new_opts.deck_scroll_offset = max_k;
-                                handled = true;
+                            if let Some(carrel) = carrel_snap {
+                                let total_items = carrel.beat_count.max(carrel.turn_count);
+                                let limit = carrel.layout_options.deck_window_limit.max(1);
+                                let max_k = carrel.max_deck_scroll;
+                                let (oldest, newest) = carrel.window_item_range;
+                                let window_min = oldest.saturating_sub(1);
+                                let window_max = newest.saturating_sub(1);
+
+                                if pressed && (code == KeyCode::KeyP || code == KeyCode::ArrowLeft) {
+                                    let target_beat = carrel.active_beat.saturating_sub(1);
+                                    if total_items > 0 && target_beat < window_min {
+                                        let new_k = (total_items.saturating_sub(limit).saturating_sub(target_beat)).min(max_k);
+                                        let mut new_opts = *layout_options;
+                                        new_opts.deck_scroll_offset = new_k;
+                                        new_opts.active_beat = Some(target_beat);
+                                        state.pending_relayout = Some(RelayoutRequest {
+                                            carrel_options: Some(new_opts),
+                                            ..Default::default()
+                                        });
+                                        handled = true;
+                                    }
+                                } else if pressed && (code == KeyCode::KeyN || code == KeyCode::ArrowRight) {
+                                    let target_beat = (carrel.active_beat + 1).min(total_items.saturating_sub(1));
+                                    if total_items > 0 && target_beat > window_max {
+                                        let new_k = (total_items.saturating_sub(1).saturating_sub(target_beat)).min(max_k);
+                                        let mut new_opts = *layout_options;
+                                        new_opts.deck_scroll_offset = new_k;
+                                        new_opts.active_beat = Some(target_beat);
+                                        state.pending_relayout = Some(RelayoutRequest {
+                                            carrel_options: Some(new_opts),
+                                            ..Default::default()
+                                        });
+                                        handled = true;
+                                    }
+                                } else if pressed && code == KeyCode::Comma {
+                                    let mut new_opts = *layout_options;
+                                    new_opts.deck_scroll_offset = (new_opts.deck_scroll_offset + 1).min(max_k);
+                                    state.pending_relayout = Some(RelayoutRequest {
+                                        carrel_options: Some(new_opts),
+                                        ..Default::default()
+                                    });
+                                    handled = true;
+                                } else if pressed && code == KeyCode::Period {
+                                    let mut new_opts = *layout_options;
+                                    new_opts.deck_scroll_offset = new_opts.deck_scroll_offset.saturating_sub(1);
+                                    state.pending_relayout = Some(RelayoutRequest {
+                                        carrel_options: Some(new_opts),
+                                        ..Default::default()
+                                    });
+                                    handled = true;
+                                } else if pressed && code == KeyCode::Home {
+                                    let mut new_opts = *layout_options;
+                                    new_opts.deck_scroll_offset = 0;
+                                    new_opts.active_beat = Some(total_items.saturating_sub(1));
+                                    state.pending_relayout = Some(RelayoutRequest {
+                                        carrel_options: Some(new_opts),
+                                        ..Default::default()
+                                    });
+                                    handled = true;
+                                } else if pressed && code == KeyCode::End {
+                                    let mut new_opts = *layout_options;
+                                    new_opts.deck_scroll_offset = max_k;
+                                    new_opts.active_beat = Some(0);
+                                    state.pending_relayout = Some(RelayoutRequest {
+                                        carrel_options: Some(new_opts),
+                                        ..Default::default()
+                                    });
+                                    handled = true;
+                                }
                             }
-                            if handled && new_opts != *layout_options {
-                                state.pending_relayout = Some(RelayoutRequest {
-                                    carrel_options: Some(new_opts),
-                                    ..Default::default()
-                                });
-                            } else {
+
+                            if !handled {
                                 state.scene.on_key(&self.ctx, code, pressed);
                             }
                         }

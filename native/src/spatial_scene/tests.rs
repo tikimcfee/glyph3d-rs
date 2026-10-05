@@ -607,6 +607,7 @@ fn test_agent_carrel_sliding_window_and_time_scroll() {
         desk_revision_limit: 4,
         desk_scroll_offset: 0,
         max_file_stacks: 10,
+        active_beat: None,
     };
 
     let carrel = scene.spawn_agent_carrel_with_options(root, &session, &rev_engine, opts);
@@ -619,6 +620,7 @@ fn test_agent_carrel_sliding_window_and_time_scroll() {
     assert_eq!(carrel_comp.slot_to_beat[1], 18);
     assert_eq!(carrel_comp.slot_to_beat[2], 17);
     assert_eq!(carrel_comp.slot_to_beat[3], 16);
+    assert_eq!(carrel_comp.active_beat, 19);
 
     // 3. Test scrolling back in time: K = 2 (scroll 2 beats back)
     let opts_scrolled = CarrelLayoutOptions {
@@ -627,6 +629,7 @@ fn test_agent_carrel_sliding_window_and_time_scroll() {
         desk_revision_limit: 4,
         desk_scroll_offset: 0,
         max_file_stacks: 10,
+        active_beat: Some(15),
     };
     let carrel_scrolled = scene.spawn_agent_carrel_with_options(root, &session, &rev_engine, opts_scrolled);
     let scrolled_comp = scene.world.get::<AgentCarrel>(carrel_scrolled).unwrap();
@@ -636,4 +639,6 @@ fn test_agent_carrel_sliding_window_and_time_scroll() {
     assert_eq!(scrolled_comp.slot_to_beat[1], 16);
     assert_eq!(scrolled_comp.slot_to_beat[2], 15);
     assert_eq!(scrolled_comp.slot_to_beat[3], 14);
+    // Focused active beat is 15 (slot 2)
+    assert_eq!(scrolled_comp.active_beat, 15);
 }

@@ -813,9 +813,39 @@ impl WindowState {
                         .show(root_ui.ctx(), |ui| {
                             ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
                             ui.horizontal(|ui| {
-                                if ui.button("◀ Prev (P/←)").clicked() {
-                                    self.scene.on_key(ctx, winit::keyboard::KeyCode::KeyP, true);
+                                if ui.button("⏮ Oldest (End)").clicked() {
+                                    let mut opts = carrel.layout_options;
+                                    opts.deck_scroll_offset = carrel.max_deck_scroll;
+                                    opts.active_beat = Some(0);
+                                    *pending_relayout = Some(RelayoutRequest {
+                                        carrel_options: Some(opts),
+                                        ..Default::default()
+                                    });
                                 }
+
+                                let total_beats = carrel.beat_count.max(carrel.turn_count);
+                                let limit = carrel.layout_options.deck_window_limit.max(1);
+                                let max_k = carrel.max_deck_scroll;
+                                let (oldest, newest) = carrel.window_item_range;
+                                let window_min = oldest.saturating_sub(1);
+                                let window_max = newest.saturating_sub(1);
+
+                                if ui.button("◀ Prev (P/←)").clicked() && total_beats > 0 {
+                                    let target_beat = carrel.active_beat.saturating_sub(1);
+                                    if target_beat < window_min {
+                                        let new_k = (total_beats.saturating_sub(limit).saturating_sub(target_beat)).min(max_k);
+                                        let mut opts = carrel.layout_options;
+                                        opts.deck_scroll_offset = new_k;
+                                        opts.active_beat = Some(target_beat);
+                                        *pending_relayout = Some(RelayoutRequest {
+                                            carrel_options: Some(opts),
+                                            ..Default::default()
+                                        });
+                                    } else {
+                                        self.scene.on_key(ctx, winit::keyboard::KeyCode::KeyP, true);
+                                    }
+                                }
+
                                 if carrel.beat_count > 0 {
                                     ui.label(egui::RichText::new(format!(
                                         "Beat {} / {} (T{})",
@@ -826,9 +856,33 @@ impl WindowState {
                                 } else {
                                     ui.label(egui::RichText::new(format!("Turn {} / {}", carrel.active_turn + 1, carrel.turn_count)).strong());
                                 }
-                                if ui.button("Next (N/→) ▶").clicked() {
-                                    self.scene.on_key(ctx, winit::keyboard::KeyCode::KeyN, true);
+
+                                if ui.button("Next (N/→) ▶").clicked() && total_beats > 0 {
+                                    let target_beat = (carrel.active_beat + 1).min(total_beats.saturating_sub(1));
+                                    if target_beat > window_max {
+                                        let new_k = (total_beats.saturating_sub(1).saturating_sub(target_beat)).min(max_k);
+                                        let mut opts = carrel.layout_options;
+                                        opts.deck_scroll_offset = new_k;
+                                        opts.active_beat = Some(target_beat);
+                                        *pending_relayout = Some(RelayoutRequest {
+                                            carrel_options: Some(opts),
+                                            ..Default::default()
+                                        });
+                                    } else {
+                                        self.scene.on_key(ctx, winit::keyboard::KeyCode::KeyN, true);
+                                    }
                                 }
+
+                                if ui.button("Latest ⏭ (Home)").clicked() {
+                                    let mut opts = carrel.layout_options;
+                                    opts.deck_scroll_offset = 0;
+                                    opts.active_beat = Some(total_beats.saturating_sub(1));
+                                    *pending_relayout = Some(RelayoutRequest {
+                                        carrel_options: Some(opts),
+                                        ..Default::default()
+                                    });
+                                }
+
                                 ui.separator();
                                 if ui.button("Mode (V)").clicked() {
                                     self.scene.on_key(ctx, winit::keyboard::KeyCode::KeyV, true);
@@ -851,49 +905,13 @@ impl WindowState {
                                 if carrel.layout_options.deck_scroll_offset > 0 {
                                     ui.colored_label(
                                         egui::Color32::from_rgb(255, 180, 80),
-                                        format!("(-{} back)", carrel.layout_options.deck_scroll_offset),
+                                        format!("(-{} back in history)", carrel.layout_options.deck_scroll_offset),
                                     );
                                 } else {
                                     ui.colored_label(
                                         egui::Color32::from_rgb(100, 240, 140),
                                         "(LIVE / LATEST)",
                                     );
-                                }
-                            });
-
-                            // Time Travel Buttons
-                            ui.horizontal(|ui| {
-                                if ui.button("⏮ Oldest (End)").clicked() {
-                                    let mut opts = carrel.layout_options;
-                                    opts.deck_scroll_offset = carrel.max_deck_scroll;
-                                    *pending_relayout = Some(RelayoutRequest {
-                                        carrel_options: Some(opts),
-                                        ..Default::default()
-                                    });
-                                }
-                                if ui.button("◀ Back (<)").clicked() {
-                                    let mut opts = carrel.layout_options;
-                                    opts.deck_scroll_offset = (opts.deck_scroll_offset + 1).min(carrel.max_deck_scroll);
-                                    *pending_relayout = Some(RelayoutRequest {
-                                        carrel_options: Some(opts),
-                                        ..Default::default()
-                                    });
-                                }
-                                if ui.button("Fwd (>) ▶").clicked() {
-                                    let mut opts = carrel.layout_options;
-                                    opts.deck_scroll_offset = opts.deck_scroll_offset.saturating_sub(1);
-                                    *pending_relayout = Some(RelayoutRequest {
-                                        carrel_options: Some(opts),
-                                        ..Default::default()
-                                    });
-                                }
-                                if ui.button("Latest ⏭ (Home)").clicked() {
-                                    let mut opts = carrel.layout_options;
-                                    opts.deck_scroll_offset = 0;
-                                    *pending_relayout = Some(RelayoutRequest {
-                                        carrel_options: Some(opts),
-                                        ..Default::default()
-                                    });
                                 }
                             });
 
