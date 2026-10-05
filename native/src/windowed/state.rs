@@ -489,7 +489,14 @@ impl WindowState {
                 egui::Window::new("Debug")
                     .id(egui::Id::new("stage_k_debug_panel"))
                     .open(debug_open)
+                    .default_pos(egui::pos2(10.0, 10.0))
+                    .default_size(egui::vec2(360.0, 520.0))
+                    .min_size(egui::vec2(280.0, 180.0))
+                    .resizable(true)
+                    .collapsible(true)
+                    .vscroll(true)
                     .show(root_ui.ctx(), |ui| {
+                        ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
                         ui.label(format!("FPS: {fps:.1}"));
                         match &probe_snap {
                             Some(snap) => {
@@ -798,8 +805,13 @@ impl WindowState {
                     egui::Window::new(format!("Agent Carrel: {}", carrel.session_id))
                         .id(egui::Id::new("agent_carrel_hud"))
                         .default_pos(egui::pos2(20.0, 20.0))
-                        .default_width(380.0)
+                        .default_size(egui::vec2(380.0, 480.0))
+                        .min_size(egui::vec2(280.0, 160.0))
+                        .resizable(true)
+                        .collapsible(true)
+                        .vscroll(true)
                         .show(root_ui.ctx(), |ui| {
+                            ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
                             ui.horizontal(|ui| {
                                 if ui.button("◀ Prev (P/←)").clicked() {
                                     self.scene.on_key(ctx, winit::keyboard::KeyCode::KeyP, true);
@@ -931,18 +943,22 @@ impl WindowState {
                                 ui.label(egui::RichText::new("Active Beat:").heading());
                                 ui.colored_label(egui::Color32::from_rgb(250, 220, 120), &carrel.beat_summary);
                             }
-                            ui.separator();
-                            ui.label(egui::RichText::new("Turn Prompt:").heading());
-                            ui.label(&carrel.prompt_summary);
+                            if !carrel.prompt_summary.is_empty() {
+                                ui.separator();
+                                ui.collapsing("Turn Prompt", |ui| {
+                                    ui.label(&carrel.prompt_summary);
+                                });
+                            }
                             if !carrel.touched_files.is_empty() {
                                 ui.separator();
-                                ui.label(egui::RichText::new("Workdesk File Revisions:").heading());
-                                for (path, act, total) in &carrel.touched_files {
-                                    ui.horizontal(|ui| {
-                                        ui.colored_label(egui::Color32::from_rgb(100, 220, 160), "•");
-                                        ui.label(format!("{path} (active: R{act}, total: {total})"));
-                                    });
-                                }
+                                ui.collapsing(format!("Workdesk Files ({})", carrel.touched_files.len()), |ui| {
+                                    for (path, act, total) in &carrel.touched_files {
+                                        ui.horizontal(|ui| {
+                                            ui.colored_label(egui::Color32::from_rgb(100, 220, 160), "•");
+                                            ui.label(format!("{path} (active: R{act}, total: {total})"));
+                                        });
+                                    }
+                                });
                             }
                         });
                 }
@@ -957,10 +973,12 @@ impl WindowState {
                         .id(egui::Id::new("agent_session_browser"))
                         .open(session_browser_open)
                         .default_pos(egui::pos2(50.0, 50.0))
-                        .default_width(580.0)
-                        .default_height(480.0)
+                        .default_size(egui::vec2(580.0, 480.0))
+                        .min_size(egui::vec2(360.0, 240.0))
                         .resizable(true)
+                        .collapsible(true)
                         .show(root_ui.ctx(), |ui| {
+                            ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
                             // 1. Controls bar
                             ui.horizontal(|ui| {
                                 ui.label("Search:");
