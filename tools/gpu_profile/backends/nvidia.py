@@ -68,6 +68,17 @@ def available() -> bool:
     return shutil.which("ncu") is not None
 
 
+def gpu_busy_pct() -> float | None:
+    """Whole-GPU utilization right now, from nvidia-smi (max over devices)."""
+    if shutil.which("nvidia-smi") is None:
+        return None
+    out = subprocess.run(
+        ["nvidia-smi", "--query-gpu=utilization.gpu", "--format=csv,noheader,nounits"], capture_output=True, text=True
+    ).stdout
+    values = [float(v) for v in out.split() if v.strip().replace(".", "", 1).isdigit()]
+    return max(values) if values else None
+
+
 def capture(command: list[str], out_dir: Path, env: dict[str, str], time_limit_s: int) -> None:
     raw = out_dir / "raw"
     raw.mkdir(parents=True, exist_ok=True)

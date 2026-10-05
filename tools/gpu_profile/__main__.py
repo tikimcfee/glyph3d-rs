@@ -25,6 +25,7 @@ from gpu_profile.backends import BACKENDS, auto  # noqa: E402
 from gpu_profile.schema import CANONICAL_METRICS, SCHEMA_TAG  # noqa: E402
 
 DEFAULT_GAP_MS = 150
+IDLE_BUSY_LIMIT_PCT = 15.0
 
 
 def _backend(name: str):
@@ -38,19 +39,46 @@ def _write_profile(out: Path, profile: dict) -> None:
         print(f"  note: {note}")
 
 
+def _idle_preflight(backend, allow_busy: bool) -> float | None:
+    """Refuse to measure on a GPU that is already busy. A foreign workload
+    time-slices with ours and inflates every number without any error — on
+    2026-10-05 an orphaned compute context held an M2 at 100% for hours."""
+    import time
+
+    readings = []
+    for _ in range(3):
+        value = backend.gpu_busy_pct()
+        if value is None:
+            return None
+        readings.append(value)
+        time.sleep(0.5)
+    idle = min(readings)
+    if idle > IDLE_BUSY_LIMIT_PCT and not allow_busy:
+        raise SystemExit(
+            f"gpu_profile: GPU is {idle:.0f}% busy before the target even starts (limit {IDLE_BUSY_LIMIT_PCT}%). "
+            "Something else owns the GPU; numbers would be time-sliced against it. Find it (README: Metal notes) "
+            "or pass --allow-busy-gpu to record anyway."
+        )
+    return idle
+
+
 def cmd_capture(args) -> None:
     backend = _backend(args.backend)
+    idle = _idle_preflight(backend, args.allow_busy_gpu)
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     command = args.command[1:] if args.command[:1] == ["--"] else args.command
     if not command:
         raise SystemExit("gpu_profile capture: give the target command after --")
     env = {"GLYPH_CHAIN_PROF": "stages", "GLYPH_GPU_ISOLATE_MS": str(args.gap_ms)}
-    meta = {"backend": backend.NAME, "command": command, "gap_ms": args.gap_ms, "label": args.label or out.name}
+    meta = {"backend": backend.NAME, "command": command, "gap_ms": args.gap_ms, "label": args.label or out.name,
+            "idle_gpu_busy_pct": idle}
     (out / "capture.json").write_text(json.dumps(meta, indent=2) + "\n")
-    print(f"gpu_profile: capturing with {backend.NAME} -> {out}")
+    print(f"gpu_profile: capturing with {backend.NAME} -> {out} (idle GPU busy: {idle}%)")
     backend.capture(command, out, env, args.time_limit)
-    _write_profile(out, backend.analyze(out, meta["label"], command, args.gap_ms))
+    profile = backend.analyze(out, meta["label"], command, args.gap_ms)
+    profile["idle_gpu_busy_pct"] = idle
+    _write_profile(out, profile)
 
 
 def cmd_analyze(args) -> None:
@@ -118,6 +146,7 @@ def main(argv: list[str] | None = None) -> None:
     capture.add_argument("--label", help="name for this capture in reports (default: out dir name)")
     capture.add_argument("--gap-ms", type=int, default=DEFAULT_GAP_MS, help="idle gap around each stage")
     capture.add_argument("--time-limit", type=int, default=120, help="seconds before the recorder stops")
+    capture.add_argument("--allow-busy-gpu", action="store_true", help="record even if the GPU is busy beforehand")
     capture.add_argument("command", nargs=argparse.REMAINDER)
     capture.set_defaults(func=cmd_capture)
 

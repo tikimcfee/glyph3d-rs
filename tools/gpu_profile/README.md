@@ -28,8 +28,8 @@ python3 tools/gpu_profile analyze out/gpu-profile/base
 | `backends/nvidia.py` | Nsight Compute per-kernel replay (**untested on hardware**) |
 | `__main__.py` | `capture` / `analyze` / `report` |
 
-A backend is four names — `NAME`, `available()`, `capture(...)`,
-`analyze(...)` — plus a table mapping native counters to canonical keys.
+A backend is five names — `NAME`, `available()`, `gpu_busy_pct()`,
+`capture(...)`, `analyze(...)` — plus a table mapping native counters to canonical keys.
 Native values are always kept verbatim under `"native"`; a canonical metric
 a backend cannot measure is absent and reports print `n/a`.
 
@@ -65,7 +65,9 @@ resolved, so the gaps are true GPU idle. Profiling-only: output is untouched.
   `Device Utilization %=100` at rest, and our kernels were time-sliced
   against it in ~8 ms quanta (every timing that day was inflated ~2x). Quick
   check: `ioreg -r -d 1 -c IOAccelerator | grep -o '"Device Utilization %"=[0-9]*'`
-  should read near 0 when nothing is running.
+  should read near 0 when nothing is running. `capture` now runs this check
+  itself (per backend: ioreg on Metal, nvidia-smi on NVIDIA) and refuses a
+  GPU more than 15% busy at rest unless `--allow-busy-gpu`.
 - Deeper than counters: a programmatic `.gputrace` (MTLCaptureManager,
   `MTL_CAPTURE_ENABLED=1`) opened in Xcode gives per-line shader cost and
   register pressure; not automated here.

@@ -1,7 +1,8 @@
-"""Profiler backends. Each module exposes the same four names:
+"""Profiler backends. Each module exposes the same five names:
 
     NAME: str
     available() -> bool
+    gpu_busy_pct() -> float | None                          # idle preflight; None = unknown
     capture(command, out_dir, env, time_limit_s) -> None   # writes out_dir/raw/...
     analyze(out_dir, label, command, gap_ms) -> dict       # a schema.SCHEMA_TAG profile
 """

@@ -61,6 +61,13 @@ def available() -> bool:
     ).returncode == 0
 
 
+def gpu_busy_pct() -> float | None:
+    """Whole-GPU utilization right now (IOAccelerator 'Device Utilization %')."""
+    text = subprocess.run(["ioreg", "-r", "-d", "1", "-c", "IOAccelerator"], capture_output=True, text=True).stdout
+    match = re.search(r'"Device Utilization %"=(\d+)', text)
+    return float(match.group(1)) if match else None
+
+
 def capture(command: list[str], out_dir: Path, env: dict[str, str], time_limit_s: int) -> None:
     raw = out_dir / "raw"
     raw.mkdir(parents=True, exist_ok=True)
