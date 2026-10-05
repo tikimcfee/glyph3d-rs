@@ -1,7 +1,9 @@
 use cubecl::prelude::*;
 
 use super::monoid::{
-    advance_fixed, fixed_pair, flags_at, item_search_desc, key_to_float, ordered_key, wrap_segment_of,
+    advance_fixed, combine, fixed_pair, flags_at, identity, is_survivor, item_search_desc,
+    key_to_float, leaf_of, ordered_key, p_load, rows_for, s_load, s_store, wrap_row_of,
+    wrap_segment_of,
 };
 use super::scan::fold_of;
 use super::{
@@ -10,9 +12,9 @@ use super::{
     ITEM_DESC_DEPTH_PER_COL, ITEM_DESC_FLAT_COLOR, ITEM_DESC_GROUP, ITEM_DESC_HAS_PAGE,
     ITEM_DESC_IS_PER_RECORD, ITEM_DESC_LINE_HEIGHT, ITEM_DESC_ORIGIN_X, ITEM_DESC_ORIGIN_Y,
     ITEM_DESC_ORIGIN_Z, ITEM_DESC_PAGE_COLS, ITEM_DESC_PAGE_GAP_X, ITEM_DESC_PAGE_ROWS,
-    ITEM_DESC_PAGES_WIDE, ITEM_DESC_SCROLL_ROWS, ITEM_DESC_STRIDE, ITEM_DESC_WRAP_WIDTH,
-    ITEM_DESC_Z_STEP, ITEM_DESC_Z_STEP_LO,
-    LC_COL, LC_ROW, LC_STRIDE, LM_STRIDE, LM_X, LM_Y, LM_Z, RESOLVE_SLOTS,
+    ITEM_DESC_PAGES_WIDE, ITEM_DESC_SCROLL_ROWS, ITEM_DESC_STRIDE, ITEM_DESC_WRAP_MODE,
+    ITEM_DESC_WRAP_WIDTH, ITEM_DESC_Z_STEP, ITEM_DESC_Z_STEP_LO,
+    LC_COL, LC_ROW, LC_STRIDE, LM_STRIDE, LM_X, LM_Y, LM_Z, PARTIAL_COUNT_STRIDE, RESOLVE_SLOTS,
 };
 use super::tail::EXT_STRIDE;
 
@@ -38,59 +40,55 @@ use super::tail::EXT_STRIDE;
 // from 1 and every x >= 0 has an ordered key above 0.
 #[cube(launch_unchecked)]
 pub(super) fn resolve_x(
-    sm: &[f32],
-    fl: &[u32],
-    lm: &mut [f32],
-    lc: &[u32],
-    items: &[f32],
-    ie: &[u32],
-    ir: &[u32],
-    wc: &[u32],
-    otb: &[u32],
-    wm: &[f32],
-    row_max: &mut [Atomic<u32>],
-    x_max: &mut [Atomic<u32>],
-    extent_words: &[u32],
-    page_gap_x: &[f32],
+    advance_widths: &[f32],
+    glyph_flags: &[u32],
+    layout_metrics: &mut [f32],
+    line_columns: &[u32],
+    item_descriptors: &[u32],
+    item_record_ordinals: &[u32],
+    ordinal_to_byte_map: &[u32],
+    item_row_max: &mut [Atomic<u32>],
+    item_x_max: &mut [Atomic<u32>],
+    max_row_extents: &[u32],
     #[comptime] units: usize,
     #[comptime] span: usize,
 ) {
-    let t = ABSOLUTE_POS;
-    let n = fl.len() * 4; // packed: words -> bytes
-    let item_count = ir.len() / 2;
-    let u = UNIT_POS as usize;
-    let srow = Shared::<[Atomic<u32>]>::new_slice(RESOLVE_SLOTS);
-    let sx = Shared::<[Atomic<u32>]>::new_slice(RESOLVE_SLOTS);
-    let mut sbase = Shared::<u32>::new();
+    let thread_pos = ABSOLUTE_POS;
+    let total_bytes = glyph_flags.len() * 4; // packed: words -> bytes
+    let item_count = item_descriptors.len() / ITEM_DESC_STRIDE;
+    let unit_idx = UNIT_POS as usize;
+    let shared_row_max = Shared::<[Atomic<u32>]>::new_slice(RESOLVE_SLOTS);
+    let shared_x_max = Shared::<[Atomic<u32>]>::new_slice(RESOLVE_SLOTS);
+    let mut shared_item_base = Shared::<u32>::new();
     let cube_lo = CUBE_POS * units * span;
-    if u == 0 {
+    if unit_idx == 0 {
         // The item at this cube's first byte anchors the slot numbering.
-        let probe = if cube_lo < n { cube_lo } else { n - 1 };
-        let mut b = 0usize;
+        let probe = if cube_lo < total_bytes { cube_lo } else { total_bytes - 1 };
+        let mut probe_item = 0usize;
         if item_count > 0 {
-            b = item_search(ir, item_count, probe);
+            probe_item = item_search_desc(item_descriptors, item_count, probe);
         }
-        *sbase = b as u32;
+        *shared_item_base = probe_item as u32;
     }
-    let mut z = u;
+    let mut z = unit_idx;
     while z < RESOLVE_SLOTS {
-        srow[z].store(0u32);
-        sx[z].store(0u32);
+        shared_row_max[z].store(0u32);
+        shared_x_max[z].store(0u32);
         z += units;
     }
     sync_cube();
-    let it_base = *sbase as usize;
+    let cube_item_base = *shared_item_base as usize;
 
-    let lo = t * span;
-    if lo < n {
-        let hi = if lo + span < n { lo + span } else { n };
+    let range_start = thread_pos * span;
+    if range_start < total_bytes {
+        let range_end = if range_start + span < total_bytes { range_start + span } else { total_bytes };
         // The item walk, seeded at the range start.
-        let mut it = 0usize;
+        let mut item_index = 0usize;
         let mut start = 0usize;
-        let mut nxt = n;
+        let mut next_item_boundary = total_bytes;
         let mut wrap = 0i32;
         let mut fold = 0i32;
-        let mut lh = 0.0f32;
+        let mut line_height = 0.0f32;
         let mut origin_x = 0.0f32;
         let mut origin_y = 0.0f32;
         let mut origin_z = 0.0f32;
@@ -105,116 +103,121 @@ pub(super) fn resolve_x(
         let mut pages_wide = 1i32;
         let mut stride_reach = 0.0f32;
         let mut stride_reach_tail = 0.0f32;
-        let has = item_count > 0;
-        if has {
-            it = item_search(ir, item_count, lo);
-            start = ir[it * 2] as usize;
-            nxt = if it + 1 < item_count { ir[(it + 1) * 2] as usize } else { n };
-            wrap = ie[it * IE_STRIDE + IE_WRAP_WIDTH] as i32;
-            fold = fold_of(ie, it, wrap);
-            let io = it * IM_STRIDE;
-            lh = items[io + IM_LINE_HEIGHT];
-            origin_x = items[io + IM_ORIGIN_X];
-            origin_y = items[io + IM_ORIGIN_Y];
-            origin_z = items[io + IM_ORIGIN_Z];
-            z_step = items[io + IM_Z_STEP];
-            z_step_lo = items[io + IM_Z_STEP_LO];
-            band_stride_y = items[io + IM_BAND_STRIDE_Y];
-            depth_per_band = items[io + IM_DEPTH_PER_BAND];
-            depth_per_col = items[io + IM_DEPTH_PER_COL];
-            let ie_off = it * IE_STRIDE;
-            let has_page = ie[ie_off + IE_HAS_PAGE] != 0;
-            rows = if has_page { ie[ie_off + IE_PAGE_ROWS] as i32 } else { 0 };
-            cols = if has_page { ie[ie_off + IE_PAGE_COLS] as i32 } else { 0 };
-            scroll = if has_page { ie[ie_off + IE_SCROLL_ROWS] as i32 } else { 0 };
-            let pages_wide_raw = ie[ie_off + IE_PAGES_WIDE] as i32;
+        let has_items = item_count > 0;
+        if has_items {
+            item_index = item_search_desc(item_descriptors, item_count, range_start);
+            let desc_offset = item_index * ITEM_DESC_STRIDE;
+            start = item_descriptors[desc_offset + ITEM_DESC_BYTE_START] as usize;
+            next_item_boundary = if item_index + 1 < item_count {
+                item_descriptors[(item_index + 1) * ITEM_DESC_STRIDE + ITEM_DESC_BYTE_START] as usize
+            } else {
+                total_bytes
+            };
+            wrap = item_descriptors[desc_offset + ITEM_DESC_WRAP_WIDTH] as i32;
+            fold = fold_of(item_descriptors, item_index, wrap);
+            line_height = f32::from_bits(item_descriptors[desc_offset + ITEM_DESC_LINE_HEIGHT]);
+            origin_x = f32::from_bits(item_descriptors[desc_offset + ITEM_DESC_ORIGIN_X]);
+            origin_y = f32::from_bits(item_descriptors[desc_offset + ITEM_DESC_ORIGIN_Y]);
+            origin_z = f32::from_bits(item_descriptors[desc_offset + ITEM_DESC_ORIGIN_Z]);
+            z_step = f32::from_bits(item_descriptors[desc_offset + ITEM_DESC_Z_STEP]);
+            z_step_lo = f32::from_bits(item_descriptors[desc_offset + ITEM_DESC_Z_STEP_LO]);
+            band_stride_y = f32::from_bits(item_descriptors[desc_offset + ITEM_DESC_BAND_STRIDE_Y]);
+            depth_per_band = f32::from_bits(item_descriptors[desc_offset + ITEM_DESC_DEPTH_PER_BAND]);
+            depth_per_col = f32::from_bits(item_descriptors[desc_offset + ITEM_DESC_DEPTH_PER_COL]);
+            let has_page = item_descriptors[desc_offset + ITEM_DESC_HAS_PAGE] != 0;
+            rows = if has_page { item_descriptors[desc_offset + ITEM_DESC_PAGE_ROWS] as i32 } else { 0 };
+            cols = if has_page { item_descriptors[desc_offset + ITEM_DESC_PAGE_COLS] as i32 } else { 0 };
+            scroll = if has_page { item_descriptors[desc_offset + ITEM_DESC_SCROLL_ROWS] as i32 } else { 0 };
+            let pages_wide_raw = item_descriptors[desc_offset + ITEM_DESC_PAGES_WIDE] as i32;
             pages_wide = if pages_wide_raw > 1 { pages_wide_raw } else { 1 };
             if has_page && rows > 0 {
-                let exact = advance_fixed(key_to_float(extent_words[it * 2]))
-                    + advance_fixed(page_gap_x[it]);
+                let page_gap_x = f32::from_bits(item_descriptors[desc_offset + ITEM_DESC_PAGE_GAP_X]);
+                let exact = advance_fixed(key_to_float(max_row_extents[item_index * 2]))
+                    + advance_fixed(page_gap_x);
                 fixed_pair(exact, &mut stride_reach, &mut stride_reach_tail);
             }
         }
         let mut x = 0.0f32;
         let mut in_seg = false;
-        let mut cur_it = it;
+        let mut current_item_index = item_index;
         let mut loc_row_max = 0u32;
         let mut loc_x_max = 0u32;
-        let mut id = lo;
-        while id < hi {
-            while has && nxt <= id {
+        let mut id = range_start;
+        while id < range_end {
+            while has_items && next_item_boundary <= id {
                 if loc_row_max > 0 {
-                    let slot = cur_it - it_base;
+                    let slot = current_item_index - cube_item_base;
                     if slot < RESOLVE_SLOTS {
-                        srow[slot].fetch_max(loc_row_max);
-                        sx[slot].fetch_max(loc_x_max);
+                        shared_row_max[slot].fetch_max(loc_row_max);
+                        shared_x_max[slot].fetch_max(loc_x_max);
                     } else {
-                        row_max[cur_it].fetch_max(loc_row_max);
-                        x_max[cur_it].fetch_max(loc_x_max);
+                        item_row_max[current_item_index].fetch_max(loc_row_max);
+                        item_x_max[current_item_index].fetch_max(loc_x_max);
                     }
                     loc_row_max = 0u32;
                     loc_x_max = 0u32;
                 }
-                it += 1;
-                cur_it = it;
-                start = ir[it * 2] as usize;
-                nxt = if it + 1 < item_count { ir[(it + 1) * 2] as usize } else { n };
-                wrap = ie[it * IE_STRIDE + IE_WRAP_WIDTH] as i32;
-                fold = fold_of(ie, it, wrap);
-                let io = it * IM_STRIDE;
-                lh = items[io + IM_LINE_HEIGHT];
-                origin_x = items[io + IM_ORIGIN_X];
-                origin_y = items[io + IM_ORIGIN_Y];
-                origin_z = items[io + IM_ORIGIN_Z];
-                z_step = items[io + IM_Z_STEP];
-                z_step_lo = items[io + IM_Z_STEP_LO];
-                band_stride_y = items[io + IM_BAND_STRIDE_Y];
-                depth_per_band = items[io + IM_DEPTH_PER_BAND];
-                depth_per_col = items[io + IM_DEPTH_PER_COL];
-                let ie_off = it * IE_STRIDE;
-                let has_page = ie[ie_off + IE_HAS_PAGE] != 0;
-                rows = if has_page { ie[ie_off + IE_PAGE_ROWS] as i32 } else { 0 };
-                cols = if has_page { ie[ie_off + IE_PAGE_COLS] as i32 } else { 0 };
-                scroll = if has_page { ie[ie_off + IE_SCROLL_ROWS] as i32 } else { 0 };
-                let pages_wide_raw = ie[ie_off + IE_PAGES_WIDE] as i32;
+                item_index += 1;
+                current_item_index = item_index;
+                let desc_offset = item_index * ITEM_DESC_STRIDE;
+                start = item_descriptors[desc_offset + ITEM_DESC_BYTE_START] as usize;
+                next_item_boundary = if item_index + 1 < item_count {
+                    item_descriptors[(item_index + 1) * ITEM_DESC_STRIDE + ITEM_DESC_BYTE_START] as usize
+                } else {
+                    total_bytes
+                };
+                wrap = item_descriptors[desc_offset + ITEM_DESC_WRAP_WIDTH] as i32;
+                fold = fold_of(item_descriptors, item_index, wrap);
+                line_height = f32::from_bits(item_descriptors[desc_offset + ITEM_DESC_LINE_HEIGHT]);
+                origin_x = f32::from_bits(item_descriptors[desc_offset + ITEM_DESC_ORIGIN_X]);
+                origin_y = f32::from_bits(item_descriptors[desc_offset + ITEM_DESC_ORIGIN_Y]);
+                origin_z = f32::from_bits(item_descriptors[desc_offset + ITEM_DESC_ORIGIN_Z]);
+                z_step = f32::from_bits(item_descriptors[desc_offset + ITEM_DESC_Z_STEP]);
+                z_step_lo = f32::from_bits(item_descriptors[desc_offset + ITEM_DESC_Z_STEP_LO]);
+                band_stride_y = f32::from_bits(item_descriptors[desc_offset + ITEM_DESC_BAND_STRIDE_Y]);
+                depth_per_band = f32::from_bits(item_descriptors[desc_offset + ITEM_DESC_DEPTH_PER_BAND]);
+                depth_per_col = f32::from_bits(item_descriptors[desc_offset + ITEM_DESC_DEPTH_PER_COL]);
+                let has_page = item_descriptors[desc_offset + ITEM_DESC_HAS_PAGE] != 0;
+                rows = if has_page { item_descriptors[desc_offset + ITEM_DESC_PAGE_ROWS] as i32 } else { 0 };
+                cols = if has_page { item_descriptors[desc_offset + ITEM_DESC_PAGE_COLS] as i32 } else { 0 };
+                scroll = if has_page { item_descriptors[desc_offset + ITEM_DESC_SCROLL_ROWS] as i32 } else { 0 };
+                let pages_wide_raw = item_descriptors[desc_offset + ITEM_DESC_PAGES_WIDE] as i32;
                 pages_wide = if pages_wide_raw > 1 { pages_wide_raw } else { 1 };
                 if has_page && rows > 0 {
-                    let exact = advance_fixed(key_to_float(extent_words[it * 2]))
-                        + advance_fixed(page_gap_x[it]);
+                    let page_gap_x = f32::from_bits(item_descriptors[desc_offset + ITEM_DESC_PAGE_GAP_X]);
+                    let exact = advance_fixed(key_to_float(max_row_extents[item_index * 2]))
+                        + advance_fixed(page_gap_x);
                     fixed_pair(exact, &mut stride_reach, &mut stride_reach_tail);
                 } else {
                     stride_reach = 0.0f32;
                     stride_reach_tail = 0.0f32;
                 }
             }
-            let f = flags_at(fl, id);
-            if (f & F_LEADER) != 0 {
-                let col = lc[id * LC_STRIDE + LC_COL] as i32;
-                if fold > 0 {
-                    let head = col % fold == 0;
-                    if !in_seg || head {
-                        // Entry walk (backward, once per segment entry; free at
-                        // a head where col % fold == 0 empties the loop).
-                        x = 0.0f32;
-                        let ord = wc[id] as i32;
-                        let mut k = col % fold;
-                        while k >= 1 {
-                            let q = otb[start + (ord - k) as usize] as usize;
-                            x += sm[q];
-                            k -= 1;
-                        }
-                        in_seg = true;
+            let glyph_flags_val = flags_at(glyph_flags, id);
+            if (glyph_flags_val & F_LEADER) != 0 {
+                let col = line_columns[id * LC_STRIDE + LC_COL] as i32;
+                let seg_col = if fold > 0 { col % fold } else { col };
+                let is_segment_head = seg_col == 0;
+                if !in_seg || is_segment_head {
+                    // Entry walk (backward, once per segment entry; free at
+                    // a head where seg_col == 0 empties the loop).
+                    x = 0.0f32;
+                    let item_ordinal = item_record_ordinals[id] as i32;
+                    let mut back_col = seg_col;
+                    while back_col >= 1 {
+                        let prev_byte_idx = ordinal_to_byte_map[start + (item_ordinal - back_col) as usize] as usize;
+                        x += advance_widths[prev_byte_idx];
+                        back_col -= 1;
                     }
-                } else {
-                    x = wm[id];
+                    in_seg = true;
                 }
-                let row = lc[id * LC_STRIDE + LC_ROW] as i32;
-                let wrap_segment = wrap_segment_of(col, wrap, (f & F_NEWLINE) != 0);
-                let mo = id * LM_STRIDE;
+                let row = line_columns[id * LC_STRIDE + LC_ROW] as i32;
+                let wrap_segment = wrap_segment_of(col, wrap, (glyph_flags_val & F_NEWLINE) != 0);
+                let metrics_offset = id * LM_STRIDE;
                 let base = x + origin_x;
 
                 let mut final_x = base;
-                let mut final_y = fma(-(row as f32), lh, origin_y);
+                let mut final_y = fma(-(row as f32), line_height, origin_y);
                 let depth_steps = -(wrap_segment as f32);
                 let z_tail_folded = fma(depth_steps, z_step_lo, origin_z);
                 let mut final_z = fma(depth_steps, z_step, z_tail_folded);
@@ -234,16 +237,16 @@ pub(super) fn resolve_x(
                     let x_with_tail = fma(page_col, stride_reach_tail, base);
                     final_x = fma(page_col, stride_reach, x_with_tail);
                     let row_in_page = (screen_row - y_page * rows) as f32;
-                    let y_row_folded = fma(-row_in_page, lh, origin_y);
+                    let y_row_folded = fma(-row_in_page, line_height, origin_y);
                     final_y = fma(-(band as f32), band_stride_y, y_row_folded);
                     let z_stepped = fma(depth_steps, z_step, z_tail_folded);
                     let z_banded = fma(band as f32, depth_per_band, z_stepped);
                     final_z = fma(x_page as f32, depth_per_col, z_banded);
                 }
 
-                lm[mo + LM_X] = final_x;
-                lm[mo + LM_Y] = final_y;
-                lm[mo + LM_Z] = final_z;
+                layout_metrics[metrics_offset + LM_X] = final_x;
+                layout_metrics[metrics_offset + LM_Y] = final_y;
+                layout_metrics[metrics_offset + LM_Z] = final_z;
 
                 let r = (row + 1) as u32;
                 if r > loc_row_max {
@@ -253,359 +256,592 @@ pub(super) fn resolve_x(
                 if k > loc_x_max {
                     loc_x_max = k;
                 }
-                if (f & F_NEWLINE) == 0 && fold > 0 {
+                if (glyph_flags_val & F_NEWLINE) == 0 {
                     // This leader's advance feeds the next x — the same add
                     // the backward re-sum performed, one step forward.
-                    x += sm[id];
+                    x += advance_widths[id];
                 }
             }
             id += 1;
         }
         if loc_row_max > 0 {
-            let slot = cur_it - it_base;
+            let slot = current_item_index - cube_item_base;
             if slot < RESOLVE_SLOTS {
-                srow[slot].fetch_max(loc_row_max);
-                sx[slot].fetch_max(loc_x_max);
+                shared_row_max[slot].fetch_max(loc_row_max);
+                shared_x_max[slot].fetch_max(loc_x_max);
             } else {
-                row_max[cur_it].fetch_max(loc_row_max);
-                x_max[cur_it].fetch_max(loc_x_max);
+                item_row_max[current_item_index].fetch_max(loc_row_max);
+                item_x_max[current_item_index].fetch_max(loc_x_max);
             }
         }
     }
     sync_cube();
-    if u < RESOLVE_SLOTS {
-        let it = it_base + u;
-        if it < item_count {
-            row_max[it].fetch_max(srow[u].load());
-            x_max[it].fetch_max(sx[u].load());
+    if unit_idx < RESOLVE_SLOTS {
+        let item_idx = cube_item_base + unit_idx;
+        if item_idx < item_count {
+            item_row_max[item_idx].fetch_max(shared_row_max[unit_idx].load());
+            item_x_max[item_idx].fetch_max(shared_x_max[unit_idx].load());
         }
     }
 }
 
-/// Fused resolveX and extent reduction: computes wrapped X, page layout, and folds
-/// bounding boxes directly in registers, eliminating the separate extent_fold kernel.
+/// Fused scan chase, spatial positioning, extent reduction, and direct slot/tint emission:
+/// Unifies `apply` with `resolve_x_fused`, completely eliminating intermediate VRAM roundtrips
+/// for `line_columns`, `item_record_ordinals`, and `ordinal_to_byte_map` (~1.55 GB on flagship corpus).
+/// Preserves bit-exact layout and pagination parity with left-to-right advance accumulation.
 #[cube(launch_unchecked)]
-pub(super) fn resolve_x_fused(
-    sm: &[f32],
-    fl: &[u32],
-    lm: &mut [f32],
-    lc: &[u32],
-    items: &[f32],
-    ie: &[u32],
-    ir: &[u32],
-    wc: &[u32],
-    otb: &[u32],
-    wm: &[f32],
-    extent_words: &[u32],
-    page_gap_x: &[f32],
-    gi: &[u32],
-    hgt: &[f32],
-    ext: &mut [Atomic<u32>],
+pub(super) fn apply_and_emit(
+    glyph_flags: &[u32],
+    advance_widths: &[f32],
+    item_descriptors: &[u32],
+    tile_spine_counts: &[u32],
+    tile_spine_metrics: &[f32],
+    max_row_extents: &[u32],
+    glyph_indices: &[u32],
+    item_extents: &mut [Atomic<u32>],
+    per_record_semantic_colors: &[u32],
+    instance_slots: &mut [u32],
+    instance_tints: &mut [u32],
     #[comptime] units: usize,
-    #[comptime] span: usize,
+    #[comptime] rake: usize,
+    #[comptime] log: usize,
 ) {
-    let t = ABSOLUTE_POS;
-    let n = fl.len() * 4; // packed: words -> bytes
-    let item_count = ir.len() / 2;
-    let u = UNIT_POS as usize;
-    let sext = Shared::<[Atomic<u32>]>::new_slice(RESOLVE_SLOTS * EXT_STRIDE);
-    let sflags = Shared::<[Atomic<u32>]>::new_slice(RESOLVE_SLOTS);
-    let mut sbase = Shared::<u32>::new();
-    let cube_lo = CUBE_POS * units * span;
-    if u == 0 {
-        let probe = if cube_lo < n { cube_lo } else { n - 1 };
-        let mut b = 0usize;
+    let tile_idx = CUBE_POS;
+    let unit_idx = UNIT_POS as usize;
+    let total_bytes = glyph_flags.len() * 4; // packed: words -> bytes
+    let item_count = item_descriptors.len() / ITEM_DESC_STRIDE;
+    let range_start = tile_idx * (units * rake) + unit_idx * rake;
+    let range_end = if range_start + rake < total_bytes { range_start + rake } else { total_bytes };
+
+    let shared_item_extents = Shared::<[Atomic<u32>]>::new_slice(RESOLVE_SLOTS * EXT_STRIDE);
+    let shared_item_flags = Shared::<[Atomic<u32>]>::new_slice(RESOLVE_SLOTS);
+    let mut shared_item_base = Shared::<u32>::new();
+    let cube_lo = tile_idx * (units * rake);
+    if unit_idx == 0 {
+        let probe = if total_bytes > 0 {
+            if cube_lo < total_bytes { cube_lo } else { total_bytes - 1 }
+        } else {
+            0usize
+        };
+        let mut probe_item = 0usize;
         if item_count > 0 {
-            b = item_search(ir, item_count, probe);
+            probe_item = item_search_desc(item_descriptors, item_count, probe);
         }
-        *sbase = b as u32;
+        *shared_item_base = probe_item as u32;
     }
 
-    let zero_k = 0x8000_0000u32;
-    let inf_k = 0xFF80_0000u32;
-    let ninf_k = 0x007F_FFFFu32;
+    let ordered_key_zero = 0x8000_0000u32;
+    let ordered_key_infinity = 0xFF80_0000u32;
+    let ordered_key_neg_infinity = 0x007F_FFFFu32;
 
-    let mut z = u;
-    while z < RESOLVE_SLOTS {
-        sflags[z].store(0u32);
-        let e = z * EXT_STRIDE;
-        sext[e].store(zero_k);
-        sext[e + 1].store(zero_k);
-        sext[e + 2].store(zero_k);
-        sext[e + 3].store(zero_k);
-        sext[e + 4].store(inf_k);
-        sext[e + 5].store(inf_k);
-        sext[e + 6].store(ninf_k);
-        sext[e + 7].store(ninf_k);
-        sext[e + 8].store(inf_k);
-        sext[e + 9].store(ninf_k);
-        z += units;
+    let mut slot_index = unit_idx;
+    while slot_index < RESOLVE_SLOTS {
+        shared_item_flags[slot_index].store(0u32);
+        let extent_offset = slot_index * EXT_STRIDE;
+        shared_item_extents[extent_offset].store(ordered_key_zero);
+        shared_item_extents[extent_offset + 1].store(ordered_key_zero);
+        shared_item_extents[extent_offset + 2].store(ordered_key_zero);
+        shared_item_extents[extent_offset + 3].store(ordered_key_zero);
+        shared_item_extents[extent_offset + 4].store(ordered_key_infinity);
+        shared_item_extents[extent_offset + 5].store(ordered_key_infinity);
+        shared_item_extents[extent_offset + 6].store(ordered_key_neg_infinity);
+        shared_item_extents[extent_offset + 7].store(ordered_key_neg_infinity);
+        shared_item_extents[extent_offset + 8].store(ordered_key_infinity);
+        shared_item_extents[extent_offset + 9].store(ordered_key_neg_infinity);
+        slot_index += units;
+    }
+
+    let total_tile_bytes = units * rake;
+    let tile_byte_start = tile_idx * total_tile_bytes;
+    let tile_word_start = tile_byte_start >> 2;
+    let total_tile_words = total_tile_bytes.div_ceil(4);
+
+    let mut shared_tile_flags = Shared::<[u32]>::new_slice((units * rake) / 4);
+
+    let mut preload_word_idx = unit_idx;
+    while preload_word_idx < total_tile_words {
+        let global_word_idx = tile_word_start + preload_word_idx;
+        shared_tile_flags[preload_word_idx] = if global_word_idx < glyph_flags.len() {
+            glyph_flags[global_word_idx]
+        } else {
+            0u32
+        };
+        preload_word_idx += units;
     }
     sync_cube();
-    let it_base = *sbase as usize;
 
-    let lo = t * span;
-    if lo < n {
-        let hi = if lo + span < n { lo + span } else { n };
-        let mut it = 0usize;
-        let mut start = 0usize;
-        let mut nxt = n;
-        let mut wrap = 0i32;
-        let mut fold = 0i32;
-        let has = item_count > 0;
-        if has {
-            it = item_search(ir, item_count, lo);
-            start = ir[it * 2] as usize;
-            nxt = if it + 1 < item_count { ir[(it + 1) * 2] as usize } else { n };
-            wrap = ie[it * IE_STRIDE + IE_WRAP_WIDTH] as i32;
-            fold = fold_of(ie, it, wrap);
+    // Phase 1: Serial rake of this unit's bytes into one monoid accumulator
+    let mut accumulator = identity();
+    let mut item_index = 0usize;
+    let mut start = 0usize;
+    let mut next_item_boundary = total_bytes;
+    let mut active_wrap_width = 0i32;
+    let mut active_wrap_mode = 0i32;
+    let has_items = item_count > 0;
+    if has_items {
+        item_index = item_search_desc(item_descriptors, item_count, range_start);
+        start = item_descriptors[item_index * ITEM_DESC_STRIDE + ITEM_DESC_BYTE_START] as usize;
+        next_item_boundary = if item_index + 1 < item_count {
+            item_descriptors[(item_index + 1) * ITEM_DESC_STRIDE + ITEM_DESC_BYTE_START] as usize
+        } else {
+            total_bytes
+        };
+        active_wrap_width = item_descriptors[item_index * ITEM_DESC_STRIDE + ITEM_DESC_WRAP_WIDTH] as i32;
+        active_wrap_mode = item_descriptors[item_index * ITEM_DESC_STRIDE + ITEM_DESC_WRAP_MODE] as i32;
+    }
+    if range_start < total_bytes {
+        let mut id = range_start;
+        while id < range_end {
+            while has_items && next_item_boundary <= id {
+                item_index += 1;
+                start = item_descriptors[item_index * ITEM_DESC_STRIDE + ITEM_DESC_BYTE_START] as usize;
+                next_item_boundary = if item_index + 1 < item_count {
+                    item_descriptors[(item_index + 1) * ITEM_DESC_STRIDE + ITEM_DESC_BYTE_START] as usize
+                } else {
+                    total_bytes
+                };
+                active_wrap_width = item_descriptors[item_index * ITEM_DESC_STRIDE + ITEM_DESC_WRAP_WIDTH] as i32;
+                active_wrap_mode = item_descriptors[item_index * ITEM_DESC_STRIDE + ITEM_DESC_WRAP_MODE] as i32;
+            }
+            let reset = if has_items && id == start { 1i32 } else { 0i32 };
+            let leaf = leaf_of(glyph_flags, advance_widths, active_wrap_width, active_wrap_mode, reset, id);
+            combine(&mut accumulator, &leaf);
+            id += 1;
         }
-        let mut x = 0.0f32;
-        let mut in_seg = false;
-        let mut cur_it = it;
+    } else {
+        accumulator.wrap = active_wrap_width;
+        accumulator.mode = active_wrap_mode;
+    }
 
-        let mut pg_rmax = f32::new(0.0f32);
-        let mut pg_ymin = f32::new(0.0f32);
-        let mut pg_zmin = f32::new(0.0f32);
-        let mut pg_zmax = f32::new(0.0f32);
-        let mut ink_xmin = f32::new(3.4028235e38f32);
-        let mut ink_ymin = f32::new(3.4028235e38f32);
-        let mut ink_rmax = f32::new(-3.4028235e38f32);
-        let mut ink_ymax = f32::new(-3.4028235e38f32);
-        let mut ink_zmin = f32::new(3.4028235e38f32);
-        let mut ink_zmax = f32::new(-3.4028235e38f32);
-        let mut any_leader = false;
-        let mut any_survivor = false;
+    // Phase 2: Cube Blelloch scan across units in shared memory
+    let mut shared_counts = Shared::<[i32]>::new_slice(units * PARTIAL_COUNT_STRIDE);
+    let mut shared_metrics = Shared::<[f32]>::new_slice(units);
+    s_store(&mut shared_counts, &mut shared_metrics, unit_idx, &accumulator);
 
-        let mut id = lo;
-        while id < hi {
-            while has && nxt <= id {
+    #[unroll]
+    for d in 0..log {
+        sync_cube();
+        let s = 1usize << d;
+        if (unit_idx + 1) & (2 * s - 1) == 0 {
+            let mut lhs = s_load(&shared_counts, &shared_metrics, unit_idx - s);
+            let rhs = s_load(&shared_counts, &shared_metrics, unit_idx);
+            combine(&mut lhs, &rhs);
+            s_store(&mut shared_counts, &mut shared_metrics, unit_idx, &lhs);
+        }
+    }
+    sync_cube();
+    if unit_idx == units - 1 {
+        let e = identity();
+        s_store(&mut shared_counts, &mut shared_metrics, unit_idx, &e);
+    }
+    #[unroll]
+    for d in 0..log {
+        sync_cube();
+        let s = units >> (d + 1);
+        if (unit_idx + 1) & (2 * s - 1) == 0 {
+            let temp_carried = s_load(&shared_counts, &shared_metrics, unit_idx);
+            let mut lhs = s_load(&shared_counts, &shared_metrics, unit_idx);
+            let rhs = s_load(&shared_counts, &shared_metrics, unit_idx - s);
+            combine(&mut lhs, &rhs);
+            s_store(&mut shared_counts, &mut shared_metrics, unit_idx, &lhs);
+            s_store(&mut shared_counts, &mut shared_metrics, unit_idx - s, &temp_carried);
+        }
+    }
+    sync_cube();
+
+    // Phase 3: The chase — combines global tile prefix + exclusive micro prefix
+    let mut run = p_load(tile_spine_counts, tile_spine_metrics, tile_idx);
+    let micro = s_load(&shared_counts, &shared_metrics, unit_idx);
+    combine(&mut run, &micro);
+
+    // Repurpose shared_counts (2304 slots, dead after micro load) to cache the tile's 2048 advance floats
+    sync_cube();
+    let mut preload_byte_idx = unit_idx;
+    while preload_byte_idx < total_tile_bytes {
+        let global_byte_idx = tile_byte_start + preload_byte_idx;
+        let adv_val = if global_byte_idx < total_bytes {
+            advance_widths[global_byte_idx]
+        } else {
+            0.0f32
+        };
+        shared_counts[preload_byte_idx] = adv_val.to_bits() as i32;
+        preload_byte_idx += units;
+    }
+    sync_cube();
+
+    let cube_item_base = *shared_item_base as usize;
+
+    let mut survivor_ordinal = run.survivors as u32;
+
+    let mut page_right_max = f32::new(0.0f32);
+    let mut page_y_min = f32::new(0.0f32);
+    let mut page_z_min = f32::new(0.0f32);
+    let mut page_z_max = f32::new(0.0f32);
+    let mut ink_x_min = f32::new(3.4028235e38f32);
+    let mut ink_y_min = f32::new(3.4028235e38f32);
+    let mut ink_right_max = f32::new(-3.4028235e38f32);
+    let mut ink_y_max = f32::new(-3.4028235e38f32);
+    let mut ink_z_min = f32::new(3.4028235e38f32);
+    let mut ink_z_max = f32::new(-3.4028235e38f32);
+    let mut any_leader = false;
+    let mut any_survivor = false;
+
+    item_index = 0usize;
+    start = 0usize;
+    next_item_boundary = total_bytes;
+    active_wrap_width = 0i32;
+    active_wrap_mode = 0i32;
+    let mut fold_unit = 0i32;
+    if has_items {
+        item_index = item_search_desc(item_descriptors, item_count, range_start);
+        start = item_descriptors[item_index * ITEM_DESC_STRIDE + ITEM_DESC_BYTE_START] as usize;
+        next_item_boundary = if item_index + 1 < item_count {
+            item_descriptors[(item_index + 1) * ITEM_DESC_STRIDE + ITEM_DESC_BYTE_START] as usize
+        } else {
+            total_bytes
+        };
+        active_wrap_width = item_descriptors[item_index * ITEM_DESC_STRIDE + ITEM_DESC_WRAP_WIDTH] as i32;
+        active_wrap_mode = item_descriptors[item_index * ITEM_DESC_STRIDE + ITEM_DESC_WRAP_MODE] as i32;
+        fold_unit = fold_of(item_descriptors, item_index, active_wrap_width);
+    }
+    let mut current_advance_x = 0.0f32;
+    let mut in_segment = false;
+    let mut current_item_index = item_index;
+
+    if range_start < total_bytes {
+        let mut id = range_start;
+        while id < range_end {
+            while has_items && next_item_boundary <= id {
                 if any_leader {
-                    let slot = cur_it - it_base;
+                    let slot = current_item_index - cube_item_base;
                     if slot < RESOLVE_SLOTS {
-                        sflags[slot].fetch_or(if any_survivor { 3u32 } else { 1u32 });
-                        let e = slot * EXT_STRIDE;
-                        sext[e].fetch_max(ordered_key(pg_rmax));
-                        sext[e + 1].fetch_min(ordered_key(pg_ymin));
-                        sext[e + 2].fetch_min(ordered_key(pg_zmin));
-                        sext[e + 3].fetch_max(ordered_key(pg_zmax));
+                        shared_item_flags[slot].fetch_or(if any_survivor { 3u32 } else { 1u32 });
+                        let extent_offset = slot * EXT_STRIDE;
+                        shared_item_extents[extent_offset].fetch_max(ordered_key(page_right_max));
+                        shared_item_extents[extent_offset + 1].fetch_min(ordered_key(page_y_min));
+                        shared_item_extents[extent_offset + 2].fetch_min(ordered_key(page_z_min));
+                        shared_item_extents[extent_offset + 3].fetch_max(ordered_key(page_z_max));
                         if any_survivor {
-                            sext[e + 4].fetch_min(ordered_key(ink_xmin));
-                            sext[e + 5].fetch_min(ordered_key(ink_ymin));
-                            sext[e + 6].fetch_max(ordered_key(ink_rmax));
-                            sext[e + 7].fetch_max(ordered_key(ink_ymax));
-                            sext[e + 8].fetch_min(ordered_key(ink_zmin));
-                            sext[e + 9].fetch_max(ordered_key(ink_zmax));
+                            shared_item_extents[extent_offset + 4].fetch_min(ordered_key(ink_x_min));
+                            shared_item_extents[extent_offset + 5].fetch_min(ordered_key(ink_y_min));
+                            shared_item_extents[extent_offset + 6].fetch_max(ordered_key(ink_right_max));
+                            shared_item_extents[extent_offset + 7].fetch_max(ordered_key(ink_y_max));
+                            shared_item_extents[extent_offset + 8].fetch_min(ordered_key(ink_z_min));
+                            shared_item_extents[extent_offset + 9].fetch_max(ordered_key(ink_z_max));
                         }
                     } else {
-                        let e = cur_it * EXT_STRIDE;
-                        ext[e].fetch_max(ordered_key(pg_rmax));
-                        ext[e + 1].fetch_min(ordered_key(pg_ymin));
-                        ext[e + 2].fetch_min(ordered_key(pg_zmin));
-                        ext[e + 3].fetch_max(ordered_key(pg_zmax));
+                        let extent_offset = current_item_index * EXT_STRIDE;
+                        item_extents[extent_offset].fetch_max(ordered_key(page_right_max));
+                        item_extents[extent_offset + 1].fetch_min(ordered_key(page_y_min));
+                        item_extents[extent_offset + 2].fetch_min(ordered_key(page_z_min));
+                        item_extents[extent_offset + 3].fetch_max(ordered_key(page_z_max));
                         if any_survivor {
-                            ext[e + 4].fetch_min(ordered_key(ink_xmin));
-                            ext[e + 5].fetch_min(ordered_key(ink_ymin));
-                            ext[e + 6].fetch_max(ordered_key(ink_rmax));
-                            ext[e + 7].fetch_max(ordered_key(ink_ymax));
-                            ext[e + 8].fetch_min(ordered_key(ink_zmin));
-                            ext[e + 9].fetch_max(ordered_key(ink_zmax));
+                            item_extents[extent_offset + 4].fetch_min(ordered_key(ink_x_min));
+                            item_extents[extent_offset + 5].fetch_min(ordered_key(ink_y_min));
+                            item_extents[extent_offset + 6].fetch_max(ordered_key(ink_right_max));
+                            item_extents[extent_offset + 7].fetch_max(ordered_key(ink_y_max));
+                            item_extents[extent_offset + 8].fetch_min(ordered_key(ink_z_min));
+                            item_extents[extent_offset + 9].fetch_max(ordered_key(ink_z_max));
                         }
                     }
-                    pg_rmax = f32::new(0.0f32);
-                    pg_ymin = f32::new(0.0f32);
-                    pg_zmin = f32::new(0.0f32);
-                    pg_zmax = f32::new(0.0f32);
-                    ink_xmin = f32::new(3.4028235e38f32);
-                    ink_ymin = f32::new(3.4028235e38f32);
-                    ink_rmax = f32::new(-3.4028235e38f32);
-                    ink_ymax = f32::new(-3.4028235e38f32);
-                    ink_zmin = f32::new(3.4028235e38f32);
-                    ink_zmax = f32::new(-3.4028235e38f32);
+                    page_right_max = f32::new(0.0f32);
+                    page_y_min = f32::new(0.0f32);
+                    page_z_min = f32::new(0.0f32);
+                    page_z_max = f32::new(0.0f32);
+                    ink_x_min = f32::new(3.4028235e38f32);
+                    ink_y_min = f32::new(3.4028235e38f32);
+                    ink_right_max = f32::new(-3.4028235e38f32);
+                    ink_y_max = f32::new(-3.4028235e38f32);
+                    ink_z_min = f32::new(3.4028235e38f32);
+                    ink_z_max = f32::new(-3.4028235e38f32);
                     any_leader = false;
                     any_survivor = false;
                 }
-                it += 1;
-                cur_it = it;
-                start = ir[it * 2] as usize;
-                nxt = if it + 1 < item_count { ir[(it + 1) * 2] as usize } else { n };
-                wrap = ie[it * IE_STRIDE + IE_WRAP_WIDTH] as i32;
-                fold = fold_of(ie, it, wrap);
-            }
-            let f = flags_at(fl, id);
-            if (f & F_LEADER) != 0 {
-                let col = lc[id * LC_STRIDE + LC_COL] as i32;
-                if fold > 0 {
-                    let head = col % fold == 0;
-                    if !in_seg || head {
-                        x = 0.0f32;
-                        let ord = wc[id] as i32;
-                        let mut k = col % fold;
-                        while k >= 1 {
-                            let q = otb[start + (ord - k) as usize] as usize;
-                            x += sm[q];
-                            k -= 1;
-                        }
-                        in_seg = true;
-                    }
+                item_index += 1;
+                current_item_index = item_index;
+                start = item_descriptors[item_index * ITEM_DESC_STRIDE + ITEM_DESC_BYTE_START] as usize;
+                next_item_boundary = if item_index + 1 < item_count {
+                    item_descriptors[(item_index + 1) * ITEM_DESC_STRIDE + ITEM_DESC_BYTE_START] as usize
                 } else {
-                    x = wm[id];
+                    total_bytes
+                };
+                active_wrap_width = item_descriptors[item_index * ITEM_DESC_STRIDE + ITEM_DESC_WRAP_WIDTH] as i32;
+                active_wrap_mode = item_descriptors[item_index * ITEM_DESC_STRIDE + ITEM_DESC_WRAP_MODE] as i32;
+                fold_unit = fold_of(item_descriptors, item_index, active_wrap_width);
+                in_segment = false;
+            }
+            let reset = has_items && id == start;
+            if reset {
+                run.reset = 0;
+                run.nl = 0;
+                run.glyphs = 0;
+                run.rows = 0;
+                run.head_len = 0;
+                run.tail_len = 0;
+                run.tail_adv = 0.0;
+                run.wrap = active_wrap_width;
+                run.mode = active_wrap_mode;
+                in_segment = false;
+            }
+            let local_id = id - tile_byte_start;
+            let glyph_flags_val = (shared_tile_flags[local_id >> 2] >> (((local_id & 3) * 8) as u32)) & 0xFF;
+            if (glyph_flags_val & F_LEADER) != 0 {
+                let col = run.tail_len;
+                let mut closed = 0i32;
+                if run.nl > 0 {
+                    closed = rows_for(run.head_len, active_wrap_width, active_wrap_mode) + run.rows;
                 }
-                let row = lc[id * LC_STRIDE + LC_ROW] as i32;
-                let io = it * IM_STRIDE;
-                let wrap_segment = wrap_segment_of(col, wrap, (f & F_NEWLINE) != 0);
-                let lh = items[io + IM_LINE_HEIGHT];
-                let mo = id * LM_STRIDE;
-                let base = x + items[io + IM_ORIGIN_X];
+                let wr = wrap_row_of(col, active_wrap_width, (glyph_flags_val & F_NEWLINE) != 0, active_wrap_mode);
+                let row = closed + wr;
 
-                let mut final_x = base;
-                let mut final_y = fma(-(row as f32), lh, items[io + IM_ORIGIN_Y]);
+                let segment_column = if fold_unit > 0 { col % fold_unit } else { col };
+                let is_segment_head = segment_column == 0;
+                if !in_segment || is_segment_head {
+                    current_advance_x = 0.0f32;
+                    if fold_unit > 0 && segment_column > 0 {
+                        let mut backward_column = segment_column;
+                        let mut start_byte_index = id as i32 - 1;
+                        let tile_byte_start_i32 = tile_byte_start as i32;
+
+                        // Fast branch-free walk in on-chip SRAM while inside the current tile
+                        while backward_column >= 1 && start_byte_index >= tile_byte_start_i32 {
+                            let local_idx = start_byte_index as usize - tile_byte_start;
+                            let flag = (shared_tile_flags[local_idx >> 2] >> (((local_idx & 3) * 8) as u32)) & 0xFF;
+                            if (flag & F_LEADER) != 0 {
+                                backward_column -= 1;
+                            }
+                            if backward_column >= 1 {
+                                start_byte_index -= 1;
+                            }
+                        }
+
+                        // Rare fallback: only if the segment crossed before the tile boundary
+                        while backward_column >= 1 && start_byte_index >= 0 {
+                            if (flags_at(glyph_flags, start_byte_index as usize) & F_LEADER) != 0 {
+                                backward_column -= 1;
+                            }
+                            if backward_column >= 1 {
+                                start_byte_index -= 1;
+                            }
+                        }
+
+                        // Fast forward accumulation
+                        if start_byte_index >= tile_byte_start_i32 {
+                            let local_start = start_byte_index as usize - tile_byte_start;
+                            let local_end = id - tile_byte_start;
+                            let mut local_idx = local_start;
+                            while local_idx < local_end {
+                                let flag = (shared_tile_flags[local_idx >> 2] >> (((local_idx & 3) * 8) as u32)) & 0xFF;
+                                if (flag & F_LEADER) != 0 {
+                                    current_advance_x += f32::from_bits(shared_counts[local_idx] as u32);
+                                }
+                                local_idx += 1;
+                            }
+                        } else {
+                            let mut forward_index = start_byte_index as usize;
+                            while forward_index < id {
+                                if (flags_at(glyph_flags, forward_index) & F_LEADER) != 0 {
+                                    current_advance_x += advance_widths[forward_index];
+                                }
+                                forward_index += 1;
+                            }
+                        }
+                    } else if fold_unit == 0 {
+                        current_advance_x = run.tail_adv;
+                    }
+                    in_segment = true;
+                }
+
+                let descriptor_offset = item_index * ITEM_DESC_STRIDE;
+                let wrap_segment = wrap_segment_of(col, active_wrap_width, (glyph_flags_val & F_NEWLINE) != 0);
+                let line_height = f32::from_bits(item_descriptors[descriptor_offset + ITEM_DESC_LINE_HEIGHT]);
+                let origin_x = f32::from_bits(item_descriptors[descriptor_offset + ITEM_DESC_ORIGIN_X]);
+                let origin_y = f32::from_bits(item_descriptors[descriptor_offset + ITEM_DESC_ORIGIN_Y]);
+                let origin_z = f32::from_bits(item_descriptors[descriptor_offset + ITEM_DESC_ORIGIN_Z]);
+                let z_step = f32::from_bits(item_descriptors[descriptor_offset + ITEM_DESC_Z_STEP]);
+                let z_step_lo = f32::from_bits(item_descriptors[descriptor_offset + ITEM_DESC_Z_STEP_LO]);
+                let band_stride_y = f32::from_bits(item_descriptors[descriptor_offset + ITEM_DESC_BAND_STRIDE_Y]);
+                let depth_per_band = f32::from_bits(item_descriptors[descriptor_offset + ITEM_DESC_DEPTH_PER_BAND]);
+                let depth_per_col = f32::from_bits(item_descriptors[descriptor_offset + ITEM_DESC_DEPTH_PER_COL]);
+                let base_x = current_advance_x + origin_x;
+
+                let mut final_x = base_x;
+                let mut final_y = fma(-(row as f32), line_height, origin_y);
                 let depth_steps = -(wrap_segment as f32);
                 let z_tail_folded = fma(
                     depth_steps,
-                    items[io + IM_Z_STEP_LO],
-                    items[io + IM_ORIGIN_Z],
+                    z_step_lo,
+                    origin_z,
                 );
-                let mut final_z = fma(depth_steps, items[io + IM_Z_STEP], z_tail_folded);
+                let mut final_z = fma(depth_steps, z_step, z_tail_folded);
 
-                let ie_off = it * IE_STRIDE;
-                let has_page = ie[ie_off + IE_HAS_PAGE] != 0;
-                let rows = if has_page { ie[ie_off + IE_PAGE_ROWS] as i32 } else { 0 };
-                let cols = if has_page { ie[ie_off + IE_PAGE_COLS] as i32 } else { 0 };
-                let scroll = if has_page { ie[ie_off + IE_SCROLL_ROWS] as i32 } else { 0 };
-                if rows != 0 || cols != 0 || scroll != 0 {
-                    let screen_row = row - scroll;
+                let has_page = item_descriptors[descriptor_offset + ITEM_DESC_HAS_PAGE] != 0;
+                let page_rows = if has_page { item_descriptors[descriptor_offset + ITEM_DESC_PAGE_ROWS] as i32 } else { 0 };
+                let page_cols = if has_page { item_descriptors[descriptor_offset + ITEM_DESC_PAGE_COLS] as i32 } else { 0 };
+                let scroll_rows = if has_page { item_descriptors[descriptor_offset + ITEM_DESC_SCROLL_ROWS] as i32 } else { 0 };
+                if page_rows != 0 || page_cols != 0 || scroll_rows != 0 {
+                    let screen_row = row - scroll_rows;
                     let mut y_page = 0;
-                    if rows > 0 && screen_row >= rows {
-                        y_page = screen_row / rows;
+                    if page_rows > 0 && screen_row >= page_rows {
+                        y_page = screen_row / page_rows;
                     }
                     let mut x_page = 0;
-                    if cols > 0 {
-                        x_page = col / cols;
+                    if page_cols > 0 {
+                        x_page = col / page_cols;
                     }
-                    let pages_wide_raw = ie[ie_off + IE_PAGES_WIDE] as i32;
+                    let pages_wide_raw = item_descriptors[descriptor_offset + ITEM_DESC_PAGES_WIDE] as i32;
                     let pages_wide = if pages_wide_raw > 1 { pages_wide_raw } else { 1 };
                     let band = y_page / pages_wide;
                     let page_col = (y_page % pages_wide) as f32;
                     let mut stride_reach = 0.0f32;
                     let mut stride_reach_tail = 0.0f32;
-                    if has_page && rows > 0 {
-                        let exact = advance_fixed(key_to_float(extent_words[it * 2]))
-                            + advance_fixed(page_gap_x[it]);
+                    if has_page && page_rows > 0 {
+                        let page_gap_x = f32::from_bits(item_descriptors[descriptor_offset + ITEM_DESC_PAGE_GAP_X]);
+                        let exact = advance_fixed(key_to_float(max_row_extents[item_index * 2]))
+                            + advance_fixed(page_gap_x);
                         fixed_pair(exact, &mut stride_reach, &mut stride_reach_tail);
                     }
-                    let x_with_tail = fma(page_col, stride_reach_tail, base);
+                    let x_with_tail = fma(page_col, stride_reach_tail, base_x);
                     final_x = fma(page_col, stride_reach, x_with_tail);
-                    let row_in_page = (screen_row - y_page * rows) as f32;
-                    let y_row_folded = fma(-row_in_page, lh, items[io + IM_ORIGIN_Y]);
-                    final_y = fma(-(band as f32), items[io + IM_BAND_STRIDE_Y], y_row_folded);
-                    let z_stepped = fma(depth_steps, items[io + IM_Z_STEP], z_tail_folded);
-                    let z_banded = fma(band as f32, items[io + IM_DEPTH_PER_BAND], z_stepped);
-                    final_z = fma(x_page as f32, items[io + IM_DEPTH_PER_COL], z_banded);
+                    let row_in_page = (screen_row - y_page * page_rows) as f32;
+                    let y_row_folded = fma(-row_in_page, line_height, origin_y);
+                    final_y = fma(-(band as f32), band_stride_y, y_row_folded);
+                    let z_stepped = fma(depth_steps, z_step, z_tail_folded);
+                    let z_banded = fma(band as f32, depth_per_band, z_stepped);
+                    final_z = fma(x_page as f32, depth_per_col, z_banded);
                 }
-
-                lm[mo + LM_X] = final_x;
-                lm[mo + LM_Y] = final_y;
-                lm[mo + LM_Z] = final_z;
 
                 any_leader = true;
-                let right = final_x + sm[id];
-                if right > pg_rmax {
-                    pg_rmax = right;
+                let glyph_advance = f32::from_bits(shared_counts[local_id] as u32);
+                let right = final_x + glyph_advance;
+                if right > page_right_max {
+                    page_right_max = right;
                 }
-                if final_y < pg_ymin {
-                    pg_ymin = final_y;
+                if final_y < page_y_min {
+                    page_y_min = final_y;
                 }
-                if final_z < pg_zmin {
-                    pg_zmin = final_z;
+                if final_z < page_z_min {
+                    page_z_min = final_z;
                 }
-                if final_z > pg_zmax {
-                    pg_zmax = final_z;
+                if final_z > page_z_max {
+                    page_z_max = final_z;
                 }
-                if gi[id] != 0u32 {
+                if is_survivor(glyph_flags_val) {
                     any_survivor = true;
-                    let half = hgt[id] * 0.5f32;
+                    let half = 0.5f32;
                     let y_lo = final_y - half;
                     let y_hi = final_y + half;
-                    if final_x < ink_xmin {
-                        ink_xmin = final_x;
+                    if final_x < ink_x_min {
+                        ink_x_min = final_x;
                     }
-                    if y_lo < ink_ymin {
-                        ink_ymin = y_lo;
+                    if y_lo < ink_y_min {
+                        ink_y_min = y_lo;
                     }
-                    if right > ink_rmax {
-                        ink_rmax = right;
+                    if right > ink_right_max {
+                        ink_right_max = right;
                     }
-                    if y_hi > ink_ymax {
-                        ink_ymax = y_hi;
+                    if y_hi > ink_y_max {
+                        ink_y_max = y_hi;
                     }
-                    if final_z < ink_zmin {
-                        ink_zmin = final_z;
+                    if final_z < ink_z_min {
+                        ink_z_min = final_z;
                     }
-                    if final_z > ink_zmax {
-                        ink_zmax = final_z;
+                    if final_z > ink_z_max {
+                        ink_z_max = final_z;
                     }
+
+                    // Direct instance emission: emit 8-word slot and 2-word tint
+                    let item_color_base = item_descriptors[descriptor_offset + ITEM_DESC_COLOR_BASE];
+                    let item_is_per_record = item_descriptors[descriptor_offset + ITEM_DESC_IS_PER_RECORD];
+                    let item_flat_color = item_descriptors[descriptor_offset + ITEM_DESC_FLAT_COLOR];
+                    let item_group_id = item_descriptors[descriptor_offset + ITEM_DESC_GROUP];
+                    let color = if item_is_per_record != 0u32 {
+                        let record_ordinal = run.glyphs as u32;
+                        per_record_semantic_colors[(item_color_base + record_ordinal) as usize]
+                    } else {
+                        item_flat_color
+                    };
+                    let slot_word_offset = survivor_ordinal as usize * 8;
+                    if slot_word_offset + 8 <= instance_slots.len() {
+                        instance_slots[slot_word_offset] = final_x.to_bits();
+                        instance_slots[slot_word_offset + 1] = final_y.to_bits();
+                        instance_slots[slot_word_offset + 2] = final_z.to_bits();
+                        instance_slots[slot_word_offset + 3] = glyph_indices[id];
+                        instance_slots[slot_word_offset + 4] = color;
+                        instance_slots[slot_word_offset + 5] = item_group_id;
+                        instance_slots[slot_word_offset + 6] = glyph_advance.to_bits();
+                        instance_slots[slot_word_offset + 7] = 0x3f800000; // 1.0f32.to_bits()
+                    }
+                    let tint_word_offset = survivor_ordinal as usize * 2;
+                    if tint_word_offset + 2 <= instance_tints.len() {
+                        instance_tints[tint_word_offset] = glyph_indices[id];
+                        instance_tints[tint_word_offset + 1] = color;
+                    }
+                    survivor_ordinal += 1u32;
                 }
 
-                if (f & F_NEWLINE) == 0 && fold > 0 {
-                    x += sm[id];
+                if (glyph_flags_val & F_NEWLINE) == 0 {
+                    current_advance_x += glyph_advance;
                 }
             }
+            let leaf = leaf_of(glyph_flags, advance_widths, active_wrap_width, active_wrap_mode, if reset { 1i32 } else { 0i32 }, id);
+            combine(&mut run, &leaf);
             id += 1;
         }
+
         if any_leader {
-            let slot = cur_it - it_base;
+            let slot = current_item_index - cube_item_base;
             if slot < RESOLVE_SLOTS {
-                sflags[slot].fetch_or(if any_survivor { 3u32 } else { 1u32 });
-                let e = slot * EXT_STRIDE;
-                sext[e].fetch_max(ordered_key(pg_rmax));
-                sext[e + 1].fetch_min(ordered_key(pg_ymin));
-                sext[e + 2].fetch_min(ordered_key(pg_zmin));
-                sext[e + 3].fetch_max(ordered_key(pg_zmax));
+                shared_item_flags[slot].fetch_or(if any_survivor { 3u32 } else { 1u32 });
+                let extent_offset = slot * EXT_STRIDE;
+                shared_item_extents[extent_offset].fetch_max(ordered_key(page_right_max));
+                shared_item_extents[extent_offset + 1].fetch_min(ordered_key(page_y_min));
+                shared_item_extents[extent_offset + 2].fetch_min(ordered_key(page_z_min));
+                shared_item_extents[extent_offset + 3].fetch_max(ordered_key(page_z_max));
                 if any_survivor {
-                    sext[e + 4].fetch_min(ordered_key(ink_xmin));
-                    sext[e + 5].fetch_min(ordered_key(ink_ymin));
-                    sext[e + 6].fetch_max(ordered_key(ink_rmax));
-                    sext[e + 7].fetch_max(ordered_key(ink_ymax));
-                    sext[e + 8].fetch_min(ordered_key(ink_zmin));
-                    sext[e + 9].fetch_max(ordered_key(ink_zmax));
+                    shared_item_extents[extent_offset + 4].fetch_min(ordered_key(ink_x_min));
+                    shared_item_extents[extent_offset + 5].fetch_min(ordered_key(ink_y_min));
+                    shared_item_extents[extent_offset + 6].fetch_max(ordered_key(ink_right_max));
+                    shared_item_extents[extent_offset + 7].fetch_max(ordered_key(ink_y_max));
+                    shared_item_extents[extent_offset + 8].fetch_min(ordered_key(ink_z_min));
+                    shared_item_extents[extent_offset + 9].fetch_max(ordered_key(ink_z_max));
                 }
             } else {
-                let e = cur_it * EXT_STRIDE;
-                ext[e].fetch_max(ordered_key(pg_rmax));
-                ext[e + 1].fetch_min(ordered_key(pg_ymin));
-                ext[e + 2].fetch_min(ordered_key(pg_zmin));
-                ext[e + 3].fetch_max(ordered_key(pg_zmax));
+                let extent_offset = current_item_index * EXT_STRIDE;
+                item_extents[extent_offset].fetch_max(ordered_key(page_right_max));
+                item_extents[extent_offset + 1].fetch_min(ordered_key(page_y_min));
+                item_extents[extent_offset + 2].fetch_min(ordered_key(page_z_min));
+                item_extents[extent_offset + 3].fetch_max(ordered_key(page_z_max));
                 if any_survivor {
-                    ext[e + 4].fetch_min(ordered_key(ink_xmin));
-                    ext[e + 5].fetch_min(ordered_key(ink_ymin));
-                    ext[e + 6].fetch_max(ordered_key(ink_rmax));
-                    ext[e + 7].fetch_max(ordered_key(ink_ymax));
-                    ext[e + 8].fetch_min(ordered_key(ink_zmin));
-                    ext[e + 9].fetch_max(ordered_key(ink_zmax));
+                    item_extents[extent_offset + 4].fetch_min(ordered_key(ink_x_min));
+                    item_extents[extent_offset + 5].fetch_min(ordered_key(ink_y_min));
+                    item_extents[extent_offset + 6].fetch_max(ordered_key(ink_right_max));
+                    item_extents[extent_offset + 7].fetch_max(ordered_key(ink_y_max));
+                    item_extents[extent_offset + 8].fetch_min(ordered_key(ink_z_min));
+                    item_extents[extent_offset + 9].fetch_max(ordered_key(ink_z_max));
                 }
             }
         }
     }
     sync_cube();
-    if u < RESOLVE_SLOTS {
-        let it = it_base + u;
-        if it < item_count {
-            let flags = sflags[u].load();
+    if unit_idx < RESOLVE_SLOTS {
+        let item_index = cube_item_base + unit_idx;
+        if item_index < item_count {
+            let flags = shared_item_flags[unit_idx].load();
             if (flags & 1u32) != 0 {
-                let se = u * EXT_STRIDE;
-                let e = it * EXT_STRIDE;
-                ext[e].fetch_max(sext[se].load());
-                ext[e + 1].fetch_min(sext[se + 1].load());
-                ext[e + 2].fetch_min(sext[se + 2].load());
-                ext[e + 3].fetch_max(sext[se + 3].load());
+                let shared_extent_offset = unit_idx * EXT_STRIDE;
+                let extent_offset = item_index * EXT_STRIDE;
+                item_extents[extent_offset].fetch_max(shared_item_extents[shared_extent_offset].load());
+                item_extents[extent_offset + 1].fetch_min(shared_item_extents[shared_extent_offset + 1].load());
+                item_extents[extent_offset + 2].fetch_min(shared_item_extents[shared_extent_offset + 2].load());
+                item_extents[extent_offset + 3].fetch_max(shared_item_extents[shared_extent_offset + 3].load());
                 if (flags & 2u32) != 0 {
-                    ext[e + 4].fetch_min(sext[se + 4].load());
-                    ext[e + 5].fetch_min(sext[se + 5].load());
-                    ext[e + 6].fetch_max(sext[se + 6].load());
-                    ext[e + 7].fetch_max(sext[se + 7].load());
-                    ext[e + 8].fetch_min(sext[se + 8].load());
-                    ext[e + 9].fetch_max(sext[se + 9].load());
+                    item_extents[extent_offset + 4].fetch_min(shared_item_extents[shared_extent_offset + 4].load());
+                    item_extents[extent_offset + 5].fetch_min(shared_item_extents[shared_extent_offset + 5].load());
+                    item_extents[extent_offset + 6].fetch_max(shared_item_extents[shared_extent_offset + 6].load());
+                    item_extents[extent_offset + 7].fetch_max(shared_item_extents[shared_extent_offset + 7].load());
+                    item_extents[extent_offset + 8].fetch_min(shared_item_extents[shared_extent_offset + 8].load());
+                    item_extents[extent_offset + 9].fetch_max(shared_item_extents[shared_extent_offset + 9].load());
                 }
             }
         }
@@ -644,11 +880,11 @@ pub(super) fn resolve_x_fused(
 // fired). Four input slices, one mutable output.
 #[cube(launch_unchecked)]
 pub(super) fn extent_pair(
-    sm: &[f32],
-    fl: &[u32],
-    lc: &[u32],
+    advance_widths: &[f32],
+    glyph_flags: &[u32],
+    line_columns: &[u32],
     walk_plan: &[u32],
-    extent_words: &mut [Atomic<u32>],
+    max_row_extents: &mut [Atomic<u32>],
     min_sw: u32,
     uniform_sw: u32,
     #[comptime] units: usize,
@@ -656,80 +892,80 @@ pub(super) fn extent_pair(
 ) {
     let tile = CUBE_POS;
     let u = UNIT_POS as usize;
-    let n = lc.len() / LC_STRIDE;
-    let tile_lo = tile * (units * rake);
+    let n = line_columns.len() / LC_STRIDE;
+    let tile_start = tile * (units * rake);
     let item_count = walk_plan.len() / 3;
 
-    let sext = Shared::<[Atomic<u32>]>::new_slice(RESOLVE_SLOTS);
-    let mut sbase = Shared::<u32>::new();
+    let shared_max_extents = Shared::<[Atomic<u32>]>::new_slice(RESOLVE_SLOTS);
+    let mut shared_item_base = Shared::<u32>::new();
 
     if u == 0 {
-        let mut b = 0usize;
+        let mut probe_item = 0usize;
         if item_count > 0 && n > 0 {
-            let probe = if tile_lo < n { tile_lo } else { n - 1 };
-            let mut lo = 0usize;
-            let mut hi = item_count;
-            while lo + 1 < hi {
-                let mid = (lo + hi) / 2;
+            let probe = if tile_start < n { tile_start } else { n - 1 };
+            let mut search_lo = 0usize;
+            let mut search_hi = item_count;
+            while search_lo + 1 < search_hi {
+                let mid = (search_lo + search_hi) / 2;
                 if (walk_plan[mid * 3] as usize) <= probe {
-                    lo = mid;
+                    search_lo = mid;
                 } else {
-                    hi = mid;
+                    search_hi = mid;
                 }
             }
-            b = lo;
+            probe_item = search_lo;
         }
-        *sbase = b as u32;
+        *shared_item_base = probe_item as u32;
     }
 
     let zero_k = 0x8000_0000u32;
     if u < RESOLVE_SLOTS {
-        sext[u].store(zero_k);
+        shared_max_extents[u].store(zero_k);
     }
     sync_cube();
-    let it_base = *sbase as usize;
-    let nxt_start = if it_base + 1 < item_count {
-        walk_plan[(it_base + 1) * 3] as usize
+    let tile_item_base = *shared_item_base as usize;
+    let nxt_start = if tile_item_base + 1 < item_count {
+        walk_plan[(tile_item_base + 1) * 3] as usize
     } else {
         n
     };
 
     let mut k = 0usize;
     while k < rake {
-        let b = tile_lo + k * units + u;
-        if b < n && (flags_at(fl, b) & F_LEADER) != 0 {
-            let col = lc[b * LC_STRIDE + LC_COL] as usize;
+        let byte_index = tile_start + k * units + u;
+        if byte_index < n && (flags_at(glyph_flags, byte_index) & F_LEADER) != 0 {
+            let col = line_columns[byte_index * LC_STRIDE + LC_COL] as usize;
             let candidate = col == 0
                 || (col >= (min_sw as usize)
                     && (uniform_sw == 0 || col.is_multiple_of(uniform_sw as usize)));
             if candidate {
-                let mut lo = it_base;
-                if b >= nxt_start {
-                    let mut l = it_base;
-                    let mut hi = item_count;
-                    while l + 1 < hi {
-                        let mid = (l + hi) / 2;
-                        if (walk_plan[mid * 3] as usize) <= b {
-                            l = mid;
+                let mut matched_item = tile_item_base;
+                if byte_index >= nxt_start {
+                    let mut search_lo = tile_item_base;
+                    let mut search_hi = item_count;
+                    while search_lo + 1 < search_hi {
+                        let mid = (search_lo + search_hi) / 2;
+                        if (walk_plan[mid * 3] as usize) <= byte_index {
+                            search_lo = mid;
                         } else {
-                            hi = mid;
+                            search_hi = mid;
                         }
                     }
-                    lo = l;
+                    matched_item = search_lo;
                 }
-                let sw = walk_plan[lo * 3 + 2] as usize;
+                let sw = walk_plan[matched_item * 3 + 2] as usize;
                 if col == 0 || (sw != 0 && col.is_multiple_of(sw)) {
-                    let stop = walk_plan[lo * 3 + 1] as usize;
+                    let stop = walk_plan[matched_item * 3 + 1] as usize;
                     let mut sum = 0.0f32;
                     let mut widest = 0.0f32;
                     let mut count = 0usize;
-                    let mut id = b;
+                    let mut id = byte_index;
                     let mut cur_word_idx = id >> 2;
-                    let mut fl_word = fl[cur_word_idx];
+                    let mut fl_word = glyph_flags[cur_word_idx];
                     while id < stop {
                         let word_idx = id >> 2;
                         if word_idx != cur_word_idx {
-                            fl_word = fl[word_idx];
+                            fl_word = glyph_flags[word_idx];
                             cur_word_idx = word_idx;
                         }
                         let f = (fl_word >> (((id & 3) * 8) as u32)) & 0xFF;
@@ -748,17 +984,17 @@ pub(super) fn extent_pair(
                                 // joins (fold.rs:758).
                                 break;
                             }
-                            sum += sm[id];
+                            sum += advance_widths[id];
                         }
                         id += 1;
                     }
                     if widest > 0.0f32 {
                         let key = ordered_key(widest);
-                        let slot = lo - it_base;
+                        let slot = matched_item - tile_item_base;
                         if slot < RESOLVE_SLOTS {
-                            sext[slot].fetch_max(key);
+                            shared_max_extents[slot].fetch_max(key);
                         } else {
-                            extent_words[lo * 2].fetch_max(key);
+                            max_row_extents[matched_item * 2].fetch_max(key);
                         }
                     }
                 }
@@ -768,11 +1004,11 @@ pub(super) fn extent_pair(
     }
     sync_cube();
     if u < RESOLVE_SLOTS {
-        let it = it_base + u;
-        if it < item_count {
-            let val = sext[u].load();
+        let item_idx = tile_item_base + u;
+        if item_idx < item_count {
+            let val = shared_max_extents[u].load();
             if val > zero_k {
-                extent_words[it * 2].fetch_max(val);
+                max_row_extents[item_idx * 2].fetch_max(val);
             }
         }
     }
@@ -781,63 +1017,59 @@ pub(super) fn extent_pair(
 #[allow(dead_code)]
 #[cube(launch_unchecked)]
 pub(super) fn derive_stride(
-    extent_words: &[u32],
-    ie: &[u32],
-    page_gap_x: &[f32],
+    max_row_extents: &[u32],
+    item_descriptors: &[u32],
     strides: &mut [f32],
 ) {
-    let i = ABSOLUTE_POS;
-    let item_count = ie.len() / IE_STRIDE;
-    if i < item_count {
-        let ie_off = i * IE_STRIDE;
-        let has_page = ie[ie_off + IE_HAS_PAGE] != 0;
-        let rows = ie[ie_off + IE_PAGE_ROWS] as i32;
+    let item_idx = ABSOLUTE_POS;
+    let item_count = item_descriptors.len() / ITEM_DESC_STRIDE;
+    if item_idx < item_count {
+        let desc_offset = item_idx * ITEM_DESC_STRIDE;
+        let has_page = item_descriptors[desc_offset + ITEM_DESC_HAS_PAGE] != 0;
+        let rows = item_descriptors[desc_offset + ITEM_DESC_PAGE_ROWS] as i32;
         if has_page && rows > 0 {
             // The gap folds EXACTLY in fixed-point — the engine holds
             // extent+gap as an f64 (an f32 value plus a small constant,
             // exact in f64), and the f32 add would round it whenever the
             // sum crosses a binade. The decode splits the exact value
             // into (fl(stride), sub-ulp tail) for paginate's fmas.
-            let exact = advance_fixed(key_to_float(extent_words[i * 2]))
-                + advance_fixed(page_gap_x[i]);
+            let exact = advance_fixed(key_to_float(max_row_extents[item_idx * 2]))
+                + advance_fixed(f32::from_bits(item_descriptors[desc_offset + ITEM_DESC_PAGE_GAP_X]));
             let mut stride_sum = 0.0f32;
             let mut stride_tail = 0.0f32;
             fixed_pair(exact, &mut stride_sum, &mut stride_tail);
-            strides[i * 2] = stride_sum;
-            strides[i * 2 + 1] = stride_tail;
+            strides[item_idx * 2] = stride_sum;
+            strides[item_idx * 2 + 1] = stride_tail;
         } else {
-            strides[i * 2] = 0.0;
-            strides[i * 2 + 1] = 0.0;
+            strides[item_idx * 2] = 0.0;
+            strides[item_idx * 2 + 1] = 0.0;
         }
     }
 }
 
-// ── legacy dispatch: paginate (now fused directly into resolve_x) ────────────
+// ── legacy dispatch: paginate (now fused directly into apply_and_emit) ────────
 #[allow(dead_code)]
 #[cube(launch_unchecked)]
 pub(super) fn paginate(
-    lm: &mut [f32],
-    fl: &[u32],
-    lc: &[u32],
-    items: &[f32],
-    ie: &[u32],
-    ir: &[u32],
+    layout_metrics: &mut [f32],
+    glyph_flags: &[u32],
+    line_columns: &[u32],
+    item_descriptors: &[u32],
     strides: &[f32],
 ) {
-    let id = ABSOLUTE_POS;
-    let n = fl.len() * 4; // packed: words -> bytes
-    let item_count = ir.len() / 2;
-    if id < n && (flags_at(fl, id) & F_LEADER) != 0 && item_count > 0 {
-        let it = item_search(ir, item_count, id);
-        let io = it * IM_STRIDE;
-        let ie_off = it * IE_STRIDE;
-        let has_page = ie[ie_off + IE_HAS_PAGE] != 0;
-        let rows = if has_page { ie[ie_off + IE_PAGE_ROWS] as i32 } else { 0 };
-        let cols = if has_page { ie[ie_off + IE_PAGE_COLS] as i32 } else { 0 };
-        let scroll = if has_page { ie[ie_off + IE_SCROLL_ROWS] as i32 } else { 0 };
+    let byte_index = ABSOLUTE_POS;
+    let total_bytes = glyph_flags.len() * 4; // packed: words -> bytes
+    let item_count = item_descriptors.len() / ITEM_DESC_STRIDE;
+    if byte_index < total_bytes && (flags_at(glyph_flags, byte_index) & F_LEADER) != 0 && item_count > 0 {
+        let item_idx = item_search_desc(item_descriptors, item_count, byte_index);
+        let desc_offset = item_idx * ITEM_DESC_STRIDE;
+        let has_page = item_descriptors[desc_offset + ITEM_DESC_HAS_PAGE] != 0;
+        let rows = if has_page { item_descriptors[desc_offset + ITEM_DESC_PAGE_ROWS] as i32 } else { 0 };
+        let cols = if has_page { item_descriptors[desc_offset + ITEM_DESC_PAGE_COLS] as i32 } else { 0 };
+        let scroll = if has_page { item_descriptors[desc_offset + ITEM_DESC_SCROLL_ROWS] as i32 } else { 0 };
         if rows != 0 || cols != 0 || scroll != 0 {
-            let row = lc[id * LC_STRIDE + LC_ROW] as i32;
-            let col = lc[id * LC_STRIDE + LC_COL] as i32;
+            let row = line_columns[byte_index * LC_STRIDE + LC_ROW] as i32;
+            let col = line_columns[byte_index * LC_STRIDE + LC_COL] as i32;
             let screen_row = row - scroll;
             let mut y_page = 0;
             if rows > 0 && screen_row >= rows {
@@ -847,13 +1079,13 @@ pub(super) fn paginate(
             if cols > 0 {
                 x_page = col / cols;
             }
-            let pages_wide_raw = ie[ie_off + IE_PAGES_WIDE] as i32;
+            let pages_wide_raw = item_descriptors[desc_offset + ITEM_DESC_PAGES_WIDE] as i32;
             let pages_wide = if pages_wide_raw > 1 { pages_wide_raw } else { 1 };
             let band = y_page / pages_wide;
-            let wrap = ie[ie_off + IE_WRAP_WIDTH] as i32;
-            let wrap_segment = wrap_segment_of(col, wrap, (flags_at(fl, id) & F_NEWLINE) != 0);
-            let line_height = items[io + IM_LINE_HEIGHT];
-            let mo = id * LM_STRIDE;
+            let wrap = item_descriptors[desc_offset + ITEM_DESC_WRAP_WIDTH] as i32;
+            let wrap_segment = wrap_segment_of(col, wrap, (flags_at(glyph_flags, byte_index) & F_NEWLINE) != 0);
+            let line_height = f32::from_bits(item_descriptors[desc_offset + ITEM_DESC_LINE_HEIGHT]);
+            let metrics_offset = byte_index * LM_STRIDE;
             // The three position formulas, one nested OPAQUE fma per
             // term, folded TAIL-FIRST — the tiny correction words ride
             // INSIDE the dominant term's single rounding, which is the
@@ -868,24 +1100,25 @@ pub(super) fn paginate(
             //   which page column of the band this row lands on, times
             //   how far one page column reaches (the stride pair).
             let page_col = (y_page % pages_wide) as f32;
-            let stride_reach_tail = strides[it * 2 + 1];
-            let stride_reach = strides[it * 2];
-            let x_with_tail = fma(page_col, stride_reach_tail, lm[mo + LM_X]);
-            lm[mo + LM_X] = fma(page_col, stride_reach, x_with_tail);
+            let stride_reach_tail = strides[item_idx * 2 + 1];
+            let stride_reach = strides[item_idx * 2];
+            let x_with_tail = fma(page_col, stride_reach_tail, layout_metrics[metrics_offset + LM_X]);
+            layout_metrics[metrics_offset + LM_X] = fma(page_col, stride_reach, x_with_tail);
             // Y = page top − row-in-page × line height − band × band stride.
             let row_in_page = (screen_row - y_page * rows) as f32;
-            let y_row_folded = fma(-row_in_page, line_height, items[io + IM_ORIGIN_Y]);
-            lm[mo + LM_Y] = fma(-(band as f32), items[io + IM_BAND_STRIDE_Y], y_row_folded);
+            let y_row_folded = fma(-row_in_page, line_height, f32::from_bits(item_descriptors[desc_offset + ITEM_DESC_ORIGIN_Y]));
+            layout_metrics[metrics_offset + LM_Y] = fma(-(band as f32), f32::from_bits(item_descriptors[desc_offset + ITEM_DESC_BAND_STRIDE_Y]), y_row_folded);
             // Z = depth origin − wrap segment × depth step
             //       + band × band depth + page column × column depth.
             // The last two terms are zero in repo mode; the depth step
-            // carries an f64 tail lane (IM_Z_STEP_LO) because the engine
+            // carries an f64 tail lane (ITEM_DESC_Z_STEP_LO) because the engine
             // multiplies the full f64 param.
             let depth_steps = -(wrap_segment as f32);
-            let z_tail_folded = fma(depth_steps, items[io + IM_Z_STEP_LO], items[io + IM_ORIGIN_Z]);
-            let z_stepped = fma(depth_steps, items[io + IM_Z_STEP], z_tail_folded);
-            let z_banded = fma(band as f32, items[io + IM_DEPTH_PER_BAND], z_stepped);
-            lm[mo + LM_Z] = fma(x_page as f32, items[io + IM_DEPTH_PER_COL], z_banded);
+            let z_tail_folded = fma(depth_steps, f32::from_bits(item_descriptors[desc_offset + ITEM_DESC_Z_STEP_LO]), f32::from_bits(item_descriptors[desc_offset + ITEM_DESC_ORIGIN_Z]));
+            let z_stepped = fma(depth_steps, f32::from_bits(item_descriptors[desc_offset + ITEM_DESC_Z_STEP]), z_tail_folded);
+            let z_banded = fma(band as f32, f32::from_bits(item_descriptors[desc_offset + ITEM_DESC_DEPTH_PER_BAND]), z_stepped);
+            layout_metrics[metrics_offset + LM_Z] = fma(x_page as f32, f32::from_bits(item_descriptors[desc_offset + ITEM_DESC_DEPTH_PER_COL]), z_banded);
         }
     }
 }
+
