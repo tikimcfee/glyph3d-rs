@@ -814,47 +814,13 @@ impl WindowState {
                             ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
                             ui.horizontal(|ui| {
                                 if ui.button("⏮ Oldest (End)").clicked() {
-                                    let mut opts = carrel.layout_options;
-                                    opts.deck_scroll_offset = carrel.max_deck_scroll;
-                                    opts.active_beat = Some(0);
-                                    *pending_relayout = Some(RelayoutRequest {
-                                        carrel_options: Some(opts),
-                                        ..Default::default()
-                                    });
+                                    self.scene.on_key(ctx, winit::keyboard::KeyCode::End, true);
                                 }
 
                                 let total_beats = carrel.beat_count.max(carrel.turn_count);
-                                let limit = carrel.layout_options.deck_window_limit.max(1);
-                                let max_k = carrel.max_deck_scroll;
-                                let (oldest, newest) = carrel.window_item_range;
-                                let window_min = oldest.saturating_sub(1);
-                                let window_max = newest.saturating_sub(1);
 
                                 if ui.button("◀ Prev (P/←/〔)").clicked() && total_beats > 0 {
-                                    if carrel.active_beat == 0 {
-                                        let target_beat = total_beats - 1;
-                                        let mut opts = carrel.layout_options;
-                                        opts.deck_scroll_offset = 0;
-                                        opts.active_beat = Some(target_beat);
-                                        *pending_relayout = Some(RelayoutRequest {
-                                            carrel_options: Some(opts),
-                                            ..Default::default()
-                                        });
-                                    } else {
-                                        let target_beat = carrel.active_beat - 1;
-                                        if target_beat < window_min {
-                                            let new_k = (total_beats.saturating_sub(1).saturating_sub(target_beat)).min(max_k);
-                                            let mut opts = carrel.layout_options;
-                                            opts.deck_scroll_offset = new_k;
-                                            opts.active_beat = Some(target_beat);
-                                            *pending_relayout = Some(RelayoutRequest {
-                                                carrel_options: Some(opts),
-                                                ..Default::default()
-                                            });
-                                        } else {
-                                            self.scene.on_key(ctx, winit::keyboard::KeyCode::KeyP, true);
-                                        }
-                                    }
+                                    self.scene.on_key(ctx, winit::keyboard::KeyCode::BracketLeft, true);
                                 }
 
                                 if carrel.beat_count > 0 {
@@ -869,39 +835,11 @@ impl WindowState {
                                 }
 
                                 if ui.button("Next (N/→/〕) ▶").clicked() && total_beats > 0 {
-                                    if carrel.active_beat >= total_beats.saturating_sub(1) {
-                                        let mut opts = carrel.layout_options;
-                                        opts.deck_scroll_offset = max_k;
-                                        opts.active_beat = Some(0);
-                                        *pending_relayout = Some(RelayoutRequest {
-                                            carrel_options: Some(opts),
-                                            ..Default::default()
-                                        });
-                                    } else {
-                                        let target_beat = carrel.active_beat + 1;
-                                        if target_beat > window_max {
-                                            let new_k = (total_beats.saturating_sub(limit).saturating_sub(target_beat)).min(max_k);
-                                            let mut opts = carrel.layout_options;
-                                            opts.deck_scroll_offset = new_k;
-                                            opts.active_beat = Some(target_beat);
-                                            *pending_relayout = Some(RelayoutRequest {
-                                                carrel_options: Some(opts),
-                                                ..Default::default()
-                                            });
-                                        } else {
-                                            self.scene.on_key(ctx, winit::keyboard::KeyCode::KeyN, true);
-                                        }
-                                    }
+                                    self.scene.on_key(ctx, winit::keyboard::KeyCode::BracketRight, true);
                                 }
 
                                 if ui.button("Latest ⏭ (Home)").clicked() {
-                                    let mut opts = carrel.layout_options;
-                                    opts.deck_scroll_offset = 0;
-                                    opts.active_beat = Some(total_beats.saturating_sub(1));
-                                    *pending_relayout = Some(RelayoutRequest {
-                                        carrel_options: Some(opts),
-                                        ..Default::default()
-                                    });
+                                    self.scene.on_key(ctx, winit::keyboard::KeyCode::Home, true);
                                 }
 
                                 ui.separator();

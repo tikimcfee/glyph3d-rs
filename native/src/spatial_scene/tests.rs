@@ -693,74 +693,58 @@ fn test_agent_carrel_page_aware_continuous_navigation() {
     let total_items = session.linearize_events(Some(&rev_engine)).len();
     assert_eq!(total_items, 24);
     let limit = 4usize;
-    let max_k = total_items - limit;
+    let initial_beat = total_items - 1; // 23
 
-    let mut current_k = 0usize;
-    let mut active_beat = total_items - 1; // 23
-
-    // Page 1: beats 23, 22, 21, 20 (k = 0)
+    // Initial window: beats 23, 22, 21, 20 (k = 0)
     let carrel = scene.spawn_agent_carrel_with_options(
         root,
         &session,
         &rev_engine,
         CarrelLayoutOptions {
             deck_window_limit: limit,
-            deck_scroll_offset: current_k,
+            deck_scroll_offset: 0,
             desk_revision_limit: 4,
             desk_scroll_offset: 0,
             max_file_stacks: 10,
-            active_beat: Some(active_beat),
+            active_beat: Some(initial_beat),
         },
     );
     let comp = scene.world.get::<AgentCarrel>(carrel).unwrap();
     assert_eq!(comp.slot_to_beat, vec![23, 22, 21, 20]);
     assert_eq!(comp.active_beat, 23);
 
-    // Simulate backward navigation through all beats: 23 -> 0
+    // Verify all 24 cards were spawned into ECS
+    assert_eq!(comp.all_card_entities.len(), 24);
+
+    // Simulate backward navigation through all beats: 23 -> 0 in O(1) without rebuilding
     let mut visited_slots = Vec::new();
     for _ in 0..total_items - 1 {
-        let (window_min, _window_max) = {
-            let comp = scene.world.get::<AgentCarrel>(carrel).unwrap();
-            let oldest = comp.slot_to_beat.last().copied().unwrap_or(0);
-            let newest = comp.slot_to_beat.first().copied().unwrap_or(0);
-            (oldest, newest)
-        };
-
-        let target_beat = active_beat - 1;
-        if target_beat < window_min {
-            // Page turn backward to next window
-            current_k = (total_items.saturating_sub(1).saturating_sub(target_beat)).min(max_k);
-            let new_carrel = scene.spawn_agent_carrel_with_options(
-                root,
-                &session,
-                &rev_engine,
-                CarrelLayoutOptions {
-                    deck_window_limit: limit,
-                    deck_scroll_offset: current_k,
-                    desk_revision_limit: 4,
-                    desk_scroll_offset: 0,
-                    max_file_stacks: 10,
-                    active_beat: Some(target_beat),
-                },
-            );
-            active_beat = target_beat;
-            let comp = scene.world.get::<AgentCarrel>(new_carrel).unwrap();
-            let slot = comp.slot_to_beat.iter().position(|&b| b == active_beat).unwrap();
-            visited_slots.push((active_beat, slot));
-        } else {
-            scene.carrel_set_beat(carrel, target_beat, &session, &rev_engine);
-            active_beat = target_beat;
-            let comp = scene.world.get::<AgentCarrel>(carrel).unwrap();
-            let slot = comp.slot_to_beat.iter().position(|&b| b == active_beat).unwrap();
-            visited_slots.push((active_beat, slot));
-        }
+        let beat = scene.carrel_step_prev(carrel, &session, &rev_engine);
+        let comp = scene.world.get::<AgentCarrel>(carrel).unwrap();
+        let slot = comp.slot_to_beat.iter().position(|&b| b == beat).unwrap();
+        visited_slots.push((beat, slot));
     }
 
-    // Verify all beats were successfully visited and each landed on a valid slot (0..4)
+    // Verify all beats were visited and always occupied a valid slot (0..4)
     assert_eq!(visited_slots.len(), 23);
     for &(beat, slot) in &visited_slots {
         assert!(slot < limit, "beat {beat} mapped to invalid slot {slot}");
     }
-    // Final beat should be 0, at slot 3 of the oldest window (k = 20, beats [3, 2, 1, 0])
+    // Final beat should be 0, at slot 3 of the oldest window (beats [3, 2, 1, 0])
     assert_eq!(visited_slots.last().unwrap(), &(0, 3));
+    let comp = scene.world.get::<AgentCarrel>(carrel).unwrap();
+    assert_eq!(comp.slot_to_beat, vec![3, 2, 1, 0]);
+
+    // Now simulate forward navigation back from 0 -> 23 in O(1)
+    let mut forward_slots = Vec::new();
+    for _ in 0..total_items - 1 {
+        let beat = scene.carrel_step_next(carrel, &session, &rev_engine);
+        let comp = scene.world.get::<AgentCarrel>(carrel).unwrap();
+        let slot = comp.slot_to_beat.iter().position(|&b| b == beat).unwrap();
+        forward_slots.push((beat, slot));
+    }
+    assert_eq!(forward_slots.len(), 23);
+    assert_eq!(forward_slots.last().unwrap(), &(23, 0));
+    let comp = scene.world.get::<AgentCarrel>(carrel).unwrap();
+    assert_eq!(comp.slot_to_beat, vec![23, 22, 21, 20]);
 }

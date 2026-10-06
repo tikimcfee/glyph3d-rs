@@ -275,7 +275,7 @@ impl GlyphScene {
                     },
                 }
             }
-            K::BracketRight | K::KeyN | K::ArrowRight => {
+            K::BracketRight | K::KeyN | K::ArrowRight | K::Period => {
                 if let Some(ctrl) = &mut self.controller {
                     if let Some(msg) = ctrl.carrel_next().or_else(|| ctrl.deck_next()) {
                         let updated_gids = ctrl.sync_gpu_groups(&mut self.groups_cpu);
@@ -289,7 +289,7 @@ impl GlyphScene {
                     }
                 }
             }
-            K::BracketLeft | K::KeyP | K::ArrowLeft => {
+            K::BracketLeft | K::KeyP | K::ArrowLeft | K::Comma => {
                 if let Some(ctrl) = &mut self.controller {
                     if let Some(msg) = ctrl.carrel_prev().or_else(|| ctrl.deck_prev()) {
                         let updated_gids = ctrl.sync_gpu_groups(&mut self.groups_cpu);
@@ -300,6 +300,37 @@ impl GlyphScene {
                         println!("{msg}");
                     } else {
                         println!("deck: reached beginning of deck (or no active deck)");
+                    }
+                }
+            }
+            K::Home => {
+                if let Some(ctrl) = &mut self.controller {
+                    let total = ctrl
+                        .session
+                        .as_ref()
+                        .map(|s| s.linearize_events(ctrl.revision_engine.as_ref()).len().max(s.turn_count()))
+                        .unwrap_or(0);
+                    if total > 0 {
+                        if let Some(msg) = ctrl.carrel_set_beat(total - 1) {
+                            let updated_gids = ctrl.sync_gpu_groups(&mut self.groups_cpu);
+                            self.write_group_rows(ctx, &updated_gids);
+                            for &g in &updated_gids {
+                                self.sync_segment(g);
+                            }
+                            println!("{msg}");
+                        }
+                    }
+                }
+            }
+            K::End => {
+                if let Some(ctrl) = &mut self.controller {
+                    if let Some(msg) = ctrl.carrel_set_beat(0) {
+                        let updated_gids = ctrl.sync_gpu_groups(&mut self.groups_cpu);
+                        self.write_group_rows(ctx, &updated_gids);
+                        for &g in &updated_gids {
+                            self.sync_segment(g);
+                        }
+                        println!("{msg}");
                     }
                 }
             }

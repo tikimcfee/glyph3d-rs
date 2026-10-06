@@ -11,9 +11,9 @@ use glam::Vec3;
 use crate::agent_transcript::AgentSession;
 use crate::revision::RevisionEngine;
 use super::{
-    deck::{Deck, DeckMode},
+    deck::{Deck, DeckItem, DeckMode},
     workdesk::{FileRevisionStack, Workdesk},
-    ChildOf, SpatialScene,
+    ChildOf, SpatialScene, Visible,
 };
 
 use serde::{Deserialize, Serialize};
@@ -90,6 +90,8 @@ pub struct AgentCarrel {
     pub session_id: String,
     pub deck_entity: Entity,
     pub workdesk_entity: Entity,
+    pub inactive_pool: Entity,
+    pub all_card_entities: Vec<Entity>,
     pub active_turn: usize,
     pub turn_count: usize,
     pub active_beat: usize,
@@ -121,6 +123,17 @@ impl SpatialScene {
             ))
             .id();
 
+        // Container for cards outside the visible sliding window
+        let inactive_pool = self
+            .world
+            .spawn((
+                Transform::from_scale(Vec3::ZERO),
+                ChildOf(carrel_entity),
+                Name::new("inactive_card_pool"),
+                Visible(false),
+            ))
+            .id();
+
         // 2. Deck container on the left side
         let deck_parent = self
             .world
@@ -142,41 +155,64 @@ impl SpatialScene {
         let total_items = if total_events > 0 { total_events } else { turn_count };
         let mut slot_to_beat = Vec::new();
 
-        if total_items > 0 {
-            let limit = options.deck_window_limit.max(1);
-            let max_scroll = total_items.saturating_sub(limit);
-            let scroll_k = options.deck_scroll_offset.min(max_scroll);
-            let window_size = limit.min(total_items.saturating_sub(scroll_k));
+        let limit = options.deck_window_limit.max(1);
+        let max_scroll = total_items.saturating_sub(limit);
+        let scroll_k = options.deck_scroll_offset.min(max_scroll);
+        let window_size = limit.min(total_items.saturating_sub(scroll_k));
 
+        if total_items > 0 {
             for slot in 0..window_size {
                 let chrono_idx = (total_items - 1 - scroll_k) - slot;
                 slot_to_beat.push(chrono_idx);
-                if !events.is_empty() {
-                    let event = &events[chrono_idx];
-                    self.spawn_agent_turn_card(
-                        deck_entity,
-                        slot,
-                        event.index,
-                        event.turn_index,
-                        [55.0, 40.0],
-                        4.0,
-                        event.summary(),
-                        Some(event.banner_colors()),
-                    );
-                } else {
-                    let turn = &session.turns[chrono_idx];
-                    self.spawn_agent_turn_card(
-                        deck_entity,
-                        slot,
-                        turn.turn_index,
-                        turn.turn_index,
-                        [55.0, 40.0],
-                        4.0,
-                        turn.summary(),
-                        None,
-                    );
-                }
             }
+        }
+
+        // Spawn ALL card entities: active window as children of deck_entity, inactive in inactive_pool
+        let mut all_card_entities = Vec::with_capacity(total_items);
+        for chrono_idx in 0..total_items {
+            let in_window_slot = slot_to_beat.iter().position(|&b| b == chrono_idx);
+            let parent_e = if in_window_slot.is_some() { deck_entity } else { inactive_pool };
+            let slot = in_window_slot.unwrap_or(0);
+
+            let card_e = if !events.is_empty() {
+                let event = &events[chrono_idx];
+                self.spawn_agent_turn_card(
+                    parent_e,
+                    slot,
+                    event.index,
+                    event.turn_index,
+                    [55.0, 40.0],
+                    4.0,
+                    event.summary(),
+                    Some(event.banner_colors()),
+                )
+            } else {
+                let turn = &session.turns[chrono_idx];
+                self.spawn_agent_turn_card(
+                    parent_e,
+                    slot,
+                    turn.turn_index,
+                    turn.turn_index,
+                    [55.0, 40.0],
+                    4.0,
+                    turn.summary(),
+                    None,
+                )
+            };
+
+            if in_window_slot.is_none() {
+                self.world
+                    .entity_mut(card_e)
+                    .remove::<DeckItem>()
+                    .insert((
+                        Visible(false),
+                        Transform::from_scale(Vec3::ZERO),
+                    ));
+            } else {
+                self.world.entity_mut(card_e).insert(Visible(true));
+            }
+
+            all_card_entities.push(card_e);
         }
 
         // 3. Workdesk container on the right side
@@ -252,6 +288,8 @@ impl SpatialScene {
             session_id: session.session_id.clone(),
             deck_entity,
             workdesk_entity,
+            inactive_pool,
+            all_card_entities,
             active_turn: initial_turn,
             turn_count,
             active_beat: initial_beat,
@@ -292,19 +330,7 @@ impl SpatialScene {
         session: &AgentSession,
         revision_engine: &RevisionEngine,
     ) -> usize {
-        let next_idx = if let Some(carrel) = self.world.get::<AgentCarrel>(carrel_entity) {
-            let total = carrel.beat_count.max(carrel.turn_count);
-            if total == 0 {
-                0
-            } else {
-                (carrel.active_beat + 1) % total
-            }
-        } else {
-            return 0;
-        };
-
-        self.carrel_set_beat(carrel_entity, next_idx, session, revision_engine);
-        next_idx
+        self.carrel_step_next(carrel_entity, session, revision_engine)
     }
 
     /// Go back to the previous atomic beat in the carrel, wrapping around.
@@ -314,22 +340,228 @@ impl SpatialScene {
         session: &AgentSession,
         revision_engine: &RevisionEngine,
     ) -> usize {
-        let prev_idx = if let Some(carrel) = self.world.get::<AgentCarrel>(carrel_entity) {
-            let total = carrel.beat_count.max(carrel.turn_count);
-            if total == 0 {
-                0
-            } else {
-                (carrel.active_beat + total - 1) % total
-            }
-        } else {
-            return 0;
-        };
-
-        self.carrel_set_beat(carrel_entity, prev_idx, session, revision_engine);
-        prev_idx
+        self.carrel_step_prev(carrel_entity, session, revision_engine)
     }
 
-    /// Set the active atomic beat index for the carrel and synchronize the workdesk.
+    /// Step back one beat in history (older beat), sliding the window in O(1) if at the end of the window.
+    pub fn carrel_step_prev(
+        &mut self,
+        carrel_entity: Entity,
+        session: &AgentSession,
+        revision_engine: &RevisionEngine,
+    ) -> usize {
+        let (deck_e, inactive_pool, total_items, current_beat, slot_to_beat, all_cards) = {
+            let Some(carrel) = self.world.get::<AgentCarrel>(carrel_entity) else {
+                return 0;
+            };
+            let total = carrel.beat_count.max(carrel.turn_count);
+            (
+                carrel.deck_entity,
+                carrel.inactive_pool,
+                total,
+                carrel.active_beat,
+                carrel.slot_to_beat.clone(),
+                carrel.all_card_entities.clone(),
+            )
+        };
+
+        if total_items == 0 || slot_to_beat.is_empty() {
+            return 0;
+        }
+
+        let current_slot = slot_to_beat.iter().position(|&b| b == current_beat);
+        let s = current_slot.unwrap_or(0);
+
+        let target_beat = if s + 1 < slot_to_beat.len() {
+            // Already inside the window: advance to next older slot
+            let next_slot = s + 1;
+            let target = slot_to_beat[next_slot];
+            if let Some(mut deck) = self.world.get_mut::<Deck>(deck_e) {
+                deck.set_active_page(next_slot, slot_to_beat.len());
+            }
+            target
+        } else {
+            // At the oldest edge of the window: slide backward in history in O(1)
+            let oldest_in_window = slot_to_beat[s];
+            if oldest_in_window > 0 {
+                let next_older = oldest_in_window - 1;
+
+                // 1. Pop slot 0 (newest in window) and move to inactive pool
+                let popped_beat = slot_to_beat[0];
+                if popped_beat < all_cards.len() {
+                    let popped_e = all_cards[popped_beat];
+                    self.world
+                        .entity_mut(popped_e)
+                        .remove::<DeckItem>()
+                        .insert((
+                            ChildOf(inactive_pool),
+                            Visible(false),
+                            Transform::from_scale(Vec3::ZERO),
+                        ));
+                }
+
+                // 2. Shift remaining cards in ECS: slot j -> j - 1
+                let mut new_slot_to_beat = slot_to_beat[1..].to_vec();
+                for (j, &beat) in new_slot_to_beat.iter().enumerate() {
+                    if beat < all_cards.len() {
+                        let card_e = all_cards[beat];
+                        if let Some(mut di) = self.world.get_mut::<DeckItem>(card_e) {
+                            di.index = j;
+                        }
+                    }
+                }
+
+                // 3. Append next_older at slot W - 1
+                new_slot_to_beat.push(next_older);
+                let new_slot = new_slot_to_beat.len() - 1;
+                if next_older < all_cards.len() {
+                    let new_e = all_cards[next_older];
+                    self.world
+                        .entity_mut(new_e)
+                        .insert((
+                            ChildOf(deck_e),
+                            DeckItem { index: new_slot },
+                            Visible(true),
+                            Transform::IDENTITY,
+                        ));
+                }
+
+                if let Some(mut deck) = self.world.get_mut::<Deck>(deck_e) {
+                    deck.set_active_page(new_slot, new_slot_to_beat.len());
+                }
+
+                if let Some(mut carrel) = self.world.get_mut::<AgentCarrel>(carrel_entity) {
+                    carrel.slot_to_beat = new_slot_to_beat;
+                    carrel.layout_options.deck_scroll_offset =
+                        (total_items - 1).saturating_sub(carrel.slot_to_beat[0]);
+                }
+
+                next_older
+            } else {
+                // At the beginning of history: wrap to newest turn (total_items - 1)
+                self.carrel_set_beat_sliding(
+                    carrel_entity,
+                    total_items.saturating_sub(1),
+                    session,
+                    revision_engine,
+                );
+                return total_items.saturating_sub(1);
+            }
+        };
+
+        self.carrel_set_beat_internal(carrel_entity, target_beat, session, revision_engine);
+        target_beat
+    }
+
+    /// Step forward one beat in history (newer beat), sliding the window in O(1) if at the newest slot.
+    pub fn carrel_step_next(
+        &mut self,
+        carrel_entity: Entity,
+        session: &AgentSession,
+        revision_engine: &RevisionEngine,
+    ) -> usize {
+        let (deck_e, inactive_pool, total_items, current_beat, slot_to_beat, all_cards) = {
+            let Some(carrel) = self.world.get::<AgentCarrel>(carrel_entity) else {
+                return 0;
+            };
+            let total = carrel.beat_count.max(carrel.turn_count);
+            (
+                carrel.deck_entity,
+                carrel.inactive_pool,
+                total,
+                carrel.active_beat,
+                carrel.slot_to_beat.clone(),
+                carrel.all_card_entities.clone(),
+            )
+        };
+
+        if total_items == 0 || slot_to_beat.is_empty() {
+            return 0;
+        }
+
+        let current_slot = slot_to_beat.iter().position(|&b| b == current_beat);
+        let s = current_slot.unwrap_or(0);
+
+        let target_beat = if s > 0 {
+            // Already inside the window: retreat to newer slot
+            let next_slot = s - 1;
+            let target = slot_to_beat[next_slot];
+            if let Some(mut deck) = self.world.get_mut::<Deck>(deck_e) {
+                deck.set_active_page(next_slot, slot_to_beat.len());
+            }
+            target
+        } else {
+            // At the newest edge of the window (slot 0): slide forward in history in O(1)
+            let newest_in_window = slot_to_beat[0];
+            if newest_in_window + 1 < total_items {
+                let next_newer = newest_in_window + 1;
+
+                // 1. Pop oldest slot at end of window and move to inactive pool
+                let popped_beat = slot_to_beat[slot_to_beat.len() - 1];
+                if popped_beat < all_cards.len() {
+                    let popped_e = all_cards[popped_beat];
+                    self.world
+                        .entity_mut(popped_e)
+                        .remove::<DeckItem>()
+                        .insert((
+                            ChildOf(inactive_pool),
+                            Visible(false),
+                            Transform::from_scale(Vec3::ZERO),
+                        ));
+                }
+
+                // 2. Shift remaining cards in ECS: slot j -> j + 1
+                let mut new_slot_to_beat = Vec::with_capacity(slot_to_beat.len());
+                new_slot_to_beat.push(next_newer);
+                for &beat in &slot_to_beat[..slot_to_beat.len() - 1] {
+                    new_slot_to_beat.push(beat);
+                }
+
+                for (j, &beat) in new_slot_to_beat.iter().enumerate().skip(1) {
+                    if beat < all_cards.len() {
+                        let card_e = all_cards[beat];
+                        if let Some(mut di) = self.world.get_mut::<DeckItem>(card_e) {
+                            di.index = j;
+                        }
+                    }
+                }
+
+                // 3. Prepend next_newer at slot 0
+                if next_newer < all_cards.len() {
+                    let new_e = all_cards[next_newer];
+                    self.world
+                        .entity_mut(new_e)
+                        .insert((
+                            ChildOf(deck_e),
+                            DeckItem { index: 0 },
+                            Visible(true),
+                            Transform::IDENTITY,
+                        ));
+                }
+
+                if let Some(mut deck) = self.world.get_mut::<Deck>(deck_e) {
+                    deck.set_active_page(0, new_slot_to_beat.len());
+                }
+
+                if let Some(mut carrel) = self.world.get_mut::<AgentCarrel>(carrel_entity) {
+                    carrel.slot_to_beat = new_slot_to_beat;
+                    carrel.layout_options.deck_scroll_offset =
+                        (total_items - 1).saturating_sub(carrel.slot_to_beat[0]);
+                }
+
+                next_newer
+            } else {
+                // At newest turn: wrap to oldest (beat 0)
+                self.carrel_set_beat_sliding(carrel_entity, 0, session, revision_engine);
+                return 0;
+            }
+        };
+
+        self.carrel_set_beat_internal(carrel_entity, target_beat, session, revision_engine);
+        target_beat
+    }
+
+    /// Set the active atomic beat index for the carrel, re-anchoring sliding window if necessary.
     pub fn carrel_set_beat(
         &mut self,
         carrel_entity: Entity,
@@ -337,20 +569,114 @@ impl SpatialScene {
         session: &AgentSession,
         revision_engine: &RevisionEngine,
     ) {
-        let (deck_e, workdesk_e, slot_opt) = if let Some(mut carrel) = self.world.get_mut::<AgentCarrel>(carrel_entity) {
+        self.carrel_set_beat_sliding(carrel_entity, beat_index, session, revision_engine);
+    }
+
+    /// Jump to a specific beat, re-anchoring the sliding window if the target is outside.
+    pub fn carrel_set_beat_sliding(
+        &mut self,
+        carrel_entity: Entity,
+        target_beat: usize,
+        session: &AgentSession,
+        revision_engine: &RevisionEngine,
+    ) {
+        let (deck_e, inactive_pool, total_items, old_slot_to_beat, all_cards, limit) = {
+            let Some(carrel) = self.world.get::<AgentCarrel>(carrel_entity) else {
+                return;
+            };
+            let total = carrel.beat_count.max(carrel.turn_count);
+            (
+                carrel.deck_entity,
+                carrel.inactive_pool,
+                total,
+                carrel.slot_to_beat.clone(),
+                carrel.all_card_entities.clone(),
+                carrel.layout_options.deck_window_limit.max(1),
+            )
+        };
+
+        if total_items == 0 {
+            return;
+        }
+        let target_beat = target_beat.min(total_items - 1);
+
+        if old_slot_to_beat.contains(&target_beat) {
+            let slot = old_slot_to_beat.iter().position(|&b| b == target_beat).unwrap();
+            if let Some(mut deck) = self.world.get_mut::<Deck>(deck_e) {
+                deck.set_active_page(slot, old_slot_to_beat.len());
+            }
+            self.carrel_set_beat_internal(carrel_entity, target_beat, session, revision_engine);
+            return;
+        }
+
+        // Re-anchor window to contain target_beat
+        let window_size = limit.min(total_items);
+        let max_k = total_items.saturating_sub(window_size);
+        let target_k = (total_items.saturating_sub(1).saturating_sub(target_beat)).min(max_k);
+
+        let mut new_slot_to_beat = Vec::with_capacity(window_size);
+        for slot in 0..window_size {
+            let chrono_idx = (total_items - 1 - target_k) - slot;
+            new_slot_to_beat.push(chrono_idx);
+        }
+
+        // Move cards leaving the window to inactive_pool
+        for &beat in &old_slot_to_beat {
+            if !new_slot_to_beat.contains(&beat) && beat < all_cards.len() {
+                let e = all_cards[beat];
+                self.world
+                    .entity_mut(e)
+                    .remove::<DeckItem>()
+                    .insert((
+                        ChildOf(inactive_pool),
+                        Visible(false),
+                        Transform::from_scale(Vec3::ZERO),
+                    ));
+            }
+        }
+
+        // Move cards entering the window to deck_entity
+        for (slot, &beat) in new_slot_to_beat.iter().enumerate() {
+            if beat < all_cards.len() {
+                let e = all_cards[beat];
+                self.world
+                    .entity_mut(e)
+                    .insert((
+                        ChildOf(deck_e),
+                        DeckItem { index: slot },
+                        Visible(true),
+                        Transform::IDENTITY,
+                    ));
+            }
+        }
+
+        let slot = new_slot_to_beat.iter().position(|&b| b == target_beat).unwrap_or(0);
+        if let Some(mut deck) = self.world.get_mut::<Deck>(deck_e) {
+            deck.set_active_page(slot, new_slot_to_beat.len());
+        }
+
+        if let Some(mut carrel) = self.world.get_mut::<AgentCarrel>(carrel_entity) {
+            carrel.slot_to_beat = new_slot_to_beat;
+            carrel.layout_options.deck_scroll_offset = target_k;
+        }
+
+        self.carrel_set_beat_internal(carrel_entity, target_beat, session, revision_engine);
+    }
+
+    /// Internal synchronization of active beat, turn index, and workdesk file revisions.
+    fn carrel_set_beat_internal(
+        &mut self,
+        carrel_entity: Entity,
+        beat_index: usize,
+        session: &AgentSession,
+        revision_engine: &RevisionEngine,
+    ) {
+        let workdesk_e = if let Some(mut carrel) = self.world.get_mut::<AgentCarrel>(carrel_entity) {
             carrel.active_beat = beat_index;
-            let slot = carrel.slot_to_beat.iter().position(|&b| b == beat_index);
-            (carrel.deck_entity, carrel.workdesk_entity, slot)
+            carrel.workdesk_entity
         } else {
             return;
         };
-
-        if let Some(slot) = slot_opt {
-            let total = self.world.get::<AgentCarrel>(carrel_entity).map(|c| c.slot_to_beat.len()).unwrap_or(1);
-            if let Some(mut deck) = self.world.get_mut::<Deck>(deck_e) {
-                deck.set_active_page(slot, total);
-            }
-        }
 
         let events = session.linearize_events(Some(revision_engine));
         if let Some(event) = events.get(beat_index) {
@@ -432,30 +758,27 @@ impl SpatialScene {
         revision_engine: &RevisionEngine,
     ) {
         let events = session.linearize_events(Some(revision_engine));
-        if let Some(beat_idx) = events
-            .iter()
-            .rposition(|e| e.turn_index == turn_index && e.file_path().is_some())
-            .or_else(|| events.iter().position(|e| e.turn_index == turn_index))
-        {
-            self.carrel_set_beat(carrel_entity, beat_idx, session, revision_engine);
-            return;
+        if !events.is_empty() {
+            if let Some(beat_idx) = events
+                .iter()
+                .rposition(|e| e.turn_index == turn_index && e.file_path().is_some())
+                .or_else(|| events.iter().position(|e| e.turn_index == turn_index))
+            {
+                self.carrel_set_beat_sliding(carrel_entity, beat_idx, session, revision_engine);
+                return;
+            }
         }
 
-        let (deck_e, workdesk_e) = if let Some(mut carrel) = self.world.get_mut::<AgentCarrel>(carrel_entity) {
+        self.carrel_set_beat_sliding(carrel_entity, turn_index, session, revision_engine);
+
+        // Find file revisions produced or observed in this turn
+        let workdesk_e = if let Some(mut carrel) = self.world.get_mut::<AgentCarrel>(carrel_entity) {
             carrel.active_turn = turn_index;
-            (carrel.deck_entity, carrel.workdesk_entity)
+            carrel.workdesk_entity
         } else {
             return;
         };
 
-        if let Some(slot) = self.world.get::<AgentCarrel>(carrel_entity).and_then(|c| c.slot_to_beat.iter().position(|&t| t == turn_index)) {
-            let total = self.world.get::<AgentCarrel>(carrel_entity).map(|c| c.slot_to_beat.len()).unwrap_or(1);
-            if let Some(mut deck) = self.world.get_mut::<Deck>(deck_e) {
-                deck.set_active_page(slot, total);
-            }
-        }
-
-        // Find file revisions produced or observed in this turn
         if let Some(turn) = session.turns.get(turn_index) {
             let desk_comp = match self.world.get::<Workdesk>(workdesk_e) {
                 Some(d) => d.clone(),

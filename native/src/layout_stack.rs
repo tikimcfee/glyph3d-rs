@@ -539,6 +539,33 @@ impl LayoutController {
         let total = session.turn_count();
         Some(format!("carrel: jump to turn {}/{}", turn_index + 1, total))
     }
+
+    /// Jump to a specific atomic beat in the agent carrel.
+    pub fn carrel_set_beat(&mut self, beat_index: usize) -> Option<String> {
+        let carrel_e = self.active_carrel?;
+        let session = self.session.as_ref()?;
+        let rev_engine = self.revision_engine.as_ref()?;
+        self.scene.carrel_set_beat(carrel_e, beat_index, session, rev_engine);
+        self.scene.update_transforms();
+        let events = session.linearize_events(Some(rev_engine));
+        let total = events.len().max(session.turn_count());
+        let summary = events
+            .get(beat_index)
+            .map(|e| e.summary())
+            .unwrap_or_else(|| {
+                session
+                    .turns
+                    .get(beat_index)
+                    .map(|t| t.summary())
+                    .unwrap_or_default()
+            });
+        Some(format!(
+            "carrel: beat {}/{} — \"{}\"",
+            beat_index + 1,
+            total,
+            summary
+        ))
+    }
 }
 
 
