@@ -8,7 +8,7 @@ use super::monoid::{
     ordered_key, p_load, p_store, rows_for, s_load, s_store, wrap_row_of, wrap_segment_of,
 };
 use super::{
-    F_LEADER, F_NEWLINE,
+    F_CLUSTER_HEAD, F_CLUSTER_TRAILER, F_LEADER, F_NEWLINE,
     ITEM_DESC_BYTE_START, ITEM_DESC_CELL_ADVANCE, ITEM_DESC_HAS_PAGE, ITEM_DESC_LINE_HEIGHT, ITEM_DESC_ORIGIN_X,
     ITEM_DESC_ORIGIN_Y, ITEM_DESC_ORIGIN_Z, ITEM_DESC_PAGE_COLS, ITEM_DESC_STRIDE,
     ITEM_DESC_WRAP_MODE, ITEM_DESC_WRAP_WIDTH, ITEM_DESC_Z_STEP, ITEM_DESC_Z_STEP_LO,
@@ -32,6 +32,7 @@ pub(super) fn tile_scan(
     trie_block_metrics: &[f32],
     trie_block_codepoints: &[u32],
     #[comptime] trie_block_shift: u32,
+    bitmap_advance: f32,
     item_descriptors: &[u32],
     tile_counts: &mut [u32],
     tile_metrics: &mut [f32],
@@ -120,15 +121,21 @@ pub(super) fn tile_scan(
             let local_id = id - tile_byte_start;
             let glyph_flag = (shared_tile_flags[local_id >> 2] >> (((local_id & 3) * 8) as u32)) & 0xFF;
             let advance = if (glyph_flag & super::F_LEADER) != 0 {
-                let lead_byte = byte_at(bytes, id, total_bytes);
-                if lead_byte < 128u32 {
-                    let entry_offset = (ascii_block_base | lead_byte) as usize;
-                    trie_block_metrics[entry_offset * 2]
+                if (glyph_flag & F_CLUSTER_HEAD) != 0 {
+                    bitmap_advance
+                } else if (glyph_flag & F_CLUSTER_TRAILER) != 0 {
+                    0.0f32
                 } else {
-                    let cp_len = seq_len_at(bytes, id, total_bytes);
-                    let cp = cp_at(bytes, id, cp_len, total_bytes);
-                    let (adv, _) = decode_trie(cp, trie_block_indices, trie_block_metrics, trie_block_codepoints, trie_block_shift);
-                    adv
+                    let lead_byte = byte_at(bytes, id, total_bytes);
+                    if lead_byte < 128u32 {
+                        let entry_offset = (ascii_block_base | lead_byte) as usize;
+                        trie_block_metrics[entry_offset * 2]
+                    } else {
+                        let cp_len = seq_len_at(bytes, id, total_bytes);
+                        let cp = cp_at(bytes, id, cp_len, total_bytes);
+                        let (adv, _) = decode_trie(cp, trie_block_indices, trie_block_metrics, trie_block_codepoints, trie_block_shift);
+                        adv
+                    }
                 }
             } else {
                 0.0f32

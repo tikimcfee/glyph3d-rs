@@ -244,6 +244,7 @@ pub fn run(ctx: &GpuContext, fixture_path: &Path) -> ! {
     let tiles_grid = |tiles: usize| {
         CubeCount::Static(tiles.min(65535) as u32, tiles.div_ceil(65535) as u32, 1)
     };
+    let bitmap_advance = fx.trie.cluster_table().map(|c| c.2).unwrap_or(0.0f32);
     let t0 = std::time::Instant::now();
     unsafe {
         tile_scan::launch_unchecked(
@@ -256,6 +257,7 @@ pub fn run(ctx: &GpuContext, fixture_path: &Path) -> ! {
             BufferArg::from_raw_parts(h_trie_m.clone(), trie_block_metrics_len),
             BufferArg::from_raw_parts(h_trie_c.clone(), trie_block_codepoints_len),
             trie_block_shift,
+            bitmap_advance,
             BufferArg::from_raw_parts(h_item_desc.clone(), item_descriptors.len()),
             BufferArg::from_raw_parts(h_tc.clone(), n_tiles * PARTIAL_COUNT_STRIDE),
             BufferArg::from_raw_parts(h_tm.clone(), n_tiles),

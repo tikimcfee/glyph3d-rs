@@ -88,9 +88,8 @@ const RESOLVE_SLOTS: usize = 16;
 const TRIE_FLAG_MISSING: u32 = 1;
 const F_MISSING: u32 = 8;
 /// The cluster trailer lane (fold::F_CLUSTER_TRAILER) — bit 16, inside the
-/// packed byte lane. Nothing in the chain reads it; the corpus FLAGS
-/// comparison is its only witness, so it rides anyway.
-const F_CLUSTER_TRAILER: u32 = 16;
+/// packed byte lane.
+pub(super) const F_CLUSTER_TRAILER: u32 = 16;
 
 const LM_STRIDE: usize = 3;
 const LM_X: usize = 0;

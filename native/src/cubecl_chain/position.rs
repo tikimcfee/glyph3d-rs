@@ -9,7 +9,7 @@ use super::scan::fold_of;
 use super::cluster::{cp_at, seq_len_at};
 use super::decode::{byte_at, decode_trie};
 use super::{
-    F_CLUSTER_HEAD, F_LEADER, F_NEWLINE,
+    F_CLUSTER_HEAD, F_CLUSTER_TRAILER, F_LEADER, F_NEWLINE,
     ITEM_DESC_BAND_STRIDE_Y, ITEM_DESC_BYTE_START, ITEM_DESC_CELL_ADVANCE, ITEM_DESC_COLOR_BASE, ITEM_DESC_DEPTH_PER_BAND,
     ITEM_DESC_DEPTH_PER_COL, ITEM_DESC_FLAT_COLOR, ITEM_DESC_GROUP, ITEM_DESC_HAS_PAGE,
     ITEM_DESC_IS_PER_RECORD, ITEM_DESC_LINE_HEIGHT, ITEM_DESC_ORIGIN_X, ITEM_DESC_ORIGIN_Y,
@@ -219,6 +219,8 @@ pub(super) fn resolve_x(
                         
                         let adv = if (flags_at(glyph_flags, prev_byte_idx) & F_CLUSTER_HEAD) != 0 {
                             bitmap_advance
+                        } else if (flags_at(glyph_flags, prev_byte_idx) & F_CLUSTER_TRAILER) != 0 {
+                            0.0f32
                         } else {
                             let cp_len = seq_len_at(bytes, prev_byte_idx, total_bytes);
                             let cp = cp_at(bytes, prev_byte_idx, cp_len, total_bytes);
@@ -281,6 +283,8 @@ pub(super) fn resolve_x(
                     
                     let adv = if (glyph_flags_val & F_CLUSTER_HEAD) != 0 {
                         bitmap_advance
+                    } else if (glyph_flags_val & F_CLUSTER_TRAILER) != 0 {
+                        0.0f32
                     } else {
                         let cp_len = seq_len_at(bytes, id, total_bytes);
                         let cp = cp_at(bytes, id, cp_len, total_bytes);
@@ -458,6 +462,8 @@ pub(super) fn apply_and_emit(
             let advance = if (flag & F_LEADER) != 0 {
                 if (flag & F_CLUSTER_HEAD) != 0 {
                     bitmap_advance
+                } else if (flag & F_CLUSTER_TRAILER) != 0 {
+                    0.0f32
                 } else {
                     let lead_byte = byte_at(bytes, id, total_bytes);
                     if lead_byte < 128u32 {
@@ -588,6 +594,8 @@ pub(super) fn apply_and_emit(
                             if (flag & F_LEADER) != 0 {
                                 if (flag & F_CLUSTER_HEAD) != 0 {
                                     pre_tile_adv += bitmap_advance;
+                                } else if (flag & F_CLUSTER_TRAILER) != 0 {
+                                    // trailer contributes 0.0 advance
                                 } else {
                                     let lead_byte = byte_at(bytes, forward_index, total_bytes);
                                     if lead_byte < 128u32 {
@@ -754,67 +762,67 @@ pub(super) fn apply_and_emit(
                     if entry_is_clean {
                         current_advance_x = segment_entry_advances[segment_column as usize];
                     } else if fold_unit > 0 && segment_column > 0 {
-                        let target_leader_col = col - segment_column;
-                        let tile_base_col = shared_counts[total_tile_bytes];
-                        if target_leader_col < tile_base_col {
-                            current_advance_x = shared_metrics[0];
+                        let mut backward_column = segment_column;
+                        let mut start_byte_index = id as i32 - 1;
+                        let tile_byte_start_i32 = tile_byte_start as i32;
+
+                        // Fast branch-free walk in on-chip SRAM while inside the current tile
+                        while backward_column >= 1 && start_byte_index >= tile_byte_start_i32 {
+                            let local_idx = start_byte_index as usize - tile_byte_start;
+                            let flag = (shared_tile_flags[local_idx >> 2] >> (((local_idx & 3) * 8) as u32)) & 0xFF;
+                            if (flag & F_LEADER) != 0 {
+                                backward_column -= 1;
+                            }
+                            if backward_column >= 1 {
+                                start_byte_index -= 1;
+                            }
+                        }
+
+                        // Rare fallback: only if the segment crossed before the tile boundary
+                        while backward_column >= 1 && start_byte_index >= 0 {
+                            if (flags_at(glyph_flags, start_byte_index as usize) & F_LEADER) != 0 {
+                                backward_column -= 1;
+                            }
+                            if backward_column >= 1 {
+                                start_byte_index -= 1;
+                            }
+                        }
+
+                        // Fast forward accumulation
+                        if start_byte_index >= tile_byte_start_i32 {
+                            let local_start = start_byte_index as usize - tile_byte_start;
                             let local_end = id - tile_byte_start;
-                            let mut local_idx = 0usize;
+                            let mut local_idx = local_start;
                             while local_idx < local_end {
-                                if (local_idx & 3) == 0 && local_idx + 4 <= local_end && (shared_tile_flags[local_idx >> 2] & 0x01010101) == 0x01010101 {
+                                let flag = (shared_tile_flags[local_idx >> 2] >> (((local_idx & 3) * 8) as u32)) & 0xFF;
+                                if (flag & F_LEADER) != 0 {
                                     current_advance_x += f32::from_bits(shared_counts[local_idx] as u32);
-                                    current_advance_x += f32::from_bits(shared_counts[local_idx + 1] as u32);
-                                    current_advance_x += f32::from_bits(shared_counts[local_idx + 2] as u32);
-                                    current_advance_x += f32::from_bits(shared_counts[local_idx + 3] as u32);
-                                    local_idx += 4;
-                                } else {
-                                    let flag = (shared_tile_flags[local_idx >> 2] >> (((local_idx & 3) * 8) as u32)) & 0xFF;
-                                    if (flag & F_LEADER) != 0 {
-                                        current_advance_x += f32::from_bits(shared_counts[local_idx] as u32);
-                                    }
-                                    local_idx += 1;
                                 }
+                                local_idx += 1;
                             }
                         } else {
-                            let mut lo = 0usize;
-                            let mut hi = unit_idx;
-                            while lo < hi {
-                                let mid = (lo + hi + 1) >> 1;
-                                if shared_counts[total_tile_bytes + mid] <= target_leader_col {
-                                    lo = mid;
-                                } else {
-                                    hi = mid - 1;
-                                }
-                            }
-                            let mut head_local = lo * bytes_per_thread;
-                            let head_end = head_local + bytes_per_thread;
-                            let mut cur_col = shared_counts[total_tile_bytes + lo];
-                            while head_local < head_end {
-                                let flag = (shared_tile_flags[head_local >> 2] >> (((head_local & 3) * 8) as u32)) & 0xFF;
-                                if (flag & F_LEADER) != 0 {
-                                    if cur_col == target_leader_col {
-                                        break;
+                            let mut forward_index = if start_byte_index >= 0 { start_byte_index as usize } else { 0usize };
+                            while forward_index < id {
+                                if (flags_at(glyph_flags, forward_index) & F_LEADER) != 0 {
+                                    let flag = flags_at(glyph_flags, forward_index);
+                                    if (flag & F_CLUSTER_HEAD) != 0 {
+                                        current_advance_x += bitmap_advance;
+                                    } else if (flag & F_CLUSTER_TRAILER) != 0 {
+                                        // trailer contributes 0.0 advance
+                                    } else {
+                                        let lead_byte = byte_at(bytes, forward_index, total_bytes);
+                                        if lead_byte < 128u32 {
+                                            let entry_offset = (ascii_block_base | lead_byte) as usize;
+                                            current_advance_x += trie_block_metrics[entry_offset * 2];
+                                        } else {
+                                            let cp_len = seq_len_at(bytes, forward_index, total_bytes);
+                                            let cp = cp_at(bytes, forward_index, cp_len, total_bytes);
+                                            let (adv, _) = decode_trie(cp, trie_block_indices, trie_block_metrics, trie_block_codepoints, trie_block_shift);
+                                            current_advance_x += adv;
+                                        }
                                     }
-                                    cur_col += 1;
                                 }
-                                head_local += 1;
-                            }
-                            let local_end = id - tile_byte_start;
-                            let mut local_idx = head_local;
-                            while local_idx < local_end {
-                                if (local_idx & 3) == 0 && local_idx + 4 <= local_end && (shared_tile_flags[local_idx >> 2] & 0x01010101) == 0x01010101 {
-                                    current_advance_x += f32::from_bits(shared_counts[local_idx] as u32);
-                                    current_advance_x += f32::from_bits(shared_counts[local_idx + 1] as u32);
-                                    current_advance_x += f32::from_bits(shared_counts[local_idx + 2] as u32);
-                                    current_advance_x += f32::from_bits(shared_counts[local_idx + 3] as u32);
-                                    local_idx += 4;
-                                } else {
-                                    let flag = (shared_tile_flags[local_idx >> 2] >> (((local_idx & 3) * 8) as u32)) & 0xFF;
-                                    if (flag & F_LEADER) != 0 {
-                                        current_advance_x += f32::from_bits(shared_counts[local_idx] as u32);
-                                    }
-                                    local_idx += 1;
-                                }
+                                forward_index += 1;
                             }
                         }
                     } else if fold_unit == 0 {

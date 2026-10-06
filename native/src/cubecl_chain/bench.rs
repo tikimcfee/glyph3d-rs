@@ -579,6 +579,7 @@ pub fn bench(ctx: &GpuContext, corpus_path: &Path) -> ! {
                         BufferArg::from_raw_parts(h_bm.clone(), bm.len()),
                         BufferArg::from_raw_parts(h_bc.clone(), bc.len()),
                         bshift,
+                        bitmap_advance,
                         BufferArg::from_raw_parts(h_item_desc.clone(), ITEM_DESC_STRIDE),
                         BufferArg::from_raw_parts(h_tc.clone(), n_tiles * PARTIAL_COUNT_STRIDE),
                         BufferArg::from_raw_parts(h_tm.clone(), n_tiles),
