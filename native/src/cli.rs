@@ -3,6 +3,7 @@
 //! parity tests.
 
 pub mod args;
+pub mod command;
 pub mod ops;
 pub mod parsers;
 
@@ -10,5 +11,6 @@ pub mod parsers;
 mod tests;
 
 pub use args::*;
+pub use command::*;
 pub use ops::*;
 pub use parsers::*;

@@ -39,7 +39,7 @@ pub struct PickContext {
 }
 
 /// A pick request — scripted (CLI) or interactive (click).
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub enum PickCommand {
     /// Group-level pick: first file whose rel path contains the substring.
     File(String),
@@ -51,7 +51,7 @@ pub enum PickCommand {
 
 /// A manipulation verb, applied to the current pick. Instance verbs need a
 /// glyph pick; group verbs need at least a file pick.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub enum Verb {
     /// Recolor the picked glyph (packed sRGB rgb, alpha kept 255).
     RecolorGlyph([u8; 3]),

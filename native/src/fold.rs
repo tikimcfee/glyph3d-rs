@@ -83,7 +83,8 @@ pub const TRIE_FLAG_MISSING: u32 = 1;
 /// surface WIDER, not narrower. What keeps the scan form safe is structural and
 /// unchanged: an item boundary emits a resetting leaf, so no interval without a reset
 /// spans two items. See `scan::tests::mixed_mode_is_outside_the_monoid_s_domain`.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, clap::ValueEnum)]
+#[value(rename_all = "lower")]
 pub enum WrapMode {
     /// A wrap advances the visual row. The DERIVE default only because its
     /// wire code is 0 (see `code`) — the production default is `Back`
@@ -92,6 +93,26 @@ pub enum WrapMode {
     Down,
     /// A wrap keeps the row and steps only in depth.
     Back,
+}
+
+impl std::fmt::Display for WrapMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            WrapMode::Down => write!(f, "down"),
+            WrapMode::Back => write!(f, "back"),
+        }
+    }
+}
+
+impl std::str::FromStr for WrapMode {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "down" => Ok(WrapMode::Down),
+            "back" => Ok(WrapMode::Back),
+            other => Err(format!("unknown wrap mode {other:?}")),
+        }
+    }
 }
 
 impl WrapMode {
@@ -125,11 +146,32 @@ impl WrapMode {
 /// the variation selectors, the tags) never occupy a cell. Records stay per
 /// leader either way: ROW/COL, the witness lanes, and the pick cross-check do
 /// not move.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, clap::ValueEnum)]
+#[value(rename_all = "lower")]
 pub enum ClusterMode {
     #[default]
     Leader,
     Cluster,
+}
+
+impl std::fmt::Display for ClusterMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ClusterMode::Leader => write!(f, "leader"),
+            ClusterMode::Cluster => write!(f, "cluster"),
+        }
+    }
+}
+
+impl std::str::FromStr for ClusterMode {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "leader" => Ok(ClusterMode::Leader),
+            "cluster" => Ok(ClusterMode::Cluster),
+            other => Err(format!("unknown cluster mode {other:?}")),
+        }
+    }
 }
 
 impl ClusterMode {

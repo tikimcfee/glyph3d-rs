@@ -3,6 +3,7 @@ use crate::glyph_scene::{PickCommand, Verb};
 use super::args::RawOps;
 
 /// Stage G: one scripted operation (picks and verbs interleave in CLI order).
+#[derive(Clone, Debug)]
 pub enum Op {
     Pick(PickCommand),
     Verb(Verb),

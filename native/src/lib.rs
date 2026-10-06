@@ -44,6 +44,7 @@ pub const OFFSCREEN_WIDTH: u32 = 1600;
 pub const OFFSCREEN_HEIGHT: u32 = 1000;
 
 /// Which scene a run mode builds.
+#[derive(Clone, Debug)]
 pub enum SceneChoice {
     /// Stage A stress demo (1M colored quads).
     Demo,

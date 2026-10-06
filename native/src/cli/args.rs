@@ -5,6 +5,48 @@ use super::parsers::*;
 use crate::glyph_scene::Verb;
 
 
+/// Windowed presentation mode.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, clap::ValueEnum)]
+#[value(rename_all = "lower")]
+pub enum PresentMode {
+    #[default]
+    Fifo,
+    Mailbox,
+    Immediate,
+}
+
+impl From<PresentMode> for wgpu::PresentMode {
+    fn from(m: PresentMode) -> Self {
+        match m {
+            PresentMode::Fifo => wgpu::PresentMode::Fifo,
+            PresentMode::Mailbox => wgpu::PresentMode::Mailbox,
+            PresentMode::Immediate => wgpu::PresentMode::Immediate,
+        }
+    }
+}
+
+impl std::fmt::Display for PresentMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PresentMode::Fifo => write!(f, "fifo"),
+            PresentMode::Mailbox => write!(f, "mailbox"),
+            PresentMode::Immediate => write!(f, "immediate"),
+        }
+    }
+}
+
+impl std::str::FromStr for PresentMode {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "fifo" => Ok(PresentMode::Fifo),
+            "mailbox" => Ok(PresentMode::Mailbox),
+            "immediate" => Ok(PresentMode::Immediate),
+            other => Err(format!("unknown present mode {other:?}")),
+        }
+    }
+}
+
 /// Long-form help tail: the mode summary + verb reference + windowed keys from
 /// the hand-rolled parser's --help (nothing user-facing was dropped).
 const AFTER_LONG_HELP: &str = "\
@@ -107,8 +149,8 @@ pub struct Cli {
     /// chunk rather than the corpus. The record strategies remain because they
     /// are the verification form: `VerifyLayout` needs a wire stream, and
     /// `--repo-verify` diffs whichever pair you name.
-    #[arg(long, value_name = "MODE", default_value = "hyper", value_parser = ["naive", "batch", "direct", "cubecl", "hyper"])]
-    pub repo_engine: String,
+    #[arg(long, value_name = "MODE", default_value = "hyper")]
+    pub repo_engine: crate::repo::Strategy,
     /// Diff the chosen strategy against a counterpart, bit-exact over the
     /// whole repo: placements and instances always, wire records when both
     /// paths have them (`direct` has none, and the PASS line says so).
@@ -119,8 +161,8 @@ pub struct Cli {
     /// under; `repo-down` covers the other) keeps the row and steps the
     /// segment back in depth instead — one row per source line however long
     /// it is. `down` advances the visual row per wrap.
-    #[arg(long, value_name = "MODE", default_value = "back", value_parser = ["down", "back"])]
-    pub wrap_mode: String,
+    #[arg(long, value_name = "MODE", default_value = "back")]
+    pub wrap_mode: crate::fold::WrapMode,
     /// The wrap staircase's pitch: z step per intra-line wrap segment, as a
     /// multiple of the em cell height (`RepoParams::z_wrap_spacing` — the
     /// web's `zWrapSpacing`). 0 restores the flat layout exactly
@@ -136,17 +178,17 @@ pub struct Cli {
     /// tones, keycaps) to single slots with trailing leaders zeroed; `leader`
     /// is one glyph per UTF-8 leader. The emoji baselines pin `leader`
     /// explicitly.
-    #[arg(long, value_name = "MODE", default_value = "cluster", value_parser = ["leader", "cluster"])]
-    pub cluster_mode: String,
+    #[arg(long, value_name = "MODE", default_value = "cluster")]
+    pub cluster_mode: crate::fold::ClusterMode,
     /// Spatial arrangement mode for the repository files across the canvas:
     /// `shelf` (default: height-classed shelves across the whole repo) or
     /// `carrel` (hierarchical directory-based neighborhood carrels).
-    #[arg(long, value_name = "MODE", default_value = "shelf", value_parser = ["shelf", "carrel"])]
-    pub layout_mode: String,
+    #[arg(long, value_name = "MODE", default_value = "shelf")]
+    pub layout_mode: crate::repo::RepoLayoutMode,
     /// Syntax color mode on repo load: `flat` (default: fast geometric load with extension-based LOD tint, awaiting external colorization)
     /// or `syntax` (eager CPU lexer during load)
-    #[arg(long, value_name = "MODE", default_value = "flat", value_parser = ["syntax", "flat"])]
-    pub color_mode: String,
+    #[arg(long, value_name = "MODE", default_value = "flat")]
+    pub color_mode: crate::repo::ColorMode,
     /// Stage E2: frame the first file whose path contains SUBSTR
     #[arg(long, value_name = "SUBSTR")]
     pub focus_file: Option<String>,
@@ -247,8 +289,8 @@ pub struct Cli {
     /// vsync, so the FPS line reads the monitor's refresh; `mailbox` and
     /// `immediate` uncap it where the surface supports them (else fifo, and
     /// the log says so). Offscreen renders never present and ignore this.
-    #[arg(long, value_name = "MODE", default_value = "fifo", value_parser = ["fifo", "mailbox", "immediate"])]
-    pub present_mode: String,
+    #[arg(long, value_name = "MODE", default_value = "fifo")]
+    pub present_mode: PresentMode,
     /// Stage G op-stream flags, captured per-flag by clap and re-interleaved
     /// into `ops` by build_ops().
     #[command(flatten)]
@@ -333,8 +375,12 @@ pub fn parse_cli_from(matches: clap::ArgMatches) -> Cli {
                 if matches.value_source("wrap_mode")
                     != Some(clap::parser::ValueSource::CommandLine)
                 {
-                    if let Some(wm) = cfg.wrap_mode {
-                        cli.wrap_mode = wm;
+                    if let Some(wm) = &cfg.wrap_mode {
+                        if let Ok(parsed) = wm.parse::<crate::fold::WrapMode>() {
+                            cli.wrap_mode = parsed;
+                        } else {
+                            log::warn!("unknown wrap_mode in launch config: '{wm}'");
+                        }
                     }
                 }
                 if matches.value_source("z_wrap_spacing")
@@ -347,15 +393,23 @@ pub fn parse_cli_from(matches: clap::ArgMatches) -> Cli {
                 if matches.value_source("cluster_mode")
                     != Some(clap::parser::ValueSource::CommandLine)
                 {
-                    if let Some(cm) = cfg.cluster_mode {
-                        cli.cluster_mode = cm;
+                    if let Some(cm) = &cfg.cluster_mode {
+                        if let Ok(parsed) = cm.parse::<crate::fold::ClusterMode>() {
+                            cli.cluster_mode = parsed;
+                        } else {
+                            log::warn!("unknown cluster_mode in launch config: '{cm}'");
+                        }
                     }
                 }
                 if matches.value_source("color_mode")
                     != Some(clap::parser::ValueSource::CommandLine)
                 {
-                    if let Some(cm) = cfg.color_mode {
-                        cli.color_mode = cm;
+                    if let Some(cm) = &cfg.color_mode {
+                        if let Ok(parsed) = cm.parse::<crate::repo::ColorMode>() {
+                            cli.color_mode = parsed;
+                        } else {
+                            log::warn!("unknown color_mode in launch config: '{cm}'");
+                        }
                     }
                 }
                 if matches.value_source("no_cull")

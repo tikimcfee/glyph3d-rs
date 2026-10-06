@@ -1,16 +1,9 @@
 use crate::fold;
 
-/// `--wrap-mode` -> the layout parameter. clap's `value_parser` has already
-/// refused anything that is not one of the two spellings, so an unknown value
-/// here is a bug in this function rather than in the caller's command line —
-/// which is why it panics instead of falling back to the default. A silent
-/// fallback would render mode A while the operator believed they asked for B.
+/// `--wrap-mode` -> the layout parameter. Delegates to WrapMode's FromStr implementation.
 pub fn parse_wrap_mode(s: &str) -> fold::WrapMode {
-    match s {
-        "down" => fold::WrapMode::Down,
-        "back" => fold::WrapMode::Back,
-        other => panic!("--wrap-mode: unknown mode {other:?} (clap should have refused it)"),
-    }
+    s.parse()
+        .unwrap_or_else(|e| panic!("--wrap-mode: {e} (clap should have refused it)"))
 }
 
 /// `--z-wrap-spacing` validation, run by clap at parse time. NaN must be
@@ -32,61 +25,35 @@ pub fn parse_z_wrap_spacing(s: &str) -> Result<f64, String> {
     Ok(v)
 }
 
-/// Panics on an unknown strategy for the same reason `parse_wrap_mode` does:
-/// clap has already refused anything else, so reaching here means the parser
-/// and this match disagree, and silently loading with the wrong strategy would
-/// make a verification run compare something other than what was asked for.
+/// Parse strategy string into `Strategy`, with compile-time cubecl feature guard.
 pub fn parse_strategy(s: &str) -> crate::repo::Strategy {
-    use crate::repo::Strategy;
-    match s {
-        "naive" => Strategy::PerItem,
-        "batch" => Strategy::Batched,
-        "direct" => Strategy::Direct,
-        "cubecl" => {
-            #[cfg(feature = "cubecl")]
-            {
-                Strategy::Cubecl
-            }
-            #[cfg(not(feature = "cubecl"))]
-            {
-                eprintln!("error: --repo-engine cubecl was not compiled into this binary (rebuild with `cargo run --features cubecl`)");
-                std::process::exit(1);
-            }
-        }
-        "hyper" => Strategy::Hyper,
-        other => panic!("--repo-engine: unknown mode {other:?} (clap should have refused it)"),
+    let strategy: crate::repo::Strategy = s
+        .parse()
+        .unwrap_or_else(|e| panic!("--repo-engine: {e} (clap should have refused it)"));
+    #[cfg(not(feature = "cubecl"))]
+    if strategy == crate::repo::Strategy::Cubecl {
+        eprintln!("error: --repo-engine cubecl was not compiled into this binary (rebuild with `cargo run --features cubecl`)");
+        std::process::exit(1);
     }
+    strategy
 }
 
-/// `--cluster-mode` -> the layout parameter. Same shape as `parse_wrap_mode`:
-/// clap has already refused anything that is not one of the two spellings, so
-/// an unknown value here is a bug in this function rather than in the caller's
-/// command line — a silent fallback would render mode A while the operator
-/// believed they asked for B.
+/// `--cluster-mode` -> the layout parameter. Delegates to ClusterMode's FromStr.
 pub fn parse_cluster_mode(s: &str) -> fold::ClusterMode {
-    match s {
-        "leader" => fold::ClusterMode::Leader,
-        "cluster" => fold::ClusterMode::Cluster,
-        other => panic!("--cluster-mode: unknown mode {other:?} (clap should have refused it)"),
-    }
+    s.parse()
+        .unwrap_or_else(|e| panic!("--cluster-mode: {e} (clap should have refused it)"))
 }
 
-/// `--layout-mode` -> the layout parameter. Same shape as `parse_wrap_mode`:
+/// `--layout-mode` -> the layout parameter. Delegates to RepoLayoutMode's FromStr.
 pub fn parse_layout_mode(s: &str) -> crate::repo::RepoLayoutMode {
-    match s {
-        "shelf" => crate::repo::RepoLayoutMode::Shelf,
-        "carrel" => crate::repo::RepoLayoutMode::Carrel,
-        other => panic!("--layout-mode: unknown mode {other:?} (clap should have refused it)"),
-    }
+    s.parse()
+        .unwrap_or_else(|e| panic!("--layout-mode: {e} (clap should have refused it)"))
 }
 
-/// `--color-mode` -> the repo syntax color mode.
+/// `--color-mode` -> the repo syntax color mode. Delegates to ColorMode's FromStr.
 pub fn parse_color_mode(s: &str) -> crate::repo::ColorMode {
-    match s {
-        "syntax" => crate::repo::ColorMode::Syntax,
-        "flat" => crate::repo::ColorMode::Flat,
-        other => panic!("--color-mode: unknown mode {other:?} (clap should have refused it)"),
-    }
+    s.parse()
+        .unwrap_or_else(|e| panic!("--color-mode: {e} (clap should have refused it)"))
 }
 
 /// Parse comma-separated RGBA float string into `[f32; 4]`
@@ -103,11 +70,10 @@ pub fn parse_rgba(s: &str) -> Result<[f32; 4], String> {
     Ok(out)
 }
 
-/// clap has already refused anything outside the three spellings.
+/// Parse windowed present mode string.
 pub fn parse_present_mode(s: &str) -> wgpu::PresentMode {
-    match s {
-        "mailbox" => wgpu::PresentMode::Mailbox,
-        "immediate" => wgpu::PresentMode::Immediate,
-        _ => wgpu::PresentMode::Fifo,
-    }
+    let mode: super::args::PresentMode = s
+        .parse()
+        .unwrap_or_else(|e| panic!("--present-mode: {e} (clap should have refused it)"));
+    mode.into()
 }

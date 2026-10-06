@@ -3,6 +3,7 @@ use clap::CommandFactory;
 use super::*;
 use crate::fold;
 use crate::glyph_scene::{PickCommand, Verb};
+use crate::SceneChoice;
 
 fn try_parse(args: &[&str]) -> Result<Cli, clap::Error> {
     let argv = std::iter::once("glyph3d-native").chain(args.iter().copied());
@@ -28,12 +29,12 @@ fn defaults_match_old_parser() {
     assert!(cli.engine_render.is_none());
     assert!(cli.load_repo.is_none());
     // The DEFAULT is `hyper` (pure-Rust parallel direct engine).
-    assert_eq!(cli.repo_engine, "hyper");
+    assert_eq!(cli.repo_engine, crate::repo::Strategy::Hyper);
     // THE DEFAULT THE SCREENSHOT BASELINES DEPEND ON. A change here moves
     // repo-wide.png and repo-zoom.png, so it is pinned in the CLI layer too
     // and not only in RepoParams::default.
-    assert_eq!(cli.wrap_mode, "back");
-    assert_eq!(parse_wrap_mode(&cli.wrap_mode), fold::WrapMode::Back);
+    assert_eq!(cli.wrap_mode, fold::WrapMode::Back);
+    assert_eq!(parse_wrap_mode("back"), fold::WrapMode::Back);
     // ...and the non-default is still reachable and still spelled the same.
     assert_eq!(parse_wrap_mode("down"), fold::WrapMode::Down);
     // Same standing as wrap_mode: the wrap staircase's pitch moves the
@@ -42,15 +43,15 @@ fn defaults_match_old_parser() {
     assert_eq!(cli.z_wrap_spacing, 0.15);
     // The sequence pass: cluster is the default (since 2026-09-22); leader
     // is the reachable other spelling, and the emoji view pins it by hand.
-    assert_eq!(cli.cluster_mode, "cluster");
-    assert_eq!(parse_cluster_mode(&cli.cluster_mode), fold::ClusterMode::Cluster);
+    assert_eq!(cli.cluster_mode, fold::ClusterMode::Cluster);
+    assert_eq!(parse_cluster_mode("cluster"), fold::ClusterMode::Cluster);
     assert_eq!(parse_cluster_mode("leader"), fold::ClusterMode::Leader);
-    assert_eq!(cli.layout_mode, "shelf");
-    assert_eq!(parse_layout_mode(&cli.layout_mode), crate::repo::RepoLayoutMode::Shelf);
+    assert_eq!(cli.layout_mode, crate::repo::RepoLayoutMode::Shelf);
+    assert_eq!(parse_layout_mode("shelf"), crate::repo::RepoLayoutMode::Shelf);
     assert_eq!(parse_layout_mode("carrel"), crate::repo::RepoLayoutMode::Carrel);
     // Syntax color mode: flat is the default for instant geometric load without unneeded color allocations.
-    assert_eq!(cli.color_mode, "flat");
-    assert_eq!(parse_color_mode(&cli.color_mode), crate::repo::ColorMode::Flat);
+    assert_eq!(cli.color_mode, crate::repo::ColorMode::Flat);
+    assert_eq!(parse_color_mode("flat"), crate::repo::ColorMode::Flat);
     assert_eq!(parse_color_mode("syntax"), crate::repo::ColorMode::Syntax);
     assert!(!cli.repo_verify);
     assert!(cli.focus_file.is_none());
@@ -74,8 +75,8 @@ fn defaults_match_old_parser() {
     // Fifo is the default because it is what every FPS figure before
     // 2026-09-07 was measured under; changing it would make old numbers
     // incomparable without saying so.
-    assert_eq!(cli.present_mode, "fifo");
-    assert_eq!(parse_present_mode(&cli.present_mode), wgpu::PresentMode::Fifo);
+    assert_eq!(cli.present_mode, PresentMode::Fifo);
+    assert_eq!(parse_present_mode("fifo"), wgpu::PresentMode::Fifo);
 }
 
 #[test]
@@ -96,8 +97,8 @@ fn scalar_flags_parse() {
         "--emoji-sheet", "sheets/other.bin",
     ]);
     assert_eq!(cli.emoji_sheet, Some(PathBuf::from("sheets/other.bin")));
-    assert_eq!(cli.present_mode, "mailbox");
-    assert_eq!(parse_present_mode(&cli.present_mode), wgpu::PresentMode::Mailbox);
+    assert_eq!(cli.present_mode, PresentMode::Mailbox);
+    assert_eq!(parse_present_mode("mailbox"), wgpu::PresentMode::Mailbox);
     assert!(cli.gpu_key);
     assert!(cli.gpu_profile);
     assert_eq!(cli.screenshot, Some(PathBuf::from("out.png")));
@@ -112,16 +113,12 @@ fn scalar_flags_parse() {
     assert_eq!(cli.file_bg_color, Some([0.15, 0.15, 0.20, 0.80]));
     assert_eq!(cli.lod_min_px, Some(2.0));
     assert_eq!(cli.load_repo, Some(PathBuf::from("fixtures/g-pick-repo")));
-    assert_eq!(cli.repo_engine, "batch");
-    assert_eq!(cli.wrap_mode, "back");
-    assert_eq!(parse_wrap_mode(&cli.wrap_mode), fold::WrapMode::Back);
+    assert_eq!(cli.repo_engine, crate::repo::Strategy::Batched);
+    assert_eq!(cli.wrap_mode, fold::WrapMode::Back);
     assert_eq!(cli.z_wrap_spacing, 0.6);
-    assert_eq!(cli.cluster_mode, "cluster");
-    assert_eq!(parse_cluster_mode(&cli.cluster_mode), fold::ClusterMode::Cluster);
-    assert_eq!(cli.layout_mode, "carrel");
-    assert_eq!(parse_layout_mode(&cli.layout_mode), crate::repo::RepoLayoutMode::Carrel);
-    assert_eq!(cli.color_mode, "flat");
-    assert_eq!(parse_color_mode(&cli.color_mode), crate::repo::ColorMode::Flat);
+    assert_eq!(cli.cluster_mode, fold::ClusterMode::Cluster);
+    assert_eq!(cli.layout_mode, crate::repo::RepoLayoutMode::Carrel);
+    assert_eq!(cli.color_mode, crate::repo::ColorMode::Flat);
     assert!(cli.repo_verify);
     assert_eq!(cli.focus_file.as_deref(), Some("alpha"));
     assert_eq!(cli.render_file, Some(PathBuf::from("src/main.rs")));
@@ -467,7 +464,7 @@ fn launch_config_file_merging() {
     assert_eq!(cli.file_bg_color, Some([0.2, 0.3, 0.4, 0.9]));
     assert_eq!(cli.lod_min_px, Some(3.5));
     assert!(cli.no_greeking);
-    assert_eq!(cli.wrap_mode, "back"); // CLI flag overrode TOML config
+    assert_eq!(cli.wrap_mode, fold::WrapMode::Back); // CLI flag overrode TOML config
 }
 
 #[test]
@@ -493,4 +490,52 @@ fn launch_config_greek_pure_merging() {
     assert!(cli.greek_pure);
     assert_eq!(cli.greek_onset_px, Some(15.0));
 }
+
+#[test]
+fn cli_action_dispatch_variants() {
+    // 1. Completion
+    let cli = parse(&["--generate", "bash"]);
+    assert!(matches!(cli.action(), CliCommand::GenerateCompletion { shell: clap_complete::Shell::Bash }));
+
+    // 2. GpuInfo
+    let cli = parse(&["--gpu-key"]);
+    assert!(matches!(cli.action(), CliCommand::GpuInfo(GpuInfoMode::Key)));
+    let cli = parse(&["--gpu-profile"]);
+    assert!(matches!(cli.action(), CliCommand::GpuInfo(GpuInfoMode::Profile)));
+
+    // 3. Fixture
+    let cli = parse(&["--fixture-manifest", "a.bin"]);
+    assert!(matches!(cli.action(), CliCommand::Fixture(FixtureTask::Manifest(_))));
+
+    // 4. RepoScanOnly
+    let cli = parse(&["--load-repo", "some/dir", "--repo-scan-only"]);
+    assert!(matches!(cli.action(), CliCommand::RepoScanOnly { .. }));
+
+    // 5. Render: Demo
+    let cli = parse(&["--demo"]);
+    match cli.action() {
+        CliCommand::Render(plan) => {
+            assert!(matches!(plan.choice, SceneChoice::Demo));
+            assert!(matches!(plan.target, RenderTarget::Windowed { .. }));
+        }
+        other => panic!("expected Render, got {other:?}"),
+    }
+
+    // 6. Render: Offscreen
+    let cli = parse(&["--screenshot", "out.png", "--frames", "3"]);
+    match cli.action() {
+        CliCommand::Render(plan) => {
+            assert!(matches!(plan.choice, SceneChoice::Text { .. }));
+            match plan.target {
+                RenderTarget::Offscreen { path, frames, .. } => {
+                    assert_eq!(path, PathBuf::from("out.png"));
+                    assert_eq!(frames, 3);
+                }
+                _ => panic!("expected Offscreen"),
+            }
+        }
+        other => panic!("expected Render, got {other:?}"),
+    }
+}
+
 

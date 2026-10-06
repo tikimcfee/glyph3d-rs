@@ -30,14 +30,45 @@ use crate::text::{self, StagedText};
 pub use crate::layout_stack::{LayoutController, LayoutStack, LayoutZone, SpatialLayoutStrategy};
 
 /// Layout engine strategy.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, clap::ValueEnum)]
 pub enum Strategy {
     #[default]
+    #[value(name = "hyper")]
     Hyper,
+    #[value(name = "direct")]
     Direct,
+    #[value(name = "batch")]
     Batched,
+    #[value(name = "naive")]
     PerItem,
+    #[value(name = "cubecl")]
     Cubecl,
+}
+
+impl std::fmt::Display for Strategy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Strategy::Hyper => write!(f, "hyper"),
+            Strategy::Direct => write!(f, "direct"),
+            Strategy::Batched => write!(f, "batch"),
+            Strategy::PerItem => write!(f, "naive"),
+            Strategy::Cubecl => write!(f, "cubecl"),
+        }
+    }
+}
+
+impl std::str::FromStr for Strategy {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "hyper" => Ok(Strategy::Hyper),
+            "direct" => Ok(Strategy::Direct),
+            "batch" => Ok(Strategy::Batched),
+            "naive" => Ok(Strategy::PerItem),
+            "cubecl" => Ok(Strategy::Cubecl),
+            other => Err(format!("unknown strategy {other:?}")),
+        }
+    }
 }
 
 impl Strategy {
@@ -146,7 +177,8 @@ pub struct RepoParams {
     pub field_mode: glyph_field::GlyphFieldMode,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
+#[value(rename_all = "lower")]
 pub enum RepoLayoutMode {
     /// Traditional height-classed shelf packing across the whole repo.
     #[default]
@@ -155,8 +187,29 @@ pub enum RepoLayoutMode {
     Carrel,
 }
 
+impl std::fmt::Display for RepoLayoutMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RepoLayoutMode::Shelf => write!(f, "shelf"),
+            RepoLayoutMode::Carrel => write!(f, "carrel"),
+        }
+    }
+}
+
+impl std::str::FromStr for RepoLayoutMode {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "shelf" => Ok(RepoLayoutMode::Shelf),
+            "carrel" => Ok(RepoLayoutMode::Carrel),
+            other => Err(format!("unknown layout mode {other:?}")),
+        }
+    }
+}
+
 /// Colorization strategy during repo load.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, clap::ValueEnum)]
+#[value(rename_all = "lower")]
 pub enum ColorMode {
     /// Eager CPU syntax coloring during load via colorize_leaders (default, preserves all goldens).
     #[default]
@@ -164,6 +217,26 @@ pub enum ColorMode {
     /// Fast geometric ingestion: uniform base color for glyphs, file-extension map for LOD backdrop tint.
     /// Defers per-glyph syntax coloring to external/asynchronous flows.
     Flat,
+}
+
+impl std::fmt::Display for ColorMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ColorMode::Syntax => write!(f, "syntax"),
+            ColorMode::Flat => write!(f, "flat"),
+        }
+    }
+}
+
+impl std::str::FromStr for ColorMode {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "syntax" => Ok(ColorMode::Syntax),
+            "flat" => Ok(ColorMode::Flat),
+            other => Err(format!("unknown color mode {other:?}")),
+        }
+    }
 }
 
 impl Default for RepoParams {
