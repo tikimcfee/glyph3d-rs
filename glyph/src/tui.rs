@@ -1,0 +1,1347 @@
+//! Interactive launcher TUI for glyph3d-native.
+//!
+//! Provides a mission-control terminal interface for configuring launch
+//! flags, inspecting hardware/GPU profile and build currency, and launching
+//! the 3D windowed renderer with a clean terminal handoff.
+
+use crossterm::{
+    event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
+    execute,
+    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+};
+use ratatui::{
+    backend::CrosstermBackend,
+    layout::{Alignment, Constraint, Direction, Layout, Rect},
+    style::{Color, Style, Stylize},
+    text::{Line, Span},
+    widgets::{Block, BorderType, Borders, Paragraph},
+    Frame, Terminal,
+};
+use serde::Deserialize;
+use std::io::{self, stdout, Stdout};
+use std::path::PathBuf;
+use std::process::Command;
+
+use crate::{gpu_key, gpu_profile, is_current, root, Manifest};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TargetMode {
+    Repo,
+    File,
+    Demo,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LayoutMode {
+    Shelf,
+    Carrel,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WrapMode {
+    Back,
+    Down,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ColorMode {
+    Syntax,
+    Flat,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClusterMode {
+    Cluster,
+    Leader,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RepoEngine {
+    Hyper,
+    Direct,
+    Batch,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PresentMode {
+    Fifo,
+    Mailbox,
+    Immediate,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FocusField {
+    TargetMode,
+    RepoPath,
+    FocusFile,
+    FilePath,
+    LayoutMode,
+    WrapMode,
+    RepoEngine,
+    ColorMode,
+    ClusterMode,
+    Greeking,
+    FileBackgrounds,
+    Cull,
+    UiOverlay,
+    PresentMode,
+}
+
+impl FocusField {
+    pub const ALL: &'static [FocusField] = &[
+        FocusField::TargetMode,
+        FocusField::RepoPath,
+        FocusField::FocusFile,
+        FocusField::FilePath,
+        FocusField::LayoutMode,
+        FocusField::WrapMode,
+        FocusField::RepoEngine,
+        FocusField::ColorMode,
+        FocusField::ClusterMode,
+        FocusField::Greeking,
+        FocusField::FileBackgrounds,
+        FocusField::Cull,
+        FocusField::UiOverlay,
+        FocusField::PresentMode,
+    ];
+
+    pub fn is_text_input(self) -> bool {
+        matches!(
+            self,
+            FocusField::RepoPath | FocusField::FocusFile | FocusField::FilePath
+        )
+    }
+
+    pub fn next(self, target: TargetMode) -> Self {
+        let mut idx = Self::ALL.iter().position(|&f| f == self).unwrap_or(0);
+        loop {
+            idx = (idx + 1) % Self::ALL.len();
+            let candidate = Self::ALL[idx];
+            if candidate.is_applicable(target) {
+                return candidate;
+            }
+        }
+    }
+
+    pub fn prev(self, target: TargetMode) -> Self {
+        let mut idx = Self::ALL.iter().position(|&f| f == self).unwrap_or(0);
+        loop {
+            idx = if idx == 0 { Self::ALL.len() - 1 } else { idx - 1 };
+            let candidate = Self::ALL[idx];
+            if candidate.is_applicable(target) {
+                return candidate;
+            }
+        }
+    }
+
+    pub fn is_applicable(self, target: TargetMode) -> bool {
+        match self {
+            FocusField::RepoPath | FocusField::FocusFile | FocusField::LayoutMode
+            | FocusField::RepoEngine => target == TargetMode::Repo,
+            FocusField::FilePath => target == TargetMode::File,
+            _ => true,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct FileLaunchConfig {
+    file_backgrounds: Option<bool>,
+    wrap_mode: Option<String>,
+    z_wrap_spacing: Option<f64>,
+    cluster_mode: Option<String>,
+    color_mode: Option<String>,
+    no_cull: Option<bool>,
+    no_ui: Option<bool>,
+    greeking: Option<bool>,
+    load_repo: Option<String>,
+}
+
+pub struct LauncherState {
+    pub target: TargetMode,
+    pub repo_path: String,
+    pub focus_file: String,
+    pub file_path: String,
+    pub layout_mode: LayoutMode,
+    pub wrap_mode: WrapMode,
+    pub color_mode: ColorMode,
+    pub cluster_mode: ClusterMode,
+    pub repo_engine: RepoEngine,
+    pub present_mode: PresentMode,
+    pub file_backgrounds: bool,
+    pub greeking: bool,
+    pub cull: bool,
+    pub ui_overlay: bool,
+    pub z_wrap_spacing: f64,
+    pub focus: FocusField,
+    pub status_message: String,
+    pub config_source: Option<String>,
+}
+
+impl LauncherState {
+    pub fn new() -> Self {
+        let mut state = Self {
+            target: TargetMode::Repo,
+            repo_path: ".".to_string(),
+            focus_file: String::new(),
+            file_path: "native/src/main.rs".to_string(),
+            layout_mode: LayoutMode::Shelf,
+            wrap_mode: WrapMode::Back,
+            color_mode: ColorMode::Syntax,
+            cluster_mode: ClusterMode::Cluster,
+            repo_engine: RepoEngine::Hyper,
+            present_mode: PresentMode::Fifo,
+            file_backgrounds: true,
+            greeking: true,
+            cull: true,
+            ui_overlay: true,
+            z_wrap_spacing: 0.15,
+            focus: FocusField::TargetMode,
+            status_message: "Ready to launch".to_string(),
+            config_source: None,
+        };
+        state.load_config_file();
+        state
+    }
+
+    pub fn load_config_file(&mut self) {
+        let candidates = [
+            PathBuf::from("launch_config.toml"),
+            root().join("launch_config.toml"),
+        ];
+        for path in &candidates {
+            if path.is_file() {
+                if let Ok(content) = std::fs::read_to_string(path) {
+                    if let Ok(cfg) = toml::from_str::<FileLaunchConfig>(&content) {
+                        if let Some(fb) = cfg.file_backgrounds {
+                            self.file_backgrounds = fb;
+                        }
+                        if let Some(zw) = cfg.z_wrap_spacing {
+                            self.z_wrap_spacing = zw;
+                        }
+                        if let Some(wm) = cfg.wrap_mode.as_deref() {
+                            self.wrap_mode = match wm {
+                                "down" => WrapMode::Down,
+                                _ => WrapMode::Back,
+                            };
+                        }
+                        if let Some(cm) = cfg.color_mode.as_deref() {
+                            self.color_mode = match cm {
+                                "flat" => ColorMode::Flat,
+                                _ => ColorMode::Syntax,
+                            };
+                        }
+                        if let Some(cl) = cfg.cluster_mode.as_deref() {
+                            self.cluster_mode = match cl {
+                                "leader" => ClusterMode::Leader,
+                                _ => ClusterMode::Cluster,
+                            };
+                        }
+                        if let Some(nc) = cfg.no_cull {
+                            self.cull = !nc;
+                        }
+                        if let Some(nu) = cfg.no_ui {
+                            self.ui_overlay = !nu;
+                        }
+                        if let Some(gr) = cfg.greeking {
+                            self.greeking = gr;
+                        }
+                        if let Some(lr) = cfg.load_repo {
+                            self.repo_path = lr;
+                        }
+                        self.config_source = Some(path.display().to_string());
+                        self.status_message = format!("Loaded defaults from {}", path.display());
+                        return;
+                    }
+                }
+            }
+        }
+        self.config_source = None;
+    }
+
+    pub fn build_cli_args(&self) -> Vec<String> {
+        let mut args = Vec::new();
+        match self.target {
+            TargetMode::Repo => {
+                args.push("--load-repo".to_string());
+                args.push(if self.repo_path.trim().is_empty() {
+                    ".".to_string()
+                } else {
+                    self.repo_path.clone()
+                });
+                if !self.focus_file.trim().is_empty() {
+                    args.push("--focus-file".to_string());
+                    args.push(self.focus_file.clone());
+                }
+                match self.layout_mode {
+                    LayoutMode::Shelf => args.push("--layout-mode".to_string()),
+                    LayoutMode::Carrel => {
+                        args.push("--layout-mode".to_string());
+                        args.push("carrel".to_string());
+                    }
+                }
+                if self.layout_mode == LayoutMode::Shelf {
+                    args.push("shelf".to_string());
+                }
+                args.push("--repo-engine".to_string());
+                args.push(match self.repo_engine {
+                    RepoEngine::Hyper => "hyper".to_string(),
+                    RepoEngine::Direct => "direct".to_string(),
+                    RepoEngine::Batch => "batch".to_string(),
+                });
+            }
+            TargetMode::File => {
+                args.push("--render-file".to_string());
+                args.push(if self.file_path.trim().is_empty() {
+                    "native/src/main.rs".to_string()
+                } else {
+                    self.file_path.clone()
+                });
+            }
+            TargetMode::Demo => {
+                args.push("--demo".to_string());
+            }
+        }
+
+        args.push("--wrap-mode".to_string());
+        args.push(match self.wrap_mode {
+            WrapMode::Back => "back".to_string(),
+            WrapMode::Down => "down".to_string(),
+        });
+
+        args.push("--color-mode".to_string());
+        args.push(match self.color_mode {
+            ColorMode::Syntax => "syntax".to_string(),
+            ColorMode::Flat => "flat".to_string(),
+        });
+
+        args.push("--cluster-mode".to_string());
+        args.push(match self.cluster_mode {
+            ClusterMode::Cluster => "cluster".to_string(),
+            ClusterMode::Leader => "leader".to_string(),
+        });
+
+        if self.file_backgrounds {
+            args.push("--file-backgrounds".to_string());
+        }
+        if !self.greeking {
+            args.push("--no-greeking".to_string());
+        }
+        if !self.cull {
+            args.push("--no-cull".to_string());
+        }
+        if !self.ui_overlay {
+            args.push("--no-ui".to_string());
+        }
+        if self.present_mode != PresentMode::Fifo {
+            args.push("--present-mode".to_string());
+            args.push(match self.present_mode {
+                PresentMode::Fifo => "fifo".to_string(),
+                PresentMode::Mailbox => "mailbox".to_string(),
+                PresentMode::Immediate => "immediate".to_string(),
+            });
+        }
+
+        args
+    }
+
+    pub fn command_preview(&self) -> String {
+        let args = self.build_cli_args();
+        format!("glyph3d-native {}", args.join(" "))
+    }
+
+    pub fn toggle_current(&mut self) {
+        match self.focus {
+            FocusField::TargetMode => {
+                self.target = match self.target {
+                    TargetMode::Repo => TargetMode::File,
+                    TargetMode::File => TargetMode::Demo,
+                    TargetMode::Demo => TargetMode::Repo,
+                };
+            }
+            FocusField::LayoutMode => {
+                self.layout_mode = match self.layout_mode {
+                    LayoutMode::Shelf => LayoutMode::Carrel,
+                    LayoutMode::Carrel => LayoutMode::Shelf,
+                };
+            }
+            FocusField::WrapMode => {
+                self.wrap_mode = match self.wrap_mode {
+                    WrapMode::Back => WrapMode::Down,
+                    WrapMode::Down => WrapMode::Back,
+                };
+            }
+            FocusField::RepoEngine => {
+                self.repo_engine = match self.repo_engine {
+                    RepoEngine::Hyper => RepoEngine::Direct,
+                    RepoEngine::Direct => RepoEngine::Batch,
+                    RepoEngine::Batch => RepoEngine::Hyper,
+                };
+            }
+            FocusField::ColorMode => {
+                self.color_mode = match self.color_mode {
+                    ColorMode::Syntax => ColorMode::Flat,
+                    ColorMode::Flat => ColorMode::Syntax,
+                };
+            }
+            FocusField::ClusterMode => {
+                self.cluster_mode = match self.cluster_mode {
+                    ClusterMode::Cluster => ClusterMode::Leader,
+                    ClusterMode::Leader => ClusterMode::Cluster,
+                };
+            }
+            FocusField::PresentMode => {
+                self.present_mode = match self.present_mode {
+                    PresentMode::Fifo => PresentMode::Mailbox,
+                    PresentMode::Mailbox => PresentMode::Immediate,
+                    PresentMode::Immediate => PresentMode::Fifo,
+                };
+            }
+            FocusField::FileBackgrounds => {
+                self.file_backgrounds = !self.file_backgrounds;
+            }
+            FocusField::Greeking => {
+                self.greeking = !self.greeking;
+            }
+            FocusField::Cull => {
+                self.cull = !self.cull;
+            }
+            FocusField::UiOverlay => {
+                self.ui_overlay = !self.ui_overlay;
+            }
+            FocusField::RepoPath | FocusField::FocusFile | FocusField::FilePath => {}
+        }
+    }
+
+    pub fn cycle_next(&mut self) {
+        match self.focus {
+            FocusField::TargetMode => {
+                self.target = match self.target {
+                    TargetMode::Repo => TargetMode::File,
+                    TargetMode::File => TargetMode::Demo,
+                    TargetMode::Demo => TargetMode::Repo,
+                };
+            }
+            FocusField::LayoutMode => {
+                self.layout_mode = LayoutMode::Carrel;
+            }
+            FocusField::WrapMode => {
+                self.wrap_mode = WrapMode::Down;
+            }
+            FocusField::RepoEngine => {
+                self.repo_engine = match self.repo_engine {
+                    RepoEngine::Hyper => RepoEngine::Direct,
+                    RepoEngine::Direct => RepoEngine::Batch,
+                    RepoEngine::Batch => RepoEngine::Hyper,
+                };
+            }
+            FocusField::ColorMode => {
+                self.color_mode = ColorMode::Flat;
+            }
+            FocusField::ClusterMode => {
+                self.cluster_mode = ClusterMode::Leader;
+            }
+            FocusField::PresentMode => {
+                self.present_mode = match self.present_mode {
+                    PresentMode::Fifo => PresentMode::Mailbox,
+                    PresentMode::Mailbox => PresentMode::Immediate,
+                    PresentMode::Immediate => PresentMode::Fifo,
+                };
+            }
+            FocusField::FileBackgrounds => self.file_backgrounds = true,
+            FocusField::Greeking => self.greeking = true,
+            FocusField::Cull => self.cull = true,
+            FocusField::UiOverlay => self.ui_overlay = true,
+            FocusField::RepoPath | FocusField::FocusFile | FocusField::FilePath => {}
+        }
+    }
+
+    pub fn cycle_prev(&mut self) {
+        match self.focus {
+            FocusField::TargetMode => {
+                self.target = match self.target {
+                    TargetMode::Repo => TargetMode::Demo,
+                    TargetMode::File => TargetMode::Repo,
+                    TargetMode::Demo => TargetMode::File,
+                };
+            }
+            FocusField::LayoutMode => {
+                self.layout_mode = LayoutMode::Shelf;
+            }
+            FocusField::WrapMode => {
+                self.wrap_mode = WrapMode::Back;
+            }
+            FocusField::RepoEngine => {
+                self.repo_engine = match self.repo_engine {
+                    RepoEngine::Hyper => RepoEngine::Batch,
+                    RepoEngine::Direct => RepoEngine::Hyper,
+                    RepoEngine::Batch => RepoEngine::Direct,
+                };
+            }
+            FocusField::ColorMode => {
+                self.color_mode = ColorMode::Syntax;
+            }
+            FocusField::ClusterMode => {
+                self.cluster_mode = ClusterMode::Cluster;
+            }
+            FocusField::PresentMode => {
+                self.present_mode = match self.present_mode {
+                    PresentMode::Fifo => PresentMode::Immediate,
+                    PresentMode::Mailbox => PresentMode::Fifo,
+                    PresentMode::Immediate => PresentMode::Mailbox,
+                };
+            }
+            FocusField::FileBackgrounds => self.file_backgrounds = false,
+            FocusField::Greeking => self.greeking = false,
+            FocusField::Cull => self.cull = false,
+            FocusField::UiOverlay => self.ui_overlay = false,
+            FocusField::RepoPath | FocusField::FocusFile | FocusField::FilePath => {}
+        }
+    }
+}
+
+pub fn run(manifest: &Manifest) -> bool {
+    let mut terminal = match init_terminal() {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("FAIL  could not initialize terminal: {e}");
+            return false;
+        }
+    };
+
+    let mut state = LauncherState::new();
+    let res = run_loop(&mut terminal, &mut state, manifest);
+    let _ = restore_terminal(&mut terminal);
+    res
+}
+
+fn init_terminal() -> io::Result<Terminal<CrosstermBackend<Stdout>>> {
+    enable_raw_mode()?;
+    let mut stdout = stdout();
+    execute!(stdout, EnterAlternateScreen)?;
+    Terminal::new(CrosstermBackend::new(stdout))
+}
+
+fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> io::Result<()> {
+    disable_raw_mode()?;
+    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    terminal.show_cursor()?;
+    Ok(())
+}
+
+fn run_loop(
+    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    state: &mut LauncherState,
+    manifest: &Manifest,
+) -> bool {
+    loop {
+        if let Err(e) = terminal.draw(|f| draw_ui(f, state, manifest)) {
+            eprintln!("FAIL  render error: {e}");
+            return false;
+        }
+
+        if let Ok(Event::Key(key)) = event::read() {
+            if key.kind != KeyEventKind::Press {
+                continue;
+            }
+
+            match key.code {
+                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    return true;
+                }
+                KeyCode::Esc => {
+                    return true;
+                }
+                KeyCode::Char('q') | KeyCode::Char('Q') if !state.focus.is_text_input() => {
+                    return true;
+                }
+                KeyCode::BackTab => {
+                    state.focus = state.focus.prev(state.target);
+                }
+                KeyCode::Tab => {
+                    if key.modifiers.contains(KeyModifiers::SHIFT) {
+                        state.focus = state.focus.prev(state.target);
+                    } else {
+                        state.focus = state.focus.next(state.target);
+                    }
+                }
+                KeyCode::Down => {
+                    state.focus = state.focus.next(state.target);
+                }
+                KeyCode::Up => {
+                    state.focus = state.focus.prev(state.target);
+                }
+                KeyCode::Left => {
+                    state.cycle_prev();
+                }
+                KeyCode::Right => {
+                    state.cycle_next();
+                }
+                KeyCode::Char(' ') => {
+                    if state.focus.is_text_input() {
+                        match state.focus {
+                            FocusField::RepoPath => state.repo_path.push(' '),
+                            FocusField::FocusFile => state.focus_file.push(' '),
+                            FocusField::FilePath => state.file_path.push(' '),
+                            _ => {}
+                        }
+                    } else {
+                        state.toggle_current();
+                    }
+                }
+                KeyCode::Char('b') | KeyCode::Char('B') if !state.focus.is_text_input() => {
+                    // Build action
+                    run_external_action(terminal, "Building products...", || {
+                        let _ = Command::new("cargo")
+                            .arg("glyph")
+                            .arg("build")
+                            .current_dir(root())
+                            .status();
+                    });
+                    state.status_message = "Build completed.".to_string();
+                }
+                KeyCode::Char('t') | KeyCode::Char('T') if !state.focus.is_text_input() => {
+                    // Test gates
+                    run_external_action(terminal, "Running verification gates...", || {
+                        let _ = Command::new("cargo")
+                            .arg("glyph")
+                            .arg("test")
+                            .current_dir(root())
+                            .status();
+                    });
+                    state.status_message = "Gate test completed.".to_string();
+                }
+                KeyCode::Char('r') | KeyCode::Char('R') if !state.focus.is_text_input() => {
+                    state.load_config_file();
+                }
+                KeyCode::Enter => {
+                    // Launch windowed renderer
+                    let exe = root().join("target/release/glyph3d-native");
+                    if !exe.exists() {
+                        state.status_message =
+                            "Binary not found: press [B] to build first.".to_string();
+                        continue;
+                    }
+                    let args = state.build_cli_args();
+                    let cwd = std::env::current_dir().unwrap_or_else(|_| root());
+
+                    run_external_action(terminal, "Launching glyph3d-native...", || {
+                        let _ = Command::new(&exe)
+                            .args(&args)
+                            .current_dir(cwd)
+                            .status();
+                    });
+                    state.status_message = "Returned from glyph3d-native.".to_string();
+                }
+                KeyCode::Backspace => match state.focus {
+                    FocusField::RepoPath => {
+                        state.repo_path.pop();
+                    }
+                    FocusField::FocusFile => {
+                        state.focus_file.pop();
+                    }
+                    FocusField::FilePath => {
+                        state.file_path.pop();
+                    }
+                    _ => {}
+                },
+                KeyCode::Char(c) => match state.focus {
+                    FocusField::RepoPath => {
+                        state.repo_path.push(c);
+                    }
+                    FocusField::FocusFile => {
+                        state.focus_file.push(c);
+                    }
+                    FocusField::FilePath => {
+                        state.file_path.push(c);
+                    }
+                    _ => {}
+                },
+                _ => {}
+            }
+        }
+    }
+}
+
+fn run_external_action<F: FnOnce()>(
+    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    msg: &str,
+    action: F,
+) {
+    let _ = disable_raw_mode();
+    let _ = execute!(terminal.backend_mut(), LeaveAlternateScreen);
+    let _ = terminal.show_cursor();
+
+    println!("\n── {msg}\n");
+    action();
+    println!("\n[Press Enter to return to launcher...]");
+    let mut buf = String::new();
+    let _ = io::stdin().read_line(&mut buf);
+
+    let _ = enable_raw_mode();
+    let _ = execute!(terminal.backend_mut(), EnterAlternateScreen);
+    let _ = terminal.hide_cursor();
+    let _ = terminal.clear();
+}
+
+fn draw_ui(f: &mut Frame, state: &LauncherState, manifest: &Manifest) {
+    let size = f.area();
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3), // Header
+            Constraint::Min(14),   // 2-Column Body
+            Constraint::Length(3), // Live command preview
+            Constraint::Length(1), // Footer keybinds
+        ])
+        .split(size);
+
+    draw_header(f, chunks[0]);
+    draw_body(f, chunks[1], state, manifest);
+    draw_preview(f, chunks[2], state);
+    draw_footer(f, chunks[3]);
+}
+
+fn draw_header(f: &mut Frame, area: Rect) {
+    let header_text = vec![
+        Line::from(vec![
+            Span::styled(" GLYPH3D ", Style::default().bg(Color::Cyan).fg(Color::Black).bold()),
+            Span::styled(" Interactive Launcher & Configuration Mission Control", Style::default().fg(Color::White).bold()),
+        ]),
+        Line::from(vec![
+            Span::styled(" Navigate: ", Style::default().fg(Color::DarkGray)),
+            Span::styled("Tab / Up / Down", Style::default().fg(Color::Yellow)),
+            Span::styled("   Select/Cycle: ", Style::default().fg(Color::DarkGray)),
+            Span::styled("Left / Right / Space", Style::default().fg(Color::Yellow)),
+            Span::styled("   Launch: ", Style::default().fg(Color::DarkGray)),
+            Span::styled("Enter", Style::default().fg(Color::Green).bold()),
+        ]),
+    ];
+
+    let block = Block::default()
+        .borders(Borders::BOTTOM)
+        .border_style(Style::default().fg(Color::Cyan));
+    let p = Paragraph::new(header_text).block(block);
+    f.render_widget(p, area);
+}
+
+fn draw_body(f: &mut Frame, area: Rect, state: &LauncherState, manifest: &Manifest) {
+    let main_chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage(50), // Left column: Target & Layout
+            Constraint::Percentage(50), // Right column: Graphics & Environment
+        ])
+        .split(area);
+
+    draw_left_column(f, main_chunks[0], state);
+    draw_right_column(f, main_chunks[1], state, manifest);
+}
+
+fn draw_left_column(f: &mut Frame, area: Rect, state: &LauncherState) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(6), // 1. Launch Target
+            Constraint::Min(8),    // 2. Layout & Layout Engine
+        ])
+        .split(area);
+
+    draw_target_section(f, chunks[0], state);
+    draw_layout_section(f, chunks[1], state);
+}
+
+fn draw_right_column(f: &mut Frame, area: Rect, state: &LauncherState, manifest: &Manifest) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(8), // 3. Graphics & Shading
+            Constraint::Min(6),    // 4. Hardware & Environment
+        ])
+        .split(area);
+
+    draw_graphics_section(f, chunks[0], state);
+    draw_sidebar(f, chunks[1], state, manifest);
+}
+
+fn line_prefix(focused: bool) -> Span<'static> {
+    if focused {
+        Span::styled("▶ ", Style::default().fg(Color::Cyan).bold())
+    } else {
+        Span::raw("  ")
+    }
+}
+
+fn draw_target_section(f: &mut Frame, area: Rect, state: &LauncherState) {
+    let is_focused = state.focus == FocusField::TargetMode;
+    let mut lines = Vec::new();
+
+    // Line 1: Target Mode
+    lines.push(Line::from(vec![
+        line_prefix(is_focused),
+        Span::styled(
+            "Target: ",
+            if is_focused {
+                Style::default().fg(Color::Cyan).bold()
+            } else {
+                Style::default().fg(Color::DarkGray)
+            },
+        ),
+        format_radio("Repo", state.target == TargetMode::Repo, is_focused),
+        Span::raw(" "),
+        format_radio("File", state.target == TargetMode::File, is_focused),
+        Span::raw(" "),
+        format_radio("Demo", state.target == TargetMode::Demo, is_focused),
+    ]));
+
+    // Line 2 & 3: Depending on target mode
+    match state.target {
+        TargetMode::Repo => {
+            let repo_focused = state.focus == FocusField::RepoPath;
+            let focus_file_focused = state.focus == FocusField::FocusFile;
+            lines.push(Line::from(vec![
+                line_prefix(repo_focused),
+                Span::styled(
+                    "Repo:   ",
+                    if repo_focused {
+                        Style::default().fg(Color::Cyan).bold()
+                    } else {
+                        Style::default().fg(Color::DarkGray)
+                    },
+                ),
+                Span::styled(
+                    format!("{:<25}", if state.repo_path.is_empty() { "." } else { &state.repo_path }),
+                    if repo_focused {
+                        Style::default().bg(Color::Blue).fg(Color::White).bold()
+                    } else {
+                        Style::default().fg(Color::Yellow)
+                    },
+                ),
+            ]));
+            lines.push(Line::from(vec![
+                line_prefix(focus_file_focused),
+                Span::styled(
+                    "Focus:  ",
+                    if focus_file_focused {
+                        Style::default().fg(Color::Cyan).bold()
+                    } else {
+                        Style::default().fg(Color::DarkGray)
+                    },
+                ),
+                Span::styled(
+                    format!("{:<25}", if state.focus_file.is_empty() { "(all files)" } else { &state.focus_file }),
+                    if focus_file_focused {
+                        Style::default().bg(Color::Blue).fg(Color::White).bold()
+                    } else {
+                        Style::default().fg(Color::Yellow)
+                    },
+                ),
+            ]));
+        }
+        TargetMode::File => {
+            let file_focused = state.focus == FocusField::FilePath;
+            lines.push(Line::from(vec![
+                line_prefix(file_focused),
+                Span::styled(
+                    "File:   ",
+                    if file_focused {
+                        Style::default().fg(Color::Cyan).bold()
+                    } else {
+                        Style::default().fg(Color::DarkGray)
+                    },
+                ),
+                Span::styled(
+                    format!("{:<25}", state.file_path),
+                    if file_focused {
+                        Style::default().bg(Color::Blue).fg(Color::White).bold()
+                    } else {
+                        Style::default().fg(Color::Yellow)
+                    },
+                ),
+            ]));
+            lines.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled("Staged directly via Slug WGSL pipeline", Style::default().fg(Color::DarkGray)),
+            ]));
+        }
+        TargetMode::Demo => {
+            lines.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled("Stage A 1M quad-field stress demo", Style::default().fg(Color::Magenta)),
+            ]));
+            lines.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled("Evaluates raw GPU fillrate & instancing", Style::default().fg(Color::DarkGray)),
+            ]));
+        }
+    }
+
+    let is_section_focused = matches!(
+        state.focus,
+        FocusField::TargetMode
+            | FocusField::RepoPath
+            | FocusField::FocusFile
+            | FocusField::FilePath
+    );
+
+    let block = Block::default()
+        .title(" 1. Launch Target ")
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(if is_section_focused {
+            Style::default().fg(Color::Cyan)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        });
+    f.render_widget(Paragraph::new(lines).block(block), area);
+}
+
+fn draw_layout_section(f: &mut Frame, area: Rect, state: &LauncherState) {
+    let is_layout = state.focus == FocusField::LayoutMode;
+    let is_wrap = state.focus == FocusField::WrapMode;
+    let is_engine = state.focus == FocusField::RepoEngine;
+    let is_color = state.focus == FocusField::ColorMode;
+    let is_cluster = state.focus == FocusField::ClusterMode;
+
+    let lines = vec![
+        Line::from(vec![
+            line_prefix(is_layout),
+            Span::styled(
+                "Layout:  ",
+                if is_layout {
+                    Style::default().fg(Color::Cyan).bold()
+                } else {
+                    Style::default().fg(Color::DarkGray)
+                },
+            ),
+            format_choice("shelf", state.layout_mode == LayoutMode::Shelf, is_layout),
+            Span::raw(" "),
+            format_choice("carrel", state.layout_mode == LayoutMode::Carrel, is_layout),
+        ]),
+        Line::from(vec![
+            line_prefix(is_wrap),
+            Span::styled(
+                "Wrap:    ",
+                if is_wrap {
+                    Style::default().fg(Color::Cyan).bold()
+                } else {
+                    Style::default().fg(Color::DarkGray)
+                },
+            ),
+            format_choice("back (Z-depth)", state.wrap_mode == WrapMode::Back, is_wrap),
+            Span::raw(" "),
+            format_choice("down (cols)", state.wrap_mode == WrapMode::Down, is_wrap),
+        ]),
+        Line::from(vec![
+            line_prefix(is_engine),
+            Span::styled(
+                "Engine:  ",
+                if is_engine {
+                    Style::default().fg(Color::Cyan).bold()
+                } else {
+                    Style::default().fg(Color::DarkGray)
+                },
+            ),
+            format_choice("hyper (Rayon)", state.repo_engine == RepoEngine::Hyper, is_engine),
+            Span::raw(" "),
+            format_choice("direct", state.repo_engine == RepoEngine::Direct, is_engine),
+            Span::raw(" "),
+            format_choice("batch", state.repo_engine == RepoEngine::Batch, is_engine),
+        ]),
+        Line::from(vec![
+            line_prefix(is_color),
+            Span::styled(
+                "Color:   ",
+                if is_color {
+                    Style::default().fg(Color::Cyan).bold()
+                } else {
+                    Style::default().fg(Color::DarkGray)
+                },
+            ),
+            format_choice("syntax (lexer)", state.color_mode == ColorMode::Syntax, is_color),
+            Span::raw(" "),
+            format_choice("flat", state.color_mode == ColorMode::Flat, is_color),
+        ]),
+        Line::from(vec![
+            line_prefix(is_cluster),
+            Span::styled(
+                "Cluster: ",
+                if is_cluster {
+                    Style::default().fg(Color::Cyan).bold()
+                } else {
+                    Style::default().fg(Color::DarkGray)
+                },
+            ),
+            format_choice("cluster (UAX29)", state.cluster_mode == ClusterMode::Cluster, is_cluster),
+            Span::raw(" "),
+            format_choice("leader", state.cluster_mode == ClusterMode::Leader, is_cluster),
+        ]),
+    ];
+
+    let is_section_focused = matches!(
+        state.focus,
+        FocusField::LayoutMode
+            | FocusField::WrapMode
+            | FocusField::RepoEngine
+            | FocusField::ColorMode
+            | FocusField::ClusterMode
+    );
+
+    let block = Block::default()
+        .title(" 2. Layout & Layout Engine ")
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(if is_section_focused {
+            Style::default().fg(Color::Cyan)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        });
+    f.render_widget(Paragraph::new(lines).block(block), area);
+}
+
+fn draw_graphics_section(f: &mut Frame, area: Rect, state: &LauncherState) {
+    let is_greeking = state.focus == FocusField::Greeking;
+    let is_cards = state.focus == FocusField::FileBackgrounds;
+    let is_cull = state.focus == FocusField::Cull;
+    let is_ui = state.focus == FocusField::UiOverlay;
+    let is_present = state.focus == FocusField::PresentMode;
+
+    let show_hint = area.width >= 48;
+
+    let lines = vec![
+        Line::from(vec![
+            line_prefix(is_greeking),
+            Span::styled(
+                "Greeking:       ",
+                if is_greeking {
+                    Style::default().fg(Color::Cyan).bold()
+                } else {
+                    Style::default().fg(Color::DarkGray)
+                },
+            ),
+            format_toggle(state.greeking, is_greeking),
+            if show_hint {
+                Span::styled(" (subpixel ink)", Style::default().fg(Color::DarkGray))
+            } else {
+                Span::raw("")
+            },
+        ]),
+        Line::from(vec![
+            line_prefix(is_cards),
+            Span::styled(
+                "File Cards:     ",
+                if is_cards {
+                    Style::default().fg(Color::Cyan).bold()
+                } else {
+                    Style::default().fg(Color::DarkGray)
+                },
+            ),
+            format_toggle(state.file_backgrounds, is_cards),
+            if show_hint {
+                Span::styled(" (bounds)", Style::default().fg(Color::DarkGray))
+            } else {
+                Span::raw("")
+            },
+        ]),
+        Line::from(vec![
+            line_prefix(is_cull),
+            Span::styled(
+                "Frustum Culling:",
+                if is_cull {
+                    Style::default().fg(Color::Cyan).bold()
+                } else {
+                    Style::default().fg(Color::DarkGray)
+                },
+            ),
+            format_toggle(state.cull, is_cull),
+            if show_hint {
+                Span::styled(" (AABB cull)", Style::default().fg(Color::DarkGray))
+            } else {
+                Span::raw("")
+            },
+        ]),
+        Line::from(vec![
+            line_prefix(is_ui),
+            Span::styled(
+                "Egui Overlay:   ",
+                if is_ui {
+                    Style::default().fg(Color::Cyan).bold()
+                } else {
+                    Style::default().fg(Color::DarkGray)
+                },
+            ),
+            format_toggle(state.ui_overlay, is_ui),
+            if show_hint {
+                Span::styled(" (in-app UI)", Style::default().fg(Color::DarkGray))
+            } else {
+                Span::raw("")
+            },
+        ]),
+        Line::from(vec![
+            line_prefix(is_present),
+            Span::styled(
+                "Present Mode:   ",
+                if is_present {
+                    Style::default().fg(Color::Cyan).bold()
+                } else {
+                    Style::default().fg(Color::DarkGray)
+                },
+            ),
+            format_choice("fifo", state.present_mode == PresentMode::Fifo, is_present),
+            Span::raw(" "),
+            format_choice("mailbox", state.present_mode == PresentMode::Mailbox, is_present),
+            Span::raw(" "),
+            format_choice("immediate", state.present_mode == PresentMode::Immediate, is_present),
+        ]),
+    ];
+
+    let is_section_focused = matches!(
+        state.focus,
+        FocusField::Greeking
+            | FocusField::FileBackgrounds
+            | FocusField::Cull
+            | FocusField::UiOverlay
+            | FocusField::PresentMode
+    );
+
+    let block = Block::default()
+        .title(" 3. Graphics & Shading ")
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(if is_section_focused {
+            Style::default().fg(Color::Cyan)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        });
+    f.render_widget(Paragraph::new(lines).block(block), area);
+}
+
+fn draw_sidebar(f: &mut Frame, area: Rect, state: &LauncherState, manifest: &Manifest) {
+    let gpu = gpu_key().unwrap_or("unknown");
+    let prof = gpu_profile()
+        .unwrap_or("unavailable")
+        .lines()
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_string();
+
+    let renderer_art = manifest.artifact.get("renderer");
+    let is_curr = renderer_art.map(|a| is_current("renderer", a)).unwrap_or(false);
+
+    let diag_lines = vec![
+        Line::from(vec![
+            Span::styled("GPU Adapter:  ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                if prof.is_empty() { "Probing..." } else { &prof },
+                Style::default().fg(Color::Cyan).bold(),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("Golden Key:   ", Style::default().fg(Color::DarkGray)),
+            Span::styled(gpu, Style::default().fg(Color::White)),
+        ]),
+        Line::from(vec![
+            Span::styled("Build Status: ", Style::default().fg(Color::DarkGray)),
+            if is_curr {
+                Span::styled("● CURRENT (up to date)", Style::default().fg(Color::Green).bold())
+            } else {
+                Span::styled("○ STALE (press B to build)", Style::default().fg(Color::Red).bold())
+            },
+        ]),
+        Line::from(vec![
+            Span::styled("Config File:  ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                state.config_source.as_deref().unwrap_or("None (default flags)"),
+                Style::default().fg(Color::Yellow),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("Status:       ", Style::default().fg(Color::DarkGray)),
+            Span::styled(&state.status_message, Style::default().fg(Color::Cyan)),
+        ]),
+    ];
+
+    let block = Block::default()
+        .title(" 4. Environment & Status ")
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(Color::DarkGray));
+    f.render_widget(Paragraph::new(diag_lines).block(block), area);
+}
+
+fn draw_preview(f: &mut Frame, area: Rect, state: &LauncherState) {
+    let cmd = state.command_preview();
+    let p = Paragraph::new(vec![
+        Line::from(vec![
+            Span::styled("$ ", Style::default().fg(Color::Green).bold()),
+            Span::styled(cmd, Style::default().fg(Color::White).bold()),
+        ]),
+    ])
+    .block(
+        Block::default()
+            .title(" Live Invocation Preview ")
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(Color::Green)),
+    );
+    f.render_widget(p, area);
+}
+
+fn draw_footer(f: &mut Frame, area: Rect) {
+    let keys = Line::from(vec![
+        Span::styled(" [Enter] ", Style::default().bg(Color::Green).fg(Color::Black).bold()),
+        Span::styled("Launch  ", Style::default().fg(Color::White)),
+        Span::styled(" [B] ", Style::default().bg(Color::Blue).fg(Color::White).bold()),
+        Span::styled("Build  ", Style::default().fg(Color::White)),
+        Span::styled(" [T] ", Style::default().bg(Color::Magenta).fg(Color::White).bold()),
+        Span::styled("Test Gates  ", Style::default().fg(Color::White)),
+        Span::styled(" [R] ", Style::default().bg(Color::Yellow).fg(Color::Black).bold()),
+        Span::styled("Reload Config  ", Style::default().fg(Color::White)),
+        Span::styled(" [Space] ", Style::default().bg(Color::DarkGray).fg(Color::White).bold()),
+        Span::styled("Toggle  ", Style::default().fg(Color::White)),
+        Span::styled(" [Q / Esc] ", Style::default().bg(Color::Red).fg(Color::White).bold()),
+        Span::styled("Quit", Style::default().fg(Color::White)),
+    ]);
+    let p = Paragraph::new(keys).alignment(Alignment::Center);
+    f.render_widget(p, area);
+}
+
+fn format_radio<'a>(label: &'a str, selected: bool, focused: bool) -> Span<'a> {
+    if selected {
+        if focused {
+            Span::styled(format!("[● {label}]"), Style::default().bg(Color::Cyan).fg(Color::Black).bold())
+        } else {
+            Span::styled(format!("[● {label}]"), Style::default().fg(Color::Cyan).bold())
+        }
+    } else {
+        Span::styled(format!("[○ {label}]"), Style::default().fg(Color::DarkGray))
+    }
+}
+
+fn format_choice<'a>(label: &'a str, selected: bool, focused: bool) -> Span<'a> {
+    if selected {
+        if focused {
+            Span::styled(format!("[{label}]"), Style::default().bg(Color::Cyan).fg(Color::Black).bold())
+        } else {
+            Span::styled(format!("[{label}]"), Style::default().fg(Color::Cyan).bold())
+        }
+    } else {
+        Span::styled(format!(" {label} "), Style::default().fg(Color::DarkGray))
+    }
+}
+
+fn format_toggle(enabled: bool, focused: bool) -> Span<'static> {
+    if enabled {
+        if focused {
+            Span::styled("[● ENABLED]", Style::default().bg(Color::Green).fg(Color::Black).bold())
+        } else {
+            Span::styled("[● ENABLED]", Style::default().fg(Color::Green).bold())
+        }
+    } else if focused {
+        Span::styled("[○ DISABLED]", Style::default().bg(Color::Red).fg(Color::White).bold())
+    } else {
+        Span::styled("[○ DISABLED]", Style::default().fg(Color::Red))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_launcher_state_initial_build_args() {
+        let state = LauncherState::new();
+        let args = state.build_cli_args();
+        assert!(args.contains(&"--load-repo".to_string()));
+        assert!(args.contains(&"--wrap-mode".to_string()));
+        assert!(args.contains(&"--color-mode".to_string()));
+    }
+
+    #[test]
+    fn test_target_mode_cycle() {
+        let mut state = LauncherState::new();
+        assert_eq!(state.target, TargetMode::Repo);
+        state.focus = FocusField::TargetMode;
+        state.toggle_current();
+        assert_eq!(state.target, TargetMode::File);
+        state.toggle_current();
+        assert_eq!(state.target, TargetMode::Demo);
+        state.toggle_current();
+        assert_eq!(state.target, TargetMode::Repo);
+    }
+
+    #[test]
+    fn test_focus_navigation_skips_inapplicable() {
+        let mut focus = FocusField::TargetMode;
+        // In Repo mode, FilePath should be skipped
+        let mut visited = Vec::new();
+        for _ in 0..FocusField::ALL.len() {
+            focus = focus.next(TargetMode::Repo);
+            visited.push(focus);
+        }
+        assert!(!visited.contains(&FocusField::FilePath));
+        assert!(visited.contains(&FocusField::RepoPath));
+
+        // In File mode, RepoPath and FocusFile should be skipped
+        focus = FocusField::TargetMode;
+        visited.clear();
+        for _ in 0..FocusField::ALL.len() {
+            focus = focus.next(TargetMode::File);
+            visited.push(focus);
+        }
+        assert!(!visited.contains(&FocusField::RepoPath));
+        assert!(!visited.contains(&FocusField::FocusFile));
+        assert!(visited.contains(&FocusField::FilePath));
+    }
+
+    #[test]
+    fn test_command_preview_format() {
+        let mut state = LauncherState::new();
+        state.target = TargetMode::Demo;
+        let preview = state.command_preview();
+        assert!(preview.starts_with("glyph3d-native --demo"));
+    }
+
+    #[test]
+    fn test_directional_selection_and_toggles() {
+        let mut state = LauncherState::new();
+
+        // LayoutMode: Left = Shelf, Right = Carrel
+        state.focus = FocusField::LayoutMode;
+        state.cycle_next();
+        assert_eq!(state.layout_mode, LayoutMode::Carrel);
+        state.cycle_prev();
+        assert_eq!(state.layout_mode, LayoutMode::Shelf);
+
+        // RepoEngine: 3-way cycle
+        state.focus = FocusField::RepoEngine;
+        assert_eq!(state.repo_engine, RepoEngine::Hyper);
+        state.cycle_next();
+        assert_eq!(state.repo_engine, RepoEngine::Direct);
+        state.cycle_next();
+        assert_eq!(state.repo_engine, RepoEngine::Batch);
+        state.cycle_prev();
+        assert_eq!(state.repo_engine, RepoEngine::Direct);
+
+        // Booleans: Left = false, Right = true
+        state.focus = FocusField::Greeking;
+        state.cycle_prev();
+        assert!(!state.greeking);
+        state.cycle_next();
+        assert!(state.greeking);
+    }
+
+    #[test]
+    fn test_focus_field_visual_order_matches_all() {
+        // Ensure ALL starts with TargetMode and ends with PresentMode
+        assert_eq!(FocusField::ALL[0], FocusField::TargetMode);
+        assert_eq!(*FocusField::ALL.last().unwrap(), FocusField::PresentMode);
+        // Verify Next and Prev wrap around cleanly
+        let next_wrap = FocusField::PresentMode.next(TargetMode::Repo);
+        assert_eq!(next_wrap, FocusField::TargetMode);
+        let prev_wrap = FocusField::TargetMode.prev(TargetMode::Repo);
+        assert_eq!(prev_wrap, FocusField::PresentMode);
+    }
+}

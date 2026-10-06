@@ -32,18 +32,21 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
+mod tui;
+
 // ── the manifest, as types ───────────────────────────────────────────────
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct Manifest {
-    settings: Settings,
-    artifact: BTreeMap<String, Artifact>,
-    golden_view: Vec<GoldenView>,
-    gate: Vec<Gate>,
+pub(crate) struct Manifest {
+    pub(crate) settings: Settings,
+    pub(crate) artifact: BTreeMap<String, Artifact>,
+    pub(crate) golden_view: Vec<GoldenView>,
+    pub(crate) gate: Vec<Gate>,
     #[serde(default)]
-    mutation: Vec<Mutation>,
+    pub(crate) mutation: Vec<Mutation>,
 }
+
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -56,7 +59,7 @@ struct Settings {
 /// pixel baselines, whose bytes cannot be derived from anything.
 #[derive(Debug, Deserialize, PartialEq, Eq, Clone, Copy)]
 #[serde(rename_all = "lowercase")]
-enum Class {
+pub(crate) enum Class {
     /// Untracked build output. Only has to be CURRENT.
     Product,
     /// Tracked; verified by rebuilding and byte-comparing.
@@ -67,8 +70,9 @@ enum Class {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct Artifact {
-    class: Class,
+pub(crate) struct Artifact {
+    pub(crate) class: Class,
+
     outputs: Vec<String>,
     #[serde(default)]
     inputs: Vec<String>,
@@ -151,9 +155,10 @@ struct Mutation {
 
 // ── paths and process ────────────────────────────────────────────────────
 
-fn root() -> PathBuf {
+pub(crate) fn root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap().to_path_buf()
 }
+
 fn native() -> PathBuf {
     root().join("native")
 }
@@ -217,10 +222,11 @@ fn write_stamp(name: &str, digest: &str) {
     let _ = std::fs::write(stamps().join(format!("{name}.sha256")), digest);
 }
 
-fn is_current(name: &str, a: &Artifact) -> bool {
+pub(crate) fn is_current(name: &str, a: &Artifact) -> bool {
     stamp_of(name).as_deref() == Some(input_digest(a).as_str())
         && a.outputs.iter().all(|o| root().join(o).exists())
 }
+
 
 /// `build` achieves currency; `--frozen` only asserts it. Keeping those apart
 /// is the whole reason `test` no longer has a gate that quietly rebuilds.
@@ -1357,6 +1363,8 @@ enum Cmd {
     /// rasterizer's golden set: how many pixels differ and in what shape.
     /// An instrument, not a gate — cross-vendor equality is not a goal.
     Drift,
+    /// Launch the interactive terminal UI (mission-control launcher).
+    Tui,
 }
 
 /// The engine shared library's extension on THIS host: `dylib` on macOS, `so`
@@ -1375,7 +1383,7 @@ fn dylib_ext() -> &'static str {
 /// ONCE. `None` when the renderer is not built or refused to answer — a
 /// caller that needs it says which. Not resolved at manifest load like
 /// `{dylib}`: the answer needs the product that `build` is about to make.
-fn gpu_key() -> Option<&'static str> {
+pub(crate) fn gpu_key() -> Option<&'static str> {
     static KEY: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
     KEY.get_or_init(|| {
         let bin = root().join("target/release/glyph3d-native");
@@ -1392,7 +1400,7 @@ fn gpu_key() -> Option<&'static str> {
 }
 
 /// The live hardware record (`--gpu-profile`), for the provenance NOTE.
-fn gpu_profile() -> Option<&'static str> {
+pub(crate) fn gpu_profile() -> Option<&'static str> {
     static TEXT: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
     TEXT.get_or_init(|| {
         let bin = root().join("target/release/glyph3d-native");
@@ -1401,6 +1409,7 @@ fn gpu_profile() -> Option<&'static str> {
     })
     .as_deref()
 }
+
 
 /// A manifest path with `{gpu}` filled in for this host, or None if the key
 /// is unknown. Paths without the token pass through unchanged.
@@ -1446,6 +1455,8 @@ fn main() -> ExitCode {
     // Before anything can rebuild us out from under ourselves; see self_exe.
     let _ = self_exe();
     let cli = Cli::parse();
+
+
     let m = match load() {
         Ok(m) => m,
         Err(e) => {
@@ -1488,6 +1499,7 @@ fn main() -> ExitCode {
             cmd_prove(&m, gate.as_deref(), &mutations, changed)
         }
         Cmd::Drift => cmd_drift(&m),
+        Cmd::Tui => tui::run(&m),
         Cmd::Gate { name } => match m.gate.iter().find(|g| g.name == name) {
             Some(g) => run_gate(g, &m),
             None => {

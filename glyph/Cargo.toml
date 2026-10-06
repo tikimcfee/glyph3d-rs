@@ -23,3 +23,6 @@ sha2 = "0.10"
 # `glyph drift`: decode this host's renders and another platform's golden set
 # to say how far apart two rasterizers are. Already in the lock via `image`.
 png = "0.18"
+ratatui = "0.29"
+crossterm = "0.28"
+
