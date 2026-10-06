@@ -74,7 +74,7 @@ egui-winit = { version = "0.36", optional = true }
 egui-wgpu = { version = "0.36", optional = true }
 
 [features]
-default = ["egui-ui"]
+default = ["egui-ui", "cubecl"]
 # Stage K: build the windowed egui overlay. With the feature off (or `--no-ui`
 # at runtime) windowed behavior is exactly pre-K.
 egui-ui = ["dep:egui", "dep:egui-winit", "dep:egui-wgpu"]
