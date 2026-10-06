@@ -21,6 +21,7 @@ pub struct LaunchConfig {
     pub greek_smooth: Option<bool>,
     pub greek_onset_px: Option<f32>,
     pub load_repo: Option<PathBuf>,
+    pub field_mode: Option<String>,
 }
 
 impl LaunchConfig {
@@ -93,6 +94,9 @@ impl LaunchConfig {
                 "load_repo" => {
                     cfg.load_repo = Some(PathBuf::from(strip_quotes(val)));
                 }
+                "field_mode" => {
+                    cfg.field_mode = Some(strip_quotes(val));
+                }
                 _ => {
                     // Unknown keys are ignored for forward-compatibility
                 }
@@ -150,6 +154,7 @@ mod tests {
             greek_pure = true
             greek_onset_px = 12.0
             load_repo = "/path/to/repo"
+            field_mode = "derived"
         "#;
         let cfg = LaunchConfig::from_toml_str(toml).expect("parse failed");
         assert_eq!(cfg.file_backgrounds, Some(true));
@@ -165,5 +170,6 @@ mod tests {
         assert_eq!(cfg.greek_pure, Some(true));
         assert_eq!(cfg.greek_onset_px, Some(12.0));
         assert_eq!(cfg.load_repo, Some(PathBuf::from("/path/to/repo")));
+        assert_eq!(cfg.field_mode.as_deref(), Some("derived"));
     }
 }

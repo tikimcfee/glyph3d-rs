@@ -15,10 +15,8 @@ pub enum GlyphFieldMode {
     /// general mode, and the default.
     #[default]
     Instanced,
-    /// A compact record per glyph with the placement derived in the vertex
-    /// stage from per-line tables. Smaller and faster to emit, but leans on
-    /// the layout's structure (rows on a grid, mostly uniform advances) to
-    /// stay cheap. Planned; not yet implemented.
+    /// Compact 20 B record per glyph (`DerivedSlot`) with placement Y/Z derived
+    /// in the vertex stage from per-line tables and ItemParamsGpu.
     Derived,
 }
 

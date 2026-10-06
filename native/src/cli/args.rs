@@ -158,8 +158,8 @@ pub struct Cli {
     pub no_cull: bool,
     /// Glyph field render mode: `instanced` (default: one full 32 B placement
     /// record per glyph, read as-is by the vertex stage) or `derived` (compact
-    /// record, placement derived in the vertex stage — not implemented yet;
-    /// refused at startup). Fixed for the scene's lifetime.
+    /// 20 B record per glyph with vertex-stage Y/Z derivation from line tables).
+    /// Fixed for the scene's lifetime.
     #[arg(long, value_name = "MODE", default_value = "instanced")]
     pub field_mode: glyph_field::GlyphFieldMode,
     /// Stage K: windowed without the egui UI overlay (exact pre-K behavior)
@@ -405,6 +405,17 @@ pub fn parse_cli_from(matches: clap::ArgMatches) -> Cli {
                 {
                     if let Some(lr) = cfg.load_repo {
                         cli.load_repo = Some(lr);
+                    }
+                }
+                if matches.value_source("field_mode")
+                    != Some(clap::parser::ValueSource::CommandLine)
+                {
+                    if let Some(fm) = &cfg.field_mode {
+                        if let Ok(parsed) = fm.parse::<glyph_field::GlyphFieldMode>() {
+                            cli.field_mode = parsed;
+                        } else {
+                            log::warn!("unknown field_mode in launch config: '{fm}'");
+                        }
                     }
                 }
             }

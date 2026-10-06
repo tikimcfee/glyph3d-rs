@@ -70,6 +70,12 @@ pub enum PresentMode {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FieldMode {
+    Instanced,
+    Derived,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FocusField {
     TargetMode,
     RepoPath,
@@ -83,6 +89,7 @@ pub enum FocusField {
     Greeking,
     FileBackgrounds,
     Cull,
+    FieldMode,
     UiOverlay,
     PresentMode,
 }
@@ -101,6 +108,7 @@ impl FocusField {
         FocusField::Greeking,
         FocusField::FileBackgrounds,
         FocusField::Cull,
+        FocusField::FieldMode,
         FocusField::UiOverlay,
         FocusField::PresentMode,
     ];
@@ -155,6 +163,7 @@ struct FileLaunchConfig {
     no_ui: Option<bool>,
     greeking: Option<bool>,
     load_repo: Option<String>,
+    field_mode: Option<String>,
 }
 
 pub struct LauncherState {
@@ -171,6 +180,7 @@ pub struct LauncherState {
     pub file_backgrounds: bool,
     pub greeking: bool,
     pub cull: bool,
+    pub field_mode: FieldMode,
     pub ui_overlay: bool,
     pub z_wrap_spacing: f64,
     pub focus: FocusField,
@@ -194,6 +204,7 @@ impl LauncherState {
             file_backgrounds: true,
             greeking: true,
             cull: true,
+            field_mode: FieldMode::Instanced,
             ui_overlay: true,
             z_wrap_spacing: 0.15,
             focus: FocusField::TargetMode,
@@ -248,6 +259,12 @@ impl LauncherState {
                         }
                         if let Some(lr) = cfg.load_repo {
                             self.repo_path = lr;
+                        }
+                        if let Some(fm) = cfg.field_mode.as_deref() {
+                            self.field_mode = match fm.to_lowercase().as_str() {
+                                "derived" => FieldMode::Derived,
+                                _ => FieldMode::Instanced,
+                            };
                         }
                         self.config_source = Some(path.display().to_string());
                         self.status_message = format!("Loaded defaults from {}", path.display());
@@ -319,6 +336,12 @@ impl LauncherState {
         args.push(match self.cluster_mode {
             ClusterMode::Cluster => "cluster".to_string(),
             ClusterMode::Leader => "leader".to_string(),
+        });
+
+        args.push("--field-mode".to_string());
+        args.push(match self.field_mode {
+            FieldMode::Instanced => "instanced".to_string(),
+            FieldMode::Derived => "derived".to_string(),
         });
 
         if self.file_backgrounds {
@@ -406,6 +429,12 @@ impl LauncherState {
             FocusField::Cull => {
                 self.cull = !self.cull;
             }
+            FocusField::FieldMode => {
+                self.field_mode = match self.field_mode {
+                    FieldMode::Instanced => FieldMode::Derived,
+                    FieldMode::Derived => FieldMode::Instanced,
+                };
+            }
             FocusField::UiOverlay => {
                 self.ui_overlay = !self.ui_overlay;
             }
@@ -451,6 +480,7 @@ impl LauncherState {
             FocusField::FileBackgrounds => self.file_backgrounds = true,
             FocusField::Greeking => self.greeking = true,
             FocusField::Cull => self.cull = true,
+            FocusField::FieldMode => self.field_mode = FieldMode::Derived,
             FocusField::UiOverlay => self.ui_overlay = true,
             FocusField::RepoPath | FocusField::FocusFile | FocusField::FilePath => {}
         }
@@ -494,6 +524,7 @@ impl LauncherState {
             FocusField::FileBackgrounds => self.file_backgrounds = false,
             FocusField::Greeking => self.greeking = false,
             FocusField::Cull => self.cull = false,
+            FocusField::FieldMode => self.field_mode = FieldMode::Instanced,
             FocusField::UiOverlay => self.ui_overlay = false,
             FocusField::RepoPath | FocusField::FocusFile | FocusField::FilePath => {}
         }
@@ -756,7 +787,7 @@ fn draw_right_column(f: &mut Frame, area: Rect, state: &LauncherState, manifest:
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(8), // 3. Graphics & Shading
+            Constraint::Length(9), // 3. Graphics & Shading
             Constraint::Min(6),    // 4. Hardware & Environment
         ])
         .split(area);
@@ -1004,6 +1035,7 @@ fn draw_graphics_section(f: &mut Frame, area: Rect, state: &LauncherState) {
     let is_greeking = state.focus == FocusField::Greeking;
     let is_cards = state.focus == FocusField::FileBackgrounds;
     let is_cull = state.focus == FocusField::Cull;
+    let is_field_mode = state.focus == FocusField::FieldMode;
     let is_ui = state.focus == FocusField::UiOverlay;
     let is_present = state.focus == FocusField::PresentMode;
 
@@ -1062,6 +1094,20 @@ fn draw_graphics_section(f: &mut Frame, area: Rect, state: &LauncherState) {
             },
         ]),
         Line::from(vec![
+            line_prefix(is_field_mode),
+            Span::styled(
+                "Field Mode:     ",
+                if is_field_mode {
+                    Style::default().fg(Color::Cyan).bold()
+                } else {
+                    Style::default().fg(Color::DarkGray)
+                },
+            ),
+            format_choice("instanced (32B)", state.field_mode == FieldMode::Instanced, is_field_mode),
+            Span::raw(" "),
+            format_choice("derived (20B)", state.field_mode == FieldMode::Derived, is_field_mode),
+        ]),
+        Line::from(vec![
             line_prefix(is_ui),
             Span::styled(
                 "Egui Overlay:   ",
@@ -1101,6 +1147,7 @@ fn draw_graphics_section(f: &mut Frame, area: Rect, state: &LauncherState) {
         FocusField::Greeking
             | FocusField::FileBackgrounds
             | FocusField::Cull
+            | FocusField::FieldMode
             | FocusField::UiOverlay
             | FocusField::PresentMode
     );
@@ -1331,6 +1378,16 @@ mod tests {
         assert!(!state.greeking);
         state.cycle_next();
         assert!(state.greeking);
+
+        // FieldMode: Left = Instanced, Right = Derived
+        state.focus = FocusField::FieldMode;
+        assert_eq!(state.field_mode, FieldMode::Instanced);
+        state.cycle_next();
+        assert_eq!(state.field_mode, FieldMode::Derived);
+        state.cycle_prev();
+        assert_eq!(state.field_mode, FieldMode::Instanced);
+        state.toggle_current();
+        assert_eq!(state.field_mode, FieldMode::Derived);
     }
 
     #[test]
