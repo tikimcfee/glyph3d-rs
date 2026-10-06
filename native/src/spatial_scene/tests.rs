@@ -469,16 +469,27 @@ fn test_workdesk_file_revisions_z_stack() {
     let t1 = scene.world.get::<Transform>(r1).unwrap();
     let t2 = scene.world.get::<Transform>(r2).unwrap();
 
+    // Initial state: Revision 0 is active at front (z = 0)
     assert_eq!(t0.translation.z, 0.0);
     assert_eq!(t1.translation.z, -12.0);
     assert_eq!(t2.translation.z, -24.0);
 
-    // Stack count and active revision should be 3 and 2
     let desk_comp = scene.world.get::<Workdesk>(desk).unwrap();
     let stack_e = *desk_comp.file_stacks.get("src/main.rs").unwrap();
     let stack_comp = scene.world.get::<FileRevisionStack>(stack_e).unwrap();
     assert_eq!(stack_comp.revision_count, 3);
-    assert_eq!(stack_comp.active_revision, 2);
+    assert_eq!(stack_comp.active_revision, 0);
+
+    // Dynamically shift active revision to revision 2: r2 moves to front (z = 0)
+    scene.world.get_mut::<FileRevisionStack>(stack_e).unwrap().active_revision = 2;
+    scene.update_transforms();
+
+    let t0 = scene.world.get::<Transform>(r0).unwrap();
+    let t1 = scene.world.get::<Transform>(r1).unwrap();
+    let t2 = scene.world.get::<Transform>(r2).unwrap();
+    assert_eq!(t2.translation.z, 0.0);
+    assert_eq!(t0.translation.z, -12.0);
+    assert_eq!(t1.translation.z, -24.0);
 }
 
 #[test]

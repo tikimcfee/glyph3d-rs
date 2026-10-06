@@ -833,7 +833,7 @@ impl WindowState {
                                 if ui.button("◀ Prev (P/←)").clicked() && total_beats > 0 {
                                     let target_beat = carrel.active_beat.saturating_sub(1);
                                     if target_beat < window_min {
-                                        let new_k = (total_beats.saturating_sub(limit).saturating_sub(target_beat)).min(max_k);
+                                        let new_k = (total_beats.saturating_sub(1).saturating_sub(target_beat)).min(max_k);
                                         let mut opts = carrel.layout_options;
                                         opts.deck_scroll_offset = new_k;
                                         opts.active_beat = Some(target_beat);
@@ -860,7 +860,7 @@ impl WindowState {
                                 if ui.button("Next (N/→) ▶").clicked() && total_beats > 0 {
                                     let target_beat = (carrel.active_beat + 1).min(total_beats.saturating_sub(1));
                                     if target_beat > window_max {
-                                        let new_k = (total_beats.saturating_sub(1).saturating_sub(target_beat)).min(max_k);
+                                        let new_k = (total_beats.saturating_sub(limit).saturating_sub(target_beat)).min(max_k);
                                         let mut opts = carrel.layout_options;
                                         opts.deck_scroll_offset = new_k;
                                         opts.active_beat = Some(target_beat);

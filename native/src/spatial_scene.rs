@@ -137,6 +137,7 @@ impl SpatialScene {
     pub fn update_transforms_animated(&mut self, dt: Option<f32>) {
         self.apply_spatial_alignments();
         self.apply_deck_layouts(dt);
+        self.apply_workdesk_layouts(dt);
         self.transform_schedule.run(&mut self.world);
         self.cached_mesh_draws = self.extract_mesh_instances();
     }

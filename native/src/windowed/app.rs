@@ -438,11 +438,14 @@ impl ApplicationHandler for App<'_> {
                 state.scene.set_viewport(size.width, size.height);
             }
             WindowEvent::RedrawRequested => {
-                state.render(&self.ctx);
                 // The layout controls apply BETWEEN frames: the panel set
                 // pending_relayout on slider release / toggle click during
-                // this render; rebuild now so the next render presents the
-                // new params.
+                // previous render or keypress; rebuild before render if pending.
+                #[cfg(feature = "egui-ui")]
+                if let Some(req) = state.pending_relayout.take() {
+                    apply_relayout(&self.ctx, &mut self.choice, self.cull_opts, self.ui, state, req);
+                }
+                state.render(&self.ctx);
                 #[cfg(feature = "egui-ui")]
                 if let Some(req) = state.pending_relayout.take() {
                     apply_relayout(&self.ctx, &mut self.choice, self.cull_opts, self.ui, state, req);
@@ -580,19 +583,6 @@ impl ApplicationHandler for App<'_> {
                                 if pressed && (code == KeyCode::KeyP || code == KeyCode::ArrowLeft) {
                                     let target_beat = carrel.active_beat.saturating_sub(1);
                                     if total_items > 0 && target_beat < window_min {
-                                        let new_k = (total_items.saturating_sub(limit).saturating_sub(target_beat)).min(max_k);
-                                        let mut new_opts = *layout_options;
-                                        new_opts.deck_scroll_offset = new_k;
-                                        new_opts.active_beat = Some(target_beat);
-                                        state.pending_relayout = Some(RelayoutRequest {
-                                            carrel_options: Some(new_opts),
-                                            ..Default::default()
-                                        });
-                                        handled = true;
-                                    }
-                                } else if pressed && (code == KeyCode::KeyN || code == KeyCode::ArrowRight) {
-                                    let target_beat = (carrel.active_beat + 1).min(total_items.saturating_sub(1));
-                                    if total_items > 0 && target_beat > window_max {
                                         let new_k = (total_items.saturating_sub(1).saturating_sub(target_beat)).min(max_k);
                                         let mut new_opts = *layout_options;
                                         new_opts.deck_scroll_offset = new_k;
@@ -601,6 +591,21 @@ impl ApplicationHandler for App<'_> {
                                             carrel_options: Some(new_opts),
                                             ..Default::default()
                                         });
+                                        state.window.request_redraw();
+                                        handled = true;
+                                    }
+                                } else if pressed && (code == KeyCode::KeyN || code == KeyCode::ArrowRight) {
+                                    let target_beat = (carrel.active_beat + 1).min(total_items.saturating_sub(1));
+                                    if total_items > 0 && target_beat > window_max {
+                                        let new_k = (total_items.saturating_sub(limit).saturating_sub(target_beat)).min(max_k);
+                                        let mut new_opts = *layout_options;
+                                        new_opts.deck_scroll_offset = new_k;
+                                        new_opts.active_beat = Some(target_beat);
+                                        state.pending_relayout = Some(RelayoutRequest {
+                                            carrel_options: Some(new_opts),
+                                            ..Default::default()
+                                        });
+                                        state.window.request_redraw();
                                         handled = true;
                                     }
                                 } else if pressed && code == KeyCode::Comma {
@@ -610,6 +615,7 @@ impl ApplicationHandler for App<'_> {
                                         carrel_options: Some(new_opts),
                                         ..Default::default()
                                     });
+                                    state.window.request_redraw();
                                     handled = true;
                                 } else if pressed && code == KeyCode::Period {
                                     let mut new_opts = *layout_options;
@@ -618,6 +624,7 @@ impl ApplicationHandler for App<'_> {
                                         carrel_options: Some(new_opts),
                                         ..Default::default()
                                     });
+                                    state.window.request_redraw();
                                     handled = true;
                                 } else if pressed && code == KeyCode::Home {
                                     let mut new_opts = *layout_options;
@@ -627,6 +634,7 @@ impl ApplicationHandler for App<'_> {
                                         carrel_options: Some(new_opts),
                                         ..Default::default()
                                     });
+                                    state.window.request_redraw();
                                     handled = true;
                                 } else if pressed && code == KeyCode::End {
                                     let mut new_opts = *layout_options;
@@ -636,12 +644,14 @@ impl ApplicationHandler for App<'_> {
                                         carrel_options: Some(new_opts),
                                         ..Default::default()
                                     });
+                                    state.window.request_redraw();
                                     handled = true;
                                 }
                             }
 
                             if !handled {
                                 state.scene.on_key(&self.ctx, code, pressed);
+                                state.window.request_redraw();
                             }
                         }
                         #[cfg(not(feature = "egui-ui"))]

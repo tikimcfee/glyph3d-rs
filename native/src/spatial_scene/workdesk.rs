@@ -112,7 +112,7 @@ impl SpatialScene {
             .map(|d| d.revision_z_pitch)
             .unwrap_or(15.0);
 
-        // Spawn new stack container with DepthZ alignment
+        // Spawn new stack container
         let stack_entity = self
             .world
             .spawn((
@@ -128,7 +128,6 @@ impl SpatialScene {
                     window_limit: 20,
                     scroll_offset: 0,
                 },
-                SpatialAlignment::depth(z_pitch, 0.0, 2.0),
             ))
             .id();
 
@@ -204,7 +203,6 @@ impl SpatialScene {
         let rev_index = if let Some(mut stack) = self.world.get_mut::<FileRevisionStack>(stack_entity) {
             let idx = stack.revision_count;
             stack.revision_count += 1;
-            stack.active_revision = idx;
             idx
         } else {
             0
@@ -218,5 +216,93 @@ impl SpatialScene {
             card_size,
             summary,
         )
+    }
+
+    /// Apply layout rules for all FileRevisionStack entities on workdesks.
+    ///
+    /// Dynamically shifts cards so that the card matching `active_revision`
+    /// sits at the front of the stack (Z = 0), with subsequent and previous
+    /// revisions cascading behind into -Z.
+    pub fn apply_workdesk_layouts(&mut self, dt: Option<f32>) {
+        let mut stacks_to_layout: Vec<(Entity, FileRevisionStack)> = Vec::new();
+        {
+            let mut query = self.world.query::<(Entity, &FileRevisionStack)>();
+            for (entity, stack) in query.iter(&self.world) {
+                stacks_to_layout.push((entity, stack.clone()));
+            }
+        }
+
+        for (stack_entity, stack) in stacks_to_layout {
+            let children_entities: Vec<Entity> = if let Some(children) = self.world.get::<Children>(stack_entity) {
+                children.to_vec()
+            } else {
+                continue;
+            };
+
+            let n = children_entities.len();
+            if n == 0 {
+                continue;
+            }
+
+            // Find child matching stack.active_revision
+            let active_idx = children_entities
+                .iter()
+                .position(|&child| {
+                    self.world
+                        .get::<FileRevisionCard>(child)
+                        .map(|c| c.revision_index == stack.active_revision)
+                        .unwrap_or(false)
+                })
+                .unwrap_or(0);
+
+            let cascade_x = 0.0f32;
+            let cascade_y = 2.0f32;
+            let z_pitch = stack.z_pitch;
+
+            let easing_alpha = dt.map(|delta| (1.0 - (-14.0 * delta).exp()).clamp(0.0, 1.0));
+            let mut min_bound = glam::Vec3::splat(f32::INFINITY);
+            let mut max_bound = glam::Vec3::splat(f32::NEG_INFINITY);
+
+            for (i, &child) in children_entities.iter().enumerate() {
+                let delta = if i >= active_idx {
+                    i - active_idx
+                } else {
+                    n - 1 - (active_idx - i - 1)
+                } as f32;
+
+                let target_trans = glam::Vec3::new(
+                    delta * cascade_x,
+                    delta * cascade_y,
+                    -delta * z_pitch,
+                );
+
+                if let Some(mut transform) = self.world.get_mut::<Transform>(child) {
+                    if let Some(alpha) = easing_alpha {
+                        transform.translation = transform.translation.lerp(target_trans, alpha);
+                    } else {
+                        transform.translation = target_trans;
+                    }
+                }
+
+                if let Some(lb) = self.world.get::<LocalBounds>(child) {
+                    let c_min = target_trans + glam::Vec3::from(lb.min);
+                    let c_max = target_trans + glam::Vec3::from(lb.max);
+                    min_bound = min_bound.min(c_min);
+                    max_bound = max_bound.max(c_max);
+                }
+            }
+
+            if min_bound.x.is_finite() && max_bound.x.is_finite() {
+                let container_bounds = LocalBounds {
+                    min: min_bound.to_array(),
+                    max: max_bound.to_array(),
+                };
+                if let Some(mut lb) = self.world.get_mut::<LocalBounds>(stack_entity) {
+                    *lb = container_bounds;
+                } else {
+                    self.world.entity_mut(stack_entity).insert(container_bounds);
+                }
+            }
+        }
     }
 }
