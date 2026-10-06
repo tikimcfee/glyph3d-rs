@@ -1,5 +1,8 @@
 use cubecl::prelude::*;
 
+use super::cluster::{cp_at, seq_len_at};
+use super::decode::decode_trie;
+
 use super::monoid::{
     combine, flags_at, identity, item_search_desc, leaf_of,
     ordered_key, p_load, p_store, rows_for, s_load, s_store, wrap_row_of, wrap_segment_of,
@@ -24,7 +27,11 @@ use super::{
 #[cube(launch_unchecked)]
 pub(super) fn tile_scan(
     glyph_flags: &[u32],
-    advance_widths: &[f32],
+    bytes: &[u32],
+    trie_block_indices: &[u32],
+    trie_block_metrics: &[f32],
+    trie_block_codepoints: &[u32],
+    #[comptime] trie_block_shift: u32,
     item_descriptors: &[u32],
     tile_counts: &mut [u32],
     tile_metrics: &mut [f32],
@@ -83,7 +90,15 @@ pub(super) fn tile_scan(
                 active_cell_advance_bits = item_descriptors[item_index * ITEM_DESC_STRIDE + ITEM_DESC_CELL_ADVANCE];
             }
             let reset = if has_items && id == start { 1i32 } else { 0i32 };
-            let leaf = leaf_of(glyph_flags, advance_widths, active_wrap_width, active_wrap_mode, reset, active_cell_advance_bits, id);
+            let advance = if (flags_at(glyph_flags, id) & super::F_LEADER) != 0 {
+                let cp_len = seq_len_at(bytes, id, total_bytes);
+                let cp = cp_at(bytes, id, cp_len, total_bytes);
+                let (adv, _) = decode_trie(cp, trie_block_indices, trie_block_metrics, trie_block_codepoints, trie_block_shift);
+                adv
+            } else {
+                0.0f32
+            };
+            let leaf = leaf_of(glyph_flags, advance, active_wrap_width, active_wrap_mode, reset, active_cell_advance_bits, id);
             combine(&mut accumulator, &leaf);
             id += 1;
         }
@@ -260,7 +275,11 @@ pub(super) fn fold_of(item_descriptors: &[u32], item_index: usize, wrap_width: i
 #[cube(launch_unchecked)]
 pub(super) fn apply(
     glyph_flags: &[u32],
-    advance_widths: &[f32],
+    bytes: &[u32],
+    trie_block_indices: &[u32],
+    trie_block_metrics: &[f32],
+    trie_block_codepoints: &[u32],
+    #[comptime] trie_block_shift: u32,
     line_columns: &mut [u32],
     layout_metrics: &mut [f32],
     item_descriptors: &[u32],
@@ -351,7 +370,15 @@ pub(super) fn apply(
                 active_cell_advance_bits = item_descriptors[item_index * ITEM_DESC_STRIDE + ITEM_DESC_CELL_ADVANCE];
             }
             let reset = if has_items && id == start { 1i32 } else { 0i32 };
-            let leaf = leaf_of(glyph_flags, advance_widths, active_wrap_width, active_wrap_mode, reset, active_cell_advance_bits, id);
+            let advance = if (flags_at(glyph_flags, id) & super::F_LEADER) != 0 {
+                let cp_len = seq_len_at(bytes, id, total_bytes);
+                let cp = cp_at(bytes, id, cp_len, total_bytes);
+                let (adv, _) = decode_trie(cp, trie_block_indices, trie_block_metrics, trie_block_codepoints, trie_block_shift);
+                adv
+            } else {
+                0.0f32
+            };
+            let leaf = leaf_of(glyph_flags, advance, active_wrap_width, active_wrap_mode, reset, active_cell_advance_bits, id);
             combine(&mut accumulator, &leaf);
             id += 1;
         }
@@ -526,7 +553,15 @@ pub(super) fn apply(
                     }
                 }
             }
-            let leaf = leaf_of(glyph_flags, advance_widths, active_wrap_width, active_wrap_mode, if reset { 1i32 } else { 0i32 }, active_cell_advance_bits, id);
+            let advance = if (flags_at(glyph_flags, id) & super::F_LEADER) != 0 {
+                let cp_len = seq_len_at(bytes, id, total_bytes);
+                let cp = cp_at(bytes, id, cp_len, total_bytes);
+                let (adv, _) = decode_trie(cp, trie_block_indices, trie_block_metrics, trie_block_codepoints, trie_block_shift);
+                adv
+            } else {
+                0.0f32
+            };
+            let leaf = leaf_of(glyph_flags, advance, active_wrap_width, active_wrap_mode, if reset { 1i32 } else { 0i32 }, active_cell_advance_bits, id);
             combine(&mut run, &leaf);
             id += 1;
         }

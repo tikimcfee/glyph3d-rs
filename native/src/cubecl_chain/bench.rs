@@ -176,7 +176,7 @@ pub fn bench(ctx: &GpuContext, corpus_path: &Path) -> ! {
     let cdev = cubecl::wgpu::init_device(setup, Default::default());
     let client = cubecl::Device::Wgpu(cdev).client();
     let n_words = n.div_ceil(4);
-    let (h_fl, h_sm, h_gi, h_hgt) = if decode_mode {
+    let (h_fl, h_sm, _h_gi, h_hgt) = if decode_mode {
         (
             client.empty(n_words * 4),
             client.empty(n * 4),
@@ -331,8 +331,7 @@ pub fn bench(ctx: &GpuContext, corpus_path: &Path) -> ! {
                     BufferArg::from_raw_parts(h_bm.clone(), bm.len()),
                     BufferArg::from_raw_parts(h_bc.clone(), bc.len()),
                     BufferArg::from_raw_parts(h_fl.clone(), n_words),
-                    BufferArg::from_raw_parts(h_sm.clone(), n),
-                    BufferArg::from_raw_parts(h_gi.clone(), n),
+                    
                     BufferArg::from_raw_parts(h_hgt.clone(), n),
                     BufferArg::from_raw_parts(h_cslot.clone(), n),
                     bshift,
@@ -349,8 +348,7 @@ pub fn bench(ctx: &GpuContext, corpus_path: &Path) -> ! {
                     BufferArg::from_raw_parts(h_ir.clone(), 2),
                     BufferArg::from_raw_parts(h_ic.clone(), ic.len()),
                     BufferArg::from_raw_parts(h_fl.clone(), n_words),
-                    BufferArg::from_raw_parts(h_sm.clone(), n),
-                    BufferArg::from_raw_parts(h_gi.clone(), n),
+                    
                     BufferArg::from_raw_parts(h_cslot.clone(), n),
                     BufferArg::from_raw_parts(h_cend.clone(), n),
                     seq_max,
@@ -427,8 +425,7 @@ pub fn bench(ctx: &GpuContext, corpus_path: &Path) -> ! {
                     BufferArg::from_raw_parts(h_bm.clone(), bm.len()),
                     BufferArg::from_raw_parts(h_bc.clone(), bc.len()),
                     BufferArg::from_raw_parts(h_fl.clone(), n_words),
-                    BufferArg::from_raw_parts(h_sm.clone(), n),
-                    BufferArg::from_raw_parts(h_gi.clone(), n),
+                    
                     BufferArg::from_raw_parts(h_hgt.clone(), n),
                     BufferArg::from_raw_parts(h_cslot.clone(), n),
                     bshift,
@@ -450,8 +447,7 @@ pub fn bench(ctx: &GpuContext, corpus_path: &Path) -> ! {
                     BufferArg::from_raw_parts(h_ir.clone(), 2),
                     BufferArg::from_raw_parts(h_ic.clone(), ic.len()),
                     BufferArg::from_raw_parts(h_fl.clone(), n_words),
-                    BufferArg::from_raw_parts(h_sm.clone(), n),
-                    BufferArg::from_raw_parts(h_gi.clone(), n),
+                    
                     BufferArg::from_raw_parts(h_cslot.clone(), n),
                     BufferArg::from_raw_parts(h_cend.clone(), n),
                     seq_max,
@@ -560,8 +556,7 @@ pub fn bench(ctx: &GpuContext, corpus_path: &Path) -> ! {
                     BufferArg::from_raw_parts(h_ir.clone(), 2),
                     BufferArg::from_raw_parts(h_cend.clone(), n),
                     BufferArg::from_raw_parts(h_cslot.clone(), n),
-                    BufferArg::from_raw_parts(h_sm.clone(), n),
-                    BufferArg::from_raw_parts(h_gi.clone(), n),
+                    
                     BufferArg::from_raw_parts(h_fl.clone(), n_words),
                     kmax as usize,
                     cstride,
@@ -579,7 +574,11 @@ pub fn bench(ctx: &GpuContext, corpus_path: &Path) -> ! {
                         tiles_grid(n_tiles),
                         CubeDim::new_1d(units as u32),
                         BufferArg::from_raw_parts(h_fl.clone(), n_words),
-                        BufferArg::from_raw_parts(h_sm.clone(), n),
+                        BufferArg::from_raw_parts(h_fl.clone(), n_words),
+                        BufferArg::from_raw_parts(h_bi.clone(), bi.len()),
+                        BufferArg::from_raw_parts(h_bm.clone(), bm.len()),
+                        BufferArg::from_raw_parts(h_bc.clone(), bc.len()),
+                        bshift,
                         BufferArg::from_raw_parts(h_item_desc.clone(), ITEM_DESC_STRIDE),
                         BufferArg::from_raw_parts(h_tc.clone(), n_tiles * PARTIAL_COUNT_STRIDE),
                         BufferArg::from_raw_parts(h_tm.clone(), n_tiles),
@@ -607,7 +606,11 @@ pub fn bench(ctx: &GpuContext, corpus_path: &Path) -> ! {
                         tiles_grid(n_tiles),
                         CubeDim::new_1d(units as u32),
                         BufferArg::from_raw_parts(h_fl.clone(), n_words),
-                        BufferArg::from_raw_parts(h_sm.clone(), n),
+                        BufferArg::from_raw_parts(h_fl.clone(), n_words),
+                        BufferArg::from_raw_parts(h_bi.clone(), bi.len()),
+                        BufferArg::from_raw_parts(h_bm.clone(), bm.len()),
+                        BufferArg::from_raw_parts(h_bc.clone(), bc.len()),
+                        bshift,
                         BufferArg::from_raw_parts(h_lc.clone(), n * LC_STRIDE),
                         BufferArg::from_raw_parts(h_lm.clone(), n * LM_STRIDE),
                         BufferArg::from_raw_parts(h_item_desc.clone(), ITEM_DESC_STRIDE),
@@ -658,7 +661,15 @@ pub fn bench(ctx: &GpuContext, corpus_path: &Path) -> ! {
                             &client,
                             cubes_of(n.div_ceil(rspan)),
                             CubeDim::new_1d(256),
-                            BufferArg::from_raw_parts(h_sm.clone(), n),
+                            BufferArg::from_raw_parts(h_bytes.clone(), n_words),
+                            BufferArg::from_raw_parts(h_bi.clone(), bi.len()),
+                            BufferArg::from_raw_parts(h_bm.clone(), bm.len()),
+                            BufferArg::from_raw_parts(h_bc.clone(), bc.len()),
+                            bshift,
+                            BufferArg::from_raw_parts(h_cslot.clone(), n),
+                            BufferArg::from_raw_parts(h_cslot.clone(), n),
+                            BufferArg::from_raw_parts(h_cslot.clone(), 1),
+                            136.0f32,
                             BufferArg::from_raw_parts(h_fl.clone(), n_words),
                             BufferArg::from_raw_parts(h_lm.clone(), n * LM_STRIDE),
                             BufferArg::from_raw_parts(h_lc.clone(), n * LC_STRIDE),

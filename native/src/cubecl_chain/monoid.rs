@@ -4,7 +4,7 @@ use super::{
     F_CLUSTER_TRAILER, F_LEADER, F_NEWLINE, F_SURVIVOR, ITEM_DESC_BYTE_START, ITEM_DESC_STRIDE,
     P_CLEAN_BREAK, P_CLEAN_LEN, P_GLYPHS, P_HEAD_LEN, P_MODE, P_NL, P_RESET, P_ROWS, P_SURVIVORS,
     P_TAIL_LEN, P_WRAP,
-    PARTIAL_COUNT_STRIDE, SM_ADVANCE, SM_STRIDE, WRAP_BACK,
+    PARTIAL_COUNT_STRIDE, WRAP_BACK,
 };
 
 // ── the monoid, device-side ──────────────────────────────────────────────────
@@ -208,7 +208,7 @@ pub(super) fn is_survivor(glyph_flag: u32) -> bool {
 #[cube]
 pub(super) fn leaf_of(
     glyph_flags: &[u32],
-    advance_widths: &[f32],
+    advance: f32,
     wrap_width: i32,
     wrap_mode: i32,
     is_item_reset: i32,
@@ -234,9 +234,8 @@ pub(super) fn leaf_of(
         } else {
             element.head_len = 1;
             element.tail_len = 1;
-            let leader_advance = advance_widths[byte_index * SM_STRIDE + SM_ADVANCE];
-            element.tail_adv = leader_advance;
-            if leader_advance.to_bits() == cell_advance_bits {
+            element.tail_adv = advance;
+            if advance.to_bits() == cell_advance_bits {
                 element.clean_len = 1;
             } else {
                 element.clean_break = 1;

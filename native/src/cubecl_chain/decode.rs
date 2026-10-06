@@ -29,8 +29,7 @@ pub(super) fn decode(
     blocks_m: &[f32],
     blocks_c: &[u32],
     glyph_flags: &mut [u32],
-    advance_widths: &mut [f32],
-    glyph_indices: &mut [u32],
+    
     glyph_heights: &mut [f32],
     candidate_slots: &mut [u32],
     block_shift: u32,
@@ -89,7 +88,7 @@ pub(super) fn decode(
                         0u32
                     };
                     let entry_offset = ((block << block_shift) | (codepoint & 0xFFu32)) as usize;
-                    advance_widths[byte_index] = blocks_m[entry_offset * 2];
+                    
                     // glyph_indices and height ride the same two-level lookup the
                     // advance does — blocks_c's low word is the glyph id,
                     // blocks_m's high word the height (both pre-converted
@@ -97,7 +96,7 @@ pub(super) fn decode(
                     // record emitter's GLYPH_ID (phase 4 rung 1; the module
                     // header's "no device writer" gap closes here).
                     let glyph_id = blocks_c[entry_offset * 2];
-                    glyph_indices[byte_index] = glyph_id;
+                    
                     glyph_heights[byte_index] = blocks_m[entry_offset * 2 + 1];
                     let flag = F_LEADER
                         | (if lead_byte == 10u32 {
@@ -120,8 +119,8 @@ pub(super) fn decode(
                     // decode_and_resolve zeroes the statics of a non-leader
                     // — glyph_indices and height included (the fold's sm stride-2
                     // reference zeroes both lanes).
-                    advance_widths[byte_index] = f32::from_bits(0u32);
-                    glyph_indices[byte_index] = 0u32;
+                    
+                    
                     glyph_heights[byte_index] = f32::from_bits(0u32);
                 }
             }
@@ -169,7 +168,7 @@ pub(super) fn byte_from_pair(curr: u32, next: u32, offset: usize, id: usize, n: 
 pub(super) fn decode_probe(
     bytes: &[u32],
     block_index: &[u32],
-    blocks_m: &[f32],
+    _blocks_m: &[f32],
     blocks_c: &[u32],
     bitmap: &[u32],
     secondary_offsets: &[u32],
@@ -178,8 +177,7 @@ pub(super) fn decode_probe(
     item_record_bounds: &[u32],
     item_cluster_enabled: &[u32],
     glyph_flags: &mut [u32],
-    advance_widths: &mut [f32],
-    glyph_indices: &mut [u32],
+    
     candidate_head_positions: &mut [u32],
     candidate_slots: &mut [u32],
     candidate_end_positions: &mut [u32],
@@ -235,9 +233,9 @@ pub(super) fn decode_probe(
                         0u32
                     };
                     let entry_offset = ((block << block_shift) | (codepoint & 0xFFu32)) as usize;
-                    advance_widths[byte_index] = blocks_m[entry_offset * 2];
+                    
                     let glyph_id = blocks_c[entry_offset * 2];
-                    glyph_indices[byte_index] = glyph_id;
+                    
                     let mut flag = F_LEADER
                         | (if lead_byte == 10u32 {
                             F_NEWLINE
@@ -266,8 +264,8 @@ pub(super) fn decode_probe(
                     }
                     if cluster_enabled && byte_index >= item_start_byte && byte_index < item_end_byte {
                         if is_static_zero(codepoint) != 0u32 {
-                            advance_widths[byte_index] = f32::from_bits(0u32);
-                            glyph_indices[byte_index] = 0u32;
+                            
+                            
                             flag = (flag & !F_SURVIVOR) | F_CLUSTER_TRAILER;
                         } else {
                             let mut bit = 0u32;
@@ -426,9 +424,6 @@ pub(super) fn decode_probe(
                         }
                     }
                     packed_word |= flag << ((lane as u32) * 8u32);
-                } else {
-                    advance_widths[byte_index] = f32::from_bits(0u32);
-                    glyph_indices[byte_index] = 0u32;
                 }
             }
             lane += 1usize;
@@ -437,3 +432,22 @@ pub(super) fn decode_probe(
     }
 }
 
+
+#[cube]
+pub(super) fn decode_trie(
+    codepoint: u32,
+    block_index: &[u32],
+    blocks_m: &[f32],
+    blocks_c: &[u32],
+    block_shift: u32,
+) -> (f32, u32) {
+    let block = if codepoint <= 0x10FFFFu32 {
+        block_index[(codepoint >> block_shift) as usize]
+    } else {
+        0u32
+    };
+    let entry_offset = ((block << block_shift) | (codepoint & 0xFFu32)) as usize;
+    let advance = blocks_m[entry_offset * 2];
+    let glyph_id = blocks_c[entry_offset * 2];
+    (advance, glyph_id)
+}

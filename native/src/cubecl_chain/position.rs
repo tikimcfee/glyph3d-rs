@@ -6,8 +6,10 @@ use super::monoid::{
     wrap_segment_of,
 };
 use super::scan::fold_of;
+use super::cluster::{cp_at, seq_len_at};
+use super::decode::decode_trie;
 use super::{
-    F_LEADER, F_NEWLINE,
+    F_CLUSTER_HEAD, F_LEADER, F_NEWLINE,
     ITEM_DESC_BAND_STRIDE_Y, ITEM_DESC_BYTE_START, ITEM_DESC_CELL_ADVANCE, ITEM_DESC_COLOR_BASE, ITEM_DESC_DEPTH_PER_BAND,
     ITEM_DESC_DEPTH_PER_COL, ITEM_DESC_FLAT_COLOR, ITEM_DESC_GROUP, ITEM_DESC_HAS_PAGE,
     ITEM_DESC_IS_PER_RECORD, ITEM_DESC_LINE_HEIGHT, ITEM_DESC_ORIGIN_X, ITEM_DESC_ORIGIN_Y,
@@ -40,7 +42,15 @@ use super::tail::EXT_STRIDE;
 // from 1 and every x >= 0 has an ordered key above 0.
 #[cube(launch_unchecked)]
 pub(super) fn resolve_x(
-    advance_widths: &[f32],
+    bytes: &[u32],
+    trie_block_indices: &[u32],
+    trie_block_metrics: &[f32],
+    trie_block_codepoints: &[u32],
+    #[comptime] trie_block_shift: u32,
+    _candidate_head_positions: &[u32],
+    _candidate_slots: &[u32],
+    _candidate_total: &[u32],
+    bitmap_advance: f32,
     glyph_flags: &[u32],
     layout_metrics: &mut [f32],
     line_columns: &[u32],
@@ -206,7 +216,16 @@ pub(super) fn resolve_x(
                     let mut back_col = seg_col;
                     while back_col >= 1 {
                         let prev_byte_idx = ordinal_to_byte_map[start + (item_ordinal - back_col) as usize] as usize;
-                        x += advance_widths[prev_byte_idx];
+                        
+                        let adv = if (flags_at(glyph_flags, prev_byte_idx) & F_CLUSTER_HEAD) != 0 {
+                            bitmap_advance
+                        } else {
+                            let cp_len = seq_len_at(bytes, prev_byte_idx, total_bytes);
+                            let cp = cp_at(bytes, prev_byte_idx, cp_len, total_bytes);
+                            let (decoded_adv, _) = decode_trie(cp, trie_block_indices, trie_block_metrics, trie_block_codepoints, trie_block_shift);
+                            decoded_adv
+                        };
+                        x += adv;
                         back_col -= 1;
                     }
                     in_seg = true;
@@ -259,7 +278,16 @@ pub(super) fn resolve_x(
                 if (glyph_flags_val & F_NEWLINE) == 0 {
                     // This leader's advance feeds the next x — the same add
                     // the backward re-sum performed, one step forward.
-                    x += advance_widths[id];
+                    
+                    let adv = if (glyph_flags_val & F_CLUSTER_HEAD) != 0 {
+                        bitmap_advance
+                    } else {
+                        let cp_len = seq_len_at(bytes, id, total_bytes);
+                        let cp = cp_at(bytes, id, cp_len, total_bytes);
+                        let (decoded_adv, _) = decode_trie(cp, trie_block_indices, trie_block_metrics, trie_block_codepoints, trie_block_shift);
+                        decoded_adv
+                    };
+                    x += adv;
                 }
             }
             id += 1;
@@ -292,12 +320,19 @@ pub(super) fn resolve_x(
 #[cube(launch_unchecked)]
 pub(super) fn apply_and_emit(
     glyph_flags: &[u32],
-    advance_widths: &[f32],
+    bytes: &[u32],
+    trie_block_indices: &[u32],
+    trie_block_metrics: &[f32],
+    trie_block_codepoints: &[u32],
+    #[comptime] trie_block_shift: u32,
+    _candidate_head_positions: &[u32],
+    _candidate_slots: &[u32],
+    _candidate_total: &[u32],
+    bitmap_advance: f32,
     item_descriptors: &[u32],
     tile_spine_counts: &[u32],
     tile_spine_metrics: &[f32],
     max_row_extents: &[u32],
-    glyph_indices: &[u32],
     item_extents: &mut [Atomic<u32>],
     per_record_semantic_colors: &[u32],
     segment_entry_advances: &[f32],
@@ -409,7 +444,15 @@ pub(super) fn apply_and_emit(
                 active_cell_advance_bits = item_descriptors[item_index * ITEM_DESC_STRIDE + ITEM_DESC_CELL_ADVANCE];
             }
             let reset = if has_items && id == start { 1i32 } else { 0i32 };
-            let leaf = leaf_of(glyph_flags, advance_widths, active_wrap_width, active_wrap_mode, reset, active_cell_advance_bits, id);
+            let advance = if (flags_at(glyph_flags, id) & F_LEADER) != 0 {
+                let cp_len = seq_len_at(bytes, id, total_bytes);
+                let cp = cp_at(bytes, id, cp_len, total_bytes);
+                let (adv, _) = decode_trie(cp, trie_block_indices, trie_block_metrics, trie_block_codepoints, trie_block_shift);
+                adv
+            } else {
+                0.0f32
+            };
+            let leaf = leaf_of(glyph_flags, advance, active_wrap_width, active_wrap_mode, reset, active_cell_advance_bits, id);
             combine(&mut accumulator, &leaf);
             id += 1;
         }
@@ -470,7 +513,15 @@ pub(super) fn apply_and_emit(
     while preload_byte_idx < total_tile_bytes {
         let global_byte_idx = tile_byte_start + preload_byte_idx;
         let adv_val = if global_byte_idx < total_bytes {
-            advance_widths[global_byte_idx]
+            let flag = (shared_tile_flags[preload_byte_idx >> 2] >> (((preload_byte_idx & 3) * 8) as u32)) & 0xFF;
+            if (flag & F_CLUSTER_HEAD) != 0 {
+                bitmap_advance
+            } else {
+                let cp_len = seq_len_at(bytes, global_byte_idx, total_bytes);
+                let cp = cp_at(bytes, global_byte_idx, cp_len, total_bytes);
+                let (adv, _) = decode_trie(cp, trie_block_indices, trie_block_metrics, trie_block_codepoints, trie_block_shift);
+                adv
+            }
         } else {
             0.0f32
         };
@@ -667,7 +718,15 @@ pub(super) fn apply_and_emit(
                             let mut forward_index = start_byte_index as usize;
                             while forward_index < id {
                                 if (flags_at(glyph_flags, forward_index) & F_LEADER) != 0 {
-                                    current_advance_x += advance_widths[forward_index];
+                                    let flag = flags_at(glyph_flags, forward_index);
+                                    if (flag & F_CLUSTER_HEAD) != 0 {
+                                        current_advance_x += bitmap_advance;
+                                    } else {
+                                        let cp_len = seq_len_at(bytes, forward_index, total_bytes);
+                                        let cp = cp_at(bytes, forward_index, cp_len, total_bytes);
+                                        let (adv, _) = decode_trie(cp, trie_block_indices, trie_block_metrics, trie_block_codepoints, trie_block_shift);
+                                        current_advance_x += adv;
+                                    }
                                 }
                                 forward_index += 1;
                             }
@@ -787,10 +846,34 @@ pub(super) fn apply_and_emit(
                     } else {
                         item_flat_color
                     };
+                    let mut glyph_id = 0u32;
+                    if (glyph_flags_val & F_CLUSTER_HEAD) != 0 {
+                        let total = _candidate_total[0];
+                        let mut lo = 0u32;
+                        let mut hi = total;
+                        while lo < hi {
+                            let mid = (lo + hi) / 2u32;
+                            let pos = _candidate_head_positions[mid as usize];
+                            if pos < id as u32 {
+                                lo = mid + 1u32;
+                            } else {
+                                hi = mid;
+                            }
+                        }
+                        if lo < total && _candidate_head_positions[lo as usize] == id as u32 {
+                            glyph_id = _candidate_slots[lo as usize];
+                        }
+                    } else {
+                        let cp_len = seq_len_at(bytes, id, total_bytes);
+                        let cp = cp_at(bytes, id, cp_len, total_bytes);
+                        let (_, decoded_glyph_id) = decode_trie(cp, trie_block_indices, trie_block_metrics, trie_block_codepoints, trie_block_shift);
+                        glyph_id = decoded_glyph_id;
+                    }
+
                     if emit_derived {
                         let slot_word_offset = survivor_ordinal as usize * 5;
                         if slot_word_offset + 5 <= instance_slots.len() {
-                            let glyph_and_wrap = glyph_indices[id] | ((wrap_segment as u32) << 16u32);
+                            let glyph_and_wrap = glyph_id | ((wrap_segment as u32) << 16u32);
                             instance_slots[slot_word_offset] = final_x.to_bits();
                             instance_slots[slot_word_offset + 1] = row as u32;
                             instance_slots[slot_word_offset + 2] = glyph_and_wrap;
@@ -803,7 +886,7 @@ pub(super) fn apply_and_emit(
                             instance_slots[slot_word_offset] = final_x.to_bits();
                             instance_slots[slot_word_offset + 1] = final_y.to_bits();
                             instance_slots[slot_word_offset + 2] = final_z.to_bits();
-                            instance_slots[slot_word_offset + 3] = glyph_indices[id];
+                            instance_slots[slot_word_offset + 3] = glyph_id;
                             instance_slots[slot_word_offset + 4] = color;
                             instance_slots[slot_word_offset + 5] = item_group_id;
                             instance_slots[slot_word_offset + 6] = glyph_advance.to_bits();
@@ -812,7 +895,7 @@ pub(super) fn apply_and_emit(
                     }
                     let tint_word_offset = survivor_ordinal as usize * 2;
                     if tint_word_offset + 2 <= instance_tints.len() {
-                        instance_tints[tint_word_offset] = glyph_indices[id];
+                        instance_tints[tint_word_offset] = glyph_id;
                         instance_tints[tint_word_offset + 1] = color;
                     }
                     survivor_ordinal += 1u32;
@@ -822,7 +905,8 @@ pub(super) fn apply_and_emit(
                     current_advance_x += glyph_advance;
                 }
             }
-            let leaf = leaf_of(glyph_flags, advance_widths, active_wrap_width, active_wrap_mode, if reset { 1i32 } else { 0i32 }, active_cell_advance_bits, id);
+            let advance_for_leaf = if (glyph_flags_val & F_LEADER) != 0 { f32::from_bits(shared_counts[local_id] as u32) } else { 0.0f32 };
+            let leaf = leaf_of(glyph_flags, advance_for_leaf, active_wrap_width, active_wrap_mode, if reset { 1i32 } else { 0i32 }, active_cell_advance_bits, id);
             combine(&mut run, &leaf);
             id += 1;
         }

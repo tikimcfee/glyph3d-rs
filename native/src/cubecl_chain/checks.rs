@@ -167,6 +167,16 @@ pub fn run(ctx: &GpuContext, fixture_path: &Path) -> ! {
     let h_advance_widths = client.create_from_slice(bytemuck::cast_slice(&advance_widths));
     let h_glyph_indices = client.create_from_slice(bytemuck::cast_slice(&giv));
     let h_glyph_heights = client.create_from_slice(bytemuck::cast_slice(&hgv));
+    let packed_bytes = super::pack_words(&fx.bytes);
+    let h_bytes = client.create_from_slice(bytemuck::cast_slice(&packed_bytes));
+    let h_trie_idx = client.create_from_slice(bytemuck::cast_slice(&fx.trie.block_index));
+    let h_trie_m = client.create_from_slice(bytemuck::cast_slice(&fx.trie.blocks_m));
+    let h_trie_c = client.create_from_slice(bytemuck::cast_slice(&fx.trie.blocks_c));
+    let trie_block_indices_len = fx.trie.block_index.len();
+    let trie_block_metrics_len = fx.trie.blocks_m.len();
+    let trie_block_codepoints_len = fx.trie.blocks_c.len();
+    let trie_block_shift = crate::glyph_trie::BLOCK_SHIFT;
+    let h_cslot = client.empty(n * 4);
     let h_recs = client.empty(leaders.max(1) * 8 * 4);
     // Per-item record bases: the record stream is item order, ordinal
     // order within items — base[it] is where item it's records start.
@@ -241,7 +251,11 @@ pub fn run(ctx: &GpuContext, fixture_path: &Path) -> ! {
             tiles_grid(n_tiles),
             CubeDim::new_1d(threads_per_cube as u32),
             BufferArg::from_raw_parts(h_glyph_flags.clone(), n_words),
-            BufferArg::from_raw_parts(h_advance_widths.clone(), n),
+            BufferArg::from_raw_parts(h_bytes.clone(), n_words),
+            BufferArg::from_raw_parts(h_trie_idx.clone(), trie_block_indices_len),
+            BufferArg::from_raw_parts(h_trie_m.clone(), trie_block_metrics_len),
+            BufferArg::from_raw_parts(h_trie_c.clone(), trie_block_codepoints_len),
+            trie_block_shift,
             BufferArg::from_raw_parts(h_item_desc.clone(), item_descriptors.len()),
             BufferArg::from_raw_parts(h_tc.clone(), n_tiles * PARTIAL_COUNT_STRIDE),
             BufferArg::from_raw_parts(h_tm.clone(), n_tiles),
@@ -275,7 +289,11 @@ pub fn run(ctx: &GpuContext, fixture_path: &Path) -> ! {
                 tiles_grid(n_tiles),
                 CubeDim::new_1d(threads_per_cube as u32),
                 BufferArg::from_raw_parts(h_glyph_flags.clone(), n_words),
-                BufferArg::from_raw_parts(h_advance_widths.clone(), n),
+                BufferArg::from_raw_parts(h_bytes.clone(), n_words),
+                BufferArg::from_raw_parts(h_trie_idx.clone(), trie_block_indices_len),
+                BufferArg::from_raw_parts(h_trie_m.clone(), trie_block_metrics_len),
+                BufferArg::from_raw_parts(h_trie_c.clone(), trie_block_codepoints_len),
+                trie_block_shift,
                 BufferArg::from_raw_parts(h_lc.clone(), n * LC_STRIDE),
                 BufferArg::from_raw_parts(h_lm.clone(), n * LM_STRIDE),
                 BufferArg::from_raw_parts(h_item_desc.clone(), item_descriptors.len()),
@@ -315,7 +333,15 @@ pub fn run(ctx: &GpuContext, fixture_path: &Path) -> ! {
                 &client,
                 cubes_of(n.div_ceil(rspan)),
                 CubeDim::new_1d(256),
-                BufferArg::from_raw_parts(h_advance_widths.clone(), n),
+                BufferArg::from_raw_parts(h_bytes.clone(), n_words),
+                BufferArg::from_raw_parts(h_trie_idx.clone(), trie_block_indices_len),
+                BufferArg::from_raw_parts(h_trie_m.clone(), trie_block_metrics_len),
+                BufferArg::from_raw_parts(h_trie_c.clone(), trie_block_codepoints_len),
+                trie_block_shift,
+                BufferArg::from_raw_parts(h_cslot.clone(), n_words),
+                BufferArg::from_raw_parts(h_cslot.clone(), n_words),
+                BufferArg::from_raw_parts(h_cslot.clone(), 1),
+                136.0f32,
                 BufferArg::from_raw_parts(h_glyph_flags.clone(), n_words),
                 BufferArg::from_raw_parts(h_lm.clone(), n * LM_STRIDE),
                 BufferArg::from_raw_parts(h_lc.clone(), n * LC_STRIDE),
@@ -624,8 +650,6 @@ pub fn decode_check(ctx: &GpuContext, fixture_path: &Path) -> ! {
     let h_bm = client.create_from_slice(bytemuck::cast_slice(&fx.trie.blocks_m));
     let h_bc = client.create_from_slice(bytemuck::cast_slice(&fx.trie.blocks_c));
     let h_glyph_flags = client.empty(n_words * 4);
-    let h_advance_widths = client.empty(n * 4);
-    let h_glyph_indices = client.empty(n * 4);
     let h_glyph_heights = client.empty(n * 4);
     // decode clears the candidate-slot lane as of 2026-09-30; this driver
     // never reads it, so a plain allocation rides the launch.
@@ -645,21 +669,15 @@ pub fn decode_check(ctx: &GpuContext, fixture_path: &Path) -> ! {
             BufferArg::from_raw_parts(h_bm.clone(), fx.trie.blocks_m.len()),
             BufferArg::from_raw_parts(h_bc.clone(), fx.trie.blocks_c.len()),
             BufferArg::from_raw_parts(h_glyph_flags.clone(), n_words),
-            BufferArg::from_raw_parts(h_advance_widths.clone(), n),
-            BufferArg::from_raw_parts(h_glyph_indices.clone(), n),
             BufferArg::from_raw_parts(h_glyph_heights.clone(), n),
             BufferArg::from_raw_parts(h_cslot.clone(), n),
             crate::glyph_trie::BLOCK_SHIFT,
         );
     }
     let fl_bytes = client.read_one(h_glyph_flags).expect("read fl");
-    let sm_bytes = client.read_one(h_advance_widths).expect("read sm");
-    let gi_bytes = client.read_one(h_glyph_indices).expect("read gi");
     let hgt_bytes = client.read_one(h_glyph_heights).expect("read hgt");
     let dt = t0.elapsed();
     let flw: &[u32] = bytemuck::cast_slice(&fl_bytes);
-    let advance_widths: &[f32] = bytemuck::cast_slice(&sm_bytes);
-    let giv: &[u32] = bytemuck::cast_slice(&gi_bytes);
     let hgv: &[f32] = bytemuck::cast_slice(&hgt_bytes);
 
     let mut bad = 0usize;
@@ -669,22 +687,6 @@ pub fn decode_check(ctx: &GpuContext, fixture_path: &Path) -> ! {
         if want_f != got_f {
             if bad < 8 {
                 println!("  MISMATCH byte {id} flags: cpu {want_f:#04x} gpu {got_f:#04x}");
-            }
-            bad += 1;
-        }
-        if slots.advance(id).to_bits() != advance_widths[id].to_bits() {
-            if bad < 8 {
-                println!(
-                    "  MISMATCH byte {id} advance: cpu {:e} gpu {:e}",
-                    slots.advance(id),
-                    advance_widths[id]
-                );
-            }
-            bad += 1;
-        }
-        if slots.gi[id] != giv[id] {
-            if bad < 8 {
-                println!("  MISMATCH byte {id} gi: cpu {} gpu {}", slots.gi[id], giv[id]);
             }
             bad += 1;
         }
@@ -779,7 +781,7 @@ pub fn cluster_check(ctx: &GpuContext, fixture_path: &Path) -> ! {
     let h_ic = client.create_from_slice(bytemuck::cast_slice(&ic));
     let h_glyph_flags = client.empty(n_words * 4);
     let h_advance_widths = client.empty(n * 4);
-    let h_glyph_indices = client.empty(n * 4);
+    
     let h_glyph_heights = client.empty(n * 4);
     let h_cslot = client.create_from_slice(bytemuck::cast_slice(&vec![0u32; n]));
     let h_cend = client.empty(n * 4);
@@ -813,8 +815,6 @@ pub fn cluster_check(ctx: &GpuContext, fixture_path: &Path) -> ! {
             BufferArg::from_raw_parts(h_bm.clone(), fx.trie.blocks_m.len()),
             BufferArg::from_raw_parts(h_bc.clone(), fx.trie.blocks_c.len()),
             BufferArg::from_raw_parts(h_glyph_flags.clone(), n_words),
-            BufferArg::from_raw_parts(h_advance_widths.clone(), n),
-            BufferArg::from_raw_parts(h_glyph_indices.clone(), n),
             BufferArg::from_raw_parts(h_glyph_heights.clone(), n),
             BufferArg::from_raw_parts(h_cslot.clone(), n),
             crate::glyph_trie::BLOCK_SHIFT,
@@ -831,8 +831,6 @@ pub fn cluster_check(ctx: &GpuContext, fixture_path: &Path) -> ! {
             BufferArg::from_raw_parts(h_ir.clone(), item_record_bounds.len()),
             BufferArg::from_raw_parts(h_ic.clone(), ic.len()),
             BufferArg::from_raw_parts(h_glyph_flags.clone(), n_words),
-            BufferArg::from_raw_parts(h_advance_widths.clone(), n),
-            BufferArg::from_raw_parts(h_glyph_indices.clone(), n),
             BufferArg::from_raw_parts(h_cslot.clone(), n),
             BufferArg::from_raw_parts(h_cend.clone(), n),
             seq_max,
@@ -943,8 +941,6 @@ pub fn cluster_check(ctx: &GpuContext, fixture_path: &Path) -> ! {
             BufferArg::from_raw_parts(h_ir.clone(), item_record_bounds.len()),
             BufferArg::from_raw_parts(h_cend.clone(), n),
             BufferArg::from_raw_parts(h_cslot.clone(), n),
-            BufferArg::from_raw_parts(h_advance_widths.clone(), n),
-            BufferArg::from_raw_parts(h_glyph_indices.clone(), n),
             BufferArg::from_raw_parts(h_glyph_flags.clone(), n_words),
             kmax as usize,
             stride,

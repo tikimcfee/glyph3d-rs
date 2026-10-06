@@ -2,7 +2,7 @@ use cubecl::prelude::*;
 
 use super::decode::byte_at;
 use super::monoid::item_search;
-use super::{F_CLUSTER_TRAILER, F_LEADER};
+use super::{F_CLUSTER_HEAD, F_CLUSTER_TRAILER, F_LEADER};
 
 // ── the cluster pass, phase 3b: probe (parallel) + chain (per item) ───────────
 //
@@ -111,8 +111,7 @@ pub(super) fn cluster_probe(
     item_record_bounds: &[u32],
     item_cluster_enabled: &[u32],
     glyph_flags: &mut [u32],
-    advance_widths: &mut [f32],
-    glyph_indices: &mut [u32],
+    
     candidate_slots: &mut [u32],
     candidate_end_positions: &mut [u32],
     #[comptime] seq_max: u32,
@@ -149,8 +148,6 @@ pub(super) fn cluster_probe(
                             // for a static-zero byte in a cluster item — gi
                             // included. The probe wrote two of them until
                             // the repo parity driver caught the third.
-                            advance_widths[byte_index] = f32::from_bits(0u32);
-                            glyph_indices[byte_index] = 0u32;
                             packed_word |= F_CLUSTER_TRAILER << ((lane as u32) * 8u32);
                         } else {
                             // cp above 0x10FFFF is malformed decode — the
@@ -734,13 +731,12 @@ pub(super) fn cluster_mark(
     item_root_candidates: &[u32],
     item_record_bounds: &[u32],
     candidate_end_positions: &[u32],
-    candidate_slots: &[u32],
-    advance_widths: &mut [f32],
-    glyph_indices: &mut [u32],
+    _candidate_slots: &[u32],
+    
     glyph_flags_atomic: &mut [Atomic<u32>],
     #[comptime] kmax: usize,
     #[comptime] stride: usize,
-    bitmap_advance: f32,
+    _bitmap_advance: f32,
 ) {
     // Comptime on purpose — landmine #7's shape (runtime scalars after
     // several same-typed slices) misbound rank_step outright before these
@@ -778,21 +774,21 @@ pub(super) fn cluster_mark(
                     let item_end_boundary = item_record_bounds[item_index * 2 + 1] as usize;
                     let candidate_end = candidate_end_positions[candidate_index] as usize;
                     let marking_limit = if candidate_end < item_end_boundary { candidate_end } else { item_end_boundary };
-                    advance_widths[head_pos] = bitmap_advance;
+                    
                     // A committed head's glyph IS the sequence's slot —
                     // the record emitter's GLYPH_ID for cluster heads
                     // (fold.rs:607's slots.gi[id] = best_slot). The
                     // consumer is the repo parity driver / phase 4.
-                    glyph_indices[head_pos] = candidate_slots[candidate_index];
+                    glyph_flags_atomic[head_pos >> 2].fetch_or(F_CLUSTER_HEAD << (((head_pos & 3) as u32) * 8u32));
                     let mut trailer_pos = head_pos + 1usize;
                     while trailer_pos < marking_limit {
                         if flags_at_from_atomic(glyph_flags_atomic, trailer_pos) & F_LEADER != 0 {
-                            advance_widths[trailer_pos] = f32::from_bits(0u32);
+                            
                             // fold.rs:610-612: a trailer member's gi zeroes
                             // with its advance — the engine's records carry
                             // gi 0 for cluster trailers, and the parity
                             // driver catches exactly this.
-                            glyph_indices[trailer_pos] = 0u32;
+                            
                             glyph_flags_atomic[trailer_pos >> 2].fetch_or(F_CLUSTER_TRAILER << (((trailer_pos & 3) as u32) * 8u32));
                         }
                         trailer_pos += 1usize;

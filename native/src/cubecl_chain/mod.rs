@@ -79,10 +79,6 @@ const P_SURVIVORS: usize = 8;
 /// appended after the schema's nine — no CPU-side fold reads them.
 const P_CLEAN_LEN: usize = 9;
 const P_CLEAN_BREAK: usize = 10;
-/// The measure static is ADVANCE ONLY. Height is renderer statics the
-/// scan never reads; carrying it here doubled the per-byte measure traffic.
-const SM_STRIDE: usize = 1;
-const SM_ADVANCE: usize = 0;
 /// resolveX's per-cube shared reduction slots, item-relative from the item
 /// at the cube's first byte. A 2 KB tile spanning more than this many items
 /// (never in practice) takes the global-atomic overflow path instead.
@@ -168,6 +164,7 @@ const ITEM_DESC_PAD6: usize = 31;
 const F_LEADER: u32 = 1;
 const F_NEWLINE: u32 = 4;
 pub(super) const F_SURVIVOR: u32 = 32;
+pub(super) const F_CLUSTER_HEAD: u32 = 64;
 const WRAP_BACK: i32 = 1;
 
 // ── the driver ────────────────────────────────────────────────────────────────
@@ -189,7 +186,7 @@ const WRAP_BACK: i32 = 1;
 /// class (the fork gate's attempted mutation was dropped for exactly this).
 /// The reddening witness is the unit test in this file; the classifier's
 /// continuation rule itself is fenced by the real-byte flags diffs.
-fn pack_words(bytes: &[u8]) -> Vec<u32> {
+pub(super) fn pack_words(bytes: &[u8]) -> Vec<u32> {
     let n = bytes.len();
     if n == 0 {
         return Vec::new();
