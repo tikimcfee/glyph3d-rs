@@ -293,10 +293,11 @@ impl SpatialScene {
         revision_engine: &RevisionEngine,
     ) -> usize {
         let next_idx = if let Some(carrel) = self.world.get::<AgentCarrel>(carrel_entity) {
-            if carrel.beat_count == 0 {
+            let total = carrel.beat_count.max(carrel.turn_count);
+            if total == 0 {
                 0
             } else {
-                (carrel.active_beat + 1) % carrel.beat_count
+                (carrel.active_beat + 1) % total
             }
         } else {
             return 0;
@@ -314,10 +315,11 @@ impl SpatialScene {
         revision_engine: &RevisionEngine,
     ) -> usize {
         let prev_idx = if let Some(carrel) = self.world.get::<AgentCarrel>(carrel_entity) {
-            if carrel.beat_count == 0 {
+            let total = carrel.beat_count.max(carrel.turn_count);
+            if total == 0 {
                 0
             } else {
-                (carrel.active_beat + carrel.beat_count - 1) % carrel.beat_count
+                (carrel.active_beat + total - 1) % total
             }
         } else {
             return 0;

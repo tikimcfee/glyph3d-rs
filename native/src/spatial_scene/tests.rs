@@ -653,3 +653,114 @@ fn test_agent_carrel_sliding_window_and_time_scroll() {
     // Focused active beat is 15 (slot 2)
     assert_eq!(scrolled_comp.active_beat, 15);
 }
+
+#[test]
+fn test_agent_carrel_page_aware_continuous_navigation() {
+    use crate::agent_transcript::claude::parse_claude_session;
+    use crate::revision::RevisionEngine;
+    use crate::spatial_scene::agent_carrel::CarrelLayoutOptions;
+    use serde_json::json;
+
+    let mut turns_json = Vec::new();
+    for i in 0..12 {
+        turns_json.push(json!({
+            "type": "user",
+            "message": { "role": "user", "content": [{ "type": "text", "text": format!("Turn {i}") }] }
+        }).to_string());
+        turns_json.push(json!({
+            "type": "assistant",
+            "message": {
+                "role": "assistant",
+                "content": [
+                    { "type": "tool_use", "id": format!("t{i}"), "name": "Write", "input": { "file_path": "a.rs", "content": format!("v{i}") } }
+                ]
+            }
+        }).to_string());
+        turns_json.push(json!({
+            "type": "user",
+            "toolUseResult": { "type": "create", "filePath": "a.rs", "content": format!("v{i}") },
+            "message": { "role": "user", "content": [{ "type": "tool_result", "tool_use_id": format!("t{i}") }] }
+        }).to_string());
+    }
+
+    let session = parse_claude_session(&turns_json.join("\n"), "paging_sess");
+    let mut rev_engine = RevisionEngine::new();
+    rev_engine.ingest_session(&session);
+
+    let mut scene = SpatialScene::new();
+    let root = scene.spawn_root("canvas");
+
+    let total_items = session.linearize_events(Some(&rev_engine)).len();
+    assert_eq!(total_items, 24);
+    let limit = 4usize;
+    let max_k = total_items - limit;
+
+    let mut current_k = 0usize;
+    let mut active_beat = total_items - 1; // 23
+
+    // Page 1: beats 23, 22, 21, 20 (k = 0)
+    let carrel = scene.spawn_agent_carrel_with_options(
+        root,
+        &session,
+        &rev_engine,
+        CarrelLayoutOptions {
+            deck_window_limit: limit,
+            deck_scroll_offset: current_k,
+            desk_revision_limit: 4,
+            desk_scroll_offset: 0,
+            max_file_stacks: 10,
+            active_beat: Some(active_beat),
+        },
+    );
+    let comp = scene.world.get::<AgentCarrel>(carrel).unwrap();
+    assert_eq!(comp.slot_to_beat, vec![23, 22, 21, 20]);
+    assert_eq!(comp.active_beat, 23);
+
+    // Simulate backward navigation through all beats: 23 -> 0
+    let mut visited_slots = Vec::new();
+    for _ in 0..total_items - 1 {
+        let (window_min, _window_max) = {
+            let comp = scene.world.get::<AgentCarrel>(carrel).unwrap();
+            let oldest = comp.slot_to_beat.last().copied().unwrap_or(0);
+            let newest = comp.slot_to_beat.first().copied().unwrap_or(0);
+            (oldest, newest)
+        };
+
+        let target_beat = active_beat - 1;
+        if target_beat < window_min {
+            // Page turn backward to next window
+            current_k = (total_items.saturating_sub(1).saturating_sub(target_beat)).min(max_k);
+            let new_carrel = scene.spawn_agent_carrel_with_options(
+                root,
+                &session,
+                &rev_engine,
+                CarrelLayoutOptions {
+                    deck_window_limit: limit,
+                    deck_scroll_offset: current_k,
+                    desk_revision_limit: 4,
+                    desk_scroll_offset: 0,
+                    max_file_stacks: 10,
+                    active_beat: Some(target_beat),
+                },
+            );
+            active_beat = target_beat;
+            let comp = scene.world.get::<AgentCarrel>(new_carrel).unwrap();
+            let slot = comp.slot_to_beat.iter().position(|&b| b == active_beat).unwrap();
+            visited_slots.push((active_beat, slot));
+        } else {
+            scene.carrel_set_beat(carrel, target_beat, &session, &rev_engine);
+            active_beat = target_beat;
+            let comp = scene.world.get::<AgentCarrel>(carrel).unwrap();
+            let slot = comp.slot_to_beat.iter().position(|&b| b == active_beat).unwrap();
+            visited_slots.push((active_beat, slot));
+        }
+    }
+
+    // Verify all beats were successfully visited and each landed on a valid slot (0..4)
+    assert_eq!(visited_slots.len(), 23);
+    for &(beat, slot) in &visited_slots {
+        assert!(slot < limit, "beat {beat} mapped to invalid slot {slot}");
+    }
+    // Final beat should be 0, at slot 3 of the oldest window (k = 20, beats [3, 2, 1, 0])
+    assert_eq!(visited_slots.last().unwrap(), &(0, 3));
+}

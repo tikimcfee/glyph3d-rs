@@ -830,19 +830,30 @@ impl WindowState {
                                 let window_min = oldest.saturating_sub(1);
                                 let window_max = newest.saturating_sub(1);
 
-                                if ui.button("◀ Prev (P/←)").clicked() && total_beats > 0 {
-                                    let target_beat = carrel.active_beat.saturating_sub(1);
-                                    if target_beat < window_min {
-                                        let new_k = (total_beats.saturating_sub(1).saturating_sub(target_beat)).min(max_k);
+                                if ui.button("◀ Prev (P/←/〔)").clicked() && total_beats > 0 {
+                                    if carrel.active_beat == 0 {
+                                        let target_beat = total_beats - 1;
                                         let mut opts = carrel.layout_options;
-                                        opts.deck_scroll_offset = new_k;
+                                        opts.deck_scroll_offset = 0;
                                         opts.active_beat = Some(target_beat);
                                         *pending_relayout = Some(RelayoutRequest {
                                             carrel_options: Some(opts),
                                             ..Default::default()
                                         });
                                     } else {
-                                        self.scene.on_key(ctx, winit::keyboard::KeyCode::KeyP, true);
+                                        let target_beat = carrel.active_beat - 1;
+                                        if target_beat < window_min {
+                                            let new_k = (total_beats.saturating_sub(1).saturating_sub(target_beat)).min(max_k);
+                                            let mut opts = carrel.layout_options;
+                                            opts.deck_scroll_offset = new_k;
+                                            opts.active_beat = Some(target_beat);
+                                            *pending_relayout = Some(RelayoutRequest {
+                                                carrel_options: Some(opts),
+                                                ..Default::default()
+                                            });
+                                        } else {
+                                            self.scene.on_key(ctx, winit::keyboard::KeyCode::KeyP, true);
+                                        }
                                     }
                                 }
 
@@ -857,19 +868,29 @@ impl WindowState {
                                     ui.label(egui::RichText::new(format!("Turn {} / {}", carrel.active_turn + 1, carrel.turn_count)).strong());
                                 }
 
-                                if ui.button("Next (N/→) ▶").clicked() && total_beats > 0 {
-                                    let target_beat = (carrel.active_beat + 1).min(total_beats.saturating_sub(1));
-                                    if target_beat > window_max {
-                                        let new_k = (total_beats.saturating_sub(limit).saturating_sub(target_beat)).min(max_k);
+                                if ui.button("Next (N/→/〕) ▶").clicked() && total_beats > 0 {
+                                    if carrel.active_beat >= total_beats.saturating_sub(1) {
                                         let mut opts = carrel.layout_options;
-                                        opts.deck_scroll_offset = new_k;
-                                        opts.active_beat = Some(target_beat);
+                                        opts.deck_scroll_offset = max_k;
+                                        opts.active_beat = Some(0);
                                         *pending_relayout = Some(RelayoutRequest {
                                             carrel_options: Some(opts),
                                             ..Default::default()
                                         });
                                     } else {
-                                        self.scene.on_key(ctx, winit::keyboard::KeyCode::KeyN, true);
+                                        let target_beat = carrel.active_beat + 1;
+                                        if target_beat > window_max {
+                                            let new_k = (total_beats.saturating_sub(limit).saturating_sub(target_beat)).min(max_k);
+                                            let mut opts = carrel.layout_options;
+                                            opts.deck_scroll_offset = new_k;
+                                            opts.active_beat = Some(target_beat);
+                                            *pending_relayout = Some(RelayoutRequest {
+                                                carrel_options: Some(opts),
+                                                ..Default::default()
+                                            });
+                                        } else {
+                                            self.scene.on_key(ctx, winit::keyboard::KeyCode::KeyN, true);
+                                        }
                                     }
                                 }
 

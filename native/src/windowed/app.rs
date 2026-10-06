@@ -580,33 +580,62 @@ impl ApplicationHandler for App<'_> {
                                 let window_min = oldest.saturating_sub(1);
                                 let window_max = newest.saturating_sub(1);
 
-                                if pressed && (code == KeyCode::KeyP || code == KeyCode::ArrowLeft) {
-                                    let target_beat = carrel.active_beat.saturating_sub(1);
-                                    if total_items > 0 && target_beat < window_min {
-                                        let new_k = (total_items.saturating_sub(1).saturating_sub(target_beat)).min(max_k);
-                                        let mut new_opts = *layout_options;
-                                        new_opts.deck_scroll_offset = new_k;
-                                        new_opts.active_beat = Some(target_beat);
-                                        state.pending_relayout = Some(RelayoutRequest {
-                                            carrel_options: Some(new_opts),
-                                            ..Default::default()
-                                        });
-                                        state.window.request_redraw();
-                                        handled = true;
+                                if pressed && (code == KeyCode::KeyP || code == KeyCode::ArrowLeft || code == KeyCode::BracketLeft) {
+                                    if total_items > 0 {
+                                        if carrel.active_beat == 0 {
+                                            let target_beat = total_items - 1;
+                                            let mut new_opts = *layout_options;
+                                            new_opts.deck_scroll_offset = 0;
+                                            new_opts.active_beat = Some(target_beat);
+                                            state.pending_relayout = Some(RelayoutRequest {
+                                                carrel_options: Some(new_opts),
+                                                ..Default::default()
+                                            });
+                                            state.window.request_redraw();
+                                            handled = true;
+                                        } else {
+                                            let target_beat = carrel.active_beat - 1;
+                                            if target_beat < window_min {
+                                                let new_k = (total_items.saturating_sub(1).saturating_sub(target_beat)).min(max_k);
+                                                let mut new_opts = *layout_options;
+                                                new_opts.deck_scroll_offset = new_k;
+                                                new_opts.active_beat = Some(target_beat);
+                                                state.pending_relayout = Some(RelayoutRequest {
+                                                    carrel_options: Some(new_opts),
+                                                    ..Default::default()
+                                                });
+                                                state.window.request_redraw();
+                                                handled = true;
+                                            }
+                                        }
                                     }
-                                } else if pressed && (code == KeyCode::KeyN || code == KeyCode::ArrowRight) {
-                                    let target_beat = (carrel.active_beat + 1).min(total_items.saturating_sub(1));
-                                    if total_items > 0 && target_beat > window_max {
-                                        let new_k = (total_items.saturating_sub(limit).saturating_sub(target_beat)).min(max_k);
-                                        let mut new_opts = *layout_options;
-                                        new_opts.deck_scroll_offset = new_k;
-                                        new_opts.active_beat = Some(target_beat);
-                                        state.pending_relayout = Some(RelayoutRequest {
-                                            carrel_options: Some(new_opts),
-                                            ..Default::default()
-                                        });
-                                        state.window.request_redraw();
-                                        handled = true;
+                                } else if pressed && (code == KeyCode::KeyN || code == KeyCode::ArrowRight || code == KeyCode::BracketRight) {
+                                    if total_items > 0 {
+                                        if carrel.active_beat >= total_items.saturating_sub(1) {
+                                            let mut new_opts = *layout_options;
+                                            new_opts.deck_scroll_offset = max_k;
+                                            new_opts.active_beat = Some(0);
+                                            state.pending_relayout = Some(RelayoutRequest {
+                                                carrel_options: Some(new_opts),
+                                                ..Default::default()
+                                            });
+                                            state.window.request_redraw();
+                                            handled = true;
+                                        } else {
+                                            let target_beat = carrel.active_beat + 1;
+                                            if target_beat > window_max {
+                                                let new_k = (total_items.saturating_sub(limit).saturating_sub(target_beat)).min(max_k);
+                                                let mut new_opts = *layout_options;
+                                                new_opts.deck_scroll_offset = new_k;
+                                                new_opts.active_beat = Some(target_beat);
+                                                state.pending_relayout = Some(RelayoutRequest {
+                                                    carrel_options: Some(new_opts),
+                                                    ..Default::default()
+                                                });
+                                                state.window.request_redraw();
+                                                handled = true;
+                                            }
+                                        }
                                     }
                                 } else if pressed && code == KeyCode::Comma {
                                     let mut new_opts = *layout_options;
