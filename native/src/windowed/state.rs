@@ -311,10 +311,7 @@ impl WindowState {
                         }
                         self.pending_relayout = Some(RelayoutRequest {
                             z_wrap_spacing: Some(new),
-                            toggle_cluster: false,
-                            toggle_layout: false,
-                            switch_agent_session: None,
-                            carrel_options: None,
+                            ..Default::default()
                         });
                         self.zspace_selftest = 2;
                     }
@@ -357,11 +354,8 @@ impl WindowState {
                             self.scene.instance_count()
                         );
                         self.pending_relayout = Some(RelayoutRequest {
-                            z_wrap_spacing: None,
                             toggle_cluster: true,
-                            toggle_layout: false,
-                            switch_agent_session: None,
-                            carrel_options: None,
+                            ..Default::default()
                         });
                         self.cluster_selftest = 2;
                     }
@@ -514,6 +508,17 @@ impl WindowState {
                                     "camera: {mode} eye=({:.2},{:.2},{:.2}) yaw={:.3} pitch={:.3}",
                                     snap.eye[0], snap.eye[1], snap.eye[2], snap.yaw, snap.pitch,
                                 ));
+                                if snap.strategy.is_some() || snap.field_mode.is_some() {
+                                    let engine_str = snap
+                                        .strategy
+                                        .map(|s| s.to_string())
+                                        .unwrap_or_else(|| "n/a".to_string());
+                                    let field_str = snap
+                                        .field_mode
+                                        .map(|m| format!("{m:?}"))
+                                        .unwrap_or_else(|| "n/a".to_string());
+                                    ui.label(format!("engine: {engine_str} | field: {field_str}"));
+                                }
                                 ui.label(
                                     snap.last_pick
                                         .as_deref()
@@ -636,14 +641,114 @@ impl WindowState {
                                 if resp.drag_stopped() || (resp.changed() && !resp.dragged()) {
                                     *pending_relayout = Some(RelayoutRequest {
                                         z_wrap_spacing: Some(*spacing),
-                                        toggle_cluster: false,
-                                        toggle_layout: false,
-                                        switch_agent_session: None,
-                                        carrel_options: None,
+                                        ..Default::default()
                                     });
                                 }
                             }
                         }
+                        // Layout engine strategy selection — repo scenes only.
+                        if let Some(snap) = &probe_snap {
+                            if let Some(current_strategy) = snap.strategy {
+                                ui.separator();
+                                ui.label(
+                                    "layout engine (repo) — click switches backend & rebuilds:",
+                                );
+                                ui.horizontal_wrapped(|ui| {
+                                    if ui
+                                        .selectable_label(
+                                            current_strategy == crate::repo::Strategy::Hyper,
+                                            "Hyper (CPU)",
+                                        )
+                                        .clicked()
+                                        && current_strategy != crate::repo::Strategy::Hyper
+                                    {
+                                        *pending_relayout = Some(RelayoutRequest {
+                                            set_strategy: Some(crate::repo::Strategy::Hyper),
+                                            ..Default::default()
+                                        });
+                                    }
+                                    #[cfg(feature = "cubecl")]
+                                    if ui
+                                        .selectable_label(
+                                            current_strategy == crate::repo::Strategy::Cubecl,
+                                            "CubeCL (GPU)",
+                                        )
+                                        .clicked()
+                                        && current_strategy != crate::repo::Strategy::Cubecl
+                                    {
+                                        *pending_relayout = Some(RelayoutRequest {
+                                            set_strategy: Some(crate::repo::Strategy::Cubecl),
+                                            ..Default::default()
+                                        });
+                                    }
+                                    if ui
+                                        .selectable_label(
+                                            current_strategy == crate::repo::Strategy::Direct,
+                                            "Direct",
+                                        )
+                                        .clicked()
+                                        && current_strategy != crate::repo::Strategy::Direct
+                                    {
+                                        *pending_relayout = Some(RelayoutRequest {
+                                            set_strategy: Some(crate::repo::Strategy::Direct),
+                                            ..Default::default()
+                                        });
+                                    }
+                                    if ui
+                                        .selectable_label(
+                                            current_strategy == crate::repo::Strategy::Batched,
+                                            "Batch",
+                                        )
+                                        .clicked()
+                                        && current_strategy != crate::repo::Strategy::Batched
+                                    {
+                                        *pending_relayout = Some(RelayoutRequest {
+                                            set_strategy: Some(crate::repo::Strategy::Batched),
+                                            ..Default::default()
+                                        });
+                                    }
+                                });
+                            }
+                        }
+
+                        // Glyph field mode selection (Derived 20B vs Instanced 32B)
+                        if let Some(snap) = &probe_snap {
+                            if let Some(current_mode) = snap.field_mode {
+                                ui.separator();
+                                ui.label(
+                                    "glyph field mode — click switches slot format & rebuilds:",
+                                );
+                                ui.horizontal(|ui| {
+                                    if ui
+                                        .selectable_label(
+                                            current_mode == glyph_field::GlyphFieldMode::Derived,
+                                            "Derived (20B)",
+                                        )
+                                        .clicked()
+                                        && current_mode != glyph_field::GlyphFieldMode::Derived
+                                    {
+                                        *pending_relayout = Some(RelayoutRequest {
+                                            set_field_mode: Some(glyph_field::GlyphFieldMode::Derived),
+                                            ..Default::default()
+                                        });
+                                    }
+                                    if ui
+                                        .selectable_label(
+                                            current_mode == glyph_field::GlyphFieldMode::Instanced,
+                                            "Instanced (32B)",
+                                        )
+                                        .clicked()
+                                        && current_mode != glyph_field::GlyphFieldMode::Instanced
+                                    {
+                                        *pending_relayout = Some(RelayoutRequest {
+                                            set_field_mode: Some(glyph_field::GlyphFieldMode::Instanced),
+                                            ..Default::default()
+                                        });
+                                    }
+                                });
+                            }
+                        }
+
                         // The sequence pass toggle — repo AND text scenes
                         // (text scenes seed the probe from the staging
                         // choice, no pick context needed). The same rebuild
@@ -661,11 +766,8 @@ impl WindowState {
                                     .clicked()
                                 {
                                     *pending_relayout = Some(RelayoutRequest {
-                                        z_wrap_spacing: None,
                                         toggle_cluster: true,
-                                        toggle_layout: false,
-                                        switch_agent_session: None,
-                                        carrel_options: None,
+                                        ..Default::default()
                                     });
                                 }
                             }
@@ -684,11 +786,8 @@ impl WindowState {
                                 };
                                 if ui.button(label).clicked() {
                                     *pending_relayout = Some(RelayoutRequest {
-                                        z_wrap_spacing: None,
-                                        toggle_cluster: false,
                                         toggle_layout: true,
-                                        switch_agent_session: None,
-                                        carrel_options: None,
+                                        ..Default::default()
                                     });
                                 }
                             }
@@ -1052,11 +1151,8 @@ impl WindowState {
                                                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                                                     if ui.button("▶ Load").clicked() {
                                                         *pending_relayout = Some(RelayoutRequest {
-                                                            z_wrap_spacing: None,
-                                                            toggle_cluster: false,
-                                                            toggle_layout: false,
                                                             switch_agent_session: Some(s.path.clone()),
-                                                            carrel_options: None,
+                                                            ..Default::default()
                                                         });
                                                     }
                                                     if let Some(m) = s.modified {

@@ -324,6 +324,7 @@ impl GlyphScene {
             pick,
             probe_cluster_mode: None,
             probe_layout_mode: None,
+            probe_strategy: None,
             picked: None,
             selection: None,
             geom_overrides: std::collections::HashMap::new(),

@@ -409,6 +409,7 @@ fn build_scene_impl(
             let t_scene = std::time::Instant::now();
             let mut scene = GlyphScene::new(ctx, color_format, &atlas, staged, camera_mode, cull, field_mode);
             scene.set_probe_layout_mode(*layout_mode);
+            scene.set_probe_strategy(*strategy);
             let scene_dur = t_scene.elapsed();
             let visual_total = t_visual_start.elapsed();
 

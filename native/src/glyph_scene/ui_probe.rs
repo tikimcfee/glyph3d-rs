@@ -68,6 +68,10 @@ pub struct UiProbeState {
     pub cluster_mode: Option<bool>,
     /// Canvas layout arrangement mode (repo scenes): shelf vs carrel. None for non-repo scenes.
     pub layout_mode: Option<crate::repo::RepoLayoutMode>,
+    /// Layout engine strategy (repo scenes): Hyper (CPU) vs Cubecl (GPU) vs Direct vs Batch.
+    pub strategy: Option<crate::repo::Strategy>,
+    /// Glyph field render mode: Instanced (32B) vs Derived (20B).
+    pub field_mode: Option<glyph_field::GlyphFieldMode>,
     /// Currently grabbed group ID (file grab via `KeyG`).
     pub grabbed_group: Option<u32>,
     /// Currently grabbed zone / carrel ID (carrel grab via `KeyC`).
@@ -142,6 +146,12 @@ impl GlyphScene {
         self.probe_layout_mode = Some(mode);
     }
 
+    /// Seed for the panel's layout engine strategy on repo scenes.
+    /// Called by the scene builder between `new` and `init_ui_probe`.
+    pub fn set_probe_strategy(&mut self, strategy: crate::repo::Strategy) {
+        self.probe_strategy = Some(strategy);
+    }
+
     /// Stage K: install and return the windowed debug-UI probe. Windowed mode
     /// calls this on the concrete scene BEFORE boxing it as
     /// `Box<dyn SceneLike>` (build_scene_probed); offscreen never does, so
@@ -190,6 +200,8 @@ impl GlyphScene {
             .map(|f| f.item.cluster_mode == crate::fold::ClusterMode::Cluster)
             .or(self.probe_cluster_mode);
         let layout_mode = self.probe_layout_mode;
+        let strategy = self.probe_strategy;
+        let field_mode = Some(self.field.mode());
         let (file_backgrounds, file_bg_color, lod_min_px) = self
             .cull
             .as_ref()
@@ -211,6 +223,8 @@ impl GlyphScene {
             z_wrap_spacing,
             cluster_mode,
             layout_mode,
+            strategy,
+            field_mode,
             ..Default::default()
         }));
         self.ui_probe = Some(probe.clone());

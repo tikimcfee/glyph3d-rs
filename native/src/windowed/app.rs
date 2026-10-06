@@ -39,7 +39,7 @@ use super::utc_stamp;
 pub(super) fn apply_relayout(
     ctx: &GpuContext,
     choice: &mut SceneChoice,
-    cull_opts: crate::SceneCullOptions,
+    cull_opts: &mut crate::SceneCullOptions,
     ui: bool,
     state: &mut WindowState,
     req: RelayoutRequest,
@@ -80,6 +80,24 @@ pub(super) fn apply_relayout(
                 changed = true;
                 note += &format!("z_wrap_spacing -> {new_z} ");
             }
+        }
+    }
+    // Layout engine strategy (repo scenes only).
+    if let Some(new_strategy) = req.set_strategy {
+        if let SceneChoice::Repo { strategy, .. } = choice {
+            if *strategy != new_strategy {
+                *strategy = new_strategy;
+                changed = true;
+                note += &format!("strategy -> {:?} ", new_strategy);
+            }
+        }
+    }
+    // Glyph field render mode (all scenes).
+    if let Some(new_mode) = req.set_field_mode {
+        if cull_opts.field_mode != new_mode {
+            cull_opts.field_mode = new_mode;
+            changed = true;
+            note += &format!("field_mode -> {:?} ", new_mode);
         }
     }
     // The cluster toggle rides any scene whose choice carries the mode —
@@ -134,7 +152,7 @@ pub(super) fn apply_relayout(
             },
         )
     } else {
-        (None, cull_opts)
+        (None, *cull_opts)
     };
     let t = Instant::now();
     let (mut scene, probe) = if ui {
@@ -166,6 +184,8 @@ pub(super) struct RelayoutRequest {
     pub(super) toggle_layout: bool,
     pub(super) switch_agent_session: Option<std::path::PathBuf>,
     pub(super) carrel_options: Option<crate::spatial_scene::CarrelLayoutOptions>,
+    pub(super) set_strategy: Option<crate::repo::Strategy>,
+    pub(super) set_field_mode: Option<glyph_field::GlyphFieldMode>,
 }
 
 pub(super) struct App<'a> {
@@ -446,7 +466,7 @@ impl ApplicationHandler for App<'_> {
                 // previous render or keypress; rebuild before render if pending.
                 #[cfg(feature = "egui-ui")]
                 if let Some(req) = state.pending_relayout.take() {
-                    apply_relayout(&self.ctx, &mut self.choice, self.cull_opts, self.ui, state, req);
+                    apply_relayout(&self.ctx, &mut self.choice, &mut self.cull_opts, self.ui, state, req);
                 }
                 state.render(&self.ctx);
                 if let Some(max_frames) = self.frames {
@@ -457,7 +477,7 @@ impl ApplicationHandler for App<'_> {
                 }
                 #[cfg(feature = "egui-ui")]
                 if let Some(req) = state.pending_relayout.take() {
-                    apply_relayout(&self.ctx, &mut self.choice, self.cull_opts, self.ui, state, req);
+                    apply_relayout(&self.ctx, &mut self.choice, &mut self.cull_opts, self.ui, state, req);
                     state.window.request_redraw();
                 }
                 if self.live.is_some() {
@@ -517,11 +537,8 @@ impl ApplicationHandler for App<'_> {
                         #[cfg(feature = "egui-ui")]
                         {
                             state.pending_relayout = Some(RelayoutRequest {
-                                z_wrap_spacing: None,
-                                toggle_cluster: false,
                                 toggle_layout: true,
-                                switch_agent_session: None,
-                                carrel_options: None,
+                                ..Default::default()
                             });
                             state.window.request_redraw();
                         }
