@@ -1,10 +1,10 @@
 use cubecl::prelude::*;
 
 use super::cluster::{cp_at, seq_len_at};
-use super::decode::decode_trie;
+use super::decode::{byte_at, decode_trie};
 
 use super::monoid::{
-    combine, flags_at, identity, item_search_desc, leaf_of,
+    combine, flags_at, identity, item_search_desc, leaf_from_flag, leaf_of,
     ordered_key, p_load, p_store, rows_for, s_load, s_store, wrap_row_of, wrap_segment_of,
 };
 use super::{
@@ -45,6 +45,33 @@ pub(super) fn tile_scan(
     let item_count = item_descriptors.len() / ITEM_DESC_STRIDE;
     let range_start = tile_idx * (threads_per_cube * bytes_per_thread) + unit_idx * bytes_per_thread;
     let range_end = if range_start + bytes_per_thread < total_bytes { range_start + bytes_per_thread } else { total_bytes };
+
+    #[allow(clippy::len_zero)]
+    let ascii_block_base = if trie_block_indices.len() > 0 {
+        trie_block_indices[0] << trie_block_shift
+    } else {
+        0u32
+    };
+
+    let total_tile_bytes = threads_per_cube * bytes_per_thread;
+    let tile_byte_start = tile_idx * total_tile_bytes;
+    let tile_word_start = tile_byte_start >> 2;
+    let total_tile_words = total_tile_bytes.div_ceil(4);
+
+    let mut shared_tile_flags = Shared::<[u32]>::new_slice((threads_per_cube * bytes_per_thread) / 4);
+
+    let mut preload_word_idx = unit_idx;
+    while preload_word_idx < total_tile_words {
+        let global_word_idx = tile_word_start + preload_word_idx;
+        shared_tile_flags[preload_word_idx] = if global_word_idx < glyph_flags.len() {
+            glyph_flags[global_word_idx]
+        } else {
+            0u32
+        };
+        preload_word_idx += threads_per_cube;
+    }
+    sync_cube();
+
     // ItemWalk seed. For pad units (range_start >= total_bytes) the seed clamps to the last byte
     // so the pad element carries the wrap/mode in force at the tile's end —
     // see the module header for why a pure-identity pad would poison the
@@ -90,15 +117,23 @@ pub(super) fn tile_scan(
                 active_cell_advance_bits = item_descriptors[item_index * ITEM_DESC_STRIDE + ITEM_DESC_CELL_ADVANCE];
             }
             let reset = if has_items && id == start { 1i32 } else { 0i32 };
-            let advance = if (flags_at(glyph_flags, id) & super::F_LEADER) != 0 {
-                let cp_len = seq_len_at(bytes, id, total_bytes);
-                let cp = cp_at(bytes, id, cp_len, total_bytes);
-                let (adv, _) = decode_trie(cp, trie_block_indices, trie_block_metrics, trie_block_codepoints, trie_block_shift);
-                adv
+            let local_id = id - tile_byte_start;
+            let glyph_flag = (shared_tile_flags[local_id >> 2] >> (((local_id & 3) * 8) as u32)) & 0xFF;
+            let advance = if (glyph_flag & super::F_LEADER) != 0 {
+                let lead_byte = byte_at(bytes, id, total_bytes);
+                if lead_byte < 128u32 {
+                    let entry_offset = (ascii_block_base | lead_byte) as usize;
+                    trie_block_metrics[entry_offset * 2]
+                } else {
+                    let cp_len = seq_len_at(bytes, id, total_bytes);
+                    let cp = cp_at(bytes, id, cp_len, total_bytes);
+                    let (adv, _) = decode_trie(cp, trie_block_indices, trie_block_metrics, trie_block_codepoints, trie_block_shift);
+                    adv
+                }
             } else {
                 0.0f32
             };
-            let leaf = leaf_of(glyph_flags, advance, active_wrap_width, active_wrap_mode, reset, active_cell_advance_bits, id);
+            let leaf = leaf_from_flag(glyph_flag, advance, active_wrap_width, active_wrap_mode, reset, active_cell_advance_bits);
             combine(&mut accumulator, &leaf);
             id += 1;
         }

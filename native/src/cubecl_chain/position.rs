@@ -435,6 +435,8 @@ pub(super) fn apply_and_emit(
         active_wrap_mode = item_descriptors[item_index * ITEM_DESC_STRIDE + ITEM_DESC_WRAP_MODE] as i32;
         active_cell_advance_bits = item_descriptors[item_index * ITEM_DESC_STRIDE + ITEM_DESC_CELL_ADVANCE];
     }
+    let mut thread_local_advances = Array::<f32>::new(bytes_per_thread);
+    let mut local_byte_offset = 0usize;
     if range_start < total_bytes {
         let mut id = range_start;
         while id < range_end {
@@ -471,6 +473,8 @@ pub(super) fn apply_and_emit(
             } else {
                 0.0f32
             };
+            thread_local_advances[local_byte_offset] = advance;
+            local_byte_offset += 1;
             let leaf = leaf_from_flag(flag, advance, active_wrap_width, active_wrap_mode, reset, active_cell_advance_bits);
             combine(&mut accumulator, &leaf);
             id += 1;
@@ -529,35 +533,17 @@ pub(super) fn apply_and_emit(
 
     // Repurpose shared_counts (2304 slots, dead after thread_local_element load) to cache the tile's 2048 advance floats
     sync_cube();
-    let mut preload_byte_idx = unit_idx;
-    while preload_byte_idx < total_tile_bytes {
-        let global_byte_idx = tile_byte_start + preload_byte_idx;
-        let adv_val = if global_byte_idx < total_bytes {
-            let flag = (shared_tile_flags[preload_byte_idx >> 2] >> (((preload_byte_idx & 3) * 8) as u32)) & 0xFF;
-            if (flag & F_LEADER) != 0 {
-                if (flag & F_CLUSTER_HEAD) != 0 {
-                    bitmap_advance
-                } else {
-                    let lead_byte = byte_at(bytes, global_byte_idx, total_bytes);
-                    if lead_byte < 128u32 {
-                        let entry_offset = (ascii_block_base | lead_byte) as usize;
-                        trie_block_metrics[entry_offset * 2]
-                    } else {
-                        let cp_len = seq_len_at(bytes, global_byte_idx, total_bytes);
-                        let cp = cp_at(bytes, global_byte_idx, cp_len, total_bytes);
-                        let (adv, _) = decode_trie(cp, trie_block_indices, trie_block_metrics, trie_block_codepoints, trie_block_shift);
-                        adv
-                    }
-                }
-            } else {
-                0.0f32
-            }
-        } else {
-            0.0f32
-        };
-        shared_counts[preload_byte_idx] = adv_val.to_bits() as i32;
-        preload_byte_idx += threads_per_cube;
+    let base_slot = unit_idx * bytes_per_thread;
+    let mut store_idx = 0usize;
+    while store_idx < local_byte_offset {
+        shared_counts[base_slot + store_idx] = thread_local_advances[store_idx].to_bits() as i32;
+        store_idx += 1;
     }
+    while store_idx < bytes_per_thread {
+        shared_counts[base_slot + store_idx] = 0i32;
+        store_idx += 1;
+    }
+    sync_cube();
 
     if unit_idx < 128 {
         let entry_offset = (ascii_block_base | (unit_idx as u32)) as usize;
