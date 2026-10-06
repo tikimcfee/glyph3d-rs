@@ -139,6 +139,11 @@ pub struct RepoParams {
     pub layout_mode: RepoLayoutMode,
     /// Colorization strategy during load: `Syntax` (eager CPU lexer) or `Flat` (fast geometric load).
     pub color_mode: ColorMode,
+    /// The glyph field the device layout emits for: `Instanced` (32 B
+    /// `RenderSlot`) or `Derived` (20 B `DerivedSlot` + line table). The
+    /// HyperLayout device path writes the chosen format straight into the
+    /// GPU arena — no host transcode between layout and field.
+    pub field_mode: glyph_field::GlyphFieldMode,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -178,6 +183,7 @@ impl Default for RepoParams {
             cluster_mode: crate::fold::ClusterMode::Leader,
             layout_mode: RepoLayoutMode::Shelf,
             color_mode: ColorMode::Flat,
+            field_mode: glyph_field::GlyphFieldMode::Instanced,
         }
     }
 }
@@ -438,16 +444,26 @@ pub fn load_repo_from_walk(
         .collect();
 
     let mut backend = match strategy {
+        // The cubecl chain emits 32 B RenderSlots only; for the Derived field
+        // it runs on its own device into the host arena and the field
+        // transcodes (correct, not the fast path).
         #[cfg(feature = "cubecl")]
         Strategy::Cubecl => match gpu {
-            Some(ctx) => crate::layout::LayoutEngine::cubecl_with_device(
-                crate::cubecl_chain::SharedDevice::from_ctx(ctx),
-            ),
+            Some(ctx) if params.field_mode == glyph_field::GlyphFieldMode::Instanced => {
+                crate::layout::LayoutEngine::cubecl_with_device(
+                    crate::cubecl_chain::SharedDevice::from_ctx(ctx),
+                )
+            }
+            Some(_) => {
+                tracing::warn!("cubecl strategy emits RenderSlots only; derived field uses the host transcode");
+                crate::layout::LayoutEngine::cubecl()
+            }
             None => crate::layout::LayoutEngine::cubecl(),
         },
         _ => match gpu {
             Some(ctx) => crate::layout::LayoutEngine::hyper_with_device(
                 crate::gpu::SharedDevice::from_ctx(ctx),
+                params.field_mode,
             ),
             None => crate::layout::LayoutEngine::hyper(),
         },
@@ -740,13 +756,16 @@ impl RepoLoad {
             });
         #[cfg(feature = "cubecl")]
         let tint_stream: Option<&[u32]> = if mapped_slots.is_none() {
-            self.arena.device_slots().map(|d| d.tint.as_slice())
+            self.arena
+                .device_slots()
+                .filter(|d| d.derived.is_none())
+                .map(|d| d.tint.as_slice())
         } else {
             None
         };
         #[cfg(not(feature = "cubecl"))]
         let tint_stream: Option<&[u32]> = None;
-        let chunks = if mapped_slots.is_none() && tint_stream.is_none() {
+        let chunks = if self.arena.device_slots().is_none() {
             self.arena.instance_chunks()
         } else {
             Vec::new()
@@ -754,6 +773,7 @@ impl RepoLoad {
         let is_flat = self.color_mode == ColorMode::Flat;
         let file_tints = self.arena.device_slots().map(|d| &d.file_tints);
         let file_blocks = self.arena.device_slots().map(|d| &d.file_blocks);
+        let emoji_tint_pairs = self.arena.device_slots().map(|d| &d.emoji_tint_pairs);
         let seg_of = |v: &FileView| {
             let tint = if is_flat {
                 let area = (v.width as f64 * v.height as f64).max(1e-3);
@@ -774,7 +794,16 @@ impl RepoLoad {
                         // chunk boundary tints bit-identically to the contiguous fold.
                         let mut tint = crate::glyph_scene::SegTintAccum::new(slot_ink);
                         let want = v.slot_base..v.slot_base + v.slot_count;
-                        if let Some(slots) = mapped_slots {
+                        // Derived device emission: no 32 B slots exist to read
+                        // back, so Pass 2 captured this item's (glyph, color)
+                        // pairs — its whole slot range, in slot order.
+                        let emitted_pairs = emoji_tint_pairs
+                            .and_then(|e| e.get(v.group_id as usize))
+                            .filter(|p| !p.is_empty());
+                        if let Some(pairs) = emitted_pairs {
+                            debug_assert_eq!(pairs.len(), v.slot_count * 2);
+                            tint.add_tint(pairs);
+                        } else if let Some(slots) = mapped_slots {
                             tint.add_slots(&slots[want]);
                         } else if let Some(tp) = tint_stream {
                             tint.add_tint(&tp[want.start * 2..want.end * 2]);
@@ -884,6 +913,8 @@ impl RepoLoad {
                 log::warn!("focus: no file path contains {needle:?} — fitting the whole field");
             }
         }
+        let gpu_item_params: Vec<glyph_field::ItemParamsGpu> =
+            pick_files.iter().map(|f| glyph_field::ItemParamsGpu::from(&f.item)).collect();
         StagedText {
             glyphs_emitted: self.arena.len(),
             codepoints_decoded: self.stats.records,
@@ -906,6 +937,7 @@ impl RepoLoad {
                 folds: std::collections::HashMap::new(),
             }),
             controller: self.controller,
+            item_params: gpu_item_params,
         }
     }
 

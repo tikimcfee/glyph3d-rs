@@ -25,7 +25,7 @@
 # Ratchet, NOT an equality: tests are added constantly, so an exact pin would
 # redden on the most common good action in the repo. A green run whose real
 # count exceeds the floor prints a NOTE naming the value to raise it to.
-test_floor = 164
+test_floor = 179
 
 
 # ── Products ─────────────────────────────────────────────────────────────
@@ -36,7 +36,7 @@ test_floor = 164
 [artifact.renderer]
 class = "product"
 outputs = ["target/release/glyph3d-native"]
-inputs = ["native/src/**/*", "native/Cargo.toml", "native/Cargo.lock"]
+inputs = ["native/src/**/*", "native/Cargo.toml", "native/Cargo.lock", "crates/**/*"]
 build = "cd native && cargo build --release"
 note = "Pure-Rust native renderer."
 
@@ -441,7 +441,7 @@ expect = "cargo-clippy — 2 warnings"
 name = "coverage-scale"
 gate = "pixel-ab"
 why = "the golden views are the ONLY pixel check; a shader constant that changes glyph antialiasing must move them. Chosen because it is purely visual — it does not touch the fold, the corpus or CPU-side picking, so a red here is attributable to this gate and no other"
-file = "native/src/shaders/glyph_field.wgsl"
+file = "crates/glyph-field-instanced/shaders/glyph_field.wgsl"
 op = "replace"
 find = "cov = clamp(coverage * 0.5, 0.0, 1.0);"
 with = "cov = clamp(coverage * 0.62, 0.0, 1.0);"
@@ -452,7 +452,7 @@ rebuild = "cargo build --release"
 name = "depth-write-off"
 gate = "pixel-ab"
 why = "the 2026-09-07 z-order defect put back: the glyph pass testing depth without writing it, so a later-drawn file paints over a nearer one. CONSUMED BY: repo-back-oblique, the frame added for it — and repo-wide, whose front-on column had been painting over long.md's pages in every baseline before that day without anyone seeing it"
-file = "native/src/glyph_scene/pipelines.rs"
+file = "crates/glyph-field-instanced/src/pipeline.rs"
 op = "replace"
 find = """            // blends in exactly the order it did before.
             depth_write_enabled: Some(true),"""
@@ -465,7 +465,7 @@ rebuild = "cargo build --release"
 name = "emoji-uv-flip"
 gate = "pixel-ab"
 why = "the sheet sampled upside down — the class of defect the emoji frame exists for (a cell placement, inset or flip error), which no numeric gate can see because the layout is untouched. CONSUMED BY: emoji.png and nothing else; every text frame stays byte-equal under it, which is also the proof that no text frame samples the sheet"
-file = "native/src/shaders/glyph_field.wgsl"
+file = "crates/glyph-field-instanced/shaders/glyph_field.wgsl"
 op = "replace"
 find = "        let t = vec2<f32>(c.x, 1.0 - c.y);"
 with = "        let t = vec2<f32>(c.x, c.y);"

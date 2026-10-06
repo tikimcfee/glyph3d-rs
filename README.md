@@ -36,8 +36,9 @@ Platform: macOS on Apple Silicon (`osx-arm64`; Metal) and Linux x86_64 (`linux-6
                                 ▼
  ┌─────────────────────────────────────────────────────────────┐
  │ native/src/glyph_scene/     — Slug WGSL Renderer            │
- │ • buffers.rs: Mapped instance arena & zero-copy upload      │
- │ • pipelines.rs: Glyph analytic-coverage & composite pipeline│
+ │ • crates/glyph-field*: GlyphField trait + one crate per mode│
+ │   (Instanced: RenderSlot upload, glyph pipeline, WGSL)      │
+ │ • pipelines.rs: composite & selection tint pipelines        │
  │ • render.rs: Frustum/LOD CPU culling, multi-pass rendering  │
  └─────────────────────────────────────────────────────────────┘
 ```
@@ -47,8 +48,8 @@ Platform: macOS on Apple Silicon (`osx-arm64`; Metal) and Linux x86_64 (`linux-6
   instances directly into mapped GPU shared memory.
 - **`native/src/glyph_scene/`** (Rust, wgpu 30 / winit 0.30 / glam 0.33 / egui 0.36):
   Decomposed into modular submodules:
-  - `buffers.rs`: Mapped instance arena allocation (`MTLStorageModeShared`) and unified memory transcoding.
-  - `pipelines.rs`: Slug analytic-coverage render pipelines, selection mask/tint pipelines, and composite state.
+  - `setup.rs`: scene construction; builds the glyph field for the chosen `--field-mode`.
+  - `pipelines.rs`: composite state and the selection tint pipeline.
   - `render.rs`: Frame render pass orchestration, two-level CPU frustum/LOD culling, backdrop quad pass,
     glyph field pass, and fullscreen composite pass.
 - **`native/src/layout/span.rs`**: ByteSpan token painting for AST/LSP integration (`Paint::ByteSpans`),
@@ -109,7 +110,8 @@ shasum -a 256 /tmp/test.png
 |---|---|
 | `native/` | The pure-Rust renderer and layout engine binary. Contracts in `native/src/*.rs` |
 | `native/src/layout_hyper.rs` | HyperLayout: sub-second parallel CPU layout into mapped shared memory |
-| `native/src/glyph_scene/` | Modularized Slug WGSL renderer: `buffers.rs`, `pipelines.rs`, `render.rs` |
+| `native/src/glyph_scene/` | Modularized Slug WGSL renderer: `setup.rs`, `pipelines.rs`, `render.rs` |
+| `crates/glyph-field*` | The glyph field by render mode: the `GlyphField` contract, and the Instanced mode (`RenderSlot` upload — mapped `MTLStorageModeShared` or staged — glyph pipeline, `glyph_field.wgsl`) |
 | `native/src/cubecl_*.rs` | Decoupled CubeCL GPU compute kernels (gated behind `[features] cubecl`) |
 | `glyph/` | The verification and mutation runner (`cargo run -p glyph -- validate`) |
 | `assets/atlas/` | Prebaked glyph-geometry binaries + `engine-trie.bin` + `FORMAT.md` |

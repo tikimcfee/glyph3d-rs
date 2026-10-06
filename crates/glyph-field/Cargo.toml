@@ -1,0 +1,14 @@
+[package]
+name = "glyph-field"
+version = "0.1.0"
+edition = "2021"
+description = "The glyph field's mode-neutral contract: the GlyphField trait every render mode implements, the field mode enum, and the records and GPU resources the modes share."
+
+# The contract crate owns no shader and no slot format. A render mode
+# (`glyph-field-instanced`, later `glyph-field-derived`) owns its own slot
+# record, emission, upload, WGSL and pipelines, and implements `GlyphField`
+# so the scene can draw and edit glyphs without knowing which mode it holds.
+[dependencies]
+wgpu = "30"
+bytemuck = { version = "1", features = ["derive"] }
+encase = "0.12"

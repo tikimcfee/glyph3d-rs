@@ -156,6 +156,12 @@ pub struct Cli {
     /// Stage F: disable the cull/LOD pass (legacy per-chunk draws; debug/A-B)
     #[arg(long)]
     pub no_cull: bool,
+    /// Glyph field render mode: `instanced` (default: one full 32 B placement
+    /// record per glyph, read as-is by the vertex stage) or `derived` (compact
+    /// record, placement derived in the vertex stage — not implemented yet;
+    /// refused at startup). Fixed for the scene's lifetime.
+    #[arg(long, value_name = "MODE", default_value = "instanced")]
+    pub field_mode: glyph_field::GlyphFieldMode,
     /// Stage K: windowed without the egui UI overlay (exact pre-K behavior)
     #[arg(long)]
     pub no_ui: bool,
@@ -234,6 +240,9 @@ pub struct Cli {
     /// engine's batched output — the fence the load-path flip rides on.
     #[arg(long, value_name = "DIR")]
     pub cubecl_repo_check: Option<PathBuf>,
+    /// P2 Spike: verify bit-exactness of vertex-stage Y and Z derivation on GPU
+    #[arg(long, value_name = "DIR")]
+    pub spike_vertex_yz: Option<PathBuf>,
     /// Windowed only: how frames reach the display. `fifo` (the default) is
     /// vsync, so the FPS line reads the monitor's refresh; `mailbox` and
     /// `immediate` uncap it where the surface supports them (else fifo, and

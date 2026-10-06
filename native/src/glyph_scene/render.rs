@@ -111,8 +111,8 @@ pub(super) fn render_scene(
             &cull.segments,
             &cull.hidden,
             &view,
-            scene.chunk_cap,
-            scene.bind_groups.len() as u32,
+            scene.field.chunk_capacity(),
+            scene.field.chunk_count(),
         );
         if !phase_draws.backdrops.is_empty() {
             let max_cap = (cull.backdrop_insts_buf.size()
@@ -150,7 +150,8 @@ pub(super) fn render_scene(
         PhaseDraws {
             backdrops: Vec::new(),
             glyph_ranges: scene
-                .chunk_counts
+                .field
+                .chunk_glyph_counts()
                 .iter()
                 .enumerate()
                 .map(|(c, &n)| (c as u32, 0..n))
@@ -333,16 +334,8 @@ pub(super) fn render_scene(
                     .profiler
                     .as_ref()
                     .map(|p| p.borrow().begin_query("glyph stream", &mut pass));
-                pass.set_pipeline(&scene.pipeline);
-                pass.set_index_buffer(scene.quad_index_buf.slice(..), wgpu::IndexFormat::Uint16);
-                let mut cur_chunk = u32::MAX;
-                for (c, r) in &phase_draws.glyph_ranges {
-                    if *c != cur_chunk {
-                        cur_chunk = *c;
-                        pass.set_bind_group(0, &scene.bind_groups[*c as usize], &[]);
-                    }
-                    pass.draw_indexed(0..6, 0, r.clone());
-                }
+                pass.set_pipeline(scene.field.glyph_pipeline());
+                scene.field.record_draws(&mut pass, &phase_draws.glyph_ranges);
                 if let (Some(p), Some(q)) = (&ctx.profiler, q) {
                     p.borrow().end_query(&mut pass, q);
                 }
@@ -397,26 +390,19 @@ pub(super) fn render_scene(
                 ..Default::default()
             });
             pass.set_pipeline(&fx.mask_pipeline);
-            pass.set_index_buffer(scene.quad_index_buf.slice(..), wgpu::IndexFormat::Uint16);
-            match sel {
-                Selection::Glyph { chunk, local } => {
-                    pass.set_bind_group(0, &scene.bind_groups[*chunk as usize], &[]);
-                    pass.draw_indexed(0..6, 0, *local..*local + 1);
-                }
-                Selection::Segment { slot_base, slot_count } => {
-                    // Per-chunk split — the same math cull_segments uses.
-                    let slot_end = slot_base + slot_count;
-                    for c in 0..scene.bind_groups.len() as u32 {
-                        let c_lo = c * scene.chunk_cap;
-                        let lo = (*slot_base).max(c_lo);
-                        let hi = slot_end.min(c_lo + scene.chunk_cap);
-                        if hi > lo {
-                            pass.set_bind_group(0, &scene.bind_groups[c as usize], &[]);
-                            pass.draw_indexed(0..6, 0, (lo - c_lo)..(hi - c_lo));
-                        }
-                    }
-                }
-            }
+            let mask_draws: Vec<(u32, std::ops::Range<u32>)> = match sel {
+                Selection::Glyph { chunk, local } => vec![(*chunk, *local..*local + 1)],
+                // Per-chunk split — the same math cull_segments uses.
+                Selection::Segment { slot_base, slot_count } => glyph_field::split_at_chunks(
+                    *slot_base,
+                    *slot_count,
+                    scene.field.chunk_capacity(),
+                )
+                .filter(|(chunk, _, _)| *chunk < scene.field.chunk_count())
+                .map(|(chunk, local, _)| (chunk, local))
+                .collect(),
+            };
+            scene.field.record_draws(&mut pass, &mask_draws);
         }
         if let (Some(p), Some(q)) = (&ctx.profiler, mask_query) {
             p.borrow().end_query(encoder, q);

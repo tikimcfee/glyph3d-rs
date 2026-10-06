@@ -20,6 +20,7 @@ pub mod scan;
 pub mod scene;
 pub mod seam;
 pub mod spatial_scene;
+pub mod spike_vertex_yz;
 pub mod text;
 pub mod windowed;
 
@@ -123,6 +124,8 @@ pub struct SceneCullOptions {
     pub greeking: bool,
     pub greek_pure: bool,
     pub greek_onset_px: Option<f32>,
+    /// Which glyph-field implementation the scene builds (`--field-mode`).
+    pub field_mode: glyph_scene::GlyphFieldMode,
 }
 
 impl Default for SceneCullOptions {
@@ -135,6 +138,7 @@ impl Default for SceneCullOptions {
             greeking: true,
             greek_pure: true,
             greek_onset_px: None,
+            field_mode: glyph_scene::GlyphFieldMode::Instanced,
         }
     }
 }
@@ -178,7 +182,9 @@ pub fn build_scene_from_staged(
     camera_mode: CameraMode,
     cull: bool,
 ) -> Box<dyn SceneLike> {
-    Box::new(GlyphScene::new(ctx, color_format, atlas, staged, camera_mode, cull))
+    Box::new(GlyphScene::new(
+        ctx, color_format, atlas, staged, camera_mode, cull, glyph_scene::GlyphFieldMode::Instanced,
+    ))
 }
 
 /// The PROBED twin of [`build_scene_from_staged`] — installs the Debug
@@ -193,7 +199,9 @@ pub fn build_scene_from_staged_probed(
     camera_mode: CameraMode,
     cull: bool,
 ) -> (Box<dyn SceneLike>, Option<glyph_scene::UiProbe>) {
-    let mut scene = GlyphScene::new(ctx, color_format, atlas, staged, camera_mode, cull);
+    let mut scene = GlyphScene::new(
+        ctx, color_format, atlas, staged, camera_mode, cull, glyph_scene::GlyphFieldMode::Instanced,
+    );
     let probe = scene.init_ui_probe();
     (Box::new(scene), Some(probe))
 }
@@ -238,6 +246,7 @@ fn build_scene_impl(
         (Box::new(scene) as Box<dyn SceneLike>, p)
     };
     let cull = cull_opts.cull;
+    let field_mode = cull_opts.field_mode;
     match choice {
         SceneChoice::Demo => (Box::new(Scene::new(ctx, color_format)), None),
         SceneChoice::Text { file, copies, emoji_sheet, cluster_mode } => {
@@ -251,7 +260,7 @@ fn build_scene_impl(
                 copies,
                 staged.missing_or_bitmap,
             );
-            let mut scene = GlyphScene::new(ctx, color_format, &atlas, staged, camera_mode, cull);
+            let mut scene = GlyphScene::new(ctx, color_format, &atlas, staged, camera_mode, cull, field_mode);
             scene.set_probe_cluster_mode(matches!(cluster_mode, fold::ClusterMode::Cluster));
             glyph(scene)
         }
@@ -265,7 +274,7 @@ fn build_scene_impl(
                 placement.record_count - placement.slot_count,
             );
             let staged = text::stage_records(arena, &placement, &atlas.slot_ink);
-            glyph(GlyphScene::new(ctx, color_format, &atlas, staged, camera_mode, cull))
+            glyph(GlyphScene::new(ctx, color_format, &atlas, staged, camera_mode, cull, field_mode))
         }
         SceneChoice::Repo {
             dir,
@@ -285,6 +294,7 @@ fn build_scene_impl(
                 cluster_mode: *cluster_mode,
                 layout_mode: *layout_mode,
                 color_mode: *color_mode,
+                field_mode,
                 ..Default::default()
             };
             let t_visual_start = std::time::Instant::now();
@@ -333,7 +343,7 @@ fn build_scene_impl(
             let staged_dur = t_staged.elapsed();
 
             let t_scene = std::time::Instant::now();
-            let mut scene = GlyphScene::new(ctx, color_format, &atlas, staged, camera_mode, cull);
+            let mut scene = GlyphScene::new(ctx, color_format, &atlas, staged, camera_mode, cull, field_mode);
             scene.set_probe_layout_mode(*layout_mode);
             let scene_dur = t_scene.elapsed();
             let visual_total = t_visual_start.elapsed();

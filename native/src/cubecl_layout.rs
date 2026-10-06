@@ -233,6 +233,9 @@ impl LayoutGlyphs for CubeclLayout {
                 mapped_slots: None,
                 file_tints: Vec::new(),
                 file_blocks: Vec::new(),
+                format: glyph_field::GlyphFieldMode::Instanced,
+                derived: None,
+                emoji_tint_pairs: Vec::new(),
             });
         }
         self.phases = CubeclPhases {
