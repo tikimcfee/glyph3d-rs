@@ -105,6 +105,9 @@ pub struct LayoutController {
     pub scene: SpatialScene,
     pub zone_entities: HashMap<String, Entity>,
     pub file_entities: Vec<Entity>,
+    pub active_carrel: Option<Entity>,
+    pub session: Option<crate::agent_transcript::AgentSession>,
+    pub revision_engine: Option<crate::revision::RevisionEngine>,
 }
 
 impl std::fmt::Debug for LayoutController {
@@ -147,6 +150,9 @@ impl LayoutController {
             scene: SpatialScene::new(),
             zone_entities: HashMap::new(),
             file_entities: Vec::new(),
+            active_carrel: None,
+            session: None,
+            revision_engine: None,
         }
     }
 
@@ -374,9 +380,12 @@ impl LayoutController {
             self.scene.spawn_agent_turn_card(
                 deck,
                 i,
+                i,
+                i,
                 [55.0, 36.0],
                 4.0,
                 *title,
+                None,
             );
         }
 
@@ -426,6 +435,136 @@ impl LayoutController {
         self.scene.update_transforms();
 
         "spawned Agent Carrel demo with 4 Turn Cards and Workdesk (press [ / ] or n / p to turn pages, v to splay grid, c to grab/drag)".to_string()
+    }
+
+    /// Spawn an Agent Carrel into the spatial scene with custom options and track it for navigation.
+    pub fn spawn_agent_carrel_session_with_options(
+        &mut self,
+        session: crate::agent_transcript::AgentSession,
+        revision_engine: crate::revision::RevisionEngine,
+        options: crate::spatial_scene::CarrelLayoutOptions,
+    ) -> Entity {
+        let carrel_root = self.scene.spawn_root("agent_carrel_root");
+        let carrel_zone = self.scene.spawn_zone(
+            carrel_root,
+            format!("agent:carrel:{}", session.session_id),
+            format!("Agent Carrel: {}", session.session_id),
+            Transform::IDENTITY,
+            [280.0, 160.0],
+        );
+        self.zone_entities.insert("agent:carrel".to_string(), carrel_zone);
+
+        let carrel_e = self.scene.spawn_agent_carrel_with_options(carrel_zone, &session, &revision_engine, options);
+        self.active_carrel = Some(carrel_e);
+        self.session = Some(session);
+        self.revision_engine = Some(revision_engine);
+        self.scene.update_transforms();
+        carrel_e
+    }
+
+    /// Spawn an Agent Carrel into the spatial scene and track it for navigation.
+    pub fn spawn_agent_carrel_session(
+        &mut self,
+        session: crate::agent_transcript::AgentSession,
+        revision_engine: crate::revision::RevisionEngine,
+    ) -> Entity {
+        self.spawn_agent_carrel_session_with_options(
+            session,
+            revision_engine,
+            crate::spatial_scene::CarrelLayoutOptions::default(),
+        )
+    }
+
+    /// Advance active atomic beat (or turn) in the agent carrel.
+    pub fn carrel_next(&mut self) -> Option<String> {
+        let carrel_e = self.active_carrel?;
+        let session = self.session.as_ref()?;
+        let rev_engine = self.revision_engine.as_ref()?;
+        let next_beat = self.scene.carrel_next_beat(carrel_e, session, rev_engine);
+        self.scene.update_transforms();
+        let events = session.linearize_events(Some(rev_engine));
+        let total = events.len().max(session.turn_count());
+        let summary = events
+            .get(next_beat)
+            .map(|e| e.summary())
+            .unwrap_or_else(|| {
+                session
+                    .turns
+                    .get(next_beat)
+                    .map(|t| t.summary())
+                    .unwrap_or_default()
+            });
+        Some(format!(
+            "carrel: beat {}/{} — \"{}\"",
+            next_beat + 1,
+            total,
+            summary
+        ))
+    }
+
+    /// Retreat active atomic beat (or turn) in the agent carrel.
+    pub fn carrel_prev(&mut self) -> Option<String> {
+        let carrel_e = self.active_carrel?;
+        let session = self.session.as_ref()?;
+        let rev_engine = self.revision_engine.as_ref()?;
+        let prev_beat = self.scene.carrel_prev_beat(carrel_e, session, rev_engine);
+        self.scene.update_transforms();
+        let events = session.linearize_events(Some(rev_engine));
+        let total = events.len().max(session.turn_count());
+        let summary = events
+            .get(prev_beat)
+            .map(|e| e.summary())
+            .unwrap_or_else(|| {
+                session
+                    .turns
+                    .get(prev_beat)
+                    .map(|t| t.summary())
+                    .unwrap_or_default()
+            });
+        Some(format!(
+            "carrel: beat {}/{} — \"{}\"",
+            prev_beat + 1,
+            total,
+            summary
+        ))
+    }
+
+    /// Jump to a specific turn in the agent carrel.
+    pub fn carrel_set_turn(&mut self, turn_index: usize) -> Option<String> {
+        let carrel_e = self.active_carrel?;
+        let session = self.session.as_ref()?;
+        let rev_engine = self.revision_engine.as_ref()?;
+        self.scene.carrel_set_turn(carrel_e, turn_index, session, rev_engine);
+        self.scene.update_transforms();
+        let total = session.turn_count();
+        Some(format!("carrel: jump to turn {}/{}", turn_index + 1, total))
+    }
+
+    /// Jump to a specific atomic beat in the agent carrel.
+    pub fn carrel_set_beat(&mut self, beat_index: usize) -> Option<String> {
+        let carrel_e = self.active_carrel?;
+        let session = self.session.as_ref()?;
+        let rev_engine = self.revision_engine.as_ref()?;
+        self.scene.carrel_set_beat(carrel_e, beat_index, session, rev_engine);
+        self.scene.update_transforms();
+        let events = session.linearize_events(Some(rev_engine));
+        let total = events.len().max(session.turn_count());
+        let summary = events
+            .get(beat_index)
+            .map(|e| e.summary())
+            .unwrap_or_else(|| {
+                session
+                    .turns
+                    .get(beat_index)
+                    .map(|t| t.summary())
+                    .unwrap_or_default()
+            });
+        Some(format!(
+            "carrel: beat {}/{} — \"{}\"",
+            beat_index + 1,
+            total,
+            summary
+        ))
     }
 }
 

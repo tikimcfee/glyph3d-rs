@@ -93,6 +93,18 @@ pub struct Cli {
     /// Text file to stage (UTF-8); default: this crate's main.rs
     #[arg(long, value_name = "PATH")]
     pub render_file: Option<PathBuf>,
+    /// Load an agent transcript session (JSONL from Claude Code or Antigravity) into an Agent Carrel
+    #[arg(long, value_name = "PATH")]
+    pub agent_session: Option<PathBuf>,
+    /// Sliding window limit for Agent Carrel turn/beat deck (default 20)
+    #[arg(long, value_name = "N", default_value_t = 20)]
+    pub deck_window_limit: usize,
+    /// Sliding window time scroll offset backward for Agent Carrel deck (default 0)
+    #[arg(long, value_name = "N", default_value_t = 0)]
+    pub deck_scroll_offset: usize,
+    /// Sliding window limit for Agent Carrel workdesk file revisions (default 20)
+    #[arg(long, value_name = "N", default_value_t = 20)]
+    pub desk_revision_limit: usize,
     /// Tile the file N times (stress)
     #[arg(long, value_name = "N", default_value_t = 1)]
     pub copies: u32,
@@ -472,11 +484,22 @@ pub fn parse_cli_from(matches: clap::ArgMatches) -> Cli {
                         }
                     }
                 }
+                if matches.value_source("agent_session")
+                    != Some(clap::parser::ValueSource::CommandLine)
+                {
+                    if let Some(session) = cfg.agent_session {
+                        cli.agent_session = Some(session);
+                    }
+                }
             }
             Err(e) => {
                 log::warn!("{e}");
             }
         }
+    }
+
+    if let Some(session) = &cli.agent_session {
+        cli.agent_session = Some(crate::launch_config::expand_home(session));
     }
 
     cli

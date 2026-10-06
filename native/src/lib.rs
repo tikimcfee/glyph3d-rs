@@ -2,6 +2,7 @@
 
 use std::path::{Path, PathBuf};
 
+pub mod agent_transcript;
 pub mod atlas;
 pub mod bake;
 pub mod cli;
@@ -16,6 +17,7 @@ pub mod layout_hyper;
 pub mod layout_stack;
 pub mod offscreen;
 pub mod repo;
+pub mod revision;
 pub mod scan;
 pub mod scene;
 pub mod seam;
@@ -52,6 +54,12 @@ pub enum SceneChoice {
     Text { file: PathBuf, copies: u32, emoji_sheet: PathBuf, cluster_mode: fold::ClusterMode },
     /// Stage E1: lay `file` out with the engine and render through Slug glyph renderer.
     EngineText { file: PathBuf, trie: PathBuf, emoji_sheet: PathBuf },
+    /// Agent Session: 3D Agent Carrel with Turn Deck and Workdesk.
+    AgentSession {
+        session_path: PathBuf,
+        emoji_sheet: PathBuf,
+        layout_options: spatial_scene::CarrelLayoutOptions,
+    },
     /// Stage E2: load a whole repository as a field of code pages — one group
     /// per file, one shared glyph arena, grid layout.
     Repo {
@@ -276,6 +284,61 @@ fn build_scene_impl(
             );
             let staged = text::stage_records(arena, &placement, &atlas.slot_ink);
             glyph(GlyphScene::new(ctx, color_format, &atlas, staged, camera_mode, cull, field_mode))
+        }
+        SceneChoice::AgentSession { session_path, emoji_sheet, layout_options } => {
+            let session = match agent_transcript::load_session_from_path(session_path) {
+                Ok(s) => s,
+                Err(e) => {
+                    log::error!("Failed to load agent session from {}: {}", session_path.display(), e);
+                    let session_id = session_path
+                        .file_stem()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("empty");
+                    agent_transcript::AgentSession::new(agent_transcript::HarnessKind::ClaudeCode, session_id)
+                }
+            };
+            let cwd_opt = session.cwd.clone();
+            let cur_dir = std::env::current_dir().ok();
+
+            let mut rev_engine = revision::RevisionEngine::new().with_disk_resolver(move |rel_path: &str| {
+                let clean = rel_path.trim().trim_matches('"').trim_matches('\'');
+                let path_str = clean.strip_prefix("file://").unwrap_or(clean);
+                let p = std::path::Path::new(path_str);
+                if p.is_absolute() && p.is_file() {
+                    if let Ok(content) = std::fs::read_to_string(p) {
+                        return Some(content);
+                    }
+                }
+                if let Some(ref cwd) = cwd_opt {
+                    let full = std::path::Path::new(cwd).join(path_str);
+                    if full.is_file() {
+                        if let Ok(content) = std::fs::read_to_string(&full) {
+                            return Some(content);
+                        }
+                    }
+                }
+                if let Some(ref cur) = cur_dir {
+                    let full = cur.join(path_str);
+                    if full.is_file() {
+                        if let Ok(content) = std::fs::read_to_string(&full) {
+                            return Some(content);
+                        }
+                    }
+                }
+                None
+            });
+            rev_engine.ingest_session(&session);
+
+            let atlas = atlas::Atlas::load(ctx, emoji_sheet);
+            let staged = agent_transcript::stage_agent_session_with_options(
+                Some(&atlas),
+                &atlas.slot_ink,
+                session,
+                rev_engine,
+                *layout_options,
+            );
+            let scene = GlyphScene::new(ctx, color_format, &atlas, staged, camera_mode, cull, field_mode);
+            glyph(scene)
         }
         SceneChoice::Repo {
             dir,

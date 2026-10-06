@@ -45,6 +45,10 @@ pub struct Deck {
     pub flip_angle_rad: f32,
     /// Whether the deck wraps circularly in Deck mode (Rolodex carousel).
     pub wrap: bool,
+    /// Maximum number of cards visible in the sliding window.
+    pub window_limit: usize,
+    /// Number of items scrolled backward in time ($K$).
+    pub scroll_offset: usize,
 }
 
 impl Default for Deck {
@@ -59,6 +63,8 @@ impl Default for Deck {
             splay_lift: 8.0,
             flip_angle_rad: 0.12,
             wrap: true,
+            window_limit: 20,
+            scroll_offset: 0,
         }
     }
 }
@@ -90,6 +96,16 @@ impl Deck {
 
     pub fn with_wrap(mut self, wrap: bool) -> Self {
         self.wrap = wrap;
+        self
+    }
+
+    pub fn with_window_limit(mut self, limit: usize) -> Self {
+        self.window_limit = limit.max(1);
+        self
+    }
+
+    pub fn with_scroll_offset(mut self, offset: usize) -> Self {
+        self.scroll_offset = offset;
         self
     }
 
@@ -393,5 +409,17 @@ impl SpatialScene {
     pub fn deck_toggle_mode(&mut self, deck_entity: Entity) -> Option<DeckMode> {
         let mut deck = self.world.get_mut::<Deck>(deck_entity)?;
         Some(deck.toggle_mode())
+    }
+
+    /// Set active page in a Deck entity.
+    pub fn deck_set_active(&mut self, deck_entity: Entity, active_index: usize) {
+        let total = self
+            .world
+            .get::<Children>(deck_entity)
+            .map(|c| c.len())
+            .unwrap_or(0);
+        if let Some(mut deck) = self.world.get_mut::<Deck>(deck_entity) {
+            deck.set_active_page(active_index, total);
+        }
     }
 }

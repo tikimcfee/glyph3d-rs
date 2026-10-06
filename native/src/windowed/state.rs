@@ -95,6 +95,20 @@ pub(super) struct WindowState {
     pub(super) cluster_selftest: u8,
 }
 
+#[cfg(feature = "egui-ui")]
+fn format_relative_time(dur: std::time::Duration) -> String {
+    let secs = dur.as_secs();
+    if secs < 60 {
+        "just now".to_string()
+    } else if secs < 3600 {
+        format!("{}m ago", secs / 60)
+    } else if secs < 86400 {
+        format!("{}h ago", secs / 3600)
+    } else {
+        format!("{}d ago", secs / 86400)
+    }
+}
+
 impl WindowState {
     pub(super) fn resize(&mut self, ctx: &GpuContext, width: u32, height: u32) {
         if width == 0 || height == 0 {
@@ -299,6 +313,8 @@ impl WindowState {
                             z_wrap_spacing: Some(new),
                             toggle_cluster: false,
                             toggle_layout: false,
+                            switch_agent_session: None,
+                            carrel_options: None,
                         });
                         self.zspace_selftest = 2;
                     }
@@ -344,6 +360,8 @@ impl WindowState {
                             z_wrap_spacing: None,
                             toggle_cluster: true,
                             toggle_layout: false,
+                            switch_agent_session: None,
+                            carrel_options: None,
                         });
                         self.cluster_selftest = 2;
                     }
@@ -449,6 +467,10 @@ impl WindowState {
             let scratch = &mut egui.scratch;
             let filter = &mut egui.filter;
             let selected_group = &mut egui.selected_group;
+            let session_browser_open = &mut egui.session_browser_open;
+            let session_filter_text = &mut egui.session_filter_text;
+            let session_filter_harness = &mut egui.session_filter_harness;
+            let discovered_sessions = &mut egui.discovered_sessions;
             // The layout dial's apply signal: the panel's slider sets it on
             // release; the RedrawRequested arm consumes it and rebuilds.
             let pending_relayout = &mut self.pending_relayout;
@@ -467,7 +489,14 @@ impl WindowState {
                 egui::Window::new("Debug")
                     .id(egui::Id::new("stage_k_debug_panel"))
                     .open(debug_open)
+                    .default_pos(egui::pos2(10.0, 10.0))
+                    .default_size(egui::vec2(360.0, 520.0))
+                    .min_size(egui::vec2(280.0, 180.0))
+                    .resizable(true)
+                    .collapsible(true)
+                    .vscroll(true)
                     .show(root_ui.ctx(), |ui| {
+                        ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
                         ui.label(format!("FPS: {fps:.1}"));
                         match &probe_snap {
                             Some(snap) => {
@@ -609,6 +638,8 @@ impl WindowState {
                                         z_wrap_spacing: Some(*spacing),
                                         toggle_cluster: false,
                                         toggle_layout: false,
+                                        switch_agent_session: None,
+                                        carrel_options: None,
                                     });
                                 }
                             }
@@ -633,6 +664,8 @@ impl WindowState {
                                         z_wrap_spacing: None,
                                         toggle_cluster: true,
                                         toggle_layout: false,
+                                        switch_agent_session: None,
+                                        carrel_options: None,
                                     });
                                 }
                             }
@@ -654,10 +687,19 @@ impl WindowState {
                                         z_wrap_spacing: None,
                                         toggle_cluster: false,
                                         toggle_layout: true,
+                                        switch_agent_session: None,
+                                        carrel_options: None,
                                     });
                                 }
                             }
                         }
+                        ui.separator();
+                        ui.horizontal(|ui| {
+                            ui.label("agent sessions (F7):");
+                            if ui.button("Browse Sessions 📂").clicked() {
+                                *session_browser_open = !*session_browser_open;
+                            }
+                        });
                         ui.separator();
                         ui.label("K2 typing test — WASD/h/g/t/x here must not move the scene:");
                         ui.text_edit_singleline(scratch);
@@ -758,6 +800,284 @@ impl WindowState {
                             }
                         }
                     });
+
+                if let Some(carrel) = probe_snap.as_ref().and_then(|s| s.carrel.as_ref()) {
+                    egui::Window::new(format!("Agent Carrel: {}", carrel.session_id))
+                        .id(egui::Id::new("agent_carrel_hud"))
+                        .default_pos(egui::pos2(20.0, 20.0))
+                        .default_size(egui::vec2(380.0, 480.0))
+                        .min_size(egui::vec2(280.0, 160.0))
+                        .resizable(true)
+                        .collapsible(true)
+                        .vscroll(true)
+                        .show(root_ui.ctx(), |ui| {
+                            ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
+                            ui.horizontal(|ui| {
+                                if ui.button("⏮ Oldest (End)").clicked() {
+                                    self.scene.on_key(ctx, winit::keyboard::KeyCode::End, true);
+                                }
+
+                                let total_beats = carrel.beat_count.max(carrel.turn_count);
+
+                                if ui.button("◀ Prev (P/←/〔)").clicked() && total_beats > 0 {
+                                    self.scene.on_key(ctx, winit::keyboard::KeyCode::BracketLeft, true);
+                                }
+
+                                if carrel.beat_count > 0 {
+                                    ui.label(egui::RichText::new(format!(
+                                        "Beat {} / {} (T{})",
+                                        carrel.active_beat + 1,
+                                        carrel.beat_count,
+                                        carrel.active_turn + 1
+                                    )).strong());
+                                } else {
+                                    ui.label(egui::RichText::new(format!("Turn {} / {}", carrel.active_turn + 1, carrel.turn_count)).strong());
+                                }
+
+                                if ui.button("Next (N/→/〕) ▶").clicked() && total_beats > 0 {
+                                    self.scene.on_key(ctx, winit::keyboard::KeyCode::BracketRight, true);
+                                }
+
+                                if ui.button("Latest ⏭ (Home)").clicked() {
+                                    self.scene.on_key(ctx, winit::keyboard::KeyCode::Home, true);
+                                }
+
+                                ui.separator();
+                                if ui.button("Mode (V)").clicked() {
+                                    self.scene.on_key(ctx, winit::keyboard::KeyCode::KeyV, true);
+                                }
+                                ui.separator();
+                                if ui.button("Sessions (F7) 📂").clicked() {
+                                    *session_browser_open = !*session_browser_open;
+                                }
+                            });
+
+                            // Timeline & Window Information
+                            ui.separator();
+                            let total_beats = carrel.beat_count.max(carrel.turn_count);
+                            let (w_old, w_new) = carrel.window_item_range;
+                            ui.horizontal(|ui| {
+                                ui.label(egui::RichText::new(format!(
+                                    "Window: [{}..{}] of {}",
+                                    w_old, w_new, total_beats
+                                )).strong());
+                                if carrel.layout_options.deck_scroll_offset > 0 {
+                                    ui.colored_label(
+                                        egui::Color32::from_rgb(255, 180, 80),
+                                        format!("(-{} back in history)", carrel.layout_options.deck_scroll_offset),
+                                    );
+                                } else {
+                                    ui.colored_label(
+                                        egui::Color32::from_rgb(100, 240, 140),
+                                        "(LIVE / LATEST)",
+                                    );
+                                }
+                            });
+
+                            // Collapsible Sliders for limits and offsets
+                            let mut current_opts = carrel.layout_options;
+                            let mut opts_changed = false;
+                            ui.collapsing("Window Limits & Time Travel", |ui| {
+                                ui.horizontal(|ui| {
+                                    ui.label("Deck Window Limit:");
+                                    let resp = ui.add(egui::Slider::new(&mut current_opts.deck_window_limit, 5..=100).text("cards"));
+                                    if resp.drag_stopped() || resp.lost_focus() {
+                                        opts_changed = true;
+                                    }
+                                });
+                                ui.horizontal(|ui| {
+                                    ui.label("Time Scroll (K):");
+                                    let max_k = carrel.max_deck_scroll;
+                                    let resp = ui.add(egui::Slider::new(&mut current_opts.deck_scroll_offset, 0..=max_k).text("turns back"));
+                                    if resp.drag_stopped() || resp.lost_focus() {
+                                        opts_changed = true;
+                                    }
+                                });
+                                ui.horizontal(|ui| {
+                                    ui.label("Desk Revision Limit:");
+                                    let resp = ui.add(egui::Slider::new(&mut current_opts.desk_revision_limit, 3..=50).text("revs/file"));
+                                    if resp.drag_stopped() || resp.lost_focus() {
+                                        opts_changed = true;
+                                    }
+                                });
+                                ui.horizontal(|ui| {
+                                    ui.label("Max File Stacks:");
+                                    let resp = ui.add(egui::Slider::new(&mut current_opts.max_file_stacks, 5..=50).text("files"));
+                                    if resp.drag_stopped() || resp.lost_focus() {
+                                        opts_changed = true;
+                                    }
+                                });
+                            });
+
+                            if opts_changed && current_opts != carrel.layout_options {
+                                *pending_relayout = Some(RelayoutRequest {
+                                    carrel_options: Some(current_opts),
+                                    ..Default::default()
+                                });
+                            }
+                            if !carrel.beat_summary.is_empty() {
+                                ui.separator();
+                                ui.label(egui::RichText::new("Active Beat:").heading());
+                                ui.colored_label(egui::Color32::from_rgb(250, 220, 120), &carrel.beat_summary);
+                            }
+                            if !carrel.prompt_summary.is_empty() {
+                                ui.separator();
+                                ui.collapsing("Turn Prompt", |ui| {
+                                    ui.label(&carrel.prompt_summary);
+                                });
+                            }
+                            if !carrel.touched_files.is_empty() {
+                                ui.separator();
+                                ui.collapsing(format!("Workdesk Files ({})", carrel.touched_files.len()), |ui| {
+                                    for (path, act, total) in &carrel.touched_files {
+                                        ui.horizontal(|ui| {
+                                            ui.colored_label(egui::Color32::from_rgb(100, 220, 160), "•");
+                                            ui.label(format!("{path} (active: R{act}, total: {total})"));
+                                        });
+                                    }
+                                });
+                            }
+                        });
+                }
+
+                if *session_browser_open {
+                    if discovered_sessions.is_none() {
+                        let cfg = crate::launch_config::LaunchConfig::load_or_default();
+                        *discovered_sessions = Some(crate::agent_transcript::scan_agent_sessions(&cfg));
+                    }
+
+                    egui::Window::new("Agent Sessions (F7)")
+                        .id(egui::Id::new("agent_session_browser"))
+                        .open(session_browser_open)
+                        .default_pos(egui::pos2(50.0, 50.0))
+                        .default_size(egui::vec2(580.0, 480.0))
+                        .min_size(egui::vec2(360.0, 240.0))
+                        .resizable(true)
+                        .collapsible(true)
+                        .show(root_ui.ctx(), |ui| {
+                            ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
+                            // 1. Controls bar
+                            ui.horizontal(|ui| {
+                                ui.label("Search:");
+                                ui.text_edit_singleline(session_filter_text);
+                                if !session_filter_text.is_empty() && ui.button("✖").clicked() {
+                                    session_filter_text.clear();
+                                }
+                                if ui.button("⟳ Refresh").clicked() {
+                                    let cfg = crate::launch_config::LaunchConfig::load_or_default();
+                                    *discovered_sessions = Some(crate::agent_transcript::scan_agent_sessions(&cfg));
+                                }
+                            });
+
+                            // 2. Filter tabs
+                            ui.horizontal(|ui| {
+                                ui.selectable_value(
+                                    session_filter_harness,
+                                    crate::agent_transcript::discovery::SessionHarnessFilter::All,
+                                    "All",
+                                );
+                                ui.selectable_value(
+                                    session_filter_harness,
+                                    crate::agent_transcript::discovery::SessionHarnessFilter::ClaudeCode,
+                                    "Claude Code",
+                                );
+                                ui.selectable_value(
+                                    session_filter_harness,
+                                    crate::agent_transcript::discovery::SessionHarnessFilter::Antigravity,
+                                    "Antigravity",
+                                );
+                            });
+                            ui.separator();
+
+                            let Some(all_sessions) = discovered_sessions.as_ref() else {
+                                ui.label("No sessions scanned yet.");
+                                return;
+                            };
+
+                            let filter_lower = session_filter_text.to_lowercase();
+                            let filtered: Vec<&crate::agent_transcript::discovery::DiscoveredSession> = all_sessions
+                                .iter()
+                                .filter(|s| {
+                                    match *session_filter_harness {
+                                        crate::agent_transcript::discovery::SessionHarnessFilter::All => true,
+                                        crate::agent_transcript::discovery::SessionHarnessFilter::ClaudeCode => {
+                                            s.harness == crate::agent_transcript::types::HarnessKind::ClaudeCode
+                                        }
+                                        crate::agent_transcript::discovery::SessionHarnessFilter::Antigravity => {
+                                            s.harness == crate::agent_transcript::types::HarnessKind::Antigravity
+                                        }
+                                    }
+                                })
+                                .filter(|s| {
+                                    if filter_lower.is_empty() {
+                                        return true;
+                                    }
+                                    s.title.to_lowercase().contains(&filter_lower)
+                                        || s.id.to_lowercase().contains(&filter_lower)
+                                        || s.project_name.as_deref().unwrap_or("").to_lowercase().contains(&filter_lower)
+                                        || s.path.to_string_lossy().to_lowercase().contains(&filter_lower)
+                                })
+                                .collect();
+
+                            ui.label(format!("Showing {} of {} sessions", filtered.len(), all_sessions.len()));
+                            ui.separator();
+
+                            egui::ScrollArea::vertical()
+                                .auto_shrink([false, false])
+                                .show(ui, |ui| {
+                                    if filtered.is_empty() {
+                                        ui.label("No matching sessions found.");
+                                        return;
+                                    }
+                                    for s in filtered {
+                                        ui.group(|ui| {
+                                            ui.horizontal(|ui| {
+                                                match s.harness {
+                                                    crate::agent_transcript::types::HarnessKind::ClaudeCode => {
+                                                        ui.colored_label(egui::Color32::from_rgb(230, 140, 70), "[Claude]");
+                                                    }
+                                                    crate::agent_transcript::types::HarnessKind::Antigravity => {
+                                                        ui.colored_label(egui::Color32::from_rgb(100, 180, 240), "[Antigravity]");
+                                                    }
+                                                    crate::agent_transcript::types::HarnessKind::KimiCode => {
+                                                        ui.colored_label(egui::Color32::from_rgb(160, 120, 240), "[Kimi]");
+                                                    }
+                                                    crate::agent_transcript::types::HarnessKind::Generic => {
+                                                        ui.colored_label(egui::Color32::from_rgb(180, 180, 180), "[Agent]");
+                                                    }
+                                                }
+                                                if let Some(proj) = &s.project_name {
+                                                    ui.colored_label(egui::Color32::from_rgb(180, 200, 120), format!("📂 {proj}"));
+                                                }
+                                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                                    if ui.button("▶ Load").clicked() {
+                                                        *pending_relayout = Some(RelayoutRequest {
+                                                            z_wrap_spacing: None,
+                                                            toggle_cluster: false,
+                                                            toggle_layout: false,
+                                                            switch_agent_session: Some(s.path.clone()),
+                                                            carrel_options: None,
+                                                        });
+                                                    }
+                                                    if let Some(m) = s.modified {
+                                                        if let Ok(dur) = std::time::SystemTime::now().duration_since(m) {
+                                                            ui.label(egui::RichText::new(format_relative_time(dur)).weak().small());
+                                                        }
+                                                    }
+                                                });
+                                            });
+                                            ui.label(egui::RichText::new(&s.title).strong());
+                                            ui.horizontal(|ui| {
+                                                let prefix = crate::agent_transcript::types::truncate_chars(&s.id, 16);
+                                                ui.label(egui::RichText::new(format!("ID: {prefix}…")).weak().small());
+                                                let kb = (s.file_size_bytes as f64) / 1024.0;
+                                                ui.label(egui::RichText::new(format!("{kb:.1} KB")).weak().small());
+                                            });
+                                        });
+                                    }
+                                });
+                        });
+                }
             });
             let egui::FullOutput {
                 platform_output,

@@ -22,9 +22,42 @@ pub struct LaunchConfig {
     pub greek_onset_px: Option<f32>,
     pub load_repo: Option<PathBuf>,
     pub field_mode: Option<String>,
+    pub claude_projects_dir: Option<PathBuf>,
+    pub antigravity_brain_dir: Option<PathBuf>,
+    pub agent_session: Option<PathBuf>,
 }
 
 impl LaunchConfig {
+    /// Load launch config from default locations (`launch_config.toml` or `../launch_config.toml`),
+    /// or return default configuration if neither exists.
+    pub fn load_or_default() -> Self {
+        if Path::new("launch_config.toml").is_file() {
+            Self::from_file(Path::new("launch_config.toml")).unwrap_or_default()
+        } else if Path::new("../launch_config.toml").is_file() {
+            Self::from_file(Path::new("../launch_config.toml")).unwrap_or_default()
+        } else {
+            Self::default()
+        }
+    }
+
+    /// Return the resolved Claude Code projects directory, falling back to `~/.claude/projects`.
+    pub fn resolved_claude_projects_dir(&self) -> PathBuf {
+        if let Some(dir) = &self.claude_projects_dir {
+            expand_home(dir)
+        } else {
+            expand_home(Path::new("~/.claude/projects"))
+        }
+    }
+
+    /// Return the resolved Antigravity brain directory, falling back to `~/.gemini/antigravity/brain`.
+    pub fn resolved_antigravity_brain_dir(&self) -> PathBuf {
+        if let Some(dir) = &self.antigravity_brain_dir {
+            expand_home(dir)
+        } else {
+            expand_home(Path::new("~/.gemini/antigravity/brain"))
+        }
+    }
+
     /// Load from a file path. Returns Err with a message if reading or parsing fails.
     pub fn from_file(path: &Path) -> Result<Self, String> {
         let content = std::fs::read_to_string(path)
@@ -97,6 +130,15 @@ impl LaunchConfig {
                 "field_mode" => {
                     cfg.field_mode = Some(strip_quotes(val));
                 }
+                "claude_projects_dir" => {
+                    cfg.claude_projects_dir = Some(PathBuf::from(strip_quotes(val)));
+                }
+                "antigravity_brain_dir" => {
+                    cfg.antigravity_brain_dir = Some(PathBuf::from(strip_quotes(val)));
+                }
+                "agent_session" => {
+                    cfg.agent_session = Some(PathBuf::from(strip_quotes(val)));
+                }
                 _ => {
                     // Unknown keys are ignored for forward-compatibility
                 }
@@ -104,6 +146,28 @@ impl LaunchConfig {
         }
         Ok(cfg)
     }
+}
+
+/// Expand leading `~` or `~/` to the user's home directory.
+pub fn expand_home(path: &Path) -> PathBuf {
+    let s = path.to_string_lossy();
+    if s == "~" {
+        if let Some(home) = home_dir() {
+            return home;
+        }
+    } else if let Some(stripped) = s.strip_prefix("~/").or_else(|| s.strip_prefix("~\\")) {
+        if let Some(home) = home_dir() {
+            return home.join(stripped);
+        }
+    }
+    path.to_path_buf()
+}
+
+/// Retrieve the user's home directory via HOME or USERPROFILE environment variable.
+pub fn home_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
 }
 
 fn strip_quotes(s: &str) -> String {
@@ -155,6 +219,9 @@ mod tests {
             greek_onset_px = 12.0
             load_repo = "/path/to/repo"
             field_mode = "derived"
+            claude_projects_dir = "~/my_claude_projects"
+            antigravity_brain_dir = "~/my_antigravity_brain"
+            agent_session = "~/sessions/my_session.jsonl"
         "#;
         let cfg = LaunchConfig::from_toml_str(toml).expect("parse failed");
         assert_eq!(cfg.file_backgrounds, Some(true));
@@ -171,5 +238,20 @@ mod tests {
         assert_eq!(cfg.greek_onset_px, Some(12.0));
         assert_eq!(cfg.load_repo, Some(PathBuf::from("/path/to/repo")));
         assert_eq!(cfg.field_mode.as_deref(), Some("derived"));
+        assert_eq!(cfg.claude_projects_dir, Some(PathBuf::from("~/my_claude_projects")));
+        assert_eq!(cfg.antigravity_brain_dir, Some(PathBuf::from("~/my_antigravity_brain")));
+        assert_eq!(cfg.agent_session, Some(PathBuf::from("~/sessions/my_session.jsonl")));
+    }
+
+    #[test]
+    fn test_expand_home_logic() {
+        let p = Path::new("relative/path/file.txt");
+        assert_eq!(expand_home(p), PathBuf::from("relative/path/file.txt"));
+
+        if let Some(home) = home_dir() {
+            let tilde_path = Path::new("~/sub/dir");
+            assert_eq!(expand_home(tilde_path), home.join("sub/dir"));
+            assert_eq!(expand_home(Path::new("~")), home);
+        }
     }
 }

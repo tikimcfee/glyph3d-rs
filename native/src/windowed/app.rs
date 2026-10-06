@@ -46,6 +46,32 @@ pub(super) fn apply_relayout(
 ) {
     let mut changed = false;
     let mut note = String::new();
+    let reset_pose = req.switch_agent_session.is_some();
+    if let Some(session_path) = req.switch_agent_session {
+        let emoji_sheet = match choice {
+            SceneChoice::AgentSession { emoji_sheet, .. } => emoji_sheet.clone(),
+            SceneChoice::Text { emoji_sheet, .. } => emoji_sheet.clone(),
+            SceneChoice::EngineText { emoji_sheet, .. } => emoji_sheet.clone(),
+            SceneChoice::Repo { emoji_sheet, .. } => emoji_sheet.clone(),
+            SceneChoice::Demo => crate::default_emoji_sheet(),
+        };
+        *choice = SceneChoice::AgentSession {
+            session_path: session_path.clone(),
+            emoji_sheet,
+            layout_options: crate::spatial_scene::CarrelLayoutOptions::default(),
+        };
+        changed = true;
+        note += &format!("switch_agent_session -> {} ", session_path.display());
+    }
+    if let SceneChoice::AgentSession { layout_options, .. } = choice {
+        if let Some(new_opts) = req.carrel_options {
+            if *layout_options != new_opts {
+                *layout_options = new_opts;
+                changed = true;
+                note += &format!("carrel_options -> limit: {}, scroll: {} ", new_opts.deck_window_limit, new_opts.deck_scroll_offset);
+            }
+        }
+    }
     // The z dial exists on repo scenes only.
     if let SceneChoice::Repo { z_wrap_spacing, .. } = choice {
         if let Some(new_z) = req.z_wrap_spacing {
@@ -117,8 +143,10 @@ pub(super) fn apply_relayout(
         (crate::build_scene_with_options(ctx, state.config.format, choice, CameraMode::Fly, live_cull_opts), None)
     };
     scene.set_viewport(state.config.width, state.config.height);
-    if let Some((eye, yaw, pitch)) = pose {
-        scene.set_cam_pose(eye, yaw, pitch);
+    if !reset_pose {
+        if let Some((eye, yaw, pitch)) = pose {
+            scene.set_cam_pose(eye, yaw, pitch);
+        }
     }
     state.scene = scene;
     state.ui_probe = probe;
@@ -131,11 +159,13 @@ pub(super) fn apply_relayout(
 /// What the panel asked the rebuild arm to change. Either field alone may be
 /// set; the arm applies both and rebuilds only if one actually moved.
 #[cfg(feature = "egui-ui")]
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Default)]
 pub(super) struct RelayoutRequest {
     pub(super) z_wrap_spacing: Option<f64>,
     pub(super) toggle_cluster: bool,
     pub(super) toggle_layout: bool,
+    pub(super) switch_agent_session: Option<std::path::PathBuf>,
+    pub(super) carrel_options: Option<crate::spatial_scene::CarrelLayoutOptions>,
 }
 
 pub(super) struct App<'a> {
@@ -287,6 +317,10 @@ impl ApplicationHandler for App<'_> {
                 debug_open: true,
                 filter: String::new(),
                 selected_group: None,
+                session_browser_open: false,
+                session_filter_text: String::new(),
+                session_filter_harness: crate::agent_transcript::discovery::SessionHarnessFilter::All,
+                discovered_sessions: None,
             })
         } else {
             None
@@ -320,6 +354,7 @@ impl ApplicationHandler for App<'_> {
         #[cfg(feature = "egui-ui")]
         if self.ui {
             println!("debug panel: F1 toggles the egui Debug window (sliders tune LOD_MIN_PX live)");
+            println!("agent sessions: F7 toggles the Agent Sessions browser");
         }
         println!("screenshot: F2 saves the next presented frame to out/windowed-shot-<timestamp>.png");
 
@@ -404,14 +439,18 @@ impl ApplicationHandler for App<'_> {
                 state.scene.set_viewport(size.width, size.height);
             }
             WindowEvent::RedrawRequested => {
-                state.render(&self.ctx);
                 // The layout controls apply BETWEEN frames: the panel set
                 // pending_relayout on slider release / toggle click during
-                // this render; rebuild now so the next render presents the
-                // new params.
+                // previous render or keypress; rebuild before render if pending.
                 #[cfg(feature = "egui-ui")]
                 if let Some(req) = state.pending_relayout.take() {
                     apply_relayout(&self.ctx, &mut self.choice, self.cull_opts, self.ui, state, req);
+                }
+                state.render(&self.ctx);
+                #[cfg(feature = "egui-ui")]
+                if let Some(req) = state.pending_relayout.take() {
+                    apply_relayout(&self.ctx, &mut self.choice, self.cull_opts, self.ui, state, req);
+                    state.window.request_redraw();
                 }
                 if self.live.is_some() {
                     #[cfg(feature = "egui-ui")]
@@ -473,6 +512,8 @@ impl ApplicationHandler for App<'_> {
                                 z_wrap_spacing: None,
                                 toggle_cluster: false,
                                 toggle_layout: true,
+                                switch_agent_session: None,
+                                carrel_options: None,
                             });
                             state.window.request_redraw();
                         }
@@ -504,6 +545,13 @@ impl ApplicationHandler for App<'_> {
                         }
                         return;
                     }
+                    #[cfg(feature = "egui-ui")]
+                    if code == KeyCode::F7 && pressed {
+                        if let Some(egui) = state.egui.as_mut() {
+                            egui.session_browser_open = !egui.session_browser_open;
+                        }
+                        return;
+                    }
                     // Esc releases the pointer grab (and is not camera input).
                     if code == KeyCode::Escape && pressed {
                         state.ungrab();
@@ -518,6 +566,7 @@ impl ApplicationHandler for App<'_> {
                         }
                     } else {
                         state.scene.on_key(&self.ctx, code, pressed);
+                        state.window.request_redraw();
                     }
                 }
             }

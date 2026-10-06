@@ -394,9 +394,12 @@ fn test_agent_turn_card_spawning_and_bounds() {
     let card = scene.spawn_agent_turn_card(
         root,
         0,
+        0,
+        0,
         [60.0, 40.0],
         4.0,
         "Turn 0: Inspecting repo",
+        None,
     );
 
     scene.update_transforms();
@@ -466,14 +469,282 @@ fn test_workdesk_file_revisions_z_stack() {
     let t1 = scene.world.get::<Transform>(r1).unwrap();
     let t2 = scene.world.get::<Transform>(r2).unwrap();
 
+    // Initial state: Revision 0 is active at front (z = 0)
     assert_eq!(t0.translation.z, 0.0);
     assert_eq!(t1.translation.z, -12.0);
     assert_eq!(t2.translation.z, -24.0);
 
-    // Stack count and active revision should be 3 and 2
     let desk_comp = scene.world.get::<Workdesk>(desk).unwrap();
     let stack_e = *desk_comp.file_stacks.get("src/main.rs").unwrap();
     let stack_comp = scene.world.get::<FileRevisionStack>(stack_e).unwrap();
     assert_eq!(stack_comp.revision_count, 3);
-    assert_eq!(stack_comp.active_revision, 2);
+    assert_eq!(stack_comp.active_revision, 0);
+
+    // Dynamically shift active revision to revision 2: r2 moves to front (z = 0)
+    scene.world.get_mut::<FileRevisionStack>(stack_e).unwrap().active_revision = 2;
+    scene.update_transforms();
+
+    let t0 = scene.world.get::<Transform>(r0).unwrap();
+    let t1 = scene.world.get::<Transform>(r1).unwrap();
+    let t2 = scene.world.get::<Transform>(r2).unwrap();
+    assert_eq!(t2.translation.z, 0.0);
+    assert_eq!(t0.translation.z, -12.0);
+    assert_eq!(t1.translation.z, -24.0);
+}
+
+#[test]
+fn test_agent_carrel_spawning_and_turn_navigation() {
+    use crate::agent_transcript::claude::parse_claude_session;
+    use crate::revision::RevisionEngine;
+    use serde_json::json;
+
+    let transcript = vec![
+        // Turn 0
+        json!({
+            "type": "user",
+            "message": { "role": "user", "content": [{ "type": "text", "text": "Turn 0 prompt" }] }
+        }).to_string(),
+        json!({
+            "type": "assistant",
+            "message": {
+                "role": "assistant",
+                "content": [
+                    { "type": "tool_use", "id": "t1", "name": "Write", "input": { "file_path": "foo.rs", "content": "base" } }
+                ]
+            }
+        }).to_string(),
+        json!({
+            "type": "user",
+            "toolUseResult": { "type": "create", "filePath": "foo.rs", "content": "base" },
+            "message": { "role": "user", "content": [{ "type": "tool_result", "tool_use_id": "t1" }] }
+        }).to_string(),
+        // Turn 1
+        json!({
+            "type": "user",
+            "message": { "role": "user", "content": [{ "type": "text", "text": "Turn 1 prompt" }] }
+        }).to_string(),
+        json!({
+            "type": "assistant",
+            "message": {
+                "role": "assistant",
+                "content": [
+                    { "type": "tool_use", "id": "t2", "name": "Edit", "input": { "file_path": "foo.rs", "old_string": "base", "new_string": "updated" } }
+                ]
+            }
+        }).to_string(),
+        json!({
+            "type": "user",
+            "toolUseResult": { "filePath": "foo.rs", "structuredPatch": [{ "oldStart": 1, "oldLines": 1, "newStart": 1, "newLines": 1, "lines": ["-base", "+updated"] }] },
+            "message": { "role": "user", "content": [{ "type": "tool_result", "tool_use_id": "t2" }] }
+        }).to_string(),
+    ].join("\n");
+
+    let session = parse_claude_session(&transcript, "carrel_sess");
+    let mut rev_engine = RevisionEngine::new();
+    rev_engine.ingest_session(&session);
+
+    let mut scene = SpatialScene::new();
+    let root = scene.spawn_root("canvas");
+    let carrel = scene.spawn_agent_carrel(root, &session, &rev_engine);
+
+    scene.update_transforms();
+
+    let carrel_comp = scene.world.get::<AgentCarrel>(carrel).unwrap();
+    assert_eq!(carrel_comp.turn_count, 2);
+    // Initial state: latest turn is at front/slot 0
+    assert_eq!(carrel_comp.active_turn, 1);
+
+    let desk = scene.world.get::<Workdesk>(carrel_comp.workdesk_entity).unwrap();
+    let stack_e = *desk.file_stacks.get("foo.rs").unwrap();
+    let stack = scene.world.get::<FileRevisionStack>(stack_e).unwrap();
+    assert_eq!(stack.active_revision, 1);
+
+    // Navigate back to turn 0
+    let prev = scene.carrel_prev_turn(carrel, &session, &rev_engine);
+    assert_eq!(prev, 0);
+
+    let stack_prev = scene.world.get::<FileRevisionStack>(stack_e).unwrap();
+    assert_eq!(stack_prev.active_revision, 0);
+
+    // Advance to turn 1
+    let next = scene.carrel_next_turn(carrel, &session, &rev_engine);
+    assert_eq!(next, 1);
+
+    let stack_after = scene.world.get::<FileRevisionStack>(stack_e).unwrap();
+    assert_eq!(stack_after.active_revision, 1);
+}
+
+#[test]
+fn test_agent_carrel_sliding_window_and_time_scroll() {
+    use crate::agent_transcript::claude::parse_claude_session;
+    use crate::revision::RevisionEngine;
+    use crate::spatial_scene::agent_carrel::CarrelLayoutOptions;
+    use serde_json::json;
+
+    // Build a session with 10 turns
+    let mut turns_json = Vec::new();
+    for i in 0..10 {
+        turns_json.push(json!({
+            "type": "user",
+            "message": { "role": "user", "content": [{ "type": "text", "text": format!("Turn {i} prompt") }] }
+        }).to_string());
+        turns_json.push(json!({
+            "type": "assistant",
+            "message": {
+                "role": "assistant",
+                "content": [
+                    { "type": "tool_use", "id": format!("t{i}"), "name": "Write", "input": { "file_path": "a.rs", "content": format!("v{i}") } }
+                ]
+            }
+        }).to_string());
+        turns_json.push(json!({
+            "type": "user",
+            "toolUseResult": { "type": "create", "filePath": "a.rs", "content": format!("v{i}") },
+            "message": { "role": "user", "content": [{ "type": "tool_result", "tool_use_id": format!("t{i}") }] }
+        }).to_string());
+    }
+
+    let session = parse_claude_session(&turns_json.join("\n"), "sliding_sess");
+    let mut rev_engine = RevisionEngine::new();
+    rev_engine.ingest_session(&session);
+
+    let mut scene = SpatialScene::new();
+    let root = scene.spawn_root("canvas");
+
+    // Test with window limit = 4, scroll offset K = 0 (latest)
+    let opts = CarrelLayoutOptions {
+        deck_window_limit: 4,
+        deck_scroll_offset: 0,
+        desk_revision_limit: 4,
+        desk_scroll_offset: 0,
+        max_file_stacks: 10,
+        active_beat: None,
+    };
+
+    let carrel = scene.spawn_agent_carrel_with_options(root, &session, &rev_engine, opts);
+    let carrel_comp = scene.world.get::<AgentCarrel>(carrel).unwrap();
+
+    // 1. Sliding window should contain exactly 4 cards
+    assert_eq!(carrel_comp.slot_to_beat.len(), 4);
+    // 2. Slot 0 must be the newest beat (beat index 19 out of 20)
+    assert_eq!(carrel_comp.slot_to_beat[0], 19);
+    assert_eq!(carrel_comp.slot_to_beat[1], 18);
+    assert_eq!(carrel_comp.slot_to_beat[2], 17);
+    assert_eq!(carrel_comp.slot_to_beat[3], 16);
+    assert_eq!(carrel_comp.active_beat, 19);
+
+    // 3. Test scrolling back in time: K = 2 (scroll 2 beats back)
+    let opts_scrolled = CarrelLayoutOptions {
+        deck_window_limit: 4,
+        deck_scroll_offset: 2,
+        desk_revision_limit: 4,
+        desk_scroll_offset: 0,
+        max_file_stacks: 10,
+        active_beat: Some(15),
+    };
+    let carrel_scrolled = scene.spawn_agent_carrel_with_options(root, &session, &rev_engine, opts_scrolled);
+    let scrolled_comp = scene.world.get::<AgentCarrel>(carrel_scrolled).unwrap();
+    assert_eq!(scrolled_comp.slot_to_beat.len(), 4);
+    // Beats 19 and 18 are popped off; newest is now 19 - 2 = 17!
+    assert_eq!(scrolled_comp.slot_to_beat[0], 17);
+    assert_eq!(scrolled_comp.slot_to_beat[1], 16);
+    assert_eq!(scrolled_comp.slot_to_beat[2], 15);
+    assert_eq!(scrolled_comp.slot_to_beat[3], 14);
+    // Focused active beat is 15 (slot 2)
+    assert_eq!(scrolled_comp.active_beat, 15);
+}
+
+#[test]
+fn test_agent_carrel_page_aware_continuous_navigation() {
+    use crate::agent_transcript::claude::parse_claude_session;
+    use crate::revision::RevisionEngine;
+    use crate::spatial_scene::agent_carrel::CarrelLayoutOptions;
+    use serde_json::json;
+
+    let mut turns_json = Vec::new();
+    for i in 0..12 {
+        turns_json.push(json!({
+            "type": "user",
+            "message": { "role": "user", "content": [{ "type": "text", "text": format!("Turn {i}") }] }
+        }).to_string());
+        turns_json.push(json!({
+            "type": "assistant",
+            "message": {
+                "role": "assistant",
+                "content": [
+                    { "type": "tool_use", "id": format!("t{i}"), "name": "Write", "input": { "file_path": "a.rs", "content": format!("v{i}") } }
+                ]
+            }
+        }).to_string());
+        turns_json.push(json!({
+            "type": "user",
+            "toolUseResult": { "type": "create", "filePath": "a.rs", "content": format!("v{i}") },
+            "message": { "role": "user", "content": [{ "type": "tool_result", "tool_use_id": format!("t{i}") }] }
+        }).to_string());
+    }
+
+    let session = parse_claude_session(&turns_json.join("\n"), "paging_sess");
+    let mut rev_engine = RevisionEngine::new();
+    rev_engine.ingest_session(&session);
+
+    let mut scene = SpatialScene::new();
+    let root = scene.spawn_root("canvas");
+
+    let total_items = session.linearize_events(Some(&rev_engine)).len();
+    assert_eq!(total_items, 24);
+    let limit = 4usize;
+    let initial_beat = total_items - 1; // 23
+
+    // Initial window: beats 23, 22, 21, 20 (k = 0)
+    let carrel = scene.spawn_agent_carrel_with_options(
+        root,
+        &session,
+        &rev_engine,
+        CarrelLayoutOptions {
+            deck_window_limit: limit,
+            deck_scroll_offset: 0,
+            desk_revision_limit: 4,
+            desk_scroll_offset: 0,
+            max_file_stacks: 10,
+            active_beat: Some(initial_beat),
+        },
+    );
+    let comp = scene.world.get::<AgentCarrel>(carrel).unwrap();
+    assert_eq!(comp.slot_to_beat, vec![23, 22, 21, 20]);
+    assert_eq!(comp.active_beat, 23);
+
+    // Verify all 24 cards were spawned into ECS
+    assert_eq!(comp.all_card_entities.len(), 24);
+
+    // Simulate backward navigation through all beats: 23 -> 0 in O(1) without rebuilding
+    let mut visited_slots = Vec::new();
+    for _ in 0..total_items - 1 {
+        let beat = scene.carrel_step_prev(carrel, &session, &rev_engine);
+        let comp = scene.world.get::<AgentCarrel>(carrel).unwrap();
+        let slot = comp.slot_to_beat.iter().position(|&b| b == beat).unwrap();
+        visited_slots.push((beat, slot));
+    }
+
+    // Verify all beats were visited and always occupied a valid slot (0..4)
+    assert_eq!(visited_slots.len(), 23);
+    for &(beat, slot) in &visited_slots {
+        assert!(slot < limit, "beat {beat} mapped to invalid slot {slot}");
+    }
+    // Final beat should be 0, at slot 3 of the oldest window (beats [3, 2, 1, 0])
+    assert_eq!(visited_slots.last().unwrap(), &(0, 3));
+    let comp = scene.world.get::<AgentCarrel>(carrel).unwrap();
+    assert_eq!(comp.slot_to_beat, vec![3, 2, 1, 0]);
+
+    // Now simulate forward navigation back from 0 -> 23 in O(1)
+    let mut forward_slots = Vec::new();
+    for _ in 0..total_items - 1 {
+        let beat = scene.carrel_step_next(carrel, &session, &rev_engine);
+        let comp = scene.world.get::<AgentCarrel>(carrel).unwrap();
+        let slot = comp.slot_to_beat.iter().position(|&b| b == beat).unwrap();
+        forward_slots.push((beat, slot));
+    }
+    assert_eq!(forward_slots.len(), 23);
+    assert_eq!(forward_slots.last().unwrap(), &(23, 0));
+    let comp = scene.world.get::<AgentCarrel>(carrel).unwrap();
+    assert_eq!(comp.slot_to_beat, vec![23, 22, 21, 20]);
 }

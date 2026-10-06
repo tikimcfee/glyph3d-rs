@@ -179,6 +179,19 @@ impl Cli {
         let emoji_sheet = self.emoji_sheet.clone().unwrap_or_else(default_emoji_sheet);
         let choice = if self.demo {
             SceneChoice::Demo
+        } else if let Some(session_path) = &self.agent_session {
+            SceneChoice::AgentSession {
+                session_path: session_path.clone(),
+                emoji_sheet,
+                layout_options: crate::spatial_scene::CarrelLayoutOptions {
+                    deck_window_limit: self.deck_window_limit,
+                    deck_scroll_offset: self.deck_scroll_offset,
+                    desk_revision_limit: self.desk_revision_limit,
+                    desk_scroll_offset: 0,
+                    max_file_stacks: 20,
+                    active_beat: None,
+                },
+            }
         } else if let Some(dir) = &self.load_repo {
             SceneChoice::Repo {
                 dir: dir.clone(),

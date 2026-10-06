@@ -181,6 +181,66 @@ pub(super) fn render_scene(
                 format!("group:{}", h.group_id)
             }
         });
+        p.carrel = scene.controller.as_ref().and_then(|ctrl| {
+            let carrel_e = ctrl.active_carrel?;
+            let carrel_comp = ctrl.scene.world.get::<crate::spatial_scene::AgentCarrel>(carrel_e)?;
+            let session = ctrl.session.as_ref()?;
+            let prompt = session.turns.get(carrel_comp.active_turn)
+                .and_then(|t| t.prompt.as_deref())
+                .unwrap_or("—");
+            let touched = if let Some(desk) = ctrl.scene.world.get::<crate::spatial_scene::workdesk::Workdesk>(carrel_comp.workdesk_entity) {
+                let mut files: Vec<(String, usize, usize)> = desk.file_stacks.iter().map(|(path, &stack_e)| {
+                    let (act, cnt) = if let Some(st) = ctrl.scene.world.get::<crate::spatial_scene::workdesk::FileRevisionStack>(stack_e) {
+                        (st.active_revision, st.revision_count)
+                    } else {
+                        (0, 0)
+                    };
+                    (path.clone(), act, cnt)
+                }).collect();
+                files.sort_by(|a, b| a.0.cmp(&b.0));
+                files
+            } else {
+                Vec::new()
+            };
+            let events = session.linearize_events(ctrl.revision_engine.as_ref());
+            let beat_summary = events.get(carrel_comp.active_beat)
+                .map(|e| e.summary())
+                .unwrap_or_else(|| {
+                    session.turns.get(carrel_comp.active_turn).map(|t| t.summary()).unwrap_or_default()
+                });
+
+            let total_items = if !events.is_empty() { carrel_comp.beat_count } else { carrel_comp.turn_count };
+            let limit = carrel_comp.layout_options.deck_window_limit.max(1);
+            let max_deck_scroll = total_items.saturating_sub(limit);
+            let k = carrel_comp.layout_options.deck_scroll_offset.min(max_deck_scroll);
+            let m = limit.min(total_items.saturating_sub(k));
+            let window_item_range = if total_items > 0 && m > 0 {
+                let newest = total_items - k;
+                let oldest = total_items - k - m + 1;
+                (oldest, newest)
+            } else {
+                (0, 0)
+            };
+
+            let max_desk_scroll = ctrl.revision_engine.as_ref().map(|re| {
+                re.all_histories().values().map(|h| h.revisions.len().saturating_sub(carrel_comp.layout_options.desk_revision_limit.max(1))).max().unwrap_or(0)
+            }).unwrap_or(0);
+
+            Some(crate::glyph_scene::UiCarrelState {
+                session_id: carrel_comp.session_id.clone(),
+                active_turn: carrel_comp.active_turn,
+                turn_count: carrel_comp.turn_count,
+                active_beat: carrel_comp.active_beat,
+                beat_count: carrel_comp.beat_count,
+                prompt_summary: prompt.to_string(),
+                beat_summary,
+                touched_files: touched,
+                layout_options: carrel_comp.layout_options,
+                window_item_range,
+                max_deck_scroll,
+                max_desk_scroll,
+            })
+        });
         if scene.cull.is_some() {
             p.cull_ranges = phase_draws.glyph_ranges.len();
             p.cull_instances = phase_draws

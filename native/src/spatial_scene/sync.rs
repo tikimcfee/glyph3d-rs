@@ -56,6 +56,12 @@ impl SpatialScene {
             }
 
             let parent_affine = gtf.affine();
+            let parent_scale_sq = parent_affine.x_axis.length_squared()
+                + parent_affine.y_axis.length_squared()
+                + parent_affine.z_axis.length_squared();
+            if parent_scale_sq < 1e-6 {
+                continue;
+            }
 
             match mesh_kind {
                 SceneMeshKind::Quad { size, origin } => {
@@ -96,23 +102,27 @@ impl SpatialScene {
             &GlobalTransform,
             &GlyphGroupBinding,
             Option<&Visible>,
-        ), Changed<GlobalTransform>>();
+        ), Or<(Changed<GlobalTransform>, Changed<Visible>)>>();
 
         for (gtf, binding, vis) in query.iter(&self.world) {
-            if let Some(v) = vis {
-                if !v.0 {
-                    continue;
-                }
-            }
+            let is_visible = vis.map(|v| v.0).unwrap_or(true);
+            let (scale, rotation, translation) = gtf.to_scale_rotation_translation();
+            let has_scale = scale.length_squared() > 1e-6;
 
             let idx = binding.group_id as usize;
             if idx < groups.len() {
-                let (scale, rotation, translation) = gtf.to_scale_rotation_translation();
                 let g = &mut groups[idx];
-                g.cols[0] = [translation.x, translation.y, translation.z, 0.0];
-                g.cols[1] = [rotation.x, rotation.y, rotation.z, rotation.w];
-                g.cols[2] = binding.tint;
-                g.cols[3] = [scale.x, scale.y, scale.z, 0.0];
+                if is_visible && has_scale {
+                    g.cols[0] = [translation.x, translation.y, translation.z, 0.0];
+                    g.cols[1] = [rotation.x, rotation.y, rotation.z, rotation.w];
+                    g.cols[2] = binding.tint;
+                    g.cols[3] = [scale.x, scale.y, scale.z, 0.0];
+                } else {
+                    g.cols[0] = [translation.x, translation.y, translation.z, 0.0];
+                    g.cols[1] = [rotation.x, rotation.y, rotation.z, rotation.w];
+                    g.cols[2] = [0.0, 0.0, 0.0, 0.0];
+                    g.cols[3] = [0.0, 0.0, 0.0, 0.0];
+                }
                 updated.push(binding.group_id);
             }
         }
@@ -120,5 +130,36 @@ impl SpatialScene {
         self.world.clear_trackers();
 
         updated
+    }
+
+    /// Populate all entities with a `GlyphGroupBinding` into the GPU `GroupRow` buffer unconditionally.
+    pub fn sync_all_to_group_rows(&mut self, groups: &mut [GroupRow]) {
+        let mut query = self.world.query::<(
+            &GlobalTransform,
+            &GlyphGroupBinding,
+            Option<&Visible>,
+        )>();
+
+        for (gtf, binding, vis) in query.iter(&self.world) {
+            let is_visible = vis.map(|v| v.0).unwrap_or(true);
+            let (scale, rotation, translation) = gtf.to_scale_rotation_translation();
+            let has_scale = scale.length_squared() > 1e-6;
+
+            let idx = binding.group_id as usize;
+            if idx < groups.len() {
+                let g = &mut groups[idx];
+                if is_visible && has_scale {
+                    g.cols[0] = [translation.x, translation.y, translation.z, 0.0];
+                    g.cols[1] = [rotation.x, rotation.y, rotation.z, rotation.w];
+                    g.cols[2] = binding.tint;
+                    g.cols[3] = [scale.x, scale.y, scale.z, 0.0];
+                } else {
+                    g.cols[0] = [translation.x, translation.y, translation.z, 0.0];
+                    g.cols[1] = [rotation.x, rotation.y, rotation.z, rotation.w];
+                    g.cols[2] = [0.0, 0.0, 0.0, 0.0];
+                    g.cols[3] = [0.0, 0.0, 0.0, 0.0];
+                }
+            }
+        }
     }
 }
