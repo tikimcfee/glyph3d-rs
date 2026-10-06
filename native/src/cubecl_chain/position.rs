@@ -304,21 +304,21 @@ pub(super) fn apply_and_emit(
     instance_slots: &mut [u32],
     instance_tints: &mut [u32],
     #[comptime] emit_derived: bool,
-    #[comptime] units: usize,
-    #[comptime] rake: usize,
+    #[comptime] threads_per_cube: usize,
+    #[comptime] bytes_per_thread: usize,
     #[comptime] log: usize,
 ) {
     let tile_idx = CUBE_POS;
     let unit_idx = UNIT_POS as usize;
     let total_bytes = glyph_flags.len() * 4; // packed: words -> bytes
     let item_count = item_descriptors.len() / ITEM_DESC_STRIDE;
-    let range_start = tile_idx * (units * rake) + unit_idx * rake;
-    let range_end = if range_start + rake < total_bytes { range_start + rake } else { total_bytes };
+    let range_start = tile_idx * (threads_per_cube * bytes_per_thread) + unit_idx * bytes_per_thread;
+    let range_end = if range_start + bytes_per_thread < total_bytes { range_start + bytes_per_thread } else { total_bytes };
 
     let shared_item_extents = Shared::<[Atomic<u32>]>::new_slice(RESOLVE_SLOTS * EXT_STRIDE);
     let shared_item_flags = Shared::<[Atomic<u32>]>::new_slice(RESOLVE_SLOTS);
     let mut shared_item_base = Shared::<u32>::new();
-    let cube_lo = tile_idx * (units * rake);
+    let cube_lo = tile_idx * (threads_per_cube * bytes_per_thread);
     if unit_idx == 0 {
         let probe = if total_bytes > 0 {
             if cube_lo < total_bytes { cube_lo } else { total_bytes - 1 }
@@ -350,15 +350,15 @@ pub(super) fn apply_and_emit(
         shared_item_extents[extent_offset + 7].store(ordered_key_neg_infinity);
         shared_item_extents[extent_offset + 8].store(ordered_key_infinity);
         shared_item_extents[extent_offset + 9].store(ordered_key_neg_infinity);
-        slot_index += units;
+        slot_index += threads_per_cube;
     }
 
-    let total_tile_bytes = units * rake;
+    let total_tile_bytes = threads_per_cube * bytes_per_thread;
     let tile_byte_start = tile_idx * total_tile_bytes;
     let tile_word_start = tile_byte_start >> 2;
     let total_tile_words = total_tile_bytes.div_ceil(4);
 
-    let mut shared_tile_flags = Shared::<[u32]>::new_slice((units * rake) / 4);
+    let mut shared_tile_flags = Shared::<[u32]>::new_slice((threads_per_cube * bytes_per_thread) / 4);
 
     let mut preload_word_idx = unit_idx;
     while preload_word_idx < total_tile_words {
@@ -368,7 +368,7 @@ pub(super) fn apply_and_emit(
         } else {
             0u32
         };
-        preload_word_idx += units;
+        preload_word_idx += threads_per_cube;
     }
     sync_cube();
 
@@ -419,8 +419,8 @@ pub(super) fn apply_and_emit(
     }
 
     // Phase 2: Cube Blelloch scan across units in shared memory
-    let mut shared_counts = Shared::<[i32]>::new_slice(units * PARTIAL_COUNT_STRIDE);
-    let mut shared_metrics = Shared::<[f32]>::new_slice(units);
+    let mut shared_counts = Shared::<[i32]>::new_slice(threads_per_cube * PARTIAL_COUNT_STRIDE);
+    let mut shared_metrics = Shared::<[f32]>::new_slice(threads_per_cube);
     s_store(&mut shared_counts, &mut shared_metrics, unit_idx, &accumulator);
 
     #[unroll]
@@ -435,7 +435,7 @@ pub(super) fn apply_and_emit(
         }
     }
     sync_cube();
-    if unit_idx == units - 1 {
+    if unit_idx == threads_per_cube - 1 {
         let e = identity();
         s_store(&mut shared_counts, &mut shared_metrics, unit_idx, &e);
     }
@@ -447,7 +447,7 @@ pub(super) fn apply_and_emit(
     #[unroll]
     for d in 0..log {
         sync_cube();
-        let s = units >> (d + 1);
+        let s = threads_per_cube >> (d + 1);
         if (unit_idx + 1) & (2 * s - 1) == 0 {
             let temp_carried = s_load(&shared_counts, &shared_metrics, unit_idx);
             let mut lhs = s_load(&shared_counts, &shared_metrics, unit_idx);
@@ -459,12 +459,12 @@ pub(super) fn apply_and_emit(
     }
     sync_cube();
 
-    // Phase 3: The chase — combines global tile prefix + exclusive micro prefix
+    // Phase 3: The chase — combines global tile prefix + exclusive thread-local prefix
     let mut run = p_load(tile_spine_counts, tile_spine_metrics, tile_idx);
-    let micro = s_load(&shared_counts, &shared_metrics, unit_idx);
-    combine(&mut run, &micro);
+    let thread_local_element = s_load(&shared_counts, &shared_metrics, unit_idx);
+    combine(&mut run, &thread_local_element);
 
-    // Repurpose shared_counts (2304 slots, dead after micro load) to cache the tile's 2048 advance floats
+    // Repurpose shared_counts (2304 slots, dead after thread_local_element load) to cache the tile's 2048 advance floats
     sync_cube();
     let mut preload_byte_idx = unit_idx;
     while preload_byte_idx < total_tile_bytes {
@@ -475,7 +475,7 @@ pub(super) fn apply_and_emit(
             0.0f32
         };
         shared_counts[preload_byte_idx] = adv_val.to_bits() as i32;
-        preload_byte_idx += units;
+        preload_byte_idx += threads_per_cube;
     }
     sync_cube();
 

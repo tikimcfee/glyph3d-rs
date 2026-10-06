@@ -31,17 +31,17 @@ pub fn run(ctx: &GpuContext, fixture_path: &Path) -> ! {
     // The tile shape, env-overridable so a (units, rake) sweep runs through
     // the same instrument — cross-shape agreement with the CPU scan's
     // (64, 256) chunks is associativity checked in situ.
-    let units: usize = std::env::var("GLYPH_CHAIN_TILE")
+    let threads_per_cube: usize = std::env::var("GLYPH_CHAIN_TILE")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(256);
-    let rake: usize = std::env::var("GLYPH_CHAIN_RAKE")
+    let bytes_per_thread: usize = std::env::var("GLYPH_CHAIN_RAKE")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(8);
-    assert!(units.is_power_of_two(), "GLYPH_CHAIN_TILE must be a power of two");
-    let log = units.ilog2() as usize;
-    let n_tiles = n.div_ceil(units * rake).max(1);
+    assert!(threads_per_cube.is_power_of_two(), "GLYPH_CHAIN_TILE must be a power of two");
+    let log = threads_per_cube.ilog2() as usize;
+    let n_tiles = n.div_ceil(threads_per_cube * bytes_per_thread).max(1);
     // resolve_x worker span (bytes per worker; entry walks scale with
     // worker count, sweeps with span).
     let rspan: usize = std::env::var("GLYPH_CHAIN_SPAN")
@@ -163,10 +163,10 @@ pub fn run(ctx: &GpuContext, fixture_path: &Path) -> ! {
     let cdev = cubecl::wgpu::init_device(setup, Default::default());
     let client = cubecl::Device::Wgpu(cdev).client();
 
-    let h_fl = client.create_from_slice(bytemuck::cast_slice(&glyph_flags));
-    let h_sm = client.create_from_slice(bytemuck::cast_slice(&advance_widths));
-    let h_gi = client.create_from_slice(bytemuck::cast_slice(&giv));
-    let h_hgt = client.create_from_slice(bytemuck::cast_slice(&hgv));
+    let h_glyph_flags = client.create_from_slice(bytemuck::cast_slice(&glyph_flags));
+    let h_advance_widths = client.create_from_slice(bytemuck::cast_slice(&advance_widths));
+    let h_glyph_indices = client.create_from_slice(bytemuck::cast_slice(&giv));
+    let h_glyph_heights = client.create_from_slice(bytemuck::cast_slice(&hgv));
     let h_recs = client.empty(leaders.max(1) * 8 * 4);
     // Per-item record bases: the record stream is item order, ordinal
     // order within items — base[it] is where item it's records start.
@@ -239,26 +239,26 @@ pub fn run(ctx: &GpuContext, fixture_path: &Path) -> ! {
         tile_scan::launch_unchecked(
             &client,
             tiles_grid(n_tiles),
-            CubeDim::new_1d(units as u32),
-            BufferArg::from_raw_parts(h_fl.clone(), n_words),
-            BufferArg::from_raw_parts(h_sm.clone(), n),
+            CubeDim::new_1d(threads_per_cube as u32),
+            BufferArg::from_raw_parts(h_glyph_flags.clone(), n_words),
+            BufferArg::from_raw_parts(h_advance_widths.clone(), n),
             BufferArg::from_raw_parts(h_item_desc.clone(), item_descriptors.len()),
             BufferArg::from_raw_parts(h_tc.clone(), n_tiles * PARTIAL_COUNT_STRIDE),
             BufferArg::from_raw_parts(h_tm.clone(), n_tiles),
-            units,
-            rake,
+            threads_per_cube,
+            bytes_per_thread,
             log,
         );
         if stages >= 2 {
             spine_scan::launch_unchecked(
                 &client,
                 CubeCount::new_single(),
-                CubeDim::new_1d(units as u32),
+                CubeDim::new_1d(threads_per_cube as u32),
                 BufferArg::from_raw_parts(h_tc.clone(), n_tiles * PARTIAL_COUNT_STRIDE),
                 BufferArg::from_raw_parts(h_tm.clone(), n_tiles),
                 BufferArg::from_raw_parts(h_xc.clone(), n_tiles * PARTIAL_COUNT_STRIDE),
                 BufferArg::from_raw_parts(h_xm.clone(), n_tiles),
-                units,
+                threads_per_cube,
                 log,
             );
         }
@@ -273,9 +273,9 @@ pub fn run(ctx: &GpuContext, fixture_path: &Path) -> ! {
             apply::launch_unchecked(
                 &client,
                 tiles_grid(n_tiles),
-                CubeDim::new_1d(units as u32),
-                BufferArg::from_raw_parts(h_fl.clone(), n_words),
-                BufferArg::from_raw_parts(h_sm.clone(), n),
+                CubeDim::new_1d(threads_per_cube as u32),
+                BufferArg::from_raw_parts(h_glyph_flags.clone(), n_words),
+                BufferArg::from_raw_parts(h_advance_widths.clone(), n),
                 BufferArg::from_raw_parts(h_lc.clone(), n * LC_STRIDE),
                 BufferArg::from_raw_parts(h_lm.clone(), n * LM_STRIDE),
                 BufferArg::from_raw_parts(h_item_desc.clone(), item_descriptors.len()),
@@ -285,8 +285,8 @@ pub fn run(ctx: &GpuContext, fixture_path: &Path) -> ! {
                 BufferArg::from_raw_parts(h_otb.clone(), n),
                 BufferArg::from_raw_parts(h_rmax.clone(), item_count),
                 BufferArg::from_raw_parts(h_xmax.clone(), item_count),
-                units,
-                rake,
+                threads_per_cube,
+                bytes_per_thread,
                 log,
                 inline_resolve,
                 false,
@@ -297,16 +297,16 @@ pub fn run(ctx: &GpuContext, fixture_path: &Path) -> ! {
             let rake_ep = 32usize;
             extent_pair::launch_unchecked(
                 &client,
-                tiles_grid(n.div_ceil(units * rake_ep).max(1)),
-                CubeDim::new_1d(units as u32),
-                BufferArg::from_raw_parts(h_sm.clone(), n),
-                BufferArg::from_raw_parts(h_fl.clone(), n_words),
+                tiles_grid(n.div_ceil(threads_per_cube * rake_ep).max(1)),
+                CubeDim::new_1d(threads_per_cube as u32),
+                BufferArg::from_raw_parts(h_advance_widths.clone(), n),
+                BufferArg::from_raw_parts(h_glyph_flags.clone(), n_words),
                 BufferArg::from_raw_parts(h_lc.clone(), n * LC_STRIDE),
                 BufferArg::from_raw_parts(h_plan.clone(), item_count * 3),
                 BufferArg::from_raw_parts(h_extent.clone(), item_count * 2),
                 min_sw,
                 0,
-                units,
+                threads_per_cube,
                 rake_ep,
             );
         }
@@ -315,8 +315,8 @@ pub fn run(ctx: &GpuContext, fixture_path: &Path) -> ! {
                 &client,
                 cubes_of(n.div_ceil(rspan)),
                 CubeDim::new_1d(256),
-                BufferArg::from_raw_parts(h_sm.clone(), n),
-                BufferArg::from_raw_parts(h_fl.clone(), n_words),
+                BufferArg::from_raw_parts(h_advance_widths.clone(), n),
+                BufferArg::from_raw_parts(h_glyph_flags.clone(), n_words),
                 BufferArg::from_raw_parts(h_lm.clone(), n * LM_STRIDE),
                 BufferArg::from_raw_parts(h_lc.clone(), n * LC_STRIDE),
                 BufferArg::from_raw_parts(h_item_desc.clone(), item_descriptors.len()),
@@ -336,15 +336,15 @@ pub fn run(ctx: &GpuContext, fixture_path: &Path) -> ! {
                 &client,
                 cubes_of(n),
                 CubeDim::new_1d(256),
-                BufferArg::from_raw_parts(h_fl.clone(), n_words),
+                BufferArg::from_raw_parts(h_glyph_flags.clone(), n_words),
                 BufferArg::from_raw_parts(h_wc.clone(), n),
                 BufferArg::from_raw_parts(h_ir.clone(), item_count * 2),
                 BufferArg::from_raw_parts(h_base.clone(), item_count),
                 BufferArg::from_raw_parts(h_lm.clone(), n * LM_STRIDE),
                 BufferArg::from_raw_parts(h_lc.clone(), n * LC_STRIDE),
-                BufferArg::from_raw_parts(h_sm.clone(), n),
-                BufferArg::from_raw_parts(h_hgt.clone(), n),
-                BufferArg::from_raw_parts(h_gi.clone(), n),
+                BufferArg::from_raw_parts(h_advance_widths.clone(), n),
+                BufferArg::from_raw_parts(h_glyph_heights.clone(), n),
+                BufferArg::from_raw_parts(h_glyph_indices.clone(), n),
                 BufferArg::from_raw_parts(h_recs.clone(), leaders * 8),
                 BufferArg::from_raw_parts(h_win0, 1),
             );
@@ -362,7 +362,7 @@ pub fn run(ctx: &GpuContext, fixture_path: &Path) -> ! {
     };
     let dt = t0.elapsed();
     if std::env::var_os("GLYPH_CHAIN_DEBUG").is_some() {
-        let fl_bytes = client.read_one(h_fl).expect("read fl");
+        let fl_bytes = client.read_one(h_glyph_flags).expect("read fl");
         let flb: &[u32] = bytemuck::cast_slice(&fl_bytes);
         println!(
             "  dbg fl readback: [{} {} {} {} {} {} {} {}]",
@@ -566,8 +566,8 @@ pub fn run(ctx: &GpuContext, fixture_path: &Path) -> ! {
         n,
         item_count,
         leaders,
-        units,
-        rake,
+        threads_per_cube,
+        bytes_per_thread,
         bad,
         rec_bad,
         max_rec_dev,
@@ -623,10 +623,10 @@ pub fn decode_check(ctx: &GpuContext, fixture_path: &Path) -> ! {
     let h_bi = client.create_from_slice(bytemuck::cast_slice(&fx.trie.block_index));
     let h_bm = client.create_from_slice(bytemuck::cast_slice(&fx.trie.blocks_m));
     let h_bc = client.create_from_slice(bytemuck::cast_slice(&fx.trie.blocks_c));
-    let h_fl = client.empty(n_words * 4);
-    let h_sm = client.empty(n * 4);
-    let h_gi = client.empty(n * 4);
-    let h_hgt = client.empty(n * 4);
+    let h_glyph_flags = client.empty(n_words * 4);
+    let h_advance_widths = client.empty(n * 4);
+    let h_glyph_indices = client.empty(n * 4);
+    let h_glyph_heights = client.empty(n * 4);
     // decode clears the candidate-slot lane as of 2026-09-30; this driver
     // never reads it, so a plain allocation rides the launch.
     let h_cslot = client.empty(n * 4);
@@ -644,18 +644,18 @@ pub fn decode_check(ctx: &GpuContext, fixture_path: &Path) -> ! {
             BufferArg::from_raw_parts(h_bi.clone(), fx.trie.block_index.len()),
             BufferArg::from_raw_parts(h_bm.clone(), fx.trie.blocks_m.len()),
             BufferArg::from_raw_parts(h_bc.clone(), fx.trie.blocks_c.len()),
-            BufferArg::from_raw_parts(h_fl.clone(), n_words),
-            BufferArg::from_raw_parts(h_sm.clone(), n),
-            BufferArg::from_raw_parts(h_gi.clone(), n),
-            BufferArg::from_raw_parts(h_hgt.clone(), n),
+            BufferArg::from_raw_parts(h_glyph_flags.clone(), n_words),
+            BufferArg::from_raw_parts(h_advance_widths.clone(), n),
+            BufferArg::from_raw_parts(h_glyph_indices.clone(), n),
+            BufferArg::from_raw_parts(h_glyph_heights.clone(), n),
             BufferArg::from_raw_parts(h_cslot.clone(), n),
             crate::glyph_trie::BLOCK_SHIFT,
         );
     }
-    let fl_bytes = client.read_one(h_fl).expect("read fl");
-    let sm_bytes = client.read_one(h_sm).expect("read sm");
-    let gi_bytes = client.read_one(h_gi).expect("read gi");
-    let hgt_bytes = client.read_one(h_hgt).expect("read hgt");
+    let fl_bytes = client.read_one(h_glyph_flags).expect("read fl");
+    let sm_bytes = client.read_one(h_advance_widths).expect("read sm");
+    let gi_bytes = client.read_one(h_glyph_indices).expect("read gi");
+    let hgt_bytes = client.read_one(h_glyph_heights).expect("read hgt");
     let dt = t0.elapsed();
     let flw: &[u32] = bytemuck::cast_slice(&fl_bytes);
     let advance_widths: &[f32] = bytemuck::cast_slice(&sm_bytes);
@@ -777,21 +777,21 @@ pub fn cluster_check(ctx: &GpuContext, fixture_path: &Path) -> ! {
     let h_pval = client.create_from_slice(bytemuck::cast_slice(&pval));
     let h_ir = client.create_from_slice(bytemuck::cast_slice(&item_record_bounds));
     let h_ic = client.create_from_slice(bytemuck::cast_slice(&ic));
-    let h_fl = client.empty(n_words * 4);
-    let h_sm = client.empty(n * 4);
-    let h_gi = client.empty(n * 4);
-    let h_hgt = client.empty(n * 4);
+    let h_glyph_flags = client.empty(n_words * 4);
+    let h_advance_widths = client.empty(n * 4);
+    let h_glyph_indices = client.empty(n * 4);
+    let h_glyph_heights = client.empty(n * 4);
     let h_cslot = client.create_from_slice(bytemuck::cast_slice(&vec![0u32; n]));
     let h_cend = client.empty(n * 4);
     // The ranked chain's buffers. The compaction tiles mirror the scan
     // chain's 256x8 shape; the graph buffers are sized off C, read back
     // once after count_spine (fixtures are small — the bench does the same
     // readback in setup, outside its timing windows).
-    let (units, rake) = (256usize, 8usize);
-    let log = units.ilog2() as usize;
-    let n_tiles = n.div_ceil(units * rake).max(1);
+    let (threads_per_cube, bytes_per_thread) = (256usize, 8usize);
+    let log = threads_per_cube.ilog2() as usize;
+    let n_tiles = n.div_ceil(threads_per_cube * bytes_per_thread).max(1);
     let h_tc = client.empty(n_tiles * 4);
-    let h_up = client.empty(n_tiles * units * 4);
+    let h_up = client.empty(n_tiles * threads_per_cube * 4);
     let h_xc = client.empty(n_tiles * 4);
     let h_total = client.empty(4);
     let h_hp = client.empty(n * 4);
@@ -812,10 +812,10 @@ pub fn cluster_check(ctx: &GpuContext, fixture_path: &Path) -> ! {
             BufferArg::from_raw_parts(h_bi.clone(), fx.trie.block_index.len()),
             BufferArg::from_raw_parts(h_bm.clone(), fx.trie.blocks_m.len()),
             BufferArg::from_raw_parts(h_bc.clone(), fx.trie.blocks_c.len()),
-            BufferArg::from_raw_parts(h_fl.clone(), n_words),
-            BufferArg::from_raw_parts(h_sm.clone(), n),
-            BufferArg::from_raw_parts(h_gi.clone(), n),
-            BufferArg::from_raw_parts(h_hgt.clone(), n),
+            BufferArg::from_raw_parts(h_glyph_flags.clone(), n_words),
+            BufferArg::from_raw_parts(h_advance_widths.clone(), n),
+            BufferArg::from_raw_parts(h_glyph_indices.clone(), n),
+            BufferArg::from_raw_parts(h_glyph_heights.clone(), n),
             BufferArg::from_raw_parts(h_cslot.clone(), n),
             crate::glyph_trie::BLOCK_SHIFT,
         );
@@ -830,9 +830,9 @@ pub fn cluster_check(ctx: &GpuContext, fixture_path: &Path) -> ! {
             BufferArg::from_raw_parts(h_seq.clone(), seq.len()),
             BufferArg::from_raw_parts(h_ir.clone(), item_record_bounds.len()),
             BufferArg::from_raw_parts(h_ic.clone(), ic.len()),
-            BufferArg::from_raw_parts(h_fl.clone(), n_words),
-            BufferArg::from_raw_parts(h_sm.clone(), n),
-            BufferArg::from_raw_parts(h_gi.clone(), n),
+            BufferArg::from_raw_parts(h_glyph_flags.clone(), n_words),
+            BufferArg::from_raw_parts(h_advance_widths.clone(), n),
+            BufferArg::from_raw_parts(h_glyph_indices.clone(), n),
             BufferArg::from_raw_parts(h_cslot.clone(), n),
             BufferArg::from_raw_parts(h_cend.clone(), n),
             seq_max,
@@ -840,22 +840,22 @@ pub fn cluster_check(ctx: &GpuContext, fixture_path: &Path) -> ! {
         count_tile::launch_unchecked(
             &client,
             tiles_grid(n_tiles),
-            CubeDim::new_1d(units as u32),
+            CubeDim::new_1d(threads_per_cube as u32),
             BufferArg::from_raw_parts(h_cslot.clone(), n),
             BufferArg::from_raw_parts(h_tc.clone(), n_tiles),
-            BufferArg::from_raw_parts(h_up.clone(), n_tiles * units),
-            units,
-            rake,
+            BufferArg::from_raw_parts(h_up.clone(), n_tiles * threads_per_cube),
+            threads_per_cube,
+            bytes_per_thread,
             log,
         );
         count_spine::launch_unchecked(
             &client,
             CubeCount::new_single(),
-            CubeDim::new_1d(units as u32),
+            CubeDim::new_1d(threads_per_cube as u32),
             BufferArg::from_raw_parts(h_tc.clone(), n_tiles),
             BufferArg::from_raw_parts(h_xc.clone(), n_tiles),
             BufferArg::from_raw_parts(h_total.clone(), 1),
-            units,
+            threads_per_cube,
             log,
         );
     }
@@ -884,13 +884,13 @@ pub fn cluster_check(ctx: &GpuContext, fixture_path: &Path) -> ! {
         cand_scatter::launch_unchecked(
             &client,
             tiles_grid(n_tiles),
-            CubeDim::new_1d(units as u32),
+            CubeDim::new_1d(threads_per_cube as u32),
             BufferArg::from_raw_parts(h_cslot.clone(), n),
             BufferArg::from_raw_parts(h_xc.clone(), n_tiles),
-            BufferArg::from_raw_parts(h_up.clone(), n_tiles * units),
+            BufferArg::from_raw_parts(h_up.clone(), n_tiles * threads_per_cube),
             BufferArg::from_raw_parts(h_hp.clone(), c),
-            units,
-            rake,
+            threads_per_cube,
+            bytes_per_thread,
         );
         jump_build::launch_unchecked(
             &client,
@@ -943,16 +943,16 @@ pub fn cluster_check(ctx: &GpuContext, fixture_path: &Path) -> ! {
             BufferArg::from_raw_parts(h_ir.clone(), item_record_bounds.len()),
             BufferArg::from_raw_parts(h_cend.clone(), n),
             BufferArg::from_raw_parts(h_cslot.clone(), n),
-            BufferArg::from_raw_parts(h_sm.clone(), n),
-            BufferArg::from_raw_parts(h_gi.clone(), n),
-            BufferArg::from_raw_parts(h_fl.clone(), n_words),
+            BufferArg::from_raw_parts(h_advance_widths.clone(), n),
+            BufferArg::from_raw_parts(h_glyph_indices.clone(), n),
+            BufferArg::from_raw_parts(h_glyph_flags.clone(), n_words),
             kmax as usize,
             stride,
             bitmap_advance,
         );
     }
-    let fl_bytes = client.read_one(h_fl).expect("read fl");
-    let sm_bytes = client.read_one(h_sm).expect("read sm");
+    let fl_bytes = client.read_one(h_glyph_flags).expect("read fl");
+    let sm_bytes = client.read_one(h_advance_widths).expect("read sm");
     let dt = t0.elapsed();
     if std::env::var_os("GLYPH_CHAIN_DEBUG").is_some() {
         let hp_b = client.read_one(h_hp.clone()).expect("hp");

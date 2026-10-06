@@ -10,8 +10,8 @@ use super::super::ITEM_DESC_STRIDE;
 use super::InstanceInputs;
 
 pub(crate) struct ChainHostInputs {
-    pub units: usize,
-    pub rake: usize,
+    pub threads_per_cube: usize,
+    pub bytes_per_thread: usize,
     pub log: usize,
     pub n_tiles: usize,
     pub n_words: usize,
@@ -55,16 +55,16 @@ pub(crate) fn prepare_chain_inputs(
 ) -> ChainHostInputs {
     let item_count = items.len();
     let n = bytes.len();
-    let units = std::env::var("GLYPH_CHAIN_TILE")
+    let threads_per_cube = std::env::var("GLYPH_CHAIN_TILE")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(256usize);
-    let rake = std::env::var("GLYPH_CHAIN_RAKE")
+    let bytes_per_thread = std::env::var("GLYPH_CHAIN_RAKE")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(8usize);
-    let log = units.ilog2() as usize;
-    let n_tiles = n.div_ceil(units * rake).max(1);
+    let log = threads_per_cube.ilog2() as usize;
+    let n_tiles = n.div_ceil(threads_per_cube * bytes_per_thread).max(1);
     let n_words = n.div_ceil(4);
     let (seq, seq_max, bitmap_advance) = match trie.cluster_table() {
         Some((s, m, a)) => (s.to_vec(), m, a),
@@ -233,8 +233,8 @@ pub(crate) fn prepare_chain_inputs(
     }
 
     ChainHostInputs {
-        units,
-        rake,
+        threads_per_cube,
+        bytes_per_thread,
         log,
         n_tiles,
         n_words,

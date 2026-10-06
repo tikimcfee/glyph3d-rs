@@ -399,15 +399,15 @@ pub(super) fn count_tile(
     candidate_slots: &[u32],
     tile_counts: &mut [u32],
     unit_prefixes: &mut [u32],
-    #[comptime] units: usize,
-    #[comptime] rake: usize,
+    #[comptime] threads_per_cube: usize,
+    #[comptime] bytes_per_thread: usize,
     #[comptime] log: usize,
 ) {
     let tile = CUBE_POS;
     let unit_pos = UNIT_POS as usize;
     let total_slots = candidate_slots.len();
-    let range_start = tile * (units * rake) + unit_pos * rake;
-    let range_end = if range_start + rake < total_slots { range_start + rake } else { total_slots };
+    let range_start = tile * (threads_per_cube * bytes_per_thread) + unit_pos * bytes_per_thread;
+    let range_end = if range_start + bytes_per_thread < total_slots { range_start + bytes_per_thread } else { total_slots };
     let mut candidate_count = 0u32;
     if range_start < total_slots {
         let mut slot_index = range_start;
@@ -422,7 +422,7 @@ pub(super) fn count_tile(
     // phase writes EVERY shared slot before any read — naga only inserts
     // workgroup zero-init when initialization-before-read is unprovable,
     // and conditional writes (the probe's key scratch, formerly) force it.
-    let mut shared_counts = Shared::<[u32]>::new_slice(units);
+    let mut shared_counts = Shared::<[u32]>::new_slice(threads_per_cube);
     shared_counts[unit_pos] = candidate_count;
     #[unroll]
     for d in 0..log {
@@ -433,14 +433,14 @@ pub(super) fn count_tile(
         }
     }
     sync_cube();
-    if unit_pos == units - 1 {
+    if unit_pos == threads_per_cube - 1 {
         tile_counts[tile] = shared_counts[unit_pos];
         shared_counts[unit_pos] = 0u32;
     }
     #[unroll]
     for d in 0..log {
         sync_cube();
-        let s = units >> (d + 1);
+        let s = threads_per_cube >> (d + 1);
         if (unit_pos + 1) & (2 * s - 1) == 0 {
             let t = shared_counts[unit_pos];
             shared_counts[unit_pos] += shared_counts[unit_pos - s];
@@ -448,7 +448,7 @@ pub(super) fn count_tile(
         }
     }
     sync_cube();
-    unit_prefixes[tile * units + unit_pos] = shared_counts[unit_pos];
+    unit_prefixes[tile * threads_per_cube + unit_pos] = shared_counts[unit_pos];
 }
 
 /// The compaction spine: one cube Blelloch-scans the tile totals into
@@ -462,12 +462,12 @@ pub(super) fn count_spine(
     tile_counts: &[u32],
     tile_spine_counts: &mut [u32],
     grand_total: &mut [u32],
-    #[comptime] units: usize,
+    #[comptime] threads_per_cube: usize,
     #[comptime] log: usize,
 ) {
     let unit_pos = UNIT_POS as usize;
     let n_tiles = tile_counts.len();
-    let per = n_tiles.div_ceil(units);
+    let per = n_tiles.div_ceil(threads_per_cube);
     let first = unit_pos * per;
     let last = if first + per < n_tiles { first + per } else { n_tiles };
     let mut accumulated_count = 0u32;
@@ -478,7 +478,7 @@ pub(super) fn count_spine(
             t += 1usize;
         }
     }
-    let mut shared_counts = Shared::<[u32]>::new_slice(units);
+    let mut shared_counts = Shared::<[u32]>::new_slice(threads_per_cube);
     shared_counts[unit_pos] = accumulated_count;
     #[unroll]
     for d in 0..log {
@@ -489,13 +489,13 @@ pub(super) fn count_spine(
         }
     }
     sync_cube();
-    if unit_pos == units - 1 {
+    if unit_pos == threads_per_cube - 1 {
         shared_counts[unit_pos] = 0u32;
     }
     #[unroll]
     for d in 0..log {
         sync_cube();
-        let s = units >> (d + 1);
+        let s = threads_per_cube >> (d + 1);
         if (unit_pos + 1) & (2 * s - 1) == 0 {
             let t = shared_counts[unit_pos];
             shared_counts[unit_pos] += shared_counts[unit_pos - s];
@@ -524,15 +524,15 @@ pub(super) fn cand_scatter(
     tile_spine_counts: &[u32],
     unit_prefixes: &[u32],
     candidate_head_positions: &mut [u32],
-    #[comptime] units: usize,
-    #[comptime] rake: usize,
+    #[comptime] threads_per_cube: usize,
+    #[comptime] bytes_per_thread: usize,
 ) {
     let tile = CUBE_POS;
     let unit_pos = UNIT_POS as usize;
     let total_slots = candidate_slots.len();
-    let range_start = tile * (units * rake) + unit_pos * rake;
-    let range_end = if range_start + rake < total_slots { range_start + rake } else { total_slots };
-    let mut scatter_index = tile_spine_counts[tile] + unit_prefixes[tile * units + unit_pos];
+    let range_start = tile * (threads_per_cube * bytes_per_thread) + unit_pos * bytes_per_thread;
+    let range_end = if range_start + bytes_per_thread < total_slots { range_start + bytes_per_thread } else { total_slots };
+    let mut scatter_index = tile_spine_counts[tile] + unit_prefixes[tile * threads_per_cube + unit_pos];
     if range_start < total_slots {
         let mut slot_index = range_start;
         while slot_index < range_end {

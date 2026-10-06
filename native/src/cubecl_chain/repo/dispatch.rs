@@ -248,7 +248,7 @@ pub(crate) fn launch_block1(
     }
 }
 
-/// Executes Block 2 Part A: candidate resolution (if any), survivor counting (sv_count_tile, sv_count_spine), and item_totals.
+/// Executes Block 2 Part A: candidate resolution (if any) and cluster marking.
 pub(crate) fn launch_block2_totals(
     client: &Client,
     n: usize,
@@ -356,8 +356,8 @@ pub(crate) fn launch_block2_geometry(
 ) {
     let n_tiles = inputs.n_tiles;
     let n_words = inputs.n_words;
-    let units = inputs.units;
-    let rake = inputs.rake;
+    let threads_per_cube = inputs.threads_per_cube;
+    let bytes_per_thread = inputs.bytes_per_thread;
     let log = inputs.log;
 
     unsafe {
@@ -366,14 +366,14 @@ pub(crate) fn launch_block2_geometry(
         tile_scan::launch_unchecked(
             client,
             tiles_grid(n_tiles),
-            CubeDim::new_1d(units as u32),
+            CubeDim::new_1d(threads_per_cube as u32),
             BufferArg::from_raw_parts(buf.h_glyph_flags.clone(), n_words),
             BufferArg::from_raw_parts(buf.h_advance_widths.clone(), n),
             BufferArg::from_raw_parts(buf.h_item_descriptors.as_ref().unwrap().clone(), inputs.item_descriptors.len()),
             BufferArg::from_raw_parts(buf.h_tile_counts.as_ref().unwrap().clone(), n_tiles * PARTIAL_COUNT_STRIDE),
             BufferArg::from_raw_parts(buf.h_tile_metrics.as_ref().unwrap().clone(), n_tiles),
-            units,
-            rake,
+            threads_per_cube,
+            bytes_per_thread,
             log,
         );
         prof.end(client, "tile_scan");
@@ -382,12 +382,12 @@ pub(crate) fn launch_block2_geometry(
         spine_scan::launch_unchecked(
             client,
             CubeCount::new_single(),
-            CubeDim::new_1d(units as u32),
+            CubeDim::new_1d(threads_per_cube as u32),
             BufferArg::from_raw_parts(buf.h_tile_counts.as_ref().unwrap().clone(), n_tiles * PARTIAL_COUNT_STRIDE),
             BufferArg::from_raw_parts(buf.h_tile_metrics.as_ref().unwrap().clone(), n_tiles),
             BufferArg::from_raw_parts(buf.h_spine_counts.as_ref().unwrap().clone(), n_tiles * PARTIAL_COUNT_STRIDE),
             BufferArg::from_raw_parts(buf.h_spine_metrics.as_ref().unwrap().clone(), n_tiles),
-            units,
+            threads_per_cube,
             log,
         );
         prof.end(client, "spine_scan");
@@ -396,7 +396,7 @@ pub(crate) fn launch_block2_geometry(
         apply_and_emit::launch_unchecked(
             client,
             tiles_grid(n_tiles),
-            CubeDim::new_1d(units as u32),
+            CubeDim::new_1d(threads_per_cube as u32),
             BufferArg::from_raw_parts(buf.h_glyph_flags.clone(), n_words),
             BufferArg::from_raw_parts(buf.h_advance_widths.clone(), n),
             BufferArg::from_raw_parts(buf.h_item_descriptors.as_ref().unwrap().clone(), inputs.item_descriptors.len()),
@@ -410,8 +410,8 @@ pub(crate) fn launch_block2_geometry(
             BufferArg::from_raw_parts(buf.h_instance_slots.clone(), buf.slots_words),
             BufferArg::from_raw_parts(buf.h_instance_tints.clone(), buf.tint_words),
             emit_derived,
-            units,
-            rake,
+            threads_per_cube,
+            bytes_per_thread,
             log,
         );
         prof.end(client, "apply_and_emit");
@@ -432,12 +432,12 @@ pub fn prewarm_pipelines(client: &Client) {
 
     let dim_256 = CubeDim::new_1d(256);
 
-    let units = 256usize;
-    let rake = std::env::var("GLYPH_CHAIN_RAKE")
+    let threads_per_cube = 256usize;
+    let bytes_per_thread = std::env::var("GLYPH_CHAIN_RAKE")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(8usize);
-    let log = units.ilog2() as usize;
+    let log = threads_per_cube.ilog2() as usize;
 
     unsafe {
         // 1. decode_probe
@@ -551,8 +551,8 @@ pub fn prewarm_pipelines(client: &Client) {
             dummy(2, ITEM_DESC_STRIDE),
             dummy(3, PARTIAL_COUNT_STRIDE),
             dummy(4, 1),
-            units,
-            rake,
+            threads_per_cube,
+            bytes_per_thread,
             log,
         );
 
@@ -565,7 +565,7 @@ pub fn prewarm_pipelines(client: &Client) {
             dummy(1, 1),
             dummy(2, PARTIAL_COUNT_STRIDE),
             dummy(3, 1),
-            units,
+            threads_per_cube,
             log,
         );
 
@@ -587,8 +587,8 @@ pub fn prewarm_pipelines(client: &Client) {
             dummy(9, 8),
             dummy(10, 2),
             false,
-            units,
-            rake,
+            threads_per_cube,
+            bytes_per_thread,
             log,
         );
     }

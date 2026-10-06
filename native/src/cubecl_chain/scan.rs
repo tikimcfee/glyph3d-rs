@@ -28,16 +28,16 @@ pub(super) fn tile_scan(
     item_descriptors: &[u32],
     tile_counts: &mut [u32],
     tile_metrics: &mut [f32],
-    #[comptime] units: usize,
-    #[comptime] rake: usize,
+    #[comptime] threads_per_cube: usize,
+    #[comptime] bytes_per_thread: usize,
     #[comptime] log: usize,
 ) {
     let tile_idx = CUBE_POS;
     let unit_idx = UNIT_POS as usize;
     let total_bytes = glyph_flags.len() * 4; // packed: words -> bytes
     let item_count = item_descriptors.len() / ITEM_DESC_STRIDE;
-    let range_start = tile_idx * (units * rake) + unit_idx * rake;
-    let range_end = if range_start + rake < total_bytes { range_start + rake } else { total_bytes };
+    let range_start = tile_idx * (threads_per_cube * bytes_per_thread) + unit_idx * bytes_per_thread;
+    let range_end = if range_start + bytes_per_thread < total_bytes { range_start + bytes_per_thread } else { total_bytes };
     // ItemWalk seed. For pad units (range_start >= total_bytes) the seed clamps to the last byte
     // so the pad element carries the wrap/mode in force at the tile's end —
     // see the module header for why a pure-identity pad would poison the
@@ -92,8 +92,8 @@ pub(super) fn tile_scan(
         accumulator.mode = active_wrap_mode;
     }
 
-    let mut shared_counts = Shared::<[i32]>::new_slice(units * PARTIAL_COUNT_STRIDE);
-    let mut shared_metrics = Shared::<[f32]>::new_slice(units);
+    let mut shared_counts = Shared::<[i32]>::new_slice(threads_per_cube * PARTIAL_COUNT_STRIDE);
+    let mut shared_metrics = Shared::<[f32]>::new_slice(threads_per_cube);
     s_store(&mut shared_counts, &mut shared_metrics, unit_idx, &accumulator);
 
     // Up-sweep: x[unit_idx] = combine(x[unit_idx-s], x[unit_idx]) at the ends of 2s-blocks. The
@@ -116,7 +116,7 @@ pub(super) fn tile_scan(
     // until 2026-10-05: eight barriers and ~255 combines per tile whose
     // results nothing read.)
     sync_cube();
-    if unit_idx == units - 1 {
+    if unit_idx == threads_per_cube - 1 {
         let total = s_load(&shared_counts, &shared_metrics, unit_idx);
         p_store(tile_counts, tile_metrics, tile_idx, &total);
     }
@@ -137,13 +137,13 @@ pub(super) fn spine_scan(
     tile_metrics: &[f32],
     tile_spine_counts: &mut [u32],
     tile_spine_metrics: &mut [f32],
-    #[comptime] units: usize,
+    #[comptime] threads_per_cube: usize,
     #[comptime] log: usize,
 ) {
-    let u = UNIT_POS as usize;
+    let thread_idx = UNIT_POS as usize;
     let n_tiles = tile_counts.len() / PARTIAL_COUNT_STRIDE;
-    let per = n_tiles.div_ceil(units);
-    let first = u * per;
+    let per = n_tiles.div_ceil(threads_per_cube);
+    let first = thread_idx * per;
     let last = if first + per < n_tiles { first + per } else { n_tiles };
     let mut acc = identity();
     if first < n_tiles {
@@ -158,43 +158,43 @@ pub(super) fn spine_scan(
         acc.mode = tile_counts[o + P_MODE] as i32;
     }
 
-    let mut sc = Shared::<[i32]>::new_slice(units * PARTIAL_COUNT_STRIDE);
-    let mut sf = Shared::<[f32]>::new_slice(units);
-    s_store(&mut sc, &mut sf, u, &acc);
+    let mut shared_counts = Shared::<[i32]>::new_slice(threads_per_cube * PARTIAL_COUNT_STRIDE);
+    let mut shared_metrics = Shared::<[f32]>::new_slice(threads_per_cube);
+    s_store(&mut shared_counts, &mut shared_metrics, thread_idx, &acc);
 
     #[unroll]
     for d in 0..log {
         sync_cube();
         let s = 1usize << d;
-        if (u + 1) & (2 * s - 1) == 0 {
-            let mut lhs = s_load(&sc, &sf, u - s);
-            let rhs = s_load(&sc, &sf, u);
+        if (thread_idx + 1) & (2 * s - 1) == 0 {
+            let mut lhs = s_load(&shared_counts, &shared_metrics, thread_idx - s);
+            let rhs = s_load(&shared_counts, &shared_metrics, thread_idx);
             combine(&mut lhs, &rhs);
-            s_store(&mut sc, &mut sf, u, &lhs);
+            s_store(&mut shared_counts, &mut shared_metrics, thread_idx, &lhs);
         }
     }
     sync_cube();
-    if u == units - 1 {
+    if thread_idx == threads_per_cube - 1 {
         let e = identity();
-        s_store(&mut sc, &mut sf, u, &e);
+        s_store(&mut shared_counts, &mut shared_metrics, thread_idx, &e);
     }
     #[unroll]
     for d in 0..log {
         sync_cube();
-        let s = units >> (d + 1);
-        if (u + 1) & (2 * s - 1) == 0 {
-            let temp_carried = s_load(&sc, &sf, u);
-            let mut lhs = s_load(&sc, &sf, u);
-            let rhs = s_load(&sc, &sf, u - s);
+        let s = threads_per_cube >> (d + 1);
+        if (thread_idx + 1) & (2 * s - 1) == 0 {
+            let temp_carried = s_load(&shared_counts, &shared_metrics, thread_idx);
+            let mut lhs = s_load(&shared_counts, &shared_metrics, thread_idx);
+            let rhs = s_load(&shared_counts, &shared_metrics, thread_idx - s);
             combine(&mut lhs, &rhs);
-            s_store(&mut sc, &mut sf, u, &lhs);
-            s_store(&mut sc, &mut sf, u - s, &temp_carried);
+            s_store(&mut shared_counts, &mut shared_metrics, thread_idx, &lhs);
+            s_store(&mut shared_counts, &mut shared_metrics, thread_idx - s, &temp_carried);
         }
     }
     sync_cube();
 
     // Chase: this unit's block of tiles gets its global exclusive prefixes.
-    let mut pre = s_load(&sc, &sf, u);
+    let mut pre = s_load(&shared_counts, &shared_metrics, thread_idx);
     if first < n_tiles {
         for t in first..last {
             p_store(tile_spine_counts, tile_spine_metrics, t, &pre);
