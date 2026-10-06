@@ -4,7 +4,7 @@ use std::ops::Range;
 
 use glyph_field::{
     shared_bind_group_entries, FieldResources, FieldTargets, GlyphField, GlyphFieldMode,
-    GlyphPlacement, ItemParamsGpu, LineRecord, SlotChunk, SlotSource, BINDING_SLOTS,
+    GlyphPlacement, ItemParamsGpu, SlotChunk, SlotSource, BINDING_SLOTS,
 };
 use wgpu::util::DeviceExt;
 
@@ -44,10 +44,17 @@ impl DerivedField {
         };
 
         let (storage, line_table) = match source {
-            SlotSource::Device { chunk_capacity, chunks, mapped_base, glyph_count } => {
+            SlotSource::Device { chunk_capacity, chunks, mapped_base, glyph_count, line_table } => {
+                // A device source for this field is the producer's direct
+                // Derived emission (HyperLayout Pass 2): 20 B slots whose
+                // `line_idx` already indexes this table. No upload, no
+                // transcode — bind as-is.
+                let line_table = line_table.expect(
+                    "Derived field given a device source without a line table: \
+                     the producer emitted another field's slot format",
+                );
                 let storage = DerivedSlotStorage::new(chunks.to_vec(), chunk_capacity, glyph_count, mapped_base);
-                let default_line = vec![LineRecord { item_idx: 0, row: 0 }];
-                (storage, default_line)
+                (storage, std::borrow::Cow::Borrowed(line_table))
             }
             SlotSource::Host { slices, glyph_count, direct_host_upload } => {
                 let upload = upload_derived_slots(device, queue, &slices, glyph_count, direct_host_upload, item_params);
@@ -58,7 +65,7 @@ impl DerivedField {
                     .map(|(buffer, &slots)| SlotChunk { buffer, offset: 0, slots })
                     .collect();
                 let storage = DerivedSlotStorage::new(chunks, upload.chunk_capacity, glyph_count, None);
-                (storage, upload.line_table)
+                (storage, std::borrow::Cow::Owned(upload.line_table))
             }
         };
 

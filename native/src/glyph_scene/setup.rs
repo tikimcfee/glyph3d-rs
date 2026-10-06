@@ -170,18 +170,30 @@ impl GlyphScene {
             sample_count: SCENE_SAMPLE_COUNT,
         };
         // The arena's two forms map onto the field's two sources. A DEVICE
-        // arena (the endpoint, E2b) is already slots in the Instanced format,
-        // chunked by its producer; a HOST arena is the engine's neutral
-        // records, which the mode converts and uploads. Unified-memory direct
-        // upload is a property of the adapter, decided here (Metal +
-        // MAPPABLE_PRIMARY_BUFFERS — see glyph_field_instanced::upload).
+        // arena is already slots in the field's OWN format (the producer was
+        // told the mode — 32 B RenderSlots for Instanced, 20 B DerivedSlots
+        // plus a line table for Derived), chunked by its producer; a HOST
+        // arena is the engine's neutral records, which the mode converts and
+        // uploads. Unified-memory direct upload is a property of the adapter,
+        // decided here (Metal + MAPPABLE_PRIMARY_BUFFERS — see
+        // glyph_field_instanced::upload).
         let source = match arena.device_slots() {
-            Some(dev) => SlotSource::Device {
-                chunk_capacity: dev.chunk_slots,
-                chunks: &dev.chunks,
-                glyph_count: instances_len,
-                mapped_base: dev.mapped_slots,
-            },
+            Some(dev) => {
+                assert_eq!(
+                    dev.format, field_mode,
+                    "device arena was emitted for {:?} but the scene builds a {:?} field",
+                    dev.format, field_mode
+                );
+                SlotSource::Device {
+                    chunk_capacity: dev.chunk_slots,
+                    chunks: &dev.chunks,
+                    glyph_count: instances_len,
+                    mapped_base: dev
+                        .mapped_slots
+                        .or_else(|| dev.derived.as_ref().and_then(|d| d.mapped_base)),
+                    line_table: dev.derived.as_ref().map(|d| d.line_table.as_slice()),
+                }
+            }
             None => SlotSource::Host {
                 slices: arena.instance_chunks(),
                 glyph_count: instances_len,

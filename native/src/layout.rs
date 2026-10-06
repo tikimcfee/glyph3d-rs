@@ -482,11 +482,21 @@ pub struct DeviceSlots {
     pub chunk_slots: usize,
     pub len: usize,
     /// When mapped in host-visible memory, base pointer to the RenderSlot slice as usize.
+    /// RenderSlot ONLY — None whenever `format` is Derived (see `derived`).
     pub mapped_slots: Option<usize>,
     /// Precomputed in-flight tint accumulators per item, avoiding 3 GB mapped memory readback.
     pub file_tints: Vec<FileTintAccum>,
     /// Precomputed in-flight local block bounds per item, avoiding 3 GB mapped memory readback in build_file_blocks.
     pub file_blocks: Vec<Vec<crate::glyph_scene::BlockCull>>,
+    /// Which field's slot format the chunks hold. A field binds only its own
+    /// format; setup refuses a mismatch rather than drawing garbage.
+    pub format: glyph_field::GlyphFieldMode,
+    /// The Derived format's companions (None for Instanced).
+    pub derived: Option<DerivedDeviceSlots>,
+    /// Per item: `(glyph_id, color)` pairs captured at emission for items
+    /// whose fast tint is not final (`has_emoji`), empty otherwise — so the
+    /// tint fold never reads device slots back. Empty when not produced.
+    pub emoji_tint_pairs: Vec<Vec<u32>>,
     /// (glyph_id, color) per slot, slot order — read through `as_slice`.
     #[cfg(feature = "cubecl")]
     pub tint: TintStore,
@@ -494,6 +504,17 @@ pub struct DeviceSlots {
     /// re-allocated — never read by design; their Drop is the release.
     #[cfg(feature = "cubecl")]
     pub keep_alive: Vec<Box<dyn std::any::Any + Send>>,
+}
+
+/// What a Derived-format device arena carries beside its 20 B slots.
+pub struct DerivedDeviceSlots {
+    /// `{item_idx, row}` per line, item-major: item `i`'s rows occupy
+    /// `line_base[i] .. line_base[i] + row_count[i]`, and a slot's `line_idx`
+    /// is `line_base + row` — written by Pass 2, no fix-up.
+    pub line_table: Vec<glyph_field::LineRecord>,
+    /// Host address of the mapped `DerivedSlot` slice (unified memory), for
+    /// in-place bulk color writes. None on staged (discrete) paths.
+    pub mapped_base: Option<usize>,
 }
 
 /// One chunk of device slots — the field contract's [`glyph_field::SlotChunk`]
@@ -788,9 +809,15 @@ impl LayoutEngine {
         Self::Hyper(crate::layout_hyper::HyperLayout::new())
     }
 
-    /// Constructs a HyperLayout engine sharing a GPU context device.
-    pub fn hyper_with_device(device: crate::gpu::SharedDevice) -> Self {
-        Self::Hyper(crate::layout_hyper::HyperLayout::with_device(device))
+    /// Constructs a HyperLayout engine sharing a GPU context device. The
+    /// device path emits `field_mode`'s own slot format directly (32 B
+    /// `RenderSlot` for Instanced, 20 B `DerivedSlot` + line table for
+    /// Derived) — the renderer then binds it with no transcode.
+    pub fn hyper_with_device(
+        device: crate::gpu::SharedDevice,
+        field_mode: glyph_field::GlyphFieldMode,
+    ) -> Self {
+        Self::Hyper(crate::layout_hyper::HyperLayout::with_device(device, field_mode))
     }
 
     /// Constructs a CubeCL layout engine if the feature is enabled.

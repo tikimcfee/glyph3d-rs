@@ -1,32 +1,121 @@
 //! Pass 2 parallel layout worker for device-mapped / VRAM slot buffers.
+//!
+//! One walk, two slot formats. The per-glyph math (fold, wrap, pagination,
+//! extents, tint, cull blocks) is written once; what a survivor becomes in
+//! memory is the [`SlotEmit`] parameter, monomorphized per format so neither
+//! format pays a branch for the other:
+//!
+//! - [`RenderEmit`] — the Instanced field's 32 B `RenderSlot`.
+//! - [`DerivedEmit`] — the Derived field's 20 B `DerivedSlot`, whose Y/Z the
+//!   vertex stage re-derives from `line_table[line_base + row]` and the
+//!   slot's wrap segment.
 
 use rayon::prelude::*;
 use crate::atlas::TrieTable;
 use crate::fold::{rows_for_line, wrap_row_of, wrap_segment_of};
 use crate::glyph_scene::{BlockCull, RenderSlot, SUBSEG_BLOCK_SIZE};
 use crate::layout::{FileTintAccum, InkExtent, ItemPlacement, LayoutItem, PageExtent, Paint};
+use glyph_field_derived::DerivedSlot;
 use super::char_resolve::resolve_byte_char;
-use super::types::{ItemPrepass, Pass2DeviceOutput, SendPtr};
+use super::types::{ItemPrepass, Pass2DeviceOutput};
 
-pub fn layout_pass2_device(
+/// Everything Pass 2 knows about one survivor at the moment it is emitted.
+#[derive(Clone, Copy)]
+pub(crate) struct EmitFields {
+    pub pos: [f32; 3],
+    pub glyph_id: u32,
+    pub color: u32,
+    pub group_id: u32,
+    pub advance: f32,
+    pub height: f32,
+    /// Item-local row (WrapDown rows included) — the Derived line key.
+    pub row: i64,
+    /// Fold count along the line — the Derived Z step index.
+    pub wrap_segment: i64,
+}
+
+/// A device slot format Pass 2 can emit directly.
+pub(crate) trait SlotEmit: Sync {
+    type Slot: Copy + Send + Sync;
+    /// Whether this format indexes a line table (and so needs `line_bases`
+    /// and the row bound checked).
+    const USES_LINES: bool;
+    fn emit(f: &EmitFields, line_base: u32) -> Self::Slot;
+    /// `(glyph_id, color)` — the tint fold's view of a slot.
+    fn tint_pair(s: &Self::Slot) -> [u32; 2];
+}
+
+pub(crate) struct RenderEmit;
+
+impl SlotEmit for RenderEmit {
+    type Slot = RenderSlot;
+    const USES_LINES: bool = false;
+    #[inline(always)]
+    fn emit(f: &EmitFields, _line_base: u32) -> RenderSlot {
+        RenderSlot {
+            pos: f.pos,
+            glyph_id: f.glyph_id,
+            color: f.color,
+            group_id: f.group_id,
+            advance: f.advance,
+            height: f.height,
+        }
+    }
+    #[inline(always)]
+    fn tint_pair(s: &RenderSlot) -> [u32; 2] {
+        [s.glyph_id, s.color]
+    }
+}
+
+pub(crate) struct DerivedEmit;
+
+impl SlotEmit for DerivedEmit {
+    type Slot = DerivedSlot;
+    const USES_LINES: bool = true;
+    #[inline(always)]
+    fn emit(f: &EmitFields, line_base: u32) -> DerivedSlot {
+        // Saturate like the host transcode's float->int cast did: a segment
+        // past 65535 pins to the last step rather than wrapping to the front.
+        let wrap = f.wrap_segment.clamp(0, u16::MAX as i64) as u16;
+        DerivedSlot::new(
+            f.pos[0],
+            line_base + f.row as u32,
+            (f.glyph_id & 0xFFFF) as u16,
+            wrap,
+            f.color,
+            f.group_id,
+        )
+    }
+    #[inline(always)]
+    fn tint_pair(s: &DerivedSlot) -> [u32; 2] {
+        [s.glyph_id() as u32, s.color]
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn layout_pass2_device<E: SlotEmit>(
     items: &[LayoutItem<'_>],
     prepasses: &[ItemPrepass],
     slot_bases: &[u32],
+    line_bases: &[u32],
     trie: &TrieTable,
     bitmap_adv: f32,
     em_height_fu: u32,
-    dest: SendPtr<RenderSlot>,
+    dest_addr: usize,
 ) -> Pass2DeviceOutput {
-    let dest_addr = dest.0 as usize;
+    debug_assert!(!E::USES_LINES || line_bases.len() == items.len());
     let lut = crate::glyph_scene::srgb_to_linear_table();
     let results: Vec<_> = items
         .par_iter()
         .zip(prepasses.par_iter())
         .zip(slot_bases.par_iter())
-        .map(|((item, pre), &slot_base)| {
+        .enumerate()
+        .map(|(item_idx, ((item, pre), &slot_base))| {
             let bytes = item.bytes;
             let p = &item.params;
             let group_id = item.group_id;
+            let line_base = if E::USES_LINES { line_bases[item_idx] } else { 0 };
+            let mut max_row_seen = -1i64;
 
             let fold_unit = if p.wrap_width > 0 {
                 p.wrap_width as i64
@@ -58,7 +147,7 @@ pub fn layout_pass2_device(
             let mut survivor_out = 0usize;
             let mut trailer_until = 0usize;
 
-            let out_ptr = unsafe { (dest_addr as *mut RenderSlot).add(slot_base as usize) };
+            let out_ptr = unsafe { (dest_addr as *mut E::Slot).add(slot_base as usize) };
             let flat_color = if let Paint::Flat(c) = item.paint { Some(c) } else { None };
             let (local_colors_buf, per_record_colors) = match item.paint {
                 Paint::PerRecord(c) => (None, Some(c)),
@@ -240,15 +329,21 @@ pub fn layout_pass2_device(
                         file_cells += 1;
                     }
 
+                    if E::USES_LINES && row > max_row_seen {
+                        max_row_seen = row;
+                    }
+                    let fields = EmitFields {
+                        pos: [pos_x, pos_y, pos_z],
+                        glyph_id: r.glyph_id,
+                        color,
+                        group_id,
+                        advance: r.advance,
+                        height: r.height,
+                        row,
+                        wrap_segment,
+                    };
                     unsafe {
-                        *out_ptr.add(survivor_out) = RenderSlot {
-                            pos: [pos_x, pos_y, pos_z],
-                            glyph_id: r.glyph_id,
-                            color,
-                            group_id,
-                            advance: r.advance,
-                            height: r.height,
-                        };
+                        out_ptr.add(survivor_out).write(E::emit(&fields, line_base));
                     }
                     survivor_out += 1;
 
@@ -304,6 +399,17 @@ pub fn layout_pass2_device(
                 }
 
                 pos += 1;
+            }
+
+            // The line table reserved `row_count` entries for this item before
+            // the walk; a row at or past it would index the NEXT item's lines
+            // and draw this glyph at that item's Y. Loud, not silent.
+            if E::USES_LINES {
+                assert!(
+                    max_row_seen < pre.row_count as i64,
+                    "pass 1 counted {} rows for item {item_idx} but pass 2 emitted row {max_row_seen}",
+                    pre.row_count,
+                );
             }
 
             if has_blocks
@@ -370,4 +476,33 @@ pub fn layout_pass2_device(
         file_tints,
         file_blocks,
     }
+}
+
+/// `(glyph_id, color)` pairs for every item whose fast tint cannot stand
+/// alone (`has_emoji`: its bitmap slots fold the atlas's per-slot ink, which
+/// Pass 2 does not have). Read from the slots just written, while the
+/// destination is still host-visible, so no consumer ever has to read the
+/// device buffer back. Emoji items are rare; every other entry is empty.
+pub(crate) fn emoji_tint_pairs<E: SlotEmit>(
+    dest_addr: usize,
+    out: &Pass2DeviceOutput,
+) -> Vec<Vec<u32>> {
+    out.placements
+        .par_iter()
+        .zip(out.file_tints.par_iter())
+        .map(|(pl, t)| {
+            if !t.has_emoji {
+                return Vec::new();
+            }
+            let base = dest_addr as *const E::Slot;
+            let slots = unsafe {
+                std::slice::from_raw_parts(base.add(pl.slot_base as usize), pl.slot_count as usize)
+            };
+            let mut pairs = Vec::with_capacity(slots.len() * 2);
+            for s in slots {
+                pairs.extend_from_slice(&E::tint_pair(s));
+            }
+            pairs
+        })
+        .collect()
 }

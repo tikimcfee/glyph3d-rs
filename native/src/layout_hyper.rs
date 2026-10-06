@@ -11,14 +11,17 @@ use std::sync::Arc;
 use rayon::prelude::*;
 
 use crate::atlas::TrieTable;
+use crate::fold::rows_for_line;
 use crate::glyph_scene::RenderSlot;
 use crate::layout::{
-    DeviceSlotChunk, DeviceSlots, GlyphArena, ItemPlacement, LayoutError, LayoutGlyphs,
-    LayoutItem,
+    DerivedDeviceSlots, DeviceSlotChunk, DeviceSlots, GlyphArena, ItemPlacement, LayoutError,
+    LayoutGlyphs, LayoutItem,
 };
 #[cfg(feature = "cubecl")]
 use crate::layout::TintStore;
 use crate::text::fu_to_world;
+use glyph_field::{GlyphFieldMode, LineRecord};
+use glyph_field_derived::DerivedSlot;
 
 mod types;
 pub use types::{ItemPrepass, Pass2DeviceOutput, SendPtr};
@@ -27,15 +30,19 @@ pub(crate) mod char_resolve;
 use char_resolve::resolve_byte_char;
 
 mod device_alloc;
-use device_alloc::{layout_device_discrete, layout_device_unified};
+use device_alloc::{layout_device_discrete, layout_device_unified, DeviceEmission, EmitInputs};
 
 mod pass2_device;
+use pass2_device::{DerivedEmit, RenderEmit};
 mod pass2_host;
 use pass2_host::layout_pass2_host;
 
 pub struct HyperLayout {
     trie: Option<Arc<TrieTable>>,
     device: Option<crate::gpu::SharedDevice>,
+    /// Whose slot format the device path emits. Host (no-device) runs
+    /// always produce the neutral 48 B records regardless.
+    field_mode: GlyphFieldMode,
 }
 
 impl Default for HyperLayout {
@@ -49,13 +56,15 @@ impl HyperLayout {
         Self {
             trie: None,
             device: None,
+            field_mode: GlyphFieldMode::Instanced,
         }
     }
 
-    pub(crate) fn with_device(device: crate::gpu::SharedDevice) -> Self {
+    pub(crate) fn with_device(device: crate::gpu::SharedDevice, field_mode: GlyphFieldMode) -> Self {
         Self {
             trie: None,
             device: Some(device),
+            field_mode,
         }
     }
 
@@ -63,6 +72,7 @@ impl HyperLayout {
         Self {
             trie: Some(trie),
             device: None,
+            field_mode: GlyphFieldMode::Instanced,
         }
     }
 }
@@ -112,161 +122,7 @@ impl HyperLayout {
 
         // --- PASS 1 (Parallel): Prepass per item to find counts and max_row_extent ---
         let sp_pass1 = tracing::info_span!("hyper.pass1").entered();
-        let prepasses: Vec<ItemPrepass> = items
-            .par_iter()
-            .map(|item| {
-                let bytes = item.bytes;
-                let p = &item.params;
-                let fold_unit = if p.wrap_width > 0 {
-                    p.wrap_width as i64
-                } else if p.has_page {
-                    p.page_cols as i64
-                } else {
-                    0
-                };
-
-                let mut survivor_count = 0u32;
-                let mut max_row_extent = 0.0f64;
-                let mut trailer_until = 0usize;
-
-                let ascii_adv = fu_to_world(1229, em_height_fu);
-                let mut pos = 0usize;
-                if fold_unit == 0 {
-                    let mut line_adv = 0.0f64;
-                    while pos < bytes.len() {
-                        let nl_pos = match memchr::memchr(b'\n', &bytes[pos..]) {
-                            Some(offset) => pos + offset,
-                            None => bytes.len(),
-                        };
-                        let line = &bytes[pos..nl_pos];
-                        if line.iter().all(|b| (0x20..0x7F).contains(b)) {
-                            let l = line.len();
-                            survivor_count += l as u32;
-                            let end_adv = line_adv + l as f64 * ascii_adv as f64;
-                            if end_adv > max_row_extent {
-                                max_row_extent = end_adv;
-                            }
-                            line_adv = 0.0;
-                            pos = if nl_pos < bytes.len() { nl_pos + 1 } else { nl_pos };
-                            continue;
-                        }
-
-                        for i in pos..nl_pos {
-                            let r = match resolve_byte_char(bytes, i, &trie, bitmap_adv, em_height_fu, &mut trailer_until) {
-                                Some(r) => r,
-                                None => continue,
-                            };
-
-                            if line_adv > max_row_extent {
-                                max_row_extent = line_adv;
-                            }
-
-                            if r.glyph_id != 0 {
-                                survivor_count += 1;
-                            }
-
-                            line_adv += r.advance as f64;
-                        }
-
-                        if nl_pos < bytes.len() {
-                            if line_adv > max_row_extent {
-                                max_row_extent = line_adv;
-                            }
-                            line_adv = 0.0;
-                            pos = nl_pos + 1;
-                        } else {
-                            pos = nl_pos;
-                        }
-                    }
-                } else {
-                    let mut col = 0i64;
-                    let mut seg_adv = 0.0f32;
-                    let fu = fold_unit as usize;
-                    let mut seg_adv_stack = [0.0f32; 256];
-                    let mut seg_adv_heap = Vec::new();
-                    let seg_adv_table: &[f32] = if fu < 256 {
-                        let mut cur = 0.0f32;
-                        for slot in seg_adv_stack.iter_mut().take(fu + 1) {
-                            *slot = cur;
-                            cur += ascii_adv;
-                        }
-                        &seg_adv_stack[..=fu]
-                    } else {
-                        seg_adv_heap.reserve(fu + 1);
-                        let mut cur = 0.0f32;
-                        for _ in 0..=fu {
-                            seg_adv_heap.push(cur);
-                            cur += ascii_adv;
-                        }
-                        &seg_adv_heap
-                    };
-
-                    while pos < bytes.len() {
-                        let nl_pos = match memchr::memchr(b'\n', &bytes[pos..]) {
-                            Some(offset) => pos + offset,
-                            None => bytes.len(),
-                        };
-                        let line = &bytes[pos..nl_pos];
-                        if line.iter().all(|b| (0x20..0x7F).contains(b)) {
-                            let l = line.len();
-                            survivor_count += l as u32;
-                            let line_max_seg = if l >= fu {
-                                seg_adv_table[fu - 1]
-                            } else {
-                                seg_adv_table[l]
-                            };
-                            if line_max_seg as f64 > max_row_extent {
-                                max_row_extent = line_max_seg as f64;
-                            }
-                            col = 0;
-                            seg_adv = 0.0;
-                            pos = if nl_pos < bytes.len() { nl_pos + 1 } else { nl_pos };
-                            continue;
-                        }
-
-                        for i in pos..nl_pos {
-                            let r = match resolve_byte_char(bytes, i, &trie, bitmap_adv, em_height_fu, &mut trailer_until) {
-                                Some(r) => r,
-                                None => continue,
-                            };
-
-                            let item_rel_x = seg_adv as f64;
-                            if item_rel_x > max_row_extent {
-                                max_row_extent = item_rel_x;
-                            }
-
-                            if r.glyph_id != 0 {
-                                survivor_count += 1;
-                            }
-
-                            col += 1;
-                            if col % fold_unit == 0 {
-                                seg_adv = 0.0;
-                            } else {
-                                seg_adv += r.advance;
-                            }
-                        }
-
-                        if nl_pos < bytes.len() {
-                            let item_rel_x = seg_adv as f64;
-                            if item_rel_x > max_row_extent {
-                                max_row_extent = item_rel_x;
-                            }
-                            col = 0;
-                            seg_adv = 0.0;
-                            pos = nl_pos + 1;
-                        } else {
-                            pos = nl_pos;
-                        }
-                    }
-                }
-
-                ItemPrepass {
-                    survivor_count,
-                    max_row_extent,
-                }
-            })
-            .collect();
+        let prepasses = pass1_prepass(items, &trie, bitmap_adv, em_height_fu);
         drop(sp_pass1);
 
         // --- Prefix Sum of survivor offsets ---
@@ -277,49 +133,89 @@ impl HyperLayout {
             total_survivors += pre.survivor_count as usize;
         }
 
+        let derived = self.field_mode == GlyphFieldMode::Derived;
+        let slot_bytes = if derived {
+            std::mem::size_of::<DerivedSlot>()
+        } else {
+            std::mem::size_of::<RenderSlot>()
+        };
         let can_use_device = allow_device
             && self.device.as_ref().is_some_and(|dev| {
-                (total_survivors * std::mem::size_of::<RenderSlot>()) as u64 <= dev.max_buffer_size
+                (total_survivors * slot_bytes) as u64 <= dev.max_buffer_size
                     && total_survivors > 0
             });
 
         if can_use_device {
             let dev = self.device.as_ref().unwrap();
-            let (wgpu_buf, mapped_slots, pass2_out) = if dev.is_unified() && dev.host_visible_storage {
-                layout_device_unified(
-                    dev,
-                    total_survivors,
-                    items,
-                    &prepasses,
-                    &slot_bases,
-                    &trie,
-                    bitmap_adv,
-                    em_height_fu,
-                )
+            let unified = dev.is_unified() && dev.host_visible_storage;
+
+            // Derived: each item owns `row_count` consecutive line-table
+            // entries; their bases are known now, so Pass 2 writes final
+            // `line_idx` values in one walk.
+            let line_bases: Vec<u32> = if derived {
+                let mut bases = Vec::with_capacity(item_count);
+                let mut acc = 0u64;
+                for pre in &prepasses {
+                    bases.push(acc as u32);
+                    acc += pre.row_count as u64;
+                }
+                assert!(acc <= u32::MAX as u64, "line table exceeds u32 indices ({acc} rows)");
+                bases
             } else {
-                layout_device_discrete(
-                    dev,
-                    total_survivors,
-                    items,
-                    &prepasses,
-                    &slot_bases,
-                    &trie,
-                    bitmap_adv,
-                    em_height_fu,
-                )
+                Vec::new()
             };
+            let inputs = EmitInputs {
+                items,
+                prepasses: &prepasses,
+                slot_bases: &slot_bases,
+                line_bases: &line_bases,
+                trie: &trie,
+                bitmap_adv,
+                em_height_fu,
+            };
+
+            let (emission, derived_extras) = if derived {
+                let label = "derived glyph slots (direct)";
+                // The table depends only on Pass 1; build it alongside Pass 2.
+                let (emission, line_table) = rayon::join(
+                    || {
+                        if unified {
+                            layout_device_unified::<DerivedEmit>(dev, total_survivors, &inputs, label)
+                        } else {
+                            layout_device_discrete::<DerivedEmit>(dev, total_survivors, &inputs, label)
+                        }
+                    },
+                    || build_line_table(items, &prepasses, &line_bases),
+                );
+                let extras = DerivedDeviceSlots { line_table, mapped_base: emission.mapped_base };
+                (emission, Some(extras))
+            } else {
+                let label = "glyph render slots (direct)";
+                let emission = if unified {
+                    layout_device_unified::<RenderEmit>(dev, total_survivors, &inputs, label)
+                } else {
+                    layout_device_discrete::<RenderEmit>(dev, total_survivors, &inputs, label)
+                };
+                (emission, None)
+            };
+            let DeviceEmission { buffer, mapped_base, pass2: pass2_out, emoji_tint_pairs } = emission;
 
             let device_slots = DeviceSlots {
                 chunks: vec![DeviceSlotChunk {
-                    buffer: wgpu_buf,
+                    buffer,
                     offset: 0,
                     slots: total_survivors as u32,
                 }],
                 chunk_slots: total_survivors,
                 len: total_survivors,
-                mapped_slots,
+                // RenderSlot-typed readers key off this; never hand them a
+                // DerivedSlot mapping.
+                mapped_slots: if derived { None } else { mapped_base },
                 file_tints: pass2_out.file_tints,
                 file_blocks: pass2_out.file_blocks,
+                format: self.field_mode,
+                derived: derived_extras,
+                emoji_tint_pairs,
                 #[cfg(feature = "cubecl")]
                 tint: TintStore::Host(Vec::new()),
                 #[cfg(feature = "cubecl")]
@@ -347,6 +243,216 @@ impl HyperLayout {
     }
 }
 
+
+/// PASS 1 (parallel): per item, survivor count, widest row extent, and the
+/// FOLDED row count (the Derived line table's size, known before Pass 2).
+fn pass1_prepass(
+    items: &[LayoutItem<'_>],
+    trie: &TrieTable,
+    bitmap_adv: f32,
+    em_height_fu: u32,
+) -> Vec<ItemPrepass> {
+    items
+        .par_iter()
+        .map(|item| {
+            let bytes = item.bytes;
+            let p = &item.params;
+            let fold_unit = if p.wrap_width > 0 {
+                p.wrap_width as i64
+            } else if p.has_page {
+                p.page_cols as i64
+            } else {
+                0
+            };
+
+            let mut survivor_count = 0u32;
+            let mut max_row_extent = 0.0f64;
+            let mut trailer_until = 0usize;
+            // Rows this item's records occupy — exactly Pass 2's
+            // `base_row` progression (`rows_for_line` per line, the last,
+            // unterminated line included). Unfolded: one row per line.
+            let mut row_count = 0u64;
+            let wrap_w = p.wrap_width as i64;
+
+            let ascii_adv = fu_to_world(1229, em_height_fu);
+            let mut pos = 0usize;
+            if fold_unit == 0 {
+                let mut line_adv = 0.0f64;
+                while pos < bytes.len() {
+                    row_count += 1;
+                    let nl_pos = match memchr::memchr(b'\n', &bytes[pos..]) {
+                        Some(offset) => pos + offset,
+                        None => bytes.len(),
+                    };
+                    let line = &bytes[pos..nl_pos];
+                    if line.iter().all(|b| (0x20..0x7F).contains(b)) {
+                        let l = line.len();
+                        survivor_count += l as u32;
+                        let end_adv = line_adv + l as f64 * ascii_adv as f64;
+                        if end_adv > max_row_extent {
+                            max_row_extent = end_adv;
+                        }
+                        line_adv = 0.0;
+                        pos = if nl_pos < bytes.len() { nl_pos + 1 } else { nl_pos };
+                        continue;
+                    }
+
+                    for i in pos..nl_pos {
+                        let r = match resolve_byte_char(bytes, i, trie, bitmap_adv, em_height_fu, &mut trailer_until) {
+                            Some(r) => r,
+                            None => continue,
+                        };
+
+                        if line_adv > max_row_extent {
+                            max_row_extent = line_adv;
+                        }
+
+                        if r.glyph_id != 0 {
+                            survivor_count += 1;
+                        }
+
+                        line_adv += r.advance as f64;
+                    }
+
+                    if nl_pos < bytes.len() {
+                        if line_adv > max_row_extent {
+                            max_row_extent = line_adv;
+                        }
+                        line_adv = 0.0;
+                        pos = nl_pos + 1;
+                    } else {
+                        pos = nl_pos;
+                    }
+                }
+            } else {
+                let mut col = 0i64;
+                let mut seg_adv = 0.0f32;
+                let fu = fold_unit as usize;
+                let mut seg_adv_stack = [0.0f32; 256];
+                let mut seg_adv_heap = Vec::new();
+                let seg_adv_table: &[f32] = if fu < 256 {
+                    let mut cur = 0.0f32;
+                    for slot in seg_adv_stack.iter_mut().take(fu + 1) {
+                        *slot = cur;
+                        cur += ascii_adv;
+                    }
+                    &seg_adv_stack[..=fu]
+                } else {
+                    seg_adv_heap.reserve(fu + 1);
+                    let mut cur = 0.0f32;
+                    for _ in 0..=fu {
+                        seg_adv_heap.push(cur);
+                        cur += ascii_adv;
+                    }
+                    &seg_adv_heap
+                };
+
+                while pos < bytes.len() {
+                    let nl_pos = match memchr::memchr(b'\n', &bytes[pos..]) {
+                        Some(offset) => pos + offset,
+                        None => bytes.len(),
+                    };
+                    let line = &bytes[pos..nl_pos];
+                    if line.iter().all(|b| (0x20..0x7F).contains(b)) {
+                        let l = line.len();
+                        survivor_count += l as u32;
+                        row_count += rows_for_line(l as i64, wrap_w, p.wrap_mode) as u64;
+                        let line_max_seg = if l >= fu {
+                            seg_adv_table[fu - 1]
+                        } else {
+                            seg_adv_table[l]
+                        };
+                        if line_max_seg as f64 > max_row_extent {
+                            max_row_extent = line_max_seg as f64;
+                        }
+                        col = 0;
+                        seg_adv = 0.0;
+                        pos = if nl_pos < bytes.len() { nl_pos + 1 } else { nl_pos };
+                        continue;
+                    }
+
+                    for i in pos..nl_pos {
+                        let r = match resolve_byte_char(bytes, i, trie, bitmap_adv, em_height_fu, &mut trailer_until) {
+                            Some(r) => r,
+                            None => continue,
+                        };
+
+                        let item_rel_x = seg_adv as f64;
+                        if item_rel_x > max_row_extent {
+                            max_row_extent = item_rel_x;
+                        }
+
+                        if r.glyph_id != 0 {
+                            survivor_count += 1;
+                        }
+
+                        col += 1;
+                        if col % fold_unit == 0 {
+                            seg_adv = 0.0;
+                        } else {
+                            seg_adv += r.advance;
+                        }
+                    }
+                    row_count += rows_for_line(col, wrap_w, p.wrap_mode) as u64;
+
+                    if nl_pos < bytes.len() {
+                        let item_rel_x = seg_adv as f64;
+                        if item_rel_x > max_row_extent {
+                            max_row_extent = item_rel_x;
+                        }
+                        col = 0;
+                        seg_adv = 0.0;
+                        pos = nl_pos + 1;
+                    } else {
+                        pos = nl_pos;
+                    }
+                }
+            }
+
+            ItemPrepass {
+                survivor_count,
+                max_row_extent,
+                row_count: u32::try_from(row_count).expect("item row count exceeds u32"),
+            }
+        })
+        .collect()
+}
+
+/// The Derived line table: item `i`'s rows `0..row_count[i]` at
+/// `line_bases[i]..`, each `{ item_idx: group_id, row }`. A pure function of
+/// Pass 1, so it runs concurrently with Pass 2. Every row gets an entry, even
+/// one no survivor lands on — the cost of knowing the bases up front, 8 B a row.
+fn build_line_table(
+    items: &[LayoutItem<'_>],
+    prepasses: &[ItemPrepass],
+    line_bases: &[u32],
+) -> Vec<LineRecord> {
+    let total = prepasses.iter().map(|p| p.row_count as usize).sum::<usize>();
+    if total == 0 {
+        return vec![LineRecord { item_idx: 0, row: 0 }];
+    }
+    let mut table: Vec<LineRecord> = Vec::with_capacity(total);
+    let spare = &mut table.spare_capacity_mut()[..total];
+    let mut pieces = Vec::with_capacity(items.len());
+    let mut rest = spare;
+    for pre in prepasses {
+        let (head, tail) = rest.split_at_mut(pre.row_count as usize);
+        pieces.push(head);
+        rest = tail;
+    }
+    debug_assert!(line_bases.len() == items.len());
+    pieces
+        .into_par_iter()
+        .zip(items.par_iter())
+        .for_each(|(piece, item)| {
+            for (row, slot) in piece.iter_mut().enumerate() {
+                slot.write(LineRecord { item_idx: item.group_id, row: row as u32 });
+            }
+        });
+    // SAFETY: the pieces partition exactly `total` slots and each was written.
+    unsafe { table.set_len(total) };
+    table
+}
 
 impl crate::layout::VerifyLayout for HyperLayout {
     fn layout_validated_items_recording(
@@ -511,6 +617,115 @@ mod tests {
         // Verify arena_flat now has identical colors to arena_spanned
         let flat_updated_colors: Vec<u32> = arena_flat.instances().iter().map(|s| s.color).collect();
         assert_eq!(flat_updated_colors, spanned_colors);
+    }
+
+    /// The direct Derived emission (Pass 2 writing 20 B `DerivedSlot`s with
+    /// final `line_idx` from Pass 1's row counts) must agree slot for slot
+    /// with the host path it replaced: 48 B records transcoded afterwards.
+    /// Covers unfolded, WrapBack and WrapDown folds, a wrap-heavy line, an
+    /// empty item, and an emoji (non-ASCII) item.
+    #[test]
+    fn derived_direct_emission_matches_host_transcode() {
+        use bytemuck::Zeroable;
+        use crate::fold::WrapMode;
+        use crate::layout::{ItemParams, Paint};
+        let long_line: Vec<u8> = b"0123456789abcdefghij".repeat(40);
+        let mut wrapped = b"short\n".to_vec();
+        wrapped.extend_from_slice(&long_line);
+        wrapped.extend_from_slice(b"\n\n  tail line\nno newline at end");
+        let emoji = "smile \u{1F600} ok\nflag \u{1F1FA}\u{1F1F8} x\n".as_bytes().to_vec();
+        let plain = b"fn main() {\n    let x = 1;\n}\n".to_vec();
+        let bodies: Vec<(&[u8], ItemParams)> = vec![
+            (&plain, ItemParams { line_height: 1.25, ..Default::default() }),
+            (
+                &wrapped,
+                ItemParams {
+                    line_height: 1.25,
+                    wrap_width: 37,
+                    wrap_mode: WrapMode::Back,
+                    z_step: 0.15,
+                    origin_z: 2.0,
+                    ..Default::default()
+                },
+            ),
+            (
+                &wrapped,
+                ItemParams {
+                    line_height: 1.25,
+                    wrap_width: 23,
+                    wrap_mode: WrapMode::Down,
+                    z_step: 0.15,
+                    ..Default::default()
+                },
+            ),
+            (b"", ItemParams { line_height: 1.25, ..Default::default() }),
+            (&emoji, ItemParams { line_height: 1.25, wrap_width: 8, z_step: 0.1, ..Default::default() }),
+        ];
+        let items: Vec<LayoutItem<'_>> = bodies
+            .iter()
+            .enumerate()
+            .map(|(i, (bytes, params))| LayoutItem {
+                bytes,
+                params: *params,
+                group_id: i as u32,
+                paint: Paint::Flat(0x1234_5678 + i as u32),
+            })
+            .collect();
+
+        // Host path: neutral 48 B records.
+        let mut hyper = HyperLayout::new();
+        let mut arena = GlyphArena::new();
+        let host_places = hyper.layout_items(&items, &mut arena).expect("host layout");
+        let host = arena.instances();
+
+        // Direct path: Pass 1 + DerivedEmit into a host Vec.
+        let trie = crate::default_trie();
+        let em_height_fu = trie.metrics.em_height_fu;
+        let bitmap_adv = fu_to_world(trie.bitmap_advance_fu, em_height_fu);
+        let prepasses = pass1_prepass(&items, &trie, bitmap_adv, em_height_fu);
+        let mut slot_bases = Vec::new();
+        let mut line_bases = Vec::new();
+        let (mut slots_acc, mut lines_acc) = (0u32, 0u32);
+        for p in &prepasses {
+            slot_bases.push(slots_acc);
+            line_bases.push(lines_acc);
+            slots_acc += p.survivor_count;
+            lines_acc += p.row_count;
+        }
+        assert_eq!(slots_acc as usize, host.len());
+        let mut direct = vec![DerivedSlot::zeroed(); host.len()];
+        let inputs = EmitInputs {
+            items: &items,
+            prepasses: &prepasses,
+            slot_bases: &slot_bases,
+            line_bases: &line_bases,
+            trie: &trie,
+            bitmap_adv,
+            em_height_fu,
+        };
+        let (out, _pairs) = inputs.run::<DerivedEmit>(direct.as_mut_ptr() as usize);
+        let line_table = build_line_table(&items, &prepasses, &line_bases);
+        assert_eq!(line_table.len(), lines_acc as usize);
+
+        assert_eq!(out.placements.len(), host_places.len());
+        for (a, b) in out.placements.iter().zip(&host_places) {
+            assert_eq!((a.slot_base, a.slot_count), (b.slot_base, b.slot_count));
+        }
+        for (k, (d, h)) in direct.iter().zip(host).enumerate() {
+            let p = &items[h.group_id as usize].params;
+            let want_wrap = if p.z_step.abs() > 1e-6 {
+                ((p.origin_z as f32 - h.pos[2]) / p.z_step as f32).round().max(0.0) as u32
+            } else {
+                0
+            };
+            let line = line_table[d.line_idx as usize];
+            assert_eq!(d.x.to_bits(), h.pos[0].to_bits(), "slot {k}: x");
+            assert_eq!(d.glyph_and_wrap & 0xFFFF, h.glyph_id & 0xFFFF, "slot {k}: glyph");
+            assert_eq!(d.glyph_and_wrap >> 16, want_wrap, "slot {k}: wrap segment");
+            assert_eq!(d.color, h.color, "slot {k}: color");
+            assert_eq!(d.group_id, h.group_id, "slot {k}: group");
+            assert_eq!((line.item_idx, line.row), (h.group_id, h.row), "slot {k}: line");
+        }
     }
 }
 

@@ -294,6 +294,7 @@ fn build_scene_impl(
                 cluster_mode: *cluster_mode,
                 layout_mode: *layout_mode,
                 color_mode: *color_mode,
+                field_mode,
                 ..Default::default()
             };
             let t_visual_start = std::time::Instant::now();
@@ -328,11 +329,7 @@ fn build_scene_impl(
                     &params,
                     *strategy,
                     *verify,
-                    if field_mode == glyph_field::GlyphFieldMode::Derived {
-                        None
-                    } else {
-                        Some(ctx)
-                    },
+                    Some(ctx),
                     arena,
                     None,
                 );

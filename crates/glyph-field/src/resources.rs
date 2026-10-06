@@ -18,7 +18,7 @@
 //! | 6       | emoji sheet (filterable 2D array)| fragment          |
 //! | 7       | emoji sampler                    | fragment          |
 
-use crate::{GlyphInstance, ItemParamsGpu};
+use crate::{GlyphInstance, ItemParamsGpu, LineRecord};
 
 /// The frame uniform's binding (the camera block).
 pub const BINDING_FRAME_UNIFORM: u32 = 0;
@@ -74,6 +74,10 @@ pub enum SlotSource<'a> {
         /// When the chunks are one contiguous host-visible mapping, its base
         /// address — lets bulk color writes skip the queue.
         mapped_base: Option<usize>,
+        /// The Derived format's `{item_idx, row}` table its slots index
+        /// (`line_idx`). None for formats that store Y/Z per slot; a Derived
+        /// field refuses a device source without one.
+        line_table: Option<&'a [LineRecord]>,
     },
     /// The engine's neutral records on the host, possibly in several slices
     /// that concatenate to the glyph sequence. The mode converts and uploads.
