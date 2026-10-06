@@ -240,6 +240,9 @@ pub struct Cli {
     /// engine's batched output — the fence the load-path flip rides on.
     #[arg(long, value_name = "DIR")]
     pub cubecl_repo_check: Option<PathBuf>,
+    /// P2 Spike: verify bit-exactness of vertex-stage Y and Z derivation on GPU
+    #[arg(long, value_name = "DIR")]
+    pub spike_vertex_yz: Option<PathBuf>,
     /// Windowed only: how frames reach the display. `fifo` (the default) is
     /// vsync, so the FPS line reads the monitor's refresh; `mailbox` and
     /// `immediate` uncap it where the surface supports them (else fifo, and

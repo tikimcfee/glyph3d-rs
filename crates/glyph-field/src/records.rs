@@ -32,19 +32,19 @@ pub struct GlyphInstance {
     pub _pad: u32,
 }
 
-/// Group table row — 5 vec4s, 80 B, the web's GROUP_STRIDE=5 schema
-/// (glyphVertex.js): offset / quat / color+alpha / scale+colorBlend / clip.
+/// Group table row — 6 vec4s, 96 B, extended from the web's GROUP_STRIDE=5 schema
+/// (glyphVertex.js): offset / quat / color+alpha / scale+colorBlend / clip / bg_color.
 /// Every mode's shader binds the same table (binding 2), so a group verb is
 /// mode-neutral by construction.
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable, encase::ShaderType)]
 pub struct GroupRow {
-    pub cols: [[f32; 4]; 5],
+    pub cols: [[f32; 4]; 6],
 }
 
 impl GroupRow {
     /// Identity pose at `offset`: unit quat, white opaque color, unit scale,
-    /// colorBlend 0 (multiply), clip disabled.
+    /// colorBlend 0 (multiply), clip disabled, transparent background.
     pub fn identity(offset: [f32; 3]) -> Self {
         Self {
             cols: [
@@ -53,6 +53,7 @@ impl GroupRow {
                 [1.0, 1.0, 1.0, 1.0],
                 [1.0, 1.0, 1.0, 0.0],
                 [0.0, 0.0, 0.0, 0.0],
+                [0.0, 0.0, 0.0, 0.0], // bg_color
             ],
         }
     }
@@ -113,8 +114,8 @@ mod layout_tests {
 
     #[test]
     fn group_row_size_and_offsets() {
-        assert_eq!(<GroupRow as ShaderSize>::SHADER_SIZE.get(), 80, "GROUP_STRIDE=5 vec4s");
-        assert_eq!(std::mem::size_of::<GroupRow>(), 80);
+        assert_eq!(<GroupRow as ShaderSize>::SHADER_SIZE.get(), 96, "GROUP_STRIDE=6 vec4s");
+        assert_eq!(std::mem::size_of::<GroupRow>(), 96);
         assert_eq!(GroupRow::METADATA.offset(0), 0, "cols offset");
     }
 
@@ -147,11 +148,12 @@ mod layout_tests {
                 [0.25, 0.5, 0.75, 1.0],
                 [2.0, 2.0, 2.0, 0.0],
                 [-1.0, -2.0, 1e10, f32::MIN_POSITIVE],
+                [0.1, 0.2, 0.3, 0.4],
             ],
         };
         let mut buf = Vec::<u8>::new();
         encase::StorageBuffer::new(&mut buf).write(&row).unwrap();
-        assert_eq!(buf.len(), 80);
+        assert_eq!(buf.len(), 96);
         assert_eq!(&buf[..], bytemuck::bytes_of(&row), "GroupRow bytes");
     }
 }

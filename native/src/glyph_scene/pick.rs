@@ -71,6 +71,12 @@ pub enum Verb {
     TintCycle,
     SetHidden(bool),
     ToggleHidden,
+    /// Set a per-glyph background color (RGBA) by allocating/repointing its group.
+    SetGlyphBackground([f32; 4]),
+    /// Set a per-glyph transform (translation, rotation quat, scale) by repointing its group.
+    SetGlyphTransform([f32; 3], [f32; 4], [f32; 3]),
+    /// Reset a glyph's group back to its original file group.
+    ResetGlyphGroup,
 }
 
 /// A resolved glyph within a file.
@@ -595,12 +601,29 @@ impl GlyphScene {
             .map(|f| Selection::Segment { slot_base: f.slot_base, slot_count: f.slot_count })
     }
 
-    /// Upload one edited group row (80 B) — never the whole table.
+    /// Upload one edited group row (96 B) — never the whole table.
     pub(super) fn write_group_row(&self, ctx: &GpuContext, gid: u32) {
         if let Some(g) = self.groups_cpu.get(gid as usize) {
             ctx.queue
-                .write_buffer(&self.group_buf, gid as u64 * 80, bytemuck::bytes_of(g));
+                .write_buffer(&self.group_buf, gid as u64 * 96, bytemuck::bytes_of(g));
         }
+    }
+
+    /// Find an existing matching group row or allocate a new one (up to max_groups).
+    pub(super) fn allocate_group_row(&mut self, ctx: &GpuContext, row: crate::glyph_scene::GroupRow) -> Option<u32> {
+        let max_groups = (self.group_buf.size() / 96) as u32;
+        for (i, r) in self.groups_cpu.iter().enumerate() {
+            if bytemuck::bytes_of(r) == bytemuck::bytes_of(&row) {
+                return Some(i as u32);
+            }
+        }
+        if (self.groups_cpu.len() as u32) < max_groups {
+            let gid = self.groups_cpu.len() as u32;
+            self.groups_cpu.push(row);
+            self.write_group_row(ctx, gid);
+            return Some(gid);
+        }
+        None
     }
 
     pub(super) fn write_group_rows(&self, ctx: &GpuContext, gids: &[u32]) {
@@ -621,7 +644,7 @@ impl GlyphScene {
             let slice = &self.groups_cpu[min_gid..=max_gid];
             ctx.queue.write_buffer(
                 &self.group_buf,
-                min_gid as u64 * 80,
+                min_gid as u64 * 96,
                 bytemuck::cast_slice(slice),
             );
         } else {
@@ -876,6 +899,60 @@ impl GlyphScene {
                 let rgb = crate::repo::DIR_TINTS[(step as usize) % crate::repo::DIR_TINTS.len()];
                 let line = self.apply_verb(ctx, &Verb::TintGroup(rgb));
                 format!("{line} [palette step {step}]")
+            }
+            Verb::SetGlyphBackground(bg_rgba) => {
+                let Some(g) = &glyph else {
+                    return format!("verb set-glyph-background: {rel} pick has no glyph");
+                };
+                let Some(slot) = g.slot else {
+                    return format!("verb set-glyph-background: {rel} '{}' is blank (no instance)", g.ch);
+                };
+                // Read the glyph's CURRENT group (to inherit its TRS/tint)
+                let current_gid = if let Some(_) = self.geom_overrides.get(&slot) {
+                    gid // we don't currently track group_id overrides in geom_overrides, so use hit.group_id
+                } else {
+                    gid
+                };
+                
+                let mut row = self.groups_cpu.get(current_gid as usize).copied().unwrap_or(crate::glyph_scene::GroupRow::identity([0.0; 3]));
+                row.cols[5] = *bg_rgba; // Set background color
+                
+                if let Some(new_gid) = self.allocate_group_row(ctx, row) {
+                    self.field.write_group_id(&ctx.queue, slot, new_gid);
+                    format!("verb set-glyph-background: {rel} row {} col {} slot {slot} -> group {new_gid}", g.row, g.col)
+                } else {
+                    format!("verb set-glyph-background: {rel} out of groups (max {})", self.group_buf.size() / 96)
+                }
+            }
+            Verb::SetGlyphTransform(t, q, s) => {
+                let Some(g) = &glyph else {
+                    return format!("verb set-glyph-transform: {rel} pick has no glyph");
+                };
+                let Some(slot) = g.slot else {
+                    return format!("verb set-glyph-transform: {rel} '{}' is blank (no instance)", g.ch);
+                };
+                let mut row = self.groups_cpu.get(gid as usize).copied().unwrap_or(crate::glyph_scene::GroupRow::identity([0.0; 3]));
+                row.cols[0] = [t[0], t[1], t[2], 0.0];
+                row.cols[1] = *q;
+                row.cols[3] = [s[0], s[1], s[2], row.cols[3][3]];
+                
+                if let Some(new_gid) = self.allocate_group_row(ctx, row) {
+                    self.field.write_group_id(&ctx.queue, slot, new_gid);
+                    format!("verb set-glyph-transform: {rel} row {} col {} slot {slot} -> group {new_gid}", g.row, g.col)
+                } else {
+                    format!("verb set-glyph-transform: {rel} out of groups (max {})", self.group_buf.size() / 96)
+                }
+            }
+            Verb::ResetGlyphGroup => {
+                let Some(g) = &glyph else {
+                    return format!("verb reset-glyph-group: {rel} pick has no glyph");
+                };
+                let Some(slot) = g.slot else {
+                    return format!("verb reset-glyph-group: {rel} '{}' is blank (no instance)", g.ch);
+                };
+                // Reset to the file's original group
+                self.field.write_group_id(&ctx.queue, slot, gid);
+                format!("verb reset-glyph-group: {rel} row {} col {} slot {slot} -> group {gid}", g.row, g.col)
             }
             Verb::SetHidden(hide) => {
                 let Some(g) = self.groups_cpu.get_mut(gid as usize) else {

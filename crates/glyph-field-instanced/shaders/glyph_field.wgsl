@@ -45,7 +45,7 @@
 
 const MAX_CURVES: u32 = 256u;
 const TEX_W: i32 = 1024;
-const GROUP_STRIDE: u32 = 5u; // vec4s per group row (glyphVertex.js GROUP_STRIDE)
+const GROUP_STRIDE: u32 = 6u; // vec4s per group row (extended from glyphVertex.js GROUP_STRIDE=5)
 
 // Per-instance glyph slot — 32 B / 8 lanes, the endpoint form (note 23):
 // what remains of the web's stride-11 byte-slot layout once the dead lanes
@@ -120,6 +120,7 @@ struct VsOut {
     @location(6) emoji_uv: vec2<f32>,
     @location(7) @interpolate(flat) emoji_layer: u32,
     @location(8) group_rgb: vec3<f32>,
+    @location(9) bg_color: vec4<f32>,
 };
 
 @vertex
@@ -157,7 +158,7 @@ fn vs_main(
     // anchored at inst.pos — same shape as scaled+alignOffset+iPos in the web.
     let aligned = vec3<f32>(c.x * quad_w, (c.y - 0.5) * inst.height, 0.0) + inst.pos;
 
-    // Group table row (5 vec4s): offset / quat / color+alpha / scale+colorBlend / clip.
+    // Group table row (6 vec4s): offset / quat / color+alpha / scale+colorBlend / clip / bg_color.
     // Robust storage access CLAMPS OOB reads — so clamp here AND cull below,
     // exactly like the web's explicit bound check.
     let grow = min(inst.group_id, params.max_groups - 1u);
@@ -167,6 +168,7 @@ fn vs_main(
     let gcolor = groups[gbase + 2u]; // col 2: color.rgb + alpha
     let gscale = groups[gbase + 3u]; // col 3: scale.xyz + colorBlend (w)
     let gclip = groups[gbase + 4u];  // col 4: clipTop, clipBottom, clipEnabled
+    let gbg = groups[gbase + 5u];    // col 5: bg_color.rgba
 
     // World = rotate(quat, aligned * groupScale) + groupOffset  (T·R·S).
     let local = aligned * gscale.xyz;
@@ -230,6 +232,7 @@ fn vs_main(
     out.emoji_uv = emoji_uv;
     out.emoji_layer = emoji_layer;
     out.group_rgb = gcolor.rgb;
+    out.bg_color = gbg;
     return out;
 }
 
@@ -331,9 +334,8 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     }
 
     // Empty glyph (space / .notdef): no ink.
-    if in.curve_count == 0u {
-        discard;
-    }
+    // If it has a background, we still need to draw the background.
+    // We'll compute cov=0 and let the background blend take over.
 
     // Pixel footprint in glyph-UV space, per axis — resolution-independent AA.
     let fw = fwidth(in.glyph_uv);
@@ -343,21 +345,23 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     // em_px is the on-screen pixel height of the character cell (1.0 / fw.y).
     let em_px = 1.0 / max(fw.y, 1e-4);
     var greek = 0.0;
-    if params.greek_mode == 1u {
-        // Smooth transition over [full..onset]
-        let onset = params.greek_onset_px;
-        let full = onset * 0.45;
-        let t = clamp((onset - em_px) / max(onset - full, 0.01), 0.0, 1.0);
-        greek = t * t * (3.0 - 2.0 * t);
-    } else if params.greek_mode == 2u {
-        // Pure bypass: instant cut below onset, eliminating all Bézier curve ALU & texture loads
-        if em_px <= params.greek_onset_px {
-            greek = 1.0;
+    if in.curve_count > 0u {
+        if params.greek_mode == 1u {
+            // Smooth transition over [full..onset]
+            let onset = params.greek_onset_px;
+            let full = onset * 0.45;
+            let t = clamp((onset - em_px) / max(onset - full, 0.01), 0.0, 1.0);
+            greek = t * t * (3.0 - 2.0 * t);
+        } else if params.greek_mode == 2u {
+            // Pure bypass: instant cut below onset, eliminating all Bézier curve ALU & texture loads
+            if em_px <= params.greek_onset_px {
+                greek = 1.0;
+            }
         }
     }
 
     var cov = 0.0;
-    if greek < 1.0 {
+    if greek < 1.0 && in.curve_count > 0u {
         // Minification amount m, smoothstep-ramped over [min_lo, min_hi].
         let fw_max = max(fw.x, fw.y);
         var m = clamp((fw_max - params.min_lo) / (params.min_hi - params.min_lo), 0.0, 1.0);
@@ -386,7 +390,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         cov = clamp(coverage * 0.5, 0.0, 1.0);
     }
 
-    if greek > 0.0 {
+    if greek > 0.0 && in.curve_count > 0u {
         // Greeking ink bar: continuous horizontal word bars with analytic AA.
         // In y: spans baseline (0.20) to cap-height (0.75).
         // In x: spans full cell [0.0, 1.0] so adjacent word characters connect seamlessly.
@@ -400,16 +404,20 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         cov = mix(cov, bar_cov, greek);
     }
 
-    let alpha = cov * in.group_alpha;
-    if alpha <= 0.0 {
+    let fg_alpha = cov * in.group_alpha;
+    let bg_alpha = in.bg_color.a * in.group_alpha;
+
+    if fg_alpha <= 0.0 && bg_alpha <= 0.0 {
         discard;
     }
 
-    // Colors are authored as display (sRGB) values; decode to linear — the
-    // sRGB target's hardware encode round-trips them back to authored.
-    // Output is PREMULTIPLIED (pipeline blends ONE / OneMinusSrcAlpha): the
-    // web's vColor·cov with alpha=cov under three's NormalBlending applies cov
-    // twice at edges; premultiplied is the correct coverage composite.
-    let rgb = pow(in.color, vec3<f32>(2.2)) * alpha;
-    return vec4<f32>(rgb, alpha);
+    // Colors are authored as display (sRGB) values; decode to linear.
+    let fg_rgb = pow(in.color, vec3<f32>(2.2)) * fg_alpha;
+    let bg_rgb = pow(in.bg_color.rgb, vec3<f32>(2.2)) * bg_alpha;
+
+    // A over B: fg over bg
+    let out_alpha = fg_alpha + bg_alpha * (1.0 - fg_alpha);
+    let out_rgb = fg_rgb + bg_rgb * (1.0 - fg_alpha);
+
+    return vec4<f32>(out_rgb, out_alpha);
 }

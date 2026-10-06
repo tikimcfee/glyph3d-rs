@@ -66,6 +66,9 @@ pub trait GlyphField {
     /// Resize one glyph's cell.
     fn write_extent(&self, queue: &wgpu::Queue, slot: u32, advance: f32, height: f32);
 
+    /// Change the group ID for one glyph.
+    fn write_group_id(&self, queue: &wgpu::Queue, slot: u32, group_id: u32);
+
     // ── bulk verbs ─────────────────────────────────────────────────────
 
     /// Rewrite the full placement of the contiguous slots

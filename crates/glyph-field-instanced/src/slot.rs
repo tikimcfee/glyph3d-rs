@@ -30,6 +30,8 @@ pub const SLOT_BYTES: u64 = std::mem::size_of::<RenderSlot>() as u64;
 pub const POSITION_OFFSET: u64 = 0;
 /// Byte offset of `color` (4 B) within a slot.
 pub const COLOR_OFFSET: u64 = 16;
+/// Byte offset of `group_id` (4 B) within a slot.
+pub const GROUP_ID_OFFSET: u64 = 20;
 /// Byte offset of `advance` (4 B, with `height` immediately after) within a slot.
 pub const EXTENT_OFFSET: u64 = 24;
 

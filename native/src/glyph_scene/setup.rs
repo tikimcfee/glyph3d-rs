@@ -58,12 +58,15 @@ impl GlyphScene {
         let t_scene_start = std::time::Instant::now();
         let binding_limit = ctx.device.limits().max_storage_buffer_binding_size as usize;
         let instances_len = arena.len();
-        let group_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        
+        let max_groups = 65536;
+        let group_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("group table"),
-            contents: bytemuck::cast_slice(&groups),
-            // Stage G: COPY_DST for partial per-row edit uploads (80 B/row).
+            size: (max_groups * std::mem::size_of::<GroupRow>()) as u64,
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
         });
+        ctx.queue.write_buffer(&group_buf, 0, bytemuck::cast_slice(&groups));
         log::info!(
             "emoji sheet bound: {} cells, {} mip levels, {:.1} MiB",
             atlas.emoji.sheet.cells.len(),
@@ -85,7 +88,7 @@ impl GlyphScene {
         });
         let sheet = &atlas.emoji.sheet;
         let params = Params {
-            max_groups: groups.len() as u32,
+            max_groups: max_groups as u32,
             greek_mode: 2,
             _pad1: 0,
             _pad2: 0,

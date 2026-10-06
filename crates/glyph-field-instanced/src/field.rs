@@ -179,6 +179,10 @@ impl GlyphField for InstancedField {
         self.storage.write_field(queue, slot, EXTENT_OFFSET, bytemuck::cast_slice(&[advance, height]));
     }
 
+    fn write_group_id(&self, queue: &wgpu::Queue, slot: u32, group_id: u32) {
+        self.storage.write_field(queue, slot, crate::slot::GROUP_ID_OFFSET, &group_id.to_le_bytes());
+    }
+
     fn write_placements(&self, queue: &wgpu::Queue, first_slot: u32, placements: &[GlyphPlacement]) {
         let slots: Vec<RenderSlot> = placements.iter().map(RenderSlot::from).collect();
         self.storage.write_slots(queue, first_slot, &slots);
