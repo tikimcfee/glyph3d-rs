@@ -220,6 +220,7 @@ fn main() {
                     no_ui,
                     shot,
                     present_mode,
+                    frames,
                 } => {
                     windowed::run(
                         ctx,
@@ -230,6 +231,7 @@ fn main() {
                         shot,
                         present_mode.into(),
                         None,
+                        frames,
                     );
                 }
             }

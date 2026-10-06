@@ -19,7 +19,7 @@ fn parse(args: &[&str]) -> Cli {
 fn defaults_match_old_parser() {
     let cli = parse(&[]);
     assert!(cli.screenshot.is_none());
-    assert_eq!(cli.frames, 1);
+    assert_eq!(cli.frames, None);
     assert!(!cli.demo);
     assert!(cli.render_file.is_none());
     assert_eq!(cli.copies, 1);
@@ -102,7 +102,7 @@ fn scalar_flags_parse() {
     assert!(cli.gpu_key);
     assert!(cli.gpu_profile);
     assert_eq!(cli.screenshot, Some(PathBuf::from("out.png")));
-    assert_eq!(cli.frames, 2);
+    assert_eq!(cli.frames, Some(2));
     assert!(cli.demo);
     assert_eq!(cli.copies, 3);
     assert_eq!(cli.zoom, 2.5);
@@ -536,6 +536,70 @@ fn cli_action_dispatch_variants() {
         }
         other => panic!("expected Render, got {other:?}"),
     }
+
+    // 7. Render: Offscreen default frames (1)
+    let cli = parse(&["--screenshot", "out.png"]);
+    match cli.action() {
+        CliCommand::Render(plan) => match plan.target {
+            RenderTarget::Offscreen { frames, .. } => {
+                assert_eq!(frames, 1);
+            }
+            _ => panic!("expected Offscreen"),
+        },
+        other => panic!("expected Render, got {other:?}"),
+    }
+
+    // 8. Render: Windowed with frames
+    let cli = parse(&["--frames", "1"]);
+    match cli.action() {
+        CliCommand::Render(plan) => match plan.target {
+            RenderTarget::Windowed { frames, .. } => {
+                assert_eq!(frames, Some(1));
+            }
+            _ => panic!("expected Windowed"),
+        },
+        other => panic!("expected Render, got {other:?}"),
+    }
+
+    // 9. Render: Windowed without frames
+    let cli = parse(&[]);
+    match cli.action() {
+        CliCommand::Render(plan) => match plan.target {
+            RenderTarget::Windowed { frames, .. } => {
+                assert_eq!(frames, None);
+            }
+            _ => panic!("expected Windowed"),
+        },
+        other => panic!("expected Render, got {other:?}"),
+    }
+}
+
+#[test]
+fn launch_config_frames_merging() {
+    let tmp = std::env::temp_dir().join(format!("test_launch_cfg_frames_{}.toml", std::process::id()));
+    std::fs::write(
+        &tmp,
+        r#"
+        frames = 1
+        "#,
+    )
+    .expect("write temp config");
+
+    let cli = parse(&[
+        "--launch-config",
+        tmp.to_str().unwrap(),
+    ]);
+    assert_eq!(cli.frames, Some(1));
+
+    let cli_override = parse(&[
+        "--launch-config",
+        tmp.to_str().unwrap(),
+        "--frames",
+        "5",
+    ]);
+    assert_eq!(cli_override.frames, Some(5));
+
+    let _ = std::fs::remove_file(&tmp);
 }
 
 

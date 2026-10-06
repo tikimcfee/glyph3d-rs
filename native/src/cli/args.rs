@@ -84,9 +84,9 @@ pub struct Cli {
     /// Offscreen: render to PATH (PNG), print timing, exit 0
     #[arg(long, value_name = "PATH")]
     pub screenshot: Option<PathBuf>,
-    /// Frames to render offscreen
-    #[arg(long, value_name = "N", default_value_t = 1)]
-    pub frames: u32,
+    /// Frames to render before exiting (offscreen and windowed)
+    #[arg(long, value_name = "N")]
+    pub frames: Option<u32>,
     /// Stage A quad-field demo instead of the text field
     #[arg(long)]
     pub demo: bool,
@@ -500,6 +500,13 @@ pub fn parse_cli_from(matches: clap::ArgMatches) -> Cli {
                 {
                     if let Some(session) = cfg.agent_session {
                         cli.agent_session = Some(session);
+                    }
+                }
+                if matches.value_source("frames")
+                    != Some(clap::parser::ValueSource::CommandLine)
+                {
+                    if let Some(f) = cfg.frames {
+                        cli.frames = Some(f);
                     }
                 }
             }

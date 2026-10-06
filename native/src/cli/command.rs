@@ -87,6 +87,7 @@ pub enum RenderTarget {
         no_ui: bool,
         shot: Option<(u64, PathBuf)>,
         present_mode: PresentMode,
+        frames: Option<u32>,
     },
 }
 
@@ -236,7 +237,7 @@ impl Cli {
         let target = match &self.screenshot {
             Some(path) => RenderTarget::Offscreen {
                 path: path.clone(),
-                frames: self.frames,
+                frames: self.frames.unwrap_or(1),
                 zoom: self.zoom,
             },
             None => {
@@ -245,6 +246,7 @@ impl Cli {
                     no_ui: self.no_ui,
                     shot,
                     present_mode: self.present_mode,
+                    frames: self.frames,
                 }
             }
         };

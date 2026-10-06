@@ -128,6 +128,7 @@ pub fn run(
     shot: Option<(u64, std::path::PathBuf)>,
     present_mode: wgpu::PresentMode,
     live: Option<LiveSource>,
+    frames: Option<u32>,
 ) {
     // Without the `egui-ui` feature the overlay is compiled out entirely;
     // the flag is accepted (and ignored) so the CLI is identical either way.
@@ -147,6 +148,7 @@ pub fn run(
         ui,
         shot,
         present_mode,
+        frames,
     };
     event_loop.run_app(&mut app).expect("event loop error");
 }

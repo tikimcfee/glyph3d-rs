@@ -192,6 +192,8 @@ pub(super) struct App<'a> {
     /// refresh (75 on the first Linux box, 2026-09-07 — a number that says
     /// nothing about the renderer). Applied only if the surface offers it.
     pub(super) present_mode: wgpu::PresentMode,
+    /// Stop after N presented frames.
+    pub(super) frames: Option<u32>,
 }
 
 impl App<'_> {
@@ -447,6 +449,12 @@ impl ApplicationHandler for App<'_> {
                     apply_relayout(&self.ctx, &mut self.choice, self.cull_opts, self.ui, state, req);
                 }
                 state.render(&self.ctx);
+                if let Some(max_frames) = self.frames {
+                    if state.frames_total >= max_frames as u64 {
+                        event_loop.exit();
+                        return;
+                    }
+                }
                 #[cfg(feature = "egui-ui")]
                 if let Some(req) = state.pending_relayout.take() {
                     apply_relayout(&self.ctx, &mut self.choice, self.cull_opts, self.ui, state, req);

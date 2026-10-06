@@ -70,17 +70,21 @@ pub(super) fn decode(
                 if len > 0u32 {
                     // decode_codepoint_at, transcribed (reads past the end
                     // are zero, continuations never validated).
-                    let byte1 = byte_from_pair(curr_word, next_word, lane + 1, byte_index + 1, total_bytes);
-                    let byte2 = byte_from_pair(curr_word, next_word, lane + 2, byte_index + 2, total_bytes);
-                    let byte3 = byte_from_pair(curr_word, next_word, lane + 3, byte_index + 3, total_bytes);
                     let codepoint = if len == 1u32 {
                         lead_byte
-                    } else if len == 2u32 {
-                        ((lead_byte & 0x1Fu32) << 6u32) | (byte1 & 0x3Fu32)
-                    } else if len == 3u32 {
-                        ((lead_byte & 0x0Fu32) << 12u32) | ((byte1 & 0x3Fu32) << 6u32) | (byte2 & 0x3Fu32)
                     } else {
-                        ((lead_byte & 0x07u32) << 18u32) | ((byte1 & 0x3Fu32) << 12u32) | ((byte2 & 0x3Fu32) << 6u32) | (byte3 & 0x3Fu32)
+                        let byte1 = byte_from_pair(curr_word, next_word, lane + 1, byte_index + 1, total_bytes);
+                        if len == 2u32 {
+                            ((lead_byte & 0x1Fu32) << 6u32) | (byte1 & 0x3Fu32)
+                        } else {
+                            let byte2 = byte_from_pair(curr_word, next_word, lane + 2, byte_index + 2, total_bytes);
+                            if len == 3u32 {
+                                ((lead_byte & 0x0Fu32) << 12u32) | ((byte1 & 0x3Fu32) << 6u32) | (byte2 & 0x3Fu32)
+                            } else {
+                                let byte3 = byte_from_pair(curr_word, next_word, lane + 3, byte_index + 3, total_bytes);
+                                ((lead_byte & 0x07u32) << 18u32) | ((byte1 & 0x3Fu32) << 12u32) | ((byte2 & 0x3Fu32) << 6u32) | (byte3 & 0x3Fu32)
+                            }
+                        }
                     };
                     let block = if codepoint <= 0x10FFFFu32 {
                         block_index[(codepoint >> block_shift) as usize]
@@ -215,17 +219,21 @@ pub(super) fn decode_probe(
                     0u32
                 };
                 if len > 0u32 {
-                    let byte1 = byte_from_pair(curr_word, next_word, lane + 1, byte_index + 1, total_bytes);
-                    let byte2 = byte_from_pair(curr_word, next_word, lane + 2, byte_index + 2, total_bytes);
-                    let byte3 = byte_from_pair(curr_word, next_word, lane + 3, byte_index + 3, total_bytes);
                     let codepoint = if len == 1u32 {
                         lead_byte
-                    } else if len == 2u32 {
-                        ((lead_byte & 0x1Fu32) << 6u32) | (byte1 & 0x3Fu32)
-                    } else if len == 3u32 {
-                        ((lead_byte & 0x0Fu32) << 12u32) | ((byte1 & 0x3Fu32) << 6u32) | (byte2 & 0x3Fu32)
                     } else {
-                        ((lead_byte & 0x07u32) << 18u32) | ((byte1 & 0x3Fu32) << 12u32) | ((byte2 & 0x3Fu32) << 6u32) | (byte3 & 0x3Fu32)
+                        let byte1 = byte_from_pair(curr_word, next_word, lane + 1, byte_index + 1, total_bytes);
+                        if len == 2u32 {
+                            ((lead_byte & 0x1Fu32) << 6u32) | (byte1 & 0x3Fu32)
+                        } else {
+                            let byte2 = byte_from_pair(curr_word, next_word, lane + 2, byte_index + 2, total_bytes);
+                            if len == 3u32 {
+                                ((lead_byte & 0x0Fu32) << 12u32) | ((byte1 & 0x3Fu32) << 6u32) | (byte2 & 0x3Fu32)
+                            } else {
+                                let byte3 = byte_from_pair(curr_word, next_word, lane + 3, byte_index + 3, total_bytes);
+                                ((lead_byte & 0x07u32) << 18u32) | ((byte1 & 0x3Fu32) << 12u32) | ((byte2 & 0x3Fu32) << 6u32) | (byte3 & 0x3Fu32)
+                            }
+                        }
                     };
                     let block = if codepoint <= 0x10FFFFu32 {
                         block_index[(codepoint >> block_shift) as usize]
@@ -253,26 +261,22 @@ pub(super) fn decode_probe(
                             0u32
                         });
 
-                    let mut item_start_byte = 0usize;
-                    let mut item_end_byte = 0usize;
-                    let mut cluster_enabled = false;
-                    if item_count > 0 {
-                        let item_index = item_search(item_record_bounds, item_count, byte_index);
-                        item_start_byte = item_record_bounds[item_index * 2] as usize;
-                        item_end_byte = item_record_bounds[item_index * 2 + 1] as usize;
-                        cluster_enabled = item_cluster_enabled[item_index] != 0;
+                    let is_sz = is_static_zero(codepoint);
+                    let mut is_candidate_head = 0u32;
+                    if is_sz == 0u32 && codepoint <= 0x10FFFFu32 {
+                        is_candidate_head = (bitmap[(codepoint >> 5u32) as usize] >> (codepoint & 0x1Fu32)) & 1u32;
                     }
-                    if cluster_enabled && byte_index >= item_start_byte && byte_index < item_end_byte {
-                        if is_static_zero(codepoint) != 0u32 {
-                            
-                            
-                            flag = (flag & !F_SURVIVOR) | F_CLUSTER_TRAILER;
-                        } else {
-                            let mut bit = 0u32;
-                            if codepoint <= 0x10FFFFu32 {
-                                bit = (bitmap[(codepoint >> 5u32) as usize] >> (codepoint & 0x1Fu32)) & 1u32;
-                            }
-                            if bit != 0u32 {
+
+                    if (is_sz != 0u32 || is_candidate_head != 0u32) && item_count > 0 {
+                        let item_index = item_search(item_record_bounds, item_count, byte_index);
+                        let item_start_byte = item_record_bounds[item_index * 2] as usize;
+                        let item_end_byte = item_record_bounds[item_index * 2 + 1] as usize;
+                        let cluster_enabled = item_cluster_enabled[item_index] != 0;
+
+                        if cluster_enabled && byte_index >= item_start_byte && byte_index < item_end_byte {
+                            if is_sz != 0u32 {
+                                flag = (flag & !F_SURVIVOR) | F_CLUSTER_TRAILER;
+                            } else {
                                 let mut search_byte_pos = byte_index + len as usize;
                                 let mut second_codepoint = 0u32;
                                 let mut is_hunting = 1u32;

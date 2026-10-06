@@ -266,12 +266,13 @@ fn run_live(
     glyph3d_native::windowed::run(
         ctx,
         choice,
-        true,
+        glyph3d_native::SceneCullOptions { cull: true, ..Default::default() },
         &[],
         true,
         None,
         wgpu::PresentMode::AutoVsync,
         Some(live),
+        None,
     );
     Ok(())
 }

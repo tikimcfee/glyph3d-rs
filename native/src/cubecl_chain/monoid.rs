@@ -206,23 +206,19 @@ pub(super) fn is_survivor(glyph_flag: u32) -> bool {
 }
 
 #[cube]
-pub(super) fn leaf_of(
-    glyph_flags: &[u32],
+pub(super) fn leaf_from_flag(
+    glyph_flag: u32,
     advance: f32,
     wrap_width: i32,
     wrap_mode: i32,
     is_item_reset: i32,
     cell_advance_bits: u32,
-    byte_index: usize,
 ) -> ChainElem {
     let mut element = identity();
     element.reset = is_item_reset;
     element.wrap = wrap_width;
     element.mode = wrap_mode;
-    // An item reset is a clean break BEFORE this byte: a clean leader here
-    // still starts the new run with length 1.
     element.clean_break = is_item_reset;
-    let glyph_flag = flags_at(glyph_flags, byte_index);
     if (glyph_flag & F_LEADER) != 0 {
         element.glyphs = 1;
         if is_survivor(glyph_flag) {
@@ -243,6 +239,20 @@ pub(super) fn leaf_of(
         }
     }
     element
+}
+
+#[cube]
+pub(super) fn leaf_of(
+    glyph_flags: &[u32],
+    advance: f32,
+    wrap_width: i32,
+    wrap_mode: i32,
+    is_item_reset: i32,
+    cell_advance_bits: u32,
+    byte_index: usize,
+) -> ChainElem {
+    let glyph_flag = flags_at(glyph_flags, byte_index);
+    leaf_from_flag(glyph_flag, advance, wrap_width, wrap_mode, is_item_reset, cell_advance_bits)
 }
 
 #[cube]

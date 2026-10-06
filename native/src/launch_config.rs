@@ -26,6 +26,7 @@ pub struct LaunchConfig {
     pub claude_projects_dir: Option<PathBuf>,
     pub antigravity_brain_dir: Option<PathBuf>,
     pub agent_session: Option<PathBuf>,
+    pub frames: Option<u32>,
 }
 
 impl LaunchConfig {
@@ -143,6 +144,11 @@ impl LaunchConfig {
                 "agent_session" => {
                     cfg.agent_session = Some(PathBuf::from(strip_quotes(val)));
                 }
+                "frames" => {
+                    cfg.frames = Some(val.parse::<u32>().map_err(|e| {
+                        format!("line {}: invalid integer for frames: {e}", line_idx + 1)
+                    })?);
+                }
                 _ => {
                     // Unknown keys are ignored for forward-compatibility
                 }
@@ -226,6 +232,7 @@ mod tests {
             claude_projects_dir = "~/my_claude_projects"
             antigravity_brain_dir = "~/my_antigravity_brain"
             agent_session = "~/sessions/my_session.jsonl"
+            frames = 1
         "#;
         let cfg = LaunchConfig::from_toml_str(toml).expect("parse failed");
         assert_eq!(cfg.file_backgrounds, Some(true));
@@ -245,6 +252,7 @@ mod tests {
         assert_eq!(cfg.claude_projects_dir, Some(PathBuf::from("~/my_claude_projects")));
         assert_eq!(cfg.antigravity_brain_dir, Some(PathBuf::from("~/my_antigravity_brain")));
         assert_eq!(cfg.agent_session, Some(PathBuf::from("~/sessions/my_session.jsonl")));
+        assert_eq!(cfg.frames, Some(1));
     }
 
     #[test]
