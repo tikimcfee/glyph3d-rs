@@ -28,6 +28,7 @@ use crate::{gpu_key, gpu_profile, is_current, root, Manifest};
 pub enum TargetMode {
     Repo,
     File,
+    Agent,
     Demo,
 }
 
@@ -82,8 +83,10 @@ pub enum FocusField {
     RepoPath,
     FocusFile,
     FilePath,
+    SessionPath,
     LayoutMode,
     WrapMode,
+    ZWrapSpacing,
     RepoEngine,
     ColorMode,
     ClusterMode,
@@ -101,8 +104,10 @@ impl FocusField {
         FocusField::RepoPath,
         FocusField::FocusFile,
         FocusField::FilePath,
+        FocusField::SessionPath,
         FocusField::LayoutMode,
         FocusField::WrapMode,
+        FocusField::ZWrapSpacing,
         FocusField::RepoEngine,
         FocusField::ColorMode,
         FocusField::ClusterMode,
@@ -117,7 +122,10 @@ impl FocusField {
     pub fn is_text_input(self) -> bool {
         matches!(
             self,
-            FocusField::RepoPath | FocusField::FocusFile | FocusField::FilePath
+            FocusField::RepoPath
+                | FocusField::FocusFile
+                | FocusField::FilePath
+                | FocusField::SessionPath
         )
     }
 
@@ -148,10 +156,18 @@ impl FocusField {
             FocusField::RepoPath | FocusField::FocusFile | FocusField::LayoutMode
             | FocusField::RepoEngine => target == TargetMode::Repo,
             FocusField::FilePath => target == TargetMode::File,
+            FocusField::SessionPath => target == TargetMode::Agent,
+            FocusField::ZWrapSpacing => target != TargetMode::Demo,
             _ => true,
         }
     }
 }
+
+pub const REPO_PRESETS: &[&str] = &[
+    ".",
+    "/Users/lugo/localdev/viz-web/glyph3d-js",
+    "native/fixtures/g-pick-repo",
+];
 
 #[derive(Debug, Deserialize, Default)]
 struct FileLaunchConfig {
@@ -166,6 +182,7 @@ struct FileLaunchConfig {
     load_repo: Option<String>,
     repo_engine: Option<String>,
     field_mode: Option<String>,
+    agent_session: Option<String>,
 }
 
 pub struct LauncherState {
@@ -173,6 +190,7 @@ pub struct LauncherState {
     pub repo_path: String,
     pub focus_file: String,
     pub file_path: String,
+    pub session_path: String,
     pub layout_mode: LayoutMode,
     pub wrap_mode: WrapMode,
     pub color_mode: ColorMode,
@@ -191,12 +209,72 @@ pub struct LauncherState {
 }
 
 impl LauncherState {
+    pub fn discover_agent_sessions() -> Vec<String> {
+        let mut sessions = Vec::new();
+        let home = match std::env::var("HOME") {
+            Ok(h) => PathBuf::from(h),
+            Err(_) => return sessions,
+        };
+
+        // 1. Antigravity brain transcripts
+        let brain_dir = home.join(".gemini/antigravity/brain");
+        if let Ok(entries) = std::fs::read_dir(&brain_dir) {
+            let mut found = Vec::new();
+            for entry in entries.flatten() {
+                let transcript = entry.path().join(".system_generated/logs/transcript.jsonl");
+                if transcript.is_file() {
+                    if let Ok(meta) = transcript.metadata() {
+                        if let Ok(mtime) = meta.modified() {
+                            found.push((mtime, transcript));
+                        }
+                    }
+                }
+            }
+            found.sort_by_key(|a| std::cmp::Reverse(a.0));
+            for (_, p) in found.into_iter().take(10) {
+                sessions.push(p.display().to_string());
+            }
+        }
+
+        // 2. Claude projects transcripts
+        let claude_dir = home.join(".claude/projects");
+        if let Ok(entries) = std::fs::read_dir(&claude_dir) {
+            let mut found = Vec::new();
+            for entry in entries.flatten() {
+                if entry.path().is_dir() {
+                    if let Ok(files) = std::fs::read_dir(entry.path()) {
+                        for f in files.flatten() {
+                            if f.path().extension().and_then(|s| s.to_str()) == Some("jsonl") {
+                                if let Ok(meta) = f.metadata() {
+                                    if let Ok(mtime) = meta.modified() {
+                                        found.push((mtime, f.path()));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            found.sort_by_key(|a| std::cmp::Reverse(a.0));
+            for (_, p) in found.into_iter().take(10) {
+                sessions.push(p.display().to_string());
+            }
+        }
+
+        sessions
+    }
+
     pub fn new() -> Self {
+        let default_session = Self::discover_agent_sessions()
+            .into_iter()
+            .next()
+            .unwrap_or_default();
         let mut state = Self {
             target: TargetMode::Repo,
             repo_path: ".".to_string(),
             focus_file: String::new(),
             file_path: "native/src/main.rs".to_string(),
+            session_path: default_session,
             layout_mode: LayoutMode::Shelf,
             wrap_mode: WrapMode::Back,
             color_mode: ColorMode::Syntax,
@@ -206,7 +284,7 @@ impl LauncherState {
             file_backgrounds: true,
             greeking: true,
             cull: true,
-            field_mode: FieldMode::Instanced,
+            field_mode: FieldMode::Derived,
             ui_overlay: true,
             z_wrap_spacing: 0.15,
             focus: FocusField::TargetMode,
@@ -276,6 +354,11 @@ impl LauncherState {
                                 _ => FieldMode::Instanced,
                             };
                         }
+                        if let Some(asess) = cfg.agent_session {
+                            if !asess.trim().is_empty() {
+                                self.session_path = asess;
+                            }
+                        }
                         self.config_source = Some(path.display().to_string());
                         self.status_message = format!("Loaded defaults from {}", path.display());
                         return;
@@ -301,14 +384,14 @@ impl LauncherState {
                     args.push(self.focus_file.clone());
                 }
                 match self.layout_mode {
-                    LayoutMode::Shelf => args.push("--layout-mode".to_string()),
+                    LayoutMode::Shelf => {
+                        args.push("--layout-mode".to_string());
+                        args.push("shelf".to_string());
+                    }
                     LayoutMode::Carrel => {
                         args.push("--layout-mode".to_string());
                         args.push("carrel".to_string());
                     }
-                }
-                if self.layout_mode == LayoutMode::Shelf {
-                    args.push("shelf".to_string());
                 }
                 args.push("--repo-engine".to_string());
                 args.push(match self.repo_engine {
@@ -326,9 +409,25 @@ impl LauncherState {
                     self.file_path.clone()
                 });
             }
+            TargetMode::Agent => {
+                args.push("--agent-session".to_string());
+                args.push(if self.session_path.trim().is_empty() {
+                    Self::discover_agent_sessions()
+                        .into_iter()
+                        .next()
+                        .unwrap_or_else(|| "transcript.jsonl".to_string())
+                } else {
+                    self.session_path.clone()
+                });
+            }
             TargetMode::Demo => {
                 args.push("--demo".to_string());
             }
+        }
+
+        if self.target != TargetMode::Demo {
+            args.push("--z-wrap-spacing".to_string());
+            args.push(format!("{:.2}", self.z_wrap_spacing));
         }
 
         args.push("--wrap-mode".to_string());
@@ -389,8 +488,18 @@ impl LauncherState {
             FocusField::TargetMode => {
                 self.target = match self.target {
                     TargetMode::Repo => TargetMode::File,
-                    TargetMode::File => TargetMode::Demo,
+                    TargetMode::File => TargetMode::Agent,
+                    TargetMode::Agent => TargetMode::Demo,
                     TargetMode::Demo => TargetMode::Repo,
+                };
+            }
+            FocusField::ZWrapSpacing => {
+                self.z_wrap_spacing = match (self.z_wrap_spacing * 100.0).round() as i32 {
+                    10 => 0.15,
+                    15 => 0.25,
+                    25 => 0.50,
+                    50 => 0.10,
+                    _ => 0.15,
                 };
             }
             FocusField::LayoutMode => {
@@ -450,7 +559,7 @@ impl LauncherState {
             FocusField::UiOverlay => {
                 self.ui_overlay = !self.ui_overlay;
             }
-            FocusField::RepoPath | FocusField::FocusFile | FocusField::FilePath => {}
+            FocusField::RepoPath | FocusField::FocusFile | FocusField::FilePath | FocusField::SessionPath => {}
         }
     }
 
@@ -459,9 +568,35 @@ impl LauncherState {
             FocusField::TargetMode => {
                 self.target = match self.target {
                     TargetMode::Repo => TargetMode::File,
-                    TargetMode::File => TargetMode::Demo,
+                    TargetMode::File => TargetMode::Agent,
+                    TargetMode::Agent => TargetMode::Demo,
                     TargetMode::Demo => TargetMode::Repo,
                 };
+            }
+            FocusField::RepoPath => {
+                let idx = REPO_PRESETS.iter().position(|&p| p == self.repo_path);
+                let next_idx = match idx {
+                    Some(i) => (i + 1) % REPO_PRESETS.len(),
+                    None => 0,
+                };
+                self.repo_path = REPO_PRESETS[next_idx].to_string();
+            }
+            FocusField::SessionPath => {
+                let sessions = Self::discover_agent_sessions();
+                if !sessions.is_empty() {
+                    let idx = sessions.iter().position(|s| s == &self.session_path);
+                    let next_idx = match idx {
+                        Some(i) => (i + 1) % sessions.len(),
+                        None => 0,
+                    };
+                    self.session_path = sessions[next_idx].clone();
+                }
+            }
+            FocusField::ZWrapSpacing => {
+                self.z_wrap_spacing = ((self.z_wrap_spacing + 0.05) * 100.0).round() / 100.0;
+                if self.z_wrap_spacing > 2.0 {
+                    self.z_wrap_spacing = 2.0;
+                }
             }
             FocusField::LayoutMode => {
                 self.layout_mode = LayoutMode::Carrel;
@@ -495,7 +630,7 @@ impl LauncherState {
             FocusField::Cull => self.cull = true,
             FocusField::FieldMode => self.field_mode = FieldMode::Derived,
             FocusField::UiOverlay => self.ui_overlay = true,
-            FocusField::RepoPath | FocusField::FocusFile | FocusField::FilePath => {}
+            FocusField::FocusFile | FocusField::FilePath => {}
         }
     }
 
@@ -505,8 +640,34 @@ impl LauncherState {
                 self.target = match self.target {
                     TargetMode::Repo => TargetMode::Demo,
                     TargetMode::File => TargetMode::Repo,
-                    TargetMode::Demo => TargetMode::File,
+                    TargetMode::Agent => TargetMode::File,
+                    TargetMode::Demo => TargetMode::Agent,
                 };
+            }
+            FocusField::RepoPath => {
+                let idx = REPO_PRESETS.iter().position(|&p| p == self.repo_path);
+                let prev_idx = match idx {
+                    Some(i) => if i == 0 { REPO_PRESETS.len() - 1 } else { i - 1 },
+                    None => REPO_PRESETS.len() - 1,
+                };
+                self.repo_path = REPO_PRESETS[prev_idx].to_string();
+            }
+            FocusField::SessionPath => {
+                let sessions = Self::discover_agent_sessions();
+                if !sessions.is_empty() {
+                    let idx = sessions.iter().position(|s| s == &self.session_path);
+                    let prev_idx = match idx {
+                        Some(i) => if i == 0 { sessions.len() - 1 } else { i - 1 },
+                        None => sessions.len() - 1,
+                    };
+                    self.session_path = sessions[prev_idx].clone();
+                }
+            }
+            FocusField::ZWrapSpacing => {
+                self.z_wrap_spacing = ((self.z_wrap_spacing - 0.05) * 100.0).round() / 100.0;
+                if self.z_wrap_spacing < 0.01 {
+                    self.z_wrap_spacing = 0.01;
+                }
             }
             FocusField::LayoutMode => {
                 self.layout_mode = LayoutMode::Shelf;
@@ -540,7 +701,7 @@ impl LauncherState {
             FocusField::Cull => self.cull = false,
             FocusField::FieldMode => self.field_mode = FieldMode::Instanced,
             FocusField::UiOverlay => self.ui_overlay = false,
-            FocusField::RepoPath | FocusField::FocusFile | FocusField::FilePath => {}
+            FocusField::FocusFile | FocusField::FilePath => {}
         }
     }
 }
@@ -628,6 +789,7 @@ fn run_loop(
                             FocusField::RepoPath => state.repo_path.push(' '),
                             FocusField::FocusFile => state.focus_file.push(' '),
                             FocusField::FilePath => state.file_path.push(' '),
+                            FocusField::SessionPath => state.session_path.push(' '),
                             _ => {}
                         }
                     } else {
@@ -635,15 +797,19 @@ fn run_loop(
                     }
                 }
                 KeyCode::Char('b') | KeyCode::Char('B') if !state.focus.is_text_input() => {
-                    // Build action
-                    run_external_action(terminal, "Building products...", || {
+                    // Build action: build with --features cubecl
+                    run_external_action(terminal, "Building glyph3d-native (with --features cubecl)...", || {
                         let _ = Command::new("cargo")
-                            .arg("glyph")
                             .arg("build")
+                            .arg("--release")
+                            .arg("-p")
+                            .arg("glyph3d-native")
+                            .arg("--features")
+                            .arg("cubecl")
                             .current_dir(root())
                             .status();
                     });
-                    state.status_message = "Build completed.".to_string();
+                    state.status_message = "Build completed (release + cubecl).".to_string();
                 }
                 KeyCode::Char('t') | KeyCode::Char('T') if !state.focus.is_text_input() => {
                     // Test gates
@@ -688,6 +854,9 @@ fn run_loop(
                     FocusField::FilePath => {
                         state.file_path.pop();
                     }
+                    FocusField::SessionPath => {
+                        state.session_path.pop();
+                    }
                     _ => {}
                 },
                 KeyCode::Char(c) => match state.focus {
@@ -699,6 +868,9 @@ fn run_loop(
                     }
                     FocusField::FilePath => {
                         state.file_path.push(c);
+                    }
+                    FocusField::SessionPath => {
+                        state.session_path.push(c);
                     }
                     _ => {}
                 },
@@ -837,6 +1009,8 @@ fn draw_target_section(f: &mut Frame, area: Rect, state: &LauncherState) {
         Span::raw(" "),
         format_radio("File", state.target == TargetMode::File, is_focused),
         Span::raw(" "),
+        format_radio("Agent", state.target == TargetMode::Agent, is_focused),
+        Span::raw(" "),
         format_radio("Demo", state.target == TargetMode::Demo, is_focused),
     ]));
 
@@ -856,13 +1030,14 @@ fn draw_target_section(f: &mut Frame, area: Rect, state: &LauncherState) {
                     },
                 ),
                 Span::styled(
-                    format!("{:<25}", if state.repo_path.is_empty() { "." } else { &state.repo_path }),
+                    format!("{:<22}", if state.repo_path.is_empty() { "." } else { &state.repo_path }),
                     if repo_focused {
                         Style::default().bg(Color::Blue).fg(Color::White).bold()
                     } else {
                         Style::default().fg(Color::Yellow)
                     },
                 ),
+                Span::styled(" (◄/► presets)", Style::default().fg(Color::DarkGray)),
             ]));
             lines.push(Line::from(vec![
                 line_prefix(focus_file_focused),
@@ -910,6 +1085,33 @@ fn draw_target_section(f: &mut Frame, area: Rect, state: &LauncherState) {
                 Span::styled("Staged directly via Slug WGSL pipeline", Style::default().fg(Color::DarkGray)),
             ]));
         }
+        TargetMode::Agent => {
+            let session_focused = state.focus == FocusField::SessionPath;
+            lines.push(Line::from(vec![
+                line_prefix(session_focused),
+                Span::styled(
+                    "Session:",
+                    if session_focused {
+                        Style::default().fg(Color::Cyan).bold()
+                    } else {
+                        Style::default().fg(Color::DarkGray)
+                    },
+                ),
+                Span::raw(" "),
+                Span::styled(
+                    format!("{:<28}", if state.session_path.is_empty() { "(press ◄/► to pick recent)" } else { &state.session_path }),
+                    if session_focused {
+                        Style::default().bg(Color::Blue).fg(Color::White).bold()
+                    } else {
+                        Style::default().fg(Color::Yellow)
+                    },
+                ),
+            ]));
+            lines.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled("3D Rolodex deck & Carrel navigation (◄/► recent)", Style::default().fg(Color::DarkGray)),
+            ]));
+        }
         TargetMode::Demo => {
             lines.push(Line::from(vec![
                 Span::raw("  "),
@@ -928,6 +1130,7 @@ fn draw_target_section(f: &mut Frame, area: Rect, state: &LauncherState) {
             | FocusField::RepoPath
             | FocusField::FocusFile
             | FocusField::FilePath
+            | FocusField::SessionPath
     );
 
     let block = Block::default()
@@ -945,6 +1148,7 @@ fn draw_target_section(f: &mut Frame, area: Rect, state: &LauncherState) {
 fn draw_layout_section(f: &mut Frame, area: Rect, state: &LauncherState) {
     let is_layout = state.focus == FocusField::LayoutMode;
     let is_wrap = state.focus == FocusField::WrapMode;
+    let is_z_spacing = state.focus == FocusField::ZWrapSpacing;
     let is_engine = state.focus == FocusField::RepoEngine;
     let is_color = state.focus == FocusField::ColorMode;
     let is_cluster = state.focus == FocusField::ClusterMode;
@@ -953,7 +1157,7 @@ fn draw_layout_section(f: &mut Frame, area: Rect, state: &LauncherState) {
         Line::from(vec![
             line_prefix(is_layout),
             Span::styled(
-                "Layout:  ",
+                "Layout:   ",
                 if is_layout {
                     Style::default().fg(Color::Cyan).bold()
                 } else {
@@ -967,7 +1171,7 @@ fn draw_layout_section(f: &mut Frame, area: Rect, state: &LauncherState) {
         Line::from(vec![
             line_prefix(is_wrap),
             Span::styled(
-                "Wrap:    ",
+                "Wrap:     ",
                 if is_wrap {
                     Style::default().fg(Color::Cyan).bold()
                 } else {
@@ -979,9 +1183,23 @@ fn draw_layout_section(f: &mut Frame, area: Rect, state: &LauncherState) {
             format_choice("down (cols)", state.wrap_mode == WrapMode::Down, is_wrap),
         ]),
         Line::from(vec![
+            line_prefix(is_z_spacing),
+            Span::styled(
+                "Z Spacing:",
+                if is_z_spacing {
+                    Style::default().fg(Color::Cyan).bold()
+                } else {
+                    Style::default().fg(Color::DarkGray)
+                },
+            ),
+            Span::raw(" "),
+            format_dial(state.z_wrap_spacing, is_z_spacing),
+            Span::styled(" × em cell (◄/► dial)", Style::default().fg(Color::DarkGray)),
+        ]),
+        Line::from(vec![
             line_prefix(is_engine),
             Span::styled(
-                "Engine:  ",
+                "Engine:   ",
                 if is_engine {
                     Style::default().fg(Color::Cyan).bold()
                 } else {
@@ -999,7 +1217,7 @@ fn draw_layout_section(f: &mut Frame, area: Rect, state: &LauncherState) {
         Line::from(vec![
             line_prefix(is_color),
             Span::styled(
-                "Color:   ",
+                "Color:    ",
                 if is_color {
                     Style::default().fg(Color::Cyan).bold()
                 } else {
@@ -1013,7 +1231,7 @@ fn draw_layout_section(f: &mut Frame, area: Rect, state: &LauncherState) {
         Line::from(vec![
             line_prefix(is_cluster),
             Span::styled(
-                "Cluster: ",
+                "Cluster:  ",
                 if is_cluster {
                     Style::default().fg(Color::Cyan).bold()
                 } else {
@@ -1030,6 +1248,7 @@ fn draw_layout_section(f: &mut Frame, area: Rect, state: &LauncherState) {
         state.focus,
         FocusField::LayoutMode
             | FocusField::WrapMode
+            | FocusField::ZWrapSpacing
             | FocusField::RepoEngine
             | FocusField::ColorMode
             | FocusField::ClusterMode
@@ -1264,6 +1483,8 @@ fn draw_footer(f: &mut Frame, area: Rect) {
         Span::styled("Reload Config  ", Style::default().fg(Color::White)),
         Span::styled(" [Space] ", Style::default().bg(Color::DarkGray).fg(Color::White).bold()),
         Span::styled("Toggle  ", Style::default().fg(Color::White)),
+        Span::styled(" [◄/►] ", Style::default().bg(Color::Cyan).fg(Color::Black).bold()),
+        Span::styled("Adjust/Preset  ", Style::default().fg(Color::White)),
         Span::styled(" [Q / Esc] ", Style::default().bg(Color::Red).fg(Color::White).bold()),
         Span::styled("Quit", Style::default().fg(Color::White)),
     ]);
@@ -1295,6 +1516,15 @@ fn format_choice<'a>(label: &'a str, selected: bool, focused: bool) -> Span<'a> 
     }
 }
 
+fn format_dial<'a>(val: f64, focused: bool) -> Span<'a> {
+    let text = format!("[◄ {:.2} ►]", val);
+    if focused {
+        Span::styled(text, Style::default().bg(Color::Cyan).fg(Color::Black).bold())
+    } else {
+        Span::styled(text, Style::default().fg(Color::Yellow).bold())
+    }
+}
+
 fn format_toggle(enabled: bool, focused: bool) -> Span<'static> {
     if enabled {
         if focused {
@@ -1320,6 +1550,7 @@ mod tests {
         assert!(args.contains(&"--load-repo".to_string()));
         assert!(args.contains(&"--wrap-mode".to_string()));
         assert!(args.contains(&"--color-mode".to_string()));
+        assert!(args.contains(&"--z-wrap-spacing".to_string()));
     }
 
     #[test]
@@ -1330,6 +1561,8 @@ mod tests {
         state.toggle_current();
         assert_eq!(state.target, TargetMode::File);
         state.toggle_current();
+        assert_eq!(state.target, TargetMode::Agent);
+        state.toggle_current();
         assert_eq!(state.target, TargetMode::Demo);
         state.toggle_current();
         assert_eq!(state.target, TargetMode::Repo);
@@ -1338,16 +1571,18 @@ mod tests {
     #[test]
     fn test_focus_navigation_skips_inapplicable() {
         let mut focus = FocusField::TargetMode;
-        // In Repo mode, FilePath should be skipped
+        // In Repo mode, FilePath and SessionPath should be skipped
         let mut visited = Vec::new();
         for _ in 0..FocusField::ALL.len() {
             focus = focus.next(TargetMode::Repo);
             visited.push(focus);
         }
         assert!(!visited.contains(&FocusField::FilePath));
+        assert!(!visited.contains(&FocusField::SessionPath));
         assert!(visited.contains(&FocusField::RepoPath));
+        assert!(visited.contains(&FocusField::ZWrapSpacing));
 
-        // In File mode, RepoPath and FocusFile should be skipped
+        // In File mode, RepoPath, FocusFile, and SessionPath should be skipped
         focus = FocusField::TargetMode;
         visited.clear();
         for _ in 0..FocusField::ALL.len() {
@@ -1356,7 +1591,20 @@ mod tests {
         }
         assert!(!visited.contains(&FocusField::RepoPath));
         assert!(!visited.contains(&FocusField::FocusFile));
+        assert!(!visited.contains(&FocusField::SessionPath));
         assert!(visited.contains(&FocusField::FilePath));
+
+        // In Agent mode, RepoPath, FocusFile, and FilePath should be skipped
+        focus = FocusField::TargetMode;
+        visited.clear();
+        for _ in 0..FocusField::ALL.len() {
+            focus = focus.next(TargetMode::Agent);
+            visited.push(focus);
+        }
+        assert!(!visited.contains(&FocusField::RepoPath));
+        assert!(!visited.contains(&FocusField::FocusFile));
+        assert!(!visited.contains(&FocusField::FilePath));
+        assert!(visited.contains(&FocusField::SessionPath));
     }
 
     #[test]
@@ -1365,6 +1613,43 @@ mod tests {
         state.target = TargetMode::Demo;
         let preview = state.command_preview();
         assert!(preview.starts_with("glyph3d-native --demo"));
+    }
+
+    #[test]
+    fn test_agent_session_build_args() {
+        let mut state = LauncherState::new();
+        state.target = TargetMode::Agent;
+        state.session_path = "/path/to/my_transcript.jsonl".to_string();
+        let args = state.build_cli_args();
+        assert!(args.contains(&"--agent-session".to_string()));
+        assert!(args.contains(&"/path/to/my_transcript.jsonl".to_string()));
+        assert!(args.contains(&"--z-wrap-spacing".to_string()));
+    }
+
+    #[test]
+    fn test_z_wrap_spacing_dial() {
+        let mut state = LauncherState::new();
+        state.focus = FocusField::ZWrapSpacing;
+        state.z_wrap_spacing = 0.15;
+        state.cycle_next();
+        assert_eq!(state.z_wrap_spacing, 0.20);
+        state.cycle_prev();
+        assert_eq!(state.z_wrap_spacing, 0.15);
+        state.toggle_current();
+        assert_eq!(state.z_wrap_spacing, 0.25);
+    }
+
+    #[test]
+    fn test_repo_preset_cycling() {
+        let mut state = LauncherState::new();
+        state.focus = FocusField::RepoPath;
+        state.repo_path = ".".to_string();
+        state.cycle_next();
+        assert_eq!(state.repo_path, "/Users/lugo/localdev/viz-web/glyph3d-js");
+        state.cycle_next();
+        assert_eq!(state.repo_path, "native/fixtures/g-pick-repo");
+        state.cycle_next();
+        assert_eq!(state.repo_path, ".");
     }
 
     #[test]
@@ -1403,10 +1688,11 @@ mod tests {
 
         // FieldMode: Left = Instanced, Right = Derived
         state.focus = FocusField::FieldMode;
+        state.cycle_prev();
         assert_eq!(state.field_mode, FieldMode::Instanced);
         state.cycle_next();
         assert_eq!(state.field_mode, FieldMode::Derived);
-        state.cycle_prev();
+        state.toggle_current();
         assert_eq!(state.field_mode, FieldMode::Instanced);
         state.toggle_current();
         assert_eq!(state.field_mode, FieldMode::Derived);

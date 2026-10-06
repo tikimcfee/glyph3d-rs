@@ -31,20 +31,20 @@ cluster_mode = "cluster"
 color_mode = "flat"
 
 # Layout engine backend: "hyper" (parallel CPU Rayon, default) or "cubecl" (GPU compute)
-# repo_engine = "hyper"
+repo_engine = "hyper"
 
-# Glyph field render mode: "instanced" (32B slots, default) or "derived" (compact 20B slots)
-# field_mode = "derived"
+# Glyph field render mode: "derived" (compact 20B slots, zero-copy, recommended) or "instanced" (32B slots)
+field_mode = "derived"
 
 # Debug flags
 no_cull = false
 no_ui = false
 
 # Default repository to open if none specified on CLI (optional)
-# load_repo = "fixtures/g-pick-repo"
+# load_repo = "native/fixtures/g-pick-repo"
 
 # Default agent session transcript path to load at startup (optional)
-# agent_session = "~/.gemini/antigravity/brain/3857a1e2-a1c0-4a52-b86c-8f7b82e0bd18/.system_generated/logs/transcript.jsonl"
+# agent_session = "~/.gemini/antigravity/brain/dfb37967-e8f7-4c18-b1aa-52d838c6f9c3/.system_generated/logs/transcript.jsonl"
 
 # Custom directory locations for Claude Code and Antigravity session discovery (optional)
 # claude_projects_dir = "~/.claude/projects"
