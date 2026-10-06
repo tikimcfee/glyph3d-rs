@@ -908,11 +908,7 @@ impl GlyphScene {
                     return format!("verb set-glyph-background: {rel} '{}' is blank (no instance)", g.ch);
                 };
                 // Read the glyph's CURRENT group (to inherit its TRS/tint)
-                let current_gid = if let Some(_) = self.geom_overrides.get(&slot) {
-                    gid // we don't currently track group_id overrides in geom_overrides, so use hit.group_id
-                } else {
-                    gid
-                };
+                let current_gid = gid;
                 
                 let mut row = self.groups_cpu.get(current_gid as usize).copied().unwrap_or(crate::glyph_scene::GroupRow::identity([0.0; 3]));
                 row.cols[5] = *bg_rgba; // Set background color

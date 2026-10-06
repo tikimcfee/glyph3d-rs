@@ -884,6 +884,8 @@ impl RepoLoad {
                 log::warn!("focus: no file path contains {needle:?} — fitting the whole field");
             }
         }
+        let gpu_item_params: Vec<glyph_field::ItemParamsGpu> =
+            pick_files.iter().map(|f| glyph_field::ItemParamsGpu::from(&f.item)).collect();
         StagedText {
             glyphs_emitted: self.arena.len(),
             codepoints_decoded: self.stats.records,
@@ -906,6 +908,7 @@ impl RepoLoad {
                 folds: std::collections::HashMap::new(),
             }),
             controller: self.controller,
+            item_params: gpu_item_params,
         }
     }
 

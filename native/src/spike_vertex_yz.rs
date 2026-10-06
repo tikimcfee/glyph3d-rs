@@ -345,7 +345,7 @@ pub fn evaluate_slots_on_gpu(
     });
     let items_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("spike items"),
-        contents: bytemuck::cast_slice(&gpu_items),
+        contents: bytemuck::cast_slice(gpu_items),
         usage: wgpu::BufferUsages::STORAGE,
     });
     let uniforms = SpikeUniforms {

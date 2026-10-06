@@ -33,7 +33,7 @@ mod resources;
 
 pub use field::{split_at_chunks, GlyphField};
 pub use mode::{GlyphFieldMode, ParseGlyphFieldModeError};
-pub use records::{GlyphInstance, GlyphPlacement, GroupRow};
+pub use records::{GlyphInstance, GlyphPlacement, GroupRow, ItemParamsGpu, LineRecord};
 pub use resources::{
     shared_bind_group_entries, shared_layout_entries, FieldResources, FieldTargets, SlotChunk,
     SlotSource, BINDING_FRAME_UNIFORM, BINDING_SLOTS,

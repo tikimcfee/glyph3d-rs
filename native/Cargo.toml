@@ -19,6 +19,7 @@ wgpu = "30"
 # owning its slot format, upload, WGSL and pipelines.
 glyph-field = { path = "../crates/glyph-field" }
 glyph-field-instanced = { path = "../crates/glyph-field-instanced" }
+glyph-field-derived = { path = "../crates/glyph-field-derived" }
 winit = "0.30"
 pollster = "0.4"
 bytemuck = { version = "1", features = ["derive"] }

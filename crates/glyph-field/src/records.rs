@@ -155,5 +155,91 @@ mod layout_tests {
         encase::StorageBuffer::new(&mut buf).write(&row).unwrap();
         assert_eq!(buf.len(), 96);
         assert_eq!(&buf[..], bytemuck::bytes_of(&row), "GroupRow bytes");
+
+        let line = LineRecord {
+            item_idx: 42,
+            row: 100,
+        };
+        let mut buf = Vec::<u8>::new();
+        encase::StorageBuffer::new(&mut buf).write(&line).unwrap();
+        assert_eq!(buf.len(), 8);
+        assert_eq!(&buf[..], bytemuck::bytes_of(&line), "LineRecord bytes");
+
+        let item = ItemParamsGpu {
+            line_height: 1.0,
+            origin_y: 2.0,
+            origin_z: 3.0,
+            z_step: 0.05,
+            z_step_lo: 0.001,
+            band_stride_y: 110.0,
+            depth_per_band: 0.0,
+            depth_per_col: 0.0,
+            page_rows: 100,
+            pages_wide: 4,
+            page_cols: 0,
+            scroll_rows: 0,
+            has_page: 1,
+            line_height_lo: 0.0,
+            _pad1: 0,
+            _pad2: 0,
+        };
+        let mut buf = Vec::<u8>::new();
+        encase::StorageBuffer::new(&mut buf).write(&item).unwrap();
+        assert_eq!(buf.len(), 64);
+        assert_eq!(&buf[..], bytemuck::bytes_of(&item), "ItemParamsGpu bytes");
     }
 }
+
+/// A record in the line table: maps a logical line index to its item index and folded row.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Pod, Zeroable, encase::ShaderType)]
+pub struct LineRecord {
+    pub item_idx: u32,
+    pub row: u32,
+}
+
+/// Layout parameters per item (file) on the GPU, 64 B (16 words).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Pod, Zeroable, encase::ShaderType)]
+pub struct ItemParamsGpu {
+    pub line_height: f32,
+    pub origin_y: f32,
+    pub origin_z: f32,
+    pub z_step: f32,
+    pub z_step_lo: f32,
+    pub band_stride_y: f32,
+    pub depth_per_band: f32,
+    pub depth_per_col: f32,
+    pub page_rows: i32,
+    pub pages_wide: i32,
+    pub page_cols: i32,
+    pub scroll_rows: i32,
+    pub has_page: u32,
+    pub line_height_lo: f32,
+    pub _pad1: u32,
+    pub _pad2: u32,
+}
+
+impl Default for ItemParamsGpu {
+    fn default() -> Self {
+        Self {
+            line_height: 1.0,
+            origin_y: 0.0,
+            origin_z: 0.0,
+            z_step: 0.0,
+            z_step_lo: 0.0,
+            band_stride_y: 0.0,
+            depth_per_band: 0.0,
+            depth_per_col: 0.0,
+            page_rows: 0,
+            pages_wide: 0,
+            page_cols: 0,
+            scroll_rows: 0,
+            has_page: 0,
+            line_height_lo: 0.0,
+            _pad1: 0,
+            _pad2: 0,
+        }
+    }
+}
+

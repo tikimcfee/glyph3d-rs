@@ -81,6 +81,8 @@ pub struct StagedText {
     pub pick: Option<PickContext>,
     /// Hierarchical layout controller and spatial scene graph (repo mode).
     pub controller: Option<crate::layout_stack::LayoutController>,
+    /// GPU layout parameters per item (file) for Derived render mode.
+    pub item_params: Vec<glyph_field::ItemParamsGpu>,
 }
 
 /// Stage F: one cull segment covering a whole staged block (the text/engine
@@ -456,6 +458,13 @@ pub fn stage_file(
         segments,
         pick: None,
         controller: None,
+        item_params: vec![
+            glyph_field::ItemParamsGpu {
+                line_height: line_h,
+                ..Default::default()
+            };
+            copies as usize
+        ],
     }
 }
 
@@ -829,6 +838,7 @@ pub fn stage_records(arena: GlyphArena, placement: &ItemPlacement, slot_ink: &[O
         focus_bounds: None,
         pick: None,
         controller: None,
+        item_params: vec![glyph_field::ItemParamsGpu::default()],
     }
 }
 

@@ -18,7 +18,7 @@
 //! | 6       | emoji sheet (filterable 2D array)| fragment          |
 //! | 7       | emoji sampler                    | fragment          |
 
-use crate::GlyphInstance;
+use crate::{GlyphInstance, ItemParamsGpu};
 
 /// The frame uniform's binding (the camera block).
 pub const BINDING_FRAME_UNIFORM: u32 = 0;
@@ -35,6 +35,8 @@ pub struct FieldResources<'a> {
     pub params: &'a wgpu::Buffer,
     pub emoji_sheet: &'a wgpu::TextureView,
     pub emoji_sampler: &'a wgpu::Sampler,
+    pub glyph_advances: &'a wgpu::Buffer,
+    pub item_params: &'a [ItemParamsGpu],
 }
 
 /// The targets the field's main pipeline renders into.

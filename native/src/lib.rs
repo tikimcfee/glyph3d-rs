@@ -328,7 +328,11 @@ fn build_scene_impl(
                     &params,
                     *strategy,
                     *verify,
-                    Some(ctx),
+                    if field_mode == glyph_field::GlyphFieldMode::Derived {
+                        None
+                    } else {
+                        Some(ctx)
+                    },
                     arena,
                     None,
                 );

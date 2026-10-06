@@ -7,10 +7,11 @@ use crate::gpu::GpuContext;
 use crate::text::StagedText;
 use glyph_field::{FieldResources, FieldTargets, GlyphField, GlyphFieldMode, SlotSource};
 use glyph_field_instanced::InstancedField;
+use glyph_field_derived::DerivedField;
 use super::{
     CameraMode, CullState, FlyCamera, GlyphScene,
     cull::SegCull,
-    instance::{FrameUniform, Params, RenderSlot, GlyphInstance, GroupRow},
+    instance::{FrameUniform, Params, GlyphInstance, GroupRow},
     target::{MASK_FORMAT, POOL_FORMAT, SCENE_SAMPLE_COUNT},
     camera::FOV_Y,
     tint::seg_tint,
@@ -158,6 +159,8 @@ impl GlyphScene {
             params: &params_buf,
             emoji_sheet: &emoji_view,
             emoji_sampler: &emoji_sampler,
+            glyph_advances: &atlas.glyph_advances,
+            item_params: &staged.item_params,
         };
         let depth_format = wgpu::TextureFormat::Depth32Float;
         let targets = FieldTargets {
@@ -190,11 +193,9 @@ impl GlyphScene {
             GlyphFieldMode::Instanced => {
                 Box::new(InstancedField::new(device, &ctx.queue, source, &resources, targets))
             }
-            // The CLI refuses `derived` until the mode ships, so no caller
-            // reaches this arm; a library caller that does gets told plainly.
-            GlyphFieldMode::Derived => panic!(
-                "glyph field mode 'derived' is not implemented yet — build with GlyphFieldMode::Instanced"
-            ),
+            GlyphFieldMode::Derived => {
+                Box::new(DerivedField::new(device, &ctx.queue, source, &resources, targets))
+            }
         };
         let field_dur = t_scene_start.elapsed();
         let t_pipe_start = std::time::Instant::now();
@@ -202,7 +203,7 @@ impl GlyphScene {
             "glyph field ({}): {} instances ({} MiB) in {} chunk(s) of ≤{} ({} MiB binding limit), {} groups",
             field.mode(),
             instances_len,
-            (instances_len * std::mem::size_of::<RenderSlot>()) >> 20,
+            (instances_len * field.slot_bytes() as usize) >> 20,
             field.chunk_count(),
             field.chunk_capacity(),
             binding_limit >> 20,

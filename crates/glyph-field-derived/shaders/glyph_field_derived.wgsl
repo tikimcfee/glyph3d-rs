@@ -1,71 +1,55 @@
-// Stage C — Slug analytic-coverage glyph field.
+// glyph_field_derived.wgsl — Slug analytic-coverage text renderer in Derived mode.
 //
-// WGSL port of the web renderer's two shaders (semantics, not TSL API):
-//   vertex:   packages/glyph3d-core/src/core/glyphVertex.js
-//             (glyph-map lookup → quad sizing → per-instance position →
-//              group TRS → MVP → vertex culls)
-//   fragment: packages/glyph3d-core/src/GlyphField.js _buildOutputNode()
-//             (fractional winding-number coverage over quadratic beziers
-//              along +X and +Y rays, scaled by fwidth(glyphUV); continuous
-//              minification ramp = dilate + soften)
+// In Derived mode, instance slots are compact 20 B records:
+//   w0    x: f32                 world X coordinate (pen origin at left edge)
+//   w1    line_idx: u32          indexes line_table: array<LineRecord>
+//   w2    glyph_and_wrap: u32    low 16: glyph_id (atlas slot), high 16: wrap_segment
+//   w3    color: u32             packed sRGB RGBA8 (r in bits 0..7, a in 24..31)
+//   w4    group_id: u32          index into the group table
 //
-// Textures are Rgba32Uint, sampled with textureLoad (no filtering):
-//   glyphmap[g] = [curveStart, curveCount, mode, emojiCell]  (1 texel/slot)
-//   curves: 2 texels/curve: [P0.xy, P1.xy], [P2.xy, _, _], uint16-in-u32,
-//           normalized per-glyph-cell [0,1], y-UP (0=descender, 1=ascender).
+// Y and Z coordinates are derived in the vertex stage from line_table and item_table:
+//   line = line_table[inst.line_idx]   // { item_idx, row }
+//   item = item_table[line.item_idx]   // ItemParamsGpu (64 B)
+//   yz   = derive_yz(line.row, wrap_segment, item)
 //
-// Colour emoji (2026-09-10, out/EMOJI.md): mode==1 samples the emoji sheet —
-// an Rgba8UnormSrgb 2D-array texture of STRAIGHT-alpha cells (atlas.rs). The
-// alpha contract, stated once so another platform can check its own product:
-//   1. the sampler returns LINEAR rgb (the sRGB decode is the format's) and
-//      straight alpha, mip-filtered from levels that were box-filtered in
-//      PREMULTIPLIED space and stored straight (atlas.rs box_down_straight);
-//   2. the group tint is authored sRGB, decoded here with the same pow(2.2)
-//      the outline path uses, and multiplied in — identity for a white group;
-//   3. output is PREMULTIPLIED, rgb * alpha, into the same ONE/ONE_MINUS_SRC
-//      blend as the outline path. Premultiplying BEFORE the sRGB decode would
-//      be a different product; that is the mistake to look for if emoji edges
-//      differ across platforms while text does not.
-// The per-instance colour is not applied: it is the syntax colour, and an
-// image has its own. Group alpha and the clip/cull rules apply as for text.
-//
-// Skipped vs the web (documented in the Stage C report):
-//   - frame mode (external video grid)
-//   - highlight tint/fill (vAddedColor/vFillAmount)
-//   - stipple-dither LOD fade band (ditherSpan); hard discard at alpha==0
-//   - width-compression dial (k = 1)
+// Advance is looked up from the resident atlas table:
+//   advance = glyph_advances[glyph_id]
+// Cell height is constant 1.0.
 
-// Stage F note: the renderer no longer draws the whole chunk per frame.
-// The CPU cull (glyph_scene.rs module header) issues ONE RANGE DRAW per
-// visible segment per chunk — draw(0..6, base..base+count), instance_index
-// chunk-local — so this shader is byte-for-byte unchanged from Stage E2 and
-// blending order within each chunk still matches the legacy full draws
-// (segment ranges ascend in arena order). Far (subpixel) segments are
-// substituted by flat backdrop quads from cull.wgsl, never partially drawn.
-
-const MAX_CURVES: u32 = 256u;
 const TEX_W: i32 = 1024;
-const GROUP_STRIDE: u32 = 6u; // vec4s per group row (extended from glyphVertex.js GROUP_STRIDE=5)
+const MAX_CURVES: u32 = 128u;
+const GROUP_STRIDE: u32 = 6u;
 
-// Per-instance glyph slot — 32 B / 8 lanes, the endpoint form (note 23):
-// what remains of the web's stride-11 byte-slot layout once the dead lanes
-// fell out (row/col, flags, _pad — note 22's sweep found no live reader:
-// pick rides the engine cache, the verbs write by slot offset, the tint
-// fold wants glyph_id+color). color and group_id are per-instance
-// ATTRIBUTES on classic web fields; keeping them inline makes the record
-// self-contained for the native port. Layout:
-//   w0-2  pos.xyz       world anchor: pen origin (left edge), cell-vertical center
-//   w3    glyph_id      FontChain global slot (keys glyphmap)
-//   w4    color         packed RGBA8 (sRGB display values)
-//   w5    group_id      index into the group table
-//   w6-7  advance, height   world units (advance = cell width; height = cell height)
-struct InstanceSlot {
-    pos: vec3<f32>,
-    glyph_id: u32,
+struct DerivedSlot {
+    x: f32,
+    line_idx: u32,
+    glyph_and_wrap: u32,
     color: u32,
     group_id: u32,
-    advance: f32,
-    height: f32,
+};
+
+struct LineRecord {
+    item_idx: u32,
+    row: u32,
+};
+
+struct ItemParamsGpu {
+    line_height: f32,
+    origin_y: f32,
+    origin_z: f32,
+    z_step: f32,
+    z_step_lo: f32,
+    band_stride_y: f32,
+    depth_per_band: f32,
+    depth_per_col: f32,
+    page_rows: i32,
+    pages_wide: i32,
+    page_cols: i32,
+    scroll_rows: i32,
+    has_page: u32,
+    line_height_lo: f32,
+    _pad1: u32,
+    _pad2: u32,
 };
 
 struct Camera {
@@ -94,17 +78,52 @@ struct Params {
 };
 
 @group(0) @binding(0) var<uniform> camera: Camera;
-@group(0) @binding(1) var<storage, read> instances: array<InstanceSlot>;
+@group(0) @binding(1) var<storage, read> instances: array<DerivedSlot>;
 @group(0) @binding(2) var<storage, read> groups: array<vec4<f32>>;
 @group(0) @binding(3) var glyphmap: texture_2d<u32>;
 @group(0) @binding(4) var curves: texture_2d<u32>;
 @group(0) @binding(5) var<uniform> params: Params;
 @group(0) @binding(6) var emoji_tex: texture_2d_array<f32>;
 @group(0) @binding(7) var emoji_samp: sampler;
+@group(0) @binding(8) var<storage, read> line_table: array<LineRecord>;
+@group(0) @binding(9) var<storage, read> item_table: array<ItemParamsGpu>;
+@group(0) @binding(10) var<storage, read> glyph_advances: array<f32>;
 
 // Sentinel in the glyph map's .w for a bitmap slot the sheet has no cell
 // for (a web-era slot the vendored font cannot draw): rendered blank.
 const NO_CELL: u32 = 0xFFFFFFFFu;
+
+fn derive_yz(row: u32, wrap_segment: u32, item: ItemParamsGpu) -> vec2<f32> {
+    var derived_y = 0.0;
+    var derived_z = 0.0;
+
+    let depth_steps = -(f32(wrap_segment));
+    let z_tail = fma(depth_steps, item.z_step_lo, item.origin_z);
+    let z_stepped = fma(depth_steps, item.z_step, z_tail);
+
+    if (item.has_page != 0u) {
+        let screen_row = i32(row) - item.scroll_rows;
+        var y_page = 0;
+        if (item.page_rows > 0 && screen_row >= item.page_rows) {
+            y_page = screen_row / item.page_rows;
+        }
+        let pages_wide = max(item.pages_wide, 1);
+        let band = y_page / pages_wide;
+        let row_in_page = f32(screen_row - y_page * item.page_rows);
+        let y_tail = fma(-row_in_page, item.line_height_lo, item.origin_y);
+        let y_row_folded = fma(-row_in_page, item.line_height, y_tail);
+        derived_y = fma(-(f32(band)), item.band_stride_y, y_row_folded);
+
+        let z_banded = fma(f32(band), item.depth_per_band, z_stepped);
+        derived_z = z_banded;
+    } else {
+        let y_tail = fma(-(f32(row)), item.line_height_lo, item.origin_y);
+        derived_y = fma(-(f32(row)), item.line_height, y_tail);
+        derived_z = z_stepped;
+    }
+
+    return vec2<f32>(derived_y, derived_z);
+}
 
 struct VsOut {
     @builtin(position) clip: vec4<f32>,
@@ -114,9 +133,6 @@ struct VsOut {
     @location(3) @interpolate(flat) curve_start: u32,
     @location(4) @interpolate(flat) curve_count: u32,
     @location(5) @interpolate(flat) mode: u32,
-    // Emoji: the sheet UV (texels/layer size, already inset half a texel and
-    // flipped so v runs down the PNG's rows) and the layer. group_rgb is the
-    // tint without the instance colour, which an image does not take.
     @location(6) emoji_uv: vec2<f32>,
     @location(7) @interpolate(flat) emoji_layer: u32,
     @location(8) group_rgb: vec3<f32>,
@@ -128,10 +144,6 @@ fn vs_main(
     @builtin(vertex_index) vi: u32,
     @builtin(instance_index) ii: u32,
 ) -> VsOut {
-    // Unit quad corners, uv == position: (0,0)=bottom-left … (1,1)=top-right.
-    // Matches the web's PlaneGeometry where uv = positionLocal + 0.5 and the
-    // v axis runs bottom→top, so NO y-flip against the y-up curve data.
-    // Indexed via shared quad index buffer [0, 1, 2, 0, 2, 3] (33% vertex savings).
     var corners = array<vec2<f32>, 4>(
         vec2<f32>(0.0, 0.0),
         vec2<f32>(1.0, 0.0),
@@ -140,27 +152,28 @@ fn vs_main(
     );
 
     let inst = instances[ii];
+    let line = line_table[inst.line_idx];
+    let item = item_table[line.item_idx];
+    let glyph_id = inst.glyph_and_wrap & 0xFFFFu;
+    let wrap_segment = inst.glyph_and_wrap >> 16u;
+
+    let yz = derive_yz(line.row, wrap_segment, item);
+    let inst_pos = vec3<f32>(inst.x, yz.x, yz.y);
 
     // Glyph-map lookup: slot → curve range + mode.
-    let gid = i32(inst.glyph_id);
+    let gid = i32(glyph_id);
     let info = textureLoad(glyphmap, vec2<i32>(gid % TEX_W, gid / TEX_W), 0);
     let mode = info.z; // 0 = outline, 1 = bitmap emoji
 
-    // Quad sizing: bitmap glyphs get a SQUARE quad; outline keeps the narrow
-    // advance. (widthCompress k = 1 — dial not ported.)
-    var quad_w = inst.advance;
+    var quad_w = glyph_advances[glyph_id];
     if mode == 1u {
-        quad_w = inst.height;
+        quad_w = 1.0;
     }
 
     let c = corners[vi];
-    // local quad: x ∈ [0, quadW] (pen origin at left edge), y ∈ [-h/2, +h/2],
-    // anchored at inst.pos — same shape as scaled+alignOffset+iPos in the web.
-    let aligned = vec3<f32>(c.x * quad_w, (c.y - 0.5) * inst.height, 0.0) + inst.pos;
+    let aligned = vec3<f32>(c.x * quad_w, (c.y - 0.5) * 1.0, 0.0) + inst_pos;
 
     // Group table row (6 vec4s): offset / quat / color+alpha / scale+colorBlend / clip / bg_color.
-    // Robust storage access CLAMPS OOB reads — so clamp here AND cull below,
-    // exactly like the web's explicit bound check.
     let grow = min(inst.group_id, params.max_groups - 1u);
     let gbase = grow * GROUP_STRIDE;
     let gpos = groups[gbase];        // col 0: offset.xyz
@@ -170,24 +183,20 @@ fn vs_main(
     let gclip = groups[gbase + 4u];  // col 4: clipTop, clipBottom, clipEnabled
     let gbg = groups[gbase + 5u];    // col 5: bg_color.rgba
 
-    // World = rotate(quat, aligned * groupScale) + groupOffset  (T·R·S).
+    // World = rotate(quat, aligned * groupScale) + groupOffset (T·R·S).
     let local = aligned * gscale.xyz;
-    // v' = v + 2·q.xyz × (q.xyz × v + q.w·v) — quat sandwich, cross-form.
     let qc = cross(gquat.xyz, local) + local * gquat.w;
     let posed = local + 2.0 * cross(gquat.xyz, qc);
     var clip = camera.view_proj * vec4<f32>(posed + gpos.xyz, 1.0);
 
-    // Vertex culls → degenerate to outside-NDC (z/w = 2 > 1): GPU clips them.
+    // Vertex culls → degenerate to outside-NDC.
     if inst.group_id >= params.max_groups || gcolor.a <= 0.01 {
         clip = vec4<f32>(2.0, 2.0, 2.0, 1.0);
     }
-    if gclip.z > 0.5 && (inst.pos.y > gclip.x || inst.pos.y < gclip.y) {
+    if gclip.z > 0.5 && (inst_pos.y > gclip.x || inst_pos.y < gclip.y) {
         clip = vec4<f32>(2.0, 2.0, 2.0, 1.0);
     }
 
-    // Instance color (packed sRGB RGBA8) blended with the group color:
-    // colorBlend 0 = multiply, 1 = replace. Explicit lerp (web comment:
-    // TSL .mix() returned the wrong operand at t=0).
     let icolor = vec3<f32>(
         f32(inst.color & 0xFFu),
         f32((inst.color >> 8u) & 0xFFu),
@@ -196,12 +205,6 @@ fn vs_main(
     let base_color = icolor * gcolor.rgb;
     let blended = base_color + (gcolor.rgb - base_color) * gscale.w;
 
-    // Emoji cell → sheet UV. Cell i sits at layer i / (cols·rows), row
-    // (i mod cols·rows) / cols, col i mod cols. The sample rect is the cell
-    // inset by half a texel on every side so bilinear filtering never reads
-    // the neighbouring cell's edge texel, at any mip the loader built
-    // (atlas.rs mip_levels_for keeps every level's footprint inside a cell).
-    // v is flipped: glyph_uv.y runs bottom→top, the PNG's rows run top→down.
     var emoji_uv = vec2<f32>(0.0);
     var emoji_layer = 0u;
     if mode == 1u && info.w != NO_CELL {
@@ -214,8 +217,6 @@ fn vs_main(
         let t = vec2<f32>(c.x, 1.0 - c.y);
         emoji_uv = (cell_xy + inset + t * span) / params.emoji_layer;
     }
-    // A bitmap slot with no cell draws nothing: pass mode 2 so the fragment
-    // stage discards it before the curve path can misread curve_count == 0.
     var out_mode = mode;
     if mode == 1u && info.w == NO_CELL {
         out_mode = 2u;
@@ -236,25 +237,17 @@ fn vs_main(
     return out;
 }
 
-// Rotate 90° so the +X ray becomes a +Y ray in the rotated frame.
 fn rot90(v: vec2<f32>) -> vec2<f32> {
     return vec2<f32>(v.y, -v.x);
 }
 
-// Analytic coverage of one quadratic bezier for a +X ray through the origin
-// (endpoints pre-translated by the sample point). invDiameter = 1 / pixel
-// footprint along the ray axis; fractional crossings give sub-pixel coverage.
-// Direct port of computeCoverage in GlyphField.js (Dobbie/Lengyel "Slug"),
-// including the stable-root fix and the near-horizontal line guard.
 fn compute_coverage(inv_diameter: f32, dilate: f32, p0: vec2<f32>, p1: vec2<f32>, p2: vec2<f32>) -> f32 {
     var result = 0.0;
 
-    // Cheap reject: curve entirely on one side of the ray (y == 0).
     let all_above = p0.y > 0.0 && p1.y > 0.0 && p2.y > 0.0;
     let all_below = p0.y < 0.0 && p1.y < 0.0 && p2.y < 0.0;
 
     if !(all_above || all_below) {
-        // Q(t).y = 0 → a.y·t² − 2·b.y·t + c.y = 0 (factor of −2 baked into b).
         let a = p0 - 2.0 * p1 + p2;
         let b = p0 - p1;
         let c = p0;
@@ -264,11 +257,9 @@ fn compute_coverage(inv_diameter: f32, dilate: f32, p0: vec2<f32>, p1: vec2<f32>
         var solvable = true;
 
         if abs(a.y) >= 1e-5 {
-            // Quadratic: two roots — t0 always exits, t1 always enters.
             let radicand = b.y * b.y - a.y * c.y;
             if radicand > 0.0 {
                 let s = sqrt(radicand);
-                // STABLE roots: q = b.y + sign(b.y)·s, then q/a.y and c.y/q.
                 let q = b.y + select(-s, s, b.y >= 0.0);
                 if b.y >= 0.0 {
                     t0 = c.y / q;
@@ -278,12 +269,9 @@ fn compute_coverage(inv_diameter: f32, dilate: f32, p0: vec2<f32>, p1: vec2<f32>
                     t1 = c.y / q;
                 }
             } else {
-                solvable = false; // radicand ≤ 0 → no crossing
+                solvable = false;
             }
         } else {
-            // Degenerate quadratic = line segment; one root, by direction.
-            // Guard: endpoints at (nearly) the same y → segment ∥ ray → skip;
-            // the orthogonal ray resolves it stably.
             let denom = p0.y - p2.y;
             if abs(denom) >= 1e-6 {
                 let t = p0.y / denom;
@@ -316,9 +304,6 @@ fn compute_coverage(inv_diameter: f32, dilate: f32, p0: vec2<f32>, p1: vec2<f32>
 
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
-    // Bitmap emoji branch — BEFORE the curveCount==0 empty test, as FORMAT.md
-    // requires (a bitmap slot has zero curves). See the header for the alpha
-    // contract; this is its one implementation.
     if in.mode == 1u {
         let s = textureSample(emoji_tex, emoji_samp, in.emoji_uv, in.emoji_layer);
         let alpha = s.a * in.group_alpha;
@@ -328,7 +313,6 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         let rgb = s.rgb * pow(in.group_rgb, vec3<f32>(2.2)) * alpha;
         return vec4<f32>(rgb, alpha);
     }
-    // mode 2: a bitmap slot the sheet has no cell for — blank, keeps its cell.
     if in.mode == 2u {
         discard;
     }
@@ -338,47 +322,38 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         discard;
     }
 
-    // Pixel footprint in glyph-UV space, per axis — resolution-independent AA.
     let fw = fwidth(in.glyph_uv);
-
-    // Greeking: at small/subpixel scale, transition from aliased vector curves
-    // to smooth, energy-conserving horizontal syntax bars.
-    // em_px is the on-screen pixel height of the character cell (1.0 / fw.y).
     let em_px = 1.0 / max(fw.y, 1e-4);
     var greek = 0.0;
-    if params.greek_mode == 1u {
-        // Smooth transition over [full..onset]
-        let onset = params.greek_onset_px;
-        let full = onset * 0.45;
-        let t = clamp((onset - em_px) / max(onset - full, 0.01), 0.0, 1.0);
-        greek = t * t * (3.0 - 2.0 * t);
-    } else if params.greek_mode == 2u {
-        // Pure bypass: instant cut below onset, eliminating all Bézier curve ALU & texture loads
-        if em_px <= params.greek_onset_px {
-            greek = 1.0;
+    if in.curve_count > 0u {
+        if params.greek_mode == 1u {
+            let onset = params.greek_onset_px;
+            let full = onset * 0.45;
+            let t = clamp((onset - em_px) / max(onset - full, 0.01), 0.0, 1.0);
+            greek = t * t * (3.0 - 2.0 * t);
+        } else if params.greek_mode == 2u {
+            if em_px <= params.greek_onset_px {
+                greek = 1.0;
+            }
         }
     }
 
     var cov = 0.0;
-    if greek < 1.0 {
-        // Minification amount m, smoothstep-ramped over [min_lo, min_hi].
+    if greek < 1.0 && in.curve_count > 0u {
         let fw_max = max(fw.x, fw.y);
         var m = clamp((fw_max - params.min_lo) / (params.min_hi - params.min_lo), 0.0, 1.0);
         m = m * m * (3.0 - 2.0 * m);
 
-        // Dilation half-width + softened inverse footprint (identity at m=0).
         let dilate = m * params.dilate_px;
         let inv_d = (vec2<f32>(1.0) / fw) * (1.0 - m * params.soften);
 
         var coverage = 0.0;
         let n = min(in.curve_count, MAX_CURVES);
         for (var i = 0u; i < n; i = i + 1u) {
-            // 2 texels per curve: [P0.xy, P1.xy] then [P2.xy, _, _].
             let ci = (in.curve_start + i) * 2u;
             let t0 = textureLoad(curves, vec2<i32>(i32(ci % 1024u), i32(ci / 1024u)), 0);
             let t1 = textureLoad(curves, vec2<i32>(i32((ci + 1u) % 1024u), i32((ci + 1u) / 1024u)), 0);
 
-            // Unpack uint16 → [0,1], translate so the sample point is the origin.
             let p0 = vec2<f32>(f32(t0.x), f32(t0.y)) / 65535.0 - in.glyph_uv;
             let p1 = vec2<f32>(f32(t0.z), f32(t0.w)) / 65535.0 - in.glyph_uv;
             let p2 = vec2<f32>(f32(t1.x), f32(t1.y)) / 65535.0 - in.glyph_uv;
@@ -389,10 +364,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         cov = clamp(coverage * 0.5, 0.0, 1.0);
     }
 
-    if greek > 0.0 {
-        // Greeking ink bar: continuous horizontal word bars with analytic AA.
-        // In y: spans baseline (0.20) to cap-height (0.75).
-        // In x: spans full cell [0.0, 1.0] so adjacent word characters connect seamlessly.
+    if greek > 0.0 && in.curve_count > 0u {
         let dy = max(fw.y, 1e-4);
         let y_cov = clamp((in.glyph_uv.y - 0.20) / dy + 0.5, 0.0, 1.0)
                   - clamp((in.glyph_uv.y - 0.75) / dy + 0.5, 0.0, 1.0);
@@ -403,22 +375,18 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         cov = mix(cov, bar_cov, greek);
     }
 
-    let alpha = cov * in.group_alpha;
-    if alpha <= 0.0 && in.bg_color.a <= 0.0 {
-        discard;
-    }
-
-    let rgb = pow(in.color, vec3<f32>(2.2)) * alpha;
-    if in.bg_color.a <= 0.0 {
-        return vec4<f32>(rgb, alpha);
-    }
-
+    let fg_alpha = cov * in.group_alpha;
     let bg_alpha = in.bg_color.a * in.group_alpha;
-    if alpha <= 0.0 && bg_alpha <= 0.0 {
+
+    if fg_alpha <= 0.0 && bg_alpha <= 0.0 {
         discard;
     }
+
+    let fg_rgb = pow(in.color, vec3<f32>(2.2)) * fg_alpha;
     let bg_rgb = pow(in.bg_color.rgb, vec3<f32>(2.2)) * bg_alpha;
-    let out_alpha = alpha + bg_alpha * (1.0 - alpha);
-    let out_rgb = rgb + bg_rgb * (1.0 - alpha);
+
+    let out_alpha = fg_alpha + bg_alpha * (1.0 - fg_alpha);
+    let out_rgb = fg_rgb + bg_rgb * (1.0 - fg_alpha);
+
     return vec4<f32>(out_rgb, out_alpha);
 }

@@ -220,6 +220,31 @@ impl Default for ItemParams {
     }
 }
 
+impl From<&ItemParams> for glyph_field::ItemParamsGpu {
+    fn from(p: &ItemParams) -> Self {
+        let z_step_lo = (p.z_step - p.z_step as f32 as f64) as f32;
+        let line_height_lo = (p.line_height - p.line_height as f32 as f64) as f32;
+        Self {
+            line_height: p.line_height as f32,
+            origin_y: p.origin_y as f32,
+            origin_z: p.origin_z as f32,
+            z_step: p.z_step as f32,
+            z_step_lo,
+            band_stride_y: p.band_stride_y as f32,
+            depth_per_band: p.depth_per_band as f32,
+            depth_per_col: p.depth_per_col as f32,
+            page_rows: p.page_rows,
+            pages_wide: p.pages_wide,
+            page_cols: p.page_cols,
+            scroll_rows: p.scroll_rows,
+            has_page: if p.has_page { 1 } else { 0 },
+            line_height_lo,
+            _pad1: 0,
+            _pad2: 0,
+        }
+    }
+}
+
 impl ItemParams {
     /// Refuse a layout a backend would silently turn into NaN.
     ///

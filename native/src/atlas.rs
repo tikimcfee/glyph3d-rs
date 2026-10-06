@@ -406,6 +406,8 @@ pub struct Atlas {
     /// syntax colour, a colour an emoji does not display. `None` for every
     /// slot that is not a bitmap with a cell.
     pub slot_ink: Vec<Option<[f32; 4]>>,
+    /// Per-slot advance in world units, uploaded as a resident storage buffer.
+    pub glyph_advances: wgpu::Buffer,
 }
 
 // ── the colour-emoji sheet (G3ES) ─────────────────────────────────────────
@@ -1100,6 +1102,25 @@ impl Atlas {
             slot_ink.len()
         );
 
+        let em = metrics.em_height_fu;
+        let primary_adv = crate::text::fu_to_world(metrics.advance_fu as i32, em);
+        let bitmap_adv = crate::text::fu_to_world(trie.bitmap_advance_fu, em);
+        let slot_advances: Vec<f32> = (0..slot_count as usize)
+            .map(|s| {
+                if trie.emoji_cell[s].is_some() || s >= 4431 {
+                    bitmap_adv
+                } else {
+                    primary_adv
+                }
+            })
+            .collect();
+        use wgpu::util::DeviceExt;
+        let glyph_advances = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("glyph advances"),
+            contents: bytemuck::cast_slice(&slot_advances),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        });
+
         Self {
             curves,
             glyphmap,
@@ -1107,6 +1128,7 @@ impl Atlas {
             trie,
             emoji,
             slot_ink,
+            glyph_advances,
         }
     }
 

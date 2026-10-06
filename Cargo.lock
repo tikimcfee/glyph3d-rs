@@ -2847,6 +2847,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "glyph-field-derived"
+version = "0.1.0"
+dependencies = [
+ "bytemuck",
+ "encase",
+ "glyph-field",
+ "naga",
+ "rayon",
+ "wgpu",
+]
+
+[[package]]
 name = "glyph-field-instanced"
 version = "0.1.0"
 dependencies = [
@@ -2874,6 +2886,7 @@ dependencies = [
  "encase",
  "glam",
  "glyph-field",
+ "glyph-field-derived",
  "glyph-field-instanced",
  "image",
  "log",

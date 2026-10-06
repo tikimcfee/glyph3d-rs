@@ -1,0 +1,15 @@
+[package]
+name = "glyph-field-derived"
+version = "0.1.0"
+edition = "2021"
+description = "The Derived glyph field: compact 20 B DerivedSlot per glyph, positions derived in vertex stage from line tables."
+
+[dependencies]
+glyph-field = { path = "../glyph-field" }
+wgpu = "30"
+bytemuck = { version = "1", features = ["derive"] }
+encase = "0.12"
+rayon = "1.10"
+
+[dev-dependencies]
+naga = { version = "30", features = ["wgsl-in"] }
