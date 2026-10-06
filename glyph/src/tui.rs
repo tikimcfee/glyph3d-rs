@@ -58,6 +58,7 @@ pub enum ClusterMode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RepoEngine {
     Hyper,
+    Cubecl,
     Direct,
     Batch,
 }
@@ -163,6 +164,7 @@ struct FileLaunchConfig {
     no_ui: Option<bool>,
     greeking: Option<bool>,
     load_repo: Option<String>,
+    repo_engine: Option<String>,
     field_mode: Option<String>,
 }
 
@@ -260,6 +262,14 @@ impl LauncherState {
                         if let Some(lr) = cfg.load_repo {
                             self.repo_path = lr;
                         }
+                        if let Some(re) = cfg.repo_engine.as_deref() {
+                            self.repo_engine = match re.to_lowercase().as_str() {
+                                "cubecl" => RepoEngine::Cubecl,
+                                "direct" => RepoEngine::Direct,
+                                "batch" => RepoEngine::Batch,
+                                _ => RepoEngine::Hyper,
+                            };
+                        }
                         if let Some(fm) = cfg.field_mode.as_deref() {
                             self.field_mode = match fm.to_lowercase().as_str() {
                                 "derived" => FieldMode::Derived,
@@ -303,6 +313,7 @@ impl LauncherState {
                 args.push("--repo-engine".to_string());
                 args.push(match self.repo_engine {
                     RepoEngine::Hyper => "hyper".to_string(),
+                    RepoEngine::Cubecl => "cubecl".to_string(),
                     RepoEngine::Direct => "direct".to_string(),
                     RepoEngine::Batch => "batch".to_string(),
                 });
@@ -396,7 +407,8 @@ impl LauncherState {
             }
             FocusField::RepoEngine => {
                 self.repo_engine = match self.repo_engine {
-                    RepoEngine::Hyper => RepoEngine::Direct,
+                    RepoEngine::Hyper => RepoEngine::Cubecl,
+                    RepoEngine::Cubecl => RepoEngine::Direct,
                     RepoEngine::Direct => RepoEngine::Batch,
                     RepoEngine::Batch => RepoEngine::Hyper,
                 };
@@ -459,7 +471,8 @@ impl LauncherState {
             }
             FocusField::RepoEngine => {
                 self.repo_engine = match self.repo_engine {
-                    RepoEngine::Hyper => RepoEngine::Direct,
+                    RepoEngine::Hyper => RepoEngine::Cubecl,
+                    RepoEngine::Cubecl => RepoEngine::Direct,
                     RepoEngine::Direct => RepoEngine::Batch,
                     RepoEngine::Batch => RepoEngine::Hyper,
                 };
@@ -504,7 +517,8 @@ impl LauncherState {
             FocusField::RepoEngine => {
                 self.repo_engine = match self.repo_engine {
                     RepoEngine::Hyper => RepoEngine::Batch,
-                    RepoEngine::Direct => RepoEngine::Hyper,
+                    RepoEngine::Cubecl => RepoEngine::Hyper,
+                    RepoEngine::Direct => RepoEngine::Cubecl,
                     RepoEngine::Batch => RepoEngine::Direct,
                 };
             }
@@ -976,6 +990,8 @@ fn draw_layout_section(f: &mut Frame, area: Rect, state: &LauncherState) {
             ),
             format_choice("hyper (Rayon)", state.repo_engine == RepoEngine::Hyper, is_engine),
             Span::raw(" "),
+            format_choice("cubecl (GPU)", state.repo_engine == RepoEngine::Cubecl, is_engine),
+            Span::raw(" "),
             format_choice("direct", state.repo_engine == RepoEngine::Direct, is_engine),
             Span::raw(" "),
             format_choice("batch", state.repo_engine == RepoEngine::Batch, is_engine),
@@ -1362,15 +1378,21 @@ mod tests {
         state.cycle_prev();
         assert_eq!(state.layout_mode, LayoutMode::Shelf);
 
-        // RepoEngine: 3-way cycle
+        // RepoEngine: 4-way cycle
         state.focus = FocusField::RepoEngine;
         assert_eq!(state.repo_engine, RepoEngine::Hyper);
+        state.cycle_next();
+        assert_eq!(state.repo_engine, RepoEngine::Cubecl);
         state.cycle_next();
         assert_eq!(state.repo_engine, RepoEngine::Direct);
         state.cycle_next();
         assert_eq!(state.repo_engine, RepoEngine::Batch);
         state.cycle_prev();
         assert_eq!(state.repo_engine, RepoEngine::Direct);
+        state.cycle_prev();
+        assert_eq!(state.repo_engine, RepoEngine::Cubecl);
+        state.cycle_prev();
+        assert_eq!(state.repo_engine, RepoEngine::Hyper);
 
         // Booleans: Left = false, Right = true
         state.focus = FocusField::Greeking;

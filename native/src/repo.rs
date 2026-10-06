@@ -517,21 +517,18 @@ pub fn load_repo_from_walk(
         .collect();
 
     let mut backend = match strategy {
-        // The cubecl chain emits 32 B RenderSlots only; for the Derived field
-        // it runs on its own device into the host arena and the field
-        // transcodes (correct, not the fast path).
+        // The CubeCL chain emits directly to DeviceSlots on the shared GPU device:
+        // 32 B RenderSlots in Instanced mode, or 20 B DerivedSlots in Derived mode
+        // for zero-copy bind by the glyph field.
         #[cfg(feature = "cubecl")]
         Strategy::Cubecl => match gpu {
-            Some(ctx) if params.field_mode == glyph_field::GlyphFieldMode::Instanced => {
+            Some(ctx) => {
                 crate::layout::LayoutEngine::cubecl_with_device(
                     crate::cubecl_chain::SharedDevice::from_ctx(ctx),
+                    params.field_mode,
                 )
             }
-            Some(_) => {
-                tracing::warn!("cubecl strategy emits RenderSlots only; derived field uses the host transcode");
-                crate::layout::LayoutEngine::cubecl()
-            }
-            None => crate::layout::LayoutEngine::cubecl(),
+            None => crate::layout::LayoutEngine::cubecl(params.field_mode),
         },
         _ => match gpu {
             Some(ctx) => crate::layout::LayoutEngine::hyper_with_device(

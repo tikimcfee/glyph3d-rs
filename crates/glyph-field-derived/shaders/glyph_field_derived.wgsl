@@ -8,7 +8,7 @@
 //   w4    group_id: u32          index into the group table
 //
 // Y and Z coordinates are derived in the vertex stage from line_table and item_table:
-//   line = line_table[inst.line_idx]   // { item_idx, row }
+//   line = line_table[inst.row]   // { item_idx, row }
 //   item = item_table[line.item_idx]   // ItemParamsGpu (64 B)
 //   yz   = derive_yz(line.row, wrap_segment, item)
 //
@@ -22,15 +22,10 @@ const GROUP_STRIDE: u32 = 6u;
 
 struct DerivedSlot {
     x: f32,
-    line_idx: u32,
+    row: u32,
     glyph_and_wrap: u32,
     color: u32,
-    group_id: u32,
-};
-
-struct LineRecord {
-    item_idx: u32,
-    row: u32,
+    item_and_group: u32,
 };
 
 struct ItemParamsGpu {
@@ -85,9 +80,8 @@ struct Params {
 @group(0) @binding(5) var<uniform> params: Params;
 @group(0) @binding(6) var emoji_tex: texture_2d_array<f32>;
 @group(0) @binding(7) var emoji_samp: sampler;
-@group(0) @binding(8) var<storage, read> line_table: array<LineRecord>;
-@group(0) @binding(9) var<storage, read> item_table: array<ItemParamsGpu>;
-@group(0) @binding(10) var<storage, read> glyph_advances: array<f32>;
+@group(0) @binding(8) var<storage, read> item_table: array<ItemParamsGpu>;
+@group(0) @binding(9) var<storage, read> glyph_advances: array<f32>;
 
 // Sentinel in the glyph map's .w for a bitmap slot the sheet has no cell
 // for (a web-era slot the vendored font cannot draw): rendered blank.
@@ -152,12 +146,12 @@ fn vs_main(
     );
 
     let inst = instances[ii];
-    let line = line_table[inst.line_idx];
-    let item = item_table[line.item_idx];
-    let glyph_id = inst.glyph_and_wrap & 0xFFFFu;
+    let item_idx = inst.item_and_group & 0xFFFFu;
+    let group_id = inst.item_and_group >> 16u;
+    let item = item_table[item_idx];
     let wrap_segment = inst.glyph_and_wrap >> 16u;
-
-    let yz = derive_yz(line.row, wrap_segment, item);
+    let glyph_id = inst.glyph_and_wrap & 0xFFFFu;
+    let yz = derive_yz(inst.row, wrap_segment, item);
     let inst_pos = vec3<f32>(inst.x, yz.x, yz.y);
 
     // Glyph-map lookup: slot → curve range + mode.
@@ -174,7 +168,7 @@ fn vs_main(
     let aligned = vec3<f32>(c.x * quad_w, (c.y - 0.5) * 1.0, 0.0) + inst_pos;
 
     // Group table row (6 vec4s): offset / quat / color+alpha / scale+colorBlend / clip / bg_color.
-    let grow = min(inst.group_id, params.max_groups - 1u);
+    let grow = min(group_id, params.max_groups - 1u);
     let gbase = grow * GROUP_STRIDE;
     let gpos = groups[gbase];        // col 0: offset.xyz
     let gquat = groups[gbase + 1u];  // col 1: rotation quaternion xyzw
@@ -190,7 +184,7 @@ fn vs_main(
     var clip = camera.view_proj * vec4<f32>(posed + gpos.xyz, 1.0);
 
     // Vertex culls → degenerate to outside-NDC.
-    if inst.group_id >= params.max_groups || gcolor.a <= 0.01 {
+    if group_id >= params.max_groups || gcolor.a <= 0.01 {
         clip = vec4<f32>(2.0, 2.0, 2.0, 1.0);
     }
     if gclip.z > 0.5 && (inst_pos.y > gclip.x || inst_pos.y < gclip.y) {

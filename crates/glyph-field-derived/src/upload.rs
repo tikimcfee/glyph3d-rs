@@ -1,8 +1,7 @@
-//! Host records → device slots: 48 B GlyphInstance transcoded into 20 B DerivedSlot
-//! and logical lines mapped into LineRecord { item_idx, row }.
+//! Host records → device slots: 48 B GlyphInstance transcoded into 20 B DerivedSlot.
 
 use bytemuck::Zeroable;
-use glyph_field::{GlyphInstance, ItemParamsGpu, LineRecord};
+use glyph_field::{GlyphInstance, ItemParamsGpu};
 
 use crate::slot::DerivedSlot;
 
@@ -21,49 +20,12 @@ pub struct HostUploadDerived {
     pub chunk_capacity: usize,
     pub chunk_counts: Vec<u32>,
     pub buffers: Vec<wgpu::Buffer>,
-    pub line_table: Vec<LineRecord>,
 }
 
 const CHUNK_SIZE: usize = 65536;
 
-/// Build the line table from host slices and record each slot's line_idx.
-pub fn build_line_table(
-    slices: &[&[GlyphInstance]],
-    count: usize,
-) -> (Vec<LineRecord>, Vec<u32>) {
-    let mut line_table = Vec::<LineRecord>::new();
-    let mut line_indices = Vec::<u32>::with_capacity(count);
-
-    let mut current_key = (u32::MAX, u32::MAX);
-    let mut current_line_idx = 0u32;
-
-    for slice in slices {
-        for inst in *slice {
-            let key = (inst.group_id, inst.row);
-            if key != current_key {
-                current_key = key;
-                current_line_idx = line_table.len() as u32;
-                line_table.push(LineRecord {
-                    item_idx: inst.group_id,
-                    row: inst.row,
-                });
-            }
-            line_indices.push(current_line_idx);
-        }
-    }
-
-    if line_table.is_empty() {
-        line_table.push(LineRecord {
-            item_idx: 0,
-            row: 0,
-        });
-    }
-
-    (line_table, line_indices)
-}
-
 #[inline(always)]
-fn transcode_one(inst: &GlyphInstance, line_idx: u32, item_params: &[ItemParamsGpu]) -> DerivedSlot {
+fn transcode_one(inst: &GlyphInstance, item_params: &[ItemParamsGpu]) -> DerivedSlot {
     let wrap_segment = if inst.flags != 0 {
         (inst.flags & 0xFFFF) as u16
     } else if let Some(item) = item_params.get(inst.group_id as usize) {
@@ -77,44 +39,48 @@ fn transcode_one(inst: &GlyphInstance, line_idx: u32, item_params: &[ItemParamsG
     };
 
     let glyph_id = (inst.glyph_id & 0xFFFF) as u16;
+    let item_idx = (inst.group_id & 0xFFFF) as u16; // upload.rs transcode lacks true item_idx
+    let group_id = (inst.group_id & 0xFFFF) as u16;
+    let row = inst.row;
+
     DerivedSlot::new(
         inst.pos[0],
-        line_idx,
+        row,
         glyph_id,
         wrap_segment,
         inst.color,
-        inst.group_id,
+        item_idx,
+        group_id,
     )
 }
 
 unsafe fn transcode_derived_sub_slices(
     dest_ptr: *mut DerivedSlot,
-    sub_slices: &[(usize, &[GlyphInstance], &[u32])],
+    sub_slices: &[(usize, &[GlyphInstance])],
     written: usize,
     count: usize,
     item_params: &[ItemParamsGpu],
 ) {
     let dest = SendPtr(dest_ptr);
-    for &(dst_off, slice, lines) in sub_slices {
+    for &(dst_off, slice) in sub_slices {
         if slice.len() >= 16384 {
             use rayon::prelude::*;
             slice
                 .par_chunks(CHUNK_SIZE)
-                .zip(lines.par_chunks(CHUNK_SIZE))
                 .enumerate()
-                .for_each(|(chunk_idx, (chunk, line_chunk))| {
+                .for_each(|(chunk_idx, chunk)| {
                     let out_ptr = unsafe { dest.add(dst_off + chunk_idx * CHUNK_SIZE) };
-                    for (k, (g, &l_idx)) in chunk.iter().zip(line_chunk.iter()).enumerate() {
+                    for (k, g) in chunk.iter().enumerate() {
                         unsafe {
-                            std::ptr::write(out_ptr.add(k), transcode_one(g, l_idx, item_params));
+                            std::ptr::write(out_ptr.add(k), transcode_one(g, item_params));
                         }
                     }
                 });
         } else {
             let out_ptr = unsafe { dest.0.add(dst_off) };
-            for (k, (g, &l_idx)) in slice.iter().zip(lines.iter()).enumerate() {
+            for (k, g) in slice.iter().enumerate() {
                 unsafe {
-                    std::ptr::write(out_ptr.add(k), transcode_one(g, l_idx, item_params));
+                    std::ptr::write(out_ptr.add(k), transcode_one(g, item_params));
                 }
             }
         }
@@ -133,7 +99,7 @@ fn upload_direct_metal(
     device: &wgpu::Device,
     label: &str,
     usage: wgpu::BufferUsages,
-    sub_slices: &[(usize, &[GlyphInstance], &[u32])],
+    sub_slices: &[(usize, &[GlyphInstance])],
     written: usize,
     count: usize,
     item_params: &[ItemParamsGpu],
@@ -180,7 +146,7 @@ fn upload_staged_discrete(
     queue: &wgpu::Queue,
     label: &str,
     usage: wgpu::BufferUsages,
-    sub_slices: &[(usize, &[GlyphInstance], &[u32])],
+    sub_slices: &[(usize, &[GlyphInstance])],
     written: usize,
     count: usize,
     item_params: &[ItemParamsGpu],
@@ -225,8 +191,6 @@ pub fn upload_derived_slots(
     direct_host_upload: bool,
     item_params: &[ItemParamsGpu],
 ) -> HostUploadDerived {
-    let (line_table, line_indices) = build_line_table(slices, glyph_count);
-
     let binding_limit = device.limits().max_storage_buffer_binding_size as usize;
     let chunk_cap = (binding_limit / std::mem::size_of::<DerivedSlot>()).max(1);
     let mut chunk_counts: Vec<u32> = (0..glyph_count.div_ceil(chunk_cap).max(1))
@@ -237,13 +201,6 @@ pub fn upload_derived_slots(
         if *c == 0 {
             *c = 1;
         }
-    }
-
-    let mut line_offsets = Vec::with_capacity(slices.len());
-    let mut curr_line_off = 0usize;
-    for s in slices {
-        line_offsets.push(curr_line_off);
-        curr_line_off += s.len();
     }
 
     let mut ac = 0usize;
@@ -263,7 +220,7 @@ pub fn upload_derived_slots(
             let first = i * chunk_cap;
             let need_end = first + count as usize;
 
-            let mut sub_slices: Vec<(usize, &[GlyphInstance], &[u32])> = Vec::new();
+            let mut sub_slices: Vec<(usize, &[GlyphInstance])> = Vec::new();
             let mut written = 0usize;
             while written < count as usize && ac < slices.len() {
                 let c = slices[ac];
@@ -275,9 +232,7 @@ pub fn upload_derived_slots(
                 let lo = first.saturating_sub(arena_base);
                 let hi = (need_end - arena_base).min(c.len());
                 if hi > lo {
-                    let base_line_idx = line_offsets[ac] + lo;
-                    let line_slice = &line_indices[base_line_idx..base_line_idx + (hi - lo)];
-                    sub_slices.push((written, &c[lo..hi], line_slice));
+                    sub_slices.push((written, &c[lo..hi]));
                     written += hi - lo;
                 }
                 if hi == c.len() {
@@ -298,6 +253,5 @@ pub fn upload_derived_slots(
         chunk_capacity: chunk_cap,
         chunk_counts,
         buffers,
-        line_table,
     }
 }

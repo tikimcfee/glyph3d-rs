@@ -352,6 +352,7 @@ pub(crate) fn launch_block2_geometry(
     inputs: &ChainHostInputs,
     buf: &ChainBuffers,
     prof: &mut ChainProfiler,
+    emit_derived: bool,
 ) {
     let n_tiles = inputs.n_tiles;
     let n_words = inputs.n_words;
@@ -408,6 +409,7 @@ pub(crate) fn launch_block2_geometry(
             BufferArg::from_raw_parts(buf.h_segment_entry_advances.clone(), inputs.segment_entry_advances.len()),
             BufferArg::from_raw_parts(buf.h_instance_slots.clone(), buf.slots_words),
             BufferArg::from_raw_parts(buf.h_instance_tints.clone(), buf.tint_words),
+            emit_derived,
             units,
             rake,
             log,
@@ -584,6 +586,7 @@ pub fn prewarm_pipelines(client: &Client) {
             dummy(11, 1),
             dummy(9, 8),
             dummy(10, 2),
+            false,
             units,
             rake,
             log,

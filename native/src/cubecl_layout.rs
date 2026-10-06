@@ -61,20 +61,23 @@ pub struct CubeclLayout {
     /// device merge); `None` lets the chain construct its own.
     device: Option<crate::cubecl_chain::SharedDevice>,
     phases: CubeclPhases,
+    pub field_mode: glyph_field::GlyphFieldMode,
 }
 
 impl CubeclLayout {
-    pub fn new() -> Self {
-        Self::default()
+    pub fn new(field_mode: glyph_field::GlyphFieldMode) -> Self {
+        Self { device: None, phases: CubeclPhases::default(),
+            field_mode }
     }
 
     /// Share the caller's (the renderer's) GPU device — rung 5a's merge: the
     /// chain computes on the same device/queue that draws, and the second
     /// device of the rung-4 compromise never exists.
-    pub(crate) fn with_device(device: crate::cubecl_chain::SharedDevice) -> Self {
+    pub(crate) fn with_device(device: crate::cubecl_chain::SharedDevice, field_mode: glyph_field::GlyphFieldMode) -> Self {
         Self {
             device: Some(device),
-            ..Default::default()
+            phases: CubeclPhases::default(),
+            field_mode,
         }
     }
 
@@ -217,6 +220,7 @@ impl LayoutGlyphs for CubeclLayout {
             &fis,
             &inputs,
             false,
+            self.field_mode,
         );
         assert!(
             arena.is_empty(),
@@ -233,8 +237,12 @@ impl LayoutGlyphs for CubeclLayout {
                 mapped_slots: None,
                 file_tints: Vec::new(),
                 file_blocks: Vec::new(),
-                format: glyph_field::GlyphFieldMode::Instanced,
-                derived: None,
+                format: self.field_mode,
+                derived: if self.field_mode == glyph_field::GlyphFieldMode::Derived {
+                    Some(crate::layout::DerivedDeviceSlots { mapped_base: None })
+                } else {
+                    None
+                },
                 emoji_tint_pairs: Vec::new(),
             });
         }
@@ -267,6 +275,7 @@ impl VerifyLayout for CubeclLayout {
             &fis,
             &inputs,
             true,
+            self.field_mode,
         );
         assert!(
             arena.is_empty(),

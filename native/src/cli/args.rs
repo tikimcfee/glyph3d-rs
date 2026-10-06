@@ -473,6 +473,17 @@ pub fn parse_cli_from(matches: clap::ArgMatches) -> Cli {
                         cli.load_repo = Some(lr);
                     }
                 }
+                if matches.value_source("repo_engine")
+                    != Some(clap::parser::ValueSource::CommandLine)
+                {
+                    if let Some(re) = &cfg.repo_engine {
+                        if let Ok(parsed) = re.parse::<crate::repo::Strategy>() {
+                            cli.repo_engine = parsed;
+                        } else {
+                            log::warn!("unknown repo_engine in launch config: '{re}'");
+                        }
+                    }
+                }
                 if matches.value_source("field_mode")
                     != Some(clap::parser::ValueSource::CommandLine)
                 {

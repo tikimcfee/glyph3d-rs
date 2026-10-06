@@ -508,10 +508,6 @@ pub struct DeviceSlots {
 
 /// What a Derived-format device arena carries beside its 20 B slots.
 pub struct DerivedDeviceSlots {
-    /// `{item_idx, row}` per line, item-major: item `i`'s rows occupy
-    /// `line_base[i] .. line_base[i] + row_count[i]`, and a slot's `line_idx`
-    /// is `line_base + row` — written by Pass 2, no fix-up.
-    pub line_table: Vec<glyph_field::LineRecord>,
     /// Host address of the mapped `DerivedSlot` slice (unified memory), for
     /// in-place bulk color writes. None on staged (discrete) paths.
     pub mapped_base: Option<usize>,
@@ -822,14 +818,14 @@ impl LayoutEngine {
 
     /// Constructs a CubeCL layout engine if the feature is enabled.
     #[cfg(feature = "cubecl")]
-    pub fn cubecl() -> Self {
-        Self::Cubecl(crate::cubecl_layout::CubeclLayout::new())
+    pub fn cubecl(field_mode: glyph_field::GlyphFieldMode) -> Self {
+        Self::Cubecl(crate::cubecl_layout::CubeclLayout::new(field_mode))
     }
 
     /// Constructs a CubeCL layout engine sharing a GPU context device.
     #[cfg(feature = "cubecl")]
-    pub(crate) fn cubecl_with_device(device: crate::cubecl_chain::SharedDevice) -> Self {
-        Self::Cubecl(crate::cubecl_layout::CubeclLayout::with_device(device))
+    pub(crate) fn cubecl_with_device(device: crate::cubecl_chain::SharedDevice, field_mode: glyph_field::GlyphFieldMode) -> Self {
+        Self::Cubecl(crate::cubecl_layout::CubeclLayout::with_device(device, field_mode))
     }
 
     /// Retrieve generic backend execution phases.

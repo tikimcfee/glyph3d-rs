@@ -14,21 +14,21 @@ use bytemuck::{Pod, Zeroable};
 #[derive(Clone, Copy, Debug, PartialEq, Pod, Zeroable, encase::ShaderType)]
 pub struct DerivedSlot {
     pub x: f32,
-    pub line_idx: u32,
+    pub row: u32,
     pub glyph_and_wrap: u32,
     pub color: u32,
-    pub group_id: u32,
+    pub item_and_group: u32,
 }
 
 impl DerivedSlot {
     #[inline(always)]
-    pub fn new(x: f32, line_idx: u32, glyph_id: u16, wrap_segment: u16, color: u32, group_id: u32) -> Self {
+    pub fn new(x: f32, row: u32, glyph_id: u16, wrap_segment: u16, color: u32, item_idx: u16, group_id: u16) -> Self {
         Self {
             x,
-            line_idx,
+            row,
             glyph_and_wrap: (glyph_id as u32) | ((wrap_segment as u32) << 16),
             color,
-            group_id,
+            item_and_group: (item_idx as u32) | ((group_id as u32) << 16),
         }
     }
 
@@ -45,10 +45,10 @@ impl DerivedSlot {
 
 pub const SLOT_BYTES: u64 = 20;
 pub const X_OFFSET: u64 = 0;
-pub const LINE_IDX_OFFSET: u64 = 4;
+pub const ROW_OFFSET: u64 = 4;
 pub const GLYPH_AND_WRAP_OFFSET: u64 = 8;
 pub const COLOR_OFFSET: u64 = 12;
-pub const GROUP_ID_OFFSET: u64 = 16;
+pub const ITEM_AND_GROUP_OFFSET: u64 = 16;
 
 #[cfg(test)]
 mod tests {
@@ -59,15 +59,15 @@ mod tests {
         assert_eq!(std::mem::size_of::<DerivedSlot>(), 20);
         assert_eq!(std::mem::align_of::<DerivedSlot>(), 4);
         assert_eq!(core::mem::offset_of!(DerivedSlot, x) as u64, X_OFFSET);
-        assert_eq!(core::mem::offset_of!(DerivedSlot, line_idx) as u64, LINE_IDX_OFFSET);
+        assert_eq!(core::mem::offset_of!(DerivedSlot, row) as u64, ROW_OFFSET);
         assert_eq!(core::mem::offset_of!(DerivedSlot, glyph_and_wrap) as u64, GLYPH_AND_WRAP_OFFSET);
         assert_eq!(core::mem::offset_of!(DerivedSlot, color) as u64, COLOR_OFFSET);
-        assert_eq!(core::mem::offset_of!(DerivedSlot, group_id) as u64, GROUP_ID_OFFSET);
+        assert_eq!(core::mem::offset_of!(DerivedSlot, item_and_group) as u64, ITEM_AND_GROUP_OFFSET);
     }
 
     #[test]
     fn encase_bytes_match_bytemuck() {
-        let slot = DerivedSlot::new(123.456, 789, 42, 5, 0xDEADBEEF, 11);
+        let slot = DerivedSlot::new(123.456, 789, 42, 5, 0xDEADBEEF, 10, 11);
         let mut buf = Vec::<u8>::new();
         encase::StorageBuffer::new(&mut buf).write(&slot).unwrap();
         assert_eq!(buf.len(), 20);

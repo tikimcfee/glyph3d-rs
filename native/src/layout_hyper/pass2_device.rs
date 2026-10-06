@@ -26,6 +26,7 @@ pub(crate) struct EmitFields {
     pub glyph_id: u32,
     pub color: u32,
     pub group_id: u32,
+    pub item_idx: u32,
     pub advance: f32,
     pub height: f32,
     /// Item-local row (WrapDown rows included) — the Derived line key.
@@ -73,17 +74,18 @@ impl SlotEmit for DerivedEmit {
     type Slot = DerivedSlot;
     const USES_LINES: bool = true;
     #[inline(always)]
-    fn emit(f: &EmitFields, line_base: u32) -> DerivedSlot {
+    fn emit(f: &EmitFields, _line_base: u32) -> DerivedSlot {
         // Saturate like the host transcode's float->int cast did: a segment
         // past 65535 pins to the last step rather than wrapping to the front.
         let wrap = f.wrap_segment.clamp(0, u16::MAX as i64) as u16;
         DerivedSlot::new(
             f.pos[0],
-            line_base + f.row as u32,
+            f.row as u32,
             (f.glyph_id & 0xFFFF) as u16,
             wrap,
             f.color,
-            f.group_id,
+            (f.item_idx & 0xFFFF) as u16,
+            (f.group_id & 0xFFFF) as u16,
         )
     }
     #[inline(always)]
@@ -337,6 +339,7 @@ pub(crate) fn layout_pass2_device<E: SlotEmit>(
                         glyph_id: r.glyph_id,
                         color,
                         group_id,
+                        item_idx: item_idx as u32,
                         advance: r.advance,
                         height: r.height,
                         row,

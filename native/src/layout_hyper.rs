@@ -20,7 +20,7 @@ use crate::layout::{
 #[cfg(feature = "cubecl")]
 use crate::layout::TintStore;
 use crate::text::fu_to_world;
-use glyph_field::{GlyphFieldMode, LineRecord};
+use glyph_field::GlyphFieldMode;
 use glyph_field_derived::DerivedSlot;
 
 mod types;
@@ -177,17 +177,12 @@ impl HyperLayout {
             let (emission, derived_extras) = if derived {
                 let label = "derived glyph slots (direct)";
                 // The table depends only on Pass 1; build it alongside Pass 2.
-                let (emission, line_table) = rayon::join(
-                    || {
-                        if unified {
-                            layout_device_unified::<DerivedEmit>(dev, total_survivors, &inputs, label)
-                        } else {
-                            layout_device_discrete::<DerivedEmit>(dev, total_survivors, &inputs, label)
-                        }
-                    },
-                    || build_line_table(items, &prepasses, &line_bases),
-                );
-                let extras = DerivedDeviceSlots { line_table, mapped_base: emission.mapped_base };
+                let emission = if unified {
+                    layout_device_unified::<DerivedEmit>(dev, total_survivors, &inputs, label)
+                } else {
+                    layout_device_discrete::<DerivedEmit>(dev, total_survivors, &inputs, label)
+                };
+                let extras = DerivedDeviceSlots { mapped_base: emission.mapped_base };
                 (emission, Some(extras))
             } else {
                 let label = "glyph render slots (direct)";
@@ -418,41 +413,6 @@ fn pass1_prepass(
         .collect()
 }
 
-/// The Derived line table: item `i`'s rows `0..row_count[i]` at
-/// `line_bases[i]..`, each `{ item_idx: group_id, row }`. A pure function of
-/// Pass 1, so it runs concurrently with Pass 2. Every row gets an entry, even
-/// one no survivor lands on — the cost of knowing the bases up front, 8 B a row.
-fn build_line_table(
-    items: &[LayoutItem<'_>],
-    prepasses: &[ItemPrepass],
-    line_bases: &[u32],
-) -> Vec<LineRecord> {
-    let total = prepasses.iter().map(|p| p.row_count as usize).sum::<usize>();
-    if total == 0 {
-        return vec![LineRecord { item_idx: 0, row: 0 }];
-    }
-    let mut table: Vec<LineRecord> = Vec::with_capacity(total);
-    let spare = &mut table.spare_capacity_mut()[..total];
-    let mut pieces = Vec::with_capacity(items.len());
-    let mut rest = spare;
-    for pre in prepasses {
-        let (head, tail) = rest.split_at_mut(pre.row_count as usize);
-        pieces.push(head);
-        rest = tail;
-    }
-    debug_assert!(line_bases.len() == items.len());
-    pieces
-        .into_par_iter()
-        .zip(items.par_iter())
-        .for_each(|(piece, item)| {
-            for (row, slot) in piece.iter_mut().enumerate() {
-                slot.write(LineRecord { item_idx: item.group_id, row: row as u32 });
-            }
-        });
-    // SAFETY: the pieces partition exactly `total` slots and each was written.
-    unsafe { table.set_len(total) };
-    table
-}
 
 impl crate::layout::VerifyLayout for HyperLayout {
     fn layout_validated_items_recording(
@@ -704,8 +664,6 @@ mod tests {
             em_height_fu,
         };
         let (out, _pairs) = inputs.run::<DerivedEmit>(direct.as_mut_ptr() as usize);
-        let line_table = build_line_table(&items, &prepasses, &line_bases);
-        assert_eq!(line_table.len(), lines_acc as usize);
 
         assert_eq!(out.placements.len(), host_places.len());
         for (a, b) in out.placements.iter().zip(&host_places) {
@@ -718,13 +676,12 @@ mod tests {
             } else {
                 0
             };
-            let line = line_table[d.line_idx as usize];
             assert_eq!(d.x.to_bits(), h.pos[0].to_bits(), "slot {k}: x");
             assert_eq!(d.glyph_and_wrap & 0xFFFF, h.glyph_id & 0xFFFF, "slot {k}: glyph");
             assert_eq!(d.glyph_and_wrap >> 16, want_wrap, "slot {k}: wrap segment");
             assert_eq!(d.color, h.color, "slot {k}: color");
-            assert_eq!(d.group_id, h.group_id, "slot {k}: group");
-            assert_eq!((line.item_idx, line.row), (h.group_id, h.row), "slot {k}: line");
+            assert_eq!((d.item_and_group >> 16), h.group_id, "slot {k}: group");
+            assert_eq!(d.row, h.row, "slot {k}: row");
         }
     }
 }

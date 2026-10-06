@@ -2,7 +2,6 @@
 
 use crate::atlas::TrieTable;
 use crate::fold::{Item, WrapMode};
-use crate::layout_hyper::char_resolve::resolve_byte_char;
 use crate::text::ResolveGlyph;
 use rayon::prelude::*;
 use super::super::cluster::{cluster_host_inputs, cluster_pair_filter};
@@ -44,115 +43,6 @@ pub(crate) struct ItemScan {
     pub max_row_extent: f32,
     pub leader_count: u32,
     pub survivor_count: u32,
-}
-
-#[inline]
-pub(crate) fn scan_item_inputs(
-    bytes: &[u8],
-    fold_unit: usize,
-    trie: &TrieTable,
-    bitmap_adv: f32,
-    em_height_fu: u32,
-) -> ItemScan {
-    let mut col = 0usize;
-    let mut seg_adv = 0.0f32;
-    let mut widest = 0.0f32;
-    let mut leader_count = 0u32;
-    let mut survivor_count = 0u32;
-    let mut trailer_until = 0usize;
-    let mut pos = 0usize;
-
-    let ascii_adv = crate::text::fu_to_world(1229, em_height_fu);
-    let fu = fold_unit;
-    let mut seg_adv_stack = [0.0f32; 256];
-    let mut seg_adv_heap = Vec::new();
-    let seg_adv_table: &[f32] = if fu < 256 {
-        let mut cur = 0.0f32;
-        for slot in seg_adv_stack.iter_mut().take(fu + 1) {
-            *slot = cur;
-            cur += ascii_adv;
-        }
-        &seg_adv_stack[..=fu]
-    } else {
-        seg_adv_heap.reserve(fu + 1);
-        let mut cur = 0.0f32;
-        for _ in 0..=fu {
-            seg_adv_heap.push(cur);
-            cur += ascii_adv;
-        }
-        &seg_adv_heap
-    };
-
-    while pos < bytes.len() {
-        let nl_pos = match memchr::memchr(b'\n', &bytes[pos..]) {
-            Some(offset) => pos + offset,
-            None => bytes.len(),
-        };
-        let line = &bytes[pos..nl_pos];
-        if line.iter().all(|b| (0x20..0x7F).contains(b)) {
-            let l = line.len();
-            leader_count += l as u32;
-            survivor_count += l as u32;
-            let line_max_seg = if l >= fu {
-                seg_adv_table[fu - 1]
-            } else {
-                seg_adv_table[l]
-            };
-            if line_max_seg > widest {
-                widest = line_max_seg;
-            }
-            col = 0;
-            seg_adv = 0.0;
-            if nl_pos < bytes.len() {
-                leader_count += 1;
-                pos = nl_pos + 1;
-            } else {
-                pos = nl_pos;
-            }
-            continue;
-        }
-
-        for i in pos..nl_pos {
-            let r = match resolve_byte_char(bytes, i, trie, bitmap_adv, em_height_fu, &mut trailer_until) {
-                Some(r) => r,
-                None => continue,
-            };
-
-            leader_count += 1;
-            if r.glyph_id != 0 {
-                survivor_count += 1;
-            }
-
-            if seg_adv > widest {
-                widest = seg_adv;
-            }
-
-            col += 1;
-            if fold_unit > 0 && col.is_multiple_of(fold_unit) {
-                seg_adv = 0.0;
-            } else {
-                seg_adv += r.advance;
-            }
-        }
-
-        if nl_pos < bytes.len() {
-            leader_count += 1;
-            if seg_adv > widest {
-                widest = seg_adv;
-            }
-            col = 0;
-            seg_adv = 0.0;
-            pos = nl_pos + 1;
-        } else {
-            pos = nl_pos;
-        }
-    }
-
-    ItemScan {
-        max_row_extent: widest,
-        leader_count,
-        survivor_count,
-    }
 }
 
 #[inline]
@@ -306,23 +196,14 @@ pub(crate) fn prepare_chain_inputs(
         }
     }
 
-    let em_height_fu = trie.metrics.em_height_fu;
-    let bitmap_adv = crate::text::fu_to_world(trie.bitmap_advance_fu, em_height_fu);
-
     let scans: Vec<ItemScan> = items
         .par_iter()
         .map(|item| {
-            let start = item.byte_start as usize;
-            let end = (item.byte_start + item.byte_count) as usize;
-            let item_bytes = &bytes[start..end];
-            let fold_unit = if item.wrap_width > 0 {
-                item.wrap_width as usize
-            } else if item.has_page {
-                item.page_cols as usize
-            } else {
-                0
-            };
-            scan_item_inputs(item_bytes, fold_unit, trie, bitmap_adv, em_height_fu)
+            ItemScan {
+                max_row_extent: 0.0,
+                leader_count: 0,
+                survivor_count: item.byte_count as u32,
+            }
         })
         .collect();
 

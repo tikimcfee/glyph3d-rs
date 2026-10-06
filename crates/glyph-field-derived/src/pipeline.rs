@@ -3,8 +3,8 @@
 use glyph_field::{shared_layout_entries, FieldTargets, BINDING_SLOTS};
 
 pub const BINDING_LINE_TABLE: u32 = 8;
-pub const BINDING_ITEM_TABLE: u32 = 9;
-pub const BINDING_GLYPH_ADVANCES: u32 = 10;
+pub const BINDING_ITEM_TABLE: u32 = 8;
+pub const BINDING_GLYPH_ADVANCES: u32 = 9;
 
 /// Creates the bind group layout for derived glyph field rendering (bindings 0..10):
 /// 0: frame uniform
@@ -22,16 +22,6 @@ pub fn build_glyph_bgl(device: &wgpu::Device) -> wgpu::BindGroupLayout {
     let [frame_uniform, rest @ ..] = shared_layout_entries();
     let slot_storage = wgpu::BindGroupLayoutEntry {
         binding: BINDING_SLOTS,
-        visibility: wgpu::ShaderStages::VERTEX,
-        ty: wgpu::BindingType::Buffer {
-            ty: wgpu::BufferBindingType::Storage { read_only: true },
-            has_dynamic_offset: false,
-            min_binding_size: None,
-        },
-        count: None,
-    };
-    let line_table = wgpu::BindGroupLayoutEntry {
-        binding: BINDING_LINE_TABLE,
         visibility: wgpu::ShaderStages::VERTEX,
         ty: wgpu::BindingType::Buffer {
             ty: wgpu::BufferBindingType::Storage { read_only: true },
@@ -65,7 +55,7 @@ pub fn build_glyph_bgl(device: &wgpu::Device) -> wgpu::BindGroupLayout {
     entries.push(frame_uniform);
     entries.push(slot_storage);
     entries.extend(rest);
-    entries.push(line_table);
+
     entries.push(item_table);
     entries.push(glyph_advances);
 

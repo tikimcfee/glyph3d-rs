@@ -128,6 +128,7 @@ pub(crate) fn run_repo_chain(
     items: &[crate::fold::Item],
     inputs: &InstanceInputs,
     readback_slots: bool,
+    field_mode: glyph_field::GlyphFieldMode,
 ) -> ChainStream {
     let item_count = items.len();
     let n: usize = bytes.len();
@@ -194,6 +195,7 @@ pub(crate) fn run_repo_chain(
         inputs,
         &trie,
         needs_tint,
+        field_mode == glyph_field::GlyphFieldMode::Derived,
     );
 
     let t_dispatch = std::time::Instant::now();
@@ -228,6 +230,7 @@ pub(crate) fn run_repo_chain(
         &host_inputs,
         &buf,
         &mut prof,
+        field_mode == glyph_field::GlyphFieldMode::Derived,
     );
 
     let t_rb = std::time::Instant::now();

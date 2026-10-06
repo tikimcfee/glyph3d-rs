@@ -21,6 +21,7 @@ pub struct LaunchConfig {
     pub greek_smooth: Option<bool>,
     pub greek_onset_px: Option<f32>,
     pub load_repo: Option<PathBuf>,
+    pub repo_engine: Option<String>,
     pub field_mode: Option<String>,
     pub claude_projects_dir: Option<PathBuf>,
     pub antigravity_brain_dir: Option<PathBuf>,
@@ -126,6 +127,9 @@ impl LaunchConfig {
                 }
                 "load_repo" => {
                     cfg.load_repo = Some(PathBuf::from(strip_quotes(val)));
+                }
+                "repo_engine" => {
+                    cfg.repo_engine = Some(strip_quotes(val));
                 }
                 "field_mode" => {
                     cfg.field_mode = Some(strip_quotes(val));

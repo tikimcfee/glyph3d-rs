@@ -48,7 +48,7 @@ impl InstancedField {
         targets: FieldTargets,
     ) -> Self {
         let storage = match source {
-            SlotSource::Device { chunk_capacity, chunks, mapped_base, glyph_count, line_table: _ } => {
+            SlotSource::Device { chunk_capacity, chunks, mapped_base, glyph_count, .. } => {
                 SlotStorage::new(chunks.to_vec(), chunk_capacity, glyph_count, mapped_base)
             }
             SlotSource::Host { slices, glyph_count, direct_host_upload } => {

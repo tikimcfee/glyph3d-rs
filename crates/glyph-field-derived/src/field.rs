@@ -10,7 +10,7 @@ use wgpu::util::DeviceExt;
 
 use crate::pipeline::{
     build_glyph_bgl, build_glyph_pipeline, build_mask_pipeline, BINDING_GLYPH_ADVANCES,
-    BINDING_ITEM_TABLE, BINDING_LINE_TABLE,
+    BINDING_ITEM_TABLE,
 };
 use crate::slot::{DerivedSlot, COLOR_OFFSET, SLOT_BYTES};
 use crate::storage::DerivedSlotStorage;
@@ -22,7 +22,6 @@ pub struct DerivedField {
     shader: wgpu::ShaderModule,
     pipeline_layout: wgpu::PipelineLayout,
     quad_index_buffer: wgpu::Buffer,
-    _line_table_buffer: wgpu::Buffer,
     _item_table_buffer: wgpu::Buffer,
     bind_groups: Vec<wgpu::BindGroup>,
     storage: DerivedSlotStorage,
@@ -43,18 +42,13 @@ impl DerivedField {
             resources.item_params
         };
 
-        let (storage, line_table) = match source {
-            SlotSource::Device { chunk_capacity, chunks, mapped_base, glyph_count, line_table } => {
+        let storage = match source {
+            SlotSource::Device { chunk_capacity, chunks, mapped_base, glyph_count, .. } => {
                 // A device source for this field is the producer's direct
                 // Derived emission (HyperLayout Pass 2): 20 B slots whose
                 // `line_idx` already indexes this table. No upload, no
                 // transcode — bind as-is.
-                let line_table = line_table.expect(
-                    "Derived field given a device source without a line table: \
-                     the producer emitted another field's slot format",
-                );
-                let storage = DerivedSlotStorage::new(chunks.to_vec(), chunk_capacity, glyph_count, mapped_base);
-                (storage, std::borrow::Cow::Borrowed(line_table))
+                DerivedSlotStorage::new(chunks.to_vec(), chunk_capacity, glyph_count, mapped_base)
             }
             SlotSource::Host { slices, glyph_count, direct_host_upload } => {
                 let upload = upload_derived_slots(device, queue, &slices, glyph_count, direct_host_upload, item_params);
@@ -64,8 +58,7 @@ impl DerivedField {
                     .zip(upload.chunk_counts.iter())
                     .map(|(buffer, &slots)| SlotChunk { buffer, offset: 0, slots })
                     .collect();
-                let storage = DerivedSlotStorage::new(chunks, upload.chunk_capacity, glyph_count, None);
-                (storage, std::borrow::Cow::Owned(upload.line_table))
+                DerivedSlotStorage::new(chunks, upload.chunk_capacity, glyph_count, None)
             }
         };
 
@@ -74,13 +67,6 @@ impl DerivedField {
             contents: bytemuck::cast_slice(&[0u16, 1, 2, 0, 2, 3]),
             usage: wgpu::BufferUsages::INDEX,
         });
-
-        let line_table_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("derived line table"),
-            contents: bytemuck::cast_slice(&line_table),
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-        });
-
         let item_table_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("derived item table"),
             contents: bytemuck::cast_slice(item_params),
@@ -93,7 +79,6 @@ impl DerivedField {
             &bgl,
             &storage.chunks,
             resources,
-            &line_table_buffer,
             &item_table_buffer,
         );
         let (shader, pipeline_layout, pipeline) = build_glyph_pipeline(device, &bgl, targets);
@@ -103,7 +88,6 @@ impl DerivedField {
             shader,
             pipeline_layout,
             quad_index_buffer,
-            _line_table_buffer: line_table_buffer,
             _item_table_buffer: item_table_buffer,
             bind_groups,
             storage,
@@ -116,7 +100,6 @@ fn build_chunk_bind_groups(
     bgl: &wgpu::BindGroupLayout,
     chunks: &[SlotChunk],
     resources: &FieldResources<'_>,
-    line_table_buf: &wgpu::Buffer,
     item_table_buf: &wgpu::Buffer,
 ) -> Vec<wgpu::BindGroup> {
     let bind_group_count = chunks.len();
@@ -137,12 +120,7 @@ fn build_chunk_bind_groups(
                     offset: chunk.offset,
                     size: std::num::NonZeroU64::new(chunk.slots as u64 * SLOT_BYTES),
                 }),
-            };
-            let line_storage = wgpu::BindGroupEntry {
-                binding: BINDING_LINE_TABLE,
-                resource: line_table_buf.as_entire_binding(),
-            };
-            let item_storage = wgpu::BindGroupEntry {
+            };            let item_storage = wgpu::BindGroupEntry {
                 binding: BINDING_ITEM_TABLE,
                 resource: item_table_buf.as_entire_binding(),
             };
@@ -155,7 +133,7 @@ fn build_chunk_bind_groups(
             entries.push(frame_uniform);
             entries.push(slot_storage);
             entries.extend(rest);
-            entries.push(line_storage);
+            
             entries.push(item_storage);
             entries.push(advances_storage);
 
@@ -240,7 +218,8 @@ impl GlyphField for DerivedField {
                     p.glyph_id as u16,
                     0,
                     p.color,
-                    p.group_id,
+                    (p.group_id & 0xFFFF) as u16,
+                    (p.group_id & 0xFFFF) as u16,
                 )
             })
             .collect();

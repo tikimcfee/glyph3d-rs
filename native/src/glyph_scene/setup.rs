@@ -191,7 +191,6 @@ impl GlyphScene {
                     mapped_base: dev
                         .mapped_slots
                         .or_else(|| dev.derived.as_ref().and_then(|d| d.mapped_base)),
-                    line_table: dev.derived.as_ref().map(|d| d.line_table.as_slice()),
                 }
             }
             None => SlotSource::Host {

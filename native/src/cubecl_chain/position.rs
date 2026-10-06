@@ -303,6 +303,7 @@ pub(super) fn apply_and_emit(
     segment_entry_advances: &[f32],
     instance_slots: &mut [u32],
     instance_tints: &mut [u32],
+    #[comptime] emit_derived: bool,
     #[comptime] units: usize,
     #[comptime] rake: usize,
     #[comptime] log: usize,
@@ -786,16 +787,28 @@ pub(super) fn apply_and_emit(
                     } else {
                         item_flat_color
                     };
-                    let slot_word_offset = survivor_ordinal as usize * 8;
-                    if slot_word_offset + 8 <= instance_slots.len() {
-                        instance_slots[slot_word_offset] = final_x.to_bits();
-                        instance_slots[slot_word_offset + 1] = final_y.to_bits();
-                        instance_slots[slot_word_offset + 2] = final_z.to_bits();
-                        instance_slots[slot_word_offset + 3] = glyph_indices[id];
-                        instance_slots[slot_word_offset + 4] = color;
-                        instance_slots[slot_word_offset + 5] = item_group_id;
-                        instance_slots[slot_word_offset + 6] = glyph_advance.to_bits();
-                        instance_slots[slot_word_offset + 7] = 0x3f800000; // 1.0f32.to_bits()
+                    if emit_derived {
+                        let slot_word_offset = survivor_ordinal as usize * 5;
+                        if slot_word_offset + 5 <= instance_slots.len() {
+                            let glyph_and_wrap = glyph_indices[id] | ((wrap_segment as u32) << 16u32);
+                            instance_slots[slot_word_offset] = final_x.to_bits();
+                            instance_slots[slot_word_offset + 1] = row as u32;
+                            instance_slots[slot_word_offset + 2] = glyph_and_wrap;
+                            instance_slots[slot_word_offset + 3] = color;
+                            instance_slots[slot_word_offset + 4] = (item_index as u32 & 0xFFFFu32) | ((item_group_id & 0xFFFFu32) << 16u32);
+                        }
+                    } else {
+                        let slot_word_offset = survivor_ordinal as usize * 8;
+                        if slot_word_offset + 8 <= instance_slots.len() {
+                            instance_slots[slot_word_offset] = final_x.to_bits();
+                            instance_slots[slot_word_offset + 1] = final_y.to_bits();
+                            instance_slots[slot_word_offset + 2] = final_z.to_bits();
+                            instance_slots[slot_word_offset + 3] = glyph_indices[id];
+                            instance_slots[slot_word_offset + 4] = color;
+                            instance_slots[slot_word_offset + 5] = item_group_id;
+                            instance_slots[slot_word_offset + 6] = glyph_advance.to_bits();
+                            instance_slots[slot_word_offset + 7] = 0x3f800000u32; // 1.0f32.to_bits()
+                        }
                     }
                     let tint_word_offset = survivor_ordinal as usize * 2;
                     if tint_word_offset + 2 <= instance_tints.len() {

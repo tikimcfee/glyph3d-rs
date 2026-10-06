@@ -103,6 +103,7 @@ pub fn repo_check(ctx: &GpuContext, dir: &Path, color_mode: crate::repo::ColorMo
         &fis,
         &inputs,
         true,
+        glyph_field::GlyphFieldMode::Instanced,
     );
     let total_slots = stream.total_slots;
     let c = stream.candidates;

@@ -107,6 +107,7 @@ pub(crate) struct BufferAllocationResult {
 }
 
 #[inline]
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn allocate_chain_buffers(
     client: &Client,
     bytes: &[u8],
@@ -115,6 +116,7 @@ pub(crate) fn allocate_chain_buffers(
     instance_inputs: &InstanceInputs,
     trie: &TrieTable,
     needs_tint: bool,
+    is_derived: bool,
 ) -> BufferAllocationResult {
     let n = bytes.len();
     let n_words = inputs.n_words;
@@ -172,9 +174,10 @@ pub(crate) fn allocate_chain_buffers(
     };
     let h_segment_entry_advances = alloc_upload(bytemuck::cast_slice(&inputs.segment_entry_advances));
     let total_slots = inputs.total_slots;
+    let slot_words = if is_derived { 5 } else { 8 };
     let (h_instance_slots, slots_words) = (
-        alloc_empty(total_slots.max(1) as usize * 8 * 4),
-        total_slots.max(1) as usize * 8,
+        alloc_empty(total_slots.max(1) as usize * slot_words * 4),
+        total_slots.max(1) as usize * slot_words,
     );
     let (h_instance_tints, tint_words) = if needs_tint {
         (

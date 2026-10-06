@@ -2,7 +2,7 @@
 
 use glyph_field::{split_at_chunks, SlotChunk};
 
-use crate::slot::{DerivedSlot, COLOR_OFFSET, GROUP_ID_OFFSET, SLOT_BYTES, X_OFFSET};
+use crate::slot::{DerivedSlot, COLOR_OFFSET, ITEM_AND_GROUP_OFFSET, SLOT_BYTES, X_OFFSET};
 
 /// Where the Derived field's `DerivedSlot`s live: one buffer range per chunk.
 pub struct DerivedSlotStorage {
@@ -85,6 +85,6 @@ impl DerivedSlotStorage {
     }
 
     pub(crate) fn write_group_id(&self, queue: &wgpu::Queue, slot: u32, group_id: u32) {
-        self.write_field(queue, slot, GROUP_ID_OFFSET, bytemuck::bytes_of(&group_id));
+        self.write_field(queue, slot, ITEM_AND_GROUP_OFFSET, bytemuck::bytes_of(&group_id));
     }
 }
