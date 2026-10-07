@@ -168,6 +168,7 @@ pub(super) fn byte_from_pair(curr: u32, next: u32, offset: usize, id: usize, n: 
 /// Codepoints are decoded once in registers, eliminating the 97 MB VRAM
 /// round-trip of `fl`, redundant `seq_len_at`/`cp_at` re-evaluations, and
 /// an entire 95-million-thread dispatch from the critical path.
+#[allow(clippy::manual_range_contains)]
 #[cube(launch_unchecked)]
 pub(super) fn decode_probe(
     bytes: &[u32],
@@ -193,12 +194,6 @@ pub(super) fn decode_probe(
     let word_index = ABSOLUTE_POS;
     let total_bytes = bytes.len() * 4;
     let item_count = item_record_bounds.len() / 2;
-    #[allow(clippy::len_zero)]
-    let ascii_block_base = if block_index.len() > 0 {
-        block_index[0] << block_shift
-    } else {
-        0u32
-    };
     if word_index < glyph_flags.len() {
         let curr_word = bytes[word_index];
         let next_word = if word_index + 1 < bytes.len() {
@@ -241,35 +236,43 @@ pub(super) fn decode_probe(
                             }
                         }
                     };
-                    let entry_offset = if is_ascii {
-                        (ascii_block_base | lead_byte) as usize
+                    let mut flag = if is_ascii {
+                        F_LEADER
+                            | (if lead_byte == 10u32 {
+                                F_NEWLINE
+                            } else {
+                                0u32
+                            })
+                            | (if lead_byte >= 32u32 && lead_byte <= 126u32 {
+                                F_SURVIVOR
+                            } else {
+                                0u32
+                            })
                     } else {
                         let block = if codepoint <= 0x10FFFFu32 {
                             block_index[(codepoint >> block_shift) as usize]
                         } else {
                             0u32
                         };
-                        ((block << block_shift) | (codepoint & 0xFFu32)) as usize
+                        let entry_offset = ((block << block_shift) | (codepoint & 0xFFu32)) as usize;
+                        let glyph_id = blocks_c[entry_offset * 2];
+                        F_LEADER
+                            | (if lead_byte == 10u32 {
+                                F_NEWLINE
+                            } else {
+                                0u32
+                            })
+                            | (if blocks_c[entry_offset * 2 + 1] & TRIE_FLAG_MISSING != 0 {
+                                F_MISSING
+                            } else {
+                                0u32
+                            })
+                            | (if glyph_id != 0u32 {
+                                F_SURVIVOR
+                            } else {
+                                0u32
+                            })
                     };
-                    
-                    let glyph_id = blocks_c[entry_offset * 2];
-                    
-                    let mut flag = F_LEADER
-                        | (if lead_byte == 10u32 {
-                            F_NEWLINE
-                        } else {
-                            0u32
-                        })
-                        | (if blocks_c[entry_offset * 2 + 1] & TRIE_FLAG_MISSING != 0 {
-                            F_MISSING
-                        } else {
-                            0u32
-                        })
-                        | (if glyph_id != 0u32 {
-                            F_SURVIVOR
-                        } else {
-                            0u32
-                        });
 
                     let is_sz = if is_ascii { 0u32 } else { is_static_zero(codepoint) };
                     let mut is_candidate_head = 0u32;

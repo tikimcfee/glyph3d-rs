@@ -260,10 +260,12 @@ pub(crate) fn prepare_chain_inputs<'a>(
         leader_totals.push(pre.leader_count);
         survivor_totals.push(pre.survivor_count);
     }
-    let has_cluster = prepasses
+    let cluster_count = prepasses
         .iter()
         .zip(items)
-        .any(|(pre, it)| pre.has_cluster && it.cluster_mode == crate::fold::ClusterMode::Cluster);
+        .filter(|(pre, it)| pre.has_cluster && it.cluster_mode == crate::fold::ClusterMode::Cluster)
+        .count();
+    let has_cluster = cluster_count > 0;
 
     let t_place0 = std::time::Instant::now();
     let placements: Vec<crate::layout::ItemPlacement> = if wants_instances {
@@ -299,10 +301,11 @@ pub(crate) fn prepare_chain_inputs<'a>(
     let dur_placements = t_place0.elapsed();
 
     tracing::info!(
-        "tables breakdown: prepass {:?}, placements {:?} (has_cluster: {})",
+        "tables breakdown: prepass {:?}, placements {:?} (has_cluster: {}, cluster_items: {})",
         dur_prepass,
         dur_placements,
         has_cluster,
+        cluster_count,
     );
 
     ChainHostInputs {

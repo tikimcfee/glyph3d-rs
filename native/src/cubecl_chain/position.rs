@@ -405,26 +405,38 @@ pub(super) fn apply_and_emit(
 
     let total_tile_bytes = threads_per_cube * bytes_per_thread;
     let tile_byte_start = tile_idx * total_tile_bytes;
-    let tile_word_start = tile_byte_start >> 2;
-    let total_tile_words = total_tile_bytes.div_ceil(4);
 
     let mut shared_tile_flags = Shared::<[u32]>::new_slice((threads_per_cube * bytes_per_thread) / 4);
 
-    let mut preload_word_idx = unit_idx;
-    while preload_word_idx < total_tile_words {
-        let global_word_idx = tile_word_start + preload_word_idx;
-        shared_tile_flags[preload_word_idx] = if global_word_idx < glyph_flags.len() {
-            glyph_flags[global_word_idx]
-        } else {
-            0u32
-        };
-        preload_word_idx += threads_per_cube;
-    }
+    let thread_word_idx = range_start >> 2;
+    let thread_flags_word0 = if thread_word_idx < glyph_flags.len() {
+        glyph_flags[thread_word_idx]
+    } else {
+        0u32
+    };
+    let thread_flags_word1 = if thread_word_idx + 1 < glyph_flags.len() {
+        glyph_flags[thread_word_idx + 1]
+    } else {
+        0u32
+    };
+    let thread_bytes_word0 = if thread_word_idx < bytes.len() {
+        bytes[thread_word_idx]
+    } else {
+        0x8080_8080u32
+    };
+    let thread_bytes_word1 = if thread_word_idx + 1 < bytes.len() {
+        bytes[thread_word_idx + 1]
+    } else {
+        0x8080_8080u32
+    };
+    shared_tile_flags[unit_idx * 2] = thread_flags_word0;
+    shared_tile_flags[unit_idx * 2 + 1] = thread_flags_word1;
     sync_cube();
 
     // Phase 1: Serial rake of this unit's bytes into one monoid accumulator
     let mut accumulator = identity();
     let mut item_index = 0usize;
+    let mut initial_item_index = 0usize;
     let mut start = 0usize;
     let mut next_item_boundary = total_bytes;
     let mut active_wrap_width = 0i32;
@@ -433,6 +445,7 @@ pub(super) fn apply_and_emit(
     let has_items = item_count > 0;
     if has_items {
         item_index = item_search_desc(item_descriptors, item_count, range_start);
+        initial_item_index = item_index;
         start = item_descriptors[item_index * ITEM_DESC_STRIDE + ITEM_DESC_BYTE_START] as usize;
         next_item_boundary = if item_index + 1 < item_count {
             item_descriptors[(item_index + 1) * ITEM_DESC_STRIDE + ITEM_DESC_BYTE_START] as usize
@@ -446,17 +459,6 @@ pub(super) fn apply_and_emit(
     let mut thread_local_advances = Array::<f32>::new(bytes_per_thread);
     let mut local_byte_offset = 0usize;
     if range_start < total_bytes {
-        let thread_word_idx = range_start >> 2;
-        let phase1_bytes_word0 = if thread_word_idx < bytes.len() {
-            bytes[thread_word_idx]
-        } else {
-            0x8080_8080u32
-        };
-        let phase1_bytes_word1 = if thread_word_idx + 1 < bytes.len() {
-            bytes[thread_word_idx + 1]
-        } else {
-            0x8080_8080u32
-        };
         let mut id = range_start;
         while id < range_end {
             while has_items && next_item_boundary <= id {
@@ -472,19 +474,22 @@ pub(super) fn apply_and_emit(
                 active_cell_advance_bits = item_descriptors[item_index * ITEM_DESC_STRIDE + ITEM_DESC_CELL_ADVANCE];
             }
             let reset = if has_items && id == start { 1i32 } else { 0i32 };
-            let local_id = id - tile_byte_start;
-            let flag = (shared_tile_flags[local_id >> 2] >> (((local_id & 3) * 8) as u32)) & 0xFF;
+            let lane = id - range_start;
+            let flag = if lane < 4 {
+                (thread_flags_word0 >> ((lane * 8) as u32)) & 0xFF
+            } else {
+                (thread_flags_word1 >> (((lane - 4) * 8) as u32)) & 0xFF
+            };
             let advance = if (flag & F_LEADER) != 0 {
                 if (flag & F_CLUSTER_HEAD) != 0 {
                     bitmap_advance
                 } else if (flag & F_CLUSTER_TRAILER) != 0 {
                     0.0f32
                 } else {
-                    let lane = id - range_start;
                     let lead_byte = if lane < 4 {
-                        (phase1_bytes_word0 >> ((lane * 8) as u32)) & 0xFF
+                        (thread_bytes_word0 >> ((lane * 8) as u32)) & 0xFF
                     } else {
-                        (phase1_bytes_word1 >> (((lane - 4) * 8) as u32)) & 0xFF
+                        (thread_bytes_word1 >> (((lane - 4) * 8) as u32)) & 0xFF
                     };
                     if lead_byte >= 32u32 && lead_byte <= 126u32 {
                         f32::from_bits(active_cell_advance_bits)
@@ -503,8 +508,22 @@ pub(super) fn apply_and_emit(
             };
             thread_local_advances[local_byte_offset] = advance;
             local_byte_offset += 1;
-            let leaf = leaf_from_flag(flag, advance, active_wrap_width, active_wrap_mode, reset, active_cell_advance_bits);
-            combine(&mut accumulator, &leaf);
+            let is_surv = is_survivor(flag);
+            if (flag & F_NEWLINE) == 0 && (flag & F_LEADER) != 0 && advance.to_bits() == active_cell_advance_bits && reset == 0 {
+                accumulator.clean_len += 1;
+                accumulator.tail_len += 1;
+                accumulator.tail_adv += advance;
+                if accumulator.nl == 0 {
+                    accumulator.head_len = accumulator.tail_len;
+                }
+                accumulator.glyphs += 1;
+                if is_surv {
+                    accumulator.survivors += 1;
+                }
+            } else {
+                let leaf = leaf_from_flag(flag, advance, active_wrap_width, active_wrap_mode, reset, active_cell_advance_bits);
+                combine(&mut accumulator, &leaf);
+            }
             id += 1;
         }
     } else {
@@ -627,8 +646,10 @@ pub(super) fn apply_and_emit(
     let mut item_flat_color = 0u32;
     let mut item_group_id = 0u32;
 
+    let mut has_page_active = false;
+    let mut item_and_group_word = 0u32;
     if has_items {
-        item_index = item_search_desc(item_descriptors, item_count, range_start);
+        item_index = initial_item_index;
         start = item_descriptors[item_index * ITEM_DESC_STRIDE + ITEM_DESC_BYTE_START] as usize;
         next_item_boundary = if item_index + 1 < item_count {
             item_descriptors[(item_index + 1) * ITEM_DESC_STRIDE + ITEM_DESC_BYTE_START] as usize
@@ -668,6 +689,8 @@ pub(super) fn apply_and_emit(
         item_is_per_record = item_descriptors[descriptor_offset + ITEM_DESC_IS_PER_RECORD];
         item_flat_color = item_descriptors[descriptor_offset + ITEM_DESC_FLAT_COLOR];
         item_group_id = item_descriptors[descriptor_offset + ITEM_DESC_GROUP];
+        has_page_active = page_rows != 0 || page_cols != 0 || scroll_rows != 0;
+        item_and_group_word = (item_index as u32 & 0xFFFFu32) | ((item_group_id & 0xFFFFu32) << 16u32);
     }
     let mut current_advance_x = 0.0f32;
     let mut in_segment = false;
@@ -682,17 +705,6 @@ pub(super) fn apply_and_emit(
     let mut seen_survivor_on_line = false;
 
     if range_start < total_bytes {
-        let thread_word_idx = range_start >> 2;
-        let phase3_bytes_word0 = if thread_word_idx < bytes.len() {
-            bytes[thread_word_idx]
-        } else {
-            0x8080_8080u32
-        };
-        let phase3_bytes_word1 = if thread_word_idx + 1 < bytes.len() {
-            bytes[thread_word_idx + 1]
-        } else {
-            0x8080_8080u32
-        };
         let mut id = range_start;
         while id < range_end {
             while has_items && next_item_boundary <= id {
@@ -782,6 +794,8 @@ pub(super) fn apply_and_emit(
                 item_is_per_record = item_descriptors[descriptor_offset + ITEM_DESC_IS_PER_RECORD];
                 item_flat_color = item_descriptors[descriptor_offset + ITEM_DESC_FLAT_COLOR];
                 item_group_id = item_descriptors[descriptor_offset + ITEM_DESC_GROUP];
+                has_page_active = page_rows != 0 || page_cols != 0 || scroll_rows != 0;
+                item_and_group_word = (item_index as u32 & 0xFFFFu32) | ((item_group_id & 0xFFFFu32) << 16u32);
 
                 in_segment = false;
                 prev_row = i32::new(-1);
@@ -808,8 +822,13 @@ pub(super) fn apply_and_emit(
                 prev_x_page = i32::new(-1);
                 seen_survivor_on_line = false;
             }
-            let local_id = id - tile_byte_start;
-            let glyph_flags_val = (shared_tile_flags[local_id >> 2] >> (((local_id & 3) * 8) as u32)) & 0xFF;
+            let lane = id - range_start;
+            let glyph_advance = thread_local_advances[lane];
+            let glyph_flags_val = if lane < 4 {
+                (thread_flags_word0 >> ((lane * 8) as u32)) & 0xFF
+            } else {
+                (thread_flags_word1 >> (((lane - 4) * 8) as u32)) & 0xFF
+            };
             if (glyph_flags_val & F_LEADER) != 0 {
                 let col = run.tail_len;
                 let mut closed = 0i32;
@@ -881,7 +900,9 @@ pub(super) fn apply_and_emit(
                                         // trailer contributes 0.0 advance
                                     } else {
                                         let lead_byte = byte_at(bytes, forward_index, total_bytes);
-                                        if lead_byte < 128u32 {
+                                        if lead_byte >= 32u32 && lead_byte <= 126u32 {
+                                            current_advance_x += f32::from_bits(active_cell_advance_bits);
+                                        } else if lead_byte < 128u32 {
                                             let entry_offset = (ascii_block_base | lead_byte) as usize;
                                             current_advance_x += trie_block_metrics[entry_offset * 2];
                                         } else {
@@ -957,7 +978,7 @@ pub(super) fn apply_and_emit(
                     }
                 }
 
-                if page_rows != 0 || page_cols != 0 || scroll_rows != 0 {
+                if has_page_active {
                     let screen_row = row - scroll_rows;
                     let mut y_page = 0;
                     if page_rows > 0 && screen_row >= page_rows {
@@ -969,7 +990,6 @@ pub(super) fn apply_and_emit(
                 }
 
                 any_leader = true;
-                let glyph_advance = f32::from_bits(shared_counts[local_id] as u32);
                 let right = final_x + glyph_advance;
                 if track_extents && right > page_right_max {
                     page_right_max = right;
@@ -1027,9 +1047,9 @@ pub(super) fn apply_and_emit(
                     } else {
                         let lane = id - range_start;
                         let lead_byte = if lane < 4 {
-                            (phase3_bytes_word0 >> ((lane * 8) as u32)) & 0xFF
+                            (thread_bytes_word0 >> ((lane * 8) as u32)) & 0xFF
                         } else {
-                            (phase3_bytes_word1 >> (((lane - 4) * 8) as u32)) & 0xFF
+                            (thread_bytes_word1 >> (((lane - 4) * 8) as u32)) & 0xFF
                         };
                         if lead_byte < 128u32 {
                             glyph_id = shared_metrics[1 + (lead_byte as usize)].to_bits();
@@ -1049,7 +1069,7 @@ pub(super) fn apply_and_emit(
                             instance_slots[slot_word_offset + 1] = row as u32;
                             instance_slots[slot_word_offset + 2] = glyph_and_wrap;
                             instance_slots[slot_word_offset + 3] = color;
-                            instance_slots[slot_word_offset + 4] = (item_index as u32 & 0xFFFFu32) | ((item_group_id & 0xFFFFu32) << 16u32);
+                            instance_slots[slot_word_offset + 4] = item_and_group_word;
                         }
                     } else {
                         let slot_word_offset = survivor_ordinal as usize * 8;
@@ -1078,9 +1098,24 @@ pub(super) fn apply_and_emit(
                     current_advance_x += glyph_advance;
                 }
             }
-            let advance_for_leaf = if (glyph_flags_val & F_LEADER) != 0 { f32::from_bits(shared_counts[local_id] as u32) } else { 0.0f32 };
-            let leaf = leaf_from_flag(glyph_flags_val, advance_for_leaf, active_wrap_width, active_wrap_mode, if reset { 1i32 } else { 0i32 }, active_cell_advance_bits);
-            combine(&mut run, &leaf);
+            let advance_for_leaf = if (glyph_flags_val & F_LEADER) != 0 { glyph_advance } else { 0.0f32 };
+            let reset_int = if reset { 1i32 } else { 0i32 };
+            let is_surv = is_survivor(glyph_flags_val);
+            if (glyph_flags_val & F_NEWLINE) == 0 && (glyph_flags_val & F_LEADER) != 0 && glyph_advance.to_bits() == active_cell_advance_bits && reset_int == 0 {
+                run.clean_len += 1;
+                run.tail_len += 1;
+                run.tail_adv += glyph_advance;
+                if run.nl == 0 {
+                    run.head_len = run.tail_len;
+                }
+                run.glyphs += 1;
+                if is_surv {
+                    run.survivors += 1;
+                }
+            } else {
+                let leaf = leaf_from_flag(glyph_flags_val, advance_for_leaf, active_wrap_width, active_wrap_mode, reset_int, active_cell_advance_bits);
+                combine(&mut run, &leaf);
+            }
             id += 1;
         }
 

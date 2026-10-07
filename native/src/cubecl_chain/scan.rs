@@ -4,7 +4,7 @@ use super::cluster::{cp_at, seq_len_at};
 use super::decode::decode_trie;
 
 use super::monoid::{
-    combine, flags_at, identity, item_search_desc, leaf_from_flag, leaf_of,
+    combine, flags_at, identity, is_survivor, item_search_desc, leaf_from_flag, leaf_of,
     ordered_key, p_load, p_store, rows_for, s_load, s_store, wrap_row_of, wrap_segment_of,
 };
 use super::{
@@ -55,27 +55,18 @@ pub(super) fn tile_scan(
         0u32
     };
 
-    let total_tile_bytes = threads_per_cube * bytes_per_thread;
-    let tile_byte_start = tile_idx * total_tile_bytes;
-    let tile_word_start = tile_byte_start >> 2;
-    let total_tile_words = total_tile_bytes.div_ceil(4);
-
-    let mut shared_tile_flags = Shared::<[u32]>::new_slice((threads_per_cube * bytes_per_thread) / 4);
-
-    let mut preload_word_idx = unit_idx;
-    while preload_word_idx < total_tile_words {
-        let global_word_idx = tile_word_start + preload_word_idx;
-        shared_tile_flags[preload_word_idx] = if global_word_idx < glyph_flags.len() {
-            glyph_flags[global_word_idx]
-        } else {
-            0u32
-        };
-        preload_word_idx += threads_per_cube;
-    }
-    sync_cube();
-
-    // Register-resident bytes for this thread's 8-byte range
+    // Register-resident flags and bytes for this thread's 8-byte range
     let thread_word_idx = range_start >> 2;
+    let thread_flags_word0 = if thread_word_idx < glyph_flags.len() {
+        glyph_flags[thread_word_idx]
+    } else {
+        0u32
+    };
+    let thread_flags_word1 = if thread_word_idx + 1 < glyph_flags.len() {
+        glyph_flags[thread_word_idx + 1]
+    } else {
+        0u32
+    };
     let thread_bytes_word0 = if thread_word_idx < bytes.len() {
         bytes[thread_word_idx]
     } else {
@@ -132,15 +123,18 @@ pub(super) fn tile_scan(
                 active_cell_advance_bits = item_descriptors[item_index * ITEM_DESC_STRIDE + ITEM_DESC_CELL_ADVANCE];
             }
             let reset = if has_items && id == start { 1i32 } else { 0i32 };
-            let local_id = id - tile_byte_start;
-            let glyph_flag = (shared_tile_flags[local_id >> 2] >> (((local_id & 3) * 8) as u32)) & 0xFF;
+            let lane = id - range_start;
+            let glyph_flag = if lane < 4 {
+                (thread_flags_word0 >> ((lane * 8) as u32)) & 0xFF
+            } else {
+                (thread_flags_word1 >> (((lane - 4) * 8) as u32)) & 0xFF
+            };
             let advance = if (glyph_flag & super::F_LEADER) != 0 {
                 if (glyph_flag & F_CLUSTER_HEAD) != 0 {
                     bitmap_advance
                 } else if (glyph_flag & F_CLUSTER_TRAILER) != 0 {
                     0.0f32
                 } else {
-                    let lane = id - range_start;
                     let lead_byte = if lane < 4 {
                         (thread_bytes_word0 >> ((lane * 8) as u32)) & 0xFF
                     } else {
@@ -161,8 +155,22 @@ pub(super) fn tile_scan(
             } else {
                 0.0f32
             };
-            let leaf = leaf_from_flag(glyph_flag, advance, active_wrap_width, active_wrap_mode, reset, active_cell_advance_bits);
-            combine(&mut accumulator, &leaf);
+            let is_surv = is_survivor(glyph_flag);
+            if (glyph_flag & F_NEWLINE) == 0 && (glyph_flag & super::F_LEADER) != 0 && advance.to_bits() == active_cell_advance_bits && reset == 0 {
+                accumulator.clean_len += 1;
+                accumulator.tail_len += 1;
+                accumulator.tail_adv += advance;
+                if accumulator.nl == 0 {
+                    accumulator.head_len = accumulator.tail_len;
+                }
+                accumulator.glyphs += 1;
+                if is_surv {
+                    accumulator.survivors += 1;
+                }
+            } else {
+                let leaf = leaf_from_flag(glyph_flag, advance, active_wrap_width, active_wrap_mode, reset, active_cell_advance_bits);
+                combine(&mut accumulator, &leaf);
+            }
             id += 1;
         }
     } else {
