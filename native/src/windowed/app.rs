@@ -699,6 +699,12 @@ impl App<'_> {
 
     fn about_to_wait_impl(&mut self, event_loop: &ActiveEventLoop) {
         if let Some(state) = &mut self.state {
+            if let Some(max_frames) = self.frames {
+                if state.frames_total >= max_frames as u64 {
+                    event_loop.exit();
+                    return;
+                }
+            }
             // Post-L3 fix: while the surface reports Occluded, do NOT spin
             // request_redraw (measured pre-fix: ~250k skipped acquires/s,
             // ~100% CPU). winit 0.30 gives no reliable wake when a fully
