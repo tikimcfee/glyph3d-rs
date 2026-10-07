@@ -242,6 +242,7 @@ pub(crate) fn run_repo_chain(
         &buf,
         &mut prof,
         field_mode == glyph_field::GlyphFieldMode::Derived,
+        readback_slots,
     );
     let dur_b2g = t_b2g.elapsed();
 

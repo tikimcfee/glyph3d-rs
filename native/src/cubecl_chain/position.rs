@@ -344,6 +344,7 @@ pub(super) fn apply_and_emit(
     instance_slots: &mut [u32],
     instance_tints: &mut [u32],
     #[comptime] emit_derived: bool,
+    #[comptime] track_extents: bool,
     #[comptime] threads_per_cube: usize,
     #[comptime] bytes_per_thread: usize,
     #[comptime] log: usize,
@@ -355,11 +356,11 @@ pub(super) fn apply_and_emit(
     let range_start = tile_idx * (threads_per_cube * bytes_per_thread) + unit_idx * bytes_per_thread;
     let range_end = if range_start + bytes_per_thread < total_bytes { range_start + bytes_per_thread } else { total_bytes };
 
-    let shared_item_extents = Shared::<[Atomic<u32>]>::new_slice(RESOLVE_SLOTS * EXT_STRIDE);
-    let shared_item_flags = Shared::<[Atomic<u32>]>::new_slice(RESOLVE_SLOTS);
+    let shared_item_extents = Shared::<[Atomic<u32>]>::new_slice(if track_extents { RESOLVE_SLOTS * EXT_STRIDE } else { 1 });
+    let shared_item_flags = Shared::<[Atomic<u32>]>::new_slice(if track_extents { RESOLVE_SLOTS } else { 1 });
     let mut shared_item_base = Shared::<u32>::new();
     let cube_lo = tile_idx * (threads_per_cube * bytes_per_thread);
-    if unit_idx == 0 {
+    if track_extents && unit_idx == 0 {
         let probe = if total_bytes > 0 {
             if cube_lo < total_bytes { cube_lo } else { total_bytes - 1 }
         } else {
@@ -383,21 +384,23 @@ pub(super) fn apply_and_emit(
     let ordered_key_infinity = 0xFF80_0000u32;
     let ordered_key_neg_infinity = 0x007F_FFFFu32;
 
-    let mut slot_index = unit_idx;
-    while slot_index < RESOLVE_SLOTS {
-        shared_item_flags[slot_index].store(0u32);
-        let extent_offset = slot_index * EXT_STRIDE;
-        shared_item_extents[extent_offset].store(ordered_key_zero);
-        shared_item_extents[extent_offset + 1].store(ordered_key_zero);
-        shared_item_extents[extent_offset + 2].store(ordered_key_zero);
-        shared_item_extents[extent_offset + 3].store(ordered_key_zero);
-        shared_item_extents[extent_offset + 4].store(ordered_key_infinity);
-        shared_item_extents[extent_offset + 5].store(ordered_key_infinity);
-        shared_item_extents[extent_offset + 6].store(ordered_key_neg_infinity);
-        shared_item_extents[extent_offset + 7].store(ordered_key_neg_infinity);
-        shared_item_extents[extent_offset + 8].store(ordered_key_infinity);
-        shared_item_extents[extent_offset + 9].store(ordered_key_neg_infinity);
-        slot_index += threads_per_cube;
+    if track_extents {
+        let mut slot_index = unit_idx;
+        while slot_index < RESOLVE_SLOTS {
+            shared_item_flags[slot_index].store(0u32);
+            let extent_offset = slot_index * EXT_STRIDE;
+            shared_item_extents[extent_offset].store(ordered_key_zero);
+            shared_item_extents[extent_offset + 1].store(ordered_key_zero);
+            shared_item_extents[extent_offset + 2].store(ordered_key_zero);
+            shared_item_extents[extent_offset + 3].store(ordered_key_zero);
+            shared_item_extents[extent_offset + 4].store(ordered_key_infinity);
+            shared_item_extents[extent_offset + 5].store(ordered_key_infinity);
+            shared_item_extents[extent_offset + 6].store(ordered_key_neg_infinity);
+            shared_item_extents[extent_offset + 7].store(ordered_key_neg_infinity);
+            shared_item_extents[extent_offset + 8].store(ordered_key_infinity);
+            shared_item_extents[extent_offset + 9].store(ordered_key_neg_infinity);
+            slot_index += threads_per_cube;
+        }
     }
 
     let total_tile_bytes = threads_per_cube * bytes_per_thread;
@@ -576,7 +579,10 @@ pub(super) fn apply_and_emit(
     }
     sync_cube();
 
-    let cube_item_base = *shared_item_base as usize;
+    let mut cube_item_base = 0usize;
+    if track_extents {
+        cube_item_base = *shared_item_base as usize;
+    }
 
     let mut survivor_ordinal = run.survivors as u32;
 
@@ -690,7 +696,7 @@ pub(super) fn apply_and_emit(
         let mut id = range_start;
         while id < range_end {
             while has_items && next_item_boundary <= id {
-                if any_leader {
+                if track_extents && any_leader {
                     let slot = current_item_index - cube_item_base;
                     if slot < RESOLVE_SLOTS {
                         shared_item_flags[slot].fetch_or(if any_survivor { 3u32 } else { 1u32 });
@@ -902,7 +908,7 @@ pub(super) fn apply_and_emit(
 
                 let x_page = if page_cols > 0 { col / page_cols } else { 0 };
                 let mut recompute_yz = false;
-                if row != prev_row || wrap_segment != prev_wrap_segment || x_page != prev_x_page {
+                if (!emit_derived || track_extents) && (row != prev_row || wrap_segment != prev_wrap_segment || x_page != prev_x_page) {
                     prev_row = row;
                     prev_wrap_segment = wrap_segment;
                     prev_x_page = x_page;
@@ -938,14 +944,16 @@ pub(super) fn apply_and_emit(
                     prev_y_lo = line_final_y - 0.5f32;
                     prev_y_hi = line_final_y + 0.5f32;
 
-                    if line_final_y < page_y_min {
-                        page_y_min = line_final_y;
-                    }
-                    if line_final_z < page_z_min {
-                        page_z_min = line_final_z;
-                    }
-                    if line_final_z > page_z_max {
-                        page_z_max = line_final_z;
+                    if track_extents {
+                        if line_final_y < page_y_min {
+                            page_y_min = line_final_y;
+                        }
+                        if line_final_z < page_z_min {
+                            page_z_min = line_final_z;
+                        }
+                        if line_final_z > page_z_max {
+                            page_z_max = line_final_z;
+                        }
                     }
                 }
 
@@ -963,30 +971,32 @@ pub(super) fn apply_and_emit(
                 any_leader = true;
                 let glyph_advance = f32::from_bits(shared_counts[local_id] as u32);
                 let right = final_x + glyph_advance;
-                if right > page_right_max {
+                if track_extents && right > page_right_max {
                     page_right_max = right;
                 }
                 if is_survivor(glyph_flags_val) {
                     any_survivor = true;
-                    if final_x < ink_x_min {
-                        ink_x_min = final_x;
-                    }
-                    if right > ink_right_max {
-                        ink_right_max = right;
-                    }
-                    if recompute_yz || !seen_survivor_on_line {
-                        seen_survivor_on_line = true;
-                        if prev_y_lo < ink_y_min {
-                            ink_y_min = prev_y_lo;
+                    if track_extents {
+                        if final_x < ink_x_min {
+                            ink_x_min = final_x;
                         }
-                        if prev_y_hi > ink_y_max {
-                            ink_y_max = prev_y_hi;
+                        if right > ink_right_max {
+                            ink_right_max = right;
                         }
-                        if prev_final_z < ink_z_min {
-                            ink_z_min = prev_final_z;
-                        }
-                        if prev_final_z > ink_z_max {
-                            ink_z_max = prev_final_z;
+                        if recompute_yz || !seen_survivor_on_line {
+                            seen_survivor_on_line = true;
+                            if prev_y_lo < ink_y_min {
+                                ink_y_min = prev_y_lo;
+                            }
+                            if prev_y_hi > ink_y_max {
+                                ink_y_max = prev_y_hi;
+                            }
+                            if prev_final_z < ink_z_min {
+                                ink_z_min = prev_final_z;
+                            }
+                            if prev_final_z > ink_z_max {
+                                ink_z_max = prev_final_z;
+                            }
                         }
                     }
 
@@ -1074,7 +1084,7 @@ pub(super) fn apply_and_emit(
             id += 1;
         }
 
-        if any_leader {
+        if track_extents && any_leader {
             let slot = current_item_index - cube_item_base;
             if slot < RESOLVE_SLOTS {
                 shared_item_flags[slot].fetch_or(if any_survivor { 3u32 } else { 1u32 });
@@ -1108,25 +1118,28 @@ pub(super) fn apply_and_emit(
             }
         }
     }
-    sync_cube();
-    if unit_idx < RESOLVE_SLOTS {
-        let item_index = cube_item_base + unit_idx;
-        if item_index < item_count {
-            let flags = shared_item_flags[unit_idx].load();
-            if (flags & 1u32) != 0 {
-                let shared_extent_offset = unit_idx * EXT_STRIDE;
-                let extent_offset = item_index * EXT_STRIDE;
-                item_extents[extent_offset].fetch_max(shared_item_extents[shared_extent_offset].load());
-                item_extents[extent_offset + 1].fetch_min(shared_item_extents[shared_extent_offset + 1].load());
-                item_extents[extent_offset + 2].fetch_min(shared_item_extents[shared_extent_offset + 2].load());
-                item_extents[extent_offset + 3].fetch_max(shared_item_extents[shared_extent_offset + 3].load());
-                if (flags & 2u32) != 0 {
-                    item_extents[extent_offset + 4].fetch_min(shared_item_extents[shared_extent_offset + 4].load());
-                    item_extents[extent_offset + 5].fetch_min(shared_item_extents[shared_extent_offset + 5].load());
-                    item_extents[extent_offset + 6].fetch_max(shared_item_extents[shared_extent_offset + 6].load());
-                    item_extents[extent_offset + 7].fetch_max(shared_item_extents[shared_extent_offset + 7].load());
-                    item_extents[extent_offset + 8].fetch_min(shared_item_extents[shared_extent_offset + 8].load());
-                    item_extents[extent_offset + 9].fetch_max(shared_item_extents[shared_extent_offset + 9].load());
+
+    if track_extents {
+        sync_cube();
+        if unit_idx < RESOLVE_SLOTS {
+            let item_index = cube_item_base + unit_idx;
+            if item_index < item_count {
+                let flags = shared_item_flags[unit_idx].load();
+                if (flags & 1u32) != 0 {
+                    let shared_extent_offset = unit_idx * EXT_STRIDE;
+                    let extent_offset = item_index * EXT_STRIDE;
+                    item_extents[extent_offset].fetch_max(shared_item_extents[shared_extent_offset].load());
+                    item_extents[extent_offset + 1].fetch_min(shared_item_extents[shared_extent_offset + 1].load());
+                    item_extents[extent_offset + 2].fetch_min(shared_item_extents[shared_extent_offset + 2].load());
+                    item_extents[extent_offset + 3].fetch_max(shared_item_extents[shared_extent_offset + 3].load());
+                    if (flags & 2u32) != 0 {
+                        item_extents[extent_offset + 4].fetch_min(shared_item_extents[shared_extent_offset + 4].load());
+                        item_extents[extent_offset + 5].fetch_min(shared_item_extents[shared_extent_offset + 5].load());
+                        item_extents[extent_offset + 6].fetch_max(shared_item_extents[shared_extent_offset + 6].load());
+                        item_extents[extent_offset + 7].fetch_max(shared_item_extents[shared_extent_offset + 7].load());
+                        item_extents[extent_offset + 8].fetch_min(shared_item_extents[shared_extent_offset + 8].load());
+                        item_extents[extent_offset + 9].fetch_max(shared_item_extents[shared_extent_offset + 9].load());
+                    }
                 }
             }
         }

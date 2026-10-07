@@ -354,6 +354,7 @@ pub(crate) fn launch_block2_geometry(
     buf: &ChainBuffers,
     prof: &mut ChainProfiler,
     emit_derived: bool,
+    track_extents: bool,
 ) {
     let n_tiles = inputs.n_tiles;
     let n_words = inputs.n_words;
@@ -399,34 +400,43 @@ pub(crate) fn launch_block2_geometry(
         prof.end(client, "spine_scan");
 
         prof.begin(client, "apply_and_emit");
-        apply_and_emit::launch_unchecked(
-            client,
-            tiles_grid(n_tiles),
-            CubeDim::new_1d(threads_per_cube as u32),
-            BufferArg::from_raw_parts(buf.h_glyph_flags.clone(), n_words),
-            BufferArg::from_raw_parts(buf.h_bytes.as_ref().unwrap().clone(), n_words),
-            BufferArg::from_raw_parts(buf.h_trie_block_indices.as_ref().unwrap().clone(), buf.trie_block_indices_len),
-            BufferArg::from_raw_parts(buf.h_trie_block_metrics.as_ref().unwrap().clone(), buf.trie_block_metrics_len),
-            BufferArg::from_raw_parts(buf.h_trie_block_codepoints.as_ref().unwrap().clone(), buf.trie_block_codepoints_len),
-            buf.trie_block_shift,
-            BufferArg::from_raw_parts(buf.h_candidate_head_positions.as_ref().unwrap().clone(), buf.candidate_stride),
-            BufferArg::from_raw_parts(buf.h_candidate_slots.as_ref().unwrap().clone(), buf.candidate_stride),
-            BufferArg::from_raw_parts(buf.h_candidate_total.as_ref().unwrap().clone(), 1),
-            inputs.bitmap_advance,
-            BufferArg::from_raw_parts(buf.h_item_descriptors.as_ref().unwrap().clone(), inputs.item_descriptors.len()),
-            BufferArg::from_raw_parts(buf.h_spine_counts.as_ref().unwrap().clone(), n_tiles * PARTIAL_COUNT_STRIDE),
-            BufferArg::from_raw_parts(buf.h_spine_metrics.as_ref().unwrap().clone(), n_tiles),
-            BufferArg::from_raw_parts(buf.h_max_row_extents.as_ref().unwrap().clone(), item_count * 2),
-            BufferArg::from_raw_parts(buf.h_item_extents.clone(), item_count * EXT_STRIDE),
-            BufferArg::from_raw_parts(buf.h_per_record_semantic_colors.clone(), buf.per_record_colors_words),
-            BufferArg::from_raw_parts(buf.h_segment_entry_advances.clone(), inputs.segment_entry_advances.len()),
-            BufferArg::from_raw_parts(buf.h_instance_slots.clone(), buf.slots_words),
-            BufferArg::from_raw_parts(buf.h_instance_tints.clone(), buf.tint_words),
-            emit_derived,
-            threads_per_cube,
-            bytes_per_thread,
-            log,
-        );
+        let launch_apply = |emit_derived_val: bool, track_extents_val: bool| {
+            apply_and_emit::launch_unchecked(
+                client,
+                tiles_grid(n_tiles),
+                CubeDim::new_1d(threads_per_cube as u32),
+                BufferArg::from_raw_parts(buf.h_glyph_flags.clone(), n_words),
+                BufferArg::from_raw_parts(buf.h_bytes.as_ref().unwrap().clone(), n_words),
+                BufferArg::from_raw_parts(buf.h_trie_block_indices.as_ref().unwrap().clone(), buf.trie_block_indices_len),
+                BufferArg::from_raw_parts(buf.h_trie_block_metrics.as_ref().unwrap().clone(), buf.trie_block_metrics_len),
+                BufferArg::from_raw_parts(buf.h_trie_block_codepoints.as_ref().unwrap().clone(), buf.trie_block_codepoints_len),
+                buf.trie_block_shift,
+                BufferArg::from_raw_parts(buf.h_candidate_head_positions.as_ref().unwrap().clone(), buf.candidate_stride),
+                BufferArg::from_raw_parts(buf.h_candidate_slots.as_ref().unwrap().clone(), buf.candidate_stride),
+                BufferArg::from_raw_parts(buf.h_candidate_total.as_ref().unwrap().clone(), 1),
+                inputs.bitmap_advance,
+                BufferArg::from_raw_parts(buf.h_item_descriptors.as_ref().unwrap().clone(), inputs.item_descriptors.len()),
+                BufferArg::from_raw_parts(buf.h_spine_counts.as_ref().unwrap().clone(), n_tiles * PARTIAL_COUNT_STRIDE),
+                BufferArg::from_raw_parts(buf.h_spine_metrics.as_ref().unwrap().clone(), n_tiles),
+                BufferArg::from_raw_parts(buf.h_max_row_extents.as_ref().unwrap().clone(), item_count * 2),
+                BufferArg::from_raw_parts(buf.h_item_extents.clone(), item_count * EXT_STRIDE),
+                BufferArg::from_raw_parts(buf.h_per_record_semantic_colors.clone(), buf.per_record_colors_words),
+                BufferArg::from_raw_parts(buf.h_segment_entry_advances.clone(), inputs.segment_entry_advances.len()),
+                BufferArg::from_raw_parts(buf.h_instance_slots.clone(), buf.slots_words),
+                BufferArg::from_raw_parts(buf.h_instance_tints.clone(), buf.tint_words),
+                emit_derived_val,
+                track_extents_val,
+                threads_per_cube,
+                bytes_per_thread,
+                log,
+            );
+        };
+        match (emit_derived, track_extents) {
+            (true, true) => launch_apply(true, true),
+            (true, false) => launch_apply(true, false),
+            (false, true) => launch_apply(false, true),
+            (false, false) => launch_apply(false, false),
+        }
         prof.end(client, "apply_and_emit");
         prof.block_end(client, "block2_geometry");
     }
@@ -482,6 +492,7 @@ pub fn prewarm_pipelines_parallel(client_emitter: &Client, client_scanners: &Cli
                         dummy(15, 8),
                         dummy(16, 2),
                         false,
+                        true,
                         threads_per_cube,
                         bytes_per_thread,
                         log,
@@ -512,6 +523,7 @@ pub fn prewarm_pipelines_parallel(client_emitter: &Client, client_scanners: &Cli
                         dummy(15, 5),
                         dummy(16, 2),
                         true,
+                        false,
                         threads_per_cube,
                         bytes_per_thread,
                         log,
