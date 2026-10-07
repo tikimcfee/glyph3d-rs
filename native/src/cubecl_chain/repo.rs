@@ -281,13 +281,19 @@ pub(crate) fn run_repo_chain(
         buf.release_pre_survivor();
     }
 
+    let bytes_per_slot = if field_mode == glyph_field::GlyphFieldMode::Derived { 20u64 } else { 32u64 };
+    let required_slot_buffer_bytes = (total_slots as u64) * bytes_per_slot;
     assert!(
-        (total_slots as u64) * 32 <= device_ref.max_buffer_size,
-        "the endpoint needs one {} B slot buffer — over this device's \
+        required_slot_buffer_bytes <= device_ref.max_buffer_size,
+        "the endpoint needs one {required_slot_buffer_bytes} B slot buffer ({field_mode:?} mode) — over this device's \
          max_buffer_size ({}); chunked slot buffers are the named \
-         follow-up",
-        (total_slots as u64) * 32,
+         follow-up{}",
         device_ref.max_buffer_size,
+        if field_mode != glyph_field::GlyphFieldMode::Derived && (total_slots as u64) * 20 <= device_ref.max_buffer_size {
+            format!("; try running with `--field-mode derived` (requires only {} B)", (total_slots as u64) * 20)
+        } else {
+            String::new()
+        }
     );
 
     let placements = decode_placements(
@@ -324,8 +330,9 @@ pub(crate) fn run_repo_chain(
 
     let mut slots_all = Vec::new();
     if readback_slots {
+        let slot_words = if field_mode == glyph_field::GlyphFieldMode::Derived { 5 } else { 8 };
         let sb = client.read_one(h_instance_slots.clone()).expect("read slot scatter");
-        slots_all = bytemuck::cast_slice::<u8, u32>(&sb)[..total_slots as usize * 8].to_vec();
+        slots_all = bytemuck::cast_slice::<u8, u32>(&sb)[..total_slots as usize * slot_words].to_vec();
     }
 
     let slot_device = package_slot_device(&client, h_instance_slots, total_slots);
