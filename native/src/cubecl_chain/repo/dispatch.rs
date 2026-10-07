@@ -7,7 +7,7 @@ use super::super::cluster::{
     cand_sort, cluster_mark, item_roots, jump_build, rank_step,
 };
 use super::super::decode::decode_probe;
-use super::super::position::apply_and_emit;
+use super::super::position::{apply_and_emit, apply_and_emit_derived};
 use super::super::scan::{spine_scan, tile_scan};
 use super::super::tail::EXT_STRIDE;
 use super::super::{ITEM_DESC_STRIDE, PARTIAL_COUNT_STRIDE};
@@ -438,8 +438,34 @@ pub(crate) fn launch_block2_geometry(
             );
         };
         match (emit_derived, track_extents) {
+            (true, false) => {
+                apply_and_emit_derived::launch_unchecked(
+                    client,
+                    tiles_grid(n_tiles),
+                    CubeDim::new_1d(threads_per_cube as u32),
+                    BufferArg::from_raw_parts(buf.h_glyph_flags.clone(), buf.glyph_flags_words),
+                    BufferArg::from_raw_parts(buf.h_bytes.as_ref().unwrap().clone(), n_words),
+                    BufferArg::from_raw_parts(buf.h_trie_block_indices.as_ref().unwrap().clone(), buf.trie_block_indices_len),
+                    BufferArg::from_raw_parts(buf.h_trie_block_metrics.as_ref().unwrap().clone(), buf.trie_block_metrics_len),
+                    BufferArg::from_raw_parts(buf.h_trie_block_codepoints.as_ref().unwrap().clone(), buf.trie_block_codepoints_len),
+                    buf.trie_block_shift,
+                    BufferArg::from_raw_parts(buf.h_candidate_head_positions.as_ref().unwrap().clone(), buf.candidate_stride),
+                    BufferArg::from_raw_parts(buf.h_candidate_slots.as_ref().unwrap().clone(), buf.candidate_stride),
+                    BufferArg::from_raw_parts(buf.h_candidate_total.as_ref().unwrap().clone(), 1),
+                    inputs.bitmap_advance,
+                    BufferArg::from_raw_parts(buf.h_item_descriptors.as_ref().unwrap().clone(), inputs.item_descriptors.len()),
+                    BufferArg::from_raw_parts(buf.h_tile_item_base.as_ref().unwrap().clone(), n_tiles),
+                    BufferArg::from_raw_parts(buf.h_spine_counts.as_ref().unwrap().clone(), n_tiles * PARTIAL_COUNT_STRIDE),
+                    BufferArg::from_raw_parts(buf.h_spine_metrics.as_ref().unwrap().clone(), n_tiles),
+                    BufferArg::from_raw_parts(buf.h_max_row_extents.as_ref().unwrap().clone(), item_count * 2),
+                    BufferArg::from_raw_parts(buf.h_per_record_semantic_colors.clone(), buf.per_record_colors_words),
+                    BufferArg::from_raw_parts(buf.h_segment_entry_advances.clone(), inputs.segment_entry_advances.len()),
+                    BufferArg::from_raw_parts(buf.h_instance_slots.clone(), buf.slots_words),
+                    threads_per_cube,
+                    bytes_per_thread,
+                );
+            }
             (true, true) => launch_apply(true, true),
-            (true, false) => launch_apply(true, false),
             (false, true) => launch_apply(false, true),
             (false, false) => launch_apply(false, false),
         }
@@ -506,7 +532,7 @@ pub fn prewarm_pipelines_parallel(client_emitter: &Client, client_scanners: &Cli
                     );
                 }
                 if is_derived != Some(false) {
-                    apply_and_emit::launch_unchecked(
+                    apply_and_emit_derived::launch_unchecked(
                         client_emitter,
                         CubeCount::Static(1, 1, 1),
                         dim_256,
@@ -525,16 +551,11 @@ pub fn prewarm_pipelines_parallel(client_emitter: &Client, client_scanners: &Cli
                         dummy(9, PARTIAL_COUNT_STRIDE),
                         dummy(10, 1),
                         dummy(11, 2),
-                        dummy(12, EXT_STRIDE),
                         dummy(13, 1),
                         dummy(14, 1),
                         dummy(15, 5),
-                        dummy(16, 2),
-                        true,
-                        false,
                         threads_per_cube,
                         bytes_per_thread,
-                        log,
                     );
                 }
                 let _ = client_emitter.flush();
@@ -548,32 +569,38 @@ pub fn prewarm_pipelines_parallel(client_emitter: &Client, client_scanners: &Cli
             let dummy = |_slot: usize, len: usize| unsafe { BufferArg::from_raw_parts(dummy_buf.clone(), len) };
 
             unsafe {
-                // 1. decode_probe
-                let t_dp = std::time::Instant::now();
-                decode_probe::launch_unchecked(
-                    client_scanners,
-                    CubeCount::Static(1, 1, 1),
-                    dim_256,
-                    dummy(0, 1),
-                    dummy(1, 1),
-                    dummy(2, 2),
-                    dummy(3, 2),
-                    dummy(4, 1),
-                    dummy(5, 1),
-                    dummy(6, 1),
-                    dummy(7, 1),
-                    dummy(8, 2),
-                    dummy(9, 1),
-                    dummy(10, 0),
-                    dummy(11, 1),
-                    dummy(12, 1),
-                    dummy(13, 1),
-                    dummy(14, 1),
-                    8u32,
-                    9u32,
-                    16384usize,
-                );
-                log::info!("prewarm: decode_probe compiled in {:?}", t_dp.elapsed());
+                let prewarm_cluster = std::env::var("GLYPH_PREWARM_CLUSTER")
+                    .map(|v| v != "0")
+                    .unwrap_or(false);
+
+                if prewarm_cluster {
+                    // 1. decode_probe
+                    let t_dp = std::time::Instant::now();
+                    decode_probe::launch_unchecked(
+                        client_scanners,
+                        CubeCount::Static(1, 1, 1),
+                        dim_256,
+                        dummy(0, 1),
+                        dummy(1, 1),
+                        dummy(2, 2),
+                        dummy(3, 2),
+                        dummy(4, 1),
+                        dummy(5, 1),
+                        dummy(6, 1),
+                        dummy(7, 1),
+                        dummy(8, 2),
+                        dummy(9, 1),
+                        dummy(10, 0),
+                        dummy(11, 1),
+                        dummy(12, 1),
+                        dummy(13, 1),
+                        dummy(14, 1),
+                        8u32,
+                        9u32,
+                        16384usize,
+                    );
+                    log::info!("prewarm: decode_probe compiled in {:?}", t_dp.elapsed());
+                }
 
                 // 2. tile_scan (core text layout scan)
                 let t_ts = std::time::Instant::now();
@@ -612,10 +639,6 @@ pub fn prewarm_pipelines_parallel(client_emitter: &Client, client_scanners: &Cli
                     log,
                 );
                 log::info!("prewarm: spine_scan compiled in {:?}", t_ss.elapsed());
-
-                let prewarm_cluster = std::env::var("GLYPH_PREWARM_CLUSTER")
-                    .map(|v| v != "0")
-                    .unwrap_or(false);
 
                 if prewarm_cluster {
                     // 4. cand_sort

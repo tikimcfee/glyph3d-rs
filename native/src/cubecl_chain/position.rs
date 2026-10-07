@@ -348,7 +348,7 @@ pub(super) fn apply_and_emit(
     #[comptime] track_extents: bool,
     #[comptime] threads_per_cube: usize,
     #[comptime] bytes_per_thread: usize,
-    #[comptime] log: usize,
+    #[comptime] _log: usize,
 ) {
     let tile_idx = CUBE_POS;
     let unit_idx = UNIT_POS as usize;
@@ -642,7 +642,6 @@ pub(super) fn apply_and_emit(
     let mut shared_warp_counts = Shared::<[i32]>::new_slice(8usize * PARTIAL_COUNT_STRIDE);
     let mut shared_warp_metrics = Shared::<[f32]>::new_slice(8usize);
 
-    if log == 8 {
         // Level 1: Intra-warp Blelloch up-sweep for each 32-thread warp (d in 0..5)
         #[unroll]
         for d in 0..5 {
@@ -702,38 +701,6 @@ pub(super) fn apply_and_emit(
             s_store(&mut shared_counts, &mut shared_metrics, unit_idx, &warp_prefix, threads_per_cube);
         }
         sync_cube();
-    } else {
-        #[unroll]
-        for d in 0..log {
-            sync_cube();
-            let s = 1usize << d;
-            if (unit_idx + 1) & (2 * s - 1) == 0 {
-                let mut lhs = s_load(&shared_counts, &shared_metrics, unit_idx - s, threads_per_cube);
-                let rhs = s_load(&shared_counts, &shared_metrics, unit_idx, threads_per_cube);
-                combine(&mut lhs, &rhs);
-                s_store(&mut shared_counts, &mut shared_metrics, unit_idx, &lhs, threads_per_cube);
-            }
-        }
-        sync_cube();
-        if unit_idx == threads_per_cube - 1 {
-            let e = identity();
-            s_store(&mut shared_counts, &mut shared_metrics, unit_idx, &e, threads_per_cube);
-        }
-        #[unroll]
-        for d in 0..log {
-            sync_cube();
-            let s = threads_per_cube >> (d + 1);
-            if (unit_idx + 1) & (2 * s - 1) == 0 {
-                let temp_carried = s_load(&shared_counts, &shared_metrics, unit_idx, threads_per_cube);
-                let mut lhs = s_load(&shared_counts, &shared_metrics, unit_idx, threads_per_cube);
-                let rhs = s_load(&shared_counts, &shared_metrics, unit_idx - s, threads_per_cube);
-                combine(&mut lhs, &rhs);
-                s_store(&mut shared_counts, &mut shared_metrics, unit_idx, &lhs, threads_per_cube);
-                s_store(&mut shared_counts, &mut shared_metrics, unit_idx - s, &temp_carried, threads_per_cube);
-            }
-        }
-        sync_cube();
-    }
 
     // Phase 3: The chase — combines global tile prefix + exclusive thread-local prefix
     let mut run = p_load(tile_spine_counts, tile_spine_metrics, tile_idx);
@@ -2470,3 +2437,1207 @@ pub(super) fn paginate(
     }
 }
 
+
+
+
+#[cube]
+#[allow(clippy::manual_range_contains)]
+pub(super) fn resolve_entry_advance(
+    id: usize,
+    segment_column: i32,
+    fold_unit: i32,
+    run_clean_len: i32,
+    run_tail_adv: f32,
+    tile_byte_start: usize,
+    total_bytes: usize,
+    glyph_flags: &[u32],
+    bytes: &[u32],
+    shared_tile_flags: &[u32],
+    segment_entry_advances: &[f32],
+    bitmap_advance: f32,
+    ascii_block_base: u32,
+    active_cell_advance_bits: u32,
+    trie_block_indices: &[u32],
+    trie_block_metrics: &[f32],
+    trie_block_codepoints: &[u32],
+    #[comptime] trie_block_shift: u32,
+) -> f32 {
+    let entry_is_clean = run_clean_len >= segment_column;
+    if entry_is_clean {
+        (segment_column as f32) * f32::from_bits(active_cell_advance_bits)
+    } else if fold_unit > 0 && id >= segment_column as usize {
+        let mut current_advance_x = 0.0f32;
+        let mut backward_column = segment_column;
+        let mut start_byte_index = id as i32 - 1;
+
+        if tile_byte_start > 0 {
+            let entry_seg_idx = id / fold_unit as usize;
+            if entry_seg_idx < segment_entry_advances.len() {
+                current_advance_x = segment_entry_advances[entry_seg_idx];
+            }
+        }
+
+        let tile_byte_start_i32 = tile_byte_start as i32;
+        while backward_column >= 1 && start_byte_index >= tile_byte_start_i32 {
+            let in_tile_byte_idx = (start_byte_index - tile_byte_start_i32) as usize;
+            let word_idx = in_tile_byte_idx >> 2;
+            let flag_byte_idx = in_tile_byte_idx & 3;
+            let flags_word = shared_tile_flags[word_idx];
+            let flag = (flags_word >> ((flag_byte_idx * 8) as u32)) & 0xFF;
+            if (flag & F_LEADER) != 0 {
+                backward_column -= 1;
+            }
+            if backward_column >= 1 {
+                start_byte_index -= 1;
+            }
+        }
+
+        while backward_column >= 1 && start_byte_index >= 0 {
+            let is_lead = if glyph_flags.len() > 1 {
+                (flags_at(glyph_flags, start_byte_index as usize) & F_LEADER) != 0
+            } else {
+                (byte_at(bytes, start_byte_index as usize, total_bytes) & 0xC0u32) != 0x80u32
+            };
+            if is_lead {
+                backward_column -= 1;
+            }
+            if backward_column >= 1 {
+                start_byte_index -= 1;
+            }
+        }
+
+        let mut forward_index = if start_byte_index >= 0 { start_byte_index as usize } else { 0usize };
+        while forward_index < id {
+            let is_lead = if glyph_flags.len() > 1 {
+                (flags_at(glyph_flags, forward_index) & F_LEADER) != 0
+            } else {
+                (byte_at(bytes, forward_index, total_bytes) & 0xC0u32) != 0x80u32
+            };
+            if is_lead {
+                let flag = if glyph_flags.len() > 1 {
+                    flags_at(glyph_flags, forward_index)
+                } else {
+                    0u32
+                };
+                if (flag & F_CLUSTER_HEAD) != 0 {
+                    current_advance_x += bitmap_advance;
+                } else if (flag & F_CLUSTER_TRAILER) != 0 {
+                } else {
+                    let lead_byte = byte_at(bytes, forward_index, total_bytes);
+                    if lead_byte >= 32u32 && lead_byte <= 126u32 {
+                        current_advance_x += f32::from_bits(active_cell_advance_bits);
+                    } else if lead_byte < 128u32 {
+                        let entry_offset = (ascii_block_base | lead_byte) as usize;
+                        current_advance_x += trie_block_metrics[entry_offset * 2];
+                    } else {
+                        let cp_len = seq_len_at(bytes, forward_index, total_bytes);
+                        let cp = cp_at(bytes, forward_index, cp_len, total_bytes);
+                        let (adv, _) = decode_trie(cp, trie_block_indices, trie_block_metrics, trie_block_codepoints, trie_block_shift);
+                        current_advance_x += adv;
+                    }
+                }
+            }
+            forward_index += 1;
+        }
+        current_advance_x
+    } else if fold_unit == 0 {
+        run_tail_adv
+    } else {
+        0.0f32
+    }
+}
+
+#[allow(clippy::manual_range_contains)]
+#[cube(launch_unchecked)]
+pub(super) fn apply_and_emit_derived(
+    glyph_flags: &[u32],
+    bytes: &[u32],
+    trie_block_indices: &[u32],
+    trie_block_metrics: &[f32],
+    trie_block_codepoints: &[u32],
+    #[comptime] trie_block_shift: u32,
+    _candidate_head_positions: &[u32],
+    _candidate_slots: &[u32],
+    _candidate_total: &[u32],
+    bitmap_advance: f32,
+    item_descriptors: &[u32],
+    tile_item_base: &[u32],
+    tile_spine_counts: &[u32],
+    tile_spine_metrics: &[f32],
+    max_row_extents: &[u32],
+    per_record_semantic_colors: &[u32],
+    segment_entry_advances: &[f32],
+    instance_slots: &mut [u32],
+    #[comptime] threads_per_cube: usize,
+    #[comptime] bytes_per_thread: usize,
+) {
+    let tile_idx = CUBE_POS;
+    let unit_idx = UNIT_POS as usize;
+    let total_bytes = bytes.len() * 4; // packed: words -> bytes
+    let item_count = item_descriptors.len() / ITEM_DESC_STRIDE;
+    let range_start = tile_idx * (threads_per_cube * bytes_per_thread) + unit_idx * bytes_per_thread;
+    let range_end = if range_start + bytes_per_thread < total_bytes { range_start + bytes_per_thread } else { total_bytes };
+
+    #[allow(clippy::len_zero)]
+    let ascii_block_base = if trie_block_indices.len() > 0 {
+        trie_block_indices[0] << trie_block_shift
+    } else {
+        0u32
+    };
+
+    let total_tile_bytes = threads_per_cube * bytes_per_thread;
+    let tile_byte_start = tile_idx * total_tile_bytes;
+    let tile_byte_end = tile_byte_start + total_tile_bytes;
+
+    let mut shared_item_desc = Shared::<[u32]>::new_slice(ITEM_DESC_STRIDE);
+    let tile_base_item = if item_count > 0 { tile_item_base[tile_idx] as usize } else { 0usize };
+    let has_items = item_count > 0;
+    if has_items && unit_idx < ITEM_DESC_STRIDE {
+        let base_offset = tile_base_item * ITEM_DESC_STRIDE;
+        shared_item_desc[unit_idx] = if base_offset + unit_idx < item_descriptors.len() {
+            item_descriptors[base_offset + unit_idx]
+        } else {
+            0u32
+        };
+    }
+
+    let mut shared_tile_flags = Shared::<[u32]>::new_slice((threads_per_cube * bytes_per_thread) / 4);
+
+    let thread_word_idx = range_start >> 2;
+    let thread_bytes_word0 = if thread_word_idx < bytes.len() {
+        bytes[thread_word_idx]
+    } else {
+        0x8080_8080u32
+    };
+    let thread_bytes_word1 = if thread_word_idx + 1 < bytes.len() {
+        bytes[thread_word_idx + 1]
+    } else {
+        0x8080_8080u32
+    };
+    let thread_flags_word0 = if glyph_flags.len() > 1 {
+        if thread_word_idx < glyph_flags.len() {
+            glyph_flags[thread_word_idx]
+        } else {
+            0u32
+        }
+    } else {
+        let next_word = thread_bytes_word1;
+        crate::cubecl_chain::decode::compute_flags_word(
+            thread_bytes_word0,
+            next_word,
+            thread_word_idx,
+            total_bytes,
+            trie_block_indices,
+            trie_block_codepoints,
+            trie_block_shift,
+        )
+    };
+    let thread_flags_word1 = if glyph_flags.len() > 1 {
+        if thread_word_idx + 1 < glyph_flags.len() {
+            glyph_flags[thread_word_idx + 1]
+        } else {
+            0u32
+        }
+    } else {
+        let next_word = if thread_word_idx + 2 < bytes.len() {
+            bytes[thread_word_idx + 2]
+        } else {
+            0x8080_8080u32
+        };
+        crate::cubecl_chain::decode::compute_flags_word(
+            thread_bytes_word1,
+            next_word,
+            thread_word_idx + 1,
+            total_bytes,
+            trie_block_indices,
+            trie_block_codepoints,
+            trie_block_shift,
+        )
+    };
+
+    shared_tile_flags[unit_idx * 2] = thread_flags_word0;
+    shared_tile_flags[unit_idx * 2 + 1] = thread_flags_word1;
+
+    let tile_item_start = shared_item_desc[ITEM_DESC_BYTE_START] as usize;
+    let tile_item_stop = shared_item_desc[ITEM_DESC_BYTE_STOP] as usize;
+    let is_uniform_tile = has_items && tile_byte_end <= tile_item_stop && tile_byte_start >= tile_item_start;
+
+    // Phase 1: Serial rake of this unit's bytes into one monoid accumulator
+    let mut accumulator = identity();
+    let mut seed = range_start;
+    if seed >= total_bytes {
+        seed = total_bytes - 1;
+    }
+    let mut item_index = tile_base_item;
+    let mut initial_item_index = tile_base_item;
+    let mut start = tile_item_start;
+    let mut next_item_boundary = tile_item_stop;
+    let mut active_wrap_width = shared_item_desc[ITEM_DESC_WRAP_WIDTH] as i32;
+    let mut active_wrap_mode = shared_item_desc[ITEM_DESC_WRAP_MODE] as i32;
+    let mut active_cell_advance_bits = shared_item_desc[ITEM_DESC_CELL_ADVANCE];
+
+    if !is_uniform_tile && has_items {
+        item_index = tile_base_item;
+        let mut cur_boundary = if item_index + 1 < item_count {
+            item_descriptors[(item_index + 1) * ITEM_DESC_STRIDE + ITEM_DESC_BYTE_START] as usize
+        } else {
+            total_bytes
+        };
+        while item_index + 1 < item_count && cur_boundary <= seed {
+            item_index += 1;
+            cur_boundary = if item_index + 1 < item_count {
+                item_descriptors[(item_index + 1) * ITEM_DESC_STRIDE + ITEM_DESC_BYTE_START] as usize
+            } else {
+                total_bytes
+            };
+        }
+        initial_item_index = item_index;
+        start = item_descriptors[item_index * ITEM_DESC_STRIDE + ITEM_DESC_BYTE_START] as usize;
+        next_item_boundary = cur_boundary;
+        active_wrap_width = item_descriptors[item_index * ITEM_DESC_STRIDE + ITEM_DESC_WRAP_WIDTH] as i32;
+        active_wrap_mode = item_descriptors[item_index * ITEM_DESC_STRIDE + ITEM_DESC_WRAP_MODE] as i32;
+        active_cell_advance_bits = item_descriptors[item_index * ITEM_DESC_STRIDE + ITEM_DESC_CELL_ADVANCE];
+    }
+
+    if range_start < total_bytes {
+        let is_all_8_ascii = thread_flags_word0 == 0x2121_2121u32
+            && thread_flags_word1 == 0x2121_2121u32
+            && ((thread_bytes_word0 | thread_bytes_word1) & 0x8080_8080u32) == 0u32
+            && range_start != start
+            && (range_start + 8 <= next_item_boundary)
+            && (range_start + 8 <= total_bytes);
+
+        if is_all_8_ascii {
+            let cell_advance = f32::from_bits(active_cell_advance_bits);
+            accumulator.clean_len = 8;
+            accumulator.tail_len = 8;
+            accumulator.tail_adv = cell_advance * 8.0f32;
+            accumulator.head_len = 8;
+            accumulator.glyphs = 8;
+            accumulator.survivors = 8;
+            accumulator.wrap = active_wrap_width;
+            accumulator.mode = active_wrap_mode;
+        } else {
+            let mut id = range_start;
+            while id < range_end {
+                while !is_uniform_tile && has_items && next_item_boundary <= id {
+                    item_index += 1;
+                    start = item_descriptors[item_index * ITEM_DESC_STRIDE + ITEM_DESC_BYTE_START] as usize;
+                    next_item_boundary = if item_index + 1 < item_count {
+                        item_descriptors[(item_index + 1) * ITEM_DESC_STRIDE + ITEM_DESC_BYTE_START] as usize
+                    } else {
+                        total_bytes
+                    };
+                    active_wrap_width = item_descriptors[item_index * ITEM_DESC_STRIDE + ITEM_DESC_WRAP_WIDTH] as i32;
+                    active_wrap_mode = item_descriptors[item_index * ITEM_DESC_STRIDE + ITEM_DESC_WRAP_MODE] as i32;
+                    active_cell_advance_bits = item_descriptors[item_index * ITEM_DESC_STRIDE + ITEM_DESC_CELL_ADVANCE];
+                }
+                let reset = if has_items && id == start { 1i32 } else { 0i32 };
+                let lane = id - range_start;
+                let is_lane0_word_ascii = lane == 0
+                    && thread_flags_word0 == 0x2121_2121u32
+                    && (thread_bytes_word0 & 0x8080_8080u32) == 0u32
+                    && (range_start != start)
+                    && (range_start + 4 <= next_item_boundary)
+                    && (range_start + 4 <= total_bytes);
+
+                let is_lane4_word_ascii = lane == 4
+                    && thread_flags_word1 == 0x2121_2121u32
+                    && (thread_bytes_word1 & 0x8080_8080u32) == 0u32
+                    && (range_start + 4 != start)
+                    && (range_start + 8 <= next_item_boundary)
+                    && (range_start + 8 <= total_bytes);
+
+                if is_lane0_word_ascii || is_lane4_word_ascii {
+                    let cell_advance = f32::from_bits(active_cell_advance_bits);
+                    accumulator.clean_len += 4;
+                    accumulator.tail_len += 4;
+                    accumulator.tail_adv += cell_advance * 4.0f32;
+                    if accumulator.nl == 0 {
+                        accumulator.head_len = accumulator.tail_len;
+                    }
+                    accumulator.glyphs += 4;
+                    accumulator.survivors += 4;
+                    id += 4;
+                } else {
+                    let flag = if lane < 4 {
+                        (thread_flags_word0 >> ((lane * 8) as u32)) & 0xFF
+                    } else {
+                        (thread_flags_word1 >> (((lane - 4) * 8) as u32)) & 0xFF
+                    };
+                    let advance = if (flag & F_LEADER) != 0 {
+                        if (flag & F_CLUSTER_HEAD) != 0 {
+                            bitmap_advance
+                        } else if (flag & F_CLUSTER_TRAILER) != 0 {
+                            0.0f32
+                        } else {
+                            let lead_byte = if lane < 4 {
+                                (thread_bytes_word0 >> ((lane * 8) as u32)) & 0xFF
+                            } else {
+                                (thread_bytes_word1 >> (((lane - 4) * 8) as u32)) & 0xFF
+                            };
+                            if lead_byte >= 32u32 && lead_byte <= 126u32 {
+                                f32::from_bits(active_cell_advance_bits)
+                            } else if lead_byte < 128u32 {
+                                let entry_offset = (ascii_block_base | lead_byte) as usize;
+                                trie_block_metrics[entry_offset * 2]
+                            } else {
+                                let cp_len = seq_len_at(bytes, id, total_bytes);
+                                let cp = cp_at(bytes, id, cp_len, total_bytes);
+                                let (adv, _) = decode_trie(cp, trie_block_indices, trie_block_metrics, trie_block_codepoints, trie_block_shift);
+                                adv
+                            }
+                        }
+                    } else {
+                        0.0f32
+                    };
+                    let is_surv = is_survivor(flag);
+                    if (flag & F_NEWLINE) == 0 && (flag & F_LEADER) != 0 && advance.to_bits() == active_cell_advance_bits && reset == 0 {
+                        accumulator.clean_len += 1;
+                        accumulator.tail_len += 1;
+                        accumulator.tail_adv += advance;
+                        if accumulator.nl == 0 {
+                            accumulator.head_len = accumulator.tail_len;
+                        }
+                        accumulator.glyphs += 1;
+                        if is_surv {
+                            accumulator.survivors += 1;
+                        }
+                    } else {
+                        let leaf = leaf_from_flag(flag, advance, active_wrap_width, active_wrap_mode, reset, active_cell_advance_bits);
+                        combine(&mut accumulator, &leaf);
+                    }
+                    id += 1;
+                }
+            }
+        }
+    } else {
+        accumulator.wrap = active_wrap_width;
+        accumulator.mode = active_wrap_mode;
+    }
+
+    // Phase 2: 2-Level Cube Blelloch scan across units in shared memory
+    let mut shared_counts = Shared::<[i32]>::new_slice(threads_per_cube * PARTIAL_COUNT_STRIDE);
+    let mut shared_metrics = Shared::<[f32]>::new_slice(threads_per_cube);
+    s_store(&mut shared_counts, &mut shared_metrics, unit_idx, &accumulator, threads_per_cube);
+
+    let mut shared_warp_counts = Shared::<[i32]>::new_slice(8usize * PARTIAL_COUNT_STRIDE);
+    let mut shared_warp_metrics = Shared::<[f32]>::new_slice(8usize);
+
+    // Level 1: Intra-warp Blelloch up-sweep for each 32-thread warp (d in 0..5)
+    #[unroll]
+    for d in 0..5 {
+        sync_cube();
+        let s = 1usize << d;
+        if (unit_idx + 1) & (2 * s - 1) == 0 {
+            let mut lhs = s_load(&shared_counts, &shared_metrics, unit_idx - s, threads_per_cube);
+            let rhs = s_load(&shared_counts, &shared_metrics, unit_idx, threads_per_cube);
+            combine(&mut lhs, &rhs);
+            s_store(&mut shared_counts, &mut shared_metrics, unit_idx, &lhs, threads_per_cube);
+        }
+    }
+    sync_cube();
+
+    // Save warp totals and zero warp roots
+    if (unit_idx + 1) & 31 == 0 {
+        let warp_idx = unit_idx >> 5;
+        let total = s_load(&shared_counts, &shared_metrics, unit_idx, threads_per_cube);
+        s_store(&mut shared_warp_counts, &mut shared_warp_metrics, warp_idx, &total, 8usize);
+        let e = identity();
+        s_store(&mut shared_counts, &mut shared_metrics, unit_idx, &e, threads_per_cube);
+    }
+
+    // Level 1: Intra-warp Blelloch down-sweep for each 32-thread warp (d in 0..5)
+    #[unroll]
+    for d in 0..5 {
+        sync_cube();
+        let s = 16usize >> d;
+        if (unit_idx + 1) & (2 * s - 1) == 0 {
+            let temp_carried = s_load(&shared_counts, &shared_metrics, unit_idx, threads_per_cube);
+            let mut lhs = s_load(&shared_counts, &shared_metrics, unit_idx, threads_per_cube);
+            let rhs = s_load(&shared_counts, &shared_metrics, unit_idx - s, threads_per_cube);
+            combine(&mut lhs, &rhs);
+            s_store(&mut shared_counts, &mut shared_metrics, unit_idx, &lhs, threads_per_cube);
+            s_store(&mut shared_counts, &mut shared_metrics, unit_idx - s, &temp_carried, threads_per_cube);
+        }
+    }
+    sync_cube();
+
+    // Level 2: Warp 0 computes the exact prefix scan over the 8 warp totals
+    if unit_idx == 0 {
+        let mut prefix = identity();
+        for w in 0usize..8usize {
+            let warp_total = s_load(&shared_warp_counts, &shared_warp_metrics, w, 8usize);
+            s_store(&mut shared_warp_counts, &mut shared_warp_metrics, w, &prefix, 8usize);
+            combine(&mut prefix, &warp_total);
+        }
+    }
+    sync_cube();
+
+    // Combine warp prefix into each thread's intra-warp prefix
+    let warp_idx = unit_idx >> 5;
+    if warp_idx > 0 {
+        let mut warp_prefix = s_load(&shared_warp_counts, &shared_warp_metrics, warp_idx, 8usize);
+        let local_prefix = s_load(&shared_counts, &shared_metrics, unit_idx, threads_per_cube);
+        combine(&mut warp_prefix, &local_prefix);
+        s_store(&mut shared_counts, &mut shared_metrics, unit_idx, &warp_prefix, threads_per_cube);
+    }
+    sync_cube();
+
+    // Phase 3: The chase — combines global tile prefix + exclusive thread-local prefix
+    let mut run = p_load(tile_spine_counts, tile_spine_metrics, tile_idx);
+    let thread_local_element = s_load(&shared_counts, &shared_metrics, unit_idx, threads_per_cube);
+    combine(&mut run, &thread_local_element);
+    sync_cube();
+    shared_counts[1280usize + unit_idx] = 0i32;
+    if unit_idx < 8usize {
+        shared_counts[1536usize + unit_idx] = 0i32;
+    }
+
+    let mut survivor_ordinal = run.survivors as u32;
+
+    let mut origin_x: f32;
+    let mut fold_unit: i32;
+    let mut page_rows: i32;
+    let mut page_cols: i32;
+    let mut scroll_rows: i32;
+    let mut pages_wide: i32;
+    let mut stride_reach: f32;
+    let mut stride_reach_tail: f32;
+    let mut item_color_base: u32;
+    let mut item_is_per_record: u32;
+    let mut item_flat_color: u32;
+    let mut has_page_active: bool;
+    let mut item_and_group_word: u32;
+
+    if is_uniform_tile {
+        item_index = tile_base_item;
+        start = shared_item_desc[ITEM_DESC_BYTE_START] as usize;
+        next_item_boundary = total_bytes;
+        active_wrap_width = shared_item_desc[ITEM_DESC_WRAP_WIDTH] as i32;
+        active_wrap_mode = shared_item_desc[ITEM_DESC_WRAP_MODE] as i32;
+        active_cell_advance_bits = shared_item_desc[ITEM_DESC_CELL_ADVANCE];
+        fold_unit = if active_wrap_width > 0 {
+            active_wrap_width
+        } else if shared_item_desc[ITEM_DESC_HAS_PAGE] != 0 {
+            shared_item_desc[ITEM_DESC_PAGE_COLS] as i32
+        } else {
+            0
+        };
+        origin_x = f32::from_bits(shared_item_desc[ITEM_DESC_ORIGIN_X]);
+
+        let has_page = shared_item_desc[ITEM_DESC_HAS_PAGE] != 0;
+        page_rows = if has_page { shared_item_desc[ITEM_DESC_PAGE_ROWS] as i32 } else { 0 };
+        page_cols = if has_page { shared_item_desc[ITEM_DESC_PAGE_COLS] as i32 } else { 0 };
+        scroll_rows = if has_page { shared_item_desc[ITEM_DESC_SCROLL_ROWS] as i32 } else { 0 };
+        let pages_wide_raw = shared_item_desc[ITEM_DESC_PAGES_WIDE] as i32;
+        pages_wide = if pages_wide_raw > 1 { pages_wide_raw } else { 1 };
+        stride_reach = 0.0f32;
+        stride_reach_tail = 0.0f32;
+        if has_page && page_rows > 0 {
+            let page_gap_x = f32::from_bits(shared_item_desc[ITEM_DESC_PAGE_GAP_X]);
+            let exact = advance_fixed(key_to_float(max_row_extents[tile_base_item * 2]))
+                + advance_fixed(page_gap_x);
+            fixed_pair(exact, &mut stride_reach, &mut stride_reach_tail);
+        }
+        item_color_base = shared_item_desc[ITEM_DESC_COLOR_BASE];
+        item_is_per_record = shared_item_desc[ITEM_DESC_IS_PER_RECORD];
+        item_flat_color = shared_item_desc[ITEM_DESC_FLAT_COLOR];
+        let item_group_id = shared_item_desc[ITEM_DESC_GROUP];
+        has_page_active = page_rows != 0 || page_cols != 0 || scroll_rows != 0;
+        item_and_group_word = (item_index as u32 & 0xFFFFu32) | ((item_group_id & 0xFFFFu32) << 16u32);
+    } else {
+        item_index = initial_item_index;
+        start = item_descriptors[item_index * ITEM_DESC_STRIDE + ITEM_DESC_BYTE_START] as usize;
+        next_item_boundary = if item_index + 1 < item_count {
+            item_descriptors[(item_index + 1) * ITEM_DESC_STRIDE + ITEM_DESC_BYTE_START] as usize
+        } else {
+            total_bytes
+        };
+        let descriptor_offset = item_index * ITEM_DESC_STRIDE;
+        active_wrap_width = item_descriptors[descriptor_offset + ITEM_DESC_WRAP_WIDTH] as i32;
+        active_wrap_mode = item_descriptors[descriptor_offset + ITEM_DESC_WRAP_MODE] as i32;
+        active_cell_advance_bits = item_descriptors[descriptor_offset + ITEM_DESC_CELL_ADVANCE];
+        fold_unit = fold_of(item_descriptors, item_index, active_wrap_width);
+        origin_x = f32::from_bits(item_descriptors[descriptor_offset + ITEM_DESC_ORIGIN_X]);
+
+        let has_page = item_descriptors[descriptor_offset + ITEM_DESC_HAS_PAGE] != 0;
+        page_rows = if has_page { item_descriptors[descriptor_offset + ITEM_DESC_PAGE_ROWS] as i32 } else { 0 };
+        page_cols = if has_page { item_descriptors[descriptor_offset + ITEM_DESC_PAGE_COLS] as i32 } else { 0 };
+        scroll_rows = if has_page { item_descriptors[descriptor_offset + ITEM_DESC_SCROLL_ROWS] as i32 } else { 0 };
+        let pages_wide_raw = item_descriptors[descriptor_offset + ITEM_DESC_PAGES_WIDE] as i32;
+        pages_wide = if pages_wide_raw > 1 { pages_wide_raw } else { 1 };
+        stride_reach = 0.0f32;
+        stride_reach_tail = 0.0f32;
+        if has_page && page_rows > 0 {
+            let page_gap_x = f32::from_bits(item_descriptors[descriptor_offset + ITEM_DESC_PAGE_GAP_X]);
+            let exact = advance_fixed(key_to_float(max_row_extents[item_index * 2]))
+                + advance_fixed(page_gap_x);
+            fixed_pair(exact, &mut stride_reach, &mut stride_reach_tail);
+        }
+        item_color_base = item_descriptors[descriptor_offset + ITEM_DESC_COLOR_BASE];
+        item_is_per_record = item_descriptors[descriptor_offset + ITEM_DESC_IS_PER_RECORD];
+        item_flat_color = item_descriptors[descriptor_offset + ITEM_DESC_FLAT_COLOR];
+        let item_group_id = item_descriptors[descriptor_offset + ITEM_DESC_GROUP];
+        has_page_active = page_rows != 0 || page_cols != 0 || scroll_rows != 0;
+        item_and_group_word = (item_index as u32 & 0xFFFFu32) | ((item_group_id & 0xFFFFu32) << 16u32);
+    }
+
+    let mut current_advance_x = 0.0f32;
+    let mut in_segment = false;
+
+    if range_start < total_bytes {
+        let mut id = range_start;
+        while id < range_end {
+            while !is_uniform_tile && has_items && next_item_boundary <= id {
+                item_index += 1;
+                start = item_descriptors[item_index * ITEM_DESC_STRIDE + ITEM_DESC_BYTE_START] as usize;
+                next_item_boundary = if item_index + 1 < item_count {
+                    item_descriptors[(item_index + 1) * ITEM_DESC_STRIDE + ITEM_DESC_BYTE_START] as usize
+                } else {
+                    total_bytes
+                };
+                let descriptor_offset = item_index * ITEM_DESC_STRIDE;
+                active_wrap_width = item_descriptors[descriptor_offset + ITEM_DESC_WRAP_WIDTH] as i32;
+                active_wrap_mode = item_descriptors[descriptor_offset + ITEM_DESC_WRAP_MODE] as i32;
+                active_cell_advance_bits = item_descriptors[descriptor_offset + ITEM_DESC_CELL_ADVANCE];
+                fold_unit = fold_of(item_descriptors, item_index, active_wrap_width);
+                origin_x = f32::from_bits(item_descriptors[descriptor_offset + ITEM_DESC_ORIGIN_X]);
+
+                let has_page = item_descriptors[descriptor_offset + ITEM_DESC_HAS_PAGE] != 0;
+                page_rows = if has_page { item_descriptors[descriptor_offset + ITEM_DESC_PAGE_ROWS] as i32 } else { 0 };
+                page_cols = if has_page { item_descriptors[descriptor_offset + ITEM_DESC_PAGE_COLS] as i32 } else { 0 };
+                scroll_rows = if has_page { item_descriptors[descriptor_offset + ITEM_DESC_SCROLL_ROWS] as i32 } else { 0 };
+                let pages_wide_raw = item_descriptors[descriptor_offset + ITEM_DESC_PAGES_WIDE] as i32;
+                pages_wide = if pages_wide_raw > 1 { pages_wide_raw } else { 1 };
+                stride_reach = 0.0f32;
+                stride_reach_tail = 0.0f32;
+                if has_page && page_rows > 0 {
+                    let page_gap_x = f32::from_bits(item_descriptors[descriptor_offset + ITEM_DESC_PAGE_GAP_X]);
+                    let exact = advance_fixed(key_to_float(max_row_extents[item_index * 2]))
+                        + advance_fixed(page_gap_x);
+                    fixed_pair(exact, &mut stride_reach, &mut stride_reach_tail);
+                }
+                item_color_base = item_descriptors[descriptor_offset + ITEM_DESC_COLOR_BASE];
+                item_is_per_record = item_descriptors[descriptor_offset + ITEM_DESC_IS_PER_RECORD];
+                item_flat_color = item_descriptors[descriptor_offset + ITEM_DESC_FLAT_COLOR];
+                let item_group_id = item_descriptors[descriptor_offset + ITEM_DESC_GROUP];
+                has_page_active = page_rows != 0 || page_cols != 0 || scroll_rows != 0;
+                item_and_group_word = (item_index as u32 & 0xFFFFu32) | ((item_group_id & 0xFFFFu32) << 16u32);
+            }
+
+            let reset = has_items && id == start;
+            if reset {
+                run.nl = 0;
+                run.rows = 0;
+                run.head_len = 0;
+                run.tail_len = 0;
+                run.tail_adv = 0.0f32;
+                run.clean_len = 0;
+                run.clean_break = 1;
+                run.wrap = active_wrap_width;
+                run.mode = active_wrap_mode;
+                in_segment = false;
+            }
+            let lane = id - range_start;
+            let col = run.tail_len;
+            let segment_column = if fold_unit > 0 { col % fold_unit } else { col };
+            let no_wrap_crossing = fold_unit == 0 || (segment_column + 4 <= fold_unit);
+            let no_page_crossing = page_cols == 0 || ((col / page_cols) == ((col + 3) / page_cols));
+
+            let is_lane0_word_ascii = lane == 0
+                && thread_flags_word0 == 0x2121_2121u32
+                && (thread_bytes_word0 & 0x8080_8080u32) == 0u32
+                && (range_start != start)
+                && (range_start + 4 <= next_item_boundary)
+                && (range_start + 4 <= total_bytes);
+
+            let is_lane4_word_ascii = lane == 4
+                && thread_flags_word1 == 0x2121_2121u32
+                && (thread_bytes_word1 & 0x8080_8080u32) == 0u32
+                && (range_start + 4 != start)
+                && (range_start + 8 <= next_item_boundary)
+                && (range_start + 8 <= total_bytes);
+
+            let no_wrap_crossing_8 = fold_unit == 0 || (segment_column + 8 <= fold_unit);
+            let no_page_crossing_8 = page_cols == 0 || ((col / page_cols) == ((col + 7) / page_cols));
+            let is_all_8_ascii = lane == 0
+                && thread_flags_word0 == 0x2121_2121u32
+                && thread_flags_word1 == 0x2121_2121u32
+                && ((thread_bytes_word0 | thread_bytes_word1) & 0x8080_8080u32) == 0u32
+                && (range_start != start)
+                && (range_start + 8 <= next_item_boundary)
+                && (range_start + 8 <= total_bytes);
+
+            let can_take_8_byte_burst = is_all_8_ascii && no_wrap_crossing_8 && no_page_crossing_8;
+            let can_take_word_fast_path = no_wrap_crossing
+                && no_page_crossing
+                && (is_lane0_word_ascii || is_lane4_word_ascii);
+
+            let warp_idx = unit_idx >> 5usize;
+            let lane_id = unit_idx & 31usize;
+
+            shared_counts[1280usize + unit_idx] = if can_take_8_byte_burst { 1i32 } else { 0i32 };
+
+            if lane_id == 0 {
+                let mut all_burst = 1i32;
+                let warp_ballot_base = 1280usize + warp_idx * 32usize;
+                #[unroll]
+                for check_lane in 0usize..32usize {
+                    if shared_counts[warp_ballot_base + check_lane] == 0 {
+                        all_burst = 0i32;
+                    }
+                }
+                shared_counts[1536usize + warp_idx] = all_burst;
+            }
+
+            let warp_all_burst = shared_counts[1536usize + warp_idx] == 1i32;
+
+            if can_take_8_byte_burst {
+                let is_segment_head = segment_column == 0;
+                if is_segment_head {
+                    current_advance_x = 0.0f32;
+                    in_segment = true;
+                } else if !in_segment {
+                    current_advance_x = resolve_entry_advance(
+                        id,
+                        segment_column,
+                        fold_unit,
+                        run.clean_len,
+                        run.tail_adv,
+                        tile_byte_start,
+                        total_bytes,
+                        glyph_flags,
+                        bytes,
+                        &shared_tile_flags,
+                        segment_entry_advances,
+                        bitmap_advance,
+                        ascii_block_base,
+                        active_cell_advance_bits,
+                        trie_block_indices,
+                        trie_block_metrics,
+                        trie_block_codepoints,
+                        trie_block_shift,
+                    );
+                    in_segment = true;
+                }
+
+                let mut closed = 0i32;
+                if run.nl > 0 {
+                    closed = rows_for(run.head_len, active_wrap_width, active_wrap_mode) + run.rows;
+                }
+                let wr = wrap_row_of(col, active_wrap_width, false, active_wrap_mode);
+                let row = closed + wr;
+                let wrap_segment = wrap_segment_of(col, active_wrap_width, false);
+
+                let cell_advance = f32::from_bits(active_cell_advance_bits);
+                let base_x0 = current_advance_x + origin_x;
+                current_advance_x += cell_advance;
+                let base_x1 = current_advance_x + origin_x;
+                current_advance_x += cell_advance;
+                let base_x2 = current_advance_x + origin_x;
+                current_advance_x += cell_advance;
+                let base_x3 = current_advance_x + origin_x;
+                current_advance_x += cell_advance;
+                let base_x4 = current_advance_x + origin_x;
+                current_advance_x += cell_advance;
+                let base_x5 = current_advance_x + origin_x;
+                current_advance_x += cell_advance;
+                let base_x6 = current_advance_x + origin_x;
+                current_advance_x += cell_advance;
+                let base_x7 = current_advance_x + origin_x;
+                current_advance_x += cell_advance;
+
+                let mut final_x0 = base_x0;
+                let mut final_x1 = base_x1;
+                let mut final_x2 = base_x2;
+                let mut final_x3 = base_x3;
+                let mut final_x4 = base_x4;
+                let mut final_x5 = base_x5;
+                let mut final_x6 = base_x6;
+                let mut final_x7 = base_x7;
+
+                if has_page_active {
+                    let screen_row = row - scroll_rows;
+                    let mut y_page = 0;
+                    if page_rows > 0 && screen_row >= page_rows {
+                        y_page = screen_row / page_rows;
+                    }
+                    let page_col = (y_page % pages_wide) as f32;
+                    let x_with_tail0 = fma(page_col, stride_reach_tail, base_x0);
+                    final_x0 = fma(page_col, stride_reach, x_with_tail0);
+                    let x_with_tail1 = fma(page_col, stride_reach_tail, base_x1);
+                    final_x1 = fma(page_col, stride_reach, x_with_tail1);
+                    let x_with_tail2 = fma(page_col, stride_reach_tail, base_x2);
+                    final_x2 = fma(page_col, stride_reach, x_with_tail2);
+                    let x_with_tail3 = fma(page_col, stride_reach_tail, base_x3);
+                    final_x3 = fma(page_col, stride_reach, x_with_tail3);
+                    let x_with_tail4 = fma(page_col, stride_reach_tail, base_x4);
+                    final_x4 = fma(page_col, stride_reach, x_with_tail4);
+                    let x_with_tail5 = fma(page_col, stride_reach_tail, base_x5);
+                    final_x5 = fma(page_col, stride_reach, x_with_tail5);
+                    let x_with_tail6 = fma(page_col, stride_reach_tail, base_x6);
+                    final_x6 = fma(page_col, stride_reach, x_with_tail6);
+                    let x_with_tail7 = fma(page_col, stride_reach_tail, base_x7);
+                    final_x7 = fma(page_col, stride_reach, x_with_tail7);
+                }
+
+                let b0 = thread_bytes_word0 & 0xFF;
+                let b1 = (thread_bytes_word0 >> 8u32) & 0xFF;
+                let b2 = (thread_bytes_word0 >> 16u32) & 0xFF;
+                let b3 = (thread_bytes_word0 >> 24u32) & 0xFF;
+                let b4 = thread_bytes_word1 & 0xFF;
+                let b5 = (thread_bytes_word1 >> 8u32) & 0xFF;
+                let b6 = (thread_bytes_word1 >> 16u32) & 0xFF;
+                let b7 = (thread_bytes_word1 >> 24u32) & 0xFF;
+                let glyph_id0 = b0 - 31u32;
+                let glyph_id1 = b1 - 31u32;
+                let glyph_id2 = b2 - 31u32;
+                let glyph_id3 = b3 - 31u32;
+                let glyph_id4 = b4 - 31u32;
+                let glyph_id5 = b5 - 31u32;
+                let glyph_id6 = b6 - 31u32;
+                let glyph_id7 = b7 - 31u32;
+
+                let (color0, color1, color2, color3, color4, color5, color6, color7) = if item_is_per_record != 0u32 {
+                    let color_offset = (item_color_base + run.glyphs as u32) as usize;
+                    (
+                        per_record_semantic_colors[color_offset],
+                        per_record_semantic_colors[color_offset + 1],
+                        per_record_semantic_colors[color_offset + 2],
+                        per_record_semantic_colors[color_offset + 3],
+                        per_record_semantic_colors[color_offset + 4],
+                        per_record_semantic_colors[color_offset + 5],
+                        per_record_semantic_colors[color_offset + 6],
+                        per_record_semantic_colors[color_offset + 7],
+                    )
+                } else {
+                    (
+                        item_flat_color, item_flat_color, item_flat_color, item_flat_color,
+                        item_flat_color, item_flat_color, item_flat_color, item_flat_color,
+                    )
+                };
+
+                let slot_word_offset = survivor_ordinal as usize * 5;
+                let wrap_hi = (wrap_segment as u32) << 16u32;
+
+                if warp_all_burst {
+                    let warp_survivor_base = survivor_ordinal - (lane_id as u32 * 8u32);
+                    let warp_base_slot_word = warp_survivor_base as usize * 5;
+
+                    if warp_base_slot_word + 1280 <= instance_slots.len() {
+                        let warp_staging_base = warp_idx * 160;
+
+                        #[unroll]
+                        for g in 0usize..8usize {
+                            if (lane_id >> 2) == g {
+                                let sub_lane = lane_id & 3;
+                                let staging_lane_base = warp_staging_base + sub_lane * 40;
+
+                                shared_counts[staging_lane_base]      = final_x0.to_bits() as i32;
+                                shared_counts[staging_lane_base + 1]  = row;
+                                shared_counts[staging_lane_base + 2]  = (glyph_id0 | wrap_hi) as i32;
+                                shared_counts[staging_lane_base + 3]  = color0 as i32;
+                                shared_counts[staging_lane_base + 4]  = item_and_group_word as i32;
+
+                                shared_counts[staging_lane_base + 5]  = final_x1.to_bits() as i32;
+                                shared_counts[staging_lane_base + 6]  = row;
+                                shared_counts[staging_lane_base + 7]  = (glyph_id1 | wrap_hi) as i32;
+                                shared_counts[staging_lane_base + 8]  = color1 as i32;
+                                shared_counts[staging_lane_base + 9]  = item_and_group_word as i32;
+
+                                shared_counts[staging_lane_base + 10] = final_x2.to_bits() as i32;
+                                shared_counts[staging_lane_base + 11] = row;
+                                shared_counts[staging_lane_base + 12] = (glyph_id2 | wrap_hi) as i32;
+                                shared_counts[staging_lane_base + 13] = color2 as i32;
+                                shared_counts[staging_lane_base + 14] = item_and_group_word as i32;
+
+                                shared_counts[staging_lane_base + 15] = final_x3.to_bits() as i32;
+                                shared_counts[staging_lane_base + 16] = row;
+                                shared_counts[staging_lane_base + 17] = (glyph_id3 | wrap_hi) as i32;
+                                shared_counts[staging_lane_base + 18] = color3 as i32;
+                                shared_counts[staging_lane_base + 19] = item_and_group_word as i32;
+
+                                shared_counts[staging_lane_base + 20] = final_x4.to_bits() as i32;
+                                shared_counts[staging_lane_base + 21] = row;
+                                shared_counts[staging_lane_base + 22] = (glyph_id4 | wrap_hi) as i32;
+                                shared_counts[staging_lane_base + 23] = color4 as i32;
+                                shared_counts[staging_lane_base + 24] = item_and_group_word as i32;
+
+                                shared_counts[staging_lane_base + 25] = final_x5.to_bits() as i32;
+                                shared_counts[staging_lane_base + 26] = row;
+                                shared_counts[staging_lane_base + 27] = (glyph_id5 | wrap_hi) as i32;
+                                shared_counts[staging_lane_base + 28] = color5 as i32;
+                                shared_counts[staging_lane_base + 29] = item_and_group_word as i32;
+
+                                shared_counts[staging_lane_base + 30] = final_x6.to_bits() as i32;
+                                shared_counts[staging_lane_base + 31] = row;
+                                shared_counts[staging_lane_base + 32] = (glyph_id6 | wrap_hi) as i32;
+                                shared_counts[staging_lane_base + 33] = color6 as i32;
+                                shared_counts[staging_lane_base + 34] = item_and_group_word as i32;
+
+                                shared_counts[staging_lane_base + 35] = final_x7.to_bits() as i32;
+                                shared_counts[staging_lane_base + 36] = row;
+                                shared_counts[staging_lane_base + 37] = (glyph_id7 | wrap_hi) as i32;
+                                shared_counts[staging_lane_base + 38] = color7 as i32;
+                                shared_counts[staging_lane_base + 39] = item_and_group_word as i32;
+                            }
+
+                            let group_dram_base = warp_base_slot_word + g * 160;
+                            #[unroll]
+                            for k in 0usize..5usize {
+                                let word_offset = k * 32 + lane_id;
+                                instance_slots[group_dram_base + word_offset] = shared_counts[warp_staging_base + word_offset] as u32;
+                            }
+                        }
+                    }
+                } else if slot_word_offset + 40 <= instance_slots.len() {
+                    instance_slots[slot_word_offset]      = final_x0.to_bits();
+                    instance_slots[slot_word_offset + 1]  = row as u32;
+                    instance_slots[slot_word_offset + 2]  = glyph_id0 | wrap_hi;
+                    instance_slots[slot_word_offset + 3]  = color0;
+                    instance_slots[slot_word_offset + 4]  = item_and_group_word;
+
+                    instance_slots[slot_word_offset + 5]  = final_x1.to_bits();
+                    instance_slots[slot_word_offset + 6]  = row as u32;
+                    instance_slots[slot_word_offset + 7]  = glyph_id1 | wrap_hi;
+                    instance_slots[slot_word_offset + 8]  = color1;
+                    instance_slots[slot_word_offset + 9]  = item_and_group_word;
+
+                    instance_slots[slot_word_offset + 10] = final_x2.to_bits();
+                    instance_slots[slot_word_offset + 11] = row as u32;
+                    instance_slots[slot_word_offset + 12] = glyph_id2 | wrap_hi;
+                    instance_slots[slot_word_offset + 13] = color2;
+                    instance_slots[slot_word_offset + 14] = item_and_group_word;
+
+                    instance_slots[slot_word_offset + 15] = final_x3.to_bits();
+                    instance_slots[slot_word_offset + 16] = row as u32;
+                    instance_slots[slot_word_offset + 17] = glyph_id3 | wrap_hi;
+                    instance_slots[slot_word_offset + 18] = color3;
+                    instance_slots[slot_word_offset + 19] = item_and_group_word;
+
+                    instance_slots[slot_word_offset + 20] = final_x4.to_bits();
+                    instance_slots[slot_word_offset + 21] = row as u32;
+                    instance_slots[slot_word_offset + 22] = glyph_id4 | wrap_hi;
+                    instance_slots[slot_word_offset + 23] = color4;
+                    instance_slots[slot_word_offset + 24] = item_and_group_word;
+
+                    instance_slots[slot_word_offset + 25] = final_x5.to_bits();
+                    instance_slots[slot_word_offset + 26] = row as u32;
+                    instance_slots[slot_word_offset + 27] = glyph_id5 | wrap_hi;
+                    instance_slots[slot_word_offset + 28] = color5;
+                    instance_slots[slot_word_offset + 29] = item_and_group_word;
+
+                    instance_slots[slot_word_offset + 30] = final_x6.to_bits();
+                    instance_slots[slot_word_offset + 31] = row as u32;
+                    instance_slots[slot_word_offset + 32] = glyph_id6 | wrap_hi;
+                    instance_slots[slot_word_offset + 33] = color6;
+                    instance_slots[slot_word_offset + 34] = item_and_group_word;
+
+                    instance_slots[slot_word_offset + 35] = final_x7.to_bits();
+                    instance_slots[slot_word_offset + 36] = row as u32;
+                    instance_slots[slot_word_offset + 37] = glyph_id7 | wrap_hi;
+                    instance_slots[slot_word_offset + 38] = color7;
+                    instance_slots[slot_word_offset + 39] = item_and_group_word;
+                }
+
+                survivor_ordinal += 8u32;
+                run.tail_len += 8;
+                run.tail_adv += cell_advance * 8.0f32;
+                run.clean_len += 8;
+                if run.nl == 0 {
+                    run.head_len = run.tail_len;
+                }
+                run.glyphs += 8;
+                run.survivors += 8;
+                id += 8;
+            } else if can_take_word_fast_path {
+                let is_segment_head = segment_column == 0;
+                if is_segment_head {
+                    current_advance_x = 0.0f32;
+                    in_segment = true;
+                } else if !in_segment {
+                    current_advance_x = resolve_entry_advance(
+                        id,
+                        segment_column,
+                        fold_unit,
+                        run.clean_len,
+                        run.tail_adv,
+                        tile_byte_start,
+                        total_bytes,
+                        glyph_flags,
+                        bytes,
+                        &shared_tile_flags,
+                        segment_entry_advances,
+                        bitmap_advance,
+                        ascii_block_base,
+                        active_cell_advance_bits,
+                        trie_block_indices,
+                        trie_block_metrics,
+                        trie_block_codepoints,
+                        trie_block_shift,
+                    );
+                    in_segment = true;
+                }
+
+                let mut closed = 0i32;
+                if run.nl > 0 {
+                    closed = rows_for(run.head_len, active_wrap_width, active_wrap_mode) + run.rows;
+                }
+                let wr = wrap_row_of(col, active_wrap_width, false, active_wrap_mode);
+                let row = closed + wr;
+                let wrap_segment = wrap_segment_of(col, active_wrap_width, false);
+
+                let cell_advance = f32::from_bits(active_cell_advance_bits);
+                let base_x0 = current_advance_x + origin_x;
+                current_advance_x += cell_advance;
+                let base_x1 = current_advance_x + origin_x;
+                current_advance_x += cell_advance;
+                let base_x2 = current_advance_x + origin_x;
+                current_advance_x += cell_advance;
+                let base_x3 = current_advance_x + origin_x;
+                current_advance_x += cell_advance;
+
+                let mut final_x0 = base_x0;
+                let mut final_x1 = base_x1;
+                let mut final_x2 = base_x2;
+                let mut final_x3 = base_x3;
+
+                if has_page_active {
+                    let screen_row = row - scroll_rows;
+                    let mut y_page = 0;
+                    if page_rows > 0 && screen_row >= page_rows {
+                        y_page = screen_row / page_rows;
+                    }
+                    let page_col = (y_page % pages_wide) as f32;
+                    let x_with_tail0 = fma(page_col, stride_reach_tail, base_x0);
+                    final_x0 = fma(page_col, stride_reach, x_with_tail0);
+                    let x_with_tail1 = fma(page_col, stride_reach_tail, base_x1);
+                    final_x1 = fma(page_col, stride_reach, x_with_tail1);
+                    let x_with_tail2 = fma(page_col, stride_reach_tail, base_x2);
+                    final_x2 = fma(page_col, stride_reach, x_with_tail2);
+                    let x_with_tail3 = fma(page_col, stride_reach_tail, base_x3);
+                    final_x3 = fma(page_col, stride_reach, x_with_tail3);
+                }
+
+                let bytes_word = if is_lane0_word_ascii { thread_bytes_word0 } else { thread_bytes_word1 };
+                let b0 = bytes_word & 0xFF;
+                let b1 = (bytes_word >> 8u32) & 0xFF;
+                let b2 = (bytes_word >> 16u32) & 0xFF;
+                let b3 = (bytes_word >> 24u32) & 0xFF;
+                let glyph_id0 = b0 - 31u32;
+                let glyph_id1 = b1 - 31u32;
+                let glyph_id2 = b2 - 31u32;
+                let glyph_id3 = b3 - 31u32;
+
+                let (color0, color1, color2, color3) = if item_is_per_record != 0u32 {
+                    let color_offset = (item_color_base + run.glyphs as u32) as usize;
+                    (
+                        per_record_semantic_colors[color_offset],
+                        per_record_semantic_colors[color_offset + 1],
+                        per_record_semantic_colors[color_offset + 2],
+                        per_record_semantic_colors[color_offset + 3],
+                    )
+                } else {
+                    (item_flat_color, item_flat_color, item_flat_color, item_flat_color)
+                };
+
+                let slot_word_offset = survivor_ordinal as usize * 5;
+                if slot_word_offset + 20 <= instance_slots.len() {
+                    let glyph_and_wrap0 = glyph_id0 | ((wrap_segment as u32) << 16u32);
+                    instance_slots[slot_word_offset]      = final_x0.to_bits();
+                    instance_slots[slot_word_offset + 1]  = row as u32;
+                    instance_slots[slot_word_offset + 2]  = glyph_and_wrap0;
+                    instance_slots[slot_word_offset + 3]  = color0;
+                    instance_slots[slot_word_offset + 4]  = item_and_group_word;
+
+                    let glyph_and_wrap1 = glyph_id1 | ((wrap_segment as u32) << 16u32);
+                    instance_slots[slot_word_offset + 5]  = final_x1.to_bits();
+                    instance_slots[slot_word_offset + 6]  = row as u32;
+                    instance_slots[slot_word_offset + 7]  = glyph_and_wrap1;
+                    instance_slots[slot_word_offset + 8]  = color1;
+                    instance_slots[slot_word_offset + 9]  = item_and_group_word;
+
+                    let glyph_and_wrap2 = glyph_id2 | ((wrap_segment as u32) << 16u32);
+                    instance_slots[slot_word_offset + 10] = final_x2.to_bits();
+                    instance_slots[slot_word_offset + 11] = row as u32;
+                    instance_slots[slot_word_offset + 12] = glyph_and_wrap2;
+                    instance_slots[slot_word_offset + 13] = color2;
+                    instance_slots[slot_word_offset + 14] = item_and_group_word;
+
+                    let glyph_and_wrap3 = glyph_id3 | ((wrap_segment as u32) << 16u32);
+                    instance_slots[slot_word_offset + 15] = final_x3.to_bits();
+                    instance_slots[slot_word_offset + 16] = row as u32;
+                    instance_slots[slot_word_offset + 17] = glyph_and_wrap3;
+                    instance_slots[slot_word_offset + 18] = color3;
+                    instance_slots[slot_word_offset + 19] = item_and_group_word;
+                }
+
+                survivor_ordinal += 4u32;
+                run.tail_len += 4;
+                run.tail_adv += cell_advance * 4.0f32;
+                run.clean_len += 4;
+                if run.nl == 0 {
+                    run.head_len = run.tail_len;
+                }
+                run.glyphs += 4;
+                run.survivors += 4;
+                id += 4;
+            } else {
+                let glyph_flags_val = if lane < 4 {
+                    (thread_flags_word0 >> ((lane * 8) as u32)) & 0xFF
+                } else {
+                    (thread_flags_word1 >> (((lane - 4) * 8) as u32)) & 0xFF
+                };
+
+                let mut glyph_advance = 0.0f32;
+                if (glyph_flags_val & F_LEADER) != 0 {
+                    let is_segment_head = segment_column == 0;
+                    if is_segment_head {
+                        current_advance_x = 0.0f32;
+                        in_segment = true;
+                    } else if !in_segment {
+                        current_advance_x = resolve_entry_advance(
+                            id,
+                            segment_column,
+                            fold_unit,
+                            run.clean_len,
+                            run.tail_adv,
+                            tile_byte_start,
+                            total_bytes,
+                            glyph_flags,
+                            bytes,
+                            &shared_tile_flags,
+                            segment_entry_advances,
+                            bitmap_advance,
+                            ascii_block_base,
+                            active_cell_advance_bits,
+                            trie_block_indices,
+                            trie_block_metrics,
+                            trie_block_codepoints,
+                            trie_block_shift,
+                        );
+                        in_segment = true;
+                    }
+
+                    let mut closed = 0i32;
+                    if run.nl > 0 {
+                        closed = rows_for(run.head_len, active_wrap_width, active_wrap_mode) + run.rows;
+                    }
+                    let wr = wrap_row_of(col, active_wrap_width, (glyph_flags_val & F_NEWLINE) != 0, active_wrap_mode);
+                    let row = closed + wr;
+                    let wrap_segment = wrap_segment_of(col, active_wrap_width, (glyph_flags_val & F_NEWLINE) != 0);
+
+                    let base_x = current_advance_x + origin_x;
+                    let mut final_x = base_x;
+                    if has_page_active {
+                        let screen_row = row - scroll_rows;
+                        let mut y_page = 0;
+                        if page_rows > 0 && screen_row >= page_rows {
+                            y_page = screen_row / page_rows;
+                        }
+                        let page_col = (y_page % pages_wide) as f32;
+                        let x_with_tail = fma(page_col, stride_reach_tail, base_x);
+                        final_x = fma(page_col, stride_reach, x_with_tail);
+                    }
+
+                    #[allow(unused_assignments)]
+                    let mut is_surv = false;
+                    let mut glyph_id = 0u32;
+                    let color = if item_is_per_record != 0u32 {
+                        let color_offset = (item_color_base + run.glyphs as u32) as usize;
+                        if color_offset < per_record_semantic_colors.len() {
+                            per_record_semantic_colors[color_offset]
+                        } else {
+                            item_flat_color
+                        }
+                    } else {
+                        item_flat_color
+                    };
+
+                    if (glyph_flags_val & F_CLUSTER_HEAD) != 0 {
+                        glyph_advance = bitmap_advance;
+                        is_surv = true;
+                        let total = _candidate_total[0];
+                        let mut lo = 0u32;
+                        let mut hi = total;
+                        while lo < hi {
+                            let mid = (lo + hi) / 2u32;
+                            let pos = _candidate_head_positions[mid as usize];
+                            if pos < id as u32 {
+                                lo = mid + 1u32;
+                            } else {
+                                hi = mid;
+                            }
+                        }
+                        if lo < total && _candidate_head_positions[lo as usize] == id as u32 {
+                            glyph_id = _candidate_slots[lo as usize];
+                        }
+                    } else if (glyph_flags_val & F_CLUSTER_TRAILER) != 0 {
+                        glyph_advance = 0.0f32;
+                        is_surv = false;
+                    } else {
+                        let lead_byte = if lane < 4 {
+                            (thread_bytes_word0 >> ((lane * 8) as u32)) & 0xFF
+                        } else {
+                            (thread_bytes_word1 >> (((lane - 4) * 8) as u32)) & 0xFF
+                        };
+                        if lead_byte >= 32u32 && lead_byte <= 126u32 {
+                            glyph_advance = f32::from_bits(active_cell_advance_bits);
+                            glyph_id = lead_byte - 31u32;
+                            is_surv = true;
+                        } else if lead_byte < 128u32 {
+                            let entry_offset = (ascii_block_base | lead_byte) as usize;
+                            glyph_advance = trie_block_metrics[entry_offset * 2];
+                            glyph_id = trie_block_codepoints[entry_offset * 2];
+                            is_surv = is_survivor(glyph_flags_val);
+                        } else {
+                            let cp_len = seq_len_at(bytes, id, total_bytes);
+                            let cp = cp_at(bytes, id, cp_len, total_bytes);
+                            let (adv, decoded_glyph_id) = decode_trie(cp, trie_block_indices, trie_block_metrics, trie_block_codepoints, trie_block_shift);
+                            glyph_advance = adv;
+                            glyph_id = decoded_glyph_id;
+                            is_surv = is_survivor(glyph_flags_val);
+                        }
+                    }
+
+                    if is_surv {
+                        let slot_word_offset = survivor_ordinal as usize * 5;
+                        if slot_word_offset + 5 <= instance_slots.len() {
+                            let glyph_and_wrap = glyph_id | ((wrap_segment as u32) << 16u32);
+                            instance_slots[slot_word_offset]     = final_x.to_bits();
+                            instance_slots[slot_word_offset + 1] = row as u32;
+                            instance_slots[slot_word_offset + 2] = glyph_and_wrap;
+                            instance_slots[slot_word_offset + 3] = color;
+                            instance_slots[slot_word_offset + 4] = item_and_group_word;
+                        }
+                        survivor_ordinal += 1u32;
+                    }
+
+                    if (glyph_flags_val & F_NEWLINE) == 0 {
+                        current_advance_x += glyph_advance;
+                    }
+                }
+                let advance_for_leaf = if (glyph_flags_val & F_LEADER) != 0 { glyph_advance } else { 0.0f32 };
+                let reset_int = if reset { 1i32 } else { 0i32 };
+                let is_surv = is_survivor(glyph_flags_val);
+                if (glyph_flags_val & F_NEWLINE) == 0 && (glyph_flags_val & F_LEADER) != 0 && glyph_advance.to_bits() == active_cell_advance_bits && reset_int == 0 {
+                    run.clean_len += 1;
+                    run.tail_len += 1;
+                    run.tail_adv += glyph_advance;
+                    if run.nl == 0 {
+                        run.head_len = run.tail_len;
+                    }
+                    run.glyphs += 1;
+                    if is_surv {
+                        run.survivors += 1;
+                    }
+                } else {
+                    let leaf = leaf_from_flag(glyph_flags_val, advance_for_leaf, active_wrap_width, active_wrap_mode, reset_int, active_cell_advance_bits);
+                    combine(&mut run, &leaf);
+                }
+                id += 1;
+            }
+        }
+    }
+}
