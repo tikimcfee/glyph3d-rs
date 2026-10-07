@@ -740,8 +740,29 @@ pub(super) fn apply_and_emit(
     let thread_local_element = s_load(&shared_counts, &shared_metrics, unit_idx, threads_per_cube);
     combine(&mut run, &thread_local_element);
 
+    let local_surv_prefix = thread_local_element.survivors;
+    let tile_survivor_base = (run.survivors - local_surv_prefix) as usize;
 
-    let mut cube_item_base = 0usize;
+    if emit_derived {
+        sync_cube();
+        if unit_idx == 0 {
+            shared_metrics[0] = local_surv_prefix as f32;
+        }
+        if unit_idx == 64 {
+            shared_metrics[1] = local_surv_prefix as f32;
+        }
+        if unit_idx == 128 {
+            shared_metrics[2] = local_surv_prefix as f32;
+        }
+        if unit_idx == 192 {
+            shared_metrics[3] = local_surv_prefix as f32;
+        }
+        if unit_idx == 255 {
+            shared_metrics[4] = (local_surv_prefix + accumulator.survivors) as f32;
+        }
+        sync_cube();
+    }
+
     if track_extents {
         cube_item_base = *shared_item_base as usize;
     }
@@ -899,9 +920,16 @@ pub(super) fn apply_and_emit(
     let mut prev_y_hi = f32::new(0.0f32);
     let mut seen_survivor_on_line = false;
 
-    if range_start < total_bytes {
-        let mut id = range_start;
-        while id < range_end {
+    let num_stages = if emit_derived { 4usize } else { 1usize };
+    for group_id in 0..num_stages {
+        let group_start_surv = if emit_derived { shared_metrics[group_id] as u32 } else { 0u32 };
+        let group_end_surv = if emit_derived { shared_metrics[group_id + 1] as u32 } else { 0u32 };
+        let group_total_words = if emit_derived { ((group_end_surv - group_start_surv) as usize) * 5 } else { 0usize };
+
+        let is_my_group = if emit_derived { (unit_idx >> 6) == group_id } else { true };
+        if is_my_group && range_start < total_bytes {
+            let mut id = range_start;
+            while id < range_end {
             while !is_uniform_tile && has_items && next_item_boundary <= id {
                 if track_extents && any_leader {
                     let slot = current_item_index - cube_item_base;
@@ -1318,57 +1346,55 @@ pub(super) fn apply_and_emit(
                 };
 
                 if emit_derived {
-                    let slot_word_offset = survivor_ordinal as usize * 5;
-                    if slot_word_offset + 40 <= instance_slots.len() {
-                        let wrap_hi = (wrap_segment as u32) << 16u32;
-                        instance_slots[slot_word_offset]      = final_x0.to_bits();
-                        instance_slots[slot_word_offset + 1]  = row as u32;
-                        instance_slots[slot_word_offset + 2]  = glyph_id0 | wrap_hi;
-                        instance_slots[slot_word_offset + 3]  = color0;
-                        instance_slots[slot_word_offset + 4]  = item_and_group_word;
+                    let local_word_offset = ((survivor_ordinal - group_start_surv) as usize) * 5;
+                    let wrap_hi = (wrap_segment as u32) << 16u32;
+                    shared_counts[local_word_offset]      = final_x0.to_bits() as i32;
+                    shared_counts[local_word_offset + 1]  = row;
+                    shared_counts[local_word_offset + 2]  = (glyph_id0 | wrap_hi) as i32;
+                    shared_counts[local_word_offset + 3]  = color0 as i32;
+                    shared_counts[local_word_offset + 4]  = item_and_group_word as i32;
 
-                        instance_slots[slot_word_offset + 5]  = final_x1.to_bits();
-                        instance_slots[slot_word_offset + 6]  = row as u32;
-                        instance_slots[slot_word_offset + 7]  = glyph_id1 | wrap_hi;
-                        instance_slots[slot_word_offset + 8]  = color1;
-                        instance_slots[slot_word_offset + 9]  = item_and_group_word;
+                    shared_counts[local_word_offset + 5]  = final_x1.to_bits() as i32;
+                    shared_counts[local_word_offset + 6]  = row;
+                    shared_counts[local_word_offset + 7]  = (glyph_id1 | wrap_hi) as i32;
+                    shared_counts[local_word_offset + 8]  = color1 as i32;
+                    shared_counts[local_word_offset + 9]  = item_and_group_word as i32;
 
-                        instance_slots[slot_word_offset + 10] = final_x2.to_bits();
-                        instance_slots[slot_word_offset + 11] = row as u32;
-                        instance_slots[slot_word_offset + 12] = glyph_id2 | wrap_hi;
-                        instance_slots[slot_word_offset + 13] = color2;
-                        instance_slots[slot_word_offset + 14] = item_and_group_word;
+                    shared_counts[local_word_offset + 10] = final_x2.to_bits() as i32;
+                    shared_counts[local_word_offset + 11] = row;
+                    shared_counts[local_word_offset + 12] = (glyph_id2 | wrap_hi) as i32;
+                    shared_counts[local_word_offset + 13] = color2 as i32;
+                    shared_counts[local_word_offset + 14] = item_and_group_word as i32;
 
-                        instance_slots[slot_word_offset + 15] = final_x3.to_bits();
-                        instance_slots[slot_word_offset + 16] = row as u32;
-                        instance_slots[slot_word_offset + 17] = glyph_id3 | wrap_hi;
-                        instance_slots[slot_word_offset + 18] = color3;
-                        instance_slots[slot_word_offset + 19] = item_and_group_word;
+                    shared_counts[local_word_offset + 15] = final_x3.to_bits() as i32;
+                    shared_counts[local_word_offset + 16] = row;
+                    shared_counts[local_word_offset + 17] = (glyph_id3 | wrap_hi) as i32;
+                    shared_counts[local_word_offset + 18] = color3 as i32;
+                    shared_counts[local_word_offset + 19] = item_and_group_word as i32;
 
-                        instance_slots[slot_word_offset + 20] = final_x4.to_bits();
-                        instance_slots[slot_word_offset + 21] = row as u32;
-                        instance_slots[slot_word_offset + 22] = glyph_id4 | wrap_hi;
-                        instance_slots[slot_word_offset + 23] = color4;
-                        instance_slots[slot_word_offset + 24] = item_and_group_word;
+                    shared_counts[local_word_offset + 20] = final_x4.to_bits() as i32;
+                    shared_counts[local_word_offset + 21] = row;
+                    shared_counts[local_word_offset + 22] = (glyph_id4 | wrap_hi) as i32;
+                    shared_counts[local_word_offset + 23] = color4 as i32;
+                    shared_counts[local_word_offset + 24] = item_and_group_word as i32;
 
-                        instance_slots[slot_word_offset + 25] = final_x5.to_bits();
-                        instance_slots[slot_word_offset + 26] = row as u32;
-                        instance_slots[slot_word_offset + 27] = glyph_id5 | wrap_hi;
-                        instance_slots[slot_word_offset + 28] = color5;
-                        instance_slots[slot_word_offset + 29] = item_and_group_word;
+                    shared_counts[local_word_offset + 25] = final_x5.to_bits() as i32;
+                    shared_counts[local_word_offset + 26] = row;
+                    shared_counts[local_word_offset + 27] = (glyph_id5 | wrap_hi) as i32;
+                    shared_counts[local_word_offset + 28] = color5 as i32;
+                    shared_counts[local_word_offset + 29] = item_and_group_word as i32;
 
-                        instance_slots[slot_word_offset + 30] = final_x6.to_bits();
-                        instance_slots[slot_word_offset + 31] = row as u32;
-                        instance_slots[slot_word_offset + 32] = glyph_id6 | wrap_hi;
-                        instance_slots[slot_word_offset + 33] = color6;
-                        instance_slots[slot_word_offset + 34] = item_and_group_word;
+                    shared_counts[local_word_offset + 30] = final_x6.to_bits() as i32;
+                    shared_counts[local_word_offset + 31] = row;
+                    shared_counts[local_word_offset + 32] = (glyph_id6 | wrap_hi) as i32;
+                    shared_counts[local_word_offset + 33] = color6 as i32;
+                    shared_counts[local_word_offset + 34] = item_and_group_word as i32;
 
-                        instance_slots[slot_word_offset + 35] = final_x7.to_bits();
-                        instance_slots[slot_word_offset + 36] = row as u32;
-                        instance_slots[slot_word_offset + 37] = glyph_id7 | wrap_hi;
-                        instance_slots[slot_word_offset + 38] = color7;
-                        instance_slots[slot_word_offset + 39] = item_and_group_word;
-                    }
+                    shared_counts[local_word_offset + 35] = final_x7.to_bits() as i32;
+                    shared_counts[local_word_offset + 36] = row;
+                    shared_counts[local_word_offset + 37] = (glyph_id7 | wrap_hi) as i32;
+                    shared_counts[local_word_offset + 38] = color7 as i32;
+                    shared_counts[local_word_offset + 39] = item_and_group_word as i32;
                 } else {
                     let slot_word_offset = survivor_ordinal as usize * 8;
                     if slot_word_offset + 64 <= instance_slots.len() {
