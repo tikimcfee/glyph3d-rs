@@ -377,9 +377,10 @@ fn build_scene_impl(
                     let mut guard = ctx.prewarm_handle.lock().unwrap();
                     if guard.is_none() {
                         let dev = shared_dev.clone();
+                        let is_derived = params.field_mode == glyph_field::GlyphFieldMode::Derived;
                         *guard = Some(std::thread::spawn(move || {
                             let t = std::time::Instant::now();
-                            cubecl_chain::prewarm(&dev);
+                            cubecl_chain::prewarm(&dev, Some(is_derived));
                             log::info!("cubecl compute pipeline prewarm finished in {:?}", t.elapsed());
                         }));
                     }

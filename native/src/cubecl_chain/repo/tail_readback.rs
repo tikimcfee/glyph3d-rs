@@ -190,6 +190,7 @@ pub(crate) fn decode_placements(
     leader_totals: &[u32],
 ) -> Vec<ItemPlacement> {
     let _sp_placements = tracing::info_span!("tail.placements").entered();
+    let _ = client.flush();
     let extent_bytes_opt = if device.is_unified() && device.host_visible_storage {
         let res = client
             .get_resource::<WgpuServer<AutoCompiler>>(h_item_extents.clone())

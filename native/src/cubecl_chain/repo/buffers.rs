@@ -4,7 +4,7 @@ use std::cell::Cell;
 use cubecl::client::Client;
 use cubecl::server::Handle;
 use crate::atlas::TrieTable;
-use super::super::{pack_words, PARTIAL_COUNT_STRIDE};
+use super::super::PARTIAL_COUNT_STRIDE;
 use super::prep::ChainHostInputs;
 use super::InstanceInputs;
 
@@ -110,7 +110,7 @@ pub(crate) fn allocate_chain_buffers(
     client: &Client,
     bytes: &[u8],
     item_count: usize,
-    inputs: &ChainHostInputs,
+    inputs: &ChainHostInputs<'_>,
     instance_inputs: &InstanceInputs,
     trie: &TrieTable,
     needs_tint: bool,
@@ -130,20 +130,28 @@ pub(crate) fn allocate_chain_buffers(
         client.create_from_slice(b)
     };
 
-    let packed = pack_words(bytes);
     let (trie_block_indices, trie_block_metrics, trie_block_codepoints, trie_block_shift) = trie.device_tables();
     let trie_block_indices_len = trie_block_indices.len();
     let trie_block_metrics_len = trie_block_metrics.len();
     let trie_block_codepoints_len = trie_block_codepoints.len();
 
-    let h_bytes = alloc_upload(bytemuck::cast_slice(&packed));
-    let h_trie_block_indices = alloc_upload(bytemuck::cast_slice(&trie_block_indices));
-    let h_trie_block_metrics = alloc_upload(bytemuck::cast_slice(&trie_block_metrics));
-    let h_trie_block_codepoints = alloc_upload(bytemuck::cast_slice(&trie_block_codepoints));
-    let h_cluster_sequence_table = alloc_upload(bytemuck::cast_slice(&inputs.seq));
-    let h_cluster_bitmap = alloc_upload(bytemuck::cast_slice(&inputs.bitmap));
-    let h_cluster_secondary_offsets = alloc_upload(bytemuck::cast_slice(&inputs.pair_secondary_offsets));
-    let h_cluster_secondary_values = alloc_upload(bytemuck::cast_slice(&inputs.pair_secondary_values));
+    let t_start = std::time::Instant::now();
+    let h_bytes = if bytes.len() >= n_words * 4 {
+        alloc_upload(&bytes[..n_words * 4])
+    } else {
+        let mut padded = Vec::with_capacity(n_words * 4);
+        padded.extend_from_slice(bytes);
+        padded.resize(n_words * 4, 0x80);
+        alloc_upload(&padded)
+    };
+    let t_bytes = t_start.elapsed();
+    let h_trie_block_indices = alloc_upload(bytemuck::cast_slice(trie_block_indices));
+    let h_trie_block_metrics = alloc_upload(bytemuck::cast_slice(trie_block_metrics));
+    let h_trie_block_codepoints = alloc_upload(bytemuck::cast_slice(trie_block_codepoints));
+    let h_cluster_sequence_table = alloc_upload(bytemuck::cast_slice(inputs.seq));
+    let h_cluster_bitmap = alloc_upload(bytemuck::cast_slice(inputs.bitmap));
+    let h_cluster_secondary_offsets = alloc_upload(bytemuck::cast_slice(inputs.pair_secondary_offsets));
+    let h_cluster_secondary_values = alloc_upload(bytemuck::cast_slice(inputs.pair_secondary_values));
     let h_item_record_bounds = alloc_upload(bytemuck::cast_slice(&inputs.item_record_bounds));
     let h_item_cluster_enabled = alloc_upload(bytemuck::cast_slice(&inputs.item_cluster_enabled));
     let h_item_descriptors = alloc_upload(bytemuck::cast_slice(&inputs.item_descriptors));
@@ -170,12 +178,15 @@ pub(crate) fn allocate_chain_buffers(
         (alloc_empty(4), 1)
     };
     let h_segment_entry_advances = alloc_upload(bytemuck::cast_slice(&inputs.segment_entry_advances));
+    let t_meta = t_start.elapsed() - t_bytes;
     let total_slots = inputs.total_slots;
     let slot_words = if is_derived { 5 } else { 8 };
+    let t_before_slots = std::time::Instant::now();
     let (h_instance_slots, slots_words) = (
         alloc_empty(total_slots.max(1) as usize * slot_words * 4),
         total_slots.max(1) as usize * slot_words,
     );
+    let t_slots = t_before_slots.elapsed();
     let (h_instance_tints, tint_words) = if needs_tint {
         (
             alloc_empty(total_slots.max(1) as usize * 2 * 4),
@@ -184,7 +195,9 @@ pub(crate) fn allocate_chain_buffers(
     } else {
         (alloc_empty(4), 1)
     };
-    let cluster_allocs = if inputs.has_cluster {
+    let mut cluster_allocs = None;
+    let t_cluster = if inputs.has_cluster {
+        let t_c = std::time::Instant::now();
         let kmax = ((candidate_capacity as u32 + 1).next_power_of_two().trailing_zeros()) as usize;
         let h_lvl = alloc_empty(kmax * candidate_stride * 4);
         let h_parent = alloc_empty(candidate_stride * 4);
@@ -193,7 +206,8 @@ pub(crate) fn allocate_chain_buffers(
         let h_d_a = alloc_empty(candidate_stride * 4);
         let h_d_b = alloc_empty(candidate_stride * 4);
         let h_roots = alloc_empty(item_count.max(1) * 4);
-        Some(ClusterCandidateAllocs {
+        let elapsed = t_c.elapsed();
+        cluster_allocs = Some(ClusterCandidateAllocs {
             h_lvl,
             h_parent,
             h_parent_b,
@@ -204,10 +218,20 @@ pub(crate) fn allocate_chain_buffers(
             candidate_capacity,
             kmax,
             candidate_stride,
-        })
+        });
+        elapsed
     } else {
-        None
+        std::time::Duration::ZERO
     };
+
+    log::info!(
+        "allocate_chain_buffers: total {:?}, bytes upload {:?}, meta {:?}, slots empty {:?}, cluster empty {:?}",
+        t_start.elapsed(),
+        t_bytes,
+        t_meta,
+        t_slots,
+        t_cluster
+    );
 
     BufferAllocationResult {
         buffers: ChainBuffers {

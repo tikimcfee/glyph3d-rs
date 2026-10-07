@@ -196,9 +196,10 @@ fn main() {
             #[cfg(feature = "cubecl")]
             if matches!(&plan.choice, SceneChoice::Repo { strategy: repo::Strategy::Cubecl, .. }) {
                 let shared_dev = gpu::SharedDevice::from_ctx(&ctx);
+                let is_derived = plan.cull_opts.field_mode == glyph_field::GlyphFieldMode::Derived;
                 let handle = std::thread::spawn(move || {
                     let t = std::time::Instant::now();
-                    cubecl_chain::prewarm(&shared_dev);
+                    cubecl_chain::prewarm(&shared_dev, Some(is_derived));
                     log::info!("cubecl compute pipeline prewarm finished in {:?}", t.elapsed());
                 });
                 *ctx.prewarm_handle.lock().unwrap() = Some(handle);

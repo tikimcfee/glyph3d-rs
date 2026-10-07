@@ -46,6 +46,7 @@ fn is_static_zero_cp(cp: u32) -> bool {
     cp == 0x200D || (0xFE00..=0xFE0F).contains(&cp) || (0xE0020..=0xE007F).contains(&cp)
 }
 
+#[allow(clippy::too_many_arguments)]
 #[inline(always)]
 fn resolve_leader(
     bytes: &[u8],
@@ -55,12 +56,14 @@ fn resolve_leader(
     bitmap_adv: f32,
     em_height_fu: u32,
     trailer_until: &mut usize,
+    has_cluster: &mut bool,
 ) -> ResolvedChar {
     let cp = decode_codepoint(bytes, pos, seq_len);
     let entry = trie.lookup(cp);
     let height = fu_to_world(entry.height_fu, em_height_fu);
 
     if pos < *trailer_until {
+        *has_cluster = true;
         return ResolvedChar {
             glyph_id: 0,
             advance: 0.0,
@@ -76,6 +79,10 @@ fn resolve_leader(
             height,
             is_newline: true,
         };
+    }
+
+    if is_static_zero_cp(cp) || (cp >= 0x80 && trie.starts_a_sequence(cp)) {
+        *has_cluster = true;
     }
 
     if is_static_zero_cp(cp) {
@@ -131,6 +138,7 @@ fn resolve_leader(
                     let last_mid = members[span_members - 1];
                     let last_len = sequence_length(bytes[last_mid]);
                     *trailer_until = last_mid + last_len;
+                    *has_cluster = true;
                 }
                 let entry = trie.lookup(cp);
                 return ResolvedChar {
@@ -161,6 +169,27 @@ pub(crate) fn resolve_byte_char(
     em_height_fu: u32,
     trailer_until: &mut usize,
 ) -> Option<ResolvedChar> {
+    resolve_byte_char_cluster(
+        bytes,
+        pos,
+        trie,
+        bitmap_adv,
+        em_height_fu,
+        trailer_until,
+        &mut false,
+    )
+}
+
+#[inline(always)]
+pub(crate) fn resolve_byte_char_cluster(
+    bytes: &[u8],
+    pos: usize,
+    trie: &TrieTable,
+    bitmap_adv: f32,
+    em_height_fu: u32,
+    trailer_until: &mut usize,
+    has_cluster: &mut bool,
+) -> Option<ResolvedChar> {
     let lead = bytes[pos];
     let fast = trie.fast_byte_table[lead as usize];
     if fast.glyph_id != AsciiFastEntry::SENTINEL && pos >= *trailer_until {
@@ -178,6 +207,7 @@ pub(crate) fn resolve_byte_char(
                 bitmap_adv,
                 em_height_fu,
                 trailer_until,
+                has_cluster,
             ))
         }
     }

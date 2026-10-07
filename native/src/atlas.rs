@@ -106,6 +106,14 @@ pub struct TrieTable {
     /// Direct 256-entry fast-path table for all single-byte characters.
     /// Unmapped bytes / multibyte UTF-8 lead/continuation bytes have `glyph_id == u32::MAX`.
     pub fast_byte_table: [AsciiFastEntry; 256],
+    /// Precomputed device-side tables (indices, measures, counts) in world units.
+    pub device_block_indices: Vec<u32>,
+    pub device_measures: Vec<f32>,
+    pub device_counts: Vec<u32>,
+    /// Precomputed cluster tables: candidacy bitmap and pair filter.
+    pub cluster_bitmap: Vec<u32>,
+    pub pair_secondary_offsets: Vec<u32>,
+    pub pair_secondary_values: Vec<u32>,
 }
 
 /// Precomputed fast-path metadata for single-byte ASCII characters (0x00..=0x7F).
@@ -125,6 +133,50 @@ impl AsciiFastEntry {
     pub fn is_fast(&self) -> bool {
         self.glyph_id != Self::SENTINEL
     }
+}
+
+fn compute_cluster_tables(
+    sequences: &[u32],
+    seq_max: u32,
+) -> (Vec<u32>, Vec<u32>, Vec<u32>) {
+    if sequences.is_empty() {
+        return (Vec::new(), Vec::new(), Vec::new());
+    }
+    let stride = 2 + seq_max as usize;
+    let mut bitmap = vec![0u32; 0x110000 / 32 + 1];
+    for i in (0..sequences.len()).step_by(stride) {
+        let cp = sequences[i + 2] as usize;
+        bitmap[cp >> 5] |= 1 << (cp & 31);
+    }
+    assert!(
+        (0..sequences.len())
+            .step_by(stride)
+            .all(|e| (0..sequences[e + 1] as usize).all(|k| sequences[e + 2 + k] != 0)),
+        "sequence entry with a zero element would break the pair filter's sentinel"
+    );
+    let mut pairs: Vec<(u32, u32)> = Vec::new();
+    for e in (0..sequences.len()).step_by(stride) {
+        if sequences[e + 1] >= 2 {
+            pairs.push((sequences[e + 2], sequences[e + 3]));
+        }
+    }
+    pairs.sort_unstable();
+    pairs.dedup();
+    let mut offsets = vec![0u32; 0x110000 + 2];
+    for &(first, _) in &pairs {
+        offsets[first as usize + 1] += 1;
+    }
+    for i in 1..offsets.len() {
+        offsets[i] += offsets[i - 1];
+    }
+    let mut cursor = offsets.clone();
+    let mut values = vec![0u32; pairs.len()];
+    for &(first, second) in &pairs {
+        let s = cursor[first as usize] as usize;
+        values[s] = second;
+        cursor[first as usize] += 1;
+    }
+    (bitmap, offsets, values)
 }
 
 impl TrieTable {
@@ -197,6 +249,21 @@ impl TrieTable {
             .collect();
         let mut ascii_table = [None; 128];
         let em = metrics.em_height_fu;
+        let stride = entry_stride as usize;
+        let n = blocks.len() / stride;
+        let mut device_measures = Vec::with_capacity(n * 2);
+        let mut device_counts = Vec::with_capacity(n * 2);
+        for e in 0..n {
+            let o = e * stride;
+            device_counts.push(blocks[o]);
+            device_measures.push(crate::text::fu_to_world(blocks[o + 1] as i32, em));
+            device_measures.push(crate::text::fu_to_world(blocks[o + 2] as i32, em));
+            device_counts.push(blocks[o + 3]);
+        }
+        let device_block_indices = block_index.clone();
+        let (cluster_bitmap, pair_secondary_offsets, pair_secondary_values) =
+            compute_cluster_tables(&sequences, seq_max);
+
         let mut t = Self {
             metrics,
             block_shift,
@@ -218,6 +285,12 @@ impl TrieTable {
                 height: 0.0,
                 is_newline: false,
             }; 256],
+            device_block_indices,
+            device_measures,
+            device_counts,
+            cluster_bitmap,
+            pair_secondary_offsets,
+            pair_secondary_values,
         };
         for b in 0..128u8 {
             let cp = b as u32;
@@ -229,7 +302,7 @@ impl TrieTable {
                     height: crate::text::fu_to_world(entry.height_fu, em),
                     is_newline: true,
                 });
-            } else if !t.starts_a_sequence(cp) && !crate::fold::is_static_zero_cp(cp) {
+            } else if !crate::fold::is_static_zero_cp(cp) {
                 let entry = t.lookup(cp);
                 ascii_table[b as usize] = Some(AsciiFastEntry {
                     glyph_id: entry.glyph_id,
@@ -262,23 +335,11 @@ impl TrieTable {
     /// index, per-entry measures [ADVANCE, HEIGHT], per-entry identity +
     /// bitfield [GLYPH_ID, FLAGS], and the block shift. The fu→world
     /// conversion runs through the SAME f64-rounding function the CPU
-    /// resolve uses, computed once here — so the device's advance bits are
+    /// resolve uses, precomputed once at load time — so the device's advance bits are
     /// the CPU's advance bits, and no device-side division (with fast-math
     /// questions attached) ever runs.
-    pub fn device_tables(&self) -> (Vec<u32>, Vec<f32>, Vec<u32>, u32) {
-        let em = self.metrics.em_height_fu;
-        let stride = self.entry_stride as usize;
-        let n = self.blocks.len() / stride;
-        let mut measures = Vec::with_capacity(n * 2);
-        let mut counts = Vec::with_capacity(n * 2);
-        for e in 0..n {
-            let o = e * stride;
-            counts.push(self.blocks[o]);
-            measures.push(crate::text::fu_to_world(self.blocks[o + 1] as i32, em));
-            measures.push(crate::text::fu_to_world(self.blocks[o + 2] as i32, em));
-            counts.push(self.blocks[o + 3]);
-        }
-        (self.block_index.clone(), measures, counts, self.block_shift)
+    pub fn device_tables(&self) -> (&[u32], &[f32], &[u32], u32) {
+        (&self.device_block_indices, &self.device_measures, &self.device_counts, self.block_shift)
     }
 
     /// Codepoint → trie entry (the two dependent loads of FORMAT.md).
@@ -726,8 +787,17 @@ struct CacheHeader {
     _reserved: [u8; 16],
 }
 
+enum CachedLevels {
+    Mmap {
+        mmap: memmap2::Mmap,
+        data_offset: usize,
+        total_bytes: usize,
+    },
+    Owned(Vec<Vec<Vec<u8>>>),
+}
+
 struct CachedEmoji {
-    levels: Vec<Vec<Vec<u8>>>,
+    levels: CachedLevels,
     cell_ink: Vec<[f32; 4]>,
 }
 
@@ -737,7 +807,6 @@ fn try_load_cache(
     sheet: &EmojiSheet,
     mip_levels: u32,
 ) -> Option<CachedEmoji> {
-    use std::io::Read;
     let meta = std::fs::metadata(sheet_path).ok()?;
     let source_len = meta.len();
     let source_mtime_secs = meta
@@ -748,22 +817,12 @@ fn try_load_cache(
         .unwrap_or(0);
 
     let file = std::fs::File::open(cache_path).ok()?;
-    let mut reader = std::io::BufReader::with_capacity(16 * 1024 * 1024, file);
-
-    let mut hdr = CacheHeader {
-        magic: [0; 4],
-        version: 0,
-        source_len: 0,
-        source_mtime_secs: 0,
-        layers: 0,
-        layer_w: 0,
-        layer_h: 0,
-        mip_levels: 0,
-        cell_count: 0,
-        _reserved0: 0,
-        _reserved: [0; 16],
-    };
-    reader.read_exact(bytemuck::bytes_of_mut(&mut hdr)).ok()?;
+    let mmap = unsafe { memmap2::Mmap::map(&file).ok()? };
+    let _ = mmap.advise(memmap2::Advice::WillNeed);
+    if mmap.len() < std::mem::size_of::<CacheHeader>() {
+        return None;
+    }
+    let hdr: CacheHeader = *bytemuck::from_bytes(&mmap[..std::mem::size_of::<CacheHeader>()]);
 
     if hdr.magic != *CACHE_MAGIC
         || hdr.version != CACHE_VERSION
@@ -778,25 +837,35 @@ fn try_load_cache(
         return None;
     }
 
-    let mut cell_ink: Vec<[f32; 4]> = vec![[0.0; 4]; hdr.cell_count as usize];
-    reader.read_exact(bytemuck::cast_slice_mut(&mut cell_ink)).ok()?;
+    let ink_offset = std::mem::size_of::<CacheHeader>();
+    let ink_bytes = hdr.cell_count as usize * std::mem::size_of::<[f32; 4]>();
+    if mmap.len() < ink_offset + ink_bytes {
+        return None;
+    }
+    let cell_ink: Vec<[f32; 4]> = bytemuck::cast_slice(&mmap[ink_offset..ink_offset + ink_bytes]).to_vec();
 
-    let mut levels: Vec<Vec<Vec<u8>>> = Vec::with_capacity(hdr.layers as usize);
+    let data_offset = ink_offset + ink_bytes;
+    let mut total_bytes = 0usize;
     for _ in 0..hdr.layers {
-        let mut chain = Vec::with_capacity(hdr.mip_levels as usize);
         let (mut w, mut h) = (hdr.layer_w, hdr.layer_h);
         for _ in 0..hdr.mip_levels {
-            let bytes = (w * h * 4) as usize;
-            let mut data = vec![0u8; bytes];
-            reader.read_exact(&mut data).ok()?;
-            chain.push(data);
+            total_bytes += (w * h * 4) as usize;
             w /= 2;
             h /= 2;
         }
-        levels.push(chain);
+    }
+    if mmap.len() < data_offset + total_bytes {
+        return None;
     }
 
-    Some(CachedEmoji { levels, cell_ink })
+    Some(CachedEmoji {
+        levels: CachedLevels::Mmap {
+            mmap,
+            data_offset,
+            total_bytes,
+        },
+        cell_ink,
+    })
 }
 
 fn save_cache(
@@ -879,7 +948,7 @@ impl EmojiTexture {
                 if let Err(e) = save_cache(&cache_path, path, &sheet, mip_levels, &levels, &cell_ink) {
                     log::warn!("failed to write atlas mip cache to {}: {e}", cache_path.display());
                 }
-                (levels, cell_ink, false, t_decode, t_mips)
+                (CachedLevels::Owned(levels), cell_ink, false, t_decode, t_mips)
             }
         };
 
@@ -893,27 +962,86 @@ impl EmojiTexture {
             usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         });
-        let mut texture_bytes = 0u64;
-        for (layer, chain) in levels.iter().enumerate() {
+        let mut total_texture_bytes = 0u64;
+        for _ in 0..sheet.layers {
             let (mut w, mut h) = (sheet.layer_w, sheet.layer_h);
-            for (level, data) in chain.iter().enumerate() {
-                assert!((w * 4).is_multiple_of(UPLOAD_PITCH_ALIGN), "emoji mip {level}: pitch {} not aligned", w * 4);
-                queue.write_texture(
-                    wgpu::TexelCopyTextureInfo {
-                        texture: &texture,
-                        mip_level: level as u32,
-                        origin: wgpu::Origin3d { x: 0, y: 0, z: layer as u32 },
-                        aspect: wgpu::TextureAspect::All,
-                    },
-                    data,
-                    wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(w * 4), rows_per_image: Some(h) },
-                    wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
-                );
-                texture_bytes += data.len() as u64;
+            for _ in 0..mip_levels {
+                total_texture_bytes += (w * h * 4) as u64;
                 w /= 2;
                 h /= 2;
             }
         }
+
+        let staging = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("emoji sheet staging"),
+            size: total_texture_bytes,
+            usage: wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: true,
+        });
+        {
+            let mut mapped = staging
+                .slice(..)
+                .get_mapped_range_mut()
+                .expect("staging mapped range");
+            match &levels {
+                CachedLevels::Mmap { mmap, data_offset, total_bytes } => {
+                    use rayon::prelude::*;
+                    const CHUNK_SIZE: usize = 32 * 1024 * 1024;
+                    let dest_ptr = mapped.slice(..).as_raw_element_ptr().as_ptr();
+                    let dst: &mut [u8] = unsafe { std::slice::from_raw_parts_mut(dest_ptr, *total_bytes) };
+                    let src = &mmap[*data_offset..*data_offset + *total_bytes];
+                    dst.par_chunks_mut(CHUNK_SIZE)
+                        .zip(src.par_chunks(CHUNK_SIZE))
+                        .for_each(|(d, s)| {
+                            d.copy_from_slice(s);
+                        });
+                }
+                CachedLevels::Owned(layers) => {
+                    let mut cursor = 0;
+                    for chain in layers {
+                        for data in chain {
+                            mapped.slice(cursor..cursor + data.len()).copy_from_slice(data);
+                            cursor += data.len();
+                        }
+                    }
+                }
+            }
+        }
+        staging.unmap();
+
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("emoji texture blit"),
+        });
+        let mut buffer_offset = 0u64;
+        for layer in 0..sheet.layers {
+            let (mut w, mut h) = (sheet.layer_w, sheet.layer_h);
+            for level in 0..mip_levels {
+                assert!((w * 4).is_multiple_of(UPLOAD_PITCH_ALIGN), "emoji mip {level}: pitch {} not aligned", w * 4);
+                let bytes = (w * h * 4) as u64;
+                encoder.copy_buffer_to_texture(
+                    wgpu::TexelCopyBufferInfo {
+                        buffer: &staging,
+                        layout: wgpu::TexelCopyBufferLayout {
+                            offset: buffer_offset,
+                            bytes_per_row: Some(w * 4),
+                            rows_per_image: Some(h),
+                        },
+                    },
+                    wgpu::TexelCopyTextureInfo {
+                        texture: &texture,
+                        mip_level: level,
+                        origin: wgpu::Origin3d { x: 0, y: 0, z: layer },
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+                );
+                buffer_offset += bytes;
+                w /= 2;
+                h /= 2;
+            }
+        }
+        queue.submit([encoder.finish()]);
+        let texture_bytes = total_texture_bytes;
         let t_upload = t0.elapsed() - t_parse - t_decode - t_mips;
         log::info!(
             "emoji sheet: {} cells ({}x{}, {} ppem, bearing y {}, advance {} px) in {} layer(s) of {}x{}, \

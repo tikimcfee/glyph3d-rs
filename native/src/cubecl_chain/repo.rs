@@ -140,12 +140,12 @@ pub(crate) fn run_repo_chain(
     drop(sp_prep);
     let sp_tables = tracing::info_span!("chain.tables").entered();
 
-    let trie = crate::atlas::TrieTable::load(&crate::atlas_dir());
+    let trie = crate::atlas::default_trie();
     let host_inputs = prepare_chain_inputs(
         bytes,
         items,
         &trie,
-        true,
+        readback_slots,
         Some(inputs),
     );
 
@@ -180,10 +180,21 @@ pub(crate) fn run_repo_chain(
 
     let t_upload = std::time::Instant::now();
     drop(sp_init);
+
     let span_upload = tracing::info_span!("chain.upload", live_bytes = tracing::field::Empty);
     let sp_upload = span_upload.enter();
 
-    let needs_tint = readback_slots || inputs.is_per_record.iter().any(|&x| x != 0);
+    if let Some(dev) = device {
+        if let Some(h) = dev.prewarm_handle.lock().unwrap().take() {
+            let t_prewarm_wait = std::time::Instant::now();
+            h.join().expect("cubecl prewarm thread panicked");
+            log::info!("joined prewarm thread before buffer allocation in {:?}", t_prewarm_wait.elapsed());
+        }
+    }
+
+    let needs_tint = readback_slots
+        || (field_mode != glyph_field::GlyphFieldMode::Derived
+            && inputs.is_per_record.iter().any(|&x| x != 0));
     let buffers::BufferAllocationResult {
         buffers: mut buf,
         live_bytes,
@@ -202,18 +213,16 @@ pub(crate) fn run_repo_chain(
     span_upload.record("live_bytes", live_bytes);
     drop(sp_upload);
     drop(span_upload);
+
     let sp_dispatch = tracing::info_span!("chain.dispatch").entered();
 
     let mut prof = ChainProfiler::new();
 
-    if let Some(dev) = device {
-        if let Some(h) = dev.prewarm_handle.lock().unwrap().take() {
-            h.join().expect("cubecl prewarm thread panicked");
-        }
-    }
-
+    let t_b1 = std::time::Instant::now();
     launch_block1(&client, n, &host_inputs, &buf, &mut prof);
+    let dur_b1 = t_b1.elapsed();
 
+    let t_b2t = std::time::Instant::now();
     launch_block2_totals(
         &client,
         n,
@@ -222,7 +231,9 @@ pub(crate) fn run_repo_chain(
         &buf,
         &mut prof,
     );
+    let dur_b2t = t_b2t.elapsed();
 
+    let t_b2g = std::time::Instant::now();
     launch_block2_geometry(
         &client,
         n,
@@ -231,6 +242,16 @@ pub(crate) fn run_repo_chain(
         &buf,
         &mut prof,
         field_mode == glyph_field::GlyphFieldMode::Derived,
+    );
+    let dur_b2g = t_b2g.elapsed();
+
+    let t_fl = std::time::Instant::now();
+    let _ = client.flush();
+    let dur_fl = t_fl.elapsed();
+
+    tracing::info!(
+        "dispatch breakdown: b1 {:?}, b2_totals {:?}, b2_geo {:?}, flush {:?}",
+        dur_b1, dur_b2t, dur_b2g, dur_fl
     );
 
     let t_rb = std::time::Instant::now();
@@ -296,15 +317,19 @@ pub(crate) fn run_repo_chain(
         }
     );
 
-    let placements = decode_placements(
-        &client,
-        device_ref,
-        buf.h_item_extents.clone(),
-        item_count,
-        &item_slot_bases,
-        &survivor_totals,
-        &leader_totals,
-    );
+    let placements = if readback_slots {
+        decode_placements(
+            &client,
+            device_ref,
+            buf.h_item_extents.clone(),
+            item_count,
+            &item_slot_bases,
+            &survivor_totals,
+            &leader_totals,
+        )
+    } else {
+        host_inputs.placements
+    };
 
     let c = if readback_slots && host_inputs.has_cluster {
         if let Some(ref h_candidate_total) = buf.h_candidate_total {
@@ -335,10 +360,24 @@ pub(crate) fn run_repo_chain(
         slots_all = bytemuck::cast_slice::<u8, u32>(&sb)[..total_slots as usize * slot_words].to_vec();
     }
 
+    let t_pre_pkg = std::time::Instant::now();
     let slot_device = package_slot_device(&client, h_instance_slots, total_slots);
-    buf.release_survivor_scan();
+    let dur_pkg = t_pre_pkg.elapsed();
 
+    let t_pre_rel = std::time::Instant::now();
+    buf.release_survivor_scan();
+    let dur_rel = t_pre_rel.elapsed();
+
+    let t_pre_prof = std::time::Instant::now();
     prof.print_summary();
+    let dur_prof = t_pre_prof.elapsed();
+
+    tracing::info!(
+        "tail probes: pkg {} µs, rel {} µs, prof {} µs",
+        dur_pkg.as_micros(),
+        dur_rel.as_micros(),
+        dur_prof.as_micros(),
+    );
 
     ChainStream {
         total_slots,

@@ -1,28 +1,26 @@
 //! Host-side table preparation and input prepass for the GPU scan chain.
 
+use rayon::prelude::*;
 use crate::atlas::TrieTable;
 use crate::fold::{Item, WrapMode};
-use crate::layout_hyper::char_resolve::resolve_byte_char;
 use crate::text::ResolveGlyph;
-use rayon::prelude::*;
-use super::super::cluster::{cluster_host_inputs, cluster_pair_filter};
 use super::super::tail::{ordered_key_host, EXT_STRIDE};
 use super::super::ITEM_DESC_STRIDE;
 use super::InstanceInputs;
 
-pub(crate) struct ChainHostInputs {
+pub(crate) struct ChainHostInputs<'a> {
     pub threads_per_cube: usize,
     pub bytes_per_thread: usize,
     pub log: usize,
     pub n_tiles: usize,
     pub n_words: usize,
-    pub seq: Vec<u32>,
+    pub seq: &'a [u32],
     pub seq_max: u32,
     pub bitmap_advance: f32,
-    pub bitmap: Vec<u32>,
+    pub bitmap: &'a [u32],
     pub item_cluster_enabled: Vec<u32>,
-    pub pair_secondary_offsets: Vec<u32>,
-    pub pair_secondary_values: Vec<u32>,
+    pub pair_secondary_offsets: &'a [u32],
+    pub pair_secondary_values: &'a [u32],
     pub item_record_bounds: Vec<u32>,
     pub item_descriptors: Vec<u32>,
     /// `segment_entry_advances[k]`: k one-cell advances summed left to right
@@ -38,131 +36,17 @@ pub(crate) struct ChainHostInputs {
     pub total_records: u32,
     pub total_slots: u32,
     pub has_cluster: bool,
-}
-
-pub(crate) struct ItemScan {
-    pub max_row_extent: f32,
-    pub leader_count: u32,
-    pub survivor_count: u32,
+    pub placements: Vec<crate::layout::ItemPlacement>,
 }
 
 #[inline]
-pub(crate) fn scan_item_inputs(
-    bytes: &[u8],
-    fold_unit: usize,
-    trie: &TrieTable,
-    bitmap_adv: f32,
-    em_height_fu: u32,
-) -> ItemScan {
-    let mut col = 0usize;
-    let mut seg_adv = 0.0f32;
-    let mut widest = 0.0f32;
-    let mut leader_count = 0u32;
-    let mut survivor_count = 0u32;
-    let mut trailer_until = 0usize;
-    let mut pos = 0usize;
-
-    let ascii_adv = crate::text::fu_to_world(1229, em_height_fu);
-    let fu = fold_unit;
-    let mut seg_adv_stack = [0.0f32; 256];
-    let mut seg_adv_heap = Vec::new();
-    let seg_adv_table: &[f32] = if fu < 256 {
-        let mut cur = 0.0f32;
-        for slot in seg_adv_stack.iter_mut().take(fu + 1) {
-            *slot = cur;
-            cur += ascii_adv;
-        }
-        &seg_adv_stack[..=fu]
-    } else {
-        seg_adv_heap.reserve(fu + 1);
-        let mut cur = 0.0f32;
-        for _ in 0..=fu {
-            seg_adv_heap.push(cur);
-            cur += ascii_adv;
-        }
-        &seg_adv_heap
-    };
-
-    while pos < bytes.len() {
-        let nl_pos = match memchr::memchr(b'\n', &bytes[pos..]) {
-            Some(offset) => pos + offset,
-            None => bytes.len(),
-        };
-        let line = &bytes[pos..nl_pos];
-        if line.iter().all(|b| (0x20..0x7F).contains(b)) {
-            let l = line.len();
-            leader_count += l as u32;
-            survivor_count += l as u32;
-            let line_max_seg = if l >= fu {
-                seg_adv_table[fu - 1]
-            } else {
-                seg_adv_table[l]
-            };
-            if line_max_seg > widest {
-                widest = line_max_seg;
-            }
-            col = 0;
-            seg_adv = 0.0;
-            if nl_pos < bytes.len() {
-                leader_count += 1;
-                pos = nl_pos + 1;
-            } else {
-                pos = nl_pos;
-            }
-            continue;
-        }
-
-        for i in pos..nl_pos {
-            let r = match resolve_byte_char(bytes, i, trie, bitmap_adv, em_height_fu, &mut trailer_until) {
-                Some(r) => r,
-                None => continue,
-            };
-
-            leader_count += 1;
-            if r.glyph_id != 0 {
-                survivor_count += 1;
-            }
-
-            if seg_adv > widest {
-                widest = seg_adv;
-            }
-
-            col += 1;
-            if fold_unit > 0 && col.is_multiple_of(fold_unit) {
-                seg_adv = 0.0;
-            } else {
-                seg_adv += r.advance;
-            }
-        }
-
-        if nl_pos < bytes.len() {
-            leader_count += 1;
-            if seg_adv > widest {
-                widest = seg_adv;
-            }
-            col = 0;
-            seg_adv = 0.0;
-            pos = nl_pos + 1;
-        } else {
-            pos = nl_pos;
-        }
-    }
-
-    ItemScan {
-        max_row_extent: widest,
-        leader_count,
-        survivor_count,
-    }
-}
-
-#[inline]
-pub(crate) fn prepare_chain_inputs(
+pub(crate) fn prepare_chain_inputs<'a>(
     bytes: &[u8],
     items: &[Item],
-    trie: &TrieTable,
+    trie: &'a TrieTable,
     wants_instances: bool,
     instance_inputs: Option<&InstanceInputs>,
-) -> ChainHostInputs {
+) -> ChainHostInputs<'a> {
     let item_count = items.len();
     let n = bytes.len();
     let threads_per_cube = std::env::var("GLYPH_CHAIN_TILE")
@@ -177,14 +61,19 @@ pub(crate) fn prepare_chain_inputs(
     let n_tiles = n.div_ceil(threads_per_cube * bytes_per_thread).max(1);
     let n_words = n.div_ceil(4);
     let (seq, seq_max, bitmap_advance) = match trie.cluster_table() {
-        Some((s, m, a)) => (s.to_vec(), m, a),
+        Some((s, m, a)) => (s, m, a),
         None => {
             eprintln!("cubecl-repo-check: atlas carries no sequence section");
             std::process::exit(1);
         }
     };
-    let (bitmap, item_cluster_enabled) = cluster_host_inputs(&seq, seq_max, items);
-    let (pair_secondary_offsets, pair_secondary_values) = cluster_pair_filter(&seq, seq_max);
+    let item_cluster_enabled = items
+        .iter()
+        .map(|it| u32::from(it.cluster_mode == crate::fold::ClusterMode::Cluster))
+        .collect();
+    let bitmap = &trie.cluster_bitmap[..];
+    let pair_secondary_offsets = &trie.pair_secondary_offsets[..];
+    let pair_secondary_values = &trie.pair_secondary_values[..];
     let mut item_record_bounds = Vec::with_capacity(item_count * 2);
     let mut item_descriptors = Vec::with_capacity(item_count * ITEM_DESC_STRIDE);
     // The one-cell advance, in the same conversion decode writes per byte,
@@ -309,22 +198,42 @@ pub(crate) fn prepare_chain_inputs(
     let em_height_fu = trie.metrics.em_height_fu;
     let bitmap_adv = crate::text::fu_to_world(trie.bitmap_advance_fu, em_height_fu);
 
-    let scans: Vec<ItemScan> = items
-        .par_iter()
-        .map(|item| {
-            let start = item.byte_start as usize;
-            let end = (item.byte_start + item.byte_count) as usize;
-            let item_bytes = &bytes[start..end];
-            let fold_unit = if item.wrap_width > 0 {
-                item.wrap_width as usize
-            } else if item.has_page {
-                item.page_cols as usize
-            } else {
-                0
-            };
-            scan_item_inputs(item_bytes, fold_unit, trie, bitmap_adv, em_height_fu)
+    let layout_items: Vec<crate::layout::LayoutItem<'_>> = items
+        .iter()
+        .map(|it| {
+            let start = it.byte_start as usize;
+            let end = (it.byte_start + it.byte_count) as usize;
+            crate::layout::LayoutItem {
+                bytes: &bytes[start..end],
+                params: crate::layout::ItemParams {
+                    origin_x: it.origin_x,
+                    origin_y: it.origin_y,
+                    origin_z: it.origin_z,
+                    line_height: it.line_height,
+                    z_step: it.z_step,
+                    wrap_width: it.wrap_width as i32,
+                    wrap_mode: it.wrap_mode,
+                    cluster_mode: it.cluster_mode,
+                    has_page: it.has_page,
+                    page_rows: it.page_rows as i32,
+                    page_cols: it.page_cols as i32,
+                    scroll_rows: it.scroll_rows as i32,
+                    pages_wide: it.pages_wide as i32,
+                    page_gap_x: it.page_gap_x,
+                    band_stride_y: it.band_stride_y,
+                    depth_per_band: it.depth_per_band,
+                    depth_per_col: it.depth_per_col,
+                    page_line_height: it.page_line_height,
+                },
+                group_id: 0,
+                paint: crate::layout::Paint::Flat(0),
+            }
         })
         .collect();
+
+    let t_prepass0 = std::time::Instant::now();
+    let prepasses = crate::layout_hyper::pass1_prepass(&layout_items, trie, bitmap_adv, em_height_fu);
+    let dur_prepass = t_prepass0.elapsed();
 
     let mut extent_words = Vec::with_capacity(item_count * 2);
     let mut leader_totals = Vec::with_capacity(item_count);
@@ -334,9 +243,10 @@ pub(crate) fn prepare_chain_inputs(
     let mut total_records = 0u32;
     let mut total_slots = 0u32;
 
-    for (i, scan) in scans.into_iter().enumerate() {
+    for (i, pre) in prepasses.iter().enumerate() {
+        let max_row_extent = pre.max_row_extent as f32;
         let key = ordered_key_host(if items[i].has_page && items[i].page_rows > 0 {
-            scan.max_row_extent
+            max_row_extent
         } else {
             0.0f32
         });
@@ -345,11 +255,55 @@ pub(crate) fn prepare_chain_inputs(
 
         item_record_bases.push(total_records);
         item_slot_bases.push(total_slots);
-        total_records += scan.leader_count;
-        total_slots += scan.survivor_count;
-        leader_totals.push(scan.leader_count);
-        survivor_totals.push(scan.survivor_count);
+        total_records += pre.leader_count;
+        total_slots += pre.survivor_count;
+        leader_totals.push(pre.leader_count);
+        survivor_totals.push(pre.survivor_count);
     }
+    let has_cluster = prepasses
+        .iter()
+        .zip(items)
+        .any(|(pre, it)| pre.has_cluster && it.cluster_mode == crate::fold::ClusterMode::Cluster);
+
+    let t_place0 = std::time::Instant::now();
+    let placements: Vec<crate::layout::ItemPlacement> = if wants_instances {
+        layout_items
+            .par_iter()
+            .zip(prepasses.par_iter())
+            .zip(item_slot_bases.par_iter())
+            .map(|((item, pre), &slot_base)| {
+                let (mut placement, _, _, _) = crate::layout_hyper::compute_single_item_placement(
+                    &item.params,
+                    item.bytes,
+                    slot_base,
+                    pre.max_row_extent,
+                    trie,
+                    bitmap_adv,
+                    em_height_fu,
+                );
+                placement.slot_count = pre.survivor_count;
+                placement.record_count = pre.leader_count;
+                placement
+            })
+            .collect()
+    } else {
+        layout_items
+            .iter()
+            .zip(prepasses.iter())
+            .zip(item_slot_bases.iter())
+            .map(|((item, pre), &slot_base)| {
+                closed_form_placement(item, pre, slot_base, trie, em_height_fu)
+            })
+            .collect()
+    };
+    let dur_placements = t_place0.elapsed();
+
+    tracing::info!(
+        "tables breakdown: prepass {:?}, placements {:?} (has_cluster: {})",
+        dur_prepass,
+        dur_placements,
+        has_cluster,
+    );
 
     ChainHostInputs {
         threads_per_cube,
@@ -376,6 +330,74 @@ pub(crate) fn prepare_chain_inputs(
         item_slot_bases,
         total_records,
         total_slots,
-        has_cluster: items.iter().any(|it| it.cluster_mode == crate::fold::ClusterMode::Cluster),
+        has_cluster,
+        placements,
     }
 }
+
+fn closed_form_placement(
+    item: &crate::layout::LayoutItem<'_>,
+    pre: &crate::layout_hyper::ItemPrepass,
+    slot_base: u32,
+    trie: &TrieTable,
+    em_height_fu: u32,
+) -> crate::layout::ItemPlacement {
+    let p = &item.params;
+    let page_active = p.has_page && (p.page_rows > 0 || p.page_cols > 0 || p.scroll_rows > 0);
+    let page_stride_x = if p.has_page && p.page_rows > 0 {
+        pre.max_row_extent + p.page_gap_x
+    } else {
+        0.0
+    };
+    let cell_advance = crate::text::fu_to_world(trie.metrics.advance_fu as i32, em_height_fu) as f64;
+    let page_rows = p.page_rows.max(1) as i64;
+    let pages_wide = (p.pages_wide as i64).max(1);
+    let scroll_rows = p.scroll_rows as i64;
+    let max_row = (pre.row_count as i64).saturating_sub(1);
+    let y_page = if page_rows > 0 { max_row / page_rows } else { 0 };
+    let band = if pages_wide > 0 { y_page / pages_wide } else { 0 };
+    let total_pages = y_page + 1;
+    let max_page_col = (total_pages - 1).min(pages_wide - 1);
+
+    let page_right = if page_active {
+        ((p.origin_x as f32) as f64 + max_page_col as f64 * page_stride_x + pre.max_row_extent) as f32
+    } else {
+        (p.origin_x + pre.max_row_extent) as f32
+    };
+
+    let screen_row = max_row + scroll_rows;
+    let page_bottom = if page_active {
+        (p.origin_y
+            - (screen_row - y_page * page_rows) as f64 * p.line_height
+            - band as f64 * p.band_stride_y) as f32
+    } else {
+        (p.origin_y - max_row as f64 * p.line_height) as f32
+    };
+
+    let wrap_w = p.wrap_width as f64;
+    let max_wrap_segment = if p.wrap_mode == crate::fold::WrapMode::Back && wrap_w > 0.0 && cell_advance > 0.0 {
+        ((pre.max_row_extent / (wrap_w * cell_advance)).ceil() as i64).saturating_sub(1).max(0)
+    } else {
+        0
+    };
+
+    let page_z_min = (p.origin_z - max_wrap_segment as f64 * p.z_step + band as f64 * p.depth_per_band) as f32;
+    let page_z_max = (p.origin_z + band as f64 * p.depth_per_band) as f32;
+
+    crate::layout::ItemPlacement {
+        slot_base,
+        slot_count: pre.survivor_count,
+        record_count: pre.leader_count,
+        page: crate::layout::PageExtent {
+            right: page_right,
+            bottom: page_bottom,
+            z_min: page_z_min,
+            z_max: page_z_max,
+        },
+        ink: crate::layout::InkExtent {
+            min: [0.0; 3],
+            max: [0.0; 3],
+        },
+    }
+}
+

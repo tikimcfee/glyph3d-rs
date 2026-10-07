@@ -2947,6 +2947,7 @@ dependencies = [
  "image",
  "log",
  "memchr",
+ "memmap2",
  "naga",
  "pollster",
  "rayon",

@@ -1,7 +1,7 @@
 use cubecl::prelude::*;
 
 use super::cluster::{cp_at, seq_len_at};
-use super::decode::{byte_at, decode_trie};
+use super::decode::decode_trie;
 
 use super::monoid::{
     combine, flags_at, identity, item_search_desc, leaf_from_flag, leaf_of,
@@ -24,6 +24,7 @@ use super::{
 // tile total. The critical path per tile is rake + 2·log(units) combines —
 // against the old thread-per-chunk serial fold's one-thread `chunk`-deep
 // chain with units-fold less parallelism.
+#[allow(clippy::manual_range_contains)]
 #[cube(launch_unchecked)]
 pub(super) fn tile_scan(
     glyph_flags: &[u32],
@@ -72,6 +73,19 @@ pub(super) fn tile_scan(
         preload_word_idx += threads_per_cube;
     }
     sync_cube();
+
+    // Register-resident bytes for this thread's 8-byte range
+    let thread_word_idx = range_start >> 2;
+    let thread_bytes_word0 = if thread_word_idx < bytes.len() {
+        bytes[thread_word_idx]
+    } else {
+        0x8080_8080u32
+    };
+    let thread_bytes_word1 = if thread_word_idx + 1 < bytes.len() {
+        bytes[thread_word_idx + 1]
+    } else {
+        0x8080_8080u32
+    };
 
     // ItemWalk seed. For pad units (range_start >= total_bytes) the seed clamps to the last byte
     // so the pad element carries the wrap/mode in force at the tile's end —
@@ -126,8 +140,15 @@ pub(super) fn tile_scan(
                 } else if (glyph_flag & F_CLUSTER_TRAILER) != 0 {
                     0.0f32
                 } else {
-                    let lead_byte = byte_at(bytes, id, total_bytes);
-                    if lead_byte < 128u32 {
+                    let lane = id - range_start;
+                    let lead_byte = if lane < 4 {
+                        (thread_bytes_word0 >> ((lane * 8) as u32)) & 0xFF
+                    } else {
+                        (thread_bytes_word1 >> (((lane - 4) * 8) as u32)) & 0xFF
+                    };
+                    if lead_byte >= 32u32 && lead_byte <= 126u32 {
+                        f32::from_bits(active_cell_advance_bits)
+                    } else if lead_byte < 128u32 {
                         let entry_offset = (ascii_block_base | lead_byte) as usize;
                         trie_block_metrics[entry_offset * 2]
                     } else {

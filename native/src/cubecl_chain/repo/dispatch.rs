@@ -194,7 +194,7 @@ impl ChainProfiler {
 pub(crate) fn launch_block1(
     client: &Client,
     _n: usize,
-    inputs: &ChainHostInputs,
+    inputs: &ChainHostInputs<'_>,
     buf: &ChainBuffers,
     prof: &mut ChainProfiler,
 ) {
@@ -203,6 +203,7 @@ pub(crate) fn launch_block1(
     unsafe {
         prof.block_begin(client, "block1");
         prof.begin(client, "decode_probe");
+        let t_dp0 = std::time::Instant::now();
         decode_probe::launch_unchecked(
             client,
             cubes_of(n_words),
@@ -226,8 +227,10 @@ pub(crate) fn launch_block1(
             inputs.seq_max,
             buf.candidate_capacity,
         );
+        let dur_dp = t_dp0.elapsed();
         prof.end(client, "decode_probe");
 
+        let t_cs0 = std::time::Instant::now();
         if buf.cluster_allocs.is_some() {
             prof.begin(client, "cand_sort");
             cand_sort::launch_unchecked(
@@ -242,6 +245,8 @@ pub(crate) fn launch_block1(
             );
             prof.end(client, "cand_sort");
         }
+        let dur_cs = t_cs0.elapsed();
+        tracing::info!("launch_block1 breakdown: decode_probe {:?}, cand_sort {:?}", dur_dp, dur_cs);
         prof.block_end(client, "block1");
     }
 }
@@ -251,7 +256,7 @@ pub(crate) fn launch_block2_totals(
     client: &Client,
     _n: usize,
     item_count: usize,
-    inputs: &ChainHostInputs,
+    inputs: &ChainHostInputs<'_>,
     buf: &ChainBuffers,
     prof: &mut ChainProfiler,
 ) {
@@ -345,7 +350,7 @@ pub(crate) fn launch_block2_geometry(
     client: &Client,
     _n: usize,
     item_count: usize,
-    inputs: &ChainHostInputs,
+    inputs: &ChainHostInputs<'_>,
     buf: &ChainBuffers,
     prof: &mut ChainProfiler,
     emit_derived: bool,
@@ -429,12 +434,15 @@ pub(crate) fn launch_block2_geometry(
 
 /// Pre-warms (compiles and caches) all 15 CubeCL compute shader pipelines
 /// concurrently on a background thread so cold starts pay zero shader JIT latency.
-pub fn prewarm_pipelines(client: &Client) {
+pub fn prewarm_pipelines(client: &Client, is_derived: Option<bool>) {
+    let t_prewarm_start = std::time::Instant::now();
     let zeroes = vec![0u32; 256];
     let zeroes_bytes = bytemuck::cast_slice::<u32, u8>(&zeroes);
+    let t_buf0 = std::time::Instant::now();
     let dummy_buffers: Vec<_> = (0..25)
         .map(|_| client.create_from_slice(zeroes_bytes))
         .collect();
+    let _dur_bufs = t_buf0.elapsed();
 
     let dummy = |slot: usize, len: usize| unsafe { BufferArg::from_raw_parts(dummy_buffers[slot].clone(), len) };
 
@@ -448,6 +456,12 @@ pub fn prewarm_pipelines(client: &Client) {
     let log = threads_per_cube.ilog2() as usize;
 
     unsafe {
+        let flush_kernel = |name: &'static str| {
+            let t = std::time::Instant::now();
+            let _ = client.flush();
+            log::info!("prewarm compile {name}: {:?}", t.elapsed());
+        };
+
         // 1. decode_probe
         decode_probe::launch_unchecked(
             client,
@@ -472,6 +486,7 @@ pub fn prewarm_pipelines(client: &Client) {
             9u32,
             16384usize,
         );
+        flush_kernel("decode_probe");
 
         // 2. cand_sort
         cand_sort::launch_unchecked(
@@ -484,40 +499,41 @@ pub fn prewarm_pipelines(client: &Client) {
             dummy(3, 1),
             16384usize,
         );
+        flush_kernel("cand_sort");
 
         // 3. jump_build
         jump_build::launch_unchecked(
             client,
-            CubeCount::Static(1, 1, 1),
+            CubeCount::new_single(),
             dim_256,
             dummy(0, 1),
             dummy(1, 1),
             dummy(2, 2),
             dummy(3, 1),
-            dummy(4, 256),
-            dummy(5, 256),
+            dummy(4, 1),
+            dummy(5, 1),
         );
+        flush_kernel("jump_build");
 
-        // 6. rank_step (prewarm all doubling rounds for standard repo capacity)
-        for k in 0..15 {
-            rank_step::launch_unchecked(
-                client,
-                CubeCount::Static(1, 1, 1),
-                dim_256,
-                dummy(0, 256),
-                dummy(1, 256),
-                dummy(2, 256),
-                dummy(3, 256),
-                dummy(4, 256),
-                k,
-                16385,
-            );
-        }
+        // 4. rank_step
+        rank_step::launch_unchecked(
+            client,
+            CubeCount::new_single(),
+            dim_256,
+            dummy(0, 1),
+            dummy(1, 1),
+            dummy(2, 1),
+            dummy(3, 1),
+            dummy(4, 1),
+            0usize,
+            1usize,
+        );
+        flush_kernel("rank_step");
 
-        // 7. item_roots
+        // 5. item_roots
         item_roots::launch_unchecked(
             client,
-            CubeCount::Static(1, 1, 1),
+            CubeCount::new_single(),
             dim_256,
             dummy(0, 1),
             dummy(1, 1),
@@ -525,11 +541,12 @@ pub fn prewarm_pipelines(client: &Client) {
             dummy(3, 1),
             dummy(4, 1),
         );
+        flush_kernel("item_roots");
 
-        // 8. cluster_mark
+        // 6. cluster_mark
         cluster_mark::launch_unchecked(
             client,
-            CubeCount::Static(1, 1, 1),
+            CubeCount::new_single(),
             dim_256,
             dummy(0, 1),
             dummy(1, 1),
@@ -540,10 +557,11 @@ pub fn prewarm_pipelines(client: &Client) {
             dummy(6, 1),
             dummy(7, 1),
             dummy(8, 1),
-            15,
-            16385,
-            136.0f32,
+            1usize,
+            1usize,
+            0.0f32,
         );
+        flush_kernel("cluster_mark");
 
         // 9. tile_scan
         tile_scan::launch_unchecked(
@@ -564,6 +582,7 @@ pub fn prewarm_pipelines(client: &Client) {
             bytes_per_thread,
             log,
         );
+        flush_kernel("tile_scan");
 
         // 10. spine_scan
         spine_scan::launch_unchecked(
@@ -577,41 +596,76 @@ pub fn prewarm_pipelines(client: &Client) {
             threads_per_cube,
             log,
         );
+        flush_kernel("spine_scan");
 
         // 11. apply_and_emit (unified scan, position, extents, and direct slot/tint emission)
-        apply_and_emit::launch_unchecked(
-            client,
-            CubeCount::Static(1, 1, 1),
-            dim_256,
-            dummy(0, 1),
-            dummy(1, 0),
-            dummy(2, 1),
-            dummy(3, 1),
-            dummy(4, 1),
-            8u32,
-            dummy(5, 1),
-            dummy(6, 1),
-            dummy(7, 1),
-            136.0f32,
-            dummy(8, ITEM_DESC_STRIDE),
-            dummy(9, PARTIAL_COUNT_STRIDE),
-            dummy(10, 1),
-            dummy(11, 2),
-            dummy(12, EXT_STRIDE),
-            dummy(13, 1),
-            dummy(14, 1),
-            dummy(15, 8),
-            dummy(16, 2),
-            false,
-            threads_per_cube,
-            bytes_per_thread,
-            log,
+        if is_derived != Some(true) {
+            apply_and_emit::launch_unchecked(
+                client,
+                CubeCount::Static(1, 1, 1),
+                dim_256,
+                dummy(0, 1),
+                dummy(1, 0),
+                dummy(2, 1),
+                dummy(3, 1),
+                dummy(4, 1),
+                8u32,
+                dummy(5, 1),
+                dummy(6, 1),
+                dummy(7, 1),
+                136.0f32,
+                dummy(8, ITEM_DESC_STRIDE),
+                dummy(9, PARTIAL_COUNT_STRIDE),
+                dummy(10, 1),
+                dummy(11, 2),
+                dummy(12, EXT_STRIDE),
+                dummy(13, 1),
+                dummy(14, 1),
+                dummy(15, 8),
+                dummy(16, 2),
+                false,
+                threads_per_cube,
+                bytes_per_thread,
+                log,
+            );
+            flush_kernel("apply_and_emit_instanced");
+        }
+        if is_derived != Some(false) {
+            apply_and_emit::launch_unchecked(
+                client,
+                CubeCount::Static(1, 1, 1),
+                dim_256,
+                dummy(0, 1),
+                dummy(1, 0),
+                dummy(2, 1),
+                dummy(3, 1),
+                dummy(4, 1),
+                8u32,
+                dummy(5, 1),
+                dummy(6, 1),
+                dummy(7, 1),
+                136.0f32,
+                dummy(8, ITEM_DESC_STRIDE),
+                dummy(9, PARTIAL_COUNT_STRIDE),
+                dummy(10, 1),
+                dummy(11, 2),
+                dummy(12, EXT_STRIDE),
+                dummy(13, 1),
+                dummy(14, 1),
+                dummy(15, 5),
+                dummy(16, 2),
+                true,
+                threads_per_cube,
+                bytes_per_thread,
+                log,
+            );
+            flush_kernel("apply_and_emit_derived");
+        }
+
+        log::info!(
+            "prewarm_pipelines completed in {:?}",
+            t_prewarm_start.elapsed()
         );
     }
-    // Wait for the background queue to execute all prewarm launches so every
-    // compute shader pipeline is fully compiled by Naga and Metal/Vulkan
-    // into the device pipeline cache before prewarm returns.
-    let _ = pollster::block_on(client.sync());
-    let _ = client.read_one(dummy_buffers[15].clone());
 }
 

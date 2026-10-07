@@ -50,6 +50,7 @@ encase = "0.12"
 rayon = "1.10"
 memchr = "2"
 simdutf8 = "0.1"
+memmap2 = "0.9"
 bevy_ecs = { version = "0.20.0-rc.2", default-features = false, features = ["std"] }
 bevy_transform = { version = "0.20.0-rc.2", default-features = false, features = ["std", "bevy-support"] }
 serde = { version = "1", features = ["derive", "rc"] }

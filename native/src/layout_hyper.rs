@@ -27,7 +27,7 @@ mod types;
 pub use types::{ItemPrepass, Pass2DeviceOutput, SendPtr};
 
 pub(crate) mod char_resolve;
-use char_resolve::resolve_byte_char;
+use char_resolve::resolve_byte_char_cluster;
 
 mod device_alloc;
 use device_alloc::{layout_device_discrete, layout_device_unified, DeviceEmission, EmitInputs};
@@ -35,7 +35,7 @@ use device_alloc::{layout_device_discrete, layout_device_unified, DeviceEmission
 mod pass2_device;
 use pass2_device::{DerivedEmit, RenderEmit};
 mod pass2_host;
-use pass2_host::layout_pass2_host;
+pub use pass2_host::{compute_single_item_placement, layout_pass2_host, scan_item_max_row_extent};
 
 pub struct HyperLayout {
     trie: Option<Arc<TrieTable>>,
@@ -241,7 +241,7 @@ impl HyperLayout {
 
 /// PASS 1 (parallel): per item, survivor count, widest row extent, and the
 /// FOLDED row count (the Derived line table's size, known before Pass 2).
-fn pass1_prepass(
+pub(crate) fn pass1_prepass(
     items: &[LayoutItem<'_>],
     trie: &TrieTable,
     bitmap_adv: f32,
@@ -261,8 +261,10 @@ fn pass1_prepass(
             };
 
             let mut survivor_count = 0u32;
+            let mut leader_count = 0u32;
             let mut max_row_extent = 0.0f64;
             let mut trailer_until = 0usize;
+            let mut has_cluster = false;
             // Rows this item's records occupy — exactly Pass 2's
             // `base_row` progression (`rows_for_line` per line, the last,
             // unterminated line included). Unfolded: one row per line.
@@ -283,21 +285,28 @@ fn pass1_prepass(
                     if line.iter().all(|b| (0x20..0x7F).contains(b)) {
                         let l = line.len();
                         survivor_count += l as u32;
+                        leader_count += l as u32;
                         let end_adv = line_adv + l as f64 * ascii_adv as f64;
                         if end_adv > max_row_extent {
                             max_row_extent = end_adv;
                         }
                         line_adv = 0.0;
-                        pos = if nl_pos < bytes.len() { nl_pos + 1 } else { nl_pos };
+                        if nl_pos < bytes.len() {
+                            leader_count += 1;
+                            pos = nl_pos + 1;
+                        } else {
+                            pos = nl_pos;
+                        }
                         continue;
                     }
 
                     for i in pos..nl_pos {
-                        let r = match resolve_byte_char(bytes, i, trie, bitmap_adv, em_height_fu, &mut trailer_until) {
+                        let r = match resolve_byte_char_cluster(bytes, i, trie, bitmap_adv, em_height_fu, &mut trailer_until, &mut has_cluster) {
                             Some(r) => r,
                             None => continue,
                         };
 
+                        leader_count += 1;
                         if line_adv > max_row_extent {
                             max_row_extent = line_adv;
                         }
@@ -310,6 +319,7 @@ fn pass1_prepass(
                     }
 
                     if nl_pos < bytes.len() {
+                        leader_count += 1;
                         if line_adv > max_row_extent {
                             max_row_extent = line_adv;
                         }
@@ -351,6 +361,7 @@ fn pass1_prepass(
                     if line.iter().all(|b| (0x20..0x7F).contains(b)) {
                         let l = line.len();
                         survivor_count += l as u32;
+                        leader_count += l as u32;
                         row_count += rows_for_line(l as i64, wrap_w, p.wrap_mode) as u64;
                         let line_max_seg = if l >= fu {
                             seg_adv_table[fu - 1]
@@ -362,16 +373,22 @@ fn pass1_prepass(
                         }
                         col = 0;
                         seg_adv = 0.0;
-                        pos = if nl_pos < bytes.len() { nl_pos + 1 } else { nl_pos };
+                        if nl_pos < bytes.len() {
+                            leader_count += 1;
+                            pos = nl_pos + 1;
+                        } else {
+                            pos = nl_pos;
+                        }
                         continue;
                     }
 
                     for i in pos..nl_pos {
-                        let r = match resolve_byte_char(bytes, i, trie, bitmap_adv, em_height_fu, &mut trailer_until) {
+                        let r = match resolve_byte_char_cluster(bytes, i, trie, bitmap_adv, em_height_fu, &mut trailer_until, &mut has_cluster) {
                             Some(r) => r,
                             None => continue,
                         };
 
+                        leader_count += 1;
                         let item_rel_x = seg_adv as f64;
                         if item_rel_x > max_row_extent {
                             max_row_extent = item_rel_x;
@@ -391,6 +408,7 @@ fn pass1_prepass(
                     row_count += rows_for_line(col, wrap_w, p.wrap_mode) as u64;
 
                     if nl_pos < bytes.len() {
+                        leader_count += 1;
                         let item_rel_x = seg_adv as f64;
                         if item_rel_x > max_row_extent {
                             max_row_extent = item_rel_x;
@@ -406,8 +424,10 @@ fn pass1_prepass(
 
             ItemPrepass {
                 survivor_count,
+                leader_count,
                 max_row_extent,
                 row_count: u32::try_from(row_count).expect("item row count exceeds u32"),
+                has_cluster,
             }
         })
         .collect()

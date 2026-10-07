@@ -99,7 +99,8 @@ fn marshal(
     crate::cubecl_chain::InstanceInputs,
 ) {
     let total_bytes: usize = items.iter().map(|it| it.bytes.len()).sum();
-    let mut bytes = Vec::with_capacity(total_bytes);
+    let n_words = total_bytes.div_ceil(4);
+    let mut bytes = Vec::with_capacity(n_words * 4);
     let mut fis = Vec::with_capacity(items.len());
     let mut per_record_colors: Vec<u32> = Vec::new();
     let mut color_base = vec![0u32; items.len()];
@@ -178,6 +179,7 @@ fn marshal(
         groups.push(item.group_id);
         off += item.bytes.len();
     }
+    bytes.resize(n_words * 4, 0x80);
     let inputs = crate::cubecl_chain::InstanceInputs {
         per_record_colors,
         color_base,

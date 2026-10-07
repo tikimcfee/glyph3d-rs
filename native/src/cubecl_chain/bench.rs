@@ -227,9 +227,9 @@ pub fn bench(ctx: &GpuContext, corpus_path: &Path) -> ! {
     let packed = pack_words(&bytes);
     let (bi, bm, bc, bshift) = trie.device_tables();
     let h_bytes = client.create_from_slice(bytemuck::cast_slice(&packed));
-    let h_bi = client.create_from_slice(bytemuck::cast_slice(&bi));
-    let h_bm = client.create_from_slice(bytemuck::cast_slice(&bm));
-    let h_bc = client.create_from_slice(bytemuck::cast_slice(&bc));
+    let h_bi = client.create_from_slice(bytemuck::cast_slice(bi));
+    let h_bm = client.create_from_slice(bytemuck::cast_slice(bm));
+    let h_bc = client.create_from_slice(bytemuck::cast_slice(bc));
     // The cluster stages' inputs: the sequence section, the host-built
     // candidacy bitmap + per-item mode flags (cluster_host_inputs), and the
     // probe's scratch. The buffers exist in every mode — the cluster launches

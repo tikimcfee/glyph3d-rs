@@ -56,11 +56,11 @@ pub use repo_check::repo_check;
 pub use repo::ChainPhases;
 pub(crate) use repo::{InstanceInputs, SharedDevice, run_repo_chain};
 
-/// Pre-warms all 16 CubeCL compute pipelines in the background.
-pub fn prewarm(device: &SharedDevice) {
+/// Pre-warms all CubeCL compute pipelines in the background.
+pub fn prewarm(device: &SharedDevice, is_derived: Option<bool>) {
     if let Some(ref cd) = device.cubecl_device {
         let client = cubecl::Device::Wgpu(cd.clone()).client();
-        repo::prewarm_pipelines(&client);
+        repo::prewarm_pipelines(&client, is_derived);
     }
 }
 
