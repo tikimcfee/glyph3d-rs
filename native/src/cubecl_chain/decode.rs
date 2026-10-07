@@ -504,16 +504,16 @@ pub(super) fn compute_ascii_flags_word(curr_word: u32) -> u32 {
     let b3 = curr_word >> 24u32;
     let f0 = F_LEADER
         | (if b0 == 10u32 { F_NEWLINE } else { 0u32 })
-        | (if b0 >= 33u32 && b0 <= 126u32 { F_SURVIVOR } else { 0u32 });
+        | (if b0 >= 32u32 && b0 <= 126u32 { F_SURVIVOR } else { 0u32 });
     let f1 = F_LEADER
         | (if b1 == 10u32 { F_NEWLINE } else { 0u32 })
-        | (if b1 >= 33u32 && b1 <= 126u32 { F_SURVIVOR } else { 0u32 });
+        | (if b1 >= 32u32 && b1 <= 126u32 { F_SURVIVOR } else { 0u32 });
     let f2 = F_LEADER
         | (if b2 == 10u32 { F_NEWLINE } else { 0u32 })
-        | (if b2 >= 33u32 && b2 <= 126u32 { F_SURVIVOR } else { 0u32 });
+        | (if b2 >= 32u32 && b2 <= 126u32 { F_SURVIVOR } else { 0u32 });
     let f3 = F_LEADER
         | (if b3 == 10u32 { F_NEWLINE } else { 0u32 })
-        | (if b3 >= 33u32 && b3 <= 126u32 { F_SURVIVOR } else { 0u32 });
+        | (if b3 >= 32u32 && b3 <= 126u32 { F_SURVIVOR } else { 0u32 });
     f0 | (f1 << 8u32) | (f2 << 16u32) | (f3 << 24u32)
 }
 
@@ -572,7 +572,7 @@ pub(super) fn compute_flags_word(
                     let flag = if is_ascii {
                         F_LEADER
                             | (if lead_byte == 10u32 { F_NEWLINE } else { 0u32 })
-                            | (if lead_byte >= 33u32 && lead_byte <= 126u32 { F_SURVIVOR } else { 0u32 })
+                            | (if lead_byte >= 32u32 && lead_byte <= 126u32 { F_SURVIVOR } else { 0u32 })
                     } else {
                         let block = if codepoint <= 0x10FFFFu32 {
                             block_index[(codepoint >> block_shift) as usize]
