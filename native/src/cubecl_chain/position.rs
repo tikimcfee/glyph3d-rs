@@ -640,12 +640,6 @@ pub(super) fn apply_and_emit(
     }
     sync_cube();
 
-    if unit_idx < 128 {
-        let entry_offset = (ascii_block_base | (unit_idx as u32)) as usize;
-        shared_metrics[1 + unit_idx] = f32::from_bits(trie_block_codepoints[entry_offset * 2]);
-    }
-    sync_cube();
-
     let mut cube_item_base = 0usize;
     if track_extents {
         cube_item_base = *shared_item_base as usize;
@@ -1099,26 +1093,16 @@ pub(super) fn apply_and_emit(
                     }
                 }
 
-                let record_ordinal = run.glyphs as u32;
-                let color0 = if item_is_per_record != 0u32 {
-                    per_record_semantic_colors[(item_color_base + record_ordinal) as usize]
+                let (color0, color1, color2, color3) = if item_is_per_record != 0u32 {
+                    let color_offset = (item_color_base + run.glyphs as u32) as usize;
+                    (
+                        per_record_semantic_colors[color_offset],
+                        per_record_semantic_colors[color_offset + 1],
+                        per_record_semantic_colors[color_offset + 2],
+                        per_record_semantic_colors[color_offset + 3],
+                    )
                 } else {
-                    item_flat_color
-                };
-                let color1 = if item_is_per_record != 0u32 {
-                    per_record_semantic_colors[(item_color_base + record_ordinal + 1u32) as usize]
-                } else {
-                    item_flat_color
-                };
-                let color2 = if item_is_per_record != 0u32 {
-                    per_record_semantic_colors[(item_color_base + record_ordinal + 2u32) as usize]
-                } else {
-                    item_flat_color
-                };
-                let color3 = if item_is_per_record != 0u32 {
-                    per_record_semantic_colors[(item_color_base + record_ordinal + 3u32) as usize]
-                } else {
-                    item_flat_color
+                    (item_flat_color, item_flat_color, item_flat_color, item_flat_color)
                 };
 
                 let bytes_word = if lane == 0 { thread_bytes_word0 } else { thread_bytes_word1 };
@@ -1126,10 +1110,10 @@ pub(super) fn apply_and_emit(
                 let b1 = (bytes_word >> 8u32) & 0xFF;
                 let b2 = (bytes_word >> 16u32) & 0xFF;
                 let b3 = (bytes_word >> 24u32) & 0xFF;
-                let glyph_id0 = shared_metrics[1 + (b0 as usize)].to_bits();
-                let glyph_id1 = shared_metrics[1 + (b1 as usize)].to_bits();
-                let glyph_id2 = shared_metrics[1 + (b2 as usize)].to_bits();
-                let glyph_id3 = shared_metrics[1 + (b3 as usize)].to_bits();
+                let glyph_id0 = b0 - 31u32;
+                let glyph_id1 = b1 - 31u32;
+                let glyph_id2 = b2 - 31u32;
+                let glyph_id3 = b3 - 31u32;
 
                 if emit_derived {
                     let slot_word_offset = survivor_ordinal as usize * 5;
@@ -1459,7 +1443,11 @@ pub(super) fn apply_and_emit(
                             (thread_bytes_word1 >> (((lane - 4) * 8) as u32)) & 0xFF
                         };
                         if lead_byte < 128u32 {
-                            glyph_id = shared_metrics[1 + (lead_byte as usize)].to_bits();
+                            glyph_id = if lead_byte >= 32u32 && lead_byte <= 126u32 {
+                                lead_byte - 31u32
+                            } else {
+                                0u32
+                            };
                         } else {
                             let cp_len = seq_len_at(bytes, id, total_bytes);
                             let cp = cp_at(bytes, id, cp_len, total_bytes);
