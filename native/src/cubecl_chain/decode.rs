@@ -201,9 +201,29 @@ pub(super) fn decode_probe(
         } else {
             0u32
         };
-        let mut packed_word = 0u32;
-        let mut lane = 0usize;
-        while lane < 4 {
+        let is_pure_ascii = (curr_word & 0x8080_8080u32) == 0u32 && (next_word & 0x80u32) == 0u32 && (word_index * 4 + 4 <= total_bytes);
+        if is_pure_ascii {
+            let b0 = curr_word & 0xFFu32;
+            let b1 = (curr_word >> 8u32) & 0xFFu32;
+            let b2 = (curr_word >> 16u32) & 0xFFu32;
+            let b3 = curr_word >> 24u32;
+            let f0 = F_LEADER
+                | (if b0 == 10u32 { F_NEWLINE } else { 0u32 })
+                | (if b0 >= 32u32 && b0 <= 126u32 { F_SURVIVOR } else { 0u32 });
+            let f1 = F_LEADER
+                | (if b1 == 10u32 { F_NEWLINE } else { 0u32 })
+                | (if b1 >= 32u32 && b1 <= 126u32 { F_SURVIVOR } else { 0u32 });
+            let f2 = F_LEADER
+                | (if b2 == 10u32 { F_NEWLINE } else { 0u32 })
+                | (if b2 >= 32u32 && b2 <= 126u32 { F_SURVIVOR } else { 0u32 });
+            let f3 = F_LEADER
+                | (if b3 == 10u32 { F_NEWLINE } else { 0u32 })
+                | (if b3 >= 32u32 && b3 <= 126u32 { F_SURVIVOR } else { 0u32 });
+            glyph_flags[word_index] = f0 | (f1 << 8u32) | (f2 << 16u32) | (f3 << 24u32);
+        } else {
+            let mut packed_word = 0u32;
+            let mut lane = 0usize;
+            while lane < 4 {
             let byte_index = word_index * 4 + lane;
             if byte_index < total_bytes {
                 let lead_byte = byte_from_pair(curr_word, next_word, lane, byte_index, total_bytes);
@@ -276,7 +296,12 @@ pub(super) fn decode_probe(
 
                     let is_sz = if is_ascii { 0u32 } else { is_static_zero(codepoint) };
                     let mut is_candidate_head = 0u32;
-                    if is_sz == 0u32 && codepoint <= 0x10FFFFu32 {
+                    let next_byte = if is_ascii {
+                        byte_from_pair(curr_word, next_word, lane + 1, byte_index + 1, total_bytes)
+                    } else {
+                        0u32
+                    };
+                    if is_sz == 0u32 && (!is_ascii || next_byte >= 128u32) && codepoint <= 0x10FFFFu32 {
                         is_candidate_head = (bitmap[(codepoint >> 5u32) as usize] >> (codepoint & 0x1Fu32)) & 1u32;
                     }
 
@@ -447,6 +472,7 @@ pub(super) fn decode_probe(
         }
         glyph_flags[word_index] = packed_word;
     }
+}
 }
 
 
