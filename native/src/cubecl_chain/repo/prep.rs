@@ -5,7 +5,7 @@ use crate::atlas::TrieTable;
 use crate::fold::{Item, WrapMode};
 use crate::text::ResolveGlyph;
 use super::super::tail::{ordered_key_host, EXT_STRIDE};
-use super::super::ITEM_DESC_STRIDE;
+use super::super::{ITEM_DESC_BYTE_START, ITEM_DESC_STRIDE};
 use super::InstanceInputs;
 
 pub(crate) struct ChainHostInputs<'a> {
@@ -23,6 +23,7 @@ pub(crate) struct ChainHostInputs<'a> {
     pub pair_secondary_values: &'a [u32],
     pub item_record_bounds: Vec<u32>,
     pub item_descriptors: Vec<u32>,
+    pub tile_item_base: Vec<u32>,
     /// `segment_entry_advances[k]`: k one-cell advances summed left to right
     /// from 0.0 in f32 — apply_and_emit's O(1) entry x for a clean segment.
     pub segment_entry_advances: Vec<f32>,
@@ -308,6 +309,9 @@ pub(crate) fn prepare_chain_inputs<'a>(
         cluster_count,
     );
 
+    let tile_size = threads_per_cube * bytes_per_thread;
+    let tile_item_base = compute_tile_item_base(n_tiles, tile_size, n, &item_descriptors, item_count);
+
     ChainHostInputs {
         threads_per_cube,
         bytes_per_thread,
@@ -323,6 +327,7 @@ pub(crate) fn prepare_chain_inputs<'a>(
         pair_secondary_values,
         item_record_bounds,
         item_descriptors,
+        tile_item_base,
         segment_entry_advances,
         walk_plan,
         ext_seed,
@@ -336,6 +341,28 @@ pub(crate) fn prepare_chain_inputs<'a>(
         has_cluster,
         placements,
     }
+}
+
+/// Precomputes the base item index for each tile, eliminating threadgroup binary searches and barriers on the GPU.
+pub(crate) fn compute_tile_item_base(
+    n_tiles: usize,
+    tile_size: usize,
+    total_bytes: usize,
+    item_descriptors: &[u32],
+    item_count: usize,
+) -> Vec<u32> {
+    let mut tile_item_base = Vec::with_capacity(n_tiles);
+    let mut current_item_index = 0usize;
+    for tile_index in 0..n_tiles {
+        let probe_byte = (tile_index * tile_size).min(if total_bytes > 0 { total_bytes - 1 } else { 0 });
+        while current_item_index + 1 < item_count
+            && (item_descriptors[(current_item_index + 1) * ITEM_DESC_STRIDE + ITEM_DESC_BYTE_START] as usize) <= probe_byte
+        {
+            current_item_index += 1;
+        }
+        tile_item_base.push(current_item_index as u32);
+    }
+    tile_item_base
 }
 
 fn closed_form_placement(
@@ -370,9 +397,38 @@ fn closed_form_placement(
 
     let screen_row = max_row + scroll_rows;
     let page_bottom = if page_active {
-        (p.origin_y
-            - (screen_row - y_page * page_rows) as f64 * p.line_height
-            - band as f64 * p.band_stride_y) as f32
+        if max_row < 0 {
+            p.origin_y as f32
+        } else if total_pages == 1 {
+            (p.origin_y - screen_row as f64 * p.line_height) as f32
+        } else {
+            // With multiple pages (total_pages > 1), every page prior to the last
+            // is a full page reaching row depth (page_rows - 1).
+            let full_page_row = page_rows - 1;
+            let last_band_pages = total_pages - band * pages_wide;
+
+            // Deepest baseline in preceding band (if any band < band existed)
+            let prev_band_bottom = if band > 0 {
+                let prev_band = band - 1;
+                let full_screen_row = full_page_row + scroll_rows;
+                p.origin_y - full_screen_row as f64 * p.line_height - prev_band as f64 * p.band_stride_y
+            } else {
+                f64::INFINITY
+            };
+
+            // Deepest baseline in the current (last) band
+            let last_band_bottom = if last_band_pages > 1 {
+                // The current band has at least one preceding full page
+                let full_screen_row = full_page_row + scroll_rows;
+                p.origin_y - full_screen_row as f64 * p.line_height - band as f64 * p.band_stride_y
+            } else {
+                // The current band contains only the partial last page
+                let last_screen_row = (max_row - (total_pages - 1) * page_rows) + scroll_rows;
+                p.origin_y - last_screen_row as f64 * p.line_height - band as f64 * p.band_stride_y
+            };
+
+            prev_band_bottom.min(last_band_bottom) as f32
+        }
     } else {
         (p.origin_y - max_row as f64 * p.line_height) as f32
     };

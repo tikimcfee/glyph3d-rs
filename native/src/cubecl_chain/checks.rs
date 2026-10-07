@@ -187,6 +187,14 @@ pub fn run(ctx: &GpuContext, fixture_path: &Path) -> ! {
     let h_base = client.create_from_slice(bytemuck::cast_slice(&item_record_bases));
     let h_ir = client.create_from_slice(bytemuck::cast_slice(&item_record_bounds));
     let h_item_desc = client.create_from_slice(bytemuck::cast_slice(&item_descriptors));
+    let tile_item_base = super::repo::prep::compute_tile_item_base(
+        n_tiles,
+        threads_per_cube * bytes_per_thread,
+        n,
+        &item_descriptors,
+        item_count,
+    );
+    let h_tile_item_base = client.create_from_slice(bytemuck::cast_slice(&tile_item_base));
     let h_tc = client.empty(n_tiles * PARTIAL_COUNT_STRIDE * 4);
     let h_tm = client.empty(n_tiles * 4);
     let h_xc = client.empty(n_tiles * PARTIAL_COUNT_STRIDE * 4);
@@ -259,6 +267,7 @@ pub fn run(ctx: &GpuContext, fixture_path: &Path) -> ! {
             trie_block_shift,
             bitmap_advance,
             BufferArg::from_raw_parts(h_item_desc.clone(), item_descriptors.len()),
+            BufferArg::from_raw_parts(h_tile_item_base.clone(), n_tiles),
             BufferArg::from_raw_parts(h_tc.clone(), n_tiles * PARTIAL_COUNT_STRIDE),
             BufferArg::from_raw_parts(h_tm.clone(), n_tiles),
             threads_per_cube,

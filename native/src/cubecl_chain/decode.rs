@@ -494,3 +494,102 @@ pub(super) fn decode_trie(
     let glyph_id = blocks_c[entry_offset * 2];
     (advance, glyph_id)
 }
+
+#[cube]
+#[allow(clippy::manual_range_contains)]
+pub(super) fn compute_ascii_flags_word(curr_word: u32) -> u32 {
+    let b0 = curr_word & 0xFFu32;
+    let b1 = (curr_word >> 8u32) & 0xFFu32;
+    let b2 = (curr_word >> 16u32) & 0xFFu32;
+    let b3 = curr_word >> 24u32;
+    let f0 = F_LEADER
+        | (if b0 == 10u32 { F_NEWLINE } else { 0u32 })
+        | (if b0 >= 33u32 && b0 <= 126u32 { F_SURVIVOR } else { 0u32 });
+    let f1 = F_LEADER
+        | (if b1 == 10u32 { F_NEWLINE } else { 0u32 })
+        | (if b1 >= 33u32 && b1 <= 126u32 { F_SURVIVOR } else { 0u32 });
+    let f2 = F_LEADER
+        | (if b2 == 10u32 { F_NEWLINE } else { 0u32 })
+        | (if b2 >= 33u32 && b2 <= 126u32 { F_SURVIVOR } else { 0u32 });
+    let f3 = F_LEADER
+        | (if b3 == 10u32 { F_NEWLINE } else { 0u32 })
+        | (if b3 >= 33u32 && b3 <= 126u32 { F_SURVIVOR } else { 0u32 });
+    f0 | (f1 << 8u32) | (f2 << 16u32) | (f3 << 24u32)
+}
+
+#[cube]
+#[allow(clippy::manual_range_contains)]
+pub(super) fn compute_flags_word(
+    curr_word: u32,
+    next_word: u32,
+    word_index: usize,
+    total_bytes: usize,
+    block_index: &[u32],
+    blocks_c: &[u32],
+    block_shift: u32,
+) -> u32 {
+    let is_pure_ascii = (curr_word & 0x8080_8080u32) == 0u32
+        && (next_word & 0x80u32) == 0u32
+        && (word_index * 4 + 4 <= total_bytes);
+    if is_pure_ascii {
+        compute_ascii_flags_word(curr_word)
+    } else {
+        let mut packed_word = 0u32;
+        let mut lane = 0usize;
+        while lane < 4 {
+            let byte_index = word_index * 4 + lane;
+            if byte_index < total_bytes {
+                let lead_byte = byte_from_pair(curr_word, next_word, lane, byte_index, total_bytes);
+                let is_ascii = lead_byte < 128u32;
+                let len = if is_ascii {
+                    1u32
+                } else if lead_byte & 0xE0u32 == 0xC0u32 {
+                    2u32
+                } else if lead_byte & 0xF0u32 == 0xE0u32 {
+                    3u32
+                } else if lead_byte & 0xF8u32 == 0xF0u32 {
+                    4u32
+                } else {
+                    0u32
+                };
+                if len > 0u32 {
+                    let codepoint = if is_ascii {
+                        lead_byte
+                    } else {
+                        let byte1 = byte_from_pair(curr_word, next_word, lane + 1, byte_index + 1, total_bytes);
+                        if len == 2u32 {
+                            ((lead_byte & 0x1Fu32) << 6u32) | (byte1 & 0x3Fu32)
+                        } else {
+                            let byte2 = byte_from_pair(curr_word, next_word, lane + 2, byte_index + 2, total_bytes);
+                            if len == 3u32 {
+                                ((lead_byte & 0x0Fu32) << 12u32) | ((byte1 & 0x3Fu32) << 6u32) | (byte2 & 0x3Fu32)
+                            } else {
+                                let byte3 = byte_from_pair(curr_word, next_word, lane + 3, byte_index + 3, total_bytes);
+                                ((lead_byte & 0x07u32) << 18u32) | ((byte1 & 0x3Fu32) << 12u32) | ((byte2 & 0x3Fu32) << 6u32) | (byte3 & 0x3Fu32)
+                            }
+                        }
+                    };
+                    let flag = if is_ascii {
+                        F_LEADER
+                            | (if lead_byte == 10u32 { F_NEWLINE } else { 0u32 })
+                            | (if lead_byte >= 33u32 && lead_byte <= 126u32 { F_SURVIVOR } else { 0u32 })
+                    } else {
+                        let block = if codepoint <= 0x10FFFFu32 {
+                            block_index[(codepoint >> block_shift) as usize]
+                        } else {
+                            0u32
+                        };
+                        let entry_offset = ((block << block_shift) | (codepoint & 0xFFu32)) as usize;
+                        let glyph_id = blocks_c[entry_offset * 2];
+                        F_LEADER
+                            | (if blocks_c[entry_offset * 2 + 1] & TRIE_FLAG_MISSING != 0 { F_MISSING } else { 0u32 })
+                            | (if glyph_id != 0u32 { F_SURVIVOR } else { 0u32 })
+                    };
+                    packed_word |= flag << ((lane as u32) * 8u32);
+                }
+            }
+            lane += 1usize;
+        }
+        packed_word
+    }
+}

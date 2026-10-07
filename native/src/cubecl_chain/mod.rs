@@ -102,8 +102,7 @@ const ITEM_DESC_STRIDE: usize = 32;
 
 // 0..2: Record bounds (item_record_bounds)
 const ITEM_DESC_BYTE_START: usize = 0;
-#[allow(dead_code)]
-const ITEM_DESC_BYTE_STOP: usize = 1;
+pub(super) const ITEM_DESC_BYTE_STOP: usize = 1;
 
 // 2..10: Layout configuration (item_layout_configs)
 const ITEM_DESC_PAGE_ROWS: usize = 2;

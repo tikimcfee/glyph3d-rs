@@ -271,6 +271,8 @@ pub fn bench(ctx: &GpuContext, corpus_path: &Path) -> ! {
     let h_cend = client.empty(n * 4);
     let h_ir = client.create_from_slice(bytemuck::cast_slice(&item_record_bounds));
     let h_item_desc = client.create_from_slice(bytemuck::cast_slice(&item_descriptors));
+    let tile_item_base = vec![0u32; n_tiles];
+    let h_tile_item_base = client.create_from_slice(bytemuck::cast_slice(&tile_item_base));
     let h_tc = client.empty(n_tiles * PARTIAL_COUNT_STRIDE * 4);
     let h_tm = client.empty(n_tiles * 4);
     let h_xc = client.empty(n_tiles * PARTIAL_COUNT_STRIDE * 4);
@@ -581,6 +583,7 @@ pub fn bench(ctx: &GpuContext, corpus_path: &Path) -> ! {
                         bshift,
                         bitmap_advance,
                         BufferArg::from_raw_parts(h_item_desc.clone(), ITEM_DESC_STRIDE),
+                        BufferArg::from_raw_parts(h_tile_item_base.clone(), n_tiles),
                         BufferArg::from_raw_parts(h_tc.clone(), n_tiles * PARTIAL_COUNT_STRIDE),
                         BufferArg::from_raw_parts(h_tm.clone(), n_tiles),
                         units,

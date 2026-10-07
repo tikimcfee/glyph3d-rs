@@ -22,6 +22,7 @@ pub(crate) struct ChainBuffers {
     pub h_item_record_bounds: Handle,
     pub h_item_cluster_enabled: Option<Handle>,
     pub h_item_descriptors: Option<Handle>,
+    pub h_tile_item_base: Option<Handle>,
     pub h_walk_plan: Option<Handle>,
     pub h_max_row_extents: Option<Handle>,
     pub trie_block_indices_len: usize,
@@ -158,8 +159,8 @@ pub(crate) fn allocate_chain_buffers(
     let h_item_record_bounds = alloc_upload(bytemuck::cast_slice(&inputs.item_record_bounds));
     let h_item_cluster_enabled = alloc_upload(bytemuck::cast_slice(&inputs.item_cluster_enabled));
     let h_item_descriptors = alloc_upload(bytemuck::cast_slice(&inputs.item_descriptors));
+    let h_tile_item_base = alloc_upload(bytemuck::cast_slice(&inputs.tile_item_base));
     let h_glyph_flags = alloc_empty(n_words * 4);
-    // Note: h_glyph_heights, h_advance_widths, and h_glyph_indices are eliminated.
     // Quad height is constant CELL_HEIGHT_WORLD = 1.0, and trie lookup is evaluated inline.
     let h_tile_counts = alloc_empty(n_tiles * PARTIAL_COUNT_STRIDE * 4);
     let h_tile_metrics = alloc_empty(n_tiles * 4);
@@ -268,6 +269,7 @@ pub(crate) fn allocate_chain_buffers(
             h_item_record_bounds,
             h_item_cluster_enabled: Some(h_item_cluster_enabled),
             h_item_descriptors: Some(h_item_descriptors),
+            h_tile_item_base: Some(h_tile_item_base),
             h_walk_plan: Some(h_walk_plan),
             h_max_row_extents: Some(h_max_row_extents),
             trie_block_indices_len,

@@ -342,40 +342,49 @@ pub(super) fn key_to_float(k: u32) -> f32 {
     f32::from_bits(float_bits)
 }
 
-/// Load a monoid element from the shared tile arrays (the pc lane layout, i32).
+/// Load a monoid element from the shared tile arrays (coalesced SoA lane layout, i32).
 #[cube]
-pub(super) fn s_load(shared_counts: &[i32], shared_metrics: &[f32], i: usize) -> ChainElem {
-    let offset = i * PARTIAL_COUNT_STRIDE;
+pub(super) fn s_load(
+    shared_counts: &[i32],
+    shared_metrics: &[f32],
+    i: usize,
+    #[comptime] threads_per_cube: usize,
+) -> ChainElem {
     ChainElem {
-        reset: shared_counts[offset + P_RESET],
-        nl: shared_counts[offset + P_NL],
-        glyphs: shared_counts[offset + P_GLYPHS],
-        rows: shared_counts[offset + P_ROWS],
-        head_len: shared_counts[offset + P_HEAD_LEN],
-        tail_len: shared_counts[offset + P_TAIL_LEN],
-        wrap: shared_counts[offset + P_WRAP],
-        mode: shared_counts[offset + P_MODE],
-        survivors: shared_counts[offset + P_SURVIVORS],
-        clean_len: shared_counts[offset + P_CLEAN_LEN],
-        clean_break: shared_counts[offset + P_CLEAN_BREAK],
+        reset: shared_counts[P_RESET * threads_per_cube + i],
+        nl: shared_counts[P_NL * threads_per_cube + i],
+        glyphs: shared_counts[P_GLYPHS * threads_per_cube + i],
+        rows: shared_counts[P_ROWS * threads_per_cube + i],
+        head_len: shared_counts[P_HEAD_LEN * threads_per_cube + i],
+        tail_len: shared_counts[P_TAIL_LEN * threads_per_cube + i],
+        wrap: shared_counts[P_WRAP * threads_per_cube + i],
+        mode: shared_counts[P_MODE * threads_per_cube + i],
+        survivors: shared_counts[P_SURVIVORS * threads_per_cube + i],
+        clean_len: shared_counts[P_CLEAN_LEN * threads_per_cube + i],
+        clean_break: shared_counts[P_CLEAN_BREAK * threads_per_cube + i],
         tail_adv: shared_metrics[i],
     }
 }
 
-/// Store a monoid element into the shared tile arrays.
+/// Store a monoid element into the shared tile arrays (coalesced SoA lane layout, i32).
 #[cube]
-pub(super) fn s_store(shared_counts: &mut [i32], shared_metrics: &mut [f32], i: usize, element: &ChainElem) {
-    let offset = i * PARTIAL_COUNT_STRIDE;
-    shared_counts[offset + P_RESET] = element.reset;
-    shared_counts[offset + P_NL] = element.nl;
-    shared_counts[offset + P_GLYPHS] = element.glyphs;
-    shared_counts[offset + P_ROWS] = element.rows;
-    shared_counts[offset + P_HEAD_LEN] = element.head_len;
-    shared_counts[offset + P_TAIL_LEN] = element.tail_len;
-    shared_counts[offset + P_WRAP] = element.wrap;
-    shared_counts[offset + P_MODE] = element.mode;
-    shared_counts[offset + P_SURVIVORS] = element.survivors;
-    shared_counts[offset + P_CLEAN_LEN] = element.clean_len;
-    shared_counts[offset + P_CLEAN_BREAK] = element.clean_break;
+pub(super) fn s_store(
+    shared_counts: &mut [i32],
+    shared_metrics: &mut [f32],
+    i: usize,
+    element: &ChainElem,
+    #[comptime] threads_per_cube: usize,
+) {
+    shared_counts[P_RESET * threads_per_cube + i] = element.reset;
+    shared_counts[P_NL * threads_per_cube + i] = element.nl;
+    shared_counts[P_GLYPHS * threads_per_cube + i] = element.glyphs;
+    shared_counts[P_ROWS * threads_per_cube + i] = element.rows;
+    shared_counts[P_HEAD_LEN * threads_per_cube + i] = element.head_len;
+    shared_counts[P_TAIL_LEN * threads_per_cube + i] = element.tail_len;
+    shared_counts[P_WRAP * threads_per_cube + i] = element.wrap;
+    shared_counts[P_MODE * threads_per_cube + i] = element.mode;
+    shared_counts[P_SURVIVORS * threads_per_cube + i] = element.survivors;
+    shared_counts[P_CLEAN_LEN * threads_per_cube + i] = element.clean_len;
+    shared_counts[P_CLEAN_BREAK * threads_per_cube + i] = element.clean_break;
     shared_metrics[i] = element.tail_adv;
 }
