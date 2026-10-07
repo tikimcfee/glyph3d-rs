@@ -193,6 +193,12 @@ pub(super) fn decode_probe(
     let word_index = ABSOLUTE_POS;
     let total_bytes = bytes.len() * 4;
     let item_count = item_record_bounds.len() / 2;
+    #[allow(clippy::len_zero)]
+    let ascii_block_base = if block_index.len() > 0 {
+        block_index[0] << block_shift
+    } else {
+        0u32
+    };
     if word_index < glyph_flags.len() {
         let curr_word = bytes[word_index];
         let next_word = if word_index + 1 < bytes.len() {
@@ -206,8 +212,8 @@ pub(super) fn decode_probe(
             let byte_index = word_index * 4 + lane;
             if byte_index < total_bytes {
                 let lead_byte = byte_from_pair(curr_word, next_word, lane, byte_index, total_bytes);
-                // sequence_length, transcribed: the lenient classifier.
-                let len = if lead_byte & 0x80u32 == 0u32 {
+                let is_ascii = lead_byte < 128u32;
+                let len = if is_ascii {
                     1u32
                 } else if lead_byte & 0xE0u32 == 0xC0u32 {
                     2u32
@@ -219,7 +225,7 @@ pub(super) fn decode_probe(
                     0u32
                 };
                 if len > 0u32 {
-                    let codepoint = if len == 1u32 {
+                    let codepoint = if is_ascii {
                         lead_byte
                     } else {
                         let byte1 = byte_from_pair(curr_word, next_word, lane + 1, byte_index + 1, total_bytes);
@@ -235,12 +241,16 @@ pub(super) fn decode_probe(
                             }
                         }
                     };
-                    let block = if codepoint <= 0x10FFFFu32 {
-                        block_index[(codepoint >> block_shift) as usize]
+                    let entry_offset = if is_ascii {
+                        (ascii_block_base | lead_byte) as usize
                     } else {
-                        0u32
+                        let block = if codepoint <= 0x10FFFFu32 {
+                            block_index[(codepoint >> block_shift) as usize]
+                        } else {
+                            0u32
+                        };
+                        ((block << block_shift) | (codepoint & 0xFFu32)) as usize
                     };
-                    let entry_offset = ((block << block_shift) | (codepoint & 0xFFu32)) as usize;
                     
                     let glyph_id = blocks_c[entry_offset * 2];
                     
@@ -261,7 +271,7 @@ pub(super) fn decode_probe(
                             0u32
                         });
 
-                    let is_sz = is_static_zero(codepoint);
+                    let is_sz = if is_ascii { 0u32 } else { is_static_zero(codepoint) };
                     let mut is_candidate_head = 0u32;
                     if is_sz == 0u32 && codepoint <= 0x10FFFFu32 {
                         is_candidate_head = (bitmap[(codepoint >> 5u32) as usize] >> (codepoint & 0x1Fu32)) & 1u32;

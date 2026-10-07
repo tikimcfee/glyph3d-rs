@@ -381,7 +381,7 @@ pub struct GpuContext {
     pub cubecl_device: std::sync::OnceLock<cubecl::wgpu::WgpuDevice>,
     #[cfg(feature = "cubecl")]
     pub prewarm_handle: std::sync::Arc<std::sync::Mutex<Option<std::thread::JoinHandle<()>>>>,
-    pub prefetched_walk: std::sync::Arc<std::sync::Mutex<Option<std::thread::JoinHandle<crate::repo::WalkResult>>>>,
+    pub prefetched_walk: std::sync::Arc<std::sync::Mutex<Option<std::thread::JoinHandle<crate::repo::PrefetchedRepo>>>>,
     pub prefetched_atlas: std::sync::Arc<std::sync::Mutex<Option<std::thread::JoinHandle<crate::atlas::Atlas>>>>,
 }
 
@@ -400,7 +400,7 @@ pub struct SharedDevice {
     pub prewarm_handle: std::sync::Arc<std::sync::Mutex<Option<std::thread::JoinHandle<()>>>>,
     #[cfg(feature = "cubecl")]
     pub cubecl_device: Option<cubecl::wgpu::WgpuDevice>,
-    pub prefetched_walk: std::sync::Arc<std::sync::Mutex<Option<std::thread::JoinHandle<crate::repo::WalkResult>>>>,
+    pub prefetched_walk: std::sync::Arc<std::sync::Mutex<Option<std::thread::JoinHandle<crate::repo::PrefetchedRepo>>>>,
     pub prefetched_atlas: std::sync::Arc<std::sync::Mutex<Option<std::thread::JoinHandle<crate::atlas::Atlas>>>>,
 }
 

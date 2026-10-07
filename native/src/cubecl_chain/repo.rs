@@ -2,7 +2,7 @@ use cubecl::wgpu::{AutoGraphicsApi, GraphicsApi, WgpuSetup};
 
 mod buffers;
 mod dispatch;
-mod prep;
+pub(crate) mod prep;
 mod tail_emit;
 mod tail_readback;
 
@@ -129,6 +129,7 @@ pub(crate) fn run_repo_chain(
     inputs: &InstanceInputs,
     readback_slots: bool,
     field_mode: glyph_field::GlyphFieldMode,
+    precomputed_host_inputs: Option<prep::ChainHostInputs<'static>>,
 ) -> ChainStream {
     let item_count = items.len();
     let n: usize = bytes.len();
@@ -140,14 +141,19 @@ pub(crate) fn run_repo_chain(
     drop(sp_prep);
     let sp_tables = tracing::info_span!("chain.tables").entered();
 
-    let trie = crate::atlas::default_trie();
-    let host_inputs = prepare_chain_inputs(
-        &bytes,
-        items,
-        &trie,
-        readback_slots,
-        Some(inputs),
-    );
+    let trie = crate::atlas::default_trie_ref();
+    let host_inputs = match precomputed_host_inputs {
+        Some(hi) => hi,
+        None => {
+            prepare_chain_inputs(
+                &bytes,
+                items,
+                trie,
+                readback_slots,
+                Some(inputs),
+            )
+        }
+    };
 
     let t_init = std::time::Instant::now();
     drop(sp_tables);
@@ -196,7 +202,7 @@ pub(crate) fn run_repo_chain(
         item_count,
         &host_inputs,
         inputs,
-        &trie,
+        trie,
         needs_tint,
         field_mode == glyph_field::GlyphFieldMode::Derived,
     );

@@ -452,6 +452,47 @@ pub fn load_items(
     )
 }
 
+/// Precomputed repository walk and optional GPU chain tables.
+pub struct PrefetchedRepo {
+    pub walk: WalkResult,
+    pub file_params: Vec<ItemParams>,
+    #[cfg(feature = "cubecl")]
+    pub(crate) cubecl_data: Option<crate::cubecl_layout::PrefetchedCubeclData>,
+}
+
+/// Run repository filesystem walking, file_params calculation, and optional
+/// CubeCL pre-marshaling and table preparation on a background thread.
+pub fn prefetch_repo(
+    dir: &Path,
+    params: RepoParams,
+    strategy: Strategy,
+) -> PrefetchedRepo {
+    let walk = walk_repo(dir);
+    use rayon::prelude::*;
+    let file_params: Vec<ItemParams> = walk
+        .files
+        .par_iter()
+        .map(|f| {
+            let newlines = memchr::memchr_iter(b'\n', &f.bytes).count();
+            file_item_params(&params, f.bytes.len(), newlines)
+        })
+        .collect();
+
+    #[cfg(feature = "cubecl")]
+    let cubecl_data = if strategy == Strategy::Cubecl {
+        Some(crate::cubecl_layout::marshal_from_walk(&walk, &file_params, params.color_mode))
+    } else {
+        None
+    };
+
+    PrefetchedRepo {
+        walk,
+        file_params,
+        #[cfg(feature = "cubecl")]
+        cubecl_data,
+    }
+}
+
 /// `load_repo` with the walk and the arena already in hand: the caller walks
 /// first so it can size the arena to the byte count (the render path's
 /// device-mapped arena exists because of this split — leaders ≤ bytes, so
@@ -468,9 +509,58 @@ pub fn load_repo_from_walk(
     strategy: Strategy,
     verify: bool,
     gpu: Option<&crate::gpu::GpuContext>,
+    arena: GlyphArena,
+    folds: Option<&std::collections::HashMap<String, Vec<std::ops::Range<u32>>>>,
+) -> RepoLoad {
+    use rayon::prelude::*;
+    let file_params: Vec<ItemParams> = walk
+        .files
+        .par_iter()
+        .map(|f| {
+            let newlines = memchr::memchr_iter(b'\n', &f.bytes).count();
+            file_item_params(params, f.bytes.len(), newlines)
+        })
+        .collect();
+
+    let prefetched = PrefetchedRepo {
+        walk,
+        file_params,
+        #[cfg(feature = "cubecl")]
+        cubecl_data: None,
+    };
+
+    load_repo_from_prefetched(
+        root,
+        prefetched,
+        trie,
+        params,
+        strategy,
+        verify,
+        gpu,
+        arena,
+        folds,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn load_repo_from_prefetched(
+    root: &Path,
+    prefetched: PrefetchedRepo,
+    trie: &Path,
+    params: &RepoParams,
+    strategy: Strategy,
+    verify: bool,
+    gpu: Option<&crate::gpu::GpuContext>,
     mut arena: GlyphArena,
     folds: Option<&std::collections::HashMap<String, Vec<std::ops::Range<u32>>>>,
 ) -> RepoLoad {
+    let PrefetchedRepo {
+        walk,
+        file_params,
+        #[cfg(feature = "cubecl")]
+        cubecl_data,
+    } = prefetched;
+
     let _load = tracing::info_span!(
         "repo.load",
         files = walk.files.len(),
@@ -481,23 +571,6 @@ pub fn load_repo_from_walk(
     .entered();
     let walk_dur = walk.walk_dur;
 
-    use rayon::prelude::*;
-
-    // Per-file params (pagination sized per file). Newline counts double as
-    // the row estimate — one fast byte scan per file.
-    let file_params: Vec<ItemParams> = walk
-        .files
-        .par_iter()
-        .map(|f| {
-            let newlines = memchr::memchr_iter(b'\n', &f.bytes).count();
-            file_item_params(params, f.bytes.len(), newlines)
-        })
-        .collect();
-
-    // Paint is chosen from the SOURCE BYTES and indexed by RECORD, so it is
-    // computed here and handed across the seam rather than applied to the
-    // instances afterwards: compaction destroys the index that names a byte
-    // (the argument is at `layout::Paint`).
     let mut stage_dur = std::time::Duration::ZERO;
     let paint_mode = match params.color_mode {
         ColorMode::Syntax => Paint::SyntaxHeuristic,
@@ -523,10 +596,14 @@ pub fn load_repo_from_walk(
         #[cfg(feature = "cubecl")]
         Strategy::Cubecl => match gpu {
             Some(ctx) => {
-                crate::layout::LayoutEngine::cubecl_with_device(
+                let mut engine = crate::layout::LayoutEngine::cubecl_with_device(
                     crate::cubecl_chain::SharedDevice::from_ctx(ctx),
                     params.field_mode,
-                )
+                );
+                if let Some(cd) = cubecl_data {
+                    engine.set_cubecl_prefetched(cd);
+                }
+                engine
             }
             None => crate::layout::LayoutEngine::cubecl(params.field_mode),
         },

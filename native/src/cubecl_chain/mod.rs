@@ -54,7 +54,7 @@ pub use bench::bench;
 pub use checks::{cluster_check, decode_check, run};
 pub use repo_check::repo_check;
 pub use repo::ChainPhases;
-pub(crate) use repo::{InstanceInputs, SharedDevice, run_repo_chain};
+pub(crate) use repo::{InstanceInputs, SharedDevice, run_repo_chain, prep};
 
 /// Pre-warms all CubeCL compute pipelines in the background.
 pub fn prewarm(device: &SharedDevice, is_derived: Option<bool>) {

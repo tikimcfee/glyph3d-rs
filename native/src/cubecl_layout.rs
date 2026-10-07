@@ -53,6 +53,14 @@ pub struct CubeclPhases {
     pub compact: Duration,
 }
 
+/// Precomputed data produced by a background prefetch thread during window/GPU initialization.
+pub(crate) struct PrefetchedCubeclData {
+    pub(crate) bytes: Vec<u8>,
+    pub(crate) items: Vec<crate::fold::Item>,
+    pub(crate) instance_inputs: crate::cubecl_chain::InstanceInputs,
+    pub(crate) host_inputs: crate::cubecl_chain::prep::ChainHostInputs<'static>,
+}
+
 /// The device-chain backend. Construct and `load_trie_file` like any other;
 /// the atlas tables are loaded per run inside the chain.
 #[derive(Default)]
@@ -62,12 +70,17 @@ pub struct CubeclLayout {
     device: Option<crate::cubecl_chain::SharedDevice>,
     phases: CubeclPhases,
     pub field_mode: glyph_field::GlyphFieldMode,
+    pub(crate) prefetched_inputs: Option<Box<PrefetchedCubeclData>>,
 }
 
 impl CubeclLayout {
     pub fn new(field_mode: glyph_field::GlyphFieldMode) -> Self {
-        Self { device: None, phases: CubeclPhases::default(),
-            field_mode }
+        Self {
+            device: None,
+            phases: CubeclPhases::default(),
+            field_mode,
+            prefetched_inputs: None,
+        }
     }
 
     /// Share the caller's (the renderer's) GPU device — rung 5a's merge: the
@@ -78,6 +91,7 @@ impl CubeclLayout {
             device: Some(device),
             phases: CubeclPhases::default(),
             field_mode,
+            prefetched_inputs: None,
         }
     }
 
@@ -190,6 +204,97 @@ fn marshal(
     (bytes, fis, inputs)
 }
 
+/// Pre-marshals and pre-computes chain tables from the filesystem walk in parallel with GPU init.
+pub(crate) fn marshal_from_walk(
+    walk: &crate::repo::WalkResult,
+    file_params: &[crate::layout::ItemParams],
+    color_mode: crate::repo::ColorMode,
+) -> PrefetchedCubeclData {
+    let total_bytes: usize = walk.total_bytes;
+    let n_words = total_bytes.div_ceil(4);
+    let mut bytes = Vec::with_capacity(n_words * 4);
+    let mut fis = Vec::with_capacity(walk.files.len());
+    let mut per_record_colors: Vec<u32> = Vec::new();
+    let mut color_base = vec![0u32; walk.files.len()];
+    let mut is_per_record = vec![0u32; walk.files.len()];
+    let mut flat_colors = vec![0u32; walk.files.len()];
+    let mut groups = Vec::with_capacity(walk.files.len());
+    let mut off = 0usize;
+
+    use rayon::prelude::*;
+    let syntax_colors: Option<Vec<Vec<u32>>> = if color_mode == crate::repo::ColorMode::Syntax {
+        Some(
+            walk.files
+                .par_iter()
+                .map(|f| crate::text::colorize_leaders(&f.bytes))
+                .collect(),
+        )
+    } else {
+        None
+    };
+
+    for (index, file) in walk.files.iter().enumerate() {
+        bytes.extend_from_slice(&file.bytes);
+        let p = &file_params[index];
+        fis.push(crate::fold::Item {
+            byte_start: off as i64,
+            byte_count: file.bytes.len() as i64,
+            origin_x: p.origin_x,
+            origin_y: p.origin_y,
+            origin_z: p.origin_z,
+            wrap_width: p.wrap_width as i64,
+            wrap_mode: p.wrap_mode,
+            cluster_mode: p.cluster_mode,
+            z_step: p.z_step,
+            line_height: p.line_height,
+            has_page: p.has_page,
+            page_rows: p.page_rows as i64,
+            page_cols: p.page_cols as i64,
+            scroll_rows: p.scroll_rows as i64,
+            pages_wide: p.pages_wide as i64,
+            page_gap_x: p.page_gap_x,
+            band_stride_y: p.band_stride_y,
+            depth_per_band: p.depth_per_band,
+            depth_per_col: p.depth_per_col,
+            page_line_height: p.page_line_height,
+        });
+
+        color_base[index] = per_record_colors.len() as u32;
+        if let Some(ref colors) = syntax_colors {
+            is_per_record[index] = 1;
+            per_record_colors.extend_from_slice(&colors[index]);
+        } else {
+            flat_colors[index] = crate::layout::DEFAULT_COLOR_PACKED;
+        }
+        groups.push(index as u32);
+        off += file.bytes.len();
+    }
+    bytes.resize(n_words * 4, 0x80);
+    let inputs = crate::cubecl_chain::InstanceInputs {
+        per_record_colors,
+        color_base,
+        is_per_record,
+        flat_colors,
+        groups,
+    };
+
+    let trie = crate::atlas::default_trie_ref();
+    let host_inputs = crate::cubecl_chain::prep::prepare_chain_inputs(
+        &bytes,
+        &fis,
+        trie,
+        /* wants_instances = */ false,
+        Some(&inputs),
+    );
+
+    PrefetchedCubeclData {
+        bytes,
+        items: fis,
+        instance_inputs: inputs,
+        host_inputs,
+    }
+}
+
 impl LayoutGlyphs for CubeclLayout {
     fn name(&self) -> &'static str {
         "cubecl"
@@ -214,7 +319,13 @@ impl LayoutGlyphs for CubeclLayout {
         arena: &mut GlyphArena,
     ) -> Result<Vec<ItemPlacement>, LayoutError> {
         let t_marshal = Instant::now();
-        let (bytes, fis, inputs) = marshal(items);
+        let (bytes, fis, inputs, precomputed_host_inputs) = match self.prefetched_inputs.take() {
+            Some(data) => (data.bytes, data.items, data.instance_inputs, Some(data.host_inputs)),
+            None => {
+                let (b, f, i) = marshal(items);
+                (b, f, i, None)
+            }
+        };
         let marshal_dur = t_marshal.elapsed();
         let stream = crate::cubecl_chain::run_repo_chain(
             self.device.as_ref(),
@@ -223,6 +334,7 @@ impl LayoutGlyphs for CubeclLayout {
             &inputs,
             false,
             self.field_mode,
+            precomputed_host_inputs,
         );
         assert!(
             arena.is_empty(),
@@ -278,6 +390,7 @@ impl VerifyLayout for CubeclLayout {
             &inputs,
             true,
             self.field_mode,
+            None,
         );
         assert!(
             arena.is_empty(),

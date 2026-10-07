@@ -206,9 +206,28 @@ fn main() {
                 std::process::exit(1);
             }
 
-            let prefetched_walk = if let SceneChoice::Repo { dir, .. } = &plan.choice {
+            let prefetched_walk = if let SceneChoice::Repo {
+                dir,
+                strategy,
+                wrap_mode,
+                z_wrap_spacing,
+                cluster_mode,
+                layout_mode,
+                color_mode,
+                ..
+            } = &plan.choice {
                 let dir = dir.clone();
-                Some(std::thread::spawn(move || repo::walk_repo(&dir)))
+                let strategy = *strategy;
+                let params = repo::RepoParams {
+                    wrap_mode: *wrap_mode,
+                    z_wrap_spacing: *z_wrap_spacing,
+                    cluster_mode: *cluster_mode,
+                    layout_mode: *layout_mode,
+                    color_mode: *color_mode,
+                    field_mode: plan.cull_opts.field_mode,
+                    ..Default::default()
+                };
+                Some(std::thread::spawn(move || repo::prefetch_repo(&dir, params, strategy)))
             } else {
                 None
             };

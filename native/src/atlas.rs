@@ -34,6 +34,13 @@ pub fn default_trie() -> Arc<TrieTable> {
     }).clone()
 }
 
+/// Static reference to the process-wide immutable font `TrieTable`.
+pub fn default_trie_ref() -> &'static TrieTable {
+    DEFAULT_TRIE.get_or_init(|| {
+        Arc::new(TrieTable::load(&crate::atlas_dir()))
+    }).as_ref()
+}
+
 /// Both Slug textures are row-major, 1024 texels wide (slug-constants.js
 /// TEXTURE_WIDTH). Texel `i` lives at `(i % 1024, i / 1024)`.
 pub const ATLAS_TEX_WIDTH: u32 = 1024;

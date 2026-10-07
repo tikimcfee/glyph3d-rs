@@ -392,18 +392,18 @@ fn build_scene_impl(
                         }));
                     }
                 }
-                let walk = if let Some(h) = ctx.prefetched_walk.lock().unwrap_or_else(|e| e.into_inner()).take() {
+                let prefetched = if let Some(h) = ctx.prefetched_walk.lock().unwrap_or_else(|e| e.into_inner()).take() {
                     let t_wait = std::time::Instant::now();
-                    let res = h.join().unwrap_or_else(|_| repo::walk_repo(dir));
-                    log::info!("joined prefetched repo walk in {:?}", t_wait.elapsed());
+                    let res = h.join().unwrap_or_else(|_| repo::prefetch_repo(dir, params, *strategy));
+                    log::info!("joined prefetched repo in {:?}", t_wait.elapsed());
                     res
                 } else {
-                    repo::walk_repo(dir)
+                    repo::prefetch_repo(dir, params, *strategy)
                 };
                 let arena = layout::GlyphArena::new();
-                let load = repo::load_repo_from_walk(
+                let load = repo::load_repo_from_prefetched(
                     dir,
-                    walk,
+                    prefetched,
                     &default_engine_trie(),
                     &params,
                     *strategy,

@@ -828,6 +828,14 @@ impl LayoutEngine {
         Self::Cubecl(crate::cubecl_layout::CubeclLayout::with_device(device, field_mode))
     }
 
+    /// Sets prefetched inputs from the background prefetch thread.
+    #[cfg(feature = "cubecl")]
+    pub(crate) fn set_cubecl_prefetched(&mut self, data: crate::cubecl_layout::PrefetchedCubeclData) {
+        if let Self::Cubecl(ref mut c) = self {
+            c.prefetched_inputs = Some(Box::new(data));
+        }
+    }
+
     /// Retrieve generic backend execution phases.
     pub fn phases(&self) -> crate::repo::BackendPhases {
         crate::repo::BackendPhases::default()
