@@ -432,9 +432,9 @@ pub(crate) fn launch_block2_geometry(
     }
 }
 
-/// Pre-warms (compiles and caches) all 15 CubeCL compute shader pipelines
-/// concurrently on a background thread so cold starts pay zero shader JIT latency.
-pub fn prewarm_pipelines(client: &Client, is_derived: Option<bool>) {
+/// Pre-warms (compiles and caches) all CubeCL compute shader pipelines across two
+/// independent worker clients/servers concurrently on background threads.
+pub fn prewarm_pipelines_parallel(client_emitter: &Client, client_scanners: &Client, is_derived: Option<bool>) {
     let t_prewarm_start = std::time::Instant::now();
     let zeroes = vec![0u32; 256];
     let zeroes_bytes = bytemuck::cast_slice::<u32, u8>(&zeroes);
@@ -448,18 +448,18 @@ pub fn prewarm_pipelines(client: &Client, is_derived: Option<bool>) {
     let log = threads_per_cube.ilog2() as usize;
 
     std::thread::scope(|scope| {
-        // Thread 1: Compile apply_and_emit (the heaviest shader: ~100ms)
-        let client_emitter = client.clone();
-        scope.spawn(move || {
-            let dummy_buffers: Vec<_> = (0..20)
-                .map(|_| client_emitter.create_from_slice(zeroes_bytes))
-                .collect();
-            let dummy = |slot: usize, len: usize| unsafe { BufferArg::from_raw_parts(dummy_buffers[slot].clone(), len) };
+        // Thread 1: Compile apply_and_emit (the heaviest shader: ~100ms) on server 1
+        scope.spawn(|| {
+            let t_buf0 = std::time::Instant::now();
+            let dummy_buf = client_emitter.create_from_slice(zeroes_bytes);
+            log::info!("dummy_buf created in {:?}", t_buf0.elapsed());
+            let dummy = |_slot: usize, len: usize| unsafe { BufferArg::from_raw_parts(dummy_buf.clone(), len) };
 
             unsafe {
+                let t_ae = std::time::Instant::now();
                 if is_derived != Some(true) {
                     apply_and_emit::launch_unchecked(
-                        &client_emitter,
+                        client_emitter,
                         CubeCount::Static(1, 1, 1),
                         dim_256,
                         dummy(0, 1),
@@ -489,7 +489,7 @@ pub fn prewarm_pipelines(client: &Client, is_derived: Option<bool>) {
                 }
                 if is_derived != Some(false) {
                     apply_and_emit::launch_unchecked(
-                        &client_emitter,
+                        client_emitter,
                         CubeCount::Static(1, 1, 1),
                         dim_256,
                         dummy(0, 1),
@@ -517,22 +517,20 @@ pub fn prewarm_pipelines(client: &Client, is_derived: Option<bool>) {
                         log,
                     );
                 }
-                let _ = client_emitter.flush();
+                log::info!("prewarm: apply_and_emit compiled in {:?}", t_ae.elapsed());
             }
         });
 
-        // Thread 2: Compile decode_probe, cand_sort, jump_build, rank_step, item_roots, cluster_mark, tile_scan, spine_scan (~75ms)
-        let client_scanners = client.clone();
-        scope.spawn(move || {
-            let dummy_buffers: Vec<_> = (0..20)
-                .map(|_| client_scanners.create_from_slice(zeroes_bytes))
-                .collect();
-            let dummy = |slot: usize, len: usize| unsafe { BufferArg::from_raw_parts(dummy_buffers[slot].clone(), len) };
+        // Thread 2: Compile decode_probe, tile_scan, spine_scan on server 2
+        scope.spawn(|| {
+            let dummy_buf = client_scanners.create_from_slice(zeroes_bytes);
+            let dummy = |_slot: usize, len: usize| unsafe { BufferArg::from_raw_parts(dummy_buf.clone(), len) };
 
             unsafe {
                 // 1. decode_probe
+                let t_dp = std::time::Instant::now();
                 decode_probe::launch_unchecked(
-                    &client_scanners,
+                    client_scanners,
                     CubeCount::Static(1, 1, 1),
                     dim_256,
                     dummy(0, 1),
@@ -554,80 +552,12 @@ pub fn prewarm_pipelines(client: &Client, is_derived: Option<bool>) {
                     9u32,
                     16384usize,
                 );
+                log::info!("prewarm: decode_probe compiled in {:?}", t_dp.elapsed());
 
-                // 2. cand_sort
-                cand_sort::launch_unchecked(
-                    &client_scanners,
-                    CubeCount::new_single(),
-                    CubeDim::new_1d(32),
-                    dummy(0, 1),
-                    dummy(1, 1),
-                    dummy(2, 1),
-                    dummy(3, 1),
-                    16384usize,
-                );
-
-                // 3. jump_build
-                jump_build::launch_unchecked(
-                    &client_scanners,
-                    CubeCount::new_single(),
-                    dim_256,
-                    dummy(0, 1),
-                    dummy(1, 1),
-                    dummy(2, 2),
-                    dummy(3, 1),
-                    dummy(4, 1),
-                    dummy(5, 1),
-                );
-
-                // 4. rank_step
-                rank_step::launch_unchecked(
-                    &client_scanners,
-                    CubeCount::new_single(),
-                    dim_256,
-                    dummy(0, 1),
-                    dummy(1, 1),
-                    dummy(2, 1),
-                    dummy(3, 1),
-                    dummy(4, 1),
-                    0usize,
-                    1usize,
-                );
-
-                // 5. item_roots
-                item_roots::launch_unchecked(
-                    &client_scanners,
-                    CubeCount::new_single(),
-                    dim_256,
-                    dummy(0, 1),
-                    dummy(1, 1),
-                    dummy(2, 2),
-                    dummy(3, 1),
-                    dummy(4, 1),
-                );
-
-                // 6. cluster_mark
-                cluster_mark::launch_unchecked(
-                    &client_scanners,
-                    CubeCount::new_single(),
-                    dim_256,
-                    dummy(0, 1),
-                    dummy(1, 1),
-                    dummy(2, 1),
-                    dummy(3, 1),
-                    dummy(4, 1),
-                    dummy(5, 2),
-                    dummy(6, 1),
-                    dummy(7, 1),
-                    dummy(8, 1),
-                    1usize,
-                    1usize,
-                    0.0f32,
-                );
-
-                // 7. tile_scan
+                // 2. tile_scan (core text layout scan)
+                let t_ts = std::time::Instant::now();
                 tile_scan::launch_unchecked(
-                    &client_scanners,
+                    client_scanners,
                     CubeCount::Static(1, 1, 1),
                     dim_256,
                     dummy(0, 0),
@@ -644,10 +574,12 @@ pub fn prewarm_pipelines(client: &Client, is_derived: Option<bool>) {
                     bytes_per_thread,
                     log,
                 );
+                log::info!("prewarm: tile_scan compiled in {:?}", t_ts.elapsed());
 
-                // 8. spine_scan
+                // 3. spine_scan (core text layout spine)
+                let t_ss = std::time::Instant::now();
                 spine_scan::launch_unchecked(
-                    &client_scanners,
+                    client_scanners,
                     CubeCount::new_single(),
                     dim_256,
                     dummy(0, PARTIAL_COUNT_STRIDE),
@@ -657,8 +589,83 @@ pub fn prewarm_pipelines(client: &Client, is_derived: Option<bool>) {
                     threads_per_cube,
                     log,
                 );
+                log::info!("prewarm: spine_scan compiled in {:?}", t_ss.elapsed());
 
-                let _ = client_scanners.flush();
+                let prewarm_cluster = std::env::var("GLYPH_PREWARM_CLUSTER")
+                    .map(|v| v != "0")
+                    .unwrap_or(false);
+
+                if prewarm_cluster {
+                    // 4. cand_sort
+                    cand_sort::launch_unchecked(
+                        client_scanners,
+                        CubeCount::new_single(),
+                        CubeDim::new_1d(32),
+                        dummy(0, 1),
+                        dummy(1, 1),
+                        dummy(2, 1),
+                        dummy(3, 1),
+                        16384usize,
+                    );
+
+                    // 5. jump_build
+                    jump_build::launch_unchecked(
+                        client_scanners,
+                        CubeCount::new_single(),
+                        dim_256,
+                        dummy(0, 1),
+                        dummy(1, 1),
+                        dummy(2, 2),
+                        dummy(3, 1),
+                        dummy(4, 1),
+                        dummy(5, 1),
+                    );
+
+                    // 6. rank_step
+                    rank_step::launch_unchecked(
+                        client_scanners,
+                        CubeCount::new_single(),
+                        dim_256,
+                        dummy(0, 1),
+                        dummy(1, 1),
+                        dummy(2, 1),
+                        dummy(3, 1),
+                        dummy(4, 1),
+                        0usize,
+                        1usize,
+                    );
+
+                    // 7. item_roots
+                    item_roots::launch_unchecked(
+                        client_scanners,
+                        CubeCount::new_single(),
+                        dim_256,
+                        dummy(0, 1),
+                        dummy(1, 1),
+                        dummy(2, 2),
+                        dummy(3, 1),
+                        dummy(4, 1),
+                    );
+
+                    // 8. cluster_mark
+                    cluster_mark::launch_unchecked(
+                        client_scanners,
+                        CubeCount::new_single(),
+                        dim_256,
+                        dummy(0, 1),
+                        dummy(1, 1),
+                        dummy(2, 1),
+                        dummy(3, 1),
+                        dummy(4, 1),
+                        dummy(5, 2),
+                        dummy(6, 1),
+                        dummy(7, 1),
+                        dummy(8, 1),
+                        1usize,
+                        1usize,
+                        0.0f32,
+                    );
+                }
             }
         });
     });
@@ -667,5 +674,10 @@ pub fn prewarm_pipelines(client: &Client, is_derived: Option<bool>) {
         "prewarm_pipelines completed in {:?}",
         t_prewarm_start.elapsed()
     );
+}
+
+/// Pre-warms pipelines on a single client.
+pub fn prewarm_pipelines(client: &Client, is_derived: Option<bool>) {
+    prewarm_pipelines_parallel(client, client, is_derived);
 }
 

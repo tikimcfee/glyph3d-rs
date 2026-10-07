@@ -382,6 +382,7 @@ pub struct GpuContext {
     #[cfg(feature = "cubecl")]
     pub prewarm_handle: std::sync::Arc<std::sync::Mutex<Option<std::thread::JoinHandle<()>>>>,
     pub prefetched_walk: std::sync::Arc<std::sync::Mutex<Option<std::thread::JoinHandle<crate::repo::WalkResult>>>>,
+    pub prefetched_atlas: std::sync::Arc<std::sync::Mutex<Option<std::thread::JoinHandle<crate::atlas::Atlas>>>>,
 }
 
 /// The renderer's device context handles passed across layout stages.
@@ -400,6 +401,7 @@ pub struct SharedDevice {
     #[cfg(feature = "cubecl")]
     pub cubecl_device: Option<cubecl::wgpu::WgpuDevice>,
     pub prefetched_walk: std::sync::Arc<std::sync::Mutex<Option<std::thread::JoinHandle<crate::repo::WalkResult>>>>,
+    pub prefetched_atlas: std::sync::Arc<std::sync::Mutex<Option<std::thread::JoinHandle<crate::atlas::Atlas>>>>,
 }
 
 impl SharedDevice {
@@ -434,6 +436,7 @@ impl SharedDevice {
             #[cfg(feature = "cubecl")]
             cubecl_device,
             prefetched_walk: ctx.prefetched_walk.clone(),
+            prefetched_atlas: ctx.prefetched_atlas.clone(),
         }
     }
 
@@ -678,6 +681,7 @@ pub async fn init(compatible_surface: Option<&wgpu::Surface<'_>>) -> GpuContext 
         #[cfg(feature = "cubecl")]
         prewarm_handle: std::sync::Arc::new(std::sync::Mutex::new(None)),
         prefetched_walk: std::sync::Arc::new(std::sync::Mutex::new(None)),
+        prefetched_atlas: std::sync::Arc::new(std::sync::Mutex::new(None)),
     }
 }
 

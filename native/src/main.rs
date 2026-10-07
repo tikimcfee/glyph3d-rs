@@ -216,6 +216,25 @@ fn main() {
             let ctx = pollster::block_on(gpu::init(None));
             *ctx.prefetched_walk.lock().unwrap_or_else(|e| e.into_inner()) = prefetched_walk;
 
+            let emoji_sheet_path = match &plan.choice {
+                SceneChoice::Repo { emoji_sheet, .. } => Some(emoji_sheet.clone()),
+                SceneChoice::Text { emoji_sheet, .. } => Some(emoji_sheet.clone()),
+                SceneChoice::EngineText { emoji_sheet, .. } => Some(emoji_sheet.clone()),
+                SceneChoice::AgentSession { emoji_sheet, .. } => Some(emoji_sheet.clone()),
+                _ => None,
+            };
+            if let Some(emoji_sheet) = emoji_sheet_path {
+                let dev = ctx.device.clone();
+                let q = ctx.queue.clone();
+                let atlas_handle = std::thread::spawn(move || {
+                    let t = std::time::Instant::now();
+                    let a = atlas::Atlas::load_device(&dev, &q, &emoji_sheet);
+                    log::info!("prefetched atlas loaded in {:?}", t.elapsed());
+                    a
+                });
+                *ctx.prefetched_atlas.lock().unwrap_or_else(|e| e.into_inner()) = Some(atlas_handle);
+            }
+
             #[cfg(feature = "cubecl")]
             if matches!(&plan.choice, SceneChoice::Repo { strategy: repo::Strategy::Cubecl, .. }) {
                 let shared_dev = gpu::SharedDevice::from_ctx(&ctx);

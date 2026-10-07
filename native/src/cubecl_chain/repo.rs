@@ -184,14 +184,6 @@ pub(crate) fn run_repo_chain(
     let span_upload = tracing::info_span!("chain.upload", live_bytes = tracing::field::Empty);
     let sp_upload = span_upload.enter();
 
-    if let Some(dev) = device {
-        if let Some(h) = dev.prewarm_handle.lock().unwrap().take() {
-            let t_prewarm_wait = std::time::Instant::now();
-            h.join().expect("cubecl prewarm thread panicked");
-            log::info!("joined prewarm thread before buffer allocation in {:?}", t_prewarm_wait.elapsed());
-        }
-    }
-
     let needs_tint = readback_slots
         || (field_mode != glyph_field::GlyphFieldMode::Derived
             && inputs.is_per_record.iter().any(|&x| x != 0));
@@ -213,6 +205,14 @@ pub(crate) fn run_repo_chain(
     span_upload.record("live_bytes", live_bytes);
     drop(sp_upload);
     drop(span_upload);
+
+    if let Some(dev) = device {
+        if let Some(h) = dev.prewarm_handle.lock().unwrap_or_else(|e| e.into_inner()).take() {
+            let t_prewarm_wait = std::time::Instant::now();
+            h.join().expect("cubecl prewarm thread panicked");
+            log::info!("joined prewarm thread right before dispatch in {:?}", t_prewarm_wait.elapsed());
+        }
+    }
 
     let sp_dispatch = tracing::info_span!("chain.dispatch").entered();
 

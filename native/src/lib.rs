@@ -366,10 +366,17 @@ fn build_scene_impl(
             let queue = &ctx.queue;
             #[cfg(feature = "cubecl")]
             let shared_dev = gpu::SharedDevice::from_ctx(ctx);
+            let prefetched_atlas_handle = ctx.prefetched_atlas.lock().unwrap_or_else(|e| e.into_inner()).take();
             let (load, atlas, atlas_wall) = std::thread::scope(|s| {
-                let atlas_handle = s.spawn(|| {
+                let atlas_handle = s.spawn(move || {
                     let t = std::time::Instant::now();
-                    let a = atlas::Atlas::load_device(device, queue, emoji_sheet);
+                    let a = if let Some(h) = prefetched_atlas_handle {
+                        let res = h.join().expect("prefetched atlas thread panicked");
+                        log::info!("joined prefetched atlas in {:?}", t.elapsed());
+                        res
+                    } else {
+                        atlas::Atlas::load_device(device, queue, emoji_sheet)
+                    };
                     (a, t.elapsed())
                 });
                 #[cfg(feature = "cubecl")]

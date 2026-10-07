@@ -202,13 +202,32 @@ pub(crate) fn allocate_chain_buffers(
     let t_cluster = if inputs.has_cluster {
         let t_c = std::time::Instant::now();
         let kmax = ((candidate_capacity as u32 + 1).next_power_of_two().trailing_zeros()) as usize;
-        let h_lvl = alloc_empty(kmax * candidate_stride * 4);
-        let h_parent = alloc_empty(candidate_stride * 4);
-        let h_parent_b = alloc_empty(candidate_stride * 4);
-        let h_d0 = alloc_empty(candidate_stride * 4);
-        let h_d_a = alloc_empty(candidate_stride * 4);
-        let h_d_b = alloc_empty(candidate_stride * 4);
-        let h_roots = alloc_empty(item_count.max(1) * 4);
+        let stride_bytes = (candidate_stride * 4).next_multiple_of(256);
+        let roots_bytes = (item_count.max(1) * 4).next_multiple_of(256);
+        let total_scratch_bytes = (kmax + 5) * stride_bytes + roots_bytes;
+        let h_scratch = alloc_empty(total_scratch_bytes);
+
+        let mut offset = 0u64;
+        let h_lvl = h_scratch.clone().offset_start(offset);
+        offset += (kmax * stride_bytes) as u64;
+
+        let h_parent = h_scratch.clone().offset_start(offset);
+        offset += stride_bytes as u64;
+
+        let h_parent_b = h_scratch.clone().offset_start(offset);
+        offset += stride_bytes as u64;
+
+        let h_d0 = h_scratch.clone().offset_start(offset);
+        offset += stride_bytes as u64;
+
+        let h_d_a = h_scratch.clone().offset_start(offset);
+        offset += stride_bytes as u64;
+
+        let h_d_b = h_scratch.clone().offset_start(offset);
+        offset += stride_bytes as u64;
+
+        let h_roots = h_scratch.offset_start(offset);
+
         let elapsed = t_c.elapsed();
         cluster_allocs = Some(ClusterCandidateAllocs {
             h_lvl,
