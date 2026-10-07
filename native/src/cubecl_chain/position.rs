@@ -352,7 +352,7 @@ pub(super) fn apply_and_emit(
 ) {
     let tile_idx = CUBE_POS;
     let unit_idx = UNIT_POS as usize;
-    let total_bytes = glyph_flags.len() * 4; // packed: words -> bytes
+    let total_bytes = bytes.len() * 4; // packed: words -> bytes
     let item_count = item_descriptors.len() / ITEM_DESC_STRIDE;
     let range_start = tile_idx * (threads_per_cube * bytes_per_thread) + unit_idx * bytes_per_thread;
     let range_end = if range_start + bytes_per_thread < total_bytes { range_start + bytes_per_thread } else { total_bytes };
@@ -1878,7 +1878,12 @@ pub(super) fn apply_and_emit(
 
                         // Rare fallback: only if the segment crossed before the tile boundary
                         while backward_column >= 1 && start_byte_index >= 0 {
-                            if (flags_at(glyph_flags, start_byte_index as usize) & F_LEADER) != 0 {
+                            let is_lead = if glyph_flags.len() > 1 {
+                                (flags_at(glyph_flags, start_byte_index as usize) & F_LEADER) != 0
+                            } else {
+                                (byte_at(bytes, start_byte_index as usize, total_bytes) & 0xC0u32) != 0x80u32
+                            };
+                            if is_lead {
                                 backward_column -= 1;
                             }
                             if backward_column >= 1 {
@@ -1889,8 +1894,17 @@ pub(super) fn apply_and_emit(
                         // Forward accumulation
                         let mut forward_index = if start_byte_index >= 0 { start_byte_index as usize } else { 0usize };
                         while forward_index < id {
-                            if (flags_at(glyph_flags, forward_index) & F_LEADER) != 0 {
-                                let flag = flags_at(glyph_flags, forward_index);
+                            let is_lead = if glyph_flags.len() > 1 {
+                                (flags_at(glyph_flags, forward_index) & F_LEADER) != 0
+                            } else {
+                                (byte_at(bytes, forward_index, total_bytes) & 0xC0u32) != 0x80u32
+                            };
+                            if is_lead {
+                                let flag = if glyph_flags.len() > 1 {
+                                    flags_at(glyph_flags, forward_index)
+                                } else {
+                                    0u32
+                                };
                                 if (flag & F_CLUSTER_HEAD) != 0 {
                                     current_advance_x += bitmap_advance;
                                 } else if (flag & F_CLUSTER_TRAILER) != 0 {

@@ -32,6 +32,7 @@ pub(crate) struct ChainBuffers {
 
     // Intermediate pass buffers
     pub h_glyph_flags: Handle,
+    pub glyph_flags_words: usize,
     pub h_candidate_slots: Option<Handle>,
     pub h_candidate_end_positions: Option<Handle>,
     pub h_tile_counts: Option<Handle>,
@@ -160,7 +161,11 @@ pub(crate) fn allocate_chain_buffers(
     let h_item_cluster_enabled = alloc_upload(bytemuck::cast_slice(&inputs.item_cluster_enabled));
     let h_item_descriptors = alloc_upload(bytemuck::cast_slice(&inputs.item_descriptors));
     let h_tile_item_base = alloc_upload(bytemuck::cast_slice(&inputs.tile_item_base));
-    let h_glyph_flags = alloc_empty(n_words * 4);
+    let (h_glyph_flags, glyph_flags_words) = if inputs.has_cluster {
+        (alloc_empty(n_words * 4), n_words)
+    } else {
+        (alloc_empty(4), 1)
+    };
     // Quad height is constant CELL_HEIGHT_WORLD = 1.0, and trie lookup is evaluated inline.
     let h_tile_counts = alloc_empty(n_tiles * PARTIAL_COUNT_STRIDE * 4);
     let h_tile_metrics = alloc_empty(n_tiles * 4);
@@ -277,6 +282,7 @@ pub(crate) fn allocate_chain_buffers(
             trie_block_codepoints_len,
             trie_block_shift,
             h_glyph_flags,
+            glyph_flags_words,
             h_candidate_slots: Some(h_candidate_slots),
             h_candidate_end_positions: Some(h_candidate_end_positions),
             h_tile_counts: Some(h_tile_counts),

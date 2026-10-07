@@ -44,7 +44,7 @@ pub(super) fn tile_scan(
 ) {
     let tile_idx = CUBE_POS;
     let unit_idx = UNIT_POS as usize;
-    let total_bytes = glyph_flags.len() * 4; // packed: words -> bytes
+    let total_bytes = bytes.len() * 4; // packed: words -> bytes
     let item_count = item_descriptors.len() / ITEM_DESC_STRIDE;
     let range_start = tile_idx * (threads_per_cube * bytes_per_thread) + unit_idx * bytes_per_thread;
     let range_end = if range_start + bytes_per_thread < total_bytes { range_start + bytes_per_thread } else { total_bytes };

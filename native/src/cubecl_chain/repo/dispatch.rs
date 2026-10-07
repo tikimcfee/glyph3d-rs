@@ -198,6 +198,10 @@ pub(crate) fn launch_block1(
     buf: &ChainBuffers,
     prof: &mut ChainProfiler,
 ) {
+    if !inputs.has_cluster {
+        return;
+    }
+
     let n_words = inputs.n_words;
 
     unsafe {
@@ -369,7 +373,7 @@ pub(crate) fn launch_block2_geometry(
             client,
             tiles_grid(n_tiles),
             CubeDim::new_1d(threads_per_cube as u32),
-            BufferArg::from_raw_parts(buf.h_glyph_flags.clone(), n_words),
+            BufferArg::from_raw_parts(buf.h_glyph_flags.clone(), buf.glyph_flags_words),
             BufferArg::from_raw_parts(buf.h_bytes.as_ref().unwrap().clone(), n_words),
             BufferArg::from_raw_parts(buf.h_trie_block_indices.as_ref().unwrap().clone(), buf.trie_block_indices_len),
             BufferArg::from_raw_parts(buf.h_trie_block_metrics.as_ref().unwrap().clone(), buf.trie_block_metrics_len),
@@ -406,7 +410,7 @@ pub(crate) fn launch_block2_geometry(
                 client,
                 tiles_grid(n_tiles),
                 CubeDim::new_1d(threads_per_cube as u32),
-                BufferArg::from_raw_parts(buf.h_glyph_flags.clone(), n_words),
+                BufferArg::from_raw_parts(buf.h_glyph_flags.clone(), buf.glyph_flags_words),
                 BufferArg::from_raw_parts(buf.h_bytes.as_ref().unwrap().clone(), n_words),
                 BufferArg::from_raw_parts(buf.h_trie_block_indices.as_ref().unwrap().clone(), buf.trie_block_indices_len),
                 BufferArg::from_raw_parts(buf.h_trie_block_metrics.as_ref().unwrap().clone(), buf.trie_block_metrics_len),
