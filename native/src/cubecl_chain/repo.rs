@@ -124,7 +124,7 @@ pub(crate) struct ChainStream {
 
 pub(crate) fn run_repo_chain(
     device: Option<&SharedDevice>,
-    bytes: &[u8],
+    bytes: Vec<u8>,
     items: &[crate::fold::Item],
     inputs: &InstanceInputs,
     readback_slots: bool,
@@ -142,7 +142,7 @@ pub(crate) fn run_repo_chain(
 
     let trie = crate::atlas::default_trie();
     let host_inputs = prepare_chain_inputs(
-        bytes,
+        &bytes,
         items,
         &trie,
         readback_slots,

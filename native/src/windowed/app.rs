@@ -238,8 +238,48 @@ impl App<'_> {
     }
 }
 
+fn handle_panic_or_broken_pipe(action: &str, err: Box<dyn std::any::Any + Send>) -> ! {
+    let is_broken_pipe = err
+        .downcast_ref::<String>()
+        .is_some_and(|s| s.contains("Broken pipe") || s.contains("os error 32"))
+        || err
+            .downcast_ref::<&str>()
+            .is_some_and(|s| s.contains("Broken pipe") || s.contains("os error 32"));
+    if is_broken_pipe {
+        std::process::exit(0);
+    }
+    eprintln!("Panic during {action}: {:?}", err);
+    std::process::exit(1);
+}
+
 impl ApplicationHandler for App<'_> {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+        if let Err(err) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.resumed_impl(event_loop))) {
+            handle_panic_or_broken_pipe("window resume / startup", err);
+        }
+    }
+
+    fn window_event(&mut self, event_loop: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
+        if let Err(err) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.window_event_impl(event_loop, id, event))) {
+            handle_panic_or_broken_pipe("window event handling", err);
+        }
+    }
+
+    fn device_event(&mut self, event_loop: &ActiveEventLoop, id: winit::event::DeviceId, event: DeviceEvent) {
+        if let Err(err) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.device_event_impl(event_loop, id, event))) {
+            handle_panic_or_broken_pipe("window device_event", err);
+        }
+    }
+
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        if let Err(err) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.about_to_wait_impl(event_loop))) {
+            handle_panic_or_broken_pipe("window about_to_wait", err);
+        }
+    }
+}
+
+impl App<'_> {
+    fn resumed_impl(&mut self, event_loop: &ActiveEventLoop) {
         if self.state.is_some() {
             return;
         }
@@ -434,7 +474,7 @@ impl ApplicationHandler for App<'_> {
         });
     }
 
-    fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
+    fn window_event_impl(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
         let Some(state) = self.state.as_mut() else { return };
         // Stage K: egui sees every window event FIRST. Scene routing below only
         // handles events egui did not consume (0.36 semantics: pointer/wheel
@@ -644,7 +684,7 @@ impl ApplicationHandler for App<'_> {
         }
     }
 
-    fn device_event(&mut self, _event_loop: &ActiveEventLoop, _id: winit::event::DeviceId, event: DeviceEvent) {
+    fn device_event_impl(&mut self, _event_loop: &ActiveEventLoop, _id: winit::event::DeviceId, event: DeviceEvent) {
         // Raw mouse deltas drive look while grabbed (unaffected by the
         // confined pointer hitting the window edge).
         if let DeviceEvent::MouseMotion { delta: (dx, dy) } = event {
@@ -657,7 +697,7 @@ impl ApplicationHandler for App<'_> {
         }
     }
 
-    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+    fn about_to_wait_impl(&mut self, event_loop: &ActiveEventLoop) {
         if let Some(state) = &mut self.state {
             // Post-L3 fix: while the surface reports Occluded, do NOT spin
             // request_redraw (measured pre-fix: ~250k skipped acquires/s,

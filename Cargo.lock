@@ -2936,6 +2936,7 @@ dependencies = [
  "clap",
  "clap_complete",
  "cubecl",
+ "cubecl-common",
  "egui",
  "egui-wgpu",
  "egui-winit",

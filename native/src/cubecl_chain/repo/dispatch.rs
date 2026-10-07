@@ -438,16 +438,8 @@ pub fn prewarm_pipelines(client: &Client, is_derived: Option<bool>) {
     let t_prewarm_start = std::time::Instant::now();
     let zeroes = vec![0u32; 256];
     let zeroes_bytes = bytemuck::cast_slice::<u32, u8>(&zeroes);
-    let t_buf0 = std::time::Instant::now();
-    let dummy_buffers: Vec<_> = (0..25)
-        .map(|_| client.create_from_slice(zeroes_bytes))
-        .collect();
-    let _dur_bufs = t_buf0.elapsed();
-
-    let dummy = |slot: usize, len: usize| unsafe { BufferArg::from_raw_parts(dummy_buffers[slot].clone(), len) };
 
     let dim_256 = CubeDim::new_1d(256);
-
     let threads_per_cube = 256usize;
     let bytes_per_thread = std::env::var("GLYPH_CHAIN_RAKE")
         .ok()
@@ -455,217 +447,225 @@ pub fn prewarm_pipelines(client: &Client, is_derived: Option<bool>) {
         .unwrap_or(8usize);
     let log = threads_per_cube.ilog2() as usize;
 
-    unsafe {
-        let flush_kernel = |name: &'static str| {
-            let t = std::time::Instant::now();
-            let _ = client.flush();
-            log::info!("prewarm compile {name}: {:?}", t.elapsed());
-        };
+    std::thread::scope(|scope| {
+        // Thread 1: Compile apply_and_emit (the heaviest shader: ~100ms)
+        let client_emitter = client.clone();
+        scope.spawn(move || {
+            let dummy_buffers: Vec<_> = (0..20)
+                .map(|_| client_emitter.create_from_slice(zeroes_bytes))
+                .collect();
+            let dummy = |slot: usize, len: usize| unsafe { BufferArg::from_raw_parts(dummy_buffers[slot].clone(), len) };
 
-        // 1. decode_probe
-        decode_probe::launch_unchecked(
-            client,
-            CubeCount::Static(1, 1, 1),
-            dim_256,
-            dummy(0, 1),
-            dummy(1, 1),
-            dummy(2, 2),
-            dummy(3, 2),
-            dummy(4, 1),
-            dummy(5, 1),
-            dummy(6, 1),
-            dummy(7, 1),
-            dummy(8, 2),
-            dummy(9, 1),
-            dummy(10, 0),
-            dummy(11, 1),
-            dummy(12, 1),
-            dummy(13, 1),
-            dummy(14, 1),
-            8u32,
-            9u32,
-            16384usize,
-        );
-        flush_kernel("decode_probe");
+            unsafe {
+                if is_derived != Some(true) {
+                    apply_and_emit::launch_unchecked(
+                        &client_emitter,
+                        CubeCount::Static(1, 1, 1),
+                        dim_256,
+                        dummy(0, 1),
+                        dummy(1, 0),
+                        dummy(2, 1),
+                        dummy(3, 1),
+                        dummy(4, 1),
+                        8u32,
+                        dummy(5, 1),
+                        dummy(6, 1),
+                        dummy(7, 1),
+                        136.0f32,
+                        dummy(8, ITEM_DESC_STRIDE),
+                        dummy(9, PARTIAL_COUNT_STRIDE),
+                        dummy(10, 1),
+                        dummy(11, 2),
+                        dummy(12, EXT_STRIDE),
+                        dummy(13, 1),
+                        dummy(14, 1),
+                        dummy(15, 8),
+                        dummy(16, 2),
+                        false,
+                        threads_per_cube,
+                        bytes_per_thread,
+                        log,
+                    );
+                }
+                if is_derived != Some(false) {
+                    apply_and_emit::launch_unchecked(
+                        &client_emitter,
+                        CubeCount::Static(1, 1, 1),
+                        dim_256,
+                        dummy(0, 1),
+                        dummy(1, 0),
+                        dummy(2, 1),
+                        dummy(3, 1),
+                        dummy(4, 1),
+                        8u32,
+                        dummy(5, 1),
+                        dummy(6, 1),
+                        dummy(7, 1),
+                        136.0f32,
+                        dummy(8, ITEM_DESC_STRIDE),
+                        dummy(9, PARTIAL_COUNT_STRIDE),
+                        dummy(10, 1),
+                        dummy(11, 2),
+                        dummy(12, EXT_STRIDE),
+                        dummy(13, 1),
+                        dummy(14, 1),
+                        dummy(15, 5),
+                        dummy(16, 2),
+                        true,
+                        threads_per_cube,
+                        bytes_per_thread,
+                        log,
+                    );
+                }
+                let _ = client_emitter.flush();
+            }
+        });
 
-        // 2. cand_sort
-        cand_sort::launch_unchecked(
-            client,
-            CubeCount::new_single(),
-            CubeDim::new_1d(32),
-            dummy(0, 1),
-            dummy(1, 1),
-            dummy(2, 1),
-            dummy(3, 1),
-            16384usize,
-        );
-        flush_kernel("cand_sort");
+        // Thread 2: Compile decode_probe, cand_sort, jump_build, rank_step, item_roots, cluster_mark, tile_scan, spine_scan (~75ms)
+        let client_scanners = client.clone();
+        scope.spawn(move || {
+            let dummy_buffers: Vec<_> = (0..20)
+                .map(|_| client_scanners.create_from_slice(zeroes_bytes))
+                .collect();
+            let dummy = |slot: usize, len: usize| unsafe { BufferArg::from_raw_parts(dummy_buffers[slot].clone(), len) };
 
-        // 3. jump_build
-        jump_build::launch_unchecked(
-            client,
-            CubeCount::new_single(),
-            dim_256,
-            dummy(0, 1),
-            dummy(1, 1),
-            dummy(2, 2),
-            dummy(3, 1),
-            dummy(4, 1),
-            dummy(5, 1),
-        );
-        flush_kernel("jump_build");
+            unsafe {
+                // 1. decode_probe
+                decode_probe::launch_unchecked(
+                    &client_scanners,
+                    CubeCount::Static(1, 1, 1),
+                    dim_256,
+                    dummy(0, 1),
+                    dummy(1, 1),
+                    dummy(2, 2),
+                    dummy(3, 2),
+                    dummy(4, 1),
+                    dummy(5, 1),
+                    dummy(6, 1),
+                    dummy(7, 1),
+                    dummy(8, 2),
+                    dummy(9, 1),
+                    dummy(10, 0),
+                    dummy(11, 1),
+                    dummy(12, 1),
+                    dummy(13, 1),
+                    dummy(14, 1),
+                    8u32,
+                    9u32,
+                    16384usize,
+                );
 
-        // 4. rank_step
-        rank_step::launch_unchecked(
-            client,
-            CubeCount::new_single(),
-            dim_256,
-            dummy(0, 1),
-            dummy(1, 1),
-            dummy(2, 1),
-            dummy(3, 1),
-            dummy(4, 1),
-            0usize,
-            1usize,
-        );
-        flush_kernel("rank_step");
+                // 2. cand_sort
+                cand_sort::launch_unchecked(
+                    &client_scanners,
+                    CubeCount::new_single(),
+                    CubeDim::new_1d(32),
+                    dummy(0, 1),
+                    dummy(1, 1),
+                    dummy(2, 1),
+                    dummy(3, 1),
+                    16384usize,
+                );
 
-        // 5. item_roots
-        item_roots::launch_unchecked(
-            client,
-            CubeCount::new_single(),
-            dim_256,
-            dummy(0, 1),
-            dummy(1, 1),
-            dummy(2, 2),
-            dummy(3, 1),
-            dummy(4, 1),
-        );
-        flush_kernel("item_roots");
+                // 3. jump_build
+                jump_build::launch_unchecked(
+                    &client_scanners,
+                    CubeCount::new_single(),
+                    dim_256,
+                    dummy(0, 1),
+                    dummy(1, 1),
+                    dummy(2, 2),
+                    dummy(3, 1),
+                    dummy(4, 1),
+                    dummy(5, 1),
+                );
 
-        // 6. cluster_mark
-        cluster_mark::launch_unchecked(
-            client,
-            CubeCount::new_single(),
-            dim_256,
-            dummy(0, 1),
-            dummy(1, 1),
-            dummy(2, 1),
-            dummy(3, 1),
-            dummy(4, 1),
-            dummy(5, 2),
-            dummy(6, 1),
-            dummy(7, 1),
-            dummy(8, 1),
-            1usize,
-            1usize,
-            0.0f32,
-        );
-        flush_kernel("cluster_mark");
+                // 4. rank_step
+                rank_step::launch_unchecked(
+                    &client_scanners,
+                    CubeCount::new_single(),
+                    dim_256,
+                    dummy(0, 1),
+                    dummy(1, 1),
+                    dummy(2, 1),
+                    dummy(3, 1),
+                    dummy(4, 1),
+                    0usize,
+                    1usize,
+                );
 
-        // 9. tile_scan
-        tile_scan::launch_unchecked(
-            client,
-            CubeCount::Static(1, 1, 1),
-            dim_256,
-            dummy(0, 0),
-            dummy(1, 1),
-            dummy(2, 1),
-            dummy(3, 1),
-            dummy(4, 1),
-            8u32,
-            0.0f32,
-            dummy(5, ITEM_DESC_STRIDE),
-            dummy(6, PARTIAL_COUNT_STRIDE),
-            dummy(7, 1),
-            threads_per_cube,
-            bytes_per_thread,
-            log,
-        );
-        flush_kernel("tile_scan");
+                // 5. item_roots
+                item_roots::launch_unchecked(
+                    &client_scanners,
+                    CubeCount::new_single(),
+                    dim_256,
+                    dummy(0, 1),
+                    dummy(1, 1),
+                    dummy(2, 2),
+                    dummy(3, 1),
+                    dummy(4, 1),
+                );
 
-        // 10. spine_scan
-        spine_scan::launch_unchecked(
-            client,
-            CubeCount::new_single(),
-            dim_256,
-            dummy(0, PARTIAL_COUNT_STRIDE),
-            dummy(1, 1),
-            dummy(2, PARTIAL_COUNT_STRIDE),
-            dummy(3, 1),
-            threads_per_cube,
-            log,
-        );
-        flush_kernel("spine_scan");
+                // 6. cluster_mark
+                cluster_mark::launch_unchecked(
+                    &client_scanners,
+                    CubeCount::new_single(),
+                    dim_256,
+                    dummy(0, 1),
+                    dummy(1, 1),
+                    dummy(2, 1),
+                    dummy(3, 1),
+                    dummy(4, 1),
+                    dummy(5, 2),
+                    dummy(6, 1),
+                    dummy(7, 1),
+                    dummy(8, 1),
+                    1usize,
+                    1usize,
+                    0.0f32,
+                );
 
-        // 11. apply_and_emit (unified scan, position, extents, and direct slot/tint emission)
-        if is_derived != Some(true) {
-            apply_and_emit::launch_unchecked(
-                client,
-                CubeCount::Static(1, 1, 1),
-                dim_256,
-                dummy(0, 1),
-                dummy(1, 0),
-                dummy(2, 1),
-                dummy(3, 1),
-                dummy(4, 1),
-                8u32,
-                dummy(5, 1),
-                dummy(6, 1),
-                dummy(7, 1),
-                136.0f32,
-                dummy(8, ITEM_DESC_STRIDE),
-                dummy(9, PARTIAL_COUNT_STRIDE),
-                dummy(10, 1),
-                dummy(11, 2),
-                dummy(12, EXT_STRIDE),
-                dummy(13, 1),
-                dummy(14, 1),
-                dummy(15, 8),
-                dummy(16, 2),
-                false,
-                threads_per_cube,
-                bytes_per_thread,
-                log,
-            );
-            flush_kernel("apply_and_emit_instanced");
-        }
-        if is_derived != Some(false) {
-            apply_and_emit::launch_unchecked(
-                client,
-                CubeCount::Static(1, 1, 1),
-                dim_256,
-                dummy(0, 1),
-                dummy(1, 0),
-                dummy(2, 1),
-                dummy(3, 1),
-                dummy(4, 1),
-                8u32,
-                dummy(5, 1),
-                dummy(6, 1),
-                dummy(7, 1),
-                136.0f32,
-                dummy(8, ITEM_DESC_STRIDE),
-                dummy(9, PARTIAL_COUNT_STRIDE),
-                dummy(10, 1),
-                dummy(11, 2),
-                dummy(12, EXT_STRIDE),
-                dummy(13, 1),
-                dummy(14, 1),
-                dummy(15, 5),
-                dummy(16, 2),
-                true,
-                threads_per_cube,
-                bytes_per_thread,
-                log,
-            );
-            flush_kernel("apply_and_emit_derived");
-        }
+                // 7. tile_scan
+                tile_scan::launch_unchecked(
+                    &client_scanners,
+                    CubeCount::Static(1, 1, 1),
+                    dim_256,
+                    dummy(0, 0),
+                    dummy(1, 1),
+                    dummy(2, 1),
+                    dummy(3, 1),
+                    dummy(4, 1),
+                    8u32,
+                    0.0f32,
+                    dummy(5, ITEM_DESC_STRIDE),
+                    dummy(6, PARTIAL_COUNT_STRIDE),
+                    dummy(7, 1),
+                    threads_per_cube,
+                    bytes_per_thread,
+                    log,
+                );
 
-        log::info!(
-            "prewarm_pipelines completed in {:?}",
-            t_prewarm_start.elapsed()
-        );
-    }
+                // 8. spine_scan
+                spine_scan::launch_unchecked(
+                    &client_scanners,
+                    CubeCount::new_single(),
+                    dim_256,
+                    dummy(0, PARTIAL_COUNT_STRIDE),
+                    dummy(1, 1),
+                    dummy(2, PARTIAL_COUNT_STRIDE),
+                    dummy(3, 1),
+                    threads_per_cube,
+                    log,
+                );
+
+                let _ = client_scanners.flush();
+            }
+        });
+    });
+
+    log::info!(
+        "prewarm_pipelines completed in {:?}",
+        t_prewarm_start.elapsed()
+    );
 }
 

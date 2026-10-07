@@ -56,6 +56,21 @@ fn main() {
             tracing_subscriber::EnvFilter::new("glyph3d_native=info,wgpu=info,naga=warn")
         });
 
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let payload = if let Some(s) = info.payload().downcast_ref::<&str>() {
+            Some(*s)
+        } else {
+            info.payload().downcast_ref::<String>().map(|s| s.as_str())
+        };
+        if let Some(msg) = payload {
+            if msg.contains("Broken pipe") || msg.contains("os error 32") {
+                std::process::exit(0);
+            }
+        }
+        default_hook(info);
+    }));
+
     tracing_subscriber::fmt()
         .with_env_filter(env_filter)
         .with_writer(std::io::stderr)
@@ -191,7 +206,15 @@ fn main() {
                 std::process::exit(1);
             }
 
+            let prefetched_walk = if let SceneChoice::Repo { dir, .. } = &plan.choice {
+                let dir = dir.clone();
+                Some(std::thread::spawn(move || repo::walk_repo(&dir)))
+            } else {
+                None
+            };
+
             let ctx = pollster::block_on(gpu::init(None));
+            *ctx.prefetched_walk.lock().unwrap_or_else(|e| e.into_inner()) = prefetched_walk;
 
             #[cfg(feature = "cubecl")]
             if matches!(&plan.choice, SceneChoice::Repo { strategy: repo::Strategy::Cubecl, .. }) {
@@ -202,7 +225,7 @@ fn main() {
                     cubecl_chain::prewarm(&shared_dev, Some(is_derived));
                     log::info!("cubecl compute pipeline prewarm finished in {:?}", t.elapsed());
                 });
-                *ctx.prewarm_handle.lock().unwrap() = Some(handle);
+                *ctx.prewarm_handle.lock().unwrap_or_else(|e| e.into_inner()) = Some(handle);
             }
 
             match plan.target {

@@ -99,7 +99,7 @@ pub fn repo_check(ctx: &GpuContext, dir: &Path, color_mode: crate::repo::ColorMo
     let device = SharedDevice::from_ctx(ctx);
     let stream = run_repo_chain(
         Some(&device),
-        &bytes,
+        bytes,
         &fis,
         &inputs,
         true,

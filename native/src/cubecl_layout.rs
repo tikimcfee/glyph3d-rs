@@ -218,7 +218,7 @@ impl LayoutGlyphs for CubeclLayout {
         let marshal_dur = t_marshal.elapsed();
         let stream = crate::cubecl_chain::run_repo_chain(
             self.device.as_ref(),
-            &bytes,
+            bytes,
             &fis,
             &inputs,
             false,
@@ -273,7 +273,7 @@ impl VerifyLayout for CubeclLayout {
         let marshal_dur = t_marshal.elapsed();
         let stream = crate::cubecl_chain::run_repo_chain(
             self.device.as_ref(),
-            &bytes,
+            bytes,
             &fis,
             &inputs,
             true,

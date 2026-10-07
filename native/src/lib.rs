@@ -374,7 +374,7 @@ fn build_scene_impl(
                 });
                 #[cfg(feature = "cubecl")]
                 if *strategy == repo::Strategy::Cubecl {
-                    let mut guard = ctx.prewarm_handle.lock().unwrap();
+                    let mut guard = ctx.prewarm_handle.lock().unwrap_or_else(|e| e.into_inner());
                     if guard.is_none() {
                         let dev = shared_dev.clone();
                         let is_derived = params.field_mode == glyph_field::GlyphFieldMode::Derived;
@@ -385,7 +385,14 @@ fn build_scene_impl(
                         }));
                     }
                 }
-                let walk = repo::walk_repo(dir);
+                let walk = if let Some(h) = ctx.prefetched_walk.lock().unwrap_or_else(|e| e.into_inner()).take() {
+                    let t_wait = std::time::Instant::now();
+                    let res = h.join().unwrap_or_else(|_| repo::walk_repo(dir));
+                    log::info!("joined prefetched repo walk in {:?}", t_wait.elapsed());
+                    res
+                } else {
+                    repo::walk_repo(dir)
+                };
                 let arena = layout::GlyphArena::new();
                 let load = repo::load_repo_from_walk(
                     dir,

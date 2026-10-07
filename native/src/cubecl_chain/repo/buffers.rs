@@ -108,7 +108,7 @@ pub(crate) struct BufferAllocationResult {
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn allocate_chain_buffers(
     client: &Client,
-    bytes: &[u8],
+    bytes: Vec<u8>,
     item_count: usize,
     inputs: &ChainHostInputs<'_>,
     instance_inputs: &InstanceInputs,
@@ -136,14 +136,17 @@ pub(crate) fn allocate_chain_buffers(
     let trie_block_codepoints_len = trie_block_codepoints.len();
 
     let t_start = std::time::Instant::now();
-    let h_bytes = if bytes.len() >= n_words * 4 {
-        alloc_upload(&bytes[..n_words * 4])
-    } else {
-        let mut padded = Vec::with_capacity(n_words * 4);
-        padded.extend_from_slice(bytes);
-        padded.resize(n_words * 4, 0x80);
-        alloc_upload(&padded)
-    };
+    let mut bytes = bytes;
+    let target_len = n_words * 4;
+    if bytes.len() < target_len {
+        bytes.resize(target_len, 0x80);
+    } else if bytes.len() > target_len {
+        bytes.truncate(target_len);
+    }
+    let bytes_len = bytes.len();
+    live.set(live.get() + bytes_len as u64);
+    let bytes_data = cubecl_common::bytes::Bytes::from_bytes_vec(bytes);
+    let h_bytes = client.create(bytes_data);
     let t_bytes = t_start.elapsed();
     let h_trie_block_indices = alloc_upload(bytemuck::cast_slice(trie_block_indices));
     let h_trie_block_metrics = alloc_upload(bytemuck::cast_slice(trie_block_metrics));
