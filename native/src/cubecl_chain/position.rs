@@ -475,56 +475,90 @@ pub(super) fn apply_and_emit(
             }
             let reset = if has_items && id == start { 1i32 } else { 0i32 };
             let lane = id - range_start;
-            let flag = if lane < 4 {
-                (thread_flags_word0 >> ((lane * 8) as u32)) & 0xFF
-            } else {
-                (thread_flags_word1 >> (((lane - 4) * 8) as u32)) & 0xFF
-            };
-            let advance = if (flag & F_LEADER) != 0 {
-                if (flag & F_CLUSTER_HEAD) != 0 {
-                    bitmap_advance
-                } else if (flag & F_CLUSTER_TRAILER) != 0 {
-                    0.0f32
-                } else {
-                    let lead_byte = if lane < 4 {
-                        (thread_bytes_word0 >> ((lane * 8) as u32)) & 0xFF
-                    } else {
-                        (thread_bytes_word1 >> (((lane - 4) * 8) as u32)) & 0xFF
-                    };
-                    if lead_byte >= 32u32 && lead_byte <= 126u32 {
-                        f32::from_bits(active_cell_advance_bits)
-                    } else if lead_byte < 128u32 {
-                        let entry_offset = (ascii_block_base | lead_byte) as usize;
-                        trie_block_metrics[entry_offset * 2]
-                    } else {
-                        let cp_len = seq_len_at(bytes, id, total_bytes);
-                        let cp = cp_at(bytes, id, cp_len, total_bytes);
-                        let (adv, _) = decode_trie(cp, trie_block_indices, trie_block_metrics, trie_block_codepoints, trie_block_shift);
-                        adv
-                    }
-                }
-            } else {
-                0.0f32
-            };
-            thread_local_advances[local_byte_offset] = advance;
-            local_byte_offset += 1;
-            let is_surv = is_survivor(flag);
-            if (flag & F_NEWLINE) == 0 && (flag & F_LEADER) != 0 && advance.to_bits() == active_cell_advance_bits && reset == 0 {
-                accumulator.clean_len += 1;
-                accumulator.tail_len += 1;
-                accumulator.tail_adv += advance;
+            if lane == 0 && thread_flags_word0 == 0x2121_2121u32 && (range_start != start) && (range_start + 4 <= next_item_boundary) && (range_start + 4 <= total_bytes) {
+                let cell_advance = f32::from_bits(active_cell_advance_bits);
+                thread_local_advances[0] = cell_advance;
+                thread_local_advances[1] = cell_advance;
+                thread_local_advances[2] = cell_advance;
+                thread_local_advances[3] = cell_advance;
+                local_byte_offset += 4;
+                accumulator.clean_len += 4;
+                accumulator.tail_len += 4;
+                accumulator.tail_adv += cell_advance * 4.0f32;
                 if accumulator.nl == 0 {
                     accumulator.head_len = accumulator.tail_len;
                 }
-                accumulator.glyphs += 1;
-                if is_surv {
-                    accumulator.survivors += 1;
+                accumulator.glyphs += 4;
+                accumulator.survivors += 4;
+                id += 4;
+            } else if lane == 4 && thread_flags_word1 == 0x2121_2121u32 && (range_start + 4 != start) && (range_start + 8 <= next_item_boundary) && (range_start + 8 <= total_bytes) {
+                let cell_advance = f32::from_bits(active_cell_advance_bits);
+                thread_local_advances[4] = cell_advance;
+                thread_local_advances[5] = cell_advance;
+                thread_local_advances[6] = cell_advance;
+                thread_local_advances[7] = cell_advance;
+                local_byte_offset += 4;
+                accumulator.clean_len += 4;
+                accumulator.tail_len += 4;
+                accumulator.tail_adv += cell_advance * 4.0f32;
+                if accumulator.nl == 0 {
+                    accumulator.head_len = accumulator.tail_len;
                 }
+                accumulator.glyphs += 4;
+                accumulator.survivors += 4;
+                id += 4;
             } else {
-                let leaf = leaf_from_flag(flag, advance, active_wrap_width, active_wrap_mode, reset, active_cell_advance_bits);
-                combine(&mut accumulator, &leaf);
+                let flag = if lane < 4 {
+                    (thread_flags_word0 >> ((lane * 8) as u32)) & 0xFF
+                } else {
+                    (thread_flags_word1 >> (((lane - 4) * 8) as u32)) & 0xFF
+                };
+                let advance = if (flag & F_LEADER) != 0 {
+                    if (flag & F_CLUSTER_HEAD) != 0 {
+                        bitmap_advance
+                    } else if (flag & F_CLUSTER_TRAILER) != 0 {
+                        0.0f32
+                    } else {
+                        let lead_byte = if lane < 4 {
+                            (thread_bytes_word0 >> ((lane * 8) as u32)) & 0xFF
+                        } else {
+                            (thread_bytes_word1 >> (((lane - 4) * 8) as u32)) & 0xFF
+                        };
+                        if lead_byte >= 32u32 && lead_byte <= 126u32 {
+                            f32::from_bits(active_cell_advance_bits)
+                        } else if lead_byte < 128u32 {
+                            let entry_offset = (ascii_block_base | lead_byte) as usize;
+                            trie_block_metrics[entry_offset * 2]
+                        } else {
+                            let cp_len = seq_len_at(bytes, id, total_bytes);
+                            let cp = cp_at(bytes, id, cp_len, total_bytes);
+                            let (adv, _) = decode_trie(cp, trie_block_indices, trie_block_metrics, trie_block_codepoints, trie_block_shift);
+                            adv
+                        }
+                    }
+                } else {
+                    0.0f32
+                };
+                thread_local_advances[local_byte_offset] = advance;
+                local_byte_offset += 1;
+                let is_surv = is_survivor(flag);
+                if (flag & F_NEWLINE) == 0 && (flag & F_LEADER) != 0 && advance.to_bits() == active_cell_advance_bits && reset == 0 {
+                    accumulator.clean_len += 1;
+                    accumulator.tail_len += 1;
+                    accumulator.tail_adv += advance;
+                    if accumulator.nl == 0 {
+                        accumulator.head_len = accumulator.tail_len;
+                    }
+                    accumulator.glyphs += 1;
+                    if is_surv {
+                        accumulator.survivors += 1;
+                    }
+                } else {
+                    let leaf = leaf_from_flag(flag, advance, active_wrap_width, active_wrap_mode, reset, active_cell_advance_bits);
+                    combine(&mut accumulator, &leaf);
+                }
+                id += 1;
             }
-            id += 1;
         }
     } else {
         accumulator.wrap = active_wrap_width;
