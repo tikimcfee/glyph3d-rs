@@ -537,6 +537,7 @@ pub fn prewarm_pipelines_parallel(client_emitter: &Client, client_scanners: &Cli
                         log,
                     );
                 }
+                let _ = client_emitter.flush();
                 log::info!("prewarm: apply_and_emit compiled in {:?}", t_ae.elapsed());
             }
         });
@@ -687,6 +688,7 @@ pub fn prewarm_pipelines_parallel(client_emitter: &Client, client_scanners: &Cli
                         0.0f32,
                     );
                 }
+                let _ = client_scanners.flush();
             }
         });
     });
