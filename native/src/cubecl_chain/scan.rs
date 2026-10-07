@@ -124,18 +124,21 @@ pub(super) fn tile_scan(
             }
             let reset = if has_items && id == start { 1i32 } else { 0i32 };
             let lane = id - range_start;
-            if lane == 0 && thread_flags_word0 == 0x2121_2121u32 && (range_start != start) && (range_start + 4 <= next_item_boundary) && (range_start + 4 <= total_bytes) {
-                let cell_advance = f32::from_bits(active_cell_advance_bits);
-                accumulator.clean_len += 4;
-                accumulator.tail_len += 4;
-                accumulator.tail_adv += cell_advance * 4.0f32;
-                if accumulator.nl == 0 {
-                    accumulator.head_len = accumulator.tail_len;
-                }
-                accumulator.glyphs += 4;
-                accumulator.survivors += 4;
-                id += 4;
-            } else if lane == 4 && thread_flags_word1 == 0x2121_2121u32 && (range_start + 4 != start) && (range_start + 8 <= next_item_boundary) && (range_start + 8 <= total_bytes) {
+            let is_lane0_word_ascii = lane == 0
+                && thread_flags_word0 == 0x2121_2121u32
+                && (thread_bytes_word0 & 0x8080_8080u32) == 0u32
+                && (range_start != start)
+                && (range_start + 4 <= next_item_boundary)
+                && (range_start + 4 <= total_bytes);
+
+            let is_lane4_word_ascii = lane == 4
+                && thread_flags_word1 == 0x2121_2121u32
+                && (thread_bytes_word1 & 0x8080_8080u32) == 0u32
+                && (range_start + 4 != start)
+                && (range_start + 8 <= next_item_boundary)
+                && (range_start + 8 <= total_bytes);
+
+            if is_lane0_word_ascii || is_lane4_word_ascii {
                 let cell_advance = f32::from_bits(active_cell_advance_bits);
                 accumulator.clean_len += 4;
                 accumulator.tail_len += 4;

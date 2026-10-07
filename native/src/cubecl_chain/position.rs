@@ -475,7 +475,21 @@ pub(super) fn apply_and_emit(
             }
             let reset = if has_items && id == start { 1i32 } else { 0i32 };
             let lane = id - range_start;
-            if lane == 0 && thread_flags_word0 == 0x2121_2121u32 && (range_start != start) && (range_start + 4 <= next_item_boundary) && (range_start + 4 <= total_bytes) {
+            let is_lane0_word_ascii = lane == 0
+                && thread_flags_word0 == 0x2121_2121u32
+                && (thread_bytes_word0 & 0x8080_8080u32) == 0u32
+                && (range_start != start)
+                && (range_start + 4 <= next_item_boundary)
+                && (range_start + 4 <= total_bytes);
+
+            let is_lane4_word_ascii = lane == 4
+                && thread_flags_word1 == 0x2121_2121u32
+                && (thread_bytes_word1 & 0x8080_8080u32) == 0u32
+                && (range_start + 4 != start)
+                && (range_start + 8 <= next_item_boundary)
+                && (range_start + 8 <= total_bytes);
+
+            if is_lane0_word_ascii {
                 let cell_advance = f32::from_bits(active_cell_advance_bits);
                 thread_local_advances[0] = cell_advance;
                 thread_local_advances[1] = cell_advance;
@@ -491,7 +505,7 @@ pub(super) fn apply_and_emit(
                 accumulator.glyphs += 4;
                 accumulator.survivors += 4;
                 id += 4;
-            } else if lane == 4 && thread_flags_word1 == 0x2121_2121u32 && (range_start + 4 != start) && (range_start + 8 <= next_item_boundary) && (range_start + 8 <= total_bytes) {
+            } else if is_lane4_word_ascii {
                 let cell_advance = f32::from_bits(active_cell_advance_bits);
                 thread_local_advances[4] = cell_advance;
                 thread_local_advances[5] = cell_advance;
@@ -857,13 +871,372 @@ pub(super) fn apply_and_emit(
                 seen_survivor_on_line = false;
             }
             let lane = id - range_start;
-            let glyph_advance = thread_local_advances[lane];
-            let glyph_flags_val = if lane < 4 {
-                (thread_flags_word0 >> ((lane * 8) as u32)) & 0xFF
+            let col = run.tail_len;
+            let segment_column = if fold_unit > 0 { col % fold_unit } else { col };
+            let no_wrap_crossing = fold_unit == 0 || (segment_column + 4 <= fold_unit);
+            let no_page_crossing = page_cols == 0 || ((col / page_cols) == ((col + 3) / page_cols));
+
+            let is_lane0_word_ascii = lane == 0
+                && thread_flags_word0 == 0x2121_2121u32
+                && (thread_bytes_word0 & 0x8080_8080u32) == 0u32
+                && (range_start != start)
+                && (range_start + 4 <= next_item_boundary)
+                && (range_start + 4 <= total_bytes);
+
+            let is_lane4_word_ascii = lane == 4
+                && thread_flags_word1 == 0x2121_2121u32
+                && (thread_bytes_word1 & 0x8080_8080u32) == 0u32
+                && (range_start + 4 != start)
+                && (range_start + 8 <= next_item_boundary)
+                && (range_start + 8 <= total_bytes);
+
+            let can_take_word_fast_path = no_wrap_crossing
+                && no_page_crossing
+                && (is_lane0_word_ascii || is_lane4_word_ascii);
+
+            if can_take_word_fast_path {
+                let is_segment_head = segment_column == 0;
+                if is_segment_head {
+                    current_advance_x = 0.0f32;
+                    in_segment = true;
+                } else if !in_segment {
+                    let entry_is_clean = fold_unit > 0
+                        && segment_column > 0
+                        && run.clean_len >= segment_column
+                        && (segment_column as usize) < segment_entry_advances.len();
+                    if entry_is_clean {
+                        current_advance_x = segment_entry_advances[segment_column as usize];
+                    } else if fold_unit > 0 && segment_column > 0 {
+                        let mut backward_column = segment_column;
+                        let mut start_byte_index = id as i32 - 1;
+                        let tile_byte_start_i32 = tile_byte_start as i32;
+
+                        // Fast branch-free walk in on-chip SRAM while inside the current tile
+                        while backward_column >= 1 && start_byte_index >= tile_byte_start_i32 {
+                            let local_idx = start_byte_index as usize - tile_byte_start;
+                            let flag = (shared_tile_flags[local_idx >> 2] >> (((local_idx & 3) * 8) as u32)) & 0xFF;
+                            if (flag & F_LEADER) != 0 {
+                                backward_column -= 1;
+                            }
+                            if backward_column >= 1 {
+                                start_byte_index -= 1;
+                            }
+                        }
+
+                        // Rare fallback: only if the segment crossed before the tile boundary
+                        while backward_column >= 1 && start_byte_index >= 0 {
+                            if (flags_at(glyph_flags, start_byte_index as usize) & F_LEADER) != 0 {
+                                backward_column -= 1;
+                            }
+                            if backward_column >= 1 {
+                                start_byte_index -= 1;
+                            }
+                        }
+
+                        // Fast forward accumulation
+                        if start_byte_index >= tile_byte_start_i32 {
+                            let local_start = start_byte_index as usize - tile_byte_start;
+                            let local_end = id - tile_byte_start;
+                            let mut local_idx = local_start;
+                            while local_idx < local_end {
+                                let flag = (shared_tile_flags[local_idx >> 2] >> (((local_idx & 3) * 8) as u32)) & 0xFF;
+                                if (flag & F_LEADER) != 0 {
+                                    current_advance_x += f32::from_bits(shared_counts[local_idx] as u32);
+                                }
+                                local_idx += 1;
+                            }
+                        } else {
+                            let mut forward_index = if start_byte_index >= 0 { start_byte_index as usize } else { 0usize };
+                            while forward_index < id {
+                                if (flags_at(glyph_flags, forward_index) & F_LEADER) != 0 {
+                                    let flag = flags_at(glyph_flags, forward_index);
+                                    if (flag & F_CLUSTER_HEAD) != 0 {
+                                        current_advance_x += bitmap_advance;
+                                    } else if (flag & F_CLUSTER_TRAILER) != 0 {
+                                        // trailer contributes 0.0 advance
+                                    } else {
+                                        let lead_byte = byte_at(bytes, forward_index, total_bytes);
+                                        if lead_byte >= 32u32 && lead_byte <= 126u32 {
+                                            current_advance_x += f32::from_bits(active_cell_advance_bits);
+                                        } else if lead_byte < 128u32 {
+                                            let entry_offset = (ascii_block_base | lead_byte) as usize;
+                                            current_advance_x += trie_block_metrics[entry_offset * 2];
+                                        } else {
+                                            let cp_len = seq_len_at(bytes, forward_index, total_bytes);
+                                            let cp = cp_at(bytes, forward_index, cp_len, total_bytes);
+                                            let (adv, _) = decode_trie(cp, trie_block_indices, trie_block_metrics, trie_block_codepoints, trie_block_shift);
+                                            current_advance_x += adv;
+                                        }
+                                    }
+                                }
+                                forward_index += 1;
+                            }
+                        }
+                    } else if fold_unit == 0 {
+                        current_advance_x = run.tail_adv;
+                    }
+                    in_segment = true;
+                }
+
+                let mut closed = 0i32;
+                if run.nl > 0 {
+                    closed = rows_for(run.head_len, active_wrap_width, active_wrap_mode) + run.rows;
+                }
+                let wr = wrap_row_of(col, active_wrap_width, false, active_wrap_mode);
+                let row = closed + wr;
+                let wrap_segment = wrap_segment_of(col, active_wrap_width, false);
+
+                let x_page = if page_cols > 0 { col / page_cols } else { 0 };
+                let mut recompute_yz = false;
+                if (!emit_derived || track_extents) && (row != prev_row || wrap_segment != prev_wrap_segment || x_page != prev_x_page) {
+                    prev_row = row;
+                    prev_wrap_segment = wrap_segment;
+                    prev_x_page = x_page;
+                    recompute_yz = true;
+                    seen_survivor_on_line = false;
+
+                    let mut line_final_y = fma(-(row as f32), line_height, origin_y);
+                    let depth_steps = -(wrap_segment as f32);
+                    let z_tail_folded = fma(
+                        depth_steps,
+                        z_step_lo,
+                        origin_z,
+                    );
+                    let mut line_final_z = fma(depth_steps, z_step, z_tail_folded);
+
+                    if page_rows != 0 || page_cols != 0 || scroll_rows != 0 {
+                        let screen_row = row - scroll_rows;
+                        let mut y_page = 0;
+                        if page_rows > 0 && screen_row >= page_rows {
+                            y_page = screen_row / page_rows;
+                        }
+                        let band = y_page / pages_wide;
+                        let row_in_page = (screen_row - y_page * page_rows) as f32;
+                        let y_row_folded = fma(-row_in_page, line_height, origin_y);
+                        line_final_y = fma(-(band as f32), band_stride_y, y_row_folded);
+                        let z_stepped = fma(depth_steps, z_step, z_tail_folded);
+                        let z_banded = fma(band as f32, depth_per_band, z_stepped);
+                        line_final_z = fma(x_page as f32, depth_per_col, z_banded);
+                    }
+
+                    prev_final_y = line_final_y;
+                    prev_final_z = line_final_z;
+                    prev_y_lo = line_final_y - 0.5f32;
+                    prev_y_hi = line_final_y + 0.5f32;
+
+                    if track_extents {
+                        if line_final_y < page_y_min {
+                            page_y_min = line_final_y;
+                        }
+                        if line_final_z < page_z_min {
+                            page_z_min = line_final_z;
+                        }
+                        if line_final_z > page_z_max {
+                            page_z_max = line_final_z;
+                        }
+                    }
+                }
+
+                let cell_advance = f32::from_bits(active_cell_advance_bits);
+                let base_x0 = current_advance_x + origin_x;
+                current_advance_x += cell_advance;
+                let base_x1 = current_advance_x + origin_x;
+                current_advance_x += cell_advance;
+                let base_x2 = current_advance_x + origin_x;
+                current_advance_x += cell_advance;
+                let base_x3 = current_advance_x + origin_x;
+                current_advance_x += cell_advance;
+
+                let mut final_x0 = base_x0;
+                let mut final_x1 = base_x1;
+                let mut final_x2 = base_x2;
+                let mut final_x3 = base_x3;
+
+                if has_page_active {
+                    let screen_row = row - scroll_rows;
+                    let mut y_page = 0;
+                    if page_rows > 0 && screen_row >= page_rows {
+                        y_page = screen_row / page_rows;
+                    }
+                    let page_col = (y_page % pages_wide) as f32;
+                    let x_with_tail0 = fma(page_col, stride_reach_tail, base_x0);
+                    final_x0 = fma(page_col, stride_reach, x_with_tail0);
+                    let x_with_tail1 = fma(page_col, stride_reach_tail, base_x1);
+                    final_x1 = fma(page_col, stride_reach, x_with_tail1);
+                    let x_with_tail2 = fma(page_col, stride_reach_tail, base_x2);
+                    final_x2 = fma(page_col, stride_reach, x_with_tail2);
+                    let x_with_tail3 = fma(page_col, stride_reach_tail, base_x3);
+                    final_x3 = fma(page_col, stride_reach, x_with_tail3);
+                }
+
+                any_leader = true;
+                any_survivor = true;
+                if track_extents {
+                    let right3 = final_x3 + cell_advance;
+                    if right3 > page_right_max {
+                        page_right_max = right3;
+                    }
+                    if final_x0 < ink_x_min {
+                        ink_x_min = final_x0;
+                    }
+                    if right3 > ink_right_max {
+                        ink_right_max = right3;
+                    }
+                    if recompute_yz || !seen_survivor_on_line {
+                        seen_survivor_on_line = true;
+                        if prev_y_lo < ink_y_min {
+                            ink_y_min = prev_y_lo;
+                        }
+                        if prev_y_hi > ink_y_max {
+                            ink_y_max = prev_y_hi;
+                        }
+                        if prev_final_z < ink_z_min {
+                            ink_z_min = prev_final_z;
+                        }
+                        if prev_final_z > ink_z_max {
+                            ink_z_max = prev_final_z;
+                        }
+                    }
+                }
+
+                let record_ordinal = run.glyphs as u32;
+                let color0 = if item_is_per_record != 0u32 {
+                    per_record_semantic_colors[(item_color_base + record_ordinal) as usize]
+                } else {
+                    item_flat_color
+                };
+                let color1 = if item_is_per_record != 0u32 {
+                    per_record_semantic_colors[(item_color_base + record_ordinal + 1u32) as usize]
+                } else {
+                    item_flat_color
+                };
+                let color2 = if item_is_per_record != 0u32 {
+                    per_record_semantic_colors[(item_color_base + record_ordinal + 2u32) as usize]
+                } else {
+                    item_flat_color
+                };
+                let color3 = if item_is_per_record != 0u32 {
+                    per_record_semantic_colors[(item_color_base + record_ordinal + 3u32) as usize]
+                } else {
+                    item_flat_color
+                };
+
+                let bytes_word = if lane == 0 { thread_bytes_word0 } else { thread_bytes_word1 };
+                let b0 = bytes_word & 0xFF;
+                let b1 = (bytes_word >> 8u32) & 0xFF;
+                let b2 = (bytes_word >> 16u32) & 0xFF;
+                let b3 = (bytes_word >> 24u32) & 0xFF;
+                let glyph_id0 = shared_metrics[1 + (b0 as usize)].to_bits();
+                let glyph_id1 = shared_metrics[1 + (b1 as usize)].to_bits();
+                let glyph_id2 = shared_metrics[1 + (b2 as usize)].to_bits();
+                let glyph_id3 = shared_metrics[1 + (b3 as usize)].to_bits();
+
+                if emit_derived {
+                    let slot_word_offset = survivor_ordinal as usize * 5;
+                    if slot_word_offset + 20 <= instance_slots.len() {
+                        let glyph_and_wrap0 = glyph_id0 | ((wrap_segment as u32) << 16u32);
+                        instance_slots[slot_word_offset]      = final_x0.to_bits();
+                        instance_slots[slot_word_offset + 1]  = row as u32;
+                        instance_slots[slot_word_offset + 2]  = glyph_and_wrap0;
+                        instance_slots[slot_word_offset + 3]  = color0;
+                        instance_slots[slot_word_offset + 4]  = item_and_group_word;
+
+                        let glyph_and_wrap1 = glyph_id1 | ((wrap_segment as u32) << 16u32);
+                        instance_slots[slot_word_offset + 5]  = final_x1.to_bits();
+                        instance_slots[slot_word_offset + 6]  = row as u32;
+                        instance_slots[slot_word_offset + 7]  = glyph_and_wrap1;
+                        instance_slots[slot_word_offset + 8]  = color1;
+                        instance_slots[slot_word_offset + 9]  = item_and_group_word;
+
+                        let glyph_and_wrap2 = glyph_id2 | ((wrap_segment as u32) << 16u32);
+                        instance_slots[slot_word_offset + 10] = final_x2.to_bits();
+                        instance_slots[slot_word_offset + 11] = row as u32;
+                        instance_slots[slot_word_offset + 12] = glyph_and_wrap2;
+                        instance_slots[slot_word_offset + 13] = color2;
+                        instance_slots[slot_word_offset + 14] = item_and_group_word;
+
+                        let glyph_and_wrap3 = glyph_id3 | ((wrap_segment as u32) << 16u32);
+                        instance_slots[slot_word_offset + 15] = final_x3.to_bits();
+                        instance_slots[slot_word_offset + 16] = row as u32;
+                        instance_slots[slot_word_offset + 17] = glyph_and_wrap3;
+                        instance_slots[slot_word_offset + 18] = color3;
+                        instance_slots[slot_word_offset + 19] = item_and_group_word;
+                    }
+                } else {
+                    let slot_word_offset = survivor_ordinal as usize * 8;
+                    if slot_word_offset + 32 <= instance_slots.len() {
+                        let one_bits = 0x3f800000u32;
+                        let cell_bits = active_cell_advance_bits;
+                        let y_bits = prev_final_y.to_bits();
+                        let z_bits = prev_final_z.to_bits();
+
+                        instance_slots[slot_word_offset]      = final_x0.to_bits();
+                        instance_slots[slot_word_offset + 1]  = y_bits;
+                        instance_slots[slot_word_offset + 2]  = z_bits;
+                        instance_slots[slot_word_offset + 3]  = glyph_id0;
+                        instance_slots[slot_word_offset + 4]  = color0;
+                        instance_slots[slot_word_offset + 5]  = item_group_id;
+                        instance_slots[slot_word_offset + 6]  = cell_bits;
+                        instance_slots[slot_word_offset + 7]  = one_bits;
+
+                        instance_slots[slot_word_offset + 8]  = final_x1.to_bits();
+                        instance_slots[slot_word_offset + 9]  = y_bits;
+                        instance_slots[slot_word_offset + 10] = z_bits;
+                        instance_slots[slot_word_offset + 11] = glyph_id1;
+                        instance_slots[slot_word_offset + 12] = color1;
+                        instance_slots[slot_word_offset + 13] = item_group_id;
+                        instance_slots[slot_word_offset + 14] = cell_bits;
+                        instance_slots[slot_word_offset + 15] = one_bits;
+
+                        instance_slots[slot_word_offset + 16] = final_x2.to_bits();
+                        instance_slots[slot_word_offset + 17] = y_bits;
+                        instance_slots[slot_word_offset + 18] = z_bits;
+                        instance_slots[slot_word_offset + 19] = glyph_id2;
+                        instance_slots[slot_word_offset + 20] = color2;
+                        instance_slots[slot_word_offset + 21] = item_group_id;
+                        instance_slots[slot_word_offset + 22] = cell_bits;
+                        instance_slots[slot_word_offset + 23] = one_bits;
+
+                        instance_slots[slot_word_offset + 24] = final_x3.to_bits();
+                        instance_slots[slot_word_offset + 25] = y_bits;
+                        instance_slots[slot_word_offset + 26] = z_bits;
+                        instance_slots[slot_word_offset + 27] = glyph_id3;
+                        instance_slots[slot_word_offset + 28] = color3;
+                        instance_slots[slot_word_offset + 29] = item_group_id;
+                        instance_slots[slot_word_offset + 30] = cell_bits;
+                        instance_slots[slot_word_offset + 31] = one_bits;
+                    }
+                    let tint_word_offset = survivor_ordinal as usize * 2;
+                    if tint_word_offset + 8 <= instance_tints.len() {
+                        instance_tints[tint_word_offset]     = glyph_id0;
+                        instance_tints[tint_word_offset + 1] = color0;
+                        instance_tints[tint_word_offset + 2] = glyph_id1;
+                        instance_tints[tint_word_offset + 3] = color1;
+                        instance_tints[tint_word_offset + 4] = glyph_id2;
+                        instance_tints[tint_word_offset + 5] = color2;
+                        instance_tints[tint_word_offset + 6] = glyph_id3;
+                        instance_tints[tint_word_offset + 7] = color3;
+                    }
+                }
+
+                survivor_ordinal += 4u32;
+                run.clean_len += 4;
+                run.tail_len += 4;
+                run.tail_adv += cell_advance * 4.0f32;
+                if run.nl == 0 {
+                    run.head_len = run.tail_len;
+                }
+                run.glyphs += 4;
+                run.survivors += 4;
+                id += 4;
             } else {
-                (thread_flags_word1 >> (((lane - 4) * 8) as u32)) & 0xFF
-            };
-            if (glyph_flags_val & F_LEADER) != 0 {
+                let glyph_advance = thread_local_advances[lane];
+                let glyph_flags_val = if lane < 4 {
+                    (thread_flags_word0 >> ((lane * 8) as u32)) & 0xFF
+                } else {
+                    (thread_flags_word1 >> (((lane - 4) * 8) as u32)) & 0xFF
+                };
+                if (glyph_flags_val & F_LEADER) != 0 {
                 let col = run.tail_len;
                 let mut closed = 0i32;
                 if run.nl > 0 {
@@ -1151,6 +1524,7 @@ pub(super) fn apply_and_emit(
                 combine(&mut run, &leaf);
             }
             id += 1;
+            }
         }
 
         if track_extents && any_leader {
