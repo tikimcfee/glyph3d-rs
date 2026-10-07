@@ -108,8 +108,26 @@ pub(super) fn tile_scan(
     }
     let mut accumulator = identity();
     if range_start < total_bytes {
-        let mut id = range_start;
-        while id < range_end {
+        let is_all_8_ascii = thread_flags_word0 == 0x2121_2121u32
+            && thread_flags_word1 == 0x2121_2121u32
+            && ((thread_bytes_word0 | thread_bytes_word1) & 0x8080_8080u32) == 0u32
+            && range_start != start
+            && (range_start + 8 <= next_item_boundary)
+            && (range_start + 8 <= total_bytes);
+
+        if is_all_8_ascii {
+            let cell_advance = f32::from_bits(active_cell_advance_bits);
+            accumulator.clean_len = 8;
+            accumulator.tail_len = 8;
+            accumulator.tail_adv = cell_advance * 8.0f32;
+            accumulator.head_len = 8;
+            accumulator.glyphs = 8;
+            accumulator.survivors = 8;
+            accumulator.wrap = active_wrap_width;
+            accumulator.mode = active_wrap_mode;
+        } else {
+            let mut id = range_start;
+            while id < range_end {
             while has_items && next_item_boundary <= id {
                 item_index += 1;
                 start = item_descriptors[item_index * ITEM_DESC_STRIDE + ITEM_DESC_BYTE_START] as usize;
@@ -199,6 +217,7 @@ pub(super) fn tile_scan(
                 }
                 id += 1;
             }
+        }
         }
     } else {
         accumulator.wrap = active_wrap_width;

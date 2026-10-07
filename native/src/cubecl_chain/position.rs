@@ -459,8 +459,35 @@ pub(super) fn apply_and_emit(
     let mut thread_local_advances = Array::<f32>::new(bytes_per_thread);
     let mut local_byte_offset = 0usize;
     if range_start < total_bytes {
-        let mut id = range_start;
-        while id < range_end {
+        let is_all_8_ascii = thread_flags_word0 == 0x2121_2121u32
+            && thread_flags_word1 == 0x2121_2121u32
+            && ((thread_bytes_word0 | thread_bytes_word1) & 0x8080_8080u32) == 0u32
+            && range_start != start
+            && (range_start + 8 <= next_item_boundary)
+            && (range_start + 8 <= total_bytes);
+
+        if is_all_8_ascii {
+            let cell_advance = f32::from_bits(active_cell_advance_bits);
+            thread_local_advances[0] = cell_advance;
+            thread_local_advances[1] = cell_advance;
+            thread_local_advances[2] = cell_advance;
+            thread_local_advances[3] = cell_advance;
+            thread_local_advances[4] = cell_advance;
+            thread_local_advances[5] = cell_advance;
+            thread_local_advances[6] = cell_advance;
+            thread_local_advances[7] = cell_advance;
+            local_byte_offset = 8;
+            accumulator.clean_len = 8;
+            accumulator.tail_len = 8;
+            accumulator.tail_adv = cell_advance * 8.0f32;
+            accumulator.head_len = 8;
+            accumulator.glyphs = 8;
+            accumulator.survivors = 8;
+            accumulator.wrap = active_wrap_width;
+            accumulator.mode = active_wrap_mode;
+        } else {
+            let mut id = range_start;
+            while id < range_end {
             while has_items && next_item_boundary <= id {
                 item_index += 1;
                 start = item_descriptors[item_index * ITEM_DESC_STRIDE + ITEM_DESC_BYTE_START] as usize;
@@ -573,6 +600,7 @@ pub(super) fn apply_and_emit(
                 }
                 id += 1;
             }
+        }
         }
     } else {
         accumulator.wrap = active_wrap_width;
