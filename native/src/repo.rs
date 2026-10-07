@@ -318,20 +318,11 @@ pub struct FileView {
     /// Render-arena range (instances; blanks/missing are dropped from it).
     pub slot_base: usize,
     pub slot_count: usize,
-    /// Page size in world units (before the group offset).
+    pub ink: crate::layout::InkExtent,
+    /// Exact ink size in world units (derived from `ink.max - ink.min`).
     pub width: f32,
     pub height: f32,
-    /// Depth extent of the laid-out page, before the group offset.
-    ///
-    /// From `page`, not `ink`. In Z the two measure the same thing — a glyph
-    /// quad has no thickness, so depth is a point per record — and page runs
-    /// over ALL records while ink runs over survivors, making page a superset.
-    /// A box containing everything drawn only costs a draw; one that does not
-    /// can drop something visible.
-    ///
-    /// This does NOT generalise to Y: `page.bottom` tracks baselines and ink
-    /// hangs half a glyph-height below them, which is why the xy below carries
-    /// hand-tuned margins instead of using the page directly.
+    /// Depth extent of the ink.
     pub z_min: f32,
     pub z_max: f32,
     /// Group offset assigned by the grid layout.
@@ -801,6 +792,13 @@ pub fn load_repo_from_prefetched(
         let placed = &placements[index];
         total_records += placed.record_count as usize;
         total_blanks += (placed.record_count - placed.slot_count) as usize;
+        let mut ink = placed.ink;
+        if placed.slot_count == 0 || ink.min[0] > ink.max[0] {
+            ink = crate::layout::InkExtent { min: [0.0; 3], max: [0.0; 3] };
+        }
+        let width = (ink.max[0] - ink.min[0]).max(0.0);
+        let height = (ink.max[1] - ink.min[1]).max(0.0);
+
         views.push(FileView {
             rel_path: f.rel_path.clone(),
             dir: f.dir.clone(),
@@ -808,10 +806,11 @@ pub fn load_repo_from_prefetched(
             record_count: placed.record_count as usize,
             slot_base: placed.slot_base as usize,
             slot_count: placed.slot_count as usize,
-            width: placed.page.right,
-            height: -placed.page.bottom + params.line_height as f32,
-            z_min: placed.page.z_min,
-            z_max: placed.page.z_max,
+            ink,
+            width,
+            height,
+            z_min: ink.min[2],
+            z_max: ink.max[2],
             offset: [0.0; 3],
             item: file_params[index],
         });
@@ -992,14 +991,14 @@ impl RepoLoad {
             };
             crate::glyph_scene::SegCull {
                 min: [
-                    v.offset[0] - crate::glyph_scene::SEG_CULL_PAD_MIN[0],
-                    v.offset[1] - v.height - crate::glyph_scene::SEG_CULL_PAD_MIN[1],
-                    v.offset[2] + v.z_min,
+                    v.offset[0] + v.ink.min[0] - crate::glyph_scene::SEG_CULL_PAD_MIN[0],
+                    v.offset[1] + v.ink.min[1] - crate::glyph_scene::SEG_CULL_PAD_MIN[1],
+                    v.offset[2] + v.ink.min[2],
                 ],
                 max: [
-                    v.offset[0] + v.width + crate::glyph_scene::SEG_CULL_PAD_MAX[0],
-                    v.offset[1] + crate::glyph_scene::SEG_CULL_PAD_MAX[1],
-                    v.offset[2] + v.z_max,
+                    v.offset[0] + v.ink.max[0] + crate::glyph_scene::SEG_CULL_PAD_MAX[0],
+                    v.offset[1] + v.ink.max[1] + crate::glyph_scene::SEG_CULL_PAD_MAX[1],
+                    v.offset[2] + v.ink.max[2],
                 ],
                 slot_base: v.slot_base as u32,
                 slot_count: v.slot_count as u32,
@@ -1028,25 +1027,27 @@ impl RepoLoad {
                 slot_count: v.slot_count as u32,
                 item: v.item,
                 aabb_min: [
-                    -crate::glyph_scene::SEG_CULL_PAD_MIN[0],
-                    -v.height - crate::glyph_scene::SEG_CULL_PAD_MIN[1],
-                    v.z_min - crate::glyph_scene::PICK_AABB_PAD_Z,
+                    v.ink.min[0] - crate::glyph_scene::SEG_CULL_PAD_MIN[0],
+                    v.ink.min[1] - crate::glyph_scene::SEG_CULL_PAD_MIN[1],
+                    v.ink.min[2] - crate::glyph_scene::PICK_AABB_PAD_Z,
                 ],
                 aabb_max: [
-                    v.width + crate::glyph_scene::SEG_CULL_PAD_MAX[0],
-                    crate::glyph_scene::SEG_CULL_PAD_MAX[1],
-                    v.z_max + crate::glyph_scene::PICK_AABB_PAD_Z,
+                    v.ink.max[0] + crate::glyph_scene::SEG_CULL_PAD_MAX[0],
+                    v.ink.max[1] + crate::glyph_scene::SEG_CULL_PAD_MAX[1],
+                    v.ink.max[2] + crate::glyph_scene::PICK_AABB_PAD_Z,
                 ],
             })
             .collect();
         let mut focus_bounds = None;
         if let Some(needle) = focus {
             if let Some(v) = self.files.iter().find(|v| v.rel_path.contains(needle)) {
-                let cx = v.offset[0] + v.width * 0.5;
-                let cy = v.offset[1] - v.height * 0.5;
+                let cx = v.offset[0] + (v.ink.min[0] + v.ink.max[0]) * 0.5;
+                let cy = v.offset[1] + (v.ink.min[1] + v.ink.max[1]) * 0.5;
+                let hw = (v.ink.max[0] - v.ink.min[0]).max(1.0) * 0.5;
+                let hh = (v.ink.max[1] - v.ink.min[1]).max(1.0) * 0.5;
                 focus_bounds = Some((
                     [cx, cy],
-                    [v.width.max(1.0) * 0.5, v.height.max(1.0) * 0.5],
+                    [hw, hh],
                 ));
                 log::info!(
                     "focus: {} ({}x{} records, page {:.3}x{:.3} world units)",

@@ -117,6 +117,7 @@ pub(crate) fn layout_shelf(
         v.offset = *off;
         min_z = min_z.min(v.offset[2] + v.z_min);
         max_z = max_z.max(v.offset[2] + v.z_max);
+        
         groups.push(GroupRow::tinted(v.offset, dir_tint(&v.dir)));
     }
     log::info!(

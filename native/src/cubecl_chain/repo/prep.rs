@@ -443,6 +443,28 @@ fn closed_form_placement(
     let page_z_min = (p.origin_z - max_wrap_segment as f64 * p.z_step + band as f64 * p.depth_per_band) as f32;
     let page_z_max = (p.origin_z + band as f64 * p.depth_per_band) as f32;
 
+    let cell_height = crate::text::fu_to_world(em_height_fu as i32, em_height_fu);
+    let half_height = cell_height * 0.5;
+    let ink = if pre.survivor_count == 0 {
+        crate::layout::InkExtent {
+            min: [f32::INFINITY; 3],
+            max: [f32::NEG_INFINITY; 3],
+        }
+    } else {
+        crate::layout::InkExtent {
+            min: [
+                p.origin_x as f32,
+                page_bottom - half_height,
+                page_z_min,
+            ],
+            max: [
+                page_right,
+                p.origin_y as f32 + half_height,
+                page_z_max,
+            ],
+        }
+    };
+
     crate::layout::ItemPlacement {
         slot_base,
         slot_count: pre.survivor_count,
@@ -453,10 +475,7 @@ fn closed_form_placement(
             z_min: page_z_min,
             z_max: page_z_max,
         },
-        ink: crate::layout::InkExtent {
-            min: [0.0; 3],
-            max: [0.0; 3],
-        },
+        ink,
     }
 }
 
