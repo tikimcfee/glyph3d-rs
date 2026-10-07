@@ -27,3 +27,22 @@ Agents MUST follow these rules when developing in this codebase.
 ## 6. Style
 - **Format**: Do not mass-reformat existing code with `cargo fmt`. Match the local style of the file you're editing.
 - **Comments**: Comments must explain WHY (empirical findings, bug history, invariants), not what the code does. Add stage tags (e.g. `// Stage M: ...`) for historical context if introducing major architectural changes.
+
+## 7. Descriptive Naming over Terse Density
+- **No Cryptic Abbreviations**: Low-level systems and GPU programming is not an excuse for variable density. Use clear, self-documenting full names:
+  - `glyph_advance_widths` instead of `sm` or `adv`
+  - `glyph_indices` instead of `gi`
+  - `glyph_flags` instead of `fl`
+  - `threads_per_cube` instead of `units`
+  - `bytes_per_thread` instead of `rake`
+  - `survivor_ordinal` instead of `sv_`
+  - `active_cell_advance_bits` instead of `cell_bits`
+- **Readability Across Agents & Humans**: Code is read far more often than it is written. Eliminating acronym mapping eliminates bugs.
+
+## 8. GPU Float Determinism & Kernel Safety
+- **Strict Float Addition Order**: Floating-point addition is non-associative: `(a + b) + c != a + (b + c)`. All GPU compute kernels that sum layout coordinates or advances MUST accumulate in strict left-to-right order from the segment head to maintain bit-exact parity with CPU reference folds.
+- **Bounded Kernel Loops & Hang Prevention**: Because GPU tiles have fixed threadgroup dimensions (e.g. 2048 bytes) while corpora end at arbitrary byte offsets, all backward and forward walks across shared or global memory MUST be strictly bounded (`global_byte_index < total_bytes`, `start_byte_index >= 0`). Never cast negative loop indices to `usize`.
+- **Surgical Edits**: Never use blind regex or bulk search-and-replace scripts across Rust source files; always use AST-aware tool edits (`replace_file_content`) and run `cargo check --workspace` after every edit.
+
+## 9. Feature Flags & Binary Defaults
+- Keep primary layout and render engines (e.g. `cubecl`) in the `default` features of `native/Cargo.toml` so that standard `cargo run`, `cargo test`, and `glyph tui` invocations work out-of-the-box without requiring manual feature flags.
