@@ -192,6 +192,7 @@ impl Cli {
                     max_file_stacks: 20,
                     active_beat: None,
                 },
+                cached_session: std::sync::Arc::new(std::sync::RwLock::new(None)),
             }
         } else if let Some(dir) = &self.load_repo {
             SceneChoice::Repo {

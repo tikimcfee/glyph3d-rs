@@ -20,6 +20,14 @@ pub struct RevisionEngine {
     disk_resolver: Option<DiskResolver>,
 }
 
+impl std::fmt::Debug for RevisionEngine {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RevisionEngine")
+            .field("histories_count", &self.histories.len())
+            .finish()
+    }
+}
+
 impl Default for RevisionEngine {
     fn default() -> Self {
         Self::new()

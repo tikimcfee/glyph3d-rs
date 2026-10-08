@@ -713,8 +713,8 @@ fn test_agent_carrel_page_aware_continuous_navigation() {
     assert_eq!(comp.slot_to_beat, vec![23, 22, 21, 20]);
     assert_eq!(comp.active_beat, 23);
 
-    // Verify all 24 cards were spawned into ECS
-    assert_eq!(comp.all_card_entities.len(), 24);
+    // Verify only the active sliding window of cards (4) was spawned into ECS
+    assert_eq!(comp.card_entities.len(), limit);
 
     // Simulate backward navigation through all beats: 23 -> 0 in O(1) without rebuilding
     let mut visited_slots = Vec::new();

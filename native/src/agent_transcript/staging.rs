@@ -10,7 +10,7 @@ use crate::layout_stack::LayoutController;
 use crate::repo::{RepoLayoutMode, RepoParams};
 use crate::revision::{FileRevision, RevisionEngine};
 use crate::spatial_scene::GlyphGroupBinding;
-use crate::text::{cover_segment, pack_rgba8, StagedText, CELL_HEIGHT_WORLD, LINE_HEIGHT_FACTOR};
+use crate::text::{pack_rgba8, StagedText, CELL_HEIGHT_WORLD, LINE_HEIGHT_FACTOR};
 
 /// Wrap prose into lines with a maximum column width, breaking at spaces when possible.
 /// Uses character counts and Unicode scalar boundaries rather than byte slicing to avoid panics.
@@ -1003,7 +1003,7 @@ fn format_revision_card_body(rev: &FileRevision) -> Vec<(String, [u8; 3])> {
 /// Stage an Agent Session and its Workdesk into a visual 3D scene with custom layout options.
 pub fn stage_agent_session_with_options(
     atlas: Option<&Atlas>,
-    slot_ink: &[Option<[f32; 4]>],
+    _slot_ink: &[Option<[f32; 4]>],
     session: AgentSession,
     revision_engine: RevisionEngine,
     layout_options: crate::spatial_scene::CarrelLayoutOptions,
@@ -1049,6 +1049,48 @@ pub fn stage_agent_session_with_options(
     let line_h = CELL_HEIGHT_WORLD * LINE_HEIGHT_FACTOR;
 
     let mut next_gid = 1u32;
+
+    #[derive(Clone, Copy)]
+    struct GroupInfo {
+        slot_base: u32,
+        slot_count: u32,
+        local_min: [f32; 3],
+        local_max: [f32; 3],
+    }
+
+    let mut group_info: Vec<Option<GroupInfo>> = Vec::new();
+    let record_group = |gid: u32, instances: &[GlyphInstance], base: u32, info: &mut Vec<Option<GroupInfo>>| {
+        let count = (instances.len() as u32).saturating_sub(base);
+        let (min, max) = if count > 0 {
+            let mut min_x = f32::INFINITY;
+            let mut min_y = f32::INFINITY;
+            let mut min_z = f32::INFINITY;
+            let mut max_x = f32::NEG_INFINITY;
+            let mut max_y = f32::NEG_INFINITY;
+            let mut max_z = f32::NEG_INFINITY;
+            for inst in &instances[base as usize..] {
+                min_x = min_x.min(inst.pos[0]);
+                min_y = min_y.min(inst.pos[1] - inst.height);
+                min_z = min_z.min(inst.pos[2]);
+                max_x = max_x.max(inst.pos[0] + inst.advance);
+                max_y = max_y.max(inst.pos[1]);
+                max_z = max_z.max(inst.pos[2]);
+            }
+            ([min_x, min_y, min_z], [max_x, max_y, max_z])
+        } else {
+            ([0.0, 0.0, 0.0], [0.0, 0.0, 0.0])
+        };
+        let idx = gid as usize;
+        if idx >= info.len() {
+            info.resize_with(idx + 1, || None);
+        }
+        info[idx] = Some(GroupInfo {
+            slot_base: base,
+            slot_count: count,
+            local_min: min,
+            local_max: max,
+        });
+    };
 
     // 1. Turn Deck Turn Cards: Left (Mind) and Right (Impact) Pages
     let mut turn_query = controller
@@ -1115,6 +1157,7 @@ pub fn stage_agent_session_with_options(
                 },
             ));
 
+            let base_lh = raw_instances.len() as u32;
             if let Some(atlas) = atlas {
                 layout_colored_lines(
                     atlas,
@@ -1126,6 +1169,11 @@ pub fn stage_agent_session_with_options(
                     &mut raw_instances,
                     &mut codepoints_decoded,
                 );
+            }
+            record_group(left_hdr_gid, &raw_instances, base_lh, &mut group_info);
+
+            let base_lb = raw_instances.len() as u32;
+            if let Some(atlas) = atlas {
                 layout_colored_lines(
                     atlas,
                     &left_body,
@@ -1137,6 +1185,7 @@ pub fn stage_agent_session_with_options(
                     &mut codepoints_decoded,
                 );
             }
+            record_group(left_body_gid, &raw_instances, base_lb, &mut group_info);
 
             // Right Page
             let unscaled_h = (right_body.len() as f32 * line_h).max(1.0);
@@ -1172,6 +1221,7 @@ pub fn stage_agent_session_with_options(
                 },
             ));
 
+            let base_rh = raw_instances.len() as u32;
             if let Some(atlas) = atlas {
                 layout_colored_lines(
                     atlas,
@@ -1183,6 +1233,11 @@ pub fn stage_agent_session_with_options(
                     &mut raw_instances,
                     &mut codepoints_decoded,
                 );
+            }
+            record_group(right_hdr_gid, &raw_instances, base_rh, &mut group_info);
+
+            let base_rb = raw_instances.len() as u32;
+            if let Some(atlas) = atlas {
                 layout_colored_lines(
                     atlas,
                     &right_body,
@@ -1194,6 +1249,7 @@ pub fn stage_agent_session_with_options(
                     &mut codepoints_decoded,
                 );
             }
+            record_group(right_body_gid, &raw_instances, base_rb, &mut group_info);
         }
 
 
@@ -1247,6 +1303,7 @@ pub fn stage_agent_session_with_options(
                     },
                 ));
 
+                let base_h = raw_instances.len() as u32;
                 if let Some(atlas) = atlas {
                     layout_colored_lines(
                         atlas,
@@ -1258,6 +1315,11 @@ pub fn stage_agent_session_with_options(
                         &mut raw_instances,
                         &mut codepoints_decoded,
                     );
+                }
+                record_group(header_gid, &raw_instances, base_h, &mut group_info);
+
+                let base_b = raw_instances.len() as u32;
+                if let Some(atlas) = atlas {
                     layout_colored_lines(
                         atlas,
                         &body_lines,
@@ -1269,11 +1331,12 @@ pub fn stage_agent_session_with_options(
                         &mut codepoints_decoded,
                     );
                 }
+                record_group(body_gid, &raw_instances, base_b, &mut group_info);
             }
         }
     }
 
-    // 3. Workdesk Stack Title Labels (queried directly from ECS)
+    // 3. Workdesk Stack Title Labels (queried directly from ECS into Group 0)
     let mut stack_query = controller.scene.world.query::<(
         &crate::spatial_scene::FileRevisionStack,
         &bevy_transform::prelude::GlobalTransform,
@@ -1283,6 +1346,7 @@ pub fn stage_agent_session_with_options(
         .map(|(s, g)| (s.clone(), g.translation()))
         .collect();
 
+    let base_labels = raw_instances.len() as u32;
     if let Some(atlas) = atlas {
         for (stack, trans) in stacks {
             let rev_count = revision_engine
@@ -1303,24 +1367,12 @@ pub fn stage_agent_session_with_options(
             );
         }
     }
+    record_group(0, &raw_instances, base_labels, &mut group_info);
 
     // Update global transforms for all child glyph fields
     controller.scene.update_transforms();
 
     let glyphs_emitted = raw_instances.len();
-    let mut cover = cover_segment(
-        &raw_instances,
-        bounds_min,
-        bounds_max,
-        slot_ink,
-    );
-    // In agent carrel mode, glyph instances belong to dynamic ECS groups whose
-    // world positions are transformed on the GPU via group rows. Sub-block culling
-    // on untransformed local coordinates would falsely reject cards translated away
-    // from the origin. Clearing blocks keeps segment-level culling over the full carrel.
-    cover.blocks.clear();
-    let segments = vec![cover];
-    let instances = GlyphArena::from_vec(raw_instances);
 
     // Synchronize all ECS groups into the GPU group buffer
     let max_gid = controller
@@ -1334,6 +1386,51 @@ pub fn stage_agent_session_with_options(
     let total_groups = (max_gid + 1) as usize;
     let mut groups = vec![GroupRow::identity([0.0, 0.0, 0.0]); total_groups.max(1)];
     controller.scene.sync_all_to_group_rows(&mut groups);
+
+    // Build per-group SegCull segments so frustum culling actively culls off-screen cards
+    let mut segments = Vec::with_capacity(total_groups);
+    for (gid, g) in groups.iter().enumerate().take(total_groups) {
+        let off = [g.cols[0][0], g.cols[0][1], g.cols[0][2]];
+        let sc = [
+            if g.cols[3][0].abs() > 1e-6 { g.cols[3][0] } else { 1.0 },
+            if g.cols[3][1].abs() > 1e-6 { g.cols[3][1] } else { 1.0 },
+            if g.cols[3][2].abs() > 1e-6 { g.cols[3][2] } else { 1.0 },
+        ];
+        if let Some(Some(data)) = group_info.get(gid) {
+            if data.slot_count > 0 {
+                let w_min = [
+                    data.local_min[0] * sc[0] + off[0] - crate::glyph_scene::SEG_CULL_PAD_MIN[0],
+                    data.local_min[1] * sc[1] + off[1] - crate::glyph_scene::SEG_CULL_PAD_MIN[1],
+                    data.local_min[2] * sc[2] + off[2] - 0.2,
+                ];
+                let w_max = [
+                    data.local_max[0] * sc[0] + off[0] + crate::glyph_scene::SEG_CULL_PAD_MAX[0],
+                    data.local_max[1] * sc[1] + off[1] + crate::glyph_scene::SEG_CULL_PAD_MAX[1],
+                    data.local_max[2] * sc[2] + off[2] + 0.2,
+                ];
+                let tint = [g.cols[2][0], g.cols[2][1], g.cols[2][2], 0.7];
+                segments.push(crate::glyph_scene::SegCull {
+                    min: w_min,
+                    max: w_max,
+                    slot_base: data.slot_base,
+                    slot_count: data.slot_count,
+                    tint,
+                    blocks: Vec::new(),
+                });
+                continue;
+            }
+        }
+        segments.push(crate::glyph_scene::SegCull {
+            min: off,
+            max: off,
+            slot_base: 0,
+            slot_count: 0,
+            tint: [0.0; 4],
+            blocks: Vec::new(),
+        });
+    }
+
+    let instances = GlyphArena::from_vec(raw_instances);
 
     StagedText {
         instances,

@@ -59,6 +59,7 @@ pub(super) fn apply_relayout(
             session_path: session_path.clone(),
             emoji_sheet,
             layout_options: crate::spatial_scene::CarrelLayoutOptions::default(),
+            cached_session: std::sync::Arc::new(std::sync::RwLock::new(None)),
         };
         changed = true;
         note += &format!("switch_agent_session -> {} ", session_path.display());
@@ -505,8 +506,16 @@ impl App<'_> {
                 // pending_relayout on slider release / toggle click during
                 // previous render or keypress; rebuild before render if pending.
                 #[cfg(feature = "egui-ui")]
-                if let Some(req) = state.pending_relayout.take() {
-                    apply_relayout(&self.ctx, &mut self.choice, &mut self.cull_opts, self.ui, state, req);
+                {
+                    if let Some(opts) = state.scene.take_pending_carrel_options() {
+                        state.pending_relayout = Some(RelayoutRequest {
+                            carrel_options: Some(opts),
+                            ..Default::default()
+                        });
+                    }
+                    if let Some(req) = state.pending_relayout.take() {
+                        apply_relayout(&self.ctx, &mut self.choice, &mut self.cull_opts, self.ui, state, req);
+                    }
                 }
                 state.render(&self.ctx);
                 if let Some(max_frames) = self.frames {
@@ -516,9 +525,17 @@ impl App<'_> {
                     }
                 }
                 #[cfg(feature = "egui-ui")]
-                if let Some(req) = state.pending_relayout.take() {
-                    apply_relayout(&self.ctx, &mut self.choice, &mut self.cull_opts, self.ui, state, req);
-                    state.window.request_redraw();
+                {
+                    if let Some(opts) = state.scene.take_pending_carrel_options() {
+                        state.pending_relayout = Some(RelayoutRequest {
+                            carrel_options: Some(opts),
+                            ..Default::default()
+                        });
+                    }
+                    if let Some(req) = state.pending_relayout.take() {
+                        apply_relayout(&self.ctx, &mut self.choice, &mut self.cull_opts, self.ui, state, req);
+                        state.window.request_redraw();
+                    }
                 }
                 if self.live.is_some() {
                     #[cfg(feature = "egui-ui")]

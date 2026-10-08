@@ -88,6 +88,11 @@ pub trait SceneLike {
     /// Stage G debug: read back instance bytes at a global slot (partial-
     /// upload verification). Default no-op.
     fn debug_dump_instances(&self, _ctx: &GpuContext, _slot: u64, _out: &mut [u32]) {}
+
+    /// Retrieve and clear any pending carrel layout options signaled by carrel navigation.
+    fn take_pending_carrel_options(&mut self) -> Option<crate::spatial_scene::CarrelLayoutOptions> {
+        None
+    }
 }
 
 /// Stress-test target: 1,000,000 instances, one draw call.

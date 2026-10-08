@@ -411,6 +411,10 @@ impl SceneLike for GlyphScene {
     ) {
         render::render_scene(self, ctx, encoder, target, t);
     }
+
+    fn take_pending_carrel_options(&mut self) -> Option<crate::spatial_scene::CarrelLayoutOptions> {
+        self.controller.as_mut().and_then(|c| c.pending_carrel_options.take())
+    }
 }
 
 // ── Stage H (Phase 5) — encase layout assertions ────────────────────────────

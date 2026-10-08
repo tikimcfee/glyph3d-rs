@@ -108,6 +108,7 @@ pub struct LayoutController {
     pub active_carrel: Option<Entity>,
     pub session: Option<crate::agent_transcript::AgentSession>,
     pub revision_engine: Option<crate::revision::RevisionEngine>,
+    pub pending_carrel_options: Option<crate::spatial_scene::CarrelLayoutOptions>,
 }
 
 impl std::fmt::Debug for LayoutController {
@@ -153,6 +154,7 @@ impl LayoutController {
             active_carrel: None,
             session: None,
             revision_engine: None,
+            pending_carrel_options: None,
         }
     }
 
@@ -480,8 +482,14 @@ impl LayoutController {
         let carrel_e = self.active_carrel?;
         let session = self.session.as_ref()?;
         let rev_engine = self.revision_engine.as_ref()?;
+        let old_opts = self.scene.world.get::<crate::spatial_scene::AgentCarrel>(carrel_e)?.layout_options;
         let next_beat = self.scene.carrel_next_beat(carrel_e, session, rev_engine);
         self.scene.update_transforms();
+        if let Some(carrel) = self.scene.world.get::<crate::spatial_scene::AgentCarrel>(carrel_e) {
+            if carrel.layout_options != old_opts {
+                self.pending_carrel_options = Some(carrel.layout_options);
+            }
+        }
         let events = session.linearize_events(Some(rev_engine));
         let total = events.len().max(session.turn_count());
         let summary = events
@@ -507,8 +515,14 @@ impl LayoutController {
         let carrel_e = self.active_carrel?;
         let session = self.session.as_ref()?;
         let rev_engine = self.revision_engine.as_ref()?;
+        let old_opts = self.scene.world.get::<crate::spatial_scene::AgentCarrel>(carrel_e)?.layout_options;
         let prev_beat = self.scene.carrel_prev_beat(carrel_e, session, rev_engine);
         self.scene.update_transforms();
+        if let Some(carrel) = self.scene.world.get::<crate::spatial_scene::AgentCarrel>(carrel_e) {
+            if carrel.layout_options != old_opts {
+                self.pending_carrel_options = Some(carrel.layout_options);
+            }
+        }
         let events = session.linearize_events(Some(rev_engine));
         let total = events.len().max(session.turn_count());
         let summary = events
@@ -545,8 +559,14 @@ impl LayoutController {
         let carrel_e = self.active_carrel?;
         let session = self.session.as_ref()?;
         let rev_engine = self.revision_engine.as_ref()?;
+        let old_opts = self.scene.world.get::<crate::spatial_scene::AgentCarrel>(carrel_e)?.layout_options;
         self.scene.carrel_set_beat(carrel_e, beat_index, session, rev_engine);
         self.scene.update_transforms();
+        if let Some(carrel) = self.scene.world.get::<crate::spatial_scene::AgentCarrel>(carrel_e) {
+            if carrel.layout_options != old_opts {
+                self.pending_carrel_options = Some(carrel.layout_options);
+            }
+        }
         let events = session.linearize_events(Some(rev_engine));
         let total = events.len().max(session.turn_count());
         let summary = events

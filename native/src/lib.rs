@@ -45,6 +45,10 @@ pub use scene::{Scene, SceneLike};
 pub const OFFSCREEN_WIDTH: u32 = 1600;
 pub const OFFSCREEN_HEIGHT: u32 = 1000;
 
+pub type CachedAgentSession = std::sync::Arc<
+    std::sync::RwLock<Option<std::sync::Arc<(agent_transcript::AgentSession, revision::RevisionEngine)>>>,
+>;
+
 /// Which scene a run mode builds.
 #[derive(Clone, Debug)]
 pub enum SceneChoice {
@@ -59,6 +63,7 @@ pub enum SceneChoice {
         session_path: PathBuf,
         emoji_sheet: PathBuf,
         layout_options: spatial_scene::CarrelLayoutOptions,
+        cached_session: CachedAgentSession,
     },
     /// Stage E2: load a whole repository as a field of code pages — one group
     /// per file, one shared glyph arena, grid layout.
@@ -285,49 +290,59 @@ fn build_scene_impl(
             let staged = text::stage_records(arena, &placement, &atlas.slot_ink);
             glyph(GlyphScene::new(ctx, color_format, &atlas, staged, camera_mode, cull, field_mode))
         }
-        SceneChoice::AgentSession { session_path, emoji_sheet, layout_options } => {
-            let session = match agent_transcript::load_session_from_path(session_path) {
-                Ok(s) => s,
-                Err(e) => {
-                    log::error!("Failed to load agent session from {}: {}", session_path.display(), e);
-                    let session_id = session_path
-                        .file_stem()
-                        .and_then(|s| s.to_str())
-                        .unwrap_or("empty");
-                    agent_transcript::AgentSession::new(agent_transcript::HarnessKind::ClaudeCode, session_id)
-                }
-            };
-            let cwd_opt = session.cwd.clone();
-            let cur_dir = std::env::current_dir().ok();
+        SceneChoice::AgentSession { session_path, emoji_sheet, layout_options, cached_session } => {
+            let cached_opt = cached_session.read().ok().and_then(|g| g.clone());
+            let (session, rev_engine) = if let Some(cached) = cached_opt {
+                let (s, r) = (*cached).clone();
+                (s, r)
+            } else {
+                let session = match agent_transcript::load_session_from_path(session_path) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        log::error!("Failed to load agent session from {}: {}", session_path.display(), e);
+                        let session_id = session_path
+                            .file_stem()
+                            .and_then(|s| s.to_str())
+                            .unwrap_or("empty");
+                        agent_transcript::AgentSession::new(agent_transcript::HarnessKind::ClaudeCode, session_id)
+                    }
+                };
+                let cwd_opt = session.cwd.clone();
+                let cur_dir = std::env::current_dir().ok();
 
-            let mut rev_engine = revision::RevisionEngine::new().with_disk_resolver(move |rel_path: &str| {
-                let clean = rel_path.trim().trim_matches('"').trim_matches('\'');
-                let path_str = clean.strip_prefix("file://").unwrap_or(clean);
-                let p = std::path::Path::new(path_str);
-                if p.is_absolute() && p.is_file() {
-                    if let Ok(content) = std::fs::read_to_string(p) {
-                        return Some(content);
-                    }
-                }
-                if let Some(ref cwd) = cwd_opt {
-                    let full = std::path::Path::new(cwd).join(path_str);
-                    if full.is_file() {
-                        if let Ok(content) = std::fs::read_to_string(&full) {
+                let mut rev_engine = revision::RevisionEngine::new().with_disk_resolver(move |rel_path: &str| {
+                    let clean = rel_path.trim().trim_matches('"').trim_matches('\'');
+                    let path_str = clean.strip_prefix("file://").unwrap_or(clean);
+                    let p = std::path::Path::new(path_str);
+                    if p.is_absolute() && p.is_file() {
+                        if let Ok(content) = std::fs::read_to_string(p) {
                             return Some(content);
                         }
                     }
-                }
-                if let Some(ref cur) = cur_dir {
-                    let full = cur.join(path_str);
-                    if full.is_file() {
-                        if let Ok(content) = std::fs::read_to_string(&full) {
-                            return Some(content);
+                    if let Some(ref cwd) = cwd_opt {
+                        let full = std::path::Path::new(cwd).join(path_str);
+                        if full.is_file() {
+                            if let Ok(content) = std::fs::read_to_string(&full) {
+                                return Some(content);
+                            }
                         }
                     }
+                    if let Some(ref cur) = cur_dir {
+                        let full = cur.join(path_str);
+                        if full.is_file() {
+                            if let Ok(content) = std::fs::read_to_string(&full) {
+                                return Some(content);
+                            }
+                        }
+                    }
+                    None
+                });
+                rev_engine.ingest_session(&session);
+                if let Ok(mut g) = cached_session.write() {
+                    *g = Some(std::sync::Arc::new((session.clone(), rev_engine.clone())));
                 }
-                None
-            });
-            rev_engine.ingest_session(&session);
+                (session, rev_engine)
+            };
 
             let atlas = atlas::Atlas::load(ctx, emoji_sheet);
             let staged = agent_transcript::stage_agent_session_with_options(
