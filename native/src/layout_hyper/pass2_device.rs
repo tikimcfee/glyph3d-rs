@@ -19,29 +19,26 @@ use glyph_field_derived::DerivedSlot;
 use super::char_resolve::resolve_byte_char;
 use super::types::{ItemPrepass, Pass2DeviceOutput};
 
-/// Everything Pass 2 knows about one survivor at the moment it is emitted.
-#[derive(Clone, Copy)]
-pub(crate) struct EmitFields {
-    pub pos: [f32; 3],
-    pub glyph_id: u32,
-    pub color: u32,
-    pub group_id: u32,
-    pub item_idx: u32,
-    pub advance: f32,
-    pub height: f32,
-    /// Item-local row (WrapDown rows included) — the Derived line key.
-    pub row: i64,
-    /// Fold count along the line — the Derived Z step index.
-    pub wrap_segment: i64,
-}
-
 /// A device slot format Pass 2 can emit directly.
 pub(crate) trait SlotEmit: Sync {
     type Slot: Copy + Send + Sync;
     /// Whether this format indexes a line table (and so needs `line_bases`
     /// and the row bound checked).
     const USES_LINES: bool;
-    fn emit(f: &EmitFields, line_base: u32) -> Self::Slot;
+    #[allow(clippy::too_many_arguments)]
+    fn emit(
+        pos_x: f32,
+        pos_y: f32,
+        pos_z: f32,
+        glyph_id: u32,
+        color: u32,
+        group_id: u32,
+        item_idx: u32,
+        advance: f32,
+        height: f32,
+        row: i64,
+        wrap_segment: i64,
+    ) -> Self::Slot;
     /// `(glyph_id, color)` — the tint fold's view of a slot.
     fn tint_pair(s: &Self::Slot) -> [u32; 2];
 }
@@ -52,14 +49,26 @@ impl SlotEmit for RenderEmit {
     type Slot = RenderSlot;
     const USES_LINES: bool = false;
     #[inline(always)]
-    fn emit(f: &EmitFields, _line_base: u32) -> RenderSlot {
+    fn emit(
+        pos_x: f32,
+        pos_y: f32,
+        pos_z: f32,
+        glyph_id: u32,
+        color: u32,
+        group_id: u32,
+        _item_idx: u32,
+        advance: f32,
+        height: f32,
+        _row: i64,
+        _wrap_segment: i64,
+    ) -> RenderSlot {
         RenderSlot {
-            pos: f.pos,
-            glyph_id: f.glyph_id,
-            color: f.color,
-            group_id: f.group_id,
-            advance: f.advance,
-            height: f.height,
+            pos: [pos_x, pos_y, pos_z],
+            glyph_id,
+            color,
+            group_id,
+            advance,
+            height,
         }
     }
     #[inline(always)]
@@ -74,18 +83,28 @@ impl SlotEmit for DerivedEmit {
     type Slot = DerivedSlot;
     const USES_LINES: bool = true;
     #[inline(always)]
-    fn emit(f: &EmitFields, _line_base: u32) -> DerivedSlot {
-        // Saturate like the host transcode's float->int cast did: a segment
-        // past 65535 pins to the last step rather than wrapping to the front.
-        let wrap = f.wrap_segment.clamp(0, u16::MAX as i64) as u16;
+    fn emit(
+        pos_x: f32,
+        _pos_y: f32,
+        _pos_z: f32,
+        glyph_id: u32,
+        color: u32,
+        group_id: u32,
+        item_idx: u32,
+        _advance: f32,
+        _height: f32,
+        row: i64,
+        wrap_segment: i64,
+    ) -> DerivedSlot {
+        let wrap = wrap_segment.clamp(0, u16::MAX as i64) as u16;
         DerivedSlot::new(
-            f.pos[0],
-            f.row as u32,
-            (f.glyph_id & 0xFFFF) as u16,
+            pos_x,
+            row as u32,
+            (glyph_id & 0xFFFF) as u16,
             wrap,
-            f.color,
-            (f.item_idx & 0xFFFF) as u16,
-            (f.group_id & 0xFFFF) as u16,
+            color,
+            (item_idx & 0xFFFF) as u16,
+            (group_id & 0xFFFF) as u16,
         )
     }
     #[inline(always)]
@@ -128,7 +147,7 @@ fn layout_pass2_chunk<E: SlotEmit>(
     initial_col: i64,
     initial_seg_adv: f32,
     initial_line_adv: f64,
-    line_base: u32,
+    _line_base: u32,
     trie: &TrieTable,
     bitmap_adv: f32,
     em_height_fu: u32,
@@ -186,7 +205,7 @@ fn layout_pass2_chunk<E: SlotEmit>(
             None => bytes.len(),
         };
         let first_slice = &bytes[..first_nl];
-        if first_slice.iter().all(|&b| (0x20..=0x7E).contains(&b)) {
+        if crate::text::is_pure_printable_ascii(first_slice) {
             crate::text::colorize_pure_ascii_line(first_slice, &mut line_colors);
         } else {
             crate::text::colorize_line_into(first_slice, &mut line_colors);
@@ -256,7 +275,7 @@ fn layout_pass2_chunk<E: SlotEmit>(
             };
             let line_bytes = &bytes[pos..line_end];
             let line_len = line_bytes.len();
-            let is_pure_ascii = line_bytes.iter().all(|&b| (0x20..=0x7E).contains(&b));
+            let is_pure_ascii = crate::text::is_pure_printable_ascii(line_bytes);
 
             if is_syntax_heuristic {
                 if is_pure_ascii {
@@ -266,179 +285,197 @@ fn layout_pass2_chunk<E: SlotEmit>(
                 }
             }
 
-            // Line-level ASCII fast path:
-            if !matches!(item.paint, Paint::ByteSpans(_))
-                && is_pure_ascii
-                && (wrap_w == 0 || line_len <= wrap_w as usize)
-            {
-                let row = base_row;
-                let wrap_segment = 0i64;
-                let x_page = 0i64;
-
-                if row != last_row || wrap_segment != last_wrap_seg || x_page != last_x_page {
-                    last_row = row;
-                    last_wrap_seg = wrap_segment;
-                    last_x_page = x_page;
-
-                    if page_active {
-                        let (y_page, screen_row) = if page_rows > 0 {
-                            (row / page_rows, row + scroll_rows)
-                        } else {
-                            (0, row)
-                        };
-                        let band = y_page / pages_wide;
-                        cached_page_x_off = (y_page % pages_wide) as f64 * page_stride_x;
-                        cached_py = (origin_y
-                            - (screen_row - y_page * page_rows) as f64 * line_height
-                            - band as f64 * band_stride_y) as f32;
-                        cached_pz = (origin_z - wrap_segment as f64 * z_step
-                            + band as f64 * depth_per_band
-                            + x_page as f64 * depth_per_col) as f32;
-                    } else {
-                        cached_page_x_off = 0.0;
-                        cached_py = (-(row as f64) * line_height + origin_y) as f32;
-                        cached_pz = (-(wrap_segment as f64) * z_step + origin_z) as f32;
-                    }
-
-                    if cached_py < page_bottom {
-                        page_bottom = cached_py;
-                    }
-                    if cached_pz < page_z_min {
-                        page_z_min = cached_pz;
-                    }
-                    if cached_pz > page_z_max {
-                        page_z_max = cached_pz;
-                    }
-                }
-
-                let row_py = cached_py;
-                let row_pz = cached_pz;
-                let start_survivors = survivor_out;
+            // Line-level ASCII fast path (handles both single-segment and wrapped multi-segment lines):
+            if !matches!(item.paint, Paint::ByteSpans(_)) && is_pure_ascii {
+                let seg_limit = if wrap_w > 0 { wrap_w as usize } else { usize::MAX };
+                let mut seg_offset = 0usize;
+                let mut wrap_segment = 0i64;
                 let mut line_adv_f64 = line_adv;
                 let mut seg_adv_f32 = seg_adv;
 
-                for (char_idx, &b) in line_bytes.iter().enumerate() {
-                    let item_rel_x = if fold_unit > 0 { seg_adv_f32 as f64 } else { line_adv_f64 };
-                    let base_x = (item_rel_x + origin_x) as f32;
-                    let pos_x = if page_active {
-                        (base_x as f64 + cached_page_x_off) as f32
+                while seg_offset < line_len {
+                    let seg_len = (line_len - seg_offset).min(seg_limit);
+                    let seg_bytes = &line_bytes[seg_offset..seg_offset + seg_len];
+
+                    let row = if is_wrap_back {
+                        base_row
                     } else {
-                        base_x
+                        base_row + wrap_segment
                     };
-                    let right = pos_x + ascii_adv;
-                    if right > page_right {
-                        page_right = right;
+                    let x_page = 0i64;
+
+                    if row != last_row || wrap_segment != last_wrap_seg || x_page != last_x_page {
+                        last_row = row;
+                        last_wrap_seg = wrap_segment;
+                        last_x_page = x_page;
+
+                        if page_active {
+                            let (y_page, screen_row) = if page_rows > 0 {
+                                (row / page_rows, row + scroll_rows)
+                            } else {
+                                (0, row)
+                            };
+                            let band = y_page / pages_wide;
+                            cached_page_x_off = (y_page % pages_wide) as f64 * page_stride_x;
+                            cached_py = (origin_y
+                                - (screen_row - y_page * page_rows) as f64 * line_height
+                                - band as f64 * band_stride_y) as f32;
+                            cached_pz = (origin_z - wrap_segment as f64 * z_step
+                                + band as f64 * depth_per_band
+                                + x_page as f64 * depth_per_col) as f32;
+                        } else {
+                            cached_page_x_off = 0.0;
+                            cached_py = (-(row as f64) * line_height + origin_y) as f32;
+                            cached_pz = (-(wrap_segment as f64) * z_step + origin_z) as f32;
+                        }
+
+                        if cached_py < page_bottom {
+                            page_bottom = cached_py;
+                        }
+                        if cached_pz < page_z_min {
+                            page_z_min = cached_pz;
+                        }
+                        if cached_pz > page_z_max {
+                            page_z_max = cached_pz;
+                        }
                     }
-                    line_adv_f64 += ascii_adv as f64;
-                    seg_adv_f32 += ascii_adv;
 
-                    let glyph_id = trie.fast_byte_table[b as usize].glyph_id;
-                    if glyph_id != 0 {
-                        if pos_x < ink_min[0] {
-                            ink_min[0] = pos_x;
-                        }
-                        if right > ink_max[0] {
-                            ink_max[0] = right;
-                        }
+                    let row_py = cached_py;
+                    let row_pz = cached_pz;
+                    let start_survivors = survivor_out;
 
-                        let color = if let Some(c) = flat_color {
-                            c
-                        } else if is_syntax_heuristic {
-                            if char_idx < line_colors.len() {
-                                line_colors[char_idx]
+                    let qw = ascii_adv.max(crate::text::CELL_HEIGHT_WORLD);
+                    let half_h = 0.5 * crate::text::CELL_HEIGHT_WORLD;
+                    let y_lo = row_py - half_h;
+                    let y_hi = row_py + half_h;
+                    if has_blocks {
+                        if y_lo < cur_blk_min_y { cur_blk_min_y = y_lo; }
+                        if y_hi > cur_blk_max_y { cur_blk_max_y = y_hi; }
+                        if row_pz < cur_blk_min_z { cur_blk_min_z = row_pz; }
+                        if row_pz > cur_blk_max_z { cur_blk_max_z = row_pz; }
+                    }
+
+                    for (char_idx_in_seg, &b) in seg_bytes.iter().enumerate() {
+                        let char_idx = seg_offset + char_idx_in_seg;
+                        let item_rel_x = if fold_unit > 0 { seg_adv_f32 as f64 } else { line_adv_f64 };
+                        let base_x = (item_rel_x + origin_x) as f32;
+                        let pos_x = if page_active {
+                            (base_x as f64 + cached_page_x_off) as f32
+                        } else {
+                            base_x
+                        };
+                        let right = pos_x + ascii_adv;
+                        if right > page_right {
+                            page_right = right;
+                        }
+                        line_adv_f64 += ascii_adv as f64;
+                        seg_adv_f32 += ascii_adv;
+
+                        let glyph_id = trie.fast_byte_table[b as usize].glyph_id;
+                        if glyph_id != 0 {
+                            if pos_x < ink_min[0] {
+                                ink_min[0] = pos_x;
+                            }
+                            if right > ink_max[0] {
+                                ink_max[0] = right;
+                            }
+
+                            let color = if let Some(c) = flat_color {
+                                c
+                            } else if is_syntax_heuristic {
+                                if char_idx < line_colors.len() {
+                                    line_colors[char_idx]
+                                } else {
+                                    crate::layout::DEFAULT_COLOR_PACKED
+                                }
+                            } else if let Some(colors) = per_record_colors {
+                                if record_idx + char_idx < colors.len() {
+                                    colors[record_idx + char_idx]
+                                } else {
+                                    0xFFFF_FFFF
+                                }
                             } else {
                                 crate::layout::DEFAULT_COLOR_PACKED
+                            };
+
+                            if flat_color.is_none() {
+                                let c0 = (color & 0xFF) as usize;
+                                let c1 = ((color >> 8) & 0xFF) as usize;
+                                let c2 = ((color >> 16) & 0xFF) as usize;
+                                file_s0 += lut[c0];
+                                file_s1 += lut[c1];
+                                file_s2 += lut[c2];
+                                file_cells += 1;
                             }
-                        } else if let Some(colors) = per_record_colors {
-                            if record_idx + char_idx < colors.len() {
-                                colors[record_idx + char_idx]
-                            } else {
-                                0xFFFF_FFFF
+
+                            unsafe {
+                                out_ptr.add(survivor_out).write(E::emit(
+                                    pos_x,
+                                    row_py,
+                                    row_pz,
+                                    glyph_id,
+                                    color,
+                                    group_id,
+                                    item_idx,
+                                    ascii_adv,
+                                    crate::text::CELL_HEIGHT_WORLD,
+                                    row,
+                                    wrap_segment,
+                                ));
                             }
-                        } else {
-                            crate::layout::DEFAULT_COLOR_PACKED
-                        };
+                            survivor_out += 1;
 
-                        if flat_color.is_none() {
-                            let c0 = (color & 0xFF) as usize;
-                            let c1 = ((color >> 8) & 0xFF) as usize;
-                            let c2 = ((color >> 16) & 0xFF) as usize;
-                            file_s0 += lut[c0];
-                            file_s1 += lut[c1];
-                            file_s2 += lut[c2];
-                            file_cells += 1;
-                        }
+                            if has_blocks {
+                                if pos_x < cur_blk_min_x { cur_blk_min_x = pos_x; }
+                                let x_hi = pos_x + qw;
+                                if x_hi > cur_blk_max_x { cur_blk_max_x = x_hi; }
+                                cur_blk_count += 1;
 
-                        let fields = EmitFields {
-                            pos: [pos_x, row_py, row_pz],
-                            glyph_id,
-                            color,
-                            group_id,
-                            item_idx,
-                            advance: ascii_adv,
-                            height: crate::text::CELL_HEIGHT_WORLD,
-                            row,
-                            wrap_segment: 0,
-                        };
-                        unsafe {
-                            out_ptr.add(survivor_out).write(E::emit(&fields, line_base));
-                        }
-                        survivor_out += 1;
-
-                        if has_blocks {
-                            let qw = ascii_adv.max(crate::text::CELL_HEIGHT_WORLD);
-                            let half_h = 0.5 * crate::text::CELL_HEIGHT_WORLD;
-                            if pos_x < cur_blk_min_x { cur_blk_min_x = pos_x; }
-                            let x_hi = pos_x + qw;
-                            if x_hi > cur_blk_max_x { cur_blk_max_x = x_hi; }
-                            let y_lo = row_py - half_h;
-                            let y_hi = row_py + half_h;
-                            if y_lo < cur_blk_min_y { cur_blk_min_y = y_lo; }
-                            if y_hi > cur_blk_max_y { cur_blk_max_y = y_hi; }
-                            if row_pz < cur_blk_min_z { cur_blk_min_z = row_pz; }
-                            if row_pz > cur_blk_max_z { cur_blk_max_z = row_pz; }
-                            cur_blk_count += 1;
-
-                            if cur_blk_count == SUBSEG_BLOCK_SIZE {
-                                if cur_blk_min_x <= cur_blk_max_x && cur_blk_min_y <= cur_blk_max_y {
-                                    local_blocks.push(BlockCull {
-                                        min: [cur_blk_min_x, cur_blk_min_y, cur_blk_min_z],
-                                        max: [cur_blk_max_x, cur_blk_max_y, cur_blk_max_z],
-                                        slot_base: chunk_rel_slot + (survivor_out - SUBSEG_BLOCK_SIZE) as u32,
-                                        slot_count: SUBSEG_BLOCK_SIZE as u32,
-                                    });
+                                if cur_blk_count == SUBSEG_BLOCK_SIZE {
+                                    if cur_blk_min_x <= cur_blk_max_x && cur_blk_min_y <= cur_blk_max_y {
+                                        local_blocks.push(BlockCull {
+                                            min: [cur_blk_min_x, cur_blk_min_y, cur_blk_min_z],
+                                            max: [cur_blk_max_x, cur_blk_max_y, cur_blk_max_z],
+                                            slot_base: chunk_rel_slot + (survivor_out - SUBSEG_BLOCK_SIZE) as u32,
+                                            slot_count: SUBSEG_BLOCK_SIZE as u32,
+                                        });
+                                    }
+                                    cur_blk_min_x = f32::INFINITY;
+                                    cur_blk_min_y = y_lo;
+                                    cur_blk_min_z = row_pz;
+                                    cur_blk_max_x = f32::NEG_INFINITY;
+                                    cur_blk_max_y = y_hi;
+                                    cur_blk_max_z = row_pz;
+                                    cur_blk_count = 0;
                                 }
-                                cur_blk_min_x = f32::INFINITY;
-                                cur_blk_min_y = f32::INFINITY;
-                                cur_blk_min_z = f32::INFINITY;
-                                cur_blk_max_x = f32::NEG_INFINITY;
-                                cur_blk_max_y = f32::NEG_INFINITY;
-                                cur_blk_max_z = f32::NEG_INFINITY;
-                                cur_blk_count = 0;
                             }
                         }
                     }
-                }
 
-                if survivor_out > start_survivors {
-                    let half = 0.5 * crate::text::CELL_HEIGHT_WORLD;
-                    if row_py - half < ink_min[1] {
-                        ink_min[1] = row_py - half;
+                    if survivor_out > start_survivors {
+                        let half = 0.5 * crate::text::CELL_HEIGHT_WORLD;
+                        if row_py - half < ink_min[1] {
+                            ink_min[1] = row_py - half;
+                        }
+                        if row_py + half > ink_max[1] {
+                            ink_max[1] = row_py + half;
+                        }
+                        if row_pz < ink_min[2] {
+                            ink_min[2] = row_pz;
+                        }
+                        if row_pz > ink_max[2] {
+                            ink_max[2] = row_pz;
+                        }
+                        last_ink_y = row_py;
+                        last_ink_z = row_pz;
+                        if E::USES_LINES && row > max_row_seen {
+                            max_row_seen = row;
+                        }
                     }
-                    if row_py + half > ink_max[1] {
-                        ink_max[1] = row_py + half;
-                    }
-                    if row_pz < ink_min[2] {
-                        ink_min[2] = row_pz;
-                    }
-                    if row_pz > ink_max[2] {
-                        ink_max[2] = row_pz;
-                    }
-                    last_ink_y = row_py;
-                    last_ink_z = row_pz;
-                    if E::USES_LINES && row > max_row_seen {
-                        max_row_seen = row;
-                    }
+
+                    wrap_segment += 1;
+                    seg_offset += seg_len;
+                    seg_adv_f32 = 0.0;
                 }
 
                 record_idx += line_len;
@@ -601,19 +638,20 @@ fn layout_pass2_chunk<E: SlotEmit>(
             if E::USES_LINES && row > max_row_seen {
                 max_row_seen = row;
             }
-            let fields = EmitFields {
-                pos: [pos_x, pos_y, pos_z],
-                glyph_id: r.glyph_id,
-                color,
-                group_id,
-                item_idx,
-                advance: r.advance,
-                height: r.height,
-                row,
-                wrap_segment,
-            };
             unsafe {
-                out_ptr.add(survivor_out).write(E::emit(&fields, line_base));
+                out_ptr.add(survivor_out).write(E::emit(
+                    pos_x,
+                    pos_y,
+                    pos_z,
+                    r.glyph_id,
+                    color,
+                    group_id,
+                    item_idx,
+                    r.advance,
+                    r.height,
+                    row,
+                    wrap_segment,
+                ));
             }
             survivor_out += 1;
 

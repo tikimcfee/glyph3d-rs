@@ -1025,6 +1025,51 @@ pub fn colorize_line_into(line_bytes: &[u8], colors: &mut Vec<u32>) {
     }
 }
 
+/// Returns true if all bytes in `bytes` are printable ASCII (0x20..=0x7E).
+///
+/// Uses 16-byte NEON on aarch64 and portable 8-byte SWAR on 64-bit words,
+/// falling back to scalar for trailing bytes.
+#[inline]
+pub fn is_pure_printable_ascii(bytes: &[u8]) -> bool {
+    let len = bytes.len();
+    let mut i = 0usize;
+
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        use std::arch::aarch64::*;
+        let lower = vdupq_n_u8(0x20);
+        let bound = vdupq_n_u8(0x5E); // 0x7E - 0x20
+        while i + 16 <= len {
+            let chunk = vld1q_u8(bytes.as_ptr().add(i));
+            let sub = vsubq_u8(chunk, lower);
+            let bad = vcgtq_u8(sub, bound);
+            if vmaxvq_u8(bad) != 0 {
+                return false;
+            }
+            i += 16;
+        }
+    }
+
+    while i + 8 <= len {
+        let w = unsafe { (bytes.as_ptr().add(i) as *const u64).read_unaligned() };
+        let has_lt_20 = w.wrapping_sub(0x2020202020202020) & !w & 0x8080808080808080;
+        let has_ge_7f = ((w & 0x7F7F7F7F7F7F7F7F).wrapping_add(0x0101010101010101) | w) & 0x8080808080808080;
+        if (has_lt_20 | has_ge_7f) != 0 {
+            return false;
+        }
+        i += 8;
+    }
+
+    while i < len {
+        let b = bytes[i];
+        if !(0x20..=0x7E).contains(&b) {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
 /// Fast-path syntax coloring for pure printable ASCII lines (0x20..=0x7E).
 /// Avoids UTF-8 decode branches and char conversions.
 #[inline]
@@ -1193,6 +1238,36 @@ mod tests {
             assert_eq!(buf_a, buf_b, "mismatch on line: {}", String::from_utf8_lossy(line));
         }
     }
+
+    #[test]
+    fn test_is_pure_printable_ascii_exhaustive() {
+        // Test single bytes
+        for b in 0u8..=255 {
+            let slice = [b];
+            let expected = (0x20..=0x7E).contains(&b);
+            assert_eq!(super::is_pure_printable_ascii(&slice), expected, "Byte 0x{b:02X} failed");
+        }
+
+        // Test lengths from 0 to 64 bytes with all printable
+        for len in 0..=64 {
+            let vec: Vec<u8> = (0..len).map(|i| 0x20 + (i % 95) as u8).collect();
+            assert!(super::is_pure_printable_ascii(&vec), "Length {len} printable failed");
+
+            // Poison each position with a non-printable byte
+            for pos in 0..len {
+                let mut poisoned = vec.clone();
+                poisoned[pos] = 0x09; // tab
+                assert!(!super::is_pure_printable_ascii(&poisoned), "Poison tab at pos {pos}/{len} failed");
+
+                poisoned[pos] = 0x7F; // DEL
+                assert!(!super::is_pure_printable_ascii(&poisoned), "Poison DEL at pos {pos}/{len} failed");
+
+                poisoned[pos] = 0x80; // High byte
+                assert!(!super::is_pure_printable_ascii(&poisoned), "Poison 0x80 at pos {pos}/{len} failed");
+            }
+        }
+    }
 }
+
 
 

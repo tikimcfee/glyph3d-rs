@@ -330,7 +330,7 @@ pub(crate) fn pass1_prepass_chunk_bytes(
         let mut line_adv = 0.0f64;
         let mut seg_adv = 0.0f32;
 
-        let is_pure_ascii = bytes.iter().all(|b| (0x20..0x7F).contains(b));
+        let is_pure_ascii = crate::text::is_pure_printable_ascii(bytes);
         if is_pure_ascii {
             let l = bytes.len();
             survivor_count = l as u32;
@@ -411,7 +411,7 @@ pub(crate) fn pass1_prepass_chunk_bytes(
         let mut line_adv = 0.0f64;
         let mut seg_adv = 0.0f32;
 
-        let is_pure_ascii = line.iter().all(|b| (0x20..0x7F).contains(b));
+        let is_pure_ascii = crate::text::is_pure_printable_ascii(line);
         if is_pure_ascii {
             let l = line.len();
             line_survivors = l as u32;
