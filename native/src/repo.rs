@@ -447,6 +447,7 @@ pub fn load_items(
 pub struct PrefetchedRepo {
     pub walk: WalkResult,
     pub file_params: Vec<ItemParams>,
+    pub(crate) hyper_data: Option<crate::layout_hyper::PrefetchedHyperData>,
     #[cfg(feature = "cubecl")]
     pub(crate) cubecl_data: Option<crate::cubecl_layout::PrefetchedCubeclData>,
 }
@@ -459,14 +460,10 @@ pub fn prefetch_repo(
     strategy: Strategy,
 ) -> PrefetchedRepo {
     let walk = walk_repo(dir);
-    use rayon::prelude::*;
     let file_params: Vec<ItemParams> = walk
         .files
-        .par_iter()
-        .map(|f| {
-            let newlines = memchr::memchr_iter(b'\n', &f.bytes).count();
-            file_item_params(&params, f.bytes.len(), newlines)
-        })
+        .iter()
+        .map(|f| file_item_params(&params, f.bytes.len(), f.newline_count))
         .collect();
 
     #[cfg(feature = "cubecl")]
@@ -476,9 +473,16 @@ pub fn prefetch_repo(
         None
     };
 
+    let hyper_data = if strategy == Strategy::Hyper {
+        Some(crate::layout_hyper::prefetch_hyper(&walk.files, &file_params))
+    } else {
+        None
+    };
+
     PrefetchedRepo {
         walk,
         file_params,
+        hyper_data,
         #[cfg(feature = "cubecl")]
         cubecl_data,
     }
@@ -503,19 +507,16 @@ pub fn load_repo_from_walk(
     arena: GlyphArena,
     folds: Option<&std::collections::HashMap<String, Vec<std::ops::Range<u32>>>>,
 ) -> RepoLoad {
-    use rayon::prelude::*;
     let file_params: Vec<ItemParams> = walk
         .files
-        .par_iter()
-        .map(|f| {
-            let newlines = memchr::memchr_iter(b'\n', &f.bytes).count();
-            file_item_params(params, f.bytes.len(), newlines)
-        })
+        .iter()
+        .map(|f| file_item_params(params, f.bytes.len(), f.newline_count))
         .collect();
 
     let prefetched = PrefetchedRepo {
         walk,
         file_params,
+        hyper_data: None,
         #[cfg(feature = "cubecl")]
         cubecl_data: None,
     };
@@ -548,6 +549,7 @@ pub fn load_repo_from_prefetched(
     let PrefetchedRepo {
         walk,
         file_params,
+        hyper_data,
         #[cfg(feature = "cubecl")]
         cubecl_data,
     } = prefetched;
@@ -599,11 +601,23 @@ pub fn load_repo_from_prefetched(
             None => crate::layout::LayoutEngine::cubecl(params.field_mode),
         },
         _ => match gpu {
-            Some(ctx) => crate::layout::LayoutEngine::hyper_with_device(
-                crate::gpu::SharedDevice::from_ctx(ctx),
-                params.field_mode,
-            ),
-            None => crate::layout::LayoutEngine::hyper(),
+            Some(ctx) => {
+                let mut engine = crate::layout::LayoutEngine::hyper_with_device(
+                    crate::gpu::SharedDevice::from_ctx(ctx),
+                    params.field_mode,
+                );
+                if let Some(hd) = hyper_data {
+                    engine.set_hyper_prefetched(hd);
+                }
+                engine
+            }
+            None => {
+                let mut engine = crate::layout::LayoutEngine::hyper();
+                if let Some(hd) = hyper_data {
+                    engine.set_hyper_prefetched(hd);
+                }
+                engine
+            }
         },
     };
     backend
@@ -701,7 +715,7 @@ pub fn load_repo_from_prefetched(
             // recomputes when the fold feeds the layout).
             let paginated = {
                 let item = &file_params[index];
-                let newlines = f.bytes.iter().filter(|&&b| b == b'\n').count();
+                let newlines = f.newline_count;
                 let rows_est = newlines
                     .max(f.bytes.len() / item.wrap_width.max(1) as usize)
                     .max(1);

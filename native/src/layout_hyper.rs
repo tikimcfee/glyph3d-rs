@@ -44,6 +44,7 @@ pub struct HyperLayout {
     /// Whose slot format the device path emits. Host (no-device) runs
     /// always produce the neutral 48 B records regardless.
     field_mode: GlyphFieldMode,
+    pub(crate) prefetched_data: Option<PrefetchedHyperData>,
 }
 
 impl Default for HyperLayout {
@@ -58,6 +59,7 @@ impl HyperLayout {
             trie: None,
             device: None,
             field_mode: GlyphFieldMode::Instanced,
+            prefetched_data: None,
         }
     }
 
@@ -66,6 +68,7 @@ impl HyperLayout {
             trie: None,
             device: Some(device),
             field_mode,
+            prefetched_data: None,
         }
     }
 
@@ -74,7 +77,12 @@ impl HyperLayout {
             trie: Some(trie),
             device: None,
             field_mode: GlyphFieldMode::Instanced,
+            prefetched_data: None,
         }
+    }
+
+    pub fn set_prefetched(&mut self, data: PrefetchedHyperData) {
+        self.prefetched_data = Some(data);
     }
 }
 
@@ -121,19 +129,32 @@ impl HyperLayout {
         let em_height_fu = trie.metrics.em_height_fu;
         let bitmap_adv = fu_to_world(trie.bitmap_advance_fu, em_height_fu);
 
-        let (chunks, item_chunk_ranges) = chunk::slice_items_into_chunks(items);
-
         // --- PASS 1 (Parallel): Prepass per chunk to find counts and max_row_extent ---
-        let sp_pass1 = tracing::info_span!("hyper.pass1").entered();
-        let agg = pass1_prepass_chunks(
-            &chunks,
-            &item_chunk_ranges,
-            items,
-            &trie,
-            bitmap_adv,
-            em_height_fu,
-        );
-        drop(sp_pass1);
+        let (chunks, item_chunk_ranges, agg) = if let Some(pre) = self.prefetched_data.take() {
+            let chunks: Vec<chunk::LayoutChunk<'_>> = pre
+                .chunk_defs
+                .iter()
+                .map(|def| chunk::LayoutChunk {
+                    item_index: def.item_index,
+                    bytes: &items[def.item_index].bytes[def.byte_offset..def.byte_offset + def.byte_len],
+                    byte_offset: def.byte_offset,
+                })
+                .collect();
+            (chunks, pre.item_chunk_ranges, pre.aggregate)
+        } else {
+            let (chunks, item_chunk_ranges) = chunk::slice_items_into_chunks(items);
+            let sp_pass1 = tracing::info_span!("hyper.pass1").entered();
+            let agg = pass1_prepass_chunks(
+                &chunks,
+                &item_chunk_ranges,
+                items,
+                &trie,
+                bitmap_adv,
+                em_height_fu,
+            );
+            drop(sp_pass1);
+            (chunks, item_chunk_ranges, agg)
+        };
 
         let prepasses = agg.prepasses;
         let chunk_slot_bases = agg.chunk_slot_bases;
@@ -167,19 +188,6 @@ impl HyperLayout {
 
             // Derived: each item owns `row_count` consecutive line-table
             // entries; their bases are known now, so Pass 2 writes final
-            // `line_idx` values in one walk.
-            let line_bases: Vec<u32> = if derived {
-                let mut bases = Vec::with_capacity(item_count);
-                let mut acc = 0u64;
-                for pre in &prepasses {
-                    bases.push(acc as u32);
-                    acc += pre.row_count as u64;
-                }
-                assert!(acc <= u32::MAX as u64, "line table exceeds u32 indices ({acc} rows)");
-                bases
-            } else {
-                Vec::new()
-            };
             let inputs = EmitInputs {
                 items,
                 chunks: &chunks,
@@ -192,7 +200,6 @@ impl HyperLayout {
                 chunk_initial_cols: &chunk_initial_cols,
                 chunk_initial_seg_advs: &chunk_initial_seg_advs,
                 chunk_initial_line_advs: &chunk_initial_line_advs,
-                line_bases: &line_bases,
                 trie: &trie,
                 bitmap_adv,
                 em_height_fu,
@@ -264,7 +271,8 @@ impl HyperLayout {
 
 
 /// Prepass aggregation output holding per-item prepasses and per-chunk starting offsets.
-pub(crate) struct PrepassAggregate {
+#[derive(Clone, Debug)]
+pub struct PrepassAggregate {
     pub prepasses: Vec<ItemPrepass>,
     pub chunk_slot_bases: Vec<u32>,
     pub chunk_base_rows: Vec<i64>,
@@ -275,6 +283,14 @@ pub(crate) struct PrepassAggregate {
     pub total_survivors: usize,
 }
 
+/// Precomputed chunks and Pass 1 metadata from background prefetch.
+#[derive(Clone, Debug)]
+pub struct PrefetchedHyperData {
+    pub chunk_defs: Vec<chunk::ChunkDef>,
+    pub item_chunk_ranges: Vec<std::ops::Range<usize>>,
+    pub aggregate: PrepassAggregate,
+}
+
 /// Evaluates Pass 1 on a single byte slice (whole file or chunk).
 pub(crate) fn pass1_prepass_chunk_bytes(
     bytes: &[u8],
@@ -282,6 +298,7 @@ pub(crate) fn pass1_prepass_chunk_bytes(
     trie: &TrieTable,
     bitmap_adv: f32,
     em_height_fu: u32,
+    global_seg_adv_table: &[f32],
 ) -> ChunkPrepass {
     let fold_unit = if p.wrap_width > 0 {
         p.wrap_width as i64
@@ -300,25 +317,8 @@ pub(crate) fn pass1_prepass_chunk_bytes(
     let ascii_adv = fu_to_world(1229, em_height_fu);
 
     let fu = fold_unit as usize;
-    let mut seg_adv_stack = [0.0f32; 256];
-    let mut seg_adv_heap = Vec::new();
-    let seg_adv_table: &[f32] = if fu > 0 {
-        if fu < 256 {
-            let mut cur = 0.0f32;
-            for slot in seg_adv_stack.iter_mut().take(fu + 1) {
-                *slot = cur;
-                cur += ascii_adv;
-            }
-            &seg_adv_stack[..=fu]
-        } else {
-            seg_adv_heap.reserve(fu + 1);
-            let mut cur = 0.0f32;
-            for _ in 0..=fu {
-                seg_adv_heap.push(cur);
-                cur += ascii_adv;
-            }
-            &seg_adv_heap
-        }
+    let seg_adv_table: &[f32] = if fu > 0 && fu < global_seg_adv_table.len() {
+        &global_seg_adv_table[..=fu]
     } else {
         &[]
     };
@@ -503,25 +503,74 @@ pub(crate) fn pass1_prepass_chunks(
     bitmap_adv: f32,
     em_height_fu: u32,
 ) -> PrepassAggregate {
+    let max_fold_unit = items
+        .iter()
+        .map(|it| {
+            let p = &it.params;
+            if p.wrap_width > 0 {
+                p.wrap_width as usize
+            } else if p.has_page {
+                p.page_cols as usize
+            } else {
+                0
+            }
+        })
+        .max()
+        .unwrap_or(0);
+
+    let ascii_adv = fu_to_world(1229, em_height_fu);
+    let mut global_seg_adv_table = Vec::with_capacity(max_fold_unit + 1);
+    if max_fold_unit > 0 {
+        let mut cur = 0.0f32;
+        for _ in 0..=max_fold_unit {
+            global_seg_adv_table.push(cur);
+            cur += ascii_adv;
+        }
+    }
+
     let chunk_prepasses: Vec<ChunkPrepass> = chunks
         .par_iter()
         .map(|chunk| {
             let item = &items[chunk.item_index];
-            pass1_prepass_chunk_bytes(chunk.bytes, &item.params, trie, bitmap_adv, em_height_fu)
+            pass1_prepass_chunk_bytes(
+                chunk.bytes,
+                &item.params,
+                trie,
+                bitmap_adv,
+                em_height_fu,
+                &global_seg_adv_table,
+            )
         })
         .collect();
 
-    let mut prepasses = Vec::with_capacity(items.len());
-    let mut chunk_slot_bases = Vec::with_capacity(chunks.len());
-    let mut chunk_base_rows = Vec::with_capacity(chunks.len());
-    let mut chunk_record_bases = Vec::with_capacity(chunks.len());
-    let mut chunk_initial_cols = Vec::with_capacity(chunks.len());
-    let mut chunk_initial_seg_advs = Vec::with_capacity(chunks.len());
-    let mut chunk_initial_line_advs = Vec::with_capacity(chunks.len());
+    let file_params: Vec<crate::layout::ItemParams> = items.iter().map(|it| it.params).collect();
+    aggregate_chunk_prepasses(
+        &chunk_prepasses,
+        item_chunk_ranges,
+        chunks.len(),
+        &file_params,
+        em_height_fu,
+    )
+}
+
+pub(crate) fn aggregate_chunk_prepasses(
+    chunk_prepasses: &[ChunkPrepass],
+    item_chunk_ranges: &[std::ops::Range<usize>],
+    total_chunks: usize,
+    file_params: &[crate::layout::ItemParams],
+    em_height_fu: u32,
+) -> PrepassAggregate {
+    let mut prepasses = Vec::with_capacity(file_params.len());
+    let mut chunk_slot_bases = Vec::with_capacity(total_chunks);
+    let mut chunk_base_rows = Vec::with_capacity(total_chunks);
+    let mut chunk_record_bases = Vec::with_capacity(total_chunks);
+    let mut chunk_initial_cols = Vec::with_capacity(total_chunks);
+    let mut chunk_initial_seg_advs = Vec::with_capacity(total_chunks);
+    let mut chunk_initial_line_advs = Vec::with_capacity(total_chunks);
     let mut total_survivors = 0usize;
 
     for (item_idx, range) in item_chunk_ranges.iter().enumerate() {
-        let p = &items[item_idx].params;
+        let p = &file_params[item_idx];
         let wrap_w = p.wrap_width as i64;
         let fold_unit = if p.wrap_width > 0 {
             p.wrap_width as i64
@@ -607,6 +656,73 @@ pub(crate) fn pass1_prepass_chunks(
         chunk_initial_seg_advs,
         chunk_initial_line_advs,
         total_survivors,
+    }
+}
+
+/// Computes Pass 1 chunk prepasses ahead of time during repository prefetching.
+pub fn prefetch_hyper(
+    files: &[crate::repo::RepoFile],
+    file_params: &[crate::layout::ItemParams],
+) -> PrefetchedHyperData {
+    let trie = crate::default_trie();
+    let em_height_fu = trie.metrics.em_height_fu;
+    let bitmap_adv = fu_to_world(trie.bitmap_advance_fu, em_height_fu);
+
+    let byte_slices: Vec<&[u8]> = files.iter().map(|f| f.bytes.as_slice()).collect();
+    let (chunk_defs, item_chunk_ranges) = chunk::slice_byte_buffers_into_chunk_defs(&byte_slices);
+
+    let max_fold_unit = file_params
+        .iter()
+        .map(|p| {
+            if p.wrap_width > 0 {
+                p.wrap_width as usize
+            } else if p.has_page {
+                p.page_cols as usize
+            } else {
+                0
+            }
+        })
+        .max()
+        .unwrap_or(0);
+
+    let ascii_adv = fu_to_world(1229, em_height_fu);
+    let mut global_seg_adv_table = Vec::with_capacity(max_fold_unit + 1);
+    if max_fold_unit > 0 {
+        let mut cur = 0.0f32;
+        for _ in 0..=max_fold_unit {
+            global_seg_adv_table.push(cur);
+            cur += ascii_adv;
+        }
+    }
+
+    let chunk_prepasses: Vec<ChunkPrepass> = chunk_defs
+        .par_iter()
+        .map(|def| {
+            let p = &file_params[def.item_index];
+            let chunk_bytes = &files[def.item_index].bytes[def.byte_offset..def.byte_offset + def.byte_len];
+            pass1_prepass_chunk_bytes(
+                chunk_bytes,
+                p,
+                &trie,
+                bitmap_adv,
+                em_height_fu,
+                &global_seg_adv_table,
+            )
+        })
+        .collect();
+
+    let aggregate = aggregate_chunk_prepasses(
+        &chunk_prepasses,
+        &item_chunk_ranges,
+        chunk_defs.len(),
+        file_params,
+        em_height_fu,
+    );
+
+    PrefetchedHyperData {
+        chunk_defs,
+        item_chunk_ranges,
+        aggregate,
     }
 }
 
@@ -863,13 +979,10 @@ mod tests {
         let agg = pass1_prepass_chunks(&chunks, &item_chunk_ranges, &items, &trie, bitmap_adv, em_height_fu);
         let prepasses = agg.prepasses;
         let mut slot_bases = Vec::new();
-        let mut line_bases = Vec::new();
-        let (mut slots_acc, mut lines_acc) = (0u32, 0u32);
+        let mut slots_acc = 0u32;
         for p in &prepasses {
             slot_bases.push(slots_acc);
-            line_bases.push(lines_acc);
             slots_acc += p.survivor_count;
-            lines_acc += p.row_count;
         }
         assert_eq!(slots_acc as usize, host.len());
         let mut direct = vec![DerivedSlot::zeroed(); host.len()];
@@ -885,7 +998,6 @@ mod tests {
             chunk_initial_cols: &agg.chunk_initial_cols,
             chunk_initial_seg_advs: &agg.chunk_initial_seg_advs,
             chunk_initial_line_advs: &agg.chunk_initial_line_advs,
-            line_bases: &line_bases,
             trie: &trie,
             bitmap_adv,
             em_height_fu,

@@ -1070,12 +1070,13 @@ pub fn is_pure_printable_ascii(bytes: &[u8]) -> bool {
     true
 }
 
-/// Fast-path syntax coloring for pure printable ASCII lines (0x20..=0x7E).
-/// Avoids UTF-8 decode branches and char conversions.
+/// Fast-path syntax coloring for pure printable ASCII lines (0x20..=0x7E) writing into a slice.
+/// Avoids vector resizing and heap allocations.
+/// Returns the counts of `[DEFAULT, KEYWORD, NUMBER, STRING, COMMENT, PUNCT]` in the line.
 #[inline]
-pub fn colorize_pure_ascii_line(line: &[u8], colors: &mut Vec<u32>) {
-    colors.clear();
-    colors.reserve(line.len());
+pub fn colorize_pure_ascii_line_slice(line: &[u8], colors: &mut [u32]) -> [u32; 6] {
+    debug_assert_eq!(line.len(), colors.len());
+    let mut counts = [0u32; 6];
     let mut word_start = usize::MAX;
     let mut in_comment = false;
     let mut in_string: Option<u8> = None;
@@ -1085,47 +1086,78 @@ pub fn colorize_pure_ascii_line(line: &[u8], colors: &mut Vec<u32>) {
         let mut color = palette::C_DEFAULT;
         if in_comment {
             color = palette::C_COMMENT;
+            counts[4] += 1;
         } else if let Some(q) = in_string {
             if b == q && prev != b'\\' {
                 in_string = None;
             }
             color = palette::C_STRING;
+            counts[3] += 1;
         } else if b == b'/' && prev == b'/' {
             in_comment = true;
-            if let Some(last) = colors.last_mut() {
-                *last = palette::C_COMMENT;
+            if i > 0 {
+                colors[i - 1] = palette::C_COMMENT;
+                counts[5] -= 1;
+                counts[4] += 1;
             }
             color = palette::C_COMMENT;
+            counts[4] += 1;
         } else if b == b'"' || b == b'\'' || b == b'`' {
             in_string = Some(b);
             color = palette::C_STRING;
+            counts[3] += 1;
         } else if ASCII_WORD_CHAR[b as usize] {
             if word_start == usize::MAX {
                 word_start = i;
             }
             if line[word_start].is_ascii_digit() {
                 color = palette::C_NUMBER;
+                counts[2] += 1;
+            } else {
+                counts[0] += 1;
             }
         } else {
             if word_start != usize::MAX {
                 let wc = word_color_packed(&line[word_start..i]);
-                if wc != palette::C_DEFAULT {
-                    colors[word_start..].fill(wc);
+                if wc == palette::C_KEYWORD {
+                    colors[word_start..i].fill(wc);
+                    let word_len = (i - word_start) as u32;
+                    counts[0] -= word_len;
+                    counts[1] += word_len;
                 }
                 word_start = usize::MAX;
             }
             color = palette::C_PUNCT;
+            counts[5] += 1;
         }
-        colors.push(color);
+        colors[i] = color;
         prev = b;
     }
     if word_start != usize::MAX {
         let wc = word_color_packed(&line[word_start..]);
-        if wc != palette::C_DEFAULT {
+        if wc == palette::C_KEYWORD {
             colors[word_start..].fill(wc);
+            let word_len = (line.len() - word_start) as u32;
+            counts[0] -= word_len;
+            counts[1] += word_len;
         }
     }
+    counts
 }
+
+/// Fast-path syntax coloring for pure printable ASCII lines (0x20..=0x7E).
+/// Avoids UTF-8 decode branches and char conversions.
+/// Returns the counts of `[DEFAULT, KEYWORD, NUMBER, STRING, COMMENT, PUNCT]` in the line.
+#[inline]
+pub fn colorize_pure_ascii_line(line: &[u8], colors: &mut Vec<u32>) -> [u32; 6] {
+    if colors.len() < line.len() {
+        colors.resize(line.len(), palette::C_DEFAULT);
+    } else {
+        colors.truncate(line.len());
+    }
+    colorize_pure_ascii_line_slice(line, colors)
+}
+
 
 #[cfg(test)]
 mod tests {
@@ -1236,6 +1268,37 @@ mod tests {
             colorize_line_into(line, &mut buf_a);
             colorize_pure_ascii_line(line, &mut buf_b);
             assert_eq!(buf_a, buf_b, "mismatch on line: {}", String::from_utf8_lossy(line));
+        }
+    }
+
+    #[test]
+    fn colorize_pure_ascii_line_slice_counts_match_colors() {
+        let lines = [
+            b"const x = 42;".as_slice(),
+            b"let y = \"hello world\"; // comment".as_slice(),
+            b"fn test() -> bool { true }".as_slice(),
+            b"for (let i = 0; i < 10; i++) { sum += i; }".as_slice(),
+            b"// entire line is comment".as_slice(),
+            b"\"unclosed string".as_slice(),
+            b"   12345 67890 abc def return function   ".as_slice(),
+        ];
+        let mut colors = Vec::new();
+        for &line in &lines {
+            colors.resize(line.len(), 0);
+            let counts = colorize_pure_ascii_line_slice(line, &mut colors);
+            let mut manual_counts = [0u32; 6];
+            for &c in &colors {
+                match c {
+                    palette::C_DEFAULT => manual_counts[0] += 1,
+                    palette::C_KEYWORD => manual_counts[1] += 1,
+                    palette::C_NUMBER  => manual_counts[2] += 1,
+                    palette::C_STRING  => manual_counts[3] += 1,
+                    palette::C_COMMENT => manual_counts[4] += 1,
+                    palette::C_PUNCT   => manual_counts[5] += 1,
+                    _ => panic!("unknown color: {:X}", c),
+                }
+            }
+            assert_eq!(counts, manual_counts, "mismatch on line: {}", String::from_utf8_lossy(line));
         }
     }
 

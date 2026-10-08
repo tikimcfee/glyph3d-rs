@@ -27,6 +27,7 @@ pub struct RepoFile {
     /// Parent directory (relative, "" at the root) — the group-tint key.
     pub dir: String,
     pub bytes: Vec<u8>,
+    pub newline_count: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -71,7 +72,8 @@ impl RepoFile {
             .rfind('/')
             .map(|i| rel_path[..i].to_string())
             .unwrap_or_default();
-        RepoFile { rel_path, dir, bytes }
+        let newline_count = memchr::memchr_iter(b'\n', &bytes).count();
+        RepoFile { rel_path, dir, bytes, newline_count }
     }
 }
 
@@ -80,7 +82,6 @@ pub fn walk_repo(root: &Path) -> WalkResult {
     let _sp = tracing::info_span!("repo.walk", root = %root.display()).entered();
     let t0 = std::time::Instant::now();
     let mut candidates: Vec<(String, PathBuf)> = Vec::new();
-    let mut skipped_large = 0usize;
     let mut dirs_visited = 0usize;
     let mut stack: Vec<PathBuf> = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
@@ -90,40 +91,31 @@ pub fn walk_repo(root: &Path) -> WalkResult {
         };
         dirs_visited += 1;
         for entry in rd.flatten() {
-            let name = match entry.file_name().to_str() {
-                Some(s) => s.to_string(),
-                None => continue,
+            let file_name_os = entry.file_name();
+            let Some(name) = file_name_os.to_str() else {
+                continue;
             };
             if name.starts_with('.') && name != ".github" {
                 continue;
             }
-            let path = entry.path();
             let ft = match entry.file_type() {
                 Ok(t) => t,
                 Err(_) => continue,
             };
             if ft.is_dir() {
-                if SKIP_DIRS.contains(&name.as_str()) {
+                if SKIP_DIRS.contains(&name) {
                     continue;
                 }
-                stack.push(path);
+                stack.push(entry.path());
             } else if ft.is_file() {
-                let ext = path
-                    .extension()
-                    .and_then(|e| e.to_str())
-                    .unwrap_or("")
-                    .to_ascii_lowercase();
-                if !SOURCE_EXTENSIONS.contains(&ext.as_str()) {
+                let Some((_, ext)) = name.rsplit_once('.') else {
                     continue;
-                }
-                let meta = match entry.metadata() {
-                    Ok(m) => m,
-                    Err(_) => continue,
                 };
-                if meta.len() > MAX_FILE_BYTES {
-                    skipped_large += 1;
+                let ext_lower = ext.to_ascii_lowercase();
+                if !SOURCE_EXTENSIONS.contains(&ext_lower.as_str()) {
                     continue;
                 }
+                let path = entry.path();
                 let rel = path
                     .strip_prefix(root)
                     .unwrap_or(&path)
@@ -137,37 +129,61 @@ pub fn walk_repo(root: &Path) -> WalkResult {
 
     use rayon::prelude::*;
 
-    let read_results: Vec<Option<RepoFile>> = candidates
+    enum CandidateReadResult {
+        File(RepoFile),
+        SkippedLarge,
+        SkippedNonUtf8,
+        Error,
+    }
+
+    let read_results: Vec<CandidateReadResult> = candidates
         .into_par_iter()
         .map(|(rel, path)| {
-            let bytes = std::fs::read(&path).ok()?;
-            if simdutf8::basic::from_utf8(&bytes).is_err() {
-                return None;
+            let meta = match std::fs::metadata(&path) {
+                Ok(m) => m,
+                Err(_) => return CandidateReadResult::Error,
+            };
+            if meta.len() > MAX_FILE_BYTES {
+                return CandidateReadResult::SkippedLarge;
             }
+            let bytes = match std::fs::read(&path) {
+                Ok(b) => b,
+                Err(_) => return CandidateReadResult::Error,
+            };
+            if simdutf8::basic::from_utf8(&bytes).is_err() {
+                return CandidateReadResult::SkippedNonUtf8;
+            }
+            let newline_count = memchr::memchr_iter(b'\n', &bytes).count();
             let dir = rel
                 .rsplit_once('/')
                 .map(|(d, _)| d.to_string())
                 .unwrap_or_default();
-            Some(RepoFile {
+            CandidateReadResult::File(RepoFile {
                 rel_path: rel,
                 dir,
                 bytes,
+                newline_count,
             })
         })
         .collect();
 
     let mut files = Vec::with_capacity(read_results.len());
     let mut total_bytes = 0usize;
+    let mut skipped_large = 0usize;
     let mut skipped_non_utf8 = 0usize;
     for res in read_results {
         match res {
-            Some(f) => {
+            CandidateReadResult::File(f) => {
                 total_bytes += f.bytes.len();
                 files.push(f);
             }
-            None => {
+            CandidateReadResult::SkippedLarge => {
+                skipped_large += 1;
+            }
+            CandidateReadResult::SkippedNonUtf8 => {
                 skipped_non_utf8 += 1;
             }
+            CandidateReadResult::Error => {}
         }
     }
     WalkResult {

@@ -33,7 +33,6 @@ pub(crate) struct EmitInputs<'a, 'b> {
     pub chunk_initial_cols: &'a [i64],
     pub chunk_initial_seg_advs: &'a [f32],
     pub chunk_initial_line_advs: &'a [f64],
-    pub line_bases: &'a [u32],
     pub trie: &'a TrieTable,
     pub bitmap_adv: f32,
     pub em_height_fu: u32,

@@ -836,6 +836,13 @@ impl LayoutEngine {
         }
     }
 
+    /// Sets prefetched inputs from the background prefetch thread for HyperLayout.
+    pub(crate) fn set_hyper_prefetched(&mut self, data: crate::layout_hyper::PrefetchedHyperData) {
+        if let Self::Hyper(ref mut h) = self {
+            h.set_prefetched(data);
+        }
+    }
+
     /// Retrieve generic backend execution phases.
     pub fn phases(&self) -> crate::repo::BackendPhases {
         crate::repo::BackendPhases::default()

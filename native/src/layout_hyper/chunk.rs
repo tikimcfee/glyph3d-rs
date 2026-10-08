@@ -22,27 +22,31 @@ pub struct LayoutChunk<'a> {
     pub byte_offset: usize,
 }
 
-/// Slices layout items into chunks (line-aligned when newlines exist, or wrap-aware intra-line for one-liners).
-///
-/// Returns:
-/// - `chunks`: Flat array of all chunks across all items.
-/// - `item_chunk_ranges`: Slice index ranges in `chunks` belonging to each item.
-pub fn slice_items_into_chunks<'a>(
-    items: &[LayoutItem<'a>],
-) -> (Vec<LayoutChunk<'a>>, Vec<std::ops::Range<usize>>) {
-    let mut chunks = Vec::with_capacity(items.len() + 256);
-    let mut item_chunk_ranges = Vec::with_capacity(items.len());
+/// Lifetime-free specification of a chunk within an item.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ChunkDef {
+    pub item_index: usize,
+    pub byte_offset: usize,
+    pub byte_len: usize,
+}
 
-    for (item_index, item) in items.iter().enumerate() {
-        let chunk_start_index = chunks.len();
-        let bytes = item.bytes;
+/// Slices byte buffers into lifetime-free ChunkDefs.
+pub fn slice_byte_buffers_into_chunk_defs(
+    buffers: &[impl AsRef<[u8]>],
+) -> (Vec<ChunkDef>, Vec<std::ops::Range<usize>>) {
+    let mut chunk_defs = Vec::with_capacity(buffers.len() + 256);
+    let mut item_chunk_ranges = Vec::with_capacity(buffers.len());
+
+    for (item_index, item) in buffers.iter().enumerate() {
+        let chunk_start_index = chunk_defs.len();
+        let bytes = item.as_ref();
         let total_bytes = bytes.len();
 
         if total_bytes <= CHUNK_THRESHOLD_BYTES {
-            chunks.push(LayoutChunk {
+            chunk_defs.push(ChunkDef {
                 item_index,
-                bytes,
                 byte_offset: 0,
+                byte_len: total_bytes,
             });
         } else {
             let mut current_offset = 0usize;
@@ -50,10 +54,10 @@ pub fn slice_items_into_chunks<'a>(
             while current_offset < total_bytes {
                 let remaining = total_bytes - current_offset;
                 if remaining <= CHUNK_THRESHOLD_BYTES {
-                    chunks.push(LayoutChunk {
+                    chunk_defs.push(ChunkDef {
                         item_index,
-                        bytes: &bytes[current_offset..total_bytes],
                         byte_offset: current_offset,
+                        byte_len: remaining,
                     });
                     break;
                 }
@@ -63,12 +67,8 @@ pub fn slice_items_into_chunks<'a>(
                 let search_slice = &bytes[target_offset..search_window_end];
 
                 let chunk_end = match memchr::memchr(b'\n', search_slice) {
-                    Some(newline_offset) => {
-                        target_offset + newline_offset + 1
-                    }
+                    Some(newline_offset) => target_offset + newline_offset + 1,
                     None => {
-                        // No newline found within the search window — this is an ultra-long line!
-                        // Slicing at target_offset, aligned to next UTF-8 character boundary.
                         let mut cut = target_offset;
                         while cut < total_bytes && (bytes[cut] & 0xC0) == 0x80 {
                             cut += 1;
@@ -77,17 +77,39 @@ pub fn slice_items_into_chunks<'a>(
                     }
                 };
 
-                chunks.push(LayoutChunk {
+                chunk_defs.push(ChunkDef {
                     item_index,
-                    bytes: &bytes[current_offset..chunk_end],
                     byte_offset: current_offset,
+                    byte_len: chunk_end - current_offset,
                 });
 
                 current_offset = chunk_end;
             }
         }
-        item_chunk_ranges.push(chunk_start_index..chunks.len());
+        item_chunk_ranges.push(chunk_start_index..chunk_defs.len());
     }
+
+    (chunk_defs, item_chunk_ranges)
+}
+
+/// Slices layout items into chunks (line-aligned when newlines exist, or wrap-aware intra-line for one-liners).
+///
+/// Returns:
+/// - `chunks`: Flat array of all chunks across all items.
+/// - `item_chunk_ranges`: Slice index ranges in `chunks` belonging to each item.
+pub fn slice_items_into_chunks<'a>(
+    items: &[LayoutItem<'a>],
+) -> (Vec<LayoutChunk<'a>>, Vec<std::ops::Range<usize>>) {
+    let byte_slices: Vec<&[u8]> = items.iter().map(|it| it.bytes).collect();
+    let (chunk_defs, item_chunk_ranges) = slice_byte_buffers_into_chunk_defs(&byte_slices);
+    let chunks = chunk_defs
+        .into_iter()
+        .map(|def| LayoutChunk {
+            item_index: def.item_index,
+            bytes: &items[def.item_index].bytes[def.byte_offset..def.byte_offset + def.byte_len],
+            byte_offset: def.byte_offset,
+        })
+        .collect();
 
     (chunks, item_chunk_ranges)
 }

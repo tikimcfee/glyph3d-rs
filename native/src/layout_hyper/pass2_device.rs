@@ -39,6 +39,47 @@ pub(crate) trait SlotEmit: Sync {
         row: i64,
         wrap_segment: i64,
     ) -> Self::Slot;
+    #[allow(clippy::too_many_arguments)]
+    fn emit_fast(
+        pos_x: f32,
+        glyph_id: u32,
+        color: u32,
+        row_py: f32,
+        row_pz: f32,
+        row_u32: u32,
+        wrap_high: u32,
+        item_and_group: u32,
+        group_id: u32,
+        ascii_adv: f32,
+    ) -> Self::Slot;
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn emit_burst8(
+        dest: *mut Self::Slot,
+        pos_xs: [f32; 8],
+        glyph_ids: [u32; 8],
+        colors: [u32; 8],
+        row_py: f32,
+        row_pz: f32,
+        row_u32: u32,
+        wrap_high: u32,
+        item_and_group: u32,
+        group_id: u32,
+        ascii_adv: f32,
+    );
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn emit_burst4(
+        dest: *mut Self::Slot,
+        pos_xs: [f32; 4],
+        glyph_ids: [u32; 4],
+        colors: [u32; 4],
+        row_py: f32,
+        row_pz: f32,
+        row_u32: u32,
+        wrap_high: u32,
+        item_and_group: u32,
+        group_id: u32,
+        ascii_adv: f32,
+    );
     /// `(glyph_id, color)` — the tint fold's view of a slot.
     fn tint_pair(s: &Self::Slot) -> [u32; 2];
 }
@@ -70,6 +111,72 @@ impl SlotEmit for RenderEmit {
             advance,
             height,
         }
+    }
+    #[inline(always)]
+    fn emit_fast(
+        pos_x: f32,
+        glyph_id: u32,
+        color: u32,
+        row_py: f32,
+        row_pz: f32,
+        _row_u32: u32,
+        _wrap_high: u32,
+        _item_and_group: u32,
+        group_id: u32,
+        ascii_adv: f32,
+    ) -> RenderSlot {
+        RenderSlot {
+            pos: [pos_x, row_py, row_pz],
+            glyph_id,
+            color,
+            group_id,
+            advance: ascii_adv,
+            height: crate::text::CELL_HEIGHT_WORLD,
+        }
+    }
+    #[inline(always)]
+    unsafe fn emit_burst8(
+        dest: *mut RenderSlot,
+        pos_xs: [f32; 8],
+        glyph_ids: [u32; 8],
+        colors: [u32; 8],
+        row_py: f32,
+        row_pz: f32,
+        _row_u32: u32,
+        _wrap_high: u32,
+        _item_and_group: u32,
+        group_id: u32,
+        ascii_adv: f32,
+    ) {
+        let cell_h = crate::text::CELL_HEIGHT_WORLD;
+        dest.write(RenderSlot { pos: [pos_xs[0], row_py, row_pz], glyph_id: glyph_ids[0], color: colors[0], group_id, advance: ascii_adv, height: cell_h });
+        dest.add(1).write(RenderSlot { pos: [pos_xs[1], row_py, row_pz], glyph_id: glyph_ids[1], color: colors[1], group_id, advance: ascii_adv, height: cell_h });
+        dest.add(2).write(RenderSlot { pos: [pos_xs[2], row_py, row_pz], glyph_id: glyph_ids[2], color: colors[2], group_id, advance: ascii_adv, height: cell_h });
+        dest.add(3).write(RenderSlot { pos: [pos_xs[3], row_py, row_pz], glyph_id: glyph_ids[3], color: colors[3], group_id, advance: ascii_adv, height: cell_h });
+        dest.add(4).write(RenderSlot { pos: [pos_xs[4], row_py, row_pz], glyph_id: glyph_ids[4], color: colors[4], group_id, advance: ascii_adv, height: cell_h });
+        dest.add(5).write(RenderSlot { pos: [pos_xs[5], row_py, row_pz], glyph_id: glyph_ids[5], color: colors[5], group_id, advance: ascii_adv, height: cell_h });
+        dest.add(6).write(RenderSlot { pos: [pos_xs[6], row_py, row_pz], glyph_id: glyph_ids[6], color: colors[6], group_id, advance: ascii_adv, height: cell_h });
+        dest.add(7).write(RenderSlot { pos: [pos_xs[7], row_py, row_pz], glyph_id: glyph_ids[7], color: colors[7], group_id, advance: ascii_adv, height: cell_h });
+    }
+    #[inline(always)]
+    unsafe fn emit_burst4(
+        dest: *mut RenderSlot,
+        pos_xs: [f32; 4],
+        glyph_ids: [u32; 4],
+        colors: [u32; 4],
+        row_py: f32,
+        row_pz: f32,
+        _row_u32: u32,
+        _wrap_high: u32,
+        _item_and_group: u32,
+        group_id: u32,
+        ascii_adv: f32,
+    ) {
+        let cell_h = crate::text::CELL_HEIGHT_WORLD;
+        dest.write(RenderSlot { pos: [pos_xs[0], row_py, row_pz], glyph_id: glyph_ids[0], color: colors[0], group_id, advance: ascii_adv, height: cell_h });
+        dest.add(1).write(RenderSlot { pos: [pos_xs[1], row_py, row_pz], glyph_id: glyph_ids[1], color: colors[1], group_id, advance: ascii_adv, height: cell_h });
+        dest.add(2).write(RenderSlot { pos: [pos_xs[2], row_py, row_pz], glyph_id: glyph_ids[2], color: colors[2], group_id, advance: ascii_adv, height: cell_h });
+        dest.add(3).write(RenderSlot { pos: [pos_xs[3], row_py, row_pz], glyph_id: glyph_ids[3], color: colors[3], group_id, advance: ascii_adv, height: cell_h });
     }
     #[inline(always)]
     fn tint_pair(s: &RenderSlot) -> [u32; 2] {
@@ -106,6 +213,69 @@ impl SlotEmit for DerivedEmit {
             (item_idx & 0xFFFF) as u16,
             (group_id & 0xFFFF) as u16,
         )
+    }
+    #[inline(always)]
+    fn emit_fast(
+        pos_x: f32,
+        glyph_id: u32,
+        color: u32,
+        _row_py: f32,
+        _row_pz: f32,
+        row_u32: u32,
+        wrap_high: u32,
+        item_and_group: u32,
+        _group_id: u32,
+        _ascii_adv: f32,
+    ) -> DerivedSlot {
+        DerivedSlot {
+            x: pos_x,
+            row: row_u32,
+            glyph_and_wrap: (glyph_id & 0xFFFF) | wrap_high,
+            color,
+            item_and_group,
+        }
+    }
+    #[inline(always)]
+    unsafe fn emit_burst8(
+        dest: *mut DerivedSlot,
+        pos_xs: [f32; 8],
+        glyph_ids: [u32; 8],
+        colors: [u32; 8],
+        _row_py: f32,
+        _row_pz: f32,
+        row_u32: u32,
+        wrap_high: u32,
+        item_and_group: u32,
+        _group_id: u32,
+        _ascii_adv: f32,
+    ) {
+        dest.write(DerivedSlot { x: pos_xs[0], row: row_u32, glyph_and_wrap: (glyph_ids[0] & 0xFFFF) | wrap_high, color: colors[0], item_and_group });
+        dest.add(1).write(DerivedSlot { x: pos_xs[1], row: row_u32, glyph_and_wrap: (glyph_ids[1] & 0xFFFF) | wrap_high, color: colors[1], item_and_group });
+        dest.add(2).write(DerivedSlot { x: pos_xs[2], row: row_u32, glyph_and_wrap: (glyph_ids[2] & 0xFFFF) | wrap_high, color: colors[2], item_and_group });
+        dest.add(3).write(DerivedSlot { x: pos_xs[3], row: row_u32, glyph_and_wrap: (glyph_ids[3] & 0xFFFF) | wrap_high, color: colors[3], item_and_group });
+        dest.add(4).write(DerivedSlot { x: pos_xs[4], row: row_u32, glyph_and_wrap: (glyph_ids[4] & 0xFFFF) | wrap_high, color: colors[4], item_and_group });
+        dest.add(5).write(DerivedSlot { x: pos_xs[5], row: row_u32, glyph_and_wrap: (glyph_ids[5] & 0xFFFF) | wrap_high, color: colors[5], item_and_group });
+        dest.add(6).write(DerivedSlot { x: pos_xs[6], row: row_u32, glyph_and_wrap: (glyph_ids[6] & 0xFFFF) | wrap_high, color: colors[6], item_and_group });
+        dest.add(7).write(DerivedSlot { x: pos_xs[7], row: row_u32, glyph_and_wrap: (glyph_ids[7] & 0xFFFF) | wrap_high, color: colors[7], item_and_group });
+    }
+    #[inline(always)]
+    unsafe fn emit_burst4(
+        dest: *mut DerivedSlot,
+        pos_xs: [f32; 4],
+        glyph_ids: [u32; 4],
+        colors: [u32; 4],
+        _row_py: f32,
+        _row_pz: f32,
+        row_u32: u32,
+        wrap_high: u32,
+        item_and_group: u32,
+        _group_id: u32,
+        _ascii_adv: f32,
+    ) {
+        dest.write(DerivedSlot { x: pos_xs[0], row: row_u32, glyph_and_wrap: (glyph_ids[0] & 0xFFFF) | wrap_high, color: colors[0], item_and_group });
+        dest.add(1).write(DerivedSlot { x: pos_xs[1], row: row_u32, glyph_and_wrap: (glyph_ids[1] & 0xFFFF) | wrap_high, color: colors[1], item_and_group });
+        dest.add(2).write(DerivedSlot { x: pos_xs[2], row: row_u32, glyph_and_wrap: (glyph_ids[2] & 0xFFFF) | wrap_high, color: colors[2], item_and_group });
+        dest.add(3).write(DerivedSlot { x: pos_xs[3], row: row_u32, glyph_and_wrap: (glyph_ids[3] & 0xFFFF) | wrap_high, color: colors[3], item_and_group });
     }
     #[inline(always)]
     fn tint_pair(s: &DerivedSlot) -> [u32; 2] {
@@ -147,7 +317,6 @@ fn layout_pass2_chunk<E: SlotEmit>(
     initial_col: i64,
     initial_seg_adv: f32,
     initial_line_adv: f64,
-    _line_base: u32,
     trie: &TrieTable,
     bitmap_adv: f32,
     em_height_fu: u32,
@@ -199,6 +368,8 @@ fn layout_pass2_chunk<E: SlotEmit>(
     } else {
         Vec::new()
     };
+    let mut stack_line_colors = [crate::layout::DEFAULT_COLOR_PACKED; 256];
+
     if is_syntax_heuristic && initial_col > 0 {
         let first_nl = match memchr::memchr(b'\n', bytes) {
             Some(off) => off,
@@ -259,6 +430,13 @@ fn layout_pass2_chunk<E: SlotEmit>(
     let mut last_ink_z = f32::NAN;
     let mut emoji_cells = 0usize;
 
+    let tint_default = [lut[212], lut[212], lut[212]];
+    let tint_keyword = [lut[197], lut[134], lut[192]];
+    let tint_number = [lut[181], lut[206], lut[168]];
+    let tint_string = [lut[206], lut[145], lut[120]];
+    let tint_comment = [lut[106], lut[153], lut[85]];
+    let tint_punct = [lut[128], lut[128], lut[128]];
+
     let mut pos = 0usize;
     let mut span_idx = if let Paint::ByteSpans(spans) = item.paint {
         spans.partition_point(|s| s.end <= chunk_byte_offset as u32)
@@ -277,9 +455,15 @@ fn layout_pass2_chunk<E: SlotEmit>(
             let line_len = line_bytes.len();
             let is_pure_ascii = crate::text::is_pure_printable_ascii(line_bytes);
 
+            let mut ascii_syntax_counts = None;
             if is_syntax_heuristic {
                 if is_pure_ascii {
-                    crate::text::colorize_pure_ascii_line(line_bytes, &mut line_colors);
+                    let counts = if line_len <= 256 {
+                        crate::text::colorize_pure_ascii_line_slice(line_bytes, &mut stack_line_colors[..line_len])
+                    } else {
+                        crate::text::colorize_pure_ascii_line(line_bytes, &mut line_colors)
+                    };
+                    ascii_syntax_counts = Some(counts);
                 } else {
                     crate::text::colorize_line_into(line_bytes, &mut line_colors);
                 }
@@ -287,6 +471,51 @@ fn layout_pass2_chunk<E: SlotEmit>(
 
             // Line-level ASCII fast path (handles both single-segment and wrapped multi-segment lines):
             if !matches!(item.paint, Paint::ByteSpans(_)) && is_pure_ascii {
+                if flat_color.is_none() {
+                    if let Some(counts) = ascii_syntax_counts {
+                        file_s0 += counts[0] as f64 * tint_default[0]
+                                 + counts[1] as f64 * tint_keyword[0]
+                                 + counts[2] as f64 * tint_number[0]
+                                 + counts[3] as f64 * tint_string[0]
+                                 + counts[4] as f64 * tint_comment[0]
+                                 + counts[5] as f64 * tint_punct[0];
+                        file_s1 += counts[0] as f64 * tint_default[1]
+                                 + counts[1] as f64 * tint_keyword[1]
+                                 + counts[2] as f64 * tint_number[1]
+                                 + counts[3] as f64 * tint_string[1]
+                                 + counts[4] as f64 * tint_comment[1]
+                                 + counts[5] as f64 * tint_punct[1];
+                        file_s2 += counts[0] as f64 * tint_default[2]
+                                 + counts[1] as f64 * tint_keyword[2]
+                                 + counts[2] as f64 * tint_number[2]
+                                 + counts[3] as f64 * tint_string[2]
+                                 + counts[4] as f64 * tint_comment[2]
+                                 + counts[5] as f64 * tint_punct[2];
+                        file_cells += line_len;
+                    } else if let Some(colors) = per_record_colors {
+                        let line_c = if record_idx + line_len <= colors.len() {
+                            &colors[record_idx..record_idx + line_len]
+                        } else {
+                            &colors[record_idx..]
+                        };
+                        for &c in line_c {
+                            file_s0 += lut[(c & 0xFF) as usize];
+                            file_s1 += lut[((c >> 8) & 0xFF) as usize];
+                            file_s2 += lut[((c >> 16) & 0xFF) as usize];
+                        }
+                        file_cells += line_c.len();
+                    } else {
+                        let def = crate::layout::DEFAULT_COLOR_PACKED;
+                        let c0 = (def & 0xFF) as usize;
+                        let c1 = ((def >> 8) & 0xFF) as usize;
+                        let c2 = ((def >> 16) & 0xFF) as usize;
+                        file_s0 += lut[c0] * line_len as f64;
+                        file_s1 += lut[c1] * line_len as f64;
+                        file_s2 += lut[c2] * line_len as f64;
+                        file_cells += line_len;
+                    }
+                }
+
                 let seg_limit = if wrap_w > 0 { wrap_w as usize } else { usize::MAX };
                 let mut seg_offset = 0usize;
                 let mut wrap_segment = 0i64;
@@ -342,6 +571,9 @@ fn layout_pass2_chunk<E: SlotEmit>(
 
                     let row_py = cached_py;
                     let row_pz = cached_pz;
+                    let row_u32 = row.max(0) as u32;
+                    let wrap_high = ((wrap_segment.max(0) as u32) & 0xFFFF) << 16;
+                    let item_and_group = (item_idx & 0xFFFF) | ((group_id & 0xFFFF) << 16);
                     let start_survivors = survivor_out;
 
                     let qw = ascii_adv.max(crate::text::CELL_HEIGHT_WORLD);
@@ -363,7 +595,13 @@ fn layout_pass2_chunk<E: SlotEmit>(
                         if let Some(c) = flat_color {
                             c
                         } else if is_syntax_heuristic {
-                            if idx < line_colors.len() {
+                            if line_len <= 256 {
+                                if idx < line_len {
+                                    stack_line_colors[idx]
+                                } else {
+                                    crate::layout::DEFAULT_COLOR_PACKED
+                                }
+                            } else if idx < line_colors.len() {
                                 line_colors[idx]
                             } else {
                                 crate::layout::DEFAULT_COLOR_PACKED
@@ -379,7 +617,192 @@ fn layout_pass2_chunk<E: SlotEmit>(
                         }
                     };
 
+                    let ascii_adv_f64 = ascii_adv as f64;
                     let mut char_idx_in_seg = 0usize;
+
+                    // 8-wide burst loop:
+                    while char_idx_in_seg + 8 <= seg_bytes.len() {
+                        let b0 = seg_bytes[char_idx_in_seg];
+                        let b1 = seg_bytes[char_idx_in_seg + 1];
+                        let b2 = seg_bytes[char_idx_in_seg + 2];
+                        let b3 = seg_bytes[char_idx_in_seg + 3];
+                        let b4 = seg_bytes[char_idx_in_seg + 4];
+                        let b5 = seg_bytes[char_idx_in_seg + 5];
+                        let b6 = seg_bytes[char_idx_in_seg + 6];
+                        let b7 = seg_bytes[char_idx_in_seg + 7];
+
+                        let g0 = trie.fast_byte_table[b0 as usize].glyph_id;
+                        let g1 = trie.fast_byte_table[b1 as usize].glyph_id;
+                        let g2 = trie.fast_byte_table[b2 as usize].glyph_id;
+                        let g3 = trie.fast_byte_table[b3 as usize].glyph_id;
+                        let g4 = trie.fast_byte_table[b4 as usize].glyph_id;
+                        let g5 = trie.fast_byte_table[b5 as usize].glyph_id;
+                        let g6 = trie.fast_byte_table[b6 as usize].glyph_id;
+                        let g7 = trie.fast_byte_table[b7 as usize].glyph_id;
+
+                        if g0 != 0 && g1 != 0 && g2 != 0 && g3 != 0
+                            && g4 != 0 && g5 != 0 && g6 != 0 && g7 != 0
+                            && (!has_blocks || cur_blk_count + 8 <= SUBSEG_BLOCK_SIZE)
+                        {
+                            let char_idx0 = seg_offset + char_idx_in_seg;
+
+                            let adv0 = line_adv_f64;
+                            let adv1 = adv0 + ascii_adv_f64;
+                            let adv2 = adv1 + ascii_adv_f64;
+                            let adv3 = adv2 + ascii_adv_f64;
+                            let adv4 = adv3 + ascii_adv_f64;
+                            let adv5 = adv4 + ascii_adv_f64;
+                            let adv6 = adv5 + ascii_adv_f64;
+                            let adv7 = adv6 + ascii_adv_f64;
+                            line_adv_f64 = adv7 + ascii_adv_f64;
+
+                            let s0 = seg_adv_f32;
+                            let s1 = s0 + ascii_adv;
+                            let s2 = s1 + ascii_adv;
+                            let s3 = s2 + ascii_adv;
+                            let s4 = s3 + ascii_adv;
+                            let s5 = s4 + ascii_adv;
+                            let s6 = s5 + ascii_adv;
+                            let s7 = s6 + ascii_adv;
+                            seg_adv_f32 = s7 + ascii_adv;
+
+                            let (x0, x1, x2, x3, x4, x5, x6, x7) = if fold_unit > 0 {
+                                (
+                                    (s0 as f64 + origin_x) as f32,
+                                    (s1 as f64 + origin_x) as f32,
+                                    (s2 as f64 + origin_x) as f32,
+                                    (s3 as f64 + origin_x) as f32,
+                                    (s4 as f64 + origin_x) as f32,
+                                    (s5 as f64 + origin_x) as f32,
+                                    (s6 as f64 + origin_x) as f32,
+                                    (s7 as f64 + origin_x) as f32,
+                                )
+                            } else {
+                                (
+                                    (adv0 + origin_x) as f32,
+                                    (adv1 + origin_x) as f32,
+                                    (adv2 + origin_x) as f32,
+                                    (adv3 + origin_x) as f32,
+                                    (adv4 + origin_x) as f32,
+                                    (adv5 + origin_x) as f32,
+                                    (adv6 + origin_x) as f32,
+                                    (adv7 + origin_x) as f32,
+                                )
+                            };
+
+                            let (pos_x0, pos_x1, pos_x2, pos_x3, pos_x4, pos_x5, pos_x6, pos_x7) = if page_active {
+                                (
+                                    (x0 as f64 + cached_page_x_off) as f32,
+                                    (x1 as f64 + cached_page_x_off) as f32,
+                                    (x2 as f64 + cached_page_x_off) as f32,
+                                    (x3 as f64 + cached_page_x_off) as f32,
+                                    (x4 as f64 + cached_page_x_off) as f32,
+                                    (x5 as f64 + cached_page_x_off) as f32,
+                                    (x6 as f64 + cached_page_x_off) as f32,
+                                    (x7 as f64 + cached_page_x_off) as f32,
+                                )
+                            } else {
+                                (x0, x1, x2, x3, x4, x5, x6, x7)
+                            };
+                            last_char_pos_x = pos_x7;
+
+                            if seg_first_survivor_x.is_nan() {
+                                seg_first_survivor_x = pos_x0;
+                            }
+                            seg_last_survivor_right = pos_x7 + ascii_adv;
+
+                            let (c0, c1, c2, c3, c4, c5, c6, c7) = if let Some(c) = flat_color {
+                                (c, c, c, c, c, c, c, c)
+                            } else if is_syntax_heuristic {
+                                if line_len <= 256 {
+                                    (
+                                        stack_line_colors[char_idx0],
+                                        stack_line_colors[char_idx0 + 1],
+                                        stack_line_colors[char_idx0 + 2],
+                                        stack_line_colors[char_idx0 + 3],
+                                        stack_line_colors[char_idx0 + 4],
+                                        stack_line_colors[char_idx0 + 5],
+                                        stack_line_colors[char_idx0 + 6],
+                                        stack_line_colors[char_idx0 + 7],
+                                    )
+                                } else {
+                                    (
+                                        line_colors[char_idx0],
+                                        line_colors[char_idx0 + 1],
+                                        line_colors[char_idx0 + 2],
+                                        line_colors[char_idx0 + 3],
+                                        line_colors[char_idx0 + 4],
+                                        line_colors[char_idx0 + 5],
+                                        line_colors[char_idx0 + 6],
+                                        line_colors[char_idx0 + 7],
+                                    )
+                                }
+                            } else if per_record_colors.is_some() {
+                                (
+                                    get_color(char_idx0),
+                                    get_color(char_idx0 + 1),
+                                    get_color(char_idx0 + 2),
+                                    get_color(char_idx0 + 3),
+                                    get_color(char_idx0 + 4),
+                                    get_color(char_idx0 + 5),
+                                    get_color(char_idx0 + 6),
+                                    get_color(char_idx0 + 7),
+                                )
+                            } else {
+                                let def = crate::layout::DEFAULT_COLOR_PACKED;
+                                (def, def, def, def, def, def, def, def)
+                            };
+
+                            unsafe {
+                                E::emit_burst8(
+                                    out_ptr.add(survivor_out),
+                                    [pos_x0, pos_x1, pos_x2, pos_x3, pos_x4, pos_x5, pos_x6, pos_x7],
+                                    [g0, g1, g2, g3, g4, g5, g6, g7],
+                                    [c0, c1, c2, c3, c4, c5, c6, c7],
+                                    row_py,
+                                    row_pz,
+                                    row_u32,
+                                    wrap_high,
+                                    item_and_group,
+                                    group_id,
+                                    ascii_adv,
+                                );
+                            }
+                            survivor_out += 8;
+
+                            if has_blocks {
+                                if cur_blk_count == 0 {
+                                    cur_blk_min_x = pos_x0;
+                                }
+                                cur_blk_max_x = pos_x7 + qw;
+                                cur_blk_count += 8;
+                                if cur_blk_count == SUBSEG_BLOCK_SIZE {
+                                    if cur_blk_min_x <= cur_blk_max_x && cur_blk_min_y <= cur_blk_max_y {
+                                        local_blocks.push(BlockCull {
+                                            min: [cur_blk_min_x, cur_blk_min_y, cur_blk_min_z],
+                                            max: [cur_blk_max_x, cur_blk_max_y, cur_blk_max_z],
+                                            slot_base: chunk_rel_slot + (survivor_out - SUBSEG_BLOCK_SIZE) as u32,
+                                            slot_count: SUBSEG_BLOCK_SIZE as u32,
+                                        });
+                                    }
+                                    cur_blk_min_x = f32::INFINITY;
+                                    cur_blk_min_y = y_lo;
+                                    cur_blk_min_z = row_pz;
+                                    cur_blk_max_x = f32::NEG_INFINITY;
+                                    cur_blk_max_y = y_hi;
+                                    cur_blk_max_z = row_pz;
+                                    cur_blk_count = 0;
+                                }
+                            }
+
+                            char_idx_in_seg += 8;
+                            continue;
+                        }
+
+                        break;
+                    }
+
+                    // 4-wide burst loop:
                     while char_idx_in_seg + 4 <= seg_bytes.len() {
                         let b0 = seg_bytes[char_idx_in_seg];
                         let b1 = seg_bytes[char_idx_in_seg + 1];
@@ -392,56 +815,103 @@ fn layout_pass2_chunk<E: SlotEmit>(
                         let g3 = trie.fast_byte_table[b3 as usize].glyph_id;
 
                         if g0 != 0 && g1 != 0 && g2 != 0 && g3 != 0 && (!has_blocks || cur_blk_count + 4 <= SUBSEG_BLOCK_SIZE) {
+
+
                             let char_idx0 = seg_offset + char_idx_in_seg;
 
-                            let item_rel_x0 = if fold_unit > 0 { seg_adv_f32 as f64 } else { line_adv_f64 };
-                            let base_x0 = (item_rel_x0 + origin_x) as f32;
-                            let pos_x0 = if page_active { (base_x0 as f64 + cached_page_x_off) as f32 } else { base_x0 };
-                            line_adv_f64 += ascii_adv as f64;
-                            seg_adv_f32 += ascii_adv;
+                            let adv0 = line_adv_f64;
+                            let adv1 = adv0 + ascii_adv_f64;
+                            let adv2 = adv1 + ascii_adv_f64;
+                            let adv3 = adv2 + ascii_adv_f64;
+                            line_adv_f64 = adv3 + ascii_adv_f64;
 
-                            let item_rel_x1 = if fold_unit > 0 { seg_adv_f32 as f64 } else { line_adv_f64 };
-                            let base_x1 = (item_rel_x1 + origin_x) as f32;
-                            let pos_x1 = if page_active { (base_x1 as f64 + cached_page_x_off) as f32 } else { base_x1 };
-                            line_adv_f64 += ascii_adv as f64;
-                            seg_adv_f32 += ascii_adv;
+                            let s0 = seg_adv_f32;
+                            let s1 = s0 + ascii_adv;
+                            let s2 = s1 + ascii_adv;
+                            let s3 = s2 + ascii_adv;
+                            seg_adv_f32 = s3 + ascii_adv;
 
-                            let item_rel_x2 = if fold_unit > 0 { seg_adv_f32 as f64 } else { line_adv_f64 };
-                            let base_x2 = (item_rel_x2 + origin_x) as f32;
-                            let pos_x2 = if page_active { (base_x2 as f64 + cached_page_x_off) as f32 } else { base_x2 };
-                            line_adv_f64 += ascii_adv as f64;
-                            seg_adv_f32 += ascii_adv;
+                            let (x0, x1, x2, x3) = if fold_unit > 0 {
+                                (
+                                    (s0 as f64 + origin_x) as f32,
+                                    (s1 as f64 + origin_x) as f32,
+                                    (s2 as f64 + origin_x) as f32,
+                                    (s3 as f64 + origin_x) as f32,
+                                )
+                            } else {
+                                (
+                                    (adv0 + origin_x) as f32,
+                                    (adv1 + origin_x) as f32,
+                                    (adv2 + origin_x) as f32,
+                                    (adv3 + origin_x) as f32,
+                                )
+                            };
 
-                            let item_rel_x3 = if fold_unit > 0 { seg_adv_f32 as f64 } else { line_adv_f64 };
-                            let base_x3 = (item_rel_x3 + origin_x) as f32;
-                            let pos_x3 = if page_active { (base_x3 as f64 + cached_page_x_off) as f32 } else { base_x3 };
+                            let (pos_x0, pos_x1, pos_x2, pos_x3) = if page_active {
+                                (
+                                    (x0 as f64 + cached_page_x_off) as f32,
+                                    (x1 as f64 + cached_page_x_off) as f32,
+                                    (x2 as f64 + cached_page_x_off) as f32,
+                                    (x3 as f64 + cached_page_x_off) as f32,
+                                )
+                            } else {
+                                (x0, x1, x2, x3)
+                            };
                             last_char_pos_x = pos_x3;
-                            line_adv_f64 += ascii_adv as f64;
-                            seg_adv_f32 += ascii_adv;
 
                             if seg_first_survivor_x.is_nan() {
                                 seg_first_survivor_x = pos_x0;
                             }
                             seg_last_survivor_right = pos_x3 + ascii_adv;
 
-                            let c0 = get_color(char_idx0);
-                            let c1 = get_color(char_idx0 + 1);
-                            let c2 = get_color(char_idx0 + 2);
-                            let c3 = get_color(char_idx0 + 3);
-
-                            if flat_color.is_none() {
-                                file_s0 += lut[(c0 & 0xFF) as usize] + lut[(c1 & 0xFF) as usize] + lut[(c2 & 0xFF) as usize] + lut[(c3 & 0xFF) as usize];
-                                file_s1 += lut[((c0 >> 8) & 0xFF) as usize] + lut[((c1 >> 8) & 0xFF) as usize] + lut[((c2 >> 8) & 0xFF) as usize] + lut[((c3 >> 8) & 0xFF) as usize];
-                                file_s2 += lut[((c0 >> 16) & 0xFF) as usize] + lut[((c1 >> 16) & 0xFF) as usize] + lut[((c2 >> 16) & 0xFF) as usize] + lut[((c3 >> 16) & 0xFF) as usize];
-                                file_cells += 4;
-                            }
+                            let (c0, c1, c2, c3) = if let Some(c) = flat_color {
+                                (c, c, c, c)
+                            } else if is_syntax_heuristic {
+                                if line_len <= 256 {
+                                    (
+                                        stack_line_colors[char_idx0],
+                                        stack_line_colors[char_idx0 + 1],
+                                        stack_line_colors[char_idx0 + 2],
+                                        stack_line_colors[char_idx0 + 3],
+                                    )
+                                } else {
+                                    (
+                                        line_colors[char_idx0],
+                                        line_colors[char_idx0 + 1],
+                                        line_colors[char_idx0 + 2],
+                                        line_colors[char_idx0 + 3],
+                                    )
+                                }
+                            } else if per_record_colors.is_some() {
+                                (
+                                    get_color(char_idx0),
+                                    get_color(char_idx0 + 1),
+                                    get_color(char_idx0 + 2),
+                                    get_color(char_idx0 + 3),
+                                )
+                            } else {
+                                (
+                                    crate::layout::DEFAULT_COLOR_PACKED,
+                                    crate::layout::DEFAULT_COLOR_PACKED,
+                                    crate::layout::DEFAULT_COLOR_PACKED,
+                                    crate::layout::DEFAULT_COLOR_PACKED,
+                                )
+                            };
 
                             unsafe {
-                                let p = out_ptr.add(survivor_out);
-                                p.write(E::emit(pos_x0, row_py, row_pz, g0, c0, group_id, item_idx, ascii_adv, crate::text::CELL_HEIGHT_WORLD, row, wrap_segment));
-                                p.add(1).write(E::emit(pos_x1, row_py, row_pz, g1, c1, group_id, item_idx, ascii_adv, crate::text::CELL_HEIGHT_WORLD, row, wrap_segment));
-                                p.add(2).write(E::emit(pos_x2, row_py, row_pz, g2, c2, group_id, item_idx, ascii_adv, crate::text::CELL_HEIGHT_WORLD, row, wrap_segment));
-                                p.add(3).write(E::emit(pos_x3, row_py, row_pz, g3, c3, group_id, item_idx, ascii_adv, crate::text::CELL_HEIGHT_WORLD, row, wrap_segment));
+                                E::emit_burst4(
+                                    out_ptr.add(survivor_out),
+                                    [pos_x0, pos_x1, pos_x2, pos_x3],
+                                    [g0, g1, g2, g3],
+                                    [c0, c1, c2, c3],
+                                    row_py,
+                                    row_pz,
+                                    row_u32,
+                                    wrap_high,
+                                    item_and_group,
+                                    group_id,
+                                    ascii_adv,
+                                );
                             }
                             survivor_out += 4;
 
@@ -475,6 +945,7 @@ fn layout_pass2_chunk<E: SlotEmit>(
                         }
 
                         // Fallback single character:
+                        let b = seg_bytes[char_idx_in_seg];
                         let char_idx = seg_offset + char_idx_in_seg;
                         let item_rel_x = if fold_unit > 0 { seg_adv_f32 as f64 } else { line_adv_f64 };
                         let base_x = (item_rel_x + origin_x) as f32;
@@ -484,9 +955,10 @@ fn layout_pass2_chunk<E: SlotEmit>(
                             base_x
                         };
                         last_char_pos_x = pos_x;
-                        line_adv_f64 += ascii_adv as f64;
+                        line_adv_f64 += ascii_adv_f64;
                         seg_adv_f32 += ascii_adv;
 
+                        let g0 = trie.fast_byte_table[b as usize].glyph_id;
                         if g0 != 0 {
                             if seg_first_survivor_x.is_nan() {
                                 seg_first_survivor_x = pos_x;
@@ -494,29 +966,19 @@ fn layout_pass2_chunk<E: SlotEmit>(
                             seg_last_survivor_right = pos_x + ascii_adv;
 
                             let color = get_color(char_idx);
-                            if flat_color.is_none() {
-                                let c0 = (color & 0xFF) as usize;
-                                let c1 = ((color >> 8) & 0xFF) as usize;
-                                let c2 = ((color >> 16) & 0xFF) as usize;
-                                file_s0 += lut[c0];
-                                file_s1 += lut[c1];
-                                file_s2 += lut[c2];
-                                file_cells += 1;
-                            }
 
                             unsafe {
-                                out_ptr.add(survivor_out).write(E::emit(
+                                out_ptr.add(survivor_out).write(E::emit_fast(
                                     pos_x,
-                                    row_py,
-                                    row_pz,
                                     g0,
                                     color,
+                                    row_py,
+                                    row_pz,
+                                    row_u32,
+                                    wrap_high,
+                                    item_and_group,
                                     group_id,
-                                    item_idx,
                                     ascii_adv,
-                                    crate::text::CELL_HEIGHT_WORLD,
-                                    row,
-                                    wrap_segment,
                                 ));
                             }
                             survivor_out += 1;
@@ -548,6 +1010,7 @@ fn layout_pass2_chunk<E: SlotEmit>(
                             }
                         }
                         char_idx_in_seg += 1;
+
                     }
 
                     // Trailing 0..3 characters in segment:
@@ -573,29 +1036,19 @@ fn layout_pass2_chunk<E: SlotEmit>(
                             seg_last_survivor_right = pos_x + ascii_adv;
 
                             let color = get_color(char_idx);
-                            if flat_color.is_none() {
-                                let c0 = (color & 0xFF) as usize;
-                                let c1 = ((color >> 8) & 0xFF) as usize;
-                                let c2 = ((color >> 16) & 0xFF) as usize;
-                                file_s0 += lut[c0];
-                                file_s1 += lut[c1];
-                                file_s2 += lut[c2];
-                                file_cells += 1;
-                            }
 
                             unsafe {
-                                out_ptr.add(survivor_out).write(E::emit(
+                                out_ptr.add(survivor_out).write(E::emit_fast(
                                     pos_x,
-                                    row_py,
-                                    row_pz,
                                     glyph_id,
                                     color,
+                                    row_py,
+                                    row_pz,
+                                    row_u32,
+                                    wrap_high,
+                                    item_and_group,
                                     group_id,
-                                    item_idx,
                                     ascii_adv,
-                                    crate::text::CELL_HEIGHT_WORLD,
-                                    row,
-                                    wrap_segment,
                                 ));
                             }
                             survivor_out += 1;
@@ -939,7 +1392,6 @@ pub(crate) fn layout_pass2_device<E: SlotEmit>(
     inputs: &super::device_alloc::EmitInputs<'_, '_>,
     dest_addr: usize,
 ) -> Pass2DeviceOutput {
-    debug_assert!(!E::USES_LINES || inputs.line_bases.len() == inputs.items.len());
     let lut = crate::glyph_scene::srgb_to_linear_table();
 
     let chunk_results: Vec<ChunkPass2Output> = inputs
@@ -957,7 +1409,6 @@ pub(crate) fn layout_pass2_device<E: SlotEmit>(
             let initial_col = inputs.chunk_initial_cols[chunk_idx];
             let initial_seg_adv = inputs.chunk_initial_seg_advs[chunk_idx];
             let initial_line_adv = inputs.chunk_initial_line_advs[chunk_idx];
-            let line_base = if E::USES_LINES { inputs.line_bases[item_idx] } else { 0 };
 
             layout_pass2_chunk::<E>(
                 chunk.bytes,
@@ -972,7 +1423,6 @@ pub(crate) fn layout_pass2_device<E: SlotEmit>(
                 initial_col,
                 initial_seg_adv,
                 initial_line_adv,
-                line_base,
                 inputs.trie,
                 inputs.bitmap_adv,
                 inputs.em_height_fu,
