@@ -15,13 +15,17 @@ time.
 ## Layout
 
 - `native/` — the pure-Rust renderer and layout engine binary (`glyph3d-native`).
-  Features sub-second repo loading (`HyperLayout`) and modularized Slug WGSL rendering.
+  Features sub-200ms repo loading (`HyperLayout`) and modularized Slug WGSL rendering.
 - `glyph/` — the verification gate and mutation test runner (`cargo run -p glyph -- validate`).
 - `crates/` — the glyph field, split by render mode (2026-10): `glyph-field` is the
   mode-neutral contract (`GlyphField` trait, `GlyphFieldMode`, the shared records and
   binding map); `glyph-field-instanced` is the Instanced mode (32 B `RenderSlot`, its
-  upload path, pipelines and `glyph_field.wgsl`). Chosen at load with `--field-mode`.
-- `tools/` — check scripts, generators, and repro helpers.
+  upload path, pipelines and `glyph_field.wgsl`); `glyph-field-derived` is the Derived mode
+  (20 B `DerivedSlot`, GPU vertex-stage Y/Z derivation, and `glyph_field_derived.wgsl`).
+  Chosen at load with `--field-mode instanced|derived`.
+- `tools/` — check scripts, generators, `bench_hyper.py` performance harness, and repro helpers.
+- `.agents/` — agent house rules (`rules/rust-engineering.md`) and operational testing skill
+  (`skills/glyph-engine-testing/SKILL.md`).
 - `assets/atlas/` — prebaked glyph-geometry binaries (+ `FORMAT.md`).
 - `schema/glyph-identity.json` — layout source of truth (vendored, hash-pinned).
 - `out/` — historical reports, proof PNGs, `tooling-ab/baseline/` (the pixel oracle).
@@ -37,7 +41,7 @@ time.
 # Build the pure-Rust binary directly with Cargo:
 cargo build --release -p glyph3d-native
 
-# Run the test suite (106 unit tests + WGSL validation):
+# Run the test suite (222 unit tests across 13 binaries + WGSL validation):
 cargo test --workspace
 
 # Validate build.toml gates and mutation tests:
@@ -51,12 +55,13 @@ native Rust with Rayon and unified-memory shared buffer mapping.
 
 **Performance characteristics:**
 - Flagship corpus `/Users/lugo/localdev/viz-web/glyph3d-js` (1,306 files, 97.0 MB source,
-  95.2 million glyph instances) loads and lays out in **~0.57s** on Apple Silicon Metal
-  (total visual initialization ~0.93s, 4.4ms submit+render).
+  95.2 million glyph instances) loads and lays out in **~168 ms** backend (576.9 MB/s) /
+  **~177 ms** total visual init in `--color-mode flat`, and **~215 ms** backend (450.9 MB/s) /
+  **~226 ms** total visual init in `--color-mode syntax` on Apple Silicon Metal.
 - Decoupled CubeCL: experimental CubeCL GPU compute kernels are decoupled behind the
   optional Cargo feature `cubecl` (`cargo check --features cubecl`).
 - ByteSpan token painting: `ByteSpan` and `Paint::ByteSpans` provide byte-range semantic
-  token coloring directly from AST/LSP analyses.
+  token coloring directly from AST/LSP analyses into mapped unified memory.
 - Modularized renderer: `glyph_scene.rs` is factored into `setup.rs`, `pipelines.rs`
   (composite) and `render.rs`; the glyph field itself — slot storage, upload, glyph
   pipeline, WGSL — lives behind the `GlyphField` trait in `crates/` (one crate per

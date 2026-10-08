@@ -83,15 +83,19 @@ a backend or a caller; the short version:
   produces none. The CubeCL backend answers the same call (its 48 B arena is
   reconstructed from the records and slot streams — both bit-fenced) — no gate
   pins that pairing; the cubecl-fork gate is its fence.
-- **`cubecl` is the DEFAULT strategy** since E2b (2026-09-29) — the
-  endpoint is the product path: the chain scatters 32 B slots into the
-  buffer the renderer binds, no hop anywhere. `--repo-engine
-  naive|batch|direct` selects a Mojo strategy when you want one (the
-  gates that name a specific pair pin it explicitly); before the flip
-  `direct` was the default (since 2026-09-07), and the repo golden views
-  deliberately pin no strategy, so the default gets pixel coverage —
-  through the flip they stayed byte-equal (the fork fence proves the
-  chain's output bit-identical to the engine's).
+- **`HyperLayout` (`hyper`) is the DEFAULT layout engine** in pure Rust: a parallel,
+  cache-blocked CPU layout engine using Rayon, intra-file line chunking, wrap-aware
+  chunking for minified files, background pipelined prepasses, aligned 8-burst / 4-burst
+  register slot emission, and zero-allocation streaming lexer coloring. Emits 32-byte
+  `RenderSlot` instances in `Instanced` mode or compact 20-byte `DerivedSlot` instances
+  in `Derived` mode directly into mapped GPU unified memory without intermediate copies.
+- `--repo-engine hyper|cubecl|direct|batch` selects the layout engine:
+  - `hyper` (default): parallel Rust CPU layout with sub-200ms visual init.
+  - `cubecl`: experimental pure-GPU compute pipeline (Metal/WGPU; requires `--features cubecl`).
+  - `direct` / `batch`: CPU reference layout strategies for parity verification.
+- `--field-mode instanced|derived` selects the glyph field mode:
+  - `instanced` (32 B per glyph): precomputed 3D coordinates.
+  - `derived` (20 B per glyph): compact word layout, Y/Z derived dynamically in vertex WGSL.
 - A verify over ZERO items refuses. Before 2026-09-07 a missing corpus directory
   printed `PASS: 0 items, 0 instances` and exited 0 — the gate passing having
   compared nothing.
