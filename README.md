@@ -124,4 +124,5 @@ python3 tools/bench_hyper.py --repo /path/to/glyph3d-js -n 5 --color-mode flat
 | `.agents/` | Agent guidelines, house rules (`rules/rust-engineering.md`), and testing skill (`skills/glyph-engine-testing/SKILL.md`) |
 | `assets/atlas/` | Prebaked glyph-geometry binaries + `engine-trie.bin` + `FORMAT.md` |
 | `schema/` | `glyph-identity.json` — single source of truth for buffer/lane layouts |
+| `research/` | GPU architecture studies, web target notes, and `desktop-platform-audit.md` |
 | `out/` | Golden baselines (`tooling-ab/baseline/`), proof PNGs, and historical stage reports |

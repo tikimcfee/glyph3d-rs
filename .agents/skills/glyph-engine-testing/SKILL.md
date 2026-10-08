@@ -94,3 +94,13 @@ GLYPH_CHAIN_PROF=1 ./target/release/glyph3d-native \
 - **In-Engine UI (`egui`)**:
   - The HUD rendered directly inside the 3D graphics window.
   - Controls camera frustum, spatial zone dragging, desk rolodex, and live diagnostics (`F1` toggles debug panel).
+
+---
+
+## 5. Cross-Platform Desktop Considerations
+
+When developing, testing, or benchmarking on non-macOS desktop architectures (x86_64, discrete NVIDIA/AMD GPUs), see the exhaustive guide in `research/desktop-platform-audit.md`:
+- **Direct Unified Memory vs Discrete Staging**: On macOS Metal, slot buffers are directly mapped into DRAM (`mapped_base: Some(addr)`). On desktop discrete GPUs, `layout_device_discrete` routes through mapped staging buffers followed by GPU copy blits (`mapped_base: None`).
+- **Dynamic Color Updates**: When `mapped_base` is `None`, per-slot `write_colors` falls back to single-slot driver writes. Batch dynamic color changes when targeting discrete GPUs.
+- **Cache Sizing**: `CHUNK_THRESHOLD_BYTES = 64 KiB` was sized for Apple Silicon 128 KiB L1D caches. On desktop x86 with 32/48 KiB L1D, test 32 KiB chunks.
+- **GPU Keys**: Baselines are keyed by `<backend>-<vendor>` (`metal-apple`, `vulkan-nvidia`, `vulkan-amd`). New host adapters can be calibrated with `cargo glyph drift`.

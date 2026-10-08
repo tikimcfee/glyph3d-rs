@@ -136,6 +136,23 @@ says how the build tool uses both. `--present-mode fifo|mailbox|immediate` is
 windowed-only and rides on the FPS line, because under Fifo that figure is the
 display's refresh (75 on the first Linux box) and not a fact about the renderer.
 
+## Apple Silicon vs. Desktop x86_64 & Discrete GPU Specifics
+
+Detailed technical audit lives in `research/desktop-platform-audit.md`. Key touchpoints:
+- **Unified vs. Discrete Slot Buffers (`native/src/layout_hyper/device_alloc.rs`)**:
+  - `#[cfg(target_os = "macos")]` allocates Metal `MTLStorageModeShared` memory and maps it (`mapped_base: Some(addr)`). Pass 2 writes directly to device memory with zero copies.
+  - On non-macOS/desktop, `layout_device_discrete` writes to a mapped staging buffer, unmaps, and blits to device VRAM via `encoder.copy_buffer_to_buffer` (`mapped_base: None`).
+  - ⚠️ **Dynamic Color Writes**: When `mapped_base` is `None`, `crates/glyph-field-*/src/storage.rs` `write_colors` falls back to one 4-byte `queue.write_buffer` per slot. On discrete GPUs with large repos, batch these writes to avoid driver call overhead.
+- **Cache Sizing & Chunk Threshold (`native/src/layout_hyper/chunk.rs`)**:
+  - `CHUNK_THRESHOLD_BYTES = 64 * 1024` (64 KiB) is tuned for Apple Silicon M-series L1 Data Cache (128 KiB per P-core).
+  - Desktop x86_64 (AMD Zen 3/4/5, Intel Raptor Lake) has **32 KiB or 48 KiB L1D** per core. A 64 KiB chunk spills to L2. On desktop, testing 32 KiB or 16 KiB thresholds can keep chunks 100% L1D-resident.
+- **Cache Lines & Burst Stores (`native/src/layout_hyper/pass2_device.rs`)**:
+  - `emit_burst8` writes 8 `DerivedSlot`s (160 B) or 4 `RenderSlot`s (128 B). Standard x86_64 cache line width is 64 B (Apple M2 SLC/L2 is 128 B).
+- **Golden Pixel Keys**:
+  - macOS Metal: `metal-apple`. Desktop Linux/Windows: `vulkan-nvidia`, `vulkan-amd`. Golden baselines are keyed per hardware in `out/tooling-ab/baseline/<key>/`.
+- **Pure Rust Portability**:
+  - Zero target-specific inline assembly or architecture-specific intrinsics. LLVM auto-vectorizes clean slice loops to AVX2/AVX-512 on x86_64 and NEON on ARM64. Numerical pick checks (`tools/check-pick-oracle.sh`) are 100% bit-exact across platforms.
+
 ## Debug env vars
 
 - `GLYPH_PROFILE=1` — requests TIMESTAMP_QUERY and builds a wgpu-profiler;
