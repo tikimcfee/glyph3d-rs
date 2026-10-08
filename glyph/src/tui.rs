@@ -64,6 +64,25 @@ pub enum RepoEngine {
     Batch,
 }
 
+impl RepoEngine {
+    pub fn description(self) -> &'static str {
+        match self {
+            RepoEngine::Hyper => {
+                "Parallel CPU Rayon layout writing unified memory. Cache-blocked CPU fold, sub-second repo loading."
+            }
+            RepoEngine::Cubecl => {
+                "Pure GPU parallel compute pipeline (Metal/WGPU) with in-flight UTF-8 decode, parallel Blelloch scan & direct slot emission."
+            }
+            RepoEngine::Direct => {
+                "Direct CPU layout path bypassing intermediate wire records (single-threaded direct arena write)."
+            }
+            RepoEngine::Batch => {
+                "Batched sequential CPU layout engine path writing intermediate wire records."
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PresentMode {
     Fifo,
@@ -75,6 +94,19 @@ pub enum PresentMode {
 pub enum FieldMode {
     Instanced,
     Derived,
+}
+
+impl FieldMode {
+    pub fn description(self) -> &'static str {
+        match self {
+            FieldMode::Instanced => {
+                "32 B RenderSlot per glyph (pre-computed 3D world coordinates X, Y, Z, color, size, UV)."
+            }
+            FieldMode::Derived => {
+                "20 B DerivedSlot per glyph (X, row, glyph/wrap, color, group). Y/Z dynamically derived on GPU in vertex shader."
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1254,7 +1286,7 @@ fn draw_layout_section(f: &mut Frame, area: Rect, state: &LauncherState) {
             | FocusField::ClusterMode
     );
 
-    let block = Block::default()
+    let mut block = Block::default()
         .title(" 2. Layout & Layout Engine ")
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
@@ -1263,6 +1295,13 @@ fn draw_layout_section(f: &mut Frame, area: Rect, state: &LauncherState) {
         } else {
             Style::default().fg(Color::DarkGray)
         });
+
+    if is_engine {
+        if let Some(subtitle) = format_subtitle_description(state.repo_engine.description(), area.width) {
+            block = block.title_bottom(subtitle);
+        }
+    }
+
     f.render_widget(Paragraph::new(lines).block(block), area);
 }
 
@@ -1387,7 +1426,7 @@ fn draw_graphics_section(f: &mut Frame, area: Rect, state: &LauncherState) {
             | FocusField::PresentMode
     );
 
-    let block = Block::default()
+    let mut block = Block::default()
         .title(" 3. Graphics & Shading ")
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
@@ -1396,6 +1435,13 @@ fn draw_graphics_section(f: &mut Frame, area: Rect, state: &LauncherState) {
         } else {
             Style::default().fg(Color::DarkGray)
         });
+
+    if is_field_mode {
+        if let Some(subtitle) = format_subtitle_description(state.field_mode.description(), area.width) {
+            block = block.title_bottom(subtitle);
+        }
+    }
+
     f.render_widget(Paragraph::new(lines).block(block), area);
 }
 
@@ -1537,6 +1583,33 @@ fn format_toggle(enabled: bool, focused: bool) -> Span<'static> {
     } else {
         Span::styled("[○ DISABLED]", Style::default().fg(Color::Red))
     }
+}
+
+fn format_subtitle_description(description: &str, area_width: u16) -> Option<Line<'static>> {
+    // Require sufficient width to render border corners, margins, icon, and meaningful text.
+    if area_width < 18 {
+        return None;
+    }
+
+    // Border corners (2), border margins (2), prefix " ℹ " (3), suffix " " (1) = 8 columns.
+    let available_width = area_width.saturating_sub(8) as usize;
+    if available_width < 10 {
+        return None;
+    }
+
+    let character_count = description.chars().count();
+    let text = if character_count <= available_width {
+        description.to_string()
+    } else {
+        let max_characters = available_width.saturating_sub(1);
+        let prefix: String = description.chars().take(max_characters).collect();
+        format!("{prefix}…")
+    };
+
+    Some(Line::from(vec![
+        Span::styled(" ℹ ", Style::default().fg(Color::Cyan).bold()),
+        Span::styled(format!("{text} "), Style::default().fg(Color::White)),
+    ]))
 }
 
 #[cfg(test)]
@@ -1708,5 +1781,141 @@ mod tests {
         assert_eq!(next_wrap, FocusField::TargetMode);
         let prev_wrap = FocusField::TargetMode.prev(TargetMode::Repo);
         assert_eq!(prev_wrap, FocusField::PresentMode);
+    }
+
+    #[test]
+    fn test_repo_engine_descriptions() {
+        assert_eq!(
+            RepoEngine::Hyper.description(),
+            "Parallel CPU Rayon layout writing unified memory. Cache-blocked CPU fold, sub-second repo loading."
+        );
+        assert_eq!(
+            RepoEngine::Cubecl.description(),
+            "Pure GPU parallel compute pipeline (Metal/WGPU) with in-flight UTF-8 decode, parallel Blelloch scan & direct slot emission."
+        );
+        assert_eq!(
+            RepoEngine::Direct.description(),
+            "Direct CPU layout path bypassing intermediate wire records (single-threaded direct arena write)."
+        );
+        assert_eq!(
+            RepoEngine::Batch.description(),
+            "Batched sequential CPU layout engine path writing intermediate wire records."
+        );
+    }
+
+    #[test]
+    fn test_field_mode_descriptions() {
+        assert_eq!(
+            FieldMode::Instanced.description(),
+            "32 B RenderSlot per glyph (pre-computed 3D world coordinates X, Y, Z, color, size, UV)."
+        );
+        assert_eq!(
+            FieldMode::Derived.description(),
+            "20 B DerivedSlot per glyph (X, row, glyph/wrap, color, group). Y/Z dynamically derived on GPU in vertex shader."
+        );
+    }
+
+    #[test]
+    fn test_format_subtitle_description_narrow_and_wide() {
+        let desc = "Short test string";
+        // Less than 18 columns returns None
+        assert!(format_subtitle_description(desc, 17).is_none());
+
+        // Wide area returns full string
+        let wide = format_subtitle_description(desc, 60).unwrap();
+        assert_eq!(wide.spans[0].content, " ℹ ");
+        assert_eq!(wide.spans[1].content, "Short test string ");
+
+        // Narrow area truncates with ellipsis
+        // Area width 22: available_width = 14. 13 chars + '…' + ' '
+        let narrow = format_subtitle_description(desc, 22).unwrap();
+        assert_eq!(narrow.spans[0].content, " ℹ ");
+        assert_eq!(narrow.spans[1].content, "Short test st… ");
+    }
+
+    #[test]
+    fn test_tui_subtitles_rendered_on_select() {
+        use ratatui::backend::TestBackend;
+
+        let backend = TestBackend::new(120, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        // 1. RepoEngine focused: layout section should display the engine description
+        let mut state = LauncherState::new();
+        state.focus = FocusField::RepoEngine;
+        state.repo_engine = RepoEngine::Hyper;
+
+        terminal
+            .draw(|f| {
+                draw_layout_section(f, Rect::new(0, 0, 60, 10), &state);
+            })
+            .unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let content: String = buffer.content().iter().map(|c| c.symbol()).collect();
+        assert!(content.contains("Parallel CPU Rayon layout"));
+
+        // Change engine to Cubecl: subtitle updates immediately
+        state.repo_engine = RepoEngine::Cubecl;
+        terminal
+            .draw(|f| {
+                draw_layout_section(f, Rect::new(0, 0, 60, 10), &state);
+            })
+            .unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let content: String = buffer.content().iter().map(|c| c.symbol()).collect();
+        assert!(content.contains("Pure GPU parallel compute"));
+
+        // Unfocus RepoEngine: layout section should not show engine subtitle
+        state.focus = FocusField::LayoutMode;
+        terminal
+            .draw(|f| {
+                draw_layout_section(f, Rect::new(0, 0, 60, 10), &state);
+            })
+            .unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let content: String = buffer.content().iter().map(|c| c.symbol()).collect();
+        assert!(!content.contains("Parallel CPU Rayon layout"));
+        assert!(!content.contains("Pure GPU parallel compute"));
+
+        // 2. FieldMode focused: graphics section should display field mode description
+        state.focus = FocusField::FieldMode;
+        state.field_mode = FieldMode::Derived;
+        terminal
+            .draw(|f| {
+                draw_graphics_section(f, Rect::new(0, 0, 60, 10), &state);
+            })
+            .unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let content: String = buffer.content().iter().map(|c| c.symbol()).collect();
+        assert!(content.contains("20 B DerivedSlot"));
+
+        // Change field mode to Instanced: subtitle updates immediately
+        state.field_mode = FieldMode::Instanced;
+        terminal
+            .draw(|f| {
+                draw_graphics_section(f, Rect::new(0, 0, 60, 10), &state);
+            })
+            .unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let content: String = buffer.content().iter().map(|c| c.symbol()).collect();
+        assert!(content.contains("32 B RenderSlot"));
+
+        // Unfocus FieldMode: graphics section should not show field mode subtitle
+        state.focus = FocusField::Greeking;
+        terminal
+            .draw(|f| {
+                draw_graphics_section(f, Rect::new(0, 0, 60, 10), &state);
+            })
+            .unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let content: String = buffer.content().iter().map(|c| c.symbol()).collect();
+        assert!(!content.contains("32 B RenderSlot"));
+        assert!(!content.contains("20 B DerivedSlot"));
     }
 }

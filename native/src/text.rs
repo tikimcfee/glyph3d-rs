@@ -25,13 +25,13 @@ pub const LINE_HEIGHT_FACTOR: f32 = 1.25;
 /// Tab stop width in cells.
 pub const TAB_CELLS: u32 = 4;
 
-/// sRGB display-value palette (VS Code dark+ flavored).
-mod palette {
+/// sRGB display-value palette (VS Code dark+ flavored, brightened comments for contrast).
+pub(crate) mod palette {
     pub const DEFAULT: [u8; 3] = [212, 212, 212]; // identifiers, plain text
     pub const KEYWORD: [u8; 3] = [197, 134, 192]; // const/let/fn/return…
     pub const NUMBER: [u8; 3] = [181, 206, 168];
     pub const STRING: [u8; 3] = [206, 145, 120];
-    pub const COMMENT: [u8; 3] = [106, 153, 85];
+    pub const COMMENT: [u8; 3] = [125, 200, 115]; // vibrant, legible spring green (high contrast against dark background)
     pub const PUNCT: [u8; 3] = [128, 128, 128];
 
     pub const C_DEFAULT: u32 = super::pack_rgba8(DEFAULT, 255);
@@ -159,6 +159,49 @@ fn is_word_char(ch: char) -> bool {
     }
 }
 
+/// Checks whether a line starts with block comment continuation markers:
+/// leading whitespace followed by `*` and then ` `, `/`, `*`, `\t`, `\n`, `\r`, or end-of-slice.
+#[inline(always)]
+pub(crate) fn is_block_comment_continuation_line(bytes: &[u8]) -> bool {
+    let mut index = 0usize;
+    while index < bytes.len() && (bytes[index] == b' ' || bytes[index] == b'\t') {
+        index += 1;
+    }
+    if index < bytes.len() && bytes[index] == b'*' {
+        let next_index = index + 1;
+        next_index >= bytes.len()
+            || bytes[next_index] == b' '
+            || bytes[next_index] == b'/'
+            || bytes[next_index] == b'*'
+            || bytes[next_index] == b'\t'
+            || bytes[next_index] == b'\n'
+            || bytes[next_index] == b'\r'
+    } else {
+        false
+    }
+}
+
+/// Checks whether a char slice starts with block comment continuation markers.
+#[inline(always)]
+fn is_block_comment_continuation_chars(chars: &[char]) -> bool {
+    let mut index = 0usize;
+    while index < chars.len() && (chars[index] == ' ' || chars[index] == '\t') {
+        index += 1;
+    }
+    if index < chars.len() && chars[index] == '*' {
+        let next_index = index + 1;
+        next_index >= chars.len()
+            || chars[next_index] == ' '
+            || chars[next_index] == '/'
+            || chars[next_index] == '*'
+            || chars[next_index] == '\t'
+            || chars[next_index] == '\n'
+            || chars[next_index] == '\r'
+    } else {
+        false
+    }
+}
+
 /// Stage a UTF-8 text file, tiled `copies` times (each copy its own group,
 /// offset in a grid of blocks — exercises the group table and is the stress
 /// path toward ≥1M instances).
@@ -199,7 +242,7 @@ pub fn stage_file(
     // identifier/number run began, so a keyword can recolor its span at flush.
     let mut word = String::new();
     let mut word_start: usize = 0;
-    let mut in_comment = false;
+    let mut in_line_comment = false;
     let mut in_string: Option<char> = None;
     let mut prev = '\0';
 
@@ -234,6 +277,9 @@ pub fn stage_file(
     };
 
     let chars: Vec<char> = text.chars().collect();
+    let is_block_continuation = is_block_comment_continuation_chars(&chars);
+    let mut in_block_comment = is_block_continuation;
+    let mut block_comment_start = if is_block_continuation { 0 } else { usize::MAX };
     let mut ci = 0usize;
     while ci < chars.len() {
         let ch = chars[ci];
@@ -292,7 +338,7 @@ pub fn stage_file(
                         }
                         word.clear();
                     }
-                    let color = if in_comment {
+                    let color = if in_line_comment || in_block_comment {
                         palette::COMMENT
                     } else if in_string.is_some() {
                         palette::STRING
@@ -319,7 +365,13 @@ pub fn stage_file(
                 }
                 word.clear();
             }
-            in_comment = false;
+            in_line_comment = false;
+            in_block_comment = if ci + 1 < chars.len() {
+                is_block_comment_continuation_chars(&chars[ci + 1..])
+            } else {
+                false
+            };
+            block_comment_start = if in_block_comment { ci + 1 } else { usize::MAX };
             in_string = None;
             max_col = max_col.max(col);
             col = 0;
@@ -336,7 +388,14 @@ pub fn stage_file(
             continue;
         }
 
-        let color = if in_comment {
+        let mut is_closing_block_comment = false;
+        let color = if in_line_comment {
+            palette::COMMENT
+        } else if in_block_comment {
+            if ci > block_comment_start + 1 && prev == '*' && ch == '/' {
+                in_block_comment = false;
+                is_closing_block_comment = true;
+            }
             palette::COMMENT
         } else if let Some(q) = in_string {
             if ch == q && prev != '\\' {
@@ -344,13 +403,34 @@ pub fn stage_file(
             }
             palette::STRING
         } else if ch == '/' && prev == '/' {
-            in_comment = true;
+            in_line_comment = true;
             // Recolor the preceding '/' too.
             if let Some(g) = glyphs.last_mut() {
                 if g.col + 1 == col && g.row == row {
                     g.color = palette::COMMENT;
                 }
             }
+            palette::COMMENT
+        } else if ch == '*' && prev == '/' {
+            in_block_comment = true;
+            block_comment_start = ci;
+            if let Some(g) = glyphs.last_mut() {
+                if g.col + 1 == col && g.row == row {
+                    g.color = palette::COMMENT;
+                }
+            }
+            palette::COMMENT
+        } else if ch == '#' && (ci + 1 >= chars.len() || (chars[ci + 1] != '[' && !(chars[ci + 1] == '!' && ci + 2 < chars.len() && chars[ci + 2] == '['))) {
+            if !word.is_empty() {
+                let wc = word_color(&word);
+                if wc != palette::DEFAULT {
+                    for g in &mut glyphs[word_start..] {
+                        g.color = wc;
+                    }
+                }
+                word.clear();
+            }
+            in_line_comment = true;
             palette::COMMENT
         } else if ch == '"' || ch == '\'' || ch == '`' {
             in_string = Some(ch);
@@ -389,7 +469,7 @@ pub fn stage_file(
             &mut codepoints_decoded,
             &mut missing_or_bitmap,
         );
-        prev = ch;
+        prev = if is_closing_block_comment { '\0' } else { ch };
         ci += 1;
     }
     max_col = max_col.max(col);
@@ -853,7 +933,10 @@ pub fn colorize_leaders(bytes: &[u8]) -> Vec<u32> {
     let mut word_start_byte = usize::MAX;
     let mut word_end_byte = 0usize;
     let mut word_start_col = 0usize;
-    let mut in_comment = false;
+    let is_block_continuation = is_block_comment_continuation_line(bytes);
+    let mut in_line_comment = false;
+    let mut in_block_comment = is_block_continuation;
+    let mut block_comment_start = if is_block_continuation { 0 } else { usize::MAX };
     let mut in_string: Option<char> = None;
     let mut prev = '\0';
 
@@ -891,23 +974,55 @@ pub fn colorize_leaders(bytes: &[u8]) -> Vec<u32> {
                 }
                 word_start_byte = usize::MAX;
             }
-            in_comment = false;
+            in_line_comment = false;
+            in_block_comment = if id + 1 < bytes.len() {
+                is_block_comment_continuation_line(&bytes[id + 1..])
+            } else {
+                false
+            };
+            block_comment_start = if in_block_comment { id + 1 } else { usize::MAX };
             in_string = None;
         } else if ch == '\t' {
             word_start_byte = usize::MAX;
-        } else if in_comment {
+        } else if in_line_comment {
             color = palette::C_COMMENT;
+        } else if in_block_comment {
+            color = palette::C_COMMENT;
+            if id > block_comment_start + 1 && prev == '*' && ch == '/' {
+                in_block_comment = false;
+                colors.push(color);
+                prev = '\0';
+                id += 1;
+                continue;
+            }
         } else if let Some(q) = in_string {
             if ch == q && prev != '\\' {
                 in_string = None;
             }
             color = palette::C_STRING;
         } else if ch == '/' && prev == '/' {
-            in_comment = true;
+            in_line_comment = true;
             // Recolor the preceding '/' too (it was pushed as punctuation).
             if let Some(last) = colors.last_mut() {
                 *last = palette::C_COMMENT;
             }
+            color = palette::C_COMMENT;
+        } else if ch == '*' && prev == '/' {
+            in_block_comment = true;
+            block_comment_start = id;
+            if let Some(last) = colors.last_mut() {
+                *last = palette::C_COMMENT;
+            }
+            color = palette::C_COMMENT;
+        } else if ch == '#' && (id + 1 >= bytes.len() || (bytes[id + 1] != b'[' && !(bytes[id + 1] == b'!' && id + 2 < bytes.len() && bytes[id + 2] == b'['))) {
+            if word_start_byte != usize::MAX {
+                let wc = word_color_packed(&bytes[word_start_byte..word_end_byte]);
+                if wc != palette::C_DEFAULT {
+                    colors[word_start_col..].fill(wc);
+                }
+                word_start_byte = usize::MAX;
+            }
+            in_line_comment = true;
             color = palette::C_COMMENT;
         } else if ch == '"' || ch == '\'' || ch == '`' {
             in_string = Some(ch);
@@ -937,6 +1052,349 @@ pub fn colorize_leaders(bytes: &[u8]) -> Vec<u32> {
     }
     colors
 }
+
+/// Colorize a single line's leaders into a reusable vector.
+/// Clears `colors` and pushes one packed RGBA u32 per leader in `line_bytes`.
+pub fn colorize_line_into(line_bytes: &[u8], colors: &mut Vec<u32>) {
+    colors.clear();
+    if is_pure_printable_ascii(line_bytes) {
+        colors.resize(line_bytes.len(), 0);
+        colorize_pure_ascii_line_slice(line_bytes, colors.as_mut_slice());
+        return;
+    }
+    colors.reserve(line_bytes.len());
+    let mut word_start_byte = usize::MAX;
+    let mut word_end_byte = 0usize;
+    let mut word_start_col = 0usize;
+    let is_block_continuation = is_block_comment_continuation_line(line_bytes);
+    let mut in_line_comment = false;
+    let mut in_block_comment = is_block_continuation;
+    let mut block_comment_start = if is_block_continuation { 0 } else { usize::MAX };
+    let mut in_string: Option<char> = None;
+    let mut prev = '\n';
+
+    let byte_at = |i: usize| -> u32 {
+        if i < line_bytes.len() { line_bytes[i] as u32 } else { 0 }
+    };
+    let mut id = 0usize;
+    while id < line_bytes.len() {
+        let b0 = line_bytes[id] as u32;
+        let (n, ch) = if b0 < 0x80 {
+            (1usize, b0 as u8 as char)
+        } else if b0 & 0xE0 == 0xC0 {
+            let cp = ((b0 & 0x1F) << 6) | (byte_at(id + 1) & 0x3F);
+            (2usize, char::from_u32(cp).unwrap_or('\u{FFFD}'))
+        } else if b0 & 0xF0 == 0xE0 {
+            let cp = ((b0 & 0x0F) << 12) | ((byte_at(id + 1) & 0x3F) << 6) | (byte_at(id + 2) & 0x3F);
+            (3usize, char::from_u32(cp).unwrap_or('\u{FFFD}'))
+        } else if b0 & 0xF8 == 0xF0 {
+            let cp = ((b0 & 0x07) << 18)
+                | ((byte_at(id + 1) & 0x3F) << 12)
+                | ((byte_at(id + 2) & 0x3F) << 6)
+                | (byte_at(id + 3) & 0x3F);
+            (4usize, char::from_u32(cp).unwrap_or('\u{FFFD}'))
+        } else {
+            id += 1;
+            continue;
+        };
+
+        let mut color = palette::C_DEFAULT;
+        if ch == '\t' {
+            word_start_byte = usize::MAX;
+        } else if in_line_comment {
+            color = palette::C_COMMENT;
+        } else if in_block_comment {
+            color = palette::C_COMMENT;
+            if id > block_comment_start + 1 && prev == '*' && ch == '/' {
+                in_block_comment = false;
+                colors.push(color);
+                prev = '\0';
+                id += 1;
+                continue;
+            }
+        } else if let Some(q) = in_string {
+            if ch == q && prev != '\\' {
+                in_string = None;
+            }
+            color = palette::C_STRING;
+        } else if ch == '/' && prev == '/' {
+            in_line_comment = true;
+            if let Some(last) = colors.last_mut() {
+                *last = palette::C_COMMENT;
+            }
+            color = palette::C_COMMENT;
+        } else if ch == '*' && prev == '/' {
+            in_block_comment = true;
+            block_comment_start = id;
+            if let Some(last) = colors.last_mut() {
+                *last = palette::C_COMMENT;
+            }
+            color = palette::C_COMMENT;
+        } else if ch == '#' && (id + 1 >= line_bytes.len() || (line_bytes[id + 1] != b'[' && !(line_bytes[id + 1] == b'!' && id + 2 < line_bytes.len() && line_bytes[id + 2] == b'['))) {
+            if word_start_byte != usize::MAX {
+                let wc = word_color_packed(&line_bytes[word_start_byte..word_end_byte]);
+                if wc != palette::C_DEFAULT {
+                    colors[word_start_col..].fill(wc);
+                }
+                word_start_byte = usize::MAX;
+            }
+            in_line_comment = true;
+            color = palette::C_COMMENT;
+        } else if ch == '"' || ch == '\'' || ch == '`' {
+            in_string = Some(ch);
+            color = palette::C_STRING;
+        } else if is_word_char(ch) {
+            if word_start_byte == usize::MAX {
+                word_start_byte = id;
+                word_start_col = colors.len();
+            }
+            word_end_byte = id + n;
+            if line_bytes[word_start_byte].is_ascii_digit() {
+                color = palette::C_NUMBER;
+            }
+        } else {
+            if word_start_byte != usize::MAX {
+                let wc = word_color_packed(&line_bytes[word_start_byte..word_end_byte]);
+                if wc != palette::C_DEFAULT {
+                    colors[word_start_col..].fill(wc);
+                }
+                word_start_byte = usize::MAX;
+            }
+            color = palette::C_PUNCT;
+        }
+        colors.push(color);
+        prev = ch;
+        id += 1;
+    }
+    if word_start_byte != usize::MAX {
+        let wc = word_color_packed(&line_bytes[word_start_byte..word_end_byte]);
+        if wc != palette::C_DEFAULT {
+            colors[word_start_col..].fill(wc);
+        }
+    }
+}
+
+/// Returns true if all bytes in `bytes` are printable ASCII (0x20..=0x7E).
+///
+/// Uses 16-byte NEON on aarch64 and portable 8-byte SWAR on 64-bit words,
+/// falling back to scalar for trailing bytes.
+#[inline]
+pub fn is_pure_printable_ascii(bytes: &[u8]) -> bool {
+    let len = bytes.len();
+    let mut i = 0usize;
+
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        use std::arch::aarch64::*;
+        let lower = vdupq_n_u8(0x20);
+        let bound = vdupq_n_u8(0x5E); // 0x7E - 0x20
+        while i + 16 <= len {
+            let chunk = vld1q_u8(bytes.as_ptr().add(i));
+            let sub = vsubq_u8(chunk, lower);
+            let bad = vcgtq_u8(sub, bound);
+            if vmaxvq_u8(bad) != 0 {
+                return false;
+            }
+            i += 16;
+        }
+    }
+
+    while i + 8 <= len {
+        let w = unsafe { (bytes.as_ptr().add(i) as *const u64).read_unaligned() };
+        let has_lt_20 = w.wrapping_sub(0x2020202020202020) & !w & 0x8080808080808080;
+        let has_ge_7f = ((w & 0x7F7F7F7F7F7F7F7F).wrapping_add(0x0101010101010101) | w) & 0x8080808080808080;
+        if (has_lt_20 | has_ge_7f) != 0 {
+            return false;
+        }
+        i += 8;
+    }
+
+    while i < len {
+        let b = bytes[i];
+        if !(0x20..=0x7E).contains(&b) {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
+/// Fast-path syntax coloring for pure printable ASCII lines (0x20..=0x7E) writing into a slice.
+/// Avoids vector resizing and heap allocations.
+/// Returns the counts of `[DEFAULT, KEYWORD, NUMBER, STRING, COMMENT, PUNCT]` in the line.
+#[inline]
+pub fn colorize_pure_ascii_line_slice(line: &[u8], colors: &mut [u32]) -> [u32; 6] {
+    debug_assert_eq!(line.len(), colors.len());
+    let mut counts = [0u32; 6];
+    if line.is_empty() {
+        return counts;
+    }
+
+    let mut first_non_space = 0usize;
+    while first_non_space < line.len() && line[first_non_space] == b' ' {
+        first_non_space += 1;
+    }
+
+    // Fast path: Pure whitespace line
+    if first_non_space == line.len() {
+        colors.fill(palette::C_PUNCT);
+        counts[5] = line.len() as u32;
+        return counts;
+    }
+
+    let is_block_continuation = is_block_comment_continuation_line(line);
+
+    // Fast path: Block comment continuation line without closing '*/'
+    if is_block_continuation && memchr::memchr(b'/', line).is_none() {
+        colors.fill(palette::C_COMMENT);
+        counts[4] = line.len() as u32;
+        return counts;
+    }
+
+    // Fast path: Full-line '//' comment
+    if line[first_non_space..].starts_with(b"//") {
+        if first_non_space > 0 {
+            colors[..first_non_space].fill(palette::C_PUNCT);
+            counts[5] = first_non_space as u32;
+        }
+        colors[first_non_space..].fill(palette::C_COMMENT);
+        counts[4] = (line.len() - first_non_space) as u32;
+        return counts;
+    }
+
+    // Fast path: Full-line '#' comment
+    if line[first_non_space] == b'#' && (first_non_space + 1 >= line.len() || (line[first_non_space + 1] != b'[' && !(line[first_non_space + 1] == b'!' && first_non_space + 2 < line.len() && line[first_non_space + 2] == b'['))) {
+        if first_non_space > 0 {
+            colors[..first_non_space].fill(palette::C_PUNCT);
+            counts[5] = first_non_space as u32;
+        }
+        colors[first_non_space..].fill(palette::C_COMMENT);
+        counts[4] = (line.len() - first_non_space) as u32;
+        return counts;
+    }
+
+    let mut word_start = usize::MAX;
+    let mut in_block_comment = is_block_continuation;
+    let mut block_comment_start = if is_block_continuation { 0 } else { usize::MAX };
+    let mut in_string: Option<u8> = None;
+    let mut prev = b'\n';
+
+    let mut start_idx = 0usize;
+    if !is_block_continuation && first_non_space > 0 {
+        colors[..first_non_space].fill(palette::C_PUNCT);
+        counts[5] = first_non_space as u32;
+        start_idx = first_non_space;
+        prev = b' ';
+    }
+
+    for i in start_idx..line.len() {
+        let b = line[i];
+        let mut color = palette::C_DEFAULT;
+        if in_block_comment {
+            color = palette::C_COMMENT;
+            counts[4] += 1;
+            if i > block_comment_start + 1 && prev == b'*' && b == b'/' {
+                in_block_comment = false;
+                colors[i] = color;
+                prev = b'\0';
+                continue;
+            }
+        } else if let Some(q) = in_string {
+            if b == q && prev != b'\\' {
+                in_string = None;
+            }
+            color = palette::C_STRING;
+            counts[3] += 1;
+        } else if b == b'/' && prev == b'/' {
+            if i > 0 {
+                colors[i - 1..].fill(palette::C_COMMENT);
+                counts[5] -= 1;
+                counts[4] += (line.len() - (i - 1)) as u32;
+            } else {
+                colors.fill(palette::C_COMMENT);
+                counts[4] += line.len() as u32;
+            }
+            break;
+        } else if b == b'*' && prev == b'/' {
+            in_block_comment = true;
+            block_comment_start = i;
+            if i > 0 {
+                colors[i - 1] = palette::C_COMMENT;
+                counts[5] -= 1;
+                counts[4] += 1;
+            }
+            color = palette::C_COMMENT;
+            counts[4] += 1;
+        } else if b == b'#' && (i + 1 >= line.len() || (line[i + 1] != b'[' && !(line[i + 1] == b'!' && i + 2 < line.len() && line[i + 2] == b'['))) {
+            if word_start != usize::MAX {
+                let wc = word_color_packed(&line[word_start..i]);
+                if wc == palette::C_KEYWORD {
+                    colors[word_start..i].fill(wc);
+                    let word_len = (i - word_start) as u32;
+                    counts[0] -= word_len;
+                    counts[1] += word_len;
+                }
+                word_start = usize::MAX;
+            }
+            colors[i..].fill(palette::C_COMMENT);
+            counts[4] += (line.len() - i) as u32;
+            break;
+        } else if b == b'"' || b == b'\'' || b == b'`' {
+            in_string = Some(b);
+            color = palette::C_STRING;
+            counts[3] += 1;
+        } else if ASCII_WORD_CHAR[b as usize] {
+            if word_start == usize::MAX {
+                word_start = i;
+            }
+            if line[word_start].is_ascii_digit() {
+                color = palette::C_NUMBER;
+                counts[2] += 1;
+            } else {
+                counts[0] += 1;
+            }
+        } else {
+            if word_start != usize::MAX {
+                let wc = word_color_packed(&line[word_start..i]);
+                if wc == palette::C_KEYWORD {
+                    colors[word_start..i].fill(wc);
+                    let word_len = (i - word_start) as u32;
+                    counts[0] -= word_len;
+                    counts[1] += word_len;
+                }
+                word_start = usize::MAX;
+            }
+            color = palette::C_PUNCT;
+            counts[5] += 1;
+        }
+        colors[i] = color;
+        prev = b;
+    }
+    if word_start != usize::MAX {
+        let wc = word_color_packed(&line[word_start..]);
+        if wc == palette::C_KEYWORD {
+            colors[word_start..].fill(wc);
+            let word_len = (line.len() - word_start) as u32;
+            counts[0] -= word_len;
+            counts[1] += word_len;
+        }
+    }
+    counts
+}
+
+/// Fast-path syntax coloring for pure printable ASCII lines (0x20..=0x7E).
+/// Avoids UTF-8 decode branches and char conversions.
+/// Returns the counts of `[DEFAULT, KEYWORD, NUMBER, STRING, COMMENT, PUNCT]` in the line.
+#[inline]
+pub fn colorize_pure_ascii_line(line: &[u8], colors: &mut Vec<u32>) -> [u32; 6] {
+    if colors.len() < line.len() {
+        colors.resize(line.len(), palette::C_DEFAULT);
+    } else {
+        colors.truncate(line.len());
+    }
+    colorize_pure_ascii_line_slice(line, colors)
+}
+
 
 #[cfg(test)]
 mod tests {
@@ -1010,4 +1468,120 @@ mod tests {
         assert_eq!(rows[8], 1, "the 8-cell line's newline rides its second row");
         assert_eq!(rows[9], 2, "and the next line starts immediately below");
     }
+
+    #[test]
+    fn colorize_line_into_matches_colorize_leaders() {
+        let sample = b"const x = 42;\nlet y = \"hello world\"; // comment\n# python comment\n/* block */\n * star line\n */\n#[derive(Debug)]\nfn test() -> bool { true }\n";
+        let full_colors = colorize_leaders(sample);
+
+        let mut reconstructed = Vec::new();
+        let mut line_buf = Vec::new();
+        for line in sample.split(|&b| b == b'\n') {
+            colorize_line_into(line, &mut line_buf);
+            reconstructed.extend_from_slice(&line_buf);
+            reconstructed.push(palette::C_DEFAULT); // newline color in colorize_leaders
+        }
+        reconstructed.pop(); // remove extra newline from trailing empty split
+
+        assert_eq!(reconstructed.len(), full_colors.len());
+        for (i, (&rec, &orig)) in reconstructed.iter().zip(&full_colors).enumerate() {
+            assert_eq!(rec, orig, "mismatch at index {i}");
+        }
+    }
+
+    #[test]
+    fn colorize_pure_ascii_line_matches_colorize_line_into() {
+        let lines = [
+            b"const x = 42;".as_slice(),
+            b"let y = \"hello world\"; // comment".as_slice(),
+            b"fn test() -> bool { true }".as_slice(),
+            b"for (let i = 0; i < 10; i++) { sum += i; }".as_slice(),
+            b"// entire line is comment".as_slice(),
+            b"# python or shell comment".as_slice(),
+            b"x = 10 # trailing hash comment".as_slice(),
+            b"/* block comment */".as_slice(),
+            b" * continuation comment".as_slice(),
+            b" */".as_slice(),
+            b"#[derive(Clone)]".as_slice(),
+            b"/* comment */ let x = 42;".as_slice(),
+            b"\"unclosed string".as_slice(),
+        ];
+        let mut buf_a = Vec::new();
+        let mut buf_b = Vec::new();
+        for &line in &lines {
+            colorize_line_into(line, &mut buf_a);
+            colorize_pure_ascii_line(line, &mut buf_b);
+            assert_eq!(buf_a, buf_b, "mismatch on line: {}", String::from_utf8_lossy(line));
+        }
+    }
+
+    #[test]
+    fn colorize_pure_ascii_line_slice_counts_match_colors() {
+        let lines = [
+            b"const x = 42;".as_slice(),
+            b"let y = \"hello world\"; // comment".as_slice(),
+            b"fn test() -> bool { true }".as_slice(),
+            b"for (let i = 0; i < 10; i++) { sum += i; }".as_slice(),
+            b"// entire line is comment".as_slice(),
+            b"# python or shell comment".as_slice(),
+            b"x = 10 # trailing hash comment".as_slice(),
+            b"/* block comment */".as_slice(),
+            b" * continuation comment".as_slice(),
+            b" */".as_slice(),
+            b"#[derive(Clone)]".as_slice(),
+            b"/* comment */ let x = 42;".as_slice(),
+            b"\"unclosed string".as_slice(),
+            b"   12345 67890 abc def return function   ".as_slice(),
+        ];
+        let mut colors = Vec::new();
+        for &line in &lines {
+            colors.resize(line.len(), 0);
+            let counts = colorize_pure_ascii_line_slice(line, &mut colors);
+            let mut manual_counts = [0u32; 6];
+            for &c in &colors {
+                match c {
+                    palette::C_DEFAULT => manual_counts[0] += 1,
+                    palette::C_KEYWORD => manual_counts[1] += 1,
+                    palette::C_NUMBER  => manual_counts[2] += 1,
+                    palette::C_STRING  => manual_counts[3] += 1,
+                    palette::C_COMMENT => manual_counts[4] += 1,
+                    palette::C_PUNCT   => manual_counts[5] += 1,
+                    _ => panic!("unknown color: {:X}", c),
+                }
+            }
+            assert_eq!(counts, manual_counts, "mismatch on line: {}", String::from_utf8_lossy(line));
+        }
+    }
+
+    #[test]
+    fn test_is_pure_printable_ascii_exhaustive() {
+        // Test single bytes
+        for b in 0u8..=255 {
+            let slice = [b];
+            let expected = (0x20..=0x7E).contains(&b);
+            assert_eq!(super::is_pure_printable_ascii(&slice), expected, "Byte 0x{b:02X} failed");
+        }
+
+        // Test lengths from 0 to 64 bytes with all printable
+        for len in 0..=64 {
+            let vec: Vec<u8> = (0..len).map(|i| 0x20 + (i % 95) as u8).collect();
+            assert!(super::is_pure_printable_ascii(&vec), "Length {len} printable failed");
+
+            // Poison each position with a non-printable byte
+            for pos in 0..len {
+                let mut poisoned = vec.clone();
+                poisoned[pos] = 0x09; // tab
+                assert!(!super::is_pure_printable_ascii(&poisoned), "Poison tab at pos {pos}/{len} failed");
+
+                poisoned[pos] = 0x7F; // DEL
+                assert!(!super::is_pure_printable_ascii(&poisoned), "Poison DEL at pos {pos}/{len} failed");
+
+                poisoned[pos] = 0x80; // High byte
+                assert!(!super::is_pure_printable_ascii(&poisoned), "Poison 0x80 at pos {pos}/{len} failed");
+            }
+        }
+    }
 }
+
+
+
