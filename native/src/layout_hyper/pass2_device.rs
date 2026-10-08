@@ -355,7 +355,126 @@ fn layout_pass2_chunk<E: SlotEmit>(
                         if row_pz > cur_blk_max_z { cur_blk_max_z = row_pz; }
                     }
 
-                    for (char_idx_in_seg, &b) in seg_bytes.iter().enumerate() {
+                    let mut seg_first_survivor_x = f32::NAN;
+                    let mut seg_last_survivor_right = f32::NAN;
+                    let mut last_char_pos_x = f32::NAN;
+
+                    let get_color = |idx: usize| -> u32 {
+                        if let Some(c) = flat_color {
+                            c
+                        } else if is_syntax_heuristic {
+                            if idx < line_colors.len() {
+                                line_colors[idx]
+                            } else {
+                                crate::layout::DEFAULT_COLOR_PACKED
+                            }
+                        } else if let Some(colors) = per_record_colors {
+                            if record_idx + idx < colors.len() {
+                                colors[record_idx + idx]
+                            } else {
+                                0xFFFF_FFFF
+                            }
+                        } else {
+                            crate::layout::DEFAULT_COLOR_PACKED
+                        }
+                    };
+
+                    let mut char_idx_in_seg = 0usize;
+                    while char_idx_in_seg + 4 <= seg_bytes.len() {
+                        let b0 = seg_bytes[char_idx_in_seg];
+                        let b1 = seg_bytes[char_idx_in_seg + 1];
+                        let b2 = seg_bytes[char_idx_in_seg + 2];
+                        let b3 = seg_bytes[char_idx_in_seg + 3];
+
+                        let g0 = trie.fast_byte_table[b0 as usize].glyph_id;
+                        let g1 = trie.fast_byte_table[b1 as usize].glyph_id;
+                        let g2 = trie.fast_byte_table[b2 as usize].glyph_id;
+                        let g3 = trie.fast_byte_table[b3 as usize].glyph_id;
+
+                        if g0 != 0 && g1 != 0 && g2 != 0 && g3 != 0 && (!has_blocks || cur_blk_count + 4 <= SUBSEG_BLOCK_SIZE) {
+                            let char_idx0 = seg_offset + char_idx_in_seg;
+
+                            let item_rel_x0 = if fold_unit > 0 { seg_adv_f32 as f64 } else { line_adv_f64 };
+                            let base_x0 = (item_rel_x0 + origin_x) as f32;
+                            let pos_x0 = if page_active { (base_x0 as f64 + cached_page_x_off) as f32 } else { base_x0 };
+                            line_adv_f64 += ascii_adv as f64;
+                            seg_adv_f32 += ascii_adv;
+
+                            let item_rel_x1 = if fold_unit > 0 { seg_adv_f32 as f64 } else { line_adv_f64 };
+                            let base_x1 = (item_rel_x1 + origin_x) as f32;
+                            let pos_x1 = if page_active { (base_x1 as f64 + cached_page_x_off) as f32 } else { base_x1 };
+                            line_adv_f64 += ascii_adv as f64;
+                            seg_adv_f32 += ascii_adv;
+
+                            let item_rel_x2 = if fold_unit > 0 { seg_adv_f32 as f64 } else { line_adv_f64 };
+                            let base_x2 = (item_rel_x2 + origin_x) as f32;
+                            let pos_x2 = if page_active { (base_x2 as f64 + cached_page_x_off) as f32 } else { base_x2 };
+                            line_adv_f64 += ascii_adv as f64;
+                            seg_adv_f32 += ascii_adv;
+
+                            let item_rel_x3 = if fold_unit > 0 { seg_adv_f32 as f64 } else { line_adv_f64 };
+                            let base_x3 = (item_rel_x3 + origin_x) as f32;
+                            let pos_x3 = if page_active { (base_x3 as f64 + cached_page_x_off) as f32 } else { base_x3 };
+                            last_char_pos_x = pos_x3;
+                            line_adv_f64 += ascii_adv as f64;
+                            seg_adv_f32 += ascii_adv;
+
+                            if seg_first_survivor_x.is_nan() {
+                                seg_first_survivor_x = pos_x0;
+                            }
+                            seg_last_survivor_right = pos_x3 + ascii_adv;
+
+                            let c0 = get_color(char_idx0);
+                            let c1 = get_color(char_idx0 + 1);
+                            let c2 = get_color(char_idx0 + 2);
+                            let c3 = get_color(char_idx0 + 3);
+
+                            if flat_color.is_none() {
+                                file_s0 += lut[(c0 & 0xFF) as usize] + lut[(c1 & 0xFF) as usize] + lut[(c2 & 0xFF) as usize] + lut[(c3 & 0xFF) as usize];
+                                file_s1 += lut[((c0 >> 8) & 0xFF) as usize] + lut[((c1 >> 8) & 0xFF) as usize] + lut[((c2 >> 8) & 0xFF) as usize] + lut[((c3 >> 8) & 0xFF) as usize];
+                                file_s2 += lut[((c0 >> 16) & 0xFF) as usize] + lut[((c1 >> 16) & 0xFF) as usize] + lut[((c2 >> 16) & 0xFF) as usize] + lut[((c3 >> 16) & 0xFF) as usize];
+                                file_cells += 4;
+                            }
+
+                            unsafe {
+                                let p = out_ptr.add(survivor_out);
+                                p.write(E::emit(pos_x0, row_py, row_pz, g0, c0, group_id, item_idx, ascii_adv, crate::text::CELL_HEIGHT_WORLD, row, wrap_segment));
+                                p.add(1).write(E::emit(pos_x1, row_py, row_pz, g1, c1, group_id, item_idx, ascii_adv, crate::text::CELL_HEIGHT_WORLD, row, wrap_segment));
+                                p.add(2).write(E::emit(pos_x2, row_py, row_pz, g2, c2, group_id, item_idx, ascii_adv, crate::text::CELL_HEIGHT_WORLD, row, wrap_segment));
+                                p.add(3).write(E::emit(pos_x3, row_py, row_pz, g3, c3, group_id, item_idx, ascii_adv, crate::text::CELL_HEIGHT_WORLD, row, wrap_segment));
+                            }
+                            survivor_out += 4;
+
+                            if has_blocks {
+                                if cur_blk_count == 0 {
+                                    cur_blk_min_x = pos_x0;
+                                }
+                                cur_blk_max_x = pos_x3 + qw;
+                                cur_blk_count += 4;
+                                if cur_blk_count == SUBSEG_BLOCK_SIZE {
+                                    if cur_blk_min_x <= cur_blk_max_x && cur_blk_min_y <= cur_blk_max_y {
+                                        local_blocks.push(BlockCull {
+                                            min: [cur_blk_min_x, cur_blk_min_y, cur_blk_min_z],
+                                            max: [cur_blk_max_x, cur_blk_max_y, cur_blk_max_z],
+                                            slot_base: chunk_rel_slot + (survivor_out - SUBSEG_BLOCK_SIZE) as u32,
+                                            slot_count: SUBSEG_BLOCK_SIZE as u32,
+                                        });
+                                    }
+                                    cur_blk_min_x = f32::INFINITY;
+                                    cur_blk_min_y = y_lo;
+                                    cur_blk_min_z = row_pz;
+                                    cur_blk_max_x = f32::NEG_INFINITY;
+                                    cur_blk_max_y = y_hi;
+                                    cur_blk_max_z = row_pz;
+                                    cur_blk_count = 0;
+                                }
+                            }
+
+                            char_idx_in_seg += 4;
+                            continue;
+                        }
+
+                        // Fallback single character:
                         let char_idx = seg_offset + char_idx_in_seg;
                         let item_rel_x = if fold_unit > 0 { seg_adv_f32 as f64 } else { line_adv_f64 };
                         let base_x = (item_rel_x + origin_x) as f32;
@@ -364,40 +483,96 @@ fn layout_pass2_chunk<E: SlotEmit>(
                         } else {
                             base_x
                         };
-                        let right = pos_x + ascii_adv;
-                        if right > page_right {
-                            page_right = right;
+                        last_char_pos_x = pos_x;
+                        line_adv_f64 += ascii_adv as f64;
+                        seg_adv_f32 += ascii_adv;
+
+                        if g0 != 0 {
+                            if seg_first_survivor_x.is_nan() {
+                                seg_first_survivor_x = pos_x;
+                            }
+                            seg_last_survivor_right = pos_x + ascii_adv;
+
+                            let color = get_color(char_idx);
+                            if flat_color.is_none() {
+                                let c0 = (color & 0xFF) as usize;
+                                let c1 = ((color >> 8) & 0xFF) as usize;
+                                let c2 = ((color >> 16) & 0xFF) as usize;
+                                file_s0 += lut[c0];
+                                file_s1 += lut[c1];
+                                file_s2 += lut[c2];
+                                file_cells += 1;
+                            }
+
+                            unsafe {
+                                out_ptr.add(survivor_out).write(E::emit(
+                                    pos_x,
+                                    row_py,
+                                    row_pz,
+                                    g0,
+                                    color,
+                                    group_id,
+                                    item_idx,
+                                    ascii_adv,
+                                    crate::text::CELL_HEIGHT_WORLD,
+                                    row,
+                                    wrap_segment,
+                                ));
+                            }
+                            survivor_out += 1;
+
+                            if has_blocks {
+                                if cur_blk_count == 0 {
+                                    cur_blk_min_x = pos_x;
+                                }
+                                cur_blk_max_x = pos_x + qw;
+                                cur_blk_count += 1;
+
+                                if cur_blk_count == SUBSEG_BLOCK_SIZE {
+                                    if cur_blk_min_x <= cur_blk_max_x && cur_blk_min_y <= cur_blk_max_y {
+                                        local_blocks.push(BlockCull {
+                                            min: [cur_blk_min_x, cur_blk_min_y, cur_blk_min_z],
+                                            max: [cur_blk_max_x, cur_blk_max_y, cur_blk_max_z],
+                                            slot_base: chunk_rel_slot + (survivor_out - SUBSEG_BLOCK_SIZE) as u32,
+                                            slot_count: SUBSEG_BLOCK_SIZE as u32,
+                                        });
+                                    }
+                                    cur_blk_min_x = f32::INFINITY;
+                                    cur_blk_min_y = y_lo;
+                                    cur_blk_min_z = row_pz;
+                                    cur_blk_max_x = f32::NEG_INFINITY;
+                                    cur_blk_max_y = y_hi;
+                                    cur_blk_max_z = row_pz;
+                                    cur_blk_count = 0;
+                                }
+                            }
                         }
+                        char_idx_in_seg += 1;
+                    }
+
+                    // Trailing 0..3 characters in segment:
+                    while char_idx_in_seg < seg_bytes.len() {
+                        let b = seg_bytes[char_idx_in_seg];
+                        let char_idx = seg_offset + char_idx_in_seg;
+                        let item_rel_x = if fold_unit > 0 { seg_adv_f32 as f64 } else { line_adv_f64 };
+                        let base_x = (item_rel_x + origin_x) as f32;
+                        let pos_x = if page_active {
+                            (base_x as f64 + cached_page_x_off) as f32
+                        } else {
+                            base_x
+                        };
+                        last_char_pos_x = pos_x;
                         line_adv_f64 += ascii_adv as f64;
                         seg_adv_f32 += ascii_adv;
 
                         let glyph_id = trie.fast_byte_table[b as usize].glyph_id;
                         if glyph_id != 0 {
-                            if pos_x < ink_min[0] {
-                                ink_min[0] = pos_x;
+                            if seg_first_survivor_x.is_nan() {
+                                seg_first_survivor_x = pos_x;
                             }
-                            if right > ink_max[0] {
-                                ink_max[0] = right;
-                            }
+                            seg_last_survivor_right = pos_x + ascii_adv;
 
-                            let color = if let Some(c) = flat_color {
-                                c
-                            } else if is_syntax_heuristic {
-                                if char_idx < line_colors.len() {
-                                    line_colors[char_idx]
-                                } else {
-                                    crate::layout::DEFAULT_COLOR_PACKED
-                                }
-                            } else if let Some(colors) = per_record_colors {
-                                if record_idx + char_idx < colors.len() {
-                                    colors[record_idx + char_idx]
-                                } else {
-                                    0xFFFF_FFFF
-                                }
-                            } else {
-                                crate::layout::DEFAULT_COLOR_PACKED
-                            };
-
+                            let color = get_color(char_idx);
                             if flat_color.is_none() {
                                 let c0 = (color & 0xFF) as usize;
                                 let c1 = ((color >> 8) & 0xFF) as usize;
@@ -426,9 +601,10 @@ fn layout_pass2_chunk<E: SlotEmit>(
                             survivor_out += 1;
 
                             if has_blocks {
-                                if pos_x < cur_blk_min_x { cur_blk_min_x = pos_x; }
-                                let x_hi = pos_x + qw;
-                                if x_hi > cur_blk_max_x { cur_blk_max_x = x_hi; }
+                                if cur_blk_count == 0 {
+                                    cur_blk_min_x = pos_x;
+                                }
+                                cur_blk_max_x = pos_x + qw;
                                 cur_blk_count += 1;
 
                                 if cur_blk_count == SUBSEG_BLOCK_SIZE {
@@ -449,6 +625,22 @@ fn layout_pass2_chunk<E: SlotEmit>(
                                     cur_blk_count = 0;
                                 }
                             }
+                        }
+                        char_idx_in_seg += 1;
+                    }
+
+                    if !last_char_pos_x.is_nan() {
+                        let right = last_char_pos_x + ascii_adv;
+                        if right > page_right {
+                            page_right = right;
+                        }
+                    }
+                    if !seg_first_survivor_x.is_nan() {
+                        if seg_first_survivor_x < ink_min[0] {
+                            ink_min[0] = seg_first_survivor_x;
+                        }
+                        if seg_last_survivor_right > ink_max[0] {
+                            ink_max[0] = seg_last_survivor_right;
                         }
                     }
 
