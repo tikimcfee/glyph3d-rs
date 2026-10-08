@@ -151,15 +151,13 @@ pub(crate) fn layout_pass2_device<E: SlotEmit>(
 
             let out_ptr = unsafe { (dest_addr as *mut E::Slot).add(slot_base as usize) };
             let flat_color = if let Paint::Flat(c) = item.paint { Some(c) } else { None };
-            let (local_colors_buf, per_record_colors) = match item.paint {
-                Paint::PerRecord(c) => (None, Some(c)),
-                Paint::SyntaxHeuristic => {
-                    let cols = crate::text::colorize_leaders(bytes);
-                    (Some(cols), None)
-                }
-                _ => (None, None),
+            let is_syntax_heuristic = matches!(item.paint, Paint::SyntaxHeuristic);
+            let per_record_colors = if let Paint::PerRecord(c) = item.paint { Some(c) } else { None };
+            let mut line_colors = if is_syntax_heuristic {
+                Vec::with_capacity(256)
+            } else {
+                Vec::new()
             };
-            let colors_slice = per_record_colors.or(local_colors_buf.as_deref());
             let mut file_s0 = 0.0f64;
             let mut file_s1 = 0.0f64;
             let mut file_s2 = 0.0f64;
@@ -202,9 +200,226 @@ pub(crate) fn layout_pass2_device<E: SlotEmit>(
             let mut cached_py = 0.0f32;
             let mut cached_pz = 0.0f32;
 
+            let ascii_adv = crate::text::fu_to_world(1229, em_height_fu);
+            let mut last_ink_y = f32::NAN;
+            let mut last_ink_z = f32::NAN;
+            let mut emoji_cells = 0usize;
+
             let mut pos = 0usize;
             let mut span_idx = 0usize;
             while pos < bytes.len() {
+                if col == 0 {
+                    let nl_offset = memchr::memchr(b'\n', &bytes[pos..]);
+                    let line_end = match nl_offset {
+                        Some(off) => pos + off,
+                        None => bytes.len(),
+                    };
+                    let line_bytes = &bytes[pos..line_end];
+                    let line_len = line_bytes.len();
+                    let is_pure_ascii = line_bytes.iter().all(|&b| (0x20..=0x7E).contains(&b));
+
+                    if is_syntax_heuristic {
+                        if is_pure_ascii {
+                            crate::text::colorize_pure_ascii_line(line_bytes, &mut line_colors);
+                        } else {
+                            crate::text::colorize_line_into(line_bytes, &mut line_colors);
+                        }
+                    }
+
+                    // Line-level ASCII fast path:
+                    // When pure printable ASCII (0x20..=0x7E) and fits within wrap_width (or wrap_width == 0).
+                    if !matches!(item.paint, Paint::ByteSpans(_))
+                        && is_pure_ascii
+                        && (wrap_w == 0 || line_len <= wrap_w as usize)
+                    {
+                        let row = base_row;
+                        let wrap_segment = 0i64;
+                        let x_page = 0i64;
+
+                        if row != last_row || wrap_segment != last_wrap_seg || x_page != last_x_page {
+                            last_row = row;
+                            last_wrap_seg = wrap_segment;
+                            last_x_page = x_page;
+
+                            if page_active {
+                                let (y_page, screen_row) = if page_rows > 0 {
+                                    (row / page_rows, row + scroll_rows)
+                                } else {
+                                    (0, row)
+                                };
+                                let band = y_page / pages_wide;
+                                cached_page_x_off = (y_page % pages_wide) as f64 * page_stride_x;
+                                cached_py = (origin_y
+                                    - (screen_row - y_page * page_rows) as f64 * line_height
+                                    - band as f64 * band_stride_y) as f32;
+                                cached_pz = (origin_z - wrap_segment as f64 * z_step
+                                    + band as f64 * depth_per_band
+                                    + x_page as f64 * depth_per_col) as f32;
+                            } else {
+                                cached_page_x_off = 0.0;
+                                cached_py = (-(row as f64) * line_height + origin_y) as f32;
+                                cached_pz = (-(wrap_segment as f64) * z_step + origin_z) as f32;
+                            }
+
+                            if cached_py < page_bottom {
+                                page_bottom = cached_py;
+                            }
+                            if cached_pz < page_z_min {
+                                page_z_min = cached_pz;
+                            }
+                            if cached_pz > page_z_max {
+                                page_z_max = cached_pz;
+                            }
+                        }
+
+                        let row_py = cached_py;
+                        let row_pz = cached_pz;
+                        let start_survivors = survivor_out;
+                        let mut line_adv_f64 = line_adv;
+                        let mut seg_adv_f32 = seg_adv;
+
+                        for (char_idx, &b) in line_bytes.iter().enumerate() {
+                            let item_rel_x = if fold_unit > 0 { seg_adv_f32 as f64 } else { line_adv_f64 };
+                            let base_x = (item_rel_x + origin_x) as f32;
+                            let pos_x = if page_active {
+                                (base_x as f64 + cached_page_x_off) as f32
+                            } else {
+                                base_x
+                            };
+                            let right = pos_x + ascii_adv;
+                            if right > page_right {
+                                page_right = right;
+                            }
+                            line_adv_f64 += ascii_adv as f64;
+                            seg_adv_f32 += ascii_adv;
+
+                            let glyph_id = trie.fast_byte_table[b as usize].glyph_id;
+                            if glyph_id != 0 {
+                                if pos_x < ink_min[0] {
+                                    ink_min[0] = pos_x;
+                                }
+                                if right > ink_max[0] {
+                                    ink_max[0] = right;
+                                }
+
+                                let color = if let Some(c) = flat_color {
+                                    c
+                                } else if is_syntax_heuristic {
+                                    if char_idx < line_colors.len() {
+                                        line_colors[char_idx]
+                                    } else {
+                                        crate::layout::DEFAULT_COLOR_PACKED
+                                    }
+                                } else if let Some(colors) = per_record_colors {
+                                    if record_idx + char_idx < colors.len() {
+                                        colors[record_idx + char_idx]
+                                    } else {
+                                        0xFFFF_FFFF
+                                    }
+                                } else {
+                                    crate::layout::DEFAULT_COLOR_PACKED
+                                };
+
+                                if flat_color.is_none() {
+                                    let c0 = (color & 0xFF) as usize;
+                                    let c1 = ((color >> 8) & 0xFF) as usize;
+                                    let c2 = ((color >> 16) & 0xFF) as usize;
+                                    file_s0 += lut[c0];
+                                    file_s1 += lut[c1];
+                                    file_s2 += lut[c2];
+                                    file_cells += 1;
+                                }
+
+                                let fields = EmitFields {
+                                    pos: [pos_x, row_py, row_pz],
+                                    glyph_id,
+                                    color,
+                                    group_id,
+                                    item_idx: item_idx as u32,
+                                    advance: ascii_adv,
+                                    height: crate::text::CELL_HEIGHT_WORLD,
+                                    row,
+                                    wrap_segment: 0,
+                                };
+                                unsafe {
+                                    out_ptr.add(survivor_out).write(E::emit(&fields, line_base));
+                                }
+                                survivor_out += 1;
+
+                                if has_blocks {
+                                    let qw = ascii_adv.max(crate::text::CELL_HEIGHT_WORLD);
+                                    let half_h = 0.5 * crate::text::CELL_HEIGHT_WORLD;
+                                    if pos_x < cur_blk_min_x { cur_blk_min_x = pos_x; }
+                                    let x_hi = pos_x + qw;
+                                    if x_hi > cur_blk_max_x { cur_blk_max_x = x_hi; }
+                                    let y_lo = row_py - half_h;
+                                    let y_hi = row_py + half_h;
+                                    if y_lo < cur_blk_min_y { cur_blk_min_y = y_lo; }
+                                    if y_hi > cur_blk_max_y { cur_blk_max_y = y_hi; }
+                                    if row_pz < cur_blk_min_z { cur_blk_min_z = row_pz; }
+                                    if row_pz > cur_blk_max_z { cur_blk_max_z = row_pz; }
+                                    cur_blk_count += 1;
+
+                                    if cur_blk_count == SUBSEG_BLOCK_SIZE {
+                                        if cur_blk_min_x <= cur_blk_max_x && cur_blk_min_y <= cur_blk_max_y {
+                                            local_blocks.push(BlockCull {
+                                                min: [cur_blk_min_x, cur_blk_min_y, cur_blk_min_z],
+                                                max: [cur_blk_max_x, cur_blk_max_y, cur_blk_max_z],
+                                                slot_base: (survivor_out - SUBSEG_BLOCK_SIZE) as u32,
+                                                slot_count: SUBSEG_BLOCK_SIZE as u32,
+                                            });
+                                        }
+                                        cur_blk_min_x = f32::INFINITY;
+                                        cur_blk_min_y = f32::INFINITY;
+                                        cur_blk_min_z = f32::INFINITY;
+                                        cur_blk_max_x = f32::NEG_INFINITY;
+                                        cur_blk_max_y = f32::NEG_INFINITY;
+                                        cur_blk_max_z = f32::NEG_INFINITY;
+                                        cur_blk_count = 0;
+                                    }
+                                }
+                            }
+                        }
+
+                        if survivor_out > start_survivors {
+                            let half = 0.5 * crate::text::CELL_HEIGHT_WORLD;
+                            if row_py - half < ink_min[1] {
+                                ink_min[1] = row_py - half;
+                            }
+                            if row_py + half > ink_max[1] {
+                                ink_max[1] = row_py + half;
+                            }
+                            if row_pz < ink_min[2] {
+                                ink_min[2] = row_pz;
+                            }
+                            if row_pz > ink_max[2] {
+                                ink_max[2] = row_pz;
+                            }
+                            last_ink_y = row_py;
+                            last_ink_z = row_pz;
+                            if E::USES_LINES && row > max_row_seen {
+                                max_row_seen = row;
+                            }
+                        }
+
+                        record_idx += line_len;
+                        col = line_len as i64;
+                        line_adv = line_adv_f64;
+                        seg_adv = seg_adv_f32;
+                        pos = line_end;
+
+                        if pos < bytes.len() && bytes[pos] == b'\n' {
+                            record_idx += 1;
+                            base_row += rows_for_line(col, wrap_w, p.wrap_mode);
+                            col = 0;
+                            line_adv = 0.0;
+                            seg_adv = 0.0;
+                            pos += 1;
+                        }
+                        continue;
+                    }
+                }
+
                 let r = match resolve_byte_char(bytes, pos, trie, bitmap_adv, em_height_fu, &mut trailer_until) {
                     Some(r) => r,
                     None => {
@@ -275,7 +490,13 @@ pub(crate) fn layout_pass2_device<E: SlotEmit>(
 
                 let color = if let Some(c) = flat_color {
                     c
-                } else if let Some(colors) = colors_slice {
+                } else if is_syntax_heuristic {
+                    if (col as usize) < line_colors.len() {
+                        line_colors[col as usize]
+                    } else {
+                        crate::layout::DEFAULT_COLOR_PACKED
+                    }
+                } else if let Some(colors) = per_record_colors {
                     if record_idx < colors.len() {
                         colors[record_idx]
                     } else {
@@ -303,25 +524,30 @@ pub(crate) fn layout_pass2_device<E: SlotEmit>(
                     if right > ink_max[0] {
                         ink_max[0] = right;
                     }
-                    if pos_y - half < ink_min[1] {
-                        ink_min[1] = pos_y - half;
+                    if pos_y != last_ink_y || r.height != crate::text::CELL_HEIGHT_WORLD {
+                        if pos_y - half < ink_min[1] {
+                            ink_min[1] = pos_y - half;
+                        }
+                        if pos_y + half > ink_max[1] {
+                            ink_max[1] = pos_y + half;
+                        }
+                        last_ink_y = pos_y;
                     }
-                    if pos_y + half > ink_max[1] {
-                        ink_max[1] = pos_y + half;
-                    }
-                    if pos_z < ink_min[2] {
-                        ink_min[2] = pos_z;
-                    }
-                    if pos_z > ink_max[2] {
-                        ink_max[2] = pos_z;
+                    if pos_z != last_ink_z {
+                        if pos_z < ink_min[2] {
+                            ink_min[2] = pos_z;
+                        }
+                        if pos_z > ink_max[2] {
+                            ink_max[2] = pos_z;
+                        }
+                        last_ink_z = pos_z;
                     }
 
                     let gid = r.glyph_id as usize;
                     if gid < trie.emoji_cell.len() && trie.emoji_cell[gid].is_some() {
                         file_has_emoji = true;
-                    } else if flat_color.is_some() {
-                        file_cells += 1;
-                    } else {
+                        emoji_cells += 1;
+                    } else if flat_color.is_none() {
                         let c0 = (color & 0xFF) as usize;
                         let c1 = ((color >> 8) & 0xFF) as usize;
                         let c2 = ((color >> 16) & 0xFF) as usize;
@@ -429,13 +655,15 @@ pub(crate) fn layout_pass2_device<E: SlotEmit>(
             }
 
             if let Some(c) = flat_color {
-                if file_cells > 0 {
+                let non_emoji = survivor_out.saturating_sub(emoji_cells);
+                if non_emoji > 0 {
                     let c0 = (c & 0xFF) as usize;
                     let c1 = ((c >> 8) & 0xFF) as usize;
                     let c2 = ((c >> 16) & 0xFF) as usize;
-                    file_s0 = lut[c0] * file_cells as f64;
-                    file_s1 = lut[c1] * file_cells as f64;
-                    file_s2 = lut[c2] * file_cells as f64;
+                    file_s0 = lut[c0] * non_emoji as f64;
+                    file_s1 = lut[c1] * non_emoji as f64;
+                    file_s2 = lut[c2] * non_emoji as f64;
+                    file_cells = non_emoji;
                 }
             }
 

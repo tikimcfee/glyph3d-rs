@@ -938,6 +938,150 @@ pub fn colorize_leaders(bytes: &[u8]) -> Vec<u32> {
     colors
 }
 
+/// Colorize a single line's leaders into a reusable vector.
+/// Clears `colors` and pushes one packed RGBA u32 per leader in `line_bytes`.
+pub fn colorize_line_into(line_bytes: &[u8], colors: &mut Vec<u32>) {
+    colors.clear();
+    colors.reserve(line_bytes.len());
+    let mut word_start_byte = usize::MAX;
+    let mut word_end_byte = 0usize;
+    let mut word_start_col = 0usize;
+    let mut in_comment = false;
+    let mut in_string: Option<char> = None;
+    let mut prev = '\n';
+
+    let byte_at = |i: usize| -> u32 {
+        if i < line_bytes.len() { line_bytes[i] as u32 } else { 0 }
+    };
+    let mut id = 0usize;
+    while id < line_bytes.len() {
+        let b0 = line_bytes[id] as u32;
+        let (n, ch) = if b0 < 0x80 {
+            (1usize, b0 as u8 as char)
+        } else if b0 & 0xE0 == 0xC0 {
+            let cp = ((b0 & 0x1F) << 6) | (byte_at(id + 1) & 0x3F);
+            (2usize, char::from_u32(cp).unwrap_or('\u{FFFD}'))
+        } else if b0 & 0xF0 == 0xE0 {
+            let cp = ((b0 & 0x0F) << 12) | ((byte_at(id + 1) & 0x3F) << 6) | (byte_at(id + 2) & 0x3F);
+            (3usize, char::from_u32(cp).unwrap_or('\u{FFFD}'))
+        } else if b0 & 0xF8 == 0xF0 {
+            let cp = ((b0 & 0x07) << 18)
+                | ((byte_at(id + 1) & 0x3F) << 12)
+                | ((byte_at(id + 2) & 0x3F) << 6)
+                | (byte_at(id + 3) & 0x3F);
+            (4usize, char::from_u32(cp).unwrap_or('\u{FFFD}'))
+        } else {
+            id += 1;
+            continue;
+        };
+
+        let mut color = palette::C_DEFAULT;
+        if ch == '\t' {
+            word_start_byte = usize::MAX;
+        } else if in_comment {
+            color = palette::C_COMMENT;
+        } else if let Some(q) = in_string {
+            if ch == q && prev != '\\' {
+                in_string = None;
+            }
+            color = palette::C_STRING;
+        } else if ch == '/' && prev == '/' {
+            in_comment = true;
+            if let Some(last) = colors.last_mut() {
+                *last = palette::C_COMMENT;
+            }
+            color = palette::C_COMMENT;
+        } else if ch == '"' || ch == '\'' || ch == '`' {
+            in_string = Some(ch);
+            color = palette::C_STRING;
+        } else if is_word_char(ch) {
+            if word_start_byte == usize::MAX {
+                word_start_byte = id;
+                word_start_col = colors.len();
+            }
+            word_end_byte = id + n;
+            if line_bytes[word_start_byte].is_ascii_digit() {
+                color = palette::C_NUMBER;
+            }
+        } else {
+            if word_start_byte != usize::MAX {
+                let wc = word_color_packed(&line_bytes[word_start_byte..word_end_byte]);
+                if wc != palette::C_DEFAULT {
+                    colors[word_start_col..].fill(wc);
+                }
+                word_start_byte = usize::MAX;
+            }
+            color = palette::C_PUNCT;
+        }
+        colors.push(color);
+        prev = ch;
+        id += 1;
+    }
+    if word_start_byte != usize::MAX {
+        let wc = word_color_packed(&line_bytes[word_start_byte..word_end_byte]);
+        if wc != palette::C_DEFAULT {
+            colors[word_start_col..].fill(wc);
+        }
+    }
+}
+
+/// Fast-path syntax coloring for pure printable ASCII lines (0x20..=0x7E).
+/// Avoids UTF-8 decode branches and char conversions.
+#[inline]
+pub fn colorize_pure_ascii_line(line: &[u8], colors: &mut Vec<u32>) {
+    colors.clear();
+    colors.reserve(line.len());
+    let mut word_start = usize::MAX;
+    let mut in_comment = false;
+    let mut in_string: Option<u8> = None;
+    let mut prev = b'\n';
+
+    for (i, &b) in line.iter().enumerate() {
+        let mut color = palette::C_DEFAULT;
+        if in_comment {
+            color = palette::C_COMMENT;
+        } else if let Some(q) = in_string {
+            if b == q && prev != b'\\' {
+                in_string = None;
+            }
+            color = palette::C_STRING;
+        } else if b == b'/' && prev == b'/' {
+            in_comment = true;
+            if let Some(last) = colors.last_mut() {
+                *last = palette::C_COMMENT;
+            }
+            color = palette::C_COMMENT;
+        } else if b == b'"' || b == b'\'' || b == b'`' {
+            in_string = Some(b);
+            color = palette::C_STRING;
+        } else if ASCII_WORD_CHAR[b as usize] {
+            if word_start == usize::MAX {
+                word_start = i;
+            }
+            if line[word_start].is_ascii_digit() {
+                color = palette::C_NUMBER;
+            }
+        } else {
+            if word_start != usize::MAX {
+                let wc = word_color_packed(&line[word_start..i]);
+                if wc != palette::C_DEFAULT {
+                    colors[word_start..].fill(wc);
+                }
+                word_start = usize::MAX;
+            }
+            color = palette::C_PUNCT;
+        }
+        colors.push(color);
+        prev = b;
+    }
+    if word_start != usize::MAX {
+        let wc = word_color_packed(&line[word_start..]);
+        if wc != palette::C_DEFAULT {
+            colors[word_start..].fill(wc);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1010,4 +1154,45 @@ mod tests {
         assert_eq!(rows[8], 1, "the 8-cell line's newline rides its second row");
         assert_eq!(rows[9], 2, "and the next line starts immediately below");
     }
+
+    #[test]
+    fn colorize_line_into_matches_colorize_leaders() {
+        let sample = b"const x = 42;\nlet y = \"hello world\"; // comment\nfn test() -> bool { true }\n";
+        let full_colors = colorize_leaders(sample);
+
+        let mut reconstructed = Vec::new();
+        let mut line_buf = Vec::new();
+        for line in sample.split(|&b| b == b'\n') {
+            colorize_line_into(line, &mut line_buf);
+            reconstructed.extend_from_slice(&line_buf);
+            reconstructed.push(palette::C_DEFAULT); // newline color in colorize_leaders
+        }
+        reconstructed.pop(); // remove extra newline from trailing empty split
+
+        assert_eq!(reconstructed.len(), full_colors.len());
+        for (i, (&rec, &orig)) in reconstructed.iter().zip(&full_colors).enumerate() {
+            assert_eq!(rec, orig, "mismatch at index {i}");
+        }
+    }
+
+    #[test]
+    fn colorize_pure_ascii_line_matches_colorize_line_into() {
+        let lines = [
+            b"const x = 42;".as_slice(),
+            b"let y = \"hello world\"; // comment".as_slice(),
+            b"fn test() -> bool { true }".as_slice(),
+            b"for (let i = 0; i < 10; i++) { sum += i; }".as_slice(),
+            b"// entire line is comment".as_slice(),
+            b"\"unclosed string".as_slice(),
+        ];
+        let mut buf_a = Vec::new();
+        let mut buf_b = Vec::new();
+        for &line in &lines {
+            colorize_line_into(line, &mut buf_a);
+            colorize_pure_ascii_line(line, &mut buf_b);
+            assert_eq!(buf_a, buf_b, "mismatch on line: {}", String::from_utf8_lossy(line));
+        }
+    }
 }
+
+
