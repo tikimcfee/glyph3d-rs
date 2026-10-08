@@ -1023,5 +1023,110 @@ mod tests {
             assert_eq!(d.row, h.row, "slot {k}: row");
         }
     }
+
+    #[test]
+    fn block_cull_bounds_enclose_all_slots() {
+        let mut sample = String::new();
+        for line_index in 0..40 {
+            let indent = if line_index % 3 == 0 { "                    " } else { "    " };
+            let content = format!("let variable_{line_index} = compute_value_{line_index}(foo, bar, baz); // comment\n");
+            sample.push_str(indent);
+            sample.push_str(&content);
+        }
+        let bytes = sample.as_bytes();
+        let items = [LayoutItem {
+            bytes,
+            params: ItemParams { line_height: 1.25, ..Default::default() },
+            group_id: 0,
+            paint: Paint::SyntaxHeuristic,
+        }];
+
+        let trie = crate::default_trie();
+        let em_height_fu = trie.metrics.em_height_fu;
+        let bitmap_adv = fu_to_world(trie.bitmap_advance_fu, em_height_fu);
+        let (chunks, item_chunk_ranges) = chunk::slice_items_into_chunks(&items);
+        let agg = pass1_prepass_chunks(&chunks, &item_chunk_ranges, &items, &trie, bitmap_adv, em_height_fu);
+        let prepasses = agg.prepasses;
+        assert!(prepasses[0].survivor_count > crate::glyph_scene::SUBSEG_BLOCK_SIZE as u32);
+
+        let mut slot_bases = Vec::new();
+        let mut slots_acc = 0u32;
+        for p in &prepasses {
+            slot_bases.push(slots_acc);
+            slots_acc += p.survivor_count;
+        }
+        let mut direct: Vec<RenderSlot> = vec![bytemuck::Zeroable::zeroed(); slots_acc as usize];
+        let inputs = EmitInputs {
+            items: &items,
+            chunks: &chunks,
+            item_chunk_ranges: &item_chunk_ranges,
+            prepasses: &prepasses,
+            slot_bases: &slot_bases,
+            chunk_slot_bases: &agg.chunk_slot_bases,
+            chunk_base_rows: &agg.chunk_base_rows,
+            chunk_record_bases: &agg.chunk_record_bases,
+            chunk_initial_cols: &agg.chunk_initial_cols,
+            chunk_initial_seg_advs: &agg.chunk_initial_seg_advs,
+            chunk_initial_line_advs: &agg.chunk_initial_line_advs,
+            trie: &trie,
+            bitmap_adv,
+            em_height_fu,
+        };
+        let (out, _pairs) = inputs.run::<RenderEmit>(direct.as_mut_ptr() as usize);
+        assert!(!out.file_blocks.is_empty());
+        let blocks = &out.file_blocks[0];
+        assert!(blocks.len() >= 2, "must have multiple blocks for > 512 survivors, got {}", blocks.len());
+
+        for (block_index, block) in blocks.iter().enumerate() {
+            assert!(
+                block.min[0] <= block.max[0],
+                "block {block_index} has inverted X: min {} > max {}",
+                block.min[0],
+                block.max[0]
+            );
+            assert!(
+                block.min[1] <= block.max[1],
+                "block {block_index} has inverted Y: min {} > max {}",
+                block.min[1],
+                block.max[1]
+            );
+            assert!(
+                block.min[2] <= block.max[2],
+                "block {block_index} has inverted Z: min {} > max {}",
+                block.min[2],
+                block.max[2]
+            );
+
+            let start = block.slot_base as usize;
+            let end = (block.slot_base + block.slot_count) as usize;
+            for (slot_idx, slot) in direct[start..end].iter().enumerate() {
+                assert!(
+                    slot.pos[0] >= block.min[0] - 1e-4,
+                    "block {block_index}, slot {slot_idx}: x {} < min_x {}",
+                    slot.pos[0],
+                    block.min[0]
+                );
+                assert!(
+                    slot.pos[0] <= block.max[0] + 1e-4,
+                    "block {block_index}, slot {slot_idx}: x {} > max_x {}",
+                    slot.pos[0],
+                    block.max[0]
+                );
+                let half_h = 0.5 * slot.height;
+                assert!(
+                    slot.pos[1] - half_h >= block.min[1] - 1e-4,
+                    "block {block_index}, slot {slot_idx}: y_lo {} < min_y {}",
+                    slot.pos[1] - half_h,
+                    block.min[1]
+                );
+                assert!(
+                    slot.pos[1] + half_h <= block.max[1] + 1e-4,
+                    "block {block_index}, slot {slot_idx}: y_hi {} > max_y {}",
+                    slot.pos[1] + half_h,
+                    block.max[1]
+                );
+            }
+        }
+    }
 }
 

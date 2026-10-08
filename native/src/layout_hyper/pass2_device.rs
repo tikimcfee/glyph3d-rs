@@ -430,12 +430,36 @@ fn layout_pass2_chunk<E: SlotEmit>(
     let mut last_ink_z = f32::NAN;
     let mut emoji_cells = 0usize;
 
-    let tint_default = [lut[212], lut[212], lut[212]];
-    let tint_keyword = [lut[197], lut[134], lut[192]];
-    let tint_number = [lut[181], lut[206], lut[168]];
-    let tint_string = [lut[206], lut[145], lut[120]];
-    let tint_comment = [lut[106], lut[153], lut[85]];
-    let tint_punct = [lut[128], lut[128], lut[128]];
+    let tint_default = [
+        lut[crate::text::palette::DEFAULT[0] as usize],
+        lut[crate::text::palette::DEFAULT[1] as usize],
+        lut[crate::text::palette::DEFAULT[2] as usize],
+    ];
+    let tint_keyword = [
+        lut[crate::text::palette::KEYWORD[0] as usize],
+        lut[crate::text::palette::KEYWORD[1] as usize],
+        lut[crate::text::palette::KEYWORD[2] as usize],
+    ];
+    let tint_number = [
+        lut[crate::text::palette::NUMBER[0] as usize],
+        lut[crate::text::palette::NUMBER[1] as usize],
+        lut[crate::text::palette::NUMBER[2] as usize],
+    ];
+    let tint_string = [
+        lut[crate::text::palette::STRING[0] as usize],
+        lut[crate::text::palette::STRING[1] as usize],
+        lut[crate::text::palette::STRING[2] as usize],
+    ];
+    let tint_comment = [
+        lut[crate::text::palette::COMMENT[0] as usize],
+        lut[crate::text::palette::COMMENT[1] as usize],
+        lut[crate::text::palette::COMMENT[2] as usize],
+    ];
+    let tint_punct = [
+        lut[crate::text::palette::PUNCT[0] as usize],
+        lut[crate::text::palette::PUNCT[1] as usize],
+        lut[crate::text::palette::PUNCT[2] as usize],
+    ];
 
     let mut pos = 0usize;
     let mut span_idx = if let Paint::ByteSpans(spans) = item.paint {
@@ -580,12 +604,6 @@ fn layout_pass2_chunk<E: SlotEmit>(
                     let half_h = 0.5 * crate::text::CELL_HEIGHT_WORLD;
                     let y_lo = row_py - half_h;
                     let y_hi = row_py + half_h;
-                    if has_blocks {
-                        if y_lo < cur_blk_min_y { cur_blk_min_y = y_lo; }
-                        if y_hi > cur_blk_max_y { cur_blk_max_y = y_hi; }
-                        if row_pz < cur_blk_min_z { cur_blk_min_z = row_pz; }
-                        if row_pz > cur_blk_max_z { cur_blk_max_z = row_pz; }
-                    }
 
                     let mut seg_first_survivor_x = f32::NAN;
                     let mut seg_last_survivor_right = f32::NAN;
@@ -771,10 +789,25 @@ fn layout_pass2_chunk<E: SlotEmit>(
                             survivor_out += 8;
 
                             if has_blocks {
-                                if cur_blk_count == 0 {
+                                if pos_x0 < cur_blk_min_x {
                                     cur_blk_min_x = pos_x0;
                                 }
-                                cur_blk_max_x = pos_x7 + qw;
+                                let burst_max_x = pos_x7 + qw;
+                                if burst_max_x > cur_blk_max_x {
+                                    cur_blk_max_x = burst_max_x;
+                                }
+                                if y_lo < cur_blk_min_y {
+                                    cur_blk_min_y = y_lo;
+                                }
+                                if y_hi > cur_blk_max_y {
+                                    cur_blk_max_y = y_hi;
+                                }
+                                if row_pz < cur_blk_min_z {
+                                    cur_blk_min_z = row_pz;
+                                }
+                                if row_pz > cur_blk_max_z {
+                                    cur_blk_max_z = row_pz;
+                                }
                                 cur_blk_count += 8;
                                 if cur_blk_count == SUBSEG_BLOCK_SIZE {
                                     if cur_blk_min_x <= cur_blk_max_x && cur_blk_min_y <= cur_blk_max_y {
@@ -786,11 +819,11 @@ fn layout_pass2_chunk<E: SlotEmit>(
                                         });
                                     }
                                     cur_blk_min_x = f32::INFINITY;
-                                    cur_blk_min_y = y_lo;
-                                    cur_blk_min_z = row_pz;
+                                    cur_blk_min_y = f32::INFINITY;
+                                    cur_blk_min_z = f32::INFINITY;
                                     cur_blk_max_x = f32::NEG_INFINITY;
-                                    cur_blk_max_y = y_hi;
-                                    cur_blk_max_z = row_pz;
+                                    cur_blk_max_y = f32::NEG_INFINITY;
+                                    cur_blk_max_z = f32::NEG_INFINITY;
                                     cur_blk_count = 0;
                                 }
                             }
@@ -916,10 +949,25 @@ fn layout_pass2_chunk<E: SlotEmit>(
                             survivor_out += 4;
 
                             if has_blocks {
-                                if cur_blk_count == 0 {
+                                if pos_x0 < cur_blk_min_x {
                                     cur_blk_min_x = pos_x0;
                                 }
-                                cur_blk_max_x = pos_x3 + qw;
+                                let burst_max_x = pos_x3 + qw;
+                                if burst_max_x > cur_blk_max_x {
+                                    cur_blk_max_x = burst_max_x;
+                                }
+                                if y_lo < cur_blk_min_y {
+                                    cur_blk_min_y = y_lo;
+                                }
+                                if y_hi > cur_blk_max_y {
+                                    cur_blk_max_y = y_hi;
+                                }
+                                if row_pz < cur_blk_min_z {
+                                    cur_blk_min_z = row_pz;
+                                }
+                                if row_pz > cur_blk_max_z {
+                                    cur_blk_max_z = row_pz;
+                                }
                                 cur_blk_count += 4;
                                 if cur_blk_count == SUBSEG_BLOCK_SIZE {
                                     if cur_blk_min_x <= cur_blk_max_x && cur_blk_min_y <= cur_blk_max_y {
@@ -931,11 +979,11 @@ fn layout_pass2_chunk<E: SlotEmit>(
                                         });
                                     }
                                     cur_blk_min_x = f32::INFINITY;
-                                    cur_blk_min_y = y_lo;
-                                    cur_blk_min_z = row_pz;
+                                    cur_blk_min_y = f32::INFINITY;
+                                    cur_blk_min_z = f32::INFINITY;
                                     cur_blk_max_x = f32::NEG_INFINITY;
-                                    cur_blk_max_y = y_hi;
-                                    cur_blk_max_z = row_pz;
+                                    cur_blk_max_y = f32::NEG_INFINITY;
+                                    cur_blk_max_z = f32::NEG_INFINITY;
                                     cur_blk_count = 0;
                                 }
                             }
@@ -984,10 +1032,25 @@ fn layout_pass2_chunk<E: SlotEmit>(
                             survivor_out += 1;
 
                             if has_blocks {
-                                if cur_blk_count == 0 {
+                                if pos_x < cur_blk_min_x {
                                     cur_blk_min_x = pos_x;
                                 }
-                                cur_blk_max_x = pos_x + qw;
+                                let char_max_x = pos_x + qw;
+                                if char_max_x > cur_blk_max_x {
+                                    cur_blk_max_x = char_max_x;
+                                }
+                                if y_lo < cur_blk_min_y {
+                                    cur_blk_min_y = y_lo;
+                                }
+                                if y_hi > cur_blk_max_y {
+                                    cur_blk_max_y = y_hi;
+                                }
+                                if row_pz < cur_blk_min_z {
+                                    cur_blk_min_z = row_pz;
+                                }
+                                if row_pz > cur_blk_max_z {
+                                    cur_blk_max_z = row_pz;
+                                }
                                 cur_blk_count += 1;
 
                                 if cur_blk_count == SUBSEG_BLOCK_SIZE {
@@ -1000,11 +1063,11 @@ fn layout_pass2_chunk<E: SlotEmit>(
                                         });
                                     }
                                     cur_blk_min_x = f32::INFINITY;
-                                    cur_blk_min_y = y_lo;
-                                    cur_blk_min_z = row_pz;
+                                    cur_blk_min_y = f32::INFINITY;
+                                    cur_blk_min_z = f32::INFINITY;
                                     cur_blk_max_x = f32::NEG_INFINITY;
-                                    cur_blk_max_y = y_hi;
-                                    cur_blk_max_z = row_pz;
+                                    cur_blk_max_y = f32::NEG_INFINITY;
+                                    cur_blk_max_z = f32::NEG_INFINITY;
                                     cur_blk_count = 0;
                                 }
                             }
@@ -1054,10 +1117,25 @@ fn layout_pass2_chunk<E: SlotEmit>(
                             survivor_out += 1;
 
                             if has_blocks {
-                                if cur_blk_count == 0 {
+                                if pos_x < cur_blk_min_x {
                                     cur_blk_min_x = pos_x;
                                 }
-                                cur_blk_max_x = pos_x + qw;
+                                let char_max_x = pos_x + qw;
+                                if char_max_x > cur_blk_max_x {
+                                    cur_blk_max_x = char_max_x;
+                                }
+                                if y_lo < cur_blk_min_y {
+                                    cur_blk_min_y = y_lo;
+                                }
+                                if y_hi > cur_blk_max_y {
+                                    cur_blk_max_y = y_hi;
+                                }
+                                if row_pz < cur_blk_min_z {
+                                    cur_blk_min_z = row_pz;
+                                }
+                                if row_pz > cur_blk_max_z {
+                                    cur_blk_max_z = row_pz;
+                                }
                                 cur_blk_count += 1;
 
                                 if cur_blk_count == SUBSEG_BLOCK_SIZE {
@@ -1070,11 +1148,11 @@ fn layout_pass2_chunk<E: SlotEmit>(
                                         });
                                     }
                                     cur_blk_min_x = f32::INFINITY;
-                                    cur_blk_min_y = y_lo;
-                                    cur_blk_min_z = row_pz;
+                                    cur_blk_min_y = f32::INFINITY;
+                                    cur_blk_min_z = f32::INFINITY;
                                     cur_blk_max_x = f32::NEG_INFINITY;
-                                    cur_blk_max_y = y_hi;
-                                    cur_blk_max_z = row_pz;
+                                    cur_blk_max_y = f32::NEG_INFINITY;
+                                    cur_blk_max_z = f32::NEG_INFINITY;
                                     cur_blk_count = 0;
                                 }
                             }
