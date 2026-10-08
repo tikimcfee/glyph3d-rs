@@ -23,8 +23,13 @@ pub(crate) struct DeviceEmission {
 /// The per-run inputs every emission shares.
 pub(crate) struct EmitInputs<'a, 'b> {
     pub items: &'a [LayoutItem<'b>],
+    pub chunks: &'a [super::chunk::LayoutChunk<'b>],
+    pub item_chunk_ranges: &'a [std::ops::Range<usize>],
     pub prepasses: &'a [ItemPrepass],
     pub slot_bases: &'a [u32],
+    pub chunk_slot_bases: &'a [u32],
+    pub chunk_base_rows: &'a [i64],
+    pub chunk_record_bases: &'a [usize],
     pub line_bases: &'a [u32],
     pub trie: &'a TrieTable,
     pub bitmap_adv: f32,
@@ -36,16 +41,7 @@ impl EmitInputs<'_, '_> {
     /// survivors of `E::Slot` — a mapped GPU buffer, or a host Vec in tests).
     pub(crate) fn run<E: SlotEmit>(&self, dest_addr: usize) -> (Pass2DeviceOutput, Vec<Vec<u32>>) {
         let sp_pass2 = tracing::info_span!("hyper.pass2").entered();
-        let out = layout_pass2_device::<E>(
-            self.items,
-            self.prepasses,
-            self.slot_bases,
-            self.line_bases,
-            self.trie,
-            self.bitmap_adv,
-            self.em_height_fu,
-            dest_addr,
-        );
+        let out = layout_pass2_device::<E>(self, dest_addr);
         drop(sp_pass2);
         let pairs = emoji_tint_pairs::<E>(dest_addr, &out);
         (out, pairs)

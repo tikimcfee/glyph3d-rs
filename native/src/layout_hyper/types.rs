@@ -6,7 +6,8 @@ pub struct Pass2DeviceOutput {
     pub file_blocks: Vec<Vec<crate::glyph_scene::BlockCull>>,
 }
 
-#[derive(Clone, Copy)]
+#[repr(align(64))]
+#[derive(Clone, Copy, Debug)]
 pub struct ItemPrepass {
     pub survivor_count: u32,
     pub leader_count: u32,

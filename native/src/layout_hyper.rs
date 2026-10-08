@@ -26,6 +26,7 @@ use glyph_field_derived::DerivedSlot;
 mod types;
 pub use types::{ItemPrepass, Pass2DeviceOutput, SendPtr};
 
+pub(crate) mod chunk;
 pub(crate) mod char_resolve;
 use char_resolve::resolve_byte_char_cluster;
 
@@ -120,17 +121,29 @@ impl HyperLayout {
         let em_height_fu = trie.metrics.em_height_fu;
         let bitmap_adv = fu_to_world(trie.bitmap_advance_fu, em_height_fu);
 
-        // --- PASS 1 (Parallel): Prepass per item to find counts and max_row_extent ---
+        let (chunks, item_chunk_ranges) = chunk::slice_items_into_chunks(items);
+
+        // --- PASS 1 (Parallel): Prepass per chunk to find counts and max_row_extent ---
         let sp_pass1 = tracing::info_span!("hyper.pass1").entered();
-        let prepasses = pass1_prepass(items, &trie, bitmap_adv, em_height_fu);
+        let agg = pass1_prepass_chunks(
+            &chunks,
+            &item_chunk_ranges,
+            items,
+            &trie,
+            bitmap_adv,
+            em_height_fu,
+        );
         drop(sp_pass1);
 
-        // --- Prefix Sum of survivor offsets ---
+        let prepasses = agg.prepasses;
+        let chunk_slot_bases = agg.chunk_slot_bases;
+        let chunk_base_rows = agg.chunk_base_rows;
+        let chunk_record_bases = agg.chunk_record_bases;
+        let total_survivors = agg.total_survivors;
+
         let mut slot_bases = Vec::with_capacity(item_count);
-        let mut total_survivors = 0usize;
-        for pre in &prepasses {
-            slot_bases.push(total_survivors as u32);
-            total_survivors += pre.survivor_count as usize;
+        for range in &item_chunk_ranges {
+            slot_bases.push(chunk_slot_bases[range.start]);
         }
 
         let derived = self.field_mode == GlyphFieldMode::Derived;
@@ -166,8 +179,13 @@ impl HyperLayout {
             };
             let inputs = EmitInputs {
                 items,
+                chunks: &chunks,
+                item_chunk_ranges: &item_chunk_ranges,
                 prepasses: &prepasses,
                 slot_bases: &slot_bases,
+                chunk_slot_bases: &chunk_slot_bases,
+                chunk_base_rows: &chunk_base_rows,
+                chunk_record_bases: &chunk_record_bases,
                 line_bases: &line_bases,
                 trie: &trie,
                 bitmap_adv,
@@ -239,6 +257,272 @@ impl HyperLayout {
 }
 
 
+/// Prepass aggregation output holding per-item prepasses and per-chunk starting offsets.
+pub(crate) struct PrepassAggregate {
+    pub prepasses: Vec<ItemPrepass>,
+    pub chunk_slot_bases: Vec<u32>,
+    pub chunk_base_rows: Vec<i64>,
+    pub chunk_record_bases: Vec<usize>,
+    pub total_survivors: usize,
+}
+
+/// Evaluates Pass 1 on a single byte slice (whole file or line-aligned chunk).
+pub(crate) fn pass1_prepass_chunk_bytes(
+    bytes: &[u8],
+    p: &crate::layout::ItemParams,
+    trie: &TrieTable,
+    bitmap_adv: f32,
+    em_height_fu: u32,
+) -> ItemPrepass {
+    let fold_unit = if p.wrap_width > 0 {
+        p.wrap_width as i64
+    } else if p.has_page {
+        p.page_cols as i64
+    } else {
+        0
+    };
+
+    let mut survivor_count = 0u32;
+    let mut leader_count = 0u32;
+    let mut max_row_extent = 0.0f64;
+    let mut trailer_until = 0usize;
+    let mut has_cluster = false;
+    let mut row_count = 0u64;
+    let wrap_w = p.wrap_width as i64;
+
+    let ascii_adv = fu_to_world(1229, em_height_fu);
+    let mut pos = 0usize;
+    if fold_unit == 0 {
+        let mut line_adv = 0.0f64;
+        while pos < bytes.len() {
+            row_count += 1;
+            let nl_pos = match memchr::memchr(b'\n', &bytes[pos..]) {
+                Some(offset) => pos + offset,
+                None => bytes.len(),
+            };
+            let line = &bytes[pos..nl_pos];
+            if line.iter().all(|b| (0x20..0x7F).contains(b)) {
+                let l = line.len();
+                survivor_count += l as u32;
+                leader_count += l as u32;
+                let end_adv = line_adv + l as f64 * ascii_adv as f64;
+                if end_adv > max_row_extent {
+                    max_row_extent = end_adv;
+                }
+                line_adv = 0.0;
+                if nl_pos < bytes.len() {
+                    leader_count += 1;
+                    pos = nl_pos + 1;
+                } else {
+                    pos = nl_pos;
+                }
+                continue;
+            }
+
+            for i in pos..nl_pos {
+                let r = match resolve_byte_char_cluster(bytes, i, trie, bitmap_adv, em_height_fu, &mut trailer_until, &mut has_cluster) {
+                    Some(r) => r,
+                    None => continue,
+                };
+
+                leader_count += 1;
+                if line_adv > max_row_extent {
+                    max_row_extent = line_adv;
+                }
+
+                if r.glyph_id != 0 {
+                    survivor_count += 1;
+                }
+
+                line_adv += r.advance as f64;
+            }
+
+            if nl_pos < bytes.len() {
+                leader_count += 1;
+                if line_adv > max_row_extent {
+                    max_row_extent = line_adv;
+                }
+                line_adv = 0.0;
+                pos = nl_pos + 1;
+            } else {
+                pos = nl_pos;
+            }
+        }
+    } else {
+        let mut col = 0i64;
+        let mut seg_adv = 0.0f32;
+        let fu = fold_unit as usize;
+        let mut seg_adv_stack = [0.0f32; 256];
+        let mut seg_adv_heap = Vec::new();
+        let seg_adv_table: &[f32] = if fu < 256 {
+            let mut cur = 0.0f32;
+            for slot in seg_adv_stack.iter_mut().take(fu + 1) {
+                *slot = cur;
+                cur += ascii_adv;
+            }
+            &seg_adv_stack[..=fu]
+        } else {
+            seg_adv_heap.reserve(fu + 1);
+            let mut cur = 0.0f32;
+            for _ in 0..=fu {
+                seg_adv_heap.push(cur);
+                cur += ascii_adv;
+            }
+            &seg_adv_heap
+        };
+
+        while pos < bytes.len() {
+            let nl_pos = match memchr::memchr(b'\n', &bytes[pos..]) {
+                Some(offset) => pos + offset,
+                None => bytes.len(),
+            };
+            let line = &bytes[pos..nl_pos];
+            if line.iter().all(|b| (0x20..0x7F).contains(b)) {
+                let l = line.len();
+                survivor_count += l as u32;
+                leader_count += l as u32;
+                row_count += rows_for_line(l as i64, wrap_w, p.wrap_mode) as u64;
+                let line_max_seg = if l >= fu {
+                    seg_adv_table[fu - 1]
+                } else {
+                    seg_adv_table[l]
+                };
+                if line_max_seg as f64 > max_row_extent {
+                    max_row_extent = line_max_seg as f64;
+                }
+                col = 0;
+                seg_adv = 0.0;
+                if nl_pos < bytes.len() {
+                    leader_count += 1;
+                    pos = nl_pos + 1;
+                } else {
+                    pos = nl_pos;
+                }
+                continue;
+            }
+
+            for i in pos..nl_pos {
+                let r = match resolve_byte_char_cluster(bytes, i, trie, bitmap_adv, em_height_fu, &mut trailer_until, &mut has_cluster) {
+                    Some(r) => r,
+                    None => continue,
+                };
+
+                leader_count += 1;
+                let item_rel_x = seg_adv as f64;
+                if item_rel_x > max_row_extent {
+                    max_row_extent = item_rel_x;
+                }
+
+                if r.glyph_id != 0 {
+                    survivor_count += 1;
+                }
+
+                col += 1;
+                if col % fold_unit == 0 {
+                    seg_adv = 0.0;
+                } else {
+                    seg_adv += r.advance;
+                }
+            }
+            row_count += rows_for_line(col, wrap_w, p.wrap_mode) as u64;
+
+            if nl_pos < bytes.len() {
+                leader_count += 1;
+                let item_rel_x = seg_adv as f64;
+                if item_rel_x > max_row_extent {
+                    max_row_extent = item_rel_x;
+                }
+                col = 0;
+                seg_adv = 0.0;
+                pos = nl_pos + 1;
+            } else {
+                pos = nl_pos;
+            }
+        }
+    }
+
+    ItemPrepass {
+        survivor_count,
+        leader_count,
+        max_row_extent,
+        row_count: u32::try_from(row_count).expect("item row count exceeds u32"),
+        has_cluster,
+    }
+}
+
+/// Evaluates Pass 1 across all line-aligned chunks in parallel and aggregates per-item results.
+pub(crate) fn pass1_prepass_chunks(
+    chunks: &[chunk::LayoutChunk<'_>],
+    item_chunk_ranges: &[std::ops::Range<usize>],
+    items: &[LayoutItem<'_>],
+    trie: &TrieTable,
+    bitmap_adv: f32,
+    em_height_fu: u32,
+) -> PrepassAggregate {
+    let chunk_prepasses: Vec<ItemPrepass> = chunks
+        .par_iter()
+        .map(|chunk| {
+            let item = &items[chunk.item_index];
+            pass1_prepass_chunk_bytes(chunk.bytes, &item.params, trie, bitmap_adv, em_height_fu)
+        })
+        .collect();
+
+    let mut prepasses = Vec::with_capacity(items.len());
+    let mut chunk_slot_bases = Vec::with_capacity(chunks.len());
+    let mut chunk_base_rows = Vec::with_capacity(chunks.len());
+    let mut chunk_record_bases = Vec::with_capacity(chunks.len());
+    let mut total_survivors = 0usize;
+
+    for range in item_chunk_ranges {
+        let mut item_survivor_count = 0u32;
+        let mut item_leader_count = 0u32;
+        let mut item_max_row_extent = 0.0f64;
+        let mut item_row_count = 0u32;
+        let mut item_has_cluster = false;
+
+        let mut item_accum_rows = 0i64;
+        let mut item_accum_records = 0usize;
+
+        for chunk_index in range.clone() {
+            let chunk_prepass = &chunk_prepasses[chunk_index];
+
+            chunk_slot_bases.push(total_survivors as u32);
+            chunk_base_rows.push(item_accum_rows);
+            chunk_record_bases.push(item_accum_records);
+
+            total_survivors += chunk_prepass.survivor_count as usize;
+            item_accum_rows += chunk_prepass.row_count as i64;
+            item_accum_records += chunk_prepass.leader_count as usize;
+
+            item_survivor_count += chunk_prepass.survivor_count;
+            item_leader_count += chunk_prepass.leader_count;
+            if chunk_prepass.max_row_extent > item_max_row_extent {
+                item_max_row_extent = chunk_prepass.max_row_extent;
+            }
+            item_row_count += chunk_prepass.row_count;
+            if chunk_prepass.has_cluster {
+                item_has_cluster = true;
+            }
+        }
+
+        prepasses.push(ItemPrepass {
+            survivor_count: item_survivor_count,
+            leader_count: item_leader_count,
+            max_row_extent: item_max_row_extent,
+            row_count: item_row_count,
+            has_cluster: item_has_cluster,
+        });
+    }
+
+    PrepassAggregate {
+        prepasses,
+        chunk_slot_bases,
+        chunk_base_rows,
+        chunk_record_bases,
+        total_survivors,
+    }
+}
+
 /// PASS 1 (parallel): per item, survivor count, widest row extent, and the
 /// FOLDED row count (the Derived line table's size, known before Pass 2).
 pub(crate) fn pass1_prepass(
@@ -247,190 +531,16 @@ pub(crate) fn pass1_prepass(
     bitmap_adv: f32,
     em_height_fu: u32,
 ) -> Vec<ItemPrepass> {
-    items
-        .par_iter()
-        .map(|item| {
-            let bytes = item.bytes;
-            let p = &item.params;
-            let fold_unit = if p.wrap_width > 0 {
-                p.wrap_width as i64
-            } else if p.has_page {
-                p.page_cols as i64
-            } else {
-                0
-            };
-
-            let mut survivor_count = 0u32;
-            let mut leader_count = 0u32;
-            let mut max_row_extent = 0.0f64;
-            let mut trailer_until = 0usize;
-            let mut has_cluster = false;
-            // Rows this item's records occupy — exactly Pass 2's
-            // `base_row` progression (`rows_for_line` per line, the last,
-            // unterminated line included). Unfolded: one row per line.
-            let mut row_count = 0u64;
-            let wrap_w = p.wrap_width as i64;
-
-            let ascii_adv = fu_to_world(1229, em_height_fu);
-            let mut pos = 0usize;
-            if fold_unit == 0 {
-                let mut line_adv = 0.0f64;
-                while pos < bytes.len() {
-                    row_count += 1;
-                    let nl_pos = match memchr::memchr(b'\n', &bytes[pos..]) {
-                        Some(offset) => pos + offset,
-                        None => bytes.len(),
-                    };
-                    let line = &bytes[pos..nl_pos];
-                    if line.iter().all(|b| (0x20..0x7F).contains(b)) {
-                        let l = line.len();
-                        survivor_count += l as u32;
-                        leader_count += l as u32;
-                        let end_adv = line_adv + l as f64 * ascii_adv as f64;
-                        if end_adv > max_row_extent {
-                            max_row_extent = end_adv;
-                        }
-                        line_adv = 0.0;
-                        if nl_pos < bytes.len() {
-                            leader_count += 1;
-                            pos = nl_pos + 1;
-                        } else {
-                            pos = nl_pos;
-                        }
-                        continue;
-                    }
-
-                    for i in pos..nl_pos {
-                        let r = match resolve_byte_char_cluster(bytes, i, trie, bitmap_adv, em_height_fu, &mut trailer_until, &mut has_cluster) {
-                            Some(r) => r,
-                            None => continue,
-                        };
-
-                        leader_count += 1;
-                        if line_adv > max_row_extent {
-                            max_row_extent = line_adv;
-                        }
-
-                        if r.glyph_id != 0 {
-                            survivor_count += 1;
-                        }
-
-                        line_adv += r.advance as f64;
-                    }
-
-                    if nl_pos < bytes.len() {
-                        leader_count += 1;
-                        if line_adv > max_row_extent {
-                            max_row_extent = line_adv;
-                        }
-                        line_adv = 0.0;
-                        pos = nl_pos + 1;
-                    } else {
-                        pos = nl_pos;
-                    }
-                }
-            } else {
-                let mut col = 0i64;
-                let mut seg_adv = 0.0f32;
-                let fu = fold_unit as usize;
-                let mut seg_adv_stack = [0.0f32; 256];
-                let mut seg_adv_heap = Vec::new();
-                let seg_adv_table: &[f32] = if fu < 256 {
-                    let mut cur = 0.0f32;
-                    for slot in seg_adv_stack.iter_mut().take(fu + 1) {
-                        *slot = cur;
-                        cur += ascii_adv;
-                    }
-                    &seg_adv_stack[..=fu]
-                } else {
-                    seg_adv_heap.reserve(fu + 1);
-                    let mut cur = 0.0f32;
-                    for _ in 0..=fu {
-                        seg_adv_heap.push(cur);
-                        cur += ascii_adv;
-                    }
-                    &seg_adv_heap
-                };
-
-                while pos < bytes.len() {
-                    let nl_pos = match memchr::memchr(b'\n', &bytes[pos..]) {
-                        Some(offset) => pos + offset,
-                        None => bytes.len(),
-                    };
-                    let line = &bytes[pos..nl_pos];
-                    if line.iter().all(|b| (0x20..0x7F).contains(b)) {
-                        let l = line.len();
-                        survivor_count += l as u32;
-                        leader_count += l as u32;
-                        row_count += rows_for_line(l as i64, wrap_w, p.wrap_mode) as u64;
-                        let line_max_seg = if l >= fu {
-                            seg_adv_table[fu - 1]
-                        } else {
-                            seg_adv_table[l]
-                        };
-                        if line_max_seg as f64 > max_row_extent {
-                            max_row_extent = line_max_seg as f64;
-                        }
-                        col = 0;
-                        seg_adv = 0.0;
-                        if nl_pos < bytes.len() {
-                            leader_count += 1;
-                            pos = nl_pos + 1;
-                        } else {
-                            pos = nl_pos;
-                        }
-                        continue;
-                    }
-
-                    for i in pos..nl_pos {
-                        let r = match resolve_byte_char_cluster(bytes, i, trie, bitmap_adv, em_height_fu, &mut trailer_until, &mut has_cluster) {
-                            Some(r) => r,
-                            None => continue,
-                        };
-
-                        leader_count += 1;
-                        let item_rel_x = seg_adv as f64;
-                        if item_rel_x > max_row_extent {
-                            max_row_extent = item_rel_x;
-                        }
-
-                        if r.glyph_id != 0 {
-                            survivor_count += 1;
-                        }
-
-                        col += 1;
-                        if col % fold_unit == 0 {
-                            seg_adv = 0.0;
-                        } else {
-                            seg_adv += r.advance;
-                        }
-                    }
-                    row_count += rows_for_line(col, wrap_w, p.wrap_mode) as u64;
-
-                    if nl_pos < bytes.len() {
-                        leader_count += 1;
-                        let item_rel_x = seg_adv as f64;
-                        if item_rel_x > max_row_extent {
-                            max_row_extent = item_rel_x;
-                        }
-                        col = 0;
-                        seg_adv = 0.0;
-                        pos = nl_pos + 1;
-                    } else {
-                        pos = nl_pos;
-                    }
-                }
-            }
-
-            ItemPrepass {
-                survivor_count,
-                leader_count,
-                max_row_extent,
-                row_count: u32::try_from(row_count).expect("item row count exceeds u32"),
-                has_cluster,
-            }
-        })
-        .collect()
+    let (chunks, item_chunk_ranges) = chunk::slice_items_into_chunks(items);
+    let aggregate = pass1_prepass_chunks(
+        &chunks,
+        &item_chunk_ranges,
+        items,
+        trie,
+        bitmap_adv,
+        em_height_fu,
+    );
+    aggregate.prepasses
 }
 
 
@@ -662,7 +772,9 @@ mod tests {
         let trie = crate::default_trie();
         let em_height_fu = trie.metrics.em_height_fu;
         let bitmap_adv = fu_to_world(trie.bitmap_advance_fu, em_height_fu);
-        let prepasses = pass1_prepass(&items, &trie, bitmap_adv, em_height_fu);
+        let (chunks, item_chunk_ranges) = chunk::slice_items_into_chunks(&items);
+        let agg = pass1_prepass_chunks(&chunks, &item_chunk_ranges, &items, &trie, bitmap_adv, em_height_fu);
+        let prepasses = agg.prepasses;
         let mut slot_bases = Vec::new();
         let mut line_bases = Vec::new();
         let (mut slots_acc, mut lines_acc) = (0u32, 0u32);
@@ -676,8 +788,13 @@ mod tests {
         let mut direct = vec![DerivedSlot::zeroed(); host.len()];
         let inputs = EmitInputs {
             items: &items,
+            chunks: &chunks,
+            item_chunk_ranges: &item_chunk_ranges,
             prepasses: &prepasses,
             slot_bases: &slot_bases,
+            chunk_slot_bases: &agg.chunk_slot_bases,
+            chunk_base_rows: &agg.chunk_base_rows,
+            chunk_record_bases: &agg.chunk_record_bases,
             line_bases: &line_bases,
             trie: &trie,
             bitmap_adv,
