@@ -316,8 +316,8 @@ impl SceneLike for GlyphScene {
     }
 
     fn on_key(&mut self, ctx: &GpuContext, key: winit::keyboard::KeyCode, pressed: bool) {
-        if matches!(self.camera_mode, CameraMode::Fly) {
-            self.fly.on_key(key, pressed);
+        if matches!(self.camera_mode, CameraMode::Fly) && self.fly.on_key(key, pressed) {
+            return;
         }
         if pressed {
             self.verb_key(ctx, key);

@@ -346,17 +346,6 @@ impl GlyphScene {
                     }
                 }
             }
-            K::KeyD => {
-                if let Some(ctrl) = &mut self.controller {
-                    let msg = ctrl.spawn_agent_carrel_demo();
-                    let updated_gids = ctrl.sync_gpu_groups(&mut self.groups_cpu);
-                    self.write_group_rows(ctx, &updated_gids);
-                    for &g in &updated_gids {
-                        self.sync_segment(g);
-                    }
-                    println!("{msg}");
-                }
-            }
             _ => {}
         }
     }

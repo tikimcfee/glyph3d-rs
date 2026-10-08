@@ -65,7 +65,7 @@ impl FlyCamera {
         Vec3::new(sy * cp, sp, -cy * cp)
     }
 
-    pub(super) fn on_key(&mut self, code: winit::keyboard::KeyCode, pressed: bool) {
+    pub(super) fn on_key(&mut self, code: winit::keyboard::KeyCode, pressed: bool) -> bool {
         use winit::keyboard::KeyCode as K;
         let bit = match code {
             K::KeyW => FLY_FWD,
@@ -74,13 +74,14 @@ impl FlyCamera {
             K::KeyD => FLY_RIGHT,
             K::KeyE | K::KeyR => FLY_UP,
             K::KeyQ | K::KeyF => FLY_DOWN,
-            _ => return,
+            _ => return false,
         };
         if pressed {
             self.keys |= bit;
         } else {
             self.keys &= !bit;
         }
+        true
     }
 
     pub(super) fn on_look(&mut self, dx: f32, dy: f32) {
