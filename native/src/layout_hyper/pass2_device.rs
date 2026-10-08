@@ -387,6 +387,7 @@ fn layout_pass2_chunk<E: SlotEmit>(
     let mut file_s2 = 0.0f64;
     let mut file_cells = 0usize;
     let mut file_has_emoji = false;
+    let mut file_syntax_counts = [0u64; 6];
 
     let wrap_w = p.wrap_width as i64;
     let is_wrap_back = p.wrap_mode == crate::fold::WrapMode::Back;
@@ -480,6 +481,7 @@ fn layout_pass2_chunk<E: SlotEmit>(
             let is_pure_ascii = crate::text::is_pure_printable_ascii(line_bytes);
 
             let mut ascii_syntax_counts = None;
+            let mut is_comment_line = false;
             if is_syntax_heuristic {
                 if is_pure_ascii {
                     let counts = if line_len <= 256 {
@@ -487,6 +489,10 @@ fn layout_pass2_chunk<E: SlotEmit>(
                     } else {
                         crate::text::colorize_pure_ascii_line(line_bytes, &mut line_colors)
                     };
+                    if counts[4] > 0 {
+                        let leading_spaces = line_bytes.iter().take_while(|&&b| b == b' ').count();
+                        is_comment_line = counts[4] as usize + leading_spaces == line_len;
+                    }
                     ascii_syntax_counts = Some(counts);
                 } else {
                     crate::text::colorize_line_into(line_bytes, &mut line_colors);
@@ -497,24 +503,12 @@ fn layout_pass2_chunk<E: SlotEmit>(
             if !matches!(item.paint, Paint::ByteSpans(_)) && is_pure_ascii {
                 if flat_color.is_none() {
                     if let Some(counts) = ascii_syntax_counts {
-                        file_s0 += counts[0] as f64 * tint_default[0]
-                                 + counts[1] as f64 * tint_keyword[0]
-                                 + counts[2] as f64 * tint_number[0]
-                                 + counts[3] as f64 * tint_string[0]
-                                 + counts[4] as f64 * tint_comment[0]
-                                 + counts[5] as f64 * tint_punct[0];
-                        file_s1 += counts[0] as f64 * tint_default[1]
-                                 + counts[1] as f64 * tint_keyword[1]
-                                 + counts[2] as f64 * tint_number[1]
-                                 + counts[3] as f64 * tint_string[1]
-                                 + counts[4] as f64 * tint_comment[1]
-                                 + counts[5] as f64 * tint_punct[1];
-                        file_s2 += counts[0] as f64 * tint_default[2]
-                                 + counts[1] as f64 * tint_keyword[2]
-                                 + counts[2] as f64 * tint_number[2]
-                                 + counts[3] as f64 * tint_string[2]
-                                 + counts[4] as f64 * tint_comment[2]
-                                 + counts[5] as f64 * tint_punct[2];
+                        file_syntax_counts[0] += counts[0] as u64;
+                        file_syntax_counts[1] += counts[1] as u64;
+                        file_syntax_counts[2] += counts[2] as u64;
+                        file_syntax_counts[3] += counts[3] as u64;
+                        file_syntax_counts[4] += counts[4] as u64;
+                        file_syntax_counts[5] += counts[5] as u64;
                         file_cells += line_len;
                     } else if let Some(colors) = per_record_colors {
                         let line_c = if record_idx + line_len <= colors.len() {
@@ -608,9 +602,10 @@ fn layout_pass2_chunk<E: SlotEmit>(
                     let mut seg_first_survivor_x = f32::NAN;
                     let mut seg_last_survivor_right = f32::NAN;
                     let mut last_char_pos_x = f32::NAN;
+                    let effective_flat_color = flat_color.or(if is_comment_line { Some(crate::text::palette::C_COMMENT) } else { None });
 
                     let get_color = |idx: usize| -> u32 {
-                        if let Some(c) = flat_color {
+                        if let Some(c) = effective_flat_color {
                             c
                         } else if is_syntax_heuristic {
                             if line_len <= 256 {
@@ -729,30 +724,32 @@ fn layout_pass2_chunk<E: SlotEmit>(
                             }
                             seg_last_survivor_right = pos_x7 + ascii_adv;
 
-                            let (c0, c1, c2, c3, c4, c5, c6, c7) = if let Some(c) = flat_color {
+                            let (c0, c1, c2, c3, c4, c5, c6, c7) = if let Some(c) = effective_flat_color {
                                 (c, c, c, c, c, c, c, c)
                             } else if is_syntax_heuristic {
                                 if line_len <= 256 {
+                                    let colors_chunk: &[u32; 8] = stack_line_colors[char_idx0..char_idx0 + 8].try_into().unwrap();
                                     (
-                                        stack_line_colors[char_idx0],
-                                        stack_line_colors[char_idx0 + 1],
-                                        stack_line_colors[char_idx0 + 2],
-                                        stack_line_colors[char_idx0 + 3],
-                                        stack_line_colors[char_idx0 + 4],
-                                        stack_line_colors[char_idx0 + 5],
-                                        stack_line_colors[char_idx0 + 6],
-                                        stack_line_colors[char_idx0 + 7],
+                                        colors_chunk[0],
+                                        colors_chunk[1],
+                                        colors_chunk[2],
+                                        colors_chunk[3],
+                                        colors_chunk[4],
+                                        colors_chunk[5],
+                                        colors_chunk[6],
+                                        colors_chunk[7],
                                     )
                                 } else {
+                                    let colors_chunk: &[u32; 8] = line_colors[char_idx0..char_idx0 + 8].try_into().unwrap();
                                     (
-                                        line_colors[char_idx0],
-                                        line_colors[char_idx0 + 1],
-                                        line_colors[char_idx0 + 2],
-                                        line_colors[char_idx0 + 3],
-                                        line_colors[char_idx0 + 4],
-                                        line_colors[char_idx0 + 5],
-                                        line_colors[char_idx0 + 6],
-                                        line_colors[char_idx0 + 7],
+                                        colors_chunk[0],
+                                        colors_chunk[1],
+                                        colors_chunk[2],
+                                        colors_chunk[3],
+                                        colors_chunk[4],
+                                        colors_chunk[5],
+                                        colors_chunk[6],
+                                        colors_chunk[7],
                                     )
                                 }
                             } else if per_record_colors.is_some() {
@@ -897,22 +894,24 @@ fn layout_pass2_chunk<E: SlotEmit>(
                             }
                             seg_last_survivor_right = pos_x3 + ascii_adv;
 
-                            let (c0, c1, c2, c3) = if let Some(c) = flat_color {
+                            let (c0, c1, c2, c3) = if let Some(c) = effective_flat_color {
                                 (c, c, c, c)
                             } else if is_syntax_heuristic {
                                 if line_len <= 256 {
+                                    let colors_chunk: &[u32; 4] = stack_line_colors[char_idx0..char_idx0 + 4].try_into().unwrap();
                                     (
-                                        stack_line_colors[char_idx0],
-                                        stack_line_colors[char_idx0 + 1],
-                                        stack_line_colors[char_idx0 + 2],
-                                        stack_line_colors[char_idx0 + 3],
+                                        colors_chunk[0],
+                                        colors_chunk[1],
+                                        colors_chunk[2],
+                                        colors_chunk[3],
                                     )
                                 } else {
+                                    let colors_chunk: &[u32; 4] = line_colors[char_idx0..char_idx0 + 4].try_into().unwrap();
                                     (
-                                        line_colors[char_idx0],
-                                        line_colors[char_idx0 + 1],
-                                        line_colors[char_idx0 + 2],
-                                        line_colors[char_idx0 + 3],
+                                        colors_chunk[0],
+                                        colors_chunk[1],
+                                        colors_chunk[2],
+                                        colors_chunk[3],
                                     )
                                 }
                             } else if per_record_colors.is_some() {
@@ -1444,6 +1443,27 @@ fn layout_pass2_chunk<E: SlotEmit>(
             slot_base: chunk_rel_slot + (survivor_out - cur_blk_count) as u32,
             slot_count: cur_blk_count as u32,
         });
+    }
+
+    if flat_color.is_none() && is_syntax_heuristic {
+        file_s0 += file_syntax_counts[0] as f64 * tint_default[0]
+                 + file_syntax_counts[1] as f64 * tint_keyword[0]
+                 + file_syntax_counts[2] as f64 * tint_number[0]
+                 + file_syntax_counts[3] as f64 * tint_string[0]
+                 + file_syntax_counts[4] as f64 * tint_comment[0]
+                 + file_syntax_counts[5] as f64 * tint_punct[0];
+        file_s1 += file_syntax_counts[0] as f64 * tint_default[1]
+                 + file_syntax_counts[1] as f64 * tint_keyword[1]
+                 + file_syntax_counts[2] as f64 * tint_number[1]
+                 + file_syntax_counts[3] as f64 * tint_string[1]
+                 + file_syntax_counts[4] as f64 * tint_comment[1]
+                 + file_syntax_counts[5] as f64 * tint_punct[1];
+        file_s2 += file_syntax_counts[0] as f64 * tint_default[2]
+                 + file_syntax_counts[1] as f64 * tint_keyword[2]
+                 + file_syntax_counts[2] as f64 * tint_number[2]
+                 + file_syntax_counts[3] as f64 * tint_string[2]
+                 + file_syntax_counts[4] as f64 * tint_comment[2]
+                 + file_syntax_counts[5] as f64 * tint_punct[2];
     }
 
     ChunkPass2Output {

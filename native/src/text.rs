@@ -1057,6 +1057,11 @@ pub fn colorize_leaders(bytes: &[u8]) -> Vec<u32> {
 /// Clears `colors` and pushes one packed RGBA u32 per leader in `line_bytes`.
 pub fn colorize_line_into(line_bytes: &[u8], colors: &mut Vec<u32>) {
     colors.clear();
+    if is_pure_printable_ascii(line_bytes) {
+        colors.resize(line_bytes.len(), 0);
+        colorize_pure_ascii_line_slice(line_bytes, colors.as_mut_slice());
+        return;
+    }
     colors.reserve(line_bytes.len());
     let mut word_start_byte = usize::MAX;
     let mut word_end_byte = 0usize;
@@ -1221,20 +1226,71 @@ pub fn is_pure_printable_ascii(bytes: &[u8]) -> bool {
 pub fn colorize_pure_ascii_line_slice(line: &[u8], colors: &mut [u32]) -> [u32; 6] {
     debug_assert_eq!(line.len(), colors.len());
     let mut counts = [0u32; 6];
-    let mut word_start = usize::MAX;
+    if line.is_empty() {
+        return counts;
+    }
+
+    let mut first_non_space = 0usize;
+    while first_non_space < line.len() && line[first_non_space] == b' ' {
+        first_non_space += 1;
+    }
+
+    // Fast path: Pure whitespace line
+    if first_non_space == line.len() {
+        colors.fill(palette::C_PUNCT);
+        counts[5] = line.len() as u32;
+        return counts;
+    }
+
     let is_block_continuation = is_block_comment_continuation_line(line);
-    let mut in_line_comment = false;
+
+    // Fast path: Block comment continuation line without closing '*/'
+    if is_block_continuation && memchr::memchr(b'/', line).is_none() {
+        colors.fill(palette::C_COMMENT);
+        counts[4] = line.len() as u32;
+        return counts;
+    }
+
+    // Fast path: Full-line '//' comment
+    if line[first_non_space..].starts_with(b"//") {
+        if first_non_space > 0 {
+            colors[..first_non_space].fill(palette::C_PUNCT);
+            counts[5] = first_non_space as u32;
+        }
+        colors[first_non_space..].fill(palette::C_COMMENT);
+        counts[4] = (line.len() - first_non_space) as u32;
+        return counts;
+    }
+
+    // Fast path: Full-line '#' comment
+    if line[first_non_space] == b'#' && (first_non_space + 1 >= line.len() || (line[first_non_space + 1] != b'[' && !(line[first_non_space + 1] == b'!' && first_non_space + 2 < line.len() && line[first_non_space + 2] == b'['))) {
+        if first_non_space > 0 {
+            colors[..first_non_space].fill(palette::C_PUNCT);
+            counts[5] = first_non_space as u32;
+        }
+        colors[first_non_space..].fill(palette::C_COMMENT);
+        counts[4] = (line.len() - first_non_space) as u32;
+        return counts;
+    }
+
+    let mut word_start = usize::MAX;
     let mut in_block_comment = is_block_continuation;
     let mut block_comment_start = if is_block_continuation { 0 } else { usize::MAX };
     let mut in_string: Option<u8> = None;
     let mut prev = b'\n';
 
-    for (i, &b) in line.iter().enumerate() {
+    let mut start_idx = 0usize;
+    if !is_block_continuation && first_non_space > 0 {
+        colors[..first_non_space].fill(palette::C_PUNCT);
+        counts[5] = first_non_space as u32;
+        start_idx = first_non_space;
+        prev = b' ';
+    }
+
+    for i in start_idx..line.len() {
+        let b = line[i];
         let mut color = palette::C_DEFAULT;
-        if in_line_comment {
-            color = palette::C_COMMENT;
-            counts[4] += 1;
-        } else if in_block_comment {
+        if in_block_comment {
             color = palette::C_COMMENT;
             counts[4] += 1;
             if i > block_comment_start + 1 && prev == b'*' && b == b'/' {
@@ -1250,14 +1306,15 @@ pub fn colorize_pure_ascii_line_slice(line: &[u8], colors: &mut [u32]) -> [u32; 
             color = palette::C_STRING;
             counts[3] += 1;
         } else if b == b'/' && prev == b'/' {
-            in_line_comment = true;
             if i > 0 {
-                colors[i - 1] = palette::C_COMMENT;
+                colors[i - 1..].fill(palette::C_COMMENT);
                 counts[5] -= 1;
-                counts[4] += 1;
+                counts[4] += (line.len() - (i - 1)) as u32;
+            } else {
+                colors.fill(palette::C_COMMENT);
+                counts[4] += line.len() as u32;
             }
-            color = palette::C_COMMENT;
-            counts[4] += 1;
+            break;
         } else if b == b'*' && prev == b'/' {
             in_block_comment = true;
             block_comment_start = i;
@@ -1279,9 +1336,9 @@ pub fn colorize_pure_ascii_line_slice(line: &[u8], colors: &mut [u32]) -> [u32; 
                 }
                 word_start = usize::MAX;
             }
-            in_line_comment = true;
-            color = palette::C_COMMENT;
-            counts[4] += 1;
+            colors[i..].fill(palette::C_COMMENT);
+            counts[4] += (line.len() - i) as u32;
+            break;
         } else if b == b'"' || b == b'\'' || b == b'`' {
             in_string = Some(b);
             color = palette::C_STRING;
