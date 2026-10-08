@@ -125,6 +125,9 @@ fn layout_pass2_chunk<E: SlotEmit>(
     item_slot_base: u32,
     initial_base_row: i64,
     initial_record_base: usize,
+    initial_col: i64,
+    initial_seg_adv: f32,
+    initial_line_adv: f64,
     line_base: u32,
     trie: &TrieTable,
     bitmap_adv: f32,
@@ -160,9 +163,10 @@ fn layout_pass2_chunk<E: SlotEmit>(
     let mut ink_max = [f32::NEG_INFINITY; 3];
 
     let mut base_row = initial_base_row;
-    let mut col = 0i64;
-    let mut line_adv = 0.0f64;
-    let mut seg_adv = 0.0f32;
+    let mut col = initial_col;
+    let mut line_adv = initial_line_adv;
+    let mut seg_adv = initial_seg_adv;
+    let mut line_start_col = initial_col;
     let mut record_idx = initial_record_base;
     let mut survivor_out = 0usize;
     let mut trailer_until = 0usize;
@@ -176,6 +180,18 @@ fn layout_pass2_chunk<E: SlotEmit>(
     } else {
         Vec::new()
     };
+    if is_syntax_heuristic && initial_col > 0 {
+        let first_nl = match memchr::memchr(b'\n', bytes) {
+            Some(off) => off,
+            None => bytes.len(),
+        };
+        let first_slice = &bytes[..first_nl];
+        if first_slice.iter().all(|&b| (0x20..=0x7E).contains(&b)) {
+            crate::text::colorize_pure_ascii_line(first_slice, &mut line_colors);
+        } else {
+            crate::text::colorize_line_into(first_slice, &mut line_colors);
+        }
+    }
     let mut file_s0 = 0.0f64;
     let mut file_s1 = 0.0f64;
     let mut file_s2 = 0.0f64;
@@ -437,6 +453,7 @@ fn layout_pass2_chunk<E: SlotEmit>(
                     col = 0;
                     line_adv = 0.0;
                     seg_adv = 0.0;
+                    line_start_col = 0;
                     pos += 1;
                 }
                 continue;
@@ -514,8 +531,9 @@ fn layout_pass2_chunk<E: SlotEmit>(
         let color = if let Some(c) = flat_color {
             c
         } else if is_syntax_heuristic {
-            if (col as usize) < line_colors.len() {
-                line_colors[col as usize]
+            let col_in_line = (col - line_start_col) as usize;
+            if col_in_line < line_colors.len() {
+                line_colors[col_in_line]
             } else {
                 crate::layout::DEFAULT_COLOR_PACKED
             }
@@ -640,6 +658,7 @@ fn layout_pass2_chunk<E: SlotEmit>(
             col = 0;
             line_adv = 0.0;
             seg_adv = 0.0;
+            line_start_col = 0;
         } else {
             col += 1;
             line_adv += r.advance as f64;
@@ -705,6 +724,9 @@ pub(crate) fn layout_pass2_device<E: SlotEmit>(
             let item_slot_base = inputs.slot_bases[item_idx];
             let initial_base_row = inputs.chunk_base_rows[chunk_idx];
             let initial_record_base = inputs.chunk_record_bases[chunk_idx];
+            let initial_col = inputs.chunk_initial_cols[chunk_idx];
+            let initial_seg_adv = inputs.chunk_initial_seg_advs[chunk_idx];
+            let initial_line_adv = inputs.chunk_initial_line_advs[chunk_idx];
             let line_base = if E::USES_LINES { inputs.line_bases[item_idx] } else { 0 };
 
             layout_pass2_chunk::<E>(
@@ -717,6 +739,9 @@ pub(crate) fn layout_pass2_device<E: SlotEmit>(
                 item_slot_base,
                 initial_base_row,
                 initial_record_base,
+                initial_col,
+                initial_seg_adv,
+                initial_line_adv,
                 line_base,
                 inputs.trie,
                 inputs.bitmap_adv,

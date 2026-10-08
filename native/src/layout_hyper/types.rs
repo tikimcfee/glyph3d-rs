@@ -22,6 +22,30 @@ pub struct ItemPrepass {
     pub has_cluster: bool,
 }
 
+/// Output of Pass 1 prepass on a single chunk.
+#[repr(align(64))]
+#[derive(Clone, Copy, Debug)]
+pub struct ChunkPrepass {
+    pub survivor_count: u32,
+    pub leader_count: u32,
+    pub max_row_extent: f64,
+    pub has_cluster: bool,
+    /// Total rows from lines completed inside this chunk.
+    pub completed_rows: u32,
+    /// Does this chunk contain at least one newline?
+    pub has_newline: bool,
+    /// If has_newline is false: leaders in this chunk.
+    pub delta_col: i64,
+    pub delta_line_adv: f64,
+    pub delta_seg_adv: f32,
+    /// If has_newline is true: leaders in the segment before the first newline.
+    pub first_seg_col: i64,
+    /// If has_newline is true: leaders in the segment after the last newline.
+    pub last_seg_col: i64,
+    pub last_seg_line_adv: f64,
+    pub last_seg_seg_adv: f32,
+}
+
 #[derive(Clone, Copy)]
 pub struct SendPtr<T>(pub *mut T);
 unsafe impl<T> Send for SendPtr<T> {}
