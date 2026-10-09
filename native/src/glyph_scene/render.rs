@@ -2,7 +2,7 @@
 //! Extracted from `glyph_scene.rs` to modularize frame rendering.
 
 use crate::gpu::GpuContext;
-use crate::glyph_scene::camera::FOV_Y;
+use crate::glyph_scene::camera::fov_y_deg;
 use crate::glyph_scene::cull::{cull_segments, frustum_planes, CullView, Phase, PhaseDraws};
 use crate::glyph_scene::instance::FrameUniform;
 use crate::glyph_scene::pick::format_pick;
@@ -51,7 +51,7 @@ pub(super) fn render_scene(
     // drag takes effect this frame. This is the SINGLE write site of
     // CullState::lod_min_px, and it runs only when a windowed probe is
     // installed — offscreen never installs one, so offscreen culls with
-    // the LOD_MIN_PX const by construction (gate 6's byte-equal PNGs are
+    // the `[lod] min_px` setting by construction (gate 6's byte-equal PNGs are
     // the proof).
     if let (Some(probe), Some(cull)) = (&scene.ui_probe, &scene.cull) {
         let p = probe.borrow();
@@ -77,7 +77,7 @@ pub(super) fn render_scene(
     // with the cull block below (it was CullView-local before L1 — the
     // uniform needs it even under --no-cull). flags bit 0
     // (deterministic_rendering) stays 0 — reserved.
-    let px_scale = height as f32 / (2.0 * (FOV_Y.to_radians() * 0.5).tan());
+    let px_scale = height as f32 / (2.0 * (fov_y_deg().to_radians() * 0.5).tan());
     let cam = FrameUniform {
         view_proj: frame.view_proj.to_cols_array(),
         eye: frame.eye.to_array(),

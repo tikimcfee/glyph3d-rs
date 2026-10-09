@@ -3,7 +3,7 @@
 //! method. Extracted from `glyph_scene.rs` in the 2026-09 code-shape
 //! refactor — a pure move.
 
-use super::{CameraMode, GlyphScene, LOD_MIN_PX};
+use super::{CameraMode, GlyphScene};
 
 // The windowed egui Debug panel (K3) needs read-only scene state, but
 // windowed.rs holds the scene type-erased as `Box<dyn SceneLike>` and fence
@@ -30,7 +30,7 @@ pub struct UiProbeState {
     // applied by render() before culling. Seeded from the compile-time
     // consts at install; offscreen never installs a probe, so the consts
     // rule there. ──
-    /// Live LOD threshold in px/em (const default: LOD_MIN_PX = 1.0).
+    /// Live LOD threshold in px/em (default: `[lod] min_px`).
     pub lod_min_px: f32,
     /// Live file background cards toggle.
     pub file_backgrounds: bool,
@@ -206,7 +206,10 @@ impl GlyphScene {
             .cull
             .as_ref()
             .map(|c| (c.file_backgrounds.get(), c.file_bg_color.get(), c.lod_min_px.get()))
-            .unwrap_or((false, crate::DEFAULT_FILE_BG_COLOR, LOD_MIN_PX));
+            .unwrap_or_else(|| {
+                let s = crate::config::settings();
+                (false, s.glyph_scene.file_bg_color, s.lod.min_px)
+            });
         let mode = self.params.get().greek_mode;
         let greeking = mode != 0;
         let greek_pure = mode == 2;

@@ -128,7 +128,6 @@ pub fn engine_layout(file: &Path, trie: &Path) -> (layout::GlyphArena, layout::I
     (arena, placements[0])
 }
 
-pub const DEFAULT_FILE_BG_COLOR: [f32; 4] = [0.10, 0.10, 0.13, 0.85];
 
 #[derive(Clone, Copy, Debug)]
 pub struct SceneCullOptions {
@@ -148,7 +147,7 @@ impl Default for SceneCullOptions {
         Self {
             cull: true,
             file_backgrounds: false,
-            file_bg_color: DEFAULT_FILE_BG_COLOR,
+            file_bg_color: config::settings().glyph_scene.file_bg_color,
             lod_min_px: None,
             greeking: true,
             greek_pure: true,

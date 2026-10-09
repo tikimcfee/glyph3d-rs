@@ -5,7 +5,7 @@ use crate::repo::{self, RepoParams, Strategy};
 use crate::{SceneChoice, SceneCullOptions};
 use super::args::{default_text_file, Cli, PresentMode};
 use super::ops::Op;
-use crate::{default_emoji_sheet, default_engine_trie, DEFAULT_FILE_BG_COLOR};
+use crate::{default_emoji_sheet, default_engine_trie};
 
 /// Top-level action requested via the CLI.
 #[derive(Debug)]
@@ -227,7 +227,9 @@ impl Cli {
         let cull_opts = SceneCullOptions {
             cull: !self.no_cull,
             file_backgrounds: self.file_backgrounds,
-            file_bg_color: self.file_bg_color.unwrap_or(DEFAULT_FILE_BG_COLOR),
+            file_bg_color: self
+                .file_bg_color
+                .unwrap_or(crate::config::settings().glyph_scene.file_bg_color),
             lod_min_px: self.lod_min_px,
             greeking: !self.no_greeking,
             greek_pure,

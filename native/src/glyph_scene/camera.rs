@@ -6,10 +6,19 @@
 
 use glam::{Mat4, Vec3};
 
-/// Vertical field of view shared by every glyph-scene camera mode.
-/// (pub since Stage K (K5): the Debug panel's file browser mirrors the
-/// Front-camera framing formula for click-to-fly navigation.)
-pub const FOV_Y: f32 = 40f32;
+/// Vertical field of view shared by every glyph-scene camera mode, degrees
+/// (`[camera] fov_y_deg`).
+pub fn fov_y_deg() -> f32 {
+    crate::config::settings().camera.fov_y_deg
+}
+
+/// Front-camera fit distance for a vertical half-extent: the distance at
+/// which it fills the view, with the configured margin and pad. The single
+/// form of the framing formula (the Debug panel's click-to-fly mirrors it).
+pub fn fit_distance(half_h_needed: f32) -> f32 {
+    let c = &crate::config::settings().camera;
+    half_h_needed / (c.fov_y_deg.to_radians() * 0.5).tan() * c.frame_margin + c.frame_pad
+}
 
 /// Camera behavior. `Front` faces the text plane dead-on at a fit distance
 /// (offscreen verification); `Orbit` slowly circles the block (legacy
@@ -46,13 +55,14 @@ const FLY_DOWN: u8 = 32;
 
 impl FlyCamera {
     pub(super) fn new(eye: Vec3, fit: f32) -> Self {
+        let c = &crate::config::settings().camera;
         Self {
             eye,
             yaw: 0.0,
             pitch: 0.0,
-            speed: fit * 0.4,
-            speed_min: fit * 0.005,
-            speed_max: fit * 8.0,
+            speed: fit * c.fly_speed,
+            speed_min: fit * c.fly_speed_min,
+            speed_max: fit * c.fly_speed_max,
             vel: Vec3::ZERO,
             keys: 0,
         }
@@ -85,15 +95,16 @@ impl FlyCamera {
     }
 
     pub(super) fn on_look(&mut self, dx: f32, dy: f32) {
-        const SENS: f32 = 0.0022;
+        let sens = crate::config::settings().camera.look_sensitivity;
         // yaw += : mouse-right rotates the view toward +X (camera right).
         // (was yaw -=, which swung the view left — inverted horizontal look)
-        self.yaw += dx * SENS;
-        self.pitch = (self.pitch - dy * SENS).clamp(-1.55, 1.55);
+        self.yaw += dx * sens;
+        self.pitch = (self.pitch - dy * sens).clamp(-1.55, 1.55);
     }
 
     pub(super) fn on_scroll(&mut self, lines: f32) {
-        self.speed = (self.speed * 1.15f32.powf(lines)).clamp(self.speed_min, self.speed_max);
+        let step = crate::config::settings().camera.fly_scroll_step;
+        self.speed = (self.speed * step.powf(lines)).clamp(self.speed_min, self.speed_max);
     }
 
     pub(super) fn tick(&mut self, dt: f32) {
@@ -123,8 +134,8 @@ impl FlyCamera {
         } else {
             Vec3::ZERO
         };
-        // Exponential approach: ~63% of the way to target every 100 ms.
-        let k = 1.0 - (-10.0 * dt).exp();
+        // Exponential approach: ~63% of the way to target every 1/rate s.
+        let k = 1.0 - (-crate::config::settings().camera.fly_damping * dt).exp();
         self.vel += (target - self.vel) * k;
         self.eye += self.vel * dt;
     }

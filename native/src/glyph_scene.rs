@@ -36,7 +36,7 @@
 //! The staged instances are partitioned into SEGMENTS (one per file in repo
 //! mode; a single cover segment for text scenes). Each frame, `cull_segments`
 //! (CPU, ~1.3k AABBs ≈ microseconds) tests each segment's world AABB against
-//! the frustum and its on-screen glyph size against LOD_MIN_PX, producing:
+//! the frustum and its on-screen glyph size against the LOD threshold, producing:
 //!   - per-chunk vertex-range draw lists for visible segments
 //!     (`pass.draw(0..6, base..base+count)` — instance_index stays
 //!     chunk-local, exactly like the legacy per-chunk draws), and
@@ -71,13 +71,13 @@ use crate::scene::SceneLike;
 
 
 mod camera;
-pub use camera::{CameraMode, FlyCamera, FOV_Y};
+pub use camera::{fit_distance, fov_y_deg, CameraMode, FlyCamera};
 use camera::CamFrame;
 
 mod cull;
 pub use cull::{
-    BackdropInst, BlockCull, SegCull, BACKDROP_GAIN, BLOCK_CULL_PAD_MAX, BLOCK_CULL_PAD_MIN,
-    GLYPH_CELL_AREA, LOD_MIN_PX, PICK_AABB_PAD_Z, SEG_CULL_PAD_MAX, SEG_CULL_PAD_MIN,
+    BackdropInst, BlockCull, SegCull, BLOCK_CULL_PAD_MAX, BLOCK_CULL_PAD_MIN,
+    GLYPH_CELL_AREA, PICK_AABB_PAD_Z, SEG_CULL_PAD_MAX, SEG_CULL_PAD_MIN,
     SUBSEG_BLOCK_SIZE,
 };
 use cull::CullState;
@@ -190,15 +190,16 @@ pub struct GlyphScene {
 
 // ── Stage K (K4): what the live controls change, and what stays const ────
 //
-// LOD_MIN_PX becomes live in windowed runs via `CullState::lod_min_px`
-// (a Cell seeded from the const — the `viewport: Cell` precedent for
+// The LOD threshold (`[lod] min_px`) becomes live in windowed runs via
+// `CullState::lod_min_px` (a Cell seeded from the setting — the `viewport: Cell` precedent for
 // render(&self) immutability). The Debug-panel slider writes the shared
 // probe cell; render() copies it into the Cell before culling. That copy is
 // the SINGLE write site, and it runs only when a probe is installed
 // (windowed) — offscreen never installs one, so offscreen culls with the
-// const by construction (the byte-equal PNG gates prove it).
+// setting's default by construction (the byte-equal PNG gates prove it).
 //
-// BACKDROP_GAIN stays a compile-time const. The K4 handoff assumed it lived
+// The backdrop gain (`[lod] backdrop_gain`) is a launch-time setting, not a
+// live one. The K4 handoff assumed it lived
 // in the Params uniform — it does NOT: Params carries only the Slug
 // minification dials (glyph_field.wgsl), while the gain is baked into
 // SegCull.tint's alpha at STAGING time by seg_tint (text.rs/repo.rs share
@@ -213,9 +214,8 @@ impl GlyphScene {
     /// writes directly into host-visible mapped slots without queue uploads.
     /// Otherwise, dispatches wgpu queue write_buffer commands.
     fn camera_eye_target(&self, t: f32, aspect: f32) -> (Vec3, Vec3) {
-        let fov = FOV_Y.to_radians();
         let half_h_needed = (self.half_h).max(self.half_w / aspect);
-        let fit = half_h_needed / (fov * 0.5).tan() * 1.08 + 2.0;
+        let fit = fit_distance(half_h_needed);
         match self.camera_mode {
             CameraMode::Front { zoom } => {
                 let d = fit / zoom.max(0.01);
@@ -234,9 +234,9 @@ impl GlyphScene {
     }
 
     pub(in crate::glyph_scene) fn camera_frame(&self, t: f32, aspect: f32) -> CamFrame {
-        let fov = FOV_Y.to_radians();
+        let fov = fov_y_deg().to_radians();
         let half_h_needed = (self.half_h).max(self.half_w / aspect);
-        let fit = half_h_needed / (fov * 0.5).tan() * 1.08 + 2.0;
+        let fit = fit_distance(half_h_needed);
         let (near, far) = match self.camera_mode {
             CameraMode::Front { zoom } => {
                 let d = fit / zoom.max(0.01);
@@ -250,9 +250,10 @@ impl GlyphScene {
                 // Fly depth conditioning: keep near at 0.05 for single-glyph
                 // closeups, while conditioning far to the scene bounds and distance
                 // from the field center to prevent f32 depth precision collapse and Z-fighting.
+                let c = &crate::config::settings().camera;
                 let d_center = (self.fly.eye - self.center).length();
-                let far = (d_center + self.fit * 4.0).clamp(20_000.0, 100_000.0);
-                (0.05, far)
+                let far = (d_center + self.fit * c.fly_far_fit).clamp(c.fly_far_min, c.fly_far_max);
+                (c.fly_near, far)
             }
         };
         let (eye, target) = self.camera_eye_target(t, aspect);

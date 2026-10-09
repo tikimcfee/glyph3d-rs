@@ -13,7 +13,7 @@ use super::{
     cull::SegCull,
     instance::{FrameUniform, Params, GlyphInstance, GroupRow},
     target::{MASK_FORMAT, POOL_FORMAT, SCENE_SAMPLE_COUNT},
-    camera::FOV_Y,
+    camera::fit_distance,
     tint::seg_tint,
     pipelines, mesh
 };
@@ -247,7 +247,7 @@ impl GlyphScene {
             // dominated by the vertical half-extent, and render() recomputes
             // the exact value per frame — this is for Fly's near/far/speed.
             let half_h_needed = half_h.max(half_w / 1.6);
-            half_h_needed / (FOV_Y.to_radians() * 0.5).tan() * 1.08 + 2.0
+            fit_distance(half_h_needed)
         };
         let fly = FlyCamera::new(center + Vec3::new(0.0, 0.0, fit), fit);
 

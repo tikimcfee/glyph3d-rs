@@ -27,6 +27,8 @@ pub const DEFAULTS_TOML: &str = include_str!("../../config/defaults.toml");
 #[serde(deny_unknown_fields)]
 pub struct Settings {
     pub glyph_scene: GlyphSceneSettings,
+    pub lod: LodSettings,
+    pub camera: CameraSettings,
     pub quad_demo: QuadDemoSettings,
 }
 
@@ -36,6 +38,47 @@ pub struct Settings {
 pub struct GlyphSceneSettings {
     /// RGBA the glyph field pass clears to (`wgpu::Color`).
     pub clear_color: [f64; 4],
+    /// File card background RGBA when `--file-backgrounds` is on and no
+    /// `--file-bg-color` / launch `file_bg_color` was given.
+    pub file_bg_color: [f32; 4],
+}
+
+/// Far-LOD substitution (`glyph_scene::cull`).
+#[derive(Clone, Debug, PartialEq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LodSettings {
+    /// On-screen px per em below which a segment draws its backdrop quad
+    /// instead of glyphs (default for `--lod-min-px`).
+    pub min_px: f32,
+    /// Backdrop coverage gain: backdrop alpha = ink fraction x gain.
+    pub backdrop_gain: f32,
+}
+
+/// Glyph-scene cameras (`glyph_scene::camera`).
+#[derive(Clone, Debug, PartialEq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CameraSettings {
+    /// Vertical field of view, degrees, every camera mode.
+    pub fov_y_deg: f32,
+    /// Front framing: fit distance = half-extent / tan(fov/2) x margin + pad.
+    pub frame_margin: f32,
+    pub frame_pad: f32,
+    /// Fly mouse-look, radians per pixel.
+    pub look_sensitivity: f32,
+    /// Fly speed at start, and its scroll range, as fractions of the fit distance.
+    pub fly_speed: f32,
+    pub fly_speed_min: f32,
+    pub fly_speed_max: f32,
+    /// Fly speed multiplier per scroll line.
+    pub fly_scroll_step: f32,
+    /// Fly velocity damping rate, 1/s (~63% of the way to target per 1/rate s).
+    pub fly_damping: f32,
+    /// Fly near plane, world units.
+    pub fly_near: f32,
+    /// Fly far plane = distance to field center + fit x fly_far_fit, clamped.
+    pub fly_far_fit: f32,
+    pub fly_far_min: f32,
+    pub fly_far_max: f32,
 }
 
 /// The 1M-instance quad field (`--demo`).
@@ -121,6 +164,17 @@ mod tests {
     fn defaults_match_migrated_literals() {
         let s = Settings::defaults().unwrap();
         assert_eq!(s.glyph_scene.clear_color, [0.07, 0.07, 0.09, 1.0]);
+        assert_eq!(s.glyph_scene.file_bg_color, [0.10f32, 0.10, 0.13, 0.85]);
+        assert_eq!(s.lod.min_px, 1.0f32);
+        assert_eq!(s.lod.backdrop_gain, 0.7f32);
+        let c = &s.camera;
+        assert_eq!(c.fov_y_deg, 40f32);
+        assert_eq!((c.frame_margin, c.frame_pad), (1.08f32, 2.0f32));
+        assert_eq!(c.look_sensitivity, 0.0022f32);
+        assert_eq!((c.fly_speed, c.fly_speed_min, c.fly_speed_max), (0.4f32, 0.005f32, 8.0f32));
+        assert_eq!((c.fly_scroll_step, c.fly_damping), (1.15f32, 10.0f32));
+        assert_eq!(c.fly_near, 0.05f32);
+        assert_eq!((c.fly_far_fit, c.fly_far_min, c.fly_far_max), (4.0f32, 20_000.0f32, 100_000.0f32));
         assert_eq!(s.quad_demo.clear_color, [0.02, 0.02, 0.04, 1.0]);
     }
 

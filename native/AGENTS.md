@@ -177,7 +177,7 @@ Detailed technical audit lives in `research/desktop-platform-audit.md`. Key touc
 - `GLYPH_G_DUMP=<slot>[,<len>]` — offscreen only: reads back instance bytes
   at `slot` from the glyph arena and prints hex (buffer write-path audits).
 - `GLYPH_K4_SELFTEST=1` — windowed, dev-only (Stage K): at t≈3 s moves the
-  Debug panel's LOD_MIN_PX slider programmatically (1.0 → 16.0) and logs the
+  Debug panel's LOD threshold slider programmatically (1.0 → 16.0) and logs the
   cull counters before/after — exercises the panel → probe → CullState →
   cull path without a human at the mouse.
 - `GLYPH_ZSPACE_SELFTEST=1` — windowed, dev-only: at t≈3 s drives the Debug

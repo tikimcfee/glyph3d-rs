@@ -596,7 +596,7 @@ impl WindowState {
                             ui.add(
                                 egui::Slider::new(&mut p.lod_min_px, 0.25..=16.0)
                                     .logarithmic(true)
-                                    .text("LOD_MIN_PX px/em (const 1.0)"),
+                                    .text("LOD px/em"),
                             );
                             ui.horizontal(|ui| {
                                 ui.checkbox(&mut p.file_backgrounds, "File card backgrounds");
@@ -888,19 +888,12 @@ impl WindowState {
                                                         );
                                                     // Front-camera framing
                                                     // (camera_eye_target):
-                                                    // fit the AABB, margin
-                                                    // 1.08 + 2.0, text plane
-                                                    // faces +Z.
+                                                    // fit the AABB, text
+                                                    // plane faces +Z.
                                                     let half_h_needed = dynst
                                                         .half[1]
                                                         .max(dynst.half[0] / viewport_aspect);
-                                                    let dist = half_h_needed
-                                                        / (crate::glyph_scene::FOV_Y
-                                                            .to_radians()
-                                                            * 0.5)
-                                                            .tan()
-                                                        * 1.08
-                                                        + 2.0;
+                                                    let dist = crate::glyph_scene::fit_distance(half_h_needed);
                                                     self.scene.set_cam_pose(
                                                         [dynst.center[0], dynst.center[1], dist],
                                                         0.0,

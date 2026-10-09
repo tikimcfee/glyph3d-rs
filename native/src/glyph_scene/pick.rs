@@ -8,7 +8,7 @@
 use glam::DVec3;
 use std::path::PathBuf;
 
-use super::{CameraMode, GlyphPlacement, GlyphScene, GroupRow, Selection, FOV_Y};
+use super::{fov_y_deg, CameraMode, GlyphPlacement, GlyphScene, GroupRow, Selection};
 use crate::gpu::GpuContext;
 use crate::layout::{GlyphRecord, ItemParams};
 
@@ -255,7 +255,7 @@ impl GlyphScene {
         }
         let right = DVec3::Y.cross(back).normalize(); // view x axis
         let up = back.cross(right); // view y axis
-        let tan = (FOV_Y as f64 * 0.5).to_radians().tan();
+        let tan = (fov_y_deg() as f64 * 0.5).to_radians().tan();
         let nx = (x as f64 / w as f64) * 2.0 - 1.0;
         let ny = 1.0 - (y as f64 / h as f64) * 2.0;
         // View-space ray (nx·tan·aspect, ny·tan, −1) rotated to world.
