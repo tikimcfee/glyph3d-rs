@@ -2,7 +2,8 @@
 //! Extracted from `glyph_scene.rs` to modularize frame rendering.
 
 use crate::gpu::GpuContext;
-use crate::glyph_scene::camera::FOV_Y;
+use crate::glyph_scene::camera::fov_y_deg;
+use crate::glyph_scene::environment::EnvCamera;
 use crate::glyph_scene::cull::{cull_segments, frustum_planes, CullView, Phase, PhaseDraws};
 use crate::glyph_scene::instance::FrameUniform;
 use crate::glyph_scene::pick::format_pick;
@@ -51,7 +52,7 @@ pub(super) fn render_scene(
     // drag takes effect this frame. This is the SINGLE write site of
     // CullState::lod_min_px, and it runs only when a windowed probe is
     // installed — offscreen never installs one, so offscreen culls with
-    // the LOD_MIN_PX const by construction (gate 6's byte-equal PNGs are
+    // the `[lod] min_px` setting by construction (gate 6's byte-equal PNGs are
     // the proof).
     if let (Some(probe), Some(cull)) = (&scene.ui_probe, &scene.cull) {
         let p = probe.borrow();
@@ -77,7 +78,7 @@ pub(super) fn render_scene(
     // with the cull block below (it was CullView-local before L1 — the
     // uniform needs it even under --no-cull). flags bit 0
     // (deterministic_rendering) stays 0 — reserved.
-    let px_scale = height as f32 / (2.0 * (FOV_Y.to_radians() * 0.5).tan());
+    let px_scale = height as f32 / (2.0 * (fov_y_deg().to_radians() * 0.5).tan());
     let cam = FrameUniform {
         view_proj: frame.view_proj.to_cols_array(),
         eye: frame.eye.to_array(),
@@ -90,6 +91,16 @@ pub(super) fn render_scene(
     };
     ctx.queue
         .write_buffer(&scene.camera_buf, 0, bytemuck::bytes_of(&cam));
+    if scene.environment.is_on() {
+        let env_cam = EnvCamera {
+            eye: frame.eye.as_dvec3(),
+            vp_rel: frame.view_proj_rel,
+            far: frame.far,
+            fit: scene.fit,
+        };
+        let ground_y = scene.environment.ground_y(scene.scene_min_y);
+        scene.environment.write(&ctx.queue, &env_cam, ground_y);
+    }
 
     // --- Stage F: CPU segment cull (frustum + LOD) ----------------------
     // Stage L (L2): the cull output IS the phase lists (PhaseDraws). The
@@ -170,6 +181,7 @@ pub(super) fn render_scene(
         p.eye = frame.eye.to_array();
         p.yaw = scene.fly.yaw;
         p.pitch = scene.fly.pitch;
+        p.environment = scene.environment.mode.get();
         p.last_pick = scene.picked.as_ref().map(format_pick);
         p.grabbed_group = scene.grabbed_group;
         p.grabbed_zone = scene.grabbed_zone.clone();
@@ -320,12 +332,9 @@ pub(super) fn render_scene(
             view: draw_color_view,
             resolve_target: None,
             ops: wgpu::Operations {
-                load: wgpu::LoadOp::Clear(wgpu::Color {
-                    r: 0.07,
-                    g: 0.07,
-                    b: 0.09,
-                    a: 1.0,
-                }),
+                load: wgpu::LoadOp::Clear(crate::config::wgpu_color(
+                    crate::config::settings().glyph_scene.clear_color,
+                )),
                 store: wgpu::StoreOp::Store,
             },
             depth_slice: None,
@@ -340,6 +349,11 @@ pub(super) fn render_scene(
         }),
         ..Default::default()
     });
+    // The environment (ground/sky) goes down first, opaque, writing depth;
+    // everything after sorts against it. Off: nothing recorded.
+    if scene.environment.is_on() {
+        scene.environment.draw(&mut pass);
+    }
     // Stage L (L2): record the phase lists in phase order — Backdrop
     // first, Glyphs second, exactly the Stage F order. Empty phases
     // record nothing (the legacy --no-cull branch has no Backdrop

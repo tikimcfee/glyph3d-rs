@@ -8,7 +8,7 @@ use crate::SceneChoice;
 fn try_parse(args: &[&str]) -> Result<Cli, clap::Error> {
     let argv = std::iter::once("glyph3d-native").chain(args.iter().copied());
     let matches = Cli::command().try_get_matches_from(argv)?;
-    Ok(parse_cli_from(matches))
+    Ok(parse_cli_from(matches).unwrap_or_else(|e| panic!("launch config: {e}")))
 }
 
 fn parse(args: &[&str]) -> Cli {
@@ -81,9 +81,11 @@ fn defaults_match_old_parser() {
 
 #[test]
 fn scalar_flags_parse() {
+    let cfg = std::env::temp_dir().join(format!("test_scalar_cfg_{}.toml", std::process::id()));
+    std::fs::write(&cfg, "").expect("write temp config");
     let cli = parse(&[
         "--screenshot", "out.png", "--frames", "2", "--demo", "--copies", "3", "--zoom",
-        "2.5", "--no-cull", "--no-ui", "--launch-config", "config.toml",
+        "2.5", "--no-cull", "--no-ui", "--launch-config", cfg.to_str().unwrap(),
         "--file-backgrounds", "--file-bg-color", "0.15,0.15,0.20,0.80",
         "--lod-min-px", "2.0",
         "--load-repo", "fixtures/g-pick-repo",
@@ -108,7 +110,8 @@ fn scalar_flags_parse() {
     assert_eq!(cli.zoom, 2.5);
     assert!(cli.no_cull);
     assert!(cli.no_ui);
-    assert_eq!(cli.launch_config, Some(PathBuf::from("config.toml")));
+    let _ = std::fs::remove_file(&cfg);
+    assert_eq!(cli.launch_config, Some(cfg));
     assert!(cli.file_backgrounds);
     assert_eq!(cli.file_bg_color, Some([0.15, 0.15, 0.20, 0.80]));
     assert_eq!(cli.lod_min_px, Some(2.0));
@@ -232,7 +235,7 @@ fn op_stream_preserves_cli_order() {
         }
         _ => panic!("op[0] should be the upgraded RowCol pick"),
     }
-    assert!(matches!(cli.ops[1], Op::Verb(Verb::RecolorLine([255, 0, 0]))));
+    assert!(matches!(cli.ops[1], Op::Verb(Verb::RecolorLine(Some([255, 0, 0])))));
     match &cli.ops[2] {
         Op::CamPose(p, yaw, pitch) => {
             assert_eq!(*p, [1.0, 2.0, 3.0]);
@@ -347,11 +350,11 @@ fn verb_error_messages_survive() {
 fn verb_defaults_and_forms() {
     assert!(matches!(
         parse_verb("recolor-glyph").unwrap(),
-        Verb::RecolorGlyph([255, 80, 80])
+        Verb::RecolorGlyph(None)
     ));
     assert!(matches!(
         parse_verb("recolor-line").unwrap(),
-        Verb::RecolorLine([255, 213, 79])
+        Verb::RecolorLine(None)
     ));
     assert!(matches!(
         parse_verb("nudge-glyph 1 2").unwrap(),
@@ -381,11 +384,11 @@ fn verb_defaults_and_forms() {
     // both fall through to the default and the check is unobservable.
     assert!(matches!(
         parse_verb("recolor-glyph aabbcc").unwrap(),
-        Verb::RecolorGlyph([0xAA, 0xBB, 0xCC])
+        Verb::RecolorGlyph(Some([0xAA, 0xBB, 0xCC]))
     ));
     assert!(matches!(
         parse_verb("recolor-line 0a141e").unwrap(),
-        Verb::RecolorLine([0x0A, 0x14, 0x1E])
+        Verb::RecolorLine(Some([0x0A, 0x14, 0x1E]))
     ));
     assert!(matches!(parse_verb("show-group").unwrap(), Verb::SetHidden(false)));
     assert!(matches!(parse_verb("toggle-hidden").unwrap(), Verb::ToggleHidden));
@@ -435,6 +438,16 @@ fn negative_numbers_in_cam_pose_and_pick_px() {
         }
         _ => panic!("expected CamPose"),
     }
+}
+
+#[test]
+fn missing_explicit_launch_config_is_an_error() {
+    let argv = ["glyph3d-native", "--launch-config", "/nonexistent/launch_config.toml"];
+    let matches = Cli::command().try_get_matches_from(argv).expect("clap parse");
+    let Err(err) = parse_cli_from(matches) else {
+        panic!("a missing --launch-config must not load");
+    };
+    assert!(err.contains("/nonexistent/launch_config.toml"), "error should name the path: {err}");
 }
 
 #[test]
@@ -610,4 +623,9 @@ fn launch_config_frames_merging() {
     let _ = std::fs::remove_file(&tmp);
 }
 
+#[test]
+fn screenshot_runs_never_discover_launch_config() {
+    assert!(!discovers_launch_config(&parse(&["--screenshot", "out.png", "--demo"])));
+    assert!(discovers_launch_config(&parse(&["--demo"])));
+}
 

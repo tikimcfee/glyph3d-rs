@@ -6,6 +6,7 @@ pub mod agent_transcript;
 pub mod atlas;
 pub mod bake;
 pub mod cli;
+pub mod config;
 pub mod fixture;
 pub mod fold;
 pub mod glyph_scene;
@@ -128,7 +129,6 @@ pub fn engine_layout(file: &Path, trie: &Path) -> (layout::GlyphArena, layout::I
     (arena, placements[0])
 }
 
-pub const DEFAULT_FILE_BG_COLOR: [f32; 4] = [0.10, 0.10, 0.13, 0.85];
 
 #[derive(Clone, Copy, Debug)]
 pub struct SceneCullOptions {
@@ -141,6 +141,10 @@ pub struct SceneCullOptions {
     pub greek_onset_px: Option<f32>,
     /// Which glyph-field implementation the scene builds (`--field-mode`).
     pub field_mode: glyph_scene::GlyphFieldMode,
+    /// The ground/sky environment (`--environment`, `[environment] mode`).
+    pub environment: config::EnvironmentMode,
+    /// Explicit ground height (`--ground-y`); None = below the scene.
+    pub ground_y: Option<f32>,
 }
 
 impl Default for SceneCullOptions {
@@ -148,12 +152,14 @@ impl Default for SceneCullOptions {
         Self {
             cull: true,
             file_backgrounds: false,
-            file_bg_color: DEFAULT_FILE_BG_COLOR,
+            file_bg_color: config::settings().glyph_scene.file_bg_color,
             lod_min_px: None,
             greeking: true,
             greek_pure: true,
             greek_onset_px: None,
             field_mode: glyph_scene::GlyphFieldMode::Instanced,
+            environment: config::settings().environment.mode,
+            ground_y: None,
         }
     }
 }
@@ -257,6 +263,7 @@ fn build_scene_impl(
         if let Some(onset) = cull_opts.greek_onset_px {
             scene.set_greek_onset_px(&ctx.queue, onset);
         }
+        scene.set_environment(cull_opts.environment, cull_opts.ground_y);
         let p = probe.then(|| scene.init_ui_probe());
         (Box::new(scene) as Box<dyn SceneLike>, p)
     };

@@ -8,7 +8,7 @@
 use glam::DVec3;
 use std::path::PathBuf;
 
-use super::{CameraMode, GlyphPlacement, GlyphScene, GroupRow, Selection, FOV_Y};
+use super::{fov_y_deg, CameraMode, GlyphPlacement, GlyphScene, GroupRow, Selection};
 use crate::gpu::GpuContext;
 use crate::layout::{GlyphRecord, ItemParams};
 
@@ -57,10 +57,13 @@ pub enum PickCommand {
 /// glyph pick; group verbs need at least a file pick.
 #[derive(Clone, Debug)]
 pub enum Verb {
-    /// Recolor the picked glyph (packed sRGB rgb, alpha kept 255).
-    RecolorGlyph([u8; 3]),
-    /// Recolor every glyph on the picked glyph's folded row ("highlight line").
-    RecolorLine([u8; 3]),
+    /// Recolor the picked glyph (packed sRGB rgb, alpha kept 255). None =
+    /// `[verbs] recolor_glyph`, resolved when applied — the verb parser runs
+    /// inside clap, before the launch config's settings are installed.
+    RecolorGlyph(Option<[u8; 3]>),
+    /// Recolor every glyph on the picked glyph's folded row ("highlight
+    /// line"). None = `[verbs] recolor_line`, resolved when applied.
+    RecolorLine(Option<[u8; 3]>),
     /// Offset the picked glyph's local position (plumbing demo).
     NudgeGlyph([f32; 3]),
     /// Scale the picked glyph's quad (advance & height; plumbing demo).
@@ -255,7 +258,7 @@ impl GlyphScene {
         }
         let right = DVec3::Y.cross(back).normalize(); // view x axis
         let up = back.cross(right); // view y axis
-        let tan = (FOV_Y as f64 * 0.5).to_radians().tan();
+        let tan = (fov_y_deg() as f64 * 0.5).to_radians().tan();
         let nx = (x as f64 / w as f64) * 2.0 - 1.0;
         let ny = 1.0 - (y as f64 / h as f64) * 2.0;
         // View-space ray (nx·tan·aspect, ny·tan, −1) rotated to world.
@@ -745,6 +748,7 @@ impl GlyphScene {
         };
         match verb {
             Verb::RecolorGlyph(rgb) => {
+                let rgb = &rgb.unwrap_or(crate::config::settings().verbs.recolor_glyph);
                 let Some(g) = &glyph else {
                     return format!("verb recolor-glyph: {rel} pick has no glyph");
                 };
@@ -758,6 +762,7 @@ impl GlyphScene {
                 )
             }
             Verb::RecolorLine(rgb) => {
+                let rgb = &rgb.unwrap_or(crate::config::settings().verbs.recolor_line);
                 let Some(g) = &glyph else {
                     return format!("verb recolor-line: {rel} pick has no glyph");
                 };
@@ -917,7 +922,8 @@ impl GlyphScene {
                 if i < self.tint_step.len() {
                     self.tint_step[i] = step;
                 }
-                let rgb = crate::repo::DIR_TINTS[(step as usize) % crate::repo::DIR_TINTS.len()];
+                let tints = crate::repo::dir_tints();
+                let rgb = tints[(step as usize) % tints.len()];
                 let line = self.apply_verb(ctx, &Verb::TintGroup(rgb));
                 format!("{line} [palette step {step}]")
             }

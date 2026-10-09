@@ -263,7 +263,7 @@ pub fn parse_antigravity_session(text: &str, session_id: &str) -> AgentSession {
                 if let Some(think) = obj.get("thinking").and_then(|v| v.as_str()) {
                     let trimmed = think.trim();
                     if !trimmed.is_empty() {
-                        current_turn.thinking.push(trimmed.to_string());
+                        current_turn.push_thinking(trimmed.to_string());
                         if current_turn.timestamp.is_none() {
                             current_turn.timestamp = ts;
                         }
@@ -273,7 +273,7 @@ pub fn parse_antigravity_session(text: &str, session_id: &str) -> AgentSession {
                 if let Some(msg) = obj.get("content").and_then(|v| v.as_str()) {
                     let trimmed = msg.trim();
                     if !trimmed.is_empty() {
-                        current_turn.assistant_messages.push(trimmed.to_string());
+                        current_turn.push_message(trimmed.to_string());
                         if current_turn.timestamp.is_none() {
                             current_turn.timestamp = ts;
                         }
@@ -290,7 +290,7 @@ pub fn parse_antigravity_session(text: &str, session_id: &str) -> AgentSession {
                             current_turn.file_actions.push(fa);
                         }
 
-                        current_turn.tool_calls.push(ToolCallRecord {
+                        current_turn.push_tool(ToolCallRecord {
                             id: tool_id,
                             name,
                             input: args,

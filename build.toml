@@ -25,14 +25,14 @@
 # Ratchet, NOT an equality: tests are added constantly, so an exact pin would
 # redden on the most common good action in the repo. A green run whose real
 # count exceeds the floor prints a NOTE naming the value to raise it to.
-test_floor = 252
+test_floor = 268
 
 
 # ── Products ─────────────────────────────────────────────────────────────
 
 # The renderer's inputs are everything cargo compiles into the binary: its
-# source and the workspace crates (every include_str!/include_bytes! resolves
-# inside those two trees; the atlas is read at RUN time, not compiled in), the
+# source, the workspace crates and config/ (every include_str!/include_bytes! resolves
+# inside those trees; the atlas is read at RUN time, not compiled in), the
 # root manifest (workspace members, [profile.release]), the root lockfile
 # (dependency versions) and cargo config. Until 2026-10-09 this named
 # `native/Cargo.lock`, gone since the workspace move (2026-09-06), and omitted
@@ -48,8 +48,9 @@ outputs = ["target/release/glyph3d-native"]
 # and the two link different bytes. Until 2026-10-09 the stamp vouched for the
 # package-scope binary and every gate after cargo-build ran the other one
 # (measured: 62b55bfe vs 6dc7340c). Hence glyph/Cargo.toml as an input: its
-# dependencies' features reach this binary.
-inputs = ["native/src/**/*", "native/Cargo.toml", "crates/**/*", "glyph/Cargo.toml", "Cargo.toml", "Cargo.lock", ".cargo/config.toml"]
+# dependencies' features reach this binary. config/ holds the compiled-in
+# settings defaults (main, 2026-10-09).
+inputs = ["native/src/**/*", "native/Cargo.toml", "crates/**/*", "glyph/Cargo.toml", "config/**/*", "Cargo.toml", "Cargo.lock", ".cargo/config.toml"]
 build = "cargo build --release"
 note = "Pure-Rust native renderer."
 

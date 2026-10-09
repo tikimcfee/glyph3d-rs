@@ -1,14 +1,18 @@
 # Glyph3D Launch Configuration — EXAMPLE
 #
-# Copy to `launch_config.toml` (gitignored) and edit for this machine:
+# Copy to `launch_config.toml` (gitignored; personal) and edit for this machine:
 #
 #     cp launch_config.example.toml launch_config.toml
 #
-# The renderer reads `launch_config.toml` from the working directory or its
-# parent; the `cargo glyph` launcher TUI reads it from the working directory or
-# the repo root. Startup defaults for interactive windowed runs only: any CLI
-# flag overrides a setting here, and a `--screenshot` run (every gate) ignores
-# the file entirely. Values below DIFFER from the CLI defaults where marked.
+# Startup defaults for interactive windowed runs. The renderer reads it from the
+# repo root or native/, or from --launch-config <path>; the `cargo glyph`
+# launcher TUI reads it from the working directory or the repo root. Any CLI
+# flag overrides a setting here, and a `--screenshot` run (every gate) never
+# reads the file. Unknown keys are errors. Values below DIFFER from the CLI
+# defaults where marked.
+#
+# Top-level keys below are launch options. [section] tables override the
+# compiled settings in config/defaults.toml, key by key — see the end of file.
 
 # Render file card background bounding surfaces behind glyph fields
 file_backgrounds = true
@@ -70,3 +74,14 @@ no_ui = false
 # claude_projects_dir = "~/.claude/projects"
 # antigravity_brain_dir = "~/.gemini/antigravity/brain"
 # kimi_sessions_dir = ""
+
+# ── Settings overrides ───────────────────────────────────────────────────────
+# Any key from config/defaults.toml, under its own [section]. Only the keys you
+# set are overridden; the rest keep their compiled defaults.
+#
+# [glyph_scene]
+# clear_color = [0.07, 0.07, 0.09, 1.0]
+#
+# [environment]
+# mode = "ground"          # ground plane + sky; the B key toggles it live
+# ground_color = [0.034, 0.042, 0.060]

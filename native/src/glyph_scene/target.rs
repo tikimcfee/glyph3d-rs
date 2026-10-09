@@ -91,10 +91,9 @@ pub(super) enum Selection {
     Segment { slot_base: u32, slot_count: u32 },
 }
 
-/// Stage L (L4): the selection tint (warm yellow, 45% additive) — the
-/// flash's bright-yellow legacy, but as a coverage-weighted tint that keeps
-/// the glyph readable underneath.
-pub(super) const SELECTION_TINT: [f32; 4] = [1.0, 0.85, 0.25, 0.45];
+// Stage L (L4): the selection tint is the `[glyph_scene] selection_tint`
+// setting (warm yellow, 45% — the flash's bright-yellow legacy, but as a
+// coverage-weighted tint that keeps the glyph readable underneath).
 
 /// Stage L (L4): mask/tint pass resources (windowed shader path only).
 pub(super) struct SelectionFx {

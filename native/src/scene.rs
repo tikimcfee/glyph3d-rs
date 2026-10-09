@@ -301,13 +301,16 @@ impl Scene {
 
     /// Camera at time `t`: slow orbit above the field, looking at its center.
     fn camera(&self, t: f32, aspect: f32) -> Mat4 {
-        let radius = 950.0;
-        let height = 620.0;
-        let angle = t * 0.15; // rad/s — one orbit ~42 s
-        let eye = Vec3::new(radius * angle.cos(), height, radius * angle.sin());
+        let c = &crate::config::settings().quad_demo;
+        let angle = t * c.orbit_rate;
+        let eye = Vec3::new(c.orbit_radius * angle.cos(), c.orbit_height, c.orbit_radius * angle.sin());
         let view = glam::camera::rh::view::look_at_mat4(eye, Vec3::ZERO, Vec3::Y);
-        let proj =
-            glam::camera::rh::proj::directx::perspective(60f32.to_radians(), aspect, 5000.0, 1.0);
+        let proj = glam::camera::rh::proj::directx::perspective(
+            c.fov_y_deg.to_radians(),
+            aspect,
+            c.far,
+            c.near,
+        );
         proj * view
     }
 
@@ -350,12 +353,9 @@ impl Scene {
                 view: color_view,
                 resolve_target: None,
                 ops: wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(wgpu::Color {
-                        r: 0.02,
-                        g: 0.02,
-                        b: 0.04,
-                        a: 1.0,
-                    }),
+                    load: wgpu::LoadOp::Clear(crate::config::wgpu_color(
+                        crate::config::settings().quad_demo.clear_color,
+                    )),
                     store: wgpu::StoreOp::Store,
                 },
                 depth_slice: None,

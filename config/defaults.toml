@@ -1,0 +1,263 @@
+# glyph3d defaults — every named, tunable value the renderer and UI read.
+#
+# Compiled into the binary (native/src/config.rs, include_str!). COMPLETE by
+# contract: every key here is required, so deleting one is a parse failure,
+# not a silent zero. Override any of them, per key, in a [section] of your
+# launch_config.toml (see launch_config.example.toml); unknown sections and
+# keys are errors.
+#
+# Contracts are NOT here — layout metrics, slot/atlas formats, anything a
+# reference check was computed against. See .agents/rules/rust-engineering.md
+# section 10 for the line between the two.
+#
+# Every golden view renders with exactly these values. Changing one here is a
+# re-baseline; say so in the commit.
+#
+# Colors are RGBA in 0.0-1.0, handed to the consuming pass as-is.
+
+[glyph_scene]
+# What the glyph field pass clears to (behind every file).
+clear_color = [0.07, 0.07, 0.09, 1.0]
+# File card background when --file-backgrounds is on and no colour was given
+# on the command line or as the launch key file_bg_color.
+file_bg_color = [0.10, 0.10, 0.13, 0.85]
+# Selection tint over the picked glyphs / file in windowed runs: RGB, and A
+# as its strength (a coverage-weighted tint that keeps the glyph readable).
+selection_tint = [1.0, 0.85, 0.25, 0.45]
+
+[lod]
+# On-screen px per em cell (cell height = 1.0 world unit) below which a file
+# segment draws its backdrop quad instead of glyphs. Below 1 px/em glyphs are
+# raster-lottery subpixel blobs; the backdrop (mean ink colour x coverage) is
+# the visually equivalent form. Never substitutes at >= 1 px/em, so legible
+# text is always drawn glyph by glyph. Default for --lod-min-px.
+min_px = 1.0
+# Backdrop alpha = ink fraction x gain. Fitted against the pre-LOD full-field
+# render: 0.7 matches its mean linear pixel value within ~3% (1.9 overshot
+# +45%, 1.3 +29%, 1.0 +17%). See out/STAGE_F_REPORT.md.
+backdrop_gain = 0.7
+
+[camera]
+# Vertical field of view, degrees, every camera mode.
+fov_y_deg = 40.0
+# Front framing: fit distance = half-extent / tan(fov/2) x margin + pad.
+frame_margin = 1.08
+frame_pad = 2.0
+# Fly mouse-look, radians per pixel of mouse motion.
+look_sensitivity = 0.0022
+# Fly speed at start and its scroll range, as fractions of the fit distance.
+fly_speed = 0.4
+fly_speed_min = 0.005
+fly_speed_max = 8.0
+# Fly speed multiplier per scroll line.
+fly_scroll_step = 1.15
+# Fly velocity damping rate (1/s): ~63% of the way to the target speed every
+# 1/rate seconds (10.0 = every 100 ms).
+fly_damping = 10.0
+# Fly near plane (world units), kept small for single-glyph close-ups.
+fly_near = 0.05
+# Fly far plane = distance to field center + fit x fly_far_fit, clamped to
+# [fly_far_min, fly_far_max] to keep f32 depth precision from collapsing.
+fly_far_fit = 4.0
+fly_far_min = 20000.0
+fly_far_max = 100000.0
+# Fly pitch limit, radians either side of level (just short of straight up
+# or down, where yaw would degenerate).
+fly_pitch_limit = 1.55
+# Front and orbit cameras: near = distance x fraction, far = distance x factor.
+front_near_fraction = 0.01
+front_far_factor = 20.0
+# Orbit camera (legacy windowed demo): radius in fit distances, angular rate in
+# rad/s, and eye height as a fraction of the radius.
+orbit_radius_fit = 1.05
+orbit_rate = 0.12
+orbit_height_fraction = 0.18
+
+[repo]
+# Per-directory group tints, multiplied with the syntax colours (bright
+# pastels: the hue groups a directory's pages without drowning the palette).
+# A directory hashes to one entry; the tint-cycle verb walks this list.
+dir_tints = [
+    [1.00, 1.00, 1.00],
+    [1.00, 0.93, 0.87],
+    [0.88, 1.00, 0.92],
+    [0.88, 0.95, 1.00],
+    [1.00, 0.91, 1.00],
+    [0.95, 1.00, 0.88],
+    [1.00, 0.97, 0.86],
+    [0.92, 0.92, 1.00],
+    [0.90, 1.00, 1.00],
+    [1.00, 0.88, 0.88],
+]
+# Far-LOD backdrop tint for an extension no [[repo.extension_tints]] lists.
+extension_tint_fallback = [0.75, 0.75, 0.75]   # neutral grey
+
+# Far-LOD backdrop tint by file extension (flat colour mode). The first entry
+# listing an extension wins.
+[[repo.extension_tints]]
+extensions = ["rs"]
+tint = [0.85, 0.40, 0.20]   # Rust orange
+[[repo.extension_tints]]
+extensions = ["js", "mjs", "cjs"]
+tint = [0.95, 0.85, 0.20]   # JavaScript yellow
+[[repo.extension_tints]]
+extensions = ["ts", "tsx"]
+tint = [0.20, 0.50, 0.85]   # TypeScript blue
+[[repo.extension_tints]]
+extensions = ["json"]
+tint = [0.90, 0.75, 0.30]   # JSON amber
+[[repo.extension_tints]]
+extensions = ["md", "markdown"]
+tint = [0.40, 0.60, 0.80]   # Markdown steel blue
+[[repo.extension_tints]]
+extensions = ["toml", "yaml", "yml"]
+tint = [0.70, 0.40, 0.60]   # config purple
+[[repo.extension_tints]]
+extensions = ["py"]
+tint = [0.25, 0.65, 0.55]   # Python teal
+[[repo.extension_tints]]
+extensions = ["c", "h", "cpp", "hpp", "cc"]
+tint = [0.35, 0.55, 0.85]   # C/C++ navy
+[[repo.extension_tints]]
+extensions = ["go"]
+tint = [0.20, 0.70, 0.85]   # Go cyan
+[[repo.extension_tints]]
+extensions = ["sh", "bash", "zsh"]
+tint = [0.45, 0.75, 0.45]   # shell green
+[[repo.extension_tints]]
+extensions = ["html", "htm"]
+tint = [0.90, 0.45, 0.25]   # HTML orange-red
+[[repo.extension_tints]]
+extensions = ["css", "scss", "less"]
+tint = [0.30, 0.55, 0.90]   # CSS blue
+
+[agent_cards]
+# Turn cards: two pages (mind, impact) hinged on a spine, each with a banner.
+# Banner pair used when the card has no event kind.
+default_banners = [[0.20, 0.36, 0.60, 0.95], [0.18, 0.52, 0.35, 0.95]]
+mind_page = [0.08, 0.10, 0.14, 0.90]
+impact_page = [0.10, 0.12, 0.17, 0.90]
+spine = [0.18, 0.22, 0.30, 0.75]
+
+[agent_cards.banners]
+# Banner pair [mind, impact] per transcript event kind.
+user_prompt = [[0.22, 0.38, 0.65, 0.95], [0.18, 0.28, 0.48, 0.95]]          # slate blue / indigo
+thinking = [[0.48, 0.36, 0.15, 0.95], [0.38, 0.28, 0.12, 0.95]]             # warm gold / amber
+file_read = [[0.15, 0.38, 0.58, 0.95], [0.12, 0.30, 0.48, 0.95]]            # cyan / cobalt
+file_edit = [[0.65, 0.38, 0.12, 0.95], [0.55, 0.30, 0.10, 0.95]]            # amber / flame orange
+file_write = [[0.15, 0.55, 0.30, 0.95], [0.12, 0.45, 0.25, 0.95]]           # emerald
+command = [[0.28, 0.28, 0.32, 0.95], [0.20, 0.20, 0.24, 0.95]]              # terminal graphite
+tool_invocation = [[0.25, 0.35, 0.45, 0.95], [0.18, 0.26, 0.35, 0.95]]      # steel blue
+assistant_response = [[0.18, 0.48, 0.38, 0.95], [0.14, 0.38, 0.30, 0.95]]   # deep teal / forest
+
+[agent_cards.workdesk]
+# Workdesk plate accent per file action.
+read = [0.15, 0.35, 0.55, 0.90]           # cyan-slate
+edit = [0.60, 0.40, 0.15, 0.90]           # amber
+write = [0.15, 0.50, 0.30, 0.90]          # emerald
+ast_analysis = [0.45, 0.20, 0.55, 0.90]   # purple
+
+[agent_text]
+# Transcript card text, sRGB 0-255. Colour says which KIND of event a card is:
+# the banner carries the kind's hue, and every section heading inside the page
+# takes its kind's accent (below), so a run of edits reads as a run of one
+# colour while scrolling the deck. Titles stay neutral: they overlap the banner,
+# where same-hue text loses contrast. All other text uses these few roles.
+title = [255, 255, 255]          # card titles (turn and beat)
+subtitle = [150, 175, 205]       # second header line of every page
+heading = [225, 235, 250]        # headings not tied to one kind (TOUCHED FILES)
+rule = [70, 90, 115]             # separator rules
+body = [220, 230, 240]           # prose, payloads, file content
+meta = [160, 180, 200]           # sizes, lengths, tool ids, summaries
+emphasis = [240, 245, 255]       # a spec's subject: target path, tool name
+muted = [135, 150, 165]          # empty states: "(No ... recorded)"
+comment = [130, 155, 170]        # comment lines in shown source
+ok = [110, 235, 140]
+error = [250, 115, 115]
+diff_add = [120, 245, 140]
+diff_remove = [245, 120, 120]
+diff_hunk = [110, 200, 255]      # "@@ -a,b +c,d @@"
+diff_context = [195, 205, 220]
+
+[agent_text.kinds]
+# One accent per event kind, each in the hue family of that kind's card banner
+# ([agent_cards.banners]). File actions (touched-file lists, revision cards)
+# share the read / edit / write / ast entries. Keep these mutually distinct:
+# telling kinds apart at a glance is their whole job.
+user_prompt = [140, 160, 255]          # periwinkle (banner: slate blue / indigo)
+thinking = [245, 210, 100]             # gold
+file_read = [100, 205, 250]            # cyan
+file_edit = [250, 150, 70]             # flame orange (distinct from thinking's gold)
+file_write = [110, 235, 140]           # emerald
+ast_analysis = [210, 155, 250]         # purple
+command = [200, 205, 215]              # silver (banner: terminal graphite)
+tool_invocation = [150, 190, 215]      # steel blue
+assistant_response = [120, 225, 190]   # teal-mint
+
+[ui]
+# egui overlay label colours, sRGB 0-255 integers.
+grab_active = [255, 200, 80]          # "ACTIVE GRAB" banner
+history_back = [255, 180, 80]         # deck scrolled back in history
+history_live = [100, 240, 140]        # deck at the live / latest beat
+beat_summary = [250, 220, 120]
+workdesk_bullet = [100, 220, 160]
+harness_claude = [230, 140, 70]
+harness_antigravity = [100, 180, 240]
+harness_kimi = [160, 120, 240]
+harness_generic = [180, 180, 180]
+project_name = [180, 200, 120]
+
+[environment]
+# The ground/sky environment behind the glyph scene. Off by default; turn it on
+# with --environment ground, mode = "ground" in your launch_config.toml's
+# [environment], or the B key in a windowed run.
+# Colours here are linear, like clear_color: the scene target is sRGB-encoded
+# on write, so 0.034 linear is 0x34 on screen. The comments give sRGB hex.
+mode = "off"
+# World units between the scene's lowest point and the ground (a text line is
+# 1.25), so nothing rests exactly on the plane.
+ground_gap = 5.0
+# Grid spacing in world units: FIXED; it never re-spaces as the camera moves.
+minor_spacing = 10.0
+major_spacing = 100.0
+line_width_px = 1.0
+axis_width_px = 2.0
+# Lines are full strength while a grid cell spans >= start px on screen and fade
+# to nothing by end px, so distant lines go quiet instead of shimmering.
+line_fade_start_px = 12.0
+line_fade_end_px = 3.0
+# Fog toward the horizon colour, by distance from the eye, in multiples of the
+# scene's fit distance (how far the front camera sits to frame the whole
+# scene). Fixed per scene: it scales with the content, so a 3000-unit-tall
+# repo is not buried in fog, and it never moves as the camera flies. The end
+# is also capped at fog_far_fraction of the camera's far plane, so the ground
+# never meets the far clip with a hard edge.
+fog_start_fit = 1.5
+fog_end_fit = 12.0
+fog_far_fraction = 0.9
+ground_color = [0.034, 0.042, 0.060]                # #343a45
+minor_line_color = [0.065, 0.074, 0.098, 1.0]       # ~#474f5a
+major_line_color = [0.110, 0.122, 0.155, 1.0]       # ~#5c616d
+axis_x_color = [0.40, 0.08, 0.08, 1.0]              # x axis (z = 0), red
+axis_z_color = [0.08, 0.16, 0.50, 1.0]              # z axis (x = 0), blue
+sky_horizon_color = [0.070, 0.070, 0.090]           # the old clear colour
+sky_zenith_color = [0.016, 0.018, 0.026]
+# How high above the horizon (sin of elevation) the sky reaches zenith colour.
+sky_gradient_height = 0.5
+
+[verbs]
+# Default colours (sRGB 0-255) of the recolor verbs when none is given.
+recolor_line = [255, 213, 79]    # recolor-line and the windowed H key
+recolor_glyph = [255, 80, 80]    # recolor-glyph
+
+[quad_demo]
+# What the --demo quad field pass clears to.
+clear_color = [0.02, 0.02, 0.04, 1.0]
+# The demo's orbit camera: radius and height (world units), angular rate
+# (rad/s; 0.15 is one orbit in ~42 s), vertical FOV (degrees), near/far planes.
+orbit_radius = 950.0
+orbit_height = 620.0
+orbit_rate = 0.15
+fov_y_deg = 60.0
+near = 1.0
+far = 5000.0

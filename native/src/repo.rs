@@ -380,7 +380,7 @@ pub struct RepoLoad {
 }
 
 mod shelf;
-pub use shelf::{extension_tint, DIR_TINTS};
+pub use shelf::{dir_tints, extension_tint};
 pub(crate) use shelf::{dir_tint, layout_shelf};
 
 
@@ -935,7 +935,7 @@ impl RepoLoad {
             let tint = if is_flat {
                 let area = (v.width as f64 * v.height as f64).max(1e-3);
                 let ink_frac = (v.slot_count as f64 * crate::glyph_scene::GLYPH_CELL_AREA as f64 / area).min(1.0);
-                let e = (ink_frac * crate::glyph_scene::BACKDROP_GAIN as f64).min(1.0);
+                let e = (ink_frac * crate::config::settings().lod.backdrop_gain as f64).min(1.0);
                 let rgb = extension_tint(&v.rel_path);
                 [rgb[0], rgb[1], rgb[2], e as f32]
             } else {

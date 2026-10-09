@@ -13,7 +13,7 @@ use super::{
     cull::SegCull,
     instance::{FrameUniform, Params, GlyphInstance, GroupRow},
     target::{MASK_FORMAT, POOL_FORMAT, SCENE_SAMPLE_COUNT},
-    camera::FOV_Y,
+    camera::fit_distance,
     tint::seg_tint,
     pipelines, mesh
 };
@@ -247,7 +247,7 @@ impl GlyphScene {
             // dominated by the vertical half-extent, and render() recomputes
             // the exact value per frame — this is for Fly's near/far/speed.
             let half_h_needed = half_h.max(half_w / 1.6);
-            half_h_needed / (FOV_Y.to_radians() * 0.5).tan() * 1.08 + 2.0
+            fit_distance(half_h_needed)
         };
         let fly = FlyCamera::new(center + Vec3::new(0.0, 0.0, fit), fit);
 
@@ -341,6 +341,8 @@ impl GlyphScene {
             params: Cell::new(params),
             mesh_pipeline,
             mesh_frame_bg,
+            scene_min_y: staged.bounds_min[1],
+            environment: super::environment::Environment::new(device, depth_format),
         }
     }
 
@@ -387,6 +389,13 @@ impl GlyphScene {
         if let Some(cull) = &self.cull {
             cull.file_bg_color.set(rgba);
         }
+    }
+
+    /// Set the environment mode and an explicit ground height (None = the
+    /// scene's lowest point minus `[environment] ground_gap`).
+    pub fn set_environment(&mut self, mode: crate::config::EnvironmentMode, ground_y: Option<f32>) {
+        self.environment.mode.set(mode);
+        self.environment.ground_y_override.set(ground_y);
     }
 
     /// Set the LOD minimum pixel threshold.

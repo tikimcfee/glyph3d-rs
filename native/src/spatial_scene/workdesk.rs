@@ -25,13 +25,15 @@ pub enum FileActionKind {
 }
 
 impl FileActionKind {
-    /// Visual plate accent color for the action kind [R, G, B, A].
+    /// Visual plate accent color for the action kind [R, G, B, A]:
+    /// `[agent_cards.workdesk]`.
     pub fn accent_color(&self) -> [f32; 4] {
+        let w = &crate::config::settings().agent_cards.workdesk;
         match self {
-            Self::Read => [0.15, 0.35, 0.55, 0.90],       // Cyan-slate
-            Self::Edit => [0.60, 0.40, 0.15, 0.90],       // Amber
-            Self::Write => [0.15, 0.50, 0.30, 0.90],      // Emerald
-            Self::AstAnalysis => [0.45, 0.20, 0.55, 0.90], // Purple
+            Self::Read => w.read,
+            Self::Edit => w.edit,
+            Self::Write => w.write,
+            Self::AstAnalysis => w.ast_analysis,
         }
     }
 }

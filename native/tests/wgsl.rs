@@ -37,7 +37,8 @@ fn all_wgsl_shaders_parse_and_validate() {
         // moved byte-identically into crates/glyph-field-instanced/shaders
         // (the Instanced field mode owns it; that crate's tests/wgsl.rs
         // validates it and pins its own set).
-        ["composite.wgsl", "cull.wgsl", "mesh.wgsl", "quad_field.wgsl"],
+        // 2026-10-09: environment.wgsl, the ground/sky pass (off by default).
+        ["composite.wgsl", "cull.wgsl", "environment.wgsl", "mesh.wgsl", "quad_field.wgsl"],
         "shader file set changed — update the test's expected list"
     );
 
@@ -56,6 +57,9 @@ fn all_wgsl_shaders_parse_and_validate() {
         for (_, ty) in module.types.iter() {
             if let naga::TypeInner::Struct { span, .. } = ty.inner {
                 if let Some(ref name) = ty.name {
+                    if name == "Env" {
+                        assert_eq!(span, 304, "Env WGSL struct size must match environment.rs EnvUniform (304 B)");
+                    }
                     if name == "BackdropInst" {
                         assert_eq!(span, 48, "BackdropInst WGSL struct size must match Rust 48-byte layout");
                     }

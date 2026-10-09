@@ -1,11 +1,14 @@
 //! Launch configuration for Glyph3D.
 //!
 //! Loads startup preferences from a configuration file (e.g. `launch_config.toml`
-//! or a path specified via `--launch-config <path>`).
+//! or a path specified via `--launch-config <path>`). Parsed with the `toml`
+//! crate; an unknown key is an error naming the key, not a silently ignored
+//! line — a mistyped setting otherwise does nothing and says nothing.
 
 use std::path::{Path, PathBuf};
 
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LaunchConfig {
     pub file_backgrounds: Option<bool>,
     pub file_bg_color: Option<[f32; 4]>,
@@ -26,20 +29,33 @@ pub struct LaunchConfig {
     pub claude_projects_dir: Option<PathBuf>,
     pub antigravity_brain_dir: Option<PathBuf>,
     pub kimi_sessions_dir: Option<PathBuf>,
+    /// Read by the `cargo glyph` launcher (its repo cycle), not the renderer.
+    /// Declared so the one shared file parses here: unknown keys are errors.
+    pub repo_presets: Option<Vec<String>>,
     pub agent_session: Option<PathBuf>,
     pub frames: Option<u32>,
+    /// The file's `[section]` tables: runtime overrides for `config::Settings`,
+    /// merged over `config/defaults.toml` (validated there, not here).
+    #[serde(skip)]
+    pub settings: toml::Table,
 }
 
 impl LaunchConfig {
     /// Load launch config from default locations (`launch_config.toml` or `../launch_config.toml`),
-    /// or return default configuration if neither exists.
+    /// or return default configuration if neither exists. A file that exists but does not
+    /// parse is logged as an error and the defaults are used — this is the mid-session
+    /// re-read; startup refuses the same file (`cli::args::parse_cli_from`).
     pub fn load_or_default() -> Self {
-        if Path::new("launch_config.toml").is_file() {
-            Self::from_file(Path::new("launch_config.toml")).unwrap_or_default()
-        } else if Path::new("../launch_config.toml").is_file() {
-            Self::from_file(Path::new("../launch_config.toml")).unwrap_or_default()
-        } else {
-            Self::default()
+        let path = [Path::new("launch_config.toml"), Path::new("../launch_config.toml")]
+            .into_iter()
+            .find(|p| p.is_file());
+        match path.map(Self::from_file) {
+            Some(Ok(cfg)) => cfg,
+            Some(Err(e)) => {
+                log::error!("{e}");
+                Self::default()
+            }
+            None => Self::default(),
         }
     }
 
@@ -64,98 +80,27 @@ impl LaunchConfig {
         let content = std::fs::read_to_string(path)
             .map_err(|e| format!("failed to read launch config '{}': {e}", path.display()))?;
         Self::from_toml_str(&content)
+            .map_err(|e| format!("invalid launch config '{}': {e}", path.display()))
     }
 
-    /// Parse a simple TOML-compatible string into LaunchConfig.
+    /// Parse a TOML string into LaunchConfig. Top-level keys are launch
+    /// options; `[section]` tables are settings overrides, split off whole.
     pub fn from_toml_str(s: &str) -> Result<Self, String> {
-        let mut cfg = LaunchConfig::default();
-        for (line_idx, line) in s.lines().enumerate() {
-            let line = line.trim();
-            if line.is_empty() || line.starts_with('#') || line.starts_with("//") {
-                continue;
-            }
-            let Some((key, val)) = line.split_once('=') else {
-                continue;
-            };
-            let key = key.trim();
-            let val = val.trim();
-            match key {
-                "file_backgrounds" => {
-                    cfg.file_backgrounds = Some(parse_bool(val, line_idx)?);
-                }
-                "file_bg_color" => {
-                    cfg.file_bg_color = Some(parse_color(val, line_idx)?);
-                }
-                "lod_min_px" => {
-                    cfg.lod_min_px = Some(val.parse::<f32>().map_err(|e| {
-                        format!("line {}: invalid float for lod_min_px: {e}", line_idx + 1)
-                    })?);
-                }
-                "wrap_mode" => {
-                    cfg.wrap_mode = Some(strip_quotes(val));
-                }
-                "z_wrap_spacing" => {
-                    cfg.z_wrap_spacing = Some(val.parse::<f64>().map_err(|e| {
-                        format!("line {}: invalid float for z_wrap_spacing: {e}", line_idx + 1)
-                    })?);
-                }
-                "cluster_mode" => {
-                    cfg.cluster_mode = Some(strip_quotes(val));
-                }
-                "color_mode" => {
-                    cfg.color_mode = Some(strip_quotes(val));
-                }
-                "no_cull" => {
-                    cfg.no_cull = Some(parse_bool(val, line_idx)?);
-                }
-                "no_ui" => {
-                    cfg.no_ui = Some(parse_bool(val, line_idx)?);
-                }
-                "greeking" => {
-                    cfg.greeking = Some(parse_bool(val, line_idx)?);
-                }
-                "greek_pure" => {
-                    cfg.greek_pure = Some(parse_bool(val, line_idx)?);
-                }
-                "greek_smooth" => {
-                    cfg.greek_smooth = Some(parse_bool(val, line_idx)?);
-                }
-                "greek_onset_px" => {
-                    cfg.greek_onset_px = Some(val.parse::<f32>().map_err(|e| {
-                        format!("line {}: invalid float for greek_onset_px: {e}", line_idx + 1)
-                    })?);
-                }
-                "load_repo" => {
-                    cfg.load_repo = Some(PathBuf::from(strip_quotes(val)));
-                }
-                "repo_engine" => {
-                    cfg.repo_engine = Some(strip_quotes(val));
-                }
-                "field_mode" => {
-                    cfg.field_mode = Some(strip_quotes(val));
-                }
-                "claude_projects_dir" => {
-                    cfg.claude_projects_dir = Some(PathBuf::from(strip_quotes(val)));
-                }
-                "antigravity_brain_dir" => {
-                    cfg.antigravity_brain_dir = Some(PathBuf::from(strip_quotes(val)));
-                }
-                "kimi_sessions_dir" => {
-                    cfg.kimi_sessions_dir = Some(PathBuf::from(strip_quotes(val)));
-                }
-                "agent_session" => {
-                    cfg.agent_session = Some(PathBuf::from(strip_quotes(val)));
-                }
-                "frames" => {
-                    cfg.frames = Some(val.parse::<u32>().map_err(|e| {
-                        format!("line {}: invalid integer for frames: {e}", line_idx + 1)
-                    })?);
-                }
-                _ => {
-                    // Unknown keys are ignored for forward-compatibility
-                }
+        let mut table: toml::Table = toml::from_str(s).map_err(|e| e.to_string())?;
+        let sections: Vec<String> = table
+            .iter()
+            .filter(|(_, v)| v.is_table())
+            .map(|(k, _)| k.clone())
+            .collect();
+        let mut settings = toml::Table::new();
+        for key in sections {
+            if let Some(v) = table.remove(&key) {
+                settings.insert(key, v);
             }
         }
+        let mut cfg: Self = serde::Deserialize::deserialize(toml::Value::Table(table))
+            .map_err(|e: toml::de::Error| e.to_string())?;
+        cfg.settings = settings;
         Ok(cfg)
     }
 }
@@ -163,33 +108,6 @@ impl LaunchConfig {
 /// Expand leading `~` or `~/` to the user's home directory. One definition,
 /// shared with the launcher through `glyph-session-dirs`.
 pub use glyph_session_dirs::{expand_home, home_dir};
-
-fn strip_quotes(s: &str) -> String {
-    s.trim_matches(|c| c == '"' || c == '\'').to_string()
-}
-
-fn parse_bool(s: &str, line: usize) -> Result<bool, String> {
-    match s.trim().to_lowercase().as_str() {
-        "true" | "1" | "yes" | "on" => Ok(true),
-        "false" | "0" | "no" | "off" => Ok(false),
-        other => Err(format!("line {}: invalid boolean '{other}'", line + 1)),
-    }
-}
-
-fn parse_color(s: &str, line: usize) -> Result<[f32; 4], String> {
-    let clean = s.trim().trim_start_matches('[').trim_end_matches(']').trim_matches('"');
-    let parts: Vec<&str> = clean.split(',').map(|p| p.trim()).collect();
-    if parts.len() != 4 {
-        return Err(format!("line {}: expected 4 floats [r,g,b,a], got '{s}'", line + 1));
-    }
-    let mut out = [0.0f32; 4];
-    for (i, p) in parts.iter().enumerate() {
-        out[i] = p.parse::<f32>().map_err(|e| {
-            format!("line {}: invalid float '{p}': {e}", line + 1)
-        })?;
-    }
-    Ok(out)
-}
 
 #[cfg(test)]
 mod tests {
@@ -216,6 +134,7 @@ mod tests {
             claude_projects_dir = "~/my_claude_projects"
             antigravity_brain_dir = "~/my_antigravity_brain"
             kimi_sessions_dir = ""
+            repo_presets = [".", "~/src/big-repo"]
             agent_session = "~/sessions/my_session.jsonl"
             frames = 1
         "#;
@@ -242,8 +161,43 @@ mod tests {
         assert!(dirs.iter().all(|d| d.harness != glyph_session_dirs::Harness::KimiCode));
         assert!(dirs.iter().any(|d| d.harness == glyph_session_dirs::Harness::ClaudeCode
             && d.origin == glyph_session_dirs::Origin::Config));
+        assert_eq!(cfg.repo_presets, Some(vec![".".to_string(), "~/src/big-repo".to_string()]));
         assert_eq!(cfg.agent_session, Some(PathBuf::from("~/sessions/my_session.jsonl")));
         assert_eq!(cfg.frames, Some(1));
+    }
+
+    #[test]
+    fn sections_are_settings_overrides() {
+        let cfg = LaunchConfig::from_toml_str(
+            "wrap_mode = \"down\"\n[glyph_scene]\nclear_color = [1.0, 0.0, 0.0, 1.0]\n",
+        )
+        .expect("parse failed");
+        assert_eq!(cfg.wrap_mode.as_deref(), Some("down"));
+        assert!(cfg.settings.contains_key("glyph_scene"));
+        let s = crate::config::Settings::with_overrides(cfg.settings).expect("merge failed");
+        assert_eq!(s.glyph_scene.clear_color, [1.0, 0.0, 0.0, 1.0]);
+    }
+
+    /// The committed example is what people copy; it must keep parsing as the
+    /// keys change, sections and all.
+    #[test]
+    fn example_file_parses() {
+        let cfg = LaunchConfig::from_toml_str(include_str!("../../launch_config.example.toml"))
+            .expect("launch_config.example.toml must parse");
+        crate::config::Settings::with_overrides(cfg.settings)
+            .expect("launch_config.example.toml sections must merge");
+    }
+
+    #[test]
+    fn unknown_key_is_an_error_naming_it() {
+        let err = LaunchConfig::from_toml_str("file_backgroundz = true\n").unwrap_err();
+        assert!(err.contains("file_backgroundz"), "error should name the key: {err}");
+    }
+
+    #[test]
+    fn integer_literal_accepted_for_float_key() {
+        let cfg = LaunchConfig::from_toml_str("lod_min_px = 2\n").expect("parse failed");
+        assert_eq!(cfg.lod_min_px, Some(2.0));
     }
 
     #[test]
