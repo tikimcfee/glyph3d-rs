@@ -2,7 +2,6 @@
 rust = "stable"
 python = "3.12"
 just = "latest"
-cargo-deny = "latest"
 cargo-nextest = "latest"
 naga = "latest"
 

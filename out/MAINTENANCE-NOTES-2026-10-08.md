@@ -26,7 +26,7 @@ machines and clones, **M** machine-specific values, **R** runner.
 | D3 | `cargo glyph test engine` matched zero gates, printed ALL GATES GREEN | closed | 4d9de92: refused as NOTHING RAN; every verdict counts gates; `engine` scope gone |
 | D4 | `.agents/rules/rust-engineering.md` claims the tree does not back | open | short pass |
 | D5 | pixi carried the retired engine's tasks and mojo/max toolchain | closed | 16372a9 (tasks), 6954a9d (deps, lock re-solved; Mac env unsolved-installed) |
-| D6 | Orphaned configs: `deny.toml` (nothing runs it) | open | gate or delete; mutants.toml fixed in 16372a9, fixture-parity script moved to D8 |
+| D6 | Orphaned configs: `deny.toml` (nothing runs it) | closed | deny.toml and mise's cargo-deny deleted (no use for it yet; research/rust-tooling-survey-2026.md keeps the case for it) |
 | D7 | Loose root docs: session handoffs, plus Mojo-era TOOLING-PLAN.md open items, BUILD-BRIEF.md, research/ surveys | open | move handoffs to `out/`; banner or trim the rest |
 | D8 | Retired Rust checks went unwatched from 09-30; `overflow-leads.txt` read by nothing | closed | 0336e85, 48a75d9, 5257df9 (reference-port, repo-verify x2, cubecl-chain/-fork, new hyper-oracle; 15 gates), 50c7085 (chain green) |
 | D9 | `engine-trie.bin` (+ `gen_real_trie.py`, `--engine-trie`) is committed and gated but read by no Rust code | closed | engine-trie.bin + its path plumbing (--engine-trie, default_engine_trie, LayoutGlyphs::load_trie_file, repo load params, LiveSource/PickContext fields) retired; the generator's checks became the atlas-tables gate (tools/check_atlas.py) and a Rust domain sweep on fu_to_world |
@@ -127,9 +127,6 @@ For discussion: C10, D9, X1, X2, P1. Small, fit anywhere: C8, C9, C11, X3.
 - §5 "no new shell scripts" beside a gate that is a shell script.
 - Reconcile with `native/AGENTS.md` by pointing, not restating.
 
-### D6. Orphans — [measured]
-
-- `deny.toml`: `cargo-deny` is in mise; nothing runs it. Gate or delete.
 ### D7. Loose root docs — [measured]
 
 `SESSION-HANDOFF.md` (2026-10-02, quotes floor 158),
