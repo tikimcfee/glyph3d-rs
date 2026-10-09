@@ -44,7 +44,7 @@ machines and clones, **M** machine-specific values, **R** runner.
 | C13 | HyperLayout ignored the item's cluster mode | closed | d427276 (mode read once per item; leader-mode oracle run gated) |
 | C14 | HyperLayout's host Pass 2 paginates `scroll_rows`/`page_cols` differently from the fold (instances only; recording path agrees). The device Pass 2 too (measured 2026-10-09, device tier). Gated alone as `hyper-oracle-paged` (red) so hyper-oracle could go green | open | latent for repos (they set neither); fix, then delete the split |
 | C15 | Device Pass 2 only: a line cut into chunks (> 64 KiB, no newline within the next 64 KiB) seeds the next chunk's segment advance as `rem * adv` (`aggregate_chunk_prepasses`), not the running f32 sum the fold and host path use: an ulp of x on `g-pick-repo/wide.txt`, 65 slots past column 65,280 [measured 2026-10-09, `--hyper-oracle-check native/fixtures/g-pick-repo`]. Also [inferred from source, no corpus has one]: a sequence split across such a cut is not clustered by the chunked passes (Pass 1, device Pass 2) while the host Pass 2 and the recording path, which walk the whole item, do cluster it, so Pass 1's survivor count can disagree with the host emission there | open | fix with a re-baseline in mind: g-pick-repo is every repo-* golden's corpus |
-| C16 | Discrete-GPU upload: an ODD total survivor count costs ~10-20 ms of backend on this host (derived, 94 MB tree: 91,417,858 slots 415-425 ms, 91,417,859 slots 430-437 ms; same at bf9a757) [measured 2026-10-09; cause not traced, the staging copy is the suspect] | open | look at the derived staging copy's size/alignment |
+| C16 | Discrete-GPU upload: an ODD total survivor count costs ~10-20 ms of backend on this host (derived, 94 MB tree: 91,417,858 slots 415-425 ms, 91,417,859 slots 430-437 ms; same at bf9a757) [measured 2026-10-09]. Cause: a buffer copy whose size is off 16 B runs whole at ~half speed (RTX 5090/Vulkan), and the staging path copies the 20 B-slot stream twice (wgpu-core's staging at `unmap`, then ours); odd counts paid ~+10 ms per copy, counts = 2 mod 4 ~+3 ms. Instanced (32 B) never paid | closed | staging padded to 16 B, copies split into a 16-aligned body + tail (`glyph_field::copy`); odd = even after (derived medians 414 vs 415 ms, A/A spread 4 ms), VRAM bytes and 18 golden renders identical. Hashes in a follow-up. Left: chunked Derived buffers start at 8 mod 16 (~+1 ms, measured with a forced split) |
 | C11 | Mutation `find` strings also match their own entry in build.toml; correct only because the target comes first | open | small: anchor them, or have the prover refuse an ambiguous find |
 | P1 | pixel-ab red on both platforms since 10-07; Linux set a month stale, 2 views never adopted | Ivan's call | Mac re-baseline first, then Linux re-adoption |
 | X1 | Experiments' Zed symlink scheme never built against real Zed | next up | needs a Zed checkout or the Mac; fieldzed's dylib build.rs deleted in 6a0b669 |
@@ -321,6 +321,11 @@ pixel-ab here: 7 of 9 views diverge from `vulkan-nvidia`, 2 have no set.
   it, undoing a whitespace perturbation. Measure product currency with
   `target/release/glyph` directly.
 - `cargo glyph` is broken in worktrees (D2); use the expanded command.
+- `glyph prove` on a `cargo-test` mutation WITHOUT `rebuild` leaves the
+  mutated renderer in `target/release` (`cargo test --release` builds the
+  bin for the integration tests; restore does not rebuild, and the input
+  hash reads current). Run `cargo build --release` before timing or
+  rendering by hand after a prove [measured 2026-10-09, C16].
 - Byte-comparing renders against main: build main with `git archive` into the
   scratchpad, render the nine views from `native/` with `--screenshot`, `cmp`
   against `out/tooling-ab/sweep/`.
