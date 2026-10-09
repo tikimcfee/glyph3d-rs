@@ -24,7 +24,7 @@ machines and clones, **M** machine-specific values, **R** runner.
 | D1 | Root and native AGENTS.md described 16 gates and the retired engine as live | closed | 3fc716c (root), 7a99b5a (native) |
 | D2 | `cargo glyph` alias doubles inside `.claude/worktrees/` | closed | the runner strips the doubled alias (strip_doubled_alias, pinned to .cargo/config.toml by a test); nested-alias-unstripped. A string alias was tried and reverted (c64ac55/3029cc3): array-vs-string ancestors make cargo refuse its config |
 | D3 | `cargo glyph test engine` matched zero gates, printed ALL GATES GREEN | closed | 4d9de92: refused as NOTHING RAN; every verdict counts gates; `engine` scope gone |
-| D4 | `.agents/rules/rust-engineering.md` claims the tree does not back | open | short pass |
+| D4 | `.agents/rules/rust-engineering.md` claims the tree does not back | closed | facts corrected, intent kept: no pedantic config (the gate is clippy --all-targets), stdout verdict/report lines are a contract not logging, new checks are gates (several are tools/*.sh), no tool-specific edit API; points to AGENTS.md as canonical |
 | D5 | pixi carried the retired engine's tasks and mojo/max toolchain | closed | 16372a9 (tasks), 6954a9d (deps, lock re-solved; Mac env unsolved-installed) |
 | D6 | Orphaned configs: `deny.toml` (nothing runs it) | closed | deny.toml and mise's cargo-deny deleted (no use for it yet; research/rust-tooling-survey-2026.md keeps the case for it) |
 | D7 | Loose root docs: session handoffs, plus Mojo-era TOOLING-PLAN.md open items, BUILD-BRIEF.md, research/ surveys | closed | three session handoffs moved to out/ with their dates (links fixed); TOOLING-PLAN, BUILD-BRIEF and three Mojo-era research surveys bannered historical |
@@ -32,8 +32,8 @@ machines and clones, **M** machine-specific values, **R** runner.
 | D9 | `engine-trie.bin` (+ `gen_real_trie.py`, `--engine-trie`) is committed and gated but read by no Rust code | closed | engine-trie.bin + its path plumbing (--engine-trie, default_engine_trie, LayoutGlyphs::load_trie_file, repo load params, LiveSource/PickContext fields) retired; the generator's checks became the atlas-tables gate (tools/check_atlas.py) and a Rust domain sweep on fu_to_world |
 | C1 | Twin field crates ~60% shared; five copies of the mapped-buffer upload | open | hoist into `glyph-field`; last, largest |
 | C2 | Oversized files | open | dead `paginate` kernel deleted (see commit); `derive_stride` was NOT dead (the chain bench launches it — the note was wrong). Left: split `glyph/src/main.rs` |
-| C3 | 46 `#[allow]`, one justified | open | pass, with C2 |
-| C4 | 63 `unwrap()` in `cubecl_chain/repo/dispatch.rs`, one shape | open | one accessor or non-optional fields |
+| C3 | `#[allow]`s | open (re-scoped) | outside CubeCL every allow is `too_many_arguments` (23 fns; 7 in the device emitter's hot loop): fold into the C1/C2 refactors, where signatures change anyway, with a perf check. CubeCL's allows wait on the GPU-direction decision |
+| C4 | 63 `unwrap()` in `cubecl_chain/repo/dispatch.rs`, one shape | parked | CubeCL may go away entirely with the GPU rethink (2026-10-09); polish only if it stays |
 | C5 | `spike_vertex_yz.rs`, 908 lines, own CLI flag, superseded | closed | deleted with --spike-vertex-yz; it ran its OWN inline WGSL and ItemParamsGpu, never the production Derived shader, so no coverage was lost (the Derived vertex-stage Y/Z stays a battery blind spot) |
 | C6 | Rust comments describing the Mojo/FFI backend as live | closed | 7a99b5a (+ `--fixture-manifest` deleted, help text and runtime labels fixed) |
 | C7 | 239 stage-letter comments | won't do | archaeology; reword only when touching |
@@ -116,16 +116,6 @@ For discussion: C10, D9, X1, X2, P1. Small, fit anywhere: C8, C9, C11, X3.
 ---
 
 ## Open items: detail
-
-### D4. rust-engineering.md — [measured]
-
-- §1 claims `clippy::pedantic` "configured in `Cargo.toml`": no `[lints]`
-  table anywhere. Add it (expect a large red) or delete the sentence.
-- §2 "never `println!`": the runner's 124 `println!` are its contract. Say
-  diagnostics go through tracing, verdict lines are presentation.
-- §8 names `replace_file_content`, an Antigravity tool name.
-- §5 "no new shell scripts" beside a gate that is a shell script.
-- Reconcile with `native/AGENTS.md` by pointing, not restating.
 
 ### C1. Twin field crates — [measured]
 
