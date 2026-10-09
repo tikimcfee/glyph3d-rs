@@ -39,7 +39,7 @@ machines and clones, **M** machine-specific values, **R** runner.
 | C7 | 239 stage-letter comments | won't do | archaeology; reword only when touching |
 | C8 | `clippy --all-targets`: 14 test-only lints + deny-level `reversed_empty_ranges` (seam.rs test) | open | sweep; gate runs without `--all-targets` |
 | C9 | `discovery.rs` names a Claude project by the slug's last `-` segment (`…-glyph3d-js` → `js`) | open | small fix |
-| C10 | CubeCL fence FAILS on BOTH machines, identical numbers; `--repo-engine cubecl` renders differ from hyper | open | bisecting on the M2 from 5e94de8 |
+| C10 | CubeCL fence FAILS on both machines. Attributed: two defects (detail) — HyperLayout's ASCII fast path vs clusters (since 09-30), and a chain regression in 26595fb (10-06) | open | decide fixes; HyperLayout has no oracle check (D8) |
 | C11 | Mutation `find` strings also match their own entry in build.toml; correct only because the target comes first | open | small: anchor them, or have the prover refuse an ambiguous find |
 | P1 | pixel-ab red on both platforms since 10-07; Linux set a month stale, 2 views never adopted | Ivan's call | Mac re-baseline first, then Linux re-adoption |
 | X1 | Experiments' Zed symlink scheme never built against real Zed | next up | needs a Zed checkout or the Mac; fieldzed's dylib build.rs deleted in 6a0b669 |
@@ -235,7 +235,36 @@ the flag and its `cli/command.rs` arm.
   Linux, so NOT a Vulkan or discrete-GPU effect: a deterministic,
   cross-platform divergence in the code. Also unchanged by merging main's
   large-dataset fixes (6f6f004).
-- Next: bisect on the M2 from 5e94de8 (gate retired) to main@164af5c.
+- **Attributed (M2, 2026-10-09)** — two separate defects:
+  1. **Fork (CubeCL vs HyperLayout) — divergence entered WITH HyperLayout.**
+     The fork fence compared CubeCL against the Mojo engine and was green
+     until 2026-09-30. At 28bc7be (Mojo removed, HyperLayout becomes the
+     reference) it fails with 1,113 record mismatches, and identically at
+     c331464, 41dc330 and 5e94de8 (gate retired, red). e141724 (HyperLayout
+     added, Mojo still present) does not build without the Mojo dylib. So
+     CubeCL agreed with the oracle-validated engine and HyperLayout did not
+     [inferred from the gate's history].
+     Mechanism [inferred from source, matches the first mismatch]:
+     `layout_hyper/char_resolve.rs` `resolve_byte_char_cluster` returns the
+     `fast_byte_table` entry for every ASCII byte without asking
+     `starts_a_sequence`, and `atlas.rs` fills that table for all ASCII except
+     newline and static-zero codepoints. Keycap sequences (`0️⃣` = 0x30 VS16
+     U+20E3) start with an ASCII byte, so HyperLayout lays out `0` as text
+     and the keycap mark as a separate glyph (fork slot 287: chain gi 5264
+     double-advance, hyper gi 17 = `0`; slot 288: hyper gi 4431). Unverified:
+     why `#️⃣`/`*️⃣` agree between the two.
+  2. **Chain (CubeCL vs scan.rs, `cluster-flags`) — regression in 26595fb**
+     (2026-10-06, "eliminate 776MB intermediate VRAM buffers with inline trie
+     evaluation in scan and emit"). Bisected on the M2, 7 steps: parent
+     d08af8b PASS, 26595fb FAIL (9 record mismatches); PASS at every earlier
+     step back to 5e94de8.
+- The fork failure grew from 1,113 record mismatches (09-30) to 708,529 lane
+  words (now); the check moved from records to slot lanes in between, and
+  26595fb may add to it. Not separated.
+- Consequences: HyperLayout is the default engine and nothing compares it to
+  the JS oracle (the `--fixture-*` instruments test fold.rs/scan.rs/text.rs).
+  `repo-cluster`'s Metal golden was taken through `--load-repo` (HyperLayout)
+  after 09-30, so it may carry defect 1.
 
 ### P1. Pixel baselines — [measured]
 
