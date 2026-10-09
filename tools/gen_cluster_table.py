@@ -7,9 +7,10 @@ never hand-written. A hand-rolled state machine broke keycaps in the 2026-09-20
 experiment and was caught only because the test expectation was wrong in the
 other direction.
 
-WHO READS THIS TABLE: the landed sequence pass deliberately reads NO classes
-(engine/glyph_cluster.mojo says why — matching is table-driven, not
-class-driven). The table covers the FULL Grapheme_Cluster_Break space plus the
+WHO READS THIS TABLE: the landed sequence pass deliberately reads NO classes.
+Matching is table-driven, not class-driven: it is a longest-prefix match
+against the font's own sequence table, so a sequence the font cannot draw as
+one glyph has nothing to resolve to whatever its classes say. The table covers the FULL Grapheme_Cluster_Break space plus the
 emoji-data properties because the general UAX #29 phase (combining marks,
 Hangul, Indic) rides it next — it is baked and carried verbatim into both
 tries now so that phase finds its data already placed; until then the tests

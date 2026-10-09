@@ -1,27 +1,22 @@
 //! Fixture parity — the Rust `.pipe.bin` reader and the
 //! bit-exact differ everything after it is gated on.
 //!
-//! WHY THIS EXISTS BEFORE ANY PORTED CODE. `engine/PORT-PLAN.md` stages the
-//! port by ACCEPTANCE TEST, and the first line of ported fold has to land
-//! against a working differ rather than before one. Rust could not read a
-//! fixture at all until this file: it passed fixture PATHS through to Mojo's
-//! `load_trie_auto` and never looked inside.
+//! Every corpus instrument (`--fixture-trie/-fold/-scan/-reference`) lands
+//! against this differ: a ported stage is accepted by diffing its output
+//! against the oracle's recorded answers, never by inspection.
 //!
-//! THE FORMAT is `engine/fixture_io.mojo`, mirrored section for section. It is
-//! frozen on disk (v5) and deliberately independent of any layer's container:
+//! THE FORMAT is the v5 `.pipe.bin`, as read below section for section. It
+//! is frozen on disk and deliberately independent of any layer's container:
 //! it carries the oracle's VALUES, and each loader realizes its own carriers.
-//! This one performs the same carrier split the Mojo loader does — trie
-//! measures narrowed f64 -> f32, identity and bitfield to native u32 — because
-//! a checker that carries values differently from the thing it checks is a
-//! second implementation with its own bugs.
+//! This one performs the carrier split the layout itself uses — trie
+//! measures narrowed f64 -> f32, identity and bitfield to native u32 —
+//! because a checker that carries values differently from the thing it
+//! checks is a second implementation with its own bugs.
 //!
-//! HOW THE PARSE IS CHECKED, given there is no second Rust parser to disagree
-//! with it: `manifest()` emits FNV-1a checksums over the PARSED, TYPED values
-//! of every section, and `engine/fixture_manifest.mojo` emits the same lines
-//! from the Mojo loader. `tools/check-fixture-parity.sh` diffs the two. That is
-//! a genuine two-implementation agreement rather than a file hashed against
-//! itself: the checksums are computed after the strides, field order, and
-//! carrier splits have been applied, so getting any of them wrong diverges.
+//! HOW THE PARSE IS CHECKED: indirectly, by every instrument above. Each one
+//! diffs lanes computed FROM the parsed values against the oracle's expected
+//! lanes in the same file, so a wrong stride, field order or carrier split
+//! diverges there.
 
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
@@ -61,12 +56,11 @@ pub const FIX_C_COL: usize = 1;
 pub const FIX_C_FLAGS: usize = 2;
 pub const FIX_C_ORD: usize = 3;
 
-/// Fold flags, from `glyph_pipeline.mojo`.
+/// Fold flags, as the fixture's FLAGS lane carries them.
 pub const F_LEADER: u32 = 1;
 pub const F_MISSING: u32 = 8;
 
 /// FIXTURE lane name for diagnostics — fixture order, not container order.
-/// Mirrors `fixture_measure_lane_name` in glyph_schema.mojo.
 pub fn measure_lane_name(lane: usize) -> &'static str {
     match lane {
         0 => "X",
@@ -91,7 +85,7 @@ pub fn count_lane_name(lane: usize) -> &'static str {
     }
 }
 
-/// `trunc_nonneg` from glyph_pipeline.mojo: `max(0, trunc(v || 0))`, the
+/// `trunc_nonneg`: `max(0, trunc(v || 0))`, the
 /// oracle's boundary semantics. Applied ONCE here, where f64 VALUES enter,
 /// rather than at every read site.
 fn trunc_nonneg(v: f64) -> i64 {
@@ -159,7 +153,7 @@ impl<'a> Reader<'a> {
 /// On disk a v3 fixture stores blocks as f64 VALUES in entry-major lane order
 /// [GLYPH_ID, ADVANCE, HEIGHT, FLAGS] — which is exactly why the corpus
 /// survived the trie's container moving on BOTH sides of the oracle. The split
-/// below is this loader's realization and matches `fixture_io.mojo`'s.
+/// below is this loader's realization.
 pub struct FixtureTrie {
     pub block_index: Vec<u32>,
     /// measures, 2 per entry: [ADVANCE, HEIGHT]
@@ -196,7 +190,7 @@ impl ResolveGlyph for FixtureTrie {
         }
     }
 
-    /// The v5 payload, on the trie as it is in the Mojo loader.
+    /// The v5 payload (the cluster sequence table), carried on the trie.
     fn cluster_table(&self) -> Option<(&[u32], u32, f32)> {
         if self.seq.is_empty() {
             None
@@ -267,7 +261,7 @@ fn load_pipe_bytes(raw: &[u8], name: String) -> Result<PipeFixture, String> {
         let adv = r.f64()?;
         let h = r.f64()?;
         let fl = r.f64()?;
-        // THE CARRIER SPLIT, matching fixture_io.mojo: measures narrow to f32
+        // THE CARRIER SPLIT: measures narrow to f32
         // (exact for anything that was f32 to begin with), identity and
         // bitfield become native u32.
         blocks_m.push(adv as f32);
@@ -390,173 +384,7 @@ fn load_pipe_bytes(raw: &[u8], name: String) -> Result<PipeFixture, String> {
     })
 }
 
-// ── The parity manifest ───────────────────────────────────────────────────
-//
-// FNV-1a 64, fed the LITTLE-ENDIAN BIT PATTERN of each parsed value in section
-// order. Two properties are wanted and a plain sum has neither: it must be
-// order-sensitive (a section read in the wrong order must diverge) and
-// bit-sensitive (a value narrowed one step too early must diverge). Hashing
-// the FILE would have neither property that matters here — it would agree no
-// matter how wrongly either side parsed it.
-
-const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
-const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
-
-#[derive(Clone, Copy)]
-pub struct Fnv(u64);
-
-impl Default for Fnv {
-    fn default() -> Self {
-        Self(FNV_OFFSET)
-    }
-}
-
-impl Fnv {
-    fn byte(&mut self, b: u8) {
-        self.0 ^= b as u64;
-        self.0 = self.0.wrapping_mul(FNV_PRIME);
-    }
-    fn u8(&mut self, v: u8) {
-        self.byte(v);
-    }
-    fn u32(&mut self, v: u32) {
-        for b in v.to_le_bytes() {
-            self.byte(b);
-        }
-    }
-    fn u64(&mut self, v: u64) {
-        for b in v.to_le_bytes() {
-            self.byte(b);
-        }
-    }
-    fn i64(&mut self, v: i64) {
-        self.u64(v as u64);
-    }
-    fn f32(&mut self, v: f32) {
-        self.u32(v.to_bits());
-    }
-    fn f64(&mut self, v: f64) {
-        self.u64(v.to_bits());
-    }
-    fn hex(self) -> String {
-        format!("{:016x}", self.0)
-    }
-}
-
 impl PipeFixture {
-    /// One canonical line per fixture. `engine/fixture_manifest.mojo` emits the
-    /// identical line from the Mojo loader; `tools/check-fixture-parity.sh`
-    /// diffs them. Keep the two emitters in lockstep — the format is the
-    /// comparison.
-    pub fn manifest(&self) -> String {
-        let mut h_bytes = Fnv::default();
-        for &b in &self.bytes {
-            h_bytes.u8(b);
-        }
-        let mut h_tindex = Fnv::default();
-        for &v in &self.trie.block_index {
-            h_tindex.u32(v);
-        }
-        let mut h_tm = Fnv::default();
-        for &v in &self.trie.blocks_m {
-            h_tm.f32(v);
-        }
-        let mut h_tc = Fnv::default();
-        for &v in &self.trie.blocks_c {
-            h_tc.u32(v);
-        }
-        // v5: the sequence payload rides the trie in both loaders, so its hash
-        // sits with the trie's, in disk order. The advance hashes as its
-        // narrowed f32 bits (the parsed carrier, matching h.tm), with a
-        // sentinel for the NaN that means "no sequences" — two platforms
-        // narrowing NaN is not a bit-exact path, so the sentinel replaces it.
-        let mut h_seq = Fnv::default();
-        let seq_count = if self.trie.seq.is_empty() { 0 } else { self.trie.seq.len() / (2 + self.trie.seq_max as usize) };
-        h_seq.u32(seq_count as u32);
-        h_seq.u32(self.trie.seq_max);
-        for &v in &self.trie.seq {
-            h_seq.u32(v);
-        }
-        h_seq.u32(if self.trie.bitmap_advance.is_nan() { u32::MAX } else { self.trie.bitmap_advance.to_bits() });
-        let mut h_items = Fnv::default();
-        for it in &self.items {
-            h_items.i64(it.byte_start);
-            h_items.i64(it.byte_count);
-            h_items.f64(it.origin_x);
-            h_items.f64(it.origin_y);
-            h_items.f64(it.origin_z);
-            h_items.i64(it.wrap_width);
-            h_items.i64(it.wrap_mode.code());
-            h_items.i64(it.cluster_mode.code());
-            h_items.f64(it.z_step);
-            h_items.f64(it.line_height);
-            h_items.u8(u8::from(it.has_page));
-            h_items.i64(it.page_rows);
-            h_items.i64(it.page_cols);
-            h_items.i64(it.scroll_rows);
-            h_items.i64(it.pages_wide);
-            h_items.f64(it.page_gap_x);
-            h_items.f64(it.band_stride_y);
-            h_items.f64(it.depth_per_band);
-            h_items.f64(it.depth_per_col);
-            h_items.f64(it.page_line_height);
-        }
-        let mut h_miss = Fnv::default();
-        for &v in &self.exp_misses {
-            h_miss.u32(v);
-        }
-        let mut h_otb = Fnv::default();
-        for &v in &self.exp_ord_to_byte {
-            h_otb.u32(v);
-        }
-        let mut h_meas = Fnv::default();
-        for &v in &self.exp_measures {
-            h_meas.f64(v);
-        }
-        let mut h_cnt = Fnv::default();
-        for &v in &self.exp_counts {
-            h_cnt.u32(v);
-        }
-        let mut h_bnds = Fnv::default();
-        for &v in &self.exp_item_bounds {
-            h_bnds.u64(v);
-        }
-        let mut h_batch = Fnv::default();
-        for &v in &self.exp_batch {
-            h_batch.u64(v);
-        }
-
-        let mut s = String::new();
-        let _ = write!(
-            s,
-            "{} bytes={} items={} tindex={} tentries={} leaders={} misses={}",
-            self.name,
-            self.byte_len,
-            self.item_count,
-            self.trie.block_index.len(),
-            self.trie.blocks_c.len() / 2,
-            self.exp_leaders,
-            self.exp_misses.len()
-        );
-        let _ = write!(
-            s,
-            " h.bytes={} h.tindex={} h.tm={} h.tc={} h.seq={} h.items={} h.miss={} h.otb={} h.meas={} h.cnt={} h.bnds={} h.batch={}",
-            h_bytes.hex(),
-            h_tindex.hex(),
-            h_tm.hex(),
-            h_tc.hex(),
-            h_seq.hex(),
-            h_items.hex(),
-            h_miss.hex(),
-            h_otb.hex(),
-            h_meas.hex(),
-            h_cnt.hex(),
-            h_bnds.hex(),
-            h_batch.hex()
-        );
-        s
-    }
-
     /// Byte offsets the oracle marked as leaders, in order. Taken from the
     /// fixture's own FLAGS lane rather than re-deriving them with a second copy
     /// of the decode — a differ that recomputes its own reference points can
@@ -570,7 +398,7 @@ impl PipeFixture {
 
 // ── The differ ────────────────────────────────────────────────────────────
 
-/// One disagreeing lane, named the way the Mojo suites name them.
+/// One disagreeing lane, named by its fixture lane name.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Mismatch {
     pub byte: usize,
@@ -585,8 +413,8 @@ pub struct Mismatch {
 ///
 /// THE NARROWING POINT: the fixture carries f64 VALUES and the engine carries
 /// f32, so the expectation narrows to f32 ONCE, here, and the comparison is on
-/// BITS. That is the same comparison every Mojo suite makes, and it is
-/// deliberate: bit equality is the contract, not approximate agreement.
+/// BITS. That is deliberate: bit equality is the contract, not approximate
+/// agreement.
 ///
 /// `got` is row-major `[position][lane]` over `positions` x `lanes`.
 pub fn diff_measures_at(
@@ -740,8 +568,9 @@ fn out_of_domain(fx: &PipeFixture) -> Option<String> {
     }
     // The sequence pass rewrites the static tier before the fold; this
     // reference deliberately folds leader-mode only — the pass lives in the
-    // twins (text.rs's stage_file, the engine), and engine-check feeds this
-    // reference ItemParams::default. A cluster-mode item is out of its
+    // twins (text.rs's stage_file, the fold and the layout backends), and the
+    // reference is specified against ItemParams::default, whose cluster mode
+    // is Leader. A cluster-mode item is out of its
     // declared domain — same reasoning as the wrap-mode line above.
     if it.cluster_mode != crate::fold::ClusterMode::Leader {
         return Some("cluster_mode=Cluster".to_string());
@@ -1041,9 +870,9 @@ pub fn diff_full_fold(fx: &PipeFixture) -> FoldDiff {
         for lane in 0..FOLD_MEASURE_LANES {
             let exp = fx.exp_measures[id * FIXTURE_MEASURE_STRIDE + lane];
             if lane == FIX_M_GLYPH_ID {
-                // GLYPH_ID IS EXACT. The Mojo's `m_at` deliberately REFUSES to
-                // return an f32 view of this lane — "a checker must carry it the
-                // way the pipeline does" — so it is compared as u32 here. An f32
+                // GLYPH_ID IS EXACT. It is an identity, not a measure, and a
+                // checker must carry it the way the pipeline does — so it is
+                // compared as u32 here, never through an f32 view. An f32
                 // comparison would be a second carrier with its own rounding,
                 // and the whole reason this lane moved out of a float array is
                 // that a container's mistake travels to everything it feeds.
@@ -1183,8 +1012,7 @@ pub struct ScanDiff {
 }
 
 /// Run the scan form at one tuning and compare against the fixture under the
-/// repo's tiered contract (`engine/conformance_scan.mojo`,
-/// `tools/scan-layout.test.mjs`).
+/// repo's tiered contract.
 ///
 /// THE TOLERANT ROW IS TOLERANT BY CONSTRUCTION. A foldless X is an f64 prefix
 /// in the serial fold and an f32 monoid lane here, so the GROUPING differs and
@@ -1335,20 +1163,6 @@ pub fn diff_scan(fx: &PipeFixture, chunk_size: usize, group_size: usize, shards:
 }
 
 // ── Gate drivers (moved from main.rs in the 2026-09 code-shape refactor) ──
-
-/// Fixture parity: emit the canonical parse manifest, one line per fixture.
-pub fn run_fixture_manifest(paths: &[PathBuf]) -> ! {
-    for p in paths {
-        match load_pipe_fixture(p) {
-            Ok(fx) => println!("{}", fx.manifest()),
-            Err(e) => {
-                eprintln!("fixture-manifest FAIL: {e}");
-                std::process::exit(1);
-            }
-        }
-    }
-    std::process::exit(0);
-}
 
 /// Full fold: the ported fold against the whole corpus, every lane of every byte.
 pub fn run_fixture_fold(paths: &[PathBuf]) -> ! {
@@ -1608,9 +1422,8 @@ mod tests {
         assert_eq!(bad[0].byte, positions[2]);
     }
 
-    /// THE STAGE 0 ACCEPTANCE TEST, and the first time the existing Rust fold
-    /// has been held to the fixture corpus rather than only to the Mojo engine
-    /// through the FFI.
+    /// THE STAGE 0 ACCEPTANCE TEST: `text::reference_layout` held to the
+    /// fixture corpus over its declared domain.
     #[test]
     fn reference_layout_is_bit_exact_on_every_in_domain_fixture() {
         let mut in_domain = 0;

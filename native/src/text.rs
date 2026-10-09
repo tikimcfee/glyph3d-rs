@@ -206,8 +206,9 @@ fn is_block_comment_continuation_chars(chars: &[char]) -> bool {
 /// offset in a grid of blocks — exercises the group table and is the stress
 /// path toward ≥1M instances).
 ///
-/// `cluster_mode` selects the sequence pass on the char stream (the engine's
-/// glyph_cluster.mojo is the same rule over the same table). Leader (the
+/// `cluster_mode` selects the sequence pass on the char stream (the fold's
+/// `fold::resolve_clusters` and the device's `cubecl_chain/cluster.rs` are
+/// the same rule over the same table). Leader (the
 /// default) stages one cell per codepoint, as this path always has.
 pub fn stage_file(
     atlas: &Atlas,
@@ -285,8 +286,8 @@ pub fn stage_file(
         let ch = chars[ci];
         // THE SEQUENCE PASS, on the char stream (cluster mode only): a leader
         // that starts a table sequence resolves to its one slot — the same
-        // longest-prefix rule as the engine's, over the same table (the
-        // engine's is glyph_cluster.mojo; the oracle's is resolveClusters).
+        // longest-prefix rule as the fold's, over the same table (the fold's
+        // is `fold::resolve_clusters`; the oracle's is resolveClusters).
         if cluster_mode == crate::fold::ClusterMode::Cluster {
             let cp = ch as u32;
             if crate::fold::is_static_zero_cp(cp) {
@@ -602,19 +603,19 @@ fn word_color(word: &str) -> [u8; 3] {
     }
 }
 
-// ── Stage E1 — engine-convention paths ──────────────────────────────────────
+// ── Fold-convention paths ───────────────────────────────────────────────────
 //
 // `stage_file` above is the PRODUCTION staging: cell-quantized columns, tab
 // stops, and blank/missing glyphs dropped from the instance stream (bitmap
 // slots are staged — the shader draws them from the emoji sheet).
-// The Mojo engine (glyph_pipeline.mojo) has different conventions by design:
-// it emits ONE record per UTF-8 leader byte (newlines, blanks, and missing
-// codepoints included), accumulates X as an f64 running sum of the per-glyph
-// f32 advances (the oracle's float discipline), counts COL in leader glyphs
-// per line (no tab stops, no double-width cells), and HEIGHT is the constant
-// cell height. `reference_layout` below re-implements THAT fold on the CPU,
-// reading the same atlas trie, so `--engine-check` can diff the FFI records
-// against an independent implementation bit-for-bit.
+// The layout fold (`fold.rs`, and every backend held to it) has different
+// conventions by design: it emits ONE record per UTF-8 leader byte (newlines,
+// blanks, and missing codepoints included), accumulates X as an f64 running
+// sum of the per-glyph f32 advances (the oracle's float discipline), counts
+// COL in leader glyphs per line (no tab stops, no double-width cells), and
+// HEIGHT is the constant cell height. `reference_layout` below re-implements
+// THAT fold on the CPU, independently, so its records can be diffed against
+// the fold's bit-for-bit.
 
 use crate::atlas::TrieTable;
 
@@ -697,7 +698,7 @@ pub(crate) fn fu_to_world(fu: i32, em_height_fu: u32) -> f32 {
     (fu as f64 * CELL_HEIGHT_WORLD as f64 / em_height_fu as f64) as f32
 }
 
-/// Replicate the engine's decode + fold (wrap 0, no pages) for one item.
+/// Replicate the fold's decode + fold (wrap 0, no pages) for one item.
 ///
 /// Byte-level UTF-8, exactly as `decode_and_resolve`: the lead byte picks the
 /// sequence length, continuation/invalid bytes are non-leaders (no record),
@@ -707,18 +708,19 @@ pub(crate) fn fu_to_world(fu: i32, em_height_fu: u32) -> f32 {
 /// computes a strict superset of it. They look like a dual code path and are
 /// not: their VALUE is that they have different lineage.
 ///
-/// `reference_layout` was written independently against the TSL kernel
-/// (Stage E1). `fold.rs` was ported from `engine/glyph_pipeline.mojo`. So
-/// `--engine-check`, which runs the Mojo engine over real source with the real
-/// atlas and diffs it against this, is comparing two implementations that do
-/// NOT share a parent. Point it at `fold.rs` instead and it becomes the Mojo
-/// checked against a port of the Mojo — an oracle sharing a fault with its
-/// port, which is the one failure mode a diff cannot see.
+/// `reference_layout` was written independently against the TSL kernel.
+/// `fold.rs` descends from the layout pipeline itself — it is the contract
+/// every backend is held to. The two do NOT share a parent
+/// (`--fixture-reference` holds this one to the corpus, `--fixture-fold` that
+/// one), so a diff between them can see a fault that one lineage carries and
+/// the other does not. Merge this into `fold.rs` and the pipeline is left
+/// checked only against itself — an oracle sharing a fault with its port,
+/// which is the one failure mode a diff cannot see.
 ///
-/// The fixtures cannot cover that gap either: they gate both implementations,
-/// so anything they miss, both miss together. `--engine-check`'s input (40 KB of
-/// this crate's own source, the real atlas trie) is outside the corpus entirely,
-/// and independence is the whole reason it is worth running there.
+/// The fixtures cannot cover that gap on their own: they gate both
+/// implementations, so anything they miss, both miss together. Independence
+/// is what makes a diff of the two worth running on input OUTSIDE the corpus
+/// (real source, the real atlas trie) — which no instrument does today.
 ///
 /// Same rule, same reason as `to_world` / `fu_to_world`: a formula written twice
 /// on purpose stops being a check the moment it is written once.
@@ -813,7 +815,7 @@ pub fn reference_layout<T: ResolveGlyph + ?Sized>(
 pub type FoldTables = (Vec<(usize, u32)>, Vec<u32>, Vec<u32>, Vec<u32>);
 
 /// Stage G — decode the UTF-8 leaders of `bytes` and fold them with the
-/// engine's exact conventions (glyph_pipeline.mojo, THE FOLD): COL is the raw
+/// layout's exact conventions (`fold.rs`, THE FOLD): COL is the raw
 /// leader count within the source line (NOT col % wrap), ROW is
 /// `base_row + wrap_row_of(col, wrap, is_newline)`, and the newline rides at
 /// column == line length but on the row it CLOSES, so a line covers

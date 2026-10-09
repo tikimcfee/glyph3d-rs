@@ -116,20 +116,14 @@ pub struct Cli {
     /// Point it at another G3ES file to swap the sheet without a rebuild.
     #[arg(long, value_name = "PATH")]
     pub emoji_sheet: Option<PathBuf>,
-    /// Trie for engine modes (default: assets/atlas/engine-trie.bin — the real
-    /// atlas mapping; pass a .pipe.bin fixture for the toy one)
+    /// Trie path handed to the layout backend for `--engine-render` (default:
+    /// assets/atlas/engine-trie.bin). Currently not read: every backend
+    /// resolves through the atlas trie (codepoints.bin)
     #[arg(long, value_name = "PATH")]
     pub engine_trie: Option<PathBuf>,
     /// Stage E1: render engine records through the Slug renderer
     #[arg(long, value_name = "PATH")]
     pub engine_render: Option<PathBuf>,
-    /// Fixture parity (reference port): print the canonical parse manifest for each
-    /// .pipe.bin fixture and exit. tools/check-fixture-parity.sh diffs these
-    /// lines against the ones engine/fixture_manifest.mojo emits from the Mojo
-    /// loader — two independent parsers agreeing on checksums over their PARSED
-    /// values, not on the file's bytes.
-    #[arg(long, value_name = "PATH", num_args = 1..)]
-    pub fixture_manifest: Vec<PathBuf>,
     /// Fixture parity: lay each .pipe.bin with the CPU reference fold and diff
     /// BIT-EXACT against the oracle's own expected lanes, then exit.
     #[arg(long, value_name = "PATH", num_args = 1..)]
@@ -154,13 +148,14 @@ pub struct Cli {
     /// Stage E2: load a whole repository as a field of code pages
     #[arg(long, value_name = "DIR")]
     pub load_repo: Option<PathBuf>,
-    /// Which FFI strategy the Mojo backend uses. `direct` is the DEFAULT: the
-    /// engine writes render instances straight into the arena, materializing no
-    /// wire record on either side of the FFI — one pass where `naive` and
-    /// `batch` take three, and it folds in chunks so lane memory follows the
-    /// chunk rather than the corpus. The record strategies remain because they
-    /// are the verification form: `VerifyLayout` needs a wire stream, and
-    /// `--repo-verify` diffs whichever pair you name.
+    /// Which layout engine a repo load uses. `hyper` (the DEFAULT) is the
+    /// parallel CPU HyperLayout, writing render instances straight into the
+    /// arena with its inputs prefetched in the background. `cubecl` is the GPU
+    /// compute chain (the `cubecl` Cargo feature, on by default). `direct`,
+    /// `batch` and `naive` run the same HyperLayout without the prefetch;
+    /// under `--repo-verify`, `direct` records no 32 B wire records
+    /// (placements and instances are diffed, records are not) while `batch`
+    /// and `naive` do.
     #[arg(long, value_name = "MODE", default_value = "hyper")]
     pub repo_engine: crate::repo::Strategy,
     /// Diff the chosen strategy against a counterpart, bit-exact over the

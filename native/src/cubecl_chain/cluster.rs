@@ -14,13 +14,14 @@ use super::{F_CLUSTER_HEAD, F_CLUSTER_TRAILER, F_LEADER};
 // killed the naive max-scan: with W=[0,10), Y=[5,15), X=[12,14) the prefix-
 // max sees Y's 15 and suppresses X, which greedy commits. v1 runs the chain
 // one thread per ITEM (the product corpus is 1,306 items — item-parallel);
-// the chunked function-composition form (the Mojo zone tables) is the
-// follow-up only if a dense-single-item measurement demands it.
+// the chunked function-composition form (per-zone transition tables) is
+// the follow-up only if a dense-single-item measurement demands it.
 //
 // Lookup is DESCENDING-LENGTH BINARY SEARCH over the sorted sequence
 // section (the section order is asserted at bake; the longest exact prefix
-// is unique) — semantics-neutral vs the Mojo st_probe hash by that same
-// argument, and it reuses the item_search pattern already proven here. The
+// is unique) — semantics-neutral vs a hash probe or the CPU's linear scan
+// by that same argument, and it reuses the item_search pattern already
+// proven here. The
 // comparator re-walks the probe's effective codepoints from the head byte
 // instead of storing a key array: the walk is deterministic, so no local
 // storage exists to spill.
@@ -86,8 +87,8 @@ pub(super) fn is_static_zero(cp: u32) -> u32 {
 /// head's own codepoint first, FE0F skipped but riding, newline/VS15/
 /// continuation/item-end breaking) and run a descending-length binary
 /// search over the sorted sequence section — the longest exact prefix is
-/// unique, so this is answer-identical to the CPU's linear scan and the
-/// Mojo's hash probe alike. The span end re-walks counting CONSUMED key
+/// unique, so this is answer-identical to the CPU's linear scan (and to
+/// any hash probe). The span end re-walks counting CONSUMED key
 /// elements, so trailing FE0Fs past the last consumer stay outside.
 ///
 /// The key scratch is a LOCAL `Array`, not `Shared`: each unit only ever
@@ -368,7 +369,7 @@ pub(super) fn cluster_probe(
 /// trailer zeroing gated on the leader bit, packed-flag fetch_or (a span
 /// can straddle threads), and the trailer walk CLAMPED to the item end —
 /// cend can overrun it by up to one codepoint, and the serial side only
-/// ever marks members strictly inside (the Mojo chain's ownership rule).
+/// ever marks members strictly inside (the item owns only its own bytes).
 ///
 /// Scope notes, deliberately recorded: the device chain writes sm/fl
 /// only — the serial `gi` lane (slot / zeroed trailers) has NO device
@@ -769,8 +770,8 @@ pub(super) fn cluster_mark(
                     // The trailer walk clamps to the ITEM END — cend can
                     // overrun it by up to one codepoint (the span-end walk
                     // starts a member before stop), and the serial side only
-                    // ever marks members strictly inside the item. The Mojo
-                    // chain's ownership rule, verbatim.
+                    // ever marks members strictly inside the item: an item
+                    // owns only its own bytes.
                     let item_end_boundary = item_record_bounds[item_index * 2 + 1] as usize;
                     let candidate_end = candidate_end_positions[candidate_index] as usize;
                     let marking_limit = if candidate_end < item_end_boundary { candidate_end } else { item_end_boundary };

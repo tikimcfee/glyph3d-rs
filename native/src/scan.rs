@@ -1,9 +1,9 @@
 //! The scan form — the same fold as a segmented monoid scan, part of the
 //! reference port.
 //!
-//! SOURCES. The oracle is `glyphPipelineScan.js` (313 lines); the working
-//! reference is `engine/glyph_scan.mojo` plus the monoid itself, which lives in
-//! `engine/glyph_bake.mojo` (`ScanElem`, `scan_combine`, `lanes_from_prefix`).
+//! SOURCES. The oracle is `glyphPipelineScan.js` (313 lines, vendored under
+//! `engine/fixtures/inputs/`). The monoid itself (`ScanElem`, `scan_combine`,
+//! `lanes_from_prefix`) lives here and `bake.rs` imports it.
 //!
 //! WHY A SECOND FORM AT ALL. This is the GPU's dispatch structure:
 //!
@@ -18,8 +18,7 @@
 //! getting identical integer lanes IS associativity checked in situ.
 //!
 //! ── THE PRECISION CONTRACT IS TIERED, AND THAT IS NOT A WEAKENING ────────────
-//! Mirrors the repo's own comparator (`tools/scan-layout.test.mjs`,
-//! `engine/conformance_scan.mojo`):
+//! The same tiers the oracle's own scan comparator uses:
 //!
 //! | lanes | agreement with the serial fold |
 //! |---|---|

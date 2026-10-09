@@ -1,9 +1,8 @@
 //! The bake, and the seed protocol it ships — part of the reference port.
 //!
-//! SOURCES. The oracle is `glyphBake.js` (250 lines); the working reference is
-//! `engine/glyph_bake.mojo`, which also happens to be where the Mojo keeps the
-//! scan monoid. This port keeps the monoid in `scan.rs` (the scan form needed it
-//! first) and imports it here — the same three functions either way.
+//! SOURCES. The oracle is `glyphBake.js` (250 lines, vendored under
+//! `engine/fixtures/inputs/`). The scan monoid lives in `scan.rs` (the scan
+//! form needed it first) and is imported here — the same three functions.
 //!
 //! WHAT THE BAKE IS FOR. One streaming pass over a file produces a record that
 //! answers questions about it later WITHOUT re-folding: how many rows under an

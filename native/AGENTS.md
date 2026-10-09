@@ -40,8 +40,8 @@ the change is wrong.
 ## The layout seam
 
 Everything that lays glyphs out goes through `native/src/layout.rs`
-(the layout seam; `engine/BACKEND-PLAN.md` no longer numbers it). Read that module header before adding
-a backend or a caller; the short version:
+(the layout seam). Read that module header before adding a backend or a
+caller; the short version:
 
 - A backend takes `LayoutItem`s (bytes + `ItemParams` + `Paint` + group),
   appends instances to a caller-owned `GlyphArena`, and returns
@@ -55,20 +55,20 @@ a backend or a caller; the short version:
   otherwise until 2026-09-04 and was wrong, because `VerifyLayout` gates the
   API, not the copy. Do not widen `LayoutGlyphs` to return records.
 
-  What DID delete the copy is `Strategy::Direct` (2026-09-07): the engine writes
-  instances straight into the caller's arena, and no wire record is materialized
-  on either side of the FFI. The record strategies remain, as the verification
-  form, and `repo-verify-direct` diffs the two against each other. Run
-  `--repo-scan-only --repo-engine direct|batch|naive` for the per-stage split
-  rather than trusting a figure here; measurements and their dates live under
-  items 3 and 4 of `engine/BACKEND-PLAN.md`.
+  What DID delete the copy is the direct path: `HyperLayout::layout_items`
+  writes instances straight into the caller's arena and materializes no 32 B
+  wire record at all. The record path (`VerifyLayout`) remains as the
+  verification form, and only `--repo-verify` takes it. Run
+  `--repo-scan-only --repo-engine hyper|direct|batch|naive` for the per-stage
+  split rather than trusting a figure here.
 - `ItemParams::validate` runs in `LayoutGlyphs::layout_items`, a PROVIDED
   method. Implement `layout_validated_items`; a backend cannot forget the
   guard because it never calls it.
-- Compaction is written once (`layout::compact_records_into`) and shared by
-  every host backend, so two backends can differ about the FOLD — the thing
-  the corpus gates — and cannot differ about blanks, paint indexing, or the
-  extents.
+- Record compaction has one host reference, `layout::compact_records_into`
+  (test-only today; the CubeCL instance tail is its device replacement). It is
+  the statement of what blanks, paint indexing and the extents mean, so a
+  backend may differ about the FOLD — the thing the corpus checks — and is
+  held to this for the rest.
 - **Paint is indexed by RECORD, not by instance.** Compaction destroys the
   index that names a byte, so paint crosses the seam and is applied during
   compaction. Indexing it by instance is the tempting mistake and
@@ -77,22 +77,26 @@ a backend or a caller; the short version:
 - `--repo-verify` diffs two backends at the seam — placements and instances
   always, and records when BOTH paths have them (`layout::diff_backends`). It
   used to compare records only, which cannot see compaction, paint or extents at
-  all. Today it runs the Mojo backend's FFI strategies against each other, in
-  two gates: `repo-verify` pairs the record strategies, `repo-verify-direct`
-  pairs `Direct` against batched and reports `0 records` because the direct path
-  produces none. The CubeCL backend answers the same call (its 48 B arena is
-  reconstructed from the records and slot streams — both bit-fenced) — no gate
-  pins that pairing; the cubecl-fork gate is its fence.
+  all. Today it diffs the chosen `--repo-engine` against a recording
+  `HyperLayout` reference run; `direct` has no records and reports `0 records`.
+  The CubeCL backend answers the same call (its 48 B arena is reconstructed
+  from the records and slot streams). **No gate runs any of this any more** —
+  the `repo-verify`, `repo-verify-direct` and `cubecl-fork` gates were retired
+  on 2026-09-30 (root `AGENTS.md`, "Retired 2026-09-30"); the instruments still
+  ship and still pass.
 - **`HyperLayout` (`hyper`) is the DEFAULT layout engine** in pure Rust: a parallel,
   cache-blocked CPU layout engine using Rayon, intra-file line chunking, wrap-aware
   chunking for minified files, background pipelined prepasses, aligned 8-burst / 4-burst
   register slot emission, and zero-allocation streaming lexer coloring. Emits 32-byte
   `RenderSlot` instances in `Instanced` mode or compact 20-byte `DerivedSlot` instances
   in `Derived` mode directly into mapped GPU unified memory without intermediate copies.
-- `--repo-engine hyper|cubecl|direct|batch` selects the layout engine:
+- `--repo-engine hyper|cubecl|direct|batch|naive` selects the layout engine:
   - `hyper` (default): parallel Rust CPU layout with sub-200ms visual init.
-  - `cubecl`: experimental pure-GPU compute pipeline (Metal/WGPU; requires `--features cubecl`).
-  - `direct` / `batch`: CPU reference layout strategies for parity verification.
+  - `cubecl`: experimental pure-GPU compute pipeline (Metal/WGPU; the `cubecl` Cargo feature, default-on).
+  - `direct` / `batch` / `naive`: the same `HyperLayout`, without `hyper`'s
+    background prefetch. Under `--repo-verify`, `direct` records nothing (the
+    diff covers placements and instances only) while `batch` and `naive` take
+    the recording path; the stats line prints their readback/compaction phases.
 - `--field-mode instanced|derived` selects the glyph field mode:
   - `instanced` (32 B per glyph): precomputed 3D coordinates.
   - `derived` (20 B per glyph): compact word layout, Y/Z derived dynamically in vertex WGSL.
@@ -228,8 +232,8 @@ battery; the state handoff is note 18 in the integration notes):
   decoration. Standing (2026-09-28): glyph3d-js reads ZERO across all
   484M measure words — the fork is closed. Keep it that way: any X/Y/Z
   change re-runs this instrument on a corpus exercising m >= 3 and wrap
-  segments >= 3. STRICT mode (`GLYPH_REPO_CHECK_STRICT=1`, set by the
-  cubecl-fork gate): any measure-word bit-deviation fails, and the census
+  segments >= 3. STRICT mode (`GLYPH_REPO_CHECK_STRICT=1`, set by
+  `tools/check-cubecl.sh`): any measure-word bit-deviation fails, and the census
   denominators — m >= 3, seg >= 3, and the cluster candidate count — must
   be nonzero: an unexercised corpus is a FAIL, so the standing fixture
   cannot quietly stop covering its subjects (the fork arithmetic classes
@@ -249,19 +253,15 @@ fl/sm are diffed bit-exact against `decode_all`+`resolve_clusters`),
 `GLYPH_RECORD_CHUNK=<n>` (the repo chain's emission window size in ELEMENTS
 — the records tail only (default 16,777,216 = 512 MB); the instance tail
 has NO windows since E2b — the scatter writes the renderer-bound buffer
-directly. The cubecl-fork gate sets 60,000 so the standing fixture's
-records cross several windows (six at 319,628 records since the
-2026-09-30 cluster extension), fencing the emitter's window carry on
-an ordinary corpus; the window bases ride runtime params buffers, so every
+directly. The cubecl-fork check (`tools/check-cubecl.sh`, retired as a
+gate on 2026-09-30) sets 60,000 so the standing fixture's records cross
+several windows (six at 319,628 records), fencing the emitter's window
+carry on an ordinary corpus; the window bases ride runtime params buffers, so every
 window shares one compiled kernel — small values cost dispatches and
 4-byte uploads, nothing else),
 `GLYPH_REPO_CHECK_TAIL=records` (drops the fork check's instance/placement
 tiers — the big-corpus escape when Both mode's four simultaneous streams
-brush the memory ceiling; the gate never sets it),
-`GLYPH_ARENA_CHUNK_SLOTS=<n>` (the mapped arena's slots per chunk buffer,
-default derived from the tighter of the storage-binding and buffer-size
-limits — the MOJO direct path's knob; the cubecl endpoint allocates its
-own slot buffer and answers to no arena), and the retired
+brush the memory ceiling; the check never sets it), and the retired
 `GLYPH_FOOTPRINT_BUDGET`/`GLYPH_FOOTPRINT_*` knobs died with the hops at
 E2b (the cliff numbers and the gate's design stay readable in note 22).
 
@@ -277,10 +277,10 @@ written note in `out/`; it just does not need that template.
 
 ## Read next
 
-Module headers in `src/*.rs` carry the real contracts (cull/LOD, pick, FFI wire
-format, CLI op-stream ordering) — they are the most reliable documentation in
-this crate, because they sit next to the code they describe.
+Module headers in `src/*.rs` carry the real contracts (cull/LOD, pick, the
+32 B record / slot formats, CLI op-stream ordering) — they are the most
+reliable documentation in this crate, because they sit next to the code they
+describe.
 
 `out/` reports are design **history**, not current state; read one to learn why
-a decision was made. For the layout seam and what comes next, `engine/BACKEND-PLAN.md`;
-for the reference port's stage record, `engine/PORT-PLAN.md`.
+a decision was made.

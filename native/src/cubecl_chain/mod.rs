@@ -5,10 +5,9 @@
 //!                -> apply (rake + Blelloch + chase) -> resolveX
 //!                -> deriveStride -> paginate
 //!
-//! The note-16 phase-2 skeleton transcribed the Mojo device chain
-//! line-for-line — thread-per-chunk serial 64-byte folds, a single-thread
-//! spine — which proved the monoid but measured transcription quality, not
-//! the algorithm. This is the textbook hierarchical scan instead: each cube
+//! A thread-per-chunk shape — serial 64-byte folds, a single-thread spine —
+//! proves the monoid but measures transcription quality, not the
+//! algorithm. This is the textbook hierarchical scan instead: each cube
 //! owns a `units x rake`-byte tile; every unit rakes its `rake` bytes into
 //! one monoid element; a workgroup Blelloch scan over the per-unit partials
 //! (shared memory, `sync_cube` between rounds) produces exclusive prefixes;

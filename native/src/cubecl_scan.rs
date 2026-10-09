@@ -4,8 +4,8 @@
 //! `p_store` as one CubeCL `chunk_reduce` (thread per 64-byte chunk), with
 //! the chunk partials diffed BIT-EXACT against the in-process CPU reference
 //! — `scan.rs`'s `scan_leaf_value`/`scan_combine`, the same monoid already
-//! proven against the JS oracle. No Mojo in the loop: the validation chain
-//! here is fixtures -> scan.rs (Rust, CPU) -> this kernel (Rust, GPU).
+//! proven against the JS oracle. The validation chain here is
+//! fixtures -> scan.rs (Rust, CPU) -> this kernel (Rust, GPU).
 //!
 //! Scope, deliberately: single-item fixtures, decode on CPU (the bench's
 //! "mode 0" shape). A HISTORICAL instrument: the phase-1 first kernel,
@@ -41,8 +41,8 @@ const WRAP_BACK: i32 = 1;
 
 /// Thread per chunk: the serial combine of one-byte leaves over the chunk,
 /// partial lanes out. A line-for-line transcription of `leaf_of` +
-/// `scan_combine` (leaf-specialized exactly like the Mojo device twin's —
-/// chunk reduce only ever combines LEAVES, so b.rows is always 0).
+/// `scan_combine`, leaf-specialized: chunk reduce only ever combines LEAVES,
+/// so b.rows is always 0.
 #[cube(launch_unchecked)]
 fn chunk_reduce(
     fl: &[u32],

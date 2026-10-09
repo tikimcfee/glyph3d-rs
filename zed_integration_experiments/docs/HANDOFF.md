@@ -47,10 +47,9 @@ providers use content-hash versions (identity == version for static bytes).
 - `repo::load_items` — the loader proper; disk walks and caller-owned
   content (envelope bytes) are the same pipeline. `WalkResult::from_files`
   is the in-memory entry.
-- `repo::rederive_cached` — ONE Engine + trie per THREAD (`thread_local`,
-  keyed by trie path). The FFI resets its arena per `load_item`
-  ("reuse the arena across loads", ffi.mojo); `Engine::new` + trie parse is
-  ~120 ms, the record walk is microseconds.
+- `repo::rederive_cached` — stateless: `layout_hyper::rederive_item_records`
+  over the process-wide trie (`default_trie()`, parsed once and shared), so
+  a re-derive pays only the layout of that one file, never a setup cost.
 - `GlyphScene::apply_surface_updates` — the seam's consumer; the style walk
   is COALESCED (full 48 B instances rebuilt per contiguous slot run,
   RecolorLine's pattern — one `write_buffer` per glyph is ~15 µs of wgpu
