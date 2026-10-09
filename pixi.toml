@@ -6,22 +6,16 @@ platforms = ["osx-arm64", "linux-64"]
 version = "0.1.0"
 
 # The artifact/gate graph is declared in build.toml and executed by
-# `glyph` (glyph/src/main.rs). These tasks are entry points over it; depends-on is used
-# where pixi can see an edge (it cannot see that cargo links the dylib —
-# build.toml's [artifact.renderer] inputs can).
+# `glyph` (glyph/src/main.rs). These tasks are thin doors onto it, plus the
+# generators; the one thing pixi supplies that nothing else does is the
+# fontTools env the emoji generators run in (build.toml's emoji-sheet check).
 [tasks]
-# pixi's job is the TOOLCHAIN (mojo/max). The build tool is `cargo glyph` —
-# see glyph/src/main.rs. These are thin doors to it so that `pixi run check`
-# keeps working and so build-engine has somewhere to live.
 glyph = "cargo glyph"
 build = "cargo glyph build"
 check = "cargo glyph test"
 check-all = "cargo glyph test"
 verify = "cargo glyph test --frozen"
 prove = "cargo glyph prove"
-suites = "./engine/check.sh cpu"
-suites-gpu = "./engine/check.sh gpu"
-suites-all = "./engine/check.sh all"
 gen-trie = "python3 tools/gen_real_trie.py"
 gen-schema = "python3 tools/gen_schema.py"
 check-gen = { cmd = "python3 tools/gen_real_trie.py --verify-only && python3 tools/gen_schema.py --check" }
@@ -29,15 +23,6 @@ check-gen = { cmd = "python3 tools/gen_real_trie.py --verify-only && python3 too
 # THIS env (pinned below) rather than whatever the host's python3 has.
 emoji-inventory = "python tools/emoji_inventory.py"
 gen-emoji-sheet = "python tools/gen_emoji_sheet.py"
-# The shared library is `.dylib` on macOS and `.so` on Linux; the build tool
-# and `native/build.rs` resolve the name by platform (see build.toml, `{dylib}`).
-# macOS needs install_name_tool so the binary can find it through @rpath;
-# Linux records the soname from the filename and needs nothing.
-build-engine = "pixi run mojo build --fp-mode contract=off -I engine engine/ffi.mojo -o native/libglyph_engine.dylib --emit shared-lib && install_name_tool -id @rpath/libglyph_engine.dylib native/libglyph_engine.dylib"
-build-native = { cmd = "cargo build --release", cwd = "native", depends-on = ["build-engine"] }
-
-[target.linux-64.tasks]
-build-engine = "pixi run mojo build --fp-mode contract=off -I engine engine/ffi.mojo -o native/libglyph_engine.so --emit shared-lib"
 
 [dependencies]
 # Capped WITHIN the 26.6/1.1 stable family: a deliberate `pixi update` may move

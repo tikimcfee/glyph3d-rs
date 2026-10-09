@@ -11,11 +11,8 @@ target/
 *.so
 *.dll
 *.rlib
-out/bench-mojo
-out/ffi_selftest
 
-# Mojo / Python
-*.mojopkg
+# Python
 __pycache__/
 *.pyc
 

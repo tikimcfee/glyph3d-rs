@@ -101,6 +101,14 @@ build = "cd engine/fixtures && node gen.mjs && node gen-bake.mjs"
 counts = { "pipe" = 26, "bake" = 8 }
 note = "The Rust-side corpus pins (fixture.rs / bake.rs, 'update deliberately') stay; they and these declared counts are two independent witnesses, not duplicates."
 
+[artifact.glyph-schema]
+class = "committed"
+outputs = ["engine/glyph_schema.mjs"]
+inputs = ["tools/gen_schema.py", "schema/glyph-identity.json"]
+build = "python3 tools/gen_schema.py"
+verify_cmd = "python3 tools/gen_schema.py --check"
+note = "The fixture format lanes gen.mjs writes, generated from the schema; --check also runs the schema's own invariant validation. Ungated from the Mojo retirement until 2026-10-09: the generator still emitted a .mojo half whose committed file was gone, so --check was red and no artifact declared it."
+
 [artifact.emoji-corpus]
 class = "committed"
 outputs = ["native/fixtures/emoji-corpus-small.txt", "native/fixtures/emoji-corpus-large.txt"]
@@ -230,7 +238,7 @@ blind_to = "whether the declared inputs are the RIGHT ones — it proves a patte
 [[gate]]
 name = "committed-artifacts"
 scope = "corpus"
-kind = "verify-committed"   # emoji-sheet, cluster-classes, emoji-corpus, engine-trie, atlas, fixtures
+kind = "verify-committed"   # glyph-schema, emoji-sheet, cluster-classes, emoji-corpus, engine-trie, atlas, fixtures
 needs = []
 compare = "each committed artifact rebuilt (scratch or generator check mode) vs its committed bytes"
 blind_to = "whether the INPUTS are right — reproducibility, not truth"
@@ -368,6 +376,15 @@ file = "assets/atlas/cluster-classes.bin"
 op = "append"
 arg = " "
 expect = "differs from a fresh bake"
+
+[[mutation]]
+name = "glyph-schema-byte"
+gate = "committed-artifacts"
+why = "the fixture generators import their lane order from this generated file; a hand-edit must not survive a regeneration, or the corpus and the schema drift apart silently. CONSUMED BY: gen_schema.py --check via the glyph-schema artifact"
+file = "engine/glyph_schema.mjs"
+op = "append"
+arg = " "
+expect = "DRIFT"
 
 [[mutation]]
 name = "emoji-corpus-byte"
