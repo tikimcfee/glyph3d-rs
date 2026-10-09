@@ -96,6 +96,7 @@ pub(super) fn render_scene(
             eye: frame.eye.as_dvec3(),
             vp_rel: frame.view_proj_rel,
             far: frame.far,
+            fit: scene.fit,
         };
         let ground_y = scene.environment.ground_y(scene.scene_min_y);
         scene.environment.write(&ctx.queue, &env_cam, ground_y);

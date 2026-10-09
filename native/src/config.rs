@@ -190,10 +190,12 @@ pub struct EnvironmentSettings {
     /// `line_fade_start_px` on screen, and gone at `line_fade_end_px`.
     pub line_fade_start_px: f32,
     pub line_fade_end_px: f32,
-    /// Fog toward the horizon colour, by distance from the eye (world units).
-    /// The end is also capped at `fog_far_fraction` of the far plane.
-    pub fog_start: f32,
-    pub fog_end: f32,
+    /// Fog toward the horizon colour, by distance from the eye, in multiples
+    /// of the scene's fit distance (fixed per scene, so it scales with the
+    /// content and never moves with the camera). The end is also capped at
+    /// `fog_far_fraction` of the far plane.
+    pub fog_start_fit: f32,
+    pub fog_end_fit: f32,
     pub fog_far_fraction: f32,
     pub ground_color: [f32; 3],
     /// RGBA: alpha is the line's strength over the ground.

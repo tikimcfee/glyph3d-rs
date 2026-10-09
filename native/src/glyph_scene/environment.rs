@@ -50,6 +50,8 @@ pub(super) struct EnvCamera {
     pub(super) vp_rel: Mat4,
     /// The frame's far plane distance (the fog ends before it).
     pub(super) far: f32,
+    /// The scene's fit distance: the unit the fog is measured in.
+    pub(super) fit: f32,
 }
 
 pub(super) struct Environment {
@@ -186,7 +188,7 @@ fn uniform(cam: &EnvCamera, ground_y: f32) -> EnvUniform {
     };
     let [mx, mz] = phase(e.minor_spacing);
     let [jx, jz] = phase(e.major_spacing);
-    let fog_end = e.fog_end.min(cam.far * e.fog_far_fraction);
+    let fog_end = (e.fog_end_fit * cam.fit).min(cam.far * e.fog_far_fraction);
     let rgb1 = |c: [f32; 3], a: f32| [c[0], c[1], c[2], a];
     EnvUniform {
         inv_vp_rel: cam.vp_rel.inverse().to_cols_array(),
@@ -194,7 +196,7 @@ fn uniform(cam: &EnvCamera, ground_y: f32) -> EnvUniform {
         eye: [cam.eye.x as f32, cam.eye.y as f32, cam.eye.z as f32, ground_y],
         grid_origin: [mx, mz, jx, jz],
         spacing: [e.minor_spacing, e.major_spacing, e.line_width_px, e.axis_width_px],
-        fade: [e.fog_start.min(fog_end), fog_end, e.line_fade_start_px, e.line_fade_end_px],
+        fade: [(e.fog_start_fit * cam.fit).min(fog_end), fog_end, e.line_fade_start_px, e.line_fade_end_px],
         ground: rgb1(e.ground_color, 1.0),
         minor_line: e.minor_line_color,
         major_line: e.major_line_color,
@@ -222,6 +224,7 @@ mod tests {
             eye: DVec3::new(12_345.678, 50.0, -98_765.4321),
             vp_rel: Mat4::IDENTITY,
             far: 100_000.0,
+            fit: 50.0,
         };
         let u = uniform(&cam, 0.0);
         let minor = crate::config::settings().environment.minor_spacing as f64;
