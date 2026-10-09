@@ -384,6 +384,7 @@ impl App<'_> {
                 session_filter_text: String::new(),
                 session_filter_harness: crate::agent_transcript::discovery::SessionHarnessFilter::All,
                 discovered_sessions: None,
+                session_dirs_report: String::new(),
             })
         } else {
             None

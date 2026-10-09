@@ -200,21 +200,10 @@ impl FocusField {
 /// with its own corpora lists them under `repo_presets` in its launch config.
 pub const DEFAULT_REPO_PRESETS: &[&str] = &[".", "native/fixtures/g-pick-repo"];
 
-/// Expand a leading `~` to `$HOME`. Paths in `launch_config.toml` are written
-/// by hand, so they get the same shorthand the renderer accepts.
-fn expand_home(path: &str) -> PathBuf {
-    let home = || std::env::var_os("HOME").map(PathBuf::from);
-    if path == "~" {
-        if let Some(h) = home() {
-            return h;
-        }
-    } else if let Some(rest) = path.strip_prefix("~/") {
-        if let Some(h) = home() {
-            return h.join(rest);
-        }
-    }
-    PathBuf::from(path)
-}
+use glyph_session_dirs::{Harness, SessionDir};
+
+/// Most-recent transcripts the launcher offers on the session field.
+const SESSION_PICKS: usize = 20;
 
 #[derive(Debug, Deserialize, Default)]
 struct FileLaunchConfig {
@@ -233,6 +222,7 @@ struct FileLaunchConfig {
     repo_presets: Option<Vec<String>>,
     claude_projects_dir: Option<String>,
     antigravity_brain_dir: Option<String>,
+    kimi_sessions_dir: Option<String>,
 }
 
 pub struct LauncherState {
@@ -258,65 +248,66 @@ pub struct LauncherState {
     pub config_source: Option<String>,
     /// What ◄/► cycles through on the repo field.
     pub repo_presets: Vec<String>,
-    /// Where session discovery looks. Config-driven only: with neither set,
-    /// the launcher discovers nothing and the session field is typed by hand.
-    pub claude_projects_dir: Option<PathBuf>,
-    pub antigravity_brain_dir: Option<PathBuf>,
+    /// Per-app session locations from the launch config (unset = app default,
+    /// empty = off). Resolved into `session_dirs` by `load_config_file`.
+    pub session_overrides: glyph_session_dirs::Overrides,
+    /// Where session discovery looks. Empty in `defaults()`, so tests never
+    /// scan the machine; `new()` resolves it against this machine.
+    pub session_dirs: Vec<SessionDir>,
 }
 
 impl LauncherState {
+    /// The newest transcripts across every resolved session directory, newest
+    /// first. Each harness lays its transcripts out differently:
+    /// - Claude Code: `<root>/<project>/<id>.jsonl`
+    /// - Antigravity: `<root>/<id>/.system_generated/logs/transcript.jsonl`
+    /// - Kimi Code:   `<root>/<workspace>/<session>/agents/main/wire.jsonl`
     pub fn discover_agent_sessions(&self) -> Vec<String> {
-        let mut sessions = Vec::new();
-
-        // 1. Antigravity brain transcripts
-        if let Some(Ok(entries)) = self.antigravity_brain_dir.as_ref().map(std::fs::read_dir) {
-            let mut found = Vec::new();
-            for entry in entries.flatten() {
-                let transcript = entry.path().join(".system_generated/logs/transcript.jsonl");
-                if transcript.is_file() {
-                    if let Ok(meta) = transcript.metadata() {
-                        if let Ok(mtime) = meta.modified() {
-                            found.push((mtime, transcript));
+        let subdirs = |dir: &std::path::Path| -> Vec<PathBuf> {
+            std::fs::read_dir(dir)
+                .map(|it| it.flatten().map(|e| e.path()).filter(|p| p.is_dir()).collect())
+                .unwrap_or_default()
+        };
+        let mut transcripts = Vec::new();
+        for dir in &self.session_dirs {
+            match dir.harness {
+                Harness::ClaudeCode => {
+                    for project in subdirs(&dir.path) {
+                        if let Ok(files) = std::fs::read_dir(&project) {
+                            transcripts.extend(
+                                files
+                                    .flatten()
+                                    .map(|f| f.path())
+                                    .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("jsonl")),
+                            );
                         }
                     }
                 }
-            }
-            found.sort_by_key(|a| std::cmp::Reverse(a.0));
-            for (_, p) in found.into_iter().take(10) {
-                sessions.push(p.display().to_string());
-            }
-        }
-
-        // 2. Claude projects transcripts
-        if let Some(Ok(entries)) = self.claude_projects_dir.as_ref().map(std::fs::read_dir) {
-            let mut found = Vec::new();
-            for entry in entries.flatten() {
-                if entry.path().is_dir() {
-                    if let Ok(files) = std::fs::read_dir(entry.path()) {
-                        for f in files.flatten() {
-                            if f.path().extension().and_then(|s| s.to_str()) == Some("jsonl") {
-                                if let Ok(meta) = f.metadata() {
-                                    if let Ok(mtime) = meta.modified() {
-                                        found.push((mtime, f.path()));
-                                    }
-                                }
-                            }
-                        }
+                Harness::Antigravity => transcripts.extend(
+                    subdirs(&dir.path)
+                        .into_iter()
+                        .map(|conv| conv.join(".system_generated/logs/transcript.jsonl")),
+                ),
+                Harness::KimiCode => {
+                    for workspace in subdirs(&dir.path) {
+                        transcripts.extend(
+                            subdirs(&workspace).into_iter().map(|s| s.join("agents/main/wire.jsonl")),
+                        );
                     }
                 }
             }
-            found.sort_by_key(|a| std::cmp::Reverse(a.0));
-            for (_, p) in found.into_iter().take(10) {
-                sessions.push(p.display().to_string());
-            }
         }
-
-        sessions
+        let mut found: Vec<_> = transcripts
+            .into_iter()
+            .filter_map(|p| Some((p.metadata().ok().filter(|m| m.is_file())?.modified().ok()?, p)))
+            .collect();
+        found.sort_by_key(|a| std::cmp::Reverse(a.0));
+        found.into_iter().take(SESSION_PICKS).map(|(_, p)| p.display().to_string()).collect()
     }
 
-    /// True when the launch config names at least one session directory.
-    pub fn has_session_dirs(&self) -> bool {
-        self.claude_projects_dir.is_some() || self.antigravity_brain_dir.is_some()
+    /// One line: which session directories are scanned, and why.
+    pub fn session_dirs_report(&self) -> String {
+        glyph_session_dirs::describe(&self.session_dirs)
     }
 
     /// The launcher with built-in defaults only: reads no file, scans no
@@ -344,8 +335,8 @@ impl LauncherState {
             status_message: "Ready to launch".to_string(),
             config_source: None,
             repo_presets: DEFAULT_REPO_PRESETS.iter().map(|p| p.to_string()).collect(),
-            claude_projects_dir: None,
-            antigravity_brain_dir: None,
+            session_overrides: glyph_session_dirs::Overrides::default(),
+            session_dirs: Vec::new(),
         }
     }
 
@@ -423,16 +414,20 @@ impl LauncherState {
                         }
                         if let Some(asess) = cfg.agent_session {
                             if !asess.trim().is_empty() {
-                                self.session_path = expand_home(&asess).display().to_string();
+                                self.session_path = glyph_session_dirs::expand_home(std::path::Path::new(&asess))
+                                    .display()
+                                    .to_string();
                             }
                         }
                         if let Some(presets) = cfg.repo_presets {
                             self.repo_presets = presets;
                         }
-                        self.claude_projects_dir =
-                            cfg.claude_projects_dir.as_deref().map(expand_home);
-                        self.antigravity_brain_dir =
-                            cfg.antigravity_brain_dir.as_deref().map(expand_home);
+                        self.session_overrides = glyph_session_dirs::Overrides {
+                            claude: cfg.claude_projects_dir.map(PathBuf::from),
+                            antigravity: cfg.antigravity_brain_dir.map(PathBuf::from),
+                            kimi: cfg.kimi_sessions_dir.map(PathBuf::from),
+                        };
+                        self.session_dirs = glyph_session_dirs::resolve(&self.session_overrides);
                         self.config_source = Some(path.display().to_string());
                         self.status_message = format!("Loaded defaults from {}", path.display());
                         return;
@@ -441,6 +436,8 @@ impl LauncherState {
             }
         }
         self.config_source = None;
+        self.session_overrides = glyph_session_dirs::Overrides::default();
+        self.session_dirs = glyph_session_dirs::resolve(&self.session_overrides);
     }
 
     pub fn build_cli_args(&self) -> Vec<String> {
@@ -638,12 +635,10 @@ impl LauncherState {
     }
 
     fn no_sessions_message(&self) -> String {
-        if self.has_session_dirs() {
-            "No transcripts found in the configured session directories".to_string()
+        if self.session_dirs.is_empty() {
+            self.session_dirs_report()
         } else {
-            "No session directories configured: set claude_projects_dir or \
-             antigravity_brain_dir in launch_config.toml"
-                .to_string()
+            format!("No transcripts in: {}", self.session_dirs_report())
         }
     }
 
@@ -1551,6 +1546,10 @@ fn draw_sidebar(f: &mut Frame, area: Rect, state: &LauncherState, manifest: &Man
             Span::styled("Status:       ", Style::default().fg(Color::DarkGray)),
             Span::styled(&state.status_message, Style::default().fg(Color::Cyan)),
         ]),
+        Line::from(vec![
+            Span::styled("Sessions:     ", Style::default().fg(Color::DarkGray)),
+            Span::styled(state.session_dirs_report(), Style::default().fg(Color::White)),
+        ]),
     ];
 
     let block = Block::default()
@@ -1796,18 +1795,31 @@ mod tests {
     }
 
     #[test]
-    fn test_session_discovery_is_config_driven() {
+    fn test_session_discovery_reads_each_harness_layout() {
         let mut state = LauncherState::defaults();
-        assert!(!state.has_session_dirs());
+        assert!(state.session_dirs.is_empty());
         assert!(state.discover_agent_sessions().is_empty());
 
         let root = std::env::temp_dir().join(format!("glyph-tui-sessions-{}", std::process::id()));
-        let project = root.join("claude/some-project");
-        std::fs::create_dir_all(&project).unwrap();
-        std::fs::write(project.join("s.jsonl"), "{}\n").unwrap();
-        state.claude_projects_dir = Some(root.join("claude"));
-        let found = state.discover_agent_sessions();
-        assert_eq!(found, vec![project.join("s.jsonl").display().to_string()]);
+        let claude = root.join("claude/some-project/s.jsonl");
+        let agy = root.join("agy/conv-1/.system_generated/logs/transcript.jsonl");
+        let kimi = root.join("kimi/wd_p_1/session_2/agents/main/wire.jsonl");
+        for f in [&claude, &agy, &kimi] {
+            std::fs::create_dir_all(f.parent().unwrap()).unwrap();
+            std::fs::write(f, "{}\n").unwrap();
+        }
+        let dir = |harness, sub: &str| SessionDir {
+            harness,
+            path: root.join(sub),
+            origin: glyph_session_dirs::Origin::Config,
+        };
+        state.session_dirs =
+            vec![dir(Harness::ClaudeCode, "claude"), dir(Harness::Antigravity, "agy"), dir(Harness::KimiCode, "kimi")];
+        let mut found = state.discover_agent_sessions();
+        found.sort();
+        let mut want: Vec<String> = [&claude, &agy, &kimi].iter().map(|p| p.display().to_string()).collect();
+        want.sort();
+        assert_eq!(found, want);
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -1816,15 +1828,14 @@ mod tests {
         let cfg: FileLaunchConfig = toml::from_str(
             "repo_presets = [\".\", \"../corpus\"]\n\
              claude_projects_dir = \"/x/claude\"\n\
-             antigravity_brain_dir = \"~/brain\"\n",
+             antigravity_brain_dir = \"~/brain\"\n\
+             kimi_sessions_dir = \"\"\n",
         )
         .unwrap();
         assert_eq!(cfg.repo_presets, Some(vec![".".to_string(), "../corpus".to_string()]));
         assert_eq!(cfg.claude_projects_dir.as_deref(), Some("/x/claude"));
-        assert_eq!(expand_home("/x/claude"), PathBuf::from("/x/claude"));
-        if let Some(home) = std::env::var_os("HOME") {
-            assert_eq!(expand_home("~/brain"), PathBuf::from(home).join("brain"));
-        }
+        assert_eq!(cfg.antigravity_brain_dir.as_deref(), Some("~/brain"));
+        assert_eq!(cfg.kimi_sessions_dir.as_deref(), Some(""));
     }
 
     #[test]

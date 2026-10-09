@@ -494,3 +494,9 @@ benchmark question for the 5090 box, not a cleanliness one.
 - Proof: full battery green except pixel-ab, which is red on the same nine views
   as before; all nine renders are byte-identical to main@872621d built in
   scratch. cargo-test 225 over 13 binaries, floor raised 222 → 225.
+- **Superseded the same day:** discovery now falls back to each app's default
+  locations (Claude Code, Antigravity desktop + CLI, Kimi Code) when the config
+  is silent; a configured path still wins per app, and `""` turns an app off.
+  One table in `crates/glyph-session-dirs`, shared by the renderer and the
+  launcher, and both report what they scanned. Kimi Code transcripts gained a
+  parser (`agent_transcript/kimi.rs`). Renders still byte-identical to main.

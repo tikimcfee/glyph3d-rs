@@ -466,6 +466,7 @@ impl WindowState {
             let session_filter_text = &mut egui.session_filter_text;
             let session_filter_harness = &mut egui.session_filter_harness;
             let discovered_sessions = &mut egui.discovered_sessions;
+            let session_dirs_report = &mut egui.session_dirs_report;
             // The layout dial's apply signal: the panel's slider sets it on
             // release; the RedrawRequested arm consumes it and rebuilds.
             let pending_relayout = &mut self.pending_relayout;
@@ -1056,8 +1057,9 @@ impl WindowState {
 
                 if *session_browser_open {
                     if discovered_sessions.is_none() {
-                        let cfg = crate::launch_config::LaunchConfig::load_or_default();
-                        *discovered_sessions = Some(crate::agent_transcript::scan_agent_sessions(&cfg));
+                        let dirs = crate::launch_config::LaunchConfig::load_or_default().session_dirs();
+                        *session_dirs_report = glyph_session_dirs::describe(&dirs);
+                        *discovered_sessions = Some(crate::agent_transcript::discovery::scan_session_dirs(&dirs));
                     }
 
                     egui::Window::new("Agent Sessions (F7)")
@@ -1078,8 +1080,9 @@ impl WindowState {
                                     session_filter_text.clear();
                                 }
                                 if ui.button("⟳ Refresh").clicked() {
-                                    let cfg = crate::launch_config::LaunchConfig::load_or_default();
-                                    *discovered_sessions = Some(crate::agent_transcript::scan_agent_sessions(&cfg));
+                                    let dirs = crate::launch_config::LaunchConfig::load_or_default().session_dirs();
+                                    *session_dirs_report = glyph_session_dirs::describe(&dirs);
+                                    *discovered_sessions = Some(crate::agent_transcript::discovery::scan_session_dirs(&dirs));
                                 }
                             });
 
@@ -1100,8 +1103,14 @@ impl WindowState {
                                     crate::agent_transcript::discovery::SessionHarnessFilter::Antigravity,
                                     "Antigravity",
                                 );
+                                ui.selectable_value(
+                                    session_filter_harness,
+                                    crate::agent_transcript::discovery::SessionHarnessFilter::KimiCode,
+                                    "Kimi",
+                                );
                             });
                             ui.separator();
+                            ui.small(format!("Scanning: {session_dirs_report}"));
 
                             let Some(all_sessions) = discovered_sessions.as_ref() else {
                                 ui.label("No sessions scanned yet.");
@@ -1109,8 +1118,9 @@ impl WindowState {
                             };
                             if all_sessions.is_empty() {
                                 ui.label(
-                                    "No sessions found. Discovery scans only the directories named by \
-                                     claude_projects_dir and antigravity_brain_dir in launch_config.toml.",
+                                    "No sessions found in those directories. Point claude_projects_dir, \
+                                     antigravity_brain_dir or kimi_sessions_dir in launch_config.toml \
+                                     elsewhere, or set one to \"\" to skip that app.",
                                 );
                                 return;
                             }
@@ -1126,6 +1136,9 @@ impl WindowState {
                                         }
                                         crate::agent_transcript::discovery::SessionHarnessFilter::Antigravity => {
                                             s.harness == crate::agent_transcript::types::HarnessKind::Antigravity
+                                        }
+                                        crate::agent_transcript::discovery::SessionHarnessFilter::KimiCode => {
+                                            s.harness == crate::agent_transcript::types::HarnessKind::KimiCode
                                         }
                                     }
                                 })
