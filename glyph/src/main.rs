@@ -12,10 +12,9 @@
 //! organised around what you just changed. The gates still exist — they are an
 //! implementation detail behind `test`, and `glyph gates` prints them.
 //!
-//! `test` BUILDS what it needs, because that is the iterating intent and
-//! because `cargo build` does not build the Mojo dylib — a stale artifact
-//! silently tests the wrong engine, which has cost this repo a day and a bogus
-//! bisect. `test --frozen` is the other intent: assert everything is already
+//! `test` BUILDS what it needs, because that is the iterating intent — a stale
+//! artifact silently tests the wrong build, which has cost this repo a day and
+//! a bogus bisect. `test --frozen` is the other intent: assert everything is already
 //! current and fail if it is not. A check that silently rebuilds can never tell
 //! you your commit was incomplete.
 //!
@@ -97,7 +96,6 @@ enum Kind {
     Cmd,
     Cargo,
     CargoTest,
-    EngineCheck,
     GoldenVerify,
     RepoVerify,
 }
@@ -107,10 +105,10 @@ enum Kind {
 #[serde(rename_all = "lowercase")]
 #[clap(rename_all = "lowercase")]
 enum Scope {
-    // `engine` (engine/*.mojo and the FFI) retired with the Mojo engine: no
-    // gate carried it, so `glyph test engine` ran nothing and printed ALL
-    // GATES GREEN (measured 2026-10-09). cmd_test now refuses an empty
-    // selection, so a scope that loses its last gate cannot do that again.
+    // A fourth scope, `engine`, outlived its last gate: `glyph test engine`
+    // ran nothing and printed ALL GATES GREEN (measured 2026-10-09). cmd_test
+    // now refuses an empty selection, so a scope that loses its last gate
+    // cannot do that again.
     /// Rust code: native/, crates/, glyph/
     Rust,
     /// layout, shaders, anything that moves a pixel
@@ -129,9 +127,6 @@ struct Gate {
     needs: Vec<String>,
     cmd: Option<String>,
     pass_line: Option<String>,
-    /// engine-check: the inputs to diff. Declared, not hardcoded in the runner.
-    #[serde(default)]
-    targets: Vec<String>,
     /// repo-verify: the wrap modes `cmd`'s {mode} is substituted with.
     #[serde(default)]
     modes: Vec<String>,
@@ -200,8 +195,8 @@ fn step(msg: &str) {
 // ── products: current, or not ────────────────────────────────────────────
 
 /// A product's currency is the hash of its inputs' CONTENT, not their mtimes.
-/// mtime is what cargo uses for the dylib edge, and it is why `cargo build`
-/// happily links an engine built from different source.
+/// mtime is the wrong signal: a checkout, a stash or a copy moves mtimes
+/// without moving content, and the reverse.
 fn input_digest(a: &Artifact) -> String {
     let mut h = Sha256::new();
     for pat in &a.inputs {
@@ -694,8 +689,7 @@ fn gate_cargo_test(m: &Manifest) -> bool {
         println!("{l}");
     }
     if !good {
-        // Name the failing tests — the engine-check gate's failure path
-        // carries the same note: printing only the summary discards WHY it
+        // Name the failing tests: printing only the summary discards WHY it
         // reddened, and a mutation's `expect` needs the reason in the text.
         for l in out.lines().filter(|l| l.contains("FAILED") || l.starts_with("panicked")) {
             println!("      {l}");
@@ -727,28 +721,6 @@ fn gate_cargo_test(m: &Manifest) -> bool {
         println!("NOTE  the floor is behind: raise test_floor to {total} in build.toml");
     }
     true
-}
-
-fn gate_engine_check(g: &Gate) -> bool {
-    let mut ok = true;
-    for target in &g.targets {
-        let (_, out) = sh(&format!("../target/release/glyph3d-native --engine-check {target}"), &native());
-        let lines: Vec<&str> = out.lines().collect();
-        let hit = lines.iter().find(|l| l.contains("engine-check PASS")).copied();
-        println!("{}", hit.unwrap_or_else(|| lines.last().copied().unwrap_or("")));
-        if hit.is_some() {
-            println!("PASS  engine-check ({target})");
-        } else {
-            // The record diff is the interesting part on failure; printing only
-            // the summary discarded WHY it reddened before anything could read it.
-            for l in lines.iter().rev().skip(1).take(10).collect::<Vec<_>>().into_iter().rev() {
-                println!("      {l}");
-            }
-            println!("FAIL  engine-check ({target})");
-            ok = false;
-        }
-    }
-    ok
 }
 
 fn gate_repo_verify(g: &Gate) -> bool {
@@ -872,7 +844,6 @@ fn run_gate(g: &Gate, m: &Manifest) -> bool {
         Kind::Cmd => gate_cmd(g),
         Kind::Cargo => gate_cargo(g),
         Kind::CargoTest => gate_cargo_test(m),
-        Kind::EngineCheck => gate_engine_check(g),
         Kind::GoldenVerify => verify_golden(m),
         Kind::RepoVerify => gate_repo_verify(g),
     }
@@ -978,13 +949,6 @@ fn validate(m: &Manifest) -> Vec<String> {
                     g.name
                 ));
             }
-        }
-        if g.kind == Kind::EngineCheck && g.targets.is_empty() {
-            p.push(format!(
-                "gate {} is kind=engine-check but declares no targets; it would diff \
-                 nothing and report success",
-                g.name
-            ));
         }
         if g.kind == Kind::RepoVerify && (g.cmd.is_none() || g.modes.is_empty()) {
             p.push(format!(
@@ -1267,7 +1231,7 @@ fn cmd_prove(
             if !good {
                 println!("FATAL {} — restore rebuild FAILED. The tree now has original", mu.name);
                 println!("      sources and a stale artifact; every later check would test the");
-                println!("      wrong binary. Run: pixi run build-engine");
+                println!("      wrong binary. Run: cargo glyph build");
                 println!("      {}", out.lines().last().unwrap_or(""));
                 return false;
             }
@@ -1327,7 +1291,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Bring the runnable binary and the engine dylib up to date.
+    /// Bring the renderer and the committed artifacts up to date.
     Build,
     /// Run the checks. No scope runs all of them.
     Test {
@@ -1374,22 +1338,10 @@ enum Cmd {
     Tui,
 }
 
-/// The engine shared library's extension on THIS host: `dylib` on macOS, `so`
-/// on Linux. build.toml names it `native/libglyph_engine.{dylib}` and the
-/// token is resolved here, once, so every path the runner stats or hashes is
-/// the real file. Same idiom as `{scratch}` and `{mode}`.
-fn dylib_ext() -> &'static str {
-    if cfg!(target_os = "macos") {
-        "dylib"
-    } else {
-        "so"
-    }
-}
-
 /// This host's golden-set key (`<backend>-<vendor>`), asked of the renderer
 /// ONCE. `None` when the renderer is not built or refused to answer — a
-/// caller that needs it says which. Not resolved at manifest load like
-/// `{dylib}`: the answer needs the product that `build` is about to make.
+/// caller that needs it says which. Not resolved at manifest load: the
+/// answer needs the product that `build` is about to make.
 pub(crate) fn gpu_key() -> Option<&'static str> {
     static KEY: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
     KEY.get_or_init(|| {
@@ -1431,14 +1383,7 @@ fn resolve_gpu(path: &str) -> Option<String> {
 fn load() -> Result<Manifest, String> {
     let p = root().join("build.toml");
     let text = std::fs::read_to_string(&p).map_err(|e| format!("{}: {e}", p.display()))?;
-    let mut m: Manifest = toml::from_str(&text)
-        .map_err(|e| format!("build.toml is not valid against the schema:\n{e}"))?;
-    for a in m.artifact.values_mut() {
-        for p in a.outputs.iter_mut().chain(a.inputs.iter_mut()) {
-            *p = p.replace("{dylib}", dylib_ext());
-        }
-    }
-    Ok(m)
+    toml::from_str(&text).map_err(|e| format!("build.toml is not valid against the schema:\n{e}"))
 }
 
 fn cmd_test(m: &Manifest, scope: Option<Scope>, frozen: bool) -> bool {

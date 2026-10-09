@@ -1,7 +1,7 @@
 #!/bin/bash
 # check-all.sh — kept as the historical entry point. The tool is `glyph`:
 #
-#   cargo glyph build          bring the binary and engine dylib up to date
+#   cargo glyph build          bring the renderer and committed artifacts up to date
 #   cargo glyph test [scope]   run the checks (rust | render | corpus)
 #   cargo glyph test --frozen  assert currency instead of building — use this to
 #                              validate a commit, so a forgotten rebuild fails
