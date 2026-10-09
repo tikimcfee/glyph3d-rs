@@ -122,37 +122,37 @@ impl ChunkSources<'_> {
     }
 }
 
+/// A slot-storage buffer in Metal unified memory, created mapped, and the
+/// host address of its first byte. The mapping lives as long as the buffer
+/// (Metal's hal `unmap_buffer` is a no-op), so the caller writes slots
+/// through the pointer before the buffer is first read on the GPU timeline.
+///
+/// The one copy of this for the field's direct upload and HyperLayout's
+/// unified-memory emission (`layout_hyper/device_alloc.rs`), which built the
+/// same buffer twice until C1. MAP_READ makes wgpu-hal choose
+/// StorageModeShared; COPY_DST/COPY_SRC serve the per-slot edits and the
+/// slot-dump readback. Metal hosts only — the caller gates on the adapter
+/// profile.
 #[cfg(target_os = "macos")]
-#[inline]
-fn upload_direct_metal<T: Transcode>(
-    device: &wgpu::Device,
-    label: &str,
-    chunk: &ChunkSources<'_>,
-    transcode: &T,
-) -> wgpu::Buffer {
+pub fn create_mapped_slot_buffer(device: &wgpu::Device, size: u64, label: &str) -> (*mut u8, wgpu::Buffer) {
     use wgpu::hal::Device as HalDevice;
-    let hal_usage = wgpu::BufferUses::STORAGE_READ_ONLY
-        | wgpu::BufferUses::COPY_DST
-        | wgpu::BufferUses::COPY_SRC
-        | wgpu::BufferUses::MAP_READ;
     let hal_dev = unsafe { device.as_hal::<wgpu::hal::api::Metal>() }
         .expect("Metal profile behind a non-Metal device");
-    let size = chunk.size::<T::Slot>();
     let hal_buf = unsafe {
         hal_dev.create_buffer(&wgpu::hal::BufferDescriptor {
             label: Some(label),
             size,
-            usage: hal_usage,
+            usage: wgpu::BufferUses::STORAGE_READ_ONLY
+                | wgpu::BufferUses::COPY_DST
+                | wgpu::BufferUses::COPY_SRC
+                | wgpu::BufferUses::MAP_READ,
             memory_flags: wgpu::hal::MemoryFlags::empty(),
         })
     }
     .expect("hal slot buffer");
     let mapping = unsafe { hal_dev.map_buffer(&hal_buf, 0..size) }.expect("hal slot map");
-    let dest_ptr = mapping.ptr.as_ptr() as *mut T::Slot;
-
-    unsafe {
-        chunk.transcode_into(dest_ptr, transcode);
-        hal_dev.unmap_buffer(&hal_buf);
+    let ptr = mapping.ptr.as_ptr();
+    let buf = unsafe {
         device.create_buffer_from_hal::<wgpu::hal::api::Metal>(
             hal_buf,
             &wgpu::BufferDescriptor {
@@ -162,7 +162,23 @@ fn upload_direct_metal<T: Transcode>(
                 mapped_at_creation: false,
             },
         )
+    };
+    (ptr, buf)
+}
+
+#[cfg(target_os = "macos")]
+#[inline]
+fn upload_direct_metal<T: Transcode>(
+    device: &wgpu::Device,
+    label: &str,
+    chunk: &ChunkSources<'_>,
+    transcode: &T,
+) -> wgpu::Buffer {
+    let (ptr, buf) = create_mapped_slot_buffer(device, chunk.size::<T::Slot>(), label);
+    unsafe {
+        chunk.transcode_into(ptr as *mut T::Slot, transcode);
     }
+    buf
 }
 
 #[inline]

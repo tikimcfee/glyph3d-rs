@@ -10,6 +10,8 @@ use crate::gpu::SharedDevice;
 use crate::layout::{DeviceSlotChunk, LayoutItem};
 use super::pass2_device::{emoji_tint_pairs, layout_pass2_device, SlotEmit};
 use super::types::{ItemPrepass, Pass2DeviceOutput};
+#[cfg(target_os = "macos")]
+use glyph_field::create_mapped_slot_buffer;
 
 /// What a device emission hands back: the chunked slot buffers, uniform chunk
 /// capacity, host mapping (if unified memory), Pass 2's per-item outputs, and
@@ -50,46 +52,6 @@ impl EmitInputs<'_, '_> {
         let pairs = emoji_tint_pairs::<E>(dest_addr, &out);
         (out, pairs)
     }
-}
-
-#[cfg(target_os = "macos")]
-pub(crate) fn create_mapped_slot_buffer(
-    device: &wgpu::Device,
-    size: u64,
-    label: &str,
-) -> (*mut u8, wgpu::Buffer) {
-    use wgpu::hal::Device as HalDevice;
-    let hal_dev = unsafe { device.as_hal::<wgpu::hal::api::Metal>() }
-        .expect("Metal profile behind a non-Metal device");
-    let hal_buf = unsafe {
-        hal_dev.create_buffer(&wgpu::hal::BufferDescriptor {
-            label: Some(label),
-            size,
-            usage: wgpu::BufferUses::STORAGE_READ_ONLY
-                | wgpu::BufferUses::COPY_DST
-                | wgpu::BufferUses::COPY_SRC
-                | wgpu::BufferUses::MAP_READ,
-            memory_flags: wgpu::hal::MemoryFlags::empty(),
-        })
-    }
-    .expect("hal arena buffer");
-    let mapping = unsafe { hal_dev.map_buffer(&hal_buf, 0..size) }.expect("hal arena map");
-    let ptr = mapping.ptr.as_ptr();
-    let buf = unsafe {
-        device.create_buffer_from_hal::<wgpu::hal::api::Metal>(
-            hal_buf,
-            &wgpu::BufferDescriptor {
-                label: Some(label),
-                size,
-                usage: wgpu::BufferUsages::STORAGE
-                    | wgpu::BufferUsages::COPY_DST
-                    | wgpu::BufferUsages::COPY_SRC
-                    | wgpu::BufferUsages::MAP_READ,
-                mapped_at_creation: false,
-            },
-        )
-    };
-    (ptr, buf)
 }
 
 pub(crate) struct ChunkPlan {
