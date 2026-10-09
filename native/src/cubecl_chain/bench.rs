@@ -8,6 +8,7 @@ use crate::gpu::GpuContext;
 use crate::scan::{DEFAULT_CHUNK_SIZE, DEFAULT_GROUP_SIZE, run_scan_pipeline};
 use crate::text::ResolveGlyph;
 
+use super::checks::{cpu_cluster_head, derived_advance};
 use super::cluster::{
     cand_scatter, cluster_host_inputs, cluster_mark, cluster_pair_filter, cluster_probe,
     count_spine, count_tile, item_roots, jump_build, rank_step,
@@ -16,8 +17,8 @@ use super::decode::decode;
 use super::position::{derive_stride, extent_pair, resolve_x};
 use super::scan::{apply, spine_scan, tile_scan};
 use super::{
-    F_CLUSTER_TRAILER, F_LEADER, F_SURVIVOR, ITEM_DESC_STRIDE, LC_COL, LC_ROW, LC_STRIDE,
-    LM_STRIDE, PARTIAL_COUNT_STRIDE, pack_words,
+    F_CLUSTER_HEAD, F_CLUSTER_TRAILER, F_LEADER, F_SURVIVOR, ITEM_DESC_STRIDE, LC_COL, LC_ROW,
+    LC_STRIDE, LM_STRIDE, PARTIAL_COUNT_STRIDE, pack_words,
 };
 
 // ── the bench driver ──────────────────────────────────────────────────────────
@@ -576,7 +577,7 @@ pub fn bench(ctx: &GpuContext, corpus_path: &Path) -> ! {
                         tiles_grid(n_tiles),
                         CubeDim::new_1d(units as u32),
                         BufferArg::from_raw_parts(h_fl.clone(), n_words),
-                        BufferArg::from_raw_parts(h_fl.clone(), n_words),
+                        BufferArg::from_raw_parts(h_bytes.clone(), n_words),
                         BufferArg::from_raw_parts(h_bi.clone(), bi.len()),
                         BufferArg::from_raw_parts(h_bm.clone(), bm.len()),
                         BufferArg::from_raw_parts(h_bc.clone(), bc.len()),
@@ -610,11 +611,12 @@ pub fn bench(ctx: &GpuContext, corpus_path: &Path) -> ! {
                         tiles_grid(n_tiles),
                         CubeDim::new_1d(units as u32),
                         BufferArg::from_raw_parts(h_fl.clone(), n_words),
-                        BufferArg::from_raw_parts(h_fl.clone(), n_words),
+                        BufferArg::from_raw_parts(h_bytes.clone(), n_words),
                         BufferArg::from_raw_parts(h_bi.clone(), bi.len()),
                         BufferArg::from_raw_parts(h_bm.clone(), bm.len()),
                         BufferArg::from_raw_parts(h_bc.clone(), bc.len()),
                         bshift,
+                        bitmap_advance,
                         BufferArg::from_raw_parts(h_lc.clone(), n * LC_STRIDE),
                         BufferArg::from_raw_parts(h_lm.clone(), n * LM_STRIDE),
                         BufferArg::from_raw_parts(h_item_desc.clone(), ITEM_DESC_STRIDE),
@@ -673,7 +675,7 @@ pub fn bench(ctx: &GpuContext, corpus_path: &Path) -> ! {
                             BufferArg::from_raw_parts(h_cslot.clone(), n),
                             BufferArg::from_raw_parts(h_cslot.clone(), n),
                             BufferArg::from_raw_parts(h_cslot.clone(), 1),
-                            136.0f32,
+                            bitmap_advance,
                             BufferArg::from_raw_parts(h_fl.clone(), n_words),
                             BufferArg::from_raw_parts(h_lm.clone(), n * LM_STRIDE),
                             BufferArg::from_raw_parts(h_lc.clone(), n * LC_STRIDE),
@@ -790,19 +792,27 @@ pub fn bench(ctx: &GpuContext, corpus_path: &Path) -> ! {
         let _ = crate::fold::decode_all(&bytes, &mut cslots, &trie);
         crate::fold::resolve_clusters(&bytes, &mut cslots, &trie, &items[0]);
         let fl_bytes = client.read_one(h_fl.clone()).expect("read fl");
-        let sm_bytes = client.read_one(h_sm.clone()).expect("read sm");
         let flw: &[u32] = bytemuck::cast_slice(&fl_bytes);
-        let smv: &[f32] = bytemuck::cast_slice(&sm_bytes);
+        // The --cubecl-cluster-check witnesses: device-only bits masked, the
+        // head bit against the CPU's committed heads, and the advance the
+        // chain DERIVES inline (no device advance lane since 26595fb).
         let mut bad = 0usize;
         for id in 0..n {
+            let dev_f = (flw[id >> 2] >> (((id & 3) * 8) as u32)) & 0xFF;
             let want_f = cslots.flags(id) & 0xFF;
-            let got_f = (flw[id >> 2] >> (((id & 3) * 8) as u32)) & 0xFF;
-            if want_f != got_f || cslots.advance(id).to_bits() != smv[id].to_bits() {
+            let got_f = dev_f & !(F_SURVIVOR | F_CLUSTER_HEAD);
+            let want_head = cpu_cluster_head(&bytes, &cslots, &trie, id, bitmap_advance);
+            let got_adv = derived_advance(&bytes, &trie, dev_f, id, bitmap_advance);
+            if want_f != got_f
+                || want_head != (dev_f & F_CLUSTER_HEAD != 0)
+                || cslots.advance(id).to_bits() != got_adv.to_bits()
+            {
                 if bad < 8 {
                     println!(
-                        "  MISMATCH byte {id} flags: cpu {want_f:#04x} gpu {got_f:#04x} advance: cpu {:e} gpu {:e}",
+                        "  MISMATCH byte {id} flags: cpu {want_f:#04x} gpu {got_f:#04x} head: cpu {want_head} gpu {} advance: cpu {:e} derived {:e}",
+                        dev_f & F_CLUSTER_HEAD != 0,
                         cslots.advance(id),
-                        smv[id]
+                        got_adv
                     );
                 }
                 bad += 1;

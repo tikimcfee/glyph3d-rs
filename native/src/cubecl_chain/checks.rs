@@ -17,8 +17,8 @@ use super::position::{extent_pair, resolve_x};
 use super::scan::{apply, spine_scan, tile_scan};
 use super::tail::emit_records;
 use super::{
-    F_CLUSTER_TRAILER, F_LEADER, F_SURVIVOR, ITEM_DESC_STRIDE, LC_COL, LC_ROW, LC_STRIDE,
-    LM_STRIDE, LM_X, LM_Y, LM_Z, PARTIAL_COUNT_STRIDE, pack_words,
+    F_CLUSTER_HEAD, F_CLUSTER_TRAILER, F_LEADER, F_SURVIVOR, ITEM_DESC_STRIDE, LC_COL, LC_ROW,
+    LC_STRIDE, LM_STRIDE, LM_X, LM_Y, LM_Z, PARTIAL_COUNT_STRIDE, pack_words,
 };
 
 pub fn run(ctx: &GpuContext, fixture_path: &Path) -> ! {
@@ -58,22 +58,9 @@ pub fn run(ctx: &GpuContext, fixture_path: &Path) -> ! {
     // the chain reads fl three-to-four passes and consumes only the low
     // byte; the full flags stay CPU-side for the renderer).
     let n_words = n.div_ceil(4);
-    let mut glyph_flags = Vec::with_capacity(n_words);
+    let bitmap_advance = fx.trie.cluster_table().map(|c| c.2).unwrap_or(0.0f32);
+    let glyph_flags = device_flag_words(&fx.bytes, &r.slots, &fx.trie, bitmap_advance);
     let mut advance_widths = Vec::with_capacity(n);
-    for w in 0..n_words {
-        let mut word = 0u32;
-        for b in 0..4 {
-            let i = w * 4 + b;
-            if i < n {
-                let mut f = r.slots.flags(i) & 0xFF;
-                if r.slots.gi[i] != 0 && (f & F_LEADER) != 0 && (f & F_CLUSTER_TRAILER) == 0 {
-                    f |= F_SURVIVOR;
-                }
-                word |= f << (b * 8);
-            }
-        }
-        glyph_flags.push(word);
-    }
     for i in 0..n {
         advance_widths.push(r.slots.advance(i));
     }
@@ -252,7 +239,6 @@ pub fn run(ctx: &GpuContext, fixture_path: &Path) -> ! {
     let tiles_grid = |tiles: usize| {
         CubeCount::Static(tiles.min(65535) as u32, tiles.div_ceil(65535) as u32, 1)
     };
-    let bitmap_advance = fx.trie.cluster_table().map(|c| c.2).unwrap_or(0.0f32);
     let t0 = std::time::Instant::now();
     unsafe {
         tile_scan::launch_unchecked(
@@ -305,6 +291,7 @@ pub fn run(ctx: &GpuContext, fixture_path: &Path) -> ! {
                 BufferArg::from_raw_parts(h_trie_m.clone(), trie_block_metrics_len),
                 BufferArg::from_raw_parts(h_trie_c.clone(), trie_block_codepoints_len),
                 trie_block_shift,
+                bitmap_advance,
                 BufferArg::from_raw_parts(h_lc.clone(), n * LC_STRIDE),
                 BufferArg::from_raw_parts(h_lm.clone(), n * LM_STRIDE),
                 BufferArg::from_raw_parts(h_item_desc.clone(), item_descriptors.len()),
@@ -352,7 +339,7 @@ pub fn run(ctx: &GpuContext, fixture_path: &Path) -> ! {
                 BufferArg::from_raw_parts(h_cslot.clone(), n_words),
                 BufferArg::from_raw_parts(h_cslot.clone(), n_words),
                 BufferArg::from_raw_parts(h_cslot.clone(), 1),
-                136.0f32,
+                bitmap_advance,
                 BufferArg::from_raw_parts(h_glyph_flags.clone(), n_words),
                 BufferArg::from_raw_parts(h_lm.clone(), n * LM_STRIDE),
                 BufferArg::from_raw_parts(h_lc.clone(), n * LC_STRIDE),
@@ -693,11 +680,26 @@ pub fn decode_check(ctx: &GpuContext, fixture_path: &Path) -> ! {
 
     let mut bad = 0usize;
     for id in 0..n {
+        let dev_f = (flw[id >> 2] >> (((id & 3) * 8) as u32)) & 0xFF;
         let want_f = slots.flags(id) & 0xFF;
-        let got_f = ((flw[id >> 2] >> (((id & 3) * 8) as u32)) & !F_SURVIVOR) & 0xFF;
+        let got_f = dev_f & !F_SURVIVOR;
         if want_f != got_f {
             if bad < 8 {
                 println!("  MISMATCH byte {id} flags: cpu {want_f:#04x} gpu {got_f:#04x}");
+            }
+            bad += 1;
+        }
+        // The device keeps no advance lane since 26595fb; the chain derives
+        // it inline from these flags + the trie. Diff that derivation (no
+        // head bits in leader mode, so the bitmap advance is never read).
+        let got_adv = derived_advance(&fx.bytes, &fx.trie, dev_f, id, f32::NAN);
+        if slots.advance(id).to_bits() != got_adv.to_bits() {
+            if bad < 8 {
+                println!(
+                    "  MISMATCH byte {id} advance: cpu {:e} derived {:e}",
+                    slots.advance(id),
+                    got_adv
+                );
             }
             bad += 1;
         }
@@ -724,7 +726,7 @@ pub fn decode_check(ctx: &GpuContext, fixture_path: &Path) -> ! {
         eprintln!("cubecl-decode-check FAIL: {bad} lane mismatches vs decode_all");
         std::process::exit(1);
     }
-    println!("cubecl-decode-check PASS: flags + advance bit-exact vs decode_all");
+    println!("cubecl-decode-check PASS: flags + derived advance + height bit-exact vs decode_all");
     std::process::exit(0);
 }
 
@@ -791,8 +793,6 @@ pub fn cluster_check(ctx: &GpuContext, fixture_path: &Path) -> ! {
     let h_ir = client.create_from_slice(bytemuck::cast_slice(&item_record_bounds));
     let h_ic = client.create_from_slice(bytemuck::cast_slice(&ic));
     let h_glyph_flags = client.empty(n_words * 4);
-    let h_advance_widths = client.empty(n * 4);
-    
     let h_glyph_heights = client.empty(n * 4);
     let h_cslot = client.create_from_slice(bytemuck::cast_slice(&vec![0u32; n]));
     let h_cend = client.empty(n * 4);
@@ -959,7 +959,6 @@ pub fn cluster_check(ctx: &GpuContext, fixture_path: &Path) -> ! {
         );
     }
     let fl_bytes = client.read_one(h_glyph_flags).expect("read fl");
-    let sm_bytes = client.read_one(h_advance_widths).expect("read sm");
     let dt = t0.elapsed();
     if std::env::var_os("GLYPH_CHAIN_DEBUG").is_some() {
         let hp_b = client.read_one(h_hp.clone()).expect("hp");
@@ -977,7 +976,6 @@ pub fn cluster_check(ctx: &GpuContext, fixture_path: &Path) -> ! {
         );
     }
     let flw: &[u32] = bytemuck::cast_slice(&fl_bytes);
-    let advance_widths: &[f32] = bytemuck::cast_slice(&sm_bytes);
     if std::env::var_os("GLYPH_CHAIN_DEBUG").is_some() {
         let cs = client.read_one(h_cslot).expect("read cslot");
         let ce = client.read_one(h_cend).expect("read cend");
@@ -997,22 +995,36 @@ pub fn cluster_check(ctx: &GpuContext, fixture_path: &Path) -> ! {
         }
     }
 
+    // Three witnesses per byte: the CPU flag lanes (device-only bits
+    // masked), the head bit against the CPU's committed heads, and — since
+    // the device keeps no per-byte advance (26595fb) — the advance the
+    // chain DERIVES from these flags (derived_advance, the host twin of
+    // scan.rs inline_advance) against the cluster-resolved advance.
     let mut bad = 0usize;
     for id in 0..n {
+        let dev_f = (flw[id >> 2] >> (((id & 3) * 8) as u32)) & 0xFF;
         let want_f = slots.flags(id) & 0xFF;
-        let got_f = ((flw[id >> 2] >> (((id & 3) * 8) as u32)) & !F_SURVIVOR) & 0xFF;
+        let got_f = dev_f & !(F_SURVIVOR | F_CLUSTER_HEAD);
         if want_f != got_f {
             if bad < 8 {
                 println!("  MISMATCH byte {id} flags: cpu {want_f:#04x} gpu {got_f:#04x}");
             }
             bad += 1;
         }
-        if slots.advance(id).to_bits() != advance_widths[id].to_bits() {
+        let want_head = cpu_cluster_head(&fx.bytes, &slots, &fx.trie, id, bitmap_advance);
+        if want_head != (dev_f & F_CLUSTER_HEAD != 0) {
+            if bad < 8 {
+                println!("  MISMATCH byte {id} head: cpu {want_head} gpu {}", dev_f & F_CLUSTER_HEAD != 0);
+            }
+            bad += 1;
+        }
+        let got_adv = derived_advance(&fx.bytes, &fx.trie, dev_f, id, bitmap_advance);
+        if slots.advance(id).to_bits() != got_adv.to_bits() {
             if bad < 8 {
                 println!(
-                    "  MISMATCH byte {id} advance: cpu {:e} gpu {:e}",
+                    "  MISMATCH byte {id} advance: cpu {:e} derived {:e}",
                     slots.advance(id),
-                    advance_widths[id]
+                    got_adv
                 );
             }
             bad += 1;
@@ -1031,6 +1043,86 @@ pub fn cluster_check(ctx: &GpuContext, fixture_path: &Path) -> ! {
         eprintln!("cubecl-cluster-check FAIL: {bad} lane mismatches vs decode_all + resolve_clusters");
         std::process::exit(1);
     }
-    println!("cubecl-cluster-check PASS: flags + advance bit-exact, cluster trailers and head advances included");
+    println!("cubecl-cluster-check PASS: flags + head bits + derived advance bit-exact, cluster trailers and head advances included");
     std::process::exit(0);
+}
+
+/// Whether the CPU cluster pass COMMITTED a head at `id` — the byte the
+/// device's cluster_mark tags F_CLUSTER_HEAD. The CPU slots carry no head
+/// bit (fold.rs has none: a committed head is visible only as its rewritten
+/// static lanes, `gi = best_slot` and `advance = bitmap_advance`), so it is
+/// read back off exactly those two lanes: a non-trailer leader whose glyph
+/// is not its own codepoint's AND whose advance is the bitmap advance. Both
+/// halves on purpose — a head whose sequence slot happened to equal the
+/// base glyph would need no head bit to lay out, and a missing glyph's
+/// zeroed gi must not read as a head.
+pub(super) fn cpu_cluster_head<T: ResolveGlyph + ?Sized>(
+    bytes: &[u8],
+    slots: &crate::fold::Slots,
+    trie: &T,
+    id: usize,
+    bitmap_advance: f32,
+) -> bool {
+    let f = slots.flags(id);
+    if f & F_LEADER == 0 || f & F_CLUSTER_TRAILER != 0 {
+        return false;
+    }
+    let len = crate::fold::sequence_length(bytes, id);
+    if len == 0 {
+        return false;
+    }
+    let cp = crate::fold::decode_codepoint_at(bytes, id, len);
+    slots.gi[id] != trie.resolve(cp).glyph_id && slots.advance(id).to_bits() == bitmap_advance.to_bits()
+}
+
+/// The PACKED device flag lanes for CPU-supplied statics: the CPU flags'
+/// low byte plus the two device-only bits the chain kernels read —
+/// F_SURVIVOR (renders: nonzero glyph, leader, not a trailer) and, since
+/// the inline trie evaluation (26595fb) dropped the per-byte advance
+/// buffer, F_CLUSTER_HEAD: the scan's advance for a committed head is the
+/// bitmap advance, and the ONLY place it can learn that is this bit.
+/// Uploading CPU flags without it lays every committed sequence out at its
+/// head codepoint's own width (the chain gate's cluster-flags failure).
+pub(super) fn device_flag_words<T: ResolveGlyph + ?Sized>(
+    bytes: &[u8],
+    slots: &crate::fold::Slots,
+    trie: &T,
+    bitmap_advance: f32,
+) -> Vec<u32> {
+    let n = bytes.len();
+    let mut words = vec![0u32; n.div_ceil(4)];
+    for (i, _) in bytes.iter().enumerate() {
+        let mut f = slots.flags(i) & 0xFF;
+        if slots.gi[i] != 0 && (f & F_LEADER) != 0 && (f & F_CLUSTER_TRAILER) == 0 {
+            f |= F_SURVIVOR;
+        }
+        if cpu_cluster_head(bytes, slots, trie, i, bitmap_advance) {
+            f |= F_CLUSTER_HEAD;
+        }
+        words[i >> 2] |= f << ((i & 3) * 8);
+    }
+    words
+}
+
+/// The advance the chain kernels derive INLINE for byte `id` from the
+/// device flags (scan.rs `inline_advance`, host twin): a committed head's
+/// bitmap advance, zero for a trailer or a non-leader, else the trie's
+/// advance for the codepoint. The cluster instruments diff THIS against
+/// the CPU's cluster-resolved advance — the per-byte advance buffer they
+/// used to read back no longer exists on device.
+pub(super) fn derived_advance<T: ResolveGlyph + ?Sized>(
+    bytes: &[u8],
+    trie: &T,
+    device_flag: u32,
+    id: usize,
+    bitmap_advance: f32,
+) -> f32 {
+    if device_flag & F_LEADER == 0 || device_flag & F_CLUSTER_TRAILER != 0 {
+        0.0
+    } else if device_flag & F_CLUSTER_HEAD != 0 {
+        bitmap_advance
+    } else {
+        let len = crate::fold::sequence_length(bytes, id);
+        trie.resolve(crate::fold::decode_codepoint_at(bytes, id, len)).advance
+    }
 }
