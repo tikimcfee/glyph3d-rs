@@ -197,8 +197,8 @@ cmd = "--render-file fixtures/emoji-view.txt --frames 2 --zoom 1.25 --cluster-mo
 [[golden_view]]
 name = "emoji-cluster"
 cmd = "--render-file fixtures/emoji-cluster-view.txt --frames 2 --zoom 1.25 --cluster-mode cluster"
-# The engine path twin: a tiny repo whose files carry the same classes through
-# --load-repo (the FFI + engine resolve them end to end).
+# The repo-load twin: a tiny repo whose files carry the same classes through
+# --load-repo (HyperLayout resolves them end to end).
 [[golden_view]]
 name = "repo-cluster"
 cmd = "--load-repo fixtures/g-cluster-repo --frames 2 --cluster-mode cluster --color-mode syntax"
@@ -206,8 +206,7 @@ cmd = "--load-repo fixtures/g-cluster-repo --frames 2 --cluster-mode cluster --c
 # ── Gates ────────────────────────────────────────────────────────────────
 # `scope` answers "I changed X, what should I run" — the question the CLI is
 # organised around, rather than the twelve-item list this used to be:
-#   engine  you touched engine/*.mojo or the FFI
-#   rust    you touched native/src
+#   rust    you touched native/, crates/ or glyph/
 #   render  you touched layout, shaders, or anything that moves a pixel
 #   corpus  you touched fixtures, generators, or vendored inputs
 # `glyph test` with no scope runs all of them, in the order below.
@@ -225,13 +224,13 @@ scope = "corpus"
 kind = "cmd"
 cmd = "target/release/glyph validate"
 needs = []
-compare = "build.toml against itself: every `needs` resolves and orders, every gate and mutation names a real target, every golden output is keyed by {gpu}, and every glob in a PRODUCT's inputs matches at least one file"
+compare = "build.toml against itself: every `needs` resolves and orders, every gate and mutation names a real target, every golden output is keyed by {gpu}, and every PRODUCT input, glob or literal, matches at least one file"
 blind_to = "whether the declared inputs are the RIGHT ones — it proves a pattern matches something, never that it matches everything that matters"
 
 [[gate]]
 name = "committed-artifacts"
 scope = "corpus"
-kind = "verify-committed"   # glyph-schema, emoji-sheet, cluster-classes, emoji-corpus, engine-trie, atlas, fixtures
+kind = "verify-committed"   # emoji-sheet, cluster-classes, emoji-corpus, engine-trie, atlas, fixtures
 needs = []
 compare = "each committed artifact rebuilt (scratch or generator check mode) vs its committed bytes"
 blind_to = "whether the INPUTS are right — reproducibility, not truth"

@@ -6,17 +6,19 @@ proven by running the checks, not by argument.
 
 **This file is canonical for anything repo-wide** — what the checks do, what is
 fenced, what the vocabulary means. `native/AGENTS.md` is canonical for the Rust
-crate (style, module contracts, debug env vars). `engine/README.md` is canonical
-for pipeline internals. When they disagree about a repo-wide fact, this file
-wins and the other is stale — say so in your commit rather than patching a
-correction on top of the stale text, which is how this file rotted the last
-time.
+crate (style, module contracts, debug env vars), and the module headers in
+`native/src` for pipeline internals. When they disagree about a repo-wide fact,
+this file wins and the other is stale — say so in your commit rather than
+patching a correction on top of the stale text, which is how this file rotted
+the last time. (It rotted again: until 2026-10-09 the check section below
+described sixteen gates when `build.toml` declared nine. It was rewritten
+against `build.toml` that day; `cargo glyph gates` is the live list.)
 
 ## Layout
 
 - `native/` — the pure-Rust renderer and layout engine binary (`glyph3d-native`).
   Features sub-200ms repo loading (`HyperLayout`) and modularized Slug WGSL rendering.
-- `glyph/` — the verification gate and mutation test runner (`cargo run -p glyph -- validate`).
+- `glyph/` — the build/verify tool: gate runner, mutation prover, launcher TUI.
 - `crates/` — the glyph field, split by render mode (2026-10): `glyph-field` is the
   mode-neutral contract (`GlyphField` trait, `GlyphFieldMode`, the shared records and
   binding map); `glyph-field-instanced` is the Instanced mode (32 B `RenderSlot`, its
@@ -26,6 +28,9 @@ time.
   `crates/glyph-session-dirs` (2026-10-09, std only) is the one table of where agent
   apps keep session transcripts, shared by the renderer's F7 browser and the
   `cargo glyph` launcher; `launch_config.example.toml` documents the overrides.
+- `engine/` — `fixtures/`, the conformance corpus recorded from the JS oracle
+  (26 `.pipe.bin` + 8 `.bake.bin`, their generators and vendored inputs), and
+  `glyph_schema.mjs`, generated from the schema.
 - `tools/` — check scripts, generators, `bench_hyper.py` performance harness, and repro helpers.
 - `.agents/` — agent house rules (`rules/rust-engineering.md`) and operational testing skill
   (`skills/glyph-engine-testing/SKILL.md`).
@@ -36,25 +41,20 @@ time.
   that actually compiles comes from crates.io via `Cargo.toml`. Patching this copy
   changes nothing.
 - `research/` — background surveys and GPU architecture studies.
-- `engine-local/`, `.claude/worktrees/` — untracked.
+- `experiments/` — the Zed-integration spikes, their own workspace, outside every gate.
+- `.claude/worktrees/` — untracked.
 
 ## Build
 
 ```sh
-# Build the pure-Rust binary directly with Cargo:
-cargo build --release -p glyph3d-native
-
-# Run the test suite (222 unit tests across 13 binaries + WGSL validation):
-cargo test --workspace
-
-# Validate build.toml gates and mutation tests:
-cargo run -p glyph -- validate
+cargo build --release -p glyph3d-native   # the renderer
+cargo test --workspace                    # every test binary + WGSL validation
+cargo run -p glyph -- validate            # build.toml against its schema
 ```
 
-**The system is 100% pure Rust.** The former Mojo external C-ABI shared library
-(`libglyph_engine.dylib`) has been completely retired and replaced by `HyperLayout`
-(`native/src/layout_hyper.rs`), a parallel, cache-blocked CPU layout engine written in
-native Rust with Rayon and unified-memory shared buffer mapping.
+The layout engine is `HyperLayout` (`native/src/layout_hyper.rs`): a parallel,
+cache-blocked CPU layout written with Rayon, writing into unified-memory mapped
+buffers where the GPU allows it and staging otherwise.
 
 **Performance characteristics:**
 - Flagship corpus: the retired JS repo, `viz-web/glyph3d-js` (1,306 files, 97.0 MB source,
@@ -63,8 +63,8 @@ native Rust with Rayon and unified-memory shared buffer mapping.
   **~226 ms** total visual init in `--color-mode syntax` on Apple Silicon Metal.
   Benchmark tools read its location from `GLYPH_FLAGSHIP_REPO`; nothing in the
   tree hardcodes where a checkout lives.
-- Decoupled CubeCL: experimental CubeCL GPU compute kernels are decoupled behind the
-  optional Cargo feature `cubecl` (`cargo check --features cubecl`).
+- CubeCL: GPU compute layout kernels (`--repo-engine cubecl`) sit behind the
+  `cubecl` Cargo feature, which is ON by default (`native/Cargo.toml`).
 - ByteSpan token painting: `ByteSpan` and `Paint::ByteSpans` provide byte-range semantic
   token coloring directly from AST/LSP analyses into mapped unified memory.
 - Modularized renderer: `glyph_scene.rs` is factored into `setup.rs`, `pipelines.rs`
@@ -80,7 +80,7 @@ or mutation survival.
 ## The tool
 
 ```sh
-cargo glyph build          bring the binary and the engine dylib up to date
+cargo glyph build          bring the renderer up to date
 cargo glyph test           run everything; nonzero if anything is wrong
 cargo glyph test rust      only what you changed: rust | render | corpus
 cargo glyph test --frozen  assert currency instead of building it
@@ -94,44 +94,50 @@ The `cargo glyph` alias is repo-scoped (it lives in `.cargo/config.toml`), so
 from outside the workspace call the binary directly:
 `<repo>/target/release/glyph3d-native --load-repo .`
 
-**Use it rather than the pieces.** Do not hand-run `cargo build`,
-`engine/check.sh`, the `tools/` scripts, or the binary's own `--engine-check` /
-`--repo-verify` flags: the ordering between them is exactly what the tool exists
-to hold for you, and getting it wrong is how a stale dylib made a check test the
-previous engine for a day. `pixi run check` and `tools/check-all.sh` still work;
-both are thin doors onto `cargo glyph test`.
+**Inside `.claude/worktrees/<name>` the alias is broken** (measured 2026-10-08):
+cargo merges `.cargo/config.toml` from every ancestor directory and alias arrays
+concatenate, so the tool receives `run …` as its verb and launches the
+renderer. Use `cargo run --quiet --release -p glyph -- <verb>`, or
+`target/release/glyph <verb>` once built.
+
+**Use it rather than the pieces.** Do not hand-run `cargo build`, the `tools/`
+scripts, or the binary's own check flags in place of a gate: the ordering
+between them is exactly what the tool exists to hold for you, and getting it
+wrong is how a stale binary once made a check test the previous build for a
+day. `tools/check-all.sh` still works; it is a thin door onto `cargo glyph test`.
 
 - **Scope is an argument, not a verb.** The scopes answer "I changed X, what
   should I run": `rust` (native/, crates/, glyph/), `render` (layout, shaders,
   anything that moves a pixel), `corpus` (fixtures, generators, vendored
   inputs). Every verdict line says how many gates ran ("4 of 9 gates ran,
   scope rust"), and a selection of ZERO gates is refused as `CHECK-ALL:
-  NOTHING RAN`, never green: the `engine` scope outlived the Mojo engine and
-  printed ALL GATES GREEN over nothing until it was removed (2026-10-09).
-- **`test` builds; `--frozen` refuses to.** Building is the iterating intent,
-  and necessary because `cargo build` does not build the Mojo dylib. `--frozen`
-  is the validating intent: if something is stale, that IS the finding, and a
-  check that silently rebuilds could never report it.
+  NOTHING RAN`, never green: a scope once outlived its last gate and printed
+  ALL GATES GREEN over nothing until it was removed (2026-10-09).
+- **`test` builds; `--frozen` refuses to.** Building is the iterating intent.
+  `--frozen` is the validating intent: if something is stale, that IS the
+  finding, and a check that silently rebuilds could never report it.
 - **`cargo glyph prove`** applies each mutation declared in `build.toml`,
   requires the named check to redden for the named reason, and restores
   byte-exact. It reports COVERAGE — which checks have no mutation and are
-  therefore unproven — not a pass count. Every check is covered as of 2026-09-07;
-  `cargo glyph prove` prints the live figure, and a new check should arrive
-  with the mutation that proves it. Scoped forms for iteration (2026-09-29):
+  therefore unproven — not a pass count. `cargo glyph prove` prints the live
+  figure, and a new check should arrive with the mutation that proves it.
+  Scoped forms for iteration (2026-09-29):
   `--mutation <name>` (repeatable) proves exactly the named mutations, and
   `--changed` proves only mutations whose target file differs from HEAD —
   "prove what you touched" (a mutation you MOVED keeps its name and is
   selected by its file). A scoped run's verdict names its scope ("a scoped
   run proves its scope, not the manifest"); the unscoped run remains the
-  landing bar.
+  landing bar. A mutation whose gate is ALREADY red cannot prove anything and
+  the prover says so — on a host whose pixel set is stale, the pixel-ab
+  mutations are unprovable until the set is re-adopted.
 - **`cargo glyph gates`** prints what each check compares and cannot see;
   **`graph`** the artifact graph; **`validate`** the manifest against its schema.
 
 **Run it in a worktree if anyone else is working in this repo.** It reads the
 WORKING TREE, not HEAD, so another thread's uncommitted edits fail your checks
-and tell you nothing about your own change. This has happened. It is a property
-of the runner, not of any one language, so it applies just as much to pure
-engine or tooling work — `native/AGENTS.md` has the worktree setup commands.
+and tell you nothing about your own change. This has happened. It is a
+property of the runner, so it applies just as much to tooling work —
+`native/AGENTS.md` has the worktree setup commands.
 
 Everything the tool does is declared in `build.toml` and typed in
 `glyph/src/main.rs`. A key the code does not know is a parse error; a field the
@@ -141,130 +147,137 @@ read by nothing at all.
 
 ## What the checks actually do
 
-By name — they were numbered positions in one shell script (`N/9`,
-renumbered twice, one with a fossil stage letter still in its filename). For
-each: what it compares, what makes it red, and **what it cannot see**. The last
-is the part worth reading. A check is a claim about a counterfactual, and a
-check whose blind spot you don't know is a green you can't price.
+Nine gates, in `build.toml` order. For each: what it compares, what makes it
+red, and **what it cannot see**. The last is the part worth reading. A check is
+a claim about a counterfactual, and a check whose blind spot you don't know is
+a green you can't price. (Gates were once numbered positions in one shell
+script, `N/9`, renumbered twice; old reports use the numbers — map by name.)
 
 **Products — `glyph build`, and the first thing `test` does.** Not a check, and
 it cannot catch anything; it is here because everything below is a statement
-about an artifact, and a stale one makes every statement false. The dylib and
-the renderer are *products*: nothing to compare against, they only have to be
-CURRENT. Currency is a content hash of the declared
-inputs (`engine/*.mojo` + the pixi pins), stamped at build time — rebuilt only
-when that hash moved, not on every pass. Red only on a Mojo compile error.
-Blind to whether the result is *correct* — it exists solely so that nothing
-downstream links a stale engine. A failed rebuild is FATAL (the battery stops):
-a stale dylib makes every gate below a statement about the wrong binary.
+about an artifact, and a stale one makes every statement false. The renderer
+is a *product*: nothing to compare against, it only has to be CURRENT.
+Currency is a content hash of the declared inputs — `native/src`, `crates/`,
+`native/Cargo.toml`, and the root `Cargo.toml`, `Cargo.lock` and
+`.cargo/config.toml` — stamped at build time, rebuilt only when that hash
+moved. Red only on a compile error, which is FATAL (the battery stops): a
+stale binary makes every gate below a statement about the wrong build. Blind
+to an input the list does not name: until 2026-10-09 it named a lockfile that
+no longer existed and omitted the real one, so a dependency bump left the
+renderer "current" (measured). `manifest` now refuses an input that matches no
+file.
 
-**committed-artifacts** (was "1"). One mechanism per generator, all driven from
-build.toml: generator-native check modes for the schema (`gen_schema.py
---check`, which also runs the schema's own tier validation), the emoji sheet
+**manifest.** `build.toml` against itself: every `needs` resolves and orders,
+every gate and mutation names a real target, every golden output is keyed by
+`{gpu}`, and every product input — glob or literal — matches at least one
+file. Blind to whether the declared inputs are the RIGHT ones: it proves a
+pattern matches something, never that it matches everything that matters.
+
+**committed-artifacts.** One mechanism per generator, all driven from
+build.toml: generator-native check modes for the emoji sheet
 (`gen_emoji_sheet.py --check`), the cluster class table (`gen_cluster_table.py
 --check`) and the emoji demo corpus (`gen_emoji_corpus.py --check`); the trie
 uses `gen_real_trie.py --verify-only`; the four atlas bins are rebuilt by
-`export-atlas.mjs` into a scratch dir and `cmp`'d. Red when a generated
+`export-atlas.mjs` into a scratch dir and `cmp`'d. The schema's generated
+`engine/glyph_schema.mjs` is NOT among them: build.toml declares no artifact
+for it (measured 2026-10-09), so only the fixture rebuild sees it, and only
+through what the generators read. Red when a generated
 artifact is hand-edited, or a generator changes behaviour. Blind to
 whether the *inputs* are right: the trie check proves `engine-trie.bin` is a
 faithful derivation of `codepoints.bin`/`glyphs.bin`, not that those are correct.
 
-**vendor-hashes** (was part of "1"). The hashes of 22 vendored + derived files
+The same gate rebuilds the **fixture corpus** in a **scratch copy** of
+`engine/fixtures` (generators + vendored inputs + the `../glyph_schema.mjs`
+edge) and byte-compares against the committed 34 — an older form deleted the
+committed fixtures in place and restored them with `git checkout`, which
+needed the restore to be exactly right. The expected counts (26 pipe + 8 bake)
+are **declared in build.toml**, never derived from the tree under test: the
+old gate `ls`-counted the tree it was checking, so a deleted fixture lowered
+both sides of the comparison and stayed green (measured 2026-09-06: eleven of
+twelve gates green on a shrunken corpus; only the fixture.rs pin caught it).
+The Rust-side pins stay — declared count in build.toml and hard pin in the
+test suite are two independent witnesses, not duplicate coverage. Blind to
+whether the oracle is *correct* — it proves reproducibility, not truth. And
+it only proves the corpus is what it was: whether the Rust layout still
+AGREES with the corpus is the job of the retired reference-port gate (below).
+
+**vendor-hashes.** The hashes of the vendored + derived files
 (`vendor-manifest.py --check`; the two `hb.*` files are additionally re-derived
-from their ref sources and byte-compared — a semantic pin, not just a hash).
-Blind to upstream drift **by design** (a difference there is information, not a
+from their ref sources and byte-compared — a semantic pin, not just a hash;
+third-party files are also held to their recorded fetch hash). Blind to
+upstream drift **by design** (a difference there is information, not a
 failure), and blind to a vendored file that matches its own recorded hash while
 being the wrong revision for the fixtures that depend on it — which has
-happened here, and is caught today only by the fixtures gate.
+happened here, and is caught today only by the fixture rebuild above.
 
-**fixtures** (was "1b"; part of the committed-artifacts gate in the runner).
-Rebuilds the corpus in a **scratch copy** of `engine/fixtures` (generators +
-vendored inputs + the `../glyph_schema.mjs` edge) and byte-compares against
-the committed 34 — the old gate deleted the committed fixtures in place and
-restored them with `git checkout`, which needed the restore to be exactly
-right. The expected counts (26 pipe + 8 bake) are **declared in build.toml**,
-never derived from the tree under test: the old gate `ls`-counted the tree it
-was checking, so a deleted fixture lowered both sides of the comparison and
-stayed green (measured 2026-09-06: eleven of twelve gates green on a shrunken
-corpus; only the fixture.rs pin caught it). The Rust-side pins stay — declared
-count in build.toml and hard pin in the test suite are two independent
-witnesses, not duplicate coverage. Blind to whether the oracle is *correct* —
-it proves reproducibility, not truth.
-
-**engine-suites** (historical). Formerly eighteen Mojo suites (12 CPU, 6 Metal)
-and `ffi_selftest` testing the C-ABI dylib. Retired along with the Mojo engine; the
-layout and fold contracts are now validated directly in native Rust via `cargo test`
-and `layout_hyper` tests.
-
-**cargo-build** (was "3"). `cargo build --release`, zero warnings. Red on any
+**cargo-build.** `cargo build --release`, zero warnings. Red on any
 warning rustc emits; a build ERROR is fatal (the battery stops). Blind to
 anything silenced with `#[allow(...)]`.
 
-**cargo-clippy** (was "4"). `cargo clippy --release`, zero warnings. Same, for
-lints.
+**cargo-clippy.** `cargo clippy --release`, zero warnings. Same, for lints.
+Blind to test-only code: the gate does not pass `--all-targets` (which, as of
+2026-10-08, reports 14 test-only lints, one of them deny-level).
 
-**cargo-test** (was "5"). naga WGSL validation, CLI parity, encase lane layout,
-`ItemParams` validation, the layout-seam suites (including the direct path's
-arena and item-range guards), the wrap-mode monoid domain, and the reference-port
-suites. The count is deliberately not written here — `cargo glyph test` prints
-it next to the floor on every run, and a number in this paragraph would be one
-more thing to forget. Red when a test fails, when a
-whole test binary stops reporting, or when **fewer than `test_floor` tests
-actually run** — the floor lives in `build.toml [settings]` now, not in shell.
-That floor is a ratchet, not an equality: adding tests never reddens it, and
-when the real count rises above it every green run prints a NOTE naming the
-number to raise it to — so it cannot decay into a figure far below reality
-without saying so. Raise it in the same commit that adds the tests.
+**cargo-doc.** `cargo doc --no-deps`, zero warnings. Red when a doc comment names
+a symbol that no longer exists, or leaves an HTML tag open. It exists because
+renames are constant here and this was the one class the battery could not see:
+two links to `Engine::records` survived its rename to `read_back` through a full
+green run. Blind to whether the prose is TRUE — it checks that the symbols named
+still exist, not that the sentence around them is current.
+
+**cargo-test.** Every test binary in the workspace: naga WGSL validation (the
+renderer's and each field-mode crate's), CLI parity, encase lane layout,
+`ItemParams` validation, the layout-seam suites, the fixture loader and its
+refusals, the fold/scan/bake unit suites (monoid domain, wrap and paginate
+rules), `text::reference_layout` bit-exact against every in-domain fixture's
+recorded answers, the transcript parsers, the launcher, and the runner's own
+verdict logic. The count is deliberately not written here — `cargo glyph test`
+prints it next to the floor on every run, and a number in this paragraph would
+be one more thing to forget. Red when a test fails, when a whole test binary
+stops reporting, or when **fewer than `test_floor` tests actually run** — the
+floor lives in `build.toml [settings]`. That floor is a ratchet, not an
+equality: adding tests never reddens it, and when the real count rises above
+it every green run prints a NOTE naming the number to raise it to — so it
+cannot decay into a figure far below reality without saying so. Raise it in
+the same commit that adds the tests.
 
 The floor exists because the previous form could not fail. It counted
-`test result: ok` summary lines and required two; at the time there were exactly
-two binaries (`unittests src/main.rs` and `tests/wgsl.rs`), so the threshold was
-met by the tree's SHAPE rather than by anything running. That premise is the
-load-bearing part of why the old check could not fail, so it is stated as of
-2026-09-06; the tree has since grown a third binary, which changes the history
-not at all. Verified 2026-09-06: marking three tests `#[ignore]`
-left the old check printing `PASS tests green` and the new one printing
-`FAIL — 82 tests ran, floor is 85`. This is also the check that holds the two
-corpus-size pins (`native/src/fixture.rs`, 26 pipe; `native/src/bake.rs`, 8 bake,
-both worded "update deliberately"), so until now corpus protection rested on
-those tests continuing to run with nothing asserting that they did. The realistic
-loss was never deletion — it is a dropped `mod` declaration or an `#[ignore]`
-that outlives its reason, neither of which rustc says a word about. **This matters more than it looks**, because the pins that keep
-the fixture corpus from silently shrinking (`native/src/fixture.rs`, 26 pipe;
-`native/src/bake.rs`, 8 bake — both worded "update deliberately") live inside
-this check. They protect the corpus; nothing yet protects them.
+`test result: ok` summary lines and required two; at the time there were
+exactly two binaries, so the threshold was met by the tree's SHAPE rather than
+by anything running. Verified 2026-09-06: marking three tests `#[ignore]` left
+the old check printing `PASS tests green` and the new one printing
+`FAIL — 82 tests ran, floor is 85`. The realistic loss was never deletion — it
+is a dropped `mod` declaration or an `#[ignore]` that outlives its reason,
+neither of which rustc says a word about. **This matters more than it looks**,
+because the pins that keep the fixture corpus from silently shrinking
+(`native/src/fixture.rs`, 26 pipe; `native/src/bake.rs`, 8 bake — both worded
+"update deliberately") live inside this check.
 
-**engine-check** (was "6"), twice. The Mojo engine through the FFI versus
-`text::reference_layout`, an independent Rust CPU fold, diffed record-by-record.
-Run on `src/main.rs` and on `fixtures/overflow-leads.txt` — the second because
-`main.rs` is well-formed UTF-8 by construction and can never reach the
-out-of-range decode path where the two implementations actually disagreed in
-September 2026. Blind to the **per-item** FFI strategy: this hardcodes the
-batched one (`main.rs:157`). Blind to malformed shapes other than the one that
-fixture carries.
-
-**pick-oracle** (`tools/check-pick-oracle.sh`; was `check-stage-g.sh` — the `g`
-was a fossil stage letter, not a position). Scripted picks and pixel-ray round
-trips from the native binary against an independent Python fold oracle. Red on
-any pick resolving to the wrong record. Since 2026-09-10 it also probes
+**pick-oracle** (`tools/check-pick-oracle.sh`). Scripted picks and pixel-ray
+round trips from the native binary against an independent Python fold oracle.
+Red on any pick resolving to the wrong record. Since 2026-09-10 it also probes
 `native/fixtures/emoji-view.txt`: a row/col pick never sees a glyph's advance
 (col is a leader count on both sides), so the emoji probes are pixel-ray
 round trips on a double-advance cell and on the cell two leaders AFTER it —
 the place a mis-sized rect would put the ray in the wrong glyph. The oracle
-itself knows nothing of advances, which is why it is a witness here. One mechanical caution survives the
-rename: under `set -euo pipefail` an oracle that exits nonzero inside a command
-substitution aborts the script mid-run. The wrapper still reports FAIL, but
-every check after the abort point silently did not run. (The missing
-`[ -x "$BIN" ]` guard was added when the file was renamed.)
+itself knows nothing of advances, which is why it is a witness here. One
+mechanical caution: under `set -euo pipefail` an oracle that exits nonzero
+inside a command substitution aborts the script mid-run. The wrapper still
+reports FAIL, but every check after the abort point silently did not run.
+Blind to pick paths outside the scripted set.
 
-**pixel-ab** (was "8"). The golden views re-rendered and byte-compared against
+**pixel-ab.** The golden views re-rendered and byte-compared against
 `out/tooling-ab/baseline/<key>/` — `cargo glyph graph` lists them, and the count
 is deliberately not repeated here because it has changed. This is the **only**
 check that sees pixels. In build.toml those PNGs are class **golden**: verified,
 with NO build path — the runner refuses to regenerate them, because re-baselining
 is a human act. Red on any change to camera, shading, layout, shaping or culling
 that reaches one of those frames. Blind to everything outside them, and it cannot
-distinguish a regression from an intentional change, which is deliberate.
+distinguish a regression from an intentional change, which is deliberate. A
+commit that moves a pixel on purpose re-baselines in the same commit and says
+why; one that does not leaves every later change unprovable on that platform
+(2026-10-07/08: a camera recentre and a palette change landed without
+re-baselining, and both platforms' sets went red).
 
 **One golden set per rasterizer, since 2026-09-07.** `<key>` is what the
 renderer prints from `--gpu-key`: `<backend>-<vendor>` off the adapter wgpu
@@ -272,7 +285,7 @@ actually picked (`metal-apple`, `vulkan-nvidia`), resolved by the runner from
 the `{gpu}` token in build.toml. The first Linux run showed why: against the
 Metal set, NVIDIA's Vulkan rasterizer differs by ~1 level over 1-4% of pixels
 plus a few dozen ISOLATED single-pixel coverage flips at quad edges, while every
-numeric gate — fold, scan, bake, FFI, direct path, picks — is bit-exact. Pixels
+numeric check — fold, scan, bake, picks — is bit-exact. Pixels
 are a property of the rasterizer; the layout is not. Making vendors agree is
 not a goal and nothing here tries. The key is deliberately coarser than the
 hardware (a 5090 and a 4090 share a set until a diff proves otherwise); each set
@@ -298,7 +311,7 @@ Both frames were inspected side by side: identical structure, identical text in
 front of the receding column, difference confined to the dense far band where
 thousands of coplanar quads overlap and the two rasterizers reject depth in a
 different order. That band is the whole point of this view, so it is the frame
-where vendors are LEAST likely to agree, and every numeric gate is bit-exact
+where vendors are LEAST likely to agree, and every numeric check is bit-exact
 across both. Expected, not a defect — but the instrument was right to make
 someone look, and this note exists so the next person does not look twice.
 What a set proves is the renderer ON THE HARDWARE THAT MADE IT — a green here on
@@ -333,20 +346,19 @@ of `glyph_field.wgsl`, so a platform whose emoji edges differ while its text
 does not has a checklist.
 `emoji-cluster` and `repo-cluster` (2026-09-20) pin the SEQUENCE PASS — one
 frame per path: the former through `--render-file` (the CPU staging twin),
-the latter through `--load-repo` (the engine end to end). One line per
+the latter through `--load-repo` (the repo load end to end). One line per
 sequence class the trie resolves (families, flags, skin tones, keycaps, tag
 flags) plus the fallbacks (unlisted chains stay pieces, ZWJ/VS16 zero-width);
-the `cluster-static-zero-off` and `cluster-trailer-advance-one` mutations
-prove they redden. The `emoji` view pins LEADER mode by hand — its fixture
-is immutable, and the default flipped to cluster on 2026-09-22, so its
-command carries `--cluster-mode leader` explicitly and the pairing now reads
-one level up: the default gets its pixel coverage from the unpinned repo
-views (g-pick-repo carries no sequences — the flip moves no pixel there),
-and leader stays pinned here.
-Known cost of the fix, measured: in the dense far region of `repo-down`,
-~1,400 of 1.6M pixels lose a little ink where coplanar quads overlap and the
-later fragment's interpolated depth lands an ulp behind — the price of a
-blended pass writing depth, accepted over draw-order visibility.
+the `cluster-static-zero-off` mutation proves they redden. The `emoji` view
+pins LEADER mode by hand — its fixture is immutable, and the default flipped
+to cluster on 2026-09-22, so its command carries `--cluster-mode leader`
+explicitly and the pairing now reads one level up: the default gets its pixel
+coverage from the unpinned repo views (g-pick-repo carries no sequences — the
+flip moves no pixel there), and leader stays pinned here.
+Known cost of the depth-write fix, measured: in the dense far region of
+`repo-down`, ~1,400 of 1.6M pixels lose a little ink where coplanar quads
+overlap and the later fragment's interpolated depth lands an ulp behind — the
+price of a blended pass writing depth, accepted over draw-order visibility.
 
 It is also less all-seeing than it looks. The page-extent origin seed was
 renderer-affecting and every view stayed byte-equal, because the seed only binds
@@ -354,113 +366,68 @@ for an item with zero records and no fixture had an empty file. It can see that
 class today only because `native/fixtures/g-pick-repo/empty.rs` was added for
 it. **Do not tidy that file away.** Ask what else these frames cannot see —
 `--wrap-mode back` on a repo whose files never wrap is the current example,
-and since E2b (2026-09-29) there is a second, proven one: **the far-LOD
-backdrop tint never fires in any golden view** — the cameras keep all five
-`g-pick-repo` files near enough that no segment substitutes its backdrop
-quad, so the seg_tint lane is pixel-invisible (the `scatter-tint-lane-dropped`
-mutation stayed GREEN here and moved to the fork gate's byte-level tint tier,
-which is where a fence for it lives now).
+and a second, proven one: **the far-LOD backdrop tint never fires in any
+golden view** — the cameras keep all five `g-pick-repo` files near enough that
+no segment substitutes its backdrop quad, so the seg_tint lane is
+pixel-invisible. Its byte-level fence lived in the cubecl-fork gate, which is
+retired, so that lane is currently watched by nothing.
 
-**repo-verify** (was "8b"), both wrap modes. The per-item and batched FFI
-strategies diffed bit-exact at the layout seam — placements, instance bytes and
-records — in `down` and `back`. Red when the two paths disagree. Blind to
-whether *either* is right: this is strategy-versus-strategy, so a fault shared
-by both is invisible. Ground truth comes from engine-check, and only for the
-batched path.
+### Retired 2026-09-30, and what it left unwatched
 
-**repo-verify-direct**, both wrap modes. `Strategy::Direct` — the path where the
-ENGINE writes render instances straight into the caller's arena, materializing no
-32 B wire record on either side of the FFI — diffed against the batched record
-path, bit-exact on placements and instance bytes. Red when they disagree. Blind
-to the wire-record tier BY CONSTRUCTION: the direct path produces none, so
-`diff_backends` reports `0 records` and the PASS line says so. Record-level
-faults are covered by `repo-verify` and `engine-check` on the other strategies.
-It also refuses a verify over zero items — before 2026-09-07 a missing corpus
-directory printed `PASS: 0 items, 0 instances` and exited 0, which is this gate
-passing having compared nothing.
+`5e94de8` ("decouple CubeCL … and clean build.toml") removed seven gates and
+26 mutations. Some served only the retired engine. Four checked pure-Rust
+paths whose **instruments still ship in the binary and still pass**, measured
+2026-10-09 — nothing runs them:
 
-**cargo-doc**. `cargo doc --no-deps`, zero warnings. Red when a doc comment names
-a symbol that no longer exists, or leaves an HTML tag open. It exists because
-renames are constant here and this was the one class the battery could not see:
-two links to `Engine::records` survived its rename to `read_back` through a full
-green run. Blind to whether the prose is TRUE — it checks that the symbols named
-still exist, not that the sentence around them is current.
+- **reference-port** — the Rust layout against the JS oracle's recorded
+  answers over the whole corpus. Its script (`tools/check-fixture-parity.sh`)
+  also needed the retired engine for one half, so the whole gate went. The Rust
+  halves: `--fixture-trie` (26 fixtures, 23,552 entries rebuilt from bytes),
+  `--fixture-fold` (155,222 leaders, 1,874,328 per-byte lanes bit-exact),
+  `--fixture-scan` (208 cases across 8 tunings; 1,188,024 leader-lanes
+  bit-exact, 53,752 within 1e-4), `--fixture-bake` (8 fixtures, 27,315
+  leaders, 167 checkpoints, 530 seed-protocol queries), `--fixture-reference`
+  (4 in-domain fixtures, 5,332 records). Only the last has a `cargo test`
+  twin; the full-corpus fold, scan, trie and bake checks against the oracle
+  run nowhere.
+- **repo-verify** — `--repo-verify`: one strategy diffed bit-exact against its
+  counterpart over `g-pick-repo`, placements and instances (and records where
+  both paths have them). Passes for `hyper`, `direct` and `batch` in both wrap
+  modes. It refuses a verify over zero items — before 2026-09-07 a missing
+  corpus printed `PASS: 0 items` and exited 0.
+- **cubecl-chain** and **cubecl-fork** — `tools/check-cubecl.sh`: the CubeCL
+  chain against the CPU scan, and the full from-bytes chain against the CPU
+  path's records and slot stream over the IMMUTABLE `native/fixtures/cubecl-fork`
+  corpus, STRICT mode refusing an unexercised bucket. CubeCL is default-on and
+  under heavy work; this was its only bit-exact fence.
 
-**reference-port** (was "9"). Six halves against the JS oracle's recorded
-answers, with the volumes it currently clears — quote these when you change it,
-because a count that quietly drops is how this check would go vacuous without
-going red: parse parity (Rust's fixture loader versus Mojo's over parsed typed
-values — 26 fixtures, 11 section checksums each), the trie rebuilt from raw
-bytes (26 fixtures, 23,552 entries), the full serial fold over every lane of
-every byte (155,222 leaders, 1,874,328 lanes), the scan form across 8 tunings
-(26 × 8 = 208 cases, 1,188,024 leader-lanes bit-exact and 53,752 within 1e-4),
-the bake and its seed protocol (8 fixtures, 27,315 leaders, 167 checkpoints,
-530 queries), and `text.rs`'s independent fold over its declared domain
-(4 fixtures, 5,332 records, 47,988 lanes). Two of these carry
-explicit anti-vacuity guards — the bake fails if no query ran, the reference
-fails if nothing was in domain — which is the right pattern. Blind to a fault
-shared by both loaders in parse parity (there is no third parser), and blind,
-silently, to any fixture outside `text.rs`'s domain.
+`native/fixtures/overflow-leads.txt`, the only input that reaches the
+out-of-range decode path, is now read by no check at all.
 
-**cubecl-chain** (2026-09-28). The CubeCL device chain versus the CPU scan
-reference (`scan.rs`) over five fixtures (wrapback-long-line, paged-rows,
-paged-cols, multi-item, cluster-flags): counts and rows exact, fold>0 X
-bit-exact, line_adv and positions at the 1e-4 eps tier, the emitted record
-stream tier-diffed per leader. Red on divergence. Blind to everything outside
-the five fixtures, to the ENGINE (this is chain-vs-CPU-scan; engine parity is
-the fork gate's claim), and to the device decode and cluster stages — this
-driver uploads CPU-computed statics, so no packed byte is ever classified on
-device here. The phantom-tail class is therefore fenced by `pack_words`' unit
-test (the `tail-pads-zero` mutation), not by any device gate.
-
-**cubecl-fork** (2026-09-28; re-formed at the endpoint, 2026-09-29; fixture extended 2026-09-30). `--cubecl-repo-check`
-in STRICT mode over the standing fork fixture (`native/fixtures/cubecl-fork`, IMMUTABLE):
-the full from-bytes chain's records versus the ENGINE's batched records, BIT-exact,
-plus the endpoint tiers — the 32 B slot stream field-equal against the engine arena
-(the renderer-bound form, fenced in the exact shape the shader reads), placements
-bit-equal — with the fork census's m >= 3 and seg >= 3 buckets proven exercised — an
-unexercised corpus is a FAIL, so the fixture cannot quietly stop covering the paginate
-arithmetic classes. Since 2026-09-30 the fixture also carries `clusters.txt` (every
-supported cluster class — families, flags, skin tones, roles, keycaps, tag flags,
-VS16 on/off, and the stay-pieces fallbacks — placed at wrap columns, page boundaries,
-line and file edges), and STRICT likewise requires a nonzero cluster candidate count:
-the pre-extension corpus was pure ASCII and read 0, which is exactly the failure the
-bucket now refuses. The same extension added a zero-byte `empty.txt` — the empty-item
-placement class (found by the extent_fold boundary bug, 2026-09-30: a one-step item
-advance misassigned the byte after an empty item to the empty item's extent lanes;
-only the pixel gate could see it, through a neighbor's shifted origin). The gate runs the fixture twice: default, and
-`GLYPH_RECORD_CHUNK=60000` (six emit windows), so the chunked emitter's `rec_first`
-carry is fenced on an ordinary corpus. The `emitter-window-offset-dropped` mutation
-reddens only through the chunked pass. (The chunked-arena and readback-hop passes and
-their six mutations retired with the hop machinery at E2b.) Blind to corpora outside
-the fixture, to a fault the engine and chain share (ground truth layers: engine-check,
-reference-port), and to non-robust backend behavior (Metal discards the
-phantom-class writes; see the mutation's `why`).
+The lessons these gates taught stay true and are the pattern for re-gating
+them: **a check must refuse to pass having compared nothing** (the bake fails
+if no query ran, the reference fails if nothing was in domain, repo-verify
+refuses zero items, STRICT refuses an unexercised bucket), and a count that
+quietly drops is how a check goes vacuous without going red — quote the
+volumes.
 
 ### What the whole battery cannot see
 
 Worth holding in one place, because each check's blind spot is defensible alone
 and the union is not:
 
-- **Nothing executes the benches.** `engine/bench/*.mojo` is compile-checked only.
-- **`ffi_selftest` only covers the single-item C ABI entry.** It was wired into
-  `engine/check.sh` on 2026-09-06 (it had been red for an unknown time — the
-  pinned toolchain miscompiled the in-process `ffi` import in executable
-  codegen, so it now links the SHIPPED dylib and genuinely crosses the
-  boundary). It skips the five multi-item fixtures by design; batched-entry
-  coverage is repo-verify. The toolchain miscompile class itself is not pinned
-  by anything else: gate engine-check uses a (0,0,0) origin and is blind to
-  exactly the `origin_x` read that broke.
+- **The layout's agreement with the JS oracle, the strategies' agreement with
+  each other, and the CubeCL chain** — retired, above.
+- **Nothing executes the benches.** `tools/bench_hyper.py` and the
+  `--cubecl-chain-bench` instrument are run by hand.
 - **`tools/verify_atlas.py`, `preview_glyphs.py`, `repro_pick_oblique.py`** are
   manual tools, run by **zero** checks. So the atlas bins' structural and semantic
   correctness, and the oblique-pick repro, are exercised by nothing in the battery
   — the atlas is only ever checked for being byte-identical to what it was, which
   says nothing about whether what it was is right.
-- **PROVENANCE.md's prose is generated but only partially validated.** The stale
-  claims found 2026-09-06 ("NOTHING READS THEM YET" for files `gen.mjs` reads at
-  :93 and :175; "all 22 committed fixtures" when there are 25) are fixed, and the
-  fixture count is now READ FROM build.toml at generation time — the generator
-  refuses to write an unverifiable number. But the rest of the prose is still
+- **PROVENANCE.md's prose is generated but only partially validated.** The
+  fixture count is READ FROM build.toml at generation time — the generator
+  refuses to write an unverifiable number — but the rest of the prose is
   hand-written inside `tools/vendor-manifest.py` and nothing re-validates it;
   the vendor-hashes gate only ever compares hashes and re-derivations.
 
@@ -485,24 +452,24 @@ landed.** "I broke it and nothing failed" and "I failed to break it" print
 identically. Assert the edit applied, then read the result. Equally: a source
 scan is worth exactly what its match set is worth — "no grep match" is not "does
 not exist," which has produced a wrong conclusion here as recently as
-2026-09-06.
+2026-09-06. A measurement can be undone before it is read, too: `cargo run -p
+glyph` re-serializes `Cargo.lock` before the runner hashes it, so a lockfile
+perturbation "proves" nothing that way (2026-10-09) — run `target/release/glyph`.
 
 There is a THIRD outcome, beyond "landed" and "failed to land": **landed in a
 region nothing reads.** Measured 2026-09-06 — resolving an out-of-range
-codepoint to a real trie block instead of the shared missing block leaves all
-sixteen suites, ffi_selftest and every instrument GREEN, because no fixture in
-the corpus carries an F5–F7 lead byte; the same edit reddens engine-check,
-whose `fixtures/overflow-leads.txt` is the only input in the tree that reaches
-that branch. So a mutation's `why` names the CONSUMER it perturbs, not just the
-defect it stands for, and "the gate stayed green" is a claim about the corpus
-until you have shown the mutated line is on a path the corpus walks.
+codepoint to a real trie block instead of the shared missing block left every
+check green but one, because no fixture in the corpus carries an F5–F7 lead
+byte; only `fixtures/overflow-leads.txt` reaches that branch. So a mutation's
+`why` names the CONSUMER it perturbs, not just the defect it stands for, and
+"the gate stayed green" is a claim about the corpus until you have shown the
+mutated line is on a path the corpus walks.
 
-The same run measured a shared fault. `phantom-row` (the wrap rule counting the
-terminating newline's own row) reddens `conformance` on 3 of 17 fixtures and
-leaves `conformance_real` green: the serial fold and the scan monoid both call
-`rows_for_line`, so the oracle-free cross-form runner cannot see a defect that
-lives inside the function they share. That is its documented blind spot, now
-with a number against it.
+A cross-form comparison is blind to a fault inside a function both forms
+share. Measured 2026-09-06: the wrap rule counting the terminating newline's
+own row (`phantom-row`) reddened the oracle-backed fixture comparison and left
+the serial-fold-versus-scan comparison green, because both forms call
+`rows_for_line`. Only the oracle can see a shared defect.
 
 ## Fences — generated, vendored, or immutable
 
@@ -513,19 +480,20 @@ with a number against it.
 | `assets/atlas/cluster-classes.bin` | generated | `tools/gen_cluster_table.py` from the vendored UCD — the class table every cluster-mode implementation reads; regenerate BEFORE the atlas bins, which carry it verbatim |
 | `assets/atlas/engine-trie.bin` | generated | `tools/gen_real_trie.py` |
 | `native/fixtures/emoji-corpus-{small,large}.txt` | generated | `tools/gen_emoji_corpus.py` from `codepoints.bin`'s v2 sequence section — the cluster demo corpus; a demo asset, not a golden input |
-| `engine/glyph_schema.{mojo,mjs}` | generated | `tools/gen_schema.py` from `schema/glyph-identity.json` — **two** edges leave the schema; editing it invalidates the corpus as well as the dylib |
+| `engine/glyph_schema.mjs` | generated | `tools/gen_schema.py` from `schema/glyph-identity.json`; the fixture generators read it, so editing the schema invalidates the corpus |
 | `tools/vendor/` | vendored, hash-pinned | `vendor-manifest.py --check`; upstream drift is information, not failure |
 | `schema/glyph-identity.json` | vendored verbatim | drift means an upstream refresh, not a local edit |
 | `native/src/shaders/*.wgsl`, `crates/*/shaders/*.wgsl` | fenced | the naga tests (`native/tests/wgsl.rs`, and each field-mode crate's own `tests/wgsl.rs`) pin the shader *set* — that it compiles and exists, not what it draws. The only thing that sees a pixel change is the golden-view A/B, whose blind spots are above. That gap is why edits here need their own re-baselined change rather than an ordinary commit. `glyph_field.wgsl` moved byte-identically (git mv) into `crates/glyph-field-instanced/shaders/` on 2026-10-05 when the glyph field split into render modes; a move is not an edit, and the goldens are the proof |
 | `native/fixtures/baseline-view.txt` | IMMUTABLE | it is the input to `text.png`; editing it re-baselines that check silently |
 | `native/fixtures/emoji-view.txt` | IMMUTABLE | the input to `emoji.png`, one line per class of bitmap slot the trie carries; same reason |
 | `native/fixtures/g-pick-repo/empty.rs` | IMMUTABLE, zero bytes | the only input that reaches the page-extent origin seed; deleting it removes a check's ability to see its subject without removing the check |
-| `native/fixtures/cubecl-fork/` | IMMUTABLE | the cubecl-fork gate's standing corpus — the only committed input exercising paginate's m >= 3 / segment >= 3 classes, the committed-cluster classes at wrap/page boundaries, and the empty-item placement class (`clusters.txt` + `empty.txt`, 2026-09-30); editing it re-hollows a bit-exactness gate silently (the strict mode's exercise asserts catch deletion, not weakening) |
+| `native/fixtures/cubecl-fork/` | IMMUTABLE | the retired cubecl-fork check's standing corpus — the only committed input exercising paginate's m >= 3 / segment >= 3 classes, the cluster classes at wrap/page boundaries, and the empty-item placement class (`clusters.txt` + `empty.txt`); kept for re-gating. Editing it re-hollows that check silently |
 | `out/tooling-ab/baseline/<key>/` | tracked pixel oracle, one set per rasterizer; **golden** in build.toml | changes only on purpose, with a note saying why; the runner refuses to regenerate it. A new host adopts its own set by hand (the gate prints how); it never edits another's |
 | `integration/egui/` | vendored reference | never compiled; the real dependency is from crates.io |
 
 Hand-editing a generated file buys a failure on the next run. Regenerate instead
-(`pixi run gen-trie` / `gen-schema`, `node tools/export-atlas.mjs`).
+(`python3 tools/gen_real_trie.py`, `python3 tools/gen_schema.py`,
+`node tools/export-atlas.mjs`; the justfile has `gen-trie` and `gen-schema`).
 
 **Which language a thing is written in is a correctness decision, not taste.**
 Code that produces or checks an ANSWER stays in its own language, deliberately:
@@ -544,8 +512,8 @@ the JS oracle this engine was ported from, now retired: `tools/vendor/ref` and
 deliberately forked. Edits there are invisible to every check here, so they
 cannot be verified and cannot be trusted.
 
-Dependency pins (wgpu 30, winit 0.30, glam 0.33, egui 0.36, cubecl =0.11.0-pre.4, mojo/max per
-`pixi.toml`): no bump without its own pass. The past bumps were done as multi-part
+Dependency pins (wgpu 30, winit 0.30, glam 0.33, egui 0.36, cubecl =0.11.0-pre.4):
+no bump without its own pass. The past bumps were done as multi-part
 work and their reports (`out/STAGE_H_REPORT.md`, `STAGE_I_REPORT.md`) are worth
 reading — but they agree on less than they look like they do, each having
 reinvented its own structure, so take the invariant and not the format: **one
@@ -561,25 +529,22 @@ single most common way to misread the repo, so:
 
 - **Lettered stages (A–L)** are **history, not structure.** `out/STAGE_*_REPORT.md`
   are records of landed work and keep their names on purpose. There has never
-  been a canonical index, and there cannot be one now: A and B have no report and
-  survive only as retrospective mentions inside later ones, and D has no report
-  either — it has a dedicated doc instead, `engine/README-FFI.md`, whose title
-  carries the letter. The convention is
-  **retired** — see "Where work lands". Outside `out/`, a stage letter is
-  archaeology. When you touch a comment carrying one, prefer the
+  been a canonical index, and there cannot be one now: some letters have no
+  report and survive only as retrospective mentions inside later ones. The
+  convention is **retired** — see "Where work lands". Outside `out/`, a stage
+  letter is archaeology. When you touch a comment carrying one, prefer the
   substance ("since the layout seam", "since the carrier split") over the letter.
 - **`Stage 0`–`4` is ambiguous and binds to two different lists.** The live one is
-  the reference port, canonically enumerated with dates and acceptance criteria in
-  **`engine/PORT-PLAN.md`** (0 = fixture parity, 1 = trie, 2 = fold, 3 = scan,
-  4 = bake). The dead one numbered the layout-seam work and was deleted from
-  `engine/BACKEND-PLAN.md`; that file now carries a warning that its own numbered
-  list is a *different* list. Some source comments still reference the dead
-  scheme unqualified. Name the thing, not the number.
+  the reference port: 0 = fixture parity, 1 = trie, 2 = fold, 3 = scan,
+  4 = bake — the `--fixture-*` instruments carry those names, and the
+  `port: stage N` commits record them. The dead one numbered the layout-seam
+  work. Some source comments still reference the dead scheme unqualified.
+  Name the thing, not the number.
 - **Check numbers (0–9, 1b, 8b)** were positions in one shell script and were
   renumbered twice before the gates got names (2026-09-06). The live
   identifiers are the `[[gate]] name =` strings in `build.toml`
-  (committed-artifacts … reference-port); `cargo glyph gates` lists
-  them. Old reports and comments still use the numbers — map by name.
+  (manifest … pixel-ab); `cargo glyph gates` lists them. Old reports and
+  comments still use the numbers — map by name.
 
 ## Where work lands
 
@@ -588,13 +553,10 @@ by a report are committed; scratch renders are not. The battery writes to
 `out/tooling-ab/sweep/` (untracked).
 
 **The lettered-stage report convention is retired.** It ran C through L and
-stopped on 2026-09-03. Since then 34 commits (33 excluding one merge) have landed
-the whole reference port, WrapBack, the phantom-row fix and the corpus vendoring,
-and **not one filed a lettered-stage report**. Read that precisely: the word
-"stage" is still in use — the reference-port commits are `port: stage 0`..`4`,
-which is the live numbering, not the retired letters. What stopped is the
-`out/STAGE_<LETTER>_REPORT.md` artifact and its template. Do not start a new
-letter; `out/STAGE_*.md` stays as history.
+stopped on 2026-09-03. What stopped is the `out/STAGE_<LETTER>_REPORT.md`
+artifact and its template; the word "stage" is still in use for the reference
+port's live numbering. Do not start a new letter; `out/STAGE_*.md` stays as
+history.
 
 Some older handoff notes have not caught up and will tell you otherwise —
 `integration/notes/08-view-structure-handoff.md:71` instructs you to file a report
@@ -610,13 +572,10 @@ written note in `out/` saying what changed and what you ran; it just is not a
 ## Read next
 
 - `native/AGENTS.md` — Rust crate rules, module contracts, debug env vars.
-- `engine/README.md`, `engine/README-FFI.md` (the C ABI), `engine/TOOLCHAIN.md`.
-- `engine/PORT-PLAN.md` — the reference port's live stage record.
-- `engine/BACKEND-PLAN.md` — the layout seam and what is planned next.
 - `native/src/*.rs` module headers — the real per-module contracts.
 - `assets/atlas/FORMAT.md`; `schema/glyph-identity.json` when touching layout.
+- `TOOLING-PLAN.md` — why the tool is shaped the way it is.
 
-`out/*_REPORT.md` are **records, not current state**, and at least one states a
-fact that later stopped being true (`ENGINE_TOOLCHAIN_REPORT.md` says no node is
-needed; checks 1 and 1b both run node). Read them for why something was done, not
-for how things are.
+`out/*_REPORT.md` are **records, not current state**, and some state facts that
+later stopped being true. Read them for why something was done, not for how
+things are.
