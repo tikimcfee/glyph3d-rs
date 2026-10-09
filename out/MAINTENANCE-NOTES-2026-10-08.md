@@ -500,3 +500,42 @@ benchmark question for the 5090 box, not a cleanliness one.
   One table in `crates/glyph-session-dirs`, shared by the renderer and the
   launcher, and both report what they scanned. Kimi Code transcripts gained a
   parser (`agent_transcript/kimi.rs`). Renders still byte-identical to main.
+
+## 6. Work log and open threads — kept current as we go
+
+**Landed on this branch** (none pushed or merged to main yet; that is Ivan's call):
+
+| Commit | What |
+|---|---|
+| 6eb2d76 | these notes |
+| 1062e23 | launch config drives repo presets and session discovery; `launch_config.toml` → `.example`; hermetic TUI tests |
+| 88525ea | `GLYPH_FLAGSHIP_REPO` / `GLYPH_WEB` env vars; repo-relative doc links |
+| 9351a8d | experiments reach Zed through the `experiments/zed` symlink |
+| f864183 | session discovery defaults to each app's locations (`crates/glyph-session-dirs`); Kimi Code parser |
+
+Main's build fix (872621d, the other agent's) was fast-forwarded in before any of it.
+
+**On the Mac after merging:** `cp launch_config.example.toml launch_config.toml`;
+`ln -s ~/localdev/externalcompute/zed experiments/zed`;
+`export GLYPH_FLAGSHIP_REPO=~/localdev/viz-web/glyph3d-js`.
+
+**Open threads, next up (Ivan named these):**
+- Experiments links: the symlink scheme is committed but has never been built
+  against real Zed. No Zed checkout on this box.
+- Missing clones: this box has neither `viz-web/glyph3d-js` (flagship corpus,
+  `GLYPH_WEB` refresh source) nor Zed.
+
+**Open threads, parked:**
+- pixel-ab re-baseline: Mac first (text, repo-zoom at least), then Linux
+  re-adoption including emoji-cluster and repo-cluster. Ivan's call (section 3).
+- `cargo glyph` alias doubles inside `.claude/worktrees/` (item 1a½). Unfixed.
+- Section 4 commit order, steps 2–8: untouched.
+- NEW 2026-10-09: `build.toml` `[artifact.renderer]` inputs list
+  `native/Cargo.lock`, which has not existed since the workspace move
+  (2026-09-06, lock at the root), and omit the root `Cargo.toml`. So a
+  dependency bump or a new workspace member does not change the renderer's
+  input hash, and `--frozen` would call a stale binary current. [inferred
+  from the manifest; not measured]
+- `just` is not installed here, so the justfile `profile` recipe is unrun.
+- `discovery.rs` derives a Claude project name from the slug's last `-`
+  segment (`…-glyph3d-js` → `js`).
