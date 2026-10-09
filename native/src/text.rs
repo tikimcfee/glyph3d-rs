@@ -930,10 +930,18 @@ pub fn stage_records(arena: GlyphArena, placement: &ItemPlacement, slot_ink: &[O
 /// keywords / numbers / strings / line comments / punctuation — a heuristic
 /// paint layer over the engine's layout; leader classification is the same
 /// byte-level logic as `reference_layout`.
+///
+/// It must paint exactly what the device Pass 2 paints line by line
+/// ([`colorize_line_into`], and for pure printable ASCII
+/// [`colorize_pure_ascii_line_slice`]) — hyper-oracle's paint tier holds the
+/// device to it. So its word rule is the fast path's: a word is checked up to
+/// the point that ENDS it (a word running into a string, `return"$"`, is not
+/// a keyword) and only a keyword is filled back. Until 2026-10-09 the generic
+/// forms checked up to the last word byte and filled back any colour, so
+/// `return"$"` came out keyword, string and all (C17).
 pub fn colorize_leaders(bytes: &[u8]) -> Vec<u32> {
     let mut colors: Vec<u32> = Vec::with_capacity(bytes.len());
     let mut word_start_byte = usize::MAX;
-    let mut word_end_byte = 0usize;
     let mut word_start_col = 0usize;
     let is_block_continuation = is_block_comment_continuation_line(bytes);
     let mut in_line_comment = false;
@@ -948,7 +956,7 @@ pub fn colorize_leaders(bytes: &[u8]) -> Vec<u32> {
     let mut id = 0usize;
     while id < bytes.len() {
         let b0 = bytes[id] as u32;
-        let (n, ch) = if b0 < 0x80 {
+        let (_len, ch) = if b0 < 0x80 {
             (1usize, b0 as u8 as char)
         } else if b0 & 0xE0 == 0xC0 {
             let cp = ((b0 & 0x1F) << 6) | (byte_at(id + 1) & 0x3F);
@@ -970,8 +978,8 @@ pub fn colorize_leaders(bytes: &[u8]) -> Vec<u32> {
         let mut color = palette::C_DEFAULT;
         if ch == '\n' {
             if word_start_byte != usize::MAX {
-                let wc = word_color_packed(&bytes[word_start_byte..word_end_byte]);
-                if wc != palette::C_DEFAULT {
+                let wc = word_color_packed(&bytes[word_start_byte..id]);
+                if wc == palette::C_KEYWORD {
                     colors[word_start_col..].fill(wc);
                 }
                 word_start_byte = usize::MAX;
@@ -1018,8 +1026,8 @@ pub fn colorize_leaders(bytes: &[u8]) -> Vec<u32> {
             color = palette::C_COMMENT;
         } else if ch == '#' && (id + 1 >= bytes.len() || (bytes[id + 1] != b'[' && !(bytes[id + 1] == b'!' && id + 2 < bytes.len() && bytes[id + 2] == b'['))) {
             if word_start_byte != usize::MAX {
-                let wc = word_color_packed(&bytes[word_start_byte..word_end_byte]);
-                if wc != palette::C_DEFAULT {
+                let wc = word_color_packed(&bytes[word_start_byte..id]);
+                if wc == palette::C_KEYWORD {
                     colors[word_start_col..].fill(wc);
                 }
                 word_start_byte = usize::MAX;
@@ -1034,14 +1042,13 @@ pub fn colorize_leaders(bytes: &[u8]) -> Vec<u32> {
                 word_start_byte = id;
                 word_start_col = colors.len();
             }
-            word_end_byte = id + n;
             if bytes[word_start_byte].is_ascii_digit() {
                 color = palette::C_NUMBER;
             }
         } else {
             if word_start_byte != usize::MAX {
-                let wc = word_color_packed(&bytes[word_start_byte..word_end_byte]);
-                if wc != palette::C_DEFAULT {
+                let wc = word_color_packed(&bytes[word_start_byte..id]);
+                if wc == palette::C_KEYWORD {
                     colors[word_start_col..].fill(wc);
                 }
                 word_start_byte = usize::MAX;
@@ -1052,7 +1059,26 @@ pub fn colorize_leaders(bytes: &[u8]) -> Vec<u32> {
         prev = ch;
         id += 1;
     }
+    // The item's last word, when no newline ends it: until 2026-10-09 it was
+    // never coloured here while `colorize_line_into` coloured it, so a file
+    // ending in a keyword painted differently on the host and device paths.
+    if word_start_byte != usize::MAX {
+        let wc = word_color_packed(&bytes[word_start_byte..]);
+        if wc == palette::C_KEYWORD {
+            colors[word_start_col..].fill(wc);
+        }
+    }
     colors
+}
+
+/// Whether the colourisers push a colour for byte `b`: every byte but a
+/// continuation byte (0x80..=0xBF) or an invalid lead (0xF8..=0xFF) — the
+/// leader rule `colorize_leaders` and [`colorize_line_into`] both decode by.
+/// The device Pass 2 counts leaders with it to find where a chunk's bytes
+/// start inside a whole-line colour run (C17).
+#[inline(always)]
+pub fn is_colorizer_leader(b: u8) -> bool {
+    b < 0x80 || b & 0xE0 == 0xC0 || b & 0xF0 == 0xE0 || b & 0xF8 == 0xF0
 }
 
 /// Colorize a single line's leaders into a reusable vector.
@@ -1066,7 +1092,6 @@ pub fn colorize_line_into(line_bytes: &[u8], colors: &mut Vec<u32>) {
     }
     colors.reserve(line_bytes.len());
     let mut word_start_byte = usize::MAX;
-    let mut word_end_byte = 0usize;
     let mut word_start_col = 0usize;
     let is_block_continuation = is_block_comment_continuation_line(line_bytes);
     let mut in_line_comment = false;
@@ -1081,7 +1106,7 @@ pub fn colorize_line_into(line_bytes: &[u8], colors: &mut Vec<u32>) {
     let mut id = 0usize;
     while id < line_bytes.len() {
         let b0 = line_bytes[id] as u32;
-        let (n, ch) = if b0 < 0x80 {
+        let (_len, ch) = if b0 < 0x80 {
             (1usize, b0 as u8 as char)
         } else if b0 & 0xE0 == 0xC0 {
             let cp = ((b0 & 0x1F) << 6) | (byte_at(id + 1) & 0x3F);
@@ -1134,8 +1159,8 @@ pub fn colorize_line_into(line_bytes: &[u8], colors: &mut Vec<u32>) {
             color = palette::C_COMMENT;
         } else if ch == '#' && (id + 1 >= line_bytes.len() || (line_bytes[id + 1] != b'[' && !(line_bytes[id + 1] == b'!' && id + 2 < line_bytes.len() && line_bytes[id + 2] == b'['))) {
             if word_start_byte != usize::MAX {
-                let wc = word_color_packed(&line_bytes[word_start_byte..word_end_byte]);
-                if wc != palette::C_DEFAULT {
+                let wc = word_color_packed(&line_bytes[word_start_byte..id]);
+                if wc == palette::C_KEYWORD {
                     colors[word_start_col..].fill(wc);
                 }
                 word_start_byte = usize::MAX;
@@ -1150,14 +1175,13 @@ pub fn colorize_line_into(line_bytes: &[u8], colors: &mut Vec<u32>) {
                 word_start_byte = id;
                 word_start_col = colors.len();
             }
-            word_end_byte = id + n;
             if line_bytes[word_start_byte].is_ascii_digit() {
                 color = palette::C_NUMBER;
             }
         } else {
             if word_start_byte != usize::MAX {
-                let wc = word_color_packed(&line_bytes[word_start_byte..word_end_byte]);
-                if wc != palette::C_DEFAULT {
+                let wc = word_color_packed(&line_bytes[word_start_byte..id]);
+                if wc == palette::C_KEYWORD {
                     colors[word_start_col..].fill(wc);
                 }
                 word_start_byte = usize::MAX;
@@ -1169,8 +1193,8 @@ pub fn colorize_line_into(line_bytes: &[u8], colors: &mut Vec<u32>) {
         id += 1;
     }
     if word_start_byte != usize::MAX {
-        let wc = word_color_packed(&line_bytes[word_start_byte..word_end_byte]);
-        if wc != palette::C_DEFAULT {
+        let wc = word_color_packed(&line_bytes[word_start_byte..]);
+        if wc == palette::C_KEYWORD {
             colors[word_start_col..].fill(wc);
         }
     }
@@ -1384,6 +1408,26 @@ pub fn colorize_pure_ascii_line_slice(line: &[u8], colors: &mut [u32]) -> [u32; 
     counts
 }
 
+/// `[DEFAULT, KEYWORD, NUMBER, STRING, COMMENT, PUNCT]` counts of a colour
+/// run — what [`colorize_pure_ascii_line_slice`] returns for the run it
+/// writes. The device Pass 2 uses it for a cut line's share, whose colours
+/// come from the whole line rather than from a colouriser call (C17).
+pub fn palette_counts(colors: &[u32]) -> [u32; 6] {
+    let mut counts = [0u32; 6];
+    for &c in colors {
+        let k = match c {
+            palette::C_KEYWORD => 1,
+            palette::C_NUMBER => 2,
+            palette::C_STRING => 3,
+            palette::C_COMMENT => 4,
+            palette::C_PUNCT => 5,
+            _ => 0,
+        };
+        counts[k] += 1;
+    }
+    counts
+}
+
 /// Fast-path syntax coloring for pure printable ASCII lines (0x20..=0x7E).
 /// Avoids UTF-8 decode branches and char conversions.
 /// Returns the counts of `[DEFAULT, KEYWORD, NUMBER, STRING, COMMENT, PUNCT]` in the line.
@@ -1471,6 +1515,49 @@ mod tests {
         assert_eq!(rows[9], 2, "and the next line starts immediately below");
     }
 
+    /// One colour per byte `is_colorizer_leader` accepts, over every byte
+    /// value in every position (continuations, overlong and invalid leads).
+    /// A lead truncated at the end of a line or item (malformed.pipe.bin's
+    /// class) panicked the per-line colouriser — every syntax-paint device
+    /// load of such a file — until 2026-10-09; and the whole-item one left an
+    /// unterminated last word uncoloured. Both now agree on both.
+    #[test]
+    fn colorizers_agree_on_truncated_leads_and_unterminated_words() {
+        for text in [&b"ab\xC3"[..], b"x \xE2\x82", b"fn \xF0\x9F\x98", b"let x = return", b"12"] {
+            let mut line = Vec::new();
+            colorize_line_into(text, &mut line);
+            assert_eq!(colorize_leaders(text), line, "{text:?}");
+        }
+    }
+
+    /// The histogram is the ASCII colouriser's own count, line for line.
+    #[test]
+    fn palette_counts_match_the_ascii_colorizer() {
+        for line in [
+            &b"fn main() { let x = 0x1F; // done"[..],
+            b"    /* open block",
+            b"   ",
+            b"\"a string\" + 'c' + `t` - 12.5e3",
+            b"#include <stdio.h>",
+            b"return while for",
+        ] {
+            let mut colors = vec![0u32; line.len()];
+            let counts = colorize_pure_ascii_line_slice(line, &mut colors);
+            assert_eq!(palette_counts(&colors), counts, "{:?}", std::str::from_utf8(line));
+        }
+    }
+
+    #[test]
+    fn colorizer_leader_rule_counts_the_colours() {
+        let mut bytes: Vec<u8> = (0u8..=255).collect();
+        bytes.extend_from_slice("fn é 世 😀 // x".as_bytes());
+        bytes.retain(|&b| b != b'\n');
+        let mut colors = Vec::new();
+        colorize_line_into(&bytes, &mut colors);
+        assert_eq!(colors.len(), bytes.iter().filter(|&&b| is_colorizer_leader(b)).count());
+        assert_eq!(colorize_leaders(&bytes).len(), colors.len());
+    }
+
     #[test]
     fn colorize_line_into_matches_colorize_leaders() {
         let sample = b"const x = 42;\nlet y = \"hello world\"; // comment\n# python comment\n/* block */\n * star line\n */\n#[derive(Debug)]\nfn test() -> bool { true }\n";
@@ -1507,13 +1594,23 @@ mod tests {
             b"#[derive(Clone)]".as_slice(),
             b"/* comment */ let x = 42;".as_slice(),
             b"\"unclosed string".as_slice(),
+            // A word that runs into a string: the fast path checks the word up
+            // to its flush point, so `return` here is never a keyword. The
+            // generic colourisers checked it up to its last word byte and
+            // painted `return"$"` keyword, string included (C17, 2026-10-09).
+            b"var e={};return\"$\"+s".as_slice(),
+            b"return'x'".as_slice(),
+            b"if`t`abc;".as_slice(),
+            b"1\"x\"2 + 3".as_slice(),
         ];
-        let mut buf_a = Vec::new();
-        let mut buf_b = Vec::new();
+        // AGAINST `colorize_leaders`, the generic colouriser: until 2026-10-09
+        // this compared against `colorize_line_into`, which hands every one
+        // of these pure-ASCII lines to the fast path itself, so it compared
+        // the fast path with itself and could not fail.
+        let mut fast = Vec::new();
         for &line in &lines {
-            colorize_line_into(line, &mut buf_a);
-            colorize_pure_ascii_line(line, &mut buf_b);
-            assert_eq!(buf_a, buf_b, "mismatch on line: {}", String::from_utf8_lossy(line));
+            colorize_pure_ascii_line(line, &mut fast);
+            assert_eq!(colorize_leaders(line), fast, "mismatch on line: {}", String::from_utf8_lossy(line));
         }
     }
 
