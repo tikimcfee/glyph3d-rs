@@ -25,7 +25,7 @@
 # Ratchet, NOT an equality: tests are added constantly, so an exact pin would
 # redden on the most common good action in the repo. A green run whose real
 # count exceeds the floor prints a NOTE naming the value to raise it to.
-test_floor = 249
+test_floor = 252
 
 
 # ── Products ─────────────────────────────────────────────────────────────
@@ -337,11 +337,11 @@ blind_to = "HyperLayout and CubeCL entirely — these are fold.rs/scan.rs/bake.r
 name = "hyper-oracle"
 scope = "render"
 kind = "cmd"
-cmd = "GLYPH_TRACE=warn target/release/glyph3d-native --hyper-oracle-check native/fixtures/cubecl-fork native/fixtures/g-cluster-repo native/fixtures/overflow-leads.txt native/fixtures/g-pick-repo native/fixtures/chunk-cut.txt --cluster-mode leader && GLYPH_TRACE=warn GLYPH_HYPER_ORACLE_STRICT=1 target/release/glyph3d-native --hyper-oracle-check engine/fixtures/*.pipe.bin native/fixtures/cubecl-fork native/fixtures/g-cluster-repo native/fixtures/overflow-leads.txt native/fixtures/g-pick-repo native/fixtures/chunk-cut.txt"
+cmd = "GLYPH_TRACE=warn target/release/glyph3d-native --hyper-oracle-check native/fixtures/cubecl-fork native/fixtures/g-cluster-repo native/fixtures/overflow-leads.txt native/fixtures/g-pick-repo native/fixtures/chunk-cut.txt native/fixtures/chunk-cut-paint.txt --cluster-mode leader && GLYPH_TRACE=warn GLYPH_HYPER_ORACLE_STRICT=1 target/release/glyph3d-native --hyper-oracle-check engine/fixtures/*.pipe.bin native/fixtures/cubecl-fork native/fixtures/g-cluster-repo native/fixtures/overflow-leads.txt native/fixtures/g-pick-repo native/fixtures/chunk-cut.txt native/fixtures/chunk-cut-paint.txt"
 pass_line = "hyper-oracle PASS"
 needs = ["renderer", "fixtures"]
-compare = "HyperLayout vs fold.rs's records compacted by layout::compact_records_into, bit-exact, through layout::diff_backends plus a per-record tally naming the byte, on FOUR tiers: records (its recording path, rederive.rs), host instances and placements (pass2_host.rs, a device-less load), and the DEVICE Pass 2 (pass2_device.rs, what every GPU load runs) run into host memory in both slot formats — RenderSlot byte-for-byte, DerivedSlot on every lane it carries — plus its placements. Corpora: the 26 pipe fixtures (each item its own buffer, its own cluster mode; paged-rows, paged-cols and scroll-only carry the page_rows / page_cols / scroll_rows classes), the IMMUTABLE cubecl-fork corpus, g-cluster-repo, overflow-leads.txt, g-pick-repo and the IMMUTABLE chunk-cut.txt (lines cut inside into chunks: a sequence across each 64 KiB target, non-ASCII advances before each cut, a continuation wider than any ASCII segment past the first page) in cluster mode, then those five again in leader mode. 2026-10-09: 1,143,155 records / 1,135,697 instances / 1,135,697 device slots x2 / 46 placements in the first run (389 sequence heads, 36 ASCII-led); 987,933 records / 983,348 instances and device slots x2 / 13 placements in the leader run. STRICT (first run) refuses zero records, zero sequence heads, or zero ASCII-led heads; both runs refuse zero device slots"
-blind_to = "Shared with the reference and so invisible here: the atlas trie (TrieTable::lookup, fu_to_world — the fixtures' own tries are world-unit and HyperLayout resolves font units) and fold::{rows_for_line, wrap_segment_of, wrap_row_of}, which HyperLayout borrows (reference-port fences those; phantom-row is the measured example). The device path past the emitter (the staging copy into VRAM, buffer chunking), the Derived field's vertex-stage Y/Z (the slot carries none), and the background Pass 1 prefetch (repo-verify holds it to the inline Pass 1 used here; since C15 both share one Pass 1 driver). Paint: every item is flat on both sides, so the device path's per-chunk syntax colouring (which restarts at an intra-line cut, unlike the whole-item colorizer) is not under test"
+compare = "HyperLayout vs fold.rs's records compacted by layout::compact_records_into, bit-exact, through layout::diff_backends plus a per-record tally naming the byte, on FIVE tiers: records (its recording path, rederive.rs), host instances and placements (pass2_host.rs, a device-less load), and the DEVICE Pass 2 (pass2_device.rs, what every GPU load runs) run into host memory in both slot formats — RenderSlot byte-for-byte, DerivedSlot on every lane it carries — plus its placements. Corpora: the 26 pipe fixtures (each item its own buffer, its own cluster mode; paged-rows, paged-cols and scroll-only carry the page_rows / page_cols / scroll_rows classes), the IMMUTABLE cubecl-fork corpus, g-cluster-repo, overflow-leads.txt, g-pick-repo and the IMMUTABLE chunk-cut.txt (lines cut inside into chunks: a sequence across each 64 KiB target, non-ASCII advances before each cut, a continuation wider than any ASCII segment past the first page) and the IMMUTABLE chunk-cut-paint.txt (a keyword across every intra-line cut) in cluster mode, then those six again in leader mode. 2026-10-09 (with chunk-cut-paint.txt): 1,504,558 records / 1,497,095 instances / 1,497,095 device slots x2 / 47 placements in the strict cluster run (389 sequence heads, 36 ASCII-led); 1,349,336 records / 1,344,746 instances and device slots x2 / 14 placements in the leader run. STRICT (first run) refuses zero records, zero sequence heads, or zero ASCII-led heads; both runs refuse zero device slots. The fifth tier, PAINT (C17, 2026-10-09): the device Pass 2 again under Paint::SyntaxHeuristic, every lane against the reference instances painted by text::colorize_leaders over the WHOLE item (the host Pass 2's colours, not the oracle's — the oracle has no paint); 1,497,095 slots x2 (785,492 a non-default colour) in the strict run, 1,344,746 x2 (666,045) in the leader run, and both runs refuse a paint tier that saw no syntax colour"
+blind_to = "Shared with the reference and so invisible here: the atlas trie (TrieTable::lookup, fu_to_world — the fixtures' own tries are world-unit and HyperLayout resolves font units) and fold::{rows_for_line, wrap_segment_of, wrap_row_of}, which HyperLayout borrows (reference-port fences those; phantom-row is the measured example). The device path past the emitter (the staging copy into VRAM, buffer chunking), the Derived field's vertex-stage Y/Z (the slot carries none), and the background Pass 1 prefetch (repo-verify holds it to the inline Pass 1 used here; since C15 both share one Pass 1 driver). Paint: the paint tier holds the device's line-by-line colouring to the whole-item colouriser, not to any truth — the heuristic's own rules (keywords, strings, comments) are shared and unjudged, and `--render-file`'s tokenizer (stage_file) is a third copy no tier reads"
 
 # HyperLayout against itself. EVERY --repo-engine but cubecl constructs the
 # same HyperLayout (layout.rs's backend table), so this is not an independent
@@ -865,4 +865,75 @@ expect = "split_body_is_fast_aligned_and_covers_the_size"
 # cargo test --release builds the renderer bin too (integration tests), so
 # without a restore rebuild prove would leave the MUTATED renderer in
 # target/release under an unchanged input hash (found 2026-10-09).
+rebuild = "cargo build --release"
+
+[[mutation]]
+name = "hyper-cut-head-own-share"
+gate = "hyper-oracle"
+why = "C17 put back: a chunk that starts inside a line colours only its own share of the line, so a string, comment or word open across the cut paints differently than a walk of the whole item does (578 of g-pick-repo/wide.txt's glyphs did until 2026-10-09; pixels in repo-down, repo-back-oblique and repo-wide). Only the paint tier sees it: layout is untouched. CONSUMED BY: layout_pass2_chunk's head colours in layout_hyper/pass2_device.rs, reached by wide.txt's intra-line cuts"
+file = "native/src/layout_hyper/pass2_device.rs"
+op = "replace"
+find = "        line_colors.extend_from_slice(&cut.head);"
+with = "        crate::text::colorize_line_into(&bytes[..memchr::memchr(b'\\n', bytes).unwrap_or(bytes.len())], &mut line_colors);"
+expect = "hyper-oracle FAIL"
+rebuild = "cargo build --release"
+
+[[mutation]]
+name = "hyper-cut-tail-own-share"
+gate = "hyper-oracle"
+why = "C17's other half put back: a chunk's last line, cut at the chunk's end, colours only the share before the cut, so a word that straddles the cut is judged on its prefix. CONSUMED BY: the cut_tail branch of layout_pass2_chunk in layout_hyper/pass2_device.rs, reached by wide.txt's intra-line cuts"
+file = "native/src/layout_hyper/pass2_device.rs"
+op = "replace"
+find = "let cut_tail = if nl_offset.is_none() && !cut.tail.is_empty() {"
+with = "let cut_tail = if false && nl_offset.is_none() && !cut.tail.is_empty() {"
+expect = "hyper-oracle FAIL"
+rebuild = "cargo build --release"
+
+[[mutation]]
+name = "hyper-comment-line-indent-painted"
+gate = "hyper-oracle"
+why = "The device's all-comment-line shortcut painted the line's indentation comment, where every colouriser paints it PUNCT (until 2026-10-09; a space has no ink, so pixel-invisible). CONSUMED BY: is_comment_line in layout_pass2_chunk (layout_hyper/pass2_device.rs), reached by real-kernels.pipe.bin's indented comment lines"
+file = "native/src/layout_hyper/pass2_device.rs"
+op = "replace"
+find = """                    // does (C17; a space has no ink, so no pixel moved).
+                    is_comment_line = counts[4] as usize == line_len;"""
+with = """                    // does (C17; a space has no ink, so no pixel moved).
+                    is_comment_line = counts[4] > 0 && counts[4] as usize + line_bytes.iter().take_while(|&&b| b == b' ').count() == line_len;"""
+expect = "hyper-oracle FAIL"
+rebuild = "cargo build --release"
+
+[[mutation]]
+name = "colorizer-fills-any-word-colour"
+gate = "cargo-test"
+why = "The generic colourisers filled ANY non-default word colour back over the word's span, the ASCII fast path only a keyword's, so a number running into a string (1\"x\"2) painted the string NUMBER on non-ASCII lines and on the host path only (until 2026-10-09). CONSUMED BY: colorize_leaders in text.rs, via colorize_pure_ascii_line_matches_colorize_line_into (which compared the fast path with itself until that day)"
+file = "native/src/text.rs"
+op = "replace"
+find = """                let wc = word_color_packed(&bytes[word_start_byte..id]);
+                if wc == palette::C_KEYWORD {
+                    colors[word_start_col..].fill(wc);
+                }
+                word_start_byte = usize::MAX;
+            }
+            color = palette::C_PUNCT;"""
+with = """                let wc = word_color_packed(&bytes[word_start_byte..id]);
+                if wc != palette::C_DEFAULT {
+                    colors[word_start_col..].fill(wc);
+                }
+                word_start_byte = usize::MAX;
+            }
+            color = palette::C_PUNCT;"""
+expect = "colorize_pure_ascii_line_matches_colorize_line_into"
+rebuild = "cargo build --release"
+
+[[mutation]]
+name = "colorizer-last-word-unflushed"
+gate = "cargo-test"
+why = "colorize_leaders never coloured an item's last word when no newline ended it, while colorize_line_into did, so a file ending in a keyword painted differently on the host and device paths (until 2026-10-09). CONSUMED BY: colorize_leaders' end flush in text.rs, via colorizers_agree_on_truncated_leads_and_unterminated_words"
+file = "native/src/text.rs"
+op = "replace"
+find = """    if word_start_byte != usize::MAX {
+        let wc = word_color_packed(&bytes[word_start_byte..]);"""
+with = """    if word_start_byte == usize::MAX - 1 {
+        let wc = word_color_packed(&bytes[word_start_byte..]);"""
+expect = "colorizers_agree_on_truncated_leads_and_unterminated_words"
 rebuild = "cargo build --release"
