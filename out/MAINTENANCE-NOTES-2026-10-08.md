@@ -7,7 +7,8 @@ status of the pass.
 **How to edit this file.** The status board is the source of truth. Item IDs
 are stable: never renumber, never reuse. When an item closes, set its row to
 `closed`, name the commit, and delete its detail section (the commit message
-carries the evidence). New findings get the next free ID in their group.
+carries the evidence). Record a hash in a FOLLOW-UP commit: amending a
+commit to name itself changes the hash it names. New findings get the next free ID in their group.
 Every claim is **[measured]** (a command ran) or **[inferred]** (read, not
 run); never promote the second kind without running it.
 
@@ -22,7 +23,7 @@ machines and clones, **M** machine-specific values, **R** runner.
 |---|---|---|---|
 | D1 | Root AGENTS.md documents 16 gates, build.toml has 9; dead read-next links; Mojo/dylib prose | open | rewrite against build.toml; takes C6, R2 with it |
 | D2 | `cargo glyph` alias doubles inside `.claude/worktrees/` | open | pick a fix option (below) |
-| D3 | `cargo glyph test engine` matched zero gates, printed ALL GATES GREEN | closed | 5860d3c: refused as NOTHING RAN; every verdict counts gates; `engine` scope gone |
+| D3 | `cargo glyph test engine` matched zero gates, printed ALL GATES GREEN | closed | 4d9de92: refused as NOTHING RAN; every verdict counts gates; `engine` scope gone |
 | D4 | `.agents/rules/rust-engineering.md` claims the tree does not back | open | short pass, with D1 |
 | D5 | `pixi.toml` tasks for a Mojo engine that no longer exists | open | retire or trim to fontTools |
 | D6 | Orphaned scripts and configs (check-cubecl.sh, fixture-parity, mutants.toml, deny.toml) | open | decide each; re-gating cubecl is the honest choice |
@@ -61,7 +62,7 @@ None pushed or merged to main; that is Ivan's call.
 | 9351a8d | experiments reach Zed through the `experiments/zed` symlink |
 | f864183 | session discovery defaults to each app's locations (`crates/glyph-session-dirs`); Kimi Code parser |
 | dc6a00f | renderer currency hashes root manifest and lockfile; `validate()` refuses dead literal inputs |
-| 5860d3c | `glyph test` refuses an empty gate selection (NOTHING RAN); verdicts count gates; `engine` scope removed |
+| 4d9de92 | `glyph test` refuses an empty gate selection (NOTHING RAN); verdicts count gates; `engine` scope removed |
 
 Main's build fix (872621d, the other agent's) was fast-forwarded in first.
 
@@ -99,7 +100,6 @@ historical). Also stale in the same file:
 - "Products" paragraph: currency is "a content hash of `engine/*.mojo` + the
   pixi pins". There is no Mojo (`engine/` holds `fixtures/` and
   `glyph_schema.mjs`). The inputs are now the Rust tree, root manifest and lock.
-- "`cargo glyph test engine` after touching Mojo is ~25s": see D3.
 - "Read next" names `engine/README.md`, `README-FFI.md`, `PORT-PLAN.md`,
   `BACKEND-PLAN.md`, `TOOLCHAIN.md`; none exist. `native/AGENTS.md` names two.
 - Fence table lists `engine/glyph_schema.{mojo,mjs}`; only `.mjs` exists, yet
