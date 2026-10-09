@@ -18,8 +18,6 @@ pub enum CliCommand {
     GpuInfo(GpuInfoMode),
     /// Developer CubeCL pipeline checks and benchmarks.
     Cubecl(CubeclTask),
-    /// Spike: verify vertex-stage Y/Z derivation on GPU.
-    SpikeVertexYz(PathBuf),
     /// Reference port parity check over .pipe.bin / .bake.bin fixtures.
     Fixture(FixtureTask),
     /// Headless repo scan, layout, and statistics measurement without a GPU.
@@ -131,10 +129,6 @@ impl Cli {
                 dir: dir.clone(),
                 color_mode: self.color_mode,
             });
-        }
-
-        if let Some(dir) = &self.spike_vertex_yz {
-            return CliCommand::SpikeVertexYz(dir.clone());
         }
 
         // Fixture parity tasks

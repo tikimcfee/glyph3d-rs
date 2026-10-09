@@ -113,64 +113,6 @@ fn main() {
                 std::process::exit(1);
             }
         }
-        CliCommand::SpikeVertexYz(dir) => {
-            let ctx = pollster::block_on(gpu::init(None));
-            let report = spike_vertex_yz::run_spike(&ctx, &dir);
-            println!("=== P2 SPIKE REPORT: Vertex-Stage Y/Z Bit-Exactness on Metal ===");
-            println!("Total Slots Evaluated: {}", report.total_slots);
-            println!(
-                "Vertex Stage Y: {} / {} exact matches ({:.4}%) | max ULP diff: {}",
-                report.vertex_y_matches,
-                report.total_slots,
-                (report.vertex_y_matches as f64 / report.total_slots as f64) * 100.0,
-                report.max_y_ulp,
-            );
-            println!(
-                "Vertex Stage Z: {} / {} exact matches ({:.4}%) | max ULP diff: {}",
-                report.vertex_z_matches,
-                report.total_slots,
-                (report.vertex_z_matches as f64 / report.total_slots as f64) * 100.0,
-                report.max_z_ulp,
-            );
-            println!(
-                "Compute Stage Y: {} / {} exact matches ({:.4}%)",
-                report.compute_y_matches,
-                report.total_slots,
-                (report.compute_y_matches as f64 / report.total_slots as f64) * 100.0,
-            );
-            println!(
-                "Compute Stage Z: {} / {} exact matches ({:.4}%)",
-                report.compute_z_matches,
-                report.total_slots,
-                (report.compute_z_matches as f64 / report.total_slots as f64) * 100.0,
-            );
-            println!(
-                "Vertex vs Compute exact bit match: {} / {} ({:.4}%)",
-                report.vertex_matches_compute,
-                report.total_slots,
-                (report.vertex_matches_compute as f64 / report.total_slots as f64) * 100.0,
-            );
-
-            if !report.first_y_mismatches.is_empty() {
-                println!("\nFirst Y mismatches (up to 5):");
-                for m in report.first_y_mismatches.iter().take(5) {
-                    println!(
-                        "  slot {}: item {} row {} wrap_seg {} | derived {:.7} ({:#010x}) vs stored {:.7} ({:#010x}) -> ULP {}",
-                        m.slot_idx, m.item_idx, m.row, m.wrap_segment, m.derived, m.derived_bits, m.stored, m.stored_bits, m.ulp
-                    );
-                }
-            }
-            if !report.first_z_mismatches.is_empty() {
-                println!("\nFirst Z mismatches (up to 5):");
-                for m in report.first_z_mismatches.iter().take(5) {
-                    println!(
-                        "  slot {}: item {} row {} wrap_seg {} | derived {:.7} ({:#010x}) vs stored {:.7} ({:#010x}) -> ULP {}",
-                        m.slot_idx, m.item_idx, m.row, m.wrap_segment, m.derived, m.derived_bits, m.stored, m.stored_bits, m.ulp
-                    );
-                }
-            }
-            std::process::exit(0);
-        }
         CliCommand::Fixture(task) => match task {
             FixtureTask::Reference(paths) => fixture::run_fixture_reference(&paths),
             FixtureTask::Trie(paths) => fixture::run_fixture_trie(&paths),

@@ -24,7 +24,6 @@ pub mod scan;
 pub mod scene;
 pub mod seam;
 pub mod spatial_scene;
-pub mod spike_vertex_yz;
 pub mod text;
 pub mod windowed;
 
