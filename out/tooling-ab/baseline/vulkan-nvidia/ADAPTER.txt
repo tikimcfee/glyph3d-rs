@@ -2,7 +2,7 @@ key: vulkan-nvidia
 backend: Vulkan
 vendor: 0x10de (nvidia)
 device: 0x2b85 NVIDIA GeForce RTX 5090 (DiscreteGpu)
-driver: NVIDIA 610.57.04
+driver: NVIDIA 615.78.08
 host: linux x86_64
 features: multi_draw_indirect_count=true timestamp_query=true
 limits: max_storage_buffer_binding_size=2147483644 max_buffer_size=4294967295
