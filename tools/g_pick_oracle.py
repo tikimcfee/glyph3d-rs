@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
-"""Stage G pick oracle: replicate the engine fold (glyph_pipeline.mojo THE
-FOLD) over raw file bytes and answer (file, row, col) -> (char, byte_off,
+"""Pick oracle: an independent Python implementation of the layout fold (the
+rule native/src/fold.rs implements; this file shares no code with it) over raw
+file bytes, answering (file, row, col) -> (char, byte_off,
 line). Used to assert the native binary's pick output independently.
 
 fold conventions: col = raw leader count within the source line;

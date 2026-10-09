@@ -1,13 +1,12 @@
-//! The serial fold — part of the reference port.
+//! The serial fold — the layout contract, in its plainest form.
 //!
 //! SOURCES. The oracle is `glyphPipelineReference.js` (779 lines, web repo
-//! `packages/glyph3d-core/src/compute/`); the working reference is
-//! `engine/glyph_pipeline.mojo`, which is already proven bit-exact against that
-//! oracle across 16 suites and is this tree's settled contract in the corners no
-//! fixture reaches (the out-of-range decode, the deleted per-glyph lineHeight
-//! fallback). Porting from the Mojo would normally risk inheriting the Mojo's
-//! faults — but the GATE here is the frozen fixture corpus, i.e. the oracle's own
-//! output, so any Mojo-specific divergence the corpus can see will show.
+//! `packages/glyph3d-core/src/compute/`; vendored as
+//! `engine/fixtures/inputs/glyphPipelineReference.js`). This file and the
+//! frozen fixture corpus — the oracle's own recorded output, replayed by
+//! `--fixture-fold` — are the contract: every backend is held to them. In the
+//! corners no fixture reaches (the out-of-range decode, the deleted per-glyph
+//! lineHeight fallback) this file's behaviour IS the settled rule.
 //!
 //! WHAT IT DOES, in order, matching `run_pipeline`:
 //!
@@ -21,19 +20,20 @@
 //!
 //! IT DOES NOT REPLACE `text::reference_layout`, which computes a subset of
 //! what this does. That is deliberate and the reason is at that function: this
-//! file was ported FROM the Mojo, `reference_layout` was written independently
-//! against the TSL kernel, and `--engine-check` is worth running precisely
-//! because its two sides have different lineage. Merging them would leave the
-//! Mojo checked against a port of itself.
+//! file descends from the layout pipeline itself, `reference_layout` was
+//! written independently against the TSL kernel, and the two are worth
+//! diffing precisely because they have different lineage. Merging them would
+//! leave the pipeline checked against a port of itself.
 //!
-//! THIS PORT IS SERIAL. The Mojo shards decode, fold, paginate and bounds across
-//! cores; every one of those decompositions is over disjoint ranges or an exact
-//! min/max, so the results are identical and the parallelism is not part of the
-//! contract. Nothing here needs to reproduce it to be bit-exact.
+//! THIS FOLD IS SERIAL. The parallel backends shard decode, fold, paginate and
+//! bounds across cores or device threads; every one of those decompositions is
+//! over disjoint ranges or an exact min/max, so the results are identical and
+//! the parallelism is not part of the contract. Nothing here needs to
+//! reproduce it to be bit-exact.
 //!
 //! ── THE FLOAT DISCIPLINE IS HYBRID, ON PURPOSE ───────────────────────────────
 //! Three regimes coexist in `layout_item`, and a port written naturally with f32
-//! locals reproduces NONE of them. Landmine 2 of engine/PORT-PLAN.md:
+//! locals reproduces NONE of them:
 //!
 //! | quantity            | discipline                        | why |
 //! |---------------------|-----------------------------------|-----|
@@ -117,7 +117,7 @@ impl std::str::FromStr for WrapMode {
 
 impl WrapMode {
     /// The wire encoding: 0 = Down, 1 = Back. Shared by the `.pipe.bin` item
-    /// record, the FFI descriptor and the device item table.
+    /// record and the device item table.
     pub const fn code(self) -> i64 {
         match self {
             WrapMode::Down => 0,
@@ -175,8 +175,8 @@ impl std::str::FromStr for ClusterMode {
 }
 
 impl ClusterMode {
-    /// The wire encoding: 0 = Leader, 1 = Cluster. Shared by the `.pipe.bin`
-    /// v5 item record and the FFI descriptor — same role as WrapMode::code.
+    /// The wire encoding: 0 = Leader, 1 = Cluster, as the `.pipe.bin` v5 item
+    /// record carries it — same role as WrapMode::code.
     pub const fn code(self) -> i64 {
         match self {
             ClusterMode::Leader => 0,
@@ -196,10 +196,6 @@ impl ClusterMode {
 }
 
 /// One file in the arena: byte range + layout params.
-///
-/// FIELD ORDER IS LOAD-BEARING — `fixture::PipeFixture::manifest` hashes these
-/// in declaration order and `engine/fixture_manifest.mojo` hashes its own struct
-/// the same way, so reordering breaks gate 9's parse parity. That is intended.
 ///
 /// `line_height` is REQUIRED: a NaN one is malformed input, not a request for a
 /// per-glyph fallback. The five integer page-geometry params are integers here
@@ -241,15 +237,16 @@ pub struct Item {
 /// Float carriers hold measures and u32 carriers hold counts — no bitcasts, and
 /// a count cannot land in a float array by accident.
 ///
-/// Allocated ZEROED, which subsumes two duties the Mojo performs explicitly: its
-/// gap sweep (bytes no item claims) and the fold's non-leader zeroing. Zero is
-/// the defined state of both, so the OUTPUT is identical; only the writes differ.
+/// Allocated ZEROED, which subsumes two duties a sharded implementation performs
+/// explicitly: a gap sweep (bytes no item claims) and the fold's non-leader
+/// zeroing. Zero is the defined state of both, so the OUTPUT is identical; only
+/// the writes differ.
 ///
 /// THE FIELD NAMES STAY SHORT HERE, and only here. `sm`/`gi`/`fl`/`lm`/`lc`/
 /// `wm`/`wc` are the cross-layer schema's own spellings — they appear under
-/// exactly these names in `engine/glyph_schema.mojo`, in the JS contract, and in
-/// every lane constant (`LM_X`, `LC_ROW`, `SM_ADVANCE`) — so renaming them here
-/// would break the correspondence that lets four layers be checked against each
+/// exactly these names in the JS contract, in the CubeCL kernels, and in every
+/// lane constant (`LM_X`, `LC_ROW`, `SM_ADVANCE`) — so renaming them here
+/// would break the correspondence that lets the layers be checked against each
 /// other. Everything LOCAL is spelled out instead: an abbreviation is a poor
 /// place to hide a carrier distinction, which is what `exp_ord` turned out to be
 /// hiding when it cost the fold a wrong comparison.
@@ -545,10 +542,10 @@ pub(crate) fn is_static_zero_cp(cp: u32) -> bool {
 
 /// THE SEQUENCE PASS — one item, one serial walk over its leaders, between
 /// decode and the fold. A transcription of the oracle's `resolveClusters`
-/// (engine/fixtures/inputs/glyphPipelineReference.js); engine/glyph_cluster.mojo
-/// is the same rule in the shipped engine. When they disagree the oracle is
-/// wrong only after the c9667ec protocol (fix the oracle, regenerate, let the
-/// ports red).
+/// (engine/fixtures/inputs/glyphPipelineReference.js); the layout backends and
+/// the device chain (`cubecl_chain/cluster.rs`) carry the same rule. When they
+/// disagree the oracle is wrong only after the c9667ec protocol (fix the
+/// oracle, regenerate, let the ports red).
 ///
 /// Longest-prefix match over the trie's sequence table, greedy from the left
 /// (a matched span is consumed whole, which pairs RI runs exactly — GB12/GB13
@@ -735,8 +732,8 @@ fn layout_item(
             line_advance
         };
         // X and BASE_X carry the same value at fold time — paginate is what
-        // later separates them — so this is one aligned 16-byte store in the
-        // Mojo, with the same expressions and the same narrowing points.
+        // later separates them — so both lanes take one expression with one
+        // narrowing point.
         let position_x = (item_relative_x + origin_x) as f32;
         slots.lm[id * 4] = position_x;
         slots.lm[id * 4 + 1] = (-(row as f64) * line_height + origin_y) as f32;
@@ -915,8 +912,8 @@ pub(crate) fn bounds_range(slots: &Slots, start: usize, stop: usize) -> [f64; 6]
 /// never a finding.
 ///
 /// Misses are collected in BYTE ORDER, one entry per occurrence rather than per
-/// distinct codepoint; the Mojo reaches the same order by concatenating its
-/// shards' lists in shard order, which is byte order.
+/// distinct codepoint; a sharded decode reaches the same order by
+/// concatenating its shards' lists in shard order, which is byte order.
 pub(crate) fn decode_all<T: ResolveGlyph + ?Sized>(
     bytes: &[u8],
     slots: &mut Slots,
@@ -992,8 +989,7 @@ pub fn run_pipeline<T: ResolveGlyph + ?Sized>(
     let (misses, leaders) = decode_all(bytes, &mut slots, trie);
 
     // ── the sequence pass, per item, between decode and the fold — so the
-    //    trailer lanes are rewritten before any advance sum reads them. The
-    //    Mojo engine's hook sits at the same point in run_pipeline_into.
+    //    trailer lanes are rewritten before any advance sum reads them.
     for item in items {
         if item.cluster_mode == ClusterMode::Cluster {
             resolve_clusters(bytes, &mut slots, trie, item);

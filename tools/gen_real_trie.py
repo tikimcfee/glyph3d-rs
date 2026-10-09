@@ -29,9 +29,11 @@ are IEEE-754 round-to-nearest-even, so the Rust side reproduces the bits with
 `(advance_fu as f64 / em_height_fu as f64) as f32` exactly as before.
 
 THIS IS A SECOND REALIZATION ON PURPOSE. `native/src/text.rs::fu_to_world` is
-the other one, and `--engine-check` diffs Mojo (which reads the blob this file
-writes) against the Rust reference (which converts from font units itself). If
-those two ever become one shared function, the check stops being a check and
+the other one: it converts from font units itself, while this file bakes the
+world-unit values into the blob. No Rust code reads the blob today (every
+layout backend resolves through codepoints.bin), so nothing currently diffs the
+two — but any check that does is a check only while they stay separate. If
+they ever become one shared function, the comparison stops being a check and
 starts comparing a function to itself. DO NOT DEDUPLICATE ACROSS THAT SEAM.
 
 Note (documented, not copied): the web's liveTrie.js uses
@@ -71,8 +73,9 @@ header calls this deliberate). The native port anchors on the geometric ratio
 v1 blobs (44 B header, no sections) still LOAD — the loader refuses only ≥ 3.
 
 The identity and the bitfield cross as NATIVE u32; the two measures as bitcast
-f32 — exactly the web trie's container (GlyphTrie.js ENTRY_STRIDE), which the
-Mojo loader splits by carrier (blocks_m f32 x2, blocks_c u32 x2).
+f32 — exactly the web trie's container (GlyphTrie.js ENTRY_STRIDE), which a
+loader splits by carrier (blocks_m f32 x2, blocks_c u32 x2 — the split
+native/src/fixture.rs's FixtureTrie makes).
 
 Run: python3 tools/gen_real_trie.py [--verify-only]
 """

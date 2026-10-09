@@ -40,8 +40,8 @@ use glyph3d_native::cli::{
 };
 use glyph3d_native::*;
 
-/// Stage D: drive the Mojo glyph engine in-process over one file.
-/// Prints slot count, per-load timing, throughput, and the first records.
+/// Parse the CLI and dispatch one run mode: a render (windowed or offscreen),
+/// a repo scan, or one of the exit-driver instruments (fixture, CubeCL, GPU info).
 fn main() {
     // Unified logging & tracing substrate.
     // tracing-log automatically captures all log::* records and routes them into tracing.
@@ -172,7 +172,6 @@ fn main() {
             std::process::exit(0);
         }
         CliCommand::Fixture(task) => match task {
-            FixtureTask::Manifest(paths) => fixture::run_fixture_manifest(&paths),
             FixtureTask::Reference(paths) => fixture::run_fixture_reference(&paths),
             FixtureTask::Trie(paths) => fixture::run_fixture_trie(&paths),
             FixtureTask::Fold(paths) => fixture::run_fixture_fold(&paths),

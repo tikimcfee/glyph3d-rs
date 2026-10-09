@@ -58,7 +58,6 @@ pub enum CubeclTask {
 /// Fixture parity tasks.
 #[derive(Debug, Clone)]
 pub enum FixtureTask {
-    Manifest(Vec<PathBuf>),
     Reference(Vec<PathBuf>),
     Trie(Vec<PathBuf>),
     Fold(Vec<PathBuf>),
@@ -136,9 +135,6 @@ impl Cli {
         }
 
         // Fixture parity tasks
-        if !self.fixture_manifest.is_empty() {
-            return CliCommand::Fixture(FixtureTask::Manifest(self.fixture_manifest.clone()));
-        }
         if !self.fixture_reference.is_empty() {
             return CliCommand::Fixture(FixtureTask::Reference(self.fixture_reference.clone()));
         }

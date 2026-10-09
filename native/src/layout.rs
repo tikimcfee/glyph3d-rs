@@ -1,19 +1,16 @@
-//! layout.rs — THE LAYOUT SEAM: one contract, three backends, two targets.
+//! layout.rs — THE LAYOUT SEAM: one contract, every backend behind it.
 //!
-//! The layout seam (`engine/BACKEND-PLAN.md` no longer numbers it).
-//! Everything that lays glyphs out passes
-//! through the types here, and the shape of these types is the whole point of
-//! the stage — the stages after it are *implementations* of this contract, so
-//! getting it wrong means writing them twice.
+//! Everything that lays glyphs out passes through the types here, and the
+//! shape of these types is the point: each backend is an *implementation* of
+//! this contract, so getting it wrong means writing every backend twice.
 //!
-//! WHY THE SEAM MOVED. Until now the contract between a layout backend and the
-//! renderer was `-> Vec<GlyphRecord>`: a CPU-owned array of every glyph's
-//! position, carried home in full. That contract is why the GPU pipeline's own
-//! benchmark reports ~100 MB/s flat from 4 MB to 24 MB — its timed region ends
-//! with six `enqueue_copy` calls hauling 36 B of output per source byte
-//! (~864 MB for a 24 MB repo), so the number is a readback-bandwidth
-//! measurement with the kernels somewhere underneath it. The contract was
-//! honest about what today's caller pays; it was the caller that was wrong.
+//! WHY THE SEAM IS SHAPED THIS WAY. The obvious contract between a layout
+//! backend and the renderer is `-> Vec<GlyphRecord>`: a CPU-owned array of
+//! every glyph's position, carried home in full. A device backend under that
+//! contract measures readback bandwidth, not its kernels — 36 B of output per
+//! source byte (~864 MB for a 24 MB repo) crosses back to the host every load,
+//! and a GPU layout benchmarked that way read ~100 MB/s flat from 4 MB to
+//! 24 MB for exactly that reason.
 //!
 //! Because everything the CPU actually did with those bytes was:
 //!
@@ -37,56 +34,54 @@
 //! ```
 //!
 //! The arena is passed IN and owned by the caller, so a backend never decides
-//! where the glyphs live. Today it is a host `Vec<GlyphInstance>`; the point of
-//! naming it a destination rather than a return value is that the
-//! device-resident path replaces
-//! its interior with a device buffer without moving a single call site.
+//! where the glyphs live. On the host it is a `Vec<GlyphInstance>`; the point
+//! of naming it a destination rather than a return value is that the
+//! device-resident path replaces its interior with a device buffer without
+//! moving a single call site.
 //!
-//! WHO IMPLEMENTS IT (the plan's table, restated as code):
+//! WHO IMPLEMENTS IT ([`LayoutEngine`]):
 //!
-//! | backend | module | target | status |
+//! | backend | module | `--repo-engine` | target |
 //! |---|---|---|---|
-//! | Mojo (CPU today, GPU when device-resident) | `layout_mojo.rs` | native | live |
-//! | Rust (`fold`/`scan`/`bake`) | next | native + wasm | gate-only today |
-//! | JS oracle | `viz-web/glyph3d-js` | — | frozen, not executed here |
+//! | `HyperLayout` (parallel CPU, Rayon) | `layout_hyper.rs` | `hyper` (default), `direct`, `batch`, `naive` | host arena or mapped device slots |
+//! | `CubeclLayout` (GPU compute chain) | `cubecl_layout.rs` | `cubecl` | device slots |
 //!
-//! All three are gated bit-exact against the same frozen corpus, so cross-
-//! platform determinism is free: native and web produce IDENTICAL layouts and a
-//! native screenshot is a valid reference for web.
+//! Beside them, outside the seam, sit the corpus instruments: the serial
+//! `fold`, the `scan` form and the `bake`, each held bit-exact (or at a stated
+//! eps tier) to the JS oracle's recorded answers in `engine/fixtures` by the
+//! `--fixture-*` instruments. The JS oracle itself (`viz-web/glyph3d-js`) is
+//! frozen and not executed here.
 //!
 //! WHAT IS DELIBERATELY NOT HERE:
 //!
 //! - **A position in the return value.** `LayoutGlyphs` cannot produce records
 //!   at all; a gate that needs them asks [`VerifyLayout`], a separate trait.
 //!   That is what lets a device-resident backend keep glyphs on the device.
-//!   IT IS NOT THE SAME AS DELETING THE READBACK, and saying otherwise has now
-//!   been wrong twice in this header. The first version claimed `VerifyLayout`
-//!   put the copy out of reach; it gates the API, not the copy. The second
-//!   said the copy was unconditional in "both strategies" — true when there
-//!   were two. `Strategy::Direct` (2026-09-07) makes none: the engine writes
-//!   instances into the caller's arena and no wire record exists on either side
-//!   of the FFI. The record strategies still copy, and are the verification
-//!   form. Which strategies exist, and what each costs, comes from
-//!   `--repo-scan-only`, not from this comment.
+//!   IT IS NOT THE SAME AS DELETING THE READBACK: `VerifyLayout` gates the
+//!   API, not the copy, and a recording run still pays it. What deletes the
+//!   copy is the direct path — `HyperLayout::layout_items` writes instances
+//!   into the caller's arena and no 32 B wire record exists at all. The
+//!   recording path is the verification form. Which strategies exist, and
+//!   what each costs, comes from `--repo-scan-only`, not from this comment.
 //! - **`text::reference_layout`.** It is a second, independently-derived
 //!   realization of the same layout and its whole value is that it shares no
-//!   lineage with the fold. It stays where it is. See `engine/PORT-PLAN.md`.
-//! - **The batch-vs-per-item split.** That is an FFI strategy, not a contract;
-//!   it lives inside the Mojo backend now (`layout_mojo::Strategy`).
+//!   lineage with the fold. It stays where it is.
+//! - **The `--repo-engine` strategy names.** `direct`/`batch`/`naive` are CLI
+//!   choices (`repo::Strategy`) that select how a load records and reports,
+//!   not separate contracts; all three construct the same `HyperLayout`.
 
 use std::path::Path;
 
 use crate::glyph_scene::GlyphInstance;
 
-/// One render-read record, exactly the engine's wire format
+/// One render-read record, exactly the layout's wire format
 /// (`schema/glyph-identity.json`): 32 B, f32 lanes crossing as raw bits.
 ///
 ///   f32 X Y Z ADVANCE HEIGHT | u32 GLYPH_ID ROW COL
 ///
-/// This is the SHARED record shape, not a Mojo detail — the Rust port produces
-/// the same 32 B from its own fold, which is what makes them diffable by bits.
-/// It lives on the seam and not in `engine.rs` for that reason; the FFI
-/// mechanics that carry it stay there.
+/// This is the SHARED record shape, not one backend's detail — every backend
+/// and every corpus instrument produces the same 32 B from its own fold, which
+/// is what makes them diffable by bits. It lives on the seam for that reason.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct GlyphRecord {
@@ -136,8 +131,9 @@ pub const DEFAULT_COLOR_PACKED: u32 = 0xFF_D4D4D4;
 // ---------------------------------------------------------------------------
 
 /// A backend's refusal. `status` is the backend's own code where it has one
-/// (the Mojo C ABI returns status ints, not exceptions); `backend` names who
-/// refused, because with three of them an unattributed error is unactionable.
+/// (an integer, so a refusal stays comparable across backends); `backend`
+/// names who refused, because with several of them an unattributed error is
+/// unactionable.
 #[derive(Debug)]
 pub struct LayoutError {
     pub backend: &'static str,
@@ -160,12 +156,12 @@ pub const LAYOUT_BAD_PARAMS: i32 = -1;
 // What goes in
 // ---------------------------------------------------------------------------
 
-/// Layout params for one item (one text file). Mirrors the engine's `Item`.
+/// Layout params for one item (one text file). Mirrors [`crate::fold::Item`].
 /// f64 fields keep the oracle's float discipline; page geometry is integer.
 ///
-/// These are the CONTRACT's params, not the FFI's: all three backends take
-/// them, and `engine.rs`'s 136 B descriptor is one backend's serialization of
-/// them.
+/// These are the CONTRACT's params, not any one backend's: every backend takes
+/// them, and a backend's own wire form of them (the `.pipe.bin` item record,
+/// the device item table `glyph_field::ItemParamsGpu`) is a serialization.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ItemParams {
     pub origin_x: f64,
@@ -248,15 +244,13 @@ impl From<&ItemParams> for glyph_field::ItemParamsGpu {
 impl ItemParams {
     /// Refuse a layout a backend would silently turn into NaN.
     ///
-    /// WHY THIS EXISTS. The Mojo engine performs NO input validation:
-    /// `Item.line_height` is a raw `Float64` and `glyph_pipeline.mojo` says in
-    /// as many words that "an unset line_height is NaN here and propagates".
-    /// Every gate in this tree then compares layouts BY BITS — and two NaNs
-    /// compare bit-equal. So a NaN pitch produces a NaN layout that
-    /// `--engine-check`, all sixteen conformance suites, and the byte-equal
-    /// render A/B would every one of them pass. The JS oracle has carried an
-    /// `assertLineHeight` for exactly this since before the port; the native
-    /// side never grew one. (Found 2026-09-02 auditing the JS oracle's tests.)
+    /// WHY THIS EXISTS. The fold performs NO input validation: `line_height`
+    /// is a raw `f64`, and an unset line_height is NaN and propagates through
+    /// every lane. Every check in this tree then compares layouts BY BITS —
+    /// and two NaNs compare bit-equal. So a NaN pitch produces a NaN layout
+    /// that every bit-exact comparison and the byte-equal render A/B would
+    /// pass. The JS oracle carries an `assertLineHeight` for exactly this;
+    /// this is the native side's.
     ///
     /// NaN specifically is not "some invalid float": it is the `.pipe.bin`
     /// wire encoding for UNSET. Reaching this function means an unset pitch
@@ -270,7 +264,7 @@ impl ItemParams {
     /// the two; this does not.
     ///
     /// It lives on the SEAM rather than in one backend because it guards the
-    /// contract, not the FFI: the Rust and GPU backends inherit it by
+    /// contract, not an implementation: the CPU and GPU backends inherit it by
     /// construction instead of each having to remember.
     pub fn validate(&self, item: usize) -> Result<(), LayoutError> {
         let bad = |what: &str, why: &str| {
@@ -757,9 +751,9 @@ pub trait LayoutGlyphs {
 /// byte to compare two backends lane by lane; frames may not.
 ///
 /// It is a distinct call rather than a getter because the records are not a
-/// by-product lying around after `layout_items`: the per-item Mojo path keeps
-/// only the last item's stream, and a device-resident backend keeps none at
-/// all. Asking for them is asking for work.
+/// by-product lying around after `layout_items`: the direct path never
+/// materializes a record, and a device-resident backend keeps none on the
+/// host at all. Asking for them is asking for work.
 pub trait VerifyLayout: LayoutGlyphs {
     /// IMPLEMENT THIS — params already validated, as above.
     fn layout_validated_items_recording(
@@ -909,14 +903,15 @@ impl VerifyLayout for LayoutEngine {
 /// Compact one item's records into the arena: drop the blanks, repack 32 B →
 /// 48 B with paint and group, and reduce the two extents in the same pass.
 ///
-/// EVERY host backend calls this — the Mojo one today, the Rust one next.
-/// That is deliberate: it means the two backends cannot disagree about
-/// compaction, only about the fold, which is the thing the corpus actually
-/// gates. A second hand-written copy of this loop would be a second place for
-/// the paint index to slip, and nothing would be watching it.
+/// TEST-ONLY TODAY: no shipping backend calls it. `HyperLayout` emits
+/// instances directly, and the CubeCL instance tail is this loop's device
+/// replacement. It stays as the one host statement of what compaction means
+/// — blanks, paint indexing, extents — which the seam's tests pin, so a
+/// backend can differ from it about the fold (the thing the corpus actually
+/// checks) and is held to it for the rest. A second hand-written copy of this
+/// loop would be a second place for the paint index to slip.
 ///
-/// A device backend replaces this with kernels (`k_partial_scan` for the
-/// compaction, `gpu_bounds` for the extents) and is held to the same output by
+/// A backend that compacts on its own is held to the same output by
 /// `--repo-verify`, which diffs arenas and placements, not just records.
 ///
 /// Blank records (`glyph_id == 0` — missing or whitespace) emit no instance;
@@ -1041,8 +1036,8 @@ pub struct VerifyReport {
 
 /// Diff two backends at the seam, bit-exact, and say where they first differ.
 ///
-/// THIS IS THE GATE THE PLAN'S STAGE 1 IS SCORED BY, which is why it compares
-/// three things rather than one. The old `--repo-verify` compared RECORDS
+/// THIS IS WHAT A NEW BACKEND IS SCORED BY, which is why it compares three
+/// things rather than one. The old `--repo-verify` compared RECORDS
 /// only; records alone cannot see a difference in compaction, in paint
 /// indexing, or in either extent — every one of which now lives behind the
 /// seam and every one of which a new backend has to get right. Instances and
@@ -1307,8 +1302,8 @@ mod tests {
     /// How this reduction relates to the ENGINE's per-item box, which is a
     /// different computation and deliberately not the same number.
     ///
-    /// `fold::bounds_range` (mirrored by the Mojo engine, and gate-verified
-    /// against the corpus by `--fixture-fold`) seeds at ±infinity and measures
+    /// `fold::bounds_range` (verified against the corpus by `--fixture-fold`)
+    /// seeds at ±infinity and measures
     /// only what is there. `page` seeds at the ORIGIN, so it always contains
     /// (0,0,0) whether or not a glyph does. They therefore disagree by the seed
     /// for any item whose content does not straddle the origin — which is most
@@ -1457,7 +1452,7 @@ mod tests {
         assert!(nan.bit_eq(&same_nan), "bit_eq must call identical bits identical");
     }
 
-    /// THE GATE STAGE 1 IS SCORED BY. A differ that cannot report a difference
+    /// WHAT A NEW BACKEND IS SCORED BY. A differ that cannot report a difference
     /// is worse than no differ, so break the output in each of the three
     /// places it looks and confirm all three are seen — and confirm the
     /// unbroken pair passes, or the three reds prove nothing.

@@ -101,8 +101,9 @@ pub struct TrieTable {
     pub seq_max: u32,
     /// v2: the G3CC class table verbatim (its own header included). Empty on v1.
     // Carried for the general UAX #29 phase: the landed sequence pass reads no
-    // classes by design (glyph_cluster.mojo says why), so today only
-    // trie_v2_tests exercise it. class_of is its reader.
+    // classes by design — it is a longest-prefix match against the font's own
+    // sequence table, so the table, not a grapheme class, decides what joins —
+    // and today only trie_v2_tests exercise it. class_of is its reader.
     pub classes: Vec<u32>,
     /// The table's first members as a set — the probe's cheap rejection. Built
     /// once at load from the sequence section itself.
@@ -351,11 +352,11 @@ impl TrieTable {
 
     /// Codepoint → trie entry (the two dependent loads of FORMAT.md).
     /// Resolve a codepoint. OUT-OF-RANGE values resolve through the shared
-    /// missing block (storage block 0), matching `decode_and_resolve` in
-    /// glyph_pipeline.mojo exactly — including which entry of that block is
-    /// read (`cp & 0xFF`), which does not change the VALUE since every entry in
-    /// the missing block is identical, but does keep the two implementations
-    /// literally the same computation.
+    /// missing block (storage block 0), exactly as the fixture trie's
+    /// `resolve` does under `fold::decode_and_resolve` — including which entry
+    /// of that block is read (`cp & 0xFF`), which does not change the VALUE
+    /// since every entry in the missing block is identical, but does keep the
+    /// two implementations literally the same computation.
     ///
     /// The engine's decode is a LENIENT classifier that never validates
     /// continuation bytes, so lead bytes 0xF5-0xF7 (and 0xF4 with a continuation

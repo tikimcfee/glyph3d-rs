@@ -504,8 +504,8 @@ fn cli_action_dispatch_variants() {
     assert!(matches!(cli.action(), CliCommand::GpuInfo(GpuInfoMode::Profile)));
 
     // 3. Fixture
-    let cli = parse(&["--fixture-manifest", "a.bin"]);
-    assert!(matches!(cli.action(), CliCommand::Fixture(FixtureTask::Manifest(_))));
+    let cli = parse(&["--fixture-fold", "a.bin"]);
+    assert!(matches!(cli.action(), CliCommand::Fixture(FixtureTask::Fold(_))));
 
     // 4. RepoScanOnly
     let cli = parse(&["--load-repo", "some/dir", "--repo-scan-only"]);

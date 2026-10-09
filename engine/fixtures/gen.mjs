@@ -6,11 +6,12 @@
  * self-contained little-endian binary: inputs (bytes, trie, item table) followed by
  * expected outputs (slots, ordinal map, misses, leaders, per-item + batch bounds).
  *
- * The native engine's conformance runner (engine/conformance.mojo) replays the
- * inputs through its own port and diffs bit-for-bit. Floats are compared as bit
- * patterns, not tolerances: the oracle is deterministic and the port is required to
- * reproduce its exact f32/f64 rounding discipline — a tolerance would hide exactly
- * the class of bug (grouping-dependent float drift) this rig exists to catch.
+ * glyph3d-native --fixture-fold / --fixture-reference (native/src/fixture.rs)
+ * replay the inputs through the native port and diff bit-for-bit. Floats are
+ * compared as bit patterns, not tolerances: the oracle is deterministic and the
+ * port is required to reproduce its exact f32/f64 rounding discipline — a
+ * tolerance would hide exactly the class of bug (grouping-dependent float drift)
+ * this rig exists to catch.
  *
  * Format (all little-endian, packed, no alignment):
  *   u32 magic 'G3DF' (0x46443347)   u32 version=5

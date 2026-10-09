@@ -29,8 +29,8 @@ use super::{
 /// requests unconditionally where supported), `GLYPH_CHAIN_LOOP` samples per
 /// dispatch with the MINIMUM kept (the "run it a few times" rule, automated).
 /// Each window flushes, so stages cannot overlap: these are per-dispatch
-/// latencies in the same posture as the Mojo bench's `mark()` table, and the
-/// sum of minima is the chain estimate — the chain is dependency-serialized,
+/// latencies, one row per stage, and the sum of minima is the chain
+/// estimate — the chain is dependency-serialized,
 /// so nothing is lost to that. The old batched wall-clock loop mode is
 /// retired: it measured repeat-overlap, not the chain.
 ///

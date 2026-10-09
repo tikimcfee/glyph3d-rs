@@ -1,21 +1,23 @@
 //! Stage E2 — repository-scale loading.
 //!
 //! Walks a repository (source-extension whitelist; VCS/build/dependency dirs
-//! skipped), runs the Mojo engine over every file, and fills ONE glyph arena.
-//! HOW it crosses into Mojo is `layout_mojo::Strategy`'s business, not this
-//! file's — the record strategies stage a 32 B wire stream and compact it here,
-//! while `Direct` has the engine write instances into the arena and stages
-//! nothing. `--repo-engine` selects; `--repo-verify` diffs two. Each file is a GROUP
+//! skipped), lays every file out through the layout seam (`HyperLayout` by
+//! default, the CubeCL chain under `--repo-engine cubecl`), and fills ONE
+//! glyph arena. The backend writes instances straight into the arena; only a
+//! `--repo-verify` run asks it for the 32 B wire records as well.
+//! `--repo-engine` selects; `--repo-verify` diffs against a recording
+//! `HyperLayout` reference. Each file is a GROUP
 //! (group_id == file index) placed on a 2D grid of code pages; files are
 //! views {slot_base/count, engine params} into the shared arena — the
 //! web's MegaGlyphField architecture (one arena, files as views).
 //!
 //! Correctness guards:
-//! - only valid UTF-8 files reach the engine (valid UTF-8 cannot decode a
-//!   codepoint past the trie's 4352-entry block index — the engine's decode
-//!   assumes well-formed leads, see Stage E1 report);
-//! - the 10 MB per-file cap also keeps every item far under the engine's
-//!   per-item 2^24-byte ordinal wall (engine README, ordinal_invariant).
+//! - only valid UTF-8 files reach the layout (valid UTF-8 cannot decode a
+//!   codepoint past the trie's 4352-entry block index — the decode assumes
+//!   well-formed leads);
+//! - the 10 MB per-file cap also keeps every item far under 2^24 bytes, the
+//!   point past which a per-item ordinal carried in an f32 would alias
+//!   (`schema/glyph-identity.json` states the rule).
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -162,8 +164,8 @@ pub struct RepoParams {
     /// THE SEQUENCE PASS, per item: whether a codepoint sequence the font draws
     /// as ONE glyph (ZWJ families, RI flags, skin tones, keycaps) resolves to
     /// its sequence slot, with trailing leaders zeroed. Leader is the
-    /// params-level default (ItemParams agrees — engine-check's reference path
-    /// depends on that); the CLI/product default flipped to cluster on
+    /// params-level default (ItemParams agrees — `text::reference_layout`,
+    /// which resolves no sequences, depends on that); the CLI/product default flipped to cluster on
     /// 2026-09-22, and the goldens pin their mode explicitly.
     pub cluster_mode: crate::fold::ClusterMode,
     /// Spatial arrangement mode for the repository files across the canvas.
@@ -344,7 +346,7 @@ pub struct LoadStats {
     /// between two of them, so the sum alone cannot answer it.
     pub phases: BackendPhases,
     /// The cubecl backend's own decomposition (rung 5's yardstick); None on
-    /// the Mojo strategies, whose spans live in `phases`.
+    /// the `HyperLayout` strategies, whose spans live in `phases`.
     #[cfg(feature = "cubecl")]
     pub cubecl: Option<crate::cubecl_layout::CubeclPhases>,
     pub stage: Duration,
@@ -384,16 +386,11 @@ pub(crate) use shelf::{dir_tint, layout_shelf};
 
 /// Whole-repo load: walk → paint → the layout seam → grid layout.
 ///
-/// `strategy` selects the Mojo backend's FFI strategy — a backend-internal
-/// choice since the layout seam, threaded through only because the CLI still
-/// exposes it. `verify` runs ANOTHER strategy as a second backend and diffs the
-/// two AT THE SEAM: placements, instances and, when both can produce them,
-/// records, all bit-exact. That is the standing check, and with the Rust
-/// backend the same call diffs Mojo against Rust with nothing new written.
-///
-/// It was `batch: bool` until `Direct` landed. A boolean cannot name three
-/// strategies, and the honest fix is the enum the backend already had rather
-/// than a second flag beside the first.
+/// `strategy` selects the backend (`Cubecl`, or `HyperLayout` for every other
+/// value — `Hyper` alone gets the background prefetch) and whether a verify
+/// run records. `verify` lays the same items out again with a recording
+/// `HyperLayout` reference and diffs the two AT THE SEAM: placements,
+/// instances and, when both can produce them, records, all bit-exact.
 pub fn load_repo(
     root: &Path,
     trie: &Path,
@@ -1122,9 +1119,9 @@ impl RepoLoad {
             s.instances,
             s.blanks,
             match s.strategy {
-                Strategy::Batched => "mojo-cpu/batched",
-                Strategy::PerItem => "mojo-cpu/per-item",
-                Strategy::Direct => "mojo-cpu/direct",
+                Strategy::Batched => "hyper/batched",
+                Strategy::PerItem => "hyper/per-item",
+                Strategy::Direct => "hyper/direct",
                 Strategy::Cubecl => "device/cubecl (endpoint)",
                 Strategy::Hyper => "hyper-rust (parallel direct)",
             },
@@ -1167,7 +1164,7 @@ impl RepoLoad {
         #[cfg(feature = "cubecl")]
         if let Some(cp) = s.cubecl {
             // The device chain's stages are a different shape from the
-            // record/direct split below — printing the Mojo block for it
+            // record/direct split below — printing the host block for it
             // would show zeros for stages that RAN, the exact ambiguity the
             // n/a rule exists against. Cubecl reports its own spans.
             let ch = &cp.chain;
@@ -1222,16 +1219,16 @@ impl RepoLoad {
                 secs(p.compact),
                 s.backend.saturating_sub(attributed).as_secs_f64(),
             );
-            // `fold` above is the whole FFI call. This is what the engine says it
-            // spent inside it — largest lane first, and `unattributed` here catches
-            // the part of the call that is neither run_pipeline nor the two stages
-            // the FFI entry owns (marshalling, arena reuse, the return trip).
+            // `fold` above is the whole backend call. This is what the backend
+            // says it spent inside it — largest lane first, and `unattributed`
+            // here catches the part of the call no engine lane claims.
             //
             // Zero-valued engine lanes are ELIDED rather than printed as 0.000s,
-            // for the same reason: a lane absent from this line did not run on this
-            // path. `eg_compact`/`eg_counts` belong to the record path and
-            // `eg_direct` to the direct one, so which lanes appear is itself the
-            // statement of which route the load took.
+            // for the same reason: a lane absent from this line did not run on
+            // this path, so which lanes appear is itself the statement of which
+            // route the load took. (No backend reports lanes today —
+            // `engine_ranked` is empty — so the line carries only
+            // `unattributed`.)
             let ranked = p.engine_ranked();
             let eng_sum: Duration = ranked.iter().map(|(_, d)| *d).sum();
             print!("  engine:");

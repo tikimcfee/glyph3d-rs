@@ -172,13 +172,11 @@ impl GlyphScene {
                 return FileStyle::VersionMismatch;
             }
         }
-        // The engine re-run, on the THREAD-CACHED rederiver (repo::
-        // rederive_cached — one Engine + trie per thread, outliving scenes:
-        // the live loop rebuilds a scene per edit, so a scene-lifetime cache
-        // would never amortize). The FFI resets the arena per load ("reuse
-        // the arena across loads", ffi.mojo). This is the P1-live
-        // measurement's named fix: uncached, this step paid ~120 ms FIXED
-        // (Engine::new + trie parse) per file per apply.
+        // The layout re-run (repo::rederive_cached): stateless —
+        // `layout_hyper::rederive_item_records` over the process-wide trie
+        // (`default_trie()`, parsed once and shared). Nothing per-scene is
+        // cached, and nothing needs to be: the live loop rebuilds a scene per
+        // edit, so any setup cost here would be paid per file per apply.
         let records = match crate::repo::rederive_cached(&pctx.trie, &bytes, &info.item) {
             Ok(records) => records,
             Err(_) => {

@@ -1,7 +1,8 @@
 //! The CubeCL layout backend — the endpoint (note 23, E2b).
 //!
 //! Bytes and params through the device chain — the SAME `run_repo_chain`
-//! the cubecl-fork gate fences bit-exactly against the Mojo engine — and
+//! that `--cubecl-repo-check` diffs bit-exactly against the CPU layout's
+//! records and slot stream (a standing instrument, not currently a gate) — and
 //! the tail is the scatter's: ONE pass writes the 32 B slots directly
 //! into the buffer the renderer binds, the placements decode from its
 //! extent lanes, and the tint stream (glyph_id, color per slot) is the
@@ -302,10 +303,10 @@ impl LayoutGlyphs for CubeclLayout {
 
     fn load_trie_file(&mut self, _path: &Path) -> Result<(), LayoutError> {
         // The chain reads the ATLAS tables (`TrieTable::load(atlas_dir())`)
-        // inside `run_repo_chain`; the engine-trie path the seam hands
-        // across is the Mojo backend's serialization. Accepting the call
-        // keeps the trait uniform — the frames' loader does not care which
-        // trie file a backend was nominally handed.
+        // inside `run_repo_chain`, so the engine-trie path the seam hands
+        // across is not read (HyperLayout ignores it the same way). Accepting
+        // the call keeps the trait uniform — the frames' loader does not care
+        // which trie file a backend was nominally handed.
         Ok(())
     }
 
