@@ -27,7 +27,7 @@ machines and clones, **M** machine-specific values, **R** runner.
 | D4 | `.agents/rules/rust-engineering.md` claims the tree does not back | open | short pass |
 | D5 | pixi carried the retired engine's tasks and mojo/max toolchain | closed | 16372a9 (tasks), 6954a9d (deps, lock re-solved; Mac env unsolved-installed) |
 | D6 | Orphaned configs: `deny.toml` (nothing runs it) | closed | deny.toml and mise's cargo-deny deleted (no use for it yet; research/rust-tooling-survey-2026.md keeps the case for it) |
-| D7 | Loose root docs: session handoffs, plus Mojo-era TOOLING-PLAN.md open items, BUILD-BRIEF.md, research/ surveys | open | move handoffs to `out/`; banner or trim the rest |
+| D7 | Loose root docs: session handoffs, plus Mojo-era TOOLING-PLAN.md open items, BUILD-BRIEF.md, research/ surveys | closed | three session handoffs moved to out/ with their dates (links fixed); TOOLING-PLAN, BUILD-BRIEF and three Mojo-era research surveys bannered historical |
 | D8 | Retired Rust checks went unwatched from 09-30; `overflow-leads.txt` read by nothing | closed | 0336e85, 48a75d9, 5257df9 (reference-port, repo-verify x2, cubecl-chain/-fork, new hyper-oracle; 15 gates), 50c7085 (chain green) |
 | D9 | `engine-trie.bin` (+ `gen_real_trie.py`, `--engine-trie`) is committed and gated but read by no Rust code | closed | engine-trie.bin + its path plumbing (--engine-trie, default_engine_trie, LayoutGlyphs::load_trie_file, repo load params, LiveSource/PickContext fields) retired; the generator's checks became the atlas-tables gate (tools/check_atlas.py) and a Rust domain sweep on fu_to_world |
 | C1 | Twin field crates ~60% shared; five copies of the mapped-buffer upload | open | hoist into `glyph-field`; last, largest |
@@ -126,20 +126,6 @@ For discussion: C10, D9, X1, X2, P1. Small, fit anywhere: C8, C9, C11, X3.
 - §8 names `replace_file_content`, an Antigravity tool name.
 - §5 "no new shell scripts" beside a gate that is a shell script.
 - Reconcile with `native/AGENTS.md` by pointing, not restating.
-
-### D7. Loose root docs — [measured]
-
-`SESSION-HANDOFF.md` (2026-10-02, quotes floor 158),
-`PLAN-AGENT-STACKS-FOCUS-LOCKING.md` (2026-10-02),
-`cubecl-performance-handoff.md`: session artifacts; AGENTS.md says notes go
-in `out/`. Move with dates in the filename (their links are repo-relative since
-88525ea and will need `../`). Mojo-era, from the 2026-10-09 inventory:
-`TOOLING-PLAN.md` is a "plan of record" whose open items (`engine/check.sh`,
-`--engine-check` cases, `ffi_selftest`, a gate list with engine-check and
-engine-suites) are void, keep its "verify the artifact that ships" rule;
-`BUILD-BRIEF.md` (29 hits) self-marks as historical but its stale list omits
-the retirement; `research/wasm-port-audit.md`, `native-rendering-stack-comparison.md`,
-`rust-to-web-target-notes.md` are Mojo-era surveys (banner or move).
 
 ### C1. Twin field crates — [measured]
 

@@ -1,5 +1,9 @@
 # wasm32-unknown-unknown readiness audit — glyph3d-native
 
+> **Historical (2026-10-09).** A Mojo-era survey of the then-current tree; line
+> references and engine assumptions predate the engine's retirement. Kept for its
+> reasoning, not as current state.
+
 Audited: native/ @ main (dirty), wgpu 30.0.1, winit 0.30.13. All line refs verified against working tree.
 
 ## 1. pollster usage
