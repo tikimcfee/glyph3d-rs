@@ -1,9 +1,4 @@
 # `cargo glyph <verb>` — the one entry point for building, testing and running
 # this project. See glyph/src/main.rs.
-#
-# A STRING, not an array: cargo merges `.cargo/config.toml` from every
-# ancestor directory and CONCATENATES arrays, so inside a worktree nested in
-# the repo (`.claude/worktrees/<name>`) an array alias doubled and the tool got
-# `run` as its verb. A string is not merged — the nearest config wins.
 [alias]
-glyph = "run --quiet --release -p glyph --"
+glyph = ["run", "--quiet", "--release", "-p", "glyph", "--"]
