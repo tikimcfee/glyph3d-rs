@@ -26,12 +26,31 @@ pub struct DiscoveredSession {
     pub path: PathBuf,
     /// Human-readable title or prompt preview.
     pub title: String,
-    /// Project name or repository scope (if inferrable).
+    /// The working directory the PROVIDER recorded for this session (Claude
+    /// Code's `cwd`, Antigravity's first `workspaceUris` entry or `cwd`, Kimi
+    /// Code's `state.json` `cwd`), as written. Never read from where the file
+    /// happens to live on disk: storage layouts are each app's business.
+    pub workspace: Option<String>,
+    /// The workspace's last path component — [`project_name_of`].
     pub project_name: Option<String>,
     /// Last modification timestamp on disk.
     pub modified: Option<SystemTime>,
     /// File size in bytes.
     pub file_size_bytes: u64,
+}
+
+/// A session's project, by one rule for every provider: the last component
+/// of the workspace it recorded (`file://` URIs included). Until 2026-10-09
+/// Claude Code sessions were named from their STORAGE folder's slug, split on
+/// `-` (`…-glyph3d-js` showed as `js`), and that guess pre-empted the `cwd`
+/// the session itself records (C9).
+pub fn project_name_of(workspace: &str) -> Option<String> {
+    let path = workspace.strip_prefix("file://").unwrap_or(workspace);
+    Path::new(path.trim_end_matches('/'))
+        .file_name()
+        .and_then(|s| s.to_str())
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
 }
 
 /// Filter criteria for the agent session browser UI.
@@ -85,27 +104,18 @@ fn scan_claude_projects_dir(root: &Path, out: &mut Vec<DiscoveredSession>) {
     for entry in entries.flatten() {
         let path = entry.path();
         if path.is_dir() {
-            let project_folder = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
-            // Clean up project name from a path slug like "-home-user-src-myproject"
-            let project_hint = project_folder
-                .rsplit('-')
-                .next()
-                .filter(|s| !s.is_empty())
-                .unwrap_or(project_folder)
-                .to_string();
-
             if let Ok(files) = fs::read_dir(&path) {
                 for file_entry in files.flatten() {
                     let file_path = file_entry.path();
                     if file_path.extension().and_then(|s| s.to_str()) == Some("jsonl") {
-                        if let Some(session) = probe_claude_session(&file_path, Some(&project_hint)) {
+                        if let Some(session) = probe_claude_session(&file_path) {
                             out.push(session);
                         }
                     }
                 }
             }
         } else if path.extension().and_then(|s| s.to_str()) == Some("jsonl") {
-            if let Some(session) = probe_claude_session(&path, None) {
+            if let Some(session) = probe_claude_session(&path) {
                 out.push(session);
             }
         }
@@ -113,7 +123,7 @@ fn scan_claude_projects_dir(root: &Path, out: &mut Vec<DiscoveredSession>) {
 }
 
 /// Fast metadata probe for a single Claude Code session.
-fn probe_claude_session(file_path: &Path, project_hint: Option<&str>) -> Option<DiscoveredSession> {
+fn probe_claude_session(file_path: &Path) -> Option<DiscoveredSession> {
     let metadata = fs::metadata(file_path).ok()?;
     let file_size_bytes = metadata.len();
     if file_size_bytes == 0 {
@@ -130,38 +140,40 @@ fn probe_claude_session(file_path: &Path, project_hint: Option<&str>) -> Option<
         .to_string();
 
     let mut title = None;
-    let mut detected_project = project_hint.map(|s| s.to_string());
+    let mut workspace: Option<String> = None;
 
-    for line_res in reader.lines().take(35) {
+    // Title from the first 35 lines; the recorded cwd may come later (a
+    // session can open with dozens of snapshot and mode lines), up to 200.
+    for (i, line_res) in reader.lines().take(200).enumerate() {
         let Ok(line) = line_res else { continue };
+        if i >= 35 && workspace.is_some() {
+            break;
+        }
+        let titling = i < 35;
 
         // 1. Look for explicit ai-title
-        if line.contains("\"ai-title\"") || line.contains("\"aiTitle\"") {
+        if titling && (line.contains("\"ai-title\"") || line.contains("\"aiTitle\"")) {
             if let Ok(val) = serde_json::from_str::<serde_json::Value>(&line) {
                 if let Some(t) = val.get("aiTitle").and_then(|v| v.as_str()) {
                     if !t.trim().is_empty() {
                         title = Some(t.trim().to_string());
-                        break;
+                        if workspace.is_some() {
+                            break;
+                        }
                     }
                 }
             }
         }
 
-        // 2. Look for cwd for project name
-        if detected_project.is_none() && line.contains("\"cwd\"") {
+        // 2. The working directory the session recorded
+        if workspace.is_none() && line.contains("\"cwd\"") {
             if let Ok(val) = serde_json::from_str::<serde_json::Value>(&line) {
-                if let Some(cwd) = val.get("cwd").and_then(|v| v.as_str()) {
-                    let name = Path::new(cwd)
-                        .file_name()
-                        .and_then(|s| s.to_str())
-                        .unwrap_or(cwd);
-                    detected_project = Some(name.to_string());
-                }
+                workspace = val.get("cwd").and_then(|v| v.as_str()).map(str::to_string);
             }
         }
 
         // 3. Fallback: prompt snippet from user message
-        if title.is_none() && line.contains("\"role\":\"user\"") {
+        if titling && title.is_none() && line.contains("\"role\":\"user\"") {
             if let Ok(val) = serde_json::from_str::<serde_json::Value>(&line) {
                 if let Some(msg) = val.get("message") {
                     if let Some(content) = msg.get("content") {
@@ -197,7 +209,8 @@ fn probe_claude_session(file_path: &Path, project_hint: Option<&str>) -> Option<
         harness: HarnessKind::ClaudeCode,
         path: file_path.to_path_buf(),
         title: final_title,
-        project_name: detected_project,
+        project_name: workspace.as_deref().and_then(project_name_of),
+        workspace,
         modified,
         file_size_bytes,
     })
@@ -217,11 +230,7 @@ fn scan_kimi_sessions_dir(root: &Path, out: &mut Vec<DiscoveredSession>) {
             }
             let id = super::kimi::session_id_for(&wire).unwrap_or_else(|| "unknown".to_string());
             let (title, cwd) = super::kimi::read_state(&session_dir.path().join("state.json"));
-            let project_name = cwd
-                .as_deref()
-                .and_then(|c| Path::new(c).file_name())
-                .and_then(|s| s.to_str())
-                .map(str::to_string);
+            let project_name = cwd.as_deref().and_then(project_name_of);
             let title = title.map(|t| clean_preview_text(&t)).filter(|t| !t.is_empty()).unwrap_or_else(|| {
                 format!("Session {}", crate::agent_transcript::types::truncate_chars(&id, 8))
             });
@@ -231,6 +240,7 @@ fn scan_kimi_sessions_dir(root: &Path, out: &mut Vec<DiscoveredSession>) {
                 path: wire,
                 title,
                 project_name,
+                workspace: cwd,
                 modified: metadata.modified().ok(),
                 file_size_bytes: metadata.len(),
             });
@@ -290,8 +300,12 @@ fn probe_antigravity_session(conv_id: &str, file_path: &Path) -> Option<Discover
     let reader = BufReader::new(file);
 
     let mut title = None;
-    let mut project_hint = None;
+    let mut workspace: Option<String> = None;
 
+    // The Antigravity CLI usually records no workspace at all (measured
+    // 2026-10-09: 9 of 10 local sessions; the tenth only inside a tool's
+    // output, describing another session). Such a session has no project,
+    // rather than one guessed from paths in its tool output.
     for line_res in reader.lines().take(30) {
         let Ok(line) = line_res else { continue };
 
@@ -306,27 +320,16 @@ fn probe_antigravity_session(conv_id: &str, file_path: &Path) -> Option<Discover
             }
         }
 
-        if project_hint.is_none() && (line.contains("\"workspaceUris\"") || line.contains("\"cwd\"")) {
+        if workspace.is_none() && (line.contains("\"workspaceUris\"") || line.contains("\"cwd\"")) {
             if let Ok(val) = serde_json::from_str::<serde_json::Value>(&line) {
-                if let Some(uris) = val.get("workspaceUris").and_then(|v| v.as_array()) {
-                    if let Some(first_uri) = uris.first().and_then(|u| u.as_str()) {
-                        let name = Path::new(first_uri)
-                            .file_name()
-                            .and_then(|s| s.to_str())
-                            .unwrap_or(first_uri);
-                        project_hint = Some(name.to_string());
-                    }
-                } else if let Some(cwd) = val.get("cwd").and_then(|v| v.as_str()) {
-                    let name = Path::new(cwd)
-                        .file_name()
-                        .and_then(|s| s.to_str())
-                        .unwrap_or(cwd);
-                    project_hint = Some(name.to_string());
-                }
+                workspace = match val.get("workspaceUris").and_then(|v| v.as_array()) {
+                    Some(uris) => uris.first().and_then(|u| u.as_str()).map(str::to_string),
+                    None => val.get("cwd").and_then(|v| v.as_str()).map(str::to_string),
+                };
             }
         }
 
-        if title.is_some() && project_hint.is_some() {
+        if title.is_some() && workspace.is_some() {
             break;
         }
     }
@@ -341,7 +344,8 @@ fn probe_antigravity_session(conv_id: &str, file_path: &Path) -> Option<Discover
         harness: HarnessKind::Antigravity,
         path: file_path.to_path_buf(),
         title: final_title,
-        project_name: project_hint,
+        project_name: workspace.as_deref().and_then(project_name_of),
+        workspace,
         modified,
         file_size_bytes,
     })
@@ -394,18 +398,40 @@ mod tests {
 
     #[test]
     fn test_probe_claude_with_ai_title() {
-        let dir = std::env::temp_dir().join("test_claude_scan");
+        // Stored under a slugged folder whose last `-` segment is NOT the
+        // project: the name must come from the cwd the session recorded,
+        // even when the ai-title line comes first (C9).
+        let dir = std::env::temp_dir().join("test_claude_scan").join("-home-u-dev-glyph3d-js");
         let _ = fs::create_dir_all(&dir);
         let file = dir.join("session_1.jsonl");
-        fs::write(&file, "{\"type\":\"mode\"}\n{\"type\":\"ai-title\",\"aiTitle\":\"Fix compiler warnings\"}\n").unwrap();
+        fs::write(
+            &file,
+            "{\"type\":\"mode\"}\n{\"type\":\"ai-title\",\"aiTitle\":\"Fix compiler warnings\"}\n{\"type\":\"user\",\"cwd\":\"/home/u/dev/glyph3d-js\"}\n",
+        )
+        .unwrap();
 
-        let s = probe_claude_session(&file, Some("my_project")).unwrap();
+        let s = probe_claude_session(&file).unwrap();
         assert_eq!(s.id, "session_1");
         assert_eq!(s.title, "Fix compiler warnings");
-        assert_eq!(s.project_name.as_deref(), Some("my_project"));
+        assert_eq!(s.workspace.as_deref(), Some("/home/u/dev/glyph3d-js"));
+        assert_eq!(s.project_name.as_deref(), Some("glyph3d-js"));
         assert_eq!(s.harness, HarnessKind::ClaudeCode);
 
-        let _ = fs::remove_dir_all(&dir);
+        // No recorded cwd: no project, rather than a guess from the folder.
+        let bare = dir.join("session_2.jsonl");
+        fs::write(&bare, "{\"type\":\"ai-title\",\"aiTitle\":\"t\"}\n").unwrap();
+        assert_eq!(probe_claude_session(&bare).unwrap().project_name, None);
+
+        let _ = fs::remove_dir_all(std::env::temp_dir().join("test_claude_scan"));
+    }
+
+    #[test]
+    fn project_is_the_workspace_last_component_for_every_provider() {
+        assert_eq!(project_name_of("/home/u/dev/glyph3d-js").as_deref(), Some("glyph3d-js"));
+        assert_eq!(project_name_of("/home/u/dev/repo/").as_deref(), Some("repo"));
+        assert_eq!(project_name_of("file:///Users/u/src/repo-native").as_deref(), Some("repo-native"));
+        assert_eq!(project_name_of("/"), None);
+        assert_eq!(project_name_of(""), None);
     }
 
     #[test]
