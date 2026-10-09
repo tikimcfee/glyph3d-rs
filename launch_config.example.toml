@@ -58,8 +58,15 @@ no_ui = false
 # Default agent session transcript path to load at startup (optional)
 # agent_session = "~/.claude/projects/<project-slug>/<session-id>.jsonl"
 
-# Agent session discovery (optional). Discovery is config-driven: with neither
-# key set, nothing is scanned and sessions are opened by path. These are the
-# usual locations for each harness.
+# Agent session discovery (optional). Per app: a path set here is the ONLY
+# place scanned for that app; "" turns the app off; unset uses the app's own
+# default locations that exist on this machine (the same home-relative paths
+# on macOS, Linux and Windows):
+#   claude       $CLAUDE_CONFIG_DIR/projects, else ~/.claude/projects
+#   antigravity  ~/.gemini/antigravity/brain (desktop app)
+#                ~/.gemini/antigravity-cli/brain (CLI)
+#   kimi         ~/.kimi-code/sessions
+# The F7 session browser and the launcher both print what they scanned.
 # claude_projects_dir = "~/.claude/projects"
 # antigravity_brain_dir = "~/.gemini/antigravity/brain"
+# kimi_sessions_dir = ""

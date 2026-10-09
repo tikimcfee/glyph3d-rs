@@ -23,6 +23,9 @@ time.
   upload path, pipelines and `glyph_field.wgsl`); `glyph-field-derived` is the Derived mode
   (20 B `DerivedSlot`, GPU vertex-stage Y/Z derivation, and `glyph_field_derived.wgsl`).
   Chosen at load with `--field-mode instanced|derived`.
+  `crates/glyph-session-dirs` (2026-10-09, std only) is the one table of where agent
+  apps keep session transcripts, shared by the renderer's F7 browser and the
+  `cargo glyph` launcher; `launch_config.example.toml` documents the overrides.
 - `tools/` — check scripts, generators, `bench_hyper.py` performance harness, and repro helpers.
 - `.agents/` — agent house rules (`rules/rust-engineering.md`) and operational testing skill
   (`skills/glyph-engine-testing/SKILL.md`).

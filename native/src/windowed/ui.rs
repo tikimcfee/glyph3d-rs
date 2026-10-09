@@ -32,6 +32,8 @@ pub(super) struct EguiUi {
     pub(super) session_filter_harness: crate::agent_transcript::discovery::SessionHarnessFilter,
     /// Cached list of discovered agent sessions.
     pub(super) discovered_sessions: Option<Vec<crate::agent_transcript::discovery::DiscoveredSession>>,
+    /// What the last scan looked at, and why: one line from `glyph-session-dirs`.
+    pub(super) session_dirs_report: String,
 }
 
 /// Stage K (K3): Debug-panel verb buttons — CLI `--verb` literals parsed

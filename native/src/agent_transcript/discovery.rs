@@ -1,10 +1,10 @@
 //! Discovery and Indexing of Agent Sessions across local and global environments.
 //!
-//! Scans the directories named in the launch config (`claude_projects_dir`,
-//! `antigravity_brain_dir`) for Claude Code and Antigravity sessions,
-//! extracting lightweight preview metadata (ID, prompt title, timestamp,
-//! harness kind, project scope). Nothing is scanned that the config does not
-//! name: no home-directory default, no working-directory probe.
+//! Scans the session directories the launch config resolves to (see
+//! `glyph-session-dirs`: a configured path per harness, else that app's
+//! default locations on this machine) for Claude Code, Antigravity and Kimi
+//! Code sessions, extracting lightweight preview metadata (ID, prompt title,
+//! timestamp, harness kind, project scope). No working-directory probe.
 
 use std::fs;
 use std::io::{BufRead, BufReader};
@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use crate::launch_config::LaunchConfig;
+use glyph_session_dirs::{Harness, SessionDir};
 use super::types::HarnessKind;
 
 /// Lightweight summary metadata of a discovered agent session on disk.
@@ -40,20 +41,24 @@ pub enum SessionHarnessFilter {
     All,
     ClaudeCode,
     Antigravity,
+    KimiCode,
 }
 
-/// Scan the configured directories for agent sessions.
+/// Scan the directories `config` resolves to for agent sessions.
 pub fn scan_agent_sessions(config: &LaunchConfig) -> Vec<DiscoveredSession> {
+    scan_session_dirs(&config.session_dirs())
+}
+
+/// Scan an explicit directory list, newest session first. Each directory is
+/// read with its harness's layout; one that does not exist adds nothing.
+pub fn scan_session_dirs(dirs: &[SessionDir]) -> Vec<DiscoveredSession> {
     let mut sessions = Vec::new();
-
-    // 1. Claude Code sessions
-    if let Some(claude_dir) = config.resolved_claude_projects_dir().filter(|d| d.is_dir()) {
-        scan_claude_projects_dir(&claude_dir, &mut sessions);
-    }
-
-    // 2. Antigravity sessions
-    if let Some(agy_dir) = config.resolved_antigravity_brain_dir().filter(|d| d.is_dir()) {
-        scan_antigravity_brain_dir(&agy_dir, &mut sessions);
+    for dir in dirs.iter().filter(|d| d.path.is_dir()) {
+        match dir.harness {
+            Harness::ClaudeCode => scan_claude_projects_dir(&dir.path, &mut sessions),
+            Harness::Antigravity => scan_antigravity_brain_dir(&dir.path, &mut sessions),
+            Harness::KimiCode => scan_kimi_sessions_dir(&dir.path, &mut sessions),
+        }
     }
 
     // Deduplicate by canonical path
@@ -196,6 +201,41 @@ fn probe_claude_session(file_path: &Path, project_hint: Option<&str>) -> Option<
         modified,
         file_size_bytes,
     })
+}
+
+/// Scan a Kimi Code sessions root: `<root>/wd_<project>_<hash>/session_<uuid>/`,
+/// each with `state.json` and the main agent's `agents/main/wire.jsonl`.
+fn scan_kimi_sessions_dir(root: &Path, out: &mut Vec<DiscoveredSession>) {
+    let Ok(workspaces) = fs::read_dir(root) else { return };
+    for workspace in workspaces.flatten() {
+        let Ok(session_dirs) = fs::read_dir(workspace.path()) else { continue };
+        for session_dir in session_dirs.flatten() {
+            let wire = session_dir.path().join("agents").join("main").join("wire.jsonl");
+            let Ok(metadata) = fs::metadata(&wire) else { continue };
+            if metadata.len() == 0 {
+                continue;
+            }
+            let id = super::kimi::session_id_for(&wire).unwrap_or_else(|| "unknown".to_string());
+            let (title, cwd) = super::kimi::read_state(&session_dir.path().join("state.json"));
+            let project_name = cwd
+                .as_deref()
+                .and_then(|c| Path::new(c).file_name())
+                .and_then(|s| s.to_str())
+                .map(str::to_string);
+            let title = title.map(|t| clean_preview_text(&t)).filter(|t| !t.is_empty()).unwrap_or_else(|| {
+                format!("Session {}", crate::agent_transcript::types::truncate_chars(&id, 8))
+            });
+            out.push(DiscoveredSession {
+                id,
+                harness: HarnessKind::KimiCode,
+                path: wire,
+                title,
+                project_name,
+                modified: metadata.modified().ok(),
+                file_size_bytes: metadata.len(),
+            });
+        }
+    }
 }
 
 /// Scan an Antigravity brain root directory.
@@ -389,13 +429,37 @@ mod tests {
     }
 
     #[test]
-    fn test_scan_agent_sessions_unconfigured_scans_nothing() {
-        // Config is the only driver: a default config names no directory, so
-        // nothing is scanned regardless of what this machine's home holds.
-        let config = LaunchConfig::default();
-        assert_eq!(config.resolved_claude_projects_dir(), None);
-        assert_eq!(config.resolved_antigravity_brain_dir(), None);
+    fn test_scan_agent_sessions_all_disabled_scans_nothing() {
+        // An empty value turns a harness off, app default or not, so this
+        // holds whatever this machine's home directory contains.
+        let mut config = LaunchConfig::default();
+        config.claude_projects_dir = Some(PathBuf::new());
+        config.antigravity_brain_dir = Some(PathBuf::new());
+        config.kimi_sessions_dir = Some(PathBuf::new());
+        assert!(config.session_dirs().is_empty());
         assert!(scan_agent_sessions(&config).is_empty());
+    }
+
+    #[test]
+    fn test_scan_kimi_sessions_dir() {
+        let root = std::env::temp_dir().join(format!("test_kimi_scan_{}", std::process::id()));
+        let session = root.join("wd_proj_abc/session_5678-ef");
+        let _ = fs::create_dir_all(session.join("agents/main"));
+        fs::write(session.join("state.json"), r#"{"title":"Kimi Task","workDir":"/src/proj"}"#).unwrap();
+        fs::write(session.join("agents/main/wire.jsonl"), "{\"type\":\"metadata\"}\n").unwrap();
+
+        let sessions = scan_session_dirs(&[SessionDir {
+            harness: Harness::KimiCode,
+            path: root.clone(),
+            origin: glyph_session_dirs::Origin::Config,
+        }]);
+        assert_eq!(sessions.len(), 1);
+        let s = &sessions[0];
+        assert_eq!((s.id.as_str(), s.title.as_str()), ("5678-ef", "Kimi Task"));
+        assert_eq!(s.project_name.as_deref(), Some("proj"));
+        assert_eq!(s.harness, HarnessKind::KimiCode);
+        assert!(s.path.ends_with("agents/main/wire.jsonl"));
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -415,6 +479,9 @@ mod tests {
         let mut config = LaunchConfig::default();
         config.claude_projects_dir = Some(claude_root);
         config.antigravity_brain_dir = Some(agy_root);
+        // Off, not unset: unset falls back to this machine's real Kimi
+        // default, and the test must not depend on what this machine holds.
+        config.kimi_sessions_dir = Some(PathBuf::new());
 
         let sessions = scan_agent_sessions(&config);
         assert_eq!(sessions.len(), 2);

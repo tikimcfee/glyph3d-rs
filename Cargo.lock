@@ -2886,6 +2886,7 @@ dependencies = [
  "clap",
  "crossterm",
  "glob",
+ "glyph-session-dirs",
  "png",
  "ratatui",
  "serde",
@@ -2927,6 +2928,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "glyph-session-dirs"
+version = "0.1.0"
+
+[[package]]
 name = "glyph3d-native"
 version = "0.1.0"
 dependencies = [
@@ -2945,6 +2950,7 @@ dependencies = [
  "glyph-field",
  "glyph-field-derived",
  "glyph-field-instanced",
+ "glyph-session-dirs",
  "image",
  "log",
  "memchr",

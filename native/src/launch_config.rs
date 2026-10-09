@@ -25,6 +25,7 @@ pub struct LaunchConfig {
     pub field_mode: Option<String>,
     pub claude_projects_dir: Option<PathBuf>,
     pub antigravity_brain_dir: Option<PathBuf>,
+    pub kimi_sessions_dir: Option<PathBuf>,
     pub agent_session: Option<PathBuf>,
     pub frames: Option<u32>,
 }
@@ -42,17 +43,20 @@ impl LaunchConfig {
         }
     }
 
-    /// The configured Claude Code projects directory, `~`-expanded. `None` when
-    /// the config names none: session discovery is config-driven, so a
-    /// machine that has not opted in is never scanned.
-    pub fn resolved_claude_projects_dir(&self) -> Option<PathBuf> {
-        self.claude_projects_dir.as_deref().map(expand_home)
+    /// The per-harness session locations this config names (unexpanded).
+    pub fn session_overrides(&self) -> glyph_session_dirs::Overrides {
+        glyph_session_dirs::Overrides {
+            claude: self.claude_projects_dir.clone(),
+            antigravity: self.antigravity_brain_dir.clone(),
+            kimi: self.kimi_sessions_dir.clone(),
+        }
     }
 
-    /// The configured Antigravity brain directory, `~`-expanded; `None` when
-    /// unset, for the same reason.
-    pub fn resolved_antigravity_brain_dir(&self) -> Option<PathBuf> {
-        self.antigravity_brain_dir.as_deref().map(expand_home)
+    /// The directories session discovery scans: per harness, the configured
+    /// path if set (an empty value disables that harness), else the app's own
+    /// default locations that exist on this machine. See `glyph-session-dirs`.
+    pub fn session_dirs(&self) -> Vec<glyph_session_dirs::SessionDir> {
+        glyph_session_dirs::resolve(&self.session_overrides())
     }
 
     /// Load from a file path. Returns Err with a message if reading or parsing fails.
@@ -136,6 +140,9 @@ impl LaunchConfig {
                 "antigravity_brain_dir" => {
                     cfg.antigravity_brain_dir = Some(PathBuf::from(strip_quotes(val)));
                 }
+                "kimi_sessions_dir" => {
+                    cfg.kimi_sessions_dir = Some(PathBuf::from(strip_quotes(val)));
+                }
                 "agent_session" => {
                     cfg.agent_session = Some(PathBuf::from(strip_quotes(val)));
                 }
@@ -153,27 +160,9 @@ impl LaunchConfig {
     }
 }
 
-/// Expand leading `~` or `~/` to the user's home directory.
-pub fn expand_home(path: &Path) -> PathBuf {
-    let s = path.to_string_lossy();
-    if s == "~" {
-        if let Some(home) = home_dir() {
-            return home;
-        }
-    } else if let Some(stripped) = s.strip_prefix("~/").or_else(|| s.strip_prefix("~\\")) {
-        if let Some(home) = home_dir() {
-            return home.join(stripped);
-        }
-    }
-    path.to_path_buf()
-}
-
-/// Retrieve the user's home directory via HOME or USERPROFILE environment variable.
-pub fn home_dir() -> Option<PathBuf> {
-    std::env::var_os("HOME")
-        .or_else(|| std::env::var_os("USERPROFILE"))
-        .map(PathBuf::from)
-}
+/// Expand leading `~` or `~/` to the user's home directory. One definition,
+/// shared with the launcher through `glyph-session-dirs`.
+pub use glyph_session_dirs::{expand_home, home_dir};
 
 fn strip_quotes(s: &str) -> String {
     s.trim_matches(|c| c == '"' || c == '\'').to_string()
@@ -226,6 +215,7 @@ mod tests {
             field_mode = "derived"
             claude_projects_dir = "~/my_claude_projects"
             antigravity_brain_dir = "~/my_antigravity_brain"
+            kimi_sessions_dir = ""
             agent_session = "~/sessions/my_session.jsonl"
             frames = 1
         "#;
@@ -246,6 +236,12 @@ mod tests {
         assert_eq!(cfg.field_mode.as_deref(), Some("derived"));
         assert_eq!(cfg.claude_projects_dir, Some(PathBuf::from("~/my_claude_projects")));
         assert_eq!(cfg.antigravity_brain_dir, Some(PathBuf::from("~/my_antigravity_brain")));
+        // An empty value parses as an empty path, which disables that harness.
+        assert_eq!(cfg.kimi_sessions_dir, Some(PathBuf::new()));
+        let dirs = cfg.session_dirs();
+        assert!(dirs.iter().all(|d| d.harness != glyph_session_dirs::Harness::KimiCode));
+        assert!(dirs.iter().any(|d| d.harness == glyph_session_dirs::Harness::ClaudeCode
+            && d.origin == glyph_session_dirs::Origin::Config));
         assert_eq!(cfg.agent_session, Some(PathBuf::from("~/sessions/my_session.jsonl")));
         assert_eq!(cfg.frames, Some(1));
     }

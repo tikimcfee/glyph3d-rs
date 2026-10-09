@@ -25,4 +25,7 @@ sha2 = "0.10"
 png = "0.18"
 ratatui = "0.29"
 crossterm = "0.28"
+# Agent session locations, shared with the renderer. std-only, so the tool
+# still never depends on the renderer it builds.
+glyph-session-dirs = { path = "../crates/glyph-session-dirs" }
 
