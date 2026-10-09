@@ -212,14 +212,13 @@ impl GlyphField for DerivedField {
         let slots: Vec<DerivedSlot> = placements
             .iter()
             .map(|p| {
-                DerivedSlot::new(
+                DerivedSlot::with_item_and_group(
                     p.position[0],
                     0, // placements edit writes X, color, group
                     p.glyph_id as u16,
                     0,
                     p.color,
-                    (p.group_id & 0xFFFF) as u16,
-                    (p.group_id & 0xFFFF) as u16,
+                    p.group_id,
                 )
             })
             .collect();

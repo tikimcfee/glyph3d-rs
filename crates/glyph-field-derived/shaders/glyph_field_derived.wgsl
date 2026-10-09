@@ -146,8 +146,8 @@ fn vs_main(
     );
 
     let inst = instances[ii];
-    let item_idx = inst.item_and_group & 0xFFFFu;
-    let group_id = inst.item_and_group >> 16u;
+    let item_idx = inst.item_and_group;
+    let group_id = inst.item_and_group;
     let item = item_table[item_idx];
     let wrap_segment = inst.glyph_and_wrap >> 16u;
     let glyph_id = inst.glyph_and_wrap & 0xFFFFu;

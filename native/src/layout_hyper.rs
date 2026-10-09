@@ -12,16 +12,14 @@ use rayon::prelude::*;
 
 use crate::atlas::TrieTable;
 use crate::fold::rows_for_line;
-use crate::glyph_scene::RenderSlot;
 use crate::layout::{
-    DerivedDeviceSlots, DeviceSlotChunk, DeviceSlots, GlyphArena, ItemPlacement, LayoutError,
-    LayoutGlyphs, LayoutItem,
+    DerivedDeviceSlots, DeviceSlots, GlyphArena, ItemPlacement, LayoutError, LayoutGlyphs,
+    LayoutItem,
 };
 #[cfg(feature = "cubecl")]
 use crate::layout::TintStore;
 use crate::text::fu_to_world;
 use glyph_field::GlyphFieldMode;
-use glyph_field_derived::DerivedSlot;
 
 mod types;
 pub use types::{ChunkPrepass, ItemPrepass, Pass2DeviceOutput, SendPtr};
@@ -171,16 +169,7 @@ impl HyperLayout {
         }
 
         let derived = self.field_mode == GlyphFieldMode::Derived;
-        let slot_bytes = if derived {
-            std::mem::size_of::<DerivedSlot>()
-        } else {
-            std::mem::size_of::<RenderSlot>()
-        };
-        let can_use_device = allow_device
-            && self.device.as_ref().is_some_and(|dev| {
-                (total_survivors * slot_bytes) as u64 <= dev.max_buffer_size
-                    && total_survivors > 0
-            });
+        let can_use_device = allow_device && self.device.is_some() && total_survivors > 0;
 
         if can_use_device {
             let dev = self.device.as_ref().unwrap();
@@ -224,15 +213,11 @@ impl HyperLayout {
                 };
                 (emission, None)
             };
-            let DeviceEmission { buffer, mapped_base, pass2: pass2_out, emoji_tint_pairs } = emission;
+            let DeviceEmission { chunks, chunk_slots, mapped_base, pass2: pass2_out, emoji_tint_pairs } = emission;
 
             let device_slots = DeviceSlots {
-                chunks: vec![DeviceSlotChunk {
-                    buffer,
-                    offset: 0,
-                    slots: total_survivors as u32,
-                }],
-                chunk_slots: total_survivors,
+                chunks,
+                chunk_slots,
                 len: total_survivors,
                 // RenderSlot-typed readers key off this; never hand them a
                 // DerivedSlot mapping.
@@ -777,7 +762,9 @@ pub use rederive::{rederive_item_records, resolve_spans_to_slot_colors};
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::glyph_scene::RenderSlot;
     use crate::layout::{ItemParams, Paint};
+    use glyph_field_derived::DerivedSlot;
 
     #[test]
     fn hyper_and_batched_agree_on_samples() {
@@ -1019,7 +1006,7 @@ mod tests {
             assert_eq!(d.glyph_and_wrap & 0xFFFF, h.glyph_id & 0xFFFF, "slot {k}: glyph");
             assert_eq!(d.glyph_and_wrap >> 16, want_wrap, "slot {k}: wrap segment");
             assert_eq!(d.color, h.color, "slot {k}: color");
-            assert_eq!((d.item_and_group >> 16), h.group_id, "slot {k}: group");
+            assert_eq!(d.group_id(), h.group_id, "slot {k}: group");
             assert_eq!(d.row, h.row, "slot {k}: row");
         }
     }
@@ -1127,6 +1114,162 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn hyper_device_chunking_splits_and_binds_across_limits() {
+        use glyph_field::{FieldResources, FieldTargets, GlyphField, SlotSource};
+        use glyph_field_derived::DerivedField;
+
+        let ctx = pollster::block_on(crate::gpu::init(None));
+        let dev = crate::gpu::SharedDevice::from_ctx(&ctx);
+
+        let text = b"line 1: hello world\nline 2: testing chunked emission\nline 3: across buffer boundaries\n";
+        let item = LayoutItem {
+            bytes: text,
+            params: ItemParams { line_height: 1.25, ..Default::default() },
+            group_id: 0,
+            paint: Paint::Flat(0xFFFFFFFF),
+        };
+
+        let trie = crate::default_trie();
+        let em_height_fu = trie.metrics.em_height_fu;
+        let bitmap_adv = fu_to_world(trie.bitmap_advance_fu, em_height_fu);
+        let items = [item];
+        let (chunks, item_chunk_ranges) = chunk::slice_items_into_chunks(&items);
+        let agg = pass1_prepass_chunks(&chunks, &item_chunk_ranges, &items, &trie, bitmap_adv, em_height_fu);
+        let prepasses = agg.prepasses;
+        let slot_bases = vec![0u32];
+        let total_survivors = prepasses[0].survivor_count as usize;
+        assert!(total_survivors > 20);
+
+        let inputs = EmitInputs {
+            items: &items,
+            chunks: &chunks,
+            item_chunk_ranges: &item_chunk_ranges,
+            prepasses: &prepasses,
+            slot_bases: &slot_bases,
+            chunk_slot_bases: &agg.chunk_slot_bases,
+            chunk_base_rows: &agg.chunk_base_rows,
+            chunk_record_bases: &agg.chunk_record_bases,
+            chunk_initial_cols: &agg.chunk_initial_cols,
+            chunk_initial_seg_advs: &agg.chunk_initial_seg_advs,
+            chunk_initial_line_advs: &agg.chunk_initial_line_advs,
+            trie: &trie,
+            bitmap_adv,
+            em_height_fu,
+        };
+
+        // Force chunk_cap = 16 slots to test multi-chunk emission on real GPU buffers
+        let chunk_cap = 16;
+        let emission = device_alloc::layout_device_discrete_chunked::<pass2_device::DerivedEmit>(
+            &dev,
+            total_survivors,
+            &inputs,
+            "test derived chunked",
+            chunk_cap,
+        );
+
+        let expected_chunks = total_survivors.div_ceil(chunk_cap);
+        assert_eq!(emission.chunks.len(), expected_chunks);
+        assert_eq!(emission.chunk_slots, chunk_cap);
+
+        let total_chunk_slots: u32 = emission.chunks.iter().map(|c| c.slots).sum();
+        assert_eq!(total_chunk_slots as usize, total_survivors);
+
+        // Verify DerivedField builds bind groups for all chunks without validation error
+        let dummy_advances = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("dummy advances"),
+            size: 256,
+            usage: wgpu::BufferUsages::STORAGE,
+            mapped_at_creation: false,
+        });
+        let dummy_frame_uniform = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("dummy frame uniform"),
+            size: 256,
+            usage: wgpu::BufferUsages::UNIFORM,
+            mapped_at_creation: false,
+        });
+        let dummy_group_table = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("dummy group table"),
+            size: 256,
+            usage: wgpu::BufferUsages::STORAGE,
+            mapped_at_creation: false,
+        });
+        let dummy_glyph_map = ctx.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("dummy glyph map"),
+            size: wgpu::Extent3d { width: 1024, height: 161, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba32Uint,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let dummy_glyph_map_view = dummy_glyph_map.create_view(&wgpu::TextureViewDescriptor::default());
+
+        let dummy_emoji_sheet = ctx.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("dummy emoji sheet"),
+            size: wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8UnormSrgb,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let dummy_emoji_sheet_view = dummy_emoji_sheet.create_view(&wgpu::TextureViewDescriptor::default());
+
+        let dummy_emoji_sampler = ctx.device.create_sampler(&wgpu::SamplerDescriptor::default());
+
+        let dummy_curves = ctx.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("dummy curves"),
+            size: wgpu::Extent3d { width: 1024, height: 161, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba32Uint,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let dummy_curves_view = dummy_curves.create_view(&wgpu::TextureViewDescriptor::default());
+
+        let dummy_params = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("dummy params"),
+            size: 256,
+            usage: wgpu::BufferUsages::UNIFORM,
+            mapped_at_creation: false,
+        });
+
+        let resources = FieldResources {
+            frame_uniform: &dummy_frame_uniform,
+            group_table: &dummy_group_table,
+            glyph_map: &dummy_glyph_map_view,
+            curves: &dummy_curves_view,
+            params: &dummy_params,
+            emoji_sheet: &dummy_emoji_sheet_view,
+            emoji_sampler: &dummy_emoji_sampler,
+            glyph_advances: &dummy_advances,
+            item_params: &[],
+        };
+
+        let source = SlotSource::Device {
+            chunk_capacity: emission.chunk_slots,
+            chunks: &emission.chunks,
+            glyph_count: total_survivors,
+            mapped_base: emission.mapped_base,
+        };
+
+        let targets = FieldTargets {
+            color_format: wgpu::TextureFormat::Rgba8UnormSrgb,
+            depth_format: wgpu::TextureFormat::Depth32Float,
+            sample_count: 1,
+        };
+
+        let field = DerivedField::new(&ctx.device, &ctx.queue, source, &resources, targets);
+        assert_eq!(field.chunk_count(), expected_chunks as u32);
+        assert_eq!(field.chunk_capacity(), chunk_cap as u32);
+        assert_eq!(field.glyph_count(), total_survivors as u32);
     }
 }
 

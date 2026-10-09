@@ -197,21 +197,20 @@ impl SlotEmit for DerivedEmit {
         glyph_id: u32,
         color: u32,
         group_id: u32,
-        item_idx: u32,
+        _item_idx: u32,
         _advance: f32,
         _height: f32,
         row: i64,
         wrap_segment: i64,
     ) -> DerivedSlot {
         let wrap = wrap_segment.clamp(0, u16::MAX as i64) as u16;
-        DerivedSlot::new(
+        DerivedSlot::with_item_and_group(
             pos_x,
             row as u32,
             (glyph_id & 0xFFFF) as u16,
             wrap,
             color,
-            (item_idx & 0xFFFF) as u16,
-            (group_id & 0xFFFF) as u16,
+            group_id,
         )
     }
     #[inline(always)]
@@ -591,7 +590,7 @@ fn layout_pass2_chunk<E: SlotEmit>(
                     let row_pz = cached_pz;
                     let row_u32 = row.max(0) as u32;
                     let wrap_high = ((wrap_segment.max(0) as u32) & 0xFFFF) << 16;
-                    let item_and_group = (item_idx & 0xFFFF) | ((group_id & 0xFFFF) << 16);
+                    let item_and_group = group_id;
                     let start_survivors = survivor_out;
 
                     let qw = ascii_adv.max(crate::text::CELL_HEIGHT_WORLD);
