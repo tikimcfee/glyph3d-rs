@@ -44,7 +44,12 @@ fork)
         echo "$out" | tail -5
         exit 1
     fi
-    # The chunked emitter, fenced: shrink the record window so the standing
+    # NOTE (2026-10-09): GLYPH_RECORD_CHUNK is read by NOTHING since the
+    # records-mode retirement (d46a6c3), so this second pass repeats the first
+    # and fences no window arithmetic. Kept, labelled, until whoever owns the
+    # chain decides whether the chunked emitter comes back or the pass goes.
+    #
+    # (History) The chunked emitter, fenced: shrink the record window so the standing
     # fixture crosses several chunk boundaries (319,628 records since the
     # 2026-09-30 cluster extension = six windows) — the 16.7M
     # default never leaves window zero here, so the window arithmetic
@@ -55,7 +60,7 @@ fork)
     if out=$(GLYPH_RECORD_CHUNK=60000 "$BIN" --cubecl-repo-check native/fixtures/cubecl-fork 2>&1); then
         echo "$out" | grep -q "cubecl-repo-check PASS" \
             && echo "$out" | grep -q "strict: bit-exact" \
-            && echo "PASS  cubecl-fork-chunked (GLYPH_RECORD_CHUNK=60000, six windows)" \
+            && echo "PASS  cubecl-fork-chunked (GLYPH_RECORD_CHUNK=60000 — read by nothing since d46a6c3; a repeat of the first pass)" \
             || { echo "FAIL  cubecl-fork-chunked — PASS/strict lines missing"; echo "$out" | tail -5; exit 1; }
     else
         echo "FAIL  cubecl-fork-chunked — exited nonzero"

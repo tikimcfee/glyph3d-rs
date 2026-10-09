@@ -80,10 +80,12 @@ caller; the short version:
   all. Today it diffs the chosen `--repo-engine` against a recording
   `HyperLayout` reference run; `direct` has no records and reports `0 records`.
   The CubeCL backend answers the same call (its 48 B arena is reconstructed
-  from the records and slot streams). **No gate runs any of this any more** —
-  the `repo-verify`, `repo-verify-direct` and `cubecl-fork` gates were retired
-  on 2026-09-30 (root `AGENTS.md`, "Retired 2026-09-30"); the instruments still
-  ship and still pass.
+  from the records and slot streams). Gated again since 2026-10-09 as
+  `repo-verify` (`hyper`) and `repo-verify-direct`, and `cubecl-fork` (red,
+  C10). Every non-cubecl strategy is the same HyperLayout, so these are
+  HyperLayout against HyperLayout; `--hyper-oracle-check` (gate
+  `hyper-oracle`, `hyper_oracle.rs`) is the one that holds HyperLayout to the
+  oracle-backed fold.
 - **`HyperLayout` (`hyper`) is the DEFAULT layout engine** in pure Rust: a parallel,
   cache-blocked CPU layout engine using Rayon, intra-file line chunking, wrap-aware
   chunking for minified files, background pipelined prepasses, aligned 8-burst / 4-burst
@@ -253,8 +255,9 @@ fl/sm are diffed bit-exact against `decode_all`+`resolve_clusters`),
 `GLYPH_RECORD_CHUNK=<n>` (the repo chain's emission window size in ELEMENTS
 — the records tail only (default 16,777,216 = 512 MB); the instance tail
 has NO windows since E2b — the scatter writes the renderer-bound buffer
-directly. The cubecl-fork check (`tools/check-cubecl.sh`, retired as a
-gate on 2026-09-30) sets 60,000 so the standing fixture's records cross
+directly. **Read by nothing since d46a6c3** (records-mode
+retirement; measured 2026-10-09) — the rest of this entry is history. The
+cubecl-fork check (`tools/check-cubecl.sh`, gated again 2026-10-09) sets 60,000 so the standing fixture's records cross
 several windows (six at 319,628 records), fencing the emitter's window
 carry on an ordinary corpus; the window bases ride runtime params buffers, so every
 window shares one compiled kernel — small values cost dispatches and

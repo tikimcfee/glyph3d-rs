@@ -1,114 +1,85 @@
 #!/usr/bin/env bash
-# check-fixture-parity.sh — stage 0's acceptance test for the reference port.
+# check-fixture-parity.sh — the reference-port gate: the Rust layout forms held
+# to the JS oracle's recorded answers over the whole committed corpus.
 #
-# THE CLAIM: native/src/fixture.rs and engine/fixture_io.mojo read the same
-# .pipe.bin the same way. There is no second Rust parser to disagree with, so
-# the second opinion is the Mojo one that has been reading this corpus all
-# along.
+# Five instruments, each over engine/fixtures, each diffing lanes computed by
+# a Rust form against the oracle's own expected lanes in the same file:
 #
-# WHAT IT COMPARES: not the files — both sides trivially agree about those —
-# but FNV-1a checksums over each side's PARSED, TYPED values, taken after
-# strides, field order and the carrier split have been applied. A wrong stride,
-# a swapped section, a field read in the wrong order or a measure narrowed at
-# the wrong moment all change a checksum. Emitters:
-#   Rust: glyph3d-native --fixture-manifest
-#   Mojo: engine/fixture_manifest.mojo
+#   --fixture-trie       every fixture's trie rebuilt from its own BYTES by the
+#                        ported GlyphTrie and compared through the wire-order
+#                        serializer against the trie the oracle stored. Not a
+#                        round trip: block layout, insertion ORDER and the
+#                        decoder choice are all under test.
+#   --fixture-fold       the serial fold (fold.rs) over every fixture, EVERY
+#                        lane of EVERY byte bit-exact, plus the miss list,
+#                        leader count, per-item boxes and batch union.
+#                        Non-leader bytes too — zero is their defined state.
+#   --fixture-scan       the same fold as a segmented monoid scan (scan.rs) at
+#                        a SWEEP of chunk/group/shard tunings, under the tiered
+#                        contract. Fails if no leader reached the BIT tier.
+#   --fixture-bake       the streaming record AND its seed protocol (bake.rs)
+#                        replayed against the .bake.bin fixtures. Fails if no
+#                        query ran.
+#   --fixture-reference  text.rs's independent CPU fold against every fixture
+#                        inside its domain. Fails if nothing was in domain.
 #
-# Plus the trie rebuild (--fixture-trie, stage 1): every fixture's trie rebuilt
-# from its own BYTES by the ported GlyphTrie and compared through the wire-order
-# serializer against the trie the oracle stored. Not a round trip — nothing of
-# the stored trie's structure is handed back to the builder, so block layout,
-# insertion ORDER and the decoder choice are all under test.
+# The parse itself is checked indirectly by all five (every lane they compare
+# is computed FROM the parsed values) and directly by the loader's
+# full-consumption check. Until 2026-09-30 a sixth half compared the parse
+# against the retired Mojo loader; that second opinion is gone.
 #
-# Plus the full fold (--fixture-fold, stage 2): the ported serial fold run over
-# every fixture with EVERY lane of EVERY byte compared bit-exact, plus the miss
-# list, leader count, per-item boxes and batch union. Non-leader bytes are
-# compared too — zero is their defined state, so a port that leaves them dirty
-# must fail.
+# NOT `set -e`: a nonzero exit inside a command substitution must not skip
+# the rest of the report (see check-pick-oracle.sh). Every instrument runs and
+# reports; the exit status is the union.
 #
-# Plus the scan form (--fixture-scan, stage 3): the same fold recast as a
-# segmented monoid scan, run at a SWEEP of chunk/group/shard tunings and compared
-# under the repo's tiered contract. Invariance across the tunings is
-# associativity checked in situ. It fails if no leader was held to the BIT-exact
-# tier, since that is the tier carrying the claim.
-#
-# Plus the bake (--fixture-bake, stage 4): the streaming record AND the seed
-# protocol it ships — checkpoint-seeded prefixAt, lanesFromPrefix, rowsUnderWrap
-# — replayed against the 8 .bake.bin fixtures and diffed bit-exact. It fails if
-# no query ran, since the query half is what a whole-file record comparison
-# cannot see.
-#
-# Plus the corpus diff (--fixture-reference): text.rs's CPU fold laid against every
-# fixture inside its domain and compared BIT-EXACT to the oracle's own expected
-# lanes. That half fails if NOTHING was in domain, because a differ that
-# compared nothing passes loudest.
+# The fixture COUNTS are declared here, not derived from the tree: a fixture
+# deleted from engine/fixtures must turn this red, not shrink both sides of the
+# comparison (build.toml's fixtures artifact declares the same 26 + 8 for the
+# corpus rebuild; fixture.rs / bake.rs pin them a third time). Update
+# deliberately.
 set -uo pipefail
+shopt -s nullglob
 cd "$(dirname "$0")/.."
 BIN=target/release/glyph3d-native
-FIX=(engine/fixtures/*.pipe.bin)
+PIPE_EXPECTED=26
+BAKE_EXPECTED=8
 FAIL=0
 
 [ -x "$BIN" ] || { echo "FAIL  $BIN not built (cargo build --release)"; exit 1; }
-[ "${#FIX[@]}" -gt 0 ] || { echo "FAIL  no fixtures found — this gate would pass vacuously"; exit 1; }
 
+FIX=(engine/fixtures/*.pipe.bin)
 BAKE=(engine/fixtures/*.bake.bin)
-[ "${#BAKE[@]}" -gt 0 ] || { echo "FAIL  no bake fixtures found"; exit 1; }
-
-# Templates carry X's: GNU mktemp refuses a bare `-t name` (BSD accepts it).
-RUST=$(mktemp -t fixparity-rust.XXXXXX)
-MOJO=$(mktemp -t fixparity-mojo.XXXXXX)
-trap 'rm -f "$RUST" "$MOJO"' EXIT
-
-if ! "$BIN" --fixture-manifest "${FIX[@]}" >"$RUST" 2>/dev/null; then
-    echo "FAIL  rust manifest emitter errored"; cat "$RUST"; exit 1
+if [ "${#FIX[@]}" -ne "$PIPE_EXPECTED" ]; then
+    echo "FAIL  ${#FIX[@]} .pipe.bin fixtures found, $PIPE_EXPECTED declared — refusing to compare a different corpus"
+    exit 1
 fi
-# The Mojo runner prints compile warnings to stderr; only stdout is the manifest.
-if ! pixi run mojo run --fp-mode contract=off -I engine \
-        engine/fixture_manifest.mojo "${FIX[@]}" >"$MOJO" 2>/dev/null; then
-    echo "FAIL  mojo manifest emitter errored"; cat "$MOJO"; exit 1
+if [ "${#BAKE[@]}" -ne "$BAKE_EXPECTED" ]; then
+    echo "FAIL  ${#BAKE[@]} .bake.bin fixtures found, $BAKE_EXPECTED declared — refusing to compare a different corpus"
+    exit 1
 fi
 
-R_LINES=$(wc -l <"$RUST" | tr -d ' ')
-if [ "$R_LINES" -ne "${#FIX[@]}" ]; then
-    echo "FAIL  manifest has $R_LINES lines for ${#FIX[@]} fixtures"; FAIL=1
-fi
+# run <label> <flag> <files...>: the instrument's own summary line is the
+# volume claim, so it is surfaced verbatim, PASS or FAIL.
+run() {
+    local label=$1 flag=$2
+    shift 2
+    local out
+    if out=$(GLYPH_TRACE=warn "$BIN" "$flag" "$@" 2>&1); then
+        echo "PASS  $label — $(echo "$out" | tail -1)"
+    else
+        echo "FAIL  $label:"
+        echo "$out" | grep -v '^  PASS' | tail -20
+        FAIL=1
+    fi
+}
 
-if diff -u "$MOJO" "$RUST" >/dev/null; then
-    echo "PASS  parse parity — ${#FIX[@]} fixtures, 11 section checksums each, Rust == Mojo"
-else
-    echo "FAIL  parse parity — the two loaders disagree:"
-    diff -u "$MOJO" "$RUST" | head -20
-    FAIL=1
-fi
+run "trie rebuild" --fixture-trie "${FIX[@]}"
+run "full fold" --fixture-fold "${FIX[@]}"
+run "scan form" --fixture-scan "${FIX[@]}"
+run "bake" --fixture-bake "${BAKE[@]}"
+run "corpus diff" --fixture-reference "${FIX[@]}"
 
-if OUT=$("$BIN" --fixture-trie "${FIX[@]}" 2>&1); then
-    echo "PASS  trie rebuild — $(echo "$OUT" | tail -1)"
-else
-    echo "FAIL  trie rebuild:"; echo "$OUT" | tail -20; FAIL=1
+if [ "$FAIL" -eq 0 ]; then
+    echo "ALL PASS"
 fi
-
-if OUT=$("$BIN" --fixture-fold "${FIX[@]}" 2>&1); then
-    echo "PASS  full fold — $(echo "$OUT" | tail -1)"
-else
-    echo "FAIL  full fold:"; echo "$OUT" | tail -20; FAIL=1
-fi
-
-if OUT=$("$BIN" --fixture-scan "${FIX[@]}" 2>&1); then
-    echo "PASS  scan form — $(echo "$OUT" | tail -1)"
-else
-    echo "FAIL  scan form:"; echo "$OUT" | tail -20; FAIL=1
-fi
-
-if OUT=$("$BIN" --fixture-bake "${BAKE[@]}" 2>&1); then
-    echo "PASS  bake — $(echo "$OUT" | tail -1)"
-else
-    echo "FAIL  bake:"; echo "$OUT" | tail -20; FAIL=1
-fi
-
-if OUT=$("$BIN" --fixture-reference "${FIX[@]}" 2>&1); then
-    echo "PASS  corpus diff — $(echo "$OUT" | tail -1)"
-else
-    echo "FAIL  corpus diff:"; echo "$OUT" | tail -20; FAIL=1
-fi
-
 exit "$FAIL"

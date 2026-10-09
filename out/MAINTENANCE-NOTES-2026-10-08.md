@@ -28,7 +28,7 @@ machines and clones, **M** machine-specific values, **R** runner.
 | D5 | pixi carried the retired engine's tasks and mojo/max toolchain | closed | 16372a9 (tasks), 6954a9d (deps, lock re-solved; Mac env unsolved-installed) |
 | D6 | Orphaned configs: `deny.toml` (nothing runs it) | open | gate or delete; mutants.toml fixed in 16372a9, fixture-parity script moved to D8 |
 | D7 | Loose root docs: session handoffs, plus Mojo-era TOOLING-PLAN.md open items, BUILD-BRIEF.md, research/ surveys | open | move handoffs to `out/`; banner or trim the rest |
-| D8 | Retired Rust checks still ship; reference-port and repo-verify PASS, nobody runs them; `overflow-leads.txt` read by nothing | open | re-gate with mutations; high value (CubeCL half blocked on C10) |
+| D8 | Retired Rust checks still ship; reference-port and repo-verify PASS, nobody runs them; `overflow-leads.txt` read by nothing | closed | re-gated 2026-10-09 (reference-port, repo-verify(-direct) green; cubecl-chain/-fork red per C10) plus the new hyper-oracle gate (red); hash in a follow-up |
 | D9 | `engine-trie.bin` (+ `gen_real_trie.py`, `--engine-trie`) is committed and gated but read by no Rust code | open | decide: keep or retire (changes committed-artifacts) |
 | C1 | Twin field crates ~60% shared; five copies of the mapped-buffer upload | open | hoist into `glyph-field`; last, largest |
 | C2 | Oversized files; dead kernels in `cubecl_chain/position.rs` | open | delete dead kernels; split `glyph/src/main.rs` |
@@ -39,7 +39,7 @@ machines and clones, **M** machine-specific values, **R** runner.
 | C7 | 239 stage-letter comments | won't do | archaeology; reword only when touching |
 | C8 | `clippy --all-targets`: 14 test-only lints + deny-level `reversed_empty_ranges` (seam.rs test) | open | sweep; gate runs without `--all-targets` |
 | C9 | `discovery.rs` names a Claude project by the slug's last `-` segment (`…-glyph3d-js` → `js`) | open | small fix |
-| C10 | CubeCL fence FAILS on both machines. Attributed: two defects (detail) — HyperLayout's ASCII fast path vs clusters (since 09-30), and a chain regression in 26595fb (10-06) | open | decide fixes; HyperLayout has no oracle check (D8) |
+| C10 | Two defects attributed (detail). Defect 2 (chain) FIXED in c5ef78a, it was the instrument. Defect 1: HyperLayout vs the oracle, now measured by the `hyper-oracle` gate (red), with two more HyperLayout defects (detail) | open | fix HyperLayout clusters with a perf A/B on the M2 |
 | C12 | CubeCL's standalone cluster pass (`--cubecl-cluster-check`, bench cluster mode; NOT the repo path's fused decode_probe) misses keycap/overlap/wrap sequences and ZWJ families; fails identically at d08af8b | open | instrument-only; fix or retire the standalone pass |
 | C11 | Mutation `find` strings also match their own entry in build.toml; correct only because the target comes first | open | small: anchor them, or have the prover refuse an ambiguous find |
 | P1 | pixel-ab red on both platforms since 10-07; Linux set a month stale, 2 views never adopted | Ivan's call | Mac re-baseline first, then Linux re-adoption |
@@ -89,8 +89,8 @@ export GLYPH_FLAGSHIP_REPO=~/localdev/viz-web/glyph3d-js
 
 ## Suggested order for what is open
 
-1. D8 (reference-port + repo-verify half): re-gate the passing checks, with
-   mutations. Restores the layout's oracle fence.
+1. (D8 done 2026-10-09.) C10 next: the hyper-oracle gate is the fence a
+   HyperLayout fix lands against.
 2. D7, D4, D6: the remaining doc and config tidy.
 3. C5: delete the spike.
 4. C2 + C3 + C4: cubecl cleanup, once C10 says whether the CubeCL path is
@@ -135,31 +135,6 @@ so (a) only helps human-made ones; weigh (c) for that reason.
 ### D6. Orphans — [measured]
 
 - `deny.toml`: `cargo-deny` is in mise; nothing runs it. Gate or delete.
-### D8. Retired checks that still pass — [measured 2026-10-09]
-
-`5e94de8` (2026-09-30, "decouple CubeCL … and clean build.toml") removed seven
-gates and 26 mutations. The Rust instruments behind four of them still pass:
-
-- reference-port, Rust halves (`--fixture-trie/-fold/-scan/-bake/-reference`
-  over `engine/fixtures`): all PASS, with the exact volumes the old AGENTS.md
-  quoted (155,222 leaders / 1,874,328 lanes fold; 208 scan cases; 27,315 bake
-  leaders / 530 queries; 5,332 reference records). The script
-  (`tools/check-fixture-parity.sh`) also needs the retired engine for its
-  parse-parity half, which is why the whole gate went.
-- repo-verify (`--repo-verify` on `g-pick-repo`): PASS for hyper, direct and
-  batch, wrap modes down and back.
-- cubecl-chain / cubecl-fork (`tools/check-cubecl.sh`): both FAIL here; see C10.
-- `native/fixtures/overflow-leads.txt` fed the retired engine-check; no check
-  reads it now. `--fixture-reference` could, if it accepts a text input.
-
-`tools/check-fixture-parity.sh` cannot be re-gated as is: it dies at its Mojo
-step, and since 7a99b5a its first Rust call (`--fixture-manifest`) is gone too.
-Rewrite it as the five Rust instruments, or declare them as gates directly.
-
-Re-gate as `kind = "cmd"` / `kind = "repo-verify"` gates (the RepoVerify kind
-and its validation still exist in the runner), each with a pass_line and a
-mutation that reddens it, and quote the volumes in `blind_to`.
-
 ### D7. Loose root docs — [measured]
 
 `SESSION-HANDOFF.md` (2026-10-02, quotes floor 158),
@@ -272,7 +247,21 @@ the flag and its `cli/command.rs` arm.
 - The fork failure grew from 1,113 record mismatches (09-30) to 708,529 lane
   words (now); the check moved from records to slot lanes in between, and
   26595fb may add to it. Not separated.
-- Consequences: HyperLayout is the default engine and nothing compares it to
+- **hyper-oracle gate (2026-10-09, red)** [measured]: HyperLayout vs
+  `fold.rs` (oracle-validated) over the 26 fixtures + cubecl-fork +
+  g-cluster-repo + overflow-leads: 6 of 29 corpora differ, 377 / 475,234
+  records. First divergence `cluster-keycap` byte 0 (fold gi 5264, hyper gi
+  18) — defect 1 confirmed against the oracle corpus, whose own keycap
+  fixture the fold clears. `#️⃣` diverges too (cubecl-fork byte 560), so
+  the chain-vs-hyper agreement on `#`/`*` above is not agreement with the
+  oracle. Two more HyperLayout divergences, independent of CubeCL:
+  (a) it ignores the item's cluster MODE (leader-mode ZWJ zeroed in
+  `cluster-zwj`; `--cluster-mode leader` on cubecl-fork + g-cluster-repo:
+  29,826 records differ); (b) its host Pass 2 paginates `scroll_rows` and
+  `page_cols` unlike the fold (`paged-rows`, `paged-cols`, `scroll-only`;
+  instances only — its recording path `rederive.rs` agrees). Latent for
+  repos, which set neither.
+- Consequences (as first written; the gate above now exists): HyperLayout is the default engine and nothing compared it to
   the JS oracle (the `--fixture-*` instruments test fold.rs/scan.rs/text.rs).
   `repo-cluster`'s Metal golden dates from 2026-09-20 (05a5935), BEFORE
   HyperLayout, so it pins the Mojo-era cluster rendering: a Mac pixel-ab run
