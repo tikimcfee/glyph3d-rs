@@ -506,6 +506,14 @@ fn cli_action_dispatch_variants() {
     // 3. Fixture
     let cli = parse(&["--fixture-fold", "a.bin"]);
     assert!(matches!(cli.action(), CliCommand::Fixture(FixtureTask::Fold(_))));
+    let cli = parse(&["--hyper-oracle-check", "a.pipe.bin", "some/dir"]);
+    match cli.action() {
+        CliCommand::Fixture(FixtureTask::HyperOracle(paths, mode)) => {
+            assert_eq!(paths.len(), 2);
+            assert_eq!(mode, crate::fold::ClusterMode::Cluster, "the CLI default mode rides along");
+        }
+        other => panic!("--hyper-oracle-check dispatched to {other:?}"),
+    }
 
     // 4. RepoScanOnly
     let cli = parse(&["--load-repo", "some/dir", "--repo-scan-only"]);

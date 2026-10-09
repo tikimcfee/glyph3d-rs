@@ -903,9 +903,11 @@ impl VerifyLayout for LayoutEngine {
 /// Compact one item's records into the arena: drop the blanks, repack 32 B →
 /// 48 B with paint and group, and reduce the two extents in the same pass.
 ///
-/// TEST-ONLY TODAY: no shipping backend calls it. `HyperLayout` emits
-/// instances directly, and the CubeCL instance tail is this loop's device
-/// replacement. It stays as the one host statement of what compaction means
+/// NO SHIPPING BACKEND CALLS IT. `HyperLayout` emits instances directly, and
+/// the CubeCL instance tail is this loop's device replacement. Its one
+/// non-test caller is the `--hyper-oracle-check` instrument
+/// (`hyper_oracle.rs`), which compacts the oracle-backed fold's records with
+/// it. It stays as the one host statement of what compaction means
 /// — blanks, paint indexing, extents — which the seam's tests pin, so a
 /// backend can differ from it about the fold (the thing the corpus actually
 /// checks) and is held to it for the rest. A second hand-written copy of this
@@ -917,7 +919,6 @@ impl VerifyLayout for LayoutEngine {
 /// Blank records (`glyph_id == 0` — missing or whitespace) emit no instance;
 /// their advance is already baked into the surviving records' X by the fold,
 /// so dropping them moves nothing.
-#[cfg(test)]
 pub(crate) fn compact_records_into(
     records: &[GlyphRecord],
     paint: Paint<'_>,

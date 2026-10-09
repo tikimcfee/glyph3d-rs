@@ -10,6 +10,7 @@ pub mod fixture;
 pub mod fold;
 pub mod glyph_scene;
 pub mod glyph_trie;
+pub mod hyper_oracle;
 pub mod gpu;
 pub mod launch_config;
 pub mod layout;

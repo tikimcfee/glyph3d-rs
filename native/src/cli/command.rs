@@ -63,6 +63,9 @@ pub enum FixtureTask {
     Fold(Vec<PathBuf>),
     Scan(Vec<PathBuf>),
     Bake(Vec<PathBuf>),
+    /// HyperLayout vs the oracle-backed fold; the mode applies to directory
+    /// and text inputs (fixtures carry their own).
+    HyperOracle(Vec<PathBuf>, crate::fold::ClusterMode),
 }
 
 /// Execution plan for rendering a scene.
@@ -149,6 +152,12 @@ impl Cli {
         }
         if !self.fixture_bake.is_empty() {
             return CliCommand::Fixture(FixtureTask::Bake(self.fixture_bake.clone()));
+        }
+        if !self.hyper_oracle_check.is_empty() {
+            return CliCommand::Fixture(FixtureTask::HyperOracle(
+                self.hyper_oracle_check.clone(),
+                self.cluster_mode,
+            ));
         }
 
         if self.repo_scan_only {
