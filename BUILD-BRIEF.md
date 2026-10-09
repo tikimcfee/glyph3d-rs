@@ -184,7 +184,7 @@ an account of which ones RUN. Four found in one day, one at a time, by accident.
   So when you subsume gate 1b, carry a DECLARED corpus size into the manifest or
   leave the pins alone; do not retire them as duplicate coverage, and do not
   copy 1b's habit of asking the tree how big the tree is.
-- **Do not edit `/Users/lugo/localdev/viz-web/glyph3d-js`.** It is the JS
+- **Do not edit the sibling web repo (`viz-web/glyph3d-js`).** It is the JS
   renderer this engine was ported from — the original oracle. Every expected
   answer in the conformance corpus traces back to it, but by way of
   **revision-pinned snapshots vendored into this repo** (`tools/vendor/ref/`

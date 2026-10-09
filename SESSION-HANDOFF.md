@@ -3,7 +3,7 @@
 **Date**: 2026-10-02  
 **Handoff From**: Antigravity Pair-Programming Session  
 **Branch with Completed Work**: `worktree-workspace-random-experiments` (HEAD @ `92d27c1`)  
-**Target Repository Checkout**: `/Users/lugo/localdev/viz-native/glyph3d-native` (`main` / `spatial-alignment`)  
+**Target Repository Checkout**: the main checkout (`main` / `spatial-alignment`)  
 
 ---
 
@@ -81,7 +81,7 @@ All work is committed on `worktree-workspace-random-experiments`:
 
 ## 4. The Incoming Agent's Mission: Exactly What to Do Next
 
-When you start in the main checkout (`/Users/lugo/localdev/viz-native/glyph3d-native`), follow this concrete roadmap:
+When you start in the main checkout, follow this concrete roadmap:
 
 ### Step 0: Sync Commits
 Ensure the commits from `worktree-workspace-random-experiments` are brought into your active branch:

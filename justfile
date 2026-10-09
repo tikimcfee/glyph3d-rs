@@ -27,8 +27,10 @@ prove:
 test:
 	CI=1 cargo nextest run --workspace
 
-# Record sampling profile of repo loading with samply
-profile file="/Users/lugo/localdev/viz-web/glyph3d-js":
+# Record sampling profile of repo loading with samply.
+# Profiles $GLYPH_FLAGSHIP_REPO when set (the large corpus you benchmark on),
+# else this repo; pass a path to profile anything else.
+profile file=env_var_or_default("GLYPH_FLAGSHIP_REPO", "."):
 	@mkdir -p out
 	samply record --save-only -o out/profile-glyph3d-js.json.gz target/release/glyph3d-native --load-repo {{file}} --repo-scan-only
 
