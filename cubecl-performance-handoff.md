@@ -2,10 +2,10 @@
 
 ## 1. Executive Summary & Verification State
 
-This document provides complete architectural orientation, data structure mappings, optimization history, and performance results for the CubeCL GPU layout pipeline in [`glyph3d-native`](file:///Users/lugo/localdev/viz-native/glyph3d-native/.claude/worktrees/workspace-random-experiments/native).
+This document provides complete architectural orientation, data structure mappings, optimization history, and performance results for the CubeCL GPU layout pipeline in [`glyph3d-native`](native).
 
 ### Verification Status (All Gates Green)
-- **Zero Terse Variables**: All cryptic, 1-character, and 2-character variable names (`b`, `ie`, `fl`, `sm`, `gi`, `hgt`, `ir`, `im`, `tc`, `tm`, `xc`, `xm`, `lc`, `lm`, `wc`, `otb`, `wm`, etc.) have been completely eliminated across the entire [`native/src/cubecl_chain/`](file:///Users/lugo/localdev/viz-native/glyph3d-native/.claude/worktrees/workspace-random-experiments/native/src/cubecl_chain) module and its integration points in [`native/src/cubecl_layout.rs`](file:///Users/lugo/localdev/viz-native/glyph3d-native/.claude/worktrees/workspace-random-experiments/native/src/cubecl_layout.rs) and [`native/src/repo.rs`](file:///Users/lugo/localdev/viz-native/glyph3d-native/.claude/worktrees/workspace-random-experiments/native/src/repo.rs).
+- **Zero Terse Variables**: All cryptic, 1-character, and 2-character variable names (`b`, `ie`, `fl`, `sm`, `gi`, `hgt`, `ir`, `im`, `tc`, `tm`, `xc`, `xm`, `lc`, `lm`, `wc`, `otb`, `wm`, etc.) have been completely eliminated across the entire [`native/src/cubecl_chain/`](native/src/cubecl_chain) module and its integration points in [`native/src/cubecl_layout.rs`](native/src/cubecl_layout.rs) and [`native/src/repo.rs`](native/src/repo.rs).
 - **Compilation & Static Analysis**: `cargo check --features cubecl -p glyph3d-native` and `cargo clippy --features cubecl -p glyph3d-native` pass with **0 errors and 0 warnings**.
 - **Unit Test Suite**: `cargo test --workspace` passes **157 of 157 tests** + full Naga WGSL shader validation.
 - **Pixel Golden Oracle**: `cargo run -p glyph -- test render` passes with **all 9 golden views byte-equal** on Apple Silicon Metal rasterizer (`demo.png`, `text.png`, `repo-wide.png`, `repo-down.png`, `repo-zoom.png`, `repo-back-oblique.png`, `emoji.png`, `emoji-cluster.png`, `repo-cluster.png`) and `pick-oracle: PASS`.
@@ -58,7 +58,7 @@ All kernels and host buffers use consistent domain terminology:
 ### Step 1: Intermediate Buffer Elimination & Direct Emission (`apply_and_emit`)
 - **Status: COMPLETED**.
 - **Implementation**:
-  - Unified the Blelloch scan and chase loop from `apply` with the spatial positioning, extent reductions, and direct slot/tint emission from `resolve_x_fused` into a single kernel [`apply_and_emit`](file:///Users/lugo/localdev/viz-native/glyph3d-native/.claude/worktrees/workspace-random-experiments/native/src/cubecl_chain/position.rs#L292).
+  - Unified the Blelloch scan and chase loop from `apply` with the spatial positioning, extent reductions, and direct slot/tint emission from `resolve_x_fused` into a single kernel [`apply_and_emit`](native/src/cubecl_chain/position.rs#L292).
   - In `ChainMode::Instances`, completely bypassed:
     - `line_columns` (`h_lc`, 776 MB)
     - `item_record_ordinals` (`h_wc`, 388 MB)
@@ -137,7 +137,7 @@ Metal hardware timestamp queries (`GLYPH_CHAIN_PROF=stages`) across all 12 compu
 
 1. **Golden Views test CPU HyperLayout**: Running `cargo run -p glyph -- test render` validates that the CPU layout and Metal renderer are intact, but **does not run CubeCL**. All CubeCL layout changes must be validated with:
    `target/release/glyph3d-native --cubecl-repo-check native/fixtures/g-pick-repo`
-2. **Double-Single Fixed-Point Precision**: `advance_fixed` and `fixed_pair` in [`monoid.rs`](file:///Users/lugo/localdev/viz-native/glyph3d-native/.claude/worktrees/workspace-random-experiments/native/src/cubecl_chain/monoid.rs) emulate 64-bit precision across 32-bit floats. Never simplify them to standard `f32` addition or `cubecl-repo-check`'s zero-deviation census will fail.
+2. **Double-Single Fixed-Point Precision**: `advance_fixed` and `fixed_pair` in [`monoid.rs`](native/src/cubecl_chain/monoid.rs) emulate 64-bit precision across 32-bit floats. Never simplify them to standard `f32` addition or `cubecl-repo-check`'s zero-deviation census will fail.
 3. **`EXT_STRIDE` is 10, not 8**: Bounding box extents are 10 lanes:
    `[page_right, page_bottom, page_z_min, page_z_max, ink_min_x, ink_min_y, ink_max_x, ink_max_y, ink_min_z, ink_max_z]`. Flags live in separate `shared_item_flags`.
 4. **`--features cubecl` Gating**: The entire CubeCL pipeline is behind the `cubecl` cargo feature. Note that `cargo run -p glyph -- test render` builds without `--features cubecl`, so always rebuild with `cargo build --release --features cubecl -p glyph3d-native` after running `glyph`.
@@ -170,5 +170,5 @@ target/release/glyph3d-native --cubecl-cluster-check ./engine/fixtures/cluster-z
 target/release/glyph3d-native --cubecl-repo-check native/fixtures/g-pick-repo
 
 # 7. Flagship benchmark run (CubeCL Layout Engine)
-target/release/glyph3d-native --load-repo /Users/lugo/localdev/viz-web/glyph3d-js --repo-engine cubecl --screenshot /tmp/test_flagship_cubecl.png --frames 1
+target/release/glyph3d-native --load-repo "$GLYPH_FLAGSHIP_REPO" --repo-engine cubecl --screenshot /tmp/test_flagship_cubecl.png --frames 1
 ```

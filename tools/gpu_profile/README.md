@@ -9,7 +9,7 @@ so an M2 capture and an RTX capture compare row by row.
 # record + attribute (writes <out>/profile.json; raw data kept under <out>/raw)
 python3 tools/gpu_profile capture --out out/gpu-profile/base -- \
     target/release/glyph3d-native --repo-engine cubecl \
-    --load-repo /Users/lugo/localdev/viz-web/glyph3d-js --screenshot /tmp/x.png --frames 1
+    --load-repo "$GLYPH_FLAGSHIP_REPO" --screenshot /tmp/x.png --frames 1
 
 # compare captures (any backend mix) on the canonical metrics
 python3 tools/gpu_profile report out/gpu-profile/base out/gpu-profile/variant --stage apply_and_emit [--native]

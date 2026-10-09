@@ -10,6 +10,7 @@ Measures:
 """
 
 import argparse
+import os
 import re
 import statistics
 import subprocess
@@ -92,7 +93,8 @@ def print_row(name, cold_val, warm_vals, unit="ms"):
 
 def main():
     parser = argparse.ArgumentParser(description="Amortized benchmark for HyperLayout")
-    parser.add_argument("--repo", default="/Users/lugo/localdev/viz-web/glyph3d-js", help="Path to repo")
+    parser.add_argument("--repo", default=os.environ.get("GLYPH_FLAGSHIP_REPO", "."),
+                        help="Path to repo (default: $GLYPH_FLAGSHIP_REPO, else this repo)")
     parser.add_argument("--bin", default="./target/release/glyph3d-native", help="Path to binary")
     parser.add_argument("-n", "--runs", type=int, default=5, help="Total number of runs (1 cold + N-1 warm)")
     parser.add_argument("--field-mode", default="derived", choices=["derived", "instanced"])

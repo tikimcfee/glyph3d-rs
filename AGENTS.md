@@ -54,10 +54,12 @@ cargo run -p glyph -- validate
 native Rust with Rayon and unified-memory shared buffer mapping.
 
 **Performance characteristics:**
-- Flagship corpus `/Users/lugo/localdev/viz-web/glyph3d-js` (1,306 files, 97.0 MB source,
+- Flagship corpus: the retired JS repo, `viz-web/glyph3d-js` (1,306 files, 97.0 MB source,
   95.2 million glyph instances) loads and lays out in **~168 ms** backend (576.9 MB/s) /
   **~177 ms** total visual init in `--color-mode flat`, and **~215 ms** backend (450.9 MB/s) /
   **~226 ms** total visual init in `--color-mode syntax` on Apple Silicon Metal.
+  Benchmark tools read its location from `GLYPH_FLAGSHIP_REPO`; nothing in the
+  tree hardcodes where a checkout lives.
 - Decoupled CubeCL: experimental CubeCL GPU compute kernels are decoupled behind the
   optional Cargo feature `cubecl` (`cargo check --features cubecl`).
 - ByteSpan token painting: `ByteSpan` and `Paint::ByteSpans` provide byte-range semantic

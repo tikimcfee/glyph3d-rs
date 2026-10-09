@@ -46,7 +46,7 @@ import { fileURLToPath } from 'url';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 // VENDORED 2026-09-02. This was an absolute path into the web repo
-// ('/Users/lugo/localdev/viz-web/glyph3d-js') — a live dependency on a tree that
+// (the authoring machine's viz-web/glyph3d-js checkout) — a live dependency on a tree that
 // is no longer trunk, invisible until someone moved a directory. tools/vendor/ref
 // now mirrors that repo's LAYOUT exactly, so every vendored file is byte-verbatim
 // and this is the only line that changed. To refresh from the web repo, copy the

@@ -50,9 +50,11 @@ Always run tests appropriate to your scope before committing:
 Use the dedicated amortized benchmarking harness to measure cold vs warm performance:
 
 ```sh
-# Benchmark 5 runs (1 cold + 4 warm) on flagship corpus:
+# Benchmark 5 runs (1 cold + 4 warm) on flagship corpus. Point
+# GLYPH_FLAGSHIP_REPO at your checkout of it (or any large repo);
+# bench_hyper.py defaults --repo to that variable, else this repo.
 python3 tools/bench_hyper.py \
-  --repo /Users/lugo/localdev/viz-web/glyph3d-js \
+  --repo "$GLYPH_FLAGSHIP_REPO" \
   -n 5 \
   --field-mode derived \
   --color-mode flat
@@ -69,7 +71,7 @@ Outputs mean, min, max, and stddev for:
 ```sh
 # CPU HyperLayout with syntax coloring:
 ./target/release/glyph3d-native \
-  --load-repo /Users/lugo/localdev/viz-web/glyph3d-js \
+  --load-repo "$GLYPH_FLAGSHIP_REPO" \
   --repo-engine hyper \
   --field-mode derived \
   --color-mode syntax \
@@ -77,7 +79,7 @@ Outputs mean, min, max, and stddev for:
 
 # GPU CubeCL with hardware profiling timestamps:
 GLYPH_CHAIN_PROF=1 ./target/release/glyph3d-native \
-  --load-repo /Users/lugo/localdev/viz-web/glyph3d-js \
+  --load-repo "$GLYPH_FLAGSHIP_REPO" \
   --repo-engine cubecl \
   --field-mode derived \
   --screenshot out/perf_test.png \

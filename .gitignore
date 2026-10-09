@@ -46,3 +46,6 @@ assets/atlas/*.cache
 /launch_config.toml
 native/launch_config.toml
 
+# mise's Python venv (mise.toml creates it at the repo root)
+/.venv/
+

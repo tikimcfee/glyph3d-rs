@@ -35,8 +35,9 @@ ever did, the hash is the finding.
 Run:  python3 tools/vendor-manifest.py            regenerate both files
       python3 tools/vendor-manifest.py --check    verify local hashes only, exit 1 on drift
 
-The web repo is looked for at GLYPH_WEB (env) or the Mac path below. When it
-is ABSENT, regeneration PRESERVES the upstream verdicts recorded in the
+The web repo is looked for at GLYPH_WEB (env) only; there is no default path,
+because where a sibling checkout lives is a property of the machine. When it
+is unset or ABSENT, regeneration PRESERVES the upstream verdicts recorded in the
 existing PROVENANCE.md instead of resetting them to n/a — before 2026-09-10 a
 regeneration on any machine without that path silently erased the record.
 """
@@ -51,7 +52,7 @@ from datetime import date
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-WEB = Path(os.environ.get("GLYPH_WEB", "/Users/lugo/localdev/viz-web/glyph3d-js"))  # only needed to REFRESH
+WEB = Path(os.environ["GLYPH_WEB"]) if os.environ.get("GLYPH_WEB") else None  # only needed to REFRESH
 BUILD_TOML = ROOT / "build.toml"
 
 # local path in this repo -> path it came from in the web repo
@@ -314,7 +315,7 @@ def recorded_upstream() -> tuple[str, dict[str, str]]:
 
 def regenerate() -> int:
     pipe, bake = fixture_counts()  # fail BEFORE writing anything
-    web_present = (WEB / ".git").exists()
+    web_present = WEB is not None and (WEB / ".git").exists()
     if web_present:
         upstream = subprocess.run(["git", "-C", str(WEB), "rev-parse", "HEAD"],
                                   capture_output=True, text=True).stdout.strip()
