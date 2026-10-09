@@ -162,7 +162,7 @@ def build() -> bytes:
             bits[cp] |= 1 << bit
 
     # ── pins: named answers the table must give ─────────────────────────
-    # The generator's self-test (the gen_real_trie.py rocket precedent): if
+    # The generator's self-test (the check_atlas.py rocket precedent): if
     # any of these moves, the data moved, and refusing to write is correct.
     def has(cp, mask):
         return bits[cp] & mask == mask

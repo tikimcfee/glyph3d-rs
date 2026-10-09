@@ -16,7 +16,7 @@ use crate::layout::{GlyphRecord, ItemParams};
 
 /// Per-file pick record: everything needed to (a) hit-test the file's AABB
 /// under the LIVE group TRS and (b) re-derive its glyph geometry via a
-/// deterministic engine re-run (`repo::rederive_records` with `item`).
+/// deterministic engine re-run (`repo::rederive_cached` with `item`).
 pub struct PickFileInfo {
     pub rel_path: String,
     pub group_id: u32,
@@ -32,7 +32,6 @@ pub struct PickFileInfo {
 /// Repo-mode pick context (one per staged scene).
 pub struct PickContext {
     pub root: PathBuf,
-    pub trie: PathBuf,
     pub files: Vec<PickFileInfo>,
     pub content: Option<std::collections::HashMap<String, std::sync::Arc<Vec<u8>>>>,
     pub folds: std::collections::HashMap<String, Vec<std::ops::Range<u32>>>,
@@ -156,7 +155,7 @@ impl GlyphScene {
                 }
             }
         };
-        let Ok(records) = crate::repo::rederive_cached(&pctx.trie, &bytes, &info.item) else {
+        let Ok(records) = crate::repo::rederive_cached(&bytes, &info.item) else {
             log::warn!("pick: failed to re-run {}", info.rel_path);
             return false;
         };

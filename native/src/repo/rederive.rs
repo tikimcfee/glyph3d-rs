@@ -1,35 +1,11 @@
 //! Deterministic record re-derivation and fold compaction.
 
-use std::path::Path;
 use crate::layout::{GlyphRecord, InkExtent, ItemParams, PageExtent};
 
-/// Stage G — deterministic per-file re-layout for picking: re-read the file
-/// from the repo root and re-run the pure-Rust layout with the EXACT ItemParams
-/// it was staged with.
-pub fn rederive_records(
-    root: &Path,
-    _trie: &Path,
-    rel_path: &str,
-    item: &ItemParams,
-) -> std::io::Result<(Vec<GlyphRecord>, Vec<u8>)> {
-    let bytes = std::fs::read(root.join(rel_path))?;
-    let trie = crate::default_trie();
-    let records = crate::layout_hyper::rederive_item_records(&bytes, item, &trie);
-    Ok((records, bytes))
-}
-
-pub fn rederive_from_bytes(
-    _trie: &Path,
-    bytes: &[u8],
-    item: &ItemParams,
-) -> std::io::Result<Vec<GlyphRecord>> {
-    let trie = crate::default_trie();
-    let records = crate::layout_hyper::rederive_item_records(bytes, item, &trie);
-    Ok(records)
-}
-
+/// Deterministic per-file re-layout for picking and folds: re-run the
+/// pure-Rust layout over `bytes` with the EXACT ItemParams the file was staged
+/// with (the atlas trie, as every load uses).
 pub fn rederive_cached(
-    _trie: &Path,
     bytes: &[u8],
     item: &ItemParams,
 ) -> std::io::Result<Vec<GlyphRecord>> {

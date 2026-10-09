@@ -300,9 +300,8 @@ cpEntries.sort((a, b) => a[0] - b[0]);
 // a slot id in the instance stream and the shader needs nothing new. The
 // sheet's sequence table is sorted by codepoint sequence, so the slot id of
 // sequence i is SEQ_SLOT_BASE + i — a pure function of (web bake, sheet), the
-// same append-only rule as 4b. gen_real_trie.py carries this section VERBATIM
-// into engine-trie.bin and cross-checks the slot base against glyphs.bin
-// (gen_real_trie.py:165-173): no mapping artifact exists to drift.
+// same append-only rule as 4b. tools/check_atlas.py cross-checks the slot base
+// against glyphs.bin: no mapping artifact exists to drift.
 const seqCount = sheet[22], seqMax = sheet[23];
 const seqStride = 2 + seqMax;
 const seqTableOff = SHEET_HEADER_WORDS + sheetCells * SHEET_CELL_STRIDE + sheetCps * SHEET_CP_STRIDE;
@@ -468,8 +467,7 @@ writeU32('glyphmap.bin',
 
 // codepoints.bin — v2: the v1 trie PLUS the two sections the sequence pass
 // reads. Header grows 44 -> 68 B (words 11..16 below); the blockIndex/blocks
-// layout is unchanged. The two sections are pure u32 data, byte-identical to
-// what gen_real_trie.py re-containers into engine-trie.bin (G3TR v2):
+// layout is unchanged. The two sections are pure u32 data:
 //   sequence section: sequenceCount x (2 + seqMax) words, [slot, len, cps..],
 //                     sorted by the codepoint sequence (the sheet's own order,
 //                     asserted below) so readers binary-search it.

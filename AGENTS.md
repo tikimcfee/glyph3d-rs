@@ -155,7 +155,7 @@ read by nothing at all.
 
 ## What the checks actually do
 
-Fifteen gates (2026-10-09), in `build.toml` order. For each: what it compares, what makes it
+Sixteen gates (2026-10-09), in `build.toml` order. For each: what it compares, what makes it
 red, and **what it cannot see**. The last is the part worth reading. A check is
 a claim about a counterfactual, and a check whose blind spot you don't know is
 a green you can't price. (Gates were once numbered positions in one shell
@@ -191,14 +191,28 @@ build.toml: generator-native check modes for the schema (`gen_schema.py
 --check`, which also runs the schema's own invariant validation), the emoji
 sheet (`gen_emoji_sheet.py --check`), the cluster class table
 (`gen_cluster_table.py --check`) and the emoji demo corpus
-(`gen_emoji_corpus.py --check`); the trie uses `gen_real_trie.py
---verify-only`; the four atlas bins are rebuilt by `export-atlas.mjs` into a
-scratch dir and `cmp`'d. (The schema was ungated from the engine's retirement
+(`gen_emoji_corpus.py --check`); the four atlas bins are rebuilt by
+`export-atlas.mjs` into a scratch dir and `cmp`'d. (The schema was ungated from the engine's retirement
 until 2026-10-09: its generator still emitted a half for the retired engine,
 so `--check` was red and no artifact declared it.) Red when a generated
 artifact is hand-edited, or a generator changes behaviour. Blind to
-whether the *inputs* are right: the trie check proves `engine-trie.bin` is a
-faithful derivation of `codepoints.bin`/`glyphs.bin`, not that those are correct.
+whether the *inputs* are right: it proves each artifact is what its generator
+makes, not that what it makes is correct. For the atlas's lookup tables,
+atlas-tables (next) checks part of that.
+
+**atlas-tables** (`tools/check_atlas.py`, 2026-10-09). What `codepoints.bin`
+and `glyphs.bin` MEAN, where it can be checked: the two agree (magic, version,
+shape, upem, missing-block metrics, the sequence slots ending at glyphs.bin's
+slot count), pinned lookups resolve where they must ('A' 34, ' ' 1, RAT 3839,
+ROCKET 4759, TAG SPACE missing, the ZWJ family 6819), every entry is one em
+tall and block 0 is the missing block. These checks lived in the generator of
+`engine-trie.bin`, a re-containering of the same tables for the retired engine
+that no Rust code read; the blob was retired (D9) and its checks kept. Its
+domain sweep — the font-unit → world conversion is the NEAREST f32 to the
+exact quotient, ties to even, over every u16 — now runs in Rust against the
+conversion that ships (`text::tests::fu_to_world_is_the_nearest_f32`).
+`atlas-pin-moved` proves this gate, `fu-to-world-wrong-denominator` the
+sweep. Blind to every codepoint and sequence outside the pins.
 
 The same gate rebuilds the **fixture corpus** in a **scratch copy** of
 `engine/fixtures` (generators + vendored inputs + the `../glyph_schema.mjs`
@@ -589,7 +603,8 @@ and the union is not:
 - **Nothing executes the benches.** `tools/bench_hyper.py` and the
   `--cubecl-chain-bench` instrument are run by hand.
 - **`tools/verify_atlas.py`, `preview_glyphs.py`, `repro_pick_oblique.py`** are
-  manual tools, run by **zero** checks. So the atlas bins' structural and semantic
+  manual tools, run by **zero** checks (atlas-tables covers the lookup tables'
+  consistency and pins, nothing of the curves or glyph map). So the atlas bins' structural and semantic
   correctness, and the oblique-pick repro, are exercised by nothing in the battery
   — the atlas is only ever checked for being byte-identical to what it was, which
   says nothing about whether what it was is right.
@@ -646,7 +661,6 @@ the serial-fold-versus-scan comparison green, because both forms call
 | `assets/atlas/{curves,glyphmap,glyphs,codepoints}.bin` | generated | `tools/export-atlas.mjs` from `tools/vendor/ref` AND `emoji-sheet.bin` (the emoji slots after the web's 4,431); hand-edits are reverted by the next rebuild-and-compare |
 | `assets/atlas/emoji-sheet.bin` | generated | `tools/gen_emoji_sheet.py` from the vendored Noto Color Emoji; regenerate it BEFORE the atlas bins, which read it |
 | `assets/atlas/cluster-classes.bin` | generated | `tools/gen_cluster_table.py` from the vendored UCD — the class table every cluster-mode implementation reads; regenerate BEFORE the atlas bins, which carry it verbatim |
-| `assets/atlas/engine-trie.bin` | generated | `tools/gen_real_trie.py` |
 | `native/fixtures/emoji-corpus-{small,large}.txt` | generated | `tools/gen_emoji_corpus.py` from `codepoints.bin`'s v2 sequence section — the cluster demo corpus; a demo asset, not a golden input |
 | `engine/glyph_schema.mjs` | generated | `tools/gen_schema.py` from `schema/glyph-identity.json`; the fixture generators read it, so editing the schema invalidates the corpus |
 | `tools/vendor/` | vendored, hash-pinned | `vendor-manifest.py --check`; upstream drift is information, not failure |
@@ -662,8 +676,8 @@ the serial-fold-versus-scan comparison green, because both forms call
 | `integration/egui/` | vendored reference | never compiled; the real dependency is from crates.io |
 
 Hand-editing a generated file buys a failure on the next run. Regenerate instead
-(`python3 tools/gen_real_trie.py`, `python3 tools/gen_schema.py`,
-`node tools/export-atlas.mjs`; the justfile has `gen-trie` and `gen-schema`).
+(`python3 tools/gen_schema.py`,
+`node tools/export-atlas.mjs`; the justfile has `gen-schema`).
 
 **Which language a thing is written in is a correctness decision, not taste.**
 Code that produces or checks an ANSWER stays in its own language, deliberately:

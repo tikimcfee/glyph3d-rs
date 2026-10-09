@@ -25,7 +25,7 @@
 # Ratchet, NOT an equality: tests are added constantly, so an exact pin would
 # redden on the most common good action in the repo. A green run whose real
 # count exceeds the floor prints a NOTE naming the value to raise it to.
-test_floor = 270
+test_floor = 271
 
 
 # ── Products ─────────────────────────────────────────────────────────────
@@ -56,14 +56,6 @@ note = "Pure-Rust native renderer."
 
 # ── Committed artifacts ──────────────────────────────────────────────────
 
-[artifact.engine-trie]
-class = "committed"
-outputs = ["assets/atlas/engine-trie.bin"]
-inputs = ["assets/atlas/glyphs.bin", "assets/atlas/codepoints.bin", "tools/gen_real_trie.py"]
-build = "python3 tools/gen_real_trie.py"
-verify_cmd = "python3 tools/gen_real_trie.py --verify-only"
-note = "Check mode rebuilds and byte-compares without writing; its own sweeps pin the semantics."
-
 # The colour-emoji sheet: the vendored font's PNG bytes verbatim plus the
 # tables that name them, keyed by the font's glyph id. Every bitmap the font
 # has is a cell, sequence-only ones included (out/EMOJI.md). Rebuilt from the
@@ -86,8 +78,10 @@ verify_cmd = "python3 tools/gen_cluster_table.py --check"
 note = "Grapheme-cluster class table, generated from the vendored UCD (never hand-written). Carried verbatim into both tries for the general UAX #29 phase; the landed sequence pass reads no classes by design — tests are its only readers today."
 
 # Regeneration is by hand and ORDERED: cluster-classes (from the vendored UCD)
-# and emoji-sheet (from the vendored font) first — the atlas reads BOTH — then
-# engine-trie (reads codepoints.bin).
+# and emoji-sheet (from the vendored font) first — the atlas reads BOTH.
+# (engine-trie.bin, re-containered from codepoints.bin for the retired engine
+# and read by no Rust code, was retired 2026-10-09; its checks are the
+# atlas-tables gate.)
 # `glyph build` verifies these; it does not run the chain.
 [artifact.atlas]
 class = "committed"
@@ -246,11 +240,21 @@ blind_to = "whether the declared inputs are the RIGHT ones — it proves a patte
 [[gate]]
 name = "committed-artifacts"
 scope = "corpus"
-kind = "verify-committed"   # glyph-schema, emoji-sheet, cluster-classes, emoji-corpus, engine-trie, atlas, fixtures
+kind = "verify-committed"   # glyph-schema, emoji-sheet, cluster-classes, emoji-corpus, atlas, fixtures
 needs = []
 compare = "each committed artifact rebuilt (scratch or generator check mode) vs its committed bytes"
 blind_to = "whether the INPUTS are right — reproducibility, not truth"
 
+
+[[gate]]
+name = "atlas-tables"
+scope = "corpus"
+kind = "cmd"
+cmd = "python3 tools/check_atlas.py"
+pass_line = "ATLAS TABLES OK"
+needs = []
+compare = "codepoints.bin against glyphs.bin (magic, version, shape, upem, missing-block metrics, sequence slots = slotCount - sequences), pinned lookups ('A' 34, ' ' 1, RAT 3839, ROCKET 4759, TAG SPACE missing, the ZWJ family -> 6819), and every entry one em tall with block 0 the missing block"
+blind_to = "any codepoint or sequence outside the pins: it proves the tables are self-consistent and right where pinned, not right everywhere. The font-unit -> world conversion is fu_to_world's unit test, not this. Committed-artifacts proves the bins are what they were; this proves what they MEAN where it can"
 [[gate]]
 name = "vendor-hashes"
 scope = "corpus"
@@ -960,3 +964,24 @@ find = "    while args.len() > n && args[1..=n]"
 with = "    while false && args.len() > n && args[1..=n]"
 expect = "doubled_alias_is_stripped"
 rebuild = "cargo build --release -p glyph"
+
+[[mutation]]
+name = "atlas-pin-moved"
+gate = "atlas-tables"
+why = "D9 (2026-10-09): the atlas checks that lived in the retired engine-trie generator are a gate of their own. A pinned slot that no longer matches the table — what a sheet or web-prefix change that moved the rocket would look like — must redden it. CONSUMED BY: the ROCKET pin in tools/check_atlas.py, read against codepoints.bin"
+file = "tools/check_atlas.py"
+op = "replace"
+find = "    expect(0x1F680, 4759, 2458, 2,"
+with = "    expect(0x1F680, 4758, 2458, 2,"
+expect = "ROCKET"
+
+[[mutation]]
+name = "fu-to-world-wrong-denominator"
+gate = "cargo-test"
+why = "D9: the font-unit -> world conversion every layout path uses is held to exact arithmetic (nearest f32 to fu/em, ties to even) over the whole u16 domain; that sweep ran on the retired generator's own copy until 2026-10-09. An off-by-one em must redden it. CONSUMED BY: text::fu_to_world, via fu_to_world_is_the_nearest_f32"
+file = "native/src/text.rs"
+op = "replace"
+find = "    (fu as f64 * CELL_HEIGHT_WORLD as f64 / em_height_fu as f64) as f32"
+with = "    (fu as f64 * CELL_HEIGHT_WORLD as f64 / (em_height_fu + 1) as f64) as f32"
+expect = "fu_to_world_is_the_nearest_f32"
+rebuild = "cargo build --release"

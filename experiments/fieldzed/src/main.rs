@@ -63,13 +63,12 @@ fn main() -> anyhow::Result<()> {
     });
 
     let ctx = pollster::block_on(glyph3d_native::gpu::init(None));
-    let trie = glyph3d_native::default_engine_trie();
     let atlas_load = Instant::now();
     let atlas = atlas::Atlas::load(&ctx, &glyph3d_native::default_emoji_sheet());
     let atlas_us = atlas_load.elapsed().as_micros();
 
     if live {
-        return run_live(ctx, rx, dir, trie, step_tx);
+        return run_live(ctx, rx, dir, step_tx);
     }
 
     let out_prefix: String = args.next().context("missing <out_prefix>")?;
@@ -140,7 +139,6 @@ fn main() -> anyhow::Result<()> {
             walk,
             Duration::ZERO,
             Path::new("."),
-            &trie,
             &params,
             glyph3d_native::repo::Strategy::Hyper,
             false,
@@ -196,7 +194,6 @@ fn run_live(
     ctx: glyph3d_native::gpu::GpuContext,
     rx: mpsc::Receiver<SurfaceUpdate>,
     dir: PathBuf,
-    trie: PathBuf,
     step: mpsc::Sender<glyph3d_native::windowed::LiveStep>,
 ) -> anyhow::Result<()> {
     let mut content: HashMap<String, Arc<Vec<u8>>> = HashMap::new();
@@ -253,7 +250,6 @@ fn run_live(
         rx,
         content,
         params: repo::RepoParams::default(),
-        trie,
         emoji_sheet: glyph3d_native::default_emoji_sheet(),
         // Loaded ONCE here — the measurement showed a per-reload atlas was
         // 96% of the rebuild hitch (185 ms of 197).

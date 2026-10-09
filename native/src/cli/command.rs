@@ -5,7 +5,7 @@ use crate::repo::{self, RepoParams, Strategy};
 use crate::{SceneChoice, SceneCullOptions};
 use super::args::{default_text_file, Cli, PresentMode};
 use super::ops::Op;
-use crate::{default_emoji_sheet, default_engine_trie};
+use crate::default_emoji_sheet;
 
 /// Top-level action requested via the CLI.
 #[derive(Debug)]
@@ -207,10 +207,8 @@ impl Cli {
                 emoji_sheet,
             }
         } else if let Some(file) = &self.engine_render {
-            let trie = self.engine_trie.clone().unwrap_or_else(default_engine_trie);
             SceneChoice::EngineText {
                 file: file.clone(),
-                trie,
                 emoji_sheet,
             }
         } else {

@@ -29,7 +29,7 @@ machines and clones, **M** machine-specific values, **R** runner.
 | D6 | Orphaned configs: `deny.toml` (nothing runs it) | open | gate or delete; mutants.toml fixed in 16372a9, fixture-parity script moved to D8 |
 | D7 | Loose root docs: session handoffs, plus Mojo-era TOOLING-PLAN.md open items, BUILD-BRIEF.md, research/ surveys | open | move handoffs to `out/`; banner or trim the rest |
 | D8 | Retired Rust checks went unwatched from 09-30; `overflow-leads.txt` read by nothing | closed | 0336e85, 48a75d9, 5257df9 (reference-port, repo-verify x2, cubecl-chain/-fork, new hyper-oracle; 15 gates), 50c7085 (chain green) |
-| D9 | `engine-trie.bin` (+ `gen_real_trie.py`, `--engine-trie`) is committed and gated but read by no Rust code | open | decide: keep or retire (changes committed-artifacts) |
+| D9 | `engine-trie.bin` (+ `gen_real_trie.py`, `--engine-trie`) is committed and gated but read by no Rust code | closed | engine-trie.bin + its path plumbing (--engine-trie, default_engine_trie, LayoutGlyphs::load_trie_file, repo load params, LiveSource/PickContext fields) retired; the generator's checks became the atlas-tables gate (tools/check_atlas.py) and a Rust domain sweep on fu_to_world |
 | C1 | Twin field crates ~60% shared; five copies of the mapped-buffer upload | open | hoist into `glyph-field`; last, largest |
 | C2 | Oversized files | open | dead `paginate` kernel deleted (see commit); `derive_stride` was NOT dead (the chain bench launches it — the note was wrong). Left: split `glyph/src/main.rs` |
 | C3 | 46 `#[allow]`, one justified | open | pass, with C2 |

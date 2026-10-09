@@ -81,7 +81,6 @@ pub struct LiveSource {
     pub rx: std::sync::mpsc::Receiver<crate::seam::SurfaceUpdate>,
     pub content: std::collections::HashMap<String, std::sync::Arc<Vec<u8>>>,
     pub params: crate::repo::RepoParams,
-    pub trie: std::path::PathBuf,
     pub emoji_sheet: std::path::PathBuf,
     pub atlas: crate::atlas::Atlas,
     pub last_style: std::collections::HashMap<String, crate::seam::SurfaceUpdate>,

@@ -70,7 +70,6 @@
 //!   choices (`repo::Strategy`) that select how a load records and reports,
 //!   not separate contracts; all three construct the same `HyperLayout`.
 
-use std::path::Path;
 
 use crate::glyph_scene::GlyphInstance;
 
@@ -711,10 +710,6 @@ pub trait LayoutGlyphs {
     /// Which backend this is, for error attribution and for the verify report.
     fn name(&self) -> &'static str;
 
-    /// Load the glyph metric tables (the trie). Every backend needs them; how
-    /// it reads them is its own business.
-    fn load_trie_file(&mut self, path: &Path) -> Result<(), LayoutError>;
-
     /// IMPLEMENT THIS. Lay out every item, appending to `arena`, and report
     /// where each landed. The returned vector is parallel to `items`, and
     /// every item's params have already been validated when it is called.
@@ -858,14 +853,6 @@ impl LayoutGlyphs for LayoutEngine {
             Self::Hyper(b) => b.name(),
             #[cfg(feature = "cubecl")]
             Self::Cubecl(b) => b.name(),
-        }
-    }
-
-    fn load_trie_file(&mut self, path: &Path) -> Result<(), LayoutError> {
-        match self {
-            Self::Hyper(b) => b.load_trie_file(path),
-            #[cfg(feature = "cubecl")]
-            Self::Cubecl(b) => b.load_trie_file(path),
         }
     }
 
