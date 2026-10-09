@@ -51,6 +51,13 @@ pub(crate) struct Manifest {
 #[serde(deny_unknown_fields)]
 struct Settings {
     test_floor: u32,
+    /// Argument lists under which every golden view must render its
+    /// baseline's exact bytes: each view is rendered again with each list
+    /// appended and compared against the SAME baseline. For a variant that
+    /// is supposed to be pixel-identical (`--field-mode derived`), so it is
+    /// covered without a second golden set to adopt and keep in step.
+    #[serde(default)]
+    golden_equivalents: Vec<String>,
 }
 
 /// How an artifact is verified is a property of its CLASS, not a per-artifact
@@ -382,24 +389,57 @@ fn verify_corpus(name: &str, a: &Artifact) -> bool {
 
 /// Goldens are re-rendered and compared. There is no build path, by design:
 /// re-baselining is a human decision, and the tool refuses to make it.
-/// Render every golden view into the sweep dir. Shared by the gate and by
-/// `drift`, so both compare the same fresh frames.
-fn render_views(m: &Manifest) -> bool {
+/// A golden equivalent's file-name tag: its arguments' alphanumerics, runs
+/// of anything else collapsed to one `-` (`--field-mode derived` →
+/// `field-mode-derived`).
+fn equivalent_tag(args: &str) -> String {
+    let mut tag = String::new();
+    for c in args.chars() {
+        if c.is_ascii_alphanumeric() {
+            tag.push(c);
+        } else if !tag.is_empty() && !tag.ends_with('-') {
+            tag.push('-');
+        }
+    }
+    tag.trim_end_matches('-').to_string()
+}
+
+/// Where a view's fresh frame lands: `<name>.png`, or `<name>@<tag>.png`
+/// under a golden equivalent.
+fn shot_path(name: &str, equivalent: Option<&str>) -> PathBuf {
+    match equivalent {
+        None => sweep().join(format!("{name}.png")),
+        Some(args) => sweep().join(format!("{name}@{}.png", equivalent_tag(args))),
+    }
+}
+
+/// Render every golden view into the sweep dir — and, with `equivalents`,
+/// again under each golden equivalent. Shared by the gate and by `drift`
+/// (which compares only the plain frames), so both read the same renders.
+fn render_views(m: &Manifest, equivalents: bool) -> bool {
     let _ = std::fs::create_dir_all(sweep());
+    let mut variants: Vec<Option<&str>> = vec![None];
+    if equivalents {
+        variants.extend(m.settings.golden_equivalents.iter().map(|e| Some(e.as_str())));
+    }
     let mut ok = true;
     for v in &m.golden_view {
-        let shot = sweep().join(format!("{}.png", v.name));
-        let (good, out) = sh(
-            &format!(
-                "../target/release/glyph3d-native {} --screenshot {}",
-                v.cmd,
-                shot.to_string_lossy()
-            ),
-            &native(),
-        );
-        if !good {
-            println!("FAIL  {} render errored — {}", v.name, out.lines().last().unwrap_or(""));
-            ok = false;
+        for eq in &variants {
+            let shot = shot_path(&v.name, *eq);
+            let (good, out) = sh(
+                &format!(
+                    "../target/release/glyph3d-native {} {} --screenshot {}",
+                    v.cmd,
+                    eq.unwrap_or(""),
+                    shot.to_string_lossy()
+                ),
+                &native(),
+            );
+            if !good {
+                let under = eq.map(|e| format!(" under {e}")).unwrap_or_default();
+                println!("FAIL  {}{under} render errored — {}", v.name, out.lines().last().unwrap_or(""));
+                ok = false;
+            }
         }
     }
     ok
@@ -442,7 +482,7 @@ fn verify_golden(m: &Manifest) -> bool {
         return false;
     };
     let dir = golden_dir(a, key);
-    if !render_views(m) {
+    if !render_views(m, true) {
         return false;
     }
     let mut ok = true;
@@ -461,13 +501,27 @@ fn verify_golden(m: &Manifest) -> bool {
                 missing.push(&v.name);
                 ok = false;
             }
-            Some(b) if std::fs::read(&b).ok() == std::fs::read(&shot).ok() => {
-                println!("PASS  {}.png BYTE-EQUAL ({key})", v.name)
-            }
-            Some(_) => {
-                println!("FAIL  {}.png diverges from baseline — the renderer changed.", v.name);
-                println!("      If that was intended, re-baseline by hand and say so in the commit.");
-                ok = false;
+            Some(b) => {
+                let golden = std::fs::read(&b).ok();
+                if golden == std::fs::read(&shot).ok() {
+                    println!("PASS  {}.png BYTE-EQUAL ({key})", v.name)
+                } else {
+                    println!("FAIL  {}.png diverges from baseline — the renderer changed.", v.name);
+                    println!("      If that was intended, re-baseline by hand and say so in the commit.");
+                    ok = false;
+                }
+                // The same baseline, under each equivalent: a divergence here
+                // with the plain frame equal is the variant breaking, not the
+                // renderer moving — never a reason to re-baseline.
+                for eq in &m.settings.golden_equivalents {
+                    if golden == std::fs::read(shot_path(&v.name, Some(eq))).ok() {
+                        println!("PASS  {}.png BYTE-EQUAL under {eq} ({key})", v.name)
+                    } else {
+                        println!("FAIL  {}.png diverges from baseline under {eq} — that variant no longer", v.name);
+                        println!("      renders what the plain view does.");
+                        ok = false;
+                    }
+                }
             }
             None => {
                 println!("FAIL  {} has no declared baseline", v.name);
@@ -587,7 +641,7 @@ fn cmd_drift(m: &Manifest) -> bool {
         return false;
     };
     step(&format!("drift: this host ({key}) against the other golden sets"));
-    if !render_views(m) {
+    if !render_views(m, false) {
         return false;
     }
     let base = golden_dir(a, key).parent().unwrap().to_path_buf();
@@ -998,6 +1052,15 @@ fn validate(m: &Manifest) -> Vec<String> {
         for v in &m.golden_view {
             if v.cmd.trim().is_empty() {
                 p.push(format!("golden_view '{}' has an empty render command", v.name));
+            }
+        }
+        let mut tags = BTreeSet::new();
+        for e in &m.settings.golden_equivalents {
+            if equivalent_tag(e).is_empty() || e.contains("--screenshot") {
+                p.push(format!("golden equivalent '{e}' must be render arguments (and not --screenshot)"));
+            }
+            if !tags.insert(equivalent_tag(e)) {
+                p.push(format!("golden equivalent '{e}' collides with another's file tag"));
             }
         }
     }
@@ -1662,6 +1725,19 @@ mod tests {
             test_verdict(9, 9, None, false),
             (false, "CHECK-ALL: FAILURES — see above (9 of 9 gates ran)".to_string())
         );
+    }
+
+    /// A golden equivalent's frames get a stable, file-safe tag of their own,
+    /// so they never overwrite the plain frame the baseline is adopted from.
+    #[test]
+    fn equivalent_frames_never_shadow_the_plain_frame() {
+        assert_eq!(equivalent_tag("--field-mode derived"), "field-mode-derived");
+        assert_eq!(equivalent_tag("  --zoom 1.25 "), "zoom-1-25");
+        assert_eq!(equivalent_tag("--"), "");
+        let plain = shot_path("text", None);
+        let derived = shot_path("text", Some("--field-mode derived"));
+        assert_ne!(plain, derived);
+        assert!(derived.ends_with("text@field-mode-derived.png"), "{}", derived.display());
     }
 
     /// The doubled alias of a nested worktree is stripped, at any depth, and
