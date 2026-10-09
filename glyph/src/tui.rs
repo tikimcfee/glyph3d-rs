@@ -195,11 +195,26 @@ impl FocusField {
     }
 }
 
-pub const REPO_PRESETS: &[&str] = &[
-    ".",
-    "/Users/lugo/localdev/viz-web/glyph3d-js",
-    "native/fixtures/g-pick-repo",
-];
+/// Repo presets the launcher cycles through when `launch_config.toml` names
+/// none. Both are repo-relative, so they exist in every checkout. A machine
+/// with its own corpora lists them under `repo_presets` in its launch config.
+pub const DEFAULT_REPO_PRESETS: &[&str] = &[".", "native/fixtures/g-pick-repo"];
+
+/// Expand a leading `~` to `$HOME`. Paths in `launch_config.toml` are written
+/// by hand, so they get the same shorthand the renderer accepts.
+fn expand_home(path: &str) -> PathBuf {
+    let home = || std::env::var_os("HOME").map(PathBuf::from);
+    if path == "~" {
+        if let Some(h) = home() {
+            return h;
+        }
+    } else if let Some(rest) = path.strip_prefix("~/") {
+        if let Some(h) = home() {
+            return h.join(rest);
+        }
+    }
+    PathBuf::from(path)
+}
 
 #[derive(Debug, Deserialize, Default)]
 struct FileLaunchConfig {
@@ -215,6 +230,9 @@ struct FileLaunchConfig {
     repo_engine: Option<String>,
     field_mode: Option<String>,
     agent_session: Option<String>,
+    repo_presets: Option<Vec<String>>,
+    claude_projects_dir: Option<String>,
+    antigravity_brain_dir: Option<String>,
 }
 
 pub struct LauncherState {
@@ -238,19 +256,20 @@ pub struct LauncherState {
     pub focus: FocusField,
     pub status_message: String,
     pub config_source: Option<String>,
+    /// What ◄/► cycles through on the repo field.
+    pub repo_presets: Vec<String>,
+    /// Where session discovery looks. Config-driven only: with neither set,
+    /// the launcher discovers nothing and the session field is typed by hand.
+    pub claude_projects_dir: Option<PathBuf>,
+    pub antigravity_brain_dir: Option<PathBuf>,
 }
 
 impl LauncherState {
-    pub fn discover_agent_sessions() -> Vec<String> {
+    pub fn discover_agent_sessions(&self) -> Vec<String> {
         let mut sessions = Vec::new();
-        let home = match std::env::var("HOME") {
-            Ok(h) => PathBuf::from(h),
-            Err(_) => return sessions,
-        };
 
         // 1. Antigravity brain transcripts
-        let brain_dir = home.join(".gemini/antigravity/brain");
-        if let Ok(entries) = std::fs::read_dir(&brain_dir) {
+        if let Some(Ok(entries)) = self.antigravity_brain_dir.as_ref().map(std::fs::read_dir) {
             let mut found = Vec::new();
             for entry in entries.flatten() {
                 let transcript = entry.path().join(".system_generated/logs/transcript.jsonl");
@@ -269,8 +288,7 @@ impl LauncherState {
         }
 
         // 2. Claude projects transcripts
-        let claude_dir = home.join(".claude/projects");
-        if let Ok(entries) = std::fs::read_dir(&claude_dir) {
+        if let Some(Ok(entries)) = self.claude_projects_dir.as_ref().map(std::fs::read_dir) {
             let mut found = Vec::new();
             for entry in entries.flatten() {
                 if entry.path().is_dir() {
@@ -296,17 +314,20 @@ impl LauncherState {
         sessions
     }
 
-    pub fn new() -> Self {
-        let default_session = Self::discover_agent_sessions()
-            .into_iter()
-            .next()
-            .unwrap_or_default();
-        let mut state = Self {
+    /// True when the launch config names at least one session directory.
+    pub fn has_session_dirs(&self) -> bool {
+        self.claude_projects_dir.is_some() || self.antigravity_brain_dir.is_some()
+    }
+
+    /// The launcher with built-in defaults only: reads no file, scans no
+    /// directory. Tests start here so they do not depend on the machine.
+    pub fn defaults() -> Self {
+        Self {
             target: TargetMode::Repo,
             repo_path: ".".to_string(),
             focus_file: String::new(),
             file_path: "native/src/main.rs".to_string(),
-            session_path: default_session,
+            session_path: String::new(),
             layout_mode: LayoutMode::Shelf,
             wrap_mode: WrapMode::Back,
             color_mode: ColorMode::Syntax,
@@ -322,8 +343,22 @@ impl LauncherState {
             focus: FocusField::TargetMode,
             status_message: "Ready to launch".to_string(),
             config_source: None,
-        };
+            repo_presets: DEFAULT_REPO_PRESETS.iter().map(|p| p.to_string()).collect(),
+            claude_projects_dir: None,
+            antigravity_brain_dir: None,
+        }
+    }
+
+    /// The launcher as a user sees it: built-in defaults, then the launch
+    /// config, then the newest discovered session if the config named none.
+    pub fn new() -> Self {
+        let mut state = Self::defaults();
         state.load_config_file();
+        if state.session_path.is_empty() {
+            if let Some(newest) = state.discover_agent_sessions().into_iter().next() {
+                state.session_path = newest;
+            }
+        }
         state
     }
 
@@ -388,9 +423,16 @@ impl LauncherState {
                         }
                         if let Some(asess) = cfg.agent_session {
                             if !asess.trim().is_empty() {
-                                self.session_path = asess;
+                                self.session_path = expand_home(&asess).display().to_string();
                             }
                         }
+                        if let Some(presets) = cfg.repo_presets {
+                            self.repo_presets = presets;
+                        }
+                        self.claude_projects_dir =
+                            cfg.claude_projects_dir.as_deref().map(expand_home);
+                        self.antigravity_brain_dir =
+                            cfg.antigravity_brain_dir.as_deref().map(expand_home);
                         self.config_source = Some(path.display().to_string());
                         self.status_message = format!("Loaded defaults from {}", path.display());
                         return;
@@ -444,7 +486,7 @@ impl LauncherState {
             TargetMode::Agent => {
                 args.push("--agent-session".to_string());
                 args.push(if self.session_path.trim().is_empty() {
-                    Self::discover_agent_sessions()
+                    self.discover_agent_sessions()
                         .into_iter()
                         .next()
                         .unwrap_or_else(|| "transcript.jsonl".to_string())
@@ -595,6 +637,16 @@ impl LauncherState {
         }
     }
 
+    fn no_sessions_message(&self) -> String {
+        if self.has_session_dirs() {
+            "No transcripts found in the configured session directories".to_string()
+        } else {
+            "No session directories configured: set claude_projects_dir or \
+             antigravity_brain_dir in launch_config.toml"
+                .to_string()
+        }
+    }
+
     pub fn cycle_next(&mut self) {
         match self.focus {
             FocusField::TargetMode => {
@@ -606,16 +658,21 @@ impl LauncherState {
                 };
             }
             FocusField::RepoPath => {
-                let idx = REPO_PRESETS.iter().position(|&p| p == self.repo_path);
+                if self.repo_presets.is_empty() {
+                    return;
+                }
+                let idx = self.repo_presets.iter().position(|p| *p == self.repo_path);
                 let next_idx = match idx {
-                    Some(i) => (i + 1) % REPO_PRESETS.len(),
+                    Some(i) => (i + 1) % self.repo_presets.len(),
                     None => 0,
                 };
-                self.repo_path = REPO_PRESETS[next_idx].to_string();
+                self.repo_path = self.repo_presets[next_idx].clone();
             }
             FocusField::SessionPath => {
-                let sessions = Self::discover_agent_sessions();
-                if !sessions.is_empty() {
+                let sessions = self.discover_agent_sessions();
+                if sessions.is_empty() {
+                    self.status_message = self.no_sessions_message();
+                } else {
                     let idx = sessions.iter().position(|s| s == &self.session_path);
                     let next_idx = match idx {
                         Some(i) => (i + 1) % sessions.len(),
@@ -677,16 +734,21 @@ impl LauncherState {
                 };
             }
             FocusField::RepoPath => {
-                let idx = REPO_PRESETS.iter().position(|&p| p == self.repo_path);
+                if self.repo_presets.is_empty() {
+                    return;
+                }
+                let idx = self.repo_presets.iter().position(|p| *p == self.repo_path);
                 let prev_idx = match idx {
-                    Some(i) => if i == 0 { REPO_PRESETS.len() - 1 } else { i - 1 },
-                    None => REPO_PRESETS.len() - 1,
+                    Some(i) => if i == 0 { self.repo_presets.len() - 1 } else { i - 1 },
+                    None => self.repo_presets.len() - 1,
                 };
-                self.repo_path = REPO_PRESETS[prev_idx].to_string();
+                self.repo_path = self.repo_presets[prev_idx].clone();
             }
             FocusField::SessionPath => {
-                let sessions = Self::discover_agent_sessions();
-                if !sessions.is_empty() {
+                let sessions = self.discover_agent_sessions();
+                if sessions.is_empty() {
+                    self.status_message = self.no_sessions_message();
+                } else {
                     let idx = sessions.iter().position(|s| s == &self.session_path);
                     let prev_idx = match idx {
                         Some(i) => if i == 0 { sessions.len() - 1 } else { i - 1 },
@@ -1618,7 +1680,7 @@ mod tests {
 
     #[test]
     fn test_launcher_state_initial_build_args() {
-        let state = LauncherState::new();
+        let state = LauncherState::defaults();
         let args = state.build_cli_args();
         assert!(args.contains(&"--load-repo".to_string()));
         assert!(args.contains(&"--wrap-mode".to_string()));
@@ -1628,7 +1690,7 @@ mod tests {
 
     #[test]
     fn test_target_mode_cycle() {
-        let mut state = LauncherState::new();
+        let mut state = LauncherState::defaults();
         assert_eq!(state.target, TargetMode::Repo);
         state.focus = FocusField::TargetMode;
         state.toggle_current();
@@ -1682,7 +1744,7 @@ mod tests {
 
     #[test]
     fn test_command_preview_format() {
-        let mut state = LauncherState::new();
+        let mut state = LauncherState::defaults();
         state.target = TargetMode::Demo;
         let preview = state.command_preview();
         assert!(preview.starts_with("glyph3d-native --demo"));
@@ -1690,7 +1752,7 @@ mod tests {
 
     #[test]
     fn test_agent_session_build_args() {
-        let mut state = LauncherState::new();
+        let mut state = LauncherState::defaults();
         state.target = TargetMode::Agent;
         state.session_path = "/path/to/my_transcript.jsonl".to_string();
         let args = state.build_cli_args();
@@ -1701,7 +1763,7 @@ mod tests {
 
     #[test]
     fn test_z_wrap_spacing_dial() {
-        let mut state = LauncherState::new();
+        let mut state = LauncherState::defaults();
         state.focus = FocusField::ZWrapSpacing;
         state.z_wrap_spacing = 0.15;
         state.cycle_next();
@@ -1714,20 +1776,60 @@ mod tests {
 
     #[test]
     fn test_repo_preset_cycling() {
-        let mut state = LauncherState::new();
+        let mut state = LauncherState::defaults();
         state.focus = FocusField::RepoPath;
         state.repo_path = ".".to_string();
-        state.cycle_next();
-        assert_eq!(state.repo_path, "/Users/lugo/localdev/viz-web/glyph3d-js");
         state.cycle_next();
         assert_eq!(state.repo_path, "native/fixtures/g-pick-repo");
         state.cycle_next();
         assert_eq!(state.repo_path, ".");
+
+        // A configured list replaces the built-ins, and an empty one is inert.
+        state.repo_presets = vec!["a".to_string(), "b".to_string()];
+        state.cycle_next();
+        assert_eq!(state.repo_path, "a");
+        state.cycle_prev();
+        assert_eq!(state.repo_path, "b");
+        state.repo_presets.clear();
+        state.cycle_next();
+        assert_eq!(state.repo_path, "b");
+    }
+
+    #[test]
+    fn test_session_discovery_is_config_driven() {
+        let mut state = LauncherState::defaults();
+        assert!(!state.has_session_dirs());
+        assert!(state.discover_agent_sessions().is_empty());
+
+        let root = std::env::temp_dir().join(format!("glyph-tui-sessions-{}", std::process::id()));
+        let project = root.join("claude/some-project");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(project.join("s.jsonl"), "{}\n").unwrap();
+        state.claude_projects_dir = Some(root.join("claude"));
+        let found = state.discover_agent_sessions();
+        assert_eq!(found, vec![project.join("s.jsonl").display().to_string()]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn test_config_keys_for_presets_and_session_dirs() {
+        let cfg: FileLaunchConfig = toml::from_str(
+            "repo_presets = [\".\", \"../corpus\"]\n\
+             claude_projects_dir = \"/x/claude\"\n\
+             antigravity_brain_dir = \"~/brain\"\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.repo_presets, Some(vec![".".to_string(), "../corpus".to_string()]));
+        assert_eq!(cfg.claude_projects_dir.as_deref(), Some("/x/claude"));
+        assert_eq!(expand_home("/x/claude"), PathBuf::from("/x/claude"));
+        if let Some(home) = std::env::var_os("HOME") {
+            assert_eq!(expand_home("~/brain"), PathBuf::from(home).join("brain"));
+        }
     }
 
     #[test]
     fn test_directional_selection_and_toggles() {
-        let mut state = LauncherState::new();
+        let mut state = LauncherState::defaults();
 
         // LayoutMode: Left = Shelf, Right = Carrel
         state.focus = FocusField::LayoutMode;
@@ -1841,7 +1943,7 @@ mod tests {
         let mut terminal = Terminal::new(backend).unwrap();
 
         // 1. RepoEngine focused: layout section should display the engine description
-        let mut state = LauncherState::new();
+        let mut state = LauncherState::defaults();
         state.focus = FocusField::RepoEngine;
         state.repo_engine = RepoEngine::Hyper;
 

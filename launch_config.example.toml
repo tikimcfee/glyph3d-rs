@@ -1,7 +1,14 @@
-# Glyph3D Launch Configuration
+# Glyph3D Launch Configuration — EXAMPLE
 #
-# Startup defaults for interactive windowed runs.
-# Any CLI flag passed on the command line will override settings in this file.
+# Copy to `launch_config.toml` (gitignored) and edit for this machine:
+#
+#     cp launch_config.example.toml launch_config.toml
+#
+# The renderer reads `launch_config.toml` from the working directory or its
+# parent; the `cargo glyph` launcher TUI reads it from the working directory or
+# the repo root. Startup defaults for interactive windowed runs only: any CLI
+# flag overrides a setting here, and a `--screenshot` run (every gate) ignores
+# the file entirely. Values below DIFFER from the CLI defaults where marked.
 
 # Render file card background bounding surfaces behind glyph fields
 file_backgrounds = true
@@ -33,7 +40,8 @@ color_mode = "flat"
 # Layout engine backend: "hyper" (parallel CPU Rayon, default) or "cubecl" (GPU compute)
 repo_engine = "hyper"
 
-# Glyph field render mode: "derived" (compact 20B slots, zero-copy, recommended) or "instanced" (32B slots)
+# Glyph field render mode: "derived" (compact 20B slots, zero-copy) or "instanced" (32B slots).
+# DIFFERS from the CLI default, which is "instanced".
 field_mode = "derived"
 
 # Debug flags
@@ -43,9 +51,15 @@ no_ui = false
 # Default repository to open if none specified on CLI (optional)
 # load_repo = "native/fixtures/g-pick-repo"
 
-# Default agent session transcript path to load at startup (optional)
-# agent_session = "~/.gemini/antigravity/brain/dfb37967-e8f7-4c18-b1aa-52d838c6f9c3/.system_generated/logs/transcript.jsonl"
+# Repos the launcher TUI cycles through with ◄/► (optional). Without this the
+# launcher offers "." and "native/fixtures/g-pick-repo". Add your own corpora.
+# repo_presets = [".", "native/fixtures/g-pick-repo", "~/src/some-large-repo"]
 
-# Custom directory locations for Claude Code and Antigravity session discovery (optional)
+# Default agent session transcript path to load at startup (optional)
+# agent_session = "~/.claude/projects/<project-slug>/<session-id>.jsonl"
+
+# Agent session discovery (optional). Discovery is config-driven: with neither
+# key set, nothing is scanned and sessions are opened by path. These are the
+# usual locations for each harness.
 # claude_projects_dir = "~/.claude/projects"
 # antigravity_brain_dir = "~/.gemini/antigravity/brain"

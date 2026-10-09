@@ -1107,6 +1107,13 @@ impl WindowState {
                                 ui.label("No sessions scanned yet.");
                                 return;
                             };
+                            if all_sessions.is_empty() {
+                                ui.label(
+                                    "No sessions found. Discovery scans only the directories named by \
+                                     claude_projects_dir and antigravity_brain_dir in launch_config.toml.",
+                                );
+                                return;
+                            }
 
                             let filter_lower = session_filter_text.to_lowercase();
                             let filtered: Vec<&crate::agent_transcript::discovery::DiscoveredSession> = all_sessions

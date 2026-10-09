@@ -1,8 +1,10 @@
 //! Discovery and Indexing of Agent Sessions across local and global environments.
 //!
-//! Scans configured directories for Claude Code (`~/.claude/projects/`) and
-//! Antigravity (`~/.gemini/antigravity/brain/`) sessions, extracting lightweight
-//! preview metadata (ID, prompt title, timestamp, harness kind, project scope).
+//! Scans the directories named in the launch config (`claude_projects_dir`,
+//! `antigravity_brain_dir`) for Claude Code and Antigravity sessions,
+//! extracting lightweight preview metadata (ID, prompt title, timestamp,
+//! harness kind, project scope). Nothing is scanned that the config does not
+//! name: no home-directory default, no working-directory probe.
 
 use std::fs;
 use std::io::{BufRead, BufReader};
@@ -40,32 +42,18 @@ pub enum SessionHarnessFilter {
     Antigravity,
 }
 
-/// Scan all configured and default directories for agent sessions.
+/// Scan the configured directories for agent sessions.
 pub fn scan_agent_sessions(config: &LaunchConfig) -> Vec<DiscoveredSession> {
     let mut sessions = Vec::new();
 
     // 1. Claude Code sessions
-    let claude_dir = config.resolved_claude_projects_dir();
-    if claude_dir.is_dir() {
+    if let Some(claude_dir) = config.resolved_claude_projects_dir().filter(|d| d.is_dir()) {
         scan_claude_projects_dir(&claude_dir, &mut sessions);
     }
 
     // 2. Antigravity sessions
-    let agy_dir = config.resolved_antigravity_brain_dir();
-    if agy_dir.is_dir() {
+    if let Some(agy_dir) = config.resolved_antigravity_brain_dir().filter(|d| d.is_dir()) {
         scan_antigravity_brain_dir(&agy_dir, &mut sessions);
-    }
-
-    // 3. Local working directory checks (e.g. ./.claude or ./.gemini)
-    if let Ok(cwd) = std::env::current_dir() {
-        let local_claude = cwd.join(".claude");
-        if local_claude.is_dir() {
-            scan_claude_projects_dir(&local_claude, &mut sessions);
-        }
-        let local_gemini = cwd.join(".gemini/antigravity/brain");
-        if local_gemini.is_dir() {
-            scan_antigravity_brain_dir(&local_gemini, &mut sessions);
-        }
     }
 
     // Deduplicate by canonical path
@@ -93,7 +81,7 @@ fn scan_claude_projects_dir(root: &Path, out: &mut Vec<DiscoveredSession>) {
         let path = entry.path();
         if path.is_dir() {
             let project_folder = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
-            // Clean up project name from slug like "-Users-lugo-localdev-viz-web-glyph3d-js"
+            // Clean up project name from a path slug like "-home-user-src-myproject"
             let project_hint = project_folder
                 .rsplit('-')
                 .next()
@@ -398,6 +386,16 @@ mod tests {
         assert_eq!(s.harness, HarnessKind::Antigravity);
 
         let _ = fs::remove_dir_all(std::env::temp_dir().join("test_agy_scan"));
+    }
+
+    #[test]
+    fn test_scan_agent_sessions_unconfigured_scans_nothing() {
+        // Config is the only driver: a default config names no directory, so
+        // nothing is scanned regardless of what this machine's home holds.
+        let config = LaunchConfig::default();
+        assert_eq!(config.resolved_claude_projects_dir(), None);
+        assert_eq!(config.resolved_antigravity_brain_dir(), None);
+        assert!(scan_agent_sessions(&config).is_empty());
     }
 
     #[test]

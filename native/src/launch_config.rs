@@ -42,22 +42,17 @@ impl LaunchConfig {
         }
     }
 
-    /// Return the resolved Claude Code projects directory, falling back to `~/.claude/projects`.
-    pub fn resolved_claude_projects_dir(&self) -> PathBuf {
-        if let Some(dir) = &self.claude_projects_dir {
-            expand_home(dir)
-        } else {
-            expand_home(Path::new("~/.claude/projects"))
-        }
+    /// The configured Claude Code projects directory, `~`-expanded. `None` when
+    /// the config names none: session discovery is config-driven, so a
+    /// machine that has not opted in is never scanned.
+    pub fn resolved_claude_projects_dir(&self) -> Option<PathBuf> {
+        self.claude_projects_dir.as_deref().map(expand_home)
     }
 
-    /// Return the resolved Antigravity brain directory, falling back to `~/.gemini/antigravity/brain`.
-    pub fn resolved_antigravity_brain_dir(&self) -> PathBuf {
-        if let Some(dir) = &self.antigravity_brain_dir {
-            expand_home(dir)
-        } else {
-            expand_home(Path::new("~/.gemini/antigravity/brain"))
-        }
+    /// The configured Antigravity brain directory, `~`-expanded; `None` when
+    /// unset, for the same reason.
+    pub fn resolved_antigravity_brain_dir(&self) -> Option<PathBuf> {
+        self.antigravity_brain_dir.as_deref().map(expand_home)
     }
 
     /// Load from a file path. Returns Err with a message if reading or parsing fails.

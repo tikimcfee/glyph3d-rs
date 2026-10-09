@@ -451,19 +451,20 @@ fn test_multi_turn_file_actions() {
     assert_eq!(t2.file_actions[0].hunks[0].lines, vec!["-fn main() {}", "+fn main() { route(); }"]);
 }
 
+/// Opt-in smoke test against a real transcript on this machine:
+/// `GLYPH_REAL_CLAUDE_SESSION=/path/to/<id>.jsonl cargo test`. Unset, it
+/// checks nothing, so it never depends on whose machine runs the suite.
 #[test]
 fn test_real_claude_session_if_present() {
-    let home = std::env::var("HOME").unwrap_or_default();
-    let session_path = std::path::PathBuf::from(home)
-        .join(".claude/projects/-Users-lugo-localdev-viz-web-glyph3d-js/61cf579f-ad10-4705-be7b-06926c5f69c3.jsonl");
-
-    if session_path.exists() {
-        let content = std::fs::read_to_string(&session_path).expect("read real session file");
-        let session = parse_claude_session(&content, "61cf579f");
-        assert_eq!(session.harness, HarnessKind::ClaudeCode);
-        assert_eq!(session.session_id, "61cf579f");
-        assert!(session.cwd.is_some());
-    }
+    let Some(session_path) = std::env::var_os("GLYPH_REAL_CLAUDE_SESSION").map(std::path::PathBuf::from) else {
+        return;
+    };
+    let content = std::fs::read_to_string(&session_path).expect("read GLYPH_REAL_CLAUDE_SESSION");
+    let id = session_path.file_stem().and_then(|s| s.to_str()).unwrap_or("session").to_string();
+    let session = parse_claude_session(&content, &id);
+    assert_eq!(session.harness, HarnessKind::ClaudeCode);
+    assert_eq!(session.session_id, id);
+    assert!(session.cwd.is_some());
 }
 
 #[test]
