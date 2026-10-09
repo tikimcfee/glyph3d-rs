@@ -1,6 +1,6 @@
 # egui 0.36.1 Integration Study Report
 
-Repo studied: `/Users/lugo/localdev/viz-native/glyph3d-native/integration/egui` (commit dadf573, 2026-09-01).
+Repo studied: `integration/egui` (commit dadf573, 2026-09-01).
 Workspace pins: `wgpu = "30.0"`, `winit = "0.30.13"` (root `Cargo.toml` lines 160–162). MSRV 1.95 (0.36.0 changelog).
 
 ---

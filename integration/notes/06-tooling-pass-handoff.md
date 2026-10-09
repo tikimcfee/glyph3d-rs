@@ -51,8 +51,8 @@ independently shippable, gated by byte-identical render A/Bs.
 
 ## The workspace
 
-- Crate: `/Users/lugo/localdev/viz-native/glyph3d-native/native/` (Cargo.toml, src/, shaders/)
-- Repo scripts: `/Users/lugo/localdev/viz-native/glyph3d-native/tools/`
+- Crate: `native/` (Cargo.toml, src/, shaders/)
+- Repo scripts: `tools/`
 - Fixture repo for runs: `native/fixtures/g-pick-repo/`
 - Stage reports (house style to follow): `out/STAGE_G_REPORT.md` is the latest
 - Stack pins: **wgpu 30 (locked line), winit 0.30, glam 0.30, edition 2021**
@@ -123,7 +123,7 @@ Build the current HEAD and record the verification state. If any of these fail a
 baseline, STOP and report — do not build on a broken base.
 
 ```bash
-cd /Users/lugo/localdev/viz-native/glyph3d-native/native
+cd native
 cargo build --release                                   # expect: clean, 0 warnings
 cargo run --release -- --engine-check src/main.rs       # expect: PASS (engine ↔ CPU oracle)
 cargo run --release -- --repo-scan-only --load-repo fixtures/g-pick-repo   # expect: stats, exit 0

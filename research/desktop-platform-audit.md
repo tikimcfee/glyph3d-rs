@@ -46,12 +46,12 @@ The codebase is **100% pure Rust** and builds without platform-specific assembly
   On Metal, host records transcode directly into mapped shared buffers. On Vulkan/DX12, this evaluates to `false` and cleanly routes through `upload_staged_discrete`.
 
 ### D. Chunked Storage Buffers & Hardware Binding Limits
-- Location: [`native/src/layout_hyper/device_alloc.rs`](file:///home/ivan/dev/glyph3d-rs/native/src/layout_hyper/device_alloc.rs)
+- Location: [`native/src/layout_hyper/device_alloc.rs`](../native/src/layout_hyper/device_alloc.rs)
 - **Problem**: Modern GPUs enforce `max_storage_buffer_binding_size` (often 128 MiB–2 GiB; 2047 MiB on NVIDIA Vulkan). For huge codebases (e.g. 144M–1.3B glyph instances), single buffer allocations exceed hardware binding limits and cause driver validation failures.
 - **Solution**: The layout planner partitions slot allocations across multiple `DeviceSlotChunk` storage buffers, binding each separately or within allowable device limits.
 
 ### E. Streaming 64 MiB Staging Buffer & PCIe DMA Saturation
-- Location: [`native/src/layout_hyper/device_alloc.rs:stage_host_memory`](file:///home/ivan/dev/glyph3d-rs/native/src/layout_hyper/device_alloc.rs)
+- Location: [`native/src/layout_hyper/device_alloc.rs:stage_host_memory`](../native/src/layout_hyper/device_alloc.rs)
 - **Problem**: In mega-scale repos like `torvalds/linux` (74,313 files, 1.29B glyphs, 24.69 GB `DerivedSlot` buffer size), staging buffers sized to match target storage chunks (1.9 GiB each) risk immediate VRAM exhaustion (`OutOfMemory`) on cards with 24–32 GB VRAM.
 - **Solution**: Discrete uploads stream through a single reusable **64 MiB staging buffer** (`wgpu::BufferUsages::COPY_SRC | MAP_WRITE`) synchronized via `dev.device.poll(Wait)`.
 - **Sizing Rationale (Why 64 MiB?)**:
@@ -61,9 +61,9 @@ The codebase is **100% pure Rust** and builds without platform-specific assembly
 
 ### F. Dynamic Group Buffer Sizing & 32-bit Addressability
 - Locations:
-  - [`native/src/glyph_scene/setup.rs`](file:///home/ivan/dev/glyph3d-rs/native/src/glyph_scene/setup.rs)
-  - [`crates/glyph-field-derived/shaders/glyph_field_derived.wgsl`](file:///home/ivan/dev/glyph3d-rs/crates/glyph-field-derived/shaders/glyph_field_derived.wgsl)
-  - [`crates/glyph-field-derived/src/slot.rs`](file:///home/ivan/dev/glyph3d-rs/crates/glyph-field-derived/src/slot.rs)
+  - [`native/src/glyph_scene/setup.rs`](../native/src/glyph_scene/setup.rs)
+  - [`crates/glyph-field-derived/shaders/glyph_field_derived.wgsl`](../crates/glyph-field-derived/shaders/glyph_field_derived.wgsl)
+  - [`crates/glyph-field-derived/src/slot.rs`](../crates/glyph-field-derived/src/slot.rs)
 - **Problem**: Repositories with $>65,536$ files (e.g. Linux kernel with 74,313 files) overflow 16-bit packed index fields. In particular, packing `item_idx` and `group_id` into a 32-bit word (`(item & 0xFFFF) | (group << 16)`) caused file indices $2 \le i < 65,536$ to unpack to values $>74,313$, falsely triggering vertex shader culling and dropping all glyphs while leaving backdrop cards visible.
 - **Solution**:
   - `group_buf` is dynamically sized to `groups.len().max(65536)`.

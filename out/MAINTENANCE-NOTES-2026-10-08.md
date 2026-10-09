@@ -97,8 +97,8 @@ Main's build fix (872621d, the other agent's) was fast-forwarded in first.
 
 ```sh
 cp launch_config.example.toml launch_config.toml
-ln -s ~/localdev/externalcompute/zed experiments/zed
-export GLYPH_FLAGSHIP_REPO=~/localdev/viz-web/glyph3d-js
+ln -s <path-to-zed-checkout> experiments/zed
+export GLYPH_FLAGSHIP_REPO=<path-to-glyph3d-js-checkout>
 ```
 
 ## Suggested order for what is open
@@ -303,19 +303,18 @@ pixel-ab here: 7 of 9 views diverge from `vulkan-nvidia`, 2 have no set.
   scratchpad, render the nine views from `native/` with `--screenshot`, `cmp`
   against `out/tooling-ab/sweep/`.
 
-### Remote runs on the M2
+### Remote runs on a second machine (Apple Silicon Mac)
 
-`rx.sh` (session scratchpad, `rx/`): uploads a job script and runs it on
-`airlugo` over ssh, either synchronously (`run`) or in tmux
-`remote-rs-space:claude` (`job`, then `wait`). Everything remote lives under
-`~/localdev/claude-remote/` on the Mac; work happens in a scratch clone there
-(`glyph3d-rs/`, cloned from Ivan's checkout, which is never written), fed by
-`rx.sh push <rev> <branch>`. Jobs must be bash 3.2-safe. The runner sets the
-Homebrew PATH, which a non-login ssh shell lacks.
+A small local helper (kept out of tree) uploads a job script over ssh and runs
+it on the Mac, either synchronously or in a tmux window, then polls for its
+exit. Everything remote lives under one scratch root with its own scratch
+clone, fed by `git push <rev>:<branch>`; the owner's checkout there is never
+written. Jobs must be bash 3.2-safe (macOS `/bin/bash`), and a non-login ssh
+shell lacks the Homebrew PATH, so the runner sets it.
 
-### M2 performance: harness and noise floor (2026-10-09)
+### Apple M2 performance: harness and noise floor (2026-10-09)
 
-`rx/jobs/perf-ab.sh`: both refs built into separate target dirs, sides
+The A/B job: both refs built into separate target dirs, sides
 alternate (order flips each round), 20 s cool-down between sides (the M2 is
 fanless and throttles back-to-back), 6 rounds x 3 runs per side per config,
 cold run discarded; flagship corpus (`viz-web/glyph3d-js`). A/A at bf9a757,
