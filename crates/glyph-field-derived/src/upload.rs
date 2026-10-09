@@ -151,9 +151,13 @@ fn upload_staged_discrete(
     item_params: &[ItemParamsGpu],
 ) -> wgpu::Buffer {
     let size = (count * std::mem::size_of::<DerivedSlot>()) as u64;
+    // 20 B slots: `size` is 16-aligned only when `count` is a multiple of 4,
+    // and an off-16 copy runs at about half speed (glyph_field::copy, C16).
+    // Pad the staging buffer (wgpu-core copies all of it at `unmap`) and split
+    // the copy out; the VRAM buffer keeps its exact size and bytes.
     let staging_buf = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("derived glyph instance staging"),
-        size,
+        size: glyph_field::padded_staging_size(size),
         usage: wgpu::BufferUsages::COPY_SRC,
         mapped_at_creation: true,
     });
@@ -177,7 +181,7 @@ fn upload_staged_discrete(
     let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
         label: Some("derived_instance_staging_copy"),
     });
-    encoder.copy_buffer_to_buffer(&staging_buf, 0, &vram_buf, 0, size);
+    glyph_field::copy_split(&mut encoder, &staging_buf, 0, &vram_buf, 0, size);
     queue.submit([encoder.finish()]);
     vram_buf
 }

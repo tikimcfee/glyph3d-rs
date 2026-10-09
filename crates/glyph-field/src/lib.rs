@@ -26,11 +26,13 @@
 //! addressable** by its slot — its color and its placement can be edited
 //! without touching any other glyph.
 
+mod copy;
 mod field;
 mod mode;
 mod records;
 mod resources;
 
+pub use copy::{copy_split, padded_staging_size, split_copy_size, FAST_COPY_ALIGN};
 pub use field::{split_at_chunks, GlyphField};
 pub use mode::{GlyphFieldMode, ParseGlyphFieldModeError};
 pub use records::{GlyphInstance, GlyphPlacement, GroupRow, ItemParamsGpu, LineRecord};
