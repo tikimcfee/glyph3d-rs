@@ -39,9 +39,9 @@ machines and clones, **M** machine-specific values, **R** runner.
 | C7 | 239 stage-letter comments | won't do | archaeology; reword only when touching |
 | C8 | `clippy --all-targets`: 14 test-only lints + deny-level `reversed_empty_ranges` (seam.rs test) | open | sweep; gate runs without `--all-targets` |
 | C9 | `discovery.rs` names a Claude project by the slug's last `-` segment (`…-glyph3d-js` → `js`) | open | small fix |
-| C10 | Two defects attributed (detail). Defect 2 (chain) FIXED in c5ef78a, it was the instrument. Defect 1 (HyperLayout's ASCII fast path never asked whether a keycap base heads a sequence) FIXED 2026-10-09 with C13: `hyper-oracle` green on four tiers (now incl. the device Pass 2, which also had its page extent drop the newline record: fixed), `cubecl-fork` green (708,529 lane words -> 0); no golden frame moved on this host; perf A/B here, M2 A/B pending | closed (M2 A/B pending) | commits on the C10 branch |
+| C10 | CubeCL fences red on both machines: two defects | closed | chain: c5ef78a (the instrument, not production); HyperLayout ASCII-led sequences: d427276, device page extent 341cad8, device-path oracle 2602c85, gates 9a100aa/ac75e9e. cubecl-fork green (708,529 -> 0). M2 A/B: no measurable cost (below) |
 | C12 | CubeCL's standalone cluster pass (`--cubecl-cluster-check`, bench cluster mode; NOT the repo path's fused decode_probe) misses keycap/overlap/wrap sequences and ZWJ families; fails identically at d08af8b | open | instrument-only; fix or retire the standalone pass |
-| C13 | HyperLayout ignored the item's cluster mode (leader-mode ZWJ zeroed; 29,826 records differ on the cluster corpora in leader mode). FIXED 2026-10-09 with C10: the mode is read once per item; hyper-oracle now also runs the cluster corpora in leader mode | closed | commits on the C10 branch |
+| C13 | HyperLayout ignored the item's cluster mode | closed | d427276 (mode read once per item; leader-mode oracle run gated) |
 | C14 | HyperLayout's host Pass 2 paginates `scroll_rows`/`page_cols` differently from the fold (instances only; recording path agrees). The device Pass 2 too (measured 2026-10-09, device tier). Gated alone as `hyper-oracle-paged` (red) so hyper-oracle could go green | open | latent for repos (they set neither); fix, then delete the split |
 | C15 | Device Pass 2 only: a line cut into chunks (> 64 KiB, no newline within the next 64 KiB) seeds the next chunk's segment advance as `rem * adv` (`aggregate_chunk_prepasses`), not the running f32 sum the fold and host path use: an ulp of x on `g-pick-repo/wide.txt`, 65 slots past column 65,280 [measured 2026-10-09, `--hyper-oracle-check native/fixtures/g-pick-repo`]. Also [inferred from source, no corpus has one]: a sequence split across such a cut is not clustered by the chunked passes (Pass 1, device Pass 2) while the host Pass 2 and the recording path, which walk the whole item, do cluster it, so Pass 1's survivor count can disagree with the host emission there | open | fix with a re-baseline in mind: g-pick-repo is every repo-* golden's corpus |
 | C16 | Discrete-GPU upload: an ODD total survivor count costs ~10-20 ms of backend on this host (derived, 94 MB tree: 91,417,858 slots 415-425 ms, 91,417,859 slots 430-437 ms; same at bf9a757) [measured 2026-10-09; cause not traced, the staging copy is the suspect] | open | look at the derived staging copy's size/alignment |
@@ -352,6 +352,20 @@ same binary both sides, warm runs, ms:
 
 So a real difference has to exceed ~8-9 ms (about 4%); derived/syntax is
 the tightest (~2 ms).
+
+**A/B of the C10/C13 fix** (a = bf9a757, b = e21315a, the fix branch tip;
+same harness, 2026-10-09):
+
+| config | backend min a/b | median a/b | visual min a/b | median a/b |
+|---|---|---|---|---|
+| derived flat | 134 / 138 | 146 / 146 | 141 / 144 | 154 / 154 |
+| derived syntax | 171 / 171 | 182 / 178 | 181 / 181 | 192 / 190 |
+| instanced flat | 216 / 218 | 222 / 230 | 222 / 224 | 229 / 236 |
+| instanced syntax | 222 / 222 | 229 / 229 | 233 / 234 | 239 / 240 |
+| instanced flat, 10 rounds (n=20) | 217 / 216 | 223 / 222 | 223 / 222 | 229 / 228 |
+
+Every difference is inside the A/A floor; the one at its edge (instanced flat
+median +8) vanished at n=20. Verdict: no measurable cost on the M2.
 
 ### Checked and fine
 
