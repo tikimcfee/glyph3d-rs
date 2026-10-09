@@ -219,6 +219,20 @@ fn write_stamp(name: &str, digest: &str) {
     let _ = std::fs::write(stamps().join(format!("{name}.sha256")), digest);
 }
 
+/// The products that read `file` (repo-relative). A mutation of one of those
+/// files, built by its gate under a name the stamp does not cover (`cargo test
+/// --release` links the renderer for the integration tests), leaves a MUTATED
+/// artifact behind an unchanged input hash once the file is restored.
+fn products_reading<'m>(m: &'m Manifest, file: &str) -> Vec<&'m str> {
+    let f = root().join(file);
+    m.artifact
+        .iter()
+        .filter(|(_, a)| a.class == Class::Product)
+        .filter(|(_, a)| a.inputs.iter().any(|pat| expand(pat).contains(&f)))
+        .map(|(name, _)| name.as_str())
+        .collect()
+}
+
 pub(crate) fn is_current(name: &str, a: &Artifact) -> bool {
     stamp_of(name).as_deref() == Some(input_digest(a).as_str())
         && a.outputs.iter().all(|o| root().join(o).exists())
@@ -1240,6 +1254,23 @@ fn cmd_prove(
                 println!("      {}", out.lines().last().unwrap_or(""));
                 return false;
             }
+        } else {
+            // No declared rebuild, but the gate may have built a product from
+            // the mutated file anyway (found 2026-10-09: `tail-pads-zero` left
+            // a mutated renderer for every later gate and every hand timing).
+            // Its stamp still matches the restored sources, so drop it and
+            // let currency rebuild.
+            let stale = products_reading(m, &mu.file);
+            if !stale.is_empty() {
+                for name in &stale {
+                    let _ = std::fs::remove_file(stamps().join(format!("{name}.sha256")));
+                }
+                if !ensure_products(m, false) {
+                    println!("FATAL {} — rebuilding {} after restore FAILED; every later", mu.name, stale.join(", "));
+                    println!("      check would test the mutated binary. Run: cargo glyph build");
+                    return false;
+                }
+            }
         }
         match verdict {
             Some(v) => {
@@ -1468,6 +1499,16 @@ mod tests {
             test_verdict(9, 9, None, false),
             (false, "CHECK-ALL: FAILURES — see above (9 of 9 gates ran)".to_string())
         );
+    }
+
+    /// prove re-stales exactly the products a restored file feeds: a renderer
+    /// source and a crate source do, a check script does not.
+    #[test]
+    fn mutated_inputs_name_the_products_they_feed() {
+        let m = load().expect("build.toml loads");
+        assert_eq!(products_reading(&m, "native/src/main.rs"), ["renderer"]);
+        assert_eq!(products_reading(&m, "crates/glyph-field/src/copy.rs"), ["renderer"]);
+        assert!(products_reading(&m, "tools/check-cubecl.sh").is_empty());
     }
 }
 

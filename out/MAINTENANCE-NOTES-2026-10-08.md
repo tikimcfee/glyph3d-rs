@@ -53,6 +53,8 @@ machines and clones, **M** machine-specific values, **R** runner.
 | R1 | Renderer currency stamp ignored the root `Cargo.toml`/`Cargo.lock` | closed | dc6a00f |
 | R2 | Dead `{dylib}` / `dylib_ext()` / engine-check machinery in the runner | closed | 3fc716c |
 | R3 | `engine/glyph_schema.mjs` and the schema validation were in no gate; `gen_schema --check` red | closed | 16372a9 (`[artifact.glyph-schema]`, mutation `glyph-schema-byte`) |
+| R4 | `glyph prove` left a MUTATED renderer behind a stamp reading current, for a cargo-test mutation without `rebuild` (`cargo test --release` links the bin) [measured 2026-10-09: tail-pads-zero, 62b55bfe -> 928dc5b4, "renderer current"]; the same for the runner, which later gates are spawned from | closed | runner fix + `prove-restale-blind` mutation; runner mutations declare `rebuild` (hash in a follow-up) |
+| R5 | The renderer product built at PACKAGE scope (`cd native && cargo build`), then cargo-build/cargo-test rebuilt it at workspace scope with unified features (crypto-common/std, indexmap/default): the stamp vouched for one binary and every later gate ran another [measured: 62b55bfe vs 6dc7340c] | closed | product builds at workspace scope; glyph/Cargo.toml is an input (hash in a follow-up) |
 | B0 | Workspace did not compile on Linux (ungated Metal HAL) | closed | 872621d on main (other agent); helper half is C1 |
 | M1 | Mac paths in TUI presets, justfile, bench script, docs | closed | 1062e23, 88525ea |
 | M2 | Session discovery hardcoded `$HOME`; tests not hermetic | closed | 1062e23, then f864183 (app defaults + Kimi parser) |
@@ -321,11 +323,12 @@ pixel-ab here: 7 of 9 views diverge from `vulkan-nvidia`, 2 have no set.
   it, undoing a whitespace perturbation. Measure product currency with
   `target/release/glyph` directly.
 - `cargo glyph` is broken in worktrees (D2); use the expanded command.
-- `glyph prove` on a `cargo-test` mutation WITHOUT `rebuild` leaves the
-  mutated renderer in `target/release` (`cargo test --release` builds the
-  bin for the integration tests; restore does not rebuild, and the input
-  hash reads current). Run `cargo build --release` before timing or
-  rendering by hand after a prove [measured 2026-10-09, C16].
+- Before R4 (2026-10-09), `glyph prove` on a `cargo-test` mutation WITHOUT
+  `rebuild` left the mutated renderer in `target/release` under a current
+  stamp. Fixed; on an older runner, `cargo build --release` after a prove.
+- A renderer's sha256 depends on build SCOPE: `cd native && cargo build` and
+  a root `cargo build` link different bytes (feature unification, R5). Hash
+  binaries built the same way, or the comparison measures the scope.
 - Byte-comparing renders against main: build main with `git archive` into the
   scratchpad, render the nine views from `native/` with `--screenshot`, `cmp`
   against `out/tooling-ab/sweep/`.

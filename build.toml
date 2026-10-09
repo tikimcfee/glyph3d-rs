@@ -42,8 +42,15 @@ test_floor = 245
 [artifact.renderer]
 class = "product"
 outputs = ["target/release/glyph3d-native"]
-inputs = ["native/src/**/*", "native/Cargo.toml", "crates/**/*", "Cargo.toml", "Cargo.lock", ".cargo/config.toml"]
-build = "cd native && cargo build --release"
+# Built at WORKSPACE scope, as cargo-build and cargo-test then rebuild it:
+# `cd native && cargo build` resolves features for this package alone, the
+# workspace unifies them with glyph's (crypto-common/std, indexmap/default),
+# and the two link different bytes. Until 2026-10-09 the stamp vouched for the
+# package-scope binary and every gate after cargo-build ran the other one
+# (measured: 62b55bfe vs 6dc7340c). Hence glyph/Cargo.toml as an input: its
+# dependencies' features reach this binary.
+inputs = ["native/src/**/*", "native/Cargo.toml", "crates/**/*", "glyph/Cargo.toml", "Cargo.toml", "Cargo.lock", ".cargo/config.toml"]
+build = "cargo build --release"
 note = "Pure-Rust native renderer."
 
 # ── Committed artifacts ──────────────────────────────────────────────────
@@ -450,6 +457,20 @@ op = "replace"
 find = "    if selected == 0 {\n        return (false,"
 with = "    if selected == usize::MAX {\n        return (false,"
 expect = "empty_gate_selection_is_refused"
+# cargo-test relinks target/release/glyph from the mutated source, and every
+# later gate in the run is spawned from that path (self_exe): restore it.
+rebuild = "cargo build --release -p glyph"
+
+[[mutation]]
+name = "prove-restale-blind"
+gate = "cargo-test"
+why = "A cargo-test mutation without `rebuild` left the MUTATED renderer in target/release behind a stamp that still read current (cargo test --release links the bin; found 2026-10-09 with tail-pads-zero: 62b55bfe -> 928dc5b4, 'renderer current'), so every later gate and every hand timing tested the mutant. prove now drops the stamp of each product the restored file feeds and rebuilds it; matching no product restores the blind spot. CONSUMED BY: products_reading in glyph/src/main.rs, via its unit test"
+file = "glyph/src/main.rs"
+op = "replace"
+find = ".filter(|(_, a)| a.inputs.iter().any(|pat| expand(pat).contains(&f)))"
+with = ".filter(|(_, a)| a.inputs.is_empty() && expand(\"\").contains(&f))"
+expect = "mutated_inputs_name_the_products_they_feed"
+rebuild = "cargo build --release -p glyph"
 
 [[mutation]]
 name = "corpus-shrink"
