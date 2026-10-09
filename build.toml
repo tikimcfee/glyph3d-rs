@@ -25,7 +25,7 @@
 # Ratchet, NOT an equality: tests are added constantly, so an exact pin would
 # redden on the most common good action in the repo. A green run whose real
 # count exceeds the floor prints a NOTE naming the value to raise it to.
-test_floor = 268
+test_floor = 269
 
 
 # ── Products ─────────────────────────────────────────────────────────────
@@ -422,8 +422,8 @@ gate = "manifest"
 why = "a product input pattern matching NO file makes the currency stamp hash nothing of what it names, so `build` skips the build and `test --frozen` asserts currency over a stale binary. `native/src/**` was exactly this from 598205b until 2026-09-16 — glob's `**` matches directories, input_digest filters to files. CONSUMED BY: the product-input scan in validate(), and nothing else"
 file = "build.toml"
 op = "replace"
-find = '"native/src/**/*"'
-with = '"native/src/**"'
+find = "inputs = [\"native/src/**/*\""
+with = "inputs = [\"native/src/**\""
 expect = "matches no file"
 
 [[mutation]]
@@ -432,8 +432,8 @@ gate = "manifest"
 why = "the literal-path twin of dead-input-glob: an input naming a file that does not exist hashes nothing for it, so changes to what it was meant to cover never stale the product. `native/Cargo.lock` was exactly this from the workspace move (2026-09-06) until 2026-10-09, invisible because the dead-glob check only scanned patterns containing `*`. CONSUMED BY: the product-input scan in validate(), and nothing else"
 file = "build.toml"
 op = "replace"
-find = '"Cargo.toml", "Cargo.lock", ".cargo/config.toml"'
-with = '"Cargo.toml", "native/Cargo.lock", ".cargo/config.toml"'
+find = "\"Cargo.toml\", \"Cargo.lock\", \".cargo/config.toml\""
+with = "\"Cargo.toml\", \"native/Cargo.lock\", \".cargo/config.toml\""
 expect = "matches no file"
 
 [[mutation]]
@@ -546,10 +546,10 @@ why = "tests that stop RUNNING must not read as coverage; #[ignore] is silent to
 file = "native/src/glyph_trie.rs"
 op = "replace"
 find = '''    #[test]
-'''
+    fn block_storage_order_follows_codepoint_order() {'''
 with = '''    #[test]
     #[ignore]
-'''
+    fn block_storage_order_follows_codepoint_order() {'''
 expect = "Coverage DROPPED"
 
 
@@ -938,3 +938,14 @@ with = """    if word_start_byte == usize::MAX - 1 {
         let wc = word_color_packed(&bytes[word_start_byte..]);"""
 expect = "colorizers_agree_on_truncated_leads_and_unterminated_words"
 rebuild = "cargo build --release"
+
+[[mutation]]
+name = "prove-ambiguous-find-accepted"
+gate = "cargo-test"
+why = "C11: a replace mutation whose find text matches more than once mutates whichever match comes first — an accident of file order. Two build.toml mutations matched their own entry and one picked the first of seven #[test]s until 2026-10-09. Counting at most one match restores the blind spot. CONSUMED BY: find_matches in glyph/src/main.rs, via mutation_finds_are_unambiguous"
+file = "glyph/src/main.rs"
+op = "replace"
+find = "        text.matches(find).count()\n"
+with = "        text.matches(find).count().min(1)\n"
+expect = "mutation_finds_are_unambiguous"
+rebuild = "cargo build --release -p glyph"

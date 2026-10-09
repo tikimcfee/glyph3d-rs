@@ -1099,6 +1099,16 @@ fn gate_output(name: &str) -> (bool, String) {
 /// Apply, returning the original bytes. Err if the edit did not land — a failed
 /// replace is silent, and an unapplied mutation looks exactly like a check that
 /// caught nothing.
+/// Non-overlapping occurrences of `find` in `text` (an empty `find` counts
+/// as absent: it would "match" everywhere and mutate nothing in particular).
+fn find_matches(text: &str, find: &str) -> usize {
+    if find.is_empty() {
+        0
+    } else {
+        text.matches(find).count()
+    }
+}
+
 fn apply_mutation(mu: &Mutation) -> Result<Vec<u8>, String> {
     let f = root().join(&mu.file);
     let before = std::fs::read(&f).map_err(|e| format!("{}: {e}", mu.file))?;
@@ -1111,8 +1121,20 @@ fn apply_mutation(mu: &Mutation) -> Result<Vec<u8>, String> {
         "replace" => {
             let text = String::from_utf8(before.clone()).map_err(|_| "not UTF-8".to_string())?;
             let find = mu.find.as_deref().unwrap_or_default();
-            if !text.contains(find) {
-                return Err(format!("find-text absent from {}; mutation cannot land", mu.file));
+            match find_matches(&text, find) {
+                0 => return Err(format!("find-text absent from {}; mutation cannot land", mu.file)),
+                1 => {}
+                // Ambiguous: `replacen(.., 1)` would mutate whichever match comes
+                // first, which is an accident of file order, not a choice. Until
+                // 2026-10-09 (C11) two build.toml mutations matched their own
+                // `find =` entry too and were right only because the target
+                // came first; another picked the first of seven #[test]s.
+                n => {
+                    return Err(format!(
+                        "find-text matches {n} times in {}; anchor it so it names one place",
+                        mu.file
+                    ))
+                }
             }
             let with = mu.with_.as_deref().unwrap_or_default();
             std::fs::write(&f, text.replacen(find, with, 1)).map_err(|e| e.to_string())?;
@@ -1499,6 +1521,22 @@ mod tests {
             test_verdict(9, 9, None, false),
             (false, "CHECK-ALL: FAILURES — see above (9 of 9 gates ran)".to_string())
         );
+    }
+
+    /// A mutation's find must name ONE place (C11), and no declared one names two.
+    #[test]
+    fn mutation_finds_are_unambiguous() {
+        assert_eq!(find_matches("a b a", "a"), 2);
+        assert_eq!(find_matches("a b", ""), 0);
+        let m = load().expect("build.toml loads");
+        for mu in m.mutation.iter().filter(|mu| mu.op == "replace") {
+            let text = std::fs::read_to_string(root().join(&mu.file)).expect("mutation target reads");
+            let n = find_matches(&text, mu.find.as_deref().unwrap_or_default());
+            // At most one: zero is the prover's own refusal ("find-text
+            // absent"), and is also what this test sees for a mutation that is
+            // APPLIED while cargo-test runs under prove.
+            assert!(n <= 1, "mutation {} matches {n} times in {}", mu.name, mu.file);
+        }
     }
 
     /// prove re-stales exactly the products a restored file feeds: a renderer
