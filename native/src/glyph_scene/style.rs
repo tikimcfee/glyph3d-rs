@@ -341,6 +341,13 @@ fn parse_highlight_sidecar(
             rgb,
         });
     }
+    // style_file's merge walk needs each file's runs byte-ascending; a sidecar
+    // is hand- or tool-written in any order, and an out-of-order run was
+    // silently skipped (found 2026-10-09 by the repo-highlight golden, whose
+    // fixture is deliberately unsorted). Stable, so equal starts keep file order.
+    for runs in map.values_mut() {
+        runs.sort_by_key(|r| r.range.start);
+    }
     Ok(map)
 }
 

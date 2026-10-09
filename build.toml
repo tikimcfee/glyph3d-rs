@@ -25,7 +25,14 @@
 # Ratchet, NOT an equality: tests are added constantly, so an exact pin would
 # redden on the most common good action in the repo. A green run whose real
 # count exceeds the floor prints a NOTE naming the value to raise it to.
-test_floor = 271
+test_floor = 272
+# Every golden view is rendered again under each of these and must match the
+# SAME baseline byte for byte (2026-10-09, C20). The Derived field renders
+# every golden frame identically to Instanced (measured on vulkan-nvidia and
+# metal-apple), so this covers its upload, storage, vertex-stage Y/Z and edit
+# paths without a second golden set to adopt. Until then no golden ran it,
+# and a Derived edit bug that emptied the frame (C19) was invisible.
+golden_equivalents = ["--field-mode derived"]
 
 
 # ── Products ─────────────────────────────────────────────────────────────
@@ -152,8 +159,9 @@ outputs = [
   "out/tooling-ab/baseline/{gpu}/emoji.png",
   "out/tooling-ab/baseline/{gpu}/emoji-cluster.png",
   "out/tooling-ab/baseline/{gpu}/repo-cluster.png",
+  "out/tooling-ab/baseline/{gpu}/repo-highlight.png",
 ]
-inputs = ["target/release/glyph3d-native", "native/fixtures/baseline-view.txt", "native/fixtures/emoji-view.txt", "native/fixtures/emoji-cluster-view.txt", "native/fixtures/g-pick-repo/**/*", "native/fixtures/g-cluster-repo/**/*", "assets/atlas/emoji-sheet.bin"]
+inputs = ["target/release/glyph3d-native", "native/fixtures/baseline-view.txt", "native/fixtures/emoji-view.txt", "native/fixtures/emoji-cluster-view.txt", "native/fixtures/g-pick-repo/**/*", "native/fixtures/g-cluster-repo/**/*", "native/fixtures/highlight-alpha.tsv", "assets/atlas/emoji-sheet.bin"]
 note = "Blind to everything outside these frames, and cannot distinguish a regression from an intentional change. One set per rasterizer ({gpu}); a set only ever proves the renderer on the hardware that made it. empty.rs in g-pick-repo is zero bytes ON PURPOSE (the only input reaching the page-extent origin seed)."
 
 # Per-view render commands (run from native/, screenshot into {scratch}).
@@ -212,6 +220,15 @@ cmd = "--render-file fixtures/emoji-cluster-view.txt --frames 2 --zoom 1.25 --cl
 [[golden_view]]
 name = "repo-cluster"
 cmd = "--load-repo fixtures/g-cluster-repo --frames 2 --cluster-mode cluster --color-mode syntax"
+# The highlight sidecar (2026-10-09) — the byte-range styling entry point the
+# AST/LSP colouring will arrive through, which no frame had seen. alpha.rs
+# whole, six spans recoloured over syntax paint. Under the Derived equivalent
+# it is the witness for C19 (Derived placement edits zeroed the row and
+# emptied this frame); the IMMUTABLE sidecar is deliberately out of byte
+# order, which is what found the sort the parser lacked.
+[[golden_view]]
+name = "repo-highlight"
+cmd = "--load-repo fixtures/g-pick-repo --frames 2 --focus-file alpha.rs --zoom 1 --color-mode syntax --highlight fixtures/highlight-alpha.tsv"
 
 # ── Gates ────────────────────────────────────────────────────────────────
 # `scope` answers "I changed X, what should I run" — the question the CLI is
@@ -408,8 +425,8 @@ name = "pixel-ab"
 scope = "render"
 kind = "golden-verify"
 needs = ["renderer", "pixel-baselines"]
-compare = "every declared golden_view re-rendered vs out/tooling-ab/baseline/<this host's --gpu-key>, byte-equal"
-blind_to = "everything outside the declared frames; regression vs intentional change (re-baselining is a human act); any rasterizer other than this host's — a set proves nothing about another vendor"
+compare = "every declared golden_view re-rendered vs out/tooling-ab/baseline/<this host's --gpu-key>, byte-equal — and again under each settings.golden_equivalents (--field-mode derived) against the same baseline"
+blind_to = "everything outside the declared frames; regression vs intentional change (re-baselining is a human act); any rasterizer other than this host's — a set proves nothing about another vendor; an equivalent that legitimately stops matching (it cannot be given its own baseline here)"
 
 # ── Declared mutations ───────────────────────────────────────────────────
 # `glyph mutate` applies each of these, requires the named gate to go red
@@ -622,6 +639,28 @@ find = """            // flat page blends in exactly the order it did before.
 with = """            // flat page blends in exactly the order it did before.
             depth_write_enabled: Some(false),"""
 expect = "repo-back-oblique.png diverges from baseline"
+rebuild = "cargo build --release"
+
+[[mutation]]
+name = "derived-placement-row-zeroed"
+gate = "pixel-ab"
+why = "C19 put back: a Derived placement edit that zeroes the slot's row (here the X write widened by one word over w1), so every edited glyph moves to its item's first row — the defect that emptied the highlight frame in Derived mode until 2026-10-09. CONSUMED BY: repo-highlight under the --field-mode derived equivalent, and nothing else: the plain frames are Instanced, and no other view edits placements after load"
+file = "crates/glyph-field-derived/src/field.rs"
+op = "replace"
+find = "storage.write_field(queue, slot, X_OFFSET, bytemuck::bytes_of(&p.position[0]));"
+with = "storage.write_field(queue, slot, X_OFFSET, bytemuck::cast_slice(&[p.position[0], 0.0]));"
+expect = "repo-highlight.png diverges from baseline under --field-mode derived"
+rebuild = "cargo build --release"
+
+[[mutation]]
+name = "sidecar-runs-unsorted"
+gate = "pixel-ab"
+why = "the highlight sidecar's runs left in file order: style_file's merge walk assumes byte-ascending runs and silently skipped an out-of-order one (found 2026-10-09 by this frame). CONSUMED BY: repo-highlight, whose IMMUTABLE sidecar lists the `1` span after the string span — the `1` stays default-coloured"
+file = "native/src/glyph_scene/style.rs"
+op = "replace"
+find = "        runs.sort_by_key(|r| r.range.start);"
+with = "        let _ = runs;"
+expect = "repo-highlight.png diverges from baseline — the renderer changed"
 rebuild = "cargo build --release"
 
 [[mutation]]

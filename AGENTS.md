@@ -515,6 +515,19 @@ What a set proves is the renderer ON THE HARDWARE THAT MADE IT — a green here 
 Linux says nothing about Metal, and `validate` refuses a golden output that is
 not keyed.
 
+**Golden equivalents: the Derived field, without a second set (2026-10-09).**
+`build.toml [settings] golden_equivalents` lists argument lists under which
+every golden view must render its baseline's exact bytes; the gate renders
+each view again with each list appended and compares against the SAME PNG
+(`PASS  text.png BYTE-EQUAL under --field-mode derived`). It holds one entry,
+`--field-mode derived`: the Derived field renders every golden frame
+identically to Instanced on both sets (measured when it was added), so its
+upload, storage, vertex-stage Y/Z and edit paths are covered with nothing new
+to adopt. Before it, no golden rendered Derived at all, and a Derived edit
+defect that emptied a frame (C19, below) was invisible. A divergence under an
+equivalent with the plain frame equal is the VARIANT breaking — never a reason
+to re-baseline. `drift` compares the plain frames only.
+
 **Which view covers what, because the answer is not uniform.** `repo-wide`
 renders the default wrap mode (`back` — a wrap costs DEPTH); `repo-down` exists
 to keep the non-default row-per-wrap geometry covered, and was added when the
@@ -556,6 +569,17 @@ Known cost of the depth-write fix, measured: in the dense far region of
 `repo-down`, ~1,400 of 1.6M pixels lose a little ink where coplanar quads
 overlap and the later fragment's interpolated depth lands an ulp behind — the
 price of a blended pass writing depth, accepted over draw-order visibility.
+
+`repo-highlight` (2026-10-09) is the only frame through the highlight
+sidecar (`--highlight`), the byte-range styling path the AST/LSP colouring
+will arrive by: `alpha.rs` whole, six spans recoloured over syntax paint.
+Under the Derived equivalent it is the witness for C19 — Derived's
+`write_placements` rewrote whole slots with the row and wrap zeroed, so every
+edited glyph left the frame (`derived-placement-row-zeroed`). Its sidecar is
+deliberately out of byte order, which found a second defect when the frame
+was made: `style_file` walks runs as byte-ascending and the sidecar parser
+never sorted, so an out-of-order span was silently skipped
+(`sidecar-runs-unsorted`).
 
 It is also less all-seeing than it looks. The page-extent origin seed was
 renderer-affecting and every view stayed byte-equal, because the seed only binds
@@ -671,6 +695,7 @@ the serial-fold-versus-scan comparison green, because both forms call
 | `native/fixtures/emoji-view.txt` | IMMUTABLE | the input to `emoji.png`, one line per class of bitmap slot the trie carries; same reason |
 | `native/fixtures/g-pick-repo/empty.rs` | IMMUTABLE, zero bytes | the only input that reaches the page-extent origin seed; deleting it removes a check's ability to see its subject without removing the check |
 | `native/fixtures/chunk-cut.txt` | IMMUTABLE | hyper-oracle's only input built for the intra-line chunk-cut classes (C15): a sequence across each 64 KiB cut target, non-ASCII advances before each cut, a continuation wider than every ASCII row past the first page. Its cut positions are planned against the 64 KiB threshold and the cut rule, so changing either (or the file) can move a target off its sequence and silently weaken the gate — re-check that each mutation in its `why` still reddens |
+| `native/fixtures/highlight-alpha.tsv` | IMMUTABLE | the input to `repo-highlight.png`; DELIBERATELY out of byte order (the `1` span after the string span) — sorting it removes the frame's only witness for `sidecar-runs-unsorted` |
 | `native/fixtures/chunk-cut-paint.txt` | IMMUTABLE | hyper-oracle's paint-tier input (C17): a `return` across every intra-line cut, one pure-ASCII line and one not, so a chunk that coloured only its own share of a line is seen at the chunk's END; the only witness `hyper-cut-tail-own-share` has |
 | `native/fixtures/cubecl-fork/` | IMMUTABLE | the retired cubecl-fork check's standing corpus — the only committed input exercising paginate's m >= 3 / segment >= 3 classes, the cluster classes at wrap/page boundaries, and the empty-item placement class (`clusters.txt` + `empty.txt`); kept for re-gating. Editing it re-hollows that check silently |
 | `out/tooling-ab/baseline/<key>/` | tracked pixel oracle, one set per rasterizer; **golden** in build.toml | changes only on purpose, with a note saying why; the runner refuses to regenerate it. A new host adopts its own set by hand (the gate prints how); it never edits another's |

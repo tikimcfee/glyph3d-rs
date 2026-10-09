@@ -12,6 +12,8 @@ use crate::pipeline::{BINDING_GLYPH_ADVANCES, BINDING_ITEM_TABLE, EXTRA_LAYOUT};
 use crate::slot::{DerivedSlot, COLOR_OFFSET, ITEM_AND_GROUP_OFFSET, SLOT_BYTES, X_OFFSET};
 use crate::upload::{DerivedTranscode, LABELS};
 
+const _: () = assert!(ITEM_AND_GROUP_OFFSET == COLOR_OFFSET + 4, "write_placements writes colour and group as one 8 B run");
+
 /// The Derived glyph field: compact 20 B slots per glyph, Y/Z derived in the
 /// vertex stage from each slot's row and its item's `ItemParamsGpu`. The
 /// pipelines, chunk bind groups and storage are the shared [`FieldCore`].
@@ -123,21 +125,20 @@ impl GlyphField for DerivedField {
         self.core.storage().write_field(queue, slot, ITEM_AND_GROUP_OFFSET, bytemuck::bytes_of(&group_id));
     }
 
+    /// What a Derived slot can take from a placement: X, colour and group.
+    /// Its row and wrap segment are the producer's (Y/Z derive from them in
+    /// the vertex stage) and the glyph id shares a word with the wrap, so
+    /// those stay as loaded. Until 2026-10-09 this wrote whole slots with
+    /// row and wrap zeroed, moving every edited glyph to its item's first
+    /// row (C19: the highlight sidecar emptied the frame).
     fn write_placements(&self, queue: &wgpu::Queue, first_slot: u32, placements: &[GlyphPlacement]) {
-        let slots: Vec<DerivedSlot> = placements
-            .iter()
-            .map(|p| {
-                DerivedSlot::with_item_and_group(
-                    p.position[0],
-                    0, // placements edit writes X, color, group
-                    p.glyph_id as u16,
-                    0,
-                    p.color,
-                    p.group_id,
-                )
-            })
-            .collect();
-        self.core.storage().write_slots(queue, first_slot, &slots);
+        let storage = self.core.storage();
+        for (i, p) in placements.iter().enumerate() {
+            let slot = first_slot + i as u32;
+            storage.write_field(queue, slot, X_OFFSET, bytemuck::bytes_of(&p.position[0]));
+            // w3 colour and w4 group are adjacent (pinned below): one write.
+            storage.write_field(queue, slot, COLOR_OFFSET, bytemuck::cast_slice(&[p.color, p.group_id]));
+        }
     }
 
     fn write_colors(&self, queue: &wgpu::Queue, first_slot: u32, colors: &[u32]) {
