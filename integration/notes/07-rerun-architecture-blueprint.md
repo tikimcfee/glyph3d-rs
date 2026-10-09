@@ -1,6 +1,6 @@
 # 07 — Rerun / re_renderer deep-dive: the borrow plan
 
-*Source read 2026-09-01 from a local shallow clone at `/Users/lugo/localdev/viz-native/rerun`
+*Source read 2026-09-01 from a local shallow clone at `<rerun-clone>`
 @ `cb5e9d6` (2026-09-01). Facts below cite `file:line` from that snapshot; sibling facts cite
 `glyph3d-native` at HEAD (`4cb3c81`, Stage H landed). This doc executes posture 2 of
 `05-integration-postures-and-roadmap.md` ("Rerun-style architecture borrowing"): what exactly to
@@ -209,7 +209,7 @@ Determinism chain untouched (engine FFI, `fold_leaders` oracle, PNG bytes); dept
 
 ## Reference index (for the next agent)
 
-Clone: `/Users/lugo/localdev/viz-native/rerun` @ `cb5e9d6`. Read in this order:
+Clone: `<rerun-clone>` @ `cb5e9d6`. Read in this order:
 
 | file | what it is |
 |---|---|

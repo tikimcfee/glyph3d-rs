@@ -44,7 +44,7 @@ edit is now loudly visible in review. The tree has never been cheaper to restruc
 
 ## The workspace
 
-- Crate: `/Users/lugo/localdev/viz-native/glyph3d-native/native/` (src/, shaders/, tests)
+- Crate: `native/` (src/, shaders/, tests)
 - Gates: `bash tools/check-all.sh` from the repo root — the ONLY gate command you need
 - Pins (do not touch any): **wgpu 30, winit 0.30, glam 0.33.6, edition 2021**
 - Key anchors at HEAD `cb35552`: `FrameTarget` `scene.rs:15`, `SceneLike::render` `scene.rs:27`
@@ -78,7 +78,7 @@ edit is now loudly visible in review. The tree has never been cheaper to restruc
 ## STEP 0 — baseline (before ANY edit)
 
 ```bash
-cd /Users/lugo/localdev/viz-native/glyph3d-native
+cd <repo>
 bash tools/check-all.sh        # expect: CHECK-ALL: ALL GATES GREEN (6 gates)
 ```
 

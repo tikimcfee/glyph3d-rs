@@ -34,7 +34,7 @@ gating (none exists today), not rendering.
 
 ## The workspace
 
-- Crate: `/Users/lugo/localdev/viz-native/glyph3d-native/native/`; gates: `bash tools/check-all.sh`
+- Crate: `native/`; gates: `bash tools/check-all.sh`
 - Pins (must not move): **wgpu 30, winit 0.30, glam 0.33.6, edition 2021**
 - **MSRV check: egui 0.36 requires rustc ≥ 1.95** (per its changelog) — verify the local toolchain
   in STEP 0 before adding anything.
@@ -81,7 +81,7 @@ gating (none exists today), not rendering.
 
 ```bash
 rustc --version                 # expect ≥ 1.95 (egui 0.36 MSRV) — if lower, STOP and report
-cd /Users/lugo/localdev/viz-native/glyph3d-native
+cd <repo>
 bash tools/check-all.sh         # expect: CHECK-ALL: ALL GATES GREEN
 # windowed FPS band (K adds ~1–2 ms CPU/frame; record the pre-K band for the report):
 # run windowed on the fixture repo ≥ 30 s, note the 1 Hz FPS lines (scene + mode of your choice)

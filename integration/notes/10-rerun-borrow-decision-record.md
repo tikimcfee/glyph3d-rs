@@ -122,7 +122,7 @@ stage.
 
 ## Provenance
 
-rerun @ `cb5e9d6` (2026-09-01, shallow clone at `/Users/lugo/localdev/viz-native/rerun`; the
+rerun @ `cb5e9d6` (2026-09-01, shallow clone at `<rerun-clone>`; the
 load-bearing files read in full, line-cited in 07). Our tree @ `cb35552` (post Stage I/J). Demand
 evidence: `out/STAGE_F|G|H|I|J_REPORT.md` gap lists + the `out/*.png` wide/zoom pair pattern.
 Execution artifacts: `08-view-structure-handoff.md` (L), `09-egui-ui-handoff.md` (K, non-rerun).
