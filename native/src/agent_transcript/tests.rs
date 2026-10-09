@@ -3,7 +3,7 @@
 //! Includes behavioral parity test against `tools/sessionAdapter.test.mjs`
 //! from `glyph3d-js`.
 
-use super::claude::{parse_claude_session, parse_iso_ts};
+use super::claude::{parse_claude_session, parse_iso_ts, user_prompt_text};
 use super::antigravity::parse_antigravity_session;
 use super::types::HarnessKind;
 use crate::spatial_scene::workdesk::FileActionKind;
@@ -637,6 +637,7 @@ fn test_utf8_multibyte_truncation_no_panic() {
         tool_calls: Vec::new(),
         assistant_messages: vec![hostile_str.clone()],
         timestamp: None,
+        steps: Vec::new(),
     };
     let turn_summary = turn.summary();
     assert!(!turn_summary.is_empty());
@@ -662,4 +663,99 @@ fn test_utf8_multibyte_truncation_no_panic() {
     assert!(ev_cmd.summary().starts_with("$ "));
 }
 
+/// Typed prompts are STRING content; everything a user record carries that the
+/// user did not type to the agent is not a prompt. Shapes from real
+/// transcripts (Claude Code 2.1.x).
+#[test]
+fn user_prompt_text_classifies_real_record_shapes() {
+    let rec = |content: serde_json::Value, extra: serde_json::Value| {
+        let mut o = json!({ "type": "user", "message": { "role": "user", "content": content } });
+        for (k, v) in extra.as_object().unwrap() {
+            o[k] = v.clone();
+        }
+        o
+    };
+    let none = json!({});
+    assert_eq!(user_prompt_text(&rec(json!("  Fix the fog  "), none.clone())).as_deref(), Some("Fix the fog"));
+    assert_eq!(
+        user_prompt_text(&rec(json!([{ "type": "text", "text": "pasted" }]), none.clone())).as_deref(),
+        Some("pasted")
+    );
+    assert_eq!(
+        user_prompt_text(&rec(
+            json!("<command-name>/code-review</command-name>\n<command-message>code-review</command-message>\n<command-args>high</command-args>"),
+            none.clone()
+        ))
+        .as_deref(),
+        Some("/code-review high")
+    );
+    assert_eq!(
+        user_prompt_text(&rec(json!("<command-name>/model</command-name>\n<command-args></command-args>"), none.clone())).as_deref(),
+        Some("/model")
+    );
+    for not_a_prompt in [
+        rec(json!("<local-command-caveat>Caveat: ...</local-command-caveat>"), json!({ "isMeta": true })),
+        rec(json!("[Image: original 2876x792]"), json!({ "isMeta": true })),
+        rec(json!("This session is being continued from a previous conversation..."), json!({ "isCompactSummary": true })),
+        rec(json!("<local-command-stdout>Set model</local-command-stdout>"), none.clone()),
+        rec(json!("<bash-input>claude stop</bash-input>"), none.clone()),
+        rec(json!("<bash-stdout>stopped</bash-stdout><bash-stderr></bash-stderr>"), none.clone()),
+        rec(json!([{ "type": "text", "text": "[Request interrupted by user]" }]), none.clone()),
+        rec(json!([{ "type": "tool_result", "tool_use_id": "t1", "content": "ok" }]), none.clone()),
+        rec(json!("   "), none.clone()),
+    ] {
+        assert_eq!(user_prompt_text(&not_a_prompt), None, "{not_a_prompt}");
+    }
+}
+
+/// The folding regression: string prompts must start turns, and a turn's
+/// thinking / tool calls / text must linearize in the order they happened,
+/// not grouped by kind. One API message spans several lines (one block each).
+#[test]
+fn claude_turns_split_on_string_prompts_and_keep_block_order() {
+    use super::types::TranscriptEventKind as K;
+    let line = |v: serde_json::Value| v.to_string();
+    let asst = |id: &str, block: serde_json::Value| {
+        line(json!({ "type": "assistant", "message": { "id": id, "role": "assistant", "content": [block] } }))
+    };
+    let result = |id: &str| {
+        line(json!({ "type": "user", "message": { "role": "user", "content": [
+            { "type": "tool_result", "tool_use_id": id, "content": "ok" } ] } }))
+    };
+    let lines = [
+        line(json!({ "type": "user", "message": { "role": "user", "content": "first prompt" } })),
+        asst("m1", json!({ "type": "thinking", "thinking": "plan" })),
+        asst("m1", json!({ "type": "tool_use", "id": "b1", "name": "Bash", "input": { "command": "ls" } })),
+        result("b1"),
+        asst("m2", json!({ "type": "text", "text": "listed" })),
+        asst("m2", json!({ "type": "tool_use", "id": "r1", "name": "Read", "input": { "file_path": "/r/a.rs" } })),
+        result("r1"),
+        asst("m3", json!({ "type": "text", "text": "read it" })),
+        line(json!({ "type": "user", "isMeta": true, "message": { "role": "user", "content": "<local-command-caveat>x</local-command-caveat>" } })),
+        line(json!({ "type": "user", "message": { "role": "user", "content": "second prompt" } })),
+        asst("m4", json!({ "type": "text", "text": "done" })),
+    ];
+    let session = parse_claude_session(&(lines.join("\n") + "\n"), "order");
+    assert_eq!(session.turns.len(), 2, "each string prompt starts a turn; the meta record does not");
+    assert_eq!(session.turns[0].prompt.as_deref(), Some("first prompt"));
+    assert_eq!(session.turns[1].prompt.as_deref(), Some("second prompt"));
+
+    let kinds: Vec<&str> = session
+        .linearize_events(None)
+        .iter()
+        .map(|e| match &e.kind {
+            K::UserPrompt { .. } => "prompt",
+            K::Thinking { .. } => "thinking",
+            K::Command { .. } => "command",
+            K::FileRead { .. } => "read",
+            K::AssistantResponse { .. } => "text",
+            _ => "other",
+        })
+        .collect();
+    assert_eq!(
+        kinds,
+        ["prompt", "thinking", "command", "text", "read", "text", "prompt", "text"],
+        "events follow transcript order, not kind groups"
+    );
+}
 
