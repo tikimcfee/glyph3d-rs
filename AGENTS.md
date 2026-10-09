@@ -130,6 +130,12 @@ day. `tools/check-all.sh` still works; it is a thin door onto `cargo glyph test`
   landing bar. A mutation whose gate is ALREADY red cannot prove anything and
   the prover says so — on a host whose pixel set is stale, the pixel-ab
   mutations are unprovable until the set is re-adopted.
+  A mutation's gate can BUILD a product from the mutated source (`cargo test
+  --release` links the renderer): after restoring, the prover drops the stamp
+  of every product the file feeds and rebuilds it, and a mutation of the
+  runner declares `rebuild`, because every later gate is spawned from
+  `target/release/glyph` (2026-10-09: before this, a prove left the mutant
+  behind a stamp reading current).
 - **`cargo glyph gates`** prints what each check compares and cannot see;
   **`graph`** the artifact graph; **`validate`** the manifest against its schema.
 
@@ -158,9 +164,14 @@ it cannot catch anything; it is here because everything below is a statement
 about an artifact, and a stale one makes every statement false. The renderer
 is a *product*: nothing to compare against, it only has to be CURRENT.
 Currency is a content hash of the declared inputs — `native/src`, `crates/`,
-`native/Cargo.toml`, and the root `Cargo.toml`, `Cargo.lock` and
-`.cargo/config.toml` — stamped at build time, rebuilt only when that hash
-moved. Red only on a compile error, which is FATAL (the battery stops): a
+`native/Cargo.toml`, `glyph/Cargo.toml`, and the root `Cargo.toml`,
+`Cargo.lock` and `.cargo/config.toml` — stamped at build time, rebuilt only
+when that hash moved. It is built at WORKSPACE scope, the scope cargo-build
+and cargo-test rebuild it at: a package-scope build resolves features for the
+renderer alone and links different bytes, so until 2026-10-09 the stamp
+vouched for one binary and every gate after cargo-build ran another (which
+is also why `glyph/Cargo.toml`, whose dependencies' features reach the
+renderer, is an input). Red only on a compile error, which is FATAL (the battery stops): a
 stale binary makes every gate below a statement about the wrong build. Blind
 to an input the list does not name: until 2026-10-09 it named a lockfile that
 no longer existed and omitted the real one, so a dependency bump left the
