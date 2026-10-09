@@ -81,8 +81,8 @@ caller; the short version:
   `HyperLayout` reference run; `direct` has no records and reports `0 records`.
   The CubeCL backend answers the same call (its 48 B arena is reconstructed
   from the records and slot streams). Gated again since 2026-10-09 as
-  `repo-verify` (`hyper`) and `repo-verify-direct`, and `cubecl-fork` (red,
-  C10). Every non-cubecl strategy is the same HyperLayout, so these are
+  `repo-verify` (`hyper`) and `repo-verify-direct`, and `cubecl-fork` (green
+  since the 2026-10-09 HyperLayout keycap fix). Every non-cubecl strategy is the same HyperLayout, so these are
   HyperLayout against HyperLayout; `--hyper-oracle-check` (gate
   `hyper-oracle`, `hyper_oracle.rs`) is the one that holds HyperLayout to the
   oracle-backed fold.

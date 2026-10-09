@@ -39,10 +39,12 @@ machines and clones, **M** machine-specific values, **R** runner.
 | C7 | 239 stage-letter comments | won't do | archaeology; reword only when touching |
 | C8 | `clippy --all-targets`: 14 test-only lints + deny-level `reversed_empty_ranges` (seam.rs test) | open | sweep; gate runs without `--all-targets` |
 | C9 | `discovery.rs` names a Claude project by the slug's last `-` segment (`…-glyph3d-js` → `js`) | open | small fix |
-| C10 | Two defects attributed (detail). Defect 2 (chain) FIXED in c5ef78a, it was the instrument. Defect 1: HyperLayout vs the oracle, now measured by the `hyper-oracle` gate (red), with two more HyperLayout defects (detail) | open | fix HyperLayout clusters with a perf A/B on the M2 |
+| C10 | Two defects attributed (detail). Defect 2 (chain) FIXED in c5ef78a, it was the instrument. Defect 1 (HyperLayout's ASCII fast path never asked whether a keycap base heads a sequence) FIXED 2026-10-09 with C13: `hyper-oracle` green on four tiers (now incl. the device Pass 2, which also had its page extent drop the newline record: fixed), `cubecl-fork` green (708,529 lane words -> 0); no golden frame moved on this host; perf A/B here, M2 A/B pending | closed (M2 A/B pending) | commits on the C10 branch |
 | C12 | CubeCL's standalone cluster pass (`--cubecl-cluster-check`, bench cluster mode; NOT the repo path's fused decode_probe) misses keycap/overlap/wrap sequences and ZWJ families; fails identically at d08af8b | open | instrument-only; fix or retire the standalone pass |
-| C13 | HyperLayout ignores the item's cluster mode (leader-mode ZWJ zeroed; 29,826 records differ on the cluster corpora in leader mode) | open | fix with C10 defect 1 (same resolver) |
-| C14 | HyperLayout's host Pass 2 paginates `scroll_rows`/`page_cols` differently from the fold (instances only; recording path agrees) | open | latent for repos (they set neither); fix after C10 |
+| C13 | HyperLayout ignored the item's cluster mode (leader-mode ZWJ zeroed; 29,826 records differ on the cluster corpora in leader mode). FIXED 2026-10-09 with C10: the mode is read once per item; hyper-oracle now also runs the cluster corpora in leader mode | closed | commits on the C10 branch |
+| C14 | HyperLayout's host Pass 2 paginates `scroll_rows`/`page_cols` differently from the fold (instances only; recording path agrees). The device Pass 2 too (measured 2026-10-09, device tier). Gated alone as `hyper-oracle-paged` (red) so hyper-oracle could go green | open | latent for repos (they set neither); fix, then delete the split |
+| C15 | Device Pass 2 only: a line cut into chunks (> 64 KiB, no newline within the next 64 KiB) seeds the next chunk's segment advance as `rem * adv` (`aggregate_chunk_prepasses`), not the running f32 sum the fold and host path use: an ulp of x on `g-pick-repo/wide.txt`, 65 slots past column 65,280 [measured 2026-10-09, `--hyper-oracle-check native/fixtures/g-pick-repo`]. Also [inferred from source, no corpus has one]: a sequence split across such a cut is not clustered by the chunked passes (Pass 1, device Pass 2) while the host Pass 2 and the recording path, which walk the whole item, do cluster it, so Pass 1's survivor count can disagree with the host emission there | open | fix with a re-baseline in mind: g-pick-repo is every repo-* golden's corpus |
+| C16 | Discrete-GPU upload: an ODD total survivor count costs ~10-20 ms of backend on this host (derived, 94 MB tree: 91,417,858 slots 415-425 ms, 91,417,859 slots 430-437 ms; same at bf9a757) [measured 2026-10-09; cause not traced, the staging copy is the suspect] | open | look at the derived staging copy's size/alignment |
 | C11 | Mutation `find` strings also match their own entry in build.toml; correct only because the target comes first | open | small: anchor them, or have the prover refuse an ambiguous find |
 | P1 | pixel-ab red on both platforms since 10-07; Linux set a month stale, 2 views never adopted | Ivan's call | Mac re-baseline first, then Linux re-adoption |
 | X1 | Experiments' Zed symlink scheme never built against real Zed | next up | needs a Zed checkout or the Mac; fieldzed's dylib build.rs deleted in 6a0b669 |
@@ -271,6 +273,16 @@ the flag and its `cli/command.rs` arm.
   `repo-cluster`'s Metal golden dates from 2026-09-20 (05a5935), BEFORE
   HyperLayout, so it pins the Mojo-era cluster rendering: a Mac pixel-ab run
   of that view is an independent witness for defect 1.
+- **Fixed 2026-10-09** [measured]: defect 1 and C13 in `char_resolve.rs`
+  (the fast-table entry carries `seq_lead`, derived from the table; a
+  `seq_lead` byte looks one byte ahead only in cluster mode, and only a
+  non-ASCII successor takes the slow path; the mode is read once per item).
+  hyper-oracle gained the device Pass 2 tier, which found the device page
+  extent dropping the newline record (fixed) and C15 (open). After:
+  hyper-oracle green (C14 split out to `hyper-oracle-paged`), cubecl-fork
+  green, every golden frame byte-identical to bf9a757's renders on this host
+  (repo-cluster included: g-cluster-repo has no keycap, so that view is a
+  witness of HyperLayout's other cluster classes, not of defect 1).
 
 ### P1. Pixel baselines — [measured]
 

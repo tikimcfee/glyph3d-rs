@@ -287,39 +287,56 @@ synthetic one), and silently to the 22 fixtures outside text.rs's domain. The
 parse is checked only through the lanes computed from it: the second loader
 it was once diffed against (Mojo) is retired.
 
-**hyper-oracle** (`--hyper-oracle-check`, `native/src/hyper_oracle.rs`; new
-2026-10-09, **red**). HyperLayout — the production layout engine — against an
-oracle-backed reference: `fold::run_pipeline` (decode, sequence pass, fold,
-paginate — the form reference-port holds bit-exact to the oracle), its records
-compacted by `layout::compact_records_into` and diffed through
-`layout::diff_backends` plus a per-record tally that names the byte and both
-glyph ids. Three tiers: records (HyperLayout's recording path), instances
-(its production host Pass 2), placements. Corpus: all 26 fixtures' bytes and
-item params (each item its own buffer, as a repo file is), the IMMUTABLE
-`cubecl-fork` corpus and `g-cluster-repo` in cluster mode, and
-`overflow-leads.txt` — the out-of-range decode input no check read after
-2026-09-30. STRICT refuses zero records, zero resolved sequences, and zero
-ASCII-led sequences. **Red on arrival** (C10 in the maintenance notes): 6 of
-29 corpora differ. The keycap class — HyperLayout's ASCII fast path never asks
-whether `1` starts a sequence, so `1️⃣` lays out as `1` plus a stray mark
-(first divergence: `cluster-keycap` byte 0, fold gi 5264 vs HyperLayout gi
-18); HyperLayout ignores the item's cluster MODE (leader-mode ZWJ zeroed in
-`cluster-zwj`; under `--cluster-mode leader` 29,826 records of `cubecl-fork`
-+ `g-cluster-repo` differ, ungated); and its host Pass 2 paginates
-`scroll_rows` and `page_cols` differently from the fold (`paged-rows`,
-`paged-cols`, `scroll-only` — instances only: its recording path agrees, its
-production path does not; latent for repos, which set neither). The
-reference's own keycap behaviour is proven: `cluster-keycap.pipe.bin` (`1️⃣`
-and `1⃣` against `[0x31, 0x20E3]`) is in the corpus `--fixture-fold` clears.
+**hyper-oracle** and **hyper-oracle-paged** (`--hyper-oracle-check`,
+`native/src/hyper_oracle.rs`; new 2026-10-09; hyper-oracle **green** since
+the C10/C13 fix the same day, hyper-oracle-paged **red**, C14). HyperLayout —
+the production layout engine — against an oracle-backed reference:
+`fold::run_pipeline` (decode, sequence pass, fold, paginate — the form
+reference-port holds bit-exact to the oracle), its records compacted by
+`layout::compact_records_into` and diffed through `layout::diff_backends`
+plus a per-record tally that names the byte and both glyph ids. Four tiers:
+records (HyperLayout's recording path), host instances and placements (its
+host Pass 2, what a device-less load runs), and the DEVICE Pass 2
+(`pass2_device.rs`, what every GPU load runs) in both slot formats plus its
+placements. The device tier runs the production emitter into host memory:
+the unified, discrete and host-staging paths all hand the same
+`EmitInputs::run` a raw address of writable memory, so only where the bytes
+land is swapped. Corpus: the fixtures' bytes and item params (each item its
+own buffer, as a repo file is, in its own cluster mode), the IMMUTABLE
+`cubecl-fork` corpus, `g-cluster-repo` and `overflow-leads.txt` (the
+out-of-range decode input no check read after 2026-09-30) in cluster mode,
+then those three again in leader mode. STRICT refuses zero records, zero
+resolved sequences, and zero ASCII-led sequences; both runs refuse zero device
+slots. **The split**: the three fixtures that set `scroll_rows`/`page_cols`
+(`paged-rows`, `paged-cols`, `scroll-only`) are hyper-oracle-paged's, red
+because both Pass 2 paths paginate them unlike the fold (C14; records agree,
+instances do not; latent for repos, which set neither). A `GLOBIGNORE` in
+hyper-oracle's command is the split and nothing else; delete both when C14
+lands. **History**: red on arrival, 6 of 29 corpora. The keycap class
+(HyperLayout's ASCII fast path never asked whether `1` starts a sequence, so
+`1️⃣` laid out as `1` plus a stray mark) and the cluster MODE (ignored:
+leader-mode ZWJ zeroed in `cluster-zwj`; 29,826 records of `cubecl-fork` +
+`g-cluster-repo` under `--cluster-mode leader`) were fixed together; the
+device tier, added with the fix, then found the device Pass 2's page extent
+dropping the newline's own record (fixed too; page extents feed no pixel).
 What the two sides SHARE, and this therefore cannot see: the atlas trie
 (`TrieTable::lookup`, `fu_to_world` — the fixtures' own tries are world-unit
 and HyperLayout resolves font units, so the oracle has never seen the atlas
 trie), and `fold::{rows_for_line, wrap_segment_of, wrap_row_of}`, which
 HyperLayout borrows from the reference (reference-port fences those:
 `phantom-row` reddens it and leaves this gate's count unmoved). Also blind to
-the DEVICE Pass 2 (`pass2_device.rs`, what a GPU load runs): this drives
-HyperLayout with no device. `hyper-head-advance` is its mutation, for the day
-it is green (measured landing while red: 6 → 10 failing corpora).
+the device path past the emitter (the staging copy, buffer chunking), the
+Derived field's vertex-stage Y/Z, and the Pass 1 prefetch. Mutations:
+`hyper-head-advance`, `hyper-keycap-lookahead-dropped`,
+`hyper-leader-mode-ignored`, and two only the device tier can see,
+`hyper-device-leader-mode-ignored` and `hyper-device-newline-page`.
+Measured but ungated (2026-10-09): a 94 MB tree of crates.io sources is
+bit-exact on every tier in both modes (99 M records); `g-pick-repo` is not,
+on the device tier only — 65 slots of `wide.txt`'s 213 KB line differ in x by
+an ulp past column 65,280, where the line is cut into chunks and Pass 1's
+aggregate seeds the chunk's segment advance by multiplication rather than
+the running sum (`aggregate_chunk_prepasses`). That frame is a golden, so it
+is left for its own change.
 
 **repo-verify** and **repo-verify-direct** (`--repo-verify`, re-gated
 2026-10-09). `--repo-engine hyper` and `direct` over `g-pick-repo`, both wrap
@@ -340,7 +357,7 @@ measured 2026-10-09), and nothing separates `direct` from its reference
 without a device.
 
 **cubecl-chain** and **cubecl-fork** (`tools/check-cubecl.sh chain|fork`,
-re-gated 2026-10-09; chain **green**, fork **red**). The chain against the CPU scan reference
+re-gated 2026-10-09; both **green** since the HyperLayout C10 fix). The chain against the CPU scan reference
 (`scan.rs`) over five fixtures — counts/rows exact, fold>0 X bit-exact,
 positions at the eps tier, emitted records tier-diffed; and the full
 from-bytes chain against HyperLayout over the IMMUTABLE `cubecl-fork` corpus
@@ -350,14 +367,13 @@ exercised. Both were red when re-gated (C10). The chain's `cluster-flags`
 failure (since 26595fb, 2026-10-06, bisected) was the INSTRUMENT: that commit
 moved "committed cluster head" into a device-only flag this driver never
 uploaded; fixed in c5ef78a, and `emitter-ordinal-zeroed` proves the gate. The
-fork fails since
-HyperLayout became its reference (2026-09-30) — and hyper-oracle shows that
-reference is itself wrong on this corpus's keycaps, so a green fork would
-mean the chain agrees with HyperLayout, not with the oracle. Their mutations
-cannot be proven while red (prove refuses an already-red gate); each restored
-one was instead checked BY HAND to move its gate's counts (the landing
-question), and the ones whose targets moved, or whose edits left the counts
-unchanged, were not restored. The script's second fork pass sets
+fork failed from the day HyperLayout became its reference (2026-09-30) to
+the HyperLayout keycap fix (2026-10-09: 314,405 of 314,686 slots, 708,529
+lane words, then 0): the chain had the keycaps right and HyperLayout did not,
+which hyper-oracle (oracle-backed) established before the fix, so this green
+is now agreement with the oracle at one remove. The fork still has NO
+mutation (all the 2026-09-30 targets left its counts unchanged when checked
+by hand while red), so it is uncovered in prove. The script's second fork pass sets
 `GLYPH_RECORD_CHUNK`, which nothing has read since the records-mode
 retirement (d46a6c3): it repeats the first pass.
 
@@ -491,10 +507,11 @@ engine to itself is a determinism check: say so in its `blind_to`.
 Worth holding in one place, because each check's blind spot is defensible alone
 and the union is not:
 
-- **The device Pass 2.** hyper-oracle and repo-verify drive HyperLayout with
-  no GPU, so the emission a real load runs (`layout_hyper/pass2_device.rs`,
-  mapped or staged slots) is compared to the host emission by unit tests and
-  to the oracle by nothing but pixels.
+- **The device path past the emitter.** Since 2026-10-09 hyper-oracle runs
+  the device Pass 2 (`layout_hyper/pass2_device.rs`) into host memory and
+  holds it to the oracle; what happens to those bytes afterwards (the
+  staging copy into VRAM, the buffer chunking, the Derived vertex stage's
+  Y/Z) is seen by pixels alone.
 - **The atlas trie's VALUES.** Every oracle comparison runs on the fixtures'
   synthetic tries; hyper-oracle runs both sides on the atlas trie, so a wrong
   advance in `codepoints.bin` moves both sides together.
