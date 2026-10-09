@@ -5,14 +5,13 @@
 #
 #   RE-MEASURED 2026-09-06 after the workspace move, and the answer changed:
 #   the default copy-to-scratch strategy NOW WORKS. Baseline built and tested
-#   cleanly (39s build + 9s test), 15 mutants over layout_mojo.rs in 3m —
+#   cleanly (39s build + 9s test), 15 mutants over one layout file in 3m —
 #   2 missed, 9 caught, 4 unviable, the same counts the old --in-place run
 #   produced.
 #
 #   The previous finding was true of the previous layout: the cargo root was
-#   native/, so a copy took only native/ and lost ../engine, ../assets and
-#   ../.pixi, which build.rs asserts and several files reach through
-#   CARGO_MANIFEST_DIR. The root is now the repo root, so the copy contains
+#   native/, so a copy took only native/ and lost ../engine and ../assets,
+#   which several files reach through CARGO_MANIFEST_DIR. The root is now the repo root, so the copy contains
 #   everything. That evaluation had recommended AGAINST the workspace; the
 #   workspace landed for other reasons and removed the objection as a side
 #   effect.
@@ -43,9 +42,11 @@
 #   serial, unparallelisable under --in-place) to ~270 (~45 min) and leaves a
 #   survivor list small enough to triage by hand.
 exclude_globs = [
-  # Covered by the reference-port / repo-verify gates, which cargo test never runs.
+  # Covered by the --fixture-* and --repo-verify instruments, which cargo test
+  # never runs. Their gates were retired 2026-09-30 and nothing runs them now
+  # (AGENTS.md, "Retired"); re-gating them makes this exclusion honest again.
   "src/fold.rs", "src/scan.rs", "src/bake.rs", "src/fixture.rs", "src/text.rs",
-  "src/glyph_trie.rs", "src/engine.rs", "src/layout_mojo.rs",
+  "src/glyph_trie.rs",
   # Zero #[test] in these; only the four-view pixel A/B sees them.
   # Measured 100% survival — pure noise.
   "src/glyph_scene.rs", "src/windowed.rs", "src/offscreen.rs",

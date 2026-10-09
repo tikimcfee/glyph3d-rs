@@ -174,14 +174,15 @@ file. Blind to whether the declared inputs are the RIGHT ones: it proves a
 pattern matches something, never that it matches everything that matters.
 
 **committed-artifacts.** One mechanism per generator, all driven from
-build.toml: generator-native check modes for the emoji sheet
-(`gen_emoji_sheet.py --check`), the cluster class table (`gen_cluster_table.py
---check`) and the emoji demo corpus (`gen_emoji_corpus.py --check`); the trie
-uses `gen_real_trie.py --verify-only`; the four atlas bins are rebuilt by
-`export-atlas.mjs` into a scratch dir and `cmp`'d. The schema's generated
-`engine/glyph_schema.mjs` is NOT among them: build.toml declares no artifact
-for it (measured 2026-10-09), so only the fixture rebuild sees it, and only
-through what the generators read. Red when a generated
+build.toml: generator-native check modes for the schema (`gen_schema.py
+--check`, which also runs the schema's own invariant validation), the emoji
+sheet (`gen_emoji_sheet.py --check`), the cluster class table
+(`gen_cluster_table.py --check`) and the emoji demo corpus
+(`gen_emoji_corpus.py --check`); the trie uses `gen_real_trie.py
+--verify-only`; the four atlas bins are rebuilt by `export-atlas.mjs` into a
+scratch dir and `cmp`'d. (The schema was ungated from the engine's retirement
+until 2026-10-09: its generator still emitted a half for the retired engine,
+so `--check` was red and no artifact declared it.) Red when a generated
 artifact is hand-edited, or a generator changes behaviour. Blind to
 whether the *inputs* are right: the trie check proves `engine-trie.bin` is a
 faithful derivation of `codepoints.bin`/`glyphs.bin`, not that those are correct.
