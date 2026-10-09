@@ -86,6 +86,10 @@ None pushed or merged to main; that is Ivan's call.
 | c5ef78a | CubeCL chain check fixed (26595fb broke the instrument, not production) |
 | 0336e85..5257df9 | five checks re-gated + hyper-oracle (helper agent); 15 gates, floor 240 |
 | 50c7085 | cubecl-chain green, mutation proven |
+| e59e4a6, f966e65, c8bc75d..e1d8690 | C16 odd-count upload; R4/R5 runner (prove re-stales, workspace-scope product); C14 pagination, C15 chunk cuts |
+| e20cb81..7a556fd | C17: colourisers agree, cut lines coloured whole, hyper-oracle paint tier + chunk-cut-paint.txt |
+| 21f9aef, d4cb1a4 | both golden sets re-adopted with every moved pixel attributed (P1) |
+| d6e060d | merged main@3a6f65f (settings defaults + overrides, ground environment, transcript fixes): battery ALL GATES GREEN 15/15, pixel-ab byte-equal on vulkan-nvidia and metal-apple |
 
 Main's build fix (872621d, the other agent's) was fast-forwarded in first.
 
