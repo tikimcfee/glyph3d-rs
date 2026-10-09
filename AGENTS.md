@@ -82,7 +82,7 @@ or mutation survival.
 ```sh
 cargo glyph build          bring the binary and the engine dylib up to date
 cargo glyph test           run everything; nonzero if anything is wrong
-cargo glyph test engine    only what you changed: engine | rust | render | corpus
+cargo glyph test rust      only what you changed: rust | render | corpus
 cargo glyph test --frozen  assert currency instead of building it
 cargo glyph run --demo     launch the renderer; arguments pass through
 ```
@@ -101,11 +101,13 @@ to hold for you, and getting it wrong is how a stale dylib made a check test the
 previous engine for a day. `pixi run check` and `tools/check-all.sh` still work;
 both are thin doors onto `cargo glyph test`.
 
-- **Scope is an argument, not a verb.** `glyph test engine` after touching Mojo
-  is ~25s against ~55s for the lot. The scopes answer "I changed X, what should
-  I run": `engine` (engine/*.mojo, the FFI), `rust` (native/src), `render`
-  (layout, shaders, anything that moves a pixel), `corpus` (fixtures,
-  generators, vendored inputs).
+- **Scope is an argument, not a verb.** The scopes answer "I changed X, what
+  should I run": `rust` (native/, crates/, glyph/), `render` (layout, shaders,
+  anything that moves a pixel), `corpus` (fixtures, generators, vendored
+  inputs). Every verdict line says how many gates ran ("4 of 9 gates ran,
+  scope rust"), and a selection of ZERO gates is refused as `CHECK-ALL:
+  NOTHING RAN`, never green: the `engine` scope outlived the Mojo engine and
+  printed ALL GATES GREEN over nothing until it was removed (2026-10-09).
 - **`test` builds; `--frozen` refuses to.** Building is the iterating intent,
   and necessary because `cargo build` does not build the Mojo dylib. `--frozen`
   is the validating intent: if something is stale, that IS the finding, and a

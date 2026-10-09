@@ -11,7 +11,7 @@ build:
 check:
 	cargo glyph test
 
-# Only what you changed: engine | rust | render | corpus
+# Only what you changed: rust | render | corpus
 check-scoped scope:
 	cargo glyph test {{scope}}
 

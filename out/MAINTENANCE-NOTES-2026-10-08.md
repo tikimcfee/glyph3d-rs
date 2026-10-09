@@ -22,7 +22,7 @@ machines and clones, **M** machine-specific values, **R** runner.
 |---|---|---|---|
 | D1 | Root AGENTS.md documents 16 gates, build.toml has 9; dead read-next links; Mojo/dylib prose | open | rewrite against build.toml; takes C6, R2 with it |
 | D2 | `cargo glyph` alias doubles inside `.claude/worktrees/` | open | pick a fix option (below) |
-| D3 | `cargo glyph test engine` matches zero gates, prints ALL GATES GREEN | open | refuse an empty gate set + mutation; drop the scope |
+| D3 | `cargo glyph test engine` matched zero gates, printed ALL GATES GREEN | closed | 5860d3c: refused as NOTHING RAN; every verdict counts gates; `engine` scope gone |
 | D4 | `.agents/rules/rust-engineering.md` claims the tree does not back | open | short pass, with D1 |
 | D5 | `pixi.toml` tasks for a Mojo engine that no longer exists | open | retire or trim to fontTools |
 | D6 | Orphaned scripts and configs (check-cubecl.sh, fixture-parity, mutants.toml, deny.toml) | open | decide each; re-gating cubecl is the honest choice |
@@ -61,6 +61,7 @@ None pushed or merged to main; that is Ivan's call.
 | 9351a8d | experiments reach Zed through the `experiments/zed` symlink |
 | f864183 | session discovery defaults to each app's locations (`crates/glyph-session-dirs`); Kimi Code parser |
 | dc6a00f | renderer currency hashes root manifest and lockfile; `validate()` refuses dead literal inputs |
+| 5860d3c | `glyph test` refuses an empty gate selection (NOTHING RAN); verdicts count gates; `engine` scope removed |
 
 Main's build fix (872621d, the other agent's) was fast-forwarded in first.
 
@@ -74,13 +75,12 @@ export GLYPH_FLAGSHIP_REPO=~/localdev/viz-web/glyph3d-js
 
 ## Suggested order for what is open
 
-1. D3: refuse an empty gate set (small, has a mutation, closes a vacuous green).
-2. D1 + R2 + C6 + D4: the doc rewrite, one series; the files cross-reference.
-3. D5, D6: tooling decisions, one commit per contested decision.
-4. D7: move handoffs.
-5. C2 + C3 + C4: cubecl cleanup. Output-neutral; re-gating cubecl (D6) gives it a proof.
-6. C5: delete the spike.
-7. C1: hoist the field machinery. Largest; wants a fresh battery.
+1. D1 + R2 + C6 + D4: the doc rewrite, one series; the files cross-reference.
+2. D5, D6: tooling decisions, one commit per contested decision.
+3. D7: move handoffs.
+4. C2 + C3 + C4: cubecl cleanup. Output-neutral; re-gating cubecl (D6) gives it a proof.
+5. C5: delete the spike.
+6. C1: hoist the field machinery. Largest; wants a fresh battery.
 
 X1, X2 and P1 are for discussion; C8, C9, X3 fit anywhere.
 
@@ -136,15 +136,6 @@ The tool takes `run` as its verb and launches the renderer, which rejects
 expanded command; (c) the tool strips a repeated alias prefix from argv.
 (a)+(b) recommended. Claude Code's own worktrees live under `.claude/worktrees/`,
 so (a) only helps human-made ones; weigh (c) for that reason.
-
-### D3. `test engine` is a vacuous green — [inferred from source]
-
-`Scope::Engine` (`glyph/src/main.rs:109`) survives; build.toml scopes gates
-`corpus`, `render`, `rust`, none `engine`. `cmd_test` filters by scope and
-prints `CHECK-ALL: ALL GATES GREEN` over an empty set. Make `cmd_test` refuse
-an empty gate set (with a mutation), and drop the scope and its mentions
-(help text, justfile comment, `tools/check-all.sh` header). Run it first to
-promote this to [measured].
 
 ### D4. rust-engineering.md — [measured]
 
