@@ -316,9 +316,11 @@ land is swapped. Corpus: the 26 pipe fixtures' bytes and item params (each item
 its own buffer, as a repo file is, in its own cluster mode; `paged-rows`,
 `paged-cols` and `scroll-only` carry the `page_rows`/`page_cols`/`scroll_rows`
 classes), the IMMUTABLE
-`cubecl-fork` corpus, `g-cluster-repo` and `overflow-leads.txt` (the
-out-of-range decode input no check read after 2026-09-30) in cluster mode,
-then those three again in leader mode. STRICT refuses zero records, zero
+`cubecl-fork` corpus, `g-cluster-repo`, `overflow-leads.txt` (the
+out-of-range decode input no check read after 2026-09-30), `g-pick-repo`
+(every repo golden's corpus; `wide.txt` is cut inside its long line) and the
+IMMUTABLE `chunk-cut.txt` (built for the intra-line cut classes, below) in
+cluster mode, then those five again in leader mode. STRICT refuses zero records, zero
 resolved sequences, and zero ASCII-led sequences; both runs refuse zero device
 slots. **History**: red on arrival, 6 of 29 corpora. The keycap class
 (HyperLayout's ASCII fast path never asked whether `1` starts a sequence, so
@@ -354,13 +356,29 @@ device tier can see, `hyper-device-leader-mode-ignored`,
 `hyper-device-newline-page` and `hyper-device-x-page-dropped`; on cargo-test,
 `hyper-device-page-cols-run` and `hyper-pass1-stride-after-advance` (the two
 classes above).
-Measured but ungated (2026-10-09): a 94 MB tree of crates.io sources is
-bit-exact on every tier in both modes (99 M records); `g-pick-repo` is not,
-on the device tier only — 65 slots of `wide.txt`'s 213 KB line differ in x by
-an ulp past column 65,280, where the line is cut into chunks and Pass 1's
-aggregate seeds the chunk's segment advance by multiplication rather than
-the running sum (`aggregate_chunk_prepasses`). That frame is a golden, so it
-is left for its own change.
+**Intra-line chunk cuts (C15, fixed 2026-10-09).** A line with no newline
+within 64 KiB of the chunk threshold is cut INSIDE the line, and the chunk
+after the cut inherits the line's column and advances. Two defects lived
+there, both found and re-derived on this gate's device tier: the inherited
+segment advance was a product (`(col % fold_unit) * ascii_adv`), not the
+fold's running f32 sum (65 slots of `g-pick-repo/wide.txt` an ulp off), and
+the cut fell on any codepoint boundary, so a sequence across it was resolved
+in two halves by the chunked passes (the device emitted the pieces; Pass 1's
+survivor count outran the host emission). Now a cut lands only before an
+ASCII byte (the atlas asserts no sequence has an ASCII member after its
+first), the seed is the running sum, and Pass 1 measures a continued line's
+width with its true seed wherever the page stride reaches an output.
+`chunk-cut.txt` carries a sequence across each of its three 64 KiB targets,
+non-ASCII advances before each cut, and continuations wider than any ASCII
+segment past the first page; mutations `hyper-chunk-seed-product`,
+`hyper-chunk-cut-splits-sequences` and `hyper-continued-line-unmeasured`.
+Moving `wide.txt`'s fourth cut (off a 0xE2 byte) changed 11 px each of
+`repo-down` and `repo-back-oblique` on this host, and that is PAINT, not layout:
+the device Pass 2 restarts its syntax colorizer at every intra-line cut,
+which the whole-item colorizer does not (596 of `wide.txt`'s glyphs disagree
+before the move, 578 after). Every item is flat in this gate, so that class is
+not under test here. Measured but ungated (2026-10-09): a 94 MB tree of
+crates.io sources is bit-exact on every tier in both modes (99 M records).
 
 **repo-verify** and **repo-verify-direct** (`--repo-verify`, re-gated
 2026-10-09). `--repo-engine hyper` and `direct` over `g-pick-repo`, both wrap
@@ -375,10 +393,11 @@ prefetch of Pass 1, and for `direct` not at all, so these catch
 nondeterminism in the parallel passes and prefetch drift — truth is
 hyper-oracle's job. `batch`/`naive` are not gated: they run the reference's
 own code path verbatim. Both gates are UNCOVERED in prove, and that is the
-finding, not an omission: the prefetch path differs from the inline one only
-in a segment-advance table g-pick-repo never reads (doubling it stayed green,
-measured 2026-10-09), and nothing separates `direct` from its reference
-without a device.
+finding, not an omission: since C15 the prefetch and the inline Pass 1 are
+one driver (`pass1_over_chunks`) and differ only in how the chunk list is
+built (before it, only in a segment-advance table g-pick-repo never read:
+doubling it stayed green, measured 2026-10-09), and nothing separates
+`direct` from its reference without a device.
 
 **cubecl-chain** and **cubecl-fork** (`tools/check-cubecl.sh chain|fork`,
 re-gated 2026-10-09; both **green** since the HyperLayout C10 fix). The chain against the CPU scan reference
@@ -608,6 +627,7 @@ the serial-fold-versus-scan comparison green, because both forms call
 | `native/fixtures/baseline-view.txt` | IMMUTABLE | it is the input to `text.png`; editing it re-baselines that check silently |
 | `native/fixtures/emoji-view.txt` | IMMUTABLE | the input to `emoji.png`, one line per class of bitmap slot the trie carries; same reason |
 | `native/fixtures/g-pick-repo/empty.rs` | IMMUTABLE, zero bytes | the only input that reaches the page-extent origin seed; deleting it removes a check's ability to see its subject without removing the check |
+| `native/fixtures/chunk-cut.txt` | IMMUTABLE | hyper-oracle's only input built for the intra-line chunk-cut classes (C15): a sequence across each 64 KiB cut target, non-ASCII advances before each cut, a continuation wider than every ASCII row past the first page. Its cut positions are planned against the 64 KiB threshold and the cut rule, so changing either (or the file) can move a target off its sequence and silently weaken the gate — re-check that each mutation in its `why` still reddens |
 | `native/fixtures/cubecl-fork/` | IMMUTABLE | the retired cubecl-fork check's standing corpus — the only committed input exercising paginate's m >= 3 / segment >= 3 classes, the cluster classes at wrap/page boundaries, and the empty-item placement class (`clusters.txt` + `empty.txt`); kept for re-gating. Editing it re-hollows that check silently |
 | `out/tooling-ab/baseline/<key>/` | tracked pixel oracle, one set per rasterizer; **golden** in build.toml | changes only on purpose, with a note saying why; the runner refuses to regenerate it. A new host adopts its own set by hand (the gate prints how); it never edits another's |
 | `integration/egui/` | vendored reference | never compiled; the real dependency is from crates.io |

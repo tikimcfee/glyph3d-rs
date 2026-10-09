@@ -152,6 +152,7 @@ Detailed technical audit lives in `research/desktop-platform-audit.md`. Key touc
 - **Cache Sizing & Chunk Threshold (`native/src/layout_hyper/chunk.rs`)**:
   - `CHUNK_THRESHOLD_BYTES = 64 * 1024` (64 KiB) is tuned for Apple Silicon M-series L1 Data Cache (128 KiB per P-core).
   - Desktop x86_64 (AMD Zen 3/4/5, Intel Raptor Lake) has **32 KiB or 48 KiB L1D** per core. A 64 KiB chunk spills to L2. On desktop, testing 32 KiB or 16 KiB thresholds can keep chunks 100% L1D-resident.
+  - A line with no newline near the threshold is cut INSIDE the line, and only before an ASCII byte (C15): no cluster sequence has an ASCII member after its first (asserted at atlas load), so every chunk resolves as the whole item does. The chunk after such a cut inherits the line's column, line advance and segment advance from Pass 1's aggregation, which computes the segment advance as the fold's running f32 sum. Changing the threshold moves `native/fixtures/chunk-cut.txt`'s cuts off the sequences it plants: re-prove its mutations.
 - **Cache Lines & Burst Stores (`native/src/layout_hyper/pass2_device.rs`)**:
   - `emit_burst8` writes 8 `DerivedSlot`s (160 B) or 4 `RenderSlot`s (128 B). Standard x86_64 cache line width is 64 B (Apple M2 SLC/L2 is 128 B).
 - **Copy sizes (`crates/glyph-field/src/copy.rs`, C16, measured 2026-10-09 on an RTX 5090)**:

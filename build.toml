@@ -327,6 +327,9 @@ blind_to = "HyperLayout and CubeCL entirely — these are fold.rs/scan.rs/bake.r
 # scroll_rows / page_cols were split out to a red `hyper-oracle-paged` gate
 # while C14 (both Pass 2 paths paginated them unlike the fold) was open; C14
 # is fixed (dd6fe01) and they are back here, with the paged gate deleted.
+# g-pick-repo (every repo golden's corpus: wide.txt is cut inside its long
+# line) and chunk-cut.txt (built for the intra-line cut classes, C15) joined
+# both runs with the C15 fix (c35770e).
 # The second invocation is the leader-mode run (C13's volume class): the same
 # corpora with every item in leader mode, so a mode that leaks is red on
 # 319,628 records rather than the 12 of cluster-zwj's leader item.
@@ -334,11 +337,11 @@ blind_to = "HyperLayout and CubeCL entirely — these are fold.rs/scan.rs/bake.r
 name = "hyper-oracle"
 scope = "render"
 kind = "cmd"
-cmd = "GLYPH_TRACE=warn target/release/glyph3d-native --hyper-oracle-check native/fixtures/cubecl-fork native/fixtures/g-cluster-repo native/fixtures/overflow-leads.txt --cluster-mode leader && GLYPH_TRACE=warn GLYPH_HYPER_ORACLE_STRICT=1 target/release/glyph3d-native --hyper-oracle-check engine/fixtures/*.pipe.bin native/fixtures/cubecl-fork native/fixtures/g-cluster-repo native/fixtures/overflow-leads.txt"
+cmd = "GLYPH_TRACE=warn target/release/glyph3d-native --hyper-oracle-check native/fixtures/cubecl-fork native/fixtures/g-cluster-repo native/fixtures/overflow-leads.txt native/fixtures/g-pick-repo native/fixtures/chunk-cut.txt --cluster-mode leader && GLYPH_TRACE=warn GLYPH_HYPER_ORACLE_STRICT=1 target/release/glyph3d-native --hyper-oracle-check engine/fixtures/*.pipe.bin native/fixtures/cubecl-fork native/fixtures/g-cluster-repo native/fixtures/overflow-leads.txt native/fixtures/g-pick-repo native/fixtures/chunk-cut.txt"
 pass_line = "hyper-oracle PASS"
 needs = ["renderer", "fixtures"]
-compare = "HyperLayout vs fold.rs's records compacted by layout::compact_records_into, bit-exact, through layout::diff_backends plus a per-record tally naming the byte, on FOUR tiers: records (its recording path, rederive.rs), host instances and placements (pass2_host.rs, a device-less load), and the DEVICE Pass 2 (pass2_device.rs, what every GPU load runs) run into host memory in both slot formats — RenderSlot byte-for-byte, DerivedSlot on every lane it carries — plus its placements. Corpora: the 26 pipe fixtures (each item its own buffer, its own cluster mode; paged-rows, paged-cols and scroll-only carry the page_rows / page_cols / scroll_rows classes), the IMMUTABLE cubecl-fork corpus, g-cluster-repo and overflow-leads.txt in cluster mode, then those three again in leader mode. 2026-10-09: 475,234 records / 468,283 instances / 468,283 device slots x2 / 40 placements in the first run (386 sequence heads, 35 ASCII-led); 320,012 records / 315,927 instances and device slots x2 / 7 placements in the leader run. STRICT (first run) refuses zero records, zero sequence heads, or zero ASCII-led heads; both runs refuse zero device slots"
-blind_to = "Shared with the reference and so invisible here: the atlas trie (TrieTable::lookup, fu_to_world — the fixtures' own tries are world-unit and HyperLayout resolves font units) and fold::{rows_for_line, wrap_segment_of, wrap_row_of}, which HyperLayout borrows (reference-port fences those; phantom-row is the measured example). The device path past the emitter (the staging copy into VRAM, buffer chunking), the Derived field's vertex-stage Y/Z (the slot carries none), and the background Pass 1 prefetch (repo-verify holds it to the inline Pass 1 used here). A sequence split across an intra-line chunk cut (a line > 64 KiB with no newline in the next 64 KiB) — no corpus here has one"
+compare = "HyperLayout vs fold.rs's records compacted by layout::compact_records_into, bit-exact, through layout::diff_backends plus a per-record tally naming the byte, on FOUR tiers: records (its recording path, rederive.rs), host instances and placements (pass2_host.rs, a device-less load), and the DEVICE Pass 2 (pass2_device.rs, what every GPU load runs) run into host memory in both slot formats — RenderSlot byte-for-byte, DerivedSlot on every lane it carries — plus its placements. Corpora: the 26 pipe fixtures (each item its own buffer, its own cluster mode; paged-rows, paged-cols and scroll-only carry the page_rows / page_cols / scroll_rows classes), the IMMUTABLE cubecl-fork corpus, g-cluster-repo, overflow-leads.txt, g-pick-repo and the IMMUTABLE chunk-cut.txt (lines cut inside into chunks: a sequence across each 64 KiB target, non-ASCII advances before each cut, a continuation wider than any ASCII segment past the first page) in cluster mode, then those five again in leader mode. 2026-10-09: 1,143,155 records / 1,135,697 instances / 1,135,697 device slots x2 / 46 placements in the first run (389 sequence heads, 36 ASCII-led); 987,933 records / 983,348 instances and device slots x2 / 13 placements in the leader run. STRICT (first run) refuses zero records, zero sequence heads, or zero ASCII-led heads; both runs refuse zero device slots"
+blind_to = "Shared with the reference and so invisible here: the atlas trie (TrieTable::lookup, fu_to_world — the fixtures' own tries are world-unit and HyperLayout resolves font units) and fold::{rows_for_line, wrap_segment_of, wrap_row_of}, which HyperLayout borrows (reference-port fences those; phantom-row is the measured example). The device path past the emitter (the staging copy into VRAM, buffer chunking), the Derived field's vertex-stage Y/Z (the slot carries none), and the background Pass 1 prefetch (repo-verify holds it to the inline Pass 1 used here; since C15 both share one Pass 1 driver). Paint: every item is flat on both sides, so the device path's per-chunk syntax colouring (which restarts at an intra-line cut, unlike the whole-item colorizer) is not under test"
 
 # HyperLayout against itself. EVERY --repo-engine but cubecl constructs the
 # same HyperLayout (layout.rs's backend table), so this is not an independent
@@ -355,7 +358,7 @@ cmd = "--load-repo fixtures/g-pick-repo --wrap-mode {mode} --repo-engine hyper -
 modes = ["down", "back"]
 needs = ["renderer"]
 compare = "`hyper` (prefetched Pass 1, recording) vs a fresh non-prefetched HyperLayout recording: placements, instances and 32 B records bit-exact over g-pick-repo (5 items, 407,133 instances, 407,451 records), both wrap modes; refuses zero items or instances"
-blind_to = "any fault in HyperLayout itself — both sides are HyperLayout (hyper-oracle is the oracle check). `batch`/`naive` are not gated: they run the reference's own code path verbatim. No mutation reddens this on this corpus: the prefetch path differs from the inline one only in a segment-advance table g-pick-repo never reads (measured 2026-10-09: doubling it stayed green), so it is UNCOVERED in prove, honestly"
+blind_to = "any fault in HyperLayout itself — both sides are HyperLayout (hyper-oracle is the oracle check). `batch`/`naive` are not gated: they run the reference's own code path verbatim. No mutation reddens this on this corpus: since C15 the prefetch and inline Pass 1 are one driver (pass1_over_chunks) differing only in how the chunk list is built (before it, only in a segment-advance table g-pick-repo never read: doubling it stayed green, measured 2026-10-09), so it is UNCOVERED in prove, honestly"
 
 # `direct`: the non-recording call against the recording one. Same engine,
 # same host path under --repo-scan-only, so records are not compared (direct
@@ -790,6 +793,44 @@ with = '''    } else if l > 0 {
         l
     } else {'''
 expect = "pagination_agrees_on_every_tier"
+
+[[mutation]]
+name = "hyper-chunk-seed-product"
+gate = "hyper-oracle"
+why = "C15 put back: a continuation chunk's segment advance is seeded as (col % fold_unit) * ascii_adv, a product, not the fold's running f32 sum, so its first partial segment sits an ulp (or, after non-ASCII advances, much more) off. Only the device Pass 2 reads the seed: the host Pass 2 walks the whole item. CONSUMED BY: continued_segment_advance, the seed of every chunk after an intra-line cut on a wrapped item; reached by g-pick-repo/wide.txt (65 slots, the original finding) and chunk-cut.txt (non-ASCII before each cut)"
+file = "native/src/layout_hyper.rs"
+op = "replace"
+find = """    if c_end % fold_unit == 0 {
+        return 0.0;
+    }"""
+with = """    if c_end > c0 {
+        let _ = (seg_in, bytes, trie, bitmap_adv, cluster);
+        return (c_end % fold_unit) as f32 * fu_to_world(1229, em_height_fu);
+    }"""
+expect = "hyper-oracle FAIL"
+rebuild = "cargo build --release"
+
+[[mutation]]
+name = "hyper-chunk-cut-splits-sequences"
+gate = "hyper-oracle"
+why = "C15's other half put back: a line is cut at the first codepoint boundary at or after the 64 KiB target, not before an ASCII byte, so a sequence straddling the target is resolved in two halves by the chunked passes (Pass 1 counts, the device Pass 2 emits) while the host Pass 2 resolves it whole. CONSUMED BY: slice_byte_buffers_into_chunk_defs's intra-line cut; reached by chunk-cut.txt, which puts a ZWJ family, a keycap and a flag across its three targets"
+file = "native/src/layout_hyper/chunk.rs"
+op = "replace"
+find = "None => match bytes[target_offset..].iter().position(|&b| b < 0x80) {"
+with = "None => match bytes[target_offset..].iter().position(|&b| (b & 0xC0) != 0x80) {"
+expect = "hyper-oracle FAIL"
+rebuild = "cargo build --release"
+
+[[mutation]]
+name = "hyper-continued-line-unmeasured"
+gate = "hyper-oracle"
+why = "Pass 1's widest x skips the continuation of a line cut into chunks (the portion the per-chunk walk cannot measure), so the page stride misses a continuation wider than every other row and every glyph on a later page column shifts. CONSUMED BY: measure_continued_lines, for items whose stride reaches an output; reached by chunk-cut.txt, whose long line sits past row 128 with a 70-emoji segment in each continuation"
+file = "native/src/layout_hyper.rs"
+op = "replace"
+find = "    if wanted.is_empty() {\n        return;\n    }"
+with = "    if !wanted.is_empty() {\n        return;\n    }"
+expect = "hyper-oracle FAIL"
+rebuild = "cargo build --release"
 
 [[mutation]]
 name = "emitter-ordinal-zeroed"
