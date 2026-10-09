@@ -4,7 +4,7 @@ use std::ops::Range;
 
 use glyph_field::{
     shared_bind_group_entries, FieldResources, FieldTargets, GlyphField, GlyphFieldMode,
-    GlyphPlacement, ItemParamsGpu, SlotChunk, SlotSource, BINDING_SLOTS,
+    GlyphPlacement, ItemParamsGpu, SlotChunk, SlotSource, SlotStorage, BINDING_SLOTS,
 };
 use wgpu::util::DeviceExt;
 
@@ -12,9 +12,8 @@ use crate::pipeline::{
     build_glyph_bgl, build_glyph_pipeline, build_mask_pipeline, BINDING_GLYPH_ADVANCES,
     BINDING_ITEM_TABLE,
 };
-use crate::slot::{DerivedSlot, COLOR_OFFSET, SLOT_BYTES};
-use crate::storage::DerivedSlotStorage;
-use crate::upload::upload_derived_slots;
+use crate::slot::{DerivedSlot, COLOR_OFFSET, ITEM_AND_GROUP_OFFSET, SLOT_BYTES, X_OFFSET};
+use crate::upload::{DerivedTranscode, LABELS};
 
 /// The Derived glyph field: compact 20 B slots per glyph, Y/Z derived from line tables.
 pub struct DerivedField {
@@ -24,7 +23,7 @@ pub struct DerivedField {
     quad_index_buffer: wgpu::Buffer,
     _item_table_buffer: wgpu::Buffer,
     bind_groups: Vec<wgpu::BindGroup>,
-    storage: DerivedSlotStorage,
+    storage: SlotStorage<DerivedSlot>,
 }
 
 impl DerivedField {
@@ -42,25 +41,11 @@ impl DerivedField {
             resources.item_params
         };
 
-        let storage = match source {
-            SlotSource::Device { chunk_capacity, chunks, mapped_base, glyph_count, .. } => {
-                // A device source for this field is the producer's direct
-                // Derived emission (HyperLayout Pass 2): 20 B slots whose
-                // `line_idx` already indexes this table. No upload, no
-                // transcode — bind as-is.
-                DerivedSlotStorage::new(chunks.to_vec(), chunk_capacity, glyph_count, mapped_base)
-            }
-            SlotSource::Host { slices, glyph_count, direct_host_upload } => {
-                let upload = upload_derived_slots(device, queue, &slices, glyph_count, direct_host_upload, item_params);
-                let chunks = upload
-                    .buffers
-                    .into_iter()
-                    .zip(upload.chunk_counts.iter())
-                    .map(|(buffer, &slots)| SlotChunk { buffer, offset: 0, slots })
-                    .collect();
-                DerivedSlotStorage::new(chunks, upload.chunk_capacity, glyph_count, None)
-            }
-        };
+        // A device source for this field is the producer's direct Derived
+        // emission (HyperLayout Pass 2): 20 B slots whose `line_idx` already
+        // indexes this table, bound as-is. A host source transcodes against
+        // the same table.
+        let storage = SlotStorage::from_source(device, queue, source, &DerivedTranscode { item_params }, &LABELS);
 
         let quad_index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("derived quad index buffer"),
@@ -77,7 +62,7 @@ impl DerivedField {
         let bind_groups = build_chunk_bind_groups(
             device,
             &bgl,
-            &storage.chunks,
+            storage.chunks(),
             resources,
             &item_table_buffer,
         );
@@ -152,11 +137,11 @@ impl GlyphField for DerivedField {
     }
 
     fn glyph_count(&self) -> u32 {
-        self.storage.glyph_count
+        self.storage.glyph_count()
     }
 
     fn chunk_capacity(&self) -> u32 {
-        self.storage.chunk_capacity
+        self.storage.chunk_capacity()
     }
 
     fn slot_bytes(&self) -> u32 {
@@ -164,7 +149,7 @@ impl GlyphField for DerivedField {
     }
 
     fn chunk_glyph_counts(&self) -> &[u32] {
-        &self.storage.chunk_counts
+        self.storage.chunk_counts()
     }
 
     fn glyph_pipeline(&self) -> &wgpu::RenderPipeline {
@@ -197,7 +182,7 @@ impl GlyphField for DerivedField {
     }
 
     fn write_position(&self, queue: &wgpu::Queue, slot: u32, position: [f32; 3]) {
-        self.storage.write_x(queue, slot, position[0]);
+        self.storage.write_field(queue, slot, X_OFFSET, bytemuck::bytes_of(&position[0]));
     }
 
     fn write_extent(&self, _queue: &wgpu::Queue, _slot: u32, _advance: f32, _height: f32) {
@@ -205,7 +190,7 @@ impl GlyphField for DerivedField {
     }
 
     fn write_group_id(&self, queue: &wgpu::Queue, slot: u32, group_id: u32) {
-        self.storage.write_group_id(queue, slot, group_id);
+        self.storage.write_field(queue, slot, ITEM_AND_GROUP_OFFSET, bytemuck::bytes_of(&group_id));
     }
 
     fn write_placements(&self, queue: &wgpu::Queue, first_slot: u32, placements: &[GlyphPlacement]) {

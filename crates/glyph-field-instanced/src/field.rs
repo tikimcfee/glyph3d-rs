@@ -4,14 +4,13 @@ use std::ops::Range;
 
 use glyph_field::{
     shared_bind_group_entries, FieldResources, FieldTargets, GlyphField, GlyphFieldMode,
-    GlyphPlacement, SlotChunk, SlotSource, BINDING_SLOTS,
+    GlyphPlacement, SlotChunk, SlotSource, SlotStorage, BINDING_SLOTS,
 };
 use wgpu::util::DeviceExt;
 
 use crate::pipeline::{build_glyph_bgl, build_glyph_pipeline, build_mask_pipeline};
 use crate::slot::{RenderSlot, EXTENT_OFFSET, POSITION_OFFSET, SLOT_BYTES};
-use crate::storage::SlotStorage;
-use crate::upload::upload_host_slots;
+use crate::upload::{InstancedTranscode, LABELS};
 
 /// The Instanced glyph field: one bind group per slot chunk over the shared
 /// resources, the glyph pipeline, and the quad index buffer every glyph draw
@@ -28,7 +27,7 @@ pub struct InstancedField {
     /// binding limit; draws name a chunk. instance_index is chunk-local,
     /// which is exactly right — each chunk binding starts at its slot 0.
     bind_groups: Vec<wgpu::BindGroup>,
-    storage: SlotStorage,
+    storage: SlotStorage<RenderSlot>,
 }
 
 impl InstancedField {
@@ -47,21 +46,7 @@ impl InstancedField {
         resources: &FieldResources<'_>,
         targets: FieldTargets,
     ) -> Self {
-        let storage = match source {
-            SlotSource::Device { chunk_capacity, chunks, mapped_base, glyph_count, .. } => {
-                SlotStorage::new(chunks.to_vec(), chunk_capacity, glyph_count, mapped_base)
-            }
-            SlotSource::Host { slices, glyph_count, direct_host_upload } => {
-                let upload = upload_host_slots(device, queue, &slices, glyph_count, direct_host_upload);
-                let chunks = upload
-                    .buffers
-                    .into_iter()
-                    .zip(upload.chunk_counts.iter())
-                    .map(|(buffer, &slots)| SlotChunk { buffer, offset: 0, slots })
-                    .collect();
-                SlotStorage::new(chunks, upload.chunk_capacity, glyph_count, None)
-            }
-        };
+        let storage = SlotStorage::from_source(device, queue, source, &InstancedTranscode, &LABELS);
 
         let quad_index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("quad index buffer"),
@@ -70,7 +55,7 @@ impl InstancedField {
         });
 
         let bgl = build_glyph_bgl(device);
-        let bind_groups = build_chunk_bind_groups(device, &bgl, &storage.chunks, resources);
+        let bind_groups = build_chunk_bind_groups(device, &bgl, storage.chunks(), resources);
         let (shader, pipeline_layout, pipeline) = build_glyph_pipeline(device, &bgl, targets);
 
         Self { pipeline, shader, pipeline_layout, quad_index_buffer, bind_groups, storage }
@@ -127,11 +112,11 @@ impl GlyphField for InstancedField {
     }
 
     fn glyph_count(&self) -> u32 {
-        self.storage.glyph_count
+        self.storage.glyph_count()
     }
 
     fn chunk_capacity(&self) -> u32 {
-        self.storage.chunk_capacity
+        self.storage.chunk_capacity()
     }
 
     fn slot_bytes(&self) -> u32 {
@@ -139,7 +124,7 @@ impl GlyphField for InstancedField {
     }
 
     fn chunk_glyph_counts(&self) -> &[u32] {
-        &self.storage.chunk_counts
+        self.storage.chunk_counts()
     }
 
     fn glyph_pipeline(&self) -> &wgpu::RenderPipeline {

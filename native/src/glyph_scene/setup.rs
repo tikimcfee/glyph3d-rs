@@ -176,7 +176,7 @@ impl GlyphScene {
         // arena is the engine's neutral records, which the mode converts and
         // uploads. Unified-memory direct upload is a property of the adapter,
         // decided here (Metal + MAPPABLE_PRIMARY_BUFFERS — see
-        // glyph_field_instanced::upload).
+        // glyph_field::upload_host_slots).
         let source = match arena.device_slots() {
             Some(dev) => {
                 assert_eq!(

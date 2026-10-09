@@ -7,9 +7,9 @@
 //!
 //! Module map:
 //! - [`slot`]: the `RenderSlot` record and its layout pins.
-//! - [`upload`]: host records → device slots (transcode 48 B → 32 B, direct
-//!   mapped write on unified memory or staging + copy on discrete).
-//! - [`storage`]: the chunked slot buffers and per-slot byte addressing.
+//! - [`upload`]: the 48 B → 32 B transcode; the upload itself (direct mapped
+//!   write on unified memory, staging + copy on discrete) and the chunked slot
+//!   storage are `glyph_field`'s, shared with the Derived mode (C1).
 //! - [`pipeline`]: the bind group layout, glyph pipeline and mask pipeline.
 //! - [`field`]: [`InstancedField`], the `GlyphField` implementation.
 //!
@@ -20,7 +20,6 @@
 pub mod field;
 pub mod pipeline;
 pub mod slot;
-pub mod storage;
 pub mod upload;
 
 pub use field::InstancedField;
