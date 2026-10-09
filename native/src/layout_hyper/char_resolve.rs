@@ -57,6 +57,14 @@ fn sequence_length(lead: u8) -> usize {
     }
 }
 
+/// Whether a byte is a LEADER — a byte [`resolve_byte_char`] answers with
+/// `Some`, one record each (a sequence's trailers included): every byte but
+/// a continuation byte or an invalid lead.
+#[inline(always)]
+pub(crate) fn is_leader_byte(b: u8) -> bool {
+    sequence_length(b) != 0
+}
+
 #[inline(always)]
 fn decode_codepoint(bytes: &[u8], pos: usize, len: usize) -> u32 {
     let b0 = bytes[pos] as u32;

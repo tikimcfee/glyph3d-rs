@@ -306,6 +306,14 @@ fn ascii_line_max_x(l: usize, terminated: bool, fu: usize, seg_adv_table: &[f32]
 }
 
 /// Evaluates Pass 1 on a single byte slice (whole file or chunk).
+///
+/// `continues_line`: the chunk starts mid-line (an intra-line cut, see
+/// `chunk.rs`). Its first line's x positions depend on the column and
+/// segment advance it inherits, which only the aggregation knows, so that
+/// portion contributes nothing to `max_row_extent` here; the aggregation
+/// measures it with the true seed where the stride can reach an output
+/// (`measure_continued_lines`).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn pass1_prepass_chunk_bytes(
     bytes: &[u8],
     p: &crate::layout::ItemParams,
@@ -313,6 +321,7 @@ pub(crate) fn pass1_prepass_chunk_bytes(
     bitmap_adv: f32,
     em_height_fu: u32,
     global_seg_adv_table: &[f32],
+    continues_line: bool,
 ) -> ChunkPrepass {
     let fold_unit = if p.wrap_width > 0 {
         p.wrap_width as i64
@@ -392,7 +401,9 @@ pub(crate) fn pass1_prepass_chunk_bytes(
         return ChunkPrepass {
             survivor_count,
             leader_count,
-            max_row_extent,
+            // A chunk that continues a line is that line's continuation
+            // throughout: none of its x is known here.
+            max_row_extent: if continues_line { 0.0 } else { max_row_extent },
             has_cluster,
             completed_rows: 0,
             has_newline: false,
@@ -425,6 +436,9 @@ pub(crate) fn pass1_prepass_chunk_bytes(
         let mut line_col = 0i64;
         let mut line_adv = 0.0f64;
         let mut seg_adv = 0.0f32;
+        // The first line of a continuing chunk is measured with its true
+        // seed by the aggregation, not here (see the doc above).
+        let widest_before_line = max_row_extent;
 
         let is_pure_ascii = crate::text::is_pure_printable_ascii(line);
         if is_pure_ascii {
@@ -474,6 +488,9 @@ pub(crate) fn pass1_prepass_chunk_bytes(
         }
 
         survivor_count += line_survivors;
+        if continues_line && line_index == 0 {
+            max_row_extent = widest_before_line;
+        }
 
         if nl_pos < bytes.len() {
             line_leaders += 1;
@@ -521,10 +538,32 @@ pub(crate) fn pass1_prepass_chunks(
     bitmap_adv: f32,
     em_height_fu: u32,
 ) -> PrepassAggregate {
-    let max_fold_unit = items
+    let item_bytes: Vec<&[u8]> = items.iter().map(|it| it.bytes).collect();
+    let file_params: Vec<crate::layout::ItemParams> = items.iter().map(|it| it.params).collect();
+    pass1_over_chunks(chunks, item_chunk_ranges, &item_bytes, &file_params, trie, bitmap_adv, em_height_fu)
+}
+
+/// Whether a chunk starts mid-line: an intra-line cut (`chunk.rs`).
+#[inline]
+fn chunk_continues_line(item_bytes: &[u8], byte_offset: usize) -> bool {
+    byte_offset > 0 && item_bytes[byte_offset - 1] != b'\n'
+}
+
+/// Pass 1 proper, shared by the inline path ([`pass1_prepass_chunks`]) and
+/// the background prefetch ([`prefetch_hyper`]): the per-chunk walk in
+/// parallel, the serial aggregation, then the continued lines measured.
+fn pass1_over_chunks(
+    chunks: &[chunk::LayoutChunk<'_>],
+    item_chunk_ranges: &[std::ops::Range<usize>],
+    item_bytes: &[&[u8]],
+    file_params: &[crate::layout::ItemParams],
+    trie: &TrieTable,
+    bitmap_adv: f32,
+    em_height_fu: u32,
+) -> PrepassAggregate {
+    let max_fold_unit = file_params
         .iter()
-        .map(|it| {
-            let p = &it.params;
+        .map(|p| {
             if p.wrap_width > 0 {
                 p.wrap_width as usize
             } else if p.has_page {
@@ -549,35 +588,100 @@ pub(crate) fn pass1_prepass_chunks(
     let chunk_prepasses: Vec<ChunkPrepass> = chunks
         .par_iter()
         .map(|chunk| {
-            let item = &items[chunk.item_index];
             pass1_prepass_chunk_bytes(
                 chunk.bytes,
-                &item.params,
+                &file_params[chunk.item_index],
                 trie,
                 bitmap_adv,
                 em_height_fu,
                 &global_seg_adv_table,
+                chunk_continues_line(item_bytes[chunk.item_index], chunk.byte_offset),
             )
         })
         .collect();
 
-    let file_params: Vec<crate::layout::ItemParams> = items.iter().map(|it| it.params).collect();
-    aggregate_chunk_prepasses(
+    let mut agg = aggregate_chunk_prepasses(
         &chunk_prepasses,
         item_chunk_ranges,
-        chunks.len(),
-        &file_params,
+        chunks,
+        file_params,
+        trie,
+        bitmap_adv,
         em_height_fu,
-    )
+    );
+    measure_continued_lines(&mut agg, chunks, item_bytes, file_params, trie, bitmap_adv, em_height_fu);
+    agg
+}
+
+/// The segment advance a line has reached at the END of a chunk that holds
+/// no newline — the seed of the chunk after it — computed as the fold
+/// computes it: the running f32 sum of the advances since the segment's last
+/// reset, in order. (Until 2026-10-09 this was `(col % fold_unit) * ascii_adv`,
+/// a product that is neither that sum nor aware of non-ASCII advances: an ulp
+/// of x for the next chunk's first partial segment, C15.)
+///
+/// The chunk spans columns `c0 .. c_end` of its line and enters with
+/// `seg_in`. If a fold-unit boundary falls inside it, the sum restarts from 0
+/// over its last `c_end % fold_unit` leaders; otherwise it continues from
+/// `seg_in` over all of them. Either way only a TAIL of the chunk is walked:
+/// it is found by counting leader bytes back from the end (a leader is any
+/// byte that is not a continuation byte or an invalid lead — one per
+/// record, trailers included), and resolved forward from the nearest ASCII
+/// byte at or before it (or the chunk's start). No sequence or trailer span
+/// crosses an ASCII byte (`chunk.rs`), so resolution from there agrees with
+/// the walk of the whole chunk. Typical cost: one fold unit of bytes.
+#[allow(clippy::too_many_arguments)]
+fn continued_segment_advance(
+    bytes: &[u8],
+    c0: i64,
+    c_end: i64,
+    fold_unit: i64,
+    seg_in: f32,
+    trie: &TrieTable,
+    bitmap_adv: f32,
+    em_height_fu: u32,
+    cluster: bool,
+) -> f32 {
+    if c_end % fold_unit == 0 {
+        return 0.0;
+    }
+    let last_reset = c_end - c_end % fold_unit;
+    let (tail, mut seg) = if last_reset > c0 { (c_end - last_reset, 0.0f32) } else { (c_end - c0, seg_in) };
+    let mut tail_start = bytes.len();
+    let mut found = 0i64;
+    while found < tail {
+        tail_start -= 1;
+        if char_resolve::is_leader_byte(bytes[tail_start]) {
+            found += 1;
+        }
+    }
+    let mut from = tail_start;
+    while from > 0 && bytes[from] >= 0x80 {
+        from -= 1;
+    }
+    let mut trailer_until = 0usize;
+    for pos in from..bytes.len() {
+        if let Some(r) =
+            char_resolve::resolve_byte_char(bytes, pos, trie, bitmap_adv, em_height_fu, cluster, &mut trailer_until)
+        {
+            if pos >= tail_start {
+                seg += r.advance;
+            }
+        }
+    }
+    seg
 }
 
 pub(crate) fn aggregate_chunk_prepasses(
     chunk_prepasses: &[ChunkPrepass],
     item_chunk_ranges: &[std::ops::Range<usize>],
-    total_chunks: usize,
+    chunks: &[chunk::LayoutChunk<'_>],
     file_params: &[crate::layout::ItemParams],
+    trie: &TrieTable,
+    bitmap_adv: f32,
     em_height_fu: u32,
 ) -> PrepassAggregate {
+    let total_chunks = chunks.len();
     let mut prepasses = Vec::with_capacity(file_params.len());
     let mut chunk_slot_bases = Vec::with_capacity(total_chunks);
     let mut chunk_base_rows = Vec::with_capacity(total_chunks);
@@ -597,7 +701,6 @@ pub(crate) fn aggregate_chunk_prepasses(
         } else {
             0
         };
-        let ascii_adv = fu_to_world(1229, em_height_fu);
 
         let mut item_survivor_count = 0u32;
         let mut item_leader_count = 0u32;
@@ -633,11 +736,27 @@ pub(crate) fn aggregate_chunk_prepasses(
             }
 
             if !cp.has_newline {
+                let c0 = cur_col;
                 cur_col += cp.delta_col;
+                // f64 sums of f32 advances are exact at any realistic line
+                // length, so the chunk's own sum added to the prefix is the
+                // fold's serial sum.
                 cur_line_adv += cp.delta_line_adv;
                 if fold_unit > 0 {
-                    let rem = (cur_col % fold_unit) as usize;
-                    cur_seg_adv = rem as f32 * ascii_adv;
+                    // Only a later chunk of this item reads the seed.
+                    if chunk_index + 1 < range.end {
+                        cur_seg_adv = continued_segment_advance(
+                            chunks[chunk_index].bytes,
+                            c0,
+                            cur_col,
+                            fold_unit,
+                            cur_seg_adv,
+                            trie,
+                            bitmap_adv,
+                            em_height_fu,
+                            char_resolve::clusters(p),
+                        );
+                    }
                 } else {
                     cur_seg_adv += cp.delta_seg_adv;
                 }
@@ -677,6 +796,105 @@ pub(crate) fn aggregate_chunk_prepasses(
     }
 }
 
+/// Whether an item's page stride can reach any output: only a row-paged item
+/// fans pages across x, only by `(y_page % pages_wide) * stride`, and that is
+/// zero for every record unless some screen row reaches past the first page
+/// and there is more than one page column. When it cannot, every emitter adds
+/// `0 * stride` (an exact zero, the stride being finite) whatever
+/// `max_row_extent` holds.
+fn stride_reaches_output(p: &crate::layout::ItemParams, row_count: u32) -> bool {
+    p.has_page
+        && p.page_rows > 0
+        && p.pages_wide > 1
+        && row_count as i64 - 1 - p.scroll_rows as i64 >= p.page_rows as i64
+}
+
+/// The widest x of the first line of every chunk that CONTINUES a line,
+/// measured with the seed the aggregation gave it, folded into its item's
+/// `max_row_extent` — the part of the fold's scalar 7 the per-chunk walk
+/// cannot see. Only for items whose stride reaches an output
+/// ([`stride_reaches_output`]), since that is `max_row_extent`'s only
+/// consumer; elsewhere it stays the widest x of the lines that start inside
+/// a chunk. In parallel over the chunks; nothing runs for a corpus with no
+/// intra-line cut.
+fn measure_continued_lines(
+    agg: &mut PrepassAggregate,
+    chunks: &[chunk::LayoutChunk<'_>],
+    item_bytes: &[&[u8]],
+    file_params: &[crate::layout::ItemParams],
+    trie: &TrieTable,
+    bitmap_adv: f32,
+    em_height_fu: u32,
+) {
+    let wanted: Vec<usize> = (0..chunks.len())
+        .filter(|&ci| {
+            let c = &chunks[ci];
+            chunk_continues_line(item_bytes[c.item_index], c.byte_offset)
+                && stride_reaches_output(&file_params[c.item_index], agg.prepasses[c.item_index].row_count)
+        })
+        .collect();
+    if wanted.is_empty() {
+        return;
+    }
+    let widest: Vec<(usize, f64)> = wanted
+        .par_iter()
+        .map(|&ci| {
+            let c = &chunks[ci];
+            let p = &file_params[c.item_index];
+            let fold_unit = if p.wrap_width > 0 {
+                p.wrap_width as i64
+            } else if p.has_page {
+                p.page_cols as i64
+            } else {
+                0
+            };
+            let cluster = char_resolve::clusters(p);
+            let mut col = agg.chunk_initial_cols[ci];
+            let mut seg = agg.chunk_initial_seg_advs[ci];
+            let mut line_adv = agg.chunk_initial_line_advs[ci];
+            let mut widest = 0.0f64;
+            let mut trailer_until = 0usize;
+            for pos in 0..c.bytes.len() {
+                let Some(r) = char_resolve::resolve_byte_char(
+                    c.bytes,
+                    pos,
+                    trie,
+                    bitmap_adv,
+                    em_height_fu,
+                    cluster,
+                    &mut trailer_until,
+                ) else {
+                    continue;
+                };
+                // The fold's scalar 7: each leader's x before its advance,
+                // the newline that closes the line included.
+                let x = if fold_unit > 0 { seg as f64 } else { line_adv };
+                if x > widest {
+                    widest = x;
+                }
+                if r.is_newline {
+                    break;
+                }
+                col += 1;
+                line_adv += r.advance as f64;
+                if fold_unit > 0 {
+                    if col % fold_unit == 0 {
+                        seg = 0.0;
+                    } else {
+                        seg += r.advance;
+                    }
+                }
+            }
+            (c.item_index, widest)
+        })
+        .collect();
+    for (item, w) in widest {
+        if w > agg.prepasses[item].max_row_extent {
+            agg.prepasses[item].max_row_extent = w;
+        }
+    }
+}
+
 /// Computes Pass 1 chunk prepasses ahead of time during repository prefetching.
 pub fn prefetch_hyper(
     files: &[crate::repo::RepoFile],
@@ -688,52 +906,22 @@ pub fn prefetch_hyper(
 
     let byte_slices: Vec<&[u8]> = files.iter().map(|f| f.bytes.as_slice()).collect();
     let (chunk_defs, item_chunk_ranges) = chunk::slice_byte_buffers_into_chunk_defs(&byte_slices);
-
-    let max_fold_unit = file_params
+    let chunks: Vec<chunk::LayoutChunk<'_>> = chunk_defs
         .iter()
-        .map(|p| {
-            if p.wrap_width > 0 {
-                p.wrap_width as usize
-            } else if p.has_page {
-                p.page_cols as usize
-            } else {
-                0
-            }
-        })
-        .max()
-        .unwrap_or(0);
-
-    let ascii_adv = fu_to_world(1229, em_height_fu);
-    let mut global_seg_adv_table = Vec::with_capacity(max_fold_unit + 1);
-    if max_fold_unit > 0 {
-        let mut cur = 0.0f32;
-        for _ in 0..=max_fold_unit {
-            global_seg_adv_table.push(cur);
-            cur += ascii_adv;
-        }
-    }
-
-    let chunk_prepasses: Vec<ChunkPrepass> = chunk_defs
-        .par_iter()
-        .map(|def| {
-            let p = &file_params[def.item_index];
-            let chunk_bytes = &files[def.item_index].bytes[def.byte_offset..def.byte_offset + def.byte_len];
-            pass1_prepass_chunk_bytes(
-                chunk_bytes,
-                p,
-                &trie,
-                bitmap_adv,
-                em_height_fu,
-                &global_seg_adv_table,
-            )
+        .map(|def| chunk::LayoutChunk {
+            item_index: def.item_index,
+            bytes: &byte_slices[def.item_index][def.byte_offset..def.byte_offset + def.byte_len],
+            byte_offset: def.byte_offset,
         })
         .collect();
 
-    let aggregate = aggregate_chunk_prepasses(
-        &chunk_prepasses,
+    let aggregate = pass1_over_chunks(
+        &chunks,
         &item_chunk_ranges,
-        chunk_defs.len(),
+        &byte_slices,
         file_params,
+        &trie,
+        bitmap_adv,
         em_height_fu,
     );
 

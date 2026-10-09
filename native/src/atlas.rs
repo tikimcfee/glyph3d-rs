@@ -317,14 +317,24 @@ impl TrieTable {
         //     head: the per-byte path looks ahead only from a `seq_lead`
         //     byte, and a pure-ASCII line (every line-level and burst
         //     shortcut in Pass 1 and both Pass 2s) never holds a sequence;
-        //  2. the probe key fits HyperLayout's fixed key buffer.
-        // An atlas that breaks either fails HERE, at load, instead of laying
-        // such a sequence out as text on a fast path.
+        //  2. the probe key fits HyperLayout's fixed key buffer;
+        //  3. no sequence has an ASCII member after its first (which implies
+        //     1). So no sequence, and no trailer span, ever reaches across an
+        //     ASCII byte, which is where HyperLayout cuts a long line into
+        //     chunks (`layout_hyper/chunk.rs`): each chunk then resolves its
+        //     bytes exactly as a walk of the whole item would.
+        // An atlas that breaks any fails HERE, at load, instead of laying
+        // such a sequence out as text on a fast path, or splitting it at a
+        // chunk cut.
         for e in t.sequences.chunks_exact(2 + seq_max as usize) {
             let cps = &e[2..2 + e[1] as usize];
             assert!(
                 !(cps.len() >= 2 && cps[0] < 0x80 && cps[1] < 0x80),
                 "codepoints.bin: sequence {cps:X?} opens with two ASCII members; HyperLayout's ASCII fast paths assume none does"
+            );
+            assert!(
+                cps.iter().skip(1).all(|&cp| cp >= 0x80),
+                "codepoints.bin: sequence {cps:X?} has an ASCII member after its first; HyperLayout's chunk cuts assume none does"
             );
         }
         assert!(

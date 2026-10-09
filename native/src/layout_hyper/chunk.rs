@@ -1,10 +1,16 @@
 //! Chunking and parallel work distribution for HyperLayout.
 //!
 //! Large files (> CHUNK_THRESHOLD_BYTES) are sliced at line boundaries (`\n`)
-//! into independent chunks. Because every chunk begins at column 0 with clean
-//! line advance and independent syntax coloring state, chunks can be prepassed
-//! and laid out in parallel across all CPU cores, eliminating Amdahl's Law
-//! single-core tail latency bottlenecks on multi-megabyte files (such as parser.c).
+//! into independent chunks, so chunks can be prepassed and laid out in
+//! parallel across all CPU cores, eliminating Amdahl's Law single-core tail
+//! latency bottlenecks on multi-megabyte files (such as parser.c).
+//!
+//! A line with no newline within `MAX_NEWLINE_SEARCH_BYTES` of the threshold
+//! (a minified file) is cut INSIDE the line, before an ASCII byte. Such a
+//! chunk does not start at column 0: it inherits the column, line advance and
+//! segment advance its line had reached, which Pass 1's aggregation computes
+//! exactly (`aggregate_chunk_prepasses`) — the running f32 segment sum the
+//! fold uses, not a product.
 
 use crate::layout::LayoutItem;
 
@@ -68,13 +74,22 @@ pub fn slice_byte_buffers_into_chunk_defs(
 
                 let chunk_end = match memchr::memchr(b'\n', search_slice) {
                     Some(newline_offset) => target_offset + newline_offset + 1,
-                    None => {
-                        let mut cut = target_offset;
-                        while cut < total_bytes && (bytes[cut] & 0xC0) == 0x80 {
-                            cut += 1;
-                        }
-                        cut
-                    }
+                    // An INTRA-LINE cut, and only ever BEFORE AN ASCII BYTE.
+                    // No cluster sequence has an ASCII member after its first
+                    // (asserted when the atlas loads), so no sequence and no
+                    // trailer span reaches across such a byte: every chunk
+                    // then resolves its bytes exactly as a walk of the whole
+                    // item does, which is what lets Pass 1 count survivors per
+                    // chunk and the device Pass 2 emit per chunk. A cut at a
+                    // mere codepoint boundary split sequences (C15, measured
+                    // 2026-10-09: a ZWJ family cut before its first ZWJ laid
+                    // out as three glyphs on the device and left the host
+                    // arena three committed slots it never wrote). A run with
+                    // no ASCII byte at all is not cut.
+                    None => match bytes[target_offset..].iter().position(|&b| b < 0x80) {
+                        Some(ascii_offset) => target_offset + ascii_offset,
+                        None => total_bytes,
+                    },
                 };
 
                 chunk_defs.push(ChunkDef {
@@ -165,6 +180,27 @@ mod tests {
             reconstructed.extend_from_slice(chunk.bytes);
         }
         assert_eq!(reconstructed, text, "Concatenated chunks must match original bytes byte-for-byte");
+    }
+
+    /// C15 (2026-10-09): an intra-line cut lands only before an ASCII byte,
+    /// so a sequence that straddles the 64 KiB target stays whole in one
+    /// chunk; and a run with no ASCII byte is not cut at all.
+    #[test]
+    fn an_intra_line_cut_never_splits_a_sequence() {
+        let family = "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}".as_bytes();
+        let mut text = vec![b'a'; CHUNK_THRESHOLD_BYTES - 4];
+        text.extend_from_slice(family); // the target falls on its first ZWJ
+        text.extend_from_slice(&[b'b'; 2 * CHUNK_THRESHOLD_BYTES]);
+        let (defs, _) = slice_byte_buffers_into_chunk_defs(&[&text]);
+        assert!(defs.len() >= 3, "{defs:?}");
+        assert_eq!(defs[0].byte_len, CHUNK_THRESHOLD_BYTES - 4 + family.len(), "the family must stay in chunk 0");
+        for d in &defs[1..] {
+            assert!(text[d.byte_offset] < 0x80, "cut at a non-ASCII byte: {d:?}");
+        }
+
+        let cjk = "\u{4E16}".repeat(3 * CHUNK_THRESHOLD_BYTES / 3);
+        let (defs, _) = slice_byte_buffers_into_chunk_defs(&[cjk.as_bytes()]);
+        assert_eq!(defs.len(), 1, "a run with no ASCII byte must not be cut: {defs:?}");
     }
 }
 
