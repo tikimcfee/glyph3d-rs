@@ -263,8 +263,9 @@ the flag and its `cli/command.rs` arm.
   26595fb may add to it. Not separated.
 - Consequences: HyperLayout is the default engine and nothing compares it to
   the JS oracle (the `--fixture-*` instruments test fold.rs/scan.rs/text.rs).
-  `repo-cluster`'s Metal golden was taken through `--load-repo` (HyperLayout)
-  after 09-30, so it may carry defect 1.
+  `repo-cluster`'s Metal golden dates from 2026-09-20 (05a5935), BEFORE
+  HyperLayout, so it pins the Mojo-era cluster rendering: a Mac pixel-ab run
+  of that view is an independent witness for defect 1.
 
 ### P1. Pixel baselines — [measured]
 
