@@ -41,3 +41,8 @@ out/windowed-shot-*.png
 assets/atlas/*.cache
 *.cache
 
+# Per-machine settings. launch_config.example.toml is the tracked template;
+# each checkout copies it to launch_config.toml and edits it for that machine.
+/launch_config.toml
+native/launch_config.toml
+
