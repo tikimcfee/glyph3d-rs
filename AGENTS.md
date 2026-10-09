@@ -319,8 +319,9 @@ classes), the IMMUTABLE
 `cubecl-fork` corpus, `g-cluster-repo`, `overflow-leads.txt` (the
 out-of-range decode input no check read after 2026-09-30), `g-pick-repo`
 (every repo golden's corpus; `wide.txt` is cut inside its long line) and the
-IMMUTABLE `chunk-cut.txt` (built for the intra-line cut classes, below) in
-cluster mode, then those five again in leader mode. STRICT refuses zero records, zero
+IMMUTABLE `chunk-cut.txt` and `chunk-cut-paint.txt` (built for the
+intra-line cut classes, below) in cluster mode, then those six again in leader
+mode. STRICT refuses zero records, zero
 resolved sequences, and zero ASCII-led sequences; both runs refuse zero device
 slots. **History**: red on arrival, 6 of 29 corpora. The keycap class
 (HyperLayout's ASCII fast path never asked whether `1` starts a sequence, so
@@ -372,13 +373,31 @@ width with its true seed wherever the page stride reaches an output.
 non-ASCII advances before each cut, and continuations wider than any ASCII
 segment past the first page; mutations `hyper-chunk-seed-product`,
 `hyper-chunk-cut-splits-sequences` and `hyper-continued-line-unmeasured`.
-Moving `wide.txt`'s fourth cut (off a 0xE2 byte) changed 11 px each of
-`repo-down` and `repo-back-oblique` on this host, and that is PAINT, not layout:
-the device Pass 2 restarts its syntax colorizer at every intra-line cut,
-which the whole-item colorizer does not (596 of `wide.txt`'s glyphs disagree
-before the move, 578 after). Every item is flat in this gate, so that class is
-not under test here. Measured but ungated (2026-10-09): a 94 MB tree of
-crates.io sources is bit-exact on every tier in both modes (99 M records).
+**The paint tier** (C17, 2026-10-09). The four tiers above run flat paint.
+A fifth runs the device Pass 2 again under `Paint::SyntaxHeuristic` and holds
+every lane to the reference instances painted by `text::colorize_leaders`
+over the WHOLE item, which is what the host Pass 2 paints. It is not
+oracle-backed (the JS oracle has no paint): it proves the device's
+line-by-line colouring agrees with the whole-item colouriser, not that the
+heuristic is right. Red on arrival, it found four disagreements, each fixed:
+the device restarted its colouring at every intra-line cut (578 of
+`wide.txt`'s glyphs; the only one that moved pixels — `repo-down` 281 px,
+`repo-back-oblique` 747, `repo-wide` 20 vs main@164af5c on this host, all of
+it measured to this one change); the generic colourisers judged a word that
+runs into a string (`return"$"`) up to its last word byte and filled any
+colour back, where the ASCII fast path judges it up to its end and fills only
+a keyword (`real-minified`); the whole-item colouriser never flushed an
+unterminated last word, and the per-line one panicked on a lead truncated at
+a line's end (`malformed`); and the device's all-comment-line shortcut painted
+indentation comment (`real-kernels`; no ink, no pixel). `chunk-cut-paint.txt`
+puts a `return` across every intra-line cut, so the tail half has a witness
+(`wide.txt` reaches only the head half). Mutations: `hyper-cut-head-own-share`,
+`hyper-cut-tail-own-share`, `hyper-comment-line-indent-painted`, and on the
+colourisers' unit tests `colorizer-fills-any-word-colour` and
+`colorizer-last-word-unflushed`. Shared and unjudged: the heuristic's own
+rules, and `--render-file`'s tokenizer (`stage_file`), a third copy no tier
+reads. Measured but ungated (2026-10-09): a 94 MB tree of crates.io sources
+is bit-exact on every tier in both modes (99 M records).
 
 **repo-verify** and **repo-verify-direct** (`--repo-verify`, re-gated
 2026-10-09). `--repo-engine hyper` and `direct` over `g-pick-repo`, both wrap
@@ -628,6 +647,7 @@ the serial-fold-versus-scan comparison green, because both forms call
 | `native/fixtures/emoji-view.txt` | IMMUTABLE | the input to `emoji.png`, one line per class of bitmap slot the trie carries; same reason |
 | `native/fixtures/g-pick-repo/empty.rs` | IMMUTABLE, zero bytes | the only input that reaches the page-extent origin seed; deleting it removes a check's ability to see its subject without removing the check |
 | `native/fixtures/chunk-cut.txt` | IMMUTABLE | hyper-oracle's only input built for the intra-line chunk-cut classes (C15): a sequence across each 64 KiB cut target, non-ASCII advances before each cut, a continuation wider than every ASCII row past the first page. Its cut positions are planned against the 64 KiB threshold and the cut rule, so changing either (or the file) can move a target off its sequence and silently weaken the gate — re-check that each mutation in its `why` still reddens |
+| `native/fixtures/chunk-cut-paint.txt` | IMMUTABLE | hyper-oracle's paint-tier input (C17): a `return` across every intra-line cut, one pure-ASCII line and one not, so a chunk that coloured only its own share of a line is seen at the chunk's END; the only witness `hyper-cut-tail-own-share` has |
 | `native/fixtures/cubecl-fork/` | IMMUTABLE | the retired cubecl-fork check's standing corpus — the only committed input exercising paginate's m >= 3 / segment >= 3 classes, the cluster classes at wrap/page boundaries, and the empty-item placement class (`clusters.txt` + `empty.txt`); kept for re-gating. Editing it re-hollows that check silently |
 | `out/tooling-ab/baseline/<key>/` | tracked pixel oracle, one set per rasterizer; **golden** in build.toml | changes only on purpose, with a note saying why; the runner refuses to regenerate it. A new host adopts its own set by hand (the gate prints how); it never edits another's |
 | `integration/egui/` | vendored reference | never compiled; the real dependency is from crates.io |

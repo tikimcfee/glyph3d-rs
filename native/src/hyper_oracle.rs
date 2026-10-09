@@ -267,8 +267,8 @@ fn show_record(r: &GlyphRecord) -> String {
 
 fn show_instance(i: &GlyphInstance) -> String {
     format!(
-        "gi {} adv {:e} x {:e} y {:e} z {:e} row {} col {}",
-        i.glyph_id, i.advance, i.pos[0], i.pos[1], i.pos[2], i.row, i.col
+        "gi {} adv {:e} x {:e} y {:e} z {:e} row {} col {} rgba {:08x}",
+        i.glyph_id, i.advance, i.pos[0], i.pos[1], i.pos[2], i.row, i.col, i.color
     )
 }
 
@@ -434,7 +434,10 @@ pub fn diff_device_item(
             d.render_bad += 1;
             if d.first.is_none() {
                 let got = render.get(i).map_or("absent".to_string(), |s| {
-                    format!("gi {} adv {:e} x {:e} y {:e} z {:e}", s.glyph_id, s.advance, s.pos[0], s.pos[1], s.pos[2])
+                    format!(
+                        "gi {} adv {:e} x {:e} y {:e} z {:e} rgba {:08x}",
+                        s.glyph_id, s.advance, s.pos[0], s.pos[1], s.pos[2], s.color
+                    )
                 });
                 d.first = Some(format!(
                     "device RenderSlot {i} ({}): oracle-backed fold {} | HyperLayout device {got}",
@@ -490,6 +493,15 @@ pub struct CorpusDiff {
     pub device_render_bad: usize,
     pub device_derived_bad: usize,
     pub device_placement_bad: usize,
+    /// The PAINT tier: the device Pass 2 again under `Paint::SyntaxHeuristic`,
+    /// every lane (colour included) against the reference instances painted
+    /// with `text::colorize_leaders` over the WHOLE item — the colours the
+    /// host Pass 2 paints. Slots compared, slots differing (both formats),
+    /// and how many reference colours were not the default (anti-vacuity: a
+    /// tier that only ever saw default paint compared nothing).
+    pub paint_slots: usize,
+    pub paint_bad: usize,
+    pub paint_colored: usize,
     /// (item label, first divergence) for every differing item, in order.
     pub firsts: Vec<(String, String)>,
     /// diff_backends' verdict over the whole corpus (the seam's own differ).
@@ -512,6 +524,9 @@ impl Default for CorpusDiff {
             device_render_bad: 0,
             device_derived_bad: 0,
             device_placement_bad: 0,
+            paint_slots: 0,
+            paint_bad: 0,
+            paint_colored: 0,
             firsts: Vec::new(),
             seam: Ok(()),
         }
@@ -602,6 +617,48 @@ pub fn diff_corpus(corpus: &Corpus, trie: &Arc<TrieTable>) -> Result<CorpusDiff,
     }
     out.device_slots = render_slots.len();
 
+    // The PAINT tier (C17, 2026-10-09). Layout is settled above, so the same
+    // emitter under syntax paint must reproduce the reference slots with the
+    // whole-item colours: the device Pass 2 colourises line by line, and a
+    // line cut into chunks (`layout_hyper/chunk.rs`) is the place it can
+    // disagree with a walk of the whole item. Not oracle-backed — the JS
+    // oracle has no paint — but the host Pass 2's own colouring.
+    let syntax_items: Vec<LayoutItem<'_>> =
+        items.iter().map(|it| LayoutItem { paint: Paint::SyntaxHeuristic, ..*it }).collect();
+    let (paint_render, paint_render_places) = device_pass2_render_on_host(&syntax_items, trie);
+    let (paint_derived, paint_derived_places) = device_pass2_derived_on_host(&syntax_items, trie);
+    let mut paint_arena = GlyphArena::new();
+    for (i, c) in corpus.items.iter().enumerate() {
+        let colors = crate::text::colorize_leaders(&c.bytes);
+        let place = compact_records_into(&refs[i].records, Paint::PerRecord(&colors), i as u32, &mut paint_arena);
+        let s = (place.slot_base as usize).min(paint_arena.instances().len());
+        let e = (s + place.slot_count as usize).min(paint_arena.instances().len());
+        let ref_inst = paint_arena.instances()[s..e].to_vec();
+        out.paint_colored +=
+            ref_inst.iter().filter(|g| g.color != crate::text::palette::C_DEFAULT).count();
+        let (rdp, ddp) = (&paint_render_places[i], &paint_derived_places[i]);
+        let span = |p: &ItemPlacement, len: usize| {
+            let s = (p.slot_base as usize).min(len);
+            s..(s + p.slot_count as usize).min(len)
+        };
+        let dd = diff_device_item(
+            &c.bytes,
+            &c.params,
+            &refs[i],
+            &ref_inst,
+            &place,
+            &paint_render[span(rdp, paint_render.len())],
+            rdp,
+            &paint_derived[span(ddp, paint_derived.len())],
+            ddp,
+        );
+        out.paint_bad += dd.render_bad + dd.derived_bad;
+        if let Some(f) = dd.first {
+            out.firsts.push((format!("{} (syntax paint)", c.label), f));
+        }
+    }
+    out.paint_slots = paint_derived.len();
+
     let ref_all: Vec<GlyphRecord> = refs.iter().flat_map(|r| r.records.iter().copied()).collect();
     let hyper_all: Vec<GlyphRecord> = hyper_recs.into_iter().flatten().collect();
     out.seam = diff_backends(
@@ -635,8 +692,12 @@ pub fn run_hyper_oracle_check(paths: &[PathBuf], cluster_mode: ClusterMode) -> !
             }
         };
         let device_bad = d.device_render_bad + d.device_derived_bad + d.device_placement_bad;
-        let clean =
-            d.record_bad == 0 && d.instance_bad == 0 && d.placement_bad == 0 && device_bad == 0 && d.seam.is_ok();
+        let clean = d.record_bad == 0
+            && d.instance_bad == 0
+            && d.placement_bad == 0
+            && device_bad == 0
+            && d.paint_bad == 0
+            && d.seam.is_ok();
         if clean {
             println!(
                 "  PASS {:<34} {} item(s), {} records, {} instances, {} device slots x2 bit-exact ({} sequence heads, {} ASCII-led)",
@@ -645,7 +706,7 @@ pub fn run_hyper_oracle_check(paths: &[PathBuf], cluster_mode: ClusterMode) -> !
         } else {
             failed += 1;
             println!(
-                "FAIL  {:<34} {}/{} records, {}/{} instances, {}/{} placements differ; device {}+{} slots (render+derived), {} placements ({} sequence heads, {} ASCII-led)",
+                "FAIL  {:<34} {}/{} records, {}/{} instances, {}/{} placements differ; device {}+{} slots (render+derived), {} placements; paint {}/{} slots ({} sequence heads, {} ASCII-led)",
                 corpus.name,
                 d.record_bad,
                 d.records,
@@ -656,6 +717,8 @@ pub fn run_hyper_oracle_check(paths: &[PathBuf], cluster_mode: ClusterMode) -> !
                 d.device_render_bad,
                 d.device_derived_bad,
                 d.device_placement_bad,
+                d.paint_bad,
+                d.paint_slots * 2,
                 d.heads,
                 d.ascii_heads
             );
@@ -685,6 +748,9 @@ pub fn run_hyper_oracle_check(paths: &[PathBuf], cluster_mode: ClusterMode) -> !
         total.device_render_bad += d.device_render_bad;
         total.device_derived_bad += d.device_derived_bad;
         total.device_placement_bad += d.device_placement_bad;
+        total.paint_slots += d.paint_slots;
+        total.paint_bad += d.paint_bad;
+        total.paint_colored += d.paint_colored;
     }
 
     // Anti-vacuity before the verdict: a differ that compared nothing passes
@@ -695,6 +761,10 @@ pub fn run_hyper_oracle_check(paths: &[PathBuf], cluster_mode: ClusterMode) -> !
     }
     if total.device_slots == 0 {
         eprintln!("hyper-oracle FAIL: the device tier compared nothing — 0 slots emitted");
+        std::process::exit(1);
+    }
+    if total.paint_colored == 0 {
+        eprintln!("hyper-oracle FAIL: the paint tier compared nothing — no reference slot carries a syntax colour");
         std::process::exit(1);
     }
     if strict && (total.heads == 0 || total.ascii_heads == 0) {
@@ -709,7 +779,7 @@ pub fn run_hyper_oracle_check(paths: &[PathBuf], cluster_mode: ClusterMode) -> !
             println!("first divergence: {label}: {f}");
         }
         eprintln!(
-            "hyper-oracle FAIL: {failed}/{} corpora differ — {}/{} records ({} in leader-mode items), {}/{} instances, {}/{} placements; device: {}+{}/{} slots (render+derived), {} placements",
+            "hyper-oracle FAIL: {failed}/{} corpora differ — {}/{} records ({} in leader-mode items), {}/{} instances, {}/{} placements; device: {}+{}/{} slots (render+derived), {} placements; paint: {}/{} slots",
             paths.len(),
             total.record_bad,
             total.records,
@@ -722,11 +792,13 @@ pub fn run_hyper_oracle_check(paths: &[PathBuf], cluster_mode: ClusterMode) -> !
             total.device_derived_bad,
             total.device_slots,
             total.device_placement_bad,
+            total.paint_bad,
+            total.paint_slots * 2,
         );
         std::process::exit(1);
     }
     println!(
-        "hyper-oracle PASS: {} corpora, {} items, {} records, {} instances, {} placements, and the device Pass 2's {} slots in both formats bit-exact vs the oracle-backed fold ({} sequence heads, {} ASCII-led)",
+        "hyper-oracle PASS: {} corpora, {} items, {} records, {} instances, {} placements, and the device Pass 2's {} slots in both formats bit-exact vs the oracle-backed fold ({} sequence heads, {} ASCII-led); under syntax paint, {} slots x2 match the whole-item colours ({} not default)",
         paths.len(),
         total.items,
         total.records,
@@ -734,7 +806,9 @@ pub fn run_hyper_oracle_check(paths: &[PathBuf], cluster_mode: ClusterMode) -> !
         total.items,
         total.device_slots,
         total.heads,
-        total.ascii_heads
+        total.ascii_heads,
+        total.paint_slots,
+        total.paint_colored
     );
     std::process::exit(0);
 }
