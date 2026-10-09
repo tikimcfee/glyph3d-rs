@@ -97,12 +97,22 @@ Still open from this round:
 - **The greeking dials**, the frame-time cap (0.1 s), and setup's assumed
   1.6 aspect ratio are still compiled in. **Key bindings** are on hold until
   the omnibar / shortcut work.
-- **Claude Code transcripts may misclassify beats.** Every recent session showed
-  long stretches of only "assistant response" or only "command" beats, even
-  where Read calls were interleaved. That needs a look at
-  `agent_transcript/claude.rs` before the deck's kind colouring can show its
-  full value on real sessions. The renders above use a synthetic mixed-kind
-  transcript for that reason.
+- ~~Claude Code transcripts may misclassify beats.~~ **Fixed in `3391e82`.**
+  - **Cause 1:** typed prompts are STRING content, and the parser only read
+    arrays, so a whole session was one turn.
+  - **Cause 2:** turns linearized grouped by kind instead of in transcript
+    order.
+  - Both are fixed, following the `-js` adapter's single file-order stream.
+    The rules were cross-checked against claude-code-log, simonw's
+    claude-code-transcripts, ccusage and the Agent SDK types.
+  - Renders: `transcript-real-{before,after}.png`.
+  - Seen in the survey but not handled yet, none of it urgent:
+    - `compact_boundary` system records could mark turn breaks.
+    - Read results of type `file_unchanged` carry no content.
+    - Subagent transcripts now live in `<session>/subagents/` (we skip
+      `isSidechain` lines, as the JS did).
+    - Token usage repeats on every block line of one API message, so any
+      future cost display must deduplicate on `message.id` + `requestId`.
 
 ## Step 2 — next, and golden-moving
 
