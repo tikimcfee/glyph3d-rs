@@ -323,12 +323,10 @@ blind_to = "HyperLayout and CubeCL entirely — these are fold.rs/scan.rs/bake.r
 
 # HyperLayout — the production engine — against the oracle-backed fold.
 # Red from 2026-10-09 (C10, C13, C14 in out/MAINTENANCE-NOTES-2026-10-08.md)
-# until the C10/C13 fix the same day; split then so the fixed classes are
-# provable while the open one stays visible: the three fixtures that set
-# scroll_rows / page_cols (C14, host AND device Pass 2 paginate them unlike
-# the fold) moved to `hyper-oracle-paged`, which is red until C14 is fixed.
-# The GLOBIGNORE below is that split and nothing else; when C14 lands, delete
-# it and the paged gate together. Every fixture is in exactly one of the two.
+# until the C10/C13 fix the same day. The three fixtures that set
+# scroll_rows / page_cols were split out to a red `hyper-oracle-paged` gate
+# while C14 (both Pass 2 paths paginated them unlike the fold) was open; C14
+# is fixed (dd6fe01) and they are back here, with the paged gate deleted.
 # The second invocation is the leader-mode run (C13's volume class): the same
 # corpora with every item in leader mode, so a mode that leaks is red on
 # 319,628 records rather than the 12 of cluster-zwj's leader item.
@@ -336,25 +334,11 @@ blind_to = "HyperLayout and CubeCL entirely — these are fold.rs/scan.rs/bake.r
 name = "hyper-oracle"
 scope = "render"
 kind = "cmd"
-cmd = "GLOBIGNORE='engine/fixtures/paged-rows.pipe.bin:engine/fixtures/paged-cols.pipe.bin:engine/fixtures/scroll-only.pipe.bin'; GLYPH_TRACE=warn target/release/glyph3d-native --hyper-oracle-check native/fixtures/cubecl-fork native/fixtures/g-cluster-repo native/fixtures/overflow-leads.txt --cluster-mode leader && GLYPH_TRACE=warn GLYPH_HYPER_ORACLE_STRICT=1 target/release/glyph3d-native --hyper-oracle-check engine/fixtures/*.pipe.bin native/fixtures/cubecl-fork native/fixtures/g-cluster-repo native/fixtures/overflow-leads.txt"
+cmd = "GLYPH_TRACE=warn target/release/glyph3d-native --hyper-oracle-check native/fixtures/cubecl-fork native/fixtures/g-cluster-repo native/fixtures/overflow-leads.txt --cluster-mode leader && GLYPH_TRACE=warn GLYPH_HYPER_ORACLE_STRICT=1 target/release/glyph3d-native --hyper-oracle-check engine/fixtures/*.pipe.bin native/fixtures/cubecl-fork native/fixtures/g-cluster-repo native/fixtures/overflow-leads.txt"
 pass_line = "hyper-oracle PASS"
 needs = ["renderer", "fixtures"]
-compare = "HyperLayout vs fold.rs's records compacted by layout::compact_records_into, bit-exact, through layout::diff_backends plus a per-record tally naming the byte, on FOUR tiers: records (its recording path, rederive.rs), host instances and placements (pass2_host.rs, a device-less load), and the DEVICE Pass 2 (pass2_device.rs, what every GPU load runs) run into host memory in both slot formats — RenderSlot byte-for-byte, DerivedSlot on every lane it carries — plus its placements. Corpora: the 23 non-paged fixtures (each item its own buffer, its own cluster mode), the IMMUTABLE cubecl-fork corpus, g-cluster-repo and overflow-leads.txt in cluster mode, then those three again in leader mode. 2026-10-09: 474,072 records / 467,174 instances / 467,174 device slots x2 / 37 placements in the first run (386 sequence heads, 35 ASCII-led); 320,012 records / 315,927 instances and device slots x2 / 7 placements in the leader run. STRICT (first run) refuses zero records, zero sequence heads, or zero ASCII-led heads; both runs refuse zero device slots"
-blind_to = "the C14 class, by the split above (hyper-oracle-paged sees it). Shared with the reference and so invisible here: the atlas trie (TrieTable::lookup, fu_to_world — the fixtures' own tries are world-unit and HyperLayout resolves font units) and fold::{rows_for_line, wrap_segment_of, wrap_row_of}, which HyperLayout borrows (reference-port fences those; phantom-row is the measured example). The device path past the emitter (the staging copy into VRAM, buffer chunking), the Derived field's vertex-stage Y/Z (the slot carries none), and the background Pass 1 prefetch (repo-verify holds it to the inline Pass 1 used here). A sequence split across an intra-line chunk cut (a line > 64 KiB with no newline in the next 64 KiB) — no corpus here has one"
-
-# The C14 half of hyper-oracle: the fixtures that set scroll_rows or
-# page_cols. RED until C14 is fixed (host and device Pass 2 paginate these
-# unlike the fold; the recording path agrees, so records are clean). No
-# mutation: it cannot be proven while red.
-[[gate]]
-name = "hyper-oracle-paged"
-scope = "render"
-kind = "cmd"
-cmd = "GLYPH_TRACE=warn target/release/glyph3d-native --hyper-oracle-check engine/fixtures/paged-rows.pipe.bin engine/fixtures/paged-cols.pipe.bin engine/fixtures/scroll-only.pipe.bin"
-pass_line = "hyper-oracle PASS"
-needs = ["renderer", "fixtures"]
-compare = "hyper-oracle's four tiers over paged-rows, paged-cols and scroll-only (1,162 records)"
-blind_to = "RED today (C14): 0/1,162 records but 1,088/1,109 host instances, 1,088+483 device slots (render+derived) and every placement differ — scroll_rows and page_cols are paginated unlike the fold on both Pass 2 paths. Everything hyper-oracle is blind to"
+compare = "HyperLayout vs fold.rs's records compacted by layout::compact_records_into, bit-exact, through layout::diff_backends plus a per-record tally naming the byte, on FOUR tiers: records (its recording path, rederive.rs), host instances and placements (pass2_host.rs, a device-less load), and the DEVICE Pass 2 (pass2_device.rs, what every GPU load runs) run into host memory in both slot formats — RenderSlot byte-for-byte, DerivedSlot on every lane it carries — plus its placements. Corpora: the 26 pipe fixtures (each item its own buffer, its own cluster mode; paged-rows, paged-cols and scroll-only carry the page_rows / page_cols / scroll_rows classes), the IMMUTABLE cubecl-fork corpus, g-cluster-repo and overflow-leads.txt in cluster mode, then those three again in leader mode. 2026-10-09: 475,234 records / 468,283 instances / 468,283 device slots x2 / 40 placements in the first run (386 sequence heads, 35 ASCII-led); 320,012 records / 315,927 instances and device slots x2 / 7 placements in the leader run. STRICT (first run) refuses zero records, zero sequence heads, or zero ASCII-led heads; both runs refuse zero device slots"
+blind_to = "Shared with the reference and so invisible here: the atlas trie (TrieTable::lookup, fu_to_world — the fixtures' own tries are world-unit and HyperLayout resolves font units) and fold::{rows_for_line, wrap_segment_of, wrap_row_of}, which HyperLayout borrows (reference-port fences those; phantom-row is the measured example). The device path past the emitter (the staging copy into VRAM, buffer chunking), the Derived field's vertex-stage Y/Z (the slot carries none), and the background Pass 1 prefetch (repo-verify holds it to the inline Pass 1 used here). A sequence split across an intra-line chunk cut (a line > 64 KiB with no newline in the next 64 KiB) — no corpus here has one"
 
 # HyperLayout against itself. EVERY --repo-engine but cubecl constructs the
 # same HyperLayout (layout.rs's backend table), so this is not an independent
@@ -760,6 +744,52 @@ find = "let right = nl_x + trie.fast_byte_table[b'\\n' as usize].advance;"
 with = "let right = nl_x;"
 expect = "hyper-oracle FAIL"
 rebuild = "cargo build --release"
+
+[[mutation]]
+name = "hyper-page-scroll-sign"
+gate = "hyper-oracle"
+why = "C14 put back in its first form: the conveyor runs the wrong way (screen_row = row + scroll_rows), so every row of a scrolled item lands scroll_rows*2 rows from where the fold puts it. The recording path (rederive.rs) has its own paginate, so records stay clean and only the instance tiers see it. CONSUMED BY: layout_hyper/page.rs Pager::frame, which the host Pass 2, both device Pass 2 paths and the cubecl prep's placement call for every cell of a paged item; reached by paged-rows and scroll-only (scroll_rows 3 and 5) on the host and device tiers"
+file = "native/src/layout_hyper/page.rs"
+op = "replace"
+find = "let screen_row = row - self.scroll;"
+with = "let screen_row = row + self.scroll;"
+expect = "hyper-oracle FAIL"
+rebuild = "cargo build --release"
+
+[[mutation]]
+name = "hyper-device-x-page-dropped"
+gate = "hyper-oracle"
+why = "the device Pass 2's pure-ASCII line path forgets the column page (x_page 0 on every run, its form before C14), so a column-paged item's cells past the first page lose their depth_per_col. The host Pass 2 and the per-byte device path are unaffected: only the device tier can see it. CONSUMED BY: layout_pass2_chunk's run frame under column paging, reached by paged-cols (page_cols 8, depth_per_col 0.75, pure-ASCII lines up to 32 columns)"
+file = "native/src/layout_hyper/pass2_device.rs"
+op = "replace"
+find = "                            x_page = (seg_offset / page_cols) as i64;"
+with = "                            x_page = 0;"
+expect = "hyper-oracle FAIL"
+rebuild = "cargo build --release"
+
+[[mutation]]
+name = "hyper-device-page-cols-run"
+gate = "cargo-test"
+why = "the device Pass 2's pure-ASCII line path stops cutting its runs at page_cols, so a column page turns only where the fold unit does. With wrap off the fold unit IS page_cols and the two cuts coincide, which is why hyper-oracle (paged-cols has wrap 0) stays green — measured 2026-10-09; the witness is the grid test, whose shapes put page_cols 4/5 under wrap 3/6/7. CONSUMED BY: layout_pass2_chunk's run length under column paging with a wrap; reddens hyper_oracle::tests::pagination_agrees_on_every_tier on the device tier"
+file = "native/src/layout_hyper/pass2_device.rs"
+op = "replace"
+find = "                                .min(page_cols - seg_offset % page_cols)"
+with = "                                .min(usize::MAX - page_cols)"
+expect = "pagination_agrees_on_every_tier"
+
+[[mutation]]
+name = "hyper-pass1-stride-after-advance"
+gate = "cargo-test"
+why = "Pass 1's widest-x takes an unterminated pure-ASCII line's x AFTER its last glyph, as it did before C14: the page stride grows by one advance whenever such a line is an item's widest. No gate corpus has a multi-page item whose widest line is its unterminated last (paged-rows' last line ties a terminated one), so hyper-oracle stays green and the witness is the grid test. CONSUMED BY: ascii_line_max_x, Pass 1's stride for every pure-ASCII line; reddens hyper_oracle::tests::pagination_agrees_on_every_tier (text 1 under row paging, pages_wide > 1)"
+file = "native/src/layout_hyper.rs"
+op = "replace"
+find = '''    } else if l > 0 {
+        l - 1
+    } else {'''
+with = '''    } else if l > 0 {
+        l
+    } else {'''
+expect = "pagination_agrees_on_every_tier"
 
 [[mutation]]
 name = "emitter-ordinal-zeroed"

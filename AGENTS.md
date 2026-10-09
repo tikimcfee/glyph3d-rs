@@ -298,9 +298,9 @@ synthetic one), and silently to the 22 fixtures outside text.rs's domain. The
 parse is checked only through the lanes computed from it: the second loader
 it was once diffed against (Mojo) is retired.
 
-**hyper-oracle** and **hyper-oracle-paged** (`--hyper-oracle-check`,
-`native/src/hyper_oracle.rs`; new 2026-10-09; hyper-oracle **green** since
-the C10/C13 fix the same day, hyper-oracle-paged **red**, C14). HyperLayout —
+**hyper-oracle** (`--hyper-oracle-check`, `native/src/hyper_oracle.rs`; new
+2026-10-09; **green** since the C10/C13 fix the same day, and over the paged
+fixtures too since the C14 fix, dd6fe01). HyperLayout —
 the production layout engine — against an oracle-backed reference:
 `fold::run_pipeline` (decode, sequence pass, fold, paginate — the form
 reference-port holds bit-exact to the oracle), its records compacted by
@@ -312,35 +312,48 @@ host Pass 2, what a device-less load runs), and the DEVICE Pass 2
 placements. The device tier runs the production emitter into host memory:
 the unified, discrete and host-staging paths all hand the same
 `EmitInputs::run` a raw address of writable memory, so only where the bytes
-land is swapped. Corpus: the fixtures' bytes and item params (each item its
-own buffer, as a repo file is, in its own cluster mode), the IMMUTABLE
+land is swapped. Corpus: the 26 pipe fixtures' bytes and item params (each item
+its own buffer, as a repo file is, in its own cluster mode; `paged-rows`,
+`paged-cols` and `scroll-only` carry the `page_rows`/`page_cols`/`scroll_rows`
+classes), the IMMUTABLE
 `cubecl-fork` corpus, `g-cluster-repo` and `overflow-leads.txt` (the
 out-of-range decode input no check read after 2026-09-30) in cluster mode,
 then those three again in leader mode. STRICT refuses zero records, zero
 resolved sequences, and zero ASCII-led sequences; both runs refuse zero device
-slots. **The split**: the three fixtures that set `scroll_rows`/`page_cols`
-(`paged-rows`, `paged-cols`, `scroll-only`) are hyper-oracle-paged's, red
-because both Pass 2 paths paginate them unlike the fold (C14; records agree,
-instances do not; latent for repos, which set neither). A `GLOBIGNORE` in
-hyper-oracle's command is the split and nothing else; delete both when C14
-lands. **History**: red on arrival, 6 of 29 corpora. The keycap class
+slots. **History**: red on arrival, 6 of 29 corpora. The keycap class
 (HyperLayout's ASCII fast path never asked whether `1` starts a sequence, so
 `1️⃣` laid out as `1` plus a stray mark) and the cluster MODE (ignored:
 leader-mode ZWJ zeroed in `cluster-zwj`; 29,826 records of `cubecl-fork` +
 `g-cluster-repo` under `--cluster-mode leader`) were fixed together; the
 device tier, added with the fix, then found the device Pass 2's page extent
 dropping the newline's own record (fixed too; page extents feed no pixel).
-What the two sides SHARE, and this therefore cannot see: the atlas trie
+The three paged fixtures were split out to a red `hyper-oracle-paged` gate
+until C14 was fixed (both Pass 2 paths paginated them unlike the fold:
+`row + scroll_rows`, `y_page` from the unscrolled row, `x_page` dropped
+without `page_rows`; the device line path never turned a column page; Pass 1's
+stride took an unterminated line's x after its last advance). Records agreed
+throughout — the recording path had its own, correct paginate. The emitters
+now share one transcription of `fold::paginate`, `layout_hyper/page.rs`.
+Note that every REPO load is paged (`file_item_params` sets `has_page` and
+`page_rows`; only `scroll_rows` and `page_cols` are unset), so this code is
+on the common path. What the two sides SHARE, and this therefore cannot see: the atlas trie
 (`TrieTable::lookup`, `fu_to_world` — the fixtures' own tries are world-unit
 and HyperLayout resolves font units, so the oracle has never seen the atlas
 trie), and `fold::{rows_for_line, wrap_segment_of, wrap_row_of}`, which
 HyperLayout borrows from the reference (reference-port fences those:
 `phantom-row` reddens it and leaves this gate's count unmoved). Also blind to
 the device path past the emitter (the staging copy, buffer chunking), the
-Derived field's vertex-stage Y/Z, and the Pass 1 prefetch. Mutations:
-`hyper-head-advance`, `hyper-keycap-lookahead-dropped`,
-`hyper-leader-mode-ignored`, and two only the device tier can see,
-`hyper-device-leader-mode-ignored` and `hyper-device-newline-page`.
+Derived field's vertex-stage Y/Z, and the Pass 1 prefetch. Two paging
+classes no gate corpus reaches — a column page that turns inside a fold unit
+(`page_cols` under a different `wrap_width`) and an unterminated widest last
+line in a multi-page item — are fenced by the unit grid
+`hyper_oracle::tests::pagination_agrees_on_every_tier` instead (cargo-test).
+Mutations: `hyper-head-advance`, `hyper-keycap-lookahead-dropped`,
+`hyper-leader-mode-ignored`, `hyper-page-scroll-sign`, and three only the
+device tier can see, `hyper-device-leader-mode-ignored`,
+`hyper-device-newline-page` and `hyper-device-x-page-dropped`; on cargo-test,
+`hyper-device-page-cols-run` and `hyper-pass1-stride-after-advance` (the two
+classes above).
 Measured but ungated (2026-10-09): a 94 MB tree of crates.io sources is
 bit-exact on every tier in both modes (99 M records); `g-pick-repo` is not,
 on the device tier only — 65 slots of `wide.txt`'s 213 KB line differ in x by
