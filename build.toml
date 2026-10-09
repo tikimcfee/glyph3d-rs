@@ -30,13 +30,19 @@ test_floor = 234
 
 # ── Products ─────────────────────────────────────────────────────────────
 
-# `{dylib}` is the host's shared-library extension (dylib on macOS, so on
-# Linux), substituted by the runner at load. pixi.toml's build-engine task is
-# per-platform for the same reason.
+# The renderer's inputs are everything cargo compiles into the binary: its
+# source and the workspace crates (every include_str!/include_bytes! resolves
+# inside those two trees; the atlas is read at RUN time, not compiled in), the
+# root manifest (workspace members, [profile.release]), the root lockfile
+# (dependency versions) and cargo config. Until 2026-10-09 this named
+# `native/Cargo.lock`, gone since the workspace move (2026-09-06), and omitted
+# the root two, so a dependency bump left the stamp unchanged and `--frozen`
+# called a stale binary current (measured: lockfile edited, "renderer
+# current"). validate() now refuses a literal input that names no file.
 [artifact.renderer]
 class = "product"
 outputs = ["target/release/glyph3d-native"]
-inputs = ["native/src/**/*", "native/Cargo.toml", "native/Cargo.lock", "crates/**/*"]
+inputs = ["native/src/**/*", "native/Cargo.toml", "crates/**/*", "Cargo.toml", "Cargo.lock", ".cargo/config.toml"]
 build = "cd native && cargo build --release"
 note = "Pure-Rust native renderer."
 
@@ -308,6 +314,16 @@ file = "build.toml"
 op = "replace"
 find = '"native/src/**/*"'
 with = '"native/src/**"'
+expect = "matches no file"
+
+[[mutation]]
+name = "dead-input-literal"
+gate = "manifest"
+why = "the literal-path twin of dead-input-glob: an input naming a file that does not exist hashes nothing for it, so changes to what it was meant to cover never stale the product. `native/Cargo.lock` was exactly this from the workspace move (2026-09-06) until 2026-10-09, invisible because the dead-glob check only scanned patterns containing `*`. CONSUMED BY: the product-input scan in validate(), and nothing else"
+file = "build.toml"
+op = "replace"
+find = '"Cargo.toml", "Cargo.lock", ".cargo/config.toml"'
+with = '"Cargo.toml", "native/Cargo.lock", ".cargo/config.toml"'
 expect = "matches no file"
 
 [[mutation]]

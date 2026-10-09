@@ -519,6 +519,21 @@ Main's build fix (872621d, the other agent's) was fast-forwarded in before any o
 `ln -s ~/localdev/externalcompute/zed experiments/zed`;
 `export GLYPH_FLAGSHIP_REPO=~/localdev/viz-web/glyph3d-js`.
 
+**Closed 2026-10-09: renderer currency missed the lockfile** [measured].
+`[artifact.renderer]` inputs named `native/Cargo.lock` (gone since the
+workspace move, 2026-09-06) and omitted the root `Cargo.toml` and `Cargo.lock`.
+Measured on main@872621d's own runner in a scratch tree: lockfile perturbed,
+`test --frozen` printed "renderer current". Fixed: inputs now cover the root
+manifest, lockfile and `.cargo/config.toml`; same perturbation now prints
+"renderer is stale". Root cause was a validation gap: `validate()` scanned only
+`*` patterns for dead inputs, so a dead LITERAL passed. It scans every input now,
+and mutation `dead-input-literal` proves it (reddens with the fix, stays green
+with the old scan).
+Measuring trap, worth keeping: `cargo run -p glyph` re-serializes `Cargo.lock`
+BEFORE the runner hashes it, silently undoing a whitespace perturbation. My
+first "defect confirmed" was void for that reason. Measure with
+`target/release/glyph` directly.
+
 **Open threads, next up (Ivan named these):**
 - Experiments links: the symlink scheme is committed but has never been built
   against real Zed. No Zed checkout on this box.
@@ -530,12 +545,11 @@ Main's build fix (872621d, the other agent's) was fast-forwarded in before any o
   re-adoption including emoji-cluster and repo-cluster. Ivan's call (section 3).
 - `cargo glyph` alias doubles inside `.claude/worktrees/` (item 1a½). Unfixed.
 - Section 4 commit order, steps 2–8: untouched.
-- NEW 2026-10-09: `build.toml` `[artifact.renderer]` inputs list
-  `native/Cargo.lock`, which has not existed since the workspace move
-  (2026-09-06, lock at the root), and omit the root `Cargo.toml`. So a
-  dependency bump or a new workspace member does not change the renderer's
-  input hash, and `--frozen` would call a stale binary current. [inferred
-  from the manifest; not measured]
 - `just` is not installed here, so the justfile `profile` recipe is unrun.
+- Dead Mojo-era machinery in the runner: `dylib_ext()` and the `{dylib}` token
+  substitution (`glyph/src/main.rs`) serve no artifact any more; the build
+  verb's help still says "and the engine dylib". Goes with the AGENTS rewrite
+  (item 1a), which must also fix "Currency is a content hash of the declared
+  inputs (`engine/*.mojo` + the pixi pins)".
 - `discovery.rs` derives a Claude project name from the slug's last `-`
   segment (`…-glyph3d-js` → `js`).

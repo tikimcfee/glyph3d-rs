@@ -939,7 +939,12 @@ fn validate(m: &Manifest) -> Vec<String> {
                 // greened on a stale binary. The empty-list check above was
                 // written for this exact failure and could not see it, because
                 // the list was three patterns long.
-                for pat in a.inputs.iter().filter(|s| s.contains('*')) {
+                //
+                // A LITERAL path that names no file is the same failure without
+                // a glob: `native/Cargo.lock` outlived the workspace move by a
+                // month (2026-09-06 to 2026-10-09) because this scan once looked
+                // only at patterns containing `*`. Every input is scanned now.
+                for pat in &a.inputs {
                     if expand(pat).is_empty() {
                         p.push(format!(
                             "artifact {name} input pattern {pat} matches no file; the currency \
