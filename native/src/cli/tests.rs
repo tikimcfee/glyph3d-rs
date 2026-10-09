@@ -334,11 +334,11 @@ fn repo_engine_rejects_bad_value() {
 
 #[test]
 fn verb_error_messages_survive() {
-    let err = parse_verb("frobnicate 1 2").err().expect("bad verb must fail");
+    let err = parse_verb("frobnicate 1 2").expect_err("bad verb must fail");
     assert!(err.contains("unknown/malformed --verb"), "{err}");
-    let err = parse_verb("nudge-glyph 1").err().expect("bad verb must fail");
+    let err = parse_verb("nudge-glyph 1").expect_err("bad verb must fail");
     assert!(err.contains("bad/missing float at position 2"), "{err}");
-    let err = parse_verb("tint-group zzzz").err().expect("bad verb must fail");
+    let err = parse_verb("tint-group zzzz").expect_err("bad verb must fail");
     assert!(err.contains("bad hex color"), "{err}");
     let err = try_parse(&["--verb", "frobnicate"]).err().expect("bad verb must fail");
     assert!(err.to_string().contains("unknown/malformed --verb"), "{err}");

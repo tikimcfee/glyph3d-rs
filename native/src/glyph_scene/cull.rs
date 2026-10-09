@@ -703,7 +703,7 @@ mod cull_depth_tests {
         v.file_backgrounds = true;
         v.file_bg_color = [0.2, 0.3, 0.4, 0.5];
 
-        let d = cull_segments(&[s.clone()], &[false], &v, 1024, 1);
+        let d = cull_segments(std::slice::from_ref(&s), &[false], &v, 1024, 1);
         assert!(drew_glyphs(&d), "glyphs must be drawn in near mode");
         assert_eq!(d.backdrops.len(), 1, "background quad must be emitted behind glyphs");
         assert_eq!(d.backdrops[0].rgba, [0.2, 0.3, 0.4, 0.5]);

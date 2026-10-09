@@ -1243,6 +1243,9 @@ fn paint_files(files: &[&[u8]]) -> Vec<Vec<u32>> {
 }
 
 #[cfg(test)]
+// A one-element slice of fold ranges is a real input here (one fold), not a
+// mistyped `(a..b).collect()` — the shape this lint exists to catch.
+#[allow(clippy::single_range_in_vec_init)]
 mod tests {
     use super::*;
     use crate::layout::GlyphRecord;

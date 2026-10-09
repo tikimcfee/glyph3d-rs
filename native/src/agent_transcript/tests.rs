@@ -231,7 +231,7 @@ fn test_degenerate_inputs() {
 
 #[test]
 fn test_antigravity_transcript_parsing() {
-    let lines = vec![
+    let lines = [
         json!({
             "step_index": 0,
             "type": "USER_INPUT",
@@ -291,7 +291,7 @@ fn test_antigravity_encoded_strings_and_multiline_revisions() {
     use crate::revision::RevisionEngine;
 
     // Real-world Antigravity transcript format with double-encoded JSON string args:
-    let lines = vec![
+    let lines = [
         json!({
             "step_index": 0,
             "type": "USER_INPUT",
@@ -384,7 +384,7 @@ fn test_antigravity_encoded_strings_and_multiline_revisions() {
 
 #[test]
 fn test_multi_turn_file_actions() {
-    let lines = vec![
+    let lines = [
         // Turn 1: user asks to create file
         json!({
             "type": "user",
@@ -496,7 +496,7 @@ fn test_stage_agent_session_creates_controller_and_navigates() {
     use super::{stage_agent_session, parse_claude_session};
     use crate::revision::RevisionEngine;
 
-    let transcript = vec![
+    let transcript = [
         json!({
             "type": "user",
             "message": { "role": "user", "content": [{ "type": "text", "text": "Turn 0 prompt" }] }
@@ -561,7 +561,7 @@ fn test_stage_agent_session_formats_and_populates_text() {
     use super::{parse_claude_session, stage_agent_session};
     use crate::revision::RevisionEngine;
 
-    let transcript = vec![
+    let transcript = [
         json!({
             "type": "user",
             "message": { "role": "user", "content": [{ "type": "text", "text": "Plan refactor for rendering" }] }

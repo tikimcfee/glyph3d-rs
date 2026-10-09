@@ -243,8 +243,9 @@ warning rustc emits; a build ERROR is fatal (the battery stops). Blind to
 anything silenced with `#[allow(...)]`.
 
 **cargo-clippy.** `cargo clippy --release`, zero warnings. Same, for lints.
-Blind to test-only code: the gate does not pass `--all-targets` (which, as of
-2026-10-08, reports 14 test-only lints, one of them deny-level).
+It runs with `--all-targets` (since 2026-10-09), so test code is linted too:
+until then 14 test-only lints had piled up unseen, one of them deny-level.
+Blind to anything silenced with `#[allow(...)]`.
 
 **cargo-doc.** `cargo doc --no-deps`, zero warnings. Red when a doc comment names
 a symbol that no longer exists, or leaves an HTML tag open. It exists because

@@ -285,7 +285,7 @@ mod tests {
         let starts = [0usize, 4];
         // Empty (and inverted) ranges contain no lines.
         assert_eq!(
-            normalized_fold_lines(&[fold(3..3), fold(5..2)], &starts),
+            normalized_fold_lines(&[fold(3..3), fold(Range { start: 5, end: 2 })], &starts),
             Vec::<Range<u32>>::new()
         );
         // A byte past EOF clamps to the LAST line — never invents one.

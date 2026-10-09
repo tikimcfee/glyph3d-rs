@@ -221,7 +221,7 @@ mod tests {
     #[test]
     fn grid_phase_survives_a_far_eye() {
         let cam = EnvCamera {
-            eye: DVec3::new(12_345.678, 50.0, -98_765.4321),
+            eye: DVec3::new(12_345.678, 50.0, -98_765.432_1),
             vp_rel: Mat4::IDENTITY,
             far: 100_000.0,
             fit: 50.0,

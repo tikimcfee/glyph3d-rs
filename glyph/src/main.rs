@@ -661,7 +661,7 @@ fn warn_count(out: &str) -> usize {
 fn gate_cargo(g: &Gate) -> bool {
     let cmd = match g.cmd.as_deref() {
         Some("build") => "cargo build --release",
-        Some("clippy") => "cargo clippy --release",
+        Some("clippy") => "cargo clippy --release --all-targets",
         // Doc links are the one rename hazard nothing else in this battery can
         // see: `[`Engine::records`]` kept pointing at a method that had been
         // renamed to `read_back`, through a full green run, because rustdoc is
@@ -1499,84 +1499,6 @@ fn test_verdict(selected: usize, total: usize, scope: Option<Scope>, ok: bool) -
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn empty_gate_selection_is_refused() {
-        let (ok, line) = test_verdict(0, 9, Some(Scope::Corpus), true);
-        assert!(!ok, "a run that selected no gate must not pass");
-        assert!(line.starts_with("CHECK-ALL: NOTHING RAN"), "{line}");
-        assert!(line.contains("0 of 9 gates ran, scope corpus"), "{line}");
-    }
-
-    #[test]
-    fn verdict_reports_how_many_gates_ran() {
-        assert_eq!(
-            test_verdict(4, 9, Some(Scope::Rust), true),
-            (true, "CHECK-ALL: ALL GATES GREEN — 4 of 9 gates ran, scope rust".to_string())
-        );
-        assert_eq!(
-            test_verdict(9, 9, None, false),
-            (false, "CHECK-ALL: FAILURES — see above (9 of 9 gates ran)".to_string())
-        );
-    }
-
-    /// The doubled alias of a nested worktree is stripped, at any depth, and
-    /// nothing else is.
-    #[test]
-    fn doubled_alias_is_stripped() {
-        let os = |v: &[&str]| v.iter().map(std::ffi::OsString::from).collect::<Vec<_>>();
-        let mut nested = vec!["glyph"];
-        nested.extend(ALIAS_EXPANSION);
-        nested.extend(ALIAS_EXPANSION);
-        nested.push("test");
-        assert_eq!(strip_doubled_alias(os(&nested)), os(&["glyph", "test"]));
-        assert_eq!(strip_doubled_alias(os(&["glyph", "test", "rust"])), os(&["glyph", "test", "rust"]));
-        // `glyph run` passes its arguments to the renderer: left alone.
-        assert_eq!(strip_doubled_alias(os(&["glyph", "run", "--demo"])), os(&["glyph", "run", "--demo"]));
-    }
-
-    /// The constant is the alias cargo actually expands.
-    #[test]
-    fn alias_expansion_matches_cargo_config() {
-        let cfg: toml::Table = std::fs::read_to_string(root().join(".cargo/config.toml"))
-            .expect(".cargo/config.toml reads")
-            .parse()
-            .expect(".cargo/config.toml parses");
-        let alias = cfg["alias"]["glyph"].as_array().expect("alias.glyph is an array");
-        let alias: Vec<&str> = alias.iter().map(|v| v.as_str().expect("string")).collect();
-        assert_eq!(alias, ALIAS_EXPANSION);
-    }
-
-    /// A mutation's find must name ONE place (C11), and no declared one names two.
-    #[test]
-    fn mutation_finds_are_unambiguous() {
-        assert_eq!(find_matches("a b a", "a"), 2);
-        assert_eq!(find_matches("a b", ""), 0);
-        let m = load().expect("build.toml loads");
-        for mu in m.mutation.iter().filter(|mu| mu.op == "replace") {
-            let text = std::fs::read_to_string(root().join(&mu.file)).expect("mutation target reads");
-            let n = find_matches(&text, mu.find.as_deref().unwrap_or_default());
-            // At most one: zero is the prover's own refusal ("find-text
-            // absent"), and is also what this test sees for a mutation that is
-            // APPLIED while cargo-test runs under prove.
-            assert!(n <= 1, "mutation {} matches {n} times in {}", mu.name, mu.file);
-        }
-    }
-
-    /// prove re-stales exactly the products a restored file feeds: a renderer
-    /// source and a crate source do, a check script does not.
-    #[test]
-    fn mutated_inputs_name_the_products_they_feed() {
-        let m = load().expect("build.toml loads");
-        assert_eq!(products_reading(&m, "native/src/main.rs"), ["renderer"]);
-        assert_eq!(products_reading(&m, "crates/glyph-field/src/copy.rs"), ["renderer"]);
-        assert!(products_reading(&m, "tools/check-cubecl.sh").is_empty());
-    }
-}
-
 /// What `cargo glyph` expands to — `.cargo/config.toml`'s alias, pinned to it
 /// by `alias_expansion_matches_cargo_config`.
 const ALIAS_EXPANSION: [&str; 6] = ["run", "--quiet", "--release", "-p", "glyph", "--"];
@@ -1596,6 +1518,7 @@ fn strip_doubled_alias(mut args: Vec<std::ffi::OsString>) -> Vec<std::ffi::OsStr
     }
     args
 }
+
 
 fn main() -> ExitCode {
     // Before anything can rebuild us out from under ourselves; see self_exe.
@@ -1714,5 +1637,83 @@ fn main() -> ExitCode {
         ExitCode::SUCCESS
     } else {
         ExitCode::from(1)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn empty_gate_selection_is_refused() {
+        let (ok, line) = test_verdict(0, 9, Some(Scope::Corpus), true);
+        assert!(!ok, "a run that selected no gate must not pass");
+        assert!(line.starts_with("CHECK-ALL: NOTHING RAN"), "{line}");
+        assert!(line.contains("0 of 9 gates ran, scope corpus"), "{line}");
+    }
+
+    #[test]
+    fn verdict_reports_how_many_gates_ran() {
+        assert_eq!(
+            test_verdict(4, 9, Some(Scope::Rust), true),
+            (true, "CHECK-ALL: ALL GATES GREEN — 4 of 9 gates ran, scope rust".to_string())
+        );
+        assert_eq!(
+            test_verdict(9, 9, None, false),
+            (false, "CHECK-ALL: FAILURES — see above (9 of 9 gates ran)".to_string())
+        );
+    }
+
+    /// The doubled alias of a nested worktree is stripped, at any depth, and
+    /// nothing else is.
+    #[test]
+    fn doubled_alias_is_stripped() {
+        let os = |v: &[&str]| v.iter().map(std::ffi::OsString::from).collect::<Vec<_>>();
+        let mut nested = vec!["glyph"];
+        nested.extend(ALIAS_EXPANSION);
+        nested.extend(ALIAS_EXPANSION);
+        nested.push("test");
+        assert_eq!(strip_doubled_alias(os(&nested)), os(&["glyph", "test"]));
+        assert_eq!(strip_doubled_alias(os(&["glyph", "test", "rust"])), os(&["glyph", "test", "rust"]));
+        // `glyph run` passes its arguments to the renderer: left alone.
+        assert_eq!(strip_doubled_alias(os(&["glyph", "run", "--demo"])), os(&["glyph", "run", "--demo"]));
+    }
+
+    /// The constant is the alias cargo actually expands.
+    #[test]
+    fn alias_expansion_matches_cargo_config() {
+        let cfg: toml::Table = std::fs::read_to_string(root().join(".cargo/config.toml"))
+            .expect(".cargo/config.toml reads")
+            .parse()
+            .expect(".cargo/config.toml parses");
+        let alias = cfg["alias"]["glyph"].as_array().expect("alias.glyph is an array");
+        let alias: Vec<&str> = alias.iter().map(|v| v.as_str().expect("string")).collect();
+        assert_eq!(alias, ALIAS_EXPANSION);
+    }
+
+    /// A mutation's find must name ONE place (C11), and no declared one names two.
+    #[test]
+    fn mutation_finds_are_unambiguous() {
+        assert_eq!(find_matches("a b a", "a"), 2);
+        assert_eq!(find_matches("a b", ""), 0);
+        let m = load().expect("build.toml loads");
+        for mu in m.mutation.iter().filter(|mu| mu.op == "replace") {
+            let text = std::fs::read_to_string(root().join(&mu.file)).expect("mutation target reads");
+            let n = find_matches(&text, mu.find.as_deref().unwrap_or_default());
+            // At most one: zero is the prover's own refusal ("find-text
+            // absent"), and is also what this test sees for a mutation that is
+            // APPLIED while cargo-test runs under prove.
+            assert!(n <= 1, "mutation {} matches {n} times in {}", mu.name, mu.file);
+        }
+    }
+
+    /// prove re-stales exactly the products a restored file feeds: a renderer
+    /// source and a crate source do, a check script does not.
+    #[test]
+    fn mutated_inputs_name_the_products_they_feed() {
+        let m = load().expect("build.toml loads");
+        assert_eq!(products_reading(&m, "native/src/main.rs"), ["renderer"]);
+        assert_eq!(products_reading(&m, "crates/glyph-field/src/copy.rs"), ["renderer"]);
+        assert!(products_reading(&m, "tools/check-cubecl.sh").is_empty());
     }
 }

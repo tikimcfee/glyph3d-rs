@@ -498,7 +498,7 @@ fn test_agent_carrel_spawning_and_turn_navigation() {
     use crate::revision::RevisionEngine;
     use serde_json::json;
 
-    let transcript = vec![
+    let transcript = [
         // Turn 0
         json!({
             "type": "user",
