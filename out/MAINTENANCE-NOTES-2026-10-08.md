@@ -22,7 +22,7 @@ machines and clones, **M** machine-specific values, **R** runner.
 | ID | Item | Status | Commit / next step |
 |---|---|---|---|
 | D1 | Root and native AGENTS.md described 16 gates and the retired engine as live | closed | 3fc716c (root), 7a99b5a (native) |
-| D2 | `cargo glyph` alias doubles inside `.claude/worktrees/` | closed | the alias is a string (cargo concatenates arrays across nested configs, not strings; measured). Needs main to carry it too: array-over-string refuses to merge |
+| D2 | `cargo glyph` alias doubles inside `.claude/worktrees/` | open | pick a fix option (below) |
 | D3 | `cargo glyph test engine` matched zero gates, printed ALL GATES GREEN | closed | 4d9de92: refused as NOTHING RAN; every verdict counts gates; `engine` scope gone |
 | D4 | `.agents/rules/rust-engineering.md` claims the tree does not back | open | short pass |
 | D5 | pixi carried the retired engine's tasks and mojo/max toolchain | closed | 16372a9 (tasks), 6954a9d (deps, lock re-solved; Mac env unsolved-installed) |
@@ -116,6 +116,25 @@ For discussion: C10, D9, X1, X2, P1. Small, fit anywhere: C8, C9, C11, X3.
 ---
 
 ## Open items: detail
+
+### D2. `cargo glyph` alias doubles in worktrees — [measured]
+
+Cargo merges `.cargo/config.toml` from every ancestor directory and `[alias]`
+arrays concatenate. From `.claude/worktrees/<name>`:
+
+```
+glyph   alias: run --quiet --release -p glyph -- run --quiet --release -p glyph --
+```
+
+The tool takes `run` as its verb and launches the renderer, which rejects
+`--quiet`. Workaround: `cargo run --quiet --release -p glyph -- <verb>`, or
+`target/release/glyph <verb>` once built. `just check` is broken too.
+
+**Options:** (a) document worktrees outside the repo directory
+(`git worktree add ../glyph3d-rs-wt/<name>`); (b) justfile recipes call the
+expanded command; (c) the tool strips a repeated alias prefix from argv.
+(a)+(b) recommended. Claude Code's own worktrees live under `.claude/worktrees/`,
+so (a) only helps human-made ones; weigh (c) for that reason.
 
 ### D4. rust-engineering.md — [measured]
 
@@ -298,7 +317,7 @@ pixel-ab here: 7 of 9 views diverge from `vulkan-nvidia`, 2 have no set.
 - `cargo run -p glyph` re-serializes `Cargo.lock` before the runner hashes
   it, undoing a whitespace perturbation. Measure product currency with
   `target/release/glyph` directly.
-- `cargo glyph` in a nested worktree needs the string alias on BOTH the checkout and the worktree (D2); `target/release/glyph <verb>` always works.
+- `cargo glyph` is broken in worktrees (D2); use the expanded command.
 - Before R4 (2026-10-09), `glyph prove` on a `cargo-test` mutation WITHOUT
   `rebuild` left the mutated renderer in `target/release` under a current
   stamp. Fixed; on an older runner, `cargo build --release` after a prove.

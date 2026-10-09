@@ -94,15 +94,11 @@ The `cargo glyph` alias is repo-scoped (it lives in `.cargo/config.toml`), so
 from outside the workspace call the binary directly:
 `<repo>/target/release/glyph3d-native --load-repo .`
 
-**The alias is a string, not an array, and must stay one** (2026-10-09).
-Cargo merges `.cargo/config.toml` from every ancestor directory and
-CONCATENATES arrays, so in a worktree nested inside the repo
-(`.claude/worktrees/<name>`, where Claude Code puts its own) the array form
-doubled and the tool got `run` as its verb. A string is not merged; the
-nearest config wins (measured with two nested configs). A checkout still on
-the array form and a nested worktree on the string form refuse to merge
-("expected string, but found array"): update both. Fallback that always
-works: `target/release/glyph <verb>`.
+**Inside `.claude/worktrees/<name>` the alias is broken** (measured 2026-10-08):
+cargo merges `.cargo/config.toml` from every ancestor directory and alias arrays
+concatenate, so the tool receives `run …` as its verb and launches the
+renderer. Use `cargo run --quiet --release -p glyph -- <verb>`, or
+`target/release/glyph <verb>` once built.
 
 **Use it rather than the pieces.** Do not hand-run `cargo build`, the `tools/`
 scripts, or the binary's own check flags in place of a gate: the ordering
