@@ -14,16 +14,16 @@ anyhow = "1"
 glyph3d-native = { path = "../../native" }
 pollster = "0.4"
 wgpu = "30"
-gpui = { path = "/Users/lugo/localdev/externalcompute/zed/crates/gpui", features = ["test-support"] }
-language = { path = "/Users/lugo/localdev/externalcompute/zed/crates/language", features = ["test-support"] }
-grammars = { path = "/Users/lugo/localdev/externalcompute/zed/crates/grammars" }
+gpui = { path = "../zed/crates/gpui", features = ["test-support"] }
+language = { path = "../zed/crates/language", features = ["test-support"] }
+grammars = { path = "../zed/crates/grammars" }
 # debug-embed: features do NOT unify across sibling packages — zedspike
 # enabling it does nothing for THIS binary. Without it, zed's fs_embed!
 # locates grammar assets by walking the EXE's ancestors for a .git (finds
 # this worktree, panics "missing config"). Same landmine, second binary.
-util = { path = "/Users/lugo/localdev/externalcompute/zed/crates/util", features = ["debug-embed"] }
-theme = { path = "/Users/lugo/localdev/externalcompute/zed/crates/theme" }
-syntax_theme = { path = "/Users/lugo/localdev/externalcompute/zed/crates/syntax_theme" }
+util = { path = "../zed/crates/util", features = ["debug-embed"] }
+theme = { path = "../zed/crates/theme" }
+syntax_theme = { path = "../zed/crates/syntax_theme" }
 # MUST be zed's git fork (same rev as the workspace patch table) — the Node
 # type this walks is the fork's; a crates.io tree-sitter would be a second,
 # incompatible crate in the graph.

@@ -9,12 +9,19 @@
 # workspace excludes this directory entirely, so the battery never sees
 # Zed's dependency graph. See zed_integration_experiments/docs/seam.md.
 #
-# Path deps point INTO the Zed checkout at ~/localdev/externalcompute/zed —
-# absolute paths are deliberate: this is an experiments-branch spike tied to
-# this machine's layout, not repo content. Workspace-inherited deps of those
-# crates resolve against Zed's own root Cargo.toml.
+# Path deps point INTO a Zed checkout through `experiments/zed`, a gitignored
+# per-machine symlink, so no path in this tree names anyone's home:
+#
+#     ln -s /path/to/your/zed experiments/zed
+#
+# Workspace-inherited deps of those crates resolve against Zed's own root
+# Cargo.toml (cargo walks up from experiments/zed/crates/<x> and finds it).
+# `exclude = ["zed"]` is load-bearing: a path dep under this directory is
+# otherwise auto-claimed as a member HERE, and Zed's `*.workspace = true`
+# fields then fail against this root (measured on a mock, 2026-10-09).
 [workspace]
 members = ["zedspike", "fieldzed"]
+exclude = ["zed"]
 resolver = "2"
 
 # Copied from Zed's root [patch.crates-io]: their tree-sitter is a git fork,

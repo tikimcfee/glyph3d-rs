@@ -19,7 +19,8 @@ use anyhow::Context as _;
 use gpui::AppContext as _;
 use gpui::TestAppContext;
 
-const ZED: &str = "/Users/lugo/localdev/externalcompute/zed";
+/// The Zed checkout, via the per-machine `experiments/zed` symlink.
+const ZED: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../zed");
 
 fn main() -> anyhow::Result<()> {
     let mut args = std::env::args().skip(1);
