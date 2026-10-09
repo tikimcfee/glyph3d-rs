@@ -49,3 +49,6 @@ native/launch_config.toml
 # mise's Python venv (mise.toml creates it at the repo root)
 /.venv/
 
+# experiments/zed is a per-machine symlink to a Zed checkout (experiments/Cargo.toml)
+/experiments/zed
+

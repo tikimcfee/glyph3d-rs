@@ -8,14 +8,14 @@ edition = "2021"
 
 [dependencies]
 anyhow = "1"
-gpui = { path = "/Users/lugo/localdev/externalcompute/zed/crates/gpui", features = ["test-support"] }
-language = { path = "/Users/lugo/localdev/externalcompute/zed/crates/language", features = ["test-support"] }
-grammars = { path = "/Users/lugo/localdev/externalcompute/zed/crates/grammars" }
+gpui = { path = "../zed/crates/gpui", features = ["test-support"] }
+language = { path = "../zed/crates/language", features = ["test-support"] }
+grammars = { path = "../zed/crates/grammars" }
 # debug-embed: zed's fs_embed! macro otherwise locates grammar assets at
 # runtime by walking up from the EXE for a .git — which finds this worktree's
 # repo, not the zed checkout, and panics "missing config". Embedding at
 # compile time makes the spike binary position-independent.
-util = { path = "/Users/lugo/localdev/externalcompute/zed/crates/util", features = ["debug-embed"] }
-theme = { path = "/Users/lugo/localdev/externalcompute/zed/crates/theme" }
-syntax_theme = { path = "/Users/lugo/localdev/externalcompute/zed/crates/syntax_theme" }
+util = { path = "../zed/crates/util", features = ["debug-embed"] }
+theme = { path = "../zed/crates/theme" }
+syntax_theme = { path = "../zed/crates/syntax_theme" }
 tree-sitter-rust = "0.24.2"
