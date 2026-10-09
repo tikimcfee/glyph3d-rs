@@ -450,7 +450,12 @@ distinguish a regression from an intentional change, which is deliberate. A
 commit that moves a pixel on purpose re-baselines in the same commit and says
 why; one that does not leaves every later change unprovable on that platform
 (2026-10-07/08: a camera recentre and a palette change landed without
-re-baselining, and both platforms' sets went red).
+re-baselining, and both platforms' sets went red until 2026-10-09, when both
+were re-adopted — `21f9aef` names the commit behind every pixel that had
+moved, and the walk found two regressions the red gate had hidden: a perf
+commit that culled `long.md`'s far lines (`048d403`, repaired by `9c96ad1`)
+and per-chunk syntax colouring (`8b28f1f`, C17). A red gate stops seeing the
+NEXT change too).
 
 **One golden set per rasterizer, since 2026-09-07.** `<key>` is what the
 renderer prints from `--gpu-key`: `<backend>-<vendor>` off the adapter wgpu
@@ -477,9 +482,11 @@ whether the high-delta pixels are isolated (edge flips) or clustered (something
 has a shape). The day that line stops saying "edge noise" is the day to look at
 the shader; until then a cross-vendor difference is expected and uninteresting.
 
-**One frame already says "clustered", and it was looked at (2026-09-07).**
-`repo-back-oblique` drifts metal-apple vs vulkan-nvidia by 8.93% of pixels with
-236 clustered high-delta — every other view is isolated edge flips, 0 clustered.
+**One frame once said "clustered", and it was looked at (2026-09-07).**
+`repo-back-oblique` drifted metal-apple vs vulkan-nvidia by 8.93% of pixels with
+236 clustered high-delta — every other view isolated edge flips, 0 clustered.
+(At the 2026-10-09 re-adoption it drifts 9.87% with 0 clustered; what removed the cluster was not
+traced. The reasoning below still holds for the band.)
 Both frames were inspected side by side: identical structure, identical text in
 front of the receding column, difference confined to the dense far band where
 thousands of coplanar quads overlap and the two rasterizers reject depth in a
