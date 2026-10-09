@@ -1,4 +1,8 @@
 # Native Rendering Stack Evaluation for GPU Code Visualization
+
+> **Historical (2026-10-09).** An August 2026 survey from the Mojo-engine era;
+> kept for its reasoning, not as current state.
+
 **As of: August 2026**
 
 ## Verdict (TL;DR)

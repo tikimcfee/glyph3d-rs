@@ -16,6 +16,9 @@
 >
 > **For current state read `AGENTS.md`, and run `cargo glyph gates`.** That is
 > the one canonical home; this file is not a second one.
+>
+> **Also (2026-10-09):** the Mojo engine it mentions has since been retired, with
+> its gates and FFI. Where this brief and `AGENTS.md` disagree, `AGENTS.md` wins.
 
 For an agent with no prior context on this repo. Everything needed is here or
 cited by path. Claims are marked **[measured]** (someone ran it) or

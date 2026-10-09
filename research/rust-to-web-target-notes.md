@@ -1,5 +1,8 @@
 # Rust → wasm Web Target — Research Notes (2026)
 
+> **Historical (2026-10-09).** A Mojo-era survey; its Mojo sections describe an
+> engine since retired. Kept for its reasoning, not as current state.
+
 Companion to `wasm-port-audit.md`. Team context: pure-JS WebGPU implementation already exists (viz-web/glyph3d-js), so web platform knowledge is assumed; this covers only the **Rust-relative** state.
 
 ## 1. Mojo → wasm: NOT SUPPORTED — no horizon

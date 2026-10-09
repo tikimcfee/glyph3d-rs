@@ -1,5 +1,11 @@
 # TOOLING-PLAN.md — from scripts to a toolchain
 
+> **Historical (2026-10-09).** Written for the Mojo-engine era. The PLAN is
+> executed and its open items are void: `engine/check.sh`, the `--engine-check`
+> cases, `ffi_selftest`, and a gate list with engine-check / engine-suites all
+> went with the engine. What still holds is the reasoning, above all "verify the
+> artifact that ships". Current state: `AGENTS.md`, `build.toml`, `cargo glyph gates`.
+
 Plan of record for the build/verify tooling. Self-contained: read this, not a
 conversation. Claims are **[measured]** (someone ran it) or **[reported]** (an
 author's account, not independently reproduced here) — do not promote the second.
