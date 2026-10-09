@@ -6,8 +6,8 @@
 //!     glyph test [scope]   run the checks; nonzero if anything is wrong
 //!     glyph run  [args]    launch the renderer
 //!
-//! Scope is an argument, not a family of verbs: `glyph test engine` after
-//! touching Mojo, `glyph test rust` after touching native/src, and so on. The
+//! Scope is an argument, not a family of verbs: `glyph test rust` after
+//! touching Rust, `glyph test render` after touching a shader, and so on. The
 //! twelve-item gate list this replaced was organised around the checks; this is
 //! organised around what you just changed. The gates still exist — they are an
 //! implementation detail behind `test`, and `glyph gates` prints them.
@@ -107,9 +107,11 @@ enum Kind {
 #[serde(rename_all = "lowercase")]
 #[clap(rename_all = "lowercase")]
 enum Scope {
-    /// engine/*.mojo and the FFI
-    Engine,
-    /// native/src
+    // `engine` (engine/*.mojo and the FFI) retired with the Mojo engine: no
+    // gate carried it, so `glyph test engine` ran nothing and printed ALL
+    // GATES GREEN (measured 2026-10-09). cmd_test now refuses an empty
+    // selection, so a scope that loses its last gate cannot do that again.
+    /// Rust code: native/, crates/, glyph/
     Rust,
     /// layout, shaders, anything that moves a pixel
     Render,
@@ -1329,7 +1331,7 @@ enum Cmd {
     Build,
     /// Run the checks. No scope runs all of them.
     Test {
-        /// Only what this scope covers: engine, rust, render, corpus.
+        /// Only what this scope covers: rust, render, corpus.
         scope: Option<Scope>,
         /// Assert everything is already current instead of building it.
         /// Use this to validate a commit: if something is stale, that IS the finding.
@@ -1447,13 +1449,76 @@ fn cmd_test(m: &Manifest, scope: Option<Scope>, frozen: bool) -> bool {
         println!("\nCHECK: FAILURES — see above");
         return false;
     }
-    for g in m.gate.iter().filter(|g| scope.is_none_or(|s| g.scope == s)) {
+    let selected: Vec<&Gate> = m.gate.iter().filter(|g| scope.is_none_or(|s| g.scope == s)).collect();
+    if selected.is_empty() {
+        // Say WHY nothing ran, so whoever reads this can tell a wrong scope
+        // from a manifest that lost its gates.
+        step("nothing to run");
+        println!("      gates by scope:");
+        for s in [Scope::Rust, Scope::Render, Scope::Corpus] {
+            let names: Vec<&str> = m.gate.iter().filter(|g| g.scope == s).map(|g| g.name.as_str()).collect();
+            println!("        {:<7} {}", scope_name(s), if names.is_empty() { "(none)".to_string() } else { names.join(", ") });
+        }
+    }
+    for g in &selected {
         step(&format!("{} — {}", g.name, g.compare.as_deref().unwrap_or("")));
         ok &= run_gate(g, m);
     }
+    let (ok, verdict) = test_verdict(selected.len(), m.gate.len(), scope, ok);
     println!();
-    println!("{}", if ok { "CHECK-ALL: ALL GATES GREEN" } else { "CHECK-ALL: FAILURES — see above" });
+    println!("{verdict}");
     ok
+}
+
+fn scope_name(s: Scope) -> String {
+    format!("{s:?}").to_lowercase()
+}
+
+/// The last line of `glyph test`, and whether the run passed.
+///
+/// A run that selected NO gate is not green, whatever else held: it checked
+/// nothing, and "ALL GATES GREEN" over an empty set is the check-that-cannot-
+/// fail shape AGENTS.md warns about. Every verdict also says how many gates
+/// ran, so a reader (or an agent) can see an unexpected count even when the
+/// run is green.
+fn test_verdict(selected: usize, total: usize, scope: Option<Scope>, ok: bool) -> (bool, String) {
+    let which = match scope {
+        Some(s) => format!("{selected} of {total} gates ran, scope {}", scope_name(s)),
+        None => format!("{selected} of {total} gates ran"),
+    };
+    if selected == 0 {
+        return (false, format!("CHECK-ALL: NOTHING RAN — {which}; a run that checks nothing is not a pass"));
+    }
+    if ok {
+        (true, format!("CHECK-ALL: ALL GATES GREEN — {which}"))
+    } else {
+        (false, format!("CHECK-ALL: FAILURES — see above ({which})"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn empty_gate_selection_is_refused() {
+        let (ok, line) = test_verdict(0, 9, Some(Scope::Corpus), true);
+        assert!(!ok, "a run that selected no gate must not pass");
+        assert!(line.starts_with("CHECK-ALL: NOTHING RAN"), "{line}");
+        assert!(line.contains("0 of 9 gates ran, scope corpus"), "{line}");
+    }
+
+    #[test]
+    fn verdict_reports_how_many_gates_ran() {
+        assert_eq!(
+            test_verdict(4, 9, Some(Scope::Rust), true),
+            (true, "CHECK-ALL: ALL GATES GREEN — 4 of 9 gates ran, scope rust".to_string())
+        );
+        assert_eq!(
+            test_verdict(9, 9, None, false),
+            (false, "CHECK-ALL: FAILURES — see above (9 of 9 gates ran)".to_string())
+        );
+    }
 }
 
 fn main() -> ExitCode {

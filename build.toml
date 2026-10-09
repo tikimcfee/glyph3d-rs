@@ -25,7 +25,7 @@
 # Ratchet, NOT an equality: tests are added constantly, so an exact pin would
 # redden on the most common good action in the repo. A green run whose real
 # count exceeds the floor prints a NOTE naming the value to raise it to.
-test_floor = 234
+test_floor = 236
 
 
 # ── Products ─────────────────────────────────────────────────────────────
@@ -325,6 +325,16 @@ op = "replace"
 find = '"Cargo.toml", "Cargo.lock", ".cargo/config.toml"'
 with = '"Cargo.toml", "native/Cargo.lock", ".cargo/config.toml"'
 expect = "matches no file"
+
+[[mutation]]
+name = "empty-test-selection-passes"
+gate = "cargo-test"
+why = "`glyph test <scope>` over a scope with no gates printed ALL GATES GREEN and exited 0: `glyph test engine` did exactly that from the Mojo retirement until 2026-10-09. A run that checks nothing must not read as a pass. CONSUMED BY: test_verdict in glyph/src/main.rs, via its unit test"
+file = "glyph/src/main.rs"
+op = "replace"
+find = "    if selected == 0 {\n        return (false,"
+with = "    if selected == usize::MAX {\n        return (false,"
+expect = "empty_gate_selection_is_refused"
 
 [[mutation]]
 name = "corpus-shrink"
