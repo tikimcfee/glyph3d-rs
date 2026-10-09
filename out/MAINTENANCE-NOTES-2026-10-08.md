@@ -47,7 +47,7 @@ machines and clones, **M** machine-specific values, **R** runner.
 | C17 | Device Pass 2 restarted its syntax colouring at every intra-line chunk cut (wide.txt: 578 glyphs disagreed with the whole-item colouriser) | closed | e20cb81 (colourisers: word-into-string rule, truncated-lead panic, unterminated last word; a test that compared the fast path with itself), af49b0d (cut lines coloured once over the whole line; comment-line indentation), 7a556fd (hyper-oracle PAINT tier, chunk-cut-paint.txt, 5 mutations). Pixels vs main@164af5c: repo-down 281, repo-back-oblique 747, repo-wide 20 px, all from af49b0d (measured); golden re-baseline is P1. M2 A/B vs 9baa679: syntax medians 178/178 (derived), 230/232 (instanced). Prove 40/40 provable |
 | C16 | Discrete-GPU upload: an ODD total survivor count costs ~10-20 ms of backend on this host (derived, 94 MB tree: 91,417,858 slots 415-425 ms, 91,417,859 slots 430-437 ms; same at bf9a757) [measured 2026-10-09]. Cause: a buffer copy whose size is off 16 B runs whole at ~half speed (RTX 5090/Vulkan), and the staging path copies the 20 B-slot stream twice (wgpu-core's staging at `unmap`, then ours); odd counts paid ~+10 ms per copy, counts = 2 mod 4 ~+3 ms. Instanced (32 B) never paid | closed | staging padded to 16 B, copies split into a 16-aligned body + tail (`glyph_field::copy`); odd = even after (derived medians 414 vs 415 ms, A/A spread 4 ms), VRAM bytes and 18 golden renders identical. e59e4a6 (fix), 3d2a50f (mutation rebuild), b90da50 (notes). M2 A/B vs a76aeaf: every config inside the A/A floor (derived syntax 174/174 ms median; the unified path makes no copy). Left: chunked Derived buffers start at 8 mod 16 (~+1 ms, measured with a forced split) |
 | C11 | Mutation `find` strings also match their own entry in build.toml; correct only because the target comes first | open | small: anchor them, or have the prover refuse an ambiguous find |
-| P1 | pixel-ab red on both platforms since 10-07; Linux set a month stale, 2 views never adopted | Ivan's call | Mac re-baseline first, then Linux re-adoption |
+| P1 | pixel-ab red on both platforms since 10-07; Linux set a month stale, 2 views never adopted | closed | 21f9aef (metal-apple: walked on the M2 from the set's own commit to the tip, every moved pixel named — d1b0f7e camera, 8b28f1f the C17 colouring, 048d403 a culling regression repaired by 9c96ad1, 9c96ad1 palette + '#'/block comments, tip C15/C17), d4cb1a4 (vulkan-nvidia re-adopted after it; drift vs Metal 0 clustered in all nine; all 9 incl. emoji-cluster/repo-cluster). pixel-ab green here; the 4 pixel mutations prove (prove coverage 44/44 provable) |
 | X1 | Experiments' Zed symlink scheme never built against real Zed | next up | needs a Zed checkout or the Mac; fieldzed's dylib build.rs deleted in 6a0b669 |
 | X2 | Missing clones here: `viz-web/glyph3d-js` (flagship corpus, `GLYPH_WEB`), Zed | next up | discuss |
 | X3 | `just` not installed here; justfile `profile` recipe unrun | open | install or accept |
@@ -287,16 +287,6 @@ the flag and its `cli/command.rs` arm.
   (repo-cluster included: g-cluster-repo has no keycap, so that view is a
   witness of HyperLayout's other cluster classes, not of defect 1).
 
-### P1. Pixel baselines — [measured]
-
-See "Pixel attribution" below. Main needs a deliberate Mac re-baseline (text,
-repo-zoom at least, looking at every frame) in a commit that says why, then a
-full Linux re-adoption including `emoji-cluster` and `repo-cluster`. Until
-then pixel-ab cannot prove any refactor on this host; the stand-in is
-byte-comparing renders against main built in scratch (used for every commit
-on this branch).
-
----
 
 ## Reference
 
