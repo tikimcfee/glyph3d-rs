@@ -226,7 +226,7 @@ fn test_backward_reconstruction_via_disk_resolver() {
 
 #[test]
 fn test_engine_ingest_parsed_session() {
-    let transcript = vec![
+    let transcript = [
         json!({
             "type": "user",
             "message": { "role": "user", "content": [{ "type": "text", "text": "Create lib.rs" }] }

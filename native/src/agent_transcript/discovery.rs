@@ -458,10 +458,12 @@ mod tests {
     fn test_scan_agent_sessions_all_disabled_scans_nothing() {
         // An empty value turns a harness off, app default or not, so this
         // holds whatever this machine's home directory contains.
-        let mut config = LaunchConfig::default();
-        config.claude_projects_dir = Some(PathBuf::new());
-        config.antigravity_brain_dir = Some(PathBuf::new());
-        config.kimi_sessions_dir = Some(PathBuf::new());
+        let config = LaunchConfig {
+            claude_projects_dir: Some(PathBuf::new()),
+            antigravity_brain_dir: Some(PathBuf::new()),
+            kimi_sessions_dir: Some(PathBuf::new()),
+            ..LaunchConfig::default()
+        };
         assert!(config.session_dirs().is_empty());
         assert!(scan_agent_sessions(&config).is_empty());
     }
@@ -502,12 +504,14 @@ mod tests {
         let _ = fs::create_dir_all(&agy_conv);
         fs::write(agy_conv.join("transcript.jsonl"), "{\"type\":\"USER_INPUT\",\"content\":\"Agy Task\"}\n").unwrap();
 
-        let mut config = LaunchConfig::default();
-        config.claude_projects_dir = Some(claude_root);
-        config.antigravity_brain_dir = Some(agy_root);
-        // Off, not unset: unset falls back to this machine's real Kimi
-        // default, and the test must not depend on what this machine holds.
-        config.kimi_sessions_dir = Some(PathBuf::new());
+        let config = LaunchConfig {
+            claude_projects_dir: Some(claude_root),
+            antigravity_brain_dir: Some(agy_root),
+            // Off, not unset: unset falls back to this machine's real Kimi
+            // default, and the test must not depend on what this machine holds.
+            kimi_sessions_dir: Some(PathBuf::new()),
+            ..LaunchConfig::default()
+        };
 
         let sessions = scan_agent_sessions(&config);
         assert_eq!(sessions.len(), 2);

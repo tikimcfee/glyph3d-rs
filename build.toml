@@ -278,7 +278,7 @@ scope = "rust"
 kind = "cargo"
 cmd = "clippy"
 needs = []
-compare = "clippy warning count vs zero"
+compare = "clippy warning count vs zero, all targets (tests included)"
 blind_to = "anything silenced with #[allow(...)]"
 
 [[gate]]
