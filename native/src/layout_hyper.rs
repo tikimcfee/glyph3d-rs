@@ -732,6 +732,68 @@ pub(crate) fn pass1_prepass(
     aggregate.prepasses
 }
 
+/// The DEVICE Pass 2 (`pass2_device.rs`, what every GPU load runs) written
+/// into host memory, for instruments (`hyper_oracle`).
+///
+/// Faithful by construction, not by imitation: the three production
+/// destinations (unified Metal's mapped buffer, the discrete path's mapped
+/// staging buffer, and the host staging allocation) all hand
+/// `EmitInputs::run` a raw address of writable memory sized for the total
+/// survivors, built from the same Pass 1 calls `layout_items_internal` makes.
+/// This hands it a host `Vec`. What it does not reach is what happens to the
+/// bytes afterwards (the staging copy into VRAM, chunking across buffers)
+/// and the background prefetch of Pass 1 (`prefetch_hyper`, which
+/// `repo-verify` holds to the inline Pass 1 used here).
+fn device_pass2_on_host<E: pass2_device::SlotEmit>(
+    items: &[LayoutItem<'_>],
+    trie: &TrieTable,
+) -> (Vec<E::Slot>, Vec<ItemPlacement>)
+where
+    E::Slot: bytemuck::Zeroable,
+{
+    let em_height_fu = trie.metrics.em_height_fu;
+    let bitmap_adv = fu_to_world(trie.bitmap_advance_fu, em_height_fu);
+    let (chunks, item_chunk_ranges) = chunk::slice_items_into_chunks(items);
+    let agg = pass1_prepass_chunks(&chunks, &item_chunk_ranges, items, trie, bitmap_adv, em_height_fu);
+    let slot_bases: Vec<u32> = item_chunk_ranges.iter().map(|r| agg.chunk_slot_bases[r.start]).collect();
+    let mut slots = vec![<E::Slot as bytemuck::Zeroable>::zeroed(); agg.total_survivors.max(1)];
+    let inputs = EmitInputs {
+        items,
+        chunks: &chunks,
+        item_chunk_ranges: &item_chunk_ranges,
+        prepasses: &agg.prepasses,
+        slot_bases: &slot_bases,
+        chunk_slot_bases: &agg.chunk_slot_bases,
+        chunk_base_rows: &agg.chunk_base_rows,
+        chunk_record_bases: &agg.chunk_record_bases,
+        chunk_initial_cols: &agg.chunk_initial_cols,
+        chunk_initial_seg_advs: &agg.chunk_initial_seg_advs,
+        chunk_initial_line_advs: &agg.chunk_initial_line_advs,
+        trie,
+        bitmap_adv,
+        em_height_fu,
+    };
+    let (out, _pairs) = inputs.run::<E>(slots.as_mut_ptr() as usize);
+    slots.truncate(agg.total_survivors);
+    (slots, out.placements)
+}
+
+/// [`device_pass2_on_host`] in the Instanced field's format (32 B `RenderSlot`).
+pub(crate) fn device_pass2_render_on_host(
+    items: &[LayoutItem<'_>],
+    trie: &TrieTable,
+) -> (Vec<crate::glyph_scene::RenderSlot>, Vec<ItemPlacement>) {
+    device_pass2_on_host::<RenderEmit>(items, trie)
+}
+
+/// [`device_pass2_on_host`] in the Derived field's format (20 B `DerivedSlot`).
+pub(crate) fn device_pass2_derived_on_host(
+    items: &[LayoutItem<'_>],
+    trie: &TrieTable,
+) -> (Vec<glyph_field_derived::DerivedSlot>, Vec<ItemPlacement>) {
+    device_pass2_on_host::<DerivedEmit>(items, trie)
+}
+
 
 impl crate::layout::VerifyLayout for HyperLayout {
     fn layout_validated_items_recording(
