@@ -219,7 +219,7 @@ impl GlyphScene {
         use winit::keyboard::KeyCode as K;
         match key {
             K::KeyH => {
-                let line = self.apply_verb(ctx, &Verb::RecolorLine([255, 213, 79]));
+                let line = self.apply_verb(ctx, &Verb::RecolorLine(None));
                 println!("{line}");
             }
             K::KeyT => {

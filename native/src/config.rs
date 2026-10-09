@@ -33,6 +33,7 @@ pub struct Settings {
     pub agent_cards: AgentCardSettings,
     pub ui: UiSettings,
     pub environment: EnvironmentSettings,
+    pub verbs: VerbSettings,
     pub quad_demo: QuadDemoSettings,
 }
 
@@ -45,6 +46,8 @@ pub struct GlyphSceneSettings {
     /// File card background RGBA when `--file-backgrounds` is on and no
     /// `--file-bg-color` / launch `file_bg_color` was given.
     pub file_bg_color: [f32; 4],
+    /// Selection tint over the picked glyphs/file (windowed): RGB, A = strength.
+    pub selection_tint: [f32; 4],
 }
 
 /// Far-LOD substitution (`glyph_scene::cull`).
@@ -83,6 +86,17 @@ pub struct CameraSettings {
     pub fly_far_fit: f32,
     pub fly_far_min: f32,
     pub fly_far_max: f32,
+    /// Fly pitch limit, radians either side of level.
+    pub fly_pitch_limit: f32,
+    /// Front and orbit depth range: near = distance x front_near_fraction,
+    /// far = distance x front_far_factor.
+    pub front_near_fraction: f32,
+    pub front_far_factor: f32,
+    /// Orbit (legacy windowed demo): radius in fit distances, angular rate
+    /// (rad/s), and eye height as a fraction of the radius.
+    pub orbit_radius_fit: f32,
+    pub orbit_rate: f32,
+    pub orbit_height_fraction: f32,
 }
 
 /// Repo scenes (`repo::shelf`).
@@ -160,6 +174,16 @@ pub struct UiSettings {
     pub project_name: [u8; 3],
 }
 
+/// Default colours of the recolor verbs (sRGB 0-255), when none is given.
+#[derive(Clone, Debug, PartialEq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VerbSettings {
+    /// `recolor-line` and the windowed H key.
+    pub recolor_line: [u8; 3],
+    /// `recolor-glyph`.
+    pub recolor_glyph: [u8; 3],
+}
+
 /// Whether the glyph scene draws the ground/sky environment.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Deserialize, clap::ValueEnum)]
 #[serde(rename_all = "lowercase")]
@@ -216,6 +240,14 @@ pub struct EnvironmentSettings {
 pub struct QuadDemoSettings {
     /// RGBA the quad field pass clears to (`wgpu::Color`).
     pub clear_color: [f64; 4],
+    /// The demo's orbit camera: radius and height (world units), angular
+    /// rate (rad/s), vertical field of view (degrees), near and far planes.
+    pub orbit_radius: f32,
+    pub orbit_height: f32,
+    pub orbit_rate: f32,
+    pub fov_y_deg: f32,
+    pub near: f32,
+    pub far: f32,
 }
 
 impl Settings {
@@ -309,6 +341,13 @@ mod tests {
         assert_eq!((c.fly_scroll_step, c.fly_damping), (1.15f32, 10.0f32));
         assert_eq!(c.fly_near, 0.05f32);
         assert_eq!((c.fly_far_fit, c.fly_far_min, c.fly_far_max), (4.0f32, 20_000.0f32, 100_000.0f32));
+        assert_eq!(c.fly_pitch_limit, 1.55f32);
+        assert_eq!((c.front_near_fraction, c.front_far_factor), (0.01f32, 20.0f32));
+        assert_eq!((c.orbit_radius_fit, c.orbit_rate, c.orbit_height_fraction), (1.05f32, 0.12f32, 0.18f32));
+        assert_eq!(s.glyph_scene.selection_tint, [1.0f32, 0.85, 0.25, 0.45]);
+        let q = &s.quad_demo;
+        assert_eq!((q.orbit_radius, q.orbit_height, q.orbit_rate), (950.0f32, 620.0f32, 0.15f32));
+        assert_eq!((q.fov_y_deg, q.near, q.far), (60f32, 1.0f32, 5000.0f32));
 
         let r = &s.repo;
         let dir_tints: &[[f32; 3]] = &[

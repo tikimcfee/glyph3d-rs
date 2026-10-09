@@ -367,7 +367,6 @@ pub(crate) fn discovers_launch_config(cli: &Cli) -> bool {
 /// explicit `--launch-config` that does not load is a mistake, not a default.
 pub fn parse_cli_from(matches: clap::ArgMatches) -> Result<Cli, String> {
     let mut cli = Cli::from_arg_matches(&matches).expect("clap derive round-trip");
-    cli.ops = build_ops(&matches, &cli.raw_ops);
 
     let config_path = if let Some(path) = &cli.launch_config {
         Some(path.clone())
@@ -533,6 +532,10 @@ pub fn parse_cli_from(matches: clap::ArgMatches) -> Result<Cli, String> {
             }
         }
     }
+
+    // After the launch config: building an op can read a setting (a recolor
+    // verb's default colour), and config::install refuses once anything has.
+    cli.ops = build_ops(&matches, &cli.raw_ops);
 
     if let Some(session) = &cli.agent_session {
         cli.agent_session = Some(crate::launch_config::expand_home(session));

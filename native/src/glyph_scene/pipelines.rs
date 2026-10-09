@@ -6,7 +6,7 @@
 //! `crates/glyph-field-instanced/src/pipeline.rs`); the scene asks its field
 //! for a mask pipeline and hands it in here.
 
-use crate::glyph_scene::target::{CompositeState, SelectionFx, POOL_FORMAT, SELECTION_TINT};
+use crate::glyph_scene::target::{CompositeState, SelectionFx, POOL_FORMAT};
 use std::cell::Cell;
 use wgpu::util::DeviceExt;
 
@@ -155,7 +155,7 @@ pub(super) fn build_composite_state(
         });
         let tint_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("selection tint"),
-            contents: bytemuck::cast_slice(&[SELECTION_TINT]),
+            contents: bytemuck::cast_slice(&[crate::config::settings().glyph_scene.selection_tint]),
             usage: wgpu::BufferUsages::UNIFORM,
         });
         SelectionFx {

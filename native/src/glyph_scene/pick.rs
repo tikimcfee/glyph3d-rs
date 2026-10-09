@@ -57,10 +57,13 @@ pub enum PickCommand {
 /// glyph pick; group verbs need at least a file pick.
 #[derive(Clone, Debug)]
 pub enum Verb {
-    /// Recolor the picked glyph (packed sRGB rgb, alpha kept 255).
-    RecolorGlyph([u8; 3]),
-    /// Recolor every glyph on the picked glyph's folded row ("highlight line").
-    RecolorLine([u8; 3]),
+    /// Recolor the picked glyph (packed sRGB rgb, alpha kept 255). None =
+    /// `[verbs] recolor_glyph`, resolved when applied — the verb parser runs
+    /// inside clap, before the launch config's settings are installed.
+    RecolorGlyph(Option<[u8; 3]>),
+    /// Recolor every glyph on the picked glyph's folded row ("highlight
+    /// line"). None = `[verbs] recolor_line`, resolved when applied.
+    RecolorLine(Option<[u8; 3]>),
     /// Offset the picked glyph's local position (plumbing demo).
     NudgeGlyph([f32; 3]),
     /// Scale the picked glyph's quad (advance & height; plumbing demo).
@@ -745,6 +748,7 @@ impl GlyphScene {
         };
         match verb {
             Verb::RecolorGlyph(rgb) => {
+                let rgb = &rgb.unwrap_or(crate::config::settings().verbs.recolor_glyph);
                 let Some(g) = &glyph else {
                     return format!("verb recolor-glyph: {rel} pick has no glyph");
                 };
@@ -758,6 +762,7 @@ impl GlyphScene {
                 )
             }
             Verb::RecolorLine(rgb) => {
+                let rgb = &rgb.unwrap_or(crate::config::settings().verbs.recolor_line);
                 let Some(g) = &glyph else {
                     return format!("verb recolor-line: {rel} pick has no glyph");
                 };

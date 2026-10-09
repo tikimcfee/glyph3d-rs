@@ -235,7 +235,7 @@ fn op_stream_preserves_cli_order() {
         }
         _ => panic!("op[0] should be the upgraded RowCol pick"),
     }
-    assert!(matches!(cli.ops[1], Op::Verb(Verb::RecolorLine([255, 0, 0]))));
+    assert!(matches!(cli.ops[1], Op::Verb(Verb::RecolorLine(Some([255, 0, 0])))));
     match &cli.ops[2] {
         Op::CamPose(p, yaw, pitch) => {
             assert_eq!(*p, [1.0, 2.0, 3.0]);
@@ -350,11 +350,11 @@ fn verb_error_messages_survive() {
 fn verb_defaults_and_forms() {
     assert!(matches!(
         parse_verb("recolor-glyph").unwrap(),
-        Verb::RecolorGlyph([255, 80, 80])
+        Verb::RecolorGlyph(None)
     ));
     assert!(matches!(
         parse_verb("recolor-line").unwrap(),
-        Verb::RecolorLine([255, 213, 79])
+        Verb::RecolorLine(None)
     ));
     assert!(matches!(
         parse_verb("nudge-glyph 1 2").unwrap(),
@@ -384,11 +384,11 @@ fn verb_defaults_and_forms() {
     // both fall through to the default and the check is unobservable.
     assert!(matches!(
         parse_verb("recolor-glyph aabbcc").unwrap(),
-        Verb::RecolorGlyph([0xAA, 0xBB, 0xCC])
+        Verb::RecolorGlyph(Some([0xAA, 0xBB, 0xCC]))
     ));
     assert!(matches!(
         parse_verb("recolor-line 0a141e").unwrap(),
-        Verb::RecolorLine([0x0A, 0x14, 0x1E])
+        Verb::RecolorLine(Some([0x0A, 0x14, 0x1E]))
     ));
     assert!(matches!(parse_verb("show-group").unwrap(), Verb::SetHidden(false)));
     assert!(matches!(parse_verb("toggle-hidden").unwrap(), Verb::ToggleHidden));

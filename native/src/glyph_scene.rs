@@ -228,10 +228,11 @@ impl GlyphScene {
                 (self.center + Vec3::new(0.0, 0.0, d), self.center)
             }
             CameraMode::Orbit => {
-                let r = fit * 1.05;
-                let a = t * 0.12; // slow orbit
+                let c = &crate::config::settings().camera;
+                let r = fit * c.orbit_radius_fit;
+                let a = t * c.orbit_rate; // slow orbit
                 (
-                    self.center + Vec3::new(r * a.cos(), r * 0.18, r * a.sin()),
+                    self.center + Vec3::new(r * a.cos(), r * c.orbit_height_fraction, r * a.sin()),
                     self.center,
                 )
             }
@@ -243,20 +244,20 @@ impl GlyphScene {
         let fov = fov_y_deg().to_radians();
         let half_h_needed = (self.half_h).max(self.half_w / aspect);
         let fit = fit_distance(half_h_needed);
+        let c = &crate::config::settings().camera;
         let (near, far) = match self.camera_mode {
             CameraMode::Front { zoom } => {
                 let d = fit / zoom.max(0.01);
-                (d * 0.01, d * 20.0)
+                (d * c.front_near_fraction, d * c.front_far_factor)
             }
             CameraMode::Orbit => {
-                let r = fit * 1.05;
-                (r * 0.01, r * 20.0)
+                let r = fit * c.orbit_radius_fit;
+                (r * c.front_near_fraction, r * c.front_far_factor)
             }
             CameraMode::Fly => {
                 // Fly depth conditioning: keep near at 0.05 for single-glyph
                 // closeups, while conditioning far to the scene bounds and distance
                 // from the field center to prevent f32 depth precision collapse and Z-fighting.
-                let c = &crate::config::settings().camera;
                 let d_center = (self.fly.eye - self.center).length();
                 let far = (d_center + self.fit * c.fly_far_fit).clamp(c.fly_far_min, c.fly_far_max);
                 (c.fly_near, far)

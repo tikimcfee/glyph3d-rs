@@ -99,7 +99,8 @@ impl FlyCamera {
         // yaw += : mouse-right rotates the view toward +X (camera right).
         // (was yaw -=, which swung the view left — inverted horizontal look)
         self.yaw += dx * sens;
-        self.pitch = (self.pitch - dy * sens).clamp(-1.55, 1.55);
+        let limit = crate::config::settings().camera.fly_pitch_limit;
+        self.pitch = (self.pitch - dy * sens).clamp(-limit, limit);
     }
 
     pub(super) fn on_scroll(&mut self, lines: f32) {
