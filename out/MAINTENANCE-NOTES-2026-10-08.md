@@ -34,7 +34,7 @@ machines and clones, **M** machine-specific values, **R** runner.
 | C2 | Oversized files; dead kernels in `cubecl_chain/position.rs` | open | delete dead kernels; split `glyph/src/main.rs` |
 | C3 | 46 `#[allow]`, one justified | open | pass, with C2 |
 | C4 | 63 `unwrap()` in `cubecl_chain/repo/dispatch.rs`, one shape | open | one accessor or non-optional fields |
-| C5 | `spike_vertex_yz.rs`, 908 lines, own CLI flag, superseded | open | delete |
+| C5 | `spike_vertex_yz.rs`, 908 lines, own CLI flag, superseded | closed | deleted with --spike-vertex-yz; it ran its OWN inline WGSL and ItemParamsGpu, never the production Derived shader, so no coverage was lost (the Derived vertex-stage Y/Z stays a battery blind spot) |
 | C6 | Rust comments describing the Mojo/FFI backend as live | closed | 7a99b5a (+ `--fixture-manifest` deleted, help text and runtime labels fixed) |
 | C7 | 239 stage-letter comments | won't do | archaeology; reword only when touching |
 | C8 | `clippy --all-targets`: 14 test-only lints + deny-level `reversed_empty_ranges` (seam.rs test) | open | sweep; gate runs without `--all-targets` |
@@ -181,14 +181,8 @@ Line counts are from 2026-10-08. As of 2026-10-09: tui.rs 2034, main.rs 1577.
 
 63 of 134 non-test unwraps are `buf.h_<name>.as_ref().unwrap()` in
 `cubecl_chain/repo/dispatch.rs` (from :215). One accessor with one `expect`,
-or non-optional fields. Others: `glyph/src/main.rs` 9, `spike_vertex_yz.rs` 7
+or non-optional fields. Others: `glyph/src/main.rs` 9
 (goes with C5), `pass2_device.rs` 4, a handful of 1–2s.
-
-### C5. `spike_vertex_yz.rs` — [measured]
-
-908 lines, `pub mod`, `--spike-vertex-yz`. Superseded by the Derived mode
-crate (`99aea85`, 2026-10-05). No gate or mutation references it. Delete with
-the flag and its `cli/command.rs` arm.
 
 ### C10. CubeCL disagrees with the CPU path on this host — [measured 2026-10-09]
 
