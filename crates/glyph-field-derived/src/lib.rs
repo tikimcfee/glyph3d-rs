@@ -6,7 +6,6 @@
 pub mod field;
 pub mod pipeline;
 pub mod slot;
-pub mod storage;
 pub mod upload;
 
 pub use field::DerivedField;

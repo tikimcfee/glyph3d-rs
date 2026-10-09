@@ -2900,6 +2900,7 @@ version = "0.1.0"
 dependencies = [
  "bytemuck",
  "encase",
+ "rayon",
  "wgpu",
 ]
 
@@ -2911,7 +2912,6 @@ dependencies = [
  "encase",
  "glyph-field",
  "naga",
- "rayon",
  "wgpu",
 ]
 
@@ -2923,7 +2923,6 @@ dependencies = [
  "encase",
  "glyph-field",
  "naga",
- "rayon",
  "wgpu",
 ]
 

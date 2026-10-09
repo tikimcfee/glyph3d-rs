@@ -5,10 +5,15 @@ edition = "2021"
 description = "The glyph field's mode-neutral contract: the GlyphField trait every render mode implements, the field mode enum, and the records and GPU resources the modes share."
 
 # The contract crate owns no shader and no slot format. A render mode
-# (`glyph-field-instanced`, later `glyph-field-derived`) owns its own slot
-# record, emission, upload, WGSL and pipelines, and implements `GlyphField`
-# so the scene can draw and edit glyphs without knowing which mode it holds.
+# (`glyph-field-instanced`, `glyph-field-derived`) owns its own slot record,
+# transcode, WGSL and pipelines, and implements `GlyphField` so the scene can
+# draw and edit glyphs without knowing which mode it holds. The slot storage
+# and host upload live here, generic over the mode's slot (C1, 2026-10-09);
+# rayon is the upload's parallel transcode; its Metal direct-upload path
+# reaches `wgpu::hal` (wgpu's default features carry the Metal backend on
+# macOS, exactly as native relies on).
 [dependencies]
 wgpu = "30"
 bytemuck = { version = "1", features = ["derive"] }
 encase = "0.12"
+rayon = "1.10"

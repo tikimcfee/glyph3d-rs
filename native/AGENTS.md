@@ -148,7 +148,7 @@ Detailed technical audit lives in `research/desktop-platform-audit.md`. Key touc
 - **Unified vs. Discrete Slot Buffers (`native/src/layout_hyper/device_alloc.rs`)**:
   - `#[cfg(target_os = "macos")]` allocates Metal `MTLStorageModeShared` memory and maps it (`mapped_base: Some(addr)`). Pass 2 writes directly to device memory with zero copies.
   - On non-macOS/desktop, `layout_device_discrete` writes to a mapped staging buffer, unmaps, and blits to device VRAM via `encoder.copy_buffer_to_buffer` (`mapped_base: None`).
-  - ⚠️ **Dynamic Color Writes**: When `mapped_base` is `None`, `crates/glyph-field-*/src/storage.rs` `write_colors` falls back to one 4-byte `queue.write_buffer` per slot. On discrete GPUs with large repos, batch these writes to avoid driver call overhead.
+  - ⚠️ **Dynamic Color Writes**: When `mapped_base` is `None`, `crates/glyph-field/src/storage.rs` `SlotStorage::write_colors` falls back to one 4-byte `queue.write_buffer` per slot. On discrete GPUs with large repos, batch these writes to avoid driver call overhead.
 - **Cache Sizing & Chunk Threshold (`native/src/layout_hyper/chunk.rs`)**:
   - `CHUNK_THRESHOLD_BYTES = 64 * 1024` (64 KiB) is tuned for Apple Silicon M-series L1 Data Cache (128 KiB per P-core).
   - Desktop x86_64 (AMD Zen 3/4/5, Intel Raptor Lake) has **32 KiB or 48 KiB L1D** per core. A 64 KiB chunk spills to L2. On desktop, testing 32 KiB or 16 KiB thresholds can keep chunks 100% L1D-resident.

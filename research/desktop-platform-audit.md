@@ -25,8 +25,8 @@ The codebase is **100% pure Rust** and builds without platform-specific assembly
 
 ### B. ⚠️ Critical Desktop Bottleneck: Dynamic Color Updates (`write_colors`)
 - Locations:
-  - [`crates/glyph-field-derived/src/storage.rs:58-81`](../crates/glyph-field-derived/src/storage.rs#L58-L81)
-  - [`crates/glyph-field-instanced/src/storage.rs:58-81`](../crates/glyph-field-instanced/src/storage.rs#L58-L81)
+  - [`crates/glyph-field/src/storage.rs`](../crates/glyph-field/src/storage.rs) `SlotStorage::write_colors`
+    (one copy for both modes since 2026-10-09; when this audit was written each mode crate had its own)
 - **Behavior**:
   - When `mapped_base` is `Some(addr)` (Metal unified), `write_colors` modifies colors in-place in DRAM via raw pointer arithmetic.
   - When `mapped_base` is `None` (Desktop discrete GPU), it falls back to:
