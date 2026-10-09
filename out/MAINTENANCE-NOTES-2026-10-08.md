@@ -21,28 +21,33 @@ machines and clones, **M** machine-specific values, **R** runner.
 
 | ID | Item | Status | Commit / next step |
 |---|---|---|---|
-| D1 | Root AGENTS.md documents 16 gates, build.toml has 9; dead read-next links; Mojo/dylib prose | open | rewrite against build.toml; takes C6, R2 with it |
+| D1 | Root and native AGENTS.md described 16 gates and the retired engine as live | closed | 3fc716c (root), 7a99b5a (native) |
 | D2 | `cargo glyph` alias doubles inside `.claude/worktrees/` | open | pick a fix option (below) |
 | D3 | `cargo glyph test engine` matched zero gates, printed ALL GATES GREEN | closed | 4d9de92: refused as NOTHING RAN; every verdict counts gates; `engine` scope gone |
-| D4 | `.agents/rules/rust-engineering.md` claims the tree does not back | open | short pass, with D1 |
-| D5 | `pixi.toml` tasks for a Mojo engine that no longer exists | open | retire or trim to fontTools |
-| D6 | Orphaned scripts and configs (check-cubecl.sh, fixture-parity, mutants.toml, deny.toml) | open | decide each; re-gating cubecl is the honest choice |
-| D7 | Loose session handoffs at the repo root | open | move to `out/` with dates |
+| D4 | `.agents/rules/rust-engineering.md` claims the tree does not back | open | short pass |
+| D5 | pixi carried the retired engine's tasks and mojo/max toolchain | closed | 16372a9 (tasks), 6954a9d (deps, lock re-solved; Mac env unsolved-installed) |
+| D6 | Orphaned configs: `deny.toml` (nothing runs it) | open | gate or delete; mutants.toml fixed in 16372a9, fixture-parity script moved to D8 |
+| D7 | Loose root docs: session handoffs, plus Mojo-era TOOLING-PLAN.md open items, BUILD-BRIEF.md, research/ surveys | open | move handoffs to `out/`; banner or trim the rest |
+| D8 | Retired Rust checks still ship; reference-port and repo-verify PASS, nobody runs them; `overflow-leads.txt` read by nothing | open | re-gate with mutations; high value (CubeCL half blocked on C10) |
+| D9 | `engine-trie.bin` (+ `gen_real_trie.py`, `--engine-trie`) is committed and gated but read by no Rust code | open | decide: keep or retire (changes committed-artifacts) |
 | C1 | Twin field crates ~60% shared; five copies of the mapped-buffer upload | open | hoist into `glyph-field`; last, largest |
 | C2 | Oversized files; dead kernels in `cubecl_chain/position.rs` | open | delete dead kernels; split `glyph/src/main.rs` |
 | C3 | 46 `#[allow]`, one justified | open | pass, with C2 |
 | C4 | 63 `unwrap()` in `cubecl_chain/repo/dispatch.rs`, one shape | open | one accessor or non-optional fields |
 | C5 | `spike_vertex_yz.rs`, 908 lines, own CLI flag, superseded | open | delete |
-| C6 | Rust comments describing the Mojo/FFI backend as live | open | with D1 |
+| C6 | Rust comments describing the Mojo/FFI backend as live | closed | 7a99b5a (+ `--fixture-manifest` deleted, help text and runtime labels fixed) |
 | C7 | 239 stage-letter comments | won't do | archaeology; reword only when touching |
 | C8 | `clippy --all-targets`: 14 test-only lints + deny-level `reversed_empty_ranges` (seam.rs test) | open | sweep; gate runs without `--all-targets` |
 | C9 | `discovery.rs` names a Claude project by the slug's last `-` segment (`…-glyph3d-js` → `js`) | open | small fix |
+| C10 | CubeCL fence FAILS on this host; `--repo-engine cubecl` renders differently from hyper | open | discuss: Mac run, or bisect from 5e94de8 |
+| C11 | Mutation `find` strings also match their own entry in build.toml; correct only because the target comes first | open | small: anchor them, or have the prover refuse an ambiguous find |
 | P1 | pixel-ab red on both platforms since 10-07; Linux set a month stale, 2 views never adopted | Ivan's call | Mac re-baseline first, then Linux re-adoption |
-| X1 | Experiments' Zed symlink scheme never built against real Zed | next up | needs a Zed checkout or the Mac |
+| X1 | Experiments' Zed symlink scheme never built against real Zed | next up | needs a Zed checkout or the Mac; fieldzed's dylib build.rs deleted in 6a0b669 |
 | X2 | Missing clones here: `viz-web/glyph3d-js` (flagship corpus, `GLYPH_WEB`), Zed | next up | discuss |
 | X3 | `just` not installed here; justfile `profile` recipe unrun | open | install or accept |
 | R1 | Renderer currency stamp ignored the root `Cargo.toml`/`Cargo.lock` | closed | dc6a00f |
-| R2 | Dead `{dylib}` / `dylib_ext()` machinery in the runner | open | with D1 |
+| R2 | Dead `{dylib}` / `dylib_ext()` / engine-check machinery in the runner | closed | 3fc716c |
+| R3 | `engine/glyph_schema.mjs` and the schema validation were in no gate; `gen_schema --check` red | closed | 16372a9 (`[artifact.glyph-schema]`, mutation `glyph-schema-byte`) |
 | B0 | Workspace did not compile on Linux (ungated Metal HAL) | closed | 872621d on main (other agent); helper half is C1 |
 | M1 | Mac paths in TUI presets, justfile, bench script, docs | closed | 1062e23, 88525ea |
 | M2 | Session discovery hardcoded `$HOME`; tests not hermetic | closed | 1062e23, then f864183 (app defaults + Kimi parser) |
@@ -63,6 +68,11 @@ None pushed or merged to main; that is Ivan's call.
 | f864183 | session discovery defaults to each app's locations (`crates/glyph-session-dirs`); Kimi Code parser |
 | dc6a00f | renderer currency hashes root manifest and lockfile; `validate()` refuses dead literal inputs |
 | 4d9de92 | `glyph test` refuses an empty gate selection (NOTHING RAN); verdicts count gates; `engine` scope removed |
+| 3fc716c | root AGENTS.md rewritten against the nine gates; engine-check and `{dylib}` machinery out of the runner |
+| 16372a9 | schema gated (`glyph-schema` artifact); generator's Mojo half, dead pixi tasks, ignores, mutants excludes removed |
+| 6954a9d | pixi: mojo/max toolchain dropped, lock re-solved (fontTools env only) |
+| 6a0b669 | experiments: fieldzed build.rs (asserted the engine dylib) deleted |
+| 7a99b5a | Mojo/FFI removed from native comments, help text, native/AGENTS.md; `--fixture-manifest` deleted |
 
 Main's build fix (872621d, the other agent's) was fast-forwarded in first.
 
@@ -76,47 +86,19 @@ export GLYPH_FLAGSHIP_REPO=~/localdev/viz-web/glyph3d-js
 
 ## Suggested order for what is open
 
-1. D1 + R2 + C6 + D4: the doc rewrite, one series; the files cross-reference.
-2. D5, D6: tooling decisions, one commit per contested decision.
-3. D7: move handoffs.
-4. C2 + C3 + C4: cubecl cleanup. Output-neutral; re-gating cubecl (D6) gives it a proof.
-5. C5: delete the spike.
-6. C1: hoist the field machinery. Largest; wants a fresh battery.
+1. D8 (reference-port + repo-verify half): re-gate the passing checks, with
+   mutations. Restores the layout's oracle fence.
+2. D7, D4, D6: the remaining doc and config tidy.
+3. C5: delete the spike.
+4. C2 + C3 + C4: cubecl cleanup, once C10 says whether the CubeCL path is
+   right; its fence is what proves the cleanup output-neutral.
+5. C1: hoist the field machinery. Largest; wants a fresh battery.
 
-X1, X2 and P1 are for discussion; C8, C9, X3 fit anywhere.
+For discussion: C10, D9, X1, X2, P1. Small, fit anywhere: C8, C9, C11, X3.
 
 ---
 
 ## Open items: detail
-
-### D1. Root AGENTS.md is the stale one — [measured]
-
-Live gates (`grep '^\[\[gate\]\]' -A1 build.toml`): manifest, committed-artifacts,
-vendor-hashes, cargo-build, cargo-clippy, cargo-doc, cargo-test, pick-oracle,
-pixel-ab. Documented but absent: engine-check, repo-verify, repo-verify-direct,
-reference-port, cubecl-chain, cubecl-fork (engine-suites already marked
-historical). Also stale in the same file:
-
-- "Products" paragraph: currency is "a content hash of `engine/*.mojo` + the
-  pixi pins". There is no Mojo (`engine/` holds `fixtures/` and
-  `glyph_schema.mjs`). The inputs are now the Rust tree, root manifest and lock.
-- "Read next" names `engine/README.md`, `README-FFI.md`, `PORT-PLAN.md`,
-  `BACKEND-PLAN.md`, `TOOLCHAIN.md`; none exist. `native/AGENTS.md` names two.
-- Fence table lists `engine/glyph_schema.{mojo,mjs}`; only `.mjs` exists, yet
-  `tools/gen_schema.py` still writes `MOJO_OUT` (:34). [inferred] its `--check`
-  may compare against a never-committed file; run it.
-- Says the `cubecl` feature is optional; `native/Cargo.toml` has
-  `default = ["egui-ui", "cubecl"]`. The manifest is right.
-- Build section quotes a test count; drop it (the file's own advice).
-
-`native/AGENTS.md` (was 1b): the layout-seam section still frames
-`Strategy::Direct` as the engine writing across the FFI and names
-`repo-verify*` as live. The strategies are real (`--repo-engine direct|batch`);
-the FFI framing is not. Three mentions.
-
-**Fix:** rewrite "What the checks actually do" against the nine live gates;
-keep the retired gates' lessons in a short "retired, and what they taught"
-block. Delete the dylib paragraph, fix read-next, date it.
 
 ### D2. `cargo glyph` alias doubles in worktrees — [measured]
 
@@ -147,23 +129,33 @@ so (a) only helps human-made ones; weigh (c) for that reason.
 - §5 "no new shell scripts" beside a gate that is a shell script.
 - Reconcile with `native/AGENTS.md` by pointing, not restating.
 
-### D5. pixi — [measured]
-
-`build-engine` compiles `engine/ffi.mojo`; `suites*` run `engine/check.sh`;
-neither exists. The mojo/max pins are dead. Live use: fontTools for the emoji
-generators (`build.toml` runs `pixi run python tools/gen_emoji_sheet.py
---check`). `mise.toml` already provisions a venv with fonttools.
-**Options:** (a) delete pixi, point build.toml at the mise venv; (b) trim
-pixi to fontTools. (a) cleaner, (b) less risk to committed-artifacts.
-
 ### D6. Orphans — [measured]
 
-- `tools/check-cubecl.sh`: the former cubecl-chain/fork fence, run by
-  nothing. The flags it drives are live. Cubecl is default-on and heavily
-  worked on, so re-gate it.
-- `tools/check-fixture-parity.sh`: references `engine/fixture_io.mojo`. Dead.
-- `native/.cargo/mutants.toml`: references `layout_mojo.rs`. Update or delete.
 - `deny.toml`: `cargo-deny` is in mise; nothing runs it. Gate or delete.
+### D8. Retired checks that still pass — [measured 2026-10-09]
+
+`5e94de8` (2026-09-30, "decouple CubeCL … and clean build.toml") removed seven
+gates and 26 mutations. The Rust instruments behind four of them still pass:
+
+- reference-port, Rust halves (`--fixture-trie/-fold/-scan/-bake/-reference`
+  over `engine/fixtures`): all PASS, with the exact volumes the old AGENTS.md
+  quoted (155,222 leaders / 1,874,328 lanes fold; 208 scan cases; 27,315 bake
+  leaders / 530 queries; 5,332 reference records). The script
+  (`tools/check-fixture-parity.sh`) also needs the retired engine for its
+  parse-parity half, which is why the whole gate went.
+- repo-verify (`--repo-verify` on `g-pick-repo`): PASS for hyper, direct and
+  batch, wrap modes down and back.
+- cubecl-chain / cubecl-fork (`tools/check-cubecl.sh`): both FAIL here; see C10.
+- `native/fixtures/overflow-leads.txt` fed the retired engine-check; no check
+  reads it now. `--fixture-reference` could, if it accepts a text input.
+
+`tools/check-fixture-parity.sh` cannot be re-gated as is: it dies at its Mojo
+step, and since 7a99b5a its first Rust call (`--fixture-manifest`) is gone too.
+Rewrite it as the five Rust instruments, or declare them as gates directly.
+
+Re-gate as `kind = "cmd"` / `kind = "repo-verify"` gates (the RepoVerify kind
+and its validation still exist in the runner), each with a pass_line and a
+mutation that reddens it, and quote the volumes in `blind_to`.
 
 ### D7. Loose root docs — [measured]
 
@@ -171,7 +163,13 @@ pixi to fontTools. (a) cleaner, (b) less risk to committed-artifacts.
 `PLAN-AGENT-STACKS-FOCUS-LOCKING.md` (2026-10-02),
 `cubecl-performance-handoff.md`: session artifacts; AGENTS.md says notes go
 in `out/`. Move with dates in the filename (their links are repo-relative since
-88525ea and will need `../`). Keep `TOOLING-PLAN.md` and `BUILD-BRIEF.md`.
+88525ea and will need `../`). Mojo-era, from the 2026-10-09 inventory:
+`TOOLING-PLAN.md` is a "plan of record" whose open items (`engine/check.sh`,
+`--engine-check` cases, `ffi_selftest`, a gate list with engine-check and
+engine-suites) are void, keep its "verify the artifact that ships" rule;
+`BUILD-BRIEF.md` (29 hits) self-marks as historical but its stale list omits
+the retirement; `research/wasm-port-audit.md`, `native-rendering-stack-comparison.md`,
+`rust-to-web-target-notes.md` are Mojo-era surveys (banner or move).
 
 ### C1. Twin field crates — [measured]
 
@@ -219,11 +217,21 @@ or non-optional fields. Others: `glyph/src/main.rs` 9, `spike_vertex_yz.rs` 7
 crate (`99aea85`, 2026-10-05). No gate or mutation references it. Delete with
 the flag and its `cli/command.rs` arm.
 
-### C6. Mojo comments — [measured]
+### C10. CubeCL disagrees with the CPU path on this host — [measured 2026-10-09]
 
-Mojo/FFI/dylib mentions: `fixture.rs` 18, `fold.rs` 13, `glyph/main.rs` 11,
-`repo.rs` 9, `layout.rs` 9, `text.rs` 8, `cluster.rs` 5. Keep history; reword
-the ones describing a live contract.
+- `tools/check-cubecl.sh chain`: 4 of 5 fixtures PASS; `cluster-flags` FAILS
+  with 9 record mismatches (4.14e-1 position deviation, 9.0e-2 x-extent).
+- `tools/check-cubecl.sh fork` (STRICT, the IMMUTABLE fork corpus): counts
+  match, 0 placement and 0 tint mismatches, but 314,405 of 314,686 slots
+  differ (708,529 lane words). The mismatches read as a one-glyph shift: slot
+  287 has `gi 5264 vs 17` and the chain's x equals the CPU's x one advance on.
+- `--repo-engine cubecl` vs `hyper`, same camera: `g-pick-repo` 65 px differ;
+  the fork corpus 295,357 px. Visible on screen.
+- Not attributed. The gate that fenced this was retired 2026-09-30 and CubeCL
+  has had heavy work since, so a regression is plausible; so is a
+  Vulkan-specific behaviour (the fork check's own notes say Metal discards
+  some phantom-class writes). The Mac run settles which; bisecting from
+  5e94de8 on this box settles when.
 
 ### P1. Pixel baselines — [measured]
 
