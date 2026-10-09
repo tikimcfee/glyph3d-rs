@@ -145,6 +145,14 @@ pub struct Cli {
     /// record AND every seed-protocol query bit-exact, then exit.
     #[arg(long, value_name = "PATH", num_args = 1..)]
     pub fixture_bake: Vec<PathBuf>,
+    /// HyperLayout against the oracle-backed fold: lay each input out with the
+    /// production engine and with `fold.rs` (held to the JS oracle by
+    /// `--fixture-fold`), diff records, instances and placements bit-exact,
+    /// then exit. Inputs: `.pipe.bin` fixtures (their bytes and item params),
+    /// directories (walked as `--load-repo` walks them, in `--cluster-mode`),
+    /// or single text files.
+    #[arg(long, value_name = "PATH", num_args = 1..)]
+    pub hyper_oracle_check: Vec<PathBuf>,
     /// Stage E2: load a whole repository as a field of code pages
     #[arg(long, value_name = "DIR")]
     pub load_repo: Option<PathBuf>,

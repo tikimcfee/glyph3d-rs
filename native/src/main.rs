@@ -177,6 +177,7 @@ fn main() {
             FixtureTask::Fold(paths) => fixture::run_fixture_fold(&paths),
             FixtureTask::Scan(paths) => scan::run_fixture_scan(&paths),
             FixtureTask::Bake(paths) => bake::run_fixture_bake(&paths),
+            FixtureTask::HyperOracle(paths, mode) => hyper_oracle::run_hyper_oracle_check(&paths, mode),
         },
         CliCommand::RepoScanOnly {
             dir,
