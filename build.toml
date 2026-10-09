@@ -25,7 +25,7 @@
 # Ratchet, NOT an equality: tests are added constantly, so an exact pin would
 # redden on the most common good action in the repo. A green run whose real
 # count exceeds the floor prints a NOTE naming the value to raise it to.
-test_floor = 226
+test_floor = 233
 
 
 # ── Products ─────────────────────────────────────────────────────────────
@@ -36,7 +36,7 @@ test_floor = 226
 [artifact.renderer]
 class = "product"
 outputs = ["target/release/glyph3d-native"]
-inputs = ["native/src/**/*", "native/Cargo.toml", "native/Cargo.lock", "crates/**/*"]
+inputs = ["native/src/**/*", "native/Cargo.toml", "native/Cargo.lock", "crates/**/*", "config/**/*"]
 build = "cd native && cargo build --release"
 note = "Pure-Rust native renderer."
 

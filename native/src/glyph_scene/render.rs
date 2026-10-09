@@ -320,12 +320,9 @@ pub(super) fn render_scene(
             view: draw_color_view,
             resolve_target: None,
             ops: wgpu::Operations {
-                load: wgpu::LoadOp::Clear(wgpu::Color {
-                    r: 0.07,
-                    g: 0.07,
-                    b: 0.09,
-                    a: 1.0,
-                }),
+                load: wgpu::LoadOp::Clear(crate::config::wgpu_color(
+                    crate::config::settings().glyph_scene.clear_color,
+                )),
                 store: wgpu::StoreOp::Store,
             },
             depth_slice: None,

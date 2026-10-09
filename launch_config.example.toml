@@ -1,7 +1,15 @@
-# Glyph3D Launch Configuration
+# Glyph3D Launch Configuration — EXAMPLE
 #
-# Startup defaults for interactive windowed runs.
-# Any CLI flag passed on the command line will override settings in this file.
+# Copy to launch_config.toml (gitignored; personal) and edit:
+#   cp launch_config.example.toml launch_config.toml
+#
+# Startup defaults for interactive windowed runs. Read from the repo root or
+# native/, or passed with --launch-config <path>. Any CLI flag passed on the
+# command line overrides this file. Screenshot runs (every gate) never read it.
+# Unknown keys are errors.
+#
+# Top-level keys below are launch options. [section] tables override the
+# compiled settings in config/defaults.toml, key by key — see the end of file.
 
 # Render file card background bounding surfaces behind glyph fields
 file_backgrounds = true
@@ -49,3 +57,10 @@ no_ui = false
 # Custom directory locations for Claude Code and Antigravity session discovery (optional)
 # claude_projects_dir = "~/.claude/projects"
 # antigravity_brain_dir = "~/.gemini/antigravity/brain"
+
+# ── Settings overrides ───────────────────────────────────────────────────────
+# Any key from config/defaults.toml, under its own [section]. Only the keys you
+# set are overridden; the rest keep their compiled defaults.
+#
+# [glyph_scene]
+# clear_color = [0.07, 0.07, 0.09, 1.0]

@@ -30,6 +30,10 @@ pub struct LaunchConfig {
     pub antigravity_brain_dir: Option<PathBuf>,
     pub agent_session: Option<PathBuf>,
     pub frames: Option<u32>,
+    /// The file's `[section]` tables: runtime overrides for `config::Settings`,
+    /// merged over `config/defaults.toml` (validated there, not here).
+    #[serde(skip)]
+    pub settings: toml::Table,
 }
 
 impl LaunchConfig {
@@ -77,9 +81,25 @@ impl LaunchConfig {
             .map_err(|e| format!("invalid launch config '{}': {e}", path.display()))
     }
 
-    /// Parse a TOML string into LaunchConfig.
+    /// Parse a TOML string into LaunchConfig. Top-level keys are launch
+    /// options; `[section]` tables are settings overrides, split off whole.
     pub fn from_toml_str(s: &str) -> Result<Self, String> {
-        toml::from_str(s).map_err(|e| e.to_string())
+        let mut table: toml::Table = toml::from_str(s).map_err(|e| e.to_string())?;
+        let sections: Vec<String> = table
+            .iter()
+            .filter(|(_, v)| v.is_table())
+            .map(|(k, _)| k.clone())
+            .collect();
+        let mut settings = toml::Table::new();
+        for key in sections {
+            if let Some(v) = table.remove(&key) {
+                settings.insert(key, v);
+            }
+        }
+        let mut cfg: Self = serde::Deserialize::deserialize(toml::Value::Table(table))
+            .map_err(|e: toml::de::Error| e.to_string())?;
+        cfg.settings = settings;
+        Ok(cfg)
     }
 }
 
@@ -151,6 +171,28 @@ mod tests {
         assert_eq!(cfg.antigravity_brain_dir, Some(PathBuf::from("~/my_antigravity_brain")));
         assert_eq!(cfg.agent_session, Some(PathBuf::from("~/sessions/my_session.jsonl")));
         assert_eq!(cfg.frames, Some(1));
+    }
+
+    #[test]
+    fn sections_are_settings_overrides() {
+        let cfg = LaunchConfig::from_toml_str(
+            "wrap_mode = \"down\"\n[glyph_scene]\nclear_color = [1.0, 0.0, 0.0, 1.0]\n",
+        )
+        .expect("parse failed");
+        assert_eq!(cfg.wrap_mode.as_deref(), Some("down"));
+        assert!(cfg.settings.contains_key("glyph_scene"));
+        let s = crate::config::Settings::with_overrides(cfg.settings).expect("merge failed");
+        assert_eq!(s.glyph_scene.clear_color, [1.0, 0.0, 0.0, 1.0]);
+    }
+
+    /// The committed example is what people copy; it must keep parsing as the
+    /// keys change, sections and all.
+    #[test]
+    fn example_file_parses() {
+        let cfg = LaunchConfig::from_toml_str(include_str!("../../launch_config.example.toml"))
+            .expect("launch_config.example.toml must parse");
+        crate::config::Settings::with_overrides(cfg.settings)
+            .expect("launch_config.example.toml sections must merge");
     }
 
     #[test]

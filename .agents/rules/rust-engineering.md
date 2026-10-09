@@ -46,3 +46,11 @@ Agents MUST follow these rules when developing in this codebase.
 
 ## 9. Feature Flags & Binary Defaults
 - Keep primary layout and render engines (e.g. `cubecl`) in the `default` features of `native/Cargo.toml` so that standard `cargo run`, `cargo test`, and `glyph tui` invocations work out-of-the-box without requiring manual feature flags.
+
+## 10. Named Values Live in Configuration
+- Every named, tunable value — colors, backgrounds, spacings, speeds, distances, fade ranges — lives in `config/defaults.toml` (compiled in), overridable per key from a `[section]` of `launch_config.toml` at runtime. Not as a Rust or WGSL literal. Read it through `crate::config::settings()`; shaders receive it through a uniform.
+- **Contracts stay compiled.** Layout metrics (`CELL_HEIGHT_WORLD`, the line-height factor), slot and atlas formats, CPU/shader shared constants (`MAX_CURVES`, `TEX_W`, `GROUP_STRIDE`), and anything a reference check or fixture was computed against are not settings: a config edit must never be able to silently disagree with an oracle. If one ever needs to become configurable, that is its own change, with the fixtures it touches.
+- **Defaults are complete.** Every settings field is required, so a key missing from `defaults.toml` is a parse failure, not a zero. Add the key there in the same commit that reads it.
+- **Moving a literal is byte-neutral or it is a re-baseline.** TOML floats parse decimal → f64 → f32, which can land one ulp from a decimal → f32 literal. Pin each migrated value in `config::tests::defaults_match_migrated_literals`, and byte-compare the golden views.
+- UI copy, log and error messages stay in code — localization is different machinery.
+

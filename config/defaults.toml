@@ -1,0 +1,24 @@
+# glyph3d defaults — every named, tunable value the renderer and UI read.
+#
+# Compiled into the binary (native/src/config.rs, include_str!). COMPLETE by
+# contract: every key here is required, so deleting one is a parse failure,
+# not a silent zero. Override any of them, per key, in a [section] of your
+# launch_config.toml (see launch_config.example.toml); unknown sections and
+# keys are errors.
+#
+# Contracts are NOT here — layout metrics, slot/atlas formats, anything a
+# reference check was computed against. See .agents/rules/rust-engineering.md
+# section 10 for the line between the two.
+#
+# Every golden view renders with exactly these values. Changing one here is a
+# re-baseline; say so in the commit.
+#
+# Colors are RGBA in 0.0-1.0, handed to the consuming pass as-is.
+
+[glyph_scene]
+# What the glyph field pass clears to (behind every file).
+clear_color = [0.07, 0.07, 0.09, 1.0]
+
+[quad_demo]
+# What the --demo quad field pass clears to.
+clear_color = [0.02, 0.02, 0.04, 1.0]

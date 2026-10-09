@@ -346,6 +346,13 @@ pub struct RawOps {
 }
 
 
+/// Whether this run looks for a personal `launch_config.toml` on its own.
+/// Screenshot runs never do: every gate that launches the binary is one, and
+/// a personal override (a color, a wrap mode) must not reach a golden view.
+pub(crate) fn discovers_launch_config(cli: &Cli) -> bool {
+    cli.screenshot.is_none()
+}
+
 /// Build the `Cli` from clap matches, merging the launch config underneath the
 /// command line. An unreadable or invalid launch config is an `Err` — an
 /// explicit `--launch-config` that does not load is a mistake, not a default.
@@ -355,16 +362,21 @@ pub fn parse_cli_from(matches: clap::ArgMatches) -> Result<Cli, String> {
 
     let config_path = if let Some(path) = &cli.launch_config {
         Some(path.clone())
-    } else if !cfg!(test) && cli.screenshot.is_none() && Path::new("launch_config.toml").is_file() {
-        Some(PathBuf::from("launch_config.toml"))
-    } else if !cfg!(test) && cli.screenshot.is_none() && Path::new("../launch_config.toml").is_file() {
-        Some(PathBuf::from("../launch_config.toml"))
+    } else if !cfg!(test) && discovers_launch_config(&cli) {
+        ["launch_config.toml", "../launch_config.toml"]
+            .into_iter()
+            .map(PathBuf::from)
+            .find(|p| p.is_file())
     } else {
         None
     };
 
     if let Some(path) = config_path {
         let cfg = crate::launch_config::LaunchConfig::from_file(&path)?;
+        if !cfg.settings.is_empty() {
+            crate::config::install(cfg.settings.clone())
+                .map_err(|e| format!("launch config '{}': {e}", path.display()))?;
+        }
         if matches.value_source("file_backgrounds")
             != Some(clap::parser::ValueSource::CommandLine)
         {

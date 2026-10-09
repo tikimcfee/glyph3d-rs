@@ -615,4 +615,9 @@ fn launch_config_frames_merging() {
     let _ = std::fs::remove_file(&tmp);
 }
 
+#[test]
+fn screenshot_runs_never_discover_launch_config() {
+    assert!(!discovers_launch_config(&parse(&["--screenshot", "out.png", "--demo"])));
+    assert!(discovers_launch_config(&parse(&["--demo"])));
+}
 

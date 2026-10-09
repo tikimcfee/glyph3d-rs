@@ -6,6 +6,7 @@ pub mod agent_transcript;
 pub mod atlas;
 pub mod bake;
 pub mod cli;
+pub mod config;
 pub mod fixture;
 pub mod fold;
 pub mod glyph_scene;

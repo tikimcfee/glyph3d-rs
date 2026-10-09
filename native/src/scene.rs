@@ -350,12 +350,9 @@ impl Scene {
                 view: color_view,
                 resolve_target: None,
                 ops: wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(wgpu::Color {
-                        r: 0.02,
-                        g: 0.02,
-                        b: 0.04,
-                        a: 1.0,
-                    }),
+                    load: wgpu::LoadOp::Clear(crate::config::wgpu_color(
+                        crate::config::settings().quad_demo.clear_color,
+                    )),
                     store: wgpu::StoreOp::Store,
                 },
                 depth_slice: None,
