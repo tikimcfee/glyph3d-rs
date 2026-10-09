@@ -6,7 +6,6 @@
 //! - Cache-resident register evaluation of positions, wrap, and pagination
 //! - Parallel execution across files
 
-use std::path::Path;
 use std::sync::Arc;
 use rayon::prelude::*;
 
@@ -88,11 +87,6 @@ impl HyperLayout {
 impl LayoutGlyphs for HyperLayout {
     fn name(&self) -> &'static str {
         "hyper-rust"
-    }
-
-    fn load_trie_file(&mut self, _path: &Path) -> Result<(), LayoutError> {
-        self.trie = Some(crate::default_trie());
-        Ok(())
     }
 
     fn layout_validated_items(
@@ -1076,9 +1070,6 @@ mod tests {
             .collect();
 
         let mut hyper = HyperLayout::new();
-        let trie_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../assets/atlas/engine-trie.bin");
-        hyper.load_trie_file(&trie_path).expect("hyper trie");
         let mut hyper_arena = GlyphArena::new();
         let hyper_places = hyper
             .layout_items(&items, &mut hyper_arena)
@@ -1114,9 +1105,6 @@ mod tests {
             paint: Paint::ByteSpans(&spans),
         };
         let mut hyper = HyperLayout::new();
-        let trie_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../assets/atlas/engine-trie.bin");
-        hyper.load_trie_file(&trie_path).expect("hyper trie");
         let mut arena = GlyphArena::new();
         let places = hyper
             .layout_items(&[item], &mut arena)
@@ -1139,10 +1127,7 @@ mod tests {
             ByteSpan { start: 16, end: 19, color: 0x2222_2222 }, // "let"
             ByteSpan { start: 24, end: 26, color: 0x3333_3333 }, // "42"
         ];
-        let trie_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../assets/atlas/engine-trie.bin");
         let mut hyper = HyperLayout::new();
-        hyper.load_trie_file(&trie_path).expect("hyper trie");
         let trie = crate::default_trie();
 
         // 1. Layout directly with Paint::ByteSpans

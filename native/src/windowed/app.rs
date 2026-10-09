@@ -829,7 +829,6 @@ fn poll_live(
         crate::repo::WalkResult::from_files(files),
         std::time::Duration::ZERO,
         std::path::Path::new("."),
-        &src.trie,
         &src.params,
         crate::repo::Strategy::Hyper,
         false,

@@ -39,14 +39,11 @@ profile-view profile="out/profile-glyph3d-js.json.gz":
 	samply load {{profile}}
 
 # Generators
-gen-trie:
-	python3 tools/gen_real_trie.py
-
 gen-schema:
 	python3 tools/gen_schema.py
 
 check-gen:
-	python3 tools/gen_real_trie.py --verify-only
+	python3 tools/check_atlas.py
 	python3 tools/gen_schema.py --check
 
 emoji-inventory:

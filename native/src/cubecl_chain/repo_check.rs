@@ -6,7 +6,7 @@ use crate::gpu::GpuContext;
 use super::repo::{InstanceInputs, SharedDevice, run_repo_chain};
 
 pub fn repo_check(ctx: &GpuContext, dir: &Path, color_mode: crate::repo::ColorMode) -> ! {
-    use crate::layout::{LayoutGlyphs as _, VerifyLayout as _};
+    use crate::layout::VerifyLayout as _;
     let t_all = std::time::Instant::now();
     // The renderer's default shape: wrap BACK, cluster on, the tuned grid
     // pagination from RepoParams::default().
@@ -115,9 +115,6 @@ pub fn repo_check(ctx: &GpuContext, dir: &Path, color_mode: crate::repo::ColorMo
     let t_eng = std::time::Instant::now();
     let mut arena = crate::layout::GlyphArena::new();
     let mut backend = crate::layout_hyper::HyperLayout::new();
-    backend
-        .load_trie_file(&crate::default_engine_trie())
-        .expect("engine trie");
     let eng_items: Vec<crate::layout::LayoutItem<'_>> = walk
         .files
         .iter()

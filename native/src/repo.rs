@@ -371,10 +371,9 @@ pub struct RepoLoad {
     pub bounds_max: [f32; 3],
     pub stats: LoadStats,
     pub color_mode: ColorMode,
-    /// Stage G: repo root + engine trie — the pick path re-reads/re-runs
-    /// individual files from these.
+    /// Stage G: repo root — the pick path re-reads/re-runs individual files
+    /// from it.
     pub root: PathBuf,
-    pub trie: PathBuf,
     /// Hierarchical layout controller and spatial scene graph.
     pub controller: Option<crate::layout_stack::LayoutController>,
 }
@@ -393,7 +392,6 @@ pub(crate) use shelf::{dir_tint, layout_shelf};
 /// instances and, when both can produce them, records, all bit-exact.
 pub fn load_repo(
     root: &Path,
-    trie: &Path,
     params: &RepoParams,
     strategy: Strategy,
     verify: bool,
@@ -401,7 +399,6 @@ pub fn load_repo(
     load_repo_from_walk(
         root,
         walk_repo(root),
-        trie,
         params,
         strategy,
         verify,
@@ -421,7 +418,6 @@ pub fn load_items(
     walk: WalkResult,
     _walk_dur: Duration,
     root: &Path,
-    trie: &Path,
     params: &RepoParams,
     strategy: Strategy,
     verify: bool,
@@ -430,7 +426,6 @@ pub fn load_items(
     load_repo_from_walk(
         root,
         walk,
-        trie,
         params,
         strategy,
         verify,
@@ -496,7 +491,6 @@ pub fn prefetch_repo(
 pub fn load_repo_from_walk(
     root: &Path,
     walk: WalkResult,
-    trie: &Path,
     params: &RepoParams,
     strategy: Strategy,
     verify: bool,
@@ -521,7 +515,6 @@ pub fn load_repo_from_walk(
     load_repo_from_prefetched(
         root,
         prefetched,
-        trie,
         params,
         strategy,
         verify,
@@ -535,7 +528,6 @@ pub fn load_repo_from_walk(
 pub fn load_repo_from_prefetched(
     root: &Path,
     prefetched: PrefetchedRepo,
-    trie: &Path,
     params: &RepoParams,
     strategy: Strategy,
     verify: bool,
@@ -617,10 +609,6 @@ pub fn load_repo_from_prefetched(
             }
         },
     };
-    backend
-        .load_trie_file(trie)
-        .expect("failed to load engine trie");
-
     let t = Instant::now();
     let sp_backend = tracing::info_span!("repo.backend").entered();
     let (mut placements, records) = if verify && strategy.can_record() {
@@ -643,7 +631,6 @@ pub fn load_repo_from_prefetched(
         let _sp_verify = tracing::info_span!("repo.verify").entered();
         let t = Instant::now();
         let mut alt = crate::layout_hyper::HyperLayout::new();
-        alt.load_trie_file(trie).expect("failed to load trie");
         let mut alt_arena = GlyphArena::new();
         let (alt_placements, alt_records) = alt
             .layout_validated_items_recording(&items, &mut alt_arena)
@@ -736,7 +723,7 @@ pub fn load_repo_from_prefetched(
                 Some(fold_lines) => {
                     let item = &file_params[index];
                     let records =
-                        rederive_cached(trie, &f.bytes, item).expect("fold: re-derive failed");
+                        rederive_cached(&f.bytes, item).expect("fold: re-derive failed");
                     let (leaders, _, _, _) =
                         crate::text::fold_leaders(&f.bytes, item.wrap_width, item.wrap_mode);
                     let starts = line_starts_of(&f.bytes);
@@ -865,13 +852,12 @@ pub fn load_repo_from_prefetched(
         stats,
         color_mode: params.color_mode,
         root: root.to_path_buf(),
-        trie: trie.to_path_buf(),
         controller: Some(controller),
     }
 }
 
 mod rederive;
-pub use rederive::{compact_folds, rederive_cached, rederive_from_bytes, rederive_records, Folded};
+pub use rederive::{compact_folds, rederive_cached, Folded};
 
 
 mod cull_blocks;
@@ -1086,7 +1072,6 @@ impl RepoLoad {
             focus_bounds,
             pick: Some(crate::glyph_scene::PickContext {
                 root: self.root,
-                trie: self.trie,
                 files: pick_files,
                 // Envelope-owned content is the CALLER's to inject (it owns
                 // the bytes); disk scenes re-derive from root. Same for the

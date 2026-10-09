@@ -1494,7 +1494,7 @@ mod trie_v2_tests {
     fn family_sequence_resolves_to_its_slot() {
         let t = load();
         assert!(!t.sequences.is_empty(), "the v2 sequence section is present");
-        // The gen_real_trie.py pin, checked on this side too: the family's
+        // The check_atlas.py pin, checked on this side too: the family's
         // slot moves only if the sheet's sequence table does.
         let fam = [0x1F468, 0x200D, 0x1F469, 0x200D, 0x1F467];
         assert_eq!(t.sequence_lookup(&fam), Some(6819));

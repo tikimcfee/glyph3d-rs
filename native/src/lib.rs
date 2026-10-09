@@ -58,7 +58,7 @@ pub enum SceneChoice {
     /// Stage C Slug text field: stage `file`, tiled `copies` times.
     Text { file: PathBuf, copies: u32, emoji_sheet: PathBuf, cluster_mode: fold::ClusterMode },
     /// Stage E1: lay `file` out with the engine and render through Slug glyph renderer.
-    EngineText { file: PathBuf, trie: PathBuf, emoji_sheet: PathBuf },
+    EngineText { file: PathBuf, emoji_sheet: PathBuf },
     /// Agent Session: 3D Agent Carrel with Turn Deck and Workdesk.
     AgentSession {
         session_path: PathBuf,
@@ -84,10 +84,6 @@ pub enum SceneChoice {
 
 pub fn atlas_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../assets/atlas")
-}
-
-pub fn default_engine_trie() -> PathBuf {
-    atlas_dir().join("engine-trie.bin")
 }
 
 pub fn default_emoji_sheet() -> PathBuf {
@@ -117,10 +113,9 @@ pub fn engine_item_at(bytes: &[u8], origin: [f64; 3]) -> layout::LayoutItem<'_> 
     }
 }
 
-pub fn engine_layout(file: &Path, trie: &Path) -> (layout::GlyphArena, layout::ItemPlacement) {
+pub fn engine_layout(file: &Path) -> (layout::GlyphArena, layout::ItemPlacement) {
     let bytes = std::fs::read(file).expect("failed to read engine input file");
     let mut backend = layout::LayoutEngine::hyper();
-    backend.load_trie_file(trie).expect("failed to load trie");
     let mut arena = layout::GlyphArena::new();
     let placements = backend
         .layout_items(&[engine_item(&bytes)], &mut arena)
@@ -285,9 +280,9 @@ fn build_scene_impl(
             scene.set_probe_cluster_mode(matches!(cluster_mode, fold::ClusterMode::Cluster));
             glyph(scene)
         }
-        SceneChoice::EngineText { file, trie, emoji_sheet } => {
+        SceneChoice::EngineText { file, emoji_sheet } => {
             let atlas = atlas::Atlas::load(ctx, emoji_sheet);
-            let (arena, placement) = engine_layout(file, trie);
+            let (arena, placement) = engine_layout(file);
             log::info!(
                 "engine-staged {}: {} records ({} blank/missing slots dropped)",
                 file.display(),
@@ -426,7 +421,6 @@ fn build_scene_impl(
                 let load = repo::load_repo_from_prefetched(
                     dir,
                     prefetched,
-                    &default_engine_trie(),
                     &params,
                     *strategy,
                     *verify,

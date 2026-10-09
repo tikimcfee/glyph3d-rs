@@ -185,7 +185,7 @@ impl GlyphScene {
         // (`default_trie()`, parsed once and shared). Nothing per-scene is
         // cached, and nothing needs to be: the live loop rebuilds a scene per
         // edit, so any setup cost here would be paid per file per apply.
-        let records = match crate::repo::rederive_cached(&pctx.trie, &bytes, &info.item) {
+        let records = match crate::repo::rederive_cached(&bytes, &info.item) {
             Ok(records) => records,
             Err(_) => {
                 log::warn!("seam/style: engine re-run failed on {}", info.rel_path);

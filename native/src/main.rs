@@ -134,7 +134,6 @@ fn main() {
             }
             let load = repo::load_repo(
                 &dir,
-                &default_engine_trie(),
                 &params,
                 strategy,
                 verify,

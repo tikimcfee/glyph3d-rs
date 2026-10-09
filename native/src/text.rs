@@ -663,7 +663,7 @@ impl ResolveGlyph for TrieTable {
 
     /// The v2 sections, on the real atlas. The advance crosses as a WORLD
     /// value through the same one-narrowing conversion every measure here
-    /// takes — the bits gen_real_trie.py wrote are reproduced, not re-derived.
+    /// takes (held to exact arithmetic by `fu_to_world_is_the_nearest_f32`).
     fn cluster_table(&self) -> Option<(&[u32], u32, f32)> {
         if self.sequences.is_empty() {
             None
@@ -691,9 +691,11 @@ pub struct RefGlyph {
     pub col: u32,
 }
 
-/// The font-units→world conversion, shared with tools/gen_real_trie.py:
-/// `fround(fu * CELL_HEIGHT_WORLD / em_height_fu)`, computed in f64 and
-/// narrowed once — the same bits the generator wrote into engine-trie.bin.
+/// The font-units→world conversion: `fu * CELL_HEIGHT_WORLD / em_height_fu`,
+/// computed in f64 and narrowed once. Every layout path resolves advances
+/// through this; `tests::fu_to_world_is_the_nearest_f32` holds it to exact
+/// arithmetic over the whole u16 domain (the sweep the retired engine-trie
+/// generator ran on its own copy of the conversion, until 2026-10-09).
 pub(crate) fn fu_to_world(fu: i32, em_height_fu: u32) -> f32 {
     (fu as f64 * CELL_HEIGHT_WORLD as f64 / em_height_fu as f64) as f32
 }
@@ -1527,6 +1529,45 @@ mod tests {
             let mut line = Vec::new();
             colorize_line_into(text, &mut line);
             assert_eq!(colorize_leaders(text), line, "{text:?}");
+        }
+    }
+
+    /// The conversion is the NEAREST f32 to the exact quotient fu / em, ties to
+    /// even, for every u16 font-unit value — checked in exact integer
+    /// arithmetic, not by evaluating the same expression twice (a check that
+    /// compares a function to a copy of itself cannot fail). It guards the
+    /// f64-then-f32 double rounding and a wrong denominator. The atlas itself
+    /// only exercises three values (1229, 2458, 2320).
+    #[test]
+    fn fu_to_world_is_the_nearest_f32() {
+        assert_eq!(CELL_HEIGHT_WORLD, 1.0, "the exact check below assumes a unit cell");
+        // An f32 > 0 as m * 2^k exactly.
+        let parts = |bits: u32| -> (i128, i32) {
+            let e = ((bits >> 23) & 0xFF) as i32;
+            let frac = (bits & 0x7F_FFFF) as i128;
+            if e == 0 { (frac, -149) } else { (frac | 0x80_0000, e - 150) }
+        };
+        for em in [2320u32, 2048, 1000] {
+            for fu in 0..=u16::MAX as i32 {
+                let got = fu_to_world(fu, em);
+                if fu == 0 {
+                    assert_eq!(got.to_bits(), 0);
+                    continue;
+                }
+                let b = got.to_bits();
+                let cands = [b - 1, b, b + 1].map(parts);
+                let s = cands.iter().map(|&(_, k)| -k).max().unwrap().max(0);
+                // |m * 2^k - fu/em| * em * 2^s, as an integer.
+                let dist = |(m, k): (i128, i32)| ((m * em as i128) << (k + s)).abs_diff((fu as i128) << s);
+                let (d_lo, d, d_hi) = (dist(cands[0]), dist(cands[1]), dist(cands[2]));
+                assert!(
+                    d <= d_lo && d <= d_hi,
+                    "fu={fu} em={em}: {got} is not the nearest f32 to the exact quotient"
+                );
+                if d == d_lo || d == d_hi {
+                    assert_eq!(b & 1, 0, "fu={fu} em={em}: a tie must round to even");
+                }
+            }
         }
     }
 

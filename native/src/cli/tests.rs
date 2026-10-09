@@ -24,7 +24,6 @@ fn defaults_match_old_parser() {
     assert!(cli.render_file.is_none());
     assert_eq!(cli.copies, 1);
     assert_eq!(cli.zoom, 1.0);
-    assert!(cli.engine_trie.is_none());
     assert!(cli.emoji_sheet.is_none());
     assert!(cli.engine_render.is_none());
     assert!(cli.load_repo.is_none());
@@ -93,7 +92,7 @@ fn scalar_flags_parse() {
         "--wrap-mode", "back", "--z-wrap-spacing", "0.6", "--cluster-mode", "cluster",
         "--layout-mode", "carrel",
         "--color-mode", "flat",
-        "--render-file", "src/main.rs", "--engine-trie", "t.bin",
+        "--render-file", "src/main.rs",
         "--engine-render", "c.rs",
         "--present-mode", "mailbox", "--gpu-key", "--gpu-profile",
         "--emoji-sheet", "sheets/other.bin",
@@ -125,7 +124,6 @@ fn scalar_flags_parse() {
     assert!(cli.repo_verify);
     assert_eq!(cli.focus_file.as_deref(), Some("alpha"));
     assert_eq!(cli.render_file, Some(PathBuf::from("src/main.rs")));
-    assert_eq!(cli.engine_trie, Some(PathBuf::from("t.bin")));
     assert_eq!(cli.engine_render, Some(PathBuf::from("c.rs")));
 }
 

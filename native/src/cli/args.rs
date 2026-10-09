@@ -116,11 +116,6 @@ pub struct Cli {
     /// Point it at another G3ES file to swap the sheet without a rebuild.
     #[arg(long, value_name = "PATH")]
     pub emoji_sheet: Option<PathBuf>,
-    /// Trie path handed to the layout backend for `--engine-render` (default:
-    /// assets/atlas/engine-trie.bin). Currently not read: every backend
-    /// resolves through the atlas trie (codepoints.bin)
-    #[arg(long, value_name = "PATH")]
-    pub engine_trie: Option<PathBuf>,
     /// Stage E1: render engine records through the Slug renderer
     #[arg(long, value_name = "PATH")]
     pub engine_render: Option<PathBuf>,

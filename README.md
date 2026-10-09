@@ -23,9 +23,9 @@ Platform: macOS on Apple Silicon (`osx-arm64`; Metal) and Linux x86_64 (`linux-6
             schema/glyph-identity.json          (vendored, hash-pinned)
                       │ tools/gen_schema.py
                       ▼
- assets/atlas/*.bin   engine-trie.bin
-        │                    │
-        ▼                    ▼
+ assets/atlas/*.bin
+        │
+        ▼
  ┌─────────────────────────────────────────────────────────────┐
  │ native/src/layout_hyper.rs  — High-performance Rust layout  │
  │ • CPU-parallel fold & survivors via Rayon cache-blocked scan│
@@ -58,7 +58,7 @@ Platform: macOS on Apple Silicon (`osx-arm64`; Metal) and Linux x86_64 (`linux-6
 - **`native/src/layout/span.rs`**: ByteSpan token painting for AST/LSP integration (`Paint::ByteSpans`),
   enabling high-performance byte-range syntax colorization without string copies.
 - **`assets/atlas/`**: Prebaked glyph geometry (curves, glyph map, font table, codepoint trie)
-  exported verbatim from the Slug atlas, plus `engine-trie.bin`. Byte format: `assets/atlas/FORMAT.md`.
+  exported verbatim from the Slug atlas. Byte format: `assets/atlas/FORMAT.md`.
 - **`build.toml`**: Declarative gate, artifact, and mutation verification graph, executed by `glyph`.
 
 ## Quickstart
@@ -122,7 +122,7 @@ python3 tools/bench_hyper.py --repo /path/to/glyph3d-js -n 5 --color-mode flat
 | `glyph/` | The verification and mutation runner (`cargo run -p glyph -- validate`) |
 | `tools/` | Verification scripts, generators, and `bench_hyper.py` performance harness |
 | `.agents/` | Agent guidelines, house rules (`rules/rust-engineering.md`), and testing skill (`skills/glyph-engine-testing/SKILL.md`) |
-| `assets/atlas/` | Prebaked glyph-geometry binaries + `engine-trie.bin` + `FORMAT.md` |
+| `assets/atlas/` | Prebaked glyph-geometry binaries + `FORMAT.md` |
 | `schema/` | `glyph-identity.json` — single source of truth for buffer/lane layouts |
 | `research/` | GPU architecture studies, web target notes, and `desktop-platform-audit.md` |
 | `out/` | Golden baselines (`tooling-ab/baseline/`), proof PNGs, and historical stage reports |

@@ -26,7 +26,6 @@ use crate::layout::{
     GlyphArena, GlyphRecord, LayoutError, LayoutGlyphs, LayoutItem, Paint, VerifyLayout,
     ItemPlacement,
 };
-use std::path::Path;
 use std::time::{Duration, Instant};
 
 /// The product path's wall-clock decomposition — rung 5's yardstick,
@@ -62,7 +61,7 @@ pub(crate) struct PrefetchedCubeclData {
     pub(crate) host_inputs: crate::cubecl_chain::prep::ChainHostInputs<'static>,
 }
 
-/// The device-chain backend. Construct and `load_trie_file` like any other;
+/// The device-chain backend. Construct it like any other;
 /// the atlas tables are loaded per run inside the chain.
 #[derive(Default)]
 pub struct CubeclLayout {
@@ -299,15 +298,6 @@ pub(crate) fn marshal_from_walk(
 impl LayoutGlyphs for CubeclLayout {
     fn name(&self) -> &'static str {
         "cubecl"
-    }
-
-    fn load_trie_file(&mut self, _path: &Path) -> Result<(), LayoutError> {
-        // The chain reads the ATLAS tables (`TrieTable::load(atlas_dir())`)
-        // inside `run_repo_chain`, so the engine-trie path the seam hands
-        // across is not read (HyperLayout ignores it the same way). Accepting
-        // the call keeps the trait uniform — the frames' loader does not care
-        // which trie file a backend was nominally handed.
-        Ok(())
     }
 
     /// THE PRODUCT PATH since E2b (note 23): the endpoint. One scatter

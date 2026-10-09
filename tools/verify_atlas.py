@@ -179,11 +179,11 @@ for i in range(seq_count):
 check(all(seq_rows[i][2] < seq_rows[i + 1][2] for i in range(seq_count - 1)),
       "sequence section sorted by codepoint sequence")
 check(all(seq_rows[i][0] == seq_rows[0][0] + i for i in range(seq_count)),
-      "sequence slots are base + index (the gen_real_trie.py rule)")
+      "sequence slots are base + index (the check_atlas.py rule)")
 fam = (0x1F468, 0x200D, 0x1F469, 0x200D, 0x1F467)
 fam_row = [r for r in seq_rows if r[2] == fam]
 check(len(fam_row) == 1 and fam_row[0][0] == 6819,
-      f"the family ZWJ sequence resolves to slot 6819 (got {fam_row}) — the pin from gen_real_trie.py")
+      f"the family ZWJ sequence resolves to slot 6819 (got {fam_row}) — the pin from check_atlas.py")
 class_sec = w[class_off: class_off + class_words]
 check(class_sec[0] == 0x43433347, "class section is a G3CC table")
 g3cc = (ATLAS / "cluster-classes.bin").read_bytes()
