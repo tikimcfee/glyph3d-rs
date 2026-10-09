@@ -91,6 +91,9 @@ None pushed or merged to main; that is Ivan's call.
 | e20cb81..7a556fd | C17: colourisers agree, cut lines coloured whole, hyper-oracle paint tier + chunk-cut-paint.txt |
 | 21f9aef, d4cb1a4 | both golden sets re-adopted with every moved pixel attributed (P1) |
 | d6e060d | merged main@3a6f65f (settings defaults + overrides, ground environment, transcript fixes): battery ALL GATES GREEN 15/15, pixel-ab byte-equal on vulkan-nvidia and metal-apple |
+| 06e5245..48edfc9 | D2 runner strips the doubled alias (string alias tried + reverted), C11 unambiguous mutation finds, C9 session project from the provider-recorded workspace |
+| 9cb0e47..87c3e66 | C5 spike deleted, C2 dead paginate kernel, aded165 public-repo path scrub, D9 engine-trie retired → atlas-tables gate (16 gates), D6 deny.toml gone |
+| 865ee62..2a9e95b | D7 docs moved/bannered, C8 clippy --all-targets, D4 rules corrected, C18 logged |
 
 Main's build fix (872621d, the other agent's) was fast-forwarded in first.
 
@@ -102,17 +105,63 @@ ln -s <path-to-zed-checkout> experiments/zed
 export GLYPH_FLAGSHIP_REPO=<path-to-glyph3d-js-checkout>
 ```
 
-## Suggested order for what is open
+## Next session: handoff (2026-10-09, tip of this branch)
 
-1. (D8 done 2026-10-09.) C10 next: the hyper-oracle gate is the fence a
-   HyperLayout fix lands against.
-2. D7, D4, D6: the remaining doc and config tidy.
-3. C5: delete the spike.
-4. C2 + C3 + C4: cubecl cleanup, once C10 says whether the CubeCL path is
-   right; its fence is what proves the cleanup output-neutral.
-5. C1: hoist the field machinery. Largest; wants a fresh battery.
+**State.** Battery ALL GATES GREEN, 16 of 16 (270+ tests, floor in build.toml);
+pixel-ab byte-equal on BOTH vulkan-nvidia and metal-apple (re-baselined
+21f9aef/d4cb1a4); `glyph prove` covers every provable mutation. Main pulled
+this branch up to the main merge (d6e060d); everything after it (D2, C11, C9,
+C5, C2 kernel, D9, D6, D7, C8, D4) is NOT on main yet.
 
-For discussion: C10, D9, X1, X2, P1. Small, fit anywhere: C8, C9, C11, X3.
+**Decided with Ivan (2026-10-09), in order:**
+
+1. **Refactors (step 3) — next.**
+   - **C1, the field crates.** `glyph-field-{instanced,derived}`: upload.rs
+     (267 lines each, ~half identical after normalising the slot name),
+     storage.rs (near-identical), field.rs, pipeline.rs. Hoist slot-generic
+     upload + storage into `glyph-field` (`T: Pod`, `SlotStorage<T>`, the
+     chunking arithmetic, one `create_mapped_hal_buffer<T>` gated once on
+     macOS). The C16 copy helpers (`glyph_field::copy`) are already there.
+     Proof of neutrality: pixel-ab on both machines + hyper-oracle device tier;
+     an M2 A/B (Derived and Instanced) because upload is on the load path.
+   - **C2, split `glyph/src/main.rs`** (~1,720 lines) into manifest / products
+     / gates / prove / cli modules. Then `glyph/src/tui.rs` (~2,030) and
+     CubeCL's `position.rs` (~3,565) only if CubeCL stays.
+   - **C3, folded in:** outside CubeCL every `#[allow]` is
+     `too_many_arguments` (23 fns). Parameter structs where the signature
+     changes anyway; the 7 in the device emitter's hot loop
+     (`pass2_device.rs`, `char_resolve.rs`) need an M2 A/B.
+2. **Load-time syntax colouring.** Being replaced by on-load LSP/AST
+   colouring. Talk first: deprecating removes the three colourisers + the
+   stage_file tokenizer, the file-tint counts, the hyper-oracle PAINT tier,
+   and moves the repo goldens to flat paint (a re-baseline). Don't unify the
+   colourisers if they are about to go.
+3. **GPU direction (Ivan, 2026-10-09):** "we need to really think about how
+   to use the GPU effectively" — the CubeCL dispatch work has not been shown
+   to beat a decent CPU path. CubeCL may go away (so C4/C12/C18 and CubeCL's
+   allows are parked). Discrete-GPU lever on record: wgpu-core zero-fills its
+   own 1.8 GB staging buffer + an extra copy, ~150 ms of ~410 ms backend on
+   the 94 MB tree (Linux/NVIDIA only; unified memory skips it).
+4. **X1/X2** (Zed experiments, flagship corpus clone here) after performance
+   is in a good state; the Linux load milestone makes a good benchmark.
+
+**Working conventions this pass settled** (also in memory):
+- Test depth by change size: build + the watching gate + `glyph prove
+  --mutation <touched>` by default; full battery + unscoped prove + M2 A/B for
+  runner changes, load-path/hot-path changes, dependency bumps, and before
+  handing back to main. Say which tier ran.
+- Public repo: tracked files must work for a cloner — no personal paths,
+  hosts or session names; names/emails are fine.
+- A red golden gate hides the NEXT change (the walk found 048d403's culling
+  loss and 8b28f1f's colouring that way): keep pixel-ab green; re-baseline only
+  on Ivan's say-so, attributing every moved pixel first.
+- `cargo glyph` now works inside `.claude/worktrees` (D2), but Ivan prefers
+  sibling worktrees (`../glyph3d-rs-<topic>`) for cargo work.
+- Second machine: helper scripts (ssh job runner, perf A/B, golden walk,
+  pixel gate) live untracked in `target/scratch/helper-tools/rx/`; they name
+  this setup and must be made generic (env-driven) before ever landing.
+  A/A noise floor on the M2: ~8-9 ms (derived syntax ~2 ms).
+- Linux A/B harness: `target/scratch/helper-tools/ab3.py`.
 
 ---
 
