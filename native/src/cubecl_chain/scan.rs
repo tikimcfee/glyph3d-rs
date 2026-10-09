@@ -491,6 +491,7 @@ pub(super) fn apply(
     trie_block_metrics: &[f32],
     trie_block_codepoints: &[u32],
     #[comptime] trie_block_shift: u32,
+    bitmap_advance: f32,
     line_columns: &mut [u32],
     layout_metrics: &mut [f32],
     item_descriptors: &[u32],
@@ -581,14 +582,17 @@ pub(super) fn apply(
                 active_cell_advance_bits = item_descriptors[item_index * ITEM_DESC_STRIDE + ITEM_DESC_CELL_ADVANCE];
             }
             let reset = if has_items && id == start { 1i32 } else { 0i32 };
-            let advance = if (flags_at(glyph_flags, id) & super::F_LEADER) != 0 {
-                let cp_len = seq_len_at(bytes, id, total_bytes);
-                let cp = cp_at(bytes, id, cp_len, total_bytes);
-                let (adv, _) = decode_trie(cp, trie_block_indices, trie_block_metrics, trie_block_codepoints, trie_block_shift);
-                adv
-            } else {
-                0.0f32
-            };
+            let advance = inline_advance(
+                flags_at(glyph_flags, id),
+                bytes,
+                id,
+                total_bytes,
+                trie_block_indices,
+                trie_block_metrics,
+                trie_block_codepoints,
+                trie_block_shift,
+                bitmap_advance,
+            );
             let leaf = leaf_of(glyph_flags, advance, active_wrap_width, active_wrap_mode, reset, active_cell_advance_bits, id);
             combine(&mut accumulator, &leaf);
             id += 1;
@@ -764,14 +768,17 @@ pub(super) fn apply(
                     }
                 }
             }
-            let advance = if (flags_at(glyph_flags, id) & super::F_LEADER) != 0 {
-                let cp_len = seq_len_at(bytes, id, total_bytes);
-                let cp = cp_at(bytes, id, cp_len, total_bytes);
-                let (adv, _) = decode_trie(cp, trie_block_indices, trie_block_metrics, trie_block_codepoints, trie_block_shift);
-                adv
-            } else {
-                0.0f32
-            };
+            let advance = inline_advance(
+                flags_at(glyph_flags, id),
+                bytes,
+                id,
+                total_bytes,
+                trie_block_indices,
+                trie_block_metrics,
+                trie_block_codepoints,
+                trie_block_shift,
+                bitmap_advance,
+            );
             let leaf = leaf_of(glyph_flags, advance, active_wrap_width, active_wrap_mode, if reset { 1i32 } else { 0i32 }, active_cell_advance_bits, id);
             combine(&mut run, &leaf);
             id += 1;
@@ -787,4 +794,38 @@ pub(super) fn apply(
             }
         }
     }
+}
+
+/// The advance a leader carries, evaluated INLINE from the packed bytes and
+/// the trie — the per-byte advance buffer this replaces (26595fb) held the
+/// CLUSTER-RESOLVED value, not the raw trie lookup: a committed head carries
+/// the bitmap advance (fold.rs `slots.sm[id * 2] = bitmap_advance`) and a
+/// trailer — sequence member or static-zero codepoint — carries zero. So
+/// the cluster flags decide before the trie does, at every site that reads
+/// an advance; a site that consults only the trie lays a flag sequence out
+/// at its pieces' widths (the chain gate's cluster-flags fixture, 2026-10-09).
+#[cube]
+fn inline_advance(
+    glyph_flag: u32,
+    bytes: &[u32],
+    byte_index: usize,
+    total_bytes: usize,
+    trie_block_indices: &[u32],
+    trie_block_metrics: &[f32],
+    trie_block_codepoints: &[u32],
+    #[comptime] trie_block_shift: u32,
+    bitmap_advance: f32,
+) -> f32 {
+    let mut advance = 0.0f32;
+    if (glyph_flag & super::F_LEADER) != 0 {
+        if (glyph_flag & F_CLUSTER_HEAD) != 0 {
+            advance = bitmap_advance;
+        } else if (glyph_flag & F_CLUSTER_TRAILER) == 0 {
+            let cp_len = seq_len_at(bytes, byte_index, total_bytes);
+            let cp = cp_at(bytes, byte_index, cp_len, total_bytes);
+            let (adv, _) = decode_trie(cp, trie_block_indices, trie_block_metrics, trie_block_codepoints, trie_block_shift);
+            advance = adv;
+        }
+    }
+    advance
 }
