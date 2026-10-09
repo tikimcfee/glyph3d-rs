@@ -39,18 +39,16 @@ fn transcode_one(inst: &GlyphInstance, item_params: &[ItemParamsGpu]) -> Derived
     };
 
     let glyph_id = (inst.glyph_id & 0xFFFF) as u16;
-    let item_idx = (inst.group_id & 0xFFFF) as u16; // upload.rs transcode lacks true item_idx
-    let group_id = (inst.group_id & 0xFFFF) as u16;
     let row = inst.row;
+    let item_and_group = inst.group_id;
 
-    DerivedSlot::new(
+    DerivedSlot::with_item_and_group(
         inst.pos[0],
         row,
         glyph_id,
         wrap_segment,
         inst.color,
-        item_idx,
-        group_id,
+        item_and_group,
     )
 }
 

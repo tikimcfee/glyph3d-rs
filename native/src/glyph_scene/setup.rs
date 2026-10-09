@@ -60,7 +60,7 @@ impl GlyphScene {
         let binding_limit = ctx.device.limits().max_storage_buffer_binding_size as usize;
         let instances_len = arena.len();
         
-        let max_groups = 65536;
+        let max_groups = groups.len().max(65536);
         let group_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("group table"),
             size: (max_groups * std::mem::size_of::<GroupRow>()) as u64,
