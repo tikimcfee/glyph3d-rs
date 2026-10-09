@@ -31,7 +31,7 @@ machines and clones, **M** machine-specific values, **R** runner.
 | D8 | Retired Rust checks went unwatched from 09-30; `overflow-leads.txt` read by nothing | closed | 0336e85, 48a75d9, 5257df9 (reference-port, repo-verify x2, cubecl-chain/-fork, new hyper-oracle; 15 gates), 50c7085 (chain green) |
 | D9 | `engine-trie.bin` (+ `gen_real_trie.py`, `--engine-trie`) is committed and gated but read by no Rust code | open | decide: keep or retire (changes committed-artifacts) |
 | C1 | Twin field crates ~60% shared; five copies of the mapped-buffer upload | open | hoist into `glyph-field`; last, largest |
-| C2 | Oversized files; dead kernels in `cubecl_chain/position.rs` | open | delete dead kernels; split `glyph/src/main.rs` |
+| C2 | Oversized files | open | dead `paginate` kernel deleted (see commit); `derive_stride` was NOT dead (the chain bench launches it — the note was wrong). Left: split `glyph/src/main.rs` |
 | C3 | 46 `#[allow]`, one justified | open | pass, with C2 |
 | C4 | 63 `unwrap()` in `cubecl_chain/repo/dispatch.rs`, one shape | open | one accessor or non-optional fields |
 | C5 | `spike_vertex_yz.rs`, 908 lines, own CLI flag, superseded | closed | deleted with --spike-vertex-yz; it ran its OWN inline WGSL and ItemParamsGpu, never the production Derived shader, so no coverage was lost (the Derived vertex-stage Y/Z stays a battery blind spot) |
@@ -159,7 +159,7 @@ had to gate one by one.
 
 | lines | file |
 |---|---|
-| 3643 | `native/src/cubecl_chain/position.rs` (dead kernels `derive_stride` :2332, `paginate` :2366) |
+| 3643 | `native/src/cubecl_chain/position.rs` (dead `paginate` kernel removed 2026-10-09) |
 | 1921 | `glyph/src/tui.rs` |
 | 1659 | `native/src/layout_hyper/pass2_device.rs` |
 | 1658 | `native/src/fixture.rs` |
