@@ -52,3 +52,5 @@ pub use resources::{
 };
 pub use storage::{SlotRecord, SlotStorage};
 pub use upload::{upload_host_slots, HostUpload, Transcode, UploadLabels};
+#[cfg(target_os = "macos")]
+pub use upload::create_mapped_slot_buffer;
