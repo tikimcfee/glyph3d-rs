@@ -32,6 +32,7 @@ pub struct Settings {
     pub repo: RepoSettings,
     pub agent_cards: AgentCardSettings,
     pub ui: UiSettings,
+    pub agent_text: AgentTextSettings,
     pub environment: EnvironmentSettings,
     pub verbs: VerbSettings,
     pub quad_demo: QuadDemoSettings,
@@ -156,6 +157,55 @@ pub struct WorkdeskAccents {
     pub edit: [f32; 4],
     pub write: [f32; 4],
     pub ast_analysis: [f32; 4],
+}
+
+/// Transcript card text (`agent_transcript::staging`), sRGB 0-255. Colour
+/// identifies the event KIND (section headings take the kind's accent; the
+/// banner quads carry its hue); everything else draws from a few neutral roles.
+#[derive(Clone, Debug, PartialEq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentTextSettings {
+    /// Card titles ("TURN n: ...", "BEAT n: ...", "ARTIFACT: ...").
+    pub title: [u8; 3],
+    /// The second header line of every page.
+    pub subtitle: [u8; 3],
+    /// Section headings not tied to one kind (e.g. TOUCHED FILES).
+    pub heading: [u8; 3],
+    /// The horizontal separator rules.
+    pub rule: [u8; 3],
+    /// Prose, payloads and file content.
+    pub body: [u8; 3],
+    /// Metadata lines: sizes, lengths, tool ids, summaries.
+    pub meta: [u8; 3],
+    /// The subject of a spec: target path, created file, tool name.
+    pub emphasis: [u8; 3],
+    /// Empty states ("(No ... recorded)").
+    pub muted: [u8; 3],
+    /// Comment lines inside shown source.
+    pub comment: [u8; 3],
+    pub ok: [u8; 3],
+    pub error: [u8; 3],
+    pub diff_add: [u8; 3],
+    pub diff_remove: [u8; 3],
+    pub diff_hunk: [u8; 3],
+    pub diff_context: [u8; 3],
+    pub kinds: AgentKindAccents,
+}
+
+/// One accent per transcript event kind (and per file action kind, which
+/// share the read/edit/write/ast entries).
+#[derive(Clone, Debug, PartialEq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentKindAccents {
+    pub user_prompt: [u8; 3],
+    pub thinking: [u8; 3],
+    pub file_read: [u8; 3],
+    pub file_edit: [u8; 3],
+    pub file_write: [u8; 3],
+    pub ast_analysis: [u8; 3],
+    pub command: [u8; 3],
+    pub tool_invocation: [u8; 3],
+    pub assistant_response: [u8; 3],
 }
 
 /// egui overlay label colours, sRGB 0-255.
@@ -405,6 +455,30 @@ mod tests {
         assert_eq!(w.ast_analysis, [0.45f32, 0.20, 0.55, 0.90]);
         // [ui] is integer sRGB, exact by construction; no pin needed.
         assert_eq!(s.quad_demo.clear_color, [0.02, 0.02, 0.04, 1.0]);
+    }
+
+    /// Kind accents exist to be told apart at a glance down a scrolled deck
+    /// (the old edit/thinking pair sat 14 apart and read as one colour).
+    #[test]
+    fn agent_kind_accents_are_mutually_distinct() {
+        let k = &Settings::defaults().unwrap().agent_text.kinds;
+        let all = [
+            ("user_prompt", k.user_prompt),
+            ("thinking", k.thinking),
+            ("file_read", k.file_read),
+            ("file_edit", k.file_edit),
+            ("file_write", k.file_write),
+            ("ast_analysis", k.ast_analysis),
+            ("command", k.command),
+            ("tool_invocation", k.tool_invocation),
+            ("assistant_response", k.assistant_response),
+        ];
+        for (i, (a, x)) in all.iter().enumerate() {
+            for (b, y) in &all[i + 1..] {
+                let d2: i32 = (0..3).map(|c| (x[c] as i32 - y[c] as i32).pow(2)).sum();
+                assert!(d2 >= 45 * 45, "{a} and {b} are too close ({:.1} < 45)", (d2 as f32).sqrt());
+            }
+        }
     }
 
     #[test]

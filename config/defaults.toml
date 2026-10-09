@@ -157,6 +157,43 @@ edit = [0.60, 0.40, 0.15, 0.90]           # amber
 write = [0.15, 0.50, 0.30, 0.90]          # emerald
 ast_analysis = [0.45, 0.20, 0.55, 0.90]   # purple
 
+[agent_text]
+# Transcript card text, sRGB 0-255. Colour says which KIND of event a card is:
+# the banner carries the kind's hue, and every section heading inside the page
+# takes its kind's accent (below), so a run of edits reads as a run of one
+# colour while scrolling the deck. Titles stay neutral: they overlap the banner,
+# where same-hue text loses contrast. All other text uses these few roles.
+title = [255, 255, 255]          # card titles (turn and beat)
+subtitle = [150, 175, 205]       # second header line of every page
+heading = [225, 235, 250]        # headings not tied to one kind (TOUCHED FILES)
+rule = [70, 90, 115]             # separator rules
+body = [220, 230, 240]           # prose, payloads, file content
+meta = [160, 180, 200]           # sizes, lengths, tool ids, summaries
+emphasis = [240, 245, 255]       # a spec's subject: target path, tool name
+muted = [135, 150, 165]          # empty states: "(No ... recorded)"
+comment = [130, 155, 170]        # comment lines in shown source
+ok = [110, 235, 140]
+error = [250, 115, 115]
+diff_add = [120, 245, 140]
+diff_remove = [245, 120, 120]
+diff_hunk = [110, 200, 255]      # "@@ -a,b +c,d @@"
+diff_context = [195, 205, 220]
+
+[agent_text.kinds]
+# One accent per event kind, each in the hue family of that kind's card banner
+# ([agent_cards.banners]). File actions (touched-file lists, revision cards)
+# share the read / edit / write / ast entries. Keep these mutually distinct:
+# telling kinds apart at a glance is their whole job.
+user_prompt = [140, 160, 255]          # periwinkle (banner: slate blue / indigo)
+thinking = [245, 210, 100]             # gold
+file_read = [100, 205, 250]            # cyan
+file_edit = [250, 150, 70]             # flame orange (distinct from thinking's gold)
+file_write = [110, 235, 140]           # emerald
+ast_analysis = [210, 155, 250]         # purple
+command = [200, 205, 215]              # silver (banner: terminal graphite)
+tool_invocation = [150, 190, 215]      # steel blue
+assistant_response = [120, 225, 190]   # teal-mint
+
 [ui]
 # egui overlay label colours, sRGB 0-255 integers.
 grab_active = [255, 200, 80]          # "ACTIVE GRAB" banner
