@@ -40,6 +40,7 @@ machines and clones, **M** machine-specific values, **R** runner.
 | C8 | `clippy --all-targets`: 14 test-only lints + deny-level `reversed_empty_ranges` (seam.rs test) | open | sweep; gate runs without `--all-targets` |
 | C9 | `discovery.rs` names a Claude project by the slug's last `-` segment (`…-glyph3d-js` → `js`) | open | small fix |
 | C10 | CubeCL fence FAILS on both machines. Attributed: two defects (detail) — HyperLayout's ASCII fast path vs clusters (since 09-30), and a chain regression in 26595fb (10-06) | open | decide fixes; HyperLayout has no oracle check (D8) |
+| C12 | CubeCL's standalone cluster pass (`--cubecl-cluster-check`, bench cluster mode; NOT the repo path's fused decode_probe) misses keycap/overlap/wrap sequences and ZWJ families; fails identically at d08af8b | open | instrument-only; fix or retire the standalone pass |
 | C11 | Mutation `find` strings also match their own entry in build.toml; correct only because the target comes first | open | small: anchor them, or have the prover refuse an ambiguous find |
 | P1 | pixel-ab red on both platforms since 10-07; Linux set a month stale, 2 views never adopted | Ivan's call | Mac re-baseline first, then Linux re-adoption |
 | X1 | Experiments' Zed symlink scheme never built against real Zed | next up | needs a Zed checkout or the Mac; fieldzed's dylib build.rs deleted in 6a0b669 |
@@ -253,7 +254,17 @@ the flag and its `cli/command.rs` arm.
      and the keycap mark as a separate glyph (fork slot 287: chain gi 5264
      double-advance, hyper gi 17 = `0`; slot 288: hyper gi 4431). Unverified:
      why `#️⃣`/`*️⃣` agree between the two.
-  2. **Chain (CubeCL vs scan.rs, `cluster-flags`) — regression in 26595fb**
+  2. **Chain (CubeCL vs scan.rs, `cluster-flags`) — regression in 26595fb,
+     FIXED in c5ef78a, and it was the INSTRUMENT, not production.** 26595fb
+     moved "this byte is a committed cluster head" into a device-only flag
+     (`F_CLUSTER_HEAD`) set by `cluster_mark` on the repo path; the chain-check
+     driver uploads CPU flags that never carried it, and a literal 136.0
+     bitmap advance replaced the trie's. It also left three instruments
+     reading a buffer it removed (cluster-check, decode-check advance, the
+     bench's cluster verify) and the bench timing the flags buffer as text.
+     Production launches `apply_and_emit`; the fixed `scan.rs::apply` runs
+     only in the check and bench. Fork numbers and cubecl renders unchanged.
+     Original finding:
      (2026-10-06, "eliminate 776MB intermediate VRAM buffers with inline trie
      evaluation in scan and emit"). Bisected on the M2, 7 steps: parent
      d08af8b PASS, 26595fb FAIL (9 record mismatches); PASS at every earlier
