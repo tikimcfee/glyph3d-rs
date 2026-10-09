@@ -295,7 +295,15 @@ fn stage_host_memory<E: SlotEmit>(
 
     let (pass2, emoji_tint_pairs) = inputs.run::<E>(host_ptr as usize);
 
-    const STAGING_BYTES: usize = 64 * 1024 * 1024; // 64 MiB streaming staging buffer
+    // 64 MiB streaming staging buffer:
+    // 1. PCIe DMA saturation: transfers >= 32-64 MiB saturate ~98% of line-rate bandwidth
+    //    (~25 GB/s on PCIe 4.0/5.0 x16); larger buffers yield diminishing returns (<1%).
+    // 2. Bounded VRAM overhead: on mega repos (e.g. Linux kernel, ~25 GB slot storage),
+    //    staging chunk sizes equal to target chunks (1.9 GiB) risk immediate device OOM.
+    //    Capping at 64 MiB limits staging VRAM overhead to 0.2% of 32 GB.
+    // 3. Low sync latency: copying 64 MiB takes ~2.5 ms, making CPU/GPU map_async sync
+    //    overhead (~30 µs) less than 1.5% of the transfer time.
+    const STAGING_BYTES: usize = 64 * 1024 * 1024;
 
     // Allocate ONE reusable staging buffer mapped at creation.
     // Total VRAM overhead for staging is strictly capped at 64 MiB.
