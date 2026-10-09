@@ -303,6 +303,86 @@ pub(crate) struct ChunkPass2Output {
     pub max_row_seen: i64,
 }
 
+/// Syntax colours for the two places a chunk can hold PART of a line (C17).
+/// The colourisers are line-local, but a line can carry state across a cut
+/// (an open string or comment; a word's colour is decided at its END and
+/// filled back to its start), so colouring a chunk's share of a cut line on
+/// its own disagrees with a walk of the whole item — 578 of
+/// `g-pick-repo/wide.txt`'s glyphs did until 2026-10-09.
+#[derive(Default)]
+struct ChunkCutColors {
+    /// The chunk STARTS inside a line: the colours of that line's leaders
+    /// that fall in this chunk, out of a colouring of the whole line.
+    head: Vec<u32>,
+    /// The chunk's LAST line starts in the chunk and runs past its end: the
+    /// colours of its leaders that fall in this chunk, likewise.
+    tail: Vec<u32>,
+}
+
+/// Colour every line that a chunk cut falls inside ONCE, over the whole
+/// line, and hand each chunk its share. Lines are found from the cuts alone
+/// (a cut at a newline needs nothing), and each line's start and end are
+/// searched once, so the work is O(cut lines), not O(chunks x line).
+fn whole_line_colors_at_cuts(
+    chunks: &[super::chunk::LayoutChunk<'_>],
+    items: &[LayoutItem<'_>],
+) -> Vec<ChunkCutColors> {
+    let mut out: Vec<ChunkCutColors> = (0..chunks.len()).map(|_| ChunkCutColors::default()).collect();
+    // (item, line start, line end — its newline or the item's end, first
+    // chunk, last chunk)
+    let mut lines: Vec<(usize, usize, usize, usize, usize)> = Vec::new();
+    for c in 1..chunks.len() {
+        let (prev, next) = (&chunks[c - 1], &chunks[c]);
+        let item = &items[next.item_index];
+        if prev.item_index != next.item_index || !matches!(item.paint, Paint::SyntaxHeuristic) {
+            continue;
+        }
+        let cut = next.byte_offset;
+        if cut == 0 || item.bytes[cut - 1] == b'\n' {
+            continue;
+        }
+        if let Some(last) = lines.last_mut() {
+            if last.0 == next.item_index && cut <= last.2 {
+                last.4 = c;
+                continue;
+            }
+        }
+        let start = memchr::memrchr(b'\n', &item.bytes[..cut]).map_or(0, |i| i + 1);
+        let end = memchr::memchr(b'\n', &item.bytes[cut..]).map_or(item.bytes.len(), |i| cut + i);
+        lines.push((next.item_index, start, end, c - 1, c));
+    }
+    if lines.is_empty() {
+        return out;
+    }
+    let leaders = |b: &[u8]| b.iter().filter(|&&x| crate::text::is_colorizer_leader(x)).count();
+    let shares: Vec<Vec<(usize, bool, Vec<u32>)>> = lines
+        .par_iter()
+        .map(|&(it, start, end, c0, c1)| {
+            let bytes = items[it].bytes;
+            let mut colors = Vec::new();
+            crate::text::colorize_line_into(&bytes[start..end], &mut colors);
+            let mut k = 0usize;
+            let mut res = Vec::with_capacity(c1 - c0 + 1);
+            for (c, ch) in chunks.iter().enumerate().take(c1 + 1).skip(c0) {
+                let a = ch.byte_offset.max(start);
+                let b = (ch.byte_offset + ch.bytes.len()).min(end);
+                let n = leaders(&bytes[a..b]);
+                res.push((c, ch.byte_offset > start, colors[k..k + n].to_vec()));
+                k += n;
+            }
+            res
+        })
+        .collect();
+    for (c, is_head, run) in shares.into_iter().flatten() {
+        if is_head {
+            out[c].head = run;
+        } else {
+            out[c].tail = run;
+        }
+    }
+    out
+}
+
 #[allow(clippy::too_many_arguments)]
 fn layout_pass2_chunk<E: SlotEmit>(
     chunk_bytes: &[u8],
@@ -322,6 +402,7 @@ fn layout_pass2_chunk<E: SlotEmit>(
     em_height_fu: u32,
     dest_addr: usize,
     lut: &[f64; 256],
+    cut: &ChunkCutColors,
 ) -> ChunkPass2Output {
     let bytes = chunk_bytes;
     let p = &item.params;
@@ -370,17 +451,10 @@ fn layout_pass2_chunk<E: SlotEmit>(
     };
     let mut stack_line_colors = [crate::layout::DEFAULT_COLOR_PACKED; 256];
 
+    // A chunk that starts mid-line paints that line's leaders from a
+    // colouring of the WHOLE line (C17), never from its own share of it.
     if is_syntax_heuristic && initial_col > 0 {
-        let first_nl = match memchr::memchr(b'\n', bytes) {
-            Some(off) => off,
-            None => bytes.len(),
-        };
-        let first_slice = &bytes[..first_nl];
-        if crate::text::is_pure_printable_ascii(first_slice) {
-            crate::text::colorize_pure_ascii_line(first_slice, &mut line_colors);
-        } else {
-            crate::text::colorize_line_into(first_slice, &mut line_colors);
-        }
+        line_colors.extend_from_slice(&cut.head);
     }
     let mut file_s0 = 0.0f64;
     let mut file_s1 = 0.0f64;
@@ -475,17 +549,36 @@ fn layout_pass2_chunk<E: SlotEmit>(
 
             let mut ascii_syntax_counts = None;
             let mut is_comment_line = false;
-            if is_syntax_heuristic {
+            // The chunk's last line, cut at the chunk's end, likewise (C17).
+            let cut_tail = if nl_offset.is_none() && !cut.tail.is_empty() { Some(&cut.tail[..]) } else { None };
+            if let (true, Some(tail)) = (is_syntax_heuristic, cut_tail) {
+                if is_pure_ascii {
+                    let dst = if line_len <= 256 { &mut stack_line_colors[..line_len] } else {
+                        line_colors.clear();
+                        line_colors.resize(line_len, 0);
+                        &mut line_colors[..]
+                    };
+                    dst.copy_from_slice(tail);
+                    let counts = crate::text::palette_counts(tail);
+                    is_comment_line = counts[4] as usize == line_len;
+                    ascii_syntax_counts = Some(counts);
+                } else {
+                    line_colors.clear();
+                    line_colors.extend_from_slice(tail);
+                }
+            } else if is_syntax_heuristic {
                 if is_pure_ascii {
                     let counts = if line_len <= 256 {
                         crate::text::colorize_pure_ascii_line_slice(line_bytes, &mut stack_line_colors[..line_len])
                     } else {
                         crate::text::colorize_pure_ascii_line(line_bytes, &mut line_colors)
                     };
-                    if counts[4] > 0 {
-                        let leading_spaces = line_bytes.iter().take_while(|&&b| b == b' ').count();
-                        is_comment_line = counts[4] as usize + leading_spaces == line_len;
-                    }
+                    // Every cell comment: paint the line flat. Indentation is
+                    // PUNCT, not comment, so an indented comment line takes the
+                    // per-cell colours; until 2026-10-09 this counted the
+                    // indentation in and painted it comment, which no colouriser
+                    // does (C17; a space has no ink, so no pixel moved).
+                    is_comment_line = counts[4] as usize == line_len;
                     ascii_syntax_counts = Some(counts);
                 } else {
                     crate::text::colorize_line_into(line_bytes, &mut line_colors);
@@ -1544,6 +1637,7 @@ pub(crate) fn layout_pass2_device<E: SlotEmit>(
     dest_addr: usize,
 ) -> Pass2DeviceOutput {
     let lut = crate::glyph_scene::srgb_to_linear_table();
+    let cut_colors = whole_line_colors_at_cuts(inputs.chunks, inputs.items);
 
     let chunk_results: Vec<ChunkPass2Output> = inputs
         .chunks
@@ -1579,6 +1673,7 @@ pub(crate) fn layout_pass2_device<E: SlotEmit>(
                 inputs.em_height_fu,
                 dest_addr,
                 lut,
+                &cut_colors[chunk_idx],
             )
         })
         .collect();
