@@ -323,6 +323,24 @@ pixel-ab here: 7 of 9 views diverge from `vulkan-nvidia`, 2 have no set.
 `rx.sh push <rev> <branch>`. Jobs must be bash 3.2-safe. The runner sets the
 Homebrew PATH, which a non-login ssh shell lacks.
 
+### M2 performance: harness and noise floor (2026-10-09)
+
+`rx/jobs/perf-ab.sh`: both refs built into separate target dirs, sides
+alternate (order flips each round), 20 s cool-down between sides (the M2 is
+fanless and throttles back-to-back), 6 rounds x 3 runs per side per config,
+cold run discarded; flagship corpus (`viz-web/glyph3d-js`). A/A at bf9a757,
+same binary both sides, warm runs, ms:
+
+| config | backend min a/b | median a/b | visual min a/b | median a/b |
+|---|---|---|---|---|
+| derived flat | 133 / 140 | 146 / 145 | 140 / 147 | 154 / 152 |
+| derived syntax | 170 / 172 | 173 / 175 | 180 / 183 | 183 / 185 |
+| instanced flat | 216 / 207 | 226 / 226 | 223 / 213 | 234 / 232 |
+| instanced syntax | 223 / 223 | 236 / 228 | 233 / 233 | 248 / 239 |
+
+So a real difference has to exceed ~8-9 ms (about 4%); derived/syntax is
+the tightest (~2 ms).
+
 ### Checked and fine
 
 - No token, key or credential in the tree or in `git log --all -p`; no
