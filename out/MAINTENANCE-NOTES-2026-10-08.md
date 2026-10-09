@@ -1,555 +1,286 @@
-# Maintenance pass — 2026-10-08
+# Maintenance notes — scratchpad (started 2026-10-08)
 
-Survey of the tree at `5809677` (main) from the `maintenance-and-things`
-worktree on the Linux box (monolith1, RTX 5090, rustc stable). Every claim is
-**[measured]** (a command ran and this is its output) or **[inferred]** (read
-from source, not executed). Do not promote the second kind.
+Working notes for the `maintenance-and-things` branch, on the Linux box
+(RTX 5090, Vulkan). Started as a survey of main at `5809677`; now the running
+status of the pass.
 
-This is a record of what was found, in priority order, with the fix each item
-wants. Nothing here has been applied yet.
+**How to edit this file.** The status board is the source of truth. Item IDs
+are stable: never renumber, never reuse. When an item closes, set its row to
+`closed`, name the commit, and delete its detail section (the commit message
+carries the evidence). New findings get the next free ID in their group.
+Every claim is **[measured]** (a command ran) or **[inferred]** (read, not
+run); never promote the second kind without running it.
 
----
-
-## 0. The tree does not compile on Linux — [measured]
-
-`cargo clippy --workspace --all-targets --release` and `cargo test --workspace
---release` both exit 101 on this host:
-
-```
-error[E0425]: cannot find type `Metal` in module `wgpu::hal::api`
-  --> crates/glyph-field-derived/src/upload.rs:112
-  --> crates/glyph-field-instanced/src/upload.rs:91, :108
-note: found an item that was configured out  (wgpu-hal-30.0.1/src/lib.rs:272  #[cfg(metal)])
-```
-
-`wgpu::hal::api::Metal` is a type that exists only when wgpu-hal is compiled
-with its Metal backend, i.e. only on macOS. Four sites in the tree name it:
-
-| file | gated? |
-|---|---|
-| `native/src/layout_hyper/device_alloc.rs` (`create_mapped_slot_buffer`) | yes — `#[cfg(target_os = "macos")]`, with a `#[cfg(not(...))]` twin that routes to `layout_device_discrete` |
-| `crates/glyph-field-instanced/src/upload.rs` (`upload_direct_metal`) | **no** |
-| `crates/glyph-field-derived/src/upload.rs` (`upload_direct_metal`) | **no** |
-| `native/src/cubecl_chain/repo/tail_readback.rs` (:153, :169) | **no** (behind the `cubecl` feature, which is default-on) |
-
-History [measured]: `upload_direct_metal` entered ungated in `9985918`
-(2026-10-04, "multi-architecture zero-copy staging") in
-`native/src/glyph_scene/buffers.rs`, moved into the field crates by `683f772`
-and `99aea85` (2026-10-05). Every commit since has been macOS work, so the
-Linux break is four days old and nothing on this host has built since
-`2771ed6`. The 2026-10-08 desktop audit doc (`research/desktop-platform-audit.md`)
-describes the discrete path as working; it cannot have been run here.
-
-**Fix (first commit on this branch):** mirror `device_alloc.rs`. Gate the
-three `upload_direct_metal` / readback functions with `#[cfg(target_os =
-"macos")]`, and give the `direct_host_upload == true` branch a
-`#[cfg(not(target_os = "macos"))]` arm that falls through to
-`upload_staged_discrete`. Then do the real fix in the same series: these are
-**five copies of one ~35-line function** (create hal buffer, map, write,
-unmap, wrap with `create_buffer_from_hal`), differing only in the slot type.
-One generic `create_mapped_hal_buffer<T>(device, count, label) -> (*mut T,
-wgpu::Buffer)` in the `glyph-field` contract crate, gated once, retires all
-five. `native/AGENTS.md` says the OS is the wrong axis for hardware branches
-and that stays true for the *runtime* decision (`profile.mappable_primary_buffers`
-decides whether to take the path); the `cfg` is forced by the *type* existing
-only under Metal, and the helper's header should say exactly that so the next
-reader does not try to remove it.
-
-Until this lands no other item in this file can be verified on Linux.
+Groups: **D** docs and tooling, **C** code shape, **P** pixels, **X** other
+machines and clones, **M** machine-specific values, **R** runner.
 
 ---
 
-## 1. Documentation rot — the biggest cleanliness class
+## Status board
 
-The Mojo engine was retired and the gate set shrank, and the canonical docs did
-not follow. Root `AGENTS.md` says it is canonical for anything repo-wide and
-that a stale sibling should be *called* stale rather than patched; by its own
-rule it is now the stale one.
-
-### 1a. Root `AGENTS.md` documents 16 gates; `build.toml` declares 9 — [measured]
-
-Live (`grep '^\[\[gate\]\]' -A1 build.toml`): manifest, committed-artifacts,
-vendor-hashes, cargo-build, cargo-clippy, cargo-doc, cargo-test, pick-oracle,
-pixel-ab.
-
-Documented in "What the checks actually do" but **absent from build.toml**:
-engine-check, repo-verify, repo-verify-direct, reference-port, cubecl-chain,
-cubecl-fork (engine-suites is already marked historical). That is roughly
-half the section, including the longest paragraphs (cubecl-fork, reference-port
-with its quoted volumes). Also stale in the same file:
-
-- "Products" paragraph describes the dylib content hash; there is no dylib
-  (`engine/` holds `fixtures/` and `glyph_schema.mjs`, zero `.mojo` files [measured]).
-- "`cargo glyph test engine` after touching Mojo is ~25s" — see 1e.
-- "Read next" names `engine/README.md`, `README-FFI.md`, `PORT-PLAN.md`,
-  `BACKEND-PLAN.md`, `TOOLCHAIN.md`: **none exist** [measured]. `native/AGENTS.md`
-  "Read next" names two of the same.
-- Fence table lists `engine/glyph_schema.{mojo,mjs}` as generated; only the
-  `.mjs` exists, and `tools/gen_schema.py` still writes `MOJO_OUT` (:34).
-  [inferred] its `--check` mode may now be comparing against a file that is
-  never committed — worth running once the build is back.
-- "Decoupled CubeCL: ... optional Cargo feature `cubecl` (`cargo check
-  --features cubecl`)" vs `native/Cargo.toml` `default = ["egui-ui", "cubecl"]`
-  and `.agents/rules` §9 which *requires* it default. The doc and the manifest
-  disagree; the manifest is right, fix the doc.
-- "Build" section quotes 222 tests across 13 binaries. `SESSION-HANDOFF.md`
-  quotes 158. `build.toml` says 222. The AGENTS.md text elsewhere says a count
-  in prose is "one more thing to forget" — follow its own advice and drop the
-  number from the Build section.
-
-**Fix:** rewrite "What the checks actually do" against the nine live gates
-(keep the retired paragraphs' *lessons* — the vacuity patterns — in a short
-"retired, and what they taught" block, since the blind-spot reasoning is the
-valuable part). Delete the Products/dylib paragraph. Fix the Read-next lists.
-Date the edit.
-
-### 1a½. `cargo glyph` is broken inside every documented worktree — [measured]
-
-`native/AGENTS.md` tells you to work in `.claude/worktrees/<name>`. Cargo
-reads `.cargo/config.toml` from **every ancestor directory** and merges them,
-and `[alias]` arrays concatenate. From a worktree under the repo root the
-alias is therefore read twice:
-
-```
-$ cargo --list | grep glyph          # from the worktree
-    glyph   alias: run --quiet --release -p glyph -- run --quiet --release -p glyph --
-$ cargo --list | grep glyph          # from the main checkout
-    glyph   alias: run --quiet --release -p glyph --
-```
-
-The tool receives `run --quiet --release -p glyph --` as its verb, matches
-`Cmd::Run`, and launches the renderer, which rejects `--quiet`. So `cargo
-glyph test` in a worktree fails before any gate runs, with an error that
-names the wrong binary. The expanded form
-`cargo run --quiet --release -p glyph -- test` works. `just check` does not
-(it calls the alias).
-
-**Fix options:** (a) document worktrees *outside* the repo directory
-(`git worktree add ../glyph3d-rs-wt/<name>`), which is the only fix that
-needs no code; (b) make the justfile recipes call the expanded command and
-point docs at `just`; (c) have the tool's `main` strip a repeated
-`run --quiet --release -p glyph --` prefix from argv with a comment naming
-this hazard. (a) plus (b) is the recommendation; (c) is a band-aid over a
-cargo behaviour. Either way the worktree instructions in both AGENTS.md
-files change.
-
-### 1b. `native/AGENTS.md` — mostly current, three stale spots — [measured]
-
-The layout-seam section still describes `Strategy::Direct` as "the engine
-writes instances straight into the caller's arena ... across the FFI" and
-names `repo-verify`/`repo-verify-direct` as live gates. `--repo-engine
-direct|batch` still exist as CPU reference strategies
-(`cli/args.rs:165`), so the *strategies* are real and the *FFI framing* is not.
-Three Mojo/FFI mentions total; a short pass.
-
-### 1c. `.agents/rules/rust-engineering.md` makes claims the tree does not back — [measured]
-
-- §1 "We use `clippy::pedantic` as a baseline (configured in `Cargo.toml`)":
-  no `[lints]` table and no `pedantic` anywhere in any Cargo.toml. Either add
-  the lints table (expect a large red) or delete the sentence.
-- §2 "Never use `println!` ... use `tracing`": 8 files import `tracing`, 0
-  `#[tracing::instrument]`, and `glyph/src/main.rs` has 124 `println!`. For a
-  CLI whose stdout *is* the contract that is correct, and the rule should say
-  "diagnostics go through tracing; the gate runner's verdict lines and the
-  offscreen instruments' PASS blocks are presentation, not logging".
-- §8 names `replace_file_content` — an Antigravity tool name, meaningless to
-  any other agent. Say "AST-aware edits" or drop it.
-- §5 "Do not introduce new shell scripts" sits next to a gate that is a shell
-  script (`tools/check-pick-oracle.sh`, run by `pixel-ab`'s sibling gate).
-  Qualify it.
-- The file says it "aligns with `native/AGENTS.md`"; the two should be
-  reconciled so one points at the other rather than restating.
-
-### 1d. `pixi.toml` is a toolchain for an engine that no longer exists — [measured]
-
-`build-engine` (both platforms) compiles `engine/ffi.mojo`; `suites*` run
-`engine/check.sh`. Neither file exists. The mojo/max pins (`==1.1.0`, `==26.6`)
-and the lock are dead weight. The only live use is fontTools for the emoji
-generators (`build.toml:62-63` runs `pixi run gen-emoji-sheet`), and
-`mise.toml` already provisions a Python venv with `pip install fonttools`.
-
-**Fix:** either (a) delete pixi entirely and point the two build.toml commands
-at the mise venv, or (b) trim pixi to the fontTools env and the emoji tasks.
-(a) is cleaner; (b) is less risk to the committed-artifacts gate. Either way
-the `build.toml:34` comment about `build-engine` goes.
-
-### 1e. `cargo glyph test engine` is a vacuous green — [inferred from source]
-
-`glyph/src/main.rs:109` still has `Scope::Engine`, and `build.toml` has gates
-scoped `corpus` (3), `render` (2), `rust` (4) — **zero `engine`**. `cmd_test`
-(:1437) filters gates by scope and prints `CHECK-ALL: ALL GATES GREEN` over an
-empty iterator. That is the exact "check that cannot fail" shape the root
-AGENTS.md spends three paragraphs warning about. Remove the variant (and the
-`engine` wording in the help text, justfile comment, and check-all.sh header),
-or make `cmd_test` refuse an empty gate set — the second is the better fence
-and should get a mutation.
-
-### 1f. Orphaned scripts and configs — [measured]
-
-- `tools/check-cubecl.sh` — the former cubecl-chain/cubecl-fork fence. Not in
-  build.toml, justfile, or any gate. The CLI flags it drives
-  (`--cubecl-chain-check`, `--cubecl-repo-check`, STRICT mode) are still live in
-  `cli/args.rs`, so the *instrument* exists and *nothing runs it*. The
-  SKILL.md tells humans to run `--cubecl-repo-check` by hand. Decide: re-gate
-  it (it was the only bit-exact fence on the GPU chain) or delete the script
-  and say why in the commit. Given cubecl is default-on and twelve of the last
-  twenty-five commits are cubecl perf work, re-gating is the honest choice.
-- `tools/check-fixture-parity.sh` — references `engine/fixture_io.mojo`. Dead.
-- `native/.cargo/mutants.toml` — references `layout_mojo.rs`. Advisory only;
-  update or delete.
-- `deny.toml` — present, `cargo-deny` is in mise, nothing runs it. Wire into
-  a gate or delete.
-- `tools/verify_atlas.py`, `preview_glyphs.py`, `repro_pick_oblique.py` —
-  already documented as run-by-nothing; unchanged.
-
-### 1g. Loose root-level docs — [measured]
-
-Four Markdown files sit at the repo root beside README.md and AGENTS.md:
-
-| file | lines | state |
-|---|---|---|
-| `SESSION-HANDOFF.md` | — | 2026-10-02 session handoff; says test_floor is 158 (it is 222); Steps 1-4 are now partly landed (`81aaa85` did Step 1's KeyD fix; `agent_transcript/` exists) |
-| `PLAN-AGENT-STACKS-FOCUS-LOCKING.md` | 205 | 2026-10-02 plan for the same work |
-| `cubecl-performance-handoff.md` | 174 | links to a `file:///Users/lugo/.../worktrees/workspace-random-experiments/` path |
-| `TOOLING-PLAN.md` | 334 | plan of record for the tooling; cross-referenced by AGENTS.md, keep |
-| `BUILD-BRIEF.md` | — | already self-marks as historical, keep |
-
-The first three are session artifacts. Root `AGENTS.md` § "Where work lands"
-says notes go in `out/`. Move them there with their dates in the filename, and
-fix the absolute link.
-
----
-
-## 2. Code shape
-
-### 2a. Twin crates share most of their lines — [measured]
-
-`crates/glyph-field-instanced/src` and `crates/glyph-field-derived/src` are
-911 and 880 lines respectively. `diff` per file:
-
-| file | instanced | derived | differing lines |
+| ID | Item | Status | Commit / next step |
 |---|---|---|---|
-| upload.rs | 259 | 257 | 158 |
-| field.rs | 226 | 264 | 142 |
-| pipeline.rs | 162 | 176 | 92 |
-| storage.rs | 95 | 90 | 39 |
+| D1 | Root AGENTS.md documents 16 gates, build.toml has 9; dead read-next links; Mojo/dylib prose | open | rewrite against build.toml; takes C6, R2 with it |
+| D2 | `cargo glyph` alias doubles inside `.claude/worktrees/` | open | pick a fix option (below) |
+| D3 | `cargo glyph test engine` matches zero gates, prints ALL GATES GREEN | open | refuse an empty gate set + mutation; drop the scope |
+| D4 | `.agents/rules/rust-engineering.md` claims the tree does not back | open | short pass, with D1 |
+| D5 | `pixi.toml` tasks for a Mojo engine that no longer exists | open | retire or trim to fontTools |
+| D6 | Orphaned scripts and configs (check-cubecl.sh, fixture-parity, mutants.toml, deny.toml) | open | decide each; re-gating cubecl is the honest choice |
+| D7 | Loose session handoffs at the repo root | open | move to `out/` with dates |
+| C1 | Twin field crates ~60% shared; five copies of the mapped-buffer upload | open | hoist into `glyph-field`; last, largest |
+| C2 | Oversized files; dead kernels in `cubecl_chain/position.rs` | open | delete dead kernels; split `glyph/src/main.rs` |
+| C3 | 46 `#[allow]`, one justified | open | pass, with C2 |
+| C4 | 63 `unwrap()` in `cubecl_chain/repo/dispatch.rs`, one shape | open | one accessor or non-optional fields |
+| C5 | `spike_vertex_yz.rs`, 908 lines, own CLI flag, superseded | open | delete |
+| C6 | Rust comments describing the Mojo/FFI backend as live | open | with D1 |
+| C7 | 239 stage-letter comments | won't do | archaeology; reword only when touching |
+| C8 | `clippy --all-targets`: 14 test-only lints + deny-level `reversed_empty_ranges` (seam.rs test) | open | sweep; gate runs without `--all-targets` |
+| C9 | `discovery.rs` names a Claude project by the slug's last `-` segment (`…-glyph3d-js` → `js`) | open | small fix |
+| P1 | pixel-ab red on both platforms since 10-07; Linux set a month stale, 2 views never adopted | Ivan's call | Mac re-baseline first, then Linux re-adoption |
+| X1 | Experiments' Zed symlink scheme never built against real Zed | next up | needs a Zed checkout or the Mac |
+| X2 | Missing clones here: `viz-web/glyph3d-js` (flagship corpus, `GLYPH_WEB`), Zed | next up | discuss |
+| X3 | `just` not installed here; justfile `profile` recipe unrun | open | install or accept |
+| R1 | Renderer currency stamp ignored the root `Cargo.toml`/`Cargo.lock` | closed | dc6a00f |
+| R2 | Dead `{dylib}` / `dylib_ext()` machinery in the runner | open | with D1 |
+| B0 | Workspace did not compile on Linux (ungated Metal HAL) | closed | 872621d on main (other agent); helper half is C1 |
+| M1 | Mac paths in TUI presets, justfile, bench script, docs | closed | 1062e23, 88525ea |
+| M2 | Session discovery hardcoded `$HOME`; tests not hermetic | closed | 1062e23, then f864183 (app defaults + Kimi parser) |
+| M3 | Committed `launch_config.toml` was a personal preference file | closed | 1062e23 (now `.example`) |
+| M4 | Experiments hardcoded a Mac Zed path | closed | 9351a8d (unbuilt: X1) |
+| M5 | mise `.venv` not gitignored | closed | 88525ea |
 
-Most differing lines are the slot type name. The split was deliberate ("one
-crate per render mode, the scene never touches slot bytes") and the contract
-crate is the right home for the shared machinery: `upload_direct_metal` /
-`upload_staged_discrete` generic over `T: Pod` (also closes item 0),
-`SlotStorage<T>` with `write_colors`, and the chunking arithmetic in
-`upload_host_slots` / `upload_derived_slots`. Each mode crate then keeps only
-its slot layout, its transcode, and its WGSL. Output-neutral by construction;
-the pixel gate and `cubecl-repo-check` are the proof once they run.
+## Landed on this branch
 
-### 2b. Oversized files — [measured]
-
-| lines | file | note |
-|---|---|---|
-| 3643 | `native/src/cubecl_chain/position.rs` | kernels + host; contains two `#[allow(dead_code)]` kernels (`derive_stride` :2332, `paginate` :2366) that are compiled and never launched |
-| 1921 | `glyph/src/tui.rs` | the Ratatui launcher |
-| 1659 | `native/src/layout_hyper/pass2_device.rs` | 5 `too_many_arguments` |
-| 1658 | `native/src/fixture.rs` | 18 Mojo mentions in comments |
-| 1587 | `native/src/text.rs` | |
-| 1572 | `glyph/src/main.rs` | manifest types + every command |
-| 1534 | `native/src/layout.rs` | the seam; leave it |
-| 1502 | `native/src/fold.rs` | |
-| 1465 | `native/src/agent_transcript/staging.rs` | |
-
-`position.rs` is the one to look at: the retired kernels can go (the
-`allow(dead_code)` is the tell), and the host-side dispatch wrappers vs the
-`#[cube]` bodies are a natural seam. `glyph/src/main.rs` would split cleanly
-into `manifest.rs` (the typed build.toml) and the command functions.
-
-### 2c. Lint suppressions — 46 `#[allow]`, few justified — [measured]
-
-House rule: `#[allow]` only when the lint is wrong for the code, with a
-one-line justification. One of the 46 has one (`windowed.rs`).
-
-- `cubecl_chain/mod.rs`: **8 × `allow(dead_code)`** on `ITEM_DESC_*_PAD*`
-  constants. Prefix them `_` or fold them into one documented stride constant.
-- `cubecl_chain/position.rs:2332, :2366`: dead kernels — delete.
-- `cubecl_chain/repo/dispatch.rs:33, :162`: `sync_prof` field and
-  `record_sync` — unused; delete or use.
-- `position.rs`: `allow(unused_assignments)` — almost always a real
-  simplification waiting.
-- `manual_range_contains` (8) and `len_zero` (3) inside `#[cube]` bodies: if
-  the cube macro cannot lower `(a..b).contains(&x)` / `is_empty()` that is a
-  legitimate reason and it should be written down once at the module top, not
-  repeated silently per function.
-- `too_many_arguments` (20): `pass2_device.rs` ×5, `scan.rs` ×4, `repo.rs` ×3.
-  The groups of five and four are the same signature repeated; a params
-  struct per module pays for itself.
-
-### 2d. `unwrap()` outside tests — house rule says `expect("why")` — [measured]
-
-134 total; those before any `#[cfg(test)]` marker in their file:
-
-| count | file |
-|---|---|
-| 63 | `native/src/cubecl_chain/repo/dispatch.rs` |
-| 9 | `glyph/src/main.rs` |
-| 7 | `native/src/spike_vertex_yz.rs` |
-| 4 | `native/src/layout_hyper/pass2_device.rs` |
-| 2 each | `repo.rs`, `glyph_scene/pick.rs`, `atlas.rs` |
-| 1 each | `agent_carrel.rs`, `scan.rs`, `layout_hyper.rs`, `fixture.rs`, `repo_check.rs` |
-
-The 63 are all one shape: `buf.h_<name>.as_ref().unwrap()` on `Option`-typed
-host buffers that are always `Some` after setup (dispatch.rs:215-222 and on).
-One accessor on the buffers struct (`fn h_bytes(&self) -> &Handle` with a
-single `expect("host buffers are allocated in prep before dispatch")`) or
-making the fields non-optional retires all 63 in one edit. The rest are a
-short pass.
-
-### 2e. `spike_vertex_yz.rs` — 908 lines, `pub mod`, its own CLI flag — [measured]
-
-A spike for vertex-stage Y/Z derivation. Its outcome landed as the Derived
-mode crate on 2026-10-05 (`99aea85`). Not referenced by any gate or mutation
-in build.toml. Delete it with `--spike-vertex-yz` and its `cli/command.rs`
-arm, naming the crate that superseded it in the commit.
-
-### 2f. Comments describing a backend that no longer exists — [measured]
-
-Mojo/FFI/dylib mentions in Rust source: `fixture.rs` 18, `fold.rs` 13,
-`glyph/main.rs` 11, `repo.rs` 9, `layout.rs` 9, `text.rs` 8, `cluster.rs` 5.
-Many are history ("ported from the Mojo fold, 2026-09") and should stay; the
-ones that describe a *live* contract ("the FFI materializes a 32 B wire
-record") should be reworded to the Rust path they now describe. Pass through
-with the AGENTS.md rewrite, same commit series.
-
-### 2g. Stage-letter comments — 239 — [measured]
-
-`Stage L` 69, `K` 49, `F` 39, `G` 38, `E` 23, `H` 20, `A` 11, `C` 9, others ≤2.
-Root AGENTS.md says the letters are archaeology and to prefer substance when
-*touching* one. Not a sweep candidate; noted so nobody starts one.
-
----
-
-## 3. Verification state on this host — [measured]
-
-Updated later the same day, after a second agent's build fix (uncommitted in
-the main checkout at the time; the three files from item 0 gated with
-`#[cfg(target_os = "macos")]`, the minimal form) was copied here and the
-battery run through the expanded tool command (item 1a½).
-
-- `nvidia-smi`: 2.6 GiB of 32 GiB in use; no llama-server hog this time.
-- With the fix: **cargo-build, cargo-clippy, cargo-doc 0 warnings; cargo-test
-  222 over 13 binaries (floor 222); manifest, committed-artifacts (34
-  fixtures, atlas, trie, emoji sheet, cluster table, corpus), vendor-hashes,
-  pick-oracle all PASS.** The fix is correct and sufficient for the build.
-  (`cargo clippy --all-targets` additionally reports 14 test-only lints and
-  one deny-level `reversed_empty_ranges` in a `seam.rs` test; the gate runs
-  without `--all-targets`, so these are not red. Worth a sweep.)
-- **pixel-ab: red, 7 of 9 views diverge from `vulkan-nvidia`, 2 have no
-  Linux baseline** (`emoji-cluster`, `repo-cluster`, added 2026-09-20 and
-  never adopted here). `glyph drift` against `metal-apple` says "clustered —
-  something has a shape" on every view but `demo`. **None of this is the
-  build fix's doing**, and most of it is not Linux's:
-  - `text.png`: every differing pixel is the comment colour. Old
-    `[106,153,85]` in the golden, `[125,200,115]` in the fresh frame — the
-    `palette::COMMENT` change in `9c96ad1` (2026-10-08, "enhance comment
-    lexing"), which moved pixels and re-baselined nothing. The same commit
-    ratcheted `test_floor`, so cargo-test was run; pixel-ab was not, or was
-    red and unmentioned. **The Mac is red on this view too.**
-  - `repo-zoom.png`: the whole field is shifted down-right against BOTH the
-    Metal golden and the old Linux golden (which agree with each other).
-    Identical under `--repo-engine hyper` and `batch` and under both
-    `--field-mode`s (four renders, byte-equal in pairs), so layout and
-    upload agree and the camera moved. `d1b0f7e` (2026-10-07, "wire
-    InkExtent into FileView") recentres the focus camera on ink extents
-    instead of page extents (`repo.rs`, the `cx`/`cy` lines). The Metal set
-    was last touched 2026-10-05. **The Mac is red here too** [inferred: by
-    reading, since the 10-05 tree's repo path panics on Linux — see below].
-  - `repo-wide`, `repo-down`, `repo-back-oblique`, `emoji`: the Metal set
-    was re-baselined 2026-10-02 (reversed-Z, Greeking) and 2026-10-05
-    (Derived mode); the Linux set never was. Stale by a month of deliberate
-    changes, plus whatever the two commits above add.
-- **Control experiment:** the tree at `99aea85` (the Metal set's own commit)
-  built on this host with the same gate patch renders `text.png`
-  **byte-identical** to the old `vulkan-nvidia` golden and within ≤16 levels
-  of the Metal golden on 13,571 px (the known cross-vendor edge noise, same
-  figure as 2026-09-07). So this host reproduces the goldens exactly when
-  the tree is the one that made them. That tree's `--load-repo` panics on
-  Linux (`instance_chunks on a device arena`, `layout.rs:588`) under every
-  strategy — the discrete repo path only started working somewhere in the
-  2026-10-05..08 series — so the repo views could not be checked the same way.
-
-**What this means for the queue:** main is pixel-red on both platforms
-since 2026-10-07 and needs a deliberate re-baseline on the Mac (text,
-repo-zoom at least; look at every frame) in a commit that says why. The
-Linux set then needs re-adopting in full, including the two views it never
-had. Neither is this branch's job; both block pixel-ab meaning anything
-for the refactors in §2.
-
----
-
-## 4. Proposed commit order for this branch
-
-1. **fix(build): gate Metal HAL paths; one mapped-buffer helper in glyph-field** — item 0 + 2a's upload half. Run the full battery; record the Vulkan pixel-ab verdict in the message.
-2. **chore(glyph): refuse an empty gate set; drop the engine scope** — item 1e, with a mutation.
-3. **docs(agents): rewrite the gate section against build.toml; fix read-next; date it** — items 1a, 1b, 1c. One commit, because the files cross-reference.
-4. **chore(tooling): retire pixi or trim it to fontTools; delete dead scripts; decide check-cubecl.sh** — items 1d, 1f. Separate commit per decision if any is contested.
-5. **chore(docs): move session handoffs to out/** — item 1g.
-6. **refactor(cubecl): remove dead kernels, pad-constant allows, dispatch.rs unwraps** — items 2b, 2c, 2d. Output-neutral; cubecl-repo-check is the proof, which is one more reason to re-gate it in step 4.
-7. **chore: delete spike_vertex_yz** — item 2e.
-8. **refactor(field): hoist shared storage/pipeline machinery into glyph-field** — rest of 2a. Last, because it is the largest and the one most worth a fresh battery.
-
-## 5. Machine-specific values — [measured 2026-10-09]
-
-Swept the tracked tree (excluding `integration/`, `tools/vendor/`, fixture inputs)
-for usernames, absolute paths, home-dir reads, hostnames, emails and credential
-shapes, and the full `git log --all -p` for credential shapes.
-
-**Clean:** no token, key or credential anywhere in the tree or its history. No
-hostname. The only email is the pixi `authors` line, which matches the commit
-author. `ADAPTER.txt` naming the device and driver is deliberate. Every gate
-invocation passes `--screenshot`, which makes `cli/args.rs` skip
-`launch_config.toml`, so the committed launch config cannot reach a golden or a
-pick (verified for pixel-ab's commands and every `$BIN` call in
-`check-pick-oracle.sh`).
-
-**Code that bakes in the Mac path `/Users/lugo/localdev/viz-web/glyph3d-js`:**
-
-| Site | Effect elsewhere |
-|---|---|
-| `glyph/src/tui.rs:200` `REPO_PRESETS` | second preset is a dead path on every other box |
-| `glyph/src/tui.rs:1721` | a unit test asserts that literal, so changing the preset breaks cargo-test |
-| `justfile:31` `profile` default | `just profile` fails without an argument |
-| `tools/bench_hyper.py:95` `--repo` default | same |
-| `tools/vendor-manifest.py:54` | has a `GLYPH_WEB` env override; only used to refresh. Fine |
-| `native/src/agent_transcript/tests.rs:458` | real-session test keyed to a Mac slug and one session id; silently skips elsewhere, so it tests nothing on any box but the M2 |
-
-Fix shape: one env var (`GLYPH_FLAGSHIP_REPO`, say) read by the TUI preset,
-bench_hyper and the justfile, falling back to a relative `../../viz-web/glyph3d-js`
-(the path AGENTS.md already uses) or to omitting the preset when absent. The
-TUI test should assert against the constant, not the literal.
-
-**TUI reads the home directory directly.** `LauncherState::discover_agent_sessions`
-(`tui.rs:244`) hardcodes `$HOME/.gemini/antigravity/brain` and `$HOME/.claude/projects`
-and ignores the `claude_projects_dir` / `antigravity_brain_dir` overrides that
-`native/src/launch_config.rs` honours. Two consequences: the launcher's default
-session is whatever transcript on the machine was touched last (on an agent box,
-usually the running agent's own session), and the 9 TUI tests that call
-`LauncherState::new()` walk every `.jsonl` under the user's `~/.claude/projects`
-plus read the repo's `launch_config.toml`. They pass, but they are not hermetic.
-Fix: route discovery through `LaunchConfig` and give `new()` a test constructor
-that skips discovery.
-
-**Committed `launch_config.toml` is a personal preference file.** It sets
-`field_mode = "derived"` against the CLI's `instanced` default, and
-`color_mode = "flat"` against the TUI's built-in `syntax` (the CLI default is
-also `flat`). Every windowed run from the repo root or `native/` picks it up, so
-on any checkout the interactive field mode differs from the documented default
-without a flag saying so, and the TUI and the bare binary disagree on colour
-unless the file is present.
-It also carries a commented example pointing at one specific Antigravity
-session UUID. Options: rename to `launch_config.example.toml` and gitignore
-`launch_config.toml`, or keep it and state in AGENTS.md that it overrides
-interactive defaults.
-
-**Docs and handoffs with Mac absolute paths**, all prose: `AGENTS.md:57`,
-`BUILD-BRIEF.md:187`, `.agents/skills/glyph-engine-testing/SKILL.md:55,72,80`,
-`tools/gpu_profile/README.md:12`, and `file:///Users/...` links in
-`research/desktop-platform-audit.md` (6) and `cubecl-performance-handoff.md` (4,
-two into a worktree that no longer exists). The links are dead on every other
-machine and on GitHub; repo-relative links work everywhere. The loose root
-handoffs (`SESSION-HANDOFF.md`, `cubecl-performance-handoff.md`) are already
-item 1g.
-
-**`experiments/` cannot build off the Mac.** `zedspike` and `fieldzed`
-`Cargo.toml` and two `main.rs` files hardcode `/Users/lugo/localdev/externalcompute/zed`.
-Excluded from the workspace and outside every gate, so harmless today; a
-`[patch]` via a gitignored `experiments/.cargo/config.toml` or a `ZED_ROOT`
-env var would make them portable if they are kept.
-
-**Hardware-shaped constants**, not paths: `CHUNK_THRESHOLD_BYTES` (64 KiB, tuned
-to M-series L1) and the burst-write sizing are documented as such in
-`native/AGENTS.md`; the cubecl 65535 grid cap matches the WebGPU default
-limit, so it is portable. Nothing to change, but the chunk threshold is a
-benchmark question for the 5090 box, not a cleanliness one.
-
-**Small:** mise's `.venv` (created at the repo root by `mise.toml`) is not in
-`.gitignore`. `discovery.rs:96` derives a project hint by taking the last
-`-`-separated segment of the slug, so `-Users-lugo-...-glyph3d-js` becomes
-`js`; not machine-specific, but it is the comment that carries the path.
-
-**Status, 2026-10-09: done on this branch, uncommitted.**
-- TUI presets come from `repo_presets` in the launch config, falling back to
-  `.` and `native/fixtures/g-pick-repo`. Session discovery in both the TUI and
-  the renderer scans only `claude_projects_dir` / `antigravity_brain_dir`; the
-  home default and the renderer's working-directory probe are gone. TUI tests
-  start from `LauncherState::defaults()`, which reads no file and no directory.
-- `launch_config.toml` is now the tracked `launch_config.example.toml`; the real
-  file is gitignored. On the Mac, `cp launch_config.example.toml launch_config.toml`
-  restores the previous behaviour exactly (same values).
-- `GLYPH_FLAGSHIP_REPO` drives the justfile `profile` default and
-  `bench_hyper.py --repo`, falling back to this repo. `vendor-manifest.py` reads
-  `GLYPH_WEB` only, with no default.
-- The real-session test runs only with `GLYPH_REAL_CLAUDE_SESSION` set.
-- Docs carry no absolute paths; `file:///` links are repo-relative.
-- `experiments/` reaches Zed through a gitignored `experiments/zed` symlink, with
-  `exclude = ["zed"]` (proven necessary on a mock workspace). Not built here:
-  there is no Zed checkout on this box.
-- Proof: full battery green except pixel-ab, which is red on the same nine views
-  as before; all nine renders are byte-identical to main@872621d built in
-  scratch. cargo-test 225 over 13 binaries, floor raised 222 → 225.
-- **Superseded the same day:** discovery now falls back to each app's default
-  locations (Claude Code, Antigravity desktop + CLI, Kimi Code) when the config
-  is silent; a configured path still wins per app, and `""` turns an app off.
-  One table in `crates/glyph-session-dirs`, shared by the renderer and the
-  launcher, and both report what they scanned. Kimi Code transcripts gained a
-  parser (`agent_transcript/kimi.rs`). Renders still byte-identical to main.
-
-## 6. Work log and open threads — kept current as we go
-
-**Landed on this branch** (none pushed or merged to main yet; that is Ivan's call):
+None pushed or merged to main; that is Ivan's call.
 
 | Commit | What |
 |---|---|
 | 6eb2d76 | these notes |
-| 1062e23 | launch config drives repo presets and session discovery; `launch_config.toml` → `.example`; hermetic TUI tests |
+| 1062e23 | launch config drives repo presets and session discovery; `.example` config; hermetic TUI tests |
 | 88525ea | `GLYPH_FLAGSHIP_REPO` / `GLYPH_WEB` env vars; repo-relative doc links |
 | 9351a8d | experiments reach Zed through the `experiments/zed` symlink |
 | f864183 | session discovery defaults to each app's locations (`crates/glyph-session-dirs`); Kimi Code parser |
+| dc6a00f | renderer currency hashes root manifest and lockfile; `validate()` refuses dead literal inputs |
 
-Main's build fix (872621d, the other agent's) was fast-forwarded in before any of it.
+Main's build fix (872621d, the other agent's) was fast-forwarded in first.
 
-**On the Mac after merging:** `cp launch_config.example.toml launch_config.toml`;
-`ln -s ~/localdev/externalcompute/zed experiments/zed`;
-`export GLYPH_FLAGSHIP_REPO=~/localdev/viz-web/glyph3d-js`.
+**On the Mac after merging:**
 
-**Closed 2026-10-09: renderer currency missed the lockfile** [measured].
-`[artifact.renderer]` inputs named `native/Cargo.lock` (gone since the
-workspace move, 2026-09-06) and omitted the root `Cargo.toml` and `Cargo.lock`.
-Measured on main@872621d's own runner in a scratch tree: lockfile perturbed,
-`test --frozen` printed "renderer current". Fixed: inputs now cover the root
-manifest, lockfile and `.cargo/config.toml`; same perturbation now prints
-"renderer is stale". Root cause was a validation gap: `validate()` scanned only
-`*` patterns for dead inputs, so a dead LITERAL passed. It scans every input now,
-and mutation `dead-input-literal` proves it (reddens with the fix, stays green
-with the old scan).
-Measuring trap, worth keeping: `cargo run -p glyph` re-serializes `Cargo.lock`
-BEFORE the runner hashes it, silently undoing a whitespace perturbation. My
-first "defect confirmed" was void for that reason. Measure with
-`target/release/glyph` directly.
+```sh
+cp launch_config.example.toml launch_config.toml
+ln -s ~/localdev/externalcompute/zed experiments/zed
+export GLYPH_FLAGSHIP_REPO=~/localdev/viz-web/glyph3d-js
+```
 
-**Open threads, next up (Ivan named these):**
-- Experiments links: the symlink scheme is committed but has never been built
-  against real Zed. No Zed checkout on this box.
-- Missing clones: this box has neither `viz-web/glyph3d-js` (flagship corpus,
-  `GLYPH_WEB` refresh source) nor Zed.
+## Suggested order for what is open
 
-**Open threads, parked:**
-- pixel-ab re-baseline: Mac first (text, repo-zoom at least), then Linux
-  re-adoption including emoji-cluster and repo-cluster. Ivan's call (section 3).
-- `cargo glyph` alias doubles inside `.claude/worktrees/` (item 1a½). Unfixed.
-- Section 4 commit order, steps 2–8: untouched.
-- `just` is not installed here, so the justfile `profile` recipe is unrun.
-- Dead Mojo-era machinery in the runner: `dylib_ext()` and the `{dylib}` token
-  substitution (`glyph/src/main.rs`) serve no artifact any more; the build
-  verb's help still says "and the engine dylib". Goes with the AGENTS rewrite
-  (item 1a), which must also fix "Currency is a content hash of the declared
-  inputs (`engine/*.mojo` + the pixi pins)".
-- `discovery.rs` derives a Claude project name from the slug's last `-`
-  segment (`…-glyph3d-js` → `js`).
+1. D3: refuse an empty gate set (small, has a mutation, closes a vacuous green).
+2. D1 + R2 + C6 + D4: the doc rewrite, one series; the files cross-reference.
+3. D5, D6: tooling decisions, one commit per contested decision.
+4. D7: move handoffs.
+5. C2 + C3 + C4: cubecl cleanup. Output-neutral; re-gating cubecl (D6) gives it a proof.
+6. C5: delete the spike.
+7. C1: hoist the field machinery. Largest; wants a fresh battery.
+
+X1, X2 and P1 are for discussion; C8, C9, X3 fit anywhere.
+
+---
+
+## Open items: detail
+
+### D1. Root AGENTS.md is the stale one — [measured]
+
+Live gates (`grep '^\[\[gate\]\]' -A1 build.toml`): manifest, committed-artifacts,
+vendor-hashes, cargo-build, cargo-clippy, cargo-doc, cargo-test, pick-oracle,
+pixel-ab. Documented but absent: engine-check, repo-verify, repo-verify-direct,
+reference-port, cubecl-chain, cubecl-fork (engine-suites already marked
+historical). Also stale in the same file:
+
+- "Products" paragraph: currency is "a content hash of `engine/*.mojo` + the
+  pixi pins". There is no Mojo (`engine/` holds `fixtures/` and
+  `glyph_schema.mjs`). The inputs are now the Rust tree, root manifest and lock.
+- "`cargo glyph test engine` after touching Mojo is ~25s": see D3.
+- "Read next" names `engine/README.md`, `README-FFI.md`, `PORT-PLAN.md`,
+  `BACKEND-PLAN.md`, `TOOLCHAIN.md`; none exist. `native/AGENTS.md` names two.
+- Fence table lists `engine/glyph_schema.{mojo,mjs}`; only `.mjs` exists, yet
+  `tools/gen_schema.py` still writes `MOJO_OUT` (:34). [inferred] its `--check`
+  may compare against a never-committed file; run it.
+- Says the `cubecl` feature is optional; `native/Cargo.toml` has
+  `default = ["egui-ui", "cubecl"]`. The manifest is right.
+- Build section quotes a test count; drop it (the file's own advice).
+
+`native/AGENTS.md` (was 1b): the layout-seam section still frames
+`Strategy::Direct` as the engine writing across the FFI and names
+`repo-verify*` as live. The strategies are real (`--repo-engine direct|batch`);
+the FFI framing is not. Three mentions.
+
+**Fix:** rewrite "What the checks actually do" against the nine live gates;
+keep the retired gates' lessons in a short "retired, and what they taught"
+block. Delete the dylib paragraph, fix read-next, date it.
+
+### D2. `cargo glyph` alias doubles in worktrees — [measured]
+
+Cargo merges `.cargo/config.toml` from every ancestor directory and `[alias]`
+arrays concatenate. From `.claude/worktrees/<name>`:
+
+```
+glyph   alias: run --quiet --release -p glyph -- run --quiet --release -p glyph --
+```
+
+The tool takes `run` as its verb and launches the renderer, which rejects
+`--quiet`. Workaround: `cargo run --quiet --release -p glyph -- <verb>`, or
+`target/release/glyph <verb>` once built. `just check` is broken too.
+
+**Options:** (a) document worktrees outside the repo directory
+(`git worktree add ../glyph3d-rs-wt/<name>`); (b) justfile recipes call the
+expanded command; (c) the tool strips a repeated alias prefix from argv.
+(a)+(b) recommended. Claude Code's own worktrees live under `.claude/worktrees/`,
+so (a) only helps human-made ones; weigh (c) for that reason.
+
+### D3. `test engine` is a vacuous green — [inferred from source]
+
+`Scope::Engine` (`glyph/src/main.rs:109`) survives; build.toml scopes gates
+`corpus`, `render`, `rust`, none `engine`. `cmd_test` filters by scope and
+prints `CHECK-ALL: ALL GATES GREEN` over an empty set. Make `cmd_test` refuse
+an empty gate set (with a mutation), and drop the scope and its mentions
+(help text, justfile comment, `tools/check-all.sh` header). Run it first to
+promote this to [measured].
+
+### D4. rust-engineering.md — [measured]
+
+- §1 claims `clippy::pedantic` "configured in `Cargo.toml`": no `[lints]`
+  table anywhere. Add it (expect a large red) or delete the sentence.
+- §2 "never `println!`": the runner's 124 `println!` are its contract. Say
+  diagnostics go through tracing, verdict lines are presentation.
+- §8 names `replace_file_content`, an Antigravity tool name.
+- §5 "no new shell scripts" beside a gate that is a shell script.
+- Reconcile with `native/AGENTS.md` by pointing, not restating.
+
+### D5. pixi — [measured]
+
+`build-engine` compiles `engine/ffi.mojo`; `suites*` run `engine/check.sh`;
+neither exists. The mojo/max pins are dead. Live use: fontTools for the emoji
+generators (`build.toml` runs `pixi run python tools/gen_emoji_sheet.py
+--check`). `mise.toml` already provisions a venv with fonttools.
+**Options:** (a) delete pixi, point build.toml at the mise venv; (b) trim
+pixi to fontTools. (a) cleaner, (b) less risk to committed-artifacts.
+
+### D6. Orphans — [measured]
+
+- `tools/check-cubecl.sh`: the former cubecl-chain/fork fence, run by
+  nothing. The flags it drives are live. Cubecl is default-on and heavily
+  worked on, so re-gate it.
+- `tools/check-fixture-parity.sh`: references `engine/fixture_io.mojo`. Dead.
+- `native/.cargo/mutants.toml`: references `layout_mojo.rs`. Update or delete.
+- `deny.toml`: `cargo-deny` is in mise; nothing runs it. Gate or delete.
+
+### D7. Loose root docs — [measured]
+
+`SESSION-HANDOFF.md` (2026-10-02, quotes floor 158),
+`PLAN-AGENT-STACKS-FOCUS-LOCKING.md` (2026-10-02),
+`cubecl-performance-handoff.md`: session artifacts; AGENTS.md says notes go
+in `out/`. Move with dates in the filename (their links are repo-relative since
+88525ea and will need `../`). Keep `TOOLING-PLAN.md` and `BUILD-BRIEF.md`.
+
+### C1. Twin field crates — [measured]
+
+`crates/glyph-field-instanced/src` 911 lines, `-derived` 880. Differing lines
+per file: upload.rs 158, field.rs 142, pipeline.rs 92, storage.rs 39; mostly
+the slot type name. Hoist into the `glyph-field` contract crate: the upload
+paths generic over `T: Pod`, `SlotStorage<T>` with `write_colors`, the chunking
+arithmetic. Includes one generic `create_mapped_hal_buffer<T>` gated once on
+`target_os = "macos"` (the type exists only under Metal; the runtime choice
+stays on `GpuProfile::mappable_primary_buffers`), retiring the five copies B0
+had to gate one by one.
+
+### C2. Oversized files — [measured]
+
+| lines | file |
+|---|---|
+| 3643 | `native/src/cubecl_chain/position.rs` (dead kernels `derive_stride` :2332, `paginate` :2366) |
+| 1921 | `glyph/src/tui.rs` |
+| 1659 | `native/src/layout_hyper/pass2_device.rs` |
+| 1658 | `native/src/fixture.rs` |
+| 1572 | `glyph/src/main.rs` (splits into `manifest.rs` + commands) |
+
+Line counts are from 2026-10-08. As of 2026-10-09: tui.rs 2034, main.rs 1577.
+
+### C3. `#[allow]` — [measured]
+
+- `cubecl_chain/mod.rs`: 8 × `dead_code` on `ITEM_DESC_*_PAD*` constants.
+- `cubecl_chain/repo/dispatch.rs:33, :162`: unused `sync_prof`, `record_sync`.
+- `position.rs`: `unused_assignments`.
+- `manual_range_contains` (8), `len_zero` (3) in `#[cube]` bodies: if the
+  macro forces it, say so once at module top.
+- `too_many_arguments` (20): `pass2_device.rs` ×5, `scan.rs` ×4, `repo.rs` ×3;
+  a params struct per module.
+
+### C4. `unwrap()` — [measured]
+
+63 of 134 non-test unwraps are `buf.h_<name>.as_ref().unwrap()` in
+`cubecl_chain/repo/dispatch.rs` (from :215). One accessor with one `expect`,
+or non-optional fields. Others: `glyph/src/main.rs` 9, `spike_vertex_yz.rs` 7
+(goes with C5), `pass2_device.rs` 4, a handful of 1–2s.
+
+### C5. `spike_vertex_yz.rs` — [measured]
+
+908 lines, `pub mod`, `--spike-vertex-yz`. Superseded by the Derived mode
+crate (`99aea85`, 2026-10-05). No gate or mutation references it. Delete with
+the flag and its `cli/command.rs` arm.
+
+### C6. Mojo comments — [measured]
+
+Mojo/FFI/dylib mentions: `fixture.rs` 18, `fold.rs` 13, `glyph/main.rs` 11,
+`repo.rs` 9, `layout.rs` 9, `text.rs` 8, `cluster.rs` 5. Keep history; reword
+the ones describing a live contract.
+
+### P1. Pixel baselines — [measured]
+
+See "Pixel attribution" below. Main needs a deliberate Mac re-baseline (text,
+repo-zoom at least, looking at every frame) in a commit that says why, then a
+full Linux re-adoption including `emoji-cluster` and `repo-cluster`. Until
+then pixel-ab cannot prove any refactor on this host; the stand-in is
+byte-comparing renders against main built in scratch (used for every commit
+on this branch).
+
+---
+
+## Reference
+
+### Pixel attribution, 2026-10-08 — [measured]
+
+pixel-ab here: 7 of 9 views diverge from `vulkan-nvidia`, 2 have no set.
+
+- `text.png`: every differing pixel is the comment colour, `[106,153,85]` in
+  the golden vs `[125,200,115]` fresh: `palette::COMMENT` in `9c96ad1`
+  (2026-10-08), not re-baselined. Red on the Mac too.
+- `repo-zoom.png`: field shifted down-right against both the Metal and old
+  Linux goldens (which agree). Byte-equal under hyper/batch and both field
+  modes, so the camera moved: `d1b0f7e` (2026-10-07) recentres the focus
+  camera on ink extents. Red on the Mac too [inferred by reading].
+- `repo-wide`, `repo-down`, `repo-back-oblique`, `emoji`: the Metal set was
+  re-baselined 2026-10-02 and 10-05; the Linux set never was.
+- Control: the tree at `99aea85` built here renders `text.png` byte-identical
+  to the old Linux golden, ≤16 levels off Metal on 13,571 px (known edge
+  noise). Its `--load-repo` panics on Linux (`layout.rs:588`), so repo views
+  could not be controlled the same way.
+
+### Measuring traps
+
+- `cargo run -p glyph` re-serializes `Cargo.lock` before the runner hashes
+  it, undoing a whitespace perturbation. Measure product currency with
+  `target/release/glyph` directly.
+- `cargo glyph` is broken in worktrees (D2); use the expanded command.
+- Byte-comparing renders against main: build main with `git archive` into the
+  scratchpad, render the nine views from `native/` with `--screenshot`, `cmp`
+  against `out/tooling-ab/sweep/`.
+
+### Checked and fine
+
+- No token, key or credential in the tree or in `git log --all -p`; no
+  hostname; the only email is the pixi `authors` line.
+- Every gate invocation passes `--screenshot`, so no launch config reaches a
+  golden or a pick.
+- `CHUNK_THRESHOLD_BYTES` (64 KiB, tuned to M-series L1) is documented as
+  such; whether it suits the 5090 box is a benchmark question. The cubecl
+  65535 grid cap is the WebGPU default limit, so portable.
