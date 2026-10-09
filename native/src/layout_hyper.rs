@@ -33,6 +33,7 @@ use device_alloc::{layout_device_discrete, layout_device_unified, DeviceEmission
 
 mod pass2_device;
 use pass2_device::{DerivedEmit, RenderEmit};
+mod page;
 mod pass2_host;
 pub use pass2_host::{compute_single_item_placement, layout_pass2_host, scan_item_max_row_extent};
 
@@ -276,6 +277,34 @@ pub struct PrefetchedHyperData {
     pub aggregate: PrepassAggregate,
 }
 
+/// The widest item-relative x a pure-ASCII line of `l` glyphs reaches, in the
+/// sense of the fold's scalar 7 (`fold::layout_item`): the maximum over the
+/// line's LEADERS of each one's x BEFORE its advance is added — so a glyph
+/// counts at its left edge, and the newline (when `terminated`) at the x the
+/// line closed on. Every ASCII glyph has `ascii_adv`, so with a fold unit the
+/// x of column `c` is `seg_adv_table[c % fu]` (the table is the running f32
+/// sum, the fold's own carrier); without one it is `c * ascii_adv` in f64,
+/// which is exact. 0.0 for a line with no leader, the fold's starting value.
+#[inline]
+fn ascii_line_max_x(l: usize, terminated: bool, fu: usize, seg_adv_table: &[f32], ascii_adv: f32) -> f64 {
+    // The last leader's column: the newline sits at `l`, the last glyph at
+    // `l - 1`; the x is increasing in the column inside a fold unit.
+    let last = if terminated {
+        l
+    } else if l > 0 {
+        l - 1
+    } else {
+        return 0.0;
+    };
+    if fu > 0 {
+        // A line that reaches the end of a fold unit has seen its widest
+        // column, fu - 1; a terminator at an exact multiple sits at 0.
+        seg_adv_table[last.min(fu - 1)] as f64
+    } else {
+        last as f64 * ascii_adv as f64
+    }
+}
+
 /// Evaluates Pass 1 on a single byte slice (whole file or chunk).
 pub(crate) fn pass1_prepass_chunk_bytes(
     bytes: &[u8],
@@ -324,14 +353,13 @@ pub(crate) fn pass1_prepass_chunk_bytes(
             col = l as i64;
             line_adv = l as f64 * ascii_adv as f64;
             if fold_unit > 0 {
-                let rem = l % fu;
-                seg_adv = seg_adv_table[rem];
-                let max_seg = if l >= fu { seg_adv_table[fu - 1] } else { seg_adv_table[l] };
-                if max_seg as f64 > max_row_extent {
-                    max_row_extent = max_seg as f64;
-                }
-            } else if line_adv > max_row_extent {
-                max_row_extent = line_adv;
+                seg_adv = seg_adv_table[l % fu];
+            }
+            // No newline: the widest x is the last glyph's own (see
+            // `ascii_line_max_x`).
+            let widest = ascii_line_max_x(l, false, fu, seg_adv_table, ascii_adv);
+            if widest > max_row_extent {
+                max_row_extent = widest;
             }
         } else {
             for i in 0..bytes.len() {
@@ -343,6 +371,12 @@ pub(crate) fn pass1_prepass_chunk_bytes(
                 if r.glyph_id != 0 {
                     survivor_count += 1;
                 }
+                // The fold's scalar 7: this leader's own x, BEFORE its
+                // advance is added.
+                let x = if fold_unit > 0 { seg_adv as f64 } else { line_adv };
+                if x > max_row_extent {
+                    max_row_extent = x;
+                }
                 col += 1;
                 line_adv += r.advance as f64;
                 if fold_unit > 0 {
@@ -351,11 +385,6 @@ pub(crate) fn pass1_prepass_chunk_bytes(
                     } else {
                         seg_adv += r.advance;
                     }
-                    if (seg_adv as f64) > max_row_extent {
-                        max_row_extent = seg_adv as f64;
-                    }
-                } else if line_adv > max_row_extent {
-                    max_row_extent = line_adv;
                 }
             }
         }
@@ -405,14 +434,11 @@ pub(crate) fn pass1_prepass_chunk_bytes(
             line_col = l as i64;
             line_adv = l as f64 * ascii_adv as f64;
             if fold_unit > 0 {
-                let rem = l % fu;
-                seg_adv = seg_adv_table[rem];
-                let line_max_seg = if l >= fu { seg_adv_table[fu - 1] } else { seg_adv_table[l] };
-                if line_max_seg as f64 > max_row_extent {
-                    max_row_extent = line_max_seg as f64;
-                }
-            } else if line_adv > max_row_extent {
-                max_row_extent = line_adv;
+                seg_adv = seg_adv_table[l % fu];
+            }
+            let widest = ascii_line_max_x(l, nl_pos < bytes.len(), fu, seg_adv_table, ascii_adv);
+            if widest > max_row_extent {
+                max_row_extent = widest;
             }
         } else {
             for i in pos..nl_pos {
@@ -424,6 +450,10 @@ pub(crate) fn pass1_prepass_chunk_bytes(
                 if r.glyph_id != 0 {
                     line_survivors += 1;
                 }
+                let x = if fold_unit > 0 { seg_adv as f64 } else { line_adv };
+                if x > max_row_extent {
+                    max_row_extent = x;
+                }
                 line_col += 1;
                 line_adv += r.advance as f64;
                 if fold_unit > 0 {
@@ -432,11 +462,13 @@ pub(crate) fn pass1_prepass_chunk_bytes(
                     } else {
                         seg_adv += r.advance;
                     }
-                    if (seg_adv as f64) > max_row_extent {
-                        max_row_extent = seg_adv as f64;
-                    }
-                } else if line_adv > max_row_extent {
-                    max_row_extent = line_adv;
+                }
+            }
+            if nl_pos < bytes.len() {
+                // The newline is a leader too, at the x the line closed on.
+                let x = if fold_unit > 0 { seg_adv as f64 } else { line_adv };
+                if x > max_row_extent {
+                    max_row_extent = x;
                 }
             }
         }

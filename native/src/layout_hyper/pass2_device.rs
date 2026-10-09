@@ -17,6 +17,7 @@ use crate::glyph_scene::{BlockCull, RenderSlot, SUBSEG_BLOCK_SIZE};
 use crate::layout::{FileTintAccum, InkExtent, ItemPlacement, LayoutItem, PageExtent, Paint};
 use glyph_field_derived::DerivedSlot;
 use super::char_resolve::resolve_byte_char;
+use super::page::Pager;
 use super::types::{ItemPrepass, Pass2DeviceOutput};
 
 /// A device slot format Pass 2 can emit directly.
@@ -335,12 +336,11 @@ fn layout_pass2_chunk<E: SlotEmit>(
     } else {
         0
     };
-    let page_stride_x = if p.has_page && p.page_rows > 0 {
-        pre.max_row_extent + p.page_gap_x
-    } else {
-        0.0
-    };
-    let page_active = p.has_page && (p.page_rows > 0 || p.page_cols > 0 || p.scroll_rows > 0);
+    let pager = Pager::new(p, pre.max_row_extent);
+    let page_active = pager.active;
+    // A column-paged item's cells change frame every `page_cols` columns;
+    // the line fast path cuts its runs there too.
+    let page_cols_run = if page_active { std::num::NonZeroUsize::new(pager.cols() as usize) } else { None };
 
     let mut page_right = 0.0f32;
     let mut page_bottom = 0.0f32;
@@ -391,14 +391,7 @@ fn layout_pass2_chunk<E: SlotEmit>(
 
     let wrap_w = p.wrap_width as i64;
     let is_wrap_back = p.wrap_mode == crate::fold::WrapMode::Back;
-    let pages_wide = (p.pages_wide as i64).max(1);
-    let page_rows = p.page_rows as i64;
-    let page_cols = p.page_cols as i64;
-    let scroll_rows = p.scroll_rows as i64;
     let line_height = p.line_height;
-    let band_stride_y = p.band_stride_y;
-    let depth_per_band = p.depth_per_band;
-    let depth_per_col = p.depth_per_col;
     let z_step = p.z_step;
     let origin_x = p.origin_x;
     let origin_y = p.origin_y;
@@ -534,17 +527,35 @@ fn layout_pass2_chunk<E: SlotEmit>(
                     }
                 }
 
-                let seg_limit = if wrap_w > 0 { wrap_w as usize } else { usize::MAX };
+                // A RUN is a stretch of cells that share one frame and one
+                // segment-advance carrier: it ends where the fold unit closes
+                // (the segment advance resets) and, for a column-paged item,
+                // where the column page turns. Without column paging a run is
+                // a wrap segment, as it always was.
+                let seg_limit = if fold_unit > 0 { fold_unit as usize } else { usize::MAX };
                 let mut seg_offset = 0usize;
                 let mut wrap_segment = 0i64;
+                let mut x_page = 0i64;
                 let mut line_adv_f64 = line_adv;
                 let mut seg_adv_f32 = seg_adv;
-                // The last segment's advance before its reset: the newline's
-                // x when the line does not end on a wrap boundary.
+                // The last run's advance before its reset: the newline's x
+                // when the line does not end on a fold-unit boundary.
                 let mut last_seg_adv = seg_adv_f32;
 
                 while seg_offset < line_len {
-                    let seg_len = (line_len - seg_offset).min(seg_limit);
+                    let seg_len = match page_cols_run {
+                        None => (line_len - seg_offset).min(seg_limit),
+                        Some(page_cols) => {
+                            // seg_limit is finite here: a column-paged item
+                            // folds at wrap_width, or at page_cols itself.
+                            let page_cols = page_cols.get();
+                            wrap_segment = if wrap_w > 0 { seg_offset as i64 / wrap_w } else { 0 };
+                            x_page = (seg_offset / page_cols) as i64;
+                            (line_len - seg_offset)
+                                .min(seg_limit - seg_offset % seg_limit)
+                                .min(page_cols - seg_offset % page_cols)
+                        }
+                    };
                     let seg_bytes = &line_bytes[seg_offset..seg_offset + seg_len];
 
                     let row = if is_wrap_back {
@@ -552,7 +563,6 @@ fn layout_pass2_chunk<E: SlotEmit>(
                     } else {
                         base_row + wrap_segment
                     };
-                    let x_page = 0i64;
 
                     if row != last_row || wrap_segment != last_wrap_seg || x_page != last_x_page {
                         last_row = row;
@@ -560,19 +570,10 @@ fn layout_pass2_chunk<E: SlotEmit>(
                         last_x_page = x_page;
 
                         if page_active {
-                            let (y_page, screen_row) = if page_rows > 0 {
-                                (row / page_rows, row + scroll_rows)
-                            } else {
-                                (0, row)
-                            };
-                            let band = y_page / pages_wide;
-                            cached_page_x_off = (y_page % pages_wide) as f64 * page_stride_x;
-                            cached_py = (origin_y
-                                - (screen_row - y_page * page_rows) as f64 * line_height
-                                - band as f64 * band_stride_y) as f32;
-                            cached_pz = (origin_z - wrap_segment as f64 * z_step
-                                + band as f64 * depth_per_band
-                                + x_page as f64 * depth_per_col) as f32;
+                            let f = pager.frame(row, seg_offset as i64, wrap_segment);
+                            cached_page_x_off = f.x_off;
+                            cached_py = f.y;
+                            cached_pz = f.z;
                         } else {
                             cached_page_x_off = 0.0;
                             cached_py = (-(row as f64) * line_height + origin_y) as f32;
@@ -1198,10 +1199,16 @@ fn layout_pass2_chunk<E: SlotEmit>(
                         }
                     }
 
-                    wrap_segment += 1;
                     seg_offset += seg_len;
                     last_seg_adv = seg_adv_f32;
-                    seg_adv_f32 = 0.0;
+                    if page_cols_run.is_none() {
+                        wrap_segment += 1;
+                        seg_adv_f32 = 0.0;
+                    } else if seg_offset.is_multiple_of(seg_limit) {
+                        // A column-page cut inside a fold unit carries the
+                        // segment advance on; only the fold unit resets it.
+                        seg_adv_f32 = 0.0;
+                    }
                 }
 
                 record_idx += line_len;
@@ -1214,33 +1221,30 @@ fn layout_pass2_chunk<E: SlotEmit>(
                     // The newline's own record. PageExtent is measured over
                     // EVERY record (layout.rs), and the newline occupies its
                     // advance at column `col` on the row it closes: for a
-                    // non-empty line that is the last segment's row (already
-                    // folded into the page above, and still the cached frame),
-                    // for an empty line a row no glyph visited. Once per
-                    // line; the per-byte paths are untouched.
-                    if line_len == 0 {
-                        // wrap_segment_of / wrap_row_of at column 0 with a
-                        // terminator are both 0.
-                        let row = base_row;
-                        if row != last_row || last_wrap_seg != 0 || last_x_page != 0 {
+                    // non-empty line that is the last run's frame (a
+                    // terminator stays in the segment it closes: already
+                    // folded into the page above, and still cached) unless a
+                    // column page turns exactly at the line's end; for an
+                    // empty line a row no glyph visited. Once per line; the
+                    // per-byte paths are untouched.
+                    let nl_col = line_len as i64;
+                    let nl_seg = crate::fold::wrap_segment_of(nl_col, wrap_w, true);
+                    let nl_x_page = if page_active { pager.x_page(nl_col) } else { 0 };
+                    {
+                        let row = if is_wrap_back { base_row } else { base_row + nl_seg };
+                        if row != last_row || nl_seg != last_wrap_seg || nl_x_page != last_x_page {
                             last_row = row;
-                            last_wrap_seg = 0;
-                            last_x_page = 0;
+                            last_wrap_seg = nl_seg;
+                            last_x_page = nl_x_page;
                             if page_active {
-                                let (y_page, screen_row) =
-                                    if page_rows > 0 { (row / page_rows, row + scroll_rows) } else { (0, row) };
-                                let band = y_page / pages_wide;
-                                cached_page_x_off = (y_page % pages_wide) as f64 * page_stride_x;
-                                cached_py = (origin_y
-                                    - (screen_row - y_page * page_rows) as f64 * line_height
-                                    - band as f64 * band_stride_y) as f32;
-                                cached_pz = (origin_z - 0.0f64 * z_step
-                                    + band as f64 * depth_per_band
-                                    + 0.0f64 * depth_per_col) as f32;
+                                let f = pager.frame(row, nl_col, nl_seg);
+                                cached_page_x_off = f.x_off;
+                                cached_py = f.y;
+                                cached_pz = f.z;
                             } else {
                                 cached_page_x_off = 0.0;
                                 cached_py = (-(row as f64) * line_height + origin_y) as f32;
-                                cached_pz = (-(0.0f64) * z_step + origin_z) as f32;
+                                cached_pz = (-(nl_seg as f64) * z_step + origin_z) as f32;
                             }
                             if cached_py < page_bottom {
                                 page_bottom = cached_py;
@@ -1292,7 +1296,7 @@ fn layout_pass2_chunk<E: SlotEmit>(
             base_row + wrap_row_of(col, wrap_w, r.is_newline, p.wrap_mode)
         };
 
-        let x_page = if page_active && page_cols > 0 { col / page_cols } else { 0 };
+        let x_page = if page_active { pager.x_page(col) } else { 0 };
 
         if row != last_row || wrap_segment != last_wrap_seg || x_page != last_x_page {
             last_row = row;
@@ -1300,19 +1304,10 @@ fn layout_pass2_chunk<E: SlotEmit>(
             last_x_page = x_page;
 
             if page_active {
-                let (y_page, screen_row) = if page_rows > 0 {
-                    (row / page_rows, row + scroll_rows)
-                } else {
-                    (0, row)
-                };
-                let band = y_page / pages_wide;
-                cached_page_x_off = (y_page % pages_wide) as f64 * page_stride_x;
-                cached_py = (origin_y
-                    - (screen_row - y_page * page_rows) as f64 * line_height
-                    - band as f64 * band_stride_y) as f32;
-                cached_pz = (origin_z - wrap_segment as f64 * z_step
-                    + band as f64 * depth_per_band
-                    + x_page as f64 * depth_per_col) as f32;
+                let f = pager.frame(row, col, wrap_segment);
+                cached_page_x_off = f.x_off;
+                cached_py = f.y;
+                cached_pz = f.z;
             } else {
                 cached_page_x_off = 0.0;
                 cached_py = (-(row as f64) * line_height + origin_y) as f32;

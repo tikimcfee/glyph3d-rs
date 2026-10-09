@@ -795,6 +795,85 @@ mod tests {
         }
     }
 
+    /// C14 (2026-10-09): pagination on every tier, host and device, over a
+    /// grid of page shapes that reaches each branch of `fold::paginate` —
+    /// scroll alone, rows alone, rows + scroll with a conveyor that runs a
+    /// row above the page, columns alone (the fold unit is then page_cols),
+    /// columns under a narrower and a wider wrap, pages_wide 1 and 3 — in
+    /// both wrap modes. The text holds what the emitters special-case:
+    /// pure-ASCII lines (the line and burst paths) at, under and over the
+    /// fold unit and exact multiples of it, empty lines, non-ASCII lines (the
+    /// per-byte path), a line ending exactly on a column page, and an
+    /// UNTERMINATED last line that is the widest — the stride is the fold's
+    /// widest pre-advance x, which an unterminated line's last glyph sets.
+    #[test]
+    fn pagination_agrees_on_every_tier() {
+        let trie = crate::default_trie();
+        let texts: [&str; 3] = [
+            "abcdefgh\n\nabcdefghijklmnop\nxy\n\u{E9}t\u{E9} caf\u{E9} \u{4E16}\u{754C}\nabcdefghijkl\n\n12345678901234567890123",
+            "line 0\nline 1\nline 2\nline 3\nline 4\nline 5\nline 6\nline 7\nline 8\nline 9 is the widest unterminated",
+            "\u{1F680}a\u{1F30D}bcdefgh\n\nabcdefghi\nabcdefgh\n",
+        ];
+        // (page_rows, page_cols, scroll_rows, pages_wide, wrap_width)
+        let shapes: [(i32, i32, i32, i32, i32); 10] = [
+            (0, 0, 3, 1, 0),
+            (3, 0, 0, 2, 0),
+            (3, 0, 2, 3, 0),
+            (4, 0, 9, 3, 0),
+            (0, 4, 0, 1, 0),
+            (0, 4, 0, 1, 6),
+            (0, 4, 0, 1, 3),
+            (2, 4, 1, 3, 0),
+            (2, 5, 1, 2, 7),
+            (3, 0, 1, 3, 5),
+        ];
+        let mut compared = 0usize;
+        for mode in [fold::WrapMode::Down, fold::WrapMode::Back] {
+            for (rows, cols, scroll, wide, wrap) in shapes {
+                let params = ItemParams {
+                    origin_x: 0.5,
+                    origin_y: -1.0,
+                    origin_z: 2.0,
+                    line_height: 1.1,
+                    z_step: 0.4,
+                    wrap_width: wrap,
+                    wrap_mode: mode,
+                    has_page: true,
+                    page_rows: rows,
+                    page_cols: cols,
+                    scroll_rows: scroll,
+                    pages_wide: wide,
+                    page_gap_x: 0.8,
+                    band_stride_y: 9.5,
+                    depth_per_band: -2.5,
+                    depth_per_col: 0.75,
+                    ..ItemParams::default()
+                };
+                let corpus = Corpus {
+                    name: "paged".into(),
+                    items: texts
+                        .iter()
+                        .enumerate()
+                        .map(|(i, t)| CorpusItem { label: format!("text {i}"), bytes: t.as_bytes().to_vec(), params })
+                        .collect(),
+                };
+                let d = diff_corpus(&corpus, &trie).expect("layout");
+                let at = format!("{mode:?} rows {rows} cols {cols} scroll {scroll} wide {wide} wrap {wrap}");
+                assert!(d.records > 0 && d.device_slots == d.instances, "{at}: compared nothing");
+                assert_eq!((d.record_bad, d.instance_bad, d.placement_bad), (0, 0, 0), "{at}: {:?}", d.firsts);
+                assert_eq!(
+                    (d.device_render_bad, d.device_derived_bad, d.device_placement_bad),
+                    (0, 0, 0),
+                    "{at}: {:?}",
+                    d.firsts
+                );
+                assert!(d.seam.is_ok(), "{at}: {:?}", d.seam);
+                compared += d.instances;
+            }
+        }
+        assert!(compared > 2000, "the grid compared only {compared} instances");
+    }
+
     #[test]
     fn the_device_tally_sees_a_planted_slot_difference() {
         let trie = crate::default_trie();
