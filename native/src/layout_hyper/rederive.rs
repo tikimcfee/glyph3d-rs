@@ -13,6 +13,7 @@ pub fn rederive_item_records(
     trie: &TrieTable,
 ) -> Vec<GlyphRecord> {
     let em_height_fu = trie.metrics.em_height_fu;
+    let cluster = super::char_resolve::clusters(p);
     let bitmap_adv = fu_to_world(trie.bitmap_advance_fu, em_height_fu);
 
     let fold_unit = if p.wrap_width > 0 {
@@ -31,7 +32,7 @@ pub fn rederive_item_records(
         let mut trailer_until = 0usize;
         let mut pos = 0usize;
         while pos < bytes.len() {
-            let r = match resolve_byte_char(bytes, pos, trie, bitmap_adv, em_height_fu, &mut trailer_until) {
+            let r = match resolve_byte_char(bytes, pos, trie, bitmap_adv, em_height_fu, cluster, &mut trailer_until) {
                 Some(r) => r,
                 None => {
                     pos += 1;
@@ -72,7 +73,7 @@ pub fn rederive_item_records(
 
     let mut pos = 0usize;
     while pos < bytes.len() {
-        let r = match resolve_byte_char(bytes, pos, trie, bitmap_adv, em_height_fu, &mut trailer_until) {
+        let r = match resolve_byte_char(bytes, pos, trie, bitmap_adv, em_height_fu, cluster, &mut trailer_until) {
             Some(r) => r,
             None => {
                 pos += 1;
@@ -143,11 +144,15 @@ pub fn rederive_item_records(
 
 /// Resolves an AST/LSP byte-span color stream into the exact packed RGBA8 colors
 /// corresponding to survivor glyph slots (non-blank printable characters).
+/// `cluster_mode` must be the one the file was laid out with: it decides
+/// which leaders survive (a keycap head or a ZWJ family is one slot).
 pub fn resolve_spans_to_slot_colors(
     bytes: &[u8],
     spans: &[ByteSpan],
     trie: &TrieTable,
+    cluster_mode: crate::fold::ClusterMode,
 ) -> Vec<u32> {
+    let cluster = cluster_mode == crate::fold::ClusterMode::Cluster;
     let em_height_fu = trie.metrics.em_height_fu;
     let bitmap_adv = fu_to_world(trie.bitmap_advance_fu, em_height_fu);
     let mut colors = Vec::new();
@@ -156,7 +161,7 @@ pub fn resolve_spans_to_slot_colors(
     let mut trailer_until = 0usize;
 
     while pos < bytes.len() {
-        let r = match resolve_byte_char(bytes, pos, trie, bitmap_adv, em_height_fu, &mut trailer_until) {
+        let r = match resolve_byte_char(bytes, pos, trie, bitmap_adv, em_height_fu, cluster, &mut trailer_until) {
             Some(r) => r,
             None => {
                 pos += 1;

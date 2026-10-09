@@ -298,6 +298,7 @@ pub(crate) fn pass1_prepass_chunk_bytes(
     let mut max_row_extent = 0.0f64;
     let mut trailer_until = 0usize;
     let mut has_cluster = false;
+    let cluster = char_resolve::clusters(p);
     let wrap_w = p.wrap_width as i64;
     let ascii_adv = fu_to_world(1229, em_height_fu);
 
@@ -334,7 +335,7 @@ pub(crate) fn pass1_prepass_chunk_bytes(
             }
         } else {
             for i in 0..bytes.len() {
-                let r = match resolve_byte_char_cluster(bytes, i, trie, bitmap_adv, em_height_fu, &mut trailer_until, &mut has_cluster) {
+                let r = match resolve_byte_char_cluster(bytes, i, trie, bitmap_adv, em_height_fu, cluster, &mut trailer_until, &mut has_cluster) {
                     Some(r) => r,
                     None => continue,
                 };
@@ -415,7 +416,7 @@ pub(crate) fn pass1_prepass_chunk_bytes(
             }
         } else {
             for i in pos..nl_pos {
-                let r = match resolve_byte_char_cluster(bytes, i, trie, bitmap_adv, em_height_fu, &mut trailer_until, &mut has_cluster) {
+                let r = match resolve_byte_char_cluster(bytes, i, trie, bitmap_adv, em_height_fu, cluster, &mut trailer_until, &mut has_cluster) {
                     Some(r) => r,
                     None => continue,
                 };
@@ -883,7 +884,7 @@ mod tests {
         assert_eq!(places_flat[0].slot_count, places_spanned[0].slot_count);
 
         // 3. Resolve spans to slot colors
-        let resolved = resolve_spans_to_slot_colors(text, &spans, &trie);
+        let resolved = resolve_spans_to_slot_colors(text, &spans, &trie, crate::fold::ClusterMode::default());
         assert_eq!(resolved.len(), places_flat[0].slot_count as usize);
 
         // Verify resolved colors exactly match the layout-time Paint::ByteSpans colors

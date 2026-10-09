@@ -324,6 +324,7 @@ fn layout_pass2_chunk<E: SlotEmit>(
 ) -> ChunkPass2Output {
     let bytes = chunk_bytes;
     let p = &item.params;
+    let cluster = super::char_resolve::clusters(p);
     let group_id = item.group_id;
     let mut max_row_seen = -1i64;
 
@@ -1218,7 +1219,7 @@ fn layout_pass2_chunk<E: SlotEmit>(
             }
         }
 
-        let r = match resolve_byte_char(bytes, pos, trie, bitmap_adv, em_height_fu, &mut trailer_until) {
+        let r = match resolve_byte_char(bytes, pos, trie, bitmap_adv, em_height_fu, cluster, &mut trailer_until) {
             Some(r) => r,
             None => {
                 pos += 1;

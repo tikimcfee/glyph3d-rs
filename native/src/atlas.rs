@@ -132,6 +132,15 @@ pub struct AsciiFastEntry {
     pub advance: f32,
     pub height: f32,
     pub is_newline: bool,
+    /// This byte is the FIRST member of some sequence in the v2 table (the
+    /// keycap bases `#`, `*`, `0`-`9` in today's atlas — derived from the
+    /// table at load, never listed by hand). Under cluster mode such a byte
+    /// may be a sequence head, so HyperLayout's per-byte fast path must not
+    /// answer from this entry when a non-ASCII byte follows it. An ASCII next
+    /// byte rules the sequence out (`TrieTable::load` asserts that no
+    /// sequence opens with two ASCII members). It rides in the entry's
+    /// padding, so testing it costs no extra load.
+    pub seq_lead: bool,
 }
 
 impl AsciiFastEntry {
@@ -292,6 +301,7 @@ impl TrieTable {
                 advance: 0.0,
                 height: 0.0,
                 is_newline: false,
+                seq_lead: false,
             }; 256],
             device_block_indices,
             device_measures,
@@ -300,6 +310,27 @@ impl TrieTable {
             pair_secondary_offsets,
             pair_secondary_values,
         };
+        // THE INVARIANTS HyperLayout's ASCII fast paths rest on, checked
+        // against the table itself (`layout_hyper/char_resolve.rs`):
+        //  1. no sequence opens with two ASCII members. So an ASCII-led
+        //     sequence (a keycap) needs a NON-ASCII byte right after its
+        //     head: the per-byte path looks ahead only from a `seq_lead`
+        //     byte, and a pure-ASCII line (every line-level and burst
+        //     shortcut in Pass 1 and both Pass 2s) never holds a sequence;
+        //  2. the probe key fits HyperLayout's fixed key buffer.
+        // An atlas that breaks either fails HERE, at load, instead of laying
+        // such a sequence out as text on a fast path.
+        for e in t.sequences.chunks_exact(2 + seq_max as usize) {
+            let cps = &e[2..2 + e[1] as usize];
+            assert!(
+                !(cps.len() >= 2 && cps[0] < 0x80 && cps[1] < 0x80),
+                "codepoints.bin: sequence {cps:X?} opens with two ASCII members; HyperLayout's ASCII fast paths assume none does"
+            );
+        }
+        assert!(
+            seq_max as usize <= crate::layout_hyper::char_resolve::MAX_SEQ_KEY,
+            "codepoints.bin: seq_max {seq_max} exceeds HyperLayout's probe key buffer"
+        );
         for b in 0..128u8 {
             let cp = b as u32;
             if cp == 0x0A {
@@ -309,6 +340,7 @@ impl TrieTable {
                     advance: crate::text::fu_to_world(entry.advance_fu, em),
                     height: crate::text::fu_to_world(entry.height_fu, em),
                     is_newline: true,
+                    seq_lead: false,
                 });
             } else if !crate::fold::is_static_zero_cp(cp) {
                 let entry = t.lookup(cp);
@@ -317,6 +349,7 @@ impl TrieTable {
                     advance: crate::text::fu_to_world(entry.advance_fu, em),
                     height: crate::text::fu_to_world(entry.height_fu, em),
                     is_newline: false,
+                    seq_lead: t.starts_a_sequence(cp),
                 });
             }
         }
@@ -325,6 +358,7 @@ impl TrieTable {
             advance: 0.0,
             height: 0.0,
             is_newline: false,
+            seq_lead: false,
         }; 256];
         for b in 0..128u8 {
             if let Some(entry) = ascii_table[b as usize] {
@@ -1424,6 +1458,26 @@ mod trie_v2_tests {
         let nl_fast = t.ascii_table[b'\n' as usize].expect("Newline fast entry exists");
         assert_eq!(nl_fast.glyph_id, 0);
         assert!(nl_fast.is_newline);
+    }
+
+    /// `seq_lead` is the table's own first members restricted to ASCII:
+    /// every flagged byte starts a sequence and every ASCII first member is
+    /// flagged. Today that is exactly the keycap bases.
+    #[test]
+    fn seq_lead_is_the_ascii_first_members_of_the_table() {
+        let t = default_trie();
+        let mut firsts: Vec<u8> = t
+            .sequences
+            .chunks_exact(2 + t.seq_max as usize)
+            .map(|e| e[2])
+            .filter(|&cp| cp < 0x80)
+            .map(|cp| cp as u8)
+            .collect();
+        firsts.sort_unstable();
+        firsts.dedup();
+        let flagged: Vec<u8> = (0..=255u8).filter(|&b| t.fast_byte_table[b as usize].seq_lead).collect();
+        assert_eq!(flagged, firsts);
+        assert_eq!(flagged, b"#*0123456789".to_vec(), "today's atlas: the keycap bases");
     }
 
     #[test]
