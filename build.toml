@@ -373,7 +373,7 @@ cmd = "bash tools/check-cubecl.sh chain"
 pass_line = "ALL PASS"
 needs = ["renderer"]
 compare = "the device chain vs the CPU scan reference (scan.rs) over five fixtures (wrapback-long-line, paged-rows, paged-cols, multi-item, cluster-flags): counts/rows exact, fold>0 X bit-exact, line_adv + positions at the eps tier, the emitted records tier-diffed"
-blind_to = "RED today (C10): cluster-flags, 9 record mismatches since 26595fb. Corpora outside the five fixtures; HyperLayout (this is chain-vs-CPU-scan); the device decode and cluster stages (this driver uploads CPU-computed statics)"
+blind_to = "Green since c5ef78a (red 2026-10-06..09: 26595fb left this driver uploading CPU flags without the device-only cluster-head bit; production was unaffected). Corpora outside the five fixtures; HyperLayout (this is chain-vs-CPU-scan); the device decode and cluster stages (this driver uploads CPU-computed statics)"
 
 [[gate]]
 name = "cubecl-fork"

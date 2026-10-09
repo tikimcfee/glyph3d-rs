@@ -340,14 +340,17 @@ measured 2026-10-09), and nothing separates `direct` from its reference
 without a device.
 
 **cubecl-chain** and **cubecl-fork** (`tools/check-cubecl.sh chain|fork`,
-re-gated 2026-10-09, **red**). The chain against the CPU scan reference
+re-gated 2026-10-09; chain **green**, fork **red**). The chain against the CPU scan reference
 (`scan.rs`) over five fixtures — counts/rows exact, fold>0 X bit-exact,
 positions at the eps tier, emitted records tier-diffed; and the full
 from-bytes chain against HyperLayout over the IMMUTABLE `cubecl-fork` corpus
 in STRICT mode — the 32 B slot stream field-equal, placements bit-equal,
 tint pairs equal, the m>=3 / seg>=3 buckets and cluster candidates proven
-exercised. Both red before they were re-gated (C10): `cluster-flags` fails
-the chain since 26595fb (2026-10-06, bisected); the fork fails since
+exercised. Both were red when re-gated (C10). The chain's `cluster-flags`
+failure (since 26595fb, 2026-10-06, bisected) was the INSTRUMENT: that commit
+moved "committed cluster head" into a device-only flag this driver never
+uploaded; fixed in c5ef78a, and `emitter-ordinal-zeroed` proves the gate. The
+fork fails since
 HyperLayout became its reference (2026-09-30) — and hyper-oracle shows that
 reference is itself wrong on this corpus's keycaps, so a green fork would
 mean the chain agrees with HyperLayout, not with the oracle. Their mutations
