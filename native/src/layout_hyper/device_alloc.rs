@@ -222,7 +222,10 @@ fn stage_single_buffer<E: SlotEmit>(
     label: &str,
     plan: &ChunkPlan,
 ) -> (Pass2DeviceOutput, Vec<Vec<u32>>, Vec<DeviceSlotChunk>) {
-    let staging_size = plan.total_bytes.max(plan.slot_bytes as u64);
+    // Padded to the copy fast path (glyph_field::copy, C16): wgpu-core copies
+    // this whole buffer from its own staging at `unmap`, and a size off 16 B
+    // halves that copy's throughput. The pad is never copied out.
+    let staging_size = glyph_field::padded_staging_size(plan.total_bytes.max(plan.slot_bytes as u64));
     let staging_buf = dev.device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("glyph slots (staging)"),
         size: staging_size,
@@ -260,7 +263,7 @@ fn stage_single_buffer<E: SlotEmit>(
             let copy_size = (count as usize * plan.slot_bytes)
                 .min(plan.total_bytes.saturating_sub(src_offset) as usize) as u64;
             if copy_size > 0 {
-                encoder.copy_buffer_to_buffer(&staging_buf, src_offset, &buffer, 0, copy_size);
+                glyph_field::copy_split(&mut encoder, &staging_buf, src_offset, &buffer, 0, copy_size);
             }
             DeviceSlotChunk {
                 buffer,
@@ -369,7 +372,8 @@ fn stage_host_memory<E: SlotEmit>(
                 let mut encoder = dev.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
                     label: Some("glyph_hyper_chunk_slice_copy"),
                 });
-                encoder.copy_buffer_to_buffer(
+                glyph_field::copy_split(
+                    &mut encoder,
                     &staging_buf,
                     0,
                     &buffer,

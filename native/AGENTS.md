@@ -154,6 +154,9 @@ Detailed technical audit lives in `research/desktop-platform-audit.md`. Key touc
   - Desktop x86_64 (AMD Zen 3/4/5, Intel Raptor Lake) has **32 KiB or 48 KiB L1D** per core. A 64 KiB chunk spills to L2. On desktop, testing 32 KiB or 16 KiB thresholds can keep chunks 100% L1D-resident.
 - **Cache Lines & Burst Stores (`native/src/layout_hyper/pass2_device.rs`)**:
   - `emit_burst8` writes 8 `DerivedSlot`s (160 B) or 4 `RenderSlot`s (128 B). Standard x86_64 cache line width is 64 B (Apple M2 SLC/L2 is 128 B).
+- **Copy sizes (`crates/glyph-field/src/copy.rs`, C16, measured 2026-10-09 on an RTX 5090)**:
+  - A `copy_buffer_to_buffer` whose size is off 16 B runs whole at about half speed; wgpu only asks for 4. A 20 B `DerivedSlot` stream is 16-aligned only at counts ≡ 0 mod 4, so an odd count cost ~+20 ms of backend on a 94 MB tree. Discrete staging buffers are padded with `padded_staging_size` and slot copies go through `copy_split` (16-aligned body + small tail). Same bytes, same buffer sizes; the unified single-chunk path makes no copy and is untouched.
+  - An off-16 source OFFSET also costs; chunked Derived buffers start chunk k at `k x chunk_cap x 20` B (≡ 8 mod 16 at the 2 GiB binding limit; a forced two-chunk split of the 94 MB tree measured ~+1 ms at 8 mod 16, ~+5 ms at 4 mod 16). Left as is: moving it would move which slot lives in which chunk.
 - **Golden Pixel Keys**:
   - macOS Metal: `metal-apple`. Desktop Linux/Windows: `vulkan-nvidia`, `vulkan-amd`. Golden baselines are keyed per hardware in `out/tooling-ab/baseline/<key>/`.
 - **Pure Rust Portability**:

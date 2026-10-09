@@ -25,7 +25,7 @@
 # Ratchet, NOT an equality: tests are added constantly, so an exact pin would
 # redden on the most common good action in the repo. A green run whose real
 # count exceeds the floor prints a NOTE naming the value to raise it to.
-test_floor = 243
+test_floor = 245
 
 
 # ── Products ─────────────────────────────────────────────────────────────
@@ -760,3 +760,13 @@ op = "replace"
 find = "        let mut tail_word = 0x8080_8080u32;"
 with = "        let mut tail_word = 0u32;"
 expect = "pack_words_fills_tail_lanes"
+
+[[mutation]]
+name = "copy-split-body-unaligned"
+gate = "cargo-test"
+why = "C16 (2026-10-09): a slot-buffer copy whose size is off 16 B runs whole at about half speed on the discrete path (RTX 5090/Vulkan measured; wgpu only asks for 4), so an odd Derived survivor count cost ~+20 ms of backend on the 94 MB tree across its two staging copies. Copying the whole size as the 'body' restores exactly that shape. Invisible to every byte and pixel gate BY DESIGN — the bytes that land are the same, only the speed moves — so the reddening witness is the helper's own unit test. CONSUMED BY: glyph_field::copy_split, called by the discrete staging copies in layout_hyper/device_alloc.rs and glyph-field-derived's upload"
+file = "crates/glyph-field/src/copy.rs"
+op = "replace"
+find = "    let body = size - size % FAST_COPY_ALIGN;"
+with = "    let body = size;"
+expect = "split_body_is_fast_aligned_and_covers_the_size"
