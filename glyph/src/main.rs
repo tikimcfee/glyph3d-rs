@@ -1103,6 +1103,11 @@ fn apply_mutation(mu: &Mutation) -> Result<Vec<u8>, String> {
             let with = mu.with_.as_deref().unwrap_or_default();
             std::fs::write(&f, text.replacen(find, with, 1)).map_err(|e| e.to_string())?;
         }
+        // The file goes; the restore below writes `before` back, which is
+        // what makes this uniform with the other ops. validate() accepted
+        // `remove` and build.toml documented it, but until 2026-10-09 this
+        // match did not, so a remove mutation failed as "unknown op" in prove.
+        "remove" => std::fs::remove_file(&f).map_err(|e| format!("{}: {e}", mu.file))?,
         other => return Err(format!("unknown op {other}")),
     }
     if std::fs::read(&f).unwrap_or_default() == before {
