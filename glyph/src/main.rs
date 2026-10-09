@@ -1523,6 +1523,33 @@ mod tests {
         );
     }
 
+    /// The doubled alias of a nested worktree is stripped, at any depth, and
+    /// nothing else is.
+    #[test]
+    fn doubled_alias_is_stripped() {
+        let os = |v: &[&str]| v.iter().map(std::ffi::OsString::from).collect::<Vec<_>>();
+        let mut nested = vec!["glyph"];
+        nested.extend(ALIAS_EXPANSION);
+        nested.extend(ALIAS_EXPANSION);
+        nested.push("test");
+        assert_eq!(strip_doubled_alias(os(&nested)), os(&["glyph", "test"]));
+        assert_eq!(strip_doubled_alias(os(&["glyph", "test", "rust"])), os(&["glyph", "test", "rust"]));
+        // `glyph run` passes its arguments to the renderer: left alone.
+        assert_eq!(strip_doubled_alias(os(&["glyph", "run", "--demo"])), os(&["glyph", "run", "--demo"]));
+    }
+
+    /// The constant is the alias cargo actually expands.
+    #[test]
+    fn alias_expansion_matches_cargo_config() {
+        let cfg: toml::Table = std::fs::read_to_string(root().join(".cargo/config.toml"))
+            .expect(".cargo/config.toml reads")
+            .parse()
+            .expect(".cargo/config.toml parses");
+        let alias = cfg["alias"]["glyph"].as_array().expect("alias.glyph is an array");
+        let alias: Vec<&str> = alias.iter().map(|v| v.as_str().expect("string")).collect();
+        assert_eq!(alias, ALIAS_EXPANSION);
+    }
+
     /// A mutation's find must name ONE place (C11), and no declared one names two.
     #[test]
     fn mutation_finds_are_unambiguous() {
@@ -1550,10 +1577,30 @@ mod tests {
     }
 }
 
+/// What `cargo glyph` expands to — `.cargo/config.toml`'s alias, pinned to it
+/// by `alias_expansion_matches_cargo_config`.
+const ALIAS_EXPANSION: [&str; 6] = ["run", "--quiet", "--release", "-p", "glyph", "--"];
+
+/// D2 (2026-10-09). Cargo merges `.cargo/config.toml` from every ancestor
+/// directory and CONCATENATES alias arrays, so in a worktree nested inside the
+/// repo (`.claude/worktrees/<name>`, where Claude Code puts its own) `cargo
+/// glyph test` reaches us as `run --quiet --release -p glyph -- test`, once per
+/// extra level. Strip every leading copy. Done here rather than by making the
+/// alias a string (which cargo does not merge): a checkout on the array form
+/// and a worktree on the string form make cargo refuse to load its config at
+/// all (measured), so that fix breaks every nested worktree on another branch.
+fn strip_doubled_alias(mut args: Vec<std::ffi::OsString>) -> Vec<std::ffi::OsString> {
+    let n = ALIAS_EXPANSION.len();
+    while args.len() > n && args[1..=n].iter().zip(ALIAS_EXPANSION).all(|(a, b)| a == b) {
+        args.drain(1..=n);
+    }
+    args
+}
+
 fn main() -> ExitCode {
     // Before anything can rebuild us out from under ourselves; see self_exe.
     let _ = self_exe();
-    let cli = Cli::parse();
+    let cli = Cli::parse_from(strip_doubled_alias(std::env::args_os().collect()));
 
 
     let m = match load() {

@@ -94,11 +94,13 @@ The `cargo glyph` alias is repo-scoped (it lives in `.cargo/config.toml`), so
 from outside the workspace call the binary directly:
 `<repo>/target/release/glyph3d-native --load-repo .`
 
-**Inside `.claude/worktrees/<name>` the alias is broken** (measured 2026-10-08):
-cargo merges `.cargo/config.toml` from every ancestor directory and alias arrays
-concatenate, so the tool receives `run …` as its verb and launches the
-renderer. Use `cargo run --quiet --release -p glyph -- <verb>`, or
-`target/release/glyph <verb>` once built.
+**The alias works in nested worktrees too** (`.claude/worktrees/<name>`,
+since 2026-10-09). Cargo merges `.cargo/config.toml` from every ancestor
+directory and concatenates alias ARRAYS, so there the tool receives
+`run --quiet --release -p glyph --` before its verb; it strips every leading
+copy (`strip_doubled_alias`, pinned to the config by a test). Keep the alias
+an array: a string is not merged, but a checkout on one form and a worktree on
+the other make cargo refuse to load its config at all (measured).
 
 **Use it rather than the pieces.** Do not hand-run `cargo build`, the `tools/`
 scripts, or the binary's own check flags in place of a gate: the ordering
