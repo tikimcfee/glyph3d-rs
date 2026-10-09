@@ -539,6 +539,9 @@ fn layout_pass2_chunk<E: SlotEmit>(
                 let mut wrap_segment = 0i64;
                 let mut line_adv_f64 = line_adv;
                 let mut seg_adv_f32 = seg_adv;
+                // The last segment's advance before its reset: the newline's
+                // x when the line does not end on a wrap boundary.
+                let mut last_seg_adv = seg_adv_f32;
 
                 while seg_offset < line_len {
                     let seg_len = (line_len - seg_offset).min(seg_limit);
@@ -1197,6 +1200,7 @@ fn layout_pass2_chunk<E: SlotEmit>(
 
                     wrap_segment += 1;
                     seg_offset += seg_len;
+                    last_seg_adv = seg_adv_f32;
                     seg_adv_f32 = 0.0;
                 }
 
@@ -1207,6 +1211,60 @@ fn layout_pass2_chunk<E: SlotEmit>(
                 pos = line_end;
 
                 if pos < bytes.len() && bytes[pos] == b'\n' {
+                    // The newline's own record. PageExtent is measured over
+                    // EVERY record (layout.rs), and the newline occupies its
+                    // advance at column `col` on the row it closes: for a
+                    // non-empty line that is the last segment's row (already
+                    // folded into the page above, and still the cached frame),
+                    // for an empty line a row no glyph visited. Once per
+                    // line; the per-byte paths are untouched.
+                    if line_len == 0 {
+                        // wrap_segment_of / wrap_row_of at column 0 with a
+                        // terminator are both 0.
+                        let row = base_row;
+                        if row != last_row || last_wrap_seg != 0 || last_x_page != 0 {
+                            last_row = row;
+                            last_wrap_seg = 0;
+                            last_x_page = 0;
+                            if page_active {
+                                let (y_page, screen_row) =
+                                    if page_rows > 0 { (row / page_rows, row + scroll_rows) } else { (0, row) };
+                                let band = y_page / pages_wide;
+                                cached_page_x_off = (y_page % pages_wide) as f64 * page_stride_x;
+                                cached_py = (origin_y
+                                    - (screen_row - y_page * page_rows) as f64 * line_height
+                                    - band as f64 * band_stride_y) as f32;
+                                cached_pz = (origin_z - 0.0f64 * z_step
+                                    + band as f64 * depth_per_band
+                                    + 0.0f64 * depth_per_col) as f32;
+                            } else {
+                                cached_page_x_off = 0.0;
+                                cached_py = (-(row as f64) * line_height + origin_y) as f32;
+                                cached_pz = (-(0.0f64) * z_step + origin_z) as f32;
+                            }
+                            if cached_py < page_bottom {
+                                page_bottom = cached_py;
+                            }
+                            if cached_pz < page_z_min {
+                                page_z_min = cached_pz;
+                            }
+                            if cached_pz > page_z_max {
+                                page_z_max = cached_pz;
+                            }
+                        }
+                    }
+                    let nl_rel_x = if fold_unit > 0 {
+                        if line_len.is_multiple_of(fold_unit as usize) { 0.0 } else { last_seg_adv as f64 }
+                    } else {
+                        line_adv
+                    };
+                    let nl_x = (nl_rel_x + origin_x) as f32;
+                    let nl_x = if page_active { (nl_x as f64 + cached_page_x_off) as f32 } else { nl_x };
+                    let right = nl_x + trie.fast_byte_table[b'\n' as usize].advance;
+                    if right > page_right {
+                        page_right = right;
+                    }
+
                     record_idx += 1;
                     base_row += rows_for_line(col, wrap_w, p.wrap_mode);
                     col = 0;
