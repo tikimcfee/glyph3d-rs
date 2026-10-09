@@ -213,7 +213,7 @@ impl std::str::FromStr for RepoLayoutMode {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default, clap::ValueEnum)]
 #[value(rename_all = "lower")]
 pub enum ColorMode {
-    /// Eager CPU syntax coloring during load via colorize_leaders (default, preserves all goldens).
+    /// Eager CPU syntax coloring during load: `Paint::SyntaxHeuristic`, coloured line by line in Pass 2 (default; the golden repo views use it).
     #[default]
     Syntax,
     /// Fast geometric ingestion: uniform base color for glyphs, file-extension map for LOD backdrop tint.
