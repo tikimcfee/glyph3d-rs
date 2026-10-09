@@ -94,6 +94,7 @@ unsafe fn transcode_derived_sub_slices(
     }
 }
 
+#[cfg(target_os = "macos")]
 #[inline]
 fn upload_direct_metal(
     device: &wgpu::Device,
@@ -242,7 +243,14 @@ pub fn upload_derived_slots(
             }
 
             if direct_host_upload {
-                upload_direct_metal(device, &label, usage, &sub_slices, written, count as usize, item_params)
+                #[cfg(target_os = "macos")]
+                {
+                    upload_direct_metal(device, &label, usage, &sub_slices, written, count as usize, item_params)
+                }
+                #[cfg(not(target_os = "macos"))]
+                {
+                    upload_staged_discrete(device, queue, &label, usage, &sub_slices, written, count as usize, item_params)
+                }
             } else {
                 upload_staged_discrete(device, queue, &label, usage, &sub_slices, written, count as usize, item_params)
             }

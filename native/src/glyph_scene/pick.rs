@@ -43,10 +43,14 @@ pub struct PickContext {
 pub enum PickCommand {
     /// Group-level pick: first file whose rel path contains the substring.
     File(String),
+    /// Group-level pick: exact group ID.
+    Group(u32),
     /// Deterministic glyph pick: exact folded (row, col) within that file.
     RowCol { file: String, row: u32, col: u32 },
     /// Ray pick through a physical pixel of the current viewport.
     Pixel { x: f32, y: f32 },
+    /// Clear the active selection.
+    Clear,
 }
 
 /// A manipulation verb, applied to the current pick. Instance verbs need a
@@ -543,10 +547,27 @@ impl GlyphScene {
 
     /// Resolve a pick command, store it as the current pick, return the log line.
     pub(super) fn apply_pick(&mut self, _ctx: &GpuContext, cmd: &PickCommand) -> Option<String> {
+        if matches!(cmd, PickCommand::Clear) {
+            self.selection = None;
+            self.picked = None;
+            return Some("pick: cleared".to_string());
+        }
         if self.pick.is_none() {
             return Some("pick: this scene has no pick context (repo mode only)".to_string());
         }
         let hit = match cmd {
+            PickCommand::Clear => unreachable!(),
+            PickCommand::Group(gid) => {
+                let pctx = self.pick.as_ref().expect("pick context checked Some at apply_pick entry");
+                pctx.files
+                    .iter()
+                    .find(|i| i.group_id == *gid)
+                    .map(|i| PickHit {
+                        group_id: i.group_id,
+                        rel_path: i.rel_path.clone(),
+                        glyph: None,
+                    })
+            }
             PickCommand::File(f) => {
                 let pctx = self.pick.as_ref().expect("pick context checked Some at apply_pick entry");
                 pctx.files

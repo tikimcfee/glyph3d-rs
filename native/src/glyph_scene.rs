@@ -304,6 +304,19 @@ impl GlyphScene {
         self.group_trs(gid).is_some_and(|(_, _, _, a)| a <= 0.01)
     }
 
+    /// Group ID of the currently selected file or glyph, if any selection is active.
+    pub fn selected_group_id(&self) -> Option<u32> {
+        if self.selection.is_some() {
+            self.picked.as_ref().map(|p| p.group_id)
+        } else {
+            None
+        }
+    }
+
+    /// Whether any selection highlight (glyph or segment) is currently active.
+    pub fn selection_active(&self) -> bool {
+        self.selection.is_some()
+    }
 }
 
 impl SceneLike for GlyphScene {
@@ -378,6 +391,10 @@ impl SceneLike for GlyphScene {
 
     fn apply_verb(&mut self, ctx: &GpuContext, verb: &Verb) -> Option<String> {
         Some(GlyphScene::apply_verb(self, ctx, verb))
+    }
+
+    fn selected_group_id(&self) -> Option<u32> {
+        GlyphScene::selected_group_id(self)
     }
 
     fn apply_highlight_sidecar(&self, ctx: &GpuContext, path: &std::path::Path) -> Option<String> {

@@ -220,11 +220,10 @@ impl GlyphScene {
             binding_limit >> 20,
             groups.len(),
         );
-        // Stage L (L4): the selection mask only exists on the shader path —
-        // the copy path (offscreen, color_format == POOL_FORMAT) never
-        // renders selection visuals.
-        let mask_pipeline = (color_format != POOL_FORMAT)
-            .then(|| field.create_mask_pipeline(device, MASK_FORMAT, SCENE_SAMPLE_COUNT));
+        // Stage L (L4): create selection mask pipeline unconditionally so both
+        // windowed platforms (Metal Bgra8UnormSrgb and Linux/Vulkan Rgba8UnormSrgb)
+        // render selection visuals.
+        let mask_pipeline = Some(field.create_mask_pipeline(device, MASK_FORMAT, SCENE_SAMPLE_COUNT));
 
         // Camera fit from staged bounds (or the Stage E2 focus-file override).
         let (center, half_w, half_h) = match staged.focus_bounds {

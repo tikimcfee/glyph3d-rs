@@ -662,6 +662,7 @@ impl App<'_> {
                 if !state.grabbed {
                     let (x, y) = state.cursor;
                     state.scene.on_click(&self.ctx, x, y);
+                    state.window.request_redraw();
                 }
             }
             WindowEvent::CursorMoved { position, .. } => {

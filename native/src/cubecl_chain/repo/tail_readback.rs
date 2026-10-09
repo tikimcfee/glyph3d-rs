@@ -4,7 +4,9 @@ use cubecl::client::Client;
 use cubecl::server::Handle;
 use cubecl::wgpu::{AutoCompiler, WgpuServer};
 use crate::gpu::SharedDevice;
-use crate::layout::{InkExtent, ItemPlacement, PageExtent, TintMapped, TintStore};
+#[cfg(target_os = "macos")]
+use crate::layout::TintMapped;
+use crate::layout::{InkExtent, ItemPlacement, PageExtent, TintStore};
 use super::super::tail::{key_to_float_host, EXT_STRIDE};
 
 /// Fallback host-staged read of the tint stream via cubecl read_one.
@@ -22,6 +24,7 @@ pub(crate) fn read_tint_store_host(
 
 /// Zero-copy readback on Unified Memory Architectures (Apple Silicon Metal).
 /// Direct mapped storage in unified DRAM without staging buffer hops.
+#[cfg(target_os = "macos")]
 #[inline]
 pub(crate) fn read_tint_store_unified(
     client: &Client,
@@ -133,9 +136,11 @@ pub(crate) fn read_tint_store(
     if readback_host {
         return read_tint_store_host(client, h_instance_tints, total_slots);
     }
+    #[cfg(target_os = "macos")]
     if device.is_unified() && device.host_visible_storage {
-        read_tint_store_unified(client, device, h_instance_tints, total_slots)
-    } else if device.is_discrete() {
+        return read_tint_store_unified(client, device, h_instance_tints, total_slots);
+    }
+    if device.is_discrete() {
         read_tint_store_discrete(client, device, h_instance_tints, total_slots)
     } else {
         read_tint_store_host(client, h_instance_tints, total_slots)
@@ -148,6 +153,7 @@ pub(crate) fn read_tint_store(
 /// MAP_WRITE-only), so host reads of the GPU-written bytes stay cached.
 /// The mapping lives as long as the buffer (Metal's unmap is a no-op) —
 /// the same lifecycle as the mapped arena's chunks.
+#[cfg(target_os = "macos")]
 pub(crate) fn mapped_read_buffer(device: &wgpu::Device, bytes: u64, label: &str) -> (wgpu::Buffer, *const u32) {
     use wgpu::hal::Device as HalDevice;
     let hal_dev = unsafe { device.as_hal::<wgpu::hal::api::Metal>() }
@@ -182,7 +188,7 @@ pub(crate) fn mapped_read_buffer(device: &wgpu::Device, bytes: u64, label: &str)
 /// Decodes item placements from GPU extent lanes in key space.
 pub(crate) fn decode_placements(
     client: &Client,
-    device: &SharedDevice,
+    _device: &SharedDevice,
     h_item_extents: Handle,
     item_count: usize,
     slot_base: &[u32],
@@ -191,7 +197,8 @@ pub(crate) fn decode_placements(
 ) -> Vec<ItemPlacement> {
     let _sp_placements = tracing::info_span!("tail.placements").entered();
     let _ = client.flush();
-    let extent_bytes_opt = if device.is_unified() && device.host_visible_storage {
+    #[cfg(target_os = "macos")]
+    let extent_bytes_opt = if _device.is_unified() && _device.host_visible_storage {
         let res = client
             .get_resource::<WgpuServer<AutoCompiler>>(h_item_extents.clone())
             .ok();
@@ -201,15 +208,15 @@ pub(crate) fn decode_placements(
                 (r.buffer.clone(), r.offset)
             };
             let bytes = (item_count * EXT_STRIDE * 4) as u64;
-            let (buf, ptr) = mapped_read_buffer(&device.device, bytes.max(4), "item extents");
-            let mut enc = device
+            let (buf, ptr) = mapped_read_buffer(&_device.device, bytes.max(4), "item extents");
+            let mut enc = _device
                 .device
                 .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                     label: Some("item extents copy"),
                 });
             enc.copy_buffer_to_buffer(&src, src_off, &buf, 0, bytes.max(4));
-            device.queue.submit([enc.finish()]);
-            device
+            _device.queue.submit([enc.finish()]);
+            _device
                 .device
                 .poll(wgpu::PollType::Wait {
                     submission_index: None,
@@ -224,6 +231,9 @@ pub(crate) fn decode_placements(
     } else {
         None
     };
+
+    #[cfg(not(target_os = "macos"))]
+    let extent_bytes_opt: Option<(Vec<u32>, wgpu::Buffer)> = None;
 
     let extent_values_storage;
     let extent_values: &[u32] = if let Some((ref v, _)) = extent_bytes_opt {

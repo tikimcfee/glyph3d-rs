@@ -69,6 +69,10 @@ pub trait SceneLike {
     fn apply_verb(&mut self, _ctx: &GpuContext, _verb: &crate::glyph_scene::Verb) -> Option<String> {
         None
     }
+    /// Returns the group ID of the currently selected file or glyph, if any selection is active.
+    fn selected_group_id(&self) -> Option<u32> {
+        None
+    }
     /// S3 spike (`experiments/zedspike`): apply a Zed-pipeline highlight
     /// sidecar to per-glyph instance colors (`--highlight`, repo scenes
     /// only); returns a log line. Default: scene doesn't support it.

@@ -461,6 +461,7 @@ impl WindowState {
             let scratch = &mut egui.scratch;
             let filter = &mut egui.filter;
             let selected_group = &mut egui.selected_group;
+            *selected_group = self.scene.selected_group_id();
             let session_browser_open = &mut egui.session_browser_open;
             let session_filter_text = &mut egui.session_filter_text;
             let session_filter_harness = &mut egui.session_filter_harness;
@@ -871,7 +872,20 @@ impl WindowState {
                                                     label,
                                                 );
                                                 if resp.clicked() {
-                                                    *selected_group = Some(row.group_id);
+                                                    if *selected_group == Some(row.group_id) {
+                                                        *selected_group = None;
+                                                        self.scene.apply_pick(
+                                                            ctx,
+                                                            &crate::glyph_scene::PickCommand::Clear,
+                                                        );
+                                                    } else {
+                                                        *selected_group = Some(row.group_id);
+                                                        self.scene.apply_pick(
+                                                            ctx,
+                                                            &crate::glyph_scene::PickCommand::Group(
+                                                                row.group_id,
+                                                            ),
+                                                        );
                                                     // Front-camera framing
                                                     // (camera_eye_target):
                                                     // fit the AABB, margin
@@ -892,6 +906,7 @@ impl WindowState {
                                                         0.0,
                                                         0.0,
                                                     );
+                                                    }
                                                 }
                                             });
                                         }
