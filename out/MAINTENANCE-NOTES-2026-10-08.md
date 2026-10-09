@@ -39,7 +39,7 @@ machines and clones, **M** machine-specific values, **R** runner.
 | C7 | 239 stage-letter comments | won't do | archaeology; reword only when touching |
 | C8 | `clippy --all-targets`: 14 test-only lints + deny-level `reversed_empty_ranges` (seam.rs test) | open | sweep; gate runs without `--all-targets` |
 | C9 | `discovery.rs` names a Claude project by the slug's last `-` segment (`…-glyph3d-js` → `js`) | open | small fix |
-| C10 | CubeCL fence FAILS on this host; `--repo-engine cubecl` renders differently from hyper | open | discuss: Mac run, or bisect from 5e94de8 |
+| C10 | CubeCL fence FAILS on BOTH machines, identical numbers; `--repo-engine cubecl` renders differ from hyper | open | bisecting on the M2 from 5e94de8 |
 | C11 | Mutation `find` strings also match their own entry in build.toml; correct only because the target comes first | open | small: anchor them, or have the prover refuse an ambiguous find |
 | P1 | pixel-ab red on both platforms since 10-07; Linux set a month stale, 2 views never adopted | Ivan's call | Mac re-baseline first, then Linux re-adoption |
 | X1 | Experiments' Zed symlink scheme never built against real Zed | next up | needs a Zed checkout or the Mac; fieldzed's dylib build.rs deleted in 6a0b669 |
@@ -73,6 +73,8 @@ None pushed or merged to main; that is Ivan's call.
 | 6954a9d | pixi: mojo/max toolchain dropped, lock re-solved (fontTools env only) |
 | 6a0b669 | experiments: fieldzed build.rs (asserted the engine dylib) deleted |
 | 7a99b5a | Mojo/FFI removed from native comments, help text, native/AGENTS.md; `--fixture-manifest` deleted |
+| 228ff6d | board after the retired-engine series |
+| 6f6f004 | merge main (large-dataset fixes); floor 237; renders byte-identical to main@164af5c |
 
 Main's build fix (872621d, the other agent's) was fast-forwarded in first.
 
@@ -227,11 +229,13 @@ the flag and its `cli/command.rs` arm.
   287 has `gi 5264 vs 17` and the chain's x equals the CPU's x one advance on.
 - `--repo-engine cubecl` vs `hyper`, same camera: `g-pick-repo` 65 px differ;
   the fork corpus 295,357 px. Visible on screen.
-- Not attributed. The gate that fenced this was retired 2026-09-30 and CubeCL
-  has had heavy work since, so a regression is plausible; so is a
-  Vulkan-specific behaviour (the fork check's own notes say Metal discards
-  some phantom-class writes). The Mac run settles which; bisecting from
-  5e94de8 on this box settles when.
+- Same on the M2 at main@164af5c (Metal, run 2026-10-09 via `rx`): chain
+  `cluster-flags` 9 record mismatches, fork 708,529 lane words / 314,405
+  slots, hyper vs cubecl renders differ on both repos. Identical numbers to
+  Linux, so NOT a Vulkan or discrete-GPU effect: a deterministic,
+  cross-platform divergence in the code. Also unchanged by merging main's
+  large-dataset fixes (6f6f004).
+- Next: bisect on the M2 from 5e94de8 (gate retired) to main@164af5c.
 
 ### P1. Pixel baselines — [measured]
 
@@ -273,6 +277,16 @@ pixel-ab here: 7 of 9 views diverge from `vulkan-nvidia`, 2 have no set.
 - Byte-comparing renders against main: build main with `git archive` into the
   scratchpad, render the nine views from `native/` with `--screenshot`, `cmp`
   against `out/tooling-ab/sweep/`.
+
+### Remote runs on the M2
+
+`rx.sh` (session scratchpad, `rx/`): uploads a job script and runs it on
+`airlugo` over ssh, either synchronously (`run`) or in tmux
+`remote-rs-space:claude` (`job`, then `wait`). Everything remote lives under
+`~/localdev/claude-remote/` on the Mac; work happens in a scratch clone there
+(`glyph3d-rs/`, cloned from Ivan's checkout, which is never written), fed by
+`rx.sh push <rev> <branch>`. Jobs must be bash 3.2-safe. The runner sets the
+Homebrew PATH, which a non-login ssh shell lacks.
 
 ### Checked and fine
 
