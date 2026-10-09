@@ -346,7 +346,10 @@ pub struct RawOps {
 }
 
 
-pub fn parse_cli_from(matches: clap::ArgMatches) -> Cli {
+/// Build the `Cli` from clap matches, merging the launch config underneath the
+/// command line. An unreadable or invalid launch config is an `Err` — an
+/// explicit `--launch-config` that does not load is a mistake, not a default.
+pub fn parse_cli_from(matches: clap::ArgMatches) -> Result<Cli, String> {
     let mut cli = Cli::from_arg_matches(&matches).expect("clap derive round-trip");
     cli.ops = build_ops(&matches, &cli.raw_ops);
 
@@ -361,157 +364,151 @@ pub fn parse_cli_from(matches: clap::ArgMatches) -> Cli {
     };
 
     if let Some(path) = config_path {
-        match crate::launch_config::LaunchConfig::from_file(&path) {
-            Ok(cfg) => {
-                if matches.value_source("file_backgrounds")
-                    != Some(clap::parser::ValueSource::CommandLine)
-                {
-                    if let Some(fb) = cfg.file_backgrounds {
-                        cli.file_backgrounds = fb;
-                    }
-                }
-                if matches.value_source("file_bg_color")
-                    != Some(clap::parser::ValueSource::CommandLine)
-                {
-                    if let Some(col) = cfg.file_bg_color {
-                        cli.file_bg_color = Some(col);
-                    }
-                }
-                if matches.value_source("lod_min_px")
-                    != Some(clap::parser::ValueSource::CommandLine)
-                {
-                    if let Some(lod) = cfg.lod_min_px {
-                        cli.lod_min_px = Some(lod);
-                    }
-                }
-                if matches.value_source("wrap_mode")
-                    != Some(clap::parser::ValueSource::CommandLine)
-                {
-                    if let Some(wm) = &cfg.wrap_mode {
-                        if let Ok(parsed) = wm.parse::<crate::fold::WrapMode>() {
-                            cli.wrap_mode = parsed;
-                        } else {
-                            log::warn!("unknown wrap_mode in launch config: '{wm}'");
-                        }
-                    }
-                }
-                if matches.value_source("z_wrap_spacing")
-                    != Some(clap::parser::ValueSource::CommandLine)
-                {
-                    if let Some(zw) = cfg.z_wrap_spacing {
-                        cli.z_wrap_spacing = zw;
-                    }
-                }
-                if matches.value_source("cluster_mode")
-                    != Some(clap::parser::ValueSource::CommandLine)
-                {
-                    if let Some(cm) = &cfg.cluster_mode {
-                        if let Ok(parsed) = cm.parse::<crate::fold::ClusterMode>() {
-                            cli.cluster_mode = parsed;
-                        } else {
-                            log::warn!("unknown cluster_mode in launch config: '{cm}'");
-                        }
-                    }
-                }
-                if matches.value_source("color_mode")
-                    != Some(clap::parser::ValueSource::CommandLine)
-                {
-                    if let Some(cm) = &cfg.color_mode {
-                        if let Ok(parsed) = cm.parse::<crate::repo::ColorMode>() {
-                            cli.color_mode = parsed;
-                        } else {
-                            log::warn!("unknown color_mode in launch config: '{cm}'");
-                        }
-                    }
-                }
-                if matches.value_source("no_cull")
-                    != Some(clap::parser::ValueSource::CommandLine)
-                {
-                    if let Some(nc) = cfg.no_cull {
-                        cli.no_cull = nc;
-                    }
-                }
-                if matches.value_source("no_ui")
-                    != Some(clap::parser::ValueSource::CommandLine)
-                {
-                    if let Some(nu) = cfg.no_ui {
-                        cli.no_ui = nu;
-                    }
-                }
-                if matches.value_source("no_greeking")
-                    != Some(clap::parser::ValueSource::CommandLine)
-                {
-                    if let Some(greek) = cfg.greeking {
-                        cli.no_greeking = !greek;
-                    }
-                }
-                if matches.value_source("greek_pure")
-                    != Some(clap::parser::ValueSource::CommandLine)
-                {
-                    if let Some(pure) = cfg.greek_pure {
-                        cli.greek_pure = pure;
-                    }
-                }
-                if matches.value_source("greek_smooth")
-                    != Some(clap::parser::ValueSource::CommandLine)
-                {
-                    if let Some(smooth) = cfg.greek_smooth {
-                        cli.greek_smooth = smooth;
-                    }
-                }
-                if matches.value_source("greek_onset_px")
-                    != Some(clap::parser::ValueSource::CommandLine)
-                {
-                    if let Some(onset) = cfg.greek_onset_px {
-                        cli.greek_onset_px = Some(onset);
-                    }
-                }
-                if matches.value_source("load_repo")
-                    != Some(clap::parser::ValueSource::CommandLine)
-                {
-                    if let Some(lr) = cfg.load_repo {
-                        cli.load_repo = Some(lr);
-                    }
-                }
-                if matches.value_source("repo_engine")
-                    != Some(clap::parser::ValueSource::CommandLine)
-                {
-                    if let Some(re) = &cfg.repo_engine {
-                        if let Ok(parsed) = re.parse::<crate::repo::Strategy>() {
-                            cli.repo_engine = parsed;
-                        } else {
-                            log::warn!("unknown repo_engine in launch config: '{re}'");
-                        }
-                    }
-                }
-                if matches.value_source("field_mode")
-                    != Some(clap::parser::ValueSource::CommandLine)
-                {
-                    if let Some(fm) = &cfg.field_mode {
-                        if let Ok(parsed) = fm.parse::<glyph_field::GlyphFieldMode>() {
-                            cli.field_mode = parsed;
-                        } else {
-                            log::warn!("unknown field_mode in launch config: '{fm}'");
-                        }
-                    }
-                }
-                if matches.value_source("agent_session")
-                    != Some(clap::parser::ValueSource::CommandLine)
-                {
-                    if let Some(session) = cfg.agent_session {
-                        cli.agent_session = Some(session);
-                    }
-                }
-                if matches.value_source("frames")
-                    != Some(clap::parser::ValueSource::CommandLine)
-                {
-                    if let Some(f) = cfg.frames {
-                        cli.frames = Some(f);
-                    }
+        let cfg = crate::launch_config::LaunchConfig::from_file(&path)?;
+        if matches.value_source("file_backgrounds")
+            != Some(clap::parser::ValueSource::CommandLine)
+        {
+            if let Some(fb) = cfg.file_backgrounds {
+                cli.file_backgrounds = fb;
+            }
+        }
+        if matches.value_source("file_bg_color")
+            != Some(clap::parser::ValueSource::CommandLine)
+        {
+            if let Some(col) = cfg.file_bg_color {
+                cli.file_bg_color = Some(col);
+            }
+        }
+        if matches.value_source("lod_min_px")
+            != Some(clap::parser::ValueSource::CommandLine)
+        {
+            if let Some(lod) = cfg.lod_min_px {
+                cli.lod_min_px = Some(lod);
+            }
+        }
+        if matches.value_source("wrap_mode")
+            != Some(clap::parser::ValueSource::CommandLine)
+        {
+            if let Some(wm) = &cfg.wrap_mode {
+                if let Ok(parsed) = wm.parse::<crate::fold::WrapMode>() {
+                    cli.wrap_mode = parsed;
+                } else {
+                    log::warn!("unknown wrap_mode in launch config: '{wm}'");
                 }
             }
-            Err(e) => {
-                log::warn!("{e}");
+        }
+        if matches.value_source("z_wrap_spacing")
+            != Some(clap::parser::ValueSource::CommandLine)
+        {
+            if let Some(zw) = cfg.z_wrap_spacing {
+                cli.z_wrap_spacing = zw;
+            }
+        }
+        if matches.value_source("cluster_mode")
+            != Some(clap::parser::ValueSource::CommandLine)
+        {
+            if let Some(cm) = &cfg.cluster_mode {
+                if let Ok(parsed) = cm.parse::<crate::fold::ClusterMode>() {
+                    cli.cluster_mode = parsed;
+                } else {
+                    log::warn!("unknown cluster_mode in launch config: '{cm}'");
+                }
+            }
+        }
+        if matches.value_source("color_mode")
+            != Some(clap::parser::ValueSource::CommandLine)
+        {
+            if let Some(cm) = &cfg.color_mode {
+                if let Ok(parsed) = cm.parse::<crate::repo::ColorMode>() {
+                    cli.color_mode = parsed;
+                } else {
+                    log::warn!("unknown color_mode in launch config: '{cm}'");
+                }
+            }
+        }
+        if matches.value_source("no_cull")
+            != Some(clap::parser::ValueSource::CommandLine)
+        {
+            if let Some(nc) = cfg.no_cull {
+                cli.no_cull = nc;
+            }
+        }
+        if matches.value_source("no_ui")
+            != Some(clap::parser::ValueSource::CommandLine)
+        {
+            if let Some(nu) = cfg.no_ui {
+                cli.no_ui = nu;
+            }
+        }
+        if matches.value_source("no_greeking")
+            != Some(clap::parser::ValueSource::CommandLine)
+        {
+            if let Some(greek) = cfg.greeking {
+                cli.no_greeking = !greek;
+            }
+        }
+        if matches.value_source("greek_pure")
+            != Some(clap::parser::ValueSource::CommandLine)
+        {
+            if let Some(pure) = cfg.greek_pure {
+                cli.greek_pure = pure;
+            }
+        }
+        if matches.value_source("greek_smooth")
+            != Some(clap::parser::ValueSource::CommandLine)
+        {
+            if let Some(smooth) = cfg.greek_smooth {
+                cli.greek_smooth = smooth;
+            }
+        }
+        if matches.value_source("greek_onset_px")
+            != Some(clap::parser::ValueSource::CommandLine)
+        {
+            if let Some(onset) = cfg.greek_onset_px {
+                cli.greek_onset_px = Some(onset);
+            }
+        }
+        if matches.value_source("load_repo")
+            != Some(clap::parser::ValueSource::CommandLine)
+        {
+            if let Some(lr) = cfg.load_repo {
+                cli.load_repo = Some(lr);
+            }
+        }
+        if matches.value_source("repo_engine")
+            != Some(clap::parser::ValueSource::CommandLine)
+        {
+            if let Some(re) = &cfg.repo_engine {
+                if let Ok(parsed) = re.parse::<crate::repo::Strategy>() {
+                    cli.repo_engine = parsed;
+                } else {
+                    log::warn!("unknown repo_engine in launch config: '{re}'");
+                }
+            }
+        }
+        if matches.value_source("field_mode")
+            != Some(clap::parser::ValueSource::CommandLine)
+        {
+            if let Some(fm) = &cfg.field_mode {
+                if let Ok(parsed) = fm.parse::<glyph_field::GlyphFieldMode>() {
+                    cli.field_mode = parsed;
+                } else {
+                    log::warn!("unknown field_mode in launch config: '{fm}'");
+                }
+            }
+        }
+        if matches.value_source("agent_session")
+            != Some(clap::parser::ValueSource::CommandLine)
+        {
+            if let Some(session) = cfg.agent_session {
+                cli.agent_session = Some(session);
+            }
+        }
+        if matches.value_source("frames")
+            != Some(clap::parser::ValueSource::CommandLine)
+        {
+            if let Some(f) = cfg.frames {
+                cli.frames = Some(f);
             }
         }
     }
@@ -520,12 +517,15 @@ pub fn parse_cli_from(matches: clap::ArgMatches) -> Cli {
         cli.agent_session = Some(crate::launch_config::expand_home(session));
     }
 
-    cli
+    Ok(cli)
 }
 
 
 pub fn parse_cli() -> Cli {
-    parse_cli_from(Cli::command().get_matches())
+    parse_cli_from(Cli::command().get_matches()).unwrap_or_else(|e| {
+        eprintln!("error: {e}");
+        std::process::exit(1);
+    })
 }
 
 pub fn default_text_file() -> PathBuf {

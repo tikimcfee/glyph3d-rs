@@ -56,6 +56,9 @@ bevy_ecs = { version = "0.20.0-rc.2", default-features = false, features = ["std
 bevy_transform = { version = "0.20.0-rc.2", default-features = false, features = ["std", "bevy-support"] }
 serde = { version = "1", features = ["derive", "rc"] }
 serde_json = "1"
+# Config files (launch_config.toml). Already resolved in the lockfile through
+# cubecl-environment (toml 1.1.6) — a version-unified add, no new resolution.
+toml = "1.1"
 # The load path's tracing substrate (note 22): spans over the chain, its
 # tail, and the repo load, so measurements stop being ad-hoc Instant
 # pairs. Both crates are already resolved in the lockfile through wgpu
