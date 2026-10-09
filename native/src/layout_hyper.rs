@@ -647,6 +647,12 @@ fn continued_segment_advance(
     }
     let last_reset = c_end - c_end % fold_unit;
     let (tail, mut seg) = if last_reset > c0 { (c_end - last_reset, 0.0f32) } else { (c_end - c0, seg_in) };
+    if tail == 0 {
+        // A chunk with no leader carries its seed through unchanged. Not
+        // reachable from the cut rule (a chunk after a cut starts at an
+        // ASCII leader), but the walk below must never index past the end.
+        return seg;
+    }
     let mut tail_start = bytes.len();
     let mut found = 0i64;
     while found < tail {
