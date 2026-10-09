@@ -2,6 +2,9 @@
 //!
 //! Replicates the 2-pass pairing and response merging behavior of `glyph3d-core`'s
 //! `sessionAdapter.js` (`parseClaudeSession`), mapping events into structured `AgentTurn`s.
+//! Like the JS event stream, every block is recorded at its own position (line
+//! order, block order within a line — one API message spans several lines, one
+//! block each), so a turn linearizes in the order things happened.
 
 use std::collections::HashMap;
 use serde_json::Value;
@@ -242,6 +245,58 @@ pub fn extract_file_action(
     })
 }
 
+/// The prompt a `user` record carries, if it is one the user actually typed.
+///
+/// Typed prompts are stored with `message.content` as a plain STRING (an array
+/// holds text blocks for pasted content, and tool_result blocks for the
+/// tool-result records, which carry no text). Not prompts, by the conventions
+/// claude-code-log and simonw/claude-code-transcripts share and the local
+/// transcripts confirm: `isMeta` records (local-command caveats, image notes,
+/// system reminders), `isCompactSummary` records, the echo of locally run
+/// commands (`<local-command-stdout>`, `<bash-input>`, `<bash-stdout>`, …),
+/// and `[Request interrupted by user]`. A slash command (`<command-name>`) IS
+/// one — it can start agent work — and reads as what was typed: `/name args`.
+pub fn user_prompt_text(obj: &Value) -> Option<String> {
+    let flag = |k: &str| obj.get(k).and_then(|v| v.as_bool()) == Some(true);
+    if flag("isMeta") || flag("isCompactSummary") {
+        return None;
+    }
+    let content = obj.get("message")?.get("content")?;
+    let text = match content {
+        Value::String(s) => s.clone(),
+        Value::Array(blocks) => blocks
+            .iter()
+            .filter(|b| b.get("type").and_then(|t| t.as_str()) == Some("text"))
+            .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => return None,
+    };
+    let text = text.trim();
+    if text.is_empty() || text.starts_with("[Request interrupted") {
+        return None;
+    }
+    if text.starts_with("<command-name>") {
+        let tag = |name: &str| {
+            let open = format!("<{name}>");
+            let close = format!("</{name}>");
+            let start = text.find(&open)? + open.len();
+            let end = text[start..].find(&close)? + start;
+            Some(text[start..end].trim())
+        };
+        let name = tag("command-name")?;
+        let slash = if name.starts_with('/') { "" } else { "/" };
+        return Some(match tag("command-args").filter(|a| !a.is_empty()) {
+            Some(args) => format!("{slash}{name} {args}"),
+            None => format!("{slash}{name}"),
+        });
+    }
+    if text.starts_with('<') {
+        return None;
+    }
+    Some(text.to_string())
+}
+
 /// Parse Claude Code session JSONL text into an `AgentSession` with ordered `AgentTurn`s.
 pub fn parse_claude_session(text: &str, fallback_session_id: &str) -> AgentSession {
     let mut parsed: Vec<Value> = Vec::new();
@@ -336,11 +391,15 @@ pub fn parse_claude_session(text: &str, fallback_session_id: &str) -> AgentSessi
             }
         }
 
-        let content = obj
+        if obj.get("message").and_then(|m| m.get("content")).is_none() {
+            continue;
+        }
+        let empty = Vec::new();
+        let blocks = obj
             .get("message")
             .and_then(|m| m.get("content"))
-            .and_then(|c| c.as_array());
-        let Some(blocks) = content else { continue };
+            .and_then(|c| c.as_array())
+            .unwrap_or(&empty);
 
         let role = obj
             .get("message")
@@ -366,27 +425,27 @@ pub fn parse_claude_session(text: &str, fallback_session_id: &str) -> AgentSessi
             }
         }
 
+        if role == "user" {
+            if let Some(prompt) = user_prompt_text(obj) {
+                // A typed prompt begins a new turn.
+                if has_emitted_in_turn {
+                    session.turns.push(current_turn);
+                    current_turn = AgentTurn::new(session.turns.len());
+                }
+                current_turn.prompt = Some(prompt);
+                current_turn.timestamp = ts;
+                has_emitted_in_turn = true;
+            }
+        }
+
         for b in blocks {
             let b_type = b.get("type").and_then(|t| t.as_str()).unwrap_or("");
 
-            if role == "user" && b_type == "text" {
-                let text = b.get("text").and_then(|t| t.as_str()).unwrap_or("");
-                let trimmed = text.trim();
-                if !trimmed.is_empty() {
-                    // New user prompt begins a new turn
-                    if has_emitted_in_turn {
-                        session.turns.push(current_turn);
-                        current_turn = AgentTurn::new(session.turns.len());
-                    }
-                    current_turn.prompt = Some(trimmed.to_string());
-                    current_turn.timestamp = ts;
-                    has_emitted_in_turn = true;
-                }
-            } else if assistant && b_type == "thinking" {
+            if assistant && b_type == "thinking" {
                 if let Some(think) = b.get("thinking").and_then(|t| t.as_str()) {
                     let trimmed = think.trim();
                     if !trimmed.is_empty() {
-                        current_turn.thinking.push(trimmed.to_string());
+                        current_turn.push_thinking(trimmed.to_string());
                         if current_turn.timestamp.is_none() {
                             current_turn.timestamp = ts;
                         }
@@ -397,7 +456,7 @@ pub fn parse_claude_session(text: &str, fallback_session_id: &str) -> AgentSessi
                 if let Some(txt) = b.get("text").and_then(|t| t.as_str()) {
                     let trimmed = txt.trim();
                     if !trimmed.is_empty() {
-                        current_turn.assistant_messages.push(trimmed.to_string());
+                        current_turn.push_message(trimmed.to_string());
                         if current_turn.timestamp.is_none() {
                             current_turn.timestamp = ts;
                         }
@@ -419,7 +478,7 @@ pub fn parse_claude_session(text: &str, fallback_session_id: &str) -> AgentSessi
                     current_turn.file_actions.push(fa);
                 }
 
-                current_turn.tool_calls.push(ToolCallRecord {
+                current_turn.push_tool(ToolCallRecord {
                     id,
                     name,
                     input,

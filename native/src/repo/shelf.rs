@@ -3,22 +3,12 @@
 use crate::glyph_scene::GroupRow;
 use super::{FileView, RepoParams};
 
-/// Subtle per-directory tints (multiplied with the syntax colors through the
-/// group color, colorBlend 0). Bright pastels — the hue shift groups a
-/// directory's pages without drowning the syntax palette. Stage G's
-/// `tint-cycle` verb walks this same palette.
-pub const DIR_TINTS: &[[f32; 3]] = &[
-    [1.00, 1.00, 1.00],
-    [1.00, 0.93, 0.87],
-    [0.88, 1.00, 0.92],
-    [0.88, 0.95, 1.00],
-    [1.00, 0.91, 1.00],
-    [0.95, 1.00, 0.88],
-    [1.00, 0.97, 0.86],
-    [0.92, 0.92, 1.00],
-    [0.90, 1.00, 1.00],
-    [1.00, 0.88, 0.88],
-];
+/// Per-directory tints (multiplied with the syntax colors through the group
+/// color, colorBlend 0): `[repo] dir_tints`. Stage G's `tint-cycle` verb
+/// walks this same palette. Never empty (`config` refuses that).
+pub fn dir_tints() -> &'static [[f32; 3]] {
+    &crate::config::settings().repo.dir_tints
+}
 
 pub(crate) fn dir_tint(dir: &str) -> [f32; 3] {
     // FNV-1a 32-bit over the directory path.
@@ -27,30 +17,24 @@ pub(crate) fn dir_tint(dir: &str) -> [f32; 3] {
         h ^= *b as u32;
         h = h.wrapping_mul(0x0100_0193);
     }
-    DIR_TINTS[(h as usize) % DIR_TINTS.len()]
+    let tints = dir_tints();
+    tints[(h as usize) % tints.len()]
 }
 
-/// O(1) file-extension LOD backdrop tint map (in linear sRGB space).
+/// File-extension LOD backdrop tint (in linear sRGB space):
+/// `[[repo.extension_tints]]`, first entry listing the extension wins, else
+/// `[repo] extension_tint_fallback`. Per file, not per glyph — a linear scan
+/// of a dozen entries.
 pub fn extension_tint(path: &str) -> [f32; 3] {
     let ext = std::path::Path::new(path)
         .extension()
         .and_then(|s| s.to_str())
         .unwrap_or("");
-    match ext {
-        "rs" => [0.85, 0.40, 0.20],                   // Rust orange
-        "js" | "mjs" | "cjs" => [0.95, 0.85, 0.20],   // JavaScript yellow
-        "ts" | "tsx" => [0.20, 0.50, 0.85],           // TypeScript blue
-        "json" => [0.90, 0.75, 0.30],                 // JSON amber
-        "md" | "markdown" => [0.40, 0.60, 0.80],      // Markdown steel blue
-        "toml" | "yaml" | "yml" => [0.70, 0.40, 0.60],// Config purple
-        "py" => [0.25, 0.65, 0.55],                   // Python teal
-        "c" | "h" | "cpp" | "hpp" | "cc" => [0.35, 0.55, 0.85], // C/C++ navy blue
-        "go" => [0.20, 0.70, 0.85],                   // Go cyan
-        "sh" | "bash" | "zsh" => [0.45, 0.75, 0.45],  // Shell green
-        "html" | "htm" => [0.90, 0.45, 0.25],         // HTML orange-red
-        "css" | "scss" | "less" => [0.30, 0.55, 0.90],// CSS blue
-        _ => [0.75, 0.75, 0.75],                      // Neutral grey
-    }
+    let repo = &crate::config::settings().repo;
+    repo.extension_tints
+        .iter()
+        .find(|e| e.extensions.iter().any(|x| x == ext))
+        .map_or(repo.extension_tint_fallback, |e| e.tint)
 }
 
 /// Packed SHELF layout, classed by height: files are stably partitioned into

@@ -3,6 +3,9 @@
 .pixi/*
 !.pixi/config.toml
 
+# Personal launch config (copy launch_config.example.toml)
+/launch_config.toml
+
 # Rust build artifacts
 target/
 

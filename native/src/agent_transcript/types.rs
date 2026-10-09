@@ -106,82 +106,128 @@ impl AgentSession {
                 event_idx += 1;
             }
 
-            // 2. Thinking Blocks (each is an atomic event)
-            for thought in &turn.thinking {
-                events.push(TranscriptEvent {
-                    index: event_idx,
-                    turn_index: turn.turn_index,
-                    kind: TranscriptEventKind::Thinking {
-                        thought: thought.clone(),
-                    },
-                    timestamp: turn.timestamp,
-                });
-                event_idx += 1;
-            }
-
-            // 3. Tool Calls (each is an atomic event)
+            // 2. Thinking, tool calls and assistant text, in the order they
+            // happened (transcript line order, block order within a line), the
+            // way the JS adapter's one event stream has always run. Turns built
+            // without recorded steps keep the old grouped order.
             let mut matched_file_actions = std::collections::HashSet::new();
-            for tool in &turn.tool_calls {
-                // Match with FileActionRecord if tool_id aligns
-                let fa_opt = turn.file_actions.iter().find(|fa| fa.tool_id == tool.id);
-                if let Some(fa) = fa_opt {
-                    matched_file_actions.insert(fa.tool_id.clone());
-                    match fa.action {
-                        FileActionKind::Edit => {
-                            let post_edit = revision_engine
-                                .and_then(|re| re.history(&fa.file_path))
-                                .and_then(|h| h.revision_for_event(event_idx).or_else(|| h.revision_for_turn(turn.turn_index)))
-                                .map(|r| r.text.as_ref().clone())
-                                .or_else(|| fa.new_content.clone());
-                            events.push(TranscriptEvent {
-                                index: event_idx,
-                                turn_index: turn.turn_index,
-                                kind: TranscriptEventKind::FileEdit {
-                                    file_path: fa.file_path.clone(),
-                                    action_record: fa.clone(),
-                                    post_edit_content: post_edit,
-                                },
-                                timestamp: tool.timestamp.or(turn.timestamp),
-                            });
-                            event_idx += 1;
-                        }
-                        FileActionKind::Read => {
-                            let content = fa
-                                .new_content
-                                .clone()
-                                .or_else(|| {
-                                    revision_engine
+            for step in turn.ordered_steps() {
+                match step {
+                    TurnStep::Thinking(i) => {
+                        events.push(TranscriptEvent {
+                            index: event_idx,
+                            turn_index: turn.turn_index,
+                            kind: TranscriptEventKind::Thinking {
+                                thought: turn.thinking[i].clone(),
+                            },
+                            timestamp: turn.timestamp,
+                        });
+                        event_idx += 1;
+                    }
+                    TurnStep::Message(i) => {
+                        events.push(TranscriptEvent {
+                            index: event_idx,
+                            turn_index: turn.turn_index,
+                            kind: TranscriptEventKind::AssistantResponse {
+                                message: turn.assistant_messages[i].clone(),
+                            },
+                            timestamp: turn.timestamp,
+                        });
+                        event_idx += 1;
+                    }
+                    TurnStep::Tool(i) => {
+                        let tool = &turn.tool_calls[i];
+                        // Match with FileActionRecord if tool_id aligns
+                        let fa_opt = turn.file_actions.iter().find(|fa| fa.tool_id == tool.id);
+                        if let Some(fa) = fa_opt {
+                            matched_file_actions.insert(fa.tool_id.clone());
+                            match fa.action {
+                                FileActionKind::Edit => {
+                                    let post_edit = revision_engine
                                         .and_then(|re| re.history(&fa.file_path))
-                                        .and_then(|h| h.get(0))
+                                        .and_then(|h| h.revision_for_event(event_idx).or_else(|| h.revision_for_turn(turn.turn_index)))
                                         .map(|r| r.text.as_ref().clone())
-                                });
+                                        .or_else(|| fa.new_content.clone());
+                                    events.push(TranscriptEvent {
+                                        index: event_idx,
+                                        turn_index: turn.turn_index,
+                                        kind: TranscriptEventKind::FileEdit {
+                                            file_path: fa.file_path.clone(),
+                                            action_record: fa.clone(),
+                                            post_edit_content: post_edit,
+                                        },
+                                        timestamp: tool.timestamp.or(turn.timestamp),
+                                    });
+                                    event_idx += 1;
+                                }
+                                FileActionKind::Read => {
+                                    let content = fa
+                                        .new_content
+                                        .clone()
+                                        .or_else(|| {
+                                            revision_engine
+                                                .and_then(|re| re.history(&fa.file_path))
+                                                .and_then(|h| h.get(0))
+                                                .map(|r| r.text.as_ref().clone())
+                                        });
+                                    events.push(TranscriptEvent {
+                                        index: event_idx,
+                                        turn_index: turn.turn_index,
+                                        kind: TranscriptEventKind::FileRead {
+                                            file_path: fa.file_path.clone(),
+                                            action_record: fa.clone(),
+                                            content,
+                                        },
+                                        timestamp: tool.timestamp.or(turn.timestamp),
+                                    });
+                                    event_idx += 1;
+                                }
+                                FileActionKind::Write => {
+                                    let content = fa.new_content.clone();
+                                    events.push(TranscriptEvent {
+                                        index: event_idx,
+                                        turn_index: turn.turn_index,
+                                        kind: TranscriptEventKind::FileWrite {
+                                            file_path: fa.file_path.clone(),
+                                            action_record: fa.clone(),
+                                            content,
+                                        },
+                                        timestamp: tool.timestamp.or(turn.timestamp),
+                                    });
+                                    event_idx += 1;
+                                }
+                                FileActionKind::AstAnalysis => {
+                                    let output = extract_output_str(tool.response.as_ref());
+                                    events.push(TranscriptEvent {
+                                        index: event_idx,
+                                        turn_index: turn.turn_index,
+                                        kind: TranscriptEventKind::ToolInvocation {
+                                            name: tool.name.clone(),
+                                            input: tool.input.clone(),
+                                            output,
+                                            is_error: tool.is_error,
+                                        },
+                                        timestamp: tool.timestamp.or(turn.timestamp),
+                                    });
+                                    event_idx += 1;
+                                }
+                            }
+                        } else if is_command_tool(&tool.name) {
+                            let cmd_str = extract_command_str(&tool.input);
+                            let output = extract_output_str(tool.response.as_ref());
                             events.push(TranscriptEvent {
                                 index: event_idx,
                                 turn_index: turn.turn_index,
-                                kind: TranscriptEventKind::FileRead {
-                                    file_path: fa.file_path.clone(),
-                                    action_record: fa.clone(),
-                                    content,
+                                kind: TranscriptEventKind::Command {
+                                    name: tool.name.clone(),
+                                    command_line: cmd_str,
+                                    output,
+                                    is_error: tool.is_error,
                                 },
                                 timestamp: tool.timestamp.or(turn.timestamp),
                             });
                             event_idx += 1;
-                        }
-                        FileActionKind::Write => {
-                            let content = fa.new_content.clone();
-                            events.push(TranscriptEvent {
-                                index: event_idx,
-                                turn_index: turn.turn_index,
-                                kind: TranscriptEventKind::FileWrite {
-                                    file_path: fa.file_path.clone(),
-                                    action_record: fa.clone(),
-                                    content,
-                                },
-                                timestamp: tool.timestamp.or(turn.timestamp),
-                            });
-                            event_idx += 1;
-                        }
-                        FileActionKind::AstAnalysis => {
+                        } else {
                             let output = extract_output_str(tool.response.as_ref());
                             events.push(TranscriptEvent {
                                 index: event_idx,
@@ -197,35 +243,6 @@ impl AgentSession {
                             event_idx += 1;
                         }
                     }
-                } else if is_command_tool(&tool.name) {
-                    let cmd_str = extract_command_str(&tool.input);
-                    let output = extract_output_str(tool.response.as_ref());
-                    events.push(TranscriptEvent {
-                        index: event_idx,
-                        turn_index: turn.turn_index,
-                        kind: TranscriptEventKind::Command {
-                            name: tool.name.clone(),
-                            command_line: cmd_str,
-                            output,
-                            is_error: tool.is_error,
-                        },
-                        timestamp: tool.timestamp.or(turn.timestamp),
-                    });
-                    event_idx += 1;
-                } else {
-                    let output = extract_output_str(tool.response.as_ref());
-                    events.push(TranscriptEvent {
-                        index: event_idx,
-                        turn_index: turn.turn_index,
-                        kind: TranscriptEventKind::ToolInvocation {
-                            name: tool.name.clone(),
-                            input: tool.input.clone(),
-                            output,
-                            is_error: tool.is_error,
-                        },
-                        timestamp: tool.timestamp.or(turn.timestamp),
-                    });
-                    event_idx += 1;
                 }
             }
 
@@ -283,19 +300,6 @@ impl AgentSession {
                     }
                 }
             }
-
-            // 4. Assistant Messages (each is an atomic event)
-            for msg in &turn.assistant_messages {
-                events.push(TranscriptEvent {
-                    index: event_idx,
-                    turn_index: turn.turn_index,
-                    kind: TranscriptEventKind::AssistantResponse {
-                        message: msg.clone(),
-                    },
-                    timestamp: turn.timestamp,
-                });
-                event_idx += 1;
-            }
         }
 
         events
@@ -316,6 +320,21 @@ pub struct AgentTurn {
     pub tool_calls: Vec<ToolCallRecord>,
     pub file_actions: Vec<FileActionRecord>,
     pub timestamp: Option<i64>,
+    /// The order thinking, tool calls and assistant text happened in, as
+    /// indices into those three vectors. Filled by the `push_*` methods;
+    /// empty for a turn built field by field, which then linearizes in the
+    /// old grouped order (see `ordered_steps`).
+    #[serde(default)]
+    pub steps: Vec<TurnStep>,
+}
+
+/// One step of a turn, indexing into `AgentTurn::{thinking, tool_calls,
+/// assistant_messages}`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TurnStep {
+    Thinking(usize),
+    Tool(usize),
+    Message(usize),
 }
 
 /// Truncate a string to at most `max_chars` Unicode scalar values, slicing safely on a character boundary.
@@ -346,7 +365,40 @@ impl AgentTurn {
             tool_calls: Vec::new(),
             file_actions: Vec::new(),
             timestamp: None,
+            steps: Vec::new(),
         }
+    }
+
+    /// Append a thinking block, recording its place in the turn.
+    pub fn push_thinking(&mut self, thought: String) {
+        self.steps.push(TurnStep::Thinking(self.thinking.len()));
+        self.thinking.push(thought);
+    }
+
+    /// Append an assistant text block, recording its place in the turn.
+    pub fn push_message(&mut self, message: String) {
+        self.steps.push(TurnStep::Message(self.assistant_messages.len()));
+        self.assistant_messages.push(message);
+    }
+
+    /// Append a tool call, recording its place in the turn.
+    pub fn push_tool(&mut self, call: ToolCallRecord) {
+        self.steps.push(TurnStep::Tool(self.tool_calls.len()));
+        self.tool_calls.push(call);
+    }
+
+    /// The turn's steps in the order they happened. A turn with no recorded
+    /// steps (built field by field) falls back to the old grouping: every
+    /// thinking block, then every tool call, then every assistant message.
+    pub fn ordered_steps(&self) -> Vec<TurnStep> {
+        if !self.steps.is_empty() {
+            return self.steps.clone();
+        }
+        (0..self.thinking.len())
+            .map(TurnStep::Thinking)
+            .chain((0..self.tool_calls.len()).map(TurnStep::Tool))
+            .chain((0..self.assistant_messages.len()).map(TurnStep::Message))
+            .collect()
     }
 
     /// Concatenated reasoning prose from all thinking blocks in this turn.
@@ -560,41 +612,20 @@ impl TranscriptEventKind {
         }
     }
 
+    /// Banner pair (mind, impact): `[agent_cards.banners]`.
     pub fn banner_colors(&self) -> ([f32; 4], [f32; 4]) {
-        match self {
-            Self::UserPrompt { .. } => (
-                [0.22, 0.38, 0.65, 0.95], // Slate blue / indigo
-                [0.18, 0.28, 0.48, 0.95],
-            ),
-            Self::Thinking { .. } => (
-                [0.48, 0.36, 0.15, 0.95], // Warm gold / amber
-                [0.38, 0.28, 0.12, 0.95],
-            ),
-            Self::FileRead { .. } => (
-                [0.15, 0.38, 0.58, 0.95], // Cyan / cobalt blue
-                [0.12, 0.30, 0.48, 0.95],
-            ),
-            Self::FileEdit { .. } => (
-                [0.65, 0.38, 0.12, 0.95], // Amber / flame orange
-                [0.55, 0.30, 0.10, 0.95],
-            ),
-            Self::FileWrite { .. } => (
-                [0.15, 0.55, 0.30, 0.95], // Emerald green
-                [0.12, 0.45, 0.25, 0.95],
-            ),
-            Self::Command { .. } => (
-                [0.28, 0.28, 0.32, 0.95], // Terminal dark slate / graphite
-                [0.20, 0.20, 0.24, 0.95],
-            ),
-            Self::ToolInvocation { .. } => (
-                [0.25, 0.35, 0.45, 0.95], // Steel blue
-                [0.18, 0.26, 0.35, 0.95],
-            ),
-            Self::AssistantResponse { .. } => (
-                [0.18, 0.48, 0.38, 0.95], // Deep teal / forest
-                [0.14, 0.38, 0.30, 0.95],
-            ),
-        }
+        let b = &crate::config::settings().agent_cards.banners;
+        let [mind, impact] = match self {
+            Self::UserPrompt { .. } => b.user_prompt,
+            Self::Thinking { .. } => b.thinking,
+            Self::FileRead { .. } => b.file_read,
+            Self::FileEdit { .. } => b.file_edit,
+            Self::FileWrite { .. } => b.file_write,
+            Self::Command { .. } => b.command,
+            Self::ToolInvocation { .. } => b.tool_invocation,
+            Self::AssistantResponse { .. } => b.assistant_response,
+        };
+        (mind, impact)
     }
 }
 

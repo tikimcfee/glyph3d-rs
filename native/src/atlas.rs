@@ -534,7 +534,7 @@ const UPLOAD_PITCH_ALIGN: u32 = 256;
 /// [`mip_levels_for`] caps `k` so no filter footprint crosses a cell edge —
 /// a bled mip would paint a neighbour's colour into a cell's border. For the
 /// baked 136×128 cell that is 4 levels (a 17×16-px cell at level 3); below
-/// that size the LOD backdrop replaces the segment anyway (`LOD_MIN_PX`).
+/// that size the LOD backdrop replaces the segment anyway (`[lod] min_px`).
 pub const EMOJI_MAX_MIP_LEVELS: u32 = 4;
 
 /// Mip levels such that every level's 2^k footprint tiles the cell exactly:

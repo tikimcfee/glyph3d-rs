@@ -150,6 +150,8 @@ pub(super) fn apply_relayout(
                 greek_pure: p.greek_pure,
                 greek_onset_px: Some(p.greek_onset_px),
                 field_mode: cull_opts.field_mode,
+                environment: p.environment,
+                ground_y: cull_opts.ground_y,
             },
         )
     } else {
@@ -417,7 +419,7 @@ impl App<'_> {
         );
         #[cfg(feature = "egui-ui")]
         if self.ui {
-            println!("debug panel: F1 toggles the egui Debug window (sliders tune LOD_MIN_PX live)");
+            println!("debug panel: F1 toggles the egui Debug window (sliders tune the LOD threshold live)");
             println!("agent sessions: F7 toggles the Agent Sessions browser");
         }
         println!("screenshot: F2 saves the next presented frame to out/windowed-shot-<timestamp>.png");

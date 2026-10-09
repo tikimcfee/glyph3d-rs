@@ -2,7 +2,7 @@
 //! instances. Extracted from `glyph_scene.rs` in the 2026-09 code-shape
 //! refactor — a pure move.
 
-use super::{GlyphInstance, RenderSlot, BACKDROP_GAIN, GLYPH_CELL_AREA};
+use super::{GlyphInstance, RenderSlot, GLYPH_CELL_AREA};
 
 /// Stage F — mean linear ink color + backdrop coverage for a slice of
 /// instances occupying a `width × height` world rect. Shared by the repo
@@ -150,7 +150,7 @@ impl<'a> SegTintAccum<'a> {
         let n = n.max(1) as f64;
         let area = (width as f64 * height as f64).max(1e-3);
         let ink_frac = (self.cells as f64 * GLYPH_CELL_AREA as f64 / area).min(1.0);
-        let e = (ink_frac * BACKDROP_GAIN as f64).min(1.0);
+        let e = (ink_frac * crate::config::settings().lod.backdrop_gain as f64).min(1.0);
         [
             (self.sum[0] / n) as f32,
             (self.sum[1] / n) as f32,

@@ -51,10 +51,9 @@ impl SpatialScene {
         let half_w = page_size[0] * 0.5;
         let half_gap = spine_gap * 0.5;
 
-        let (left_banner_col, right_banner_col) = banner_colors.unwrap_or((
-            [0.20, 0.36, 0.60, 0.95],
-            [0.18, 0.52, 0.35, 0.95],
-        ));
+        let cards = &crate::config::settings().agent_cards;
+        let (left_banner_col, right_banner_col) = banner_colors
+            .unwrap_or((cards.default_banners[0], cards.default_banners[1]));
 
         // Container bounds enclose both pages and the spine gap
         let card_bounds = LocalBounds {
@@ -93,7 +92,7 @@ impl SpatialScene {
                     origin: [-half_w, -page_size[1]],
                 },
                 SceneMeshMaterial {
-                    color: [0.08, 0.10, 0.14, 0.90],
+                    color: cards.mind_page,
                     params: [0.0, 0.0, 0.0, 0.0],
                 },
             ))
@@ -133,7 +132,7 @@ impl SpatialScene {
                     origin: [-half_w, -page_size[1]],
                 },
                 SceneMeshMaterial {
-                    color: [0.10, 0.12, 0.17, 0.90],
+                    color: cards.impact_page,
                     params: [0.0, 0.0, 0.0, 0.0],
                 },
             ))
@@ -166,7 +165,7 @@ impl SpatialScene {
                     origin: [-spine_w * 0.5, -page_size[1]],
                 },
                 SceneMeshMaterial {
-                    color: [0.18, 0.22, 0.30, 0.75],
+                    color: cards.spine,
                     params: [0.0, 0.0, 0.0, 0.0],
                 },
                 LocalBounds {

@@ -13,20 +13,9 @@ use std::cell::Cell;
 use super::{GroupRow, SCENE_SAMPLE_COUNT};
 use crate::gpu::GpuContext;
 
-/// Stage F: LOD threshold in on-screen pixels per em cell (cell height = 1.0
-/// world unit). Below 1 px/em individual glyphs are raster-lottery subpixel
-/// blobs; the segment's backdrop quad (mean ink color × ink coverage) is the
-/// visually equivalent representation. Never substitutes at ≥1 px/em, so
-/// legible text is always drawn glyph-by-glyph.
-pub const LOD_MIN_PX: f32 = 1.0;
-
-/// Stage F: backdrop coverage gain — fitted against the Stage E2 full-field
-/// render (out/f-field-before.png): with E = ink_frac × GAIN the post-LOD
-/// wide shot's mean linear pixel value matches the pre-LOD one within ~3%
-/// (GAIN 1.9 overshot +45%, 1.3 overshot +29%, 1.0 +17%, 0.7 lands even; the residual
-/// difference is the flat-per-file haze vs real per-page texture — the
-/// backdrop fills a file's intra-page gaps). See out/STAGE_F_REPORT.md.
-pub const BACKDROP_GAIN: f32 = 0.7;
+// The LOD threshold and backdrop gain are settings: `[lod] min_px` and
+// `[lod] backdrop_gain` in config/defaults.toml, which carries their
+// rationale (the gain's fit against the pre-LOD render, STAGE_F_REPORT.md).
 
 /// Per-segment cull record, 48 B. One segment per FILE in repo mode; text
 /// scenes stage a single segment covering the whole block. Bounds are
@@ -84,7 +73,7 @@ pub struct SegCull {
     pub slot_count: u32,
     /// rgb = mean LINEAR ink color (sRGB bytes pow-2.2 decoded at staging);
     /// w = effective per-pixel ink coverage E at deep minification
-    /// (`ink_frac × BACKDROP_GAIN`, clamped to 1) — the backdrop alpha.
+    /// (`ink_frac × [lod] backdrop_gain`, clamped to 1) — the backdrop alpha.
     pub tint: [f32; 4],
     /// Sub-file blocks for large files, allowing fine-grained CPU frustum culling.
     pub blocks: Vec<BlockCull>,
@@ -146,7 +135,7 @@ pub(super) struct CullView {
     pub(super) px_scale: f32,
     /// Stage K (K4): the LOD threshold (px/em) is per-frame data (was the
     /// LOD_MIN_PX const read directly) so windowed runs can tune it live;
-    /// offscreen always carries the const (see CullState::lod_min_px).
+    /// offscreen always carries the `[lod] min_px` setting (see CullState::lod_min_px).
     pub(super) lod_min_px: f32,
     /// Whether to render file background bounding quads behind glyphs when near.
     pub(super) file_backgrounds: bool,
@@ -363,8 +352,8 @@ pub(super) struct CullState {
     /// pow(new)/pow(orig) so an untouched segment keeps its Stage F tint.
     pub(super) orig_group_rgb: Vec<[f32; 3]>,
     pub(super) hidden: Vec<bool>,
-    /// Stage K (K4): live LOD threshold (px/em), seeded from the LOD_MIN_PX
-    /// const. Cell because render(&self) is immutable (the `viewport: Cell`
+    /// Stage K (K4): live LOD threshold (px/em), seeded from the `[lod] min_px`
+    /// setting. Cell because render(&self) is immutable (the `viewport: Cell`
     /// precedent). The ONLY write site is the UI-controls application in
     /// render(), which runs solely when a windowed probe is installed —
     /// offscreen never writes it, so offscreen culls with the const.
@@ -562,9 +551,9 @@ impl CullState {
             base_tint,
             orig_group_rgb,
             hidden: vec![false; segments.len()],
-            lod_min_px: Cell::new(LOD_MIN_PX),
+            lod_min_px: Cell::new(crate::config::settings().lod.min_px),
             file_backgrounds: Cell::new(false),
-            file_bg_color: Cell::new(crate::DEFAULT_FILE_BG_COLOR),
+            file_bg_color: Cell::new(crate::config::settings().glyph_scene.file_bg_color),
             backdrop_insts_buf,
             backdrop_pipeline,
             backdrop_bind_group,

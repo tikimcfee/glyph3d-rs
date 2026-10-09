@@ -68,8 +68,8 @@ pub fn parse_verb(s: &str) -> Result<Verb, String> {
         Ok([((v >> 16) & 0xFF) as u8, ((v >> 8) & 0xFF) as u8, (v & 0xFF) as u8])
     };
     Ok(match t.first().copied().unwrap_or("") {
-        "recolor-glyph" => Verb::RecolorGlyph(if t.len() > 1 { hex(1)? } else { [255, 80, 80] }),
-        "recolor-line" => Verb::RecolorLine(if t.len() > 1 { hex(1)? } else { [255, 213, 79] }),
+        "recolor-glyph" => Verb::RecolorGlyph(if t.len() > 1 { Some(hex(1)?) } else { None }),
+        "recolor-line" => Verb::RecolorLine(if t.len() > 1 { Some(hex(1)?) } else { None }),
         "nudge-glyph" => Verb::NudgeGlyph([f(1)?, f(2)?, if t.len() > 3 { f(3)? } else { 0.0 }]),
         "scale-glyph" => Verb::ScaleGlyph(f(1)?),
         "move-group" => Verb::MoveGroup([f(1)?, f(2)?, f(3)?]),

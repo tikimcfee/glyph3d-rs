@@ -214,12 +214,12 @@ impl GlyphScene {
     }
 
     /// Windowed verb keys: h highlight line, g grab/release file, c grab/release carrel,
-    /// t cycle tint, x toggle hidden.
+    /// t cycle tint, x toggle hidden, b toggle the ground/sky environment.
     pub(super) fn verb_key(&mut self, ctx: &GpuContext, key: winit::keyboard::KeyCode) {
         use winit::keyboard::KeyCode as K;
         match key {
             K::KeyH => {
-                let line = self.apply_verb(ctx, &Verb::RecolorLine([255, 213, 79]));
+                let line = self.apply_verb(ctx, &Verb::RecolorLine(None));
                 println!("{line}");
             }
             K::KeyT => {
@@ -229,6 +229,10 @@ impl GlyphScene {
             K::KeyX => {
                 let line = self.apply_verb(ctx, &Verb::ToggleHidden);
                 println!("{line}");
+            }
+            K::KeyB => {
+                let mode = self.environment.toggle();
+                println!("environment: {mode:?}");
             }
             K::KeyG => {
                 self.grabbed_zone = None;

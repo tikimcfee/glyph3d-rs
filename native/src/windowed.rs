@@ -31,7 +31,7 @@
 //!     per frame in render()); it re-acquires once the pointer leaves egui.
 //!
 //! K3 adds the Debug window (FPS/camera/pick readouts, verb buttons calling
-//! the exact CLI op API, K2 scratch text field). K4 makes LOD_MIN_PX live
+//! the exact CLI op API, K2 scratch text field). K4 makes the LOD threshold live
 //! via a slider (probe-cell → CullState Cell seam; offscreen keeps the
 //! const) and adds live cull counters; F1 toggles the window.
 //!
