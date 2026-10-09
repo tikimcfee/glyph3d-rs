@@ -28,19 +28,27 @@ impl GlyphScene {
         spans: &[crate::layout::ByteSpan],
         trie: &crate::atlas::TrieTable,
     ) -> usize {
-        let (slot_base, slot_count) = if let Some(pctx) = &self.pick {
+        // The cluster mode the slots were laid out with decides which leaders
+        // own a slot: the file's own params in a repo scene, the staging
+        // choice in a text scene.
+        let (slot_base, slot_count, cluster_mode) = if let Some(pctx) = &self.pick {
             if let Some(f) = pctx.files.iter().find(|f| f.group_id == group_id) {
-                (f.slot_base, f.slot_count)
+                (f.slot_base, f.slot_count, f.item.cluster_mode)
             } else {
                 return 0;
             }
         } else if group_id == 0 {
-            (0, self.field.glyph_count())
+            let mode = match self.probe_cluster_mode {
+                Some(true) => crate::fold::ClusterMode::Cluster,
+                Some(false) => crate::fold::ClusterMode::Leader,
+                None => crate::fold::ClusterMode::default(),
+            };
+            (0, self.field.glyph_count(), mode)
         } else {
             return 0;
         };
 
-        let colors = crate::layout_hyper::resolve_spans_to_slot_colors(file_bytes, spans, trie);
+        let colors = crate::layout_hyper::resolve_spans_to_slot_colors(file_bytes, spans, trie, cluster_mode);
         let to_write = colors.len().min(slot_count as usize);
         self.write_slot_colors(ctx, slot_base, &colors[..to_write]);
         to_write
