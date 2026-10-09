@@ -23,6 +23,9 @@ pub struct UiProbeState {
     /// Fly-camera angles (windowed always runs Fly).
     pub yaw: f32,
     pub pitch: f32,
+    /// The environment mode actually drawn this frame (the B toggle lands
+    /// here), so a relayout rebuild keeps it.
+    pub environment: crate::config::EnvironmentMode,
     /// The last resolved pick, formatted by the same `format_pick` as the
     /// stdout pick log line.
     pub last_pick: Option<String>,

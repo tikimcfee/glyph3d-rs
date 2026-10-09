@@ -32,6 +32,7 @@ pub struct Settings {
     pub repo: RepoSettings,
     pub agent_cards: AgentCardSettings,
     pub ui: UiSettings,
+    pub environment: EnvironmentSettings,
     pub quad_demo: QuadDemoSettings,
 }
 
@@ -157,6 +158,54 @@ pub struct UiSettings {
     pub harness_kimi: [u8; 3],
     pub harness_generic: [u8; 3],
     pub project_name: [u8; 3],
+}
+
+/// Whether the glyph scene draws the ground/sky environment.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Deserialize, clap::ValueEnum)]
+#[serde(rename_all = "lowercase")]
+#[value(rename_all = "lower")]
+pub enum EnvironmentMode {
+    /// No environment: the pass clears to `[glyph_scene] clear_color`.
+    #[default]
+    Off,
+    /// A ground plane with a grid below the scene, and a sky gradient.
+    Ground,
+}
+
+/// The ground/sky environment pass (`glyph_scene::environment`). Colours are
+/// linear (the scene target is sRGB-encoded on write), like `clear_color`.
+#[derive(Clone, Debug, PartialEq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EnvironmentSettings {
+    /// Default for `--environment`.
+    pub mode: EnvironmentMode,
+    /// World units between the scene's lowest point and the ground.
+    pub ground_gap: f32,
+    /// Grid line spacing, world units — fixed; it never adapts to the camera.
+    pub minor_spacing: f32,
+    pub major_spacing: f32,
+    pub line_width_px: f32,
+    pub axis_width_px: f32,
+    /// Grid lines are at full strength while a cell spans at least
+    /// `line_fade_start_px` on screen, and gone at `line_fade_end_px`.
+    pub line_fade_start_px: f32,
+    pub line_fade_end_px: f32,
+    /// Fog toward the horizon colour, by distance from the eye (world units).
+    /// The end is also capped at `fog_far_fraction` of the far plane.
+    pub fog_start: f32,
+    pub fog_end: f32,
+    pub fog_far_fraction: f32,
+    pub ground_color: [f32; 3],
+    /// RGBA: alpha is the line's strength over the ground.
+    pub minor_line_color: [f32; 4],
+    pub major_line_color: [f32; 4],
+    /// The z = 0 line (running along x) and the x = 0 line (along z).
+    pub axis_x_color: [f32; 4],
+    pub axis_z_color: [f32; 4],
+    pub sky_horizon_color: [f32; 3],
+    pub sky_zenith_color: [f32; 3],
+    /// How far above the horizon (in sin of elevation) the sky reaches zenith.
+    pub sky_gradient_height: f32,
 }
 
 /// The 1M-instance quad field (`--demo`).

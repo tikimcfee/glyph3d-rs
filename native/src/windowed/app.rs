@@ -150,6 +150,8 @@ pub(super) fn apply_relayout(
                 greek_pure: p.greek_pure,
                 greek_onset_px: Some(p.greek_onset_px),
                 field_mode: cull_opts.field_mode,
+                environment: p.environment,
+                ground_y: cull_opts.ground_y,
             },
         )
     } else {

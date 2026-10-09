@@ -101,6 +101,7 @@ use target::{CompositeState, Selection, ViewTarget, SCENE_SAMPLE_COUNT};
 mod ui_probe;
 pub use ui_probe::{UiCarrelState, UiProbe, UiProbeState};
 
+mod environment;
 mod interaction;
 mod style;
 mod setup;
@@ -186,6 +187,11 @@ pub struct GlyphScene {
     pub(in crate::glyph_scene) params: Cell<Params>,
     pub(crate) mesh_pipeline: std::cell::RefCell<mesh::MeshPipeline>,
     pub(crate) mesh_frame_bg: wgpu::BindGroup,
+    /// The staged scene's lowest y (all files, not the camera's focus): the
+    /// environment's ground sits `[environment] ground_gap` below it.
+    pub(in crate::glyph_scene) scene_min_y: f32,
+    /// The ground/sky pass; off unless asked for (records nothing when off).
+    pub(in crate::glyph_scene) environment: environment::Environment,
 }
 
 // ── Stage K (K4): what the live controls change, and what stays const ────
@@ -271,9 +277,13 @@ impl GlyphScene {
             _ => glam::camera::rh::view::look_at_mat4(eye, target, Vec3::Y),
         };
         let proj = glam::camera::rh::proj::directx::perspective(fov, aspect, far, near);
+        let mut view_rot = view;
+        view_rot.w_axis = glam::Vec4::W;
         CamFrame {
             view_proj: proj * view,
             eye,
+            view_proj_rel: proj * view_rot,
+            far,
         }
     }
 

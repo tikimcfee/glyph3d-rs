@@ -146,4 +146,9 @@ impl FlyCamera {
 pub(super) struct CamFrame {
     pub(super) view_proj: Mat4,
     pub(super) eye: Vec3,
+    /// proj × view with the view's translation zeroed: the camera-relative
+    /// form the environment pass builds rays from (no large-coordinate
+    /// cancellation).
+    pub(super) view_proj_rel: Mat4,
+    pub(super) far: f32,
 }

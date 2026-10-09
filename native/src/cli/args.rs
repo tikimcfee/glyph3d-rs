@@ -216,6 +216,15 @@ pub struct Cli {
     /// Fixed for the scene's lifetime.
     #[arg(long, value_name = "MODE", default_value = "instanced")]
     pub field_mode: glyph_field::GlyphFieldMode,
+    /// Ground/sky environment behind the glyph scene: `off` or `ground`
+    /// (default: `[environment] mode` in config, itself `off`). Windowed:
+    /// the B key toggles it live.
+    #[arg(long, value_name = "MODE")]
+    pub environment: Option<crate::config::EnvironmentMode>,
+    /// Explicit ground plane height (world y) for `--environment ground`;
+    /// default: the scene's lowest point minus `[environment] ground_gap`.
+    #[arg(long, value_name = "Y", allow_negative_numbers = true)]
+    pub ground_y: Option<f32>,
     /// Stage K: windowed without the egui UI overlay (exact pre-K behavior)
     #[arg(long)]
     pub no_ui: bool,

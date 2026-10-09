@@ -3,6 +3,7 @@
 
 use crate::gpu::GpuContext;
 use crate::glyph_scene::camera::fov_y_deg;
+use crate::glyph_scene::environment::EnvCamera;
 use crate::glyph_scene::cull::{cull_segments, frustum_planes, CullView, Phase, PhaseDraws};
 use crate::glyph_scene::instance::FrameUniform;
 use crate::glyph_scene::pick::format_pick;
@@ -90,6 +91,15 @@ pub(super) fn render_scene(
     };
     ctx.queue
         .write_buffer(&scene.camera_buf, 0, bytemuck::bytes_of(&cam));
+    if scene.environment.is_on() {
+        let env_cam = EnvCamera {
+            eye: frame.eye.as_dvec3(),
+            vp_rel: frame.view_proj_rel,
+            far: frame.far,
+        };
+        let ground_y = scene.environment.ground_y(scene.scene_min_y);
+        scene.environment.write(&ctx.queue, &env_cam, ground_y);
+    }
 
     // --- Stage F: CPU segment cull (frustum + LOD) ----------------------
     // Stage L (L2): the cull output IS the phase lists (PhaseDraws). The
@@ -170,6 +180,7 @@ pub(super) fn render_scene(
         p.eye = frame.eye.to_array();
         p.yaw = scene.fly.yaw;
         p.pitch = scene.fly.pitch;
+        p.environment = scene.environment.mode.get();
         p.last_pick = scene.picked.as_ref().map(format_pick);
         p.grabbed_group = scene.grabbed_group;
         p.grabbed_zone = scene.grabbed_zone.clone();
@@ -337,6 +348,11 @@ pub(super) fn render_scene(
         }),
         ..Default::default()
     });
+    // The environment (ground/sky) goes down first, opaque, writing depth;
+    // everything after sorts against it. Off: nothing recorded.
+    if scene.environment.is_on() {
+        scene.environment.draw(&mut pass);
+    }
     // Stage L (L2): record the phase lists in phase order — Backdrop
     // first, Glyphs second, exactly the Stage F order. Empty phases
     // record nothing (the legacy --no-cull branch has no Backdrop

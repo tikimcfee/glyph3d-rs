@@ -235,6 +235,10 @@ impl Cli {
             greek_pure,
             greek_onset_px: self.greek_onset_px,
             field_mode: self.field_mode,
+            environment: self
+                .environment
+                .unwrap_or(crate::config::settings().environment.mode),
+            ground_y: self.ground_y,
         };
 
         let target = match &self.screenshot {

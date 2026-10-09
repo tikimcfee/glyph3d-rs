@@ -140,6 +140,10 @@ pub struct SceneCullOptions {
     pub greek_onset_px: Option<f32>,
     /// Which glyph-field implementation the scene builds (`--field-mode`).
     pub field_mode: glyph_scene::GlyphFieldMode,
+    /// The ground/sky environment (`--environment`, `[environment] mode`).
+    pub environment: config::EnvironmentMode,
+    /// Explicit ground height (`--ground-y`); None = below the scene.
+    pub ground_y: Option<f32>,
 }
 
 impl Default for SceneCullOptions {
@@ -153,6 +157,8 @@ impl Default for SceneCullOptions {
             greek_pure: true,
             greek_onset_px: None,
             field_mode: glyph_scene::GlyphFieldMode::Instanced,
+            environment: config::settings().environment.mode,
+            ground_y: None,
         }
     }
 }
@@ -256,6 +262,7 @@ fn build_scene_impl(
         if let Some(onset) = cull_opts.greek_onset_px {
             scene.set_greek_onset_px(&ctx.queue, onset);
         }
+        scene.set_environment(cull_opts.environment, cull_opts.ground_y);
         let p = probe.then(|| scene.init_ui_probe());
         (Box::new(scene) as Box<dyn SceneLike>, p)
     };

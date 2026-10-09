@@ -64,3 +64,7 @@ no_ui = false
 #
 # [glyph_scene]
 # clear_color = [0.07, 0.07, 0.09, 1.0]
+#
+# [environment]
+# mode = "ground"          # ground plane + sky; the B key toggles it live
+# ground_color = [0.034, 0.042, 0.060]

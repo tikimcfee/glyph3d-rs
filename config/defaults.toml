@@ -156,6 +156,41 @@ harness_kimi = [160, 120, 240]
 harness_generic = [180, 180, 180]
 project_name = [180, 200, 120]
 
+[environment]
+# The ground/sky environment behind the glyph scene. Off by default; turn it on
+# with --environment ground, mode = "ground" in your launch_config.toml's
+# [environment], or the B key in a windowed run.
+# Colours here are linear, like clear_color: the scene target is sRGB-encoded
+# on write, so 0.034 linear is 0x34 on screen. The comments give sRGB hex.
+mode = "off"
+# World units between the scene's lowest point and the ground (a text line is
+# 1.25), so nothing rests exactly on the plane.
+ground_gap = 5.0
+# Grid spacing in world units: FIXED; it never re-spaces as the camera moves.
+minor_spacing = 10.0
+major_spacing = 100.0
+line_width_px = 1.0
+axis_width_px = 2.0
+# Lines are full strength while a grid cell spans >= start px on screen and fade
+# to nothing by end px, so distant lines go quiet instead of shimmering.
+line_fade_start_px = 12.0
+line_fade_end_px = 3.0
+# Fog toward the horizon colour, by distance from the eye (world units). The
+# end is also capped at fog_far_fraction of the camera's far plane, so the
+# ground never meets the far clip with a hard edge.
+fog_start = 200.0
+fog_end = 6000.0
+fog_far_fraction = 0.9
+ground_color = [0.034, 0.042, 0.060]                # #343a45
+minor_line_color = [0.065, 0.074, 0.098, 1.0]       # ~#474f5a
+major_line_color = [0.110, 0.122, 0.155, 1.0]       # ~#5c616d
+axis_x_color = [0.40, 0.08, 0.08, 1.0]              # x axis (z = 0), red
+axis_z_color = [0.08, 0.16, 0.50, 1.0]              # z axis (x = 0), blue
+sky_horizon_color = [0.070, 0.070, 0.090]           # the old clear colour
+sky_zenith_color = [0.016, 0.018, 0.026]
+# How high above the horizon (sin of elevation) the sky reaches zenith colour.
+sky_gradient_height = 0.5
+
 [quad_demo]
 # What the --demo quad field pass clears to.
 clear_color = [0.02, 0.02, 0.04, 1.0]
