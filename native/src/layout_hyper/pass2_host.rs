@@ -6,6 +6,7 @@ use crate::fold::{rows_for_line, wrap_row_of, wrap_segment_of};
 use crate::glyph_scene::GlyphInstance;
 use crate::layout::{InkExtent, ItemPlacement, LayoutItem, PageExtent, Paint};
 use super::char_resolve::{resolve_byte_char, resolve_byte_char_cluster};
+use super::page::{paged_x, Pager};
 use super::types::{ItemPrepass, SendPtr};
 
 pub fn layout_pass2_host(
@@ -35,12 +36,7 @@ pub fn layout_pass2_host(
             } else {
                 0
             };
-            let page_stride_x = if p.has_page && p.page_rows > 0 {
-                pre.max_row_extent + p.page_gap_x
-            } else {
-                0.0
-            };
-            let page_active = p.has_page && (p.page_rows > 0 || p.page_cols > 0 || p.scroll_rows > 0);
+            let pager = Pager::new(p, pre.max_row_extent);
 
             let mut page_right = 0.0f32;
             let mut page_bottom = 0.0f32;
@@ -72,14 +68,7 @@ pub fn layout_pass2_host(
 
             let wrap_w = p.wrap_width as i64;
             let is_wrap_back = p.wrap_mode == crate::fold::WrapMode::Back;
-            let pages_wide = (p.pages_wide as i64).max(1);
-            let page_rows = p.page_rows as i64;
-            let page_cols = p.page_cols as i64;
-            let scroll_rows = p.scroll_rows as i64;
             let line_height = p.line_height;
-            let band_stride_y = p.band_stride_y;
-            let depth_per_band = p.depth_per_band;
-            let depth_per_col = p.depth_per_col;
             let z_step = p.z_step;
             let origin_x = p.origin_x;
             let origin_y = p.origin_y;
@@ -108,28 +97,9 @@ pub fn layout_pass2_host(
                 let base_y = (-(row as f64) * line_height + origin_y) as f32;
                 let base_z = (-(wrap_segment as f64) * z_step + origin_z) as f32;
 
-                let (pos_x, pos_y, pos_z) = if page_active {
-                    let (y_page, x_page, screen_row) = if page_rows > 0 {
-                        let y_page = row / page_rows;
-                        let screen_row = row + scroll_rows;
-                        let x_page = if page_cols > 0 {
-                            col / page_cols
-                        } else {
-                            0
-                        };
-                        (y_page, x_page, screen_row)
-                    } else {
-                        (0, 0, row)
-                    };
-                    let band = y_page / pages_wide;
-                    let px = (base_x as f64 + (y_page % pages_wide) as f64 * page_stride_x) as f32;
-                    let py = (origin_y
-                        - (screen_row - y_page * page_rows) as f64 * line_height
-                        - band as f64 * band_stride_y) as f32;
-                    let pz = (origin_z - wrap_segment as f64 * z_step
-                        + band as f64 * depth_per_band
-                        + x_page as f64 * depth_per_col) as f32;
-                    (px, py, pz)
+                let (pos_x, pos_y, pos_z) = if pager.active {
+                    let f = pager.frame(row, col, wrap_segment);
+                    (paged_x(base_x, &f), f.y, f.z)
                 } else {
                     (base_x, base_y, base_z)
                 };
@@ -264,12 +234,8 @@ pub fn compute_single_item_placement(
     } else {
         0
     };
-    let page_stride_x = if p.has_page && p.page_rows > 0 {
-        max_row_extent + p.page_gap_x
-    } else {
-        0.0
-    };
-    let page_active = p.has_page && (p.page_rows > 0 || p.page_cols > 0 || p.scroll_rows > 0);
+    let pager = Pager::new(p, max_row_extent);
+    let page_active = pager.active;
 
     let mut page_right = 0.0f32;
     let mut page_bottom = 0.0f32;
@@ -296,11 +262,7 @@ pub fn compute_single_item_placement(
     let pages_wide = (p.pages_wide as i64).max(1);
     let page_rows = p.page_rows as i64;
     let page_cols = p.page_cols as i64;
-    let scroll_rows = p.scroll_rows as i64;
     let line_height = p.line_height;
-    let band_stride_y = p.band_stride_y;
-    let depth_per_band = p.depth_per_band;
-    let depth_per_col = p.depth_per_col;
     let z_step = p.z_step;
     let origin_x = p.origin_x;
     let origin_y = p.origin_y;
@@ -345,16 +307,8 @@ pub fn compute_single_item_placement(
                     let row = base_row;
                     let base_x = origin_x as f32;
                     let (pos_x, pos_y, pos_z) = if page_active {
-                        let y_page = if page_rows > 0 { row / page_rows } else { 0 };
-                        let screen_row = row + scroll_rows;
-                        let band = y_page / pages_wide;
-                        let px = (base_x as f64 + (y_page % pages_wide) as f64 * page_stride_x) as f32;
-                        let py = (origin_y
-                            - (screen_row - y_page * page_rows) as f64 * line_height
-                            - band as f64 * band_stride_y) as f32;
-                        let pz = (origin_z - wrap_segment as f64 * z_step
-                            + band as f64 * depth_per_band) as f32;
-                        (px, py, pz)
+                        let f = pager.frame(row, 0, wrap_segment);
+                        (paged_x(base_x, &f), f.y, f.z)
                     } else {
                         let base_y = (-(row as f64) * line_height + origin_y) as f32;
                         let base_z = (-(wrap_segment as f64) * z_step + origin_z) as f32;
@@ -391,31 +345,26 @@ pub fn compute_single_item_placement(
                 if page_active && page_rows > 0 && pages_wide > 1 && row >= page_rows {
                     is_multi_page = true;
                 }
-                let (py, pz, y_page_mod) = if page_active {
-                    let y_page = if page_rows > 0 { row / page_rows } else { 0 };
-                    let screen_row = row + scroll_rows;
-                    let band = y_page / pages_wide;
-                    let py = (origin_y
-                        - (screen_row - y_page * page_rows) as f64 * line_height
-                        - band as f64 * band_stride_y) as f32;
-                    let pz = (origin_z - wrap_segment as f64 * z_step
-                        + band as f64 * depth_per_band) as f32;
-                    (py, pz, y_page % pages_wide)
+                // This shortcut runs only for page_cols == 0, so the column
+                // page is 0 for every cell of the segment.
+                let (py, pz, frame) = if page_active {
+                    let f = pager.frame(row, seg_start as i64, wrap_segment);
+                    (f.y, f.z, Some(f))
                 } else {
                     let base_y = (-(row as f64) * line_height + origin_y) as f32;
                     let base_z = (-(wrap_segment as f64) * z_step + origin_z) as f32;
-                    (base_y, base_z, 0)
+                    (base_y, base_z, None)
                 };
 
-                let pos_x_0 = if page_active {
-                    ((origin_x as f32) as f64 + y_page_mod as f64 * page_stride_x) as f32
+                let pos_x_0 = if let Some(f) = &frame {
+                    paged_x(origin_x as f32, f)
                 } else {
                     origin_x as f32
                 };
                 let last_item_rel_x = if fold_u > 0 { seg_adv_table[seg_len - 1] as f64 } else { (seg_len - 1) as f64 * cell_advance as f64 };
                 let last_base_x = (last_item_rel_x + origin_x) as f32;
-                let pos_x_last = if page_active {
-                    (last_base_x as f64 + y_page_mod as f64 * page_stride_x) as f32
+                let pos_x_last = if let Some(f) = &frame {
+                    paged_x(last_base_x, f)
                 } else {
                     last_base_x
                 };
@@ -499,27 +448,8 @@ pub fn compute_single_item_placement(
             let base_z = (-(wrap_segment as f64) * z_step + origin_z) as f32;
 
             let (pos_x, pos_y, pos_z) = if page_active {
-                let (y_page, x_page, screen_row) = if page_rows > 0 {
-                    let y_page = row / page_rows;
-                    let screen_row = row + scroll_rows;
-                    let x_page = if page_cols > 0 {
-                        col / page_cols
-                    } else {
-                        0
-                    };
-                    (y_page, x_page, screen_row)
-                } else {
-                    (0, 0, row)
-                };
-                let band = y_page / pages_wide;
-                let px = (base_x as f64 + (y_page % pages_wide) as f64 * page_stride_x) as f32;
-                let py = (origin_y
-                    - (screen_row - y_page * page_rows) as f64 * line_height
-                    - band as f64 * band_stride_y) as f32;
-                let pz = (origin_z - wrap_segment as f64 * z_step
-                    + band as f64 * depth_per_band
-                    + x_page as f64 * depth_per_col) as f32;
-                (px, py, pz)
+                let f = pager.frame(row, col, wrap_segment);
+                (paged_x(base_x, &f), f.y, f.z)
             } else {
                 (base_x, base_y, base_z)
             };
@@ -600,27 +530,8 @@ pub fn compute_single_item_placement(
             let base_z = (-(wrap_segment as f64) * z_step + origin_z) as f32;
 
             let (pos_x, pos_y, pos_z) = if page_active {
-                let (y_page, x_page, screen_row) = if page_rows > 0 {
-                    let y_page = row / page_rows;
-                    let screen_row = row + scroll_rows;
-                    let x_page = if page_cols > 0 {
-                        col / page_cols
-                    } else {
-                        0
-                    };
-                    (y_page, x_page, screen_row)
-                } else {
-                    (0, 0, row)
-                };
-                let band = y_page / pages_wide;
-                let px = (base_x as f64 + (y_page % pages_wide) as f64 * page_stride_x) as f32;
-                let py = (origin_y
-                    - (screen_row - y_page * page_rows) as f64 * line_height
-                    - band as f64 * band_stride_y) as f32;
-                let pz = (origin_z - wrap_segment as f64 * z_step
-                    + band as f64 * depth_per_band
-                    + x_page as f64 * depth_per_col) as f32;
-                (px, py, pz)
+                let f = pager.frame(row, col, wrap_segment);
+                (paged_x(base_x, &f), f.y, f.z)
             } else {
                 (base_x, base_y, base_z)
             };
