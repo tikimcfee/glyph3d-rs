@@ -59,6 +59,103 @@ fly_far_fit = 4.0
 fly_far_min = 20000.0
 fly_far_max = 100000.0
 
+[repo]
+# Per-directory group tints, multiplied with the syntax colours (bright
+# pastels: the hue groups a directory's pages without drowning the palette).
+# A directory hashes to one entry; the tint-cycle verb walks this list.
+dir_tints = [
+    [1.00, 1.00, 1.00],
+    [1.00, 0.93, 0.87],
+    [0.88, 1.00, 0.92],
+    [0.88, 0.95, 1.00],
+    [1.00, 0.91, 1.00],
+    [0.95, 1.00, 0.88],
+    [1.00, 0.97, 0.86],
+    [0.92, 0.92, 1.00],
+    [0.90, 1.00, 1.00],
+    [1.00, 0.88, 0.88],
+]
+# Far-LOD backdrop tint for an extension no [[repo.extension_tints]] lists.
+extension_tint_fallback = [0.75, 0.75, 0.75]   # neutral grey
+
+# Far-LOD backdrop tint by file extension (flat colour mode). The first entry
+# listing an extension wins.
+[[repo.extension_tints]]
+extensions = ["rs"]
+tint = [0.85, 0.40, 0.20]   # Rust orange
+[[repo.extension_tints]]
+extensions = ["js", "mjs", "cjs"]
+tint = [0.95, 0.85, 0.20]   # JavaScript yellow
+[[repo.extension_tints]]
+extensions = ["ts", "tsx"]
+tint = [0.20, 0.50, 0.85]   # TypeScript blue
+[[repo.extension_tints]]
+extensions = ["json"]
+tint = [0.90, 0.75, 0.30]   # JSON amber
+[[repo.extension_tints]]
+extensions = ["md", "markdown"]
+tint = [0.40, 0.60, 0.80]   # Markdown steel blue
+[[repo.extension_tints]]
+extensions = ["toml", "yaml", "yml"]
+tint = [0.70, 0.40, 0.60]   # config purple
+[[repo.extension_tints]]
+extensions = ["py"]
+tint = [0.25, 0.65, 0.55]   # Python teal
+[[repo.extension_tints]]
+extensions = ["c", "h", "cpp", "hpp", "cc"]
+tint = [0.35, 0.55, 0.85]   # C/C++ navy
+[[repo.extension_tints]]
+extensions = ["go"]
+tint = [0.20, 0.70, 0.85]   # Go cyan
+[[repo.extension_tints]]
+extensions = ["sh", "bash", "zsh"]
+tint = [0.45, 0.75, 0.45]   # shell green
+[[repo.extension_tints]]
+extensions = ["html", "htm"]
+tint = [0.90, 0.45, 0.25]   # HTML orange-red
+[[repo.extension_tints]]
+extensions = ["css", "scss", "less"]
+tint = [0.30, 0.55, 0.90]   # CSS blue
+
+[agent_cards]
+# Turn cards: two pages (mind, impact) hinged on a spine, each with a banner.
+# Banner pair used when the card has no event kind.
+default_banners = [[0.20, 0.36, 0.60, 0.95], [0.18, 0.52, 0.35, 0.95]]
+mind_page = [0.08, 0.10, 0.14, 0.90]
+impact_page = [0.10, 0.12, 0.17, 0.90]
+spine = [0.18, 0.22, 0.30, 0.75]
+
+[agent_cards.banners]
+# Banner pair [mind, impact] per transcript event kind.
+user_prompt = [[0.22, 0.38, 0.65, 0.95], [0.18, 0.28, 0.48, 0.95]]          # slate blue / indigo
+thinking = [[0.48, 0.36, 0.15, 0.95], [0.38, 0.28, 0.12, 0.95]]             # warm gold / amber
+file_read = [[0.15, 0.38, 0.58, 0.95], [0.12, 0.30, 0.48, 0.95]]            # cyan / cobalt
+file_edit = [[0.65, 0.38, 0.12, 0.95], [0.55, 0.30, 0.10, 0.95]]            # amber / flame orange
+file_write = [[0.15, 0.55, 0.30, 0.95], [0.12, 0.45, 0.25, 0.95]]           # emerald
+command = [[0.28, 0.28, 0.32, 0.95], [0.20, 0.20, 0.24, 0.95]]              # terminal graphite
+tool_invocation = [[0.25, 0.35, 0.45, 0.95], [0.18, 0.26, 0.35, 0.95]]      # steel blue
+assistant_response = [[0.18, 0.48, 0.38, 0.95], [0.14, 0.38, 0.30, 0.95]]   # deep teal / forest
+
+[agent_cards.workdesk]
+# Workdesk plate accent per file action.
+read = [0.15, 0.35, 0.55, 0.90]           # cyan-slate
+edit = [0.60, 0.40, 0.15, 0.90]           # amber
+write = [0.15, 0.50, 0.30, 0.90]          # emerald
+ast_analysis = [0.45, 0.20, 0.55, 0.90]   # purple
+
+[ui]
+# egui overlay label colours, sRGB 0-255 integers.
+grab_active = [255, 200, 80]          # "ACTIVE GRAB" banner
+history_back = [255, 180, 80]         # deck scrolled back in history
+history_live = [100, 240, 140]        # deck at the live / latest beat
+beat_summary = [250, 220, 120]
+workdesk_bullet = [100, 220, 160]
+harness_claude = [230, 140, 70]
+harness_antigravity = [100, 180, 240]
+harness_kimi = [160, 120, 240]
+harness_generic = [180, 180, 180]
+project_name = [180, 200, 120]
+
 [quad_demo]
 # What the --demo quad field pass clears to.
 clear_color = [0.02, 0.02, 0.04, 1.0]

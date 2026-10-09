@@ -171,7 +171,7 @@ pub struct GlyphScene {
     pub(crate) cursor: (f32, f32),
     /// Viewport in physical px, refreshed every render() (ray unprojection).
     pub(crate) viewport: Cell<(u32, u32)>,
-    /// Per-group position in the DIR_TINTS cycle (t verb).
+    /// Per-group position in the `[repo] dir_tints` cycle (t verb).
     pub(crate) tint_step: Vec<u32>,
     /// Stage K: windowed debug-UI probe (None offscreen / under --no-ui).
     pub(crate) ui_probe: Option<UiProbe>,

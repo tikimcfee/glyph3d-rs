@@ -378,7 +378,7 @@ pub struct RepoLoad {
 }
 
 mod shelf;
-pub use shelf::{extension_tint, DIR_TINTS};
+pub use shelf::{dir_tints, extension_tint};
 pub(crate) use shelf::{dir_tint, layout_shelf};
 
 

@@ -17,6 +17,11 @@ use super::app::RelayoutRequest;
 #[cfg(feature = "egui-ui")]
 use super::ui::{EguiUi, PANEL_VERBS};
 
+/// A `[ui]` colour setting (sRGB 0-255) as an egui colour.
+fn ui_rgb([r, g, b]: [u8; 3]) -> egui::Color32 {
+    egui::Color32::from_rgb(r, g, b)
+}
+
 pub(super) struct WindowState {
     pub(super) window: Arc<Window>,
     pub(super) surface: wgpu::Surface<'static>,
@@ -530,7 +535,7 @@ impl WindowState {
                                 }
                                 if snap.grabbed_zone.is_some() || snap.grabbed_group.is_some() {
                                     ui.colored_label(
-                                        egui::Color32::from_rgb(255, 200, 80),
+                                        ui_rgb(crate::config::settings().ui.grab_active),
                                         format!(
                                             "ACTIVE GRAB: {}",
                                             if let Some(z) = &snap.grabbed_zone {
@@ -970,12 +975,12 @@ impl WindowState {
                                 )).strong());
                                 if carrel.layout_options.deck_scroll_offset > 0 {
                                     ui.colored_label(
-                                        egui::Color32::from_rgb(255, 180, 80),
+                                        ui_rgb(crate::config::settings().ui.history_back),
                                         format!("(-{} back in history)", carrel.layout_options.deck_scroll_offset),
                                     );
                                 } else {
                                     ui.colored_label(
-                                        egui::Color32::from_rgb(100, 240, 140),
+                                        ui_rgb(crate::config::settings().ui.history_live),
                                         "(LIVE / LATEST)",
                                     );
                                 }
@@ -1025,7 +1030,7 @@ impl WindowState {
                             if !carrel.beat_summary.is_empty() {
                                 ui.separator();
                                 ui.label(egui::RichText::new("Active Beat:").heading());
-                                ui.colored_label(egui::Color32::from_rgb(250, 220, 120), &carrel.beat_summary);
+                                ui.colored_label(ui_rgb(crate::config::settings().ui.beat_summary), &carrel.beat_summary);
                             }
                             if !carrel.prompt_summary.is_empty() {
                                 ui.separator();
@@ -1038,7 +1043,7 @@ impl WindowState {
                                 ui.collapsing(format!("Workdesk Files ({})", carrel.touched_files.len()), |ui| {
                                     for (path, act, total) in &carrel.touched_files {
                                         ui.horizontal(|ui| {
-                                            ui.colored_label(egui::Color32::from_rgb(100, 220, 160), "•");
+                                            ui.colored_label(ui_rgb(crate::config::settings().ui.workdesk_bullet), "•");
                                             ui.label(format!("{path} (active: R{act}, total: {total})"));
                                         });
                                     }
@@ -1141,20 +1146,20 @@ impl WindowState {
                                             ui.horizontal(|ui| {
                                                 match s.harness {
                                                     crate::agent_transcript::types::HarnessKind::ClaudeCode => {
-                                                        ui.colored_label(egui::Color32::from_rgb(230, 140, 70), "[Claude]");
+                                                        ui.colored_label(ui_rgb(crate::config::settings().ui.harness_claude), "[Claude]");
                                                     }
                                                     crate::agent_transcript::types::HarnessKind::Antigravity => {
-                                                        ui.colored_label(egui::Color32::from_rgb(100, 180, 240), "[Antigravity]");
+                                                        ui.colored_label(ui_rgb(crate::config::settings().ui.harness_antigravity), "[Antigravity]");
                                                     }
                                                     crate::agent_transcript::types::HarnessKind::KimiCode => {
-                                                        ui.colored_label(egui::Color32::from_rgb(160, 120, 240), "[Kimi]");
+                                                        ui.colored_label(ui_rgb(crate::config::settings().ui.harness_kimi), "[Kimi]");
                                                     }
                                                     crate::agent_transcript::types::HarnessKind::Generic => {
-                                                        ui.colored_label(egui::Color32::from_rgb(180, 180, 180), "[Agent]");
+                                                        ui.colored_label(ui_rgb(crate::config::settings().ui.harness_generic), "[Agent]");
                                                     }
                                                 }
                                                 if let Some(proj) = &s.project_name {
-                                                    ui.colored_label(egui::Color32::from_rgb(180, 200, 120), format!("📂 {proj}"));
+                                                    ui.colored_label(ui_rgb(crate::config::settings().ui.project_name), format!("📂 {proj}"));
                                                 }
                                                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                                                     if ui.button("▶ Load").clicked() {

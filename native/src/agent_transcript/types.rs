@@ -560,41 +560,20 @@ impl TranscriptEventKind {
         }
     }
 
+    /// Banner pair (mind, impact): `[agent_cards.banners]`.
     pub fn banner_colors(&self) -> ([f32; 4], [f32; 4]) {
-        match self {
-            Self::UserPrompt { .. } => (
-                [0.22, 0.38, 0.65, 0.95], // Slate blue / indigo
-                [0.18, 0.28, 0.48, 0.95],
-            ),
-            Self::Thinking { .. } => (
-                [0.48, 0.36, 0.15, 0.95], // Warm gold / amber
-                [0.38, 0.28, 0.12, 0.95],
-            ),
-            Self::FileRead { .. } => (
-                [0.15, 0.38, 0.58, 0.95], // Cyan / cobalt blue
-                [0.12, 0.30, 0.48, 0.95],
-            ),
-            Self::FileEdit { .. } => (
-                [0.65, 0.38, 0.12, 0.95], // Amber / flame orange
-                [0.55, 0.30, 0.10, 0.95],
-            ),
-            Self::FileWrite { .. } => (
-                [0.15, 0.55, 0.30, 0.95], // Emerald green
-                [0.12, 0.45, 0.25, 0.95],
-            ),
-            Self::Command { .. } => (
-                [0.28, 0.28, 0.32, 0.95], // Terminal dark slate / graphite
-                [0.20, 0.20, 0.24, 0.95],
-            ),
-            Self::ToolInvocation { .. } => (
-                [0.25, 0.35, 0.45, 0.95], // Steel blue
-                [0.18, 0.26, 0.35, 0.95],
-            ),
-            Self::AssistantResponse { .. } => (
-                [0.18, 0.48, 0.38, 0.95], // Deep teal / forest
-                [0.14, 0.38, 0.30, 0.95],
-            ),
-        }
+        let b = &crate::config::settings().agent_cards.banners;
+        let [mind, impact] = match self {
+            Self::UserPrompt { .. } => b.user_prompt,
+            Self::Thinking { .. } => b.thinking,
+            Self::FileRead { .. } => b.file_read,
+            Self::FileEdit { .. } => b.file_edit,
+            Self::FileWrite { .. } => b.file_write,
+            Self::Command { .. } => b.command,
+            Self::ToolInvocation { .. } => b.tool_invocation,
+            Self::AssistantResponse { .. } => b.assistant_response,
+        };
+        (mind, impact)
     }
 }
 

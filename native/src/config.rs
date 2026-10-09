@@ -29,6 +29,9 @@ pub struct Settings {
     pub glyph_scene: GlyphSceneSettings,
     pub lod: LodSettings,
     pub camera: CameraSettings,
+    pub repo: RepoSettings,
+    pub agent_cards: AgentCardSettings,
+    pub ui: UiSettings,
     pub quad_demo: QuadDemoSettings,
 }
 
@@ -81,6 +84,81 @@ pub struct CameraSettings {
     pub fly_far_max: f32,
 }
 
+/// Repo scenes (`repo::shelf`).
+#[derive(Clone, Debug, PartialEq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RepoSettings {
+    /// Per-directory group tints, multiplied with the syntax colours; a
+    /// directory hashes (FNV-1a) to one entry. The `tint-cycle` verb walks
+    /// the same list. Must be non-empty.
+    pub dir_tints: Vec<[f32; 3]>,
+    /// Far-LOD backdrop tint by file extension (flat colour mode). First
+    /// entry listing the extension wins.
+    pub extension_tints: Vec<ExtensionTint>,
+    /// Backdrop tint for an extension no entry lists.
+    pub extension_tint_fallback: [f32; 3],
+}
+
+#[derive(Clone, Debug, PartialEq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExtensionTint {
+    pub extensions: Vec<String>,
+    pub tint: [f32; 3],
+}
+
+/// Agent-transcript turn cards and workdesk plates (`spatial_scene`).
+#[derive(Clone, Debug, PartialEq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentCardSettings {
+    /// Banner pair (mind page, impact page) for a card given no event colours.
+    pub default_banners: [[f32; 4]; 2],
+    pub mind_page: [f32; 4],
+    pub impact_page: [f32; 4],
+    pub spine: [f32; 4],
+    pub banners: CardBanners,
+    pub workdesk: WorkdeskAccents,
+}
+
+/// Banner pair (mind page, impact page) per transcript event kind.
+#[derive(Clone, Debug, PartialEq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CardBanners {
+    pub user_prompt: [[f32; 4]; 2],
+    pub thinking: [[f32; 4]; 2],
+    pub file_read: [[f32; 4]; 2],
+    pub file_edit: [[f32; 4]; 2],
+    pub file_write: [[f32; 4]; 2],
+    pub command: [[f32; 4]; 2],
+    pub tool_invocation: [[f32; 4]; 2],
+    pub assistant_response: [[f32; 4]; 2],
+}
+
+/// Workdesk plate accent per file action kind.
+#[derive(Clone, Debug, PartialEq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkdeskAccents {
+    pub read: [f32; 4],
+    pub edit: [f32; 4],
+    pub write: [f32; 4],
+    pub ast_analysis: [f32; 4],
+}
+
+/// egui overlay label colours, sRGB 0-255.
+#[derive(Clone, Debug, PartialEq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UiSettings {
+    pub grab_active: [u8; 3],
+    pub history_back: [u8; 3],
+    pub history_live: [u8; 3],
+    pub beat_summary: [u8; 3],
+    pub workdesk_bullet: [u8; 3],
+    pub harness_claude: [u8; 3],
+    pub harness_antigravity: [u8; 3],
+    pub harness_kimi: [u8; 3],
+    pub harness_generic: [u8; 3],
+    pub project_name: [u8; 3],
+}
+
 /// The 1M-instance quad field (`--demo`).
 #[derive(Clone, Debug, PartialEq, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -104,7 +182,12 @@ impl Settings {
     }
 
     fn deserialize_table(table: toml::Table) -> Result<Self, String> {
-        serde::Deserialize::deserialize(toml::Value::Table(table)).map_err(|e| e.to_string())
+        let s: Self = serde::Deserialize::deserialize(toml::Value::Table(table))
+            .map_err(|e: toml::de::Error| e.to_string())?;
+        if s.repo.dir_tints.is_empty() {
+            return Err("[repo] dir_tints must not be empty".into());
+        }
+        Ok(s)
     }
 }
 
@@ -175,7 +258,70 @@ mod tests {
         assert_eq!((c.fly_scroll_step, c.fly_damping), (1.15f32, 10.0f32));
         assert_eq!(c.fly_near, 0.05f32);
         assert_eq!((c.fly_far_fit, c.fly_far_min, c.fly_far_max), (4.0f32, 20_000.0f32, 100_000.0f32));
+
+        let r = &s.repo;
+        let dir_tints: &[[f32; 3]] = &[
+            [1.00, 1.00, 1.00],
+            [1.00, 0.93, 0.87],
+            [0.88, 1.00, 0.92],
+            [0.88, 0.95, 1.00],
+            [1.00, 0.91, 1.00],
+            [0.95, 1.00, 0.88],
+            [1.00, 0.97, 0.86],
+            [0.92, 0.92, 1.00],
+            [0.90, 1.00, 1.00],
+            [1.00, 0.88, 0.88],
+        ];
+        assert_eq!(r.dir_tints, dir_tints);
+        let ext: &[(&[&str], [f32; 3])] = &[
+            (&["rs"], [0.85, 0.40, 0.20]),
+            (&["js", "mjs", "cjs"], [0.95, 0.85, 0.20]),
+            (&["ts", "tsx"], [0.20, 0.50, 0.85]),
+            (&["json"], [0.90, 0.75, 0.30]),
+            (&["md", "markdown"], [0.40, 0.60, 0.80]),
+            (&["toml", "yaml", "yml"], [0.70, 0.40, 0.60]),
+            (&["py"], [0.25, 0.65, 0.55]),
+            (&["c", "h", "cpp", "hpp", "cc"], [0.35, 0.55, 0.85]),
+            (&["go"], [0.20, 0.70, 0.85]),
+            (&["sh", "bash", "zsh"], [0.45, 0.75, 0.45]),
+            (&["html", "htm"], [0.90, 0.45, 0.25]),
+            (&["css", "scss", "less"], [0.30, 0.55, 0.90]),
+        ];
+        assert_eq!(r.extension_tints.len(), ext.len());
+        for (got, (exts, tint)) in r.extension_tints.iter().zip(ext) {
+            assert_eq!(got.extensions, *exts);
+            assert_eq!(got.tint, *tint);
+        }
+        assert_eq!(r.extension_tint_fallback, [0.75f32, 0.75, 0.75]);
+
+        let a = &s.agent_cards;
+        assert_eq!(a.default_banners, [[0.20f32, 0.36, 0.60, 0.95], [0.18, 0.52, 0.35, 0.95]]);
+        assert_eq!(a.mind_page, [0.08f32, 0.10, 0.14, 0.90]);
+        assert_eq!(a.impact_page, [0.10f32, 0.12, 0.17, 0.90]);
+        assert_eq!(a.spine, [0.18f32, 0.22, 0.30, 0.75]);
+        let b = &a.banners;
+        assert_eq!(b.user_prompt, [[0.22f32, 0.38, 0.65, 0.95], [0.18, 0.28, 0.48, 0.95]]);
+        assert_eq!(b.thinking, [[0.48f32, 0.36, 0.15, 0.95], [0.38, 0.28, 0.12, 0.95]]);
+        assert_eq!(b.file_read, [[0.15f32, 0.38, 0.58, 0.95], [0.12, 0.30, 0.48, 0.95]]);
+        assert_eq!(b.file_edit, [[0.65f32, 0.38, 0.12, 0.95], [0.55, 0.30, 0.10, 0.95]]);
+        assert_eq!(b.file_write, [[0.15f32, 0.55, 0.30, 0.95], [0.12, 0.45, 0.25, 0.95]]);
+        assert_eq!(b.command, [[0.28f32, 0.28, 0.32, 0.95], [0.20, 0.20, 0.24, 0.95]]);
+        assert_eq!(b.tool_invocation, [[0.25f32, 0.35, 0.45, 0.95], [0.18, 0.26, 0.35, 0.95]]);
+        assert_eq!(b.assistant_response, [[0.18f32, 0.48, 0.38, 0.95], [0.14, 0.38, 0.30, 0.95]]);
+        let w = &a.workdesk;
+        assert_eq!(w.read, [0.15f32, 0.35, 0.55, 0.90]);
+        assert_eq!(w.edit, [0.60f32, 0.40, 0.15, 0.90]);
+        assert_eq!(w.write, [0.15f32, 0.50, 0.30, 0.90]);
+        assert_eq!(w.ast_analysis, [0.45f32, 0.20, 0.55, 0.90]);
+        // [ui] is integer sRGB, exact by construction; no pin needed.
         assert_eq!(s.quad_demo.clear_color, [0.02, 0.02, 0.04, 1.0]);
+    }
+
+    #[test]
+    fn empty_dir_tints_refused() {
+        let over: toml::Table = toml::from_str("[repo]\ndir_tints = []\n").unwrap();
+        let err = Settings::with_overrides(over).unwrap_err();
+        assert!(err.contains("dir_tints"), "{err}");
     }
 
     #[test]

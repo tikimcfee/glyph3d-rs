@@ -917,7 +917,8 @@ impl GlyphScene {
                 if i < self.tint_step.len() {
                     self.tint_step[i] = step;
                 }
-                let rgb = crate::repo::DIR_TINTS[(step as usize) % crate::repo::DIR_TINTS.len()];
+                let tints = crate::repo::dir_tints();
+                let rgb = tints[(step as usize) % tints.len()];
                 let line = self.apply_verb(ctx, &Verb::TintGroup(rgb));
                 format!("{line} [palette step {step}]")
             }
