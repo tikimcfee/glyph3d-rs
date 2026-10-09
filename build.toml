@@ -296,6 +296,95 @@ needs = ["renderer"]
 compare = "scripted picks and pixel-ray round trips vs an independent Python fold oracle"
 blind_to = "pick paths outside the scripted set"
 
+# ── The layout against the oracle, and the engines against each other ────
+# Re-gated 2026-10-09. 5e94de8 (2026-09-30) removed these with the engine
+# they partly served; the instruments kept shipping and kept passing, run by
+# nothing. Each refuses to pass having compared nothing.
+
+# The Rust layout forms against the JS oracle's recorded answers. The volumes
+# the five halves clear today are quoted in `compare` — a count that quietly
+# drops is how this would go vacuous without going red.
+[[gate]]
+name = "reference-port"
+scope = "corpus"
+kind = "cmd"
+cmd = "bash tools/check-fixture-parity.sh"
+pass_line = "ALL PASS"
+needs = ["renderer", "fixtures"]
+compare = "five Rust forms vs the JS oracle's recorded answers over engine/fixtures (26 pipe + 8 bake, counts declared in the script): trie rebuilt from bytes (23,552 entries); serial fold, every lane of every byte (155,222 leaders, 1,874,328 lanes bit-exact); scan form across 8 tunings (208 cases, 1,188,024 leader-lanes bit-exact, 53,752 within 1e-4); bake + seed protocol (27,315 leaders, 167 checkpoints, 530 queries); text.rs's independent fold over its domain (4 fixtures, 5,332 records)"
+blind_to = "HyperLayout and CubeCL entirely — these are fold.rs/scan.rs/bake.rs/text.rs, not the engines that ship (hyper-oracle holds HyperLayout to fold.rs); the atlas trie (fixtures carry their own synthetic tries); any fixture outside text.rs's domain, silently (22 of 26 today); the parse, except through the lanes computed from it (its second loader, Mojo, is retired)"
+
+# HyperLayout — the production engine — against the oracle-backed fold.
+# RED BY DESIGN on 2026-10-09 (C10 in out/MAINTENANCE-NOTES-2026-10-08.md):
+# HyperLayout's ASCII fast path skips the sequence pass, so keycaps are not
+# clustered; it also ignores the item's cluster mode, and its host Pass 2
+# paginates scroll_rows and page_cols differently from the fold. Green is the
+# day those are fixed; `hyper-head-advance` is the mutation for that day.
+[[gate]]
+name = "hyper-oracle"
+scope = "render"
+kind = "cmd"
+cmd = "GLYPH_TRACE=warn GLYPH_HYPER_ORACLE_STRICT=1 target/release/glyph3d-native --hyper-oracle-check engine/fixtures/*.pipe.bin native/fixtures/cubecl-fork native/fixtures/g-cluster-repo native/fixtures/overflow-leads.txt"
+pass_line = "hyper-oracle PASS"
+needs = ["renderer", "fixtures"]
+compare = "HyperLayout's host layout (records from its recording path, instances from its production Pass 2, placements) vs fold.rs's records compacted by layout::compact_records_into, bit-exact, through layout::diff_backends plus a per-record tally naming the byte: all 26 fixtures' bytes and item params (each item its own buffer), the IMMUTABLE cubecl-fork corpus and g-cluster-repo in cluster mode, overflow-leads.txt. Today 475,234 records / 468,283 instances / 40 placements. STRICT refuses zero records, zero sequence heads, or zero ASCII-led heads"
+blind_to = "RED today (C10): 6 of 29 corpora differ — the first divergence is cluster-keycap byte 0 ('1' U+0031: fold gi 5264, HyperLayout gi 18). Shared with the reference and so invisible here: the atlas trie (TrieTable::lookup, fu_to_world — the fixtures' own tries are world-unit and HyperLayout resolves font units) and fold::{rows_for_line, wrap_segment_of, wrap_row_of}, which HyperLayout borrows (reference-port fences those; phantom-row is the measured example). Also blind to the DEVICE Pass 2 (pass2_device.rs, what a GPU load runs) — this drives HyperLayout with no device"
+
+# HyperLayout against itself. EVERY --repo-engine but cubecl constructs the
+# same HyperLayout (layout.rs's backend table), so this is not an independent
+# witness of anything: under --repo-scan-only (no GPU) the only difference
+# between the two sides is `hyper`'s background prefetch of Pass 1. It
+# catches nondeterminism in the parallel passes and prefetch/inline drift;
+# truth is hyper-oracle's job. --repo-scan-only is LOAD-BEARING: without it
+# this opens the windowed renderer and never returns.
+[[gate]]
+name = "repo-verify"
+scope = "render"
+kind = "repo-verify"
+cmd = "--load-repo fixtures/g-pick-repo --wrap-mode {mode} --repo-engine hyper --repo-verify --repo-scan-only"
+modes = ["down", "back"]
+needs = ["renderer"]
+compare = "`hyper` (prefetched Pass 1, recording) vs a fresh non-prefetched HyperLayout recording: placements, instances and 32 B records bit-exact over g-pick-repo (5 items, 407,133 instances, 407,451 records), both wrap modes; refuses zero items or instances"
+blind_to = "any fault in HyperLayout itself — both sides are HyperLayout (hyper-oracle is the oracle check). `batch`/`naive` are not gated: they run the reference's own code path verbatim. No mutation reddens this on this corpus: the prefetch path differs from the inline one only in a segment-advance table g-pick-repo never reads (measured 2026-10-09: doubling it stayed green), so it is UNCOVERED in prove, honestly"
+
+# `direct`: the non-recording call against the recording one. Same engine,
+# same host path under --repo-scan-only, so records are not compared (direct
+# produces none — the PASS line says `0 records`).
+[[gate]]
+name = "repo-verify-direct"
+scope = "render"
+kind = "repo-verify"
+cmd = "--load-repo fixtures/g-pick-repo --wrap-mode {mode} --repo-engine direct --repo-verify --repo-scan-only"
+modes = ["down", "back"]
+needs = ["renderer"]
+compare = "`direct` (layout_items, no records) vs a HyperLayout recording: placements and instances bit-exact over g-pick-repo, both wrap modes; refuses zero items or instances"
+blind_to = "the wire-record tier (direct makes none) and every fault both calls share — without a GPU both run the same host Pass 2, so this is a determinism check, not a strategy comparison; the device path is not reached. UNCOVERED in prove: no mutation separates the two sides"
+
+# The CubeCL chain. Both RED since before they were re-gated (C10): chain on
+# cluster-flags since 26595fb (2026-10-06, bisected), fork since HyperLayout
+# became its reference (2026-09-30). Gated red so the red is visible; their
+# mutations cannot be proven until the gates are green (prove refuses a gate
+# that is already red), and were checked instead for landing, by hand.
+[[gate]]
+name = "cubecl-chain"
+scope = "rust"
+kind = "cmd"
+cmd = "bash tools/check-cubecl.sh chain"
+pass_line = "ALL PASS"
+needs = ["renderer"]
+compare = "the device chain vs the CPU scan reference (scan.rs) over five fixtures (wrapback-long-line, paged-rows, paged-cols, multi-item, cluster-flags): counts/rows exact, fold>0 X bit-exact, line_adv + positions at the eps tier, the emitted records tier-diffed"
+blind_to = "RED today (C10): cluster-flags, 9 record mismatches since 26595fb. Corpora outside the five fixtures; HyperLayout (this is chain-vs-CPU-scan); the device decode and cluster stages (this driver uploads CPU-computed statics)"
+
+[[gate]]
+name = "cubecl-fork"
+scope = "rust"
+kind = "cmd"
+cmd = "bash tools/check-cubecl.sh fork"
+pass_line = "ALL PASS"
+needs = ["renderer"]
+compare = "the full from-bytes chain vs HyperLayout over the IMMUTABLE native/fixtures/cubecl-fork corpus in STRICT mode: the 32 B slot stream field-equal, placements bit-equal, tint pairs equal, the census's m>=3 / seg>=3 buckets and cluster candidates proven exercised"
+blind_to = "RED today (C10): 314,405 of 314,686 slots / 708,529 lane words differ — and the reference is now HyperLayout, which hyper-oracle shows is itself wrong on this corpus's keycaps, so a green here would mean the chain agrees with HyperLayout, not with the oracle. The script's second (chunked) pass sets GLYPH_RECORD_CHUNK, which nothing has read since d46a6c3: it repeats the first. NO MUTATION: all nine 2026-09-30 targets that still exist textually (tail.rs scatter/extent/tint, position.rs paginate/z-step/segment-reset) and two adapted to the fused apply_and_emit kernel left the counts unchanged (708,529 / 0 / 0, measured by hand 2026-10-09) — they land in kernels this path does not run, or in lanes the comparison does not separate. Corpora outside the fixture"
+
 [[gate]]
 name = "pixel-ab"
 scope = "render"
@@ -541,3 +630,70 @@ expect = "PICK ORACLE CHECK: FAILURES"
 rebuild = "cargo build --release"
 
 
+# ── reference-port, hyper-oracle, cubecl-chain (re-gated 2026-10-09) ─────
+[[mutation]]
+name = "advance-zeroed"
+gate = "reference-port"
+why = "every glyph x-position derives from the per-byte advance; zeroing the accessor must break the fold's agreement with the oracle's recorded lanes. cargo-mutants once measured this exact mutant MISSED by the whole unit suite. CONSUMED BY: fold.rs layout_item's advance sums (and scan.rs's, and the fixture differ's ADVANCE lane) — every fixture"
+file = "native/src/fold.rs"
+op = "replace"
+find = """    pub fn advance(&self, id: usize) -> f32 {
+        self.sm[id * 2]
+    }"""
+with = """    pub fn advance(&self, id: usize) -> f32 {
+        let _ = id;
+        0.0
+    }"""
+expect = "FAIL  full fold"
+rebuild = "cargo build --release"
+
+[[mutation]]
+name = "phantom-row"
+gate = "reference-port"
+why = "the 2026-09-04 phantom row: a wrap rule that counts the terminating newline's own row steals a blank row whenever wrap divides the line length exactly. CONSUMED BY: wrap-exact (lines of 4/8/12 at wrap 4 — the fixture exists for this) and every WrapDown fixture whose lines land on a multiple. A SHARED function: HyperLayout borrows fold::rows_for_line, so hyper-oracle cannot see this (both sides move together) — only the oracle can"
+file = "native/src/fold.rs"
+op = "replace"
+find = "        (length - 1) / wrap + 1"
+with = "        length / wrap + 1"
+expect = "FAIL  full fold"
+rebuild = "cargo build --release"
+
+[[mutation]]
+name = "fixture-deleted"
+gate = "reference-port"
+why = "a fixture removed from engine/fixtures must turn the gate red, not shrink both sides of the comparison — the 2026-09-06 class (eleven of twelve gates green on a shrunken corpus). CONSUMED BY: the script's declared count (26), which is checked before any instrument runs"
+file = "engine/fixtures/wrap-exact.pipe.bin"
+op = "remove"
+expect = "declared — refusing"
+
+[[mutation]]
+name = "hyper-head-advance"
+gate = "hyper-oracle"
+why = "a resolved sequence head at half its bitmap advance: every neighbour after it shifts left. The mutation for the day hyper-oracle is GREEN — it cannot be proven while the gate is red (C10). Landing measured by hand 2026-10-09: 6 -> 10 failing corpora (cluster-flags, cluster-overlap, cluster-skin and g-cluster-repo join), 377 -> 29,557 differing records. CONSUMED BY: char_resolve.rs resolve_leader's sequence-hit return, which every non-ASCII-led head in the fixtures, cubecl-fork/clusters.txt and g-cluster-repo reaches"
+file = "native/src/layout_hyper/char_resolve.rs"
+op = "replace"
+find = "                    advance: bitmap_adv,"
+with = "                    advance: bitmap_adv * 0.5,"
+expect = "hyper-oracle FAIL"
+rebuild = "cargo build --release"
+
+[[mutation]]
+name = "emitter-ordinal-zeroed"
+gate = "cubecl-chain"
+why = "the record emitter places each record at its item base plus its ordinal; dropping the ordinal stacks every record on its item's first slot, which the records witness must catch. Cannot be proven while cubecl-chain is red (C10); landing measured by hand 2026-10-09: 1 -> 5 failing fixtures (multi-item 254 record mismatches). CONSUMED BY: emit_records' global ordinal, the chain-check witness's only subject (adapted from the 2026-09-30 form: the gather moved into item_record_bases + item_record_ordinals)"
+file = "native/src/cubecl_chain/tail.rs"
+op = "replace"
+find = "let global_ordinal = item_record_bases[item_index] + item_record_ordinals[record_index];"
+with = "let global_ordinal = item_record_bases[item_index];"
+expect = "record mismatches"
+rebuild = "cargo build --release"
+
+[[mutation]]
+name = "tail-pads-zero"
+gate = "cargo-test"
+why = "the packed corpus's tail lanes must be 0x80 continuation leads; zero pads decode on device as phantom NUL leaders. Invisible to every device gate (trailing phantom records self-truncate past total_records), so the reddening witness is the host unit test. Restored 2026-10-09 against pack_words' current form (the tail word is built whole now). CONSUMED BY: decode's flags lane, which every byte-indexed kernel reads"
+file = "native/src/cubecl_chain/mod.rs"
+op = "replace"
+find = "        let mut tail_word = 0x8080_8080u32;"
+with = "        let mut tail_word = 0u32;"
+expect = "pack_words_fills_tail_lanes"

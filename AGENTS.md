@@ -147,7 +147,7 @@ read by nothing at all.
 
 ## What the checks actually do
 
-Nine gates, in `build.toml` order. For each: what it compares, what makes it
+Fifteen gates (2026-10-09), in `build.toml` order. For each: what it compares, what makes it
 red, and **what it cannot see**. The last is the part worth reading. A check is
 a claim about a counterfactual, and a check whose blind spot you don't know is
 a green you can't price. (Gates were once numbered positions in one shell
@@ -200,7 +200,7 @@ The Rust-side pins stay — declared count in build.toml and hard pin in the
 test suite are two independent witnesses, not duplicate coverage. Blind to
 whether the oracle is *correct* — it proves reproducibility, not truth. And
 it only proves the corpus is what it was: whether the Rust layout still
-AGREES with the corpus is the job of the retired reference-port gate (below).
+AGREES with the corpus is the job of the reference-port gate (below).
 
 **vendor-hashes.** The hashes of the vendored + derived files
 (`vendor-manifest.py --check`; the two `hb.*` files are additionally re-derived
@@ -266,6 +266,97 @@ mechanical caution: under `set -euo pipefail` an oracle that exits nonzero
 inside a command substitution aborts the script mid-run. The wrapper still
 reports FAIL, but every check after the abort point silently did not run.
 Blind to pick paths outside the scripted set.
+
+**reference-port** (`tools/check-fixture-parity.sh`; re-gated 2026-10-09).
+The Rust layout forms against the JS oracle's recorded answers, five halves,
+with the volumes they clear — quote these when you change it, because a count
+that quietly drops is how this check would go vacuous without going red:
+`--fixture-trie` (26 fixtures, 23,552 trie entries rebuilt from bytes),
+`--fixture-fold` (the serial fold, 155,222 leaders, 1,874,328 per-byte lanes
+bit-exact), `--fixture-scan` (208 cases across 8 tunings; 1,188,024
+leader-lanes bit-exact, 53,752 within 1e-4), `--fixture-bake` (8 fixtures,
+27,315 leaders, 167 checkpoints, 530 seed-protocol queries) and
+`--fixture-reference` (text.rs over its domain: 4 fixtures, 5,332 records).
+The script declares the corpus size (26 + 8) and refuses any other; the bake
+fails if no query ran, the reference if nothing was in domain. Red on any lane
+that leaves its tier. `phantom-row` and `advance-zeroed` prove it reddens
+through the fold, `fixture-deleted` that a shrunken corpus is refused. Blind
+to the engines that SHIP — these are `fold.rs`/`scan.rs`/`bake.rs`/`text.rs`,
+not HyperLayout or CubeCL — to the atlas trie (each fixture carries its own
+synthetic one), and silently to the 22 fixtures outside text.rs's domain. The
+parse is checked only through the lanes computed from it: the second loader
+it was once diffed against (Mojo) is retired.
+
+**hyper-oracle** (`--hyper-oracle-check`, `native/src/hyper_oracle.rs`; new
+2026-10-09, **red**). HyperLayout — the production layout engine — against an
+oracle-backed reference: `fold::run_pipeline` (decode, sequence pass, fold,
+paginate — the form reference-port holds bit-exact to the oracle), its records
+compacted by `layout::compact_records_into` and diffed through
+`layout::diff_backends` plus a per-record tally that names the byte and both
+glyph ids. Three tiers: records (HyperLayout's recording path), instances
+(its production host Pass 2), placements. Corpus: all 26 fixtures' bytes and
+item params (each item its own buffer, as a repo file is), the IMMUTABLE
+`cubecl-fork` corpus and `g-cluster-repo` in cluster mode, and
+`overflow-leads.txt` — the out-of-range decode input no check read after
+2026-09-30. STRICT refuses zero records, zero resolved sequences, and zero
+ASCII-led sequences. **Red on arrival** (C10 in the maintenance notes): 6 of
+29 corpora differ. The keycap class — HyperLayout's ASCII fast path never asks
+whether `1` starts a sequence, so `1️⃣` lays out as `1` plus a stray mark
+(first divergence: `cluster-keycap` byte 0, fold gi 5264 vs HyperLayout gi
+18); HyperLayout ignores the item's cluster MODE (leader-mode ZWJ zeroed in
+`cluster-zwj`; under `--cluster-mode leader` 29,826 records of `cubecl-fork`
++ `g-cluster-repo` differ, ungated); and its host Pass 2 paginates
+`scroll_rows` and `page_cols` differently from the fold (`paged-rows`,
+`paged-cols`, `scroll-only` — instances only: its recording path agrees, its
+production path does not; latent for repos, which set neither). The
+reference's own keycap behaviour is proven: `cluster-keycap.pipe.bin` (`1️⃣`
+and `1⃣` against `[0x31, 0x20E3]`) is in the corpus `--fixture-fold` clears.
+What the two sides SHARE, and this therefore cannot see: the atlas trie
+(`TrieTable::lookup`, `fu_to_world` — the fixtures' own tries are world-unit
+and HyperLayout resolves font units, so the oracle has never seen the atlas
+trie), and `fold::{rows_for_line, wrap_segment_of, wrap_row_of}`, which
+HyperLayout borrows from the reference (reference-port fences those:
+`phantom-row` reddens it and leaves this gate's count unmoved). Also blind to
+the DEVICE Pass 2 (`pass2_device.rs`, what a GPU load runs): this drives
+HyperLayout with no device. `hyper-head-advance` is its mutation, for the day
+it is green (measured landing while red: 6 → 10 failing corpora).
+
+**repo-verify** and **repo-verify-direct** (`--repo-verify`, re-gated
+2026-10-09). `--repo-engine hyper` and `direct` over `g-pick-repo`, both wrap
+modes, diffed against a fresh recording HyperLayout at the seam: placements,
+instances, and records where both sides have them (`direct` has none and its
+PASS line says `0 records`). Each refuses a verify over zero items — before
+2026-09-07 a missing corpus printed `PASS: 0 items` and exited 0. Read the
+pair honestly: **every `--repo-engine` but `cubecl` constructs the same
+HyperLayout**, so this is HyperLayout against HyperLayout. Under
+`--repo-scan-only` (no GPU) the sides differ only by `hyper`'s background
+prefetch of Pass 1, and for `direct` not at all, so these catch
+nondeterminism in the parallel passes and prefetch drift — truth is
+hyper-oracle's job. `batch`/`naive` are not gated: they run the reference's
+own code path verbatim. Both gates are UNCOVERED in prove, and that is the
+finding, not an omission: the prefetch path differs from the inline one only
+in a segment-advance table g-pick-repo never reads (doubling it stayed green,
+measured 2026-10-09), and nothing separates `direct` from its reference
+without a device.
+
+**cubecl-chain** and **cubecl-fork** (`tools/check-cubecl.sh chain|fork`,
+re-gated 2026-10-09, **red**). The chain against the CPU scan reference
+(`scan.rs`) over five fixtures — counts/rows exact, fold>0 X bit-exact,
+positions at the eps tier, emitted records tier-diffed; and the full
+from-bytes chain against HyperLayout over the IMMUTABLE `cubecl-fork` corpus
+in STRICT mode — the 32 B slot stream field-equal, placements bit-equal,
+tint pairs equal, the m>=3 / seg>=3 buckets and cluster candidates proven
+exercised. Both red before they were re-gated (C10): `cluster-flags` fails
+the chain since 26595fb (2026-10-06, bisected); the fork fails since
+HyperLayout became its reference (2026-09-30) — and hyper-oracle shows that
+reference is itself wrong on this corpus's keycaps, so a green fork would
+mean the chain agrees with HyperLayout, not with the oracle. Their mutations
+cannot be proven while red (prove refuses an already-red gate); each restored
+one was instead checked BY HAND to move its gate's counts (the landing
+question), and the ones whose targets moved, or whose edits left the counts
+unchanged, were not restored. The script's second fork pass sets
+`GLYPH_RECORD_CHUNK`, which nothing has read since the records-mode
+retirement (d46a6c3): it repeats the first pass.
 
 **pixel-ab.** The golden views re-rendered and byte-compared against
 `out/tooling-ab/baseline/<key>/` — `cargo glyph graph` lists them, and the count
@@ -373,52 +464,37 @@ no segment substitutes its backdrop quad, so the seg_tint lane is
 pixel-invisible. Its byte-level fence lived in the cubecl-fork gate, which is
 retired, so that lane is currently watched by nothing.
 
-### Retired 2026-09-30, and what it left unwatched
+### Retired 2026-09-30, re-gated 2026-10-09
 
 `5e94de8` ("decouple CubeCL … and clean build.toml") removed seven gates and
-26 mutations. Some served only the retired engine. Four checked pure-Rust
-paths whose **instruments still ship in the binary and still pass**, measured
-2026-10-09 — nothing runs them:
+26 mutations. Three served only the retired engine (engine-suites,
+engine-check, and its Mojo halves). Four checked pure-Rust paths whose
+instruments kept shipping and kept passing, run by nothing for nine days;
+they are back above as reference-port, repo-verify(-direct) and
+cubecl-chain/-fork, and the check that never existed — HyperLayout against
+the oracle — arrived with them, red. In those nine days HyperLayout became the
+only engine, and nothing compared it to anything but itself.
 
-- **reference-port** — the Rust layout against the JS oracle's recorded
-  answers over the whole corpus. Its script (`tools/check-fixture-parity.sh`)
-  also needed the retired engine for one half, so the whole gate went. The Rust
-  halves: `--fixture-trie` (26 fixtures, 23,552 entries rebuilt from bytes),
-  `--fixture-fold` (155,222 leaders, 1,874,328 per-byte lanes bit-exact),
-  `--fixture-scan` (208 cases across 8 tunings; 1,188,024 leader-lanes
-  bit-exact, 53,752 within 1e-4), `--fixture-bake` (8 fixtures, 27,315
-  leaders, 167 checkpoints, 530 seed-protocol queries), `--fixture-reference`
-  (4 in-domain fixtures, 5,332 records). Only the last has a `cargo test`
-  twin; the full-corpus fold, scan, trie and bake checks against the oracle
-  run nowhere.
-- **repo-verify** — `--repo-verify`: one strategy diffed bit-exact against its
-  counterpart over `g-pick-repo`, placements and instances (and records where
-  both paths have them). Passes for `hyper`, `direct` and `batch` in both wrap
-  modes. It refuses a verify over zero items — before 2026-09-07 a missing
-  corpus printed `PASS: 0 items` and exited 0.
-- **cubecl-chain** and **cubecl-fork** — `tools/check-cubecl.sh`: the CubeCL
-  chain against the CPU scan, and the full from-bytes chain against the CPU
-  path's records and slot stream over the IMMUTABLE `native/fixtures/cubecl-fork`
-  corpus, STRICT mode refusing an unexercised bucket. CubeCL is default-on and
-  under heavy work; this was its only bit-exact fence.
-
-`native/fixtures/overflow-leads.txt`, the only input that reaches the
-out-of-range decode path, is now read by no check at all.
-
-The lessons these gates taught stay true and are the pattern for re-gating
-them: **a check must refuse to pass having compared nothing** (the bake fails
-if no query ran, the reference fails if nothing was in domain, repo-verify
-refuses zero items, STRICT refuses an unexercised bucket), and a count that
-quietly drops is how a check goes vacuous without going red — quote the
-volumes.
+The lessons these gates taught stay true and are the pattern for any new one:
+**a check must refuse to pass having compared nothing** (the bake fails if no
+query ran, the reference fails if nothing was in domain, repo-verify refuses
+zero items, STRICT refuses an unexercised bucket, the parity script refuses a
+corpus of the wrong size), and a count that quietly drops is how a check goes
+vacuous without going red — quote the volumes. And a gate that compares an
+engine to itself is a determinism check: say so in its `blind_to`.
 
 ### What the whole battery cannot see
 
 Worth holding in one place, because each check's blind spot is defensible alone
 and the union is not:
 
-- **The layout's agreement with the JS oracle, the strategies' agreement with
-  each other, and the CubeCL chain** — retired, above.
+- **The device Pass 2.** hyper-oracle and repo-verify drive HyperLayout with
+  no GPU, so the emission a real load runs (`layout_hyper/pass2_device.rs`,
+  mapped or staged slots) is compared to the host emission by unit tests and
+  to the oracle by nothing but pixels.
+- **The atlas trie's VALUES.** Every oracle comparison runs on the fixtures'
+  synthetic tries; hyper-oracle runs both sides on the atlas trie, so a wrong
+  advance in `codepoints.bin` moves both sides together.
 - **Nothing executes the benches.** `tools/bench_hyper.py` and the
   `--cubecl-chain-bench` instrument are run by hand.
 - **`tools/verify_atlas.py`, `preview_glyphs.py`, `repro_pick_oblique.py`** are
