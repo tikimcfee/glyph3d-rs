@@ -1006,7 +1006,7 @@ mod tests {
             assert_eq!(d.glyph_and_wrap & 0xFFFF, h.glyph_id & 0xFFFF, "slot {k}: glyph");
             assert_eq!(d.glyph_and_wrap >> 16, want_wrap, "slot {k}: wrap segment");
             assert_eq!(d.color, h.color, "slot {k}: color");
-            assert_eq!((d.item_and_group >> 16), h.group_id, "slot {k}: group");
+            assert_eq!(d.group_id(), h.group_id, "slot {k}: group");
             assert_eq!(d.row, h.row, "slot {k}: row");
         }
     }

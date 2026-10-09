@@ -271,6 +271,10 @@ fn stage_single_buffer<E: SlotEmit>(
         .collect();
 
     dev.queue.submit([encoder.finish()]);
+    let _ = dev.device.poll(wgpu::PollType::Wait {
+        submission_index: None,
+        timeout: None,
+    });
     (pass2, emoji_tint_pairs, chunks)
 }
 
@@ -291,6 +295,19 @@ fn stage_host_memory<E: SlotEmit>(
 
     let (pass2, emoji_tint_pairs) = inputs.run::<E>(host_ptr as usize);
 
+    const STAGING_BYTES: usize = 64 * 1024 * 1024; // 64 MiB streaming staging buffer
+
+    // Allocate ONE reusable staging buffer mapped at creation.
+    // Total VRAM overhead for staging is strictly capped at 64 MiB.
+    let staging_buf = dev.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("glyph slots streaming staging"),
+        size: STAGING_BYTES as u64,
+        usage: wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::MAP_WRITE,
+        mapped_at_creation: true,
+    });
+
+    let mut is_mapped = true;
+
     let chunks: Vec<DeviceSlotChunk> = plan.chunk_counts
         .iter()
         .enumerate()
@@ -301,31 +318,60 @@ fn stage_host_memory<E: SlotEmit>(
             let copy_bytes = (count as usize * plan.slot_bytes)
                 .min((plan.total_bytes as usize).saturating_sub(src_offset));
 
-            let staging_buf = dev.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("glyph slots chunk (staging)"),
-                size: chunk_size,
-                usage: wgpu::BufferUsages::COPY_SRC,
-                mapped_at_creation: true,
-            });
-            if copy_bytes > 0 {
-                let mut mapped = staging_buf
-                    .slice(..)
-                    .get_mapped_range_mut()
-                    .expect("chunk staging mapped range");
-                let dest_ptr = mapped.slice(..).as_raw_element_ptr().as_ptr();
-                let dst = unsafe { std::slice::from_raw_parts_mut(dest_ptr, copy_bytes) };
-                let src = unsafe { std::slice::from_raw_parts(host_ptr.add(src_offset), copy_bytes) };
-                dst.copy_from_slice(src);
-            }
-            staging_buf.unmap();
-
             let buffer = create_chunk_buffer(dev, chunk_size, &chunk_label);
 
-            let mut encoder = dev.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("glyph_hyper_chunk_staging_copy"),
-            });
-            encoder.copy_buffer_to_buffer(&staging_buf, 0, &buffer, 0, chunk_size);
-            dev.queue.submit([encoder.finish()]);
+            let mut written = 0;
+            while written < copy_bytes {
+                let slice_len = (copy_bytes - written).min(STAGING_BYTES);
+
+                if !is_mapped {
+                    let (tx, rx) = std::sync::mpsc::channel();
+                    staging_buf.slice(..).map_async(wgpu::MapMode::Write, move |res| {
+                        let _ = tx.send(res);
+                    });
+                    dev.device
+                        .poll(wgpu::PollType::Wait {
+                            submission_index: None,
+                            timeout: None,
+                        })
+                        .expect("staging poll failed");
+                    rx.recv()
+                        .expect("staging callback dropped")
+                        .expect("staging map_async failed");
+                    is_mapped = true;
+                }
+
+                {
+                    let mut mapped = staging_buf
+                        .slice(..)
+                        .get_mapped_range_mut()
+                        .expect("staging mapped range");
+                    let dest_ptr = mapped.slice(..).as_raw_element_ptr().as_ptr();
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            host_ptr.add(src_offset + written),
+                            dest_ptr,
+                            slice_len,
+                        );
+                    }
+                }
+                staging_buf.unmap();
+                is_mapped = false;
+
+                let mut encoder = dev.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("glyph_hyper_chunk_slice_copy"),
+                });
+                encoder.copy_buffer_to_buffer(
+                    &staging_buf,
+                    0,
+                    &buffer,
+                    written as u64,
+                    slice_len as u64,
+                );
+                dev.queue.submit([encoder.finish()]);
+
+                written += slice_len;
+            }
 
             DeviceSlotChunk {
                 buffer,
@@ -335,9 +381,17 @@ fn stage_host_memory<E: SlotEmit>(
         })
         .collect();
 
+    // Ensure last copy completes before staging buffer is dropped.
+    let _ = dev.device.poll(wgpu::PollType::Wait {
+        submission_index: None,
+        timeout: None,
+    });
+    drop(staging_buf);
+
     unsafe {
         std::alloc::dealloc(host_ptr, layout);
     }
 
     (pass2, emoji_tint_pairs, chunks)
 }
+

@@ -22,13 +22,31 @@ pub struct DerivedSlot {
 
 impl DerivedSlot {
     #[inline(always)]
-    pub fn new(x: f32, row: u32, glyph_id: u16, wrap_segment: u16, color: u32, item_idx: u16, group_id: u16) -> Self {
+    pub fn new(x: f32, row: u32, glyph_id: u16, wrap_segment: u16, color: u32, _item_idx: u16, group_id: u16) -> Self {
         Self {
             x,
             row,
             glyph_and_wrap: (glyph_id as u32) | ((wrap_segment as u32) << 16),
             color,
-            item_and_group: (item_idx as u32) | ((group_id as u32) << 16),
+            item_and_group: group_id as u32,
+        }
+    }
+
+    #[inline(always)]
+    pub fn with_item_and_group(
+        x: f32,
+        row: u32,
+        glyph_id: u16,
+        wrap_segment: u16,
+        color: u32,
+        item_and_group: u32,
+    ) -> Self {
+        Self {
+            x,
+            row,
+            glyph_and_wrap: (glyph_id as u32) | ((wrap_segment as u32) << 16),
+            color,
+            item_and_group,
         }
     }
 
@@ -40,6 +58,11 @@ impl DerivedSlot {
     #[inline(always)]
     pub fn wrap_segment(&self) -> u16 {
         (self.glyph_and_wrap >> 16) as u16
+    }
+
+    #[inline(always)]
+    pub fn group_id(&self) -> u32 {
+        self.item_and_group
     }
 }
 
