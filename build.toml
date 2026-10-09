@@ -770,3 +770,7 @@ op = "replace"
 find = "    let body = size - size % FAST_COPY_ALIGN;"
 with = "    let body = size;"
 expect = "split_body_is_fast_aligned_and_covers_the_size"
+# cargo test --release builds the renderer bin too (integration tests), so
+# without a restore rebuild prove would leave the MUTATED renderer in
+# target/release under an unchanged input hash (found 2026-10-09).
+rebuild = "cargo build --release"
