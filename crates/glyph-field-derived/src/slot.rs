@@ -2,7 +2,7 @@
 //!
 //! Layout:
 //!   w0 (offset 0):  x: f32 (pen origin in world units)
-//!   w1 (offset 4):  line_idx: u32 (indexes line table {item_idx, row})
+//!   w1 (offset 4):  row: u32 (the glyph's row in its item; Y/Z derive from it)
 //!   w2 (offset 8):  glyph_and_wrap: u32 (low 16: glyph_id, high 16: wrap_segment)
 //!   w3 (offset 12): color: u32 (packed RGBA8)
 //!   w4 (offset 16): group_id: u32 (the addressability hook into GroupRow)

@@ -2,9 +2,9 @@
 //! Extracted from `glyph_scene.rs` to modularize shader and pipeline creation.
 //!
 //! The glyph field's own bind group layout, glyph pipeline and selection-mask
-//! pipeline moved into the field-mode crates in the 2026-10 split (Instanced:
-//! `crates/glyph-field-instanced/src/pipeline.rs`); the scene asks its field
-//! for a mask pipeline and hands it in here.
+//! pipeline moved into the field-mode crates in the 2026-10 split, and from
+//! there into the shared `glyph_field::FieldCore` (C1, 2026-10-09); the scene
+//! asks its field for a mask pipeline and hands it in here.
 
 use crate::glyph_scene::target::{CompositeState, SelectionFx, POOL_FORMAT};
 use std::cell::Cell;

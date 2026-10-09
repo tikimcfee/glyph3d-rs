@@ -10,15 +10,17 @@
 //! - [`upload`]: the 48 B → 32 B transcode; the upload itself (direct mapped
 //!   write on unified memory, staging + copy on discrete) and the chunked slot
 //!   storage are `glyph_field`'s, shared with the Derived mode (C1).
-//! - [`pipeline`]: the bind group layout, glyph pipeline and mask pipeline.
-//! - [`field`]: [`InstancedField`], the `GlyphField` implementation.
+//! - [`field`]: [`InstancedField`], the `GlyphField` implementation: this
+//!   mode's slot writes over `glyph_field::FieldCore` (pipelines, chunk bind
+//!   groups, draws).
 //!
 //! Moved out of `native/src/glyph_scene/{instance,buffers,pipelines}.rs` when
 //! the field split into modes (2026-10) — a pure move: same labels, same
 //! upload paths, same pipeline state, and the WGSL byte-identical (git mv).
+//! The mode-neutral half then moved again, into `glyph_field` (C1, 2026-10-09),
+//! with the same labels and state.
 
 pub mod field;
-pub mod pipeline;
 pub mod slot;
 pub mod upload;
 
