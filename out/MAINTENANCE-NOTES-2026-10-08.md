@@ -28,7 +28,7 @@ machines and clones, **M** machine-specific values, **R** runner.
 | D5 | pixi carried the retired engine's tasks and mojo/max toolchain | closed | 16372a9 (tasks), 6954a9d (deps, lock re-solved; Mac env unsolved-installed) |
 | D6 | Orphaned configs: `deny.toml` (nothing runs it) | open | gate or delete; mutants.toml fixed in 16372a9, fixture-parity script moved to D8 |
 | D7 | Loose root docs: session handoffs, plus Mojo-era TOOLING-PLAN.md open items, BUILD-BRIEF.md, research/ surveys | open | move handoffs to `out/`; banner or trim the rest |
-| D8 | Retired Rust checks still ship; reference-port and repo-verify PASS, nobody runs them; `overflow-leads.txt` read by nothing | closed | re-gated 2026-10-09 (reference-port, repo-verify(-direct) green; cubecl-chain/-fork red per C10) plus the new hyper-oracle gate (red); hash in a follow-up |
+| D8 | Retired Rust checks went unwatched from 09-30; `overflow-leads.txt` read by nothing | closed | 0336e85, 48a75d9, 5257df9 (reference-port, repo-verify x2, cubecl-chain/-fork, new hyper-oracle; 15 gates), 50c7085 (chain green) |
 | D9 | `engine-trie.bin` (+ `gen_real_trie.py`, `--engine-trie`) is committed and gated but read by no Rust code | open | decide: keep or retire (changes committed-artifacts) |
 | C1 | Twin field crates ~60% shared; five copies of the mapped-buffer upload | open | hoist into `glyph-field`; last, largest |
 | C2 | Oversized files; dead kernels in `cubecl_chain/position.rs` | open | delete dead kernels; split `glyph/src/main.rs` |
@@ -41,6 +41,8 @@ machines and clones, **M** machine-specific values, **R** runner.
 | C9 | `discovery.rs` names a Claude project by the slug's last `-` segment (`…-glyph3d-js` → `js`) | open | small fix |
 | C10 | Two defects attributed (detail). Defect 2 (chain) FIXED in c5ef78a, it was the instrument. Defect 1: HyperLayout vs the oracle, now measured by the `hyper-oracle` gate (red), with two more HyperLayout defects (detail) | open | fix HyperLayout clusters with a perf A/B on the M2 |
 | C12 | CubeCL's standalone cluster pass (`--cubecl-cluster-check`, bench cluster mode; NOT the repo path's fused decode_probe) misses keycap/overlap/wrap sequences and ZWJ families; fails identically at d08af8b | open | instrument-only; fix or retire the standalone pass |
+| C13 | HyperLayout ignores the item's cluster mode (leader-mode ZWJ zeroed; 29,826 records differ on the cluster corpora in leader mode) | open | fix with C10 defect 1 (same resolver) |
+| C14 | HyperLayout's host Pass 2 paginates `scroll_rows`/`page_cols` differently from the fold (instances only; recording path agrees) | open | latent for repos (they set neither); fix after C10 |
 | C11 | Mutation `find` strings also match their own entry in build.toml; correct only because the target comes first | open | small: anchor them, or have the prover refuse an ambiguous find |
 | P1 | pixel-ab red on both platforms since 10-07; Linux set a month stale, 2 views never adopted | Ivan's call | Mac re-baseline first, then Linux re-adoption |
 | X1 | Experiments' Zed symlink scheme never built against real Zed | next up | needs a Zed checkout or the Mac; fieldzed's dylib build.rs deleted in 6a0b669 |
@@ -76,6 +78,9 @@ None pushed or merged to main; that is Ivan's call.
 | 7a99b5a | Mojo/FFI removed from native comments, help text, native/AGENTS.md; `--fixture-manifest` deleted |
 | 228ff6d | board after the retired-engine series |
 | 6f6f004 | merge main (large-dataset fixes); floor 237; renders byte-identical to main@164af5c |
+| c5ef78a | CubeCL chain check fixed (26595fb broke the instrument, not production) |
+| 0336e85..5257df9 | five checks re-gated + hyper-oracle (helper agent); 15 gates, floor 240 |
+| 50c7085 | cubecl-chain green, mutation proven |
 
 Main's build fix (872621d, the other agent's) was fast-forwarded in first.
 
