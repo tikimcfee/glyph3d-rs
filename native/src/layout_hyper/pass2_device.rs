@@ -7,8 +7,8 @@
 //!
 //! - [`RenderEmit`] — the Instanced field's 32 B `RenderSlot`.
 //! - [`DerivedEmit`] — the Derived field's 20 B `DerivedSlot`, whose Y/Z the
-//!   vertex stage re-derives from `line_table[line_base + row]` and the
-//!   slot's wrap segment.
+//!   vertex stage re-derives from the slot's row, its item's `ItemParamsGpu`
+//!   and its wrap segment.
 
 use rayon::prelude::*;
 use crate::atlas::TrieTable;

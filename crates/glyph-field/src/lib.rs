@@ -24,6 +24,9 @@
 //!   what a mode is built from.
 //! - [`SlotStorage`] / [`upload_host_slots`]: the chunked slot buffers and the
 //!   host upload, generic over a mode's [`SlotRecord`] and its [`Transcode`].
+//! - [`FieldCore`]: the glyph and mask pipelines, the per-chunk bind groups,
+//!   draw recording and the slot dump; a mode adds its WGSL and any extra
+//!   bindings through a [`FieldShape`].
 //!
 //! The one invariant every mode must keep: **each glyph is individually
 //! addressable** by its slot — its color and its placement can be edited
@@ -31,6 +34,7 @@
 
 mod copy;
 mod field;
+mod field_core;
 mod mode;
 mod records;
 mod resources;
@@ -39,6 +43,7 @@ mod upload;
 
 pub use copy::{copy_split, padded_staging_size, split_copy_size, FAST_COPY_ALIGN};
 pub use field::{split_at_chunks, GlyphField};
+pub use field_core::{FieldCore, FieldShape};
 pub use mode::{GlyphFieldMode, ParseGlyphFieldModeError};
 pub use records::{GlyphInstance, GlyphPlacement, GroupRow, ItemParamsGpu, LineRecord};
 pub use resources::{
