@@ -17,7 +17,7 @@ advice). Its shader idea held up. These specifics did not, for this renderer:
 | fixed 200 / 2000 spacing, unprojected world rays | 1 text cell = 1.0 world unit; eye reaches ~1e4 (f32 cancellation) | spacings in config (10 / 100); camera-relative rays; grid phase reduced in f64 |
 | windowed-only enable | leaves the ground unpinned by any golden | `--environment` flag, works offscreen; a golden view for it is step 2 |
 
-## What landed (5 commits)
+## What landed (first 5 commits)
 
 1. `f335d74` — `launch_config.toml` parsed with the `toml` crate (already in the
    lockfile via cubecl). **Unknown keys are errors** naming the key; a config that
@@ -63,6 +63,46 @@ was proven another way:
 | `ground-environment/repo-oblique-ground.png` | the `repo-back-oblique` pose |
 | `ground-environment/repo-high-ground.png` | `--cam-pose 150 400 400 0 -35` |
 | `ground-environment/axes-ground.png` | `--cam-pose -150 100 250 -30 -35` (x axis) |
+
+## Follow-ups after the first review (same day)
+
+Ivan's review of the windowed build: the ground renders correctly, the sky
+gradient helps the space read, and the fog is too dense on tall content. Four
+more commits:
+
+6. `8291387` — **fog is now measured in multiples of the scene's fit distance**
+   (`fog_start_fit` 1.5, `fog_end_fit` 12). Fixed world units (200..6000) buried
+   tall scenes: `native/src` lays out at 2836 x 3146 units. Fit is constant per
+   scene, so nothing moves while you fly. Renders: `tall-{front,oblique}-ground.png`.
+   Far-LOD backdrops are translucent, so the grid now shows through them.
+   That is accurate.
+7. `c8cf832` — selection tint, recolor-verb colours, and the remaining camera
+   values (pitch limit, front/orbit depth range, orbit path, `--demo` camera)
+   into config. The config guard caught an ordering bug: `parse_verb` runs inside
+   clap, before the launch config is read. Verbs now resolve their default
+   colour when applied.
+8. `63eb453` — **transcript text palette (option A)**. 82 distinct colours
+   become 15 neutral roles plus one accent per event kind. Colour means one
+   thing, the kind, so a scroll down the deck reads as "a run of edits, then
+   thinking". Section headings take the kind's accent. Titles stay white
+   (coloured titles were tried: same-hue text on the banner lost contrast).
+   Edit moved from amber to flame orange, because it sat 14 apart from
+   thinking's gold. A test now keeps every pair of kind accents >= 45 apart.
+   Renders: `transcript-deck-{before,after}.png`.
+
+Still open from this round:
+
+- **Mesh lighting** (light direction, 0.8 diffuse, 0.2 ambient) is in the
+  fenced `mesh.wgsl`. Moving it to config needs a uniform added to that shader.
+- **The greeking dials**, the frame-time cap (0.1 s), and setup's assumed
+  1.6 aspect ratio are still compiled in. **Key bindings** are on hold until
+  the omnibar / shortcut work.
+- **Claude Code transcripts may misclassify beats.** Every recent session showed
+  long stretches of only "assistant response" or only "command" beats, even
+  where Read calls were interleaved. That needs a look at
+  `agent_transcript/claude.rs` before the deck's kind colouring can show its
+  full value on real sessions. The renders above use a synthetic mixed-kind
+  transcript for that reason.
 
 ## Step 2 — next, and golden-moving
 
