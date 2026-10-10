@@ -357,7 +357,21 @@ after `hide-group` reads `segments 5 (1 hidden) | items 4/5 visible | lines
 tier), back to `5/5` and `318` after `show-group`; every HUD line ends
 `| selection 0:0..1 | pick alpha.rs byte 0`. `GLYPH_G_DUMP=0:35` printed
 `transient slot 19: [40879d21, 00000003, 00000042, ffd4d4d4, 00000000]` — the
-same five words the Derived field's slot 32 holds for that glyph.
+same five words the Derived field's slot 32 holds for that glyph. The two
+modes' recolour frames (`visible-recolor.png` vs `derived-recolor.png`,
+the first two commands above) are byte-identical on this box: 0 px differ.
+
+On the M2 (metal-apple, 2026-10-10, the same rev through the remote job):
+the full battery green there too (15 of 15, 314 tests, every golden
+byte-equal plain and under `--field-mode derived`); hyper-oracle's visible
+tier 1,497,095 slots flat and 1,497,095 again under spans (641,641 coloured)
+in the strict run, the same figures as here; the witness coincides EXACTLY
+in every case there as well (0 px in one mask only, identical boxes), with
+Metal inking two pixels fewer than Vulkan on the row band (57,715), the
+background quad (38,856) and the hidden file (94,230) — isolated edge flips,
+the cross-vendor noise the pixel gate's `drift` instrument names.
+`GLYPH_G_DUMP=0:35` printed the same transient slot 19 and the same five
+words, and the two modes' recolour frames were byte-identical there too.
 
 What this cannot see: `set_item_bbox` (a wrong box is a culling error,
 pixel-visible only when it culls the item — the HUD's items tier is the
