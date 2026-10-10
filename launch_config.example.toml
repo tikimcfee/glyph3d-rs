@@ -20,13 +20,24 @@ file_backgrounds = true
 # File card background RGBA color [red, green, blue, alpha] (normalized 0.0 to 1.0)
 file_bg_color = [0.10, 0.10, 0.13, 0.85]
 
-# Macro LOD threshold in on-screen px/em (default: 1.0).
-# Below this threshold, distant files collapse into an LOD backdrop quad.
-lod_min_px = 1.0
+# LOD thresholds, in on-screen pixels per text row (how tall a row of text
+# appears on screen); fixed, never adapted to the camera. The Debug panel's
+# two sliders move them live and keep text_detail_px >= show_glyphs_px.
+#
+# "Show glyphs" (default: 1.0): rows at least this tall are drawn as glyphs;
+# below it a distant file collapses into its backdrop rectangle (in visible
+# mode a line becomes a wash). Was `lod_min_px`; the old key still parses.
+show_glyphs_px = 1.0
+
+# "Text detail" (default: 10.0): rows at least this tall get full curve
+# detail; below it glyphs fuzz progressively (greeking). Was `greek_onset_px`;
+# the old key still parses.
+text_detail_px = 10.0
 
 # Greeking / Moiré suppression (default: true).
-# Smooths subpixel glyphs (< 5px) into stable horizontal ink bars,
+# Smooths subpixel glyphs into stable horizontal ink bars below text_detail_px,
 # eliminating high-frequency sparkling, strobing, and aliasing during flight.
+# greek_smooth = true blends gradually instead of the default hard cut.
 greeking = true
 
 # Wrap layout mode: "back" (Z-staircase), "down" (vertical columns), etc.

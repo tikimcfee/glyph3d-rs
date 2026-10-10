@@ -123,8 +123,8 @@ atlas trie (`layout_hyper::visible::trie_upload`: the raw `codepoints.bin`
 sections, the sequence table, a 0x110000-bit first-member bitmap, the
 metrics) and calls `VisibleField::new`. Per frame, `render.rs` calls
 `field.prepare(..)` with the camera, viewport, `px_scale`, the two LOD
-thresholds (glyph tier = `[lod] min_px`, backdrop tier = `[lod]
-visible_backdrop_px`, both live from the panel), `greek_mode`, the debug
+thresholds (glyph tier = `[lod] show_glyphs_px` — `min_px` until C26 —,
+backdrop tier = `[lod] visible_backdrop_px`, both live from the panel), `greek_mode`, the debug
 tint and time; the CPU cull runs only for the BACKDROPS (under the backdrop
 threshold) and the hidden flags; the glyph phase is the field's own draw
 plus `record_wash_draw`. Selection and the slot verbs draw/apply nothing in
@@ -143,8 +143,9 @@ target/release/glyph3d-native --load-repo native/fixtures/g-pick-repo --field-mo
 # The panel door: launch in any mode, F1, "glyph field mode" → "Visible (no slots)".
 # The scene rebuilds through the same arm the other selectors use; the
 # highlighted label is the mode actually BUILT (a lane-limit fallback shows
-# as Instanced). The "visible field" block under cull/LOD has the backdrop
-# px/em slider and the debug tint selector.
+# as Instanced). Under the panel's LOD block (C26: "Text detail" and "Show
+# glyphs", px per text row) visible mode adds the "File rectangle" handle
+# under Show glyphs, and the debug tint selector.
 target/release/glyph3d-native --load-repo native/fixtures/g-pick-repo --field-mode derived
 
 # The TUI door: cargo glyph run → "3. Graphics & Shading" → Field Mode, ◄/►

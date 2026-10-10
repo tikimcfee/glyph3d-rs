@@ -99,7 +99,7 @@ mod target;
 use target::{CompositeState, Selection, ViewTarget, SCENE_SAMPLE_COUNT};
 
 mod ui_probe;
-pub use ui_probe::{UiCarrelState, UiProbe, UiProbeState};
+pub use ui_probe::{LodHandle, UiCarrelState, UiProbe, UiProbeState};
 
 mod environment;
 mod interaction;

@@ -51,19 +51,31 @@ pub struct GlyphSceneSettings {
     pub selection_tint: [f32; 4],
 }
 
-/// Far-LOD substitution (`glyph_scene::cull`).
+/// Far-LOD substitution (`glyph_scene::cull`) and text detail (the glyph
+/// shaders' greeking). Every threshold is px per text row — how many
+/// on-screen pixels tall a row appears — fixed, never camera-adapted; the
+/// Debug panel keeps them ordered `text_detail_px >= show_glyphs_px >=
+/// visible_backdrop_px` (`UiProbeState::keep_lod_order`).
 #[derive(Clone, Debug, PartialEq, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LodSettings {
-    /// On-screen px per em below which a segment draws its backdrop quad
-    /// instead of glyphs (default for `--lod-min-px`).
-    pub min_px: f32,
+    /// "Show glyphs": at or above this a segment is drawn as glyphs; below
+    /// it, its backdrop rectangle (visible mode: a line wash). Default for
+    /// `--show-glyphs-px`. Was `min_px` until 2026-10-10 (C26); the old key
+    /// in a launch_config.toml `[lod]` section is renamed before the merge
+    /// (`RENAMED_SETTINGS_KEYS`).
+    pub show_glyphs_px: f32,
+    /// "Text detail": at or above this glyphs render with full curve detail;
+    /// below it the shader fuzzes their windings progressively (greeking;
+    /// `--no-greeking` / `--greek-smooth`). Default for `--text-detail-px`.
+    pub text_detail_px: f32,
     /// Backdrop coverage gain: backdrop alpha = ink fraction x gain.
     pub backdrop_gain: f32,
-    /// `--field-mode visible` only: on-screen px per em below which a whole
-    /// item collapses to its backdrop quad. Between this and `min_px` its
-    /// lines are WASHES (one quad per line); at or above `min_px` they are
-    /// laid out as glyphs. The other modes never read it.
+    /// `--field-mode visible` only: below this a whole item collapses to
+    /// its backdrop rectangle. Between this and `show_glyphs_px` its lines
+    /// are WASHES (one quad per line); at or above `show_glyphs_px` they are
+    /// laid out as glyphs. The panel's "File rectangle" handle under "Show
+    /// glyphs". The other modes never read it.
     pub visible_backdrop_px: f32,
 }
 
@@ -312,9 +324,10 @@ impl Settings {
     }
 
     /// The compiled defaults with `overrides` deep-merged over them.
-    pub fn with_overrides(overrides: toml::Table) -> Result<Self, String> {
+    pub fn with_overrides(mut overrides: toml::Table) -> Result<Self, String> {
         let mut table: toml::Table = toml::from_str(DEFAULTS_TOML)
             .map_err(|e| format!("config/defaults.toml: {e}"))?;
+        rename_old_keys(&mut overrides);
         merge(&mut table, overrides);
         Self::deserialize_table(table)
     }
@@ -326,6 +339,26 @@ impl Settings {
             return Err("[repo] dir_tints must not be empty".into());
         }
         Ok(s)
+    }
+}
+
+/// Settings keys renamed since a launch_config.toml may have been written:
+/// (section, old key, new key). The old spelling is moved to the new one
+/// BEFORE the merge, so it replaces the defaults' key instead of landing
+/// beside it (serde would then refuse the pair as a duplicate field). When a
+/// file carries both, the new key wins.
+const RENAMED_SETTINGS_KEYS: &[(&str, &str, &str)] = &[
+    // C26 (2026-10-10): "Show glyphs" got its plain name.
+    ("lod", "min_px", "show_glyphs_px"),
+];
+
+fn rename_old_keys(overrides: &mut toml::Table) {
+    for (section, old, new) in RENAMED_SETTINGS_KEYS {
+        if let Some(toml::Value::Table(t)) = overrides.get_mut(*section) {
+            if let Some(v) = t.remove(*old) {
+                t.entry((*new).to_string()).or_insert(v);
+            }
+        }
     }
 }
 
@@ -376,6 +409,19 @@ mod tests {
         Settings::defaults().expect("config/defaults.toml must parse into Settings");
     }
 
+    /// A `[lod] min_px` written before C26 (2026-10-10) still merges, into
+    /// `show_glyphs_px`; the defaults' own key is replaced, not duplicated.
+    #[test]
+    fn old_lod_min_px_override_renames_to_show_glyphs_px() {
+        let over: toml::Table = toml::from_str("[lod]\nmin_px = 2.5\n").unwrap();
+        let s = Settings::with_overrides(over).unwrap();
+        assert_eq!(s.lod.show_glyphs_px, 2.5f32);
+        assert_eq!(s.lod.text_detail_px, 10.0f32, "an untouched key keeps its default");
+        // Both spellings: the new key wins, the old is dropped.
+        let both: toml::Table = toml::from_str("[lod]\nmin_px = 2.5\nshow_glyphs_px = 3.0\n").unwrap();
+        assert_eq!(Settings::with_overrides(both).unwrap().lod.show_glyphs_px, 3.0f32);
+    }
+
     /// Migration pin: each value moved out of the code must come back from
     /// the defaults file bit-identical to the literal it replaced (a TOML
     /// float goes decimal -> f64 -> f32, which can land one ulp away from a
@@ -386,7 +432,10 @@ mod tests {
         let s = Settings::defaults().unwrap();
         assert_eq!(s.glyph_scene.clear_color, [0.07, 0.07, 0.09, 1.0]);
         assert_eq!(s.glyph_scene.file_bg_color, [0.10f32, 0.10, 0.13, 0.85]);
-        assert_eq!(s.lod.min_px, 1.0f32);
+        assert_eq!(s.lod.show_glyphs_px, 1.0f32);
+        // 10.0 was `Params { greek_onset_px: 10.0 }` in glyph_scene/setup.rs
+        // until C26 (2026-10-10).
+        assert_eq!(s.lod.text_detail_px, 10.0f32);
         assert_eq!(s.lod.backdrop_gain, 0.7f32);
         assert_eq!(s.lod.visible_backdrop_px, 0.25f32);
         let c = &s.camera;

@@ -52,8 +52,8 @@ pub(super) fn render_scene(
     // drag takes effect this frame. This is the SINGLE write site of
     // CullState::lod_min_px, and it runs only when a windowed probe is
     // installed — offscreen never installs one, so offscreen culls with
-    // the `[lod] min_px` setting by construction (gate 6's byte-equal PNGs are
-    // the proof).
+    // the `[lod] show_glyphs_px` setting by construction (gate 6's byte-equal
+    // PNGs are the proof).
     if let (Some(probe), Some(cull)) = (&scene.ui_probe, &scene.cull) {
         let p = probe.borrow();
         cull.lod_min_px.set(p.lod_min_px);
@@ -103,7 +103,7 @@ pub(super) fn render_scene(
     // glyph-tier lines into its transient slots) goes into THIS encoder
     // before the glyph pass. The thresholds are the cull cells (live from the
     // panel in windowed runs, the `[lod]` settings offscreen): the glyph tier
-    // is the existing `min_px`, the backdrop tier the visible mode's own.
+    // is the existing `show_glyphs_px`, the backdrop tier the visible mode's own.
     if self_drawing {
         let p = scene.params.get();
         let (lod_glyph_px, lod_backdrop_px) = scene
@@ -112,7 +112,7 @@ pub(super) fn render_scene(
             .map(|c| (c.lod_min_px.get(), c.lod_backdrop_px.get()))
             .unwrap_or_else(|| {
                 let s = &crate::config::settings().lod;
-                (s.min_px, s.visible_backdrop_px)
+                (s.show_glyphs_px, s.visible_backdrop_px)
             });
         let prepare = glyph_field::FramePrepare {
             view_proj: frame.view_proj.to_cols_array_2d(),

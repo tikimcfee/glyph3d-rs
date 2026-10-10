@@ -283,15 +283,19 @@ pub struct Cli {
     /// Enable pure/hard Greeking bypass (active by default)
     #[arg(long)]
     pub greek_pure: bool,
-    /// On-screen glyph height in px/em where Greeking begins (default: 10.0)
-    #[arg(long, value_name = "F")]
-    pub greek_onset_px: Option<f32>,
+    /// "Text detail": px per text row at or above which glyphs render with
+    /// full curve detail; below it they fuzz progressively (greeking).
+    /// Default: the config's lod.text_detail_px (10.0). Was --greek-onset-px, still accepted
+    #[arg(long, alias = "greek-onset-px", value_name = "F")]
+    pub text_detail_px: Option<f32>,
     /// File background card RGBA color (e.g. "0.10,0.10,0.13,0.85")
     #[arg(long, value_name = "R,G,B,A", value_parser = parse_rgba)]
     pub file_bg_color: Option<[f32; 4]>,
-    /// Override the initial LOD minimum pixel threshold (default: 1.0)
-    #[arg(long, value_name = "F")]
-    pub lod_min_px: Option<f32>,
+    /// "Show glyphs": px per text row at or above which a file is drawn as
+    /// glyphs; below it, a backdrop rectangle (visible mode: a line wash).
+    /// Default: the config's lod.show_glyphs_px (1.0). Was --lod-min-px, still accepted
+    #[arg(long, alias = "lod-min-px", value_name = "F")]
+    pub show_glyphs_px: Option<f32>,
     /// Stage K (K6): windowed only — capture the frame after N frames have
     /// rendered (requires --screenshot-out; the app KEEPS RUNNING afterward —
     /// unlike --screenshot it never exits)
@@ -404,11 +408,11 @@ pub fn parse_cli_from(matches: clap::ArgMatches) -> Result<Cli, String> {
                 cli.file_bg_color = Some(col);
             }
         }
-        if matches.value_source("lod_min_px")
+        if matches.value_source("show_glyphs_px")
             != Some(clap::parser::ValueSource::CommandLine)
         {
-            if let Some(lod) = cfg.lod_min_px {
-                cli.lod_min_px = Some(lod);
+            if let Some(lod) = cfg.show_glyphs_px {
+                cli.show_glyphs_px = Some(lod);
             }
         }
         if matches.value_source("wrap_mode")
@@ -486,11 +490,11 @@ pub fn parse_cli_from(matches: clap::ArgMatches) -> Result<Cli, String> {
                 cli.greek_smooth = smooth;
             }
         }
-        if matches.value_source("greek_onset_px")
+        if matches.value_source("text_detail_px")
             != Some(clap::parser::ValueSource::CommandLine)
         {
-            if let Some(onset) = cfg.greek_onset_px {
-                cli.greek_onset_px = Some(onset);
+            if let Some(onset) = cfg.text_detail_px {
+                cli.text_detail_px = Some(onset);
             }
         }
         if matches.value_source("load_repo")

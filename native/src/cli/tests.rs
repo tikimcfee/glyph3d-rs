@@ -61,11 +61,11 @@ fn defaults_match_old_parser() {
     assert!(!cli.no_greeking);
     assert!(!cli.greek_pure);
     assert!(!cli.greek_smooth);
-    assert!(cli.greek_onset_px.is_none());
+    assert!(cli.text_detail_px.is_none());
     assert!(cli.launch_config.is_none());
     assert!(!cli.file_backgrounds);
     assert!(cli.file_bg_color.is_none());
-    assert!(cli.lod_min_px.is_none());
+    assert!(cli.show_glyphs_px.is_none());
     assert!(cli.screenshot_frame.is_none());
     assert!(cli.screenshot_out.is_none());
     assert!(cli.ops.is_empty());
@@ -86,7 +86,7 @@ fn scalar_flags_parse() {
         "--screenshot", "out.png", "--frames", "2", "--demo", "--copies", "3", "--zoom",
         "2.5", "--no-cull", "--no-ui", "--launch-config", cfg.to_str().unwrap(),
         "--file-backgrounds", "--file-bg-color", "0.15,0.15,0.20,0.80",
-        "--lod-min-px", "2.0",
+        "--show-glyphs-px", "2.0", "--text-detail-px", "12",
         "--load-repo", "fixtures/g-pick-repo",
         "--repo-engine", "batch", "--repo-verify", "--focus-file", "alpha",
         "--wrap-mode", "back", "--z-wrap-spacing", "0.6", "--cluster-mode", "cluster",
@@ -113,7 +113,8 @@ fn scalar_flags_parse() {
     assert_eq!(cli.launch_config, Some(cfg));
     assert!(cli.file_backgrounds);
     assert_eq!(cli.file_bg_color, Some([0.15, 0.15, 0.20, 0.80]));
-    assert_eq!(cli.lod_min_px, Some(2.0));
+    assert_eq!(cli.show_glyphs_px, Some(2.0));
+    assert_eq!(cli.text_detail_px, Some(12.0));
     assert_eq!(cli.load_repo, Some(PathBuf::from("fixtures/g-pick-repo")));
     assert_eq!(cli.repo_engine, crate::repo::Strategy::Batched);
     assert_eq!(cli.wrap_mode, fold::WrapMode::Back);
@@ -504,7 +505,7 @@ fn launch_config_file_merging() {
         r#"
         file_backgrounds = true
         file_bg_color = [0.2, 0.3, 0.4, 0.9]
-        lod_min_px = 3.5
+        show_glyphs_px = 3.5
         wrap_mode = "down"
         greeking = false
         "#,
@@ -521,7 +522,7 @@ fn launch_config_file_merging() {
 
     assert!(cli.file_backgrounds);
     assert_eq!(cli.file_bg_color, Some([0.2, 0.3, 0.4, 0.9]));
-    assert_eq!(cli.lod_min_px, Some(3.5));
+    assert_eq!(cli.show_glyphs_px, Some(3.5));
     assert!(cli.no_greeking);
     assert_eq!(cli.wrap_mode, fold::WrapMode::Back); // CLI flag overrode TOML config
 }
@@ -534,7 +535,7 @@ fn launch_config_greek_pure_merging() {
         r#"
         greeking = true
         greek_pure = true
-        greek_onset_px = 15.0
+        text_detail_px = 15.0
         "#,
     )
     .expect("write temp config");
@@ -547,7 +548,26 @@ fn launch_config_greek_pure_merging() {
 
     assert!(!cli.no_greeking);
     assert!(cli.greek_pure);
-    assert_eq!(cli.greek_onset_px, Some(15.0));
+    assert_eq!(cli.text_detail_px, Some(15.0));
+}
+
+/// C26 (2026-10-10): `--lod-min-px` became `--show-glyphs-px` and
+/// `--greek-onset-px` became `--text-detail-px`; the old flags and the old
+/// launch_config keys still land in the new fields, and a flag still beats
+/// the file.
+#[test]
+fn old_lod_flags_and_keys_are_aliases() {
+    let cli = parse(&["--lod-min-px", "2", "--greek-onset-px", "12"]);
+    assert_eq!(cli.show_glyphs_px, Some(2.0));
+    assert_eq!(cli.text_detail_px, Some(12.0));
+
+    let tmp = std::env::temp_dir().join(format!("test_launch_cfg_lod_alias_{}.toml", std::process::id()));
+    std::fs::write(&tmp, "lod_min_px = 3.5\ngreek_onset_px = 15.0\n").expect("write temp config");
+    let cli = parse(&["--launch-config", tmp.to_str().unwrap()]);
+    assert_eq!((cli.show_glyphs_px, cli.text_detail_px), (Some(3.5), Some(15.0)));
+    let cli = parse(&["--launch-config", tmp.to_str().unwrap(), "--show-glyphs-px", "0.5"]);
+    let _ = std::fs::remove_file(&tmp);
+    assert_eq!((cli.show_glyphs_px, cli.text_detail_px), (Some(0.5), Some(15.0)));
 }
 
 #[test]

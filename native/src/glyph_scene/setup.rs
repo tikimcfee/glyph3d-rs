@@ -102,7 +102,7 @@ impl GlyphScene {
             emoji_cols: sheet.cols,
             emoji_rows: sheet.rows_per_layer,
             emoji_layer: [sheet.layer_w as f32, sheet.layer_h as f32],
-            greek_onset_px: 10.0,
+            greek_onset_px: crate::config::settings().lod.text_detail_px,
             _pad3: 0,
         };
         let params_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {

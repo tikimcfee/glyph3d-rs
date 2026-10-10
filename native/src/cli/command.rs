@@ -193,10 +193,10 @@ impl Cli {
             file_bg_color: self
                 .file_bg_color
                 .unwrap_or(crate::config::settings().glyph_scene.file_bg_color),
-            lod_min_px: self.lod_min_px,
+            lod_min_px: self.show_glyphs_px,
             greeking: !self.no_greeking,
             greek_pure,
-            greek_onset_px: self.greek_onset_px,
+            greek_onset_px: self.text_detail_px,
             field_mode: self.field_mode,
             debug_tint: self.debug_tint.as_u32(),
             environment: self
