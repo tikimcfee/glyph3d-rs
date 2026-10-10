@@ -73,7 +73,8 @@ buffers where the GPU allows it and staging otherwise.
   render mode, chosen with `--field-mode`; the scene never touches slot bytes).
 
 **The dependency graph is declared in `build.toml`** (artifact, input globs,
-build command, class) and executed by `glyph` (`glyph/src/main.rs`). The baseline PNGs are class **golden**: verified,
+build command, class) and executed by `glyph` (`glyph/src/`: `manifest.rs` the
+types, `gates.rs`, `golden.rs`, `prove.rs`, `products.rs`, `main.rs` the CLI). The baseline PNGs are class **golden**: verified,
 never built — the runner refuses. Red on any compiler warning, test failure, gate mismatch,
 or mutation survival.
 
@@ -148,7 +149,7 @@ property of the runner, so it applies just as much to tooling work —
 `native/AGENTS.md` has the worktree setup commands.
 
 Everything the tool does is declared in `build.toml` and typed in
-`glyph/src/main.rs`. A key the code does not know is a parse error; a field the
+`glyph/src/manifest.rs`. A key the code does not know is a parse error; a field the
 code does not read is a `dead_code` warning against a zero-warning gate. That is
 deliberate: this repo shipped a manifest whose `needs` edges were declared and
 read by nothing at all.

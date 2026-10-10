@@ -1,6 +1,6 @@
 # build.toml — the declarative build/verify graph for glyph3d-native.
 #
-# Consumed by `glyph` (glyph/src/main.rs; `cargo glyph --help`). This file is
+# Consumed by `glyph` (glyph/src/, entry main.rs; `cargo glyph --help`). This file is
 # the single account of WHICH artifacts exist, WHAT they are built from, and
 # WHICH instruments run over them — the thing that used to live only as line
 # order in tools/check-all.sh. Root AGENTS.md ("Verification") explains what
@@ -473,8 +473,8 @@ rebuild = "cargo build --release -p glyph"
 [[mutation]]
 name = "prove-restale-blind"
 gate = "cargo-test"
-why = "A cargo-test mutation without `rebuild` left the MUTATED renderer in target/release behind a stamp that still read current (cargo test --release links the bin; found 2026-10-09 with tail-pads-zero: 62b55bfe -> 928dc5b4, 'renderer current'), so every later gate and every hand timing tested the mutant. prove now drops the stamp of each product the restored file feeds and rebuilds it; matching no product restores the blind spot. CONSUMED BY: products_reading in glyph/src/main.rs, via its unit test"
-file = "glyph/src/main.rs"
+why = "A cargo-test mutation without `rebuild` left the MUTATED renderer in target/release behind a stamp that still read current (cargo test --release links the bin; found 2026-10-09 with tail-pads-zero: 62b55bfe -> 928dc5b4, 'renderer current'), so every later gate and every hand timing tested the mutant. prove now drops the stamp of each product the restored file feeds and rebuilds it; matching no product restores the blind spot. CONSUMED BY: products_reading in glyph/src/products.rs, via its unit test"
+file = "glyph/src/products.rs"
 op = "replace"
 find = ".filter(|(_, a)| a.inputs.iter().any(|pat| expand(pat).contains(&f)))"
 with = ".filter(|(_, a)| a.inputs.is_empty() && expand(\"\").contains(&f))"
@@ -985,8 +985,8 @@ rebuild = "cargo build --release"
 [[mutation]]
 name = "prove-ambiguous-find-accepted"
 gate = "cargo-test"
-why = "C11: a replace mutation whose find text matches more than once mutates whichever match comes first — an accident of file order. Two build.toml mutations matched their own entry and one picked the first of seven #[test]s until 2026-10-09. Counting at most one match restores the blind spot. CONSUMED BY: find_matches in glyph/src/main.rs, via mutation_finds_are_unambiguous"
-file = "glyph/src/main.rs"
+why = "C11: a replace mutation whose find text matches more than once mutates whichever match comes first — an accident of file order. Two build.toml mutations matched their own entry and one picked the first of seven #[test]s until 2026-10-09. Counting at most one match restores the blind spot. CONSUMED BY: find_matches in glyph/src/prove.rs, via mutation_finds_are_unambiguous"
+file = "glyph/src/prove.rs"
 op = "replace"
 find = "        text.matches(find).count()\n"
 with = "        text.matches(find).count().min(1)\n"

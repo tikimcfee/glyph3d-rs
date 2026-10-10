@@ -22,7 +22,9 @@ use std::io::{self, stdout, Stdout};
 use std::path::PathBuf;
 use std::process::Command;
 
-use crate::{gpu_key, gpu_profile, is_current, root, Manifest};
+use crate::manifest::Manifest;
+use crate::paths::{gpu_key, gpu_profile, root};
+use crate::products::is_current;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TargetMode {
