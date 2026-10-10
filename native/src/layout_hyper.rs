@@ -323,6 +323,7 @@ pub(crate) fn pass1_prepass_chunk_bytes(
     let mut max_row_extent = 0.0f64;
     let mut trailer_until = 0usize;
     let mut has_cluster = false;
+    let mut has_emoji = false;
     let cluster = char_resolve::clusters(p);
     let rctx = ResolveCtx { trie, bitmap_adv, em_height_fu, cluster };
     let wrap_w = p.wrap_width as i64;
@@ -364,6 +365,7 @@ pub(crate) fn pass1_prepass_chunk_bytes(
                     Some(r) => r,
                     None => continue,
                 };
+                has_emoji |= trie.is_emoji_glyph(r.glyph_id);
                 leader_count += 1;
                 if r.glyph_id != 0 {
                     survivor_count += 1;
@@ -393,6 +395,7 @@ pub(crate) fn pass1_prepass_chunk_bytes(
             // throughout: none of its x is known here.
             max_row_extent: if continues_line { 0.0 } else { max_row_extent },
             has_cluster,
+            has_emoji,
             completed_rows: 0,
             has_newline: false,
             delta_col: col,
@@ -448,6 +451,7 @@ pub(crate) fn pass1_prepass_chunk_bytes(
                     Some(r) => r,
                     None => continue,
                 };
+                has_emoji |= trie.is_emoji_glyph(r.glyph_id);
                 line_leaders += 1;
                 if r.glyph_id != 0 {
                     line_survivors += 1;
@@ -505,6 +509,7 @@ pub(crate) fn pass1_prepass_chunk_bytes(
         leader_count,
         max_row_extent,
         has_cluster,
+        has_emoji,
         completed_rows,
         has_newline: true,
         delta_col: 0,
@@ -696,6 +701,7 @@ pub(crate) fn aggregate_chunk_prepasses(
         let mut item_leader_count = 0u32;
         let mut item_max_row_extent = 0.0f64;
         let mut item_has_cluster = false;
+        let mut item_has_emoji = false;
 
         let mut cur_base_row = 0i64;
         let mut cur_record_base = 0usize;
@@ -724,6 +730,7 @@ pub(crate) fn aggregate_chunk_prepasses(
             if cp.has_cluster {
                 item_has_cluster = true;
             }
+            item_has_emoji |= cp.has_emoji;
 
             if !cp.has_newline {
                 let c0 = cur_col;
@@ -768,6 +775,7 @@ pub(crate) fn aggregate_chunk_prepasses(
             max_row_extent: item_max_row_extent,
             row_count: u32::try_from(cur_base_row).expect("item row count exceeds u32"),
             has_cluster: item_has_cluster,
+            has_emoji: item_has_emoji,
         });
     }
 
@@ -1011,6 +1019,115 @@ mod tests {
     use crate::glyph_scene::RenderSlot;
     use crate::layout::{ItemParams, Paint};
     use glyph_field_derived::DerivedSlot;
+
+    /// A host `WindowSink`: two window buffers used alternately (as the GPU
+    /// sink uses two staging buffers), each flushed into one stream buffer at
+    /// its window's offset — what the GPU copy does.
+    struct HostWindowSink {
+        bufs: [Vec<u8>; 2],
+        stream: Vec<u8>,
+        slot_bytes: usize,
+        windows_seen: usize,
+    }
+
+    impl pass2_device::WindowSink for HostWindowSink {
+        fn begin(&mut self, k: usize, w: &pass2_device::SlotWindow) -> usize {
+            let buf = &mut self.bufs[k % 2];
+            buf.clear();
+            buf.resize((w.slots.len() * self.slot_bytes).max(1), 0xA5);
+            buf.as_mut_ptr() as usize
+        }
+        fn end(&mut self, k: usize, w: &pass2_device::SlotWindow) {
+            let n = w.slots.len() * self.slot_bytes;
+            let at = w.slots.start * self.slot_bytes;
+            self.stream[at..at + n].copy_from_slice(&self.bufs[k % 2][..n]);
+            self.windows_seen += 1;
+        }
+    }
+
+    fn windowed_matches_unwindowed<E: pass2_device::SlotEmit>(items: &[LayoutItem<'_>], window_slots: &[usize])
+    where
+        E::Slot: bytemuck::Pod,
+    {
+        let trie = crate::default_trie();
+        let em_height_fu = trie.metrics.em_height_fu;
+        let bitmap_adv = fu_to_world(trie.bitmap_advance_fu, em_height_fu);
+        let (chunks, item_chunk_ranges) = chunk::slice_items_into_chunks(items);
+        let agg = pass1_prepass_chunks(&chunks, &item_chunk_ranges, items, &trie, bitmap_adv, em_height_fu);
+        let slot_bases: Vec<u32> = item_chunk_ranges.iter().map(|r| agg.chunk_slot_bases[r.start]).collect();
+        let inputs = EmitInputs {
+            items,
+            chunks: &chunks,
+            item_chunk_ranges: &item_chunk_ranges,
+            prepasses: &agg.prepasses,
+            slot_bases: &slot_bases,
+            chunk_slot_bases: &agg.chunk_slot_bases,
+            chunk_base_rows: &agg.chunk_base_rows,
+            chunk_record_bases: &agg.chunk_record_bases,
+            chunk_initial_cols: &agg.chunk_initial_cols,
+            chunk_initial_seg_advs: &agg.chunk_initial_seg_advs,
+            chunk_initial_line_advs: &agg.chunk_initial_line_advs,
+            trie: &trie,
+            bitmap_adv,
+            em_height_fu,
+        };
+        let total = agg.total_survivors;
+        let size = std::mem::size_of::<E::Slot>();
+        let mut reference = vec![<E::Slot as bytemuck::Zeroable>::zeroed(); total.max(1)];
+        let (ref_out, ref_pairs) = inputs.run::<E>(reference.as_mut_ptr() as usize);
+        let ref_bytes: &[u8] = bytemuck::cast_slice(&reference[..total]);
+        assert!(ref_pairs.iter().any(|p| !p.is_empty()), "the corpus must exercise the emoji scratch path");
+        assert!(chunks.len() > items.len(), "the corpus must cut some item into several chunks");
+
+        for &ws in window_slots {
+            let windows = pass2_device::plan_windows(&agg.chunk_slot_bases, total, ws);
+            let mut sink = HostWindowSink {
+                bufs: [Vec::new(), Vec::new()],
+                stream: vec![0x5A; total * size],
+                slot_bytes: size,
+                windows_seen: 0,
+            };
+            let (out, pairs) = pass2_device::emit_windows::<E>(&inputs, &windows, total, &mut sink);
+            assert_eq!(sink.windows_seen, windows.len());
+            assert!(sink.stream == ref_bytes, "window_slots {ws}: windowed slot bytes differ from the unwindowed emission");
+            assert_eq!(out.placements, ref_out.placements, "window_slots {ws}: placements");
+            assert_eq!(out.file_tints, ref_out.file_tints, "window_slots {ws}: tints");
+            assert_eq!(pairs, ref_pairs, "window_slots {ws}: emoji tint pairs");
+        }
+    }
+
+    /// C22: emitting the slot stream window by window into staging memory —
+    /// with the emoji items' chunks detoured through host scratch for their
+    /// tint pairs — lands exactly the bytes, placements, tints and pairs of
+    /// the one-buffer emission, for one chunk per window, a few hundred
+    /// slots per window, and one window. Host memory only, so it holds on
+    /// every machine, unlike pixel-ab (which sees staging only on a discrete
+    /// GPU).
+    #[test]
+    fn windowed_emission_matches_unwindowed() {
+        use crate::fold::WrapMode;
+        let read = |p: &str| std::fs::read(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(p)).expect(p);
+        let emoji = read("fixtures/emoji-view.txt");
+        let cluster = read("fixtures/g-cluster-repo/main.rs");
+        let cut = read("fixtures/chunk-cut-paint.txt");
+        let plain = b"fn main() {\n    let x = 1;\n}\n".to_vec();
+        let params = ItemParams { line_height: 1.25, wrap_width: 80, wrap_mode: WrapMode::Back, z_step: 0.15, ..Default::default() };
+        let bodies: Vec<(&[u8], Paint)> = vec![
+            (&plain, Paint::Flat(0x1234_5678)),
+            (&emoji, Paint::Flat(0x2233_4455)),
+            (&cut, Paint::SyntaxHeuristic),
+            (b"", Paint::Flat(0x0102_0304)),
+            (&cluster, Paint::SyntaxHeuristic),
+        ];
+        let items: Vec<LayoutItem<'_>> = bodies
+            .iter()
+            .enumerate()
+            .map(|(i, (bytes, paint))| LayoutItem { bytes, params, group_id: i as u32, paint: *paint })
+            .collect();
+        let sizes = [1, 700, usize::MAX];
+        windowed_matches_unwindowed::<pass2_device::DerivedEmit>(&items, &sizes);
+        windowed_matches_unwindowed::<pass2_device::RenderEmit>(&items, &sizes);
+    }
 
     #[test]
     fn hyper_and_batched_agree_on_samples() {

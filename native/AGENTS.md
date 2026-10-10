@@ -168,17 +168,21 @@ Detailed technical audit lives in `research/desktop-platform-audit.md`. Key touc
   Without it the device is created exactly as before (zero-cost Option).
 - `GLYPH_TRACE=<filter>` — the load path's span instrument (integration
   note 22): `repo.{walk,backend,verify,views,layout,staged,segments}` and
-  `hyper.{pass1,pass2,emoji_tints}`, printed on span CLOSE with busy/idle times. The filter is a tracing EnvFilter string (fallback
+  `hyper.{pass1,pass2,emoji_tints,pass2.windowed,staging.stream}`, printed on span CLOSE with busy/idle times. The filter is a tracing EnvFilter string (fallback
   `RUST_LOG`; unset = off, one atomic per span). `glyph3d_native=info`
   is the useful setting — a bare `info` also admits wgpu's own
   tracing records, which is loud. The spans mirror the
   LoadStats Instant boundaries exactly so the two can be
   cross-checked; the prints stay the presentation contract.
-- `GLYPH_STAGING=single` — discrete GPUs only: stage the slots through one
-  mapped-at-creation buffer (the pre-2026-10-09 default) instead of host
-  memory streamed through 64 MiB. Slower on the measured NVIDIA box (wgpu-core
-  zero-fills and copies its own staging, and the emoji tint re-read hits
-  write-combined memory); kept for hardware nobody has measured.
+- `GLYPH_STAGING=host|single` — discrete GPUs only. The default is WINDOWED
+  emission (C22): Pass 2 writes each 64 MiB window of the slot stream straight
+  into one of two mapped staging buffers, uploaded while the next fills; the
+  chunks of emoji-holding items detour through host scratch for their tint
+  pairs. `host` writes host memory and streams it through one 64 MiB buffer
+  (a full extra copy); `single` is one mapped-at-creation buffer, which
+  wgpu-core zero-fills and copies. On the measured NVIDIA box (derived, 102 MB
+  tree): windowed 121 ms, host 194, single 482. The fallbacks stay for
+  hardware nobody has measured.
 - `GLYPH_PICK_DEBUG=1` — pick-path diagnostics: pixel ray, AABB hits, local
   point, candidate records (glyph_scene/pick.rs pick functions).
 - `GLYPH_CULL_DEBUG=1` — at t=0.0 prints cull stats: visible draw ranges,
