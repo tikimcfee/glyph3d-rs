@@ -5,7 +5,7 @@ use crate::atlas::TrieTable;
 use crate::fold::{rows_for_line, wrap_row_of, wrap_segment_of};
 use crate::glyph_scene::GlyphInstance;
 use crate::layout::{InkExtent, ItemPlacement, LayoutItem, PageExtent, Paint};
-use super::char_resolve::{resolve_byte_char, resolve_byte_char_cluster};
+use super::char_resolve::{resolve_byte_char, resolve_byte_char_cluster, ResolveCtx};
 use super::page::{paged_x, Pager};
 use super::types::{ItemPrepass, SendPtr};
 
@@ -27,6 +27,7 @@ pub fn layout_pass2_host(
             let bytes = item.bytes;
             let p = &item.params;
             let cluster = super::char_resolve::clusters(p);
+            let rctx = ResolveCtx { trie, bitmap_adv, em_height_fu, cluster };
             let group_id = item.group_id;
 
             let fold_unit = if p.wrap_width > 0 {
@@ -77,7 +78,7 @@ pub fn layout_pass2_host(
             let mut pos = 0usize;
             let mut span_idx = 0usize;
             while pos < bytes.len() {
-                let r = match resolve_byte_char(bytes, pos, trie, bitmap_adv, em_height_fu, cluster, &mut trailer_until) {
+                let r = match resolve_byte_char(bytes, pos, rctx, &mut trailer_until) {
                     Some(r) => r,
                     None => {
                         pos += 1;
@@ -245,6 +246,7 @@ pub fn compute_single_item_placement(
     let mut is_multi_page = false;
     let mut has_cluster = false;
     let cluster = super::char_resolve::clusters(p);
+    let rctx = ResolveCtx { trie, bitmap_adv, em_height_fu, cluster };
 
     let mut ink_min = [f32::INFINITY; 3];
     let mut ink_max = [f32::NEG_INFINITY; 3];
@@ -421,7 +423,7 @@ pub fn compute_single_item_placement(
         // Fallback: process this line character by character from pos to nl_pos
         let mut cur_pos = pos;
         while cur_pos < nl_pos {
-            let r = match resolve_byte_char_cluster(bytes, cur_pos, trie, bitmap_adv, em_height_fu, cluster, &mut trailer_until, &mut has_cluster) {
+            let r = match resolve_byte_char_cluster(bytes, cur_pos, rctx, &mut trailer_until, &mut has_cluster) {
                 Some(r) => r,
                 None => {
                     cur_pos += 1;
@@ -505,7 +507,7 @@ pub fn compute_single_item_placement(
 
         // Process newline if present
         if nl_pos < bytes.len() {
-            let r = match resolve_byte_char(bytes, nl_pos, trie, bitmap_adv, em_height_fu, cluster, &mut trailer_until) {
+            let r = match resolve_byte_char(bytes, nl_pos, rctx, &mut trailer_until) {
                 Some(r) => r,
                 None => {
                     pos = nl_pos + 1;
@@ -594,6 +596,7 @@ pub fn scan_item_max_row_extent(
     cluster_mode: crate::fold::ClusterMode,
 ) -> f32 {
     let cluster = cluster_mode == crate::fold::ClusterMode::Cluster;
+    let rctx = ResolveCtx { trie, bitmap_adv, em_height_fu, cluster };
     let mut widest = 0.0f32;
     let mut trailer_until = 0usize;
     let mut pos = 0usize;
@@ -664,7 +667,7 @@ pub fn scan_item_max_row_extent(
         let mut seg_adv = 0.0f32;
         let mut line_adv = 0.0f64;
         while cur_pos < nl_pos {
-            let r = match resolve_byte_char(bytes, cur_pos, trie, bitmap_adv, em_height_fu, cluster, &mut trailer_until) {
+            let r = match resolve_byte_char(bytes, cur_pos, rctx, &mut trailer_until) {
                 Some(r) => r,
                 None => {
                     cur_pos += 1;
