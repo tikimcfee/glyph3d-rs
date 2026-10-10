@@ -1781,6 +1781,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "glyph-scene-graph"
+version = "0.1.0"
+dependencies = [
+ "bytemuck",
+ "naga",
+ "pollster",
+ "wgpu",
+]
+
+[[package]]
 name = "glyph-session-dirs"
 version = "0.1.0"
 

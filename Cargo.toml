@@ -12,7 +12,7 @@
 # dir, the check scripts, and the docs.
 [workspace]
 resolver = "2"
-members = ["native", "glyph", "crates/glyph-field", "crates/glyph-field-instanced", "crates/glyph-field-derived", "crates/glyph-field-visible", "crates/glyph-session-dirs"]
+members = ["native", "glyph", "crates/glyph-field", "crates/glyph-field-instanced", "crates/glyph-field-derived", "crates/glyph-field-visible", "crates/glyph-session-dirs", "crates/glyph-scene-graph"]
 # The Zed-integration experiments are their OWN workspace
 # (experiments/Cargo.toml) where native's deps and Zed's graph unify in one
 # lock seeded from Zed's. `exclude` keeps directory-walking from claiming
