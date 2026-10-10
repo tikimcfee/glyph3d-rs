@@ -319,7 +319,32 @@ pub(crate) fn pass1_prepass_chunk_bytes(
     em_height_fu: u32,
     global_seg_adv_table: &[f32],
     continues_line: bool,
-    mut lines: Option<&mut ChunkLines>,
+    lines: Option<&mut ChunkLines>,
+    segment_bytes: usize,
+) -> ChunkPrepass {
+    // Two monomorphizations, so a load that wants no line table runs the
+    // walk with none of the collection in it — not even a predictable
+    // branch per byte (measured 2026-10-10: a runtime flag cost ~0.5 ms of
+    // a 4 ms Pass 1 on the 93 MB tree).
+    match lines {
+        Some(out) => pass1_prepass_chunk_walk::<true>(bytes, p, trie, bitmap_adv, em_height_fu, global_seg_adv_table, continues_line, out, segment_bytes),
+        None => {
+            let mut none = ChunkLines::default();
+            pass1_prepass_chunk_walk::<false>(bytes, p, trie, bitmap_adv, em_height_fu, global_seg_adv_table, continues_line, &mut none, segment_bytes)
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn pass1_prepass_chunk_walk<const COLLECT: bool>(
+    bytes: &[u8],
+    p: &crate::layout::ItemParams,
+    trie: &TrieTable,
+    bitmap_adv: f32,
+    em_height_fu: u32,
+    global_seg_adv_table: &[f32],
+    continues_line: bool,
+    out: &mut ChunkLines,
     segment_bytes: usize,
 ) -> ChunkPrepass {
     let fold_unit = if p.wrap_width > 0 {
@@ -373,7 +398,7 @@ pub(crate) fn pass1_prepass_chunk_bytes(
             if widest > max_row_extent {
                 max_row_extent = widest;
             }
-            if let Some(out) = lines.as_deref_mut() {
+            if COLLECT {
                 // Every byte is a cell: the cuts land on the targets.
                 let mut off = segment_bytes;
                 while off < l {
@@ -389,10 +414,8 @@ pub(crate) fn pass1_prepass_chunk_bytes(
             }
         } else {
             for i in 0..bytes.len() {
-                if plan.cut_here(i, bytes[i]) {
-                    if let Some(out) = lines.as_deref_mut() {
-                        out.seeds.push(ChunkSeed { line: 0, byte_offset: i as u32, col: col as u32, seg_adv, cells });
-                    }
+                if COLLECT && plan.cut_here(i, bytes[i]) {
+                    out.seeds.push(ChunkSeed { line: 0, byte_offset: i as u32, col: col as u32, seg_adv, cells });
                 }
                 let r = match resolve_byte_char_cluster(bytes, i, rctx, &mut trailer_until, &mut has_cluster) {
                     Some(r) => r,
@@ -411,7 +434,9 @@ pub(crate) fn pass1_prepass_chunk_bytes(
                 }
                 col += 1;
                 line_adv += r.advance as f64;
-                cells += cells_of(r.advance, ascii_adv);
+                if COLLECT {
+                    cells += cells_of(r.advance, ascii_adv);
+                }
                 if fold_unit > 0 {
                     if col % fold_unit == 0 {
                         seg_adv = 0.0;
@@ -422,7 +447,7 @@ pub(crate) fn pass1_prepass_chunk_bytes(
             }
         }
         // An empty item is one empty chunk, and has no line.
-        if let Some(out) = lines.as_deref_mut().filter(|_| !bytes.is_empty()) {
+        if COLLECT && !bytes.is_empty() {
             out.lines.push(ChunkLine { start: 0, glyphs: survivor_count, col: col as u32, terminated: false });
         }
 
@@ -485,7 +510,7 @@ pub(crate) fn pass1_prepass_chunk_bytes(
             if widest > max_row_extent {
                 max_row_extent = widest;
             }
-            if let Some(out) = lines.as_deref_mut() {
+            if COLLECT {
                 let mut off = segment_bytes;
                 while off < l {
                     out.seeds.push(ChunkSeed {
@@ -500,16 +525,14 @@ pub(crate) fn pass1_prepass_chunk_bytes(
             }
         } else {
             for i in pos..nl_pos {
-                if plan.cut_here(i - pos, bytes[i]) {
-                    if let Some(out) = lines.as_deref_mut() {
-                        out.seeds.push(ChunkSeed {
-                            line: line_index as u32,
-                            byte_offset: i as u32,
-                            col: line_col as u32,
-                            seg_adv,
-                            cells,
-                        });
-                    }
+                if COLLECT && plan.cut_here(i - pos, bytes[i]) {
+                    out.seeds.push(ChunkSeed {
+                        line: line_index as u32,
+                        byte_offset: i as u32,
+                        col: line_col as u32,
+                        seg_adv,
+                        cells,
+                    });
                 }
                 let r = match resolve_byte_char_cluster(bytes, i, rctx, &mut trailer_until, &mut has_cluster) {
                     Some(r) => r,
@@ -526,7 +549,9 @@ pub(crate) fn pass1_prepass_chunk_bytes(
                 }
                 line_col += 1;
                 line_adv += r.advance as f64;
-                cells += cells_of(r.advance, ascii_adv);
+                if COLLECT {
+                    cells += cells_of(r.advance, ascii_adv);
+                }
                 if fold_unit > 0 {
                     if line_col % fold_unit == 0 {
                         seg_adv = 0.0;
@@ -548,7 +573,7 @@ pub(crate) fn pass1_prepass_chunk_bytes(
         if continues_line && line_index == 0 {
             max_row_extent = widest_before_line;
         }
-        if let Some(out) = lines.as_deref_mut() {
+        if COLLECT {
             out.lines.push(ChunkLine {
                 start: pos as u32,
                 glyphs: line_survivors,
