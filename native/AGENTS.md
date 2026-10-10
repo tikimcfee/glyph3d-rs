@@ -168,12 +168,17 @@ Detailed technical audit lives in `research/desktop-platform-audit.md`. Key touc
   Without it the device is created exactly as before (zero-cost Option).
 - `GLYPH_TRACE=<filter>` — the load path's span instrument (integration
   note 22): `repo.{walk,backend,verify,views,layout,staged,segments}` and
-  `hyper.{pass1,pass2}`, printed on span CLOSE with busy/idle times. The filter is a tracing EnvFilter string (fallback
+  `hyper.{pass1,pass2,emoji_tints}`, printed on span CLOSE with busy/idle times. The filter is a tracing EnvFilter string (fallback
   `RUST_LOG`; unset = off, one atomic per span). `glyph3d_native=info`
   is the useful setting — a bare `info` also admits wgpu's own
   tracing records, which is loud. The spans mirror the
   LoadStats Instant boundaries exactly so the two can be
   cross-checked; the prints stay the presentation contract.
+- `GLYPH_STAGING=single` — discrete GPUs only: stage the slots through one
+  mapped-at-creation buffer (the pre-2026-10-09 default) instead of host
+  memory streamed through 64 MiB. Slower on the measured NVIDIA box (wgpu-core
+  zero-fills and copies its own staging, and the emoji tint re-read hits
+  write-combined memory); kept for hardware nobody has measured.
 - `GLYPH_PICK_DEBUG=1` — pick-path diagnostics: pixel ray, AABB hits, local
   point, candidate records (glyph_scene/pick.rs pick functions).
 - `GLYPH_CULL_DEBUG=1` — at t=0.0 prints cull stats: visible draw ranges,

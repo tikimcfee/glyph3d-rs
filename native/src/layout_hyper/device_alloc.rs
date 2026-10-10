@@ -49,7 +49,11 @@ impl EmitInputs<'_, '_> {
         let sp_pass2 = tracing::info_span!("hyper.pass2").entered();
         let out = layout_pass2_device::<E>(self, dest_addr);
         drop(sp_pass2);
+        // Timed apart from Pass 2: it READS the slots just written, which is
+        // cheap from cached memory and was not from write-combined staging.
+        let sp_tints = tracing::info_span!("hyper.emoji_tints").entered();
         let pairs = emoji_tint_pairs::<E>(dest_addr, &out);
+        drop(sp_tints);
         (out, pairs)
     }
 }
@@ -163,7 +167,18 @@ pub(crate) fn layout_device_discrete_chunked<E: SlotEmit>(
     let plan = ChunkPlan::new::<E>(dev, total_survivors, Some(chunk_cap));
     let max_buf = dev.device.limits().max_buffer_size;
 
-    let (pass2, emoji_tint_pairs, chunks) = if plan.total_bytes <= max_buf {
+    // Host staging is the discrete default (2026-10-09): Pass 2 writes plain
+    // cached host memory, which is then streamed to the VRAM chunks through
+    // one 64 MiB staging buffer. The single mapped-at-creation buffer it
+    // replaces made wgpu-core allocate, zero-fill and copy its own
+    // slot-sized staging (~158 ms of a 461 ms backend on a 93 MB tree, RTX
+    // 5090), and left the emoji tint re-read on write-combined memory
+    // (~190 ms); host staging measured 204 ms there (out/GPU-DIRECTION-
+    // 2026-10-09.md). `GLYPH_STAGING=single` keeps the old path for hardware
+    // where it may still win (an integrated GPU was never measured).
+    let single = plan.total_bytes <= max_buf
+        && std::env::var("GLYPH_STAGING").is_ok_and(|v| v == "single");
+    let (pass2, emoji_tint_pairs, chunks) = if single {
         stage_single_buffer::<E>(dev, inputs, label, &plan)
     } else {
         stage_host_memory::<E>(dev, inputs, label, &plan)
@@ -286,7 +301,11 @@ fn stage_host_memory<E: SlotEmit>(
         .enumerate()
         .map(|(i, &count)| {
             let chunk_size = (count as usize * plan.slot_bytes) as u64;
-            let chunk_label = format!("{label} {i}/{}", plan.chunk_counts.len());
+            let chunk_label = if plan.chunk_counts.len() == 1 {
+                label.to_string()
+            } else {
+                format!("{label} {i}/{}", plan.chunk_counts.len())
+            };
             let src_offset = i * plan.chunk_cap * plan.slot_bytes;
             let copy_bytes = (count as usize * plan.slot_bytes)
                 .min((plan.total_bytes as usize).saturating_sub(src_offset));
