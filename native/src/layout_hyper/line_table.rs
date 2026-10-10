@@ -2,8 +2,9 @@
 //! slot per glyph (M1 of `out/GPU-DIRECTION-2026-10-09.md`, 2026-10-10).
 //!
 //! One [`LineEntry`] per line of every item — where its bytes start, which
-//! item it belongs to, the row its first cell sits on, and how many glyph
-//! slots it produces — plus a [`SegmentSeed`] at every cut of a long line, so
+//! item it belongs to, the row its first cell sits on, how many glyph
+//! slots it produces, its leaders and its widest fold unit (the cull's and
+//! the wash's extent, C28) — plus a [`SegmentSeed`] at every cut of a long line, so
 //! a kernel can lay out any segment of any line from its seed alone, with the
 //! same bits the whole-line fold produces.
 //!
@@ -57,7 +58,7 @@ use super::chunk::LayoutChunk;
 /// invocation and 3.7 ms at this size (Round 2 of the GPU-direction report).
 pub const SEGMENT_BYTES: usize = 2048;
 
-/// One line of one item. 16 B, `repr(C)`, uploaded as-is.
+/// One line of one item. 24 B, `repr(C)`, uploaded as-is.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct LineEntry {
@@ -71,6 +72,18 @@ pub struct LineEntry {
     /// Glyph slots the line produces (leaders whose glyph is not 0; the
     /// newline is never one).
     pub glyph_count: u32,
+    /// The line's leaders, trailers included — the fold's column at its end
+    /// (the newline excluded). The cull counts the line's depth segments
+    /// (`col / wrap`) and column pages from it (C28, 2026-10-10).
+    pub cols: u32,
+    /// The line's widest fold unit in cells — the sum of its leaders'
+    /// advances between two fold-unit boundaries, the largest such — or the
+    /// whole line's advance when the item has no fold unit. Exactly the x
+    /// its glyphs reach from the item's origin: the cull's x bound and the
+    /// wash box's width (C28). Measured by Pass 1's walk; a line cut by a
+    /// chunk boundary gets its continuation measured again with the true
+    /// fold state (`measure_continued_line_widths`).
+    pub width_cells: u32,
 }
 
 /// A cut inside a long line, and the fold state at it. 24 B, `repr(C)`.
@@ -129,6 +142,14 @@ pub(crate) struct ChunkLine {
     pub glyphs: u32,
     /// Leaders in the part of the line this chunk holds.
     pub col: u32,
+    /// The widest fold unit of that part, in cells, with the fold boundaries
+    /// counted from the CHUNK's start: final for a line that starts in the
+    /// chunk (its last, possibly partial, unit a lower bound the
+    /// continuation's replay raises), meaningless for a continuation's
+    /// first line (a unit counted from the wrong boundary can straddle two
+    /// true units and over-count), which `measure_continued_line_widths`
+    /// measures instead.
+    pub width_cells: u32,
     pub terminated: bool,
 }
 
@@ -248,6 +269,10 @@ pub(crate) fn assemble(
                     let (open_idx, open_col) = open.take().expect("continuation without an open line");
                     t.entries[open_idx].glyph_count += line.glyphs;
                     let total_col = open_col + line.col as i64;
+                    // The continuation's width is NOT merged here: its fold
+                    // boundaries were counted from the chunk's start
+                    // (`ChunkLine::width_cells`); the replay measures it.
+                    t.entries[open_idx].cols = total_col as u32;
                     if line.terminated {
                         base_row += rows_for_line(total_col, wrap_w, p.wrap_mode);
                     } else {
@@ -261,6 +286,8 @@ pub(crate) fn assemble(
                         item: item as u32,
                         base_row: base_row as u32,
                         glyph_count: line.glyphs,
+                        cols: line.col,
+                        width_cells: line.width_cells,
                     });
                     if line.terminated {
                         base_row += rows_for_line(line.col as i64, wrap_w, p.wrap_mode);
@@ -415,6 +442,81 @@ pub(crate) fn seed_continued_lines(
         t.seeds[si] = s;
     }
     t.seeds.sort_by_key(|s| (s.line, s.byte_offset));
+}
+
+/// The widest fold unit of every line a chunk cut continues, in cells
+/// (`LineEntry::width_cells`, C28): the per-chunk walk measured the
+/// continuation's part with fold boundaries counted from the CHUNK's start,
+/// which can land a unit across two true units and over-count it, so each
+/// continuing chunk's first line is walked again here from its true state —
+/// the aggregation's column, and the cells already in the unit the cut fell
+/// in (the running segment advance, whole cells) — to the line's end or the
+/// chunk's, and the entry takes the larger of what its head measured and
+/// this. In parallel over the continuing chunks; nothing runs for a corpus
+/// with no intra-line chunk cut.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn measure_continued_line_widths(
+    t: &mut LineTable,
+    chunks: &[LayoutChunk<'_>],
+    chunk_continues: &[bool],
+    chunk_initial_cols: &[i64],
+    chunk_initial_seg_advs: &[f32],
+    chunk_initial_line_advs: &[f64],
+    file_params: &[ItemParams],
+    trie: &TrieTable,
+    bitmap_adv: f32,
+    em_height_fu: u32,
+) {
+    let cell_adv = fu_to_world(trie.metrics.advance_fu as i32, em_height_fu);
+    let wanted: Vec<usize> = (0..chunks.len()).filter(|&ci| chunk_continues[ci]).collect();
+    if wanted.is_empty() {
+        return;
+    }
+    let measured: Vec<(usize, u32)> = wanted
+        .par_iter()
+        .filter_map(|&ci| {
+            let c = &chunks[ci];
+            let p = &file_params[c.item_index];
+            let fold_unit = if p.wrap_width > 0 {
+                p.wrap_width as i64
+            } else if p.has_page {
+                p.page_cols as i64
+            } else {
+                0
+            };
+            // The open entry: the item's last entry that starts before the chunk.
+            let range = t.item_lines(c.item_index);
+            let idx = t.entries[range.clone()].iter().rposition(|e| (e.byte_start as usize) < c.byte_offset).map(|k| range.start + k)?;
+            let rctx = ResolveCtx { trie, bitmap_adv, em_height_fu, cluster: char_resolve::clusters(p) };
+            let mut col = chunk_initial_cols[ci];
+            let mut unit = if fold_unit > 0 {
+                cells_of(chunk_initial_seg_advs[ci], cell_adv)
+            } else {
+                (chunk_initial_line_advs[ci] / cell_adv as f64).round() as u32
+            };
+            let mut width = 0u32;
+            let mut trailer_until = 0usize;
+            for pos in 0..c.bytes.len() {
+                let Some(r) = char_resolve::resolve_byte_char(c.bytes, pos, rctx, &mut trailer_until) else {
+                    continue;
+                };
+                if r.is_newline {
+                    break;
+                }
+                col += 1;
+                unit += cells_of(r.advance, cell_adv);
+                if fold_unit > 0 && col % fold_unit == 0 {
+                    width = width.max(unit);
+                    unit = 0;
+                }
+            }
+            Some((idx, width.max(unit)))
+        })
+        .collect();
+    for (idx, w) in measured {
+        let e = &mut t.entries[idx];
+        e.width_cells = e.width_cells.max(w);
+    }
 }
 
 /// Build the table for one item on its own, as a repo file is laid out: its

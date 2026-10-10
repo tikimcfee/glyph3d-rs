@@ -254,9 +254,9 @@ mod tests {
         assert_eq!(std::mem::size_of::<super::super::LineEntry>(), std::mem::size_of::<LineEntryGpu>());
         assert_eq!(std::mem::align_of::<super::super::LineEntry>(), std::mem::align_of::<LineEntryGpu>());
         assert_eq!(std::mem::size_of::<super::super::SegmentSeed>(), std::mem::size_of::<SegmentSeedGpu>());
-        let entries = [super::super::LineEntry { byte_start: 1, item: 2, base_row: 3, glyph_count: 4 }];
+        let entries = [super::super::LineEntry { byte_start: 1, item: 2, base_row: 3, glyph_count: 4, cols: 5, width_cells: 6 }];
         let gpu: &[LineEntryGpu] = bytemuck::cast_slice(&entries);
-        assert_eq!(gpu[0], LineEntryGpu { byte_start: 1, item: 2, base_row: 3, glyph_count: 4 });
+        assert_eq!(gpu[0], LineEntryGpu { byte_start: 1, item: 2, base_row: 3, glyph_count: 4, cols: 5, width_cells: 6 });
         let seeds = [super::super::SegmentSeed { line: 1, byte_offset: 2, col: 3, seg_adv: 4.5, cells: 6, _pad: 0 }];
         let gpu: &[SegmentSeedGpu] = bytemuck::cast_slice(&seeds);
         assert_eq!(gpu[0], SegmentSeedGpu { line: 1, byte_offset: 2, col: 3, seg_adv: 4.5, cells: 6, _pad: 0 });

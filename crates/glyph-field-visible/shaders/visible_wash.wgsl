@@ -1,14 +1,27 @@
-// visible_wash.wgsl — the WASH tier: one flat quad per line whose rows
-// project under `lod_glyph_px`, in its spans' mean colour, drawn after the
-// glyph pass with the glyph pass's depth state (tested and written,
-// GreaterEqual) and premultiplied blend.
+// visible_wash.wgsl — the WASH tier: one BOX per line whose rows project
+// under `lod_glyph_px`, in its spans' mean colour, drawn after the glyph
+// pass with the glyph pass's depth state (tested and written, GreaterEqual)
+// and premultiplied blend.
 //
-// The quad's y/z come from the Derived shader's `derive_yz` on the entry's
-// row lane (so a wash sits exactly where the line's first row of glyphs
-// would), stacked `rows` rows down for a WrapDown line; its x extent is the
-// cull's byte-length bound. Colour = entry colour x group colour, as the
-// Derived shader blends; alpha = the entry's alpha (1 under the threshold,
-// the fade over the 1 px band above it) x the group's.
+// The box is the volume the line's glyphs would fill: x from the entry's
+// origin over its widest fold unit (Pass 1's `width_cells`, exactly what the
+// glyphs reach); y the first row's cell, stacked `rows` rows down for a
+// WrapDown line; z from segment 0's depth to the last segment's (`nseg`,
+// the Derived shader's `derive_yz` on both, so the front face sits exactly
+// where the line's first row of glyphs would and the back face where its
+// deepest fold would). A line that spans no depth draws its front face
+// only: the other five would coincide with it or have no area, and a
+// coincident face blended twice would double the fade band's alpha.
+//
+// C28 (2026-10-10): before this the wash was ONE flat quad at segment 0's
+// depth, as wide as the cull's conservative byte bound (2 x fold unit): a
+// back-wrapped line at the wash tier ran off to the right instead of
+// receding, the full-wash layer of the cull-state tint being where Ivan
+// saw it. The witness is `tests/gpu.rs`' wash-vs-glyph extent check.
+//
+// Colour = entry colour x group colour, as the Derived shader blends; alpha
+// = the entry's alpha (1 under the threshold, the fade over the 1 px band
+// above it) x the group's.
 
 struct ItemParamsGpu {
     line_height: f32,
@@ -29,7 +42,7 @@ struct ItemParamsGpu {
     _pad2: u32,
 };
 
-struct Wash { item: u32, row_lane: u32, x0: f32, width: f32, color: u32, rows: u32, alpha: f32, tint: u32 };
+struct Wash { item: u32, row_lane: u32, x0: f32, width: f32, color: u32, rows: u32, alpha: f32, tint: u32, nseg: u32 };
 
 struct Frame {
     view_proj: mat4x4<f32>,
@@ -46,6 +59,7 @@ struct Frame {
 @group(0) @binding(3) var<storage, read> item_params: array<ItemParamsGpu>;
 
 const GROUP_STRIDE: u32 = 6u;
+const OFF_SCREEN: vec4<f32> = vec4<f32>(2.0, 2.0, 2.0, 1.0);
 
 // glyph_field_derived.wgsl's derive_yz, verbatim.
 fn derive_yz(row_lane: u32, wrap_segment: u32, item: ItemParamsGpu) -> vec2<f32> {
@@ -82,6 +96,25 @@ fn derive_yz(row_lane: u32, wrap_segment: u32, item: ItemParamsGpu) -> vec2<f32>
     return vec2<f32>(derived_y, derived_z);
 }
 
+// The box's 36 vertices as unit-cube corners: face vi / 6 — 0 front (z 0),
+// 1 back (z 1), 2 top (y 1), 3 bottom (y 0), 4 left (x 0), 5 right (x 1) —
+// two triangles each over the face's (u, v) square: (0,0) (1,0) (1,1) (1,1)
+// (0,1) (0,0). The index buffer is the identity 0..36 (gpu.rs).
+fn box_corner(vi: u32) -> vec3<f32> {
+    let face = vi / 6u;
+    let k = vi % 6u;
+    let u = f32(k == 1u || k == 2u || k == 3u);
+    let v = f32(k == 2u || k == 3u || k == 4u);
+    switch face {
+        case 0u: { return vec3<f32>(u, v, 0.0); }
+        case 1u: { return vec3<f32>(u, v, 1.0); }
+        case 2u: { return vec3<f32>(u, 1.0, v); }
+        case 3u: { return vec3<f32>(u, 0.0, v); }
+        case 4u: { return vec3<f32>(0.0, v, u); }
+        default: { return vec3<f32>(1.0, v, u); }
+    }
+}
+
 struct VsOut {
     @builtin(position) clip: vec4<f32>,
     @location(0) color: vec3<f32>,
@@ -90,21 +123,20 @@ struct VsOut {
 
 @vertex
 fn vs_main(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> VsOut {
-    var corners = array<vec2<f32>, 4>(
-        vec2<f32>(0.0, 0.0),
-        vec2<f32>(1.0, 0.0),
-        vec2<f32>(1.0, 1.0),
-        vec2<f32>(0.0, 1.0),
-    );
     let e = wash[ii];
     let item = item_params[e.item];
-    let yz = derive_yz(e.row_lane, 0u, item);
-    let c = corners[vi];
+    let nseg = max(e.nseg, 1u);
+    // The first row's y and segment 0's z; the last segment's z.
+    let yz0 = derive_yz(e.row_lane, 0u, item);
+    let yz1 = derive_yz(e.row_lane, nseg - 1u, item);
+    let c = box_corner(vi);
     // The first row's cell spans y +- 0.5 (the glyph quad); further rows
     // stack down by the line height.
-    let top = yz.x + 0.5;
-    let bottom = yz.x - 0.5 - f32(max(e.rows, 1u) - 1u) * item.line_height;
-    let aligned = vec3<f32>(e.x0 + c.x * e.width, mix(bottom, top, c.y), yz.y);
+    let top = yz0.x + 0.5;
+    let bottom = yz0.x - 0.5 - f32(max(e.rows, 1u) - 1u) * item.line_height;
+    let aligned = vec3<f32>(e.x0 + c.x * e.width, mix(bottom, top, c.y), mix(yz0.y, yz1.y, c.z));
+    // No depth to span: the front face alone.
+    let flat = nseg == 1u || abs(yz1.y - yz0.y) < 1e-6;
 
     let rows = arrayLength(&groups) / GROUP_STRIDE;
     let gbase = min(item.group, rows - 1u) * GROUP_STRIDE;
@@ -118,10 +150,13 @@ fn vs_main(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> 
     let posed = local + 2.0 * cross(gquat.xyz, qc);
     var clip = frame.view_proj * vec4<f32>(posed + gpos.xyz, 1.0);
     if (gcolor.a <= 0.01 || e.alpha <= 0.0) {
-        clip = vec4<f32>(2.0, 2.0, 2.0, 1.0);
+        clip = OFF_SCREEN;
     }
-    if (gclip.z > 0.5 && (yz.x > gclip.x || yz.x < gclip.y)) {
-        clip = vec4<f32>(2.0, 2.0, 2.0, 1.0);
+    if (gclip.z > 0.5 && (yz0.x > gclip.x || yz0.x < gclip.y)) {
+        clip = OFF_SCREEN;
+    }
+    if (flat && vi >= 6u) {
+        clip = OFF_SCREEN;
     }
 
     var packed = e.color;

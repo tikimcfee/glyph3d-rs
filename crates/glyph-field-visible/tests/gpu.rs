@@ -179,6 +179,12 @@ struct Corpus {
     item_slots: Vec<std::ops::Range<usize>>,
     /// Per expected slot, its (item, item-relative leader byte).
     expected_keys: Vec<(u32, u32)>,
+    /// Per expected slot, its advance in cells (the wash extent witness).
+    expected_cells: Vec<u32>,
+    /// Per line, the cells advanced by leaders that produce NO slot (a
+    /// missing glyph, a malformed lead): the fold's cursor moves, the
+    /// glyphs do not, so a wash may reach that far past the last glyph.
+    line_blank_cells: Vec<u32>,
 }
 
 impl Corpus {
@@ -215,7 +221,7 @@ fn rows_for_line(len: i64, wrap: i64, down: bool) -> i64 {
 fn build(trie: &TrieUpload, specs: &[ItemSpec], segment_bytes: usize) -> Corpus {
     let tw = Twin { trie };
     let cell_adv = tables::fu_to_world(ADVANCE_FU as i32, EM_HEIGHT_FU);
-    let mut c = Corpus { items: vec![], bytes: vec![], lines: vec![], seeds: vec![], spans: vec![], expected: vec![], item_slots: vec![], expected_keys: vec![] };
+    let mut c = Corpus { items: vec![], bytes: vec![], lines: vec![], seeds: vec![], spans: vec![], expected: vec![], item_slots: vec![], expected_keys: vec![], expected_cells: vec![], line_blank_cells: vec![] };
     let mut byte_base = 0u64;
     for (idx, s) in specs.iter().enumerate() {
         let bytes = &s.text;
@@ -233,6 +239,9 @@ fn build(trie: &TrieUpload, specs: &[ItemSpec], segment_bytes: usize) -> Corpus 
             let line_end = bytes[line_start..].iter().position(|&b| b == b'\n').map_or(bytes.len(), |o| line_start + o);
             let line_idx = c.lines.len() as u32;
             let (mut col, mut cells, mut seg_adv, mut glyphs) = (0i64, 0u32, 0f32, 0u32);
+            // The line's widest fold unit in cells (`LineEntryGpu::width_cells`),
+            // and the cells its slot-less leaders advanced.
+            let (mut unit_cells, mut width, mut blank_cells) = (0u32, 0u32, 0u32);
             let mut trailer_until = 0usize;
             let mut seg_start = line_start;
             let mut i = line_start;
@@ -273,11 +282,17 @@ fn build(trie: &TrieUpload, specs: &[ItemSpec], segment_bytes: usize) -> Corpus 
                         glyph_field_derived::item_lane(idx as u32),
                     ));
                     c.expected_keys.push((idx as u32, i as u32));
+                    c.expected_cells.push(k);
                     glyphs += 1;
+                } else {
+                    blank_cells += k;
                 }
                 col += 1;
                 cells += k;
+                unit_cells += k;
                 if fold_unit > 0 && col % fold_unit == 0 {
+                    width = width.max(unit_cells);
+                    unit_cells = 0;
                     seg_adv = 0.0;
                 } else {
                     seg_adv += k as f32 * cell_adv;
@@ -286,7 +301,15 @@ fn build(trie: &TrieUpload, specs: &[ItemSpec], segment_bytes: usize) -> Corpus 
                 // following bytes are classified on their own).
                 i += 1;
             }
-            c.lines.push(LineEntryGpu { byte_start: line_start as u32, item: idx as u32, base_row: base_row as u32, glyph_count: glyphs });
+            c.lines.push(LineEntryGpu {
+                byte_start: line_start as u32,
+                item: idx as u32,
+                base_row: base_row as u32,
+                glyph_count: glyphs,
+                cols: col as u32,
+                width_cells: width.max(unit_cells),
+            });
+            c.line_blank_cells.push(blank_cells);
             base_row += rows_for_line(col, s.wrap_width as i64, down);
             line_start = line_end + 1;
         }
@@ -729,6 +752,105 @@ fn the_frame_path_culls_lays_out_and_draws() {
     assert_eq!(h.color, 0xFF000000, "byte 0 took span 0 after the remap");
     let w = got.iter().find(|s| glyph_field_derived::item_of(s.item_and_group) == 0 && glyph_field_derived::row_of(s.row) == 0 && s.glyph_id() == b'w' as u16).expect("the 'w' of world");
     assert_eq!(w.color, 0xFF000006, "byte 6 took span 6 after the remap");
+}
+
+/// C28 (2026-10-10): the wash tier is a BOX per line that spans exactly what
+/// the line's glyphs span — x from the item's origin over the line's widest
+/// fold unit, the rows a WrapDown line stacks, the depth segments a WrapBack
+/// line recedes through — held here to the glyph slots of the same line
+/// from the twin: every slot inside the box, the box no wider than the
+/// glyphs reach, as many depth segments as the deepest slot's fold, as many
+/// rows as the lowest slot's. Before it the wash was a flat quad at segment
+/// 0's depth as wide as the cull's 2x-fold-unit byte bound, and Ivan saw
+/// wide.txt's back-wrapped lines run off the right instead of receding;
+/// nothing held the wash tier to anything.
+///
+/// Rows past a page boundary are not judged for x: the wash stacks a
+/// WrapDown line's rows straight down while the glyphs move to the next
+/// page column — a known coarseness of the wash, outside C28.
+#[test]
+fn the_wash_box_spans_exactly_what_the_glyphs_span() {
+    let (device, queue) = device();
+    let (trie, c) = corpus();
+    let refs: Vec<&[u8]> = c.bytes.iter().map(|b| b.as_slice()).collect();
+    let inp = inputs(&trie, &c, &refs);
+    let params: Vec<ItemParamsGpu> = c.items.iter().map(|i| i.params).collect();
+    let dummy = Dummy::new(&device);
+    let field = VisibleField::new(&device, &queue, &inp, &dummy.resources(&params), TARGETS, VisibleLimits { max_slots: 1 << 16, max_segments: 1 << 12, max_wash: 1 << 12 });
+    let cell_adv = tables::fu_to_world(ADVANCE_FU as i32, EM_HEIGHT_FU);
+    // Every line a wash (the glyph threshold above every row), hard greeking.
+    run_frame(&device, &queue, &field, &frame(0.0, 1e9, 0.0, 2, 0));
+    let k = field.read_counters(&queue);
+    let n = k[tables::counter::WASH];
+    assert_eq!(n, c.lines.len() as u32, "one wash box per line");
+    let washes = field.read_wash(&queue, n);
+    let eps = 1e-3f32;
+    let mut checked = 0usize;
+    let mut deep = 0usize;
+    let mut stacked = 0usize;
+    for w in &washes {
+        let item = w.item as usize;
+        let row0 = glyph_field_derived::row_of(w.row_lane);
+        let li = c
+            .lines
+            .iter()
+            .position(|l| l.item == w.item && l.base_row == row0)
+            .unwrap_or_else(|| panic!("a wash names a line: item {item} row {row0}"));
+        let line = c.lines[li];
+        let line_end = c.lines.get(li + 1).filter(|next| next.item == w.item).map_or(c.bytes[item].len() as u32, |next| next.byte_start - 1);
+        let slots: Vec<(usize, &DerivedSlot)> = c
+            .expected_keys
+            .iter()
+            .enumerate()
+            .filter(|(_, &(it, b))| it == w.item && b >= line.byte_start && b < line_end)
+            .map(|(k, _)| (k, &c.expected[k]))
+            .collect();
+        if slots.is_empty() {
+            assert_eq!(w.width, 0.0, "line {li}: an empty line's wash has no width");
+            continue;
+        }
+        let p = c.items[item].params;
+        let page_of = |row: u32| -> i32 {
+            let screen_row = row as i32 - p.scroll_rows;
+            if p.has_page != 0 && p.page_rows > 0 && screen_row >= p.page_rows {
+                screen_row / p.page_rows
+            } else {
+                0
+            }
+        };
+        let first_page = page_of(row0);
+        let x_lo = slots.iter().filter(|(_, s)| page_of(glyph_field_derived::row_of(s.row)) == first_page).map(|(_, s)| s.x).fold(f32::INFINITY, f32::min);
+        let x_hi = slots
+            .iter()
+            .filter(|(_, s)| page_of(glyph_field_derived::row_of(s.row)) == first_page)
+            .map(|(k, s)| s.x + c.expected_cells[*k] as f32 * cell_adv)
+            .fold(f32::NEG_INFINITY, f32::max);
+        let max_seg = slots.iter().map(|(_, s)| u32::from(s.wrap_segment())).max().unwrap();
+        let max_row = slots.iter().map(|(_, s)| glyph_field_derived::row_of(s.row)).max().unwrap();
+        assert!(
+            w.x0 <= x_lo + eps && x_hi <= w.x0 + w.width + eps,
+            "line {li} (item {item} row {row0}): glyphs x [{x_lo}, {x_hi}] escape the wash [{}, {}]",
+            w.x0,
+            w.x0 + w.width
+        );
+        // Tight on the right, up to the advance of leaders with no glyph
+        // (the malformed line ends in a truncated lead: the fold's cursor
+        // moves one cell past the last drawn glyph, and so may the wash).
+        let slack = c.line_blank_cells[li] as f32 * cell_adv;
+        assert!(
+            x_hi >= w.x0 + w.width - slack - eps,
+            "line {li}: the wash [{}, {}] is wider than its glyphs reach ({x_hi}; {slack} of slot-less advance allowed)",
+            w.x0,
+            w.x0 + w.width
+        );
+        assert_eq!(w.nseg, max_seg + 1, "line {li}: the box spans the line's depth segments");
+        assert_eq!(w.rows, max_row - row0 + 1, "line {li}: the box stacks the line's rows");
+        checked += 1;
+        deep += usize::from(w.nseg > 1);
+        stacked += usize::from(w.rows > 1);
+    }
+    assert!(checked >= 10, "the corpus gave {checked} non-empty washed lines to check");
+    assert!(deep >= 1 && stacked >= 1, "the corpus must wash a back-wrapped line ({deep}) and a down-wrapped one ({stacked})");
 }
 
 // ── M3: edits and selection keyed by (item, byte) ───────────────────────────

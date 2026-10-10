@@ -12,12 +12,16 @@
 //                  total plans cull_lines' indirect dispatch.
 //   cull_lines     one invocation per candidate line, dispatched indirectly:
 //                  finds its item by binary search over the bases, builds the
-//                  line's world box (x from its byte length, rows and depth
-//                  segments from the fold rules, pages from `Pager`), tests
-//                  it, and sorts a visible line into the GLYPH tier (one
-//                  segment entry per cut, slots reserved for the whole line
-//                  at once) or the WASH tier (one quad in its spans' mean
-//                  colour).
+//                  line's world box (x over its widest fold unit, rows from
+//                  the table, depth segments and column pages from its leader
+//                  count by the fold rules, pages from `Pager`), tests it, and
+//                  sorts a visible line into the GLYPH tier (one segment entry
+//                  per cut, slots reserved for the whole line at once) or the
+//                  WASH tier (one BOX in its spans' mean colour: that same x
+//                  extent, its rows, its depth segments — C28, 2026-10-10;
+//                  before it the wash was a flat quad at segment 0's depth as
+//                  wide as the cull's 2x bound, and a back-wrapped line at
+//                  the wash tier ran off to the right instead of receding).
 //   finalize       one invocation: the layout dispatch and both draws'
 //                  indirect arguments from the counters.
 //
@@ -86,14 +90,17 @@ struct ItemParamsGpu {
     _pad2: u32,
 };
 
-struct LineEntry { byte_start: u32, item: u32, base_row: u32, glyph_count: u32 };
+// `cols`: the line's leaders (the fold's column at its end); `width_cells`:
+// its widest fold unit in cells (the whole line without one).
+struct LineEntry { byte_start: u32, item: u32, base_row: u32, glyph_count: u32, cols: u32, width_cells: u32 };
 struct SegmentSeed { line: u32, byte_offset: u32, col: u32, seg_adv: f32, cells: u32, _pad: u32 };
 struct ByteSpan { start: u32, end: u32, color: u32 };
 struct Seg { item: u32, line: u32, byte_off: u32, byte_end: u32, col: u32, cells: u32, seg_adv: f32, slot_base: u32 };
-// One WASH quad: the line's first row (row lane as the Derived slot
-// carries it), its x extent, its mean colour, how many rows it stacks, its
-// alpha, and a debug tint (0 = none).
-struct Wash { item: u32, row_lane: u32, x0: f32, width: f32, color: u32, rows: u32, alpha: f32, tint: u32 };
+// One WASH box: the line's first row (row lane as the Derived slot carries
+// it), its x extent, its mean colour, how many rows it stacks (WrapDown),
+// its alpha, a debug tint (0 = none), and how many depth segments it spans
+// (WrapBack: segment 0's z to the last's).
+struct Wash { item: u32, row_lane: u32, x0: f32, width: f32, color: u32, rows: u32, alpha: f32, tint: u32, nseg: u32 };
 
 struct Frame {
     view_proj: mat4x4<f32>,
@@ -316,22 +323,24 @@ fn cell_z(p: ItemParamsGpu, seg: f32, x_page: f32, band: f32) -> f32 {
     return fma(x_page, p.depth_per_col, z_banded);
 }
 
-// The LOCAL (pre-group) box of a line: x from its byte length (bytes >=
-// cells, every advance <= 2 cells, a fold unit resets x), rows from the
-// table, depth from the fold's segment fan and column pages, pages from
-// `Pager`'s integer rules — one run of rows per page the line crosses.
-fn line_local_box(it: ItemGpu, p: ItemParamsGpu, base_row: u32, rows: u32, len: u32) -> Box {
+// The depth segments a line's leaders fold into: `wrap_segment = col / wrap`
+// for its last leader, plus one (one segment without a wrap).
+fn depth_segments(it: ItemGpu, cols: u32) -> u32 {
+    if (it.wrap_width == 0u) { return 1u; }
+    return max(1u, (cols + it.wrap_width - 1u) / it.wrap_width);
+}
+
+// The LOCAL (pre-group) box of a line: x over its widest fold unit (Pass
+// 1's `width_cells`: exact, the glyphs reach no further), rows from the
+// table, depth from the fold's segment fan (`nseg`) and column pages (from
+// the leader count), pages from `Pager`'s integer rules — one run of rows
+// per page the line crosses.
+fn line_local_box(it: ItemGpu, p: ItemParamsGpu, base_row: u32, rows: u32, cols: u32, width_cells: u32, nseg: u32) -> Box {
     let cell_adv = frame.lod.w;
-    let wrap = it.wrap_width;
     let paged_cols = it.has_page != 0u && it.page_cols > 0;
-    let fold_unit = select(select(0u, u32(it.page_cols), paged_cols), wrap, wrap > 0u);
-    var width_cells = len;
-    if (fold_unit > 0u) { width_cells = min(len, 2u * fold_unit); }
     let w = f32(width_cells) * cell_adv;
-    var nseg = 1u;
-    if (wrap > 0u) { nseg = max(1u, (len + wrap - 1u) / wrap); }
     var xp_max = 0u;
-    if (paged_cols) { xp_max = len / u32(it.page_cols); }
+    if (paged_cols) { xp_max = cols / u32(it.page_cols); }
     let s_hi = f32(nseg - 1u);
     let x_hi = f32(xp_max);
     // z over the segment and column-page extremes (band added per run).
@@ -416,10 +425,10 @@ fn wash_color(it: ItemGpu, line: u32, s: u32, e: u32) -> u32 {
     return m.x | (m.y << 8u) | (m.z << 16u) | 0xFF000000u;
 }
 
-fn push_wash(it_idx: u32, row_lane: u32, x0: f32, width: f32, color: u32, rows: u32, alpha: f32, tint: u32) {
+fn push_wash(it_idx: u32, row_lane: u32, x0: f32, width: f32, color: u32, rows: u32, alpha: f32, tint: u32, nseg: u32) {
     let k = atomicAdd(&counters[C_WASH], 1u);
     if (k >= frame.u1.z) { return; }
-    wash[k] = Wash(it_idx, row_lane, x0, width, color, rows, alpha, tint);
+    wash[k] = Wash(it_idx, row_lane, x0, width, color, rows, alpha, tint, nseg);
 }
 
 @compute @workgroup_size(64)
@@ -452,7 +461,8 @@ fn cull_lines(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
 
     let gbase = group_base(it.group);
-    let local = line_local_box(it, p, line.base_row, rows, len);
+    let depth = depth_segments(it, line.cols);
+    let local = line_local_box(it, p, line.base_row, rows, line.cols, line.width_cells, depth);
     let world = to_world(gbase, local);
     if (!box_in_frustum(world)) { return; }
     let gscale = groups[gbase + 3u];
@@ -460,8 +470,10 @@ fn cull_lines(@builtin(global_invocation_id) gid: vec3<u32>) {
     let greek = frame.u0.x;
     let tint_mode = frame.u0.y;
 
-    // The wash quad's first-row lane (column page 0: the line's start) and
-    // x origin (the first row's page).
+    // The wash box's first-row lane (column page 0: the line's start), its
+    // x origin (the first row's page) and its width: the line's widest fold
+    // unit, exactly what its glyphs reach — not the cull box, which is the
+    // same today but may be padded; the wash is what the eye sees.
     let row_lane = pack_row(line.base_row, 0u);
     var wash_x0 = it.origin_x_hi;
     if (it.has_page != 0u && p.page_rows > 0) {
@@ -471,7 +483,7 @@ fn cull_lines(@builtin(global_invocation_id) gid: vec3<u32>) {
             wash_x0 = wash_x0 + f32(y_page % max(p.pages_wide, 1)) * it.stride_hi;
         }
     }
-    let wash_w = local.hi.x - local.lo.x;
+    let wash_w = f32(line.width_cells) * frame.lod.w;
 
     if (px < frame.lod.x) {
         // WASH tier.
@@ -480,7 +492,7 @@ fn cull_lines(@builtin(global_invocation_id) gid: vec3<u32>) {
         var tint = 0u;
         if (tint_mode == 1u) { tint = TINT_WASH_TIER; }
         if (tint_mode == 2u) { tint = TINT_WASH_FULL; }
-        push_wash(it_idx, row_lane, wash_x0, wash_w, wash_color(it, li, line.byte_start, line.byte_start + len), rows, 1.0, tint);
+        push_wash(it_idx, row_lane, wash_x0, wash_w, wash_color(it, li, line.byte_start, line.byte_start + len), rows, 1.0, tint, depth);
         return;
     }
 
@@ -502,7 +514,7 @@ fn cull_lines(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (seg_base + nseg > frame.u1.y) {
         atomicAdd(&counters[C_LINES_DROPPED], 1u);
         atomicAdd(&counters[C_SLOTS_DROPPED], line.glyph_count);
-        if (tint_mode == 2u) { push_wash(it_idx, row_lane, wash_x0, wash_w, TINT_DROPPED, rows, 1.0, TINT_DROPPED); }
+        if (tint_mode == 2u) { push_wash(it_idx, row_lane, wash_x0, wash_w, TINT_DROPPED, rows, 1.0, TINT_DROPPED, depth); }
         return;
     }
     atomicMax(&counters[C_SEG_FIT_END], seg_base + nseg);
@@ -511,7 +523,7 @@ fn cull_lines(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (!fits) {
         atomicAdd(&counters[C_LINES_DROPPED], 1u);
         atomicAdd(&counters[C_SLOTS_DROPPED], line.glyph_count);
-        if (tint_mode == 2u) { push_wash(it_idx, row_lane, wash_x0, wash_w, TINT_DROPPED, rows, 1.0, TINT_DROPPED); }
+        if (tint_mode == 2u) { push_wash(it_idx, row_lane, wash_x0, wash_w, TINT_DROPPED, rows, 1.0, TINT_DROPPED, depth); }
         // Empty entries keep the segment range contiguous.
         for (var k = 0u; k < nseg; k = k + 1u) {
             segs[seg_base + k] = Seg(it_idx, li, 0u, 0u, 0u, 0u, 0.0, 0u);
@@ -547,7 +559,7 @@ fn cull_lines(@builtin(global_invocation_id) gid: vec3<u32>) {
         var tint = 0u;
         if (tint_mode == 1u) { tint = TINT_WASH_TIER; }
         if (tint_mode == 2u) { tint = TINT_WASH_BAND; }
-        push_wash(it_idx, row_lane, wash_x0, wash_w, wash_color(it, li, line.byte_start, line.byte_start + len), rows, frame.lod.x + 1.0 - px, tint);
+        push_wash(it_idx, row_lane, wash_x0, wash_w, wash_color(it, li, line.byte_start, line.byte_start + len), rows, frame.lod.x + 1.0 - px, tint, depth);
     }
 }
 
@@ -564,7 +576,8 @@ fn finalize() {
     indirect[I_DRAW + 2u] = 0u;
     indirect[I_DRAW + 3u] = 0u;
     indirect[I_DRAW + 4u] = 0u;
-    indirect[I_WASH_DRAW] = 6u;
+    // A wash is a box: six faces, 36 indices (visible_wash.wgsl's corner table).
+    indirect[I_WASH_DRAW] = 36u;
     indirect[I_WASH_DRAW + 1u] = min(atomicLoad(&counters[C_WASH]), frame.u1.z);
     indirect[I_WASH_DRAW + 2u] = 0u;
     indirect[I_WASH_DRAW + 3u] = 0u;
