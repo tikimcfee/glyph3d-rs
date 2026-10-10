@@ -517,3 +517,70 @@ cargo glyph gates
 cmp ../out/tooling-ab/sweep/repo-highlight@visible.png ../out/tooling-ab/baseline/vulkan-nvidia/repo-highlight.png && echo byte-equal
 ```
 
+
+## C30 — a deterministic draw order (2026-10-10)
+
+**What Ivan saw, and why.** In visible mode, on a large file in a big JS
+repo, angled or not: where many back-stacked glyphs overlap, they flickered
+in and out on top of each other — on a still camera, visible mode only. The
+cull appended each visible item and reserved each line's segments and slots
+by `atomicAdd`, so the transient slots (the glyph draw order) came out in
+whatever order the GPU ran the invocations, different every frame. The glyph
+pass blends and writes depth, so where a line's deeper wrap segments overlap
+another line's glyphs on screen the overlap is resolved by draw order (a
+near glyph's anti-aliased fringe writes depth and rejects ink drawn after
+it). Measured offscreen on vulkan-nvidia before the fix: six renders of one
+steep pose over a generated long file differed by 88-183 px (max channel
+delta 70), and 188 px from derived; at shallow pitch, or with
+`--z-wrap-spacing 0`, not at all.
+
+**The fix.** Every placement is a scan in (item index, line) order
+(`visible_cull.wgsl`, ORDER): `cull_items` flags each item and sums its
+256-item block, `prefix_items` scans the block sums, `compact_items` writes
+the visible items in index order with their candidate-line bases; in cull B
+`cull_lines` classifies each line (glyph tier, wash tier, nothing) into a
+record and sums its block's segments, slots and wash boxes, `scan_blocks`
+scans those, and `emit_lines` writes each line's segment entries and wash box
+at its scanned offsets. The visible draw order is therefore arena order, the
+stored modes' order, and the same view lays out the same bytes every frame.
+The cap rule becomes index-ordered: offsets are monotone, so the lines that
+fit are a prefix and the lines dropped are the LAST in (item, line) order,
+the same every frame; the dropped counters still sum every dropped line and
+slot. A wash box a line reserves and nothing fills (the cull-state tint's
+reservation for a line that fits) is written empty, alpha 0.
+
+**What holds it.** `native/tests/visible_repeat.rs` renders that steep pose
+over a corpus it generates (one 20,000-line code-like file, a quarter of its
+lines past the wrap) four times in visible mode and once in derived, and
+requires every frame byte-identical (1.1 s). Mutation
+`visible-slot-order-atomic` (the slot base back on an atomic counter)
+reddens it. The crate's frame test now holds the transient slots to the twin
+IN ORDER, and a capped frame to the arena-order prefix, repeated.
+
+**The price** (`GLYPH_VISIBLE_TIMING=1`, median of 130 settled frames,
+RTX 5090 Vulkan; `gpu cull` spans every cull pass, both sides):
+
+| pose | corpus | candidate lines | cull before | cull after | layout before | layout after |
+|---|---|---|---|---|---|---|
+| s4 steep | generated, 20k lines | 20,000 | 0.020 ms | 0.031 ms | 0.226 ms | 0.228 ms |
+| s2 oblique | generated | 20,000 | 0.021 | 0.032 | 0.226 | 0.227 |
+| j1 far | a 570-file JS repo | 137,167 (all wash) | 0.022 | 0.040 | 0.005 | 0.005 |
+| j2 mid steep | JS repo | 6,611 | 0.021 | 0.035 | 0.115 | 0.130 |
+| j3 close steep | JS repo | 5,534 | 0.021 | 0.035 | 0.354 | 0.334 |
+| r1 far | 29,377 crates.io files, 13 M lines | 0 | 0.016 | 0.023 | 0.005 | 0.005 |
+| r2 | crates.io | 83,840 (all wash) | 0.025 | 0.041 | 0.005 | 0.005 |
+| r3 close steep | crates.io | 13,594 | 0.022 | 0.035 | 0.140 | 0.140 |
+| r4 | crates.io | 21,189 | 0.022 | 0.035 | 0.199 | 0.197 |
+| r5 grazing | crates.io | 174,349 | 0.031 | 0.054 | 0.195 | 0.193 |
+
+The cull costs 7-23 µs more per frame (three more dispatches and a second
+look at each line); the layout is unchanged within ±20 µs. A first cut that
+scanned the items in one workgroup cost 70 µs on the 29,377-item corpus and
+was replaced by the block scan above.
+
+**Not covered.** The selection mask (M3) still appends its slots by an
+atomic counter (`layout_segments` in MASK mode); the mask pass has no depth
+and no blend, so where two selected glyphs overlap on screen the last
+written wins, and that can still vary frame to frame. The stacked-layer
+shimmer under camera motion (C30's other finding, all modes alike) is
+untouched.

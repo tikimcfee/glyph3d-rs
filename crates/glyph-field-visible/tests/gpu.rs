@@ -661,7 +661,8 @@ fn the_frame_path_culls_lays_out_and_draws() {
     let segments = lines + c.seeds.len() as u32;
 
     // 1. Everything in view, every line glyph tier: the transient slots are
-    //    the twin's, as a set (segment order is atomic).
+    //    the twin's, in the twin's order — arena order, (item, line, byte):
+    //    the cull places lines by scans since C30, by atomics before.
     run_frame(&device, &queue, &field, &frame(0.0, 0.0, 0.0, 1, 0));
     let k = field.read_counters(&queue);
     assert_eq!(k[tables::counter::ITEMS_VISIBLE], items, "items visible");
@@ -671,11 +672,8 @@ fn the_frame_path_culls_lays_out_and_draws() {
     assert_eq!(k[tables::counter::SEG_FIT_END], segments, "segments");
     assert_eq!(k[tables::counter::SLOT_FIT_END], total, "slots");
     assert_eq!(k[tables::counter::SLOTS_DROPPED], 0);
-    let mut got = field.read_slots(&queue, total);
-    let mut want = c.expected.clone();
-    got.sort_by_key(sort_key);
-    want.sort_by_key(sort_key);
-    assert_slots_equal(&got, &want, "frame slots (sorted)");
+    let got = field.read_slots(&queue, total);
+    assert_slots_equal(&got, &c.expected, "frame slots (in arena order)");
 
     // 2. A hidden item: neither laid out nor counted.
     field.set_item_hidden(&queue, 1, true);
@@ -720,9 +718,17 @@ fn the_frame_path_culls_lays_out_and_draws() {
     assert_eq!(k[tables::counter::SLOTS_DROPPED] + k[tables::counter::SLOT_FIT_END], total, "every slot is drawn or counted dropped");
     assert_eq!(k[tables::counter::LINES_GLYPH] + k[tables::counter::LINES_DROPPED], lines);
     let fit = small.read_slots(&queue, k[tables::counter::SLOT_FIT_END]);
-    for s in &fit {
-        assert!(c.expected.iter().any(|w| sort_key(w) == sort_key(s) || (w.item_and_group == s.item_and_group && w.row == s.row && w.x.to_bits() == s.x.to_bits())), "a drawn slot is a real one: {}", describe(s));
-    }
+    // The lines that fit are the FIRST in (item, line) order and the dropped
+    // ones the last, the same lines every frame (C30): the drawn slots are
+    // the arena's prefix, and a second frame draws the same bytes.
+    // (Colour aside: the cull-state tint paints every drawn glyph.)
+    let place = |s: &DerivedSlot| (s.x.to_bits(), s.row, s.glyph_and_wrap, s.item_and_group);
+    let bad = fit.iter().zip(&c.expected).filter(|(g, w)| place(g) != place(w)).count();
+    assert_eq!(bad, 0, "capped frame: {bad} of {} drawn slots are not the arena-order prefix", fit.len());
+    run_frame(&device, &queue, &small, &frame(0.0, 0.0, 0.0, 1, 2));
+    let k2 = small.read_counters(&queue);
+    assert_eq!(k2, k, "a capped frame repeats its counters");
+    assert_slots_equal(&small.read_slots(&queue, k2[tables::counter::SLOT_FIT_END]), &fit, "a capped frame repeats its slots");
 
     // 7. The stats ring: after a few frames the readback has landed.
     for _ in 0..4 {

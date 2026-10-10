@@ -47,7 +47,7 @@ fn visible_wgsl_shaders_parse_and_validate() {
     // mask kernels (M3) are `layout_segments` in another mode plus
     // `finalize_mask`, so the layout file grew by one.
     let entry_points: &[(&str, &[&str])] = &[
-        ("visible_cull.wgsl", &["cull_items", "cull_lines", "finalize", "prefix_items"]),
+        ("visible_cull.wgsl", &["compact_items", "cull_items", "cull_lines", "emit_lines", "finalize", "prefix_items", "scan_blocks"]),
         ("visible_layout.wgsl", &["count_seed_segments", "finalize_mask", "layout_segments", "prefix_seed_survivors"]),
         ("visible_wash.wgsl", &["fs_main", "vs_main"]),
     ];

@@ -37,13 +37,15 @@
 //! a seeded segment learns its slot count: at load, the layout kernel runs
 //! in COUNT mode once per seed (`count_seed_segments`, then
 //! `prefix_seed_survivors`) and leaves each seed's survivors-before
-//! resident; cull B reserves a whole line's slots with one `atomicAdd` of
-//! its `glyph_count` and gives segment k the base plus that prefix. The
-//! public struct is unchanged; the side table is 4 B per seed.
+//! resident; cull B gives a whole line its slots at a scanned base (its
+//! `glyph_count` summed over the lines before it in (item, line) order,
+//! C30 — an `atomicAdd` until then) and segment k the base plus that
+//! prefix. The public struct is unchanged; the side table is 4 B per seed.
 //!
 //! EDITS AND SELECTION KEYED BY (ITEM, BYTE) (M3, 2026-10-10). A slot here
-//! lives one frame and lands where the atomics put it, so nothing the
-//! renderer keyed by slot survives; every such consumer is re-keyed:
+//! lives one frame and lands where the cull puts it (arena order since C30,
+//! but only among the lines in view), so nothing the renderer keyed by slot
+//! survives; every such consumer is re-keyed:
 //!
 //! - **Per-glyph verbs** → [`VisibleField::set_glyph_override`] /
 //!   [`VisibleField::clear_glyph_override`]: a resident override table
