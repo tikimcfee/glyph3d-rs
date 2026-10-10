@@ -30,18 +30,14 @@
 //! This file is the CLI SHELL (clap parsing, run-mode dispatch, help); the
 //! renderer lives in the library — `src/lib.rs`.
 
-
-
 use clap::CommandFactory;
-#[cfg(feature = "cubecl")]
-use glyph3d_native::cli::CubeclTask;
 use glyph3d_native::cli::{
     parse_cli, Cli, CliCommand, FixtureTask, GpuInfoMode, RenderTarget,
 };
 use glyph3d_native::*;
 
 /// Parse the CLI and dispatch one run mode: a render (windowed or offscreen),
-/// a repo scan, or one of the exit-driver instruments (fixture, CubeCL, GPU info).
+/// a repo scan, or one of the exit-driver instruments (fixture, GPU info).
 fn main() {
     // Unified logging & tracing substrate.
     // tracing-log automatically captures all log::* records and routes them into tracing.
@@ -90,29 +86,6 @@ fn main() {
                 GpuInfoMode::Profile => print!("{}", ctx.profile.render_text()),
             }
         }
-        CliCommand::Cubecl(task) => {
-            #[cfg(feature = "cubecl")]
-            {
-                let ctx = pollster::block_on(gpu::init(None));
-                match task {
-                    CubeclTask::Smoke => cubecl_smoke::run(&ctx),
-                    CubeclTask::ScanCheck(path) => cubecl_scan::run(&ctx, &path),
-                    CubeclTask::ChainCheck(path) => cubecl_chain::run(&ctx, &path),
-                    CubeclTask::ChainBench(path) => cubecl_chain::bench(&ctx, &path),
-                    CubeclTask::DecodeCheck(path) => cubecl_chain::decode_check(&ctx, &path),
-                    CubeclTask::ClusterCheck(path) => cubecl_chain::cluster_check(&ctx, &path),
-                    CubeclTask::RepoCheck { dir, color_mode } => {
-                        cubecl_chain::repo_check(&ctx, &dir, color_mode);
-                    }
-                }
-            }
-            #[cfg(not(feature = "cubecl"))]
-            {
-                let _ = task;
-                eprintln!("error: cubecl options require building with `--features cubecl`");
-                std::process::exit(1);
-            }
-        }
         CliCommand::Fixture(task) => match task {
             FixtureTask::Reference(paths) => fixture::run_fixture_reference(&paths),
             FixtureTask::Trie(paths) => fixture::run_fixture_trie(&paths),
@@ -127,11 +100,6 @@ fn main() {
             strategy,
             verify,
         } => {
-            #[cfg(not(feature = "cubecl"))]
-            if strategy == repo::Strategy::Cubecl {
-                eprintln!("error: --repo-engine cubecl was not compiled into this binary (rebuild with `cargo run --features cubecl`)");
-                std::process::exit(1);
-            }
             let load = repo::load_repo(
                 &dir,
                 &params,
@@ -141,12 +109,6 @@ fn main() {
             load.print_stats();
         }
         CliCommand::Render(plan) => {
-            #[cfg(not(feature = "cubecl"))]
-            if let SceneChoice::Repo { strategy: repo::Strategy::Cubecl, .. } = plan.choice {
-                eprintln!("error: --repo-engine cubecl was not compiled into this binary (rebuild with `cargo run --features cubecl`)");
-                std::process::exit(1);
-            }
-
             let prefetched_walk = if let SceneChoice::Repo {
                 dir,
                 strategy,
@@ -193,18 +155,6 @@ fn main() {
                     a
                 });
                 *ctx.prefetched_atlas.lock().unwrap_or_else(|e| e.into_inner()) = Some(atlas_handle);
-            }
-
-            #[cfg(feature = "cubecl")]
-            if matches!(&plan.choice, SceneChoice::Repo { strategy: repo::Strategy::Cubecl, .. }) {
-                let shared_dev = gpu::SharedDevice::from_ctx(&ctx);
-                let is_derived = plan.cull_opts.field_mode == glyph_field::GlyphFieldMode::Derived;
-                let handle = std::thread::spawn(move || {
-                    let t = std::time::Instant::now();
-                    cubecl_chain::prewarm(&shared_dev, Some(is_derived));
-                    log::info!("cubecl compute pipeline prewarm finished in {:?}", t.elapsed());
-                });
-                *ctx.prewarm_handle.lock().unwrap_or_else(|e| e.into_inner()) = Some(handle);
             }
 
             match plan.target {

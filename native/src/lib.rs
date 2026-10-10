@@ -27,15 +27,6 @@ pub mod spatial_scene;
 pub mod text;
 pub mod windowed;
 
-#[cfg(feature = "cubecl")]
-pub mod cubecl_smoke;
-#[cfg(feature = "cubecl")]
-pub mod cubecl_scan;
-#[cfg(feature = "cubecl")]
-pub mod cubecl_chain;
-#[cfg(feature = "cubecl")]
-pub mod cubecl_layout;
-
 pub use atlas::default_trie;
 pub use cli::{Op, parse_verb};
 pub use glyph_scene::{CameraMode, GlyphScene};
@@ -122,7 +113,6 @@ pub fn engine_layout(file: &Path) -> (layout::GlyphArena, layout::ItemPlacement)
         .expect("engine layout failed");
     (arena, placements[0])
 }
-
 
 #[derive(Clone, Copy, Debug)]
 pub struct SceneCullOptions {
@@ -381,8 +371,6 @@ fn build_scene_impl(
             let t_visual_start = std::time::Instant::now();
             let device = &ctx.device;
             let queue = &ctx.queue;
-            #[cfg(feature = "cubecl")]
-            let shared_dev = gpu::SharedDevice::from_ctx(ctx);
             let prefetched_atlas_handle = ctx.prefetched_atlas.lock().unwrap_or_else(|e| e.into_inner()).take();
             let (load, atlas, atlas_wall) = std::thread::scope(|s| {
                 let atlas_handle = s.spawn(move || {
@@ -396,19 +384,6 @@ fn build_scene_impl(
                     };
                     (a, t.elapsed())
                 });
-                #[cfg(feature = "cubecl")]
-                if *strategy == repo::Strategy::Cubecl {
-                    let mut guard = ctx.prewarm_handle.lock().unwrap_or_else(|e| e.into_inner());
-                    if guard.is_none() {
-                        let dev = shared_dev.clone();
-                        let is_derived = params.field_mode == glyph_field::GlyphFieldMode::Derived;
-                        *guard = Some(std::thread::spawn(move || {
-                            let t = std::time::Instant::now();
-                            cubecl_chain::prewarm(&dev, Some(is_derived));
-                            log::info!("cubecl compute pipeline prewarm finished in {:?}", t.elapsed());
-                        }));
-                    }
-                }
                 let prefetched = if let Some(h) = ctx.prefetched_walk.lock().unwrap_or_else(|e| e.into_inner()).take() {
                     let t_wait = std::time::Instant::now();
                     let res = h.join().unwrap_or_else(|_| repo::prefetch_repo(dir, params, *strategy));

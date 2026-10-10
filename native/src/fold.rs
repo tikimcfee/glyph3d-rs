@@ -244,7 +244,7 @@ pub struct Item {
 ///
 /// THE FIELD NAMES STAY SHORT HERE, and only here. `sm`/`gi`/`fl`/`lm`/`lc`/
 /// `wm`/`wc` are the cross-layer schema's own spellings — they appear under
-/// exactly these names in the JS contract, in the CubeCL kernels, and in every
+/// exactly these names in the JS contract and in every
 /// lane constant (`LM_X`, `LC_ROW`, `SM_ADVANCE`) — so renaming them here
 /// would break the correspondence that lets the layers be checked against each
 /// other. Everything LOCAL is spelled out instead: an abbreviation is a poor
@@ -542,8 +542,8 @@ pub(crate) fn is_static_zero_cp(cp: u32) -> bool {
 
 /// THE SEQUENCE PASS — one item, one serial walk over its leaders, between
 /// decode and the fold. A transcription of the oracle's `resolveClusters`
-/// (engine/fixtures/inputs/glyphPipelineReference.js); the layout backends and
-/// the device chain (`cubecl_chain/cluster.rs`) carry the same rule. When they
+/// (engine/fixtures/inputs/glyphPipelineReference.js); the layout backends
+/// carry the same rule. When they
 /// disagree the oracle is wrong only after the c9667ec protocol (fix the
 /// oracle, regenerate, let the ports red).
 ///

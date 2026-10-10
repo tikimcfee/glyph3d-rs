@@ -30,17 +30,13 @@ Always run tests appropriate to your scope before committing:
    ```
    Validates deterministic picks and ray-cast hits on `alpha.rs`, `wide.txt`, `sub/deep.py`, `long.md`, `text.rs`, and `emoji-view.txt`.
 
-2. **GPU CubeCL Layout Parity (Optional Feature)**:
+2. **HyperLayout against the oracle (records, host and device Pass 2, paint), incl. emoji sequences**:
    ```sh
-   cargo run --release -p glyph3d-native --features cubecl -- --cubecl-repo-check native/fixtures/g-pick-repo
+   cargo glyph gate hyper-oracle
    ```
-   Compares GPU layout slots against the CPU reference fold bit-for-bit. Must report 0 mismatches.
-
-3. **Unicode & Cluster Verification**:
-   ```sh
-   cargo run --release -p glyph3d-native --features cubecl -- --cubecl-repo-check tools/vendor/third-party/unicode-ucd
-   ```
-   Checks emoji sequences, skin-tone modifiers, flags, and zero-width joiners.
+   Holds the production layout to the oracle-backed fold bit-for-bit over the fixture corpus, `g-pick-repo`,
+   `g-cluster-repo` and the cluster/chunk-cut fixtures; emoji sequences, skin tones, flags and ZWJ included.
+   (The CubeCL parity checks that used to sit here retired with the engine on 2026-10-09.)
 
 ---
 
@@ -77,13 +73,6 @@ Outputs mean, min, max, and stddev for:
   --color-mode syntax \
   --frames 1
 
-# GPU CubeCL with hardware profiling timestamps:
-GLYPH_CHAIN_PROF=1 ./target/release/glyph3d-native \
-  --load-repo "$GLYPH_FLAGSHIP_REPO" \
-  --repo-engine cubecl \
-  --field-mode derived \
-  --screenshot out/perf_test.png \
-  --frames 1
 ```
 
 ---
@@ -91,8 +80,8 @@ GLYPH_CHAIN_PROF=1 ./target/release/glyph3d-native \
 ## 4. UI vs TUI Distinction
 
 - **Launcher TUI (`glyph tui`)**:
-  - Interactive terminal application built with Ratatui (`glyph/src/tui.rs`). Run via `cargo run -p glyph -- tui`.
-  - Features dynamic subtitles on focus/select for layout engines (`hyper`, `cubecl`, `direct`, `batch`) and field modes (`instanced`, `derived`).
+  - Interactive terminal application built with Ratatui (`glyph/src/tui/`). Run via `cargo run -p glyph -- tui`.
+  - Features dynamic subtitles on focus/select for layout engines (`hyper`, `direct`, `batch`) and field modes (`instanced`, `derived`).
 - **In-Engine UI (`egui`)**:
   - The HUD rendered directly inside the 3D graphics window.
   - Controls camera frustum, spatial zone dragging, desk rolodex, and live diagnostics (`F1` toggles debug panel).

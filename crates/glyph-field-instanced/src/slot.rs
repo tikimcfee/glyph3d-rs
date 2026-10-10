@@ -4,8 +4,8 @@ use bytemuck::{Pod, Zeroable};
 use glyph_field::{GlyphInstance, GlyphPlacement};
 
 /// The render-bound slot — 32 B, what the shader's `InstanceSlot` has been
-/// since E2a. The CubeCL chain's scatter produces this form on device (the
-/// endpoint, note 23); the 48 B engine paths transcode at staging. Field
+/// since E2a. HyperLayout's device Pass 2 emits this form directly; the
+/// 48 B engine paths transcode at staging. Field
 /// order is the shader's read order minus the dead lanes — every value the
 /// vertex math reads is bit-identical to the 48 B form's.
 ///

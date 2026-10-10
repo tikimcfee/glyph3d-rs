@@ -31,7 +31,6 @@ Platform: macOS on Apple Silicon (`osx-arm64`; Metal) and Linux x86_64 (`linux-6
  │ • CPU-parallel fold & survivors via Rayon cache-blocked scan│
  │ • Intra-file chunking & wrap-aware segmentation for minified│
  │ • Zero-copy direct write into mapped Metal shared memory    │
- │ • Optional CubeCL compute engine (--features cubecl)        │
  │ • ByteSpan semantic token painting for AST / LSP integration│
  └──────────────────────────────┬──────────────────────────────┘
                                 │ writes RenderSlot [32B] or DerivedSlot [20B]
@@ -70,8 +69,6 @@ Requirements: macOS/Apple Silicon or Linux x86_64, a recent Rust toolchain (MSRV
 cargo build --release -p glyph3d-native
 cargo run --release -p glyph3d-native
 
-# Optional: enable experimental CubeCL compute kernels
-cargo check --features cubecl
 ```
 
 ### Running the Renderer
@@ -118,7 +115,6 @@ python3 tools/bench_hyper.py --repo /path/to/glyph3d-js -n 5 --color-mode flat
 | `native/src/layout_hyper.rs` | HyperLayout: parallel CPU layout engine into mapped unified memory |
 | `native/src/glyph_scene/` | Modularized Slug WGSL renderer: `setup.rs`, `pipelines.rs`, `render.rs` |
 | `crates/glyph-field*` | The glyph field by render mode: mode-neutral contract (`glyph-field`), Instanced 32B mode (`glyph-field-instanced`), and Derived 20B mode (`glyph-field-derived`) |
-| `native/src/cubecl_*.rs` | Decoupled CubeCL GPU compute kernels (gated behind `[features] cubecl`) |
 | `glyph/` | The verification and mutation runner (`cargo run -p glyph -- validate`) |
 | `tools/` | Verification scripts, generators, and `bench_hyper.py` performance harness |
 | `.agents/` | Agent guidelines, house rules (`rules/rust-engineering.md`), and testing skill (`skills/glyph-engine-testing/SKILL.md`) |
