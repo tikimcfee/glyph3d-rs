@@ -703,3 +703,25 @@ fn screenshot_runs_never_discover_launch_config() {
     assert!(discovers_launch_config(&parse(&["--demo"])));
 }
 
+/// C27 (2026-10-10): a scene typed on the command line is the scene. The
+/// file's scene keys used to merge one by one, so its `load_repo` outranked
+/// a typed `--render-file` (repo beats file in `Cli::action`).
+#[test]
+fn launch_config_scene_yields_to_a_typed_scene() {
+    let tmp = std::env::temp_dir().join(format!("test_launch_cfg_scene_{}.toml", std::process::id()));
+    std::fs::write(&tmp, "load_repo = \"/cfg/repo\"\nfocus_file = \"alpha\"\nfield_mode = \"visible\"\n")
+        .expect("write temp config");
+    let cfg = tmp.to_str().unwrap();
+
+    let from_file = parse(&["--launch-config", cfg]);
+    assert_eq!(from_file.load_repo, Some(PathBuf::from("/cfg/repo")));
+    assert_eq!(from_file.focus_file.as_deref(), Some("alpha"));
+
+    let typed = parse(&["--launch-config", cfg, "--render-file", "x.rs"]);
+    let _ = std::fs::remove_file(&tmp);
+    assert_eq!(typed.load_repo, None, "the file's repo must not outrank a typed --render-file");
+    assert_eq!(typed.render_file, Some(PathBuf::from("x.rs")));
+    // Non-scene keys still apply.
+    assert_eq!(typed.field_mode, glyph_field::GlyphFieldMode::Visible);
+}
+

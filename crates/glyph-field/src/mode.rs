@@ -9,6 +9,8 @@ use std::str::FromStr;
 /// lifetime: each mode has its own slot format, emission, upload and shaders,
 /// so switching means rebuilding the field.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "clap", derive(clap::ValueEnum))]
+#[cfg_attr(feature = "clap", value(rename_all = "lower"))]
 pub enum GlyphFieldMode {
     /// One full 32 B placement record per glyph (`RenderSlot`), read by the
     /// vertex stage as-is. Works for any glyph sizes and any placement — the

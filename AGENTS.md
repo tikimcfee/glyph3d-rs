@@ -18,7 +18,8 @@ against `build.toml` that day; `cargo glyph gates` is the live list.)
 
 - `native/` — the pure-Rust renderer and layout engine binary (`glyph3d-native`).
   Features sub-200ms repo loading (`HyperLayout`) and modularized Slug WGSL rendering.
-- `glyph/` — the build/verify tool: gate runner, mutation prover, launcher TUI.
+- `glyph/` — the build/verify tool: gate runner, mutation prover. (The launcher
+  TUI moved into the renderer on 2026-10-10, C27: `native/src/launcher/`.)
 - `crates/` — the glyph field, split by render mode (2026-10): `glyph-field` is the
   mode-neutral contract (`GlyphField` trait, `GlyphFieldMode`, the shared records and
   binding map); `glyph-field-instanced` is the Instanced mode (32 B `RenderSlot`, its
@@ -38,7 +39,7 @@ against `build.toml` that day; `cargo glyph gates` is the live list.)
   Derived and Visible mode.
   `crates/glyph-session-dirs` (2026-10-09, std only) is the one table of where agent
   apps keep session transcripts, shared by the renderer's F7 browser and the
-  `cargo glyph` launcher; `launch_config.example.toml` documents the overrides.
+  renderer's launcher; `launch_config.example.toml` documents the overrides.
 - `engine/` — `fixtures/`, the conformance corpus recorded from the JS oracle
   (26 `.pipe.bin` + 8 `.bake.bin`, their generators and vendored inputs), and
   `glyph_schema.mjs`, generated from the schema.
@@ -100,7 +101,8 @@ cargo glyph build          bring the renderer up to date
 cargo glyph test           run everything; nonzero if anything is wrong
 cargo glyph test rust      only what you changed: rust | render | corpus
 cargo glyph test --frozen  assert currency instead of building it
-cargo glyph run --demo     launch the renderer; arguments pass through
+cargo glyph run --demo     build if stale, then launch the renderer; arguments
+                           pass through, and none opens its terminal launcher
 ```
 
 `run` executes in YOUR directory, so a file argument means what it says relative

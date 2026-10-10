@@ -3,7 +3,7 @@ name = "glyph-session-dirs"
 version = "0.1.0"
 edition = "2021"
 publish = false
-description = "Where agent harnesses keep their session transcripts: one table of per-app default locations, shared by the renderer's session browser and the cargo glyph launcher."
+description = "Where agent harnesses keep their session transcripts: one table of per-app default locations, shared by the renderer's session browser and its launcher."
 
 # std only, deliberately: `glyph` (the build tool) depends on this, and the
 # build tool must never depend on the renderer it builds and reports on.

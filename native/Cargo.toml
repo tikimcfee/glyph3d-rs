@@ -17,7 +17,7 @@ wgpu = "30"
 # The glyph field, split by render mode (2026-10): the mode-neutral contract
 # (GlyphField trait, field mode, shared records) and one crate per mode, each
 # owning its slot format, upload, WGSL and pipelines.
-glyph-field = { path = "../crates/glyph-field" }
+glyph-field = { path = "../crates/glyph-field", features = ["clap"] }
 glyph-field-instanced = { path = "../crates/glyph-field-instanced" }
 glyph-field-derived = { path = "../crates/glyph-field-derived" }
 glyph-field-visible = { path = "../crates/glyph-field-visible" }
@@ -73,9 +73,17 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 egui = { version = "0.36", optional = true }
 egui-winit = { version = "0.36", optional = true }
 egui-wgpu = { version = "0.36", optional = true }
+# C27 (2026-10-10): the terminal launcher (`--launcher`, `src/launcher/`),
+# moved here from the build tool. Same versions the tool used, so the
+# lockfile resolves nothing new.
+ratatui = { version = "0.29", optional = true }
+crossterm = { version = "0.28", optional = true }
 
 [features]
-default = ["egui-ui"]
+default = ["egui-ui", "launcher"]
+# The terminal launcher. Off, `--launcher` is refused and a bare run opens
+# the default scene, as it did before C27.
+launcher = ["dep:ratatui", "dep:crossterm"]
 # Stage K: build the windowed egui overlay. With the feature off (or `--no-ui`
 # at runtime) windowed behavior is exactly pre-K.
 egui-ui = ["dep:egui", "dep:egui-winit", "dep:egui-wgpu"]

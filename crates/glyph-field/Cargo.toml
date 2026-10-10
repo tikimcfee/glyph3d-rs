@@ -17,3 +17,6 @@ wgpu = "30"
 bytemuck = { version = "1", features = ["derive"] }
 encase = "0.12"
 rayon = "1.10"
+# Optional: `GlyphFieldMode` as a clap `ValueEnum`, so the renderer's
+# `--field-mode` and its launcher read the mode names and help from one derive.
+clap = { version = "4", features = ["derive"], optional = true }

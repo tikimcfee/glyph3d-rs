@@ -76,7 +76,9 @@ impl DebugTint {
 /// the hand-rolled parser's --help (nothing user-facing was dropped).
 const AFTER_LONG_HELP: &str = "\
 MODES:
-  no args                windowed text field (default file: this crate's main.rs)
+  no args                the terminal launcher, on a terminal (--launcher
+                         anywhere); otherwise the windowed text field
+                         (default file: this crate's main.rs)
   --demo                 windowed: Stage A quad-field demo
   --screenshot PATH      offscreen: render N frames, write PNG, print timing,
                          exit 0. Deterministic (fixed virtual clock).
@@ -271,6 +273,12 @@ pub struct Cli {
     /// Path to launch configuration file (default: looks for launch_config.toml if present)
     #[arg(long, value_name = "PATH")]
     pub launch_config: Option<PathBuf>,
+    /// Open the terminal launcher (also what no arguments at all opens, on a
+    /// terminal): pick a scene and its options, Enter starts the renderer on
+    /// them and the menu returns when the window closes. With
+    /// --launch-config, the launcher starts from that file.
+    #[arg(long)]
+    pub launcher: bool,
     /// Render file background cards behind glyph fields
     #[arg(long)]
     pub file_backgrounds: bool,
@@ -394,152 +402,7 @@ pub fn parse_cli_from(matches: clap::ArgMatches) -> Result<Cli, String> {
             crate::config::install(cfg.settings.clone())
                 .map_err(|e| format!("launch config '{}': {e}", path.display()))?;
         }
-        if matches.value_source("file_backgrounds")
-            != Some(clap::parser::ValueSource::CommandLine)
-        {
-            if let Some(fb) = cfg.file_backgrounds {
-                cli.file_backgrounds = fb;
-            }
-        }
-        if matches.value_source("file_bg_color")
-            != Some(clap::parser::ValueSource::CommandLine)
-        {
-            if let Some(col) = cfg.file_bg_color {
-                cli.file_bg_color = Some(col);
-            }
-        }
-        if matches.value_source("show_glyphs_px")
-            != Some(clap::parser::ValueSource::CommandLine)
-        {
-            if let Some(lod) = cfg.show_glyphs_px {
-                cli.show_glyphs_px = Some(lod);
-            }
-        }
-        if matches.value_source("wrap_mode")
-            != Some(clap::parser::ValueSource::CommandLine)
-        {
-            if let Some(wm) = &cfg.wrap_mode {
-                if let Ok(parsed) = wm.parse::<crate::fold::WrapMode>() {
-                    cli.wrap_mode = parsed;
-                } else {
-                    log::warn!("unknown wrap_mode in launch config: '{wm}'");
-                }
-            }
-        }
-        if matches.value_source("z_wrap_spacing")
-            != Some(clap::parser::ValueSource::CommandLine)
-        {
-            if let Some(zw) = cfg.z_wrap_spacing {
-                cli.z_wrap_spacing = zw;
-            }
-        }
-        if matches.value_source("cluster_mode")
-            != Some(clap::parser::ValueSource::CommandLine)
-        {
-            if let Some(cm) = &cfg.cluster_mode {
-                if let Ok(parsed) = cm.parse::<crate::fold::ClusterMode>() {
-                    cli.cluster_mode = parsed;
-                } else {
-                    log::warn!("unknown cluster_mode in launch config: '{cm}'");
-                }
-            }
-        }
-        if matches.value_source("color_mode")
-            != Some(clap::parser::ValueSource::CommandLine)
-        {
-            if let Some(cm) = &cfg.color_mode {
-                if let Ok(parsed) = cm.parse::<crate::repo::ColorMode>() {
-                    cli.color_mode = parsed;
-                } else {
-                    log::warn!("unknown color_mode in launch config: '{cm}'");
-                }
-            }
-        }
-        if matches.value_source("no_cull")
-            != Some(clap::parser::ValueSource::CommandLine)
-        {
-            if let Some(nc) = cfg.no_cull {
-                cli.no_cull = nc;
-            }
-        }
-        if matches.value_source("no_ui")
-            != Some(clap::parser::ValueSource::CommandLine)
-        {
-            if let Some(nu) = cfg.no_ui {
-                cli.no_ui = nu;
-            }
-        }
-        if matches.value_source("no_greeking")
-            != Some(clap::parser::ValueSource::CommandLine)
-        {
-            if let Some(greek) = cfg.greeking {
-                cli.no_greeking = !greek;
-            }
-        }
-        if matches.value_source("greek_pure")
-            != Some(clap::parser::ValueSource::CommandLine)
-        {
-            if let Some(pure) = cfg.greek_pure {
-                cli.greek_pure = pure;
-            }
-        }
-        if matches.value_source("greek_smooth")
-            != Some(clap::parser::ValueSource::CommandLine)
-        {
-            if let Some(smooth) = cfg.greek_smooth {
-                cli.greek_smooth = smooth;
-            }
-        }
-        if matches.value_source("text_detail_px")
-            != Some(clap::parser::ValueSource::CommandLine)
-        {
-            if let Some(onset) = cfg.text_detail_px {
-                cli.text_detail_px = Some(onset);
-            }
-        }
-        if matches.value_source("load_repo")
-            != Some(clap::parser::ValueSource::CommandLine)
-        {
-            if let Some(lr) = cfg.load_repo {
-                cli.load_repo = Some(lr);
-            }
-        }
-        if matches.value_source("repo_engine")
-            != Some(clap::parser::ValueSource::CommandLine)
-        {
-            if let Some(re) = &cfg.repo_engine {
-                if let Ok(parsed) = re.parse::<crate::repo::Strategy>() {
-                    cli.repo_engine = parsed;
-                } else {
-                    log::warn!("unknown repo_engine in launch config: '{re}'");
-                }
-            }
-        }
-        if matches.value_source("field_mode")
-            != Some(clap::parser::ValueSource::CommandLine)
-        {
-            if let Some(fm) = &cfg.field_mode {
-                if let Ok(parsed) = fm.parse::<glyph_field::GlyphFieldMode>() {
-                    cli.field_mode = parsed;
-                } else {
-                    log::warn!("unknown field_mode in launch config: '{fm}'");
-                }
-            }
-        }
-        if matches.value_source("agent_session")
-            != Some(clap::parser::ValueSource::CommandLine)
-        {
-            if let Some(session) = cfg.agent_session {
-                cli.agent_session = Some(session);
-            }
-        }
-        if matches.value_source("frames")
-            != Some(clap::parser::ValueSource::CommandLine)
-        {
-            if let Some(f) = cfg.frames {
-                cli.frames = Some(f);
-            }
-        }
+        merge_launch_config(&mut cli, &matches, cfg);
     }
 
     // After the launch config: building an op can read a setting (a recolor
@@ -551,6 +414,67 @@ pub fn parse_cli_from(matches: clap::ArgMatches) -> Result<Cli, String> {
     }
 
     Ok(cli)
+}
+
+/// The launch config under the command line: a key applies unless its flag
+/// was typed. The scene keys (`demo`, `agent_session`, `load_repo`,
+/// `render_file`) go as one: a scene typed on the command line is the scene.
+/// Until C27 (2026-10-10) they merged one by one, so a file's `load_repo`
+/// outranked a typed `--render-file` (the scene precedence is demo > session
+/// > repo > file, `Cli::action`).
+fn merge_launch_config(cli: &mut Cli, matches: &clap::ArgMatches, cfg: crate::launch_config::LaunchConfig) {
+    let typed = |id: &str| matches.value_source(id) == Some(clap::parser::ValueSource::CommandLine);
+    // `under!(key)`: the file's value where the flag of the same name was not
+    // typed; `Some` for a field the CLI holds as an Option.
+    macro_rules! under {
+        ($key:ident) => {
+            if !typed(stringify!($key)) {
+                if let Some(v) = cfg.$key {
+                    cli.$key = v;
+                }
+            }
+        };
+        (Some $key:ident) => {
+            if !typed(stringify!($key)) {
+                if let Some(v) = cfg.$key {
+                    cli.$key = Some(v);
+                }
+            }
+        };
+    }
+    under!(file_backgrounds);
+    under!(Some file_bg_color);
+    under!(Some show_glyphs_px);
+    under!(wrap_mode);
+    under!(z_wrap_spacing);
+    under!(cluster_mode);
+    under!(color_mode);
+    under!(no_cull);
+    under!(no_ui);
+    if !typed("no_greeking") {
+        if let Some(greek) = cfg.greeking {
+            cli.no_greeking = !greek;
+        }
+    }
+    under!(greek_pure);
+    under!(greek_smooth);
+    under!(Some text_detail_px);
+    under!(Some focus_file);
+    under!(layout_mode);
+    under!(repo_engine);
+    under!(field_mode);
+    under!(debug_tint);
+    under!(present_mode);
+    under!(Some frames);
+    let scene_typed = ["demo", "agent_session", "load_repo", "render_file", "engine_render"]
+        .into_iter()
+        .any(typed);
+    if !scene_typed {
+        under!(demo);
+        under!(Some agent_session);
+        under!(Some load_repo);
+        under!(Some render_file);
+    }
 }
 
 pub fn parse_cli() -> Cli {

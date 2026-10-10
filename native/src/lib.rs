@@ -14,6 +14,8 @@ pub mod glyph_trie;
 pub mod hyper_oracle;
 pub mod gpu;
 pub mod launch_config;
+#[cfg(feature = "launcher")]
+pub mod launcher;
 pub mod layout;
 pub mod layout_hyper;
 pub mod layout_stack;
