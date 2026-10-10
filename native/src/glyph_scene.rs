@@ -103,6 +103,7 @@ pub use ui_probe::{LodHandle, UiCarrelState, UiProbe, UiProbeState};
 
 mod environment;
 mod interaction;
+mod library;
 mod style;
 mod setup;
 mod pipelines;
@@ -489,6 +490,10 @@ impl SceneLike for GlyphScene {
         if matches!(self.camera_mode, CameraMode::Fly) {
             self.fly.tick(dt);
         }
+    }
+
+    fn animate(&mut self, ctx: &GpuContext, dt: f32) {
+        self.animate_library(ctx, dt);
     }
 
     fn render(

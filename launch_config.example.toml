@@ -83,7 +83,7 @@ no_ui = false
 # Repos the launcher cycles through with ◄/► (optional). Without this the
 # launcher offers "." and "native/fixtures/g-pick-repo". Add your own corpora.
 # Other scene keys: render_file = "<path>", demo = true, focus_file = "<substr>".
-# Other modes: layout_mode = "shelf" | "carrel", debug_tint = "off" | "lod" |
+# Other modes: layout_mode = "shelf" | "carrel" | "library", debug_tint = "off" | "lod" |
 # "cull", present_mode = "fifo" | "mailbox" | "immediate".
 # repo_presets = [".", "native/fixtures/g-pick-repo", "~/src/some-large-repo"]
 
@@ -113,3 +113,10 @@ no_ui = false
 # [environment]
 # mode = "ground"          # ground plane + sky; the B key toggles it live
 # ground_color = [0.034, 0.042, 0.060]
+#
+# [library]                # --layout-mode library (every key: config/defaults.toml)
+# stack = "x"              # "z" volumes (deck/splay), "x" shelf, "y" pile
+# sort = "size"            # "name", "size" (biggest first), "ext"
+# form = "splay"           # volumes open laid out as a grid instead of a deck
+# page_w = 60.0
+# page_h = 80.0

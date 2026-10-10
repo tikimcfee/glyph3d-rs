@@ -140,7 +140,10 @@ pub fn run_scene(
             label: Some("offscreen frame"), // Stage L (O2)
         });
         // Fixed virtual clock step (1/60 s per frame) so screenshots are
-        // deterministic regardless of how fast frames actually encode.
+        // deterministic regardless of how fast frames actually encode. The
+        // scene's own animation steps on the same clock (a no-op for every
+        // scene without one, which is every golden view).
+        scene.animate(ctx, 1.0 / 60.0);
         scene.render(
             ctx,
             &mut encoder,

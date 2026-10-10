@@ -25,8 +25,78 @@ impl LayoutController {
             return res;
         }
 
+        if self.mode == RepoLayoutMode::Library {
+            return self.apply_library(views);
+        }
+
         // Dynamic multi-zone layout (handles Carrel and custom zones)
         self.apply_dynamic_stack(views)
+    }
+
+    /// `--layout-mode library`: build the books on a fresh spatial scene,
+    /// seat them, and read every file's group row off its flattened world
+    /// transform (`sync_all_to_group_rows`) — translation AND the fit scale.
+    /// `views[i].offset` takes the translation; the scale is read from the
+    /// group row by everything downstream (`RepoLoad::into_staged`'s cull
+    /// boxes, `CullState`'s local boxes). Bounds are the union of every
+    /// file's scaled ink box and every page rect, so the camera frames the
+    /// pages, not only the text.
+    fn apply_library(
+        &mut self,
+        views: &mut [FileView],
+    ) -> (Vec<GroupRow>, [f32; 3], [f32; 3]) {
+        self.scene = SpatialScene::new();
+        self.zone_entities.clear();
+        let files: Vec<crate::library::plan::LibFile> = views
+            .iter()
+            .map(|v| crate::library::plan::LibFile { rel_path: v.rel_path.clone(), ink_min: v.ink.min, ink_max: v.ink.max })
+            .collect();
+        let dirs: Vec<String> = views.iter().map(|v| v.dir.clone()).collect();
+        let tints: Vec<[f32; 3]> = views.iter().map(|v| dir_tint(&v.dir)).collect();
+        let lib = crate::library::Library::build(
+            &mut self.scene,
+            files,
+            &dirs,
+            &tints,
+            &crate::config::settings().library,
+        );
+        self.scene.update_transforms();
+        let mut groups: Vec<GroupRow> = tints.iter().map(|t| GroupRow::tinted([0.0; 3], *t)).collect();
+        self.scene.sync_all_to_group_rows(&mut groups);
+        // Spawning marked every transform changed; the first page turn must
+        // sync only what it moves.
+        self.scene.world.clear_trackers();
+        let (mut lo, mut hi) = ([f32::INFINITY; 3], [f32::NEG_INFINITY; 3]);
+        for (i, (v, g)) in views.iter_mut().zip(&groups).enumerate() {
+            v.offset = [g.cols[0][0], g.cols[0][1], g.cols[0][2]];
+            let s = [g.cols[3][0], g.cols[3][1], g.cols[3][2]];
+            for a in 0..3 {
+                lo[a] = lo[a].min(v.offset[a] + v.ink.min[a] * s[a]);
+                hi[a] = hi[a].max(v.offset[a] + v.ink.max[a] * s[a]);
+            }
+            if let Some((pmin, pmax)) = lib.page_world_rect(&self.scene, i) {
+                for a in 0..3 {
+                    lo[a] = lo[a].min(pmin[a]);
+                    hi[a] = hi[a].max(pmax[a]);
+                }
+            }
+        }
+        if views.is_empty() {
+            (lo, hi) = ([0.0; 3], [1.0; 3]);
+        }
+        self.file_entities = lib.file_e.clone();
+        for (zid, e) in lib.zones() {
+            self.zone_entities.insert(zid, e);
+        }
+        println!("{}", lib.summary());
+        log::info!(
+            "layout [library]: field {:.0}x{:.0}x{:.0}",
+            hi[0] - lo[0],
+            hi[1] - lo[1],
+            hi[2] - lo[2],
+        );
+        self.library = Some(lib);
+        (groups, lo, hi)
     }
 
     fn apply_dynamic_stack(

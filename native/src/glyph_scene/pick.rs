@@ -85,6 +85,10 @@ pub enum Verb {
     SetGlyphTransform([f32; 3], [f32; 4], [f32; 3]),
     /// Reset a glyph's group back to its original file group.
     ResetGlyphGroup,
+    /// `--layout-mode library` controls (page, form, stack, sort): they need
+    /// no pick (paging and form address the picked file's volume when there
+    /// is one, else every volume) and only retarget — the frames ease.
+    Library(crate::library::LibraryVerb),
 }
 
 /// A resolved glyph within a file.
@@ -228,6 +232,7 @@ fn verb_name(verb: &Verb) -> &'static str {
         Verb::SetGlyphBackground(_) => "set-glyph-background",
         Verb::SetGlyphTransform(..) => "set-glyph-transform",
         Verb::ResetGlyphGroup => "reset-glyph-group",
+        Verb::Library(_) => "library",
     }
 }
 
@@ -899,6 +904,9 @@ impl GlyphScene {
     /// Apply a manipulation verb to the current pick. All GPU writes are
     /// partial uploads; the return string is the audit log line.
     pub(super) fn apply_verb(&mut self, ctx: &GpuContext, verb: &Verb) -> String {
+        if let Verb::Library(v) = verb {
+            return self.apply_library_verb(v);
+        }
         let Some(hit) = &self.picked else {
             return "verb: nothing picked yet — ignored".to_string();
         };
@@ -1158,6 +1166,7 @@ impl GlyphScene {
                 self.field.write_group_id(&ctx.queue, slot, gid, gid);
                 format!("verb reset-glyph-group: {rel} row {} col {} slot {slot} -> group {gid}", g.row, g.col)
             }
+            Verb::Library(_) => unreachable!("apply_verb answers the library verbs before the pick check"),
             Verb::SetHidden(hide) => {
                 let Some(g) = self.groups_cpu.get_mut(gid as usize) else {
                     return format!("verb hide/show: group {gid} out of range");

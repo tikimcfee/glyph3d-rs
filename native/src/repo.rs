@@ -182,6 +182,9 @@ pub enum RepoLayoutMode {
     Shelf,
     /// Hierarchical directory-based neighborhood carrels.
     Carrel,
+    /// Every file a book contain-fitted onto a uniform page; directories as
+    /// pageable volumes, nested one depth step back (`library`).
+    Library,
 }
 
 impl std::fmt::Display for RepoLayoutMode {
@@ -189,6 +192,7 @@ impl std::fmt::Display for RepoLayoutMode {
         match self {
             RepoLayoutMode::Shelf => write!(f, "shelf"),
             RepoLayoutMode::Carrel => write!(f, "carrel"),
+            RepoLayoutMode::Library => write!(f, "library"),
         }
     }
 }
@@ -199,6 +203,7 @@ impl std::str::FromStr for RepoLayoutMode {
         match s {
             "shelf" => Ok(RepoLayoutMode::Shelf),
             "carrel" => Ok(RepoLayoutMode::Carrel),
+            "library" => Ok(RepoLayoutMode::Library),
             other => Err(format!("unknown layout mode {other:?}")),
         }
     }

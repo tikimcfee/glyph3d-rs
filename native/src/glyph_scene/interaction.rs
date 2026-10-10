@@ -214,9 +214,28 @@ impl GlyphScene {
     }
 
     /// Windowed verb keys: h highlight line, g grab/release file, c grab/release carrel,
-    /// t cycle tint, x toggle hidden, b toggle the ground/sky environment.
+    /// t cycle tint, x toggle hidden, b toggle the ground/sky environment; in
+    /// a library load ] [ (n p . , arrows) turn pages, Home/End jump, v
+    /// toggles deck/splay.
     pub(super) fn verb_key(&mut self, ctx: &GpuContext, key: winit::keyboard::KeyCode) {
         use winit::keyboard::KeyCode as K;
+        // A library load takes the deck keys for its volumes (the picked
+        // file's, else every volume): the same verbs `--verb` scripts.
+        if self.has_library() {
+            use crate::library::{FormCmd, LibraryVerb, Page};
+            let verb = match key {
+                K::BracketRight | K::KeyN | K::ArrowRight | K::Period => Some(LibraryVerb::Page(Page::Next)),
+                K::BracketLeft | K::KeyP | K::ArrowLeft | K::Comma => Some(LibraryVerb::Page(Page::Prev)),
+                K::Home => Some(LibraryVerb::Page(Page::First)),
+                K::End => Some(LibraryVerb::Page(Page::Last)),
+                K::KeyV => Some(LibraryVerb::Form(FormCmd::Toggle)),
+                _ => None,
+            };
+            if let Some(v) = verb {
+                println!("{}", self.apply_library_verb(&v));
+                return;
+            }
+        }
         match key {
             K::KeyH => {
                 let line = self.apply_verb(ctx, &Verb::RecolorLine(None));

@@ -19,6 +19,7 @@ pub mod launcher;
 pub mod layout;
 pub mod layout_hyper;
 pub mod layout_stack;
+pub mod library;
 pub mod offscreen;
 pub mod repo;
 pub mod revision;

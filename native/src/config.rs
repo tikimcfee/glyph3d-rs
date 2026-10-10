@@ -36,6 +36,7 @@ pub struct Settings {
     pub environment: EnvironmentSettings,
     pub verbs: VerbSettings,
     pub quad_demo: QuadDemoSettings,
+    pub library: LibrarySettings,
 }
 
 /// The glyph field view (`--render-file`, `--load-repo`, windowed).
@@ -317,6 +318,57 @@ pub struct QuadDemoSettings {
     pub far: f32,
 }
 
+/// `--layout-mode library` (`library`): every file a book contain-fitted
+/// onto a uniform page, directories as volumes. World units throughout (a
+/// text row is 1.25); the JS scheme's 900 x 1200 page and its gaps, scaled
+/// to a page about one 100-column file page wide.
+#[derive(Clone, Debug, PartialEq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LibrarySettings {
+    /// The page every book presents (portrait: books, not monitors).
+    pub page_w: f32,
+    pub page_h: f32,
+    /// A deck's full z step between pages; the gap added between shelf and
+    /// pile pages.
+    pub gap: f32,
+    /// How a directory's books stack: "z" volume, "x" shelf, "y" pile.
+    pub stack: crate::library::Stack,
+    /// "name", "size" (content area, biggest first) or "ext", then name.
+    pub sort: crate::library::Sort,
+    pub reverse: bool,
+    /// A volume's form at load: "deck" (rolodex) or "splay" (m x n grid).
+    pub form: crate::library::Form,
+    /// The contain-fit may enlarge a small file up to this.
+    pub max_upscale: f32,
+    /// "front": the content's reading surface on the page plane, its depth
+    /// (the wrap staircase) receding into the book; "center": depth centred
+    /// on the page (the JS scheme, whose content was flat).
+    pub depth_align: crate::library::DepthAlign,
+    /// Easing rate (1/s) of every page turn and relayout: each frame closes
+    /// 1 - e^(-lerp*dt) of the remaining distance.
+    pub lerp: f32,
+    /// A node within this distance (world units, any axis) snaps home.
+    pub settle: f32,
+    /// Splayed volume: fixed column count (0 = from splay_aspect), gaps
+    /// between grid pages, grid shape target, and the head page's lift.
+    pub splay_cols: u32,
+    pub splay_gap_x: f32,
+    pub splay_gap_y: f32,
+    pub splay_aspect: f32,
+    pub splay_lift: f32,
+    /// Gap between a directory's stack and its child-directory tier.
+    pub dir_gap: f32,
+    /// Z step back per directory level.
+    pub depth_z: f32,
+    /// Child-tier wrap target (width = aspect x height).
+    pub aspect: f32,
+    /// One quad behind each page (the scene mesh pass), premultiplied RGBA,
+    /// page_face_gap behind the page plane.
+    pub page_faces: bool,
+    pub page_face_color: [f32; 4],
+    pub page_face_gap: f32,
+}
+
 impl Settings {
     /// The compiled defaults alone.
     pub fn defaults() -> Result<Self, String> {
@@ -337,6 +389,13 @@ impl Settings {
             .map_err(|e: toml::de::Error| e.to_string())?;
         if s.repo.dir_tints.is_empty() {
             return Err("[repo] dir_tints must not be empty".into());
+        }
+        let l = &s.library;
+        if !(l.page_w > 0.0 && l.page_h > 0.0 && l.max_upscale > 0.0 && l.splay_aspect > 0.0 && l.aspect > 0.0) {
+            return Err("[library] page_w, page_h, max_upscale, splay_aspect and aspect must be > 0".into());
+        }
+        if !(l.gap >= 0.0 && l.lerp >= 0.0 && l.settle >= 0.0 && l.dir_gap >= 0.0 && l.depth_z >= 0.0) {
+            return Err("[library] gap, lerp, settle, dir_gap and depth_z must be >= 0".into());
         }
         Ok(s)
     }

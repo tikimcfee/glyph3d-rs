@@ -125,7 +125,8 @@ pub(super) fn apply_relayout(
         if let SceneChoice::Repo { layout_mode, .. } = choice {
             *layout_mode = match *layout_mode {
                 crate::repo::RepoLayoutMode::Shelf => crate::repo::RepoLayoutMode::Carrel,
-                crate::repo::RepoLayoutMode::Carrel => crate::repo::RepoLayoutMode::Shelf,
+                crate::repo::RepoLayoutMode::Carrel => crate::repo::RepoLayoutMode::Library,
+                crate::repo::RepoLayoutMode::Library => crate::repo::RepoLayoutMode::Shelf,
             };
             changed = true;
             note += &format!("layout_mode -> {:?} ", *layout_mode);
@@ -794,6 +795,7 @@ impl App<'_> {
             let dt = state.last_frame.elapsed().as_secs_f32().min(0.1);
             state.last_frame = Instant::now();
             state.scene.tick(dt);
+            state.scene.animate(&self.ctx, dt);
             state.window.request_redraw(); // continuous render loop
         }
     }
