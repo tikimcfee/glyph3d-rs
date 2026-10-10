@@ -131,14 +131,33 @@ pub(crate) fn verify_golden(m: &Manifest) -> bool {
                 }
                 // The same baseline, under each equivalent: a divergence here
                 // with the plain frame equal is the variant breaking, not the
-                // renderer moving — never a reason to re-baseline.
+                // renderer moving — never a reason to re-baseline. A view
+                // EXEMPT from an equivalent (build.toml, with its why) is
+                // rendered all the same and its distance reported, so the
+                // known difference stays in sight and a stale exemption
+                // shows as one.
                 for eq in &m.settings.golden_equivalents {
-                    if golden == std::fs::read(shot_path(&v.name, Some(eq))).ok() {
-                        println!("PASS  {}.png BYTE-EQUAL under {eq} ({key})", v.name)
-                    } else {
-                        println!("FAIL  {}.png diverges from baseline under {eq} — that variant no longer", v.name);
-                        println!("      renders what the plain view does.");
-                        ok = false;
+                    let shot_eq = shot_path(&v.name, Some(eq));
+                    let equal = golden == std::fs::read(&shot_eq).ok();
+                    match (v.exemption(eq), equal) {
+                        (None, true) => println!("PASS  {}.png BYTE-EQUAL under {eq} ({key})", v.name),
+                        (None, false) => {
+                            println!("FAIL  {}.png diverges from baseline under {eq} — that variant no longer", v.name);
+                            println!("      renders what the plain view does.");
+                            ok = false;
+                        }
+                        (Some(why), true) => {
+                            println!("NOTE  {}.png under {eq}: EXEMPT, yet BYTE-EQUAL — the exemption may be stale: {why}", v.name);
+                        }
+                        (Some(why), false) => {
+                            let distance = match (png_rgba(&b), png_rgba(&shot_eq)) {
+                                (Ok((w, h, a)), Ok((w2, h2, c))) if (w, h) == (w2, h2) => {
+                                    format!("{} px differ", drift_stats(w, h, &a, &c).differing)
+                                }
+                                _ => "frames of different size or unreadable".to_string(),
+                            };
+                            println!("NOTE  {}.png under {eq}: EXEMPT, {distance} — {why}", v.name);
+                        }
                     }
                 }
             }

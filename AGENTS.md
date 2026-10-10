@@ -533,6 +533,32 @@ defect that emptied a frame (C19, below) was invisible. A divergence under an
 equivalent with the plain frame equal is the VARIANT breaking — never a reason
 to re-baseline. `drift` compares the plain frames only.
 
+**The Visible field as an equivalent, with named exemptions (M4, 2026-10-10).**
+The second entry is `--field-mode visible`. Measured on both sets before it
+was added: `demo` (no field), `text`, `emoji` and `emoji-cluster` (a
+`--render-file` scene has no line table and falls back to Instanced, which
+the load says) and `repo-highlight` (visible mode for real: the sidecar's
+spans over alpha.rs) render their baselines byte for byte; the five
+syntax-painted repo views do not, and the difference is exactly the
+load-time syntax paint, which visible mode does not apply by decision —
+under `--field-mode visible` each is the stored modes' `--color-mode flat`
+render byte for byte (47,154 / 222,277 / 43,715 / 256,744 / 29,181 px of
+token colour short of the baseline for repo-wide / -down / -zoom /
+-back-oblique / -cluster on vulkan-nvidia; within ±101 px of those on
+metal-apple, the rasterizers' usual edge noise). Those five are EXEMPT from
+that one equivalent,
+each with its why on the view (`[[golden_view.exempt]]`); an exempt frame is
+still rendered and its distance printed as a NOTE with the pixel count, an
+exempt frame that turns out byte-equal is flagged as a possibly stale
+exemption, `validate` refuses an exemption naming no declared equivalent or
+no why, and `cargo glyph gates` lists every exemption under pixel-ab — a
+named blind spot, priced like the rest, never a quiet drop. So the visible
+equivalent holds visible mode to pixels on ONE frame (repo-highlight;
+`visible-row-off-by-one` proves it reddens); flat twins of the five would
+hold it on their cameras too, and candidate frames for those live in
+`out/tooling-ab/sweep/candidates/visible-flat/` (byte-identical to the
+visible renders and to Instanced's flat render) for Ivan to adopt or not.
+
 **Which view covers what, because the answer is not uniform.** `repo-wide`
 renders the default wrap mode (`back` — a wrap costs DEPTH); `repo-down` exists
 to keep the non-default row-per-wrap geometry covered, and was added when the

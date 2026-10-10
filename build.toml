@@ -25,14 +25,21 @@
 # Ratchet, NOT an equality: tests are added constantly, so an exact pin would
 # redden on the most common good action in the repo. A green run whose real
 # count exceeds the floor prints a NOTE naming the value to raise it to.
-test_floor = 320
+test_floor = 325
 # Every golden view is rendered again under each of these and must match the
 # SAME baseline byte for byte (2026-10-09, C20). The Derived field renders
 # every golden frame identically to Instanced (measured on vulkan-nvidia and
 # metal-apple), so this covers its upload, storage, vertex-stage Y/Z and edit
 # paths without a second golden set to adopt. Until then no golden ran it,
 # and a Derived edit bug that emptied the frame (C19) was invisible.
-golden_equivalents = ["--field-mode derived"]
+# `--field-mode visible` (M4, 2026-10-10): the Visible field lays every frame
+# out on the GPU per frame; held here to the same baselines where it can be
+# — repo-highlight for real (visible mode, byte-equal), the --render-file
+# views by their fall-back to Instanced (no line table), demo with no field —
+# and EXEMPT, with its why on the view, where it cannot: the five
+# syntax-painted repo views, which visible mode renders flat by decision
+# (`[[golden_view.exempt]]`; rendered and reported, never judged).
+golden_equivalents = ["--field-mode derived", "--field-mode visible"]
 
 
 # ── Products ─────────────────────────────────────────────────────────────
@@ -177,15 +184,33 @@ cmd = "--render-file fixtures/baseline-view.txt --frames 2"
 # bit-exact, so these frames staying byte-equal across a default change is the
 # proof that the change was safe — which is exactly what happened when `direct`
 # became the default.
+# The five syntax-painted repo views are EXEMPT from the visible equivalent
+# (M4, 2026-10-10): visible mode applies no load-time syntax paint, by
+# decision (M2), and under --field-mode visible each of them is the stored
+# modes' --color-mode flat render BYTE FOR BYTE (measured on vulkan-nvidia
+# and metal-apple) — the distance from the baseline is the token colours and
+# nothing else. Rendered and reported with the pixel count, never judged.
+# Flat twins of these views would hold visible mode to pixels on the same
+# cameras; candidates are rendered into out/tooling-ab/sweep/candidates/
+# visible-flat/ and adopting any is Ivan's call.
 [[golden_view]]
 name = "repo-wide"
 cmd = "--load-repo fixtures/g-pick-repo --frames 2 --color-mode syntax"
+[[golden_view.exempt]]
+equivalent = "--field-mode visible"
+why = "visible mode paints no syntax (by decision): this frame under it is the stored modes' --color-mode flat render byte for byte, 47,154 px of token colour short of the baseline on vulkan-nvidia, 47,112 on metal-apple (long.md's line numbers, alpha.rs's and deep.py's keywords, wide.txt's source)"
 [[golden_view]]
 name = "repo-down"
 cmd = "--load-repo fixtures/g-pick-repo --frames 2 --wrap-mode down --color-mode syntax"
+[[golden_view.exempt]]
+equivalent = "--field-mode visible"
+why = "visible mode paints no syntax (by decision): this frame under it is the stored modes' --color-mode flat render byte for byte, 222,277 px of token colour short of the baseline on vulkan-nvidia, 222,278 on metal-apple"
 [[golden_view]]
 name = "repo-zoom"
 cmd = "--load-repo fixtures/g-pick-repo --frames 2 --focus-file alpha.rs --zoom 3 --color-mode syntax"
+[[golden_view.exempt]]
+equivalent = "--field-mode visible"
+why = "visible mode paints no syntax (by decision): this frame under it is the stored modes' --color-mode flat render byte for byte, 43,715 px of token colour short of the baseline on both vulkan-nvidia and metal-apple — exactly alpha.rs's punctuation, number and string glyphs; its identifiers match"
 # The z-order frame. Front-on views cannot see whether a wrapped column that
 # recedes in `back` mode is occluded by the page beside it — that needs a
 # camera pitched down over wide.txt so its column converges up into long.md.
@@ -195,6 +220,9 @@ cmd = "--load-repo fixtures/g-pick-repo --frames 2 --focus-file alpha.rs --zoom 
 [[golden_view]]
 name = "repo-back-oblique"
 cmd = "--load-repo fixtures/g-pick-repo --frames 2 --cam-pose 30 -120 60 0 -12 --color-mode syntax"
+[[golden_view.exempt]]
+equivalent = "--field-mode visible"
+why = "visible mode paints no syntax (by decision): this frame under it is the stored modes' --color-mode flat render byte for byte, 256,744 px of token colour short of the baseline on vulkan-nvidia, 256,643 on metal-apple (wide.txt's receding source); its z-order is the same picture"
 # The colour-emoji frame (2026-09-10): every class of bitmap slot the trie has
 # — web-era re-pointed, appended, no-cell, emoji-in-the-font-but-text-here —
 # through the CPU staging path and the shader's mode-1 branch. The only frame
@@ -220,6 +248,9 @@ cmd = "--render-file fixtures/emoji-cluster-view.txt --frames 2 --zoom 1.25 --cl
 [[golden_view]]
 name = "repo-cluster"
 cmd = "--load-repo fixtures/g-cluster-repo --frames 2 --cluster-mode cluster --color-mode syntax"
+[[golden_view.exempt]]
+equivalent = "--field-mode visible"
+why = "visible mode paints no syntax (by decision): this frame under it is the stored modes' --color-mode flat render byte for byte, 29,181 px of token colour short of the baseline on vulkan-nvidia, 29,178 on metal-apple; the sequence pass itself (families, flags, keycaps, the fallbacks) lays out the same glyphs"
 # The highlight sidecar (2026-10-09) — the byte-range styling entry point the
 # AST/LSP colouring will arrive through, which no frame had seen. alpha.rs
 # whole, six spans recoloured over syntax paint. Under the Derived equivalent
@@ -409,8 +440,8 @@ name = "pixel-ab"
 scope = "render"
 kind = "golden-verify"
 needs = ["renderer", "pixel-baselines"]
-compare = "every declared golden_view re-rendered vs out/tooling-ab/baseline/<this host's --gpu-key>, byte-equal — and again under each settings.golden_equivalents (--field-mode derived) against the same baseline"
-blind_to = "everything outside the declared frames; regression vs intentional change (re-baselining is a human act); any rasterizer other than this host's — a set proves nothing about another vendor; an equivalent that legitimately stops matching (it cannot be given its own baseline here)"
+compare = "every declared golden_view re-rendered vs out/tooling-ab/baseline/<this host's --gpu-key>, byte-equal — and again under each settings.golden_equivalents (--field-mode derived, --field-mode visible) against the same baseline; a view exempt from an equivalent (golden_view.exempt, with its why) is rendered under it all the same and its distance printed as a NOTE with the pixel count, never judged, and an exempt frame that turns out byte-equal is flagged as a possibly stale exemption"
+blind_to = "everything outside the declared frames; regression vs intentional change (re-baselining is a human act); any rasterizer other than this host's — a set proves nothing about another vendor; an equivalent that legitimately stops matching (it cannot be given its own baseline here); the exempt (view, equivalent) pairs `glyph gates` lists — today the five syntax-painted repo views under --field-mode visible, which visible mode renders flat by decision (their reported distance is the token colours and nothing else, measured); and what the visible equivalent reaches: the --render-file views fall back to Instanced under it (no line table) and demo has no field, so repo-highlight is the one frame held to visible mode's own pixels (visible-row-off-by-one proves it)"
 
 # ── Declared mutations ───────────────────────────────────────────────────
 # `glyph mutate` applies each of these, requires the named gate to go red
@@ -1104,4 +1135,15 @@ op = "replace"
 find = "                visible.set_item_bbox(&ctx.queue, item, min, max);"
 with = "                let _ = (visible, item, min, max);"
 expect = "a_moved_item_is_drawn_where_it_went"
+rebuild = "cargo build --release"
+
+[[mutation]]
+name = "visible-row-off-by-one"
+gate = "pixel-ab"
+why = "M4 (2026-10-10): the visible equivalent must redden when visible mode breaks a frame. Every glyph the visible kernel lays out one row down moves every pixel of repo-highlight under --field-mode visible — the one view that renders visible mode for real and is held to its baseline — while the plain frame and the Derived equivalent stay byte-equal (the stored modes never run the kernel) and the exempt views only report a larger distance. CONSUMED BY: the slot's row lane the kernel writes (visible_layout.wgsl), read by the Derived draw's derive_yz. The shader is include_str!'d, so the renderer rebuilds"
+file = "crates/glyph-field-visible/shaders/visible_layout.wgsl"
+op = "replace"
+find = "let slot = DerivedSlot(x, pack_row(row, x_page), glyph | ((wrap_segment & 0xFFFFu) << 16u), color, lane);"
+with = "let slot = DerivedSlot(x, pack_row(row + 1u, x_page), glyph | ((wrap_segment & 0xFFFFu) << 16u), color, lane);"
+expect = "diverges from baseline under --field-mode visible"
 rebuild = "cargo build --release"
