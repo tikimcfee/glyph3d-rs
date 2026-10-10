@@ -19,6 +19,13 @@ fn gate_cargo(g: &Gate) -> bool {
         // never invoked. Found by an audit 2026-09-07, not by a check.
         // `--no-deps` keeps it to this crate's own prose.
         Some("doc") => "cargo doc -p glyph3d-native --no-deps",
+        // The renderer without its default features (no egui overlay): a
+        // supported build that nothing compiled until 2026-10-09, when it
+        // was found broken (C24). Its own target dir, so the changed feature
+        // set never invalidates the main build.
+        Some("check-no-ui") => {
+            "cargo check -p glyph3d-native --no-default-features --all-targets --target-dir target/no-ui"
+        }
         other => {
             println!("FAIL  {} has unknown cargo cmd {other:?}", g.name);
             return false;
