@@ -7,8 +7,12 @@
 //! - [`GlyphFieldMode::Instanced`] stores every glyph's full placement
 //!   (position, extent, glyph, color, group) — 32 B per glyph — and the
 //!   vertex stage reads it as-is.
-//! - [`GlyphFieldMode::Derived`] (planned) stores a compact record and derives
-//!   the rest of the placement in the vertex stage.
+//! - [`GlyphFieldMode::Derived`] stores a compact record (20 B) and derives
+//!   Y/Z in the vertex stage from per-item tables.
+//! - [`GlyphFieldMode::Visible`] stores no record per glyph: the source bytes
+//!   and a line table are resident, and the lines in view are laid out per
+//!   frame on the GPU into a transient Derived-format buffer
+//!   (`glyph-field-visible`).
 //!
 //! Each mode is its own crate with its own slot record, transcode, WGSL and
 //! pipelines — no shader branches on the mode, and the modes' load flows never
@@ -29,8 +33,10 @@
 //!   bindings through a [`FieldShape`].
 //!
 //! The one invariant every mode must keep: **each glyph is individually
-//! addressable** by its slot — its color and its placement can be edited
-//! without touching any other glyph.
+//! addressable** — its color and its placement can be edited without
+//! touching any other glyph. The stored modes address it by slot; Visible,
+//! whose slots are transient, by (item, byte) (M3, 2026-10-10), with the
+//! edit applied by its layout kernel every frame.
 
 mod copy;
 mod field;

@@ -1,31 +1,21 @@
-//! glyph3d-native — native GPU port of the glyph3d-js code-visualization system.
+//! glyph3d-native — the glyph3d renderer: source text, whole repositories of
+//! it, laid out in 3D and drawn on the GPU with analytic (Slug) glyph
+//! coverage.
 //!
-//! Stage A: windowed/offscreen shell + 1M-instance quad-field stress demo.
-//! Stage C: Slug analytic-coverage glyph renderer (atlas loader, WGSL Slug
-//!          pipeline, text staging) behind `--render-file` (the default scene).
-//! Stage F: fly camera (windowed) + per-file CPU frustum/LOD culling with
-//!          far-LOD backdrop quads — the repo field is interactive.
-//!          `--no-cull` keeps the legacy full-field draws for A/B.
-//! Stage G: CPU picking + live manipulation. `--pick-file/--pick-row/
-//!          --pick-col/--pick-px` resolve file → row/col → char; `--verb`
-//!          edits instances (recolor/nudge/scale glyph, recolor line) and
-//!          groups (move/scale/tint/hide) with partial buffer uploads.
-//!          Windowed: left click picks, h/g/t/x verbs, right-drag look.
-//! Stage H: clap CLI (parity-tested), naga WGSL validation in `cargo test`,
-//!          opt-in wgpu-profiler pass timings (GLYPH_PROFILE=1), encase
-//!          layout assertions for the hand-mirrored WGSL lane maps.
-//! Stage I: glam 0.30 → 0.33 (byte-identical under the full A/B suite);
-//!          baseline views moved onto the immutable fixtures/baseline-view.txt.
-//! Stage K: egui 0.36 overlay on the windowed renderer (K1: deps + plumbing
-//!          with an empty UI; `--no-ui` gives exact pre-K windowed behavior).
-//!
-//! Run modes:
-//!   (default) `[--render-file <path>] [--copies N]`
-//!                                    windowed: text field, orbiting camera, FPS log.
-//!   --demo                           windowed: Stage A quad-field demo.
-//!   --screenshot <path.png> [--frames N] [--zoom F] [--render-file P] [--copies N] [--demo]
-//!                                    offscreen: render N frames, write PNG, print
-//!                                    timing, exit 0. Deterministic (fixed virtual clock).
+//! Run modes (`--help` has every flag; `cargo glyph run` builds first):
+//!   (no arguments, on a terminal) / `--launcher`
+//!                    the terminal launcher (`launcher/`): pick a scene and
+//!                    its options, Enter starts the renderer on them.
+//!   `--load-repo DIR`  a repository as a field of files (HyperLayout;
+//!                    `--field-mode instanced|derived|visible`).
+//!   `--render-file P`  one text file; `--agent-session P` an agent transcript;
+//!                    `--demo` the quad-field stress demo.
+//!   `--screenshot PATH [--frames N]`
+//!                    offscreen: render, write a PNG, exit. Deterministic (a
+//!                    fixed virtual clock), which is what the golden views
+//!                    rest on.
+//!   check instruments  `--fixture-*`, `--hyper-oracle-check`, `--repo-verify`,
+//!                    `--gpu-key`, ...: run by the `cargo glyph` gates.
 //!
 //! This file is the CLI SHELL (clap parsing, run-mode dispatch, help); the
 //! renderer lives in the library — `src/lib.rs`.

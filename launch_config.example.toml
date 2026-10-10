@@ -50,7 +50,7 @@ text_detail_px = 10.0
 # greek_smooth = true blends gradually instead of the default hard cut.
 greeking = true
 
-# Wrap layout mode: "back" (Z-staircase), "down" (vertical columns), etc.
+# Wrap layout mode: "back" (a wrap steps back in depth) or "down" (a wrap is a new row)
 wrap_mode = "back"
 
 # Z-step spacing between wrapped columns in units of em cell height (default: 0.15)
@@ -62,13 +62,14 @@ cluster_mode = "cluster"
 # Syntax color mode on repo load: "syntax" (CPU lexer) or "flat" (geometry only)
 color_mode = "flat"
 
-# Layout engine backend: "hyper" (parallel CPU Rayon, default), "direct" or "batch"
+# Layout engine: "hyper" (default: HyperLayout with background prefetch); "direct",
+# "batch" and "naive" are the same HyperLayout without it (verification forms)
 repo_engine = "hyper"
 
 # Glyph field render mode: "derived" (compact 20B slots, zero-copy), "instanced"
-# (32B slots), or "visible" (EXPERIMENTAL: no slot per glyph; the lines in view
-# are laid out per frame on the GPU — out/VISIBLE-MODE.md; switchable live from
-# the Debug panel, F8 shows its HUD).
+# (32B slots), or "visible" (no slot per glyph: the lines in view are laid out
+# per frame on the GPU — out/VISIBLE-MODE.md; no load-time syntax colour;
+# switchable live from the Debug panel, F8 shows its HUD).
 # DIFFERS from the CLI default, which is "instanced".
 field_mode = "derived"
 

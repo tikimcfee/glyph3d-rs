@@ -247,7 +247,7 @@ pub struct Cli {
     /// Glyph field render mode: `instanced` (default: one full 32 B placement
     /// record per glyph, read as-is by the vertex stage), `derived` (compact
     /// 20 B record per glyph with vertex-stage Y/Z derivation from line
-    /// tables), or `visible` (EXPERIMENTAL, behind this flag: no slot per
+    /// tables), or `visible` (no slot per
     /// glyph — the source bytes and a line table are resident and the lines
     /// in view are laid out per frame on the GPU; `out/VISIBLE-MODE.md`).
     /// Switchable live from the Debug panel's selector (the scene rebuilds);

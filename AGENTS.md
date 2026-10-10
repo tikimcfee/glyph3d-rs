@@ -25,7 +25,7 @@ against `build.toml` that day; `cargo glyph gates` is the live list.)
   binding map); `glyph-field-instanced` is the Instanced mode (32 B `RenderSlot`, its
   upload path, pipelines and `glyph_field.wgsl`); `glyph-field-derived` is the Derived mode
   (20 B `DerivedSlot`, GPU vertex-stage Y/Z derivation, and `glyph_field_derived.wgsl`);
-  `glyph-field-visible` (2026-10-10, EXPERIMENTAL, M2 of `out/VISIBLE-MODE.md`) is the
+  `glyph-field-visible` (2026-10-10; `out/VISIBLE-MODE.md`) is the
   Visible mode — no slot per glyph: the source bytes, Pass 1's line table and the atlas
   trie are resident, the lines in view are laid out per frame on the GPU into a
   transient `DerivedSlot` buffer the Derived shader draws, and lines too small for
@@ -53,7 +53,11 @@ against `build.toml` that day; `cargo glyph gates` is the live list.)
   that actually compiles comes from crates.io via `Cargo.toml`. Patching this copy
   changes nothing.
 - `research/` — background surveys and GPU architecture studies.
-- `experiments/` — the Zed-integration spikes, their own workspace, outside every gate.
+- `experiments/` — its own workspace, outside every gate: the Zed-integration
+  spikes and `gpu-direction/` (the GPU-layout research behind visible mode;
+  some of its scripts still name the retired CubeCL engine).
+- `config/defaults.toml` — every named, tunable value (colours, spacings, LOD
+  thresholds), compiled in; `launch_config.toml` `[section]`s override it.
 - `.claude/worktrees/` — untracked.
 
 ## Build
@@ -69,10 +73,14 @@ cache-blocked CPU layout written with Rayon, writing into unified-memory mapped
 buffers where the GPU allows it and staging otherwise.
 
 **Performance characteristics:**
-- Flagship corpus: the retired JS repo, `viz-web/glyph3d-js` (1,306 files, 97.0 MB source,
-  95.2 million glyph instances) loads and lays out in **~168 ms** backend (576.9 MB/s) /
+- Flagship corpus: the retired JS repo, glyph3d-js (1,306 files, 97.0 MB source,
+  95.2 million glyph instances) loaded and laid out in **~168 ms** backend (576.9 MB/s) /
   **~177 ms** total visual init in `--color-mode flat`, and **~215 ms** backend (450.9 MB/s) /
   **~226 ms** total visual init in `--color-mode syntax` on Apple Silicon Metal.
+  These figures are from late 2026-09, before C22's windowed staging and
+  before visible mode (which runs no Pass 2 at all); they have not been
+  re-measured since. `tools/bench_hyper.py` reproduces them; re-measure
+  before quoting.
   Benchmark tools read its location from `GLYPH_FLAGSHIP_REPO`; nothing in the
   tree hardcodes where a checkout lives.
 - CubeCL, the GPU compute-layout engine (`--repo-engine cubecl`), was RETIRED on
@@ -80,7 +88,7 @@ buffers where the GPU allows it and staging otherwise.
   launch overhead never beat HyperLayout, and HyperLayout's host staging recovers
   its one discrete-GPU advantage. The measurements and the case are in
   `out/GPU-DIRECTION-2026-10-09.md`; the GPU's next role (laying out only the
-  visible lines from resident bytes) is being prototyped under `experiments/`.
+  visible lines from resident bytes) shipped as the visible field mode.
 - ByteSpan token painting: `ByteSpan` and `Paint::ByteSpans` provide byte-range semantic
   token coloring directly from AST/LSP analyses into mapped unified memory.
 - Modularized renderer: `glyph_scene.rs` is factored into `setup.rs`, `pipelines.rs`
@@ -129,7 +137,7 @@ day. `tools/check-all.sh` still works; it is a thin door onto `cargo glyph test`
 - **Scope is an argument, not a verb.** The scopes answer "I changed X, what
   should I run": `rust` (native/, crates/, glyph/), `render` (layout, shaders,
   anything that moves a pixel), `corpus` (fixtures, generators, vendored
-  inputs). Every verdict line says how many gates ran ("4 of 9 gates ran,
+  inputs). Every verdict line says how many gates ran ("5 of 15 gates ran,
   scope rust"), and a selection of ZERO gates is refused as `CHECK-ALL:
   NOTHING RAN`, never green: a scope once outlived its last gate and printed
   ALL GATES GREEN over nothing until it was removed (2026-10-09).
@@ -748,7 +756,7 @@ the mutation harness edits a file, runs a check and matches a string, so it
 moved from Python into `glyph` without argument. Ask which one you are holding
 before you rewrite it.
 
-**The sibling web repo at `../../viz-web/glyph3d-js` is read-only history.** It is
+**The JS repo this engine was ported from (glyph3d-js) is read-only history.** It is
 the JS oracle this engine was ported from, now retired: `tools/vendor/ref` and
 `engine/fixtures/inputs/` are revision-pinned snapshots of it, and the two have
 deliberately forked. Edits there are invisible to every check here, so they

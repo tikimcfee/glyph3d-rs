@@ -2,7 +2,7 @@
 name = "glyph3d-native"
 version = "0.1.0"
 edition = "2021"
-description = "Stage A: native wgpu shell for the million-glyph code-visualization port"
+description = "The glyph3d renderer: whole repositories laid out as text in 3D, on the GPU"
 
 # The lib target exists so the Zed-integration experiment can link the
 # renderer into the experiment workspace (one binary, one lock there — the

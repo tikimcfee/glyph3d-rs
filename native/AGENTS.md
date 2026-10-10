@@ -102,7 +102,8 @@ caller; the short version:
 - `--field-mode instanced|derived|visible` selects the glyph field mode:
   - `instanced` (32 B per glyph): precomputed 3D coordinates.
   - `derived` (20 B per glyph): compact word layout, Y/Z derived dynamically in vertex WGSL.
-  - `visible` (EXPERIMENTAL, 2026-10-10; `out/VISIBLE-MODE.md` M2): no slot per
+  - `visible` (2026-10-10; a golden equivalent since M4, with five syntax views
+    exempt; the default is still `instanced`; `out/VISIBLE-MODE.md`): no slot per
     glyph. HyperLayout runs Pass 1 WITH the line table and no Pass 2; the arena
     comes back in its third form (`layout_hyper::VisibleStaging`: the table, one
     seed per item, and — moved in by the loader, never copied — the walk's own
@@ -142,7 +143,7 @@ caller; the short version:
 input in the tree that reaches the page extent's origin seed. The seed binds
 only for an item with ZERO records; before that file existed, seeding the
 extent empty instead reddened its unit test and left all four screenshots
-byte-equal, so gate 8 could not see it at all. With the empty file in place
+byte-equal, so pixel-ab could not see it at all. With the empty file in place
 that same mutation moves `repo-wide.png` (verified 2026-09-04; `repo-zoom` is
 framed on alpha.rs and still cannot see it, which is fine — one gate seeing it
 is the point). Do not "tidy up" the empty file, and if the fixture is ever
@@ -156,11 +157,12 @@ rebuilt, put one back.
 - **Fail-loud panics**: this is a binary, not a library. `expect("...")` /
   `assert!` with a diagnostic message is the documented convention — do NOT
   convert to error-returning style. Bare `unwrap()` only in `#[cfg(test)]`.
-- **`cargo fmt`**: the tree is NOT fmt-clean (≈234 hunks across all src files,
-  mostly long-line wrapping). Do not mass-reformat — the diff/review cost
+- **`cargo fmt`**: the tree is NOT fmt-clean (mostly long-line wrapping). Do not mass-reformat — the diff/review cost
   exceeds the value. Match the local style of the file you're editing.
 - Comments explain WHY (empirical findings, bug history, invariants), not
-  what the code does. Stage-tagged (`// Stage F: ...`) for archaeology.
+  what the code does. Existing `// Stage F: ...` tags are archaeology; do not
+  add new stage letters (root `AGENTS.md` § Vocabulary) — name the substance
+  and date it (`C28, 2026-10-10`).
 
 ## The hardware profile
 
@@ -168,7 +170,9 @@ rebuilt, put one back.
 and carried in `GpuContext`. Anything that must branch on hardware — present
 mode, indirect-draw support, the Metal `first_instance` workaround in
 `glyph_scene.rs` — reads it; `cfg!(target_os)` is the wrong axis for all of
-those and is not used for any of them. `--gpu-key` prints the golden-set key
+those and is not used for any of them. (The one `#[cfg(target_os = "macos")]`
+axis in the tree is the unified-memory slot allocation below: it reaches the
+Metal HAL, which exists only there.) `--gpu-key` prints the golden-set key
 (`backend-vendor`), `--gpu-profile` the full record; root `AGENTS.md` § pixel-ab
 says how the build tool uses both. `--present-mode fifo|mailbox|immediate` is
 windowed-only and rides on the FPS line, because under Fifo that figure is the
@@ -176,10 +180,12 @@ display's refresh (75 on the first Linux box) and not a fact about the renderer.
 
 ## Apple Silicon vs. Desktop x86_64 & Discrete GPU Specifics
 
-Detailed technical audit lives in `research/desktop-platform-audit.md`. Key touchpoints:
+This section is the one copy of these facts (the testing skill points here;
+`research/desktop-platform-audit.md` is the 2026-10 survey behind it, and
+its staging text predates C22). Key touchpoints:
 - **Unified vs. Discrete Slot Buffers (`native/src/layout_hyper/device_alloc.rs`)**:
   - `#[cfg(target_os = "macos")]` allocates Metal `MTLStorageModeShared` memory and maps it (`mapped_base: Some(addr)`). Pass 2 writes directly to device memory with zero copies.
-  - On non-macOS/desktop, `layout_device_discrete` writes to a mapped staging buffer, unmaps, and blits to device VRAM via `encoder.copy_buffer_to_buffer` (`mapped_base: None`).
+  - On non-macOS/desktop (`mapped_base: None`), the default is WINDOWED emission (C22): Pass 2 writes each 64 MiB window of the slot stream into one of two mapped staging buffers, copied to VRAM while the next fills (`GLYPH_STAGING` below names the fallbacks).
   - ⚠️ **Dynamic Color Writes**: When `mapped_base` is `None`, `crates/glyph-field/src/storage.rs` `SlotStorage::write_colors` falls back to one 4-byte `queue.write_buffer` per slot. On discrete GPUs with large repos, batch these writes to avoid driver call overhead.
 - **Cache Sizing & Chunk Threshold (`native/src/layout_hyper/chunk.rs`)**:
   - `CHUNK_THRESHOLD_BYTES = 64 * 1024` (64 KiB) is tuned for Apple Silicon M-series L1 Data Cache (128 KiB per P-core).
@@ -191,7 +197,7 @@ Detailed technical audit lives in `research/desktop-platform-audit.md`. Key touc
   - A `copy_buffer_to_buffer` whose size is off 16 B runs whole at about half speed; wgpu only asks for 4. A 20 B `DerivedSlot` stream is 16-aligned only at counts ≡ 0 mod 4, so an odd count cost ~+20 ms of backend on a 94 MB tree. Discrete staging buffers are padded with `padded_staging_size` and slot copies go through `copy_split` (16-aligned body + small tail). Same bytes, same buffer sizes; the unified single-chunk path makes no copy and is untouched.
   - An off-16 source OFFSET also costs; chunked Derived buffers start chunk k at `k x chunk_cap x 20` B (≡ 8 mod 16 at the 2 GiB binding limit; a forced two-chunk split of the 94 MB tree measured ~+1 ms at 8 mod 16, ~+5 ms at 4 mod 16). Left as is: moving it would move which slot lives in which chunk.
 - **Golden Pixel Keys**:
-  - macOS Metal: `metal-apple`. Desktop Linux/Windows: `vulkan-nvidia`, `vulkan-amd`. Golden baselines are keyed per hardware in `out/tooling-ab/baseline/<key>/`.
+  - Golden baselines are keyed per rasterizer in `out/tooling-ab/baseline/<key>/`; sets exist for `metal-apple` and `vulkan-nvidia`. Any other key (e.g. `vulkan-amd`) is red until a human adopts its set.
 - **Pure Rust Portability**:
   - Zero target-specific inline assembly or architecture-specific intrinsics. LLVM auto-vectorizes clean slice loops to AVX2/AVX-512 on x86_64 and NEON on ARM64. Numerical pick checks (`tools/check-pick-oracle.sh`) are 100% bit-exact across platforms.
 
@@ -200,8 +206,7 @@ Detailed technical audit lives in `research/desktop-platform-audit.md`. Key touc
 - `GLYPH_PROFILE=1` — requests TIMESTAMP_QUERY and builds a wgpu-profiler;
   per-pass GPU timings print (windowed: 1 Hz; offscreen: once per run).
   Without it the device is created exactly as before (zero-cost Option).
-- `GLYPH_TRACE=<filter>` — the load path's span instrument (integration
-  note 22): `repo.{walk,backend,verify,views,layout,staged,segments}` and
+- `GLYPH_TRACE=<filter>` — the load path's span instrument: `repo.{walk,backend,verify,views,layout,staged,segments}` and
   `hyper.{pass1,pass2,emoji_tints,pass2.windowed,staging.stream}`, printed on span CLOSE with busy/idle times. The filter is a tracing EnvFilter string (fallback
   `RUST_LOG`; unset = off, one atomic per span). `glyph3d_native=info`
   is the useful setting — a bare `info` also admits wgpu's own
@@ -217,6 +222,11 @@ Detailed technical audit lives in `research/desktop-platform-audit.md`. Key touc
   wgpu-core zero-fills and copies. On the measured NVIDIA box (derived, 102 MB
   tree): windowed 121 ms, host 194, single 482. The fallbacks stay for
   hardware nobody has measured.
+- `GLYPH_HYPER_ORACLE_STRICT=1` — the hyper-oracle gate's form: besides
+  refusing zero records, refuse a corpus in which the reference resolved no
+  sequence or no ASCII-led one. `GLYPH_HYPER_ORACLE_NO_GPU` skips the visible
+  tier (the GPU kernel vs Pass 2) on a host without a usable adapter, and says
+  so; the gate never sets it.
 - `GLYPH_PICK_DEBUG=1` — pick-path diagnostics: pixel ray, AABB hits, local
   point, candidate records (glyph_scene/pick.rs pick functions).
 - `GLYPH_CULL_DEBUG=1` — at t=0.0 prints cull stats: visible draw ranges,
@@ -272,9 +282,7 @@ Detailed technical audit lives in `research/desktop-platform-audit.md`. Key touc
 - `GLYPH_FIELDMODE_SELFTEST=1` — windowed, dev-only (2026-10-10): at t≈3 s
   cycles the field mode Instanced → Derived → Visible through the SAME
   rebuild arm the Debug panel's selector fires, printing the F8 HUD line
-  (`FIELDMODE-SELFTEST before/after step N: …`) around each rebuild. Until the
-  Visible field's bodies land, the third step panics at `VisibleField::new`,
-  which is the proof that the mode reaches the call.
+  (`FIELDMODE-SELFTEST before/after step N: …`) around each rebuild.
 - `GLYPH_VISIBLE_VERB_SELFTEST=1` — windowed, dev-only (M3, 2026-10-10): from
   t≈3 s, one step every fourth frame, through the SAME entry points the CLI op
   stream and the panel use (`apply_pick`, then `apply_verb` on `parse_verb`
@@ -321,7 +329,7 @@ documentation.
 
 ## Commit cadence
 
-One logical change per commit; run `tools/check-all.sh` before each lands and
+One logical change per commit; run `cargo glyph test` before each lands and
 put what you ran in the message. Untracked scratch (`out/tooling-ab/sweep/`,
 proof PNGs) is fine to regenerate; tracked artifacts change only on purpose.
 
