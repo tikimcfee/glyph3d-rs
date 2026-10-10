@@ -7,13 +7,13 @@ Recorded because a vendored file with no recorded origin is indistinguishable
 from a local invention six months later.
 
   upstream repo    viz-web/glyph3d-js
-  upstream commit  2ef79b7e762a07ebbf72713f97527a6831b7a839
-  regenerated      2026-09-20  (tools/vendor-manifest.py)
+  upstream commit  2ef79b7e762a07ebbf72713f97527a6831b7a839  (recorded; web repo not present at regeneration on 2026-10-10)
+  regenerated      2026-10-10  (tools/vendor-manifest.py)
 
 ## The fixture oracle is pinned PER FILE
 
-`engine/fixtures/{gen,gen-bake}.mjs` reproduce all 25 committed
-fixtures (17 `.pipe.bin` + 8 `.bake.bin`; counts read from
+`engine/fixtures/{gen,gen-bake}.mjs` reproduce all 34 committed
+fixtures (26 `.pipe.bin` + 8 `.bake.bin`; counts read from
 `build.toml [artifact.fixtures]`) byte-for-byte, in this tree, with no web
 repo present — but only from these
 revisions. Today's upstream cannot: `glyphPipelineReference.js` stopped
