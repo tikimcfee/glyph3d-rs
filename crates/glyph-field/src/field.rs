@@ -3,7 +3,7 @@
 
 use std::ops::Range;
 
-use crate::{GlyphFieldMode, GlyphPlacement};
+use crate::{FramePrepare, GlyphFieldMode, GlyphPlacement};
 
 /// A built glyph field: per-glyph slot storage in chunks, the pipeline that
 /// draws it, and the verbs that edit single glyphs.
@@ -47,6 +47,18 @@ pub trait GlyphField {
         mask_format: wgpu::TextureFormat,
         sample_count: u32,
     ) -> wgpu::RenderPipeline;
+
+    /// Per-frame work before the glyph pass, in the frame's own encoder: a
+    /// mode that lays out only the visible lines (Visible) culls and emits
+    /// its transient slots here; the stored modes do nothing.
+    fn prepare(&self, _queue: &wgpu::Queue, _encoder: &mut wgpu::CommandEncoder, _frame: &FramePrepare) {}
+
+    /// Whether the field culls and draws itself: its `record_draws` ignores
+    /// the ranges it is given and draws what `prepare` emitted (one
+    /// indirect draw), so the scene's per-file glyph ranges are not built.
+    fn draws_itself(&self) -> bool {
+        false
+    }
 
     /// Record draws for `(chunk, chunk-local slot range)` pairs into a pass
     /// whose pipeline the CALLER has set (the glyph pipeline or a mask

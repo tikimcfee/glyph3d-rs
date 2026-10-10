@@ -1,0 +1,16 @@
+[package]
+name = "glyph-field-visible"
+version = "0.1.0"
+edition = "2021"
+description = "The Visible glyph field: no slot per glyph — resident bytes and a line table, the visible lines laid out per frame on the GPU and drawn through the Derived shader."
+
+[dependencies]
+glyph-field = { path = "../glyph-field" }
+glyph-field-derived = { path = "../glyph-field-derived" }
+wgpu = "30"
+bytemuck = { version = "1", features = ["derive"] }
+encase = "0.12"
+log = "0.4"
+
+[dev-dependencies]
+naga = { version = "30", features = ["wgsl-in"] }

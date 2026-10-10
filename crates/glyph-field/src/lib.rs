@@ -47,7 +47,7 @@ pub use field_core::{FieldCore, FieldShape};
 pub use mode::{GlyphFieldMode, ParseGlyphFieldModeError};
 pub use records::{GlyphInstance, GlyphPlacement, GroupRow, ItemParamsGpu, LineRecord};
 pub use resources::{
-    shared_bind_group_entries, shared_layout_entries, FieldResources, FieldTargets, SlotChunk,
+    shared_bind_group_entries, shared_layout_entries, FieldResources, FieldTargets, FramePrepare, SlotChunk,
     SlotSource, BINDING_FRAME_UNIFORM, BINDING_SLOTS,
 };
 pub use storage::{SlotRecord, SlotStorage};

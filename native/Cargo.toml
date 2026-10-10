@@ -20,6 +20,7 @@ wgpu = "30"
 glyph-field = { path = "../crates/glyph-field" }
 glyph-field-instanced = { path = "../crates/glyph-field-instanced" }
 glyph-field-derived = { path = "../crates/glyph-field-derived" }
+glyph-field-visible = { path = "../crates/glyph-field-visible" }
 glyph-session-dirs = { path = "../crates/glyph-session-dirs" }
 winit = "0.30"
 pollster = "0.4"
