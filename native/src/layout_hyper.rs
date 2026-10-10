@@ -335,6 +335,11 @@ pub(crate) fn pass1_prepass_chunk_bytes(
     }
 }
 
+// `inline(never)`: with both instantiations inlined into the dispatching
+// wrapper, LLVM kept COLLECT as a runtime branch inside one 14 KB function
+// instead of two specialised walks (the M2 measured it: +0.7 ms of an 11 ms
+// Pass 1, 2026-10-10). As separate functions the `false` walk is the old one.
+#[inline(never)]
 #[allow(clippy::too_many_arguments)]
 fn pass1_prepass_chunk_walk<const COLLECT: bool>(
     bytes: &[u8],
