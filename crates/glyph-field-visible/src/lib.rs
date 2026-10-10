@@ -40,6 +40,44 @@
 //! resident; cull B reserves a whole line's slots with one `atomicAdd` of
 //! its `glyph_count` and gives segment k the base plus that prefix. The
 //! public struct is unchanged; the side table is 4 B per seed.
+//!
+//! EDITS AND SELECTION KEYED BY (ITEM, BYTE) (M3, 2026-10-10). A slot here
+//! lives one frame and lands where the atomics put it, so nothing the
+//! renderer keyed by slot survives; every such consumer is re-keyed:
+//!
+//! - **Per-glyph verbs** → [`VisibleField::set_glyph_override`] /
+//!   [`VisibleField::clear_glyph_override`]: a resident override table
+//!   (`tables::GlyphOverrideGpu`, 16 B, one run per item sorted by byte,
+//!   allocated like the spans) the layout kernel walks beside the spans.
+//!   Colour beats the span's; the x nudge is an f32 add after the single
+//!   rounding (NOT part of the oracle contract — the oracle has no nudges;
+//!   `tests/gpu.rs` holds it to the host's f32 add); a group makes the slot's
+//!   lane `glyph_field_derived::override_lane(item, k)`, k a row the field
+//!   allocates in the Derived draw's group-override table (binding 10; 4,095
+//!   rows, one per distinct group named, never freed).
+//! - **Line and highlight recolours** → [`VisibleField::set_item_span_range`]:
+//!   a merge into the item's spans on the host, uploaded through
+//!   `set_item_spans`.
+//! - **The selection mask** → [`VisibleField::prepare_mask`] +
+//!   [`VisibleField::record_mask_draw`]: the layout kernel again in MASK
+//!   mode, over the frame's own segment list, emitting only the item's
+//!   leaders in the byte range into a SECOND transient buffer with its own
+//!   indirect draw; a second `FieldCore` over that buffer gives the scene's
+//!   mask pipeline (built from the main core; identical layout) its bind
+//!   group. A line in the WASH tier has no segment entry and so no mask —
+//!   a selection there draws nothing, by construction.
+//! - **`GLYPH_G_DUMP`** → [`VisibleField::locate`] names the transient slot
+//!   of (item, byte) in the last frame by reading the segment list back and
+//!   re-walking the covering segment on the CPU (`walk.rs`, over the packed
+//!   trie the kernel reads); `GlyphField::read_slot_words` then reads it.
+//!
+//! Costs: the layout bind group gains two bindings (15 storage + 2 uniform
+//! per stage); the frame path gains one 20 B `write_buffer` (the mask draw's
+//! reset); a selection costs two dispatches (one indirect, the frame's
+//! segment count, early-out per entry) and a 20 B copy; resident memory
+//! grows by the override table (1 MiB, or 64 B per item past 16 K items),
+//! the group table (16 KiB) and the mask slots (`mask_capacity` × 20 B,
+//! 20 MiB at the default limits).
 
 use std::ops::Range;
 
@@ -52,10 +90,11 @@ use glyph_field_derived::DerivedSlot;
 pub mod gpu;
 pub mod tables;
 pub mod test_support;
+pub mod walk;
 
 pub use tables::{
-    byte_chunk_shift, frustum_planes, fu_to_world, kernel_x, pack_trie, plan_dispatch, reference_x, FrameGpu, ItemGpu,
-    LayoutParamsGpu, PackedTrie, SegGpu, TrieMetaGpu, WashGpu,
+    byte_chunk_shift, frustum_planes, fu_to_world, kernel_x, merge_span_range, pack_trie, plan_dispatch, reference_x,
+    FrameGpu, GlyphOverrideGpu, ItemGpu, LayoutParamsGpu, PackedTrie, SegGpu, TrieMetaGpu, WashGpu,
 };
 
 /// One line of one item, as Pass 1 writes it (`layout_hyper::LineEntry`,
@@ -233,15 +272,27 @@ pub struct VisibleStats {
     pub draw_ms: f32,
 }
 
+/// What the headless layout returns: the slots in Pass 2 order, and the
+/// group-override table the overrides' group indices point into (index k →
+/// group row; `[0]` unused), so a caller can turn a slot's lane back into a
+/// group.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct HeadlessLayout {
+    pub slots: Vec<DerivedSlot>,
+    pub group_overrides: Vec<u32>,
+}
+
 /// The Visible field.
 pub struct VisibleField {
     resident: gpu::Resident,
     frame: gpu::Frame,
     /// The Derived draw over the transient slot buffer (one chunk).
     core: FieldCore<DerivedSlot>,
-    /// Bound as the Derived shader's group-override table (binding 10);
-    /// all zero — a transient slot never carries an override.
-    _group_overrides: wgpu::Buffer,
+    /// The same shader and layout over the selection MASK buffer: the
+    /// scene's mask pipeline (built from `core`) binds this core's group,
+    /// which wgpu accepts because identical layouts are one layout (the
+    /// device's bind-group-layout pool dedups by entries).
+    mask_core: FieldCore<DerivedSlot>,
     /// Live slots in the one chunk, as the trait reports them: none that a
     /// caller may address (they are rebuilt every frame).
     chunk_counts: [u32; 1],
@@ -250,7 +301,7 @@ pub struct VisibleField {
 impl VisibleField {
     /// Build the field: upload the resident tables, create the cull and
     /// layout pipelines and the transient buffers, and the Derived draw over
-    /// the transient slot buffer.
+    /// the transient slot buffer (and a second over the mask buffer).
     ///
     /// The Derived item table (binding 8) is built from `inputs.items[i].params`;
     /// `resources.item_params` is not read. `limits.max_slots × 20 B` must
@@ -266,16 +317,12 @@ impl VisibleField {
     ) -> Self {
         let resident = gpu::Resident::new(device, queue, inputs);
         let frame = gpu::Frame::new(device, queue, &resident, resources, targets, limits);
-        let group_overrides = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("visible group overrides (all zero)"),
-            size: (glyph_field_derived::OVERRIDE_MAX as u64 + 1) * 4,
-            usage: wgpu::BufferUsages::STORAGE,
-            mapped_at_creation: false,
-        });
-        let entries = frame.derived_shape_entries(&resident, resources, &group_overrides);
+        let entries = frame.derived_shape_entries(&resident, resources, &resident.group_overrides);
         let shape = gpu::derived_shape(&entries);
         let core = FieldCore::new(device, frame.slot_storage(), resources, targets, &shape);
-        Self { resident, frame, core, _group_overrides: group_overrides, chunk_counts: [0] }
+        let mask_shape = glyph_field::FieldShape { label_prefix: "visible mask ", ..shape };
+        let mask_core = FieldCore::new(device, frame.mask_slot_storage(), resources, targets, &mask_shape);
+        Self { resident, frame, core, mask_core, chunk_counts: [0] }
     }
 
     /// Replace one item's colour spans (an edit arriving as byte ranges):
@@ -301,44 +348,93 @@ impl VisibleField {
 
     // ── M3: edits and selection keyed by (item, byte) ─────────────────
 
-    /// Set (or replace) the override of one glyph.
-    pub fn set_glyph_override(&self, _queue: &wgpu::Queue, _ov: GlyphOverride) {
-        todo!("M3: set_glyph_override")
+    /// Set (or replace) the override of one glyph. One that changes nothing
+    /// (colour 0, nudge 0, [`NO_GROUP`]) clears. A byte past the item is
+    /// ignored with a warning; a byte that is not a surviving leader is
+    /// kept but never applied (the kernel passes it over). The group's row
+    /// in the Derived override table is allocated on first use and never
+    /// freed; past 4,095 distinct groups the group part is dropped with a
+    /// warning and the colour and nudge still apply. When the item's run
+    /// has no slack the run is remapped to the table's tail; when the tail
+    /// is full the edit is refused with a warning.
+    pub fn set_glyph_override(&self, queue: &wgpu::Queue, ov: GlyphOverride) {
+        self.resident.set_glyph_override(queue, ov);
     }
 
     /// Remove one glyph's override, if any.
-    pub fn clear_glyph_override(&self, _queue: &wgpu::Queue, _item: u32, _byte: u32) {
-        todo!("M3: clear_glyph_override")
+    pub fn clear_glyph_override(&self, queue: &wgpu::Queue, item: u32, byte: u32) {
+        self.resident.clear_glyph_override(queue, item, byte);
     }
 
     /// Colour the byte range `[start, end)` of an item: the new span replaces
     /// whatever spans overlapped it (clipping them at its edges), the rest
-    /// stay. A line recolour or a highlight run is this.
-    pub fn set_item_span_range(&self, _queue: &wgpu::Queue, _item: u32, _start: u32, _end: u32, _color: u32) {
-        todo!("M3: set_item_span_range")
+    /// stay. A line recolour or a highlight run is this. `color` 0 clears
+    /// the range back to the default colour; `end` is clamped to the item
+    /// and an empty range is a no-op. See [`merge_span_range`] for the
+    /// exact rule; the upload is `set_item_spans`'s, with its remap and
+    /// refusal.
+    pub fn set_item_span_range(&self, queue: &wgpu::Queue, item: u32, start: u32, end: u32, color: u32) {
+        self.resident.set_item_span_range(queue, item, start, end, color);
     }
 
     /// Prepare the selection mask for the glyphs of item `item` whose leader
     /// byte lies in `[start, end)`: the layout kernel again, over only the
     /// visible segments that intersect the range, into a second transient
     /// buffer (the selection is drawn with the mask pipeline the scene
-    /// creates, no depth, no blend). Call after `prepare` in the same encoder.
-    pub fn prepare_mask(&self, _queue: &wgpu::Queue, _encoder: &mut wgpu::CommandEncoder, _item: u32, _start: u32, _end: u32) {
-        todo!("M3: prepare_mask")
+    /// creates, no depth, no blend). Call after `prepare` in the same
+    /// encoder, at most once per frame (a second call's slots would append
+    /// to the first's count but its filter would replace it). An empty
+    /// range, or no call at all, leaves the mask draw at zero instances —
+    /// `prepare` resets it every frame. A selection over a line in the WASH
+    /// tier, or one culled or dropped at a cap, has no segment entry and
+    /// draws nothing; one past [`Self::mask_capacity`] slots is truncated.
+    pub fn prepare_mask(&self, queue: &wgpu::Queue, encoder: &mut wgpu::CommandEncoder, item: u32, start: u32, end: u32) {
+        self.frame.prepare_mask(&self.resident, queue, encoder, item, start, end);
     }
 
     /// Record the mask draw of what `prepare_mask` emitted (an indirect draw
     /// over the selection buffer); the caller set the mask pipeline.
-    pub fn record_mask_draw(&self, _pass: &mut wgpu::RenderPass<'_>) {
-        todo!("M3: record_mask_draw")
+    pub fn record_mask_draw(&self, pass: &mut wgpu::RenderPass<'_>) {
+        self.frame.record_mask_draw(&self.mask_core, pass);
+    }
+
+    /// Slots the selection mask buffer holds (the frame's slot cap or
+    /// `tables::MASK_SLOTS_MAX`, whichever is lower).
+    pub fn mask_capacity(&self) -> u32 {
+        self.frame.mask_capacity
     }
 
     /// Where the glyph at (item, byte) landed in the LAST prepared frame's
     /// transient buffer, if it was laid out: reads the segment list back
     /// (blocking; diagnostics such as GLYPH_G_DUMP, never the frame path)
-    /// and counts survivors from the covering segment's start.
-    pub fn locate(&self, _queue: &wgpu::Queue, _item: u32, _byte: u32) -> Option<u32> {
-        todo!("M3: locate")
+    /// and counts survivors from the covering segment's start. `None` when
+    /// the byte is not a surviving leader (a continuation byte, a glyph-0
+    /// cell such as a tab, a sequence trailer, the newline), or its line was
+    /// not in the glyph tier this frame.
+    pub fn locate(&self, queue: &wgpu::Queue, item: u32, byte: u32) -> Option<u32> {
+        self.frame.locate(&self.resident, queue, item, byte)
+    }
+
+    /// The overrides of one item as the device has them (tests).
+    pub fn item_overrides(&self, item: u32) -> Vec<GlyphOverrideGpu> {
+        self.resident.item_overrides(item)
+    }
+
+    /// The Derived group-override table as the device has it (index →
+    /// group; `[0]` unused), for turning a slot's lane back into its group.
+    pub fn group_override_table(&self) -> Vec<u32> {
+        self.resident.group_override_table()
+    }
+
+    /// The mask draw's instance count after the last `prepare_mask`
+    /// (blocking; tests).
+    pub fn read_mask_count(&self, queue: &wgpu::Queue) -> u32 {
+        self.frame.read_mask_count(&self.resident, queue)
+    }
+
+    /// The first `count` mask slots (blocking; tests).
+    pub fn read_mask_slots(&self, queue: &wgpu::Queue, count: u32) -> Vec<DerivedSlot> {
+        self.frame.read_mask_slots(&self.resident, queue, count)
     }
 
     /// The last COMPLETED frame's counters (see [`VisibleStats`]); they lag
@@ -384,7 +480,15 @@ impl VisibleField {
 /// different count for some line would shift that line's slots — which the
 /// diff would show as a run of mismatches from that line on.
 pub fn layout_all_lines(device: &wgpu::Device, queue: &wgpu::Queue, inputs: &VisibleInputs<'_>) -> Vec<DerivedSlot> {
-    gpu::layout_all_lines(device, queue, inputs)
+    gpu::layout_all_lines(device, queue, inputs, &[]).slots
+}
+
+/// [`layout_all_lines`] with per-glyph overrides applied first (the same
+/// kernel the frame runs them through), returning the slots and the
+/// group-override table their lanes index. The witness for the override
+/// path without a frame.
+pub fn layout_all_lines_with_overrides(device: &wgpu::Device, queue: &wgpu::Queue, inputs: &VisibleInputs<'_>, overrides: &[GlyphOverride]) -> HeadlessLayout {
+    gpu::layout_all_lines(device, queue, inputs, overrides)
 }
 
 impl GlyphField for VisibleField {
@@ -433,5 +537,13 @@ impl GlyphField for VisibleField {
     fn write_group_id(&self, _queue: &wgpu::Queue, _slot: u32, _item: u32, _group_id: u32) {}
     fn write_placements(&self, _queue: &wgpu::Queue, _first_slot: u32, _placements: &[GlyphPlacement]) {}
     fn write_colors(&self, _queue: &wgpu::Queue, _first_slot: u32, _colors: &[u32]) {}
-    fn read_slot_words(&self, _device: &wgpu::Device, _queue: &wgpu::Queue, _slot: u32, _out: &mut [u32]) {}
+    /// The words of a TRANSIENT slot of the last prepared frame — the index
+    /// [`VisibleField::locate`] names (GLYPH_G_DUMP); blocking.
+    fn read_slot_words(&self, device: &wgpu::Device, queue: &wgpu::Queue, slot: u32, out: &mut [u32]) {
+        if slot >= self.frame.limits.max_slots {
+            out.fill(0);
+            return;
+        }
+        self.core.read_slot_words(device, queue, slot, out);
+    }
 }

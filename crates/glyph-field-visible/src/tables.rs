@@ -3,12 +3,13 @@
 //! pure functions that build them from [`crate::VisibleInputs`] — the
 //! packed trie, the extended item table, the span table with its per-line
 //! first-span index, the byte-chunk placement — plus the frame's frustum
-//! planes and the dispatch plan. Nothing here touches a device, so every
-//! piece has a unit test.
+//! planes and the dispatch plan, and (M3) the per-glyph override table's
+//! allocator and the span-range merge the byte-keyed edits rest on. Nothing
+//! here touches a device, so every piece has a unit test.
 
 use bytemuck::{Pod, Zeroable};
 
-use crate::{ByteSpanGpu, LineEntryGpu, TrieUpload, VisibleItem};
+use crate::{ByteSpanGpu, GlyphOverride, LineEntryGpu, TrieUpload, VisibleItem, NO_GROUP};
 
 /// Workgroup size of every per-element kernel.
 pub const WORKGROUP: u32 = 64;
@@ -23,6 +24,30 @@ pub const INDIRECT_CULL_B: u64 = 0;
 pub const INDIRECT_LAYOUT: u64 = 16;
 pub const INDIRECT_DRAW: u64 = 32;
 pub const INDIRECT_WASH_DRAW: u64 = 64;
+
+/// Words of the selection mask's argument buffer (`visible_layout.wgsl`'s
+/// `mask_args`): the slot counter at 0 (atomic), the mask draw's
+/// `DrawIndexedIndirectArgs` at 4..9 (byte offset [`MASK_ARGS_DRAW`]).
+pub const MASK_ARGS_WORDS: usize = 12;
+pub const MASK_ARGS_DRAW: u64 = 16;
+
+/// `LayoutParamsGpu::mode`: the frame's (or the headless) layout, every
+/// glyph of every segment to `seg.slot_base`.
+pub const LAYOUT_MODE_ALL: u32 = 0;
+/// `LayoutParamsGpu::mode`: the selection mask — only the segments of
+/// `filter_item` that intersect `[filter_lo, filter_hi)`, only the leaders
+/// in that range, appended by atomic counter into the mask slot buffer.
+pub const LAYOUT_MODE_MASK: u32 = 1;
+
+/// The most slots the selection mask buffer holds (1 M × 20 B = 20 MiB);
+/// [`crate::VisibleField::mask_capacity`] is the frame's cap or this,
+/// whichever is lower. A selection past it is truncated (the count is
+/// clamped in `finalize_mask`), never read past the buffer.
+pub const MASK_SLOTS_MAX: u32 = 1 << 20;
+
+/// The device override table's least capacity (entries): one override is
+/// 16 B, so this is 1 MiB; a load with many items gets four per item.
+pub const OVERRIDE_TABLE_MIN: u32 = 1 << 16;
 
 /// Counter slots, as the cull shader names them.
 pub mod counter {
@@ -73,7 +98,33 @@ pub struct ItemGpu {
     pub group: u32,
     pub bbox_min: [f32; 3],
     pub bbox_max: [f32; 3],
-    pub _pad: [u32; 5],
+    /// The item's run in the override table (`GlyphOverrideGpu`, sorted by
+    /// byte); zero at load, written by the override edits (M3). Took two of
+    /// the five pad words, so the row stays 128 B.
+    pub override_base: u32,
+    pub override_count: u32,
+    pub _pad: [u32; 3],
+}
+
+/// One per-glyph override as the kernel reads it (16 B): the glyph's leader
+/// byte (item-relative), its colour (0 = keep the span's), an x nudge added
+/// after the narrowing (0 = none), and the index of its group in the
+/// Derived group-override table (0 = the item's own group). The device
+/// form of [`crate::GlyphOverride`]; per item sorted by `byte`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Pod, Zeroable)]
+pub struct GlyphOverrideGpu {
+    pub byte: u32,
+    pub color: u32,
+    pub x_nudge: f32,
+    pub group_index: u32,
+}
+
+impl GlyphOverrideGpu {
+    /// An override that changes nothing — setting one is clearing it.
+    pub fn is_noop(&self) -> bool {
+        self.color == 0 && self.x_nudge == 0.0 && self.group_index == 0
+    }
 }
 
 /// One segment entry (32 B), cull B's output and the layout kernel's input.
@@ -147,7 +198,7 @@ pub struct TrieMetaGpu {
     pub one: f32,
 }
 
-/// What a layout dispatch is told (16 B).
+/// What a layout dispatch is told (48 B).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Pod, Zeroable)]
 pub struct LayoutParamsGpu {
@@ -156,6 +207,28 @@ pub struct LayoutParamsGpu {
     pub debug_tint: u32,
     pub default_color: u32,
     pub chunk_shift: u32,
+    /// [`LAYOUT_MODE_ALL`] or [`LAYOUT_MODE_MASK`].
+    pub mode: u32,
+    /// The mask's item and item-relative byte range `[lo, hi)`.
+    pub filter_item: u32,
+    pub filter_lo: u32,
+    pub filter_hi: u32,
+    /// Slots the mask buffer holds.
+    pub mask_cap: u32,
+    pub _pad: [u32; 3],
+}
+
+impl LayoutParamsGpu {
+    /// The frame's (or the headless) parameters: every segment, every glyph.
+    pub fn all(count: u32, debug_tint: u32, default_color: u32, chunk_shift: u32) -> Self {
+        Self { count, debug_tint, default_color, chunk_shift, mode: LAYOUT_MODE_ALL, ..Default::default() }
+    }
+
+    /// The selection mask's: `count` segment entries scanned, only `item`'s
+    /// leaders in `[lo, hi)` emitted, at most `mask_cap` of them.
+    pub fn mask(count: u32, default_color: u32, chunk_shift: u32, item: u32, lo: u32, hi: u32, mask_cap: u32) -> Self {
+        Self { count, debug_tint: 0, default_color, chunk_shift, mode: LAYOUT_MODE_MASK, filter_item: item, filter_lo: lo, filter_hi: hi, mask_cap, _pad: [0; 3] }
+    }
 }
 
 // ── packed trie entries ─────────────────────────────────────────────────────
@@ -164,6 +237,8 @@ pub const PK_GLYPH_MASK: u32 = 0xFFFF;
 pub const PK_K_SHIFT: u32 = 16;
 pub const PK_SEQ_FIRST: u32 = 1 << 18;
 pub const PK_MISSING: u32 = 1 << 19;
+/// Glyph and cells: what a resolved leader is (the kernel's `PK_RESOLVED_MASK`).
+pub const PK_RESOLVED_MASK: u32 = 0x3FFFF;
 /// The ASCII table's entry for a byte that is not a leader.
 pub const PK_SENTINEL: u32 = u32::MAX;
 
@@ -358,7 +433,9 @@ pub fn item_gpu(i: usize, it: &VisibleItem, place: (u32, u32), span_base: u32, s
         group: it.group_id,
         bbox_min: it.bbox_min,
         bbox_max: it.bbox_max,
-        _pad: [0; 5],
+        override_base: 0,
+        override_count: 0,
+        _pad: [0; 3],
     }
 }
 
@@ -451,6 +528,139 @@ pub fn first_span_index_for_item(line_starts: &[u32], run: &[ByteSpanGpu], base:
             base + si as u32
         })
         .collect()
+}
+
+/// Colour `[start, end)` of an item's sorted, non-overlapping spans: the new
+/// span replaces whatever it overlaps, a span straddling an edge keeps the
+/// part outside, spans elsewhere stay. `color` 0 is a CLEAR — the range
+/// loses its spans and shows the default colour (a span with colour 0 would
+/// paint transparent black, which nothing wants). Nothing coalesces: two
+/// adjacent spans of one colour stay two, so the result is always what the
+/// caller can predict from the inputs. An empty range is a no-op.
+pub fn merge_span_range(spans: &mut Vec<ByteSpanGpu>, start: u32, end: u32, color: u32) {
+    if start >= end {
+        return;
+    }
+    let new = ByteSpanGpu { start, end, color };
+    let mut out = Vec::with_capacity(spans.len() + 2);
+    let mut inserted = color == 0;
+    for s in spans.iter() {
+        if s.end <= start {
+            out.push(*s);
+            continue;
+        }
+        if s.start >= end {
+            if !inserted {
+                out.push(new);
+                inserted = true;
+            }
+            out.push(*s);
+            continue;
+        }
+        // An overlap: the parts outside the range survive around the new span.
+        if s.start < start {
+            out.push(ByteSpanGpu { start: s.start, end: start, color: s.color });
+        }
+        if !inserted {
+            out.push(new);
+            inserted = true;
+        }
+        if s.end > end {
+            out.push(ByteSpanGpu { start: end, end: s.end, color: s.color });
+        }
+    }
+    if !inserted {
+        out.push(new);
+    }
+    *spans = out;
+}
+
+// ── per-glyph overrides ─────────────────────────────────────────────────────
+
+/// The override table's host side: each item's overrides (sorted by byte;
+/// the copy every edit is made on, then uploaded whole — a verb touches one
+/// glyph, so a run is small) and its run `(base, capacity)` in the device
+/// table, plus the free tail. Allocation is the span table's: nothing at
+/// load, a run with slack at the first edit, a fresh run at the tail when
+/// the slack is used up (the old run becomes a hole; nothing compacts),
+/// refusal when the tail is full.
+#[derive(Clone, Debug)]
+pub struct OverrideAlloc {
+    pub items: Vec<Vec<GlyphOverrideGpu>>,
+    pub runs: Vec<(u32, u32)>,
+    pub next_free: u32,
+    pub capacity: u32,
+}
+
+/// What an edit did to the device table, for the uploader.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OverrideEdit {
+    /// The host copy did not change (clearing an absent override).
+    Unchanged,
+    /// Rewrite the item's run from `from` (an index into the item's list) on,
+    /// at its existing base; the row's count moved.
+    InPlace { from: usize },
+    /// The item moved to a fresh run at `base`; rewrite it whole.
+    Remapped { base: u32 },
+    /// The tail is full: refused, the host copy left as it was.
+    Refused,
+}
+
+impl OverrideAlloc {
+    pub fn new(items: usize) -> Self {
+        let capacity = OVERRIDE_TABLE_MIN.max(items as u32 * 4) + 1024;
+        Self { items: vec![Vec::new(); items], runs: vec![(0, 0); items], next_free: 0, capacity }
+    }
+
+    /// Set, replace or (a no-op record) remove the override of `byte` in
+    /// `item`, keeping the list sorted; says how to mirror it on the device.
+    pub fn edit(&mut self, item: usize, rec: GlyphOverrideGpu) -> OverrideEdit {
+        let list = &mut self.items[item];
+        let (_, cap) = self.runs[item];
+        let at = list.binary_search_by_key(&rec.byte, |r| r.byte);
+        if rec.is_noop() {
+            return match at {
+                Ok(p) => {
+                    list.remove(p);
+                    OverrideEdit::InPlace { from: p }
+                }
+                Err(_) => OverrideEdit::Unchanged,
+            };
+        }
+        let n_after = list.len() as u32 + u32::from(at.is_err());
+        if n_after > cap {
+            let need = n_after + span_slack(n_after);
+            if self.next_free + need > self.capacity {
+                return OverrideEdit::Refused;
+            }
+            let b = self.next_free;
+            self.next_free += need;
+            self.runs[item] = (b, need);
+            match at {
+                Ok(p) => list[p] = rec,
+                Err(p) => list.insert(p, rec),
+            }
+            return OverrideEdit::Remapped { base: b };
+        }
+        match at {
+            Ok(p) => {
+                list[p] = rec;
+                OverrideEdit::InPlace { from: p }
+            }
+            Err(p) => {
+                list.insert(p, rec);
+                OverrideEdit::InPlace { from: p }
+            }
+        }
+    }
+}
+
+/// The device record of a [`GlyphOverride`] given its group's index in the
+/// Derived override table (0 when the group is the item's own, or when the
+/// table is full and the group part is dropped).
+pub fn override_gpu(ov: &GlyphOverride, group_index: u32) -> GlyphOverrideGpu {
+    debug_assert!(ov.group != NO_GROUP || group_index == 0, "NO_GROUP carries no index");
+    GlyphOverrideGpu { byte: ov.byte, color: ov.color, x_nudge: ov.x_nudge, group_index }
 }
 
 // ── frame math ──────────────────────────────────────────────────────────────
@@ -684,6 +894,99 @@ mod tests {
     #[should_panic(expected = "before the previous end")]
     fn overlapping_spans_are_refused() {
         check_spans(0, &[ByteSpanGpu { start: 0, end: 5, color: 0 }, ByteSpanGpu { start: 4, end: 9, color: 0 }], 10);
+    }
+
+    fn sp(start: u32, end: u32, color: u32) -> ByteSpanGpu {
+        ByteSpanGpu { start, end, color }
+    }
+
+    /// Every merge result is checked as a valid run too (sorted, disjoint,
+    /// non-empty): the device refuses anything else.
+    fn merged(base: &[ByteSpanGpu], start: u32, end: u32, color: u32) -> Vec<ByteSpanGpu> {
+        let mut v = base.to_vec();
+        merge_span_range(&mut v, start, end, color);
+        check_spans(0, &v, 1000);
+        v
+    }
+
+    #[test]
+    fn merge_span_range_replaces_what_it_overlaps_and_clips_the_rest() {
+        let base = [sp(10, 20, 1), sp(30, 40, 2), sp(50, 60, 3)];
+        // Inside one span: the span splits around the new one.
+        assert_eq!(merged(&base, 12, 15, 9), [sp(10, 12, 1), sp(12, 15, 9), sp(15, 20, 1), sp(30, 40, 2), sp(50, 60, 3)]);
+        // Straddling a span's end into the gap.
+        assert_eq!(merged(&base, 15, 25, 9), [sp(10, 15, 1), sp(15, 25, 9), sp(30, 40, 2), sp(50, 60, 3)]);
+        // Straddling a span's start from the gap.
+        assert_eq!(merged(&base, 25, 35, 9), [sp(10, 20, 1), sp(25, 35, 9), sp(35, 40, 2), sp(50, 60, 3)]);
+        // Covering a whole span and parts of its neighbours.
+        assert_eq!(merged(&base, 15, 55, 9), [sp(10, 15, 1), sp(15, 55, 9), sp(55, 60, 3)]);
+        // Covering everything.
+        assert_eq!(merged(&base, 0, 100, 9), [sp(0, 100, 9)]);
+        // Exactly one span: replaced, neighbours untouched.
+        assert_eq!(merged(&base, 30, 40, 9), [sp(10, 20, 1), sp(30, 40, 9), sp(50, 60, 3)]);
+        // Adjacent (touching, not overlapping) on both sides: nothing clipped,
+        // nothing coalesced.
+        assert_eq!(merged(&base, 20, 30, 9), [sp(10, 20, 1), sp(20, 30, 9), sp(30, 40, 2), sp(50, 60, 3)]);
+        assert_eq!(merged(&base, 20, 30, 1), [sp(10, 20, 1), sp(20, 30, 1), sp(30, 40, 2), sp(50, 60, 3)], "same colour stays two spans");
+        // In a gap, before everything, after everything, into an empty list.
+        assert_eq!(merged(&base, 22, 28, 9), [sp(10, 20, 1), sp(22, 28, 9), sp(30, 40, 2), sp(50, 60, 3)]);
+        assert_eq!(merged(&base, 0, 5, 9), [sp(0, 5, 9), sp(10, 20, 1), sp(30, 40, 2), sp(50, 60, 3)]);
+        assert_eq!(merged(&base, 70, 80, 9), [sp(10, 20, 1), sp(30, 40, 2), sp(50, 60, 3), sp(70, 80, 9)]);
+        assert_eq!(merged(&[], 3, 7, 9), [sp(3, 7, 9)]);
+        // An empty (or reversed) range is a no-op.
+        assert_eq!(merged(&base, 15, 15, 9), base);
+        assert_eq!(merged(&base, 15, 12, 9), base);
+        // Colour 0 clears: the range loses its spans, the edges are kept.
+        assert_eq!(merged(&base, 15, 35, 0), [sp(10, 15, 1), sp(35, 40, 2), sp(50, 60, 3)]);
+        assert_eq!(merged(&base, 0, 100, 0), []);
+        // Merging is idempotent and the last write wins.
+        let once = merged(&base, 15, 35, 9);
+        assert_eq!(merged(&once, 15, 35, 9), once);
+        assert_eq!(merged(&once, 15, 35, 7), [sp(10, 15, 1), sp(15, 35, 7), sp(35, 40, 2), sp(50, 60, 3)]);
+    }
+
+    fn ov(byte: u32, color: u32) -> GlyphOverrideGpu {
+        GlyphOverrideGpu { byte, color, x_nudge: 0.0, group_index: 0 }
+    }
+
+    #[test]
+    fn override_alloc_keeps_runs_sorted_remaps_when_full_and_refuses_at_the_tail() {
+        let mut a = OverrideAlloc::new(3);
+        assert_eq!(a.runs, [(0, 0); 3], "nothing is allocated at load");
+        // The first edit of an item remaps it to a fresh run with slack.
+        assert_eq!(a.edit(1, ov(40, 1)), OverrideEdit::Remapped { base: 0 });
+        assert_eq!(a.runs[1], (0, 1 + span_slack(1)));
+        // Inserts land sorted and say where the rewrite starts.
+        assert_eq!(a.edit(1, ov(10, 2)), OverrideEdit::InPlace { from: 0 });
+        assert_eq!(a.edit(1, ov(90, 3)), OverrideEdit::InPlace { from: 2 });
+        assert_eq!(a.edit(1, ov(40, 4)), OverrideEdit::InPlace { from: 1 }, "a replace rewrites from the record");
+        assert_eq!(a.items[1], [ov(10, 2), ov(40, 4), ov(90, 3)]);
+        // A no-op record clears; clearing an absent byte changes nothing.
+        assert_eq!(a.edit(1, ov(40, 0)), OverrideEdit::InPlace { from: 1 });
+        assert_eq!(a.items[1], [ov(10, 2), ov(90, 3)]);
+        assert_eq!(a.edit(1, ov(41, 0)), OverrideEdit::Unchanged);
+        assert_eq!(a.edit(2, ov(5, 0)), OverrideEdit::Unchanged, "an item with no run stays without one");
+        assert_eq!(a.runs[2], (0, 0));
+        // Fill item 1's slack: the next insert remaps to the tail.
+        let (base, cap) = a.runs[1];
+        for b in 0..cap - 2 {
+            assert!(matches!(a.edit(1, ov(100 + b, 1)), OverrideEdit::InPlace { .. }));
+        }
+        assert_eq!(a.items[1].len() as u32, cap);
+        let next = a.next_free;
+        assert_eq!(a.edit(1, ov(1000, 1)), OverrideEdit::Remapped { base: next });
+        assert_ne!(a.runs[1].0, base, "the old run is a hole");
+        assert_eq!(a.items[1].len() as u32, cap + 1);
+        // The tail runs out: refused, the host copy untouched.
+        a.capacity = a.next_free;
+        let before = a.items[0].clone();
+        assert_eq!(a.edit(0, ov(1, 1)), OverrideEdit::Refused);
+        assert_eq!(a.items[0], before);
+        // The device record of a host override.
+        let g = override_gpu(&GlyphOverride { item: 0, byte: 7, color: 0xFF112233, x_nudge: 0.25, group: 9 }, 3);
+        assert_eq!(g, GlyphOverrideGpu { byte: 7, color: 0xFF112233, x_nudge: 0.25, group_index: 3 });
+        assert!(!g.is_noop());
+        assert!(override_gpu(&GlyphOverride { item: 0, byte: 7, color: 0, x_nudge: 0.0, group: NO_GROUP }, 0).is_noop());
     }
 
     /// The kernel's x against HyperLayout's two narrowings, over random fold
