@@ -232,7 +232,7 @@ impl From<&ItemParams> for glyph_field::ItemParamsGpu {
             scroll_rows: p.scroll_rows,
             has_page: if p.has_page { 1 } else { 0 },
             line_height_lo,
-            _pad1: 0,
+            group: 0,
             _pad2: 0,
         }
     }

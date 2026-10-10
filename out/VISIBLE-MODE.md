@@ -56,3 +56,33 @@ lines (34.9 B/line), 90,234,603 glyphs — the renderer's own instance count —
 `--load-repo` of the same tree (`repo: … engine records -> N glyph instances`).
 
 Not visible yet: nothing draws from the table until M2.
+
+## Between M1 and M2 — two Derived-mode fixes the visible mode inherits (2026-10-10)
+
+The visible mode draws through the Derived shader, so two latent defects in
+its vertex stage were fixed first, each with the witness it lacked:
+
+- **The column page** (`fix(derived): the vertex stage carries the column page`):
+  z dropped `fold::paginate`'s `x_page × depth_per_col`. The slot's row lane
+  is now `row:24 | x_page:8` (`crates/glyph-field-derived/src/derive.rs`) and
+  the shader adds the term. Witness:
+  `cargo test --release -p glyph3d-native derived_vertex_stage` — a Rust
+  transcription of `derive_yz` held to the Instanced emitter's y/z over the
+  pagination grid (4,048 slots, 1,064 on a later column page, max error
+  2.4e-7); mutation `derived-column-page-term-dropped`.
+- **The item/group lane** (`fix(derived): the group lane keeps the item`):
+  one word was read as both item and group, so a group verb
+  (`set-glyph-background`, `set-glyph-transform`) made the vertex stage derive
+  Y/Z from another item. The lane is now `item:20 | override:12`; the group is
+  the item's own (`ItemParamsGpu::group`) unless an override index names a
+  row in a resident table (binding 10). `GlyphField::write_group_id` takes
+  the item. Witness: `cargo test --release -p glyph-field-derived`
+  (`group_lane_resolves_to_the_item_or_its_override`, the shader-text pins);
+  mutation `derived-override-lane-unshifted`.
+
+To see the second one in the app (windowed, any repo, `--field-mode derived`):
+pick a glyph and run `set-glyph-background` or `set-glyph-transform` from the
+verb panel — before the fix the glyph jumped to another file's rows (or
+vanished, out of the item table); now it stays put and takes the new group.
+Neither fix moves a golden pixel: no golden view is column-paged and every
+load-time lane is the same word as before.
