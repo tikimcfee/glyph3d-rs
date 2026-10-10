@@ -994,7 +994,14 @@ impl RepoLoad {
             }
         }
         let gpu_item_params: Vec<glyph_field::ItemParamsGpu> =
-            pick_files.iter().map(|f| glyph_field::ItemParamsGpu::from(&f.item)).collect();
+            pick_files
+                .iter()
+                .map(|f| {
+                    let mut p = glyph_field::ItemParamsGpu::from(&f.item);
+                    p.group = f.group_id;
+                    p
+                })
+                .collect();
         StagedText {
             glyphs_emitted: self.arena.len(),
             codepoints_decoded: self.stats.records,
