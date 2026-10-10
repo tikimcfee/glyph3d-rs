@@ -1,127 +1,108 @@
 # glyph3d-native
 
-A high-performance pure-Rust (Rust + wgpu) implementation of the glyph3d code-visualization
-renderer: it lays out source code as fields of GPU glyphs — a single file, a stress demo, or an
-entire repository rendered as a navigable grid of code pages — and draws them with a Slug-style
-analytic-coverage renderer.
+A renderer that lays source code out as text in 3D and draws it on the GPU:
+a single file, an agent transcript, or an entire repository as a field of
+files you fly through. Glyphs are drawn with Slug-style analytic coverage
+(resolution-independent curves, no glyph textures), in pure Rust on wgpu.
 
-The engine features **sub-200ms repo load and visual initialization** (~168ms layout / ~177ms total visual init
-in flat mode, ~215ms layout / ~226ms visual init in syntax mode for 95.2 million glyph instances across 1,306 files
-on Apple Silicon Metal) via parallel cache-blocked CPU layout (`HyperLayout`), intra-file chunking, background
-pipelined prepass, burst slot emission, and direct unified-memory arena mapping.
+What it is built for is SCALE with exactness. A repository of tens of
+thousands of files and on the order of a hundred million glyphs loads in
+seconds, and
+in the visible field mode the GPU lays out only the lines on screen each
+frame, so the per-frame cost follows what you can see, not the size of the
+repo. Underneath, the layout engine is held bit-for-bit to an independent
+reference, and every offscreen frame is byte-deterministic, so every change
+is checked by execution rather than argument.
 
-The defining property of this tree is **bit-exactness**: the pure-Rust layout engine reproduces
-canonical layouts bit-for-bit, the Rust renderer's offscreen output is byte-deterministic,
-and a comprehensive gate suite proves both on every commit. Refactors are output-neutral by contract,
-verified by gates and golden SHA-256 screenshot hashes rather than by argument.
-
-Platform: macOS on Apple Silicon (`osx-arm64`; Metal) and Linux x86_64 (`linux-64`; Vulkan).
-
-## Architecture
-
-```
-            schema/glyph-identity.json          (vendored, hash-pinned)
-                      │ tools/gen_schema.py
-                      ▼
- assets/atlas/*.bin
-        │
-        ▼
- ┌─────────────────────────────────────────────────────────────┐
- │ native/src/layout_hyper.rs  — High-performance Rust layout  │
- │ • CPU-parallel fold & survivors via Rayon cache-blocked scan│
- │ • Intra-file chunking & wrap-aware segmentation for minified│
- │ • Zero-copy direct write into mapped Metal shared memory    │
- │ • ByteSpan semantic token painting for AST / LSP integration│
- └──────────────────────────────┬──────────────────────────────┘
-                                │ writes RenderSlot [32B] or DerivedSlot [20B]
-                                ▼
- ┌─────────────────────────────────────────────────────────────┐
- │ native/src/glyph_scene/     — Slug WGSL Renderer            │
- │ • crates/glyph-field*: GlyphField trait + one crate per mode│
- │   - Instanced: 32B RenderSlot upload, glyph pipeline, WGSL  │
- │   - Derived: 20B DerivedSlot upload, GPU vertex-stage Y/Z   │
- │   - Visible (exp): no slots; lines in view laid out per frame│
- │ • pipelines.rs: composite & selection tint pipelines        │
- │ • render.rs: Frustum/LOD CPU culling, multi-pass rendering  │
- └─────────────────────────────────────────────────────────────┘
-```
-
-- **`native/src/layout_hyper.rs`** (Rust): Cache-blocked parallel CPU layout engine. Computes line wrapping,
-  indentation, blank/missing glyph filtering, and coordinates in CPU cache, writing 32-byte `RenderSlot`
-  or 20-byte `DerivedSlot` instances directly into mapped GPU shared memory.
-- **`native/src/glyph_scene/`** (Rust, wgpu 30 / winit 0.30 / glam 0.33 / egui 0.36):
-  Decomposed into modular submodules:
-  - `setup.rs`: scene construction; builds the glyph field for the chosen `--field-mode` (`instanced`,
-    `derived`, or the experimental `visible`, which keeps no slot per glyph and lays out the lines in
-    view per frame on the GPU — `out/VISIBLE-MODE.md`).
-  - `pipelines.rs`: composite state and the selection tint pipeline.
-  - `render.rs`: Frame render pass orchestration, two-level CPU frustum/LOD culling, backdrop quad pass,
-    glyph field pass, and fullscreen composite pass.
-- **`native/src/layout/span.rs`**: ByteSpan token painting for AST/LSP integration (`Paint::ByteSpans`),
-  enabling high-performance byte-range syntax colorization without string copies.
-- **`assets/atlas/`**: Prebaked glyph geometry (curves, glyph map, font table, codepoint trie)
-  exported verbatim from the Slug atlas. Byte format: `assets/atlas/FORMAT.md`.
-- **`build.toml`**: Declarative gate, artifact, and mutation verification graph, executed by `glyph`.
+Platforms: macOS on Apple Silicon (Metal) and Linux x86_64 (Vulkan).
 
 ## Quickstart
 
-Requirements: macOS/Apple Silicon or Linux x86_64, a recent Rust toolchain (MSRV 1.95).
+Requirements: a recent Rust toolchain (MSRV 1.95); macOS/Apple Silicon or
+Linux x86_64 with a Vulkan driver.
 
 ```sh
-# Build and run the native binary
-cargo build --release -p glyph3d-native
-cargo run --release -p glyph3d-native
-
+cargo glyph run                     # build if stale, then open the launcher
+cargo glyph run --load-repo <dir>   # straight to a repo (any renderer flag works)
 ```
 
-### Running the Renderer
+The launcher is a terminal menu: pick a scene (repo, file, agent session,
+demo) and its options, press Enter, and the window opens; close it and you
+are back in the menu. What you change there is saved to your
+`launch_config.toml` (gitignored; `launch_config.example.toml` documents
+every key), and repos you launch join its presets.
 
-Binary is `target/release/glyph3d-native` (or `cargo run --release -p glyph3d-native -- [ARGS]`).
+`cargo glyph` is a repo-scoped cargo alias (`.cargo/config.toml`) for the
+project's build tool. Outside the repo, run the binary directly:
+`<repo>/target/release/glyph3d-native --load-repo .`
 
-| What | Command |
+### In the window
+
+| Key | Does |
 |---|---|
-| Windowed text field (default: this crate's own `main.rs`) | `cargo run --release -p glyph3d-native` |
-| 1M-quad stress demo | `cargo run --release -p glyph3d-native -- --demo` |
-| Render a specific file | `cargo run --release -p glyph3d-native -- --render-file <path>` |
-| A whole repo as a glyph field (default: `HyperLayout`) | `cargo run --release -p glyph3d-native -- --load-repo <dir> [--focus-file <substr>]` |
-| Deterministic offscreen render → PNG | `cargo run --release -p glyph3d-native -- --load-repo <dir> --screenshot out/shot.png` |
+| WASD, E/R up, Q/F down, right-drag | fly; scroll changes speed |
+| left click | pick a glyph |
+| G | grab the picked file (mouse drags, scroll scales; G again releases) |
+| C | grab the picked file's whole carrel (directory group); C again releases |
+| h / t / x | highlight the line / tint the file / hide the file |
+| B | toggle the ground environment |
+| F1 | Debug panel: field mode, "Text detail" / "Show glyphs" LOD sliders, wrap spacing, "copy pose" |
+| F2 | screenshot to `out/windowed-shot-*.png` (`GLYPH_POSE_PRINT=1` also prints its camera pose) |
+| F7 | agent session browser |
+| F8 | field HUD: mode, tiers, culling and GPU timings |
 
-Windowed controls: WASD/E/R/Q/F fly camera, right-drag look, left-click pick,
-`h/g/t/x` edit verbs, F1 toggles the egui debug panel, F2 saves a screenshot
-to `out/windowed-shot-<utc-stamp>.png`.
+### What a repo load reads
+
+The walker takes files whose extension is on a source list (about 60: Rust,
+JS/TS, Python, Go, C/C++, Markdown, JSON, TOML, WGSL, shell, ...; see
+`SOURCE_EXTENSIONS` in `native/src/repo/walk.rs`). It skips directories by
+NAME (`.git`, `node_modules`, `target`, `build`, `dist`, `out`, `tmp`, and a
+few more; `.gitignore` is not read), files over 10 MiB, and files that are
+not UTF-8. So extensionless files (`Makefile`, `Dockerfile`) and unlisted
+types (`.S`, `.proto`, `.ini`) are not shown. The load summary prints the
+file count and the size and encoding skips.
+
+## Field modes
+
+How the glyphs live on the GPU, chosen with `--field-mode` (or the launcher,
+or live from the Debug panel):
+
+| Mode | Per glyph | What it means |
+|---|---|---|
+| `instanced` (default) | 32 B record | every glyph's full placement, read as-is |
+| `derived` | 20 B record | compact; the vertex stage derives Y/Z from per-file tables |
+| `visible` | nothing | the source bytes and a line table stay resident; each frame the GPU culls to the lines in view and lays out only those. Lines too small for glyphs become one-quad washes, files too small for washes become rectangles |
+
+All three render the same pixels on every golden view, with one difference
+by design: visible mode applies no load-time syntax colouring (colour is
+meant to arrive as byte spans from AST/LSP analysis; `--highlight` takes a
+sidecar of such spans today). Text, agent-session and demo scenes use the
+stored modes. Every glyph stays individually editable in every mode
+(recolour, background, transform), keyed by slot in the stored modes and by
+(file, byte) in visible mode. The design log is `out/VISIBLE-MODE.md`.
 
 ## Verification
 
-The test and validation battery:
-
 ```sh
-# 1. Run all unit and integration tests (222 tests across 13 binaries)
-cargo test --workspace
-
-# 2. Validate build.toml gates and mutation blocks
-cargo run -p glyph -- validate
-
-# 3. Verify pixel-exact golden rendering on flagship corpus
-cargo run --release -p glyph3d-native -- --load-repo /path/to/glyph3d-js --screenshot /tmp/test.png
-shasum -a 256 /tmp/test.png
-# Expected: 7957dc62b473e64c5e35c9184811554b101d0bf3e40b3b7cdc7f95dab988c6d5
-
-# 4. Amortized multi-run performance benchmarking
-python3 tools/bench_hyper.py --repo /path/to/glyph3d-js -n 5 --color-mode flat
+cargo glyph test            # every gate; nonzero if anything is wrong
+cargo glyph test rust       # iterate: rust | render | corpus
+cargo glyph gates           # what each gate compares, and what it cannot see
+cargo glyph prove           # mutate the code; each check must go red for its reason
 ```
 
-## Repo Map
+The gates hold the production layout engine (HyperLayout) bit-for-bit to an
+oracle-backed reference fold, ported from and checked against a recorded
+corpus of the original JavaScript implementation; byte-compare golden
+frames per GPU vendor (one set per rasterizer: `metal-apple`,
+`vulkan-nvidia`); and refuse any compiler, clippy or rustdoc warning. Golden
+images are never regenerated by the tool; re-baselining is a human decision.
+Root `AGENTS.md` is the full account, blind spots included.
 
-| Path | What it is |
-|---|---|
-| `native/` | The pure-Rust renderer and layout engine binary. Contracts in `native/src/*.rs` |
-| `native/src/layout_hyper.rs` | HyperLayout: parallel CPU layout engine into mapped unified memory |
-| `native/src/glyph_scene/` | Modularized Slug WGSL renderer: `setup.rs`, `pipelines.rs`, `render.rs` |
-| `crates/glyph-field*` | The glyph field by render mode: mode-neutral contract (`glyph-field`), Instanced 32B mode (`glyph-field-instanced`), and Derived 20B mode (`glyph-field-derived`) |
-| `glyph/` | The verification and mutation runner (`cargo run -p glyph -- validate`) |
-| `tools/` | Verification scripts, generators, and `bench_hyper.py` performance harness |
-| `.agents/` | Agent guidelines, house rules (`rules/rust-engineering.md`), and testing skill (`skills/glyph-engine-testing/SKILL.md`) |
-| `assets/atlas/` | Prebaked glyph-geometry binaries + `FORMAT.md` |
-| `schema/` | `glyph-identity.json` — single source of truth for buffer/lane layouts |
-| `research/` | GPU architecture studies, web target notes, and `desktop-platform-audit.md` |
-| `out/` | Golden baselines (`tooling-ab/baseline/`), proof PNGs, and historical stage reports |
+## Where to read next
+
+- `AGENTS.md`: the repo map, what every check does and cannot see, what is
+  fenced (generated, vendored, immutable), and the vocabulary.
+- `native/AGENTS.md`: the renderer crate's rules, module contracts, platform
+  notes, and every debug environment variable.
+- `out/VISIBLE-MODE.md`: the visible field mode, milestone by milestone.
+- `out/`: dated reports and design records (history, not current state).
