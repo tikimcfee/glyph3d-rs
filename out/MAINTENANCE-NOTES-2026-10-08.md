@@ -162,6 +162,12 @@ available to it (helpers in `target/scratch/helper-tools/rx/`, untracked).
 If a session ends with it mid-milestone: check its worktree for uncommitted
 files (by mtime; the worktree guard blocks `git -C`), then resume it with
 SendMessage and a state summary.
+**2026-10-10:** that delegate's context ran out mid-M3 (it handed back at
+`041d38d` with 28 uncommitted files: crate and oracle work verified, the
+renderer group unbuilt). A FRESH Fable agent was launched to finish M3 in the
+same worktree from that handback; it reports commits, battery, mutations and
+the M2 verdict. Ivan's LOD answer is relayed to it (px/em thresholds
+confirmed); C26 waits until it is idle.
 
 **Queued:**
 - **C26** (LOD panel: separate "Text detail" from "Show glyphs") — hand to
