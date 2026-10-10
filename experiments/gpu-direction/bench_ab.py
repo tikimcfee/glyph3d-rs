@@ -70,8 +70,8 @@ def run_once(bin_path, repo, args):
 
 
 def loadavg():
-    with open("/proc/loadavg") as f:
-        return f.read().split()[:3]
+    # os.getloadavg works on Linux and macOS alike (no /proc on the latter).
+    return [f"{v:.2f}" for v in os.getloadavg()]
 
 
 def main():
