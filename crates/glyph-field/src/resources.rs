@@ -39,6 +39,26 @@ pub struct FieldResources<'a> {
     pub item_params: &'a [ItemParamsGpu],
 }
 
+/// What a frame hands a self-culling field before its glyph pass
+/// ([`crate::GlyphField::prepare`]): the camera, the viewport, and the LOD
+/// policy — the projected row height (px) under which a line is washed
+/// instead of laid out, and under which an item is a backdrop; `greek_mode`
+/// as the Params uniform carries it (0 off, 1 fade, 2 hard); `debug_tint`
+/// 0 off, 1 colour by LOD tier, 2 colour by cull state.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct FramePrepare {
+    pub view_proj: [[f32; 4]; 4],
+    pub eye: [f32; 3],
+    pub viewport: [f32; 2],
+    /// Pixels per world unit at distance 1 (the scene's `px_scale`).
+    pub px_scale: f32,
+    pub lod_glyph_px: f32,
+    pub lod_backdrop_px: f32,
+    pub greek_mode: u32,
+    pub debug_tint: u32,
+    pub time: f32,
+}
+
 /// The targets the field's main pipeline renders into.
 #[derive(Clone, Copy, Debug)]
 pub struct FieldTargets {

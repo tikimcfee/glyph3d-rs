@@ -207,6 +207,7 @@ impl GlyphScene {
             GlyphFieldMode::Derived => {
                 Box::new(DerivedField::new(device, &ctx.queue, source, &resources, targets))
             }
+            GlyphFieldMode::Visible => todo!("M2: the Visible field is built from the line table, not from slots"),
         };
         let field_dur = t_scene_start.elapsed();
         let t_pipe_start = std::time::Instant::now();
