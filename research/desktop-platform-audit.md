@@ -1,5 +1,12 @@
 # Apple Silicon vs. Desktop x86_64 & Discrete GPU Platform Audit
 
+> **Background survey (2026-10).** The current platform facts live in
+> `native/AGENTS.md` § "Apple Silicon vs. Desktop". Superseded here: the
+> discrete staging description (the default is C22 windowed emission; the
+> single mapped buffer and host staging are the `GLYPH_STAGING` fallbacks),
+> the CubeCL sections (retired 2026-10-09), and `vulkan-amd` (no such golden
+> set exists).
+
 ## Overview
 
 This document serves as an architectural bridge for agents and engineers transitioning from the Apple Silicon development baseline (Apple M2, Metal, unified memory) to high-performance desktop architectures (x86_64, AMD Zen / Intel Core, Vulkan / DirectX 12, discrete GPUs with dedicated VRAM).

@@ -1,5 +1,11 @@
 # Zed-integration notes — the session log
 
+> **History (2026-10-10).** A record of the Zed-integration spikes; branch
+> names, the floor and tool details in it are from their date (the
+> `cargo glyph` alias it calls broken was fixed, `strip_doubled_alias`;
+> the Mojo engine and its rpaths are retired). The spikes' code lives in
+> `experiments/`, outside every gate.
+
 Companion to `seam.md` (the frozen contract): this file is the running
 record of what landed, what was measured, what bit, and what's queued.
 Newest rungs at the bottom; every claim cites the commit that landed it.

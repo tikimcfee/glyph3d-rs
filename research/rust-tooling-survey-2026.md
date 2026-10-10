@@ -1,4 +1,8 @@
 # Rust Developer Tooling Survey — Late 2025 / 2026
+
+> **Background survey, not policy.** What the repo actually uses and requires
+> is in `.agents/rules/rust-engineering.md` and root `AGENTS.md` (there is,
+> for instance, no tracy integration).
 ## For a native rendering engine codebase (wgpu / wgpu-native style, Rust, wasm32/web targets)
 
 Version dates below were verified against crates.io API and GitHub release pages (checked 2026).
