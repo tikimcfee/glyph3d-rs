@@ -243,6 +243,14 @@ impl GlyphScene {
     pub(super) fn visible_item_of(&self, gid: u32) -> Option<u32> {
         self.field.visible()?;
         let pctx = self.pick.as_ref()?;
+        // A repo load files item i under group i, so the direct probe answers
+        // every load group; the scan is for anything else. Measured
+        // 2026-10-10: the scan alone, once per moved group, was 217 ms of a
+        // library frame animating 29,377 files (O(N²)); the probe makes it
+        // vanish from the profile.
+        if pctx.files.get(gid as usize).is_some_and(|f| f.group_id == gid) {
+            return Some(gid);
+        }
         pctx.files.iter().position(|f| f.group_id == gid).map(|i| i as u32)
     }
 
