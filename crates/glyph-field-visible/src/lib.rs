@@ -175,6 +175,25 @@ pub struct VisibleInputs<'a> {
     pub default_color: u32,
 }
 
+/// A per-glyph edit keyed by (item, byte) — what the slot verbs become when
+/// slots are transient (M3). Applied by the layout kernel to the glyph whose
+/// leader byte is `byte`: `color` replaces the span colour when non-zero,
+/// `x_nudge` is added to x (the Derived slot carries no y/z nudge, as in
+/// Derived mode), and `group` (not [`NO_GROUP`]) becomes the slot's group via
+/// the Derived override lane. One override per (item, byte); setting it
+/// again replaces it, clearing removes it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct GlyphOverride {
+    pub item: u32,
+    pub byte: u32,
+    pub color: u32,
+    pub x_nudge: f32,
+    pub group: u32,
+}
+
+/// `GlyphOverride::group` for "the item's own group".
+pub const NO_GROUP: u32 = u32::MAX;
+
 /// Sizing of the transient buffers.
 #[derive(Clone, Copy, Debug)]
 pub struct VisibleLimits {
@@ -278,6 +297,48 @@ impl VisibleField {
     /// update).
     pub fn set_item_bbox(&self, queue: &wgpu::Queue, item: u32, bbox_min: [f32; 3], bbox_max: [f32; 3]) {
         self.resident.set_item_bbox(queue, item, bbox_min, bbox_max);
+    }
+
+    // ── M3: edits and selection keyed by (item, byte) ─────────────────
+
+    /// Set (or replace) the override of one glyph.
+    pub fn set_glyph_override(&self, _queue: &wgpu::Queue, _ov: GlyphOverride) {
+        todo!("M3: set_glyph_override")
+    }
+
+    /// Remove one glyph's override, if any.
+    pub fn clear_glyph_override(&self, _queue: &wgpu::Queue, _item: u32, _byte: u32) {
+        todo!("M3: clear_glyph_override")
+    }
+
+    /// Colour the byte range `[start, end)` of an item: the new span replaces
+    /// whatever spans overlapped it (clipping them at its edges), the rest
+    /// stay. A line recolour or a highlight run is this.
+    pub fn set_item_span_range(&self, _queue: &wgpu::Queue, _item: u32, _start: u32, _end: u32, _color: u32) {
+        todo!("M3: set_item_span_range")
+    }
+
+    /// Prepare the selection mask for the glyphs of item `item` whose leader
+    /// byte lies in `[start, end)`: the layout kernel again, over only the
+    /// visible segments that intersect the range, into a second transient
+    /// buffer (the selection is drawn with the mask pipeline the scene
+    /// creates, no depth, no blend). Call after `prepare` in the same encoder.
+    pub fn prepare_mask(&self, _queue: &wgpu::Queue, _encoder: &mut wgpu::CommandEncoder, _item: u32, _start: u32, _end: u32) {
+        todo!("M3: prepare_mask")
+    }
+
+    /// Record the mask draw of what `prepare_mask` emitted (an indirect draw
+    /// over the selection buffer); the caller set the mask pipeline.
+    pub fn record_mask_draw(&self, _pass: &mut wgpu::RenderPass<'_>) {
+        todo!("M3: record_mask_draw")
+    }
+
+    /// Where the glyph at (item, byte) landed in the LAST prepared frame's
+    /// transient buffer, if it was laid out: reads the segment list back
+    /// (blocking; diagnostics such as GLYPH_G_DUMP, never the frame path)
+    /// and counts survivors from the covering segment's start.
+    pub fn locate(&self, _queue: &wgpu::Queue, _item: u32, _byte: u32) -> Option<u32> {
+        todo!("M3: locate")
     }
 
     /// The last COMPLETED frame's counters (see [`VisibleStats`]); they lag
