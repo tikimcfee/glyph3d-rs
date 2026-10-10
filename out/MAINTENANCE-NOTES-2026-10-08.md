@@ -117,6 +117,7 @@ Pushed to origin/main through d3cf141 on 2026-10-09 (Ivan's call); later rows ar
 | ed4a570 | C21 prove 2x faster |
 | 32b3924 | merge of the visible-mode branch: M1 line table (+ Pass 1 kept separate per mode, A/B'd on both machines), Derived column-page and group-lane fixes |
 | 0c56d03 | visible mode M2 merged: `--field-mode visible` end to end, hyper-oracle sixth tier (kernel == Pass 2, both GPUs), lane-limit fallback; pixel-ab 20/20 on both machines |
+| 041d38d..15f7c79 | visible mode M3: overrides/spans/selection/verbs/picking by (item, byte), oracle span half, pixel witness; 314 tests |
 
 Main's build fix (872621d, the other agent's) was fast-forwarded in first.
 
@@ -168,6 +169,23 @@ renderer group unbuilt). A FRESH Fable agent was launched to finish M3 in the
 same worktree from that handback; it reports commits, battery, mutations and
 the M2 verdict. Ivan's LOD answer is relayed to it (px/em thresholds
 confirmed); C26 waits until it is idle.
+**M3 DONE and merged (2026-10-10):** the delegate's state was moved into THIS
+worktree (merge of its scaffold 041d38d + its 28 uncommitted files copied
+byte-exact), because the finishing agent inherited this session's isolation
+and could not commit elsewhere. It committed f408b75 (crate), b103517
+(oracle span half), e9a64f8 (renderer: selection, verbs, picking, dump by
+(item, byte)), 15f7c79 (docs). Verified: battery 15/15, 314 tests, on both
+machines; `--frozen` here on the committed tree; mutations
+visible-span-first-byte-uncoloured, visible-verb-keyed-off-by-one-byte and
+`--changed` (7/7) redden; the visible_verbs pixel witness matches Derived at
+0 px on both GPUs. Declared crate gaps (for M4 or a fix-up): a selection past
+mask_capacity is truncated silently; prepare_mask unguarded against a second
+call per frame; verb group rows never freed. The delegate's old worktree
+(.claude/worktrees/agent-a164e953c6cdd7fc6) is a STALE copy of committed work:
+safe to discard (Ivan's call; the worktree guard keeps sessions out of it).
+NEXT for visible mode: C26 (handed to the finishing agent), then M4 (visible as
+a golden equivalent: its recolour frame is already byte-identical to Derived's
+on both rasterizers).
 
 **Queued:**
 - **C26** (LOD panel: separate "Text detail" from "Show glyphs") — hand to
