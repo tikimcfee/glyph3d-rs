@@ -5,6 +5,8 @@
 //! device memory on unified Metal, a mapped staging buffer + one copy
 //! elsewhere. Neither path ever materializes the 48 B host record.
 
+use rayon::prelude::*;
+
 use crate::atlas::TrieTable;
 use crate::gpu::SharedDevice;
 use crate::layout::{DeviceSlotChunk, LayoutItem};
@@ -353,13 +355,18 @@ fn stage_host_memory<E: SlotEmit>(
                         .get_mapped_range_mut()
                         .expect("staging mapped range");
                     let dest_ptr = mapped.slice(..).as_raw_element_ptr().as_ptr();
-                    unsafe {
-                        std::ptr::copy_nonoverlapping(
-                            host_ptr.add(src_offset + written),
-                            dest_ptr,
-                            slice_len,
-                        );
-                    }
+                    // Parallel: one thread copied at ~15-19 GB/s, under the
+                    // box's copy bandwidth (C22). Same bytes, same places.
+                    let (src, dst) = unsafe {
+                        (
+                            std::slice::from_raw_parts(host_ptr.add(src_offset + written), slice_len),
+                            std::slice::from_raw_parts_mut(dest_ptr, slice_len),
+                        )
+                    };
+                    const PIECE: usize = 1 << 20;
+                    dst.par_chunks_mut(PIECE)
+                        .zip(src.par_chunks(PIECE))
+                        .for_each(|(d, s)| d.copy_from_slice(s));
                 }
                 staging_buf.unmap();
                 is_mapped = false;
