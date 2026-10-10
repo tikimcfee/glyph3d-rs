@@ -1,5 +1,11 @@
 # HANDOFF — the Zed-integration experiments tree
 
+> **History (2026-10-10).** A record of the Zed-integration spikes; branch
+> names, the floor and tool details in it are from their date (the
+> `cargo glyph` alias it calls broken was fixed, `strip_doubled_alias`;
+> the Mojo engine and its rpaths are retired). The spikes' code lives in
+> `experiments/`, outside every gate.
+
 Written 2026-09-27 for whoever picks this up next (agent or human). This
 doc describes WHAT THINGS ARE; history and per-commit narrative live in
 `notes.md`, the frozen contract in `seam.md`. Read order for a cold start:

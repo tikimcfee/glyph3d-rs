@@ -1,5 +1,11 @@
 # The Zed integration seam — contract, decisions, and ladder
 
+> **History (2026-10-10).** A record of the Zed-integration spikes; branch
+> names, the floor and tool details in it are from their date (the
+> `cargo glyph` alias it calls broken was fixed, `strip_doubled_alias`;
+> the Mojo engine and its rpaths are retired). The spikes' code lives in
+> `experiments/`, outside every gate.
+
 Status: P1 LANDED through the one-binary rung (2026-09-25). S1–S3 spikes
 (`fc6a197` chunks + HTML, `fd1731f` `--highlight`, `8bcb1d8` sidecar);
 P1a lib split (`1fd056b`), P1b seam types (`beca711`), P1c renderer consumer

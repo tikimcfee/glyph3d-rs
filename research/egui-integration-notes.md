@@ -1,5 +1,8 @@
 # egui Integration Prep Notes
 
+> **Background (2026-09-01).** The egui overlay shipped (stage K); this is the
+> prep research behind it.
+
 Date: 2026-09-01 · Vendored source: `integration/egui` (shallow clone, master @ `dadf573`, egui 0.36.1; removed 2026-10-10, upstream at that commit has it)
 Companion deep-dive: `out/history/integration/egui-integration-report.md` (330 lines, API-level detail, all names verified against the checked-out source)
 
