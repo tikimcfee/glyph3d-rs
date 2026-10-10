@@ -674,6 +674,12 @@ and the union is not:
   correctness, and the oblique-pick repro, are exercised by nothing in the battery
   — the atlas is only ever checked for being byte-identical to what it was, which
   says nothing about whether what it was is right.
+- **`--layout-mode library` renders in no golden view** (2026-10-10; a
+  probe, `native/src/library.rs`). Its arithmetic is held to the JS
+  scheme's numbers and its scene binding (group rows, page turns) by
+  `library::tests`; its pixels, the page faces and the animation path past
+  the group rows are seen by nothing. Candidate frames and the commands
+  that made them are in `out/LIBRARY-LAYOUT-FINDINGS-2026-10-10.md`.
 - **PROVENANCE.md's prose is generated but only partially validated.** The
   fixture count is READ FROM build.toml at generation time — the generator
   refuses to write an unverifiable number — but the rest of the prose is

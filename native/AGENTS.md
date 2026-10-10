@@ -243,6 +243,16 @@ its staging text predates C22). Key touchpoints:
   two frames behind. Run a pose for ~150 `--frames` and take the median of
   the settled frames (C30, 2026-10-10). The wait serializes frames: an
   instrument, never the frame path.
+- `GLYPH_LIBRARY_TIMING=1` — `--layout-mode library` (2026-10-10,
+  `native/src/library.rs`): one `LIBTIME` line per animated frame — nodes
+  moved, groups synced, the CPU stages (`ease_ms`, `propagate_ms` = bevy
+  transform propagation + scene-mesh re-extraction, `sync_ms`, `upload_ms`,
+  `seg_ms` = `sync_segment` per moved file) and the bytes queued (group rows,
+  Visible item boxes, page-face mesh instances). Animations run on the
+  offscreen 1/60 s clock (`SceneLike::animate`), so `--verb page-next
+  --frames 120` is a deterministic page turn. A settled library prints
+  nothing: it does no work. `out/LIBRARY-LAYOUT-FINDINGS-2026-10-10.md` has
+  the measured figures.
 - `GLYPH_G_DUMP=<slot>[,<len>]` — offscreen only: reads back instance bytes
   at `slot` from the glyph arena and prints hex (buffer write-path audits).
   `GLYPH_G_DUMP=<item>:<byte>[,<len>]` (M3, 2026-10-10) is the Visible
