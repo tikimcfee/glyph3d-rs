@@ -113,6 +113,12 @@ pub(super) struct WindowState {
     /// the HUD line after it. 0 = off/done; 1 = armed; 2.. = the step to run.
     #[cfg(feature = "egui-ui")]
     pub(super) visible_verb_selftest: u8,
+    /// Dev-only verification hook state (GLYPH_GRAB_SELFTEST=file[:dx:dy],
+    /// C29): the windowed GRAB path — `g` on a picked file, cursor drags
+    /// through `SceneLike::on_cursor`, `g` again — printing the HUD line
+    /// after each phase. 0 = off/done; 1 = armed; 2.. = the step to run.
+    #[cfg(feature = "egui-ui")]
+    pub(super) grab_selftest: u8,
 }
 
 /// The `--cam-pose` argument that reproduces a Fly pose: eye, then yaw and
@@ -543,6 +549,57 @@ impl WindowState {
                 _ => {}
             }
             self.visible_verb_selftest = if step >= 7 { 0 } else { step + 1 };
+        }
+        // Dev-only verification hook (GLYPH_GRAB_SELFTEST=file[:dx:dy], C29,
+        // 2026-10-10): the windowed GRAB path, through the SAME entry points
+        // the window uses — `apply_pick` on `file`, `on_cursor` to park the
+        // cursor at the centre, `on_key(G)` to grab, ten `on_cursor` steps
+        // along (dx, dy) px (default 0, 400: straight down), `on_key(G)` to
+        // release — one step every fourth frame from t≈3 s, the HUD line
+        // (items and lines per tier) printed after each, and the group's
+        // offset at the end (`move-group 0 0 0`). Meant for `--field-mode
+        // visible` with a `--cam-pose` that puts the drag where you want:
+        // an item still in view after the drag must stay counted visible.
+        #[cfg(feature = "egui-ui")]
+        if self.grab_selftest != 0 && self.time() > 3.0 && self.frames_total.is_multiple_of(4) {
+            let step = self.grab_selftest;
+            let hud = |state: &Self| state.ui_probe.as_ref().map(|p| hud_line(&p.borrow(), state.ui_fps)).unwrap_or_default();
+            let spec = std::env::var("GLYPH_GRAB_SELFTEST").unwrap_or_default();
+            let mut parts = spec.split(':');
+            let file = parts.next().filter(|f| *f != "1").unwrap_or("").to_string();
+            let dx: f32 = parts.next().and_then(|v| v.parse().ok()).unwrap_or(0.0);
+            let dy: f32 = parts.next().and_then(|v| v.parse().ok()).unwrap_or(400.0);
+            let (cx, cy) = (self.config.width as f32 * 0.5, self.config.height as f32 * 0.5);
+            const DRAG_STEPS: u8 = 10;
+            match step {
+                1 => {
+                    let cmd = crate::glyph_scene::PickCommand::RowCol { file, row: 0, col: 0 };
+                    let line = self.scene.apply_pick(ctx, &cmd).unwrap_or_else(|| "scene does not support picks".to_string());
+                    println!("GRAB-SELFTEST step 1 (pick {cmd:?}): {line}");
+                    // Park the cursor before grabbing: a drag's delta is
+                    // measured from wherever the cursor last was.
+                    self.scene.on_cursor(ctx, cx, cy);
+                }
+                2 => {
+                    self.scene.on_key(ctx, winit::keyboard::KeyCode::KeyG, true);
+                    println!("GRAB-SELFTEST step 2 (g, grabbed): hud {}", hud(self));
+                }
+                s if s < 3 + DRAG_STEPS => {
+                    let k = f32::from(s - 2) / f32::from(DRAG_STEPS);
+                    self.scene.on_cursor(ctx, cx + dx * k, cy + dy * k);
+                    println!("GRAB-SELFTEST step {s} (drag to {:+.0},{:+.0} px): hud {}", dx * k, dy * k, hud(self));
+                }
+                s if s == 3 + DRAG_STEPS => {
+                    self.scene.on_key(ctx, winit::keyboard::KeyCode::KeyG, true);
+                    let verb = crate::parse_verb("move-group 0 0 0").expect("selftest verb literal must parse like the CLI");
+                    let line = self.scene.apply_verb(ctx, &verb).unwrap_or_default();
+                    println!("GRAB-SELFTEST step {s} (g, released): {line}");
+                }
+                _ => {
+                    println!("GRAB-SELFTEST hud after release: {}", hud(self));
+                }
+            }
+            self.grab_selftest = if step >= 4 + DRAG_STEPS { 0 } else { step + 1 };
         }
         // wgpu 30: get_current_texture returns a status enum instead of Result.
         use wgpu::CurrentSurfaceTexture as Cst;

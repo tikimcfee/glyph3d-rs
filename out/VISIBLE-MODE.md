@@ -374,13 +374,12 @@ the cross-vendor noise the pixel gate's `drift` instrument names.
 `GLYPH_G_DUMP=0:35` printed the same transient slot 19 and the same five
 words, and the two modes' recolour frames were byte-identical there too.
 
-What this cannot see: `set_item_bbox` (a wrong box is a culling error,
-pixel-visible only when it culls the item — the HUD's items tier is the
-readout; the `move-group` reply is the trace), `set-glyph-transform`'s group
-lane beyond what the background quad shares with it, and `nudge-glyph` (x only;
-the reply is the trace — the override merge is unit-tested).
+What this cannot see: `set-glyph-transform`'s group lane beyond what the
+background quad shares with it, and `nudge-glyph` (x only; the reply is the
+trace — the override merge is unit-tested). `set_item_bbox` was on this list
+until C29 (below) gave it a witness.
 
-## C28 — the wash tier's extent (2026-10-10)
+## C28 and C29 — the wash tier's extent, and a moved file (2026-10-10)
 
 **C28, confirmed by run, fixed.** At the wash tier a back-wrapped line ran
 off to the right instead of receding: the wash was ONE flat quad at segment
@@ -416,3 +415,27 @@ target/release/glyph3d-native --load-repo native/fixtures/g-pick-repo --field-mo
 # with the column now instead of spreading to the right.
 target/release/glyph3d-native --load-repo native/fixtures/g-pick-repo --field-mode visible --debug-tint cull --cam-pose 30 -120 60 0 -12
 ```
+
+**C29, not reproduced on this tree; fenced.** The two hypotheses were run:
+(a) a moved item's box left stale — `move-group` on long.md into wide.txt's
+column (`--pick-file long.md --verb "move-group -12.7 -167.8 -20"`) at
+twelve poses around, above and inside the column renders byte-identical to
+derived mode (0 px), and the windowed grab (`GLYPH_GRAB_SELFTEST=long.md:0:700
+… --cam-pose 30 -60 300 0 0`) keeps the file counted visible through the
+whole drag (`items 5/5`; glyph lines 317 → 171 only as rows leave the view;
+offset (17.7, −101.9, 0) after), because `sync_segment` pushes the box on
+every step; (b) a compacted-index misuse — the cull's line bases and the
+draw's counts are the frame's own reservations and cannot name another
+item's line. What the screenshot shows that this tree cannot: the HUD at
+`items 1/5` with a long.md row drawn in plain glyph colour — measured
+(217, 202, 189), the column's (216, 201, 188), so the field's own draw, not
+the selection tint — while the draw count equals the frame's reservations;
+the screenshot predates M3's box push (e9a64f8) or caught the stats ring
+mid-lag. The fence: `a_moved_item_is_drawn_where_it_went`
+(`native/tests/visible_verbs.rs`) moves long.md clear out of its load box
+and holds the visible frame to the derived one at a pose where only the
+moved box is in view (≤ 8 px); mutation `visible-moved-item-box-stale`
+(the push removed) reddens it. If it recurs: F8's items tier against the
+picture, then `GLYPH_CULL_DEBUG=1` offscreen with the pose from "copy pose"
+and the same `move-group`.
+
