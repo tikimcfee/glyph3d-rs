@@ -13,6 +13,9 @@ use crate::{ByteSpanGpu, GlyphOverride, LineEntryGpu, TrieUpload, VisibleItem, N
 
 /// Workgroup size of every per-element kernel.
 pub const WORKGROUP: u32 = 64;
+/// Workgroup size of cull B's line kernels (`cull_lines`, `emit_lines`):
+/// one scan block of candidate lines (`visible_cull.wgsl`'s `LWG`, C30).
+pub const CULL_LINES_WORKGROUP: u32 = 256;
 /// wgpu's default `max_compute_workgroups_per_dimension`.
 pub const MAX_GROUPS_X: u32 = 65_535;
 /// Words of the counters buffer (`visible_cull.wgsl`'s `counters`).
@@ -49,7 +52,10 @@ pub const MASK_SLOTS_MAX: u32 = 1 << 20;
 /// 16 B, so this is 1 MiB; a load with many items gets four per item.
 pub const OVERRIDE_TABLE_MIN: u32 = 1 << 16;
 
-/// Counter slots, as the cull shader names them.
+/// Counter slots, as the cull shader names them. The tier and drop counts
+/// are sums (`atomicAdd`, the same in any order); `SEGMENTS`, `SLOTS` and
+/// `WASH` are the frame's reservations (the scan's totals, C30);
+/// `SEG_FIT_END` / `SLOT_FIT_END` the fitting lines' ends (`atomicMax`).
 pub mod counter {
     pub const ITEMS_VISIBLE: usize = 0;
     pub const ITEMS_BACKDROP: usize = 1;
@@ -692,7 +698,13 @@ pub fn frustum_planes(view_proj: &[[f32; 4]; 4]) -> [[f32; 4]; 6] {
 /// Workgroups for `count` elements at [`WORKGROUP`] per group: x capped at
 /// [`MAX_GROUPS_X`], y carrying the rest (the kernels' `linear_id`).
 pub fn plan_dispatch(count: u32) -> [u32; 3] {
-    let groups = count.div_ceil(WORKGROUP);
+    plan_dispatch_wg(count, WORKGROUP)
+}
+
+/// [`plan_dispatch`] at `wg` elements per group (the cull's 256-wide scan
+/// kernels: `visible_cull.wgsl`'s `block_of`).
+pub fn plan_dispatch_wg(count: u32, wg: u32) -> [u32; 3] {
+    let groups = count.div_ceil(wg);
     [groups.min(MAX_GROUPS_X), groups.div_ceil(MAX_GROUPS_X).max(1), 1]
 }
 

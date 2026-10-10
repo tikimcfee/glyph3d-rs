@@ -1,36 +1,57 @@
 // visible_cull.wgsl — the Visible field's per-frame cull, four dispatches in
 // one compute pass, nothing read back:
 //
-//   cull_items     one invocation per item: its world box (the scene's own
-//                  `SegCull` box, group offset applied) against the frustum,
-//                  the `hidden` bit, and the projected row height at the
-//                  box's nearest point — under `lod_backdrop_px` the item is
-//                  a BACKDROP (the scene draws its quad; nothing is laid
-//                  out), else it is appended to `visible` (atomic order).
-//   prefix_items   one workgroup: an exclusive scan of the visible items'
-//                  line counts gives each its candidate-line base, and the
-//                  total plans cull_lines' indirect dispatch.
-//   cull_lines     one invocation per candidate line, dispatched indirectly:
-//                  finds its item by binary search over the bases, builds the
-//                  line's world box (x over its widest fold unit, rows from
-//                  the table, depth segments and column pages from its leader
-//                  count by the fold rules, pages from `Pager`), tests it, and
-//                  sorts a visible line into the GLYPH tier (one segment entry
-//                  per cut, slots reserved for the whole line at once) or the
-//                  WASH tier (one BOX in its spans' mean colour: that same x
-//                  extent, its rows, its depth segments — C28, 2026-10-10;
-//                  before it the wash was a flat quad at segment 0's depth as
-//                  wide as the cull's 2x bound, and a back-wrapped line at
-//                  the wash tier ran off to the right instead of receding).
+//   cull_items     one invocation per item, 256 to a workgroup: its world
+//                  box (the scene's own `SegCull` box, group offset applied)
+//                  against the frustum, the `hidden` bit, and the projected
+//                  row height at the box's nearest point — under
+//                  `lod_backdrop_px` the item is a BACKDROP (the scene draws
+//                  its quad; nothing is laid out), else its `item_flag` is
+//                  set; its workgroup's sums (visible items, their lines) go
+//                  to `block_sums`.
+//   prefix_items   one workgroup: an exclusive scan of those block sums; the
+//                  totals plan cull B's indirect dispatch.
+//   compact_items  the same dispatch as cull_items: the visible items in
+//                  index order into `visible`, each with its candidate-line
+//                  base.
+//   cull_lines     one invocation per candidate line, dispatched indirectly,
+//                  256 to a workgroup: finds its item by binary search over
+//                  the bases, builds the line's world box (x over its widest
+//                  fold unit, rows from the table, depth segments and column
+//                  pages from its leader count by the fold rules, pages from
+//                  `Pager`), tests it, and sorts a visible line into the
+//                  GLYPH tier (one segment entry per cut, slots for the whole
+//                  line) or the WASH tier (one BOX in its spans' mean colour:
+//                  that same x extent, its rows, its depth segments — C28,
+//                  2026-10-10). It records the decision (`line_rec`) and its
+//                  workgroup's sums of the three counts a line reserves —
+//                  segments, slots, wash boxes — in `block_sums`.
+//   scan_blocks    one workgroup: an exclusive scan of the block sums.
+//   emit_lines     the same dispatch as cull_lines: each workgroup scans its
+//                  lines' counts again, adds its block's base, and writes the
+//                  segment entries and wash boxes at those offsets.
 //   finalize       one invocation: the layout dispatch and both draws'
 //                  indirect arguments from the counters.
 //
-// CAPS. Slots and segments are reserved by monotone atomics, so every line
-// that fits precedes every line that does not: `slot_fit_end` /
-// `seg_fit_end` (atomicMax of the fitting reservations) are contiguous,
-// fully written ranges, and the draw and the layout dispatch read those,
-// never the raw counters. A line dropped at the slot cap still writes its
-// reserved segment entries, EMPTY, so the segment range has no hole.
+// ORDER (C30, 2026-10-10). Every offset is a scan in (item index, line)
+// order, so the transient slots, segments and wash boxes come out in arena
+// order — the stored modes' draw order — and the same view lays out the same
+// bytes every frame. Until C30 they were reserved by `atomicAdd`, in
+// whatever order the GPU ran the invocations: the order changed frame to
+// frame, and where a line's back-stacked segments overlap another line's
+// glyphs the glyph pass (blended, writing depth) resolves the overlap by draw
+// order, so those glyphs flickered on a still camera (Ivan, a large file in a
+// big JS repo). The witness is `native/tests/visible_repeat.rs`.
+//
+// CAPS. Offsets are monotone in that order, so every line that fits precedes
+// every line that does not, and the lines dropped at a cap are the same
+// lines every frame: the LAST in (item, line) order. `seg_fit_end` /
+// `slot_fit_end` (atomicMax of the fitting lines' ends — a max, the same in
+// any order) are contiguous, fully written ranges, and the draw and the
+// layout dispatch read those, never the totals. A line dropped at the slot
+// cap still writes its segment entries, EMPTY, so the segment range has no
+// hole; a reserved wash box nothing fills is written EMPTY (alpha 0, which
+// the wash vertex stage moves off screen).
 //
 // The frustum planes come from the host (`frustum_planes`, the same
 // Gribb-Hartmann extraction as the renderer's `cull.rs`); the test is the
@@ -128,6 +149,14 @@ struct Frame {
 @group(0) @binding(14) var<storage, read_write> wash: array<Wash>;
 // The dispatch and draw arguments, copied into the INDIRECT buffer by the host between passes.
 @group(0) @binding(15) var<storage, read_write> indirect: array<u32>;
+// C30: the scans' scratch. `item_flag[i]` 1 when item i is visible this
+// frame; `line_rec[v]` the decision for candidate line v — x its segment
+// count (glyph tier) in bits 0..27 and the tier / wash / fade flags in
+// 28..31, y the fade alpha's bits; `block_sums[b]` the segment, slot and
+// wash counts of cull B's workgroup b, then (after scan_blocks) its bases.
+@group(0) @binding(16) var<storage, read_write> item_flag: array<u32>;
+@group(0) @binding(17) var<storage, read_write> line_rec: array<vec2<u32>>;
+@group(0) @binding(18) var<storage, read_write> block_sums: array<vec4<u32>>;
 
 // Counter slots (stats.rs reads the same map).
 const C_ITEMS_VISIBLE: u32 = 0u;
@@ -154,6 +183,8 @@ const I_WASH_DRAW: u32 = 16u;
 
 const GROUP_STRIDE: u32 = 6u;
 const WG: u32 = 64u;
+// Cull B's workgroup: one scan block of lines.
+const LWG: u32 = 256u;
 const MAX_GROUPS_X: u32 = 65535u;
 const ROW_MAX: u32 = 0xFFFFFFu;
 const X_PAGE_MAX: u32 = 0xFFu;
@@ -163,16 +194,16 @@ const TINT_WASH_FULL: u32 = 0xFFFF40FFu;     // cull state: a full wash (under t
 const TINT_WASH_BAND: u32 = 0xFFFFFF40u;     // cull state: a wash fading in over the 1 px band: cyan
 const TINT_DROPPED: u32 = 0xFF4040FFu;       // cull state: a glyph-tier line dropped at a cap: red
 
-fn linear_id(gid: vec3<u32>) -> u32 {
-    return gid.y * (MAX_GROUPS_X * WG) + gid.x;
-}
-
-// `plan_dispatch` (lib.rs): groups of 64, x capped at 65,535, y the rest.
-fn write_dispatch(at: u32, count: u32) {
-    let groups = (count + WG - 1u) / WG;
+// `plan_dispatch` (lib.rs): groups of `wg`, x capped at 65,535, y the rest.
+fn write_dispatch_wg(at: u32, count: u32, wg: u32) {
+    let groups = (count + wg - 1u) / wg;
     indirect[at] = min(groups, MAX_GROUPS_X);
     indirect[at + 1u] = max((groups + MAX_GROUPS_X - 1u) / MAX_GROUPS_X, 1u);
     indirect[at + 2u] = 1u;
+}
+
+fn write_dispatch(at: u32, count: u32) {
+    write_dispatch_wg(at, count, WG);
 }
 
 struct Box { lo: vec3<f32>, hi: vec3<f32> };
@@ -239,13 +270,12 @@ fn to_world(gbase: u32, b: Box) -> Box {
 
 // ---- cull A ----------------------------------------------------------------
 
-@compute @workgroup_size(64)
-fn cull_items(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let i = linear_id(gid);
-    if (i >= frame.u0.z) { return; }
+// One item's verdict: 1 when it is laid out this frame (visible, near enough
+// for lines), else 0 with the reason counted.
+fn item_visible(i: u32) -> u32 {
     if (hidden[i] != 0u) {
         atomicAdd(&counters[C_ITEMS_HIDDEN], 1u);
-        return;
+        return 0u;
     }
     let it = items[i];
     var b: Box;
@@ -253,55 +283,59 @@ fn cull_items(@builtin(global_invocation_id) gid: vec3<u32>) {
     b.hi = vec3<f32>(it.bbox_max_x, it.bbox_max_y, it.bbox_max_z);
     if (b.lo.x > b.hi.x || !box_in_frustum(b)) {
         atomicAdd(&counters[C_ITEMS_CULLED], 1u);
-        return;
+        return 0u;
     }
     let gscale = groups[group_base(it.group) + 3u];
     if (row_px(b, it.line_height * gscale.y) < frame.lod.y) {
         atomicAdd(&counters[C_ITEMS_BACKDROP], 1u);
-        return;
+        return 0u;
     }
-    let k = atomicAdd(&counters[C_ITEMS_VISIBLE], 1u);
-    visible[k] = i;
+    return 1u;
+}
+
+// What a visible item contributes to the scan: one place, its lines.
+fn item_counts(i: u32) -> vec3<u32> {
+    if (i >= frame.u0.z || item_flag[i] == 0u) { return vec3<u32>(0u); }
+    return vec3<u32>(1u, items[i].line_count, 0u);
+}
+
+// The verdict per item, and its workgroup's sums (block_sums, which cull B
+// reuses for the lines once the items are compacted).
+@compute @workgroup_size(256)
+fn cull_items(@builtin(local_invocation_id) lid: vec3<u32>, @builtin(workgroup_id) wid: vec3<u32>) {
+    let block = block_of(wid);
+    let i = block * LWG + lid.x;
+    if (i < frame.u0.z) { item_flag[i] = item_visible(i); }
+    let incl = wg_scan3(lid.x, item_counts(i));
+    if (lid.x == LWG - 1u) { block_sums[block] = vec4<u32>(incl, 0u); }
 }
 
 // ---- prefix -----------------------------------------------------------------
 
-var<workgroup> scan: array<u32, 256>;
-var<workgroup> wg_n: u32;
-var<workgroup> wg_carry: u32;
-
+// One workgroup: the item blocks' sums -> their exclusive bases; the totals
+// are the visible items and the candidate lines, which plan cull B.
 @compute @workgroup_size(256)
 fn prefix_items(@builtin(local_invocation_id) lid: vec3<u32>) {
-    let t = lid.x;
-    if (t == 0u) {
-        wg_n = atomicLoad(&counters[C_ITEMS_VISIBLE]);
-        wg_carry = 0u;
+    let sums = scan_block_sums(lid.x, (frame.u0.z + LWG - 1u) / LWG);
+    if (lid.x == 0u) {
+        atomicStore(&counters[C_ITEMS_VISIBLE], sums.x);
+        atomicStore(&counters[C_LINES_CANDIDATE], sums.y);
+        write_dispatch_wg(I_CULL_B, sums.y, LWG);
     }
-    let n = workgroupUniformLoad(&wg_n);
-    for (var base = 0u; base < n; base = base + 256u) {
-        let k = base + t;
-        var v = 0u;
-        if (k < n) { v = items[visible[k]].line_count; }
-        scan[t] = v;
-        workgroupBarrier();
-        // Hillis-Steele inclusive scan.
-        for (var off = 1u; off < 256u; off = off << 1u) {
-            var add = 0u;
-            if (t >= off) { add = scan[t - off]; }
-            workgroupBarrier();
-            scan[t] = scan[t] + add;
-            workgroupBarrier();
-        }
-        let carry = workgroupUniformLoad(&wg_carry);
-        if (k < n) { line_base[k] = carry + scan[t] - v; }
-        workgroupBarrier();
-        if (t == 0u) { wg_carry = carry + scan[255]; }
-        workgroupBarrier();
-    }
-    let total = workgroupUniformLoad(&wg_carry);
-    if (t == 0u) {
-        atomicStore(&counters[C_LINES_CANDIDATE], total);
-        write_dispatch(I_CULL_B, total);
+}
+
+// The visible items in index order: each one's place in `visible` and its
+// candidate-line base, from its block's base and the block's own scan.
+@compute @workgroup_size(256)
+fn compact_items(@builtin(local_invocation_id) lid: vec3<u32>, @builtin(workgroup_id) wid: vec3<u32>) {
+    let block = block_of(wid);
+    let i = block * LWG + lid.x;
+    let v = item_counts(i);
+    let incl = wg_scan3(lid.x, v);
+    if (v.x != 0u) {
+        let at = block_sums[block].xyz + incl - v;
+        visible[at.x] = i;
+        line_base[at.x] = at.y;
     }
 }
 
@@ -425,17 +459,17 @@ fn wash_color(it: ItemGpu, line: u32, s: u32, e: u32) -> u32 {
     return m.x | (m.y << 8u) | (m.z << 16u) | 0xFF000000u;
 }
 
-fn push_wash(it_idx: u32, row_lane: u32, x0: f32, width: f32, color: u32, rows: u32, alpha: f32, tint: u32, nseg: u32) {
-    let k = atomicAdd(&counters[C_WASH], 1u);
-    if (k >= frame.u1.z) { return; }
-    wash[k] = Wash(it_idx, row_lane, x0, width, color, rows, alpha, tint, nseg);
-}
+// The line record's flags (bits 28..31 of `line_rec.x`).
+const TIER_WASH: u32 = 1u;
+const TIER_GLYPH: u32 = 2u;
+const REC_WASH: u32 = 4u;   // the line reserves one wash box
+const REC_FADE: u32 = 8u;   // its wash is the fade band's (glyph tier)
+const REC_NSEG_MASK: u32 = 0x0FFFFFFFu;
 
-@compute @workgroup_size(64)
-fn cull_lines(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let v = linear_id(gid);
-    let total = atomicLoad(&counters[C_LINES_CANDIDATE]);
-    if (v >= total) { return; }
+// A candidate line: its item, its line-table index, its byte length, rows.
+struct LineCtx { it_idx: u32, li: u32, len: u32, rows: u32 };
+
+fn line_ctx(v: u32) -> LineCtx {
     // The visible item whose line range holds v: the last base <= v.
     let n = atomicLoad(&counters[C_ITEMS_VISIBLE]);
     var lo = 0u;
@@ -446,7 +480,6 @@ fn cull_lines(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
     let it_idx = visible[lo];
     let it = items[it_idx];
-    let p = item_params[it_idx];
     let li = it.first_line + (v - line_base[lo]);
     let line = lines[li];
     let last_line = it.first_line + it.line_count - 1u;
@@ -459,16 +492,170 @@ fn cull_lines(@builtin(global_invocation_id) gid: vec3<u32>) {
     } else if (it.wrap_mode == 0u && it.wrap_width > 0u) {
         rows = max(1u, (len + it.wrap_width - 1u) / it.wrap_width);
     }
+    return LineCtx(it_idx, li, len, rows);
+}
 
+// The line's seeds: [x, y) by binary search over the sorted seed table.
+fn seed_range(li: u32) -> vec2<u32> {
+    let seeds_total = frame.u0.w;
+    var s_lo = 0u;
+    var s_hi = seeds_total;
+    while (s_lo < s_hi) {
+        let mid = (s_lo + s_hi) >> 1u;
+        if (seeds[mid].line < li) { s_lo = mid + 1u; } else { s_hi = mid; }
+    }
+    var s1 = s_lo;
+    while (s1 < seeds_total && seeds[s1].line == li) { s1 = s1 + 1u; }
+    return vec2<u32>(s_lo, s1);
+}
+
+// What a line reserves, from its record: segments, slots, wash boxes.
+fn rec_counts(rec: vec2<u32>, glyph_count: u32) -> vec3<u32> {
+    let flags = rec.x >> 28u;
+    var c = vec3<u32>(0u);
+    if (flags & 3u) == TIER_GLYPH {
+        c.x = rec.x & REC_NSEG_MASK;
+        c.y = glyph_count;
+    }
+    if (flags & REC_WASH) != 0u { c.z = 1u; }
+    return c;
+}
+
+fn make_rec(nseg: u32, flags: u32, alpha: f32) -> vec2<u32> {
+    return vec2<u32>(min(nseg, REC_NSEG_MASK) | (flags << 28u), bitcast<u32>(alpha));
+}
+
+// cull_lines' per-line decision (no barrier inside: the entry point scans
+// after it in uniform control flow).
+fn classify(c: LineCtx) -> vec2<u32> {
+    let it = items[c.it_idx];
+    let p = item_params[c.it_idx];
+    let line = lines[c.li];
     let gbase = group_base(it.group);
     let depth = depth_segments(it, line.cols);
-    let local = line_local_box(it, p, line.base_row, rows, line.cols, line.width_cells, depth);
+    let local = line_local_box(it, p, line.base_row, c.rows, line.cols, line.width_cells, depth);
     let world = to_world(gbase, local);
-    if (!box_in_frustum(world)) { return; }
+    if (!box_in_frustum(world)) { return vec2<u32>(0u); }
     let gscale = groups[gbase + 3u];
     let px = row_px(world, p.line_height * gscale.y);
     let greek = frame.u0.x;
     let tint_mode = frame.u0.y;
+    if (px < frame.lod.x) {
+        // WASH tier: a box when greeking draws one.
+        atomicAdd(&counters[C_LINES_WASH], 1u);
+        var flags = TIER_WASH;
+        if (greek != 0u) { flags = flags | REC_WASH; }
+        return make_rec(0u, flags, 1.0);
+    }
+    // GLYPH tier: one segment per cut. Over the 1 px band above the glyph
+    // threshold the wash fades in under the glyphs (greek_mode 1 only); the
+    // cull-state tint reserves a box for a line it may paint as dropped.
+    let sr = seed_range(c.li);
+    let nseg = (sr.y - sr.x) + 1u;
+    var flags = TIER_GLYPH;
+    var alpha = 0.0;
+    if (greek == 1u && px < frame.lod.x + 1.0) {
+        flags = flags | REC_FADE | REC_WASH;
+        alpha = frame.lod.x + 1.0 - px;
+    }
+    if (tint_mode == 2u) { flags = flags | REC_WASH; }
+    return make_rec(nseg, flags, alpha);
+}
+
+var<workgroup> lscan: array<vec3<u32>, 256>;
+var<workgroup> lcarry: vec3<u32>;
+var<workgroup> lnb: u32;
+
+// Inclusive Hillis-Steele scan of one value per invocation over LWG.
+fn wg_scan3(t: u32, v: vec3<u32>) -> vec3<u32> {
+    lscan[t] = v;
+    workgroupBarrier();
+    for (var off = 1u; off < LWG; off = off << 1u) {
+        var add = vec3<u32>(0u);
+        if (t >= off) { add = lscan[t - off]; }
+        workgroupBarrier();
+        lscan[t] = lscan[t] + add;
+        workgroupBarrier();
+    }
+    let r = lscan[t];
+    workgroupBarrier();
+    return r;
+}
+
+fn block_of(wid: vec3<u32>) -> u32 {
+    return wid.y * MAX_GROUPS_X + wid.x;
+}
+
+@compute @workgroup_size(256)
+fn cull_lines(@builtin(local_invocation_id) lid: vec3<u32>, @builtin(workgroup_id) wid: vec3<u32>) {
+    let block = block_of(wid);
+    let v = block * LWG + lid.x;
+    let total = atomicLoad(&counters[C_LINES_CANDIDATE]);
+    var counts = vec3<u32>(0u);
+    if (v < total) {
+        let c = line_ctx(v);
+        let rec = classify(c);
+        line_rec[v] = rec;
+        counts = rec_counts(rec, lines[c.li].glyph_count);
+    }
+    let incl = wg_scan3(lid.x, counts);
+    if (lid.x == LWG - 1u) { block_sums[block] = vec4<u32>(incl, 0u); }
+}
+
+// One workgroup's scan of the first `nblocks` block sums, in place: counts
+// -> exclusive bases, in block order. Returns the totals (every invocation).
+// `nblocks` must be uniform: it comes from the frame uniform or a counter
+// read through a workgroup variable.
+fn scan_block_sums(t: u32, nblocks: u32) -> vec3<u32> {
+    if (t == 0u) {
+        lcarry = vec3<u32>(0u);
+        lnb = nblocks;
+    }
+    let nb = workgroupUniformLoad(&lnb);
+    for (var base = 0u; base < nb; base = base + LWG) {
+        let k = base + t;
+        var v = vec3<u32>(0u);
+        if (k < nb) { v = block_sums[k].xyz; }
+        let incl = wg_scan3(t, v);
+        let carry = workgroupUniformLoad(&lcarry);
+        if (k < nb) { block_sums[k] = vec4<u32>(carry + incl - v, 0u); }
+        if (t == LWG - 1u) { lcarry = carry + incl; }
+        workgroupBarrier();
+    }
+    return workgroupUniformLoad(&lcarry);
+}
+
+// One workgroup: the line blocks' sums -> their bases; the totals are the
+// frame's reservations.
+@compute @workgroup_size(256)
+fn scan_blocks(@builtin(local_invocation_id) lid: vec3<u32>) {
+    let total = atomicLoad(&counters[C_LINES_CANDIDATE]);
+    let sums = scan_block_sums(lid.x, (total + LWG - 1u) / LWG);
+    if (lid.x == 0u) {
+        atomicStore(&counters[C_SEGMENTS], sums.x);
+        atomicStore(&counters[C_SLOTS], sums.y);
+        atomicStore(&counters[C_WASH], sums.z);
+    }
+}
+
+fn put_wash(k: u32, w: Wash) {
+    if (k >= frame.u1.z) { return; }
+    wash[k] = w;
+}
+
+// One line's writes at its scanned bases (x segments, y slots, z wash).
+fn emit_line(c: LineCtx, rec: vec2<u32>, base: vec3<u32>) {
+    let flags = rec.x >> 28u;
+    let tier = flags & 3u;
+    if (tier == 0u) { return; }
+    let it_idx = c.it_idx;
+    let li = c.li;
+    let it = items[it_idx];
+    let p = item_params[it_idx];
+    let line = lines[li];
+    let depth = depth_segments(it, line.cols);
+    let tint_mode = frame.u0.y;
+    let has_wash = (flags & REC_WASH) != 0u;
 
     // The wash box's first-row lane (column page 0: the line's start), its
     // x origin (the first row's page) and its width: the line's widest fold
@@ -484,46 +671,38 @@ fn cull_lines(@builtin(global_invocation_id) gid: vec3<u32>) {
         }
     }
     let wash_w = f32(line.width_cells) * frame.lod.w;
+    // A reserved box nothing fills stays EMPTY (alpha 0: off screen).
+    var w = Wash(it_idx, row_lane, wash_x0, wash_w, 0u, c.rows, 0.0, 0u, depth);
 
-    if (px < frame.lod.x) {
-        // WASH tier.
-        atomicAdd(&counters[C_LINES_WASH], 1u);
-        if (greek == 0u) { return; }
+    if (tier == TIER_WASH) {
+        if (!has_wash) { return; }
         var tint = 0u;
         if (tint_mode == 1u) { tint = TINT_WASH_TIER; }
         if (tint_mode == 2u) { tint = TINT_WASH_FULL; }
-        push_wash(it_idx, row_lane, wash_x0, wash_w, wash_color(it, li, line.byte_start, line.byte_start + len), rows, 1.0, tint, depth);
+        w.color = wash_color(it, li, line.byte_start, line.byte_start + c.len);
+        w.alpha = 1.0;
+        w.tint = tint;
+        put_wash(base.z, w);
         return;
     }
 
-    // GLYPH tier: one segment per cut. The line's seeds: [s0, s1) by binary
-    // search over the sorted seed table.
-    let seeds_total = frame.u0.w;
-    var s_lo = 0u;
-    var s_hi = seeds_total;
-    while (s_lo < s_hi) {
-        let mid = (s_lo + s_hi) >> 1u;
-        if (seeds[mid].line < li) { s_lo = mid + 1u; } else { s_hi = mid; }
-    }
-    let s0 = s_lo;
-    var s1 = s0;
-    while (s1 < seeds_total && seeds[s1].line == li) { s1 = s1 + 1u; }
-    let nseg = (s1 - s0) + 1u;
-
-    let seg_base = atomicAdd(&counters[C_SEGMENTS], nseg);
+    let nseg = rec.x & REC_NSEG_MASK;
+    let seg_base = base.x;
+    let slot_base = base.y;
     if (seg_base + nseg > frame.u1.y) {
         atomicAdd(&counters[C_LINES_DROPPED], 1u);
         atomicAdd(&counters[C_SLOTS_DROPPED], line.glyph_count);
-        if (tint_mode == 2u) { push_wash(it_idx, row_lane, wash_x0, wash_w, TINT_DROPPED, rows, 1.0, TINT_DROPPED, depth); }
+        if (tint_mode == 2u) { w.color = TINT_DROPPED; w.alpha = 1.0; w.tint = TINT_DROPPED; }
+        if (has_wash) { put_wash(base.z, w); }
         return;
     }
     atomicMax(&counters[C_SEG_FIT_END], seg_base + nseg);
-    let slot_base = atomicAdd(&counters[C_SLOTS], line.glyph_count);
     let fits = slot_base + line.glyph_count <= frame.u1.x;
     if (!fits) {
         atomicAdd(&counters[C_LINES_DROPPED], 1u);
         atomicAdd(&counters[C_SLOTS_DROPPED], line.glyph_count);
-        if (tint_mode == 2u) { push_wash(it_idx, row_lane, wash_x0, wash_w, TINT_DROPPED, rows, 1.0, TINT_DROPPED, depth); }
+        if (tint_mode == 2u) { w.color = TINT_DROPPED; w.alpha = 1.0; w.tint = TINT_DROPPED; }
+        if (has_wash) { put_wash(base.z, w); }
         // Empty entries keep the segment range contiguous.
         for (var k = 0u; k < nseg; k = k + 1u) {
             segs[seg_base + k] = Seg(it_idx, li, 0u, 0u, 0u, 0u, 0.0, 0u);
@@ -532,6 +711,9 @@ fn cull_lines(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
     atomicMax(&counters[C_SLOT_FIT_END], slot_base + line.glyph_count);
     atomicAdd(&counters[C_LINES_GLYPH], 1u);
+    let sr = seed_range(li);
+    let s0 = sr.x;
+    let seeds_total = frame.u0.w;
     for (var k = 0u; k < nseg; k = k + 1u) {
         var seg: Seg;
         seg.item = it_idx;
@@ -549,18 +731,37 @@ fn cull_lines(@builtin(global_invocation_id) gid: vec3<u32>) {
             seg.seg_adv = sd.seg_adv;
             seg.slot_base = slot_base + survivors[seeds_total + s0 + k - 1u];
         }
-        seg.byte_end = len;
+        seg.byte_end = c.len;
         if (k + 1u < nseg) { seg.byte_end = seeds[s0 + k].byte_offset; }
         segs[seg_base + k] = seg;
     }
-    // Over the 1 px band above the glyph threshold the wash fades in under
-    // the glyphs (greek_mode 1 only).
-    if (greek == 1u && px < frame.lod.x + 1.0) {
+    if ((flags & REC_FADE) != 0u) {
         var tint = 0u;
         if (tint_mode == 1u) { tint = TINT_WASH_TIER; }
         if (tint_mode == 2u) { tint = TINT_WASH_BAND; }
-        push_wash(it_idx, row_lane, wash_x0, wash_w, wash_color(it, li, line.byte_start, line.byte_start + len), rows, frame.lod.x + 1.0 - px, tint, depth);
+        w.color = wash_color(it, li, line.byte_start, line.byte_start + c.len);
+        w.alpha = bitcast<f32>(rec.y);
+        w.tint = tint;
     }
+    if (has_wash) { put_wash(base.z, w); }
+}
+
+@compute @workgroup_size(256)
+fn emit_lines(@builtin(local_invocation_id) lid: vec3<u32>, @builtin(workgroup_id) wid: vec3<u32>) {
+    let block = block_of(wid);
+    let v = block * LWG + lid.x;
+    let total = atomicLoad(&counters[C_LINES_CANDIDATE]);
+    var counts = vec3<u32>(0u);
+    var rec = vec2<u32>(0u);
+    var c = LineCtx(0u, 0u, 0u, 0u);
+    if (v < total) {
+        c = line_ctx(v);
+        rec = line_rec[v];
+        counts = rec_counts(rec, lines[c.li].glyph_count);
+    }
+    let incl = wg_scan3(lid.x, counts);
+    let base = block_sums[block].xyz + incl - counts;
+    if (v < total) { emit_line(c, rec, base); }
 }
 
 // ---- finalize ---------------------------------------------------------------

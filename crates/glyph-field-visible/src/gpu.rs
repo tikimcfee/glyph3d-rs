@@ -663,7 +663,10 @@ pub struct Frame {
     cull_bg: wgpu::BindGroup,
     cull_items: wgpu::ComputePipeline,
     prefix_items: wgpu::ComputePipeline,
+    compact_items: wgpu::ComputePipeline,
     cull_lines: wgpu::ComputePipeline,
+    scan_blocks: wgpu::ComputePipeline,
+    emit_lines: wgpu::ComputePipeline,
     finalize: wgpu::ComputePipeline,
     layout_bg: wgpu::BindGroup,
     wash_pipeline: wgpu::RenderPipeline,
@@ -701,6 +704,19 @@ impl Frame {
         let n_items = resident.items_total.max(1) as u64;
         let visible = storage_zeroed(device, "visible item list", n_items * 4, wgpu::BufferUsages::empty());
         let line_base = storage_zeroed(device, "visible line bases", n_items * 4, wgpu::BufferUsages::empty());
+        // C30: the scans' scratch (`visible_cull.wgsl` ORDER). A candidate
+        // line is a line of a visible item, so `lines_total` bounds them.
+        let item_flag = storage_zeroed(device, "visible item flags", n_items * 4, wgpu::BufferUsages::empty());
+        let line_rec_bytes = resident.lines_total.max(1) as u64 * 8;
+        assert!(
+            line_rec_bytes <= binding_limit,
+            "visible field: {} lines need {line_rec_bytes} B of cull records, over the storage binding limit {binding_limit}",
+            resident.lines_total
+        );
+        let line_rec = storage_zeroed(device, "visible line records", line_rec_bytes, wgpu::BufferUsages::empty());
+        // Block sums: the item blocks' in cull A, then the line blocks' in cull B.
+        let blocks = (resident.lines_total.max(resident.items_total) as u64).div_ceil(CULL_LINES_WORKGROUP as u64).max(1);
+        let block_sums = storage_zeroed(device, "visible cull block sums", blocks * 16, wgpu::BufferUsages::empty());
         let counters = storage_zeroed(device, "visible counters", STATS_COUNTERS_BYTES, wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC);
         // COPY_SRC on the segment list is for `locate`'s readback.
         let segs = storage_zeroed(device, "visible segments", limits.max_segments as u64 * std::mem::size_of::<SegGpu>() as u64, wgpu::BufferUsages::COPY_SRC);
@@ -760,6 +776,9 @@ impl Frame {
                 storage_entry(13, false, compute),
                 storage_entry(14, false, compute),
                 storage_entry(15, false, compute),
+                storage_entry(16, false, compute),
+                storage_entry(17, false, compute),
+                storage_entry(18, false, compute),
             ],
         });
         let cull_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -782,6 +801,9 @@ impl Frame {
                 bind(13, &segs),
                 bind(14, &wash),
                 bind(15, &args),
+                bind(16, &item_flag),
+                bind(17, &line_rec),
+                bind(18, &block_sums),
             ],
         });
         let cull_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -795,7 +817,10 @@ impl Frame {
         });
         let cull_items = compute_pipeline(device, &cull_pl, &cull_module, "cull_items");
         let prefix_items = compute_pipeline(device, &cull_pl, &cull_module, "prefix_items");
+        let compact_items = compute_pipeline(device, &cull_pl, &cull_module, "compact_items");
         let cull_lines = compute_pipeline(device, &cull_pl, &cull_module, "cull_lines");
+        let scan_blocks = compute_pipeline(device, &cull_pl, &cull_module, "scan_blocks");
+        let emit_lines = compute_pipeline(device, &cull_pl, &cull_module, "emit_lines");
         let finalize = compute_pipeline(device, &cull_pl, &cull_module, "finalize");
         let layout_bg = resident.layout_bind_group(&resident.layout_params, &segs, &slots, &mask_args);
         let mask_layout_bg = resident.layout_bind_group(&mask_params, &segs, &mask_slots, &mask_args);
@@ -904,7 +929,10 @@ impl Frame {
             cull_bg,
             cull_items,
             prefix_items,
+            compact_items,
             cull_lines,
+            scan_blocks,
+            emit_lines,
             finalize,
             layout_bg,
             wash_pipeline,
@@ -961,17 +989,27 @@ impl Frame {
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("visible cull A"), timestamp_writes: ts(Some(0), None) });
             pass.set_bind_group(0, &self.cull_bg, &[]);
-            let [x, y, z] = plan_dispatch(resident.items_total);
+            // Verdict and block sums per item, their scan, the compaction
+            // (C30: the visible items in index order, every frame).
+            let [x, y, z] = plan_dispatch_wg(resident.items_total, CULL_LINES_WORKGROUP);
             pass.set_pipeline(&self.cull_items);
             pass.dispatch_workgroups(x, y, z);
             pass.set_pipeline(&self.prefix_items);
             pass.dispatch_workgroups(1, 1, 1);
+            pass.set_pipeline(&self.compact_items);
+            pass.dispatch_workgroups(x, y, z);
         }
         encoder.copy_buffer_to_buffer(&self.args, INDIRECT_CULL_B, &self.indirect, INDIRECT_CULL_B, 12);
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("visible cull B"), timestamp_writes: ts(None, Some(1)) });
             pass.set_bind_group(0, &self.cull_bg, &[]);
+            // Classify every candidate line, scan the workgroups' counts,
+            // write at the scanned offsets (C30: arena order, every frame).
             pass.set_pipeline(&self.cull_lines);
+            pass.dispatch_workgroups_indirect(&self.indirect, INDIRECT_CULL_B);
+            pass.set_pipeline(&self.scan_blocks);
+            pass.dispatch_workgroups(1, 1, 1);
+            pass.set_pipeline(&self.emit_lines);
             pass.dispatch_workgroups_indirect(&self.indirect, INDIRECT_CULL_B);
             pass.set_pipeline(&self.finalize);
             pass.dispatch_workgroups(1, 1, 1);
