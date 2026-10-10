@@ -86,6 +86,9 @@ VERBS (--verb \"V [ARGS]\", repeatable; applies to the most recent pick):
   nudge-glyph dx dy [dz] | scale-glyph f
   move-group dx dy dz | scale-group s
   tint-group rrggbb | tint-cycle | hide-group | show-group | toggle-hidden
+  set-glyph-background rrggbb[aa] | set-glyph-transform tx ty tz [s] | reset-glyph-group
+  (--field-mode visible keys the glyph verbs by item:byte; nudge is x-only
+  and scale-glyph is not representable there, as in derived)
 
 WINDOWED MODE:
   fly camera — WASD move, E|R up, Q|F down, RIGHT-drag look, scroll = speed,

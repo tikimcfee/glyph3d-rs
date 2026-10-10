@@ -497,6 +497,8 @@ impl App<'_> {
             cluster_selftest: u8::from(std::env::var_os("GLYPH_CLUSTER_SELFTEST").is_some()),
             #[cfg(feature = "egui-ui")]
             fieldmode_selftest: u8::from(std::env::var_os("GLYPH_FIELDMODE_SELFTEST").is_some()),
+            #[cfg(feature = "egui-ui")]
+            visible_verb_selftest: u8::from(std::env::var_os("GLYPH_VISIBLE_VERB_SELFTEST").is_some()),
         });
     }
 

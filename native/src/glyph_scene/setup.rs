@@ -391,6 +391,7 @@ impl GlyphScene {
             picked: None,
             selection: None,
             geom_overrides: std::collections::HashMap::new(),
+            glyph_overrides: std::collections::HashMap::new(),
             cache: None,
             grabbed_group: None,
             controller,

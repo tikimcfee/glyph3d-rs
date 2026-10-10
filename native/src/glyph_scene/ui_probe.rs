@@ -29,6 +29,13 @@ pub struct UiProbeState {
     /// The last resolved pick, formatted by the same `format_pick` as the
     /// stdout pick log line.
     pub last_pick: Option<String>,
+    /// The current selection in the field's own key (`Selection::describe`):
+    /// `item:start..end` for the Visible field, the slot or slot range for
+    /// the stored modes. None when nothing is selected.
+    pub selection: Option<String>,
+    /// The last pick's key, compact: `file byte N` for a glyph, `file (file)`
+    /// for a file-level pick — what the Visible field's verbs address.
+    pub pick_key: Option<String>,
     // ── K4: UI → scene controls. Written by the Debug-panel sliders;
     // applied by render() before culling. Seeded from the compile-time
     // consts at install; offscreen never installs a probe, so the consts

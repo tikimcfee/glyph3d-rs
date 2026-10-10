@@ -126,6 +126,22 @@ pub(super) fn render_scene(
             time: t,
         };
         scene.field.prepare(&ctx.queue, encoder, &prepare);
+        // The selection mask's content, right after `prepare` and before any
+        // pass (same encoder): the field lays the selected byte range's
+        // glyphs out again into its selection buffer, which the mask pass
+        // below draws. Gated exactly as that pass is (the mask machinery is
+        // built for both drivers since the mask pipeline became
+        // unconditional — an offscreen frame with a pick carries the
+        // highlight too, which is what lets `tests/visible_verbs.rs` witness
+        // this pass by pixel).
+        if let (Some(visible), Some(Selection::ByteRange { item, start, end }), true, true) = (
+            scene.field.visible(),
+            scene.selection.as_ref(),
+            comp.selection_fx.is_some(),
+            vt.mask.is_some(),
+        ) {
+            visible.prepare_mask(&ctx.queue, encoder, *item, *start, *end);
+        }
     }
     if scene.environment.is_on() {
         let env_cam = EnvCamera {
@@ -229,6 +245,11 @@ pub(super) fn render_scene(
         p.pitch = scene.fly.pitch;
         p.environment = scene.environment.mode.get();
         p.last_pick = scene.picked.as_ref().map(format_pick);
+        p.selection = scene.selection.as_ref().map(Selection::describe);
+        p.pick_key = scene.picked.as_ref().map(|h| match &h.glyph {
+            Some(g) => format!("{} byte {}", h.rel_path, g.byte_off),
+            None => format!("{} (file)", h.rel_path),
+        });
         p.grabbed_group = scene.grabbed_group;
         p.grabbed_zone = scene.grabbed_zone.clone();
         p.active_zone = scene.picked.as_ref().map(|h| {
@@ -485,20 +506,13 @@ pub(super) fn render_scene(
     // Stage L (L4): the Selection phase — own mask target ⇒ own pass,
     // rendered after Glyphs. The variant is constructed here, when a
     // selection exists (no selection → the L3 command stream is
-    // unchanged). Windowed shader path only: on the copy path
-    // (offscreen) selection_fx/mask are None and this block is skipped,
-    // so offscreen output never carries the tint.
-    // The Visible field has no slots to key a Selection::Glyph/Segment on
-    // (its glyphs are transient, re-laid every frame): the mask draws
-    // nothing there until M3 re-keys the selection by (item, line, column).
-    // Said once, not per frame.
-    if self_drawing && scene.selection.is_some() {
-        static SAID: std::sync::Once = std::sync::Once::new();
-        SAID.call_once(|| {
-            log::warn!("selection highlight: not keyed for the Visible field yet (M3) — the mask pass draws nothing");
-        });
-    }
-    let selection_phase = (scene.selection.is_some() && !self_drawing).then_some(Phase::Selection);
+    // unchanged, which is every golden frame). Both drivers have the mask
+    // machinery (`CompositeState::selection_fx`), so an offscreen frame
+    // with a pick carries the tint — `tests/visible_verbs.rs` reads it.
+    // The Visible field's selection is a byte range (M3): `prepare_mask`
+    // above laid its glyphs out into the field's selection buffer, and the
+    // mask pass draws that buffer under the same mask pipeline.
+    let selection_phase = scene.selection.is_some().then_some(Phase::Selection);
     // The pool slot the composite will read: the scene slot, or the
     // tinted ping-pong partner when a selection was rendered.
     let mut final_slot = pool_slot;
@@ -535,19 +549,31 @@ pub(super) fn render_scene(
                 ..Default::default()
             });
             pass.set_pipeline(&fx.mask_pipeline);
-            let mask_draws: Vec<(u32, std::ops::Range<u32>)> = match sel {
-                Selection::Glyph { chunk, local } => vec![(*chunk, *local..*local + 1)],
-                // Per-chunk split — the same math cull_segments uses.
-                Selection::Segment { slot_base, slot_count } => glyph_field::split_at_chunks(
-                    *slot_base,
-                    *slot_count,
-                    scene.field.chunk_capacity(),
-                )
-                .filter(|(chunk, _, _)| *chunk < scene.field.chunk_count())
-                .map(|(chunk, local, _)| (chunk, local))
-                .collect(),
-            };
-            scene.field.record_draws(&mut pass, &mask_draws);
+            match sel {
+                // The Visible field: what `prepare_mask` emitted, one
+                // indirect draw over its selection buffer.
+                Selection::ByteRange { .. } => {
+                    if let Some(visible) = scene.field.visible() {
+                        visible.record_mask_draw(&mut pass);
+                    }
+                }
+                Selection::Glyph { .. } | Selection::Segment { .. } => {
+                    let mask_draws: Vec<(u32, std::ops::Range<u32>)> = match sel {
+                        Selection::Glyph { chunk, local } => vec![(*chunk, *local..*local + 1)],
+                        // Per-chunk split — the same math cull_segments uses.
+                        Selection::Segment { slot_base, slot_count } => glyph_field::split_at_chunks(
+                            *slot_base,
+                            *slot_count,
+                            scene.field.chunk_capacity(),
+                        )
+                        .filter(|(chunk, _, _)| *chunk < scene.field.chunk_count())
+                        .map(|(chunk, local, _)| (chunk, local))
+                        .collect(),
+                        Selection::ByteRange { .. } => unreachable!("matched above"),
+                    };
+                    scene.field.record_draws(&mut pass, &mask_draws);
+                }
+            }
         }
         if let (Some(p), Some(q)) = (&ctx.profiler, mask_query) {
             p.borrow().end_query(encoder, q);

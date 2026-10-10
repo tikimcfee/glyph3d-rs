@@ -109,18 +109,6 @@ pub fn run_scene(
         }
     }
 
-    // Stage G debug: GLYPH_G_DUMP=<slot>[,<len>] reads back instance bytes
-    // after the ops to verify partial uploads landed.
-    if let Some(spec) = std::env::var_os("GLYPH_G_DUMP") {
-        let spec = spec.to_string_lossy().to_string();
-        let mut parts = spec.split(',');
-        let slot: u64 = parts.next().and_then(|s| s.parse().ok()).expect("GLYPH_G_DUMP slot");
-        let len: u64 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(96);
-        let mut buf = vec![0u32; (len as usize / 4).max(12)];
-        scene.debug_dump_instances(ctx, slot, &mut buf);
-        println!("GLYPH_G_DUMP slot {slot}: {buf:08x?}");
-    }
-
     // Readback buffer: copy_texture_to_buffer requires 256-byte-aligned rows.
     let unpadded_bpr = size.width * 4;
     let padded_bpr = unpadded_bpr.div_ceil(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT)
@@ -244,6 +232,35 @@ pub fn run_scene(
     drop(data);
     readback.unmap();
 
+    // Stage G debug: GLYPH_G_DUMP reads slot bytes back after the frames, to
+    // verify a verb's upload landed. `<slot>[,<len>]` is a stored slot;
+    // `<item>:<byte>[,<len>]` (M3) is the Visible field's key — the glyph is
+    // located in the transient buffer of the LAST prepared frame, which is
+    // why this runs after the loop and the readback wait (before 2026-10-10
+    // it ran before the first frame; a stored slot reads the same either
+    // way). The PNG is untouched: a print, not a draw.
+    if let Some(spec) = std::env::var_os("GLYPH_G_DUMP") {
+        match parse_dump_spec(&spec.to_string_lossy()) {
+            Ok(DumpSpec::Slot { slot, len }) => {
+                let mut buf = vec![0u32; (len / 4).max(12)];
+                scene.debug_dump_instances(ctx, slot, &mut buf);
+                println!("GLYPH_G_DUMP slot {slot}: {buf:08x?}");
+            }
+            Ok(DumpSpec::ItemByte { item, byte, len }) => match scene.debug_locate(ctx, item, byte) {
+                Some(slot) => {
+                    let mut buf = vec![0u32; (len / 4).max(5)];
+                    scene.debug_dump_instances(ctx, u64::from(slot), &mut buf);
+                    println!("GLYPH_G_DUMP item {item} byte {byte} -> transient slot {slot}: {buf:08x?}");
+                }
+                None => println!(
+                    "GLYPH_G_DUMP item {item} byte {byte}: not laid out in the last frame \
+                     (culled or washed, or the field is not Visible — a stored field is addressed by slot)"
+                ),
+            },
+            Err(e) => panic!("GLYPH_G_DUMP: {e}"),
+        }
+    }
+
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).expect("create output directory");
     }
@@ -300,4 +317,53 @@ pub fn run_scene(
         );
     }
     println!("wrote {}", path.display());
+}
+
+/// What `GLYPH_G_DUMP` asks for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DumpSpec {
+    /// `<slot>[,<len>]`: a stored field's slot, `len` bytes (default 96).
+    Slot { slot: u64, len: usize },
+    /// `<item>:<byte>[,<len>]`: the Visible field's key, located in the last
+    /// prepared frame's transient buffer; `len` bytes (default one 20 B slot).
+    ItemByte { item: u32, byte: u32, len: usize },
+}
+
+/// Parse `GLYPH_G_DUMP`'s value.
+pub fn parse_dump_spec(spec: &str) -> Result<DumpSpec, String> {
+    let (head, len) = match spec.split_once(',') {
+        Some((h, l)) => (h.trim(), Some(l.trim().parse::<usize>().map_err(|_| format!("bad length in {spec:?}"))?)),
+        None => (spec.trim(), None),
+    };
+    match head.split_once(':') {
+        Some((item, byte)) => {
+            let item = item.trim().parse::<u32>().map_err(|_| format!("bad item in {spec:?} (want item:byte)"))?;
+            let byte = byte.trim().parse::<u32>().map_err(|_| format!("bad byte in {spec:?} (want item:byte)"))?;
+            Ok(DumpSpec::ItemByte { item, byte, len: len.unwrap_or(20) })
+        }
+        None => {
+            let slot = head.parse::<u64>().map_err(|_| format!("bad slot in {spec:?} (want slot[,len] or item:byte[,len])"))?;
+            Ok(DumpSpec::Slot { slot, len: len.unwrap_or(96) })
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{parse_dump_spec, DumpSpec};
+
+    /// Both forms, both defaults, and that a malformed value is refused
+    /// rather than read as slot 0.
+    #[test]
+    fn g_dump_spec_parses_slots_and_item_bytes() {
+        assert_eq!(parse_dump_spec("42"), Ok(DumpSpec::Slot { slot: 42, len: 96 }));
+        assert_eq!(parse_dump_spec("42,32"), Ok(DumpSpec::Slot { slot: 42, len: 32 }));
+        assert_eq!(parse_dump_spec("3:17"), Ok(DumpSpec::ItemByte { item: 3, byte: 17, len: 20 }));
+        assert_eq!(parse_dump_spec(" 3:17 , 40"), Ok(DumpSpec::ItemByte { item: 3, byte: 17, len: 40 }));
+        assert!(parse_dump_spec("").is_err());
+        assert!(parse_dump_spec("3:").is_err());
+        assert!(parse_dump_spec(":17").is_err());
+        assert!(parse_dump_spec("3:17,x").is_err());
+        assert!(parse_dump_spec("slot").is_err());
+    }
 }

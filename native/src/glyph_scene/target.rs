@@ -44,9 +44,12 @@ pub(super) struct CompositeState {
     pub(super) sampler: wgpu::Sampler,
     pub(super) target: Option<ViewTarget>,
     pub(super) parity: Cell<u8>,
-    /// Stage L (L4): selection mask/tint machinery — only on the
-    /// shader-composite path (windowed). None when the driver composites by
-    /// copy (offscreen), which therefore never renders selection visuals.
+    /// Stage L (L4): selection mask/tint machinery. Built whenever the mask
+    /// pipeline is (always, since `setup` made it unconditional for both
+    /// windowed platforms), so an OFFSCREEN frame with a pick carries the
+    /// highlight too — the old "copy path never renders selection visuals"
+    /// was stale by 2026-10-10, when `tests/visible_verbs.rs` measured the
+    /// tint in offscreen PNGs. The goldens run no pick, so they are untouched.
     pub(super) selection_fx: Option<SelectionFx>,
 }
 
@@ -62,9 +65,8 @@ pub(super) struct ViewTarget {
     pub(super) depth: wgpu::TextureView,
     pub(super) bind_groups: [wgpu::BindGroup; 2],
     /// Stage L (L4): the selection mask target + per-pool-slot tint bind
-    /// groups. Only created on the shader-composite path (windowed) — the
-    /// copy path (offscreen) never renders selection visuals, so offscreen
-    /// stays byte-identical by construction.
+    /// groups, created with `selection_fx` (see its note: both drivers have
+    /// it; a frame without a selection records no mask pass either way).
     pub(super) mask: Option<MaskSet>,
 }
 
@@ -84,11 +86,34 @@ pub(super) struct MaskSet {
 /// has no slot) selects the whole segment; a pick MISS clears. Verbs never
 /// touch it. Persistent until the next pick — this closes the "sticky
 /// flash" gap.
+///
+/// The Visible field keeps no slot per glyph (its transient buffer is
+/// re-ordered by atomics every frame), so there a selection is a BYTE RANGE
+/// of an item (M3, 2026-10-10): the item is the file's index (its group id
+/// at load) and the bytes are leader offsets within the file — the two
+/// things the CPU pick already yields. The mask pass asks the field to lay
+/// the range's glyphs out again into its selection buffer and draws that.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Selection {
     /// One glyph slot (arena-global split into chunk + chunk-local index).
     Glyph { chunk: u32, local: u32 },
     /// A whole segment/file (arena slot range; split per chunk at draw).
     Segment { slot_base: u32, slot_count: u32 },
+    /// The glyphs of item `item` whose leader byte lies in `[start, end)`
+    /// (Visible field only): one glyph is `[byte, byte + utf8 len)`, a file
+    /// is `[0, byte_len)`.
+    ByteRange { item: u32, start: u32, end: u32 },
+}
+
+impl Selection {
+    /// The HUD's one-word form: what is selected, in the field's own key.
+    pub(super) fn describe(&self) -> String {
+        match self {
+            Selection::Glyph { chunk, local } => format!("slot chunk {chunk} local {local}"),
+            Selection::Segment { slot_base, slot_count } => format!("slots {slot_base}..+{slot_count}"),
+            Selection::ByteRange { item, start, end } => format!("{item}:{start}..{end}"),
+        }
+    }
 }
 
 // Stage L (L4): the selection tint is the `[glyph_scene] selection_tint`

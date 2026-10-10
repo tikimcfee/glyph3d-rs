@@ -8,6 +8,8 @@
 use glam::DVec3;
 use std::path::PathBuf;
 
+use glyph_field_visible::{GlyphOverride, NO_GROUP};
+
 use super::{fov_y_deg, CameraMode, GlyphPlacement, GlyphScene, GroupRow, Selection};
 use crate::gpu::GpuContext;
 use crate::layout::{GlyphRecord, ItemParams};
@@ -123,9 +125,138 @@ pub(super) struct PickCacheEntry {
     lines: Vec<u32>,
     /// Global arena slot per record; u32::MAX for blank/missing (no instance).
     slot_of: Vec<u32>,
+    /// The file's length in bytes — the end of a whole-item byte range.
+    byte_len: usize,
+}
+
+// ── M3: the Visible field's keys — (item, byte) in place of a slot ─────────
+//
+// The Visible field keeps no slot per glyph, so everything the scene keyed by
+// slot is re-keyed there by the item (the file's index in the load, == its
+// group id at load) and the glyph's LEADER byte offset within the file. The
+// CPU pick already yields both (`PickFileInfo::group_id`, `PickGlyph::byte_off`);
+// the helpers below are the pure half, so a test can hold the construction
+// without a device.
+
+/// The selection a pick resolves to in the Visible field: a glyph with a
+/// slot is its own leader bytes `[byte, byte + utf8 len)`; a file-level pick
+/// or a blank glyph (which draws nothing) is the whole item `[0, byte_len)`
+/// (`u32::MAX` when the length is unknown — every leader lies below it).
+pub(super) fn byte_range_selection(item: u32, glyph: Option<&PickGlyph>, byte_len: Option<u32>) -> Selection {
+    match glyph {
+        Some(g) if g.slot.is_some() => {
+            let (start, end) = glyph_byte_range(g.byte_off, g.ch);
+            Selection::ByteRange { item, start, end }
+        }
+        _ => Selection::ByteRange { item, start: 0, end: byte_len.unwrap_or(u32::MAX) },
+    }
+}
+
+/// One glyph's leader bytes: `[byte_off, byte_off + utf8 len)`.
+pub(super) fn glyph_byte_range(byte_off: usize, ch: char) -> (u32, u32) {
+    (byte_off as u32, (byte_off + ch.len_utf8()) as u32)
+}
+
+/// The byte range `[start, end)` covering every record on folded row `row`:
+/// `records` yields `(row, leader byte, codepoint)` per record, as the pick
+/// cache holds them. The records of a row are byte-contiguous, so the range
+/// is the first leader to the last leader's end. None when the row is empty.
+pub(super) fn row_byte_range(records: impl Iterator<Item = (u32, usize, u32)>, row: u32) -> Option<(u32, u32)> {
+    let mut range: Option<(usize, usize)> = None;
+    for (r, byte, cp) in records {
+        if r != row {
+            continue;
+        }
+        let end = byte + char::from_u32(cp).map_or(1, char::len_utf8);
+        range = Some(match range {
+            None => (byte, end),
+            Some((s, e)) => (s.min(byte), e.max(end)),
+        });
+    }
+    range.map(|(s, e)| (s as u32, e as u32))
+}
+
+/// One verb's effect on a glyph's override.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) enum OverrideEdit {
+    /// `recolor-glyph`: replace the colour (packed RGBA8, alpha 255 — never
+    /// zero, which the kernel reads as "no colour override").
+    Color(u32),
+    /// `nudge-glyph`: add to the x nudge (the slot carries no y/z, as in
+    /// Derived mode).
+    NudgeX(f32),
+    /// `set-glyph-background` / `set-glyph-transform`: the allocated group row.
+    Group(u32),
+    /// `reset-glyph-group`: back to the item's own group.
+    ClearGroup,
+}
+
+/// Merge one edit into a glyph's override: the other lanes keep what earlier
+/// verbs set (a recolour after a nudge keeps the nudge, and vice versa).
+pub(super) fn merged_override(existing: Option<GlyphOverride>, item: u32, byte: u32, edit: OverrideEdit) -> GlyphOverride {
+    let mut ov = existing.unwrap_or(GlyphOverride { item, byte, color: 0, x_nudge: 0.0, group: NO_GROUP });
+    debug_assert_eq!((ov.item, ov.byte), (item, byte), "an override is merged under its own key");
+    match edit {
+        OverrideEdit::Color(c) => ov.color = c,
+        OverrideEdit::NudgeX(dx) => ov.x_nudge += dx,
+        OverrideEdit::Group(g) => ov.group = g,
+        OverrideEdit::ClearGroup => ov.group = NO_GROUP,
+    }
+    ov
+}
+
+/// An override that overrides nothing — cleared from the field rather than
+/// kept as a no-op entry.
+pub(super) fn override_is_empty(ov: &GlyphOverride) -> bool {
+    ov.color == 0 && ov.x_nudge == 0.0 && ov.group == NO_GROUP
+}
+
+/// The verb's CLI name, for the reply lines.
+fn verb_name(verb: &Verb) -> &'static str {
+    match verb {
+        Verb::RecolorGlyph(_) => "recolor-glyph",
+        Verb::RecolorLine(_) => "recolor-line",
+        Verb::NudgeGlyph(_) => "nudge-glyph",
+        Verb::ScaleGlyph(_) => "scale-glyph",
+        Verb::MoveGroup(_) => "move-group",
+        Verb::ScaleGroup(_) => "scale-group",
+        Verb::TintGroup(_) => "tint-group",
+        Verb::TintCycle => "tint-cycle",
+        Verb::SetHidden(true) => "hide-group",
+        Verb::SetHidden(false) => "show-group",
+        Verb::ToggleHidden => "toggle-hidden",
+        Verb::SetGlyphBackground(_) => "set-glyph-background",
+        Verb::SetGlyphTransform(..) => "set-glyph-transform",
+        Verb::ResetGlyphGroup => "reset-glyph-group",
+    }
 }
 
 impl GlyphScene {
+    /// The Visible field's key for the picked file: its item index (the
+    /// file's position in the load, == its group id at load). None for the
+    /// stored modes, which keep their slot paths.
+    pub(super) fn visible_item_of(&self, gid: u32) -> Option<u32> {
+        self.field.visible()?;
+        let pctx = self.pick.as_ref()?;
+        pctx.files.iter().position(|f| f.group_id == gid).map(|i| i as u32)
+    }
+
+    /// Merge `edit` into the glyph's override (the scene's map is the source
+    /// of truth) and push the result to the Visible field — or clear it when
+    /// nothing is left to override.
+    fn set_visible_override(&mut self, ctx: &GpuContext, key: (u32, u32), edit: OverrideEdit) -> GlyphOverride {
+        let ov = merged_override(self.glyph_overrides.get(&key).copied(), key.0, key.1, edit);
+        let visible = self.field.visible().expect("set_visible_override: the field is Visible");
+        if override_is_empty(&ov) {
+            self.glyph_overrides.remove(&key);
+            visible.clear_glyph_override(&ctx.queue, key.0, key.1);
+        } else {
+            self.glyph_overrides.insert(key, ov);
+            visible.set_glyph_override(&ctx.queue, ov);
+        }
+        ov
+    }
+
     /// Ensure the one-entry pick cache holds `gid`'s re-derived file data:
     /// records (bit-identical engine re-run) + the CPU byte walks. The fold
     /// cross-check (CPU row/col vs engine ROW/COL lanes, every record) is the
@@ -198,6 +329,7 @@ impl GlyphScene {
             leaders,
             lines,
             slot_of,
+            byte_len: bytes.len(),
         });
         true
     }
@@ -605,12 +737,17 @@ impl GlyphScene {
     }
 
     /// Stage L (L4): pick hit → selection mask content.
-    fn selection_from_hit(&self, h: &PickHit) -> Option<Selection> {
-        // The Visible field keeps no slot per glyph, so neither selection
-        // form has anything to name yet (M3 re-keys them by item/line/col);
-        // the pick itself resolved on the CPU and stands.
-        if self.field.visible().is_some() {
-            return None;
+    fn selection_from_hit(&mut self, h: &PickHit) -> Option<Selection> {
+        // The Visible field keeps no slot per glyph: the selection is the
+        // picked glyph's leader bytes, or the whole item for a file-level
+        // (or blank-glyph) pick — the length comes from the pick cache, which
+        // a glyph pick has already filled and a file pick fills here.
+        if let Some(item) = self.visible_item_of(h.group_id) {
+            let whole_item = !h.glyph.as_ref().is_some_and(|g| g.slot.is_some());
+            let byte_len = (whole_item && self.ensure_pick_cache(h.group_id))
+                .then(|| self.cache.as_ref().map(|c| c.byte_len as u32))
+                .flatten();
+            return Some(byte_range_selection(item, h.glyph.as_ref(), byte_len));
         }
         if let Some(g) = &h.glyph {
             if let Some(slot) = g.slot {
@@ -686,57 +823,74 @@ impl GlyphScene {
     /// Re-derive a cull segment from the live group TRS: the world AABB
     /// follows offset/scale, and the backdrop tint follows the group color
     /// relative to its as-staged value (so untouched segments keep their
-    /// Stage F-fitted tint exactly).
-    pub(super) fn sync_segment(&mut self, gid: u32) {
+    /// Stage F-fitted tint exactly). The Visible field culls its items by
+    /// its own copy of that box, so the recomputed one is pushed to it too
+    /// (M3) — every group edit lands here, whichever verb or drag moved it.
+    pub(super) fn sync_segment(&mut self, ctx: &GpuContext, gid: u32) {
         let Some(g) = self.groups_cpu.get(gid as usize).copied() else {
             return;
         };
-        let Some(cull) = &mut self.cull else { return };
-        let i = gid as usize;
-        if i >= cull.segments.len() {
-            return;
-        }
         let (ox, oy, oz) = (g.cols[0][0], g.cols[0][1], g.cols[0][2]);
         let (sx, sy, sz) = (
             g.cols[3][0].max(0.0),
             g.cols[3][1].max(0.0),
             g.cols[3][2].max(0.0),
         );
-        cull.segments[i].min = [
-            cull.local_min[i][0] * sx + ox,
-            cull.local_min[i][1] * sy + oy,
-            cull.local_min[i][2] * sz + oz,
-        ];
-        cull.segments[i].max = [
-            cull.local_max[i][0] * sx + ox,
-            cull.local_max[i][1] * sy + oy,
-            cull.local_max[i][2] * sz + oz,
-        ];
-        if let Some(lblks) = cull.local_blocks.get(i) {
-            for (b_idx, lb) in lblks.iter().enumerate() {
-                if let Some(b) = cull.segments[i].blocks.get_mut(b_idx) {
-                    b.min = [
-                        lb.min[0] * sx + ox,
-                        lb.min[1] * sy + oy,
-                        lb.min[2] * sz + oz,
-                    ];
-                    b.max = [
-                        lb.max[0] * sx + ox,
-                        lb.max[1] * sy + oy,
-                        lb.max[2] * sz + oz,
-                    ];
+        let i = gid as usize;
+        let mut world_box: Option<([f32; 3], [f32; 3])> = None;
+        if let Some(cull) = &mut self.cull {
+            if i >= cull.segments.len() {
+                return;
+            }
+            cull.segments[i].min = [
+                cull.local_min[i][0] * sx + ox,
+                cull.local_min[i][1] * sy + oy,
+                cull.local_min[i][2] * sz + oz,
+            ];
+            cull.segments[i].max = [
+                cull.local_max[i][0] * sx + ox,
+                cull.local_max[i][1] * sy + oy,
+                cull.local_max[i][2] * sz + oz,
+            ];
+            if let Some(lblks) = cull.local_blocks.get(i) {
+                for (b_idx, lb) in lblks.iter().enumerate() {
+                    if let Some(b) = cull.segments[i].blocks.get_mut(b_idx) {
+                        b.min = [
+                            lb.min[0] * sx + ox,
+                            lb.min[1] * sy + oy,
+                            lb.min[2] * sz + oz,
+                        ];
+                        b.max = [
+                            lb.max[0] * sx + ox,
+                            lb.max[1] * sy + oy,
+                            lb.max[2] * sz + oz,
+                        ];
+                    }
                 }
             }
+            let bt = cull.base_tint[i];
+            let orig = cull.orig_group_rgb[i];
+            let mut t = bt;
+            for (c, tc) in t.iter_mut().enumerate().take(3) {
+                let newc = g.cols[2][c].max(0.0).powf(2.2);
+                let oldc = orig[c].max(1e-6).powf(2.2);
+                *tc = (bt[c] * newc / oldc).min(1.0);
+            }
+            cull.segments[i].tint = t;
+            world_box = Some((cull.segments[i].min, cull.segments[i].max));
+        } else if let Some(info) = self.pick.as_ref().and_then(|p| p.files.iter().find(|f| f.group_id == gid)) {
+            // --no-cull: no segment table, but the Visible field still culls
+            // itself — the pick AABB carries the same margins (plus a z pad).
+            world_box = Some((
+                [info.aabb_min[0] * sx + ox, info.aabb_min[1] * sy + oy, info.aabb_min[2] * sz + oz],
+                [info.aabb_max[0] * sx + ox, info.aabb_max[1] * sy + oy, info.aabb_max[2] * sz + oz],
+            ));
         }
-        let bt = cull.base_tint[i];
-        let orig = cull.orig_group_rgb[i];
-        let mut t = bt;
-        for (c, tc) in t.iter_mut().enumerate().take(3) {
-            let newc = g.cols[2][c].max(0.0).powf(2.2);
-            let oldc = orig[c].max(1e-6).powf(2.2);
-            *tc = (bt[c] * newc / oldc).min(1.0);
+        if let (Some((min, max)), Some(item)) = (world_box, self.visible_item_of(gid)) {
+            if let Some(visible) = self.field.visible() {
+                visible.set_item_bbox(&ctx.queue, item, min, max);
+            }
         }
-        cull.segments[i].tint = t;
     }
 
     /// Apply a manipulation verb to the current pick. All GPU writes are
@@ -745,16 +899,28 @@ impl GlyphScene {
         let Some(hit) = &self.picked else {
             return "verb: nothing picked yet — ignored".to_string();
         };
-        // Every verb below addresses a SLOT; the Visible field has none (its
-        // glyphs are re-laid every frame), so until M3 re-keys the verbs by
-        // byte range they are reported, not applied — the group verbs
-        // included, because their slot sweep would ask for slot math too.
-        if self.field.visible().is_some() {
-            return format!("verb {verb:?}: not keyed for the Visible field yet (M3) — ignored");
-        }
         let gid = hit.group_id;
         let rel = hit.rel_path.clone();
         let glyph = hit.glyph.clone();
+        // The glyph verbs address a SLOT; the Visible field has none (its
+        // glyphs are re-laid every frame), so there they are keyed by
+        // (item, byte) instead — `apply_glyph_verb_visible`. The group verbs
+        // edit the group table either way and share the path below (where
+        // `sync_segment` and `SetHidden` also tell the field).
+        if let Some(item) = self.visible_item_of(gid) {
+            if matches!(
+                verb,
+                Verb::RecolorGlyph(_)
+                    | Verb::RecolorLine(_)
+                    | Verb::NudgeGlyph(_)
+                    | Verb::ScaleGlyph(_)
+                    | Verb::SetGlyphBackground(_)
+                    | Verb::SetGlyphTransform(..)
+                    | Verb::ResetGlyphGroup
+            ) {
+                return self.apply_glyph_verb_visible(ctx, item, verb);
+            }
+        }
         let pack = |rgb: [u8; 3]| -> u32 {
             rgb[0] as u32 | (rgb[1] as u32) << 8 | (rgb[2] as u32) << 16 | 0xFF00_0000
         };
@@ -896,7 +1062,7 @@ impl GlyphScene {
                 g.cols[0][2] += d[2];
                 let off = [g.cols[0][0], g.cols[0][1], g.cols[0][2]];
                 self.write_group_row(ctx, gid);
-                self.sync_segment(gid);
+                self.sync_segment(ctx, gid);
                 format!(
                     "verb move-group: {rel} group {gid} offset -> ({:.1},{:.1},{:.1}) (80 B row)",
                     off[0], off[1], off[2]
@@ -911,7 +1077,7 @@ impl GlyphScene {
                 }
                 let s = g.cols[3][0];
                 self.write_group_row(ctx, gid);
-                self.sync_segment(gid);
+                self.sync_segment(ctx, gid);
                 format!("verb scale-group: {rel} group {gid} scale -> {s:.3} (80 B row)")
             }
             Verb::TintGroup(rgb) => {
@@ -922,7 +1088,7 @@ impl GlyphScene {
                 g.cols[2][1] = rgb[1];
                 g.cols[2][2] = rgb[2];
                 self.write_group_row(ctx, gid);
-                self.sync_segment(gid);
+                self.sync_segment(ctx, gid);
                 format!(
                     "verb tint-group: {rel} group {gid} tint -> ({:.2},{:.2},{:.2}) (80 B row)",
                     rgb[0], rgb[1], rgb[2]
@@ -1000,8 +1166,19 @@ impl GlyphScene {
                     }
                 }
                 self.write_group_row(ctx, gid);
+                // The Visible field culls its items itself: tell it, so the
+                // item leaves (or rejoins) every tier and the HUD's counts move.
+                let item_note = match self.visible_item_of(gid) {
+                    Some(item) => {
+                        if let Some(visible) = self.field.visible() {
+                            visible.set_item_hidden(&ctx.queue, item, *hide);
+                        }
+                        format!("; item {item} hidden={hide}")
+                    }
+                    None => String::new(),
+                };
                 format!(
-                    "verb {}: {rel} group {gid} (alpha -> {}, 80 B row; cull skips the segment)",
+                    "verb {}: {rel} group {gid} (alpha -> {}, 80 B row; cull skips the segment{item_note})",
                     if *hide { "hide-group" } else { "show-group" },
                     g_alpha(self.groups_cpu.get(gid as usize)),
                 )
@@ -1010,6 +1187,115 @@ impl GlyphScene {
                 let hidden = self.group_hidden(gid);
                 self.apply_verb(ctx, &Verb::SetHidden(!hidden))
             }
+        }
+    }
+
+    /// The glyph verbs on the Visible field, keyed by (item, byte) — M3.
+    /// `recolor-glyph`, `nudge-glyph`, `set-glyph-background`,
+    /// `set-glyph-transform` and `reset-glyph-group` merge into the glyph's
+    /// override (`glyph_overrides` is the source of truth; the field holds a
+    /// copy); `recolor-line` is a byte-range span over the picked row;
+    /// `scale-glyph` is not representable (the slot's advance and height come
+    /// from the atlas table, as in Derived) and says so. Every reply names
+    /// the item and byte it applied to.
+    fn apply_glyph_verb_visible(&mut self, ctx: &GpuContext, item: u32, verb: &Verb) -> String {
+        let hit = self.picked.clone().expect("apply_glyph_verb_visible: caller checked the pick");
+        let gid = hit.group_id;
+        let rel = hit.rel_path;
+        let name = verb_name(verb);
+        let Some(g) = hit.glyph else {
+            return format!("verb {name}: {rel} pick has no glyph");
+        };
+        if g.slot.is_none() {
+            return format!("verb {name}: {rel} '{}' is blank (no glyph to override)", g.ch);
+        }
+        let byte = g.byte_off as u32;
+        let key = (item, byte);
+        let pack = |rgb: [u8; 3]| -> u32 { rgb[0] as u32 | (rgb[1] as u32) << 8 | (rgb[2] as u32) << 16 | 0xFF00_0000 };
+        let hex = |rgb: [u8; 3]| format!("#{:02x}{:02x}{:02x}", rgb[0], rgb[1], rgb[2]);
+        match verb {
+            Verb::RecolorGlyph(rgb) => {
+                let rgb = rgb.unwrap_or(crate::config::settings().verbs.recolor_glyph);
+                self.set_visible_override(ctx, key, OverrideEdit::Color(pack(rgb)));
+                format!(
+                    "verb recolor-glyph: {rel} item {item} byte {byte} (row {} col {} {:?}) -> {} (override)",
+                    g.row,
+                    g.col,
+                    g.ch,
+                    hex(rgb)
+                )
+            }
+            Verb::RecolorLine(rgb) => {
+                let rgb = rgb.unwrap_or(crate::config::settings().verbs.recolor_line);
+                if !self.ensure_pick_cache(gid) {
+                    return format!("verb recolor-line: {rel} pick cache unavailable");
+                }
+                let c = self.cache.as_ref().expect("cache populated: ensure_pick_cache just returned true");
+                let row = g.row;
+                let range = row_byte_range(
+                    c.records.iter().zip(&c.leaders).map(|(r, &(b, cp))| (r.row(), b, cp)),
+                    row,
+                );
+                let Some((start, end)) = range else {
+                    return format!("verb recolor-line: {rel} item {item} row {row} has no records");
+                };
+                let visible = self.field.visible().expect("apply_glyph_verb_visible: the field is Visible");
+                visible.set_item_span_range(&ctx.queue, item, start, end, pack(rgb));
+                format!("verb recolor-line: {rel} item {item} bytes {start}..{end} (row {row}) -> {} (span)", hex(rgb))
+            }
+            Verb::NudgeGlyph(d) => {
+                let ov = self.set_visible_override(ctx, key, OverrideEdit::NudgeX(d[0]));
+                if let Some(pg) = self.picked.as_mut().and_then(|h| h.glyph.as_mut()) {
+                    pg.pos[0] += d[0];
+                }
+                let dropped = if d[1] != 0.0 || d[2] != 0.0 {
+                    " — y/z nudge not representable (the slot carries x only, as in Derived)"
+                } else {
+                    ""
+                };
+                format!("verb nudge-glyph: {rel} item {item} byte {byte} x_nudge -> {:.2} (override){dropped}", ov.x_nudge)
+            }
+            Verb::ScaleGlyph(f) => format!(
+                "verb scale-glyph: {rel} item {item} byte {byte} x{f} not representable in the Visible field \
+                 (advance and height come from the atlas table, as in Derived) — ignored"
+            ),
+            Verb::SetGlyphBackground(bg_rgba) => {
+                let mut row = self
+                    .groups_cpu
+                    .get(gid as usize)
+                    .copied()
+                    .unwrap_or(crate::glyph_scene::GroupRow::identity([0.0; 3]));
+                row.cols[5] = *bg_rgba;
+                match self.allocate_group_row(ctx, row) {
+                    Some(new_gid) => {
+                        self.set_visible_override(ctx, key, OverrideEdit::Group(new_gid));
+                        format!("verb set-glyph-background: {rel} item {item} byte {byte} (row {} col {}) -> group {new_gid} (override)", g.row, g.col)
+                    }
+                    None => format!("verb set-glyph-background: {rel} out of groups (max {})", self.group_buf.size() / 96),
+                }
+            }
+            Verb::SetGlyphTransform(t, q, s) => {
+                let mut row = self
+                    .groups_cpu
+                    .get(gid as usize)
+                    .copied()
+                    .unwrap_or(crate::glyph_scene::GroupRow::identity([0.0; 3]));
+                row.cols[0] = [t[0], t[1], t[2], 0.0];
+                row.cols[1] = *q;
+                row.cols[3] = [s[0], s[1], s[2], row.cols[3][3]];
+                match self.allocate_group_row(ctx, row) {
+                    Some(new_gid) => {
+                        self.set_visible_override(ctx, key, OverrideEdit::Group(new_gid));
+                        format!("verb set-glyph-transform: {rel} item {item} byte {byte} (row {} col {}) -> group {new_gid} (override)", g.row, g.col)
+                    }
+                    None => format!("verb set-glyph-transform: {rel} out of groups (max {})", self.group_buf.size() / 96),
+                }
+            }
+            Verb::ResetGlyphGroup => {
+                self.set_visible_override(ctx, key, OverrideEdit::ClearGroup);
+                format!("verb reset-glyph-group: {rel} item {item} byte {byte} -> group {gid} (the item's own)")
+            }
+            _ => unreachable!("apply_verb routes only the glyph verbs here"),
         }
     }
 }
@@ -1083,5 +1369,85 @@ mod pick_3d_tests {
         let t = ray_aabb(ro, rd, min, max);
         assert!(t.is_some(), "ray along -Z must pierce 3D depth AABB");
         assert!((t.unwrap() - 30.0).abs() < 1e-6);
+    }
+}
+
+/// M3: the (item, byte) re-keying, held without a device — the selection a
+/// pick becomes in the Visible field, the row range `recolor-line` colours,
+/// and the override merge every glyph verb goes through.
+#[cfg(test)]
+mod visible_key_tests {
+    use super::*;
+
+    fn glyph(byte_off: usize, ch: char, slot: Option<u32>) -> PickGlyph {
+        PickGlyph { record: 0, slot, row: 2, col: 5, line: 2, byte_off, ch, pos: [0.0; 3], advance: 0.5, height: 1.0 }
+    }
+
+    #[test]
+    fn a_glyph_pick_selects_its_leader_bytes_and_a_file_pick_the_whole_item() {
+        // ASCII: one byte. A multi-byte leader: its whole UTF-8 run, so the
+        // range's end is where the NEXT leader starts.
+        assert_eq!(
+            byte_range_selection(3, Some(&glyph(17, 'A', Some(40))), Some(100)),
+            Selection::ByteRange { item: 3, start: 17, end: 18 }
+        );
+        assert_eq!(
+            byte_range_selection(3, Some(&glyph(17, '\u{1F600}', Some(40))), Some(100)),
+            Selection::ByteRange { item: 3, start: 17, end: 21 }
+        );
+        // A file-level pick is the whole item; so is a blank glyph (no slot —
+        // nothing to light), as the stored modes select the whole segment.
+        assert_eq!(byte_range_selection(3, None, Some(100)), Selection::ByteRange { item: 3, start: 0, end: 100 });
+        assert_eq!(
+            byte_range_selection(3, Some(&glyph(17, ' ', None)), Some(100)),
+            Selection::ByteRange { item: 3, start: 0, end: 100 }
+        );
+        // Unknown length: every leader lies below u32::MAX.
+        assert_eq!(byte_range_selection(0, None, None), Selection::ByteRange { item: 0, start: 0, end: u32::MAX });
+        assert_eq!(Selection::ByteRange { item: 3, start: 17, end: 21 }.describe(), "3:17..21");
+    }
+
+    #[test]
+    fn a_row_range_runs_from_its_first_leader_to_its_last_leaders_end() {
+        // (row, byte, codepoint): row 1 holds bytes 4..7 ('d', 'é' (2 B), '\n').
+        let recs = [
+            (0, 0, 'a' as u32),
+            (0, 1, 'b' as u32),
+            (0, 2, 'c' as u32),
+            (0, 3, '\n' as u32),
+            (1, 4, 'd' as u32),
+            (1, 5, 'é' as u32),
+            (1, 7, '\n' as u32),
+            (2, 8, 'x' as u32),
+        ];
+        assert_eq!(row_byte_range(recs.iter().copied(), 1), Some((4, 8)));
+        assert_eq!(row_byte_range(recs.iter().copied(), 0), Some((0, 4)));
+        assert_eq!(row_byte_range(recs.iter().copied(), 2), Some((8, 9)));
+        assert_eq!(row_byte_range(recs.iter().copied(), 7), None);
+        // Order-independent: the range is min/max, not first/last seen.
+        assert_eq!(row_byte_range(recs.iter().rev().copied(), 1), Some((4, 8)));
+    }
+
+    #[test]
+    fn override_edits_merge_lane_by_lane_and_clear_to_empty() {
+        let c = merged_override(None, 2, 9, OverrideEdit::Color(0xFF00_00FF));
+        assert_eq!(c, GlyphOverride { item: 2, byte: 9, color: 0xFF00_00FF, x_nudge: 0.0, group: NO_GROUP });
+        // A nudge after a recolour keeps the colour; nudges accumulate.
+        let n = merged_override(Some(c), 2, 9, OverrideEdit::NudgeX(0.25));
+        let n = merged_override(Some(n), 2, 9, OverrideEdit::NudgeX(0.25));
+        assert_eq!((n.color, n.x_nudge, n.group), (0xFF00_00FF, 0.5, NO_GROUP));
+        // A group override rides beside both; clearing it leaves them.
+        let g = merged_override(Some(n), 2, 9, OverrideEdit::Group(77));
+        assert_eq!((g.color, g.x_nudge, g.group), (0xFF00_00FF, 0.5, 77));
+        let cleared = merged_override(Some(g), 2, 9, OverrideEdit::ClearGroup);
+        assert_eq!((cleared.color, cleared.x_nudge, cleared.group), (0xFF00_00FF, 0.5, NO_GROUP));
+        assert!(!override_is_empty(&cleared));
+        // Only a group set and then cleared is empty — and gets removed, not kept.
+        let only_group = merged_override(None, 2, 9, OverrideEdit::Group(77));
+        assert!(!override_is_empty(&only_group));
+        assert!(override_is_empty(&merged_override(Some(only_group), 2, 9, OverrideEdit::ClearGroup)));
+        // A nudge back to zero is empty too.
+        let back = merged_override(Some(merged_override(None, 2, 9, OverrideEdit::NudgeX(1.0))), 2, 9, OverrideEdit::NudgeX(-1.0));
+        assert!(override_is_empty(&back));
     }
 }

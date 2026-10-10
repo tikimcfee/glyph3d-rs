@@ -114,8 +114,19 @@ caller; the short version:
     pass; the CPU cull keeps only the backdrops, under `[lod] visible_backdrop_px`,
     and the hidden flags). No syntax heuristic runs in this mode (by decision);
     a `--highlight` sidecar becomes byte spans (`VisibleField::set_item_spans`).
-    Selection highlight and the slot verbs are not keyed for it yet (M3): the
-    mask draws nothing and a verb is reported, not applied. `--debug-tint lod|cull`
+    **Everything the scene keyed by SLOT is keyed by (item, byte) here** (M3,
+    2026-10-10; `out/VISIBLE-MODE.md` § M3): the item is the file's index in
+    the load (its group id at load, `GlyphScene::visible_item_of`) and the byte
+    the glyph's leader offset — both from the CPU pick. The selection is a
+    `Selection::ByteRange` the field lays out again into its mask buffer
+    (`prepare_mask` after `prepare`, same encoder; `record_mask_draw` in the
+    mask pass); the glyph verbs merge into one `GlyphOverride` per (item,
+    byte) (`glyph_overrides`, the scene's map, is the source of truth —
+    colour, x nudge, group; y/z nudge and `scale-glyph` are not representable,
+    as in Derived, and the reply says so); `recolor-line` is a span over the
+    row's byte range; `hide-group` also calls `set_item_hidden`, and every
+    `sync_segment` pushes the recomputed box with `set_item_bbox`. The stored
+    modes' slot paths are untouched. `--debug-tint lod|cull`
     colours its glyphs by LOD tier or cull state (the other modes never read it).
   - **The Derived lanes are a load-time limit** (`layout_hyper::derived_lane_limits`,
     2026-10-10): item count vs `ITEM_MAX`, rows per item vs `ROW_MAX`, column pages
@@ -212,6 +223,14 @@ Detailed technical audit lives in `research/desktop-platform-audit.md`. Key touc
   instance count, backdrop count.
 - `GLYPH_G_DUMP=<slot>[,<len>]` — offscreen only: reads back instance bytes
   at `slot` from the glyph arena and prints hex (buffer write-path audits).
+  `GLYPH_G_DUMP=<item>:<byte>[,<len>]` (M3, 2026-10-10) is the Visible
+  field's form: the glyph whose leader is `byte` of item `item` is LOCATED in
+  the transient slot buffer of the last prepared frame (`VisibleField::locate`,
+  a blocking segment-list readback) and its 20 B slot printed; "not laid out
+  in the last frame" when the line was culled or washed. Both forms now run
+  AFTER the frames and the readback wait (the stored form used to run before
+  the first frame; a stored slot reads the same either way). The PNG is
+  untouched by either. `offscreen::parse_dump_spec` is the parser.
 - `GLYPH_K4_SELFTEST=1` — windowed, dev-only (Stage K): at t≈3 s moves the
   Debug panel's LOD threshold slider programmatically (1.0 → 16.0) and logs the
   cull counters before/after — exercises the panel → probe → CullState →
@@ -237,6 +256,16 @@ Detailed technical audit lives in `research/desktop-platform-audit.md`. Key touc
   (`FIELDMODE-SELFTEST before/after step N: …`) around each rebuild. Until the
   Visible field's bodies land, the third step panics at `VisibleField::new`,
   which is the proof that the mode reaches the call.
+- `GLYPH_VISIBLE_VERB_SELFTEST=1` — windowed, dev-only (M3, 2026-10-10): from
+  t≈3 s, one step every fourth frame, through the SAME entry points the CLI op
+  stream and the panel use (`apply_pick`, then `apply_verb` on `parse_verb`
+  literals): picks the first file's row 0 col 0 (`=file[:row[:col]]` picks
+  elsewhere), then `recolor-glyph`, `nudge-glyph 0.5 0 0`,
+  `set-glyph-background 2050c0`, `hide-group`, `show-group`, printing each
+  reply (`VISIBLE-VERB-SELFTEST step N (...)`) and the F8 HUD line after it
+  (`... hud after step N: ...`, which carries `selection item:start..end` and
+  `pick file byte N` in visible mode). Meant for `--field-mode visible`; in a
+  stored mode the same steps run through the slot paths.
 - `GLYPH_POSE_PRINT=1` — windowed: F2 (screenshot) also prints the frame's
   camera as the `--cam-pose X Y Z YAW PITCH` argument (degrees) that
   reproduces it — the same line the Debug panel's "copy pose" button puts on
@@ -247,6 +276,9 @@ Detailed technical audit lives in `research/desktop-platform-audit.md`. Key touc
   per tier (glyph / wash / backdrop), segments, slots (and dropped) and the
   GPU cull/layout/draw ms from `VisibleField::stats()`; the stored modes show
   their instance and draw-range counts. Open by default in `--field-mode visible`.
+  Since M3 it also shows the selection in the field's own key
+  (`item:start..end` for Visible, the slot or slot range otherwise) and the
+  pick's `file byte N`.
 - `GLYPH_L3_SHADER_COMPOSITE=1` — offscreen, dev-only (Stage L): makes the
   offscreen target Bgra8UnormSrgb, forcing the WINDOWED shader-composite
   path (composite.wgsl) under the deterministic oracle driver; the readback
