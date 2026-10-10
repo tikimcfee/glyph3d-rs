@@ -1,0 +1,40 @@
+# jit-text — headless measurement crate for the GPU-direction study, the
+# sibling of ../jit-layout: the visible-set layout kernel made REAL TEXT.
+# The kernel resolves glyphs on the GPU from the resident atlas tables
+# (the codepoints.bin trie as-is, or a direct BMP table + hash tables),
+# cluster mode included (emoji sequences), and the slots it emits drive the
+# renderer's own Derived-mode Slug shader. `--check` holds every slot to
+# HyperLayout (the native crate, linked as a library). Measurement only;
+# nothing here is a gate.
+#
+# Its OWN workspace, like jit-layout (the experiments root needs a Zed
+# checkout this crate has no use for; the repo root `exclude`s experiments).
+#
+#     cd experiments/gpu-direction/jit-text && cargo build --release
+#     target/release/jit-text <corpus-dir> [--view page|overview|worst|all] [--repeat K]
+#         [--screenshot <png>] [--atlas-dir <dir>] [--emoji-sheet <path>]
+#         [--no-emoji] [--check <fixture-file-or-dir>] [--threads T] [--segment-bytes S]
+#
+# wgpu is pinned to the same major as native/Cargo.toml (30.x).
+[package]
+name = "jit-text"
+version = "0.1.0"
+edition = "2021"
+
+[workspace]
+
+[dependencies]
+wgpu = "30"
+pollster = "0.4"
+bytemuck = { version = "1", features = ["derive"] }
+memchr = "2"
+png = "0.18"
+glam = "0.33"
+# The reference for --check (HyperLayout), and the emoji sheet decoder.
+# CubeCL off (not wanted here). The egui overlay feature has to stay ON: with
+# it off the library does not compile (windowed/state.rs names egui ungated,
+# 2026-10-09) — a defect in native's feature gating, not this crate's to fix.
+glyph3d-native = { path = "../../../native", default-features = false, features = ["egui-ui"] }
+
+[profile.release]
+debug = 1
