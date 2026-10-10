@@ -5,6 +5,81 @@
 
 use super::{CameraMode, GlyphScene};
 
+/// Which LOD handle the Debug panel just moved (C26, 2026-10-10).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LodHandle {
+    /// "Text detail" (`greek_onset_px`).
+    TextDetail,
+    /// "Show glyphs" (`lod_min_px`).
+    ShowGlyphs,
+    /// "File rectangle", the Visible field's tier under Show glyphs
+    /// (`lod_backdrop_px`).
+    FileRectangle,
+}
+
+/// Keep the three LOD tiers ordered after `moved` changed: text detail >=
+/// show glyphs >= file rectangle (all px per text row). The handle that
+/// moved keeps its value and the others yield — a clamp, never an error —
+/// so glyphs always appear fuzzed first and sharpen as the viewer
+/// approaches. Only the panel calls this, on a slider change: values that
+/// arrive from the CLI or a config file are applied as given.
+pub fn keep_lod_order(moved: LodHandle, text_detail: &mut f32, show_glyphs: &mut f32, file_rectangle: &mut f32) {
+    match moved {
+        LodHandle::TextDetail => {
+            *show_glyphs = show_glyphs.min(*text_detail);
+            *file_rectangle = file_rectangle.min(*show_glyphs);
+        }
+        LodHandle::ShowGlyphs => {
+            *text_detail = text_detail.max(*show_glyphs);
+            *file_rectangle = file_rectangle.min(*show_glyphs);
+        }
+        LodHandle::FileRectangle => {
+            *show_glyphs = show_glyphs.max(*file_rectangle);
+            *text_detail = text_detail.max(*show_glyphs);
+        }
+    }
+}
+
+impl UiProbeState {
+    /// `keep_lod_order` over this state's three live thresholds.
+    pub fn keep_lod_order(&mut self, moved: LodHandle) {
+        keep_lod_order(moved, &mut self.greek_onset_px, &mut self.lod_min_px, &mut self.lod_backdrop_px);
+    }
+}
+
+#[cfg(test)]
+mod lod_order_tests {
+    use super::{keep_lod_order, LodHandle};
+
+    fn after(moved: LodHandle, detail: f32, show: f32, rect: f32) -> (f32, f32, f32) {
+        let (mut d, mut s, mut r) = (detail, show, rect);
+        keep_lod_order(moved, &mut d, &mut s, &mut r);
+        (d, s, r)
+    }
+
+    #[test]
+    fn the_moved_handle_wins_and_the_others_yield() {
+        // Show glyphs dragged above text detail: detail follows it up.
+        assert_eq!(after(LodHandle::ShowGlyphs, 10.0, 12.0, 0.25), (12.0, 12.0, 0.25));
+        // Text detail dragged below show glyphs: show glyphs follows it down,
+        // and the file rectangle under it too.
+        assert_eq!(after(LodHandle::TextDetail, 0.5, 1.0, 0.25), (0.5, 0.5, 0.25));
+        assert_eq!(after(LodHandle::TextDetail, 0.1, 1.0, 0.25), (0.1, 0.1, 0.1));
+        // File rectangle dragged above both: both follow it up.
+        assert_eq!(after(LodHandle::FileRectangle, 2.0, 1.0, 3.0), (3.0, 3.0, 3.0));
+        // Show glyphs dragged below the file rectangle: the rectangle follows.
+        assert_eq!(after(LodHandle::ShowGlyphs, 10.0, 0.1, 0.25), (10.0, 0.1, 0.1));
+    }
+
+    #[test]
+    fn an_ordered_set_is_untouched_whichever_handle_moved() {
+        for moved in [LodHandle::TextDetail, LodHandle::ShowGlyphs, LodHandle::FileRectangle] {
+            assert_eq!(after(moved, 10.0, 1.0, 0.25), (10.0, 1.0, 0.25), "{moved:?}");
+            assert_eq!(after(moved, 1.0, 1.0, 1.0), (1.0, 1.0, 1.0), "{moved:?} (equal is ordered)");
+        }
+    }
+}
+
 // The windowed egui Debug panel (K3) needs read-only scene state, but
 // windowed.rs holds the scene type-erased as `Box<dyn SceneLike>` and fence
 // 4 forbids trait changes. The probe is the channel: a shared cell installed
@@ -40,11 +115,13 @@ pub struct UiProbeState {
     // applied by render() before culling. Seeded from the compile-time
     // consts at install; offscreen never installs a probe, so the consts
     // rule there. ──
-    /// Live LOD threshold in px/em (default: `[lod] min_px`).
+    /// Live "Show glyphs" threshold, px per text row (default: `[lod]
+    /// show_glyphs_px`): at or above it a segment is glyphs, below it a
+    /// backdrop rectangle (visible mode: a line wash).
     pub lod_min_px: f32,
-    /// Live backdrop threshold of the Visible field in px/em (default:
-    /// `[lod] visible_backdrop_px`); lines between it and `lod_min_px` are
-    /// washes. Unread by the other modes.
+    /// Live "File rectangle" threshold of the Visible field, px per text row
+    /// (default: `[lod] visible_backdrop_px`); lines between it and
+    /// `lod_min_px` are washes. Unread by the other modes.
     pub lod_backdrop_px: f32,
     /// Live debug tint of the Visible field (`--debug-tint`): 0 off, 1 by
     /// LOD tier, 2 by cull state. Written to the Params uniform's spare
@@ -58,7 +135,9 @@ pub struct UiProbeState {
     pub greeking: bool,
     /// Live Greeking pure bypass (hard cutoff, max FPS) toggle.
     pub greek_pure: bool,
-    /// Live Greeking onset threshold in px/em (default 10.0).
+    /// Live "Text detail" threshold, px per text row (default: `[lod]
+    /// text_detail_px`): at or above it glyphs render with full curve
+    /// detail, below it greeking fuzzes them progressively.
     pub greek_onset_px: f32,
     // ── K4: live cull readouts (scene → UI; the same sums GLYPH_CULL_DEBUG
     // prints). Zero when culling is disabled (--no-cull). ──
@@ -234,7 +313,7 @@ impl GlyphScene {
             .map(|c| (c.file_backgrounds.get(), c.file_bg_color.get(), c.lod_min_px.get(), c.lod_backdrop_px.get()))
             .unwrap_or_else(|| {
                 let s = crate::config::settings();
-                (false, s.glyph_scene.file_bg_color, s.lod.min_px, s.lod.visible_backdrop_px)
+                (false, s.glyph_scene.file_bg_color, s.lod.show_glyphs_px, s.lod.visible_backdrop_px)
             });
         let mode = self.params.get().greek_mode;
         let greeking = mode != 0;

@@ -135,7 +135,7 @@ pub(super) struct CullView {
     pub(super) px_scale: f32,
     /// Stage K (K4): the LOD threshold (px/em) is per-frame data (was the
     /// LOD_MIN_PX const read directly) so windowed runs can tune it live;
-    /// offscreen always carries the `[lod] min_px` setting (see CullState::lod_min_px).
+    /// offscreen always carries the `[lod] show_glyphs_px` setting (see CullState::lod_min_px).
     pub(super) lod_min_px: f32,
     /// Whether to render file background bounding quads behind glyphs when near.
     pub(super) file_backgrounds: bool,
@@ -352,8 +352,9 @@ pub(super) struct CullState {
     /// pow(new)/pow(orig) so an untouched segment keeps its Stage F tint.
     pub(super) orig_group_rgb: Vec<[f32; 3]>,
     pub(super) hidden: Vec<bool>,
-    /// Stage K (K4): live LOD threshold (px/em), seeded from the `[lod] min_px`
-    /// setting. Cell because render(&self) is immutable (the `viewport: Cell`
+    /// Stage K (K4): the live "Show glyphs" threshold (px per text row), seeded
+    /// from the `[lod] show_glyphs_px` setting (the panel's name for it since
+    /// C26). Cell because render(&self) is immutable (the `viewport: Cell`
     /// precedent). The ONLY write site is the UI-controls application in
     /// render(), which runs solely when a windowed probe is installed —
     /// offscreen never writes it, so offscreen culls with the const.
@@ -556,7 +557,7 @@ impl CullState {
             base_tint,
             orig_group_rgb,
             hidden: vec![false; segments.len()],
-            lod_min_px: Cell::new(crate::config::settings().lod.min_px),
+            lod_min_px: Cell::new(crate::config::settings().lod.show_glyphs_px),
             lod_backdrop_px: Cell::new(crate::config::settings().lod.visible_backdrop_px),
             file_backgrounds: Cell::new(false),
             file_bg_color: Cell::new(crate::config::settings().glyph_scene.file_bg_color),

@@ -26,21 +26,35 @@ file_bg_color = [0.10, 0.10, 0.13, 0.85]
 selection_tint = [1.0, 0.85, 0.25, 0.45]
 
 [lod]
-# On-screen px per em cell (cell height = 1.0 world unit) below which a file
-# segment draws its backdrop quad instead of glyphs. Below 1 px/em glyphs are
-# raster-lottery subpixel blobs; the backdrop (mean ink colour x coverage) is
-# the visually equivalent form. Never substitutes at >= 1 px/em, so legible
-# text is always drawn glyph by glyph. Default for --lod-min-px.
-min_px = 1.0
+# Every threshold here is "px per text row": how many on-screen pixels tall a
+# row of text appears (a row is one em cell, 1.0 world unit). Fixed values,
+# never adapted to the camera. The Debug panel moves them live (windowed only;
+# offscreen and every gate keep these) and keeps them ordered
+# text_detail_px >= show_glyphs_px >= visible_backdrop_px, so glyphs appear
+# fuzzed and sharpen on approach (C26, 2026-10-10).
+#
+# "Show glyphs": at or above this a file segment is drawn glyph by glyph;
+# below it the segment draws its backdrop quad instead (in --field-mode
+# visible, a line below it is a wash). Below 1 px/em glyphs are raster-lottery
+# subpixel blobs; the backdrop (mean ink colour x coverage) is the visually
+# equivalent form. Never substitutes at >= 1 px/em, so legible text is always
+# drawn glyph by glyph. Default for --show-glyphs-px. Was `min_px` until C26;
+# the old key still merges from a launch_config.toml [lod] section.
+show_glyphs_px = 1.0
+# "Text detail": at or above this glyphs render with full curve detail; below
+# it the shader fuzzes their windings progressively (greeking: fewer ALU ops,
+# no moiré) — smoothly with --greek-smooth, as a hard cut by default. Default
+# for --text-detail-px; 10.0 was the compiled literal before C26.
+text_detail_px = 10.0
 # Backdrop alpha = ink fraction x gain. Fitted against the pre-LOD full-field
 # render: 0.7 matches its mean linear pixel value within ~3% (1.9 overshot
 # +45%, 1.3 +29%, 1.0 +17%). See out/STAGE_F_REPORT.md.
 backdrop_gain = 0.7
-# --field-mode visible only (M2, out/VISIBLE-MODE.md): px per em below which a
-# whole item is its backdrop quad. Lines between this and min_px are washes
-# (one quad per line in the item's tint); at or above min_px they are laid out
-# as glyphs. A fixed threshold, never adapted to the camera. The other field
-# modes never read it.
+# --field-mode visible only (M2, out/VISIBLE-MODE.md): below this a whole item
+# is one backdrop rectangle. Lines between this and show_glyphs_px are washes
+# (one quad per line in the item's tint); at or above show_glyphs_px they are
+# laid out as glyphs. The panel's "File rectangle" handle under "Show glyphs".
+# The other field modes never read it.
 visible_backdrop_px = 0.25
 
 [camera]

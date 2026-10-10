@@ -232,9 +232,16 @@ Detailed technical audit lives in `research/desktop-platform-audit.md`. Key touc
   the first frame; a stored slot reads the same either way). The PNG is
   untouched by either. `offscreen::parse_dump_spec` is the parser.
 - `GLYPH_K4_SELFTEST=1` — windowed, dev-only (Stage K): at t≈3 s moves the
-  Debug panel's LOD threshold slider programmatically (1.0 → 16.0) and logs the
-  cull counters before/after — exercises the panel → probe → CullState →
-  cull path without a human at the mouse.
+  Debug panel's "Show glyphs" slider programmatically (1.0 → 16.0 px per text
+  row) and logs the cull counters before/after — exercises the panel → probe
+  → CullState → cull path without a human at the mouse. (The panel's LOD
+  block since C26, 2026-10-10: "Text detail" = `[lod] text_detail_px`, the
+  greeking onset, with the fuzz toggle and smooth/pure beside it; "Show
+  glyphs" = `[lod] show_glyphs_px`, the backdrop tier, with visible mode's
+  "File rectangle" = `[lod] visible_backdrop_px` under it; the panel keeps
+  them ordered, the moved handle winning — `UiProbeState::keep_lod_order`.
+  CLI: `--text-detail-px`, `--show-glyphs-px`; the old `--greek-onset-px` /
+  `--lod-min-px` and launch_config keys still parse.)
 - `GLYPH_ZSPACE_SELFTEST=1` — windowed, dev-only: at t≈3 s drives the Debug
   panel's z_wrap_spacing dial to 2× and fires the SAME scene-rebuild arm the
   slider's drag-release uses, logging instance count (must not change —

@@ -823,49 +823,84 @@ impl WindowState {
                                 }
                             }
                         });
-                        // K4: live cull/LOD tuning — the slider writes the
+                        // K4: live cull/LOD tuning — the sliders write the
                         // shared probe cell; GlyphScene::render applies it to
-                        // CullState's Cell before culling (same frame). The
-                        // readouts are the sums GLYPH_CULL_DEBUG prints.
+                        // CullState's Cell and the Params uniform before
+                        // culling (same frame). The readouts are the sums
+                        // GLYPH_CULL_DEBUG prints.
+                        //
+                        // C26 (2026-10-10): two ideas, two always-visible
+                        // sliders in plain words. Every threshold is "px per
+                        // text row" — how many on-screen pixels tall a row
+                        // appears — fixed, never camera-adapted. The panel
+                        // keeps Text detail >= Show glyphs (>= File rectangle
+                        // in visible mode): the handle that moved wins and
+                        // the others yield (`UiProbeState::keep_lod_order`),
+                        // so glyphs appear fuzzed first and sharpen on
+                        // approach. CLI/config values are applied as given.
                         if let (Some(snap), Some(cell)) = (&probe_snap, &self.ui_probe) {
                             ui.separator();
-                            ui.label("cull/LOD — live, windowed only (offscreen keeps consts):");
-                            // Range brackets the const default (1.0 px/em) with
-                            // ~2 octaves each way; logarithmic because the
-                            // threshold is a perceptual scale.
+                            ui.label("LOD — live, windowed only (offscreen keeps the [lod] settings); px = on-screen pixels per text row:");
+                            let visible = snap.field_mode == Some(glyph_field::GlyphFieldMode::Visible);
                             let mut p = cell.borrow_mut();
-                            ui.add(
+                            let detail = ui.add(
+                                egui::Slider::new(&mut p.greek_onset_px, 2.0..=32.0)
+                                    .suffix(" px")
+                                    .text("Text detail — rows this tall get full curve detail; below, glyphs fuzz progressively"),
+                            );
+                            let fuzz = p.greeking;
+                            ui.horizontal(|ui| {
+                                ui.checkbox(&mut p.greeking, "fuzz below it (greeking, anti-moiré)");
+                                ui.add_enabled_ui(fuzz, |ui| {
+                                    ui.selectable_value(&mut p.greek_pure, false, "smooth");
+                                    ui.selectable_value(&mut p.greek_pure, true, "pure (hard cut, max FPS)");
+                                });
+                            });
+                            // Range brackets the default (1.0) with ~2 octaves
+                            // each way; logarithmic because the threshold is
+                            // a perceptual scale.
+                            let show = ui.add(
                                 egui::Slider::new(&mut p.lod_min_px, 0.25..=16.0)
                                     .logarithmic(true)
-                                    .text("LOD px/em"),
+                                    .suffix(" px")
+                                    .text(if visible {
+                                        "Show glyphs — rows this tall become glyphs; below, a line is a wash"
+                                    } else {
+                                        "Show glyphs — rows this tall become glyphs; below, a file is its rectangle"
+                                    }),
                             );
+                            // The visible field's second handle, under Show
+                            // glyphs: the file-rectangle-vs-line-wash tier.
+                            let rect = visible.then(|| {
+                                ui.indent("lod_file_rectangle", |ui| {
+                                    ui.add(
+                                        egui::Slider::new(&mut p.lod_backdrop_px, 0.05..=4.0)
+                                            .logarithmic(true)
+                                            .suffix(" px")
+                                            .text("File rectangle (visible mode) — rows this tall get line washes; below, the whole file is one rectangle"),
+                                    )
+                                })
+                                .inner
+                            });
+                            if detail.changed() {
+                                p.keep_lod_order(crate::glyph_scene::LodHandle::TextDetail);
+                            } else if show.changed() {
+                                p.keep_lod_order(crate::glyph_scene::LodHandle::ShowGlyphs);
+                            } else if rect.is_some_and(|r| r.changed()) {
+                                p.keep_lod_order(crate::glyph_scene::LodHandle::FileRectangle);
+                            }
                             ui.horizontal(|ui| {
                                 ui.checkbox(&mut p.file_backgrounds, "File card backgrounds");
                                 ui.color_edit_button_rgba_unmultiplied(&mut p.file_bg_color);
                             });
-                            ui.checkbox(&mut p.greeking, "Glyph greeking (anti-moiré)");
-                            if p.greeking {
-                                ui.checkbox(&mut p.greek_pure, "Pure bypass (hard cutoff, max FPS)");
-                                ui.add(
-                                    egui::Slider::new(&mut p.greek_onset_px, 2.0..=32.0)
-                                        .text("Greeking onset px/em (default 10.0)"),
-                                );
-                            }
                             ui.label(format!(
                                 "cull: {} draw ranges, {} instances | {} backdrops",
                                 snap.cull_ranges, snap.cull_instances, snap.cull_backdrops
                             ));
-                            // The visible field's own dials. Fixed thresholds
-                            // (never camera-adapted); the tint is a diagnostic
+                            // The visible field's debug tint: a diagnostic
                             // the stored modes' shaders never read.
-                            if snap.field_mode == Some(glyph_field::GlyphFieldMode::Visible) {
+                            if visible {
                                 ui.separator();
-                                ui.label("visible field — glyph tier is the LOD px/em above; under this, an item is a backdrop (between: washes):");
-                                ui.add(
-                                    egui::Slider::new(&mut p.lod_backdrop_px, 0.05..=4.0)
-                                        .logarithmic(true)
-                                        .text("backdrop px/em"),
-                                );
                                 ui.horizontal(|ui| {
                                     ui.label("debug tint:");
                                     for (mode, label) in [(0u32, "off"), (1, "by LOD tier"), (2, "by cull state")] {

@@ -12,7 +12,10 @@ use std::path::{Path, PathBuf};
 pub struct LaunchConfig {
     pub file_backgrounds: Option<bool>,
     pub file_bg_color: Option<[f32; 4]>,
-    pub lod_min_px: Option<f32>,
+    /// "Show glyphs", px per text row (`--show-glyphs-px`). Was `lod_min_px`
+    /// until 2026-10-10 (C26); the old key still parses as an alias.
+    #[serde(alias = "lod_min_px")]
+    pub show_glyphs_px: Option<f32>,
     pub wrap_mode: Option<String>,
     pub z_wrap_spacing: Option<f64>,
     pub cluster_mode: Option<String>,
@@ -22,7 +25,10 @@ pub struct LaunchConfig {
     pub greeking: Option<bool>,
     pub greek_pure: Option<bool>,
     pub greek_smooth: Option<bool>,
-    pub greek_onset_px: Option<f32>,
+    /// "Text detail", px per text row (`--text-detail-px`). Was
+    /// `greek_onset_px`; the old key still parses as an alias.
+    #[serde(alias = "greek_onset_px")]
+    pub text_detail_px: Option<f32>,
     pub load_repo: Option<PathBuf>,
     pub repo_engine: Option<String>,
     pub field_mode: Option<String>,
@@ -119,7 +125,7 @@ mod tests {
             # Glyph3D launch config
             file_backgrounds = true
             file_bg_color = [0.12, 0.13, 0.18, 0.90]
-            lod_min_px = 1.5
+            show_glyphs_px = 1.5
             wrap_mode = "back"
             z_wrap_spacing = 0.20
             cluster_mode = "cluster"
@@ -128,7 +134,7 @@ mod tests {
             no_ui = true
             greeking = true
             greek_pure = true
-            greek_onset_px = 12.0
+            text_detail_px = 12.0
             load_repo = "/path/to/repo"
             field_mode = "derived"
             claude_projects_dir = "~/my_claude_projects"
@@ -141,7 +147,7 @@ mod tests {
         let cfg = LaunchConfig::from_toml_str(toml).expect("parse failed");
         assert_eq!(cfg.file_backgrounds, Some(true));
         assert_eq!(cfg.file_bg_color, Some([0.12, 0.13, 0.18, 0.90]));
-        assert_eq!(cfg.lod_min_px, Some(1.5));
+        assert_eq!(cfg.show_glyphs_px, Some(1.5));
         assert_eq!(cfg.wrap_mode.as_deref(), Some("back"));
         assert_eq!(cfg.z_wrap_spacing, Some(0.20));
         assert_eq!(cfg.cluster_mode.as_deref(), Some("cluster"));
@@ -150,7 +156,7 @@ mod tests {
         assert_eq!(cfg.no_ui, Some(true));
         assert_eq!(cfg.greeking, Some(true));
         assert_eq!(cfg.greek_pure, Some(true));
-        assert_eq!(cfg.greek_onset_px, Some(12.0));
+        assert_eq!(cfg.text_detail_px, Some(12.0));
         assert_eq!(cfg.load_repo, Some(PathBuf::from("/path/to/repo")));
         assert_eq!(cfg.field_mode.as_deref(), Some("derived"));
         assert_eq!(cfg.claude_projects_dir, Some(PathBuf::from("~/my_claude_projects")));
@@ -196,8 +202,17 @@ mod tests {
 
     #[test]
     fn integer_literal_accepted_for_float_key() {
-        let cfg = LaunchConfig::from_toml_str("lod_min_px = 2\n").expect("parse failed");
-        assert_eq!(cfg.lod_min_px, Some(2.0));
+        let cfg = LaunchConfig::from_toml_str("show_glyphs_px = 2\n").expect("parse failed");
+        assert_eq!(cfg.show_glyphs_px, Some(2.0));
+    }
+
+    /// C26 (2026-10-10) renamed `lod_min_px` and `greek_onset_px`; a file
+    /// written before it still parses, into the new fields.
+    #[test]
+    fn old_lod_keys_are_aliases() {
+        let cfg = LaunchConfig::from_toml_str("lod_min_px = 2\ngreek_onset_px = 12.0\n").expect("parse failed");
+        assert_eq!(cfg.show_glyphs_px, Some(2.0));
+        assert_eq!(cfg.text_detail_px, Some(12.0));
     }
 
     #[test]
