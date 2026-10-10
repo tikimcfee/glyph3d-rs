@@ -15,7 +15,7 @@ use crate::fold::{rows_for_line, wrap_row_of, wrap_segment_of};
 use crate::glyph_scene::{BlockCull, RenderSlot, SUBSEG_BLOCK_SIZE};
 use crate::layout::{FileTintAccum, InkExtent, ItemPlacement, LayoutItem, PageExtent, Paint};
 use glyph_field_derived::DerivedSlot;
-use super::char_resolve::resolve_byte_char;
+use super::char_resolve::{resolve_byte_char, ResolveCtx};
 use super::page::Pager;
 use super::types::Pass2DeviceOutput;
 
@@ -379,6 +379,7 @@ fn layout_pass2_chunk<E: SlotEmit>(
     let bytes = chunk_bytes;
     let p = &item.params;
     let cluster = super::char_resolve::clusters(p);
+    let rctx = ResolveCtx { trie, bitmap_adv, em_height_fu, cluster };
     let group_id = item.group_id;
     let mut max_row_seen = -1i64;
 
@@ -1323,7 +1324,7 @@ fn layout_pass2_chunk<E: SlotEmit>(
             }
         }
 
-        let r = match resolve_byte_char(bytes, pos, trie, bitmap_adv, em_height_fu, cluster, &mut trailer_until) {
+        let r = match resolve_byte_char(bytes, pos, rctx, &mut trailer_until) {
             Some(r) => r,
             None => {
                 pos += 1;

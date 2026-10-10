@@ -848,8 +848,8 @@ find = """    if c_end % fold_unit == 0 {
         return 0.0;
     }"""
 with = """    if c_end > c0 {
-        let _ = (seg_in, bytes, trie, bitmap_adv, cluster);
-        return (c_end % fold_unit) as f32 * fu_to_world(1229, em_height_fu);
+        let _ = (seg_in, bytes);
+        return (c_end % fold_unit) as f32 * fu_to_world(1229, rctx.em_height_fu);
     }"""
 expect = "hyper-oracle FAIL"
 rebuild = "cargo build --release"

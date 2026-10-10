@@ -93,22 +93,32 @@ fn resolved(glyph_id: u32, advance: f32, height: f32, is_newline: bool) -> Resol
     ResolvedChar { glyph_id, advance, height, is_newline, seq_lead: false }
 }
 
+/// What resolving a byte reads besides the bytes: the atlas trie and the
+/// item's constants (bitmap advance, em height, cluster mode). `Copy`, built
+/// once per item (or chunk) walk and passed by value — the walk's STATE
+/// (`trailer_until`, `has_cluster`) stays the caller's `&mut` locals on
+/// purpose, so the hot loops keep them where they were (C3, 2026-10-09).
+#[derive(Clone, Copy)]
+pub(crate) struct ResolveCtx<'a> {
+    pub trie: &'a TrieTable,
+    pub bitmap_adv: f32,
+    pub em_height_fu: u32,
+    pub cluster: bool,
+}
+
 /// The slow path: one leader the fast table could not answer (a non-ASCII
 /// leader, a byte inside a trailer span, or a `seq_lead` byte with a
 /// non-ASCII successor in cluster mode).
-#[allow(clippy::too_many_arguments)]
 #[inline(always)]
 fn resolve_leader(
     bytes: &[u8],
     pos: usize,
     seq_len: usize,
-    trie: &TrieTable,
-    bitmap_adv: f32,
-    em_height_fu: u32,
-    cluster: bool,
+    ctx: ResolveCtx<'_>,
     trailer_until: &mut usize,
     has_cluster: &mut bool,
 ) -> ResolvedChar {
+    let ResolveCtx { trie, bitmap_adv, em_height_fu, cluster } = ctx;
     let cp = decode_codepoint(bytes, pos, seq_len);
     let entry = trie.lookup(cp);
     let height = fu_to_world(entry.height_fu, em_height_fu);
@@ -190,40 +200,25 @@ fn resolve_leader(
 pub(crate) fn resolve_byte_char(
     bytes: &[u8],
     pos: usize,
-    trie: &TrieTable,
-    bitmap_adv: f32,
-    em_height_fu: u32,
-    cluster: bool,
+    ctx: ResolveCtx<'_>,
     trailer_until: &mut usize,
 ) -> Option<ResolvedChar> {
-    resolve_byte_char_cluster(
-        bytes,
-        pos,
-        trie,
-        bitmap_adv,
-        em_height_fu,
-        cluster,
-        trailer_until,
-        &mut false,
-    )
+    resolve_byte_char_cluster(bytes, pos, ctx, trailer_until, &mut false)
 }
 
 /// Resolve the byte at `pos`: `None` for a non-leader (a continuation or
 /// invalid lead byte), else its glyph, advance and height. `cluster` is the
 /// item's mode ([`clusters`]); `trailer_until` carries a matched sequence's
 /// span across calls and starts at 0 for each item (or chunk).
-#[allow(clippy::too_many_arguments)]
 #[inline(always)]
 pub(crate) fn resolve_byte_char_cluster(
     bytes: &[u8],
     pos: usize,
-    trie: &TrieTable,
-    bitmap_adv: f32,
-    em_height_fu: u32,
-    cluster: bool,
+    ctx: ResolveCtx<'_>,
     trailer_until: &mut usize,
     has_cluster: &mut bool,
 ) -> Option<ResolvedChar> {
+    let ResolveCtx { trie, cluster, .. } = ctx;
     let lead = bytes[pos];
     let fast = trie.fast_byte_table[lead as usize];
     // The fast answer, unless this ASCII byte may head a sequence: a
@@ -240,16 +235,6 @@ pub(crate) fn resolve_byte_char_cluster(
     if seq_len == 0 {
         None
     } else {
-        Some(resolve_leader(
-            bytes,
-            pos,
-            seq_len,
-            trie,
-            bitmap_adv,
-            em_height_fu,
-            cluster,
-            trailer_until,
-            has_cluster,
-        ))
+        Some(resolve_leader(bytes, pos, seq_len, ctx, trailer_until, has_cluster))
     }
 }

@@ -25,7 +25,7 @@ pub use types::{ChunkPrepass, ItemPrepass, Pass2DeviceOutput, SendPtr};
 
 pub(crate) mod chunk;
 pub(crate) mod char_resolve;
-use char_resolve::resolve_byte_char_cluster;
+use char_resolve::{resolve_byte_char_cluster, ResolveCtx};
 
 mod device_alloc;
 use device_alloc::{layout_device_discrete, layout_device_unified, DeviceEmission, EmitInputs};
@@ -331,6 +331,7 @@ pub(crate) fn pass1_prepass_chunk_bytes(
     let mut trailer_until = 0usize;
     let mut has_cluster = false;
     let cluster = char_resolve::clusters(p);
+    let rctx = ResolveCtx { trie, bitmap_adv, em_height_fu, cluster };
     let wrap_w = p.wrap_width as i64;
     let ascii_adv = fu_to_world(1229, em_height_fu);
 
@@ -366,7 +367,7 @@ pub(crate) fn pass1_prepass_chunk_bytes(
             }
         } else {
             for i in 0..bytes.len() {
-                let r = match resolve_byte_char_cluster(bytes, i, trie, bitmap_adv, em_height_fu, cluster, &mut trailer_until, &mut has_cluster) {
+                let r = match resolve_byte_char_cluster(bytes, i, rctx, &mut trailer_until, &mut has_cluster) {
                     Some(r) => r,
                     None => continue,
                 };
@@ -450,7 +451,7 @@ pub(crate) fn pass1_prepass_chunk_bytes(
             }
         } else {
             for i in pos..nl_pos {
-                let r = match resolve_byte_char_cluster(bytes, i, trie, bitmap_adv, em_height_fu, cluster, &mut trailer_until, &mut has_cluster) {
+                let r = match resolve_byte_char_cluster(bytes, i, rctx, &mut trailer_until, &mut has_cluster) {
                     Some(r) => r,
                     None => continue,
                 };
@@ -624,17 +625,13 @@ fn pass1_over_chunks(
 /// byte at or before it (or the chunk's start). No sequence or trailer span
 /// crosses an ASCII byte (`chunk.rs`), so resolution from there agrees with
 /// the walk of the whole chunk. Typical cost: one fold unit of bytes.
-#[allow(clippy::too_many_arguments)]
 fn continued_segment_advance(
     bytes: &[u8],
     c0: i64,
     c_end: i64,
     fold_unit: i64,
     seg_in: f32,
-    trie: &TrieTable,
-    bitmap_adv: f32,
-    em_height_fu: u32,
-    cluster: bool,
+    rctx: ResolveCtx<'_>,
 ) -> f32 {
     if c_end % fold_unit == 0 {
         return 0.0;
@@ -662,7 +659,7 @@ fn continued_segment_advance(
     let mut trailer_until = 0usize;
     for pos in from..bytes.len() {
         if let Some(r) =
-            char_resolve::resolve_byte_char(bytes, pos, trie, bitmap_adv, em_height_fu, cluster, &mut trailer_until)
+            char_resolve::resolve_byte_char(bytes, pos, rctx, &mut trailer_until)
         {
             if pos >= tail_start {
                 seg += r.advance;
@@ -751,10 +748,7 @@ pub(crate) fn aggregate_chunk_prepasses(
                             cur_col,
                             fold_unit,
                             cur_seg_adv,
-                            trie,
-                            bitmap_adv,
-                            em_height_fu,
-                            char_resolve::clusters(p),
+                            ResolveCtx { trie, bitmap_adv, em_height_fu, cluster: char_resolve::clusters(p) },
                         );
                     }
                 } else {
@@ -849,6 +843,7 @@ fn measure_continued_lines(
                 0
             };
             let cluster = char_resolve::clusters(p);
+            let rctx = ResolveCtx { trie, bitmap_adv, em_height_fu, cluster };
             let mut col = agg.chunk_initial_cols[ci];
             let mut seg = agg.chunk_initial_seg_advs[ci];
             let mut line_adv = agg.chunk_initial_line_advs[ci];
@@ -858,10 +853,7 @@ fn measure_continued_lines(
                 let Some(r) = char_resolve::resolve_byte_char(
                     c.bytes,
                     pos,
-                    trie,
-                    bitmap_adv,
-                    em_height_fu,
-                    cluster,
+                    rctx,
                     &mut trailer_until,
                 ) else {
                     continue;
