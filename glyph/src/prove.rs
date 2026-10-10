@@ -4,7 +4,7 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use crate::manifest::{Manifest, Mutation};
+use crate::manifest::{Class, Manifest, Mutation};
 use crate::paths::{root, sh, stamps, step};
 use crate::products::{ensure_products, products_reading};
 
@@ -161,10 +161,49 @@ pub(crate) fn cmd_prove(
         }
     }
 
+    // Whether a gate reads a built product (the renderer). `needs_met` only
+    // checks that the product EXISTS, so such a gate runs whatever binary is
+    // on disk — after a deferred restore, possibly the previous mutant.
+    let needs_product = |gate: &str| {
+        m.gate.iter().find(|g| g.name == gate).is_some_and(|g| {
+            g.needs.iter().any(|n| m.artifact.get(n).is_some_and(|a| a.class == Class::Product))
+        })
+    };
+
+    // The clean-tree check, ONCE per gate (C21): a gate that is already red
+    // proves nothing under a mutation. Every mutation is restored byte-exact
+    // (checked below, or the run reports it) and its products rebuilt before
+    // any gate reads them, so the answer cannot change mid-run; it used to
+    // be asked again for every mutation (13x for cargo-test).
+    if !selected.is_empty() {
+        step("products, then the clean-tree check of each selected gate");
+        if !ensure_products(m, false) {
+            println!("FATAL the products do not build on the clean tree; nothing can be proven.");
+            return false;
+        }
+    }
+    let t_checks = std::time::Instant::now();
+    let mut clean: std::collections::BTreeMap<&str, bool> = std::collections::BTreeMap::new();
+    for mu in selected.iter() {
+        if !clean.contains_key(mu.gate.as_str()) {
+            let (ok, _) = gate_output(&mu.gate);
+            clean.insert(mu.gate.as_str(), ok);
+        }
+    }
+    let checks_time = t_checks.elapsed();
+    // Products a deferred restore left stale; rebuilt before a gate reads
+    // them, and once at the end.
+    let mut restore_pending = false;
+
+    // Where a prove's time goes (C21): per mutation, the mutant build, the
+    // gate under the mutation, and the restore (index 0, the clean-tree
+    // check, is now paid once per gate above).
+    let mut timings: Vec<(&str, [std::time::Duration; 4])> = Vec::new();
     for mu in selected.iter().copied() {
         step(&format!("mutation: {} → {}", mu.name, mu.gate));
+        let mut phase = [std::time::Duration::ZERO; 4];
 
-        let (pre_ok, _) = gate_output(&mu.gate);
+        let pre_ok = clean[mu.gate.as_str()];
         if !pre_ok {
             println!("FAIL  {} — gate {} was ALREADY RED before mutating;", mu.name, mu.gate);
             println!("      a red here would prove nothing. Fix the tree first.");
@@ -183,6 +222,7 @@ pub(crate) fn cmd_prove(
 
         let mut verdict: Option<String> = None;
         let mut built = true;
+        let t = std::time::Instant::now();
         if let Some(rb) = &mu.rebuild {
             let (good, out) = sh(rb, &root());
             if !good {
@@ -195,6 +235,15 @@ pub(crate) fn cmd_prove(
                 }
             }
         }
+        // A gate that reads a product, under a mutation that declares no
+        // rebuild of its own: bring products current first, so it never
+        // runs a previous mutation's binary left by a deferred restore.
+        if built && mu.rebuild.is_none() && needs_product(&mu.gate) && !ensure_products(m, false) {
+            println!("FATAL {} — products do not build before its gate; run: cargo glyph build", mu.name);
+            return false;
+        }
+        phase[1] = t.elapsed();
+        let t = std::time::Instant::now();
         if built {
             let (post_ok, out) = gate_output(&mu.gate);
             verdict = Some(if post_ok {
@@ -223,11 +272,28 @@ pub(crate) fn cmd_prove(
             });
         }
 
+        phase[2] = t.elapsed();
+        let t = std::time::Instant::now();
         // Restore, always, and prove it came back.
         let f = root().join(&mu.file);
         let _ = std::fs::write(&f, &before);
         let restored = std::fs::read(&f).unwrap_or_default() == before;
-        if let Some(rb) = &mu.rebuild {
+        // The restore's rebuild is DEFERRED when the file feeds a product
+        // (C21): its stamp is dropped, and currency rebuilds it before the
+        // next gate that reads it — usually the next mutation's own mutant
+        // build makes that rebuild moot — and once at the end. The stamp
+        // must go either way: a declared rebuild or the gate itself may have
+        // built the product from the mutated file (found 2026-10-09:
+        // `tail-pads-zero` left a mutated renderer behind a stamp reading
+        // current). A file no product reads (the runner's own sources) is
+        // rebuilt at once: every later gate is spawned from that binary.
+        let stale = products_reading(m, &mu.file);
+        if !stale.is_empty() {
+            for name in &stale {
+                let _ = std::fs::remove_file(stamps().join(format!("{name}.sha256")));
+            }
+            restore_pending = true;
+        } else if let Some(rb) = &mu.rebuild {
             let (good, out) = sh(rb, &root());
             if !good {
                 println!("FATAL {} — restore rebuild FAILED. The tree now has original", mu.name);
@@ -236,24 +302,15 @@ pub(crate) fn cmd_prove(
                 println!("      {}", out.lines().last().unwrap_or(""));
                 return false;
             }
-        } else {
-            // No declared rebuild, but the gate may have built a product from
-            // the mutated file anyway (found 2026-10-09: `tail-pads-zero` left
-            // a mutated renderer for every later gate and every hand timing).
-            // Its stamp still matches the restored sources, so drop it and
-            // let currency rebuild.
-            let stale = products_reading(m, &mu.file);
-            if !stale.is_empty() {
-                for name in &stale {
-                    let _ = std::fs::remove_file(stamps().join(format!("{name}.sha256")));
-                }
-                if !ensure_products(m, false) {
-                    println!("FATAL {} — rebuilding {} after restore FAILED; every later", mu.name, stale.join(", "));
-                    println!("      check would test the mutated binary. Run: cargo glyph build");
-                    return false;
-                }
-            }
         }
+        phase[3] = t.elapsed();
+        timings.push((&mu.name, phase));
+        println!(
+            "      time: build {:.1}s, gate {:.1}s, restore {:.1}s",
+            phase[1].as_secs_f64(),
+            phase[2].as_secs_f64(),
+            phase[3].as_secs_f64(),
+        );
         match verdict {
             Some(v) => {
                 println!("{v}");
@@ -269,6 +326,39 @@ pub(crate) fn cmd_prove(
         }
     }
 
+    // The deferred restores, settled once: the tree is the original and its
+    // products are rebuilt from it before anything else runs.
+    let t_final = std::time::Instant::now();
+    if restore_pending {
+        step("restoring products from the original tree");
+        if !ensure_products(m, false) {
+            println!("FATAL rebuilding the products after the last restore FAILED; run: cargo glyph build");
+            return false;
+        }
+    }
+    let final_restore = t_final.elapsed();
+
+    if !timings.is_empty() {
+        let total = |i: usize| timings.iter().map(|(_, p)| p[i].as_secs_f64()).sum::<f64>();
+        let all: f64 = (1..4).map(total).sum::<f64>() + checks_time.as_secs_f64() + final_restore.as_secs_f64();
+        println!();
+        println!(
+            "TIME      {:.0}s over {} mutations: clean-tree checks {:.0}s ({} gates, once each), mutant build {:.0}s, \
+             gate under mutation {:.0}s, restore {:.0}s (+{:.0}s final)",
+            all,
+            timings.len(),
+            checks_time.as_secs_f64(),
+            clean.len(),
+            total(1),
+            total(2),
+            total(3),
+            final_restore.as_secs_f64(),
+        );
+        let mut slowest: Vec<_> = timings.iter().map(|(n, p)| (*n, p.iter().map(|d| d.as_secs_f64()).sum::<f64>())).collect();
+        slowest.sort_by(|a, b| b.1.total_cmp(&a.1));
+        let top: Vec<String> = slowest.iter().take(5).map(|(n, t)| format!("{n} {t:.0}s")).collect();
+        println!("          slowest: {}", top.join(", "));
+    }
     println!();
     println!(
         "COVERAGE  {} gates, {} with mutations, {} uncovered",
