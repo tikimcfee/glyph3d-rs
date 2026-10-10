@@ -8,7 +8,7 @@ use glyph_field::{
 };
 use wgpu::util::DeviceExt;
 
-use crate::pipeline::{BINDING_GLYPH_ADVANCES, BINDING_ITEM_TABLE, EXTRA_LAYOUT};
+use crate::pipeline::{BINDING_GLYPH_ADVANCES, BINDING_GROUP_OVERRIDES, BINDING_ITEM_TABLE, EXTRA_LAYOUT};
 use crate::slot::{DerivedSlot, COLOR_OFFSET, ITEM_AND_GROUP_OFFSET, SLOT_BYTES, X_OFFSET};
 use crate::upload::{DerivedTranscode, LABELS};
 
@@ -21,6 +21,15 @@ pub struct DerivedField {
     core: FieldCore<DerivedSlot>,
     /// Bound in every chunk's group (binding 8); held so it outlives them.
     _item_table_buffer: wgpu::Buffer,
+    /// Each item's group row, as the item table carries it: a verb that
+    /// sets a glyph back to it clears the glyph's override.
+    item_groups: Vec<u32>,
+    /// The group overrides (binding 10, `derive.rs`): `OVERRIDE_MAX + 1`
+    /// words, index 0 unused. Filled as group verbs allocate rows.
+    group_overrides: wgpu::Buffer,
+    /// The next free override index; never reused (a verb's group row is
+    /// never freed either).
+    next_override: std::cell::Cell<u32>,
 }
 
 impl DerivedField {
@@ -48,6 +57,13 @@ impl DerivedField {
             contents: bytemuck::cast_slice(item_params),
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
         });
+        let item_groups: Vec<u32> = item_params.iter().map(|p| p.group).collect();
+        let group_overrides = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("derived group overrides"),
+            size: (crate::derive::OVERRIDE_MAX as u64 + 1) * 4,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
         let extra_entries = [
             wgpu::BindGroupEntry {
                 binding: BINDING_ITEM_TABLE,
@@ -56,6 +72,10 @@ impl DerivedField {
             wgpu::BindGroupEntry {
                 binding: BINDING_GLYPH_ADVANCES,
                 resource: resources.glyph_advances.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: BINDING_GROUP_OVERRIDES,
+                resource: group_overrides.as_entire_binding(),
             },
         ];
         let shape = FieldShape {
@@ -67,7 +87,13 @@ impl DerivedField {
         };
         let core = FieldCore::new(device, storage, resources, targets, &shape);
 
-        Self { core, _item_table_buffer: item_table_buffer }
+        Self {
+            core,
+            _item_table_buffer: item_table_buffer,
+            item_groups,
+            group_overrides,
+            next_override: std::cell::Cell::new(1),
+        }
     }
 }
 
@@ -121,11 +147,30 @@ impl GlyphField for DerivedField {
         // In Derived mode, glyph advance and height are looked up from the atlas table in GPU memory.
     }
 
-    fn write_group_id(&self, queue: &wgpu::Queue, slot: u32, group_id: u32) {
-        self.core.storage().write_field(queue, slot, ITEM_AND_GROUP_OFFSET, bytemuck::bytes_of(&group_id));
+    /// The lane stays the glyph's ITEM (Y/Z derive from it); the group
+    /// rides as an override index into the resident table, or none when the
+    /// group is the item's own again (`derive.rs`).
+    fn write_group_id(&self, queue: &wgpu::Queue, slot: u32, item: u32, group_id: u32) {
+        let own = self.item_groups.get(item as usize).copied().unwrap_or(item);
+        let lane = if group_id == own {
+            crate::derive::item_lane(item)
+        } else {
+            let idx = self.next_override.get();
+            if idx > crate::derive::OVERRIDE_MAX {
+                log::warn!("derived field: out of group overrides ({} in use); glyph keeps its group", crate::derive::OVERRIDE_MAX);
+                return;
+            }
+            self.next_override.set(idx + 1);
+            queue.write_buffer(&self.group_overrides, idx as u64 * 4, bytemuck::bytes_of(&group_id));
+            crate::derive::override_lane(item, idx)
+        };
+        self.core.storage().write_field(queue, slot, ITEM_AND_GROUP_OFFSET, bytemuck::bytes_of(&lane));
     }
 
-    /// What a Derived slot can take from a placement: X, colour and group.
+    /// What a Derived slot can take from a placement: X, colour and group —
+    /// the group as the plain item lane (`GlyphPlacement::group_id` is the
+    /// item's own group, which is its index), so a recolour clears any
+    /// override the glyph had, as it replaced its group before.
     /// Its row and wrap segment are the producer's (Y/Z derive from them in
     /// the vertex stage) and the glyph id shares a word with the wrap, so
     /// those stay as loaded. Until 2026-10-09 this wrote whole slots with

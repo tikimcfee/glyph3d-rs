@@ -5,10 +5,10 @@
 //   w1    row: u32               row:24 | x_page:8 (derive.rs) — the cell's row in its item and its column page
 //   w2    glyph_and_wrap: u32    low 16: glyph_id (atlas slot), high 16: wrap_segment
 //   w3    color: u32             packed sRGB RGBA8 (r in bits 0..7, a in 24..31)
-//   w4    group_id: u32          index into the group table
+//   w4    item_and_group: u32    item:20 | override:12 (derive.rs) — the item the row/page derive from; the group is the item's unless an override index names one
 //
 // Y and Z coordinates are derived in the vertex stage from the item table:
-//   item = item_table[inst.item_and_group]   // ItemParamsGpu (64 B)
+//   item = item_table[inst.item_and_group & 0xFFFFF]   // ItemParamsGpu (64 B); group = item.group or group_overrides[lane >> 20]
 //   yz   = derive_yz(inst.row, wrap_segment, item)   // row lane: row:24 | x_page:8
 // (`derive.rs` carries the same function in Rust, held to the Instanced
 // emitter's positions by `hyper_oracle::tests::derived_vertex_stage_agrees_with_instanced`.)
@@ -44,7 +44,7 @@ struct ItemParamsGpu {
     scroll_rows: i32,
     has_page: u32,
     line_height_lo: f32,
-    _pad1: u32,
+    group: u32,
     _pad2: u32,
 };
 
@@ -83,6 +83,9 @@ struct Params {
 @group(0) @binding(7) var emoji_samp: sampler;
 @group(0) @binding(8) var<storage, read> item_table: array<ItemParamsGpu>;
 @group(0) @binding(9) var<storage, read> glyph_advances: array<f32>;
+// Group overrides (derive.rs): index 0 is "none"; a slot whose lane carries
+// index k takes group `group_overrides[k]` instead of its item's.
+@group(0) @binding(10) var<storage, read> group_overrides: array<u32>;
 
 // Sentinel in the glyph map's .w for a bitmap slot the sheet has no cell
 // for (a web-era slot the vendored font cannot draw): rendered blank.
@@ -152,9 +155,16 @@ fn vs_main(
     );
 
     let inst = instances[ii];
-    let item_idx = inst.item_and_group;
-    let group_id = inst.item_and_group;
+    // The lane is item:20 | override:12 (derive.rs). Until 2026-10-10 it was
+    // one number read as both item and group, so a group verb moved the
+    // glyph to another item's rows.
+    let item_idx = inst.item_and_group & 0xFFFFFu;
+    let override_idx = inst.item_and_group >> 20u;
     let item = item_table[item_idx];
+    var group_id = item.group;
+    if (override_idx != 0u) {
+        group_id = group_overrides[override_idx];
+    }
     let wrap_segment = inst.glyph_and_wrap >> 16u;
     let glyph_id = inst.glyph_and_wrap & 0xFFFFu;
     let yz = derive_yz(inst.row, wrap_segment, item);

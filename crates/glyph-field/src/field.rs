@@ -66,8 +66,11 @@ pub trait GlyphField {
     /// Resize one glyph's cell.
     fn write_extent(&self, queue: &wgpu::Queue, slot: u32, advance: f32, height: f32);
 
-    /// Change the group ID for one glyph.
-    fn write_group_id(&self, queue: &wgpu::Queue, slot: u32, group_id: u32);
+    /// Change the group ID for one glyph. `item` is the glyph's item (file)
+    /// index: a mode whose slot derives its placement from the item table
+    /// (Derived) keeps the item in the same lane as the group and must
+    /// rewrite both; Instanced ignores it.
+    fn write_group_id(&self, queue: &wgpu::Queue, slot: u32, item: u32, group_id: u32);
 
     // ── bulk verbs ─────────────────────────────────────────────────────
 

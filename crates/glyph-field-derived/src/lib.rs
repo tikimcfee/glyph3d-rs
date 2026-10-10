@@ -9,7 +9,10 @@ pub mod pipeline;
 pub mod slot;
 pub mod upload;
 
-pub use derive::{derive_yz, pack_row, row_of, x_page_of, ROW_MAX, X_PAGE_MAX};
+pub use derive::{
+    derive_yz, item_lane, item_of, override_lane, override_of, pack_row, resolve_group, row_of, x_page_of, ITEM_MAX,
+    OVERRIDE_MAX, ROW_MAX, X_PAGE_MAX,
+};
 pub use field::DerivedField;
 pub use slot::DerivedSlot;
 

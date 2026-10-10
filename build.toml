@@ -25,7 +25,7 @@
 # Ratchet, NOT an equality: tests are added constantly, so an exact pin would
 # redden on the most common good action in the repo. A green run whose real
 # count exceeds the floor prints a NOTE naming the value to raise it to.
-test_floor = 277
+test_floor = 279
 # Every golden view is rendered again under each of these and must match the
 # SAME baseline byte for byte (2026-10-09, C20). The Derived field renders
 # every golden frame identically to Instanced (measured on vulkan-nvidia and
@@ -807,6 +807,16 @@ op = "replace"
 find = "                                .min(page_cols - seg_offset % page_cols)"
 with = "                                .min(usize::MAX - page_cols)"
 expect = "pagination_agrees_on_every_tier"
+
+[[mutation]]
+name = "derived-override-lane-unshifted"
+gate = "cargo-test"
+why = "the Derived lane before 2026-10-10, by another route: an override index written over the item instead of beside it, so a group verb turns the glyph's item into the override number and the vertex stage derives Y/Z from another item's rows. CONSUMED BY: derive::override_lane, which DerivedField::write_group_id packs for every SetGlyphBackground / SetGlyphTransform; reddens derive::tests::group_lane_resolves_to_the_item_or_its_override (item_of no longer round-trips). Blind to the shader reading the lane differently from the transcription beyond the pinned lines (wgsl_resolves_the_group_from_the_item_or_the_override_table)"
+file = "crates/glyph-field-derived/src/derive.rs"
+op = "replace"
+find = "    item_lane(item) | (override_idx.min(OVERRIDE_MAX) << ITEM_BITS)"
+with = "    item_lane(item) | override_idx.min(OVERRIDE_MAX)"
+expect = "group_lane_resolves_to_the_item_or_its_override"
 
 [[mutation]]
 name = "derived-column-page-term-dropped"
