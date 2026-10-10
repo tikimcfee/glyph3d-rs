@@ -60,6 +60,11 @@ pub struct LodSettings {
     pub min_px: f32,
     /// Backdrop coverage gain: backdrop alpha = ink fraction x gain.
     pub backdrop_gain: f32,
+    /// `--field-mode visible` only: on-screen px per em below which a whole
+    /// item collapses to its backdrop quad. Between this and `min_px` its
+    /// lines are WASHES (one quad per line); at or above `min_px` they are
+    /// laid out as glyphs. The other modes never read it.
+    pub visible_backdrop_px: f32,
 }
 
 /// Glyph-scene cameras (`glyph_scene::camera`).
@@ -383,6 +388,7 @@ mod tests {
         assert_eq!(s.glyph_scene.file_bg_color, [0.10f32, 0.10, 0.13, 0.85]);
         assert_eq!(s.lod.min_px, 1.0f32);
         assert_eq!(s.lod.backdrop_gain, 0.7f32);
+        assert_eq!(s.lod.visible_backdrop_px, 0.25f32);
         let c = &s.camera;
         assert_eq!(c.fov_y_deg, 40f32);
         assert_eq!((c.frame_margin, c.frame_pad), (1.08f32, 2.0f32));

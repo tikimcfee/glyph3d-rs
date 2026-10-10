@@ -180,6 +180,20 @@ impl GlyphScene {
                 return FileStyle::VersionMismatch;
             }
         }
+        // The Visible field colours by BYTE RANGE, not by slot: the runs go
+        // to the GPU as the item's span table and the kernel reads them as it
+        // lays the line out. No re-derive, no slot walk — the whole point of
+        // that mode. The item index is the file's position in the load.
+        if let Some(visible) = self.field.visible() {
+            let Some(item) = pctx.files.iter().position(|f| f.rel_path == info.rel_path) else {
+                return FileStyle::Failed;
+            };
+            let spans = byte_spans_of(runs, bytes.len());
+            visible.set_item_spans(&ctx.queue, item as u32, &spans);
+            // Every byte a span covers is coloured; the count is in spans,
+            // not glyphs (the field never counts glyphs on the host).
+            return FileStyle::Ok { colored: spans.len(), unstyled: 0 };
+        }
         // The layout re-run (repo::rederive_cached): stateless —
         // `layout_hyper::rederive_item_records` over the process-wide trie
         // (`default_trie()`, parsed once and shared). Nothing per-scene is
@@ -303,6 +317,30 @@ impl GlyphScene {
     }
 }
 
+/// Style runs as the Visible field's span table wants them: sorted by start,
+/// non-overlapping (a later run starts where the earlier one ended), clipped
+/// to the item, empty ranges dropped, colour packed RGBA8 with alpha 255.
+pub(crate) fn byte_spans_of(runs: &[crate::seam::StyleRun], byte_len: usize) -> Vec<glyph_field_visible::ByteSpanGpu> {
+    let mut sorted: Vec<&crate::seam::StyleRun> = runs.iter().collect();
+    sorted.sort_by_key(|r| r.range.start);
+    let mut out = Vec::with_capacity(sorted.len());
+    let mut cursor = 0usize;
+    for run in sorted {
+        let start = run.range.start.max(cursor);
+        let end = run.range.end.min(byte_len);
+        if end <= start {
+            continue;
+        }
+        out.push(glyph_field_visible::ByteSpanGpu {
+            start: start as u32,
+            end: end as u32,
+            color: u32::from(run.rgb[0]) | u32::from(run.rgb[1]) << 8 | u32::from(run.rgb[2]) << 16 | 0xFF00_0000,
+        });
+        cursor = end;
+    }
+    out
+}
+
 fn parse_highlight_sidecar(
     path: &std::path::Path,
 ) -> Result<std::collections::HashMap<String, Vec<crate::seam::StyleRun>>, String> {
@@ -349,5 +387,29 @@ fn parse_highlight_sidecar(
         runs.sort_by_key(|r| r.range.start);
     }
     Ok(map)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::byte_spans_of;
+    use crate::seam::StyleRun;
+
+    /// The span table's contract: sorted, non-overlapping, clipped, packed
+    /// with alpha 255 — whatever order and overlap the runs arrive in.
+    #[test]
+    fn byte_spans_are_sorted_clipped_and_disjoint() {
+        let runs = [
+            StyleRun { range: 10..20, rgb: [1, 2, 3] }, // overlapped by the earlier-starting run: starts at 12
+            StyleRun { range: 0..12, rgb: [4, 5, 6] },
+            StyleRun { range: 30..40, rgb: [7, 8, 9] }, // past the item: clipped to 30..32
+            StyleRun { range: 15..15, rgb: [0, 0, 0] }, // empty: dropped
+        ];
+        let spans = byte_spans_of(&runs, 32);
+        let got: Vec<(u32, u32, u32)> = spans.iter().map(|s| (s.start, s.end, s.color)).collect();
+        assert_eq!(got, [(0, 12, 0xFF06_0504), (12, 20, 0xFF03_0201), (30, 32, 0xFF09_0807)]);
+        for w in spans.windows(2) {
+            assert!(w[0].end <= w[1].start, "spans overlap: {:?} then {:?}", w[0], w[1]);
+        }
+    }
 }
 

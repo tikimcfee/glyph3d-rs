@@ -25,6 +25,12 @@ pub struct ItemPrepass {
     /// needs its `(glyph, colour)` pairs, which a staging path that writes
     /// write-combined memory must capture during emission (C22).
     pub has_emoji: bool,
+    /// The widest line in LEADERS (its newline's column; trailers counted),
+    /// over every line of the item, chunk cuts joined. Read once per load by
+    /// `derived_lane_limits`: a column-paged item's widest column page is
+    /// this over `page_cols`, and the Derived slot's row lane holds 8 bits
+    /// of it.
+    pub max_line_cols: u32,
 }
 
 /// Output of Pass 1 prepass on a single chunk.
@@ -50,6 +56,10 @@ pub struct ChunkPrepass {
     pub last_seg_col: i64,
     pub last_seg_line_adv: f64,
     pub last_seg_seg_adv: f32,
+    /// The widest line of this chunk in leaders, measured once per line (a
+    /// line the chunk only continues counts the part it holds; the
+    /// aggregation adds the inherited column).
+    pub max_line_cols: u32,
 }
 
 #[derive(Clone, Copy)]

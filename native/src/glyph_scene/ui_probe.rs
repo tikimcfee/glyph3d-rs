@@ -35,6 +35,14 @@ pub struct UiProbeState {
     // rule there. ──
     /// Live LOD threshold in px/em (default: `[lod] min_px`).
     pub lod_min_px: f32,
+    /// Live backdrop threshold of the Visible field in px/em (default:
+    /// `[lod] visible_backdrop_px`); lines between it and `lod_min_px` are
+    /// washes. Unread by the other modes.
+    pub lod_backdrop_px: f32,
+    /// Live debug tint of the Visible field (`--debug-tint`): 0 off, 1 by
+    /// LOD tier, 2 by cull state. Written to the Params uniform's spare
+    /// lane; the other modes' shaders never read it.
+    pub debug_tint: u32,
     /// Live file background cards toggle.
     pub file_backgrounds: bool,
     /// Live file background cards color.
@@ -50,6 +58,14 @@ pub struct UiProbeState {
     pub cull_ranges: usize,
     pub cull_instances: u64,
     pub cull_backdrops: usize,
+    // ── The field HUD (F8): per-frame readouts beside the K4 counters. ──
+    /// The CPU segment cull's wall time this frame, ms.
+    pub cull_cpu_ms: f32,
+    /// Cull segments (one per file) and how many are user-hidden.
+    pub segments: usize,
+    pub hidden_segments: usize,
+    /// The Visible field's own counters (None for the stored modes).
+    pub visible_stats: Option<glyph_field_visible::VisibleStats>,
     // ── Layout dial (repo scenes): the wrap staircase's pitch. Unlike the
     // K4 controls this is LAYOUT, not a per-frame cull input — applying it
     // re-runs load_repo and rebuilds the scene (windowed.rs's
@@ -205,20 +221,23 @@ impl GlyphScene {
         let layout_mode = self.probe_layout_mode;
         let strategy = self.probe_strategy;
         let field_mode = Some(self.field.mode());
-        let (file_backgrounds, file_bg_color, lod_min_px) = self
+        let (file_backgrounds, file_bg_color, lod_min_px, lod_backdrop_px) = self
             .cull
             .as_ref()
-            .map(|c| (c.file_backgrounds.get(), c.file_bg_color.get(), c.lod_min_px.get()))
+            .map(|c| (c.file_backgrounds.get(), c.file_bg_color.get(), c.lod_min_px.get(), c.lod_backdrop_px.get()))
             .unwrap_or_else(|| {
                 let s = crate::config::settings();
-                (false, s.glyph_scene.file_bg_color, s.lod.min_px)
+                (false, s.glyph_scene.file_bg_color, s.lod.min_px, s.lod.visible_backdrop_px)
             });
         let mode = self.params.get().greek_mode;
         let greeking = mode != 0;
         let greek_pure = mode == 2;
         let greek_onset_px = self.params.get().greek_onset_px;
+        let debug_tint = self.params.get().debug_tint;
         let probe = UiProbe::new(std::cell::RefCell::new(UiProbeState {
             lod_min_px,
+            lod_backdrop_px,
+            debug_tint,
             file_backgrounds,
             file_bg_color,
             greeking,

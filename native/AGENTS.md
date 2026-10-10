@@ -99,9 +99,30 @@ caller; the short version:
     background prefetch. Under `--repo-verify`, `direct` records nothing (the
     diff covers placements and instances only) while `batch` and `naive` take
     the recording path; the stats line prints their readback/compaction phases.
-- `--field-mode instanced|derived` selects the glyph field mode:
+- `--field-mode instanced|derived|visible` selects the glyph field mode:
   - `instanced` (32 B per glyph): precomputed 3D coordinates.
   - `derived` (20 B per glyph): compact word layout, Y/Z derived dynamically in vertex WGSL.
+  - `visible` (EXPERIMENTAL, 2026-10-10; `out/VISIBLE-MODE.md` M2): no slot per
+    glyph. HyperLayout runs Pass 1 WITH the line table and no Pass 2; the arena
+    comes back in its third form (`layout_hyper::VisibleStaging`: the table, one
+    seed per item, and — moved in by the loader, never copied — the walk's own
+    byte Vecs), `into_staged` finishes the field's items with the shelf's group
+    offsets, and `glyph_scene::setup` hands it all to `VisibleField::new`. The
+    placements come from `pass2_host::compute_single_item_placement`, held
+    bit-exact to the device Pass 2 (`visible::tests::placements_agree_with_the_derived_device_pass2`).
+    The field culls and draws itself (`GlyphField::prepare` before the glyph
+    pass; the CPU cull keeps only the backdrops, under `[lod] visible_backdrop_px`,
+    and the hidden flags). No syntax heuristic runs in this mode (by decision);
+    a `--highlight` sidecar becomes byte spans (`VisibleField::set_item_spans`).
+    Selection highlight and the slot verbs are not keyed for it yet (M3): the
+    mask draws nothing and a verb is reported, not applied. `--debug-tint lod|cull`
+    colours its glyphs by LOD tier or cull state (the other modes never read it).
+  - **The Derived lanes are a load-time limit** (`layout_hyper::derived_lane_limits`,
+    2026-10-10): item count vs `ITEM_MAX`, rows per item vs `ROW_MAX`, column pages
+    vs `X_PAGE_MAX` (from Pass 1's `max_line_cols`), checked once per load before
+    any slot is emitted. A Derived or Visible load past them falls back to
+    `instanced` with ONE warning naming the item and the limit; the field the scene
+    builds follows the arena, and the panel/HUD show the mode actually built.
 - A verify over ZERO items refuses. Before 2026-09-07 a missing corpus directory
   printed `PASS: 0 items, 0 instances` and exited 0 — the gate passing having
   compared nothing.
@@ -210,6 +231,22 @@ Detailed technical audit lives in `research/desktop-platform-audit.md`. Key touc
   345; on fixtures/emoji-corpus-small.txt, a TEXT scene: 893 → 801).
   The button shows on repo and text scenes; demo/engine-text scenes carry
   no mode and hide it.
+- `GLYPH_FIELDMODE_SELFTEST=1` — windowed, dev-only (2026-10-10): at t≈3 s
+  cycles the field mode Instanced → Derived → Visible through the SAME
+  rebuild arm the Debug panel's selector fires, printing the F8 HUD line
+  (`FIELDMODE-SELFTEST before/after step N: …`) around each rebuild. Until the
+  Visible field's bodies land, the third step panics at `VisibleField::new`,
+  which is the proof that the mode reaches the call.
+- `GLYPH_POSE_PRINT=1` — windowed: F2 (screenshot) also prints the frame's
+  camera as the `--cam-pose X Y Z YAW PITCH` argument (degrees) that
+  reproduces it — the same line the Debug panel's "copy pose" button puts on
+  the clipboard — so a view seen once can become a golden view's command.
+- **F8** toggles the field HUD (windowed, egui): a top-left readout, separate
+  from the F1 Debug window, of the field mode, engine, segments/hidden,
+  backdrops, CPU cull ms, fps and — for the Visible field — items and lines
+  per tier (glyph / wash / backdrop), segments, slots (and dropped) and the
+  GPU cull/layout/draw ms from `VisibleField::stats()`; the stored modes show
+  their instance and draw-range counts. Open by default in `--field-mode visible`.
 - `GLYPH_L3_SHADER_COMPOSITE=1` — offscreen, dev-only (Stage L): makes the
   offscreen target Bgra8UnormSrgb, forcing the WINDOWED shader-composite
   path (composite.wgsl) under the deterministic oracle driver; the readback

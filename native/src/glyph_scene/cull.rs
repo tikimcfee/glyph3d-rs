@@ -358,6 +358,11 @@ pub(super) struct CullState {
     /// render(), which runs solely when a windowed probe is installed —
     /// offscreen never writes it, so offscreen culls with the const.
     pub(super) lod_min_px: Cell<f32>,
+    /// The visible field's second threshold (`[lod] visible_backdrop_px`):
+    /// px/em below which an item is a backdrop; between it and `lod_min_px`
+    /// the field washes the lines. Same write discipline as `lod_min_px`.
+    /// Unread by the other modes.
+    pub(super) lod_backdrop_px: Cell<f32>,
     pub(super) file_backgrounds: Cell<bool>,
     pub(super) file_bg_color: Cell<[f32; 4]>,
     /// seg_count × 32 B staging target for the per-frame backdrop list.
@@ -552,6 +557,7 @@ impl CullState {
             orig_group_rgb,
             hidden: vec![false; segments.len()],
             lod_min_px: Cell::new(crate::config::settings().lod.min_px),
+            lod_backdrop_px: Cell::new(crate::config::settings().lod.visible_backdrop_px),
             file_backgrounds: Cell::new(false),
             file_bg_color: Cell::new(crate::config::settings().glyph_scene.file_bg_color),
             backdrop_insts_buf,

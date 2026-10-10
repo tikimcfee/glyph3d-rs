@@ -449,6 +449,12 @@ pub struct GlyphArena {
     /// on device, bound directly — no host copy exists. Mutually exclusive
     /// with the host form; every slice-returning accessor panics on it.
     device: Option<DeviceSlots>,
+    /// The third form (`--field-mode visible`, 2026-10-10): NO slots at all.
+    /// Pass 1's line table and the items' own bytes, which the field lays out
+    /// per frame on the GPU (`layout_hyper::visible`). `instances` stays
+    /// empty, so the slice accessors return nothing rather than panicking;
+    /// `len()` reports the glyphs the items WOULD produce.
+    visible: Option<crate::layout_hyper::VisibleStaging>,
 }
 
 /// The endpoint's arena form (note 23, E2b): the chain's 32 B RenderSlots
@@ -508,18 +514,40 @@ impl GlyphArena {
 
     /// Wrap a host Vec (the text/engine-text scenes stage from their own fold).
     pub fn from_vec(instances: Vec<GlyphInstance>) -> Self {
-        Self { instances, device: None }
+        Self { instances, device: None, visible: None }
     }
 
     /// The endpoint form (note 23, E2b): the chain's slots on device.
     pub fn from_device(device: DeviceSlots) -> Self {
         assert!(device.len > 0, "a device arena with zero slots is the host form's job");
-        Self { instances: Vec::new(), device: Some(device) }
+        Self { instances: Vec::new(), device: Some(device), visible: None }
+    }
+
+    /// The visible form: no slots, the line table and (once the loader moves
+    /// them in) the bytes.
+    pub fn from_visible(staging: crate::layout_hyper::VisibleStaging) -> Self {
+        Self { instances: Vec::new(), device: None, visible: Some(staging) }
     }
 
     /// True on the endpoint form — 32 B slots on device, bound directly.
     pub fn is_device(&self) -> bool {
         self.device.is_some()
+    }
+
+    /// True on the visible form — no slots; the field lays out per frame.
+    pub fn is_visible(&self) -> bool {
+        self.visible.is_some()
+    }
+
+    /// The visible form's staging. None on the other two forms.
+    pub fn visible_staging(&self) -> Option<&crate::layout_hyper::VisibleStaging> {
+        self.visible.as_ref()
+    }
+
+    /// The visible form's staging, to finish (the loader moves the bytes in,
+    /// `into_staged` builds the items).
+    pub fn visible_staging_mut(&mut self) -> Option<&mut crate::layout_hyper::VisibleStaging> {
+        self.visible.as_mut()
     }
 
     /// The device slots (buffer + offset per chunk) for the renderer's
@@ -528,10 +556,13 @@ impl GlyphArena {
         self.device.as_ref()
     }
 
-    /// Slots written so far — the next item's `slot_base`.
+    /// Slots written so far — the next item's `slot_base`. On the visible
+    /// form, the glyphs the items would produce (nothing is written).
     pub fn len(&self) -> usize {
         if let Some(d) = &self.device {
             d.len
+        } else if let Some(v) = &self.visible {
+            usize::try_from(v.glyph_count).expect("glyph count exceeds usize")
         } else {
             self.instances.len()
         }
@@ -749,6 +780,14 @@ impl LayoutEngine {
         field_mode: glyph_field::GlyphFieldMode,
     ) -> Self {
         Self::Hyper(crate::layout_hyper::HyperLayout::with_device(device, field_mode))
+    }
+
+    /// A device-less HyperLayout that still knows the field mode: for
+    /// Instanced and Derived it is `hyper()` (no device, host records); for
+    /// Visible it stages the line table and bytes, which needs no device —
+    /// the `--repo-scan-only` and live (`load_items`) doors to that mode.
+    pub fn hyper_with_mode(field_mode: glyph_field::GlyphFieldMode) -> Self {
+        Self::Hyper(crate::layout_hyper::HyperLayout::with_field_mode(field_mode))
     }
 
     /// Sets prefetched inputs from the background prefetch thread for HyperLayout.

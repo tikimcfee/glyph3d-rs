@@ -37,7 +37,7 @@ impl GlyphScene {
 
         // --- instance + group buffers --------------------------------------
         let mut arena = staged.instances;
-        if arena.is_empty() && !arena.is_device() {
+        if arena.is_empty() && !arena.is_device() && !arena.is_visible() {
             arena.push(GlyphInstance {
                 pos: [0.0; 3],
                 glyph_id: 0,
@@ -91,7 +91,7 @@ impl GlyphScene {
         let params = Params {
             max_groups: max_groups as u32,
             greek_mode: 2,
-            _pad1: 0,
+            debug_tint: 0,
             _pad2: 0,
             // GLYPH_LOD_DEFAULTS (GlyphField.js)
             dilate_px: 0.75,
@@ -177,50 +177,113 @@ impl GlyphScene {
         // uploads. Unified-memory direct upload is a property of the adapter,
         // decided here (Metal + MAPPABLE_PRIMARY_BUFFERS — see
         // glyph_field::upload_host_slots).
-        let source = match arena.device_slots() {
-            Some(dev) => {
-                assert_eq!(
-                    dev.format, field_mode,
-                    "device arena was emitted for {:?} but the scene builds a {:?} field",
-                    dev.format, field_mode
+        // The field the scene BUILDS follows the arena, not the request: the
+        // layout may have fallen back (a Derived or Visible load past the
+        // slot lanes — `layout_hyper::derived_lane_limits` — emits Instanced
+        // and says so), and a host arena has no table for a Visible field
+        // (text and engine-text scenes, a recording verify run). The probe
+        // reads `field.mode()`, so the panel and the HUD show what was built.
+        let built_mode = match (arena.device_slots(), arena.visible_staging()) {
+            (Some(dev), _) if dev.format != field_mode => {
+                log::warn!(
+                    "field mode {field_mode} requested, but the layout emitted {} slots — building a {} field",
+                    dev.format, dev.format
                 );
-                SlotSource::Device {
+                dev.format
+            }
+            (None, None) if field_mode == GlyphFieldMode::Visible => {
+                log::warn!(
+                    "field mode visible requested, but this scene staged host records (no line table) — building an instanced field"
+                );
+                GlyphFieldMode::Instanced
+            }
+            _ => field_mode,
+        };
+        let field = if let Some(staging) = arena.visible_staging() {
+            assert_eq!(built_mode, GlyphFieldMode::Visible, "a visible arena is only ever bound by the Visible field");
+            assert_eq!(staging.items.len(), staging.item_bytes.len(), "into_staged finished every item");
+            let item_bytes: Vec<&[u8]> = staging.item_bytes.iter().map(|b| b.as_slice()).collect();
+            let trie = crate::layout_hyper::visible::trie_upload(&atlas.trie);
+            let inputs = glyph_field_visible::VisibleInputs {
+                item_bytes: &item_bytes,
+                items: &staging.items,
+                // The seam's table records are the kernel's, lane for lane
+                // (16 B and 24 B, same field order; `visible_records_are_the_kernels`).
+                lines: bytemuck::cast_slice(&staging.line_table.entries),
+                seeds: bytemuck::cast_slice(&staging.line_table.seeds),
+                segment_bytes: staging.line_table.segment_bytes,
+                trie: &trie,
+                // No spans at load: the mode runs no syntax heuristic (by
+                // decision); a `--highlight` sidecar arrives through
+                // `set_item_spans` afterwards.
+                spans: &[],
+                default_color: crate::layout::DEFAULT_COLOR_PACKED,
+            };
+            log::info!(
+                "visible field: {} items, {} B of source, {} lines, {} seeds, {} glyphs would be slots",
+                staging.items.len(),
+                item_bytes.iter().map(|b| b.len()).sum::<usize>(),
+                staging.line_table.entries.len(),
+                staging.line_table.seeds.len(),
+                staging.glyph_count,
+            );
+            super::FieldHandle::Visible(Box::new(glyph_field_visible::VisibleField::new(
+                device,
+                &ctx.queue,
+                &inputs,
+                &resources,
+                targets,
+                glyph_field_visible::VisibleLimits::default(),
+            )))
+        } else {
+            let source = match arena.device_slots() {
+                Some(dev) => SlotSource::Device {
                     chunk_capacity: dev.chunk_slots,
                     chunks: &dev.chunks,
                     glyph_count: instances_len,
                     mapped_base: dev
                         .mapped_slots
                         .or_else(|| dev.derived.as_ref().and_then(|d| d.mapped_base)),
+                },
+                None => SlotSource::Host {
+                    slices: arena.instance_chunks(),
+                    glyph_count: instances_len,
+                    direct_host_upload: ctx.profile.backend == wgpu::Backend::Metal
+                        && ctx.profile.mappable_primary_buffers,
+                },
+            };
+            let boxed: Box<dyn GlyphField> = match built_mode {
+                GlyphFieldMode::Instanced => {
+                    Box::new(InstancedField::new(device, &ctx.queue, source, &resources, targets))
                 }
-            }
-            None => SlotSource::Host {
-                slices: arena.instance_chunks(),
-                glyph_count: instances_len,
-                direct_host_upload: ctx.profile.backend == wgpu::Backend::Metal
-                    && ctx.profile.mappable_primary_buffers,
-            },
-        };
-        let field: Box<dyn GlyphField> = match field_mode {
-            GlyphFieldMode::Instanced => {
-                Box::new(InstancedField::new(device, &ctx.queue, source, &resources, targets))
-            }
-            GlyphFieldMode::Derived => {
-                Box::new(DerivedField::new(device, &ctx.queue, source, &resources, targets))
-            }
-            GlyphFieldMode::Visible => todo!("M2: the Visible field is built from the line table, not from slots"),
+                GlyphFieldMode::Derived => {
+                    Box::new(DerivedField::new(device, &ctx.queue, source, &resources, targets))
+                }
+                GlyphFieldMode::Visible => unreachable!("a Visible field is built from a visible arena above"),
+            };
+            super::FieldHandle::Dyn(boxed)
         };
         let field_dur = t_scene_start.elapsed();
         let t_pipe_start = std::time::Instant::now();
-        log::info!(
-            "glyph field ({}): {} instances ({} MiB) in {} chunk(s) of ≤{} ({} MiB binding limit), {} groups",
-            field.mode(),
-            instances_len,
-            (instances_len * field.slot_bytes() as usize) >> 20,
-            field.chunk_count(),
-            field.chunk_capacity(),
-            binding_limit >> 20,
-            groups.len(),
-        );
+        if field.draws_itself() {
+            log::info!(
+                "glyph field ({}): {} glyphs resident as bytes + line table, laid out per frame; {} groups",
+                field.mode(),
+                instances_len,
+                groups.len(),
+            );
+        } else {
+            log::info!(
+                "glyph field ({}): {} instances ({} MiB) in {} chunk(s) of ≤{} ({} MiB binding limit), {} groups",
+                field.mode(),
+                instances_len,
+                (instances_len * field.slot_bytes() as usize) >> 20,
+                field.chunk_count(),
+                field.chunk_capacity(),
+                binding_limit >> 20,
+                groups.len(),
+            );
+        }
         // Stage L (L4): create selection mask pipeline unconditionally so both
         // windowed platforms (Metal Bgra8UnormSrgb and Linux/Vulkan Rgba8UnormSrgb)
         // render selection visuals.
@@ -366,6 +429,25 @@ impl GlyphScene {
             0
         };
         self.set_greek_mode(queue, mode);
+    }
+
+    /// The visible field's debug tint (`--debug-tint`; `FramePrepare::debug_tint`):
+    /// 0 off, 1 colour by LOD tier, 2 colour by cull state. Lives in the
+    /// Params uniform's spare lane; the stored modes' shaders never read it.
+    pub fn set_debug_tint(&self, queue: &wgpu::Queue, mode: u32) {
+        let mut p = self.params.get();
+        if p.debug_tint != mode {
+            p.debug_tint = mode;
+            self.params.set(p);
+            queue.write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&p));
+        }
+    }
+
+    /// The visible field's backdrop threshold (px/em; `[lod] visible_backdrop_px`).
+    pub fn set_lod_backdrop_px(&mut self, px: f32) {
+        if let Some(cull) = &self.cull {
+            cull.lod_backdrop_px.set(px);
+        }
     }
 
     /// Configure the on-screen glyph height in px/em where Greeking begins (default: 10.0).

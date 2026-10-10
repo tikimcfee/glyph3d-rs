@@ -23,8 +23,15 @@ against `build.toml` that day; `cargo glyph gates` is the live list.)
   mode-neutral contract (`GlyphField` trait, `GlyphFieldMode`, the shared records and
   binding map); `glyph-field-instanced` is the Instanced mode (32 B `RenderSlot`, its
   upload path, pipelines and `glyph_field.wgsl`); `glyph-field-derived` is the Derived mode
-  (20 B `DerivedSlot`, GPU vertex-stage Y/Z derivation, and `glyph_field_derived.wgsl`).
-  Chosen at load with `--field-mode instanced|derived`.
+  (20 B `DerivedSlot`, GPU vertex-stage Y/Z derivation, and `glyph_field_derived.wgsl`);
+  `glyph-field-visible` (2026-10-10, EXPERIMENTAL, M2 of `out/VISIBLE-MODE.md`) is the
+  Visible mode — no slot per glyph: the source bytes, Pass 1's line table and the atlas
+  trie are resident, the lines in view are laid out per frame on the GPU into a
+  transient `DerivedSlot` buffer the Derived shader draws, and lines too small for
+  glyphs are washes (one quad each). The renderer's side of it is
+  `native/src/layout_hyper/visible.rs` (the arena's third form) and the `Visible`
+  arms of `glyph_scene/{setup,render}.rs`. Chosen at load with
+  `--field-mode instanced|derived|visible`, switchable live from the Debug panel.
   `crates/glyph-session-dirs` (2026-10-09, std only) is the one table of where agent
   apps keep session transcripts, shared by the renderer's F7 browser and the
   `cargo glyph` launcher; `launch_config.example.toml` documents the overrides.

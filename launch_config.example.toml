@@ -44,7 +44,10 @@ color_mode = "flat"
 # Layout engine backend: "hyper" (parallel CPU Rayon, default), "direct" or "batch"
 repo_engine = "hyper"
 
-# Glyph field render mode: "derived" (compact 20B slots, zero-copy) or "instanced" (32B slots).
+# Glyph field render mode: "derived" (compact 20B slots, zero-copy), "instanced"
+# (32B slots), or "visible" (EXPERIMENTAL: no slot per glyph; the lines in view
+# are laid out per frame on the GPU — out/VISIBLE-MODE.md; switchable live from
+# the Debug panel, F8 shows its HUD).
 # DIFFERS from the CLI default, which is "instanced".
 field_mode = "derived"
 

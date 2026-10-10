@@ -51,7 +51,11 @@ pub(super) struct FrameUniform {
 pub(super) struct Params {
     pub(super) max_groups: u32,
     pub(super) greek_mode: u32, // 0 = disabled, 1 = smooth blend (default), 2 = pure hard bypass
-    pub(super) _pad1: u32,
+    /// The visible field's debug tint (`--debug-tint`): 0 off, 1 colour by
+    /// LOD tier, 2 colour by cull state. Rides in what was a pad lane, so
+    /// the Instanced and Derived shaders (which never read it) are byte-
+    /// unchanged at 0; only `FramePrepare::debug_tint` carries it anywhere.
+    pub(super) debug_tint: u32,
     pub(super) _pad2: u32,
     pub(super) dilate_px: f32,
     pub(super) soften: f32,

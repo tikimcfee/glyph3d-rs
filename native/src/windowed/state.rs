@@ -99,6 +99,64 @@ pub(super) struct WindowState {
     /// the same pending_relayout arm the panel's button uses.
     #[cfg(feature = "egui-ui")]
     pub(super) cluster_selftest: u8,
+    /// Dev-only verification hook state (GLYPH_FIELDMODE_SELFTEST=1): at
+    /// t≈3 s cycles the field mode Instanced → Derived → Visible through the
+    /// same pending_relayout arm the panel's selector fires, printing the
+    /// HUD line after each rebuild. 0 = off/done; odd states fire, even
+    /// states are the quiet frame after a rebuild (see `render`).
+    #[cfg(feature = "egui-ui")]
+    pub(super) fieldmode_selftest: u8,
+}
+
+/// The `--cam-pose` argument that reproduces a Fly pose: eye, then yaw and
+/// pitch in DEGREES (the CLI converts back; `cli::ops`). One formatter for
+/// the panel's copy button and the F2 `GLYPH_POSE_PRINT` line, so the two
+/// cannot disagree about units.
+pub(super) fn cam_pose_arg(eye: [f32; 3], yaw: f32, pitch: f32) -> String {
+    format!(
+        "--cam-pose {:.3} {:.3} {:.3} {:.3} {:.3}",
+        eye[0],
+        eye[1],
+        eye[2],
+        yaw.to_degrees(),
+        pitch.to_degrees()
+    )
+}
+
+/// The field HUD's one-line form: what the field is and what it did this
+/// frame. Drawn (as several lines) by the F8 HUD and printed verbatim by the
+/// field-mode self-test, so the two read the same numbers.
+#[cfg(feature = "egui-ui")]
+fn hud_line(snap: &crate::glyph_scene::UiProbeState, fps: f32) -> String {
+    let mode = snap.field_mode.map(|m| m.to_string()).unwrap_or_else(|| "n/a".to_string());
+    let strategy = snap.strategy.map(|s| s.to_string()).unwrap_or_else(|| "n/a".to_string());
+    let mut line = format!(
+        "field {mode} | engine {strategy} | segments {} ({} hidden) | backdrops {} | cull {:.2} ms | fps {fps:.1}",
+        snap.segments, snap.hidden_segments, snap.cull_backdrops, snap.cull_cpu_ms
+    );
+    match &snap.visible_stats {
+        Some(s) => {
+            line += &format!(
+                " | items {}/{} visible, {} backdrop | lines {} candidate: {} glyph, {} wash | segments {} | slots {} ({} dropped) | gpu cull {:.2} layout {:.2} draw {:.2} ms",
+                s.items_visible,
+                s.items_total,
+                s.items_backdrop,
+                s.lines_candidate,
+                s.lines_glyph,
+                s.lines_wash,
+                s.segments,
+                s.slots,
+                s.slots_dropped,
+                s.cull_ms,
+                s.layout_ms,
+                s.draw_ms,
+            );
+        }
+        None => {
+            line += &format!(" | instances {} in {} draw ranges", snap.cull_instances, snap.cull_ranges);
+        }
+    }
+    line
 }
 
 #[cfg(feature = "egui-ui")]
@@ -385,6 +443,51 @@ impl WindowState {
             }
             _ => {}
         }
+        // Dev-only verification hook (GLYPH_FIELDMODE_SELFTEST=1): cycle the
+        // field mode Instanced → Derived → Visible through the SAME
+        // pending_relayout arm the panel's selector fires, printing the HUD
+        // line after each rebuild. Odd states fire a request (consumed after
+        // this render), even states are the quiet frame whose render fills
+        // the new probe; the print reads that. Until the Visible field's
+        // bodies land, the third step panics at `VisibleField::new` — which
+        // is the point of running it: the mode reaches the call.
+        #[cfg(feature = "egui-ui")]
+        {
+            let step_mode = |s: u8| match s {
+                1 => Some(glyph_field::GlyphFieldMode::Instanced),
+                3 => Some(glyph_field::GlyphFieldMode::Derived),
+                5 => Some(glyph_field::GlyphFieldMode::Visible),
+                _ => None,
+            };
+            match self.fieldmode_selftest {
+                s @ (1 | 3 | 5) if s > 1 || self.time() > 3.0 => {
+                    let has_mode = self.ui_probe.as_ref().and_then(|p| p.borrow().field_mode);
+                    match (has_mode, step_mode(s)) {
+                        (Some(_), Some(mode)) => {
+                            if let Some(probe) = &self.ui_probe {
+                                println!("FIELDMODE-SELFTEST before step {}: {}", s.div_ceil(2), hud_line(&probe.borrow(), self.ui_fps));
+                            }
+                            self.pending_relayout = Some(RelayoutRequest {
+                                set_field_mode: Some(mode),
+                                ..Default::default()
+                            });
+                            self.fieldmode_selftest = s + 1;
+                        }
+                        _ => {
+                            println!("FIELDMODE-SELFTEST: scene carries no field mode (no probe) — skipping");
+                            self.fieldmode_selftest = 0;
+                        }
+                    }
+                }
+                s @ (2 | 4 | 6) => {
+                    if let Some(probe) = &self.ui_probe {
+                        println!("FIELDMODE-SELFTEST after step {}:  {}", s / 2, hud_line(&probe.borrow(), self.ui_fps));
+                    }
+                    self.fieldmode_selftest = if s == 6 { 0 } else { s + 1 };
+                }
+                _ => {}
+            }
+        }
         // wgpu 30: get_current_texture returns a status enum instead of Result.
         use wgpu::CurrentSurfaceTexture as Cst;
         let frame = match self.surface.get_current_texture() {
@@ -473,10 +576,66 @@ impl WindowState {
             let session_filter_harness = &mut egui.session_filter_harness;
             let discovered_sessions = &mut egui.discovered_sessions;
             let session_dirs_report = &mut egui.session_dirs_report;
+            let hud_open = egui.hud_open;
             // The layout dial's apply signal: the panel's slider sets it on
             // release; the RedrawRequested arm consumes it and rebuilds.
             let pending_relayout = &mut self.pending_relayout;
             let full_output = egui_ctx.run_ui(raw_input, |root_ui| {
+                // The field HUD (F8): an always-on readout, separate from the
+                // Debug window, anchored top-left — what the field is and
+                // what it did this frame, in the same words the self-test
+                // prints (`hud_line`).
+                if hud_open {
+                    if let Some(snap) = &probe_snap {
+                        egui::Area::new(egui::Id::new("field_hud"))
+                            .anchor(egui::Align2::LEFT_TOP, [8.0, 8.0])
+                            .order(egui::Order::Foreground)
+                            .interactable(false)
+                            .show(root_ui.ctx(), |ui| {
+                                egui::Frame::popup(ui.style()).show(ui, |ui| {
+                                    let mode = snap.field_mode.map(|m| m.to_string()).unwrap_or_else(|| "n/a".to_string());
+                                    let strategy = snap.strategy.map(|s| s.to_string()).unwrap_or_else(|| "n/a".to_string());
+                                    ui.monospace(format!("field {mode} | engine {strategy} | {fps:.1} fps"));
+                                    ui.monospace(format!(
+                                        "segments {} ({} hidden) | backdrops {} | cull {:.2} ms CPU",
+                                        snap.segments, snap.hidden_segments, snap.cull_backdrops, snap.cull_cpu_ms
+                                    ));
+                                    match &snap.visible_stats {
+                                        Some(s) => {
+                                            ui.monospace(format!(
+                                                "items {}/{} visible, {} backdrop",
+                                                s.items_visible, s.items_total, s.items_backdrop
+                                            ));
+                                            ui.monospace(format!(
+                                                "lines {} candidate: {} glyph | {} wash",
+                                                s.lines_candidate, s.lines_glyph, s.lines_wash
+                                            ));
+                                            ui.monospace(format!(
+                                                "segments {} | slots {} ({} dropped)",
+                                                s.segments, s.slots, s.slots_dropped
+                                            ));
+                                            ui.monospace(format!(
+                                                "gpu: cull {:.2} | layout {:.2} | draw {:.2} ms",
+                                                s.cull_ms, s.layout_ms, s.draw_ms
+                                            ));
+                                        }
+                                        None => {
+                                            ui.monospace(format!(
+                                                "instances {} in {} draw ranges",
+                                                snap.cull_instances, snap.cull_ranges
+                                            ));
+                                        }
+                                    }
+                                    if snap.debug_tint != 0 {
+                                        ui.monospace(format!(
+                                            "debug tint: {}",
+                                            if snap.debug_tint == 1 { "by LOD tier" } else { "by cull state" }
+                                        ));
+                                    }
+                                });
+                            });
+                    }
+                }
                 // K1 leftover REMOVED (stage-k fix): the empty
                 // `CentralPanel::default()` paints an OPAQUE full-viewport
                 // panel_fill rect that blanketed the 3D scene — "background
@@ -513,9 +672,18 @@ impl WindowState {
                                     None => "—".to_string(),
                                 };
                                 ui.label(format!(
-                                    "camera: {mode} eye=({:.2},{:.2},{:.2}) yaw={:.3} pitch={:.3}",
+                                    "camera: {mode} eye=({:.2},{:.2},{:.2}) yaw={:.3} pitch={:.3} rad ({:.1}°, {:.1}°)",
                                     snap.eye[0], snap.eye[1], snap.eye[2], snap.yaw, snap.pitch,
+                                    snap.yaw.to_degrees(), snap.pitch.to_degrees(),
                                 ));
+                                // The pose as the argument that reproduces
+                                // it: a view seen once becomes a golden
+                                // view's command line.
+                                if ui.button("copy pose (--cam-pose, degrees)").clicked() {
+                                    let arg = cam_pose_arg(snap.eye, snap.yaw, snap.pitch);
+                                    println!("{arg}");
+                                    ui.ctx().copy_text(arg);
+                                }
                                 if snap.strategy.is_some() || snap.field_mode.is_some() {
                                     let engine_str = snap
                                         .strategy
@@ -621,6 +789,26 @@ impl WindowState {
                                 "cull: {} draw ranges, {} instances | {} backdrops",
                                 snap.cull_ranges, snap.cull_instances, snap.cull_backdrops
                             ));
+                            // The visible field's own dials. Fixed thresholds
+                            // (never camera-adapted); the tint is a diagnostic
+                            // the stored modes' shaders never read.
+                            if snap.field_mode == Some(glyph_field::GlyphFieldMode::Visible) {
+                                ui.separator();
+                                ui.label("visible field — glyph tier is the LOD px/em above; under this, an item is a backdrop (between: washes):");
+                                ui.add(
+                                    egui::Slider::new(&mut p.lod_backdrop_px, 0.05..=4.0)
+                                        .logarithmic(true)
+                                        .text("backdrop px/em"),
+                                );
+                                ui.horizontal(|ui| {
+                                    ui.label("debug tint:");
+                                    for (mode, label) in [(0u32, "off"), (1, "by LOD tier"), (2, "by cull state")] {
+                                        if ui.selectable_label(p.debug_tint == mode, label).clicked() {
+                                            p.debug_tint = mode;
+                                        }
+                                    }
+                                });
+                            }
                         }
                         // The layout dial (repo scenes only): the wrap
                         // staircase's pitch. Unlike K4's cull input this IS
@@ -705,39 +893,31 @@ impl WindowState {
                             }
                         }
 
-                        // Glyph field mode selection (Derived 20B vs Instanced 32B)
+                        // Glyph field mode selection: the two stored formats
+                        // and the Visible field (no slots; experimental, M2).
+                        // The highlighted label is the mode actually BUILT
+                        // (the probe reads `field.mode()`), so a lane-limit
+                        // fallback shows as Instanced here.
                         if let Some(snap) = &probe_snap {
                             if let Some(current_mode) = snap.field_mode {
                                 ui.separator();
                                 ui.label(
-                                    "glyph field mode — click switches slot format & rebuilds:",
+                                    "glyph field mode — click switches the field & rebuilds (visible: experimental, lays out per frame):",
                                 );
                                 ui.horizontal(|ui| {
-                                    if ui
-                                        .selectable_label(
-                                            current_mode == glyph_field::GlyphFieldMode::Derived,
-                                            "Derived (20B)",
-                                        )
-                                        .clicked()
-                                        && current_mode != glyph_field::GlyphFieldMode::Derived
-                                    {
-                                        *pending_relayout = Some(RelayoutRequest {
-                                            set_field_mode: Some(glyph_field::GlyphFieldMode::Derived),
-                                            ..Default::default()
-                                        });
-                                    }
-                                    if ui
-                                        .selectable_label(
-                                            current_mode == glyph_field::GlyphFieldMode::Instanced,
-                                            "Instanced (32B)",
-                                        )
-                                        .clicked()
-                                        && current_mode != glyph_field::GlyphFieldMode::Instanced
-                                    {
-                                        *pending_relayout = Some(RelayoutRequest {
-                                            set_field_mode: Some(glyph_field::GlyphFieldMode::Instanced),
-                                            ..Default::default()
-                                        });
+                                    for (mode, label) in [
+                                        (glyph_field::GlyphFieldMode::Derived, "Derived (20B)"),
+                                        (glyph_field::GlyphFieldMode::Instanced, "Instanced (32B)"),
+                                        (glyph_field::GlyphFieldMode::Visible, "Visible (no slots)"),
+                                    ] {
+                                        if ui.selectable_label(current_mode == mode, label).clicked()
+                                            && current_mode != mode
+                                        {
+                                            *pending_relayout = Some(RelayoutRequest {
+                                                set_field_mode: Some(mode),
+                                                ..Default::default()
+                                            });
+                                        }
                                     }
                                 });
                             }

@@ -402,6 +402,14 @@ impl TrieTable {
         (&self.device_block_indices, &self.device_measures, &self.device_counts, self.block_shift)
     }
 
+    /// The trie's own sections, verbatim: `(block_shift, block_index, blocks,
+    /// entry_stride)` — what [`Self::lookup`] indexes. The visible field
+    /// uploads them as-is (`layout_hyper::visible::trie_upload`), so its
+    /// kernel resolves a codepoint through the same two dependent loads.
+    pub fn raw_sections(&self) -> (u32, &[u32], &[u32], u32) {
+        (self.block_shift, &self.block_index, &self.blocks, self.entry_stride)
+    }
+
     /// Codepoint → trie entry (the two dependent loads of FORMAT.md).
     /// Resolve a codepoint. OUT-OF-RANGE values resolve through the shared
     /// missing block (storage block 0), exactly as the fixture trie's

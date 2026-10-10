@@ -72,6 +72,9 @@ pub enum PresentMode {
 pub enum FieldMode {
     Instanced,
     Derived,
+    /// Experimental (`--field-mode visible`, M2 of `out/VISIBLE-MODE.md`):
+    /// no slot per glyph; the lines in view are laid out per frame on the GPU.
+    Visible,
 }
 
 impl FieldMode {
@@ -83,6 +86,45 @@ impl FieldMode {
             FieldMode::Derived => {
                 "20 B DerivedSlot per glyph (X, row, glyph/wrap, color, group). Y/Z dynamically derived on GPU in vertex shader."
             }
+            FieldMode::Visible => {
+                "EXPERIMENTAL: no slot per glyph. Source bytes + line table resident on the GPU; the lines in view are laid out per frame (F8 HUD shows the tiers)."
+            }
+        }
+    }
+
+    /// The `--field-mode` spelling (`glyph_field::GlyphFieldMode::as_str`).
+    pub fn cli_name(self) -> &'static str {
+        match self {
+            FieldMode::Instanced => "instanced",
+            FieldMode::Derived => "derived",
+            FieldMode::Visible => "visible",
+        }
+    }
+
+    /// The launch config's spelling, case-insensitive; anything else is the
+    /// CLI default (instanced), as the renderer's own parse falls back.
+    pub fn from_config(name: &str) -> Self {
+        match name.to_lowercase().as_str() {
+            "derived" => FieldMode::Derived,
+            "visible" => FieldMode::Visible,
+            _ => FieldMode::Instanced,
+        }
+    }
+
+    /// The three-way cycle (◄/► and Enter), like `RepoEngine`'s.
+    pub fn next(self) -> Self {
+        match self {
+            FieldMode::Instanced => FieldMode::Derived,
+            FieldMode::Derived => FieldMode::Visible,
+            FieldMode::Visible => FieldMode::Instanced,
+        }
+    }
+
+    pub fn prev(self) -> Self {
+        match self {
+            FieldMode::Instanced => FieldMode::Visible,
+            FieldMode::Derived => FieldMode::Instanced,
+            FieldMode::Visible => FieldMode::Derived,
         }
     }
 }
@@ -384,10 +426,7 @@ impl LauncherState {
                             };
                         }
                         if let Some(fm) = cfg.field_mode.as_deref() {
-                            self.field_mode = match fm.to_lowercase().as_str() {
-                                "derived" => FieldMode::Derived,
-                                _ => FieldMode::Instanced,
-                            };
+                            self.field_mode = FieldMode::from_config(fm);
                         }
                         if let Some(asess) = cfg.agent_session {
                             if !asess.trim().is_empty() {
@@ -496,10 +535,7 @@ impl LauncherState {
         });
 
         args.push("--field-mode".to_string());
-        args.push(match self.field_mode {
-            FieldMode::Instanced => "instanced".to_string(),
-            FieldMode::Derived => "derived".to_string(),
-        });
+        args.push(self.field_mode.cli_name().to_string());
 
         if self.file_backgrounds {
             args.push("--file-backgrounds".to_string());
@@ -597,10 +633,7 @@ impl LauncherState {
                 self.cull = !self.cull;
             }
             FocusField::FieldMode => {
-                self.field_mode = match self.field_mode {
-                    FieldMode::Instanced => FieldMode::Derived,
-                    FieldMode::Derived => FieldMode::Instanced,
-                };
+                self.field_mode = self.field_mode.next();
             }
             FocusField::UiOverlay => {
                 self.ui_overlay = !self.ui_overlay;
@@ -686,7 +719,7 @@ impl LauncherState {
             FocusField::FileBackgrounds => self.file_backgrounds = true,
             FocusField::Greeking => self.greeking = true,
             FocusField::Cull => self.cull = true,
-            FocusField::FieldMode => self.field_mode = FieldMode::Derived,
+            FocusField::FieldMode => self.field_mode = self.field_mode.next(),
             FocusField::UiOverlay => self.ui_overlay = true,
             FocusField::FocusFile | FocusField::FilePath => {}
         }
@@ -761,7 +794,7 @@ impl LauncherState {
             FocusField::FileBackgrounds => self.file_backgrounds = false,
             FocusField::Greeking => self.greeking = false,
             FocusField::Cull => self.cull = false,
-            FocusField::FieldMode => self.field_mode = FieldMode::Instanced,
+            FocusField::FieldMode => self.field_mode = self.field_mode.prev(),
             FocusField::UiOverlay => self.ui_overlay = false,
             FocusField::FocusFile | FocusField::FilePath => {}
         }
@@ -963,16 +996,44 @@ mod tests {
         state.cycle_next();
         assert!(state.greeking);
 
-        // FieldMode: Left = Instanced, Right = Derived
+        // FieldMode: 3-way cycle like RepoEngine (Instanced → Derived →
+        // Visible → Instanced; ◄ walks it backwards)
         state.focus = FocusField::FieldMode;
+        assert_eq!(state.field_mode, FieldMode::Derived, "the launcher's default");
         state.cycle_prev();
         assert_eq!(state.field_mode, FieldMode::Instanced);
         state.cycle_next();
         assert_eq!(state.field_mode, FieldMode::Derived);
+        state.cycle_next();
+        assert_eq!(state.field_mode, FieldMode::Visible);
+        state.cycle_next();
+        assert_eq!(state.field_mode, FieldMode::Instanced);
+        state.cycle_prev();
+        assert_eq!(state.field_mode, FieldMode::Visible);
         state.toggle_current();
         assert_eq!(state.field_mode, FieldMode::Instanced);
         state.toggle_current();
         assert_eq!(state.field_mode, FieldMode::Derived);
+    }
+
+    /// Every launcher mode reaches the renderer under the renderer's own
+    /// spelling, and the config's spelling round-trips (unknown → instanced,
+    /// as the renderer's parse falls back).
+    #[test]
+    fn test_field_mode_names_and_build_args() {
+        for mode in [FieldMode::Instanced, FieldMode::Derived, FieldMode::Visible] {
+            assert_eq!(FieldMode::from_config(mode.cli_name()), mode);
+            assert_eq!(FieldMode::from_config(&mode.cli_name().to_uppercase()), mode);
+            let mut state = LauncherState::defaults();
+            state.field_mode = mode;
+            let args = state.build_cli_args();
+            let at = args.iter().position(|a| a == "--field-mode").expect("--field-mode is always passed");
+            assert_eq!(args[at + 1], mode.cli_name());
+        }
+        assert_eq!(FieldMode::from_config("vertexy"), FieldMode::Instanced);
+        let mut state = LauncherState::defaults();
+        state.field_mode = FieldMode::Visible;
+        assert!(state.build_cli_args().contains(&"visible".to_string()));
     }
 
     #[test]
@@ -1013,5 +1074,7 @@ mod tests {
             FieldMode::Derived.description(),
             "20 B DerivedSlot per glyph (X, row, glyph/wrap, color, group). Y/Z dynamically derived on GPU in vertex shader."
         );
+        assert!(FieldMode::Visible.description().starts_with("EXPERIMENTAL"));
+        assert!(FieldMode::Visible.description().contains("no slot per glyph"));
     }
 }

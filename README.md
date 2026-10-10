@@ -40,6 +40,7 @@ Platform: macOS on Apple Silicon (`osx-arm64`; Metal) and Linux x86_64 (`linux-6
  │ • crates/glyph-field*: GlyphField trait + one crate per mode│
  │   - Instanced: 32B RenderSlot upload, glyph pipeline, WGSL  │
  │   - Derived: 20B DerivedSlot upload, GPU vertex-stage Y/Z   │
+ │   - Visible (exp): no slots; lines in view laid out per frame│
  │ • pipelines.rs: composite & selection tint pipelines        │
  │ • render.rs: Frustum/LOD CPU culling, multi-pass rendering  │
  └─────────────────────────────────────────────────────────────┘
@@ -50,7 +51,9 @@ Platform: macOS on Apple Silicon (`osx-arm64`; Metal) and Linux x86_64 (`linux-6
   or 20-byte `DerivedSlot` instances directly into mapped GPU shared memory.
 - **`native/src/glyph_scene/`** (Rust, wgpu 30 / winit 0.30 / glam 0.33 / egui 0.36):
   Decomposed into modular submodules:
-  - `setup.rs`: scene construction; builds the glyph field for the chosen `--field-mode` (`instanced` or `derived`).
+  - `setup.rs`: scene construction; builds the glyph field for the chosen `--field-mode` (`instanced`,
+    `derived`, or the experimental `visible`, which keeps no slot per glyph and lays out the lines in
+    view per frame on the GPU — `out/VISIBLE-MODE.md`).
   - `pipelines.rs`: composite state and the selection tint pipeline.
   - `render.rs`: Frame render pass orchestration, two-level CPU frustum/LOD culling, backdrop quad pass,
     glyph field pass, and fullscreen composite pass.

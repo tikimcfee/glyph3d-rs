@@ -46,6 +46,32 @@ impl std::str::FromStr for PresentMode {
     }
 }
 
+/// The Visible field's debug tint (`--debug-tint`): colour each glyph by the
+/// LOD tier its line landed in, or by its item's cull state. A diagnostic
+/// lane in the Params uniform; the Instanced and Derived shaders never read
+/// it, so it moves no pixel there.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, clap::ValueEnum)]
+#[value(rename_all = "lower")]
+pub enum DebugTint {
+    #[default]
+    Off,
+    /// Colour by LOD tier (glyph / wash / backdrop).
+    Lod,
+    /// Colour by cull state (visible / culled by frustum / culled by LOD).
+    Cull,
+}
+
+impl DebugTint {
+    /// The uniform's encoding (`FramePrepare::debug_tint`).
+    pub fn as_u32(self) -> u32 {
+        match self {
+            DebugTint::Off => 0,
+            DebugTint::Lod => 1,
+            DebugTint::Cull => 2,
+        }
+    }
+}
+
 /// Long-form help tail: the mode summary + verb reference + windowed keys from
 /// the hand-rolled parser's --help (nothing user-facing was dropped).
 const AFTER_LONG_HELP: &str = "\
@@ -65,7 +91,8 @@ WINDOWED MODE:
   fly camera — WASD move, E|R up, Q|F down, RIGHT-drag look, scroll = speed,
   Esc releases | interact: LEFT click = pick glyph, h highlight line,
   g grab file (mouse drags, scroll scales), t tint, x hide |
-  F1 toggle Debug panel, F2 save screenshot (out/windowed-shot-*.png) |
+  F1 toggle Debug panel, F2 save screenshot (out/windowed-shot-*.png;
+  GLYPH_POSE_PRINT=1 also prints the frame's --cam-pose), F8 toggle the field HUD |
   --screenshot-frame N --screenshot-out PATH: scripted capture, keeps running";
 
 /// Stage H: clap-derive CLI. Semantics (flags, defaults, op-stream order) are
@@ -213,11 +240,19 @@ pub struct Cli {
     #[arg(long)]
     pub no_cull: bool,
     /// Glyph field render mode: `instanced` (default: one full 32 B placement
-    /// record per glyph, read as-is by the vertex stage) or `derived` (compact
-    /// 20 B record per glyph with vertex-stage Y/Z derivation from line tables).
-    /// Fixed for the scene's lifetime.
+    /// record per glyph, read as-is by the vertex stage), `derived` (compact
+    /// 20 B record per glyph with vertex-stage Y/Z derivation from line
+    /// tables), or `visible` (EXPERIMENTAL, behind this flag: no slot per
+    /// glyph — the source bytes and a line table are resident and the lines
+    /// in view are laid out per frame on the GPU; `out/VISIBLE-MODE.md`).
+    /// Switchable live from the Debug panel's selector (the scene rebuilds);
+    /// a load past the Derived slot lanes falls back to `instanced` and says so.
     #[arg(long, value_name = "MODE", default_value = "instanced")]
     pub field_mode: glyph_field::GlyphFieldMode,
+    /// Visible field only: tint glyphs by `lod` tier or `cull` state (`off`
+    /// by default). The other modes ignore it; the F8 HUD names the active one.
+    #[arg(long, value_name = "MODE", default_value = "off")]
+    pub debug_tint: DebugTint,
     /// Ground/sky environment behind the glyph scene: `off` or `ground`
     /// (default: `[environment] mode` in config, itself `off`). Windowed:
     /// the B key toggles it live.
