@@ -54,6 +54,7 @@ machines and clones, **M** machine-specific values, **R** runner.
 | C24 | `glyph3d-native` does not build with `default-features = false`: `egui` is used ungated in `windowed/state.rs` (found by the GPU research agent, 2026-10-09) | closed | egui uses gated (ui_rgb; poll_live reads the pose only with egui); new gate cargo-check-no-ui (cargo check --no-default-features --all-targets, own target dir) + mutation egui-use-ungated |
 | C25 | gpu.rs requests MAPPABLE_PRIMARY_BUFFERS on every adapter that offers it (wgpu warns "massive performance footgun" on discrete GPUs, every load on the Linux box); only Metal's direct upload uses it. Pre-existing | open | request it only where used (Metal + the direct upload), then A/B a discrete load; expected neutral (no mappable storage buffers are created on discrete) |
 | C26 | The debug panel's LOD controls blur two ideas Ivan wants separate (2026-10-10): TEXT DETAIL (greek_onset_px, default 10: below it the shader fuzzes glyph windings for fewer ALU ops; hidden behind the greeking checkbox) and SHOW GLYPHS (lod_min_px, default 1: below it a file segment is its backdrop rectangle; in visible mode also the glyph-vs-wash boundary, with lod_backdrop_px 0.25 as the file-rectangle tier). All three are labelled "px/em" (= on-screen pixels per text row) | queued for the visible-mode delegate after M3 (Ivan: keep it on the hard parts first) | two always-visible sliders in plain words — "Text detail" (with smooth/pure beside it) and "Show glyphs" (visible mode's file-rectangle tier as its second handle) — showing the px value; the panel keeps Text detail >= Show glyphs (glyphs appear fuzzed and sharpen on approach); config keys and docs renamed to match |
+| C27 | The launcher TUI lives in `glyph` and starts the renderer through translated command-line flags: two parsers of launch_config.toml with different rules, the file applied twice, cargo shell-outs to run itself, option spellings in three places | decided, not started | move the launcher into the renderer over its own CLI/config model; launch by spawning itself with the typed config file. Plan + steps: out/PLAN-LAUNCHER-INTO-RENDERER-2026-10-10.md |
 | C16 | Discrete-GPU upload: an ODD total survivor count costs ~10-20 ms of backend on this host (derived, 94 MB tree: 91,417,858 slots 415-425 ms, 91,417,859 slots 430-437 ms; same at bf9a757) [measured 2026-10-09]. Cause: a buffer copy whose size is off 16 B runs whole at ~half speed (RTX 5090/Vulkan), and the staging path copies the 20 B-slot stream twice (wgpu-core's staging at `unmap`, then ours); odd counts paid ~+10 ms per copy, counts = 2 mod 4 ~+3 ms. Instanced (32 B) never paid | closed | staging padded to 16 B, copies split into a 16-aligned body + tail (`glyph_field::copy`); odd = even after (derived medians 414 vs 415 ms, A/A spread 4 ms), VRAM bytes and 18 golden renders identical. e59e4a6 (fix), 3d2a50f (mutation rebuild), b90da50 (notes). M2 A/B vs a76aeaf: every config inside the A/A floor (derived syntax 174/174 ms median; the unified path makes no copy). Left: chunked Derived buffers start at 8 mod 16 (~+1 ms, measured with a forced split) |
 | C11 | Mutation `find` strings also match their own entry in build.toml; correct only because the target comes first | closed | prover refuses a find that matches more than once; 3 mutations anchored (2 matched their own build.toml entry, 1 picked the first of 7 #[test]s); prove-ambiguous-find-accepted |
 | P1 | pixel-ab red on both platforms since 10-07; Linux set a month stale, 2 views never adopted | closed | 21f9aef (metal-apple: walked on the M2 from the set's own commit to the tip, every moved pixel named — d1b0f7e camera, 8b28f1f the C17 colouring, 048d403 a culling regression repaired by 9c96ad1, 9c96ad1 palette + '#'/block comments, tip C15/C17), d4cb1a4 (vulkan-nvidia re-adopted after it; drift vs Metal 0 clustered in all nine; all 9 incl. emoji-cluster/repo-cluster). pixel-ab green here; the 4 pixel mutations prove (prove coverage 44/44 provable) |
@@ -127,72 +128,62 @@ ln -s <path-to-zed-checkout> experiments/zed
 export GLYPH_FLAGSHIP_REPO=<path-to-glyph3d-js-checkout>
 ```
 
-## Next session: handoff (2026-10-09, tip of this branch)
+## Next session: handoff (2026-10-10, tip of this branch = origin/main)
 
-**State.** Battery ALL GATES GREEN, 16 of 16 (270+ tests, floor in build.toml);
-pixel-ab byte-equal on BOTH vulkan-nvidia and metal-apple (re-baselined
-21f9aef/d4cb1a4); `glyph prove` covers every provable mutation. Main pulled
-this branch up to the main merge (d6e060d); everything after it (D2, C11, C9,
-C5, C2 kernel, D9, D6, D7, C8, D4) is NOT on main yet.
+**State.** Battery ALL GATES GREEN, 15 of 15 (300 tests, floor 300); pixel-ab
+20/20 (10 views, plain and under `--field-mode derived`) on BOTH vulkan-nvidia
+and metal-apple; unscoped `glyph prove` reddens all mutations (~12 min since
+C21). Everything is pushed: this branch and `origin/main` are the same commit.
+(Ivan's own `main` checkout may lag `origin/main`: `git merge --ff-only
+origin/main` there.)
 
-**Decided with Ivan (2026-10-09), in order:**
+**Landed 2026-10-09/10** (details in the landed table above): C1-C3 refactors;
+C2 splits of the runner and the TUI; CubeCL retired (report:
+`out/GPU-DIRECTION-2026-10-09.md`); discrete staging 482 -> 121 ms derived
+backend on the Linux box (host staging, parallel copy, C22 windowed
+direct-to-staging emission); C19 Derived edit bug, sidecar sort, golden
+equivalents (Derived pass), repo-highlight frame; C21 prove 2x faster; C24
+no-UI build + gate; and the VISIBLE field mode (M1 line table, M2
+`--field-mode visible` end to end with a sixth hyper-oracle tier holding the
+GPU kernel to Pass 2 on both GPUs; `out/VISIBLE-MODE.md` is its "how to see
+it" log).
 
-1. **Refactors (step 3) — next.**
-   - **C1, the field crates.** `glyph-field-{instanced,derived}`: upload.rs
-     (267 lines each, ~half identical after normalising the slot name),
-     storage.rs (near-identical), field.rs, pipeline.rs. Hoist slot-generic
-     upload + storage into `glyph-field` (`T: Pod`, `SlotStorage<T>`, the
-     chunking arithmetic, one `create_mapped_hal_buffer<T>` gated once on
-     macOS). The C16 copy helpers (`glyph_field::copy`) are already there.
-     Proof of neutrality: pixel-ab on both machines + hyper-oracle device tier;
-     an M2 A/B (Derived and Instanced) because upload is on the load path.
-   - **C2, split `glyph/src/main.rs`** (~1,720 lines) into manifest / products
-     / gates / prove / cli modules. Then `glyph/src/tui.rs` (~2,030) and
-     CubeCL's `position.rs` (~3,565) only if CubeCL stays.
-   - **C3, folded in:** outside CubeCL every `#[allow]` is
-     `too_many_arguments` (23 fns). Parameter structs where the signature
-     changes anyway; the 7 in the device emitter's hot loop
-     (`pass2_device.rs`, `char_resolve.rs`) need an M2 A/B.
-2. **Load-time syntax colouring.** Being replaced by on-load LSP/AST
-   colouring. Talk first: deprecating removes the three colourisers + the
-   stage_file tokenizer, the file-tint counts, the hyper-oracle PAINT tier,
-   and moves the repo goldens to flat paint (a re-baseline). Don't unify the
-   colourisers if they are about to go.
-3. **GPU direction (Ivan, 2026-10-09):** "we need to really think about how
-   to use the GPU effectively" — the CubeCL dispatch work has not been shown
-   to beat a decent CPU path. CubeCL may go away (so C4/C12/C18 and CubeCL's
-   allows are parked). Discrete-GPU lever on record: wgpu-core zero-fills its
-   own 1.8 GB staging buffer + an extra copy, ~150 ms of ~410 ms backend on
-   the 94 MB tree (Linux/NVIDIA only; unified memory skips it).
-   **2026-10-09: decided — CubeCL retired (c78ee46).** Research by a separate agent
-   (report in out/; prototype under experiments/gpu-direction/ on its branch).
-   Visible-set layout measured at Linux scale: 1.68 GB resident vs 26.6 GB of
-   slots, ~1 s load, sub-ms frames. Next on the CPU path: host staging as the
-   discrete default, emoji tint pairs folded into emission (~250 ms here).
-   Earlier: research delegated to a separate agent on its own branch
-   (rewrite vs retire; Ivan's "think of it like a mesh" — draw-time derivation
-   from source bytes — tested as a hypothesis); its report lands as
-   `out/GPU-DIRECTION-2026-10-09.md` on that branch.
-4. **X1/X2** (Zed experiments, flagship corpus clone here) after performance
-   is in a good state; the Linux load milestone makes a good benchmark.
+**In flight: the visible-mode delegate** (a Fable agent in its own worktree,
+branch `worktree-agent-a164e953c6cdd7fc6`). It implements milestone by
+milestone and reports after each; I review and merge (it never pushes). Next:
+**M3** — re-key the slot-addressed consumers by (item, byte): GlyphField verbs
+and `read_slot_words`, overrides, selection mask, picking, culling. Then M4
+(`golden_equivalents` gains `--field-mode visible`). M5 (default flip) is
+Ivan's call. Rules it works under: production code allowed on its branch;
+full battery green per commit; every milestone ships something Ivan can SEE
+in the open app (live mode switch, F8 HUD, `--debug-tint lod|cull`, poses via
+"copy pose"), with the commands in the commit message. The M2 machine is
+available to it (helpers in `target/scratch/helper-tools/rx/`, untracked).
+If a session ends with it mid-milestone: check its worktree for uncommitted
+files (by mtime; the worktree guard blocks `git -C`), then resume it with
+SendMessage and a state summary.
 
-**Working conventions this pass settled** (also in memory):
-- Test depth by change size: build + the watching gate + `glyph prove
-  --mutation <touched>` by default; full battery + unscoped prove + M2 A/B for
-  runner changes, load-path/hot-path changes, dependency bumps, and before
-  handing back to main. Say which tier ran.
-- Public repo: tracked files must work for a cloner — no personal paths,
-  hosts or session names; names/emails are fine.
-- A red golden gate hides the NEXT change (the walk found 048d403's culling
-  loss and 8b28f1f's colouring that way): keep pixel-ab green; re-baseline only
-  on Ivan's say-so, attributing every moved pixel first.
-- `cargo glyph` now works inside `.claude/worktrees` (D2), but Ivan prefers
-  sibling worktrees (`../glyph3d-rs-<topic>`) for cargo work.
-- Second machine: helper scripts (ssh job runner, perf A/B, golden walk,
-  pixel gate) live untracked in `target/scratch/helper-tools/rx/`; they name
-  this setup and must be made generic (env-driven) before ever landing.
-  A/A noise floor on the M2: ~8-9 ms (derived syntax ~2 ms).
-- Linux A/B harness: `target/scratch/helper-tools/ab3.py`.
+**Queued:**
+- **C26** (LOD panel: separate "Text detail" from "Show glyphs") — hand to
+  the delegate when it reports M3 and is idle; Ivan wants it on the hard
+  parts first.
+- **C27 — the launcher moves into the renderer.** Decided with Ivan;
+  plan, facts to validate and steps in
+  `out/PLAN-LAUNCHER-INTO-RENDERER-2026-10-10.md`. For a fresh session:
+  validate the plan's facts against the code, then implement in its steps.
+  Touches the TUI, `launch_config.rs` and `native/src/cli/`, none of the
+  delegate's M3 files.
+
+**On hold by decision:** retiring the load-time syntax heuristic and the
+re-baseline that goes with it (after the new algorithms are agreed); the
+`pass2_device.rs` split (until visible mode settles, to avoid merge pain).
+**Small open items:** C23 (the GPU staging sink is still pixel-only), C25
+(MAPPABLE_PRIMARY_BUFFERS requested on discrete; probably neutral, one A/B).
+
+**Working conventions** (also in memory): test depth by change size; public
+repo (no personal paths/hosts/session names in tracked files); keep pixel-ab
+green and re-baseline only on Ivan's say-so, every moved pixel attributed;
+interleaved A/Bs with load reported; the M2 is fanless (cool-downs).
 
 ---
 
