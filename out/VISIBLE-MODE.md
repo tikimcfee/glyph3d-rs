@@ -499,6 +499,14 @@ baseline (`validate` refuses otherwise). The other road — visible mode
 carrying the heuristic's colours as byte spans — is a feature against the
 standing decision, noted and not taken.
 
+**On the M2 (metal-apple, 2026-10-10, dba6500 through the remote job):**
+`validate` green (60 mutations), `gates` listing the two equivalents and
+the five exemptions, the pixel-ab gate PASS under `--field-mode visible`
+for demo, text, emoji, emoji-cluster and repo-highlight against the
+metal-apple set and the five NOTEs at 47,112 / 222,278 / 43,715 /
+256,643 / 29,178 px, the full battery ALL GATES GREEN 15 of 15 with 325
+tests at floor 325.
+
 ```sh
 # See it: the gate's own lines (the two equivalents, the five NOTEs).
 cargo glyph test render
