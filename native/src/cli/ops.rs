@@ -46,12 +46,17 @@ pub(crate) fn set_pick_row_col(ops: &mut Vec<Op>, row: Option<u32>, col: Option<
 ///   move-group dx dy dz         scale-group s
 ///   tint-group rrggbb           tint-cycle
 ///   hide-group | show-group | toggle-hidden
+///   set-glyph-background rrggbb`[aa]`   set-glyph-transform tx ty tz `[s]`
+///   reset-glyph-group
+/// (the last three, 2026-10-10: the group-per-glyph verbs had no CLI form,
+/// so nothing scripted could reach them — the M3 witness needs one.)
 pub fn parse_verb(s: &str) -> Result<Verb, String> {
     let t: Vec<&str> = s.split_whitespace().collect();
     let usage = format!(
         "unknown/malformed --verb {s:?} — expected recolor-glyph|recolor-line|\
          nudge-glyph|scale-glyph|move-group|scale-group|tint-group|tint-cycle|\
-         hide-group|show-group|toggle-hidden"
+         hide-group|show-group|toggle-hidden|set-glyph-background|\
+         set-glyph-transform|reset-glyph-group"
     );
     let f = |i: usize| -> Result<f32, String> {
         t.get(i)
@@ -66,6 +71,24 @@ pub fn parse_verb(s: &str) -> Result<Verb, String> {
         let v = u32::from_str_radix(h, 16)
             .map_err(|_| format!("--verb {s:?}: bad hex color {h:?}"))?;
         Ok([((v >> 16) & 0xFF) as u8, ((v >> 8) & 0xFF) as u8, (v & 0xFF) as u8])
+    };
+    // rrggbb or rrggbbaa (alpha defaults to ff), as sRGB floats.
+    let hex_rgba = |i: usize| -> Result<[f32; 4], String> {
+        let h = t
+            .get(i)
+            .ok_or_else(|| format!("--verb {s:?}: missing rrggbb[aa] at position {i}"))?
+            .trim_start_matches('#');
+        if h.len() != 6 && h.len() != 8 {
+            return Err(format!("--verb {s:?}: bad hex color {h:?} (want rrggbb or rrggbbaa)"));
+        }
+        let v = u32::from_str_radix(h, 16).map_err(|_| format!("--verb {s:?}: bad hex color {h:?}"))?;
+        let v = if h.len() == 6 { (v << 8) | 0xFF } else { v };
+        Ok([
+            ((v >> 24) & 0xFF) as f32 / 255.0,
+            ((v >> 16) & 0xFF) as f32 / 255.0,
+            ((v >> 8) & 0xFF) as f32 / 255.0,
+            (v & 0xFF) as f32 / 255.0,
+        ])
     };
     Ok(match t.first().copied().unwrap_or("") {
         "recolor-glyph" => Verb::RecolorGlyph(if t.len() > 1 { Some(hex(1)?) } else { None }),
@@ -82,6 +105,13 @@ pub fn parse_verb(s: &str) -> Result<Verb, String> {
         "hide-group" => Verb::SetHidden(true),
         "show-group" => Verb::SetHidden(false),
         "toggle-hidden" => Verb::ToggleHidden,
+        "set-glyph-background" => Verb::SetGlyphBackground(hex_rgba(1)?),
+        "set-glyph-transform" => {
+            // Translation, identity rotation, uniform scale (default 1).
+            let sc = if t.len() > 4 { f(4)? } else { 1.0 };
+            Verb::SetGlyphTransform([f(1)?, f(2)?, f(3)?], [0.0, 0.0, 0.0, 1.0], [sc, sc, sc])
+        }
+        "reset-glyph-group" => Verb::ResetGlyphGroup,
         _ => return Err(usage),
     })
 }

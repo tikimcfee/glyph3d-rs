@@ -227,3 +227,141 @@ reddens it through this tier. The grid test
 `hyper_oracle::tests::pagination_agrees_on_every_tier` runs the tier too, over
 every paging shape.
 
+## M3 — how to see it (2026-10-10)
+
+**The problem M3 solves.** In visible mode the slot buffer is transient and
+its order is set by atomics each frame, so everything the scene keyed by SLOT
+— the selection mask, the glyph verbs, `GLYPH_G_DUMP` — named nothing there
+(M2 left them "reported, not applied"). M3 re-keys them by **(item, byte)**:
+the item is the file's index in the load (its group id at load,
+`GlyphScene::visible_item_of`) and the byte is the glyph's LEADER offset
+within the file — both already what the CPU pick yields (`PickFileInfo::group_id`,
+`PickGlyph::byte_off`). The stored modes keep their slot paths untouched (the
+goldens, and the goldens under `--field-mode derived`, are the proof).
+
+**How each consumer is keyed now** (renderer side; the field's bodies are the
+crate's, `crates/glyph-field-visible`):
+
+| Consumer | Stored modes (unchanged) | Visible (M3) |
+|---|---|---|
+| Selection (`glyph_scene/target.rs`) | `Selection::Glyph{chunk,local}` / `Segment{slot_base,slot_count}` | `Selection::ByteRange{item,start,end}`: a glyph → `[byte, byte+utf8 len)`; a file-level or blank pick → `[0, byte_len)` (`pick::byte_range_selection`) |
+| Mask pass (`render.rs`) | `record_draws` over the slot range | `prepare_mask(queue, encoder, item, start, end)` right after `prepare` (same encoder, before any pass; only when the mask pass will run — windowed), then `set_pipeline(mask)` + `record_mask_draw(pass)` |
+| `recolor-glyph` | `write_color(slot)` | `set_glyph_override(GlyphOverride{item, byte, color, ..})` |
+| `nudge-glyph` | `write_position(slot)` | override `x_nudge += dx` (y/z not representable — the reply says so, as in Derived) |
+| `scale-glyph` | `write_extent(slot)` | not representable (advance/height come from the atlas table, as in Derived) — reply only |
+| `set-glyph-background` / `set-glyph-transform` | group row allocated, `write_group_id(slot)` | group row allocated as before, then override `group = new row` |
+| `reset-glyph-group` | `write_group_id(slot, own)` | override `group = NO_GROUP`; an override left with nothing in it is CLEARED (`clear_glyph_override`) |
+| `recolor-line` | rebuilt placements over the row's slots | `set_item_span_range(item, start, end, color)` over the row's byte range (`pick::row_byte_range`, from the pick cache) |
+| `hide-group` / `show-group` | group alpha + CPU cull flag | the same, plus `set_item_hidden(item, hide)` — the HUD's items/lines tiers move |
+| group TRS edits (move/scale/tint, grab drag, carrel moves — everything that reaches `sync_segment`) | the SegCull box recomputed | the same, plus `set_item_bbox(item, min, max)` with the recomputed box (`--no-cull`: from the pick AABB) |
+| `--highlight` / seam `apply_surface_updates` (`style.rs`) | per-slot placements | `set_item_spans(item, spans)` — whole-item replace (M2 already) |
+| `GLYPH_G_DUMP` (`offscreen.rs`) | `<slot>[,<len>]` | `<item>:<byte>[,<len>]` → `locate` in the last prepared frame → the 20 B slot |
+| HUD (F8) | slot / slot range | `selection item:start..end` and `pick file byte N` |
+
+The scene's `glyph_overrides: HashMap<(item, byte), GlyphOverride>` is the
+source of truth for the per-glyph edits; every verb merges one lane into it
+(`pick::merged_override`: a recolour after a nudge keeps the nudge) and pushes
+the whole record to the field. Every Visible verb reply names the `item` and
+`byte` it applied to.
+
+**Commands** (repo root, release build, GPU). The reproducible door is the
+CLI op stream offscreen — the same `apply_pick`/`apply_verb` the click and the
+panel call:
+
+```sh
+# Pick a glyph and recolour it, visible mode, screenshot. The reply names the key:
+#   verb recolor-glyph: alpha.rs item 0 byte 35 (row 3 col 8 'a') -> #e01010 (override)
+target/release/glyph3d-native --load-repo native/fixtures/g-pick-repo --field-mode visible \
+    --focus-file alpha.rs --zoom 3 --pick-file alpha.rs --pick-row 3 --pick-col 8 \
+    --verb "recolor-glyph e01010" --screenshot out/visible-recolor.png
+
+# The same in derived mode, for the eye's A/B (the witness below does it by pixel):
+target/release/glyph3d-native --load-repo native/fixtures/g-pick-repo --field-mode derived \
+    --focus-file alpha.rs --zoom 3 --pick-file alpha.rs --pick-row 3 --pick-col 8 \
+    --verb "recolor-glyph e01010" --screenshot out/derived-recolor.png
+
+# The row, the per-glyph group (background quad / transform), and the reset:
+#   --verb "recolor-line 10e010"
+#   --verb "set-glyph-background 1010e0"      (rrggbb[aa]; new CLI form, 2026-10-10)
+#   --verb "set-glyph-transform 0 2 0 1.5"    (tx ty tz [s]; new)
+#   --verb reset-glyph-group                  (new)
+#   --verb "nudge-glyph 0.5 0 0"              (x only in visible/derived; y/z reported)
+#   --verb hide-group / show-group            (also set_item_hidden)
+
+# Where did that glyph land this frame? Locate it in the transient buffer:
+GLYPH_G_DUMP=0:35 target/release/glyph3d-native --load-repo native/fixtures/g-pick-repo \
+    --field-mode visible --focus-file alpha.rs --zoom 3 --screenshot out/visible-dump.png
+#   GLYPH_G_DUMP item 0 byte 35 -> transient slot N: [x, row, glyph_and_wrap, color, item_and_group]
+
+# The windowed self-test: pick (first file, row 0 col 0) then recolor-glyph,
+# nudge-glyph, set-glyph-background, hide-group, show-group, one every fourth
+# frame from t≈3 s, printing each reply and the HUD line after it.
+GLYPH_VISIBLE_VERB_SELFTEST=1 target/release/glyph3d-native --load-repo native/fixtures/g-pick-repo --field-mode visible
+GLYPH_VISIBLE_VERB_SELFTEST=wide.txt:2:10 target/release/glyph3d-native --load-repo native/fixtures/g-pick-repo --field-mode visible
+
+# The panel door: launch visible, LEFT-click a glyph — the selection mask
+# highlights it (the field lays the byte range out again into its mask buffer);
+# click a file's empty margin — the whole item highlights; h recolours the row,
+# x hides/shows the file (the HUD's items/lines tiers move), t cycles the tint,
+# g grabs the file (drag moves it; the item box follows). F1's verb buttons are
+# the same `--verb` literals. The F8 HUD shows `selection item:start..end` and
+# `pick file byte N`.
+target/release/glyph3d-native --load-repo native/fixtures/g-pick-repo --field-mode visible
+```
+
+**The witness** (`cargo test --release -p glyph3d-native --test visible_verbs`;
+`native/tests/visible_verbs.rs`, in the cargo-test gate; mutation
+`visible-verb-keyed-off-by-one-byte` proves it). It runs the release binary
+as `pick-oracle` and the golden runner do — `g-pick-repo` from the `repo-zoom`
+camera (alpha.rs, zoom 3), `--pick-file alpha.rs --pick-row 3 --pick-col 8`
+(the `a` of `alpha`, byte 35), in `derived` and in `visible` mode, plain and
+with one verb — and reads the PNGs. Five cases: `recolor-glyph e01010`,
+`recolor-line 10e010`, `set-glyph-background 1010e0`, `hide-group`, and
+`selection` (the frame with the pick against the frame without one: the
+selection mask — offscreen frames carry the highlight, since the mask
+machinery is built for both drivers). For each it asserts:
+
+- the verbed frame differs from the plain frame of the same mode in a SMALL
+  region only (a cell at this zoom is 134×145 px: a bounding box at most
+  200×220 px and 20,000 changed pixels for a glyph, 200×320 and 60,000 for
+  its em-tall background quad, a band at most 300 px tall and 250,000 pixels
+  for the row; `hide-group` empties the file and is held only to coincide),
+  and some changed pixel carries the verb's DOMINANT channel at least 60
+  above the other two (40 for the alpha-blended background) — the shader
+  blends the slot colour with the group tint, so `#e01010` renders as
+  ≈ (255,167,95) where the plain cream is (255,249,204); what survives the
+  blend is which channel leads;
+- the set of pixels changed in visible mode coincides with the set changed in
+  derived mode: symmetric difference at most max(8, 5 % of the larger set),
+  bounding boxes within 2 px — the (item, byte) key addressed the glyph the
+  slot did;
+- the visible reply names `item` and `byte`.
+
+Measured on this box (vulkan-nvidia, 2026-10-10) — every case coincides
+EXACTLY, 0 px in one mask only, identical boxes:
+
+| case | changed px (both modes) | box | colour (verbed, best pixel) | visible reply |
+|---|---|---|---|---|
+| `recolor-glyph e01010` | 9,203 | 134×145 at (183,615) | red leads by 100 (255,155,93) | `item 0 byte 35 (row 3 col 8 'a') -> #e01010 (override)` |
+| `recolor-line 10e010` | 57,717 | 1396×247 at (183,565) | green leads by 202 (8,210,6) | `item 0 bytes 27..46 (row 3) -> #10e010 (span)` |
+| `set-glyph-background 1010e0` | 38,858 | 158×299 at (167,537) | blue leads by 60 (179,167,239) | `item 0 byte 35 (row 3 col 8) -> group 5 (override)` |
+| `hide-group` | 94,232 | 1548×808 at (31,192) | — | `group 0 (...; item 0 hidden=true)` |
+| `selection` (pick, no verb) | 9,203 | 134×145 at (183,615) | — (the `[glyph_scene] selection_tint`) | `pick: alpha.rs group=0 rec=35 row=3 col=8 line=3 byte=35 char='a'` |
+
+Unit tests beside it: `pick::visible_key_tests` (the selection a pick becomes,
+the row range, the override merge), `offscreen::tests::g_dump_spec_parses_slots_and_item_bytes`,
+`cli::tests::glyph_group_verb_forms`. The self-test above, run on this box:
+the pick resolves `u` at byte 0, each reply names `item 0 byte 0`, and the HUD
+after `hide-group` reads `segments 5 (1 hidden) | items 4/5 visible | lines
+312 candidate: 312 glyph` (318 before — alpha.rs's six lines left every
+tier), back to `5/5` and `318` after `show-group`; every HUD line ends
+`| selection 0:0..1 | pick alpha.rs byte 0`. `GLYPH_G_DUMP=0:35` printed
+`transient slot 19: [40879d21, 00000003, 00000042, ffd4d4d4, 00000000]` — the
+same five words the Derived field's slot 32 holds for that glyph.
+
+What this cannot see: `set_item_bbox` (a wrong box is a culling error,
+pixel-visible only when it culls the item — the HUD's items tier is the
+readout; the `move-group` reply is the trace), `set-glyph-transform`'s group
+lane beyond what the background quad shares with it, and `nudge-glyph` (x only;
+the reply is the trace — the override merge is unit-tested).
+

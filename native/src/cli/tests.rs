@@ -414,6 +414,40 @@ fn verb_defaults_and_forms() {
     ));
 }
 
+/// The group-per-glyph verbs' CLI forms (2026-10-10): every channel of the
+/// background colour is asserted with distinct non-0/255 bytes (the
+/// `tint-group` lesson above), alpha defaults to 1 and parses when given, the
+/// transform's scale defaults to 1, and malformed colours are refused.
+#[test]
+fn glyph_group_verb_forms() {
+    let Verb::SetGlyphBackground(c) = parse_verb("set-glyph-background 123456").unwrap() else {
+        panic!("set-glyph-background did not parse to SetGlyphBackground");
+    };
+    assert!((c[0] - 18.0 / 255.0).abs() < 1e-6, "red: {c:?}");
+    assert!((c[1] - 52.0 / 255.0).abs() < 1e-6, "green: {c:?}");
+    assert!((c[2] - 86.0 / 255.0).abs() < 1e-6, "blue: {c:?}");
+    assert!((c[3] - 1.0).abs() < 1e-6, "alpha defaults to 1: {c:?}");
+    let Verb::SetGlyphBackground(c) = parse_verb("set-glyph-background #12345678").unwrap() else {
+        panic!("rrggbbaa form did not parse");
+    };
+    assert!((c[3] - 120.0 / 255.0).abs() < 1e-6, "alpha: {c:?}");
+    assert!(parse_verb("set-glyph-background 1234").is_err(), "4 hex digits is neither form");
+    assert!(parse_verb("set-glyph-background").is_err(), "the colour is required");
+
+    let Verb::SetGlyphTransform(t, q, s) = parse_verb("set-glyph-transform 1 2 3").unwrap() else {
+        panic!("set-glyph-transform did not parse");
+    };
+    assert_eq!(t, [1.0, 2.0, 3.0]);
+    assert_eq!(q, [0.0, 0.0, 0.0, 1.0], "identity rotation");
+    assert_eq!(s, [1.0, 1.0, 1.0], "scale defaults to 1");
+    let Verb::SetGlyphTransform(_, _, s) = parse_verb("set-glyph-transform 1 2 3 2.5").unwrap() else {
+        panic!("set-glyph-transform with scale did not parse");
+    };
+    assert_eq!(s, [2.5, 2.5, 2.5]);
+    assert!(parse_verb("set-glyph-transform 1 2").is_err(), "three translation floats are required");
+    assert!(matches!(parse_verb("reset-glyph-group").unwrap(), Verb::ResetGlyphGroup));
+}
+
 #[test]
 fn screenshot_frame_flags_parse() {
     // Stage K (K6): the windowed capture pair parses together.

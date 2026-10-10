@@ -25,7 +25,7 @@
 # Ratchet, NOT an equality: tests are added constantly, so an exact pin would
 # redden on the most common good action in the repo. A green run whose real
 # count exceeds the floor prints a NOTE naming the value to raise it to.
-test_floor = 300
+test_floor = 314
 # Every golden view is rendered again under each of these and must match the
 # SAME baseline byte for byte (2026-10-09, C20). The Derived field renders
 # every golden frame identically to Instanced (measured on vulkan-nvidia and
@@ -1060,4 +1060,15 @@ op = "replace"
 find = "    (fu as f64 * CELL_HEIGHT_WORLD as f64 / em_height_fu as f64) as f32"
 with = "    (fu as f64 * CELL_HEIGHT_WORLD as f64 / (em_height_fu + 1) as f64) as f32"
 expect = "fu_to_world_is_the_nearest_f32"
+rebuild = "cargo build --release"
+
+[[mutation]]
+name = "visible-verb-keyed-off-by-one-byte"
+gate = "cargo-test"
+why = "M3 (2026-10-10): the Visible field's glyph verbs are keyed by (item, leader byte) where the stored fields key by slot, and the two keys must name the SAME glyph. Keying the override one byte late lands recolor-glyph on the NEXT glyph (`l` of `alpha`, not `a`): the visible frame's changed-pixel set no longer coincides with the derived frame's. CONSUMED BY: the pixel witness native/tests/visible_verbs.rs (symmetric difference of the two masks, 0 px when right), and nothing else — the hyper-oracle tiers run no verb, and no golden view runs one in visible mode"
+file = "native/src/glyph_scene/pick.rs"
+op = "replace"
+find = "        let byte = g.byte_off as u32;\n        let key = (item, byte);"
+with = "        let byte = g.byte_off as u32 + 1;\n        let key = (item, byte);"
+expect = "visible_verbs_address_the_glyph_the_slot_did"
 rebuild = "cargo build --release"

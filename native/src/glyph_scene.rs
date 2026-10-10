@@ -190,8 +190,14 @@ pub struct GlyphScene {
     /// windowed composite path.
     pub(in crate::glyph_scene) selection: Option<Selection>,
     /// Geometry overrides from nudge/scale-glyph verbs (slot → pos/advance/
-    /// height), so a later recolor-line rebuild preserves them.
+    /// height), so a later recolor-line rebuild preserves them. The stored
+    /// modes' map; the Visible field's is `glyph_overrides`.
     pub(crate) geom_overrides: std::collections::HashMap<u32, ([f32; 3], f32, f32)>,
+    /// The Visible field's per-glyph edits, keyed by (item, leader byte) —
+    /// the source of truth the field holds a copy of (M3): colour, x nudge
+    /// and group override merged lane by lane as the verbs arrive
+    /// (`pick::merged_override`).
+    pub(crate) glyph_overrides: std::collections::HashMap<(u32, u32), glyph_field_visible::GlyphOverride>,
     /// One-entry cache of the last pick's re-derived file data.
     pub(in crate::glyph_scene) cache: Option<PickCacheEntry>,
     /// Windowed grab verb: the group being dragged with the mouse.
@@ -458,7 +464,25 @@ impl SceneLike for GlyphScene {
     }
 
     fn debug_dump_instances(&self, ctx: &GpuContext, slot: u64, out: &mut [u32]) {
-        self.field.read_slot_words(&ctx.device, &ctx.queue, slot as u32, out);
+        match self.field.visible() {
+            // The transient buffer of the last prepared frame: the slot is
+            // what `debug_locate` answered, not an address that survives.
+            Some(visible) => {
+                let slots = visible.read_slots(&ctx.queue, slot as u32 + 1);
+                if let Some(s) = slots.last() {
+                    // The Derived slot's five words, in buffer order.
+                    let words = [s.x.to_bits(), s.row, s.glyph_and_wrap, s.color, s.item_and_group];
+                    for (o, w) in out.iter_mut().zip(words) {
+                        *o = w;
+                    }
+                }
+            }
+            None => self.field.read_slot_words(&ctx.device, &ctx.queue, slot as u32, out),
+        }
+    }
+
+    fn debug_locate(&self, ctx: &GpuContext, item: u32, byte: u32) -> Option<u32> {
+        self.field.visible().and_then(|v| v.locate(&ctx.queue, item, byte))
     }
 
     fn tick(&mut self, dt: f32) {

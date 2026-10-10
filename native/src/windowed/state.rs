@@ -106,6 +106,13 @@ pub(super) struct WindowState {
     /// states are the quiet frame after a rebuild (see `render`).
     #[cfg(feature = "egui-ui")]
     pub(super) fieldmode_selftest: u8,
+    /// Dev-only verification hook state (GLYPH_VISIBLE_VERB_SELFTEST=1, M3):
+    /// at t≈3 s picks a glyph through `apply_pick` (the CLI/click entry) and
+    /// applies recolor-glyph, nudge-glyph, set-glyph-background, hide-group
+    /// and show-group one every few frames, printing each verb's reply and
+    /// the HUD line after it. 0 = off/done; 1 = armed; 2.. = the step to run.
+    #[cfg(feature = "egui-ui")]
+    pub(super) visible_verb_selftest: u8,
 }
 
 /// The `--cam-pose` argument that reproduces a Fly pose: eye, then yaw and
@@ -155,6 +162,14 @@ fn hud_line(snap: &crate::glyph_scene::UiProbeState, fps: f32) -> String {
         None => {
             line += &format!(" | instances {} in {} draw ranges", snap.cull_instances, snap.cull_ranges);
         }
+    }
+    // What is selected and what the verbs address, in the field's own key
+    // (M3: `item:start..end` and `file byte N` for the Visible field).
+    if let Some(sel) = &snap.selection {
+        line += &format!(" | selection {sel}");
+    }
+    if let Some(pick) = &snap.pick_key {
+        line += &format!(" | pick {pick}");
     }
     line
 }
@@ -488,6 +503,47 @@ impl WindowState {
                 _ => {}
             }
         }
+        // Dev-only verification hook (GLYPH_VISIBLE_VERB_SELFTEST=1, M3): the
+        // verbs through the SAME entry points the CLI op stream and the panel
+        // use (`apply_pick`, `apply_verb` with `parse_verb`'s literals), one
+        // step every fourth frame from t≈3 s so the HUD line printed after
+        // each step reads a frame that saw the edit (the Visible field's
+        // counters lag a frame or two). The value is the pick:
+        // `1` = the first file's row 0 col 0; `file[:row[:col]]` otherwise.
+        // Meant for `--field-mode visible` (the replies name item:byte); in a
+        // stored mode the same steps run through the slot paths.
+        #[cfg(feature = "egui-ui")]
+        if self.visible_verb_selftest != 0 && self.time() > 3.0 && self.frames_total.is_multiple_of(4) {
+            let step = self.visible_verb_selftest;
+            let hud = |state: &Self| state.ui_probe.as_ref().map(|p| hud_line(&p.borrow(), state.ui_fps)).unwrap_or_default();
+            if step > 1 {
+                println!("VISIBLE-VERB-SELFTEST hud after step {}: {}", step - 1, hud(self));
+            }
+            let verb_step = |state: &mut Self, spec: &str| {
+                let verb = crate::parse_verb(spec).expect("selftest verb literal must parse like the CLI");
+                let line = state.scene.apply_verb(ctx, &verb).unwrap_or_else(|| "scene does not support verbs".to_string());
+                println!("VISIBLE-VERB-SELFTEST step {step} ({spec}): {line}");
+            };
+            match step {
+                1 => {
+                    let spec = std::env::var("GLYPH_VISIBLE_VERB_SELFTEST").unwrap_or_default();
+                    let mut parts = spec.split(':');
+                    let file = parts.next().filter(|f| *f != "1").unwrap_or("").to_string();
+                    let row = parts.next().and_then(|r| r.parse().ok()).unwrap_or(0);
+                    let col = parts.next().and_then(|c| c.parse().ok()).unwrap_or(0);
+                    let cmd = crate::glyph_scene::PickCommand::RowCol { file, row, col };
+                    let line = self.scene.apply_pick(ctx, &cmd).unwrap_or_else(|| "scene does not support picks".to_string());
+                    println!("VISIBLE-VERB-SELFTEST step 1 (pick {cmd:?}): {line}");
+                }
+                2 => verb_step(self, "recolor-glyph"),
+                3 => verb_step(self, "nudge-glyph 0.5 0 0"),
+                4 => verb_step(self, "set-glyph-background 2050c0"),
+                5 => verb_step(self, "hide-group"),
+                6 => verb_step(self, "show-group"),
+                _ => {}
+            }
+            self.visible_verb_selftest = if step >= 7 { 0 } else { step + 1 };
+        }
         // wgpu 30: get_current_texture returns a status enum instead of Result.
         use wgpu::CurrentSurfaceTexture as Cst;
         let frame = match self.surface.get_current_texture() {
@@ -630,6 +686,16 @@ impl WindowState {
                                         ui.monospace(format!(
                                             "debug tint: {}",
                                             if snap.debug_tint == 1 { "by LOD tier" } else { "by cull state" }
+                                        ));
+                                    }
+                                    // The selection and the pick in the
+                                    // field's own key (M3): what a verb
+                                    // would address right now.
+                                    if snap.selection.is_some() || snap.pick_key.is_some() {
+                                        ui.monospace(format!(
+                                            "selection {} | pick {}",
+                                            snap.selection.as_deref().unwrap_or("none"),
+                                            snap.pick_key.as_deref().unwrap_or("none")
                                         ));
                                     }
                                 });

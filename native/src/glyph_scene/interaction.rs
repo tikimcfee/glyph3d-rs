@@ -77,7 +77,7 @@ impl GlyphScene {
                     let updated_gids = ctrl.sync_gpu_groups(&mut self.groups_cpu);
                     self.write_group_rows(ctx, &updated_gids);
                     for &gid in &updated_gids {
-                        self.sync_segment(gid);
+                        self.sync_segment(ctx, gid);
                     }
                 }
             }
@@ -141,7 +141,7 @@ impl GlyphScene {
                 let updated_gids = ctrl.sync_gpu_groups(&mut self.groups_cpu);
                 self.write_group_rows(ctx, &updated_gids);
                 for &g in &updated_gids {
-                    self.sync_segment(g);
+                    self.sync_segment(ctx, g);
                 }
                 return;
             } else if let Some(g) = self.groups_cpu.get_mut(gid as usize) {
@@ -156,7 +156,7 @@ impl GlyphScene {
         }
 
         self.write_group_row(ctx, gid);
-        self.sync_segment(gid);
+        self.sync_segment(ctx, gid);
     }
 
     /// Windowed scroll: scales the grabbed carrel or file; otherwise camera speed.
@@ -169,7 +169,7 @@ impl GlyphScene {
                     let updated_gids = ctrl.sync_gpu_groups(&mut self.groups_cpu);
                     self.write_group_rows(ctx, &updated_gids);
                     for &gid in &updated_gids {
-                        self.sync_segment(gid);
+                        self.sync_segment(ctx, gid);
                     }
                     println!("grab carrel: zone '{zid_str}' scaled by factor {f:.3}");
                 }
@@ -186,7 +186,7 @@ impl GlyphScene {
                     let updated_gids = ctrl.sync_gpu_groups(&mut self.groups_cpu);
                     self.write_group_rows(ctx, &updated_gids);
                     for &g in &updated_gids {
-                        self.sync_segment(g);
+                        self.sync_segment(ctx, g);
                     }
                     if let Some(g) = self.groups_cpu.get(gid as usize) {
                         s = g.cols[3][0];
@@ -206,7 +206,7 @@ impl GlyphScene {
                 s = g.cols[3][0];
             }
             self.write_group_row(ctx, gid);
-            self.sync_segment(gid);
+            self.sync_segment(ctx, gid);
             println!("grab: group {gid} scale -> {s:.3}");
         } else if matches!(self.camera_mode, CameraMode::Fly) {
             self.fly.on_scroll(lines);
@@ -285,7 +285,7 @@ impl GlyphScene {
                         let updated_gids = ctrl.sync_gpu_groups(&mut self.groups_cpu);
                         self.write_group_rows(ctx, &updated_gids);
                         for &g in &updated_gids {
-                            self.sync_segment(g);
+                            self.sync_segment(ctx, g);
                         }
                         println!("{msg}");
                     } else {
@@ -299,7 +299,7 @@ impl GlyphScene {
                         let updated_gids = ctrl.sync_gpu_groups(&mut self.groups_cpu);
                         self.write_group_rows(ctx, &updated_gids);
                         for &g in &updated_gids {
-                            self.sync_segment(g);
+                            self.sync_segment(ctx, g);
                         }
                         println!("{msg}");
                     } else {
@@ -319,7 +319,7 @@ impl GlyphScene {
                             let updated_gids = ctrl.sync_gpu_groups(&mut self.groups_cpu);
                             self.write_group_rows(ctx, &updated_gids);
                             for &g in &updated_gids {
-                                self.sync_segment(g);
+                                self.sync_segment(ctx, g);
                             }
                             println!("{msg}");
                         }
@@ -332,7 +332,7 @@ impl GlyphScene {
                         let updated_gids = ctrl.sync_gpu_groups(&mut self.groups_cpu);
                         self.write_group_rows(ctx, &updated_gids);
                         for &g in &updated_gids {
-                            self.sync_segment(g);
+                            self.sync_segment(ctx, g);
                         }
                         println!("{msg}");
                     }
@@ -344,7 +344,7 @@ impl GlyphScene {
                         let updated_gids = ctrl.sync_gpu_groups(&mut self.groups_cpu);
                         self.write_group_rows(ctx, &updated_gids);
                         for &g in &updated_gids {
-                            self.sync_segment(g);
+                            self.sync_segment(ctx, g);
                         }
                         println!("{msg}");
                     }

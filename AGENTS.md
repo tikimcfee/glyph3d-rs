@@ -32,6 +32,10 @@ against `build.toml` that day; `cargo glyph gates` is the live list.)
   `native/src/layout_hyper/visible.rs` (the arena's third form) and the `Visible`
   arms of `glyph_scene/{setup,render}.rs`. Chosen at load with
   `--field-mode instanced|derived|visible`, switchable live from the Debug panel.
+  M3 (2026-10-10) re-keyed selection, the glyph verbs and styling there by
+  (item, byte) in place of the slot (`out/VISIBLE-MODE.md` § M3); the witness
+  is `native/tests/visible_verbs.rs`, a pixel comparison of the same verb in
+  Derived and Visible mode.
   `crates/glyph-session-dirs` (2026-10-09, std only) is the one table of where agent
   apps keep session transcripts, shared by the renderer's F7 browser and the
   `cargo glyph` launcher; `launch_config.example.toml` documents the overrides.

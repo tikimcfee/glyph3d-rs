@@ -98,6 +98,13 @@ pub trait SceneLike {
     /// Stage G debug: read back instance bytes at a global slot (partial-
     /// upload verification). Default no-op.
     fn debug_dump_instances(&self, _ctx: &GpuContext, _slot: u64, _out: &mut [u32]) {}
+    /// M3 debug: where the glyph at (item, leader byte) landed in the LAST
+    /// prepared frame's transient slot buffer — the Visible field's key, for
+    /// `GLYPH_G_DUMP=item:byte`. None for fields that keep slots (their slot
+    /// IS the address) and when the glyph was not laid out this frame.
+    fn debug_locate(&self, _ctx: &GpuContext, _item: u32, _byte: u32) -> Option<u32> {
+        None
+    }
 
     /// Retrieve and clear any pending carrel layout options signaled by carrel navigation.
     fn take_pending_carrel_options(&mut self) -> Option<crate::spatial_scene::CarrelLayoutOptions> {
