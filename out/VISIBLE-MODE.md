@@ -380,3 +380,39 @@ readout; the `move-group` reply is the trace), `set-glyph-transform`'s group
 lane beyond what the background quad shares with it, and `nudge-glyph` (x only;
 the reply is the trace — the override merge is unit-tested).
 
+## C28 — the wash tier's extent (2026-10-10)
+
+**C28, confirmed by run, fixed.** At the wash tier a back-wrapped line ran
+off to the right instead of receding: the wash was ONE flat quad at segment
+0's depth, as wide as the cull's conservative byte bound (`2 × fold_unit`
+cells). Ivan's evidence — the overhang only in the magenta layer of
+`--debug-tint cull`, `TINT_WASH_FULL` — was exact; measured here at
+`--cam-pose 25 -150 2500 0 0` (rows ≈ 0.7 px: wash tier), wide.txt's
+wash bar was ≈ 58 px wide where its glyphs span ≈ 30. Now Pass 1 writes two
+more lanes per line (`LineEntry`, 24 B: `cols`, the leaders; `width_cells`,
+the widest fold unit in cells — exactly what the glyphs reach; a line a
+chunk cut continues is measured again with its true fold state,
+`measure_continued_line_widths`), the cull's line box uses them (tighter
+than the byte bound), and the wash is a BOX per line (`visible_wash.wgsl`,
+36 indices): x over `width_cells`, y the line's rows (WrapDown stacks),
+z from segment 0's depth to the last segment's (WrapBack recedes); a line
+with no depth draws its front face only. The witness is the crate's
+`the_wash_box_spans_exactly_what_the_glyphs_span` (`tests/gpu.rs`): every
+wash box over the test corpus against the glyph slots of its line — inside
+the box, the box no wider than the glyphs reach (up to the advance of
+slot-less leaders, e.g. a truncated lead), as many depth segments as the
+deepest slot's fold, as many rows as the lowest slot's. Mutations
+`wash-width-doubled` and `wash-depth-flat` redden it. The wash tier was
+held to nothing before.
+
+```sh
+# C28, see it: wide.txt 2,500 units away, head-on, cull tint — the magenta
+# bar at the bottom is wide.txt's nine lines as washes, now ≈ 30 px wide
+# like the glyph-forced derived frame's bar (was ≈ 58).
+target/release/glyph3d-native --load-repo native/fixtures/g-pick-repo --field-mode visible --debug-tint cull --cam-pose 25 -150 2500 0 0 --screenshot out/c28-wash.png
+target/release/glyph3d-native --load-repo native/fixtures/g-pick-repo --field-mode derived --show-glyphs-px 0.01 --cam-pose 25 -150 2500 0 0 --screenshot out/c28-glyphs.png
+# Windowed: fly back from wide.txt's column with the cull tint on (F1 →
+# debug tint → by cull state) until its lines go magenta: the washes recede
+# with the column now instead of spreading to the right.
+target/release/glyph3d-native --load-repo native/fixtures/g-pick-repo --field-mode visible --debug-tint cull --cam-pose 30 -120 60 0 -12
+```

@@ -1,7 +1,7 @@
 //! The Visible glyph field — [`glyph_field::GlyphFieldMode::Visible`].
 //!
 //! No slot per glyph is kept. Resident on the GPU: the source bytes (1 B per
-//! byte), the line table Pass 1 writes (`LineEntryGpu`, 16 B per line), the
+//! byte), the line table Pass 1 writes (`LineEntryGpu`, 24 B per line), the
 //! long-line segment seeds (`SegmentSeedGpu`), an item table, the atlas trie
 //! (`TrieUpload`) and the colour spans (`ByteSpanGpu`). Each frame
 //! [`VisibleField::prepare`] culls the items' boxes and then their lines
@@ -98,7 +98,12 @@ pub use tables::{
 };
 
 /// One line of one item, as Pass 1 writes it (`layout_hyper::LineEntry`,
-/// the same 16 B). `byte_start` is item-relative.
+/// the same 24 B). `byte_start` is item-relative; `cols` the line's leaders
+/// (the fold's column at its end, the newline excluded), from which the cull
+/// counts its depth segments and column pages; `width_cells` its widest
+/// fold unit in cells — the whole line's advance when the item has no fold
+/// unit — which bounds the cull's x and is the wash box's width (C28,
+/// 2026-10-10; before it the wash drew the cull's `2 × fold_unit` byte bound).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Pod, Zeroable)]
 pub struct LineEntryGpu {
@@ -106,6 +111,8 @@ pub struct LineEntryGpu {
     pub item: u32,
     pub base_row: u32,
     pub glyph_count: u32,
+    pub cols: u32,
+    pub width_cells: u32,
 }
 
 /// A cut inside a long line and the fold state at it
@@ -437,14 +444,22 @@ impl VisibleField {
         self.frame.read_mask_slots(&self.resident, queue, count)
     }
 
+    /// The first `count` wash entries of the last prepared frame — one box
+    /// per WASH-tier line (`tables::counter::WASH` is how many) — read back
+    /// BLOCKING (tests: the wash-vs-glyph extent witness).
+    pub fn read_wash(&self, queue: &wgpu::Queue, count: u32) -> Vec<WashGpu> {
+        self.frame.read_wash(&self.resident, queue, count)
+    }
+
     /// The last COMPLETED frame's counters (see [`VisibleStats`]); they lag
     /// the frame being prepared by two.
     pub fn stats(&self) -> VisibleStats {
         self.frame.stats()
     }
 
-    /// Record the wash tier's quads (one per WASH-tier line) into a pass
-    /// whose pipeline the field sets itself; drawn after the glyph pass.
+    /// Record the wash tier's boxes (one per WASH-tier line: its x extent,
+    /// its rows, its depth segments) into a pass whose pipeline the field
+    /// sets itself; drawn after the glyph pass.
     pub fn record_wash_draw(&self, pass: &mut wgpu::RenderPass<'_>) {
         self.frame.record_wash_draw(pass);
     }

@@ -83,7 +83,8 @@ struct ItemGpu {
     _pad4: u32,
 };
 
-struct LineEntry { byte_start: u32, item: u32, base_row: u32, glyph_count: u32 };
+// `cols` and `width_cells` are the cull's (C28); the kernel reads neither.
+struct LineEntry { byte_start: u32, item: u32, base_row: u32, glyph_count: u32, cols: u32, width_cells: u32 };
 struct SegmentSeed { line: u32, byte_offset: u32, col: u32, seg_adv: f32, cells: u32, _pad: u32 };
 struct ByteSpan { start: u32, end: u32, color: u32 };
 // One per-glyph override (tables.rs GlyphOverrideGpu): the leader's item-

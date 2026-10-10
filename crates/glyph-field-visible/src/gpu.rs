@@ -668,7 +668,9 @@ pub struct Frame {
     layout_bg: wgpu::BindGroup,
     wash_pipeline: wgpu::RenderPipeline,
     wash_bg: wgpu::BindGroup,
-    quad_index: wgpu::Buffer,
+    /// The identity 0..36: a wash is a box of six faces, and the vertex
+    /// stage turns the index into a cube corner (`visible_wash.wgsl`).
+    wash_index: wgpu::Buffer,
     stats: Vec<StatsSlot>,
     last_stats: Cell<VisibleStats>,
     timestamps: Option<(wgpu::QuerySet, wgpu::Buffer, f32)>,
@@ -702,7 +704,8 @@ impl Frame {
         let counters = storage_zeroed(device, "visible counters", STATS_COUNTERS_BYTES, wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC);
         // COPY_SRC on the segment list is for `locate`'s readback.
         let segs = storage_zeroed(device, "visible segments", limits.max_segments as u64 * std::mem::size_of::<SegGpu>() as u64, wgpu::BufferUsages::COPY_SRC);
-        let wash = storage_zeroed(device, "visible wash quads", limits.max_wash as u64 * std::mem::size_of::<WashGpu>() as u64, wgpu::BufferUsages::empty());
+        // COPY_SRC on the wash list is for the tests' extent witness.
+        let wash = storage_zeroed(device, "visible wash boxes", limits.max_wash as u64 * std::mem::size_of::<WashGpu>() as u64, wgpu::BufferUsages::COPY_SRC);
         let slots = storage_zeroed(device, "visible transient slots", slot_bytes, wgpu::BufferUsages::COPY_SRC);
         let args = storage_zeroed(device, "visible dispatch/draw args (storage)", (INDIRECT_WORDS * 4) as u64, wgpu::BufferUsages::COPY_SRC);
         let indirect = device.create_buffer(&wgpu::BufferDescriptor {
@@ -711,9 +714,10 @@ impl Frame {
             usage: wgpu::BufferUsages::INDIRECT | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        let quad_index = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("visible wash quad index buffer"),
-            contents: bytemuck::cast_slice(&[0u16, 1, 2, 0, 2, 3]),
+        let box_indices: Vec<u16> = (0u16..36).collect();
+        let wash_index = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("visible wash box index buffer"),
+            contents: bytemuck::cast_slice(&box_indices),
             usage: wgpu::BufferUsages::INDEX,
         });
 
@@ -905,7 +909,7 @@ impl Frame {
             layout_bg,
             wash_pipeline,
             wash_bg,
-            quad_index,
+            wash_index,
             stats,
             last_stats: Cell::new(VisibleStats { items_total: resident.items_total, ..Default::default() }),
             timestamps,
@@ -1059,8 +1063,16 @@ impl Frame {
     pub fn record_wash_draw(&self, pass: &mut wgpu::RenderPass<'_>) {
         pass.set_pipeline(&self.wash_pipeline);
         pass.set_bind_group(0, &self.wash_bg, &[]);
-        pass.set_index_buffer(self.quad_index.slice(..), wgpu::IndexFormat::Uint16);
+        pass.set_index_buffer(self.wash_index.slice(..), wgpu::IndexFormat::Uint16);
         pass.draw_indexed_indirect(&self.indirect, INDIRECT_WASH_DRAW);
+    }
+
+    /// The first `count` wash entries of the last prepared frame, read back
+    /// blocking (tests).
+    pub fn read_wash(&self, resident: &Resident, queue: &wgpu::Queue, count: u32) -> Vec<WashGpu> {
+        let count = count.min(self.limits.max_wash) as u64;
+        let data = read_back(&resident.device, queue, &self.wash, 0, count * std::mem::size_of::<WashGpu>() as u64);
+        bytemuck::cast_slice(&data).to_vec()
     }
 
     /// The counters of the LAST prepared frame, read back blocking — a test

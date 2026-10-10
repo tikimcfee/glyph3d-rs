@@ -143,7 +143,11 @@ pub struct SegGpu {
     pub slot_base: u32,
 }
 
-/// One wash quad (32 B).
+/// One wash BOX (36 B): the line's first row lane, its x extent (the item's
+/// origin over its widest fold unit), its mean colour, the rows a WrapDown
+/// line stacks, its alpha, a debug tint, and the depth segments a WrapBack
+/// line recedes through — the box runs from segment 0's z to the last's
+/// (C28, 2026-10-10; a flat quad at segment 0 before).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Pod, Zeroable)]
 pub struct WashGpu {
@@ -155,6 +159,7 @@ pub struct WashGpu {
     pub rows: u32,
     pub alpha: f32,
     pub tint: u32,
+    pub nseg: u32,
 }
 
 /// The per-frame uniform every Visible kernel reads (224 B).
@@ -875,10 +880,10 @@ mod tests {
             ByteSpanGpu { start: 45, end: 60, color: 3 },
         ];
         let lines = [
-            LineEntryGpu { byte_start: 0, item: 0, base_row: 0, glyph_count: 0 },
-            LineEntryGpu { byte_start: 10, item: 0, base_row: 1, glyph_count: 0 },
-            LineEntryGpu { byte_start: 25, item: 0, base_row: 2, glyph_count: 0 },
-            LineEntryGpu { byte_start: 70, item: 0, base_row: 3, glyph_count: 0 },
+            LineEntryGpu { byte_start: 0, item: 0, base_row: 0, glyph_count: 0, cols: 0, width_cells: 0 },
+            LineEntryGpu { byte_start: 10, item: 0, base_row: 1, glyph_count: 0, cols: 0, width_cells: 0 },
+            LineEntryGpu { byte_start: 25, item: 0, base_row: 2, glyph_count: 0, cols: 0, width_cells: 0 },
+            LineEntryGpu { byte_start: 70, item: 0, base_row: 3, glyph_count: 0, cols: 0, width_cells: 0 },
         ];
         let (table, alloc) = plan_spans(std::slice::from_ref(&it), &spans);
         assert_eq!(alloc.runs, [(0, 3, 3 + 16)]);

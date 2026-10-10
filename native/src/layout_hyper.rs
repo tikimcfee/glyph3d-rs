@@ -549,6 +549,10 @@ fn pass1_prepass_chunk_walk<const COLLECT: bool>(
         let mut line_adv = 0.0f64;
         let mut seg_adv = 0.0f32;
         let mut cells = 0u32;
+        // The line's widest fold unit so far and the cells in the current
+        // one (`LineEntry::width_cells`, C28; COLLECT only).
+        let mut unit_cells = 0u32;
+        let mut width_cells = 0u32;
         let mut plan = CutPlan::new(segment_bytes);
 
         let is_pure_ascii = crate::text::is_pure_printable_ascii(bytes);
@@ -560,6 +564,10 @@ fn pass1_prepass_chunk_walk<const COLLECT: bool>(
             line_adv = l as f64 * ascii_adv as f64;
             if fold_unit > 0 {
                 seg_adv = seg_adv_table[l % fu];
+            }
+            if COLLECT {
+                // Every byte is one cell: a full unit, or the whole line.
+                width_cells = if fold_unit > 0 { l.min(fu) as u32 } else { l as u32 };
             }
             // No newline: the widest x is the last glyph's own (see
             // `ascii_line_max_x`).
@@ -604,7 +612,13 @@ fn pass1_prepass_chunk_walk<const COLLECT: bool>(
                 col += 1;
                 line_adv += r.advance as f64;
                 if COLLECT {
-                    cells += cells_of(r.advance, ascii_adv);
+                    let k = cells_of(r.advance, ascii_adv);
+                    cells += k;
+                    unit_cells += k;
+                    if fold_unit > 0 && col % fold_unit == 0 {
+                        width_cells = width_cells.max(unit_cells);
+                        unit_cells = 0;
+                    }
                 }
                 if fold_unit > 0 {
                     if col % fold_unit == 0 {
@@ -617,7 +631,7 @@ fn pass1_prepass_chunk_walk<const COLLECT: bool>(
         }
         // An empty item is one empty chunk, and has no line.
         if COLLECT && !bytes.is_empty() {
-            out.lines.push(ChunkLine { start: 0, glyphs: survivor_count, col: col as u32, terminated: false });
+            out.lines.push(ChunkLine { start: 0, glyphs: survivor_count, col: col as u32, width_cells: width_cells.max(unit_cells), terminated: false });
         }
 
         return ChunkPrepass {
@@ -662,6 +676,10 @@ fn pass1_prepass_chunk_walk<const COLLECT: bool>(
         let mut line_adv = 0.0f64;
         let mut seg_adv = 0.0f32;
         let mut cells = 0u32;
+        // The line's widest fold unit so far and the cells in the current
+        // one (`LineEntry::width_cells`, C28; COLLECT only).
+        let mut unit_cells = 0u32;
+        let mut width_cells = 0u32;
         let mut plan = CutPlan::new(segment_bytes);
         // The first line of a continuing chunk is measured with its true
         // seed by the aggregation, not here (see the doc above).
@@ -676,6 +694,9 @@ fn pass1_prepass_chunk_walk<const COLLECT: bool>(
             line_adv = l as f64 * ascii_adv as f64;
             if fold_unit > 0 {
                 seg_adv = seg_adv_table[l % fu];
+            }
+            if COLLECT {
+                width_cells = if fold_unit > 0 { l.min(fu) as u32 } else { l as u32 };
             }
             let widest = ascii_line_max_x(l, nl_pos < bytes.len(), fu, seg_adv_table, ascii_adv);
             if widest > max_row_extent {
@@ -721,7 +742,13 @@ fn pass1_prepass_chunk_walk<const COLLECT: bool>(
                 line_col += 1;
                 line_adv += r.advance as f64;
                 if COLLECT {
-                    cells += cells_of(r.advance, ascii_adv);
+                    let k = cells_of(r.advance, ascii_adv);
+                    cells += k;
+                    unit_cells += k;
+                    if fold_unit > 0 && line_col % fold_unit == 0 {
+                        width_cells = width_cells.max(unit_cells);
+                        unit_cells = 0;
+                    }
                 }
                 if fold_unit > 0 {
                     if line_col % fold_unit == 0 {
@@ -753,6 +780,7 @@ fn pass1_prepass_chunk_walk<const COLLECT: bool>(
                 start: pos as u32,
                 glyphs: line_survivors,
                 col: line_col as u32,
+                width_cells: width_cells.max(unit_cells),
                 terminated: nl_pos < bytes.len(),
             });
         }
@@ -943,6 +971,18 @@ pub(crate) fn pass1_over_chunks_with_lines(
             segment_bytes,
         );
         line_table::seed_continued_lines(
+            &mut table,
+            chunks,
+            &chunk_continues,
+            &agg.chunk_initial_cols,
+            &agg.chunk_initial_seg_advs,
+            &agg.chunk_initial_line_advs,
+            file_params,
+            trie,
+            bitmap_adv,
+            em_height_fu,
+        );
+        line_table::measure_continued_line_widths(
             &mut table,
             chunks,
             &chunk_continues,
