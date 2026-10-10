@@ -543,3 +543,144 @@ GATES GREEN — 16 of 16 gates ran`, every golden view BYTE-EQUAL on
 changes to `native/` are four spans and three env-gated switches defaulting to
 the previous behaviour; the prototype and bench scripts live in `experiments/`,
 outside every gate. `cargo glyph prove` was not run: no mutation's target moved.
+
+---
+
+## Linux scale (2026-10-09)
+
+Follow-up, same day, after the retire decision: does the visible-set design
+hold at Ivan's target — the whole Linux tree as one resident byte buffer plus a
+line table, laid out per frame for what is in view? Measured with the
+`jit-layout` prototype extended for it (`experiments/gpu-direction/jit-layout/`,
+still its own workspace, outside every gate; nothing under `native/` was
+touched in this pass). Corpus: a Linux checkout at HEAD 2026-10-09 (1.8 GB on
+disk, 95,954 files), walked with the renderer's own rules (its `SKIP_DIRS`,
+`SOURCE_EXTENSIONS`, 10 MiB cap, UTF-8 check): **74,313 files kept, 1,370 MB,
+38.19 M lines, 1,331.8 M glyphs** (10 files skipped for size, 0 non-UTF-8).
+Same box as above; the GPU was shared with the coordinator's battery
+throughout — load average 5.8–10.5 across these runs — and every figure is the
+min / median of 5 interleaved repeats.
+
+### What HyperLayout would need for this tree (inferred, not attempted)
+
+1,331.8 M glyphs × 20 B = **26.6 GB** of Derived slots, × 32 B = **42.6 GB**
+Instanced. `max_buffer_size` here is 4.3 GB, so 7 or 10 chunk buffers;
+Derived would take 82 % of this card's 32.6 GB VRAM plus, on the discrete
+staging path, the same again in host RAM for the duration of the load;
+Instanced does not fit in VRAM at all, and neither fits a 32 GB Mac. I did
+not try: on a shared 60 GB box the attempt would have paged. The arithmetic is
+the result. For comparison the **visible-set design's resident set is
+1,678 MB** — bytes 1,370 + line table 305.5 (8 B/line: `byte_start`, glyph
+count) + item table 2.4 (32 B/file) — in two 1 GiB byte chunks because the
+binding limit is 2^31−4 (items padded so none straddles; the kernel picks the
+chunk with a shift).
+
+### The part that does not go away: Pass 1 (measured)
+
+Walk and read, like the renderer: enumerate 247 ms (serial), read + UTF-8 check
+334 ms on 32 threads (4.1 GB/s from page cache), concatenate 84 ms. Then the
+line table and per-file extents over all 1.37 GB, one file per task under
+`std::thread::scope`:
+
+| threads | min / median ms | GB/s at min |
+|---|---|---|
+| 1 | 759 / 879 | 1.8 |
+| 4 | 255 / 276 | 5.4 |
+| 8 | 150 / 156 | 9.1 |
+| 16 | 92 / 106 | 15.0 |
+| 32 | **79 / 86** | **17.5** |
+
+It scales almost linearly to 16 threads and 3.4× from 4 to 32, so this pass
+is **compute-bound per thread, not bandwidth-bound**; it reaches DRAM speed
+only with every core. That is consistent with the earlier memory note once you
+read it the right way round: HyperLayout saturates DRAM at one thread because
+it *writes* 20–31 B per source byte, and this pass writes ~0.2. (HyperLayout's
+own Pass 1 on the 93 MB tree was 5 ms = 18.6 GB/s on 32 threads — the same
+ceiling, reached by its pure-ASCII closed form.) **Inferred for the M2** at the
+4-thread rate: 250–350 ms for the whole Linux tree; `m2/03_jit_layout.sh`
+measures it.
+
+Resident upload, 1,678 MB through `create_buffer_init`: 206 / 212 ms, plus
+21 ms submit + poll — wgpu's write path at ~8 GB/s, and the one load-time cost
+in this design that is proportional to the corpus and crosses the bus. On
+unified memory it should be a memcpy or nothing; that is the M2 question.
+
+So the whole load at Linux scale on this box is roughly **1.0 s**: 0.67 s of
+file I/O and concatenation that every design pays, 0.08 s of Pass 1, 0.23 s of
+upload. The status-quo path cannot complete at all.
+
+### Per frame (measured, segments at 2 KiB)
+
+| view | lines | slots | compute GPU | draw GPU (flat quads) | CPU list + upload | frame wall |
+|---|---|---|---|---|---|---|
+| **page** — 60 lines of `kernel/bpf/verifier.c` | 60 | 1,380 | **0.017 / 0.017** | 0.003 | 0.003 | 0.074 / 0.081 |
+| **overview** — first 50 lines of 2,000 files | 91,199 | 2.53 M | **0.215 / 0.216** | 1.24 | 1.26 / 1.30 | 1.64 / 1.67 |
+| **worst** — the 1,000 longest lines in the tree | 1,000 (1,041 segments) | 1.06 M | **0.50 / 0.51** | 0.52 | 0.06 | 1.13 / 1.24 |
+| random, 100 k lines | 100,000 | 2.56 M | 0.13 / 0.13 | 1.44 | 0.36 | 1.76 / 1.77 |
+| random, 1 M lines | 1,000,000 | 26.7 M | 2.5 / 2.6 | 16.3 | 3.9 / 4.1 | 19.4 / 19.5 |
+
+Layout is never the frame's cost: at the overview the compute pass is 0.2 ms
+and the 2.5 M-quad flat draw six times that; at a million lines (more than any
+screen) it is 2.5 ms against a 16 ms draw. The CPU's share is building and
+uploading the visible list (32 B per visible line here; 1.3 ms at the
+overview), which a GPU-side cull over the resident line table would remove —
+the table is uploaded and resident, this kernel just does not read it yet.
+
+### Long lines: seeded segments (implemented, measured, verified)
+
+The kernel now takes **segments**, not lines. Pass 1 cuts any line longer than
+`--segment-bytes` on HyperLayout's rule — only before an ASCII byte, so no
+sequence can straddle a cut — and snapshots the continuation's seeds during
+its serial walk: the column, the running **f32** segment advance since the
+last wrap-unit boundary (the fold's own carrier, as `continued_segment_advance`
+does it, never `col × adv`), and the paint state. Every slot of every window
+read back **bit-equal to the single-threaded whole-line CPU fold, x bits
+included**: the 100 k random window (2.56 M slots), the worst view at S =
+65536 / 2048 / 512 (1.06 M slots each), and the repo's own `native/` tree,
+whose fixtures carry 250 KB lines (1,529 segments). That is the witness
+milestone 2 needs, in miniature.
+
+What segmentation buys on the worst view: S = 64 KiB (off) 1.41 ms → S = 2 KiB
+0.50 ms → S = 512 B **0.14 ms**, ten times. And a fact about the corpus: **the
+Linux tree has no 64 KiB-line pathology** — its five longest lines are
+6,833 / 4,496 / 4,496 / 4,022 / 3,542 B, all in `tools/testing/selftests/hid/`
+test data. The earlier 9 ms single-thread figure was a synthetic minified
+line; real code trees are short-lined, and the segment seed makes the
+remaining long ones cheap.
+
+### Pixels
+
+`experiments/gpu-direction/linux-overview.png` (2,000 files, per-file tint,
+quads clamped to 1 px) and `linux-page.png` (60 lines of `verifier.c`,
+indentation and comment colour visible): the prototype's own offscreen frames,
+800×500, flat quads where the real renderer's Slug pass would fill glyph
+coverage. No text or paths in either.
+
+### Does the design hold at this scale?
+
+Yes, on this box, for everything the prototype models: 1.68 GB resident where
+the current path needs 26–43 GB and cannot load; a one-second load that is two
+thirds file I/O; sub-millisecond layout for any realistic view; long lines
+handled by the seed rule HyperLayout already owns, bit-exact.
+
+What it does not model, so the biggest unknowns left, in order:
+
+1. **The M2.** Unified memory is where the design has the most to gain (no
+   upload) and where Pass 1 has four performance cores, not 32: the 250–350 ms
+   estimate for Linux is inferred. `m2/run_all.sh` is the plan.
+2. **Emoji sequences and the atlas trie in the kernel.** Non-ASCII here is one
+   codepoint, advance 1.0. The 380 KB trie binds trivially; the greedy
+   sequence chain runs serially per segment as on the CPU; untested in WGSL.
+3. **Paint parity.** A `//` flag stands in for `colorize_leaders`'s five-state
+   heuristic; the C17 lesson (per-line colouring must agree with the whole-item
+   colouriser at every cut) applies to segments exactly as it did to chunks.
+4. **Culling from the GPU side.** The CPU currently builds the visible list;
+   at a million lines that is 4 ms of CPU and a 32 MB upload per frame.
+   Resident line table + a cull kernel + an indirect draw is the obvious next
+   step and was not built.
+5. **The draw itself.** At 1 M visible lines a 26.7 M-quad draw is 16 ms even
+   flat; the real limit on "how much can be on screen" is coverage, not
+   layout, and LOD/backdrop substitution (which the renderer already does per
+   file) is what keeps the overview honest.
+6. **Walk time.** 0.67 s of the 1.0 s load is reading 74 k files. Nothing
+   GPU-side helps that; mmap or a persistent corpus cache would.

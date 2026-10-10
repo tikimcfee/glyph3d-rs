@@ -10,7 +10,9 @@
 # need Zed. The root `exclude`s this directory; build it from here:
 #
 #     cd experiments/gpu-direction/jit-layout && cargo build --release
-#     target/release/jit-layout <corpus-dir> [--visible-lines N] [--repeat K] [--long-line-bytes L]
+#     target/release/jit-layout <corpus-dir> [--walk renderer|all] [--threads T]
+#         [--view page|overview|worst|random] [--visible-lines N] [--segment-bytes S]
+#         [--repeat K] [--screenshot <png>] [--no-draw]
 #
 # wgpu is pinned to the same major as native/Cargo.toml (30.x).
 [package]
@@ -25,6 +27,7 @@ wgpu = "30"
 pollster = "0.4"
 bytemuck = { version = "1", features = ["derive"] }
 memchr = "2"
+png = "0.18"
 
 [profile.release]
 debug = 1
