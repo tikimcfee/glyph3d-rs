@@ -74,7 +74,7 @@ gating (none exists today), not rendering.
    windowed runs only*; the offscreen path keeps the compile-time defaults (see K4 for the
    mechanism). Slider state never reaches staging, buffers, or the engine.
 6. House cadence: one logical change per commit, `bash tools/check-all.sh` green after each with
-   results in the commit message, report at `out/STAGE_K_REPORT.md`, zero build+clippy warnings,
+   results in the commit message, report at `out/history/STAGE_K_REPORT.md`, zero build+clippy warnings,
    fail-loud `expect` style, no fmt mass-reformat.
 
 ## STEP 0 — baseline (before ANY edit)
@@ -203,7 +203,7 @@ pick) if vanilla egui trees actually hurt — and then justify the dep in the re
   is the prerequisite, and `register_native_texture` demands `Rgba8Unorm` (non-sRGB) — the
   wrinkle is already recorded in 08's L3. Don't prototype it inside K.
 
-## Final checklist for `out/STAGE_K_REPORT.md`
+## Final checklist for `out/history/STAGE_K_REPORT.md`
 
 Goal/Result header; per-phase detail (API names as actually resolved — e.g. confirm `run_ui` vs
 any 0.36.x renames against the vendored source, it's the known gotcha); verification table (six
@@ -225,4 +225,4 @@ frame — scene pass AND the egui overlay — back from the acquired surface tex
 final submit and before present, swizzles BGRA→RGBA (windowed surface is `Bgra8UnormSrgb`), and
 writes a PNG. Lives in `windowed.rs` (`capture_to_png` + the F2 arm) and `main.rs` (the CLI
 pair); offscreen untouched. Agent-verifiable pixel checks are now possible per stage — the two
-K6 proof PNGs (fixture repo + notes repo) are described in `out/STAGE_K_REPORT.md`.
+K6 proof PNGs (fixture repo + notes repo) are described in `out/history/STAGE_K_REPORT.md`.

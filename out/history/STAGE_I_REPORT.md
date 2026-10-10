@@ -1,3 +1,5 @@
+> **History.** Moved to `out/history/` on 2026-10-10: a dated record, not current state. What is true now: `README.md`, root `AGENTS.md`, `out/MAINTENANCE-NOTES-2026-10-08.md`.
+
 # Stage I — glam 0.30 → 0.33 bump (+ baseline-fixture rider)
 
 **Goal**: two gated pieces. (1) Rider: retire the Stage-H text.png
@@ -170,7 +172,7 @@ published 0.33.6 sources in the local registry:
   block), `native/Cargo.lock` (glam 0.30.10 → 0.33.6 only),
   `native/src/scene.rs` (2 call sites), `native/src/glyph_scene.rs`
   (3 call sites).
-- This report: `out/STAGE_I_REPORT.md`.
+- This report: `out/history/STAGE_I_REPORT.md`.
 
 No changes to: `engine-local/`, `assets/atlas/`, `src/shaders/*.wgsl`,
 staging math, buffer write paths, render order, CLI, or any other

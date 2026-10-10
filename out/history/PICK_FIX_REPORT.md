@@ -1,3 +1,5 @@
+> **History.** Moved to `out/history/` on 2026-10-10: a dated record, not current state. What is true now: `README.md`, root `AGENTS.md`, `out/MAINTENANCE-NOTES-2026-10-08.md`.
+
 # Pick fix — f32 view-proj inverse in `pixel_ray` (windowed picking)
 
 **Symptom (windowed, glyph3d-js, 95M glyphs):** (1) close-up on a large file:

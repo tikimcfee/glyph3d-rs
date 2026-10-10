@@ -1,3 +1,5 @@
+> **History.** Moved to `out/history/` on 2026-10-10: a dated record, not current state. Moot: the Mojo toolchain it planned to bump is retired. What is true now: `README.md`, root `AGENTS.md`, `out/MAINTENANCE-NOTES-2026-10-08.md`.
+
 # Toolchain bump — the prepared pass (write-up for the next session)
 
 Status: RESEARCHED, not started. Prepared 2026-09-24 from a live read of

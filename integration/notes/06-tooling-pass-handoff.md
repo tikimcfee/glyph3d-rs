@@ -54,7 +54,7 @@ independently shippable, gated by byte-identical render A/Bs.
 - Crate: `native/` (Cargo.toml, src/, shaders/)
 - Repo scripts: `tools/`
 - Fixture repo for runs: `native/fixtures/g-pick-repo/`
-- Stage reports (house style to follow): `out/STAGE_G_REPORT.md` is the latest
+- Stage reports (house style to follow): `out/history/STAGE_G_REPORT.md` is the latest
 - Stack pins: **wgpu 30 (locked line), winit 0.30, glam 0.30, edition 2021**
 
 ## HARD FENCES — each with its reason
@@ -112,8 +112,8 @@ independently shippable, gated by byte-identical render A/Bs.
 5. **Zero-warning discipline**: `cargo build` and `cargo build --release` must finish
    with 0 warnings (house rule, see stage reports).
 6. Output artifacts: new screenshots/debug logs go in `out/` (it's the established
-   scratch dir). Your final report goes to `out/STAGE_H_REPORT.md` in the style of
-   `out/STAGE_G_REPORT.md` (Goal / Result / per-phase detail / verification / file
+   scratch dir). Your final report goes to `out/history/STAGE_H_REPORT.md` in the style of
+   `out/history/STAGE_G_REPORT.md` (Goal / Result / per-phase detail / verification / file
    diffs). *Why:* keeps this pass inside the repo's existing history conventions, so
    the next stage can cite it the way this pass cites Stage G.
 
@@ -287,7 +287,7 @@ divergence is the only failure.
 
 ---
 
-## Final checklist for the stage report (`out/STAGE_H_REPORT.md`)
+## Final checklist for the stage report (`out/history/STAGE_H_REPORT.md`)
 
 - Goal/Result header in the house style; per-phase sections with the crate versions
   actually resolved (report `cargo tree` versions, not Cargo.toml ranges).

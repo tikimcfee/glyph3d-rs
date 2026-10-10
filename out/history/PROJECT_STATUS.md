@@ -1,3 +1,5 @@
+> **History.** Moved to `out/history/` on 2026-10-10: a dated record, not current state. A status snapshot from 2026-09-03. What is true now: `README.md`, root `AGENTS.md`, `out/MAINTENANCE-NOTES-2026-10-08.md`.
+
 # PROJECT STATUS — regroup after Stages K + L (2026-09-03)
 
 HEAD: `12437dd` (stage-l report). Eight-gate suite: **ALL GREEN**. Human
@@ -65,7 +67,7 @@ API (**1.04× pipeline / 1.09× scan, bit-identical**), check-all grew to eight
 gates (generator byte-identity + 16 Mojo conformance suites first). Their
 conformance-matrix engagement assertions found 16/48 cells testing nothing.
 We absorbed: `pixi install` + `build-engine`, all gates green, zero conflicts
-with K/L. Full story: `out/ENGINE_TOOLCHAIN_REPORT.md`.
+with K/L. Full story: `out/history/ENGINE_TOOLCHAIN_REPORT.md`.
 
 ## 2. Verification posture (why "working" means something)
 

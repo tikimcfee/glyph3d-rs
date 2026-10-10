@@ -1,3 +1,5 @@
+> **History.** Moved to `out/history/` on 2026-10-10: a dated record, not current state. What is true now: `README.md`, root `AGENTS.md`, `out/MAINTENANCE-NOTES-2026-10-08.md`.
+
 # STAGE K REPORT — egui UI overlay on the windowed renderer
 
 ## Goal

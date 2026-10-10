@@ -48,7 +48,11 @@ against `build.toml` that day; `cargo glyph gates` is the live list.)
   (`skills/glyph-engine-testing/SKILL.md`).
 - `assets/atlas/` — prebaked glyph-geometry binaries (+ `FORMAT.md`).
 - `schema/glyph-identity.json` — layout source of truth (vendored, hash-pinned).
-- `out/` — historical reports, proof PNGs, `tooling-ab/baseline/` (the pixel oracle).
+- `out/` — the live board (`MAINTENANCE-NOTES-2026-10-08.md`), `VISIBLE-MODE.md`,
+  design records still cited by code (`EMOJI.md`, `GPU-DIRECTION-2026-10-09.md`),
+  open plans, proof PNGs, `tooling-ab/baseline/` (the pixel oracle), and
+  `out/history/`: dated reports and executed plans, each bannered as history
+  (moved there 2026-10-10).
 - `integration/` — vendored egui 0.36.1 source. A **grep reference only**: the egui
   that actually compiles comes from crates.io via `Cargo.toml`. Patching this copy
   changes nothing.
@@ -764,7 +768,7 @@ cannot be verified and cannot be trusted.
 
 Dependency pins (wgpu 30, winit 0.30, glam 0.33, egui 0.36):
 no bump without its own pass. The past bumps were done as multi-part
-work and their reports (`out/STAGE_H_REPORT.md`, `STAGE_I_REPORT.md`) are worth
+work and their reports (`out/history/STAGE_H_REPORT.md`, `STAGE_I_REPORT.md`) are worth
 reading — but they agree on less than they look like they do, each having
 reinvented its own structure, so take the invariant and not the format: **one
 dependency per commit, the full battery green before each commit lands** (not
@@ -777,7 +781,7 @@ named scratch dir. Record what moved and why.
 Three numbering schemes exist in this tree and two of them are dead. This is the
 single most common way to misread the repo, so:
 
-- **Lettered stages (A–L)** are **history, not structure.** `out/STAGE_*_REPORT.md`
+- **Lettered stages (A–L)** are **history, not structure.** `out/history/STAGE_*_REPORT.md`
   are records of landed work and keep their names on purpose. There has never
   been a canonical index, and there cannot be one now: some letters have no
   report and survive only as retrospective mentions inside later ones. The
@@ -803,9 +807,9 @@ by a report are committed; scratch renders are not. The battery writes to
 `out/tooling-ab/sweep/` (untracked).
 
 **The lettered-stage report convention is retired.** It ran C through L and
-stopped on 2026-09-03. What stopped is the `out/STAGE_<LETTER>_REPORT.md`
+stopped on 2026-09-03. What stopped is the `out/history/STAGE_<LETTER>_REPORT.md`
 artifact and its template; the word "stage" is still in use for the reference
-port's live numbering. Do not start a new letter; `out/STAGE_*.md` stays as
+port's live numbering. Do not start a new letter; `out/history/STAGE_*.md` stays as
 history.
 
 Some older handoff notes have not caught up and will tell you otherwise —
@@ -824,7 +828,7 @@ written note in `out/` saying what changed and what you ran; it just is not a
 - `native/AGENTS.md` — Rust crate rules, module contracts, debug env vars.
 - `native/src/*.rs` module headers — the real per-module contracts.
 - `assets/atlas/FORMAT.md`; `schema/glyph-identity.json` when touching layout.
-- `TOOLING-PLAN.md` — why the tool is shaped the way it is.
+- `out/history/TOOLING-PLAN.md` — why the tool is shaped the way it is (2026-09; history).
 
 `out/*_REPORT.md` are **records, not current state**, and some state facts that
 later stopped being true. Read them for why something was done, not for how

@@ -219,7 +219,7 @@ pub struct GlyphScene {
     pub(crate) device: wgpu::Device,
     /// Stage L (L3): composite machinery — the ONLY release path (the
     /// --no-composite A/B escape hatch proved neutrality and was removed at
-    /// stage end; see out/STAGE_L_REPORT.md).
+    /// stage end; see out/history/STAGE_L_REPORT.md).
     pub(in crate::glyph_scene) composite: CompositeState,
     pub(in crate::glyph_scene) params_buf: wgpu::Buffer,
     pub(in crate::glyph_scene) params: Cell<Params>,
@@ -249,7 +249,7 @@ pub struct GlyphScene {
 // SegCull.tint's alpha at STAGING time by seg_tint (text.rs/repo.rs share
 // that path). A live gain would need either a cull.wgsl edit (fence 4) or
 // an ink_frac plumbing redesign across staging + sync_segment. Cut from K4;
-// the feasible future seam is recorded in out/STAGE_K_REPORT.md.
+// the feasible future seam is recorded in out/history/STAGE_K_REPORT.md.
 
 impl GlyphScene {
 

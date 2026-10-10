@@ -1,3 +1,5 @@
+> **History.** Moved to `out/history/` on 2026-10-10: a dated record, not current state. What is true now: `README.md`, root `AGENTS.md`, `out/MAINTENANCE-NOTES-2026-10-08.md`.
+
 # STAGE L REPORT — view-structure borrow (re_renderer → glyph3d-native)
 
 ## Goal
@@ -186,7 +188,7 @@ during cull_segments" taken literally).
 | File | +/- | Content |
 |---|---|---|
 | `native/src/glyph_scene.rs` | +199/−92 | L1 FrameUniform + L2 phase lists |
-| `out/STAGE_L_REPORT.md` | new | this report |
+| `out/history/STAGE_L_REPORT.md` | new | this report |
 
 ---
 

@@ -1,3 +1,5 @@
+> **History.** Moved to `out/history/` on 2026-10-10: a dated record, not current state. The plan of record for the `glyph` build tool, 2026-09; the tool it planned exists (`cargo glyph gates` is the live list). What is true now: `README.md`, root `AGENTS.md`, `out/MAINTENANCE-NOTES-2026-10-08.md`.
+
 # TOOLING-PLAN.md — from scripts to a toolchain
 
 > **Historical (2026-10-09).** Written for the Mojo-engine era. The PLAN is

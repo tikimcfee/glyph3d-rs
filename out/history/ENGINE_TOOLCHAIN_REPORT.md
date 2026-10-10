@@ -1,3 +1,5 @@
+> **History.** Moved to `out/history/` on 2026-10-10: a dated record, not current state. The Mojo engine and its pixi build steps are RETIRED; nothing here is a step to follow. What is true now: `README.md`, root `AGENTS.md`, `out/MAINTENANCE-NOTES-2026-10-08.md`.
+
 # ENGINE / TOOLCHAIN REPORT — the JS dependency is gone, and the gates grew
 
 Merged to `main` as `a37a847` (+ `7cd9d55`), 2026-09-02. Nine commits from
@@ -51,7 +53,7 @@ cannot, and it came up clean.
 
 The symlink was load-bearing — `bench.mojo` and `split_bench.mojo` open
 `"engine/bench/bench.bin"` at runtime, and ~40 suite headers say `-I engine`.
-Renaming made all of those correct as written. Dated `out/STAGE_*_REPORT.md`
+Renaming made all of those correct as written. Dated `out/history/STAGE_*_REPORT.md`
 files keep the old name on purpose; they are records, not live docs.
 
 **No `node` is needed to build any engine input any more.** `export-atlas.mjs`

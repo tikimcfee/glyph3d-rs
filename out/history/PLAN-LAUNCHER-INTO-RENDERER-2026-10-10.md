@@ -1,3 +1,5 @@
+> **History.** Moved to `out/history/` on 2026-10-10: a dated record, not current state. EXECUTED (C27): fe52766 and 890dfc2; the launcher is native/src/launcher/. What is true now: `README.md`, root `AGENTS.md`, `out/MAINTENANCE-NOTES-2026-10-08.md`.
+
 # Plan: the launcher moves into the renderer (C27)
 
 Decided with Ivan, 2026-10-10. **Not started.** Validate the facts below

@@ -31,7 +31,7 @@ steals that can land in any commit along the way.
 
 **Why after K, not before:** K is the big user-facing win, specced three ways (note 04, the egui
 source study, and its executable handoff `09-egui-ui-handoff.md`), and named "next stage" in
-`out/STAGE_I_REPORT.md` remaining-gaps #1. L1/L2 are K-order-independent, but
+`out/history/STAGE_I_REPORT.md` remaining-gaps #1. L1/L2 are K-order-independent, but
 sequencing them after K keeps one-variable-per-gate and means L3's composite integrates against
 the real egui pass instead of a prediction. If K slips, L1+L2 may proceed standalone (they touch
 nothing K touches); L3 wants K landed.
@@ -68,7 +68,7 @@ edit is now loudly visible in review. The tree has never been cheaper to restruc
    fail-loud `expect` style; zero build+clippy warnings; no `cargo fmt` mass-reformat; comments
    explain WHY with stage tags (`// Stage L: ...`).
 4. **One variable per commit, `bash tools/check-all.sh` green after each, results in the commit
-   message, report at `out/STAGE_L_REPORT.md`** (house cadence, per AGENTS.md).
+   message, report at `out/history/STAGE_L_REPORT.md`** (house cadence, per AGENTS.md).
 5. **The oracle path stays copy-exact by construction where possible** — see L3's
    copy-vs-shader composite split. Where a gate *could* be argued, it must instead be
    constructed unfailable.
@@ -246,7 +246,7 @@ Determinism chain (engine FFI, `fold_leaders` oracle, PNG bytes); depth conventi
 pipeline; `SceneLike` trait shape (both drivers and both scenes ride it — L changes impls, not
 the contract).
 
-## Final checklist for `out/STAGE_L_REPORT.md`
+## Final checklist for `out/history/STAGE_L_REPORT.md`
 
 Goal/Result header; per-phase detail (what moved, file:line); verification table (six
 `check-all.sh` gates per commit + the L-specific extras: cull counters, FPS band, verb smokes,
@@ -266,7 +266,7 @@ on the oracle driver, bit-exact by construction AND empirically; `composite.wgsl
 shader path windowed; `--no-composite` escape hatch proved neutrality then was
 removed); L4 selection mask (`Phase::Selection`; click-flash hack removed —
 pick selects, miss clears, persistent until next pick). O1/O2 steals landed as
-their own commits. Notable deviations recorded in `out/STAGE_L_REPORT.md`:
+their own commits. Notable deviations recorded in `out/history/STAGE_L_REPORT.md`:
 wgpu 30's default error handler PANICS (O1 deliberately changed semantics to
 log-once, owner-ratified with a loud `[GPU-ERROR]` marker); `wgpu::Color::BLACK`
 is (0,0,0,1) — a mask "clear" bug the K6 pixel seam caught in minutes; no

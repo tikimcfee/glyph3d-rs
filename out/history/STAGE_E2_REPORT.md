@@ -1,3 +1,5 @@
+> **History.** Moved to `out/history/` on 2026-10-10: a dated record, not current state. What is true now: `README.md`, root `AGENTS.md`, `out/MAINTENANCE-NOTES-2026-10-08.md`.
+
 # Stage E2 — repo-scale loading: a whole repository as a field of code pages
 
 **Goal**: load an entire repo through the Mojo engine and render it as a
