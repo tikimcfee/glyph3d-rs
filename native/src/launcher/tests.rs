@@ -187,6 +187,59 @@ fn the_launch_keeps_what_the_launcher_does_not_show() {
     assert!(back.settings.contains_key("glyph_scene"), "{text}");
 }
 
+/// A launch saves what was changed into the user's file, and a repo
+/// launched from outside the presets joins them.
+#[test]
+fn a_launch_saves_changes_and_remembers_the_repo() {
+    let dir = std::env::temp_dir().join(format!("test_launcher_save_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("launch_config.toml");
+    std::fs::write(&path, "# mine\nwrap_mode = \"back\"\nagent_session = \"~/s.jsonl\"\n").unwrap();
+
+    let mut l = Launcher::open(Some(path.clone()));
+    assert_eq!(l.target, Target::Agent);
+    assert!(!l.save().unwrap(), "nothing changed: the file is not rewritten (~ kept as typed)");
+
+    l.target = Target::Repo;
+    l.repo_path = "~/src/linux".into();
+    l.cfg.field_mode = Some(GlyphFieldMode::Visible);
+    l.remember_repo();
+    assert!(l.save().unwrap());
+    let text = std::fs::read_to_string(&path).unwrap();
+    let back = LaunchConfig::from_toml_str(&text).unwrap();
+    assert!(text.starts_with("# mine\nwrap_mode = \"back\"\n"), "{text}");
+    assert_eq!(back.field_mode, Some(GlyphFieldMode::Visible));
+    assert_eq!(back.load_repo, Some(PathBuf::from("~/src/linux")), "saved as typed, not absolute");
+    assert_eq!(back.agent_session, None, "the scene is the one launched");
+    assert_eq!(
+        back.repo_presets,
+        Some(vec![".".into(), "native/fixtures/g-pick-repo".into(), "~/src/linux".into()]),
+    );
+
+    // Reopened, the launcher is where it was left.
+    let again = Launcher::open(Some(path.clone()));
+    assert_eq!((again.target, again.repo_path.as_str()), (Target::Repo, "~/src/linux"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn remembered_repos_are_capped_oldest_first_keeping_the_built_ins() {
+    let mut l = Launcher::defaults();
+    l.target = Target::Repo;
+    for i in 0..20 {
+        l.repo_path = format!("/r{i}");
+        l.remember_repo();
+    }
+    let presets = l.cfg.repo_presets.clone().unwrap();
+    assert_eq!(presets.len(), 16);
+    assert_eq!(&presets[..2], &[".".to_string(), "native/fixtures/g-pick-repo".to_string()]);
+    assert_eq!(presets[2], "/r6");
+    assert_eq!(presets[15], "/r19");
+    l.repo_path = "/r19".into();
+    l.remember_repo();
+    assert_eq!(l.cfg.repo_presets.unwrap().len(), 16, "a known repo is not added twice");
+}
+
 /// A config that does not load is shown, never swallowed (the old TUI
 /// ignored a file that failed to parse and launched without it).
 #[test]

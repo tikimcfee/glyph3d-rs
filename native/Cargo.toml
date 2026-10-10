@@ -78,12 +78,15 @@ egui-wgpu = { version = "0.36", optional = true }
 # lockfile resolves nothing new.
 ratatui = { version = "0.29", optional = true }
 crossterm = { version = "0.28", optional = true }
+# The launcher saves its changes into the user's launch_config.toml in place,
+# comments kept. The version toml 1.1 already resolves.
+toml_edit = { version = "0.25", optional = true }
 
 [features]
 default = ["egui-ui", "launcher"]
 # The terminal launcher. Off, `--launcher` is refused and a bare run opens
 # the default scene, as it did before C27.
-launcher = ["dep:ratatui", "dep:crossterm"]
+launcher = ["dep:ratatui", "dep:crossterm", "dep:toml_edit"]
 # Stage K: build the windowed egui overlay. With the feature off (or `--no-ui`
 # at runtime) windowed behavior is exactly pre-K.
 egui-ui = ["dep:egui", "dep:egui-winit", "dep:egui-wgpu"]

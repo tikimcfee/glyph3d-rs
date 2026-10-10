@@ -17,6 +17,9 @@
 # picked, the scene's path made absolute) and starts the renderer on it, so
 # the status line's "Last launch" file repeats a launch by hand:
 #     glyph3d-native --launch-config <that file>
+# Each launch also SAVES what you changed in the launcher into this file (or
+# creates ./launch_config.toml): only the changed keys, in place, comments and
+# [sections] kept, and a repo launched from outside `repo_presets` joins it.
 #
 # Top-level keys below are launch options. [section] tables override the
 # compiled settings in config/defaults.toml, key by key — see the end of file.

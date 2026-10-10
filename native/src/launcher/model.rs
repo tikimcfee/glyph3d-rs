@@ -22,6 +22,10 @@ pub const DEFAULT_REPO_PRESETS: &[&str] = &[".", "native/fixtures/g-pick-repo"];
 /// Most-recent transcripts the session field cycles through.
 const SESSION_PICKS: usize = 20;
 
+/// How many repos `repo_presets` keeps once launches start adding to it;
+/// the oldest added one goes first.
+const REPO_PRESETS_MAX: usize = 16;
+
 /// Which scene a launch opens — the config's scene keys, one at a time.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Target {
@@ -184,6 +188,9 @@ pub struct Launcher {
     /// The options as loaded and edited. Scene keys live in the fields below
     /// until a launch writes the chosen one back.
     pub cfg: LaunchConfig,
+    /// The config as loaded (scene keys included): what a save compares
+    /// against, so only what the launcher changed is written.
+    baseline: LaunchConfig,
     /// The CLI with no arguments: every default a control shows.
     defaults: Cli,
     /// `[lod]` as the renderer would resolve it under `cfg`'s sections.
@@ -211,6 +218,7 @@ impl Launcher {
         let defaults = Cli::try_parse_from(["glyph3d-native"]).expect("the CLI parses with no arguments");
         let mut l = Self {
             cfg: LaunchConfig::default(),
+            baseline: LaunchConfig::default(),
             defaults,
             lod_defaults: (0.0, 0.0),
             target: Target::Repo,
@@ -254,6 +262,7 @@ impl Launcher {
         });
         self.sessions = None;
         let Some(path) = path else {
+            self.baseline = LaunchConfig::default();
             self.config_source = None;
             self.config_error = None;
             self.status = "No launch_config.toml: CLI defaults".to_string();
@@ -275,6 +284,7 @@ impl Launcher {
 
     /// Take a loaded config as the launcher's state.
     pub fn adopt(&mut self, mut cfg: LaunchConfig) {
+        self.baseline = cfg.clone();
         self.target = if cfg.demo == Some(true) {
             Target::Demo
         } else if cfg.agent_session.is_some() {
@@ -293,7 +303,8 @@ impl Launcher {
             self.file_path = p.display().to_string();
         }
         if let Some(p) = cfg.agent_session.take() {
-            self.session_path = crate::launch_config::expand_home(&p).display().to_string();
+            // As written (`~` and all): a save writes it back unchanged.
+            self.session_path = p.display().to_string();
         }
         cfg.demo = None;
         self.cfg = cfg;
@@ -470,7 +481,8 @@ impl Launcher {
 
     /// The selected session's title and project, when it is a scanned one.
     pub fn session_title(&self) -> Option<String> {
-        let s = self.sessions.as_ref()?.iter().find(|s| s.path.display().to_string() == self.session_path)?;
+        let current = crate::launch_config::expand_home(Path::new(&self.session_path));
+        let s = self.sessions.as_ref()?.iter().find(|s| s.path == current)?;
         Some(match &s.project_name {
             Some(p) => format!("{} — {}", p, s.title),
             None => s.title.clone(),
@@ -478,7 +490,7 @@ impl Launcher {
     }
 
     fn step_session(&mut self, dir: i32) {
-        let current = self.session_path.clone();
+        let current = crate::launch_config::expand_home(Path::new(&self.session_path)).display().to_string();
         let paths: Vec<String> = self.sessions().iter().map(|s| s.path.display().to_string()).collect();
         if paths.is_empty() {
             let dirs = self.cfg.session_dirs();
@@ -506,8 +518,19 @@ impl Launcher {
     /// scene's one key, its path made absolute against `cwd` (`run` resolves
     /// paths against where you typed it; the file outlives that).
     pub fn launch_config(&self, cwd: &Path) -> LaunchConfig {
+        self.scene_config(Some(cwd))
+    }
+
+    /// The same config with the paths as typed: what a save writes into the
+    /// user's own file.
+    pub fn saved_config(&self) -> LaunchConfig {
+        self.scene_config(None)
+    }
+
+    fn scene_config(&self, cwd: Option<&Path>) -> LaunchConfig {
         let abs = |s: &str, fallback: &str| -> PathBuf {
             let s = if s.trim().is_empty() { fallback } else { s.trim() };
+            let Some(cwd) = cwd else { return PathBuf::from(s) };
             let p = crate::launch_config::expand_home(Path::new(s));
             if p.is_absolute() {
                 p
@@ -529,6 +552,51 @@ impl Launcher {
             cfg.focus_file = None;
         }
         cfg
+    }
+}
+
+impl Launcher {
+    /// Add the repo about to launch to `repo_presets` if it is not there, so
+    /// ◄/► offers it next time. Built-in presets are written out the first
+    /// time, so the list in the file is the whole cycle.
+    pub fn remember_repo(&mut self) {
+        let repo = self.repo_path.trim();
+        if self.target != Target::Repo || repo.is_empty() {
+            return;
+        }
+        let mut presets = self.repo_presets();
+        if presets.iter().any(|p| p == repo) {
+            return;
+        }
+        presets.push(repo.to_string());
+        let builtin = |p: &String| DEFAULT_REPO_PRESETS.contains(&p.as_str());
+        while presets.len() > REPO_PRESETS_MAX {
+            match presets.iter().position(|p| !builtin(p)) {
+                Some(i) => presets.remove(i),
+                None => break,
+            };
+        }
+        self.cfg.repo_presets = Some(presets);
+    }
+
+    /// Where a save goes: the file the options came from, else a new
+    /// `launch_config.toml` here (the first place the renderer looks).
+    pub fn save_path(&self) -> PathBuf {
+        self.config_source.clone().unwrap_or_else(|| PathBuf::from("launch_config.toml"))
+    }
+
+    /// Save what the launcher changed into the user's config (see `save`).
+    /// `Ok(false)`: nothing had changed.
+    pub fn save(&mut self) -> Result<bool, String> {
+        if self.config_error.is_some() {
+            return Err("the config did not load; not saving over it".to_string());
+        }
+        let path = self.save_path();
+        let changed = self.saved_config();
+        let wrote = super::save::save(&path, &self.baseline, &changed)?;
+        self.baseline = changed;
+        self.config_source = Some(path);
+        Ok(wrote)
     }
 }
 

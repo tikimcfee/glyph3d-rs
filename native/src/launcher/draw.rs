@@ -163,7 +163,10 @@ fn draw_sidebar(f: &mut Frame, area: Rect, l: &Launcher) {
     let mut lines = vec![Line::from(vec![
         Span::styled("Config file:  ", dim),
         Span::styled(
-            l.config_source.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "none (CLI defaults)".into()),
+            match &l.config_source {
+                Some(p) => format!("{} (a launch saves changes here)", p.display()),
+                None => "none: CLI defaults (a launch creates ./launch_config.toml)".into(),
+            },
             Style::default().fg(Color::Yellow),
         ),
     ])];

@@ -9,7 +9,9 @@
 //! and not the window in-process because winit allows one event loop per
 //! process (macOS cannot recreate it), so an in-process window could never
 //! hand back. The file is written and read by one struct in one binary;
-//! nothing is translated into flags.
+//! nothing is translated into flags. Each launch also saves what the
+//! launcher changed into the user's own `launch_config.toml` (`save`), and a
+//! repo launched from outside the presets joins `repo_presets`.
 //!
 //! It replaces the TUI that lived in the build tool (`cargo glyph tui`),
 //! which parsed `launch_config.toml` with its own looser copy of the keys,
@@ -18,6 +20,7 @@
 
 mod draw;
 mod model;
+mod save;
 
 pub use model::{Control, Launcher, Target, View};
 
@@ -127,6 +130,13 @@ fn launch(terminal: &mut Terminal<CrosstermBackend<Stdout>>, l: &mut Launcher) {
         return;
     }
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    // The user's own file first: what you launch is what opens next time.
+    l.remember_repo();
+    let saved = match l.save() {
+        Ok(true) => format!("saved to {}", l.save_path().display()),
+        Ok(false) => String::new(),
+        Err(e) => format!("NOT saved: {e}"),
+    };
     let file = launch_file();
     if let Err(e) = std::fs::write(&file, l.launch_config(&cwd).to_toml_string()) {
         l.status = format!("Not launched: could not write {}: {e}", file.display());
@@ -153,7 +163,7 @@ fn launch(terminal: &mut Terminal<CrosstermBackend<Stdout>>, l: &mut Launcher) {
     let _ = execute!(terminal.backend_mut(), EnterAlternateScreen);
     let _ = terminal.hide_cursor();
     let _ = terminal.clear();
-    l.status = status;
+    l.status = if saved.is_empty() { status } else { format!("{status}; {saved}") };
     l.last_launch = Some(file);
 }
 
