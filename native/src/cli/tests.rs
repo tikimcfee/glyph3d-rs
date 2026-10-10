@@ -703,6 +703,30 @@ fn screenshot_runs_never_discover_launch_config() {
     assert!(discovers_launch_config(&parse(&["--demo"])));
 }
 
+/// Every way a gate launches the binary without `--screenshot` is a check or
+/// a measurement, and none reads a personal launch config (2026-10-10: a
+/// saved `field_mode = "visible"` reddened repo-verify-direct).
+#[test]
+fn check_runs_never_discover_launch_config() {
+    for args in [
+        &["--load-repo", "r", "--repo-engine", "direct", "--repo-verify", "--repo-scan-only"][..],
+        &["--load-repo", "r", "--repo-verify"],
+        &["--load-repo", "r", "--repo-scan-only"],
+        &["--fixture-trie", "f"],
+        &["--fixture-fold", "f"],
+        &["--fixture-scan", "f"],
+        &["--fixture-bake", "f"],
+        &["--fixture-reference", "f"],
+        &["--hyper-oracle-check", "f"],
+        &["--line-table-stats", "f"],
+        &["--gpu-key"],
+        &["--gpu-profile"],
+    ] {
+        assert!(!discovers_launch_config(&parse(args)), "{args:?} must not read a personal launch config");
+    }
+    assert!(discovers_launch_config(&parse(&["--load-repo", "r"])), "an interactive repo load does");
+}
+
 /// C27 (2026-10-10): a scene typed on the command line is the scene. The
 /// file's scene keys used to merge one by one, so its `load_repo` outranked
 /// a typed `--render-file` (repo beats file in `Cli::action`).
