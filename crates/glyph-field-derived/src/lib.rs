@@ -3,11 +3,13 @@
 //! Compact 20 B [`DerivedSlot`] per glyph, Y and Z positions derived in the vertex stage
 //! from line and item tables.
 
+pub mod derive;
 pub mod field;
 pub mod pipeline;
 pub mod slot;
 pub mod upload;
 
+pub use derive::{derive_yz, pack_row, row_of, x_page_of, ROW_MAX, X_PAGE_MAX};
 pub use field::DerivedField;
 pub use slot::DerivedSlot;
 

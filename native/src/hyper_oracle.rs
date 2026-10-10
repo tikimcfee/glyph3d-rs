@@ -394,9 +394,11 @@ fn render_slot_of(i: &GlyphInstance) -> RenderSlot {
 /// `wrap_segment_of`; a survivor is never a newline).
 fn derived_slot_of(i: &GlyphInstance, p: &ItemParams) -> DerivedSlot {
     let wrap = fold::wrap_segment_of(i.col as i64, p.wrap_width as i64, false);
+    // The row lane carries the column page (glyph_field_derived::derive).
+    let x_page = if p.has_page && p.page_cols > 0 { i.col / p.page_cols as u32 } else { 0 };
     DerivedSlot::with_item_and_group(
         i.pos[0],
-        i.row,
+        glyph_field_derived::pack_row(i.row, x_page),
         (i.glyph_id & 0xFFFF) as u16,
         wrap.clamp(0, u16::MAX as i64) as u16,
         i.color,
@@ -946,6 +948,105 @@ mod tests {
             }
         }
         assert!(compared > 2000, "the grid compared only {compared} instances");
+    }
+
+    /// The Derived field's vertex stage, the one lane the oracle cannot see
+    /// (a `DerivedSlot` carries no Y or Z), held to the Instanced emitter:
+    /// `glyph_field_derived::derive_yz` — the shader's `derive_yz`
+    /// transcribed — over every device-emitted Derived slot of the
+    /// pagination grid must land on the `RenderSlot`'s own y and z, within
+    /// the ulps the shader's f32 fma chain is allowed against the emitter's
+    /// f64 arithmetic. Before 2026-10-10 every column-paged shape failed
+    /// here: the slot had no column page and z dropped
+    /// `x_page × depth_per_col` (0.75 per page in this grid, thousands of
+    /// ulps). The shader and its transcription are kept in step by hand;
+    /// `derive::tests::wgsl_derive_yz_carries_the_column_page_term` pins
+    /// the term in the shader's text.
+    #[test]
+    fn derived_vertex_stage_agrees_with_instanced() {
+        use crate::layout_hyper::{device_pass2_derived_on_host, device_pass2_render_on_host};
+        let trie = crate::default_trie();
+        let texts: [&str; 3] = [
+            "abcdefgh\n\nabcdefghijklmnop\nxy\n\u{E9}t\u{E9} caf\u{E9} \u{4E16}\u{754C}\nabcdefghijkl\n\n12345678901234567890123",
+            "line 0\nline 1\nline 2\nline 3\nline 4\nline 5\nline 6\nline 7\nline 8\nline 9 is the widest unterminated",
+            "\u{1F680}a\u{1F30D}bcdefgh\n\nabcdefghi\nabcdefgh\n",
+        ];
+        let shapes: [(i32, i32, i32, i32, i32); 11] = [
+            (0, 0, 0, 1, 0),
+            (0, 0, 3, 1, 0),
+            (3, 0, 0, 2, 0),
+            (3, 0, 2, 3, 0),
+            (4, 0, 9, 3, 0),
+            (0, 4, 0, 1, 0),
+            (0, 4, 0, 1, 6),
+            (0, 4, 0, 1, 3),
+            (2, 4, 1, 3, 0),
+            (2, 5, 1, 2, 7),
+            (3, 0, 1, 3, 5),
+        ];
+        let mut compared = 0usize;
+        let mut column_paged = 0usize;
+        let mut max_err = 0.0f32;
+        for mode in [fold::WrapMode::Down, fold::WrapMode::Back] {
+            for (rows, cols, scroll, wide, wrap) in shapes {
+                let params = ItemParams {
+                    origin_x: 0.5,
+                    origin_y: -1.0,
+                    origin_z: 2.0,
+                    line_height: 1.1,
+                    z_step: 0.4,
+                    wrap_width: wrap,
+                    wrap_mode: mode,
+                    has_page: rows != 0 || cols != 0 || scroll != 0,
+                    page_rows: rows,
+                    page_cols: cols,
+                    scroll_rows: scroll,
+                    pages_wide: wide,
+                    page_gap_x: 0.8,
+                    band_stride_y: 9.5,
+                    depth_per_band: -2.5,
+                    depth_per_col: 0.75,
+                    ..ItemParams::default()
+                };
+                let items: Vec<LayoutItem<'_>> = texts
+                    .iter()
+                    .enumerate()
+                    .map(|(i, t)| LayoutItem {
+                        bytes: t.as_bytes(),
+                        params,
+                        group_id: i as u32,
+                        paint: Paint::Flat(DEFAULT_COLOR_PACKED),
+                    })
+                    .collect();
+                let (render, _) = device_pass2_render_on_host(&items, &trie);
+                let (derived, _) = device_pass2_derived_on_host(&items, &trie);
+                assert_eq!(render.len(), derived.len());
+                let gpu = glyph_field::ItemParamsGpu::from(&params);
+                let at = format!("{mode:?} rows {rows} cols {cols} scroll {scroll} wide {wide} wrap {wrap}");
+                for (k, (r, d)) in render.iter().zip(derived.iter()).enumerate() {
+                    let [y, z] = glyph_field_derived::derive_yz(d.row, d.wrap_segment() as u32, &gpu);
+                    for (name, got, want) in [("y", y, r.pos[1]), ("z", z, r.pos[2])] {
+                        // The shader's f32 fma chain against the emitter's f64:
+                        // sub-micro-unit noise either way (a cell is ~0.53 wide);
+                        // the dropped page term was 0.75 per column page.
+                        let err = (got - want).abs();
+                        assert!(
+                            got.is_finite() && err <= 1e-4,
+                            "{at}: slot {k} {name}: shader {got} vs emitter {want} (err {err}; row lane {:#x})",
+                            d.row
+                        );
+                        max_err = max_err.max(err);
+                    }
+                    if glyph_field_derived::x_page_of(d.row) > 0 {
+                        column_paged += 1;
+                    }
+                    compared += 1;
+                }
+            }
+        }
+        assert!(compared > 2000, "the grid compared only {compared} slots");
+        assert!(column_paged > 200, "only {column_paged} slots sat on a column page past the first");
+        eprintln!("derived vertex stage: {compared} slots, {column_paged} on a later column page, max error {max_err:e}");
     }
 
     #[test]

@@ -25,7 +25,7 @@
 # Ratchet, NOT an equality: tests are added constantly, so an exact pin would
 # redden on the most common good action in the repo. A green run whose real
 # count exceeds the floor prints a NOTE naming the value to raise it to.
-test_floor = 274
+test_floor = 277
 # Every golden view is rendered again under each of these and must match the
 # SAME baseline byte for byte (2026-10-09, C20). The Derived field renders
 # every golden frame identically to Instanced (measured on vulkan-nvidia and
@@ -807,6 +807,16 @@ op = "replace"
 find = "                                .min(page_cols - seg_offset % page_cols)"
 with = "                                .min(usize::MAX - page_cols)"
 expect = "pagination_agrees_on_every_tier"
+
+[[mutation]]
+name = "derived-column-page-term-dropped"
+gate = "cargo-test"
+why = "the Derived vertex stage before 2026-10-10: z without fold::paginate's x_page * depth_per_col term. Every column-paged item's z was wrong in Derived mode and nothing saw it — no golden view is column-paged (the repo never sets page_cols) and hyper-oracle compares slots, not the vertex stage. The row lane now carries the column page (row:24 | x_page:8) and glyph_field_derived::derive_yz is the shader's transcription; dropping the term there reddens the witness. CONSUMED BY: derive_yz's paged branch; reddens hyper_oracle::tests::derived_vertex_stage_agrees_with_instanced on every column-paged shape of the grid (thousands of ulps). Blind to the shader's own text drifting from the transcription — derive::tests::wgsl_derive_yz_carries_the_column_page_term pins the term's text, nothing executes the WGSL"
+file = "crates/glyph-field-derived/src/derive.rs"
+op = "replace"
+find = "        let z = (x_page as f32).mul_add(item.depth_per_col, z_banded);"
+with = "        let z = (0.0 * x_page as f32).mul_add(item.depth_per_col, z_banded);"
+expect = "derived_vertex_stage_agrees_with_instanced"
 
 [[mutation]]
 name = "hyper-pass1-stride-after-advance"

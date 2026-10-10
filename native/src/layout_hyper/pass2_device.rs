@@ -59,6 +59,7 @@ pub(crate) trait SlotEmit: Sync {
         height: f32,
         row: i64,
         wrap_segment: i64,
+        x_page: i64,
     ) -> Self::Slot;
     fn emit_fast(
         pos_x: f32,
@@ -102,6 +103,7 @@ impl SlotEmit for RenderEmit {
         height: f32,
         _row: i64,
         _wrap_segment: i64,
+        _x_page: i64,
     ) -> RenderSlot {
         RenderSlot {
             pos: [pos_x, pos_y, pos_z],
@@ -187,11 +189,12 @@ impl SlotEmit for DerivedEmit {
         _height: f32,
         row: i64,
         wrap_segment: i64,
+        x_page: i64,
     ) -> DerivedSlot {
         let wrap = wrap_segment.clamp(0, u16::MAX as i64) as u16;
         DerivedSlot::with_item_and_group(
             pos_x,
-            row as u32,
+            glyph_field_derived::pack_row(row.max(0) as u32, x_page.max(0) as u32),
             (glyph_id & 0xFFFF) as u16,
             wrap,
             color,
@@ -659,7 +662,8 @@ fn layout_pass2_chunk<E: SlotEmit>(
 
                     let row_py = cached_py;
                     let row_pz = cached_pz;
-                    let row_u32 = row.max(0) as u32;
+                    // The Derived row lane carries the column page (derive.rs).
+                    let row_u32 = glyph_field_derived::pack_row(row.max(0) as u32, x_page.max(0) as u32);
                     let wrap_high = ((wrap_segment.max(0) as u32) & 0xFFFF) << 16;
                     let item_and_group = group_id;
                     let frame = RowFrame { py: row_py, pz: row_pz, row: row_u32, wrap_high, item_and_group, group_id, ascii_adv };
@@ -1468,6 +1472,7 @@ fn layout_pass2_chunk<E: SlotEmit>(
                     r.height,
                     row,
                     wrap_segment,
+                    x_page,
                 ));
             }
             survivor_out += 1;

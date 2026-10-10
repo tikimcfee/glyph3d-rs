@@ -46,7 +46,13 @@ fn transcode_one(inst: &GlyphInstance, item_params: &[ItemParamsGpu]) -> Derived
     };
 
     let glyph_id = (inst.glyph_id & 0xFFFF) as u16;
-    let row = inst.row;
+    // The row lane carries the column page (derive.rs): col / page_cols for
+    // a column-paged item, else 0.
+    let x_page = match item_params.get(inst.group_id as usize) {
+        Some(item) if item.has_page != 0 && item.page_cols > 0 => inst.col / item.page_cols as u32,
+        _ => 0,
+    };
+    let row = crate::derive::pack_row(inst.row, x_page);
     let item_and_group = inst.group_id;
 
     DerivedSlot::with_item_and_group(

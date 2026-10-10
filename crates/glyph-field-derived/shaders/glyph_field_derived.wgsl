@@ -2,15 +2,16 @@
 //
 // In Derived mode, instance slots are compact 20 B records:
 //   w0    x: f32                 world X coordinate (pen origin at left edge)
-//   w1    line_idx: u32          indexes line_table: array<LineRecord>
+//   w1    row: u32               row:24 | x_page:8 (derive.rs) — the cell's row in its item and its column page
 //   w2    glyph_and_wrap: u32    low 16: glyph_id (atlas slot), high 16: wrap_segment
 //   w3    color: u32             packed sRGB RGBA8 (r in bits 0..7, a in 24..31)
 //   w4    group_id: u32          index into the group table
 //
-// Y and Z coordinates are derived in the vertex stage from line_table and item_table:
-//   line = line_table[inst.row]   // { item_idx, row }
-//   item = item_table[line.item_idx]   // ItemParamsGpu (64 B)
-//   yz   = derive_yz(line.row, wrap_segment, item)
+// Y and Z coordinates are derived in the vertex stage from the item table:
+//   item = item_table[inst.item_and_group]   // ItemParamsGpu (64 B)
+//   yz   = derive_yz(inst.row, wrap_segment, item)   // row lane: row:24 | x_page:8
+// (`derive.rs` carries the same function in Rust, held to the Instanced
+// emitter's positions by `hyper_oracle::tests::derived_vertex_stage_agrees_with_instanced`.)
 //
 // Advance is looked up from the resident atlas table:
 //   advance = glyph_advances[glyph_id]
@@ -87,9 +88,14 @@ struct Params {
 // for (a web-era slot the vendored font cannot draw): rendered blank.
 const NO_CELL: u32 = 0xFFFFFFFFu;
 
-fn derive_yz(row: u32, wrap_segment: u32, item: ItemParamsGpu) -> vec2<f32> {
+// The row lane is `row:24 | x_page:8` (derive.rs): the column page rides the
+// high byte so z can carry fold::paginate's `x_page * depth_per_col` term,
+// which has no other source in the vertex stage (the slot has no column).
+fn derive_yz(row_lane: u32, wrap_segment: u32, item: ItemParamsGpu) -> vec2<f32> {
     var derived_y = 0.0;
     var derived_z = 0.0;
+    let row = row_lane & 0xFFFFFFu;
+    let x_page = row_lane >> 24u;
 
     let depth_steps = -(f32(wrap_segment));
     let z_tail = fma(depth_steps, item.z_step_lo, item.origin_z);
@@ -109,7 +115,7 @@ fn derive_yz(row: u32, wrap_segment: u32, item: ItemParamsGpu) -> vec2<f32> {
         derived_y = fma(-(f32(band)), item.band_stride_y, y_row_folded);
 
         let z_banded = fma(f32(band), item.depth_per_band, z_stepped);
-        derived_z = z_banded;
+        derived_z = fma(f32(x_page), item.depth_per_col, z_banded);
     } else {
         let y_tail = fma(-(f32(row)), item.line_height_lo, item.origin_y);
         derived_y = fma(-(f32(row)), item.line_height, y_tail);
