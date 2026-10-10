@@ -172,6 +172,13 @@ applied). Ivan's call: `--demo` (a golden view), `--no-cull`, the
 Zed-experiment live path (feature-gate vs delete), the walker reporting its
 extension and directory-name skips.
 
+**Direction (2026-10-10):** views over bytes and a pooled transform tree —
+`out/DESIGN-VIEWS-AND-TRANSFORMS-2026-10-10.md`. It supersedes "agent cards
+as items" above as the route to retiring Instanced. In flight: a delegate
+porting glyph3d-js's Book/library layout as `--layout-mode library` (a probe,
+with `out/LIBRARY-LAYOUT-FINDINGS-2026-10-10.md`), and a survey of GPU
+transform hierarchies (`research/gpu-transform-hierarchies-2026-10.md`).
+
 **On hold by decision:** retiring the load-time syntax heuristic and its
 re-baseline (until AST/LSP colouring is agreed); the `pass2_device.rs` split.
 **Small open items:** C23 (the GPU staging sink is pixel-only), C25
