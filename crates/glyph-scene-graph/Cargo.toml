@@ -1,0 +1,18 @@
+[package]
+name = "glyph-scene-graph"
+version = "0.1.0"
+edition = "2021"
+description = "The renderer's transform tree: pooled nodes behind generation handles, CPU-owned topology in depth-first order, per-table dirty tracking, and one GPU compute pass that derives world transforms over the dirty ranges only."
+
+# Step 1 of out/DESIGN-VIEWS-AND-TRANSFORMS-2026-10-10.md (§ "Groups: a pooled
+# transform tree"). The crate knows nothing of glyphs: the renderer maps its
+# group rows onto nodes (native/src/glyph_scene/nodes.rs) and hands the
+# resolve pass its group buffer as an optional output. pollster drives the
+# bench binary's device (already in the lockfile through native).
+[dependencies]
+wgpu = "30"
+bytemuck = { version = "1", features = ["derive"] }
+pollster = "0.4"
+
+[dev-dependencies]
+naga = { version = "30", features = ["wgsl-in"] }
