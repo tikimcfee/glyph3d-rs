@@ -71,7 +71,7 @@ pub struct UiProbeState {
     pub cluster_mode: Option<bool>,
     /// Canvas layout arrangement mode (repo scenes): shelf vs carrel. None for non-repo scenes.
     pub layout_mode: Option<crate::repo::RepoLayoutMode>,
-    /// Layout engine strategy (repo scenes): Hyper (CPU) vs Cubecl (GPU) vs Direct vs Batch.
+    /// Layout engine strategy (repo scenes): Hyper vs Direct vs Batch vs Naive.
     pub strategy: Option<crate::repo::Strategy>,
     /// Glyph field render mode: Instanced (32B) vs Derived (20B).
     pub field_mode: Option<glyph_field::GlyphFieldMode>,

@@ -110,6 +110,9 @@ The codebase is **100% pure Rust** and builds without platform-specific assembly
 - Adoption is straightforward: run `cargo glyph drift` to verify differences are purely edge-rasterization noise, and follow the adoption commands printed by the runner.
 
 ### B. Compute Workgroup Limits
+
+*(B and C describe the CubeCL compute engine, retired 2026-10-09; kept as history.)*
+
 - Apple M2 reports `max_compute_workgroups_per_dimension = 65,535`. CubeCL grids exceeding 65,535 tiles spill onto the Y dimension (`cubes_of`).
 - Desktop Vulkan adapters (NVIDIA RTX, AMD Radeon) typically report $2^{31}-1$ (2,147,483,647). The spill logic remains functional and correct, but desktop hardware has virtually unlimited 1D grid headroom.
 

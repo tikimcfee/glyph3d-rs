@@ -41,7 +41,6 @@ pub enum ClusterMode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RepoEngine {
     Hyper,
-    Cubecl,
     Direct,
     Batch,
 }
@@ -51,9 +50,6 @@ impl RepoEngine {
         match self {
             RepoEngine::Hyper => {
                 "Parallel CPU Rayon layout writing unified memory. Cache-blocked CPU fold, sub-second repo loading."
-            }
-            RepoEngine::Cubecl => {
-                "Pure GPU parallel compute pipeline (Metal/WGPU) with in-flight UTF-8 decode, parallel Blelloch scan & direct slot emission."
             }
             RepoEngine::Direct => {
                 "Direct CPU layout path bypassing intermediate wire records (single-threaded direct arena write)."
@@ -382,7 +378,6 @@ impl LauncherState {
                         }
                         if let Some(re) = cfg.repo_engine.as_deref() {
                             self.repo_engine = match re.to_lowercase().as_str() {
-                                "cubecl" => RepoEngine::Cubecl,
                                 "direct" => RepoEngine::Direct,
                                 "batch" => RepoEngine::Batch,
                                 _ => RepoEngine::Hyper,
@@ -449,7 +444,6 @@ impl LauncherState {
                 args.push("--repo-engine".to_string());
                 args.push(match self.repo_engine {
                     RepoEngine::Hyper => "hyper".to_string(),
-                    RepoEngine::Cubecl => "cubecl".to_string(),
                     RepoEngine::Direct => "direct".to_string(),
                     RepoEngine::Batch => "batch".to_string(),
                 });
@@ -569,8 +563,7 @@ impl LauncherState {
             }
             FocusField::RepoEngine => {
                 self.repo_engine = match self.repo_engine {
-                    RepoEngine::Hyper => RepoEngine::Cubecl,
-                    RepoEngine::Cubecl => RepoEngine::Direct,
+                    RepoEngine::Hyper => RepoEngine::Direct,
                     RepoEngine::Direct => RepoEngine::Batch,
                     RepoEngine::Batch => RepoEngine::Hyper,
                 };
@@ -672,8 +665,7 @@ impl LauncherState {
             }
             FocusField::RepoEngine => {
                 self.repo_engine = match self.repo_engine {
-                    RepoEngine::Hyper => RepoEngine::Cubecl,
-                    RepoEngine::Cubecl => RepoEngine::Direct,
+                    RepoEngine::Hyper => RepoEngine::Direct,
                     RepoEngine::Direct => RepoEngine::Batch,
                     RepoEngine::Batch => RepoEngine::Hyper,
                 };
@@ -749,8 +741,7 @@ impl LauncherState {
             FocusField::RepoEngine => {
                 self.repo_engine = match self.repo_engine {
                     RepoEngine::Hyper => RepoEngine::Batch,
-                    RepoEngine::Cubecl => RepoEngine::Hyper,
-                    RepoEngine::Direct => RepoEngine::Cubecl,
+                    RepoEngine::Direct => RepoEngine::Hyper,
                     RepoEngine::Batch => RepoEngine::Direct,
                 };
             }
@@ -953,19 +944,15 @@ mod tests {
         state.cycle_prev();
         assert_eq!(state.layout_mode, LayoutMode::Shelf);
 
-        // RepoEngine: 4-way cycle
+        // RepoEngine: 3-way cycle
         state.focus = FocusField::RepoEngine;
         assert_eq!(state.repo_engine, RepoEngine::Hyper);
-        state.cycle_next();
-        assert_eq!(state.repo_engine, RepoEngine::Cubecl);
         state.cycle_next();
         assert_eq!(state.repo_engine, RepoEngine::Direct);
         state.cycle_next();
         assert_eq!(state.repo_engine, RepoEngine::Batch);
         state.cycle_prev();
         assert_eq!(state.repo_engine, RepoEngine::Direct);
-        state.cycle_prev();
-        assert_eq!(state.repo_engine, RepoEngine::Cubecl);
         state.cycle_prev();
         assert_eq!(state.repo_engine, RepoEngine::Hyper);
 
@@ -1005,10 +992,6 @@ mod tests {
         assert_eq!(
             RepoEngine::Hyper.description(),
             "Parallel CPU Rayon layout writing unified memory. Cache-blocked CPU fold, sub-second repo loading."
-        );
-        assert_eq!(
-            RepoEngine::Cubecl.description(),
-            "Pure GPU parallel compute pipeline (Metal/WGPU) with in-flight UTF-8 decode, parallel Blelloch scan & direct slot emission."
         );
         assert_eq!(
             RepoEngine::Direct.description(),

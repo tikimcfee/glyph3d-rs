@@ -1,8 +1,8 @@
 //! Stage E2 — repository-scale loading.
 //!
 //! Walks a repository (source-extension whitelist; VCS/build/dependency dirs
-//! skipped), lays every file out through the layout seam (`HyperLayout` by
-//! default, the CubeCL chain under `--repo-engine cubecl`), and fills ONE
+//! skipped), lays every file out through the layout seam (`HyperLayout`,
+//! whatever `--repo-engine` says), and fills ONE
 //! glyph arena. The backend writes instances straight into the arena; only a
 //! `--repo-verify` run asks it for the 32 B wire records as well.
 //! `--repo-engine` selects; `--repo-verify` diffs against a recording
@@ -43,8 +43,6 @@ pub enum Strategy {
     Batched,
     #[value(name = "naive")]
     PerItem,
-    #[value(name = "cubecl")]
-    Cubecl,
 }
 
 impl std::fmt::Display for Strategy {
@@ -54,7 +52,6 @@ impl std::fmt::Display for Strategy {
             Strategy::Direct => write!(f, "direct"),
             Strategy::Batched => write!(f, "batch"),
             Strategy::PerItem => write!(f, "naive"),
-            Strategy::Cubecl => write!(f, "cubecl"),
         }
     }
 }
@@ -67,7 +64,6 @@ impl std::str::FromStr for Strategy {
             "direct" => Ok(Strategy::Direct),
             "batch" => Ok(Strategy::Batched),
             "naive" => Ok(Strategy::PerItem),
-            "cubecl" => Ok(Strategy::Cubecl),
             other => Err(format!("unknown strategy {other:?}")),
         }
     }
@@ -75,11 +71,11 @@ impl std::str::FromStr for Strategy {
 
 impl Strategy {
     pub fn can_record(&self) -> bool {
-        matches!(self, Strategy::Hyper | Strategy::Batched | Strategy::PerItem | Strategy::Cubecl)
+        matches!(self, Strategy::Hyper | Strategy::Batched | Strategy::PerItem)
     }
 
     pub fn materializes_records(&self) -> bool {
-        matches!(self, Strategy::Batched | Strategy::PerItem | Strategy::Cubecl)
+        matches!(self, Strategy::Batched | Strategy::PerItem)
     }
 }
 
@@ -104,7 +100,6 @@ impl BackendPhases {
 
 mod walk;
 pub use walk::{walk_repo, RepoFile, WalkResult, MAX_FILE_BYTES, SKIP_DIRS, SOURCE_EXTENSIONS};
-
 
 /// All layout dials for the repo field in one struct.
 #[derive(Clone, Copy, Debug)]
@@ -345,10 +340,6 @@ pub struct LoadStats {
     /// have three different fixes, and item 3 of the plan is a decision
     /// between two of them, so the sum alone cannot answer it.
     pub phases: BackendPhases,
-    /// The cubecl backend's own decomposition (rung 5's yardstick); None on
-    /// the `HyperLayout` strategies, whose spans live in `phases`.
-    #[cfg(feature = "cubecl")]
-    pub cubecl: Option<crate::cubecl_layout::CubeclPhases>,
     pub stage: Duration,
     pub layout: Duration,
     pub files: usize,
@@ -382,11 +373,10 @@ mod shelf;
 pub use shelf::{dir_tints, extension_tint};
 pub(crate) use shelf::{dir_tint, layout_shelf};
 
-
 /// Whole-repo load: walk → paint → the layout seam → grid layout.
 ///
-/// `strategy` selects the backend (`Cubecl`, or `HyperLayout` for every other
-/// value — `Hyper` alone gets the background prefetch) and whether a verify
+/// `strategy` selects how `HyperLayout` runs (`Hyper` alone gets the
+/// background prefetch) and whether a verify
 /// run records. `verify` lays the same items out again with a recording
 /// `HyperLayout` reference and diffs the two AT THE SEAM: placements,
 /// instances and, when both can produce them, records, all bit-exact.
@@ -440,12 +430,10 @@ pub struct PrefetchedRepo {
     pub walk: WalkResult,
     pub file_params: Vec<ItemParams>,
     pub(crate) hyper_data: Option<crate::layout_hyper::PrefetchedHyperData>,
-    #[cfg(feature = "cubecl")]
-    pub(crate) cubecl_data: Option<crate::cubecl_layout::PrefetchedCubeclData>,
 }
 
-/// Run repository filesystem walking, file_params calculation, and optional
-/// CubeCL pre-marshaling and table preparation on a background thread.
+/// Run repository filesystem walking, file_params calculation and (for
+/// `hyper`) the Pass 1 prefetch on a background thread.
 pub fn prefetch_repo(
     dir: &Path,
     params: RepoParams,
@@ -458,13 +446,6 @@ pub fn prefetch_repo(
         .map(|f| file_item_params(&params, f.bytes.len(), f.newline_count))
         .collect();
 
-    #[cfg(feature = "cubecl")]
-    let cubecl_data = if strategy == Strategy::Cubecl {
-        Some(crate::cubecl_layout::marshal_from_walk(&walk, &file_params, params.color_mode))
-    } else {
-        None
-    };
-
     let hyper_data = if strategy == Strategy::Hyper {
         Some(crate::layout_hyper::prefetch_hyper(&walk.files, &file_params))
     } else {
@@ -475,8 +456,6 @@ pub fn prefetch_repo(
         walk,
         file_params,
         hyper_data,
-        #[cfg(feature = "cubecl")]
-        cubecl_data,
     }
 }
 
@@ -484,9 +463,9 @@ pub fn prefetch_repo(
 /// first so it can size the arena to the byte count (the render path's
 /// device-mapped arena exists because of this split — leaders ≤ bytes, so
 /// `walk.total_bytes` is the slot bound the direct path commits against).
-/// `gpu` is the renderer's device when one exists — the cubecl backend
-/// shares it (rung 5a) instead of constructing a second; `None` is the
-/// no-GPU door (`--repo-scan-only`), where the chain makes its own.
+/// `gpu` is the renderer's device when one exists — HyperLayout emits
+/// straight into its buffers; `None` is the no-GPU door
+/// (`--repo-scan-only`), where layout fills a host arena.
 #[allow(clippy::too_many_arguments)]
 pub fn load_repo_from_walk(
     root: &Path,
@@ -508,8 +487,6 @@ pub fn load_repo_from_walk(
         walk,
         file_params,
         hyper_data: None,
-        #[cfg(feature = "cubecl")]
-        cubecl_data: None,
     };
 
     load_repo_from_prefetched(
@@ -539,8 +516,6 @@ pub fn load_repo_from_prefetched(
         walk,
         file_params,
         hyper_data,
-        #[cfg(feature = "cubecl")]
-        cubecl_data,
     } = prefetched;
 
     let _load = tracing::info_span!(
@@ -571,44 +546,18 @@ pub fn load_repo_from_prefetched(
         })
         .collect();
 
-    let mut backend = match strategy {
-        // The CubeCL chain emits directly to DeviceSlots on the shared GPU device:
-        // 32 B RenderSlots in Instanced mode, or 20 B DerivedSlots in Derived mode
-        // for zero-copy bind by the glyph field.
-        #[cfg(feature = "cubecl")]
-        Strategy::Cubecl => match gpu {
-            Some(ctx) => {
-                let mut engine = crate::layout::LayoutEngine::cubecl_with_device(
-                    crate::cubecl_chain::SharedDevice::from_ctx(ctx),
-                    params.field_mode,
-                );
-                if let Some(cd) = cubecl_data {
-                    engine.set_cubecl_prefetched(cd);
-                }
-                engine
-            }
-            None => crate::layout::LayoutEngine::cubecl(params.field_mode),
-        },
-        _ => match gpu {
-            Some(ctx) => {
-                let mut engine = crate::layout::LayoutEngine::hyper_with_device(
-                    crate::gpu::SharedDevice::from_ctx(ctx),
-                    params.field_mode,
-                );
-                if let Some(hd) = hyper_data {
-                    engine.set_hyper_prefetched(hd);
-                }
-                engine
-            }
-            None => {
-                let mut engine = crate::layout::LayoutEngine::hyper();
-                if let Some(hd) = hyper_data {
-                    engine.set_hyper_prefetched(hd);
-                }
-                engine
-            }
-        },
+    // Every strategy runs HyperLayout; with a GPU it emits straight into
+    // the field's own slot format.
+    let mut backend = match gpu {
+        Some(ctx) => crate::layout::LayoutEngine::hyper_with_device(
+            crate::gpu::SharedDevice::from_ctx(ctx),
+            params.field_mode,
+        ),
+        None => crate::layout::LayoutEngine::hyper(),
     };
+    if let Some(hd) = hyper_data {
+        backend.set_hyper_prefetched(hd);
+    }
     let t = Instant::now();
     let sp_backend = tracing::info_span!("repo.backend").entered();
     let (mut placements, records) = if verify && strategy.can_record() {
@@ -828,8 +777,6 @@ pub fn load_repo_from_prefetched(
         walk: walk_dur,
         backend: backend_dur,
         phases: backend.phases(),
-        #[cfg(feature = "cubecl")]
-        cubecl: backend.cubecl_phases(),
         stage: stage_dur,
         layout: layout_dur,
         files: walk.files.len(),
@@ -859,11 +806,9 @@ pub fn load_repo_from_prefetched(
 mod rederive;
 pub use rederive::{compact_folds, rederive_cached, Folded};
 
-
 mod cull_blocks;
 pub use cull_blocks::{line_of_byte, line_starts_of};
 use cull_blocks::build_file_blocks;
-
 
 impl RepoLoad {
     /// Convert into the renderer's staged form. `focus` selects one file
@@ -897,16 +842,6 @@ impl RepoLoad {
                 // SAFETY: pointer was mapped by create_mapped_render_slots and outlives arena
                 unsafe { std::slice::from_raw_parts(addr as *const crate::glyph_scene::RenderSlot, len) }
             });
-        #[cfg(feature = "cubecl")]
-        let tint_stream: Option<&[u32]> = if mapped_slots.is_none() {
-            self.arena
-                .device_slots()
-                .filter(|d| d.derived.is_none())
-                .map(|d| d.tint.as_slice())
-        } else {
-            None
-        };
-        #[cfg(not(feature = "cubecl"))]
         let tint_stream: Option<&[u32]> = None;
         let chunks = if self.arena.device_slots().is_none() {
             self.arena.instance_chunks()
@@ -1107,7 +1042,6 @@ impl RepoLoad {
                 Strategy::Batched => "hyper/batched",
                 Strategy::PerItem => "hyper/per-item",
                 Strategy::Direct => "hyper/direct",
-                Strategy::Cubecl => "device/cubecl (endpoint)",
                 Strategy::Hyper => "hyper-rust (parallel direct)",
             },
             if s.verified { " (verified bit-exact vs the other strategy)" } else { "" },
@@ -1141,90 +1075,47 @@ impl RepoLoad {
         // ambiguity that made `fold` look like the fold for a day. Only the
         // person who built the path knows which zero is which, and they are not
         // the person who reads this next.
-        #[cfg(feature = "cubecl")]
-        let has_cubecl = s.cubecl.is_some();
-        #[cfg(not(feature = "cubecl"))]
-        let has_cubecl = false;
-
-        #[cfg(feature = "cubecl")]
-        if let Some(cp) = s.cubecl {
-            // The device chain's stages are a different shape from the
-            // record/direct split below — printing the host block for it
-            // would show zeros for stages that RAN, the exact ambiguity the
-            // n/a rule exists against. Cubecl reports its own spans.
-            let ch = &cp.chain;
-            let accounted = cp.marshal
-                + ch.prep
-                + ch.tables
-                + ch.init
-                + ch.upload
-                + ch.dispatch
-                + cp.emit_readback
-                + cp.convert
-                + cp.compact;
-            println!(
-                "  cubecl chain: prep {:.3}s | tables {:.3}s | init {:.3}s | pack+upload {:.3}s \
-                 | dispatch {:.3}s | emit+readback {:.3}s ({:.2} GB records)",
-                ch.prep.as_secs_f64(),
-                ch.tables.as_secs_f64(),
-                ch.init.as_secs_f64(),
-                ch.upload.as_secs_f64(),
-                ch.dispatch.as_secs_f64(),
-                cp.emit_readback.as_secs_f64(),
-                (s.records * 32) as f64 / 1.073_741_824e9,
-            );
-            println!(
-                "  cubecl host: marshal {:.3}s | convert {:.3}s | compact {:.3}s \
-                 | unattributed {:.3}s",
-                cp.marshal.as_secs_f64(),
-                cp.convert.as_secs_f64(),
-                cp.compact.as_secs_f64(),
-                s.backend.saturating_sub(accounted).as_secs_f64(),
-            );
+        let p = s.phases;
+        let attributed = p.fold + p.readback() + p.compact;
+        let absent = !s.strategy.materializes_records();
+        let secs = |d: Duration| {
+            if absent { "n/a".to_string() } else { format!("{:.3}s", d.as_secs_f64()) }
+        };
+        println!(
+            "  backend: fold {:.3}s | readback {} (alloc {} + copy {}, {}) \
+             | compact {} | unattributed {:.3}s",
+            p.fold.as_secs_f64(),
+            secs(p.readback()),
+            secs(p.readback_alloc),
+            secs(p.readback_copy),
+            if absent {
+                "no wire record on this path".to_string()
+            } else {
+                format!("{:.2} GB", (s.records * 32) as f64 / 1.073_741_824e9)
+            },
+            secs(p.compact),
+            s.backend.saturating_sub(attributed).as_secs_f64(),
+        );
+        // `fold` above is the whole backend call. This is what the backend
+        // says it spent inside it — largest lane first, and `unattributed`
+        // here catches the part of the call no engine lane claims.
+        //
+        // Zero-valued engine lanes are ELIDED rather than printed as 0.000s,
+        // for the same reason: a lane absent from this line did not run on
+        // this path, so which lanes appear is itself the statement of which
+        // route the load took. (No backend reports lanes today —
+        // `engine_ranked` is empty — so the line carries only
+        // `unattributed`.)
+        let ranked = p.engine_ranked();
+        let eng_sum: Duration = ranked.iter().map(|(_, d)| *d).sum();
+        print!("  engine:");
+        for (name, d) in ranked.iter().filter(|(_, d)| !d.is_zero()) {
+            print!(" {} {:.3}s", name, d.as_secs_f64());
         }
-        if !has_cubecl {
-            let p = s.phases;
-            let attributed = p.fold + p.readback() + p.compact;
-            let absent = !s.strategy.materializes_records();
-            let secs = |d: Duration| {
-                if absent { "n/a".to_string() } else { format!("{:.3}s", d.as_secs_f64()) }
-            };
-            println!(
-                "  backend: fold {:.3}s | readback {} (alloc {} + copy {}, {}) \
-                 | compact {} | unattributed {:.3}s",
-                p.fold.as_secs_f64(),
-                secs(p.readback()),
-                secs(p.readback_alloc),
-                secs(p.readback_copy),
-                if absent {
-                    "no wire record on this path".to_string()
-                } else {
-                    format!("{:.2} GB", (s.records * 32) as f64 / 1.073_741_824e9)
-                },
-                secs(p.compact),
-                s.backend.saturating_sub(attributed).as_secs_f64(),
-            );
-            // `fold` above is the whole backend call. This is what the backend
-            // says it spent inside it — largest lane first, and `unattributed`
-            // here catches the part of the call no engine lane claims.
-            //
-            // Zero-valued engine lanes are ELIDED rather than printed as 0.000s,
-            // for the same reason: a lane absent from this line did not run on
-            // this path, so which lanes appear is itself the statement of which
-            // route the load took. (No backend reports lanes today —
-            // `engine_ranked` is empty — so the line carries only
-            // `unattributed`.)
-            let ranked = p.engine_ranked();
-            let eng_sum: Duration = ranked.iter().map(|(_, d)| *d).sum();
-            print!("  engine:");
-            for (name, d) in ranked.iter().filter(|(_, d)| !d.is_zero()) {
-                print!(" {} {:.3}s", name, d.as_secs_f64());
-            }
-            println!(
-                " | unattributed {:.3}s",
-                p.fold.saturating_sub(eng_sum).as_secs_f64()
-            );
-        }
+        println!(
+            " | unattributed {:.3}s",
+            p.fold.saturating_sub(eng_sum).as_secs_f64()
+        );
     }
 }
 

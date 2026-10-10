@@ -97,6 +97,6 @@ mod tests {
         let m = load().expect("build.toml loads");
         assert_eq!(products_reading(&m, "native/src/main.rs"), ["renderer"]);
         assert_eq!(products_reading(&m, "crates/glyph-field/src/copy.rs"), ["renderer"]);
-        assert!(products_reading(&m, "tools/check-cubecl.sh").is_empty());
+        assert!(products_reading(&m, "tools/check-pick-oracle.sh").is_empty());
     }
 }

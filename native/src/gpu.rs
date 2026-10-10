@@ -128,7 +128,6 @@ impl ErrorTracker {
     }
 }
 
-
 // ── the hardware profile ─────────────────────────────────────────────────
 
 /// Hardware memory architecture of the GPU device.
@@ -377,10 +376,6 @@ pub struct GpuContext {
     /// Stage H: CPU-side scope times (e.g. the cull pass), merged into the
     /// profile summary. Written by scenes only when `profiler` is `Some`.
     pub cpu_scopes: RefCell<std::collections::BTreeMap<String, (f64, u64)>>,
-    #[cfg(feature = "cubecl")]
-    pub cubecl_device: std::sync::OnceLock<cubecl::wgpu::WgpuDevice>,
-    #[cfg(feature = "cubecl")]
-    pub prewarm_handle: std::sync::Arc<std::sync::Mutex<Option<std::thread::JoinHandle<()>>>>,
     pub prefetched_walk: std::sync::Arc<std::sync::Mutex<Option<std::thread::JoinHandle<crate::repo::PrefetchedRepo>>>>,
     pub prefetched_atlas: std::sync::Arc<std::sync::Mutex<Option<std::thread::JoinHandle<crate::atlas::Atlas>>>>,
 }
@@ -396,10 +391,6 @@ pub struct SharedDevice {
     pub max_buffer_size: u64,
     pub host_visible_storage: bool,
     pub memory_arch: MemoryArchitecture,
-    #[cfg(feature = "cubecl")]
-    pub prewarm_handle: std::sync::Arc<std::sync::Mutex<Option<std::thread::JoinHandle<()>>>>,
-    #[cfg(feature = "cubecl")]
-    pub cubecl_device: Option<cubecl::wgpu::WgpuDevice>,
     pub prefetched_walk: std::sync::Arc<std::sync::Mutex<Option<std::thread::JoinHandle<crate::repo::PrefetchedRepo>>>>,
     pub prefetched_atlas: std::sync::Arc<std::sync::Mutex<Option<std::thread::JoinHandle<crate::atlas::Atlas>>>>,
 }
@@ -407,21 +398,6 @@ pub struct SharedDevice {
 impl SharedDevice {
     pub fn from_ctx(ctx: &GpuContext) -> Self {
         let memory_arch = ctx.profile.memory_architecture();
-        #[cfg(feature = "cubecl")]
-        let cubecl_device = {
-            use cubecl::wgpu::GraphicsApi;
-            let cdev = ctx.cubecl_device.get_or_init(|| {
-                let setup = cubecl::wgpu::WgpuSetup {
-                    instance: ctx.instance.clone(),
-                    adapter: ctx.adapter.clone(),
-                    device: ctx.device.clone(),
-                    queue: ctx.queue.clone(),
-                    backend: cubecl::wgpu::AutoGraphicsApi::backend(),
-                };
-                cubecl::wgpu::init_device(setup, Default::default())
-            });
-            Some(cdev.clone())
-        };
         Self {
             instance: ctx.instance.clone(),
             adapter: ctx.adapter.clone(),
@@ -431,10 +407,6 @@ impl SharedDevice {
             host_visible_storage: memory_arch == MemoryArchitecture::Unified
                 && ctx.profile.mappable_primary_buffers,
             memory_arch,
-            #[cfg(feature = "cubecl")]
-            prewarm_handle: ctx.prewarm_handle.clone(),
-            #[cfg(feature = "cubecl")]
-            cubecl_device,
             prefetched_walk: ctx.prefetched_walk.clone(),
             prefetched_atlas: ctx.prefetched_atlas.clone(),
         }
@@ -560,18 +532,14 @@ pub async fn init(compatible_surface: Option<&wgpu::Surface<'_>>) -> GpuContext 
     // glyphs). Request the adapter's FULL headroom; the scene chunks the
     // arena so no single binding exceeds max_storage_buffer_binding_size, so
     // any adapter value works — but the bigger the limit, the fewer chunks.
-    // Same story for max_storage_buffers_per_shader_stage: the CubeCL scan
-    // skeleton's widest kernels bind 10-12 storage buffers (default is 8 —
-    // k_apply's pipeline failed validation on exactly that).
+    // max_storage_buffers_per_shader_stage and the compute-grid cap are
+    // requested at the adapter's value too (the retired CubeCL chain needed
+    // them; asking costs nothing and leaves headroom for compute work).
     let supported = adapter.limits();
     let limits = wgpu::Limits {
         max_storage_buffer_binding_size: supported.max_storage_buffer_binding_size,
         max_buffer_size: supported.max_buffer_size,
         max_storage_buffers_per_shader_stage: supported.max_storage_buffers_per_shader_stage,
-        // Request the adapter's real cap rather than wgpu's default. Measured
-        // on this M2: the ADAPTER itself reports 65535, so this is a no-op
-        // here — the CubeCL chain still spills large grids into Y (see its
-        // cubes_of) — but an adapter with a higher cap gets it automatically.
         max_compute_workgroups_per_dimension: supported.max_compute_workgroups_per_dimension,
         ..Default::default()
     };
@@ -584,10 +552,9 @@ pub async fn init(compatible_surface: Option<&wgpu::Surface<'_>>) -> GpuContext 
         adapter.features().contains(wgpu::Features::MULTI_DRAW_INDIRECT_COUNT)
     );
 
-    // Stage H: TIMESTAMP_QUERY is requested whenever the adapter has it — the
-    // shared device is what CubeCL's chain bench sees, and its per-dispatch
-    // GPU timing needs the feature present at device creation (cubecl picks
-    // TimingMethod::Device only then). The renderer's own in-pass scopes
+    // Stage H: TIMESTAMP_QUERY is requested whenever the adapter has it, so
+    // GPU-side timing is available without recreating the device. The
+    // renderer's own in-pass scopes
     // (INSIDE_PASSES) stay opt-in behind GLYPH_PROFILE=1; a missing feature
     // must never break a render.
     let profile_wanted = std::env::var_os("GLYPH_PROFILE").is_some();
@@ -596,7 +563,7 @@ pub async fn init(compatible_surface: Option<&wgpu::Surface<'_>>) -> GpuContext 
     if adapter_features.contains(wgpu::Features::TIMESTAMP_QUERY) {
         required_features |= wgpu::Features::TIMESTAMP_QUERY;
     } else {
-        log::warn!("timestamp queries unavailable: CubeCL bench timing falls back to system clock");
+        log::warn!("timestamp queries unavailable: GPU-side timing falls back to the system clock");
     }
     if profile_wanted && adapter_features.contains(wgpu::Features::TIMESTAMP_QUERY_INSIDE_PASSES) {
         required_features |= wgpu::Features::TIMESTAMP_QUERY_INSIDE_PASSES;
@@ -676,10 +643,6 @@ pub async fn init(compatible_surface: Option<&wgpu::Surface<'_>>) -> GpuContext 
         profile,
         profiler,
         cpu_scopes: RefCell::new(std::collections::BTreeMap::new()),
-        #[cfg(feature = "cubecl")]
-        cubecl_device: std::sync::OnceLock::new(),
-        #[cfg(feature = "cubecl")]
-        prewarm_handle: std::sync::Arc::new(std::sync::Mutex::new(None)),
         prefetched_walk: std::sync::Arc::new(std::sync::Mutex::new(None)),
         prefetched_atlas: std::sync::Arc::new(std::sync::Mutex::new(None)),
     }

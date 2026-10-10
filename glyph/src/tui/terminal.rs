@@ -106,19 +106,16 @@ fn run_loop(
                     }
                 }
                 KeyCode::Char('b') | KeyCode::Char('B') if !state.focus.is_text_input() => {
-                    // Build action: build with --features cubecl
-                    run_external_action(terminal, "Building glyph3d-native (with --features cubecl)...", || {
+                    // Build action: the runner's product build, so the
+                    // renderer it leaves is the one every gate trusts.
+                    run_external_action(terminal, "Building glyph3d-native (cargo glyph build)...", || {
                         let _ = Command::new("cargo")
+                            .arg("glyph")
                             .arg("build")
-                            .arg("--release")
-                            .arg("-p")
-                            .arg("glyph3d-native")
-                            .arg("--features")
-                            .arg("cubecl")
                             .current_dir(root())
                             .status();
                     });
-                    state.status_message = "Build completed (release + cubecl).".to_string();
+                    state.status_message = "Build completed (cargo glyph build).".to_string();
                 }
                 KeyCode::Char('t') | KeyCode::Char('T') if !state.focus.is_text_input() => {
                     // Test gates

@@ -65,7 +65,7 @@ caller; the short version:
   method. Implement `layout_validated_items`; a backend cannot forget the
   guard because it never calls it.
 - Record compaction has one host reference, `layout::compact_records_into`
-  (test-only today; the CubeCL instance tail is its device replacement). It is
+  (test-only today; the device Pass 2 emits compacted slots directly). It is
   the statement of what blanks, paint indexing and the extents mean, so a
   backend may differ about the FOLD — the thing the corpus checks — and is
   held to this for the rest.
@@ -79,10 +79,8 @@ caller; the short version:
   used to compare records only, which cannot see compaction, paint or extents at
   all. Today it diffs the chosen `--repo-engine` against a recording
   `HyperLayout` reference run; `direct` has no records and reports `0 records`.
-  The CubeCL backend answers the same call (its 48 B arena is reconstructed
-  from the records and slot streams). Gated again since 2026-10-09 as
-  `repo-verify` (`hyper`) and `repo-verify-direct`, and `cubecl-fork` (green
-  since the 2026-10-09 HyperLayout keycap fix). Every non-cubecl strategy is the same HyperLayout, so these are
+  Gated again since 2026-10-09 as `repo-verify` (`hyper`) and
+  `repo-verify-direct`. Every strategy is the same HyperLayout, so these are
   HyperLayout against HyperLayout; `--hyper-oracle-check` (gate
   `hyper-oracle`, `hyper_oracle.rs`) is the one that holds HyperLayout to the
   oracle-backed fold.
@@ -92,9 +90,9 @@ caller; the short version:
   register slot emission, and zero-allocation streaming lexer coloring. Emits 32-byte
   `RenderSlot` instances in `Instanced` mode or compact 20-byte `DerivedSlot` instances
   in `Derived` mode directly into mapped GPU unified memory without intermediate copies.
-- `--repo-engine hyper|cubecl|direct|batch|naive` selects the layout engine:
+- `--repo-engine hyper|direct|batch|naive` selects the layout engine (the
+  CubeCL compute engine, `cubecl`, was retired 2026-10-09):
   - `hyper` (default): parallel Rust CPU layout with sub-200ms visual init.
-  - `cubecl`: experimental pure-GPU compute pipeline (Metal/WGPU; the `cubecl` Cargo feature, default-on).
   - `direct` / `batch` / `naive`: the same `HyperLayout`, without `hyper`'s
     background prefetch. Under `--repo-verify`, `direct` records nothing (the
     diff covers placements and instances only) while `batch` and `naive` take
@@ -169,16 +167,12 @@ Detailed technical audit lives in `research/desktop-platform-audit.md`. Key touc
   per-pass GPU timings print (windowed: 1 Hz; offscreen: once per run).
   Without it the device is created exactly as before (zero-cost Option).
 - `GLYPH_TRACE=<filter>` — the load path's span instrument (integration
-  note 22): `repo.{walk,load,paint,backend,verify,views,layout,staged,
-  segments}`, `cubecl.marshal`, `chain.{prep,tables,init,upload,
-  dispatch}` and `tail.{totals,scatter,tint,window.{emit,readback},
-  placements}` (the window spans are the records emitter's — the
-  instance tail has no windows since E2b), printed on span CLOSE with
-  busy/idle times. The filter is a tracing EnvFilter string (fallback
+  note 22): `repo.{walk,backend,verify,views,layout,staged,segments}` and
+  `hyper.{pass1,pass2}`, printed on span CLOSE with busy/idle times. The filter is a tracing EnvFilter string (fallback
   `RUST_LOG`; unset = off, one atomic per span). `glyph3d_native=info`
-  is the useful setting — a bare `info` also admits wgpu/cubecl's own
+  is the useful setting — a bare `info` also admits wgpu's own
   tracing records, which is loud. The spans mirror the
-  LoadStats/ChainPhases Instant boundaries exactly so the two can be
+  LoadStats Instant boundaries exactly so the two can be
   cross-checked; the prints stay the presentation contract.
 - `GLYPH_PICK_DEBUG=1` — pick-path diagnostics: pixel ray, AABB hits, local
   point, candidate records (glyph_scene/pick.rs pick functions).
@@ -211,66 +205,10 @@ Detailed technical audit lives in `research/desktop-platform-audit.md`. Key touc
   swizzles BGRA→RGBA so the PNG compares directly against the Rgba
   baselines. The live-display-free proof of the composite shader.
 
-And the dev-only CubeCL instruments (all exit drivers, none in the
-battery; the state handoff is note 18 in the integration notes):
-
-- `--cubecl-smoke` — bring-up smoke (`cubecl_smoke.rs`, the note-16 phase
-  0): device-share + both-direction buffer interop + the contraction
-  measurement, verdicts printed.
-- `--cubecl-scan-check <fixture>` — phase 1: chunk partials bit-exact.
-- `--cubecl-chain-check <fixture>` — the full chain vs `scan.rs`: counts +
-  rows exact, fold>0 X bit-level, line_adv/positions eps, and (phase 4
-  rung 2) the emitted 32 B record stream tier-diffed per leader:
-  gi/row/col exact, advance/height bit-exact, X/Y/Z eps.
-- `--cubecl-chain-bench <corpus>` — per-dispatch GPU-timestamp table.
-- `--cubecl-decode-check <fixture>` — decode vs `decode_all`, bit-exact.
-- `--cubecl-cluster-check <fixture>` — decode + cluster vs `decode_all` +
-  `resolve_clusters`, bit-exact.
-- `--cubecl-repo-check <dir>` — the full chain over a real repository,
-  records tier-diffed against the engine's batched output (phase 4 rung
-  3): glyph_id/row/col exact, measures at the f32-reassociation eps
-  tier, counts must match. Parity and timing in the same run. The PASS
-  block is followed by a FORK CENSUS line — bit-deviations bucketed by
-  lane (X/Y/Z/advance/height) and by the integer context that produced
-  them (X's page multiplier m, Z's wrap segment, Y's row magnitude): it
-  is the instrument that prices the paginate arithmetic fork, and its
-  all-zero reading on an exercised corpus is a load-bearing claim, not
-  decoration. Standing (2026-09-28): glyph3d-js reads ZERO across all
-  484M measure words — the fork is closed. Keep it that way: any X/Y/Z
-  change re-runs this instrument on a corpus exercising m >= 3 and wrap
-  segments >= 3. STRICT mode (`GLYPH_REPO_CHECK_STRICT=1`, set by
-  `tools/check-cubecl.sh`): any measure-word bit-deviation fails, and the census
-  denominators — m >= 3, seg >= 3, and the cluster candidate count — must
-  be nonzero: an unexercised corpus is a FAIL, so the standing fixture
-  cannot quietly stop covering its subjects (the fork arithmetic classes
-  and, since `fixtures/cubecl-fork/clusters.txt` (2026-09-30), the
-  cluster-commit path).
-
-Shared env vars: `GLYPH_CHAIN_STAGES` (absolute dispatch count — bisection),
-`GLYPH_CHAIN_LOOP` (samples, minimum reported), `GLYPH_CHAIN_WRAP=<w>`
-(fold>0 shape), `GLYPH_CHAIN_TILE`/`RAKE` (scan shape), `GLYPH_CHAIN_SPAN`
-(resolve worker bytes), `GLYPH_CHAIN_DECODE=1` (bench runs from raw bytes),
-`GLYPH_CHAIN_CLUSTER=1` (bench adds cluster mode — implies DECODE; the
-bench item flips to Cluster, the ranked chain runs as stages 1-4
-(probe / compact / rank / mark — list ranking over the candidate jump
-graph, note 18 §6c), a 4 B setup readback sizes the level tables, and
-fl/sm are diffed bit-exact against `decode_all`+`resolve_clusters`),
-`GLYPH_CHAIN_DEBUG=1` (dumps, incl. the cluster candidate table),
-`GLYPH_RECORD_CHUNK=<n>` (the repo chain's emission window size in ELEMENTS
-— the records tail only (default 16,777,216 = 512 MB); the instance tail
-has NO windows since E2b — the scatter writes the renderer-bound buffer
-directly. **Read by nothing since d46a6c3** (records-mode
-retirement; measured 2026-10-09) — the rest of this entry is history. The
-cubecl-fork check (`tools/check-cubecl.sh`, gated again 2026-10-09) sets 60,000 so the standing fixture's records cross
-several windows (six at 319,628 records), fencing the emitter's window
-carry on an ordinary corpus; the window bases ride runtime params buffers, so every
-window shares one compiled kernel — small values cost dispatches and
-4-byte uploads, nothing else),
-`GLYPH_REPO_CHECK_TAIL=records` (drops the fork check's instance/placement
-tiers — the big-corpus escape when Both mode's four simultaneous streams
-brush the memory ceiling; the check never sets it), and the retired
-`GLYPH_FOOTPRINT_BUDGET`/`GLYPH_FOOTPRINT_*` knobs died with the hops at
-E2b (the cliff numbers and the gate's design stay readable in note 22).
+The dev-only CubeCL instruments (`--cubecl-*`) and their env vars
+(`GLYPH_CHAIN_*`, `GLYPH_RECORD_CHUNK`, `GLYPH_REPO_CHECK_*`) were retired with
+the engine on 2026-10-09; `git show 659efdb:native/AGENTS.md` has their
+documentation.
 
 ## Commit cadence
 

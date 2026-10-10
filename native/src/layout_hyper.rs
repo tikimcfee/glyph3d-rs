@@ -15,8 +15,6 @@ use crate::layout::{
     DerivedDeviceSlots, DeviceSlots, GlyphArena, ItemPlacement, LayoutError, LayoutGlyphs,
     LayoutItem,
 };
-#[cfg(feature = "cubecl")]
-use crate::layout::TintStore;
 use crate::text::fu_to_world;
 use glyph_field::GlyphFieldMode;
 
@@ -222,10 +220,6 @@ impl HyperLayout {
                 format: self.field_mode,
                 derived: derived_extras,
                 emoji_tint_pairs,
-                #[cfg(feature = "cubecl")]
-                tint: TintStore::Host(Vec::new()),
-                #[cfg(feature = "cubecl")]
-                keep_alive: Vec::new(),
             };
             *arena = GlyphArena::from_device(device_slots);
             Ok(pass2_out.placements)
@@ -248,7 +242,6 @@ impl HyperLayout {
         }
     }
 }
-
 
 /// Prepass aggregation output holding per-item prepasses and per-chunk starting offsets.
 #[derive(Clone, Debug)]
@@ -924,26 +917,6 @@ pub fn prefetch_hyper(
     }
 }
 
-/// PASS 1 (parallel): per item, survivor count, widest row extent, and the
-/// FOLDED row count (the Derived line table's size, known before Pass 2).
-pub(crate) fn pass1_prepass(
-    items: &[LayoutItem<'_>],
-    trie: &TrieTable,
-    bitmap_adv: f32,
-    em_height_fu: u32,
-) -> Vec<ItemPrepass> {
-    let (chunks, item_chunk_ranges) = chunk::slice_items_into_chunks(items);
-    let aggregate = pass1_prepass_chunks(
-        &chunks,
-        &item_chunk_ranges,
-        items,
-        trie,
-        bitmap_adv,
-        em_height_fu,
-    );
-    aggregate.prepasses
-}
-
 /// The DEVICE Pass 2 (`pass2_device.rs`, what every GPU load runs) written
 /// into host memory, for instruments (`hyper_oracle`).
 ///
@@ -1006,7 +979,6 @@ pub(crate) fn device_pass2_derived_on_host(
     device_pass2_on_host::<DerivedEmit>(items, trie)
 }
 
-
 impl crate::layout::VerifyLayout for HyperLayout {
     fn layout_validated_items_recording(
         &mut self,
@@ -1032,7 +1004,6 @@ impl crate::layout::VerifyLayout for HyperLayout {
 
 mod rederive;
 pub use rederive::{rederive_item_records, resolve_spans_to_slot_colors};
-
 
 #[cfg(test)]
 mod tests {
