@@ -31,6 +31,9 @@ pub fn line_of_byte(byte: usize, line_starts: &[usize]) -> u32 {
 
 pub(super) fn build_file_blocks(
     v: &FileView,
+    // The file's group scale (1 outside the library): `offset + local * s`,
+    // the unscaled expression bit for bit at s = 1.
+    s: [f32; 3],
     mapped_slots: Option<&[RenderSlot]>,
     chunks: &[&[GlyphInstance]],
 ) -> Vec<BlockCull> {
@@ -82,14 +85,14 @@ pub(super) fn build_file_blocks(
             if min_x <= max_x && min_y <= max_y {
                 blocks.push(BlockCull {
                     min: [
-                        v.offset[0] + min_x - BLOCK_CULL_PAD_MIN[0],
-                        v.offset[1] + min_y - BLOCK_CULL_PAD_MIN[1],
-                        v.offset[2] + min_z - BLOCK_CULL_PAD_MIN[2],
+                        v.offset[0] + min_x * s[0] - BLOCK_CULL_PAD_MIN[0] * s[0],
+                        v.offset[1] + min_y * s[1] - BLOCK_CULL_PAD_MIN[1] * s[1],
+                        v.offset[2] + min_z * s[2] - BLOCK_CULL_PAD_MIN[2] * s[2],
                     ],
                     max: [
-                        v.offset[0] + max_x + BLOCK_CULL_PAD_MAX[0],
-                        v.offset[1] + max_y + BLOCK_CULL_PAD_MAX[1],
-                        v.offset[2] + max_z + BLOCK_CULL_PAD_MAX[2],
+                        v.offset[0] + max_x * s[0] + BLOCK_CULL_PAD_MAX[0] * s[0],
+                        v.offset[1] + max_y * s[1] + BLOCK_CULL_PAD_MAX[1] * s[1],
+                        v.offset[2] + max_z * s[2] + BLOCK_CULL_PAD_MAX[2] * s[2],
                     ],
                     slot_base: b_start as u32,
                     slot_count: chunk.len() as u32,
@@ -144,14 +147,14 @@ pub(super) fn build_file_blocks(
                     if min_x <= max_x && min_y <= max_y {
                         blocks.push(BlockCull {
                             min: [
-                                v.offset[0] + min_x - BLOCK_CULL_PAD_MIN[0],
-                                v.offset[1] + min_y - BLOCK_CULL_PAD_MIN[1],
-                                v.offset[2] + min_z - BLOCK_CULL_PAD_MIN[2],
+                                v.offset[0] + min_x * s[0] - BLOCK_CULL_PAD_MIN[0] * s[0],
+                                v.offset[1] + min_y * s[1] - BLOCK_CULL_PAD_MIN[1] * s[1],
+                                v.offset[2] + min_z * s[2] - BLOCK_CULL_PAD_MIN[2] * s[2],
                             ],
                             max: [
-                                v.offset[0] + max_x + BLOCK_CULL_PAD_MAX[0],
-                                v.offset[1] + max_y + BLOCK_CULL_PAD_MAX[1],
-                                v.offset[2] + max_z + BLOCK_CULL_PAD_MAX[2],
+                                v.offset[0] + max_x * s[0] + BLOCK_CULL_PAD_MAX[0] * s[0],
+                                v.offset[1] + max_y * s[1] + BLOCK_CULL_PAD_MAX[1] * s[1],
+                                v.offset[2] + max_z * s[2] + BLOCK_CULL_PAD_MAX[2] * s[2],
                             ],
                             slot_base: b_start as u32,
                             slot_count: chunk.len() as u32,

@@ -154,6 +154,7 @@ pub(super) struct CullView {
 pub(super) fn cull_segments(
     segments: &[SegCull],
     hidden: &[bool],
+    em_scale: &[f32],
     view: &CullView,
     chunk_cap: u32,
     chunk_count: u32,
@@ -210,7 +211,9 @@ pub(super) fn cull_segments(
         let dist = ((eye.x - nx).powi(2) + (eye.y - ny).powi(2) + (eye.z - nz).powi(2))
             .sqrt()
             .max(0.001);
-        let glyph_px = px_scale / dist;
+        // At scale 1 (every group no verb or layout scaled) this is the
+        // unscaled `px_scale / dist` bit for bit.
+        let glyph_px = px_scale * em_scale.get(si).copied().unwrap_or(1.0) / dist;
         if glyph_px < lod_min_px {
             if seg.slot_count > 0 {
                 backdrops.push(BackdropInst {
@@ -347,6 +350,12 @@ pub(super) struct CullState {
     pub(super) local_min: Vec<[f32; 3]>,
     pub(super) local_max: Vec<[f32; 3]>,
     pub(super) local_blocks: Vec<Vec<BlockCull>>,
+    /// Each segment's group y scale: an em on screen is `px_scale × scale /
+    /// distance`. 1 for every group no verb has scaled; the library's fit
+    /// scale lives here (2026-10-10 — before it, the LOD assumed an em of
+    /// one world unit whatever the group's scale, so an upscaled file
+    /// collapsed to its backdrop early and a shrunk one drew subpixel glyphs).
+    pub(super) em_scale: Vec<f32>,
     pub(super) base_tint: Vec<[f32; 4]>,
     /// Group color rgb at staging time — tint edits scale the backdrop by
     /// pow(new)/pow(orig) so an untouched segment keeps its Stage F tint.
@@ -384,25 +393,34 @@ impl CullState {
         let device = &ctx.device;
         let seg_count = segments.len() as u32;
 
-        // Stage G: derive the local (pre-TRS) segment AABBs — at staging time
-        // every group is at scale 1, so local = world − group offset.
+        // Stage G: derive the local (pre-TRS) segment AABBs: local = (world −
+        // group offset) / group scale. Every group but a library file's is
+        // at scale 1 at staging, where this is the old `world − offset` bit
+        // for bit; the library stages its fit scale in the group (2026-10-10).
         let mut local_min = Vec::with_capacity(segments.len());
         let mut local_max = Vec::with_capacity(segments.len());
         let mut local_blocks = Vec::with_capacity(segments.len());
         let mut base_tint = Vec::with_capacity(segments.len());
         let mut orig_group_rgb = Vec::with_capacity(segments.len());
+        let mut em_scale = Vec::with_capacity(segments.len());
         for (i, seg) in segments.iter().enumerate() {
             let off = groups
                 .get(i)
                 .map(|g| [g.cols[0][0], g.cols[0][1], g.cols[0][2]])
                 .unwrap_or([0.0, 0.0, 0.0]);
-            local_min.push([seg.min[0] - off[0], seg.min[1] - off[1], seg.min[2] - off[2]]);
-            local_max.push([seg.max[0] - off[0], seg.max[1] - off[1], seg.max[2] - off[2]]);
+            let sc = groups
+                .get(i)
+                .map(|g| [g.cols[3][0], g.cols[3][1], g.cols[3][2]])
+                .filter(|s| s.iter().all(|&c| c > 0.0))
+                .unwrap_or([1.0, 1.0, 1.0]);
+            em_scale.push(sc[1]);
+            local_min.push([(seg.min[0] - off[0]) / sc[0], (seg.min[1] - off[1]) / sc[1], (seg.min[2] - off[2]) / sc[2]]);
+            local_max.push([(seg.max[0] - off[0]) / sc[0], (seg.max[1] - off[1]) / sc[1], (seg.max[2] - off[2]) / sc[2]]);
             let mut lblks = Vec::with_capacity(seg.blocks.len());
             for b in &seg.blocks {
                 lblks.push(BlockCull {
-                    min: [b.min[0] - off[0], b.min[1] - off[1], b.min[2] - off[2]],
-                    max: [b.max[0] - off[0], b.max[1] - off[1], b.max[2] - off[2]],
+                    min: [(b.min[0] - off[0]) / sc[0], (b.min[1] - off[1]) / sc[1], (b.min[2] - off[2]) / sc[2]],
+                    max: [(b.max[0] - off[0]) / sc[0], (b.max[1] - off[1]) / sc[1], (b.max[2] - off[2]) / sc[2]],
                     slot_base: b.slot_base,
                     slot_count: b.slot_count,
                 });
@@ -554,6 +572,7 @@ impl CullState {
             local_min,
             local_max,
             local_blocks,
+            em_scale,
             base_tint,
             orig_group_rgb,
             hidden: vec![false; segments.len()],
@@ -651,7 +670,7 @@ mod cull_depth_tests {
     fn a_segment_behind_the_near_plane_is_culled() {
         let s = seg([-1.0, -1.0, -50.0], [1.0, 1.0, -49.0]);
         let v = view_clipping_behind_z(-10.0, Vec3::new(0.0, 0.0, 5.0), 0.0);
-        let d = cull_segments(&[s], &[false], &v, 1024, 1);
+        let d = cull_segments(&[s], &[false], &[], &v, 1024, 1);
         assert!(
             !drew_glyphs(&d),
             "a segment at z=-50, behind a near plane at z=-10, was drawn: the \
@@ -665,7 +684,7 @@ mod cull_depth_tests {
     fn a_segment_in_front_of_the_near_plane_survives() {
         let s = seg([-1.0, -1.0, -1.0], [1.0, 1.0, 1.0]);
         let v = view_clipping_behind_z(-10.0, Vec3::new(0.0, 0.0, 5.0), 0.0);
-        let d = cull_segments(&[s], &[false], &v, 1024, 1);
+        let d = cull_segments(&[s], &[false], &[], &v, 1024, 1);
         assert!(drew_glyphs(&d), "a segment inside the frustum was culled");
     }
 
@@ -682,7 +701,7 @@ mod cull_depth_tests {
         let s = seg([-1.0, -1.0, -50.0], [1.0, 1.0, -49.0]);
         // px_scale/dist at dist≈50 is 20 px/em; ask for 100 so it must drop.
         let v = view_clipping_behind_z(-1.0e6, Vec3::new(0.0, 0.0, 0.0), 100.0);
-        let d = cull_segments(&[s], &[false], &v, 1024, 1);
+        let d = cull_segments(&[s], &[false], &[], &v, 1024, 1);
         assert!(
             !drew_glyphs(&d) && !d.backdrops.is_empty(),
             "a segment 50 units away in z was drawn at full detail: the LOD \
@@ -690,12 +709,32 @@ mod cull_depth_tests {
         );
     }
 
+    /// The LOD reads the group's scale (2026-10-10, the library's fit scale):
+    /// an em is `scale` world units, so the same segment at the same distance
+    /// is glyphs when its group is scaled up and a backdrop when it is not.
+    /// Before, the cull assumed an em of one world unit for every group, so a
+    /// contain-fit page enlarged 4x collapsed to its backdrop while its text
+    /// was still readable (and a shrunk one drew subpixel glyphs).
+    #[test]
+    fn lod_reads_the_group_scale() {
+        let s = seg([-1.0, -1.0, -50.0], [1.0, 1.0, -49.0]);
+        // ~20 px/em at dist ≈ 50; threshold 40: a 1x em drops, a 4x em draws.
+        let v = view_clipping_behind_z(-1.0e6, Vec3::new(0.0, 0.0, 0.0), 40.0);
+        let unscaled = cull_segments(std::slice::from_ref(&s), &[false], &[1.0], &v, 1024, 1);
+        assert!(!drew_glyphs(&unscaled) && !unscaled.backdrops.is_empty());
+        let scaled = cull_segments(std::slice::from_ref(&s), &[false], &[4.0], &v, 1024, 1);
+        assert!(drew_glyphs(&scaled), "an em 4x larger on screen was judged at 1x: the LOD ignores the group scale");
+        // Absent (an empty slice, every caller before the library) is 1.
+        let absent = cull_segments(&[s], &[false], &[], &v, 1024, 1);
+        assert_eq!(drew_glyphs(&absent), drew_glyphs(&unscaled));
+    }
+
     #[test]
     fn backdrop_quad_anchors_to_far_z() {
         assert_eq!(std::mem::size_of::<BackdropInst>(), 48);
         let s = seg([-1.0, -1.0, -50.0], [1.0, 1.0, -40.0]);
         let v = view_clipping_behind_z(-1.0e6, Vec3::new(0.0, 0.0, 0.0), 100.0);
-        let d = cull_segments(&[s], &[false], &v, 1024, 1);
+        let d = cull_segments(&[s], &[false], &[], &v, 1024, 1);
         assert_eq!(d.backdrops.len(), 1);
         assert_eq!(
             d.backdrops[0].depth[0], -50.0,
@@ -710,7 +749,7 @@ mod cull_depth_tests {
         v.file_backgrounds = true;
         v.file_bg_color = [0.2, 0.3, 0.4, 0.5];
 
-        let d = cull_segments(std::slice::from_ref(&s), &[false], &v, 1024, 1);
+        let d = cull_segments(std::slice::from_ref(&s), &[false], &[], &v, 1024, 1);
         assert!(drew_glyphs(&d), "glyphs must be drawn in near mode");
         assert_eq!(d.backdrops.len(), 1, "background quad must be emitted behind glyphs");
         assert_eq!(d.backdrops[0].rgba, [0.2, 0.3, 0.4, 0.5]);
@@ -718,7 +757,7 @@ mod cull_depth_tests {
 
         // When disabled, no backdrop is emitted in near mode
         v.file_backgrounds = false;
-        let d2 = cull_segments(&[s], &[false], &v, 1024, 1);
+        let d2 = cull_segments(&[s], &[false], &[], &v, 1024, 1);
         assert!(drew_glyphs(&d2));
         assert!(d2.backdrops.is_empty());
     }
@@ -734,7 +773,7 @@ mod cull_depth_tests {
         s2.slot_count = 150;
 
         let v = view_clipping_behind_z(-10.0, Vec3::new(0.0, 0.0, 0.0), 0.0);
-        let d = cull_segments(&[s1.clone(), s2], &[false, false], &v, 1024, 1);
+        let d = cull_segments(&[s1.clone(), s2], &[false, false], &[], &v, 1024, 1);
         assert_eq!(d.glyph_ranges.len(), 1, "contiguous segments must coalesce");
         assert_eq!(d.glyph_ranges[0], (0, 0..250));
 
@@ -742,7 +781,7 @@ mod cull_depth_tests {
         let mut s3 = seg([5.0, -1.0, -5.0], [7.0, 1.0, -4.0]);
         s3.slot_base = 300;
         s3.slot_count = 50;
-        let d2 = cull_segments(&[s1, s3], &[false, false], &v, 1024, 1);
+        let d2 = cull_segments(&[s1, s3], &[false, false], &[], &v, 1024, 1);
         assert_eq!(d2.glyph_ranges.len(), 2, "gapped segments must remain separate");
         assert_eq!(d2.glyph_ranges[0], (0, 0..100));
         assert_eq!(d2.glyph_ranges[1], (0, 300..350));
@@ -772,7 +811,7 @@ mod cull_depth_tests {
         ];
 
         let v = view_clipping_behind_z(-5.0, Vec3::new(0.0, 0.0, 5.0), 0.0);
-        let d = cull_segments(&[s], &[false], &v, 2048, 1);
+        let d = cull_segments(&[s], &[false], &[], &v, 2048, 1);
         // Only block 1 (slots 500..1000) must be drawn
         assert_eq!(d.glyph_ranges.len(), 1);
         assert_eq!(d.glyph_ranges[0], (0, 500..1000));
@@ -807,7 +846,7 @@ mod cull_depth_tests {
         ];
 
         let v = view_clipping_behind_z(-5.0, Vec3::new(0.0, 0.0, 5.0), 0.0);
-        let d = cull_segments(&[s], &[false], &v, 2048, 1);
+        let d = cull_segments(&[s], &[false], &[], &v, 2048, 1);
         assert_eq!(d.glyph_ranges.len(), 1);
         assert_eq!(d.glyph_ranges[0], (0, 500..1500));
     }
@@ -834,7 +873,7 @@ mod cull_depth_tests {
         ];
 
         let v = view_clipping_behind_z(-5.0, Vec3::new(0.0, 0.0, 5.0), 0.0);
-        let d = cull_segments(&[s], &[false], &v, 2048, 1);
+        let d = cull_segments(&[s], &[false], &[], &v, 2048, 1);
         assert_eq!(d.glyph_ranges.len(), 1);
         assert_eq!(d.glyph_ranges[0], (0, 0..1000));
     }
@@ -861,7 +900,7 @@ mod cull_depth_tests {
         ];
 
         let v = view_clipping_behind_z(-5.0, Vec3::new(0.0, 0.0, 5.0), 0.0);
-        let d = cull_segments(&[s], &[false], &v, 2048, 1);
+        let d = cull_segments(&[s], &[false], &[], &v, 2048, 1);
         assert!(!drew_glyphs(&d));
     }
 }

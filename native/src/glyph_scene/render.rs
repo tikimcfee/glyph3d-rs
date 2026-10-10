@@ -225,7 +225,7 @@ pub(super) fn render_scene(
         } else {
             (scene.field.chunk_capacity(), scene.field.chunk_count())
         };
-        let phase_draws = cull_segments(&cull.segments, &cull.hidden, &view, chunk_cap, chunk_count);
+        let phase_draws = cull_segments(&cull.segments, &cull.hidden, &cull.em_scale, &view, chunk_cap, chunk_count);
         if !phase_draws.backdrops.is_empty() {
             let max_cap = (cull.backdrop_insts_buf.size()
                 / std::mem::size_of::<crate::glyph_scene::cull::BackdropInst>() as u64)

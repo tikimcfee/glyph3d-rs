@@ -852,6 +852,9 @@ impl GlyphScene {
                 cull.local_max[i][1] * sy + oy,
                 cull.local_max[i][2] * sz + oz,
             ];
+            if let Some(e) = cull.em_scale.get_mut(i) {
+                *e = sy;
+            }
             if let Some(lblks) = cull.local_blocks.get(i) {
                 for (b_idx, lb) in lblks.iter().enumerate() {
                     if let Some(b) = cull.segments[i].blocks.get_mut(b_idx) {

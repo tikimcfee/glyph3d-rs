@@ -870,7 +870,17 @@ impl RepoLoad {
         let file_tints = self.arena.device_slots().map(|d| &d.file_tints);
         let file_blocks = self.arena.device_slots().map(|d| &d.file_blocks);
         let emoji_tint_pairs = self.arena.device_slots().map(|d| &d.emoji_tint_pairs);
+        // The file's group scale (1 in every mode but the library, whose fit
+        // rides in the group). Applied as `offset + local * s`, so at s = 1
+        // every expression below is the unscaled one bit for bit.
+        let groups = &self.groups;
+        let scale_of = |v: &FileView| -> [f32; 3] {
+            groups
+                .get(v.group_id as usize)
+                .map_or([1.0; 3], |g| [g.cols[3][0], g.cols[3][1], g.cols[3][2]])
+        };
         let seg_of = |v: &FileView| {
+            let s = scale_of(v);
             let tint = if is_flat {
                 let area = (v.width as f64 * v.height as f64).max(1e-3);
                 let ink_frac = (v.slot_count as f64 * crate::glyph_scene::GLYPH_CELL_AREA as f64 / area).min(1.0);
@@ -925,32 +935,32 @@ impl RepoLoad {
                 fbs.iter()
                     .map(|lb| crate::glyph_scene::BlockCull {
                         min: [
-                            v.offset[0] + lb.min[0] - crate::glyph_scene::BLOCK_CULL_PAD_MIN[0],
-                            v.offset[1] + lb.min[1] - crate::glyph_scene::BLOCK_CULL_PAD_MIN[1],
-                            v.offset[2] + lb.min[2] - crate::glyph_scene::BLOCK_CULL_PAD_MIN[2],
+                            v.offset[0] + lb.min[0] * s[0] - crate::glyph_scene::BLOCK_CULL_PAD_MIN[0] * s[0],
+                            v.offset[1] + lb.min[1] * s[1] - crate::glyph_scene::BLOCK_CULL_PAD_MIN[1] * s[1],
+                            v.offset[2] + lb.min[2] * s[2] - crate::glyph_scene::BLOCK_CULL_PAD_MIN[2] * s[2],
                         ],
                         max: [
-                            v.offset[0] + lb.max[0] + crate::glyph_scene::BLOCK_CULL_PAD_MAX[0],
-                            v.offset[1] + lb.max[1] + crate::glyph_scene::BLOCK_CULL_PAD_MAX[1],
-                            v.offset[2] + lb.max[2] + crate::glyph_scene::BLOCK_CULL_PAD_MAX[2],
+                            v.offset[0] + lb.max[0] * s[0] + crate::glyph_scene::BLOCK_CULL_PAD_MAX[0] * s[0],
+                            v.offset[1] + lb.max[1] * s[1] + crate::glyph_scene::BLOCK_CULL_PAD_MAX[1] * s[1],
+                            v.offset[2] + lb.max[2] * s[2] + crate::glyph_scene::BLOCK_CULL_PAD_MAX[2] * s[2],
                         ],
                         slot_base: (v.slot_base as u32) + lb.slot_base,
                         slot_count: lb.slot_count,
                     })
                     .collect()
             } else {
-                build_file_blocks(v, mapped_slots, &chunks)
+                build_file_blocks(v, s, mapped_slots, &chunks)
             };
             crate::glyph_scene::SegCull {
                 min: [
-                    v.offset[0] + v.ink.min[0] - crate::glyph_scene::SEG_CULL_PAD_MIN[0],
-                    v.offset[1] + v.ink.min[1] - crate::glyph_scene::SEG_CULL_PAD_MIN[1],
-                    v.offset[2] + v.ink.min[2],
+                    v.offset[0] + v.ink.min[0] * s[0] - crate::glyph_scene::SEG_CULL_PAD_MIN[0] * s[0],
+                    v.offset[1] + v.ink.min[1] * s[1] - crate::glyph_scene::SEG_CULL_PAD_MIN[1] * s[1],
+                    v.offset[2] + v.ink.min[2] * s[2],
                 ],
                 max: [
-                    v.offset[0] + v.ink.max[0] + crate::glyph_scene::SEG_CULL_PAD_MAX[0],
-                    v.offset[1] + v.ink.max[1] + crate::glyph_scene::SEG_CULL_PAD_MAX[1],
-                    v.offset[2] + v.ink.max[2],
+                    v.offset[0] + v.ink.max[0] * s[0] + crate::glyph_scene::SEG_CULL_PAD_MAX[0] * s[0],
+                    v.offset[1] + v.ink.max[1] * s[1] + crate::glyph_scene::SEG_CULL_PAD_MAX[1] * s[1],
+                    v.offset[2] + v.ink.max[2] * s[2],
                 ],
                 slot_base: v.slot_base as u32,
                 slot_count: v.slot_count as u32,
@@ -993,10 +1003,11 @@ impl RepoLoad {
         let mut focus_bounds = None;
         if let Some(needle) = focus {
             if let Some(v) = self.files.iter().find(|v| v.rel_path.contains(needle)) {
-                let cx = v.offset[0] + (v.ink.min[0] + v.ink.max[0]) * 0.5;
-                let cy = v.offset[1] + (v.ink.min[1] + v.ink.max[1]) * 0.5;
-                let hw = (v.ink.max[0] - v.ink.min[0]).max(1.0) * 0.5;
-                let hh = (v.ink.max[1] - v.ink.min[1]).max(1.0) * 0.5;
+                let s = scale_of(v);
+                let cx = v.offset[0] + (v.ink.min[0] + v.ink.max[0]) * 0.5 * s[0];
+                let cy = v.offset[1] + (v.ink.min[1] + v.ink.max[1]) * 0.5 * s[1];
+                let hw = ((v.ink.max[0] - v.ink.min[0]) * s[0]).max(1.0) * 0.5;
+                let hh = ((v.ink.max[1] - v.ink.min[1]) * s[1]).max(1.0) * 0.5;
                 focus_bounds = Some((
                     [cx, cy],
                     [hw, hh],

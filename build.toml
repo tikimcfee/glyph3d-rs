@@ -25,7 +25,7 @@
 # Ratchet, NOT an equality: tests are added constantly, so an exact pin would
 # redden on the most common good action in the repo. A green run whose real
 # count exceeds the floor prints a NOTE naming the value to raise it to.
-test_floor = 327
+test_floor = 328
 # Every golden view is rendered again under each of these and must match the
 # SAME baseline byte for byte (2026-10-09, C20). The Derived field renders
 # every golden frame identically to Instanced (measured on vulkan-nvidia and
@@ -1158,3 +1158,13 @@ find = "let slot = DerivedSlot(x, pack_row(row, x_page), glyph | ((wrap_segment 
 with = "let slot = DerivedSlot(x, pack_row(row + 1u, x_page), glyph | ((wrap_segment & 0xFFFFu) << 16u), color, lane);"
 expect = "diverges from baseline under --field-mode visible"
 rebuild = "cargo build --release"
+
+[[mutation]]
+name = "lod-ignores-group-scale"
+gate = "cargo-test"
+why = "the CPU cull's LOD before 2026-10-10: an em is one world unit whatever its group's scale. The library layout stages each file's contain-fit scale in its group (up to [library] max_upscale = 4), so an enlarged page collapsed to its backdrop while its text was readable on screen and a shrunk one drew subpixel glyphs — in the stored modes only (the Visible field's GPU cull already reads the group scale). No golden view scales a group, so pixel-ab cannot see it. CONSUMED BY: cull_segments' glyph_px for every segment, fed by CullState::em_scale; reddens glyph_scene::cull::tests::lod_reads_the_group_scale"
+file = "native/src/glyph_scene/cull.rs"
+op = "replace"
+find = "        let glyph_px = px_scale * em_scale.get(si).copied().unwrap_or(1.0) / dist;"
+with = "        let glyph_px = px_scale * em_scale.get(si).map(|_| 1.0).unwrap_or(1.0) / dist;"
+expect = "lod_reads_the_group_scale"
