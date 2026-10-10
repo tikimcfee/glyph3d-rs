@@ -226,6 +226,13 @@ Detailed technical audit lives in `research/desktop-platform-audit.md`. Key touc
   blocking once frame 0 has been submitted — the F8 HUD's figures, offscreen,
   so a cull disagreement can be reproduced with `--cam-pose` and numbers
   (C29, 2026-10-10).
+- `GLYPH_VISIBLE_TIMING=1` — `--field-mode visible`, offscreen: waits for the
+  GPU before every frame's `prepare` so the stats ring lands each frame, and
+  prints `VISTIME t=… cull_ms=… layout_ms=… lines_candidate=… …` — the F8
+  HUD's `gpu cull` (every cull pass, first begin to last end) and `layout`,
+  two frames behind. Run a pose for ~150 `--frames` and take the median of
+  the settled frames (C30, 2026-10-10). The wait serializes frames: an
+  instrument, never the frame path.
 - `GLYPH_G_DUMP=<slot>[,<len>]` — offscreen only: reads back instance bytes
   at `slot` from the glyph arena and prints hex (buffer write-path audits).
   `GLYPH_G_DUMP=<item>:<byte>[,<len>]` (M3, 2026-10-10) is the Visible
