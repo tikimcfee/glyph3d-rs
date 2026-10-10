@@ -296,6 +296,16 @@ fn stage_host_memory<E: SlotEmit>(
 
     let mut is_mapped = true;
 
+    // Where the stream's time goes (C22): `map_wait` is waiting for the
+    // previous slice's copy to release the staging buffer, `memcpy` the CPU
+    // copy host -> staging (every slot read and written again), `submit`
+    // encoding and queueing the copy into VRAM, `drain` the final wait. One
+    // span and one summary event per load, not one per slice.
+    let sp_stream = tracing::info_span!("hyper.staging.stream", bytes = plan.total_bytes).entered();
+    let (mut t_map_wait, mut t_memcpy, mut t_submit) =
+        (std::time::Duration::ZERO, std::time::Duration::ZERO, std::time::Duration::ZERO);
+    let mut slices = 0usize;
+
     let chunks: Vec<DeviceSlotChunk> = plan.chunk_counts
         .iter()
         .enumerate()
@@ -317,6 +327,7 @@ fn stage_host_memory<E: SlotEmit>(
                 let slice_len = (copy_bytes - written).min(STAGING_BYTES);
 
                 if !is_mapped {
+                    let t = std::time::Instant::now();
                     let (tx, rx) = std::sync::mpsc::channel();
                     staging_buf.slice(..).map_async(wgpu::MapMode::Write, move |res| {
                         let _ = tx.send(res);
@@ -331,7 +342,10 @@ fn stage_host_memory<E: SlotEmit>(
                         .expect("staging callback dropped")
                         .expect("staging map_async failed");
                     is_mapped = true;
+                    t_map_wait += t.elapsed();
                 }
+
+                let t = std::time::Instant::now();
 
                 {
                     let mut mapped = staging_buf
@@ -349,6 +363,8 @@ fn stage_host_memory<E: SlotEmit>(
                 }
                 staging_buf.unmap();
                 is_mapped = false;
+                t_memcpy += t.elapsed();
+                let t = std::time::Instant::now();
 
                 let mut encoder = dev.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
                     label: Some("glyph_hyper_chunk_slice_copy"),
@@ -362,6 +378,8 @@ fn stage_host_memory<E: SlotEmit>(
                     slice_len as u64,
                 );
                 dev.queue.submit([encoder.finish()]);
+                t_submit += t.elapsed();
+                slices += 1;
 
                 written += slice_len;
             }
@@ -375,10 +393,21 @@ fn stage_host_memory<E: SlotEmit>(
         .collect();
 
     // Ensure last copy completes before staging buffer is dropped.
+    let t_drain = std::time::Instant::now();
     let _ = dev.device.poll(wgpu::PollType::Wait {
         submission_index: None,
         timeout: None,
     });
+    let t_drain = t_drain.elapsed();
+    tracing::info!(
+        slices,
+        map_wait_ms = t_map_wait.as_secs_f64() * 1e3,
+        memcpy_ms = t_memcpy.as_secs_f64() * 1e3,
+        submit_ms = t_submit.as_secs_f64() * 1e3,
+        drain_ms = t_drain.as_secs_f64() * 1e3,
+        "staging stream"
+    );
+    drop(sp_stream);
     drop(staging_buf);
 
     unsafe {
