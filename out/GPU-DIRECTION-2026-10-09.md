@@ -684,3 +684,316 @@ What it does not model, so the biggest unknowns left, in order:
    file) is what keeps the overview honest.
 6. **Walk time.** 0.67 s of the 1.0 s load is reading 74 k files. Nothing
    GPU-side helps that; mmap or a persistent corpus cache would.
+
+---
+
+## Round 2 (2026-10-09/10)
+
+After the retire decision and the Linux-scale section: the M2 for a round, real
+Slug text instead of quads, the atlas and emoji sequences resident on the GPU,
+colour and per-glyph attributes by byte range with transient slots, and
+culling made explicit. Two machines: this box (RTX 5090 / Vulkan, 32 cores,
+shared with the coordinator's battery, load 1–15) and the M2 (Apple M2, 4P+4E,
+16 GB unified, Metal, fanless; jobs run through a tmux runner with cool-downs
+between runs and alternating order; load 2–15 because the research build and
+the Linux clone ran minutes before — the A/A floor there is ~8–9 ms on a full
+load, and every M2 figure below should be re-run on an idle machine before it
+is quoted as a constant). Everything **measured** unless marked; min / median
+of 5 repeats unless noted. Code: `experiments/gpu-direction/jit-layout` (cull,
+spans, dense attributes) and the new `experiments/gpu-direction/jit-text`
+(Slug, trie, emoji), both outside every gate; nothing under `native/` changed.
+
+### 1. M2: the production path, re-baselined (measured)
+
+Flagship (97 MB, 1,306 files, 95.2 M instances), `bench_ab.py`, 6 rounds
+alternating, 12 s cool-down, load 6.7 → 15.6:
+
+| configuration | backend min / median ms | Pass 2 | emoji tint re-read | visual init |
+|---|---|---|---|---|
+| hyper Derived syntax | **152 / 156** | 136 / 147 | 8.1 / 8.7 | 163 / 171 |
+| hyper Derived flat | 150 / 156 | 136 / 147 | 7.9 / 8.5 | 167 / 173 |
+| hyper Instanced syntax | 232 / 255 | 223 / 233 | 9.1 / 21.7 | 240 / 273 |
+| batch Derived syntax (no prefetch; Pass 1 visible) | 167 / 170 | 145 / 148 | 8.0 / 8.7 | 175 / 178 |
+
+Pass 1: 10.6 / 10.8 ms on 8 cores. So on unified memory **Pass 2 — writing
+1.9 GB of Derived slots — is 94 % of the backend**, the Instanced 32 B slot
+costs 90 ms more than the 20 B one for the same glyphs (write-bound), the
+emoji re-read that cost 193 ms on the discrete box costs 8 ms here (cacheable
+mapped memory), and syntax colour is free on both machines. The quoted 168 ms
+is today's 156.
+
+### 2. M2: the prototypes on unified memory (measured; see §6 for the caveats)
+
+**Linux tree** (the M2's clone is a day newer than this box's: 74,319 files,
+1,370 MB, 38.20 M lines, 1,294.8 M glyph slots in `jit-text`'s count, which
+resolves real glyphs):
+
+| stage | M2 | this box, for reference |
+|---|---|---|
+| walk: enumerate / read + UTF-8 (8 threads, first touch) | 457 / **2,284** ms | 247 / 334 (warm cache) |
+| Pass 1 with real glyph resolution, 8 threads | **310–334 ms = 4.1–4.4 GB/s** | 128–138 ms = 10 GB/s on 32 threads |
+| resident upload, 1,678 MB (`create_buffer_init`) | **1,004–1,106 ms** | 206–227 ms |
+| page (60 lines of `verifier.c`, 1,326 slots, 12.8 px/em): kernel / Slug draw / flat draw | 0.060 / 0.29 / 0.05 | 0.030 / 0.017 / 0.004 |
+| overview (2,000 files × 50 lines, 2.46 M slots, 0.44 px/em): kernel / Slug / flat | 1.5 / **13.7** / 9.8 | 0.31 / 1.23 / 1.20 |
+| worst (1,000 longest lines, 1.06 M slots, 2 KiB segments): kernel / Slug / flat | 1.7 / 6.4 / 4.4 | 0.78 / 0.50 / 0.50 |
+
+The M2's Pass 1 lands where the previous section inferred (250–350 ms). Two
+numbers are the finding: the **resident upload is a second** — wgpu's Metal
+`create_buffer_init` path for 1.68 GB, where the renderer's own unified path
+(`create_mapped_slot_buffer`) would have Pass 1 write the table straight into
+a mapped buffer and the bytes need not be copied at all; and **the overview's
+Slug draw is 14 ms** for 2.5 M sub-pixel glyphs (flat quads 10 ms), i.e. on
+the M2 the draw of a zoomed-out view, not its layout, is the frame — exactly
+what the renderer's per-file LOD backdrop exists for, and with LOD on (§5)
+that view lays out nothing.
+
+**Flagship** on the M2 (97 MB; its JS lines are long, so 60 lines are 15 k
+glyphs): Pass 1 20.6–22.7 ms = 4.3–4.7 GB/s, resident upload 110 MB in 20 ms —
+**against HyperLayout's 156 ms backend, the visible-set load is ~45 ms**.
+Page: kernel 1.36–1.46 ms (63 segments of ~240 glyphs: too few invocations to
+fill the GPU, latency-bound — 512 B segments are the fix), Slug 2.4–3.1 ms,
+flat 0.13. Overview (3.0 M slots): kernel 2.4, Slug 16.8, flat 12.0. Worst
+(1,000 lines, 4.1 M slots): kernel 4.7–4.9, Slug 27, flat 18.6.
+
+### 2a. M2 `jit-layout` rows (Pass-1 sweep, GPU-cull cameras, views) — measured, load 1.3–2.9
+
+**Pass 1 (line table + extents, no glyph resolution) by thread count**, two
+runs each: flagship 97.1–97.8 / 32.6–32.7 / 19.8–20.5 ms at 1 / 4 / 8 threads;
+Linux 1,459 / 438–443 / 299–301 ms (0.94 → 3.1 → 4.6 GB/s). Four performance
+cores give 3.0–3.3×, the four efficiency cores another 1.5×. The walk's
+`read + UTF-8` of the fresh Linux clone is the slow part of the M2 load:
+4.9 s on one thread, 1.5–2.5 s on 4–8 (280–940 MB/s from disk, not cache);
+the flagship, cached, reads at 7 GB/s in 14 ms.
+
+**Views (CPU-chosen lines, flat quads, 800×500, no LOD)**, min / median ms:
+
+| corpus, view | slots | layout GPU | draw GPU | CPU list + submit | frame wall |
+|---|---|---|---|---|---|
+| Linux page (60 lines) | 1,380 | 0.113 | 0.084 | 0.09 / 0.11 | 0.48 / 0.49 |
+| Linux overview (2,000 × 50) | 2.51 M | 2.79 / 2.82 | 24.8 / 25.4 | 1.15 / 1.19 | 28.2 / 28.9 |
+| Linux worst (1,000 longest, 2 KiB segments) | 1.06 M | 1.53 / 3.31 | 10.1 / 14.8 | 0.19 | 12.2 / 18.8 |
+| Linux random 100 k lines | 2.58 M | 1.86 / 2.21 | 21.3 / 24.2 | 0.78 / 0.82 | 23.7 / 29.0 |
+| flagship page (60 JS lines) | 15,234 | 1.14 / 1.17 | 0.19 / 0.21 | 0.08 / 0.10 | 1.62 / 1.76 |
+| flagship overview | 3.00 M | 1.72 / 1.78 | 18.2 | 0.60 / 0.62 | 20.6 / 20.7 |
+| flagship worst (1,000 longest) | 4.11 M | 2.92 / 3.06 | 36.9 | 0.21 / 0.24 | 40.6 |
+| flagship random 100 k lines | 5.83 M | 2.02 / 2.09 | 35.6 | 0.74 / 0.85 | 38.4 / 38.6 |
+
+The flagship's worst view, layout only, by segment size: **64 KiB segments
+(14 minified lines as single invocations) 31.4 / 31.8 ms; 2 KiB 3.68 / 3.88;
+512 B 4.04 / 8.07** — on the M2 the segment seed is not a refinement, it is
+the difference between 31 ms and 4. Every readback check passed on Metal
+(worst at 64 KiB / 2 KiB / 512 B, random 100 k, Linux worst and random: all
+slots bit-equal, x bits and colour included); every pick check passed (CPU
+pick 0.09 ms per 1,000 probes; GPU pick 0.5–1.7 ms per 1,000 in one dispatch,
+0.24–0.27 ms submit-to-poll for one). A fixed ~0.4–0.8 ms of submit-to-poll
+sits under every M2 frame (the page view's wall is 0.48 ms around 0.2 ms of
+GPU work): Metal's command-buffer round trip, the floor for any design.
+
+**GPU cull cameras (LOD 1 px), 800×500**, min ms:
+
+| corpus, camera | files / backdrops | visible lines | slots | cull A / prefix / B / final | layout | draw | CPU | wall |
+|---|---|---|---|---|---|---|---|---|
+| Linux page (one row = 8 px) | 1 / 0 | 64 | 1,509 | 0.056 / 0.096 / 0.026 / 0.007 | 0.119 | 0.091 | 0.21 | 1.02 |
+| Linux overview (0.045 px) | 0 / 2,782 | 0 | 0 | 0.059 / 0.096 / 0.008 / 0.007 | 0.008 | 0.111 | 0.20 | 0.95 |
+| Linux zoomout (0.014 px) | 0 / 20,636 | 0 | 0 | 0.066 / 0.096 / 0.008 / 0.007 | 0.008 | 0.489 | 0.21 | 1.35 |
+| Linux far (0.006 px) | 0 / 74,319 | 0 | 0 | 0.075 / 0.096 / 0.008 / 0.007 | 0.008 | 1.519 | 0.20 | 2.47 |
+| flagship page (3.2 px) | 5 / 0 | 640 | 220,049 | 0.006 / 0.045 / 0.024 / 0.004 | 1.31 | 1.89 | 0.19 | 4.04 |
+| flagship overview / far | 0 / 2 ; 0 / 1,306 | 0 | 0 | ~0.06–0.12 total | 0.004–0.008 | 0.03 / 0.08 | 0.18–0.19 | 0.78–0.80 |
+
+Cull check PASS at every camera on Metal (the GPU's visible set equals a CPU
+frustum test as a set). With LOD on, the M2 frame for any zoomed-out view is
+the backdrop draw plus the fixed round trip — 1–2.5 ms at Linux scale with
+74 k backdrop quads — and a reading view is about a millisecond. The 2,782 /
+20,636 / 74,319-backdrop rows are also the honest answer to "what does the
+whole tree cost per frame": the draw of one quad per file.
+
+### 3. Real text: Slug shading, resident atlas, emoji sequences on the GPU (this box, measured)
+
+`jit-text` draws the kernel's `DerivedSlot`s with a verbatim copy of
+`glyph_field_derived.wgsl` and the real atlas (82,239 curves 2.5 MiB, glyph
+map 160 KiB, 9,427 advances, the 361 MiB emoji sheet with mips, decoded and
+uploaded in ~86 ms here / 136 ms on the M2), depth and blend state from
+`field_core.rs`, reverse-Z perspective camera, 1600×1000.
+
+**Correctness first.** `--check` links `glyph3d-native` as a library and holds
+every slot's glyph id, advance bits, x bits and wrap segment to HyperLayout's
+own answer: **44 of 44 PASS** over `g-cluster-repo/`, `emoji-corpus-small.txt`,
+`emoji-view.txt`, `cubecl-fork/clusters.txt` (39,595 slots), `overflow-leads.txt`
+and `g-pick-repo/` (`wide.txt` 396,531 slots with intra-line cuts; `empty.rs`
+0), each × {wrap 0, wrap 100 back} × {lookup A, lookup B}. A deliberate fault
+(FE0F left in the sequence key) reddens 8 of them (`#️⃣` → `#`), so the check
+can fail. **The same 44 of 44 PASS on the M2 under Metal** (run as a separate
+job; `wide.txt` 396,531 slots, `clusters.txt` 39,595), so the kernel's answer
+is the CPU's on both rasterizers — the property the pixel gates could never
+claim across vendors, held here at the slot level. Emoji sequences — ZWJ families, flags, keycaps, skin tones, the
+keycap-base guard on the ASCII fast path — run serially per segment on the
+GPU, ported from `char_resolve.rs`. Bit-equal x without f64: every atlas
+advance is 0, 1 or 2 cells (asserted at load), so the f64 sum of f32 advances
+is exact and `f32(cells) × cell_adv` rounds identically.
+
+**Lookup variants, resident bytes.** A, the trie as shipped: index 17,408 +
+packed blocks 39,936 + head bitmap 139,268 + sequence section 183,304 =
+**380 KB**. B, Ivan's shape: direct 65,536-entry BMP table 262,144 + astral
+hash 32,768 + sequence-key hash 131,072 + sequence section = **609 KB**. Both
+pack one u32 per entry (glyph | cells << 16 | starts-a-sequence); A is two
+dependent loads, B one. Either is trivially resident.
+
+| view (Linux) | slots | px/em | kernel A | kernel B | Slug draw | flat draw | real-text delta |
+|---|---|---|---|---|---|---|---|
+| page | 1,326 | 12.84 | 0.030 | 0.030 | 0.017 | 0.004 | 0.013 |
+| overview | 2,480,612 | 0.44 | 0.314 / 0.327 | 0.314 / 0.318 | 1.23 | 1.20 | 0.026 |
+| worst, 2 KiB segments | 1,059,948 | 0.77 | 0.780 | 0.781 | 0.504 | 0.503 | 0.002 |
+| worst, 512 B segments | 1,059,948 | 0.77 | 0.215 | 0.215 | 0.561 | 0.522 | 0.039 |
+
+Binding the emoji sheet versus a 1-texel stand-in: no measurable difference on
+any view. On plain text the two lookups tie exactly; on emoji-heavy input they
+part: `emoji-corpus-large.txt` (9,538 slots) A 0.79 vs **B 0.30 ms**, its page
+A 0.60 vs B 0.27, `g-cluster-repo` A 0.165 vs B 0.066. The trie's cost is not
+its two loads but the per-probe binary search over 4,166 sequences; B's hashed
+sequence keys remove it. So: Ivan's O(1) shape is right for sequences and a
+wash for codepoints, at +230 KB.
+
+### 4. Colour and per-glyph attributes by byte range, slots transient (this box, measured)
+
+Design, in `jit-layout`: a global span table of 8 B entries
+`{start, len:24 | palette:8}` with `span_base / span_count` per item and a
+4 B per-line index of the first span that can cover the line; the kernel
+walks spans and bytes together (current span in registers, next prefetched; a
+continuation segment binary-searches once), so colouring is O(bytes + spans in
+the line). Per item a **representation**: none / spans / dense colour / dense
+colour + transform. Dense files carry a 4 B colour per glyph and optionally an
+8 B f16 transform (dx, dy, dz, scale), indexed by the glyph's ordinal in the
+file — the line table's glyph prefix plus the column — so the "deranged 1:1"
+file pays today's per-glyph price and nobody else does; the kernel branches
+once per segment, and the transform rides a parallel transient stream the
+draw reads.
+
+Resident, Linux, with demo spans (the `//` heuristic plus every identifier,
+0.83 spans per 10 B — denser than real LSP tokens are likely to be):
+**114.2 M spans, 913 MB used / 1,051 MB allocated** (12.5 % + 16 slack per
+file) **+ 153 MB per-line index**; total resident 2.89 GB. The span table is
+within sight of the 2 GiB binding limit — the next scaling wall if token
+density doubles; real spans should be measured before that is a worry.
+
+| frame | layout, no spans | layout, spans |
+|---|---|---|
+| page | 0.023 | 0.028 |
+| view overview (2.5 M slots) | 0.358 / 0.394 | 0.423 / 0.496 |
+| view 1 M lines (26.5 M slots) | 1.93 / 1.96 | 2.23 / 2.61 |
+| camera overview, LOD off (50.9 M slots) | 3.79 | 4.26 |
+
+Dense cases: (a) `verifier.c` as a normal span file, 75,106 spans, 0.6 MB,
+page layout 0.028; (b) `verifier.c` fully dense, colour + transform, 635,781 ×
+12 B = **7.6 MB**, page layout **0.039** (vs 0.028 spans, 0.023 none); (c)
+camera overview with **700 of the 2,782 in-frame files dense** (17.2 M glyphs,
+**207 MB**): **5.52 / 5.54 ms** vs 4.26 spans-only; colour-only dense 69 MB,
+4.35 / 5.57. Edit cost: `verifier.c` spans rewritten in place (75,106 → 67,714,
+within its slack) 0.14–0.60 ms CPU for 21,550 line indices + 0.06–0.16 ms
+`write_buffer`; the dense array (7.6 MB) 9–11 ms CPU to regenerate + 0.6 ms
+upload; a span set that outgrows its slack is appended and remapped, the old
+range becomes a hole, nothing compacts. **Picking by (file, byte) with no
+per-glyph storage: PASS** — a CPU function and a GPU micro-kernel (binary
+search on `byte_start` for the line, the covering segment, a count from the
+segment start) agree on 1,000 random probes at every camera, including 219
+probes into dense files and the 2.1 M-segment far frame; the read-back slot
+carries the probe's item, row and glyph. Layout with colour and transforms:
+bit-exact against the whole-line CPU fold before and after the edits.
+
+### 5. Explicit culling (this box, measured)
+
+**What the earlier per-frame numbers assumed, plainly:** the visible list was
+*chosen* on the CPU from a view definition — a line window, or 2,000 files ×
+50 lines — with no frustum test. "What's displayed" was picked, not culled.
+Those `--view` paths still exist and are labelled that way in the tool.
+
+Now, `--cull gpu` with `--camera page | overview | zoomout | far | dense`:
+every file sits on a fixed shelf (821 columns, ~98 k × 98 k world units) with
+a resident 32 B box; a perspective camera looks down; four passes — per-file
+box test, a one-workgroup prefix, per-line box test dispatched indirectly,
+finalize — then indirect layout and indirect draw, **no readback on the frame
+path** (the counter readback used for the tables is timed apart: 0.03–0.17 ms).
+Files whose rows project under `--lod-px` (default 1) become one backdrop quad
+and are not laid out. Segment and slot order is set by atomics and is **not
+stable** between frames.
+
+| camera, LOD 1 px | cull | files / backdrops | visible lines | slots | cull A / B | layout | draw | CPU | wall |
+|---|---|---|---|---|---|---|---|---|---|
+| page | gpu | 1 / 0 | 64 | 1,509 | 0.003 / 0.007 | 0.025 | 0.002 | 0.09 / 0.13 | 0.13 / 0.15 |
+| overview | gpu | 0 / 2,782 | 0 | 0 | 0.004 / 0.006 | – | 0.004 | 0.09 | 0.11 |
+| zoomout | gpu | 0 / 20,498 | 0 | 0 | 0.003 / 0.005 | – | 0.011 | 0.05 | 0.11 |
+| far | gpu | 0 / 74,313 | 0 | 0 | 0.004 / 0.005 | – | 0.038 | 0.04 | 0.13 |
+| far | cpu | 0 / 74,313 | 0 | 0 | 0.40 (CPU) | – | 0.038 | 0.43 | 0.09 |
+| dense (rows 1.5 px) | gpu | 7 / 0 | 1,996 | 54,282 | 0.003 / 0.008 | 0.033 | 0.028 | 0.04 | 0.16 |
+| dense, 2560×1440 | gpu | 51 / 0 | 16,184 | 458,322 | 0.003 / 0.011 | 0.046 | 0.227 | 0.09 | 0.39 / 0.40 |
+
+With honest LOD, 2,000 files is sub-pixel at any resolution (one row is
+0.045 px at 800×500, still sub-pixel at 2560×1440), so overview, zoomout and
+far lay out nothing and cost under 0.05 ms of GPU. The LOD-off rows are the
+worst case — every line in the frustum laid out and drawn as 1 px quads:
+
+| camera, LOD off | cull | visible lines | slot demand | cull | layout | draw | CPU | wall |
+|---|---|---|---|---|---|---|---|---|
+| overview (2,782 files) | cpu | 1,867,742 | 50.9 M | 15.6 (CPU) | 3.75 | 24.96 | 30.0 / 31.0 | 29.3 |
+| overview | gpu | 1,867,742 | 50.9 M | B 0.28 | 3.79 | 24.96 | **0.11 / 0.21** | 29.6 |
+| zoomout (20,498 files) | gpu | 12.9 M | 476 M (10.8 M lines dropped at the cap) | B 2.08 | 5.4 | 32.9 | 0.17 | 41.0 |
+| far (74,313 files) | cpu | 38.2 M | 1.33 G | 291 (CPU) | 4.9 | 37.1 | 570 / 632 | 43.6 |
+| far | gpu | 38.2 M | 1.33 G (35.9 M dropped) | B 5.99 | 4.8 | 33.0 | 0.21 / 0.25 | 45.2 |
+
+GPU culling removes the CPU from the frame (31 ms → 0.1–0.2 at the overview;
+290 ms of single-threaded CPU cull at far → 6 ms of cull B). With LOD off the
+frame is the **draw** of 50–67 M sub-pixel quads (25–33 ms), not cull or
+layout. The caps (64 M slots = 1.34 GB, 4 M segments) bind at zoomout and far;
+a line that does not fit is dropped in atomic order, so the picture has random
+holes — the cap is a safety net, LOD is the policy. **Cull check PASS**: at the
+overview with LOD off, the GPU's visible set equals a CPU frustum test as a set
+(2,782 files, 1,867,742 lines, 50,900,152 slots); page and dense pass as full
+sets; zoomout and far, where the cap binds, pass on counts.
+
+### 6. What still does not hold, and what needs Ivan
+
+Holds now, on both machines: layout from resident bytes bit-equal to
+HyperLayout including emoji sequences; real Slug text at 0.01–0.04 ms over flat
+quads here and 0.24–8 ms on the M2 depending on how many sub-pixel glyphs a
+view draws; colour and dense attributes by (file, byte) with transient slots;
+picking by (file, byte) with no per-glyph storage; culling on the GPU with no
+readback. Does not hold yet, or needs a decision:
+
+1. **The M2's resident upload (1.0–1.1 s for 1.68 GB) and first-touch walk
+   (2.3 s)** are the load. The upload is a wgpu Metal write path the renderer
+   already avoids for slots (`create_mapped_slot_buffer`): Pass 1 should write
+   the line table into a mapped buffer and the byte buffer should be the
+   mapped read target itself. **Inferred**, not measured: that takes the upload
+   to ~0. The walk is file I/O; a persistent corpus cache or mmap is the lever.
+2. **Zoomed-out views on the M2 draw-bound at 14–27 ms** for 2.5–4 M sub-pixel
+   glyphs. LOD backdrops (§5) make those views free, and the renderer already
+   has per-file LOD; the open question is policy — how much real text Ivan
+   wants at the zoom levels where glyphs are a fraction of a pixel. Decision.
+3. **Small visible sets with long lines are latency-bound on the M2** (63
+   segments → 1.4 ms kernel). Shorter segments (512 B: 3.6× faster at the
+   worst view here) fix it; a seed table per 512 B of every line is ~0.1 % of
+   the bytes. Not yet measured on the M2.
+4. **Span table size at Linux scale** with demo density: 1.05 GB + 153 MB. Real
+   LSP spans are probably sparser; dense files add 4–12 B/glyph each. Policy
+   needed: which producers get spans, which files go dense, and whether the
+   load-time syntax heuristic survives as a span *producer* (it can: it is
+   cheap and would keep today's colouring until LSP spans arrive). Decision.
+5. **Unstable slot order from atomic culling.** Picking and selection are
+   addressed by (file, byte) and do not care, but anything that caches by slot
+   index between frames (the Derived field's in-place colour writes, the
+   selection mask by slot range) has to be re-keyed. Known, designed around in
+   §4, not yet implemented in the renderer.
+6. **Pagination** (every repo file is paged in the renderer) is modelled in no
+   prototype; the per-item page frame is a pure function of row/col and the
+   fold already owns it (`layout_hyper/page.rs`), so this is porting, not
+   research — but it is on the list.
+7. **Noise.** The M2 ran at load 3–15 during these jobs; the per-frame medians
+   agree with their mins to within the A/A floor except where noted, but the
+   headline M2 numbers should be re-taken idle before anyone quotes them.
+8. **`glyph3d-native` does not build with `default-features = false`**
+   (`windowed/state.rs` uses `egui` ungated); `jit-text` pins `egui-ui`.
+   Worth a small fix on main.
+
+Frames from this round: `experiments/gpu-direction/linux-text-page.png` (real
+Slug text, 60 lines of `verifier.c`) and `linux-text-overview.png` (2,000
+files at 0.44 px/em, greeked by the shader's own rule). M2 frames are in the
+M2's `out/gpu-research/` and were not copied back.
