@@ -439,3 +439,13 @@ moved box is in view (≤ 8 px); mutation `visible-moved-item-box-stale`
 picture, then `GLYPH_CULL_DEBUG=1` offscreen with the pose from "copy pose"
 and the same `move-group`.
 
+**On the M2 (metal-apple, 2026-10-10, d88b7e3 through the remote job):**
+the full battery green there too (15 of 15, 320 tests at floor 320, every
+golden byte-equal plain and under `--field-mode derived`); the crate's GPU
+tests with the wash witness and the moved-item witness green; the C28 wash
+frame's bottom band spans 786–818 px (32 px — the glyph bar's width on
+this box, where the 2x bound drew ≈ 58); the C29 counters identical to
+this box's (`items 2 visible, 3 culled of 5 | lines 309 candidate: 111
+glyph`). Both rasterizers agree on everything numeric here, as they do on
+every tier.
+
