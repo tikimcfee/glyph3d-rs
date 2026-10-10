@@ -197,6 +197,14 @@ fn compute_cluster_tables(
 }
 
 impl TrieTable {
+    /// Whether `glyph_id` draws from the emoji sheet — the test both layout
+    /// passes use for an item's `has_emoji` (Pass 1 to plan, Pass 2 to fold
+    /// its tint), so the two cannot disagree about which files hold emoji.
+    #[inline(always)]
+    pub fn is_emoji_glyph(&self, glyph_id: u32) -> bool {
+        self.emoji_cell.get(glyph_id as usize).is_some_and(Option::is_some)
+    }
+
     /// Parse glyphs.bin (primary metrics) + codepoints.bin (the trie) from an
     /// atlas directory. Pure CPU — no textures.
     pub fn load(dir: &Path) -> Self {

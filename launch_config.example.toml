@@ -41,7 +41,7 @@ cluster_mode = "cluster"
 # Syntax color mode on repo load: "syntax" (CPU lexer) or "flat" (geometry only)
 color_mode = "flat"
 
-# Layout engine backend: "hyper" (parallel CPU Rayon, default) or "cubecl" (GPU compute)
+# Layout engine backend: "hyper" (parallel CPU Rayon, default), "direct" or "batch"
 repo_engine = "hyper"
 
 # Glyph field render mode: "derived" (compact 20B slots, zero-copy) or "instanced" (32B slots).

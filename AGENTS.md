@@ -63,8 +63,12 @@ buffers where the GPU allows it and staging otherwise.
   **~226 ms** total visual init in `--color-mode syntax` on Apple Silicon Metal.
   Benchmark tools read its location from `GLYPH_FLAGSHIP_REPO`; nothing in the
   tree hardcodes where a checkout lives.
-- CubeCL: GPU compute layout kernels (`--repo-engine cubecl`) sit behind the
-  `cubecl` Cargo feature, which is ON by default (`native/Cargo.toml`).
+- CubeCL, the GPU compute-layout engine (`--repo-engine cubecl`), was RETIRED on
+  2026-10-09. Its kernels ran at memory speed, but its upload, shader compile and
+  launch overhead never beat HyperLayout, and HyperLayout's host staging recovers
+  its one discrete-GPU advantage. The measurements and the case are in
+  `out/GPU-DIRECTION-2026-10-09.md`; the GPU's next role (laying out only the
+  visible lines from resident bytes) is being prototyped under `experiments/`.
 - ByteSpan token painting: `ByteSpan` and `Paint::ByteSpans` provide byte-range semantic
   token coloring directly from AST/LSP analyses into mapped unified memory.
 - Modularized renderer: `glyph_scene.rs` is factored into `setup.rs`, `pipelines.rs`
@@ -73,7 +77,8 @@ buffers where the GPU allows it and staging otherwise.
   render mode, chosen with `--field-mode`; the scene never touches slot bytes).
 
 **The dependency graph is declared in `build.toml`** (artifact, input globs,
-build command, class) and executed by `glyph` (`glyph/src/main.rs`). The baseline PNGs are class **golden**: verified,
+build command, class) and executed by `glyph` (`glyph/src/`: `manifest.rs` the
+types, `gates.rs`, `golden.rs`, `prove.rs`, `products.rs`, `main.rs` the CLI). The baseline PNGs are class **golden**: verified,
 never built — the runner refuses. Red on any compiler warning, test failure, gate mismatch,
 or mutation survival.
 
@@ -148,14 +153,14 @@ property of the runner, so it applies just as much to tooling work —
 `native/AGENTS.md` has the worktree setup commands.
 
 Everything the tool does is declared in `build.toml` and typed in
-`glyph/src/main.rs`. A key the code does not know is a parse error; a field the
+`glyph/src/manifest.rs`. A key the code does not know is a parse error; a field the
 code does not read is a `dead_code` warning against a zero-warning gate. That is
 deliberate: this repo shipped a manifest whose `needs` edges were declared and
 read by nothing at all.
 
 ## What the checks actually do
 
-Sixteen gates (2026-10-09), in `build.toml` order. For each: what it compares, what makes it
+Fourteen gates (2026-10-09), in `build.toml` order. For each: what it compares, what makes it
 red, and **what it cannot see**. The last is the part worth reading. A check is
 a claim about a counterfactual, and a check whose blind spot you don't know is
 a green you can't price. (Gates were once numbered positions in one shell
@@ -310,7 +315,7 @@ fails if no query ran, the reference if nothing was in domain. Red on any lane
 that leaves its tier. `phantom-row` and `advance-zeroed` prove it reddens
 through the fold, `fixture-deleted` that a shrunken corpus is refused. Blind
 to the engines that SHIP — these are `fold.rs`/`scan.rs`/`bake.rs`/`text.rs`,
-not HyperLayout or CubeCL — to the atlas trie (each fixture carries its own
+not HyperLayout — to the atlas trie (each fixture carries its own
 synthetic one), and silently to the 22 fixtures outside text.rs's domain. The
 parse is checked only through the lanes computed from it: the second loader
 it was once diffed against (Mojo) is retired.
@@ -422,7 +427,7 @@ modes, diffed against a fresh recording HyperLayout at the seam: placements,
 instances, and records where both sides have them (`direct` has none and its
 PASS line says `0 records`). Each refuses a verify over zero items — before
 2026-09-07 a missing corpus printed `PASS: 0 items` and exited 0. Read the
-pair honestly: **every `--repo-engine` but `cubecl` constructs the same
+pair honestly: **every `--repo-engine` constructs the same
 HyperLayout**, so this is HyperLayout against HyperLayout. Under
 `--repo-scan-only` (no GPU) the sides differ only by `hyper`'s background
 prefetch of Pass 1, and for `direct` not at all, so these catch
@@ -434,27 +439,6 @@ one driver (`pass1_over_chunks`) and differ only in how the chunk list is
 built (before it, only in a segment-advance table g-pick-repo never read:
 doubling it stayed green, measured 2026-10-09), and nothing separates
 `direct` from its reference without a device.
-
-**cubecl-chain** and **cubecl-fork** (`tools/check-cubecl.sh chain|fork`,
-re-gated 2026-10-09; both **green** since the HyperLayout C10 fix). The chain against the CPU scan reference
-(`scan.rs`) over five fixtures — counts/rows exact, fold>0 X bit-exact,
-positions at the eps tier, emitted records tier-diffed; and the full
-from-bytes chain against HyperLayout over the IMMUTABLE `cubecl-fork` corpus
-in STRICT mode — the 32 B slot stream field-equal, placements bit-equal,
-tint pairs equal, the m>=3 / seg>=3 buckets and cluster candidates proven
-exercised. Both were red when re-gated (C10). The chain's `cluster-flags`
-failure (since 26595fb, 2026-10-06, bisected) was the INSTRUMENT: that commit
-moved "committed cluster head" into a device-only flag this driver never
-uploaded; fixed in c5ef78a, and `emitter-ordinal-zeroed` proves the gate. The
-fork failed from the day HyperLayout became its reference (2026-09-30) to
-the HyperLayout keycap fix (2026-10-09: 314,405 of 314,686 slots, 708,529
-lane words, then 0): the chain had the keycaps right and HyperLayout did not,
-which hyper-oracle (oracle-backed) established before the fix, so this green
-is now agreement with the oracle at one remove. The fork still has NO
-mutation (all the 2026-09-30 targets left its counts unchanged when checked
-by hand while red), so it is uncovered in prove. The script's second fork pass sets
-`GLYPH_RECORD_CHUNK`, which nothing has read since the records-mode
-retirement (d46a6c3): it repeats the first pass.
 
 **pixel-ab.** The golden views re-rendered and byte-compared against
 `out/tooling-ab/baseline/<key>/` — `cargo glyph graph` lists them, and the count
@@ -590,8 +574,8 @@ it. **Do not tidy that file away.** Ask what else these frames cannot see —
 and a second, proven one: **the far-LOD backdrop tint never fires in any
 golden view** — the cameras keep all five `g-pick-repo` files near enough that
 no segment substitutes its backdrop quad, so the seg_tint lane is
-pixel-invisible. Its byte-level fence lived in the cubecl-fork gate, which is
-retired, so that lane is currently watched by nothing.
+pixel-invisible. Its byte-level fence lived in the cubecl-fork gate, retired
+with CubeCL (2026-10-09), so that lane is currently watched by nothing.
 
 ### Retired 2026-09-30, re-gated 2026-10-09
 
@@ -599,8 +583,10 @@ retired, so that lane is currently watched by nothing.
 26 mutations. Three served only the retired engine (engine-suites,
 engine-check, and its Mojo halves). Four checked pure-Rust paths whose
 instruments kept shipping and kept passing, run by nothing for nine days;
-they are back above as reference-port, repo-verify(-direct) and
-cubecl-chain/-fork, and the check that never existed — HyperLayout against
+they came back as reference-port, repo-verify(-direct) and
+cubecl-chain/-fork (the last two retired again on 2026-10-09 with the CubeCL
+engine itself; their corpus, `native/fixtures/cubecl-fork/`, stays, read by
+hyper-oracle), and the check that never existed — HyperLayout against
 the oracle — arrived with them, red. In those nine days HyperLayout became the
 only engine, and nothing compared it to anything but itself.
 
@@ -625,8 +611,7 @@ and the union is not:
 - **The atlas trie's VALUES.** Every oracle comparison runs on the fixtures'
   synthetic tries; hyper-oracle runs both sides on the atlas trie, so a wrong
   advance in `codepoints.bin` moves both sides together.
-- **Nothing executes the benches.** `tools/bench_hyper.py` and the
-  `--cubecl-chain-bench` instrument are run by hand.
+- **Nothing executes the benches.** `tools/bench_hyper.py` is run by hand.
 - **`tools/verify_atlas.py`, `preview_glyphs.py`, `repro_pick_oblique.py`** are
   manual tools, run by **zero** checks (atlas-tables covers the lookup tables'
   consistency and pins, nothing of the curves or glyph map). So the atlas bins' structural and semantic
@@ -697,7 +682,7 @@ the serial-fold-versus-scan comparison green, because both forms call
 | `native/fixtures/chunk-cut.txt` | IMMUTABLE | hyper-oracle's only input built for the intra-line chunk-cut classes (C15): a sequence across each 64 KiB cut target, non-ASCII advances before each cut, a continuation wider than every ASCII row past the first page. Its cut positions are planned against the 64 KiB threshold and the cut rule, so changing either (or the file) can move a target off its sequence and silently weaken the gate — re-check that each mutation in its `why` still reddens |
 | `native/fixtures/highlight-alpha.tsv` | IMMUTABLE | the input to `repo-highlight.png`; DELIBERATELY out of byte order (the `1` span after the string span) — sorting it removes the frame's only witness for `sidecar-runs-unsorted` |
 | `native/fixtures/chunk-cut-paint.txt` | IMMUTABLE | hyper-oracle's paint-tier input (C17): a `return` across every intra-line cut, one pure-ASCII line and one not, so a chunk that coloured only its own share of a line is seen at the chunk's END; the only witness `hyper-cut-tail-own-share` has |
-| `native/fixtures/cubecl-fork/` | IMMUTABLE | the retired cubecl-fork check's standing corpus — the only committed input exercising paginate's m >= 3 / segment >= 3 classes, the cluster classes at wrap/page boundaries, and the empty-item placement class (`clusters.txt` + `empty.txt`); kept for re-gating. Editing it re-hollows that check silently |
+| `native/fixtures/cubecl-fork/` | IMMUTABLE | named for the retired CubeCL fork check, now read by hyper-oracle (both runs) — the only committed input exercising paginate's m >= 3 / segment >= 3 classes, the cluster classes at wrap/page boundaries, and the empty-item placement class (`clusters.txt` + `empty.txt`). Editing it hollows hyper-oracle's coverage of those classes silently |
 | `out/tooling-ab/baseline/<key>/` | tracked pixel oracle, one set per rasterizer; **golden** in build.toml | changes only on purpose, with a note saying why; the runner refuses to regenerate it. A new host adopts its own set by hand (the gate prints how); it never edits another's |
 | `integration/egui/` | vendored reference | never compiled; the real dependency is from crates.io |
 
@@ -722,7 +707,7 @@ the JS oracle this engine was ported from, now retired: `tools/vendor/ref` and
 deliberately forked. Edits there are invisible to every check here, so they
 cannot be verified and cannot be trusted.
 
-Dependency pins (wgpu 30, winit 0.30, glam 0.33, egui 0.36, cubecl =0.11.0-pre.4):
+Dependency pins (wgpu 30, winit 0.30, glam 0.33, egui 0.36):
 no bump without its own pass. The past bumps were done as multi-part
 work and their reports (`out/STAGE_H_REPORT.md`, `STAGE_I_REPORT.md`) are worth
 reading — but they agree on less than they look like they do, each having

@@ -4,7 +4,7 @@ use crate::atlas::TrieTable;
 use crate::fold::{rows_for_line, wrap_row_of, wrap_segment_of};
 use crate::layout::{ByteSpan, GlyphRecord, ItemParams, DEFAULT_COLOR_PACKED};
 use crate::text::fu_to_world;
-use super::char_resolve::resolve_byte_char;
+use super::char_resolve::{resolve_byte_char, ResolveCtx};
 
 /// Deterministic single-item record generation in pure Rust, bit-identical to the layout pipeline.
 pub fn rederive_item_records(
@@ -15,6 +15,7 @@ pub fn rederive_item_records(
     let em_height_fu = trie.metrics.em_height_fu;
     let cluster = super::char_resolve::clusters(p);
     let bitmap_adv = fu_to_world(trie.bitmap_advance_fu, em_height_fu);
+    let rctx = ResolveCtx { trie, bitmap_adv, em_height_fu, cluster };
 
     let fold_unit = if p.wrap_width > 0 {
         p.wrap_width as i64
@@ -32,7 +33,7 @@ pub fn rederive_item_records(
         let mut trailer_until = 0usize;
         let mut pos = 0usize;
         while pos < bytes.len() {
-            let r = match resolve_byte_char(bytes, pos, trie, bitmap_adv, em_height_fu, cluster, &mut trailer_until) {
+            let r = match resolve_byte_char(bytes, pos, rctx, &mut trailer_until) {
                 Some(r) => r,
                 None => {
                     pos += 1;
@@ -73,7 +74,7 @@ pub fn rederive_item_records(
 
     let mut pos = 0usize;
     while pos < bytes.len() {
-        let r = match resolve_byte_char(bytes, pos, trie, bitmap_adv, em_height_fu, cluster, &mut trailer_until) {
+        let r = match resolve_byte_char(bytes, pos, rctx, &mut trailer_until) {
             Some(r) => r,
             None => {
                 pos += 1;
@@ -155,13 +156,14 @@ pub fn resolve_spans_to_slot_colors(
     let cluster = cluster_mode == crate::fold::ClusterMode::Cluster;
     let em_height_fu = trie.metrics.em_height_fu;
     let bitmap_adv = fu_to_world(trie.bitmap_advance_fu, em_height_fu);
+    let rctx = ResolveCtx { trie, bitmap_adv, em_height_fu, cluster };
     let mut colors = Vec::new();
     let mut pos = 0usize;
     let mut span_idx = 0usize;
     let mut trailer_until = 0usize;
 
     while pos < bytes.len() {
-        let r = match resolve_byte_char(bytes, pos, trie, bitmap_adv, em_height_fu, cluster, &mut trailer_until) {
+        let r = match resolve_byte_char(bytes, pos, rctx, &mut trailer_until) {
             Some(r) => r,
             None => {
                 pos += 1;

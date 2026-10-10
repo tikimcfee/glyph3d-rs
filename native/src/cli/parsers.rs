@@ -25,17 +25,9 @@ pub fn parse_z_wrap_spacing(s: &str) -> Result<f64, String> {
     Ok(v)
 }
 
-/// Parse strategy string into `Strategy`, with compile-time cubecl feature guard.
+/// Parse strategy string into `Strategy`.
 pub fn parse_strategy(s: &str) -> crate::repo::Strategy {
-    let strategy: crate::repo::Strategy = s
-        .parse()
-        .unwrap_or_else(|e| panic!("--repo-engine: {e} (clap should have refused it)"));
-    #[cfg(not(feature = "cubecl"))]
-    if strategy == crate::repo::Strategy::Cubecl {
-        eprintln!("error: --repo-engine cubecl was not compiled into this binary (rebuild with `cargo run --features cubecl`)");
-        std::process::exit(1);
-    }
-    strategy
+    s.parse().unwrap_or_else(|e| panic!("--repo-engine: {e} (clap should have refused it)"))
 }
 
 /// `--cluster-mode` -> the layout parameter. Delegates to ClusterMode's FromStr.

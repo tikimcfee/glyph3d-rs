@@ -1,8 +1,8 @@
 //! hyper_oracle.rs — HyperLayout held to an oracle-backed reference.
 //!
 //! `HyperLayout` (`layout_hyper*`) is the production layout engine: every
-//! `--load-repo` runs it, whatever `--repo-engine` says, unless that says
-//! `cubecl`. Before this instrument nothing compared it to the JS oracle. The
+//! `--load-repo` runs it, whatever `--repo-engine` says. Before this
+//! instrument nothing compared it to the JS oracle. The
 //! `--fixture-*` instruments hold `fold.rs`, `scan.rs`, `bake.rs` and
 //! `text.rs` to the oracle's recorded answers; `--repo-verify` holds
 //! HyperLayout to HyperLayout. A defect HyperLayout carries alone was
@@ -149,7 +149,7 @@ fn fold_item_of(p: &ItemParams, len: usize) -> fold::Item {
 }
 
 fn repo_params(cluster_mode: ClusterMode) -> crate::repo::RepoParams {
-    // The renderer's default shape, as cubecl-repo-check states it.
+    // The renderer's default repo shape.
     crate::repo::RepoParams {
         wrap_mode: fold::WrapMode::Back,
         cluster_mode,
