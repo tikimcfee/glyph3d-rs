@@ -695,24 +695,49 @@ pub(crate) fn pass1_over_chunks_with_lines(
     }
 
     let segment_bytes = line_segment_bytes.unwrap_or(SEGMENT_BYTES).max(1);
-    let (chunk_prepasses, chunk_lines): (Vec<ChunkPrepass>, Vec<ChunkLines>) = chunks
-        .par_iter()
-        .map(|chunk| {
-            let mut lines = ChunkLines::default();
-            let cp = pass1_prepass_chunk_bytes(
-                chunk.bytes,
-                &file_params[chunk.item_index],
-                trie,
-                bitmap_adv,
-                em_height_fu,
-                &global_seg_adv_table,
-                chunk_continues_line(item_bytes[chunk.item_index], chunk.byte_offset),
-                line_segment_bytes.map(|_| &mut lines),
-                segment_bytes,
-            );
-            (cp, lines)
-        })
-        .unzip();
+    // Two collects, not one with a tuple: a load that wants no table keeps
+    // the indexed single-allocation collect it always had (an `unzip` over
+    // the parallel iterator folds through a list and cost the M2 a measurable
+    // slice of an 11 ms Pass 1, 2026-10-10).
+    let (chunk_prepasses, chunk_lines): (Vec<ChunkPrepass>, Vec<ChunkLines>) = if line_segment_bytes.is_none() {
+        let cps: Vec<ChunkPrepass> = chunks
+            .par_iter()
+            .map(|chunk| {
+                pass1_prepass_chunk_bytes(
+                    chunk.bytes,
+                    &file_params[chunk.item_index],
+                    trie,
+                    bitmap_adv,
+                    em_height_fu,
+                    &global_seg_adv_table,
+                    chunk_continues_line(item_bytes[chunk.item_index], chunk.byte_offset),
+                    None,
+                    segment_bytes,
+                )
+            })
+            .collect();
+        (cps, Vec::new())
+    } else {
+        let both: Vec<(ChunkPrepass, ChunkLines)> = chunks
+            .par_iter()
+            .map(|chunk| {
+                let mut lines = ChunkLines::default();
+                let cp = pass1_prepass_chunk_bytes(
+                    chunk.bytes,
+                    &file_params[chunk.item_index],
+                    trie,
+                    bitmap_adv,
+                    em_height_fu,
+                    &global_seg_adv_table,
+                    chunk_continues_line(item_bytes[chunk.item_index], chunk.byte_offset),
+                    Some(&mut lines),
+                    segment_bytes,
+                );
+                (cp, lines)
+            })
+            .collect();
+        both.into_iter().unzip()
+    };
 
     let mut agg = aggregate_chunk_prepasses(
         &chunk_prepasses,
