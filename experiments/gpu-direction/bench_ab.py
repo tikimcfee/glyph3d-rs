@@ -80,6 +80,10 @@ def main():
     ap.add_argument("--repo", required=True)
     ap.add_argument("--rounds", type=int, default=6)
     ap.add_argument("--warmup", type=int, default=1)
+    ap.add_argument("--cooldown", type=float, default=0.0,
+                    help="seconds to sleep after every run (fanless machines throttle back-to-back)")
+    ap.add_argument("--alternate", action="store_true",
+                    help="reverse the configuration order on even rounds")
     ap.add_argument("configs", nargs="+", help="name=\"args\"")
     a = ap.parse_args()
     configs = []
@@ -89,8 +93,11 @@ def main():
     print(f"bin {a.bin}\nrepo {a.repo}\nrounds {a.rounds} (warmup {a.warmup} discarded)\nloadavg before {' '.join(loadavg())}")
     results = {n: [] for n, _ in configs}
     for rnd in range(a.rounds):
-        for name, args in configs:
+        order = configs[::-1] if (a.alternate and rnd % 2 == 1) else configs
+        for name, args in order:
             r = run_once(a.bin, a.repo, args)
+            if a.cooldown > 0:
+                time.sleep(a.cooldown)
             tag = "warm" if rnd < a.warmup else "keep"
             print(f"  round {rnd} {name:<18} rc={r['rc']} backend={r.get('backend_ms', float('nan')):8.1f} ms visual={r.get('visual_ms', float('nan')):8.1f} ms wall={r['wall_ms']:8.0f} ms [{tag}]", flush=True)
             if r["rc"] != 0:
