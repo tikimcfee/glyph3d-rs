@@ -949,15 +949,17 @@ impl Frame {
         // lands before the encoder, so a later `prepare_mask` copy wins).
         queue.write_buffer(&self.mask_indirect, 0, bytemuck::cast_slice(&[6u32, 0, 0, 0, 0]));
 
-        let ts = |begin: u32, end: u32| {
+        // The cull's time spans every cull pass (the begin of the first to
+        // the end of the last, C30), the layout's its one pass.
+        let ts = |begin: Option<u32>, end: Option<u32>| {
             self.timestamps.as_ref().map(|(set, _, _)| wgpu::ComputePassTimestampWrites {
                 query_set: set,
-                beginning_of_pass_write_index: Some(begin),
-                end_of_pass_write_index: Some(end),
+                beginning_of_pass_write_index: begin,
+                end_of_pass_write_index: end,
             })
         };
         {
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("visible cull A"), timestamp_writes: ts(0, 1) });
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("visible cull A"), timestamp_writes: ts(Some(0), None) });
             pass.set_bind_group(0, &self.cull_bg, &[]);
             let [x, y, z] = plan_dispatch(resident.items_total);
             pass.set_pipeline(&self.cull_items);
@@ -967,7 +969,7 @@ impl Frame {
         }
         encoder.copy_buffer_to_buffer(&self.args, INDIRECT_CULL_B, &self.indirect, INDIRECT_CULL_B, 12);
         {
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("visible cull B"), timestamp_writes: None });
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("visible cull B"), timestamp_writes: ts(None, Some(1)) });
             pass.set_bind_group(0, &self.cull_bg, &[]);
             pass.set_pipeline(&self.cull_lines);
             pass.dispatch_workgroups_indirect(&self.indirect, INDIRECT_CULL_B);
@@ -976,7 +978,7 @@ impl Frame {
         }
         encoder.copy_buffer_to_buffer(&self.args, INDIRECT_LAYOUT, &self.indirect, INDIRECT_LAYOUT, (INDIRECT_WORDS * 4) as u64 - INDIRECT_LAYOUT);
         {
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("visible layout"), timestamp_writes: ts(2, 3) });
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("visible layout"), timestamp_writes: ts(Some(2), Some(3)) });
             pass.set_bind_group(0, &self.layout_bg, &[]);
             pass.set_pipeline(&resident.layout_pipeline);
             pass.dispatch_workgroups_indirect(&self.indirect, INDIRECT_LAYOUT);

@@ -153,7 +153,25 @@ pub(super) fn render_scene(
                 );
             }
         }
+        // C30 (2026-10-10): under GLYPH_VISIBLE_TIMING, wait for the GPU
+        // before each `prepare` so the field's stats ring lands every frame,
+        // then print its GPU cull and layout times (the F8 HUD's `gpu cull
+        // … layout …`, two frames behind). A timing instrument for offscreen
+        // runs: the wait serializes frames, so never the frame path.
+        let timing = std::env::var_os("GLYPH_VISIBLE_TIMING").is_some() && scene.field.visible().is_some();
+        if timing {
+            let _ = ctx.device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None });
+        }
         scene.field.prepare(&ctx.queue, encoder, &prepare);
+        if timing {
+            if let Some(v) = scene.field.visible() {
+                let s = v.stats();
+                println!(
+                    "VISTIME t={t:.4} cull_ms={:.4} layout_ms={:.4} lines_candidate={} lines_glyph={} slots={}",
+                    s.cull_ms, s.layout_ms, s.lines_candidate, s.lines_glyph, s.slots
+                );
+            }
+        }
         // The selection mask's content, right after `prepare` and before any
         // pass (same encoder): the field lays the selected byte range's
         // glyphs out again into its selection buffer, which the mask pass
