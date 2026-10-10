@@ -373,10 +373,29 @@ pub struct RawOps {
 }
 
 /// Whether this run looks for a personal `launch_config.toml` on its own.
-/// Screenshot runs never do: every gate that launches the binary is one, and
-/// a personal override (a color, a wrap mode) must not reach a golden view.
+/// Only an interactive run does. Screenshot runs never do, and neither does
+/// any run that checks or measures (`--repo-verify`, `--repo-scan-only`, the
+/// `--fixture-*` and `--hyper-oracle-check` instruments, `--line-table-stats`,
+/// `--gpu-key` / `--gpu-profile`, `--generate`): every gate launches the
+/// binary as one of these, and a personal override (a color, a wrap mode, a
+/// field mode) must not reach what a gate compares. Until 2026-10-10 only
+/// `--screenshot` was excluded, and a launcher-saved `field_mode = "visible"`
+/// in the checkout's `launch_config.toml` turned repo-verify-direct red
+/// (`direct` lays out no instances in visible mode).
 pub(crate) fn discovers_launch_config(cli: &Cli) -> bool {
-    cli.screenshot.is_none()
+    let checks = cli.repo_verify
+        || cli.repo_scan_only
+        || cli.gpu_key
+        || cli.gpu_profile
+        || cli.generate.is_some()
+        || !cli.fixture_reference.is_empty()
+        || !cli.fixture_trie.is_empty()
+        || !cli.fixture_fold.is_empty()
+        || !cli.fixture_scan.is_empty()
+        || !cli.fixture_bake.is_empty()
+        || !cli.hyper_oracle_check.is_empty()
+        || !cli.line_table_stats.is_empty();
+    cli.screenshot.is_none() && !checks
 }
 
 /// Build the `Cli` from clap matches, merging the launch config underneath the
