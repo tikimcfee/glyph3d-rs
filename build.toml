@@ -25,7 +25,7 @@
 # Ratchet, NOT an equality: tests are added constantly, so an exact pin would
 # redden on the most common good action in the repo. A green run whose real
 # count exceeds the floor prints a NOTE naming the value to raise it to.
-test_floor = 270
+test_floor = 271
 # Every golden view is rendered again under each of these and must match the
 # SAME baseline byte for byte (2026-10-09, C20). The Derived field renders
 # every golden frame identically to Instanced (measured on vulkan-nvidia and
@@ -849,6 +849,28 @@ op = "replace"
 find = "    if wanted.is_empty() {\n        return;\n    }"
 with = "    if !wanted.is_empty() {\n        return;\n    }"
 expect = "hyper-oracle FAIL"
+rebuild = "cargo build --release"
+
+[[mutation]]
+name = "windowed-emoji-scratch-skipped"
+gate = "cargo-test"
+why = "C22: windowed emission writes write-combined staging, so the chunks of items Pass 1 flagged has_emoji are detoured through host scratch to take their tint pairs from cached memory. Skipping the detour writes them in place and loses every emoji item's pairs. CONSUMED BY: emit_windows, via windowed_emission_matches_unwindowed (emoji-view.txt and g-cluster-repo/main.rs carry the emoji)"
+file = "native/src/layout_hyper/pass2_device.rs"
+op = "replace"
+find = "                if !inputs.prepasses[item].has_emoji {\n                    return (layout_pass2_chunk::<E>(inputs, c, dest_addr, lut, &cut_colors[c]), Vec::new());"
+with = "                if true {\n                    return (layout_pass2_chunk::<E>(inputs, c, dest_addr, lut, &cut_colors[c]), Vec::new());"
+expect = "windowed_emission_matches_unwindowed"
+rebuild = "cargo build --release"
+
+[[mutation]]
+name = "windowed-chunk-order-reversed"
+gate = "cargo-test"
+why = "C22: a window's chunk results must reach the merge in chunk order — the merge folds them per item by chunk index. Reversing a window's results hands items each other's extents and tints. CONSUMED BY: emit_windows, via windowed_emission_matches_unwindowed (chunk-cut-paint.txt is several chunks of one item)"
+file = "native/src/layout_hyper/pass2_device.rs"
+op = "replace"
+find = "        for (out, pairs) in done {"
+with = "        for (out, pairs) in done.into_iter().rev() {"
+expect = "windowed_emission_matches_unwindowed"
 rebuild = "cargo build --release"
 
 [[mutation]]

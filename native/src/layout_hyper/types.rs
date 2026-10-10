@@ -20,6 +20,11 @@ pub struct ItemPrepass {
     pub row_count: u32,
     /// Whether this item contains any static zero characters or cluster sequence candidates.
     pub has_cluster: bool,
+    /// Whether any of its glyphs draws from the emoji sheet
+    /// ([`crate::atlas::TrieTable::is_emoji_glyph`]): such an item's tint
+    /// needs its `(glyph, colour)` pairs, which a staging path that writes
+    /// write-combined memory must capture during emission (C22).
+    pub has_emoji: bool,
 }
 
 /// Output of Pass 1 prepass on a single chunk.
@@ -30,6 +35,7 @@ pub struct ChunkPrepass {
     pub leader_count: u32,
     pub max_row_extent: f64,
     pub has_cluster: bool,
+    pub has_emoji: bool,
     /// Total rows from lines completed inside this chunk.
     pub completed_rows: u32,
     /// Does this chunk contain at least one newline?

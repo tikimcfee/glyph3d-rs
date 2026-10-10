@@ -10,7 +10,7 @@ use rayon::prelude::*;
 use crate::atlas::TrieTable;
 use crate::gpu::SharedDevice;
 use crate::layout::{DeviceSlotChunk, LayoutItem};
-use super::pass2_device::{emoji_tint_pairs, layout_pass2_device, SlotEmit};
+use super::pass2_device::{emit_windows, emoji_tint_pairs, layout_pass2_device, plan_windows, SlotEmit, SlotWindow, WindowSink};
 use super::types::{ItemPrepass, Pass2DeviceOutput};
 #[cfg(target_os = "macos")]
 use glyph_field::create_mapped_slot_buffer;
@@ -169,21 +169,22 @@ pub(crate) fn layout_device_discrete_chunked<E: SlotEmit>(
     let plan = ChunkPlan::new::<E>(dev, total_survivors, Some(chunk_cap));
     let max_buf = dev.device.limits().max_buffer_size;
 
-    // Host staging is the discrete default (2026-10-09): Pass 2 writes plain
-    // cached host memory, which is then streamed to the VRAM chunks through
-    // one 64 MiB staging buffer. The single mapped-at-creation buffer it
-    // replaces made wgpu-core allocate, zero-fill and copy its own
-    // slot-sized staging (~158 ms of a 461 ms backend on a 93 MB tree, RTX
-    // 5090), and left the emoji tint re-read on write-combined memory
-    // (~190 ms); host staging measured 204 ms there (out/GPU-DIRECTION-
-    // 2026-10-09.md). `GLYPH_STAGING=single` keeps the old path for hardware
-    // where it may still win (an integrated GPU was never measured).
-    let single = plan.total_bytes <= max_buf
-        && std::env::var("GLYPH_STAGING").is_ok_and(|v| v == "single");
-    let (pass2, emoji_tint_pairs, chunks) = if single {
-        stage_single_buffer::<E>(dev, inputs, label, &plan)
-    } else {
-        stage_host_memory::<E>(dev, inputs, label, &plan)
+    // Three discrete staging strategies, measured on an RTX 5090 over a
+    // 102 MB tree (derived backend medians, 2026-10-09):
+    // - windowed (the DEFAULT, C22): Pass 2 writes each 64 MiB window
+    //   straight into one of two mapped staging buffers, uploaded while the
+    //   next fills — 121 ms;
+    // - host (`GLYPH_STAGING=host`): Pass 2 writes host memory, streamed
+    //   through one 64 MiB buffer — 194 ms (the full host -> staging copy);
+    // - single (`GLYPH_STAGING=single`): one mapped-at-creation buffer, which
+    //   wgpu-core zero-fills and copies, and whose emoji tint re-read hits
+    //   write-combined memory — 482 ms.
+    // The fallbacks stay for hardware nobody has measured (an integrated GPU).
+    let staging = std::env::var("GLYPH_STAGING").unwrap_or_default();
+    let (pass2, emoji_tint_pairs, chunks) = match staging.as_str() {
+        "single" if plan.total_bytes <= max_buf => stage_single_buffer::<E>(dev, inputs, label, &plan),
+        "host" => stage_host_memory::<E>(dev, inputs, label, &plan),
+        _ => stage_windowed::<E>(dev, inputs, label, &plan),
     };
 
     DeviceEmission {
@@ -192,6 +193,137 @@ pub(crate) fn layout_device_discrete_chunked<E: SlotEmit>(
         mapped_base: None,
         pass2,
         emoji_tint_pairs,
+    }
+}
+
+/// Windowed direct-to-staging emission (C22): Pass 2 writes each 64 MiB
+/// window of the slot stream straight into one of two mapped staging
+/// buffers, which is unmapped and copied to its VRAM destination while the
+/// next window fills the other. No host-sized allocation and no host ->
+/// staging memcpy (the host path's ~70-100 ms on a 1.7 GB stream).
+fn stage_windowed<E: SlotEmit>(
+    dev: &SharedDevice,
+    inputs: &EmitInputs<'_, '_>,
+    label: &str,
+    plan: &ChunkPlan,
+) -> (Pass2DeviceOutput, Vec<Vec<u32>>, Vec<DeviceSlotChunk>) {
+    const WINDOW_BYTES: usize = 64 * 1024 * 1024;
+    let total_slots = plan.total_bytes as usize / plan.slot_bytes;
+    let windows = plan_windows(inputs.chunk_slot_bases, total_slots, (WINDOW_BYTES / plan.slot_bytes).max(1));
+    let widest = windows.iter().map(|w| w.slots.len() * plan.slot_bytes).max().unwrap_or(0);
+    let staging_size = glyph_field::padded_staging_size(widest.max(plan.slot_bytes) as u64);
+
+    let chunks: Vec<DeviceSlotChunk> = plan
+        .chunk_counts
+        .iter()
+        .enumerate()
+        .map(|(i, &count)| {
+            let chunk_label = if plan.chunk_counts.len() == 1 {
+                label.to_string()
+            } else {
+                format!("{label} {i}/{}", plan.chunk_counts.len())
+            };
+            DeviceSlotChunk {
+                buffer: create_chunk_buffer(dev, (count as usize * plan.slot_bytes) as u64, &chunk_label),
+                offset: 0,
+                slots: count,
+            }
+        })
+        .collect();
+
+    let staging = [0, 1].map(|i| {
+        dev.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some(if i == 0 { "glyph slots window staging A" } else { "glyph slots window staging B" }),
+            size: staging_size,
+            usage: wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::MAP_WRITE,
+            mapped_at_creation: true,
+        })
+    });
+    let mut sink = GpuWindowSink {
+        dev,
+        staging: &staging,
+        chunks: &chunks,
+        chunk_cap: plan.chunk_cap,
+        slot_bytes: plan.slot_bytes,
+        mapped: [true, true],
+        last_submit: [None, None],
+        view: None,
+        map_wait: std::time::Duration::ZERO,
+    };
+    let sp = tracing::info_span!("hyper.pass2.windowed", windows = windows.len()).entered();
+    let (pass2, pairs) = emit_windows::<E>(inputs, &windows, total_slots, &mut sink);
+    let map_wait = sink.map_wait;
+    drop(sp);
+    let t_drain = std::time::Instant::now();
+    let _ = dev.device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None });
+    tracing::info!(
+        windows = windows.len(),
+        map_wait_ms = map_wait.as_secs_f64() * 1e3,
+        drain_ms = t_drain.elapsed().as_secs_f64() * 1e3,
+        "windowed staging"
+    );
+    (pass2, pairs, chunks)
+}
+
+/// The windowed path's sink: two mapped staging buffers used alternately.
+struct GpuWindowSink<'a> {
+    dev: &'a SharedDevice,
+    staging: &'a [wgpu::Buffer; 2],
+    chunks: &'a [DeviceSlotChunk],
+    chunk_cap: usize,
+    slot_bytes: usize,
+    mapped: [bool; 2],
+    /// The submission that copies out of each buffer: re-mapping a buffer
+    /// waits on that copy alone, not on everything queued since.
+    last_submit: [Option<wgpu::SubmissionIndex>; 2],
+    view: Option<wgpu::BufferViewMut>,
+    map_wait: std::time::Duration,
+}
+
+impl WindowSink for GpuWindowSink<'_> {
+    fn begin(&mut self, k: usize, _window: &SlotWindow) -> usize {
+        let b = k % 2;
+        if !self.mapped[b] {
+            let t = std::time::Instant::now();
+            let (tx, rx) = std::sync::mpsc::channel();
+            self.staging[b].slice(..).map_async(wgpu::MapMode::Write, move |res| {
+                let _ = tx.send(res);
+            });
+            self.dev
+                .device
+                .poll(wgpu::PollType::Wait { submission_index: self.last_submit[b].take(), timeout: None })
+                .expect("staging poll failed");
+            rx.recv().expect("staging callback dropped").expect("staging map_async failed");
+            self.mapped[b] = true;
+            self.map_wait += t.elapsed();
+        }
+        let mut view = self.staging[b].slice(..).get_mapped_range_mut().expect("window mapped range");
+        let addr = view.slice(..).as_raw_element_ptr().as_ptr() as usize;
+        self.view = Some(view);
+        addr
+    }
+
+    fn end(&mut self, k: usize, window: &SlotWindow) {
+        let b = k % 2;
+        self.view = None;
+        self.staging[b].unmap();
+        self.mapped[b] = false;
+        let mut encoder = self.dev.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("glyph_window_copy"),
+        });
+        // The window's slots may straddle VRAM chunk boundaries: one copy per
+        // chunk it touches.
+        let mut slot = window.slots.start;
+        while slot < window.slots.end {
+            let chunk = slot / self.chunk_cap;
+            let chunk_end = ((chunk + 1) * self.chunk_cap).min(window.slots.end);
+            let src = ((slot - window.slots.start) * self.slot_bytes) as u64;
+            let dst = ((slot - chunk * self.chunk_cap) * self.slot_bytes) as u64;
+            let len = ((chunk_end - slot) * self.slot_bytes) as u64;
+            glyph_field::copy_split(&mut encoder, &self.staging[b], src, &self.chunks[chunk].buffer, dst, len);
+            slot = chunk_end;
+        }
+        self.last_submit[b] = Some(self.dev.queue.submit([encoder.finish()]));
     }
 }
 

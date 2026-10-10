@@ -279,7 +279,7 @@ pub(crate) struct ChunkPass2Output {
 /// its own disagrees with a walk of the whole item — 578 of
 /// `g-pick-repo/wide.txt`'s glyphs did until 2026-10-09.
 #[derive(Default)]
-struct ChunkCutColors {
+pub(crate) struct ChunkCutColors {
     /// The chunk STARTS inside a line: the colours of that line's leaders
     /// that fall in this chunk, out of a colouring of the whole line.
     head: Vec<u32>,
@@ -1439,8 +1439,7 @@ fn layout_pass2_chunk<E: SlotEmit>(
                 last_ink_z = pos_z;
             }
 
-            let gid = r.glyph_id as usize;
-            if gid < trie.emoji_cell.len() && trie.emoji_cell[gid].is_some() {
+            if trie.is_emoji_glyph(r.glyph_id) {
                 file_has_emoji = true;
                 emoji_cells += 1;
             } else if flat_color.is_none() {
@@ -1586,16 +1585,40 @@ pub(crate) fn layout_pass2_device<E: SlotEmit>(
     inputs: &super::device_alloc::EmitInputs<'_, '_>,
     dest_addr: usize,
 ) -> Pass2DeviceOutput {
+    let cut_colors = pass2_cut_colors(inputs);
+    let chunk_results = pass2_chunk_range::<E>(inputs, 0..inputs.chunks.len(), dest_addr, &cut_colors);
+    pass2_merge::<E>(inputs, &chunk_results)
+}
+
+/// The whole-line colours every intra-line cut needs (C17), computed once
+/// before any chunk of Pass 2 runs.
+pub(crate) fn pass2_cut_colors(inputs: &super::device_alloc::EmitInputs<'_, '_>) -> Vec<ChunkCutColors> {
+    whole_line_colors_at_cuts(inputs.chunks, inputs.items)
+}
+
+/// Pass 2 over the chunks in `range`, in parallel, each writing its slots at
+/// `dest_addr + chunk_slot_base * size_of::<E::Slot>()`. A caller emitting a
+/// WINDOW of the slot stream passes the window's address minus its first
+/// slot's byte offset (C22). Results come back in chunk order.
+pub(crate) fn pass2_chunk_range<E: SlotEmit>(
+    inputs: &super::device_alloc::EmitInputs<'_, '_>,
+    range: std::ops::Range<usize>,
+    dest_addr: usize,
+    cut_colors: &[ChunkCutColors],
+) -> Vec<ChunkPass2Output> {
     let lut = crate::glyph_scene::srgb_to_linear_table();
-    let cut_colors = whole_line_colors_at_cuts(inputs.chunks, inputs.items);
+    range
+        .into_par_iter()
+        .map(|chunk_idx| layout_pass2_chunk::<E>(inputs, chunk_idx, dest_addr, lut, &cut_colors[chunk_idx]))
+        .collect()
+}
 
-    let chunk_results: Vec<ChunkPass2Output> = inputs
-        .chunks
-        .par_iter()
-        .enumerate()
-        .map(|(chunk_idx, _)| layout_pass2_chunk::<E>(inputs, chunk_idx, dest_addr, lut, &cut_colors[chunk_idx]))
-        .collect();
-
+/// Fold the per-chunk results into per-item placements, tints and blocks.
+pub(crate) fn pass2_merge<E: SlotEmit>(
+    inputs: &super::device_alloc::EmitInputs<'_, '_>,
+    chunk_results: &[ChunkPass2Output],
+) -> Pass2DeviceOutput {
+    let lut = crate::glyph_scene::srgb_to_linear_table();
     let mut placements = Vec::with_capacity(inputs.items.len());
     let mut file_tints = Vec::with_capacity(inputs.items.len());
     let mut file_blocks = Vec::with_capacity(inputs.items.len());
@@ -1657,6 +1680,15 @@ pub(crate) fn layout_pass2_device<E: SlotEmit>(
             }
         }
 
+        // Pass 1 planned with its own reading of which items hold emoji; a
+        // staging path captures tint pairs only for those (C22), so a
+        // disagreement would lose an item's tint silently. Same test
+        // (`TrieTable::is_emoji_glyph`), same resolution; it must agree.
+        assert_eq!(
+            file_has_emoji, inputs.prepasses[item_idx].has_emoji,
+            "pass 1 and pass 2 disagree on whether item {item_idx} holds emoji",
+        );
+
         if E::USES_LINES {
             assert!(
                 max_row_seen < inputs.prepasses[item_idx].row_count as i64,
@@ -1693,6 +1725,126 @@ pub(crate) fn layout_pass2_device<E: SlotEmit>(
         file_tints,
         file_blocks,
     }
+}
+
+/// One window of the slot stream (C22): whole chunks, so contiguous slots.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SlotWindow {
+    pub chunks: std::ops::Range<usize>,
+    pub slots: std::ops::Range<usize>,
+}
+
+/// Cut the slot stream into windows of WHOLE chunks, each at most
+/// `window_slots` slots — unless one chunk alone is bigger, which then gets
+/// a window of its own. Chunk `i` owns slots `chunk_slot_bases[i] ..` the
+/// next chunk's base (Pass 1 lays them out in chunk order), so a window is
+/// a contiguous slot range and its address is known before Pass 2 runs.
+pub(crate) fn plan_windows(chunk_slot_bases: &[u32], total_slots: usize, window_slots: usize) -> Vec<SlotWindow> {
+    let n = chunk_slot_bases.len();
+    let end_of = |i: usize| if i + 1 < n { chunk_slot_bases[i + 1] as usize } else { total_slots };
+    let mut windows = Vec::new();
+    let mut i = 0;
+    while i < n {
+        let start = chunk_slot_bases[i] as usize;
+        let mut j = i + 1;
+        while j < n && end_of(j) - start <= window_slots {
+            j += 1;
+        }
+        windows.push(SlotWindow { chunks: i..j, slots: start..end_of(j - 1) });
+        i = j;
+    }
+    windows
+}
+
+/// Where each window's slots are written (C22). `begin` returns the address
+/// of writable memory for window `k` (its first slot at offset 0, room for
+/// `window.slots.len()` slots); `end` is called once the window is fully
+/// written, to hand it on. The GPU sink is a pair of mapped staging
+/// buffers; the unit test's is host memory.
+pub(crate) trait WindowSink {
+    fn begin(&mut self, k: usize, window: &SlotWindow) -> usize;
+    fn end(&mut self, k: usize, window: &SlotWindow);
+}
+
+/// Pass 2 window by window into `sink`, returning what `EmitInputs::run`
+/// returns: the merged output and each item's `(glyph, colour)` tint pairs.
+///
+/// A window's chunks run in parallel and write straight into the sink's
+/// memory, which on a discrete GPU is write-combined: fast to write, very
+/// slow to read back (an emoji tint re-read cost ~200 ms there). So the
+/// chunks of items Pass 1 flagged `has_emoji` are emitted into host scratch
+/// first, their pairs taken from cached memory, then copied into the window.
+/// Emoji items are rare; every other chunk writes once, in place.
+pub(crate) fn emit_windows<E: SlotEmit>(
+    inputs: &super::device_alloc::EmitInputs<'_, '_>,
+    windows: &[SlotWindow],
+    total_slots: usize,
+    sink: &mut impl WindowSink,
+) -> (Pass2DeviceOutput, Vec<Vec<u32>>) {
+    let lut = crate::glyph_scene::srgb_to_linear_table();
+    let cut_colors = pass2_cut_colors(inputs);
+    let n = inputs.chunks.len();
+    let slot_end = |c: usize| if c + 1 < n { inputs.chunk_slot_bases[c + 1] as usize } else { total_slots };
+    let size = std::mem::size_of::<E::Slot>();
+    let mut results: Vec<ChunkPass2Output> = Vec::with_capacity(n);
+    let mut chunk_pairs: Vec<Vec<u32>> = Vec::with_capacity(n);
+    for (k, w) in windows.iter().enumerate() {
+        let window_addr = sink.begin(k, w);
+        // Chunk c writes at dest_addr + base(c) * size; the window holds
+        // slot `w.slots.start` at offset 0.
+        let dest_addr = window_addr.wrapping_sub(w.slots.start * size);
+        let done: Vec<(ChunkPass2Output, Vec<u32>)> = w
+            .chunks
+            .clone()
+            .into_par_iter()
+            .map(|c| {
+                let item = inputs.chunks[c].item_index;
+                if !inputs.prepasses[item].has_emoji {
+                    return (layout_pass2_chunk::<E>(inputs, c, dest_addr, lut, &cut_colors[c]), Vec::new());
+                }
+                let base = inputs.chunk_slot_bases[c] as usize;
+                let count = slot_end(c) - base;
+                let mut scratch: Vec<std::mem::MaybeUninit<E::Slot>> = Vec::with_capacity(count.max(1));
+                let scratch_addr = scratch.as_mut_ptr() as usize;
+                let out = layout_pass2_chunk::<E>(inputs, c, scratch_addr.wrapping_sub(base * size), lut, &cut_colors[c]);
+                assert_eq!(out.slot_count as usize, count, "chunk {c} emitted {} of its {count} slots", out.slot_count);
+                // SAFETY: the chunk wrote exactly `count` slots into scratch
+                // (asserted), and the window has room for them at `base`.
+                let slots = unsafe { std::slice::from_raw_parts(scratch_addr as *const E::Slot, count) };
+                let mut pairs = Vec::with_capacity(count * 2);
+                for slot in slots {
+                    pairs.extend_from_slice(&E::tint_pair(slot));
+                }
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        scratch_addr as *const u8,
+                        (dest_addr + base * size) as *mut u8,
+                        count * size,
+                    );
+                }
+                (out, pairs)
+            })
+            .collect();
+        sink.end(k, w);
+        for (out, pairs) in done {
+            results.push(out);
+            chunk_pairs.push(pairs);
+        }
+    }
+    assert_eq!(results.len(), n, "windows must cover every chunk exactly once");
+    let out = pass2_merge::<E>(inputs, &results);
+    let pairs = inputs
+        .item_chunk_ranges
+        .iter()
+        .enumerate()
+        .map(|(item, range)| {
+            if !inputs.prepasses[item].has_emoji {
+                return Vec::new();
+            }
+            range.clone().flat_map(|c| chunk_pairs[c].iter().copied()).collect()
+        })
+        .collect();
+    (out, pairs)
 }
 
 /// `(glyph_id, color)` pairs for every item whose fast tint cannot stand
