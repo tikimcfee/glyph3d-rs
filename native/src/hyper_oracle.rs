@@ -513,6 +513,15 @@ pub struct CorpusDiff {
     /// when no device was given.
     pub visible_slots: usize,
     pub visible_bad: usize,
+    /// The visible tier's SPAN half (M3, 2026-10-10): the same kernel under
+    /// byte-range colour (a deterministic synthetic span set per item)
+    /// against the device Pass 2 under `Paint::ByteSpans` with the same
+    /// spans — the colouring every visible-mode recolour rides on. Slots
+    /// compared, slots differing, and how many reference slots carried a
+    /// span colour (anti-vacuity).
+    pub visible_span_slots: usize,
+    pub visible_span_bad: usize,
+    pub visible_span_colored: usize,
     /// (item label, first divergence) for every differing item, in order.
     pub firsts: Vec<(String, String)>,
     /// diff_backends' verdict over the whole corpus (the seam's own differ).
@@ -540,6 +549,9 @@ impl Default for CorpusDiff {
             paint_colored: 0,
             visible_slots: 0,
             visible_bad: 0,
+            visible_span_slots: 0,
+            visible_span_bad: 0,
+            visible_span_colored: 0,
             firsts: Vec::new(),
             seam: Ok(()),
         }
@@ -567,7 +579,12 @@ impl VisibleOracle {
 /// The visible tier's inputs for a corpus: Pass 1 with the line table over
 /// all its items at once (as a load runs it), one `VisibleItem` per item,
 /// and the kernel over every line.
-fn visible_slots_of(corpus: &Corpus, trie: &TrieTable, v: &VisibleOracle) -> Vec<DerivedSlot> {
+fn visible_slots_of(
+    corpus: &Corpus,
+    trie: &TrieTable,
+    v: &VisibleOracle,
+    spans: Option<&[Vec<crate::layout::ByteSpan>]>,
+) -> Vec<DerivedSlot> {
     use crate::layout_hyper::{chunk, pass1_over_chunks_with_lines, SEGMENT_BYTES};
     let em = trie.metrics.em_height_fu;
     let bitmap_adv = crate::text::fu_to_world(trie.bitmap_advance_fu, em);
@@ -584,6 +601,19 @@ fn visible_slots_of(corpus: &Corpus, trie: &TrieTable, v: &VisibleOracle) -> Vec
         .collect();
     let agg = pass1_over_chunks_with_lines(&chunks, &ranges, &item_bytes, &params, trie, bitmap_adv, em, Some(SEGMENT_BYTES));
     let table = agg.line_table.as_ref().expect("Pass 1 was asked for lines");
+    // The spans as the kernel reads them: one global run, each item's
+    // sorted and `span_base..span_base + span_count`.
+    let mut gpu_spans: Vec<glyph_field_visible::ByteSpanGpu> = Vec::new();
+    let mut span_ranges: Vec<(u32, u32)> = Vec::with_capacity(corpus.items.len());
+    for i in 0..corpus.items.len() {
+        let base = gpu_spans.len() as u32;
+        if let Some(all) = spans {
+            for sp in &all[i] {
+                gpu_spans.push(glyph_field_visible::ByteSpanGpu { start: sp.start, end: sp.end, color: sp.color });
+            }
+        }
+        span_ranges.push((base, gpu_spans.len() as u32 - base));
+    }
     let mut byte_base = 0u64;
     let items: Vec<glyph_field_visible::VisibleItem> = corpus
         .items
@@ -612,8 +642,8 @@ fn visible_slots_of(corpus: &Corpus, trie: &TrieTable, v: &VisibleOracle) -> Vec
                 byte_len: c.bytes.len() as u32,
                 first_line: lines.start as u32,
                 line_count: (lines.end - lines.start) as u32,
-                span_base: 0,
-                span_count: 0,
+                span_base: span_ranges[i].0,
+                span_count: span_ranges[i].1,
                 bbox_min: [0.0; 3],
                 bbox_max: [0.0; 3],
                 group_id: i as u32,
@@ -629,10 +659,36 @@ fn visible_slots_of(corpus: &Corpus, trie: &TrieTable, v: &VisibleOracle) -> Vec
         seeds: bytemuck::cast_slice(&table.seeds),
         segment_bytes: table.segment_bytes,
         trie: &v.trie,
-        spans: &[],
+        spans: &gpu_spans,
         default_color: DEFAULT_COLOR_PACKED,
     };
     glyph_field_visible::layout_all_lines(&v.device, &v.queue, &inputs)
+}
+
+/// The span tier's colours: three spans' worth, none the default.
+const SPAN_TIER_COLORS: [u32; 3] = [0xFF20_40C0, 0xFF60_C040, 0xFFC0_4060];
+
+/// A deterministic span set over an item of `len` bytes: a run of 5 bytes
+/// every 13 from byte 3 (9 bytes every seventh), cycling three colours —
+/// dense enough to land inside sequences, across chunk and segment cuts and
+/// on newlines, sparse enough to leave default colour between. Sorted and
+/// disjoint, as the paint requires.
+fn span_tier_spans(len: usize) -> Vec<crate::layout::ByteSpan> {
+    let mut out = Vec::new();
+    let mut k = 0u32;
+    let mut start = 3usize;
+    while start < len {
+        let run = if k.is_multiple_of(7) { 9 } else { 5 };
+        let end = (start + run).min(len);
+        out.push(crate::layout::ByteSpan {
+            start: start as u32,
+            end: end as u32,
+            color: SPAN_TIER_COLORS[(k % 3) as usize],
+        });
+        k += 1;
+        start += 13;
+    }
+    out
 }
 
 pub fn diff_corpus(corpus: &Corpus, trie: &Arc<TrieTable>, visible: Option<&VisibleOracle>) -> Result<CorpusDiff, String> {
@@ -764,7 +820,7 @@ pub fn diff_corpus(corpus: &Corpus, trie: &Arc<TrieTable>, visible: Option<&Visi
     // every line, against the device Pass 2's Derived slots above — same
     // bytes, same record, slot order = item, line, byte on both sides.
     if let Some(v) = visible {
-        let got = visible_slots_of(corpus, trie, v);
+        let got = visible_slots_of(corpus, trie, v, None);
         out.visible_slots = derived_slots.len();
         if got.len() != derived_slots.len() {
             out.visible_bad += got.len().abs_diff(derived_slots.len()).max(1);
@@ -789,6 +845,45 @@ pub fn diff_corpus(corpus: &Corpus, trie: &Arc<TrieTable>, visible: Option<&Visi
             out.firsts.push((
                 format!("{item} (visible kernel)"),
                 format!("slot {k}: kernel {:?} vs device Pass 2 {:?}", got[k], derived_slots[k]),
+            ));
+        }
+
+        // The SPAN half (M3): byte-range colour on both sides — the device
+        // Pass 2 under Paint::ByteSpans, the kernel with the same spans.
+        let span_sets: Vec<Vec<crate::layout::ByteSpan>> =
+            corpus.items.iter().map(|c| span_tier_spans(c.bytes.len())).collect();
+        let span_items: Vec<LayoutItem<'_>> = items
+            .iter()
+            .zip(span_sets.iter())
+            .map(|(it, sp)| LayoutItem { paint: Paint::ByteSpans(sp), ..*it })
+            .collect();
+        let (dev_spans, dev_span_places) = device_pass2_derived_on_host(&span_items, trie);
+        let got_spans = visible_slots_of(corpus, trie, v, Some(&span_sets));
+        out.visible_span_slots = dev_spans.len();
+        out.visible_span_colored += dev_spans.iter().filter(|d| d.color != DEFAULT_COLOR_PACKED).count();
+        if got_spans.len() != dev_spans.len() {
+            out.visible_span_bad += got_spans.len().abs_diff(dev_spans.len()).max(1);
+            out.firsts.push((
+                format!("{} (visible kernel, spans)", corpus.name),
+                format!("{} slots from the kernel, {} from the device Pass 2", got_spans.len(), dev_spans.len()),
+            ));
+        }
+        let mut first_bad: Option<usize> = None;
+        for (k, (g, d)) in got_spans.iter().zip(dev_spans.iter()).enumerate() {
+            if g != d {
+                out.visible_span_bad += 1;
+                first_bad.get_or_insert(k);
+            }
+        }
+        if let Some(k) = first_bad {
+            let item = dev_span_places
+                .iter()
+                .position(|p| (p.slot_base as usize..p.slot_base as usize + p.slot_count as usize).contains(&k))
+                .map(|i| corpus.items[i].label.clone())
+                .unwrap_or_else(|| "?".into());
+            out.firsts.push((
+                format!("{item} (visible kernel, spans)"),
+                format!("slot {k}: kernel {:?} vs device Pass 2 {:?}", got_spans[k], dev_spans[k]),
             ));
         }
     }
@@ -840,16 +935,17 @@ pub fn run_hyper_oracle_check(paths: &[PathBuf], cluster_mode: ClusterMode) -> !
             && device_bad == 0
             && d.paint_bad == 0
             && d.visible_bad == 0
+            && d.visible_span_bad == 0
             && d.seam.is_ok();
         if clean {
             println!(
-                "  PASS {:<34} {} item(s), {} records, {} instances, {} device slots x2 bit-exact, visible kernel {} slots ({} sequence heads, {} ASCII-led)",
-                corpus.name, d.items, d.records, d.instances, d.device_slots, d.visible_slots, d.heads, d.ascii_heads
+                "  PASS {:<34} {} item(s), {} records, {} instances, {} device slots x2 bit-exact, visible kernel {} slots flat + {} under spans ({} coloured) ({} sequence heads, {} ASCII-led)",
+                corpus.name, d.items, d.records, d.instances, d.device_slots, d.visible_slots, d.visible_span_slots, d.visible_span_colored, d.heads, d.ascii_heads
             );
         } else {
             failed += 1;
             println!(
-                "FAIL  {:<34} {}/{} records, {}/{} instances, {}/{} placements differ; device {}+{} slots (render+derived), {} placements; paint {}/{} slots; visible kernel {}/{} slots ({} sequence heads, {} ASCII-led)",
+                "FAIL  {:<34} {}/{} records, {}/{} instances, {}/{} placements differ; device {}+{} slots (render+derived), {} placements; paint {}/{} slots; visible kernel {}/{} slots flat, {}/{} under spans ({} sequence heads, {} ASCII-led)",
                 corpus.name,
                 d.record_bad,
                 d.records,
@@ -864,6 +960,8 @@ pub fn run_hyper_oracle_check(paths: &[PathBuf], cluster_mode: ClusterMode) -> !
                 d.paint_slots * 2,
                 d.visible_bad,
                 d.visible_slots,
+                d.visible_span_bad,
+                d.visible_span_slots,
                 d.heads,
                 d.ascii_heads
             );
@@ -898,6 +996,9 @@ pub fn run_hyper_oracle_check(paths: &[PathBuf], cluster_mode: ClusterMode) -> !
         total.paint_colored += d.paint_colored;
         total.visible_slots += d.visible_slots;
         total.visible_bad += d.visible_bad;
+        total.visible_span_slots += d.visible_span_slots;
+        total.visible_span_bad += d.visible_span_bad;
+        total.visible_span_colored += d.visible_span_colored;
     }
 
     // Anti-vacuity before the verdict: a differ that compared nothing passes
@@ -918,6 +1019,10 @@ pub fn run_hyper_oracle_check(paths: &[PathBuf], cluster_mode: ClusterMode) -> !
         eprintln!("hyper-oracle FAIL: the visible tier compared nothing — 0 slots");
         std::process::exit(1);
     }
+    if visible.is_some() && total.visible_span_colored == 0 {
+        eprintln!("hyper-oracle FAIL: the visible tier's span half compared nothing coloured");
+        std::process::exit(1);
+    }
     if strict && visible.is_none() {
         eprintln!("hyper-oracle FAIL (strict): the visible tier did not run (no device)");
         std::process::exit(1);
@@ -934,7 +1039,7 @@ pub fn run_hyper_oracle_check(paths: &[PathBuf], cluster_mode: ClusterMode) -> !
             println!("first divergence: {label}: {f}");
         }
         eprintln!(
-            "hyper-oracle FAIL: {failed}/{} corpora differ — {}/{} records ({} in leader-mode items), {}/{} instances, {}/{} placements; device: {}+{}/{} slots (render+derived), {} placements; paint: {}/{} slots; visible kernel: {}/{} slots",
+            "hyper-oracle FAIL: {failed}/{} corpora differ — {}/{} records ({} in leader-mode items), {}/{} instances, {}/{} placements; device: {}+{}/{} slots (render+derived), {} placements; paint: {}/{} slots; visible kernel: {}/{} slots flat, {}/{} under spans",
             paths.len(),
             total.record_bad,
             total.records,
@@ -951,11 +1056,13 @@ pub fn run_hyper_oracle_check(paths: &[PathBuf], cluster_mode: ClusterMode) -> !
             total.paint_slots * 2,
             total.visible_bad,
             total.visible_slots,
+            total.visible_span_bad,
+            total.visible_span_slots,
         );
         std::process::exit(1);
     }
     println!(
-        "hyper-oracle PASS: {} corpora, {} items, {} records, {} instances, {} placements, and the device Pass 2's {} slots in both formats bit-exact vs the oracle-backed fold ({} sequence heads, {} ASCII-led); under syntax paint, {} slots x2 match the whole-item colours ({} not default); the visible kernel's {} slots equal the device Pass 2's{}",
+        "hyper-oracle PASS: {} corpora, {} items, {} records, {} instances, {} placements, and the device Pass 2's {} slots in both formats bit-exact vs the oracle-backed fold ({} sequence heads, {} ASCII-led); under syntax paint, {} slots x2 match the whole-item colours ({} not default); the visible kernel's {} slots equal the device Pass 2's, and {} again under byte-range spans ({} coloured){}",
         paths.len(),
         total.items,
         total.records,
@@ -967,6 +1074,8 @@ pub fn run_hyper_oracle_check(paths: &[PathBuf], cluster_mode: ClusterMode) -> !
         total.paint_slots,
         total.paint_colored,
         total.visible_slots,
+        total.visible_span_slots,
+        total.visible_span_colored,
         if visible.is_some() { "" } else { " (tier skipped: no device)" }
     );
     std::process::exit(0);
@@ -1097,6 +1206,8 @@ mod tests {
                 assert!(d.records > 0 && d.device_slots == d.instances, "{at}: compared nothing");
                 assert_eq!(d.visible_slots, d.device_slots, "{at}: the visible tier compared every slot");
                 assert_eq!(d.visible_bad, 0, "{at}: visible kernel: {:?}", d.firsts);
+                assert_eq!(d.visible_span_bad, 0, "{at}: visible kernel under spans: {:?}", d.firsts);
+                assert!(d.visible_span_colored > 0, "{at}: the span half saw no colour");
                 assert_eq!((d.record_bad, d.instance_bad, d.placement_bad), (0, 0, 0), "{at}: {:?}", d.firsts);
                 assert_eq!(
                     (d.device_render_bad, d.device_derived_bad, d.device_placement_bad),
