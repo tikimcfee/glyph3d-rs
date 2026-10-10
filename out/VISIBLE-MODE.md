@@ -86,3 +86,139 @@ verb panel — before the fix the glyph jumped to another file's rows (or
 vanished, out of the item table); now it stays put and takes the new group.
 Neither fix moves a golden pixel: no golden view is column-paged and every
 load-time lane is the same word as before.
+
+## M2 — how to see it (2026-10-10)
+
+The renderer's side of the mode is wired end to end; `VisibleField::new`
+(`crates/glyph-field-visible`) is the crate's own milestone. Until its bodies
+land, `--field-mode visible` runs the whole load path below and panics at
+that call — which is the proof that the mode reaches it. Everything that
+follows is in place and stays inert for `instanced` and `derived` (the full
+battery is green on both).
+
+**What runs when `visible` is selected.** `repo::prefetch_repo` runs Pass 1
+in the background WITH the line table (`prefetch_hyper(.., field_mode)`);
+`HyperLayout::layout_items` takes that table (or runs Pass 1 again with
+lines if the prefetch was for another mode), checks the Derived lane limits
+once, runs NO Pass 2, measures each item's placement with
+`compute_single_item_placement` in parallel, and returns the arena in its
+third form — `GlyphArena::from_visible(VisibleStaging)`: the table, one seed
+per item (params, group, `max_row_extent`, slot and byte counts) and no
+bytes yet. `load_repo_from_prefetched` builds the file views, then MOVES the
+walk's `RepoFile.bytes` Vecs into the staging (one allocation per file; a
+1.4 GB tree is not copied). `into_staged` finishes each seed into a
+`VisibleItem` with what only the shelf knows — the group row and the world
+box the scene culls (the segment's, group offset applied) — with
+`stride_x = max_row_extent + page_gap_x` for row-paged items, `byte_base`
+the running sum in item order, `first_line/line_count` from the table, no
+spans (`default_color = DEFAULT_COLOR_PACKED`). `glyph_scene::setup` casts
+the table's records to the kernel's (`LineEntry`/`SegmentSeed` are the GPU
+records lane for lane — a test pins it), builds the `TrieUpload` from the
+atlas trie (`layout_hyper::visible::trie_upload`: the raw `codepoints.bin`
+sections, the sequence table, a 0x110000-bit first-member bitmap, the
+metrics) and calls `VisibleField::new`. Per frame, `render.rs` calls
+`field.prepare(..)` with the camera, viewport, `px_scale`, the two LOD
+thresholds (glyph tier = `[lod] min_px`, backdrop tier = `[lod]
+visible_backdrop_px`, both live from the panel), `greek_mode`, the debug
+tint and time; the CPU cull runs only for the BACKDROPS (under the backdrop
+threshold) and the hidden flags; the glyph phase is the field's own draw
+plus `record_wash_draw`. Selection and the slot verbs draw/apply nothing in
+this mode (logged once / reported) until M3 re-keys them by byte range.
+
+**Commands** (repo root, release build, GPU):
+
+```sh
+# The CLI door. Loads g-pick-repo in visible mode with the HUD open.
+target/release/glyph3d-native --load-repo native/fixtures/g-pick-repo --field-mode visible
+
+# The same with the debug tint (glyphs coloured by LOD tier, or by cull state).
+target/release/glyph3d-native --load-repo native/fixtures/g-pick-repo --field-mode visible --debug-tint lod
+target/release/glyph3d-native --load-repo native/fixtures/g-pick-repo --field-mode visible --debug-tint cull
+
+# The panel door: launch in any mode, F1, "glyph field mode" → "Visible (no slots)".
+# The scene rebuilds through the same arm the other selectors use; the
+# highlighted label is the mode actually BUILT (a lane-limit fallback shows
+# as Instanced). The "visible field" block under cull/LOD has the backdrop
+# px/em slider and the debug tint selector.
+target/release/glyph3d-native --load-repo native/fixtures/g-pick-repo --field-mode derived
+
+# The TUI door: cargo glyph run → "3. Graphics & Shading" → Field Mode, ◄/►
+# cycles instanced → derived → visible (exp); launch_config.toml's
+# field_mode = "visible" seeds it.
+cargo glyph run
+
+# The HUD: F8 toggles it (open by default in visible mode). Top-left: mode,
+# engine, segments/hidden, backdrops, CPU cull ms, fps; in visible mode also
+# items and lines per tier, segments, slots (and dropped), GPU cull/layout/
+# draw ms from VisibleField::stats(); stored modes show instances and ranges.
+
+# A reproducible view: fly somewhere, F1 → "copy pose" puts
+# `--cam-pose X Y Z YAW PITCH` (degrees) on the clipboard and prints it; or
+# press F2 with GLYPH_POSE_PRINT=1 to print it with the screenshot. Feed it
+# back to a golden-style command:
+GLYPH_POSE_PRINT=1 target/release/glyph3d-native --load-repo native/fixtures/g-pick-repo --field-mode visible
+target/release/glyph3d-native --load-repo native/fixtures/g-pick-repo --field-mode visible \
+    --cam-pose 12.0 -3.0 40.0 0.0 -10.0 --screenshot out/visible-check.png
+
+# The self-test: cycles Instanced → Derived → Visible at t≈3 s through the
+# relayout arm and prints the HUD line after each.
+GLYPH_FIELDMODE_SELFTEST=1 target/release/glyph3d-native --load-repo native/fixtures/g-pick-repo
+
+# No GPU: the staging alone (Pass 1 with lines, the placements, the counts).
+target/release/glyph3d-native --load-repo native/fixtures/g-pick-repo --field-mode visible --repo-scan-only
+```
+
+**What the tests assert** (`cargo test --release -p glyph3d-native --lib -- visible lane_limits max_line_cols`):
+
+- `placements_agree_with_the_derived_device_pass2`: over `g-pick-repo`,
+  `cubecl-fork`, `g-cluster-repo`, `chunk-cut.txt` and `chunk-cut-paint.txt`
+  in both cluster modes (24 items), the single-item placement the visible
+  load uses is bit-equal to the device Pass 2's — slot base and count,
+  record count, page and ink extents. It found one defect on arrival: the
+  ASCII shortcut of `compute_single_item_placement` left the newline's own
+  record out of the page extent (one cell short on every ASCII line; no
+  caller had ever read it). Fixed in the same change.
+- `a_visible_load_stages_the_table_and_the_seeds`: a device-less visible
+  load returns the third arena form, one seed per item, a table whose glyph
+  counts sum to the arena's, and the device's placements; the same engine
+  asked for `instanced` stages host records as before.
+- `visible_records_are_the_kernels`, `staging_items_carry_bases_lines_and_stride`,
+  `trie_upload_bitmap_matches_starts_a_sequence`: the casts, the item
+  finishing, and the upload's bitmap against the table's own
+  `starts_a_sequence` over every codepoint.
+- `derived_lane_limits_refuse_past_each_lane_and_name_the_item`,
+  `effective_field_mode_falls_back_to_instanced_past_the_lanes`,
+  `max_line_cols_is_the_widest_line_in_leaders`: the release-time lane
+  check (items / rows / column pages, boundaries included), the fallback
+  decision, and the new Pass 1 figure it reads, held to the oracle's records
+  over corpora with intra-line chunk cuts.
+
+Not visible yet: the pixels. They arrive with the crate's `VisibleField`
+bodies; the first thing to look at then is the HUD's tier counts against the
+`--debug-tint lod` colours, and `repo-wide`'s camera (`cargo glyph graph`
+lists the golden commands) under `--field-mode visible` beside the Derived
+frame.
+
+### The witness behind M2: the sixth hyper-oracle tier
+
+`hyper-oracle` (gate, `--hyper-oracle-check`) now runs the visible field's
+GPU layout kernel headless over EVERY line of every corpus item
+(`glyph_field_visible::layout_all_lines`: Pass 1's line table and segment
+seeds, the kernel's own trie lookup and cluster-mode sequence pass, no cull)
+and compares its `DerivedSlot`s byte for byte, in slot order, with the device
+Pass 2's Derived emission of the same bytes — the same record from the same
+bytes, the GPU's fold against HyperLayout's, which the five CPU tiers hold to
+the JS oracle. It needs a GPU (`GLYPH_HYPER_ORACLE_NO_GPU=1` skips it; the
+gate's STRICT run refuses a skipped tier) and refuses zero slots. To see it:
+
+```sh
+cd native && GLYPH_TRACE=warn ../target/release/glyph3d-native --hyper-oracle-check fixtures/g-pick-repo fixtures/cubecl-fork ../engine/fixtures/cluster-keycap.pipe.bin ../engine/fixtures/paged-rows.pipe.bin
+```
+
+Every PASS line ends `visible kernel N slots`; the first divergence, if any,
+names the item, the slot and both slots' lanes. Mutation
+`visible-keycap-lookahead-dropped` (the kernel's keycap guard removed)
+reddens it through this tier. The grid test
+`hyper_oracle::tests::pagination_agrees_on_every_tier` runs the tier too, over
+every paging shape.
+

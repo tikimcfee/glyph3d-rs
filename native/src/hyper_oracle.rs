@@ -504,6 +504,15 @@ pub struct CorpusDiff {
     pub paint_slots: usize,
     pub paint_bad: usize,
     pub paint_colored: usize,
+    /// The VISIBLE tier (M2, 2026-10-10): the visible field's layout kernel
+    /// run headless over EVERY line of the corpus
+    /// (`glyph_field_visible::layout_all_lines`), its `DerivedSlot`s compared
+    /// byte for byte, in slot order, with the device Pass 2's Derived
+    /// emission above — the same record from the same bytes, the GPU's fold
+    /// against HyperLayout's. Slots compared and slots differing; 0 compared
+    /// when no device was given.
+    pub visible_slots: usize,
+    pub visible_bad: usize,
     /// (item label, first divergence) for every differing item, in order.
     pub firsts: Vec<(String, String)>,
     /// diff_backends' verdict over the whole corpus (the seam's own differ).
@@ -529,6 +538,8 @@ impl Default for CorpusDiff {
             paint_slots: 0,
             paint_bad: 0,
             paint_colored: 0,
+            visible_slots: 0,
+            visible_bad: 0,
             firsts: Vec::new(),
             seam: Ok(()),
         }
@@ -536,7 +547,95 @@ impl Default for CorpusDiff {
 }
 
 /// Lay one corpus out both ways and diff it.
-pub fn diff_corpus(corpus: &Corpus, trie: &Arc<TrieTable>) -> Result<CorpusDiff, String> {
+/// What the visible tier needs: a device to run the kernel on and the trie
+/// in the kernel's form. `None` skips the tier (a host with no adapter; the
+/// gate's STRICT run refuses that).
+pub struct VisibleOracle {
+    pub device: wgpu::Device,
+    pub queue: wgpu::Queue,
+    pub trie: glyph_field_visible::TrieUpload,
+}
+
+impl VisibleOracle {
+    /// A headless device, and the trie the renderer would upload.
+    pub fn new(trie: &TrieTable) -> Self {
+        let ctx = pollster::block_on(crate::gpu::init(None));
+        Self { device: ctx.device, queue: ctx.queue, trie: crate::layout_hyper::visible::trie_upload(trie) }
+    }
+}
+
+/// The visible tier's inputs for a corpus: Pass 1 with the line table over
+/// all its items at once (as a load runs it), one `VisibleItem` per item,
+/// and the kernel over every line.
+fn visible_slots_of(corpus: &Corpus, trie: &TrieTable, v: &VisibleOracle) -> Vec<DerivedSlot> {
+    use crate::layout_hyper::{chunk, pass1_over_chunks_with_lines, SEGMENT_BYTES};
+    let em = trie.metrics.em_height_fu;
+    let bitmap_adv = crate::text::fu_to_world(trie.bitmap_advance_fu, em);
+    let item_bytes: Vec<&[u8]> = corpus.items.iter().map(|c| c.bytes.as_slice()).collect();
+    let params: Vec<ItemParams> = corpus.items.iter().map(|c| c.params).collect();
+    let (defs, ranges) = chunk::slice_byte_buffers_into_chunk_defs(&item_bytes);
+    let chunks: Vec<chunk::LayoutChunk<'_>> = defs
+        .iter()
+        .map(|d| chunk::LayoutChunk {
+            item_index: d.item_index,
+            bytes: &item_bytes[d.item_index][d.byte_offset..d.byte_offset + d.byte_len],
+            byte_offset: d.byte_offset,
+        })
+        .collect();
+    let agg = pass1_over_chunks_with_lines(&chunks, &ranges, &item_bytes, &params, trie, bitmap_adv, em, Some(SEGMENT_BYTES));
+    let table = agg.line_table.as_ref().expect("Pass 1 was asked for lines");
+    let mut byte_base = 0u64;
+    let items: Vec<glyph_field_visible::VisibleItem> = corpus
+        .items
+        .iter()
+        .enumerate()
+        .map(|(i, c)| {
+            let p = &c.params;
+            let mut gp = glyph_field::ItemParamsGpu::from(p);
+            gp.group = i as u32;
+            let lines = table.item_lines(i);
+            let it = glyph_field_visible::VisibleItem {
+                params: gp,
+                origin_x: p.origin_x,
+                stride_x: if p.has_page && p.page_rows > 0 {
+                    agg.prepasses[i].max_row_extent + p.page_gap_x
+                } else {
+                    0.0
+                },
+                wrap_width: p.wrap_width,
+                wrap_mode: match p.wrap_mode {
+                    fold::WrapMode::Down => glyph_field_visible::WRAP_DOWN,
+                    fold::WrapMode::Back => glyph_field_visible::WRAP_BACK,
+                },
+                cluster: u32::from(p.cluster_mode == ClusterMode::Cluster),
+                byte_base,
+                byte_len: c.bytes.len() as u32,
+                first_line: lines.start as u32,
+                line_count: (lines.end - lines.start) as u32,
+                span_base: 0,
+                span_count: 0,
+                bbox_min: [0.0; 3],
+                bbox_max: [0.0; 3],
+                group_id: i as u32,
+            };
+            byte_base += c.bytes.len() as u64;
+            it
+        })
+        .collect();
+    let inputs = glyph_field_visible::VisibleInputs {
+        item_bytes: &item_bytes,
+        items: &items,
+        lines: bytemuck::cast_slice(&table.entries),
+        seeds: bytemuck::cast_slice(&table.seeds),
+        segment_bytes: table.segment_bytes,
+        trie: &v.trie,
+        spans: &[],
+        default_color: DEFAULT_COLOR_PACKED,
+    };
+    glyph_field_visible::layout_all_lines(&v.device, &v.queue, &inputs)
+}
+
+pub fn diff_corpus(corpus: &Corpus, trie: &Arc<TrieTable>, visible: Option<&VisibleOracle>) -> Result<CorpusDiff, String> {
     let items: Vec<LayoutItem<'_>> = corpus
         .items
         .iter()
@@ -661,6 +760,39 @@ pub fn diff_corpus(corpus: &Corpus, trie: &Arc<TrieTable>) -> Result<CorpusDiff,
     }
     out.paint_slots = paint_derived.len();
 
+    // The VISIBLE tier (M2, 2026-10-10): the visible field's kernel over
+    // every line, against the device Pass 2's Derived slots above — same
+    // bytes, same record, slot order = item, line, byte on both sides.
+    if let Some(v) = visible {
+        let got = visible_slots_of(corpus, trie, v);
+        out.visible_slots = derived_slots.len();
+        if got.len() != derived_slots.len() {
+            out.visible_bad += got.len().abs_diff(derived_slots.len()).max(1);
+            out.firsts.push((
+                format!("{} (visible kernel)", corpus.name),
+                format!("{} slots from the kernel, {} from the device Pass 2", got.len(), derived_slots.len()),
+            ));
+        }
+        let mut first_bad: Option<usize> = None;
+        for (k, (g, d)) in got.iter().zip(derived_slots.iter()).enumerate() {
+            if g != d {
+                out.visible_bad += 1;
+                first_bad.get_or_insert(k);
+            }
+        }
+        if let Some(k) = first_bad {
+            let item = derived_places
+                .iter()
+                .position(|p| (p.slot_base as usize..p.slot_base as usize + p.slot_count as usize).contains(&k))
+                .map(|i| corpus.items[i].label.clone())
+                .unwrap_or_else(|| "?".into());
+            out.firsts.push((
+                format!("{item} (visible kernel)"),
+                format!("slot {k}: kernel {:?} vs device Pass 2 {:?}", got[k], derived_slots[k]),
+            ));
+        }
+    }
+
     let ref_all: Vec<GlyphRecord> = refs.iter().flat_map(|r| r.records.iter().copied()).collect();
     let hyper_all: Vec<GlyphRecord> = hyper_recs.into_iter().flatten().collect();
     out.seam = diff_backends(
@@ -675,6 +807,14 @@ pub fn diff_corpus(corpus: &Corpus, trie: &Arc<TrieTable>) -> Result<CorpusDiff,
 pub fn run_hyper_oracle_check(paths: &[PathBuf], cluster_mode: ClusterMode) -> ! {
     let strict = std::env::var("GLYPH_HYPER_ORACLE_STRICT").is_ok_and(|v| v == "1");
     let trie = crate::default_trie();
+    // The visible tier runs the kernel on this host's GPU; a host without
+    // one can still run the five CPU tiers, and says so.
+    let visible = if std::env::var_os("GLYPH_HYPER_ORACLE_NO_GPU").is_some() {
+        println!("hyper-oracle NOTE: GLYPH_HYPER_ORACLE_NO_GPU set — the visible tier is skipped");
+        None
+    } else {
+        Some(VisibleOracle::new(&trie))
+    };
     let mut total = CorpusDiff::default();
     let mut failed = 0usize;
     let mut first: Option<(String, String)> = None;
@@ -686,7 +826,7 @@ pub fn run_hyper_oracle_check(paths: &[PathBuf], cluster_mode: ClusterMode) -> !
                 std::process::exit(1);
             }
         };
-        let d = match diff_corpus(&corpus, &trie) {
+        let d = match diff_corpus(&corpus, &trie, visible.as_ref()) {
             Ok(d) => d,
             Err(e) => {
                 eprintln!("hyper-oracle FAIL: {}: HyperLayout refused the corpus: {e}", corpus.name);
@@ -699,16 +839,17 @@ pub fn run_hyper_oracle_check(paths: &[PathBuf], cluster_mode: ClusterMode) -> !
             && d.placement_bad == 0
             && device_bad == 0
             && d.paint_bad == 0
+            && d.visible_bad == 0
             && d.seam.is_ok();
         if clean {
             println!(
-                "  PASS {:<34} {} item(s), {} records, {} instances, {} device slots x2 bit-exact ({} sequence heads, {} ASCII-led)",
-                corpus.name, d.items, d.records, d.instances, d.device_slots, d.heads, d.ascii_heads
+                "  PASS {:<34} {} item(s), {} records, {} instances, {} device slots x2 bit-exact, visible kernel {} slots ({} sequence heads, {} ASCII-led)",
+                corpus.name, d.items, d.records, d.instances, d.device_slots, d.visible_slots, d.heads, d.ascii_heads
             );
         } else {
             failed += 1;
             println!(
-                "FAIL  {:<34} {}/{} records, {}/{} instances, {}/{} placements differ; device {}+{} slots (render+derived), {} placements; paint {}/{} slots ({} sequence heads, {} ASCII-led)",
+                "FAIL  {:<34} {}/{} records, {}/{} instances, {}/{} placements differ; device {}+{} slots (render+derived), {} placements; paint {}/{} slots; visible kernel {}/{} slots ({} sequence heads, {} ASCII-led)",
                 corpus.name,
                 d.record_bad,
                 d.records,
@@ -721,6 +862,8 @@ pub fn run_hyper_oracle_check(paths: &[PathBuf], cluster_mode: ClusterMode) -> !
                 d.device_placement_bad,
                 d.paint_bad,
                 d.paint_slots * 2,
+                d.visible_bad,
+                d.visible_slots,
                 d.heads,
                 d.ascii_heads
             );
@@ -753,6 +896,8 @@ pub fn run_hyper_oracle_check(paths: &[PathBuf], cluster_mode: ClusterMode) -> !
         total.paint_slots += d.paint_slots;
         total.paint_bad += d.paint_bad;
         total.paint_colored += d.paint_colored;
+        total.visible_slots += d.visible_slots;
+        total.visible_bad += d.visible_bad;
     }
 
     // Anti-vacuity before the verdict: a differ that compared nothing passes
@@ -769,6 +914,14 @@ pub fn run_hyper_oracle_check(paths: &[PathBuf], cluster_mode: ClusterMode) -> !
         eprintln!("hyper-oracle FAIL: the paint tier compared nothing — no reference slot carries a syntax colour");
         std::process::exit(1);
     }
+    if visible.is_some() && total.visible_slots == 0 {
+        eprintln!("hyper-oracle FAIL: the visible tier compared nothing — 0 slots");
+        std::process::exit(1);
+    }
+    if strict && visible.is_none() {
+        eprintln!("hyper-oracle FAIL (strict): the visible tier did not run (no device)");
+        std::process::exit(1);
+    }
     if strict && (total.heads == 0 || total.ascii_heads == 0) {
         eprintln!(
             "hyper-oracle FAIL (strict): the corpus does not exercise the sequence pass — {} heads, {} ASCII-led",
@@ -781,7 +934,7 @@ pub fn run_hyper_oracle_check(paths: &[PathBuf], cluster_mode: ClusterMode) -> !
             println!("first divergence: {label}: {f}");
         }
         eprintln!(
-            "hyper-oracle FAIL: {failed}/{} corpora differ — {}/{} records ({} in leader-mode items), {}/{} instances, {}/{} placements; device: {}+{}/{} slots (render+derived), {} placements; paint: {}/{} slots",
+            "hyper-oracle FAIL: {failed}/{} corpora differ — {}/{} records ({} in leader-mode items), {}/{} instances, {}/{} placements; device: {}+{}/{} slots (render+derived), {} placements; paint: {}/{} slots; visible kernel: {}/{} slots",
             paths.len(),
             total.record_bad,
             total.records,
@@ -796,11 +949,13 @@ pub fn run_hyper_oracle_check(paths: &[PathBuf], cluster_mode: ClusterMode) -> !
             total.device_placement_bad,
             total.paint_bad,
             total.paint_slots * 2,
+            total.visible_bad,
+            total.visible_slots,
         );
         std::process::exit(1);
     }
     println!(
-        "hyper-oracle PASS: {} corpora, {} items, {} records, {} instances, {} placements, and the device Pass 2's {} slots in both formats bit-exact vs the oracle-backed fold ({} sequence heads, {} ASCII-led); under syntax paint, {} slots x2 match the whole-item colours ({} not default)",
+        "hyper-oracle PASS: {} corpora, {} items, {} records, {} instances, {} placements, and the device Pass 2's {} slots in both formats bit-exact vs the oracle-backed fold ({} sequence heads, {} ASCII-led); under syntax paint, {} slots x2 match the whole-item colours ({} not default); the visible kernel's {} slots equal the device Pass 2's{}",
         paths.len(),
         total.items,
         total.records,
@@ -810,7 +965,9 @@ pub fn run_hyper_oracle_check(paths: &[PathBuf], cluster_mode: ClusterMode) -> !
         total.heads,
         total.ascii_heads,
         total.paint_slots,
-        total.paint_colored
+        total.paint_colored,
+        total.visible_slots,
+        if visible.is_some() { "" } else { " (tier skipped: no device)" }
     );
     std::process::exit(0);
 }
@@ -835,7 +992,7 @@ mod tests {
         let rp = repo_params(ClusterMode::Cluster);
         let text = b"fn main() {\n    let x = 1; // a comment that is long enough to wrap twice over\n}\n";
         let params = crate::repo::file_item_params(&rp, text.len(), 3);
-        let d = diff_corpus(&corpus_of(text, params), &crate::default_trie()).expect("layout");
+        let d = diff_corpus(&corpus_of(text, params), &crate::default_trie(), None).expect("layout");
         assert!(d.records > 0 && d.instances > 0, "compared nothing");
         assert_eq!(d.device_slots, d.instances, "the device tier emitted a different survivor count");
         assert_eq!((d.record_bad, d.instance_bad, d.placement_bad), (0, 0, 0), "{:?}", d.firsts);
@@ -858,7 +1015,7 @@ mod tests {
         for (mode, want_heads) in [(ClusterMode::Cluster, true), (ClusterMode::Leader, false)] {
             let rp = repo_params(mode);
             let params = crate::repo::file_item_params(&rp, text.len(), 2);
-            let d = diff_corpus(&corpus_of(text.as_bytes(), params), &trie).expect("layout");
+            let d = diff_corpus(&corpus_of(text.as_bytes(), params), &trie, None).expect("layout");
             assert!(d.records > 0 && d.device_slots == d.instances, "{mode:?}: compared nothing");
             assert_eq!((d.record_bad, d.instance_bad, d.placement_bad), (0, 0, 0), "{mode:?}: {:?}", d.firsts);
             assert_eq!(
@@ -885,6 +1042,8 @@ mod tests {
     #[test]
     fn pagination_agrees_on_every_tier() {
         let trie = crate::default_trie();
+        // The visible tier too: the kernel over every shape of the grid.
+        let visible = VisibleOracle::new(&trie);
         let texts: [&str; 3] = [
             "abcdefgh\n\nabcdefghijklmnop\nxy\n\u{E9}t\u{E9} caf\u{E9} \u{4E16}\u{754C}\nabcdefghijkl\n\n12345678901234567890123",
             "line 0\nline 1\nline 2\nline 3\nline 4\nline 5\nline 6\nline 7\nline 8\nline 9 is the widest unterminated",
@@ -933,9 +1092,11 @@ mod tests {
                         .map(|(i, t)| CorpusItem { label: format!("text {i}"), bytes: t.as_bytes().to_vec(), params })
                         .collect(),
                 };
-                let d = diff_corpus(&corpus, &trie).expect("layout");
+                let d = diff_corpus(&corpus, &trie, Some(&visible)).expect("layout");
                 let at = format!("{mode:?} rows {rows} cols {cols} scroll {scroll} wide {wide} wrap {wrap}");
                 assert!(d.records > 0 && d.device_slots == d.instances, "{at}: compared nothing");
+                assert_eq!(d.visible_slots, d.device_slots, "{at}: the visible tier compared every slot");
+                assert_eq!(d.visible_bad, 0, "{at}: visible kernel: {:?}", d.firsts);
                 assert_eq!((d.record_bad, d.instance_bad, d.placement_bad), (0, 0, 0), "{at}: {:?}", d.firsts);
                 assert_eq!(
                     (d.device_render_bad, d.device_derived_bad, d.device_placement_bad),
