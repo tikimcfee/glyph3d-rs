@@ -1,5 +1,12 @@
 # Architecture & Implementation Plan: Agent Stacks, Focus Locking & Workdesk Integration
 
+> **Status (2026-10-10): partly implemented, open.** The spatial scene graph
+> (`native/src/spatial_scene/`, bevy_ecs) and the Agent Carrel exist; the
+> rest is unexecuted. Agent cards are host-staged at absolute positions, which
+> ties them to the instanced field mode; making each card an item (a byte
+> range with its own group transform) is the open question that would let
+> them run in the derived and visible modes.
+
 **Date**: 2026-10-02  
 **Target Repository**: `glyph3d-native` (`native/`)  
 **Context**: Headless Bevy ECS Spatial Scene Graph + WGPU Renderer  

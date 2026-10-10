@@ -7,7 +7,7 @@ Companion deep-dive: `integration/egui-integration-report.md` (330 lines, API-le
 
 ## TL;DR
 
-Version stars align: our crate pins **wgpu 30 / winit 0.30**, and egui 0.36.1's workspace pins **wgpu 30.0 / winit 0.30.13**. No shim or downgrade needed — this matches the plan in `out/STAGE_I_REPORT.md` ("egui stage — next stage", unblocked after the glam bump).
+Version stars align: our crate pins **wgpu 30 / winit 0.30**, and egui 0.36.1's workspace pins **wgpu 30.0 / winit 0.30.13**. No shim or downgrade needed — this matches the plan in `out/history/STAGE_I_REPORT.md` ("egui stage — next stage", unblocked after the glam bump).
 
 Integration shape: **embed egui manually** (egui + egui-winit + egui-wgpu), **not** eframe. We keep our own event loop, surface, and scene pass; egui becomes a second render pass with `LoadOp::Load` on top. The heavy work is *input-consumption gating* (we currently have none), not rendering.
 

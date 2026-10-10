@@ -27,7 +27,7 @@ pollster = "0.4"
 bytemuck = { version = "1", features = ["derive"] }
 log = "0.4"
 image = "0.25"
-# Stage I: 0.30 → 0.33 bump (its own gated mini-stage — see out/STAGE_I_REPORT.md).
+# Stage I: 0.30 → 0.33 bump (its own gated mini-stage — see out/history/STAGE_I_REPORT.md).
 # Feature flags from Stage H carried over; all three names verified to still
 # exist in the published 0.33.6 manifest (docs.rs/crate/glam/0.33.6/features):
 #   approx            — epsilon-compare traits for oracle-style tests (additive

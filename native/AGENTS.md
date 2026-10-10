@@ -333,7 +333,7 @@ One logical change per commit; run `cargo glyph test` before each lands and
 put what you ran in the message. Untracked scratch (`out/tooling-ab/sweep/`,
 proof PNGs) is fine to regenerate; tracked artifacts change only on purpose.
 
-The `out/STAGE_<X>_REPORT.md` convention is **retired** — see root `AGENTS.md`
+The `out/history/STAGE_<X>_REPORT.md` convention is **retired** — see root `AGENTS.md`
 § "Where work lands". Do not open a new letter. Multi-part work still deserves a
 written note in `out/`; it just does not need that template.
 

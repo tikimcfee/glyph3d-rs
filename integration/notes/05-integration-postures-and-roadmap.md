@@ -83,7 +83,7 @@ churn.
 Each item is independent, reversible, and none touches the byte→record→instance
 determinism chain un-gated.
 
-**Stage H — "the tooling stage" — ✅ LANDED (Sep 2026, `out/STAGE_H_REPORT.md`).**
+**Stage H — "the tooling stage" — ✅ LANDED (Sep 2026, `out/history/STAGE_H_REPORT.md`).**
 wgpu-profiler (pass-level GPU timings behind `GLYPH_PROFILE=1`; first real numbers:
 repo-wide glyph pass 4.079 ms GPU vs cull 0.000 ms CPU — the "cull is free" claim is
 now measured), naga validation (19 tests), clap 4.6.6 CLI with a 15-test parity suite,
@@ -91,7 +91,7 @@ glam flags, encase layout assertions (option b). Caveats carried forward: Metal 
 in-pass timestamps; text.png baseline is input-sensitive to main.rs edits; puffin_egui
 still blocked on its egui 0.33 pin.
 
-**Stages I & J — ✅ LANDED (Sep 2026, `out/STAGE_I_REPORT.md` + `out/STAGE_J_REPORT.md`).**
+**Stages I & J — ✅ LANDED (Sep 2026, `out/history/STAGE_I_REPORT.md` + `out/history/STAGE_J_REPORT.md`).**
 I: glam 0.30 → 0.33.6 **byte-identical** + the text.png caveat retired (immutable
 `fixtures/baseline-view.txt` — the caveat below is historical). J: hygiene sweep — clippy
 14→0, dead-code/unwrap triage, `native/AGENTS.md` house rules, `tools/check-all.sh`

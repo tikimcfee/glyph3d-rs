@@ -1,5 +1,5 @@
 //! The launcher: a terminal front end of the renderer itself (C27,
-//! 2026-10-10; plan in `out/PLAN-LAUNCHER-INTO-RENDERER-2026-10-10.md`).
+//! 2026-10-10; plan in `out/history/PLAN-LAUNCHER-INTO-RENDERER-2026-10-10.md`).
 //!
 //! `glyph3d-native --launcher`, or no arguments at all on a terminal, opens
 //! it. Its state is a `LaunchConfig` over the CLI's own defaults (`model`),

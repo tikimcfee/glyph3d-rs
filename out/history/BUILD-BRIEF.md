@@ -1,3 +1,5 @@
+> **History.** Moved to `out/history/` on 2026-10-10: a dated record, not current state. The original 2026-09-05 brief, executed; Mojo-era. What is true now: `README.md`, root `AGENTS.md`, `out/MAINTENANCE-NOTES-2026-10-08.md`.
+
 # Brief: build the build system — **EXECUTED, and this is the record of the ask**
 
 > **DO NOT READ THIS AS CURRENT STATE.** This brief was written on 2026-09-05 to
@@ -244,7 +246,7 @@ Three numbering schemes appear in this tree; two are historical and will
 mislead you.
 
 - **Lettered stages (`Stage A`..`Stage L`)** name past batches of work recorded
-  in `out/STAGE_*_REPORT.md`. There is no index and never was — A, B and D have
+  in `out/history/STAGE_*_REPORT.md`. There is no index and never was — A, B and D have
   no report. Treat any stage letter outside `out/` as archaeology, including the
   `g` in `tools/check-pick-oracle.sh`, which is a fossil letter and not a position
   (that script is the pick oracle; one caller, cheap to rename if you are

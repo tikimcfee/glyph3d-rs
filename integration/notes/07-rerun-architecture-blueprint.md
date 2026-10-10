@@ -147,7 +147,7 @@ editing it is a re-baseline act.
   tuning becomes a time sink again (it was the Stage C loop). Must be feature-gated and must not
   change release bytes — gate: byte-compare with the feature off.
 
-### Stage K (UI — next stage, per `out/STAGE_I_REPORT.md` remaining-gaps #1)
+### Stage K (UI — next stage, per `out/history/STAGE_I_REPORT.md` remaining-gaps #1)
 
 Choose **surface-direct egui** over the rerun bridge shape: our pass, then the egui pass, same
 encoder, into the surface view (the seam STAGE_H reserved at `windowed.rs:125–140`). Rerun needs
@@ -227,5 +227,5 @@ Clone: `<rerun-clone>` @ `cb5e9d6`. Read in this order:
 | root `ARCHITECTURE.md` | ecosystem map (SDK/Arrow store/viewer crates) — context only; re_renderer's own source is the blueprint |
 
 *Sources: direct source read of the clone above; `glyph3d-native` at `4cb3c81` (module headers,
-`out/STAGE_F|G|H_REPORT.md`, `out/PICK_FIX_REPORT.md`, `tools/check-stage-g.sh`); sibling notes
+`out/STAGE_F|G|H_REPORT.md`, `out/history/PICK_FIX_REPORT.md`, `tools/check-stage-g.sh`); sibling notes
 00–06. All file:line citations spot-verified on 2026-09-01.*

@@ -1,3 +1,5 @@
+> **History.** Moved to `out/history/` on 2026-10-10: a dated record, not current state. What is true now: `README.md`, root `AGENTS.md`, `out/MAINTENANCE-NOTES-2026-10-08.md`.
+
 # Stage E1 — real atlas trie in the Mojo engine
 
 **Goal**: replace the toy fixture trie (`GLYPH_ID = (cp % 4093) + 1`, toy

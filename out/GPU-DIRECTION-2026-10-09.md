@@ -156,7 +156,7 @@ Three more facts the numbers alone do not show:
   size: 2887507456` (`cubecl-wgpu/src/compute/server.rs:358`, reached from
   `tail_emit.rs:22`). HyperLayout chunks at the binding limit; the chain does
   not. **Measured**, 5 of 5 runs.
-- **M2, quoted** from `out/CUBECL-PERFORMANCE-HANDOFF-2026-10-05.md`: 605–719 ms
+- **M2, quoted** from `out/history/CUBECL-PERFORMANCE-HANDOFF-2026-10-05.md`: 605–719 ms
   backend on the flagship, 235 ms of GPU kernel time (171 ms in
   `apply_and_emit`: 3 GB in 171 ms is 18 GB/s on a ~100 GB/s part — that kernel
   is not bandwidth-bound on Metal, or the timestamps include something else; I
@@ -431,7 +431,7 @@ What would be deleted, and what is lost:
   `tools/check-cubecl.sh` and the mutations `emitter-ordinal-zeroed` and the
   one on `cubecl_chain/mod.rs`; `tools/gpu_profile/`; and the prose in
   `AGENTS.md`, `native/AGENTS.md`, `.agents/`, `README.md`,
-  `research/desktop-platform-audit.md`. `out/CUBECL-PERFORMANCE-HANDOFF-2026-10-05.md`
+  `research/desktop-platform-audit.md`. `out/history/CUBECL-PERFORMANCE-HANDOFF-2026-10-05.md`
   stays as history.
 - **Keep** `native/fixtures/cubecl-fork/` (IMMUTABLE; `hyper-oracle` reads it in
   eight places and it is the only corpus with the m ≥ 3 / seg ≥ 3 paginate

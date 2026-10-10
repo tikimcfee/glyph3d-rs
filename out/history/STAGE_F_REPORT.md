@@ -1,3 +1,5 @@
+> **History.** Moved to `out/history/` on 2026-10-10: a dated record, not current state. What is true now: `README.md`, root `AGENTS.md`, `out/MAINTENANCE-NOTES-2026-10-08.md`.
+
 # Stage F — interactivity: fly camera + per-file frustum/LOD culling
 
 **Goal**: make the 95M-glyph repo field navigable at interactive rates.

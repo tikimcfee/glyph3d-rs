@@ -1,5 +1,9 @@
 # Ground environment + settings-in-config — 2026-10-09
 
+> **Status (2026-10-10): step 1 merged to main; step 2 (lift the layout onto
+> the ground, which moves goldens) open.** The worktree named below is
+> historical.
+
 Branch `ground-environment`, built in the sibling worktree `../glyph3d-rs-ground`.
 This is step 1 of grounding the GUI: put a ground plane and sky behind the scene to
 see how it feels, and get every tunable value out of the code first. **No golden

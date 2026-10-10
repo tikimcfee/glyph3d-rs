@@ -1,3 +1,5 @@
+> **History.** Moved to `out/history/` on 2026-10-10: a dated record, not current state. What is true now: `README.md`, root `AGENTS.md`, `out/MAINTENANCE-NOTES-2026-10-08.md`.
+
 # Stage C — Slug analytic-coverage glyph renderer (WGSL / raw wgpu)
 
 Status: **complete and verified**. `cargo build --release` is clean (0 warnings).
@@ -37,10 +39,10 @@ Status: **complete and verified**. `cargo build --release` is clean (0 warnings)
 
 ## Verification (all via offscreen `--screenshot` + visual inspection)
 
-1. **Whole file** (`glyphVertex.js`, 303 lines, 16,703 instances): upright, monospace-exact spacing, no overlap, no flipped glyphs, syntax colors correct — [out/stageC.png](../out/stageC.png).
-2. **Near camera** (4-line test file, zoom 4): beziers perfectly smooth at ~200 px glyph height — no polygonal edges; AA smooth on diagonals and rounds — [out/stageC_zoom.png](../out/stageC_zoom.png), crop [out/crop_zoom4.png](../out/crop_zoom4.png).
+1. **Whole file** (`glyphVertex.js`, 303 lines, 16,703 instances): upright, monospace-exact spacing, no overlap, no flipped glyphs, syntax colors correct — [out/stageC.png](../../out/stageC.png).
+2. **Near camera** (4-line test file, zoom 4): beziers perfectly smooth at ~200 px glyph height — no polygonal edges; AA smooth on diagonals and rounds — [out/stageC_zoom.png](../../out/stageC_zoom.png), crop [out/crop_zoom4.png](../../out/crop_zoom4.png).
 3. **Line-height A/B** (identical code vs comment lines): measured ink bands 63/61/63/61 px — identical (±2 px phase); heavier comment look at full-file zoom is the *intended* minification dilation, not a layout bug.
-4. **Emoji/tab** (`🐀🚀` + tabs): 2 bitmap/missing codepoints → blank double-width cells; tab stops land on multiples of 4 — [out/stageC_emoji.png](../out/stageC_emoji.png).
+4. **Emoji/tab** (`🐀🚀` + tabs): 2 bitmap/missing codepoints → blank double-width cells; tab stops land on multiples of 4 — [out/stageC_emoji.png](../../out/stageC_emoji.png).
 5. **Unicode fallback**: Ω é ü → ± × render via the Meslo/DejaVu chain slots.
 
 ## Performance (1600×1000 offscreen, release build)
