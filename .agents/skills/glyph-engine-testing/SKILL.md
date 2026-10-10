@@ -79,9 +79,9 @@ Outputs mean, min, max, and stddev for:
 
 ## 4. UI vs TUI Distinction
 
-- **Launcher TUI (`glyph tui`)**:
-  - Interactive terminal application built with Ratatui (`glyph/src/tui/`). Run via `cargo run -p glyph -- tui`.
-  - Features dynamic subtitles on focus/select for layout engines (`hyper`, `direct`, `batch`) and field modes (`instanced`, `derived`).
+- **Launcher (`cargo glyph run` with no arguments, or `--launcher`)**:
+  - A terminal front end of the renderer itself, built with Ratatui (`native/src/launcher/`, behind the default `launcher` feature; `cargo glyph tui` is a shortcut). It moved out of the build tool on 2026-10-10 (C27).
+  - Its state is a `LaunchConfig`; every choice row lists the flag's own clap `ValueEnum` variants, and the focused row's subtitle is the selected variant's doc comment. Enter writes the config to a temp file and starts the same binary with `--launch-config <file>`; the menu returns when the window closes.
 - **In-Engine UI (`egui`)**:
   - The HUD rendered directly inside the 3D graphics window.
   - Controls camera frustum, spatial zone dragging, desk rolodex, and live diagnostics (`F1` toggles debug panel).

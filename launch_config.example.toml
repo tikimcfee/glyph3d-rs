@@ -4,12 +4,19 @@
 #
 #     cp launch_config.example.toml launch_config.toml
 #
-# Startup defaults for interactive windowed runs. The renderer reads it from the
-# repo root or native/, or from --launch-config <path>; the `cargo glyph`
-# launcher TUI reads it from the working directory or the repo root. Any CLI
-# flag overrides a setting here, and a `--screenshot` run (every gate) never
-# reads the file. Unknown keys are errors. Values below DIFFER from the CLI
-# defaults where marked.
+# Startup defaults for interactive windowed runs, and the launcher's starting
+# point (`cargo glyph run` with no arguments, or `--launcher`). The renderer
+# reads it from the working directory or its parent, or from --launch-config
+# <path>. Any CLI flag overrides a setting here (a scene flag such as
+# --render-file overrides all of the scene keys), and a `--screenshot` run
+# (every gate) never reads the file. Unknown keys are errors, and so are
+# unknown values: a mode is spelled as its flag spells it (`--help` lists
+# them). Values below DIFFER from the CLI defaults where marked.
+#
+# The launcher writes this same format for each launch (every option you
+# picked, the scene's path made absolute) and starts the renderer on it, so
+# the status line's "Last launch" file repeats a launch by hand:
+#     glyph3d-native --launch-config <that file>
 #
 # Top-level keys below are launch options. [section] tables override the
 # compiled settings in config/defaults.toml, key by key — see the end of file.
@@ -69,8 +76,11 @@ no_ui = false
 # Default repository to open if none specified on CLI (optional)
 # load_repo = "native/fixtures/g-pick-repo"
 
-# Repos the launcher TUI cycles through with ◄/► (optional). Without this the
+# Repos the launcher cycles through with ◄/► (optional). Without this the
 # launcher offers "." and "native/fixtures/g-pick-repo". Add your own corpora.
+# Other scene keys: render_file = "<path>", demo = true, focus_file = "<substr>".
+# Other modes: layout_mode = "shelf" | "carrel", debug_tint = "off" | "lod" |
+# "cull", present_mode = "fifo" | "mailbox" | "immediate".
 # repo_presets = [".", "native/fixtures/g-pick-repo", "~/src/some-large-repo"]
 
 # Default agent session transcript path to load at startup (optional)

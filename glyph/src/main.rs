@@ -31,7 +31,6 @@ mod manifest;
 mod paths;
 mod products;
 mod prove;
-mod tui;
 
 use clap::{Parser, Subcommand};
 use std::process::{Command, ExitCode};
@@ -66,7 +65,8 @@ enum Cmd {
         #[arg(long)]
         frozen: bool,
     },
-    /// Launch the renderer. Arguments are passed through.
+    /// Bring the renderer up to date, then launch it. Arguments are passed
+    /// through; none at all opens its launcher.
     Run {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
@@ -98,8 +98,34 @@ enum Cmd {
     /// rasterizer's golden set: how many pixels differ and in what shape.
     /// An instrument, not a gate — cross-vendor equality is not a goal.
     Drift,
-    /// Launch the interactive terminal UI (mission-control launcher).
+    /// The renderer's terminal launcher: `run --launcher` (C27, 2026-10-10;
+    /// the launcher is part of the renderer now, `native/src/launcher/`).
     Tui,
+}
+
+/// `run`: the renderer, current, in YOUR directory. Until C27 (2026-10-10)
+/// this ran whatever binary was there, current or not; the products step
+/// costs a hash of the inputs when nothing changed.
+fn cmd_run(m: &Manifest, args: &[String]) -> bool {
+    if !ensure_products(m, false) {
+        return false;
+    }
+    // Runs in YOUR directory, not native/. A file argument means what it says
+    // relative to where you typed it — anything else would make
+    // `--render-file main.rs` from your own project silently open
+    // native/main.rs. The checks cd to native/ because they pass
+    // native-relative fixture paths on purpose; that is their business, not
+    // yours.
+    //
+    // stdio is inherited rather than captured: this launches a windowed app
+    // (or the terminal launcher), and buffering its output is useless.
+    let cwd = std::env::current_dir().unwrap_or_else(|_| root());
+    Command::new(root().join("target/release/glyph3d-native"))
+        .args(args)
+        .current_dir(cwd)
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
 }
 
 fn cmd_test(m: &Manifest, scope: Option<Scope>, frozen: bool) -> bool {
@@ -197,34 +223,12 @@ fn main() -> ExitCode {
             ok
         }
         Cmd::Test { scope, frozen } => cmd_test(&m, scope, frozen),
-        Cmd::Run { args } => {
-            // Runs in YOUR directory, not native/. A file argument means what
-            // it says relative to where you typed it — anything else would make
-            // `--render-file main.rs` from your own project silently open
-            // native/main.rs. The checks cd to native/ because they pass
-            // native-relative fixture paths on purpose; that is their business,
-            // not yours.
-            //
-            // stdio is inherited rather than captured: this launches a windowed
-            // app, and buffering its output until the window closes is useless.
-            let cwd = std::env::current_dir().unwrap_or_else(|_| root());
-            let exe = root().join("target/release/glyph3d-native");
-            if !exe.exists() {
-                println!("FAIL  {} does not exist — run `cargo glyph build`.", exe.display());
-                return ExitCode::from(1);
-            }
-            Command::new(exe)
-                .args(&args)
-                .current_dir(cwd)
-                .status()
-                .map(|s| s.success())
-                .unwrap_or(false)
-        }
+        Cmd::Run { args } => cmd_run(&m, &args),
         Cmd::Prove { gate, mutations, changed } => {
             cmd_prove(&m, gate.as_deref(), &mutations, changed)
         }
         Cmd::Drift => cmd_drift(&m),
-        Cmd::Tui => tui::run(&m),
+        Cmd::Tui => cmd_run(&m, &["--launcher".to_string()]),
         Cmd::Gate { name } => match m.gate.iter().find(|g| g.name == name) {
             Some(g) => run_gate(g, &m),
             None => {

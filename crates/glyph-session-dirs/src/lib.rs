@@ -1,7 +1,9 @@
 //! Where agent harnesses keep their session transcripts.
 //!
-//! One table, read by the renderer's session browser (F7) and by the
-//! `cargo glyph` launcher, so the two never disagree about where to look.
+//! One table, read by the renderer's session browser (F7) and its
+//! launcher, so the two never disagree about where to look. (The launcher
+//! lived in the build tool until C27, 2026-10-10, which is why this is a
+//! std-only crate of its own.)
 //!
 //! Resolution is per harness:
 //! - a path set in `launch_config.toml` wins, and is the ONLY place scanned

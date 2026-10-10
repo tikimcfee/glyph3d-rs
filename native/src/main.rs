@@ -32,7 +32,7 @@
 
 use clap::CommandFactory;
 use glyph3d_native::cli::{
-    parse_cli, Cli, CliCommand, FixtureTask, GpuInfoMode, RenderTarget,
+    parse_cli_from, Cli, CliCommand, FixtureTask, GpuInfoMode, RenderTarget,
 };
 use glyph3d_native::*;
 
@@ -72,7 +72,22 @@ fn main() {
         .with_writer(std::io::stderr)
         .with_span_events(tracing_subscriber::fmt::format::FmtSpan::CLOSE)
         .init();
-    let cli = parse_cli();
+    // The launcher before the config merge: it loads the file itself and
+    // shows a bad one on its status line instead of exiting on it.
+    let matches = Cli::command().get_matches();
+    #[cfg(feature = "launcher")]
+    if launcher::wanted(&matches) {
+        std::process::exit(launcher::run(matches.get_one::<std::path::PathBuf>("launch_config").cloned()));
+    }
+    #[cfg(not(feature = "launcher"))]
+    if matches.get_flag("launcher") {
+        eprintln!("error: --launcher: this build has no launcher (the `launcher` feature is off)");
+        std::process::exit(1);
+    }
+    let cli = parse_cli_from(matches).unwrap_or_else(|e| {
+        eprintln!("error: {e}");
+        std::process::exit(1);
+    });
 
     match cli.action() {
         CliCommand::GenerateCompletion { shell } => {
