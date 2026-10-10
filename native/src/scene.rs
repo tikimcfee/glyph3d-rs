@@ -61,6 +61,12 @@ pub trait SceneLike {
     /// Pin the camera to an explicit Fly pose (scripted oblique-pick repro).
     /// Default no-op (non-camera scenes ignore it).
     fn set_cam_pose(&mut self, _eye: [f32; 3], _yaw: f32, _pitch: f32) {}
+    /// The Fly pose `set_cam_pose` would reproduce: eye, yaw, pitch in
+    /// RADIANS (the F2 `GLYPH_POSE_PRINT` line converts to the degrees
+    /// `--cam-pose` takes). None for scenes without a fly camera.
+    fn cam_pose(&self) -> Option<([f32; 3], f32, f32)> {
+        None
+    }
     /// Resolve a pick; returns a log line (None = scene doesn't support it).
     fn apply_pick(&mut self, _ctx: &GpuContext, _cmd: &crate::glyph_scene::PickCommand) -> Option<String> {
         None

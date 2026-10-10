@@ -606,6 +606,12 @@ impl GlyphScene {
 
     /// Stage L (L4): pick hit → selection mask content.
     fn selection_from_hit(&self, h: &PickHit) -> Option<Selection> {
+        // The Visible field keeps no slot per glyph, so neither selection
+        // form has anything to name yet (M3 re-keys them by item/line/col);
+        // the pick itself resolved on the CPU and stands.
+        if self.field.visible().is_some() {
+            return None;
+        }
         if let Some(g) = &h.glyph {
             if let Some(slot) = g.slot {
                 let chunk_capacity = self.field.chunk_capacity();
@@ -739,6 +745,13 @@ impl GlyphScene {
         let Some(hit) = &self.picked else {
             return "verb: nothing picked yet — ignored".to_string();
         };
+        // Every verb below addresses a SLOT; the Visible field has none (its
+        // glyphs are re-laid every frame), so until M3 re-keys the verbs by
+        // byte range they are reported, not applied — the group verbs
+        // included, because their slot sweep would ask for slot math too.
+        if self.field.visible().is_some() {
+            return format!("verb {verb:?}: not keyed for the Visible field yet (M3) — ignored");
+        }
         let gid = hit.group_id;
         let rel = hit.rel_path.clone();
         let glyph = hit.glyph.clone();

@@ -178,11 +178,25 @@ fn an_unknown_color_mode_is_refused() {
 fn field_mode_parses_and_refuses_unknown() {
     assert_eq!(parse(&["--field-mode", "derived"]).field_mode, glyph_field::GlyphFieldMode::Derived);
     assert_eq!(parse(&["--field-mode", "instanced"]).field_mode, glyph_field::GlyphFieldMode::Instanced);
+    assert_eq!(parse(&["--field-mode", "visible"]).field_mode, glyph_field::GlyphFieldMode::Visible);
+    assert_eq!(parse(&[]).field_mode, glyph_field::GlyphFieldMode::Instanced, "the default stays instanced");
     let text = match try_parse(&["--field-mode", "vertexy"]) {
         Ok(_) => panic!("clap must refuse an unknown field mode"),
         Err(e) => e.to_string(),
     };
     assert!(text.contains("vertexy"), "the error must name the bad value: {text}");
+    // The visible mode reaches the scene options as itself, and its debug
+    // tint rides beside it: off by default (the uniform lane stays 0, so the
+    // stored modes' Params bytes are what they were), a named tier otherwise.
+    let plan = match parse(&["--load-repo", ".", "--field-mode", "visible"]).action() {
+        CliCommand::Render(plan) => plan,
+        _ => panic!("a repo load renders"),
+    };
+    assert_eq!(plan.cull_opts.field_mode, glyph_field::GlyphFieldMode::Visible);
+    assert_eq!(plan.cull_opts.debug_tint, 0);
+    assert_eq!(parse(&["--debug-tint", "lod"]).debug_tint.as_u32(), 1);
+    assert_eq!(parse(&["--debug-tint", "cull"]).debug_tint.as_u32(), 2);
+    assert!(try_parse(&["--debug-tint", "rainbow"]).is_err(), "clap must refuse an unknown tint");
 }
 
 /// Out-of-domain spacing is REFUSED at the boundary with the flag and the

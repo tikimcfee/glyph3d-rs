@@ -458,9 +458,14 @@ fn draw_graphics_section(f: &mut Frame, area: Rect, state: &LauncherState) {
                     Style::default().fg(Color::DarkGray)
                 },
             ),
-            format_choice("instanced (32B)", state.field_mode == FieldMode::Instanced, is_field_mode),
+            // Three choices in a half-width column: the slot sizes moved to
+            // the subtitle so the row fits a 120-column terminal (the right
+            // column is 60 wide; "(32B)"/"(20B)" pushed the third past it).
+            format_choice("instanced", state.field_mode == FieldMode::Instanced, is_field_mode),
             Span::raw(" "),
-            format_choice("derived (20B)", state.field_mode == FieldMode::Derived, is_field_mode),
+            format_choice("derived", state.field_mode == FieldMode::Derived, is_field_mode),
+            Span::raw(" "),
+            format_choice("visible (exp)", state.field_mode == FieldMode::Visible, is_field_mode),
         ]),
         Line::from(vec![
             line_prefix(is_ui),
@@ -791,6 +796,19 @@ mod tests {
         let buffer = terminal.backend().buffer();
         let content: String = buffer.content().iter().map(|c| c.symbol()).collect();
         assert!(content.contains("32 B RenderSlot"));
+
+        // The visible mode: the third choice is drawn in the launcher's own
+        // half-width column (60 of 120) and its subtitle says experimental.
+        state.field_mode = FieldMode::Visible;
+        terminal
+            .draw(|f| {
+                draw_graphics_section(f, Rect::new(0, 0, 60, 10), &state);
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let content: String = buffer.content().iter().map(|c| c.symbol()).collect();
+        assert!(content.contains("EXPERIMENTAL"), "{content}");
+        assert!(content.contains("[visible (exp)]"), "{content}");
 
         // Unfocus FieldMode: graphics section should not show field mode subtitle
         state.focus = FocusField::Greeking;

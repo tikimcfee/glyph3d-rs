@@ -447,7 +447,7 @@ pub fn prefetch_repo(
         .collect();
 
     let hyper_data = if strategy == Strategy::Hyper {
-        Some(crate::layout_hyper::prefetch_hyper(&walk.files, &file_params))
+        Some(crate::layout_hyper::prefetch_hyper(&walk.files, &file_params, params.field_mode))
     } else {
         None
     };
@@ -553,7 +553,9 @@ pub fn load_repo_from_prefetched(
             crate::gpu::SharedDevice::from_ctx(ctx),
             params.field_mode,
         ),
-        None => crate::layout::LayoutEngine::hyper(),
+        // Without a device the mode still matters for Visible (no slot is
+        // ever emitted, so it needs none); the other modes run as before.
+        None => crate::layout::LayoutEngine::hyper_with_mode(params.field_mode),
     };
     if let Some(hd) = hyper_data {
         backend.set_hyper_prefetched(hd);
@@ -766,6 +768,17 @@ pub fn load_repo_from_prefetched(
     drop(sp_views);
     stage_dur += t.elapsed();
 
+    // The visible form keeps the bytes: the walk's own Vecs move into the
+    // staging — one allocation per file, no copy of the corpus. Everything
+    // the walk still had to say (counts, times) is read before the move.
+    let files_len = walk.files.len();
+    let (walk_total_bytes, walk_skipped_large, walk_skipped_non_utf8, walk_dirs_visited) =
+        (walk.total_bytes, walk.skipped_large, walk.skipped_non_utf8, walk.dirs_visited);
+    if let Some(staging) = arena.visible_staging_mut() {
+        assert_eq!(staging.seeds.len(), files_len, "one visible seed per walked file");
+        staging.item_bytes = walk.files.into_iter().map(|f| f.bytes).collect();
+    }
+
     let t = Instant::now();
     let sp_grid = tracing::info_span!("repo.layout").entered();
     let mut controller = crate::layout_stack::LayoutController::from_mode(params.layout_mode, *params);
@@ -779,14 +792,14 @@ pub fn load_repo_from_prefetched(
         phases: backend.phases(),
         stage: stage_dur,
         layout: layout_dur,
-        files: walk.files.len(),
-        bytes: walk.total_bytes,
+        files: files_len,
+        bytes: walk_total_bytes,
         records: total_records,
         instances: instances_len,
         blanks: total_blanks,
-        skipped_large: walk.skipped_large,
-        skipped_non_utf8: walk.skipped_non_utf8,
-        dirs_visited: walk.dirs_visited,
+        skipped_large: walk_skipped_large,
+        skipped_non_utf8: walk_skipped_non_utf8,
+        dirs_visited: walk_dirs_visited,
         strategy,
         verified,
     };
@@ -848,7 +861,12 @@ impl RepoLoad {
         } else {
             Vec::new()
         };
-        let is_flat = self.color_mode == ColorMode::Flat;
+        // The visible form has no slots to fold a tint from: its backdrop
+        // takes the flat form's extension tint (no syntax heuristic runs in
+        // that mode, by decision), and no sub-file blocks — the field culls
+        // its own lines.
+        let visible = self.arena.is_visible();
+        let is_flat = self.color_mode == ColorMode::Flat || visible;
         let file_tints = self.arena.device_slots().map(|d| &d.file_tints);
         let file_blocks = self.arena.device_slots().map(|d| &d.file_blocks);
         let emoji_tint_pairs = self.arena.device_slots().map(|d| &d.emoji_tint_pairs);
@@ -901,7 +919,9 @@ impl RepoLoad {
                 }
             };
             let fast_blocks = file_blocks.and_then(|fb| fb.get(v.group_id as usize));
-            let blocks = if let Some(fbs) = fast_blocks {
+            let blocks = if visible {
+                Vec::new()
+            } else if let Some(fbs) = fast_blocks {
                 fbs.iter()
                     .map(|lb| crate::glyph_scene::BlockCull {
                         min: [
@@ -1002,12 +1022,31 @@ impl RepoLoad {
                     p
                 })
                 .collect();
+        // The visible field's items: the seam's seeds finished with what only
+        // the shelf layout knows — the group row and the world box the scene
+        // culls (the segment's, group offset applied).
+        let mut arena = self.arena;
+        if let Some(staging) = arena.visible_staging_mut() {
+            assert_eq!(staging.item_bytes.len(), self.files.len(), "the loader moved every file's bytes in");
+            let items: Vec<glyph_field_visible::VisibleItem> = self
+                .files
+                .iter()
+                .zip(segments.iter())
+                .zip(gpu_item_params.iter())
+                .enumerate()
+                .map(|(i, ((v, seg), gp))| {
+                    debug_assert_eq!(v.group_id as usize, i);
+                    staging.item(i, *gp, seg.min, seg.max)
+                })
+                .collect();
+            staging.items = items;
+        }
         StagedText {
-            glyphs_emitted: self.arena.len(),
+            glyphs_emitted: arena.len(),
             codepoints_decoded: self.stats.records,
             missing_or_bitmap: self.stats.blanks,
             segments,
-            instances: self.arena,
+            instances: arena,
             groups: self.groups,
             bounds_min: self.bounds_min,
             bounds_max: self.bounds_max,

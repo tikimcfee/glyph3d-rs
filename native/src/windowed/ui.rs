@@ -32,6 +32,10 @@ pub(super) struct EguiUi {
     pub(super) session_filter_harness: crate::agent_transcript::discovery::SessionHarnessFilter,
     /// Cached list of discovered agent sessions.
     pub(super) discovered_sessions: Option<Vec<crate::agent_transcript::discovery::DiscoveredSession>>,
+    /// The field HUD (F8 toggles): the always-on top-left readout of what
+    /// the glyph field is and what it did this frame. Independent of the
+    /// Debug window; open by default in `--field-mode visible`.
+    pub(super) hud_open: bool,
     /// What the last scan looked at, and why: one line from `glyph-session-dirs`.
     pub(super) session_dirs_report: String,
 }

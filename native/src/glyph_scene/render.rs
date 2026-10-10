@@ -57,6 +57,7 @@ pub(super) fn render_scene(
     if let (Some(probe), Some(cull)) = (&scene.ui_probe, &scene.cull) {
         let p = probe.borrow();
         cull.lod_min_px.set(p.lod_min_px);
+        cull.lod_backdrop_px.set(p.lod_backdrop_px);
         cull.file_backgrounds.set(p.file_backgrounds);
         cull.file_bg_color.set(p.file_bg_color);
     }
@@ -71,7 +72,14 @@ pub(super) fn render_scene(
         };
         scene.set_greek_mode(&ctx.queue, mode);
         scene.set_greek_onset_px(&ctx.queue, p.greek_onset_px);
+        scene.set_debug_tint(&ctx.queue, p.debug_tint);
     }
+    // A field that culls and draws itself (Visible): the scene's per-file
+    // glyph ranges are not built for it, its slot math is never asked, and
+    // the CPU cull keeps only two jobs — the BACKDROP quads (under the
+    // field's backdrop threshold, not the glyph one, so a washed item is not
+    // also a backdrop) and the hidden flags.
+    let self_drawing = scene.field.draws_itself();
 
     // Stage L (L1): fill every lane of the widened frame uniform from
     // values already computed here. px_scale is computed once and shared
@@ -91,6 +99,34 @@ pub(super) fn render_scene(
     };
     ctx.queue
         .write_buffer(&scene.camera_buf, 0, bytemuck::bytes_of(&cam));
+    // The self-culling field's per-frame work (cull, LOD sort, layout of the
+    // glyph-tier lines into its transient slots) goes into THIS encoder
+    // before the glyph pass. The thresholds are the cull cells (live from the
+    // panel in windowed runs, the `[lod]` settings offscreen): the glyph tier
+    // is the existing `min_px`, the backdrop tier the visible mode's own.
+    if self_drawing {
+        let p = scene.params.get();
+        let (lod_glyph_px, lod_backdrop_px) = scene
+            .cull
+            .as_ref()
+            .map(|c| (c.lod_min_px.get(), c.lod_backdrop_px.get()))
+            .unwrap_or_else(|| {
+                let s = &crate::config::settings().lod;
+                (s.min_px, s.visible_backdrop_px)
+            });
+        let prepare = glyph_field::FramePrepare {
+            view_proj: frame.view_proj.to_cols_array_2d(),
+            eye: frame.eye.to_array(),
+            viewport: [width as f32, height as f32],
+            px_scale,
+            lod_glyph_px,
+            lod_backdrop_px,
+            greek_mode: p.greek_mode,
+            debug_tint: p.debug_tint,
+            time: t,
+        };
+        scene.field.prepare(&ctx.queue, encoder, &prepare);
+    }
     if scene.environment.is_on() {
         let env_cam = EnvCamera {
             eye: frame.eye.as_dvec3(),
@@ -107,24 +143,27 @@ pub(super) fn render_scene(
     // legacy --no-cull path builds the Glyphs list straight from the
     // chunk counts (one full range per chunk — identical draws to the
     // pre-L2 per-chunk loop) and has no Backdrop phase content.
+    let mut cull_cpu_ms = 0.0f32;
     let phase_draws: PhaseDraws = if let Some(cull) = &scene.cull {
-        // Stage H: CPU scope timing (only when GLYPH_PROFILE=1 built a profiler).
-        let cull_t0 = ctx.profiler.as_ref().map(|_| std::time::Instant::now());
+        // Stage H: CPU scope timing (only when GLYPH_PROFILE=1 built a
+        // profiler); the HUD's cull figure reads the same clock.
+        let cull_t0 = (ctx.profiler.is_some() || scene.ui_probe.is_some()).then(std::time::Instant::now);
         let view = CullView {
             planes: frustum_planes(&frame.view_proj),
             eye: frame.eye,
             px_scale,
-            lod_min_px: cull.lod_min_px.get(),
+            lod_min_px: if self_drawing { cull.lod_backdrop_px.get() } else { cull.lod_min_px.get() },
             file_backgrounds: cull.file_backgrounds.get(),
             file_bg_color: cull.file_bg_color.get(),
         };
-        let phase_draws = cull_segments(
-            &cull.segments,
-            &cull.hidden,
-            &view,
-            scene.field.chunk_capacity(),
-            scene.field.chunk_count(),
-        );
+        // No chunks for a self-drawing field: zero chunks means the cull
+        // builds no glyph range (and never asks the field for its slot math).
+        let (chunk_cap, chunk_count) = if self_drawing {
+            (1, 0)
+        } else {
+            (scene.field.chunk_capacity(), scene.field.chunk_count())
+        };
+        let phase_draws = cull_segments(&cull.segments, &cull.hidden, &view, chunk_cap, chunk_count);
         if !phase_draws.backdrops.is_empty() {
             let max_cap = (cull.backdrop_insts_buf.size()
                 / std::mem::size_of::<crate::glyph_scene::cull::BackdropInst>() as u64)
@@ -141,7 +180,10 @@ pub(super) fn render_scene(
             );
         }
         if let Some(t0) = cull_t0 {
-            crate::gpu::record_cpu_scope(ctx, "cull (CPU)", t0.elapsed().as_secs_f64() * 1000.0);
+            cull_cpu_ms = t0.elapsed().as_secs_f32() * 1000.0;
+            if ctx.profiler.is_some() {
+                crate::gpu::record_cpu_scope(ctx, "cull (CPU)", f64::from(cull_cpu_ms));
+            }
         }
         if std::env::var_os("GLYPH_CULL_DEBUG").is_some() && t == 0.0 {
             let insts: u64 = phase_draws
@@ -157,6 +199,10 @@ pub(super) fn render_scene(
             );
         }
         phase_draws
+    } else if self_drawing {
+        // --no-cull on a self-drawing field: it still culls itself; the
+        // scene simply has no backdrops to offer.
+        PhaseDraws { backdrops: Vec::new(), glyph_ranges: Vec::new() }
     } else {
         PhaseDraws {
             backdrops: Vec::new(),
@@ -266,6 +312,14 @@ pub(super) fn render_scene(
             p.cull_instances = 0;
             p.cull_backdrops = 0;
         }
+        // The HUD's readout: what the field is, what the CPU cull cost, and
+        // the self-culling field's own counters (its readback lags a frame
+        // or two; nothing here waits for it).
+        p.field_mode = Some(scene.field.mode());
+        p.cull_cpu_ms = cull_cpu_ms;
+        p.segments = scene.cull.as_ref().map_or(0, |c| c.segments.len());
+        p.hidden_segments = scene.cull.as_ref().map_or(0, |c| c.hidden.iter().filter(|h| **h).count());
+        p.visible_stats = scene.field.visible().map(|v| v.stats());
         // The layout dial's readout: the field's depth extent over the
         // segment table (per frame, so group z-moves show too). None
         // under --no-cull — no segment table to measure.
@@ -409,7 +463,14 @@ pub(super) fn render_scene(
                     .as_ref()
                     .map(|p| p.borrow().begin_query("glyph stream", &mut pass));
                 pass.set_pipeline(scene.field.glyph_pipeline());
+                // A self-drawing field draws what its `prepare` emitted
+                // (the ranges are empty for it by construction); then its
+                // wash tier — one quad per line too small for glyphs —
+                // under its own pipeline.
                 scene.field.record_draws(&mut pass, &phase_draws.glyph_ranges);
+                if let Some(visible) = scene.field.visible() {
+                    visible.record_wash_draw(&mut pass);
+                }
                 if let (Some(p), Some(q)) = (&ctx.profiler, q) {
                     p.borrow().end_query(&mut pass, q);
                 }
@@ -427,7 +488,17 @@ pub(super) fn render_scene(
     // unchanged). Windowed shader path only: on the copy path
     // (offscreen) selection_fx/mask are None and this block is skipped,
     // so offscreen output never carries the tint.
-    let selection_phase = scene.selection.is_some().then_some(Phase::Selection);
+    // The Visible field has no slots to key a Selection::Glyph/Segment on
+    // (its glyphs are transient, re-laid every frame): the mask draws
+    // nothing there until M3 re-keys the selection by (item, line, column).
+    // Said once, not per frame.
+    if self_drawing && scene.selection.is_some() {
+        static SAID: std::sync::Once = std::sync::Once::new();
+        SAID.call_once(|| {
+            log::warn!("selection highlight: not keyed for the Visible field yet (M3) — the mask pass draws nothing");
+        });
+    }
+    let selection_phase = (scene.selection.is_some() && !self_drawing).then_some(Phase::Selection);
     // The pool slot the composite will read: the scene slot, or the
     // tinted ping-pong partner when a selection was rendered.
     let mut final_slot = pool_slot;

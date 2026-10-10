@@ -36,6 +36,8 @@ use pass2_device::{DerivedEmit, RenderEmit};
 mod page;
 mod pass2_host;
 pub use pass2_host::{compute_single_item_placement, layout_pass2_host, scan_item_max_row_extent};
+pub mod visible;
+pub use visible::{VisibleItemSeed, VisibleStaging};
 
 pub struct HyperLayout {
     trie: Option<Arc<TrieTable>>,
@@ -66,6 +68,18 @@ impl HyperLayout {
         Self {
             trie: None,
             device: Some(device),
+            field_mode,
+            prefetched_data: None,
+        }
+    }
+
+    /// No device, but a mode: Visible needs none (it emits no slot), so a
+    /// device-less load can still stage it; the other modes behave as
+    /// [`Self::new`] (host records).
+    pub(crate) fn with_field_mode(field_mode: GlyphFieldMode) -> Self {
+        Self {
+            trie: None,
+            device: None,
             field_mode,
             prefetched_data: None,
         }
@@ -123,8 +137,12 @@ impl HyperLayout {
         let em_height_fu = trie.metrics.em_height_fu;
         let bitmap_adv = fu_to_world(trie.bitmap_advance_fu, em_height_fu);
 
+        // The visible field wants Pass 1's line table and no Pass 2; the
+        // prefetch collected one only if it was told the same mode.
+        let wants_lines = allow_device && self.field_mode == GlyphFieldMode::Visible;
+
         // --- PASS 1 (Parallel): Prepass per chunk to find counts and max_row_extent ---
-        let (chunks, item_chunk_ranges, agg) = if let Some(pre) = self.prefetched_data.take() {
+        let (chunks, item_chunk_ranges, mut agg) = if let Some(pre) = self.prefetched_data.take() {
             let chunks: Vec<chunk::LayoutChunk<'_>> = pre
                 .chunk_defs
                 .iter()
@@ -138,16 +156,64 @@ impl HyperLayout {
         } else {
             let (chunks, item_chunk_ranges) = chunk::slice_items_into_chunks(items);
             let sp_pass1 = tracing::info_span!("hyper.pass1").entered();
-            let agg = pass1_prepass_chunks(
+            let agg = if wants_lines {
+                let item_bytes: Vec<&[u8]> = items.iter().map(|it| it.bytes).collect();
+                let file_params: Vec<crate::layout::ItemParams> = items.iter().map(|it| it.params).collect();
+                pass1_over_chunks_with_lines(
+                    &chunks,
+                    &item_chunk_ranges,
+                    &item_bytes,
+                    &file_params,
+                    &trie,
+                    bitmap_adv,
+                    em_height_fu,
+                    Some(SEGMENT_BYTES),
+                )
+            } else {
+                pass1_prepass_chunks(
+                    &chunks,
+                    &item_chunk_ranges,
+                    items,
+                    &trie,
+                    bitmap_adv,
+                    em_height_fu,
+                )
+            };
+            drop(sp_pass1);
+            (chunks, item_chunk_ranges, agg)
+        };
+        // A prefetch run for another mode carries no table: Pass 1 once more,
+        // with lines (the only cost of switching to Visible from the panel on
+        // a load whose prefetch predates the choice).
+        if wants_lines && agg.line_table.is_none() {
+            let item_bytes: Vec<&[u8]> = items.iter().map(|it| it.bytes).collect();
+            let file_params: Vec<crate::layout::ItemParams> = items.iter().map(|it| it.params).collect();
+            log::info!("visible: the prefetched Pass 1 carried no line table — running Pass 1 again with lines");
+            agg = pass1_over_chunks_with_lines(
                 &chunks,
                 &item_chunk_ranges,
-                items,
+                &item_bytes,
+                &file_params,
                 &trie,
                 bitmap_adv,
                 em_height_fu,
+                Some(SEGMENT_BYTES),
             );
-            drop(sp_pass1);
-            (chunks, item_chunk_ranges, agg)
+        }
+        let line_table = agg.line_table.take();
+
+        // The Derived lanes (which the Visible field reuses) are release-time
+        // limits: past them a slot would pack a wrong lane and misplace
+        // glyphs, so the load falls back to Instanced, once, loudly.
+        let field_mode = if allow_device {
+            let params: Vec<crate::layout::ItemParams> = items.iter().map(|it| it.params).collect();
+            let (mode, note) = effective_field_mode(self.field_mode, &derived_lane_limits(&agg.prepasses, &params));
+            if let Some(note) = note {
+                log::warn!("{note}");
+            }
+            mode
+        } else {
+            self.field_mode
         };
 
         let prepasses = agg.prepasses;
@@ -164,8 +230,54 @@ impl HyperLayout {
             slot_bases.push(chunk_slot_bases[range.start]);
         }
 
-        let derived = self.field_mode == GlyphFieldMode::Derived;
+        let derived = field_mode == GlyphFieldMode::Derived;
         let can_use_device = allow_device && self.device.is_some() && total_survivors > 0;
+
+        if field_mode == GlyphFieldMode::Visible && allow_device {
+            // No Pass 2: the field lays the visible lines out per frame from
+            // the bytes and the table. The placements come from the serial
+            // single-item measure (held to the device Pass 2 by
+            // `visible::tests`), in parallel over the items.
+            let sp = tracing::info_span!("hyper.visible_placements").entered();
+            let placements: Vec<ItemPlacement> = items
+                .par_iter()
+                .zip(prepasses.par_iter())
+                .zip(slot_bases.par_iter())
+                .map(|((item, pre), &slot_base)| {
+                    compute_single_item_placement(
+                        &item.params,
+                        item.bytes,
+                        slot_base,
+                        pre.max_row_extent,
+                        &trie,
+                        bitmap_adv,
+                        em_height_fu,
+                    )
+                    .0
+                })
+                .collect();
+            drop(sp);
+            let seeds = items
+                .iter()
+                .zip(prepasses.iter())
+                .zip(placements.iter())
+                .map(|((item, pre), placed)| VisibleItemSeed {
+                    params: item.params,
+                    group_id: item.group_id,
+                    max_row_extent: pre.max_row_extent,
+                    slot_count: placed.slot_count,
+                    byte_len: u32::try_from(item.bytes.len()).expect("an item's bytes exceed u32"),
+                })
+                .collect();
+            *arena = GlyphArena::from_visible(VisibleStaging {
+                item_bytes: Vec::new(),
+                line_table: line_table.expect("Pass 1 ran with lines for the visible field"),
+                seeds,
+                glyph_count: total_survivors as u64,
+                items: Vec::new(),
+            });
+            return Ok(placements);
+        }
 
         if can_use_device {
             let dev = self.device.as_ref().unwrap();
@@ -220,7 +332,7 @@ impl HyperLayout {
                 mapped_slots: if derived { None } else { mapped_base },
                 file_tints: pass2_out.file_tints,
                 file_blocks: pass2_out.file_blocks,
-                format: self.field_mode,
+                format: field_mode,
                 derived: derived_extras,
                 emoji_tint_pairs,
             };
@@ -243,6 +355,58 @@ impl HyperLayout {
             }
             Ok(placements)
         }
+    }
+}
+
+/// The Derived slot's lanes have fixed widths (`glyph_field_derived::derive`:
+/// `item:20`, `row:24 | x_page:8`), asserted only in debug builds where they
+/// are packed. This is the release-time decision, made ONCE per load from
+/// Pass 1's aggregate, before any slot is emitted or any field built: the
+/// item count against `ITEM_MAX`, each item's `row_count` against `ROW_MAX`,
+/// and each column-paged item's widest column page (`max_line_cols /
+/// page_cols`) against `X_PAGE_MAX`. The Visible field reuses the lanes, so
+/// it is held to the same limits. `Err` names the first item and limit.
+pub fn derived_lane_limits(prepasses: &[ItemPrepass], params: &[crate::layout::ItemParams]) -> Result<(), String> {
+    use glyph_field_derived::{ITEM_MAX, ROW_MAX, X_PAGE_MAX};
+    if prepasses.len() as u64 > u64::from(ITEM_MAX) + 1 {
+        return Err(format!(
+            "{} items, but the Derived item lane holds at most {} (ITEM_MAX {ITEM_MAX})",
+            prepasses.len(),
+            u64::from(ITEM_MAX) + 1
+        ));
+    }
+    for (i, (pre, p)) in prepasses.iter().zip(params).enumerate() {
+        // Rows are 0..row_count.
+        if pre.row_count > 0 && pre.row_count - 1 > ROW_MAX {
+            return Err(format!(
+                "item {i}: {} rows, but the Derived row lane holds at most {} (ROW_MAX {ROW_MAX})",
+                pre.row_count,
+                u64::from(ROW_MAX) + 1
+            ));
+        }
+        if p.has_page && p.page_cols > 0 {
+            let pages = pre.max_line_cols / p.page_cols as u32;
+            if pages > X_PAGE_MAX {
+                return Err(format!(
+                    "item {i}: a line of {} leaders reaches column page {pages} at page_cols {}, but the Derived lane holds at most {X_PAGE_MAX} (X_PAGE_MAX)",
+                    pre.max_line_cols, p.page_cols
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The field mode a load builds, given the one asked for and the lane
+/// check: a Derived or Visible request past the lanes becomes Instanced,
+/// with the warning to print. Instanced has no lanes to exceed.
+pub fn effective_field_mode(requested: GlyphFieldMode, limits: &Result<(), String>) -> (GlyphFieldMode, Option<String>) {
+    match (requested, limits) {
+        (GlyphFieldMode::Instanced, _) | (_, Ok(())) => (requested, None),
+        (mode, Err(why)) => (
+            GlyphFieldMode::Instanced,
+            Some(format!("field mode {mode} refused for this load — {why}; falling back to instanced")),
+        ),
     }
 }
 
@@ -473,6 +637,7 @@ fn pass1_prepass_chunk_walk<const COLLECT: bool>(
             last_seg_col: 0,
             last_seg_line_adv: 0.0,
             last_seg_seg_adv: 0.0,
+            max_line_cols: col as u32,
         };
     }
 
@@ -483,6 +648,7 @@ fn pass1_prepass_chunk_walk<const COLLECT: bool>(
     let mut last_seg_col = 0i64;
     let mut last_seg_line_adv = 0.0f64;
     let mut last_seg_seg_adv = 0.0f32;
+    let mut max_line_cols = 0u32;
 
     while pos < bytes.len() {
         let nl_pos = match memchr::memchr(b'\n', &bytes[pos..]) {
@@ -578,6 +744,10 @@ fn pass1_prepass_chunk_walk<const COLLECT: bool>(
         if continues_line && line_index == 0 {
             max_row_extent = widest_before_line;
         }
+        // Once per line, outside the per-byte loop (the lane-limit check).
+        if line_col as u32 > max_line_cols {
+            max_line_cols = line_col as u32;
+        }
         if COLLECT {
             out.lines.push(ChunkLine {
                 start: pos as u32,
@@ -622,6 +792,7 @@ fn pass1_prepass_chunk_walk<const COLLECT: bool>(
         last_seg_col,
         last_seg_line_adv,
         last_seg_seg_adv,
+        max_line_cols,
     }
 }
 
@@ -884,6 +1055,7 @@ pub(crate) fn aggregate_chunk_prepasses(
         let mut item_max_row_extent = 0.0f64;
         let mut item_has_cluster = false;
         let mut item_has_emoji = false;
+        let mut item_max_line_cols = 0u32;
 
         let mut cur_base_row = 0i64;
         let mut cur_record_base = 0usize;
@@ -913,6 +1085,11 @@ pub(crate) fn aggregate_chunk_prepasses(
                 item_has_cluster = true;
             }
             item_has_emoji |= cp.has_emoji;
+            // The widest line: the chunk's own lines, and the line it
+            // continues at its true column (the inherited prefix added).
+            item_max_line_cols = item_max_line_cols.max(cp.max_line_cols);
+            let continued_total = if cp.has_newline { cur_col + cp.first_seg_col } else { cur_col + cp.delta_col };
+            item_max_line_cols = item_max_line_cols.max(u32::try_from(continued_total).unwrap_or(u32::MAX));
 
             if !cp.has_newline {
                 let c0 = cur_col;
@@ -958,6 +1135,7 @@ pub(crate) fn aggregate_chunk_prepasses(
             row_count: u32::try_from(cur_base_row).expect("item row count exceeds u32"),
             has_cluster: item_has_cluster,
             has_emoji: item_has_emoji,
+            max_line_cols: item_max_line_cols,
         });
     }
 
@@ -1072,9 +1250,12 @@ fn measure_continued_lines(
 }
 
 /// Computes Pass 1 chunk prepasses ahead of time during repository prefetching.
+/// For the Visible field the walk also collects the line table, so the
+/// background Pass 1 is the whole of the load's layout work.
 pub fn prefetch_hyper(
     files: &[crate::repo::RepoFile],
     file_params: &[crate::layout::ItemParams],
+    field_mode: GlyphFieldMode,
 ) -> PrefetchedHyperData {
     let trie = crate::default_trie();
     let em_height_fu = trie.metrics.em_height_fu;
@@ -1091,7 +1272,7 @@ pub fn prefetch_hyper(
         })
         .collect();
 
-    let aggregate = pass1_over_chunks(
+    let aggregate = pass1_over_chunks_with_lines(
         &chunks,
         &item_chunk_ranges,
         &byte_slices,
@@ -1099,6 +1280,7 @@ pub fn prefetch_hyper(
         &trie,
         bitmap_adv,
         em_height_fu,
+        (field_mode == GlyphFieldMode::Visible).then_some(SEGMENT_BYTES),
     );
 
     PrefetchedHyperData {
@@ -1807,6 +1989,112 @@ mod tests {
         assert_eq!(field.chunk_count(), expected_chunks as u32);
         assert_eq!(field.chunk_capacity(), chunk_cap as u32);
         assert_eq!(field.glyph_count(), total_survivors as u32);
+    }
+
+    fn prepass_with(row_count: u32, max_line_cols: u32) -> ItemPrepass {
+        ItemPrepass {
+            survivor_count: 1,
+            leader_count: 1,
+            max_row_extent: 0.0,
+            row_count,
+            has_cluster: false,
+            has_emoji: false,
+            max_line_cols,
+        }
+    }
+
+    /// THE LANE LIMITS ARE A LOAD-TIME DECISION. A synthetic prepass past
+    /// each Derived lane is refused with the item and the limit named; one
+    /// within every lane passes, including the exact boundaries.
+    #[test]
+    fn derived_lane_limits_refuse_past_each_lane_and_name_the_item() {
+        use glyph_field_derived::{ITEM_MAX, ROW_MAX, X_PAGE_MAX};
+        let plain = ItemParams::default();
+        let paged = ItemParams { has_page: true, page_cols: 10, ..ItemParams::default() };
+
+        // Within: the boundary rows and the boundary column page pass.
+        let ok = [prepass_with(ROW_MAX + 1, 5), prepass_with(1, (X_PAGE_MAX + 1) * 10 - 1), prepass_with(0, 0)];
+        assert_eq!(derived_lane_limits(&ok, &[plain, paged, paged]), Ok(()));
+
+        // Rows: item 1 has one row too many.
+        let rows = [prepass_with(3, 1), prepass_with(ROW_MAX + 2, 1)];
+        let why = derived_lane_limits(&rows, &[plain, plain]).unwrap_err();
+        assert!(why.contains("item 1") && why.contains("ROW_MAX"), "{why}");
+
+        // Column pages: item 0's widest line reaches page X_PAGE_MAX + 1 —
+        // only because it IS column-paged; the same line under a plain item
+        // has no column page to exceed.
+        let wide = [prepass_with(1, (X_PAGE_MAX + 1) * 10)];
+        let why = derived_lane_limits(&wide, &[paged]).unwrap_err();
+        assert!(why.contains("item 0") && why.contains("X_PAGE_MAX"), "{why}");
+        assert_eq!(derived_lane_limits(&wide, &[plain]), Ok(()));
+
+        // Items: one past the item lane.
+        let many = vec![prepass_with(1, 1); ITEM_MAX as usize + 2];
+        let params = vec![plain; many.len()];
+        let why = derived_lane_limits(&many, &params).unwrap_err();
+        assert!(why.contains("ITEM_MAX"), "{why}");
+        assert_eq!(derived_lane_limits(&many[..ITEM_MAX as usize + 1], &params[..ITEM_MAX as usize + 1]), Ok(()));
+    }
+
+    /// The fallback decision: Derived and Visible past the lanes become
+    /// Instanced with a warning that names the reason; within them, or for
+    /// Instanced itself, the request stands and nothing is said.
+    #[test]
+    fn effective_field_mode_falls_back_to_instanced_past_the_lanes() {
+        let refused: Result<(), String> = Err("item 7: too many rows".into());
+        for mode in [GlyphFieldMode::Derived, GlyphFieldMode::Visible] {
+            let (got, note) = effective_field_mode(mode, &refused);
+            assert_eq!(got, GlyphFieldMode::Instanced);
+            let note = note.expect("a fallback is announced");
+            assert!(note.contains(mode.as_str()) && note.contains("item 7") && note.contains("instanced"), "{note}");
+            assert_eq!(effective_field_mode(mode, &Ok(())), (mode, None));
+        }
+        assert_eq!(effective_field_mode(GlyphFieldMode::Instanced, &refused), (GlyphFieldMode::Instanced, None));
+    }
+
+    /// `max_line_cols` is the widest line in leaders over the whole item,
+    /// chunk cuts joined: held to the oracle-backed records (a line's leaders
+    /// are its records before the newline) over corpora with intra-line
+    /// chunk cuts (`chunk-cut.txt`) and multi-byte leaders, in both modes.
+    #[test]
+    fn max_line_cols_is_the_widest_line_in_leaders() {
+        use crate::fold::ClusterMode;
+        let trie = crate::default_trie();
+        let em = trie.metrics.em_height_fu;
+        let bitmap_adv = fu_to_world(trie.bitmap_advance_fu, em);
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        let mut checked = 0usize;
+        for mode in [ClusterMode::Cluster, ClusterMode::Leader] {
+            for p in ["native/fixtures/chunk-cut.txt", "native/fixtures/g-pick-repo", "native/fixtures/g-cluster-repo", "native/fixtures/cubecl-fork"] {
+                let corpus = crate::hyper_oracle::load_corpus(&root.join(p), mode).expect(p);
+                let items: Vec<LayoutItem<'_>> = corpus
+                    .items
+                    .iter()
+                    .map(|it| LayoutItem { bytes: &it.bytes, params: it.params, group_id: 0, paint: Paint::Flat(0) })
+                    .collect();
+                let (chunks, ranges) = chunk::slice_items_into_chunks(&items);
+                let agg = pass1_prepass_chunks(&chunks, &ranges, &items, &trie, bitmap_adv, em);
+                for (i, it) in corpus.items.iter().enumerate() {
+                    let r = crate::hyper_oracle::reference_item(&it.bytes, &it.params, &trie);
+                    let mut widest = 0u32;
+                    let mut start = 0usize;
+                    for nl in memchr::memchr_iter(b'\n', &it.bytes).chain(std::iter::once(it.bytes.len())) {
+                        if nl > start || nl < it.bytes.len() {
+                            let leaders = r.record_bytes.iter().filter(|&&b| b >= start && b < nl).count() as u32;
+                            widest = widest.max(leaders);
+                        }
+                        start = nl + 1;
+                        if start > it.bytes.len() {
+                            break;
+                        }
+                    }
+                    assert_eq!(agg.prepasses[i].max_line_cols, widest, "{} / {}", corpus.name, it.label);
+                    checked += 1;
+                }
+            }
+        }
+        assert!(checked >= 20, "checked only {checked} items");
     }
 }
 

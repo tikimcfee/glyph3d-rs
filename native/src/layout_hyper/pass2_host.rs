@@ -293,6 +293,13 @@ pub fn compute_single_item_placement(
         &seg_adv_heap
     };
     let wrap_w_u = if fold_unit > 0 && wrap_w > 0 { wrap_w as usize } else { usize::MAX };
+    // The newline is a record too, with the advance the trie gives LF:
+    // PageExtent is measured over EVERY record (layout.rs), so a line's page
+    // right is its newline's x plus that advance — what the device Pass 2
+    // measures (`pass2_device.rs`, "the newline's own record"). Until
+    // 2026-10-10 this shortcut stopped at the last glyph's right, one cell
+    // short on every ASCII line; unseen because nothing called it.
+    let newline_adv = trie.fast_byte_table[b'\n' as usize].advance;
 
     let mut pos = 0usize;
     while pos < bytes.len() {
@@ -319,7 +326,8 @@ pub fn compute_single_item_placement(
                     if page_active && page_rows > 0 && pages_wide > 1 && row >= page_rows {
                         is_multi_page = true;
                     }
-                    if pos_x > page_right { page_right = pos_x; }
+                    let right = pos_x + newline_adv;
+                    if right > page_right { page_right = right; }
                     if pos_y < page_bottom { page_bottom = pos_y; }
                     if pos_z < page_z_min { page_z_min = pos_z; }
                     if pos_z > page_z_max { page_z_max = pos_z; }
@@ -401,7 +409,6 @@ pub fn compute_single_item_placement(
 
             if nl_pos < bytes.len() {
                 record_idx += 1;
-                base_row += rows_for_line(l as i64, wrap_w, p.wrap_mode);
                 let nl_rel_x = if fold_u > 0 {
                     if l.is_multiple_of(fold_u) { 0.0 } else { seg_adv_table[l % fold_u] }
                 } else {
@@ -410,6 +417,26 @@ pub fn compute_single_item_placement(
                 if nl_rel_x > measured_max_row_extent {
                     measured_max_row_extent = nl_rel_x;
                 }
+                // The newline's own record: at column `l`, in the segment it
+                // closes (`wrap_segment_of(.., true)`), on that segment's row.
+                let nl_col = l as i64;
+                let nl_seg = wrap_segment_of(nl_col, wrap_w, true);
+                let nl_row = if is_wrap_back { base_row } else { base_row + nl_seg };
+                let nl_base_x = (nl_rel_x as f64 + origin_x) as f32;
+                let (nl_x, nl_y, nl_z) = if page_active {
+                    let f = pager.frame(nl_row, nl_col, nl_seg);
+                    (paged_x(nl_base_x, &f), f.y, f.z)
+                } else {
+                    let base_y = (-(nl_row as f64) * line_height + origin_y) as f32;
+                    let base_z = (-(nl_seg as f64) * z_step + origin_z) as f32;
+                    (nl_base_x, base_y, base_z)
+                };
+                let right = nl_x + newline_adv;
+                if right > page_right { page_right = right; }
+                if nl_y < page_bottom { page_bottom = nl_y; }
+                if nl_z < page_z_min { page_z_min = nl_z; }
+                if nl_z > page_z_max { page_z_max = nl_z; }
+                base_row += rows_for_line(l as i64, wrap_w, p.wrap_mode);
                 col = 0;
                 line_adv = 0.0;
                 seg_adv = 0.0;

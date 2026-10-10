@@ -150,6 +150,7 @@ pub(super) fn apply_relayout(
                 greek_pure: p.greek_pure,
                 greek_onset_px: Some(p.greek_onset_px),
                 field_mode: cull_opts.field_mode,
+                debug_tint: p.debug_tint,
                 environment: p.environment,
                 ground_y: cull_opts.ground_y,
             },
@@ -163,6 +164,16 @@ pub(super) fn apply_relayout(
     } else {
         (crate::build_scene_with_options(ctx, state.config.format, choice, CameraMode::Fly, live_cull_opts), None)
     };
+    // The mode the scene BUILT may not be the one asked for (a load past the
+    // Derived lanes falls back to Instanced, loudly — `layout_hyper::
+    // derived_lane_limits`); the options follow the build, so the panel's
+    // selector and the next request start from what is actually drawn.
+    if let Some(built) = probe.as_ref().and_then(|p| p.borrow().field_mode) {
+        if built != cull_opts.field_mode {
+            note += &format!("(built {built}, not {}) ", cull_opts.field_mode);
+            cull_opts.field_mode = built;
+        }
+    }
     scene.set_viewport(state.config.width, state.config.height);
     if !reset_pose {
         if let Some((eye, yaw, pitch)) = pose {
@@ -387,6 +398,8 @@ impl App<'_> {
                 session_filter_harness: crate::agent_transcript::discovery::SessionHarnessFilter::All,
                 discovered_sessions: None,
                 session_dirs_report: String::new(),
+                // The field HUD starts open where it has the most to say.
+                hud_open: self.cull_opts.field_mode == glyph_field::GlyphFieldMode::Visible,
             })
         } else {
             None
@@ -404,6 +417,12 @@ impl App<'_> {
         };
         #[cfg(not(feature = "egui-ui"))]
         let mut scene = crate::build_scene_with_options(&self.ctx, format, &self.choice, CameraMode::Fly, self.cull_opts);
+        // The options follow the mode the scene BUILT (a lane-limit fallback
+        // emits Instanced and says so), as the relayout arm does.
+        #[cfg(feature = "egui-ui")]
+        if let Some(built) = ui_probe.as_ref().and_then(|p| p.borrow().field_mode) {
+            self.cull_opts.field_mode = built;
+        }
         let depth = scene::create_depth(&self.ctx.device, scene.depth_format(), config.width, config.height);
         log::info!(
             "surface: {}x{} {:?} present={:?}",
@@ -421,8 +440,9 @@ impl App<'_> {
         if self.ui {
             println!("debug panel: F1 toggles the egui Debug window (sliders tune the LOD threshold live)");
             println!("agent sessions: F7 toggles the Agent Sessions browser");
+            println!("field HUD: F8 toggles the top-left field readout (mode, cull tiers, per-frame ms)");
         }
-        println!("screenshot: F2 saves the next presented frame to out/windowed-shot-<timestamp>.png");
+        println!("screenshot: F2 saves the next presented frame to out/windowed-shot-<timestamp>.png (GLYPH_POSE_PRINT=1 also prints its --cam-pose)");
 
         // Stage G: scripted startup picks/verbs (same entry points the
         // windowed event handlers use).
@@ -475,6 +495,8 @@ impl App<'_> {
             zspace_selftest: u8::from(std::env::var_os("GLYPH_ZSPACE_SELFTEST").is_some()),
             #[cfg(feature = "egui-ui")]
             cluster_selftest: u8::from(std::env::var_os("GLYPH_CLUSTER_SELFTEST").is_some()),
+            #[cfg(feature = "egui-ui")]
+            fieldmode_selftest: u8::from(std::env::var_os("GLYPH_FIELDMODE_SELFTEST").is_some()),
         });
     }
 
@@ -545,7 +567,7 @@ impl App<'_> {
                     let ui = self.ui;
                     #[cfg(not(feature = "egui-ui"))]
                     let ui = false;
-                    poll_live(&self.ctx, self.cull_opts.cull, ui, &mut self.live, state);
+                    poll_live(&self.ctx, self.cull_opts, ui, &mut self.live, state);
                 }
             }
             // Stage K (K6): F2 = capture the next presented frame to PNG.
@@ -563,6 +585,7 @@ impl App<'_> {
                             | PhysicalKey::Code(KeyCode::F4)
                             | PhysicalKey::Code(KeyCode::F5)
                             | PhysicalKey::Code(KeyCode::F6)
+                            | PhysicalKey::Code(KeyCode::F8)
                     ) =>
             {
                 match event.physical_key {
@@ -574,6 +597,21 @@ impl App<'_> {
                             "windowed-shot-{}.png",
                             utc_stamp(std::time::SystemTime::now())
                         )));
+                        // GLYPH_POSE_PRINT=1: the shot's camera as the
+                        // `--cam-pose` argument that reproduces it (degrees),
+                        // so a view seen once can be a golden view's command.
+                        if std::env::var_os("GLYPH_POSE_PRINT").is_some() {
+                            match state.scene.cam_pose() {
+                                Some((eye, yaw, pitch)) => println!("{}", super::state::cam_pose_arg(eye, yaw, pitch)),
+                                None => println!("pose: this scene has no fly camera"),
+                            }
+                        }
+                    }
+                    PhysicalKey::Code(KeyCode::F8) => {
+                        #[cfg(feature = "egui-ui")]
+                        if let Some(egui) = state.egui.as_mut() {
+                            egui.hud_open = !egui.hud_open;
+                        }
                     }
                     PhysicalKey::Code(KeyCode::F3) => {
                         let window = state.window.clone();
@@ -759,11 +797,14 @@ impl App<'_> {
 
 fn poll_live(
     ctx: &GpuContext,
-    cull: bool,
+    cull_opts: crate::SceneCullOptions,
     ui: bool,
     live: &mut Option<super::LiveSource>,
     state: &mut WindowState,
 ) {
+    // The live rebuild keeps the run's cull switch and field mode (until
+    // 2026-10-10 it rebuilt as Instanced whatever the run was launched with).
+    let (cull, field_mode) = (cull_opts.cull, cull_opts.field_mode);
     let Some(src) = live else { return };
     let mut arrived: Vec<crate::seam::SurfaceUpdate> = std::mem::take(&mut src.backlog);
     while let Ok(update) = src.rx.try_recv() {
@@ -859,16 +900,18 @@ fn poll_live(
             staged,
             CameraMode::Fly,
             cull,
+            field_mode,
         )
     } else {
         (
-            crate::build_scene_from_staged(
+            crate::build_scene_from_staged_mode(
                 ctx,
                 state.config.format,
                 atlas,
                 staged,
                 CameraMode::Fly,
                 cull,
+                field_mode,
             ),
             None,
         )

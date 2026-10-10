@@ -125,6 +125,9 @@ pub struct SceneCullOptions {
     pub greek_onset_px: Option<f32>,
     /// Which glyph-field implementation the scene builds (`--field-mode`).
     pub field_mode: glyph_scene::GlyphFieldMode,
+    /// The Visible field's debug tint (`--debug-tint`): 0 off, 1 by LOD
+    /// tier, 2 by cull state. The other modes ignore it.
+    pub debug_tint: u32,
     /// The ground/sky environment (`--environment`, `[environment] mode`).
     pub environment: config::EnvironmentMode,
     /// Explicit ground height (`--ground-y`); None = below the scene.
@@ -142,6 +145,7 @@ impl Default for SceneCullOptions {
             greek_pure: true,
             greek_onset_px: None,
             field_mode: glyph_scene::GlyphFieldMode::Instanced,
+            debug_tint: 0,
             environment: config::settings().environment.mode,
             ground_y: None,
         }
@@ -179,6 +183,7 @@ pub fn build_scene_with_options(
 /// callers that OWN their content (the seam's envelope path: bytes through
 /// `repo::load_items` + `into_staged`, `PickContext::content` injected by
 /// the caller). No probe: this is the offscreen/linked-embedder shape.
+/// Builds the Instanced field; [`build_scene_from_staged_mode`] takes the mode.
 pub fn build_scene_from_staged(
     ctx: &GpuContext,
     color_format: wgpu::TextureFormat,
@@ -187,12 +192,28 @@ pub fn build_scene_from_staged(
     camera_mode: CameraMode,
     cull: bool,
 ) -> Box<dyn SceneLike> {
-    Box::new(GlyphScene::new(
-        ctx, color_format, atlas, staged, camera_mode, cull, glyph_scene::GlyphFieldMode::Instanced,
-    ))
+    build_scene_from_staged_mode(ctx, color_format, atlas, staged, camera_mode, cull, glyph_scene::GlyphFieldMode::Instanced)
 }
 
-/// The PROBED twin of [`build_scene_from_staged`] — installs the Debug
+/// [`build_scene_from_staged`] with the field mode threaded through: the
+/// live loop's rebuilds keep the mode the run was launched with (until
+/// 2026-10-10 they hardcoded Instanced, so a `--field-mode derived` live
+/// session silently rebuilt as Instanced on the first edit). The mode the
+/// scene BUILDS still follows the staged arena (`glyph_scene::setup`): a
+/// host-staged arena cannot carry a Visible field and falls back.
+pub fn build_scene_from_staged_mode(
+    ctx: &GpuContext,
+    color_format: wgpu::TextureFormat,
+    atlas: &atlas::Atlas,
+    staged: text::StagedText,
+    camera_mode: CameraMode,
+    cull: bool,
+    field_mode: glyph_scene::GlyphFieldMode,
+) -> Box<dyn SceneLike> {
+    Box::new(GlyphScene::new(ctx, color_format, atlas, staged, camera_mode, cull, field_mode))
+}
+
+/// The PROBED twin of [`build_scene_from_staged_mode`] — installs the Debug
 /// panel's read-back channel before type erasure, so a live rebuilt scene
 /// keeps its panel (the windowed live loop's shape: rebuild + restyle while
 /// the viewer watches).
@@ -203,10 +224,9 @@ pub fn build_scene_from_staged_probed(
     staged: text::StagedText,
     camera_mode: CameraMode,
     cull: bool,
+    field_mode: glyph_scene::GlyphFieldMode,
 ) -> (Box<dyn SceneLike>, Option<glyph_scene::UiProbe>) {
-    let mut scene = GlyphScene::new(
-        ctx, color_format, atlas, staged, camera_mode, cull, glyph_scene::GlyphFieldMode::Instanced,
-    );
+    let mut scene = GlyphScene::new(ctx, color_format, atlas, staged, camera_mode, cull, field_mode);
     let probe = scene.init_ui_probe();
     (Box::new(scene), Some(probe))
 }
@@ -247,6 +267,7 @@ fn build_scene_impl(
         if let Some(onset) = cull_opts.greek_onset_px {
             scene.set_greek_onset_px(&ctx.queue, onset);
         }
+        scene.set_debug_tint(&ctx.queue, cull_opts.debug_tint);
         scene.set_environment(cull_opts.environment, cull_opts.ground_y);
         let p = probe.then(|| scene.init_ui_probe());
         (Box::new(scene) as Box<dyn SceneLike>, p)

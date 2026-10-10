@@ -198,6 +198,7 @@ impl Cli {
             greek_pure,
             greek_onset_px: self.greek_onset_px,
             field_mode: self.field_mode,
+            debug_tint: self.debug_tint.as_u32(),
             environment: self
                 .environment
                 .unwrap_or(crate::config::settings().environment.mode),

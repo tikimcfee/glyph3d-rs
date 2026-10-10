@@ -109,14 +109,46 @@ mod pipelines;
 mod render;
 pub mod mesh;
 
+/// The scene's handle on its glyph field. Every mode is reached through the
+/// trait (`Deref<Target = dyn GlyphField>`, so `scene.field.mode()` reads as
+/// before); the Visible field is additionally held by its concrete type,
+/// because three of its verbs are not on the trait — the wash draw after the
+/// glyph phase, the per-frame counters the HUD shows, and the byte-span
+/// recolour the `--highlight` sidecar becomes in that mode.
+pub(crate) enum FieldHandle {
+    Dyn(Box<dyn GlyphField>),
+    Visible(Box<glyph_field_visible::VisibleField>),
+}
+
+impl FieldHandle {
+    /// The Visible field, when that is what the scene built.
+    pub(crate) fn visible(&self) -> Option<&glyph_field_visible::VisibleField> {
+        match self {
+            FieldHandle::Visible(v) => Some(v),
+            FieldHandle::Dyn(_) => None,
+        }
+    }
+}
+
+impl std::ops::Deref for FieldHandle {
+    type Target = dyn GlyphField;
+    fn deref(&self) -> &Self::Target {
+        match self {
+            FieldHandle::Dyn(b) => b.as_ref(),
+            FieldHandle::Visible(v) => v.as_ref(),
+        }
+    }
+}
+
 pub struct GlyphScene {
     /// The glyph field: per-glyph slot storage, the pipeline that draws it,
     /// and the single-glyph verbs — behind the mode-neutral contract, so the
     /// scene never touches a slot's bytes or knows which mode it holds
     /// (2026-10 field-mode split; see `crates/glyph-field`). Storage is
     /// chunked (a repo-scale field exceeds one storage binding); the cull and
-    /// pick slot math key on `field.chunk_capacity()`.
-    pub(crate) field: Box<dyn GlyphField>,
+    /// pick slot math key on `field.chunk_capacity()`. The Visible field
+    /// (no slots; `FieldHandle::visible`) culls and draws itself.
+    pub(crate) field: FieldHandle,
     /// The colour-emoji sheet's view, held so the texture outlives the bind
     /// groups that sample it (binding 6 of every chunk's bind group).
     pub(crate) _emoji_view: wgpu::TextureView,
@@ -395,6 +427,10 @@ impl SceneLike for GlyphScene {
 
     fn set_cam_pose(&mut self, eye: [f32; 3], yaw: f32, pitch: f32) {
         GlyphScene::set_cam_pose(self, eye, yaw, pitch);
+    }
+
+    fn cam_pose(&self) -> Option<([f32; 3], f32, f32)> {
+        Some((self.fly.eye.to_array(), self.fly.yaw, self.fly.pitch))
     }
 
     fn apply_pick(&mut self, ctx: &GpuContext, cmd: &PickCommand) -> Option<String> {
