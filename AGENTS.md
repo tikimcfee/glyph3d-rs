@@ -160,7 +160,7 @@ read by nothing at all.
 
 ## What the checks actually do
 
-Fourteen gates (2026-10-09), in `build.toml` order. For each: what it compares, what makes it
+Fifteen gates (2026-10-09), in `build.toml` order. For each: what it compares, what makes it
 red, and **what it cannot see**. The last is the part worth reading. A check is
 a claim about a counterfactual, and a check whose blind spot you don't know is
 a green you can't price. (Gates were once numbered positions in one shell
@@ -246,6 +246,14 @@ happened here, and is caught today only by the fixture rebuild above.
 **cargo-build.** `cargo build --release`, zero warnings. Red on any
 warning rustc emits; a build ERROR is fatal (the battery stops). Blind to
 anything silenced with `#[allow(...)]`.
+
+**cargo-check-no-ui** (2026-10-09). `cargo check` of the renderer with
+`--no-default-features` (no egui overlay), all targets, zero warnings, in its
+own `target/no-ui` so the changed feature set never invalidates the main build.
+It exists because that build is supported and nothing compiled it: an `egui`
+use outside the `egui-ui` gate broke it unnoticed (C24, found by the GPU
+research agent). `egui-use-ungated` proves it. Blind to whether the no-UI build
+RUNS correctly — it is checked, not executed.
 
 **cargo-clippy.** `cargo clippy --release`, zero warnings. Same, for lints.
 It runs with `--all-targets` (since 2026-10-09), so test code is linted too:

@@ -789,10 +789,15 @@ fn poll_live(
         src.last_style.insert(update.file.0.clone(), update.clone());
     }
 
+    // The live camera pose rides the UI probe, which exists only with the
+    // egui overlay; without it a live rebuild keeps the scene's own pose.
+    #[cfg(feature = "egui-ui")]
     let pose = state.ui_probe.as_ref().map(|p| {
         let p = p.borrow();
         (p.eye, p.yaw, p.pitch)
     });
+    #[cfg(not(feature = "egui-ui"))]
+    let pose: Option<([f32; 3], f32, f32)> = None;
     let t_all = Instant::now();
     let mut folds: std::collections::HashMap<String, Vec<std::ops::Range<u32>>> =
         std::collections::HashMap::new();
@@ -896,4 +901,6 @@ fn poll_live(
     {
         state.ui_probe = probe;
     }
+    #[cfg(not(feature = "egui-ui"))]
+    let _ = probe;
 }
