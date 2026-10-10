@@ -13,6 +13,15 @@
 #     target/release/jit-layout <corpus-dir> [--walk renderer|all] [--threads T]
 #         [--view page|overview|worst|random] [--visible-lines N] [--segment-bytes S]
 #         [--repeat K] [--screenshot <png>] [--no-draw]
+#         [--camera page|overview|zoomout|far|dense|all[,..]] [--cull cpu|gpu|both]
+#         [--lod-px F] [--target WxH] [--max-slots N] [--max-segments N]
+#         [--spans none|demo] [--dense-file <rel>]* [--dense-sample N] [--dense-in-view N]
+#         [--dense-mode colour|colour-xf] [--edit-file <rel>] [--probes N] [--no-pass1-scaling]
+#
+# `--view` is the original measurement: a line list CHOSEN on the CPU, no frustum
+# test. `--camera` places every file on a shelf and culls — on the CPU or on the
+# GPU (four passes, indirect dispatch + draw, nothing read back). `--spans` and
+# `--dense-*` are the range-addressed colour tables (spans.rs).
 #
 # wgpu is pinned to the same major as native/Cargo.toml (30.x).
 [package]
