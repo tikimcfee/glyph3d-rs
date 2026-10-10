@@ -525,6 +525,14 @@ fn cli_action_dispatch_variants() {
         }
         other => panic!("--hyper-oracle-check dispatched to {other:?}"),
     }
+    let cli = parse(&["--line-table-stats", "some/dir", "--cluster-mode", "leader"]);
+    match cli.action() {
+        CliCommand::Fixture(FixtureTask::LineTableStats(paths, mode)) => {
+            assert_eq!(paths.len(), 1);
+            assert_eq!(mode, crate::fold::ClusterMode::Leader, "the CLI mode rides along");
+        }
+        other => panic!("--line-table-stats dispatched to {other:?}"),
+    }
 
     // 4. RepoScanOnly
     let cli = parse(&["--load-repo", "some/dir", "--repo-scan-only"]);

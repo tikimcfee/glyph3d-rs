@@ -147,6 +147,12 @@ pub struct Cli {
     /// or single text files.
     #[arg(long, value_name = "PATH", num_args = 1..)]
     pub hyper_oracle_check: Vec<PathBuf>,
+    /// Build the visible-set line table (Pass 1's per-line index and the
+    /// long-line segment seeds, `layout_hyper/line_table.rs`) over the given
+    /// inputs and print what it holds — lines, seeds, bytes — then exit. The
+    /// same inputs `--hyper-oracle-check` takes.
+    #[arg(long, value_name = "PATH", num_args = 1..)]
+    pub line_table_stats: Vec<PathBuf>,
     /// Stage E2: load a whole repository as a field of code pages
     #[arg(long, value_name = "DIR")]
     pub load_repo: Option<PathBuf>,

@@ -93,6 +93,9 @@ fn main() {
             FixtureTask::Scan(paths) => scan::run_fixture_scan(&paths),
             FixtureTask::Bake(paths) => bake::run_fixture_bake(&paths),
             FixtureTask::HyperOracle(paths, mode) => hyper_oracle::run_hyper_oracle_check(&paths, mode),
+            FixtureTask::LineTableStats(paths, mode) => {
+                glyph3d_native::layout_hyper::line_table::run_line_table_stats(&paths, mode)
+            }
         },
         CliCommand::RepoScanOnly {
             dir,

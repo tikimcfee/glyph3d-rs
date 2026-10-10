@@ -83,7 +83,9 @@ caller; the short version:
   `repo-verify-direct`. Every strategy is the same HyperLayout, so these are
   HyperLayout against HyperLayout; `--hyper-oracle-check` (gate
   `hyper-oracle`, `hyper_oracle.rs`) is the one that holds HyperLayout to the
-  oracle-backed fold.
+  oracle-backed fold. `--line-table-stats <PATH>...` (same inputs) builds and
+  prints the visible-set field's line table (`layout_hyper/line_table.rs`,
+  M1 of `out/VISIBLE-MODE.md`): lines, long-line segment seeds, sizes.
 - **`HyperLayout` (`hyper`) is the DEFAULT layout engine** in pure Rust: a parallel,
   cache-blocked CPU layout engine using Rayon, intra-file line chunking, wrap-aware
   chunking for minified files, background pipelined prepasses, aligned 8-burst / 4-burst
