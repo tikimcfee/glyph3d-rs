@@ -44,10 +44,16 @@ fn scratch() -> PathBuf {
 /// Render one frame of `g-pick-repo` from the repo-zoom camera in `mode`,
 /// with `ops` (picks/verbs) applied before it; returns the PNG and stdout.
 fn render(mode: &str, out: &Path, ops: &[&str]) -> (image::RgbaImage, String) {
+    render_at(mode, out, &["--focus-file", "alpha.rs", "--zoom", "3"], ops)
+}
+
+/// `render` with the camera given (`--focus-file`/`--zoom` or `--cam-pose`).
+fn render_at(mode: &str, out: &Path, camera: &[&str], ops: &[&str]) -> (image::RgbaImage, String) {
     let bin = env!("CARGO_BIN_EXE_glyph3d-native");
     let output = Command::new(bin)
         .current_dir(native_dir())
-        .args(["--load-repo", REPO, "--frames", "2", "--focus-file", "alpha.rs", "--zoom", "3", "--field-mode", mode])
+        .args(["--load-repo", REPO, "--frames", "2", "--field-mode", mode])
+        .args(camera)
         .args(ops)
         .arg("--screenshot")
         .arg(out)
@@ -245,4 +251,32 @@ fn visible_verbs_address_the_glyph_the_slot_did() {
     for case in &cases {
         run_case(case, &dir);
     }
+}
+
+/// C29 (2026-10-10): a file moved clear out of its load-time box must be
+/// drawn where it went in Visible mode exactly as Derived draws it. The
+/// Visible field culls ITEMS by a world box the scene pushes on every move
+/// (`sync_segment` → `set_item_bbox`); a stale box would cull the moved file
+/// at its OLD place while the selection mask and the stored modes drew it
+/// at the new one — a file "rendered in fragments" with the HUD counting it
+/// invisible, which is what Ivan reported after dragging long.md into
+/// wide.txt's back-wrap column. long.md is moved from the shelf (y 0..−160)
+/// down into the column (y −168..) and the camera sits inside the column's
+/// y band looking along it, where the shelf is out of view: only the moved
+/// box can put the file on screen.
+#[test]
+fn a_moved_item_is_drawn_where_it_went() {
+    let dir = scratch();
+    let camera = ["--cam-pose", "21", "-190", "40", "0", "0"];
+    let ops = ["--pick-file", "long.md", "--verb", "move-group -12.7 -167.8 -20"];
+    let (derived_still, _) = render_at("derived", &dir.join("moved-derived-still.png"), &camera, &[]);
+    let (derived, _) = render_at("derived", &dir.join("moved-derived.png"), &camera, &ops);
+    let (visible, log) = render_at("visible", &dir.join("moved-visible.png"), &camera, &ops);
+    let reply = log.lines().find(|l| l.starts_with("verb move-group")).unwrap_or("");
+    assert!(reply.contains("long.md group 2 offset -> (5.0,-167.8,-20.0)"), "the move landed where planned: {reply:?}");
+    let arrived = changed_pixels(&derived_still, &derived);
+    assert!(arrived.len() > 20_000, "the move brings long.md into this view ({} px changed in derived mode)", arrived.len());
+    let diff = changed_pixels(&derived, &visible);
+    println!("moved item: derived vs visible {} px differ; the move changed {} px", diff.len(), arrived.len());
+    assert!(diff.len() <= 8, "visible mode must draw the moved file as derived does: {} px differ", diff.len());
 }

@@ -125,6 +125,34 @@ pub(super) fn render_scene(
             debug_tint: p.debug_tint,
             time: t,
         };
+        // C29 (2026-10-10): under GLYPH_CULL_DEBUG, the field's own cull
+        // counters for frame 0 — the F8 HUD's figures, offscreen — read back
+        // BLOCKING at the start of frame 1, before this frame's `prepare`
+        // zeroes them: frame 0 has been submitted by then, where a readback
+        // inside frame 0 would see zeros its own encoder had not run past.
+        // Debug only (a stall per run, never the frame path).
+        if std::env::var_os("GLYPH_CULL_DEBUG").is_some() && (t - 1.0 / 60.0).abs() < 1e-4 {
+            if let Some(v) = scene.field.visible() {
+                let c = v.read_counters(&ctx.queue);
+                use glyph_field_visible::tables::counter as k;
+                println!(
+                    "CULLDBG visible (frame 0): items {} visible, {} backdrop, {} hidden, {} culled of {} | lines {} candidate: {} glyph, {} wash, {} dropped | segments {} | slots {} ({} dropped) | wash boxes {}",
+                    c[k::ITEMS_VISIBLE],
+                    c[k::ITEMS_BACKDROP],
+                    c[k::ITEMS_HIDDEN],
+                    c[k::ITEMS_CULLED],
+                    v.stats().items_total,
+                    c[k::LINES_CANDIDATE],
+                    c[k::LINES_GLYPH],
+                    c[k::LINES_WASH],
+                    c[k::LINES_DROPPED],
+                    c[k::SEG_FIT_END],
+                    c[k::SLOT_FIT_END],
+                    c[k::SLOTS_DROPPED],
+                    c[k::WASH],
+                );
+            }
+        }
         scene.field.prepare(&ctx.queue, encoder, &prepare);
         // The selection mask's content, right after `prepare` and before any
         // pass (same encoder): the field lays the selected byte range's

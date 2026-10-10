@@ -220,7 +220,12 @@ Detailed technical audit lives in `research/desktop-platform-audit.md`. Key touc
 - `GLYPH_PICK_DEBUG=1` — pick-path diagnostics: pixel ray, AABB hits, local
   point, candidate records (glyph_scene/pick.rs pick functions).
 - `GLYPH_CULL_DEBUG=1` — at t=0.0 prints cull stats: visible draw ranges,
-  instance count, backdrop count.
+  instance count, backdrop count. In `--field-mode visible` the field's own
+  cull counters follow on the next frame (`CULLDBG visible (frame 0): items
+  a visible, b backdrop, c hidden, d culled of n | lines …`), read back
+  blocking once frame 0 has been submitted — the F8 HUD's figures, offscreen,
+  so a cull disagreement can be reproduced with `--cam-pose` and numbers
+  (C29, 2026-10-10).
 - `GLYPH_G_DUMP=<slot>[,<len>]` — offscreen only: reads back instance bytes
   at `slot` from the glyph arena and prints hex (buffer write-path audits).
   `GLYPH_G_DUMP=<item>:<byte>[,<len>]` (M3, 2026-10-10) is the Visible
@@ -273,6 +278,16 @@ Detailed technical audit lives in `research/desktop-platform-audit.md`. Key touc
   (`... hud after step N: ...`, which carries `selection item:start..end` and
   `pick file byte N` in visible mode). Meant for `--field-mode visible`; in a
   stored mode the same steps run through the slot paths.
+- `GLYPH_GRAB_SELFTEST=file[:dx:dy]` — windowed, dev-only (C29, 2026-10-10):
+  the GRAB path through the window's own entry points — `apply_pick` on
+  `file` (row 0 col 0), `on_cursor` to park the cursor at the centre,
+  `on_key(G)` to grab, ten `on_cursor` steps along (dx, dy) px (default 0,
+  400: straight down), `on_key(G)` to release — one step every fourth frame
+  from t≈3 s, printing the HUD line after each (`GRAB-SELFTEST step N …`)
+  and the group's offset at the end (`move-group 0 0 0`). An item still in
+  view after the drag must stay counted visible (`items a/b`): the drag
+  pushes its box to the Visible field (`sync_segment` → `set_item_bbox`)
+  every step. Pair it with `--cam-pose` so the drag lands where you want.
 - `GLYPH_POSE_PRINT=1` — windowed: F2 (screenshot) also prints the frame's
   camera as the `--cam-pose X Y Z YAW PITCH` argument (degrees) that
   reproduces it — the same line the Debug panel's "copy pose" button puts on
