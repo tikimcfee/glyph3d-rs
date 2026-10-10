@@ -940,7 +940,7 @@ impl GlyphScene {
                 row.cols[5] = *bg_rgba; // Set background color
                 
                 if let Some(new_gid) = self.allocate_group_row(ctx, row) {
-                    self.field.write_group_id(&ctx.queue, slot, new_gid);
+                    self.field.write_group_id(&ctx.queue, slot, gid, new_gid);
                     format!("verb set-glyph-background: {rel} row {} col {} slot {slot} -> group {new_gid}", g.row, g.col)
                 } else {
                     format!("verb set-glyph-background: {rel} out of groups (max {})", self.group_buf.size() / 96)
@@ -959,7 +959,7 @@ impl GlyphScene {
                 row.cols[3] = [s[0], s[1], s[2], row.cols[3][3]];
                 
                 if let Some(new_gid) = self.allocate_group_row(ctx, row) {
-                    self.field.write_group_id(&ctx.queue, slot, new_gid);
+                    self.field.write_group_id(&ctx.queue, slot, gid, new_gid);
                     format!("verb set-glyph-transform: {rel} row {} col {} slot {slot} -> group {new_gid}", g.row, g.col)
                 } else {
                     format!("verb set-glyph-transform: {rel} out of groups (max {})", self.group_buf.size() / 96)
@@ -973,7 +973,7 @@ impl GlyphScene {
                     return format!("verb reset-glyph-group: {rel} '{}' is blank (no instance)", g.ch);
                 };
                 // Reset to the file's original group
-                self.field.write_group_id(&ctx.queue, slot, gid);
+                self.field.write_group_id(&ctx.queue, slot, gid, gid);
                 format!("verb reset-glyph-group: {rel} row {} col {} slot {slot} -> group {gid}", g.row, g.col)
             }
             Verb::SetHidden(hide) => {

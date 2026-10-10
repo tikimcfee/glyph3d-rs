@@ -1,0 +1,42 @@
+# jit-layout — headless performance prototype for the GPU-direction study:
+# keep only the source bytes + a per-line table resident on the GPU and lay
+# out just the VISIBLE lines per frame with a compute pass, versus today's
+# whole-repo slot buffer. Measurement only; nothing here is a gate.
+#
+# Its OWN workspace, deliberately. The experiments root (../../Cargo.toml)
+# lists members whose path deps point into a Zed checkout through the
+# gitignored `experiments/zed` symlink; without that checkout cargo cannot
+# resolve the experiments workspace at all, and this crate has no reason to
+# need Zed. The root `exclude`s this directory; build it from here:
+#
+#     cd experiments/gpu-direction/jit-layout && cargo build --release
+#     target/release/jit-layout <corpus-dir> [--walk renderer|all] [--threads T]
+#         [--view page|overview|worst|random] [--visible-lines N] [--segment-bytes S]
+#         [--repeat K] [--screenshot <png>] [--no-draw]
+#         [--camera page|overview|zoomout|far|dense|all[,..]] [--cull cpu|gpu|both]
+#         [--lod-px F] [--target WxH] [--max-slots N] [--max-segments N]
+#         [--spans none|demo] [--dense-file <rel>]* [--dense-sample N] [--dense-in-view N]
+#         [--dense-mode colour|colour-xf] [--edit-file <rel>] [--probes N] [--no-pass1-scaling]
+#
+# `--view` is the original measurement: a line list CHOSEN on the CPU, no frustum
+# test. `--camera` places every file on a shelf and culls — on the CPU or on the
+# GPU (four passes, indirect dispatch + draw, nothing read back). `--spans` and
+# `--dense-*` are the range-addressed colour tables (spans.rs).
+#
+# wgpu is pinned to the same major as native/Cargo.toml (30.x).
+[package]
+name = "jit-layout"
+version = "0.1.0"
+edition = "2021"
+
+[workspace]
+
+[dependencies]
+wgpu = "30"
+pollster = "0.4"
+bytemuck = { version = "1", features = ["derive"] }
+memchr = "2"
+png = "0.18"
+
+[profile.release]
+debug = 1

@@ -180,7 +180,7 @@ mod layout_tests {
             scroll_rows: 0,
             has_page: 1,
             line_height_lo: 0.0,
-            _pad1: 0,
+            group: 0,
             _pad2: 0,
         };
         let mut buf = Vec::<u8>::new();
@@ -216,7 +216,9 @@ pub struct ItemParamsGpu {
     pub scroll_rows: i32,
     pub has_page: u32,
     pub line_height_lo: f32,
-    pub _pad1: u32,
+    /// The item's group row: what a Derived slot's lane resolves to when it
+    /// carries no override (`glyph_field_derived::derive::resolve_group`).
+    pub group: u32,
     pub _pad2: u32,
 }
 
@@ -237,7 +239,7 @@ impl Default for ItemParamsGpu {
             scroll_rows: 0,
             has_page: 0,
             line_height_lo: 0.0,
-            _pad1: 0,
+            group: 0,
             _pad2: 0,
         }
     }

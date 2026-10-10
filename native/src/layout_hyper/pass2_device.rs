@@ -59,6 +59,7 @@ pub(crate) trait SlotEmit: Sync {
         height: f32,
         row: i64,
         wrap_segment: i64,
+        x_page: i64,
     ) -> Self::Slot;
     fn emit_fast(
         pos_x: f32,
@@ -102,6 +103,7 @@ impl SlotEmit for RenderEmit {
         height: f32,
         _row: i64,
         _wrap_segment: i64,
+        _x_page: i64,
     ) -> RenderSlot {
         RenderSlot {
             pos: [pos_x, pos_y, pos_z],
@@ -181,21 +183,22 @@ impl SlotEmit for DerivedEmit {
         _pos_z: f32,
         glyph_id: u32,
         color: u32,
-        group_id: u32,
-        _item_idx: u32,
+        _group_id: u32,
+        item_idx: u32,
         _advance: f32,
         _height: f32,
         row: i64,
         wrap_segment: i64,
+        x_page: i64,
     ) -> DerivedSlot {
         let wrap = wrap_segment.clamp(0, u16::MAX as i64) as u16;
         DerivedSlot::with_item_and_group(
             pos_x,
-            row as u32,
+            glyph_field_derived::pack_row(row.max(0) as u32, x_page.max(0) as u32),
             (glyph_id & 0xFFFF) as u16,
             wrap,
             color,
-            group_id,
+            glyph_field_derived::item_lane(item_idx),
         )
     }
     #[inline(always)]
@@ -659,9 +662,12 @@ fn layout_pass2_chunk<E: SlotEmit>(
 
                     let row_py = cached_py;
                     let row_pz = cached_pz;
-                    let row_u32 = row.max(0) as u32;
+                    // The Derived row lane carries the column page (derive.rs).
+                    let row_u32 = glyph_field_derived::pack_row(row.max(0) as u32, x_page.max(0) as u32);
                     let wrap_high = ((wrap_segment.max(0) as u32) & 0xFFFF) << 16;
-                    let item_and_group = group_id;
+                    // The Derived lane is the ITEM (its group comes from the item
+                    // table; an override rides the high 12 bits, derive.rs).
+                    let item_and_group = glyph_field_derived::item_lane(item_idx);
                     let frame = RowFrame { py: row_py, pz: row_pz, row: row_u32, wrap_high, item_and_group, group_id, ascii_adv };
                     let start_survivors = survivor_out;
 
@@ -1468,6 +1474,7 @@ fn layout_pass2_chunk<E: SlotEmit>(
                     r.height,
                     row,
                     wrap_segment,
+                    x_page,
                 ));
             }
             survivor_out += 1;
