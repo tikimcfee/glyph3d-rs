@@ -89,12 +89,17 @@ load-time lane is the same word as before.
 
 ## M2 — how to see it (2026-10-10)
 
-The renderer's side of the mode is wired end to end; `VisibleField::new`
-(`crates/glyph-field-visible`) is the crate's own milestone. Until its bodies
-land, `--field-mode visible` runs the whole load path below and panics at
-that call — which is the proof that the mode reaches it. Everything that
-follows is in place and stays inert for `instanced` and `derived` (the full
-battery is green on both).
+The mode runs end to end: the renderer's load path below hands
+`crates/glyph-field-visible` its inputs, the field culls and lays out the
+visible lines on the GPU each frame and draws them through the Derived
+shader, and the sixth hyper-oracle tier (next section) holds the kernel to
+HyperLayout slot for slot. Everything here stays inert for `instanced` and
+`derived` (the full battery is green on both; every golden byte-equal). On
+the 93 MB crates tree (2026-10-10, this box): backend 11-22 ms where the
+stored modes wrote a 1.8 GB slot stream for ~460 ms; offscreen frames of the
+default view at ~0.7 ms. Not yet in this mode: syntax colour (by decision —
+colour arrives as byte-range spans), selection and the slot verbs (M3), the
+golden equivalence (M4).
 
 **What runs when `visible` is selected.** `repo::prefetch_repo` runs Pass 1
 in the background WITH the line table (`prefetch_hyper(.., field_mode)`);
