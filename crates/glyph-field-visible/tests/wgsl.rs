@@ -33,12 +33,23 @@ fn visible_wgsl_shaders_parse_and_validate() {
         ("LineEntry", std::mem::size_of::<glyph_field_visible::LineEntryGpu>()),
         ("SegmentSeed", std::mem::size_of::<glyph_field_visible::SegmentSeedGpu>()),
         ("ByteSpan", std::mem::size_of::<glyph_field_visible::ByteSpanGpu>()),
+        ("GlyphOverride", std::mem::size_of::<glyph_field_visible::GlyphOverrideGpu>()),
         ("Seg", std::mem::size_of::<glyph_field_visible::SegGpu>()),
         ("Wash", std::mem::size_of::<glyph_field_visible::WashGpu>()),
         ("DerivedSlot", std::mem::size_of::<glyph_field_derived::DerivedSlot>()),
         ("Frame", std::mem::size_of::<glyph_field_visible::FrameGpu>()),
         ("TrieMeta", std::mem::size_of::<glyph_field_visible::TrieMetaGpu>()),
         ("LayoutParams", std::mem::size_of::<glyph_field_visible::LayoutParamsGpu>()),
+    ];
+
+    // The entry points each file must carry (the host creates a pipeline
+    // per name; a renamed kernel fails here, not at device creation). The
+    // mask kernels (M3) are `layout_segments` in another mode plus
+    // `finalize_mask`, so the layout file grew by one.
+    let entry_points: &[(&str, &[&str])] = &[
+        ("visible_cull.wgsl", &["cull_items", "cull_lines", "finalize", "prefix_items"]),
+        ("visible_layout.wgsl", &["count_seed_segments", "finalize_mask", "layout_segments", "prefix_seed_survivors"]),
+        ("visible_wash.wgsl", &["fs_main", "vs_main"]),
     ];
 
     let mut validator = naga::valid::Validator::new(
@@ -54,6 +65,11 @@ fn visible_wgsl_shaders_parse_and_validate() {
         validator
             .validate(&module)
             .unwrap_or_else(|e| panic!("WGSL validation error in {}:\n{e:?}", path.display()));
+        let file = path.file_name().unwrap().to_string_lossy().into_owned();
+        let (_, want) = entry_points.iter().find(|(f, _)| *f == file).unwrap_or_else(|| panic!("{file}: no entry-point pin"));
+        let mut names: Vec<&str> = module.entry_points.iter().map(|e| e.name.as_str()).collect();
+        names.sort_unstable();
+        assert_eq!(names, *want, "{file}: entry points");
         for (_, ty) in module.types.iter() {
             if let (naga::TypeInner::Struct { span, .. }, Some(name)) = (&ty.inner, &ty.name) {
                 if let Some((_, want)) = pins.iter().find(|(n, _)| n == name) {

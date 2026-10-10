@@ -12,6 +12,13 @@
 //! The twin computes x in the reference's f64 form (`reference_x`), so it is
 //! independent of the kernel's `fma` — a device whose fma is not fused would
 //! fail here on the paged and foldless items.
+//!
+//! M3 (2026-10-10): the twin also records each slot's (item, byte) key, so
+//! the byte-keyed paths are judged against it — per-glyph overrides in the
+//! headless layout (colour, an x nudge as the host's f32 add, group rows
+//! through the Derived override lane), the selection mask holding exactly
+//! the slots whose byte is in range, `set_item_span_range` merging on the
+//! GPU path, and `locate` against a readback search over random probes.
 
 use std::future::Future;
 use std::pin::pin;
@@ -21,8 +28,8 @@ use glyph_field::{FieldResources, FieldTargets, FramePrepare, GlyphField, GroupR
 use glyph_field_derived::DerivedSlot;
 use glyph_field_visible::test_support::{synthetic_trie, ADVANCE_FU, EM_HEIGHT_FU};
 use glyph_field_visible::{
-    layout_all_lines, reference_x, tables, ByteSpanGpu, LineEntryGpu, SegmentSeedGpu, TrieUpload, VisibleField, VisibleInputs,
-    VisibleItem, VisibleLimits, WRAP_BACK, WRAP_DOWN,
+    layout_all_lines, layout_all_lines_with_overrides, reference_x, tables, ByteSpanGpu, GlyphOverride, LineEntryGpu, SegmentSeedGpu,
+    TrieUpload, VisibleField, VisibleInputs, VisibleItem, VisibleLimits, NO_GROUP, WRAP_BACK, WRAP_DOWN,
 };
 
 fn block_on<F: Future>(f: F) -> F::Output {
@@ -170,6 +177,16 @@ struct Corpus {
     expected: Vec<DerivedSlot>,
     /// Per item, its slot range in `expected`.
     item_slots: Vec<std::ops::Range<usize>>,
+    /// Per expected slot, its (item, item-relative leader byte).
+    expected_keys: Vec<(u32, u32)>,
+}
+
+impl Corpus {
+    /// The expected slot of the glyph whose leader is `byte` of `item`, if
+    /// that byte is a surviving leader.
+    fn slot_of(&self, item: u32, byte: u32) -> Option<usize> {
+        self.expected_keys.iter().position(|&k| k == (item, byte))
+    }
 }
 
 struct ItemSpec {
@@ -198,7 +215,7 @@ fn rows_for_line(len: i64, wrap: i64, down: bool) -> i64 {
 fn build(trie: &TrieUpload, specs: &[ItemSpec], segment_bytes: usize) -> Corpus {
     let tw = Twin { trie };
     let cell_adv = tables::fu_to_world(ADVANCE_FU as i32, EM_HEIGHT_FU);
-    let mut c = Corpus { items: vec![], bytes: vec![], lines: vec![], seeds: vec![], spans: vec![], expected: vec![], item_slots: vec![] };
+    let mut c = Corpus { items: vec![], bytes: vec![], lines: vec![], seeds: vec![], spans: vec![], expected: vec![], item_slots: vec![], expected_keys: vec![] };
     let mut byte_base = 0u64;
     for (idx, s) in specs.iter().enumerate() {
         let bytes = &s.text;
@@ -255,6 +272,7 @@ fn build(trie: &TrieUpload, specs: &[ItemSpec], segment_bytes: usize) -> Corpus 
                         color,
                         glyph_field_derived::item_lane(idx as u32),
                     ));
+                    c.expected_keys.push((idx as u32, i as u32));
                     glyphs += 1;
                 }
                 col += 1;
@@ -524,33 +542,44 @@ fn frame(shift_x: f32, lod_glyph_px: f32, lod_backdrop_px: f32, greek_mode: u32,
     }
 }
 
+/// The scene's mask target format (`glyph_scene/target.rs::MASK_FORMAT`).
+const MASK_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
+
+fn target(device: &wgpu::Device, label: &str, format: wgpu::TextureFormat) -> wgpu::TextureView {
+    device
+        .create_texture(&wgpu::TextureDescriptor {
+            label: Some(label),
+            size: wgpu::Extent3d { width: 64, height: 64, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        })
+        .create_view(&Default::default())
+}
+
 /// One frame: prepare, then a render pass with both draws into an offscreen
 /// target (so the pipelines and bind groups are validated), submitted.
 fn run_frame(device: &wgpu::Device, queue: &wgpu::Queue, field: &VisibleField, f: &FramePrepare) {
-    let color = device.create_texture(&wgpu::TextureDescriptor {
-        label: Some("color"),
-        size: wgpu::Extent3d { width: 64, height: 64, depth_or_array_layers: 1 },
-        mip_level_count: 1,
-        sample_count: 1,
-        dimension: wgpu::TextureDimension::D2,
-        format: TARGETS.color_format,
-        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-        view_formats: &[],
-    });
-    let depth = device.create_texture(&wgpu::TextureDescriptor {
-        label: Some("depth"),
-        size: wgpu::Extent3d { width: 64, height: 64, depth_or_array_layers: 1 },
-        mip_level_count: 1,
-        sample_count: 1,
-        dimension: wgpu::TextureDimension::D2,
-        format: TARGETS.depth_format,
-        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-        view_formats: &[],
-    });
-    let cv = color.create_view(&Default::default());
-    let dv = depth.create_view(&Default::default());
+    run_frame_with_mask(device, queue, field, f, None);
+}
+
+/// The same frame with the scene's selection pass: `prepare_mask` after
+/// `prepare` in the frame's encoder (when a selection is given), the glyph
+/// pass, then the mask pass — the mask pipeline built from the FIELD's core
+/// as the scene builds it, over the mask core's bind group, into a mask
+/// target with no depth. `selection` is `(item, start, end)`.
+fn run_frame_with_mask(device: &wgpu::Device, queue: &wgpu::Queue, field: &VisibleField, f: &FramePrepare, selection: Option<(&wgpu::RenderPipeline, u32, u32, u32)>) {
+    let cv = target(device, "color", TARGETS.color_format);
+    let dv = target(device, "depth", TARGETS.depth_format);
+    let mv = target(device, "mask", MASK_FORMAT);
     let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("frame") });
     field.prepare(queue, &mut encoder, f);
+    if let Some((_, item, start, end)) = selection {
+        field.prepare_mask(queue, &mut encoder, item, start, end);
+    }
     {
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("glyphs"),
@@ -572,6 +601,23 @@ fn run_frame(device: &wgpu::Device, queue: &wgpu::Queue, field: &VisibleField, f
         pass.set_pipeline(field.glyph_pipeline());
         field.record_draws(&mut pass, &[]);
         field.record_wash_draw(&mut pass);
+    }
+    if let Some((mask_pipeline, ..)) = selection {
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("selection mask"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: &mv,
+                resolve_target: None,
+                depth_slice: None,
+                ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT), store: wgpu::StoreOp::Store },
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+        pass.set_pipeline(mask_pipeline);
+        field.record_mask_draw(&mut pass);
     }
     queue.submit([encoder.finish()]);
     device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None }).expect("poll");
@@ -683,4 +729,260 @@ fn the_frame_path_culls_lays_out_and_draws() {
     assert_eq!(h.color, 0xFF000000, "byte 0 took span 0 after the remap");
     let w = got.iter().find(|s| glyph_field_derived::item_of(s.item_and_group) == 0 && glyph_field_derived::row_of(s.row) == 0 && s.glyph_id() == b'w' as u16).expect("the 'w' of world");
     assert_eq!(w.color, 0xFF000006, "byte 6 took span 6 after the remap");
+}
+
+// ── M3: edits and selection keyed by (item, byte) ───────────────────────────
+
+fn xorshift(state: &mut u64) -> u64 {
+    *state ^= *state << 13;
+    *state ^= *state >> 7;
+    *state ^= *state << 17;
+    *state
+}
+
+/// The per-glyph overrides through the headless kernel, held lane for lane
+/// to the twin with the same edits applied on the host: a colour beats the
+/// span, the nudge is `x + nudge` in f32 AFTER the narrowing, a group puts
+/// the field's own row index in the Derived lane. Bytes that are not
+/// surviving leaders (a tab, a continuation byte, a glyph-0 lead) take an
+/// override that changes nothing; a cleared or replaced override leaves the
+/// last state; an override in a seeded segment is found by the segment's
+/// binary search.
+#[test]
+fn overrides_apply_in_the_headless_layout_as_the_twin_predicts() {
+    let (device, queue) = device();
+    let (trie, c) = corpus();
+    let refs: Vec<&[u8]> = c.bytes.iter().map(|b| b.as_slice()).collect();
+    let inp = inputs(&trie, &c, &refs);
+    let ov = |item: u32, byte: u32, color: u32, x_nudge: f32, group: u32| GlyphOverride { item, byte, color, x_nudge, group };
+    assert_eq!(c.bytes[0][15], b'\t');
+    assert_eq!(c.bytes[0][48], 0x80, "a continuation byte");
+    assert_eq!(c.bytes[0][44], 0xE2, "a lead followed by ASCII: a glyph-0 leader");
+    assert_eq!(c.bytes[1][66], b'c', "the second segment of the long line");
+    assert!(c.seeds.iter().any(|s| s.line == c.items[1].first_line && s.byte_offset == 64), "the long line is cut at 64");
+    let overrides = vec![
+        ov(0, 1, 0xFF0000AA, 0.0, NO_GROUP),                 // colour only
+        ov(1, 66, 0, 0.375, NO_GROUP),                       // nudge only, in a seeded segment
+        ov(4, 5, 0, 0.0, 7),                                 // group only
+        ov(4, 6, 0, 0.0, 7),                                 // the same group: shares its row
+        ov(4, 7, 0, 0.0, 9),                                 // a second group: a second row
+        ov(0, 0, 0xFF00AA00, -0.125, 7),                     // all three on one glyph
+        ov(0, 15, 0xFFFFFFFF, 1.0, 9),                       // a tab: glyph 0, no slot — nothing to apply to
+        ov(0, 48, 0xFFFFFFFF, 1.0, 9),                       // a continuation byte: not a leader
+        ov(0, 44, 0xFFFFFFFF, 1.0, 9),                       // a glyph-0 lead
+        ov(2, 4, 0xFF123456, 0.0, NO_GROUP),                 // set…
+        ov(2, 4, 0, 0.0, NO_GROUP),                          // …then cleared: no effect
+        ov(4, 10, 0xFF111111, 0.0, NO_GROUP),                // set…
+        ov(4, 10, 0xFF222222, 0.0, NO_GROUP),                // …then replaced: the last wins
+    ];
+    let got = layout_all_lines_with_overrides(&device, &queue, &inp, &overrides);
+    assert_eq!(got.group_overrides, [0, 7, 9], "one row per distinct group, in order of first use");
+    let k_of = |group: u32| got.group_overrides.iter().position(|&g| g == group).expect("group has a row") as u32;
+
+    let mut want = c.expected.clone();
+    let at = |item: u32, byte: u32| c.slot_of(item, byte).unwrap_or_else(|| panic!("({item}, {byte}) is a surviving leader"));
+    want[at(0, 1)].color = 0xFF0000AA;
+    want[at(1, 66)].x += 0.375;
+    want[at(4, 5)].item_and_group = glyph_field_derived::override_lane(4, k_of(7));
+    want[at(4, 6)].item_and_group = glyph_field_derived::override_lane(4, k_of(7));
+    want[at(4, 7)].item_and_group = glyph_field_derived::override_lane(4, k_of(9));
+    want[at(0, 0)].color = 0xFF00AA00;
+    want[at(0, 0)].x += -0.125;
+    want[at(0, 0)].item_and_group = glyph_field_derived::override_lane(0, k_of(7));
+    want[at(4, 10)].color = 0xFF222222;
+    for (item, byte) in [(0, 15), (0, 48), (0, 44)] {
+        assert!(c.slot_of(item, byte).is_none(), "({item}, {byte}) must not be a surviving leader");
+    }
+    assert_slots_equal(&got.slots, &want, "headless layout with overrides");
+    // The nudge is one f32 add after the narrowing, not folded into it: the
+    // twin's x is the reference's single rounding plus the nudge.
+    let base = c.expected[at(1, 66)].x;
+    assert_ne!(got.slots[at(1, 66)].x.to_bits(), base.to_bits());
+    assert_eq!(got.slots[at(1, 66)].x.to_bits(), (base + 0.375f32).to_bits());
+}
+
+/// A frame with a selection: the mask buffer holds exactly the slots whose
+/// leader byte is in the range (as a set — atomic order), each bit-equal to
+/// the main buffer's slot of the same glyph; a range across three segments
+/// of a long line; a whole item; an empty item; an empty range; no
+/// selection; a frame whose lines are washes (no segments: nothing); and
+/// after a frame without `prepare_mask` the draw is back to zero.
+#[test]
+fn the_selection_mask_holds_exactly_the_slots_in_range() {
+    let (device, queue) = device();
+    let (trie, c) = corpus();
+    let refs: Vec<&[u8]> = c.bytes.iter().map(|b| b.as_slice()).collect();
+    let inp = inputs(&trie, &c, &refs);
+    let params: Vec<ItemParamsGpu> = c.items.iter().map(|i| i.params).collect();
+    let dummy = Dummy::new(&device);
+    let field = VisibleField::new(&device, &queue, &inp, &dummy.resources(&params), TARGETS, VisibleLimits { max_slots: 1 << 16, max_segments: 1 << 12, max_wash: 1 << 12 });
+    assert_eq!(field.mask_capacity(), 1 << 16, "the mask cap follows the slot cap under the 1 M ceiling");
+    let mask_pipeline = field.create_mask_pipeline(&device, MASK_FORMAT, 1);
+    let total = c.expected.len() as u32;
+    let all = frame(0.0, 0.0, 0.0, 1, 0);
+
+    let expect_mask = |item: u32, start: u32, end: u32, what: &str| {
+        run_frame_with_mask(&device, &queue, &field, &all, Some((&mask_pipeline, item, start, end)));
+        let n = field.read_mask_count(&queue);
+        let mut want: Vec<DerivedSlot> = c.expected_keys.iter().zip(&c.expected).filter(|(&(i, b), _)| i == item && b >= start && b < end).map(|(_, s)| *s).collect();
+        let mut got = field.read_mask_slots(&queue, n);
+        got.sort_by_key(sort_key);
+        want.sort_by_key(sort_key);
+        assert_slots_equal(&got, &want, what);
+        // Each is a slot the main buffer drew this frame too.
+        let main = field.read_slots(&queue, total);
+        for s in &got {
+            assert!(main.iter().any(|m| sort_key(m) == sort_key(s)), "{what}: a mask slot is in the main buffer: {}", describe(s));
+        }
+        n
+    };
+
+    // Three segments of the long line (cuts at 64 and 128).
+    let n = expect_mask(1, 50, 140, "mask over item 1 [50, 140)");
+    assert!(n >= 40, "the range holds many glyphs ({n})");
+    assert!(c.expected_keys.iter().any(|&(i, b)| i == 1 && (50..64).contains(&b)) && c.expected_keys.iter().any(|&(i, b)| i == 1 && (128..140).contains(&b)), "the range reaches the first and third segments");
+    // A glyph alone; a whole item (the end clamped); an item with no bytes.
+    assert_eq!(expect_mask(0, 6, 7, "one glyph"), 1);
+    assert_eq!(expect_mask(4, 0, u32::MAX, "all of item 4"), c.item_slots[4].len() as u32);
+    assert_eq!(expect_mask(3, 0, 100, "the empty item"), 0);
+    // An empty range, and no selection at all: zero instances.
+    assert_eq!(expect_mask(1, 10, 10, "an empty range"), 0);
+    run_frame_with_mask(&device, &queue, &field, &all, Some((&mask_pipeline, 1, 50, 140)));
+    assert!(field.read_mask_count(&queue) > 0);
+    run_frame(&device, &queue, &field, &all);
+    assert_eq!(field.read_mask_count(&queue), 0, "a frame without prepare_mask resets the draw");
+    // The wash tier has no segments: a selection there draws nothing.
+    run_frame_with_mask(&device, &queue, &field, &frame(0.0, 1e9, 0.0, 2, 0), Some((&mask_pipeline, 1, 50, 140)));
+    assert_eq!(field.read_mask_count(&queue), 0, "washed lines have no glyph slots to mask");
+    // Overrides ride into the mask too (the same kernel): a recoloured
+    // glyph's mask slot carries the colour (the mask pipeline ignores it,
+    // but the record is the main buffer's).
+    field.set_glyph_override(&queue, GlyphOverride { item: 0, byte: 6, color: 0xFF0000AA, x_nudge: 0.0, group: NO_GROUP });
+    run_frame_with_mask(&device, &queue, &field, &all, Some((&mask_pipeline, 0, 6, 7)));
+    let m = field.read_mask_slots(&queue, 1);
+    assert_eq!(m[0].color, 0xFF0000AA);
+    assert_eq!(m[0].glyph_id(), b'w' as u16);
+}
+
+/// `set_item_span_range` on the GPU path: colours checked per byte through
+/// `locate` (which this ties to the span edit), on a range inside the
+/// loaded spans, a clear, and a range across lines.
+#[test]
+fn set_item_span_range_merges_into_the_item_spans_on_the_gpu() {
+    let (device, queue) = device();
+    let (trie, c) = corpus();
+    let refs: Vec<&[u8]> = c.bytes.iter().map(|b| b.as_slice()).collect();
+    let inp = inputs(&trie, &c, &refs);
+    let params: Vec<ItemParamsGpu> = c.items.iter().map(|i| i.params).collect();
+    let dummy = Dummy::new(&device);
+    let field = VisibleField::new(&device, &queue, &inp, &dummy.resources(&params), TARGETS, VisibleLimits { max_slots: 1 << 16, max_segments: 1 << 12, max_wash: 1 << 12 });
+    let total = c.expected.len() as u32;
+    let all = frame(0.0, 0.0, 0.0, 1, 0);
+    let color_at = |byte: u32| -> u32 {
+        let slots = field.read_slots(&queue, total);
+        let k = field.locate(&queue, 0, byte).unwrap_or_else(|| panic!("byte {byte} of item 0 is a drawn glyph"));
+        slots[k as usize].color
+    };
+    const BLUE: u32 = 0xFF2020FF;
+    const GREEN: u32 = 0xFF20FF20;
+    const RED: u32 = 0xFFFF2020;
+
+    // As loaded: [0,5) blue, [6,11) green, [24,40) red; byte 5 default.
+    run_frame(&device, &queue, &field, &all);
+    assert_eq!((color_at(0), color_at(5), color_at(6), color_at(24)), (BLUE, DEFAULT_COLOR, GREEN, RED));
+
+    // Inside: [2, 8) → blue | new | green, with byte 5 (the gap) coloured.
+    field.set_item_span_range(&queue, 0, 2, 8, 0xFF112233);
+    run_frame(&device, &queue, &field, &all);
+    let line0: Vec<u32> = (0..11).map(color_at).collect();
+    assert_eq!(line0, [BLUE, BLUE, 0xFF112233, 0xFF112233, 0xFF112233, 0xFF112233, 0xFF112233, 0xFF112233, GREEN, GREEN, GREEN]);
+
+    // A clear: the whole first line back to the default; the later span stays.
+    field.set_item_span_range(&queue, 0, 0, 11, 0);
+    run_frame(&device, &queue, &field, &all);
+    assert!((0..11).all(|b| color_at(b) == DEFAULT_COLOR), "cleared");
+    assert_eq!(color_at(24), RED);
+
+    // Across lines: [8, 30) covers the end of line 0, line 1, and clips the
+    // red span at 30.
+    field.set_item_span_range(&queue, 0, 8, 30, 0xFF445566);
+    run_frame(&device, &queue, &field, &all);
+    assert_eq!((color_at(7), color_at(8), color_at(10)), (DEFAULT_COLOR, 0xFF445566, 0xFF445566));
+    assert_eq!((color_at(12), color_at(21)), (0xFF445566, 0xFF445566), "line 1 ('foo\\tbar \\x7f!')");
+    assert_eq!((color_at(24), color_at(29), color_at(30), color_at(38)), (0xFF445566, 0xFF445566, RED, RED));
+    // The host copy the merge ran on is what the device has: the kernel's
+    // colouring above is the proof; the span list itself is two runs.
+    let mut host = c.spans[c.items[0].span_base as usize..(c.items[0].span_base + c.items[0].span_count) as usize].to_vec();
+    glyph_field_visible::merge_span_range(&mut host, 2, 8, 0xFF112233);
+    glyph_field_visible::merge_span_range(&mut host, 0, 11, 0);
+    glyph_field_visible::merge_span_range(&mut host, 8, 30, 0xFF445566);
+    assert_eq!(host, [ByteSpanGpu { start: 8, end: 30, color: 0xFF445566 }, ByteSpanGpu { start: 30, end: 40, color: RED }]);
+}
+
+/// `locate` against a readback search: for random (item, byte) probes —
+/// surviving leaders, continuation bytes, glyph-0 cells (tabs, DEL, the
+/// newline, sequence trailers, a lead followed by ASCII), bytes past the
+/// item, an item past the field — the slot it names holds the twin's record
+/// for that glyph, or it says `None` exactly when the twin has no slot.
+#[test]
+fn locate_names_the_transient_slot_of_item_byte_or_none() {
+    let (device, queue) = device();
+    let (trie, c) = corpus();
+    let refs: Vec<&[u8]> = c.bytes.iter().map(|b| b.as_slice()).collect();
+    let inp = inputs(&trie, &c, &refs);
+    let params: Vec<ItemParamsGpu> = c.items.iter().map(|i| i.params).collect();
+    let dummy = Dummy::new(&device);
+    let field = VisibleField::new(&device, &queue, &inp, &dummy.resources(&params), TARGETS, VisibleLimits { max_slots: 1 << 16, max_segments: 1 << 12, max_wash: 1 << 12 });
+    let total = c.expected.len() as u32;
+    run_frame(&device, &queue, &field, &frame(0.0, 0.0, 0.0, 1, 0));
+    let slots = field.read_slots(&queue, total);
+
+    let mut probes: Vec<(u32, u32)> = vec![(0, 15), (0, 20), (0, 11), (0, 48), (0, 44), (0, 70), (0, 71), (0, 500), (3, 0), (9, 0), (1, 64), (1, 66), (1, 127), (1, 128)];
+    // The long line's sequence bytes: every byte of the first piece.
+    probes.extend((0..61u32).map(|b| (1, b)));
+    // The same bytes in leader mode (item 2 is the long line, cluster off).
+    probes.extend((0..61u32).map(|b| (2, b)));
+    let mut state = 0x2545_F491_4F6C_DD1Du64;
+    while probes.len() < 400 {
+        let r = xorshift(&mut state);
+        let item = (r % 5) as u32;
+        let len = c.bytes[item as usize].len() as u32;
+        probes.push((item, ((r >> 8) % (len + 4) as u64) as u32));
+    }
+    let (mut some, mut none_past, mut none_continuation, mut none_glyph0) = (0, 0, 0, 0);
+    for &(item, byte) in &probes {
+        let want = c.slot_of(item, byte).map(|k| c.expected[k]);
+        let got = field.locate(&queue, item, byte);
+        match (want, got) {
+            (Some(w), Some(k)) => {
+                assert!(k < total, "({item}, {byte}): slot {k} of {total}");
+                assert_slots_equal(&[slots[k as usize]], &[w], &format!("locate({item}, {byte}) = slot {k}"));
+                some += 1;
+            }
+            (None, None) => {
+                let bytes = c.bytes.get(item as usize);
+                match bytes.and_then(|b| b.get(byte as usize)) {
+                    None => none_past += 1,
+                    Some(b) if (0x80..0xC0).contains(b) => none_continuation += 1,
+                    Some(_) => none_glyph0 += 1,
+                }
+            }
+            (w, g) => panic!("locate({item}, {byte}): twin {w:?}, field {g:?}"),
+        }
+    }
+    // 400 probes: about half land on surviving leaders (193 on 2026-10-10),
+    // the rest spread over the None classes, each of which must be reached.
+    assert!(some >= 150, "{some} located of {}", probes.len());
+    assert!(none_past >= 5 && none_continuation >= 20 && none_glyph0 >= 20, "None classes: past {none_past}, continuation {none_continuation}, glyph-0 {none_glyph0}");
+    // GLYPH_G_DUMP's door: the trait's word readback over a located slot.
+    let k = field.locate(&queue, 0, 6).expect("'w' of world");
+    let mut words = [0u32; 5];
+    field.read_slot_words(&device, &queue, k, &mut words);
+    assert_eq!(words[2] & 0xFFFF, b'w' as u32);
+    assert_eq!(words[4], glyph_field_derived::item_lane(0));
+    // A frame with the item hidden: its glyphs have no slot.
+    field.set_item_hidden(&queue, 0, true);
+    run_frame(&device, &queue, &field, &frame(0.0, 0.0, 0.0, 1, 0));
+    assert_eq!(field.locate(&queue, 0, 6), None, "a hidden item's glyph is nowhere");
+    assert!(field.locate(&queue, 4, 0).is_some());
 }

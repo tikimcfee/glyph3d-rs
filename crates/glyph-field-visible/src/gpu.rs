@@ -7,15 +7,22 @@
 //! BIND GROUPS. Three layouts, one per shader file: every entry point of a
 //! file binds the whole set (an unused binding costs nothing), so a kernel
 //! never needs its own group. The counts stay under Metal's 31 buffers per
-//! stage: cull 15 storage + 1 uniform, layout 13 + 2, wash 3 + 1.
+//! stage: cull 15 storage + 1 uniform, layout 15 + 2 (M3 added the override
+//! table and the mask's argument words), wash 3 + 1. The layout group is
+//! built twice per frame object: over the frame's slot buffer and its
+//! params, and over the MASK slot buffer and the mask's own params uniform
+//! (a second uniform, not a rewrite: every `queue.write_buffer` of a frame
+//! lands before its encoder runs, so one buffer could not carry both).
 //!
 //! THE FRAME PATH READS NOTHING BACK. Counters are copied into a ring of
 //! three staging buffers; the copy's submit happens after `prepare`
 //! returns, so the map is requested on the NEXT `prepare` and read on the
 //! one after — `stats()` lags its frame by two. `device.poll(Poll)` runs
-//! the map callbacks without waiting.
+//! the map callbacks without waiting. `locate` and the `read_*` methods do
+//! block: they are diagnostics and tests, never the frame path.
 
 use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
 
@@ -24,7 +31,8 @@ use glyph_field_derived::DerivedSlot;
 use wgpu::util::DeviceExt;
 
 use crate::tables::{self, *};
-use crate::{ByteSpanGpu, VisibleInputs, VisibleLimits, VisibleStats};
+use crate::walk;
+use crate::{ByteSpanGpu, GlyphOverride, VisibleInputs, VisibleLimits, VisibleStats, NO_GROUP};
 
 pub const CULL_WGSL: &str = include_str!("../shaders/visible_cull.wgsl");
 pub const LAYOUT_WGSL: &str = include_str!("../shaders/visible_layout.wgsl");
@@ -98,9 +106,13 @@ fn compute_pipeline(device: &wgpu::Device, layout: &wgpu::PipelineLayout, module
     })
 }
 
-/// Block on a readback of `size` bytes from `src` (a verification path,
-/// never the frame's).
-fn read_back(device: &wgpu::Device, queue: &wgpu::Queue, src: &wgpu::Buffer, offset: u64, size: u64) -> Vec<u8> {
+/// Block on a readback of `size` bytes (a multiple of 4) from `src` (a
+/// verification path, never the frame's). Returned as WORDS so a cast to
+/// any 4-aligned record is sound: a `Vec<u8>` has no alignment promise, and
+/// a 20 B one came back 2 mod 4 on this box (2026-10-10) — the larger reads
+/// had only ever been aligned by the allocator's habit.
+fn read_back(device: &wgpu::Device, queue: &wgpu::Queue, src: &wgpu::Buffer, offset: u64, size: u64) -> Vec<u32> {
+    assert!(size.is_multiple_of(4), "visible readback: {size} B is not whole words");
     let staging = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("visible readback"),
         size: size.max(4),
@@ -122,7 +134,8 @@ fn read_back(device: &wgpu::Device, queue: &wgpu::Queue, src: &wgpu::Buffer, off
         .expect("visible readback: poll failed");
     rx.recv().expect("visible readback: callback dropped").expect("visible readback: map failed");
     let data = slice.get_mapped_range().expect("visible readback: range");
-    let out = data[..size as usize].to_vec();
+    let mut out = vec![0u32; (size / 4) as usize];
+    bytemuck::cast_slice_mut::<u32, u8>(&mut out).copy_from_slice(&data[..size as usize]);
     drop(data);
     staging.unmap();
     out
@@ -156,14 +169,36 @@ pub struct Resident {
     pub first_span: wgpu::Buffer,
     /// The host mirror the span edits need.
     pub span_alloc: RefCell<SpanAlloc>,
+    /// Each item's spans as the device has them — what a range edit merges
+    /// into (`set_item_span_range`).
+    pub spans_host: RefCell<Vec<Vec<ByteSpanGpu>>>,
+    /// The per-glyph override table (M3): `GlyphOverrideGpu` runs per item,
+    /// and the host copy every edit is made on.
+    pub overrides: wgpu::Buffer,
+    pub override_alloc: RefCell<OverrideAlloc>,
+    /// The Derived draw's group-override table (binding 10 of
+    /// `glyph_field_derived.wgsl`): index k → group row, `OVERRIDE_MAX + 1`
+    /// words, 0 unused. Rows are allocated per distinct group a glyph
+    /// override names and never freed; `group_index` is the reverse map,
+    /// `group_table` the host mirror.
+    pub group_overrides: wgpu::Buffer,
+    pub group_index: RefCell<HashMap<u32, u32>>,
+    pub group_table: RefCell<Vec<u32>>,
+    /// The trie as uploaded, kept for `locate`'s CPU walk (the words the
+    /// kernel reads; a few MB for the atlas).
+    pub trie_host: PackedTrie,
     pub line_starts: Vec<u32>,
-    /// Per item `(first_line, line_count)` and its byte length.
+    /// Per item `(first_line, line_count)`, its byte length, where its bytes
+    /// landed `(chunk, offset)`, and whether it runs the sequence pass.
     pub item_lines: Vec<(u32, u32)>,
     pub item_byte_lens: Vec<u32>,
+    pub item_place: Vec<(u32, u32)>,
+    pub item_cluster: Vec<bool>,
     pub layout_bgl: wgpu::BindGroupLayout,
     pub layout_pipeline: wgpu::ComputePipeline,
     pub count_pipeline: wgpu::ComputePipeline,
     pub prefix_pipeline: wgpu::ComputePipeline,
+    pub finalize_mask_pipeline: wgpu::ComputePipeline,
 }
 
 impl Resident {
@@ -175,14 +210,16 @@ impl Resident {
         let plan = plan_bytes(items, byte_shift);
 
         // The bytes: one buffer per chunk, written in place while mapped
-        // (zero elsewhere), four bindings in the kernel.
+        // (zero elsewhere), four bindings in the kernel. COPY_SRC for
+        // `locate`, which reads one segment's bytes back rather than keep a
+        // second copy of a tree on the host.
         let mut bytes = Vec::with_capacity(MAX_BYTE_CHUNKS);
         for (c, &size) in plan.chunk_sizes.iter().enumerate() {
             let padded = size.div_ceil(4) * 4;
             let buffer = device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some(&format!("visible bytes {c}/{}", plan.chunk_sizes.len())),
                 size: padded.max(16),
-                usage: wgpu::BufferUsages::STORAGE,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
                 mapped_at_creation: true,
             });
             {
@@ -235,6 +272,9 @@ impl Resident {
         let spans = storage_init(device, "visible spans", &span_table, copy_dst);
         let first_span = storage_init(device, "visible first span per line", &first, copy_dst);
         let trie_words = storage_init(device, "visible trie tables", &packed.words, wgpu::BufferUsages::empty());
+        let override_alloc = OverrideAlloc::new(items.len());
+        let overrides = storage_zeroed(device, "visible glyph overrides", override_alloc.capacity as u64 * std::mem::size_of::<GlyphOverrideGpu>() as u64, copy_dst);
+        let group_overrides = storage_zeroed(device, "visible group overrides (Derived binding 10)", (glyph_field_derived::OVERRIDE_MAX as u64 + 1) * 4, copy_dst);
 
         let compute = wgpu::ShaderStages::COMPUTE;
         let layout_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -255,6 +295,8 @@ impl Resident {
                 storage_entry(12, true, compute),
                 storage_entry(13, true, compute),
                 storage_entry(14, true, compute),
+                storage_entry(15, true, compute),
+                storage_entry(16, false, compute),
             ],
         });
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -269,7 +311,9 @@ impl Resident {
         let layout_pipeline = compute_pipeline(device, &pl, &module, "layout_segments");
         let count_pipeline = compute_pipeline(device, &pl, &module, "count_seed_segments");
         let prefix_pipeline = compute_pipeline(device, &pl, &module, "prefix_seed_survivors");
+        let finalize_mask_pipeline = compute_pipeline(device, &pl, &module, "finalize_mask");
 
+        let spans_host: Vec<Vec<ByteSpanGpu>> = items.iter().map(|it| inputs.spans[it.span_base as usize..(it.span_base + it.span_count) as usize].to_vec()).collect();
         let this = Self {
             device: device.clone(),
             items_total: items.len() as u32,
@@ -292,25 +336,37 @@ impl Resident {
             spans,
             first_span,
             span_alloc: RefCell::new(span_alloc),
+            spans_host: RefCell::new(spans_host),
+            overrides,
+            override_alloc: RefCell::new(override_alloc),
+            group_overrides,
+            group_index: RefCell::new(HashMap::new()),
+            group_table: RefCell::new(vec![0]),
+            trie_host: packed,
             line_starts: inputs.lines.iter().map(|l| l.byte_start).collect(),
             item_lines: items.iter().map(|it| (it.first_line, it.line_count)).collect(),
             item_byte_lens: items.iter().map(|it| it.byte_len).collect(),
+            item_place: plan.place,
+            item_cluster: items.iter().map(|it| it.cluster != 0).collect(),
             layout_bgl,
             layout_pipeline,
             count_pipeline,
             prefix_pipeline,
+            finalize_mask_pipeline,
         };
         this.count_seed_survivors(queue);
         this
     }
 
-    /// A layout bind group over `segs` and `slots`.
-    pub fn layout_bind_group(&self, segs: &wgpu::Buffer, slots: &wgpu::Buffer) -> wgpu::BindGroup {
+    /// A layout bind group over `segs` and `slots`, told by `params` (the
+    /// frame's or the mask's uniform) and with `mask_args` for the mask
+    /// counter (any 48 B storage buffer when the dispatch is not a mask).
+    pub fn layout_bind_group(&self, params: &wgpu::Buffer, segs: &wgpu::Buffer, slots: &wgpu::Buffer, mask_args: &wgpu::Buffer) -> wgpu::BindGroup {
         self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("visible layout bg"),
             layout: &self.layout_bgl,
             entries: &[
-                bind(0, &self.layout_params),
+                bind(0, params),
                 bind(1, &self.trie_meta),
                 bind(2, &self.bytes[0]),
                 bind(3, &self.bytes[1]),
@@ -325,13 +381,27 @@ impl Resident {
                 bind(12, &self.trie_words),
                 bind(13, &self.spans),
                 bind(14, &self.first_span),
+                bind(15, &self.overrides),
+                bind(16, mask_args),
             ],
         })
     }
 
+    /// The frame's (or the headless) parameters into the resident uniform.
     pub fn write_layout_params(&self, queue: &wgpu::Queue, count: u32, debug_tint: u32) {
-        let p = LayoutParamsGpu { count, debug_tint, default_color: self.default_color, chunk_shift: self.byte_shift };
+        let p = LayoutParamsGpu::all(count, debug_tint, self.default_color, self.byte_shift);
         queue.write_buffer(&self.layout_params, 0, bytemuck::bytes_of(&p));
+    }
+
+    /// A parameter block into any params uniform (the mask's).
+    pub fn write_params_to(&self, queue: &wgpu::Queue, buffer: &wgpu::Buffer, params: &LayoutParamsGpu) {
+        queue.write_buffer(buffer, 0, bytemuck::bytes_of(params));
+    }
+
+    /// A 48 B storage buffer for the mask-args binding of a dispatch that is
+    /// not a mask.
+    pub fn dummy_mask_args(&self, label: &str) -> wgpu::Buffer {
+        storage_zeroed(&self.device, label, (MASK_ARGS_WORDS * 4) as u64, wgpu::BufferUsages::empty())
     }
 
     /// At load: every seeded segment's survivor count, then each seed's
@@ -345,7 +415,8 @@ impl Resident {
         self.write_layout_params(queue, self.seeds_total, 0);
         let dummy_segs = storage_zeroed(&self.device, "visible segs (seed count)", 32, wgpu::BufferUsages::empty());
         let dummy_slots = storage_zeroed(&self.device, "visible slots (seed count)", 20, wgpu::BufferUsages::empty());
-        let bg = self.layout_bind_group(&dummy_segs, &dummy_slots);
+        let dummy_mask = self.dummy_mask_args("visible mask args (seed count)");
+        let bg = self.layout_bind_group(&self.layout_params, &dummy_segs, &dummy_slots, &dummy_mask);
         let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("visible seed survivors") });
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("visible seed count"), timestamp_writes: None });
@@ -365,8 +436,7 @@ impl Resident {
             return Vec::new();
         }
         let n = self.seeds_total as u64;
-        let data = read_back(&self.device, queue, &self.survivors, n * 4, n * 4);
-        bytemuck::cast_slice(&data).to_vec()
+        read_back(&self.device, queue, &self.survivors, n * 4, n * 4)
     }
 
     pub fn set_item_hidden(&self, queue: &wgpu::Queue, item: u32, hidden: bool) {
@@ -421,6 +491,122 @@ impl Resident {
             let idx = first_span_index_for_item(starts, spans, base);
             queue.write_buffer(&self.first_span, first_line as u64 * 4, bytemuck::cast_slice(&idx));
         }
+        self.spans_host.borrow_mut()[i] = spans.to_vec();
+    }
+
+    /// `crate::VisibleField::set_item_span_range`: merge into the host copy
+    /// (`merge_span_range`), then the whole-item path above.
+    pub fn set_item_span_range(&self, queue: &wgpu::Queue, item: u32, start: u32, end: u32, color: u32) {
+        assert!(item < self.items_total, "set_item_span_range: item {item} of {}", self.items_total);
+        let end = end.min(self.item_byte_lens[item as usize]);
+        if start >= end {
+            return;
+        }
+        let mut merged = self.spans_host.borrow()[item as usize].clone();
+        merge_span_range(&mut merged, start, end, color);
+        self.set_item_spans(queue, item, &merged);
+    }
+
+    // ── per-glyph overrides (M3) ──────────────────────────────────────
+
+    /// The index of `group` in the Derived group-override table, allocating
+    /// a row the first time a group is named; 0 (the group part dropped,
+    /// with a warning) once the 4,095 rows are in use.
+    fn group_index_for(&self, queue: &wgpu::Queue, group: u32) -> u32 {
+        if group == NO_GROUP {
+            return 0;
+        }
+        if let Some(&k) = self.group_index.borrow().get(&group) {
+            return k;
+        }
+        let mut table = self.group_table.borrow_mut();
+        let k = table.len() as u32;
+        if k > glyph_field_derived::OVERRIDE_MAX {
+            log::warn!("visible field: out of group overrides ({} in use); the glyph keeps its item's group", glyph_field_derived::OVERRIDE_MAX);
+            return 0;
+        }
+        table.push(group);
+        self.group_index.borrow_mut().insert(group, k);
+        queue.write_buffer(&self.group_overrides, k as u64 * 4, bytemuck::bytes_of(&group));
+        k
+    }
+
+    /// The group-override table as the device has it (index → group row;
+    /// `[0]` is unused).
+    pub fn group_override_table(&self) -> Vec<u32> {
+        self.group_table.borrow().clone()
+    }
+
+    /// `crate::VisibleField::set_glyph_override`. An override that changes
+    /// nothing (colour 0, no nudge, `NO_GROUP`) clears.
+    pub fn set_glyph_override(&self, queue: &wgpu::Queue, ov: GlyphOverride) {
+        assert!(ov.item < self.items_total, "set_glyph_override: item {} of {}", ov.item, self.items_total);
+        let i = ov.item as usize;
+        if ov.byte >= self.item_byte_lens[i] {
+            log::warn!("visible field: override at byte {} of item {} ({} bytes); ignored", ov.byte, ov.item, self.item_byte_lens[i]);
+            return;
+        }
+        let rec = override_gpu(&ov, self.group_index_for(queue, ov.group));
+        self.apply_override_edit(queue, i, rec);
+    }
+
+    /// `crate::VisibleField::clear_glyph_override`.
+    pub fn clear_glyph_override(&self, queue: &wgpu::Queue, item: u32, byte: u32) {
+        assert!(item < self.items_total, "clear_glyph_override: item {item} of {}", self.items_total);
+        self.apply_override_edit(queue, item as usize, GlyphOverrideGpu { byte, ..Default::default() });
+    }
+
+    /// The host edit, then its mirror on the device: the run rewritten from
+    /// the edit on (in place) or whole (after a remap), and the item row's
+    /// `(override_base, override_count)`.
+    fn apply_override_edit(&self, queue: &wgpu::Queue, item: usize, rec: GlyphOverrideGpu) {
+        let mut alloc = self.override_alloc.borrow_mut();
+        let edit = alloc.edit(item, rec);
+        let (base, _) = alloc.runs[item];
+        let list = &alloc.items[item];
+        let rewrite_from = match edit {
+            OverrideEdit::Unchanged => return,
+            OverrideEdit::Refused => {
+                log::warn!(
+                    "visible field: item {item} needs {} override slots and the table has {} free; the edit is dropped",
+                    list.len() + 1 + span_slack(list.len() as u32 + 1) as usize,
+                    alloc.capacity - alloc.next_free
+                );
+                return;
+            }
+            OverrideEdit::InPlace { from } => from,
+            OverrideEdit::Remapped { .. } => 0,
+        };
+        if rewrite_from < list.len() {
+            let stride = std::mem::size_of::<GlyphOverrideGpu>() as u64;
+            queue.write_buffer(&self.overrides, (base as u64 + rewrite_from as u64) * stride, bytemuck::cast_slice(&list[rewrite_from..]));
+        }
+        let row_offset = item as u64 * std::mem::size_of::<ItemGpu>() as u64 + std::mem::offset_of!(ItemGpu, override_base) as u64;
+        queue.write_buffer(&self.items, row_offset, bytemuck::cast_slice(&[base, list.len() as u32]));
+    }
+
+    /// The overrides of one item as the device has them (tests).
+    pub fn item_overrides(&self, item: u32) -> Vec<GlyphOverrideGpu> {
+        self.override_alloc.borrow().items[item as usize].clone()
+    }
+
+    /// The bytes `[start, end)` of an item, read back from the resident
+    /// chunk (blocking; `locate`). Copies are 4-aligned, so the read is
+    /// widened to word bounds and trimmed.
+    pub fn read_item_bytes(&self, queue: &wgpu::Queue, item: u32, start: u32, end: u32) -> Vec<u8> {
+        let (chunk, chunk_off) = self.item_place[item as usize];
+        let buffer = &self.bytes[chunk as usize];
+        let from = (chunk_off + start) as u64 & !3;
+        let to = ((chunk_off + end) as u64).div_ceil(4) * 4;
+        let to = to.min(buffer.size());
+        if to <= from {
+            return Vec::new();
+        }
+        let words = read_back(&self.device, queue, buffer, from, to - from);
+        let bytes: &[u8] = bytemuck::cast_slice(&words);
+        let skip = ((chunk_off + start) as u64 - from) as usize;
+        let take = (end - start) as usize;
+        bytes[skip..(skip + take).min(bytes.len())].to_vec()
     }
 }
 
@@ -463,6 +649,17 @@ pub struct Frame {
     /// are copied into `indirect` between passes.
     pub args: wgpu::Buffer,
     pub indirect: wgpu::Buffer,
+    /// The selection mask (M3): its own transient slot buffer
+    /// (`mask_capacity` slots), the kernel's counter and draw words
+    /// (`MASK_ARGS_WORDS`), the INDIRECT copy the mask draw reads, the
+    /// mask dispatch's own params uniform and its layout bind group (over
+    /// the FRAME's segment list and the mask slots).
+    pub mask_slots: wgpu::Buffer,
+    pub mask_args: wgpu::Buffer,
+    pub mask_indirect: wgpu::Buffer,
+    pub mask_capacity: u32,
+    mask_params: wgpu::Buffer,
+    mask_layout_bg: wgpu::BindGroup,
     cull_bg: wgpu::BindGroup,
     cull_items: wgpu::ComputePipeline,
     prefix_items: wgpu::ComputePipeline,
@@ -503,7 +700,8 @@ impl Frame {
         let visible = storage_zeroed(device, "visible item list", n_items * 4, wgpu::BufferUsages::empty());
         let line_base = storage_zeroed(device, "visible line bases", n_items * 4, wgpu::BufferUsages::empty());
         let counters = storage_zeroed(device, "visible counters", STATS_COUNTERS_BYTES, wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC);
-        let segs = storage_zeroed(device, "visible segments", limits.max_segments as u64 * std::mem::size_of::<SegGpu>() as u64, wgpu::BufferUsages::empty());
+        // COPY_SRC on the segment list is for `locate`'s readback.
+        let segs = storage_zeroed(device, "visible segments", limits.max_segments as u64 * std::mem::size_of::<SegGpu>() as u64, wgpu::BufferUsages::COPY_SRC);
         let wash = storage_zeroed(device, "visible wash quads", limits.max_wash as u64 * std::mem::size_of::<WashGpu>() as u64, wgpu::BufferUsages::empty());
         let slots = storage_zeroed(device, "visible transient slots", slot_bytes, wgpu::BufferUsages::COPY_SRC);
         let args = storage_zeroed(device, "visible dispatch/draw args (storage)", (INDIRECT_WORDS * 4) as u64, wgpu::BufferUsages::COPY_SRC);
@@ -517,6 +715,24 @@ impl Frame {
             label: Some("visible wash quad index buffer"),
             contents: bytemuck::cast_slice(&[0u16, 1, 2, 0, 2, 3]),
             usage: wgpu::BufferUsages::INDEX,
+        });
+
+        // The selection mask's buffers. COPY_SRC on the indirect copy is
+        // for the tests, which read the draw's instance count back.
+        let mask_capacity = limits.max_slots.min(MASK_SLOTS_MAX);
+        let mask_slots = storage_zeroed(device, "visible mask slots", mask_capacity as u64 * std::mem::size_of::<DerivedSlot>() as u64, wgpu::BufferUsages::COPY_SRC);
+        let mask_args = storage_zeroed(device, "visible mask args (storage)", (MASK_ARGS_WORDS * 4) as u64, wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST);
+        let mask_indirect = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("visible mask indirect args"),
+            size: 20,
+            usage: wgpu::BufferUsages::INDIRECT | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let mask_params = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("visible mask layout params"),
+            size: std::mem::size_of::<LayoutParamsGpu>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
         });
 
         // The cull kernels.
@@ -577,7 +793,8 @@ impl Frame {
         let prefix_items = compute_pipeline(device, &cull_pl, &cull_module, "prefix_items");
         let cull_lines = compute_pipeline(device, &cull_pl, &cull_module, "cull_lines");
         let finalize = compute_pipeline(device, &cull_pl, &cull_module, "finalize");
-        let layout_bg = resident.layout_bind_group(&segs, &slots);
+        let layout_bg = resident.layout_bind_group(&resident.layout_params, &segs, &slots, &mask_args);
+        let mask_layout_bg = resident.layout_bind_group(&mask_params, &segs, &mask_slots, &mask_args);
 
         // The wash draw: the glyph pass's depth and blend state.
         let vertex = wgpu::ShaderStages::VERTEX;
@@ -674,6 +891,12 @@ impl Frame {
             slots,
             args,
             indirect,
+            mask_slots,
+            mask_args,
+            mask_indirect,
+            mask_capacity,
+            mask_params,
+            mask_layout_bg,
             cull_bg,
             cull_items,
             prefix_items,
@@ -717,6 +940,10 @@ impl Frame {
         // The layout kernel bounds itself by the (whole-workgroup) segment
         // cap; finalize blanks the entries past the live count.
         resident.write_layout_params(queue, self.limits.max_segments, frame.debug_tint);
+        // No selection until `prepare_mask` says otherwise: a mask draw
+        // recorded this frame without one draws zero instances (the write
+        // lands before the encoder, so a later `prepare_mask` copy wins).
+        queue.write_buffer(&self.mask_indirect, 0, bytemuck::cast_slice(&[6u32, 0, 0, 0, 0]));
 
         let ts = |begin: u32, end: u32| {
             self.timestamps.as_ref().map(|(set, _, _)| wgpu::ComputePassTimestampWrites {
@@ -841,7 +1068,7 @@ impl Frame {
     pub fn read_counters(&self, resident: &Resident, queue: &wgpu::Queue) -> [u32; COUNTER_WORDS] {
         let data = read_back(&resident.device, queue, &self.counters, 0, STATS_COUNTERS_BYTES);
         let mut out = [0u32; COUNTER_WORDS];
-        out.copy_from_slice(bytemuck::cast_slice(&data));
+        out.copy_from_slice(&data);
         out
     }
 
@@ -850,6 +1077,90 @@ impl Frame {
         let count = count.min(self.limits.max_slots) as u64;
         let data = read_back(&resident.device, queue, &self.slots, 0, count * std::mem::size_of::<DerivedSlot>() as u64);
         bytemuck::cast_slice(&data).to_vec()
+    }
+
+    // ── the selection mask (M3) ───────────────────────────────────────
+
+    /// `crate::VisibleField::prepare_mask`: the layout kernel in MASK mode
+    /// over the frame's segment list (the same indirect dispatch size as the
+    /// layout pass — every entry is visited, those not the item's or outside
+    /// the range return at once), `finalize_mask`, and the draw words
+    /// copied into the INDIRECT buffer. Per call: two dispatches, one 20 B
+    /// copy, two `write_buffer`s (the counter's 16 B and the 48 B params).
+    pub fn prepare_mask(&self, resident: &Resident, queue: &wgpu::Queue, encoder: &mut wgpu::CommandEncoder, item: u32, start: u32, end: u32) {
+        if item >= resident.items_total {
+            log::warn!("visible field: prepare_mask item {item} of {}; nothing selected", resident.items_total);
+            return;
+        }
+        let end = end.min(resident.item_byte_lens[item as usize]);
+        if start >= end {
+            return; // `prepare` already zeroed the draw
+        }
+        queue.write_buffer(&self.mask_args, 0, &[0u8; 16]);
+        let params = LayoutParamsGpu::mask(self.limits.max_segments, resident.default_color, resident.byte_shift, item, start, end, self.mask_capacity);
+        resident.write_params_to(queue, &self.mask_params, &params);
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("visible selection mask"), timestamp_writes: None });
+            pass.set_bind_group(0, &self.mask_layout_bg, &[]);
+            pass.set_pipeline(&resident.layout_pipeline);
+            pass.dispatch_workgroups_indirect(&self.indirect, INDIRECT_LAYOUT);
+            pass.set_pipeline(&resident.finalize_mask_pipeline);
+            pass.dispatch_workgroups(1, 1, 1);
+        }
+        encoder.copy_buffer_to_buffer(&self.mask_args, MASK_ARGS_DRAW, &self.mask_indirect, 0, 20);
+    }
+
+    /// `crate::VisibleField::record_mask_draw`.
+    pub fn record_mask_draw(&self, mask_core: &FieldCore<DerivedSlot>, pass: &mut wgpu::RenderPass<'_>) {
+        mask_core.record_draw_indirect(pass, 0, &self.mask_indirect, 0);
+    }
+
+    /// The Derived draw's storage over the mask buffer: one chunk.
+    pub fn mask_slot_storage(&self) -> SlotStorage<DerivedSlot> {
+        let n = self.mask_capacity as usize;
+        SlotStorage::new(vec![SlotChunk { buffer: self.mask_slots.clone(), offset: 0, slots: n as u32 }], n, n, None)
+    }
+
+    /// The mask draw's instance count as the last `prepare_mask` left it
+    /// (blocking; tests): the INDIRECT copy's second word.
+    pub fn read_mask_count(&self, resident: &Resident, queue: &wgpu::Queue) -> u32 {
+        read_back(&resident.device, queue, &self.mask_indirect, 0, 20)[1]
+    }
+
+    /// The first `count` mask slots (blocking; tests).
+    pub fn read_mask_slots(&self, resident: &Resident, queue: &wgpu::Queue, count: u32) -> Vec<DerivedSlot> {
+        let count = count.min(self.mask_capacity) as u64;
+        let data = read_back(&resident.device, queue, &self.mask_slots, 0, count * std::mem::size_of::<DerivedSlot>() as u64);
+        bytemuck::cast_slice(&data).to_vec()
+    }
+
+    // ── locate (M3) ──────────────────────────────────────────────────
+
+    /// `crate::VisibleField::locate`: three blocking readbacks (the
+    /// counters, the segment list, the covering segment's bytes) and the
+    /// CPU walk (`walk.rs`) counting survivors to the byte.
+    pub fn locate(&self, resident: &Resident, queue: &wgpu::Queue, item: u32, byte: u32) -> Option<u32> {
+        if item >= resident.items_total || byte >= resident.item_byte_lens[item as usize] {
+            return None;
+        }
+        let counters = self.read_counters(resident, queue);
+        let seg_count = counters[counter::SEG_FIT_END].min(self.limits.max_segments);
+        if seg_count == 0 {
+            return None;
+        }
+        let data = read_back(&resident.device, queue, &self.segs, 0, seg_count as u64 * std::mem::size_of::<SegGpu>() as u64);
+        let segs: &[SegGpu] = bytemuck::cast_slice(&data);
+        let line_start = |s: &SegGpu| resident.line_starts[s.line as usize];
+        let seg = segs.iter().find(|s| s.item == item && s.byte_end > s.byte_off && line_start(s) + s.byte_off <= byte && byte < line_start(s) + s.byte_end)?;
+        let seg_start = line_start(seg) + seg.byte_off;
+        let seg_end = line_start(seg) + seg.byte_end;
+        // The walk reads up to three bytes past the segment's end for a lead
+        // cut there (zero past the item, as the kernel reads).
+        let read_end = (seg_end + 3).min(resident.item_byte_lens[item as usize]);
+        let bytes = resident.read_item_bytes(queue, item, seg_start, read_end);
+        let survivors = walk::surviving_leader_offsets(&resident.trie_host, &bytes, (seg_end - seg_start) as usize, resident.item_cluster[item as usize]);
+        let k = survivors.binary_search(&(byte - seg_start)).ok()?;
+        Some(seg.slot_base + k as u32)
     }
 
     /// The Derived draw over the transient buffer.
@@ -918,9 +1229,13 @@ pub fn all_segments(inputs: &VisibleInputs<'_>, survivors_before: &[u32]) -> (Ve
     (segs, base)
 }
 
-/// `crate::layout_all_lines`.
-pub fn layout_all_lines(device: &wgpu::Device, queue: &wgpu::Queue, inputs: &VisibleInputs<'_>) -> Vec<DerivedSlot> {
+/// `crate::layout_all_lines_with_overrides`.
+pub fn layout_all_lines(device: &wgpu::Device, queue: &wgpu::Queue, inputs: &VisibleInputs<'_>, overrides: &[GlyphOverride]) -> crate::HeadlessLayout {
     let resident = Resident::new(device, queue, inputs);
+    for ov in overrides {
+        resident.set_glyph_override(queue, *ov);
+    }
+    let dummy_mask = resident.dummy_mask_args("visible mask args (headless)");
     let before = resident.read_survivors_before(queue);
     let (segs, total) = all_segments(inputs, &before);
     assert!(total <= u32::MAX as u64, "layout_all_lines: {total} slots exceed a u32");
@@ -951,7 +1266,7 @@ pub fn layout_all_lines(device: &wgpu::Device, queue: &wgpu::Queue, inputs: &Vis
         let batch: Vec<SegGpu> = segs[k..end].iter().map(|s| SegGpu { slot_base: (s.slot_base as u64 - batch_base) as u32, ..*s }).collect();
         let segs_buf = storage_init(device, "visible headless segments", &batch, wgpu::BufferUsages::empty());
         let slots_buf = storage_zeroed(device, "visible headless slots", batch_slots * std::mem::size_of::<DerivedSlot>() as u64, wgpu::BufferUsages::COPY_SRC);
-        let bg = resident.layout_bind_group(&segs_buf, &slots_buf);
+        let bg = resident.layout_bind_group(&resident.layout_params, &segs_buf, &slots_buf, &dummy_mask);
         resident.write_layout_params(queue, batch.len() as u32, 0);
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("visible headless layout") });
         {
@@ -967,5 +1282,5 @@ pub fn layout_all_lines(device: &wgpu::Device, queue: &wgpu::Queue, inputs: &Vis
         k = end;
     }
     assert_eq!(out.len() as u64, total, "layout_all_lines: batches do not cover the slot total");
-    out
+    crate::HeadlessLayout { slots: out, group_overrides: resident.group_override_table() }
 }

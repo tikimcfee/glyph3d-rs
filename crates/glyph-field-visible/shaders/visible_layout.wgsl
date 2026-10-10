@@ -10,13 +10,32 @@
 // writes. Descends from `experiments/gpu-direction/jit-text/src/layout.wgsl`
 // (lookup variant A: the trie as shipped).
 //
-// Three entry points share `walk_segment`:
+// Four entry points, three sharing `walk_segment`:
 //   layout_segments       one per segment entry (cull B's output, or the
-//                         headless list): emits slots at seg.slot_base.
+//                         headless list): emits slots at seg.slot_base. In
+//                         MASK mode (params.mode = 1; M3) only the segments
+//                         of `filter_item` that intersect [filter_lo,
+//                         filter_hi) walk, and only the leaders inside the
+//                         range are emitted, appended by atomic counter into
+//                         the (mask) slot buffer — a selection keyed by
+//                         (item, byte range), with no slot to name.
 //   count_seed_segments   one per segment seed, at load: counts the
 //                         survivors of the segment ENDING at the seed, so
 //   prefix_seed_survivors can turn them into each seed's survivors-before —
 //                         the slot base of a seeded segment inside its line.
+//   finalize_mask         one invocation after a mask dispatch: the mask
+//                         draw's indirect arguments from its counter.
+//
+// OVERRIDES (M3). The slot verbs keyed a glyph by its slot; here a slot is
+// transient, so a per-glyph edit is keyed by (item, byte): the item's run of
+// `GlyphOverride`s, sorted by byte, walked alongside the bytes exactly as the
+// spans are (one binary search per segment start, then advance). A colour
+// override beats the span's; an x nudge is an f32 add AFTER the narrowing
+// (`add1`, so it is exactly the IEEE add the host twin does — it is not part
+// of the oracle contract, which has no nudges); a group override puts the
+// group's index in the Derived lane's upper 12 bits (derive.rs
+// `override_lane`), and the Derived draw's binding 10 maps it to the group
+// row.
 //
 // X. HyperLayout narrows the fold's x TWICE: `base_x = f32(rel + origin_x)`
 // (rel the f32 segment advance when the item has a fold unit, else the
@@ -57,8 +76,8 @@ struct ItemGpu {
     bbox_max_x: f32,
     bbox_max_y: f32,
     bbox_max_z: f32,
-    _pad0: u32,
-    _pad1: u32,
+    override_base: u32,
+    override_count: u32,
     _pad2: u32,
     _pad3: u32,
     _pad4: u32,
@@ -67,6 +86,10 @@ struct ItemGpu {
 struct LineEntry { byte_start: u32, item: u32, base_row: u32, glyph_count: u32 };
 struct SegmentSeed { line: u32, byte_offset: u32, col: u32, seg_adv: f32, cells: u32, _pad: u32 };
 struct ByteSpan { start: u32, end: u32, color: u32 };
+// One per-glyph override (tables.rs GlyphOverrideGpu): the leader's item-
+// relative byte, a colour (0 = the span's), an x nudge, a group index (0 =
+// the item's group).
+struct GlyphOverride { byte: u32, color: u32, x_nudge: f32, group_index: u32 };
 // One segment to lay out: `byte_off .. byte_end` are line-relative; `col`,
 // `cells`, `seg_adv` the fold state at `byte_off` (zeros for a line's first
 // segment); `slot_base` where its first slot goes.
@@ -92,12 +115,22 @@ struct TrieMeta {
 };
 
 // What the frame (or the headless run) sets: `count` is the dispatch's
-// element count (segments, or seeds for the seed kernels).
+// element count (segments, or seeds for the seed kernels); `mode` 0 lays
+// every segment out, 1 is the selection mask over `filter_item`'s leaders
+// in [filter_lo, filter_hi), at most `mask_cap` of them.
 struct LayoutParams {
     count: u32,
     debug_tint: u32,
     default_color: u32,
     chunk_shift: u32,
+    mode: u32,
+    filter_item: u32,
+    filter_lo: u32,
+    filter_hi: u32,
+    mask_cap: u32,
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
 };
 
 @group(0) @binding(0) var<uniform> params: LayoutParams;
@@ -115,6 +148,10 @@ struct LayoutParams {
 @group(0) @binding(12) var<storage, read> tables: array<u32>;
 @group(0) @binding(13) var<storage, read> spans: array<ByteSpan>;
 @group(0) @binding(14) var<storage, read> first_span: array<u32>;
+@group(0) @binding(15) var<storage, read> overrides: array<GlyphOverride>;
+// The mask's slot counter at word 0; `finalize_mask` writes the mask draw's
+// DrawIndexedIndirectArgs at words 4..9 (the host copies them out).
+@group(0) @binding(16) var<storage, read_write> mask_args: array<atomic<u32>, 12>;
 
 const PK_GLYPH_MASK: u32 = 0xFFFFu;
 const PK_K_SHIFT: u32 = 16u;
@@ -124,6 +161,9 @@ const MAX_SEQ_KEY: u32 = 16u;
 const ROW_MAX: u32 = 0xFFFFFFu;           // derive.rs ROW_BITS = 24
 const X_PAGE_MAX: u32 = 0xFFu;
 const ITEM_MAX: u32 = 0xFFFFFu;           // derive.rs ITEM_BITS = 20
+const ITEM_BITS: u32 = 20u;
+const OVERRIDE_MAX: u32 = 0xFFFu;         // derive.rs OVERRIDE_MAX (12 bits)
+const MODE_MASK: u32 = 1u;
 const WG: u32 = 64u;
 const MAX_GROUPS_X: u32 = 65535u;
 
@@ -378,9 +418,24 @@ fn walk_segment(seg: Seg, emit: bool) -> u32 {
             si = lo;
         }
     }
+    // Overrides: the first of the item's at or past this segment's first
+    // byte (the run is sorted by byte; one binary search per segment).
+    let ov_end = it.override_base + it.override_count;
+    var oi = ov_end;
+    if (it.override_count > 0u) {
+        let p0 = line.byte_start + seg.byte_off;
+        var lo = it.override_base;
+        var hi = ov_end;
+        while (lo < hi) {
+            let mid = (lo + hi) >> 1u;
+            if (overrides[mid].byte < p0) { lo = mid + 1u; } else { hi = mid; }
+        }
+        oi = lo;
+    }
     var tint = 0u;
     if (params.debug_tint == 1u) { tint = TINT_GLYPH_TIER; }
     if (params.debug_tint == 2u) { tint = select(TINT_CONTINUATION, TINT_FIRST_SEGMENT, seg.byte_off == 0u); }
+    let mask_mode = params.mode == MODE_MASK;
 
     var survivors = 0u;
     while (i < end) {
@@ -408,16 +463,37 @@ fn walk_segment(seg: Seg, emit: bool) -> u32 {
                 let wrap_segment = select(0u, col / wrap, wrap > 0u);
                 let row = select(line.base_row + wrap_segment, line.base_row, wrap_back);
                 let x_page = select(0u, col / page_cols, page_cols > 0u);
-                let x = glyph_x(it, fold, seg_adv, cells, row);
+                var x = glyph_x(it, fold, seg_adv, cells, row);
+                var lane = item_lane;
                 // The leader's colour: the span covering its byte (item-
                 // relative, as the spans are), else the default.
                 let q = line.byte_start + (i - line_start);
                 while (si < span_end && q >= spans[si].end) { si = si + 1u; }
                 var color = params.default_color;
                 if (si < span_end && q >= spans[si].start) { color = spans[si].color; }
+                // Its override, if the item has one at this byte (an
+                // override at a byte that is not a surviving leader is
+                // passed over, never applied to a neighbour).
+                while (oi < ov_end && overrides[oi].byte < q) { oi = oi + 1u; }
+                if (oi < ov_end && overrides[oi].byte == q) {
+                    let ov = overrides[oi];
+                    if (ov.color != 0u) { color = ov.color; }
+                    if (ov.x_nudge != 0.0) { x = add1(ov.x_nudge, x); }
+                    if (ov.group_index != 0u) { lane = item_lane | (min(ov.group_index, OVERRIDE_MAX) << ITEM_BITS); }
+                }
                 if (tint != 0u) { color = tint; }
-                slots[k] = DerivedSlot(x, pack_row(row, x_page), glyph | ((wrap_segment & 0xFFFFu) << 16u), color, item_lane);
-                k = k + 1u;
+                let slot = DerivedSlot(x, pack_row(row, x_page), glyph | ((wrap_segment & 0xFFFFu) << 16u), color, lane);
+                if (mask_mode) {
+                    // Only the leaders in the selection, appended in atomic
+                    // order (a mask is coverage; order is nothing to it).
+                    if (q >= params.filter_lo && q < params.filter_hi) {
+                        let m = atomicAdd(&mask_args[0], 1u);
+                        if (m < params.mask_cap) { slots[m] = slot; }
+                    }
+                } else {
+                    slots[k] = slot;
+                    k = k + 1u;
+                }
             }
             survivors = survivors + 1u;
         }
@@ -445,7 +521,27 @@ fn layout_segments(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (v >= params.count) { return; }
     let seg = segs[v];
     if (seg.byte_end <= seg.byte_off) { return; }   // an empty entry (a line dropped at the slot cap)
+    if (params.mode == MODE_MASK) {
+        // The selection's segments only: the item's, intersecting the range
+        // (item-relative, as the filter is).
+        if (seg.item != params.filter_item) { return; }
+        let s = lines[seg.line].byte_start;
+        if (s + seg.byte_end <= params.filter_lo || s + seg.byte_off >= params.filter_hi) { return; }
+    }
     let _n = walk_segment(seg, true);
+}
+
+// After a mask dispatch: the mask draw's DrawIndexedIndirectArgs from the
+// counter, clamped to the buffer (a selection past `mask_cap` is truncated,
+// never read past the buffer). first_instance 0, as Metal requires.
+@compute @workgroup_size(1)
+fn finalize_mask() {
+    let n = min(atomicLoad(&mask_args[0]), params.mask_cap);
+    atomicStore(&mask_args[4], 6u);
+    atomicStore(&mask_args[5], n);
+    atomicStore(&mask_args[6], 0u);
+    atomicStore(&mask_args[7], 0u);
+    atomicStore(&mask_args[8], 0u);
 }
 
 // At load: the survivors of the segment that ENDS at seed `v` — from the
