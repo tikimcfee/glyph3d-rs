@@ -1,10 +1,24 @@
 # Views over bytes, and a transform tree — 2026-10-10
 
-> **Status: agreed direction, not built.** Worked out with Ivan on 2026-10-10.
-> Open: how the tree is flattened (CPU or GPU), pending the library-layout
-> findings (`out/LIBRARY-LAYOUT-FINDINGS-2026-10-10.md`, a delegate's probe)
-> and the GPU-hierarchy survey (`research/gpu-transform-hierarchies-2026-10.md`).
-> Iterate one step at a time; each step says what it buys and what it costs.
+> **Status: agreed direction, step 1 being built.** Worked out with Ivan on
+> 2026-10-10. Inputs: the library-layout probe
+> (`out/LIBRARY-LAYOUT-FINDINGS-2026-10-10.md`) and the GPU-hierarchy survey
+> (`research/gpu-transform-hierarchies-2026-10.md`). Iterate one step at a
+> time; each step says what it buys and what it costs.
+
+## Decision: our own engine, with bevy as a source of techniques
+
+We considered hosting the renderer in bevy (its 0.20 is on our wgpu 30 and
+winit 0.30) and decided against it: its render internals churn every release,
+its frame processing (tonemapping, HDR, pipelined rendering) would cost us the
+byte-exact goldens and deterministic offscreen renders for a long while, and
+it resolves transform trees on the CPU, uploading every moved descendant. So
+the renderer becomes an engine in its own right, shaped like one: transforms,
+visibility, materials, shaders, extensions. bevy (and Unity, Wicked, the
+GPU-driven literature) is where we read techniques and adapt them, outside
+any engine's core loop: its ECS and `bevy_transform` stay where they serve,
+its scatter-upload WGSL is ours to subsume. Every wall we hit becomes a door
+or a floor, the way it has so far.
 
 ## Why
 
@@ -94,6 +108,42 @@ is one view and group per word. A dense slab is for genuinely per-glyph motion.
 
 ## Groups: a pooled transform tree
 
+**The group row is the wrong abstraction** (2026-10-10). Its 96 B bundle
+things with different owners, update rates and composition rules: the
+transform (layout and drags write it; composes down a tree), tint/alpha/blend
+(verbs write it; alpha multiplies), clip (does not compose across frames; a
+page's property) and background (a decoration). It also has no world
+transform, because nothing has a parent. The probe measured the cost: the
+animation's writer owns the whole row and erased tints and hides (E4). So a
+node is a HANDLE into parallel tables, each with one writer and its own dirty
+tracking — bevy's `Transform` / `GlobalTransform` / `Visibility` /
+`InheritedVisibility` split:
+
+| Table | Contents | Writer |
+|---|---|---|
+| topology | parent, depth-first position | CPU |
+| local | translation + quaternion + uniform scale (32 B; composes closed) | layout, drags, animation |
+| world | the composed transform (32 B) | GPU resolve pass only |
+| appearance | tint, alpha, blend (~8 B) | verbs, styling |
+| bounds | the subtree's box in its own local frame | CPU, refit along the moved node's ancestors |
+
+Per-axis scale becomes a leaf-only, non-inherited factor (as Unity Entities
+does). Clip and background move to the view or page.
+
+**Step 1 design** (from the survey, consistent with the probe's numbers):
+the CPU owns the tree and the allocator (free list, generation per slot, a
+freed row quarantined for the frames in flight); it uploads only changed
+LOCAL rows (a directory drag is one row; batches through a scatter pass
+adapted from bevy's `sparse_buffer_update` WGSL, full upload above ~15 %
+changed); one compute pass derives WORLD rows, one thread per node walking its
+parent chain (depth ~11 for the Linux tree), over the dirty ranges of the
+depth-first order only, skipped when nothing moved. First task: measure that
+pass on the M2 and the Linux box. Transitional form: the pass writes the
+existing group buffer's transform columns, so the draw path and every golden
+stay as they are until the shaders read the new tables.
+
+The rest of this section is the 2026-10-10 sketch it refines:
+
 - **Rows from a pool**, freed and reused, addressed by handles carrying a
   generation so a stale handle can never hit a reused row (slotmap style).
 - **Parent pointer.** A file's group's parent is its directory's group;
@@ -152,7 +202,8 @@ reported). A step that costs frame time says how much and why, and Ivan decides.
 
 ## Open questions
 
-- Flattening: CPU or GPU (above).
+- Flattening: decided (GPU resolve, CPU-owned tree; above). Its cost on the
+  M2 and NVIDIA is not measured yet.
 - Overlapping views at arbitrary depths: draw order and blending. The wall
   rarely overlapped; a scene will. Sort per view, or order-independent
   transparency; research before choosing.
