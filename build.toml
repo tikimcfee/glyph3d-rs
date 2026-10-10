@@ -290,6 +290,15 @@ needs = []
 compare = "rustc warning count vs zero"
 
 [[gate]]
+name = "cargo-check-no-ui"
+scope = "rust"
+kind = "cargo"
+cmd = "check-no-ui"
+needs = []
+compare = "rustc warning count vs zero, renderer built with --no-default-features (no egui overlay), all targets"
+blind_to = "whether the no-UI build RUNS correctly — it is checked, not executed; and every other feature combination"
+
+[[gate]]
 name = "cargo-clippy"
 scope = "rust"
 kind = "cargo"
@@ -872,6 +881,16 @@ find = "        for (out, pairs) in done {"
 with = "        for (out, pairs) in done.into_iter().rev() {"
 expect = "windowed_emission_matches_unwindowed"
 rebuild = "cargo build --release"
+
+[[mutation]]
+name = "egui-use-ungated"
+gate = "cargo-check-no-ui"
+why = "C24 put back: an egui item used outside the egui-ui feature gate compiles in the default build and breaks the no-UI one, which nothing built until 2026-10-09. CONSUMED BY: the no-default-features check"
+file = "native/src/windowed/state.rs"
+op = "replace"
+find = "/// A `[ui]` colour setting (sRGB 0-255) as an egui colour.\n#[cfg(feature = \"egui-ui\")]\nfn ui_rgb("
+with = "/// A `[ui]` colour setting (sRGB 0-255) as an egui colour.\nfn ui_rgb("
+expect = "cargo-check-no-ui errored"
 
 [[mutation]]
 name = "copy-split-body-unaligned"

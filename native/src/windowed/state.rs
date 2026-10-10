@@ -18,6 +18,7 @@ use super::app::RelayoutRequest;
 use super::ui::{EguiUi, PANEL_VERBS};
 
 /// A `[ui]` colour setting (sRGB 0-255) as an egui colour.
+#[cfg(feature = "egui-ui")]
 fn ui_rgb([r, g, b]: [u8; 3]) -> egui::Color32 {
     egui::Color32::from_rgb(r, g, b)
 }
