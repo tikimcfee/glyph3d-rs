@@ -53,9 +53,6 @@ against `build.toml` that day; `cargo glyph gates` is the live list.)
   open plans, proof PNGs, `tooling-ab/baseline/` (the pixel oracle), and
   `out/history/`: dated reports and executed plans, each bannered as history
   (moved there 2026-10-10).
-- `integration/` — vendored egui 0.36.1 source. A **grep reference only**: the egui
-  that actually compiles comes from crates.io via `Cargo.toml`. Patching this copy
-  changes nothing.
 - `research/` — background surveys and GPU architecture studies.
 - `experiments/` — its own workspace, outside every gate: the Zed-integration
   spikes and `gpu-direction/` (the GPU-layout research behind visible mode;
@@ -743,7 +740,6 @@ the serial-fold-versus-scan comparison green, because both forms call
 | `native/fixtures/chunk-cut-paint.txt` | IMMUTABLE | hyper-oracle's paint-tier input (C17): a `return` across every intra-line cut, one pure-ASCII line and one not, so a chunk that coloured only its own share of a line is seen at the chunk's END; the only witness `hyper-cut-tail-own-share` has |
 | `native/fixtures/cubecl-fork/` | IMMUTABLE | named for the retired CubeCL fork check, now read by hyper-oracle (both runs) — the only committed input exercising paginate's m >= 3 / segment >= 3 classes, the cluster classes at wrap/page boundaries, and the empty-item placement class (`clusters.txt` + `empty.txt`). Editing it hollows hyper-oracle's coverage of those classes silently |
 | `out/tooling-ab/baseline/<key>/` | tracked pixel oracle, one set per rasterizer; **golden** in build.toml | changes only on purpose, with a note saying why; the runner refuses to regenerate it. A new host adopts its own set by hand (the gate prints how); it never edits another's |
-| `integration/egui/` | vendored reference | never compiled; the real dependency is from crates.io |
 
 Hand-editing a generated file buys a failure on the next run. Regenerate instead
 (`python3 tools/gen_schema.py`,
@@ -812,12 +808,11 @@ artifact and its template; the word "stage" is still in use for the reference
 port's live numbering. Do not start a new letter; `out/history/STAGE_*.md` stays as
 history.
 
-Some older handoff notes have not caught up and will tell you otherwise —
-`integration/notes/08-view-structure-handoff.md:71` instructs you to file a report
-"(house cadence, per AGENTS.md)", and `06` and `09` say the same for their stages.
-**Those stages already executed and those instructions are superseded by this
-file.** `integration/notes/README.md` still lists 08 and 09 as "PLANNED, not
-executed", which is also no longer true.
+The 2026-09 integration notes (`out/history/integration/notes/`; Rerun, egui
+and ECS research, and the stage H/K/L handoffs) are history: where one tells
+you to file a stage report or calls a stage "PLANNED", that stage executed and
+this file supersedes it. (The vendored egui source they studied was removed on
+2026-10-10; the egui that compiles always came from crates.io.)
 
 Multi-part work that moves the pixel baseline or a dependency still deserves a
 written note in `out/` saying what changed and what you ran; it just is not a
