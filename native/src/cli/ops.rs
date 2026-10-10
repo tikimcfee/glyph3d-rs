@@ -56,7 +56,8 @@ pub fn parse_verb(s: &str) -> Result<Verb, String> {
         "unknown/malformed --verb {s:?} — expected recolor-glyph|recolor-line|\
          nudge-glyph|scale-glyph|move-group|scale-group|tint-group|tint-cycle|\
          hide-group|show-group|toggle-hidden|set-glyph-background|\
-         set-glyph-transform|reset-glyph-group"
+         set-glyph-transform|reset-glyph-group|page-next|page-prev|page-first|\
+         page-last|page-to|form|library-stack|library-sort"
     );
     let f = |i: usize| -> Result<f32, String> {
         t.get(i)
@@ -112,6 +113,9 @@ pub fn parse_verb(s: &str) -> Result<Verb, String> {
             Verb::SetGlyphTransform([f(1)?, f(2)?, f(3)?], [0.0, 0.0, 0.0, 1.0], [sc, sc, sc])
         }
         "reset-glyph-group" => Verb::ResetGlyphGroup,
+        w @ ("page-next" | "page-prev" | "page-first" | "page-last" | "page-to" | "form" | "library-stack" | "library-sort") => {
+            Verb::Library(crate::library::LibraryVerb::parse(w, &t[1..]).map_err(|e| format!("--verb {s:?}: {e}"))?)
+        }
         _ => return Err(usage),
     })
 }

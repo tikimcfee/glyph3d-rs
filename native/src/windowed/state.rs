@@ -1114,7 +1114,8 @@ impl WindowState {
                                 );
                                 let label = match mode {
                                     crate::repo::RepoLayoutMode::Shelf => "layout mode: SHELF (click for carrel)",
-                                    crate::repo::RepoLayoutMode::Carrel => "layout mode: CARREL (click for shelf)",
+                                    crate::repo::RepoLayoutMode::Carrel => "layout mode: CARREL (click for library)",
+                                    crate::repo::RepoLayoutMode::Library => "layout mode: LIBRARY (click for shelf)",
                                 };
                                 if ui.button(label).clicked() {
                                     *pending_relayout = Some(RelayoutRequest {

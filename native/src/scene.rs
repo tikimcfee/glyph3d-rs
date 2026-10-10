@@ -53,6 +53,13 @@ pub trait SceneLike {
     /// Left-click at a physical px position (ungrabbed pointer only).
     fn on_click(&mut self, _ctx: &GpuContext, _x: f32, _y: f32) {}
     fn tick(&mut self, _dt: f32) {}
+    /// Scene-driven animation (2026-10-10: the library's page turns and
+    /// relayouts): one step of `dt` seconds, with the context so it can
+    /// upload what moved. Both drivers call it before every frame —
+    /// windowed with wall-clock dt, offscreen with the fixed 1/60 s clock —
+    /// so an animation is scriptable and deterministic offscreen. Default:
+    /// nothing animates.
+    fn animate(&mut self, _ctx: &GpuContext, _dt: f32) {}
 
     // ── Stage G: scripted picking & manipulation (offscreen + windowed) ────
     /// Viewport in physical px for ray unprojection (offscreen sets this

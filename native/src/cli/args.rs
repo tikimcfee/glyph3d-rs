@@ -227,8 +227,10 @@ pub struct Cli {
     #[arg(long, value_name = "MODE", default_value = "cluster")]
     pub cluster_mode: crate::fold::ClusterMode,
     /// Spatial arrangement mode for the repository files across the canvas:
-    /// `shelf` (default: height-classed shelves across the whole repo) or
-    /// `carrel` (hierarchical directory-based neighborhood carrels).
+    /// `shelf` (default: height-classed shelves across the whole repo),
+    /// `carrel` (hierarchical directory-based neighborhood carrels) or
+    /// `library` (every file a book fitted onto a uniform page, directories
+    /// as pageable volumes; dials in `[library]`, see `native/src/library.rs`).
     #[arg(long, value_name = "MODE", default_value = "shelf")]
     pub layout_mode: crate::repo::RepoLayoutMode,
     /// Syntax color mode on repo load: `flat` (default: fast geometric load with extension-based LOD tint, awaiting external colorization)

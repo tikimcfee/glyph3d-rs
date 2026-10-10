@@ -281,3 +281,51 @@ orbit_rate = 0.15
 fov_y_deg = 60.0
 near = 1.0
 far = 5000.0
+
+[library]
+# --layout-mode library: every file is a BOOK contain-fitted (uniform scale,
+# never skewed) onto one page size, and each directory's books stack as a
+# VOLUME. Ported from the retired JS renderer's library scheme; its 900 x 1200
+# page and gaps are scaled here to a page about one 100-column file page wide
+# (a text row is 1.25 world units).
+page_w = 60.0
+page_h = 80.0
+# A deck's z step between pages (the JS volume's zPitch = gap); for the x shelf
+# and the y pile, the gap added between pages.
+gap = 3.0
+# "z" volume (a pageable deck or splay), "x" shelf (abreast), "y" pile.
+stack = "z"
+# "name", "size" (content area, biggest first) or "ext" (then name).
+sort = "name"
+reverse = false
+# A volume's form at load: "deck" (the rolodex) or "splay" (the m x n grid).
+form = "deck"
+# The fit may enlarge a small file up to this (caps the one-liner giant).
+max_upscale = 4.0
+# Where a book's depth goes: "front" puts the content's reading surface on the
+# page and lets the wrap staircase recede into the book; "center" centres the
+# depth on the page (the JS scheme, whose content was flat), which stands half
+# of a deep file in front of every page.
+depth_align = "front"
+# Easing rate, 1/s: each frame closes 1 - e^(-lerp*dt) of the distance left.
+lerp = 9.0
+# Within this distance (world units, any axis) a page snaps home.
+settle = 0.004
+# Splay: fixed columns (0 = derived from splay_aspect, grid w ~ aspect x h),
+# grid gaps, and how far the head page floats forward (the bookmark).
+splay_cols = 0
+splay_gap_x = 4.0
+splay_gap_y = 5.0
+splay_aspect = 1.5
+splay_lift = 2.0
+# Child directories: packed serpentine below their parent's stack, dir_gap
+# under it, depth_z further back per level, wrapping toward aspect.
+dir_gap = 6.0
+depth_z = 32.0
+aspect = 1.5
+# A page face behind every page (premultiplied RGBA: the file_bg_color look),
+# page_face_gap behind the page plane. It writes depth, so content depth behind
+# the page (the wrap staircase) is hidden from the front, inside the book.
+page_faces = true
+page_face_color = [0.085, 0.085, 0.11, 0.85]
+page_face_gap = 0.05

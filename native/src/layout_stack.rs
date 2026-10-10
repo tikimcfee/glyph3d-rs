@@ -109,6 +109,9 @@ pub struct LayoutController {
     pub session: Option<crate::agent_transcript::AgentSession>,
     pub revision_engine: Option<crate::revision::RevisionEngine>,
     pub pending_carrel_options: Option<crate::spatial_scene::CarrelLayoutOptions>,
+    /// `--layout-mode library`: the books, volumes and their animation
+    /// (`crate::library`). None in every other mode.
+    pub library: Option<crate::library::Library>,
 }
 
 impl std::fmt::Debug for LayoutController {
@@ -132,7 +135,7 @@ impl LayoutController {
     /// Create a controller for a specific layout mode.
     pub fn from_mode(mode: RepoLayoutMode, params: RepoParams) -> Self {
         let base_strategy = match mode {
-            RepoLayoutMode::Shelf => SpatialLayoutStrategy::Shelf,
+            RepoLayoutMode::Shelf | RepoLayoutMode::Library => SpatialLayoutStrategy::Shelf,
             RepoLayoutMode::Carrel => SpatialLayoutStrategy::Carrel,
         };
         let avenue_gap_x = (params.gap_x * 4.0).max(12.0);
@@ -155,6 +158,7 @@ impl LayoutController {
             session: None,
             revision_engine: None,
             pending_carrel_options: None,
+            library: None,
         }
     }
 
@@ -162,7 +166,7 @@ impl LayoutController {
     pub fn set_mode(&mut self, mode: RepoLayoutMode) {
         self.mode = mode;
         self.stack.base_strategy = match mode {
-            RepoLayoutMode::Shelf => SpatialLayoutStrategy::Shelf,
+            RepoLayoutMode::Shelf | RepoLayoutMode::Library => SpatialLayoutStrategy::Shelf,
             RepoLayoutMode::Carrel => SpatialLayoutStrategy::Carrel,
         };
     }
@@ -205,7 +209,7 @@ impl LayoutController {
         }
         match self.mode {
             RepoLayoutMode::Shelf => "base:shelf".to_string(),
-            RepoLayoutMode::Carrel => format!("dir:{dir}"),
+            RepoLayoutMode::Carrel | RepoLayoutMode::Library => format!("dir:{dir}"),
         }
     }
 
