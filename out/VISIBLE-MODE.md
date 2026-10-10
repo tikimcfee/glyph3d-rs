@@ -449,3 +449,63 @@ this box's (`items 2 visible, 3 culled of 5 | lines 309 candidate: 111
 glyph`). Both rasterizers agree on everything numeric here, as they do on
 every tier.
 
+## M4 — visible mode as a golden equivalent (2026-10-10)
+
+**Measured first.** Every golden view rendered with `--field-mode visible`
+appended, against its baseline, on both rasterizers (the pixel counts are
+the gate's own, `drift_stats`, any channel differing; ImageMagick's
+`compare -metric AE` undercounted these twentyfold and was not trusted):
+
+| view | under visible | differing px (vulkan-nvidia / metal-apple) | why |
+|---|---|---|---|
+| demo | byte-equal | 0 / 0 | no glyph field (the demo scene) |
+| text | byte-equal | 0 / 0 | `--render-file` stages host records, no line table: falls back to Instanced (the load warns) |
+| emoji | byte-equal | 0 / 0 | the same fall-back |
+| emoji-cluster | byte-equal | 0 / 0 | the same fall-back |
+| repo-highlight | byte-equal | 0 / 0 | VISIBLE MODE FOR REAL: the sidecar's spans over alpha.rs; the one frame that holds visible mode to pixels |
+| repo-wide | differs | 47,154 / 47,112 | the load-time syntax paint, which visible mode does not apply (by decision, M2): long.md's line numbers, alpha.rs's and deep.py's keywords, wide.txt's source |
+| repo-down | differs | 222,277 / 222,278 | the same |
+| repo-zoom | differs | 43,715 / 43,715 | the same — exactly the punctuation, number and string glyphs of alpha.rs; identifiers match |
+| repo-back-oblique | differs | 256,744 / 256,643 | the same; the z-order picture is identical |
+| repo-cluster | differs | 29,181 / 29,178 | the same; the sequence pass lays out the same glyphs |
+
+**Attributed before deciding.** The decisive check: each of the five
+differing frames is BYTE-IDENTICAL to the stored mode rendered with
+`--color-mode flat` (derived and instanced alike), on both rasterizers. The
+whole difference is the syntax paint, nothing else — no geometry, no LOD
+tier, no draw-order effect (the atomic slot order never moved a pixel on
+any view).
+
+**What landed (option b, with c's candidates).** `golden_equivalents` gains
+`--field-mode visible`; the five syntax views are EXEMPT from it, each with
+its why on the view (`[[golden_view.exempt]]`, build.toml). An exempt frame
+is still rendered and its distance printed as a NOTE with the pixel count
+(`NOTE  repo-wide.png under --field-mode visible: EXEMPT, 47154 px differ —
+…`); an exempt frame that turns out byte-equal is flagged as a possibly
+stale exemption; `cargo glyph validate` refuses an exemption naming no
+declared equivalent or no why; `cargo glyph gates` lists the equivalents
+and every exemption under pixel-ab. Mutation `visible-row-off-by-one`
+(every visible-mode glyph one row down) reddens the gate on
+`repo-highlight.png … under --field-mode visible` and nothing else.
+
+**For Ivan (option c, his call).** Flat twins of the five views would hold
+visible mode to pixels on the same cameras: `--color-mode flat` renders of
+repo-wide / repo-down / repo-zoom / repo-back-oblique / repo-cluster are in
+`out/tooling-ab/sweep/candidates/visible-flat/<view>-flat.png` (untracked),
+each byte-identical to the visible render and to Instanced's flat render,
+so declared as golden views they would be byte-equal under both
+equivalents. Nothing is adopted; declaring a view needs its committed
+baseline (`validate` refuses otherwise). The other road — visible mode
+carrying the heuristic's colours as byte spans — is a feature against the
+standing decision, noted and not taken.
+
+```sh
+# See it: the gate's own lines (the two equivalents, the five NOTEs).
+cargo glyph test render
+# The listing: equivalents and exemptions under pixel-ab.
+cargo glyph gates
+# A view under visible mode, by hand (from native/):
+../target/release/glyph3d-native --load-repo fixtures/g-pick-repo --frames 2 --focus-file alpha.rs --zoom 1 --color-mode syntax --highlight fixtures/highlight-alpha.tsv --field-mode visible --screenshot ../out/tooling-ab/sweep/repo-highlight@visible.png
+cmp ../out/tooling-ab/sweep/repo-highlight@visible.png ../out/tooling-ab/baseline/vulkan-nvidia/repo-highlight.png && echo byte-equal
+```
+

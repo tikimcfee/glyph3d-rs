@@ -66,6 +66,28 @@ pub(crate) struct Artifact {
 pub(crate) struct GoldenView {
     pub(crate) name: String,
     pub(crate) cmd: String,
+    /// Golden equivalents this view is NOT held to (M4, 2026-10-10): the
+    /// frame is still rendered under them and its distance from the baseline
+    /// reported as a NOTE with the pixel count — a known, named difference
+    /// kept in sight, never a quiet drop. Each names the equivalent (its
+    /// exact argument string) and why, blind_to-style; `glyph gates` lists
+    /// them under the pixel gate.
+    #[serde(default)]
+    pub(crate) exempt: Vec<Exemption>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct Exemption {
+    pub(crate) equivalent: String,
+    pub(crate) why: String,
+}
+
+impl GoldenView {
+    /// The reason this view is exempt from `equivalent`, if it is.
+    pub(crate) fn exemption(&self, equivalent: &str) -> Option<&str> {
+        self.exempt.iter().find(|e| e.equivalent == equivalent).map(|e| e.why.as_str())
+    }
 }
 
 #[derive(Debug, Deserialize, PartialEq, Eq, Clone, Copy)]
@@ -279,6 +301,26 @@ pub(crate) fn validate(m: &Manifest) -> Vec<String> {
             }
             if !tags.insert(equivalent_tag(e)) {
                 p.push(format!("golden equivalent '{e}' collides with another's file tag"));
+            }
+        }
+        // An exemption names a declared equivalent, exactly, with a reason;
+        // one that names nothing declared would exempt a view from nothing
+        // and read as coverage.
+        for v in &m.golden_view {
+            let mut seen = BTreeSet::new();
+            for e in &v.exempt {
+                if !m.settings.golden_equivalents.contains(&e.equivalent) {
+                    p.push(format!(
+                        "golden_view '{}' is exempt from '{}', which is not a declared golden equivalent",
+                        v.name, e.equivalent
+                    ));
+                }
+                if e.why.trim().is_empty() {
+                    p.push(format!("golden_view '{}' is exempt from '{}' with no why", v.name, e.equivalent));
+                }
+                if !seen.insert(e.equivalent.as_str()) {
+                    p.push(format!("golden_view '{}' is exempt from '{}' twice", v.name, e.equivalent));
+                }
             }
         }
     }

@@ -264,6 +264,19 @@ fn main() -> ExitCode {
                 if let Some(b) = &g.blind_to {
                     println!("    blind to : {b}");
                 }
+                // The pixel gate's equivalents, and every view exempt from
+                // one: an exemption is a named blind spot, listed here so it
+                // is priced like the rest.
+                if g.kind == manifest::Kind::GoldenVerify {
+                    if !m.settings.golden_equivalents.is_empty() {
+                        println!("    equivalents : {}", m.settings.golden_equivalents.join("; "));
+                    }
+                    for v in &m.golden_view {
+                        for e in &v.exempt {
+                            println!("    exempt   : {} under {} — {}", v.name, e.equivalent, e.why);
+                        }
+                    }
+                }
             }
             println!("\n  test floor: {} (ratchet)", m.settings.test_floor);
             println!("  {} golden views, {} declared mutations", m.golden_view.len(), m.mutation.len());
