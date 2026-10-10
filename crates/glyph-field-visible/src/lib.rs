@@ -27,13 +27,36 @@
 //! [`VisibleStats`]. The slot the draw reads is the Derived one, so the
 //! shader, pipeline state and bind-group map are `glyph_field_derived`'s.
 
+//!
+//! HOW IT IS BUILT (M2, 2026-10-10). `gpu.rs` holds the device side —
+//! [`gpu::Resident`] (the tables and the layout kernels, shared with the
+//! headless [`layout_all_lines`]) and [`gpu::Frame`] (the cull, the
+//! transient buffers, the indirect draws, the stats ring); `tables.rs` the
+//! pure table builders and the records the WGSL reads; the three shaders
+//! under `shaders/` (`visible_cull`, `visible_layout`, `visible_wash`). How
+//! a seeded segment learns its slot count: at load, the layout kernel runs
+//! in COUNT mode once per seed (`count_seed_segments`, then
+//! `prefix_seed_survivors`) and leaves each seed's survivors-before
+//! resident; cull B reserves a whole line's slots with one `atomicAdd` of
+//! its `glyph_count` and gives segment k the base plus that prefix. The
+//! public struct is unchanged; the side table is 4 B per seed.
+
 use std::ops::Range;
 
 use bytemuck::{Pod, Zeroable};
 use glyph_field::{
-    FieldResources, FieldTargets, FramePrepare, GlyphField, GlyphFieldMode, GlyphPlacement, ItemParamsGpu,
+    FieldCore, FieldResources, FieldTargets, FramePrepare, GlyphField, GlyphFieldMode, GlyphPlacement, ItemParamsGpu,
 };
 use glyph_field_derived::DerivedSlot;
+
+pub mod gpu;
+pub mod tables;
+pub mod test_support;
+
+pub use tables::{
+    byte_chunk_shift, frustum_planes, fu_to_world, kernel_x, pack_trie, plan_dispatch, reference_x, FrameGpu, ItemGpu,
+    LayoutParamsGpu, PackedTrie, SegGpu, TrieMetaGpu, WashGpu,
+};
 
 /// One line of one item, as Pass 1 writes it (`layout_hyper::LineEntry`,
 /// the same 16 B). `byte_start` is item-relative.
@@ -81,11 +104,15 @@ pub const WRAP_BACK: u32 = 1;
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct VisibleItem {
     pub params: ItemParamsGpu,
-    /// `ItemParams::origin_x`.
-    pub origin_x: f32,
+    /// `ItemParams::origin_x`, in the fold's own f64: the kernel narrows x
+    /// once, as Pass 2 does, from hi/lo halves of these (an f32 here cost an
+    /// ulp on every page column past the first — found by the sixth oracle
+    /// tier on paged-rows, 2026-10-10).
+    pub origin_x: f64,
     /// The row-paging stride: `max_row_extent + page_gap_x` when
-    /// `has_page && page_rows > 0`, else 0 (`layout_hyper::page::Pager`).
-    pub stride_x: f32,
+    /// `has_page && page_rows > 0`, else 0 (`layout_hyper::page::Pager`), f64
+    /// for the same reason.
+    pub stride_x: f64,
     pub wrap_width: i32,
     /// [`WRAP_DOWN`] or [`WRAP_BACK`].
     pub wrap_mode: u32,
@@ -189,38 +216,98 @@ pub struct VisibleStats {
 
 /// The Visible field.
 pub struct VisibleField {
-    _todo: (),
+    resident: gpu::Resident,
+    frame: gpu::Frame,
+    /// The Derived draw over the transient slot buffer (one chunk).
+    core: FieldCore<DerivedSlot>,
+    /// Bound as the Derived shader's group-override table (binding 10);
+    /// all zero — a transient slot never carries an override.
+    _group_overrides: wgpu::Buffer,
+    /// Live slots in the one chunk, as the trait reports them: none that a
+    /// caller may address (they are rebuilt every frame).
+    chunk_counts: [u32; 1],
 }
 
 impl VisibleField {
     /// Build the field: upload the resident tables, create the cull and
     /// layout pipelines and the transient buffers, and the Derived draw over
     /// the transient slot buffer.
+    ///
+    /// The Derived item table (binding 8) is built from `inputs.items[i].params`;
+    /// `resources.item_params` is not read. `limits.max_slots × 20 B` must
+    /// fit the device's storage binding limit (asserted), and
+    /// `max_segments` is rounded up to a whole workgroup.
     pub fn new(
-        _device: &wgpu::Device,
-        _queue: &wgpu::Queue,
-        _inputs: &VisibleInputs<'_>,
-        _resources: &FieldResources<'_>,
-        _targets: FieldTargets,
-        _limits: VisibleLimits,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        inputs: &VisibleInputs<'_>,
+        resources: &FieldResources<'_>,
+        targets: FieldTargets,
+        limits: VisibleLimits,
     ) -> Self {
-        todo!("M2: VisibleField::new")
+        let resident = gpu::Resident::new(device, queue, inputs);
+        let frame = gpu::Frame::new(device, queue, &resident, resources, targets, limits);
+        let group_overrides = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("visible group overrides (all zero)"),
+            size: (glyph_field_derived::OVERRIDE_MAX as u64 + 1) * 4,
+            usage: wgpu::BufferUsages::STORAGE,
+            mapped_at_creation: false,
+        });
+        let entries = frame.derived_shape_entries(&resident, resources, &group_overrides);
+        let shape = gpu::derived_shape(&entries);
+        let core = FieldCore::new(device, frame.slot_storage(), resources, targets, &shape);
+        Self { resident, frame, core, _group_overrides: group_overrides, chunk_counts: [0] }
     }
 
-    /// Replace one item's colour spans (an edit arriving as byte ranges).
-    pub fn set_item_spans(&self, _queue: &wgpu::Queue, _item: u32, _spans: &[ByteSpanGpu]) {
-        todo!("M2: VisibleField::set_item_spans")
+    /// Replace one item's colour spans (an edit arriving as byte ranges):
+    /// in place when they fit the item's run (its spans at load plus an
+    /// eighth and 16), else appended and remapped; refused with a warning
+    /// when the table's tail is full too.
+    pub fn set_item_spans(&self, queue: &wgpu::Queue, item: u32, spans: &[ByteSpanGpu]) {
+        self.resident.set_item_spans(queue, item, spans);
     }
 
-    /// The last frame's counters (see [`VisibleStats`]).
+    /// Hide an item from every tier (the renderer's hidden flag); it is
+    /// neither laid out nor counted visible.
+    pub fn set_item_hidden(&self, queue: &wgpu::Queue, item: u32, hidden: bool) {
+        self.resident.set_item_hidden(queue, item, hidden);
+    }
+
+    /// Replace the world box the item cull tests (after a group edit moves
+    /// the item; the line cull reads the live group table and needs no
+    /// update).
+    pub fn set_item_bbox(&self, queue: &wgpu::Queue, item: u32, bbox_min: [f32; 3], bbox_max: [f32; 3]) {
+        self.resident.set_item_bbox(queue, item, bbox_min, bbox_max);
+    }
+
+    /// The last COMPLETED frame's counters (see [`VisibleStats`]); they lag
+    /// the frame being prepared by two.
     pub fn stats(&self) -> VisibleStats {
-        todo!("M2: VisibleField::stats")
+        self.frame.stats()
     }
 
     /// Record the wash tier's quads (one per WASH-tier line) into a pass
     /// whose pipeline the field sets itself; drawn after the glyph pass.
-    pub fn record_wash_draw(&self, _pass: &mut wgpu::RenderPass<'_>) {
-        todo!("M2: VisibleField::record_wash_draw")
+    pub fn record_wash_draw(&self, pass: &mut wgpu::RenderPass<'_>) {
+        self.frame.record_wash_draw(pass);
+    }
+
+    /// The counters of the last prepared frame, read back BLOCKING — a test
+    /// and diagnostic instrument, never the frame path. Indexed by
+    /// [`tables::counter`].
+    pub fn read_counters(&self, queue: &wgpu::Queue) -> [u32; tables::COUNTER_WORDS] {
+        self.frame.read_counters(&self.resident, queue)
+    }
+
+    /// The first `count` transient slots of the last prepared frame, read
+    /// back BLOCKING (tests).
+    pub fn read_slots(&self, queue: &wgpu::Queue, count: u32) -> Vec<DerivedSlot> {
+        self.frame.read_slots(&self.resident, queue, count)
+    }
+
+    /// The transient capacity in force (caps rounded as `new` applies them).
+    pub fn limits(&self) -> VisibleLimits {
+        self.frame.limits
     }
 }
 
@@ -229,45 +316,55 @@ impl VisibleField {
 /// in the order HyperLayout's Pass 2 emits them (item, then line, then
 /// column). The witness the sixth hyper-oracle tier diffs against the device
 /// Pass 2's `DerivedSlot`s.
-pub fn layout_all_lines(_device: &wgpu::Device, _queue: &wgpu::Queue, _inputs: &VisibleInputs<'_>) -> Vec<DerivedSlot> {
-    todo!("M2: layout_all_lines")
+///
+/// Blocking; batches the slots 4 M at a time, so a 90 M-slot tree needs no
+/// 1.8 GB readback buffer. Slot bases come from the line table's
+/// `glyph_count` and the seeds' survivors-before, so a kernel that emitted a
+/// different count for some line would shift that line's slots — which the
+/// diff would show as a run of mismatches from that line on.
+pub fn layout_all_lines(device: &wgpu::Device, queue: &wgpu::Queue, inputs: &VisibleInputs<'_>) -> Vec<DerivedSlot> {
+    gpu::layout_all_lines(device, queue, inputs)
 }
 
 impl GlyphField for VisibleField {
     fn mode(&self) -> GlyphFieldMode {
         GlyphFieldMode::Visible
     }
+    /// The line table's survivors summed (what a full layout would emit;
+    /// the scene's instance count). No slot is addressable across frames —
+    /// the transient buffer is rebuilt every `prepare`.
     fn glyph_count(&self) -> u32 {
-        todo!()
+        self.resident.glyph_total.min(u32::MAX as u64) as u32
     }
     fn chunk_capacity(&self) -> u32 {
-        todo!()
+        self.frame.limits.max_slots
     }
     fn slot_bytes(&self) -> u32 {
         glyph_field_derived::slot::SLOT_BYTES as u32
     }
     fn chunk_glyph_counts(&self) -> &[u32] {
-        todo!()
+        &self.chunk_counts
     }
     fn glyph_pipeline(&self) -> &wgpu::RenderPipeline {
-        todo!()
+        self.core.glyph_pipeline()
     }
     fn create_mask_pipeline(
         &self,
-        _device: &wgpu::Device,
-        _mask_format: wgpu::TextureFormat,
-        _sample_count: u32,
+        device: &wgpu::Device,
+        mask_format: wgpu::TextureFormat,
+        sample_count: u32,
     ) -> wgpu::RenderPipeline {
-        todo!()
+        self.core.create_mask_pipeline(device, mask_format, sample_count)
     }
-    fn prepare(&self, _queue: &wgpu::Queue, _encoder: &mut wgpu::CommandEncoder, _frame: &FramePrepare) {
-        todo!("M2: cull + layout")
+    fn prepare(&self, queue: &wgpu::Queue, encoder: &mut wgpu::CommandEncoder, frame: &FramePrepare) {
+        self.frame.prepare(&self.resident, queue, encoder, frame);
     }
     fn draws_itself(&self) -> bool {
         true
     }
-    fn record_draws(&self, _pass: &mut wgpu::RenderPass<'_>, _draws: &[(u32, Range<u32>)]) {
-        todo!("M2: the indirect draw")
+    /// The ranges are ignored: one indirect draw of what `prepare` emitted.
+    fn record_draws(&self, pass: &mut wgpu::RenderPass<'_>, _draws: &[(u32, Range<u32>)]) {
+        self.frame.record_glyph_draw(&self.core, pass);
     }
     fn write_color(&self, _queue: &wgpu::Queue, _slot: u32, _rgba: u32) {}
     fn write_position(&self, _queue: &wgpu::Queue, _slot: u32, _position: [f32; 3]) {}

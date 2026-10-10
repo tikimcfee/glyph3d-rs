@@ -137,6 +137,18 @@ impl<S: SlotRecord> FieldCore<S> {
         }
     }
 
+    /// One GPU-driven draw of `chunk`: the quad index buffer and the chunk's
+    /// bind group as [`Self::record_draws`] sets them, then
+    /// `draw_indexed_indirect` from `DrawIndexedIndirectArgs` at
+    /// `indirect_offset` of `indirect` (a mode that culls on the GPU writes
+    /// them there; `first_instance` must be 0 — Metal silently drops a
+    /// draw whose is not). Added for the Visible field (2026-10-10).
+    pub fn record_draw_indirect(&self, pass: &mut wgpu::RenderPass<'_>, chunk: u32, indirect: &wgpu::Buffer, indirect_offset: u64) {
+        pass.set_index_buffer(self.quad_index_buffer.slice(..), wgpu::IndexFormat::Uint16);
+        pass.set_bind_group(0, &self.bind_groups[chunk as usize], &[]);
+        pass.draw_indexed_indirect(indirect, indirect_offset);
+    }
+
     /// Copy `out.len()` words starting at `slot` back from the device
     /// (blocking; a verification readback, not a frame path).
     pub fn read_slot_words(&self, device: &wgpu::Device, queue: &wgpu::Queue, slot: u32, out: &mut [u32]) {
