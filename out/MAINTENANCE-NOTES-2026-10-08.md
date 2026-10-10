@@ -54,9 +54,9 @@ machines and clones, **M** machine-specific values, **R** runner.
 | C24 | `glyph3d-native` does not build with `default-features = false`: `egui` is used ungated in `windowed/state.rs` (found by the GPU research agent, 2026-10-09) | closed | egui uses gated (ui_rgb; poll_live reads the pose only with egui); new gate cargo-check-no-ui (cargo check --no-default-features --all-targets, own target dir) + mutation egui-use-ungated |
 | C25 | gpu.rs requests MAPPABLE_PRIMARY_BUFFERS on every adapter that offers it (wgpu warns "massive performance footgun" on discrete GPUs, every load on the Linux box); only Metal's direct upload uses it. Pre-existing | open | request it only where used (Metal + the direct upload), then A/B a discrete load; expected neutral (no mappable storage buffers are created on discrete) |
 | C26 | The debug panel's LOD controls blur two ideas Ivan wants separate (2026-10-10): TEXT DETAIL (greek_onset_px, default 10: below it the shader fuzzes glyph windings for fewer ALU ops; hidden behind the greeking checkbox) and SHOW GLYPHS (lod_min_px, default 1: below it a file segment is its backdrop rectangle; in visible mode also the glyph-vs-wash boundary, with lod_backdrop_px 0.25 as the file-rectangle tier). All three are labelled "px/em" (= on-screen pixels per text row) | closed (5f196ae) | two always-visible panel sliders, "Text detail" (greek_onset_px) and "Show glyphs" (lod_min_px), visible mode's "File rectangle" handle under the latter; order text detail >= show glyphs >= file rectangle kept by clamping; [lod] show_glyphs_px / text_detail_px and --show-glyphs-px / --text-detail-px, old names as aliases; no default or pixel moved. The DRAG (clamp wiring) is unverified by hand: Ivan's by-eye check |
-| C27 | The launcher TUI lives in `glyph` and starts the renderer through translated command-line flags: two parsers of launch_config.toml with different rules, the file applied twice, cargo shell-outs to run itself, option spellings in three places | DONE fe52766 (2026-10-10; awaiting Ivan's hands-on check) | move the launcher into the renderer over its own CLI/config model; launch by spawning itself with the typed config file. Plan + steps: out/history/PLAN-LAUNCHER-INTO-RENDERER-2026-10-10.md |
-| C28 | Visible mode: at the greeking-level LOD (maybe another tier), extremely long lines that should wrap BACK in depth instead run straight off the right of the view, "as if that mode isn't applying the same wrap logic" (Ivan, testing 2026-10-10) | FIXED 839a5cd (delegate; battery 15/15, wash-width-doubled + wash-depth-flat proved; awaiting Ivan's eye) | EVIDENCE (Ivan, 2026-10-10): the overhang appears ONLY in the purple layer of the debug tint — purple is `TINT_WASH_FULL` (cull-state tint: a line under the glyph threshold drawn as a full wash; in the LOD tint washes are blue). So the runaway lines are washes. Reading of the code (unverified by a run): `cull_lines` passes the CULL bound as the wash's drawn extent — `wash_w = local.hi.x - local.lo.x`, where `line_local_box` sizes a wrapped line at `min(len, 2 * fold_unit)` cells (bytes, doubled to bound double-advance cells — conservative on purpose for culling) — and `visible_wash.wgsl` draws one flat quad at segment 0's row lane/z. Under `--wrap-mode back` (the default) the glyphs recede one fold unit wide per segment in z; the wash instead stays at the front depth, up to twice the column wide: the overhang. WrapDown stacks `rows` and is likely only too wide. Fix direction: draw the wash at the line's true extent (at most a fold unit per segment) and one quad per back-wrap segment (or a quad spanning segment 0..n-1 in z), keeping the 2x bound for the cull only. The glyph tier is held to Pass 2 by hyper-oracle, the wash tier by nothing |
-| C29 | Visible mode: a file dragged to overlap another's receding column (long.md sliced into wide.txt's back-wrap stretch) renders fragments of one file at the other's positions — a floating `long.md` line mid-air, a truncated band — while the HUD reads `items 1/5 visible` with two files on screen. Screenshot: out/visible-overlap-2026-10-10.png (taken on a pre-C26 build) | NOT REPRODUCED; fenced d88b7e3 (12-pose move-group sweep = derived, grab self-test keeps 5/5 items; witness a_moved_item_is_drawn_where_it_went + visible-moved-item-box-stale). Ivan to retry his drag by hand | hypotheses, unverified: (a) after a move, the per-ITEM cull uses the new bbox (M3's set_item_bbox) but the per-LINE cull and/or the layout kernel still place lines from the item's ORIGINAL origin/params while the draw applies the group transform — cull and draw disagree about where the file is; (b) the cull compacts visible items and something indexes by compacted position instead of the item index. Repro: g-pick-repo, --field-mode visible, grab long.md (G) and drop it into wide.txt's column; compare --field-mode derived at the same pose ("copy pose") |
+| C27 | The launcher TUI lives in `glyph` and starts the renderer through translated command-line flags: two parsers of launch_config.toml with different rules, the file applied twice, cargo shell-outs to run itself, option spellings in three places | DONE fe52766, 890dfc2 (Ivan: "working great") | move the launcher into the renderer over its own CLI/config model; launch by spawning itself with the typed config file. Plan + steps: out/history/PLAN-LAUNCHER-INTO-RENDERER-2026-10-10.md |
+| C28 | Visible mode: at the greeking-level LOD (maybe another tier), extremely long lines that should wrap BACK in depth instead run straight off the right of the view, "as if that mode isn't applying the same wrap logic" (Ivan, testing 2026-10-10) | FIXED 839a5cd (battery 15/15, wash-width-doubled + wash-depth-flat proved; Ivan confirmed by eye) | EVIDENCE (Ivan, 2026-10-10): the overhang appears ONLY in the purple layer of the debug tint — purple is `TINT_WASH_FULL` (cull-state tint: a line under the glyph threshold drawn as a full wash; in the LOD tint washes are blue). So the runaway lines are washes. Reading of the code (unverified by a run): `cull_lines` passes the CULL bound as the wash's drawn extent — `wash_w = local.hi.x - local.lo.x`, where `line_local_box` sizes a wrapped line at `min(len, 2 * fold_unit)` cells (bytes, doubled to bound double-advance cells — conservative on purpose for culling) — and `visible_wash.wgsl` draws one flat quad at segment 0's row lane/z. Under `--wrap-mode back` (the default) the glyphs recede one fold unit wide per segment in z; the wash instead stays at the front depth, up to twice the column wide: the overhang. WrapDown stacks `rows` and is likely only too wide. Fix direction: draw the wash at the line's true extent (at most a fold unit per segment) and one quad per back-wrap segment (or a quad spanning segment 0..n-1 in z), keeping the 2x bound for the cull only. The glyph tier is held to Pass 2 by hyper-oracle, the wash tier by nothing |
+| C29 | Visible mode: a file dragged to overlap another's receding column (long.md sliced into wide.txt's back-wrap stretch) renders fragments of one file at the other's positions — a floating `long.md` line mid-air, a truncated band — while the HUD reads `items 1/5 visible` with two files on screen. Screenshot: out/visible-overlap-2026-10-10.png (taken on a pre-C26 build) | NOT REPRODUCED; fenced d88b7e3 (12-pose move-group sweep = derived, grab self-test keeps 5/5 items; witness a_moved_item_is_drawn_where_it_went + visible-moved-item-box-stale). Ivan retried by hand: gone | hypotheses, unverified: (a) after a move, the per-ITEM cull uses the new bbox (M3's set_item_bbox) but the per-LINE cull and/or the layout kernel still place lines from the item's ORIGINAL origin/params while the draw applies the group transform — cull and draw disagree about where the file is; (b) the cull compacts visible items and something indexes by compacted position instead of the item index. Repro: g-pick-repo, --field-mode visible, grab long.md (G) and drop it into wide.txt's column; compare --field-mode derived at the same pose ("copy pose") |
 | C30 | Z-fighting between tightly packed glyphs in very long files (Ivan, testing visible mode after the C28/C29 fixes, 2026-10-10: "may or may not have an easy fix, but it's a note") | B FIXED d303565 (visible-only flicker: atomic line/slot order + depth-written AA fringes; now prefix scans, draw order = arena order, frames repeat and equal derived; cull +7-23 us; witness native/tests/visible_repeat.rs + visible-slot-order-atomic; battery 15/15, 327, on vulkan-nvidia AND metal-apple). CLOSED: Ivan confirmed the fix by eye (2026-10-10). A (stacked-layer shimmer under motion) was not a separate report: Ivan's word, cross-talk with moire, i.e. sampling aliasing in the band between the LOD prefilters (greeking below text_detail_px, washes/backdrops below show_glyphs_px), worst over stacked back-wrap layers. Not a defect; tunable by those thresholds or by washing deep layers sooner if ever wanted (A1-A3 in the groundwork remain on file). Also open: the selection mask still appends by atomic | unexamined. Candidates to check first: the back-wrap staircase's z step (`z_wrap_spacing` x em) shrinking against depth precision far from the camera; coplanar quads of one row overlapping where advances touch (the depth-write cost already measured in `repo-down`'s far band, root AGENTS.md); whether derived/instanced show the same at the same pose (a visible-only fight would point at the wash box or the layout kernel's z). Repro wanted: a --cam-pose from "copy pose" |
 | C16 | Discrete-GPU upload: an ODD total survivor count costs ~10-20 ms of backend on this host (derived, 94 MB tree: 91,417,858 slots 415-425 ms, 91,417,859 slots 430-437 ms; same at bf9a757) [measured 2026-10-09]. Cause: a buffer copy whose size is off 16 B runs whole at ~half speed (RTX 5090/Vulkan), and the staging path copies the 20 B-slot stream twice (wgpu-core's staging at `unmap`, then ours); odd counts paid ~+10 ms per copy, counts = 2 mod 4 ~+3 ms. Instanced (32 B) never paid | closed | staging padded to 16 B, copies split into a 16-aligned body + tail (`glyph_field::copy`); odd = even after (derived medians 414 vs 415 ms, A/A spread 4 ms), VRAM bytes and 18 golden renders identical. e59e4a6 (fix), 3d2a50f (mutation rebuild), b90da50 (notes). M2 A/B vs a76aeaf: every config inside the A/A floor (derived syntax 174/174 ms median; the unified path makes no copy). Left: chunked Derived buffers start at 8 mod 16 (~+1 ms, measured with a forced split) |
 | C11 | Mutation `find` strings also match their own entry in build.toml; correct only because the target comes first | closed | prover refuses a find that matches more than once; 3 mutations anchored (2 matched their own build.toml entry, 1 picked the first of 7 #[test]s); prove-ambiguous-find-accepted |
@@ -122,6 +122,11 @@ Pushed to origin/main through d3cf141 on 2026-10-09 (Ivan's call); later rows ar
 | 0c56d03 | visible mode M2 merged: `--field-mode visible` end to end, hyper-oracle sixth tier (kernel == Pass 2, both GPUs), lane-limit fallback; pixel-ab 20/20 on both machines |
 | 041d38d..15f7c79 | visible mode M3: overrides/spans/selection/verbs/picking by (item, byte), oracle span half, pixel witness; 314 tests |
 | 5f196ae | C26 LOD panel split (Text detail / Show glyphs), config and CLI renames with aliases; 319 tests |
+| fe52766, 890dfc2 | C27: the launcher moves into the renderer (one typed config model and parser; `cargo glyph run` builds first); the launcher saves changes to launch_config.toml and remembers repos |
+| 839a5cd, d88b7e3 | C28: the visible wash is a box over the line's true extent and depth (Pass 1 line table gains cols + width_cells); C29 not reproduced on the M3 build, fenced (moved-item witness) |
+| dba6500 | M4: `--field-mode visible` is a golden equivalent; five syntax views exempt by name (distance still printed); `visible-row-off-by-one` |
+| bf7854c, 6f17e3d, d303565 | C30: visible draw order deterministic (prefix scans, not atomics; cull +7-23 us); check runs never read a personal launch_config.toml; 327 tests |
+| a8dc203..a556cd7 | docs pass: agent-facing docs and README true today, history to out/history/, integration/ retired (vendored egui removed), PROVENANCE regenerated |
 
 Main's build fix (872621d, the other agent's) was fast-forwarded in first.
 
@@ -133,130 +138,54 @@ ln -s <path-to-zed-checkout> experiments/zed
 export GLYPH_FLAGSHIP_REPO=<path-to-glyph3d-js-checkout>
 ```
 
-## Next session: handoff (2026-10-10, tip of this branch = origin/main)
+## Current state and open items (2026-10-10)
 
-**State.** Battery ALL GATES GREEN, 15 of 15 (300 tests, floor 300); pixel-ab
-20/20 (10 views, plain and under `--field-mode derived`) on BOTH vulkan-nvidia
-and metal-apple; unscoped `glyph prove` reddens all mutations (~12 min since
-C21). Everything is pushed: this branch and `origin/main` are the same commit.
-(Ivan's own `main` checkout may lag `origin/main`: `git merge --ff-only
-origin/main` there.)
+**State.** origin/main is this branch. Battery ALL GATES GREEN, 15 of 15
+(327 tests at floor 327) on vulkan-nvidia and metal-apple; every golden
+byte-equal plain and under both equivalents (`--field-mode derived`;
+`--field-mode visible` with five syntax views exempt). Visible mode is the
+experiment that worked: Ivan loads near-whole repos on the M2 at a locked
+frame rate; C28-C30 found by his testing were fixed or fenced, and he
+confirmed C29's and C30's fixes by eye. (`out/VISIBLE-MODE.md` is its log.)
 
-**Landed 2026-10-09/10** (details in the landed table above): C1-C3 refactors;
-C2 splits of the runner and the TUI; CubeCL retired (report:
-`out/GPU-DIRECTION-2026-10-09.md`); discrete staging 482 -> 121 ms derived
-backend on the Linux box (host staging, parallel copy, C22 windowed
-direct-to-staging emission); C19 Derived edit bug, sidecar sort, golden
-equivalents (Derived pass), repo-highlight frame; C21 prove 2x faster; C24
-no-UI build + gate; and the VISIBLE field mode (M1 line table, M2
-`--field-mode visible` end to end with a sixth hyper-oracle tier holding the
-GPU kernel to Pass 2 on both GPUs; `out/VISIBLE-MODE.md` is its "how to see
-it" log).
+**Ivan's decisions pending:**
+- Adopt the five flat candidate goldens (`out/tooling-ab/sweep/candidates/visible-flat/`,
+  untracked; byte-identical between visible and instanced-flat on both GPUs)
+  so visible mode is held to pixels on every repo camera — or leave coverage
+  at repo-highlight plus the printed distances.
+- M5: visible as the default field mode.
+- Retiring the stored modes. Dependency order found by the 2026-10-10 code
+  survey: agent sessions are host-staged at absolute card positions (only
+  instanced stores those), so instanced stays until each card becomes an item
+  (a byte range with its own group transform: Ivan's idea, 2026-10-10); derived
+  stays as a crate regardless (visible draws through its shader, and the
+  visible oracle and pixel witnesses compare against it); the syntax heuristic
+  goes with the stored modes, which is where the flat goldens come in.
 
-**In flight: the visible-mode delegate** (a Fable agent in its own worktree,
-branch `worktree-agent-a164e953c6cdd7fc6`). It implements milestone by
-milestone and reports after each; I review and merge (it never pushes). Next:
-**M3** — re-key the slot-addressed consumers by (item, byte): GlyphField verbs
-and `read_slot_words`, overrides, selection mask, picking, culling. Then M4
-(`golden_equivalents` gains `--field-mode visible`). M5 (default flip) is
-Ivan's call. Rules it works under: production code allowed on its branch;
-full battery green per commit; every milestone ships something Ivan can SEE
-in the open app (live mode switch, F8 HUD, `--debug-tint lod|cull`, poses via
-"copy pose"), with the commands in the commit message. The M2 machine is
-available to it (helpers in `target/scratch/helper-tools/rx/`, untracked).
-If a session ends with it mid-milestone: check its worktree for uncommitted
-files (by mtime; the worktree guard blocks `git -C`), then resume it with
-SendMessage and a state summary.
-**2026-10-10:** that delegate's context ran out mid-M3 (it handed back at
-`041d38d` with 28 uncommitted files: crate and oracle work verified, the
-renderer group unbuilt). A FRESH Fable agent was launched to finish M3 in the
-same worktree from that handback; it reports commits, battery, mutations and
-the M2 verdict. Ivan's LOD answer is relayed to it (px/em thresholds
-confirmed); C26 waits until it is idle.
-**M3 DONE and merged (2026-10-10):** the delegate's state was moved into THIS
-worktree (merge of its scaffold 041d38d + its 28 uncommitted files copied
-byte-exact), because the finishing agent inherited this session's isolation
-and could not commit elsewhere. It committed f408b75 (crate), b103517
-(oracle span half), e9a64f8 (renderer: selection, verbs, picking, dump by
-(item, byte)), 15f7c79 (docs). Verified: battery 15/15, 314 tests, on both
-machines; `--frozen` here on the committed tree; mutations
-visible-span-first-byte-uncoloured, visible-verb-keyed-off-by-one-byte and
-`--changed` (7/7) redden; the visible_verbs pixel witness matches Derived at
-0 px on both GPUs. Declared crate gaps (for M4 or a fix-up): a selection past
-mask_capacity is truncated silently; prepare_mask unguarded against a second
-call per frame; verb group rows never freed. The delegate's old worktree
-(.claude/worktrees/agent-a164e953c6cdd7fc6) is a STALE copy of committed work:
-safe to discard (Ivan's call; the worktree guard keeps sessions out of it).
-NEXT for visible mode: C26 (handed to the finishing agent), then M4 (visible as
-a golden equivalent: its recolour frame is already byte-identical to Derived's
-on both rasterizers).
-**Ready to send after compaction — Ivan's testing report (2026-10-10):** visible
-mode works "fantastically" on large and small repos, Linux "better than I'd
-imagined"; two oddities found, C28 (long lines run off the right at the
-greeking-level LOD instead of wrapping back) and C29 (an overlapped, moved file
-renders fragments at the other file's positions; screenshot in out/). Hand
-both to the agent that finished M3 and C26 (it knows this code; resume it with
-SendMessage if it is still reachable, else a fresh Fable agent with this
-section and the two rows as its brief). Ask for: a reproduction of each
-(offscreen with --cam-pose where possible), the root cause stated before any
-fix, a witness that would have caught it (C28: the wash tier is held to
-nothing — a wash-vs-glyph extent check; C29: a moved-item case in the visible
-oracle or the visible_verbs witness), the fix, the battery, and the M2 run.
-Ivan may add more oddities before it is sent: append them here.
-- C28 update (Ivan, 2026-10-10): the overhang is only in the purple (full
-  wash) debug-tint layer — washes, as hypothesised; the row carries the code
-  reading (the wash draws the cull's 2x-fold-unit bound, flat at segment 0's
-  depth). Confirm with a run, then fix.
-**Sent and landed (2026-10-10):** the delegate took C28/C29 and committed
-839a5cd (C28 fixed: Pass 1's line table gains `cols` + `width_cells`, the wash
-is a box over the true extent and depth) and d88b7e3 (C29 not reproduced on
-this tree; fenced). Meanwhile C27 landed here (fe52766): the launcher is
-`native/src/launcher/`, `cargo glyph run` with no arguments (or `tui`) opens
-it, launch_config.toml has one strict typed parser, and `cargo glyph run`
-builds first. All three pushed (origin/main d88b7e3) on the delegate's
-battery: 15/15, 320 tests, floor 320. Open: Ivan's hands-on checks of all
-three; the delegate's `--frozen` + M2 run and its docs(out) verdict commit.
-Plan facts corrected while implementing C27: `cargo glyph run` did NOT build
-first (it ran whatever binary existed); the renderer's loader was strict on
-keys only (bad values warned).
-**Ivan's checks (2026-10-10):** C29 no longer reproduces, file cards still
-occlude correctly, the washes are right, and the new launcher "is working
-great". Asked for and landed: the launcher saves its changes into the user's
-launch_config.toml and remembers launched repos (890dfc2). New: C30
-(z-fighting in very long files). M4 is with the delegate (golden
-equivalents under --field-mode visible; candidates only, no adoption without
-Ivan).
-**C30 (2026-10-10):** groundwork by a fresh Opus agent ruled out depth
-precision (one back-wrap step >= 570 ulps wherever glyphs draw; reverse-Z
-Depth32Float) and found two effects: A, stacked back-wrap layers
-interleaving under motion (all modes, open for Ivan's pick), and B,
-visible-only frame nondeterminism, which Ivan confirmed is what he saw. B
-fixed in d303565 (plus bf7854c timing, 6f17e3d: check runs never read a
-personal launch_config.toml, a hole the launcher's save exposed). M2 green.
-Next: Ivan's still-camera check; his pick for A; the five visible-flat
-candidate goldens.
+**Next: code cleanup** (2026-10-10 survey; cheapest risk first): delete
+`--engine-render`; fold `batch`/`naive` into `direct` and drop the
+always-zero CubeCL-era phase lines (keep the `phases:` line bench_hyper.py
+parses); sweep 29 unreferenced `pub` fns; move the six unrun self-test
+hooks and the egui panels out of `WindowState::render` (~1,370 lines);
+fix Derived's silent `scale-glyph`/nudge-y/z no-op (it replies as if
+applied). Ivan's call: `--demo` (a golden view), `--no-cull`, the
+Zed-experiment live path (feature-gate vs delete), the walker reporting its
+extension and directory-name skips.
 
-**Queued:**
-- **C26** (LOD panel: separate "Text detail" from "Show glyphs") — hand to
-  the delegate when it reports M3 and is idle; Ivan wants it on the hard
-  parts first.
-- **C27 — the launcher moves into the renderer.** Decided with Ivan;
-  plan, facts to validate and steps in
-  `out/history/PLAN-LAUNCHER-INTO-RENDERER-2026-10-10.md`. For a fresh session:
-  validate the plan's facts against the code, then implement in its steps.
-  Touches the TUI, `launch_config.rs` and `native/src/cli/`, none of the
-  delegate's M3 files.
-
-**On hold by decision:** retiring the load-time syntax heuristic and the
-re-baseline that goes with it (after the new algorithms are agreed); the
-`pass2_device.rs` split (until visible mode settles, to avoid merge pain).
-**Small open items:** C23 (the GPU staging sink is still pixel-only), C25
-(MAPPABLE_PRIMARY_BUFFERS requested on discrete; probably neutral, one A/B).
+**On hold by decision:** retiring the load-time syntax heuristic and its
+re-baseline (until AST/LSP colouring is agreed); the `pass2_device.rs` split.
+**Small open items:** C23 (the GPU staging sink is pixel-only), C25
+(MAPPABLE_PRIMARY_BUFFERS on discrete; one A/B), the visible selection mask
+still appends by atomic (overlapping selected glyphs could vary frame to
+frame), visible group rows never freed and a selection past mask capacity
+truncated silently (M3's declared gaps).
 
 **Working conventions** (also in memory): test depth by change size; public
-repo (no personal paths/hosts/session names in tracked files); keep pixel-ab
-green and re-baseline only on Ivan's say-so, every moved pixel attributed;
-interleaved A/Bs with load reported; the M2 is fanless (cool-downs).
+repo (no personal paths, hosts or session names in tracked files); keep
+pixel-ab green and re-baseline only on Ivan's say-so, every moved pixel
+attributed; interleaved A/Bs with load reported; the M2 is fanless
+(cool-downs); a delegate sharing this worktree commits its own paths only and
+asks before a battery it will report.
 
 ---
 
