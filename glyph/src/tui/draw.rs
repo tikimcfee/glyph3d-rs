@@ -323,8 +323,6 @@ fn draw_layout_section(f: &mut Frame, area: Rect, state: &LauncherState) {
             ),
             format_choice("hyper (Rayon)", state.repo_engine == RepoEngine::Hyper, is_engine),
             Span::raw(" "),
-            format_choice("cubecl (GPU)", state.repo_engine == RepoEngine::Cubecl, is_engine),
-            Span::raw(" "),
             format_choice("direct", state.repo_engine == RepoEngine::Direct, is_engine),
             Span::raw(" "),
             format_choice("batch", state.repo_engine == RepoEngine::Batch, is_engine),
@@ -744,8 +742,8 @@ mod tests {
         let content: String = buffer.content().iter().map(|c| c.symbol()).collect();
         assert!(content.contains("Parallel CPU Rayon layout"));
 
-        // Change engine to Cubecl: subtitle updates immediately
-        state.repo_engine = RepoEngine::Cubecl;
+        // Change engine to Direct: subtitle updates immediately
+        state.repo_engine = RepoEngine::Direct;
         terminal
             .draw(|f| {
                 draw_layout_section(f, Rect::new(0, 0, 60, 10), &state);
@@ -754,7 +752,7 @@ mod tests {
 
         let buffer = terminal.backend().buffer();
         let content: String = buffer.content().iter().map(|c| c.symbol()).collect();
-        assert!(content.contains("Pure GPU parallel compute"));
+        assert!(content.contains("Direct CPU layout path"));
 
         // Unfocus RepoEngine: layout section should not show engine subtitle
         state.focus = FocusField::LayoutMode;

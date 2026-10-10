@@ -16,8 +16,6 @@ pub enum CliCommand {
     },
     /// Inspect and print GPU device profile / key, then exit.
     GpuInfo(GpuInfoMode),
-    /// Developer CubeCL pipeline checks and benchmarks.
-    Cubecl(CubeclTask),
     /// Reference port parity check over .pipe.bin / .bake.bin fixtures.
     Fixture(FixtureTask),
     /// Headless repo scan, layout, and statistics measurement without a GPU.
@@ -36,21 +34,6 @@ pub enum CliCommand {
 pub enum GpuInfoMode {
     Key,
     Profile,
-}
-
-/// Sub-tasks under CubeCL GPU compute testing.
-#[derive(Debug, Clone)]
-pub enum CubeclTask {
-    Smoke,
-    ScanCheck(PathBuf),
-    ChainCheck(PathBuf),
-    ChainBench(PathBuf),
-    DecodeCheck(PathBuf),
-    ClusterCheck(PathBuf),
-    RepoCheck {
-        dir: PathBuf,
-        color_mode: repo::ColorMode,
-    },
 }
 
 /// Fixture parity tasks.
@@ -103,32 +86,6 @@ impl Cli {
         }
         if self.gpu_profile {
             return CliCommand::GpuInfo(GpuInfoMode::Profile);
-        }
-
-        // CubeCL tasks
-        if self.cubecl_smoke {
-            return CliCommand::Cubecl(CubeclTask::Smoke);
-        }
-        if let Some(path) = &self.cubecl_scan_check {
-            return CliCommand::Cubecl(CubeclTask::ScanCheck(path.clone()));
-        }
-        if let Some(path) = &self.cubecl_chain_check {
-            return CliCommand::Cubecl(CubeclTask::ChainCheck(path.clone()));
-        }
-        if let Some(path) = &self.cubecl_chain_bench {
-            return CliCommand::Cubecl(CubeclTask::ChainBench(path.clone()));
-        }
-        if let Some(path) = &self.cubecl_decode_check {
-            return CliCommand::Cubecl(CubeclTask::DecodeCheck(path.clone()));
-        }
-        if let Some(path) = &self.cubecl_cluster_check {
-            return CliCommand::Cubecl(CubeclTask::ClusterCheck(path.clone()));
-        }
-        if let Some(dir) = &self.cubecl_repo_check {
-            return CliCommand::Cubecl(CubeclTask::RepoCheck {
-                dir: dir.clone(),
-                color_mode: self.color_mode,
-            });
         }
 
         // Fixture parity tasks

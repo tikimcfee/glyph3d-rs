@@ -44,7 +44,6 @@
 //! | backend | module | `--repo-engine` | target |
 //! |---|---|---|---|
 //! | `HyperLayout` (parallel CPU, Rayon) | `layout_hyper.rs` | `hyper` (default), `direct`, `batch`, `naive` | host arena or mapped device slots |
-//! | `CubeclLayout` (GPU compute chain) | `cubecl_layout.rs` | `cubecl` | device slots |
 //!
 //! Beside them, outside the seam, sit the corpus instruments: the serial
 //! `fold`, the `scan` form and the `bake`, each held bit-exact (or at a stated
@@ -69,7 +68,6 @@
 //! - **The `--repo-engine` strategy names.** `direct`/`batch`/`naive` are CLI
 //!   choices (`repo::Strategy`) that select how a load records and reports,
 //!   not separate contracts; all three construct the same `HyperLayout`.
-
 
 use crate::glyph_scene::GlyphInstance;
 
@@ -490,13 +488,6 @@ pub struct DeviceSlots {
     /// whose fast tint is not final (`has_emoji`), empty otherwise — so the
     /// tint fold never reads device slots back. Empty when not produced.
     pub emoji_tint_pairs: Vec<Vec<u32>>,
-    /// (glyph_id, color) per slot, slot order — read through `as_slice`.
-    #[cfg(feature = "cubecl")]
-    pub tint: TintStore,
-    /// The pool bindings that keep the chunks' memory from being
-    /// re-allocated — never read by design; their Drop is the release.
-    #[cfg(feature = "cubecl")]
-    pub keep_alive: Vec<Box<dyn std::any::Any + Send>>,
 }
 
 /// What a Derived-format device arena carries beside its 20 B slots.
@@ -509,49 +500,6 @@ pub struct DerivedDeviceSlots {
 /// One chunk of device slots — the field contract's [`glyph_field::SlotChunk`]
 /// (buffer, slot-0 byte offset, live slots), named for its producer role here.
 pub use glyph_field::SlotChunk as DeviceSlotChunk;
-
-/// The tint stream's two homes (note 23, E3b): a host Vec (the gate's Both
-/// mode, and hosts without host-visible storage) or a MAPPED shared buffer
-/// the chain's copy landed (the product on Metal — no staging, no Bytes,
-/// no to_vec; the host reads the pointer). `as_slice` is the only read.
-pub enum TintStore {
-    Host(Vec<u32>),
-    #[cfg(feature = "cubecl")]
-    Mapped(TintMapped),
-}
-
-#[cfg(feature = "cubecl")]
-pub struct TintMapped {
-    /// It OWNS the shared allocation `ptr` aliases; dropping
-    /// it would free the buffer under the fold's reads.
-    pub buffer: wgpu::Buffer,
-    pub ptr: *const u32,
-    pub words: usize,
-}
-
-impl TintStore {
-    pub fn as_slice(&self) -> &[u32] {
-        match self {
-            TintStore::Host(v) => v,
-            #[cfg(feature = "cubecl")]
-            TintStore::Mapped(m) => {
-                // SAFETY: the buffer outlives the store (owned field), the
-                // pointer is its contents base (Metal shared storage), and
-                // `words` counts what the chain's copy wrote before the
-                // poll published it.
-                unsafe { std::slice::from_raw_parts(m.ptr, m.words) }
-            }
-        }
-    }
-}
-
-// The raw pointer aliases shared storage owned by the `_buffer` field; the
-// arena moves between load threads and the slice is only ever READ through
-// as_slice (the tint fold), never written.
-#[cfg(feature = "cubecl")]
-unsafe impl Send for TintMapped {}
-#[cfg(feature = "cubecl")]
-unsafe impl Sync for TintMapped {}
 
 impl GlyphArena {
     pub fn new() -> Self {
@@ -774,12 +722,10 @@ pub trait VerifyLayout: LayoutGlyphs {
 // The unified layout container
 // ---------------------------------------------------------------------------
 
-/// A unified container for layout engines (pure-Rust HyperLayout, CubeCL GPU compute layout).
+/// A unified container for layout engines (today one: the pure-Rust HyperLayout).
 /// Allows versioned or alternative layout engines to be integrated cleanly behind a common interface.
 pub enum LayoutEngine {
     Hyper(crate::layout_hyper::HyperLayout),
-    #[cfg(feature = "cubecl")]
-    Cubecl(crate::cubecl_layout::CubeclLayout),
 }
 
 impl Default for LayoutEngine {
@@ -805,31 +751,10 @@ impl LayoutEngine {
         Self::Hyper(crate::layout_hyper::HyperLayout::with_device(device, field_mode))
     }
 
-    /// Constructs a CubeCL layout engine if the feature is enabled.
-    #[cfg(feature = "cubecl")]
-    pub fn cubecl(field_mode: glyph_field::GlyphFieldMode) -> Self {
-        Self::Cubecl(crate::cubecl_layout::CubeclLayout::new(field_mode))
-    }
-
-    /// Constructs a CubeCL layout engine sharing a GPU context device.
-    #[cfg(feature = "cubecl")]
-    pub(crate) fn cubecl_with_device(device: crate::cubecl_chain::SharedDevice, field_mode: glyph_field::GlyphFieldMode) -> Self {
-        Self::Cubecl(crate::cubecl_layout::CubeclLayout::with_device(device, field_mode))
-    }
-
-    /// Sets prefetched inputs from the background prefetch thread.
-    #[cfg(feature = "cubecl")]
-    pub(crate) fn set_cubecl_prefetched(&mut self, data: crate::cubecl_layout::PrefetchedCubeclData) {
-        if let Self::Cubecl(ref mut c) = self {
-            c.prefetched_inputs = Some(Box::new(data));
-        }
-    }
-
     /// Sets prefetched inputs from the background prefetch thread for HyperLayout.
     pub(crate) fn set_hyper_prefetched(&mut self, data: crate::layout_hyper::PrefetchedHyperData) {
-        if let Self::Hyper(ref mut h) = self {
-            h.set_prefetched(data);
-        }
+        let Self::Hyper(h) = self;
+        h.set_prefetched(data);
     }
 
     /// Retrieve generic backend execution phases.
@@ -837,22 +762,12 @@ impl LayoutEngine {
         crate::repo::BackendPhases::default()
     }
 
-    /// Retrieve CubeCL execution phases if running on CubeCL.
-    #[cfg(feature = "cubecl")]
-    pub fn cubecl_phases(&self) -> Option<crate::cubecl_layout::CubeclPhases> {
-        match self {
-            Self::Hyper(_) => None,
-            Self::Cubecl(c) => Some(c.phases()),
-        }
-    }
 }
 
 impl LayoutGlyphs for LayoutEngine {
     fn name(&self) -> &'static str {
         match self {
             Self::Hyper(b) => b.name(),
-            #[cfg(feature = "cubecl")]
-            Self::Cubecl(b) => b.name(),
         }
     }
 
@@ -863,8 +778,6 @@ impl LayoutGlyphs for LayoutEngine {
     ) -> Result<Vec<ItemPlacement>, LayoutError> {
         match self {
             Self::Hyper(b) => b.layout_validated_items(items, arena),
-            #[cfg(feature = "cubecl")]
-            Self::Cubecl(b) => b.layout_validated_items(items, arena),
         }
     }
 }
@@ -877,8 +790,6 @@ impl VerifyLayout for LayoutEngine {
     ) -> Result<(Vec<ItemPlacement>, Vec<GlyphRecord>), LayoutError> {
         match self {
             Self::Hyper(b) => b.layout_validated_items_recording(items, arena),
-            #[cfg(feature = "cubecl")]
-            Self::Cubecl(b) => b.layout_validated_items_recording(items, arena),
         }
     }
 }
@@ -890,8 +801,7 @@ impl VerifyLayout for LayoutEngine {
 /// Compact one item's records into the arena: drop the blanks, repack 32 B →
 /// 48 B with paint and group, and reduce the two extents in the same pass.
 ///
-/// NO SHIPPING BACKEND CALLS IT. `HyperLayout` emits instances directly, and
-/// the CubeCL instance tail is this loop's device replacement. Its one
+/// NO SHIPPING BACKEND CALLS IT. `HyperLayout` emits instances directly. Its one
 /// non-test caller is the `--hyper-oracle-check` instrument
 /// (`hyper_oracle.rs`), which compacts the oracle-backed fold's records with
 /// it. It stays as the one host statement of what compaction means

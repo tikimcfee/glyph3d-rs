@@ -46,7 +46,7 @@ the checks themselves (what each gate runs and cannot see) live in the root
 - **Surgical Edits**: Never use blind regex or unanchored bulk search-and-replace across Rust source files. Every edit is targeted (an exact match, asserted to occur where intended), and `cargo check --workspace` runs after it.
 
 ## 9. Feature Flags & Binary Defaults
-- Keep primary layout and render engines (e.g. `cubecl`) in the `default` features of `native/Cargo.toml` so that standard `cargo run`, `cargo test`, and `glyph tui` invocations work out-of-the-box without requiring manual feature flags.
+- Keep primary layout and render features (e.g. `egui-ui`) in the `default` features of `native/Cargo.toml` so that standard `cargo run`, `cargo test`, and `glyph tui` invocations work out-of-the-box without requiring manual feature flags.
 
 ## 10. Named Values Live in Configuration
 - Every named, tunable value — colors, backgrounds, spacings, speeds, distances, fade ranges — lives in `config/defaults.toml` (compiled in), overridable per key from a `[section]` of `launch_config.toml` at runtime. Not as a Rust or WGSL literal. Read it through `crate::config::settings()`; shaders receive it through a uniform.

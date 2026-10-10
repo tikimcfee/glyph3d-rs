@@ -51,7 +51,7 @@ pub struct FieldTargets {
 
 /// One device buffer range holding a run of a mode's slots: slot 0 starts at
 /// byte `offset` of `buffer`, `slots` slots follow. Produced on device by the
-/// GPU emitters (CubeCL chain, HyperLayout's device pass) in the format of
+/// GPU emitter (HyperLayout's device Pass 2) in the format of
 /// the mode they emit for.
 #[derive(Clone, Debug)]
 pub struct SlotChunk {

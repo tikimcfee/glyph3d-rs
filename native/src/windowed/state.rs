@@ -674,20 +674,6 @@ impl WindowState {
                                             ..Default::default()
                                         });
                                     }
-                                    #[cfg(feature = "cubecl")]
-                                    if ui
-                                        .selectable_label(
-                                            current_strategy == crate::repo::Strategy::Cubecl,
-                                            "CubeCL (GPU)",
-                                        )
-                                        .clicked()
-                                        && current_strategy != crate::repo::Strategy::Cubecl
-                                    {
-                                        *pending_relayout = Some(RelayoutRequest {
-                                            set_strategy: Some(crate::repo::Strategy::Cubecl),
-                                            ..Default::default()
-                                        });
-                                    }
                                     if ui
                                         .selectable_label(
                                             current_strategy == crate::repo::Strategy::Direct,

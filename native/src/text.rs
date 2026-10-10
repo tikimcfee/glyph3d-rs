@@ -207,8 +207,8 @@ fn is_block_comment_continuation_chars(chars: &[char]) -> bool {
 /// path toward ≥1M instances).
 ///
 /// `cluster_mode` selects the sequence pass on the char stream (the fold's
-/// `fold::resolve_clusters` and the device's `cubecl_chain/cluster.rs` are
-/// the same rule over the same table). Leader (the
+/// `fold::resolve_clusters` and HyperLayout's `char_resolve` are the same
+/// rule over the same table). Leader (the
 /// default) stages one cell per codepoint, as this path always has.
 pub fn stage_file(
     atlas: &Atlas,

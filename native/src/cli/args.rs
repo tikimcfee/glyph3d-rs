@@ -4,7 +4,6 @@ use super::ops::{build_ops, parse_verb, Op};
 use super::parsers::*;
 use crate::glyph_scene::Verb;
 
-
 /// Windowed presentation mode.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, clap::ValueEnum)]
 #[value(rename_all = "lower")]
@@ -153,8 +152,7 @@ pub struct Cli {
     pub load_repo: Option<PathBuf>,
     /// Which layout engine a repo load uses. `hyper` (the DEFAULT) is the
     /// parallel CPU HyperLayout, writing render instances straight into the
-    /// arena with its inputs prefetched in the background. `cubecl` is the GPU
-    /// compute chain (the `cubecl` Cargo feature, on by default). `direct`,
+    /// arena with its inputs prefetched in the background. `direct`,
     /// `batch` and `naive` run the same HyperLayout without the prefetch;
     /// under `--repo-verify`, `direct` records no 32 B wire records
     /// (placements and instances are diffed, records are not) while `batch`
@@ -270,37 +268,6 @@ pub struct Cli {
     /// provenance record committed beside a golden set as ADAPTER.txt.
     #[arg(long)]
     pub gpu_profile: bool,
-    /// Dev-only CubeCL bring-up smoke (note 16, phase 0): share the device,
-    /// prove buffer interop both directions, measure float contraction on the
-    /// k_apply shape, print the verdicts, exit. Not wired into the battery.
-    #[arg(long)]
-    pub cubecl_smoke: bool,
-    /// Dev-only CubeCL scan check (note 16, phase 1): the chunk_reduce kernel
-    /// over one fixture, chunk partials diffed bit-exact vs scan.rs, exit.
-    #[arg(long, value_name = "PATH")]
-    pub cubecl_scan_check: Option<PathBuf>,
-    /// Dev-only CubeCL chain check (note 16, phase 2): the full scan skeleton
-    /// over one fixture — counts + line_advance bit-exact vs scan.rs,
-    /// positions deviation-reported, exit.
-    #[arg(long, value_name = "PATH")]
-    pub cubecl_chain_check: Option<PathBuf>,
-    /// Dev-only CubeCL chain bench (note 16, phase 2): the scan skeleton over
-    /// a raw file as one item, dispatch/readback timing, exit.
-    #[arg(long, value_name = "PATH")]
-    pub cubecl_chain_bench: Option<PathBuf>,
-    /// Dev-only CubeCL decode check (phase 3a): the device decode over one
-    /// fixture — packed flags + advance diffed bit-exact vs fold::decode_all.
-    #[arg(long, value_name = "PATH")]
-    pub cubecl_decode_check: Option<PathBuf>,
-    /// Dev-only CubeCL cluster check (phase 3b): decode + cluster on device
-    /// vs decode_all + resolve_clusters — flags + advance bit-exact, exit.
-    #[arg(long, value_name = "PATH")]
-    pub cubecl_cluster_check: Option<PathBuf>,
-    /// Dev-only CubeCL repo parity driver (phase 4 rung 3): the full chain
-    /// over a real repository, records diffed tier-aware against the
-    /// engine's batched output — the fence the load-path flip rides on.
-    #[arg(long, value_name = "DIR")]
-    pub cubecl_repo_check: Option<PathBuf>,
     /// Windowed only: how frames reach the display. `fifo` (the default) is
     /// vsync, so the FPS line reads the monitor's refresh; `mailbox` and
     /// `immediate` uncap it where the surface supports them (else fifo, and
@@ -348,7 +315,6 @@ pub struct RawOps {
     #[arg(long, value_name = "PATH", action = ArgAction::Append)]
     pub highlight: Vec<PathBuf>,
 }
-
 
 /// Whether this run looks for a personal `launch_config.toml` on its own.
 /// Screenshot runs never do: every gate that launches the binary is one, and
@@ -538,7 +504,6 @@ pub fn parse_cli_from(matches: clap::ArgMatches) -> Result<Cli, String> {
 
     Ok(cli)
 }
-
 
 pub fn parse_cli() -> Cli {
     parse_cli_from(Cli::command().get_matches()).unwrap_or_else(|e| {
