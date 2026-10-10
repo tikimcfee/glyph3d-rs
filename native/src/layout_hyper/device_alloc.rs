@@ -49,7 +49,25 @@ impl EmitInputs<'_, '_> {
         let sp_pass2 = tracing::info_span!("hyper.pass2").entered();
         let out = layout_pass2_device::<E>(self, dest_addr);
         drop(sp_pass2);
-        let pairs = emoji_tint_pairs::<E>(dest_addr, &out);
+        // Timed apart from Pass 2: on a discrete GPU `dest_addr` is wgpu's
+        // staging memory, and READING slots back out of it is a different
+        // cost class from writing them (write-combined memory).
+        let sp_tints = tracing::info_span!(
+            "hyper.emoji_tint_pairs",
+            emoji_files = out.file_tints.iter().filter(|t| t.has_emoji).count()
+        )
+        .entered();
+        // GPU-direction study (2026-10-09), measurement switch, default off,
+        // and NOT output-neutral: `GLYPH_EXPERIMENT_SKIP_TINT_REREAD=1` skips
+        // the re-read entirely (emoji files lose their LOD backdrop tint) to
+        // price it. The fix this measures the ceiling of is to fold the
+        // pairs during emission, where glyph and colour are in registers.
+        let pairs = if std::env::var_os("GLYPH_EXPERIMENT_SKIP_TINT_REREAD").is_some() {
+            vec![Vec::new(); out.placements.len()]
+        } else {
+            emoji_tint_pairs::<E>(dest_addr, &out)
+        };
+        drop(sp_tints);
         (out, pairs)
     }
 }
@@ -163,7 +181,12 @@ pub(crate) fn layout_device_discrete_chunked<E: SlotEmit>(
     let plan = ChunkPlan::new::<E>(dev, total_survivors, Some(chunk_cap));
     let max_buf = dev.device.limits().max_buffer_size;
 
-    let (pass2, emoji_tint_pairs, chunks) = if plan.total_bytes <= max_buf {
+    // GPU-direction study (2026-10-09), measurement switch, default off:
+    // `GLYPH_EXPERIMENT_STAGING=host` takes the streaming host-memory path
+    // even when the slots fit one buffer, to price the two staging
+    // strategies against each other on a discrete GPU. Bytes land the same.
+    let force_host = std::env::var("GLYPH_EXPERIMENT_STAGING").is_ok_and(|v| v == "host");
+    let (pass2, emoji_tint_pairs, chunks) = if plan.total_bytes <= max_buf && !force_host {
         stage_single_buffer::<E>(dev, inputs, label, &plan)
     } else {
         stage_host_memory::<E>(dev, inputs, label, &plan)
@@ -188,12 +211,30 @@ fn stage_single_buffer<E: SlotEmit>(
     // this whole buffer from its own staging at `unmap`, and a size off 16 B
     // halves that copy's throughput. The pad is never copied out.
     let staging_size = glyph_field::padded_staging_size(plan.total_bytes.max(plan.slot_bytes as u64));
+    // The four spans below split the discrete path's cost around Pass 2 so
+    // a GLYPH_TRACE run attributes it: `create` is wgpu-core allocating AND
+    // zero-filling its own host staging for a mapped-at-creation buffer,
+    // `unmap` is wgpu-core's copy of that staging into the COPY_SRC buffer,
+    // `copy_submit` the device-to-device copies into the STORAGE chunks,
+    // `poll` the wait for them. Timing only; no bytes move differently.
+    // GPU-direction study (2026-10-09), measurement switch, default off:
+    // `GLYPH_EXPERIMENT_STAGING=mapwrite` adds MAP_WRITE so wgpu-core maps
+    // this buffer directly instead of allocating a hidden host staging
+    // buffer of its own and copying through it at `unmap`.
+    let map_write = std::env::var("GLYPH_EXPERIMENT_STAGING").is_ok_and(|v| v == "mapwrite");
+    let usage = if map_write {
+        wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::MAP_WRITE
+    } else {
+        wgpu::BufferUsages::COPY_SRC
+    };
+    let sp_create = tracing::info_span!("hyper.staging.create", bytes = staging_size).entered();
     let staging_buf = dev.device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("glyph slots (staging)"),
         size: staging_size,
-        usage: wgpu::BufferUsages::COPY_SRC,
+        usage,
         mapped_at_creation: true,
     });
+    drop(sp_create);
     let (pass2, emoji_tint_pairs) = {
         let mut mapped = staging_buf
             .slice(..)
@@ -202,8 +243,11 @@ fn stage_single_buffer<E: SlotEmit>(
         let addr = mapped.slice(..).as_raw_element_ptr().as_ptr() as usize;
         inputs.run::<E>(addr)
     };
+    let sp_unmap = tracing::info_span!("hyper.staging.unmap").entered();
     staging_buf.unmap();
+    drop(sp_unmap);
 
+    let sp_copy = tracing::info_span!("hyper.staging.copy_submit").entered();
     let mut encoder = dev.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
         label: Some("glyph_hyper_staging_copy"),
     });
@@ -236,10 +280,13 @@ fn stage_single_buffer<E: SlotEmit>(
         .collect();
 
     dev.queue.submit([encoder.finish()]);
+    drop(sp_copy);
+    let sp_poll = tracing::info_span!("hyper.staging.poll").entered();
     let _ = dev.device.poll(wgpu::PollType::Wait {
         submission_index: None,
         timeout: None,
     });
+    drop(sp_poll);
     (pass2, emoji_tint_pairs, chunks)
 }
 

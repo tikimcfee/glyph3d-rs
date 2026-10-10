@@ -21,7 +21,10 @@
 # fields then fail against this root (measured on a mock, 2026-10-09).
 [workspace]
 members = ["zedspike", "fieldzed"]
-exclude = ["zed"]
+# gpu-direction/jit-layout is its own workspace (a headless wgpu measurement
+# with no Zed dependency); excluded so it builds on a box without the `zed`
+# symlink, which this root cannot resolve without.
+exclude = ["zed", "gpu-direction/jit-layout"]
 resolver = "2"
 
 # Copied from Zed's root [patch.crates-io]: their tree-sitter is a git fork,
