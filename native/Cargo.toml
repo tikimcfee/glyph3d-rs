@@ -22,6 +22,9 @@ glyph-field-instanced = { path = "../crates/glyph-field-instanced" }
 glyph-field-derived = { path = "../crates/glyph-field-derived" }
 glyph-field-visible = { path = "../crates/glyph-field-visible" }
 glyph-session-dirs = { path = "../crates/glyph-session-dirs" }
+# The transform tree (2026-10-10): every group row a node, resolved on
+# the GPU into the group table (glyph_scene/nodes.rs).
+glyph-scene-graph = { path = "../crates/glyph-scene-graph" }
 winit = "0.30"
 pollster = "0.4"
 bytemuck = { version = "1", features = ["derive"] }

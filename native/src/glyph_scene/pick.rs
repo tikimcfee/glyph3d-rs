@@ -799,38 +799,39 @@ impl GlyphScene {
         if (self.groups_cpu.len() as u32) < max_groups {
             let gid = self.groups_cpu.len() as u32;
             self.groups_cpu.push(row);
+            // The whole row goes up (clip and background are not the
+            // tree's), and the row becomes a node like every other group.
             self.write_group_row(ctx, gid);
+            debug_assert_eq!(self.nodes.len(), gid as usize, "group ids and nodes stay in step");
+            self.nodes.push_row(&row);
             return Some(gid);
         }
         None
     }
 
-    pub(super) fn write_group_rows(&self, ctx: &GpuContext, gids: &[u32]) {
-        if gids.is_empty() {
-            return;
-        }
-        if gids.len() == 1 {
-            self.write_group_row(ctx, gids[0]);
-            return;
-        }
-        let min_gid = *gids.iter().min().unwrap() as usize;
-        let max_gid = *gids.iter().max().unwrap() as usize;
-        if min_gid >= self.groups_cpu.len() || max_gid >= self.groups_cpu.len() {
-            return;
-        }
-        let span = max_gid.saturating_sub(min_gid) + 1;
-        if span <= gids.len() * 4 || gids.len() > 8 {
-            let slice = &self.groups_cpu[min_gid..=max_gid];
-            ctx.queue.write_buffer(
-                &self.group_buf,
-                min_gid as u64 * 96,
-                bytemuck::cast_slice(slice),
-            );
-        } else {
-            for &gid in gids {
-                self.write_group_row(ctx, gid);
+    /// Rows an EXTERNAL writer (the layout controller's bevy sync: carrel
+    /// zones, decks, the library's animation) left in the CPU mirror: adopt
+    /// them into the group nodes, which upload the changed local rows and
+    /// resolve them into the table at the next frame (2026-10-10; before
+    /// this, the rows themselves went up, min..max span or row by row). The
+    /// adoption keeps a verb's tint and hide that the writer did not change
+    /// (`GroupNodes::adopt`, the library probe's E4).
+    pub(super) fn write_group_rows(&mut self, _ctx: &GpuContext, gids: &[u32]) {
+        for &gid in gids {
+            if let Some(row) = self.groups_cpu.get_mut(gid as usize) {
+                self.nodes.adopt(gid, row);
             }
         }
+    }
+
+    /// A group verb has written group `gid`'s node: refresh the CPU mirror
+    /// from the tables (what the GPU will resolve) and re-derive its cull
+    /// segment from it.
+    pub(super) fn group_node_edited(&mut self, ctx: &GpuContext, gid: u32) {
+        if let Some(row) = self.groups_cpu.get_mut(gid as usize) {
+            self.nodes.mirror(gid, row);
+        }
+        self.sync_segment(ctx, gid);
     }
 
     /// Re-derive a cull segment from the live group TRS: the world AABB
@@ -1072,44 +1073,34 @@ impl GlyphScene {
                     new_ah[0], new_ah[1]
                 )
             }
+            // The group verbs write the group's NODE — one table each (the
+            // local row, or the appearance row) — and the resolve pass writes
+            // the group row; the CPU mirror follows from the tables.
             Verb::MoveGroup(d) => {
-                let Some(g) = self.groups_cpu.get_mut(gid as usize) else {
+                if !self.nodes.translate(gid, *d) {
                     return format!("verb move-group: group {gid} out of range");
-                };
-                g.cols[0][0] += d[0];
-                g.cols[0][1] += d[1];
-                g.cols[0][2] += d[2];
-                let off = [g.cols[0][0], g.cols[0][1], g.cols[0][2]];
-                self.write_group_row(ctx, gid);
-                self.sync_segment(ctx, gid);
+                }
+                self.group_node_edited(ctx, gid);
+                let off = self.groups_cpu[gid as usize].cols[0];
                 format!(
-                    "verb move-group: {rel} group {gid} offset -> ({:.1},{:.1},{:.1}) (80 B row)",
+                    "verb move-group: {rel} group {gid} offset -> ({:.1},{:.1},{:.1}) (32 B local row)",
                     off[0], off[1], off[2]
                 )
             }
             Verb::ScaleGroup(f) => {
-                let Some(g) = self.groups_cpu.get_mut(gid as usize) else {
+                let Some(s) = self.nodes.scale_by(gid, *f) else {
                     return format!("verb scale-group: group {gid} out of range");
                 };
-                for c in 0..3 {
-                    g.cols[3][c] = (g.cols[3][c] * f).clamp(0.001, 100.0);
-                }
-                let s = g.cols[3][0];
-                self.write_group_row(ctx, gid);
-                self.sync_segment(ctx, gid);
-                format!("verb scale-group: {rel} group {gid} scale -> {s:.3} (80 B row)")
+                self.group_node_edited(ctx, gid);
+                format!("verb scale-group: {rel} group {gid} scale -> {s:.3} (32 B local row)")
             }
             Verb::TintGroup(rgb) => {
-                let Some(g) = self.groups_cpu.get_mut(gid as usize) else {
+                if !self.nodes.set_tint(gid, *rgb) {
                     return format!("verb tint-group: group {gid} out of range");
-                };
-                g.cols[2][0] = rgb[0];
-                g.cols[2][1] = rgb[1];
-                g.cols[2][2] = rgb[2];
-                self.write_group_row(ctx, gid);
-                self.sync_segment(ctx, gid);
+                }
+                self.group_node_edited(ctx, gid);
                 format!(
-                    "verb tint-group: {rel} group {gid} tint -> ({:.2},{:.2},{:.2}) (80 B row)",
+                    "verb tint-group: {rel} group {gid} tint -> ({:.2},{:.2},{:.2}) (32 B appearance row)",
                     rgb[0], rgb[1], rgb[2]
                 )
             }
@@ -1176,16 +1167,17 @@ impl GlyphScene {
             }
             Verb::Library(_) => unreachable!("apply_verb answers the library verbs before the pick check"),
             Verb::SetHidden(hide) => {
-                let Some(g) = self.groups_cpu.get_mut(gid as usize) else {
+                if !self.nodes.set_alpha(gid, if *hide { 0.0 } else { 1.0 }) {
                     return format!("verb hide/show: group {gid} out of range");
-                };
-                g.cols[2][3] = if *hide { 0.0 } else { 1.0 };
+                }
+                if let Some(g) = self.groups_cpu.get_mut(gid as usize) {
+                    self.nodes.mirror(gid, g);
+                }
                 if let Some(cull) = &mut self.cull {
                     if (gid as usize) < cull.hidden.len() {
                         cull.hidden[gid as usize] = *hide;
                     }
                 }
-                self.write_group_row(ctx, gid);
                 // The Visible field culls its items itself: tell it, so the
                 // item leaves (or rejoins) every tier and the HUD's counts move.
                 let item_note = match self.visible_item_of(gid) {
@@ -1198,7 +1190,7 @@ impl GlyphScene {
                     None => String::new(),
                 };
                 format!(
-                    "verb {}: {rel} group {gid} (alpha -> {}, 80 B row; cull skips the segment{item_note})",
+                    "verb {}: {rel} group {gid} (alpha -> {}, 32 B appearance row; cull skips the segment{item_note})",
                     if *hide { "hide-group" } else { "show-group" },
                     g_alpha(self.groups_cpu.get(gid as usize)),
                 )

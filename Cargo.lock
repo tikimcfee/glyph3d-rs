@@ -1813,6 +1813,7 @@ dependencies = [
  "glyph-field-derived",
  "glyph-field-instanced",
  "glyph-field-visible",
+ "glyph-scene-graph",
  "glyph-session-dirs",
  "image",
  "log",

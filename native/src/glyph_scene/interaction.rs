@@ -144,19 +144,13 @@ impl GlyphScene {
                     self.sync_segment(ctx, g);
                 }
                 return;
-            } else if let Some(g) = self.groups_cpu.get_mut(gid as usize) {
-                g.cols[0][0] += delta.x as f32;
-                g.cols[0][1] += delta.y as f32;
-                g.cols[0][2] += delta.z as f32;
             }
-        } else if let Some(g) = self.groups_cpu.get_mut(gid as usize) {
-            g.cols[0][0] += delta.x as f32;
-            g.cols[0][1] += delta.y as f32;
-            g.cols[0][2] += delta.z as f32;
         }
-
-        self.write_group_row(ctx, gid);
-        self.sync_segment(ctx, gid);
+        // No controller entity for the group: the drag writes its node's
+        // local row (the world delta in its parent's frame).
+        if self.nodes.translate(gid, d_vec.to_array()) {
+            self.group_node_edited(ctx, gid);
+        }
     }
 
     /// Windowed scroll: scales the grabbed carrel or file; otherwise camera speed.
@@ -193,20 +187,13 @@ impl GlyphScene {
                     }
                     println!("grab: group {gid} scale -> {s:.3}");
                     return;
-                } else if let Some(g) = self.groups_cpu.get_mut(gid as usize) {
-                    for c in 0..3 {
-                        g.cols[3][c] = (g.cols[3][c] * f).clamp(0.001, 100.0);
-                    }
-                    s = g.cols[3][0];
                 }
-            } else if let Some(g) = self.groups_cpu.get_mut(gid as usize) {
-                for c in 0..3 {
-                    g.cols[3][c] = (g.cols[3][c] * f).clamp(0.001, 100.0);
-                }
-                s = g.cols[3][0];
             }
-            self.write_group_row(ctx, gid);
-            self.sync_segment(ctx, gid);
+            // No controller entity: the wheel scales the group's node.
+            if let Some(ns) = self.nodes.scale_by(gid, f) {
+                s = ns;
+                self.group_node_edited(ctx, gid);
+            }
             println!("grab: group {gid} scale -> {s:.3}");
         } else if matches!(self.camera_mode, CameraMode::Fly) {
             self.fly.on_scroll(lines);
