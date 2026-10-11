@@ -2010,6 +2010,7 @@ mod tests {
             emoji_sampler: &dummy_emoji_sampler,
             glyph_advances: &dummy_advances,
             item_params: &[],
+            item_of_group: &[],
         };
 
         let source = SlotSource::Device {

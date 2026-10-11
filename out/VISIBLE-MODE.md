@@ -237,7 +237,9 @@ its order is set by atomics each frame, so everything the scene keyed by SLOT
 the item is the file's index in the load (its group id at load,
 `GlyphScene::visible_item_of`) and the byte is the glyph's LEADER offset
 within the file — both already what the CPU pick yields (`PickFileInfo::group_id`,
-`PickGlyph::byte_off`). The stored modes keep their slot paths untouched (the
+`PickGlyph::byte_off`). (Since 2026-10-11 the item is the picked VIEW,
+`PickHit::view`, and its group row a separate field of the view registry,
+`crate::views`; `visible_item_of` and `PickFileInfo::group_id` are gone.) The stored modes keep their slot paths untouched (the
 goldens, and the goldens under `--field-mode derived`, are the proof).
 
 **How each consumer is keyed now** (renderer side; the field's bodies are the

@@ -10,10 +10,15 @@ impl SlotRecord for DerivedSlot {
     const COLOR_OFFSET: u64 = COLOR_OFFSET;
 }
 
-/// The 48 B → 20 B transcode. Reads the item table to recover a record's
-/// wrap segment from its Z when the engine did not flag it.
+/// The 48 B → 20 B transcode. A host record names its GROUP row; the
+/// item it belongs to — the slot's item lane, and the item-table row its
+/// wrap segment is recovered against when the engine did not flag it — is
+/// `item_of_group[group]` (the scene's view registry answers it). Until
+/// 2026-10-11 the group id was written as the item, which held only because
+/// every host producer padded its item table until the two agreed.
 pub struct DerivedTranscode<'a> {
     pub item_params: &'a [ItemParamsGpu],
+    pub item_of_group: &'a [u32],
 }
 
 impl Transcode for DerivedTranscode<'_> {
@@ -21,7 +26,7 @@ impl Transcode for DerivedTranscode<'_> {
 
     #[inline(always)]
     unsafe fn transcode(&self, src: &GlyphInstance, dst: *mut DerivedSlot) {
-        std::ptr::write(dst, transcode_one(src, self.item_params));
+        std::ptr::write(dst, transcode_one(src, self.item_params, self.item_of_group));
     }
 }
 
@@ -32,10 +37,15 @@ pub const LABELS: UploadLabels = UploadLabels {
 };
 
 #[inline(always)]
-fn transcode_one(inst: &GlyphInstance, item_params: &[ItemParamsGpu]) -> DerivedSlot {
+fn transcode_one(inst: &GlyphInstance, item_params: &[ItemParamsGpu], item_of_group: &[u32]) -> DerivedSlot {
+    let item_index = item_of_group
+        .get(inst.group_id as usize)
+        .copied()
+        .filter(|&item| item != glyph_field::NO_ITEM)
+        .unwrap_or_else(|| panic!("a host record's group row {} names no single item", inst.group_id));
     let wrap_segment = if inst.flags != 0 {
         (inst.flags & 0xFFFF) as u16
-    } else if let Some(item) = item_params.get(inst.group_id as usize) {
+    } else if let Some(item) = item_params.get(item_index as usize) {
         if item.z_step.abs() > 1e-6 {
             ((item.origin_z - inst.pos[2]) / item.z_step).round().max(0.0) as u16
         } else {
@@ -48,12 +58,12 @@ fn transcode_one(inst: &GlyphInstance, item_params: &[ItemParamsGpu]) -> Derived
     let glyph_id = (inst.glyph_id & 0xFFFF) as u16;
     // The row lane carries the column page (derive.rs): col / page_cols for
     // a column-paged item, else 0.
-    let x_page = match item_params.get(inst.group_id as usize) {
+    let x_page = match item_params.get(item_index as usize) {
         Some(item) if item.has_page != 0 && item.page_cols > 0 => inst.col / item.page_cols as u32,
         _ => 0,
     };
     let row = crate::derive::pack_row(inst.row, x_page);
-    let item_and_group = inst.group_id;
+    let item_and_group = crate::derive::item_lane(item_index);
 
     DerivedSlot::with_item_and_group(
         inst.pos[0],

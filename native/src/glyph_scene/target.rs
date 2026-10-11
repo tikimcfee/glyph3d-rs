@@ -89,9 +89,9 @@ pub(super) struct MaskSet {
 ///
 /// The Visible field keeps no slot per glyph (its transient buffer is
 /// re-ordered by atomics every frame), so there a selection is a BYTE RANGE
-/// of an item (M3, 2026-10-10): the item is the file's index (its group id
-/// at load) and the bytes are leader offsets within the file — the two
-/// things the CPU pick already yields. The mask pass asks the field to lay
+/// of an item (M3, 2026-10-10): the item is the picked view (a view's
+/// index is its item row, `crate::views`) and the bytes are leader offsets
+/// within the file — the two things the CPU pick already yields. The mask pass asks the field to lay
 /// the range's glyphs out again into its selection buffer and draws that.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Selection {

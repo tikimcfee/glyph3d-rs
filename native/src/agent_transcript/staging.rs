@@ -112,41 +112,39 @@ pub fn normalize_multiline_text(text: &str) -> std::borrow::Cow<'_, str> {
     }
 }
 
-/// The item a text block is staged as: its start position's y and z as the
-/// origin, its line height, no wrap and no pages, drawn with its own group.
+/// The recipe a text block is staged as: its start position's y and z as
+/// the origin, its line height, no wrap and no pages. (Its group row is
+/// the block's view's, written into the item table by the view registry.)
 ///
 /// One item per block (2026-10-11), so the Derived field — which keeps each
 /// glyph's x and derives y and z in the vertex stage from `item_table[item]`
-/// (`glyph_field_derived::derive::derive_yz`), the item being the glyph's
-/// group id at load — lands every glyph where the Instanced field's absolute
-/// position puts it. With `line_height_lo` 0 and a row count whose product
-/// with the line height is exact, the shader's `fma` and the stager's
-/// `start_y - row * line_h` round the same exact value once each, so the two
-/// agree bit for bit (`derived_positions_match_the_staged_ones` holds them).
-pub(crate) fn block_item(start_pos: [f32; 3], line_h: f32, group_id: u32) -> glyph_field::ItemParamsGpu {
+/// (`glyph_field_derived::derive::derive_yz`) — lands every glyph where the
+/// Instanced field's absolute position puts it. With `line_height_lo` 0 and
+/// a row count whose product with the line height is exact, the shader's
+/// `fma` and the stager's `start_y - row * line_h` round the same exact
+/// value once each, so the two agree bit for bit
+/// (`derived_positions_match_the_staged_ones` holds them).
+pub(crate) fn block_item(start_pos: [f32; 3], line_h: f32) -> glyph_field::ItemParamsGpu {
     glyph_field::ItemParamsGpu {
         line_height: line_h,
         origin_y: start_pos[1],
         origin_z: start_pos[2],
-        group: group_id,
         ..Default::default()
     }
 }
 
-/// Record `item` as the item of group `group_id`, padding any gap with plain
-/// items that each name their own index as the group (the load-time
-/// identity the Derived lane relies on).
-fn set_block_item(items: &mut Vec<glyph_field::ItemParamsGpu>, group_id: u32, item: glyph_field::ItemParamsGpu) {
-    let idx = group_id as usize;
-    while items.len() <= idx {
-        let g = items.len() as u32;
-        items.push(glyph_field::ItemParamsGpu { group: g, ..Default::default() });
-    }
-    items[idx] = item;
+/// One text block as staged, before it becomes a view: its group row, its
+/// recipe and its length. The slots, segment and extent are its group's
+/// (`record_group` measures them), so the view is finished once the
+/// segments are built.
+struct StagedBlock {
+    group_row: u32,
+    recipe: glyph_field::ItemParamsGpu,
+    byte_len: u32,
 }
 
-/// Lay out colored text lines into glyph instances, and record the block's
-/// item (`block_item`) under its group.
+/// Lay out colored text lines into glyph instances, and record the block
+/// (`block_item`, its group row) for its view.
 #[allow(clippy::too_many_arguments)]
 fn layout_colored_lines(
     trie: &TrieTable,
@@ -156,13 +154,15 @@ fn layout_colored_lines(
     max_lines: usize,
     group_id: u32,
     instances: &mut Vec<GlyphInstance>,
-    items: &mut Vec<glyph_field::ItemParamsGpu>,
+    blocks: &mut Vec<StagedBlock>,
     codepoints_decoded: &mut usize,
 ) {
     let fu_per_world = trie.metrics.em_height_fu as f32 / CELL_HEIGHT_WORLD;
     let cell_w = trie.metrics.advance_fu as f32 / fu_per_world;
     let line_h = CELL_HEIGHT_WORLD * LINE_HEIGHT_FACTOR;
-    set_block_item(items, group_id, block_item(start_pos, line_h, group_id));
+    // The block's buffer: its lines as staged, a newline after each.
+    let byte_len = lines.iter().take(max_lines).map(|(line, _)| line.len() as u32 + 1).sum();
+    blocks.push(StagedBlock { group_row: group_id, recipe: block_item(start_pos, line_h), byte_len });
 
     for (row, (line, color)) in lines.iter().take(max_lines).enumerate() {
         let mut col = 0;
@@ -1085,8 +1085,8 @@ pub fn stage_agent_session_with_options(
     let focus_bounds = Some(([50.0, -10.0], [175.0, 60.0]));
 
     let mut raw_instances = Vec::new();
-    // One item per block, indexed by the block's group id (`block_item`).
-    let mut items: Vec<glyph_field::ItemParamsGpu> = Vec::new();
+    // One view per text block, in staging order (`block_item`).
+    let mut blocks: Vec<StagedBlock> = Vec::new();
     let mut codepoints_decoded = 0;
 
     let fu_per_world = trie
@@ -1233,7 +1233,7 @@ pub fn stage_agent_session_with_options(
                     4,
                     left_hdr_gid,
                     &mut raw_instances,
-                    &mut items,
+                    &mut blocks,
                     &mut codepoints_decoded,
                 );
             }
@@ -1249,7 +1249,7 @@ pub fn stage_agent_session_with_options(
                     usize::MAX,
                     left_body_gid,
                     &mut raw_instances,
-                    &mut items,
+                    &mut blocks,
                     &mut codepoints_decoded,
                 );
             }
@@ -1299,7 +1299,7 @@ pub fn stage_agent_session_with_options(
                     4,
                     right_hdr_gid,
                     &mut raw_instances,
-                    &mut items,
+                    &mut blocks,
                     &mut codepoints_decoded,
                 );
             }
@@ -1315,7 +1315,7 @@ pub fn stage_agent_session_with_options(
                     usize::MAX,
                     right_body_gid,
                     &mut raw_instances,
-                    &mut items,
+                    &mut blocks,
                     &mut codepoints_decoded,
                 );
             }
@@ -1383,7 +1383,7 @@ pub fn stage_agent_session_with_options(
                         4,
                         header_gid,
                         &mut raw_instances,
-                        &mut items,
+                        &mut blocks,
                         &mut codepoints_decoded,
                     );
                 }
@@ -1399,7 +1399,7 @@ pub fn stage_agent_session_with_options(
                         usize::MAX,
                         body_gid,
                         &mut raw_instances,
-                        &mut items,
+                        &mut blocks,
                         &mut codepoints_decoded,
                     );
                 }
@@ -1428,7 +1428,7 @@ pub fn stage_agent_session_with_options(
                 1,
                 label_gid,
                 &mut raw_instances,
-                &mut items,
+                &mut blocks,
                 &mut codepoints_decoded,
             );
             record_group(label_gid, &raw_instances, base_label, &mut group_info);
@@ -1452,7 +1452,6 @@ pub fn stage_agent_session_with_options(
     // Every allocated id has a row: the label groups carry no ECS binding.
     let total_groups = ((max_gid + 1).max(next_gid)) as usize;
     let mut groups = vec![GroupRow::identity([0.0, 0.0, 0.0]); total_groups.max(1)];
-    let group_count = groups.len();
     controller.scene.sync_all_to_group_rows(&mut groups);
 
     // Build per-group SegCull segments so frustum culling actively culls off-screen cards
@@ -1498,6 +1497,29 @@ pub fn stage_agent_session_with_options(
         });
     }
 
+    // Each block's view: its group row and recipe, and — since its group
+    // holds only it — its group's slot range, extent and segment (segments
+    // are one per group row, in group order, so segment `g` is row `g`'s).
+    let views = crate::views::Views::new(
+        blocks
+            .iter()
+            .enumerate()
+            .map(|(block, b)| {
+                let info = group_info.get(b.group_row as usize).copied().flatten().expect("every staged block's group was measured");
+                crate::views::View {
+                    buffer: block as u32,
+                    bytes: 0..b.byte_len,
+                    recipe: b.recipe,
+                    group_row: b.group_row,
+                    segment: b.group_row,
+                    slots: info.slot_base..info.slot_base + info.slot_count,
+                    local_min: info.local_min,
+                    local_max: info.local_max,
+                }
+            })
+            .collect(),
+    );
+
     let instances = GlyphArena::from_vec(raw_instances);
 
     StagedText {
@@ -1512,19 +1534,8 @@ pub fn stage_agent_session_with_options(
         segments,
         pick: None,
         controller: Some(controller),
-        item_params: session_item_params(items, group_count),
+        views,
     }
-}
-
-/// The staged item table: one item per group row, the blocks' own where a
-/// block was staged, a plain item naming its own group everywhere else (a
-/// group with no glyphs reads none of it).
-fn session_item_params(mut items: Vec<glyph_field::ItemParamsGpu>, group_count: usize) -> Vec<glyph_field::ItemParamsGpu> {
-    if group_count > items.len() {
-        let last = group_count as u32 - 1;
-        set_block_item(&mut items, last, glyph_field::ItemParamsGpu { group: last, ..Default::default() });
-    }
-    items
 }
 
 /// Stage an Agent Session and its Workdesk into a visual 3D scene with default options.

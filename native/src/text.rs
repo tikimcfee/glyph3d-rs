@@ -80,8 +80,10 @@ pub struct StagedText {
     pub pick: Option<PickContext>,
     /// Hierarchical layout controller and spatial scene graph (repo mode).
     pub controller: Option<crate::layout_stack::LayoutController>,
-    /// GPU layout parameters per item (file) for Derived render mode.
-    pub item_params: Vec<glyph_field::ItemParamsGpu>,
+    /// The views the producer staged, one per item (`crate::views`): each
+    /// one's buffer and bytes, recipe, group row, segment, slots and local
+    /// extent. The item table is written from it (`Views::item_table`).
+    pub views: crate::views::Views,
 }
 
 /// Stage F: one cull segment covering a whole staged block (the text/engine
@@ -538,17 +540,28 @@ pub fn stage_file(
         segments,
         pick: None,
         controller: None,
-        // One item per copy, each drawn with its own copy's group: the
+        // One view per copy, each drawn with its own copy's group row: the
         // Derived vertex stage reads the group from the item, so a shared
         // group 0 stacked every copy on copy 0 (2026-10-11, found when
-        // Derived became the default).
-        item_params: (0..copies)
-            .map(|copy| glyph_field::ItemParamsGpu {
-                line_height: line_h,
-                group: copy,
-                ..Default::default()
-            })
-            .collect(),
+        // Derived became the default). Every copy reads the one file and
+        // sits under the one cover segment.
+        views: crate::views::Views::new(
+            (0..copies)
+                .map(|copy| {
+                    let first_slot = copy * glyphs.len() as u32;
+                    crate::views::View {
+                        buffer: 0,
+                        bytes: 0..text.len() as u32,
+                        recipe: glyph_field::ItemParamsGpu { line_height: line_h, ..Default::default() },
+                        group_row: copy,
+                        segment: 0,
+                        slots: first_slot..first_slot + glyphs.len() as u32,
+                        local_min: [0.0, -block_h, z_lo],
+                        local_max: [block_w, line_h, z_hi],
+                    }
+                })
+                .collect(),
+        ),
     }
 }
 

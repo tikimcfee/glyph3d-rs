@@ -79,7 +79,13 @@ pub struct GlyphPlacement {
     pub glyph_id: u32,
     /// Packed RGBA8 (sRGB display values).
     pub color: u32,
+    /// The group row the glyph draws with (Instanced's group lane).
     pub group_id: u32,
+    /// The item-table row the glyph belongs to — its view (Derived's item
+    /// lane, which y and z derive from). Not the group: since the view
+    /// registry (2026-10-11) a view's group row is a field of it, not its
+    /// index, and until then Derived wrote `group_id` here.
+    pub item: u32,
     pub advance: f32,
     pub height: f32,
 }
@@ -197,6 +203,10 @@ pub struct LineRecord {
     pub item_idx: u32,
     pub row: u32,
 }
+
+/// "No item": a group row no single item draws with, in a field's
+/// group → item map (`FieldResources::item_of_group`).
+pub const NO_ITEM: u32 = u32::MAX;
 
 /// Layout parameters per item (file) on the GPU, 64 B (16 words).
 #[repr(C)]

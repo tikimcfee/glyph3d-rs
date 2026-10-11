@@ -222,7 +222,8 @@ pub(super) struct TreeCull {
 
 impl TreeCull {
     /// The tree cull for the library rooted at `root`, segment i being
-    /// `seg_nodes[i]`'s (a repo load: file i, group i).
+    /// `seg_nodes[i]`'s — the node of the group row its view draws with, as
+    /// the scene asks the view registry (`crate::views`).
     pub(super) fn new(t: &mut NodeTables, root: NodeHandle, seg_nodes: &[NodeHandle], cull: &CullState, group_rgb: &[[f32; 4]]) -> Self {
         t.ensure_order();
         let n_seg = cull.segments.len();
@@ -711,7 +712,9 @@ mod tests {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        let mut cull = CullState::new(&ctx, crate::glyph_scene::target::POOL_FORMAT, wgpu::TextureFormat::Depth32Float, &camera_buf, &segments, &groups);
+        // Segment i is file i's, drawn with group row i.
+        let segment_rows: Vec<Option<u32>> = (0..segments.len() as u32).map(Some).collect();
+        let mut cull = CullState::new(&ctx, crate::glyph_scene::target::POOL_FORMAT, wgpu::TextureFormat::Depth32Float, &camera_buf, &segments, &groups, &segment_rows);
         cull.backdrop_at_front = true;
         let rgb: Vec<[f32; 4]> = groups.iter().map(|g| g.cols[2]).collect();
         let mut tree = TreeCull::new(&mut t, lib.nodes.as_ref().unwrap().root, &file_nodes, &cull, &rgb);

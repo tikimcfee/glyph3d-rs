@@ -72,7 +72,9 @@ fn fixture(ctx: &crate::gpu::GpuContext, t: &mut NodeTables) -> Fixture {
         usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         mapped_at_creation: false,
     });
-    let cull = CullState::new(ctx, crate::glyph_scene::target::POOL_FORMAT, wgpu::TextureFormat::Depth32Float, &camera_buf, &segments, &groups);
+    // Segment i is file i's, drawn with group row i.
+    let segment_rows: Vec<Option<u32>> = (0..segments.len() as u32).map(Some).collect();
+    let cull = CullState::new(ctx, crate::glyph_scene::target::POOL_FORMAT, wgpu::TextureFormat::Depth32Float, &camera_buf, &segments, &groups, &segment_rows);
     let rgb: Vec<[f32; 4]> = groups.iter().map(|g| g.cols[2]).collect();
     let f = lib.face.expect("the default settings draw page faces");
     let face = [[-f.size[0] / 2.0, -f.size[1] / 2.0, -f.gap], [f.size[0] / 2.0, f.size[1] / 2.0, -f.gap]];

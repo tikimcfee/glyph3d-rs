@@ -542,6 +542,8 @@ impl Dummy {
             emoji_sampler: &self.sampler,
             glyph_advances: &self.glyph_advances,
             item_params,
+            // The Visible field transcodes no host records.
+            item_of_group: &[],
         }
     }
 }

@@ -50,7 +50,8 @@ impl DerivedField {
         // A device source for this field is the producer's direct Derived
         // emission (HyperLayout Pass 2), bound as-is. A host source
         // transcodes against the same item table.
-        let storage = SlotStorage::from_source(device, queue, source, &DerivedTranscode { item_params }, &LABELS);
+        let transcode = DerivedTranscode { item_params, item_of_group: resources.item_of_group };
+        let storage = SlotStorage::from_source(device, queue, source, &transcode, &LABELS);
 
         let item_table_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("derived item table"),
@@ -167,10 +168,10 @@ impl GlyphField for DerivedField {
         self.core.storage().write_field(queue, slot, ITEM_AND_GROUP_OFFSET, bytemuck::bytes_of(&lane));
     }
 
-    /// What a Derived slot can take from a placement: X, colour and group —
-    /// the group as the plain item lane (`GlyphPlacement::group_id` is the
-    /// item's own group, which is its index), so a recolour clears any
-    /// override the glyph had, as it replaced its group before.
+    /// What a Derived slot can take from a placement: X, colour and the
+    /// plain lane of its item (`GlyphPlacement::item` — its view; the group
+    /// it draws with is that item's, from the item table), so a recolour
+    /// clears any override the glyph had, as it replaced its group before.
     /// Its row and wrap segment are the producer's (Y/Z derive from them in
     /// the vertex stage) and the glyph id shares a word with the wrap, so
     /// those stay as loaded. Until 2026-10-09 this wrote whole slots with
@@ -182,7 +183,7 @@ impl GlyphField for DerivedField {
             let slot = first_slot + i as u32;
             storage.write_field(queue, slot, X_OFFSET, bytemuck::bytes_of(&p.position[0]));
             // w3 colour and w4 group are adjacent (pinned below): one write.
-            storage.write_field(queue, slot, COLOR_OFFSET, bytemuck::cast_slice(&[p.color, p.group_id]));
+            storage.write_field(queue, slot, COLOR_OFFSET, bytemuck::cast_slice(&[p.color, crate::derive::item_lane(p.item)]));
         }
     }
 
