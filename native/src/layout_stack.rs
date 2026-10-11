@@ -287,7 +287,7 @@ impl LayoutController {
                 shelf_zone_node,
                 v.rel_path.clone(),
                 v.dir.clone(),
-                i as u32,
+                v.group_id,
                 Transform::from_xyz(v.offset[0], v.offset[1], v.offset[2]),
                 ([0.0, -v.height, v.z_min], [v.width, 0.0, v.z_max]),
                 crate::repo::dir_tint(&v.dir),

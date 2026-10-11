@@ -169,10 +169,12 @@ impl GlyphScene {
         let Some((off, sc)) = self.nodes.world_offset_scale(gid).map(|(o, s)| (Vec3::from(o), Vec3::from(s))) else {
             return;
         };
+        // The drag plane goes through the first view drawn with the group.
         let center_local = self
             .pick
             .as_ref()
-            .and_then(|p| p.files.iter().find(|f| f.group_id == gid))
+            .zip(self.views.views_drawn_with(gid).first())
+            .and_then(|(p, &view)| p.files.get(view as usize))
             .map(|i| {
                 [
                     (i.aabb_min[0] + i.aabb_max[0]) * 0.5,
@@ -349,10 +351,11 @@ impl GlyphScene {
                 }
                 match &self.picked {
                     Some(h) => {
-                        self.grabbed_group = Some(h.group_id);
+                        let group_row = self.views.group_row(h.view);
+                        self.grabbed_group = Some(group_row);
                         println!(
-                            "grab: {} (group {}) — mouse drags it in the view plane, scroll scales, g releases",
-                            h.rel_path, h.group_id
+                            "grab: {} (group {group_row}) — mouse drags it in the view plane, scroll scales, g releases",
+                            h.rel_path
                         );
                     }
                     None => println!("grab: nothing picked (click a file or a region first)"),
@@ -369,7 +372,7 @@ impl GlyphScene {
                         let dir = h.rel_path.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
                         ctrl.zone_for_file(&h.rel_path, dir)
                     }
-                    None => format!("group:{}", h.group_id),
+                    None => format!("group:{}", self.views.group_row(h.view)),
                 });
                 // A picked region IS a directory: c takes it as g does.
                 let via = match (&self.picked_region, &self.picked) {

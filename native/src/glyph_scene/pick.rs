@@ -16,14 +16,13 @@ use crate::layout::{GlyphRecord, ItemParams};
 
 // ── Stage G — picking & manipulation types ─────────────────────────────────
 
-/// Per-file pick record: everything needed to (a) hit-test the file's AABB
-/// under the LIVE group TRS and (b) re-derive its glyph geometry via a
-/// deterministic engine re-run (`repo::rederive_cached` with `item`).
+/// Per-view pick record (`PickContext::files[view]`): everything needed to
+/// (a) hit-test the file's AABB under its group's LIVE TRS and (b) re-derive
+/// its glyph geometry via a deterministic engine re-run
+/// (`repo::rederive_cached` with `item`). The view's group row and slot
+/// range are the view registry's (`GlyphScene::views`), not copied here.
 pub struct PickFileInfo {
     pub rel_path: String,
-    pub group_id: u32,
-    pub slot_base: u32,
-    pub slot_count: u32,
     /// The exact engine params this file was laid out with.
     pub item: ItemParams,
     /// Local-space (pre-TRS) 3D AABB, same margins as the cull segment.
@@ -34,6 +33,7 @@ pub struct PickFileInfo {
 /// Repo-mode pick context (one per staged scene).
 pub struct PickContext {
     pub root: PathBuf,
+    /// One record per view, indexed by view.
     pub files: Vec<PickFileInfo>,
     pub content: Option<std::collections::HashMap<String, std::sync::Arc<Vec<u8>>>>,
     pub folds: std::collections::HashMap<String, Vec<std::ops::Range<u32>>>,
@@ -44,7 +44,7 @@ pub struct PickContext {
 pub enum PickCommand {
     /// Group-level pick: first file whose rel path contains the substring.
     File(String),
-    /// Group-level pick: exact group ID.
+    /// Group-level pick: the first view drawn with this group row.
     Group(u32),
     /// Deterministic glyph pick: exact folded (row, col) within that file.
     RowCol { file: String, row: u32, col: u32 },
@@ -110,10 +110,12 @@ pub struct PickGlyph {
     pub height: f32,
 }
 
-/// A resolved pick: always the file; the glyph when one is close enough.
+/// A resolved pick: always the file's view; the glyph when one is close
+/// enough. The view's group row, slots and segment are asked of the view
+/// registry when a verb needs them.
 #[derive(Clone)]
 pub struct PickHit {
-    pub group_id: u32,
+    pub view: u32,
     pub rel_path: String,
     pub glyph: Option<PickGlyph>,
 }
@@ -121,7 +123,7 @@ pub struct PickHit {
 /// Per-file pick cache: the re-derived records plus the CPU-side walks over
 /// the file bytes, all indexed by record (== leader) index.
 pub(super) struct PickCacheEntry {
-    group_id: u32,
+    view: u32,
     records: Vec<GlyphRecord>,
     /// (byte offset, codepoint) per record.
     leaders: Vec<(usize, u32)>,
@@ -136,11 +138,11 @@ pub(super) struct PickCacheEntry {
 // ── M3: the Visible field's keys — (item, byte) in place of a slot ─────────
 //
 // The Visible field keeps no slot per glyph, so everything the scene keyed by
-// slot is re-keyed there by the item (the file's index in the load, == its
-// group id at load) and the glyph's LEADER byte offset within the file. The
-// CPU pick already yields both (`PickFileInfo::group_id`, `PickGlyph::byte_off`);
-// the helpers below are the pure half, so a test can hold the construction
-// without a device.
+// slot is re-keyed there by the item (the picked VIEW — a view's index is
+// its item row, `crate::views`) and the glyph's LEADER byte offset within
+// the file. The CPU pick already yields both (`PickHit::view`,
+// `PickGlyph::byte_off`); the helpers below are the pure half, so a test can
+// hold the construction without a device.
 
 /// The selection a pick resolves to in the Visible field: a glyph with a
 /// slot is its own leader bytes `[byte, byte + utf8 len)`; a file-level pick
@@ -237,21 +239,15 @@ fn verb_name(verb: &Verb) -> &'static str {
 }
 
 impl GlyphScene {
-    /// The Visible field's key for the picked file: its item index (the
-    /// file's position in the load, == its group id at load). None for the
-    /// stored modes, which keep their slot paths.
-    pub(super) fn visible_item_of(&self, gid: u32) -> Option<u32> {
+    /// The Visible field's key for a picked view: its item, which IS the
+    /// view (a view's index is its item row, `crate::views`). None for the
+    /// stored modes, which keep their slot paths. Until the registry this
+    /// searched the pick records for the file whose group id matched (a
+    /// probe on `files[gid]` first, because the scan alone was 217 ms of a
+    /// library frame animating 29,377 files, E3b).
+    pub(super) fn visible_item(&self, view: u32) -> Option<u32> {
         self.field.visible()?;
-        let pctx = self.pick.as_ref()?;
-        // A repo load files item i under group i, so the direct probe answers
-        // every load group; the scan is for anything else. Measured
-        // 2026-10-10: the scan alone, once per moved group, was 217 ms of a
-        // library frame animating 29,377 files (O(N²)); the probe makes it
-        // vanish from the profile.
-        if pctx.files.get(gid as usize).is_some_and(|f| f.group_id == gid) {
-            return Some(gid);
-        }
-        pctx.files.iter().position(|f| f.group_id == gid).map(|i| i as u32)
+        Some(view)
     }
 
     /// Merge `edit` into the glyph's override (the scene's map is the source
@@ -270,18 +266,19 @@ impl GlyphScene {
         ov
     }
 
-    /// Ensure the one-entry pick cache holds `gid`'s re-derived file data:
+    /// Ensure the one-entry pick cache holds `view`'s re-derived file data:
     /// records (bit-identical engine re-run) + the CPU byte walks. The fold
     /// cross-check (CPU row/col vs engine ROW/COL lanes, every record) is the
     /// standing pick-correctness gate and runs on every cache fill.
-    fn ensure_pick_cache(&mut self, gid: u32) -> bool {
-        if self.cache.as_ref().is_some_and(|c| c.group_id == gid) {
+    fn ensure_pick_cache(&mut self, view: u32) -> bool {
+        if self.cache.as_ref().is_some_and(|c| c.view == view) {
             return true;
         }
         let Some(pctx) = &self.pick else { return false };
-        let Some(info) = pctx.files.iter().find(|f| f.group_id == gid) else {
+        let Some(info) = pctx.files.get(view as usize) else {
             return false;
         };
+        let slots = self.views.slots(view);
         let t = std::time::Instant::now();
         let bytes: std::sync::Arc<Vec<u8>> = if let Some(owned) = pctx
             .content
@@ -316,14 +313,14 @@ impl GlyphScene {
             }
         }
         let mut slot_of = vec![u32::MAX; records.len()];
-        let mut k = info.slot_base;
+        let mut k = slots.start;
         for (i, r) in records.iter().enumerate() {
             if r.glyph_id() != 0 {
                 slot_of[i] = k;
                 k += 1;
             }
         }
-        debug_assert_eq!(k, info.slot_base + info.slot_count);
+        debug_assert_eq!(k, slots.end);
         log::info!(
             "pick cache: {} — {} records re-derived in {:.1?} ({} B) | fold cross-check: {} ({} mismatch)",
             info.rel_path,
@@ -337,7 +334,7 @@ impl GlyphScene {
             log::warn!("pick: fold/engine row-col mismatch on {} — char resolution unreliable", info.rel_path);
         }
         self.cache = Some(PickCacheEntry {
-            group_id: gid,
+            view,
             records,
             leaders,
             lines,
@@ -347,9 +344,9 @@ impl GlyphScene {
         true
     }
 
-    /// Build a PickGlyph for record `rec` of the cached file `gid`.
-    fn make_glyph(&self, gid: u32, rec: usize) -> Option<PickGlyph> {
-        let c = self.cache.as_ref().filter(|c| c.group_id == gid)?;
+    /// Build a PickGlyph for record `rec` of the cached view `view`.
+    fn make_glyph(&self, view: u32, rec: usize) -> Option<PickGlyph> {
+        let c = self.cache.as_ref().filter(|c| c.view == view)?;
         let r = c.records.get(rec)?;
         let (byte_off, cp) = c.leaders[rec];
         Some(PickGlyph {
@@ -410,15 +407,18 @@ impl GlyphScene {
         Some((eye, dir))
     }
 
-    /// Nearest non-hidden file whose live world AABB the ray pierces.
+    /// Nearest non-hidden view whose live world AABB the ray pierces: the
+    /// view, and the ray's entry t.
     fn ray_file(&self, ro: DVec3, rd: DVec3) -> Option<(u32, f64)> {
         let pctx = self.pick.as_ref()?;
         let mut best: Option<(u32, f64)> = None;
-        for info in &pctx.files {
-            if self.group_hidden(info.group_id) {
+        for (view, info) in pctx.files.iter().enumerate() {
+            let view = view as u32;
+            let gid = self.views.group_row(view);
+            if self.group_hidden(gid) {
                 continue;
             }
-            let Some(affine) = self.group_affine(info.group_id) else {
+            let Some(affine) = self.group_affine(gid) else {
                 continue;
             };
             let inv_affine = affine.inverse();
@@ -444,7 +444,7 @@ impl GlyphScene {
             let max = b_min.max(b_max);
             if let Some(t) = ray_aabb(ro_loc_d, rd_loc_d, min, max) {
                 if best.is_none_or(|(_, bt)| t < bt) {
-                    best = Some((info.group_id, t));
+                    best = Some((view, t));
                 }
             }
         }
@@ -460,7 +460,7 @@ impl GlyphScene {
             }
             return None;
         };
-        let Some((gid, t_aabb)) = self.ray_file(ro, rd) else {
+        let Some((view, t_aabb)) = self.ray_file(ro, rd) else {
             if dbg {
                 println!(
                     "pickdbg: px ({x},{y}) ro=({:.4},{:.4},{:.4}) rd=({:.6},{:.6},{:.6}) — no file AABB under the ray",
@@ -469,14 +469,8 @@ impl GlyphScene {
             }
             return None;
         };
-        let rel_path = self
-            .pick
-            .as_ref()?
-            .files
-            .iter()
-            .find(|f| f.group_id == gid)?
-            .rel_path
-            .clone();
+        let rel_path = self.pick.as_ref()?.files.get(view as usize)?.rel_path.clone();
+        let gid = self.views.group_row(view);
         let (_off, sc, _, _) = self.group_trs(gid)?;
         if dbg {
             println!(
@@ -484,9 +478,9 @@ impl GlyphScene {
                 ro.x, ro.y, ro.z, rd.x, rd.y, rd.z
             );
         }
-        if !self.ensure_pick_cache(gid) {
+        if !self.ensure_pick_cache(view) {
             return Some(PickHit {
-                group_id: gid,
+                view,
                 rel_path,
                 glyph: None,
             });
@@ -494,7 +488,7 @@ impl GlyphScene {
         let c = self.cache.as_ref().expect("cache populated: ensure_pick_cache just returned true");
         if c.records.is_empty() {
             return Some(PickHit {
-                group_id: gid,
+                view,
                 rel_path,
                 glyph: None,
             });
@@ -611,9 +605,9 @@ impl GlyphScene {
             );
         }
 
-        let glyph = chosen_rec.and_then(|rec| self.make_glyph(gid, rec));
+        let glyph = chosen_rec.and_then(|rec| self.make_glyph(view, rec));
         Some(PickHit {
-            group_id: gid,
+            view,
             rel_path,
             glyph,
         })
@@ -624,12 +618,11 @@ impl GlyphScene {
     /// with a warning if there is no exact record).
     fn pick_row_col(&mut self, file: &str, row: u32, col: u32) -> Option<PickHit> {
         let pctx = self.pick.as_ref()?;
-        let info = pctx.files.iter().find(|f| f.rel_path.contains(file))?;
-        let gid = info.group_id;
-        let rel_path = info.rel_path.clone();
-        if !self.ensure_pick_cache(gid) {
+        let view = pctx.files.iter().position(|f| f.rel_path.contains(file))? as u32;
+        let rel_path = pctx.files[view as usize].rel_path.clone();
+        if !self.ensure_pick_cache(view) {
             return Some(PickHit {
-                group_id: gid,
+                view,
                 rel_path,
                 glyph: None,
             });
@@ -664,9 +657,9 @@ impl GlyphScene {
             }
         }
         let idx = exact.or(nearest.map(|(_, i)| i));
-        let glyph = idx.and_then(|i| self.make_glyph(gid, i));
+        let glyph = idx.and_then(|i| self.make_glyph(view, i));
         if std::env::var_os("GLYPH_PICK_DEBUG").is_some() {
-            if let (Some((off, sc, _, _)), Some(g)) = (self.group_trs(gid), &glyph) {
+            if let (Some((off, sc, _, _)), Some(g)) = (self.group_trs(self.views.group_row(view)), &glyph) {
                 println!(
                     "pickdbg: target {rel_path} rec={} local=({:.4},{:.4}) adv={:.4} h={:.4} \
                      off=({:.4},{:.4},{:.4}) sc=({:.4},{:.4}) — world cell center ({:.4},{:.4})",
@@ -686,7 +679,7 @@ impl GlyphScene {
             }
         }
         Some(PickHit {
-            group_id: gid,
+            view,
             rel_path,
             glyph,
         })
@@ -710,23 +703,20 @@ impl GlyphScene {
             PickCommand::Clear => unreachable!(),
             PickCommand::Group(gid) => {
                 let pctx = self.pick.as_ref().expect("pick context checked Some at apply_pick entry");
-                pctx.files
-                    .iter()
-                    .find(|i| i.group_id == *gid)
-                    .map(|i| PickHit {
-                        group_id: i.group_id,
-                        rel_path: i.rel_path.clone(),
-                        glyph: None,
-                    })
+                self.views.views_drawn_with(*gid).first().map(|&view| PickHit {
+                    view,
+                    rel_path: pctx.files[view as usize].rel_path.clone(),
+                    glyph: None,
+                })
             }
             PickCommand::File(f) => {
                 let pctx = self.pick.as_ref().expect("pick context checked Some at apply_pick entry");
                 pctx.files
                     .iter()
-                    .find(|i| i.rel_path.contains(f.as_str()))
-                    .map(|i| PickHit {
-                        group_id: i.group_id,
-                        rel_path: i.rel_path.clone(),
+                    .position(|i| i.rel_path.contains(f.as_str()))
+                    .map(|view| PickHit {
+                        view: view as u32,
+                        rel_path: pctx.files[view].rel_path.clone(),
                         glyph: None,
                     })
             }
@@ -739,7 +729,7 @@ impl GlyphScene {
                 // a real slot selects that glyph; a file-level pick (or a
                 // blank glyph, which has no slot) selects the whole segment.
                 self.selection = self.selection_from_hit(&h);
-                let line = format_pick(&h);
+                let line = format_pick(&h, self.views.group_row(h.view));
                 self.picked = Some(h);
                 Some(line)
             }
@@ -808,9 +798,9 @@ impl GlyphScene {
         // picked glyph's leader bytes, or the whole item for a file-level
         // (or blank-glyph) pick — the length comes from the pick cache, which
         // a glyph pick has already filled and a file pick fills here.
-        if let Some(item) = self.visible_item_of(h.group_id) {
+        if let Some(item) = self.visible_item(h.view) {
             let whole_item = !h.glyph.as_ref().is_some_and(|g| g.slot.is_some());
-            let byte_len = (whole_item && self.ensure_pick_cache(h.group_id))
+            let byte_len = (whole_item && self.ensure_pick_cache(h.view))
                 .then(|| self.cache.as_ref().map(|c| c.byte_len as u32))
                 .flatten();
             return Some(byte_range_selection(item, h.glyph.as_ref(), byte_len));
@@ -824,13 +814,9 @@ impl GlyphScene {
                 });
             }
         }
-        // File-level (or blank-glyph) pick: the whole segment's slot range.
-        self.pick
-            .as_ref()?
-            .files
-            .iter()
-            .find(|f| f.group_id == h.group_id)
-            .map(|f| Selection::Segment { slot_base: f.slot_base, slot_count: f.slot_count })
+        // File-level (or blank-glyph) pick: the view's whole slot range.
+        let slots = self.views.slots(h.view);
+        Some(Selection::Segment { slot_base: slots.start, slot_count: slots.end - slots.start })
     }
 
     /// Upload one edited group row (96 B) — never the whole table.
@@ -855,7 +841,8 @@ impl GlyphScene {
             // The whole row goes up (clip and background are not the
             // tree's), and the row becomes a node like every other group.
             self.write_group_row(ctx, gid);
-            debug_assert_eq!(self.nodes.len(), gid as usize, "group ids and nodes stay in step");
+            // Two tables keyed by group row, kept in step: no view enters here.
+            debug_assert_eq!(self.nodes.len(), gid as usize, "group rows and nodes stay in step");
             self.nodes.push_row(&row);
             return Some(gid);
         }
@@ -877,9 +864,9 @@ impl GlyphScene {
         }
     }
 
-    /// A group verb has written group `gid`'s node: refresh the CPU mirror
-    /// from the tables (what the GPU will resolve) and re-derive its cull
-    /// segment from it.
+    /// A group verb has written group row `gid`'s node: refresh the CPU
+    /// mirror from the tables (what the GPU will resolve) and re-derive the
+    /// cull segments that follow it.
     pub(super) fn group_node_edited(&mut self, ctx: &GpuContext, gid: u32) {
         if let Some(row) = self.groups_cpu.get_mut(gid as usize) {
             self.nodes.mirror(gid, row);
@@ -887,14 +874,18 @@ impl GlyphScene {
         self.sync_segment(ctx, gid);
     }
 
-    /// Re-derive a cull segment from the live group TRS: the world AABB
-    /// follows offset/scale, and the backdrop tint follows the group color
-    /// relative to its as-staged value (so untouched segments keep their
-    /// Stage F-fitted tint exactly). The Visible field needs nothing from
-    /// here: its item cull carries each item's LOCAL box through the live
-    /// group row (2026-10-10; until then every call pushed a 24 B world box,
-    /// ~23 ms a frame with 29k files animating). `_ctx` stays for the
-    /// callers' sake.
+    /// Re-derive the cull segments that follow group row `gid` (each
+    /// one whose views all draw with it, `Views::segments_following`) from
+    /// the live group TRS: the world AABB follows offset/scale, and the
+    /// backdrop tint follows the group color relative to its as-staged value
+    /// (so untouched segments keep their Stage F-fitted tint exactly). Until
+    /// the view registry (2026-10-11) this re-derived the segment whose index
+    /// was the group row's — right only while every file's segment and group
+    /// row were its index. The Visible
+    /// field needs nothing from here: its item cull carries each item's
+    /// LOCAL box through the live group row (2026-10-10; until then every
+    /// call pushed a 24 B world box, ~23 ms a frame with 29k files
+    /// animating). `_ctx` stays for the callers' sake.
     pub(super) fn sync_segment(&mut self, _ctx: &GpuContext, gid: u32) {
         let Some(g) = self.groups_cpu.get(gid as usize).copied() else {
             return;
@@ -905,10 +896,11 @@ impl GlyphScene {
             g.cols[3][1].max(0.0),
             g.cols[3][2].max(0.0),
         );
-        let i = gid as usize;
-        if let Some(cull) = &mut self.cull {
+        let Some(cull) = &mut self.cull else { return };
+        for segment in self.views.segments_following(gid) {
+            let i = segment as usize;
             if i >= cull.segments.len() {
-                return;
+                continue;
             }
             cull.segments[i].min = [
                 cull.local_min[i][0] * sx + ox,
@@ -959,7 +951,9 @@ impl GlyphScene {
         let Some(hit) = &self.picked else {
             return "verb: nothing picked yet — ignored".to_string();
         };
-        let gid = hit.group_id;
+        let view = hit.view;
+        // The group verbs edit the group row the picked view draws with.
+        let gid = self.views.group_row(view);
         let rel = hit.rel_path.clone();
         let glyph = hit.glyph.clone();
         // The glyph verbs address a SLOT; the Visible field has none (its
@@ -967,7 +961,7 @@ impl GlyphScene {
         // (item, byte) instead — `apply_glyph_verb_visible`. The group verbs
         // edit the group table either way and share the path below (where
         // `sync_segment` and `SetHidden` also tell the field).
-        if let Some(item) = self.visible_item_of(gid) {
+        if let Some(item) = self.visible_item(view) {
             if matches!(
                 verb,
                 Verb::RecolorGlyph(_)
@@ -1005,7 +999,7 @@ impl GlyphScene {
                     return format!("verb recolor-line: {rel} pick has no glyph");
                 };
                 let row = g.row;
-                if !self.ensure_pick_cache(gid) {
+                if !self.ensure_pick_cache(view) {
                     return format!("verb recolor-line: {rel} pick cache unavailable");
                 }
                 let c = self.cache.as_ref().expect("cache populated: ensure_pick_cache just returned true");
@@ -1041,6 +1035,7 @@ impl GlyphScene {
                         glyph_id: r.glyph_id(),
                         color: packed,
                         group_id: gid,
+                        item: view,
                         advance,
                         height,
                     };
@@ -1188,14 +1183,12 @@ impl GlyphScene {
                 let Some(slot) = g.slot else {
                     return format!("verb set-glyph-background: {rel} '{}' is blank (no instance)", g.ch);
                 };
-                // Read the glyph's CURRENT group (to inherit its TRS/tint)
-                let current_gid = gid;
-                
-                let mut row = self.groups_cpu.get(current_gid as usize).copied().unwrap_or(crate::glyph_scene::GroupRow::identity([0.0; 3]));
+                // The view's group row: the new row inherits its TRS and tint.
+                let mut row = self.groups_cpu.get(gid as usize).copied().unwrap_or(crate::glyph_scene::GroupRow::identity([0.0; 3]));
                 row.cols[5] = *bg_rgba; // Set background color
                 
                 if let Some(new_gid) = self.allocate_group_row(ctx, row) {
-                    self.field.write_group_id(&ctx.queue, slot, gid, new_gid);
+                    self.field.write_group_id(&ctx.queue, slot, view, new_gid);
                     format!("verb set-glyph-background: {rel} row {} col {} slot {slot} -> group {new_gid}", g.row, g.col)
                 } else {
                     format!("verb set-glyph-background: {rel} out of groups (max {})", self.group_buf.size() / 96)
@@ -1214,7 +1207,7 @@ impl GlyphScene {
                 row.cols[3] = [s[0], s[1], s[2], row.cols[3][3]];
                 
                 if let Some(new_gid) = self.allocate_group_row(ctx, row) {
-                    self.field.write_group_id(&ctx.queue, slot, gid, new_gid);
+                    self.field.write_group_id(&ctx.queue, slot, view, new_gid);
                     format!("verb set-glyph-transform: {rel} row {} col {} slot {slot} -> group {new_gid}", g.row, g.col)
                 } else {
                     format!("verb set-glyph-transform: {rel} out of groups (max {})", self.group_buf.size() / 96)
@@ -1227,8 +1220,8 @@ impl GlyphScene {
                 let Some(slot) = g.slot else {
                     return format!("verb reset-glyph-group: {rel} '{}' is blank (no instance)", g.ch);
                 };
-                // Reset to the file's original group
-                self.field.write_group_id(&ctx.queue, slot, gid, gid);
+                // Back to the group row the view draws with.
+                self.field.write_group_id(&ctx.queue, slot, view, gid);
                 format!("verb reset-glyph-group: {rel} row {} col {} slot {slot} -> group {gid}", g.row, g.col)
             }
             Verb::Library(_) => unreachable!("apply_verb answers the library verbs before the pick check"),
@@ -1239,21 +1232,32 @@ impl GlyphScene {
                 if let Some(g) = self.groups_cpu.get_mut(gid as usize) {
                     self.nodes.mirror(gid, g);
                 }
+                // The cull skips every segment that follows the group.
                 if let Some(cull) = &mut self.cull {
-                    if (gid as usize) < cull.hidden.len() {
-                        cull.hidden[gid as usize] = *hide;
+                    for segment in self.views.segments_following(gid) {
+                        if let Some(hidden) = cull.hidden.get_mut(segment as usize) {
+                            *hidden = *hide;
+                        }
                     }
                 }
-                // The Visible field culls its items itself: tell it, so the
-                // item leaves (or rejoins) every tier and the HUD's counts move.
-                let item_note = match self.visible_item_of(gid) {
-                    Some(item) => {
-                        if let Some(visible) = self.field.visible() {
+                // The Visible field culls its items itself: tell it about
+                // every view drawn with the group, so each item leaves (or
+                // rejoins) every tier and the HUD's counts move.
+                let items: Vec<u32> = match self.field.visible() {
+                    Some(visible) => {
+                        let items = self.views.views_drawn_with(gid).to_vec();
+                        for &item in &items {
                             visible.set_item_hidden(&ctx.queue, item, *hide);
                         }
-                        format!("; item {item} hidden={hide}")
+                        items
                     }
-                    None => String::new(),
+                    None => Vec::new(),
+                };
+                let item_note = if items.is_empty() {
+                    String::new()
+                } else {
+                    let list: Vec<String> = items.iter().map(u32::to_string).collect();
+                    format!("; item {} hidden={hide}", list.join(","))
                 };
                 format!(
                     "verb {}: {rel} group {gid} (alpha -> {}, 32 B appearance row; cull skips the segment{item_note})",
@@ -1278,7 +1282,8 @@ impl GlyphScene {
     /// the item and byte it applied to.
     fn apply_glyph_verb_visible(&mut self, ctx: &GpuContext, item: u32, verb: &Verb) -> String {
         let hit = self.picked.clone().expect("apply_glyph_verb_visible: caller checked the pick");
-        let gid = hit.group_id;
+        let view = hit.view;
+        let gid = self.views.group_row(view);
         let rel = hit.rel_path;
         let name = verb_name(verb);
         let Some(g) = hit.glyph else {
@@ -1305,7 +1310,7 @@ impl GlyphScene {
             }
             Verb::RecolorLine(rgb) => {
                 let rgb = rgb.unwrap_or(crate::config::settings().verbs.recolor_line);
-                if !self.ensure_pick_cache(gid) {
+                if !self.ensure_pick_cache(view) {
                     return format!("verb recolor-line: {rel} pick cache unavailable");
                 }
                 let c = self.cache.as_ref().expect("cache populated: ensure_pick_cache just returned true");
@@ -1404,14 +1409,16 @@ pub(super) fn ray_aabb(ro: DVec3, rd: DVec3, min: DVec3, max: DVec3) -> Option<f
     Some(t0)
 }
 
-/// One-line pick report: file, group, folded row/col, source line, byte
-/// offset, the actual character, and the arena slot.
-pub(super) fn format_pick(h: &PickHit) -> String {
+/// One-line pick report: file, view, the group row it draws with, folded
+/// row/col, source line, byte offset, the actual character, and the arena
+/// slot.
+pub(super) fn format_pick(h: &PickHit, gid: u32) -> String {
     match &h.glyph {
         Some(g) => format!(
-            "pick: {} group={} rec={} row={} col={} line={} byte={} char={:?} slot={} pos=({:.2},{:.2},{:.2})",
+            "pick: {} view={} group={} rec={} row={} col={} line={} byte={} char={:?} slot={} pos=({:.2},{:.2},{:.2})",
             h.rel_path,
-            h.group_id,
+            h.view,
+            gid,
             g.record,
             g.row,
             g.col,
@@ -1424,8 +1431,8 @@ pub(super) fn format_pick(h: &PickHit) -> String {
             g.pos[2],
         ),
         None => format!(
-            "pick: {} group={} (file-level pick, no glyph resolved)",
-            h.rel_path, h.group_id
+            "pick: {} view={} group={} (file-level pick, no glyph resolved)",
+            h.rel_path, h.view, gid
         ),
     }
 }

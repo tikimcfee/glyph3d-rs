@@ -324,7 +324,7 @@ pub(super) fn render_scene(
         p.yaw = scene.fly.yaw;
         p.pitch = scene.fly.pitch;
         p.environment = scene.environment.mode.get();
-        p.last_pick = scene.picked.as_ref().map(format_pick);
+        p.last_pick = scene.picked.as_ref().map(|h| format_pick(h, scene.views.group_row(h.view)));
         p.selection = scene.selection.as_ref().map(Selection::describe);
         p.pick_key = scene.picked.as_ref().map(|h| match &h.glyph {
             Some(g) => format!("{} byte {}", h.rel_path, g.byte_off),
@@ -337,7 +337,7 @@ pub(super) fn render_scene(
                 let dir = h.rel_path.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
                 ctrl.zone_for_file(&h.rel_path, dir)
             } else {
-                format!("group:{}", h.group_id)
+                format!("group:{}", scene.views.group_row(h.view))
             }
         });
         p.carrel = scene.controller.as_ref().and_then(|ctrl| {

@@ -803,12 +803,19 @@ fn derived_positions_match_the_staged_ones() {
     rev_engine.ingest_session(&session);
 
     let staged = stage_agent_session(Some(crate::atlas::default_trie_ref()), &[], session, rev_engine);
-    let items = &staged.item_params;
+    // The item table and the group → item map, as the scene builds them from
+    // the view registry (`GlyphScene::new`).
+    let items = &staged.views.item_table();
+    let item_of_group = staged.views.item_of_group_rows(staged.groups.len());
     let instances = staged.instances.instances();
     assert!(!instances.is_empty(), "the session staged glyphs");
-    assert_eq!(items.len(), staged.groups.len(), "one item per group row");
+    // One item per block, no padding (until the view registry, 2026-10-11,
+    // the table had one row per GROUP, so a group id could be read as an
+    // item): row 0 and every group that holds no block have none.
+    assert_eq!(items.len(), staged.views.len(), "one item per view");
+    assert!(items.len() < staged.groups.len(), "{} items for {} group rows: the table is padded again", items.len(), staged.groups.len());
     let item_groups: Vec<u32> = items.iter().map(|p| p.group).collect();
-    let transcode = glyph_field_derived::upload::DerivedTranscode { item_params: items };
+    let transcode = glyph_field_derived::upload::DerivedTranscode { item_params: items, item_of_group: &item_of_group };
 
     let mut off_origin_groups = std::collections::BTreeSet::new();
     let mut rows_below_origin = 0usize;

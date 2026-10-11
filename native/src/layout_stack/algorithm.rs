@@ -232,7 +232,7 @@ impl LayoutController {
                     zone_node,
                     views[file_view_idx].rel_path.clone(),
                     v.dir.clone(),
-                    file_view_idx as u32,
+                    v.group_id,
                     Transform::from_xyz(rel_x, rel_y, 0.0),
                     ([0.0, -v.height, v.z_min], [v.width, 0.0, v.z_max]),
                     tint,

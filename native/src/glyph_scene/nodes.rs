@@ -1,7 +1,9 @@
 //! The scene's group rows as nodes of the transform tree (2026-10-10;
 //! step 1 of `out/DESIGN-VIEWS-AND-TRANSFORMS-2026-10-10.md`, transitional
 //! form). `crates/glyph-scene-graph` holds the tables and the resolve pass;
-//! this module maps the renderer's group ids onto it.
+//! this module maps the renderer's group rows onto it. Everything here is
+//! keyed by GROUP ROW (`gid`), never by view: which group row a view draws
+//! with is the view registry's answer (`crate::views`).
 //!
 //! **Every group row is a node** whose parent is one identity root, and
 //! each node routes its resolved world transform and appearance into its
@@ -243,11 +245,6 @@ impl GroupNodes {
     /// Group `gid`'s node.
     pub(crate) fn node(&self, gid: u32) -> Option<NodeHandle> {
         self.nodes.get(gid as usize).copied()
-    }
-
-    /// Group ids `0..n` — a repo load's files — as nodes, in group order.
-    pub(crate) fn file_nodes(&self, n: usize) -> &[NodeHandle] {
-        &self.nodes[..n]
     }
 
     /// Note moved nodes whose subtrees' group rows the CPU mirror will take

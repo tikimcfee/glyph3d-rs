@@ -182,7 +182,13 @@ pub struct GlyphScene {
     /// `nodes.rs`): the group verbs write its tables, and its resolve pass
     /// writes the rows' transform and appearance columns on the GPU.
     pub(crate) nodes: nodes::GroupNodes,
-    /// Repo-mode pick context (None for text/engine scenes).
+    /// The view registry (`crate::views`): per view — the unit picked,
+    /// culled and edited, whose index is its item row — its group row,
+    /// node, segment and slots. Everything that relates a view to the
+    /// tables above asks here.
+    pub(crate) views: crate::views::Views,
+    /// Repo-mode pick context (None for text/engine scenes); `files[view]`
+    /// is view `view`'s pick record.
     pub(crate) pick: Option<PickContext>,
     /// The panel's cluster-toggle seed for scenes WITHOUT a pick context
     /// (text): the staging choice carries the mode and nothing else on the
@@ -382,10 +388,11 @@ impl GlyphScene {
         self.group_trs(gid).is_some_and(|(_, _, _, a)| a <= 0.01)
     }
 
-    /// Group ID of the currently selected file or glyph, if any selection is active.
+    /// The group row of the currently selected file or glyph's view, if any
+    /// selection is active.
     pub fn selected_group_id(&self) -> Option<u32> {
         if self.selection.is_some() {
-            self.picked.as_ref().map(|p| p.group_id)
+            self.picked.as_ref().map(|p| self.views.group_row(p.view))
         } else {
             None
         }

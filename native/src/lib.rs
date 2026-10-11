@@ -28,6 +28,7 @@ pub mod scene;
 pub mod seam;
 pub mod spatial_scene;
 pub mod text;
+pub mod views;
 pub mod windowed;
 
 pub use atlas::default_trie;

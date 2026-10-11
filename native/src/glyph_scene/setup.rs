@@ -71,12 +71,16 @@ impl GlyphScene {
         // The rows as nodes under an identity root: the first frame's resolve
         // rewrites columns 0-3 of every row with the bits uploaded here.
         let mut nodes = super::nodes::GroupNodes::new(device, &group_buf, max_groups as u32, &groups);
+        // Each view's node is its group row's (`crate::views`).
+        let mut views = staged.views;
+        views.attach_nodes(|group_row| nodes.node(group_row));
         // A library load moves its hierarchy onto those nodes (2026-10-10):
-        // file i's group node goes under its page's mount, and the library
-        // eases its directories and sheets by writing their local rows. Its
-        // page faces are drawn from the sheets' resolved worlds.
+        // file i's node — view i's — goes under its page's mount, and the
+        // library eases its directories and sheets by writing their local
+        // rows. Its page faces are drawn from the sheets' resolved worlds.
         let library_faces = staged.controller.as_mut().and_then(|c| c.library.as_mut()).and_then(|lib| {
-            let files = nodes.file_nodes(lib.file_count()).to_vec();
+            assert_eq!(lib.file_count(), views.len(), "a library load registers one view per file");
+            let files = views.nodes().to_vec();
             let root = nodes.root();
             lib.attach(nodes.tables_mut(), Some(root), &files);
             let spec = lib.face?;
@@ -166,6 +170,11 @@ impl GlyphScene {
         });
         let glyph_map_view = atlas.glyphmap.create_view(&Default::default());
         let curves_view = atlas.curves.create_view(&Default::default());
+        // The item table is the registry's (one row per view, its group lane
+        // the view's group row), and so is the map a host record's group
+        // row is read through to find its item.
+        let item_table = views.item_table();
+        let item_of_group = views.item_of_group_rows(groups.len());
         let resources = FieldResources {
             frame_uniform: &camera_buf,
             group_table: &group_buf,
@@ -175,7 +184,8 @@ impl GlyphScene {
             emoji_sheet: &emoji_view,
             emoji_sampler: &emoji_sampler,
             glyph_advances: &atlas.glyph_advances,
-            item_params: &staged.item_params,
+            item_params: &item_table,
+            item_of_group: &item_of_group,
         };
         let depth_format = wgpu::TextureFormat::Depth32Float;
         let targets = FieldTargets {
@@ -358,6 +368,10 @@ impl GlyphScene {
         // module header), so Stage F culls on the CPU instead; --no-cull
         // keeps the legacy per-chunk full draws for A/B.
         let mut library_regions = None;
+        // Each segment's group row, as the registry answers it: the one its
+        // views share, or none (a cover segment over several groups, a
+        // segment no view uses).
+        let segment_group_rows: Vec<Option<u32>> = (0..segments.len() as u32).map(|s| views.group_row_of_segment(s)).collect();
         let cull = if cull_enabled {
             let mut cull = CullState::new(
                 ctx,
@@ -366,12 +380,16 @@ impl GlyphScene {
                 &camera_buf,
                 &segments,
                 &groups,
+                &segment_group_rows,
             );
             let library_root = staged.controller.as_ref().and_then(|c| c.library.as_ref()).and_then(|l| l.nodes.as_ref()).map(|n| n.root);
             cull.backdrop_at_front = library_root.is_some();
             if let Some(root) = library_root {
-                let seg_nodes = nodes.file_nodes(segments.len().min(nodes.len())).to_vec();
-                let rgb: Vec<[f32; 4]> = groups.iter().map(|g| g.cols[2]).collect();
+                // Segment i's node and staged colour, through its group row
+                // (a library load: file i's view).
+                let seg_nodes: Vec<_> = segment_group_rows.iter().map_while(|g| g.and_then(|g| nodes.node(g))).collect();
+                let rgb: Vec<[f32; 4]> =
+                    segment_group_rows.iter().map(|g| g.and_then(|g| groups.get(g as usize)).map_or([1.0; 4], |row| row.cols[2])).collect();
                 let mut tree = super::tree_cull::TreeCull::new(nodes.tables_mut(), root, &seg_nodes, &cull, &rgb);
                 // Bounding regions (2026-10-10, regions.rs): each directory's
                 // box is its tree-cull box padded, so the cull logs its
@@ -402,6 +420,9 @@ impl GlyphScene {
         let composite = pipelines::build_composite_state(device, color_format, mask_pipeline);
 
         let pick = staged.pick;
+        if let Some(pctx) = &pick {
+            assert_eq!(pctx.files.len(), views.len(), "a pick record per view: PickContext::files is indexed by view");
+        }
         let controller = staged.controller;
         let groups_cpu = groups.clone();
         let tint_step = vec![0u32; groups.len()];
@@ -428,6 +449,7 @@ impl GlyphScene {
             group_buf,
             groups_cpu,
             nodes,
+            views,
             pick,
             probe_cluster_mode: None,
             probe_layout_mode: None,

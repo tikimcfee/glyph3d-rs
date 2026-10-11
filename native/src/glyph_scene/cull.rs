@@ -472,6 +472,7 @@ impl CullState {
         camera_buf: &wgpu::Buffer,
         segments: &[SegCull],
         groups: &[GroupRow],
+        segment_group_rows: &[Option<u32>],
     ) -> Self {
         let device = &ctx.device;
         let seg_count = segments.len() as u32;
@@ -480,6 +481,10 @@ impl CullState {
         // group offset) / group scale. Every group but a library file's is
         // at scale 1 at staging, where this is the old `world − offset` bit
         // for bit; the library stages its fit scale in the group (2026-10-10).
+        // A segment's group is the row its views draw with (the view
+        // registry's answer, `segment_group_rows`; until 2026-10-11 it was
+        // read as row i for segment i); a segment with none — a cover
+        // segment over several groups, one no view uses — is world space.
         let mut local_min = Vec::with_capacity(segments.len());
         let mut local_max = Vec::with_capacity(segments.len());
         let mut local_blocks = Vec::with_capacity(segments.len());
@@ -487,12 +492,11 @@ impl CullState {
         let mut orig_group_rgb = Vec::with_capacity(segments.len());
         let mut em_scale = Vec::with_capacity(segments.len());
         for (i, seg) in segments.iter().enumerate() {
-            let off = groups
-                .get(i)
+            let group = segment_group_rows.get(i).copied().flatten().and_then(|g| groups.get(g as usize));
+            let off = group
                 .map(|g| [g.cols[0][0], g.cols[0][1], g.cols[0][2]])
                 .unwrap_or([0.0, 0.0, 0.0]);
-            let sc = groups
-                .get(i)
+            let sc = group
                 .map(|g| [g.cols[3][0], g.cols[3][1], g.cols[3][2]])
                 .filter(|s| s.iter().all(|&c| c > 0.0))
                 .unwrap_or([1.0, 1.0, 1.0]);
@@ -511,8 +515,7 @@ impl CullState {
             local_blocks.push(lblks);
             base_tint.push(seg.tint);
             orig_group_rgb.push(
-                groups
-                    .get(i)
+                group
                     .map(|g| [g.cols[2][0], g.cols[2][1], g.cols[2][2]])
                     .unwrap_or([1.0, 1.0, 1.0]),
             );

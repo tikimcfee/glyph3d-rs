@@ -35,7 +35,9 @@ pub(super) struct MoveCost {
 
 impl GlyphScene {
     pub(super) fn apply_library_verb(&mut self, verb: &LibraryVerb) -> String {
-        let picked = self.picked.as_ref().map(|h| h.group_id as usize);
+        // The library's file index is the view's (one view per file, in
+        // file order).
+        let picked = self.picked.as_ref().map(|h| h.view as usize);
         let Some(ctrl) = self.controller.as_mut() else {
             return "library: not a repo scene".to_string();
         };

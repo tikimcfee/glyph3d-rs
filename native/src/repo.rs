@@ -6,10 +6,12 @@
 //! glyph arena. The backend writes instances straight into the arena; only a
 //! `--repo-verify` run asks it for the 32 B wire records as well.
 //! `--repo-engine` selects; `--repo-verify` diffs against a recording
-//! `HyperLayout` reference. Each file is a GROUP
-//! (group_id == file index) placed on a 2D grid of code pages; files are
-//! views {slot_base/count, engine params} into the shared arena — the
-//! web's MegaGlyphField architecture (one arena, files as views).
+//! `HyperLayout` reference. Each file is one VIEW (`crate::views`: its
+//! item row is the file's index) drawn with its own GROUP row, placed on a
+//! 2D grid of code pages; files are views {slot range, engine params} into
+//! the shared arena — the web's MegaGlyphField architecture (one arena,
+//! files as views). The group row is the file's index too, except under the
+//! registry's witness (`group_rows_of_files`); nothing downstream assumes it.
 //!
 //! Correctness guards:
 //! - only valid UTF-8 files reach the layout (valid UTF-8 cannot decode a
@@ -315,7 +317,10 @@ pub struct FileView {
     pub rel_path: String,
     /// Parent directory (relative) — the group-tint key.
     pub dir: String,
+    /// The group row the file draws with (`group_rows_of_files`).
     pub group_id: u32,
+    /// The file's length in bytes.
+    pub byte_len: usize,
     pub record_count: usize,
     /// Render-arena range (instances; blanks/missing are dropped from it).
     pub slot_base: usize,
@@ -539,6 +544,10 @@ pub fn load_repo_from_prefetched(
         ColorMode::Flat => Paint::Flat(crate::layout::DEFAULT_COLOR_PACKED),
     };
 
+    // Each file's group row: its own index, unless the permutation witness
+    // asks otherwise (`group_rows_of_files`). The layout writes it into the
+    // Instanced slots' group lane; the view registry carries it from here on.
+    let group_rows = group_rows_of_files(walk.files.len());
     let items: Vec<LayoutItem<'_>> = walk
         .files
         .iter()
@@ -546,7 +555,7 @@ pub fn load_repo_from_prefetched(
         .map(|(index, f)| LayoutItem {
             bytes: &f.bytes,
             params: file_params[index],
-            group_id: index as u32,
+            group_id: group_rows.of_file[index],
             paint: paint_mode,
         })
         .collect();
@@ -697,7 +706,7 @@ pub fn load_repo_from_prefetched(
                             row: r.row(),
                             col: r.col(),
                             color: crate::layout::DEFAULT_COLOR_PACKED,
-                            group_id: index as u32,
+                            group_id: group_rows.of_file[index],
                             advance: r.advance(),
                             height: r.height(),
                             flags: 0,
@@ -741,7 +750,7 @@ pub fn load_repo_from_prefetched(
     let sp_views = tracing::info_span!("repo.views").entered();
     let mut total_records = 0usize;
     let mut total_blanks = 0usize;
-    let mut views: Vec<FileView> = Vec::with_capacity(walk.files.len());
+    let mut file_views: Vec<FileView> = Vec::with_capacity(walk.files.len());
     for (index, f) in walk.files.iter().enumerate() {
         let placed = &placements[index];
         total_records += placed.record_count as usize;
@@ -753,10 +762,11 @@ pub fn load_repo_from_prefetched(
         let width = (ink.max[0] - ink.min[0]).max(0.0);
         let height = (ink.max[1] - ink.min[1]).max(0.0);
 
-        views.push(FileView {
+        file_views.push(FileView {
             rel_path: f.rel_path.clone(),
             dir: f.dir.clone(),
-            group_id: index as u32,
+            group_id: group_rows.of_file[index],
+            byte_len: f.bytes.len(),
             record_count: placed.record_count as usize,
             slot_base: placed.slot_base as usize,
             slot_count: placed.slot_count as usize,
@@ -787,7 +797,8 @@ pub fn load_repo_from_prefetched(
     let t = Instant::now();
     let sp_grid = tracing::info_span!("repo.layout").entered();
     let mut controller = crate::layout_stack::LayoutController::from_mode(params.layout_mode, *params);
-    let (groups, bounds_min, bounds_max) = controller.apply(&mut views);
+    let (rows_in_file_order, bounds_min, bounds_max) = controller.apply(&mut file_views);
+    let groups = group_rows.table(rows_in_file_order);
     drop(sp_grid);
     let layout_dur = t.elapsed();
 
@@ -811,7 +822,7 @@ pub fn load_repo_from_prefetched(
     RepoLoad {
         arena,
         groups,
-        files: views,
+        files: file_views,
         bounds_min,
         bounds_max,
         stats,
@@ -841,6 +852,10 @@ impl RepoLoad {
             self.bounds_max[0] - self.bounds_min[0],
             self.bounds_max[1] - self.bounds_min[1],
         );
+        // One view per file (`crate::views`), view i being file i — the
+        // item row of every per-item table here (the layout's placements,
+        // tints and blocks, the item table, the Visible items, the pick
+        // records) — and drawn with the file's group row, `v.group_id`.
         // Stage F: one cull segment per file — world AABB (group offset
         // applied, small margins for glyph overhang) + arena slot range +
         // the far-LOD backdrop tint derived from the file's own ink.
@@ -884,7 +899,7 @@ impl RepoLoad {
                 .get(v.group_id as usize)
                 .map_or([1.0; 3], |g| [g.cols[3][0], g.cols[3][1], g.cols[3][2]])
         };
-        let seg_of = |v: &FileView| {
+        let seg_of = |view: usize, v: &FileView| {
             let s = scale_of(v);
             let tint = if is_flat {
                 let area = (v.width as f64 * v.height as f64).max(1e-3);
@@ -893,7 +908,7 @@ impl RepoLoad {
                 let rgb = extension_tint(&v.rel_path);
                 [rgb[0], rgb[1], rgb[2], e as f32]
             } else {
-                let fast_tint = file_tints.and_then(|t| t.get(v.group_id as usize));
+                let fast_tint = file_tints.and_then(|t| t.get(view));
                 match fast_tint {
                     Some(acc) if !acc.has_emoji => {
                         let accum = crate::glyph_scene::SegTintAccum::from_parts(acc.sum, acc.cells, slot_ink);
@@ -909,7 +924,7 @@ impl RepoLoad {
                         // back, so Pass 2 captured this item's (glyph, color)
                         // pairs — its whole slot range, in slot order.
                         let emitted_pairs = emoji_tint_pairs
-                            .and_then(|e| e.get(v.group_id as usize))
+                            .and_then(|e| e.get(view))
                             .filter(|p| !p.is_empty());
                         if let Some(pairs) = emitted_pairs {
                             debug_assert_eq!(pairs.len(), v.slot_count * 2);
@@ -933,7 +948,7 @@ impl RepoLoad {
                     }
                 }
             };
-            let fast_blocks = file_blocks.and_then(|fb| fb.get(v.group_id as usize));
+            let fast_blocks = file_blocks.and_then(|fb| fb.get(view));
             let blocks = if visible {
                 Vec::new()
             } else if let Some(fbs) = fast_blocks {
@@ -981,7 +996,7 @@ impl RepoLoad {
         let sp_segments = tracing::info_span!("repo.segments").entered();
         let segments: Vec<crate::glyph_scene::SegCull> = {
             use rayon::prelude::*;
-            self.files.par_iter().map(seg_of).collect()
+            self.files.par_iter().enumerate().map(|(view, v)| seg_of(view, v)).collect()
         };
         drop(sp_segments);
         let pick_files: Vec<crate::glyph_scene::PickFileInfo> = self
@@ -989,9 +1004,6 @@ impl RepoLoad {
             .iter()
             .map(|v| crate::glyph_scene::PickFileInfo {
                 rel_path: v.rel_path.clone(),
-                group_id: v.group_id,
-                slot_base: v.slot_base as u32,
-                slot_count: v.slot_count as u32,
                 item: v.item,
                 aabb_min: [
                     v.ink.min[0] - crate::glyph_scene::SEG_CULL_PAD_MIN[0],
@@ -1029,32 +1041,39 @@ impl RepoLoad {
                 log::warn!("focus: no file path contains {needle:?} — fitting the whole field");
             }
         }
-        let gpu_item_params: Vec<glyph_field::ItemParamsGpu> =
-            pick_files
+        let views = crate::views::Views::new(
+            self.files
                 .iter()
-                .map(|f| {
-                    let mut p = glyph_field::ItemParamsGpu::from(&f.item);
-                    p.group = f.group_id;
-                    p
+                .enumerate()
+                .map(|(view, v)| {
+                    let (local_min, local_max) = segment_local_box(v);
+                    crate::views::View {
+                        buffer: view as u32,
+                        bytes: 0..v.byte_len as u32,
+                        recipe: glyph_field::ItemParamsGpu::from(&v.item),
+                        group_row: v.group_id,
+                        segment: view as u32,
+                        slots: v.slot_base as u32..(v.slot_base + v.slot_count) as u32,
+                        local_min,
+                        local_max,
+                    }
                 })
-                .collect();
+                .collect(),
+        );
         // The visible field's items: the seam's seeds finished with what only
-        // the layout knows — the group row — and the LOCAL box the field's
-        // item cull carries through that row every frame: the segment's box
-        // before the group's T·R·S (`offset + local * s` is the segment).
-        // Local since 2026-10-10, so no group edit re-uploads it.
+        // the layout knows — the group row, in the item table's group lane —
+        // and the LOCAL box the field's item cull carries through that row
+        // every frame: the segment's box before the group's T·R·S (`offset +
+        // local * s` is the segment). Local since 2026-10-10, so no group
+        // edit re-uploads it.
         let mut arena = self.arena;
         if let Some(staging) = arena.visible_staging_mut() {
-            assert_eq!(staging.item_bytes.len(), self.files.len(), "the loader moved every file's bytes in");
-            let items: Vec<glyph_field_visible::VisibleItem> = self
-                .files
-                .iter()
-                .zip(gpu_item_params.iter())
-                .enumerate()
-                .map(|(i, (v, gp))| {
-                    debug_assert_eq!(v.group_id as usize, i);
-                    let (min, max) = segment_local_box(v);
-                    staging.item(i, *gp, min, max)
+            assert_eq!(staging.item_bytes.len(), views.len(), "the loader moved every file's bytes in");
+            let item_table = views.item_table();
+            let items: Vec<glyph_field_visible::VisibleItem> = (0..views.len())
+                .map(|view| {
+                    let (min, max) = views.local_extent(view as u32);
+                    staging.item(view, item_table[view], min, max)
                 })
                 .collect();
             staging.items = items;
@@ -1080,7 +1099,7 @@ impl RepoLoad {
                 folds: std::collections::HashMap::new(),
             }),
             controller: self.controller,
-            item_params: gpu_item_params,
+            views,
         }
     }
 
@@ -1187,6 +1206,41 @@ impl RepoLoad {
 /// builds (ink plus the segment pads, no z pad) before the group's T·R·S,
 /// so `offset + local * scale` is that segment. The Visible field's items
 /// carry it (their cull applies the live group row).
+/// Which group row each walked file draws with. A repo load files file `i`
+/// under row `i`; `GLYPH_PERMUTE_GROUP_ROWS=1` is the step-A witness of the
+/// view registry (2026-10-11, `crate::views`): it files them in REVERSE
+/// under rows `1..=n` and leaves row 0 a spare identity row, so no file's
+/// group row equals its index and the table has a row no file draws with.
+/// Every reader that still assumed the two equal draws the wrong file there
+/// (`native/tests/view_registry.rs` renders both and compares the pixels).
+struct GroupRows {
+    of_file: Vec<u32>,
+    count: usize,
+}
+
+fn group_rows_of_files(file_count: usize) -> GroupRows {
+    if std::env::var_os("GLYPH_PERMUTE_GROUP_ROWS").is_some_and(|v| v == "1") {
+        log::warn!("GLYPH_PERMUTE_GROUP_ROWS=1: {file_count} files filed under group rows in reverse, row 0 spare");
+        GroupRows { of_file: (0..file_count).map(|i| (file_count - i) as u32).collect(), count: file_count + 1 }
+    } else {
+        GroupRows { of_file: (0..file_count as u32).collect(), count: file_count }
+    }
+}
+
+impl GroupRows {
+    /// The group table from the layout's rows, which come one per file in
+    /// file order (`LayoutController::apply`): row `of_file[i]` takes file
+    /// `i`'s; a row no file draws with stays the identity.
+    fn table(&self, rows_in_file_order: Vec<GroupRow>) -> Vec<GroupRow> {
+        assert_eq!(rows_in_file_order.len(), self.of_file.len(), "the layout returns one group row per file");
+        let mut table = vec![GroupRow::identity([0.0; 3]); self.count];
+        for (row, &group_row) in rows_in_file_order.into_iter().zip(&self.of_file) {
+            table[group_row as usize] = row;
+        }
+        table
+    }
+}
+
 fn segment_local_box(v: &FileView) -> ([f32; 3], [f32; 3]) {
     use crate::glyph_scene::{SEG_CULL_PAD_MAX, SEG_CULL_PAD_MIN};
     (

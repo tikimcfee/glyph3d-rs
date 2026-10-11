@@ -36,7 +36,13 @@ pub struct FieldResources<'a> {
     pub emoji_sheet: &'a wgpu::TextureView,
     pub emoji_sampler: &'a wgpu::Sampler,
     pub glyph_advances: &'a wgpu::Buffer,
+    /// The item table, one row per item (the scene's views).
     pub item_params: &'a [ItemParamsGpu],
+    /// Per group row, the item a host record (`GlyphInstance`, which names
+    /// its group and not its item) belongs to; [`crate::NO_ITEM`] for a row
+    /// no single item draws with. Read by the Derived field's host transcode
+    /// only.
+    pub item_of_group: &'a [u32],
 }
 
 /// What a frame hands a self-culling field before its glyph pass

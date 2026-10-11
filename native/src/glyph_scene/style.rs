@@ -1,5 +1,5 @@
 use crate::gpu::GpuContext;
-use super::{GlyphPlacement, GlyphScene, pick::PickFileInfo};
+use super::{GlyphPlacement, GlyphScene};
 
 pub enum FileStyle {
     Ok { colored: usize, unstyled: usize },
@@ -16,14 +16,14 @@ impl GlyphScene {
         self.field.write_colors(&ctx.queue, slot_base, colors);
     }
 
-    /// Recolors a file group in-place given its source bytes and AST/LSP byte spans.
+    /// Recolors a view in-place given its source bytes and AST/LSP byte spans.
     /// Resolves survivor glyph slots using the provided engine trie and writes colors
     /// directly to the GPU instance buffers.
     /// Returns the number of slots recolored.
     pub fn apply_file_spans(
         &self,
         ctx: &GpuContext,
-        group_id: u32,
+        view: u32,
         file_bytes: &[u8],
         spans: &[crate::layout::ByteSpan],
         trie: &crate::atlas::TrieTable,
@@ -32,12 +32,13 @@ impl GlyphScene {
         // own a slot: the file's own params in a repo scene, the staging
         // choice in a text scene.
         let (slot_base, slot_count, cluster_mode) = if let Some(pctx) = &self.pick {
-            if let Some(f) = pctx.files.iter().find(|f| f.group_id == group_id) {
-                (f.slot_base, f.slot_count, f.item.cluster_mode)
+            if let Some(f) = pctx.files.get(view as usize) {
+                let slots = self.views.slots(view);
+                (slots.start, slots.end - slots.start, f.item.cluster_mode)
             } else {
                 return 0;
             }
-        } else if group_id == 0 {
+        } else if view == 0 {
             let mode = match self.probe_cluster_mode {
                 Some(true) => crate::fold::ClusterMode::Cluster,
                 Some(false) => crate::fold::ClusterMode::Leader,
@@ -68,11 +69,11 @@ impl GlyphScene {
         let mut files = 0usize;
         let mut colored = 0usize;
         let mut unstyled = 0usize;
-        for info in &pctx.files {
+        for (view, info) in pctx.files.iter().enumerate() {
             if let Some(runs) = map.get(&info.rel_path) {
                 files += 1;
                 if let FileStyle::Ok { colored: c, unstyled: u } =
-                    self.style_file(ctx, info, runs, None)
+                    self.style_file(ctx, view as u32, runs, None)
                 {
                     colored += c;
                     unstyled += u;
@@ -108,12 +109,12 @@ impl GlyphScene {
         let mut unstyled = 0usize;
         let mut dropped = 0usize;
         for update in updates {
-            let Some(info) = pctx.files.iter().find(|f| f.rel_path == update.file.0) else {
+            let Some(view) = pctx.files.iter().position(|f| f.rel_path == update.file.0) else {
                 dropped += 1; // not in the field (yet) — the workspace grammar's job later
                 continue;
             };
             files += 1;
-            match self.style_file(ctx, info, &update.style, Some(update.version)) {
+            match self.style_file(ctx, view as u32, &update.style, Some(update.version)) {
                 FileStyle::Ok { colored: c, unstyled: u } => {
                     colored += c;
                     unstyled += u;
@@ -141,13 +142,14 @@ impl GlyphScene {
     fn style_file(
         &self,
         ctx: &GpuContext,
-        info: &PickFileInfo,
+        view: u32,
         runs: &[crate::seam::StyleRun],
         expected: Option<crate::seam::BufferVersion>,
     ) -> FileStyle {
         let Some(pctx) = &self.pick else {
             return FileStyle::Failed;
         };
+        let info = &pctx.files[view as usize];
         // Bytes' provenance: envelope-owned content first (the bytes the seam
         // folded), disk second (Stage G's original semantics). One code path
         // either way — only the read differs.
@@ -183,13 +185,11 @@ impl GlyphScene {
         // The Visible field colours by BYTE RANGE, not by slot: the runs go
         // to the GPU as the item's span table and the kernel reads them as it
         // lays the line out. No re-derive, no slot walk — the whole point of
-        // that mode. The item index is the file's position in the load.
-        if let Some(visible) = self.field.visible() {
-            let Some(item) = pctx.files.iter().position(|f| f.rel_path == info.rel_path) else {
-                return FileStyle::Failed;
-            };
+        // that mode. The item is the view (`crate::views`).
+        if let Some(item) = self.visible_item(view) {
+            let visible = self.field.visible().expect("visible_item answers only for the Visible field");
             let spans = byte_spans_of(runs, bytes.len());
-            visible.set_item_spans(&ctx.queue, item as u32, &spans);
+            visible.set_item_spans(&ctx.queue, item, &spans);
             // Every byte a span covers is coloured; the count is in spans,
             // not glyphs (the field never counts glyphs on the host).
             return FileStyle::Ok { colored: spans.len(), unstyled: 0 };
@@ -260,7 +260,8 @@ impl GlyphScene {
             }
         };
         let mut run_ix = 0usize;
-        let mut slot = info.slot_base;
+        let mut slot = self.views.slots(view).start;
+        let group_row = self.views.group_row(view);
         let mut colored = 0usize;
         let mut unstyled = 0usize;
         for (i, r) in records.iter().enumerate() {
@@ -302,7 +303,8 @@ impl GlyphScene {
                     position: pos,
                     glyph_id: r.glyph_id(),
                     color: packed,
-                    group_id: info.group_id,
+                    group_id: group_row,
+                    item: view,
                     advance,
                     height,
                 },

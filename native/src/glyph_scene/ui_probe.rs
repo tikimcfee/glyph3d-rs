@@ -281,9 +281,10 @@ impl GlyphScene {
             .map(|pctx| {
                 pctx.files
                     .iter()
-                    .map(|f| UiFileRow {
+                    .enumerate()
+                    .map(|(view, f)| UiFileRow {
                         rel_path: f.rel_path.clone(),
-                        group_id: f.group_id,
+                        group_id: self.views.group_row(view as u32),
                         aabb_min: [f.aabb_min[0], f.aabb_min[1]],
                         aabb_max: [f.aabb_max[0], f.aabb_max[1]],
                     })

@@ -125,9 +125,10 @@ caller; the short version:
     and the hidden flags). No syntax heuristic runs in this mode (by decision);
     a `--highlight` sidecar becomes byte spans (`VisibleField::set_item_spans`).
     **Everything the scene keyed by SLOT is keyed by (item, byte) here** (M3,
-    2026-10-10; `out/VISIBLE-MODE.md` § M3): the item is the file's index in
-    the load (its group id at load, `GlyphScene::visible_item_of`) and the byte
-    the glyph's leader offset — both from the CPU pick. The selection is a
+    2026-10-10; `out/VISIBLE-MODE.md` § M3): the item is the picked VIEW (a
+    view's index is its item row, `crate::views`; since 2026-10-11 its group
+    row is a separate field, never assumed equal) and the byte the glyph's
+    leader offset — both from the CPU pick. The selection is a
     `Selection::ByteRange` the field lays out again into its mask buffer
     (`prepare_mask` after `prepare`, same encoder; `record_mask_draw` in the
     mask pass); the glyph verbs merge into one `GlyphOverride` per (item,
@@ -242,6 +243,13 @@ its staging text predates C22). Key touchpoints:
   sequence or no ASCII-led one. `GLYPH_HYPER_ORACLE_NO_GPU` skips the visible
   tier (the GPU kernel vs Pass 2) on a host without a usable adapter, and says
   so; the gate never sets it.
+- `GLYPH_PERMUTE_GROUP_ROWS=1` — repo loads only: files the walked files
+  under their group rows in REVERSE, with row 0 a spare no file draws with
+  (`repo::group_rows_of_files`), so no view's group row equals its index.
+  The view registry's witness (`crate::views`, 2026-10-11):
+  `native/tests/view_registry.rs` renders `g-pick-repo` with and without it
+  and requires byte-equal frames in every field. Every pick line names both
+  (`view=… group=…`).
 - `GLYPH_PICK_DEBUG=1` — pick-path diagnostics: pixel ray, AABB hits, local
   point, candidate records (glyph_scene/pick.rs pick functions).
 - `GLYPH_CULL_DEBUG=1` — at t=0.0 prints cull stats: visible draw ranges,

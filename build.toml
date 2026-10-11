@@ -25,7 +25,7 @@
 # Ratchet, NOT an equality: tests are added constantly, so an exact pin would
 # redden on the most common good action in the repo. A green run whose real
 # count exceeds the floor prints a NOTE naming the value to raise it to.
-test_floor = 376
+test_floor = 378
 # Every golden view is rendered again under each of these and must match the
 # SAME baseline byte for byte (2026-10-09, C20). The plain frames render the
 # Derived field, the default since 2026-10-11 (Instanced retirement step 1);
@@ -1079,11 +1079,11 @@ rebuild = "cargo build --release"
 [[mutation]]
 name = "render-file-copies-share-group-0"
 gate = "cargo-test"
-why = "the text stager's items all naming group 0, as they did until 2026-10-11: the Derived vertex stage draws with the item's group, so `--render-file --copies N` stacked every copy on copy 0 in the default field (Instanced, reading the slot's group, tiled them). No golden view uses --copies. CONSUMED BY: native/tests/render_file_copies.rs, the default frame of four copies against Instanced's"
+why = "the text stager's items all naming group 0, as they did until 2026-10-11: the Derived vertex stage draws with the item's group, so `--render-file --copies N` stacked every copy on copy 0 in the default field (Instanced, reading the slot's group, tiled them). No golden view uses --copies. Since the view registry (2026-10-11) the copies are views and the item table's group lane is written from their group rows, so the mutation registers every copy's view under row 0; the host records still name rows 1..N, which no view draws with now, and the Derived host transcode refuses them (the renderer panics) instead of drawing them on copy 0 — a louder red for the same defect. CONSUMED BY: native/tests/render_file_copies.rs, the default frame of four copies against Instanced's"
 file = "native/src/text.rs"
 op = "replace"
-find = "                group: copy,"
-with = "                group: 0 * copy,"
+find = "                        group_row: copy,"
+with = "                        group_row: 0 * copy,"
 expect = "copies_tile_in_the_default_field"
 rebuild = "cargo build --release"
 
@@ -1447,3 +1447,13 @@ op = "replace"
 find = "                    (Similarity::compose(&pw, &self.local[n]), pa * self.appearance[n].tint[3])"
 with = "                    (Similarity::compose(&self.local[n], &pw), pa * self.appearance[n].tint[3])"
 expect = "resolving_subtrees_on_the_cpu_matches_world_node_for_node"
+
+[[mutation]]
+name = "view-registry-node-is-the-index"
+gate = "cargo-test"
+why = "the view registry handing back a view's own index as its group row — the identity knot put back (step A of out/DESIGN-VIEWS-SLABS-POSES-2026-10-11.md, 2026-10-11): every reader that asks the registry (the item table's group lane, each view's node, the library's file nodes, the pick's group row, every group verb) draws or edits the view's index's row. Invisible to every golden view, whose loads file view i under row i. CONSUMED BY: Views::group_row; reddens views::tests::the_registry_answers_by_field_not_by_index and agent_transcript::tests::derived_positions_match_the_staged_ones (the item table's group lane), and the lib test binary failing stops cargo test before the integration tests — so the gate never reaches the pixel witness, tests/view_registry.rs a_permuted_group_table_renders_the_unpermuted_frames, which under this mutation reddens on 10 of its 11 (case, field) pairs (measured by hand 2026-10-11, vulkan-nvidia: 46,727 to 349,373 px each; repo-wide under Instanced alone stays equal, its slots' group lane being the loader's)"
+file = "native/src/views.rs"
+op = "replace"
+find = "    pub fn group_row(&self, view: u32) -> u32 {\n        self.row(view).group_row\n"
+with = "    pub fn group_row(&self, view: u32) -> u32 {\n        view\n"
+expect = "the_registry_answers_by_field_not_by_index"

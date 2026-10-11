@@ -51,7 +51,7 @@ pub use copy::{copy_split, padded_staging_size, split_copy_size, FAST_COPY_ALIGN
 pub use field::{split_at_chunks, GlyphField};
 pub use field_core::{FieldCore, FieldShape};
 pub use mode::{GlyphFieldMode, ParseGlyphFieldModeError};
-pub use records::{GlyphInstance, GlyphPlacement, GroupRow, ItemParamsGpu, LineRecord};
+pub use records::{GlyphInstance, GlyphPlacement, GroupRow, ItemParamsGpu, LineRecord, NO_ITEM};
 pub use resources::{
     shared_bind_group_entries, shared_layout_entries, FieldResources, FieldTargets, FramePrepare, SlotChunk,
     SlotSource, BINDING_FRAME_UNIFORM, BINDING_SLOTS,
