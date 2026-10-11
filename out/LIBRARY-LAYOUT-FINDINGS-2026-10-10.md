@@ -476,6 +476,109 @@ Mutation: `library-drag-offset-forgotten`. Seen offscreen with
 puts `sub/`'s page 160 px right and 60 px up from its shelf slot, the
 drag's exact displacement.
 
+### E20. Bounding regions — built
+
+Ivan (2026-10-10): "bounding regions, so you can see actual containment of
+files and their relative positioning", with the encompassed objects moving
+with the box. The JS recipe is `ContentTreeMarkers.js`; here it is
+`native/src/glyph_scene/regions.rs` + `shaders/library_regions.wgsl`, every
+dial in `[library] region_*`, `regions = true|false`.
+
+Built:
+- **Which boxes.** One per `Plan::dirs` entry except the root (path '',
+  whose box is the whole library; the JS skipped it too). Single-child
+  chains are already compressed by the plan (`build_tree`), so no
+  pass-through directory stacks a duplicate box (`library-tree/chain/one/two`
+  is one region).
+- **The box is the tree cull's.** A region is its directory's subtree box
+  in its own frame (`TreeCull`'s bounds, E18), padded: `region_pad` x/y,
+  `region_z_pad` z, each `region_pad_step` less per nesting level (floor
+  `region_pad_min`) so a child's walls sit inside its parent's instead of
+  on them — the one departure from the JS, whose equal pads made a child at
+  its parent's edge share the wall — and at least `region_min_thickness`
+  deep. With regions on, each sheet's tree-cull box also takes its page
+  face (`TreeCull::with_own_box`), so a box encloses the pages and not only
+  the ink on them; the cull's draws cannot change (a box is its prefilter;
+  the tree-cull test now runs that form against the flat cull too). The
+  cull logs the slots each refit rewrites and `RegionTable::sync` re-pads
+  exactly those: host work per frame is O(refit directories).
+- **The world is the GPU's.** A compute pass composes each box with its
+  directory's resolved world after any resolve or box upload (the faces'
+  pattern), so drags, eases, page turns and form changes cost the regions
+  nothing on the host; a settled frame does nothing at all.
+- **Draw order.** After the page faces, before the glyphs, depth tested
+  and never written, double-sided, shallowest first (the JS `BACKDROP_BASE
+  + depth`): a page hides the walls behind it, a wall in front of a page
+  tints it, and the glyphs, drawn last, read crisply over every wall. Fill
+  opacity 0.07 (the JS), edge a screen-space hairline (each face's uv
+  against its derivative: 1 px, opacity 0.35 — the JS's 0.16 line reads as
+  nothing on this background), colour a linear-light gradient over nesting
+  depth from the JS 0x2e5f8a to 0x7a3a8a at the deepest directory.
+- **Pick.** Content out-picks regions: the file ray runs first; only a miss
+  asks `RegionTable::pick`, which walks the directory tree top-down, the
+  ray against each region in its directory's frame, descending only into
+  regions it enters, keeping the deepest (nearest entry among equals, the
+  later drawn on an exact tie). The pick highlights the region
+  (`region_picked_opacity` / `_edge_opacity`) and replies `pick: region
+  <path>/ (dir:<path>, depth d, n file(s) on its own pages, t=…)`. A region
+  pick is the newest pick: `picked` (the file) is dropped, so a verb does
+  not act on an older file; a miss or a file pick drops the region.
+- **Keys.** `g` grabs whatever is picked — the region (its directory and
+  everything in it) or else the file; `c` grabs a picked region too, else
+  the picked file's directory, as before. Both region grabs go through the
+  zone path, so the drag goes through `Library::move_zone` (it sticks, E19)
+  and the wheel scales the directory. `g` now releases any grab, including
+  a `c` grab (it used to drop a `c` grab and grab the file).
+
+Blind spots, named: a child region scaled past its parent's padding pokes
+out and is reachable only where it overlaps its parent (the walk descends
+through parents); no golden view renders the library, so the depth order
+against the glyph pass and the look are seen only by the frames below and
+`tests/library_regions.rs`'s one-region on/off comparison.
+
+Witness. Regions OFF (`[library] regions = false` via `--launch-config`)
+against the 315375e binary, workspace-scope builds of both: 105 of 105
+frames byte-equal — `g-pick-repo` (twice: before and after the last code
+change), `native/src`, `library-tree` and its chainless scratch twin, each
+in instanced/derived/visible: settled, oblique, mid form toggle, mid page
+turn, near pose, a `c` drag, a `c` drag + page turn (vulkan-nvidia).
+Regions ON: the frames below were looked at; nested boxes, depth gradient,
+edges, regions following a region drag and a page turn.
+Tests: `regions::tests` — boxes equal a from-scratch tree cull's padded
+boxes and hold every page (seated, after a drag, mid splay, mid page turn);
+the pick equals a brute-force scan over 7,200 rays, seated and again after a drag,
+and picks the depth-4 directory through its page; the compose pass equals
+its CPU twin after a drag and a scale; a region drag moves exactly its
+subtree and sticks through a page turn against an undragged twin.
+`tests/library_regions.rs` — the release binary's picks (file over region,
+region, region, miss; regions off: misses), on/off pixels (20k+ differ
+inside `sub/`'s box, 0 on the root's page and either side), a `g` drag.
+Mutations (all proven): `region-refit-unlogged`, `region-misses-its-pages`,
+`region-pick-outermost`, `region-outpicks-content`,
+`region-g-grabs-the-file`, `region-compose-drops-translation`,
+`region-draw-dropped`.
+
+Measured (arch/, 9,241 files, 695 dirs, 694 regions, visible, one run each,
+`GLYPH_LIBRARY_TIMING=1`, `--cam-pose 0 -250 300 0 0`):
+
+| case | regions' CPU per frame |
+|---|---|
+| settled | nothing (no `REGIONTIME` line; no sync, upload or compose) |
+| whole-library form toggle (637 volumes, ~9.6k nodes moving) | median 1,138 refits, 602 regions changed, one 33 KB table write, compose pass, `prepare_ms` 0.007 (max 0.13) |
+| `g` drag of a picked region (`arm64/boot/dts`, depth 3) | 4 refits, 2 regions (its ancestors) re-uploaded, 96 B, `prepare_ms` 0.002; the drag itself 0.0006 ms (`DRAGTIME`) |
+
+Candidate frames (untracked, `out/tooling-ab/sweep/candidates/library-regions/`,
+vulkan-nvidia), from `native/` with `../target/release/glyph3d-native`:
+
+| frame | arguments |
+|---|---|
+| `tree-whole-derived.png` | `--load-repo fixtures/library-tree --layout-mode library --field-mode derived --frames 2 --cam-pose -280 -270 800 22 -2` |
+| `tree-region-drag-derived.png` | the same with `--pick-px 740 500 --frames 40` and `GLYPH_DRAG_SCRIPT=g:8:0:1:30` (picks `src/core/`, drags it right; `src/`'s box grows to keep it) |
+| `tree-mid-page-derived.png` | the same pose, `--verb page-next --frames 10` |
+| `gpick-sub-picked-derived.png` | `--load-repo fixtures/g-pick-repo --layout-mode library --field-mode derived --frames 2 --pick-px 645 700` (`sub/` picked) |
+
+Not adopted as goldens: Ivan's call.
+
 ## Seeing it
 
 From `native/` (the fixture paths are native-relative), with
