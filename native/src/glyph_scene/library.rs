@@ -67,6 +67,7 @@ impl GlyphScene {
         let t_sync = Instant::now();
         let gids = ctrl.scene.sync_to_group_rows(&mut self.groups_cpu);
         let quads = ctrl.scene.mesh_draws().quads.len();
+        let update = ctrl.scene.last_update;
         let sync_ms = t_sync.elapsed().as_secs_f64() * 1e3;
         let t_up = Instant::now();
         self.write_group_rows(ctx, &gids);
@@ -88,12 +89,14 @@ impl GlyphScene {
                 0
             };
             println!(
-                "LIBTIME nodes_moved={} groups_synced={} ease_ms={:.4} propagate_ms={:.4} sync_ms={:.4} upload_ms={:.4} seg_ms={:.4} \
+                "LIBTIME nodes_moved={} groups_synced={} ease_ms={:.4} propagate_ms={:.4} (bevy {:.4} extract {:.4}) sync_ms={:.4} upload_ms={:.4} seg_ms={:.4} \
                  group_bytes={} group_writes={} mesh_bytes={} animating={}",
                 tick.nodes_moved,
                 gids.len(),
                 tick.ease_ms,
                 tick.propagate_ms,
+                update.propagate_ms,
+                update.extract_ms,
                 sync_ms,
                 upload_ms,
                 seg_ms,
