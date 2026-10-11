@@ -614,6 +614,10 @@ impl GlyphArena {
             if let Some(addr) = d.mapped_slots {
                 let count = colors.len().min(d.len.saturating_sub(slot_base));
                 let ptr = addr as *mut crate::glyph_scene::RenderSlot;
+                // SAFETY: `mapped_slots` is set only for RenderSlot arenas, never
+                // Derived (its doc; layout_hyper builds it so), and maps `d.len` slots
+                // the arena's buffers keep alive; `count` clamps every write below
+                // `d.len`.
                 unsafe {
                     for (i, &c) in colors.iter().take(count).enumerate() {
                         (*ptr.add(slot_base + i)).color = c;
@@ -675,6 +679,8 @@ impl GlyphArena {
             "commit({written}) exceeds the {} uncommitted slots reserved",
             self.instances.capacity() - len,
         );
+        // SAFETY: the caller initialised `written` slots of the tail (this function's
+        // contract), and the assert keeps `len + written` within capacity.
         unsafe { self.instances.set_len(len + written) };
     }
 }

@@ -350,6 +350,10 @@ impl HyperLayout {
                 em_height_fu,
                 SendPtr(tail_ptr),
             );
+            // SAFETY: `layout_pass2_host` wrote all `total_survivors` slots: each
+            // item's Pass 1 survivors, contiguous from its slot base (Pass 1's prefix
+            // sums). Held by hyper-oracle's host tier, which compares every instance;
+            // nothing checks the count at run time.
             unsafe {
                 arena.commit(total_survivors);
             }

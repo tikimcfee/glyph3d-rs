@@ -136,6 +136,10 @@ impl<S: SlotRecord> SlotStorage<S> {
             let base = first_slot as usize;
             let count = colors.len().min(total.saturating_sub(base));
             let stride = Self::SLOT_BYTES as usize;
+            // SAFETY: `mapped_base` is the host address of one contiguous mapping of
+            // all `glyph_count` slots (SlotSource::Device), kept alive by
+            // `self.chunks`; `count` clamps every write below `glyph_count`, and the
+            // colour word is aligned (below).
             unsafe {
                 for (i, &c) in colors.iter().take(count).enumerate() {
                     // The slot's colour word. Aligned: the mapped slice is

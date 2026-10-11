@@ -885,6 +885,10 @@ fn try_load_cache(
         .unwrap_or(0);
 
     let file = std::fs::File::open(cache_path).ok()?;
+    // SAFETY: the cache is this renderer's own derived file and is only ever replaced
+    // whole (`save_cache` writes a .tmp and renames it), never rewritten in place, so
+    // the mapped bytes cannot change under the mapping. Another process truncating it
+    // in place would break this; nothing in the tree does.
     let mmap = unsafe { memmap2::Mmap::map(&file).ok()? };
     let _ = mmap.advise(memmap2::Advice::WillNeed);
     if mmap.len() < std::mem::size_of::<CacheHeader>() {
@@ -1056,6 +1060,10 @@ impl EmojiTexture {
                     use rayon::prelude::*;
                     const CHUNK_SIZE: usize = 32 * 1024 * 1024;
                     let dest_ptr = mapped.slice(..).as_raw_element_ptr().as_ptr();
+                    // SAFETY: the staging mapping is `total_texture_bytes` long, which
+                    // equals `total_bytes`: `try_load_cache` accepted the cache only
+                    // with layers, layer size and mip count equal to the sheet's, and
+                    // both sums run over those. The mapping is this scope's alone.
                     let dst: &mut [u8] = unsafe { std::slice::from_raw_parts_mut(dest_ptr, *total_bytes) };
                     let src = &mmap[*data_offset..*data_offset + *total_bytes];
                     dst.par_chunks_mut(CHUNK_SIZE)

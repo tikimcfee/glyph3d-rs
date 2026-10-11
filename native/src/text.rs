@@ -1191,6 +1191,8 @@ pub fn is_pure_printable_ascii(bytes: &[u8]) -> bool {
     let len = bytes.len();
     let mut i = 0usize;
 
+    // SAFETY: NEON is in every aarch64 target's baseline, and each load reads
+    // `bytes[i..i + 16]` with `i + 16 <= len`.
     #[cfg(target_arch = "aarch64")]
     unsafe {
         use std::arch::aarch64::*;
@@ -1208,6 +1210,7 @@ pub fn is_pure_printable_ascii(bytes: &[u8]) -> bool {
     }
 
     while i + 8 <= len {
+        // SAFETY: `i + 8 <= len`, so the unaligned 8-byte read stays inside `bytes`.
         let w = unsafe { (bytes.as_ptr().add(i) as *const u64).read_unaligned() };
         let has_lt_20 = w.wrapping_sub(0x2020202020202020) & !w & 0x8080808080808080;
         let has_ge_7f = ((w & 0x7F7F7F7F7F7F7F7F).wrapping_add(0x0101010101010101) | w) & 0x8080808080808080;

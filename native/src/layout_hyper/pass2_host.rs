@@ -55,6 +55,9 @@ pub fn layout_pass2_host(
             let mut survivor_out = 0usize;
             let mut trailer_until = 0usize;
 
+            // SAFETY: `dest_addr` is the arena's uninitialised tail, reserved for
+            // `total_survivors` slots (`GlyphArena::uninit_tail`), and `slot_base` is
+            // Pass 1's prefix sum for this item, inside that total.
             let out_ptr = unsafe { (dest_addr as *mut GlyphInstance).add(slot_base as usize) };
             let flat_color = if let Paint::Flat(c) = item.paint { Some(c) } else { None };
             let (local_colors_buf, per_record_colors) = match item.paint {
@@ -162,6 +165,10 @@ pub fn layout_pass2_host(
                         ink_max[2] = pos_z;
                     }
 
+                    // SAFETY: a survivor (`r.glyph_id != 0`), and Pass 2 emits exactly
+                    // the survivors Pass 1 counted for this item, so the slot is inside
+                    // the item's range of the tail. Held by hyper-oracle's host tier,
+                    // which compares every instance; nothing checks it at run time.
                     unsafe {
                         *out_ptr.add(survivor_out) = GlyphInstance {
                             pos: [pos_x, pos_y, pos_z],
