@@ -923,34 +923,63 @@ reads the load's (`records`, `glyph instances`) now and agrees on all six
 runs — and it passes `--cluster-mode` both ways, which it had not since the
 2026-09-22 default flip (its "leader" runs had been cluster runs).
 
-**Pixels.** Every other golden byte-equal, plain and under both
-equivalents. `text`, `emoji` and `emoji-cluster` moved (vulkan-nvidia), and
-every moved pixel is accounted for: a scratch build of the old stager with
-four toggles — fold tabs (T), the shared colouriser (C), x as the fold's
-f32 running sum (F), the tiled block's width from that sum (B) — renders
-the new frames byte for byte with all four on.
+**Pixels, re-measured 2026-10-11 after the rebase onto configurable tab
+stops.** Step 2 was rebased onto `df464a2`, where tab stops became a layout
+recipe parameter (`fold::TabWidth`), and `--render-file`'s recipe now takes
+`[layout] render_file_tab_width_cells = 4` (overridable with `--tab-width`),
+so its tabs reach the same 4-cell stops the stager's did. Every other golden
+is byte-equal, plain and under both equivalents. `text`, `emoji` and
+`emoji-cluster` still move (vulkan-nvidia), far less in `text`'s case, and
+every moved pixel is accounted for. The old stager is deleted, so this time
+the toggles were in the new path, in a scratch build: F off is the file laid
+out at wrap 0, where x comes from the fold's f64 line carrier, whose f32
+narrowing is exactly the stager's `col * cell_w` (every addend, a tab's
+included, is an exact `k × cell`); B off is the tiled block's width rounded
+to whole cells times the cell, the stager's product. With both off, `text`
+and `emoji` render their baselines byte for byte and `emoji-cluster` is
+1,121 px off it, which is C.
 
 | cause (chain order) | text | emoji | emoji-cluster |
 |---|---|---|---|
-| T: a tab advances one trie advance (the stager stopped at 4-cell tab stops); the block narrows 66 → 63 cells and the camera refits | 71,020 | 0 | 0 |
+| T: tab stops — the stager's 4-cell stops and `TabWidth(4)` lay this fixture out identically (66 cells wide either way) | 0 | 0 | 0 |
 | C: the shared colouriser — `#` of the `#️⃣` keycap opens a `#` comment, so `bare:` paints COMMENT | 0 | 0 | 1,121 |
-| F: x = f32 running sum of advances, not `col * cell_w` (edge flips, max delta 2-3) | 94 | 751 | 267 |
-| B: the block width from that sum, an ulp past the product (36.552166 vs 36.55216 for 69 cells), so the camera centre moves ~3e-6 (edge flips everywhere, max delta 6) | 0 | 2,722 | 829 |
+| F: x = the fold's f32 running sum within a wrap segment, not `col * cell_w` (edge flips, max delta 3) | 0 | 751 | 267 |
+| B: the block width from that sum, an ulp past the product, so the camera centre moves by a few 1e-6 (edge flips, max delta 4-6). `text`: 34.962936 vs 34.962933 for 66 cells; `emoji`: 36.552166 vs 36.55216 for 69 | 200 | 2,722 | 829 |
 | residual | 0 | 0 | 0 |
-| total vs baseline | 71,020 | 3,372 | 2,217 |
+| total vs baseline | **200** (was 71,020) | 3,372 (unchanged) | 2,217 (unchanged) |
 
-Isolated, each cause alone against the stager: T 71,020 (of which, with the
-camera held at the old width, 45,212 are glyph motion alone, and the refit
-alone moves 70,496 — they overlap), C 1,121, F 751 / 267, B 2,868 / 886
-(text cannot isolate F or B: with tab stops the running sum is meaningless).
-Under `--field-mode instanced` all three new frames are byte-equal to the
-new plain frames; under `--field-mode visible` they are visible mode for
-real and each is the new frame's flat-paint twin byte for byte (32,439 /
-43,726 / 31,419 px of token colour short of it). Candidates, diff images
-and the same table: `out/tooling-ab/sweep/candidates/step2-render-file/
-vulkan-nvidia/` (untracked). Nothing under `out/tooling-ab/baseline/` was
-touched; pixel-ab is red on these three until a human adopts them (and
-metal-apple's candidates must be rendered on the M2).
+`text`'s 200 px (max delta 4, one band of glyph edges at x 814-837 of the
+1600 px frame, down every row) are F and B TOGETHER: each alone moves no
+pixel of this frame (F alone 0, B alone 0, both 200). The x of a glyph a few
+ulps left of the product and the camera a few millionths right are below
+the rasterizer's coverage step separately and cross it combined, so the
+chain books them to B, its second link. Neither is a tab question: at
+`--tab-width 1` the frame is the earlier step-2 candidate byte for byte
+(71,020 px, the old T), and `emoji` and `emoji-cluster` (no tabs) are the
+earlier candidates byte for byte. Removing B (measuring a tiled block in
+whole cells rather than by ink) would leave `text` byte-equal to its
+baseline and `emoji` at F's 751 px; it was not done, as it changes the
+block rule `tile_views` shares with the ink extents — a decision for the
+adoption, not this measurement.
+
+Under `--field-mode instanced` all three frames are byte-equal to the new
+plain frames. Under `--field-mode visible` they are visible mode for real
+and each is the new frame's flat-paint twin byte for byte (checked with the
+paint forced flat by a scratch toggle): 32,489 / 43,726 / 31,419 px of token
+colour short of the plain frame, 32,490 / 44,983 / 30,698 px off the
+baseline. Candidates, diff images and the same table:
+`out/tooling-ab/sweep/candidates/step2-render-file/vulkan-nvidia/`
+(untracked). Nothing under `out/tooling-ab/baseline/` was touched; pixel-ab
+is red on these three, plain and under both equivalents, until a human
+adopts them (and metal-apple's candidates must be rendered on the M2).
+
+*The first measurement (before the rebase, one-cell tabs), for the record:*
+`text` 71,020 px, all T — a tab advanced one trie advance where the stager
+stopped at 4-cell stops, the block narrowed 66 → 63 cells and the camera
+refit (with the camera held, 45,212 px were glyph motion alone; the refit
+alone moved 70,496; they overlap); F 94 px of `text` once T was applied;
+`emoji` and `emoji-cluster` as above. That was measured against a scratch
+build of the stager itself with the four causes as toggles.
 
 **Witnesses and mutations.** `native/tests/render_file_copies.rs` (rewritten):
 at a camera parked on the gap of the 2x2 grid, in Derived, Instanced and
@@ -958,7 +987,11 @@ Visible, the four-copy frame's top-left quadrant is the one-copy frame's
 byte for byte and every other quadrant has a copy in it; and Derived ==
 Instanced at the fitted camera, as before. `repo::tests::
 tile_views_frame_copies_as_the_text_stager_did` pins the tiling rule (379
-tests, floor raised). Mutations: `render-file-copies-share-group-0` retired
+tests, floor raised). Since the rebase (2026-10-11) the same file's
+`tabs_take_the_render_file_default` holds the tab default (Derived and
+Visible: no flag == `--tab-width 4` != `--tab-width 1`), proven by
+`render-file-tab-width-dropped`; the gap camera moved with the block, which
+the 4-cell stops widen from 63 cells to 66. Mutations: `render-file-copies-share-group-0` retired
 (its anchor, the stager's view rows, is gone; the copies' group rows come
 from the loader's `group_rows_of_views`, shared with every repo load and
 held by `view_registry.rs`), replaced by `render-file-copies-stacked`
@@ -985,10 +1018,22 @@ while pixel-ab is red).
 - The stager's layout and the fold's disagreed on more than paint: tab
   stops, `col * cell_w` against a running sum, and a block measured by
   columns rather than ink. Tabs are the one that matters to a reader (the
-  text frame lost its tab-stop alignment); every repo load has always laid
-  tabs out as one advance. Tab stops in the fold would change the layout
-  contract the JS oracle pins, so that is its own decision (open, Ivan's).
-- Found on the way, not fixed: `--load-repo <a file>` walks the file as a
-  directory, finds nothing, and the empty load panics in Derived ("a host
-  record's group row 0 names no single item": the scene's placeholder
-  instance has no view). `--render-file` is the door for one file.
+  text frame lost its tab-stop alignment). *Resolved 2026-10-11:* tab stops
+  became a layout recipe parameter on main (`fold::TabWidth`, one cell for a
+  repo load by default), and `--render-file` defaults to 4
+  (`[layout] render_file_tab_width_cells`). The stager's stop rule and
+  `TabWidth`'s are the same: `w - (cells % w)` over display cells counted
+  from the line start, a tab already on a stop advancing a whole stop, a
+  double-width glyph two cells, a cluster-mode zero-width trailer none. The
+  one difference in the counting is moot: the stager floored every
+  codepoint at one cell (`advance_cells.max(1)`), where the fold counts a
+  zero advance as zero, and no codepoint in the atlas has a zero advance
+  (every one is 1 or 2 cells, swept over all of U+0000..U+10FFFF). The
+  stager never wrapped, so "a wrap does not restart the count" never came
+  up there. The running sum and the ink-measured block remain, and are
+  what still moves pixels (above).
+- Found on the way, not fixed here: `--load-repo <a file>` walked the file
+  as a directory, found nothing, and the empty load panicked in Derived ("a
+  host record's group row 0 names no single item"). *Since `8f890d9` on main
+  (2026-10-11) the empty load renders; re-checked after the rebase, it exits
+  0.* `--render-file` is still the door for one file.

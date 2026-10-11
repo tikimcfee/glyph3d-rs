@@ -162,7 +162,14 @@ Derived's `nudge-glyph` y/z and `scale-glyph` now reply "not representable"
 and apply nothing (x nudges still apply; `native/tests/derived_verbs.rs`).
 `--engine-render` is deleted (dead; it would have rendered wrong under
 Derived's default item table).
-- **Remaining:** step 2, `--render-file` becomes a one-item repo load; step 3,
+- **Step 2 (2026-10-11): `--render-file` is a one-item repo load**
+  (`repo::load_file`; `stage_file` deleted), with 4-cell tab stops by
+  default (`[layout] render_file_tab_width_cells`, `--tab-width`). It moves
+  `text` 200 px, `emoji` 3,372 and `emoji-cluster` 2,217 on vulkan-nvidia,
+  every pixel attributed (`out/DESIGN-VIEWS-SLABS-POSES-2026-10-11.md` § 9;
+  `text` was 71,020 before the tab stops); pixel-ab is red on those three
+  until Ivan adopts the candidates, batched with other pixel moves.
+- **Remaining:** step 3,
   delete `glyph-field-instanced`, its shader, `RenderEmit` and hyper-oracle's
   RenderSlot tier (and move the emoji alpha-contract statement from
   `glyph_field.wgsl`'s header to the Derived shader's).

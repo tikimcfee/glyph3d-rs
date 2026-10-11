@@ -583,14 +583,15 @@ NEXT change too).
 **Red on three frames since step 2 (2026-10-11), on purpose.** `--render-file`
 became a one-item repo load, which moved `text`, `emoji` and `emoji-cluster`
 on vulkan-nvidia and left every other frame byte-equal. Every moved pixel is
-attributed, each cause measured by toggling it alone, in
-`out/DESIGN-VIEWS-SLABS-POSES-2026-10-11.md` § 9: `text` 71,020 px, all of
-it TABS (the fold advances a tab one trie advance where the text stager
-stopped at 4-cell tab stops, and the block it frames narrows with it);
-`emoji` 3,372 px of edge flips (x as the fold's f32 running sum, and the
-camera fit an ulp wider from it); `emoji-cluster` 2,217 px (1,121 the shared
-colouriser's `#` comment painting `bare:` after a keycap, the rest the same
-summation). Candidates and diff images are in
+attributed, each cause measured by toggling it, in
+`out/DESIGN-VIEWS-SLABS-POSES-2026-10-11.md` § 9 (re-measured 2026-10-11
+after `--render-file` took 4-cell tab stops, `[layout]
+render_file_tab_width_cells`): `text` 200 px of edge flips (max delta 4;
+it was 71,020 at one-cell tabs), the fold's f32 running-sum x and the camera
+fit an ulp wider from it acting together, neither moving a pixel alone;
+`emoji` 3,372 px of edge flips from the same two causes; `emoji-cluster`
+2,217 px (1,121 the shared colouriser's `#` comment painting `bare:` after a
+keycap, the rest the same summation). No tab-stop pixel remains. Candidates and diff images are in
 `out/tooling-ab/sweep/candidates/step2-render-file/vulkan-nvidia/`
 (untracked; metal-apple's must be rendered on that host). Until a human
 adopts them the gate is red on those three plain and under both
@@ -682,8 +683,9 @@ visible renders and to the stored modes' flat render) for Ivan to adopt or not.
 **Since step 2 (2026-10-11)** `--render-file` is a one-item repo load, so
 `text`, `emoji` and `emoji-cluster` are visible mode for real under this
 entry, and render flat like the five: each is its step-2 frame's flat-paint
-twin byte for byte (32,439 / 43,726 / 31,419 px of token colour short of
-the step-2 frames on vulkan-nvidia). They are not exempt; whether they join
+twin byte for byte (32,489 / 43,726 / 31,419 px of token colour short of
+the step-2 frames on vulkan-nvidia, re-measured 2026-10-11 with the 4-cell
+tab stops). They are not exempt; whether they join
 the five is decided when their step-2 frames are adopted.
 
 **Which view covers what, because the answer is not uniform.** `repo-wide`
