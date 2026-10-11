@@ -5,7 +5,9 @@
 //! **A view** is a byte range of one buffer, laid out with one recipe and
 //! drawn with one group row (and so one node of the transform tree). Today
 //! every producer registers one view per item: a repo load one per walked
-//! file, an agent session one per text block, `--render-file` one per copy.
+//! file, an agent session one per text block, `--render-file` one per copy
+//! — all N copies over its one buffer (since 2026-10-11 a one-item repo
+//! load, `repo::load_file`; the first producer of several views per buffer).
 //!
 //! **The view's index is its item row**, in every field and every table
 //! that is per item: the row of the GPU item table (`ItemParamsGpu`, which
@@ -46,7 +48,8 @@ const NO_VIEW: u32 = u32::MAX;
 pub struct View {
     /// The buffer the view's bytes come from, in its producer's numbering:
     /// the walked file's index at a repo load, the text block's at an agent
-    /// session, 0 at `--render-file` (every copy reads the one file).
+    /// session, 0 at `--render-file` (every copy reads the one file, and
+    /// the Visible field reads it from one host buffer).
     pub buffer: u32,
     /// The bytes of that buffer the view covers: the whole buffer today.
     pub bytes: Range<u32>,
@@ -58,7 +61,9 @@ pub struct View {
     /// alpha — and so its node (row `r` is node `GroupNodes::node(r)`).
     pub group_row: u32,
     /// Its cull segment (`StagedText::segments`). Several views may share
-    /// one: `--render-file`'s copies sit under one cover segment.
+    /// one: an agent session's text blocks sit under their card's. (The
+    /// text stager's copies shared one cover segment until 2026-10-11; as
+    /// views of a repo load each copy has its own.)
     pub segment: u32,
     /// The arena slots its glyphs occupy (empty where none are stored: the
     /// Visible field lays glyphs out per frame).

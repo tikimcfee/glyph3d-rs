@@ -229,8 +229,9 @@ impl GlyphScene {
         };
         let field = if let Some(staging) = arena.visible_staging() {
             assert_eq!(built_mode, GlyphFieldMode::Visible, "a visible arena is only ever bound by the Visible field");
-            assert_eq!(staging.items.len(), staging.item_bytes.len(), "into_staged finished every item");
-            let item_bytes: Vec<&[u8]> = staging.item_bytes.iter().map(|b| b.as_slice()).collect();
+            assert_eq!(staging.items.len(), staging.item_buffers.len(), "into_staged finished every item");
+            // One slice per item; several may be one buffer's (copies).
+            let item_bytes: Vec<&[u8]> = (0..staging.items.len()).map(|item| staging.item_bytes(item)).collect();
             let trie = crate::layout_hyper::visible::trie_upload(&atlas.trie);
             let inputs = glyph_field_visible::VisibleInputs {
                 item_bytes: &item_bytes,

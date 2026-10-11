@@ -72,8 +72,9 @@ pub(super) fn apply_relayout(
             }
         }
     }
-    // The z dial exists on repo scenes only.
-    if let SceneChoice::Repo { z_wrap_spacing, .. } = choice {
+    // The z dial exists on repo scenes, and on text scenes since they became
+    // one-file repo loads (2026-10-11).
+    if let SceneChoice::Repo { z_wrap_spacing, .. } | SceneChoice::Text { z_wrap_spacing, .. } = choice {
         if let Some(new_z) = req.z_wrap_spacing {
             if z_wrap_spacing.to_bits() != new_z.to_bits() {
                 *z_wrap_spacing = new_z;

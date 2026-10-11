@@ -1,33 +1,30 @@
-//! Stage C — text staging: UTF-8 file → glyph instance slots on a monospace grid.
+//! Text: the world metrics, the syntax palette and colourisers, the staged
+//! scene form, and the CPU reference fold.
 //!
-//! Byte→codepoint is plain UTF-8 decoding (`str::chars` — continuation bytes
-//! produce no glyph, per FORMAT.md); codepoint→slot is the codepoints.bin trie.
-//! Layout uses the primary-font metrics: cell advance 1229 fu, em height
-//! 2320 fu, scaled to a world cell height of CELL_HEIGHT_WORLD. Per-glyph color
-//! comes from a small syntax-ish tokenizer (keywords / numbers / strings /
-//! comments / punctuation).
+//! - `CELL_HEIGHT_WORLD` / `LINE_HEIGHT_FACTOR`: the primary font's em
+//!   (2320 fu) is one world unit, a line 1.25 of them (`fu_to_world`).
+//! - The syntax colourisers (`colorize_leaders` over an item,
+//!   `colorize_line_into` and the pure-ASCII fast path per line): one
+//!   colour per UTF-8 leader from a small keyword / number / string /
+//!   comment / punctuation heuristic, what `Paint::SyntaxHeuristic` paints
+//!   on every HyperLayout path.
+//! - [`StagedText`]: what a producer (a repo or file load, an agent
+//!   session) hands `GlyphScene::new`.
+//! - `reference_layout`: an independent CPU re-implementation of the
+//!   layout fold, held bit-exact to the JS oracle's fixtures.
 //!
-//! Missing / blank codepoints occupy their advance but emit no instance; bitmap
-//! (emoji) codepoints stage a real slot from the emoji sheet like any other
-//! glyph — the shader's mode-1 branch draws them (the `emoji` golden pins it).
+//! `--render-file` staged its own text here until 2026-10-11 (`stage_file`:
+//! its own tokenizer, cell-quantized columns, 4-cell tab stops). It is a
+//! one-item repo load now (`repo::load_file`), laid out and painted by the
+//! same HyperLayout and colourisers as `--load-repo`.
 
-use std::path::Path;
-
-use crate::atlas::{Atlas, FLAG_MISSING};
-use crate::glyph_scene::{seg_tint, GlyphInstance, GroupRow, PickContext, SegCull};
+use crate::glyph_scene::{GroupRow, PickContext, SegCull};
 
 /// World-space height of one em cell (ascender→descender). Everything scales
 /// from this; only the ratio to the font units matters.
 pub const CELL_HEIGHT_WORLD: f32 = 1.0;
 /// Line pitch as a multiple of the em height (looser than 1.0 for readability).
 pub const LINE_HEIGHT_FACTOR: f32 = 1.25;
-/// `stage_file`'s tab stop width in cells: `--render-file`'s own, fixed,
-/// and what `text.png` (whose fixture has tabs) is taken under. NOT the
-/// layout recipe's tab width (`fold::TabWidth`, `[layout] tab_width_cells`,
-/// one cell by default, 2026-10-11), which this stager never reads; the two
-/// meet when `--render-file` becomes a one-item repo load (step 2 of the
-/// Instanced retirement), whose recipe will then carry 4.
-pub const TAB_CELLS: u32 = 4;
 
 /// sRGB display-value palette (VS Code dark+ flavored, brightened comments for contrast).
 pub(crate) mod palette {
@@ -48,14 +45,6 @@ pub(crate) mod palette {
 
 pub const fn pack_rgba8(rgb: [u8; 3], a: u8) -> u32 {
     rgb[0] as u32 | (rgb[1] as u32) << 8 | (rgb[2] as u32) << 16 | (a as u32) << 24
-}
-
-/// Per-position working glyph before instance tiling: (col, row, slot, color).
-struct Cell {
-    col: u32,
-    row: u32,
-    slot: u32,
-    color: [u8; 3],
 }
 
 /// The staged result: instances + group rows + world bounds (for camera fit).
@@ -89,50 +78,6 @@ pub struct StagedText {
     /// one's buffer and bytes, recipe, group row, segment, slots and local
     /// extent. The item table is written from it (`Views::item_table`).
     pub views: crate::views::Views,
-}
-
-/// Stage F: one cull segment covering a whole staged block (the text/engine
-/// scenes don't need per-group granularity — their instance counts are small).
-/// Divides into sub-blocks if instance count exceeds 512 for fine-grained culling.
-pub fn cover_segment(instances: &[GlyphInstance], min: [f32; 3], max: [f32; 3], slot_ink: &[Option<[f32; 4]>]) -> SegCull {
-    const SUBSEG_BLOCK_SIZE: usize = 512;
-    let mut blocks = Vec::new();
-    if instances.len() > SUBSEG_BLOCK_SIZE {
-        for (b_idx, chunk) in instances.chunks(SUBSEG_BLOCK_SIZE).enumerate() {
-            let b_start = b_idx * SUBSEG_BLOCK_SIZE;
-            let mut min_x = f32::INFINITY;
-            let mut min_y = f32::INFINITY;
-            let mut min_z = f32::INFINITY;
-            let mut max_x = f32::NEG_INFINITY;
-            let mut max_y = f32::NEG_INFINITY;
-            let mut max_z = f32::NEG_INFINITY;
-            for s in chunk {
-                let qw = s.advance.max(s.height);
-                min_x = min_x.min(s.pos[0]);
-                max_x = max_x.max(s.pos[0] + qw);
-                min_y = min_y.min(s.pos[1] - 0.5 * s.height);
-                max_y = max_y.max(s.pos[1] + 0.5 * s.height);
-                min_z = min_z.min(s.pos[2]);
-                max_z = max_z.max(s.pos[2]);
-            }
-            if min_x <= max_x && min_y <= max_y {
-                blocks.push(crate::glyph_scene::BlockCull {
-                    min: [min_x - 0.3, min_y - 0.5, min_z],
-                    max: [max_x + 0.6, max_y + 0.75, max_z],
-                    slot_base: b_start as u32,
-                    slot_count: chunk.len() as u32,
-                });
-            }
-        }
-    }
-    SegCull {
-        min,
-        max,
-        slot_base: 0,
-        slot_count: instances.len() as u32,
-        tint: seg_tint(instances, max[0] - min[0], max[1] - min[1], slot_ink),
-        blocks,
-    }
 }
 
 const fn make_ascii_word_table() -> [bool; 128] {
@@ -187,389 +132,6 @@ pub(crate) fn is_block_comment_continuation_line(bytes: &[u8]) -> bool {
     }
 }
 
-/// Checks whether a char slice starts with block comment continuation markers.
-#[inline(always)]
-fn is_block_comment_continuation_chars(chars: &[char]) -> bool {
-    let mut index = 0usize;
-    while index < chars.len() && (chars[index] == ' ' || chars[index] == '\t') {
-        index += 1;
-    }
-    if index < chars.len() && chars[index] == '*' {
-        let next_index = index + 1;
-        next_index >= chars.len()
-            || chars[next_index] == ' '
-            || chars[next_index] == '/'
-            || chars[next_index] == '*'
-            || chars[next_index] == '\t'
-            || chars[next_index] == '\n'
-            || chars[next_index] == '\r'
-    } else {
-        false
-    }
-}
-
-/// Stage a UTF-8 text file, tiled `copies` times (each copy its own group,
-/// offset in a grid of blocks — exercises the group table and is the stress
-/// path toward ≥1M instances).
-///
-/// `cluster_mode` selects the sequence pass on the char stream (the fold's
-/// `fold::resolve_clusters` and HyperLayout's `char_resolve` are the same
-/// rule over the same table). Leader (the
-/// default) stages one cell per codepoint, as this path always has.
-pub fn stage_file(
-    atlas: &Atlas,
-    path: &Path,
-    copies: u32,
-    cluster_mode: crate::fold::ClusterMode,
-) -> StagedText {
-    let text = std::fs::read_to_string(path)
-        .unwrap_or_else(|e| panic!("failed to read text file {}: {e}", path.display()));
-
-    let fu_per_world = atlas.metrics.em_height_fu as f32 / CELL_HEIGHT_WORLD;
-    let cell_w = atlas.metrics.advance_fu as f32 / fu_per_world; // world advance
-    let line_h = CELL_HEIGHT_WORLD * LINE_HEIGHT_FACTOR;
-    // The cluster head's advance in cells — the same narrowing push_char
-    // applies to the trie's per-codepoint advances (2 by the export rule),
-    // derived from the trie so a baked-advance change moves every twin.
-    let bitmap_cells = ((atlas.trie.bitmap_advance_fu.max(0) as u32
-        + atlas.metrics.advance_fu / 2)
-        / atlas.metrics.advance_fu)
-        .max(1);
-
-    // --- lay out one copy on a monospace grid ------------------------------
-    let mut glyphs: Vec<Cell> = Vec::new();
-    let mut codepoints_decoded = 0usize;
-    let mut missing_or_bitmap = 0usize;
-
-    let mut col: u32 = 0;
-    let mut row: u32 = 0;
-    let mut max_col: u32 = 0;
-
-    // Tokenizer state. `word_start` indexes `glyphs` where the current
-    // identifier/number run began, so a keyword can recolor its span at flush.
-    let mut word = String::new();
-    let mut word_start: usize = 0;
-    let mut in_line_comment = false;
-    let mut in_string: Option<char> = None;
-    let mut prev = '\0';
-
-    let push_char = |glyphs: &mut Vec<Cell>,
-                         ch: char,
-                         col: u32,
-                         row: u32,
-                         color: [u8; 3],
-                         atlas: &Atlas,
-                         codepoints_decoded: &mut usize,
-                         missing_or_bitmap: &mut usize|
-     -> u32 {
-        *codepoints_decoded += 1;
-        let entry = atlas.lookup(ch as u32);
-        let advance_cells = (entry.advance_fu.max(0) as u32 + atlas.metrics.advance_fu / 2)
-            / atlas.metrics.advance_fu;
-        // Bitmap (emoji) slots are STAGED like any other glyph since
-        // 2026-09-10: they carry a real slot id and the shader's mode-1 branch
-        // draws them from the sheet. Only MISSING is dropped. `advance_cells`
-        // already yields 2 for them (the trie carries the doubled advance).
-        if entry.flags & FLAG_MISSING != 0 {
-            *missing_or_bitmap += 1;
-        } else if entry.glyph_id != 0 {
-            glyphs.push(Cell {
-                col,
-                row,
-                slot: entry.glyph_id,
-                color,
-            });
-        }
-        advance_cells.max(1)
-    };
-
-    let chars: Vec<char> = text.chars().collect();
-    let is_block_continuation = is_block_comment_continuation_chars(&chars);
-    let mut in_block_comment = is_block_continuation;
-    let mut block_comment_start = if is_block_continuation { 0 } else { usize::MAX };
-    let mut ci = 0usize;
-    while ci < chars.len() {
-        let ch = chars[ci];
-        // THE SEQUENCE PASS, on the char stream (cluster mode only): a leader
-        // that starts a table sequence resolves to its one slot — the same
-        // longest-prefix rule as the fold's, over the same table (the fold's
-        // is `fold::resolve_clusters`; the oracle's is resolveClusters).
-        if cluster_mode == crate::fold::ClusterMode::Cluster {
-            let cp = ch as u32;
-            if crate::fold::is_static_zero_cp(cp) {
-                // ZWJ / variation selectors / tag characters never occupy a cell.
-                prev = ch;
-                ci += 1;
-                continue;
-            }
-            if atlas.trie.starts_a_sequence(cp) {
-                // Probe forward: up to seq_max effective members, VS16 dropped
-                // from the key (the font's GSUB strips it) but riding the span.
-                let mut key = vec![cp];
-                let mut span = 1usize;
-                while ci + span < chars.len() && key.len() < atlas.trie.seq_max as usize {
-                    let c2 = chars[ci + span] as u32;
-                    if c2 == 0x0A || c2 == 0xFE0E {
-                        break;
-                    }
-                    if c2 != 0xFE0F {
-                        key.push(c2);
-                    }
-                    span += 1;
-                }
-                let mut best = None;
-                for len in (2..=key.len()).rev() {
-                    if let Some(slot) = atlas.trie.sequence_lookup(&key[..len]) {
-                        best = Some((len, slot));
-                        break;
-                    }
-                }
-                if let Some((need, slot)) = best {
-                    // The span runs through the char that gave the key's last
-                    // member — count key-consumers, so skipped VS16s stay inside.
-                    let mut covered = 0usize;
-                    let mut need = need;
-                    while need > 0 {
-                        if (chars[ci + covered] as u32) != 0xFE0F {
-                            need -= 1;
-                        }
-                        covered += 1;
-                    }
-                    // Flush an open word exactly like the word-boundary branch.
-                    if !word.is_empty() {
-                        let wc = word_color(&word);
-                        if wc != palette::DEFAULT {
-                            for g in &mut glyphs[word_start..] {
-                                g.color = wc;
-                            }
-                        }
-                        word.clear();
-                    }
-                    let color = if in_line_comment || in_block_comment {
-                        palette::COMMENT
-                    } else if in_string.is_some() {
-                        palette::STRING
-                    } else {
-                        palette::PUNCT
-                    };
-                    glyphs.push(Cell { col, row, slot, color });
-                    codepoints_decoded += covered;
-                    col += bitmap_cells; // the head advance, derived at staging
-                    prev = chars[ci + covered - 1];
-                    ci += covered;
-                    continue;
-                }
-            }
-        }
-        if ch == '\n' {
-            // Flush any open word as keyword/number/plain.
-            if !word.is_empty() {
-                let color = word_color(&word);
-                if color != palette::DEFAULT {
-                    for g in &mut glyphs[word_start..] {
-                        g.color = color;
-                    }
-                }
-                word.clear();
-            }
-            in_line_comment = false;
-            in_block_comment = if ci + 1 < chars.len() {
-                is_block_comment_continuation_chars(&chars[ci + 1..])
-            } else {
-                false
-            };
-            block_comment_start = if in_block_comment { ci + 1 } else { usize::MAX };
-            in_string = None;
-            max_col = max_col.max(col);
-            col = 0;
-            row += 1;
-            prev = ch;
-            ci += 1;
-            continue;
-        }
-        if ch == '\t' {
-            word.clear();
-            col += TAB_CELLS - (col % TAB_CELLS);
-            prev = ch;
-            ci += 1;
-            continue;
-        }
-
-        let mut is_closing_block_comment = false;
-        let color = if in_line_comment {
-            palette::COMMENT
-        } else if in_block_comment {
-            if ci > block_comment_start + 1 && prev == '*' && ch == '/' {
-                in_block_comment = false;
-                is_closing_block_comment = true;
-            }
-            palette::COMMENT
-        } else if let Some(q) = in_string {
-            if ch == q && prev != '\\' {
-                in_string = None;
-            }
-            palette::STRING
-        } else if ch == '/' && prev == '/' {
-            in_line_comment = true;
-            // Recolor the preceding '/' too.
-            if let Some(g) = glyphs.last_mut() {
-                if g.col + 1 == col && g.row == row {
-                    g.color = palette::COMMENT;
-                }
-            }
-            palette::COMMENT
-        } else if ch == '*' && prev == '/' {
-            in_block_comment = true;
-            block_comment_start = ci;
-            if let Some(g) = glyphs.last_mut() {
-                if g.col + 1 == col && g.row == row {
-                    g.color = palette::COMMENT;
-                }
-            }
-            palette::COMMENT
-        } else if ch == '#' && (ci + 1 >= chars.len() || (chars[ci + 1] != '[' && !(chars[ci + 1] == '!' && ci + 2 < chars.len() && chars[ci + 2] == '['))) {
-            if !word.is_empty() {
-                let wc = word_color(&word);
-                if wc != palette::DEFAULT {
-                    for g in &mut glyphs[word_start..] {
-                        g.color = wc;
-                    }
-                }
-                word.clear();
-            }
-            in_line_comment = true;
-            palette::COMMENT
-        } else if ch == '"' || ch == '\'' || ch == '`' {
-            in_string = Some(ch);
-            palette::STRING
-        } else if is_word_char(ch) {
-            if word.is_empty() {
-                word_start = glyphs.len();
-            }
-            word.push(ch);
-            if word.chars().next().is_some_and(|c| c.is_ascii_digit()) {
-                palette::NUMBER
-            } else {
-                palette::DEFAULT
-            }
-        } else {
-            // Word boundary: flush as keyword/number/plain.
-            if !word.is_empty() {
-                let wc = word_color(&word);
-                if wc != palette::DEFAULT {
-                    for g in &mut glyphs[word_start..] {
-                        g.color = wc;
-                    }
-                }
-                word.clear();
-            }
-            palette::PUNCT
-        };
-
-        col += push_char(
-            &mut glyphs,
-            ch,
-            col,
-            row,
-            color,
-            atlas,
-            &mut codepoints_decoded,
-            &mut missing_or_bitmap,
-        );
-        prev = if is_closing_block_comment { '\0' } else { ch };
-        ci += 1;
-    }
-    max_col = max_col.max(col);
-
-    let block_w = max_col as f32 * cell_w;
-    let block_h = (row as f32 + 1.0) * line_h;
-
-    // --- tile copies into groups -------------------------------------------
-    let copies = copies.max(1);
-    let grid_cols = (copies as f32).sqrt().ceil() as u32;
-    let gap = cell_w * 4.0;
-
-    let mut instances = Vec::with_capacity(glyphs.len() * copies as usize);
-    let mut groups = Vec::with_capacity(copies as usize);
-
-    for copy in 0..copies {
-        let gx = copy % grid_cols;
-        let gy = copy / grid_cols;
-        groups.push(GroupRow::identity([
-            gx as f32 * (block_w + gap),
-            -(gy as f32 * (block_h + gap)),
-            0.0,
-        ]));
-        for g in &glyphs {
-            instances.push(GlyphInstance {
-                pos: [g.col as f32 * cell_w, -(g.row as f32) * line_h, 0.0],
-                glyph_id: g.slot,
-                row: g.row,
-                col: g.col,
-                color: pack_rgba8(g.color, 255),
-                group_id: copy,
-                advance: cell_w,
-                height: CELL_HEIGHT_WORLD,
-                flags: 0,
-                _pad: 0,
-            });
-        }
-    }
-
-    let total_w = grid_cols as f32 * (block_w + gap) - gap;
-    let grid_rows = copies.div_ceil(grid_cols);
-    let total_h = grid_rows as f32 * (block_h + gap) - gap;
-
-    // Depth measured from the instances rather than assumed flat: this path
-    // stages copies of a block, and whether those copies carry z is a property
-    // of how they were laid out, not something to take on faith here.
-    let (z_lo, z_hi) = instances.iter().fold((0.0f32, 0.0f32), |(lo, hi), i| {
-        (lo.min(i.pos[2]), hi.max(i.pos[2]))
-    });
-    let segments = vec![cover_segment(
-        &instances,
-        [0.0, -total_h, z_lo],
-        [total_w, line_h, z_hi],
-        &atlas.slot_ink,
-    )];
-
-    StagedText {
-        glyphs_emitted: instances.len(),
-        instances: crate::layout::GlyphArena::from_vec(instances),
-        groups,
-        bounds_min: [0.0, -total_h, z_lo],
-        bounds_max: [total_w, line_h, z_hi],
-        codepoints_decoded,
-        missing_or_bitmap,
-        focus_bounds: None,
-        segments,
-        pick: None,
-        controller: None,
-        // One view per copy, each drawn with its own copy's group row: the
-        // Derived vertex stage reads the group from the item, so a shared
-        // group 0 stacked every copy on copy 0 (2026-10-11, found when
-        // Derived became the default). Every copy reads the one file and
-        // sits under the one cover segment.
-        views: crate::views::Views::new(
-            (0..copies)
-                .map(|copy| {
-                    let first_slot = copy * glyphs.len() as u32;
-                    crate::views::View {
-                        buffer: 0,
-                        bytes: 0..text.len() as u32,
-                        recipe: glyph_field::ItemParamsGpu { line_height: line_h, ..Default::default() },
-                        group_row: copy,
-                        segment: 0,
-                        slots: first_slot..first_slot + glyphs.len() as u32,
-                        local_min: [0.0, -block_h, z_lo],
-                        local_max: [block_w, line_h, z_hi],
-                    }
-                })
-                .collect(),
-        ),
-    }
-}
-
 #[inline]
 fn word_color_packed(word: &[u8]) -> u32 {
     match word.len() {
@@ -613,32 +175,21 @@ fn word_color_packed(word: &[u8]) -> u32 {
     }
 }
 
-fn word_color(word: &str) -> [u8; 3] {
-    let p = word_color_packed(word.as_bytes());
-    if p == palette::C_KEYWORD {
-        palette::KEYWORD
-    } else if p == palette::C_NUMBER {
-        palette::NUMBER
-    } else {
-        palette::DEFAULT
-    }
-}
-
 // ── Fold-convention paths ───────────────────────────────────────────────────
 //
-// `stage_file` above is the PRODUCTION staging: cell-quantized columns, tab
-// stops, and blank/missing glyphs dropped from the instance stream (bitmap
-// slots are staged — the shader draws them from the emoji sheet).
-// The layout fold (`fold.rs`, and every backend held to it) has different
-// conventions by design: it emits ONE record per UTF-8 leader byte (newlines,
-// blanks, and missing codepoints included), accumulates X as an f64 running
-// sum of the per-glyph f32 advances (the oracle's float discipline), counts
-// COL in leader glyphs per line (a double-width glyph and a tab are one
-// column each; a tab's ADVANCE reaches the item's stop, `fold::TabWidth`,
-// one cell by default and in every fixture), and HEIGHT is the constant
-// cell height. `reference_layout` below re-implements
-// THAT fold on the CPU, independently, so its records can be diffed against
-// the fold's bit-for-bit.
+// The layout fold (`fold.rs`, and every backend held to it — HyperLayout,
+// which since 2026-10-11 lays out `--render-file` too) emits ONE record per
+// UTF-8 leader byte (newlines, blanks, and missing codepoints included),
+// accumulates X as an f64 running sum of the per-glyph f32 advances (the
+// oracle's float discipline), counts COL in leader glyphs per line (a
+// double-width glyph and a tab are one column each; a tab's ADVANCE reaches
+// the item's stop, `fold::TabWidth`, one cell by default and in every
+// fixture), and HEIGHT is the constant cell height. `reference_layout` below
+// re-implements THAT fold on the CPU, independently, so its records can be
+// diffed against the fold's bit-for-bit. (Until 2026-10-11 `stage_file`
+// staged `--render-file` with conventions of its own — cell-quantized
+// columns, its own fixed 4-cell tab stops, its own tokenizer — and is gone:
+// the file is a one-item repo load.)
 
 use crate::atlas::TrieTable;
 
@@ -935,8 +486,9 @@ pub fn fold_leaders(bytes: &[u8], wrap: i32, mode: crate::fold::WrapMode) -> Fol
 
 /// Stage E2 — per-leader syntax colors for one file, in ENGINE record order
 /// (one entry per UTF-8 leader byte, exactly the records `compact` emits, so
-/// `colors[i]` paints `records[i]`). The tokenizer is `stage_file`'s —
-/// keywords / numbers / strings / line comments / punctuation — a heuristic
+/// `colors[i]` paints `records[i]`). The tokenizer — keywords / numbers /
+/// strings / line comments / punctuation, once `stage_file`'s too (gone
+/// 2026-10-11, when `--render-file` became a repo load) — is a heuristic
 /// paint layer over the engine's layout; leader classification is the same
 /// byte-level logic as `reference_layout`.
 ///

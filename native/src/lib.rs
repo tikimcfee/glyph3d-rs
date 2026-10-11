@@ -50,8 +50,16 @@ pub type CachedAgentSession = std::sync::Arc<
 pub enum SceneChoice {
     /// Stage A stress demo (1M colored quads).
     Demo,
-    /// Stage C Slug text field: stage `file`, tiled `copies` times.
-    Text { file: PathBuf, copies: u32, emoji_sheet: PathBuf, cluster_mode: fold::ClusterMode },
+    /// One text file as a repo load of that file (`repo::load_file`, since
+    /// 2026-10-11): `copies` views over it, tiled.
+    Text {
+        file: PathBuf,
+        copies: u32,
+        emoji_sheet: PathBuf,
+        cluster_mode: fold::ClusterMode,
+        wrap_mode: fold::WrapMode,
+        z_wrap_spacing: f64,
+    },
     /// Agent Session: 3D Agent Carrel with Turn Deck and Workdesk.
     AgentSession {
         session_path: PathBuf,
@@ -247,17 +255,31 @@ fn build_scene_impl(
     let field_mode = cull_opts.field_mode;
     match choice {
         SceneChoice::Demo => (Box::new(Scene::new(ctx, color_format)), None),
-        SceneChoice::Text { file, copies, emoji_sheet, cluster_mode } => {
-            let atlas = atlas::Atlas::load(ctx, emoji_sheet);
-            let staged = text::stage_file(&atlas, file, *copies, *cluster_mode);
+        SceneChoice::Text { file, copies, emoji_sheet, cluster_mode, wrap_mode, z_wrap_spacing } => {
+            // A one-file repo load (2026-10-11): HyperLayout, the shared
+            // colourisers and whichever field was asked for, Visible included.
+            let params = repo::RepoParams {
+                wrap_mode: *wrap_mode,
+                z_wrap_spacing: *z_wrap_spacing,
+                cluster_mode: *cluster_mode,
+                field_mode,
+                ..Default::default()
+            };
+            let prefetched_atlas_handle = ctx.prefetched_atlas.lock().unwrap_or_else(|e| e.into_inner()).take();
+            let atlas = match prefetched_atlas_handle {
+                Some(handle) => handle.join().expect("prefetched atlas thread panicked"),
+                None => atlas::Atlas::load_device(&ctx.device, &ctx.queue, emoji_sheet),
+            };
+            let load = repo::load_file(file, *copies, &params, Some(ctx));
             log::info!(
-                "staged {}: {} codepoints → {} glyph instances ({} copies, {} missing/bitmap)",
+                "loaded {}: {} views over one buffer, {} records → {} glyph instances ({} blank/missing dropped)",
                 file.display(),
-                staged.codepoints_decoded,
-                staged.glyphs_emitted,
-                copies,
-                staged.missing_or_bitmap,
+                load.files.len(),
+                load.stats.records,
+                load.stats.instances,
+                load.stats.blanks,
             );
+            let staged = load.into_staged(None, &atlas.slot_ink);
             let mut scene = GlyphScene::new(ctx, color_format, &atlas, staged, camera_mode, cull, field_mode);
             scene.set_probe_cluster_mode(matches!(cluster_mode, fold::ClusterMode::Cluster));
             glyph(scene)

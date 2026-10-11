@@ -13,8 +13,9 @@
 //! Since E2a (note 23) the SHADER binds the 32 B `RenderSlot`, not the 48 B
 //! `GlyphInstance`: row/col, flags and _pad have no live readers (note 22's
 //! sweep — the shader never read them, pick/verbs ride the engine cache,
-//! seg_tint wants glyph_id+color only). HyperLayout's host path and
-//! `text::stage_file` still produce `GlyphInstance`; staging transcodes
+//! seg_tint wants glyph_id+color only). HyperLayout's host path and the
+//! agent-session staging still produce `GlyphInstance` (`text::stage_file`
+//! did too until 2026-10-11); staging transcodes
 //! field-wise, so the vertex math reads the same values and the goldens stay
 //! byte-equal by construction.
 

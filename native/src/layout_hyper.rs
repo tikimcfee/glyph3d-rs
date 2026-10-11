@@ -272,7 +272,8 @@ impl HyperLayout {
                 })
                 .collect();
             *arena = GlyphArena::from_visible(VisibleStaging {
-                item_bytes: Vec::new(),
+                buffer_bytes: Vec::new(),
+                item_buffers: Vec::new(),
                 line_table: line_table.expect("Pass 1 ran with lines for the visible field"),
                 seeds,
                 glyph_count: total_survivors as u64,

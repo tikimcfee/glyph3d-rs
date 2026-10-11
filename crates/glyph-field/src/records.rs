@@ -9,7 +9,7 @@
 use bytemuck::{Pod, Zeroable};
 
 /// The engine's glyph record — 48 B, the neutral form every CPU producer
-/// (HyperLayout's host path, `text::stage_file`)
+/// (HyperLayout's host path, the agent-session staging)
 /// emits. No mode binds it directly: each mode converts it into its own slot
 /// format at upload (Instanced: field-wise into the 32 B `RenderSlot`, so the
 /// vertex math reads the same values).

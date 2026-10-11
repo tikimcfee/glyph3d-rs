@@ -25,7 +25,7 @@
 # Ratchet, NOT an equality: tests are added constantly, so an exact pin would
 # redden on the most common good action in the repo. A green run whose real
 # count exceeds the floor prints a NOTE naming the value to raise it to.
-test_floor = 389
+test_floor = 390
 # Every golden view is rendered again under each of these and must match the
 # SAME baseline byte for byte (2026-10-09, C20). The plain frames render the
 # Derived field, the default since 2026-10-11 (Instanced retirement step 1);
@@ -36,12 +36,16 @@ test_floor = 389
 # Instanced field byte-equal to the same frames until step 3 deletes it.
 # `--field-mode visible` (M4, 2026-10-10): the Visible field lays every frame
 # out on the GPU per frame; held here to the same baselines where it can be
-# — repo-highlight for real (visible mode, byte-equal), the --render-file
-# views by their fall-back to Derived (no line table; Instanced until
-# 2026-10-11), demo with no field — and EXEMPT, with its why on the view,
-# where it cannot: the five syntax-painted repo views, which visible mode
-# renders flat by decision (`[[golden_view.exempt]]`; rendered and reported,
-# never judged).
+# — repo-highlight for real (visible mode, byte-equal), demo with no field —
+# and EXEMPT, with its why on the view, where it cannot: the five
+# syntax-painted repo views, which visible mode renders flat by decision
+# (`[[golden_view.exempt]]`; rendered and reported, never judged). The three
+# --render-file views fell back to Derived under it until 2026-10-11; since
+# --render-file became a one-item repo load (step 2) they are visible mode
+# for real, and so render flat under it like the five: each is the step-2
+# frame's flat-paint twin byte for byte (measured on vulkan-nvidia). Whether
+# they are exempted like the five is decided when their step-2 frames are
+# adopted; until then pixel-ab is red on them plain and under this entry.
 golden_equivalents = ["--field-mode instanced", "--field-mode visible"]
 
 
@@ -228,7 +232,8 @@ equivalent = "--field-mode visible"
 why = "visible mode paints no syntax (by decision): this frame under it is the stored modes' --color-mode flat render byte for byte, 256,744 px of token colour short of the baseline on vulkan-nvidia, 256,643 on metal-apple (wide.txt's receding source); its z-order is the same picture"
 # The colour-emoji frame (2026-09-10): every class of bitmap slot the trie has
 # — web-era re-pointed, appended, no-cell, emoji-in-the-font-but-text-here —
-# through the CPU staging path and the shader's mode-1 branch. The only frame
+# through `--render-file` (a one-item repo load since 2026-10-11; the CPU
+# text stager before) and the shader's mode-1 branch. The only frame
 # that samples the emoji sheet, so the only one that can see it; expect more
 # cross-vendor drift here than on text (filtered sampling is not analytic
 # coverage). `emoji-uv-flip` proves it reddens. It pins `--cluster-mode
@@ -237,7 +242,8 @@ why = "visible mode paints no syntax (by decision): this frame under it is the s
 [[golden_view]]
 name = "emoji"
 cmd = "--render-file fixtures/emoji-view.txt --frames 2 --zoom 1.25 --cluster-mode leader"
-# The sequence pass, on the CPU staging path: cluster-mode rendering of every
+# The sequence pass, through `--render-file` (HyperLayout's sequence pass
+# since 2026-10-11, the text stager's before): cluster-mode rendering of every
 # sequence class the trie resolves (families, flags, skin tones, keycaps, tag
 # flags) plus the fallbacks (pieces for unlisted chains, zero-width ZWJ). Its
 # leader twin is emoji.png, which KEEPS pinning leader mode — the fixture is
@@ -247,7 +253,8 @@ cmd = "--render-file fixtures/emoji-view.txt --frames 2 --zoom 1.25 --cluster-mo
 name = "emoji-cluster"
 cmd = "--render-file fixtures/emoji-cluster-view.txt --frames 2 --zoom 1.25 --cluster-mode cluster"
 # The repo-load twin: a tiny repo whose files carry the same classes through
-# --load-repo (HyperLayout resolves them end to end).
+# --load-repo (HyperLayout resolves them end to end; since 2026-10-11 so does
+# emoji-cluster, one file at a time).
 [[golden_view]]
 name = "repo-cluster"
 cmd = "--load-repo fixtures/g-cluster-repo --frames 2 --cluster-mode cluster --color-mode syntax"
@@ -419,7 +426,7 @@ cmd = "GLYPH_TRACE=warn target/release/glyph3d-native --hyper-oracle-check nativ
 pass_line = "hyper-oracle PASS"
 needs = ["renderer", "fixtures"]
 compare = "HyperLayout vs fold.rs's records compacted by layout::compact_records_into, bit-exact, through layout::diff_backends plus a per-record tally naming the byte, on FIVE tiers: records (its recording path, rederive.rs), host instances and placements (pass2_host.rs, a device-less load), and the DEVICE Pass 2 (pass2_device.rs, what every GPU load runs) run into host memory in both slot formats — RenderSlot byte-for-byte, DerivedSlot on every lane it carries — plus its placements. Corpora: the 26 pipe fixtures (each item its own buffer, its own cluster mode; paged-rows, paged-cols and scroll-only carry the page_rows / page_cols / scroll_rows classes), the IMMUTABLE cubecl-fork corpus, g-cluster-repo, overflow-leads.txt, g-pick-repo and the IMMUTABLE chunk-cut.txt (lines cut inside into chunks: a sequence across each 64 KiB target, non-ASCII advances before each cut, a continuation wider than any ASCII segment past the first page) and the IMMUTABLE chunk-cut-paint.txt (a keyword across every intra-line cut) in cluster mode, then those six again in leader mode. 2026-10-09 (with chunk-cut-paint.txt): 1,504,558 records / 1,497,095 instances / 1,497,095 device slots x2 / 47 placements in the strict cluster run (389 sequence heads, 36 ASCII-led); 1,349,336 records / 1,344,746 instances and device slots x2 / 14 placements in the leader run. STRICT (first run) refuses zero records, zero sequence heads, or zero ASCII-led heads; both runs refuse zero device slots. The fifth tier, PAINT (C17, 2026-10-09): the device Pass 2 again under Paint::SyntaxHeuristic, every lane against the reference instances painted by text::colorize_leaders over the WHOLE item (the host Pass 2's colours, not the oracle's — the oracle has no paint); 1,497,095 slots x2 (785,492 a non-default colour) in the strict run, 1,344,746 x2 (666,045) in the leader run, and both runs refuse a paint tier that saw no syntax colour. The sixth tier, VISIBLE (M2, 2026-10-10): the visible field's GPU layout kernel (crates/glyph-field-visible, glyph_field_visible::layout_all_lines) over EVERY line of every corpus item — Pass 1 with the line table and its long-line segment seeds, the kernel's own trie lookup and cluster-mode sequence pass, no cull — its DerivedSlots compared byte for byte, in slot order, with the device Pass 2's Derived emission of the same bytes; runs on this host's GPU (gpu::init; GLYPH_HYPER_ORACLE_NO_GPU=1 skips it and STRICT refuses that); refuses zero slots. Its SPAN half (M3, 2026-10-10): the same kernel under a deterministic byte-range span set per item (5 bytes every 13 from byte 3, 9 every seventh, three colours) against the device Pass 2 under Paint::ByteSpans with the same spans — the colouring every visible-mode recolour and highlight rides on; refuses a run in which no reference slot carried a span colour. TAB STOPS (2026-10-11): two more runs, every tier, at --tab-width 4 (strict, cluster: tab-stops, g-cluster-repo, g-pick-repo — 413,131 records / 411,950 instances and device slots x2, 658 tabs wider than a cell) and --tab-width 8 (leader: tab-stops — 5,311 records / 4,478 instances, 695 tabs wider than a cell); each refuses a corpus in which no tab spanned more than one cell"
-blind_to = "Shared with the reference and so invisible here: the atlas trie (TrieTable::lookup, fu_to_world — the fixtures' own tries are world-unit and HyperLayout resolves font units) and fold::{rows_for_line, wrap_segment_of, wrap_row_of}, which HyperLayout borrows (reference-port fences those; phantom-row is the measured example). The device path past the emitter (the staging copy into VRAM, buffer chunking), the Derived field's vertex-stage Y/Z (the slot carries none), and the background Pass 1 prefetch (repo-verify holds it to the inline Pass 1 used here; since C15 both share one Pass 1 driver). Paint: the paint tier holds the device's line-by-line colouring to the whole-item colouriser, not to any truth — the heuristic's own rules (keywords, strings, comments) are shared and unjudged, and `--render-file`'s tokenizer (stage_file) is a third copy no tier reads. Visible: the tier holds the kernel to the device Pass 2 (itself held to the oracle above), over every line but through no cull, no LOD and no span colour (flat paint on both sides) — the per-frame cull, the wash tier and span colouring are the renderer's and the crate's own tests' business; and the kernel ran on THIS host's rasterizer only (the M2 runs the same check under Metal). Tab stops past one cell: NO oracle — the JS oracle and the fixtures know one-cell tabs only, so the reference there is fold.rs's own stop rule (fold::tests holds it to text::reference_layout, the independent lineage, and to the oracle-backed one-cell fold over the spaces a tab stands for); `fold::TabWidth::tab_cells` is shared by every engine and both witnesses but reference_layout, which computes the stop itself. A tabbed line long enough to be cut into chunks reaches this gate nowhere (cargo-test's grid has it)"
+blind_to = "Shared with the reference and so invisible here: the atlas trie (TrieTable::lookup, fu_to_world — the fixtures' own tries are world-unit and HyperLayout resolves font units) and fold::{rows_for_line, wrap_segment_of, wrap_row_of}, which HyperLayout borrows (reference-port fences those; phantom-row is the measured example). The device path past the emitter (the staging copy into VRAM, buffer chunking), the Derived field's vertex-stage Y/Z (the slot carries none), and the background Pass 1 prefetch (repo-verify holds it to the inline Pass 1 used here; since C15 both share one Pass 1 driver). Paint: the paint tier holds the device's line-by-line colouring to the whole-item colouriser, not to any truth — the heuristic's own rules (keywords, strings, comments) are shared and unjudged (`--render-file` paints with the same colourisers since 2026-10-11; its own tokenizer, stage_file, is gone). Visible: the tier holds the kernel to the device Pass 2 (itself held to the oracle above), over every line but through no cull, no LOD and no span colour (flat paint on both sides) — the per-frame cull, the wash tier and span colouring are the renderer's and the crate's own tests' business; and the kernel ran on THIS host's rasterizer only (the M2 runs the same check under Metal). Tab stops past one cell: NO oracle — the JS oracle and the fixtures know one-cell tabs only, so the reference there is fold.rs's own stop rule (fold::tests holds it to text::reference_layout, the independent lineage, and to the oracle-backed one-cell fold over the spaces a tab stands for); `fold::TabWidth::tab_cells` is shared by every engine and both witnesses but reference_layout, which computes the stop itself. A tabbed line long enough to be cut into chunks reaches this gate nowhere (cargo-test's grid has it)"
 
 # HyperLayout against itself. EVERY --repo-engine constructs the
 # same HyperLayout (layout.rs's backend table), so this is not an independent
@@ -457,7 +464,7 @@ scope = "render"
 kind = "golden-verify"
 needs = ["renderer", "pixel-baselines"]
 compare = "every declared golden_view re-rendered vs out/tooling-ab/baseline/<this host's --gpu-key>, byte-equal — and again under each settings.golden_equivalents (--field-mode instanced, --field-mode visible) against the same baseline (the plain frames render the Derived field, the default since 2026-10-11); a view exempt from an equivalent (golden_view.exempt, with its why) is rendered under it all the same and its distance printed as a NOTE with the pixel count, never judged, and an exempt frame that turns out byte-equal is flagged as a possibly stale exemption"
-blind_to = "everything outside the declared frames; regression vs intentional change (re-baselining is a human act); any rasterizer other than this host's — a set proves nothing about another vendor; an equivalent that legitimately stops matching (it cannot be given its own baseline here); the exempt (view, equivalent) pairs `glyph gates` lists — today the five syntax-painted repo views under --field-mode visible, which visible mode renders flat by decision (their reported distance is the token colours and nothing else, measured); and what the visible equivalent reaches: the --render-file views fall back to Derived under it (no line table; to Instanced until 2026-10-11) and demo has no field, so repo-highlight is the one frame held to visible mode's own pixels (visible-row-off-by-one proves it)"
+blind_to = "everything outside the declared frames; regression vs intentional change (re-baselining is a human act); any rasterizer other than this host's — a set proves nothing about another vendor; an equivalent that legitimately stops matching (it cannot be given its own baseline here); the exempt (view, equivalent) pairs `glyph gates` lists — today the five syntax-painted repo views under --field-mode visible, which visible mode renders flat by decision (their reported distance is the token colours and nothing else, measured); and what the visible equivalent reaches: demo has no field, and every syntax-painted frame renders flat under it — the five exempt repo views and, since --render-file became a one-item repo load (2026-10-11), text, emoji and emoji-cluster, which are visible mode for real there and not yet exempt or adopted — so repo-highlight is the one frame held to visible mode's own pixels (visible-row-off-by-one proves it)"
 
 # ── Declared mutations ───────────────────────────────────────────────────
 # `glyph mutate` applies each of these, requires the named gate to go red
@@ -708,11 +715,11 @@ rebuild = "cargo build --release"
 [[mutation]]
 name = "cluster-static-zero-off"
 gate = "pixel-ab"
-why = "the invisible-by-design rule off: ZWJ / variation selectors / tags occupy full cells again — the sequence pass's fallback state moves, which is exactly what the emoji-cluster frame exists to see. CONSUMED BY: emoji-cluster.png's lone-zwj/VS16 line"
-file = "native/src/text.rs"
+why = "the invisible-by-design rule off: ZWJ / variation selectors / tags occupy full cells again — the sequence pass's fallback state moves, which is exactly what the emoji-cluster frame exists to see. Re-anchored 2026-10-11 from the text stager (gone: --render-file is a one-item repo load) onto HyperLayout's resolve, which that frame now renders through; measured by hand that day, the mutant moves emoji-cluster.png 12,079 px against the step-2 frame and text.png and emoji.png not at all. Unprovable by `glyph prove` until the step-2 frames are adopted (pixel-ab is red on them until then). CONSUMED BY: emoji-cluster.png's lone-zwj/VS16 and pieces lines"
+file = "native/src/layout_hyper/char_resolve.rs"
 op = "replace"
-find = "            if crate::fold::is_static_zero_cp(cp) {"
-with = "            if false && crate::fold::is_static_zero_cp(cp) {"
+find = "    if is_static_zero_cp(cp) {"
+with = "    if false && is_static_zero_cp(cp) {"
 expect = "emoji-cluster.png diverges from baseline"
 rebuild = "cargo build --release"
 
@@ -1089,14 +1096,36 @@ expect = "every_glyph_shader_covers_the_largest_outline"
 rebuild = "cargo build --release"
 
 [[mutation]]
-name = "render-file-copies-share-group-0"
+name = "render-file-copies-stacked"
 gate = "cargo-test"
-why = "the text stager's items all naming group 0, as they did until 2026-10-11: the Derived vertex stage draws with the item's group, so `--render-file --copies N` stacked every copy on copy 0 in the default field (Instanced, reading the slot's group, tiled them). No golden view uses --copies. Since the view registry (2026-10-11) the copies are views and the item table's group lane is written from their group rows, so the mutation registers every copy's view under row 0; the host records still name rows 1..N, which no view draws with now, and the Derived host transcode refuses them (the renderer panics) instead of drawing them on copy 0 — a louder red for the same defect. CONSUMED BY: native/tests/render_file_copies.rs, the default frame of four copies against Instanced's"
-file = "native/src/text.rs"
+why = "every copy of `--render-file --copies N` placed at copy 0's offset: the copies draw stacked on one another, the defect class `render-file-copies-share-group-0` stood for until 2026-10-11 (the text stager's copies all naming group 0). That mutation is retired with the stager: since --render-file is a one-item repo load the copies' group rows come from the loader's `group_rows_of_views`, shared with every repo load and held by native/tests/view_registry.rs, and what is the copies' own is their tiling. No golden view uses --copies. CONSUMED BY: repo::tile_views, via tile_views_frame_copies_as_the_text_stager_did (the lib binary fails first, so native/tests/render_file_copies.rs, which also sees it, does not run)"
+file = "native/src/repo.rs"
 op = "replace"
-find = "                        group_row: copy,"
-with = "                        group_row: 0 * copy,"
-expect = "copies_tile_in_the_default_field"
+find = "        view.offset = [column as f32 * (block_width + gap), -(row as f32 * (block_height + gap)), 0.0];"
+with = "        view.offset = [0.0 * column as f32 * (block_width + gap), -(0.0 * row as f32 * (block_height + gap)), 0.0];"
+expect = "tile_views_frame_copies_as_the_text_stager_did"
+rebuild = "cargo build --release"
+
+[[mutation]]
+name = "tile-block-drops-pen-row"
+gate = "cargo-test"
+why = "a tiled copy's block measured without the pen's row after a final newline: `--render-file` frames one row shorter than the text stager did (2026-10-11, step 2: the rule that keeps the camera where it was), and the copies of a file stack a row closer. The page extent ends at the last record's row, so the rule adds the row itself. CONSUMED BY: repo::tile_views, via tile_views_frame_copies_as_the_text_stager_did"
+file = "native/src/repo.rs"
+op = "replace"
+find = "+ if newline_ended { line_height } else { 0.0 });"
+with = "+ if newline_ended { 0.0 } else { 0.0 });"
+expect = "tile_views_frame_copies_as_the_text_stager_did"
+rebuild = "cargo build --release"
+
+[[mutation]]
+name = "visible-item-bytes-by-item-index"
+gate = "cargo-test"
+why = "the Visible field handed each item the buffer at the ITEM's index rather than the item's buffer: right at a repo load (one buffer per item, so every repo frame and the view-registry witness stay byte-equal), out of range for `--render-file --copies N`, whose N items read buffer 0 (2026-10-11, the first several-views-per-buffer producer). The renderer panics and the frame never renders. CONSUMED BY: glyph_scene::setup's Visible inputs, via native/tests/render_file_copies.rs (copies_tile_in_every_field, its visible case)"
+file = "native/src/glyph_scene/setup.rs"
+op = "replace"
+find = "(0..staging.items.len()).map(|item| staging.item_bytes(item)).collect();"
+with = "(0..staging.items.len()).map(|item| staging.buffer_bytes[item].as_slice()).collect();"
+expect = "copies_tile_in_every_field"
 rebuild = "cargo build --release"
 
 [[mutation]]

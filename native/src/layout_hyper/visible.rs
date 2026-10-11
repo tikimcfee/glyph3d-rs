@@ -14,9 +14,13 @@
 //! BYTES. A repo load's bytes live in the walk's `RepoFile.bytes` Vecs. The
 //! layout seam borrows them (`LayoutItem<'_>`), so it cannot take ownership;
 //! the loader does, AFTER the views are built, by moving each file's Vec into
-//! `item_bytes` — no copy of the corpus (a 94 MB tree stays one allocation
-//! per file). The field uploads them at `items[i].byte_base`, which is the
-//! running sum of the lengths in item order.
+//! `buffer_bytes` — no copy of the corpus (a 94 MB tree stays one allocation
+//! per file) — and naming each item's file in `item_buffers` (one item per
+//! file at a repo load; at `--render-file --copies N`, 2026-10-11, N items
+//! over buffer 0, so the host keeps one copy of the file). The field uploads
+//! each ITEM's bytes at `items[i].byte_base`, the running sum of the items'
+//! lengths in item order: the GPU holds a copy per item, the line table an
+//! entry per line per item (Pass 1 runs once per item).
 //!
 //! PLACEMENTS. With no Pass 2 there is no emitter to measure the extents, so
 //! each item's `ItemPlacement` comes from `pass2_host::compute_single_item_placement`,
@@ -47,9 +51,12 @@ pub struct VisibleItemSeed {
 /// The visible mode's arena form.
 #[derive(Default)]
 pub struct VisibleStaging {
-    /// Each item's bytes, in item order. Empty until the loader moves the
-    /// walk's buffers in (`repo::load_repo_from_prefetched`).
-    pub item_bytes: Vec<Vec<u8>>,
+    /// Each buffer's bytes, in the walk's file order. Empty until the loader
+    /// moves the walk's buffers in (`repo::load_repo_from_prefetched`,
+    /// `repo::load_file`).
+    pub buffer_bytes: Vec<Vec<u8>>,
+    /// Each item's buffer, an index into `buffer_bytes`; set with it.
+    pub item_buffers: Vec<u32>,
     pub line_table: LineTable,
     pub seeds: Vec<VisibleItemSeed>,
     /// The glyphs the items would produce, summed — what `--load-repo`
@@ -60,13 +67,18 @@ pub struct VisibleStaging {
 }
 
 impl VisibleStaging {
+    /// Item `i`'s bytes: its buffer's.
+    pub fn item_bytes(&self, i: usize) -> &[u8] {
+        &self.buffer_bytes[self.item_buffers[i] as usize]
+    }
+
     /// Finish item `i` into the field's record. `bbox` is the item's LOCAL
     /// box (its `SegCull` before the group's T·R·S); the field's item cull
     /// carries it through the live group row.
     pub fn item(&self, i: usize, group_params: ItemParamsGpu, bbox_min: [f32; 3], bbox_max: [f32; 3]) -> VisibleItem {
         let seed = &self.seeds[i];
         let p = &seed.params;
-        let byte_base: u64 = self.item_bytes[..i].iter().map(|b| b.len() as u64).sum();
+        let byte_base: u64 = (0..i).map(|before| self.item_bytes(before).len() as u64).sum();
         let lines = self.line_table.item_lines(i);
         VisibleItem {
             params: group_params,
@@ -228,7 +240,7 @@ mod tests {
         assert!(arena.is_visible() && !arena.is_device());
         let staging = arena.visible_staging().unwrap();
         assert_eq!(staging.seeds.len(), items.len());
-        assert!(staging.item_bytes.is_empty(), "the loader, not the seam, owns the bytes");
+        assert!(staging.buffer_bytes.is_empty() && staging.item_buffers.is_empty(), "the loader, not the seam, owns the bytes");
         let table_glyphs: u64 = staging.line_table.entries.iter().map(|e| e.glyph_count as u64).sum();
         assert_eq!(table_glyphs, staging.glyph_count);
         assert_eq!(arena.len() as u64, staging.glyph_count);
@@ -275,7 +287,8 @@ mod tests {
         let mut arena = GlyphArena::new();
         engine.layout_items(&items, &mut arena).unwrap();
         let staging = arena.visible_staging_mut().unwrap();
-        staging.item_bytes = corpus.items.iter().map(|it| it.bytes.clone()).collect();
+        staging.buffer_bytes = corpus.items.iter().map(|it| it.bytes.clone()).collect();
+        staging.item_buffers = (0..corpus.items.len() as u32).collect();
         let mut base = 0u64;
         for (i, item) in items.iter().enumerate() {
             let mut gp = ItemParamsGpu::from(&item.params);

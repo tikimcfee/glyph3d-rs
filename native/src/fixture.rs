@@ -571,7 +571,7 @@ fn out_of_domain(fx: &PipeFixture) -> Option<String> {
     }
     // The sequence pass rewrites the static tier before the fold; this
     // reference deliberately folds leader-mode only — the pass lives in the
-    // twins (text.rs's stage_file, the fold and the layout backends), and the
+    // twins (the fold and the layout backends), and the
     // reference is specified against ItemParams::default, whose cluster mode
     // is Leader. A cluster-mode item is out of its
     // declared domain — same reasoning as the wrap-mode line above.
