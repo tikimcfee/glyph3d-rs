@@ -69,15 +69,17 @@ or live from the Debug panel):
 
 | Mode | Per glyph | What it means |
 |---|---|---|
-| `instanced` (default) | 32 B record | every glyph's full placement, read as-is |
-| `derived` | 20 B record | compact; the vertex stage derives Y/Z from per-file tables |
+| `derived` (default) | 20 B record | compact; the vertex stage derives Y/Z from per-file tables |
+| `instanced` | 32 B record | every glyph's full placement, read as-is; being retired |
 | `visible` | nothing | the source bytes and a line table stay resident; each frame the GPU culls to the lines in view and lays out only those. Lines too small for glyphs become one-quad washes, files too small for washes become rectangles |
 
 All three render the same pixels on every golden view, with one difference
 by design: visible mode applies no load-time syntax colouring (colour is
 meant to arrive as byte spans from AST/LSP analysis; `--highlight` takes a
 sidecar of such spans today). Text, agent-session and demo scenes use the
-stored modes. Every glyph stays individually editable in every mode
+stored modes (a `visible` request there builds `derived`). Derived became
+the default on 2026-10-11, with no pixel moving; `instanced` is being
+retired. Every glyph stays individually editable in every mode
 (recolour, background, transform), keyed by slot in the stored modes and by
 (file, byte) in visible mode. The design log is `out/VISIBLE-MODE.md`.
 

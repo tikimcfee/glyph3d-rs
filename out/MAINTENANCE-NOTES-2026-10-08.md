@@ -141,6 +141,38 @@ export GLYPH_FLAGSHIP_REPO=<path-to-glyph3d-js-checkout>
 
 ## Current state and open items (2026-10-10)
 
+**Instanced retirement, step 1 landed (2026-10-11): Derived is the default
+field mode, no pixel moved.** `--field-mode`, `GlyphFieldMode::default()`,
+the launcher and every in-code default now say `derived`; the plain golden
+frames render Derived and stay byte-equal to the baselines they always had.
+`golden_equivalents` swapped `--field-mode derived` (now redundant) for
+`--field-mode instanced`, so Instanced is held to every golden until it is
+deleted; the visible exemptions are unchanged. `coverage-scale` and
+`emoji-uv-flip` now mutate the Derived shader (the plain frames' field), and
+`derived-placement-row-zeroed` proves against repo-highlight's plain frame.
+The agent-session Carrel stages one item per text block (origin = the block's
+start y/z, its line height, its own group; the Workdesk stack labels, which
+shared group 0, each got a group of their own, reserved before the cards so
+draw order holds): a session renders byte-equal in both modes, and
+`derived_positions_match_the_staged_ones` holds every glyph's derived y/z to
+its staged one bit for bit (`session-block-origin-z-dropped` proves it). A
+Visible request on a host-staged scene builds Derived (was Instanced).
+Derived's `nudge-glyph` y/z and `scale-glyph` now reply "not representable"
+and apply nothing (x nudges still apply; `native/tests/derived_verbs.rs`).
+`--engine-render` is deleted (dead; it would have rendered wrong under
+Derived's default item table).
+- **Remaining:** step 2, `--render-file` becomes a one-item repo load; step 3,
+  delete `glyph-field-instanced`, its shader, `RenderEmit` and hyper-oracle's
+  RenderSlot tier (and move the emoji alpha-contract statement from
+  `glyph_field.wgsl`'s header to the Derived shader's).
+- **Temporary limitation, recorded:** a load past the Derived lanes still
+  falls back to Instanced with one warning — `ITEM_MAX` 1,048,575 items,
+  `ROW_MAX` 16,777,215 rows per item, `X_PAGE_MAX` 255 column pages
+  (`crates/glyph-field-derived/src/derive.rs`, checked by
+  `layout_hyper::derived_lane_limits`). Step 3 turns the fall-back into a
+  refusal; the workarounds then are widening a lane or splitting an
+  oversized file into several items.
+
 **State.** origin/main is this branch. Battery ALL GATES GREEN, 15 of 15
 (327 tests at floor 327) on vulkan-nvidia and metal-apple; every golden
 byte-equal plain and under both equivalents (`--field-mode derived`;
@@ -155,7 +187,9 @@ confirmed C29's and C30's fixes by eye. (`out/VISIBLE-MODE.md` is its log.)
   so visible mode is held to pixels on every repo camera — or leave coverage
   at repo-highlight plus the printed distances.
 - M5: visible as the default field mode.
-- Retiring the stored modes. Dependency order found by the 2026-10-10 code
+- Retiring the stored modes. (2026-10-11: Ivan decided to retire Instanced in
+  three steps; step 1 landed, above — the agent-session obstacle below is
+  gone, each card block is now an item.) Dependency order found by the 2026-10-10 code
   survey: agent sessions are host-staged at absolute card positions (only
   instanced stores those), so instanced stays until each card becomes an item
   (a byte range with its own group transform: Ivan's idea, 2026-10-10); derived
@@ -163,13 +197,13 @@ confirmed C29's and C30's fixes by eye. (`out/VISIBLE-MODE.md` is its log.)
   visible oracle and pixel witnesses compare against it); the syntax heuristic
   goes with the stored modes, which is where the flat goldens come in.
 
-**Next: code cleanup** (2026-10-10 survey; cheapest risk first): delete
-`--engine-render`; fold `batch`/`naive` into `direct` and drop the
+**Next: code cleanup** (2026-10-10 survey; cheapest risk first): ~~delete
+`--engine-render`~~ (done 2026-10-11); fold `batch`/`naive` into `direct` and drop the
 always-zero CubeCL-era phase lines (keep the `phases:` line bench_hyper.py
 parses); sweep 29 unreferenced `pub` fns; move the six unrun self-test
 hooks and the egui panels out of `WindowState::render` (~1,370 lines);
-fix Derived's silent `scale-glyph`/nudge-y/z no-op (it replies as if
-applied). Ivan's call: `--demo` (a golden view), `--no-cull`, the
+~~fix Derived's silent `scale-glyph`/nudge-y/z no-op~~ (done 2026-10-11: it
+says "not representable"). Ivan's call: `--demo` (a golden view), `--no-cull`, the
 Zed-experiment live path (feature-gate vs delete), the walker reporting its
 extension and directory-name skips.
 

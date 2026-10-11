@@ -99,11 +99,20 @@ caller; the short version:
     background prefetch. Under `--repo-verify`, `direct` records nothing (the
     diff covers placements and instances only) while `batch` and `naive` take
     the recording path; the stats line prints their readback/compaction phases.
-- `--field-mode instanced|derived|visible` selects the glyph field mode:
-  - `instanced` (32 B per glyph): precomputed 3D coordinates.
-  - `derived` (20 B per glyph): compact word layout, Y/Z derived dynamically in vertex WGSL.
+- `--field-mode derived|visible|instanced` selects the glyph field mode:
+  - `derived` (20 B per glyph; THE DEFAULT since 2026-10-11, Instanced
+    retirement step 1 — no golden pixel moved): compact word layout, x stored,
+    Y/Z derived in the vertex stage from the item table. Host-staged scenes
+    (`--render-file`, agent sessions) transcode their 48 B records against
+    their own item table — the agent-session Carrel stages one item per text
+    block (`agent_transcript::staging::block_item`) so derived y/z equal the
+    absolute ones bit for bit. `nudge-glyph` y/z and `scale-glyph` have no
+    lane here and reply "not representable" (x nudges apply).
+  - `instanced` (32 B per glyph): precomputed 3D coordinates. Being retired:
+    held byte-equal to every golden by the `--field-mode instanced`
+    equivalent until step 3 deletes its crate.
   - `visible` (2026-10-10; a golden equivalent since M4, with five syntax views
-    exempt; the default is still `instanced`; `out/VISIBLE-MODE.md`): no slot per
+    exempt; the default is `derived`; `out/VISIBLE-MODE.md`): no slot per
     glyph. HyperLayout runs Pass 1 WITH the line table and no Pass 2; the arena
     comes back in its third form (`layout_hyper::VisibleStaging`: the table, one
     seed per item, and — moved in by the loader, never copied — the walk's own
@@ -137,6 +146,10 @@ caller; the short version:
     any slot is emitted. A Derived or Visible load past them falls back to
     `instanced` with ONE warning naming the item and the limit; the field the scene
     builds follows the arena, and the panel/HUD show the mode actually built.
+    TEMPORARY (2026-10-11): with Derived the default, this fall-back is the
+    last thing Instanced does for a default load; step 3 of its retirement
+    makes it a refusal (workarounds: widen a lane, or split an oversized file
+    into several items).
 - A verify over ZERO items refuses. Before 2026-09-07 a missing corpus directory
   printed `PASS: 0 items, 0 instances` and exited 0 — the gate passing having
   compared nothing.
@@ -304,7 +317,7 @@ its staging text predates C22). Key touchpoints:
   cluster the default since 2026-09-22, the hook's toggle goes OFF and the
   count rises. Measured leader→cluster on fixtures/g-cluster-repo: 359 →
   345; on fixtures/emoji-corpus-small.txt, a TEXT scene: 893 → 801).
-  The button shows on repo and text scenes; demo/engine-text scenes carry
+  The button shows on repo and text scenes; demo and agent-session scenes carry
   no mode and hide it.
 - `GLYPH_FIELDMODE_SELFTEST=1` — windowed, dev-only (2026-10-10): at t≈3 s
   cycles the field mode Instanced → Derived → Visible through the SAME

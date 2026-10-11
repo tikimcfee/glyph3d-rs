@@ -32,7 +32,15 @@ against `build.toml` that day; `cargo glyph gates` is the live list.)
   glyphs are washes (one quad each). The renderer's side of it is
   `native/src/layout_hyper/visible.rs` (the arena's third form) and the `Visible`
   arms of `glyph_scene/{setup,render}.rs`. Chosen at load with
-  `--field-mode instanced|derived|visible`, switchable live from the Debug panel.
+  `--field-mode derived|visible|instanced`, switchable live from the Debug panel.
+  **Derived is the default since 2026-10-11** (Instanced retirement, step 1 of
+  three: no pixel moved — the plain golden frames now render Derived, byte-equal
+  to the baselines they always had). Step 2 makes `--render-file` a one-item
+  repo load; step 3 deletes `glyph-field-instanced`. Until then Instanced stays
+  a mode, held byte-equal by the `--field-mode instanced` golden equivalent, and
+  is still the fall-back for a load past the Derived lanes. The agent-session
+  Carrel stages one item per text block (`agent_transcript::staging::block_item`)
+  so Derived lands its glyphs where Instanced's absolute positions do.
   M3 (2026-10-10) re-keyed selection, the glyph verbs and styling there by
   (item, byte) in place of the slot (`out/VISIBLE-MODE.md` § M3); the witness
   is `native/tests/visible_verbs.rs`, a pixel comparison of the same verb in
@@ -536,24 +544,27 @@ What a set proves is the renderer ON THE HARDWARE THAT MADE IT — a green here 
 Linux says nothing about Metal, and `validate` refuses a golden output that is
 not keyed.
 
-**Golden equivalents: the Derived field, without a second set (2026-10-09).**
+**Golden equivalents: a second field, without a second set (2026-10-09).**
 `build.toml [settings] golden_equivalents` lists argument lists under which
 every golden view must render its baseline's exact bytes; the gate renders
 each view again with each list appended and compares against the SAME PNG
-(`PASS  text.png BYTE-EQUAL under --field-mode derived`). It holds one entry,
+(`PASS  text.png BYTE-EQUAL under --field-mode instanced`). Its first entry was
 `--field-mode derived`: the Derived field renders every golden frame
 identically to Instanced on both sets (measured when it was added), so its
-upload, storage, vertex-stage Y/Z and edit paths are covered with nothing new
+upload, storage, vertex-stage Y/Z and edit paths were covered with nothing new
 to adopt. Before it, no golden rendered Derived at all, and a Derived edit
-defect that emptied a frame (C19, below) was invisible. A divergence under an
-equivalent with the plain frame equal is the VARIANT breaking — never a reason
-to re-baseline. `drift` compares the plain frames only.
+defect that emptied a frame (C19, below) was invisible. **Since 2026-10-11 the
+plain frames ARE Derived** (the default), so that entry became
+`--field-mode instanced`, holding the Instanced field to the same frames until
+its crate is deleted (step 3). A divergence under an equivalent with the
+plain frame equal is the VARIANT breaking — never a reason to re-baseline.
+`drift` compares the plain frames only.
 
 **The Visible field as an equivalent, with named exemptions (M4, 2026-10-10).**
 The second entry is `--field-mode visible`. Measured on both sets before it
 was added: `demo` (no field), `text`, `emoji` and `emoji-cluster` (a
-`--render-file` scene has no line table and falls back to Instanced, which
-the load says) and `repo-highlight` (visible mode for real: the sidecar's
+`--render-file` scene has no line table and falls back to Derived — Instanced
+until 2026-10-11 — which the load says) and `repo-highlight` (visible mode for real: the sidecar's
 spans over alpha.rs) render their baselines byte for byte; the five
 syntax-painted repo views do not, and the difference is exactly the
 load-time syntax paint, which visible mode does not apply by decision —
@@ -573,7 +584,7 @@ equivalent holds visible mode to pixels on ONE frame (repo-highlight;
 `visible-row-off-by-one` proves it reddens); flat twins of the five would
 hold it on their cameras too, and candidate frames for those live in
 `out/tooling-ab/sweep/candidates/visible-flat/` (byte-identical to the
-visible renders and to Instanced's flat render) for Ivan to adopt or not.
+visible renders and to the stored modes' flat render) for Ivan to adopt or not.
 
 **Which view covers what, because the answer is not uniform.** `repo-wide`
 renders the default wrap mode (`back` — a wrap costs DEPTH); `repo-down` exists
@@ -599,8 +610,10 @@ untouched. `emoji-uv-flip` proves it reddens. Expect MORE cross-vendor drift
 on it than on text: filtered sampling of a mipmapped sRGB texture is not
 analytic coverage, and two rasterizers' filters need not agree to the bit.
 The alpha contract those pixels rest on is stated once, in the shader header
-of `glyph_field.wgsl`, so a platform whose emoji edges differ while its text
-does not has a checklist.
+of `glyph_field.wgsl` (the Instanced shader; the Derived shader the plain
+frames draw through since 2026-10-11 implements the same emoji branch, and
+the statement moves with step 3), so a platform whose emoji edges differ
+while its text does not has a checklist.
 `emoji-cluster` and `repo-cluster` (2026-09-20) pin the SEQUENCE PASS — one
 frame per path: the former through `--render-file` (the CPU staging twin),
 the latter through `--load-repo` (the repo load end to end). One line per
@@ -620,9 +633,10 @@ price of a blended pass writing depth, accepted over draw-order visibility.
 `repo-highlight` (2026-10-09) is the only frame through the highlight
 sidecar (`--highlight`), the byte-range styling path the AST/LSP colouring
 will arrive by: `alpha.rs` whole, six spans recoloured over syntax paint.
-Under the Derived equivalent it is the witness for C19 — Derived's
+It is the witness for C19 — Derived's
 `write_placements` rewrote whole slots with the row and wrap zeroed, so every
-edited glyph left the frame (`derived-placement-row-zeroed`). Its sidecar is
+edited glyph left the frame (`derived-placement-row-zeroed`) — under the
+Derived equivalent until 2026-10-11, in the plain frame since. Its sidecar is
 deliberately out of byte order, which found a second defect when the frame
 was made: `style_file` walks runs as byte-ascending and the sidecar parser
 never sorted, so an out-of-order span was silently skipped
