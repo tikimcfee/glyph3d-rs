@@ -32,7 +32,10 @@ out/windowed-shot-*.png
 
 # Agent worktrees — each is its own git repo plus a ~2.5 GB toolchain.
 # `git add -A` will otherwise commit them as gitlinks (it did, 289ada8).
-.claude/
+# Everything else under .claude/ is per machine too, except the skills
+# Claude Code loads, which are tracked links into .agents/skills/.
+/.claude/*
+!/.claude/skills/
 
 # one workspace, one target dir (was native/target before 2026-09-06)
 /target/
@@ -45,9 +48,6 @@ assets/atlas/*.cache
 # each checkout copies it to launch_config.toml and edits it for that machine.
 /launch_config.toml
 native/launch_config.toml
-
-# mise's Python venv (mise.toml creates it at the repo root)
-/.venv/
 
 # experiments/zed is a per-machine symlink to a Zed checkout (experiments/Cargo.toml)
 /experiments/zed

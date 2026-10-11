@@ -64,7 +64,7 @@ machines and clones, **M** machine-specific values, **R** runner.
 | P1 | pixel-ab red on both platforms since 10-07; Linux set a month stale, 2 views never adopted | closed | 21f9aef (metal-apple: walked on the M2 from the set's own commit to the tip, every moved pixel named — d1b0f7e camera, 8b28f1f the C17 colouring, 048d403 a culling regression repaired by 9c96ad1, 9c96ad1 palette + '#'/block comments, tip C15/C17), d4cb1a4 (vulkan-nvidia re-adopted after it; drift vs Metal 0 clustered in all nine; all 9 incl. emoji-cluster/repo-cluster). pixel-ab green here; the 4 pixel mutations prove (prove coverage 44/44 provable) |
 | X1 | Experiments' Zed symlink scheme never built against real Zed | next up | needs a Zed checkout or the Mac; fieldzed's dylib build.rs deleted in 6a0b669 |
 | X2 | Missing clones here: `viz-web/glyph3d-js` (flagship corpus, `GLYPH_WEB`), Zed | next up | discuss |
-| X3 | `just` not installed here; justfile `profile` recipe unrun | open | install or accept |
+| X3 | `just` not installed here; justfile `profile` recipe unrun | closed | the justfile and mise.toml were retired into `pixi.toml` (2026-10-11); `profile` is a pixi task, samply comes from the pixi env |
 | R1 | Renderer currency stamp ignored the root `Cargo.toml`/`Cargo.lock` | closed | dc6a00f |
 | R2 | Dead `{dylib}` / `dylib_ext()` / engine-check machinery in the runner | closed | 3fc716c |
 | R3 | `engine/glyph_schema.mjs` and the schema validation were in no gate; `gen_schema --check` red | closed | 16372a9 (`[artifact.glyph-schema]`, mutation `glyph-schema-byte`) |

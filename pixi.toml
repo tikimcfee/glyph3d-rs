@@ -5,13 +5,21 @@ name = "glyph3d-native"
 platforms = ["osx-arm64", "linux-64"]
 version = "0.1.0"
 
+# The ONE declaration of the tools this repo uses (2026-10-11; mise.toml and
+# the justfile were retired into it). `pixi install` brings up everything
+# conda-forge carries; `pixi run setup` adds the cargo-only tools. Rust itself
+# and rust-analyzer stay per host, so that rust-analyzer matches the host's
+# rustc: `rustup component add rust-analyzer`, or `brew install rust-analyzer`
+# where Rust came from Homebrew.
+#
 # The artifact/gate graph is declared in build.toml and executed by
-# `glyph` (glyph/src/main.rs). These tasks are thin doors onto it, plus the
-# generators; the one thing pixi supplies that nothing else does is the
-# fontTools env the emoji generators run in (build.toml's emoji-sheet check).
+# `glyph` (glyph/src/main.rs). The tasks below are thin doors onto it, plus
+# the generators and the hand-run tools. A gate that needs a tool from this
+# env reaches it with `pixi run`, as build.toml's emoji-sheet check does.
 [tasks]
 glyph = "cargo glyph"
 build = "cargo glyph build"
+# `pixi run check rust` passes the scope through: rust | render | corpus.
 check = "cargo glyph test"
 check-all = "cargo glyph test"
 verify = "cargo glyph test --frozen"
@@ -23,9 +31,46 @@ check-gen = { cmd = "python3 tools/check_atlas.py && python3 tools/gen_schema.py
 emoji-inventory = "python tools/emoji_inventory.py"
 gen-emoji-sheet = "python tools/gen_emoji_sheet.py"
 
+# The cargo-only tools, built from source into this checkout's .pixi/ (on
+# PATH under `pixi run`, see [activation.env]) so they leave nothing in
+# ~/.cargo/bin. naga-cli is pinned to the naga in Cargo.lock: a shader that
+# validates under another naga proves nothing about the one that ships.
+# Re-running is cheap; cargo skips a crate already at its version.
+setup = { cmd = "cargo install --locked --root .pixi/cargo-tools naga-cli@30.0.1 cargo-modules@0.27.0 && echo 'setup: rust-analyzer is per host, not here: rustup component add rust-analyzer (or brew install rust-analyzer)'" }
+
+# A fast manual test loop. Never the gate: cargo-test counts `test result`
+# lines against test_floor, which nextest does not print, and nextest skips
+# doctests.
+test = { cmd = "cargo nextest run --workspace", env = { CI = "1" } }
+
+# The items of a Rust file with their exact start-end lines:
+# `pixi run outline native/src/layout_hyper/page.rs`.
+outline = { cmd = "ast-grep scan --rule tools/ast-grep/outline.yml --json=stream {{ file }} | python3 tools/ast-grep/outline.py", args = ["file"] }
+
+# A samply profile of a repo load (scan only, no window). Profiles the
+# argument, else $GLYPH_FLAGSHIP_REPO (the corpus benchmarks run on), else
+# this repo.
+profile = { cmd = "sh -c 'samply record --save-only -o out/profile.json.gz target/release/glyph3d-native --load-repo \"${1:-${GLYPH_FLAGSHIP_REPO:-.}}\" --repo-scan-only' profile {{ repo }}", args = [{ arg = "repo", default = "" }], depends-on = ["build"] }
+profile-view = { cmd = "samply load {{ profile }}", args = [{ arg = "profile", default = "out/profile.json.gz" }] }
+
+# Prebake or refresh the emoji sheet's mip cache (assets/atlas/emoji-sheet.cache,
+# untracked): the renderer writes it whenever it builds the mips itself.
+bake-atlas-cache = { cmd = "rm -f assets/atlas/emoji-sheet.cache && cargo glyph run --screenshot target/atlas-cache-bake.png && rm -f target/atlas-cache-bake.png && echo 'baked assets/atlas/emoji-sheet.cache'" }
+
+[activation.env]
+PATH = "$PIXI_PROJECT_ROOT/.pixi/cargo-tools/bin:$PATH"
+
 [dependencies]
 # For tools/emoji_font.py (the CBDT/CBLC walker behind the emoji sheet). Only
 # tables and verbatim PNG bytes are read through it, so its version cannot
 # change an artifact — but it is pinned to a major so a solve stays boring.
-# build.toml's emoji-sheet check runs in this env; it is pixi's only job.
+# build.toml's emoji-sheet check runs in this env.
 fonttools = ">=4.63,<5"
+# Code reading and editing (out/AGENT-TOOLING-2026-10-11.md). ast-grep's
+# matching is syntactic, so its minor pins the grammar a rewrite was checked
+# against.
+ast-grep = ">=0.45,<0.46"
+difftastic = ">=0.71,<0.72"
+# Hand-run only, never in a gate (see the tasks above).
+cargo-nextest = ">=0.9.148,<0.10"
+samply = ">=0.13,<0.14"
