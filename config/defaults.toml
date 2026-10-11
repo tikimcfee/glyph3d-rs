@@ -66,9 +66,13 @@ visible_backdrop_px = 0.25
 # counts two; a wrap does not restart the count). 1 lays a tab out as one
 # ordinary cell, which is the layout before tab stops and what every golden
 # view and every fixture is taken under; 4 or 8 is an editor's. 1..=64.
-# Default for --tab-width. --render-file and the agent-session cards stage
-# through their own CPU tokenizers, which keep their fixed 4-cell stops.
+# Default for --tab-width on a repo load. The agent-session cards stage
+# through their own CPU tokenizer, which keeps its fixed 4-cell stops.
 tab_width_cells = 1
+# Tab stops for --render-file (a one-item repo load since 2026-10-11; the same
+# rule, the same 1..=64). Default for --tab-width there. 4 is what the CPU text
+# stager it replaced always laid out, and what text.png is taken under.
+render_file_tab_width_cells = 4
 
 [camera]
 # Vertical field of view, degrees, every camera mode.

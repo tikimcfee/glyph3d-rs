@@ -18,6 +18,17 @@
 //! four copies at the fitted camera is Instanced's, byte for byte. Before
 //! 2026-10-11 this test was only that last comparison, against the text
 //! stager's copies. Needs a GPU, like every render test in this crate.
+//!
+//! And `--render-file`'s tab stops (2026-10-11): its one-item recipe has a
+//! default of its own, `[layout] render_file_tab_width_cells` (4, the stops
+//! of the CPU stager it replaced; a repo load's default is one cell). The
+//! frame with no flag must be the `--tab-width 4` frame and not the
+//! `--tab-width 1` one, in the default field and in Visible (which reads
+//! the width from the item, not from slots). Mutation
+//! `render-file-tab-width-dropped` (the scene building the recipe without
+//! the width) reddens it, and `copies_tile_in_every_field` with it, whose
+//! camera is parked for the 4-cell block; the CLI test sees only the parsed
+//! choice.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -26,7 +37,9 @@ const FILE: &str = "fixtures/baseline-view.txt";
 /// The gap between the 2x2 grid's copies of `FILE`: x is the block width
 /// plus half the gap, y the block height plus half the gap, below row 0
 /// (`repo::tile_views`; the load logs both as `layout [tile]`).
-const POSE_ON_THE_GAP: [&str; 6] = ["--cam-pose", "34.4306", "-36.0612", "130", "0", "0"];
+/// (2026-10-11: re-parked for the file's 4-cell tab stops, which widen the
+/// block from 63 cells to 66 — 34.962936 by 35.0, a gap of 2.1189654.)
+const POSE_ON_THE_GAP: [&str; 6] = ["--cam-pose", "36.0224", "-36.0595", "130", "0", "0"];
 
 fn native_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).to_path_buf()
@@ -77,5 +90,29 @@ fn copies_tile_in_every_field() {
     let four = render(&["--copies", "4"], &dir.join("four.png"));
     let four_instanced = render(&["--copies", "4", "--field-mode", "instanced"], &dir.join("four-instanced.png"));
     assert!(four == four_instanced, "--copies 4: the default field's frame differs from Instanced's");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+fn differing(a: &image::RgbaImage, b: &image::RgbaImage) -> usize {
+    assert_eq!(a.dimensions(), b.dimensions());
+    a.pixels().zip(b.pixels()).filter(|(p, q)| p != q).count()
+}
+
+#[test]
+fn tabs_take_the_render_file_default() {
+    let dir = std::env::temp_dir().join(format!("glyph-render-file-tabs-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("create scratch dir");
+    for field in ["derived", "visible"] {
+        let frame = |name: &str, extra: &[&str]| {
+            render(&[&["--field-mode", field][..], extra].concat(), &dir.join(format!("{field}-{name}.png")))
+        };
+        let default = frame("default", &[]);
+        let four = frame("4", &["--tab-width", "4"]);
+        let one = frame("1", &["--tab-width", "1"]);
+        let n = differing(&default, &four);
+        assert_eq!(n, 0, "{field}: --render-file's default differs from --tab-width 4 in {n} px: its default must be 4 cells");
+        let n = differing(&four, &one);
+        assert!(n > 500, "{field}: --tab-width 4 and 1 differ in only {n} px: the width does not reach --render-file's load");
+    }
     let _ = std::fs::remove_dir_all(&dir);
 }

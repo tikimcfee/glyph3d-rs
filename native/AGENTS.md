@@ -166,8 +166,12 @@ caller; the short version:
   walks a newline-free chunk that holds a tab again from the true state
   (`walk_line_state`); the line-table replays and `measure_continued_lines`
   take the true seed already. The scan form refuses a width past one cell
-  (it has no stops; the oracle has none), and `--render-file`'s stager keeps
-  its own fixed 4-cell stops (`text::TAB_CELLS`).
+  (it has no stops; the oracle has none). `--render-file` is a one-item repo
+  load (2026-10-11) with its own default, `[layout]
+  render_file_tab_width_cells` (4, the stops its retired CPU stager had;
+  `--tab-width` overrides it there too), resolved by
+  `Cli::resolved_render_file_tab_width`. The agent-session cards stage
+  through their own CPU code with fixed 4-cell stops and read no setting.
 - A verify over ZERO items refuses. Before 2026-09-07 a missing corpus directory
   printed `PASS: 0 items, 0 instances` and exited 0 — the gate passing having
   compared nothing.

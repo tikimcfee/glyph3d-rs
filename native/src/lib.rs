@@ -57,6 +57,8 @@ pub enum SceneChoice {
         copies: u32,
         emoji_sheet: PathBuf,
         cluster_mode: fold::ClusterMode,
+        /// `--tab-width`, else `[layout] render_file_tab_width_cells`.
+        tab_width: fold::TabWidth,
         wrap_mode: fold::WrapMode,
         z_wrap_spacing: f64,
     },
@@ -255,13 +257,14 @@ fn build_scene_impl(
     let field_mode = cull_opts.field_mode;
     match choice {
         SceneChoice::Demo => (Box::new(Scene::new(ctx, color_format)), None),
-        SceneChoice::Text { file, copies, emoji_sheet, cluster_mode, wrap_mode, z_wrap_spacing } => {
+        SceneChoice::Text { file, copies, emoji_sheet, cluster_mode, tab_width, wrap_mode, z_wrap_spacing } => {
             // A one-file repo load (2026-10-11): HyperLayout, the shared
             // colourisers and whichever field was asked for, Visible included.
             let params = repo::RepoParams {
                 wrap_mode: *wrap_mode,
                 z_wrap_spacing: *z_wrap_spacing,
                 cluster_mode: *cluster_mode,
+                tab_width: *tab_width,
                 field_mode,
                 ..Default::default()
             };

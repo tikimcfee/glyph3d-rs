@@ -25,7 +25,7 @@
 # Ratchet, NOT an equality: tests are added constantly, so an exact pin would
 # redden on the most common good action in the repo. A green run whose real
 # count exceeds the floor prints a NOTE naming the value to raise it to.
-test_floor = 390
+test_floor = 391
 # Every golden view is rendered again under each of these and must match the
 # SAME baseline byte for byte (2026-10-09, C20). The plain frames render the
 # Derived field, the default since 2026-10-11 (Instanced retirement step 1);
@@ -1592,3 +1592,13 @@ op = "replace"
 find = "            tab_width: p.tab_width.cells(),"
 with = "            tab_width: 1,"
 expect = "every_field_draws_the_same_frame_at_every_tab_width"
+
+[[mutation]]
+name = "render-file-tab-width-dropped"
+gate = "cargo-test"
+why = "--render-file's one-item load built without the tab width it resolved, so its recipe takes RepoParams' default (one cell) and text.png loses its 4-cell stops (2026-10-11: the retired CPU stager's stops, carried over by [layout] render_file_tab_width_cells when --render-file became a repo load). The CLI test sees only the parsed SceneChoice. CONSUMED BY: lib.rs's SceneChoice::Text arm, the one path from the choice to repo::load_file; reddens native/tests/render_file_copies.rs (tabs_take_the_render_file_default: --tab-width 4 and 1 then draw the same frame; copies_tile_in_every_field too, its camera parked for the 4-cell block)"
+file = "native/src/lib.rs"
+op = "replace"
+find = "                tab_width: *tab_width,\n                field_mode,"
+with = "                tab_width: fold::TabWidth::ONE_CELL,\n                field_mode,"
+expect = "tabs_take_the_render_file_default"

@@ -84,6 +84,13 @@ impl Cli {
         self.tab_width.unwrap_or_else(|| crate::config::settings().layout.tab_width())
     }
 
+    /// The tab stops `--render-file`'s one-item load lays out with:
+    /// `--tab-width`, else the config's `[layout] render_file_tab_width_cells`
+    /// (4, what the CPU text stager it replaced laid out; 2026-10-11).
+    pub fn resolved_render_file_tab_width(&self) -> crate::fold::TabWidth {
+        self.tab_width.unwrap_or_else(|| crate::config::settings().layout.render_file_tab_width())
+    }
+
     /// Resolve the parsed CLI flags into an explicit, strongly typed command.
     pub fn action(&self) -> CliCommand {
         if let Some(shell) = self.generate {
@@ -187,6 +194,7 @@ impl Cli {
                 copies: self.copies,
                 emoji_sheet,
                 cluster_mode: self.cluster_mode,
+                tab_width: self.resolved_render_file_tab_width(),
                 wrap_mode: self.wrap_mode,
                 z_wrap_spacing: self.z_wrap_spacing,
             }

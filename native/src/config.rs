@@ -89,6 +89,10 @@ pub struct LayoutSettings {
     /// Tab stops, in display cells (`fold::TabWidth`, 2026-10-11): 1 is a
     /// tab of one cell, the layout before stops. Default for `--tab-width`.
     pub tab_width_cells: u32,
+    /// Tab stops for `--render-file`, a one-item repo load (2026-10-11):
+    /// 4, what the CPU text stager it replaced laid out. Default for
+    /// `--tab-width` there.
+    pub render_file_tab_width_cells: u32,
 }
 
 impl LayoutSettings {
@@ -96,6 +100,12 @@ impl LayoutSettings {
     /// settings load).
     pub fn tab_width(&self) -> crate::fold::TabWidth {
         crate::fold::TabWidth::new(self.tab_width_cells).expect("[layout] tab_width_cells is validated at load")
+    }
+
+    /// [`Self::render_file_tab_width_cells`] as the layout's type (validated
+    /// when the settings load).
+    pub fn render_file_tab_width(&self) -> crate::fold::TabWidth {
+        crate::fold::TabWidth::new(self.render_file_tab_width_cells).expect("[layout] render_file_tab_width_cells is validated at load")
     }
 }
 
@@ -433,6 +443,8 @@ impl Settings {
             return Err("[repo] dir_tints must not be empty".into());
         }
         crate::fold::TabWidth::new(s.layout.tab_width_cells).map_err(|e| format!("[layout] tab_width_cells: {e}"))?;
+        crate::fold::TabWidth::new(s.layout.render_file_tab_width_cells)
+            .map_err(|e| format!("[layout] render_file_tab_width_cells: {e}"))?;
         let l = &s.library;
         if !(l.page_w > 0.0 && l.page_h > 0.0 && l.max_upscale > 0.0 && l.splay_aspect > 0.0 && l.aspect > 0.0) {
             return Err("[library] page_w, page_h, max_upscale, splay_aspect and aspect must be > 0".into());
@@ -527,16 +539,25 @@ mod tests {
         assert_eq!(Settings::with_overrides(both).unwrap().lod.show_glyphs_px, 3.0f32);
     }
 
-    /// `[layout] tab_width_cells` overrides from a launch config, and a
-    /// width the layout cannot lay out is refused at load, naming the key.
+    /// `[layout] tab_width_cells` and `render_file_tab_width_cells` override
+    /// from a launch config, each alone, and a width the layout cannot lay
+    /// out is refused at load, naming the key.
     #[test]
     fn layout_tab_width_overrides_and_refuses_zero() {
+        let s = Settings::defaults().unwrap();
+        assert_eq!((s.layout.tab_width().cells(), s.layout.render_file_tab_width().cells()), (1, 4));
         let over: toml::Table = toml::from_str("[layout]\ntab_width_cells = 4\n").unwrap();
-        assert_eq!(Settings::with_overrides(over).unwrap().layout.tab_width().cells(), 4);
-        for bad in ["0", "65"] {
-            let over: toml::Table = toml::from_str(&format!("[layout]\ntab_width_cells = {bad}\n")).unwrap();
-            let err = Settings::with_overrides(over).expect_err("an unlayable tab width must be refused");
-            assert!(err.contains("tab_width_cells"), "{err}");
+        let s = Settings::with_overrides(over).unwrap();
+        assert_eq!((s.layout.tab_width().cells(), s.layout.render_file_tab_width().cells()), (4, 4));
+        let over: toml::Table = toml::from_str("[layout]\nrender_file_tab_width_cells = 8\n").unwrap();
+        let s = Settings::with_overrides(over).unwrap();
+        assert_eq!((s.layout.tab_width().cells(), s.layout.render_file_tab_width().cells()), (1, 8));
+        for key in ["tab_width_cells", "render_file_tab_width_cells"] {
+            for bad in ["0", "65"] {
+                let over: toml::Table = toml::from_str(&format!("[layout]\n{key} = {bad}\n")).unwrap();
+                let err = Settings::with_overrides(over).expect_err("an unlayable tab width must be refused");
+                assert!(err.contains(&format!("[layout] {key}:")), "{err}");
+            }
         }
     }
 

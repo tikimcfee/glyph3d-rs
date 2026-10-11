@@ -154,7 +154,8 @@ fn an_unknown_cluster_mode_is_refused() {
 }
 
 /// `--tab-width N` (2026-10-11): parsed into the layout's type, carried
-/// into the repo scene, the scan-only load and the oracle check, and a width
+/// into the repo scene, the scan-only load, `--render-file`'s one-item load
+/// and the oracle check, and a width
 /// the layout cannot lay out is REFUSED at the boundary with the flag named.
 #[test]
 fn tab_width_parses_rides_along_and_refuses_what_cannot_lay_out() {
@@ -167,6 +168,17 @@ fn tab_width_parses_rides_along_and_refuses_what_cannot_lay_out() {
     let cli = parse(&["--load-repo", "fixtures/g-pick-repo", "--repo-scan-only", "--tab-width", "8"]);
     let CliCommand::RepoScanOnly { params, .. } = cli.action() else { panic!("--repo-scan-only") };
     assert_eq!(params.tab_width.cells(), 8);
+    // `--render-file` (a one-item repo load since 2026-10-11): its own
+    // default, 4 cells (`[layout] render_file_tab_width_cells`), and the
+    // flag overrides it as on a repo load.
+    let cli = parse(&["--render-file", "fixtures/baseline-view.txt"]);
+    let CliCommand::Render(plan) = cli.action() else { panic!("a file render renders") };
+    let SceneChoice::Text { tab_width, .. } = plan.choice else { panic!("--render-file is a text scene") };
+    assert_eq!(tab_width.cells(), 4, "--render-file defaults to the stager's 4-cell stops");
+    let cli = parse(&["--render-file", "fixtures/baseline-view.txt", "--tab-width", "2"]);
+    let CliCommand::Render(plan) = cli.action() else { panic!("a file render renders") };
+    let SceneChoice::Text { tab_width, .. } = plan.choice else { panic!("--render-file is a text scene") };
+    assert_eq!(tab_width.cells(), 2, "the flag reaches the file's recipe");
     let cli = parse(&["--hyper-oracle-check", "some/dir", "--tab-width", "3"]);
     let CliCommand::Fixture(FixtureTask::HyperOracle(_, _, tab_width)) = cli.action() else { panic!("--hyper-oracle-check") };
     assert_eq!(tab_width.cells(), 3);
