@@ -778,6 +778,20 @@ fn emit_lines(@builtin(local_invocation_id) lid: vec3<u32>, @builtin(workgroup_i
 fn finalize() {
     let seg_count = min(atomicLoad(&counters[C_SEG_FIT_END]), frame.u1.y);
     write_dispatch(I_LAYOUT, seg_count);
+    // C32 (2026-10-11): the layout dispatch runs whole workgroups and its
+    // kernel is bounded by the segment CAP (a host uniform), not by this
+    // count, so the entries past `seg_count` in the last workgroup are read
+    // too. They hold an EARLIER frame's segments wherever that frame's list
+    // was longer, and laid their lines out again at their old slot bases,
+    // over this frame's slots — holes and line beginnings lost, flickering
+    // with the race between the two writers, after any camera move or live
+    // LOD change that shrank the list. Blanked, they return at once. The
+    // host keeps the cap a whole number of workgroups and the dispatch one
+    // row (`Frame::new`), so the tail is under one workgroup and in bounds.
+    let dispatched_end = min(((seg_count + WG - 1u) / WG) * WG, frame.u1.y);
+    for (var stale = seg_count; stale < dispatched_end; stale = stale + 1u) {
+        segs[stale] = Seg(0u, 0u, 0u, 0u, 0u, 0u, 0.0, 0u);
+    }
     // DrawIndexedIndirectArgs: index_count, instance_count, first_index,
     // base_vertex, first_instance (always 0: Metal drops a nonzero one).
     indirect[I_DRAW] = 6u;

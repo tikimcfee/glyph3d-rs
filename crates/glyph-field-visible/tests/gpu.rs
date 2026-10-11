@@ -1126,3 +1126,56 @@ fn locate_names_the_transient_slot_of_item_byte_or_none() {
     assert_eq!(field.locate(&queue, 0, 6), None, "a hidden item's glyph is nowhere");
     assert!(field.locate(&queue, 4, 0).is_some());
 }
+
+/// C32 (2026-10-11): a frame whose segment list is SHORTER than the last
+/// frame's lays out no stale entry. The layout dispatch runs whole
+/// workgroups of 64 and its kernel is bounded by the segment cap, not the
+/// live count, so the invocations past the live count in the last workgroup
+/// read the previous frame's entries there. Unblanked, those laid their old
+/// lines out again at their old slot bases, over this frame's slots, racing
+/// the current writers in the same dispatch — Ivan saw lines with missing
+/// beginnings and missing lines, flickering on a still camera, after a
+/// camera move or a live LOD change shrank the list (a static offscreen run
+/// rewrites identical entries, so it never showed). The corpus makes the
+/// stale writer win: frame A lays out item 0 (20 empty lines, then ten
+/// 60-glyph lines) before item 1 (ten one-glyph lines); frame B hides item 0,
+/// so its list is item 1's ten segments and entries 20..29 of the tail are
+/// item 0's long lines at slot base 0, 60, ..., which overwrite slots 1..9.
+#[test]
+fn a_shrinking_segment_list_lays_out_no_stale_entry() {
+    let (device, queue) = device();
+    let trie = synthetic_trie();
+    let plain = ItemParamsGpu { line_height: 1.25, group: 0, ..Default::default() };
+    let mut empty_then_long_lines = vec![b'\n'; 20];
+    for _ in 0..10 {
+        empty_then_long_lines.extend_from_slice(&[b'a'; 60]);
+        empty_then_long_lines.push(b'\n');
+    }
+    let one_glyph_lines: Vec<u8> = (0..10).flat_map(|_| *b"b\n").collect();
+    let spec = |text: Vec<u8>| ItemSpec { text, params: plain, origin_x: 0.0, stride_x: 0.0, wrap_width: 0, wrap_mode: WRAP_BACK, cluster: true, spans: vec![], group: 0 };
+    let c = build(&trie, &[spec(empty_then_long_lines), spec(one_glyph_lines)], 64);
+    let refs: Vec<&[u8]> = c.bytes.iter().map(|b| b.as_slice()).collect();
+    let inp = inputs(&trie, &c, &refs);
+    let params: Vec<ItemParamsGpu> = c.items.iter().map(|i| i.params).collect();
+    let dummy = Dummy::new(&device);
+    let field = VisibleField::new(&device, &queue, &inp, &dummy.resources(&params), TARGETS, VisibleLimits { max_slots: 1 << 16, max_segments: 1 << 12, max_wash: 1 << 12 });
+    assert!(c.seeds.is_empty(), "one segment per line");
+    assert_eq!((c.item_slots[0].len(), c.item_slots[1].len()), (600, 10));
+
+    // Frame A: both items, 40 segments.
+    run_frame(&device, &queue, &field, &frame(0.0, 0.0, 0.0, 1, 0));
+    let k = field.read_counters(&queue);
+    assert_eq!(k[tables::counter::SEG_FIT_END], 40, "frame A segments");
+    assert_slots_equal(&field.read_slots(&queue, 610), &c.expected, "frame A slots");
+
+    // Frame B, twice (the stale tail outlives a still frame): item 1 only.
+    field.set_item_hidden(&queue, 0, true);
+    let want = &c.expected[c.item_slots[1].clone()];
+    for repeat in 0..2 {
+        run_frame(&device, &queue, &field, &frame(0.0, 0.0, 0.0, 1, 0));
+        let k = field.read_counters(&queue);
+        assert_eq!(k[tables::counter::SEG_FIT_END], 10, "frame B segments");
+        assert_eq!(k[tables::counter::SLOT_FIT_END], 10, "frame B slots");
+        assert_slots_equal(&field.read_slots(&queue, 10), want, &format!("frame B (repeat {repeat}) slots after a longer frame"));
+    }
+}

@@ -25,7 +25,7 @@
 # Ratchet, NOT an equality: tests are added constantly, so an exact pin would
 # redden on the most common good action in the repo. A green run whose real
 # count exceeds the floor prints a NOTE naming the value to raise it to.
-test_floor = 379
+test_floor = 381
 # Every golden view is rendered again under each of these and must match the
 # SAME baseline byte for byte (2026-10-09, C20). The plain frames render the
 # Derived field, the default since 2026-10-11 (Instanced retirement step 1);
@@ -1183,6 +1183,17 @@ op = "replace"
 find = "    let slot_base = base.y;"
 with = "    let slot_base = atomicAdd(&counters[15u], line.glyph_count);"
 expect = "a_visible_frame_repeats_and_is_drawn_in_arena_order"
+rebuild = "cargo build --release"
+
+[[mutation]]
+name = "visible-stale-segment-tail"
+gate = "cargo-test"
+why = "C32 (2026-10-11): the Visible layout dispatch runs whole workgroups and its kernel is bounded by the segment CAP, so finalize blanks the entries between the live segment count and the end of the last workgroup. Without the blanking (as before C32, when it existed only in a comment) those entries are an EARLIER frame's segments wherever that frame's list was longer, and they lay their lines out again at their old slot bases over this frame's slots: lines lost or missing their beginnings, flickering with the race between the two writers, after any camera move or live LOD change that shrank the list — never in a static offscreen frame, which rewrites identical entries. CONSUMED BY: finalize's tail blanking (visible_cull.wgsl), read by layout_segments (and the selection mask's pass over the same list); judged by the crate's a_shrinking_segment_list_lays_out_no_stale_entry (a frame after a longer one, slot for slot against the twin); no golden and no oracle tier renders two different frames in a row"
+file = "crates/glyph-field-visible/shaders/visible_cull.wgsl"
+op = "replace"
+find = "    let dispatched_end = min(((seg_count + WG - 1u) / WG) * WG, frame.u1.y);"
+with = "    let dispatched_end = seg_count;"
+expect = "a_shrinking_segment_list_lays_out_no_stale_entry"
 rebuild = "cargo build --release"
 
 [[mutation]]

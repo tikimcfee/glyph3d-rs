@@ -684,8 +684,17 @@ impl Frame {
     pub fn new(device: &wgpu::Device, queue: &wgpu::Queue, resident: &Resident, resources: &FieldResources<'_>, targets: FieldTargets, limits: VisibleLimits) -> Self {
         // The segment cap is a whole number of workgroups: finalize blanks
         // the tail of the last group so the layout dispatch reads no stale
-        // entry (`visible_cull.wgsl`).
+        // entry (`visible_cull.wgsl`). That blanking existed only in this
+        // comment until C32 (2026-10-11), when its absence was Ivan's holes.
+        // It covers the tail of ONE workgroup row, so the cap must keep the
+        // layout dispatch one row: past 65,535 groups a second row would
+        // read a whole row of stale entries.
         let max_segments = limits.max_segments.div_ceil(WORKGROUP).max(1) * WORKGROUP;
+        assert!(
+            max_segments <= MAX_GROUPS_X * WORKGROUP,
+            "visible field: max_segments {max_segments} needs a two-row layout dispatch, whose tail finalize does not blank; at most {}",
+            MAX_GROUPS_X * WORKGROUP
+        );
         let limits = VisibleLimits { max_segments, max_slots: limits.max_slots.max(1), max_wash: limits.max_wash.max(1) };
         let binding_limit = device.limits().max_storage_buffer_binding_size;
         let slot_bytes = limits.max_slots as u64 * std::mem::size_of::<DerivedSlot>() as u64;
