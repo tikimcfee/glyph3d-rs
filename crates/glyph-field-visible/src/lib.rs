@@ -256,7 +256,10 @@ pub struct VisibleLimits {
 
 impl Default for VisibleLimits {
     fn default() -> Self {
-        Self { max_slots: 16 << 20, max_segments: 1 << 20, max_wash: 1 << 20 }
+        // max_wash 4 Mi (144 MiB of 36 B boxes; 1 Mi until 2026-10-10): a
+        // library deck lays out every page behind its head, and a near view
+        // of the kernel tree's biggest volume reserved 1.26 M wash boxes.
+        Self { max_slots: 16 << 20, max_segments: 1 << 20, max_wash: 4 << 20 }
     }
 }
 
@@ -274,6 +277,12 @@ pub struct VisibleStats {
     pub segments: u32,
     pub slots: u32,
     pub slots_dropped: u32,
+    /// Wash boxes reserved past `VisibleLimits::max_wash` this frame: the
+    /// cull writes none of them, so those lines draw NOTHING — the last in
+    /// (item, line) order, the same every frame. Counted from 2026-10-10;
+    /// before, the stats said "0 dropped" while a kernel-tree library view
+    /// reserved 1,264,446 boxes against the 1,048,576 cap.
+    pub wash_dropped: u32,
     /// GPU time of the cull passes, the layout kernel and the glyph draw,
     /// when timestamps are available; else 0.
     pub cull_ms: f32,

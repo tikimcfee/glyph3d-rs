@@ -1086,6 +1086,7 @@ impl Frame {
             segments: c[counter::SEG_FIT_END].min(self.limits.max_segments),
             slots: c[counter::SLOT_FIT_END].min(self.limits.max_slots),
             slots_dropped: c[counter::SLOTS_DROPPED],
+            wash_dropped: c[counter::WASH].saturating_sub(self.limits.max_wash),
             cull_ms,
             layout_ms,
             draw_ms: 0.0,

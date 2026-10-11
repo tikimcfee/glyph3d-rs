@@ -150,13 +150,14 @@ fn hud_line(snap: &crate::glyph_scene::UiProbeState, fps: f32) -> String {
     match &snap.visible_stats {
         Some(s) => {
             line += &format!(
-                " | items {}/{} visible, {} backdrop | lines {} candidate: {} glyph, {} wash | segments {} | slots {} ({} dropped) | gpu cull {:.2} layout {:.2} draw {:.2} ms",
+                " | items {}/{} visible, {} backdrop | lines {} candidate: {} glyph, {} wash ({} dropped) | segments {} | slots {} ({} dropped) | gpu cull {:.2} layout {:.2} draw {:.2} ms",
                 s.items_visible,
                 s.items_total,
                 s.items_backdrop,
                 s.lines_candidate,
                 s.lines_glyph,
                 s.lines_wash,
+                s.wash_dropped,
                 s.segments,
                 s.slots,
                 s.slots_dropped,
@@ -720,8 +721,8 @@ impl WindowState {
                                                 s.items_visible, s.items_total, s.items_backdrop
                                             ));
                                             ui.monospace(format!(
-                                                "lines {} candidate: {} glyph | {} wash",
-                                                s.lines_candidate, s.lines_glyph, s.lines_wash
+                                                "lines {} candidate: {} glyph | {} wash ({} dropped)",
+                                                s.lines_candidate, s.lines_glyph, s.lines_wash, s.wash_dropped
                                             ));
                                             ui.monospace(format!(
                                                 "segments {} | slots {} ({} dropped)",
