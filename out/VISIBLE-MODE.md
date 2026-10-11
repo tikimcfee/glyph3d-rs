@@ -586,3 +586,39 @@ and no blend, so where two selected glyphs overlap on screen the last
 written wins, and that can still vary frame to frame. The stacked-layer
 shimmer under camera motion (C30's other finding, all modes alike) is
 untouched.
+
+## C32 — a stale tail of the last frame's segments (2026-10-11)
+
+**What Ivan saw.** Windowed, the flagship JS repo, visible mode: right of
+`_emoji_probe.txt`, lines missing and lines drawn without their beginning,
+flickering on a still camera, gone when the camera backed off. Offscreen at
+his exact pose the frame was complete and byte-equal to derived.
+
+**Why.** The layout dispatch runs whole workgroups of 64, and
+`layout_segments` is bounded by the segment CAP, not the frame's live
+count. The up-to-63 entries past the live count in the last workgroup held
+an earlier frame's segments wherever that frame's list was longer, and laid
+their lines out again at their old slot bases over this frame's slots,
+racing this frame's writers. That takes a list shorter than an earlier
+frame's (a camera move, a live "Show glyphs" raise). A static offscreen run
+writes the same list every frame, so it never showed. `finalize` now blanks
+that tail; the code had always said it did.
+
+**What holds it.** `cargo test --release -p glyph-field-visible --test gpu
+a_shrinking` (a frame after a longer one, slot for slot against the twin;
+before the fix 9 of 10 slots held a hidden item's glyphs). Mutation
+`visible-stale-segment-tail` (the blanking removed) reddens it.
+
+```sh
+# See it offscreen: one frame at another pose, then the target pose
+# (GLYPH_FRAME_SCRIPT, native/AGENTS.md), against a static derived render.
+# On the flagship repo, at Ivan's pose with the first frame yawed +15 deg,
+# the unfixed binary drew 15,600 px unlike derived (the right-hand file's
+# holes); the fixed one draws 0.
+GLYPH_FRAME_SCRIPT="0:pose 875.233 84.362 168.034 15 -30.378;1:pose 875.233 84.362 168.034 -0.252 -30.378" \
+  target/release/glyph3d-native --load-repo "$GLYPH_FLAGSHIP_REPO" --field-mode visible --color-mode flat \
+  --file-backgrounds --no-greeking --cam-pose 875.233 84.362 168.034 -0.252 -30.378 --frames 4 --screenshot out/c32-visible.png
+target/release/glyph3d-native --load-repo "$GLYPH_FLAGSHIP_REPO" --field-mode derived --color-mode flat \
+  --file-backgrounds --no-greeking --cam-pose 875.233 84.362 168.034 -0.252 -30.378 --frames 4 --screenshot out/c32-derived.png
+cmp out/c32-visible.png out/c32-derived.png && echo byte-equal
+```
