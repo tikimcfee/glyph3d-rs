@@ -216,6 +216,13 @@ pub struct GlyphScene {
     pub grabbed_zone: Option<String>,
     /// Last known cursor position, physical px (click pick + grab drag).
     pub(crate) cursor: (f32, f32),
+    /// A grab drag not yet applied: where the cursor was when the first
+    /// unapplied move arrived, and how many moves have arrived since. The
+    /// drag is applied once per frame (`apply_drag`, from `animate`), not
+    /// once per cursor event: a whole-subtree move propagates the scene,
+    /// re-extracts its meshes and syncs every moved group, and a mouse
+    /// reports several moves per frame (2026-10-10).
+    pub(crate) drag_pending: Option<((f32, f32), u32)>,
     /// Viewport in physical px, refreshed every render() (ray unprojection).
     pub(crate) viewport: Cell<(u32, u32)>,
     /// Per-group position in the `[repo] dir_tints` cycle (t verb).
@@ -500,6 +507,7 @@ impl SceneLike for GlyphScene {
     }
 
     fn animate(&mut self, ctx: &GpuContext, dt: f32) {
+        self.apply_drag(ctx);
         self.animate_library(ctx, dt);
     }
 

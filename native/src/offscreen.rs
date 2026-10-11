@@ -109,6 +109,19 @@ pub fn run_scene(
         }
     }
 
+    // GLYPH_DRAG_SCRIPT=g|c:DX:DY[:EVENTS] (2026-10-10): a scripted grab
+    // drag through the window's own entry points — the cursor parked at the
+    // viewport centre, the grab key (g a file, c its zone; pick first), then
+    // EVENTS (default 1) cursor moves per frame of (DX, DY) px between them,
+    // applied as one drag per frame like a real mouse. With
+    // GLYPH_DRAG_TIMING=1 each frame's drag prints a DRAGTIME line.
+    let drag = std::env::var("GLYPH_DRAG_SCRIPT").ok().map(|spec| parse_drag_script(&spec));
+    if let Some((key, ..)) = drag {
+        scene.on_cursor(ctx, size.width as f32 * 0.5, size.height as f32 * 0.5);
+        scene.on_key(ctx, key, true);
+    }
+    let mut drag_cursor = (size.width as f32 * 0.5, size.height as f32 * 0.5);
+
     // Readback buffer: copy_texture_to_buffer requires 256-byte-aligned rows.
     let unpadded_bpr = size.width * 4;
     let padded_bpr = unpadded_bpr.div_ceil(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT)
@@ -143,6 +156,12 @@ pub fn run_scene(
         // deterministic regardless of how fast frames actually encode. The
         // scene's own animation steps on the same clock (a no-op for every
         // scene without one, which is every golden view).
+        if let Some((_, dx, dy, events)) = drag {
+            for _ in 0..events {
+                drag_cursor = (drag_cursor.0 + dx / events as f32, drag_cursor.1 + dy / events as f32);
+                scene.on_cursor(ctx, drag_cursor.0, drag_cursor.1);
+            }
+        }
         scene.animate(ctx, 1.0 / 60.0);
         scene.render(
             ctx,
@@ -349,6 +368,18 @@ pub fn parse_dump_spec(spec: &str) -> Result<DumpSpec, String> {
             Ok(DumpSpec::Slot { slot, len: len.unwrap_or(96) })
         }
     }
+}
+
+/// `GLYPH_DRAG_SCRIPT`'s `g|c:DX:DY[:EVENTS]`.
+fn parse_drag_script(spec: &str) -> (winit::keyboard::KeyCode, f32, f32, u32) {
+    let parts: Vec<&str> = spec.split(':').collect();
+    let key = match parts.first().copied() {
+        Some("g") => winit::keyboard::KeyCode::KeyG,
+        Some("c") => winit::keyboard::KeyCode::KeyC,
+        other => panic!("GLYPH_DRAG_SCRIPT: {other:?} is not g|c (g|c:DX:DY[:EVENTS])"),
+    };
+    let num = |i: usize, d: f32| parts.get(i).map_or(d, |v| v.parse().expect("GLYPH_DRAG_SCRIPT: DX, DY and EVENTS are numbers"));
+    (key, num(1, 0.0), num(2, 4.0), num(3, 1.0).max(1.0) as u32)
 }
 
 #[cfg(test)]

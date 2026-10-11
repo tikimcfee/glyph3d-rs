@@ -403,6 +403,7 @@ impl GlyphScene {
             controller,
             grabbed_zone: None,
             cursor: (0.0, 0.0),
+            drag_pending: None,
             viewport: Cell::new((1600, 1000)), // refreshed every render()
             tint_step,
             ui_probe: None,
