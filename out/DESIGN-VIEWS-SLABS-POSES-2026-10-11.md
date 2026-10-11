@@ -906,7 +906,7 @@ item, and Pass 1 still writes a line-table entry per line per item.
 
 **Paint and dials.** The file paints `Paint::SyntaxHeuristic` whatever
 `--color-mode` says (a text view always has; the CLI default `flat` is a
-repo-load default). `SceneChoice::Text` now carries `--wrap-mode` and
+repo-load default; both retired later that day, § 10). `SceneChoice::Text` now carries `--wrap-mode` and
 `--z-wrap-spacing`, so a long line wraps at 100 columns and a long file
 pages at 128 rows like any repo file (no golden fixture is long enough to
 show it), and the windowed z dial rebuilds text scenes too. Picks and the
@@ -916,7 +916,7 @@ it `None`).
 **Deleted** from `text.rs`: `stage_file` and everything only it used —
 `Cell`, `cover_segment`, `word_color` (the `&str` form),
 `is_block_comment_continuation_chars`, `TAB_CELLS`. Kept: `StagedText`, the
-palette and the colourisers (`Paint::SyntaxHeuristic` paints with them),
+palette and the colourisers (`Paint::SyntaxHeuristic` painted with them until § 10),
 `fu_to_world`, the metric constants and `reference_layout`. The manual
 `tools/gen_emoji_corpus.py --check-render` read the stager's log line; it
 reads the load's (`records`, `glyph instances`) now and agrees on all six
@@ -1037,3 +1037,57 @@ while pixel-ab is red).
   host record's group row 0 names no single item"). *Since `8f890d9` on main
   (2026-10-11) the empty load renders; re-checked after the rebase, it exits
   0.* `--render-file` is still the door for one file.
+
+## 10. The syntax heuristic retired (2026-10-11)
+
+Ivan, 2026-10-11: "We don't really use syntax color anymore (it should be
+gone in general)." § 7.1's item 3 put meaning on the buffer and the look on
+the view; a lexical guess at token kinds, made at load and baked into slot
+colours, fits neither. So it went, stacked on step 2 and parked with it.
+
+**What changed.** Every load paints `Paint::Flat`; colour arrives only as
+byte spans (`--highlight`, the seam's style runs, the Visible field's span
+table). Deleted: `Paint::SyntaxHeuristic`, `ColorMode` and `--color-mode`
+(refused like any unknown flag; a launch config's `color_mode = "flat"`
+still parses into nothing, `"syntax"` is refused naming the retirement),
+`text.rs`'s palette and colourisers, the device Pass 2's per-line colouring
+with C17's whole-line colours at chunk cuts, and hyper-oracle's paint tier
+with its five mutations (test floor 392 -> 385). The agent cards' own
+comment-line guess in shown source went too; their colours by event kind,
+result and diff line stay. `chunk-cut-paint.txt` stays as a cut input.
+
+**Pixels (vulkan-nvidia).** Measured before deleting: the step-2 base
+rendered every golden view with its paint forced flat (`--color-mode flat`
+on the repo views; `load_file`'s forced syntax paint switched off in a
+scratch build for the three `--render-file` views). After the retirement
+every frame is that flat render byte for byte, plain and under
+`--field-mode instanced` and `--field-mode visible` (30 of 30): the only
+change is token colour.
+
+| frame | vs baseline | vs step-2 frame | step 2 vs baseline |
+|---|---|---|---|
+| text | 32,490 | 32,489 | 200 |
+| repo-wide | 47,154 | 47,154 | 0 |
+| repo-down | 222,277 | 222,277 | 0 |
+| repo-zoom | 43,715 | 43,715 | 0 |
+| repo-back-oblique | 256,744 | 256,744 | 0 |
+| emoji | 44,983 | 43,726 | 3,372 |
+| emoji-cluster | 30,698 | 31,419 | 2,217 |
+| repo-cluster | 29,181 | 29,181 | 0 |
+| repo-highlight, demo | 0 | 0 | 0 |
+
+`repo-highlight` never moved: its sidecar repaints every glyph of alpha.rs
+(`style_file` writes the default colour where no span runs), so the syntax
+paint its command asked for never reached a pixel. Step 2's C cause for
+`emoji-cluster` (the keycap's `#` opening a comment) is subsumed: nothing is
+painted COMMENT any more. The five `[[golden_view.exempt]]` entries are
+gone; the visible equivalent holds every frame but `demo`. Candidates and
+`ATTRIBUTION.txt`: `out/tooling-ab/sweep/candidates/syntax-retired/vulkan-nvidia/`
+(untracked; nothing under `out/tooling-ab/baseline/` touched).
+
+**Left open.** Every repo backdrop now takes the extension tint, so the
+slot-colour backdrop tint fold that served the syntax loads (Pass 2's
+per-item colour sums, the Derived emoji tint pairs, the windowed emission's
+emoji detour) is reached by no load: maintenance board C34. It is the path
+a load that paints spans at load would take, which is the question to
+answer before deleting it.

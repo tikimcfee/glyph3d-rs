@@ -101,8 +101,10 @@ buffers where the GPU allows it and staging otherwise.
   **~226 ms** total visual init in `--color-mode syntax` on Apple Silicon Metal.
   These figures are from late 2026-09, before C22's windowed staging and
   before visible mode (which runs no Pass 2 at all); they have not been
-  re-measured since. `tools/bench_hyper.py` reproduces them; re-measure
-  before quoting.
+  re-measured since. `--color-mode` itself is RETIRED (2026-10-11, with the
+  syntax heuristic): every load now paints flat, so the flat figure is the
+  one that describes today's load path, and the syntax figure is history.
+  `tools/bench_hyper.py` reproduces the flat one; re-measure before quoting.
   Benchmark tools read its location from `GLYPH_FLAGSHIP_REPO`; nothing in the
   tree hardcodes where a checkout lives.
 - CubeCL, the GPU compute-layout engine (`--repo-engine cubecl`), was RETIRED on
@@ -111,8 +113,13 @@ buffers where the GPU allows it and staging otherwise.
   its one discrete-GPU advantage. The measurements and the case are in
   `out/GPU-DIRECTION-2026-10-09.md`; the GPU's next role (laying out only the
   visible lines from resident bytes) shipped as the visible field mode.
-- ByteSpan token painting: `ByteSpan` and `Paint::ByteSpans` provide byte-range semantic
-  token coloring directly from AST/LSP analyses into mapped unified memory.
+- Colour is byte spans, never guessed: `ByteSpan` and `Paint::ByteSpans` carry
+  byte-range colour from AST/LSP analyses (the `--highlight` sidecar, the
+  seam's style runs; in visible mode the field's span table). Every load
+  paints flat; the lexical syntax heuristic that guessed keywords, strings
+  and comments at load (`Paint::SyntaxHeuristic`, `--color-mode syntax`) was
+  retired on 2026-10-11 (Ivan: "it should be gone in general"), and with it
+  the agent cards' comment-line guess in shown source.
 - Modularized renderer: `glyph_scene.rs` is factored into `setup.rs`, `pipelines.rs`
   (composite) and `render.rs`; the glyph field itself — slot storage, upload, glyph
   pipeline, WGSL — lives behind the `GlyphField` trait in `crates/` (one crate per
@@ -485,30 +492,21 @@ width with its true seed wherever the page stride reaches an output.
 non-ASCII advances before each cut, and continuations wider than any ASCII
 segment past the first page; mutations `hyper-chunk-seed-product`,
 `hyper-chunk-cut-splits-sequences` and `hyper-continued-line-unmeasured`.
-**The paint tier** (C17, 2026-10-09). The four tiers above run flat paint.
-A fifth runs the device Pass 2 again under `Paint::SyntaxHeuristic` and holds
-every lane to the reference instances painted by `text::colorize_leaders`
-over the WHOLE item, which is what the host Pass 2 paints. It is not
-oracle-backed (the JS oracle has no paint): it proves the device's
-line-by-line colouring agrees with the whole-item colouriser, not that the
-heuristic is right. Red on arrival, it found four disagreements, each fixed:
-the device restarted its colouring at every intra-line cut (578 of
-`wide.txt`'s glyphs; the only one that moved pixels — `repo-down` 281 px,
-`repo-back-oblique` 747, `repo-wide` 20 vs main@164af5c on this host, all of
-it measured to this one change); the generic colourisers judged a word that
-runs into a string (`return"$"`) up to its last word byte and filled any
-colour back, where the ASCII fast path judges it up to its end and fills only
-a keyword (`real-minified`); the whole-item colouriser never flushed an
-unterminated last word, and the per-line one panicked on a lead truncated at
-a line's end (`malformed`); and the device's all-comment-line shortcut painted
-indentation comment (`real-kernels`; no ink, no pixel). `chunk-cut-paint.txt`
-puts a `return` across every intra-line cut, so the tail half has a witness
-(`wide.txt` reaches only the head half). Mutations: `hyper-cut-head-own-share`,
-`hyper-cut-tail-own-share`, `hyper-comment-line-indent-painted`, and on the
-colourisers' unit tests `colorizer-fills-any-word-colour` and
-`colorizer-last-word-unflushed`. Shared and unjudged: the heuristic's own
-rules (`--render-file` paints with these same colourisers since 2026-10-11;
-`stage_file`'s tokenizer, the third copy no tier read, is gone with it).
+**The paint tier** (C17, 2026-10-09; RETIRED 2026-10-11 with the syntax
+heuristic). A fifth tier held the device Pass 2's line-by-line syntax
+colouring to the whole-item colouriser. Red on arrival, it found four
+disagreements, each fixed then, one of which moved pixels (the device
+restarted its colouring at every intra-line cut: 578 of `wide.txt`'s
+glyphs). When every load began painting flat there was nothing left for it
+to compare, and it went with its five mutations (`hyper-cut-head-own-share`,
+`hyper-cut-tail-own-share`, `hyper-comment-line-indent-painted`,
+`colorizer-fills-any-word-colour`, `colorizer-last-word-unflushed`). Its
+input, `chunk-cut-paint.txt`, stays: the layout tiers, the windowed-emission
+test and the line-table and visible tests read it as an intra-line-cut
+input. Per-glyph colour through the device Pass 2 is now seen by the
+visible tier's span half (kernel against device under the same spans) and
+by cargo-test's `windowed_emission_matches_unwindowed` (per-record paint
+through the windows).
 Measured but ungated (2026-10-09): a 94 MB tree of crates.io sources
 is bit-exact on every tier in both modes (99 M records).
 **Tab stops** (2026-10-11, `fold::TabWidth`; `[layout] tab_width_cells` /
@@ -655,38 +653,30 @@ its crate is deleted (step 3). A divergence under an equivalent with the
 plain frame equal is the VARIANT breaking — never a reason to re-baseline.
 `drift` compares the plain frames only.
 
-**The Visible field as an equivalent, with named exemptions (M4, 2026-10-10).**
-The second entry is `--field-mode visible`. Measured on both sets before it
-was added: `demo` (no field), `text`, `emoji` and `emoji-cluster` (then a
-`--render-file` scene had no line table and fell back to a stored field)
-and `repo-highlight` (visible mode for real: the sidecar's
-spans over alpha.rs) render their baselines byte for byte; the five
-syntax-painted repo views do not, and the difference is exactly the
-load-time syntax paint, which visible mode does not apply by decision —
-under `--field-mode visible` each is the stored modes' `--color-mode flat`
-render byte for byte (47,154 / 222,277 / 43,715 / 256,744 / 29,181 px of
-token colour short of the baseline for repo-wide / -down / -zoom /
--back-oblique / -cluster on vulkan-nvidia; within ±101 px of those on
-metal-apple, the rasterizers' usual edge noise). Those five are EXEMPT from
-that one equivalent,
-each with its why on the view (`[[golden_view.exempt]]`); an exempt frame is
-still rendered and its distance printed as a NOTE with the pixel count, an
-exempt frame that turns out byte-equal is flagged as a possibly stale
-exemption, `validate` refuses an exemption naming no declared equivalent or
-no why, and `cargo glyph gates` lists every exemption under pixel-ab — a
-named blind spot, priced like the rest, never a quiet drop. So the visible
-equivalent holds visible mode to pixels on ONE frame (repo-highlight;
-`visible-row-off-by-one` proves it reddens); flat twins of the five would
-hold it on their cameras too, and candidate frames for those live in
-`out/tooling-ab/sweep/candidates/visible-flat/` (byte-identical to the
-visible renders and to the stored modes' flat render) for Ivan to adopt or not.
-**Since step 2 (2026-10-11)** `--render-file` is a one-item repo load, so
-`text`, `emoji` and `emoji-cluster` are visible mode for real under this
-entry, and render flat like the five: each is its step-2 frame's flat-paint
-twin byte for byte (32,489 / 43,726 / 31,419 px of token colour short of
-the step-2 frames on vulkan-nvidia, re-measured 2026-10-11 with the 4-cell
-tab stops). They are not exempt; whether they join
-the five is decided when their step-2 frames are adopted.
+**The Visible field as an equivalent (M4, 2026-10-10; exemptions gone
+2026-10-11).** The second entry is `--field-mode visible`. When it was
+added, visible mode applied no load-time syntax paint (by decision) and the
+stored modes did, so the five syntax-painted repo views (repo-wide, -down,
+-zoom, -back-oblique, repo-cluster) rendered under it as their stored
+modes' `--color-mode flat` render — token colour short of the baseline and
+nothing else — and were EXEMPT from that one equivalent, each with its why
+on the view (`[[golden_view.exempt]]`). The syntax heuristic's retirement
+(2026-10-11) made every mode paint flat: every golden frame now renders the
+same bytes plain, under `--field-mode instanced` and under `--field-mode
+visible` (measured on vulkan-nvidia, 30 of 30), and the five exemptions were
+removed. So the visible equivalent holds visible mode to pixels on every
+frame but `demo` (no field) — `text`, `emoji` and `emoji-cluster` included,
+which are visible mode for real since `--render-file` became a one-item repo
+load (step 2). `visible-row-off-by-one` proves it reddens (on
+repo-highlight). The mechanism stays for the next variant that legitimately
+differs: an exempt frame is still rendered and its distance printed as a
+NOTE with the pixel count, an exempt frame that turns out byte-equal is
+flagged as a possibly stale exemption, `validate` refuses an exemption
+naming no declared equivalent or no why, and `cargo glyph gates` lists
+every exemption under pixel-ab — a named blind spot, priced like the rest,
+never a quiet drop. Until their candidates are adopted, the frames whose
+token colour went (and step 2's three) are red under this entry as they
+are plain.
 
 **Which view covers what, because the answer is not uniform.** `repo-wide`
 renders the default wrap mode (`back` — a wrap costs DEPTH); `repo-down` exists
@@ -737,7 +727,10 @@ price of a blended pass writing depth, accepted over draw-order visibility.
 
 `repo-highlight` (2026-10-09) is the only frame through the highlight
 sidecar (`--highlight`), the byte-range styling path the AST/LSP colouring
-will arrive by: `alpha.rs` whole, six spans recoloured over syntax paint.
+will arrive by: `alpha.rs` whole, six spans recoloured and every glyph no
+span covers written back at the default colour (`style_file` repaints the
+whole file, which is why the syntax paint its command asked for until
+2026-10-11 never reached a pixel of it: byte-equal across the retirement).
 It is the witness for C19 — Derived's
 `write_placements` rewrote whole slots with the row and wrap zeroed, so every
 edited glyph left the frame (`derived-placement-row-zeroed`) — under the
@@ -881,7 +874,7 @@ the serial-fold-versus-scan comparison green, because both forms call
 | `native/fixtures/g-pick-repo/empty.rs` | IMMUTABLE, zero bytes | the only input that reaches the page-extent origin seed; deleting it removes a check's ability to see its subject without removing the check |
 | `native/fixtures/chunk-cut.txt` | IMMUTABLE | hyper-oracle's only input built for the intra-line chunk-cut classes (C15): a sequence across each 64 KiB cut target, non-ASCII advances before each cut, a continuation wider than every ASCII row past the first page. Its cut positions are planned against the 64 KiB threshold and the cut rule, so changing either (or the file) can move a target off its sequence and silently weaken the gate — re-check that each mutation in its `why` still reddens |
 | `native/fixtures/highlight-alpha.tsv` | IMMUTABLE | the input to `repo-highlight.png`; DELIBERATELY out of byte order (the `1` span after the string span) — sorting it removes the frame's only witness for `sidecar-runs-unsorted` |
-| `native/fixtures/chunk-cut-paint.txt` | IMMUTABLE | hyper-oracle's paint-tier input (C17): a `return` across every intra-line cut, one pure-ASCII line and one not, so a chunk that coloured only its own share of a line is seen at the chunk's END; the only witness `hyper-cut-tail-own-share` has |
+| `native/fixtures/chunk-cut-paint.txt` | IMMUTABLE | built as hyper-oracle's paint-tier input (C17; the tier was retired with the syntax heuristic on 2026-10-11, and the file's own header still says paint-tier): a `return` across every intra-line cut, one pure-ASCII cut line and one not. Still read as an intra-line-cut input by hyper-oracle's layout tiers, `windowed_emission_matches_unwindowed` (several chunks of one item: the witness `windowed-chunk-order-reversed` names) and the line-table and visible tests; editing it moves its cuts and the gate's quoted volumes |
 | `native/fixtures/tab-stops/` | IMMUTABLE | the tab-stop runs' corpus (hyper-oracle at `--tab-width` 4 and 8) and `tests/tab_stops.rs`'s frame (2026-10-11): tabs at a line's start, after non-ASCII and double-width glyphs, back to back, in wrapped rows and around a keycap (the strict run's ASCII-led head), and `long-line.txt`, past `SEGMENT_BYTES` so its tabs sit on both sides of the Visible seeds. Shortening that line or dropping its tabs hollows the visible tier's seeded-tab coverage silently |
 | `native/fixtures/cubecl-fork/` | IMMUTABLE | named for the retired CubeCL fork check, now read by hyper-oracle (both runs) — the only committed input exercising paginate's m >= 3 / segment >= 3 classes, the cluster classes at wrap/page boundaries, and the empty-item placement class (`clusters.txt` + `empty.txt`). Editing it hollows hyper-oracle's coverage of those classes silently |
 | `out/tooling-ab/baseline/<key>/` | tracked pixel oracle, one set per rasterizer; **golden** in build.toml | changes only on purpose, with a note saying why; the runner refuses to regenerate it. A new host adopts its own set by hand (the gate prints how); it never edits another's |
