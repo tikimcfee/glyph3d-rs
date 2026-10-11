@@ -1071,7 +1071,16 @@ impl GlyphScene {
                 let Some(slot) = g.slot else {
                     return format!("verb nudge-glyph: {rel} '{}' is blank (no instance)", g.ch);
                 };
-                let new = [g.pos[0] + d[0], g.pos[1] + d[1], g.pos[2] + d[2]];
+                // A Derived slot stores x only (y and z derive from its item
+                // in the vertex stage), so only the x component applies there;
+                // the reply says what was dropped, as the Visible field's does
+                // (2026-10-11: until then the reply claimed all three).
+                let x_only = self.field.mode() == super::GlyphFieldMode::Derived;
+                let new = if x_only {
+                    [g.pos[0] + d[0], g.pos[1], g.pos[2]]
+                } else {
+                    [g.pos[0] + d[0], g.pos[1] + d[1], g.pos[2] + d[2]]
+                };
                 self.field.write_position(&ctx.queue, slot, new);
                 self.geom_overrides
                     .entry(slot)
@@ -1082,10 +1091,19 @@ impl GlyphScene {
                         pg.pos = new;
                     }
                 }
-                format!(
-                    "verb nudge-glyph: {rel} slot {slot} pos -> ({:.2},{:.2},{:.2}) (12 B)",
-                    new[0], new[1], new[2]
-                )
+                if x_only {
+                    let dropped = if d[1] != 0.0 || d[2] != 0.0 {
+                        " — y/z nudge not representable in the Derived field (the slot carries x only) — ignored"
+                    } else {
+                        ""
+                    };
+                    format!("verb nudge-glyph: {rel} slot {slot} x -> {:.2} (4 B){dropped}", new[0])
+                } else {
+                    format!(
+                        "verb nudge-glyph: {rel} slot {slot} pos -> ({:.2},{:.2},{:.2}) (12 B)",
+                        new[0], new[1], new[2]
+                    )
+                }
             }
             Verb::ScaleGlyph(f) => {
                 let Some(g) = &glyph else {
@@ -1094,6 +1112,14 @@ impl GlyphScene {
                 let Some(slot) = g.slot else {
                     return format!("verb scale-glyph: {rel} '{}' is blank (no instance)", g.ch);
                 };
+                if self.field.mode() == super::GlyphFieldMode::Derived {
+                    // A Derived slot has no advance or height lane: both come
+                    // from the atlas table (`write_extent` is a no-op there).
+                    return format!(
+                        "verb scale-glyph: {rel} slot {slot} x{f} not representable in the Derived field \
+                         (advance and height come from the atlas table) — ignored"
+                    );
+                }
                 let new_ah = [g.advance * f, g.height * f];
                 self.field.write_extent(&ctx.queue, slot, new_ah[0], new_ah[1]);
                 let ov = self
