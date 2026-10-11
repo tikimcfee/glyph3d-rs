@@ -25,7 +25,7 @@
 # Ratchet, NOT an equality: tests are added constantly, so an exact pin would
 # redden on the most common good action in the repo. A green run whose real
 # count exceeds the floor prints a NOTE naming the value to raise it to.
-test_floor = 367
+test_floor = 372
 # Every golden view is rendered again under each of these and must match the
 # SAME baseline byte for byte (2026-10-09, C20). The Derived field renders
 # every golden frame identically to Instanced (measured on vulkan-nvidia and
@@ -1319,6 +1319,76 @@ op = "replace"
 find = "        self.mirror_subtrees(&pending, groups).len()"
 with = "        0"
 expect = "a_deferred_mirror_syncs_to_the_eager_rows"
+
+[[mutation]]
+name = "region-refit-unlogged"
+gate = "cargo-test"
+why = "the library's bounding regions (2026-10-10, glyph_scene/regions.rs) not told what the tree cull refit: each region is its directory's tree-cull box padded, re-padded only for the slots the cull's refit log names, so without the log a region keeps its load-time box while its pages ease, splay or are dragged out of it (and an ancestor's box stays where a dragged child was). No golden view renders the library. CONSUMED BY: TreeCull::refit's log, drained by RegionTable::sync (every frame's LibraryRegions::prepare and the region pick); reddens glyph_scene::regions::tests::region_boxes_are_the_tree_bounds_padded_through_drags_and_eases"
+file = "native/src/glyph_scene/tree_cull.rs"
+op = "replace"
+find = "            log.extend(dirty.iter().map(|&q| self.nodes[q as usize].slot));"
+with = "            let _ = (&log, &dirty);"
+expect = "region_boxes_are_the_tree_bounds_padded_through_drags_and_eases"
+
+[[mutation]]
+name = "region-misses-its-pages"
+gate = "cargo-test"
+why = "a library region boxing only the ink on its pages, not the pages (2026-10-10): with regions on, each sheet's tree-cull box takes its page face (TreeCull::with_own_box), so a directory's box encloses the page faces you see; without it a box cuts through every page narrower than its file's content fit (and an empty file's page is boxed by nothing). The cull itself cannot see it (a box is only its prefilter). CONSUMED BY: TreeCull::fit for every sheet when setup.rs builds regions; reddens glyph_scene::regions::tests::region_boxes_are_the_tree_bounds_padded_through_drags_and_eases (its page-corner containment)"
+file = "native/src/glyph_scene/tree_cull.rs"
+op = "replace"
+find = "        let mut b = if node.own { self.own_box } else { EMPTY };"
+with = "        let mut b = if node.own { EMPTY } else { EMPTY };"
+expect = "region_boxes_are_the_tree_bounds_padded_through_drags_and_eases"
+
+[[mutation]]
+name = "region-pick-outermost"
+gate = "cargo-test"
+why = "the region pick keeping the SHALLOWEST region the ray enters instead of the innermost (2026-10-10): a click inside a nested directory picks its top-level ancestor, so `g` drags the whole branch. CONSUMED BY: RegionTable::pick, behind every click that hits no file in a library with regions; reddens glyph_scene::regions::tests::the_region_pick_is_the_innermost_region_the_ray_enters"
+file = "native/src/glyph_scene/regions.rs"
+op = "replace"
+find = "            if best.is_none_or(|(bd, bt, br)| depth > bd || (depth == bd && (tt < bt || (tt == bt && r > br)))) {"
+with = "            if best.is_none_or(|(bd, bt, br)| depth < bd || (depth == bd && (tt < bt || (tt == bt && r > br)))) {"
+expect = "the_region_pick_is_the_innermost_region_the_ray_enters"
+
+[[mutation]]
+name = "region-outpicks-content"
+gate = "cargo-test"
+why = "a library region answering a click before the files inside it (2026-10-10): the JS rule, kept here, is that content out-picks the box (the box only catches its empty interior), so a click on a page's text picks the file and a click in the margin picks the directory. With the region first, no file inside any region can be clicked. CONSUMED BY: GlyphScene::apply_pick's pixel arm (pick_ray, then pick_region_at on a miss); reddens tests/library_regions.rs regions_pick_after_content_and_draw_only_where_they_are (the release binary's pick lines)"
+file = "native/src/glyph_scene/pick.rs"
+op = "replace"
+find = "            PickCommand::Pixel { x, y } => self.pick_ray(*x, *y),"
+with = "            PickCommand::Pixel { x, y } => match self.pick_region_at(*x, *y) { Some(_) => None, None => self.pick_ray(*x, *y) },"
+expect = "regions_pick_after_content_and_draw_only_where_they_are"
+
+[[mutation]]
+name = "region-g-grabs-the-file"
+gate = "cargo-test"
+why = "`g` ignoring a picked library region (2026-10-10): the region is picked and highlighted but `g` finds no file pick and grabs nothing, so a directory can be dragged only through one of its files' `c`. CONSUMED BY: interaction::grab_target, which the g and c keys ask; reddens glyph_scene::regions::tests::a_region_drag_moves_its_subtree_and_sticks"
+file = "native/src/glyph_scene/interaction.rs"
+op = "replace"
+find = "        Some(z) => Some(z),"
+with = "        Some(z) => key_c.then_some(z),"
+expect = "a_region_drag_moves_its_subtree_and_sticks"
+
+[[mutation]]
+name = "region-compose-drops-translation"
+gate = "cargo-test"
+why = "the region compose pass placing each box by its offset alone, without its directory's world translation (2026-10-10, library_regions.wgsl): every region draws near the world origin instead of around its pages, and none follows a drag, an ease or a page turn. CONSUMED BY: write_regions, every region on every frame whose flush resolved anything or uploaded a box; reddens glyph_scene::regions::tests::the_gpu_composes_the_regions_the_cpu_does"
+file = "native/src/shaders/library_regions.wgsl"
+op = "replace"
+find = "    let at = w.t_s.xyz + rotate(q, centre * s);"
+with = "    let at = rotate(q, centre * s);"
+expect = "the_gpu_composes_the_regions_the_cpu_does"
+
+[[mutation]]
+name = "region-draw-dropped"
+gate = "cargo-test"
+why = "the library's regions built, uploaded and composed but never drawn (2026-10-10): every unit test of the boxes, the pick and the compose pass stays green, and the library shows no containment at all. No golden view renders the library. CONSUMED BY: render.rs's Backdrop phase (after the page faces); reddens tests/library_regions.rs regions_pick_after_content_and_draw_only_where_they_are (regions-on vs regions-off pixels inside sub/'s box)"
+file = "native/src/glyph_scene/render.rs"
+op = "replace"
+find = "                    regions.draw(&mut pass);"
+with = "                    let _ = regions;"
+expect = "regions_pick_after_content_and_draw_only_where_they_are"
 
 [[mutation]]
 name = "scene-graph-cpu-mirror-compose-swapped"
