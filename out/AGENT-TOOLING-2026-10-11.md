@@ -26,7 +26,7 @@ removed there with `git apply -R`. Both branches merge back separately.
 `tests-mod-dropped`, which `prove --mutation` showed reddening for its stated
 reason; the file was restored byte-exact. Coverage is now 16 gates, 14 with
 mutations; the two uncovered are repo-verify and repo-verify-direct, as
-before. Next is commit 3: cargo-doc on `--workspace` AND `--release` (the
+before. Commit 3 then put cargo-doc on `--workspace` AND `--release` (the
 release profile so the gate never shares `target/debug` and its lock with an
 editor's rust-analyzer; measured 4.6 s, zero warnings, nothing gated on
 `debug_assertions`). The project `rust-analyzer.toml` was deleted, because it
@@ -35,6 +35,41 @@ cannot reach the flycheck. Commit 3 also found that cargo-modules runs
 (caught with a logging cargo shim on PATH), so the orphans script now sets
 `CARGO_TARGET_DIR=target/orphans`: 564 MB, 29 s cold and 27 s warm, and
 `target/debug` untouched. With that, no gate uses `target/debug`.
+
+### The lint series as built (2026-10-11, branch `tooling`)
+
+- `0fd05d5`: an empty `[workspace.lints]`, which every member opts into.
+- `51fd106`: dropped six `#[allow(too_many_arguments)]` that suppressed
+  nothing. Each function has exactly 7 parameters, and the lint fires above 7.
+  Found by turning every allow into `#[expect]` for one clippy run.
+- `8d50ea7` (`allow_attributes_without_reason`): reasons on the 17 left.
+  Seven of them say "not yet bundled": parameter-struct candidates in Pass
+  1, the line table, the reference scan and the transcript layout.
+- `d67dd46` (`allow_attributes`): every suppression is `#[expect]`, so a
+  stale one is a warning.
+- `ac13974`: the windowed and emoji-scratch Pass 2 paths rebase `dest_addr`
+  below their buffer, and the emitter did `ptr::add` from that base:
+  formally UB. It now offsets in integers. hyper-oracle and pixel-ab green.
+- `bfb7582` (`undocumented_unsafe_blocks`): 38 SAFETY comments. Six only
+  compile on macOS, and were found and checked with
+  `cargo clippy --target aarch64-apple-darwin --target-dir target/clippy-macos`
+  (the rustup target is installed on the Linux box). Comments only.
+- `de53e46`: native/AGENTS.md said zero arch intrinsics; text.rs has NEON.
+
+**Open, for Ivan:**
+- **Pass 1 / Pass 2 slot count is unchecked at run time.** Both emitters
+  (and the host arena's `commit`) are sound only if Pass 2 writes exactly
+  the survivors Pass 1 counted. hyper-oracle compares every slot, but only
+  the device emoji-scratch path asserts the count. A per-chunk
+  `assert_eq!(survivor_out, pre.survivor_count)` costs one compare per
+  chunk and would turn an under-count (uninitialised slots shown) into a
+  panic. An over-count would already have written past the range before it
+  fired. That one wants a bench before it lands.
+- **A macOS cross-clippy gate?** About 14 s warm, and it would have caught
+  the six macOS-only sites on Linux. But the M2 has Homebrew Rust and no
+  rustup, so the gate would have to be host-conditional.
+- **The M2's battery after merge.** The macOS SAFETY comments were
+  lint-checked cross-target, not built or run there.
 
 ### Commit 1 as built
 
