@@ -33,6 +33,9 @@ allow_attributes_without_reason = "warn"
 # #[expect] over #[allow]: an expectation the lint stops meeting is itself a
 # warning, so a suppression cannot outlive its cause (2026-10-11).
 allow_attributes = "warn"
+# Every unsafe block and impl states the invariant it relies on, checked on
+# Linux and, cross-target, on macOS, whose Metal path is cfg-gated (2026-10-11).
+undocumented_unsafe_blocks = "warn"
 
 [profile.release]
 # Keep debug info in release so future profiling stages stay sane.
