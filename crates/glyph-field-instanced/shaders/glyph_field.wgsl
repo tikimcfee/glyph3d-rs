@@ -43,7 +43,10 @@
 // (segment ranges ascend in arena order). Far (subpixel) segments are
 // substituted by flat backdrop quads from cull.wgsl, never partially drawn.
 
-const MAX_CURVES: u32 = 256u;
+// A safety bound on the per-fragment curve loop, not a budget: it must cover
+// the atlas's largest outline (468 curves, 2026-10-11), or that glyph is cut
+// off. native/tests/curve_cap.rs holds every glyph shader to it.
+const MAX_CURVES: u32 = 512u;
 const TEX_W: i32 = 1024;
 const GROUP_STRIDE: u32 = 6u; // vec4s per group row (extended from glyphVertex.js GROUP_STRIDE=5)
 

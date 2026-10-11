@@ -172,6 +172,32 @@ Derived's default item table).
   `layout_hyper::derived_lane_limits`). Step 3 turns the fall-back into a
   refusal; the workarounds then are widening a lane or splitting an
   oversized file into several items.
+- **Review of step 1 (2026-10-11): two default-path defects, both fixed.**
+  An adversarial review and an Instanced capability audit, run before any
+  deletion, found what the goldens could not see:
+  - The Derived shader's curve-loop bound was 128 (Instanced's 256) from the
+    initial snapshot, against an atlas whose largest outline has 468 curves:
+    27 glyphs drew cut off in Derived and Visible (☃ lost its eyes, ☠
+    smeared a bar down its cell; 12 of them in Instanced too). Both bounds are
+    now 512; `native/tests/curve_cap.rs` holds every glyph shader to the
+    atlas (`derived-curve-cap-128`).
+  - `--render-file --copies N` stacked every copy on copy 0 under Derived:
+    the stager's items all named group 0 (since the item/group lane split,
+    2026-10-09; invisible while Instanced was the default).
+    `native/tests/render_file_copies.rs` (`render-file-copies-share-group-0`).
+  - The instanced equivalent was unproven (every other pixel mutation now
+    targets Derived or shared code): `instanced-coverage-scale` proves it.
+  - **Open, found by the same pass:** Derived takes a fresh override index on
+    every per-glyph group verb and never reuses one, so 4,095 CALLS per field
+    lifetime exhaust it (Visible dedups by group), and past it the verb reply
+    still claims `-> group N` while the frame is unchanged; host-staged arenas
+    get no lane check (rows past `ROW_MAX` and wrap segments past 65,535
+    saturate silently); wrap_segment and glyph_id (16 bits each) are not in
+    `derived_lane_limits`; `derived_vertex_stage_agrees_with_instanced` and
+    `block_cull_bounds_enclose_all_slots` use `RenderEmit` as their reference
+    and must move onto the oracle's reference instances before step 3; the
+    shaders' greeking gate differs (Instanced greeks a blank glyph with a
+    background, Derived does not).
 
 **State.** origin/main is this branch. Battery ALL GATES GREEN, 15 of 15
 (327 tests at floor 327) on vulkan-nvidia and metal-apple; every golden

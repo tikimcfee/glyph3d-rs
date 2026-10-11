@@ -25,7 +25,7 @@
 # Ratchet, NOT an equality: tests are added constantly, so an exact pin would
 # redden on the most common good action in the repo. A green run whose real
 # count exceeds the floor prints a NOTE naming the value to raise it to.
-test_floor = 374
+test_floor = 376
 # Every golden view is rendered again under each of these and must match the
 # SAME baseline byte for byte (2026-10-09, C20). The plain frames render the
 # Derived field, the default since 2026-10-11 (Instanced retirement step 1);
@@ -1063,6 +1063,39 @@ find = """    if word_start_byte != usize::MAX {
 with = """    if word_start_byte == usize::MAX - 1 {
         let wc = word_color_packed(&bytes[word_start_byte..]);"""
 expect = "colorizers_agree_on_truncated_leads_and_unterminated_words"
+rebuild = "cargo build --release"
+
+[[mutation]]
+name = "derived-curve-cap-128"
+gate = "cargo-test"
+why = "the Derived shader's curve-loop bound back at 128, where it sat from the initial snapshot until 2026-10-11 while the atlas's largest outline has 468 curves: every glyph over 128 curves drawn cut off (☃ without its eyes, ☠ smearing a bar down its cell) in Derived and Visible, the default path. No golden frame holds such a glyph, so pixel-ab is blind to it. CONSUMED BY: native/tests/curve_cap.rs, which reads every glyph shader's MAX_CURVES against glyphmap.bin's largest outline"
+file = "crates/glyph-field-derived/shaders/glyph_field_derived.wgsl"
+op = "replace"
+find = "const MAX_CURVES: u32 = 512u;"
+with = "const MAX_CURVES: u32 = 128u;"
+expect = "every_glyph_shader_covers_the_largest_outline"
+rebuild = "cargo build --release"
+
+[[mutation]]
+name = "render-file-copies-share-group-0"
+gate = "cargo-test"
+why = "the text stager's items all naming group 0, as they did until 2026-10-11: the Derived vertex stage draws with the item's group, so `--render-file --copies N` stacked every copy on copy 0 in the default field (Instanced, reading the slot's group, tiled them). No golden view uses --copies. CONSUMED BY: native/tests/render_file_copies.rs, the default frame of four copies against Instanced's"
+file = "native/src/text.rs"
+op = "replace"
+find = "                group: copy,"
+with = "                group: 0 * copy,"
+expect = "copies_tile_in_the_default_field"
+rebuild = "cargo build --release"
+
+[[mutation]]
+name = "instanced-coverage-scale"
+gate = "pixel-ab"
+why = "proves the `--field-mode instanced` golden equivalent renders Instanced: since Derived became the default (2026-10-11) every other pixel mutation targets Derived or shared code, so an equivalent whose argument stopped reaching the field would compare Derived with Derived and stay green. CONSUMED BY: every golden view under the instanced equivalent; the plain frames stay byte-equal"
+file = "crates/glyph-field-instanced/shaders/glyph_field.wgsl"
+op = "replace"
+find = "cov = clamp(coverage * 0.5, 0.0, 1.0);"
+with = "cov = clamp(coverage * 0.62, 0.0, 1.0);"
+expect = "text.png diverges from baseline under --field-mode instanced"
 rebuild = "cargo build --release"
 
 [[mutation]]
