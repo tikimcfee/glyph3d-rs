@@ -74,6 +74,10 @@ pub trait SceneLike {
     fn cam_pose(&self) -> Option<([f32; 3], f32, f32)> {
         None
     }
+    /// The panel's "Show glyphs" threshold (px per text row), set live —
+    /// what a windowed slider drag does to the cull cell, for offscreen's
+    /// `GLYPH_FRAME_SCRIPT` (C32, 2026-10-11). Default no-op.
+    fn set_show_glyphs_px(&mut self, _px: f32) {}
     /// Resolve a pick; returns a log line (None = scene doesn't support it).
     fn apply_pick(&mut self, _ctx: &GpuContext, _cmd: &crate::glyph_scene::PickCommand) -> Option<String> {
         None

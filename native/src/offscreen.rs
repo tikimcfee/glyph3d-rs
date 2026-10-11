@@ -124,6 +124,17 @@ pub fn run_scene(
     }
     let mut drag_cursor = (size.width as f32 * 0.5, size.height as f32 * 0.5);
 
+    // GLYPH_FRAME_SCRIPT (C32, 2026-10-11): scene changes applied BEFORE a
+    // given frame, so a frame can follow a different one — a camera move or
+    // a live panel threshold, the two things a static offscreen run never
+    // does and the windowed app does all the time. C32 (a stale tail of the
+    // previous frame's segment list laid out again) was invisible to every
+    // offscreen check for exactly that reason.
+    let frame_script = std::env::var("GLYPH_FRAME_SCRIPT")
+        .ok()
+        .map(|spec| parse_frame_script(&spec).unwrap_or_else(|e| panic!("GLYPH_FRAME_SCRIPT: {e}")))
+        .unwrap_or_default();
+
     // Readback buffer: copy_texture_to_buffer requires 256-byte-aligned rows.
     let unpadded_bpr = size.width * 4;
     let padded_bpr = unpadded_bpr.div_ceil(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT)
@@ -162,6 +173,12 @@ pub fn run_scene(
             for _ in 0..events {
                 drag_cursor = (drag_cursor.0 + dx / events as f32, drag_cursor.1 + dy / events as f32);
                 scene.on_cursor(ctx, drag_cursor.0, drag_cursor.1);
+            }
+        }
+        for (_, step) in frame_script.iter().filter(|(at, _)| *at == frame) {
+            match *step {
+                FrameStep::Pose { eye, yaw_deg, pitch_deg } => scene.set_cam_pose(eye, yaw_deg.to_radians(), pitch_deg.to_radians()),
+                FrameStep::ShowGlyphsPx(px) => scene.set_show_glyphs_px(px),
             }
         }
         scene.animate(ctx, 1.0 / 60.0);
@@ -385,9 +402,56 @@ fn parse_drag_script(spec: &str) -> (winit::keyboard::KeyCode, f32, f32, u32, u3
     (key, num(1, 0.0), num(2, 4.0), num(3, 1.0).max(1.0) as u32, frames)
 }
 
+/// One `GLYPH_FRAME_SCRIPT` step.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum FrameStep {
+    /// `pose X Y Z YAW PITCH`: the `--cam-pose` form, degrees.
+    Pose { eye: [f32; 3], yaw_deg: f32, pitch_deg: f32 },
+    /// `show-glyphs-px PX`: the panel's "Show glyphs" slider.
+    ShowGlyphsPx(f32),
+}
+
+/// Parse `GLYPH_FRAME_SCRIPT`: `FRAME:STEP` entries separated by `;`, each
+/// applied before frame FRAME (0-based) renders.
+pub fn parse_frame_script(spec: &str) -> Result<Vec<(u32, FrameStep)>, String> {
+    let mut steps = Vec::new();
+    for entry in spec.split(';').map(str::trim).filter(|e| !e.is_empty()) {
+        let (frame, step) = entry.split_once(':').ok_or_else(|| format!("{entry:?} is not FRAME:STEP"))?;
+        let frame = frame.trim().parse::<u32>().map_err(|_| format!("bad frame in {entry:?}"))?;
+        let words: Vec<&str> = step.split_whitespace().collect();
+        let numbers = |want: usize| -> Result<Vec<f32>, String> {
+            let values: Vec<f32> = words[1..].iter().map(|w| w.parse::<f32>()).collect::<Result<_, _>>().map_err(|_| format!("bad number in {entry:?}"))?;
+            if values.len() != want {
+                return Err(format!("{entry:?}: {} takes {want} numbers", words[0]));
+            }
+            Ok(values)
+        };
+        let step = match words.first().copied() {
+            Some("pose") => {
+                let v = numbers(5)?;
+                FrameStep::Pose { eye: [v[0], v[1], v[2]], yaw_deg: v[3], pitch_deg: v[4] }
+            }
+            Some("show-glyphs-px") => FrameStep::ShowGlyphsPx(numbers(1)?[0]),
+            other => return Err(format!("{other:?} in {entry:?} is not pose | show-glyphs-px")),
+        };
+        steps.push((frame, step));
+    }
+    Ok(steps)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{parse_dump_spec, DumpSpec};
+    use super::{parse_dump_spec, parse_frame_script, DumpSpec, FrameStep};
+
+    #[test]
+    fn frame_script_parses_poses_and_thresholds() {
+        let s = parse_frame_script("0:pose 1 2 3 -0.5 -30; 2: show-glyphs-px 2 ;").expect("parses");
+        assert_eq!(s, vec![(0, FrameStep::Pose { eye: [1.0, 2.0, 3.0], yaw_deg: -0.5, pitch_deg: -30.0 }), (2, FrameStep::ShowGlyphsPx(2.0))]);
+        assert!(parse_frame_script("pose 1 2 3 4 5").is_err());
+        assert!(parse_frame_script("1:pose 1 2 3 4").is_err());
+        assert!(parse_frame_script("1:zoom 2").is_err());
+        assert!(parse_frame_script("x:show-glyphs-px 2").is_err());
+    }
 
     /// Both forms, both defaults, and that a malformed value is refused
     /// rather than read as slot 0.
