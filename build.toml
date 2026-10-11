@@ -25,7 +25,7 @@
 # Ratchet, NOT an equality: tests are added constantly, so an exact pin would
 # redden on the most common good action in the repo. A green run whose real
 # count exceeds the floor prints a NOTE naming the value to raise it to.
-test_floor = 358
+test_floor = 359
 # Every golden view is rendered again under each of these and must match the
 # SAME baseline byte for byte (2026-10-09, C20). The Derived field renders
 # every golden frame identically to Instanced (measured on vulkan-nvidia and
@@ -1188,6 +1188,16 @@ op = "replace"
 find = "            wash_dropped: c[counter::WASH].saturating_sub(self.limits.max_wash),"
 with = "            wash_dropped: c[counter::WASH].saturating_sub(u32::MAX),"
 expect = "the_frame_path_culls_lays_out_and_draws"
+
+[[mutation]]
+name = "drag-delta-in-world-space"
+gate = "cargo-test"
+why = "E10 of the library findings: the `g` drag added the cursor's WORLD delta to the file card's LOCAL translation. Every library file sits under its page's mount, which carries the contain-fit scale (0.02..4), so the file moved s times the cursor; the shelf and carrel never nest a card under a scaled parent, so it never showed there. No golden view drags. CONSUMED BY: interaction::card_local_delta, which the drag's controller branch applies before writing the card's Transform; reddens glyph_scene::interaction::tests::a_drag_under_a_scaled_parent_moves_the_card_by_the_world_delta"
+file = "native/src/glyph_scene/interaction.rs"
+op = "replace"
+find = "        Some(g) => g.affine().inverse().transform_vector3(world),"
+with = "        Some(_) => world,"
+expect = "a_drag_under_a_scaled_parent_moves_the_card_by_the_world_delta"
 
 [[mutation]]
 name = "library-deck-order-flipped"
