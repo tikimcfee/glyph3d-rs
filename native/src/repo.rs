@@ -1039,20 +1039,22 @@ impl RepoLoad {
                 })
                 .collect();
         // The visible field's items: the seam's seeds finished with what only
-        // the shelf layout knows — the group row and the world box the scene
-        // culls (the segment's, group offset applied).
+        // the layout knows — the group row — and the LOCAL box the field's
+        // item cull carries through that row every frame: the segment's box
+        // before the group's T·R·S (`offset + local * s` is the segment).
+        // Local since 2026-10-10, so no group edit re-uploads it.
         let mut arena = self.arena;
         if let Some(staging) = arena.visible_staging_mut() {
             assert_eq!(staging.item_bytes.len(), self.files.len(), "the loader moved every file's bytes in");
             let items: Vec<glyph_field_visible::VisibleItem> = self
                 .files
                 .iter()
-                .zip(segments.iter())
                 .zip(gpu_item_params.iter())
                 .enumerate()
-                .map(|(i, ((v, seg), gp))| {
+                .map(|(i, (v, gp))| {
                     debug_assert_eq!(v.group_id as usize, i);
-                    staging.item(i, *gp, seg.min, seg.max)
+                    let (min, max) = segment_local_box(v);
+                    staging.item(i, *gp, min, max)
                 })
                 .collect();
             staging.items = items;
@@ -1179,6 +1181,18 @@ impl RepoLoad {
             p.fold.saturating_sub(eng_sum).as_secs_f64()
         );
     }
+}
+
+/// A file's cull box in its own frame: the `SegCull` box `into_staged`
+/// builds (ink plus the segment pads, no z pad) before the group's T·R·S,
+/// so `offset + local * scale` is that segment. The Visible field's items
+/// carry it (their cull applies the live group row).
+fn segment_local_box(v: &FileView) -> ([f32; 3], [f32; 3]) {
+    use crate::glyph_scene::{SEG_CULL_PAD_MAX, SEG_CULL_PAD_MIN};
+    (
+        [v.ink.min[0] - SEG_CULL_PAD_MIN[0], v.ink.min[1] - SEG_CULL_PAD_MIN[1], v.ink.min[2]],
+        [v.ink.max[0] + SEG_CULL_PAD_MAX[0], v.ink.max[1] + SEG_CULL_PAD_MAX[1], v.ink.max[2]],
+    )
 }
 
 /// The repo paint pass: per-file `colorize_leaders`, sharded by BYTE-balanced

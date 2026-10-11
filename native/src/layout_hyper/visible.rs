@@ -60,8 +60,9 @@ pub struct VisibleStaging {
 }
 
 impl VisibleStaging {
-    /// Finish item `i` into the field's record. `bbox` is the world box the
-    /// scene culls (the same as its `SegCull`, group offset applied).
+    /// Finish item `i` into the field's record. `bbox` is the item's LOCAL
+    /// box (its `SegCull` before the group's T·R·S); the field's item cull
+    /// carries it through the live group row.
     pub fn item(&self, i: usize, group_params: ItemParamsGpu, bbox_min: [f32; 3], bbox_max: [f32; 3]) -> VisibleItem {
         let seed = &self.seeds[i];
         let p = &seed.params;

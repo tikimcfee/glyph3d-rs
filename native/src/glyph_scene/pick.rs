@@ -837,10 +837,12 @@ impl GlyphScene {
     /// Re-derive a cull segment from the live group TRS: the world AABB
     /// follows offset/scale, and the backdrop tint follows the group color
     /// relative to its as-staged value (so untouched segments keep their
-    /// Stage F-fitted tint exactly). The Visible field culls its items by
-    /// its own copy of that box, so the recomputed one is pushed to it too
-    /// (M3) — every group edit lands here, whichever verb or drag moved it.
-    pub(super) fn sync_segment(&mut self, ctx: &GpuContext, gid: u32) {
+    /// Stage F-fitted tint exactly). The Visible field needs nothing from
+    /// here: its item cull carries each item's LOCAL box through the live
+    /// group row (2026-10-10; until then every call pushed a 24 B world box,
+    /// ~23 ms a frame with 29k files animating). `_ctx` stays for the
+    /// callers' sake.
+    pub(super) fn sync_segment(&mut self, _ctx: &GpuContext, gid: u32) {
         let Some(g) = self.groups_cpu.get(gid as usize).copied() else {
             return;
         };
@@ -851,7 +853,6 @@ impl GlyphScene {
             g.cols[3][2].max(0.0),
         );
         let i = gid as usize;
-        let mut world_box: Option<([f32; 3], [f32; 3])> = None;
         if let Some(cull) = &mut self.cull {
             if i >= cull.segments.len() {
                 return;
@@ -894,19 +895,6 @@ impl GlyphScene {
                 *tc = (bt[c] * newc / oldc).min(1.0);
             }
             cull.segments[i].tint = t;
-            world_box = Some((cull.segments[i].min, cull.segments[i].max));
-        } else if let Some(info) = self.pick.as_ref().and_then(|p| p.files.iter().find(|f| f.group_id == gid)) {
-            // --no-cull: no segment table, but the Visible field still culls
-            // itself — the pick AABB carries the same margins (plus a z pad).
-            world_box = Some((
-                [info.aabb_min[0] * sx + ox, info.aabb_min[1] * sy + oy, info.aabb_min[2] * sz + oz],
-                [info.aabb_max[0] * sx + ox, info.aabb_max[1] * sy + oy, info.aabb_max[2] * sz + oz],
-            ));
-        }
-        if let (Some((min, max)), Some(item)) = (world_box, self.visible_item_of(gid)) {
-            if let Some(visible) = self.field.visible() {
-                visible.set_item_bbox(&ctx.queue, item, min, max);
-            }
         }
     }
 

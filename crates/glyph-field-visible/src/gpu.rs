@@ -444,8 +444,8 @@ impl Resident {
         queue.write_buffer(&self.hidden, item as u64 * 4, bytemuck::bytes_of(&u32::from(hidden)));
     }
 
-    pub fn set_item_bbox(&self, queue: &wgpu::Queue, item: u32, bbox_min: [f32; 3], bbox_max: [f32; 3]) {
-        assert!(item < self.items_total, "set_item_bbox: item {item} of {}", self.items_total);
+    pub fn set_item_local_box(&self, queue: &wgpu::Queue, item: u32, bbox_min: [f32; 3], bbox_max: [f32; 3]) {
+        assert!(item < self.items_total, "set_item_local_box: item {item} of {}", self.items_total);
         let words = [bbox_min[0], bbox_min[1], bbox_min[2], bbox_max[0], bbox_max[1], bbox_max[2]];
         let offset = item as u64 * std::mem::size_of::<ItemGpu>() as u64 + std::mem::offset_of!(ItemGpu, bbox_min) as u64;
         queue.write_buffer(&self.items, offset, bytemuck::cast_slice(&words));

@@ -1138,13 +1138,13 @@ expect = "a_visible_frame_repeats_and_is_drawn_in_arena_order"
 rebuild = "cargo build --release"
 
 [[mutation]]
-name = "visible-moved-item-box-stale"
+name = "visible-item-cull-ignores-group"
 gate = "cargo-test"
-why = "C29 (2026-10-10): the Visible field culls ITEMS by a world box the scene pushes on every move (sync_segment -> set_item_bbox, M3). Without the push the box stays where the file was loaded: a file dragged elsewhere is culled at its old place while the stored modes (and the selection mask) draw it at the new one — the hypothesis behind Ivan's overlapped long.md. CONSUMED BY: cull_items' frustum test over ItemGpu.bbox, judged by native/tests/visible_verbs.rs a_moved_item_is_drawn_where_it_went (long.md moved out of its load box, visible vs derived at a pose where only the moved box is in view); nothing else — the oracle tiers cull nothing"
-file = "native/src/glyph_scene/pick.rs"
+why = "the Visible field's item cull testing an item's box without its group row. Since 2026-10-10 an item carries a LOCAL box and cull_items carries it through the live group table (to_world), as the line cull does; before, the scene pushed a world box per moved item (sync_segment -> set_item_bbox, M3/C29; 24 B per item per frame, ~23 ms with 29k library files animating). Ignoring the group puts every box at the item's own origin: a file moved away (or any file of a layout that offsets its groups) is culled where its local box sits while the stored modes draw it at its group's place. CONSUMED BY: cull_items' frustum and LOD tests over ItemGpu.bbox (visible_cull.wgsl), judged by native/tests/visible_verbs.rs a_moved_item_is_drawn_where_it_went (long.md moved out of its load box, visible vs derived at a pose where only the moved box is in view); the oracle tiers cull nothing"
+file = "crates/glyph-field-visible/shaders/visible_cull.wgsl"
 op = "replace"
-find = "                visible.set_item_bbox(&ctx.queue, item, min, max);"
-with = "                let _ = (visible, item, min, max);"
+find = "    let b = to_world(gbase, lb);"
+with = "    let b = lb;"
 expect = "a_moved_item_is_drawn_where_it_went"
 rebuild = "cargo build --release"
 
