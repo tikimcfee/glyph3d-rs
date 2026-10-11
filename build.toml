@@ -25,7 +25,7 @@
 # Ratchet, NOT an equality: tests are added constantly, so an exact pin would
 # redden on the most common good action in the repo. A green run whose real
 # count exceeds the floor prints a NOTE naming the value to raise it to.
-test_floor = 378
+test_floor = 379
 # Every golden view is rendered again under each of these and must match the
 # SAME baseline byte for byte (2026-10-09, C20). The plain frames render the
 # Derived field, the default since 2026-10-11 (Instanced retirement step 1);
@@ -1457,3 +1457,13 @@ op = "replace"
 find = "    pub fn group_row(&self, view: u32) -> u32 {\n        self.row(view).group_row\n"
 with = "    pub fn group_row(&self, view: u32) -> u32 {\n        view\n"
 expect = "the_registry_answers_by_field_not_by_index"
+
+[[mutation]]
+name = "derived-empty-load-panics"
+gate = "cargo-test"
+why = "the Derived host transcode refusing the zeroed padding record a load with no items stages (the slot buffer is never empty, layout_hyper's total_survivors.max(1)): step A's check that every host record's group row names one item panicked on it, so --load-repo of an empty directory (or of a path that is a file) aborted (found 2026-10-11 by the step-2 delegate). No golden view loads nothing. CONSUMED BY: transcode_one's no-items arm; reddens tests/empty_load.rs an_empty_repo_load_renders_in_every_field"
+file = "crates/glyph-field-derived/src/upload.rs"
+op = "replace"
+find = "        _ if no_items => 0,\n"
+with = ""
+expect = "an_empty_repo_load_renders_in_every_field"

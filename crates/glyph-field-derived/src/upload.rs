@@ -19,6 +19,9 @@ impl SlotRecord for DerivedSlot {
 pub struct DerivedTranscode<'a> {
     pub item_params: &'a [ItemParamsGpu],
     pub item_of_group: &'a [u32],
+    /// The producer registered no item: its one zeroed padding record
+    /// names none (`transcode_one`).
+    pub no_items: bool,
 }
 
 impl Transcode for DerivedTranscode<'_> {
@@ -26,7 +29,7 @@ impl Transcode for DerivedTranscode<'_> {
 
     #[inline(always)]
     unsafe fn transcode(&self, src: &GlyphInstance, dst: *mut DerivedSlot) {
-        std::ptr::write(dst, transcode_one(src, self.item_params, self.item_of_group));
+        std::ptr::write(dst, transcode_one(src, self.item_params, self.item_of_group, self.no_items));
     }
 }
 
@@ -37,12 +40,15 @@ pub const LABELS: UploadLabels = UploadLabels {
 };
 
 #[inline(always)]
-fn transcode_one(inst: &GlyphInstance, item_params: &[ItemParamsGpu], item_of_group: &[u32]) -> DerivedSlot {
-    let item_index = item_of_group
-        .get(inst.group_id as usize)
-        .copied()
-        .filter(|&item| item != glyph_field::NO_ITEM)
-        .unwrap_or_else(|| panic!("a host record's group row {} names no single item", inst.group_id));
+fn transcode_one(inst: &GlyphInstance, item_params: &[ItemParamsGpu], item_of_group: &[u32], no_items: bool) -> DerivedSlot {
+    // A load with no items still stages one zeroed record (the slot buffer
+    // is never empty) and draws none; it has no item to name, so it takes
+    // lane 0. Anywhere else an unnamed group row is a producer's mistake.
+    let item_index = match item_of_group.get(inst.group_id as usize).copied() {
+        Some(item) if item != glyph_field::NO_ITEM => item,
+        _ if no_items => 0,
+        _ => panic!("a host record's group row {} names no single item", inst.group_id),
+    };
     let wrap_segment = if inst.flags != 0 {
         (inst.flags & 0xFFFF) as u16
     } else if let Some(item) = item_params.get(item_index as usize) {

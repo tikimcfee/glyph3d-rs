@@ -815,7 +815,7 @@ fn derived_positions_match_the_staged_ones() {
     assert_eq!(items.len(), staged.views.len(), "one item per view");
     assert!(items.len() < staged.groups.len(), "{} items for {} group rows: the table is padded again", items.len(), staged.groups.len());
     let item_groups: Vec<u32> = items.iter().map(|p| p.group).collect();
-    let transcode = glyph_field_derived::upload::DerivedTranscode { item_params: items, item_of_group: &item_of_group };
+    let transcode = glyph_field_derived::upload::DerivedTranscode { item_params: items, item_of_group: &item_of_group, no_items: false };
 
     let mut off_origin_groups = std::collections::BTreeSet::new();
     let mut rows_below_origin = 0usize;
