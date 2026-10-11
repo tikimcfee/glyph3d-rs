@@ -415,35 +415,39 @@ pub(super) fn render_scene(
             })
         });
         // K5: refresh the browser's dynamic row state (world pose under
-        // the live group TRS, hidden, tint). ~1.3k cheap iterations at
-        // repo scale; skipped entirely offscreen (no probe installed).
-        // (The rows are read in place: cloning them cloned every path
-        // String per frame, ~74k at the kernel tree's scale.)
+        // the live group TRS, hidden, tint) for the rows the browser drew
+        // last frame (`browser_rows`, a scrolled window of a dozen or so):
+        // the pose from the transform tree (O(depth) each — a library
+        // move's CPU mirror is deferred, 2026-10-10), the appearance from
+        // the mirror (verbs write it at once). Until 2026-10-10 every row
+        // was refreshed every frame, O(files). Skipped entirely offscreen
+        // (no probe installed).
         if !p.files.is_empty() {
             let st = &mut *p;
-            st.file_dyn = st
-                .files
-                .iter()
-                .map(|r| {
-                    let Some(g) = scene.groups_cpu.get(r.group_id as usize) else {
-                        return UiFileDyn::default();
-                    };
-                    let (ox, oy) = (g.cols[0][0], g.cols[0][1]);
-                    let (sx, sy) = (g.cols[3][0].max(0.0), g.cols[3][1].max(0.0));
-                    let wmin = [r.aabb_min[0] * sx + ox, r.aabb_min[1] * sy + oy];
-                    let wmax = [r.aabb_max[0] * sx + ox, r.aabb_max[1] * sy + oy];
-                    UiFileDyn {
-                        center: [(wmin[0] + wmax[0]) * 0.5, (wmin[1] + wmax[1]) * 0.5],
-                        half: [(wmax[0] - wmin[0]) * 0.5, (wmax[1] - wmin[1]) * 0.5],
-                        hidden: g.cols[2][3] == 0.0,
-                        tint: [
-                            (g.cols[2][0].clamp(0.0, 1.0) * 255.0) as u8,
-                            (g.cols[2][1].clamp(0.0, 1.0) * 255.0) as u8,
-                            (g.cols[2][2].clamp(0.0, 1.0) * 255.0) as u8,
-                        ],
-                    }
-                })
-                .collect();
+            if st.file_dyn.len() != st.files.len() {
+                st.file_dyn = vec![UiFileDyn::default(); st.files.len()];
+            }
+            for &i in &st.browser_rows {
+                let (Some(r), Some(slot)) = (st.files.get(i), st.file_dyn.get_mut(i)) else { continue };
+                let (Some(g), Some((o, s))) = (scene.groups_cpu.get(r.group_id as usize), scene.nodes.world_offset_scale(r.group_id)) else {
+                    *slot = UiFileDyn::default();
+                    continue;
+                };
+                let (ox, oy) = (o[0], o[1]);
+                let (sx, sy) = (s[0].max(0.0), s[1].max(0.0));
+                let wmin = [r.aabb_min[0] * sx + ox, r.aabb_min[1] * sy + oy];
+                let wmax = [r.aabb_max[0] * sx + ox, r.aabb_max[1] * sy + oy];
+                *slot = UiFileDyn {
+                    center: [(wmin[0] + wmax[0]) * 0.5, (wmin[1] + wmax[1]) * 0.5],
+                    half: [(wmax[0] - wmin[0]) * 0.5, (wmax[1] - wmin[1]) * 0.5],
+                    hidden: g.cols[2][3] == 0.0,
+                    tint: [
+                        (g.cols[2][0].clamp(0.0, 1.0) * 255.0) as u8,
+                        (g.cols[2][1].clamp(0.0, 1.0) * 255.0) as u8,
+                        (g.cols[2][2].clamp(0.0, 1.0) * 255.0) as u8,
+                    ],
+                };
+            }
         }
     }
 
