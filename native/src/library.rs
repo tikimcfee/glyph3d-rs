@@ -30,6 +30,11 @@
 //! deck|splay|toggle` (key `v`); `library-stack x|y|z`; `library-sort
 //! name|size|ext [reverse]`. Paging and form address the picked file's
 //! volume, or every volume when nothing is picked.
+//!
+//! Bounding regions (`[library] regions`, the scene's
+//! `glyph_scene/regions.rs`): a translucent box around every directory's
+//! subtree; a click inside one that hits no file picks the innermost, and
+//! `g` (or `c`) drags that directory through [`Library::move_zone`].
 
 pub mod book;
 pub mod plan;

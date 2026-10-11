@@ -262,8 +262,13 @@ its staging text predates C22). Key touchpoints:
   and no `sync_segment` (the library culls top-down from the tree,
   `glyph_scene/tree_cull.rs`). Animations run on the
   offscreen 1/60 s clock (`SceneLike::animate`), so `--verb page-next
-  --frames 120` is a deterministic page turn. A settled library prints
-  nothing: it does no work. `out/LIBRARY-LAYOUT-FINDINGS-2026-10-10.md` has
+  --frames 120` is a deterministic page turn. With `[library] regions` on
+  (E20, `glyph_scene/regions.rs`) a `REGIONTIME` line follows every frame
+  whose regions did anything: `refits` (tree-cull slots refit, any library
+  node), `uploaded` / `upload_bytes` (region rows changed and the bytes
+  written — the whole 48 B-per-region table once more than a quarter
+  changed), `composed` (the compose pass ran) and `prepare_ms`. A settled
+  library prints nothing: it does no work. `out/LIBRARY-LAYOUT-FINDINGS-2026-10-10.md` has
   the measured figures.
 - `GLYPH_G_DUMP=<slot>[,<len>]` — offscreen only: reads back instance bytes
   at `slot` from the glyph arena and prints hex (buffer write-path audits).
@@ -328,7 +333,8 @@ its staging text predates C22). Key touchpoints:
 - `GLYPH_DRAG_SCRIPT=g|c:DX:DY[:EVENTS[:FRAMES]]` — offscreen (2026-10-10): a grab
   drag scripted through the window's own entry points — cursor parked at
   the viewport centre, the grab key (`g` the picked file, `c` its zone; pick
-  first with `--pick-file`), then EVENTS cursor moves per frame (default 1)
+  first with `--pick-file`; after a `--pick-px` that landed in a library
+  region, both grab that region's directory), then EVENTS cursor moves per frame (default 1)
   totalling (DX, DY) px, for the first FRAMES frames (default every frame: a
   drag that stops, so a later ease can be seen keeping it). A drag is applied ONCE per frame (`apply_drag`,
   from `animate`), however many moves arrived; `GLYPH_DRAG_PER_EVENT=1`

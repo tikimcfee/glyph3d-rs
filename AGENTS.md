@@ -686,7 +686,12 @@ and the union is not:
   scheme's numbers and its scene binding (group rows, page turns) by
   `library::tests`; its pixels, the page faces and the animation path past
   the group rows are seen by nothing. Candidate frames and the commands
-  that made them are in `out/LIBRARY-LAYOUT-FINDINGS-2026-10-10.md`.
+  that made them are in `out/LIBRARY-LAYOUT-FINDINGS-2026-10-10.md`. Its
+  bounding regions (E20, `glyph_scene/regions.rs`) are held to the tree
+  cull's boxes, a brute-force pick and their CPU twin by `regions::tests`,
+  and seen in pixels only by `tests/library_regions.rs`'s one-region
+  on/off comparison on `g-pick-repo`; their depth order against the glyph
+  pass is seen by nothing.
 - **PROVENANCE.md's prose is generated but only partially validated.** The
   fixture count is READ FROM build.toml at generation time — the generator
   refuses to write an unverifiable number — but the rest of the prose is
