@@ -374,3 +374,80 @@ Re-run the sweep before committing; a grep is worth only its match set:
   find mutations worth promoting into `build.toml`), cargo-hack (to compile
   `glyph-field` without clap). The one hook worth adding: `naga <file>` on
   `.wgsl` edits.
+
+## Merge readiness, and what is left (2026-10-11, late)
+
+**The merge back is textually clean and one attribute short of green.**
+`git merge-tree` of `tooling` against the maintenance branch (seven commits
+since the split: tab stops, C32, the empty-load regression, `GLYPH_FRAME_SCRIPT`)
+reports no conflicts. The merged tree was checked out detached in a scratch
+worktree and run through the three gates this branch tightened:
+
+- `cargo clippy --release --all-targets`: 2 warnings, one site.
+  `native/src/layout_hyper/pass2_host.rs:629` carries
+  `#[allow(clippy::too_many_arguments)]` on `scan_item_max_row_extent`, added
+  by the tab-stops commit (bd34c17). The function has seven parameters and
+  the lint fires at eight, so the attribute suppresses nothing: delete it,
+  as 51fd106 did for six of the same. Both `allow_attributes` and
+  `allow_attributes_without_reason` flag it.
+- `cargo doc --workspace --release --no-deps`: 0 warnings.
+- `tools/check-orphans.sh`: 9 targets, ORPHANS OK.
+
+The merge itself is Ivan's to run (it reads the other session's branch):
+`git merge worktree-maintenance-and-things` in this worktree, delete the
+attribute, `cargo glyph test rust`, and fold the fix into the merge commit
+so every commit on the branch stays green.
+
+**`atlas-verify` gate (this commit).** `tools/verify_atlas.py` had asserted
+the curve and glyph-map textures, `glyphs.bin` against the glyph map, the
+trie's section layout, the sequence and class sections and the emoji cells
+since the export was written, in 0.14 s, and root AGENTS.md listed it under
+"What the whole battery cannot see". It is a `cmd` gate now (scope corpus,
+`pass_line = "VERIFY OK"`), proven by `atlas-glyphmap-disagreement`.
+Seventeen gates; the two uncovered ones are still repo-verify(-direct), for
+the reason AGENTS.md gives.
+
+**The candidate list, corroborated or refuted.** Measured against the tree,
+not the earlier counts (which double-counted lib and lib-test builds):
+
+- *Pedantic "small-correctness pack"*: 15 unique sites across nine lints
+  (`ptr_as_ptr` 4, `ref_as_ptr` 1, `naive_bytecount` 2, `checked_conversions`
+  2, `range_plus_one` 2, and one each of `manual_assert`, `nonminimal_bool`,
+  `redundant_else`, `unnested_or_patterns`). `large_stack_arrays`'s one site
+  is a 128 KiB test buffer in `chunk.rs`'s tests, not a stack risk. **Refuted
+  as a series**: the three lints this branch landed each catch a class this
+  repo had suffered (unexplained suppressions, suppressions outliving their
+  cause, an undocumented unsafe block hiding UB). None of these nine does;
+  they are taste, and a workspace lint is a rule every later contributor
+  must satisfy. If any, `ptr_as_ptr` + `ref_as_ptr` (5 sites, one commit) as
+  a follow-on to the unsafe hygiene. `many_single_char_names` (76) matches
+  Ivan's § 7 naming rule but is numeric code; his call, not a lint's.
+- *Board rows*: C3 closed (lint-enforced), C2 re-measured, X3 was already
+  closed with the setup commit. Done in this commit.
+- *pixi `check-all`*: a duplicate of `check`; removed. `tools/check-all.sh`
+  stays as the documented door.
+- *A `naga` hook on `.wgsl` edits*: would live in `.claude/settings.json`,
+  which `.gitignore` excludes (only `skills/` is tracked), and would run in
+  every session's Edit hook on this machine. Cheap, but it is Ivan's editor
+  config as much as the repo's; proposed, not done.
+- *C25 (MAPPABLE_PRIMARY_BUFFERS on discrete)*: corroborated as real and
+  small. The flag is consumed in two places (`glyph_scene/setup.rs:280`,
+  `gpu.rs:408`), both already conditioned on the backend, so requesting it
+  only where those fire is a renderer change with an expected-neutral
+  discrete A/B. Renderer work for the maintenance branch, not this one.
+- *C31 (visible-mode hide/show nondeterminism)*: a real bug, uninvestigated,
+  the most valuable open item after the merge. Not tooling.
+- *repo-verify(-direct) mutations*: refuted; AGENTS.md records why nothing
+  separates `direct` from its reference without a device.
+- *Golden coverage holes (far-LOD tint, library mode, visible flat twins)*:
+  each needs Ivan to adopt frames; candidates already exist for two.
+- *The runtime slot-count assert, parameter structs for the seven "not yet
+  bundled" functions*: hot-path engine changes; each needs hyper-oracle and
+  an M2 A/B. After the merge, one at a time.
+- *macOS cross-clippy gate*: wants a host-conditional gate (the M2 has no
+  rustup), which `build.toml` has no vocabulary for yet. Deferred.
+
+**After the merge, on Ivan's hosts**: `pixi install && pixi run setup` on the
+M2 (Homebrew Rust; `cargo install` of naga-cli and cargo-modules is the
+untested step), then the full battery there; here, uninstall the
+`~/.cargo/bin` copies of naga and cargo-modules that pixi now supersedes.
