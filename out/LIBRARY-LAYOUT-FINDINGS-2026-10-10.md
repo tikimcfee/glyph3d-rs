@@ -454,6 +454,28 @@ follow moved library files. Instanced cannot load the whole kernel (E17),
 unchanged. The carrel and every non-library controller layout still
 flatten through bevy.
 
+### E19. A directory drag did not stick — fixed
+
+Every re-plan (page, form, stack, sort) read each directory's live row as
+the ease's start and its PLANNED slot as the target, so a `c` drag was
+eased away by the next command. A drag mid-ease was lost outright: the
+next `tick` wrote the eased position over it. Ivan's rule (2026-10-10):
+user-set transforms stick, as agent turns stay in their histories. Now
+`Library::move_zone` adds the drag's delta (in the parent's frame) to the
+directory's user offset, and every target is the slot plus that offset.
+A drag mid-ease moves the ease's start and its target by the same delta.
+File drags already stuck, because no plan writes a file node's row. A
+directory's scroll scale stuck too, because the ease writes only
+translations. Witness: `library::tests::a_dragged_directory_keeps_its_
+place_through_every_replan`, plus a twin library with no drags, through
+a page turn, a form change (dragged again mid-ease) and a stack change.
+Mutation: `library-drag-offset-forgotten`. Seen offscreen with
+`GLYPH_DRAG_SCRIPT`'s new FRAMES field (a drag that stops):
+`GLYPH_DRAG_SCRIPT=c:8:-3:1:20 … --pick-file sub/deep.py --verb
+"library-stack y" --frames 240 --cam-pose 30 -200 1100 0 0` on g-pick-repo
+puts `sub/`'s page 160 px right and 60 px up from its shelf slot, the
+drag's exact displacement.
+
 ## Seeing it
 
 From `native/` (the fixture paths are native-relative), with

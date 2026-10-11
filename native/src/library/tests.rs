@@ -445,3 +445,68 @@ fn a_page_turn_moves_one_volume_and_settles_on_the_slot_law() {
     assert!(lib.form(&t, None, FormCmd::Set(Form::Splay)).contains("2 volume(s)"));
     assert!(lib.is_animating());
 }
+
+/// A directory drag sticks (Ivan, 2026-10-10: a user-set transform stays,
+/// as an agent turn stays in its history). Two libraries take the same
+/// commands — a page turn, a form change, a stack change — and one of them
+/// also has a directory dragged, once at rest and once mid-ease: settled,
+/// the dragged directory (and a file under it) sits exactly the drags'
+/// world delta from its twin, and a directory nobody dragged sits where
+/// its twin does.
+#[test]
+fn a_dragged_directory_keeps_its_place_through_every_replan() {
+    let s = &crate::config::settings().library;
+    let files = vec![
+        file("a.rs", 41.3, 17.9),
+        file("src/b.rs", 512.7, 1033.1),
+        file("src/c.rs", 3.1, 1.25),
+        file("src/deep/x/y.py", 97.0, 211.6),
+        file("src/deep/z.md", 13.37, 900.0),
+        file("docs/readme.md", 77.7, 66.6),
+    ];
+    let (mut lib, mut t, _) = attached(&files, s);
+    let (mut twin, mut tt, _) = attached(&files, s);
+    let settle = |lib: &mut Library, t: &mut NodeTables| {
+        let mut frames = 0;
+        while lib.tick(t, 1.0 / 60.0).is_some_and(|k| k.still_animating) {
+            frames += 1;
+            assert!(frames < 5000, "the ease never settled");
+        }
+    };
+    let (d1, d2) = ([40.0f32, -25.0, 3.0], [-12.5f32, 60.0, -1.0]);
+    assert!(lib.move_zone(&mut t, "dir:src/deep", d1).is_some());
+    for (k, cmd) in ["page", "form", "stack"].iter().enumerate() {
+        for (l, t) in [(&mut lib, &mut t), (&mut twin, &mut tt)] {
+            match *cmd {
+                "page" => drop(l.page(t, None, Page::Next)),
+                "form" => drop(l.form(t, None, FormCmd::Toggle)),
+                _ => drop(l.set_stack(t, crate::library::plan::Stack::Y)),
+            }
+            for _ in 0..4 {
+                l.tick(t, 1.0 / 60.0);
+            }
+        }
+        if k == 1 {
+            // Mid-ease: the drag joins the ease rather than being eased away.
+            assert!(lib.is_animating());
+            assert!(lib.move_zone(&mut t, "dir:src/deep", d2).is_some());
+        }
+        settle(&mut lib, &mut t);
+        settle(&mut twin, &mut tt);
+    }
+    let want = [0, 1, 2].map(|a| f64::from(d1[a] + d2[a]));
+    let world = |l: &Library, t: &NodeTables, zone: &str| t.world(l.zone_node(zone).unwrap()).unwrap().0.translation;
+    let (g, w) = (world(&lib, &t, "dir:src/deep"), world(&twin, &tt, "dir:src/deep"));
+    for a in 0..3 {
+        let got = f64::from(g[a]) - f64::from(w[a]);
+        assert!((got - want[a]).abs() < 1e-2, "dragged dir axis {a}: {got} from its twin, dragged {}", want[a]);
+    }
+    let file_world = |l: &Library, t: &NodeTables, f: usize| t.world(l.nodes.as_ref().unwrap().file[f]).unwrap().0.translation;
+    let (g, w) = (file_world(&lib, &t, 4), file_world(&twin, &tt, 4));
+    for a in 0..3 {
+        let got = f64::from(g[a]) - f64::from(w[a]);
+        assert!((got - want[a]).abs() < 1e-2, "file under the dragged dir, axis {a}: {got}, dragged {}", want[a]);
+    }
+    let (g, w) = (world(&lib, &t, "dir:docs"), world(&twin, &tt, "dir:docs"));
+    assert_eq!(g, w, "an undragged directory sits where its twin does");
+}

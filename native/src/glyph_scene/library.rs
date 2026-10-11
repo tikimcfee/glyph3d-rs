@@ -91,15 +91,14 @@ impl GlyphScene {
 
     /// Move a library zone by a WORLD delta: its directory node's local row
     /// takes the delta in its parent's frame (one row; the GPU carries the
-    /// subtree). Returns the move's cost, or None for no such zone.
+    /// subtree), and the library keeps it through every later re-plan
+    /// (`Library::move_zone`). Returns the move's cost, or None for no such
+    /// zone.
     pub(super) fn library_move_zone(&mut self, zone_id: &str, d: [f32; 3]) -> Option<(f64, MoveCost)> {
-        let h = self.library()?.zone_node(zone_id)?;
         let t0 = Instant::now();
-        let t = self.nodes.tables_mut();
-        let dl = t.parent_world(h).ok()?.world_delta_to_local(d);
-        let l = t.local(h).ok()?;
-        let moved = [l.translation[0] + dl[0], l.translation[1] + dl[1], l.translation[2] + dl[2]];
-        t.set_local(h, glyph_scene_graph::Similarity { translation: moved, ..l }).ok()?;
+        // The library keeps the drag (its user offset): no re-plan undoes it.
+        let lib = self.controller.as_mut()?.library.as_mut()?;
+        let h = lib.move_zone(self.nodes.tables_mut(), zone_id, d)?;
         let move_ms = t0.elapsed().as_secs_f64() * 1e3;
         Some((move_ms, self.note_tree_move(&[h])))
     }
