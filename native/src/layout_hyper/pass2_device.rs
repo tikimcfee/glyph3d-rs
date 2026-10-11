@@ -13,7 +13,7 @@
 use rayon::prelude::*;
 use crate::fold::{rows_for_line, wrap_row_of, wrap_segment_of};
 use crate::glyph_scene::{BlockCull, RenderSlot, SUBSEG_BLOCK_SIZE};
-use crate::layout::{FileTintAccum, InkExtent, ItemPlacement, LayoutItem, PageExtent, Paint};
+use crate::layout::{FileTintAccum, InkExtent, ItemPlacement, PageExtent, Paint};
 use glyph_field_derived::DerivedSlot;
 use super::char_resolve::{resolve_byte_char, ResolveCtx};
 use super::page::Pager;
@@ -276,86 +276,6 @@ pub(crate) struct ChunkPass2Output {
     pub max_row_seen: i64,
 }
 
-/// Syntax colours for the two places a chunk can hold PART of a line (C17).
-/// The colourisers are line-local, but a line can carry state across a cut
-/// (an open string or comment; a word's colour is decided at its END and
-/// filled back to its start), so colouring a chunk's share of a cut line on
-/// its own disagrees with a walk of the whole item — 578 of
-/// `g-pick-repo/wide.txt`'s glyphs did until 2026-10-09.
-#[derive(Default)]
-pub(crate) struct ChunkCutColors {
-    /// The chunk STARTS inside a line: the colours of that line's leaders
-    /// that fall in this chunk, out of a colouring of the whole line.
-    head: Vec<u32>,
-    /// The chunk's LAST line starts in the chunk and runs past its end: the
-    /// colours of its leaders that fall in this chunk, likewise.
-    tail: Vec<u32>,
-}
-
-/// Colour every line that a chunk cut falls inside ONCE, over the whole
-/// line, and hand each chunk its share. Lines are found from the cuts alone
-/// (a cut at a newline needs nothing), and each line's start and end are
-/// searched once, so the work is O(cut lines), not O(chunks x line).
-fn whole_line_colors_at_cuts(
-    chunks: &[super::chunk::LayoutChunk<'_>],
-    items: &[LayoutItem<'_>],
-) -> Vec<ChunkCutColors> {
-    let mut out: Vec<ChunkCutColors> = (0..chunks.len()).map(|_| ChunkCutColors::default()).collect();
-    // (item, line start, line end — its newline or the item's end, first
-    // chunk, last chunk)
-    let mut lines: Vec<(usize, usize, usize, usize, usize)> = Vec::new();
-    for c in 1..chunks.len() {
-        let (prev, next) = (&chunks[c - 1], &chunks[c]);
-        let item = &items[next.item_index];
-        if prev.item_index != next.item_index || !matches!(item.paint, Paint::SyntaxHeuristic) {
-            continue;
-        }
-        let cut = next.byte_offset;
-        if cut == 0 || item.bytes[cut - 1] == b'\n' {
-            continue;
-        }
-        if let Some(last) = lines.last_mut() {
-            if last.0 == next.item_index && cut <= last.2 {
-                last.4 = c;
-                continue;
-            }
-        }
-        let start = memchr::memrchr(b'\n', &item.bytes[..cut]).map_or(0, |i| i + 1);
-        let end = memchr::memchr(b'\n', &item.bytes[cut..]).map_or(item.bytes.len(), |i| cut + i);
-        lines.push((next.item_index, start, end, c - 1, c));
-    }
-    if lines.is_empty() {
-        return out;
-    }
-    let leaders = |b: &[u8]| b.iter().filter(|&&x| crate::text::is_colorizer_leader(x)).count();
-    let shares: Vec<Vec<(usize, bool, Vec<u32>)>> = lines
-        .par_iter()
-        .map(|&(it, start, end, c0, c1)| {
-            let bytes = items[it].bytes;
-            let mut colors = Vec::new();
-            crate::text::colorize_line_into(&bytes[start..end], &mut colors);
-            let mut k = 0usize;
-            let mut res = Vec::with_capacity(c1 - c0 + 1);
-            for (c, ch) in chunks.iter().enumerate().take(c1 + 1).skip(c0) {
-                let a = ch.byte_offset.max(start);
-                let b = (ch.byte_offset + ch.bytes.len()).min(end);
-                let n = leaders(&bytes[a..b]);
-                res.push((c, ch.byte_offset > start, colors[k..k + n].to_vec()));
-                k += n;
-            }
-            res
-        })
-        .collect();
-    for (c, is_head, run) in shares.into_iter().flatten() {
-        if is_head {
-            out[c].head = run;
-        } else {
-            out[c].tail = run;
-        }
-    }
-    out
-}
-
 /// Pass 2 over chunk `chunk_idx` of `inputs`, into `dest_addr`. The chunk's
 /// item, prepass, slot bases and the seed a mid-line chunk inherits (C15)
 /// are read from `inputs` here rather than passed one by one (C3).
@@ -364,7 +284,6 @@ fn layout_pass2_chunk<E: SlotEmit>(
     chunk_idx: usize,
     dest_addr: usize,
     lut: &[f64; 256],
-    cut: &ChunkCutColors,
 ) -> ChunkPass2Output {
     let chunk = &inputs.chunks[chunk_idx];
     let chunk_bytes = chunk.bytes;
@@ -412,33 +331,18 @@ fn layout_pass2_chunk<E: SlotEmit>(
     let mut col = initial_col;
     let mut line_adv = initial_line_adv;
     let mut seg_adv = initial_seg_adv;
-    let mut line_start_col = initial_col;
     let mut record_idx = initial_record_base;
     let mut survivor_out = 0usize;
     let mut trailer_until = 0usize;
 
     let out_ptr = unsafe { (dest_addr as *mut E::Slot).add(slot_base as usize) };
     let flat_color = if let Paint::Flat(c) = item.paint { Some(c) } else { None };
-    let is_syntax_heuristic = matches!(item.paint, Paint::SyntaxHeuristic);
     let per_record_colors = if let Paint::PerRecord(c) = item.paint { Some(c) } else { None };
-    let mut line_colors = if is_syntax_heuristic {
-        Vec::with_capacity(256)
-    } else {
-        Vec::new()
-    };
-    let mut stack_line_colors = [crate::layout::DEFAULT_COLOR_PACKED; 256];
-
-    // A chunk that starts mid-line paints that line's leaders from a
-    // colouring of the WHOLE line (C17), never from its own share of it.
-    if is_syntax_heuristic && initial_col > 0 {
-        line_colors.extend_from_slice(&cut.head);
-    }
     let mut file_s0 = 0.0f64;
     let mut file_s1 = 0.0f64;
     let mut file_s2 = 0.0f64;
     let mut file_cells = 0usize;
     let mut file_has_emoji = false;
-    let mut file_syntax_counts = [0u64; 6];
 
     let wrap_w = p.wrap_width as i64;
     let is_wrap_back = p.wrap_mode == crate::fold::WrapMode::Back;
@@ -478,37 +382,6 @@ fn layout_pass2_chunk<E: SlotEmit>(
     let mut last_ink_z = f32::NAN;
     let mut emoji_cells = 0usize;
 
-    let tint_default = [
-        lut[crate::text::palette::DEFAULT[0] as usize],
-        lut[crate::text::palette::DEFAULT[1] as usize],
-        lut[crate::text::palette::DEFAULT[2] as usize],
-    ];
-    let tint_keyword = [
-        lut[crate::text::palette::KEYWORD[0] as usize],
-        lut[crate::text::palette::KEYWORD[1] as usize],
-        lut[crate::text::palette::KEYWORD[2] as usize],
-    ];
-    let tint_number = [
-        lut[crate::text::palette::NUMBER[0] as usize],
-        lut[crate::text::palette::NUMBER[1] as usize],
-        lut[crate::text::palette::NUMBER[2] as usize],
-    ];
-    let tint_string = [
-        lut[crate::text::palette::STRING[0] as usize],
-        lut[crate::text::palette::STRING[1] as usize],
-        lut[crate::text::palette::STRING[2] as usize],
-    ];
-    let tint_comment = [
-        lut[crate::text::palette::COMMENT[0] as usize],
-        lut[crate::text::palette::COMMENT[1] as usize],
-        lut[crate::text::palette::COMMENT[2] as usize],
-    ];
-    let tint_punct = [
-        lut[crate::text::palette::PUNCT[0] as usize],
-        lut[crate::text::palette::PUNCT[1] as usize],
-        lut[crate::text::palette::PUNCT[2] as usize],
-    ];
-
     let mut pos = 0usize;
     let mut span_idx = if let Paint::ByteSpans(spans) = item.paint {
         spans.partition_point(|s| s.end <= chunk_byte_offset as u32)
@@ -527,56 +400,10 @@ fn layout_pass2_chunk<E: SlotEmit>(
             let line_len = line_bytes.len();
             let is_pure_ascii = crate::text::is_pure_printable_ascii(line_bytes);
 
-            let mut ascii_syntax_counts = None;
-            let mut is_comment_line = false;
-            // The chunk's last line, cut at the chunk's end, likewise (C17).
-            let cut_tail = if nl_offset.is_none() && !cut.tail.is_empty() { Some(&cut.tail[..]) } else { None };
-            if let (true, Some(tail)) = (is_syntax_heuristic, cut_tail) {
-                if is_pure_ascii {
-                    let dst = if line_len <= 256 { &mut stack_line_colors[..line_len] } else {
-                        line_colors.clear();
-                        line_colors.resize(line_len, 0);
-                        &mut line_colors[..]
-                    };
-                    dst.copy_from_slice(tail);
-                    let counts = crate::text::palette_counts(tail);
-                    is_comment_line = counts[4] as usize == line_len;
-                    ascii_syntax_counts = Some(counts);
-                } else {
-                    line_colors.clear();
-                    line_colors.extend_from_slice(tail);
-                }
-            } else if is_syntax_heuristic {
-                if is_pure_ascii {
-                    let counts = if line_len <= 256 {
-                        crate::text::colorize_pure_ascii_line_slice(line_bytes, &mut stack_line_colors[..line_len])
-                    } else {
-                        crate::text::colorize_pure_ascii_line(line_bytes, &mut line_colors)
-                    };
-                    // Every cell comment: paint the line flat. Indentation is
-                    // PUNCT, not comment, so an indented comment line takes the
-                    // per-cell colours; until 2026-10-09 this counted the
-                    // indentation in and painted it comment, which no colouriser
-                    // does (C17; a space has no ink, so no pixel moved).
-                    is_comment_line = counts[4] as usize == line_len;
-                    ascii_syntax_counts = Some(counts);
-                } else {
-                    crate::text::colorize_line_into(line_bytes, &mut line_colors);
-                }
-            }
-
             // Line-level ASCII fast path (handles both single-segment and wrapped multi-segment lines):
             if !matches!(item.paint, Paint::ByteSpans(_)) && is_pure_ascii {
                 if flat_color.is_none() {
-                    if let Some(counts) = ascii_syntax_counts {
-                        file_syntax_counts[0] += counts[0] as u64;
-                        file_syntax_counts[1] += counts[1] as u64;
-                        file_syntax_counts[2] += counts[2] as u64;
-                        file_syntax_counts[3] += counts[3] as u64;
-                        file_syntax_counts[4] += counts[4] as u64;
-                        file_syntax_counts[5] += counts[5] as u64;
-                        file_cells += line_len;
-                    } else if let Some(colors) = per_record_colors {
+                    if let Some(colors) = per_record_colors {
                         let line_c = if record_idx + line_len <= colors.len() {
                             &colors[record_idx..record_idx + line_len]
                         } else {
@@ -683,23 +510,9 @@ fn layout_pass2_chunk<E: SlotEmit>(
                     let mut seg_first_survivor_x = f32::NAN;
                     let mut seg_last_survivor_right = f32::NAN;
                     let mut last_char_pos_x = f32::NAN;
-                    let effective_flat_color = flat_color.or(if is_comment_line { Some(crate::text::palette::C_COMMENT) } else { None });
-
                     let get_color = |idx: usize| -> u32 {
-                        if let Some(c) = effective_flat_color {
+                        if let Some(c) = flat_color {
                             c
-                        } else if is_syntax_heuristic {
-                            if line_len <= 256 {
-                                if idx < line_len {
-                                    stack_line_colors[idx]
-                                } else {
-                                    crate::layout::DEFAULT_COLOR_PACKED
-                                }
-                            } else if idx < line_colors.len() {
-                                line_colors[idx]
-                            } else {
-                                crate::layout::DEFAULT_COLOR_PACKED
-                            }
                         } else if let Some(colors) = per_record_colors {
                             if record_idx + idx < colors.len() {
                                 colors[record_idx + idx]
@@ -805,34 +618,8 @@ fn layout_pass2_chunk<E: SlotEmit>(
                             }
                             seg_last_survivor_right = pos_x7 + ascii_adv;
 
-                            let (c0, c1, c2, c3, c4, c5, c6, c7) = if let Some(c) = effective_flat_color {
+                            let (c0, c1, c2, c3, c4, c5, c6, c7) = if let Some(c) = flat_color {
                                 (c, c, c, c, c, c, c, c)
-                            } else if is_syntax_heuristic {
-                                if line_len <= 256 {
-                                    let colors_chunk: &[u32; 8] = stack_line_colors[char_idx0..char_idx0 + 8].try_into().unwrap();
-                                    (
-                                        colors_chunk[0],
-                                        colors_chunk[1],
-                                        colors_chunk[2],
-                                        colors_chunk[3],
-                                        colors_chunk[4],
-                                        colors_chunk[5],
-                                        colors_chunk[6],
-                                        colors_chunk[7],
-                                    )
-                                } else {
-                                    let colors_chunk: &[u32; 8] = line_colors[char_idx0..char_idx0 + 8].try_into().unwrap();
-                                    (
-                                        colors_chunk[0],
-                                        colors_chunk[1],
-                                        colors_chunk[2],
-                                        colors_chunk[3],
-                                        colors_chunk[4],
-                                        colors_chunk[5],
-                                        colors_chunk[6],
-                                        colors_chunk[7],
-                                    )
-                                }
                             } else if per_record_colors.is_some() {
                                 (
                                     get_color(char_idx0),
@@ -969,26 +756,8 @@ fn layout_pass2_chunk<E: SlotEmit>(
                             }
                             seg_last_survivor_right = pos_x3 + ascii_adv;
 
-                            let (c0, c1, c2, c3) = if let Some(c) = effective_flat_color {
+                            let (c0, c1, c2, c3) = if let Some(c) = flat_color {
                                 (c, c, c, c)
-                            } else if is_syntax_heuristic {
-                                if line_len <= 256 {
-                                    let colors_chunk: &[u32; 4] = stack_line_colors[char_idx0..char_idx0 + 4].try_into().unwrap();
-                                    (
-                                        colors_chunk[0],
-                                        colors_chunk[1],
-                                        colors_chunk[2],
-                                        colors_chunk[3],
-                                    )
-                                } else {
-                                    let colors_chunk: &[u32; 4] = line_colors[char_idx0..char_idx0 + 4].try_into().unwrap();
-                                    (
-                                        colors_chunk[0],
-                                        colors_chunk[1],
-                                        colors_chunk[2],
-                                        colors_chunk[3],
-                                    )
-                                }
                             } else if per_record_colors.is_some() {
                                 (
                                     get_color(char_idx0),
@@ -1327,7 +1096,6 @@ fn layout_pass2_chunk<E: SlotEmit>(
                     col = 0;
                     line_adv = 0.0;
                     seg_adv = 0.0;
-                    line_start_col = 0;
                     pos += 1;
                 }
                 continue;
@@ -1396,13 +1164,6 @@ fn layout_pass2_chunk<E: SlotEmit>(
 
         let color = if let Some(c) = flat_color {
             c
-        } else if is_syntax_heuristic {
-            let col_in_line = (col - line_start_col) as usize;
-            if col_in_line < line_colors.len() {
-                line_colors[col_in_line]
-            } else {
-                crate::layout::DEFAULT_COLOR_PACKED
-            }
         } else if let Some(colors) = per_record_colors {
             if record_idx < colors.len() {
                 colors[record_idx]
@@ -1525,7 +1286,6 @@ fn layout_pass2_chunk<E: SlotEmit>(
             col = 0;
             line_adv = 0.0;
             seg_adv = 0.0;
-            line_start_col = 0;
         } else {
             col += 1;
             line_adv += line_advance_addend;
@@ -1552,27 +1312,6 @@ fn layout_pass2_chunk<E: SlotEmit>(
         });
     }
 
-    if flat_color.is_none() && is_syntax_heuristic {
-        file_s0 += file_syntax_counts[0] as f64 * tint_default[0]
-                 + file_syntax_counts[1] as f64 * tint_keyword[0]
-                 + file_syntax_counts[2] as f64 * tint_number[0]
-                 + file_syntax_counts[3] as f64 * tint_string[0]
-                 + file_syntax_counts[4] as f64 * tint_comment[0]
-                 + file_syntax_counts[5] as f64 * tint_punct[0];
-        file_s1 += file_syntax_counts[0] as f64 * tint_default[1]
-                 + file_syntax_counts[1] as f64 * tint_keyword[1]
-                 + file_syntax_counts[2] as f64 * tint_number[1]
-                 + file_syntax_counts[3] as f64 * tint_string[1]
-                 + file_syntax_counts[4] as f64 * tint_comment[1]
-                 + file_syntax_counts[5] as f64 * tint_punct[1];
-        file_s2 += file_syntax_counts[0] as f64 * tint_default[2]
-                 + file_syntax_counts[1] as f64 * tint_keyword[2]
-                 + file_syntax_counts[2] as f64 * tint_number[2]
-                 + file_syntax_counts[3] as f64 * tint_string[2]
-                 + file_syntax_counts[4] as f64 * tint_comment[2]
-                 + file_syntax_counts[5] as f64 * tint_punct[2];
-    }
-
     ChunkPass2Output {
         slot_count: survivor_out as u32,
         record_count: (record_idx - initial_record_base) as u32,
@@ -1597,15 +1336,8 @@ pub(crate) fn layout_pass2_device<E: SlotEmit>(
     inputs: &super::device_alloc::EmitInputs<'_, '_>,
     dest_addr: usize,
 ) -> Pass2DeviceOutput {
-    let cut_colors = pass2_cut_colors(inputs);
-    let chunk_results = pass2_chunk_range::<E>(inputs, 0..inputs.chunks.len(), dest_addr, &cut_colors);
+    let chunk_results = pass2_chunk_range::<E>(inputs, 0..inputs.chunks.len(), dest_addr);
     pass2_merge::<E>(inputs, &chunk_results)
-}
-
-/// The whole-line colours every intra-line cut needs (C17), computed once
-/// before any chunk of Pass 2 runs.
-pub(crate) fn pass2_cut_colors(inputs: &super::device_alloc::EmitInputs<'_, '_>) -> Vec<ChunkCutColors> {
-    whole_line_colors_at_cuts(inputs.chunks, inputs.items)
 }
 
 /// Pass 2 over the chunks in `range`, in parallel, each writing its slots at
@@ -1616,12 +1348,11 @@ pub(crate) fn pass2_chunk_range<E: SlotEmit>(
     inputs: &super::device_alloc::EmitInputs<'_, '_>,
     range: std::ops::Range<usize>,
     dest_addr: usize,
-    cut_colors: &[ChunkCutColors],
 ) -> Vec<ChunkPass2Output> {
     let lut = crate::glyph_scene::srgb_to_linear_table();
     range
         .into_par_iter()
-        .map(|chunk_idx| layout_pass2_chunk::<E>(inputs, chunk_idx, dest_addr, lut, &cut_colors[chunk_idx]))
+        .map(|chunk_idx| layout_pass2_chunk::<E>(inputs, chunk_idx, dest_addr, lut))
         .collect()
 }
 
@@ -1794,7 +1525,6 @@ pub(crate) fn emit_windows<E: SlotEmit>(
     sink: &mut impl WindowSink,
 ) -> (Pass2DeviceOutput, Vec<Vec<u32>>) {
     let lut = crate::glyph_scene::srgb_to_linear_table();
-    let cut_colors = pass2_cut_colors(inputs);
     let n = inputs.chunks.len();
     let slot_end = |c: usize| if c + 1 < n { inputs.chunk_slot_bases[c + 1] as usize } else { total_slots };
     let size = std::mem::size_of::<E::Slot>();
@@ -1812,13 +1542,13 @@ pub(crate) fn emit_windows<E: SlotEmit>(
             .map(|c| {
                 let item = inputs.chunks[c].item_index;
                 if !inputs.prepasses[item].has_emoji {
-                    return (layout_pass2_chunk::<E>(inputs, c, dest_addr, lut, &cut_colors[c]), Vec::new());
+                    return (layout_pass2_chunk::<E>(inputs, c, dest_addr, lut), Vec::new());
                 }
                 let base = inputs.chunk_slot_bases[c] as usize;
                 let count = slot_end(c) - base;
                 let mut scratch: Vec<std::mem::MaybeUninit<E::Slot>> = Vec::with_capacity(count.max(1));
                 let scratch_addr = scratch.as_mut_ptr() as usize;
-                let out = layout_pass2_chunk::<E>(inputs, c, scratch_addr.wrapping_sub(base * size), lut, &cut_colors[c]);
+                let out = layout_pass2_chunk::<E>(inputs, c, scratch_addr.wrapping_sub(base * size), lut);
                 assert_eq!(out.slot_count as usize, count, "chunk {c} emitted {} of its {count} slots", out.slot_count);
                 // SAFETY: the chunk wrote exactly `count` slots into scratch
                 // (asserted), and the window has room for them at `base`.

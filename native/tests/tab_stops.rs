@@ -15,8 +15,9 @@
 //! at widths 1, 4 and 8; the default (no flag, the `[layout]
 //! tab_width_cells` setting) must equal `--tab-width 1`, which is the layout
 //! before tab stops; and each wider width must move pixels, or the fixture
-//! has stopped exercising tabs. The repo load is flat paint (visible mode
-//! paints no syntax, by decision), so the three fields agree on colour.
+//! has stopped exercising tabs. The repo load is flat paint (every load is,
+//! since the syntax heuristic's retirement, 2026-10-11), so the three
+//! fields agree on colour.
 //!
 //! Mutation `visible-item-tab-width-dropped` (the production Visible item
 //! built at one cell) reddens this; `hyper_oracle`'s grid cannot see it,

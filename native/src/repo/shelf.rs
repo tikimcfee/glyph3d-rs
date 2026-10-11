@@ -3,7 +3,7 @@
 use crate::glyph_scene::GroupRow;
 use super::{FileView, RepoParams};
 
-/// Per-directory tints (multiplied with the syntax colors through the group
+/// Per-directory tints (multiplied with the glyph colors through the group
 /// color, colorBlend 0): `[repo] dir_tints`. Stage G's `tint-cycle` verb
 /// walks this same palette. Never empty (`config` refuses that).
 pub fn dir_tints() -> &'static [[f32; 3]] {

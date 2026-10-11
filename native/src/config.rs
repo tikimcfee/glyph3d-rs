@@ -151,7 +151,7 @@ pub struct CameraSettings {
 #[derive(Clone, Debug, PartialEq, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RepoSettings {
-    /// Per-directory group tints, multiplied with the syntax colours; a
+    /// Per-directory group tints, multiplied with the glyph colours; a
     /// directory hashes (FNV-1a) to one entry. The `tint-cycle` verb walks
     /// the same list. Must be non-empty.
     pub dir_tints: Vec<[f32; 3]>,

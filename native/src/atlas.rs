@@ -532,7 +532,7 @@ pub struct Atlas {
     /// Per SLOT, what a bitmap glyph's pixels average to — linear rgb,
     /// alpha-weighted, plus its mean alpha — for the far-LOD backdrop tint
     /// (`glyph_scene::seg_tint`), which otherwise only knows the instance's
-    /// syntax colour, a colour an emoji does not display. `None` for every
+    /// text colour, a colour an emoji does not display. `None` for every
     /// slot that is not a bitmap with a cell.
     pub slot_ink: Vec<Option<[f32; 4]>>,
     /// Per-slot advance in world units, uploaded as a resident storage buffer.

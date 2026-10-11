@@ -1582,12 +1582,15 @@ mod tests {
         let cut = read("fixtures/chunk-cut-paint.txt");
         let plain = b"fn main() {\n    let x = 1;\n}\n".to_vec();
         let params = ItemParams { line_height: 1.25, wrap_width: 80, wrap_mode: WrapMode::Back, z_step: 0.15, ..Default::default() };
+        // Per-glyph colour through the windows (the syntax paint these two
+        // items carried until 2026-10-11 did the same job).
+        let (cut_colors, cluster_colors) = (per_leader_colors(&cut), per_leader_colors(&cluster));
         let bodies: Vec<(&[u8], Paint)> = vec![
             (&plain, Paint::Flat(0x1234_5678)),
             (&emoji, Paint::Flat(0x2233_4455)),
-            (&cut, Paint::SyntaxHeuristic),
+            (&cut, Paint::PerRecord(&cut_colors)),
             (b"", Paint::Flat(0x0102_0304)),
-            (&cluster, Paint::SyntaxHeuristic),
+            (&cluster, Paint::PerRecord(&cluster_colors)),
         ];
         let items: Vec<LayoutItem<'_>> = bodies
             .iter()
@@ -1599,6 +1602,13 @@ mod tests {
         windowed_matches_unwindowed::<pass2_device::RenderEmit>(&items, &sizes);
     }
 
+    /// One distinct opaque colour per record (a record per UTF-8 leader), so
+    /// `Paint::PerRecord` paints every glyph differently.
+    fn per_leader_colors(bytes: &[u8]) -> Vec<u32> {
+        let leaders = bytes.iter().filter(|&&b| b & 0xC0 != 0x80).count() as u32;
+        (0..leaders).map(|i| 0xFF00_0000 | i.wrapping_mul(0x9E37_79B9) >> 8).collect()
+    }
+
     #[test]
     fn hyper_and_batched_agree_on_samples() {
         const SAMPLES: [&[u8]; 3] = [
@@ -1606,8 +1616,7 @@ mod tests {
             b"no trailing newline",
             b"   \t   \n\n   \n",
         ];
-        let colors: Vec<Vec<u32>> =
-            SAMPLES.iter().map(|b| crate::text::colorize_leaders(b)).collect();
+        let colors: Vec<Vec<u32>> = SAMPLES.iter().map(|b| per_leader_colors(b)).collect();
         let items: Vec<LayoutItem<'_>> = SAMPLES
             .iter()
             .enumerate()
@@ -1849,7 +1858,7 @@ mod tests {
             bytes,
             params: ItemParams { line_height: 1.25, ..Default::default() },
             group_id: 0,
-            paint: Paint::SyntaxHeuristic,
+            paint: Paint::Flat(crate::layout::DEFAULT_COLOR_PACKED),
         }];
 
         let trie = crate::default_trie();
