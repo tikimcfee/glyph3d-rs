@@ -624,6 +624,38 @@ impl NodeTables {
     pub fn order_rows(&self) -> &[u32] {
         &self.order
     }
+    /// Slot → depth-first position, and slot → subtree size (the node and
+    /// its descendants): a subtree is `order_rows()[pos .. pos + size]`.
+    /// Current only after [`Self::ensure_order`] (every flush runs it);
+    /// a top-down walk that skips a subtree jumps `size` positions.
+    pub fn positions(&self) -> &[u32] {
+        &self.pos
+    }
+    pub fn subtree_sizes(&self) -> &[u32] {
+        &self.size
+    }
+    /// Whether the depth-first order is current (no structural edit since
+    /// the last [`Self::ensure_order`]).
+    pub fn order_is_current(&self) -> bool {
+        !self.order_stale
+    }
+    /// Slot `i`'s parent slot ([`NONE`] for a root).
+    pub fn parent_slot(&self, i: u32) -> u32 {
+        self.parent[i as usize]
+    }
+    /// Slot `i`'s children, in insertion order (from the sibling links;
+    /// valid whatever the state of the order).
+    pub fn child_slots(&self, i: u32) -> impl Iterator<Item = u32> + '_ {
+        let mut c = self.first_child[i as usize];
+        std::iter::from_fn(move || {
+            if c == NONE {
+                return None;
+            }
+            let out = c;
+            c = self.next_sibling[c as usize];
+            Some(out)
+        })
+    }
 
     /// Mark every live row of every table dirty and the whole order changed
     /// (a fresh GPU mirror, e.g. after its buffers grew).

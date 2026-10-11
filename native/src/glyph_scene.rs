@@ -105,6 +105,7 @@ pub use ui_probe::{LodHandle, UiCarrelState, UiProbe, UiProbeState};
 mod environment;
 mod interaction;
 mod nodes;
+mod tree_cull;
 pub(crate) mod faces;
 mod library;
 mod style;
@@ -513,6 +514,11 @@ impl SceneLike for GlyphScene {
     fn animate(&mut self, ctx: &GpuContext, dt: f32) {
         self.apply_drag(ctx);
         self.animate_library(ctx, dt);
+        // The windowed file browser reads every group row each frame: give
+        // it the deferred moves (O(the moved subtrees), only with the UI).
+        if self.ui_probe.is_some() {
+            self.sync_group_mirror();
+        }
     }
 
     fn render(

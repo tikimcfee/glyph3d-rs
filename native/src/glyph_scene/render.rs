@@ -239,7 +239,12 @@ pub(super) fn render_scene(
         } else {
             (scene.field.chunk_capacity(), scene.field.chunk_count())
         };
-        let phase_draws = cull_segments(&cull.segments, &cull.hidden, &cull.em_scale, &view, chunk_cap, chunk_count);
+        let phase_draws = match &cull.tree {
+            // A library load: top-down over the transform tree, the flat
+            // cull's draws without a per-file box write per move.
+            Some(tree) => tree.borrow_mut().cull(&scene.nodes.tables(), cull, &view, chunk_cap, chunk_count),
+            None => cull_segments(&cull.segments, &cull.hidden, &cull.em_scale, &view, chunk_cap, chunk_count),
+        };
         if !phase_draws.backdrops.is_empty() {
             let max_cap = (cull.backdrop_insts_buf.size()
                 / std::mem::size_of::<crate::glyph_scene::cull::BackdropInst>() as u64)
@@ -412,9 +417,12 @@ pub(super) fn render_scene(
         // K5: refresh the browser's dynamic row state (world pose under
         // the live group TRS, hidden, tint). ~1.3k cheap iterations at
         // repo scale; skipped entirely offscreen (no probe installed).
+        // (The rows are read in place: cloning them cloned every path
+        // String per frame, ~74k at the kernel tree's scale.)
         if !p.files.is_empty() {
-            let files = p.files.clone();
-            p.file_dyn = files
+            let st = &mut *p;
+            st.file_dyn = st
+                .files
                 .iter()
                 .map(|r| {
                     let Some(g) = scene.groups_cpu.get(r.group_id as usize) else {

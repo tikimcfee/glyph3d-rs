@@ -694,6 +694,9 @@ impl GlyphScene {
 
     /// Resolve a pick command, store it as the current pick, return the log line.
     pub(super) fn apply_pick(&mut self, _ctx: &GpuContext, cmd: &PickCommand) -> Option<String> {
+        // The pick reads every file's live TRS from the CPU mirror: take
+        // the moves a library deferred (2026-10-10).
+        self.sync_group_mirror();
         if matches!(cmd, PickCommand::Clear) {
             self.selection = None;
             self.picked = None;
@@ -886,15 +889,12 @@ impl GlyphScene {
                     }
                 }
             }
-            let bt = cull.base_tint[i];
-            let orig = cull.orig_group_rgb[i];
-            let mut t = bt;
-            for (c, tc) in t.iter_mut().enumerate().take(3) {
-                let newc = g.cols[2][c].max(0.0).powf(2.2);
-                let oldc = orig[c].max(1e-6).powf(2.2);
-                *tc = (bt[c] * newc / oldc).min(1.0);
+            cull.segments[i].tint = super::tree_cull::backdrop_tint(cull.base_tint[i], cull.orig_group_rgb[i], g.cols[2]);
+            // A library load culls top-down from the tree: the segment is
+            // now computed there, as this synced box is (tree_cull.rs).
+            if let Some(tree) = &cull.tree {
+                tree.borrow_mut().segment_synced(i);
             }
-            cull.segments[i].tint = t;
         }
     }
 
@@ -904,6 +904,8 @@ impl GlyphScene {
         if let Verb::Library(v) = verb {
             return self.apply_library_verb(v);
         }
+        // The verbs read (and copy) group rows: take any deferred moves.
+        self.sync_group_mirror();
         let Some(hit) = &self.picked else {
             return "verb: nothing picked yet — ignored".to_string();
         };

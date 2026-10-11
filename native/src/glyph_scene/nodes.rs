@@ -69,6 +69,10 @@ pub(crate) struct GroupNodes {
     ext: Vec<[u32; 5]>,
     /// The last flush's (bytes, resolved, dispatched), for the instruments.
     last_flush: std::cell::Cell<(u64, u32, bool)>,
+    /// Moved subtree roots whose group rows the CPU mirror has not taken
+    /// yet (`defer_mirror`; each slot once, `pending_mark`).
+    pending: Vec<NodeHandle>,
+    pending_mark: Vec<bool>,
 }
 
 impl GroupNodes {
@@ -90,6 +94,8 @@ impl GroupNodes {
             nodes: Vec::with_capacity(groups.len()),
             ext: Vec::with_capacity(groups.len()),
             last_flush: std::cell::Cell::new((0, 0, false)),
+            pending: Vec::new(),
+            pending_mark: Vec::new(),
         };
         for row in groups {
             this.push_row(row);
@@ -244,6 +250,46 @@ impl GroupNodes {
         &self.nodes[..n]
     }
 
+    /// Note moved nodes whose subtrees' group rows the CPU mirror will take
+    /// when a reader asks (`sync_mirror`) — O(1) a node, nothing per row: a
+    /// directory drag no longer rewrites a row per file it carries every
+    /// frame (2026-10-10). The GPU resolve draws the move regardless.
+    pub(crate) fn defer_mirror(&mut self, moved: &[NodeHandle]) {
+        for &h in moved {
+            let i = h.index() as usize;
+            if i >= self.pending_mark.len() {
+                self.pending_mark.resize(i + 1, false);
+            }
+            if !self.pending_mark[i] {
+                self.pending_mark[i] = true;
+                self.pending.push(h);
+            }
+        }
+    }
+
+    /// Bring `groups` up to date with every deferred move (each moved
+    /// subtree resolved once, `mirror_subtrees`). Returns the rows written.
+    pub(crate) fn sync_mirror(&mut self, groups: &mut [GroupRow]) -> usize {
+        if self.pending.is_empty() {
+            return 0;
+        }
+        let pending = std::mem::take(&mut self.pending);
+        for h in &pending {
+            self.pending_mark[h.index() as usize] = false;
+        }
+        self.mirror_subtrees(&pending, groups).len()
+    }
+
+    /// Group `gid`'s live world offset and per-axis scale, composed from the
+    /// tree on demand (O(depth); the bits the mirror would hold).
+    pub(crate) fn world_offset_scale(&self, gid: u32) -> Option<([f32; 3], [f32; 3])> {
+        let &h = self.nodes.get(gid as usize)?;
+        let t = self.tables.borrow();
+        let (w, _) = t.world(h).ok()?;
+        let p = t.post_scale(h).ok()?.xyz;
+        Some((w.translation, [p[0] * w.scale, p[1] * w.scale, p[2] * w.scale]))
+    }
+
     /// The CPU mirror of a move: every node in the subtrees of `moved`
     /// resolved once on the CPU (O(1) a node; `NodeTables::resolve_subtrees`)
     /// and each one that routes to a group row rewritten into `groups` —
@@ -358,5 +404,38 @@ mod tests {
         n.adopt(0, &mut mirror);
         assert_eq!(mirror.cols[2], [0.0; 4], "a change the writer made lands");
         assert_eq!(n.len(), 3);
+    }
+
+    /// The deferred CPU mirror (2026-10-10, the library on the tree): a
+    /// moved parent's subtree is noted, not mirrored — the rows stay as
+    /// they were until a reader syncs — and the sync writes exactly the
+    /// rows an eager mirror (`mirror`, per group) writes, each once.
+    #[test]
+    fn a_deferred_mirror_syncs_to_the_eager_rows() {
+        let rows = rows();
+        let mut n = GroupNodes::cpu_only(&rows);
+        // Nest groups 0 and 2 under a scaled, offset parent, as the library
+        // nests a file under its mount.
+        let root = n.root();
+        let (g0, g2) = (n.node(0).unwrap(), n.node(2).unwrap());
+        let t = n.tables_mut();
+        let parent = t.insert(Some(root), Similarity { scale: 0.25, ..Similarity::from_translation([3.0, -4.0, 5.0]) }, Appearance::IDENTITY).unwrap();
+        t.reparent(g0, Some(parent)).unwrap();
+        t.reparent(g2, Some(parent)).unwrap();
+        let mut groups = rows.clone();
+        n.defer_mirror(&[parent]);
+        n.defer_mirror(&[parent, g0]);
+        assert_eq!(bytemuck::cast_slice::<_, u8>(&groups), bytemuck::cast_slice::<_, u8>(&rows), "deferred: nothing written yet");
+        assert_eq!(n.sync_mirror(&mut groups), 2, "each moved group's row once");
+        for gid in 0..3u32 {
+            let mut want = rows[gid as usize];
+            n.mirror(gid, &mut want);
+            assert_eq!(bytemuck::bytes_of(&groups[gid as usize]), bytemuck::bytes_of(&want), "row {gid}");
+        }
+        assert_ne!(groups[0].cols[0], rows[0].cols[0], "the nested row moved");
+        assert_eq!(n.sync_mirror(&mut groups), 0, "nothing waits after a sync");
+        let off = n.world_offset_scale(2).unwrap();
+        assert_eq!(off.0, [groups[2].cols[0][0], groups[2].cols[0][1], groups[2].cols[0][2]]);
+        assert_eq!(off.1, [groups[2].cols[3][0], groups[2].cols[3][1], groups[2].cols[3][2]]);
     }
 }

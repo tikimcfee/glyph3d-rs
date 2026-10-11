@@ -138,7 +138,7 @@ impl GlyphScene {
 
             let zid_str = zid.clone();
             if self.has_library() {
-                if let Some((move_ms, cost)) = self.library_move_zone(ctx, &zid_str, d_vec.to_array()) {
+                if let Some((move_ms, cost)) = self.library_move_zone(&zid_str, d_vec.to_array()) {
                     stages.move_ms = move_ms;
                     stages.record(cost);
                 }
@@ -164,7 +164,9 @@ impl GlyphScene {
         let Some((_, fwd)) = self.pixel_ray(w as f32 * 0.5, h as f32 * 0.5) else {
             return;
         };
-        let Some((off, sc, _, _)) = self.group_trs(gid) else {
+        // The group's live offset and scale from the tree (O(depth)): the
+        // CPU mirror of a library move is deferred (2026-10-10).
+        let Some((off, sc)) = self.nodes.world_offset_scale(gid).map(|(o, s)| (Vec3::from(o), Vec3::from(s))) else {
             return;
         };
         let center_local = self
@@ -222,8 +224,13 @@ impl GlyphScene {
         if self.nodes.translate(gid, d_vec.to_array()) {
             stages.move_ms = t.elapsed().as_secs_f64() * 1e3;
             let h = self.nodes.node(gid).expect("translate found it");
-            let cost = self.mirror_library_move(ctx, &[h]);
+            let cost = self.note_tree_move(&[h]);
             stages.record(cost);
+            // A group outside any tree cull (every scene but a library)
+            // keeps its flat cull box current here, as before.
+            if self.cull.as_ref().is_none_or(|c| c.tree.is_none()) {
+                self.group_node_edited(ctx, gid);
+            }
         }
     }
 
@@ -233,7 +240,7 @@ impl GlyphScene {
             let f = 1.1f32.powf(lines);
             let zid_str = zid.clone();
             if self.has_library() {
-                if self.library_scale_zone(ctx, &zid_str, f) {
+                if self.library_scale_zone(&zid_str, f) {
                     println!("grab carrel: zone '{zid_str}' scaled by factor {f:.3}");
                 }
                 return;
@@ -457,12 +464,12 @@ struct DragStages {
 }
 
 impl DragStages {
-    /// A tree move's CPU mirror (the library): rows into `sync_ms`, no
-    /// separate upload (the flush does it), segments into `seg_ms`.
-    fn record(&mut self, cost: super::library::MirrorCost) {
-        self.groups = cost.groups;
-        self.sync_ms = cost.mirror_ms;
-        self.seg_ms = cost.seg_ms;
+    /// A tree move (the library): the move's notes into `sync_ms` (the
+    /// mirror is deferred, the tree cull computes moved boxes as it walks),
+    /// no upload (the flush does it) and no segment sync.
+    fn record(&mut self, cost: super::library::MoveCost) {
+        self.groups = cost.nodes;
+        self.sync_ms = cost.note_ms;
     }
 }
 
