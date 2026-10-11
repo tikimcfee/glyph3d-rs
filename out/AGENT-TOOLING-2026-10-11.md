@@ -13,7 +13,24 @@ untracked `rust-analyzer.toml` at the root, plus this note.
 
 **Second session (2026-10-11): commit 1 (setup) landed, along with this note.**
 `rust-analyzer.toml` was deliberately left OUT of it, still untracked, because
-rust-analyzer ignores it (results below). Next up is commit 2, the orphans gate.
+rust-analyzer ignores it (results below).
+
+**Moved (2026-10-11).** Another session was working in the same
+`maintenance-and-things` worktree (a derived-field empty-load fix), so this
+work moved to its own sibling worktree, `../glyph3d-rs-tooling` (branch
+`tooling`, from `e5ca4d3`). Only this work's hunks came along, and they were
+removed there with `git apply -R`. Both branches merge back separately.
+
+**Commit 2 (the orphans gate) landed:** `tools/check-orphans.sh`, gate
+`orphans` (scope rust, run under `pixi run`), and mutation
+`tests-mod-dropped`, which `prove --mutation` showed reddening for its stated
+reason; the file was restored byte-exact. Coverage is now 16 gates, 14 with
+mutations; the two uncovered are repo-verify and repo-verify-direct, as
+before. Next is commit 3: cargo-doc on `--workspace` AND `--release` (the
+release profile so the gate never shares `target/debug` and its lock with an
+editor's rust-analyzer; measured 4.6 s, zero warnings, nothing gated on
+`debug_assertions`). The project `rust-analyzer.toml` was deleted, because it
+cannot reach the flycheck.
 
 ### Commit 1 as built
 
@@ -97,6 +114,36 @@ sudo there):
    (`cargo check`). Its errors arrive asynchronously, a few seconds later,
    attached to the NEXT tool result, not to the Edit's own. Tested with a
    deliberate `f32 + ()` in `page.rs`, then restored; `git diff` was empty.
+
+**Follow-up, same session.** rust-analyzer can be restarted without a new
+session. `pkill -x rust-analyzer` is enough: Claude Code starts a fresh one on
+the next LSP call. Touching `rust-analyzer.toml` does NOT make the running
+process re-read it. **The file is not read at all**, not just its
+`targetDir`. A cold-started rust-analyzer still built into `target/debug`,
+and a probe `check.extraArgs = ["--target-dir", "target/ra-probe"]`
+never reached a flycheck either. The plugin launches a bare `rust-analyzer`
+with no `initializationOptions`.
+
+**Root cause (found the same day).** rust-analyzer DOES load the project
+file: its log says `updating ra-toml workspace config: [cargo] targetDir =
+true`. But every flycheck and cargo call reads config with no source root
+(`reload.rs`: `self.config.flycheck(None)`, `self.config.cargo(None)`). For
+`None`, the config getters consult client config, then the USER
+`rust-analyzer.toml`, then defaults, and never a project file (`config.rs`,
+the `workspace` arm of `_impl_for_config_data!`). So `cargo.*` and `check.*`
+in a project `rust-analyzer.toml` cannot reach flycheck. Where the file sits
+plays no part: a minimal virtual workspace, the same workspace under a
+dot-directory, and a single package all built into `target/debug`, driven
+by a hand-written LSP client with `RA_LOG=info`.
+
+**What works:** the user-level file (`$XDG_CONFIG_HOME/rust-analyzer/rust-analyzer.toml`,
+i.e. `~/.config/...` on Linux). With `[cargo] targetDir = true` there, every
+flycheck artifact went to `target/rust-analyzer/`. rust-analyzer also
+reports a spurious `cargo/targetDir: unexpected field`, which is upstream
+rust-lang/rust-analyzer#23451 (workspace keys in the user file are applied
+but flagged). One build-script pass runs before the user file loads, so
+`target/debug` may still be touched once at startup. The project
+`rust-analyzer.toml` should be deleted.
 
 **Also found:** `.gitignore` ignores all of `.claude/`, with the comment
 "Agent worktrees". So commit 1's `.claude/skills/glyph-engine-testing` link
