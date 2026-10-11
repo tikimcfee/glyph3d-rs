@@ -839,7 +839,6 @@ pub(crate) fn pass1_prepass_chunks(
 }
 
 /// [`pass1_over_chunks`] without a line table.
-#[allow(clippy::too_many_arguments)]
 fn pass1_over_chunks(
     chunks: &[chunk::LayoutChunk<'_>],
     item_chunk_ranges: &[std::ops::Range<usize>],

@@ -244,7 +244,6 @@ fn scan_leaf(
 }
 
 /// Serial fold of leaves over `[from_byte, to_byte)` — the body of chunk_reduce.
-#[allow(clippy::too_many_arguments)]
 fn fold_range(
     slots: &Slots,
     items: &[Item],
@@ -362,7 +361,6 @@ fn apply_chunk(
 /// x is bit-identical to the serial fold's. A carried sum in any other grouping
 /// would diverge for a reason that is not a bug; this one cannot, because it IS
 /// the re-sum, scheduled differently.
-#[allow(clippy::too_many_arguments)]
 fn resolve_x_shard(
     slots: &mut Slots,
     item: &Item,
@@ -883,7 +881,6 @@ mod tests {
     /// `elements()`: those two tests need a triple with exactly the shape that
     /// reaches the junction term (`a.nl > 0, b.nl > 0, c.nl == 0`), and a random
     /// sample cannot be asked for one.
-    #[allow(clippy::too_many_arguments)]
     fn domain_elem(
         newlines: i64, glyphs: i64, rows: i64, head: i64, tail: i64, wrap: i64, mode: WrapMode,
     ) -> ScanElem {

@@ -413,7 +413,6 @@ pub fn load_repo(
 /// (`WalkResult::from_files`, the P1-live envelope path): the fold is a pure
 /// function of (bytes, params) either way, and only the bytes' provenance
 /// differs.
-#[allow(clippy::too_many_arguments)]
 pub fn load_items(
     walk: WalkResult,
     _walk_dur: Duration,
