@@ -1,7 +1,8 @@
 # Views, slabs, poses — untangling the concepts (2026-10-11)
 
-> **Status: design proposal; step A is built (2026-10-11, § 8), the rest is
-> not.** Written
+> **Status: design proposal; step A is built (2026-10-11, § 8), and so is
+> step 2 of the Instanced retirement, the first several-views-per-buffer
+> producer (§ 9); the rest is not.** Written
 > against the tree at `c3a9de5` (Derived the default; Instanced staying as an
 > opt-in field, decided 2026-10-11). It follows
 > `out/DESIGN-VIEWS-AND-TRANSFORMS-2026-10-10.md` (steps 1 and 2 built), the
@@ -865,3 +866,129 @@ not a handle (step D); `GroupNodes.nodes` stays the node column (step E);
 (item, byte) (step B); the agent staging still puts the block's y/z in the
 item origin (step D) and keeps its segments one per group row, empty ones
 included.
+
+## 9. Step 2: as built (2026-10-11)
+
+Step 2 is the Instanced retirement's (root `AGENTS.md`: Derived the default,
+then `--render-file` a one-item repo load, then the Instanced crate
+deleted), not one of § 6's letters; it lands here because it is the first
+producer to register several views over ONE buffer (`--copies N`). On top of
+step A (`86af940`).
+
+**The load.** `repo::load_file(path, copies, params, gpu)` reads the file
+(refusing non-UTF-8 and anything past `MAX_FILE_BYTES`, as a walk would),
+makes it a one-file walk rooted at its directory (the pick path re-reads
+`root/rel_path`), and runs the loader proper, `load_views`, over a
+`ViewPlan`: `buffer_of_view = [0; copies]`, placement `Tiled`. A repo load
+is the same function with `buffer_of_view = 0..files` and placement
+`Controller` (`load_repo_from_prefetched` builds that plan; nothing else
+about it changed, and every repo golden is byte-equal). One layout item per
+VIEW: a stored slot names its item (Derived's item lane, Instanced's group),
+so N copies are N layouts and N slot ranges — the price of instancing a
+buffer in the stored fields. `FileView` gained `buffer`;
+`group_rows_of_files` became `group_rows_of_views`; the registry's views
+carry `buffer: v.buffer`, so all N copies say buffer 0.
+
+**Placement.** `repo::tile_views` is the text stager's tiling, kept on
+purpose: `ceil(sqrt(n))` columns, a four-advance gap, an IDENTITY group row
+per copy (the shelf would tint the file by its directory), and bounds that
+frame a file as the stager did — a block is the inked width from the pen
+origin by the rows down to the pen's row after a final newline
+(`line_height - page.bottom`, plus a row when the file ends in `\n`), with
+the one row above row 0. Measured on the three golden fixtures, those
+heights are the stager's exactly (35.0, 17.5, 13.75). `controller` is
+`None`, as the text scene's always was.
+
+**The Visible field.** `VisibleStaging` holds `buffer_bytes` (one Vec per
+walked file, moved in, no copy) and `item_buffers`; `item_bytes(i)` is item
+`i`'s buffer. The field crate is unchanged: it still uploads one copy per
+item, and Pass 1 still writes a line-table entry per line per item.
+
+**Paint and dials.** The file paints `Paint::SyntaxHeuristic` whatever
+`--color-mode` says (a text view always has; the CLI default `flat` is a
+repo-load default). `SceneChoice::Text` now carries `--wrap-mode` and
+`--z-wrap-spacing`, so a long line wraps at 100 columns and a long file
+pages at 128 rows like any repo file (no golden fixture is long enough to
+show it), and the windowed z dial rebuilds text scenes too. Picks and the
+glyph verbs work on a text scene now (`PickContext` exists; the stager left
+it `None`).
+
+**Deleted** from `text.rs`: `stage_file` and everything only it used —
+`Cell`, `cover_segment`, `word_color` (the `&str` form),
+`is_block_comment_continuation_chars`, `TAB_CELLS`. Kept: `StagedText`, the
+palette and the colourisers (`Paint::SyntaxHeuristic` paints with them),
+`fu_to_world`, the metric constants and `reference_layout`. The manual
+`tools/gen_emoji_corpus.py --check-render` read the stager's log line; it
+reads the load's (`records`, `glyph instances`) now and agrees on all six
+runs — and it passes `--cluster-mode` both ways, which it had not since the
+2026-09-22 default flip (its "leader" runs had been cluster runs).
+
+**Pixels.** Every other golden byte-equal, plain and under both
+equivalents. `text`, `emoji` and `emoji-cluster` moved (vulkan-nvidia), and
+every moved pixel is accounted for: a scratch build of the old stager with
+four toggles — fold tabs (T), the shared colouriser (C), x as the fold's
+f32 running sum (F), the tiled block's width from that sum (B) — renders
+the new frames byte for byte with all four on.
+
+| cause (chain order) | text | emoji | emoji-cluster |
+|---|---|---|---|
+| T: a tab advances one trie advance (the stager stopped at 4-cell tab stops); the block narrows 66 → 63 cells and the camera refits | 71,020 | 0 | 0 |
+| C: the shared colouriser — `#` of the `#️⃣` keycap opens a `#` comment, so `bare:` paints COMMENT | 0 | 0 | 1,121 |
+| F: x = f32 running sum of advances, not `col * cell_w` (edge flips, max delta 2-3) | 94 | 751 | 267 |
+| B: the block width from that sum, an ulp past the product (36.552166 vs 36.55216 for 69 cells), so the camera centre moves ~3e-6 (edge flips everywhere, max delta 6) | 0 | 2,722 | 829 |
+| residual | 0 | 0 | 0 |
+| total vs baseline | 71,020 | 3,372 | 2,217 |
+
+Isolated, each cause alone against the stager: T 71,020 (of which, with the
+camera held at the old width, 45,212 are glyph motion alone, and the refit
+alone moves 70,496 — they overlap), C 1,121, F 751 / 267, B 2,868 / 886
+(text cannot isolate F or B: with tab stops the running sum is meaningless).
+Under `--field-mode instanced` all three new frames are byte-equal to the
+new plain frames; under `--field-mode visible` they are visible mode for
+real and each is the new frame's flat-paint twin byte for byte (32,439 /
+43,726 / 31,419 px of token colour short of it). Candidates, diff images
+and the same table: `out/tooling-ab/sweep/candidates/step2-render-file/
+vulkan-nvidia/` (untracked). Nothing under `out/tooling-ab/baseline/` was
+touched; pixel-ab is red on these three until a human adopts them (and
+metal-apple's candidates must be rendered on the M2).
+
+**Witnesses and mutations.** `native/tests/render_file_copies.rs` (rewritten):
+at a camera parked on the gap of the 2x2 grid, in Derived, Instanced and
+Visible, the four-copy frame's top-left quadrant is the one-copy frame's
+byte for byte and every other quadrant has a copy in it; and Derived ==
+Instanced at the fitted camera, as before. `repo::tests::
+tile_views_frame_copies_as_the_text_stager_did` pins the tiling rule (379
+tests, floor raised). Mutations: `render-file-copies-share-group-0` retired
+(its anchor, the stager's view rows, is gone; the copies' group rows come
+from the loader's `group_rows_of_views`, shared with every repo load and
+held by `view_registry.rs`), replaced by `render-file-copies-stacked`
+(`tile_views` places every copy at copy 0); new `tile-block-drops-pen-row`
+and `visible-item-bytes-by-item-index` (the Visible inputs indexed by item,
+right at a repo load, out of range for copies — only the copies test sees
+it); `cluster-static-zero-off` re-anchored from the stager to HyperLayout's
+`char_resolve` (by hand: the mutant moves `emoji-cluster` 12,079 px against
+the step-2 frame and the other two not at all; `glyph prove` cannot run it
+while pixel-ab is red).
+
+**What the note had loose, found here.**
+
+- § 3.8 says the line table belongs to the buffer and "several views over
+  one buffer share it". Built, they do not: Pass 1 runs per item, so N
+  copies are N copies of the table, and the Visible field uploads the bytes
+  per item. Only the host shares (`buffer_bytes`). Sharing the table and the
+  GPU bytes is the field crate's change (`plan_bytes` placing items of one
+  buffer at one offset, items naming line ranges they do not own) and fits
+  step D, where sub-range views need it anyway.
+- In the stored fields a view over a shared buffer cannot share slots at
+  all (a slot names its item); "instancing" a buffer is N× the slots there.
+  § 4's "memory per glyph" figures are per VIEW, not per buffer.
+- The stager's layout and the fold's disagreed on more than paint: tab
+  stops, `col * cell_w` against a running sum, and a block measured by
+  columns rather than ink. Tabs are the one that matters to a reader (the
+  text frame lost its tab-stop alignment); every repo load has always laid
+  tabs out as one advance. Tab stops in the fold would change the layout
+  contract the JS oracle pins, so that is its own decision (open, Ivan's).
+- Found on the way, not fixed: `--load-repo <a file>` walks the file as a
+  directory, finds nothing, and the empty load panics in Derived ("a host
+  record's group row 0 names no single item": the scene's placeholder
+  instance has no view). `--render-file` is the door for one file.

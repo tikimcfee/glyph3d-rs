@@ -471,6 +471,11 @@ the gate's own, `drift_stats`, any channel differing; ImageMagick's
 | repo-back-oblique | differs | 256,744 / 256,643 | the same; the z-order picture is identical |
 | repo-cluster | differs | 29,181 / 29,178 | the same; the sequence pass lays out the same glyphs |
 
+*(2026-10-11: the text, emoji and emoji-cluster rows describe the tree
+before step 2 of the Instanced retirement. `--render-file` is a one-item
+repo load since, so those three are visible mode for real and render flat;
+§ "`--render-file` in visible mode" at the end.)*
+
 **Attributed before deciding.** The decisive check: each of the five
 differing frames is BYTE-IDENTICAL to the stored mode rendered with
 `--color-mode flat` (derived and instanced alike), on both rasterizers. The
@@ -660,4 +665,34 @@ cd native
 ../target/release/glyph3d-native --load-repo fixtures/tab-stops --tab-width 4 --field-mode visible --frames 2 --screenshot ../out/tabs-visible.png
 ../target/release/glyph3d-native --load-repo fixtures/tab-stops --tab-width 4 --field-mode derived --frames 2 --screenshot ../out/tabs-derived.png
 cmp ../out/tabs-visible.png ../out/tabs-derived.png && echo byte-equal
+```
+
+## `--render-file` in visible mode (step 2, 2026-10-11)
+
+`--render-file FILE` is a one-item repo load (`repo::load_file`): Pass 1
+builds its line table like any repo file's, so the Visible field serves it
+for real — the load prints `visible field: 1 items, … lines` where it used to
+warn and fall back to a stored field. `--copies N` is N views over the one
+file (`crate::views`: every view's `buffer` is 0), tiled by
+`repo::tile_views`; the visible staging keeps ONE host copy of the bytes
+(`VisibleStaging::buffer_bytes`, each item naming its buffer in
+`item_buffers`), while the field still uploads a copy per item and Pass 1
+writes a line-table entry per line per item.
+
+No syntax heuristic runs in this mode (the standing decision), so the three
+`--render-file` golden views render flat under `--field-mode visible`: each
+is the step-2 frame's flat-paint twin byte for byte (measured on
+vulkan-nvidia with the paint forced flat by a scratch toggle), 32,439 /
+43,726 / 31,419 px of token colour short of the step-2 text / emoji /
+emoji-cluster frames. `--copies 4` in Visible is byte-equal to the flat
+Derived frame, and `native/tests/render_file_copies.rs` holds the tiling in
+all three fields. They are not exempt from the visible equivalent; that is
+decided with the adoption of their step-2 frames (root `AGENTS.md`,
+pixel-ab).
+
+```sh
+# From native/: the text frame in visible mode, HUD-free, and its log line.
+../target/release/glyph3d-native --render-file fixtures/baseline-view.txt --frames 2 --field-mode visible --screenshot ../out/tooling-ab/sweep/text@visible.png 2>&1 | grep "visible field"
+# Four copies over one buffer, Visible.
+../target/release/glyph3d-native --render-file fixtures/baseline-view.txt --copies 4 --frames 2 --field-mode visible --screenshot ../out/tooling-ab/sweep/text-copies@visible.png
 ```
