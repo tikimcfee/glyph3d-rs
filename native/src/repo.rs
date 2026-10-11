@@ -475,7 +475,7 @@ pub fn prefetch_repo(
 /// `gpu` is the renderer's device when one exists — HyperLayout emits
 /// straight into its buffers; `None` is the no-GPU door
 /// (`--repo-scan-only`), where layout fills a host arena.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, reason = "a repo-load entry point: each parameter is a separate input its callers choose (walk, device, arena, folds)")]
 pub fn load_repo_from_walk(
     root: &Path,
     walk: WalkResult,
@@ -510,7 +510,7 @@ pub fn load_repo_from_walk(
     )
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, reason = "a repo-load entry point: each parameter is a separate input its callers choose (walk, device, arena, folds)")]
 pub fn load_repo_from_prefetched(
     root: &Path,
     prefetched: PrefetchedRepo,
@@ -1263,9 +1263,10 @@ fn paint_files(files: &[&[u8]]) -> Vec<Vec<u32>> {
 }
 
 #[cfg(test)]
-// A one-element slice of fold ranges is a real input here (one fold), not a
-// mistyped `(a..b).collect()` — the shape this lint exists to catch.
-#[allow(clippy::single_range_in_vec_init)]
+#[allow(
+    clippy::single_range_in_vec_init,
+    reason = "a one-element slice of fold ranges is a real input here (one fold), not a mistyped (a..b).collect()"
+)]
 mod tests {
     use super::*;
     use crate::layout::GlyphRecord;
