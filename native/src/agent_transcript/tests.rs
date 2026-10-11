@@ -760,3 +760,90 @@ fn claude_turns_split_on_string_prompts_and_keep_block_order() {
     );
 }
 
+/// One item per block (2026-10-11): every staged session glyph, transcoded
+/// to a Derived slot by the field's own host transcode and placed by the
+/// vertex stage's `derive_yz` over the staged item table, lands at the
+/// absolute y/z the Instanced field reads — bit for bit (tolerance 0: the
+/// block origins and the 1.25 line pitch make every product exact, so the
+/// shader's `fma` and the stager's subtraction round the same value), and is
+/// drawn with the group its block was staged in. Covers the card blocks (at
+/// their group's origin) and the stack labels (each at its stack's position,
+/// in its own group since that day; they shared group 0 before, which no
+/// single item can describe).
+#[test]
+fn derived_positions_match_the_staged_ones() {
+    use super::{parse_claude_session, stage_agent_session};
+    use crate::revision::RevisionEngine;
+    use glyph_field::Transcode;
+
+    let write = |id: &str, path: &str, body: &str| {
+        [
+            json!({
+                "type": "assistant",
+                "message": { "role": "assistant", "content": [
+                    { "type": "text", "text": format!("Writing {path}.") },
+                    { "type": "tool_use", "id": id, "name": "Write", "input": { "file_path": path, "content": body } }
+                ] }
+            }).to_string(),
+            json!({
+                "type": "user",
+                "toolUseResult": { "type": "create", "filePath": path, "content": body },
+                "message": { "role": "user", "content": [{ "type": "tool_result", "tool_use_id": id }] }
+            }).to_string(),
+        ]
+    };
+    let mut lines = vec![json!({
+        "type": "user",
+        "message": { "role": "user", "content": [{ "type": "text", "text": "Create two files" }] }
+    }).to_string()];
+    lines.extend(write("t1", "src/main.rs", "fn main() {\n    println!(\"hello\");\n}\n"));
+    lines.extend(write("t2", "README.md", "# Title\n\nSome prose, é and ✓.\n"));
+    let session = parse_claude_session(&lines.join("\n"), "derived_sess");
+    let mut rev_engine = RevisionEngine::new();
+    rev_engine.ingest_session(&session);
+
+    let staged = stage_agent_session(Some(crate::atlas::default_trie_ref()), &[], session, rev_engine);
+    let items = &staged.item_params;
+    let instances = staged.instances.instances();
+    assert!(!instances.is_empty(), "the session staged glyphs");
+    assert_eq!(items.len(), staged.groups.len(), "one item per group row");
+    let item_groups: Vec<u32> = items.iter().map(|p| p.group).collect();
+    let transcode = glyph_field_derived::upload::DerivedTranscode { item_params: items };
+
+    let mut off_origin_groups = std::collections::BTreeSet::new();
+    let mut rows_below_origin = 0usize;
+    for (i, inst) in instances.iter().enumerate() {
+        let mut slot = std::mem::MaybeUninit::<glyph_field_derived::DerivedSlot>::uninit();
+        // SAFETY: `slot` is valid for one write of a DerivedSlot.
+        let slot = unsafe {
+            transcode.transcode(inst, slot.as_mut_ptr());
+            slot.assume_init()
+        };
+        let item = glyph_field_derived::item_of(slot.item_and_group) as usize;
+        let [y, z] = glyph_field_derived::derive_yz(slot.row, slot.wrap_segment() as u32, &items[item]);
+        assert_eq!(slot.x.to_bits(), inst.pos[0].to_bits(), "glyph {i}: x is stored as staged");
+        assert_eq!(
+            (y.to_bits(), z.to_bits()),
+            (inst.pos[1].to_bits(), inst.pos[2].to_bits()),
+            "glyph {i} (group {}, row {}): derived y/z ({y}, {z}) vs staged ({}, {})",
+            inst.group_id,
+            inst.row,
+            inst.pos[1],
+            inst.pos[2]
+        );
+        assert_eq!(
+            glyph_field_derived::resolve_group(slot.item_and_group, &item_groups, &[0]),
+            inst.group_id,
+            "glyph {i}: drawn with the group its block was staged in"
+        );
+        if items[item].origin_y != 0.0 || items[item].origin_z != 0.0 {
+            off_origin_groups.insert(inst.group_id);
+        }
+        rows_below_origin += usize::from(inst.pos[1] < 0.0 && items[item].origin_y == 0.0);
+    }
+    // Not vacuous: the card blocks have rows below their origin, and both
+    // stack labels sit off it, each in a group (and item) of its own.
+    assert!(rows_below_origin > 0, "no card glyph below its block's first row");
+    assert_eq!(off_origin_groups.len(), 2, "one off-origin group per stack label: {off_origin_groups:?}");
+}
+

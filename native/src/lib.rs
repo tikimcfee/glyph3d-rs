@@ -362,7 +362,7 @@ fn build_scene_impl(
 
             let atlas = atlas::Atlas::load(ctx, emoji_sheet);
             let staged = agent_transcript::stage_agent_session_with_options(
-                Some(&atlas),
+                Some(&atlas.trie),
                 &atlas.slot_ink,
                 session,
                 rev_engine,
