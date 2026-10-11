@@ -247,16 +247,20 @@ its staging text predates C22). Key touchpoints:
   instrument, never the frame path.
 - `GLYPH_LIBRARY_TIMING=1` — `--layout-mode library` (2026-10-10,
   `native/src/library.rs`): one `LIBTIME` line per animated frame — nodes
-  moved (dir and sheet local rows written), groups synced (file rows
-  mirrored into `groups_cpu`), the CPU stages (`ease_ms`, the easing loop
-  with its local-row writes; `mirror_ms`, the moved subtrees resolved on
-  the CPU into the mirror; `seg_ms` = `sync_segment` per moved file),
-  `local_bytes` (the local rows written, 32 B each) and the PREVIOUS frame's
-  flush (`last_flush_bytes`: every byte the scene graph queued — rows,
-  order span, uniforms; `last_flush_resolved`: nodes the GPU resolved).
-  Since the library moved onto the transform tree (2026-10-10) there is no
-  bevy propagation and no face upload: the page faces are written on the
-  GPU from the sheets' worlds (`glyph_scene/faces.rs`). Animations run on the
+  moved (dir and sheet local rows written), the CPU stages (`ease_ms`, the
+  easing loop with its local-row writes; `note_ms`, noting the moved nodes
+  for the deferred CPU mirror and the tree cull), `local_bytes` (the local
+  rows written, 32 B each), the PREVIOUS frame's flush (`last_flush_bytes`:
+  every byte the scene graph queued — rows, order span, uniforms;
+  `last_flush_resolved`: nodes the GPU resolved) and the previous frame's
+  tree cull (`last_cull_ms`, refit included; `last_cull_visited`: nodes
+  walked; `last_cull_candidates`: segments handed to the exact test).
+  Since the library moved onto the transform tree (2026-10-10) a move does
+  no per-file CPU work: no bevy propagation, no face upload (faces are
+  written on the GPU, `glyph_scene/faces.rs`), no per-file row mirror (it
+  is deferred until pick, a verb or the windowed HUD reads `groups_cpu`)
+  and no `sync_segment` (the library culls top-down from the tree,
+  `glyph_scene/tree_cull.rs`). Animations run on the
   offscreen 1/60 s clock (`SceneLike::animate`), so `--verb page-next
   --frames 120` is a deterministic page turn. A settled library prints
   nothing: it does no work. `out/LIBRARY-LAYOUT-FINDINGS-2026-10-10.md` has

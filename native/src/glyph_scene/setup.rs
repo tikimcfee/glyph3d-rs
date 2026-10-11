@@ -363,7 +363,14 @@ impl GlyphScene {
                 &segments,
                 &groups,
             );
-            cull.backdrop_at_front = staged.controller.as_ref().is_some_and(|c| c.library.is_some());
+            let library_root = staged.controller.as_ref().and_then(|c| c.library.as_ref()).and_then(|l| l.nodes.as_ref()).map(|n| n.root);
+            cull.backdrop_at_front = library_root.is_some();
+            if let Some(root) = library_root {
+                let seg_nodes = nodes.file_nodes(segments.len().min(nodes.len())).to_vec();
+                let rgb: Vec<[f32; 4]> = groups.iter().map(|g| g.cols[2]).collect();
+                let tree = super::tree_cull::TreeCull::new(nodes.tables_mut(), root, &seg_nodes, &cull, &rgb);
+                cull.tree = Some(std::cell::RefCell::new(tree));
+            }
             Some(cull)
         } else {
             log::info!("culling disabled (--no-cull) — legacy per-chunk draws");

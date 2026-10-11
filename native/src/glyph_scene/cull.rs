@@ -163,64 +163,134 @@ pub(super) fn cull_segments(
     chunk_cap: u32,
     chunk_count: u32,
 ) -> PhaseDraws {
-    let CullView {
-        planes,
-        eye,
-        px_scale,
-        lod_min_px,
-        file_backgrounds,
-        file_bg_color,
-        backdrop_at_front,
-    } = *view;
-    let mut draws: Vec<Vec<std::ops::Range<u32>>> =
-        (0..chunk_count).map(|_| Vec::new()).collect();
-    let mut backdrops = Vec::new();
+    let mut acc = CullAcc::new(chunk_cap, chunk_count);
     for (si, seg) in segments.iter().enumerate() {
         if hidden.get(si).copied().unwrap_or(false) {
             continue;
         }
+        let em = em_scale.get(si).copied().unwrap_or(1.0);
+        acc.segment(view, seg.min, seg.max, seg.tint, seg.slot_base, seg.slot_count, Blocks::World(&seg.blocks), em);
+    }
+    acc.finish()
+}
+
+/// A segment's sub-file blocks as the cull tests them: world boxes as
+/// stored, or LOCAL boxes carried through a group's offset and per-axis
+/// scale on the spot — `sync_segment`'s arithmetic, term for term, so a
+/// block computed here has the bits a synced one would (the library's tree
+/// cull computes moved files' blocks only when a segment straddles the
+/// frustum, instead of re-syncing every block of every moved file).
+pub(super) enum Blocks<'a> {
+    World(&'a [BlockCull]),
+    Local { blocks: &'a [BlockCull], offset: [f32; 3], scale: [f32; 3] },
+}
+
+impl Blocks<'_> {
+    fn is_empty(&self) -> bool {
+        match self {
+            Blocks::World(b) => b.is_empty(),
+            Blocks::Local { blocks, .. } => blocks.is_empty(),
+        }
+    }
+
+    fn for_each(&self, mut f: impl FnMut(&BlockCull)) {
+        match self {
+            Blocks::World(bs) => bs.iter().for_each(f),
+            Blocks::Local { blocks, offset: o, scale: s } => {
+                for lb in *blocks {
+                    f(&BlockCull {
+                        min: [lb.min[0] * s[0] + o[0], lb.min[1] * s[1] + o[1], lb.min[2] * s[2] + o[2]],
+                        max: [lb.max[0] * s[0] + o[0], lb.max[1] * s[1] + o[1], lb.max[2] * s[2] + o[2]],
+                        slot_base: lb.slot_base,
+                        slot_count: lb.slot_count,
+                    })
+                }
+            }
+        }
+    }
+}
+
+/// One frame's cull output under construction: segments go in ascending
+/// segment order (the order the glyph ranges and backdrops are recorded in,
+/// which is the blend order), `finish` flattens it into the phase lists.
+pub(super) struct CullAcc {
+    draws: Vec<Vec<std::ops::Range<u32>>>,
+    backdrops: Vec<BackdropInst>,
+    chunk_cap: u32,
+    chunk_count: u32,
+}
+
+impl CullAcc {
+    pub(super) fn new(chunk_cap: u32, chunk_count: u32) -> Self {
+        Self { draws: (0..chunk_count).map(|_| Vec::new()).collect(), backdrops: Vec::new(), chunk_cap, chunk_count }
+    }
+
+    /// Frustum + LOD for one (non-hidden) segment: its world box, backdrop
+    /// tint, slot range, blocks and em scale (`CullState::em_scale`).
+    #[allow(clippy::too_many_arguments)] // the segment's fields, unbundled so a computed box needs no SegCull
+    pub(super) fn segment(
+        &mut self,
+        view: &CullView,
+        seg_min: [f32; 3],
+        seg_max: [f32; 3],
+        tint: [f32; 4],
+        slot_base: u32,
+        slot_count: u32,
+        blocks: Blocks<'_>,
+        em: f32,
+    ) {
+        let CullView {
+            planes,
+            eye,
+            px_scale,
+            lod_min_px,
+            file_backgrounds,
+            file_bg_color,
+            backdrop_at_front,
+        } = *view;
+        let (chunk_cap, chunk_count) = (self.chunk_cap, self.chunk_count);
         // Frustum: positive-vertex test per plane, over the segment's real AABB.
         // Also tracks whether the entire file is fully inside the frustum volume.
         let mut visible = true;
         let mut fully_inside = true;
         for pl in planes {
-            let px = if pl[0] >= 0.0 { seg.max[0] } else { seg.min[0] };
-            let py = if pl[1] >= 0.0 { seg.max[1] } else { seg.min[1] };
-            let pz = if pl[2] >= 0.0 { seg.max[2] } else { seg.min[2] };
+            let px = if pl[0] >= 0.0 { seg_max[0] } else { seg_min[0] };
+            let py = if pl[1] >= 0.0 { seg_max[1] } else { seg_min[1] };
+            let pz = if pl[2] >= 0.0 { seg_max[2] } else { seg_min[2] };
             if pl[0] * px + pl[1] * py + pl[2] * pz + pl[3] < 0.0 {
                 visible = false;
                 break;
             }
             if fully_inside {
-                let nx = if pl[0] >= 0.0 { seg.min[0] } else { seg.max[0] };
-                let ny = if pl[1] >= 0.0 { seg.min[1] } else { seg.max[1] };
-                let nz = if pl[2] >= 0.0 { seg.min[2] } else { seg.max[2] };
+                let nx = if pl[0] >= 0.0 { seg_min[0] } else { seg_max[0] };
+                let ny = if pl[1] >= 0.0 { seg_min[1] } else { seg_max[1] };
+                let nz = if pl[2] >= 0.0 { seg_min[2] } else { seg_max[2] };
                 if pl[0] * nx + pl[1] * ny + pl[2] * nz + pl[3] < 0.0 {
                     fully_inside = false;
                 }
             }
         }
         if !visible {
-            continue;
+            return;
         }
         // LOD: em-cell pixel height at the AABB's nearest point to the eye
         // (conservative — a segment only drops to backdrop when even its
         // CLOSEST glyphs are subpixel).
-        let nx = eye.x.clamp(seg.min[0], seg.max[0]);
-        let ny = eye.y.clamp(seg.min[1], seg.max[1]);
+        let nx = eye.x.clamp(seg_min[0], seg_max[0]);
+        let ny = eye.y.clamp(seg_min[1], seg_max[1]);
         // Clamped into the segment, like x and y. Clamping into the old ±1 slab
         // computed the distance to a place the segment is not, understating it
         // whenever the content had depth — so far content measured near, and
         // was drawn at full detail instead of collapsing to a backdrop.
-        let nz = eye.z.clamp(seg.min[2], seg.max[2]);
+        let nz = eye.z.clamp(seg_min[2], seg_max[2]);
         let dist = ((eye.x - nx).powi(2) + (eye.y - ny).powi(2) + (eye.z - nz).powi(2))
             .sqrt()
             .max(0.001);
         // At scale 1 (every group no verb or layout scaled) this is the
         // unscaled `px_scale / dist` bit for bit.
-        let glyph_px = px_scale * em_scale.get(si).copied().unwrap_or(1.0) / dist;
+        let glyph_px = px_scale * em / dist;
         if glyph_px < lod_min_px {
-            if seg.slot_count > 0 {
+            if slot_count > 0 {
                 // Backdrops are flat quads anchored at the file space's
                 // far-Z reading surface (seg.min[2]) — except in the library,
                 // where every page has a face just behind the content's FRONT
@@ -228,30 +298,31 @@ pub(super) fn cull_segments(
                 // wrap staircase sat behind its own face, and the page read
                 // BLANK until a pick drew its glyphs into the selection mask
                 // (2026-10-10, Ivan on the kernel tree).
-                let z = if backdrop_at_front { seg.max[2] } else { seg.min[2] };
-                backdrops.push(BackdropInst {
-                    min: [seg.min[0], seg.min[1]],
-                    max: [seg.max[0], seg.max[1]],
-                    rgba: seg.tint,
+                let z = if backdrop_at_front { seg_max[2] } else { seg_min[2] };
+                self.backdrops.push(BackdropInst {
+                    min: [seg_min[0], seg_min[1]],
+                    max: [seg_max[0], seg_max[1]],
+                    rgba: tint,
                     depth: [z, 0.0, 0.0, 0.0],
                 });
             }
-            continue;
+            return;
         }
         // Near reading mode: if file_backgrounds is enabled, push a background quad
         // behind the glyphs anchored slightly behind far-Z to avoid Z-fighting.
-        if file_backgrounds && seg.slot_count > 0 {
-            backdrops.push(BackdropInst {
-                min: [seg.min[0], seg.min[1]],
-                max: [seg.max[0], seg.max[1]],
+        if file_backgrounds && slot_count > 0 {
+            self.backdrops.push(BackdropInst {
+                min: [seg_min[0], seg_min[1]],
+                max: [seg_max[0], seg_max[1]],
                 rgba: file_bg_color,
-                depth: [seg.min[2] - 0.02, 0.0, 0.0, 0.0],
+                depth: [seg_min[2] - 0.02, 0.0, 0.0, 0.0],
             });
         }
         // Glyph stream: if the file has sub-blocks and crosses the frustum boundary,
         // perform hierarchical block culling; otherwise add the entire file's slot range.
-        if !seg.blocks.is_empty() && !fully_inside {
-            for block in &seg.blocks {
+        if !blocks.is_empty() && !fully_inside {
+            let draws = &mut self.draws;
+            blocks.for_each(|block| {
                 let mut block_visible = true;
                 for pl in planes {
                     let px = if pl[0] >= 0.0 { block.max[0] } else { block.min[0] };
@@ -263,34 +334,26 @@ pub(super) fn cull_segments(
                     }
                 }
                 if block_visible && block.slot_count > 0 {
-                    add_slot_range(
-                        &mut draws,
-                        block.slot_base,
-                        block.slot_base + block.slot_count,
-                        chunk_cap,
-                        chunk_count,
-                    );
+                    add_slot_range(draws, block.slot_base, block.slot_base + block.slot_count, chunk_cap, chunk_count);
                 }
-            }
-        } else if seg.slot_count > 0 {
-            add_slot_range(
-                &mut draws,
-                seg.slot_base,
-                seg.slot_base + seg.slot_count,
-                chunk_cap,
-                chunk_count,
-            );
+            });
+        } else if slot_count > 0 {
+            add_slot_range(&mut self.draws, slot_base, slot_base + slot_count, chunk_cap, chunk_count);
         }
     }
-    // Stage L (L2): flatten chunk-major into the Glyphs phase list — the
-    // per-chunk vectors are already segment/arena-ascending, so the flat
-    // list's record order matches the pre-L2 loops exactly.
-    let glyph_ranges = draws
-        .into_iter()
-        .enumerate()
-        .flat_map(|(c, rs)| rs.into_iter().map(move |r| (c as u32, r)))
-        .collect();
-    PhaseDraws { backdrops, glyph_ranges }
+
+    pub(super) fn finish(self) -> PhaseDraws {
+        // Stage L (L2): flatten chunk-major into the Glyphs phase list — the
+        // per-chunk vectors are already segment/arena-ascending, so the flat
+        // list's record order matches the pre-L2 loops exactly.
+        let glyph_ranges = self
+            .draws
+            .into_iter()
+            .enumerate()
+            .flat_map(|(c, rs)| rs.into_iter().map(move |r| (c as u32, r)))
+            .collect();
+        PhaseDraws { backdrops: self.backdrops, glyph_ranges }
+    }
 }
 
 #[inline]
@@ -391,6 +454,10 @@ pub(super) struct CullState {
     /// `cull_segments`). False everywhere else, so every other layout's
     /// backdrops are where they were.
     pub(super) backdrop_at_front: bool,
+    /// A library load's top-down cull over the transform tree (2026-10-10,
+    /// `tree_cull.rs`): moves cost no per-file box writes. None for every
+    /// other scene, which culls flat.
+    pub(super) tree: Option<std::cell::RefCell<super::tree_cull::TreeCull>>,
     /// seg_count × 32 B staging target for the per-frame backdrop list.
     pub(super) backdrop_insts_buf: wgpu::Buffer,
     pub(super) backdrop_pipeline: wgpu::RenderPipeline,
@@ -597,6 +664,7 @@ impl CullState {
             file_backgrounds: Cell::new(false),
             file_bg_color: Cell::new(crate::config::settings().glyph_scene.file_bg_color),
             backdrop_at_front: false,
+            tree: None,
             backdrop_insts_buf,
             backdrop_pipeline,
             backdrop_bind_group,

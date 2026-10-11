@@ -25,7 +25,7 @@
 # Ratchet, NOT an equality: tests are added constantly, so an exact pin would
 # redden on the most common good action in the repo. A green run whose real
 # count exceeds the floor prints a NOTE naming the value to raise it to.
-test_floor = 364
+test_floor = 366
 # Every golden view is rendered again under each of these and must match the
 # SAME baseline byte for byte (2026-10-09, C20). The Derived field renders
 # every golden frame identically to Instanced (measured on vulkan-nvidia and
@@ -1269,6 +1269,26 @@ op = "replace"
 find = "    let t = w.t_s.xyz + rotate(q, params.offset.xyz * s);"
 with = "    let t = w.t_s.xyz;"
 expect = "the_gpu_resolves_the_library_rows_and_faces_the_cpu_does"
+
+[[mutation]]
+name = "tree-cull-refit-stops-at-the-moved-node"
+gate = "cargo-test"
+why = "the library's tree cull refitting no ancestor of a moved node (2026-10-10, tree_cull.rs): the subtree boxes above a moved directory keep covering where it WAS, so once it is dragged or eased out of them the walk rejects it and its pages vanish (and the never-moved shortcut hands stale boxes over). The flat cull, which the tree cull replaced for library loads, re-synced every moved file instead. No golden view renders the library. CONSUMED BY: TreeCull::refit, before every library frame's cull after any move; reddens glyph_scene::tree_cull::tests::the_tree_cull_draws_what_the_flat_cull_draws_over_synced_boxes"
+file = "native/src/glyph_scene/tree_cull.rs"
+op = "replace"
+find = "                q = if p == NONE { NONE } else { self.q_of_slot.get(p as usize).copied().unwrap_or(NONE) };"
+with = "                q = NONE;"
+expect = "the_tree_cull_draws_what_the_flat_cull_draws_over_synced_boxes"
+
+[[mutation]]
+name = "group-mirror-deferred-forever"
+gate = "cargo-test"
+why = "the deferred CPU mirror of a tree move never written back (2026-10-10: a library move notes its subtree instead of rewriting a group row per file every frame): pick, the verbs and the HUD read every moved file where it was at load, so a click lands on the wrong file and a verb copies a stale row. No golden view moves a nested group. CONSUMED BY: GroupNodes::sync_mirror, which apply_pick, apply_verb and the windowed HUD call before reading groups_cpu; reddens glyph_scene::nodes::tests::a_deferred_mirror_syncs_to_the_eager_rows"
+file = "native/src/glyph_scene/nodes.rs"
+op = "replace"
+find = "        self.mirror_subtrees(&pending, groups).len()"
+with = "        0"
+expect = "a_deferred_mirror_syncs_to_the_eager_rows"
 
 [[mutation]]
 name = "scene-graph-cpu-mirror-compose-swapped"
