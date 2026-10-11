@@ -150,7 +150,7 @@ Visible differ by 98,834 px, all of it pages whose fit is tiny enough to sit
 between the tiers (a whole-file backdrop in one, washed lines in the other).
 A pre-existing difference the library makes common.
 
-### E3. Visible item boxes are host-set; every moved group needs one — used the API, cost recorded
+### E3. Visible item boxes are host-set; every moved group needs one — fixed (6ac88f0)
 
 What: `item_visible` tests a host-written world box per item, while the line
 cull reads the live group table. A group that moves without its box is
@@ -171,6 +171,16 @@ and let `item_visible` apply the group row it already reads for the LOD
 (`groups[group_base(it.group) + 3u]`), or keep world boxes in their own SoA
 table uploaded as one span. Either is a change to the Visible crate and its
 cull shader, out of scope here.
+Fixed (6ac88f0, the follow-up pass): `VisibleItem.bbox_min/max` is the
+item's LOCAL box (`repo::segment_local_box`, the SegCull box before the
+group's T·R·S) and `cull_items` carries it through
+`to_world(group_base(...))` as the line cull does; `sync_segment` uploads
+nothing to the field. Goldens byte-equal plain and under both equivalents.
+Measured, `form toggle`, Visible: the kernel tree's include/ (6,714
+files) seg 4.92 -> 0.12 ms per animated frame; the whole kernel tree
+(74,313 files) seg 1.36 ms after (about 54 ms before, at include/'s per-write
+cost). Mutation `visible-item-cull-ignores-group` replaces
+`visible-moved-item-box-stale`, whose line is gone.
 
 ### E3b. `visible_item_of` was a linear scan per call — fixed
 
@@ -180,7 +190,7 @@ scanned the pick files: O(N) per moved group, O(N²) per frame. 217 ms of a
 Did: probe `files[gid]` first (a repo load files item i under group i);
 commit e63ac80. 217 -> 25 ms.
 
-### E4. The group sync owns colour and alpha — left, measured
+### E4. The group sync owns colour and alpha — fixed on main by step 1 (37bc076)
 
 What: `sync_to_group_rows` writes `cols[2] = binding.tint` (alpha 1) for
 every changed group, so any animation erases a `tint-group`, `tint-cycle` or
@@ -193,6 +203,10 @@ the next `toggle-hidden` reads alpha 1 and inverts the user's intent.
 Left: placement and appearance share one row and one writer. In the
 redesign they want separate owners (transform from the layout, colour and
 visibility from verbs), or a sync that writes only the TRS columns.
+Since step 1 (node tables, on main at 37bc076) `write_group_rows` ADOPTS an
+external writer's rows: transform always, appearance only when the writer
+itself changed it, so an animation no longer erases a verb's tint or hide.
+Not re-measured in this pass; it is not the blank-page bug (E14, E15).
 
 ### E5. Uploads are whole-table or per-row — measured
 
@@ -252,7 +266,7 @@ the candidate frames below pass `--cam-pose` for that reason. The
 animation. So `--verb page-next --frames N` renders frame N of the ease
 deterministically, and the goldens are untouched (byte-equal, 15/15).
 
-### E10. Grabbing a file inside a hierarchy moves it in the wrong space — left (by reading)
+### E10. Grabbing a file inside a hierarchy moves it in the wrong space — fixed (56fdc5d)
 
 `g` drag adds the world-space delta to the file card's LOCAL translation;
 under a mount scaled by s the file moves s times the cursor. The carrel and
@@ -260,6 +274,10 @@ shelf never nest a card under a scaled parent, so it never showed. `c`
 (grab a zone) works and moves a whole directory subtree with its nested
 children — the relative layout doing its job; the next relayout glides it
 home from where it was left (targets ease from live transforms).
+Fixed: `interaction::card_local_delta` converts the world delta into the
+card's parent frame (inverse of the parent's world affine on the vector).
+Test `a_drag_under_a_scaled_parent_moves_the_card_by_the_world_delta`,
+mutation `drag-delta-in-world-space`.
 
 ### E11. Picking survives the scale — checked
 
@@ -290,6 +308,78 @@ undoes the full group TRS.
   deck and splay) and directories glide too.
 - Loading the library costs 57 ms of `layout` at 29,377 files (spawning
   ~129,000 entities and one propagation) against the shelf's 7 ms.
+
+### E14. Far-LOD backdrops sat behind their own page face — fixed (e736226)
+
+What (Ivan, the kernel tree: pages BLANK until clicked, then shown in the
+highlight colour): the CPU cull anchors a far-LOD backdrop at the
+segment's far z (`seg.min[2]`), and every page face sits 0.05 behind the
+content's FRONT and writes depth. A file with a wrap staircase put its
+backdrop behind its own face, so at LOD distance the page drew only the
+face; a pick draws the glyphs into the selection mask, which has no depth.
+Witness (g-pick-repo): `--verb "page-to 4" --frames 150 --cam-pose 0 -60
+6000 0 0` puts wide.txt (fit 4, 424 units deep, 0.26 px/em) in front: its
+page is the face alone (486 px differ from the same frame with
+`page_faces = false`); after the fix its backdrop band is on the page.
+How common on the kernel: rare at Ivan's `z_wrap_spacing = 0.15` (one deep
+backdropped segment at a near pose), so it may not be all of what he saw.
+Did: the library sets `CullState::backdrop_at_front` (backdrop at
+`seg.max[2]`); every other layout keeps its far-z backdrops. Test
+`library_backdrop_anchors_to_the_front`, mutation `library-backdrop-at-far-z`.
+
+### E15. Visible's wash boxes past the cap were dropped silently — counted (20258d2)
+
+What: the Visible cull reserves one wash box per wash-tier line and writes
+none past `VisibleLimits::max_wash` (1 Mi): those lines draw nothing, the
+last in (item, line) order, every frame — while the HUD said "0 dropped".
+A near view of the kernel tree's biggest volume
+(drivers/gpu/drm/amd/include/asic_reg/dcn) reserved 1,264,446 boxes. A
+deck lays out every page behind its head (they are in the frustum, behind
+the head's face), which is what fills the budget: a second way a page can
+read blank until a pick lays it out into the mask. At the one pose
+checked, raising the cap moved only 355 px (the dropped lines were mostly
+occluded), so this is a candidate, not a witnessed cause.
+Did: `VisibleStats::wash_dropped` on the F8 HUD, the windowed HUD line and
+CULLDBG; `max_wash` 1 Mi -> 4 Mi (144 MiB). Mutation
+`visible-wash-drops-uncounted`.
+Left: a deck's hidden pages are laid out at all. Not laying out sheets
+behind a deck's head (or culling by the head's face) would cut the budget
+and the cost; it would also drop the sliver of text visible past the page
+edges at an angle, which is a design call.
+
+### E16. A grab drag ran once per cursor event — fixed (7a76d4a)
+
+What (Ivan: dragging a file on the kernel library drops frames): every
+cursor event applied the drag at once — transform write,
+`update_transforms` (bevy propagation over every entity, then mesh
+re-extraction), row sync, a segment per moved group — and a mouse reports
+several moves per frame. On a 9,241-file library (the kernel tree's arch/,
+instanced) one `g` step is 0.41 ms, 0.39 of it bevy propagation for ONE
+moved card; at 8 moves per frame 3.3 ms, now 0.42 (the drag is applied
+once per frame, from `animate`, as one delta; the final frame is
+byte-identical). Instruments: `GLYPH_DRAG_TIMING`, `GLYPH_DRAG_SCRIPT`,
+`GLYPH_DRAG_PER_EVENT` (native/AGENTS.md).
+Left: propagation is O(every entity) per frame of any motion. On the
+74,313-file kernel tree, Visible, everything moving: `propagate_ms`
+11.8 ms median per animated frame (seg 1.36, upload 1.77, sync 0.56), and
+a 41-file volume turning on arch/ still pays 0.38 ms bevy + 0.13-0.16 ms
+re-extracting every face. The fix is the library's hierarchy on
+`glyph-scene-graph` nodes (a move writes only the moved nodes' local rows;
+the GPU resolve does the rest) and faces re-extracted per moved sheet.
+
+### E17. Smaller findings of the follow-up pass
+
+- `--field-mode instanced` (the default) cannot load the whole kernel tree:
+  1.29 G glyphs x 32 B is past VRAM, and the load dies (wgpu OutOfMemory,
+  then a panic on the staging poll, `device_alloc.rs`) instead of falling
+  back the way the Derived lane limits do. Derived (20 B) loads on a 32 GB
+  card; Visible is the mode for it.
+- `VisibleStaging::item` sums every earlier item's bytes for `byte_base`:
+  O(N²) at load, about half a second of `staged` at 74,313 items.
+- The CPU LOD (stored modes) and the GPU LOD (Visible) still disagree near
+  the tiers (E2's remainder): an em of 1 world unit against a line of 1.25.
+  At a near pose over the kernel tree a page Visible washes is a backdrop in
+  Derived.
 
 ## Seeing it
 
