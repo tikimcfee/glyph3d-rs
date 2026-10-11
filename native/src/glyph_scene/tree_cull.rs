@@ -35,10 +35,10 @@ use glyph_scene_graph::{NodeHandle, NodeTables, Similarity, NONE};
 
 use super::cull::{BlockCull, Blocks, CullAcc, CullState, CullView, PhaseDraws};
 
-type Aabb = [[f32; 3]; 2];
-const EMPTY: Aabb = [[f32::INFINITY; 3], [f32::NEG_INFINITY; 3]];
+pub(super) type Aabb = [[f32; 3]; 2];
+pub(super) const EMPTY: Aabb = [[f32::INFINITY; 3], [f32::NEG_INFINITY; 3]];
 
-fn is_empty(b: &Aabb) -> bool {
+pub(super) fn is_empty(b: &Aabb) -> bool {
     !(b[0][0] <= b[1][0] && b[0][1] <= b[1][1] && b[0][2] <= b[1][2])
 }
 
@@ -156,6 +156,9 @@ struct Node {
     seg_hi: u32,
     /// Its own local row changed since load (a move, a drag, a verb).
     moved: bool,
+    /// Its box also takes `TreeCull::own_box` (a sheet's page face, when
+    /// the library draws regions: a region encloses the pages it holds).
+    own: bool,
     /// It or a descendant moved since load.
     subtree_moved: bool,
     /// Refit pending (dedupe within one refit).
@@ -208,6 +211,13 @@ pub(super) struct TreeCull {
     /// (`LIBTIME`).
     pub(super) last_walk: (usize, usize),
     pub(super) last_ms: f64,
+    /// The box every `own` node adds to its own (its frame).
+    own_box: Aabb,
+    /// Pool slots whose box a refit rewrote since the last `take_refits`;
+    /// None (the default) keeps no log. The library's regions read their
+    /// directories' boxes from here (`regions.rs`), so they are uploaded
+    /// when a refit changes them, never per frame.
+    refit_log: Option<Vec<u32>>,
 }
 
 impl TreeCull {
@@ -226,6 +236,7 @@ impl TreeCull {
             seg_lo: 0,
             seg_hi: 0,
             moved: false,
+            own: false,
             subtree_moved: false,
             mark: false,
             path: false,
@@ -301,6 +312,8 @@ impl TreeCull {
             stack: Vec::new(),
             last_walk: (0, 0),
             last_ms: 0.0,
+            own_box: EMPTY,
+            refit_log: None,
         };
         // Every box, children before parents (reverse pre-order).
         for q in (0..rn).rev() {
@@ -309,17 +322,58 @@ impl TreeCull {
         this
     }
 
+    /// Add `b` (in each node's own frame) to the boxes of `nodes`, and refit
+    /// every box: the library's sheets take their page face when regions are
+    /// drawn, so a directory's region encloses the pages, not only the ink
+    /// on them. The cull is unchanged by it: a box is only the walk's
+    /// prefilter, and a larger one hands the exact test more candidates
+    /// (`tests::the_tree_cull_draws_what_the_flat_cull_draws_over_synced_boxes`).
+    pub(super) fn with_own_box(mut self, t: &NodeTables, nodes: &[NodeHandle], b: Aabb, cull: &CullState) -> Self {
+        self.own_box = b;
+        for h in nodes {
+            if let Some(&q) = self.q_of_slot.get(h.index() as usize) {
+                if q != NONE {
+                    self.nodes[q as usize].own = true;
+                }
+            }
+        }
+        for q in (0..self.nodes.len() as u32).rev() {
+            self.nodes[q as usize].bounds = self.fit(t, q, cull);
+        }
+        self
+    }
+
+    /// Keep a log of the slots each refit rewrites (`take_refits`).
+    pub(super) fn log_refits(&mut self) {
+        self.refit_log.get_or_insert_with(Vec::new);
+    }
+
+    /// The slots refit since the last call (each once per refit; a slot
+    /// refit twice appears twice), in no particular order.
+    pub(super) fn take_refits(&mut self, out: &mut Vec<u32>) {
+        if let Some(log) = &mut self.refit_log {
+            out.append(log);
+        }
+    }
+
+    /// A library node's subtree box in its own frame (EMPTY: no segment
+    /// under it), as of the last refit; None: not a library node.
+    pub(super) fn bounds_of_slot(&self, slot: u32) -> Option<Aabb> {
+        let q = *self.q_of_slot.get(slot as usize)?;
+        (q != NONE).then(|| self.nodes[q as usize].bounds)
+    }
+
     /// Node q's box from its own segment and its children's boxes.
     fn fit(&self, t: &NodeTables, q: u32, cull: &CullState) -> Aabb {
         let node = &self.nodes[q as usize];
-        let mut b = EMPTY;
+        let mut b = if node.own { self.own_box } else { EMPTY };
         if node.seg != NONE {
             let i = node.seg as usize;
             let post = t.post_rows()[node.slot as usize].xyz;
             let (lo, hi) = (cull.local_min[i], cull.local_max[i]);
             let a = [0, 1, 2].map(|k| lo[k] * post[k]);
             let z = [0, 1, 2].map(|k| hi[k] * post[k]);
-            b = [[a[0].min(z[0]), a[1].min(z[1]), a[2].min(z[2])], [a[0].max(z[0]), a[1].max(z[1]), a[2].max(z[2])]];
+            union(&mut b, &[[a[0].min(z[0]), a[1].min(z[1]), a[2].min(z[2])], [a[0].max(z[0]), a[1].max(z[1]), a[2].max(z[2])]]);
         }
         let local = t.local_rows();
         for c in t.child_slots(node.slot) {
@@ -370,8 +424,9 @@ impl TreeCull {
     /// Refit the boxes the moves since the last cull invalidated: each moved
     /// node's ancestors up to the root (a node's own box is in its own
     /// frame, which its move does not change — unless a verb changed its
-    /// content), children before parents.
-    fn refit(&mut self, t: &NodeTables, cull: &CullState) {
+    /// content), children before parents. The cull runs it first; a reader
+    /// between culls (the region pick) runs it itself.
+    pub(super) fn refit(&mut self, t: &NodeTables, cull: &CullState) {
         if self.pending.is_empty() {
             return;
         }
@@ -408,6 +463,9 @@ impl TreeCull {
             n.bounds = b;
             n.bounds_epoch = self.epoch;
             n.mark = false;
+        }
+        if let Some(log) = &mut self.refit_log {
+            log.extend(dirty.iter().map(|&q| self.nodes[q as usize].slot));
         }
     }
 
@@ -657,6 +715,12 @@ mod tests {
         cull.backdrop_at_front = true;
         let rgb: Vec<[f32; 4]> = groups.iter().map(|g| g.cols[2]).collect();
         let mut tree = TreeCull::new(&mut t, lib.nodes.as_ref().unwrap().root, &file_nodes, &cull, &rgb);
+        // The same cull with page faces in the sheets' boxes (what a library
+        // with regions builds): a box is only the walk's prefilter, so the
+        // draws must not move (2026-10-10).
+        let face = [[-30.0, -40.0, -0.05], [30.0, 40.0, -0.05]];
+        let sheets = lib.nodes.as_ref().unwrap().sheet.clone();
+        let mut boxed = TreeCull::new(&mut t, lib.nodes.as_ref().unwrap().root, &file_nodes, &cull, &rgb).with_own_box(&t, &sheets, face, &cull);
         // The flat reference: the bevy-era segment table, synced per moved file.
         let mut flat = cull.segments.clone();
         let mut flat_em = cull.em_scale.clone();
@@ -683,7 +747,7 @@ mod tests {
         };
         let mut checked = 0;
         let mut culled_some = 0;
-        let mut check = |t: &mut NodeTables, tree: &mut TreeCull, flat: &[SegCull], flat_em: &[f32], r: &mut Lcg, what: &str| {
+        let mut check = |t: &mut NodeTables, tree: &mut TreeCull, boxed: &mut TreeCull, flat: &[SegCull], flat_em: &[f32], r: &mut Lcg, what: &str| {
             t.ensure_order();
             for k in 0..100 {
                 let far = k % 3 == 0;
@@ -707,11 +771,13 @@ mod tests {
                 let want = cull_segments(flat, &cull.hidden, flat_em, &view, 1 << 20, 4);
                 let got = tree.cull(t, &cull, &view, 1 << 20, 4);
                 assert!(same(&want, &got), "{what}, camera {k}: flat {} ranges / {} backdrops, tree {} / {}", want.glyph_ranges.len(), want.backdrops.len(), got.glyph_ranges.len(), got.backdrops.len());
+                let got = boxed.cull(t, &cull, &view, 1 << 20, 4);
+                assert!(same(&want, &got), "{what}, camera {k}, page faces in the sheets' boxes: flat {} ranges / {} backdrops, tree {} / {}", want.glyph_ranges.len(), want.backdrops.len(), got.glyph_ranges.len(), got.backdrops.len());
                 checked += 1;
                 culled_some += usize::from(tree.last_walk.1 < flat.len());
             }
         };
-        check(&mut t, &mut tree, &flat, &flat_em, &mut r, "seated");
+        check(&mut t, &mut tree, &mut boxed, &flat, &flat_em, &mut r, "seated");
         // A file dragged before anything else moved: its sheet and mount
         // never moved, so only the file's own flag says its stored box is
         // stale (the chain arm must look below the chain's head).
@@ -719,40 +785,45 @@ mod tests {
         let d0 = t.parent_world(f0).unwrap().world_delta_to_local([90.0, -40.0, 2.0]);
         t.set_local(f0, Similarity::from_translation(d0)).unwrap();
         tree.note_moved(f0.index());
+        boxed.note_moved(f0.index());
         sync(&mut t, &[f0], &mut flat, &mut flat_em, &cull);
-        check(&mut t, &mut tree, &flat, &flat_em, &mut r, "a file dragged at rest");
+        check(&mut t, &mut tree, &mut boxed, &flat, &flat_em, &mut r, "a file dragged at rest");
         // A whole-library form change, sampled mid-ease.
         lib.form(&t, None, FormCmd::Set(Form::Splay));
         for _ in 0..6 {
             let tick = lib.tick(&mut t, 1.0 / 60.0).unwrap();
             for h in &tick.moved {
                 tree.note_moved(h.index());
+                boxed.note_moved(h.index());
             }
             sync(&mut t, &tick.moved, &mut flat, &mut flat_em, &cull);
         }
-        check(&mut t, &mut tree, &flat, &flat_em, &mut r, "mid splay");
+        check(&mut t, &mut tree, &mut boxed, &flat, &flat_em, &mut r, "mid splay");
         // A directory dragged far off (its old bounds no longer cover it),
         // and a file dragged under its scaled mount.
         let zone = lib.zone_node("dir:src/core").unwrap();
         let l = t.local(zone).unwrap();
         t.set_local(zone, Similarity { translation: [l.translation[0] + 700.0, l.translation[1] - 250.0, l.translation[2] + 15.0], ..l }).unwrap();
         tree.note_moved(zone.index());
+        boxed.note_moved(zone.index());
         sync(&mut t, &[zone], &mut flat, &mut flat_em, &cull);
         let f = lib.nodes.as_ref().unwrap().file[7];
         let d = t.parent_world(f).unwrap().world_delta_to_local([-120.0, 33.0, 4.0]);
         t.set_local(f, Similarity::from_translation(d)).unwrap();
         tree.note_moved(f.index());
+        boxed.note_moved(f.index());
         sync(&mut t, &[f], &mut flat, &mut flat_em, &cull);
-        check(&mut t, &mut tree, &flat, &flat_em, &mut r, "after the drags");
+        check(&mut t, &mut tree, &mut boxed, &flat, &flat_em, &mut r, "after the drags");
         lib.page(&t, None, Page::Next);
         for _ in 0..4 {
             let tick = lib.tick(&mut t, 1.0 / 60.0).unwrap();
             for h in &tick.moved {
                 tree.note_moved(h.index());
+                boxed.note_moved(h.index());
             }
             sync(&mut t, &tick.moved, &mut flat, &mut flat_em, &cull);
         }
-        check(&mut t, &mut tree, &flat, &flat_em, &mut r, "mid page turn");
+        check(&mut t, &mut tree, &mut boxed, &flat, &flat_em, &mut r, "mid page turn");
         assert_eq!(checked, 500);
         assert!(culled_some > 100, "the cameras must exercise the subtree cull ({culled_some} of 500 dropped segments)");
     }

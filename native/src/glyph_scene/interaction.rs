@@ -287,7 +287,9 @@ impl GlyphScene {
         }
     }
 
-    /// Windowed verb keys: h highlight line, g grab/release file, c grab/release carrel,
+    /// Windowed verb keys: h highlight line, g grab/release the picked file
+    /// or library region (g releases any grab), c grab/release carrel (a
+    /// picked region's directory, else the picked file's zone),
     /// t cycle tint, x toggle hidden, b toggle the ground/sky environment; in
     /// a library load ] [ (n p . , arrows) turn pages, Home/End jump, v
     /// toggles deck/splay.
@@ -328,48 +330,59 @@ impl GlyphScene {
                 println!("environment: {mode:?}");
             }
             K::KeyG => {
-                self.grabbed_zone = None;
-                match self.grabbed_group {
-                    Some(gid) => {
-                        self.grabbed_group = None;
-                        println!("grab: released group {gid}");
+                // g releases whatever is grabbed; otherwise it takes the
+                // picked region (its directory and everything inside,
+                // through the zone path, so the drag sticks and the wheel
+                // scales it) or else the picked file.
+                if let Some(zid) = self.grabbed_zone.take() {
+                    println!("grab: released zone '{zid}'");
+                    return;
+                }
+                if let Some(gid) = self.grabbed_group.take() {
+                    println!("grab: released group {gid}");
+                    return;
+                }
+                if let Some(zid) = grab_target(false, self.picked_region_zone(), None) {
+                    println!("grab: region '{zid}' — mouse drags the directory and everything in it, scroll scales, g releases");
+                    self.grabbed_zone = Some(zid);
+                    return;
+                }
+                match &self.picked {
+                    Some(h) => {
+                        self.grabbed_group = Some(h.group_id);
+                        println!(
+                            "grab: {} (group {}) — mouse drags it in the view plane, scroll scales, g releases",
+                            h.rel_path, h.group_id
+                        );
                     }
-                    None => match &self.picked {
-                        Some(h) => {
-                            self.grabbed_group = Some(h.group_id);
-                            println!(
-                                "grab: {} (group {}) — mouse drags it in the view plane, scroll scales, g releases",
-                                h.rel_path, h.group_id
-                            );
-                        }
-                        None => println!("grab: nothing picked (click a file first)"),
-                    },
+                    None => println!("grab: nothing picked (click a file or a region first)"),
                 }
             }
             K::KeyC => {
                 self.grabbed_group = None;
-                match &self.grabbed_zone {
-                    Some(zid) => {
-                        let zid_clone = zid.clone();
-                        self.grabbed_zone = None;
-                        println!("grab carrel: released zone '{zid_clone}'");
+                if let Some(zid) = self.grabbed_zone.take() {
+                    println!("grab carrel: released zone '{zid}'");
+                    return;
+                }
+                let file_zone = self.picked.as_ref().map(|h| match &self.controller {
+                    Some(ctrl) => {
+                        let dir = h.rel_path.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
+                        ctrl.zone_for_file(&h.rel_path, dir)
                     }
-                    None => match &self.picked {
-                        Some(h) => {
-                            let zid = if let Some(ctrl) = &self.controller {
-                                let dir = h.rel_path.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
-                                ctrl.zone_for_file(&h.rel_path, dir)
-                            } else {
-                                format!("group:{}", h.group_id)
-                            };
-                            println!(
-                                "grab carrel: zone '{zid}' (via {}) — mouse drags the entire carrel in 3D space, scroll scales, c releases",
-                                h.rel_path
-                            );
-                            self.grabbed_zone = Some(zid);
-                        }
-                        None => println!("grab carrel: nothing picked (click a file first)"),
-                    },
+                    None => format!("group:{}", h.group_id),
+                });
+                // A picked region IS a directory: c takes it as g does.
+                let via = match (&self.picked_region, &self.picked) {
+                    (Some(_), _) => "the picked region".to_string(),
+                    (None, Some(h)) => format!("via {}", h.rel_path),
+                    (None, None) => String::new(),
+                };
+                match grab_target(true, self.picked_region_zone(), file_zone) {
+                    Some(zid) => {
+                        println!("grab carrel: zone '{zid}' ({via}) — mouse drags the entire carrel in 3D space, scroll scales, c releases");
+                        self.grabbed_zone = Some(zid);
+                    }
+                    None => println!("grab carrel: nothing picked (click a file first)"),
                 }
             }
             K::BracketRight | K::KeyN | K::ArrowRight | K::Period => {
@@ -445,6 +458,19 @@ impl GlyphScene {
             }
             _ => {}
         }
+    }
+}
+
+/// The zone a grab key takes when a library region is picked (2026-10-10,
+/// `regions.rs`): `g` and `c` both take the picked region's directory
+/// (`region_zone`, `dir:<path>`); `c` without one takes the picked file's
+/// zone (`file_zone`), and `g` without one grabs the file itself (None
+/// here: the caller's group grab).
+pub(super) fn grab_target(key_c: bool, region_zone: Option<String>, file_zone: Option<String>) -> Option<String> {
+    match region_zone {
+        Some(z) => Some(z),
+        None if key_c => file_zone,
+        None => None,
     }
 }
 

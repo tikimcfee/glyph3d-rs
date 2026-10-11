@@ -1,0 +1,17 @@
+fn item_0() { let x = 0; }  // xxxxxxxxxxxxxxxxxxxxxxxxx
+fn item_1() { let x = 3; }  // xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+fn item_2() { let x = 6; }  // xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+fn item_3() { let x = 9; }  // xxxxxxxxxx
+fn item_4() { let x = 12; }  // xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+fn item_5() { let x = 15; }  // xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+fn item_6() { let x = 18; }  // xxxxxxxxxxxxxx
+fn item_7() { let x = 21; }  // xxxxxxxxxx
+fn item_8() { let x = 24; }  // xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+fn item_9() { let x = 27; }  // xxxxxxxxxxxxxxxxxxxxxxxxxxx
+fn item_10() { let x = 30; }  // xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+fn item_11() { let x = 33; }  // xxxxxxxxxxxxxxxxxxxxxxxxx
+fn item_12() { let x = 36; }  // xxxxxxxxxxxxxxxxxxxxx
+fn item_13() { let x = 39; }  // xxxxxxxxxxxxxxxxxxxxxxxxxx
+fn item_14() { let x = 42; }  // xxxxxxxxxxxx
+fn item_15() { let x = 45; }  // xxxxxxxxxxxxxxxxxxxxxx
+fn item_16() { let x = 48; }  // xxxxxxxxxxxxxxxxxxxx

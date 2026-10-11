@@ -40,7 +40,9 @@ fn all_wgsl_shaders_parse_and_validate() {
         // 2026-10-09: environment.wgsl, the ground/sky pass (off by default).
         // 2026-10-10: library_faces.wgsl, the library's page faces written from the
         // transform tree's world rows (glyph_scene/faces.rs).
-        ["composite.wgsl", "cull.wgsl", "environment.wgsl", "library_faces.wgsl", "mesh.wgsl", "quad_field.wgsl"],
+        // 2026-10-10: library_regions.wgsl, the library's bounding regions
+        // composed from the directories' world rows (glyph_scene/regions.rs).
+        ["composite.wgsl", "cull.wgsl", "environment.wgsl", "library_faces.wgsl", "library_regions.wgsl", "mesh.wgsl", "quad_field.wgsl"],
         "shader file set changed — update the test's expected list"
     );
 
@@ -67,6 +69,15 @@ fn all_wgsl_shaders_parse_and_validate() {
                     }
                     if name == "MeshInstance" {
                         assert_eq!(span, 80, "library_faces.wgsl's MeshInstance must be mesh.rs MeshInstance (80 B)");
+                    }
+                    if name == "Region" {
+                        assert_eq!(span, 48, "Region WGSL struct size must match regions.rs RegionGpu (48 B)");
+                    }
+                    if name == "RegionInstance" {
+                        assert_eq!(span, 64, "RegionInstance WGSL struct size must match regions.rs RegionInstance (64 B)");
+                    }
+                    if name == "RegionParams" {
+                        assert_eq!(span, 32, "RegionParams WGSL struct size must match regions.rs RegionParamsGpu (32 B)");
                     }
                     if name == "FaceParams" {
                         assert_eq!(span, 64, "FaceParams WGSL struct size must match faces.rs FaceParamsGpu (64 B)");

@@ -354,6 +354,7 @@ impl GlyphScene {
         // silently drops any indirect draw with first_instance != 0 (see the
         // module header), so Stage F culls on the CPU instead; --no-cull
         // keeps the legacy per-chunk full draws for A/B.
+        let mut library_regions = None;
         let cull = if cull_enabled {
             let mut cull = CullState::new(
                 ctx,
@@ -368,7 +369,22 @@ impl GlyphScene {
             if let Some(root) = library_root {
                 let seg_nodes = nodes.file_nodes(segments.len().min(nodes.len())).to_vec();
                 let rgb: Vec<[f32; 4]> = groups.iter().map(|g| g.cols[2]).collect();
-                let tree = super::tree_cull::TreeCull::new(nodes.tables_mut(), root, &seg_nodes, &cull, &rgb);
+                let mut tree = super::tree_cull::TreeCull::new(nodes.tables_mut(), root, &seg_nodes, &cull, &rgb);
+                // Bounding regions (2026-10-10, regions.rs): each directory's
+                // box is its tree-cull box padded, so the cull logs its
+                // refits for them, and — so a box encloses its pages — each
+                // sheet's box takes its page face.
+                let lib = staged.controller.as_ref().and_then(|c| c.library.as_ref()).expect("a library root has a library");
+                if let Some(spec) = super::regions::RegionSpec::from_settings(&crate::config::settings().library) {
+                    let lnodes = lib.nodes.as_ref().expect("attached above");
+                    if let Some(f) = lib.face {
+                        let face = [[-f.size[0] / 2.0, -f.size[1] / 2.0, -f.gap], [f.size[0] / 2.0, f.size[1] / 2.0, -f.gap]];
+                        tree = tree.with_own_box(&nodes.tables(), &lnodes.sheet, face, &cull);
+                    }
+                    tree.log_refits();
+                    let table = super::regions::RegionTable::new(&lib.plan, lnodes, &tree, spec);
+                    library_regions = Some(super::regions::LibraryRegions::new(device, &camera_buf, POOL_FORMAT, table));
+                }
                 cull.tree = Some(std::cell::RefCell::new(tree));
             }
             Some(cull)
@@ -433,6 +449,8 @@ impl GlyphScene {
             mesh_pipeline,
             mesh_frame_bg,
             library_faces,
+            library_regions,
+            picked_region: None,
             scene_min_y: staged.bounds_min[1],
             environment: super::environment::Environment::new(device, depth_format),
         }

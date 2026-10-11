@@ -1,0 +1,11 @@
+fn item_0() { let x = 0; }  // xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+fn item_1() { let x = 0; }  // xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+fn item_2() { let x = 0; }  // xxxxxxxxxxxxxxxxxx
+fn item_3() { let x = 0; }  // xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+fn item_4() { let x = 0; }  // xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+fn item_5() { let x = 0; }  // xxxxxxxxx
+fn item_6() { let x = 0; }  // xxxxxxxxxxxxxxx
+fn item_7() { let x = 0; }  // xxxxxxxxxxxxxxxxx
+fn item_8() { let x = 0; }  // xxxxxxxxxxxxxxxxxxxxxxxxxxx
+fn item_9() { let x = 0; }  // xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+fn item_10() { let x = 0; }  // xxxxxxxxxxxxxxxxxxxx

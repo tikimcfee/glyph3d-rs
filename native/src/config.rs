@@ -367,6 +367,29 @@ pub struct LibrarySettings {
     pub page_faces: bool,
     pub page_face_color: [f32; 4],
     pub page_face_gap: f32,
+    /// One translucent box per directory below the root, enclosing its
+    /// subtree (`glyph_scene/regions.rs`): pickable, and `g` drags it.
+    pub regions: bool,
+    /// Padding beyond the subtree's box at nesting level 1 (x/y, z), less
+    /// by region_pad_step per level, never under region_pad_min.
+    pub region_pad: f32,
+    pub region_z_pad: f32,
+    pub region_pad_step: f32,
+    pub region_pad_min: f32,
+    /// A flat directory's box still gets this much depth.
+    pub region_min_thickness: f32,
+    /// The depth gradient's ends (linear RGB): shallowest, deepest.
+    pub region_color_a: [f32; 3],
+    pub region_color_b: [f32; 3],
+    /// Fill opacity per face, its per-level decay and floor; the edge
+    /// hairline's opacity and width (px); a picked region's fill and edge.
+    pub region_opacity: f32,
+    pub region_opacity_decay: f32,
+    pub region_min_opacity: f32,
+    pub region_edge_opacity: f32,
+    pub region_edge_px: f32,
+    pub region_picked_opacity: f32,
+    pub region_picked_edge_opacity: f32,
 }
 
 impl Settings {
@@ -396,6 +419,9 @@ impl Settings {
         }
         if !(l.gap >= 0.0 && l.lerp >= 0.0 && l.settle >= 0.0 && l.dir_gap >= 0.0 && l.depth_z >= 0.0) {
             return Err("[library] gap, lerp, settle, dir_gap and depth_z must be >= 0".into());
+        }
+        if !(l.region_pad >= 0.0 && l.region_z_pad >= 0.0 && l.region_pad_step >= 0.0 && l.region_pad_min >= 0.0 && l.region_min_thickness >= 0.0 && l.region_edge_px >= 0.0) {
+            return Err("[library] region_pad, region_z_pad, region_pad_step, region_pad_min, region_min_thickness and region_edge_px must be >= 0".into());
         }
         Ok(s)
     }
