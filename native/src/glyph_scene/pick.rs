@@ -243,7 +243,7 @@ impl GlyphScene {
     /// view (a view's index is its item row, `crate::views`). None for the
     /// stored modes, which keep their slot paths. Until the registry this
     /// searched the pick records for the file whose group id matched (a
-    /// probe on `files[gid]` first, because the scan alone was 217 ms of a
+    /// probe on `files[group_row]` first, because the scan alone was 217 ms of a
     /// library frame animating 29,377 files, E3b).
     pub(super) fn visible_item(&self, view: u32) -> Option<u32> {
         self.field.visible()?;
@@ -414,11 +414,11 @@ impl GlyphScene {
         let mut best: Option<(u32, f64)> = None;
         for (view, info) in pctx.files.iter().enumerate() {
             let view = view as u32;
-            let gid = self.views.group_row(view);
-            if self.group_hidden(gid) {
+            let group_row = self.views.group_row(view);
+            if self.group_hidden(group_row) {
                 continue;
             }
-            let Some(affine) = self.group_affine(gid) else {
+            let Some(affine) = self.group_affine(group_row) else {
                 continue;
             };
             let inv_affine = affine.inverse();
@@ -470,8 +470,8 @@ impl GlyphScene {
             return None;
         };
         let rel_path = self.pick.as_ref()?.files.get(view as usize)?.rel_path.clone();
-        let gid = self.views.group_row(view);
-        let (_off, sc, _, _) = self.group_trs(gid)?;
+        let group_row = self.views.group_row(view);
+        let (_off, sc, _, _) = self.group_trs(group_row)?;
         if dbg {
             println!(
                 "pickdbg: px ({x},{y}) ro=({:.4},{:.4},{:.4}) rd=({:.6},{:.6},{:.6}) file={rel_path}",
@@ -494,7 +494,7 @@ impl GlyphScene {
             });
         }
 
-        let affine = self.group_affine(gid)?;
+        let affine = self.group_affine(group_row)?;
         let inv_affine = affine.inverse();
 
         let ro_f32 = glam::Vec3::new(ro.x as f32, ro.y as f32, ro.z as f32);
@@ -701,9 +701,9 @@ impl GlyphScene {
         }
         let hit = match cmd {
             PickCommand::Clear => unreachable!(),
-            PickCommand::Group(gid) => {
+            PickCommand::Group(group_row) => {
                 let pctx = self.pick.as_ref().expect("pick context checked Some at apply_pick entry");
-                self.views.views_drawn_with(*gid).first().map(|&view| PickHit {
+                self.views.views_drawn_with(*group_row).first().map(|&view| PickHit {
                     view,
                     rel_path: pctx.files[view as usize].rel_path.clone(),
                     glyph: None,
@@ -820,10 +820,10 @@ impl GlyphScene {
     }
 
     /// Upload one edited group row (96 B) — never the whole table.
-    pub(super) fn write_group_row(&self, ctx: &GpuContext, gid: u32) {
-        if let Some(g) = self.groups_cpu.get(gid as usize) {
+    pub(super) fn write_group_row(&self, ctx: &GpuContext, group_row: u32) {
+        if let Some(g) = self.groups_cpu.get(group_row as usize) {
             ctx.queue
-                .write_buffer(&self.group_buf, gid as u64 * 96, bytemuck::bytes_of(g));
+                .write_buffer(&self.group_buf, group_row as u64 * 96, bytemuck::bytes_of(g));
         }
     }
 
@@ -836,15 +836,15 @@ impl GlyphScene {
             }
         }
         if (self.groups_cpu.len() as u32) < max_groups {
-            let gid = self.groups_cpu.len() as u32;
+            let group_row = self.groups_cpu.len() as u32;
             self.groups_cpu.push(row);
             // The whole row goes up (clip and background are not the
             // tree's), and the row becomes a node like every other group.
-            self.write_group_row(ctx, gid);
+            self.write_group_row(ctx, group_row);
             // Two tables keyed by group row, kept in step: no view enters here.
-            debug_assert_eq!(self.nodes.len(), gid as usize, "group rows and nodes stay in step");
+            debug_assert_eq!(self.nodes.len(), group_row as usize, "group rows and nodes stay in step");
             self.nodes.push_row(&row);
-            return Some(gid);
+            return Some(group_row);
         }
         None
     }
@@ -856,25 +856,25 @@ impl GlyphScene {
     /// this, the rows themselves went up, min..max span or row by row). The
     /// adoption keeps a verb's tint and hide that the writer did not change
     /// (`GroupNodes::adopt`, the library probe's E4).
-    pub(super) fn write_group_rows(&mut self, _ctx: &GpuContext, gids: &[u32]) {
-        for &gid in gids {
-            if let Some(row) = self.groups_cpu.get_mut(gid as usize) {
-                self.nodes.adopt(gid, row);
+    pub(super) fn write_group_rows(&mut self, _ctx: &GpuContext, group_rows: &[u32]) {
+        for &group_row in group_rows {
+            if let Some(row) = self.groups_cpu.get_mut(group_row as usize) {
+                self.nodes.adopt(group_row, row);
             }
         }
     }
 
-    /// A group verb has written group row `gid`'s node: refresh the CPU
+    /// A group verb has written group row `group_row`'s node: refresh the CPU
     /// mirror from the tables (what the GPU will resolve) and re-derive the
     /// cull segments that follow it.
-    pub(super) fn group_node_edited(&mut self, ctx: &GpuContext, gid: u32) {
-        if let Some(row) = self.groups_cpu.get_mut(gid as usize) {
-            self.nodes.mirror(gid, row);
+    pub(super) fn group_node_edited(&mut self, ctx: &GpuContext, group_row: u32) {
+        if let Some(row) = self.groups_cpu.get_mut(group_row as usize) {
+            self.nodes.mirror(group_row, row);
         }
-        self.sync_segment(ctx, gid);
+        self.sync_segment(ctx, group_row);
     }
 
-    /// Re-derive the cull segments that follow group row `gid` (each
+    /// Re-derive the cull segments that follow group row `group_row` (each
     /// one whose views all draw with it, `Views::segments_following`) from
     /// the live group TRS: the world AABB follows offset/scale, and the
     /// backdrop tint follows the group color relative to its as-staged value
@@ -886,8 +886,8 @@ impl GlyphScene {
     /// LOCAL box through the live group row (2026-10-10; until then every
     /// call pushed a 24 B world box, ~23 ms a frame with 29k files
     /// animating). `_ctx` stays for the callers' sake.
-    pub(super) fn sync_segment(&mut self, _ctx: &GpuContext, gid: u32) {
-        let Some(g) = self.groups_cpu.get(gid as usize).copied() else {
+    pub(super) fn sync_segment(&mut self, _ctx: &GpuContext, group_row: u32) {
+        let Some(g) = self.groups_cpu.get(group_row as usize).copied() else {
             return;
         };
         let (ox, oy, oz) = (g.cols[0][0], g.cols[0][1], g.cols[0][2]);
@@ -897,27 +897,27 @@ impl GlyphScene {
             g.cols[3][2].max(0.0),
         );
         let Some(cull) = &mut self.cull else { return };
-        for segment in self.views.segments_following(gid) {
-            let i = segment as usize;
-            if i >= cull.segments.len() {
+        for segment in self.views.segments_following(group_row) {
+            let segment_index = segment as usize;
+            if segment_index >= cull.segments.len() {
                 continue;
             }
-            cull.segments[i].min = [
-                cull.local_min[i][0] * sx + ox,
-                cull.local_min[i][1] * sy + oy,
-                cull.local_min[i][2] * sz + oz,
+            cull.segments[segment_index].min = [
+                cull.local_min[segment_index][0] * sx + ox,
+                cull.local_min[segment_index][1] * sy + oy,
+                cull.local_min[segment_index][2] * sz + oz,
             ];
-            cull.segments[i].max = [
-                cull.local_max[i][0] * sx + ox,
-                cull.local_max[i][1] * sy + oy,
-                cull.local_max[i][2] * sz + oz,
+            cull.segments[segment_index].max = [
+                cull.local_max[segment_index][0] * sx + ox,
+                cull.local_max[segment_index][1] * sy + oy,
+                cull.local_max[segment_index][2] * sz + oz,
             ];
-            if let Some(e) = cull.em_scale.get_mut(i) {
+            if let Some(e) = cull.em_scale.get_mut(segment_index) {
                 *e = sy;
             }
-            if let Some(lblks) = cull.local_blocks.get(i) {
+            if let Some(lblks) = cull.local_blocks.get(segment_index) {
                 for (b_idx, lb) in lblks.iter().enumerate() {
-                    if let Some(b) = cull.segments[i].blocks.get_mut(b_idx) {
+                    if let Some(b) = cull.segments[segment_index].blocks.get_mut(b_idx) {
                         b.min = [
                             lb.min[0] * sx + ox,
                             lb.min[1] * sy + oy,
@@ -931,11 +931,11 @@ impl GlyphScene {
                     }
                 }
             }
-            cull.segments[i].tint = super::tree_cull::backdrop_tint(cull.base_tint[i], cull.orig_group_rgb[i], g.cols[2]);
+            cull.segments[segment_index].tint = super::tree_cull::backdrop_tint(cull.base_tint[segment_index], cull.orig_group_rgb[segment_index], g.cols[2]);
             // A library load culls top-down from the tree: the segment is
             // now computed there, as this synced box is (tree_cull.rs).
             if let Some(tree) = &cull.tree {
-                tree.borrow_mut().segment_synced(i);
+                tree.borrow_mut().segment_synced(segment_index);
             }
         }
     }
@@ -953,7 +953,7 @@ impl GlyphScene {
         };
         let view = hit.view;
         // The group verbs edit the group row the picked view draws with.
-        let gid = self.views.group_row(view);
+        let group_row = self.views.group_row(view);
         let rel = hit.rel_path.clone();
         let glyph = hit.glyph.clone();
         // The glyph verbs address a SLOT; the Visible field has none (its
@@ -1034,7 +1034,7 @@ impl GlyphScene {
                         position: pos,
                         glyph_id: r.glyph_id(),
                         color: packed,
-                        group_id: gid,
+                        group_id: group_row,
                         item: view,
                         advance,
                         height,
@@ -1138,35 +1138,35 @@ impl GlyphScene {
             // local row, or the appearance row) — and the resolve pass writes
             // the group row; the CPU mirror follows from the tables.
             Verb::MoveGroup(d) => {
-                if !self.nodes.translate(gid, *d) {
-                    return format!("verb move-group: group {gid} out of range");
+                if !self.nodes.translate(group_row, *d) {
+                    return format!("verb move-group: group {group_row} out of range");
                 }
-                self.group_node_edited(ctx, gid);
-                let off = self.groups_cpu[gid as usize].cols[0];
+                self.group_node_edited(ctx, group_row);
+                let off = self.groups_cpu[group_row as usize].cols[0];
                 format!(
-                    "verb move-group: {rel} group {gid} offset -> ({:.1},{:.1},{:.1}) (32 B local row)",
+                    "verb move-group: {rel} group {group_row} offset -> ({:.1},{:.1},{:.1}) (32 B local row)",
                     off[0], off[1], off[2]
                 )
             }
             Verb::ScaleGroup(f) => {
-                let Some(s) = self.nodes.scale_by(gid, *f) else {
-                    return format!("verb scale-group: group {gid} out of range");
+                let Some(s) = self.nodes.scale_by(group_row, *f) else {
+                    return format!("verb scale-group: group {group_row} out of range");
                 };
-                self.group_node_edited(ctx, gid);
-                format!("verb scale-group: {rel} group {gid} scale -> {s:.3} (32 B local row)")
+                self.group_node_edited(ctx, group_row);
+                format!("verb scale-group: {rel} group {group_row} scale -> {s:.3} (32 B local row)")
             }
             Verb::TintGroup(rgb) => {
-                if !self.nodes.set_tint(gid, *rgb) {
-                    return format!("verb tint-group: group {gid} out of range");
+                if !self.nodes.set_tint(group_row, *rgb) {
+                    return format!("verb tint-group: group {group_row} out of range");
                 }
-                self.group_node_edited(ctx, gid);
+                self.group_node_edited(ctx, group_row);
                 format!(
-                    "verb tint-group: {rel} group {gid} tint -> ({:.2},{:.2},{:.2}) (32 B appearance row)",
+                    "verb tint-group: {rel} group {group_row} tint -> ({:.2},{:.2},{:.2}) (32 B appearance row)",
                     rgb[0], rgb[1], rgb[2]
                 )
             }
             Verb::TintCycle => {
-                let i = gid as usize;
+                let i = group_row as usize;
                 let step = self.tint_step.get(i).copied().unwrap_or(0) + 1;
                 if i < self.tint_step.len() {
                     self.tint_step[i] = step;
@@ -1184,12 +1184,12 @@ impl GlyphScene {
                     return format!("verb set-glyph-background: {rel} '{}' is blank (no instance)", g.ch);
                 };
                 // The view's group row: the new row inherits its TRS and tint.
-                let mut row = self.groups_cpu.get(gid as usize).copied().unwrap_or(crate::glyph_scene::GroupRow::identity([0.0; 3]));
+                let mut row = self.groups_cpu.get(group_row as usize).copied().unwrap_or(crate::glyph_scene::GroupRow::identity([0.0; 3]));
                 row.cols[5] = *bg_rgba; // Set background color
                 
-                if let Some(new_gid) = self.allocate_group_row(ctx, row) {
-                    self.field.write_group_id(&ctx.queue, slot, view, new_gid);
-                    format!("verb set-glyph-background: {rel} row {} col {} slot {slot} -> group {new_gid}", g.row, g.col)
+                if let Some(new_group_row) = self.allocate_group_row(ctx, row) {
+                    self.field.write_group_id(&ctx.queue, slot, view, new_group_row);
+                    format!("verb set-glyph-background: {rel} row {} col {} slot {slot} -> group {new_group_row}", g.row, g.col)
                 } else {
                     format!("verb set-glyph-background: {rel} out of groups (max {})", self.group_buf.size() / 96)
                 }
@@ -1201,14 +1201,14 @@ impl GlyphScene {
                 let Some(slot) = g.slot else {
                     return format!("verb set-glyph-transform: {rel} '{}' is blank (no instance)", g.ch);
                 };
-                let mut row = self.groups_cpu.get(gid as usize).copied().unwrap_or(crate::glyph_scene::GroupRow::identity([0.0; 3]));
+                let mut row = self.groups_cpu.get(group_row as usize).copied().unwrap_or(crate::glyph_scene::GroupRow::identity([0.0; 3]));
                 row.cols[0] = [t[0], t[1], t[2], 0.0];
                 row.cols[1] = *q;
                 row.cols[3] = [s[0], s[1], s[2], row.cols[3][3]];
                 
-                if let Some(new_gid) = self.allocate_group_row(ctx, row) {
-                    self.field.write_group_id(&ctx.queue, slot, view, new_gid);
-                    format!("verb set-glyph-transform: {rel} row {} col {} slot {slot} -> group {new_gid}", g.row, g.col)
+                if let Some(new_group_row) = self.allocate_group_row(ctx, row) {
+                    self.field.write_group_id(&ctx.queue, slot, view, new_group_row);
+                    format!("verb set-glyph-transform: {rel} row {} col {} slot {slot} -> group {new_group_row}", g.row, g.col)
                 } else {
                     format!("verb set-glyph-transform: {rel} out of groups (max {})", self.group_buf.size() / 96)
                 }
@@ -1221,20 +1221,20 @@ impl GlyphScene {
                     return format!("verb reset-glyph-group: {rel} '{}' is blank (no instance)", g.ch);
                 };
                 // Back to the group row the view draws with.
-                self.field.write_group_id(&ctx.queue, slot, view, gid);
-                format!("verb reset-glyph-group: {rel} row {} col {} slot {slot} -> group {gid}", g.row, g.col)
+                self.field.write_group_id(&ctx.queue, slot, view, group_row);
+                format!("verb reset-glyph-group: {rel} row {} col {} slot {slot} -> group {group_row}", g.row, g.col)
             }
             Verb::Library(_) => unreachable!("apply_verb answers the library verbs before the pick check"),
             Verb::SetHidden(hide) => {
-                if !self.nodes.set_alpha(gid, if *hide { 0.0 } else { 1.0 }) {
-                    return format!("verb hide/show: group {gid} out of range");
+                if !self.nodes.set_alpha(group_row, if *hide { 0.0 } else { 1.0 }) {
+                    return format!("verb hide/show: group {group_row} out of range");
                 }
-                if let Some(g) = self.groups_cpu.get_mut(gid as usize) {
-                    self.nodes.mirror(gid, g);
+                if let Some(g) = self.groups_cpu.get_mut(group_row as usize) {
+                    self.nodes.mirror(group_row, g);
                 }
                 // The cull skips every segment that follows the group.
                 if let Some(cull) = &mut self.cull {
-                    for segment in self.views.segments_following(gid) {
+                    for segment in self.views.segments_following(group_row) {
                         if let Some(hidden) = cull.hidden.get_mut(segment as usize) {
                             *hidden = *hide;
                         }
@@ -1245,7 +1245,7 @@ impl GlyphScene {
                 // rejoins) every tier and the HUD's counts move.
                 let items: Vec<u32> = match self.field.visible() {
                     Some(visible) => {
-                        let items = self.views.views_drawn_with(gid).to_vec();
+                        let items = self.views.views_drawn_with(group_row).to_vec();
                         for &item in &items {
                             visible.set_item_hidden(&ctx.queue, item, *hide);
                         }
@@ -1260,13 +1260,13 @@ impl GlyphScene {
                     format!("; item {} hidden={hide}", list.join(","))
                 };
                 format!(
-                    "verb {}: {rel} group {gid} (alpha -> {}, 32 B appearance row; cull skips the segment{item_note})",
+                    "verb {}: {rel} group {group_row} (alpha -> {}, 32 B appearance row; cull skips the segment{item_note})",
                     if *hide { "hide-group" } else { "show-group" },
-                    g_alpha(self.groups_cpu.get(gid as usize)),
+                    g_alpha(self.groups_cpu.get(group_row as usize)),
                 )
             }
             Verb::ToggleHidden => {
-                let hidden = self.group_hidden(gid);
+                let hidden = self.group_hidden(group_row);
                 self.apply_verb(ctx, &Verb::SetHidden(!hidden))
             }
         }
@@ -1283,7 +1283,7 @@ impl GlyphScene {
     fn apply_glyph_verb_visible(&mut self, ctx: &GpuContext, item: u32, verb: &Verb) -> String {
         let hit = self.picked.clone().expect("apply_glyph_verb_visible: caller checked the pick");
         let view = hit.view;
-        let gid = self.views.group_row(view);
+        let group_row = self.views.group_row(view);
         let rel = hit.rel_path;
         let name = verb_name(verb);
         let Some(g) = hit.glyph else {
@@ -1345,14 +1345,14 @@ impl GlyphScene {
             Verb::SetGlyphBackground(bg_rgba) => {
                 let mut row = self
                     .groups_cpu
-                    .get(gid as usize)
+                    .get(group_row as usize)
                     .copied()
                     .unwrap_or(crate::glyph_scene::GroupRow::identity([0.0; 3]));
                 row.cols[5] = *bg_rgba;
                 match self.allocate_group_row(ctx, row) {
-                    Some(new_gid) => {
-                        self.set_visible_override(ctx, key, OverrideEdit::Group(new_gid));
-                        format!("verb set-glyph-background: {rel} item {item} byte {byte} (row {} col {}) -> group {new_gid} (override)", g.row, g.col)
+                    Some(new_group_row) => {
+                        self.set_visible_override(ctx, key, OverrideEdit::Group(new_group_row));
+                        format!("verb set-glyph-background: {rel} item {item} byte {byte} (row {} col {}) -> group {new_group_row} (override)", g.row, g.col)
                     }
                     None => format!("verb set-glyph-background: {rel} out of groups (max {})", self.group_buf.size() / 96),
                 }
@@ -1360,23 +1360,23 @@ impl GlyphScene {
             Verb::SetGlyphTransform(t, q, s) => {
                 let mut row = self
                     .groups_cpu
-                    .get(gid as usize)
+                    .get(group_row as usize)
                     .copied()
                     .unwrap_or(crate::glyph_scene::GroupRow::identity([0.0; 3]));
                 row.cols[0] = [t[0], t[1], t[2], 0.0];
                 row.cols[1] = *q;
                 row.cols[3] = [s[0], s[1], s[2], row.cols[3][3]];
                 match self.allocate_group_row(ctx, row) {
-                    Some(new_gid) => {
-                        self.set_visible_override(ctx, key, OverrideEdit::Group(new_gid));
-                        format!("verb set-glyph-transform: {rel} item {item} byte {byte} (row {} col {}) -> group {new_gid} (override)", g.row, g.col)
+                    Some(new_group_row) => {
+                        self.set_visible_override(ctx, key, OverrideEdit::Group(new_group_row));
+                        format!("verb set-glyph-transform: {rel} item {item} byte {byte} (row {} col {}) -> group {new_group_row} (override)", g.row, g.col)
                     }
                     None => format!("verb set-glyph-transform: {rel} out of groups (max {})", self.group_buf.size() / 96),
                 }
             }
             Verb::ResetGlyphGroup => {
                 self.set_visible_override(ctx, key, OverrideEdit::ClearGroup);
-                format!("verb reset-glyph-group: {rel} item {item} byte {byte} -> group {gid} (the item's own)")
+                format!("verb reset-glyph-group: {rel} item {item} byte {byte} -> group {group_row} (the item's own)")
             }
             _ => unreachable!("apply_verb routes only the glyph verbs here"),
         }
@@ -1412,13 +1412,13 @@ pub(super) fn ray_aabb(ro: DVec3, rd: DVec3, min: DVec3, max: DVec3) -> Option<f
 /// One-line pick report: file, view, the group row it draws with, folded
 /// row/col, source line, byte offset, the actual character, and the arena
 /// slot.
-pub(super) fn format_pick(h: &PickHit, gid: u32) -> String {
+pub(super) fn format_pick(h: &PickHit, group_row: u32) -> String {
     match &h.glyph {
         Some(g) => format!(
             "pick: {} view={} group={} rec={} row={} col={} line={} byte={} char={:?} slot={} pos=({:.2},{:.2},{:.2})",
             h.rel_path,
             h.view,
-            gid,
+            group_row,
             g.record,
             g.row,
             g.col,
@@ -1432,7 +1432,7 @@ pub(super) fn format_pick(h: &PickHit, gid: u32) -> String {
         ),
         None => format!(
             "pick: {} view={} group={} (file-level pick, no glyph resolved)",
-            h.rel_path, h.view, gid
+            h.rel_path, h.view, group_row
         ),
     }
 }
