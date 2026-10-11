@@ -682,10 +682,12 @@ writes a line-table entry per line per item.
 No syntax heuristic runs in this mode (the standing decision), so the three
 `--render-file` golden views render flat under `--field-mode visible`: each
 is the step-2 frame's flat-paint twin byte for byte (measured on
-vulkan-nvidia with the paint forced flat by a scratch toggle), 32,439 /
+vulkan-nvidia with the paint forced flat by a scratch toggle), 32,489 /
 43,726 / 31,419 px of token colour short of the step-2 text / emoji /
-emoji-cluster frames. `--copies 4` in Visible is byte-equal to the flat
-Derived frame, and `native/tests/render_file_copies.rs` holds the tiling in
+emoji-cluster frames (re-measured 2026-10-11 after `--render-file` took
+4-cell tab stops; `text` was 32,439 at one-cell tabs). `--copies 4` in
+Visible was byte-equal to the flat Derived frame (measured before the tab
+stops, not re-measured), and `native/tests/render_file_copies.rs` holds the tiling in
 all three fields. They are not exempt from the visible equivalent; that is
 decided with the adoption of their step-2 frames (root `AGENTS.md`,
 pixel-ab).
