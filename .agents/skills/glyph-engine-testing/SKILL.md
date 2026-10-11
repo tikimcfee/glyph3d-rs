@@ -24,7 +24,7 @@ false).
 
 Do not hand-run `cargo build`, `tools/*.sh` or the binary's check flags in
 place of a gate: the ordering between them is what the tool holds for you.
-`cargo nextest run --workspace` (`just test`) is fine for a fast manual loop;
+`pixi run test` (`cargo nextest run --workspace`) is fine for a fast manual loop;
 the gate is `cargo glyph test`.
 
 `test rust` is NOT the golden check: pixels are `cargo glyph test render`

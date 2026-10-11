@@ -74,7 +74,9 @@ against `build.toml` that day; `cargo glyph gates` is the live list.)
   some of its scripts still name the retired CubeCL engine).
 - `config/defaults.toml` — every named, tunable value (colours, spacings, LOD
   thresholds), compiled in; `launch_config.toml` `[section]`s override it.
-- `.claude/worktrees/` — untracked.
+- `.claude/worktrees/` — untracked. `.claude/skills/` is tracked: links into
+  `.agents/skills/`, so Claude Code loads those skills.
+- `pixi.toml` — the one tool declaration (§ Tools).
 
 ## Build
 
@@ -194,6 +196,45 @@ Everything the tool does is declared in `build.toml` and typed in
 code does not read is a `dead_code` warning against a zero-warning gate. That is
 deliberate: this repo shipped a manifest whose `needs` edges were declared and
 read by nothing at all.
+
+## Tools, and how to read and edit code with them
+
+**`pixi.toml` is the one declaration of the tools this repo uses** (since
+2026-10-11, when `mise.toml` and the `justfile` were retired into it; both were
+earlier agents' picks that no gate used). `pixi install` brings up what
+conda-forge carries: fontTools (the emoji-sheet gate runs in this env),
+ast-grep, difftastic, nextest, samply. `pixi run setup` builds the cargo-only
+tools into `.pixi/cargo-tools`: naga-cli pinned to `Cargo.lock`'s naga, and
+cargo-modules. Under `pixi run` both sets are on PATH. **Rust and
+rust-analyzer stay per host**, so rust-analyzer matches the host's rustc
+(`rustup component add rust-analyzer`, or `brew install rust-analyzer` where
+Rust came from Homebrew). `pixi task list` shows the doors: `check [scope]`,
+`test` (nextest), `outline`, `profile`, the generators.
+
+Reading and editing, in order of preference (measured 2026-10-11,
+`out/AGENT-TOOLING-2026-10-11.md`):
+
+- **The LSP first** (rust-analyzer, Claude Code's LSP tool): definitions,
+  references, hover, call hierarchy, `documentSymbol`. Read-only; it does not
+  rename. A cold start indexes for about 30 s, and an empty answer before then
+  means nothing. `documentSymbol` puts a symbol on its doc comment's first line,
+  where a position query finds nothing, so aim at the item's own line. Its
+  check-on-save builds into `target/debug`, which the cargo-doc gate also uses,
+  so a gate can wait on that lock.
+- **`pixi run outline <file.rs>`**: every item with its exact start-end lines
+  (`tools/ast-grep/outline.yml`).
+- **ast-grep** for syntactic sweeps and rewrites: a dry run by default, `-U`
+  applies. Its matching is untyped (every `.records()`, whatever the receiver),
+  and **it does not see inside macro or attribute token trees** (`assert!`,
+  `format!`, `vec![]`, `#[cfg]`). After a rewrite, the witness is the compile
+  and `cargo glyph test rust`, not the diff.
+- **`rust-analyzer ssr`** resolves paths, but writes in place with no dry run.
+  Run it on a clean tree, then read `git diff`.
+- **`rg`** for prose, comments, WGSL and TOML. A grep is worth exactly its match
+  set (§ Earning a green).
+- **`naga <file.wgsl>`** for a fast shader check while editing. The witness is
+  still cargo-test's naga tests, and only pixel-ab sees what a shader draws.
+- **`difft`** to read a diff by syntax rather than by line.
 
 ## What the checks actually do
 
@@ -775,7 +816,7 @@ the serial-fold-versus-scan comparison green, because both forms call
 
 Hand-editing a generated file buys a failure on the next run. Regenerate instead
 (`python3 tools/gen_schema.py`,
-`node tools/export-atlas.mjs`; the justfile has `gen-schema`).
+`node tools/export-atlas.mjs`; `pixi run gen-schema` is the first).
 
 **Which language a thing is written in is a correctness decision, not taste.**
 Code that produces or checks an ANSWER stays in its own language, deliberately:

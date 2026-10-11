@@ -1,0 +1,16 @@
+# An outline of a Rust file: every item with its exact span.
+#   pixi run outline <file.rs>
+# Spans start at the item itself, not at its doc comment (the LSP's
+# documentSymbol reports the doc comment's line instead).
+id: outline
+language: rust
+severity: info
+message: item
+rule:
+  any:
+    - kind: function_item
+    - kind: struct_item
+    - kind: enum_item
+    - kind: impl_item
+    - kind: trait_item
+    - kind: mod_item
