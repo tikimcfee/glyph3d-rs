@@ -21,7 +21,7 @@ the checks themselves (what each gate runs and cannot see) live in the root
 
 ## 4. Testing
 - `pixi run test` (`cargo nextest run --workspace`) is fine for a fast manual loop.
-- Green means `cargo glyph test`, never `cargo build`. `cargo glyph test rust` covers the compiler, lints, docs and tests but no pixels; `cargo glyph test render` is the golden check. The testing skill (`.agents/skills/glyph-engine-testing/SKILL.md`) has the procedure.
+- Green means `cargo glyph test`, never `cargo build`. `cargo glyph test rust` covers the compiler, lints, docs, orphan modules and tests but no pixels; `cargo glyph test render` is the golden check. The testing skill (`.agents/skills/glyph-engine-testing/SKILL.md`) has the procedure.
 
 ## 5. Tooling
 - `pixi.toml` is the one tool declaration (root `AGENTS.md` § Tools); Rust and rust-analyzer are per host. The entry point is `cargo glyph` (`build.toml` declares every gate); pixi tasks are thin doors onto it. Do not add new ad-hoc shell entry points or `wasm-pack` workflows: a new check is a gate in `build.toml` (several existing gates are `tools/*.sh` scripts the runner calls).

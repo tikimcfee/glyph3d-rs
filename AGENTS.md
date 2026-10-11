@@ -205,7 +205,7 @@ earlier agents' picks that no gate used). `pixi install` brings up what
 conda-forge carries: fontTools (the emoji-sheet gate runs in this env),
 ast-grep, difftastic, nextest, samply. `pixi run setup` builds the cargo-only
 tools into `.pixi/cargo-tools`: naga-cli pinned to `Cargo.lock`'s naga, and
-cargo-modules. Under `pixi run` both sets are on PATH. **Rust and
+cargo-modules (the orphans gate's tool). Under `pixi run` both sets are on PATH. **Rust and
 rust-analyzer stay per host**, so rust-analyzer matches the host's rustc
 (`rustup component add rust-analyzer`, or `brew install rust-analyzer` where
 Rust came from Homebrew). `pixi task list` shows the doors: `check [scope]`,
@@ -238,7 +238,7 @@ Reading and editing, in order of preference (measured 2026-10-11,
 
 ## What the checks actually do
 
-Fifteen gates (2026-10-09), in `build.toml` order. For each: what it compares, what makes it
+Sixteen gates (2026-10-11; `cargo glyph gates` is the live list), in `build.toml` order. For each: what it compares, what makes it
 red, and **what it cannot see**. The last is the part worth reading. A check is
 a claim about a counterfactual, and a check whose blind spot you don't know is
 a green you can't price. (Gates were once numbered positions in one shell
@@ -344,6 +344,19 @@ renames are constant here and this was the one class the battery could not see:
 two links to `Engine::records` survived its rename to `read_back` through a full
 green run. Blind to whether the prose is TRUE — it checks that the symbols named
 still exist, not that the sentence around them is current.
+
+**orphans** (`tools/check-orphans.sh`, 2026-10-11). A `.rs` file that no `mod`
+declaration reaches is not compiled at all, and rustc says nothing about it.
+cargo-modules walks each target's module tree with `#[cfg(test)]` enabled and
+lists the files under `src/` it never reaches. It covers the 7 lib targets
+plus the `glyph` and `resolve-bench` bins, about 30 s in all. The realistic
+loss is a dropped `#[cfg(test)] mod tests;`: the file's tests stop existing,
+and until this gate only the cargo-test floor might have noticed, by count.
+`tests-mod-dropped` proves it. cargo-modules comes from `pixi run setup`, and
+the gate runs under `pixi run`. Blind to a file reached only under a cfg the
+host does not set (target_os branches; non-default features, of which there
+are none today). Also blind to glyph3d-native's own bin: its modules all live
+in the lib, so cargo-modules reports every one of them as an orphan of the bin.
 
 **cargo-test.** Every test binary in the workspace: naga WGSL validation (the
 renderer's and each field-mode crate's), CLI parity, encase lane layout,
