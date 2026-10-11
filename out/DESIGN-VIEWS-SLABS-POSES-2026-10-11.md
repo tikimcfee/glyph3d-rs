@@ -1,6 +1,7 @@
 # Views, slabs, poses — untangling the concepts (2026-10-11)
 
-> **Status: design proposal for discussion. Nothing here is built.** Written
+> **Status: design proposal; step A is built (2026-10-11, § 8), the rest is
+> not.** Written
 > against the tree at `c3a9de5` (Derived the default; Instanced staying as an
 > opt-in field, decided 2026-10-11). It follows
 > `out/DESIGN-VIEWS-AND-TRANSFORMS-2026-10-10.md` (steps 1 and 2 built), the
@@ -157,6 +158,10 @@ number, and the code relies on their equality in at least these places:
 
 The 2026-10-10 lane split made the GPU stop assuming it; the CPU still does
 everywhere above. This is the knot the rest of the note pulls on.
+
+*(2026-10-11: every citation above was re-read at `ed25d4b` and is exact for
+that tree; step A removed each one. § 8 says where each went, and lists nine
+more places that relied on the equality which this list did not name.)*
 
 ### 1.4 Names that mean two things; things with two names
 
@@ -695,3 +700,121 @@ Not in this order, and deliberately: the Visible-only syntax decision, the
    witnesses for steps A and G?** Both need a human to look at a frame once.
 7. **f16 or f32 pose offsets?** Sparse slabs make f32 cheap; f16 was chosen
    when the slab was dense.
+
+## 8. Step A: as built (2026-10-11)
+
+Commits `ee84ffc` (the registry) and `832e156` (the `gid` → `group_row`
+rename in `pick.rs`), on `ed25d4b`. `cargo glyph test`: all 15 gates green,
+378 tests, every golden byte-equal plain and under both equivalents
+(vulkan-nvidia).
+
+**The registry** is `native/src/views.rs`. A `View` is what a producer
+registers: `buffer` (its producer's buffer index), `bytes` (the whole buffer
+today), `recipe` (an `ItemParamsGpu` whose `group` lane is never read),
+`group_row`, `segment`, `slots`, `local_min`/`local_max`. `Views` holds the
+rows and three reverse indices built once in `Views::new`: the views drawn
+with each group row (`views_drawn_with`), the group row a segment's views
+share (`group_row_of_segment`, `None` for a cover segment over several rows
+or a segment no view uses) and, derived from those, `segments_following(g)`
+(the segments a group edit re-derives and hides). Each view's node is
+recorded by `attach_nodes` once the scene has made its group rows nodes.
+**A view's index is its item row** — the GPU item table row, the Derived
+item lane, the Visible item, `PickContext::files[view]`, the layout's
+per-item outputs — and that is the one equality the code keeps, by
+definition. Everything else is a field, read through an accessor.
+
+**Writers.** The three producers register one view per item:
+`RepoLoad::into_staged` (one per walked file, segment = the file's,
+`recipe` from its `ItemParams`, extent = `segment_local_box`),
+`stage_agent_session_with_options` (one per text block, in staging order;
+group row, segment, slots and extent are its group's) and `text::stage_file`
+(one per copy, all under the one cover segment). `StagedText::views`
+replaces `StagedText::item_params`; the scene keeps it as
+`GlyphScene::views`.
+
+**Readers, and where each § 1.3 equality went:**
+
+| § 1.3 site (at `ed25d4b`) | Now |
+|---|---|
+| `FileView.group_id = index` (`repo.rs:759`); `p.group = f.group_id` (`repo.rs:1032-1039`) | `FileView.group_id` is the loader's group row (`group_rows_of_files`, `repo.rs`); the item table is `Views::item_table`, the one place the group lane is written (setup's `FieldResources`, and `into_staged` for the Visible items) |
+| Derived `write_placements` writes `p.group_id` as the item lane (`crates/glyph-field-derived/src/field.rs:170-186`) | `GlyphPlacement` gained `item` (the view); Derived writes `item_lane(p.item)`, Instanced still writes `group_id` (`crates/glyph-field/src/records.rs`) |
+| `visible_item_of(gid)`'s probe and scan (`pick.rs:243-255`) | gone: `PickHit` carries the `view`, and `visible_item(view)` is a mode check returning it (`pick.rs`) |
+| `sync_segment` indexing `segments[gid]`, `hidden[gid]` (`pick.rs:908-911, 1242-1245`) | both walk `Views::segments_following(group_row)` (`pick.rs`, `sync_segment` and `Verb::SetHidden`; the Visible side hides every view drawn with the row) |
+| `TreeCull::new`'s "segment i being file i, group i" (`tree_cull.rs:224-225`) | setup passes each segment's node and staged colour through `group_row_of_segment` (`setup.rs`) |
+| `GroupNodes.nodes` by group id; `allocate_group_row`'s `nodes.len() == gid` (`nodes.rs:66-67`; `pick.rs:858`) | kept, and correct: both tables are keyed by group row and no view enters (said so at both places); `GroupNodes::file_nodes` — the one method that read file `i` as node `i` — is deleted |
+| the agent staging's padded item table (`staging.rs:136-146`) | gone: one item per block, dense (`set_block_item` and `session_item_params` deleted); the Derived host transcode asks `FieldResources::item_of_group` (`Views::item_of_group_rows`) which item a host record's group row belongs to |
+| `derive.rs:52-64` (history) | unchanged; it is history and still true |
+
+**Nine more places relied on the equality** and § 1.3 did not list them:
+`CullState::new` read row `i` for segment `i`'s local box, em scale and
+staged tint (`cull.rs:491-515`); `into_staged` read Pass 2's per-item tints,
+blocks and emoji pairs by group id (`repo.rs:896, 912, 936`); the Derived
+host transcode wrote a host record's group id as its item and recovered
+the wrap and column page against `item_table[group]`
+(`crates/glyph-field-derived/src/upload.rs:38-56` — the real reason for the
+staging's padding); setup attached the library's files and built the tree
+cull's segment nodes and colours by group order (`setup.rs:79, 373-374`);
+the layouts return group rows in file order, which the loader used as the
+table (`shelf.rs:105`, `algorithm.rs:259`, the library's `seated_rows` —
+now scattered by `GroupRows::table`); the file cards' `GlyphGroupBinding`
+was the file index (`layout_stack.rs:290`, `algorithm.rs:235`); the glyph
+verbs passed the group id where `write_group_id` takes the item
+(`pick.rs:1198, 1217, 1231`); every pick-record lookup searched by group id
+(`ensure_pick_cache`, `pick_ray`, `selection_from_hit`, `style.rs:35`,
+`interaction.rs:175`, the UI probe's rows); and the library verbs used the
+picked group id as the library's file index (`glyph_scene/library.rs:38`).
+
+**The witness** is `native/tests/view_registry.rs`.
+`GLYPH_PERMUTE_GROUP_ROWS=1` makes the repo loader file `g-pick-repo`'s five
+files under group rows 5..1 in reverse, with row 0 a spare identity row
+(`repo::group_rows_of_files`), so no view's group row is its index and the
+table has a row no view draws with. Four cases — the `repo-wide` frame, the
+`repo-highlight` frame, a verb chain from the whole-field camera
+(`hide-group` long.md; `recolor-line`, `set-glyph-background` alpha.rs;
+`tint-group`, `move-group` sub/deep.py) and `--layout-mode library` — each
+render byte-equal to the unpermuted load, in Derived, Instanced and Visible
+(library: Derived and Visible); the verb chain is held to move pixels
+(~91,800 against `repo-wide`) and every pick in it to name a group row that
+is not its view. It needs no adopted frame (open question 6): it compares
+two loads of the same tree. **On the parent tree it fails** — measured on
+`ed25d4b` with only the loader hook added, vulkan-nvidia: repo-highlight
+Derived 71,193 px differ (the sidecar's placement writes put each glyph in
+another item's rows), verbs Derived 493 px and Instanced 264 px (hide and
+move re-derived another file's segment), library Derived and Visible
+371,375 px each (each file under another file's mount); the other six
+pairs were byte-equal, the static load being correct wherever the GPU had
+already stopped assuming (2026-10-10's lane split). The mutation
+`view-registry-node-is-the-index` makes `Views::group_row` return the view:
+under `cargo glyph prove` the gate reddens on the registry's unit test and
+`derived_positions_match_the_staged_ones` (the failing lib binary stops
+`cargo test` before the integration tests), and by hand the witness
+reddens on 10 of its 11 pairs (46,727 to 349,373 px; only repo-wide under
+Instanced stays equal, its slots' group lane being the loader's).
+
+**Renames, within the files touched:** `PickHit::group_id` → `view`;
+`PickCacheEntry::group_id` → `view`; `visible_item_of(gid)` →
+`visible_item(view)`; in `pick.rs` every `gid` → `group_row` (`new_gid` →
+`new_group_row`) and `sync_segment`'s `i` → `segment_index`; the loader's
+local `views: Vec<FileView>` → `file_views`; `block_item` lost its group
+parameter. Pick lines print `view=… group=…` (the pick oracle reads
+`row=`/`col=`/`rec=` only).
+
+**What the note had wrong or loose.** Nothing in § 1.3 was wrong for its
+tree; it was a third of the list. The "Proves" of step A promised a test
+that today's code "would draw wrong": true, but not everywhere — the
+static repo load already drew right in all three fields, because the
+slot's group lane comes from `LayoutItem::group_id` and the Derived lane
+had been split; what drew wrong was every CPU path that edits after load
+and the library. And `ItemParamsGpu.group` written from the registry
+needed a second thing the note did not foresee: the group → item map for
+host records, because `GlyphInstance` names its group and not its item.
+
+**Left for later, deliberately:** `PickFileInfo::item` (the f64 recipe)
+beside the registry's GPU recipe — they fold together at step D's
+recipe/origin split; `FileView` keeps its name (it is the loader's per-file
+layout record); `bytes` is the whole buffer and `buffer` a producer index,
+not a handle (step D); `GroupNodes.nodes` stays the node column (step E);
+`geom_overrides` stays keyed by slot and `glyph_overrides` by
+(item, byte) (step B); the agent staging still puts the block's y/z in the
+item origin (step D) and keeps its segments one per group row, empty ones
+included.
