@@ -187,6 +187,8 @@ impl Cli {
                 copies: self.copies,
                 emoji_sheet,
                 cluster_mode: self.cluster_mode,
+                wrap_mode: self.wrap_mode,
+                z_wrap_spacing: self.z_wrap_spacing,
             }
         };
 

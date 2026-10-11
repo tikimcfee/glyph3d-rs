@@ -6,6 +6,7 @@ fn make_test_views() -> Vec<FileView> {
         FileView {
             rel_path: "src/main.rs".to_string(),
             dir: "src".to_string(),
+            buffer: 0,
             group_id: 0,
             byte_len: 100,
             record_count: 10,
@@ -22,6 +23,7 @@ fn make_test_views() -> Vec<FileView> {
         FileView {
             rel_path: "src/lib.rs".to_string(),
             dir: "src".to_string(),
+            buffer: 1,
             group_id: 1,
             byte_len: 100,
             record_count: 10,
@@ -38,6 +40,7 @@ fn make_test_views() -> Vec<FileView> {
         FileView {
             rel_path: "tests/smoke.rs".to_string(),
             dir: "tests".to_string(),
+            buffer: 2,
             group_id: 2,
             byte_len: 100,
             record_count: 5,

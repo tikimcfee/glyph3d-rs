@@ -22,10 +22,11 @@ Run:  python3 tools/gen_emoji_corpus.py                 bake both fixtures
       python3 tools/gen_emoji_corpus.py --check         rebuild in memory, byte-compare
       python3 tools/gen_emoji_corpus.py --check-render  render the calibration fixture and
                                                         both corpora in both modes; diff the
-                                                        binary's staged counts against this
-                                                        file's simulator (which the run also
-                                                        re-pins against the calibration
-                                                        fixture's known answers)
+                                                        binary's loaded counts (records,
+                                                        glyph instances) against this file's
+                                                        simulator (which the run also re-pins
+                                                        against the calibration fixture's
+                                                        known answers)
 """
 
 from __future__ import annotations
@@ -152,9 +153,11 @@ def probe(cps: list[int], i: int, entries: dict, seq_first: set, seq_max: int):
 
 
 def simulate(text: str, mode: str, trie: Trie, entries: dict, seq_first: set):
-    """stage_file's three counters (codepoints, cells, missing), both modes.
-    Calibrated against emoji-cluster-view.txt's printed counts — see
-    --check-render."""
+    """Three counters (codepoints, cells, missing), both modes: the text
+    stager's, which printed them until 2026-10-11. `cells` is the glyph
+    instances `--render-file` stages (a one-item repo load since then, which
+    prints its records — one per codepoint — and instances instead).
+    Calibrated against emoji-cluster-view.txt's counts — see --check-render."""
     cps = [ord(c) for c in text]
     codepoints = cells = missing = 0
     i = 0
@@ -466,13 +469,17 @@ def build() -> tuple[str, str]:
     )
 
 
-STAGED = re.compile(r"staged (\S+): (\d+) codepoints → (\d+) glyph instances \((\d+) copies, (\d+) missing/bitmap\)")
+# `--render-file`'s load line (a one-item repo load since 2026-10-11; the text
+# stager printed "staged …: N codepoints → M glyph instances" before).
+LOADED = re.compile(r"loaded (\S+): (\d+) views over one buffer, (\d+) records → (\d+) glyph instances")
 
 
 def check_render() -> int:
-    """The simulator against the binary's own staged counts, on the corpora AND
-    the calibration fixture (whose counts are pinned above). Sim == renderer on
-    three files x two modes is the faithfulness claim."""
+    """The simulator against the binary's own counts, on the corpora AND the
+    calibration fixture (whose counts are pinned above). Sim == renderer on
+    three files x two modes is the faithfulness claim: the renderer's glyph
+    instances are the simulator's cells, and its records one per codepoint
+    (HyperLayout records every leader, newlines and zeroed trailers too)."""
     if not BINARY.exists():
         raise SystemExit(f"ERROR  {BINARY} is missing — cargo build --release first")
     trie = Trie(CODEPOINTS.read_bytes())
@@ -487,23 +494,23 @@ def check_render() -> int:
             with tempfile.NamedTemporaryFile(suffix=".png", delete=True) as tmp:
                 run = subprocess.run(
                     [str(BINARY), "--render-file", str(path.relative_to(ROOT / "native")),
-                     "--frames", "1", "--screenshot", tmp.name]
-                    + (["--cluster-mode", "cluster"] if mode == "cluster" else []),
+                     "--frames", "1", "--screenshot", tmp.name, "--cluster-mode", mode],
                     cwd=ROOT / "native", capture_output=True, text=True)
-            m = STAGED.search(run.stdout + run.stderr)
+            m = LOADED.search(run.stdout + run.stderr)
             if not m:
-                print(f"FAIL  {path.name} {mode}: no staged line in the binary's output")
+                print(f"FAIL  {path.name} {mode}: no loaded line in the binary's output")
                 rc = 1
                 continue
-            got = (int(m.group(2)), int(m.group(3)), int(m.group(5)))
-            status = "ok" if got == want else f"MISMATCH (simulator says {want})"
-            if got != want:
+            got = (int(m.group(3)), int(m.group(4)))
+            sim = (len(text), want[1])
+            status = "ok" if got == sim else f"MISMATCH (simulator says records {sim[0]}, cells {sim[1]})"
+            if got != sim:
                 rc = 1
             if path == CALIBRATION and want != CALIBRATION_COUNTS[mode]:
                 print(f"FAIL  calibration: simulator moved off the known answer {CALIBRATION_COUNTS[mode]} "
                       f"(now {want}) — the fixture or the counter semantics changed")
                 rc = 1
-            print(f"  {path.name:28} {mode:8} codepoints {got[0]:>6}  cells {got[1]:>6}  missing {got[2]:>3}  {status}")
+            print(f"  {path.name:28} {mode:8} records {got[0]:>6}  cells {got[1]:>6}  (simulated missing {want[2]:>3})  {status}")
     print("check-render: the simulator and the renderer agree" if rc == 0 else "check-render: FAIL")
     return rc
 

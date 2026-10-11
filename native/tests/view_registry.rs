@@ -6,7 +6,7 @@
 //! its cull segment, its pick record and its Visible item, and code relied
 //! on the equality. `GLYPH_PERMUTE_GROUP_ROWS=1` makes the repo loader file
 //! `g-pick-repo`'s files under their group rows in REVERSE, with row 0 a
-//! spare no file draws with (`repo::group_rows_of_files`): every view's
+//! spare no file draws with (`repo::group_rows_of_views`): every view's
 //! group row differs from its index. Rendered through the release binary
 //! exactly as the golden runner drives it, each frame below must be
 //! byte-equal to the same frame of the plain load, in every field:

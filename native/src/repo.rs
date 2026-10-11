@@ -11,7 +11,7 @@
 //! 2D grid of code pages; files are views {slot range, engine params} into
 //! the shared arena — the web's MegaGlyphField architecture (one arena,
 //! files as views). The group row is the file's index too, except under the
-//! registry's witness (`group_rows_of_files`); nothing downstream assumes it.
+//! registry's witness (`group_rows_of_views`); nothing downstream assumes it.
 //!
 //! Correctness guards:
 //! - only valid UTF-8 files reach the layout (valid UTF-8 cannot decode a
@@ -315,16 +315,22 @@ pub fn file_item_params(p: &RepoParams, byte_len: usize, newline_count: usize) -
     }
 }
 
-/// One file's view into the shared arena. Stage G picking reads the
-/// slot-range fields (plus the per-file engine params, which make a
-/// deterministic re-layout possible). The engine-record base and row count
-/// were part of the original MegaGlyphField-style contract but no reader
-/// ever landed — dropped in the Stage J sweep (re-derivable from `item`).
+/// One view's layout record: a walked file's slot range in the shared
+/// arena, its extents and params. A repo load makes one per file; a
+/// `--render-file --copies N` load N over its one file (2026-10-11), each
+/// naming the file it reads in `buffer`. Picking reads the slot-range
+/// fields (plus the engine params, which make a deterministic re-layout
+/// possible). The engine-record base and row count were part of the
+/// original MegaGlyphField-style contract but no reader ever landed —
+/// dropped in the Stage J sweep (re-derivable from `item`).
 pub struct FileView {
     pub rel_path: String,
     /// Parent directory (relative) — the group-tint key.
     pub dir: String,
-    /// The group row the file draws with (`group_rows_of_files`).
+    /// The walked file the view reads (its index in the walk): the view
+    /// registry's `buffer`.
+    pub buffer: u32,
+    /// The group row the file draws with (`group_rows_of_views`).
     pub group_id: u32,
     /// The file's length in bytes.
     pub byte_len: usize,
@@ -526,6 +532,89 @@ pub fn load_repo_from_prefetched(
     strategy: Strategy,
     verify: bool,
     gpu: Option<&crate::gpu::GpuContext>,
+    arena: GlyphArena,
+    folds: Option<&std::collections::HashMap<String, Vec<std::ops::Range<u32>>>>,
+) -> RepoLoad {
+    let plan = ViewPlan {
+        buffer_of_view: (0..prefetched.walk.files.len() as u32).collect(),
+        placement: Placement::Controller,
+    };
+    load_views(root, prefetched, plan, params, strategy, verify, gpu, arena, folds)
+}
+
+/// `--render-file FILE [--copies N]` as a repo load of that one file
+/// (2026-10-11; step 2 of the Instanced retirement): one buffer, `copies`
+/// views over it, laid out, painted and fielded by the same HyperLayout,
+/// colourisers and fields as `--load-repo` — so the Visible field serves it
+/// for real, and the glyph verbs and picks work on it. The views are tiled
+/// (`tile_views`) rather than shelved, each its own group row so the
+/// copies sit side by side; the file paints syntax whatever
+/// `params.color_mode` says (a text view always has).
+///
+/// The bytes are refused where a walk would skip them: not UTF-8 (the
+/// decode assumes well-formed leads) or past [`MAX_FILE_BYTES`] (the
+/// per-item ordinal guard).
+pub fn load_file(path: &Path, copies: u32, params: &RepoParams, gpu: Option<&crate::gpu::GpuContext>) -> RepoLoad {
+    let started = Instant::now();
+    let bytes = std::fs::read(path).unwrap_or_else(|e| panic!("failed to read text file {}: {e}", path.display()));
+    assert!(std::str::from_utf8(&bytes).is_ok(), "{} is not valid UTF-8; the layout decodes well-formed UTF-8 only", path.display());
+    assert!(
+        bytes.len() as u64 <= MAX_FILE_BYTES,
+        "{} is {} B, past the {} B per-item cap (the ordinal guard; a repo walk skips such a file)",
+        path.display(),
+        bytes.len(),
+        MAX_FILE_BYTES
+    );
+    let file_name = path.file_name().map_or_else(|| path.display().to_string(), |n| n.to_string_lossy().into_owned());
+    // The pick path re-reads `root/rel_path` from disk, so the root is the
+    // file's own directory and the file its one walked entry.
+    let root = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    let mut walk = WalkResult::from_files(vec![RepoFile::in_memory(file_name, bytes)]);
+    walk.walk_dur = started.elapsed();
+    let file_params = walk.files.iter().map(|f| file_item_params(params, f.bytes.len(), f.newline_count)).collect();
+    let paint_syntax = RepoParams { color_mode: ColorMode::Syntax, ..*params };
+    let plan = ViewPlan { buffer_of_view: vec![0; copies.max(1) as usize], placement: Placement::Tiled };
+    load_views(
+        root,
+        PrefetchedRepo { walk, file_params, hyper_data: None },
+        plan,
+        &paint_syntax,
+        Strategy::default(),
+        false,
+        gpu,
+        GlyphArena::new(),
+        None,
+    )
+}
+
+/// Which walked file each view reads, and how the views are placed
+/// (2026-10-11). A repo load is one view per file, placed by the layout
+/// controller (shelf, carrel or library); `--render-file FILE --copies N`
+/// is N views over its one file, tiled — the first producer with several
+/// views over one buffer (`crate::views`).
+struct ViewPlan {
+    /// View `v` reads walked file `buffer_of_view[v]`.
+    buffer_of_view: Vec<u32>,
+    placement: Placement,
+}
+
+enum Placement {
+    /// `LayoutController::from_mode(params.layout_mode)`: a repo load.
+    Controller,
+    /// [`tile_views`]: `--render-file`.
+    Tiled,
+}
+
+/// The loader proper, over a [`ViewPlan`].
+#[allow(clippy::too_many_arguments)]
+fn load_views(
+    root: &Path,
+    prefetched: PrefetchedRepo,
+    plan: ViewPlan,
+    params: &RepoParams,
+    strategy: Strategy,
+    verify: bool,
+    gpu: Option<&crate::gpu::GpuContext>,
     mut arena: GlyphArena,
     folds: Option<&std::collections::HashMap<String, Vec<std::ops::Range<u32>>>>,
 ) -> RepoLoad {
@@ -534,6 +623,7 @@ pub fn load_repo_from_prefetched(
         file_params,
         hyper_data,
     } = prefetched;
+    let view_count = plan.buffer_of_view.len();
 
     let _load = tracing::info_span!(
         "repo.load",
@@ -551,18 +641,20 @@ pub fn load_repo_from_prefetched(
         ColorMode::Flat => Paint::Flat(crate::layout::DEFAULT_COLOR_PACKED),
     };
 
-    // Each file's group row: its own index, unless the permutation witness
-    // asks otherwise (`group_rows_of_files`). The layout writes it into the
+    // Each view's group row: its own index, unless the permutation witness
+    // asks otherwise (`group_rows_of_views`). The layout writes it into the
     // Instanced slots' group lane; the view registry carries it from here on.
-    let group_rows = group_rows_of_files(walk.files.len());
-    let items: Vec<LayoutItem<'_>> = walk
-        .files
+    // One layout item per VIEW: copies of one buffer are laid out once each
+    // (every stored slot names its item, so views cannot share slots).
+    let group_rows = group_rows_of_views(view_count);
+    let items: Vec<LayoutItem<'_>> = plan
+        .buffer_of_view
         .iter()
         .enumerate()
-        .map(|(index, f)| LayoutItem {
-            bytes: &f.bytes,
-            params: file_params[index],
-            group_id: group_rows.of_file[index],
+        .map(|(view, &buffer)| LayoutItem {
+            bytes: &walk.files[buffer as usize].bytes,
+            params: file_params[buffer as usize],
+            group_id: group_rows.of_view[view],
             paint: paint_mode,
         })
         .collect();
@@ -579,6 +671,13 @@ pub fn load_repo_from_prefetched(
         None => crate::layout::LayoutEngine::hyper_with_mode(params.field_mode),
     };
     if let Some(hd) = hyper_data {
+        // The prefetch ran Pass 1 over the walked FILES; it stands for the
+        // items only when each file is one view.
+        assert!(
+            plan.buffer_of_view.iter().enumerate().all(|(view, &buffer)| buffer as usize == view)
+                && view_count == walk.files.len(),
+            "a Pass 1 prefetch over the files serves one view per file only"
+        );
         backend.set_hyper_prefetched(hd);
     }
     let t = Instant::now();
@@ -655,8 +754,10 @@ pub fn load_repo_from_prefetched(
         let mut rebuilt: Vec<GlyphInstance> = Vec::with_capacity(old.len());
         let mut running: u32 = 0;
         let mut dropped_total = 0usize;
-        for (index, f) in walk.files.iter().enumerate() {
-            let placement = &mut placements[index];
+        for (view, &buffer) in plan.buffer_of_view.iter().enumerate() {
+            let buffer = buffer as usize;
+            let f = &walk.files[buffer];
+            let placement = &mut placements[view];
             let base = placement.slot_base as usize;
             let count = placement.slot_count as usize;
             let fold_lines = folds.get(&f.rel_path).filter(|v| !v.is_empty());
@@ -670,7 +771,7 @@ pub fn load_repo_from_prefetched(
             // (queued: the durable design — pagination, wrapping, everything
             // recomputes when the fold feeds the layout).
             let paginated = {
-                let item = &file_params[index];
+                let item = &file_params[buffer];
                 let newlines = f.newline_count;
                 let rows_est = newlines
                     .max(f.bytes.len() / item.wrap_width.max(1) as usize)
@@ -693,7 +794,7 @@ pub fn load_repo_from_prefetched(
                     slice
                 }
                 Some(fold_lines) => {
-                    let item = &file_params[index];
+                    let item = &file_params[buffer];
                     let records =
                         rederive_cached(&f.bytes, item).expect("fold: re-derive failed");
                     let (leaders, _, _, _) =
@@ -713,7 +814,7 @@ pub fn load_repo_from_prefetched(
                             row: r.row(),
                             col: r.col(),
                             color: crate::layout::DEFAULT_COLOR_PACKED,
-                            group_id: group_rows.of_file[index],
+                            group_id: group_rows.of_view[view],
                             advance: r.advance(),
                             height: r.height(),
                             flags: 0,
@@ -757,9 +858,10 @@ pub fn load_repo_from_prefetched(
     let sp_views = tracing::info_span!("repo.views").entered();
     let mut total_records = 0usize;
     let mut total_blanks = 0usize;
-    let mut file_views: Vec<FileView> = Vec::with_capacity(walk.files.len());
-    for (index, f) in walk.files.iter().enumerate() {
-        let placed = &placements[index];
+    let mut file_views: Vec<FileView> = Vec::with_capacity(view_count);
+    for (view, &buffer) in plan.buffer_of_view.iter().enumerate() {
+        let f = &walk.files[buffer as usize];
+        let placed = &placements[view];
         total_records += placed.record_count as usize;
         total_blanks += (placed.record_count - placed.slot_count) as usize;
         let mut ink = placed.ink;
@@ -772,7 +874,8 @@ pub fn load_repo_from_prefetched(
         file_views.push(FileView {
             rel_path: f.rel_path.clone(),
             dir: f.dir.clone(),
-            group_id: group_rows.of_file[index],
+            buffer,
+            group_id: group_rows.of_view[view],
             byte_len: f.bytes.len(),
             record_count: placed.record_count as usize,
             slot_base: placed.slot_base as usize,
@@ -783,7 +886,7 @@ pub fn load_repo_from_prefetched(
             z_min: ink.min[2],
             z_max: ink.max[2],
             offset: [0.0; 3],
-            item: file_params[index],
+            item: file_params[buffer as usize],
         });
     }
     let instances_len = arena.len();
@@ -791,21 +894,35 @@ pub fn load_repo_from_prefetched(
     stage_dur += t.elapsed();
 
     // The visible form keeps the bytes: the walk's own Vecs move into the
-    // staging — one allocation per file, no copy of the corpus. Everything
-    // the walk still had to say (counts, times) is read before the move.
+    // staging — one allocation per file, no copy of the corpus, however many
+    // views read it. Everything the walk still had to say (counts, times, a
+    // tiled block's last row) is read before the move.
     let files_len = walk.files.len();
     let (walk_total_bytes, walk_skipped_large, walk_skipped_non_utf8, walk_dirs_visited) =
         (walk.total_bytes, walk.skipped_large, walk.skipped_non_utf8, walk.dirs_visited);
+    let ends_in_newline: Vec<bool> =
+        plan.buffer_of_view.iter().map(|&buffer| walk.files[buffer as usize].bytes.last() == Some(&b'\n')).collect();
     if let Some(staging) = arena.visible_staging_mut() {
-        assert_eq!(staging.seeds.len(), files_len, "one visible seed per walked file");
-        staging.item_bytes = walk.files.into_iter().map(|f| f.bytes).collect();
+        assert_eq!(staging.seeds.len(), view_count, "one visible seed per view");
+        staging.buffer_bytes = walk.files.into_iter().map(|f| f.bytes).collect();
+        staging.item_buffers = plan.buffer_of_view.clone();
     }
 
     let t = Instant::now();
     let sp_grid = tracing::info_span!("repo.layout").entered();
-    let mut controller = crate::layout_stack::LayoutController::from_mode(params.layout_mode, *params);
-    let (rows_in_file_order, bounds_min, bounds_max) = controller.apply(&mut file_views);
-    let groups = group_rows.table(rows_in_file_order);
+    let (controller, rows_in_view_order, bounds_min, bounds_max) = match plan.placement {
+        Placement::Controller => {
+            let mut controller = crate::layout_stack::LayoutController::from_mode(params.layout_mode, *params);
+            let (rows, bounds_min, bounds_max) = controller.apply(&mut file_views);
+            (Some(controller), rows, bounds_min, bounds_max)
+        }
+        Placement::Tiled => {
+            let pages: Vec<crate::layout::PageExtent> = placements.iter().map(|p| p.page).collect();
+            let (rows, bounds_min, bounds_max) = tile_views(&mut file_views, &pages, &ends_in_newline, params.line_height as f32);
+            (None, rows, bounds_min, bounds_max)
+        }
+    };
+    let groups = group_rows.table(rows_in_view_order);
     drop(sp_grid);
     let layout_dur = t.elapsed();
 
@@ -835,7 +952,7 @@ pub fn load_repo_from_prefetched(
         stats,
         color_mode: params.color_mode,
         root: root.to_path_buf(),
-        controller: Some(controller),
+        controller,
     }
 }
 
@@ -1055,7 +1172,7 @@ impl RepoLoad {
                 .map(|(view, v)| {
                     let (local_min, local_max) = segment_local_box(v);
                     crate::views::View {
-                        buffer: view as u32,
+                        buffer: v.buffer,
                         bytes: 0..v.byte_len as u32,
                         recipe: glyph_field::ItemParamsGpu::from(&v.item),
                         group_row: v.group_id,
@@ -1075,7 +1192,7 @@ impl RepoLoad {
         // edit re-uploads it.
         let mut arena = self.arena;
         if let Some(staging) = arena.visible_staging_mut() {
-            assert_eq!(staging.item_bytes.len(), views.len(), "the loader moved every file's bytes in");
+            assert_eq!(staging.item_buffers.len(), views.len(), "the loader named every view's buffer");
             let item_table = views.item_table();
             let items: Vec<glyph_field_visible::VisibleItem> = (0..views.len())
                 .map(|view| {
@@ -1209,35 +1326,84 @@ impl RepoLoad {
     }
 }
 
-/// Which group row each walked file draws with. A repo load files file `i`
-/// under row `i`; `GLYPH_PERMUTE_GROUP_ROWS=1` is the step-A witness of the
-/// view registry (2026-10-11, `crate::views`): it files them in REVERSE
-/// under rows `1..=n` and leaves row 0 a spare identity row, so no file's
-/// group row equals its index and the table has a row no file draws with.
-/// Every reader that still assumed the two equal draws the wrong file there
+/// Which group row each view draws with. A load files view `i` under row
+/// `i`; `GLYPH_PERMUTE_GROUP_ROWS=1` is the step-A witness of the view
+/// registry (2026-10-11, `crate::views`): it files them in REVERSE under
+/// rows `1..=n` and leaves row 0 a spare identity row, so no view's group
+/// row equals its index and the table has a row no view draws with. Every
+/// reader that still assumed the two equal draws the wrong file there
 /// (`native/tests/view_registry.rs` renders both and compares the pixels).
 struct GroupRows {
-    of_file: Vec<u32>,
+    of_view: Vec<u32>,
     count: usize,
 }
 
-fn group_rows_of_files(file_count: usize) -> GroupRows {
+fn group_rows_of_views(view_count: usize) -> GroupRows {
     if std::env::var_os("GLYPH_PERMUTE_GROUP_ROWS").is_some_and(|v| v == "1") {
-        log::warn!("GLYPH_PERMUTE_GROUP_ROWS=1: {file_count} files filed under group rows in reverse, row 0 spare");
-        GroupRows { of_file: (0..file_count).map(|i| (file_count - i) as u32).collect(), count: file_count + 1 }
+        log::warn!("GLYPH_PERMUTE_GROUP_ROWS=1: {view_count} views filed under group rows in reverse, row 0 spare");
+        GroupRows { of_view: (0..view_count).map(|i| (view_count - i) as u32).collect(), count: view_count + 1 }
     } else {
-        GroupRows { of_file: (0..file_count as u32).collect(), count: file_count }
+        GroupRows { of_view: (0..view_count as u32).collect(), count: view_count }
     }
 }
 
+/// `--render-file`'s placement (2026-10-11): the views — copies of one
+/// file — in a near-square grid, row-major, `ceil(sqrt(n))` columns, with a
+/// gap of four primary-font advances, each drawn with an IDENTITY group row
+/// at its grid offset (no directory tint: a text view is no repo's file).
+/// The rule, the gap and the bounds are the ones the text stager used
+/// before `--render-file` became a repo load, so the camera frames a file
+/// as it always has.
+///
+/// A copy's block is its inked width from the pen origin (`ink.max.x`, the
+/// width the shelf measures a file by; the page extent's `right` would add
+/// the newline record's advance) by its rows down to the pen's row after a
+/// final newline (an editor's empty last line): `line_height -
+/// page.bottom`, plus a row when the file ends in a newline. The bounds add
+/// the one row above row 0 that the stager's did (`max.y = line_height`),
+/// and take depth from the pages.
+fn tile_views(
+    views: &mut [FileView],
+    pages: &[crate::layout::PageExtent],
+    ends_in_newline: &[bool],
+    line_height: f32,
+) -> (Vec<GroupRow>, [f32; 3], [f32; 3]) {
+    assert_eq!(views.len(), pages.len(), "one page extent per view");
+    let (mut block_width, mut block_height) = (0.0f32, 0.0f32);
+    let (mut depth_min, mut depth_max) = (0.0f32, 0.0f32);
+    for ((view, page), &newline_ended) in views.iter().zip(pages).zip(ends_in_newline) {
+        block_width = block_width.max(view.ink.max[0]);
+        block_height = block_height.max(line_height - page.bottom + if newline_ended { line_height } else { 0.0 });
+        depth_min = depth_min.min(page.z_min);
+        depth_max = depth_max.max(page.z_max);
+    }
+    let trie = crate::default_trie();
+    let gap = 4.0 * crate::text::fu_to_world(trie.metrics.advance_fu as i32, trie.metrics.em_height_fu);
+    let copies = views.len().max(1) as u32;
+    let grid_columns = (copies as f32).sqrt().ceil() as u32;
+    let grid_rows = copies.div_ceil(grid_columns);
+    let mut rows = Vec::with_capacity(views.len());
+    for (copy, view) in views.iter_mut().enumerate() {
+        let column = copy as u32 % grid_columns;
+        let row = copy as u32 / grid_columns;
+        view.offset = [column as f32 * (block_width + gap), -(row as f32 * (block_height + gap)), 0.0];
+        rows.push(GroupRow::identity(view.offset));
+    }
+    let total_width = grid_columns as f32 * (block_width + gap) - gap;
+    let total_height = grid_rows as f32 * (block_height + gap) - gap;
+    log::info!("layout [tile]: {copies} views, block {block_width:?} x {block_height:?}, field {total_width:?} x {total_height:?}");
+    (rows, [0.0, -total_height, depth_min], [total_width, line_height, depth_max])
+}
+
 impl GroupRows {
-    /// The group table from the layout's rows, which come one per file in
-    /// file order (`LayoutController::apply`): row `of_file[i]` takes file
-    /// `i`'s; a row no file draws with stays the identity.
-    fn table(&self, rows_in_file_order: Vec<GroupRow>) -> Vec<GroupRow> {
-        assert_eq!(rows_in_file_order.len(), self.of_file.len(), "the layout returns one group row per file");
+    /// The group table from the layout's rows, which come one per view in
+    /// view order (`LayoutController::apply`, `tile_views`): row
+    /// `of_view[i]` takes view `i`'s; a row no view draws with stays the
+    /// identity.
+    fn table(&self, rows_in_view_order: Vec<GroupRow>) -> Vec<GroupRow> {
+        assert_eq!(rows_in_view_order.len(), self.of_view.len(), "the layout returns one group row per view");
         let mut table = vec![GroupRow::identity([0.0; 3]); self.count];
-        for (row, &group_row) in rows_in_file_order.into_iter().zip(&self.of_file) {
+        for (row, &group_row) in rows_in_view_order.into_iter().zip(&self.of_view) {
             table[group_row as usize] = row;
         }
         table
@@ -1381,6 +1547,55 @@ mod tests {
         // And below the shard threshold the serial arm answers directly.
         let few: Vec<&[u8]> = refs[..3].to_vec();
         assert_eq!(paint_files(&few), serial[..3].to_vec());
+    }
+
+    /// `--render-file`'s tiling (2026-10-11), the frame the text stager made
+    /// before the file became a repo load: four copies of a three-line file
+    /// in a 2x2 grid, a block being the inked width by the rows down to the
+    /// pen's row after the final newline, four advances apart, each with an
+    /// identity group row (no directory tint); the bounds carry the one row
+    /// above row 0. A file with no final newline has no pen row below it.
+    #[test]
+    fn tile_views_frame_copies_as_the_text_stager_did() {
+        let line_height = 1.25f32;
+        let view = |copy: u32| FileView {
+            rel_path: "copy.rs".into(),
+            dir: String::new(),
+            buffer: 0,
+            group_id: copy,
+            byte_len: 30,
+            record_count: 30,
+            slot_base: 27 * copy as usize,
+            slot_count: 27,
+            ink: crate::layout::InkExtent { min: [0.0, -3.0, 0.0], max: [10.0, 0.5, 0.0] },
+            width: 10.0,
+            height: 3.5,
+            z_min: 0.0,
+            z_max: 0.0,
+            offset: [0.0; 3],
+            item: file_item_params(&RepoParams::default(), 30, 3),
+        };
+        // Rows 0..2, so the last record's y is -2.5; right counts the
+        // newline's advance, which the block must not.
+        let page = crate::layout::PageExtent { right: 10.5, bottom: -2.5, z_min: -0.25, z_max: 0.0 };
+        let mut views: Vec<FileView> = (0..4).map(view).collect();
+        let (rows, bounds_min, bounds_max) = tile_views(&mut views, &[page; 4], &[true; 4], line_height);
+        let gap = 4.0 * text::fu_to_world(1229, 2320);
+        let (block_width, block_height) = (10.0, 1.25 + 2.5 + 1.25);
+        let want = [
+            [0.0, 0.0, 0.0],
+            [block_width + gap, 0.0, 0.0],
+            [0.0, -(block_height + gap), 0.0],
+            [block_width + gap, -(block_height + gap), 0.0],
+        ];
+        for (copy, (v, row)) in views.iter().zip(&rows).enumerate() {
+            assert_eq!(v.offset, want[copy], "copy {copy}'s offset");
+            assert_eq!(row.cols, GroupRow::identity(want[copy]).cols, "copy {copy}'s group row is the identity at its offset");
+        }
+        assert_eq!(bounds_min, [0.0, -(2.0 * block_height + gap), -0.25]);
+        assert_eq!(bounds_max, [2.0 * block_width + gap, line_height, 0.0]);
+        let (_, one_min, one_max) = tile_views(&mut views[..1], &[page], &[false], line_height);
+        assert_eq!((one_min, one_max), ([0.0, -(1.25 + 2.5), -0.25], [block_width, line_height, 0.0]), "no final newline, no pen row");
     }
 
     /// The seam the whole z_wrap_spacing chain hangs on: the CLI flag sets
