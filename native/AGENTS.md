@@ -369,6 +369,15 @@ its staging text predates C22). Key touchpoints:
   frame's flush uploads its one local row), `seg_ms`. Bevy propagation is
   O(every entity): 0.39 ms for one moved card on a 9,241-file library
   before the library left bevy (2026-10-10).
+- `GLYPH_FRAME_SCRIPT="FRAME:STEP[;FRAME:STEP...]"` — offscreen (C32,
+  2026-10-11): scene changes applied before frame FRAME (0-based) renders,
+  so a frame can follow a DIFFERENT one, as every windowed frame does and
+  no static offscreen run did. STEP is `pose X Y Z YAW PITCH` (the
+  `--cam-pose` form, degrees) or `show-glyphs-px PX` (the panel's "Show
+  glyphs" slider, set live). C32 — the Visible layout laying out a stale
+  tail of the previous frame's segment list — was invisible offscreen until
+  this: `GLYPH_FRAME_SCRIPT="0:pose <elsewhere>;1:pose <target>" --frames 4`
+  against a static render of the target. Use `--frames` past the last step.
 - `GLYPH_POSE_PRINT=1` — windowed: F2 (screenshot) also prints the frame's
   camera as the `--cam-pose X Y Z YAW PITCH` argument (degrees) that
   reproduces it — the same line the Debug panel's "copy pose" button puts on

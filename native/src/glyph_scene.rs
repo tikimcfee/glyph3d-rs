@@ -474,6 +474,10 @@ impl SceneLike for GlyphScene {
         Some((self.fly.eye.to_array(), self.fly.yaw, self.fly.pitch))
     }
 
+    fn set_show_glyphs_px(&mut self, px: f32) {
+        self.set_lod_min_px(px);
+    }
+
     fn apply_pick(&mut self, ctx: &GpuContext, cmd: &PickCommand) -> Option<String> {
         GlyphScene::apply_pick(self, ctx, cmd)
     }
