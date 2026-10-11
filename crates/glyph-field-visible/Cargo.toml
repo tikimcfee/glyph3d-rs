@@ -14,3 +14,6 @@ log = "0.4"
 
 [dev-dependencies]
 naga = { version = "30", features = ["wgsl-in"] }
+
+[lints]
+workspace = true
