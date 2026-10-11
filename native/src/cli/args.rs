@@ -243,15 +243,16 @@ pub struct Cli {
     /// Stage F: disable the cull/LOD pass (legacy per-chunk draws; debug/A-B)
     #[arg(long)]
     pub no_cull: bool,
-    /// Glyph field render mode: `instanced` (default: one full 32 B placement
-    /// record per glyph, read as-is by the vertex stage), `derived` (compact
-    /// 20 B record per glyph with vertex-stage Y/Z derivation from line
-    /// tables), or `visible` (no slot per
-    /// glyph — the source bytes and a line table are resident and the lines
-    /// in view are laid out per frame on the GPU; `out/VISIBLE-MODE.md`).
-    /// Switchable live from the Debug panel's selector (the scene rebuilds);
-    /// a load past the Derived slot lanes falls back to `instanced` and says so.
-    #[arg(long, value_name = "MODE", default_value = "instanced")]
+    /// Glyph field render mode: `derived` (default since 2026-10-11: compact
+    /// 20 B record per glyph, x stored, Y/Z derived in the vertex stage from
+    /// the item table), `instanced` (one full 32 B placement record per
+    /// glyph, read as-is by the vertex stage; being retired), or `visible`
+    /// (no slot per glyph — the source bytes and a line table are resident
+    /// and the lines in view are laid out per frame on the GPU;
+    /// `out/VISIBLE-MODE.md`). Switchable live from the Debug panel's
+    /// selector (the scene rebuilds); a load past the Derived slot lanes
+    /// falls back to `instanced` and says so.
+    #[arg(long, value_name = "MODE", default_value = "derived")]
     pub field_mode: glyph_field::GlyphFieldMode,
     /// Visible field only: tint glyphs by `lod` tier or `cull` state (`off`
     /// by default). The other modes ignore it; the F8 HUD names the active one.

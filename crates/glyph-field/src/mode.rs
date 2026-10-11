@@ -13,12 +13,14 @@ use std::str::FromStr;
 #[cfg_attr(feature = "clap", value(rename_all = "lower"))]
 pub enum GlyphFieldMode {
     /// One full 32 B placement record per glyph (`RenderSlot`), read by the
-    /// vertex stage as-is. Works for any glyph sizes and any placement — the
-    /// general mode, and the default.
-    #[default]
+    /// vertex stage as-is. Works for any glyph sizes and any placement; being
+    /// retired (2026-10-11: no longer the default), and until then the
+    /// fall-back for a load past the Derived lanes.
     Instanced,
     /// Compact 20 B record per glyph (`DerivedSlot`) with placement Y/Z derived
-    /// in the vertex stage from per-line tables and ItemParamsGpu.
+    /// in the vertex stage from per-line tables and ItemParamsGpu. The
+    /// default since 2026-10-11.
+    #[default]
     Derived,
     /// No slot per glyph: the source bytes and a line table are resident and
     /// the lines in view are laid out per frame on the GPU into a transient
@@ -81,6 +83,6 @@ mod tests {
             assert_eq!(mode.to_string(), mode.as_str());
         }
         assert!("Instanced".parse::<GlyphFieldMode>().is_err(), "names are lowercase only");
-        assert_eq!(GlyphFieldMode::default(), GlyphFieldMode::Instanced);
+        assert_eq!(GlyphFieldMode::default(), GlyphFieldMode::Derived);
     }
 }

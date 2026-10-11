@@ -66,11 +66,11 @@ color_mode = "flat"
 # "batch" and "naive" are the same HyperLayout without it (verification forms)
 repo_engine = "hyper"
 
-# Glyph field render mode: "derived" (compact 20B slots, zero-copy), "instanced"
-# (32B slots), or "visible" (no slot per glyph: the lines in view are laid out
-# per frame on the GPU — out/VISIBLE-MODE.md; no load-time syntax colour;
-# switchable live from the Debug panel, F8 shows its HUD).
-# DIFFERS from the CLI default, which is "instanced".
+# Glyph field render mode: "derived" (compact 20B slots, zero-copy; the CLI
+# default since 2026-10-11), "instanced" (32B slots; being retired), or
+# "visible" (no slot per glyph: the lines in view are laid out per frame on
+# the GPU — out/VISIBLE-MODE.md; no load-time syntax colour; switchable live
+# from the Debug panel, F8 shows its HUD).
 field_mode = "derived"
 
 # Debug flags

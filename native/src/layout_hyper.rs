@@ -59,7 +59,7 @@ impl HyperLayout {
         Self {
             trie: None,
             device: None,
-            field_mode: GlyphFieldMode::Instanced,
+            field_mode: GlyphFieldMode::default(),
             prefetched_data: None,
         }
     }
@@ -89,7 +89,7 @@ impl HyperLayout {
         Self {
             trie: Some(trie),
             device: None,
-            field_mode: GlyphFieldMode::Instanced,
+            field_mode: GlyphFieldMode::default(),
             prefetched_data: None,
         }
     }

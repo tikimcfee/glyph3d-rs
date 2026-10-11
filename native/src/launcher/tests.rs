@@ -46,7 +46,7 @@ fn untouched_controls_show_the_cli_defaults() {
         View::Choice(opts) => opts.into_iter().find(|o| o.selected).unwrap().name,
         _ => unreachable!(),
     };
-    assert_eq!(selected(Control::FieldMode), "instanced");
+    assert_eq!(selected(Control::FieldMode), "derived");
     assert_eq!(selected(Control::WrapMode), "back");
     assert_eq!(selected(Control::ColorMode), "flat");
     assert_eq!(l.view(Control::Greeking), View::Toggle(true));
@@ -91,8 +91,7 @@ fn choices_cycle_both_ways_and_dials_clamp() {
     let mut l = Launcher::defaults();
     l.focus = Control::FieldMode;
     l.step(1);
-    assert_eq!(l.cfg.field_mode, Some(GlyphFieldMode::Derived));
-    l.step(1);
+    assert_eq!(l.cfg.field_mode, Some(GlyphFieldMode::Visible), "from the default, derived");
     l.step(1);
     assert_eq!(l.cfg.field_mode, Some(GlyphFieldMode::Instanced), "wraps");
     l.step(-1);
