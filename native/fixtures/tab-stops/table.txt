@@ -1,0 +1,8 @@
+name	count	note
+alpha	1	plain
+béta	22	é before the tab
+gamma世	333	a CJK glyph before the tab
+δ	4444	greek
+epsilon-is-long	5	a cell past one stop
+🌍	66	an emoji cell
+wrapped00	wrapped01	wrapped02	wrapped03	wrapped04	wrapped05	wrapped06	wrapped07	wrapped08	wrapped09	wrapped10	wrapped11	wrapped12	wrapped13	wrapped14	wrapped15
