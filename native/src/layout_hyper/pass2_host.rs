@@ -59,15 +59,7 @@ pub fn layout_pass2_host(
 
             let out_ptr = unsafe { (dest_addr as *mut GlyphInstance).add(slot_base as usize) };
             let flat_color = if let Paint::Flat(c) = item.paint { Some(c) } else { None };
-            let (local_colors_buf, per_record_colors) = match item.paint {
-                Paint::PerRecord(c) => (None, Some(c)),
-                Paint::SyntaxHeuristic => {
-                    let cols = crate::text::colorize_leaders(bytes);
-                    (Some(cols), None)
-                }
-                _ => (None, None),
-            };
-            let colors_slice = per_record_colors.or(local_colors_buf.as_deref());
+            let colors_slice = if let Paint::PerRecord(c) = item.paint { Some(c) } else { None };
 
             let wrap_w = p.wrap_width as i64;
             let is_wrap_back = p.wrap_mode == crate::fold::WrapMode::Back;

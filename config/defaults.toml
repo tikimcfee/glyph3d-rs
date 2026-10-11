@@ -111,7 +111,7 @@ orbit_rate = 0.12
 orbit_height_fraction = 0.18
 
 [repo]
-# Per-directory group tints, multiplied with the syntax colours (bright
+# Per-directory group tints, multiplied with the glyph colours (bright
 # pastels: the hue groups a directory's pages without drowning the palette).
 # A directory hashes to one entry; the tint-cycle verb walks this list.
 dir_tints = [

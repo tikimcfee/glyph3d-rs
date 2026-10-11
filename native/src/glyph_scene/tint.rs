@@ -10,7 +10,7 @@ use super::{GlyphInstance, RenderSlot, GLYPH_CELL_AREA};
 ///
 /// `slot_ink` (`Atlas::slot_ink`) says what a BITMAP slot's pixels average
 /// to; an emoji contributes that instead of its instance colour — which is
-/// the syntax colour, a colour it does not display — and counts as the two
+/// the text colour, a colour it does not display — and counts as the two
 /// cells its advance covers. Outline glyphs are summed exactly as before, so
 /// a segment without emoji tints to the same bits (the goldens hold).
 pub fn seg_tint(instances: &[GlyphInstance], width: f32, height: f32, slot_ink: &[Option<[f32; 4]>]) -> [f32; 4] {

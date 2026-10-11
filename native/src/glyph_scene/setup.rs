@@ -242,9 +242,10 @@ impl GlyphScene {
                 seeds: bytemuck::cast_slice(&staging.line_table.seeds),
                 segment_bytes: staging.line_table.segment_bytes,
                 trie: &trie,
-                // No spans at load: the mode runs no syntax heuristic (by
-                // decision); a `--highlight` sidecar arrives through
-                // `set_item_spans` afterwards.
+                // No spans at load (no load paints anything but flat since
+                // the syntax heuristic's retirement, 2026-10-11); a
+                // `--highlight` sidecar arrives through `set_item_spans`
+                // afterwards.
                 spans: &[],
                 default_color: crate::layout::DEFAULT_COLOR_PACKED,
             };

@@ -1389,20 +1389,6 @@ fn segment_local_box(v: &FileView) -> ([f32; 3], [f32; 3]) {
     )
 }
 
-/// The repo paint pass: per-file `colorize_leaders`, sharded by BYTE-balanced
-/// contiguous file ranges once the corpus is big enough to pay for threads
-/// (the seg_tint precedent, but byte-bound: the flagship's files span
-/// 100 B..2 MB, so a count-based split strands a worker on a bundle).
-/// Per-file colorize state is independent by construction and the ranges
-/// concatenate in file order — bit-identical to the serial map (the
-/// `sharded_paint_matches_serial` test fences exactly that; the golden views
-/// only ever run the serial arm). 1.0s -> ~0.24s at the flagship, 2026-09-30.
-#[cfg(test)]
-fn paint_files(files: &[&[u8]]) -> Vec<Vec<u32>> {
-    use rayon::prelude::*;
-    files.par_iter().map(|f| text::colorize_leaders(f)).collect()
-}
-
 #[cfg(test)]
 // A one-element slice of fold ranges is a real input here (one fold), not a
 // mistyped `(a..b).collect()` — the shape this lint exists to catch.
@@ -1493,27 +1479,6 @@ mod tests {
         let folded = compact_folds(&records, &[1..2], &lines_of(&[0, 2]));
         assert_eq!(folded.dropped, 0);
         assert_eq!(folded.records[1].y(), -4.0);
-    }
-
-    /// The sharded paint path (>= 64 files) must reproduce the serial map
-    /// bit-identically — the golden views run the serial path (5 files), so
-    /// without this test nothing exercises the shard cut/order logic.
-    #[test]
-    fn sharded_paint_matches_serial() {
-        let files: Vec<Vec<u8>> = (0..100usize)
-            .map(|i| {
-                format!(
-                    "// comment {i}\nlet s{i} = \"str {i}\" + '🦀'; // 🚀\nfn w{i}_ord(ord) {{ }}\n"
-                )
-                .into_bytes()
-            })
-            .collect();
-        let refs: Vec<&[u8]> = files.iter().map(|f| f.as_slice()).collect();
-        let serial: Vec<Vec<u32>> = refs.iter().map(|b| text::colorize_leaders(b)).collect();
-        assert_eq!(serial, paint_files(&refs));
-        // And below the shard threshold the serial arm answers directly.
-        let few: Vec<&[u8]> = refs[..3].to_vec();
-        assert_eq!(paint_files(&few), serial[..3].to_vec());
     }
 
     /// `--render-file`'s tiling (2026-10-11), the frame the text stager made
