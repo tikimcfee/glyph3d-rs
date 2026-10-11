@@ -469,6 +469,17 @@ pub fn run_scan_pipeline<T: ResolveGlyph + ?Sized>(
     group_size: usize,
     shards: usize,
 ) -> FoldResult {
+    // FAIL LOUD: the scan form has no tab stops (2026-10-11). A tab wider
+    // than one cell makes an advance depend on the line's cells before it,
+    // which this monoid does not carry; its only inputs are the fixtures, and
+    // the oracle that recorded them lays every tab out as one cell.
+    for (index, item) in items.iter().enumerate() {
+        assert!(
+            !item.tab_width.expands(),
+            "item {index}: the scan form lays tabs out as one cell (the oracle's domain); tab width {} has no scan form",
+            item.tab_width
+        );
+    }
     let chunk_size = chunk_size.max(1);
     let group_size = group_size.max(1);
     let shards = shards.max(1);
@@ -1136,6 +1147,7 @@ mod tests {
             wrap_width: 7,
             wrap_mode: WrapMode::Down,
                 cluster_mode: ClusterMode::default(),
+            tab_width: crate::fold::TabWidth::ONE_CELL,
             z_step: 0.1,
             line_height: 1.1,
             has_page: true,

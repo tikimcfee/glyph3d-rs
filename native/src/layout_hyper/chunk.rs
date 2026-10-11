@@ -10,7 +10,11 @@
 //! chunk does not start at column 0: it inherits the column, line advance and
 //! segment advance its line had reached, which Pass 1's aggregation computes
 //! exactly (`aggregate_chunk_prepasses`) — the running f32 segment sum the
-//! fold uses, not a product.
+//! fold uses, not a product. Under tab stops wider than a cell (2026-10-11) a
+//! tab's advance depends on the line's cells before it, which a chunk's own
+//! walk does not know; the aggregation walks a newline-free chunk that holds
+//! a tab again from the true line state (`walk_line_state`), and every later
+//! pass takes the seed it computes.
 
 use crate::layout::LayoutItem;
 

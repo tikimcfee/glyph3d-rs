@@ -142,6 +142,7 @@ mod tests {
             wrap_width: p.wrap_width as i64,
             wrap_mode: p.wrap_mode,
             cluster_mode: p.cluster_mode,
+            tab_width: p.tab_width,
             z_step: p.z_step,
             line_height: p.line_height,
             has_page: p.has_page,

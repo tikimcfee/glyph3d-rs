@@ -106,6 +106,7 @@ fn params_of_fixture_item(it: &fold::Item) -> ItemParams {
         wrap_width: it.wrap_width as i32,
         wrap_mode: it.wrap_mode,
         cluster_mode: it.cluster_mode,
+        tab_width: it.tab_width,
         has_page: it.has_page,
         page_rows: it.page_rows as i32,
         page_cols: it.page_cols as i32,
@@ -133,6 +134,7 @@ fn fold_item_of(p: &ItemParams, len: usize) -> fold::Item {
         wrap_width: p.wrap_width as i64,
         wrap_mode: p.wrap_mode,
         cluster_mode: p.cluster_mode,
+        tab_width: p.tab_width,
         z_step: p.z_step,
         line_height: p.line_height,
         has_page: p.has_page,
@@ -148,18 +150,27 @@ fn fold_item_of(p: &ItemParams, len: usize) -> fold::Item {
     }
 }
 
-fn repo_params(cluster_mode: ClusterMode) -> crate::repo::RepoParams {
+fn repo_params(cluster_mode: ClusterMode, tab_width: fold::TabWidth) -> crate::repo::RepoParams {
     // The renderer's default repo shape.
     crate::repo::RepoParams {
         wrap_mode: fold::WrapMode::Back,
         cluster_mode,
+        tab_width,
         ..Default::default()
     }
 }
 
-/// Read one input path as a corpus. A directory with no files and a fixture
-/// with no items are refused here, not compared.
+/// Read one input path as a corpus, tabs one cell wide (the layout before
+/// tab stops, and the oracle's).
 pub fn load_corpus(path: &Path, cluster_mode: ClusterMode) -> Result<Corpus, String> {
+    load_corpus_with_tabs(path, cluster_mode, fold::TabWidth::ONE_CELL)
+}
+
+/// Read one input path as a corpus. A directory with no files and a fixture
+/// with no items are refused here, not compared. `tab_width` (2026-10-11),
+/// like the cluster mode, applies to directory and text inputs; a fixture
+/// carries its own params, and the oracle that recorded it has no tab stops.
+pub fn load_corpus_with_tabs(path: &Path, cluster_mode: ClusterMode, tab_width: fold::TabWidth) -> Result<Corpus, String> {
     let name = path
         .file_name()
         .map(|s| s.to_string_lossy().into_owned())
@@ -169,7 +180,7 @@ pub fn load_corpus(path: &Path, cluster_mode: ClusterMode) -> Result<Corpus, Str
         if walk.files.is_empty() {
             return Err(format!("{}: no files walked — refusing an empty corpus", path.display()));
         }
-        let rp = repo_params(cluster_mode);
+        let rp = repo_params(cluster_mode, tab_width);
         let items = walk
             .files
             .into_iter()
@@ -203,7 +214,7 @@ pub fn load_corpus(path: &Path, cluster_mode: ClusterMode) -> Result<Corpus, Str
     }
     let bytes = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
     let newlines = bytes.iter().filter(|&&b| b == b'\n').count();
-    let params = crate::repo::file_item_params(&repo_params(cluster_mode), bytes.len(), newlines);
+    let params = crate::repo::file_item_params(&repo_params(cluster_mode, tab_width), bytes.len(), newlines);
     Ok(Corpus {
         name: format!("{name} [{cluster_mode:?}]"),
         items: vec![CorpusItem { label: name, bytes, params }],
@@ -522,6 +533,9 @@ pub struct CorpusDiff {
     pub visible_span_slots: usize,
     pub visible_span_bad: usize,
     pub visible_span_colored: usize,
+    /// Tabs the reference laid out wider than the one cell the trie gives
+    /// them (tab stops, 2026-10-11) — anti-vacuity for a `--tab-width` run.
+    pub expanded_tabs: usize,
     /// (item label, first divergence) for every differing item, in order.
     pub firsts: Vec<(String, String)>,
     /// diff_backends' verdict over the whole corpus (the seam's own differ).
@@ -552,6 +566,7 @@ impl Default for CorpusDiff {
             visible_span_slots: 0,
             visible_span_bad: 0,
             visible_span_colored: 0,
+            expanded_tabs: 0,
             firsts: Vec::new(),
             seam: Ok(()),
         }
@@ -638,6 +653,7 @@ fn visible_slots_of(
                     fold::WrapMode::Back => glyph_field_visible::WRAP_BACK,
                 },
                 cluster: u32::from(p.cluster_mode == ClusterMode::Cluster),
+                tab_width: p.tab_width.cells(),
                 byte_base,
                 byte_len: c.bytes.len() as u32,
                 first_line: lines.start as u32,
@@ -745,6 +761,13 @@ pub fn diff_corpus(corpus: &Corpus, trie: &Arc<TrieTable>, visible: Option<&Visi
         out.instance_bad += d.instance_bad;
         out.placement_bad += d.placement_bad as usize;
         out.heads += refs[i].heads;
+        let one_cell = trie.resolve(0x09).advance;
+        out.expanded_tabs += refs[i]
+            .records
+            .iter()
+            .zip(&refs[i].record_bytes)
+            .filter(|(r, &b)| c.bytes[b] == b'\t' && r.advance() != one_cell)
+            .count();
         out.ascii_heads += refs[i].ascii_heads;
         if c.params.cluster_mode == ClusterMode::Leader {
             out.leader_mode_record_bad += d.record_bad;
@@ -899,7 +922,7 @@ pub fn diff_corpus(corpus: &Corpus, trie: &Arc<TrieTable>, visible: Option<&Visi
 }
 
 /// `--hyper-oracle-check`: every path, both ways, then a verdict. Exits.
-pub fn run_hyper_oracle_check(paths: &[PathBuf], cluster_mode: ClusterMode) -> ! {
+pub fn run_hyper_oracle_check(paths: &[PathBuf], cluster_mode: ClusterMode, tab_width: fold::TabWidth) -> ! {
     let strict = std::env::var("GLYPH_HYPER_ORACLE_STRICT").is_ok_and(|v| v == "1");
     let trie = crate::default_trie();
     // The visible tier runs the kernel on this host's GPU; a host without
@@ -914,7 +937,7 @@ pub fn run_hyper_oracle_check(paths: &[PathBuf], cluster_mode: ClusterMode) -> !
     let mut failed = 0usize;
     let mut first: Option<(String, String)> = None;
     for p in paths {
-        let corpus = match load_corpus(p, cluster_mode) {
+        let corpus = match load_corpus_with_tabs(p, cluster_mode, tab_width) {
             Ok(c) => c,
             Err(e) => {
                 eprintln!("hyper-oracle FAIL: {e}");
@@ -999,6 +1022,7 @@ pub fn run_hyper_oracle_check(paths: &[PathBuf], cluster_mode: ClusterMode) -> !
         total.visible_span_slots += d.visible_span_slots;
         total.visible_span_bad += d.visible_span_bad;
         total.visible_span_colored += d.visible_span_colored;
+        total.expanded_tabs += d.expanded_tabs;
     }
 
     // Anti-vacuity before the verdict: a differ that compared nothing passes
@@ -1021,6 +1045,10 @@ pub fn run_hyper_oracle_check(paths: &[PathBuf], cluster_mode: ClusterMode) -> !
     }
     if visible.is_some() && total.visible_span_colored == 0 {
         eprintln!("hyper-oracle FAIL: the visible tier's span half compared nothing coloured");
+        std::process::exit(1);
+    }
+    if tab_width.expands() && total.expanded_tabs == 0 {
+        eprintln!("hyper-oracle FAIL: --tab-width {tab_width} compared no tab wider than one cell — the corpus does not exercise tab stops");
         std::process::exit(1);
     }
     if strict && visible.is_none() {
@@ -1078,6 +1106,12 @@ pub fn run_hyper_oracle_check(paths: &[PathBuf], cluster_mode: ClusterMode) -> !
         total.visible_span_colored,
         if visible.is_some() { "" } else { " (tier skipped: no device)" }
     );
+    if tab_width.expands() {
+        println!(
+            "hyper-oracle: tab stops every {tab_width} cells on the directory and text inputs; {} tabs laid out wider than one cell, on every tier (no oracle has tab stops: the reference is this tree's own serial fold)",
+            total.expanded_tabs
+        );
+    }
     std::process::exit(0);
 }
 
@@ -1098,7 +1132,7 @@ mod tests {
         // agree. Wrapping and paging on, so the fold's positions are not the
         // trivial ones. If this goes red, the instrument (or HyperLayout's
         // ASCII path) is wrong, not the sequence class.
-        let rp = repo_params(ClusterMode::Cluster);
+        let rp = repo_params(ClusterMode::Cluster, fold::TabWidth::ONE_CELL);
         let text = b"fn main() {\n    let x = 1; // a comment that is long enough to wrap twice over\n}\n";
         let params = crate::repo::file_item_params(&rp, text.len(), 3);
         let d = diff_corpus(&corpus_of(text, params), &crate::default_trie(), None).expect("layout");
@@ -1122,7 +1156,7 @@ mod tests {
                     0\u{FE0F}\u{FE0F}\u{20E3}2";
         let trie = crate::default_trie();
         for (mode, want_heads) in [(ClusterMode::Cluster, true), (ClusterMode::Leader, false)] {
-            let rp = repo_params(mode);
+            let rp = repo_params(mode, fold::TabWidth::ONE_CELL);
             let params = crate::repo::file_item_params(&rp, text.len(), 2);
             let d = diff_corpus(&corpus_of(text.as_bytes(), params), &trie, None).expect("layout");
             assert!(d.records > 0 && d.device_slots == d.instances, "{mode:?}: compared nothing");
@@ -1369,5 +1403,142 @@ mod tests {
         let got = load_corpus(&dir, ClusterMode::Cluster);
         let _ = std::fs::remove_dir(&dir);
         assert!(got.is_err(), "an empty corpus must be refused");
+    }
+
+    /// A line of `target_bytes` or more with no newline: words of every
+    /// width class (ASCII, two-byte, a CJK miss of one cell, a bitmap
+    /// emoji, a ZWJ family that clusters to one head) between runs of one to
+    /// three tabs, so the line's cells reach every phase of any stop.
+    fn tabbed_line(target_bytes: usize) -> String {
+        let words = ["x", "\u{E9}\u{E9}", "\u{4E16}", "abc", "\u{1F680}", "longer-word", "\u{1F468}\u{200D}\u{1F469}", "1\u{FE0F}\u{20E3}"];
+        let mut s = String::new();
+        let mut i = 0usize;
+        while s.len() < target_bytes {
+            s.push_str(words[i % words.len()]);
+            s.push_str(&i.to_string());
+            for _ in 0..(1 + i % 3) {
+                s.push('\t');
+            }
+            i += 1;
+        }
+        s
+    }
+
+    /// TAB STOPS (2026-10-11) on every tier, host, device and the Visible
+    /// kernel, against the serial fold with the same stops — the oracle has
+    /// none, so this fold (itself held to `text::reference_layout` and to
+    /// the oracle-backed one-cell fold over the spaces a tab stands for, in
+    /// `fold::tests`) is the reference past one cell. Widths 4 (every
+    /// product `f32(k) × cell` exact) and 8 (k = 5 and 7 round: the f64 line
+    /// advance must take the exact multiple). The corpus puts tabs before and
+    /// after non-ASCII glyphs, inside wraps (wrap 7 and 100, both modes), on
+    /// row and column pages, across the Visible field's segment seeds (a line
+    /// past `SEGMENT_BYTES`) and across HyperLayout's intra-line chunk cuts (a
+    /// line past twice the chunk threshold with no newline), where a chunk
+    /// must start from the line's true cells — the per-chunk walk measures
+    /// from its own start, and the aggregation walks a tabbed chunk again.
+    #[test]
+    fn tab_stops_agree_on_every_tier() {
+        use crate::layout_hyper::chunk::{slice_byte_buffers_into_chunk_defs, CHUNK_THRESHOLD_BYTES};
+        let trie = crate::default_trie();
+        let visible = VisibleOracle::new(&trie);
+        let cell = trie.resolve(0x09).advance as f64;
+        let small = "\tlead\n\
+            a\tb\tcc\tddd\teeee\t|\n\
+            \u{4E16}\u{754C}\tcjk\t\u{E9}t\u{E9}\t|\n\
+            \u{1F680}\trocket\t\t\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}\tfam\n\
+            1\u{FE0F}\u{20E3}\tkey\tabcdefgh\t\t\t|\n\
+            \n\
+            no tab here, and a line long enough to wrap at seven\n\
+            tail\t";
+        let seeded = format!("{}\nafter\tthe\tlong line\n", tabbed_line(3 * crate::layout_hyper::SEGMENT_BYTES));
+        let cut = tabbed_line(2 * CHUNK_THRESHOLD_BYTES + 4096);
+        assert!(!cut.contains('\n'));
+        let texts: [&str; 3] = [small, &seeded, &cut];
+        // (wrap, mode, page_rows, page_cols, pages_wide)
+        let shapes: [(i32, fold::WrapMode, i32, i32, i32); 6] = [
+            (0, fold::WrapMode::Back, 0, 0, 1),
+            (7, fold::WrapMode::Back, 0, 0, 1),
+            (7, fold::WrapMode::Down, 0, 0, 1),
+            (100, fold::WrapMode::Back, 0, 0, 1),
+            (5, fold::WrapMode::Down, 3, 0, 2),
+            (0, fold::WrapMode::Back, 0, 6, 1),
+        ];
+        // The chunk-cut text must really cut inside its line where the line
+        // is off a stop and the chunk holds a tab, or the case above is not
+        // the one it claims to be.
+        let (defs, _) = slice_byte_buffers_into_chunk_defs(&[cut.as_bytes()]);
+        assert!(defs.len() >= 3, "the cut text is {} chunk(s)", defs.len());
+        let mut compared = 0usize;
+        let mut moved = 0usize;
+        for width in [4u32, 8] {
+            let tab_width = fold::TabWidth::new(width).expect("a width");
+            let mut off_stop_cuts = 0usize;
+            for cluster in [ClusterMode::Cluster, ClusterMode::Leader] {
+                for (wrap, mode, rows, cols, wide) in shapes {
+                    let params = ItemParams {
+                        origin_x: 0.5,
+                        origin_y: -1.0,
+                        origin_z: 2.0,
+                        line_height: 1.1,
+                        z_step: 0.4,
+                        wrap_width: wrap,
+                        wrap_mode: mode,
+                        cluster_mode: cluster,
+                        tab_width,
+                        has_page: rows != 0 || cols != 0,
+                        page_rows: rows,
+                        page_cols: cols,
+                        pages_wide: wide,
+                        page_gap_x: 0.8,
+                        band_stride_y: 9.5,
+                        depth_per_band: -2.5,
+                        depth_per_col: 0.75,
+                        ..ItemParams::default()
+                    };
+                    let corpus = Corpus {
+                        name: "tabs".into(),
+                        items: texts
+                            .iter()
+                            .enumerate()
+                            .map(|(i, t)| CorpusItem { label: format!("text {i}"), bytes: t.as_bytes().to_vec(), params })
+                            .collect(),
+                    };
+                    let d = diff_corpus(&corpus, &trie, Some(&visible)).expect("layout");
+                    let at = format!("width {width} {cluster:?} wrap {wrap} {mode:?} rows {rows} cols {cols}");
+                    assert!(d.records > 0 && d.device_slots == d.instances, "{at}: compared nothing");
+                    assert_eq!((d.record_bad, d.instance_bad, d.placement_bad), (0, 0, 0), "{at}: {:?}", d.firsts);
+                    assert_eq!(
+                        (d.device_render_bad, d.device_derived_bad, d.device_placement_bad),
+                        (0, 0, 0),
+                        "{at}: {:?}",
+                        d.firsts
+                    );
+                    assert_eq!(d.paint_bad, 0, "{at}: syntax paint: {:?}", d.firsts);
+                    assert_eq!(d.visible_slots, d.device_slots, "{at}: the visible tier compared every slot");
+                    assert_eq!((d.visible_bad, d.visible_span_bad), (0, 0), "{at}: visible kernel: {:?}", d.firsts);
+                    assert!(d.seam.is_ok(), "{at}: {:?}", d.seam);
+                    compared += d.instances;
+                    // The cut text's chunks, read off the reference: a chunk
+                    // holding a tab whose line is off a stop where it starts.
+                    if wrap == 0 && cols == 0 {
+                        let r = reference_item(cut.as_bytes(), &params, &trie);
+                        let one = reference_item(cut.as_bytes(), &ItemParams { tab_width: fold::TabWidth::ONE_CELL, ..params }, &trie);
+                        moved += r.records.iter().zip(&one.records).filter(|(a, b)| a.x() != b.x()).count();
+                        for def in &defs[1..] {
+                            let first = r.record_bytes.iter().position(|&b| b >= def.byte_offset).expect("a record in the chunk");
+                            let cells = ((r.records[first].x() as f64 - params.origin_x) / cell).round() as u64;
+                            let chunk = &cut.as_bytes()[def.byte_offset..def.byte_offset + def.byte_len];
+                            if !cells.is_multiple_of(width as u64) && chunk.contains(&b'\t') {
+                                off_stop_cuts += 1;
+                            }
+                        }
+                    }
+                }
+            }
+            assert!(off_stop_cuts > 0, "width {width}: no chunk of the cut text starts off a stop with a tab in it");
+        }
+        assert!(compared > 100_000, "the grid compared only {compared} instances");
+        assert!(moved > 10_000, "the stops moved only {moved} glyphs of the cut text");
     }
 }

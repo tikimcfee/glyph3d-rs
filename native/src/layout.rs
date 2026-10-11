@@ -175,6 +175,12 @@ pub struct ItemParams {
     /// Whether the sequence pass resolves codepoint clusters to single glyphs.
     /// ITEM-LEVEL, exactly like `wrap_mode` — see [`crate::fold::ClusterMode`].
     pub cluster_mode: crate::fold::ClusterMode,
+    /// How far a tab advances: to the next multiple of this many display
+    /// cells along its line ([`crate::fold::TabWidth`], 2026-10-11). One cell
+    /// here, the layout every engine had before stops; a repo load takes the
+    /// `[layout] tab_width_cells` setting or `--tab-width` (`RepoParams`).
+    /// ITEM-LEVEL, exactly like `wrap_mode`, so two views can differ.
+    pub tab_width: crate::fold::TabWidth,
     pub has_page: bool,
     pub page_rows: i32,
     pub page_cols: i32,
@@ -199,6 +205,7 @@ impl Default for ItemParams {
             wrap_width: 0,
             wrap_mode: crate::fold::WrapMode::Back,
             cluster_mode: crate::fold::ClusterMode::default(),
+            tab_width: crate::fold::TabWidth::ONE_CELL,
             has_page: false,
             page_rows: 0,
             page_cols: 0,

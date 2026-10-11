@@ -5,6 +5,7 @@ use crate::fold::{rows_for_line, wrap_row_of, wrap_segment_of};
 use crate::layout::{ByteSpan, GlyphRecord, ItemParams, DEFAULT_COLOR_PACKED};
 use crate::text::fu_to_world;
 use super::char_resolve::{resolve_byte_char, ResolveCtx};
+use super::tab_stop::TabStops;
 
 /// Deterministic single-item record generation in pure Rust, bit-identical to the layout pipeline.
 pub fn rederive_item_records(
@@ -16,6 +17,7 @@ pub fn rederive_item_records(
     let cluster = super::char_resolve::clusters(p);
     let bitmap_adv = fu_to_world(trie.bitmap_advance_fu, em_height_fu);
     let rctx = ResolveCtx { trie, bitmap_adv, em_height_fu, cluster };
+    let tabs = TabStops::of(p, fu_to_world(trie.metrics.advance_fu as i32, em_height_fu));
 
     let fold_unit = if p.wrap_width > 0 {
         p.wrap_width as i64
@@ -49,12 +51,13 @@ pub fn rederive_item_records(
                 line_adv = 0.0;
                 seg_adv = 0.0;
             } else {
+                let (advance, line_advance_addend) = tabs.advance(bytes[pos], r.advance, line_adv);
                 col += 1;
-                line_adv += r.advance as f64;
+                line_adv += line_advance_addend;
                 if fold_unit > 0 && col % fold_unit == 0 {
                     seg_adv = 0.0;
                 } else {
-                    seg_adv += r.advance;
+                    seg_adv += advance;
                 }
             }
             pos += 1;
@@ -117,8 +120,10 @@ pub fn rederive_item_records(
             (base_x, base_y, base_z)
         };
 
+        // A tab's record carries the advance its stop gave it (2026-10-11).
+        let (advance, line_advance_addend) = tabs.advance(bytes[pos], r.advance, line_adv);
         records.push(GlyphRecord {
-            measures: [pos_x, pos_y, pos_z, r.advance, r.height],
+            measures: [pos_x, pos_y, pos_z, advance, r.height],
             counts: [r.glyph_id, row as u32, col as u32],
         });
 
@@ -129,11 +134,11 @@ pub fn rederive_item_records(
             seg_adv = 0.0;
         } else {
             col += 1;
-            line_adv += r.advance as f64;
+            line_adv += line_advance_addend;
             if fold_unit > 0 && col % fold_unit == 0 {
                 seg_adv = 0.0;
             } else {
-                seg_adv += r.advance;
+                seg_adv += advance;
             }
         }
 

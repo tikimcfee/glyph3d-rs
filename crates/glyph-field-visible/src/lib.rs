@@ -166,6 +166,11 @@ pub struct VisibleItem {
     pub wrap_mode: u32,
     /// Whether the sequence pass runs for this item (cluster mode).
     pub cluster: u32,
+    /// The item's tab stop width in display cells, `>= 1` (the renderer's
+    /// `fold::TabWidth`, 2026-10-11): a tab advances to the next multiple of
+    /// it, counted from its line's start. 1 is a tab of one cell — what the
+    /// trie gives it, and the layout before stops.
+    pub tab_width: u32,
     /// Where the item's bytes start in the resident byte buffer.
     pub byte_base: u64,
     pub byte_len: u32,

@@ -89,7 +89,7 @@ struct ItemGpu {
     bbox_max_z: f32,
     override_base: u32,      // the layout kernel's; the cull never reads them
     override_count: u32,
-    _pad2: u32,
+    tab_width: u32,          // the layout kernel's too (tab stops, 2026-10-11)
     _pad3: u32,
     _pad4: u32,
 };

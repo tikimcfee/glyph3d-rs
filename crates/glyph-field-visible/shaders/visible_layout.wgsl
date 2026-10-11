@@ -78,7 +78,9 @@ struct ItemGpu {
     bbox_max_z: f32,
     override_base: u32,
     override_count: u32,
-    _pad2: u32,
+    // Tab stops (2026-10-11): a tab spans to the next multiple of this many
+    // cells of its line (`fold::TabWidth`); 1 is the trie's one cell.
+    tab_width: u32,
     _pad3: u32,
     _pad4: u32,
 };
@@ -458,7 +460,16 @@ fn walk_segment(seg: Seg, emit: bool) -> u32 {
             r = resolve_leader(chunk, i, len, end, lim, cluster, &trailer_until);
         }
         let glyph = r & PK_GLYPH_MASK;
-        let kk = (r >> PK_K_SHIFT) & 3u;
+        var kk = (r >> PK_K_SHIFT) & 3u;
+        // A TAB SPANS TO ITS STOP (2026-10-11, `fold::TabWidth`): the next
+        // multiple of `tab_width` cells of the line, counted from the line's
+        // start — `cells` is that count here, seeded at a cut like the rest
+        // of the fold state, so a segment needs nothing more. Its advance is
+        // then `f32(kk) * cell_adv` below, the CPU's one correctly rounded
+        // product. A tab is ASCII, so `b` is the tab itself.
+        if (b == 0x09u && it.tab_width > 1u) {
+            kk = it.tab_width - cells % it.tab_width;
+        }
         if (glyph != 0u) {
             if (emit) {
                 let wrap_segment = select(0u, col / wrap, wrap > 0u);
@@ -503,7 +514,11 @@ fn walk_segment(seg: Seg, emit: bool) -> u32 {
         if (fold && (col % fold_unit) == 0u) {
             seg_adv = 0.0;
         } else {
-            seg_adv = seg_adv + f32(kk) * trie.cell_adv;
+            // `add1`, not `+`: a tab's product rounds (f32(5) x cell does),
+            // and a compiler free to contract `s + p * q` into one fma would
+            // round the sum once where the CPU rounds the product, then the
+            // sum. A product of 0, 1 or 2 cells is exact either way.
+            seg_adv = add1(seg_adv, f32(kk) * trie.cell_adv);
         }
         // ONE byte, not the lead's declared length: the reference classifies
         // every byte on its own (`is_leader_byte`), so a lead whose

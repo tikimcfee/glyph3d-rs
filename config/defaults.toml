@@ -57,6 +57,19 @@ backdrop_gain = 0.7
 # The other field modes never read it.
 visible_backdrop_px = 0.25
 
+[layout]
+# The layout recipe's defaults for a repo load (each file's ItemParams; a
+# view's recipe, so a later change can differ per view).
+#
+# Tab stops (2026-10-11): a tab advances to the next multiple of this many
+# display cells, counted from the start of its line (a double-width emoji
+# counts two; a wrap does not restart the count). 1 lays a tab out as one
+# ordinary cell, which is the layout before tab stops and what every golden
+# view and every fixture is taken under; 4 or 8 is an editor's. 1..=64.
+# Default for --tab-width. --render-file and the agent-session cards stage
+# through their own CPU tokenizers, which keep their fixed 4-cell stops.
+tab_width_cells = 1
+
 [camera]
 # Vertical field of view, degrees, every camera mode.
 fov_y_deg = 40.0

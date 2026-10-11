@@ -223,6 +223,14 @@ pub struct Cli {
     /// explicitly.
     #[arg(long, value_name = "MODE", default_value = "cluster")]
     pub cluster_mode: crate::fold::ClusterMode,
+    /// Tab stops on a repo load (and `--hyper-oracle-check`'s directory and
+    /// text inputs): a tab advances to the next multiple of N display cells,
+    /// counted from the start of its line (a double-width emoji counts two;
+    /// a wrap does not restart the count). 1 is a tab of one ordinary cell,
+    /// the layout before tab stops. Default: the config's
+    /// layout.tab_width_cells (1). `--render-file` keeps its own 4-cell stops.
+    #[arg(long, value_name = "N", value_parser = parse_tab_width)]
+    pub tab_width: Option<crate::fold::TabWidth>,
     /// Spatial arrangement mode for the repository files across the canvas:
     /// `shelf` (default: height-classed shelves across the whole repo),
     /// `carrel` (hierarchical directory-based neighborhood carrels) or
