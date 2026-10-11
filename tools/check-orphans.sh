@@ -36,6 +36,13 @@ TARGETS=(
     "glyph --bin glyph"
 )
 
+# cargo-modules loads the workspace as rust-analyzer does, which runs
+# `cargo check --compile-time-deps --all-targets` (build scripts, proc macros;
+# measured with a logging cargo shim, 2026-10-11). Its own target dir, as
+# cargo-check-no-ui has, so it never shares target/debug and its lock with an
+# editor's rust-analyzer.
+export CARGO_TARGET_DIR=target/orphans
+
 FAILED=0
 for t in "${TARGETS[@]}"; do
     read -r pkg sel <<<"$t"
