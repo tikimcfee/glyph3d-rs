@@ -25,7 +25,7 @@
 # Ratchet, NOT an equality: tests are added constantly, so an exact pin would
 # redden on the most common good action in the repo. A green run whose real
 # count exceeds the floor prints a NOTE naming the value to raise it to.
-test_floor = 357
+test_floor = 358
 # Every golden view is rendered again under each of these and must match the
 # SAME baseline byte for byte (2026-10-09, C20). The Derived field renders
 # every golden frame identically to Instanced (measured on vulkan-nvidia and
@@ -1168,6 +1168,16 @@ op = "replace"
 find = "        let glyph_px = px_scale * em_scale.get(si).copied().unwrap_or(1.0) / dist;"
 with = "        let glyph_px = px_scale * em_scale.get(si).map(|_| 1.0).unwrap_or(1.0) / dist;"
 expect = "lod_reads_the_group_scale"
+
+[[mutation]]
+name = "library-backdrop-at-far-z"
+gate = "cargo-test"
+why = "the far-LOD backdrop anchored at the segment's far z in a library load, as before 2026-10-10. Every library page has a face just behind the content's front that writes depth, so a file with a wrap staircase (g-pick-repo's wide.txt: 424 units deep) put its backdrop behind its own face and the page read BLANK at LOD distance until a pick drew its glyphs into the selection mask (Ivan, the kernel tree). No golden view renders the library or reaches a far-LOD backdrop. CONSUMED BY: cull_segments' backdrop depth under CullView::backdrop_at_front (set by setup for a library load); reddens glyph_scene::cull::cull_depth_tests::library_backdrop_anchors_to_the_front"
+file = "native/src/glyph_scene/cull.rs"
+op = "replace"
+find = "                let z = if backdrop_at_front { seg.max[2] } else { seg.min[2] };"
+with = "                let z = if backdrop_at_front { seg.min[2] } else { seg.min[2] };"
+expect = "library_backdrop_anchors_to_the_front"
 
 [[mutation]]
 name = "library-deck-order-flipped"

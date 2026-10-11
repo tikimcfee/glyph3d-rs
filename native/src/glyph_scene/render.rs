@@ -141,7 +141,7 @@ pub(super) fn render_scene(
                 let c = v.read_counters(&ctx.queue);
                 use glyph_field_visible::tables::counter as k;
                 println!(
-                    "CULLDBG visible (frame 0): items {} visible, {} backdrop, {} hidden, {} culled of {} | lines {} candidate: {} glyph, {} wash, {} dropped | segments {} | slots {} ({} dropped) | wash boxes {}",
+                    "CULLDBG visible (frame 0): items {} visible, {} backdrop, {} hidden, {} culled of {} | lines {} candidate: {} glyph, {} wash, {} dropped | segments {} | slots {} ({} dropped) | wash boxes {} ({} past the cap, not drawn)",
                     c[k::ITEMS_VISIBLE],
                     c[k::ITEMS_BACKDROP],
                     c[k::ITEMS_HIDDEN],
@@ -155,6 +155,7 @@ pub(super) fn render_scene(
                     c[k::SLOT_FIT_END],
                     c[k::SLOTS_DROPPED],
                     c[k::WASH],
+                    c[k::WASH].saturating_sub(v.limits().max_wash),
                 );
             }
         }
@@ -222,6 +223,7 @@ pub(super) fn render_scene(
             lod_min_px: if self_drawing { cull.lod_backdrop_px.get() } else { cull.lod_min_px.get() },
             file_backgrounds: cull.file_backgrounds.get(),
             file_bg_color: cull.file_bg_color.get(),
+            backdrop_at_front: cull.backdrop_at_front,
         };
         // No chunks for a self-drawing field: zero chunks means the cull
         // builds no glyph range (and never asks the field for its slot math).

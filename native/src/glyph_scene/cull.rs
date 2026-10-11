@@ -141,6 +141,10 @@ pub(super) struct CullView {
     pub(super) file_backgrounds: bool,
     /// RGBA color for near file background cards.
     pub(super) file_bg_color: [f32; 4],
+    /// Where a far-LOD backdrop sits in depth: the segment's FRONT
+    /// (`max[2]`, its reading surface) when true, its far z (`min[2]`)
+    /// otherwise. The library sets it (`CullState::backdrop_at_front`).
+    pub(super) backdrop_at_front: bool,
 }
 
 /// Stage F — CPU cull: frustum + LOD over the segment table. Returns the
@@ -166,6 +170,7 @@ pub(super) fn cull_segments(
         lod_min_px,
         file_backgrounds,
         file_bg_color,
+        backdrop_at_front,
     } = *view;
     let mut draws: Vec<Vec<std::ops::Range<u32>>> =
         (0..chunk_count).map(|_| Vec::new()).collect();
@@ -216,13 +221,19 @@ pub(super) fn cull_segments(
         let glyph_px = px_scale * em_scale.get(si).copied().unwrap_or(1.0) / dist;
         if glyph_px < lod_min_px {
             if seg.slot_count > 0 {
+                // Backdrops are flat quads anchored at the file space's
+                // far-Z reading surface (seg.min[2]) — except in the library,
+                // where every page has a face just behind the content's FRONT
+                // that writes depth: a backdrop at the far z of a file with a
+                // wrap staircase sat behind its own face, and the page read
+                // BLANK until a pick drew its glyphs into the selection mask
+                // (2026-10-10, Ivan on the kernel tree).
+                let z = if backdrop_at_front { seg.max[2] } else { seg.min[2] };
                 backdrops.push(BackdropInst {
-                    // Backdrops are flat quads anchored at the file space's
-                    // far-Z reading surface (seg.min[2]).
                     min: [seg.min[0], seg.min[1]],
                     max: [seg.max[0], seg.max[1]],
                     rgba: seg.tint,
-                    depth: [seg.min[2], 0.0, 0.0, 0.0],
+                    depth: [z, 0.0, 0.0, 0.0],
                 });
             }
             continue;
@@ -375,6 +386,11 @@ pub(super) struct CullState {
     pub(super) lod_backdrop_px: Cell<f32>,
     pub(super) file_backgrounds: Cell<bool>,
     pub(super) file_bg_color: Cell<[f32; 4]>,
+    /// Far-LOD backdrops at each segment's front, not its far z: true for a
+    /// library load, whose page faces sit between the two (see
+    /// `cull_segments`). False everywhere else, so every other layout's
+    /// backdrops are where they were.
+    pub(super) backdrop_at_front: bool,
     /// seg_count × 32 B staging target for the per-frame backdrop list.
     pub(super) backdrop_insts_buf: wgpu::Buffer,
     pub(super) backdrop_pipeline: wgpu::RenderPipeline,
@@ -580,6 +596,7 @@ impl CullState {
             lod_backdrop_px: Cell::new(crate::config::settings().lod.visible_backdrop_px),
             file_backgrounds: Cell::new(false),
             file_bg_color: Cell::new(crate::config::settings().glyph_scene.file_bg_color),
+            backdrop_at_front: false,
             backdrop_insts_buf,
             backdrop_pipeline,
             backdrop_bind_group,
@@ -653,6 +670,7 @@ mod cull_depth_tests {
             lod_min_px,
             file_backgrounds: false,
             file_bg_color: [0.10, 0.10, 0.13, 0.85],
+            backdrop_at_front: false,
         }
     }
 
@@ -740,6 +758,21 @@ mod cull_depth_tests {
             d.backdrops[0].depth[0], -50.0,
             "backdrop must anchor to seg.min[2] far-z reading surface"
         );
+    }
+
+    /// In the library the backdrop sits on the content's FRONT: the page
+    /// face lies just behind it and writes depth, so a backdrop at the far
+    /// z of a deep file (a wrap staircase) was hidden behind its own face —
+    /// the page read blank at LOD distance until a pick highlighted it
+    /// (2026-10-10, measured on g-pick-repo's wide.txt: 424 units deep).
+    #[test]
+    fn library_backdrop_anchors_to_the_front() {
+        let s = seg([-1.0, -1.0, -50.0], [1.0, 1.0, -40.0]);
+        let mut v = view_clipping_behind_z(-1.0e6, Vec3::new(0.0, 0.0, 0.0), 100.0);
+        v.backdrop_at_front = true;
+        let d = cull_segments(&[s], &[false], &[], &v, 1024, 1);
+        assert_eq!(d.backdrops.len(), 1);
+        assert_eq!(d.backdrops[0].depth[0], -40.0, "a library backdrop must sit on the segment's front (seg.max[2])");
     }
 
     #[test]

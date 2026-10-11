@@ -343,14 +343,16 @@ impl GlyphScene {
         // module header), so Stage F culls on the CPU instead; --no-cull
         // keeps the legacy per-chunk full draws for A/B.
         let cull = if cull_enabled {
-            Some(CullState::new(
+            let mut cull = CullState::new(
                 ctx,
                 POOL_FORMAT, // Stage L (L3): the backdrop pipeline renders into the pool
                 depth_format,
                 &camera_buf,
                 &segments,
                 &groups,
-            ))
+            );
+            cull.backdrop_at_front = staged.controller.as_ref().is_some_and(|c| c.library.is_some());
+            Some(cull)
         } else {
             log::info!("culling disabled (--no-cull) — legacy per-chunk draws");
             None
