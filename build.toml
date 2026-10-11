@@ -1281,6 +1281,26 @@ with = "                q = NONE;"
 expect = "the_tree_cull_draws_what_the_flat_cull_draws_over_synced_boxes"
 
 [[mutation]]
+name = "tree-cull-chain-drops-moved"
+gate = "cargo-test"
+why = "the tree cull's one-visit chain (sheet → mount → file, 2026-10-10) ignoring a move BELOW the chain's head: a file dragged under its mount is tested with its stored load-time box, so it is culled where it was and drawn nowhere when it leaves that box. CONSUMED BY: TreeCull::cull's chain arm, for every library file on every frame; reddens glyph_scene::tree_cull::tests::the_tree_cull_draws_what_the_flat_cull_draws_over_synced_boxes (its file dragged at rest: after any ease every sheet carries the moved flag, which hides this)"
+file = "native/src/glyph_scene/tree_cull.rs"
+op = "replace"
+find = "                    m = m || n.moved;"
+with = "                    let _ = n.moved;"
+expect = "the_tree_cull_draws_what_the_flat_cull_draws_over_synced_boxes"
+
+[[mutation]]
+name = "library-ease-active-set-empty"
+gate = "cargo-test"
+why = "the library's ease skipping the nodes short of their targets (2026-10-10: `tick` eases only `dir_active`/`sheet_active`, built at each replan, instead of scanning every dir and sheet): a page turn or form change starts and nothing moves. CONSUMED BY: Library::replan, behind every page, form, stack and sort command; reddens the library tests that sample an ease mid-flight"
+file = "native/src/library/runtime.rs"
+op = "replace"
+find = "(0..at.len()).filter(|&i| at[i] != target(i))"
+with = "(0..at.len()).filter(|&i| at[i] == target(i))"
+expect = "FAILED"
+
+[[mutation]]
 name = "group-mirror-deferred-forever"
 gate = "cargo-test"
 why = "the deferred CPU mirror of a tree move never written back (2026-10-10: a library move notes its subtree instead of rewriting a group row per file every frame): pick, the verbs and the HUD read every moved file where it was at load, so a click lands on the wrong file and a verb copies a stale row. No golden view moves a nested group. CONSUMED BY: GroupNodes::sync_mirror, which apply_pick, apply_verb and the windowed HUD call before reading groups_cpu; reddens glyph_scene::nodes::tests::a_deferred_mirror_syncs_to_the_eager_rows"
