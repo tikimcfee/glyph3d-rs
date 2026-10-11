@@ -30,6 +30,9 @@ exclude = ["experiments"]
 [workspace.lints.clippy]
 # Every #[allow] says why, in the attribute where rustc carries it (2026-10-11).
 allow_attributes_without_reason = "warn"
+# #[expect] over #[allow]: an expectation the lint stops meeting is itself a
+# warning, so a suppression cannot outlive its cause (2026-10-11).
+allow_attributes = "warn"
 
 [profile.release]
 # Keep debug info in release so future profiling stages stay sane.

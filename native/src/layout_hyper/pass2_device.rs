@@ -46,7 +46,7 @@ pub(crate) trait SlotEmit: Sync {
     /// The general path: one glyph, every field it can carry. A constructor —
     /// its arguments ARE the slot's fields, so a struct of them would be a
     /// second copy of the slot (C3 keeps this allow on purpose).
-    #[allow(clippy::too_many_arguments, reason = "a constructor: its arguments are the slot's fields, and a struct of them would be a second copy of the slot (C3)")]
+    #[expect(clippy::too_many_arguments, reason = "a constructor: its arguments are the slot's fields, and a struct of them would be a second copy of the slot (C3)")]
     fn emit(
         pos_x: f32,
         pos_y: f32,

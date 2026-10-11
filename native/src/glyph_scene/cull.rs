@@ -227,7 +227,7 @@ impl CullAcc {
 
     /// Frustum + LOD for one (non-hidden) segment: its world box, backdrop
     /// tint, slot range, blocks and em scale (`CullState::em_scale`).
-    #[allow(clippy::too_many_arguments, reason = "the segment's fields, unbundled so a computed box needs no SegCull")]
+    #[expect(clippy::too_many_arguments, reason = "the segment's fields, unbundled so a computed box needs no SegCull")]
     pub(super) fn segment(
         &mut self,
         view: &CullView,

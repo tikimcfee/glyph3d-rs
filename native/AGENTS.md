@@ -168,8 +168,10 @@ rebuilt, put one back.
 ## Style discipline
 
 - **Zero warnings** from `cargo build` and `cargo clippy`, always. Fix lints
-  properly; `#[allow]` only when the lint is genuinely wrong for the code,
-  with a one-line justification comment.
+  properly; suppress only when the lint is genuinely wrong for the code, as
+  `#[expect(lint, reason = "...")]` (root `Cargo.toml` `[workspace.lints]`
+  makes a bare `#[allow]` and a missing reason warnings, and an expectation
+  that stops being met is one too).
 - **Fail-loud panics**: this is a binary, not a library. `expect("...")` /
   `assert!` with a diagnostic message is the documented convention — do NOT
   convert to error-returning style. Bare `unwrap()` only in `#[cfg(test)]`.

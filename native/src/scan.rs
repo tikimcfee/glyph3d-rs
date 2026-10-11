@@ -273,7 +273,7 @@ fn fold_range(
 /// APPLY — one chunk: seed from the chunk's exclusive prefix, then walk its
 /// bytes writing the lanes the monoid can answer (row, col, ord, LINE_ADV) and
 /// zeroing everything that is not a laid-out leader.
-#[allow(clippy::too_many_arguments, reason = "the reference scan's APPLY step: the slot lanes, the item tables, and one chunk's prefix and bounds, passed apart; not yet bundled")]
+#[expect(clippy::too_many_arguments, reason = "the reference scan's APPLY step: the slot lanes, the item tables, and one chunk's prefix and bounds, passed apart; not yet bundled")]
 fn apply_chunk(
     slots: &mut Slots,
     items: &[Item],

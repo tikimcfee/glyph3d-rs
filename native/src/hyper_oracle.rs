@@ -406,7 +406,7 @@ fn derived_slot_of(i: &GlyphInstance, p: &ItemParams) -> DerivedSlot {
     )
 }
 
-#[allow(clippy::too_many_arguments, reason = "the three sides of one device-tier comparison: the reference, and both slot formats with their placements")]
+#[expect(clippy::too_many_arguments, reason = "the three sides of one device-tier comparison: the reference, and both slot formats with their placements")]
 pub fn diff_device_item(
     bytes: &[u8],
     params: &ItemParams,

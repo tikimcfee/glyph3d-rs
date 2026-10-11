@@ -145,7 +145,7 @@ struct StagedBlock {
 
 /// Lay out colored text lines into glyph instances, and record the block
 /// (`block_item`, its group row) for its view.
-#[allow(clippy::too_many_arguments, reason = "the text, its placement box and the three outputs it appends to, passed apart; not yet bundled")]
+#[expect(clippy::too_many_arguments, reason = "the text, its placement box and the three outputs it appends to, passed apart; not yet bundled")]
 fn layout_colored_lines(
     trie: &TrieTable,
     lines: &[(String, [u8; 3])],
