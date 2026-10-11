@@ -30,7 +30,11 @@ before. Next is commit 3: cargo-doc on `--workspace` AND `--release` (the
 release profile so the gate never shares `target/debug` and its lock with an
 editor's rust-analyzer; measured 4.6 s, zero warnings, nothing gated on
 `debug_assertions`). The project `rust-analyzer.toml` was deleted, because it
-cannot reach the flycheck.
+cannot reach the flycheck. Commit 3 also found that cargo-modules runs
+`cargo check --compile-time-deps --all-targets` in the default target dir
+(caught with a logging cargo shim on PATH), so the orphans script now sets
+`CARGO_TARGET_DIR=target/orphans`: 564 MB, 29 s cold and 27 s warm, and
+`target/debug` untouched. With that, no gate uses `target/debug`.
 
 ### Commit 1 as built
 
@@ -179,9 +183,9 @@ either way.
 - **Lint baseline.** No `[workspace.lints]`, `clippy.toml` or `rustfmt.toml`.
   23 `#[allow]`s (22 `too_many_arguments`, 1 `single_range_in_vec_init`), none
   with a reason. 39 `unsafe {` blocks, 4 `SAFETY` comments.
-- **The cargo-doc gate only documents `-p glyph3d-native`**
-  (`glyph/src/gates.rs`), so doc links in `crates/*` and `glyph/` are
-  unchecked.
+- **The cargo-doc gate only documented `-p glyph3d-native`**
+  (`glyph/src/gates.rs`), so doc links in `crates/*` and `glyph/` were
+  unchecked. Fixed in commit 3: `--workspace --release`, zero warnings.
 - **The test floor** (`gate_cargo_test`) parses `test result: ok` lines, so
   nextest must never replace `cargo test` inside the gate. nextest prints no
   such lines and skips doctests.

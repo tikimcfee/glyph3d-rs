@@ -219,8 +219,11 @@ Reading and editing, in order of preference (measured 2026-10-11,
   rename. A cold start indexes for about 30 s, and an empty answer before then
   means nothing. `documentSymbol` puts a symbol on its doc comment's first line,
   where a position query finds nothing, so aim at the item's own line. Its
-  check-on-save builds into `target/debug`, which the cargo-doc gate also uses,
-  so a gate can wait on that lock.
+  check-on-save builds into `target/debug`. Every gate runs `--release` (or its
+  own target dir), so no gate waits on rust-analyzer's lock. A project
+  `rust-analyzer.toml` cannot move that check: rust-analyzer reads its flycheck
+  config with no source root, which skips project files
+  (`out/AGENT-TOOLING-2026-10-11.md`).
 - **`pixi run outline <file.rs>`**: every item with its exact start-end lines
   (`tools/ast-grep/outline.yml`).
 - **ast-grep** for syntactic sweeps and rewrites: a dry run by default, `-U`
@@ -338,7 +341,10 @@ It runs with `--all-targets` (since 2026-10-09), so test code is linted too:
 until then 14 test-only lints had piled up unseen, one of them deny-level.
 Blind to anything silenced with `#[allow(...)]`.
 
-**cargo-doc.** `cargo doc --no-deps`, zero warnings. Red when a doc comment names
+**cargo-doc.** `cargo doc --workspace --release --no-deps`, zero warnings (every
+workspace crate since 2026-10-11; before that the renderer alone, so a dead
+link in `crates/` or `glyph/` was read by nothing: `dead-doc-link-crate`
+measured 0 warnings under the old command and 2 under the new one). Red when a doc comment names
 a symbol that no longer exists, or leaves an HTML tag open. It exists because
 renames are constant here and this was the one class the battery could not see:
 two links to `Engine::records` survived its rename to `read_back` through a full
@@ -353,7 +359,9 @@ plus the `glyph` and `resolve-bench` bins, about 30 s in all. The realistic
 loss is a dropped `#[cfg(test)] mod tests;`: the file's tests stop existing,
 and until this gate only the cargo-test floor might have noticed, by count.
 `tests-mod-dropped` proves it. cargo-modules comes from `pixi run setup`, and
-the gate runs under `pixi run`. Blind to a file reached only under a cfg the
+the gate runs under `pixi run`. cargo-modules runs its own `cargo check
+--compile-time-deps` (build scripts, proc macros), so the gate gives it
+`target/orphans`, as cargo-check-no-ui has `target/no-ui`. Blind to a file reached only under a cfg the
 host does not set (target_os branches; non-default features, of which there
 are none today). Also blind to glyph3d-native's own bin: its modules all live
 in the lib, so cargo-modules reports every one of them as an orphan of the bin.

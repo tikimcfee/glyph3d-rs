@@ -348,7 +348,7 @@ scope = "rust"
 kind = "cargo"
 cmd = "doc"
 needs = []
-compare = "rustdoc warning count vs zero — intra-doc links resolve, HTML in prose is closed"
+compare = "rustdoc warning count vs zero over every workspace crate (the renderer alone until 2026-10-11) — intra-doc links resolve, HTML in prose is closed"
 blind_to = "whether the prose is TRUE; it checks that every symbol a doc comment names still exists, not that the sentence around it is current"
 
 # A .rs file no `mod` declaration reaches is not compiled, and rustc says
@@ -629,6 +629,16 @@ find = "/// A layout backend. Bytes and params in, instances into the arena, pla
 with = "/// A layout backend, see [`GlyphArena::no_such_method`]. Bytes and params in, instances into the arena, placements"
 expect = "FAIL  cargo-doc"
 rebuild = "cargo build --release"
+
+[[mutation]]
+name = "dead-doc-link-crate"
+gate = "cargo-doc"
+why = "dead-doc-link's twin outside the renderer: until 2026-10-11 the gate documented glyph3d-native alone, so a dead link in crates/ or glyph/ was read by nothing. CONSUMED BY: rustdoc over glyph-field, reached only through --workspace"
+file = "crates/glyph-field/src/lib.rs"
+op = "replace"
+find = "//! The glyph field's mode-neutral contract.\n"
+with = "//! The glyph field's mode-neutral contract, see [`GlyphFieldMode::NoSuchMode`].\n"
+expect = "FAIL  cargo-doc"
 
 [[mutation]]
 name = "tests-mod-dropped"
