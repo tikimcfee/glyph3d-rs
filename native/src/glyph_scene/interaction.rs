@@ -108,11 +108,14 @@ impl GlyphScene {
                 return;
             };
 
-            let zone_center = self
-                .controller
-                .as_ref()
-                .and_then(|c| c.zone_world_translation(zid))
-                .map(|t| DVec3::new(t[0] as f64, t[1] as f64, t[2] as f64));
+            // A library zone is a directory node of the transform tree
+            // (2026-10-10); every other zone is the controller's bevy entity.
+            let zone_center = if self.has_library() {
+                self.library_zone_translation(zid)
+            } else {
+                self.controller.as_ref().and_then(|c| c.zone_world_translation(zid))
+            }
+            .map(|t| DVec3::new(t[0] as f64, t[1] as f64, t[2] as f64));
 
             let Some(c) = zone_center else {
                 self.grabbed_zone = None;
@@ -134,6 +137,13 @@ impl GlyphScene {
             let d_vec = glam::Vec3::new(delta.x as f32, delta.y as f32, delta.z as f32);
 
             let zid_str = zid.clone();
+            if self.has_library() {
+                if let Some((move_ms, cost)) = self.library_move_zone(ctx, &zid_str, d_vec.to_array()) {
+                    stages.move_ms = move_ms;
+                    stages.record(cost);
+                }
+                return;
+            }
             let t = std::time::Instant::now();
             let moved = self.controller.as_mut().is_some_and(|ctrl| ctrl.move_zone(&zid_str, d_vec));
             stages.move_ms = t.elapsed().as_secs_f64() * 1e3;
@@ -204,10 +214,16 @@ impl GlyphScene {
                 return;
             }
         }
-        // No controller entity for the group: the drag writes its node's
-        // local row (the world delta in its parent's frame).
+        // No controller entity for the group (every group of a library
+        // load, whose files are tree nodes under their mounts): the drag
+        // writes its node's local row — the world delta in its parent's
+        // frame (E10, now through the tree).
+        let t = std::time::Instant::now();
         if self.nodes.translate(gid, d_vec.to_array()) {
-            self.group_node_edited(ctx, gid);
+            stages.move_ms = t.elapsed().as_secs_f64() * 1e3;
+            let h = self.nodes.node(gid).expect("translate found it");
+            let cost = self.mirror_library_move(ctx, &[h]);
+            stages.record(cost);
         }
     }
 
@@ -216,6 +232,12 @@ impl GlyphScene {
         if let Some(ref zid) = self.grabbed_zone {
             let f = 1.1f32.powf(lines);
             let zid_str = zid.clone();
+            if self.has_library() {
+                if self.library_scale_zone(ctx, &zid_str, f) {
+                    println!("grab carrel: zone '{zid_str}' scaled by factor {f:.3}");
+                }
+                return;
+            }
             if let Some(ctrl) = &mut self.controller {
                 if ctrl.scale_zone(&zid_str, f) {
                     let updated_gids = ctrl.sync_gpu_groups(&mut self.groups_cpu);
@@ -432,6 +454,16 @@ struct DragStages {
     sync_ms: f64,
     upload_ms: f64,
     seg_ms: f64,
+}
+
+impl DragStages {
+    /// A tree move's CPU mirror (the library): rows into `sync_ms`, no
+    /// separate upload (the flush does it), segments into `seg_ms`.
+    fn record(&mut self, cost: super::library::MirrorCost) {
+        self.groups = cost.groups;
+        self.sync_ms = cost.mirror_ms;
+        self.seg_ms = cost.seg_ms;
+    }
 }
 
 /// A world-space drag delta in a file card's LOCAL frame: the inverse of its

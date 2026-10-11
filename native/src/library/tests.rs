@@ -1,8 +1,15 @@
 //! The library against the JS scheme's own numbers (the retired renderer's
 //! `tools/contenttree.test.mjs` § library scheme, tests 35-41, and the Book
-//! test arithmetic), plus the scene binding: what a page turn moves.
+//! test arithmetic), plus the scene binding: the tree draws what bevy drew,
+//! and what a page turn moves.
 
 use std::collections::HashMap;
+
+use glyph_scene_graph::{Appearance, NodeHandle, NodeTables, Similarity};
+
+use crate::glyph_scene::mesh::MeshInstance;
+use crate::glyph_scene::GroupRow;
+use crate::spatial_scene::SpatialScene;
 
 use super::book::{contain_fit, deck_slot, ease_k, ease_step, splay_grid, splay_slot, SplayDims};
 use super::plan::{build_tree, flow_boxes, ordered_pack, plan, slot_for, sort_books, stack_extent, Form, LibFile, Opts, Sort, Stack};
@@ -251,22 +258,141 @@ fn library_verbs_parse_and_refuse() {
     assert!(crate::cli::parse_verb("page-next").is_ok(), "--verb reaches the library parser");
 }
 
-/// The scene binding, without a GPU: a file's GroupRow is the composition of
-/// the plan (dir → volume → sheet slot → mount fit), a page turn moves only
-/// its own volume's sheets, and the ease lands every sheet on its new slot.
+/// A library on node tables the way the scene holds it: one flat group node
+/// per file under an identity root (`GroupNodes`), then `attach` moves the
+/// files under their mounts.
+fn attached(files: &[LibFile], s: &crate::config::LibrarySettings) -> (Library, NodeTables, NodeHandle) {
+    let mut lib = Library::new(files.to_vec(), s);
+    let mut t = NodeTables::default();
+    let root = t.insert(None, Similarity::IDENTITY, Appearance::IDENTITY).unwrap();
+    let file_nodes: Vec<NodeHandle> = (0..files.len())
+        .map(|i| {
+            // Whatever the load row was: attach resets it to the identity.
+            let h = t.insert(Some(root), Similarity::from_translation([i as f32 * 7.0, -3.0, 1.0]), Appearance::IDENTITY).unwrap();
+            t.set_group_row(h, Some(i as u32)).unwrap();
+            h
+        })
+        .collect();
+    lib.attach(&mut t, Some(root), &file_nodes);
+    (lib, t, root)
+}
+
+/// The old binding, rebuilt in bevy for the comparison: the hierarchy as
+/// `Library::build` spawned it until 2026-10-10 (root → dir → volume →
+/// sheet → face plate / mount → file card), every node's Transform taken
+/// from the tree's LOCAL row, then bevy's propagation, `sync_all_to_group_
+/// rows` and its mesh extraction — what the renderer drew from.
+fn bevy_reference(lib: &Library, t: &NodeTables, tints: &[[f32; 3]]) -> (Vec<GroupRow>, Vec<MeshInstance>) {
+    use bevy_transform::components::Transform;
+    use glam::{Quat, Vec3};
+    let n = lib.nodes.as_ref().unwrap();
+    let tf = |h: NodeHandle| {
+        let l = t.local(h).unwrap();
+        let q = l.rotation;
+        Transform { translation: Vec3::from(l.translation), rotation: Quat::from_xyzw(q[0], q[1], q[2], q[3]), scale: Vec3::splat(l.scale) }
+    };
+    let mut scene = SpatialScene::new();
+    let root = scene.spawn_root("library_root");
+    let mut dir_e = Vec::new();
+    let mut vol_e = Vec::new();
+    for (d, dp) in lib.plan.dirs.iter().enumerate() {
+        let parent = dp.parent.map_or(root, |i| dir_e[i]);
+        let e = scene.spawn_child(parent, tf(n.dir[d]), "dir");
+        dir_e.push(e);
+        vol_e.push(n.volume[d].map(|v| scene.spawn_child(e, tf(v), "volume")));
+    }
+    for (i, fp) in lib.plan.files.iter().enumerate() {
+        let sheet = scene.spawn_child(vol_e[fp.dir].unwrap(), tf(n.sheet[i]), "sheet");
+        if let Some(face) = &lib.face {
+            let (pw, ph) = (face.size[0], face.size[1]);
+            scene.spawn_plate(sheet, "lib:face", Transform::from_xyz(0.0, 0.0, -face.gap), [pw, ph], [-pw / 2.0, -ph / 2.0], face.color);
+        }
+        let mount = scene.spawn_child(sheet, tf(n.mount[i]), "mount");
+        scene.spawn_file_card(mount, format!("f{i}"), "", i as u32, tf(n.file[i]), ([0.0; 3], [1.0; 3]), tints[i]);
+    }
+    scene.update_transforms();
+    let mut rows: Vec<GroupRow> = tints.iter().map(|t| GroupRow::tinted([0.0; 3], *t)).collect();
+    scene.sync_all_to_group_rows(&mut rows);
+    (rows, scene.mesh_draws().quads.clone())
+}
+
+/// The rows and faces the tree resolves, against bevy's, bit for bit.
+fn assert_tree_matches_bevy(lib: &Library, t: &NodeTables, tints: &[[f32; 3]], what: &str) {
+    let n = lib.nodes.as_ref().unwrap();
+    let (want_rows, want_faces) = bevy_reference(lib, t, tints);
+    let got_rows = crate::library::seated_rows(t, n, tints);
+    for (i, (g, w)) in got_rows.iter().zip(&want_rows).enumerate() {
+        let (gb, wb): (&[u32; 24], &[u32; 24]) = (bytemuck::cast_ref(&g.cols), bytemuck::cast_ref(&w.cols));
+        assert_eq!(gb[..16], wb[..16], "{what}: file {i}'s group row (cols 0-3): tree {:?} bevy {:?}", &g.cols[..4], &w.cols[..4]);
+    }
+    let spec = lib.face.as_ref().expect("the default settings draw faces");
+    let got_faces: Vec<MeshInstance> = n.sheet.iter().map(|&s| crate::glyph_scene::faces::face_instance(&t.world(s).unwrap().0, spec)).collect();
+    assert_eq!(got_faces.len(), want_faces.len(), "{what}: one face per sheet, in file order");
+    for (i, (g, w)) in got_faces.iter().zip(&want_faces).enumerate() {
+        assert_eq!(bytemuck::bytes_of(g), bytemuck::bytes_of(w), "{what}: face {i}: tree {g:?} bevy {w:?}");
+    }
+}
+
+/// The library on the transform tree (2026-10-10) draws what the bevy
+/// hierarchy drew: every file's group row and every page face, bit for
+/// bit, seated, mid-ease, settled after a page turn and a form change, and
+/// after a directory drag and a file drag. Both sum each translation root
+/// first; every other step is a product with 1 or a sum with 0 — so this
+/// holds exactly, and the GPU resolve (same order) draws the same frame
+/// (`translation_chains_resolve_root_first_and_bit_exact`, and the witness
+/// frames in the findings log).
+#[test]
+fn the_tree_resolves_the_rows_bevy_composed() {
+    let s = &crate::config::settings().library;
+    let files = vec![
+        file("a.rs", 41.3, 17.9),
+        file("src/b.rs", 512.7, 1033.1),
+        file("src/c.rs", 3.1, 1.25),
+        file("src/deep/x/y.py", 97.0, 211.6),
+        file("src/deep/z.md", 13.37, 900.0),
+        file("docs/readme.md", 77.7, 66.6),
+        file("docs/n.txt", 0.0, 0.0),
+    ];
+    let tints: Vec<[f32; 3]> = (0..files.len()).map(|i| [0.1 * i as f32, 0.5, 0.9]).collect();
+    let (mut lib, mut t, _root) = attached(&files, s);
+    assert_tree_matches_bevy(&lib, &t, &tints, "seated");
+    // A whole-library form change: every dir and sheet eases.
+    lib.form(&t, None, FormCmd::Set(Form::Splay));
+    for frame in 0..9 {
+        let tick = lib.tick(&mut t, 1.0 / 60.0).expect("animating");
+        assert!(tick.nodes_moved > 0);
+        if frame % 4 == 0 {
+            assert_tree_matches_bevy(&lib, &t, &tints, &format!("splay frame {frame}"));
+        }
+    }
+    while lib.tick(&mut t, 1.0 / 60.0).is_some_and(|k| k.still_animating) {}
+    assert_tree_matches_bevy(&lib, &t, &tints, "splay settled");
+    // A directory drag: one local row, the world delta in its parent's frame.
+    let zone = lib.zone_node("dir:src/deep").expect("a zone per directory");
+    let d = t.parent_world(zone).unwrap().world_delta_to_local([13.25, -7.5, 0.125]);
+    let l = t.local(zone).unwrap();
+    t.set_local(zone, Similarity { translation: [l.translation[0] + d[0], l.translation[1] + d[1], l.translation[2] + d[2]], ..l }).unwrap();
+    // A file drag under its scaled mount (E10, through the tree).
+    let f = lib.nodes.as_ref().unwrap().file[1];
+    let d = t.parent_world(f).unwrap().world_delta_to_local([2.5, 1.0, 0.0]);
+    t.set_local(f, Similarity::from_translation(d)).unwrap();
+    assert_tree_matches_bevy(&lib, &t, &tints, "after the drags");
+    lib.page(&t, None, Page::Next);
+    for _ in 0..5 {
+        lib.tick(&mut t, 1.0 / 60.0);
+    }
+    assert_tree_matches_bevy(&lib, &t, &tints, "mid page turn, dragged");
+}
+
+/// The scene binding, without a GPU: a file's world is the composition of
+/// the plan (dir → volume → sheet slot → mount fit), a page turn writes only
+/// its own volume's sheets (the local rows the GPU uploads), and the ease
+/// lands every sheet on its new slot.
 #[test]
 fn a_page_turn_moves_one_volume_and_settles_on_the_slot_law() {
-    use crate::spatial_scene::SpatialScene;
     let s = &crate::config::settings().library;
     let files = vec![file("d/a.rs", 50.0, 70.0), file("d/b.rs", 10.0, 10.0), file("d/c.rs", 30.0, 5.0), file("e/x.rs", 40.0, 40.0)];
-    let dirs: Vec<String> = files.iter().map(|f| f.rel_path.rsplit_once('/').unwrap().0.to_string()).collect();
-    let tints = vec![[1.0; 3]; files.len()];
-    let mut scene = SpatialScene::new();
-    let mut lib = Library::build(&mut scene, files.clone(), &dirs, &tints, s);
-    scene.update_transforms();
-    let mut groups: Vec<crate::glyph_scene::GroupRow> = tints.iter().map(|t| crate::glyph_scene::GroupRow::tinted([0.0; 3], *t)).collect();
-    scene.sync_all_to_group_rows(&mut groups);
-    scene.world.clear_trackers();
+    let (mut lib, mut t, _root) = attached(&files, s);
 
     let expect = |lib: &Library, f: usize| -> ([f64; 3], f64) {
         let p = &lib.plan;
@@ -276,40 +402,46 @@ fn a_page_turn_moves_one_volume_and_settles_on_the_slot_law() {
         let t = [0, 1, 2].map(|a| d[a] + v[a] + fp.slot[a] + fp.fit.mount[a]);
         (t, fp.fit.scale)
     };
-    for (f, g) in groups.iter().enumerate() {
-        let (t, sc) = expect(&lib, f);
-        for (a, ta) in t.iter().enumerate() {
-            assert!((f64::from(g.cols[0][a]) - ta).abs() < 1e-3, "file {f} axis {a}: {} vs {ta}", g.cols[0][a]);
-            assert!((f64::from(g.cols[3][a]) - sc).abs() < 1e-5, "file {f} scale");
+    let world = |t: &NodeTables, lib: &Library, f: usize| t.world(lib.nodes.as_ref().unwrap().file[f]).unwrap().0;
+    for f in 0..files.len() {
+        let (want, sc) = expect(&lib, f);
+        let w = world(&t, &lib, f);
+        for (a, ta) in want.iter().enumerate() {
+            assert!((f64::from(w.translation[a]) - ta).abs() < 1e-3, "file {f} axis {a}: {} vs {ta}", w.translation[a]);
         }
+        assert!((f64::from(w.scale) - sc).abs() < 1e-5, "file {f} scale");
     }
 
     // Turn the volume holding d/b.rs (file 1); e/ stays put.
-    let reply = lib.page(&scene, Some(1), Page::Next);
+    let reply = lib.page(&t, Some(1), Page::Next);
     assert!(reply.contains("turned 1 of 1"), "{reply}");
-    let mut synced = std::collections::BTreeSet::new();
+    let sheets: Vec<NodeHandle> = lib.nodes.as_ref().unwrap().sheet.clone();
+    let mut moved = std::collections::BTreeSet::new();
     let mut frames = 0;
-    while let Some(tick) = lib.tick(&mut scene, 1.0 / 60.0) {
+    while let Some(tick) = lib.tick(&mut t, 1.0 / 60.0) {
         frames += 1;
-        synced.extend(scene.sync_to_group_rows(&mut groups));
+        for h in &tick.moved {
+            moved.insert(sheets.iter().position(|s| s == h).expect("a page turn moves sheets only"));
+        }
         if !tick.still_animating {
             break;
         }
         assert!(frames < 2000, "the ease never settled");
     }
     assert!(!lib.is_animating());
-    assert_eq!(synced.into_iter().collect::<Vec<_>>(), [0, 1, 2], "only the turned volume's files moved");
-    for (f, g) in groups.iter().enumerate() {
-        let (t, _) = expect(&lib, f);
-        for (a, ta) in t.iter().enumerate() {
-            assert!((f64::from(g.cols[0][a]) - ta).abs() < 1e-2, "settled file {f} axis {a}");
+    assert_eq!(moved.into_iter().collect::<Vec<_>>(), [0, 1, 2], "only the turned volume's sheets moved");
+    for f in 0..files.len() {
+        let (want, _) = expect(&lib, f);
+        let w = world(&t, &lib, f);
+        for (a, ta) in want.iter().enumerate() {
+            assert!((f64::from(w.translation[a]) - ta).abs() < 1e-2, "settled file {f} axis {a}");
         }
     }
     // Page order: page 2 (b.rs) now fronts at z = 0 in its volume.
     assert_eq!(lib.plan.files[1].slot, [0.0; 3]);
     // A settled library does nothing at all.
-    assert!(lib.tick(&mut scene, 1.0 / 60.0).is_none());
+    assert!(lib.tick(&mut t, 1.0 / 60.0).is_none());
     // A form change retargets every volume when nothing is picked.
-    assert!(lib.form(&scene, None, FormCmd::Set(Form::Splay)).contains("2 volume(s)"));
+    assert!(lib.form(&t, None, FormCmd::Set(Form::Splay)).contains("2 volume(s)"));
     assert!(lib.is_animating());
 }

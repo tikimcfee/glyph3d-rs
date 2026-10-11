@@ -247,11 +247,16 @@ its staging text predates C22). Key touchpoints:
   instrument, never the frame path.
 - `GLYPH_LIBRARY_TIMING=1` — `--layout-mode library` (2026-10-10,
   `native/src/library.rs`): one `LIBTIME` line per animated frame — nodes
-  moved, groups synced, the CPU stages (`ease_ms`, `propagate_ms` = bevy
-  transform propagation + scene-mesh re-extraction, each printed after it as `(bevy … extract …)`, `sync_ms`, `upload_ms`,
-  `seg_ms` = `sync_segment` per moved file) and the bytes queued (group rows,
-  page-face mesh instances; the Visible field's item boxes stopped being
-  uploaded on 2026-10-10 — its cull reads the group rows). Animations run on the
+  moved (dir and sheet local rows written), groups synced (file rows
+  mirrored into `groups_cpu`), the CPU stages (`ease_ms`, the easing loop
+  with its local-row writes; `mirror_ms`, the moved subtrees resolved on
+  the CPU into the mirror; `seg_ms` = `sync_segment` per moved file),
+  `local_bytes` (the local rows written, 32 B each) and the PREVIOUS frame's
+  flush (`last_flush_bytes`: every byte the scene graph queued — rows,
+  order span, uniforms; `last_flush_resolved`: nodes the GPU resolved).
+  Since the library moved onto the transform tree (2026-10-10) there is no
+  bevy propagation and no face upload: the page faces are written on the
+  GPU from the sheets' worlds (`glyph_scene/faces.rs`). Animations run on the
   offscreen 1/60 s clock (`SceneLike::animate`), so `--verb page-next
   --frames 120` is a deterministic page turn. A settled library prints
   nothing: it does no work. `out/LIBRARY-LAYOUT-FINDINGS-2026-10-10.md` has
@@ -325,10 +330,13 @@ its staging text predates C22). Key touchpoints:
   applies each move as it arrives, as before, for the A/B.
   `GLYPH_DRAG_TIMING=1` (offscreen or windowed) prints one `DRAGTIME` line
   per applied drag: moves folded in, groups synced, `move_ms` (the
-  controller's transform write + `update_transforms`, split into bevy
-  propagation and scene-mesh re-extraction), `sync_ms`, `upload_ms`,
-  `seg_ms`. Propagation is O(every entity): 0.39 ms for one moved card on a
-  9,241-file library (2026-10-10).
+  transform write; for a bevy-backed controller — the carrel — plus
+  `update_transforms`, split into bevy propagation and scene-mesh
+  re-extraction, both 0 for a library, whose files and zones are tree
+  nodes), `sync_ms` (the CPU mirror), `upload_ms` (0 for a tree move: the
+  frame's flush uploads its one local row), `seg_ms`. Bevy propagation is
+  O(every entity): 0.39 ms for one moved card on a 9,241-file library
+  before the library left bevy (2026-10-10).
 - `GLYPH_POSE_PRINT=1` — windowed: F2 (screenshot) also prints the frame's
   camera as the `--cam-pose X Y Z YAW PITCH` argument (degrees) that
   reproduces it — the same line the Debug panel's "copy pose" button puts on

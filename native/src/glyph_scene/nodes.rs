@@ -67,6 +67,8 @@ pub(crate) struct GroupNodes {
     nodes: Vec<NodeHandle>,
     /// Group id → the appearance the external writer last wrote.
     ext: Vec<[u32; 5]>,
+    /// The last flush's (bytes, resolved, dispatched), for the instruments.
+    last_flush: std::cell::Cell<(u64, u32, bool)>,
 }
 
 impl GroupNodes {
@@ -81,8 +83,14 @@ impl GroupNodes {
     fn cpu_only(groups: &[GroupRow]) -> Self {
         let mut tables = NodeTables::default();
         let root = tables.insert(None, Similarity::IDENTITY, Appearance::IDENTITY).expect("a fresh pool accepts a root");
-        let mut this =
-            Self { tables: RefCell::new(tables), gpu: None, root, nodes: Vec::with_capacity(groups.len()), ext: Vec::with_capacity(groups.len()) };
+        let mut this = Self {
+            tables: RefCell::new(tables),
+            gpu: None,
+            root,
+            nodes: Vec::with_capacity(groups.len()),
+            ext: Vec::with_capacity(groups.len()),
+            last_flush: std::cell::Cell::new((0, 0, false)),
+        };
         for row in groups {
             this.push_row(row);
         }
@@ -183,22 +191,93 @@ impl GroupNodes {
         let (w, alpha) = t.world(h).expect("live");
         let p = t.post_scale(h).expect("live").xyz;
         let a = t.appearance(h).expect("live");
-        row.cols[0] = [w.translation[0], w.translation[1], w.translation[2], row.cols[0][3]];
-        row.cols[1] = w.rotation;
-        row.cols[2] = [a.tint[0], a.tint[1], a.tint[2], alpha];
-        row.cols[3] = [p[0] * w.scale, p[1] * w.scale, p[2] * w.scale, a.blend];
+        write_row(row, &w, alpha, p, &a);
     }
 
     /// Upload the frame's node edits and resolve the moved subtrees into the
     /// group table — first thing in the frame's encoder, before any pass
-    /// reads a group row. A settled scene dispatches nothing.
-    pub(crate) fn flush(&self, ctx: &GpuContext, encoder: &mut wgpu::CommandEncoder) {
-        let Some(gpu) = &self.gpu else { return };
+    /// reads a group row. A settled scene dispatches nothing. Returns what
+    /// the flush did (None without a device); the last one is also kept
+    /// for the instruments (`last_flush`).
+    pub(crate) fn flush(&self, ctx: &GpuContext, encoder: &mut wgpu::CommandEncoder) -> Option<glyph_scene_graph::FlushStats> {
+        let gpu = self.gpu.as_ref()?;
         let stats = gpu.borrow_mut().flush(&ctx.device, &ctx.queue, encoder, &mut self.tables.borrow_mut());
         if stats.dispatched && ctx.profiler.is_some() {
             crate::gpu::record_cpu_scope(ctx, "group nodes flush (CPU)", (stats.cpu_plan_us + stats.cpu_encode_us) / 1e3);
         }
+        self.last_flush.set((stats.bytes, stats.resolved, stats.dispatched));
+        Some(stats)
     }
+
+    /// The last flush's (bytes queued, nodes resolved, dispatched) — the
+    /// previous frame's, when read from `animate`.
+    pub(crate) fn last_flush(&self) -> (u64, u32, bool) {
+        self.last_flush.get()
+    }
+
+    /// The resolve pass's world table (one 32 B `Similarity` per pool slot;
+    /// replaced whenever the pool outgrows it — `FlushStats::grew`).
+    pub(crate) fn world_buffer(&self) -> Option<wgpu::Buffer> {
+        Some(self.gpu.as_ref()?.borrow().world_buffer().clone())
+    }
+
+    pub(crate) fn tables_mut(&mut self) -> &mut NodeTables {
+        self.tables.get_mut()
+    }
+
+    pub(crate) fn tables(&self) -> std::cell::Ref<'_, NodeTables> {
+        self.tables.borrow()
+    }
+
+    /// The identity root every group hangs under.
+    pub(crate) fn root(&self) -> NodeHandle {
+        self.root
+    }
+
+    /// Group `gid`'s node.
+    pub(crate) fn node(&self, gid: u32) -> Option<NodeHandle> {
+        self.nodes.get(gid as usize).copied()
+    }
+
+    /// Group ids `0..n` — a repo load's files — as nodes, in group order.
+    pub(crate) fn file_nodes(&self, n: usize) -> &[NodeHandle] {
+        &self.nodes[..n]
+    }
+
+    /// The CPU mirror of a move: every node in the subtrees of `moved`
+    /// resolved once on the CPU (O(1) a node; `NodeTables::resolve_subtrees`)
+    /// and each one that routes to a group row rewritten into `groups` —
+    /// columns 0-3, exactly as `mirror` writes them. Returns the group ids
+    /// rewritten, ascending in depth-first order.
+    pub(crate) fn mirror_subtrees(&mut self, moved: &[NodeHandle], groups: &mut [GroupRow]) -> Vec<u32> {
+        let t = self.tables.get_mut();
+        let mut hits: Vec<(u32, Similarity, f32, u32)> = Vec::new();
+        t.resolve_subtrees(moved, |slot, row, w, a| {
+            if let Some(r) = row {
+                hits.push((r, *w, a, slot));
+            }
+        });
+        let mut out = Vec::with_capacity(hits.len());
+        for (gid, w, alpha, _) in hits {
+            let Some(&h) = self.nodes.get(gid as usize) else { continue };
+            let Some(row) = groups.get_mut(gid as usize) else { continue };
+            let p = t.post_scale(h).expect("live").xyz;
+            let a = t.appearance(h).expect("live");
+            write_row(row, &w, alpha, p, &a);
+            out.push(gid);
+        }
+        out
+    }
+}
+
+/// Columns 0-3 of a group row from a node's world, inherited alpha, post
+/// scale and appearance — the resolve pass's output, on the CPU (column 0's
+/// w, and columns 4-5, are left as they are).
+fn write_row(row: &mut GroupRow, w: &Similarity, alpha: f32, p: [f32; 3], a: &Appearance) {
+    row.cols[0] = [w.translation[0], w.translation[1], w.translation[2], row.cols[0][3]];
+    row.cols[1] = w.rotation;
+    row.cols[2] = [a.tint[0], a.tint[1], a.tint[2], alpha];
+    row.cols[3] = [p[0] * w.scale, p[1] * w.scale, p[2] * w.scale, a.blend];
 }
 
 #[cfg(test)]

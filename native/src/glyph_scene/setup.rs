@@ -23,7 +23,7 @@ impl GlyphScene {
         ctx: &GpuContext,
         color_format: wgpu::TextureFormat,
         atlas: &Atlas,
-        staged: StagedText,
+        mut staged: StagedText,
         camera_mode: CameraMode,
         cull_enabled: bool,
         field_mode: GlyphFieldMode,
@@ -70,7 +70,19 @@ impl GlyphScene {
         ctx.queue.write_buffer(&group_buf, 0, bytemuck::cast_slice(&groups));
         // The rows as nodes under an identity root: the first frame's resolve
         // rewrites columns 0-3 of every row with the bits uploaded here.
-        let nodes = super::nodes::GroupNodes::new(device, &group_buf, max_groups as u32, &groups);
+        let mut nodes = super::nodes::GroupNodes::new(device, &group_buf, max_groups as u32, &groups);
+        // A library load moves its hierarchy onto those nodes (2026-10-10):
+        // file i's group node goes under its page's mount, and the library
+        // eases its directories and sheets by writing their local rows. Its
+        // page faces are drawn from the sheets' resolved worlds.
+        let library_faces = staged.controller.as_mut().and_then(|c| c.library.as_mut()).and_then(|lib| {
+            let files = nodes.file_nodes(lib.file_count()).to_vec();
+            let root = nodes.root();
+            lib.attach(nodes.tables_mut(), Some(root), &files);
+            let spec = lib.face?;
+            let slots: Vec<u32> = lib.nodes.as_ref().expect("just attached").sheet.iter().map(|h| h.index()).collect();
+            Some(super::faces::LibraryFaces::new(device, &ctx.queue, &spec, &slots))
+        });
         log::info!(
             "emoji sheet bound: {} cells, {} mip levels, {:.1} MiB",
             atlas.emoji.sheet.cells.len(),
@@ -413,6 +425,7 @@ impl GlyphScene {
             params: Cell::new(params),
             mesh_pipeline,
             mesh_frame_bg,
+            library_faces,
             scene_min_y: staged.bounds_min[1],
             environment: super::environment::Environment::new(device, depth_format),
         }
