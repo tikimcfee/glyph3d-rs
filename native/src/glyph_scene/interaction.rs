@@ -26,14 +26,76 @@ impl GlyphScene {
     }
 
     /// Windowed cursor move: while a group or carrel is grabbed (`g` or `c`),
-    /// drag it in the view plane through its center.
+    /// note the drag; `apply_drag` moves it once per frame (from `animate`).
+    /// `GLYPH_DRAG_PER_EVENT=1` applies every move as it arrives, as before
+    /// 2026-10-10 — the A/B for the drag instrument.
     pub fn cursor_moved(&mut self, ctx: &GpuContext, x: f32, y: f32) {
         let prev = self.cursor;
         self.cursor = (x, y);
         if (x - prev.0).abs() + (y - prev.1).abs() < 1e-3 {
             return;
         }
+        if self.grabbed_zone.is_none() && self.grabbed_group.is_none() {
+            return;
+        }
+        self.drag_pending = Some(match self.drag_pending {
+            Some((from, n)) => (from, n + 1),
+            None => (prev, 1),
+        });
+        if std::env::var_os("GLYPH_DRAG_PER_EVENT").is_some() {
+            self.apply_drag(ctx);
+        }
+    }
 
+    /// Apply the pending grab drag: the cursor's whole path since the last
+    /// frame as ONE move in the view plane through the grabbed thing's
+    /// centre (two rays' hits on one plane: the sum of the per-event
+    /// deltas, since every delta lies in that plane). `GLYPH_DRAG_TIMING=1`
+    /// prints a `DRAGTIME` line per applied drag.
+    pub(super) fn apply_drag(&mut self, ctx: &GpuContext) {
+        let Some((prev, events)) = self.drag_pending.take() else { return };
+        let to = self.cursor;
+        let t0 = std::time::Instant::now();
+        let mut stages = DragStages::default();
+        let kind = if self.grabbed_zone.is_some() { "zone" } else { "file" };
+        self.drag_from_to(ctx, prev, to, &mut stages);
+        if std::env::var_os("GLYPH_DRAG_TIMING").is_some() {
+            println!(
+                "DRAGTIME kind={kind} events={events} groups={} move_ms={:.4} (propagate {:.4} extract {:.4}) sync_ms={:.4} upload_ms={:.4} seg_ms={:.4} total_ms={:.4}",
+                stages.groups,
+                stages.move_ms,
+                stages.propagate_ms,
+                stages.extract_ms,
+                stages.sync_ms,
+                stages.upload_ms,
+                stages.seg_ms,
+                t0.elapsed().as_secs_f64() * 1e3,
+            );
+        }
+    }
+
+    /// The controller's moved groups to the GPU: rows, then segments.
+    fn sync_controller_groups(&mut self, ctx: &GpuContext, stages: &mut DragStages) {
+        let Some(ctrl) = &mut self.controller else { return };
+        let t = std::time::Instant::now();
+        let updated_gids = ctrl.sync_gpu_groups(&mut self.groups_cpu);
+        stages.sync_ms = t.elapsed().as_secs_f64() * 1e3;
+        let t = std::time::Instant::now();
+        self.write_group_rows(ctx, &updated_gids);
+        stages.upload_ms = t.elapsed().as_secs_f64() * 1e3;
+        let t = std::time::Instant::now();
+        for &gid in &updated_gids {
+            self.sync_segment(ctx, gid);
+        }
+        stages.seg_ms = t.elapsed().as_secs_f64() * 1e3;
+        stages.groups = updated_gids.len();
+        if let Some(ctrl) = &self.controller {
+            stages.propagate_ms = ctrl.scene.last_update.propagate_ms;
+            stages.extract_ms = ctrl.scene.last_update.extract_ms;
+        }
+    }
+
+    fn drag_from_to(&mut self, ctx: &GpuContext, prev: (f32, f32), (x, y): (f32, f32), stages: &mut DragStages) {
         // Branch 1: Dragging an entire Carrel / LayoutZone (`KeyC`)
         if let Some(ref zid) = self.grabbed_zone {
             let (Some((o0, d0)), Some((o1, d1))) =
@@ -72,14 +134,11 @@ impl GlyphScene {
             let d_vec = glam::Vec3::new(delta.x as f32, delta.y as f32, delta.z as f32);
 
             let zid_str = zid.clone();
-            if let Some(ctrl) = &mut self.controller {
-                if ctrl.move_zone(&zid_str, d_vec) {
-                    let updated_gids = ctrl.sync_gpu_groups(&mut self.groups_cpu);
-                    self.write_group_rows(ctx, &updated_gids);
-                    for &gid in &updated_gids {
-                        self.sync_segment(ctx, gid);
-                    }
-                }
+            let t = std::time::Instant::now();
+            let moved = self.controller.as_mut().is_some_and(|ctrl| ctrl.move_zone(&zid_str, d_vec));
+            stages.move_ms = t.elapsed().as_secs_f64() * 1e3;
+            if moved {
+                self.sync_controller_groups(ctx, stages);
             }
             return;
         }
@@ -134,15 +193,13 @@ impl GlyphScene {
 
         if let Some(ctrl) = &mut self.controller {
             if let Some(&entity) = ctrl.file_entities.get(gid as usize) {
+                let t = std::time::Instant::now();
                 if let Some(mut transform) = ctrl.scene.world.get_mut::<bevy_transform::components::Transform>(entity) {
                     transform.translation += d_vec;
                 }
                 ctrl.scene.update_transforms();
-                let updated_gids = ctrl.sync_gpu_groups(&mut self.groups_cpu);
-                self.write_group_rows(ctx, &updated_gids);
-                for &g in &updated_gids {
-                    self.sync_segment(ctx, g);
-                }
+                stages.move_ms = t.elapsed().as_secs_f64() * 1e3;
+                self.sync_controller_groups(ctx, stages);
                 return;
             }
         }
@@ -359,4 +416,19 @@ impl GlyphScene {
             _ => {}
         }
     }
+}
+
+/// What one applied drag cost (`GLYPH_DRAG_TIMING`).
+#[derive(Default)]
+struct DragStages {
+    groups: usize,
+    /// The controller's move: the transform write and `update_transforms`
+    /// (layout systems, bevy propagation, scene-mesh re-extraction).
+    move_ms: f64,
+    /// `move_ms`'s bevy propagation and scene-mesh re-extraction.
+    propagate_ms: f64,
+    extract_ms: f64,
+    sync_ms: f64,
+    upload_ms: f64,
+    seg_ms: f64,
 }

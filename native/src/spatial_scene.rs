@@ -103,6 +103,23 @@ pub struct SpatialScene {
     pub world: World,
     transform_schedule: Schedule,
     cached_mesh_draws: SceneMeshDraws,
+    /// What the last `update_transforms` cost, by stage (the drag
+    /// instrument reads it, `GLYPH_DRAG_TIMING`).
+    pub last_update: UpdateTimes,
+}
+
+/// `SpatialScene::update_transforms_animated`'s stages, in ms. Measured
+/// 2026-10-10 on a 9,241-file library: propagation is O(every entity) —
+/// 0.39 ms for ONE moved card — while the layout systems and a mesh
+/// re-extraction with nothing moved are ~0.02 ms.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct UpdateTimes {
+    /// Alignments, decks, workdesks.
+    pub layouts_ms: f64,
+    /// The bevy transform schedule (dirty marking, propagation).
+    pub propagate_ms: f64,
+    /// Scene-mesh re-extraction (a full rebuild when any mesh moved).
+    pub extract_ms: f64,
 }
 
 impl Default for SpatialScene {
@@ -130,16 +147,25 @@ impl SpatialScene {
             world,
             transform_schedule,
             cached_mesh_draws: SceneMeshDraws::default(),
+            last_update: UpdateTimes::default(),
         }
     }
 
     /// Run transform propagation with optional delta-time easing for dynamic transitions.
     pub fn update_transforms_animated(&mut self, dt: Option<f32>) {
+        let t0 = std::time::Instant::now();
         self.apply_spatial_alignments();
         self.apply_deck_layouts(dt);
         self.apply_workdesk_layouts(dt);
+        let t1 = std::time::Instant::now();
         self.transform_schedule.run(&mut self.world);
+        let t2 = std::time::Instant::now();
         self.cached_mesh_draws = self.extract_mesh_instances();
+        self.last_update = UpdateTimes {
+            layouts_ms: (t1 - t0).as_secs_f64() * 1e3,
+            propagate_ms: (t2 - t1).as_secs_f64() * 1e3,
+            extract_ms: t2.elapsed().as_secs_f64() * 1e3,
+        };
     }
 
     /// Run transform propagation and update pre-extracted mesh draw cache (instant snap).
