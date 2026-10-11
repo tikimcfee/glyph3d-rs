@@ -1189,12 +1189,12 @@ rebuild = "cargo build --release"
 [[mutation]]
 name = "visible-slot-order-atomic"
 gate = "cargo-test"
-why = "C30 (2026-10-10): the Visible field places every line's slots by a scan in (item, line) order, so the transient slots — the glyph draw order — are arena order on every frame. Reserving them by atomicAdd again (as before C30; an unused counter, so the ranges stay disjoint and inside the cap) makes the draw order whatever order the GPU ran the lines in: where back-stacked wrap segments overlap another line's glyphs, the blended, depth-writing glyph pass resolves the overlap by that order, and the frame flickers run to run. CONSUMED BY: emit_lines' slot base (visible_cull.wgsl), read by the layout kernel's segment entries and so the Derived draw's instance order, judged by native/tests/visible_repeat.rs (repeat renders byte-identical, and equal to derived); nothing else — the oracle tiers and the crate's GPU tests compare slot SETS, not their order"
+why = "C30 (2026-10-10): the Visible field places every line's slots by a scan in (item, line) order, so the transient slots — the glyph draw order — are arena order on every frame. Reserving them by atomicAdd again (as before C30; an unused counter, so the ranges stay disjoint and inside the cap) makes the draw order whatever order the GPU ran the lines in: where back-stacked wrap segments overlap another line's glyphs, the blended, depth-writing glyph pass resolves the overlap by that order, and the frame flickers run to run. CONSUMED BY: emit_lines' slot base (visible_cull.wgsl), read by the layout kernel's segment entries and so the Derived draw's instance order, judged by native/tests/visible_repeat.rs (repeat renders byte-identical, and equal to derived) and, since C32, by the crate's a_shrinking_segment_list_lays_out_no_stale_entry, which compares slots one for one against a twin and runs first, so it is the expected failure; the oracle tiers compare slot SETS, not their order"
 file = "crates/glyph-field-visible/shaders/visible_cull.wgsl"
 op = "replace"
 find = "    let slot_base = base.y;"
 with = "    let slot_base = atomicAdd(&counters[15u], line.glyph_count);"
-expect = "a_visible_frame_repeats_and_is_drawn_in_arena_order"
+expect = "a_shrinking_segment_list_lays_out_no_stale_entry"
 rebuild = "cargo build --release"
 
 [[mutation]]
