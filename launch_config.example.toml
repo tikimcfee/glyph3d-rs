@@ -59,9 +59,6 @@ z_wrap_spacing = 0.15
 # Sequence clustering mode: "cluster" (full grapheme cluster resolution) or "leader"
 cluster_mode = "cluster"
 
-# Syntax color mode on repo load: "syntax" (CPU lexer) or "flat" (geometry only)
-color_mode = "flat"
-
 # Layout engine: "hyper" (default: HyperLayout with background prefetch); "direct",
 # "batch" and "naive" are the same HyperLayout without it (verification forms)
 repo_engine = "hyper"
@@ -69,7 +66,7 @@ repo_engine = "hyper"
 # Glyph field render mode: "derived" (compact 20B slots, zero-copy; the CLI
 # default since 2026-10-11), "instanced" (32B slots; being retired), or
 # "visible" (no slot per glyph: the lines in view are laid out per frame on
-# the GPU — out/VISIBLE-MODE.md; no load-time syntax colour; switchable live
+# the GPU — out/VISIBLE-MODE.md; switchable live
 # from the Debug panel, F8 shows its HUD).
 field_mode = "derived"
 

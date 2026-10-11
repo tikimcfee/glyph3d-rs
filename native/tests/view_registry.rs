@@ -112,16 +112,15 @@ struct Case {
 const ALL_FIELDS: &[&str] = &["derived", "instanced", "visible"];
 
 const CASES: &[Case] = &[
-    Case { name: "repo-wide", args: &["--color-mode", "syntax"], fields: ALL_FIELDS },
+    Case { name: "repo-wide", args: &[], fields: ALL_FIELDS },
     Case {
         name: "repo-highlight",
-        args: &["--focus-file", "alpha.rs", "--zoom", "1", "--color-mode", "syntax", "--highlight", "fixtures/highlight-alpha.tsv"],
+        args: &["--focus-file", "alpha.rs", "--zoom", "1", "--highlight", "fixtures/highlight-alpha.tsv"],
         fields: ALL_FIELDS,
     },
     Case {
         name: "verbs",
         args: &[
-            "--color-mode", "syntax",
             "--pick-file", "long.md", "--verb", "hide-group",
             "--pick-file", "alpha.rs", "--pick-row", "3", "--pick-col", "8",
             "--verb", "recolor-line e01010", "--verb", "set-glyph-background 1010e0",

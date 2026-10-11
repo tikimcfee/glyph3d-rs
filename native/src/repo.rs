@@ -172,8 +172,6 @@ pub struct RepoParams {
     pub tab_width: crate::fold::TabWidth,
     /// Spatial arrangement mode for the repository files across the canvas.
     pub layout_mode: RepoLayoutMode,
-    /// Colorization strategy during load: `Syntax` (eager CPU lexer) or `Flat` (fast geometric load).
-    pub color_mode: ColorMode,
     /// The glyph field the device layout emits for: `Instanced` (32 B
     /// `RenderSlot`) or `Derived` (20 B `DerivedSlot` + line table). The
     /// HyperLayout device path writes the chosen format straight into the
@@ -216,38 +214,6 @@ impl std::str::FromStr for RepoLayoutMode {
     }
 }
 
-/// Colorization strategy during repo load.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, clap::ValueEnum)]
-#[value(rename_all = "lower")]
-pub enum ColorMode {
-    /// Eager CPU syntax coloring during load: `Paint::SyntaxHeuristic`, coloured line by line in Pass 2 (default; the golden repo views use it).
-    #[default]
-    Syntax,
-    /// Fast geometric ingestion: uniform base color for glyphs, file-extension map for LOD backdrop tint.
-    /// Defers per-glyph syntax coloring to external/asynchronous flows.
-    Flat,
-}
-
-impl std::fmt::Display for ColorMode {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            ColorMode::Syntax => write!(f, "syntax"),
-            ColorMode::Flat => write!(f, "flat"),
-        }
-    }
-}
-
-impl std::str::FromStr for ColorMode {
-    type Err = String;
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "syntax" => Ok(ColorMode::Syntax),
-            "flat" => Ok(ColorMode::Flat),
-            other => Err(format!("unknown color mode {other:?}")),
-        }
-    }
-}
-
 impl Default for RepoParams {
     fn default() -> Self {
         Self {
@@ -265,7 +231,6 @@ impl Default for RepoParams {
             cluster_mode: crate::fold::ClusterMode::Leader,
             tab_width: crate::config::settings().layout.tab_width(),
             layout_mode: RepoLayoutMode::Shelf,
-            color_mode: ColorMode::Flat,
             field_mode: glyph_field::GlyphFieldMode::default(),
         }
     }
@@ -384,7 +349,11 @@ pub struct RepoLoad {
     pub bounds_min: [f32; 3],
     pub bounds_max: [f32; 3],
     pub stats: LoadStats,
-    pub color_mode: ColorMode,
+    /// Whether the load painted every glyph one flat colour — every load
+    /// since the syntax heuristic's retirement (2026-10-11). A flat load's
+    /// far-LOD backdrop takes its file's extension tint; a load that painted
+    /// per-glyph colours (spans, at load) would fold them from its slots.
+    pub painted_flat: bool,
     /// Stage G: repo root — the pick path re-reads/re-runs individual files
     /// from it.
     pub root: PathBuf,
@@ -548,8 +517,8 @@ pub fn load_repo_from_prefetched(
 /// colourisers and fields as `--load-repo` — so the Visible field serves it
 /// for real, and the glyph verbs and picks work on it. The views are tiled
 /// (`tile_views`) rather than shelved, each its own group row so the
-/// copies sit side by side; the file paints syntax whatever
-/// `params.color_mode` says (a text view always has).
+/// copies sit side by side. It paints flat like every load (the syntax
+/// heuristic it painted until then was retired the same day).
 ///
 /// The bytes are refused where a walk would skip them: not UTF-8 (the
 /// decode assumes well-formed leads) or past [`MAX_FILE_BYTES`] (the
@@ -572,13 +541,12 @@ pub fn load_file(path: &Path, copies: u32, params: &RepoParams, gpu: Option<&cra
     let mut walk = WalkResult::from_files(vec![RepoFile::in_memory(file_name, bytes)]);
     walk.walk_dur = started.elapsed();
     let file_params = walk.files.iter().map(|f| file_item_params(params, f.bytes.len(), f.newline_count)).collect();
-    let paint_syntax = RepoParams { color_mode: ColorMode::Syntax, ..*params };
     let plan = ViewPlan { buffer_of_view: vec![0; copies.max(1) as usize], placement: Placement::Tiled };
     load_views(
         root,
         PrefetchedRepo { walk, file_params, hyper_data: None },
         plan,
-        &paint_syntax,
+        params,
         Strategy::default(),
         false,
         gpu,
@@ -636,10 +604,10 @@ fn load_views(
     let walk_dur = walk.walk_dur;
 
     let mut stage_dur = std::time::Duration::ZERO;
-    let paint_mode = match params.color_mode {
-        ColorMode::Syntax => Paint::SyntaxHeuristic,
-        ColorMode::Flat => Paint::Flat(crate::layout::DEFAULT_COLOR_PACKED),
-    };
+    // Every load paints flat (2026-10-11): the lexical syntax heuristic is
+    // retired, and colour arrives afterwards as byte spans (`--highlight`,
+    // the seam's style runs), never guessed at load.
+    let paint_mode = Paint::Flat(crate::layout::DEFAULT_COLOR_PACKED);
 
     // Each view's group row: its own index, unless the permutation witness
     // asks otherwise (`group_rows_of_views`). The layout writes it into the
@@ -950,7 +918,7 @@ fn load_views(
         bounds_min,
         bounds_max,
         stats,
-        color_mode: params.color_mode,
+        painted_flat: matches!(paint_mode, Paint::Flat(_)),
         root: root.to_path_buf(),
         controller,
     }
@@ -1006,11 +974,10 @@ impl RepoLoad {
             Vec::new()
         };
         // The visible form has no slots to fold a tint from: its backdrop
-        // takes the flat form's extension tint (no syntax heuristic runs in
-        // that mode, by decision), and no sub-file blocks — the field culls
-        // its own lines.
+        // takes the flat form's extension tint, and no sub-file blocks — the
+        // field culls its own lines.
         let visible = self.arena.is_visible();
-        let is_flat = self.color_mode == ColorMode::Flat || visible;
+        let is_flat = self.painted_flat || visible;
         let file_tints = self.arena.device_slots().map(|d| &d.file_tints);
         let file_blocks = self.arena.device_slots().map(|d| &d.file_blocks);
         let emoji_tint_pairs = self.arena.device_slots().map(|d| &d.emoji_tint_pairs);

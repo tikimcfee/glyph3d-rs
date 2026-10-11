@@ -51,10 +51,6 @@ fn defaults_match_old_parser() {
     assert_eq!(cli.layout_mode, crate::repo::RepoLayoutMode::Shelf);
     assert_eq!(parse_layout_mode("shelf"), crate::repo::RepoLayoutMode::Shelf);
     assert_eq!(parse_layout_mode("carrel"), crate::repo::RepoLayoutMode::Carrel);
-    // Syntax color mode: flat is the default for instant geometric load without unneeded color allocations.
-    assert_eq!(cli.color_mode, crate::repo::ColorMode::Flat);
-    assert_eq!(parse_color_mode("flat"), crate::repo::ColorMode::Flat);
-    assert_eq!(parse_color_mode("syntax"), crate::repo::ColorMode::Syntax);
     assert!(!cli.repo_verify);
     assert!(cli.focus_file.is_none());
     assert!(!cli.repo_scan_only);
@@ -94,7 +90,6 @@ fn scalar_flags_parse() {
         "--repo-engine", "batch", "--repo-verify", "--focus-file", "alpha",
         "--wrap-mode", "back", "--z-wrap-spacing", "0.6", "--cluster-mode", "cluster",
         "--layout-mode", "carrel",
-        "--color-mode", "flat",
         "--render-file", "src/main.rs",
         "--present-mode", "mailbox", "--gpu-key", "--gpu-profile",
         "--emoji-sheet", "sheets/other.bin",
@@ -123,7 +118,6 @@ fn scalar_flags_parse() {
     assert_eq!(cli.z_wrap_spacing, 0.6);
     assert_eq!(cli.cluster_mode, fold::ClusterMode::Cluster);
     assert_eq!(cli.layout_mode, crate::repo::RepoLayoutMode::Carrel);
-    assert_eq!(cli.color_mode, crate::repo::ColorMode::Flat);
     assert!(cli.repo_verify);
     assert_eq!(cli.focus_file.as_deref(), Some("alpha"));
     assert_eq!(cli.render_file, Some(PathBuf::from("src/main.rs")));
@@ -201,14 +195,20 @@ fn an_unknown_layout_mode_is_refused() {
     assert!(text.contains("grid"), "the error must name the bad value: {text}");
 }
 
-/// An unknown color mode is REFUSED at the boundary.
+/// `--color-mode` is RETIRED (2026-10-11, with the syntax heuristic: colour
+/// arrives as byte spans), and refused like any unknown flag — `flat`, the
+/// only behaviour left, included. A command line is retyped each time and
+/// the refusal names the flag; a launch config, which outlives a command
+/// line, still parses `color_mode = "flat"` (`launch_config.rs`).
 #[test]
-fn an_unknown_color_mode_is_refused() {
-    let text = match try_parse(&["--color-mode", "neon"]) {
-        Ok(_) => panic!("clap must refuse an unknown color mode"),
-        Err(e) => e.to_string(),
-    };
-    assert!(text.contains("neon"), "the error must name the bad value: {text}");
+fn the_retired_color_mode_flag_is_refused() {
+    for mode in ["flat", "syntax"] {
+        let text = match try_parse(&["--color-mode", mode]) {
+            Ok(_) => panic!("clap must refuse the retired --color-mode {mode}"),
+            Err(e) => e.to_string(),
+        };
+        assert!(text.contains("--color-mode"), "the error must name the flag: {text}");
+    }
 }
 
 /// The field mode parses every spelling at the boundary and an unknown mode

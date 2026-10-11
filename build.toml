@@ -25,7 +25,7 @@
 # Ratchet, NOT an equality: tests are added constantly, so an exact pin would
 # redden on the most common good action in the repo. A green run whose real
 # count exceeds the floor prints a NOTE naming the value to raise it to.
-test_floor = 391
+test_floor = 392
 # Every golden view is rendered again under each of these and must match the
 # SAME baseline byte for byte (2026-10-09, C20). The plain frames render the
 # Derived field, the default since 2026-10-11 (Instanced retirement step 1);
@@ -202,19 +202,19 @@ cmd = "--render-file fixtures/baseline-view.txt --frames 2"
 # visible-flat/ and adopting any is Ivan's call.
 [[golden_view]]
 name = "repo-wide"
-cmd = "--load-repo fixtures/g-pick-repo --frames 2 --color-mode syntax"
+cmd = "--load-repo fixtures/g-pick-repo --frames 2"
 [[golden_view.exempt]]
 equivalent = "--field-mode visible"
 why = "visible mode paints no syntax (by decision): this frame under it is the stored modes' --color-mode flat render byte for byte, 47,154 px of token colour short of the baseline on vulkan-nvidia, 47,112 on metal-apple (long.md's line numbers, alpha.rs's and deep.py's keywords, wide.txt's source)"
 [[golden_view]]
 name = "repo-down"
-cmd = "--load-repo fixtures/g-pick-repo --frames 2 --wrap-mode down --color-mode syntax"
+cmd = "--load-repo fixtures/g-pick-repo --frames 2 --wrap-mode down"
 [[golden_view.exempt]]
 equivalent = "--field-mode visible"
 why = "visible mode paints no syntax (by decision): this frame under it is the stored modes' --color-mode flat render byte for byte, 222,277 px of token colour short of the baseline on vulkan-nvidia, 222,278 on metal-apple"
 [[golden_view]]
 name = "repo-zoom"
-cmd = "--load-repo fixtures/g-pick-repo --frames 2 --focus-file alpha.rs --zoom 3 --color-mode syntax"
+cmd = "--load-repo fixtures/g-pick-repo --frames 2 --focus-file alpha.rs --zoom 3"
 [[golden_view.exempt]]
 equivalent = "--field-mode visible"
 why = "visible mode paints no syntax (by decision): this frame under it is the stored modes' --color-mode flat render byte for byte, 43,715 px of token colour short of the baseline on both vulkan-nvidia and metal-apple — exactly alpha.rs's punctuation, number and string glyphs; its identifiers match"
@@ -226,7 +226,7 @@ why = "visible mode paints no syntax (by decision): this frame under it is the s
 # `depth-write-off` mutation is what proves this frame sees the class.
 [[golden_view]]
 name = "repo-back-oblique"
-cmd = "--load-repo fixtures/g-pick-repo --frames 2 --cam-pose 30 -120 60 0 -12 --color-mode syntax"
+cmd = "--load-repo fixtures/g-pick-repo --frames 2 --cam-pose 30 -120 60 0 -12"
 [[golden_view.exempt]]
 equivalent = "--field-mode visible"
 why = "visible mode paints no syntax (by decision): this frame under it is the stored modes' --color-mode flat render byte for byte, 256,744 px of token colour short of the baseline on vulkan-nvidia, 256,643 on metal-apple (wide.txt's receding source); its z-order is the same picture"
@@ -257,7 +257,7 @@ cmd = "--render-file fixtures/emoji-cluster-view.txt --frames 2 --zoom 1.25 --cl
 # emoji-cluster, one file at a time).
 [[golden_view]]
 name = "repo-cluster"
-cmd = "--load-repo fixtures/g-cluster-repo --frames 2 --cluster-mode cluster --color-mode syntax"
+cmd = "--load-repo fixtures/g-cluster-repo --frames 2 --cluster-mode cluster"
 [[golden_view.exempt]]
 equivalent = "--field-mode visible"
 why = "visible mode paints no syntax (by decision): this frame under it is the stored modes' --color-mode flat render byte for byte, 29,181 px of token colour short of the baseline on vulkan-nvidia, 29,178 on metal-apple; the sequence pass itself (families, flags, keycaps, the fallbacks) lays out the same glyphs"
@@ -270,7 +270,7 @@ why = "visible mode paints no syntax (by decision): this frame under it is the s
 # is what found the sort the parser lacked.
 [[golden_view]]
 name = "repo-highlight"
-cmd = "--load-repo fixtures/g-pick-repo --frames 2 --focus-file alpha.rs --zoom 1 --color-mode syntax --highlight fixtures/highlight-alpha.tsv"
+cmd = "--load-repo fixtures/g-pick-repo --frames 2 --focus-file alpha.rs --zoom 1 --highlight fixtures/highlight-alpha.tsv"
 
 # ── Gates ────────────────────────────────────────────────────────────────
 # `scope` answers "I changed X, what should I run" — the question the CLI is

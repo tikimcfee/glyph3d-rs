@@ -81,7 +81,6 @@ pub enum SceneChoice {
         cluster_mode: fold::ClusterMode,
         tab_width: fold::TabWidth,
         layout_mode: repo::RepoLayoutMode,
-        color_mode: repo::ColorMode,
         emoji_sheet: PathBuf,
     },
 }
@@ -258,8 +257,8 @@ fn build_scene_impl(
     match choice {
         SceneChoice::Demo => (Box::new(Scene::new(ctx, color_format)), None),
         SceneChoice::Text { file, copies, emoji_sheet, cluster_mode, tab_width, wrap_mode, z_wrap_spacing } => {
-            // A one-file repo load (2026-10-11): HyperLayout, the shared
-            // colourisers and whichever field was asked for, Visible included.
+            // A one-file repo load (2026-10-11): HyperLayout, flat paint and
+            // whichever field was asked for, Visible included.
             let params = repo::RepoParams {
                 wrap_mode: *wrap_mode,
                 z_wrap_spacing: *z_wrap_spacing,
@@ -362,7 +361,6 @@ fn build_scene_impl(
             cluster_mode,
             tab_width,
             layout_mode,
-            color_mode,
             emoji_sheet,
         } => {
             let params = repo::RepoParams {
@@ -371,7 +369,6 @@ fn build_scene_impl(
                 cluster_mode: *cluster_mode,
                 tab_width: *tab_width,
                 layout_mode: *layout_mode,
-                color_mode: *color_mode,
                 field_mode,
                 ..Default::default()
             };

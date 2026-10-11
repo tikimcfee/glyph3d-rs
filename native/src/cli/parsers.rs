@@ -48,12 +48,6 @@ pub fn parse_layout_mode(s: &str) -> crate::repo::RepoLayoutMode {
         .unwrap_or_else(|e| panic!("--layout-mode: {e} (clap should have refused it)"))
 }
 
-/// `--color-mode` -> the repo syntax color mode. Delegates to ColorMode's FromStr.
-pub fn parse_color_mode(s: &str) -> crate::repo::ColorMode {
-    s.parse()
-        .unwrap_or_else(|e| panic!("--color-mode: {e} (clap should have refused it)"))
-}
-
 /// Parse comma-separated RGBA float string into `[f32; 4]`
 pub fn parse_rgba(s: &str) -> Result<[f32; 4], String> {
     let clean = s.trim().trim_start_matches('[').trim_end_matches(']').trim_matches('"');

@@ -126,7 +126,6 @@ fn main() {
                 cluster_mode,
                 tab_width,
                 layout_mode,
-                color_mode,
                 ..
             } = &plan.choice {
                 let dir = dir.clone();
@@ -139,7 +138,6 @@ fn main() {
                     cluster_mode: *cluster_mode,
                     tab_width: *tab_width,
                     layout_mode: *layout_mode,
-                    color_mode: *color_mode,
                     field_mode: plan.cull_opts.field_mode,
                     ..Default::default()
                 };
