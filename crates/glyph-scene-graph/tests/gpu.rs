@@ -250,3 +250,55 @@ fn group_rows_under_an_identity_root_come_back_bit_for_bit() {
         assert_eq!(a, b, "row {i} after the edits");
     }
 }
+
+/// The library's shape (2026-10-10): chains of pure translations — root,
+/// directories, volume, sheet — then a mount carrying a uniform scale and a
+/// file at the identity. Nothing in such a chain can fuse into a different
+/// rounding (every product is with 1, or with a zero offset), so the GPU's
+/// world rows must equal the CPU's bit for bit, and both must be the
+/// ROOT-FIRST sum (bevy's order, which the library's rows were drawn with
+/// before it moved onto these tables). Values are picked so a leaf-first
+/// sum differs in the last bit for most chains.
+#[test]
+fn translation_chains_resolve_root_first_and_bit_exact() {
+    let (device, queue) = device();
+    let mut g = SceneGraph::new(&device);
+    let mut r = Lcg(0x11B2A2);
+    let root = g.tables.insert(None, Similarity::IDENTITY, Appearance::IDENTITY).unwrap();
+    let mut leaves = Vec::new();
+    let mut order_tells = 0;
+    for _ in 0..500 {
+        let depth = 2 + (r.next() % 8) as usize;
+        let mut p = root;
+        let mut sum = 0.0f32;
+        let mut rev: Vec<f32> = Vec::new();
+        for _ in 0..depth {
+            let x = r.range(-300.0, 300.0);
+            sum += x;
+            rev.push(x);
+            p = g.tables.insert(Some(p), Similarity::from_translation([x, r.range(-200.0, 0.0), -32.0]), Appearance::IDENTITY).unwrap();
+        }
+        let leaf_first = rev.iter().rev().fold(0.0f32, |acc, x| x + acc);
+        order_tells += usize::from(leaf_first.to_bits() != sum.to_bits());
+        let s = r.range(0.0086, 4.0);
+        let mount = g.tables.insert(Some(p), Similarity { scale: s, ..Similarity::from_translation([r.range(-30.0, 30.0), r.range(-40.0, 40.0), 0.0]) }, Appearance::IDENTITY).unwrap();
+        let file = g.tables.insert(Some(mount), Similarity::IDENTITY, Appearance::IDENTITY).unwrap();
+        leaves.push((file, sum));
+    }
+    assert!(order_tells > 50, "the corpus must tell the summation orders apart ({order_tells} chains do)");
+    flush(&mut g, &device, &queue);
+    let worlds = g.gpu.read_worlds(&device, &queue, g.tables.slot_count());
+    for (k, &(file, _)) in leaves.iter().enumerate() {
+        let (cpu, _) = g.tables.world(file).unwrap();
+        let gpu = worlds[file.index() as usize];
+        let (c, gg): (&[u32; 8], &[u32; 8]) = (bytemuck::cast_ref(&cpu), bytemuck::cast_ref(&gpu));
+        assert_eq!(c, gg, "chain {k}: gpu {gpu:?} cpu {cpu:?}");
+    }
+    // The CPU reference is the root-first sum (the mount's offset is the
+    // last term, added onto the directories' sum).
+    for (file, sum) in leaves {
+        let mount = g.tables.parent(file).unwrap().unwrap();
+        let m = g.tables.local(mount).unwrap().translation[0];
+        assert_eq!(g.tables.world(file).unwrap().0.translation[0].to_bits(), (sum + m).to_bits());
+    }
+}

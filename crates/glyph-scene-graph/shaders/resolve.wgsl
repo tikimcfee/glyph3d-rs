@@ -3,11 +3,17 @@
 // out/DESIGN-VIEWS-AND-TRANSFORMS-2026-10-10.md).
 //
 // One thread per node; each thread walks its own parent chain to a root,
-// composing bottom-up (acc = local[parent] ∘ acc). That is Wicked Engine's
-// hierarchy update (`Scene::RunHierarchyUpdateSystem`, wiScene.cpp, MIT),
-// moved from CPU jobs onto the GPU: no thread reads another's output, so the
-// pass needs no ordering, no barrier between levels and nothing special for
-// pooled rows. A node's world is a function of its chain's LOCAL rows alone
+// then composes it TOP-DOWN (acc = acc ∘ local[child], from the root to the
+// node). That is Wicked Engine's hierarchy update
+// (`Scene::RunHierarchyUpdateSystem`, wiScene.cpp, MIT), moved from CPU jobs
+// onto the GPU: no thread reads another's output, so the pass needs no
+// ordering, no barrier between levels and nothing special for pooled rows.
+// Top-down rather than bottom-up (2026-10-10, the library on the tree): a
+// world translation is then the parent's world translation plus the child's
+// offset, summed root first — the order bevy_transform's propagation (and
+// every CPU flattener) sums in, so a hierarchy ported off bevy resolves to
+// the same bits. Bottom-up sums the chain leaf first, and float addition
+// does not associate: an ulp here and there across a library. A node's world is a function of its chain's LOCAL rows alone
 // (never of a world row a previous frame left), so resolving a clean node
 // rewrites the bits it had — the host may coalesce ranges freely, and the
 // result never depends on which edits arrived in which frame.
@@ -27,6 +33,7 @@
 const NONE: u32 = 0xFFFFFFFFu;
 const WG: u32 = 64u;
 const MAX_RANGES: u32 = 64u;
+const MAX_CHAIN: u32 = 65u; // tables.rs MAX_DEPTH + 1
 const GROUP_STRIDE: u32 = 6u;
 
 struct Similarity {
@@ -104,18 +111,30 @@ fn resolve(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroup
     let r = range_at(lo);
     let node = order[r.x + (t - r.y)];
 
-    var acc = locals[node];
-    var alpha = appearance[node].tint.w;
+    // The chain, node first: at most max_depth parent steps (a corrupted
+    // cycle cannot hang the GPU), so MAX_CHAIN = MAX_DEPTH + 1 entries.
+    var chain: array<u32, MAX_CHAIN>;
+    var n = 1u;
+    chain[0] = node;
     var p = topo[node].x;
-    var steps = 0u;
     loop {
-        if p == NONE || steps >= params.max_depth {
+        if p == NONE || n > params.max_depth || n >= MAX_CHAIN {
             break;
         }
-        acc = compose(locals[p], acc);
-        alpha = appearance[p].tint.w * alpha;
+        chain[n] = p;
+        n = n + 1u;
         p = topo[p].x;
-        steps = steps + 1u;
+    }
+    var acc = locals[chain[n - 1u]];
+    var alpha = appearance[chain[n - 1u]].tint.w;
+    var k = n - 1u;
+    loop {
+        if k == 0u {
+            break;
+        }
+        acc = compose(acc, locals[chain[k - 1u]]);
+        alpha = alpha * appearance[chain[k - 1u]].tint.w;
+        k = k - 1u;
     }
     worlds[node] = acc;
 

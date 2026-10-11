@@ -158,6 +158,10 @@ pub struct NodeTables {
     dirty_appearance: DirtyBits,
     dirty_topo: DirtyBits,
     dirty_subtree: DirtyBits,
+
+    /// Scratch for [`NodeTables::resolve_subtrees`]: the last world it
+    /// computed per slot (valid only inside one call).
+    cpu_world: Vec<(Similarity, f32)>,
 }
 
 impl Default for NodeTables {
@@ -196,6 +200,7 @@ impl NodeTables {
             dirty_appearance: DirtyBits::default(),
             dirty_topo: DirtyBits::default(),
             dirty_subtree: DirtyBits::default(),
+            cpu_world: Vec::new(),
         }
     }
 
@@ -461,21 +466,75 @@ impl NodeTables {
     }
 
     /// The node's world transform and inherited alpha, composed on the CPU
-    /// in the order the GPU resolve composes it (bottom-up along the chain).
+    /// in the order the GPU resolve composes it: the chain is collected node
+    /// first, then composed TOP-DOWN from its root (`acc = acc ∘ child`), so
+    /// a world translation is summed root first, as bevy_transform sums it.
+    /// O(depth).
     pub fn world(&self, h: NodeHandle) -> Result<(Similarity, f32), NodeError> {
         let i = self.check(h)?;
-        let mut acc = self.local[i];
-        let mut alpha = self.appearance[i].tint[3];
+        let mut chain = [0u32; MAX_DEPTH as usize + 1];
+        let mut n = 1;
+        chain[0] = i as u32;
         let mut p = self.parent[i];
-        let mut steps = 0;
-        while p != NONE && steps < MAX_DEPTH {
-            let pi = p as usize;
-            acc = Similarity::compose(&self.local[pi], &acc);
-            alpha *= self.appearance[pi].tint[3];
-            p = self.parent[pi];
-            steps += 1;
+        while p != NONE && n <= MAX_DEPTH as usize {
+            chain[n] = p;
+            n += 1;
+            p = self.parent[p as usize];
+        }
+        let top = chain[n - 1] as usize;
+        let mut acc = self.local[top];
+        let mut alpha = self.appearance[top].tint[3];
+        for &c in chain[..n - 1].iter().rev() {
+            acc = Similarity::compose(&acc, &self.local[c as usize]);
+            alpha *= self.appearance[c as usize].tint[3];
         }
         Ok((acc, alpha))
+    }
+
+    /// Resolve on the CPU every node in the subtrees of `roots` (each node
+    /// once, however the subtrees nest), depth-first, and hand `f` each
+    /// node's slot, output group row, world transform and inherited alpha —
+    /// the same bits [`Self::world`] gives, at O(1) a node instead of
+    /// O(depth): a node's world is its parent's world composed with its
+    /// local row, and pre-order visits the parent first. This is the CPU
+    /// mirror of a move (the rows pick and the CPU cull read); the GPU
+    /// resolves the same nodes from the dirty ranges.
+    pub fn resolve_subtrees(&mut self, roots: &[NodeHandle], mut f: impl FnMut(u32, Option<u32>, &Similarity, f32)) {
+        self.ensure_order();
+        let mut spans: Vec<(u32, u32)> = roots
+            .iter()
+            .filter(|h| self.is_live(**h))
+            .map(|h| (self.pos[h.index as usize], self.pos[h.index as usize] + self.size[h.index as usize]))
+            .collect();
+        spans.sort_unstable();
+        let mut merged: Vec<(u32, u32)> = Vec::with_capacity(spans.len());
+        for (s, e) in spans {
+            match merged.last_mut() {
+                Some(last) if s <= last.1 => last.1 = last.1.max(e),
+                _ => merged.push((s, e)),
+            }
+        }
+        if self.cpu_world.len() < self.alive.len() {
+            self.cpu_world.resize(self.alive.len(), (Similarity::IDENTITY, 1.0));
+        }
+        for (s, e) in merged {
+            for p in s..e {
+                let n = self.order[p as usize] as usize;
+                let parent = self.parent[n];
+                // The span's first node (and any node whose parent lies
+                // outside the merged span) walks its chain once.
+                let (w, a) = if p == s || parent == NONE || self.pos[parent as usize] < s {
+                    let h = NodeHandle { index: n as u32, generation: self.generation[n] };
+                    self.world(h).expect("an ordered node is live")
+                } else {
+                    let (pw, pa) = self.cpu_world[parent as usize];
+                    (Similarity::compose(&pw, &self.local[n]), pa * self.appearance[n].tint[3])
+                };
+                self.cpu_world[n] = (w, a);
+                let row = self.group_row[n];
+                f(n as u32, (row != NONE).then_some(row), &w, a);
+            }
+        }
     }
 
     /// The world transform of the node's parent (identity for a root): the
@@ -911,7 +970,7 @@ mod tests {
     }
 
     #[test]
-    fn world_composes_the_whole_chain_bottom_up_with_alpha_multiplied() {
+    fn world_composes_the_whole_chain_top_down_with_alpha_multiplied() {
         let mut t = NodeTables::default();
         let root = t.insert(None, Similarity { scale: 2.0, ..Similarity::from_translation([10.0, 0.0, 0.0]) }, Appearance::IDENTITY).unwrap();
         let dir = t
@@ -921,10 +980,63 @@ mod tests {
             .insert(Some(dir), Similarity::from_translation([1.0, 1.0, 1.0]), Appearance { tint: [0.2, 0.4, 0.6, 0.5], ..Appearance::IDENTITY })
             .unwrap();
         let (w, alpha) = t.world(file).unwrap();
-        let expect = Similarity::compose(&t.local(root).unwrap(), &Similarity::compose(&t.local(dir).unwrap(), &t.local(file).unwrap()));
+        // Root first: (root ∘ dir) ∘ file, the order bevy sums in.
+        let expect = Similarity::compose(&Similarity::compose(&t.local(root).unwrap(), &t.local(dir).unwrap()), &t.local(file).unwrap());
         assert_eq!(w, expect);
         assert_eq!(w.translation, [12.0, 12.0, 2.0]);
         assert_eq!(alpha, 0.25);
         assert_eq!(t.parent_world(file).unwrap(), t.world(dir).unwrap().0);
+    }
+
+    /// A translation chain sums root first, which is not the leaf-first sum:
+    /// with these values the two orders differ in the last bit, and the
+    /// resolve must give bevy's (left-to-right) answer.
+    #[test]
+    fn a_translation_chain_sums_root_first() {
+        let mut t = NodeTables::default();
+        let a = t.insert(None, Similarity::from_translation([1.1, 0.0, 0.0]), Appearance::IDENTITY).unwrap();
+        let b = t.insert(Some(a), Similarity::from_translation([2.2, 0.0, 0.0]), Appearance::IDENTITY).unwrap();
+        let c = t.insert(Some(b), Similarity::from_translation([3.3, 0.0, 0.0]), Appearance::IDENTITY).unwrap();
+        let (w, _) = t.world(c).unwrap();
+        assert_eq!(w.translation[0].to_bits(), ((1.1f32 + 2.2) + 3.3).to_bits());
+        assert_ne!(((1.1f32 + 2.2) + 3.3).to_bits(), (1.1f32 + (2.2 + 3.3)).to_bits(), "the example must tell the orders apart");
+    }
+
+    /// `resolve_subtrees` visits every node under the given roots once,
+    /// nested roots included, with exactly the bits `world` composes.
+    #[test]
+    fn resolving_subtrees_on_the_cpu_matches_world_node_for_node() {
+        let mut t = NodeTables::default();
+        let nodes = tree(&mut t);
+        for (k, &h) in nodes.iter().enumerate() {
+            let l = Similarity {
+                translation: [k as f32 * 0.37, -(k as f32) * 1.1, 0.25],
+                scale: 1.0 + k as f32 * 0.125,
+                rotation: [0.0, 0.0, 0.130_526_2, 0.991_444_9],
+            };
+            t.set_local(h, l).unwrap();
+            t.set_appearance(h, Appearance { tint: [1.0, 1.0, 1.0, 0.5 + k as f32 * 0.05], ..Appearance::IDENTITY }).unwrap();
+        }
+        t.set_group_row(nodes[4], Some(9)).unwrap();
+        // nodes[1] and one of its descendants, plus a disjoint subtree.
+        let mut seen = Vec::new();
+        t.resolve_subtrees(&[nodes[4], nodes[1], nodes[5]], |slot, row, w, a| seen.push((slot, row, *w, a)));
+        let mut slots: Vec<u32> = seen.iter().map(|s| s.0).collect();
+        slots.sort_unstable();
+        slots.dedup();
+        assert_eq!(slots.len(), seen.len(), "each node once");
+        let under = |t: &mut NodeTables, h: NodeHandle| {
+            let (s, n) = t.subtree_range(h).unwrap();
+            t.order()[s as usize..(s + n) as usize].to_vec()
+        };
+        let mut want: Vec<u32> = [nodes[1], nodes[5]].iter().flat_map(|&h| under(&mut t, h)).collect();
+        want.sort_unstable();
+        want.dedup();
+        assert_eq!(slots, want);
+        for (slot, row, w, a) in seen {
+            let h = *nodes.iter().find(|h| h.index() == slot).unwrap();
+            assert_eq!((w, a), t.world(h).unwrap(), "slot {slot}");
+            assert_eq!(row, t.group_row(h).unwrap());
+        }
     }
 }
