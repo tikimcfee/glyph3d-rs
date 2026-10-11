@@ -882,6 +882,17 @@ with = "        let z = (0.0 * x_page as f32).mul_add(item.depth_per_col, z_band
 expect = "derived_vertex_stage_agrees_with_instanced"
 
 [[mutation]]
+name = "session-block-origin-z-dropped"
+gate = "cargo-test"
+why = "an agent session staged with an item table that loses each block's z (2026-10-11, Instanced retirement step 1: the Carrel stages one item per text block so the Derived field, now the default, derives y/z where the Instanced field's absolute positions put them). Every Workdesk stack label sits 0.2 in front of its stack; with origin_z gone the Derived vertex stage puts it back at z 0 while the Instanced field keeps it, and no golden view renders a session. CONSUMED BY: agent_transcript::staging::block_item, the item every session block is staged as, read by the Derived field's host transcode and derive_yz; reddens agent_transcript::tests::derived_positions_match_the_staged_ones (the stack labels' z)"
+file = "native/src/agent_transcript/staging.rs"
+op = "replace"
+find = "        origin_z: start_pos[2],"
+with = "        origin_z: 0.0,"
+expect = "derived_positions_match_the_staged_ones"
+rebuild = "cargo build --release"
+
+[[mutation]]
 name = "hyper-pass1-stride-after-advance"
 gate = "cargo-test"
 why = "Pass 1's widest-x takes an unterminated pure-ASCII line's x AFTER its last glyph, as it did before C14: the page stride grows by one advance whenever such a line is an item's widest. No gate corpus has a multi-page item whose widest line is its unterminated last (paged-rows' last line ties a terminated one), so hyper-oracle stays green and the witness is the grid test. CONSUMED BY: ascii_line_max_x, Pass 1's stride for every pure-ASCII line; reddens hyper_oracle::tests::pagination_agrees_on_every_tier (text 1 under row paging, pages_wide > 1)"

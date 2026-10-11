@@ -3,7 +3,7 @@ use bevy_transform::prelude::Transform;
 use glam::{Quat, Vec3};
 
 use crate::agent_transcript::{AgentSession, AgentTurn, TranscriptEvent, TranscriptEventKind};
-use crate::atlas::Atlas;
+use crate::atlas::TrieTable;
 use crate::glyph_scene::{GlyphInstance, GroupRow};
 use crate::layout::GlyphArena;
 use crate::layout_stack::LayoutController;
@@ -112,21 +112,57 @@ pub fn normalize_multiline_text(text: &str) -> std::borrow::Cow<'_, str> {
     }
 }
 
-/// Lay out colored text lines into glyph instances.
+/// The item a text block is staged as: its start position's y and z as the
+/// origin, its line height, no wrap and no pages, drawn with its own group.
+///
+/// One item per block (2026-10-11), so the Derived field — which keeps each
+/// glyph's x and derives y and z in the vertex stage from `item_table[item]`
+/// (`glyph_field_derived::derive::derive_yz`), the item being the glyph's
+/// group id at load — lands every glyph where the Instanced field's absolute
+/// position puts it. With `line_height_lo` 0 and a row count whose product
+/// with the line height is exact, the shader's `fma` and the stager's
+/// `start_y - row * line_h` round the same exact value once each, so the two
+/// agree bit for bit (`derived_positions_match_the_staged_ones` holds them).
+pub(crate) fn block_item(start_pos: [f32; 3], line_h: f32, group_id: u32) -> glyph_field::ItemParamsGpu {
+    glyph_field::ItemParamsGpu {
+        line_height: line_h,
+        origin_y: start_pos[1],
+        origin_z: start_pos[2],
+        group: group_id,
+        ..Default::default()
+    }
+}
+
+/// Record `item` as the item of group `group_id`, padding any gap with plain
+/// items that each name their own index as the group (the load-time
+/// identity the Derived lane relies on).
+fn set_block_item(items: &mut Vec<glyph_field::ItemParamsGpu>, group_id: u32, item: glyph_field::ItemParamsGpu) {
+    let idx = group_id as usize;
+    while items.len() <= idx {
+        let g = items.len() as u32;
+        items.push(glyph_field::ItemParamsGpu { group: g, ..Default::default() });
+    }
+    items[idx] = item;
+}
+
+/// Lay out colored text lines into glyph instances, and record the block's
+/// item (`block_item`) under its group.
 #[allow(clippy::too_many_arguments)]
 fn layout_colored_lines(
-    atlas: &Atlas,
+    trie: &TrieTable,
     lines: &[(String, [u8; 3])],
     start_pos: [f32; 3],
     max_cols: usize,
     max_lines: usize,
     group_id: u32,
     instances: &mut Vec<GlyphInstance>,
+    items: &mut Vec<glyph_field::ItemParamsGpu>,
     codepoints_decoded: &mut usize,
 ) {
-    let fu_per_world = atlas.metrics.em_height_fu as f32 / CELL_HEIGHT_WORLD;
-    let cell_w = atlas.metrics.advance_fu as f32 / fu_per_world;
+    let fu_per_world = trie.metrics.em_height_fu as f32 / CELL_HEIGHT_WORLD;
+    let cell_w = trie.metrics.advance_fu as f32 / fu_per_world;
     let line_h = CELL_HEIGHT_WORLD * LINE_HEIGHT_FACTOR;
+    set_block_item(items, group_id, block_item(start_pos, line_h, group_id));
 
     for (row, (line, color)) in lines.iter().take(max_lines).enumerate() {
         let mut col = 0;
@@ -136,7 +172,7 @@ fn layout_colored_lines(
                 col = (col + 4) & !3;
                 continue;
             }
-            let entry = atlas.lookup(ch as u32);
+            let entry = trie.lookup(ch as u32);
             if (entry.flags & crate::atlas::FLAG_MISSING) == 0 {
                 instances.push(GlyphInstance {
                     pos: [
@@ -1013,7 +1049,7 @@ fn format_revision_card_body(rev: &FileRevision) -> Vec<(String, [u8; 3])> {
 
 /// Stage an Agent Session and its Workdesk into a visual 3D scene with custom layout options.
 pub fn stage_agent_session_with_options(
-    atlas: Option<&Atlas>,
+    trie: Option<&TrieTable>,
     _slot_ink: &[Option<[f32; 4]>],
     session: AgentSession,
     revision_engine: RevisionEngine,
@@ -1049,17 +1085,36 @@ pub fn stage_agent_session_with_options(
     let focus_bounds = Some(([50.0, -10.0], [175.0, 60.0]));
 
     let mut raw_instances = Vec::new();
+    // One item per block, indexed by the block's group id (`block_item`).
+    let mut items: Vec<glyph_field::ItemParamsGpu> = Vec::new();
     let mut codepoints_decoded = 0;
 
-    let fu_per_world = atlas
+    let fu_per_world = trie
         .map(|a| a.metrics.em_height_fu as f32 / CELL_HEIGHT_WORLD)
         .unwrap_or(1000.0);
-    let cell_w = atlas
+    let cell_w = trie
         .map(|a| a.metrics.advance_fu as f32 / fu_per_world)
         .unwrap_or(0.60);
     let line_h = CELL_HEIGHT_WORLD * LINE_HEIGHT_FACTOR;
 
     let mut next_gid = 1u32;
+
+    // The Workdesk stack title labels (staged last, below) each sit at their
+    // stack's own position. They shared group 0 until 2026-10-11; an item
+    // has one origin and a group at load has one item, so each label now
+    // has its own group (identity, as group 0 is). Their ids are reserved
+    // FIRST so the cull's segments — one per group, drawn in group order —
+    // still draw the labels before the cards, as group 0 did.
+    let mut stack_query = controller.scene.world.query::<(
+        &crate::spatial_scene::FileRevisionStack,
+        &bevy_transform::prelude::GlobalTransform,
+    )>();
+    let stacks: Vec<(crate::spatial_scene::FileRevisionStack, glam::Vec3)> = stack_query
+        .iter(&controller.scene.world)
+        .map(|(s, g)| (s.clone(), g.translation()))
+        .collect();
+    let label_gid_base = next_gid;
+    next_gid += stacks.len() as u32;
 
     #[derive(Clone, Copy)]
     struct GroupInfo {
@@ -1169,30 +1224,32 @@ pub fn stage_agent_session_with_options(
             ));
 
             let base_lh = raw_instances.len() as u32;
-            if let Some(atlas) = atlas {
+            if let Some(trie) = trie {
                 layout_colored_lines(
-                    atlas,
+                    trie,
                     &left_hdr,
                     [0.0, 0.0, 0.0],
                     80,
                     4,
                     left_hdr_gid,
                     &mut raw_instances,
+                    &mut items,
                     &mut codepoints_decoded,
                 );
             }
             record_group(left_hdr_gid, &raw_instances, base_lh, &mut group_info);
 
             let base_lb = raw_instances.len() as u32;
-            if let Some(atlas) = atlas {
+            if let Some(trie) = trie {
                 layout_colored_lines(
-                    atlas,
+                    trie,
                     &left_body,
                     [0.0, 0.0, 0.0],
                     usize::MAX,
                     usize::MAX,
                     left_body_gid,
                     &mut raw_instances,
+                    &mut items,
                     &mut codepoints_decoded,
                 );
             }
@@ -1233,30 +1290,32 @@ pub fn stage_agent_session_with_options(
             ));
 
             let base_rh = raw_instances.len() as u32;
-            if let Some(atlas) = atlas {
+            if let Some(trie) = trie {
                 layout_colored_lines(
-                    atlas,
+                    trie,
                     &right_hdr,
                     [0.0, 0.0, 0.0],
                     80,
                     4,
                     right_hdr_gid,
                     &mut raw_instances,
+                    &mut items,
                     &mut codepoints_decoded,
                 );
             }
             record_group(right_hdr_gid, &raw_instances, base_rh, &mut group_info);
 
             let base_rb = raw_instances.len() as u32;
-            if let Some(atlas) = atlas {
+            if let Some(trie) = trie {
                 layout_colored_lines(
-                    atlas,
+                    trie,
                     &right_body,
                     [0.0, 0.0, 0.0],
                     usize::MAX,
                     usize::MAX,
                     right_body_gid,
                     &mut raw_instances,
+                    &mut items,
                     &mut codepoints_decoded,
                 );
             }
@@ -1315,30 +1374,32 @@ pub fn stage_agent_session_with_options(
                 ));
 
                 let base_h = raw_instances.len() as u32;
-                if let Some(atlas) = atlas {
+                if let Some(trie) = trie {
                     layout_colored_lines(
-                        atlas,
+                        trie,
                         &header_lines,
                         [0.0, 0.0, 0.0],
                         80,
                         4,
                         header_gid,
                         &mut raw_instances,
+                        &mut items,
                         &mut codepoints_decoded,
                     );
                 }
                 record_group(header_gid, &raw_instances, base_h, &mut group_info);
 
                 let base_b = raw_instances.len() as u32;
-                if let Some(atlas) = atlas {
+                if let Some(trie) = trie {
                     layout_colored_lines(
-                        atlas,
+                        trie,
                         &body_lines,
                         [0.0, 0.0, 0.0],
                         usize::MAX,
                         usize::MAX,
                         body_gid,
                         &mut raw_instances,
+                        &mut items,
                         &mut codepoints_decoded,
                     );
                 }
@@ -1347,38 +1408,32 @@ pub fn stage_agent_session_with_options(
         }
     }
 
-    // 3. Workdesk Stack Title Labels (queried directly from ECS into Group 0)
-    let mut stack_query = controller.scene.world.query::<(
-        &crate::spatial_scene::FileRevisionStack,
-        &bevy_transform::prelude::GlobalTransform,
-    )>();
-    let stacks: Vec<(crate::spatial_scene::FileRevisionStack, glam::Vec3)> = stack_query
-        .iter(&controller.scene.world)
-        .map(|(s, g)| (s.clone(), g.translation()))
-        .collect();
-
-    let base_labels = raw_instances.len() as u32;
-    if let Some(atlas) = atlas {
-        for (stack, trans) in stacks {
+    // 3. Workdesk Stack Title Labels (stacks queried from ECS above; one
+    // group and item per label, ids reserved before the cards)
+    if let Some(trie) = trie {
+        for (i, (stack, trans)) in stacks.into_iter().enumerate() {
             let rev_count = revision_engine
                 .history(&stack.file_path)
                 .map(|h| h.revisions.len())
                 .unwrap_or(stack.revision_count);
             let short_name = format_short_file_name(&stack.file_path);
             let label = format!("{} (R{})", short_name, rev_count);
+            let label_gid = label_gid_base + i as u32;
+            let base_label = raw_instances.len() as u32;
             layout_colored_lines(
-                atlas,
+                trie,
                 &[(label, pal().emphasis)],
                 [trans.x + 1.0, trans.y + 2.0, trans.z + 0.2],
                 55,
                 1,
-                0,
+                label_gid,
                 &mut raw_instances,
+                &mut items,
                 &mut codepoints_decoded,
             );
+            record_group(label_gid, &raw_instances, base_label, &mut group_info);
         }
     }
-    record_group(0, &raw_instances, base_labels, &mut group_info);
 
     // Update global transforms for all child glyph fields
     controller.scene.update_transforms();
@@ -1394,8 +1449,10 @@ pub fn stage_agent_session_with_options(
         .map(|b| b.group_id)
         .max()
         .unwrap_or(0);
-    let total_groups = (max_gid + 1) as usize;
+    // Every allocated id has a row: the label groups carry no ECS binding.
+    let total_groups = ((max_gid + 1).max(next_gid)) as usize;
     let mut groups = vec![GroupRow::identity([0.0, 0.0, 0.0]); total_groups.max(1)];
+    let group_count = groups.len();
     controller.scene.sync_all_to_group_rows(&mut groups);
 
     // Build per-group SegCull segments so frustum culling actively culls off-screen cards
@@ -1455,19 +1512,30 @@ pub fn stage_agent_session_with_options(
         segments,
         pick: None,
         controller: Some(controller),
-        item_params: Vec::new(),
+        item_params: session_item_params(items, group_count),
     }
+}
+
+/// The staged item table: one item per group row, the blocks' own where a
+/// block was staged, a plain item naming its own group everywhere else (a
+/// group with no glyphs reads none of it).
+fn session_item_params(mut items: Vec<glyph_field::ItemParamsGpu>, group_count: usize) -> Vec<glyph_field::ItemParamsGpu> {
+    if group_count > items.len() {
+        let last = group_count as u32 - 1;
+        set_block_item(&mut items, last, glyph_field::ItemParamsGpu { group: last, ..Default::default() });
+    }
+    items
 }
 
 /// Stage an Agent Session and its Workdesk into a visual 3D scene with default options.
 pub fn stage_agent_session(
-    atlas: Option<&Atlas>,
+    trie: Option<&TrieTable>,
     slot_ink: &[Option<[f32; 4]>],
     session: AgentSession,
     revision_engine: RevisionEngine,
 ) -> StagedText {
     stage_agent_session_with_options(
-        atlas,
+        trie,
         slot_ink,
         session,
         revision_engine,
