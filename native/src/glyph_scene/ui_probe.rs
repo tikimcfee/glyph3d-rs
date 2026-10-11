@@ -168,7 +168,7 @@ pub struct UiProbeState {
     /// The scene's cluster mode, for the panel's toggle label. Seeded at
     /// install — repo scenes from the pick context's uniform ItemParams,
     /// text scenes from the staging choice (GlyphScene::probe_cluster_mode);
-    /// None where the scene carries no mode (demo, engine-text) ⇒ the panel
+    /// None where the scene carries no mode (demo, agent session) ⇒ the panel
     /// hides the toggle.
     pub cluster_mode: Option<bool>,
     /// Canvas layout arrangement mode (repo scenes): shelf vs carrel. None for non-repo scenes.
@@ -305,7 +305,7 @@ impl GlyphScene {
         // read it off the pick context's uniform-per-field params (the same
         // read as the dial's seed); text scenes carry it on
         // `probe_cluster_mode` instead (no pick context there). Demo and
-        // engine-text scenes: None — the panel hides the toggle.
+        // agent-session scenes: None — the panel hides the toggle.
         let cluster_mode = self
             .pick
             .as_ref()

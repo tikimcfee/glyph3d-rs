@@ -149,7 +149,6 @@ fn main() {
             let emoji_sheet_path = match &plan.choice {
                 SceneChoice::Repo { emoji_sheet, .. } => Some(emoji_sheet.clone()),
                 SceneChoice::Text { emoji_sheet, .. } => Some(emoji_sheet.clone()),
-                SceneChoice::EngineText { emoji_sheet, .. } => Some(emoji_sheet.clone()),
                 SceneChoice::AgentSession { emoji_sheet, .. } => Some(emoji_sheet.clone()),
                 _ => None,
             };

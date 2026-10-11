@@ -147,9 +147,6 @@ pub struct Cli {
     /// Point it at another G3ES file to swap the sheet without a rebuild.
     #[arg(long, value_name = "PATH")]
     pub emoji_sheet: Option<PathBuf>,
-    /// Stage E1: render engine records through the Slug renderer
-    #[arg(long, value_name = "PATH")]
-    pub engine_render: Option<PathBuf>,
     /// Fixture parity: lay each .pipe.bin with the CPU reference fold and diff
     /// BIT-EXACT against the oracle's own expected lanes, then exit.
     #[arg(long, value_name = "PATH", num_args = 1..)]
@@ -487,7 +484,7 @@ fn merge_launch_config(cli: &mut Cli, matches: &clap::ArgMatches, cfg: crate::la
     under!(debug_tint);
     under!(present_mode);
     under!(Some frames);
-    let scene_typed = ["demo", "agent_session", "load_repo", "render_file", "engine_render"]
+    let scene_typed = ["demo", "agent_session", "load_repo", "render_file"]
         .into_iter()
         .any(typed);
     if !scene_typed {
