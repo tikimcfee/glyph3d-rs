@@ -730,6 +730,16 @@ fn the_frame_path_culls_lays_out_and_draws() {
     assert_eq!(k2, k, "a capped frame repeats its counters");
     assert_slots_equal(&small.read_slots(&queue, k2[tables::counter::SLOT_FIT_END]), &fit, "a capped frame repeats its slots");
 
+    // 6b. A wash cap that binds: the boxes past it draw nothing, and the
+    //     stats say how many (2026-10-10: they said "0 dropped" before).
+    let few = VisibleField::new(&device, &queue, &inp, &dummy.resources(&params), TARGETS, VisibleLimits { max_slots: 1 << 16, max_segments: 1 << 12, max_wash: 4 });
+    for _ in 0..4 {
+        run_frame(&device, &queue, &few, &frame(0.0, 1e9, 0.0, 2, 0));
+    }
+    assert_eq!(few.read_counters(&queue)[tables::counter::WASH], lines, "every line reserves its box");
+    assert_eq!(few.stats().wash_dropped, lines - 4, "the stats count the wash boxes past the cap");
+    assert_eq!(field.stats().wash_dropped, 0);
+
     // 7. The stats ring: after a few frames the readback has landed.
     for _ in 0..4 {
         run_frame(&device, &queue, &field, &frame(0.0, 0.0, 0.0, 1, 0));

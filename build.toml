@@ -1180,6 +1180,16 @@ with = "                let z = if backdrop_at_front { seg.min[2] } else { seg.m
 expect = "library_backdrop_anchors_to_the_front"
 
 [[mutation]]
+name = "visible-wash-drops-uncounted"
+gate = "cargo-test"
+why = "the Visible field's stats without the wash boxes past VisibleLimits::max_wash, as before 2026-10-10: the cull silently writes none of them (those lines draw nothing, the last in (item, line) order) while the HUD and CULLDBG said '0 dropped' — a kernel-tree library view reserved 1,264,446 boxes against the then 1,048,576 cap. CONSUMED BY: VisibleStats::wash_dropped (F8 HUD, the windowed HUD line); reddens the_frame_path_culls_lays_out_and_draws (glyph-field-visible tests/gpu.rs, step 6b)"
+file = "crates/glyph-field-visible/src/gpu.rs"
+op = "replace"
+find = "            wash_dropped: c[counter::WASH].saturating_sub(self.limits.max_wash),"
+with = "            wash_dropped: c[counter::WASH].saturating_sub(u32::MAX),"
+expect = "the_frame_path_culls_lays_out_and_draws"
+
+[[mutation]]
 name = "library-deck-order-flipped"
 gate = "cargo-test"
 why = "the Book's deck slot law with its order ignored: every deck reads by recency (an agent book, newest front) instead of a library volume's page order, so turning a volume sends pages the wrong way round the rolodex. No golden view renders the library (it is a probe, 2026-10-10); the slot law's own test and the scene test that turns a volume and checks every settled group row against the plan are the witnesses. CONSUMED BY: library::book::deck_slot, which every z-stack volume's sheets are placed by; reddens library::tests::deck_slot_law_reads_page_order_or_recency"
