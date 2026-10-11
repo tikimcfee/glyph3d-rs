@@ -35,8 +35,12 @@ against `build.toml` that day; `cargo glyph gates` is the live list.)
   `--field-mode derived|visible|instanced`, switchable live from the Debug panel.
   **Derived is the default since 2026-10-11** (Instanced retirement, step 1 of
   three: no pixel moved — the plain golden frames now render Derived, byte-equal
-  to the baselines they always had). Step 2 makes `--render-file` a one-item
-  repo load; step 3 deletes `glyph-field-instanced`. Until then Instanced stays
+  to the baselines they always had). Step 2 (2026-10-11) made `--render-file`
+  a one-item repo load (`repo::load_file`: HyperLayout, the shared
+  colourisers and every field — Visible for real — with `--copies N` as N
+  views over the one buffer, tiled); it moved the pixels of `text`, `emoji`
+  and `emoji-cluster`, which await adoption (pixel-ab, below). Step 3 deletes
+  `glyph-field-instanced`. Until then Instanced stays
   a mode, held byte-equal by the `--field-mode instanced` golden equivalent, and
   is still the fall-back for a load past the Derived lanes. The agent-session
   Carrel stages one item per text block (`agent_transcript::staging::block_item`)
@@ -503,8 +507,9 @@ puts a `return` across every intra-line cut, so the tail half has a witness
 `hyper-cut-tail-own-share`, `hyper-comment-line-indent-painted`, and on the
 colourisers' unit tests `colorizer-fills-any-word-colour` and
 `colorizer-last-word-unflushed`. Shared and unjudged: the heuristic's own
-rules, and `--render-file`'s tokenizer (`stage_file`), a third copy no tier
-reads. Measured but ungated (2026-10-09): a 94 MB tree of crates.io sources
+rules (`--render-file` paints with these same colourisers since 2026-10-11;
+`stage_file`'s tokenizer, the third copy no tier read, is gone with it).
+Measured but ungated (2026-10-09): a 94 MB tree of crates.io sources
 is bit-exact on every tier in both modes (99 M records).
 **Tab stops** (2026-10-11, `fold::TabWidth`; `[layout] tab_width_cells` /
 `--tab-width`, default 1). A tab advances to the next multiple of N display
@@ -575,6 +580,23 @@ commit that culled `long.md`'s far lines (`048d403`, repaired by `9c96ad1`)
 and per-chunk syntax colouring (`8b28f1f`, C17). A red gate stops seeing the
 NEXT change too).
 
+**Red on three frames since step 2 (2026-10-11), on purpose.** `--render-file`
+became a one-item repo load, which moved `text`, `emoji` and `emoji-cluster`
+on vulkan-nvidia and left every other frame byte-equal. Every moved pixel is
+attributed, each cause measured by toggling it alone, in
+`out/DESIGN-VIEWS-SLABS-POSES-2026-10-11.md` § 9: `text` 71,020 px, all of
+it TABS (the fold advances a tab one trie advance where the text stager
+stopped at 4-cell tab stops, and the block it frames narrows with it);
+`emoji` 3,372 px of edge flips (x as the fold's f32 running sum, and the
+camera fit an ulp wider from it); `emoji-cluster` 2,217 px (1,121 the shared
+colouriser's `#` comment painting `bare:` after a keycap, the rest the same
+summation). Candidates and diff images are in
+`out/tooling-ab/sweep/candidates/step2-render-file/vulkan-nvidia/`
+(untracked; metal-apple's must be rendered on that host). Until a human
+adopts them the gate is red on those three plain and under both
+equivalents, and `glyph prove` reports every pixel-ab mutation's gate
+ALREADY RED.
+
 **One golden set per rasterizer, since 2026-09-07.** `<key>` is what the
 renderer prints from `--gpu-key`: `<backend>-<vendor>` off the adapter wgpu
 actually picked (`metal-apple`, `vulkan-nvidia`), resolved by the runner from
@@ -634,9 +656,9 @@ plain frame equal is the VARIANT breaking — never a reason to re-baseline.
 
 **The Visible field as an equivalent, with named exemptions (M4, 2026-10-10).**
 The second entry is `--field-mode visible`. Measured on both sets before it
-was added: `demo` (no field), `text`, `emoji` and `emoji-cluster` (a
-`--render-file` scene has no line table and falls back to Derived — Instanced
-until 2026-10-11 — which the load says) and `repo-highlight` (visible mode for real: the sidecar's
+was added: `demo` (no field), `text`, `emoji` and `emoji-cluster` (then a
+`--render-file` scene had no line table and fell back to a stored field)
+and `repo-highlight` (visible mode for real: the sidecar's
 spans over alpha.rs) render their baselines byte for byte; the five
 syntax-painted repo views do not, and the difference is exactly the
 load-time syntax paint, which visible mode does not apply by decision —
@@ -657,6 +679,12 @@ equivalent holds visible mode to pixels on ONE frame (repo-highlight;
 hold it on their cameras too, and candidate frames for those live in
 `out/tooling-ab/sweep/candidates/visible-flat/` (byte-identical to the
 visible renders and to the stored modes' flat render) for Ivan to adopt or not.
+**Since step 2 (2026-10-11)** `--render-file` is a one-item repo load, so
+`text`, `emoji` and `emoji-cluster` are visible mode for real under this
+entry, and render flat like the five: each is its step-2 frame's flat-paint
+twin byte for byte (32,439 / 43,726 / 31,419 px of token colour short of
+the step-2 frames on vulkan-nvidia). They are not exempt; whether they join
+the five is decided when their step-2 frames are adopted.
 
 **Which view covers what, because the answer is not uniform.** `repo-wide`
 renders the default wrap mode (`back` — a wrap costs DEPTH); `repo-down` exists
@@ -675,7 +703,8 @@ throughout, because a golden cannot tell a wrong picture from a right one.
 The `depth-write-off` mutation proves the new frame reddens on that class.
 `emoji` (2026-09-10) is the only frame that samples the colour-emoji sheet —
 web-era slots re-pointed at it, appended slots, slots the font cannot draw,
-and emoji-in-the-font-that-stay-text, all through the CPU staging path — so
+and emoji-in-the-font-that-stay-text, all through `--render-file` (a
+one-item repo load since 2026-10-11, the CPU text stager before) — so
 it is the only frame that can see a cell placement, inset, flip or alpha
 error, none of which any numeric gate can see because the layout is
 untouched. `emoji-uv-flip` proves it reddens. Expect MORE cross-vendor drift
@@ -687,8 +716,10 @@ frames draw through since 2026-10-11 implements the same emoji branch, and
 the statement moves with step 3), so a platform whose emoji edges differ
 while its text does not has a checklist.
 `emoji-cluster` and `repo-cluster` (2026-09-20) pin the SEQUENCE PASS — one
-frame per path: the former through `--render-file` (the CPU staging twin),
-the latter through `--load-repo` (the repo load end to end). One line per
+frame per path: the former through `--render-file`, the latter through
+`--load-repo` (the repo load end to end). Until 2026-10-11 the former was
+the CPU text stager's own copy of the sequence pass; both frames run
+HyperLayout's since, the one-file load and the five-file one. One line per
 sequence class the trie resolves (families, flags, skin tones, keycaps, tag
 flags) plus the fallbacks (unlisted chains stay pieces, ZWJ/VS16 zero-width);
 the `cluster-static-zero-off` mutation proves they redden. The `emoji` view

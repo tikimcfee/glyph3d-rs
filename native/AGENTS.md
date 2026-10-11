@@ -103,7 +103,8 @@ caller; the short version:
   - `derived` (20 B per glyph; THE DEFAULT since 2026-10-11, Instanced
     retirement step 1 — no golden pixel moved): compact word layout, x stored,
     Y/Z derived in the vertex stage from the item table. Host-staged scenes
-    (`--render-file`, agent sessions) transcode their 48 B records against
+    (agent sessions; `--render-file` too until it became a one-item repo
+    load, 2026-10-11) transcode their 48 B records against
     their own item table — the agent-session Carrel stages one item per text
     block (`agent_transcript::staging::block_item`) so derived y/z equal the
     absolute ones bit for bit. `nudge-glyph` y/z and `scale-glyph` have no
@@ -264,9 +265,10 @@ its staging text predates C22). Key touchpoints:
   sequence or no ASCII-led one. `GLYPH_HYPER_ORACLE_NO_GPU` skips the visible
   tier (the GPU kernel vs Pass 2) on a host without a usable adapter, and says
   so; the gate never sets it.
-- `GLYPH_PERMUTE_GROUP_ROWS=1` — repo loads only: files the walked files
-  under their group rows in REVERSE, with row 0 a spare no file draws with
-  (`repo::group_rows_of_files`), so no view's group row equals its index.
+- `GLYPH_PERMUTE_GROUP_ROWS=1` — repo loads (and `--render-file`, a
+  one-item repo load since 2026-10-11): files the views under their group
+  rows in REVERSE, with row 0 a spare no view draws with
+  (`repo::group_rows_of_views`), so no view's group row equals its index.
   The view registry's witness (`crate::views`, 2026-10-11):
   `native/tests/view_registry.rs` renders `g-pick-repo` with and without it
   and requires byte-equal frames in every field. Every pick line names both
