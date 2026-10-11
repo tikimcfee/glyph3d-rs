@@ -98,8 +98,9 @@ HyperLayout slot for slot. Everything here stays inert for `instanced` and
 the 93 MB crates tree (2026-10-10, this box): backend 11-22 ms where the
 stored modes wrote a 1.8 GB slot stream for ~460 ms; offscreen frames of the
 default view at ~0.7 ms. Not yet in this mode: syntax colour (by decision —
-colour arrives as byte-range spans), selection and the slot verbs (M3), the
-golden equivalence (M4).
+colour arrives as byte-range spans; since 2026-10-11 no mode has it, the
+heuristic being retired), selection and the slot verbs (M3), the golden
+equivalence (M4).
 
 **What runs when `visible` is selected.** `repo::prefetch_repo` runs Pass 1
 in the background WITH the line table (`prefetch_hyper(.., field_mode)`);
@@ -495,6 +496,14 @@ and every exemption under pixel-ab. Mutation `visible-row-off-by-one`
 (every visible-mode glyph one row down) reddens the gate on
 `repo-highlight.png … under --field-mode visible` and nothing else.
 
+*(2026-10-11: the syntax heuristic was retired — every load in every mode
+paints flat — and every golden frame now renders the same bytes plain,
+under Instanced and under Visible (vulkan-nvidia, 30 of 30). The five
+exemptions were removed; the mechanism stays. The decision this section
+recorded as visible mode's alone, "no load-time syntax heuristic", now
+holds for every mode. `--color-mode` is refused since, so the commands
+below and in § C32 no longer pass it.)*
+
 **For Ivan (option c, his call).** Flat twins of the five views would hold
 visible mode to pixels on the same cameras: `--color-mode flat` renders of
 repo-wide / repo-down / repo-zoom / repo-back-oblique / repo-cluster are in
@@ -520,7 +529,7 @@ cargo glyph test render
 # The listing: equivalents and exemptions under pixel-ab.
 cargo glyph gates
 # A view under visible mode, by hand (from native/):
-../target/release/glyph3d-native --load-repo fixtures/g-pick-repo --frames 2 --focus-file alpha.rs --zoom 1 --color-mode syntax --highlight fixtures/highlight-alpha.tsv --field-mode visible --screenshot ../out/tooling-ab/sweep/repo-highlight@visible.png
+../target/release/glyph3d-native --load-repo fixtures/g-pick-repo --frames 2 --focus-file alpha.rs --zoom 1 --highlight fixtures/highlight-alpha.tsv --field-mode visible --screenshot ../out/tooling-ab/sweep/repo-highlight@visible.png
 cmp ../out/tooling-ab/sweep/repo-highlight@visible.png ../out/tooling-ab/baseline/vulkan-nvidia/repo-highlight.png && echo byte-equal
 ```
 
@@ -621,9 +630,9 @@ before the fix 9 of 10 slots held a hidden item's glyphs). Mutation
 # the unfixed binary drew 15,600 px unlike derived (the right-hand file's
 # holes); the fixed one draws 0.
 GLYPH_FRAME_SCRIPT="0:pose 875.233 84.362 168.034 15 -30.378;1:pose 875.233 84.362 168.034 -0.252 -30.378" \
-  target/release/glyph3d-native --load-repo "$GLYPH_FLAGSHIP_REPO" --field-mode visible --color-mode flat \
+  target/release/glyph3d-native --load-repo "$GLYPH_FLAGSHIP_REPO" --field-mode visible \
   --file-backgrounds --no-greeking --cam-pose 875.233 84.362 168.034 -0.252 -30.378 --frames 4 --screenshot out/c32-visible.png
-target/release/glyph3d-native --load-repo "$GLYPH_FLAGSHIP_REPO" --field-mode derived --color-mode flat \
+target/release/glyph3d-native --load-repo "$GLYPH_FLAGSHIP_REPO" --field-mode derived \
   --file-backgrounds --no-greeking --cam-pose 875.233 84.362 168.034 -0.252 -30.378 --frames 4 --screenshot out/c32-derived.png
 cmp out/c32-visible.png out/c32-derived.png && echo byte-equal
 ```
@@ -679,9 +688,11 @@ file (`crate::views`: every view's `buffer` is 0), tiled by
 `item_buffers`), while the field still uploads a copy per item and Pass 1
 writes a line-table entry per line per item.
 
-No syntax heuristic runs in this mode (the standing decision), so the three
-`--render-file` golden views render flat under `--field-mode visible`: each
-is the step-2 frame's flat-paint twin byte for byte (measured on
+No syntax heuristic runs in this mode (the standing decision; since
+2026-10-11, when the heuristic was retired, in no mode), so the three
+`--render-file` golden views rendered flat under `--field-mode visible`
+while the stored modes painted them: each was the step-2 frame's
+flat-paint twin byte for byte (measured on
 vulkan-nvidia with the paint forced flat by a scratch toggle), 32,489 /
 43,726 / 31,419 px of token colour short of the step-2 text / emoji /
 emoji-cluster frames (re-measured 2026-10-11 after `--render-file` took

@@ -73,11 +73,12 @@ or live from the Debug panel):
 | `instanced` | 32 B record | every glyph's full placement, read as-is; being retired |
 | `visible` | nothing | the source bytes and a line table stay resident; each frame the GPU culls to the lines in view and lays out only those. Lines too small for glyphs become one-quad washes, files too small for washes become rectangles |
 
-All three render the same pixels on every golden view, with one difference
-by design: visible mode applies no load-time syntax colouring (colour is
-meant to arrive as byte spans from AST/LSP analysis; `--highlight` takes a
-sidecar of such spans today). Text, agent-session and demo scenes use the
-stored modes (a `visible` request there builds `derived`). Derived became
+All three render the same pixels on every golden view. No mode guesses
+colour at load: the lexical syntax colouring was retired on 2026-10-11, and
+colour arrives as byte spans from AST/LSP analysis (`--highlight` takes a
+sidecar of such spans today). `--render-file` is a one-item repo load and
+runs in all three; agent-session and demo scenes use the stored modes (a
+`visible` request there builds `derived`). Derived became
 the default on 2026-10-11, with no pixel moving; `instanced` is being
 retired. Every glyph stays individually editable in every mode
 (recolour, background, transform), keyed by slot in the stored modes and by

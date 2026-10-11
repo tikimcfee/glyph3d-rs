@@ -88,10 +88,23 @@ caller; the short version:
   M1 of `out/VISIBLE-MODE.md`): lines, long-line segment seeds, sizes.
 - **`HyperLayout` (`hyper`) is the DEFAULT layout engine** in pure Rust: a parallel,
   cache-blocked CPU layout engine using Rayon, intra-file line chunking, wrap-aware
-  chunking for minified files, background pipelined prepasses, aligned 8-burst / 4-burst
-  register slot emission, and zero-allocation streaming lexer coloring. Emits 32-byte
+  chunking for minified files, background pipelined prepasses, and aligned 8-burst /
+  4-burst register slot emission. Emits 32-byte
   `RenderSlot` instances in `Instanced` mode or compact 20-byte `DerivedSlot` instances
   in `Derived` mode directly into mapped GPU unified memory without intermediate copies.
+- **Paint is flat at load, colour arrives as spans** (2026-10-11). Every load
+  paints `Paint::Flat`; per-glyph colour comes afterwards as byte spans (the
+  `--highlight` sidecar and the seam's style runs: `style_file` in a stored
+  field, `VisibleField::set_item_spans` in visible mode). `Paint::PerRecord`
+  and `Paint::ByteSpans` remain the layout's per-glyph forms. The lexical
+  syntax heuristic — `Paint::SyntaxHeuristic`, `text::colorize_leaders`
+  and the per-line device colouring with C17's whole-line colours at chunk
+  cuts, `--color-mode` — was retired that day (Ivan: "it should be gone in
+  general"); `--color-mode` is refused like any unknown flag, and a launch
+  config's `color_mode = "flat"` still parses into nothing (`"syntax"` is
+  refused, naming the retirement). The agent cards' comment-line guess in
+  shown source went with it; their colours by event kind, result and diff
+  line stay.
 - `--repo-engine hyper|direct|batch|naive` selects the layout engine (the
   CubeCL compute engine, `cubecl`, was retired 2026-10-09):
   - `hyper` (default): parallel Rust CPU layout with sub-200ms visual init.
@@ -112,8 +125,8 @@ caller; the short version:
   - `instanced` (32 B per glyph): precomputed 3D coordinates. Being retired:
     held byte-equal to every golden by the `--field-mode instanced`
     equivalent until step 3 deletes its crate.
-  - `visible` (2026-10-10; a golden equivalent since M4, with five syntax views
-    exempt; the default is `derived`; `out/VISIBLE-MODE.md`): no slot per
+  - `visible` (2026-10-10; a golden equivalent since M4, every frame held since
+    2026-10-11; the default is `derived`; `out/VISIBLE-MODE.md`): no slot per
     glyph. HyperLayout runs Pass 1 WITH the line table and no Pass 2; the arena
     comes back in its third form (`layout_hyper::VisibleStaging`: the table, one
     seed per item, and — moved in by the loader, never copied — the walk's own
@@ -123,8 +136,9 @@ caller; the short version:
     bit-exact to the device Pass 2 (`visible::tests::placements_agree_with_the_derived_device_pass2`).
     The field culls and draws itself (`GlyphField::prepare` before the glyph
     pass; the CPU cull keeps only the backdrops, under `[lod] visible_backdrop_px`,
-    and the hidden flags). No syntax heuristic runs in this mode (by decision);
-    a `--highlight` sidecar becomes byte spans (`VisibleField::set_item_spans`).
+    and the hidden flags). It paints flat at load like every mode (it was the
+    only one until the syntax heuristic's retirement, 2026-10-11); a
+    `--highlight` sidecar becomes byte spans (`VisibleField::set_item_spans`).
     **Everything the scene keyed by SLOT is keyed by (item, byte) here** (M3,
     2026-10-10; `out/VISIBLE-MODE.md` § M3): the item is the picked VIEW (a
     view's index is its item row, `crate::views`; since 2026-10-11 its group

@@ -129,8 +129,9 @@ dir_tints = [
 # Far-LOD backdrop tint for an extension no [[repo.extension_tints]] lists.
 extension_tint_fallback = [0.75, 0.75, 0.75]   # neutral grey
 
-# Far-LOD backdrop tint by file extension (flat colour mode). The first entry
-# listing an extension wins.
+# Far-LOD backdrop tint by file extension (every load since 2026-10-11, when
+# the syntax heuristic was retired and every load began painting flat). The
+# first entry listing an extension wins.
 [[repo.extension_tints]]
 extensions = ["rs"]
 tint = [0.85, 0.40, 0.20]   # Rust orange
