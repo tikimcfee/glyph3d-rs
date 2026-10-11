@@ -248,7 +248,7 @@ its staging text predates C22). Key touchpoints:
 - `GLYPH_LIBRARY_TIMING=1` — `--layout-mode library` (2026-10-10,
   `native/src/library.rs`): one `LIBTIME` line per animated frame — nodes
   moved, groups synced, the CPU stages (`ease_ms`, `propagate_ms` = bevy
-  transform propagation + scene-mesh re-extraction, `sync_ms`, `upload_ms`,
+  transform propagation + scene-mesh re-extraction, each printed after it as `(bevy … extract …)`, `sync_ms`, `upload_ms`,
   `seg_ms` = `sync_segment` per moved file) and the bytes queued (group rows,
   page-face mesh instances; the Visible field's item boxes stopped being
   uploaded on 2026-10-10 — its cull reads the group rows). Animations run on the
