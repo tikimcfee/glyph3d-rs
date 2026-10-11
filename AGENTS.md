@@ -506,6 +506,34 @@ colourisers' unit tests `colorizer-fills-any-word-colour` and
 rules, and `--render-file`'s tokenizer (`stage_file`), a third copy no tier
 reads. Measured but ungated (2026-10-09): a 94 MB tree of crates.io sources
 is bit-exact on every tier in both modes (99 M records).
+**Tab stops** (2026-10-11, `fold::TabWidth`; `[layout] tab_width_cells` /
+`--tab-width`, default 1). A tab advances to the next multiple of N display
+cells counted from the start of its LOGICAL line (a double-width glyph counts
+two; a wrap segment or column page does not restart the count); one cell is
+the layout before tab stops, and every golden and fixture is taken at one.
+Every engine recovers the line's cells from what it already carries — the
+f64 line advance is exactly `cells x cell`, the Visible seeds carry `cells` —
+and a chunk inside a long line that holds a tab is walked again from the
+true line state by the aggregation (the per-chunk walk measured it from its
+own start). Two more runs of this gate hold every tier to the serial fold at
+`--tab-width 4` (strict: `tab-stops`, `g-cluster-repo`, `g-pick-repo`;
+413,131 records, 658 tabs wider than a cell) and `--tab-width 8` (leader:
+`tab-stops`; 5,311 records, 695 tabs, stops of 5 and 7 cells whose `f32(k) x
+cell` rounds); each refuses a corpus in which no tab spanned more than one
+cell. **No oracle has tab stops**: past one cell the reference is fold.rs's
+own rule, held by `fold::tests` to `text::reference_layout` (the independent
+lineage, which computes the stop itself) and to the oracle-backed one-cell
+fold over the spaces a tab stands for. A TABBED line long enough to be cut
+into chunks reaches no gate corpus; `hyper_oracle::tests::tab_stops_agree_on_every_tier`
+(cargo-test) carries a 135 KB one, asserted to cut where its line is off a
+stop. Mutations: `visible-tab-stop-by-column`, `hyper-device-tab-stop-ignored`,
+`hyper-pass1-seed-cells-ignore-tabs` here; `hyper-tab-chunk-rewalk-skipped`,
+`fold-tab-line-advance-rounded`, `tab-cells-always-a-whole-stop` and
+`visible-item-tab-width-dropped` on cargo-test (the last on
+`native/tests/tab_stops.rs`: Derived, Instanced and Visible draw the same
+`tab-stops` frame at widths 1, 4 and 8). `--render-file` and the
+agent-session cards stage through their own CPU tokenizers, which keep fixed
+4-cell stops (`text::TAB_CELLS`; `text.png` has tabs) and read no setting.
 
 **repo-verify** and **repo-verify-direct** (`--repo-verify`, re-gated
 2026-10-09). `--repo-engine hyper` and `direct` over `g-pick-repo`, both wrap
@@ -747,6 +775,13 @@ and the union is not:
   and seen in pixels only by `tests/library_regions.rs`'s one-region
   on/off comparison on `g-pick-repo`; their depth order against the glyph
   pass is seen by nothing.
+- **Tab stops wider than one cell have no oracle** (2026-10-11). The JS
+  oracle and the fixture corpus know only one-cell tabs, so a wide stop is
+  held to this tree's own serial fold and its independent twin
+  (`text::reference_layout`) and nothing recorded; `fold::TabWidth::tab_cells`
+  is shared by every engine and every witness but that twin. No golden view
+  lays a stop wider than one cell, so their pixels are `tests/tab_stops.rs`'s
+  three-field agreement and nothing more.
 - **PROVENANCE.md's prose is generated but only partially validated.** The
   fixture count is READ FROM build.toml at generation time — the generator
   refuses to write an unverifiable number — but the rest of the prose is
@@ -811,6 +846,7 @@ the serial-fold-versus-scan comparison green, because both forms call
 | `native/fixtures/chunk-cut.txt` | IMMUTABLE | hyper-oracle's only input built for the intra-line chunk-cut classes (C15): a sequence across each 64 KiB cut target, non-ASCII advances before each cut, a continuation wider than every ASCII row past the first page. Its cut positions are planned against the 64 KiB threshold and the cut rule, so changing either (or the file) can move a target off its sequence and silently weaken the gate — re-check that each mutation in its `why` still reddens |
 | `native/fixtures/highlight-alpha.tsv` | IMMUTABLE | the input to `repo-highlight.png`; DELIBERATELY out of byte order (the `1` span after the string span) — sorting it removes the frame's only witness for `sidecar-runs-unsorted` |
 | `native/fixtures/chunk-cut-paint.txt` | IMMUTABLE | hyper-oracle's paint-tier input (C17): a `return` across every intra-line cut, one pure-ASCII line and one not, so a chunk that coloured only its own share of a line is seen at the chunk's END; the only witness `hyper-cut-tail-own-share` has |
+| `native/fixtures/tab-stops/` | IMMUTABLE | the tab-stop runs' corpus (hyper-oracle at `--tab-width` 4 and 8) and `tests/tab_stops.rs`'s frame (2026-10-11): tabs at a line's start, after non-ASCII and double-width glyphs, back to back, in wrapped rows and around a keycap (the strict run's ASCII-led head), and `long-line.txt`, past `SEGMENT_BYTES` so its tabs sit on both sides of the Visible seeds. Shortening that line or dropping its tabs hollows the visible tier's seeded-tab coverage silently |
 | `native/fixtures/cubecl-fork/` | IMMUTABLE | named for the retired CubeCL fork check, now read by hyper-oracle (both runs) — the only committed input exercising paginate's m >= 3 / segment >= 3 classes, the cluster classes at wrap/page boundaries, and the empty-item placement class (`clusters.txt` + `empty.txt`). Editing it hollows hyper-oracle's coverage of those classes silently |
 | `out/tooling-ab/baseline/<key>/` | tracked pixel oracle, one set per rasterizer; **golden** in build.toml | changes only on purpose, with a note saying why; the runner refuses to regenerate it. A new host adopts its own set by hand (the gate prints how); it never edits another's |
 

@@ -622,3 +622,42 @@ target/release/glyph3d-native --load-repo "$GLYPH_FLAGSHIP_REPO" --field-mode de
   --file-backgrounds --no-greeking --cam-pose 875.233 84.362 168.034 -0.252 -30.378 --frames 4 --screenshot out/c32-derived.png
 cmp out/c32-visible.png out/c32-derived.png && echo byte-equal
 ```
+
+## Tab stops in the kernel (2026-10-11)
+
+A tab advances to the next multiple of the item's tab width in display cells,
+counted from the start of its logical line (`fold::TabWidth`; `[layout]
+tab_width_cells`, `--tab-width`, default 1 — the layout before stops, and
+the width every golden is taken at). The kernel needed one rule and no new
+state: `walk_segment` already counts the line's cells (`cells`, seeded at
+every cut — the seed has carried the line advance in cells since M1), so a
+tab's span is `tab_width - cells % tab_width`, its advance `f32(kk) *
+cell_adv` like any other leader's. The width rides in the item row
+(`ItemGpu::tab_width`, a former pad word; the row stays 128 B), written from
+the recipe by `VisibleStaging::item`. Two details: the segment advance now
+adds through `add1` (a tab's product can round — `f32(5) x cell` does — and
+a compiler free to contract `s + p * q` into one fma would round once where
+the CPU rounds twice; a product of 0, 1 or 2 cells is exact either way, so
+nothing at one cell moved), and Pass 1's line-table walk counts a tab's
+cells in the seeds and in `width_cells`, the cull's and the wash's extent.
+`walk.rs`, the slot-index twin, needed nothing: a tab is glyph 0 whatever it
+spans, so no slot moves.
+
+What holds it: two more runs of the hyper-oracle gate (`--tab-width 4` over
+`tab-stops`, `g-cluster-repo` and `g-pick-repo`; `--tab-width 8` in leader
+mode over `tab-stops`, whose 5 KB line puts tabs on both sides of its
+seeds), the visible tier among them; `hyper_oracle::tests::tab_stops_agree_on_every_tier`
+(widths 4 and 8, both cluster modes, wraps, pages, a line cut into chunks);
+and `native/tests/tab_stops.rs` (the visible frame byte-equal to Derived and
+Instanced at widths 1, 4 and 8). Mutations `visible-tab-stop-by-column` and
+`hyper-pass1-seed-cells-ignore-tabs` (the kernel's rule, the seeds' count)
+redden the gate; `visible-item-tab-width-dropped` (the production item built
+at one cell) reddens the frame test, which the oracle grid cannot see. No
+oracle has tab stops: past one cell the chain ends at fold.rs's own rule.
+
+```sh
+cd native
+../target/release/glyph3d-native --load-repo fixtures/tab-stops --tab-width 4 --field-mode visible --frames 2 --screenshot ../out/tabs-visible.png
+../target/release/glyph3d-native --load-repo fixtures/tab-stops --tab-width 4 --field-mode derived --frames 2 --screenshot ../out/tabs-derived.png
+cmp ../out/tabs-visible.png ../out/tabs-derived.png && echo byte-equal
+```

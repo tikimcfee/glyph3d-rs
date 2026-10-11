@@ -151,6 +151,23 @@ caller; the short version:
     last thing Instanced does for a default load; step 3 of its retirement
     makes it a refusal (workarounds: widen a lane, or split an oversized file
     into several items).
+- **Tab stops are a recipe parameter** (`ItemParams::tab_width`, the
+  type `fold::TabWidth`; 2026-10-11): a tab spans to the next multiple of N
+  display cells of its logical line. A repo load takes `--tab-width`, else
+  `[layout] tab_width_cells` (1, the layout before stops) through
+  `RepoParams::tab_width`; `--hyper-oracle-check` applies the flag to its
+  directory and text inputs (fixtures stay at one cell). Every HyperLayout
+  walk asks `layout_hyper::tab_stop::TabStops` for a leader's measures: the
+  line's cells come from the f64 line advance (exactly `cells x cell`), so a
+  walk carries nothing new; a tab's ADVANCE lane is `f32(k) x cell` and the
+  f64 line advance takes the exact `k x cell`. The one state a walk cannot
+  rebuild is a chunk's start inside a long line: the per-chunk Pass 1 walk
+  measures its tabs from the chunk's start, so `aggregate_chunk_prepasses`
+  walks a newline-free chunk that holds a tab again from the true state
+  (`walk_line_state`); the line-table replays and `measure_continued_lines`
+  take the true seed already. The scan form refuses a width past one cell
+  (it has no stops; the oracle has none), and `--render-file`'s stager keeps
+  its own fixed 4-cell stops (`text::TAB_CELLS`).
 - A verify over ZERO items refuses. Before 2026-09-07 a missing corpus directory
   printed `PASS: 0 items, 0 instances` and exited 0 — the gate passing having
   compared nothing.
