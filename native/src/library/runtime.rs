@@ -9,7 +9,13 @@
 //! is recomputed, every node's easing starts from where its local row
 //! actually is (mid-ease, or wherever a drag left it), and `tick` eases dirs
 //! and sheets toward their new slots with the Book's frame-rate-independent
-//! `1 − e^(−rate·dt)`. (The JS rebuilt its volume per pass and seeded only
+//! `1 − e^(−rate·dt)`. A directory drag STICKS (Ivan, 2026-10-10: a
+//! user-set transform stays, as an agent turn stays in its history): its
+//! delta joins the directory's user offset, and every later target is the
+//! planned slot plus that offset — a re-plan moves around the user's
+//! placement, never over it. A file drag writes the file node's own row,
+//! which no plan touches, and a directory's scale (scroll while grabbed)
+//! survives because the ease writes only translations. (The JS rebuilt its volume per pass and seeded only
 //! the sheets' poses, so its directories jumped; here directories glide too
 //! — the structure never changes, only targets.)
 //!
@@ -101,7 +107,14 @@ pub struct Library {
     /// scanned per frame, 2026-10-10).
     dir_active: Vec<u32>,
     sheet_active: Vec<u32>,
+    /// Per directory: the user's drags, summed in its parent's frame; its
+    /// target is always its planned slot plus this.
+    dir_user: Vec<[f64; 3]>,
     animating: bool,
+}
+
+fn add(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
+    [a[0] + b[0], a[1] + b[1], a[2] + b[2]]
 }
 
 fn v3(p: [f64; 3]) -> [f32; 3] {
@@ -125,6 +138,7 @@ impl Library {
         });
         let dir_at = p.dirs.iter().map(|d| d.pos).collect();
         let sheet_at = p.files.iter().map(|f| f.slot).collect();
+        let dir_user = vec![[0.0; 3]; p.dirs.len()];
         Library {
             opts,
             default_form: settings.form,
@@ -141,6 +155,7 @@ impl Library {
             sheet_at,
             dir_active: Vec::new(),
             sheet_active: Vec::new(),
+            dir_user,
             animating: false,
         }
     }
@@ -251,6 +266,23 @@ impl Library {
             self.opts.page_w,
             self.opts.page_h,
         )
+    }
+
+    /// Move a directory (a zone, `dir:<path>`) by a WORLD delta, and keep
+    /// it there: one local row, the delta taken in its parent's frame, and
+    /// the same delta added to its user offset, so no later plan undoes it.
+    /// Mid-ease, its ease carries on from where the drag put it toward a
+    /// target moved by the same delta. Returns the node written.
+    pub fn move_zone(&mut self, t: &mut NodeTables, zone_id: &str, d: [f32; 3]) -> Option<NodeHandle> {
+        let di = *self.zone_dirs.get(zone_id)?;
+        let h = self.nodes.as_ref()?.dir[di];
+        let dl = t.parent_world(h).ok()?.world_delta_to_local(d);
+        let l = t.local(h).ok()?;
+        let moved = [l.translation[0] + dl[0], l.translation[1] + dl[1], l.translation[2] + dl[2]];
+        t.set_local(h, Similarity { translation: moved, ..l }).ok()?;
+        self.dir_user[di] = add(self.dir_user[di], dl.map(f64::from));
+        self.dir_at[di] = moved.map(f64::from);
+        Some(h)
     }
 
     /// The world rect of a page (its sheet's world centre ± half a page),
@@ -371,7 +403,7 @@ impl Library {
         let away = |at: &[[f64; 3]], target: &dyn Fn(usize) -> [f64; 3]| -> Vec<u32> {
             (0..at.len()).filter(|&i| at[i] != target(i)).map(|i| i as u32).collect()
         };
-        self.dir_active = away(&self.dir_at, &|d| self.plan.dirs[d].pos);
+        self.dir_active = away(&self.dir_at, &|d| add(self.plan.dirs[d].pos, self.dir_user[d]));
         self.sheet_active = away(&self.sheet_at, &|f| self.plan.files[f].slot);
         self.animating = true;
     }
@@ -399,8 +431,11 @@ impl Library {
             }
             next != target
         };
-        let (dir_at, sheet_at, plan) = (&mut self.dir_at, &mut self.sheet_at, &self.plan);
-        self.dir_active.retain(|&d| step(&mut dir_at[d as usize], plan.dirs[d as usize].pos, nodes.dir[d as usize], t));
+        let (dir_at, sheet_at, plan, user) = (&mut self.dir_at, &mut self.sheet_at, &self.plan, &self.dir_user);
+        self.dir_active.retain(|&d| {
+            let d = d as usize;
+            step(&mut dir_at[d], add(plan.dirs[d].pos, user[d]), nodes.dir[d], t)
+        });
         self.sheet_active.retain(|&f| step(&mut sheet_at[f as usize], plan.files[f as usize].slot, nodes.sheet[f as usize], t));
         let pending = !self.dir_active.is_empty() || !self.sheet_active.is_empty();
         let ease_ms = t0.elapsed().as_secs_f64() * 1e3;

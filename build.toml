@@ -25,7 +25,7 @@
 # Ratchet, NOT an equality: tests are added constantly, so an exact pin would
 # redden on the most common good action in the repo. A green run whose real
 # count exceeds the floor prints a NOTE naming the value to raise it to.
-test_floor = 366
+test_floor = 367
 # Every golden view is rendered again under each of these and must match the
 # SAME baseline byte for byte (2026-10-09, C20). The Derived field renders
 # every golden frame identically to Instanced (measured on vulkan-nvidia and
@@ -1299,6 +1299,16 @@ op = "replace"
 find = "(0..at.len()).filter(|&i| at[i] != target(i))"
 with = "(0..at.len()).filter(|&i| at[i] == target(i))"
 expect = "FAILED"
+
+[[mutation]]
+name = "library-drag-offset-forgotten"
+gate = "cargo-test"
+why = "a directory drag not kept (Ivan, 2026-10-10: user-set transforms stick): the drag writes its row but not the directory's user offset, so the next page turn, form, stack or sort change eases the directory back to its planned slot. No golden view drags. CONSUMED BY: Library::move_zone (every `c` drag) and the targets of Library::replan / tick; reddens library::tests::a_dragged_directory_keeps_its_place_through_every_replan"
+file = "native/src/library/runtime.rs"
+op = "replace"
+find = "        self.dir_user[di] = add(self.dir_user[di], dl.map(f64::from));"
+with = "        let _ = dl;"
+expect = "a_dragged_directory_keeps_its_place_through_every_replan"
 
 [[mutation]]
 name = "group-mirror-deferred-forever"

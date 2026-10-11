@@ -325,11 +325,12 @@ its staging text predates C22). Key touchpoints:
   view after the drag must stay counted visible (`items a/b`): the
   field's item cull carries the item's local box through the live group
   row (since 2026-10-10; before, the drag pushed a world box every step). Pair it with `--cam-pose` so the drag lands where you want.
-- `GLYPH_DRAG_SCRIPT=g|c:DX:DY[:EVENTS]` — offscreen (2026-10-10): a grab
+- `GLYPH_DRAG_SCRIPT=g|c:DX:DY[:EVENTS[:FRAMES]]` — offscreen (2026-10-10): a grab
   drag scripted through the window's own entry points — cursor parked at
   the viewport centre, the grab key (`g` the picked file, `c` its zone; pick
   first with `--pick-file`), then EVENTS cursor moves per frame (default 1)
-  totalling (DX, DY) px. A drag is applied ONCE per frame (`apply_drag`,
+  totalling (DX, DY) px, for the first FRAMES frames (default every frame: a
+  drag that stops, so a later ease can be seen keeping it). A drag is applied ONCE per frame (`apply_drag`,
   from `animate`), however many moves arrived; `GLYPH_DRAG_PER_EVENT=1`
   applies each move as it arrives, as before, for the A/B.
   `GLYPH_DRAG_TIMING=1` (offscreen or windowed) prints one `DRAGTIME` line
