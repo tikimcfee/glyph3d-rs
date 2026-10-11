@@ -531,9 +531,12 @@ stop. Mutations: `visible-tab-stop-by-column`, `hyper-device-tab-stop-ignored`,
 `fold-tab-line-advance-rounded`, `tab-cells-always-a-whole-stop` and
 `visible-item-tab-width-dropped` on cargo-test (the last on
 `native/tests/tab_stops.rs`: Derived, Instanced and Visible draw the same
-`tab-stops` frame at widths 1, 4 and 8). `--render-file` and the
-agent-session cards stage through their own CPU tokenizers, which keep fixed
-4-cell stops (`text::TAB_CELLS`; `text.png` has tabs) and read no setting.
+`tab-stops` frame at widths 1, 4 and 8). `--render-file` is a one-item
+repo load since 2026-10-11 and lays its tabs out by this same rule, at its
+own default `[layout] render_file_tab_width_cells = 4` (the stops its
+retired CPU stager had; `text.png` has tabs), `--tab-width` overriding it.
+The agent-session cards stage through their own CPU code, which keeps fixed
+4-cell stops and reads no setting.
 
 **repo-verify** and **repo-verify-direct** (`--repo-verify`, re-gated
 2026-10-09). `--repo-engine hyper` and `direct` over `g-pick-repo`, both wrap
