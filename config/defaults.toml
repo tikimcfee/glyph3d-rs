@@ -208,7 +208,6 @@ body = [220, 230, 240]           # prose, payloads, file content
 meta = [160, 180, 200]           # sizes, lengths, tool ids, summaries
 emphasis = [240, 245, 255]       # a spec's subject: target path, tool name
 muted = [135, 150, 165]          # empty states: "(No ... recorded)"
-comment = [130, 155, 170]        # comment lines in shown source
 ok = [110, 235, 140]
 error = [250, 115, 115]
 diff_add = [120, 245, 140]
