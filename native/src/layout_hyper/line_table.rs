@@ -216,7 +216,7 @@ pub(crate) fn cells_of(advance: f32, cell_adv: f32) -> u32 {
 /// `chunk_initial` is the aggregation's (col, seg_adv, line_adv) at each
 /// chunk's start, which seeds the chunk-cut seed and the replay of the
 /// continuation's own seeds.
-#[allow(clippy::too_many_arguments, reason = "Pass 1's per-chunk aggregation arrays (initial cols, segment and line advances), passed apart; not yet bundled")]
+#[expect(clippy::too_many_arguments, reason = "Pass 1's per-chunk aggregation arrays (initial cols, segment and line advances), passed apart; not yet bundled")]
 pub(crate) fn assemble(
     chunk_lines: &[ChunkLines],
     item_chunk_ranges: &[std::ops::Range<usize>],
@@ -324,7 +324,7 @@ pub(crate) fn assemble(
 /// its start with the aggregation's initial (col, seg_adv, line_adv) and
 /// snapshot the state at each of that line's cuts. In parallel over such
 /// chunks; nothing runs for a corpus with no intra-line chunk cut.
-#[allow(clippy::too_many_arguments, reason = "Pass 1's per-chunk aggregation arrays (initial cols, segment and line advances), passed apart; not yet bundled")]
+#[expect(clippy::too_many_arguments, reason = "Pass 1's per-chunk aggregation arrays (initial cols, segment and line advances), passed apart; not yet bundled")]
 pub(crate) fn seed_continued_lines(
     t: &mut LineTable,
     chunks: &[LayoutChunk<'_>],
@@ -454,7 +454,7 @@ pub(crate) fn seed_continued_lines(
 /// chunk's, and the entry takes the larger of what its head measured and
 /// this. In parallel over the continuing chunks; nothing runs for a corpus
 /// with no intra-line chunk cut.
-#[allow(clippy::too_many_arguments, reason = "Pass 1's per-chunk aggregation arrays (initial cols, segment and line advances), passed apart; not yet bundled")]
+#[expect(clippy::too_many_arguments, reason = "Pass 1's per-chunk aggregation arrays (initial cols, segment and line advances), passed apart; not yet bundled")]
 pub(crate) fn measure_continued_line_widths(
     t: &mut LineTable,
     chunks: &[LayoutChunk<'_>],

@@ -340,7 +340,7 @@ kind = "cargo"
 cmd = "clippy"
 needs = []
 compare = "clippy warning count vs zero, all targets (tests included)"
-blind_to = "anything silenced with #[allow(...)]"
+blind_to = "anything silenced with #[expect(..., reason)] — a stale expectation, and any bare #[allow], is itself a warning ([workspace.lints])"
 
 [[gate]]
 name = "cargo-doc"

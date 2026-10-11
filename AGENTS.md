@@ -326,7 +326,8 @@ happened here, and is caught today only by the fixture rebuild above.
 
 **cargo-build.** `cargo build --release`, zero warnings. Red on any
 warning rustc emits; a build ERROR is fatal (the battery stops). Blind to
-anything silenced with `#[allow(...)]`.
+anything silenced with `#[expect(..., reason)]` (an expectation that stops
+being met is itself a warning, so a silence cannot outlive its cause).
 
 **cargo-check-no-ui** (2026-10-09). `cargo check` of the renderer with
 `--no-default-features` (no egui overlay), all targets, zero warnings, in its
@@ -339,7 +340,9 @@ RUNS correctly — it is checked, not executed.
 **cargo-clippy.** `cargo clippy --release`, zero warnings. Same, for lints.
 It runs with `--all-targets` (since 2026-10-09), so test code is linted too:
 until then 14 test-only lints had piled up unseen, one of them deny-level.
-Blind to anything silenced with `#[allow(...)]`.
+Lint levels live in the root `Cargo.toml`'s `[workspace.lints]` (2026-10-11),
+one lint per commit with all of its fixes. Blind to anything silenced with
+`#[expect(..., reason)]`; a bare `#[allow]` is itself a warning.
 
 **cargo-doc.** `cargo doc --workspace --release --no-deps`, zero warnings (every
 workspace crate since 2026-10-11; before that the renderer alone, so a dead
