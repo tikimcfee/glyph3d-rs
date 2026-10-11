@@ -1,7 +1,8 @@
 # Views over bytes, and a transform tree — 2026-10-10
 
 > **Status: agreed direction; step 1 built in its transitional form (§ "Step
-> 1: as built", 2026-10-10), the M2 measurement pending.** Worked out with Ivan on
+> 1: as built", 2026-10-10), the library moved onto it (§ "Step 1b"), the
+> M2 measurement pending.** Worked out with Ivan on
 > 2026-10-10. Inputs: the library-layout probe
 > (`out/LIBRARY-LAYOUT-FINDINGS-2026-10-10.md`) and the GPU-hierarchy survey
 > (`research/gpu-transform-hierarchies-2026-10.md`). Iterate one step at a
@@ -253,7 +254,8 @@ field modes (29 of 30 cases; the 30th, `hide-group` then `show-group` in
 visible mode, differs from run to run on the OLD binary too — six runs, six
 hashes — a pre-existing nondeterminism, not looked into here).
 
-**It does not cover**: the library's and the controller's own hierarchies
+**It does not cover** (as built; the library's part is done by step 1b,
+below): the library's and the controller's own hierarchies
 (still flattened by bevy on the CPU; one node per group, flat under the
 root — wiring the library onto these tables is the next step); directory
 nodes; the cull boxes and Visible item boxes (still one host write per
@@ -272,6 +274,64 @@ against the CPU reference; every golden group sits under an identity root,
 where both orders agree, so no golden can see it),
 `group-adopt-takes-unchanged-appearance`, and `resolve-group-tint-halved`
 (pixel-ab: the draw path reads what the resolve writes).
+
+## Step 1b: the library on the tree (2026-10-10)
+
+Commits 737b1b0 (crate), cdb5b5e (library + faces), ca6bebe (tree cull,
+deferred mirror), 83975cd (the HUD's browser off the mirror); findings E18
+has the witness and the numbers.
+
+**What runs.** The library's hierarchy — root → directory → volume →
+sheet → mount (fit scale) → file — is nodes of the scene's tables, under
+the identity root. Interior nodes route to no group row (the crate already
+allowed it); each file node IS the file's group node, reparented under its
+mount at load, so the resolve writes its row. A move writes local rows
+only: the ease the dirs and sheets that moved, a `c` drag its directory
+node (the world delta in the parent's frame), a `g` drag the file node, the
+wheel on a zone its directory's scale. The page faces are drawn by the
+scene mesh pipeline from an instance buffer a compute pass fills from the
+sheets' world rows after any resolve (`library_faces.wgsl`); the host
+writes no face. The CPU side needs no per-file work either:
+
+- **Bounds table, top-down cull** (`native/src/glyph_scene/tree_cull.rs`,
+  library loads only). Each library node keeps its subtree's segment box in
+  its own frame; a move refits the boxes of the moved node's ancestors
+  before the next cull. The cull walks the library depth-first composing
+  worlds root first (a per-node world cache keyed by move epochs skips the
+  composition on chains nothing moved on), drops subtrees outside the
+  frustum (padded boxes: a prefilter, never a decision), and runs the flat
+  cull's exact per-segment test on the survivors in segment order — the
+  same draws as the flat cull over per-file-synced boxes (property test,
+  400 cameras). Never-moved files keep their staged boxes; moved ones get
+  `sync_segment`'s arithmetic, so the bits match the bevy era's.
+- **Deferred CPU mirror.** A move notes its subtree roots
+  (`GroupNodes::defer_mirror`); pick and the verbs bring `groups_cpu` up to
+  date when they read it (one CPU subtree resolve,
+  `NodeTables::resolve_subtrees`, O(1) a node). The drag and the windowed
+  file browser (its shown rows only) read worlds from the tree, O(depth).
+
+**Deviations from step 1, and why.**
+- The resolve composes TOP-DOWN (it collects the chain, then composes from
+  the root: translations summed root first), on the GPU and in
+  `NodeTables::world`. Leaf-first sums differ from bevy's in the last bit
+  (float addition does not associate), and the library's frames had to be
+  the bevy frames byte for byte. Still a function of the local rows alone,
+  still no node reading another's world row.
+- The bounds table lives in the renderer, CPU side, for the library only,
+  not in the crate: the boxes are segment boxes (the cull's), and the walk
+  hands its survivors to the existing exact test. Other scenes keep the
+  flat cull (their groups are flat under the root).
+- `GroupNodes::adopt` is no longer on the library's path (nothing external
+  writes its rows); it still serves the carrel and the other controller
+  layouts, which stay on bevy.
+
+**Cost now** (20k-file synthetic library, derived, this host; E18): a
+`c` drag of a 20k-file directory 0.0006 ms CPU per drag (was 2.73), a
+`g` drag 0.0016 ms (was 0.785), everything moving 0.53 ms (was 2.44) plus
+the flush's upload (one full local table, 1.9 MB, past 15 % moved). The
+per-frame cull became a walk: 0.14 ms at a near pose and 0.34 ms fitted,
+static (the flat scan was 0.06 / 0.28) — the price, at this size, of a
+cull whose cost follows the frustum rather than the file count.
 
 ## What exists today, and what changes
 

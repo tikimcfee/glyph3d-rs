@@ -26,12 +26,14 @@ interleaved A/Bs, so read the small ones (< 0.1 ms) as orders of magnitude.
   `y` piles them. Sort by name, size or ext, reversible. Child directories
   pack serpentine under their parent's stack, `depth_z` = 32 further back,
   in the parent's frame. Single-child directory chains compress.
-- Transform hierarchy on the existing bevy_ecs spatial scene: library root
-  -> directory -> volume -> sheet (slot) -> mount (fit scale + centring) ->
-  file card (`GlyphGroupBinding`, identity). The file's GroupRow is its
-  flattened world transform, written by the existing `sync_to_group_rows`.
-  One group per file (group id = file index), exactly as the shelf. The
-  group-row and slot formats are untouched.
+- Transform hierarchy, library root -> directory -> volume -> sheet (slot)
+  -> mount (fit scale + centring) -> file (identity). Until E18 it was a
+  bevy_ecs hierarchy on the spatial scene, flattened into GroupRows by
+  `sync_to_group_rows`; since E18 (2026-10-10) it is nodes of the renderer's
+  transform tree (`glyph-scene-graph`), the file node being the file's
+  group node, and the GPU resolve writes its row. One group per file (group
+  id = file index), exactly as the shelf. The group-row and slot formats
+  are untouched.
 - Runtime: verbs `page-next|page-prev|page-first|page-last|page-to N`,
   `form deck|splay|toggle`, `library-stack x|y|z`,
   `library-sort name|size|ext [reverse]` (no pick needed; paging and form
@@ -39,7 +41,8 @@ interleaved A/Bs, so read the small ones (< 0.1 ms) as orders of magnitude.
   `]`/`[` (and `n p . ,` and the arrows), Home/End, `v`. Every change is a
   retarget: the plan is recomputed and every directory and sheet eases from
   its live transform (`1 - e^(-lerp*dt)`, lerp 9/s, dt clamped to 0.1 s).
-- Page faces: one scene-mesh quad per sheet, on the page plane.
+- Page faces: one quad per sheet, on the page plane (a bevy scene mesh
+  until E18; since, written on the GPU from the sheets' worlds).
 
 Unit tests (`library::tests`, 13) hold the arithmetic to the JS test numbers
 (`tools/contenttree.test.mjs` tests 35-41 in the JS repo: splayGrid shapes,
@@ -219,7 +222,11 @@ re-uploads every quad (2.35 MB) when ANY transform under a mesh changed,
 which is why turning one 11-file volume still costs 2.15 ms of `propagate`.
 Without page faces the everything-moves frame drops from 4.82 to 3.21 ms of
 `propagate`: about 1.6 ms is mesh re-extraction, about 3.2 ms bevy
-propagation over ~35,000 moved nodes. Left.
+propagation over ~35,000 moved nodes. Fixed for the library by E18: the
+faces are written on the GPU (no host bytes when a page moves), and the
+group rows are no longer a host upload at all — only the moved nodes'
+32 B local rows go up (the scene graph's runs / scatter / whole-table
+policy, `crates/glyph-scene-graph/src/upload.rs`).
 
 ### E6. One group per file: a file's layout pages cannot be sheets — left (the key finding)
 
@@ -359,13 +366,12 @@ moved card; at 8 moves per frame 3.3 ms, now 0.42 (the drag is applied
 once per frame, from `animate`, as one delta; the final frame is
 byte-identical). Instruments: `GLYPH_DRAG_TIMING`, `GLYPH_DRAG_SCRIPT`,
 `GLYPH_DRAG_PER_EVENT` (native/AGENTS.md).
-Left: propagation is O(every entity) per frame of any motion. On the
+Left (then): propagation is O(every entity) per frame of any motion. On the
 74,313-file kernel tree, Visible, everything moving: `propagate_ms`
 11.8 ms median per animated frame (seg 1.36, upload 1.77, sync 0.56), and
 a 41-file volume turning on arch/ still pays 0.38 ms bevy + 0.13-0.16 ms
-re-extracting every face. The fix is the library's hierarchy on
-`glyph-scene-graph` nodes (a move writes only the moved nodes' local rows;
-the GPU resolve does the rest) and faces re-extracted per moved sheet.
+re-extracting every face. Fixed by E18 (the library on the transform
+tree): no bevy, no face re-extraction, no per-file work per move.
 
 ### E17. Smaller findings of the follow-up pass
 
@@ -380,6 +386,62 @@ the GPU resolve does the rest) and faces re-extracted per moved sheet.
   the tiers (E2's remainder): an em of 1 world unit against a line of 1.25.
   At a near pose over the kernel tree a page Visible washes is a backdrop in
   Derived.
+
+### E18. The library on the transform tree — fixed (737b1b0, cdb5b5e, ca6bebe, 83975cd)
+
+What: E16's remainder. Every frame of motion paid bevy propagation over
+every entity, a whole-table face re-extraction, and then per moved FILE a
+group-row sync, an upload and a `sync_segment` — O(descendants) even for a
+one-row directory drag.
+Did:
+- The hierarchy is nodes of the scene's `glyph-scene-graph` tables
+  (`Library::insert_nodes`; `GlyphScene::new` attaches it, reparenting each
+  file's group node under its mount). The ease writes only the moved dirs'
+  and sheets' local rows; a `c` drag writes its directory's row, a `g` drag
+  the file's (E10's rule through the tree). The GPU resolve writes the
+  group rows. The resolve now composes TOP-DOWN (root-first sums, bevy's
+  order; it was leaf-first), so the rows are bevy's bit for bit.
+- Page faces: a compute pass (`library_faces.wgsl`) writes each face's
+  mesh instance from its sheet's resolved world after any resolve.
+- The CPU readers: the library culls top-down from the tree (a bounds table
+  refit along the moved nodes' ancestors, a walk that composes worlds and
+  hands surviving segments to the flat cull's exact per-segment test;
+  `glyph_scene/tree_cull.rs`), and the CPU mirror of the group rows is
+  deferred until pick or a verb reads it. The windowed file browser
+  refreshes only the rows it shows, from the tree (it refreshed every row
+  every frame from the mirror, which would have forced the deferred mirror
+  in a window).
+Witness: 19 g-pick-repo library frames (the candidates below plus mid-ease,
+page-to, `g` and `c` drags, drag + turn, drag + form) x 3 modes, and 35
+frames on this repo (3 modes) and a 20,002-file synthetic tree (derived,
+visible), rendered by 3ecae63 and by ca6bebe: 92 of 92 byte-equal
+(vulkan-nvidia). The resolve and the face pass are exact for library
+chains (every product is with 1 or 0, every sum bar the offset's with 0),
+so no fused multiply-add can move a bit; the g-drag delta is now converted
+by division instead of glam's cofactor inverse, and no witness frame moved.
+Measured (offscreen, one run each, medians over the animated frames, this
+host; `GLYPH_LIBRARY_TIMING` / `GLYPH_DRAG_TIMING`, cull from
+`GLYPH_PROFILE`'s CPU scope):
+
+| case | before (3ecae63) | after (ca6bebe) |
+|---|---|---|
+| synthetic 20k, derived: `c` drag of a 20k-file directory, CPU per drag | 2.73 ms (bevy 1.60, extract 0.13, sync 0.14, upload 0.45, seg 0.38) | 0.0006 ms |
+| synthetic 20k: `g` drag of one file | 0.785 ms (bevy 0.745) | 0.0016 ms |
+| synthetic 20k: form toggle, everything moving | ease 0.19 + propagate 1.23 + sync 0.14 + upload 0.49 + seg 0.39 = 2.44 ms | ease 0.34 + notes 0.04 + cull/refit 0.15 = 0.53 ms |
+| synthetic 20k: one 50-page volume turning | 1.03 ms propagate (0.89 bevy, 0.13 extract), 1.6 MB of faces | ease 0.17 ms, 1.6 KB of local rows |
+| synthetic 20k: per-frame cull, near pose / fitted, static | 0.06 / 0.28 ms (flat) | 0.14 / 0.34 ms (tree walk) |
+| arch/ (9,241 files), visible, form toggle + `c` drag of x86/kernel, per frame | (E16: a `g` step alone 0.41 ms; whole-tree form 11.8 ms propagate at 74k) | ease 0.16 + notes 0.015 + cull 0.10 + flush 0.13 ms; drag 0.0005 ms |
+| this repo (292 files): form toggle | 0.07 ms | 0.06 ms |
+
+Left: the per-frame cull is a walk now: at 20k segments a near pose visits
+~1.9k nodes in ~0.11 ms (the visits, not the arithmetic: the same with every
+world cached), so a static frame costs a little more than the flat scan at
+this size and less as the library grows past what the frustum reaches. The
+ease itself is O(moved nodes) (0.34 ms for 20k). The Debug panel's field
+depth readout (`z_extent`) folds the stored segment boxes, so it does not
+follow moved library files. Instanced cannot load the whole kernel (E17),
+unchanged. The carrel and every non-library controller layout still
+flatten through bevy.
 
 ## Seeing it
 
