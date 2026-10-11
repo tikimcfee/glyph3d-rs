@@ -194,8 +194,9 @@ impl GlyphScene {
         if let Some(ctrl) = &mut self.controller {
             if let Some(&entity) = ctrl.file_entities.get(gid as usize) {
                 let t = std::time::Instant::now();
+                let local = card_local_delta(&ctrl.scene, entity, d_vec);
                 if let Some(mut transform) = ctrl.scene.world.get_mut::<bevy_transform::components::Transform>(entity) {
-                    transform.translation += d_vec;
+                    transform.translation += local;
                 }
                 ctrl.scene.update_transforms();
                 stages.move_ms = t.elapsed().as_secs_f64() * 1e3;
@@ -431,4 +432,54 @@ struct DragStages {
     sync_ms: f64,
     upload_ms: f64,
     seg_ms: f64,
+}
+
+/// A world-space drag delta in a file card's LOCAL frame: the inverse of its
+/// parent's world transform applied to the vector (E10, 2026-10-10). A card
+/// under a scaled parent — every library file sits under its page's mount,
+/// which carries the contain-fit scale — moved `s` times the cursor when the
+/// world delta was added to its local translation as is. A parent at the
+/// identity (the shelf, the carrel) gets the delta back unchanged.
+pub(crate) fn card_local_delta(scene: &crate::spatial_scene::SpatialScene, card: bevy_ecs::entity::Entity, world: Vec3) -> Vec3 {
+    let parent = scene.world.get::<bevy_ecs::hierarchy::ChildOf>(card).map(|c| c.parent());
+    match parent.and_then(|p| scene.world.get::<bevy_transform::components::GlobalTransform>(p)) {
+        Some(g) => g.affine().inverse().transform_vector3(world),
+        None => world,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::card_local_delta;
+    use crate::spatial_scene::SpatialScene;
+    use bevy_transform::components::{GlobalTransform, Transform};
+    use glam::Vec3;
+
+    /// E10 (2026-10-10): a `g` drag moves the file by the cursor's world
+    /// delta whatever its parent's scale. A library file sits under its
+    /// page's mount, which carries the contain-fit scale; adding the world
+    /// delta to the card's LOCAL translation moved it `s` times the cursor.
+    #[test]
+    fn a_drag_under_a_scaled_parent_moves_the_card_by_the_world_delta() {
+        let mut scene = SpatialScene::new();
+        let root = scene.spawn_root("root");
+        let mount = scene.spawn_child(
+            root,
+            Transform { translation: Vec3::new(10.0, -5.0, 2.0), scale: Vec3::splat(0.25), ..Transform::IDENTITY },
+            "mount",
+        );
+        let card = scene.spawn_file_card(mount, "a.rs", "", 0, Transform::IDENTITY, ([0.0; 3], [1.0; 3]), [1.0; 3]);
+        scene.update_transforms();
+        let before = scene.world.get::<GlobalTransform>(card).unwrap().translation();
+        let world = Vec3::new(3.0, -2.0, 0.5);
+        let local = card_local_delta(&scene, card, world);
+        scene.world.get_mut::<Transform>(card).unwrap().translation += local;
+        scene.update_transforms();
+        let moved = scene.world.get::<GlobalTransform>(card).unwrap().translation() - before;
+        assert!((moved - world).length() < 1e-5, "the card moved {moved:?} for a world delta of {world:?} under a 0.25 mount");
+        // Under an identity parent the delta is the world delta, unchanged.
+        let flat = scene.spawn_file_card(root, "b.rs", "", 1, Transform::IDENTITY, ([0.0; 3], [1.0; 3]), [1.0; 3]);
+        scene.update_transforms();
+        assert_eq!(card_local_delta(&scene, flat, world), world);
+    }
 }
