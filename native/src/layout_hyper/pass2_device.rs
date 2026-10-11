@@ -416,7 +416,13 @@ fn layout_pass2_chunk<E: SlotEmit>(
     let mut survivor_out = 0usize;
     let mut trailer_until = 0usize;
 
-    let out_ptr = unsafe { (dest_addr as *mut E::Slot).add(slot_base as usize) };
+    // Offset in integers, then cast. `dest_addr` is slot 0's address, which
+    // the windowed and emoji-scratch paths rebase below their buffer
+    // (`window_addr - start * size`): only this chunk's own slots lie inside
+    // it, so `ptr::add` from slot 0 would start outside any allocation, which
+    // is undefined even though the result lands inside (2026-10-11). Wrapping,
+    // to invert the rebase's `wrapping_sub` exactly.
+    let out_ptr = dest_addr.wrapping_add(slot_base as usize * std::mem::size_of::<E::Slot>()) as *mut E::Slot;
     let flat_color = if let Paint::Flat(c) = item.paint { Some(c) } else { None };
     let is_syntax_heuristic = matches!(item.paint, Paint::SyntaxHeuristic);
     let per_record_colors = if let Paint::PerRecord(c) = item.paint { Some(c) } else { None };
