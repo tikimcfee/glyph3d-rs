@@ -459,7 +459,7 @@ the gate's own, `drift_stats`, any channel differing; ImageMagick's
 | view | under visible | differing px (vulkan-nvidia / metal-apple) | why |
 |---|---|---|---|
 | demo | byte-equal | 0 / 0 | no glyph field (the demo scene) |
-| text | byte-equal | 0 / 0 | `--render-file` stages host records, no line table: falls back to Instanced (the load warns) |
+| text | byte-equal | 0 / 0 | `--render-file` stages host records, no line table: falls back to Instanced (the load warns; to Derived since 2026-10-11, when Derived became the default) |
 | emoji | byte-equal | 0 / 0 | the same fall-back |
 | emoji-cluster | byte-equal | 0 / 0 | the same fall-back |
 | repo-highlight | byte-equal | 0 / 0 | VISIBLE MODE FOR REAL: the sidecar's spans over alpha.rs; the one frame that holds visible mode to pixels |
