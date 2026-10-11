@@ -18,7 +18,10 @@
 // Cell height is constant 1.0.
 
 const TEX_W: i32 = 1024;
-const MAX_CURVES: u32 = 128u;
+// A safety bound on the per-fragment curve loop, not a budget: it must cover
+// the atlas's largest outline (468 curves, 2026-10-11), or that glyph is cut
+// off. native/tests/curve_cap.rs holds every glyph shader to it.
+const MAX_CURVES: u32 = 512u;
 const GROUP_STRIDE: u32 = 6u;
 
 struct DerivedSlot {

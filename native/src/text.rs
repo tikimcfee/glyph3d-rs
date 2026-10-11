@@ -538,13 +538,17 @@ pub fn stage_file(
         segments,
         pick: None,
         controller: None,
-        item_params: vec![
-            glyph_field::ItemParamsGpu {
+        // One item per copy, each drawn with its own copy's group: the
+        // Derived vertex stage reads the group from the item, so a shared
+        // group 0 stacked every copy on copy 0 (2026-10-11, found when
+        // Derived became the default).
+        item_params: (0..copies)
+            .map(|copy| glyph_field::ItemParamsGpu {
                 line_height: line_h,
+                group: copy,
                 ..Default::default()
-            };
-            copies as usize
-        ],
+            })
+            .collect(),
     }
 }
 
