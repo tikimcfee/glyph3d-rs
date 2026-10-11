@@ -320,6 +320,7 @@ fn build(trie: &TrieUpload, specs: &[ItemSpec], segment_bytes: usize) -> Corpus 
             wrap_width: s.wrap_width,
             wrap_mode: s.wrap_mode,
             cluster: u32::from(s.cluster),
+            tab_width: 1,
             byte_base,
             byte_len: bytes.len() as u32,
             first_line,

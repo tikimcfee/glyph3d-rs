@@ -7,6 +7,7 @@ use crate::glyph_scene::GlyphInstance;
 use crate::layout::{InkExtent, ItemPlacement, LayoutItem, PageExtent, Paint};
 use super::char_resolve::{resolve_byte_char, resolve_byte_char_cluster, ResolveCtx};
 use super::page::{paged_x, Pager};
+use super::tab_stop::TabStops;
 use super::types::{ItemPrepass, SendPtr};
 
 pub fn layout_pass2_host(
@@ -28,6 +29,7 @@ pub fn layout_pass2_host(
             let p = &item.params;
             let cluster = super::char_resolve::clusters(p);
             let rctx = ResolveCtx { trie, bitmap_adv, em_height_fu, cluster };
+            let tabs = TabStops::of(p, crate::text::fu_to_world(trie.metrics.advance_fu as i32, em_height_fu));
             let group_id = item.group_id;
 
             let fold_unit = if p.wrap_width > 0 {
@@ -105,7 +107,8 @@ pub fn layout_pass2_host(
                     (base_x, base_y, base_z)
                 };
 
-                let right = pos_x + r.advance;
+                let (advance, line_advance_addend) = tabs.advance(bytes[pos], r.advance, line_adv);
+                let right = pos_x + advance;
                 if right > page_right {
                     page_right = right;
                 }
@@ -188,11 +191,11 @@ pub fn layout_pass2_host(
                     seg_adv = 0.0;
                 } else {
                     col += 1;
-                    line_adv += r.advance as f64;
+                    line_adv += line_advance_addend;
                     if fold_unit > 0 && col % fold_unit == 0 {
                         seg_adv = 0.0;
                     } else {
-                        seg_adv += r.advance;
+                        seg_adv += advance;
                     }
                 }
 
@@ -271,6 +274,7 @@ pub fn compute_single_item_placement(
     let origin_z = p.origin_z;
 
     let cell_advance = crate::text::fu_to_world(trie.metrics.advance_fu as i32, em_height_fu);
+    let tabs = TabStops::of(p, cell_advance);
     let cell_height = crate::text::fu_to_world(trie.metrics.em_height_fu as i32, em_height_fu);
     let half = cell_height * 0.5;
     let mut seg_adv_stack = [0.0f32; 256];
@@ -483,7 +487,8 @@ pub fn compute_single_item_placement(
                 (base_x, base_y, base_z)
             };
 
-            let right = pos_x + r.advance;
+            let (advance, line_advance_addend) = tabs.advance(bytes[cur_pos], r.advance, line_adv);
+            let right = pos_x + advance;
             if right > page_right {
                 page_right = right;
             }
@@ -522,11 +527,11 @@ pub fn compute_single_item_placement(
 
             record_idx += 1;
             col += 1;
-            line_adv += r.advance as f64;
+            line_adv += line_advance_addend;
             if fold_unit > 0 && col % fold_unit == 0 {
                 seg_adv = 0.0;
             } else {
-                seg_adv += r.advance;
+                seg_adv += advance;
             }
 
             cur_pos += 1;
@@ -614,6 +619,7 @@ pub fn compute_single_item_placement(
 
 /// Fast parallel scan to compute an item's measured max_row_extent using SIMD memchr.
 #[inline]
+#[allow(clippy::too_many_arguments)]
 pub fn scan_item_max_row_extent(
     bytes: &[u8],
     fold_unit: usize,
@@ -621,6 +627,7 @@ pub fn scan_item_max_row_extent(
     bitmap_adv: f32,
     em_height_fu: u32,
     cluster_mode: crate::fold::ClusterMode,
+    tab_width: crate::fold::TabWidth,
 ) -> f32 {
     let cluster = cluster_mode == crate::fold::ClusterMode::Cluster;
     let rctx = ResolveCtx { trie, bitmap_adv, em_height_fu, cluster };
@@ -629,6 +636,7 @@ pub fn scan_item_max_row_extent(
     let mut pos = 0usize;
 
     let cell_advance = crate::text::fu_to_world(trie.metrics.advance_fu as i32, em_height_fu);
+    let tabs = TabStops::new(tab_width, cell_advance);
     let fu = fold_unit;
     let mut seg_adv_stack = [0.0f32; 256];
     let mut seg_adv_heap = Vec::new();
@@ -705,12 +713,13 @@ pub fn scan_item_max_row_extent(
             if item_rel_x as f32 > widest {
                 widest = item_rel_x as f32;
             }
+            let (advance, line_advance_addend) = tabs.advance(bytes[cur_pos], r.advance, line_adv);
             col += 1;
-            line_adv += r.advance as f64;
+            line_adv += line_advance_addend;
             if fu > 0 && col.is_multiple_of(fu) {
                 seg_adv = 0.0;
             } else {
-                seg_adv += r.advance;
+                seg_adv += advance;
             }
             cur_pos += 1;
         }

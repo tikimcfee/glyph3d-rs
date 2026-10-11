@@ -30,6 +30,10 @@
 //! advance the atlas carries is a whole number of cells (one test below
 //! holds that over the entire trie), so the fold's f64 sum of f32 advances is
 //! exactly `cells × cell_adv` and narrows to the same f32 as the product.
+//! The same count is what a tab stop is measured from (2026-10-11,
+//! `fold::TabWidth`: to the next multiple of the item's width, from the
+//! line's start), so a seed needs no lane for it; the walks here count a
+//! tab as the cells it spans, in the seeds and in `width_cells`.
 //!
 //! Cuts are planned every [`SEGMENT_BYTES`] from the line's start (or from a
 //! chunk's start, for the continuation of a line a chunk cut split), landing
@@ -51,6 +55,7 @@ use crate::text::fu_to_world;
 
 use super::char_resolve::{self, ResolveCtx};
 use super::chunk::LayoutChunk;
+use super::tab_stop::TabStops;
 
 /// Planned distance between the cuts of a long line, in bytes. One GPU
 /// invocation lays out one segment serially, so this bounds the longest
@@ -392,6 +397,7 @@ pub(crate) fn seed_continued_lines(
                 0
             };
             let rctx = ResolveCtx { trie, bitmap_adv, em_height_fu, cluster: char_resolve::clusters(p) };
+            let tabs = TabStops::of(p, cell_adv);
             let mut col = chunk_initial_cols[ci];
             let mut seg = chunk_initial_seg_advs[ci];
             let mut cells = (chunk_initial_line_advs[ci] / cell_adv as f64).round() as u32;
@@ -424,13 +430,14 @@ pub(crate) fn seed_continued_lines(
                 if r.is_newline {
                     break;
                 }
+                let (advance, _) = tabs.advance_at_cells(c.bytes[pos], r.advance, cells as u64);
                 col += 1;
-                cells += cells_of(r.advance, cell_adv);
+                cells += cells_of(advance, cell_adv);
                 if fold_unit > 0 {
                     if col % fold_unit == 0 {
                         seg = 0.0;
                     } else {
-                        seg += r.advance;
+                        seg += advance;
                     }
                 }
             }
@@ -488,6 +495,10 @@ pub(crate) fn measure_continued_line_widths(
             let range = t.item_lines(c.item_index);
             let idx = t.entries[range.clone()].iter().rposition(|e| (e.byte_start as usize) < c.byte_offset).map(|k| range.start + k)?;
             let rctx = ResolveCtx { trie, bitmap_adv, em_height_fu, cluster: char_resolve::clusters(p) };
+            let tabs = TabStops::of(p, cell_adv);
+            // The line's cells, for its tabs: a fold boundary resets `unit`,
+            // never this.
+            let mut line_cells = (chunk_initial_line_advs[ci] / cell_adv as f64).round() as u64;
             let mut col = chunk_initial_cols[ci];
             let mut unit = if fold_unit > 0 {
                 cells_of(chunk_initial_seg_advs[ci], cell_adv)
@@ -503,8 +514,11 @@ pub(crate) fn measure_continued_line_widths(
                 if r.is_newline {
                     break;
                 }
+                let (advance, _) = tabs.advance_at_cells(c.bytes[pos], r.advance, line_cells);
+                let k = cells_of(advance, cell_adv);
+                line_cells += k as u64;
                 col += 1;
-                unit += cells_of(r.advance, cell_adv);
+                unit += k;
                 if fold_unit > 0 && col % fold_unit == 0 {
                     width = width.max(unit);
                     unit = 0;

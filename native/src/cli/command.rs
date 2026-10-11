@@ -44,9 +44,9 @@ pub enum FixtureTask {
     Fold(Vec<PathBuf>),
     Scan(Vec<PathBuf>),
     Bake(Vec<PathBuf>),
-    /// HyperLayout vs the oracle-backed fold; the mode applies to directory
-    /// and text inputs (fixtures carry their own).
-    HyperOracle(Vec<PathBuf>, crate::fold::ClusterMode),
+    /// HyperLayout vs the oracle-backed fold; the mode and the tab width
+    /// apply to directory and text inputs (fixtures carry their own).
+    HyperOracle(Vec<PathBuf>, crate::fold::ClusterMode, crate::fold::TabWidth),
     /// The visible-set line table over the inputs, printed (M1 of the
     /// GPU-direction plan).
     LineTableStats(Vec<PathBuf>, crate::fold::ClusterMode),
@@ -78,6 +78,12 @@ pub enum RenderTarget {
 }
 
 impl Cli {
+    /// The tab stops a repo load lays out with: `--tab-width`, else the
+    /// config's `[layout] tab_width_cells` (2026-10-11).
+    pub fn resolved_tab_width(&self) -> crate::fold::TabWidth {
+        self.tab_width.unwrap_or_else(|| crate::config::settings().layout.tab_width())
+    }
+
     /// Resolve the parsed CLI flags into an explicit, strongly typed command.
     pub fn action(&self) -> CliCommand {
         if let Some(shell) = self.generate {
@@ -111,6 +117,7 @@ impl Cli {
             return CliCommand::Fixture(FixtureTask::HyperOracle(
                 self.hyper_oracle_check.clone(),
                 self.cluster_mode,
+                self.resolved_tab_width(),
             ));
         }
         if !self.line_table_stats.is_empty() {
@@ -129,6 +136,7 @@ impl Cli {
                 wrap_mode: self.wrap_mode,
                 z_wrap_spacing: self.z_wrap_spacing,
                 cluster_mode: self.cluster_mode,
+                tab_width: self.resolved_tab_width(),
                 layout_mode: self.layout_mode,
                 color_mode: self.color_mode,
                 field_mode: self.field_mode,
@@ -168,6 +176,7 @@ impl Cli {
                 wrap_mode: self.wrap_mode,
                 z_wrap_spacing: self.z_wrap_spacing,
                 cluster_mode: self.cluster_mode,
+                tab_width: self.resolved_tab_width(),
                 layout_mode: self.layout_mode,
                 color_mode: self.color_mode,
                 emoji_sheet,

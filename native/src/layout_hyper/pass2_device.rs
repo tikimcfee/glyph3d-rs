@@ -17,6 +17,7 @@ use crate::layout::{FileTintAccum, InkExtent, ItemPlacement, LayoutItem, PageExt
 use glyph_field_derived::DerivedSlot;
 use super::char_resolve::{resolve_byte_char, ResolveCtx};
 use super::page::Pager;
+use super::tab_stop::TabStops;
 use super::types::Pass2DeviceOutput;
 
 /// What every glyph of one row run shares, computed once per run and handed
@@ -470,6 +471,9 @@ fn layout_pass2_chunk<E: SlotEmit>(
     let mut cached_pz = 0.0f32;
 
     let ascii_adv = crate::text::fu_to_world(1229, em_height_fu);
+    // A chunk's tabs are measured from its seed, `initial_line_adv`: the
+    // aggregation's true line state at the chunk's start (2026-10-11).
+    let tabs = TabStops::of(p, ascii_adv);
     let mut last_ink_y = f32::NAN;
     let mut last_ink_z = f32::NAN;
     let mut emoji_cells = 0usize;
@@ -1384,7 +1388,8 @@ fn layout_pass2_chunk<E: SlotEmit>(
         let pos_y = cached_py;
         let pos_z = cached_pz;
 
-        let right = pos_x + r.advance;
+        let (advance, line_advance_addend) = tabs.advance(bytes[pos], r.advance, line_adv);
+        let right = pos_x + advance;
         if right > page_right {
             page_right = right;
         }
@@ -1523,11 +1528,11 @@ fn layout_pass2_chunk<E: SlotEmit>(
             line_start_col = 0;
         } else {
             col += 1;
-            line_adv += r.advance as f64;
+            line_adv += line_advance_addend;
             if fold_unit > 0 && col % fold_unit == 0 {
                 seg_adv = 0.0;
             } else {
-                seg_adv += r.advance;
+                seg_adv += advance;
             }
         }
 

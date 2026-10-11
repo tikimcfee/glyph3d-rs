@@ -78,6 +78,7 @@ impl VisibleStaging {
                 crate::fold::WrapMode::Back => WRAP_BACK,
             },
             cluster: u32::from(super::char_resolve::clusters(p)),
+            tab_width: p.tab_width.cells(),
             byte_base,
             byte_len: seed.byte_len,
             first_line: lines.start as u32,

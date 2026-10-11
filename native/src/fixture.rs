@@ -305,6 +305,9 @@ fn load_pipe_bytes(raw: &[u8], name: String) -> Result<PipeFixture, String> {
             wrap_mode: crate::fold::WrapMode::from_code(r.f64()? as i64),
             // v5: the cluster MODE, beside the wrap mode — same kind, same rule.
             cluster_mode: crate::fold::ClusterMode::from_code(r.f64()? as i64),
+            // No wire lane: the oracle has no tab stops, so every fixture item
+            // lays a tab out as one cell (2026-10-11).
+            tab_width: crate::fold::TabWidth::ONE_CELL,
             z_step: r.f64()?,
             line_height: r.f64()?,
             has_page: r.f64()? > 0.5,
@@ -610,6 +613,7 @@ pub fn diff_against_reference_layout(fx: &PipeFixture) -> DiffOutcome {
         &fx.bytes,
         [it.origin_x, it.origin_y, it.origin_z],
         it.line_height,
+        it.tab_width,
     );
 
     let positions = fx.leader_bytes();

@@ -195,6 +195,105 @@ impl ClusterMode {
     }
 }
 
+/// THE TAB STOP WIDTH — an ITEM-LEVEL parameter, exactly like
+/// [`WrapMode`] (2026-10-11).
+///
+/// A tab advances to the next multiple of this many DISPLAY CELLS, counted
+/// along x from the start of its LOGICAL line; a tab already on a stop
+/// advances a whole stop. A cell is the primary font's advance, which is the
+/// advance the trie gives the tab itself; a double-width glyph (a bitmap
+/// emoji, a sequence head) counts two, a zero-width trailer none; and a wrap
+/// segment or a column page does NOT restart the count — what an editor does
+/// under soft wrap. One cell, the default, is the layout every engine had
+/// before tab stops: a tab is one ordinary advance.
+///
+/// WHY DISPLAY CELLS FROM THE LOGICAL LINE, measured against the other two
+/// choices. It is EXACT: every atlas advance is a whole number of cells
+/// (`line_table::tests::every_trie_advance_is_whole_cells`), so a line's
+/// cell count is an integer, and every engine already carries it or recovers
+/// it exactly — the f64 line advance is exactly `cells × cell`, and the
+/// Visible field's segment seeds carry `cells`. It is CHEAP: the count never
+/// resets at a fold boundary, so a chunk or segment seeded mid-line needs no
+/// state it did not already have, and nothing but a tab reads it. Leader
+/// columns are wrong as soon as a line holds two tabs (the second would be
+/// measured from a column the first did not advance) or a double-width glyph;
+/// a count restarted per wrap segment would need a new seed lane and a reset
+/// on every fold boundary of every walk.
+///
+/// THE MEASURES of a tab that spans `k` cells: its ADVANCE lane, and the f32
+/// segment carrier's addend, is `f32(k) × cell` — one correctly rounded
+/// product (WGSL's `*` is correctly rounded too); the f64 line advance takes
+/// `k × cell` exactly, so it stays `cells × cell` and the foldless x and the
+/// Visible seeds stay exact. Its COLUMN is still one leader: wrap, rows,
+/// pages and pick are untouched, as they are by a double-width glyph.
+///
+/// NO ORACLE past one cell: the JS oracle and the fixture corpus know only
+/// one-advance tabs, so every fixture lays out at [`TabWidth::ONE_CELL`], and
+/// a wider stop is held only to this tree's own serial fold (and to
+/// `text::reference_layout`, the independent lineage).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct TabWidth(u32);
+
+impl TabWidth {
+    /// A tab is one ordinary advance: the layout before tab stops, and the
+    /// only width the oracle's corpus covers.
+    pub const ONE_CELL: TabWidth = TabWidth(1);
+    /// The widest stop accepted — a bound on input, not on the arithmetic
+    /// (`f32(k)` is exact far past it): a stop wider than any editor offers
+    /// is a typo, and the Visible kernel's u32 cell counts stay small.
+    pub const MAX_CELLS: u32 = 64;
+
+    /// A width of `cells` cells, refused outside `1..=MAX_CELLS` (a stop
+    /// every zero cells is not a layout).
+    pub fn new(cells: u32) -> Result<Self, String> {
+        if (1..=Self::MAX_CELLS).contains(&cells) {
+            Ok(TabWidth(cells))
+        } else {
+            Err(format!("a tab stop must be 1..={} cells wide, got {cells}", Self::MAX_CELLS))
+        }
+    }
+
+    /// The width in cells.
+    #[inline(always)]
+    pub const fn cells(self) -> u32 {
+        self.0
+    }
+
+    /// Whether a tab can span more than one cell — false at one cell, where
+    /// every walk keeps the advance the trie gave the tab.
+    #[inline(always)]
+    pub const fn expands(self) -> bool {
+        self.0 > 1
+    }
+
+    /// The cells a tab spans when its line has already reached `line_cells`
+    /// display cells: to the next multiple of the width.
+    #[inline(always)]
+    pub const fn tab_cells(self, line_cells: u64) -> u32 {
+        self.0 - (line_cells % self.0 as u64) as u32
+    }
+}
+
+impl Default for TabWidth {
+    fn default() -> Self {
+        Self::ONE_CELL
+    }
+}
+
+impl std::fmt::Display for TabWidth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl std::str::FromStr for TabWidth {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let cells: u32 = s.trim().parse().map_err(|_| format!("a tab width is a whole number of cells, got {s:?}"))?;
+        Self::new(cells)
+    }
+}
+
 /// One file in the arena: byte range + layout params.
 ///
 /// `line_height` is REQUIRED: a NaN one is malformed input, not a request for a
@@ -213,6 +312,9 @@ pub struct Item {
     pub wrap_mode: WrapMode,
     /// Item-level, exactly like `wrap_mode`. See [`ClusterMode`].
     pub cluster_mode: ClusterMode,
+    /// Item-level, exactly like `wrap_mode`. See [`TabWidth`]. The `.pipe.bin`
+    /// wire carries none: a fixture item is [`TabWidth::ONE_CELL`].
+    pub tab_width: TabWidth,
     pub z_step: f64,
     pub line_height: f64,
     pub has_page: bool,
@@ -489,6 +591,19 @@ pub(crate) fn derive_stride(max_row_extent: f64, item: &Item) -> f64 {
     }
 }
 
+/// The whole number of cells `advance` is, for the fold's tab-stop count —
+/// FAIL LOUD on an advance that is not one: tab stops are defined in whole
+/// cells, and a trie with fractional advances (a fixture's synthetic one) has
+/// no stops wider than one cell to lay out.
+fn whole_cells(advance: f32, cell_advance: f32) -> u64 {
+    let cells = (advance as f64 / cell_advance as f64).round();
+    assert!(
+        cells >= 0.0 && cells * cell_advance as f64 == advance as f64,
+        "tab stops count whole cells: an advance of {advance} is not a multiple of the cell {cell_advance}"
+    );
+    cells as u64
+}
+
 /// Whether paginate does anything for this item — an all-zero page is an
 /// identity remap the kernel early-returns from, so the driver may skip it.
 pub(crate) fn page_active(item: &Item) -> bool {
@@ -664,9 +779,15 @@ pub(crate) fn resolve_clusters<T: ResolveGlyph + ?Sized>(
 /// `write_bounds` is false for a paged item (paginate is about to rewrite every
 /// position, so a box computed here would describe the pre-page layout) and for
 /// a RESUMED range (a partial range must not publish a whole item's box).
+///
+/// `bytes` and `cell_advance` serve the item's tab stops alone ([`TabWidth`]):
+/// which leaders are tabs, and the cell — the advance the trie gives a tab.
+/// At [`TabWidth::ONE_CELL`] neither is read.
 fn layout_item(
+    bytes: &[u8],
     slots: &mut Slots,
     item: &Item,
+    cell_advance: f32,
     scalars: &mut [f64],
     scalar_base: usize,
     write_bounds: bool,
@@ -705,6 +826,10 @@ fn layout_item(
     let mut line_advance: f64 = 0.0; // f64 chain — the truth-layer prefix
     let mut segment_advance: f32 = 0.0; // genuine f32 — the GPU's summation order
     let mut ord: i64 = 0;
+    // The line's display cells, counted only when a tab can span more than
+    // one: the integer twin of `line_advance`, never reset by a fold.
+    let tab_width = item.tab_width;
+    let mut line_cells: u64 = 0;
 
     let start = item.byte_start as usize;
     let stop = (item.byte_start + item.byte_count) as usize;
@@ -715,7 +840,24 @@ fn layout_item(
             // stores unnecessary, and the lanes already hold zero.
             continue;
         }
-        let advance = slots.advance(id);
+        let mut advance = slots.advance(id);
+        // A TAB'S ADVANCE IS POSITIONAL (2026-10-11): it reaches the next stop
+        // of `tab_width` cells, so the fold writes it here, over the trie's
+        // advance decode stored — the one static lane the fold rewrites.
+        // `line_advance_addend` is the exact `cells × cell` the f64 carrier
+        // takes (`f32(k) × cell` widened is not it when the product rounds).
+        let mut line_advance_addend = advance as f64;
+        if tab_width.expands() {
+            if bytes.get(id) == Some(&b'\t') {
+                let cells = tab_width.tab_cells(line_cells);
+                advance = cells as f32 * cell_advance;
+                line_advance_addend = cells as f64 * cell_advance as f64;
+                slots.sm[id * 2] = advance;
+                line_cells += cells as u64;
+            } else if slots.flags(id) & F_NEWLINE == 0 {
+                line_cells += whole_cells(advance, cell_advance);
+            }
+        }
         // TWO indices, and under WrapBack they differ. `wrap_segment` is the DEPTH
         // fan's index and always exists; `wrap_row` is what that segment
         // contributes to the ROW, which WrapBack makes zero. The newline is a
@@ -789,9 +931,10 @@ fn layout_item(
             col = 0;
             line_advance = 0.0;
             segment_advance = 0.0;
+            line_cells = 0;
         } else {
             col += 1;
-            line_advance += advance as f64;
+            line_advance += line_advance_addend;
             // `col` is the INCREMENTED column here — a segment closes on the
             // glyph that fills it, not on the one after.
             if fold_unit > 0 && col % fold_unit == 0 {
@@ -997,9 +1140,13 @@ pub fn run_pipeline<T: ResolveGlyph + ?Sized>(
     }
 
     // ── the fold, per item ────────────────────────────────────────────────────
+    // The cell a tab stop counts in: the advance the trie gives the tab
+    // itself (the primary font's cell on the atlas). Read only by an item
+    // whose stops are wider than one cell.
+    let cell_advance = trie.resolve(0x09).advance;
     let mut item_bounds = vec![0.0f64; items.len() * 8];
     for (index, item) in items.iter().enumerate() {
-        layout_item(&mut slots, item, &mut item_bounds, index * 8, !page_active(item));
+        layout_item(bytes, &mut slots, item, cell_advance, &mut item_bounds, index * 8, !page_active(item));
     }
 
     // ── paginate: stride DERIVED from the fold's own scalar 7 ─────────────────
@@ -1494,5 +1641,163 @@ mod tests {
         // And the box's near edge follows: with the phantom, the newline
         // reached a segment no glyph occupies and dragged min Z with it.
         assert_eq!(r.item_bounds[2], 1.5, "box min Z = the deepest segment a cell reaches");
+    }
+
+    // ── Tab stops (2026-10-11) ─────────────────────────────────────────────
+    //
+    // The oracle has no tab stops, so past one cell nothing oracle-recorded
+    // can judge this fold. Two witnesses stand in: the independent lineage
+    // (`text::reference_layout`, written from the rule, not from this file),
+    // and the oracle-backed ONE-cell fold itself, over the same text with each
+    // tab replaced by the spaces that fill to its stop.
+
+    /// The tab-stop corpus: tabs at a line's start, after ASCII, after a
+    /// double-width emoji, after a CJK miss (one cell), after zero-width trailers in
+    /// cluster mode, back to back, on a stop already, and lines of every
+    /// phase.
+    const TABBED: &str = "\tlead\n\
+        a\tb\tcc\tddd\teeee\t|\n\
+        \u{4E16}\u{754C}\tcjk\t\u{E9}t\u{E9}\t|\n\
+        \u{1F680}\trocket\t\t\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}\tfam\n\
+        1\u{FE0F}\u{20E3}\tkey\tabcdefgh\t\t\t|\n\
+        \n\
+        no tab here\n\
+        tail\t";
+
+    fn tab_item(bytes: usize, cluster: ClusterMode, wrap: i64, tab_width: TabWidth) -> Item {
+        Item {
+            byte_start: 0,
+            byte_count: bytes as i64,
+            origin_x: 0.25,
+            origin_y: 1.0,
+            line_height: 1.25,
+            wrap_width: wrap,
+            z_step: 0.3,
+            cluster_mode: cluster,
+            tab_width,
+            ..Item::default()
+        }
+    }
+
+    #[test]
+    fn tab_width_is_refused_outside_its_domain_and_spans_to_the_next_stop() {
+        assert!(TabWidth::new(0).is_err() && TabWidth::new(TabWidth::MAX_CELLS + 1).is_err());
+        assert_eq!(TabWidth::default(), TabWidth::ONE_CELL);
+        assert!(!TabWidth::ONE_CELL.expands());
+        let four = TabWidth::new(4).unwrap();
+        // From cell 0 a whole stop; from 1, 2, 3 to 4; on a stop, a whole stop.
+        let spans: Vec<u32> = (0..9).map(|c| four.tab_cells(c)).collect();
+        assert_eq!(spans, [4, 3, 2, 1, 4, 3, 2, 1, 4]);
+        assert_eq!("8".parse::<TabWidth>().unwrap().cells(), 8);
+        assert!("0".parse::<TabWidth>().is_err() && "x".parse::<TabWidth>().is_err());
+    }
+
+    /// The fold's tab stops against `text::reference_layout`'s, every lane of
+    /// every record bit for bit, on the atlas trie in leader mode (the
+    /// reference resolves no sequences) with no wrap (its domain), at widths
+    /// whose products are exact (2, 4, 8) and are not (5, 7: `f32(5) × cell`
+    /// rounds) — the f64 line advance must take the exact multiple, or the
+    /// glyph after such a tab moves by an ulp.
+    #[test]
+    fn tab_stops_agree_with_the_independent_reference() {
+        let trie = crate::default_trie();
+        let bytes = TABBED.as_bytes();
+        let mut moved = 0usize;
+        for width in [1u32, 2, 4, 5, 7, 8] {
+            let tab_width = TabWidth::new(width).unwrap();
+            let item = tab_item(bytes.len(), ClusterMode::Leader, 0, tab_width);
+            let fold = run_pipeline(bytes, &*trie, &[item]);
+            let reference = crate::text::reference_layout(&*trie, bytes, [item.origin_x, item.origin_y, item.origin_z], item.line_height, tab_width);
+            let leaders: Vec<usize> = (0..bytes.len()).filter(|&id| fold.slots.flags(id) & F_LEADER != 0).collect();
+            assert_eq!(leaders.len(), reference.len(), "width {width}: record count");
+            for (&id, r) in leaders.iter().zip(&reference) {
+                let s = &fold.slots;
+                assert_eq!(
+                    (s.x(id).to_bits(), s.y(id).to_bits(), s.z(id).to_bits(), s.advance(id).to_bits(), s.height(id).to_bits()),
+                    (r.x.to_bits(), r.y.to_bits(), r.z.to_bits(), r.advance.to_bits(), r.height.to_bits()),
+                    "width {width}: byte {id} measures (fold x {} adv {} | reference x {} adv {})",
+                    s.x(id),
+                    s.advance(id),
+                    r.x,
+                    r.advance
+                );
+                assert_eq!((s.gi[id], s.row(id) as u32, s.col(id) as u32), (r.glyph_id, r.row, r.col), "width {width}: byte {id} counts");
+                if width > 1 && bytes[id] == b'\t' && s.advance(id) != trie.resolve(0x09).advance {
+                    moved += 1;
+                }
+            }
+        }
+        assert!(moved > 30, "the stops never spanned more than one cell: {moved}");
+    }
+
+    /// Past one cell the oracle has nothing to say about a tab, but it has
+    /// recorded what SPACES do: a tab that spans `k` cells must put every
+    /// glyph after it where `k` spaces in its place put it under the
+    /// oracle-backed one-cell fold — bit for bit, when no fold unit turns in
+    /// between (wrap 0: the f64 line advance, exactly `cells × cell` either
+    /// way). Both cluster modes; `k` is read from the text's own one-cell
+    /// layout (each leader's advance in cells), so a double-width head and its
+    /// zero-width trailers count as the fold counts them.
+    #[test]
+    fn tab_stops_lay_out_as_the_spaces_that_fill_to_the_stop() {
+        let trie = crate::default_trie();
+        let cell = trie.resolve(0x09).advance;
+        let bytes = TABBED.as_bytes();
+        let mut compared = 0usize;
+        for cluster in [ClusterMode::Leader, ClusterMode::Cluster] {
+            let one = run_pipeline(bytes, &*trie, &[tab_item(bytes.len(), cluster, 0, TabWidth::ONE_CELL)]);
+            for width in [2u32, 4, 5, 8] {
+                let tab_width = TabWidth::new(width).unwrap();
+                // Expand: each tab becomes the spaces to its stop, the line's
+                // cells read off the one-cell layout's advances.
+                let mut expanded: Vec<u8> = Vec::new();
+                let mut at_of: Vec<Option<usize>> = Vec::new(); // byte -> its byte in `expanded`
+                let mut line_cells = 0u64;
+                for (id, &b) in bytes.iter().enumerate() {
+                    if b == b'\t' {
+                        let k = tab_width.tab_cells(line_cells);
+                        at_of.push(None);
+                        expanded.extend(std::iter::repeat_n(b' ', k as usize));
+                        line_cells += k as u64;
+                        continue;
+                    }
+                    at_of.push(Some(expanded.len()));
+                    expanded.push(b);
+                    if b == b'\n' {
+                        line_cells = 0;
+                    } else if one.slots.flags(id) & F_LEADER != 0 {
+                        line_cells += (one.slots.advance(id) / cell).round() as u64;
+                    }
+                }
+                let tabbed = run_pipeline(bytes, &*trie, &[tab_item(bytes.len(), cluster, 0, tab_width)]);
+                let spaced = run_pipeline(&expanded, &*trie, &[tab_item(expanded.len(), cluster, 0, TabWidth::ONE_CELL)]);
+                for (id, at) in at_of.iter().enumerate() {
+                    let Some(at) = *at else { continue };
+                    if tabbed.slots.flags(id) & F_LEADER == 0 {
+                        continue;
+                    }
+                    assert_eq!(
+                        (tabbed.slots.x(id).to_bits(), tabbed.slots.y(id).to_bits(), tabbed.slots.gi[id]),
+                        (spaced.slots.x(at).to_bits(), spaced.slots.y(at).to_bits(), spaced.slots.gi[at]),
+                        "{cluster:?} width {width}: byte {id} (spaced byte {at}) x {} vs {}",
+                        tabbed.slots.x(id),
+                        spaced.slots.x(at)
+                    );
+                    compared += 1;
+                }
+            }
+        }
+        assert!(compared > 500, "compared only {compared} glyphs");
+    }
+
+    /// A trie whose advances are not whole cells has no stops wider than
+    /// one: the fold refuses rather than counting cells it cannot count.
+    #[test]
+    #[should_panic(expected = "tab stops count whole cells")]
+    fn tab_stops_refuse_a_trie_of_fractional_advances() {
+        // The test trie: letters 0.5 wide, the tab (a miss) 0.61.
+        let t = trie();
+        let bytes = b"ab\tc";
+        let _ = run_pipeline(bytes, &t, &[tab_item(bytes.len(), ClusterMode::Leader, 0, TabWidth::new(4).unwrap())]);
     }
 }

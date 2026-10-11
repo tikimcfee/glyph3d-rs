@@ -165,6 +165,11 @@ pub struct RepoParams {
     /// which resolves no sequences, depends on that); the CLI/product default flipped to cluster on
     /// 2026-09-22, and the goldens pin their mode explicitly.
     pub cluster_mode: crate::fold::ClusterMode,
+    /// TAB STOPS, per item (`fold::TabWidth`, 2026-10-11): a tab advances to
+    /// the next multiple of this many display cells of its line. The default
+    /// is the `[layout] tab_width_cells` setting (one cell — the layout before
+    /// stops, and every golden's); `--tab-width` sets it per load.
+    pub tab_width: crate::fold::TabWidth,
     /// Spatial arrangement mode for the repository files across the canvas.
     pub layout_mode: RepoLayoutMode,
     /// Colorization strategy during load: `Syntax` (eager CPU lexer) or `Flat` (fast geometric load).
@@ -258,6 +263,7 @@ impl Default for RepoParams {
             z_wrap_spacing: 0.15,
             wrap_mode: crate::fold::WrapMode::Back,
             cluster_mode: crate::fold::ClusterMode::Leader,
+            tab_width: crate::config::settings().layout.tab_width(),
             layout_mode: RepoLayoutMode::Shelf,
             color_mode: ColorMode::Flat,
             field_mode: glyph_field::GlyphFieldMode::default(),
@@ -287,6 +293,7 @@ pub fn file_item_params(p: &RepoParams, byte_len: usize, newline_count: usize) -
         wrap_width: p.wrap_cols,
         wrap_mode: p.wrap_mode,
         cluster_mode: p.cluster_mode,
+        tab_width: p.tab_width,
         has_page: true,
         page_rows: p.page_rows,
         page_cols: 0,

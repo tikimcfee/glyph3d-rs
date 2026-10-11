@@ -21,7 +21,12 @@ use crate::glyph_scene::{seg_tint, GlyphInstance, GroupRow, PickContext, SegCull
 pub const CELL_HEIGHT_WORLD: f32 = 1.0;
 /// Line pitch as a multiple of the em height (looser than 1.0 for readability).
 pub const LINE_HEIGHT_FACTOR: f32 = 1.25;
-/// Tab stop width in cells.
+/// `stage_file`'s tab stop width in cells: `--render-file`'s own, fixed,
+/// and what `text.png` (whose fixture has tabs) is taken under. NOT the
+/// layout recipe's tab width (`fold::TabWidth`, `[layout] tab_width_cells`,
+/// one cell by default, 2026-10-11), which this stager never reads; the two
+/// meet when `--render-file` becomes a one-item repo load (step 2 of the
+/// Instanced retirement), whose recipe will then carry 4.
 pub const TAB_CELLS: u32 = 4;
 
 /// sRGB display-value palette (VS Code dark+ flavored, brightened comments for contrast).
@@ -628,8 +633,10 @@ fn word_color(word: &str) -> [u8; 3] {
 // conventions by design: it emits ONE record per UTF-8 leader byte (newlines,
 // blanks, and missing codepoints included), accumulates X as an f64 running
 // sum of the per-glyph f32 advances (the oracle's float discipline), counts
-// COL in leader glyphs per line (no tab stops, no double-width cells), and
-// HEIGHT is the constant cell height. `reference_layout` below re-implements
+// COL in leader glyphs per line (a double-width glyph and a tab are one
+// column each; a tab's ADVANCE reaches the item's stop, `fold::TabWidth`,
+// one cell by default and in every fixture), and HEIGHT is the constant
+// cell height. `reference_layout` below re-implements
 // THAT fold on the CPU, independently, so its records can be diffed against
 // the fold's bit-for-bit.
 
@@ -742,17 +749,28 @@ pub(crate) fn fu_to_world(fu: i32, em_height_fu: u32) -> f32 {
 ///
 /// Same rule, same reason as `to_world` / `fu_to_world`: a formula written twice
 /// on purpose stops being a check the moment it is written once.
+///
+/// TAB STOPS (2026-10-11, `fold::TabWidth`) are written here a second time
+/// for the same reason, from the rule rather than from `fold.rs`: the cell
+/// count is kept from the line's own start as the f64 line advance over the
+/// tab's advance (exact — every atlas advance is whole cells), the tab's
+/// record advance is that cell narrowed from its exact f64 multiple, and the
+/// line advance takes the multiple itself. The oracle has no tab stops, so
+/// past one cell the two lineages agreeing is the only witness there is
+/// (`fold::tests::tab_stops_agree_with_the_independent_reference`).
 pub fn reference_layout<T: ResolveGlyph + ?Sized>(
     trie: &T,
     bytes: &[u8],
     origin: [f64; 3],
     line_height: f64,
+    tab_width: crate::fold::TabWidth,
 ) -> Vec<RefGlyph> {
     let mut out = Vec::new();
     let mut line_adv: f64 = 0.0; // f64 chain — the oracle's truth-layer prefix
     let mut row: u32 = 0;
     let mut col: u32 = 0;
     let mut id = 0usize;
+    let tab_cell = trie.resolve(0x09).advance as f64;
     let byte_at = |i: usize| -> u32 {
         if i < bytes.len() { bytes[i] as u32 } else { 0 }
     };
@@ -802,7 +820,16 @@ pub fn reference_layout<T: ResolveGlyph + ?Sized>(
         // comes back FLAG_MISSING with the missing advance and still occupies
         // its width.
         let e = trie.resolve(cp);
-        let advance = e.advance;
+        let mut advance = e.advance;
+        let mut line_adv_step = advance as f64;
+        if cp == 0x09 && tab_width.expands() {
+            let reached = line_adv / tab_cell;
+            assert_eq!(reached, reached.round(), "tab stops count whole cells; the line reached {reached} cells");
+            let width = tab_width.cells() as f64;
+            let spanned = width - reached % width;
+            line_adv_step = spanned * tab_cell;
+            advance = line_adv_step as f32;
+        }
         let height = e.height;
         out.push(RefGlyph {
             // Same narrowing points as the fold: f32(x + ox), f32(-row*lh + oy).
@@ -821,7 +848,7 @@ pub fn reference_layout<T: ResolveGlyph + ?Sized>(
             line_adv = 0.0;
         } else {
             col += 1;
-            line_adv += advance as f64;
+            line_adv += line_adv_step;
         }
         id += 1;
     }

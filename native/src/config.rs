@@ -28,6 +28,7 @@ pub const DEFAULTS_TOML: &str = include_str!("../../config/defaults.toml");
 pub struct Settings {
     pub glyph_scene: GlyphSceneSettings,
     pub lod: LodSettings,
+    pub layout: LayoutSettings,
     pub camera: CameraSettings,
     pub repo: RepoSettings,
     pub agent_cards: AgentCardSettings,
@@ -78,6 +79,24 @@ pub struct LodSettings {
     /// laid out as glyphs. The panel's "File rectangle" handle under "Show
     /// glyphs". The other modes never read it.
     pub visible_backdrop_px: f32,
+}
+
+/// The layout recipe's defaults for a repo load (`repo::RepoParams`, and
+/// from it each file's `layout::ItemParams`).
+#[derive(Clone, Debug, PartialEq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LayoutSettings {
+    /// Tab stops, in display cells (`fold::TabWidth`, 2026-10-11): 1 is a
+    /// tab of one cell, the layout before stops. Default for `--tab-width`.
+    pub tab_width_cells: u32,
+}
+
+impl LayoutSettings {
+    /// [`Self::tab_width_cells`] as the layout's type (validated when the
+    /// settings load).
+    pub fn tab_width(&self) -> crate::fold::TabWidth {
+        crate::fold::TabWidth::new(self.tab_width_cells).expect("[layout] tab_width_cells is validated at load")
+    }
 }
 
 /// Glyph-scene cameras (`glyph_scene::camera`).
@@ -413,6 +432,7 @@ impl Settings {
         if s.repo.dir_tints.is_empty() {
             return Err("[repo] dir_tints must not be empty".into());
         }
+        crate::fold::TabWidth::new(s.layout.tab_width_cells).map_err(|e| format!("[layout] tab_width_cells: {e}"))?;
         let l = &s.library;
         if !(l.page_w > 0.0 && l.page_h > 0.0 && l.max_upscale > 0.0 && l.splay_aspect > 0.0 && l.aspect > 0.0) {
             return Err("[library] page_w, page_h, max_upscale, splay_aspect and aspect must be > 0".into());
@@ -507,6 +527,19 @@ mod tests {
         assert_eq!(Settings::with_overrides(both).unwrap().lod.show_glyphs_px, 3.0f32);
     }
 
+    /// `[layout] tab_width_cells` overrides from a launch config, and a
+    /// width the layout cannot lay out is refused at load, naming the key.
+    #[test]
+    fn layout_tab_width_overrides_and_refuses_zero() {
+        let over: toml::Table = toml::from_str("[layout]\ntab_width_cells = 4\n").unwrap();
+        assert_eq!(Settings::with_overrides(over).unwrap().layout.tab_width().cells(), 4);
+        for bad in ["0", "65"] {
+            let over: toml::Table = toml::from_str(&format!("[layout]\ntab_width_cells = {bad}\n")).unwrap();
+            let err = Settings::with_overrides(over).expect_err("an unlayable tab width must be refused");
+            assert!(err.contains("tab_width_cells"), "{err}");
+        }
+    }
+
     /// Migration pin: each value moved out of the code must come back from
     /// the defaults file bit-identical to the literal it replaced (a TOML
     /// float goes decimal -> f64 -> f32, which can land one ulp away from a
@@ -523,6 +556,9 @@ mod tests {
         assert_eq!(s.lod.text_detail_px, 10.0f32);
         assert_eq!(s.lod.backdrop_gain, 0.7f32);
         assert_eq!(s.lod.visible_backdrop_px, 0.25f32);
+        // Not a migrated literal but the same standing: one cell is the tab
+        // every golden view and fixture was taken under (2026-10-11).
+        assert_eq!(s.layout.tab_width(), crate::fold::TabWidth::ONE_CELL);
         let c = &s.camera;
         assert_eq!(c.fov_y_deg, 40f32);
         assert_eq!((c.frame_margin, c.frame_pad), (1.08f32, 2.0f32));

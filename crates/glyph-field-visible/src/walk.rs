@@ -10,7 +10,10 @@
 //!
 //! Only what the slot INDEX depends on is here: which bytes are leaders and
 //! whether they survive (glyph != 0). X, rows and colour are the kernel's
-//! business and never affect a slot's position.
+//! business and never affect a slot's position. Tab stops (2026-10-11) are
+//! x alone — a tab is glyph 0 however many cells it spans — so nothing here
+//! reads the item's tab width, and [`Leader::cells`] is the trie's one cell
+//! for a tab, not its span.
 
 use crate::tables::{PackedTrie, PK_GLYPH_MASK, PK_K_SHIFT, PK_RESOLVED_MASK, PK_SEQ_FIRST};
 

@@ -44,6 +44,10 @@ fn defaults_match_old_parser() {
     assert_eq!(cli.cluster_mode, fold::ClusterMode::Cluster);
     assert_eq!(parse_cluster_mode("cluster"), fold::ClusterMode::Cluster);
     assert_eq!(parse_cluster_mode("leader"), fold::ClusterMode::Leader);
+    // Tab stops (2026-10-11): no flag, so the config's one cell — the
+    // layout every golden view is taken under.
+    assert!(cli.tab_width.is_none());
+    assert_eq!(cli.resolved_tab_width(), fold::TabWidth::ONE_CELL);
     assert_eq!(cli.layout_mode, crate::repo::RepoLayoutMode::Shelf);
     assert_eq!(parse_layout_mode("shelf"), crate::repo::RepoLayoutMode::Shelf);
     assert_eq!(parse_layout_mode("carrel"), crate::repo::RepoLayoutMode::Carrel);
@@ -147,6 +151,32 @@ fn an_unknown_cluster_mode_is_refused() {
         Err(e) => e.to_string(),
     };
     assert!(text.contains("grapheme"), "the error must name the bad value: {text}");
+}
+
+/// `--tab-width N` (2026-10-11): parsed into the layout's type, carried
+/// into the repo scene, the scan-only load and the oracle check, and a width
+/// the layout cannot lay out is REFUSED at the boundary with the flag named.
+#[test]
+fn tab_width_parses_rides_along_and_refuses_what_cannot_lay_out() {
+    let cli = parse(&["--load-repo", "fixtures/g-pick-repo", "--tab-width", "4"]);
+    assert_eq!(cli.tab_width.map(fold::TabWidth::cells), Some(4));
+    assert_eq!(cli.resolved_tab_width().cells(), 4);
+    let CliCommand::Render(plan) = cli.action() else { panic!("a repo load renders") };
+    let SceneChoice::Repo { tab_width, .. } = plan.choice else { panic!("--load-repo is a repo scene") };
+    assert_eq!(tab_width.cells(), 4, "the flag reaches the repo scene's recipe");
+    let cli = parse(&["--load-repo", "fixtures/g-pick-repo", "--repo-scan-only", "--tab-width", "8"]);
+    let CliCommand::RepoScanOnly { params, .. } = cli.action() else { panic!("--repo-scan-only") };
+    assert_eq!(params.tab_width.cells(), 8);
+    let cli = parse(&["--hyper-oracle-check", "some/dir", "--tab-width", "3"]);
+    let CliCommand::Fixture(FixtureTask::HyperOracle(_, _, tab_width)) = cli.action() else { panic!("--hyper-oracle-check") };
+    assert_eq!(tab_width.cells(), 3);
+    for bad in ["0", "65", "four"] {
+        let text = match try_parse(&["--tab-width", bad]) {
+            Ok(_) => panic!("clap must refuse --tab-width {bad}"),
+            Err(e) => e.to_string(),
+        };
+        assert!(text.contains("tab-width") || text.contains("tab width"), "the error must name the flag: {text}");
+    }
 }
 
 /// Same rule: an unknown layout mode is REFUSED at the boundary.
@@ -584,9 +614,10 @@ fn cli_action_dispatch_variants() {
     assert!(matches!(cli.action(), CliCommand::Fixture(FixtureTask::Fold(_))));
     let cli = parse(&["--hyper-oracle-check", "a.pipe.bin", "some/dir"]);
     match cli.action() {
-        CliCommand::Fixture(FixtureTask::HyperOracle(paths, mode)) => {
+        CliCommand::Fixture(FixtureTask::HyperOracle(paths, mode, tab_width)) => {
             assert_eq!(paths.len(), 2);
             assert_eq!(mode, crate::fold::ClusterMode::Cluster, "the CLI default mode rides along");
+            assert_eq!(tab_width, crate::fold::TabWidth::ONE_CELL, "the default tab width rides along");
         }
         other => panic!("--hyper-oracle-check dispatched to {other:?}"),
     }

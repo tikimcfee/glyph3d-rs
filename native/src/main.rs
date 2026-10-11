@@ -98,7 +98,7 @@ fn main() {
             FixtureTask::Fold(paths) => fixture::run_fixture_fold(&paths),
             FixtureTask::Scan(paths) => scan::run_fixture_scan(&paths),
             FixtureTask::Bake(paths) => bake::run_fixture_bake(&paths),
-            FixtureTask::HyperOracle(paths, mode) => hyper_oracle::run_hyper_oracle_check(&paths, mode),
+            FixtureTask::HyperOracle(paths, mode, tab_width) => hyper_oracle::run_hyper_oracle_check(&paths, mode, tab_width),
             FixtureTask::LineTableStats(paths, mode) => {
                 glyph3d_native::layout_hyper::line_table::run_line_table_stats(&paths, mode)
             }
@@ -124,16 +124,20 @@ fn main() {
                 wrap_mode,
                 z_wrap_spacing,
                 cluster_mode,
+                tab_width,
                 layout_mode,
                 color_mode,
                 ..
             } = &plan.choice {
                 let dir = dir.clone();
                 let strategy = *strategy;
+                // The SAME recipe the scene's load builds (lib.rs): the
+                // prefetched Pass 1 is that load's Pass 1.
                 let params = repo::RepoParams {
                     wrap_mode: *wrap_mode,
                     z_wrap_spacing: *z_wrap_spacing,
                     cluster_mode: *cluster_mode,
+                    tab_width: *tab_width,
                     layout_mode: *layout_mode,
                     color_mode: *color_mode,
                     field_mode: plan.cull_opts.field_mode,

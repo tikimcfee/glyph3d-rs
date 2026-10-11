@@ -25,6 +25,12 @@ pub fn parse_z_wrap_spacing(s: &str) -> Result<f64, String> {
     Ok(v)
 }
 
+/// `--tab-width N`: tab stops every N display cells (`fold::TabWidth`,
+/// 2026-10-11), refused outside 1..=64 with the flag named.
+pub fn parse_tab_width(s: &str) -> Result<fold::TabWidth, String> {
+    s.parse().map_err(|e| format!("--tab-width: {e}"))
+}
+
 /// Parse strategy string into `Strategy`.
 pub fn parse_strategy(s: &str) -> crate::repo::Strategy {
     s.parse().unwrap_or_else(|e| panic!("--repo-engine: {e} (clap should have refused it)"))

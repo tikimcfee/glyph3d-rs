@@ -109,7 +109,10 @@ pub struct ItemGpu {
     /// the five pad words, so the row stays 128 B.
     pub override_base: u32,
     pub override_count: u32,
-    pub _pad: [u32; 3],
+    /// `VisibleItem::tab_width`, clamped at 1 (2026-10-11; took a pad word,
+    /// so the row stays 128 B).
+    pub tab_width: u32,
+    pub _pad: [u32; 2],
 }
 
 /// One per-glyph override as the kernel reads it (16 B): the glyph's leader
@@ -446,7 +449,8 @@ pub fn item_gpu(i: usize, it: &VisibleItem, place: (u32, u32), span_base: u32, s
         bbox_max: it.bbox_max,
         override_base: 0,
         override_count: 0,
-        _pad: [0; 3],
+        tab_width: it.tab_width.max(1),
+        _pad: [0; 2],
     }
 }
 
@@ -848,6 +852,7 @@ mod tests {
             wrap_width: 0,
             wrap_mode: 0,
             cluster: 1,
+            tab_width: 1,
             byte_base: 0,
             byte_len: len,
             first_line: 0,
@@ -876,6 +881,7 @@ mod tests {
             wrap_width: 0,
             wrap_mode: 0,
             cluster: 1,
+            tab_width: 1,
             byte_base: 0,
             byte_len: 100,
             first_line: 0,

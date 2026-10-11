@@ -23,6 +23,8 @@ pub use types::{ChunkPrepass, ItemPrepass, Pass2DeviceOutput, SendPtr};
 
 pub(crate) mod chunk;
 pub(crate) mod char_resolve;
+pub(crate) mod tab_stop;
+use tab_stop::TabStops;
 pub mod line_table;
 pub use line_table::{LineEntry, LineTable, SegmentSeed, SEGMENT_BYTES};
 use line_table::{cells_of, ChunkLine, ChunkLines, ChunkSeed, CutPlan};
@@ -534,6 +536,10 @@ fn pass1_prepass_chunk_walk<const COLLECT: bool>(
     let rctx = ResolveCtx { trie, bitmap_adv, em_height_fu, cluster };
     let wrap_w = p.wrap_width as i64;
     let ascii_adv = fu_to_world(1229, em_height_fu);
+    // A continuing chunk's tabs are measured here from the CHUNK's start —
+    // placeholders like the rest of its first line's x; the aggregation
+    // walks such a chunk again from the true state (`walk_line_state`).
+    let tabs = TabStops::of(p, ascii_adv);
 
     let fu = fold_unit as usize;
     let seg_adv_table: &[f32] = if fu > 0 && fu < global_seg_adv_table.len() {
@@ -609,10 +615,11 @@ fn pass1_prepass_chunk_walk<const COLLECT: bool>(
                 if x > max_row_extent {
                     max_row_extent = x;
                 }
+                let (advance, line_advance_addend) = tabs.advance(bytes[i], r.advance, line_adv);
                 col += 1;
-                line_adv += r.advance as f64;
+                line_adv += line_advance_addend;
                 if COLLECT {
-                    let k = cells_of(r.advance, ascii_adv);
+                    let k = cells_of(advance, ascii_adv);
                     cells += k;
                     unit_cells += k;
                     if fold_unit > 0 && col % fold_unit == 0 {
@@ -624,7 +631,7 @@ fn pass1_prepass_chunk_walk<const COLLECT: bool>(
                     if col % fold_unit == 0 {
                         seg_adv = 0.0;
                     } else {
-                        seg_adv += r.advance;
+                        seg_adv += advance;
                     }
                 }
             }
@@ -739,10 +746,11 @@ fn pass1_prepass_chunk_walk<const COLLECT: bool>(
                 if x > max_row_extent {
                     max_row_extent = x;
                 }
+                let (advance, line_advance_addend) = tabs.advance(bytes[i], r.advance, line_adv);
                 line_col += 1;
-                line_adv += r.advance as f64;
+                line_adv += line_advance_addend;
                 if COLLECT {
-                    let k = cells_of(r.advance, ascii_adv);
+                    let k = cells_of(advance, ascii_adv);
                     cells += k;
                     unit_cells += k;
                     if fold_unit > 0 && line_col % fold_unit == 0 {
@@ -754,7 +762,7 @@ fn pass1_prepass_chunk_walk<const COLLECT: bool>(
                     if line_col % fold_unit == 0 {
                         seg_adv = 0.0;
                     } else {
-                        seg_adv += r.advance;
+                        seg_adv += advance;
                     }
                 }
             }
@@ -1060,6 +1068,40 @@ fn continued_segment_advance(
     seg
 }
 
+/// The fold state `(col, line advance, segment advance)` at the end of a
+/// chunk that holds no newline, entered with `state`: the serial walk, every
+/// tab measured from the line's true cells. The aggregation's form for a
+/// chunk whose tabs the per-chunk walk measured from its own start
+/// (2026-10-11). The chunk starts at an ASCII byte (`chunk.rs`), so it
+/// resolves as the walk of the whole item does.
+fn walk_line_state(
+    bytes: &[u8],
+    state: (i64, f64, f32),
+    fold_unit: i64,
+    rctx: ResolveCtx<'_>,
+    tabs: TabStops,
+) -> (i64, f64, f32) {
+    let (mut col, mut line_adv, mut seg_adv) = state;
+    let mut trailer_until = 0usize;
+    for pos in 0..bytes.len() {
+        let Some(r) = char_resolve::resolve_byte_char(bytes, pos, rctx, &mut trailer_until) else {
+            continue;
+        };
+        debug_assert!(!r.is_newline, "walk_line_state walks one line");
+        let (advance, line_advance_addend) = tabs.advance(bytes[pos], r.advance, line_adv);
+        col += 1;
+        line_adv += line_advance_addend;
+        if fold_unit > 0 {
+            if col % fold_unit == 0 {
+                seg_adv = 0.0;
+            } else {
+                seg_adv += advance;
+            }
+        }
+    }
+    (col, line_adv, seg_adv)
+}
+
 pub(crate) fn aggregate_chunk_prepasses(
     chunk_prepasses: &[ChunkPrepass],
     item_chunk_ranges: &[std::ops::Range<usize>],
@@ -1070,6 +1112,7 @@ pub(crate) fn aggregate_chunk_prepasses(
     em_height_fu: u32,
 ) -> PrepassAggregate {
     let total_chunks = chunks.len();
+    let cell_advance = fu_to_world(trie.metrics.advance_fu as i32, em_height_fu);
     let mut prepasses = Vec::with_capacity(file_params.len());
     let mut chunk_slot_bases = Vec::with_capacity(total_chunks);
     let mut chunk_base_rows = Vec::with_capacity(total_chunks);
@@ -1131,7 +1174,26 @@ pub(crate) fn aggregate_chunk_prepasses(
             let continued_total = if cp.has_newline { cur_col + cp.first_seg_col } else { cur_col + cp.delta_col };
             item_max_line_cols = item_max_line_cols.max(u32::try_from(continued_total).unwrap_or(u32::MAX));
 
-            if !cp.has_newline {
+            let tabs = TabStops::of(p, cell_advance);
+            if !cp.has_newline && tabs.expands() && memchr::memchr(b'\t', chunks[chunk_index].bytes).is_some() {
+                // A TAB'S ADVANCE DEPENDS ON THE LINE BEFORE IT (2026-10-11),
+                // and the per-chunk walk measured this chunk's tabs from the
+                // chunk's own start: its deltas are wrong whenever the line it
+                // continues has not reached a stop. Walk it again from the
+                // true state. Only a chunk inside one long line that holds a
+                // tab under stops wider than a cell pays this.
+                let (col, line_adv, seg_adv) = walk_line_state(
+                    chunks[chunk_index].bytes,
+                    (cur_col, cur_line_adv, cur_seg_adv),
+                    fold_unit,
+                    ResolveCtx { trie, bitmap_adv, em_height_fu, cluster: char_resolve::clusters(p) },
+                    tabs,
+                );
+                debug_assert_eq!(col, cur_col + cp.delta_col, "a tab moved a column");
+                cur_col = col;
+                cur_line_adv = line_adv;
+                cur_seg_adv = seg_adv;
+            } else if !cp.has_newline {
                 let c0 = cur_col;
                 cur_col += cp.delta_col;
                 // f64 sums of f32 advances are exact at any realistic line
@@ -1246,6 +1308,7 @@ fn measure_continued_lines(
             };
             let cluster = char_resolve::clusters(p);
             let rctx = ResolveCtx { trie, bitmap_adv, em_height_fu, cluster };
+            let tabs = TabStops::of(p, fu_to_world(trie.metrics.advance_fu as i32, em_height_fu));
             let mut col = agg.chunk_initial_cols[ci];
             let mut seg = agg.chunk_initial_seg_advs[ci];
             let mut line_adv = agg.chunk_initial_line_advs[ci];
@@ -1269,13 +1332,14 @@ fn measure_continued_lines(
                 if r.is_newline {
                     break;
                 }
+                let (advance, line_advance_addend) = tabs.advance(c.bytes[pos], r.advance, line_adv);
                 col += 1;
-                line_adv += r.advance as f64;
+                line_adv += line_advance_addend;
                 if fold_unit > 0 {
                     if col % fold_unit == 0 {
                         seg = 0.0;
                     } else {
-                        seg += r.advance;
+                        seg += advance;
                     }
                 }
             }
