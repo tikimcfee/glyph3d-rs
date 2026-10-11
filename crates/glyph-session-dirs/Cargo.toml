@@ -8,3 +8,6 @@ description = "Where agent harnesses keep their session transcripts: one table o
 # std only, deliberately: `glyph` (the build tool) depends on this, and the
 # build tool must never depend on the renderer it builds and reports on.
 [dependencies]
+
+[lints]
+workspace = true
