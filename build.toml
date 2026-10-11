@@ -1222,11 +1222,11 @@ expect = "a_stale_handle_is_refused_and_never_aliases_a_reused_slot"
 [[mutation]]
 name = "resolve-compose-order-swapped"
 gate = "cargo-test"
-why = "the GPU resolve composing child-then-parent (acc ∘ local[parent]) instead of parent-then-child: a nested node's translation is no longer carried through its parent's rotation and scale. Every golden group is a child of an identity root, where the two orders agree bit for bit, so pixel-ab cannot see this; the GPU test on a random 5,000-node tree, held to the CPU reference, can. CONSUMED BY: resolve.wgsl's chain walk, every node of every flush; reddens the_resolve_matches_the_cpu_reference_through_every_upload_path"
+why = "the GPU resolve composing child-then-parent (local[child] ∘ acc) instead of parent-then-child as it walks the chain down from the root: a nested node's translation is no longer carried through its parent's rotation and scale. Every golden group is a child of an identity root, where the two orders agree bit for bit, so pixel-ab cannot see this; the GPU test on a random 5,000-node tree, held to the CPU reference, can. CONSUMED BY: resolve.wgsl's top-down chain composition (2026-10-10; it was bottom-up until the library moved onto the tree), every node of every flush; reddens the_resolve_matches_the_cpu_reference_through_every_upload_path"
 file = "crates/glyph-scene-graph/shaders/resolve.wgsl"
 op = "replace"
-find = "        acc = compose(locals[p], acc);"
-with = "        acc = compose(acc, locals[p]);"
+find = "        acc = compose(acc, locals[chain[k - 1u]]);"
+with = "        acc = compose(locals[chain[k - 1u]], acc);"
 expect = "the_resolve_matches_the_cpu_reference_through_every_upload_path"
 
 [[mutation]]
