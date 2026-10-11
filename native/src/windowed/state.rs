@@ -1169,9 +1169,11 @@ impl WindowState {
                                 let row_h = ui.text_style_height(&egui::TextStyle::Body);
                                 let viewport_aspect =
                                     self.config.width as f32 / self.config.height.max(1) as f32;
+                                let mut shown: Vec<usize> = Vec::new();
                                 egui::ScrollArea::vertical()
                                     .max_height(280.0)
                                     .show_rows(ui, row_h, idxs.len(), |ui, range| {
+                                        shown.extend_from_slice(&idxs[range.clone()]);
                                         for &i in &idxs[range] {
                                             let row = &snap.files[i];
                                             let dynst =
@@ -1237,6 +1239,11 @@ impl WindowState {
                                             });
                                         }
                                     });
+                                // The scene refreshes these rows' poses
+                                // next frame (UiProbeState::browser_rows).
+                                if let Some(cell) = &self.ui_probe {
+                                    cell.borrow_mut().browser_rows = shown;
+                                }
                             }
                         }
                     });

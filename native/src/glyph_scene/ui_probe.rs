@@ -188,9 +188,17 @@ pub struct UiProbeState {
     // ── K5: group-browser data. `files` is STATIC (built once at install;
     // Rc-shared so the panel's per-frame snapshot clones a refcount, not the
     // rows). `file_dyn` is refreshed per frame (world pose under the live
-    // group TRS, hidden flag, tint) — parallel to `files`. ──
+    // group TRS, hidden flag, tint) — parallel to `files`, for the rows the
+    // browser shows (`browser_rows`). ──
     pub files: std::rc::Rc<Vec<UiFileRow>>,
     pub file_dyn: Vec<UiFileDyn>,
+    /// The `files` rows the browser drew last UI frame (written by the
+    /// panel): `file_dyn` is refreshed for these only (2026-10-10). The
+    /// browser draws a scrolled window of rows; refreshing every row each
+    /// frame was O(files) per frame, and under a library move it needed the
+    /// whole CPU mirror of the group rows synced every frame (O(the moved
+    /// subtrees): a directory drag's per-file cost, back by the side door).
+    pub browser_rows: Vec<usize>,
 }
 
 /// Read-only snapshot of an active Agent Carrel for the egui HUD.
