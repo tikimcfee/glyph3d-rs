@@ -28,6 +28,8 @@ exclude = ["experiments"]
 [workspace.lints.rust]
 
 [workspace.lints.clippy]
+# Every #[allow] says why, in the attribute where rustc carries it (2026-10-11).
+allow_attributes_without_reason = "warn"
 
 [profile.release]
 # Keep debug info in release so future profiling stages stay sane.

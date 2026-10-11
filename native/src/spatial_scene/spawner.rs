@@ -85,7 +85,7 @@ impl SpatialScene {
     }
 
     /// Spawn a code file card entity with glyph group binding.
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, reason = "a spawn constructor: its parameters are the card's fields")]
     pub fn spawn_file_card(
         &mut self,
         parent: Entity,

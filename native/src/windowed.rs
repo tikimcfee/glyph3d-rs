@@ -114,7 +114,7 @@ fn utc_stamp(now: std::time::SystemTime) -> String {
     format!("{y:04}{m:02}{d:02}-{:02}{:02}{:02}", tod / 3600, tod % 3600 / 60, tod % 60)
 }
 
-#[allow(clippy::too_many_arguments)] // the launch surface; one live param too many for the lint, not for the callers
+#[allow(clippy::too_many_arguments, reason = "the windowed launch surface: one parameter too many for the lint, not for its one caller, main")]
 pub fn run(
     ctx: GpuContext,
     // Owned: the relayout arm mutates the choice's params (Repo's
