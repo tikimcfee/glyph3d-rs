@@ -160,6 +160,9 @@ struct Node {
     subtree_moved: bool,
     /// Refit pending (dedupe within one refit).
     mark: bool,
+    /// Its subtree is a single chain ending in its one segment (a sheet →
+    /// mount → file): the walk takes the chain in one visit.
+    path: bool,
     /// The move that last wrote its local row; the refit that last wrote
     /// its box; the epoch its cached world was computed at.
     moved_epoch: u32,
@@ -225,6 +228,7 @@ impl TreeCull {
             moved: false,
             subtree_moved: false,
             mark: false,
+            path: false,
             moved_epoch: 0,
             bounds_epoch: 0,
             cache_epoch: 0,
@@ -264,6 +268,16 @@ impl TreeCull {
             let end = q + nodes[q].size as usize;
             nodes[q].seg_lo = first[q];
             nodes[q].seg_hi = first[end];
+        }
+        // Chains, from the leaves up: a lone segment node, or a segmentless
+        // node whose one child (its whole subtree but itself) is a chain.
+        for q in (0..rn as usize).rev() {
+            let size = nodes[q].size as usize;
+            nodes[q].path = if size == 1 {
+                nodes[q].seg != NONE
+            } else {
+                nodes[q].seg == NONE && nodes[q + 1].size as usize == size - 1 && nodes[q + 1].path
+            };
         }
         debug_assert!(nodes.iter().enumerate().all(|(q, n)| pos[n.slot as usize] == r0 + q as u32));
         let moved_tint = (0..n_seg)
@@ -443,7 +457,7 @@ impl TreeCull {
             };
             let m = pm || node.moved;
             let side = if pin { Side::Inside } else { classify(&wb, &view.planes) };
-            let (size, seg, slot, subtree_moved, lo, hi) = (node.size, node.seg, node.slot, node.subtree_moved, node.seg_lo, node.seg_hi);
+            let (size, seg, slot, subtree_moved, lo, hi, path) = (node.size, node.seg, node.slot, node.subtree_moved, node.seg_lo, node.seg_hi, node.path);
             if side == Side::Outside {
                 q += size;
                 continue;
@@ -456,6 +470,33 @@ impl TreeCull {
                     self.geom[si as usize] = None;
                 }
                 self.cands.extend_from_slice(&self.dfs_segs[lo as usize..hi as usize]);
+                q += size;
+                continue;
+            }
+            if path && size > 1 {
+                // A chain (sheet → mount → file, measured on the kernel
+                // tree at three visits per candidate, 2026-10-10): one
+                // visit, the composes the descent would have made in its
+                // order (the same bits), the segment a candidate. The
+                // nodes below carry this node's box down unchanged, so
+                // testing them again only re-asks the frustum; the exact
+                // per-segment test below decides either way.
+                let (mut w, mut m) = (w, m);
+                let mut leaf = slot;
+                for k in q + 1..q + size {
+                    let n = &self.nodes[k as usize];
+                    w = Similarity::compose(&w, &local[n.slot as usize]);
+                    m = m || n.moved;
+                    leaf = n.slot;
+                }
+                let si = self.dfs_segs[lo as usize];
+                let geom = m.then(|| {
+                    let ps = post[leaf as usize].xyz;
+                    (w.translation, [0, 1, 2].map(|k| (ps[k] * w.scale).max(0.0)))
+                });
+                self.stamp[si as usize] = frame;
+                self.geom[si as usize] = geom;
+                self.cands.push(si);
                 q += size;
                 continue;
             }
@@ -538,9 +579,10 @@ mod tests {
     /// way the bevy-era code kept them — every file under a moved node
     /// re-synced (`sync_segment`'s arithmetic) each frame it moved — and the
     /// tree cull gets only the moved NODES. Seated, mid form change, after a
-    /// directory dragged far off and a file dragged, mid page turn: over 400
-    /// random cameras (near and far, so both LOD tiers and every kind of
-    /// partial cull) the two must produce the same draws and backdrops, bit
+    /// directory dragged far off and a file dragged, mid page turn — and a
+    /// file dragged before anything else moved: over 500 random cameras
+    /// (near and far, so both LOD tiers and every kind of partial cull)
+    /// the two must produce the same draws and backdrops, bit
     /// for bit — the tree's subtree test is a prefilter, never a decision.
     #[test]
     fn the_tree_cull_draws_what_the_flat_cull_draws_over_synced_boxes() {
@@ -670,6 +712,15 @@ mod tests {
             }
         };
         check(&mut t, &mut tree, &flat, &flat_em, &mut r, "seated");
+        // A file dragged before anything else moved: its sheet and mount
+        // never moved, so only the file's own flag says its stored box is
+        // stale (the chain arm must look below the chain's head).
+        let f0 = lib.nodes.as_ref().unwrap().file[3];
+        let d0 = t.parent_world(f0).unwrap().world_delta_to_local([90.0, -40.0, 2.0]);
+        t.set_local(f0, Similarity::from_translation(d0)).unwrap();
+        tree.note_moved(f0.index());
+        sync(&mut t, &[f0], &mut flat, &mut flat_em, &cull);
+        check(&mut t, &mut tree, &flat, &flat_em, &mut r, "a file dragged at rest");
         // A whole-library form change, sampled mid-ease.
         lib.form(&t, None, FormCmd::Set(Form::Splay));
         for _ in 0..6 {
@@ -702,7 +753,7 @@ mod tests {
             sync(&mut t, &tick.moved, &mut flat, &mut flat_em, &cull);
         }
         check(&mut t, &mut tree, &flat, &flat_em, &mut r, "mid page turn");
-        assert_eq!(checked, 400);
-        assert!(culled_some > 100, "the cameras must exercise the subtree cull ({culled_some} of 400 dropped segments)");
+        assert_eq!(checked, 500);
+        assert!(culled_some > 100, "the cameras must exercise the subtree cull ({culled_some} of 500 dropped segments)");
     }
 }

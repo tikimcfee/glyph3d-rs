@@ -437,7 +437,18 @@ Left: the per-frame cull is a walk now: at 20k segments a near pose visits
 ~1.9k nodes in ~0.11 ms (the visits, not the arithmetic: the same with every
 world cached), so a static frame costs a little more than the flat scan at
 this size and less as the library grows past what the frustum reaches. The
-ease itself is O(moved nodes) (0.34 ms for 20k). The Debug panel's field
+ease was NOT O(moved nodes) as first written here: `tick` scanned every dir
+and sheet to find the moving ones, which the kernel tree showed (Ivan,
+windowed: a page turn of 883 sheets, `ease_ms` 0.68 against ~85k nodes
+scanned). It now keeps the nodes short of their targets in a list built at
+each replan (arch/, form toggle: 9,920 moving 0.11 ms, 205 moving 0.003 ms).
+The walk spent three visits per candidate on each sheet → mount → file
+chain; a chain is now one visit making the same composes (arch/, form
+toggle, a mid-flight frame: 5,318 → 1,982 visits, walk 0.13 → 0.084 ms; on
+the kernel, 0.65 ms at 11.8k visits before). What remains of the walk is
+the composes and their scattered reads of the local table, not the visits.
+Both changes left 24 g-pick-repo frames (3 modes) and 16 arch/ frames
+(derived, visible) byte-equal to 2e78a28's. The Debug panel's field
 depth readout (`z_extent`) folds the stored segment boxes, so it does not
 follow moved library files. Instanced cannot load the whole kernel (E17),
 unchanged. The carrel and every non-library controller layout still

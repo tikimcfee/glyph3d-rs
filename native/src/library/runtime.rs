@@ -95,6 +95,12 @@ pub struct Library {
     pub nodes: Option<LibNodes>,
     dir_at: Vec<[f64; 3]>,
     sheet_at: Vec<[f64; 3]>,
+    /// The dirs and sheets still short of their targets, ascending: `tick`
+    /// eases only these. Walking every node to find the moving ones made a
+    /// page turn of 883 sheets cost 0.68 ms on the kernel tree (~85k nodes
+    /// scanned per frame, 2026-10-10).
+    dir_active: Vec<u32>,
+    sheet_active: Vec<u32>,
     animating: bool,
 }
 
@@ -133,6 +139,8 @@ impl Library {
             nodes: None,
             dir_at,
             sheet_at,
+            dir_active: Vec::new(),
+            sheet_active: Vec::new(),
             animating: false,
         }
     }
@@ -358,6 +366,13 @@ impl Library {
                 }
             }
         }
+        // A node already at its target eases to no write (`ease_step`
+        // returns it unmoved), so leaving it out changes nothing.
+        let away = |at: &[[f64; 3]], target: &dyn Fn(usize) -> [f64; 3]| -> Vec<u32> {
+            (0..at.len()).filter(|&i| at[i] != target(i)).map(|i| i as u32).collect()
+        };
+        self.dir_active = away(&self.dir_at, &|d| self.plan.dirs[d].pos);
+        self.sheet_active = away(&self.sheet_at, &|f| self.plan.files[f].slot);
         self.animating = true;
     }
 
@@ -372,8 +387,8 @@ impl Library {
         let t0 = Instant::now();
         let k = ease_k(self.lerp, f64::from(dt));
         let mut moved = Vec::new();
-        let mut pending = false;
         let settle = self.settle;
+        // Eases one node; true while it is still short of its target.
         let mut step = |at: &mut [f64; 3], target: [f64; 3], h: NodeHandle, t: &mut NodeTables| {
             let (next, did) = ease_step(*at, target, k, settle);
             if did {
@@ -382,16 +397,12 @@ impl Library {
                 t.set_local(h, Similarity { translation: v3(next), ..l }).expect("live");
                 moved.push(h);
             }
-            if next != target {
-                pending = true;
-            }
+            next != target
         };
-        for (d, at) in self.dir_at.iter_mut().enumerate() {
-            step(at, self.plan.dirs[d].pos, nodes.dir[d], t);
-        }
-        for (f, at) in self.sheet_at.iter_mut().enumerate() {
-            step(at, self.plan.files[f].slot, nodes.sheet[f], t);
-        }
+        let (dir_at, sheet_at, plan) = (&mut self.dir_at, &mut self.sheet_at, &self.plan);
+        self.dir_active.retain(|&d| step(&mut dir_at[d as usize], plan.dirs[d as usize].pos, nodes.dir[d as usize], t));
+        self.sheet_active.retain(|&f| step(&mut sheet_at[f as usize], plan.files[f as usize].slot, nodes.sheet[f as usize], t));
+        let pending = !self.dir_active.is_empty() || !self.sheet_active.is_empty();
         let ease_ms = t0.elapsed().as_secs_f64() * 1e3;
         self.animating = pending;
         Some(LibraryTick { nodes_moved: moved.len(), moved, ease_ms, still_animating: pending })
