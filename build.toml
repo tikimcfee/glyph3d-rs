@@ -307,6 +307,20 @@ pass_line = "ATLAS TABLES OK"
 needs = []
 compare = "codepoints.bin against glyphs.bin (magic, version, shape, upem, missing-block metrics, sequence slots = slotCount - sequences), pinned lookups ('A' 34, ' ' 1, RAT 3839, ROCKET 4759, TAG SPACE missing, the ZWJ family -> 6819), and every entry one em tall with block 0 the missing block"
 blind_to = "any codepoint or sequence outside the pins: it proves the tables are self-consistent and right where pinned, not right everywhere. The font-unit -> world conversion is fu_to_world's unit test, not this. Committed-artifacts proves the bins are what they were; this proves what they MEAN where it can"
+# The other half of the atlas's meaning: the curve and glyph-map textures,
+# glyphs.bin against them, the trie's section layout and the sequence and
+# class sections. tools/verify_atlas.py had asserted all of it since the export
+# was written and was run by nothing (root AGENTS.md listed it as a blind spot
+# until 2026-10-11). 0.14 s.
+[[gate]]
+name = "atlas-verify"
+scope = "corpus"
+kind = "cmd"
+cmd = "python3 tools/verify_atlas.py"
+pass_line = "VERIFY OK"
+needs = []
+compare = "curves.bin (header, 1024-wide texture, 2 texels per curve, payload sized to curveCount, coords fit u16, zero row padding), glyphmap.bin (texels sized to entryCount, every outline range inside [0, curveCount), curveStart monotonic, bitmap entries [0,0,1,cell]), glyphs.bin against the glyphmap texel for texel (record sizes 64/56, slot 0 blank, primaryUpem = font 0), codepoints.bin's section layout (block index, blocks, sequence section ending exactly at the G3CC class section, which equals cluster-classes.bin byte for byte; bitmap advance = 2 x primary), sequence rows (lengths in [2, seqMax], slots consecutive, the ZWJ family -> 6819), lookups ('A' outline, ' ' blank, a bitmap codepoint past the web's 4,431 slots, tag space missing), and every bitmap slot's emojiCell inside emoji-sheet.bin's cell count"
+blind_to = "what a curve DRAWS (the texture is checked for shape and range, never rendered: only pixel-ab sees a glyph), the glyph map's choice of which curves make which glyph, and every codepoint outside its handful of lookups. Like atlas-tables it reads the bins as committed, so it is a statement about this export, not about the font"
 [[gate]]
 name = "vendor-hashes"
 scope = "corpus"
@@ -1161,6 +1175,16 @@ op = "replace"
 find = "    expect(0x1F680, 4759, 2458, 2,"
 with = "    expect(0x1F680, 4758, 2458, 2,"
 expect = "ROCKET"
+
+[[mutation]]
+name = "atlas-glyphmap-disagreement"
+gate = "atlas-verify"
+why = "2026-10-11: tools/verify_atlas.py gated after a year run by hand. glyphs.bin and glyphmap.bin are two files written by one export (tools/export-atlas.mjs) that must agree record for texel; an export change that moved one and not the other is the class this gate exists for, and nothing else reads both. Moving the checker's expectation off zero mismatches stands for that drift. CONSUMED BY: the record-vs-texel walk in tools/verify_atlas.py over glyphs.bin and glyphmap.bin"
+file = "tools/verify_atlas.py"
+op = "replace"
+find = "check(mismatch == 0, f\"glyphs.bin records agree with glyphmap texels"
+with = "check(mismatch == 1, f\"glyphs.bin records agree with glyphmap texels"
+expect = "glyphs.bin records agree with glyphmap texels"
 
 [[mutation]]
 name = "fu-to-world-wrong-denominator"

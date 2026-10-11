@@ -241,7 +241,7 @@ Reading and editing, in order of preference (measured 2026-10-11,
 
 ## What the checks actually do
 
-Sixteen gates (2026-10-11; `cargo glyph gates` is the live list), in `build.toml` order. For each: what it compares, what makes it
+Seventeen gates (2026-10-11; `cargo glyph gates` is the live list), in `build.toml` order. For each: what it compares, what makes it
 red, and **what it cannot see**. The last is the part worth reading. A check is
 a claim about a counterfactual, and a check whose blind spot you don't know is
 a green you can't price. (Gates were once numbered positions in one shell
@@ -314,6 +314,22 @@ test suite are two independent witnesses, not duplicate coverage. Blind to
 whether the oracle is *correct* — it proves reproducibility, not truth. And
 it only proves the corpus is what it was: whether the Rust layout still
 AGREES with the corpus is the job of the reference-port gate (below).
+
+**atlas-verify** (`tools/verify_atlas.py`, gated 2026-10-11). The other half
+of what the atlas MEANS: the curve texture (header, width, two texels per
+curve, payload sized to the curve count, coordinates that fit u16, zero row
+padding), the glyph-map texture (every outline range inside the curve count,
+`curveStart` monotonic, bitmap entries of the one shape), `glyphs.bin` against
+the glyph map texel for texel, `codepoints.bin`'s section layout (the sequence
+section ending exactly where the class section starts, and that section equal
+to `cluster-classes.bin` byte for byte), the sequence rows, a handful of
+lookups, and every bitmap slot's cell inside the emoji sheet. The script had
+asserted all of this since the export was written and was run by nothing: the
+previous version of this file listed it under "What the whole battery cannot
+see". `atlas-glyphmap-disagreement` proves it. Blind to what a curve DRAWS
+(the texture is checked for shape and range, never rendered: only pixel-ab
+sees a glyph), to which curves the glyph map assigns to which glyph, and, like
+atlas-tables, to every codepoint outside its lookups.
 
 **vendor-hashes.** The hashes of the vendored + derived files
 (`vendor-manifest.py --check`; the two `hb.*` files are additionally re-derived
@@ -754,12 +770,11 @@ and the union is not:
   synthetic tries; hyper-oracle runs both sides on the atlas trie, so a wrong
   advance in `codepoints.bin` moves both sides together.
 - **Nothing executes the benches.** `tools/bench_hyper.py` and `resolve-bench` (crates/glyph-scene-graph) are run by hand; the latter at least holds its world rows to the CPU reference after each case.
-- **`tools/verify_atlas.py`, `preview_glyphs.py`, `repro_pick_oblique.py`** are
-  manual tools, run by **zero** checks (atlas-tables covers the lookup tables'
-  consistency and pins, nothing of the curves or glyph map). So the atlas bins' structural and semantic
-  correctness, and the oblique-pick repro, are exercised by nothing in the battery
-  — the atlas is only ever checked for being byte-identical to what it was, which
-  says nothing about whether what it was is right.
+- **`tools/preview_glyphs.py` and `repro_pick_oblique.py`** are manual tools,
+  run by **zero** checks, so the oblique-pick repro is exercised by nothing in
+  the battery. (`tools/verify_atlas.py` was on this list until 2026-10-11; it
+  is the atlas-verify gate now. What the atlas's curves DRAW is still seen by
+  pixel-ab alone.)
 - **`--layout-mode library` renders in no golden view** (2026-10-10; a
   probe, `native/src/library.rs`). Its arithmetic is held to the JS
   scheme's numbers and its scene binding (group rows, page turns) by
