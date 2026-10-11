@@ -239,10 +239,6 @@ pub struct Cli {
     /// as pageable volumes; dials in `[library]`, see `native/src/library.rs`).
     #[arg(long, value_name = "MODE", default_value = "shelf")]
     pub layout_mode: crate::repo::RepoLayoutMode,
-    /// Syntax color mode on repo load: `flat` (default: fast geometric load with extension-based LOD tint, awaiting external colorization)
-    /// or `syntax` (eager CPU lexer during load)
-    #[arg(long, value_name = "MODE", default_value = "flat")]
-    pub color_mode: crate::repo::ColorMode,
     /// Stage E2: frame the first file whose path contains SUBSTR
     #[arg(long, value_name = "SUBSTR")]
     pub focus_file: Option<String>,
@@ -476,7 +472,6 @@ fn merge_launch_config(cli: &mut Cli, matches: &clap::ArgMatches, cfg: crate::la
     under!(wrap_mode);
     under!(z_wrap_spacing);
     under!(cluster_mode);
-    under!(color_mode);
     under!(no_cull);
     under!(no_ui);
     if !typed("no_greeking") {

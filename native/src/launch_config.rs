@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 
 use crate::cli::{DebugTint, PresentMode};
 use crate::fold::{ClusterMode, WrapMode};
-use crate::repo::{ColorMode, RepoLayoutMode, Strategy};
+use crate::repo::{RepoLayoutMode, Strategy};
 use glyph_field::GlyphFieldMode;
 
 /// The launch options a file can set. A mode is typed as the flag's own
@@ -37,8 +37,14 @@ pub struct LaunchConfig {
     pub z_wrap_spacing: Option<f64>,
     #[serde(default, with = "value_enum")]
     pub cluster_mode: Option<ClusterMode>,
-    #[serde(default, with = "value_enum")]
-    pub color_mode: Option<ColorMode>,
+    /// `color_mode`, RETIRED 2026-10-11 with the syntax heuristic (colour
+    /// arrives as byte spans; every load paints flat). A file that still
+    /// says `color_mode = "flat"` parses — it asks for the one behaviour
+    /// left, and a config file outlives the command line that dropped
+    /// `--color-mode` — but the key is read into nothing and never written
+    /// back; `"syntax"` is refused, naming the retirement.
+    #[serde(default, rename = "color_mode", skip_serializing, deserialize_with = "retired_color_mode")]
+    pub retired_color_mode: (),
     pub no_cull: Option<bool>,
     pub no_ui: Option<bool>,
     pub greeking: Option<bool>,
@@ -107,6 +113,21 @@ mod value_enum {
             let names: Vec<String> = T::value_variants().iter().map(super::value_name).collect();
             D::Error::custom(format!("unknown value '{name}' (expected {})", names.join(" | ")))
         })
+    }
+}
+
+/// The retired `color_mode` key: `"flat"` (any case) parses into nothing,
+/// anything else is refused naming the retirement.
+fn retired_color_mode<'de, D: serde::Deserializer<'de>>(d: D) -> Result<(), D::Error> {
+    use serde::{de::Error, Deserialize};
+    let name = String::deserialize(d)?;
+    if name.eq_ignore_ascii_case("flat") {
+        Ok(())
+    } else {
+        Err(D::Error::custom(format!(
+            "color_mode = '{name}': the syntax heuristic was retired on 2026-10-11 and every load paints flat; \
+             drop the key (colour arrives as byte spans, e.g. --highlight)"
+        )))
     }
 }
 
@@ -226,7 +247,6 @@ mod tests {
         assert_eq!(cfg.wrap_mode, Some(WrapMode::Back));
         assert_eq!(cfg.z_wrap_spacing, Some(0.20));
         assert_eq!(cfg.cluster_mode, Some(ClusterMode::Cluster));
-        assert_eq!(cfg.color_mode, Some(ColorMode::Flat));
         assert_eq!(cfg.no_cull, Some(false));
         assert_eq!(cfg.no_ui, Some(true));
         assert_eq!(cfg.greeking, Some(true));
@@ -301,7 +321,6 @@ mod tests {
             wrap_mode = "down"
             z_wrap_spacing = 0.25
             cluster_mode = "leader"
-            color_mode = "syntax"
             greeking = false
             load_repo = "/abs/repo"
             focus_file = "alpha"
@@ -323,6 +342,18 @@ mod tests {
         assert_eq!(LaunchConfig::from_toml_str(&text).expect("re-parse failed"), cfg);
         let other = LaunchConfig { demo: Some(true), render_file: Some("/f.rs".into()), ..Default::default() };
         assert_eq!(LaunchConfig::from_toml_str(&other.to_toml_string()).expect("re-parse failed"), other);
+    }
+
+    /// The retired `color_mode` key (2026-10-11): `"flat"` still parses, to
+    /// a config equal to one without the key, and is not written back;
+    /// `"syntax"` is refused naming the retirement.
+    #[test]
+    fn retired_color_mode_key_parses_flat_and_refuses_syntax() {
+        let cfg = LaunchConfig::from_toml_str("color_mode = \"flat\"\nwrap_mode = \"down\"\n").expect("flat must parse");
+        assert_eq!(cfg, LaunchConfig::from_toml_str("wrap_mode = \"down\"\n").unwrap());
+        assert!(!cfg.to_toml_string().contains("color_mode"), "the retired key is never written back");
+        let err = LaunchConfig::from_toml_str("color_mode = \"syntax\"\n").unwrap_err();
+        assert!(err.contains("retired"), "the refusal must name the retirement: {err}");
     }
 
     #[test]

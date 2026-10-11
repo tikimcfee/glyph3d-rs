@@ -77,7 +77,7 @@ fn render(repo: &Path, mode: &str, out: &Path) -> image::RgbaImage {
     let output = Command::new(env!("CARGO_BIN_EXE_glyph3d-native"))
         .arg("--load-repo")
         .arg(repo)
-        .args(["--frames", "2", "--field-mode", mode, "--color-mode", "flat"])
+        .args(["--frames", "2", "--field-mode", mode])
         .args(POSE)
         .arg("--screenshot")
         .arg(out)

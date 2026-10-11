@@ -68,7 +68,6 @@ pub enum Control {
     WrapMode,
     ZWrapSpacing,
     RepoEngine,
-    ColorMode,
     ClusterMode,
     FieldMode,
     DebugTint,
@@ -92,7 +91,6 @@ impl Control {
         Control::WrapMode,
         Control::ZWrapSpacing,
         Control::RepoEngine,
-        Control::ColorMode,
         Control::ClusterMode,
         Control::FieldMode,
         Control::DebugTint,
@@ -109,7 +107,7 @@ impl Control {
         use Control::*;
         match self {
             Target | RepoPath | FocusFile | FilePath | SessionPath => Section::Target,
-            LayoutMode | WrapMode | ZWrapSpacing | RepoEngine | ColorMode | ClusterMode => Section::Layout,
+            LayoutMode | WrapMode | ZWrapSpacing | RepoEngine | ClusterMode => Section::Layout,
             FieldMode | DebugTint | TextDetail | ShowGlyphs | Greeking | FileBackgrounds | Cull | UiOverlay
             | PresentMode => Section::Graphics,
         }
@@ -127,7 +125,6 @@ impl Control {
             WrapMode => "Wrap",
             ZWrapSpacing => "Z spacing",
             RepoEngine => "Engine",
-            ColorMode => "Color",
             ClusterMode => "Cluster",
             FieldMode => "Field mode",
             DebugTint => "Debug tint",
@@ -325,7 +322,7 @@ impl Launcher {
             }
             Control::FilePath => self.target == Target::File,
             Control::SessionPath => self.target == Target::Agent,
-            Control::ZWrapSpacing | Control::WrapMode | Control::ColorMode | Control::ClusterMode => {
+            Control::ZWrapSpacing | Control::WrapMode | Control::ClusterMode => {
                 self.target != Target::Demo
             }
             _ => true,
@@ -370,7 +367,6 @@ impl Launcher {
                 unit: "x em",
             },
             Control::RepoEngine => View::Choice(options(&cfg.repo_engine.unwrap_or(d.repo_engine))),
-            Control::ColorMode => View::Choice(options(&cfg.color_mode.unwrap_or(d.color_mode))),
             Control::ClusterMode => View::Choice(options(&cfg.cluster_mode.unwrap_or(d.cluster_mode))),
             Control::FieldMode => View::Choice(options(&cfg.field_mode.unwrap_or(d.field_mode))),
             Control::DebugTint => View::Choice(options(&cfg.debug_tint.unwrap_or(d.debug_tint))),
@@ -420,7 +416,6 @@ impl Launcher {
             Control::LayoutMode => cfg.layout_mode = Some(step_enum(&cfg.layout_mode.unwrap_or(d.layout_mode), dir)),
             Control::WrapMode => cfg.wrap_mode = Some(step_enum(&cfg.wrap_mode.unwrap_or(d.wrap_mode), dir)),
             Control::RepoEngine => cfg.repo_engine = Some(step_enum(&cfg.repo_engine.unwrap_or(d.repo_engine), dir)),
-            Control::ColorMode => cfg.color_mode = Some(step_enum(&cfg.color_mode.unwrap_or(d.color_mode), dir)),
             Control::ClusterMode => cfg.cluster_mode = Some(step_enum(&cfg.cluster_mode.unwrap_or(d.cluster_mode), dir)),
             Control::FieldMode => cfg.field_mode = Some(step_enum(&cfg.field_mode.unwrap_or(d.field_mode), dir)),
             Control::DebugTint => cfg.debug_tint = Some(step_enum(&cfg.debug_tint.unwrap_or(d.debug_tint), dir)),

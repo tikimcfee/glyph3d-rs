@@ -6,7 +6,7 @@ use super::model::{Control, Launcher, Target, View};
 use crate::cli::{parse_cli_from, Cli, DebugTint, PresentMode};
 use crate::fold::{ClusterMode, WrapMode};
 use crate::launch_config::{value_name, LaunchConfig};
-use crate::repo::{ColorMode, RepoLayoutMode, Strategy};
+use crate::repo::{RepoLayoutMode, Strategy};
 use glyph_field::GlyphFieldMode;
 
 fn names<T: ValueEnum>() -> Vec<String> {
@@ -29,7 +29,6 @@ fn every_value_enum_is_offered_whole() {
     assert_eq!(choice_names(&l, Control::LayoutMode), names::<RepoLayoutMode>());
     assert_eq!(choice_names(&l, Control::WrapMode), names::<WrapMode>());
     assert_eq!(choice_names(&l, Control::RepoEngine), names::<Strategy>());
-    assert_eq!(choice_names(&l, Control::ColorMode), names::<ColorMode>());
     assert_eq!(choice_names(&l, Control::ClusterMode), names::<ClusterMode>());
     assert_eq!(choice_names(&l, Control::FieldMode), names::<GlyphFieldMode>());
     assert_eq!(choice_names(&l, Control::DebugTint), names::<DebugTint>());
@@ -48,7 +47,6 @@ fn untouched_controls_show_the_cli_defaults() {
     };
     assert_eq!(selected(Control::FieldMode), "derived");
     assert_eq!(selected(Control::WrapMode), "back");
-    assert_eq!(selected(Control::ColorMode), "flat");
     assert_eq!(l.view(Control::Greeking), View::Toggle(true));
     assert_eq!(l.view(Control::Cull), View::Toggle(true));
     // The LOD dials show the config's [lod] defaults until moved.

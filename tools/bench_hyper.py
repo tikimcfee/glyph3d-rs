@@ -98,7 +98,6 @@ def main():
     parser.add_argument("--bin", default="./target/release/glyph3d-native", help="Path to binary")
     parser.add_argument("-n", "--runs", type=int, default=5, help="Total number of runs (1 cold + N-1 warm)")
     parser.add_argument("--field-mode", default="derived", choices=["derived", "instanced"])
-    parser.add_argument("--color-mode", default=None, choices=["syntax", "flat", "uniform"])
     args, extra = parser.parse_known_args()
 
     bin_path = Path(args.bin).resolve()
@@ -107,8 +106,6 @@ def main():
         sys.exit(1)
 
     extra_args = ["--field-mode", args.field_mode]
-    if args.color_mode:
-        extra_args += ["--color-mode", args.color_mode]
     extra_args += extra
 
     print(f"=== Benchmarking HyperLayout ({args.field_mode} mode) ===")

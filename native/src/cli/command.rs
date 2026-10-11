@@ -145,7 +145,6 @@ impl Cli {
                 cluster_mode: self.cluster_mode,
                 tab_width: self.resolved_tab_width(),
                 layout_mode: self.layout_mode,
-                color_mode: self.color_mode,
                 field_mode: self.field_mode,
                 ..Default::default()
             };
@@ -185,7 +184,6 @@ impl Cli {
                 cluster_mode: self.cluster_mode,
                 tab_width: self.resolved_tab_width(),
                 layout_mode: self.layout_mode,
-                color_mode: self.color_mode,
                 emoji_sheet,
             }
         } else {
