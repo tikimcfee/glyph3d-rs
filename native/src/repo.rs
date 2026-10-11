@@ -1202,10 +1202,6 @@ impl RepoLoad {
     }
 }
 
-/// A file's cull box in its own frame: the `SegCull` box `into_staged`
-/// builds (ink plus the segment pads, no z pad) before the group's T·R·S,
-/// so `offset + local * scale` is that segment. The Visible field's items
-/// carry it (their cull applies the live group row).
 /// Which group row each walked file draws with. A repo load files file `i`
 /// under row `i`; `GLYPH_PERMUTE_GROUP_ROWS=1` is the step-A witness of the
 /// view registry (2026-10-11, `crate::views`): it files them in REVERSE
@@ -1241,6 +1237,10 @@ impl GroupRows {
     }
 }
 
+/// A file's cull box in its own frame: the `SegCull` box `into_staged`
+/// builds (ink plus the segment pads, no z pad) before the group's T·R·S,
+/// so `offset + local * scale` is that segment. The Visible field's items
+/// carry it (their cull applies the live group row).
 fn segment_local_box(v: &FileView) -> ([f32; 3], [f32; 3]) {
     use crate::glyph_scene::{SEG_CULL_PAD_MAX, SEG_CULL_PAD_MIN};
     (
