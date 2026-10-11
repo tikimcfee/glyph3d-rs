@@ -37,6 +37,13 @@ against `build.toml` that day; `cargo glyph gates` is the live list.)
   (item, byte) in place of the slot (`out/VISIBLE-MODE.md` § M3); the witness
   is `native/tests/visible_verbs.rs`, a pixel comparison of the same verb in
   Derived and Visible mode.
+  `crates/glyph-scene-graph` (2026-10-10) is the transform tree: pooled nodes
+  behind generation handles, CPU depth-first topology, per-table dirty sets,
+  and one compute pass resolving world transforms over the dirty ranges;
+  every group row is a node of it (`native/src/glyph_scene/nodes.rs`), and
+  the pass writes the group table's transform and appearance columns.
+  `resolve-bench` (in the crate, run by hand) times it;
+  `out/DESIGN-VIEWS-AND-TRANSFORMS-2026-10-10.md` § "Step 1: as built".
   `crates/glyph-session-dirs` (2026-10-09, std only) is the one table of where agent
   apps keep session transcripts, shared by the renderer's F7 browser and the
   renderer's launcher; `launch_config.example.toml` documents the overrides.
@@ -667,7 +674,7 @@ and the union is not:
 - **The atlas trie's VALUES.** Every oracle comparison runs on the fixtures'
   synthetic tries; hyper-oracle runs both sides on the atlas trie, so a wrong
   advance in `codepoints.bin` moves both sides together.
-- **Nothing executes the benches.** `tools/bench_hyper.py` is run by hand.
+- **Nothing executes the benches.** `tools/bench_hyper.py` and `resolve-bench` (crates/glyph-scene-graph) are run by hand; the latter at least holds its world rows to the CPU reference after each case.
 - **`tools/verify_atlas.py`, `preview_glyphs.py`, `repro_pick_oblique.py`** are
   manual tools, run by **zero** checks (atlas-tables covers the lookup tables'
   consistency and pins, nothing of the curves or glyph map). So the atlas bins' structural and semantic
