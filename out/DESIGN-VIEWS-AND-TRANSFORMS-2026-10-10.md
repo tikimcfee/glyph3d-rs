@@ -1,6 +1,7 @@
 # Views over bytes, and a transform tree — 2026-10-10
 
-> **Status: agreed direction, step 1 being built.** Worked out with Ivan on
+> **Status: agreed direction; step 1 built in its transitional form (§ "Step
+> 1: as built", 2026-10-10), the M2 measurement pending.** Worked out with Ivan on
 > 2026-10-10. Inputs: the library-layout probe
 > (`out/LIBRARY-LAYOUT-FINDINGS-2026-10-10.md`) and the GPU-hierarchy survey
 > (`research/gpu-transform-hierarchies-2026-10.md`). Iterate one step at a
@@ -160,6 +161,118 @@ The rest of this section is the 2026-10-10 sketch it refines:
   per-frame pass composing parent ∘ child level by level; one row written per
   drag). Decide from the library findings and the survey.
 
+## Step 1: as built (2026-10-10)
+
+`crates/glyph-scene-graph` (the tables, the upload policy, the resolve and
+scatter shaders, `resolve-bench`) and `native/src/glyph_scene/nodes.rs` (the
+renderer's group rows as nodes). The crate header credits its sources:
+bevy (MIT/Apache-2.0: the component split, the two-level dirty bits and
+sparse-upload policy of `sparse_buffer_vec.rs`, the scatter shader adapted
+from `sparse_buffer_update.wesl`), Wicked Engine's per-node chain walk,
+Unity Entities' post-transform scale, slotmap-style handles.
+
+**What runs.** Handles are index + generation with a FIFO free list; a freed
+slot waits three frames before reuse, and a stale handle is refused before
+and after its slot is reused. The CPU keeps parent/child/sibling links and a
+depth-first order (a subtree is one contiguous range), rebuilt once per frame
+after a structural edit. Each table — local (32 B), post scale (16 B),
+appearance (32 B), topology (8 B) — has its own setter and dirty set. Per
+frame the dirty subtrees become merged depth-first ranges (at most 64, in a
+uniform); dirty rows go up as coalesced `write_buffer` runs (up to 16 runs,
+gaps of 2 rows absorbed), as one staged batch for the scatter pass beyond
+that, or as the whole table above 15 %; then one compute pass (scatter
+dispatches, then the resolve) runs, and nothing at all when nothing moved.
+
+**Measured** (`resolve-bench`, RTX 5090 / Vulkan, this box; ONE run of five
+iterations per case, median shown; a ballpark, not an A/B). GPU time is the
+whole pass (scatter + resolve) between pass-boundary timestamps. "Bytes" is
+everything queued: table rows, order span, the 528 B resolve uniform. Every
+case's world rows were held to the CPU reference afterwards (worst relative
+error 0).
+
+| case | Linux topology (102,236 nodes: 95,954 files, 6,282 dirs; leaves ≤ depth 11) | synthetic (100,351 nodes, binary tree 10 deep, 96 leaves per bottom dir) |
+|---|---|---|
+| nothing dirty | no dispatch, 0 B | no dispatch, 0 B |
+| one leaf moved | 0.003 ms GPU, 560 B, 1 node | 0.004 ms, 560 B, 1 node |
+| a subtree moved | `drivers/` (40,494 nodes): 0.005 ms, 560 B | one half (50,175 nodes): 0.006 ms, 560 B |
+| root moved | 0.009 ms, 560 B, 102,236 nodes | 0.010 ms, 560 B, 100,351 nodes |
+| subtree reparented | 0.005 ms GPU; 0.33 ms host (order rebuild); 361 KB (order span) | 0.006 ms; 0.33 ms host; 302 KB |
+| everything moved (every local row written) | 0.009 ms GPU; 0.35 ms host plan + 0.12 ms encode; 3.27 MB (full local table) | 0.010 ms; 3.21 MB |
+| first flush (all new) | 0.010 ms GPU, 2.0 ms host, 9.4 MB | 0.010 ms, 2.6 ms host, 9.2 MB |
+
+Those are with `--group-rows` (every leaf also writes a 96 B row of a group
+table, the transitional form); without it the resolve is a few µs less. The
+host side of a one-node edit is ~3 µs. The pass costs nothing worth
+optimising at this size; the uploads are the cost, and a moved directory is
+one 32 B row. On the M2 (unmeasured), from the repo root:
+
+```sh
+cargo run --release -p glyph-scene-graph --bin resolve-bench -- --tree <linux checkout> --group-rows
+```
+
+(`GLYPH_BENCH_TREE=<checkout>` works in place of `--tree`; `--subtree <dir>`
+picks the moved directory, default `drivers`; `--iters N`, default 5.)
+
+**Deviations from the design above, and why.**
+- Appearance is 32 B of f32 (tint rgb, alpha, blend, flags), not ~8 B of
+  RGBA8: the transitional group rows hold f32 columns, and only f32 makes
+  them round-trip exactly. Pack it when the shaders read the table.
+- The resolve walks every node's WHOLE chain from LOCAL rows; it never
+  stops at a clean ancestor and reads that ancestor's world row. A node's
+  world bits are then a function of the current tables alone, never of
+  which edits came in which frame (deterministic offscreen renders depend
+  on that), and resolving a clean node is harmless, which is what lets the
+  host coalesce ranges into a 64-entry uniform. Measured cost of the full
+  walk: ~10 µs for 100k nodes at depth 11.
+- Alpha inherits (multiplies down the chain); tint and blend are the node's
+  own. Under the identity root this changes nothing.
+- The order is rebuilt in one O(n) walk after any structural edit (0.33 ms
+  at 102k) rather than spliced; nothing restructures per frame yet.
+- No bounds table yet: culling still uses the host-set boxes (E3); it is
+  the next step's (pick, drag, cull from local boxes).
+- The topology row carries an output group row (transitional), so the
+  resolve can write the renderer's existing table directly.
+- Reparenting keeps the LOCAL transform (bevy's `set_parent`): the subtree's
+  world follows the new parent. A keep-world form is not written yet.
+
+**The transitional integration covers**: every group row of every scene
+(repo, text, transcript) is a node under one identity root; the resolve
+writes columns 0-3 of the group table (clip and background stay the
+host's); `move-group`, `scale-group`, `tint-group`, `tint-cycle`,
+`hide-group` / `show-group` / `toggle-hidden`, and the `g` drag and grab
+wheel on groups without a controller entity write the node tables; rows the
+glyph verbs allocate become nodes; and rows the layout controller's bevy
+sync writes (carrel zones, decks, `c` grabs, the library's animation) are
+ADOPTED: their transform always, their appearance only when that writer
+changed it. That last rule fixes E4 for the verbs: a moved file keeps its
+`tint-group` and `hide-group` (`group-adopt-takes-unchanged-appearance`),
+while a carrel that hides a card still hides it. Pixel-neutral: every golden
+is byte-equal plain and under both equivalents, and the group verbs rendered
+by the pre-integration binary and this one agree byte for byte in all three
+field modes (29 of 30 cases; the 30th, `hide-group` then `show-group` in
+visible mode, differs from run to run on the OLD binary too — six runs, six
+hashes — a pre-existing nondeterminism, not looked into here).
+
+**It does not cover**: the library's and the controller's own hierarchies
+(still flattened by bevy on the CPU; one node per group, flat under the
+root — wiring the library onto these tables is the next step); directory
+nodes; the cull boxes and Visible item boxes (still one host write per
+moved group, E3); `LIBTIME`'s `group_bytes` (in `glyph_scene/library.rs`,
+not touched here) still mirrors the old span-or-rows upload rule, so it now
+reports bytes that no longer go up; a GPU profiler scope for the pass (only
+a CPU scope under `GLYPH_PROFILE`); freeing any group row (the glyph verbs'
+override rows still accumulate). The CPU mirror (`groups_cpu`) is computed
+with the resolve's arithmetic; under a non-identity parent the GPU may fuse
+multiply-adds the CPU rounds separately, so pick and cull may differ from
+the drawn frame by an ulp once groups nest.
+
+**Proven by mutation**: `scene-graph-stale-handle-aliases`,
+`resolve-compose-order-swapped` (the GPU test on a random 5,000-node tree
+against the CPU reference; every golden group sits under an identity root,
+where both orders agree, so no golden can see it),
+`group-adopt-takes-unchanged-appearance`, and `resolve-group-tint-halved`
+(pixel-ab: the draw path reads what the resolve writes).
+
 ## What exists today, and what changes
 
 | Today | Becomes |
@@ -202,8 +315,9 @@ reported). A step that costs frame time says how much and why, and Ivan decides.
 
 ## Open questions
 
-- Flattening: decided (GPU resolve, CPU-owned tree; above). Its cost on the
-  M2 and NVIDIA is not measured yet.
+- Flattening: decided (GPU resolve, CPU-owned tree; above). Measured on
+  NVIDIA at ~10 µs for the whole Linux topology (§ Step 1: as built); the
+  M2 is not measured yet (the command is there).
 - Overlapping views at arbitrary depths: draw order and blending. The wall
   rarely overlapped; a scene will. Sort per view, or order-independent
   transparency; research before choosing.
