@@ -50,7 +50,7 @@ impl DerivedField {
         // A device source for this field is the producer's direct Derived
         // emission (HyperLayout Pass 2), bound as-is. A host source
         // transcodes against the same item table.
-        let transcode = DerivedTranscode { item_params, item_of_group: resources.item_of_group };
+        let transcode = DerivedTranscode { item_params, item_of_group: resources.item_of_group, no_items: resources.item_params.is_empty() };
         let storage = SlotStorage::from_source(device, queue, source, &transcode, &LABELS);
 
         let item_table_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
