@@ -86,7 +86,7 @@ pub(super) struct WindowState {
     /// The relayout signal (repo and text scenes): the panel sets Some(...) on
     /// the z_wrap_spacing slider's drag release or the cluster toggle's click;
     /// the RedrawRequested arm consumes it and rebuilds the scene between
-    /// frames. None where no layout params exist (demo/engine-text scenes).
+    /// frames. None where no layout params exist (demo/agent-session scenes).
     #[cfg(feature = "egui-ui")]
     pub(super) pending_relayout: Option<RelayoutRequest>,
     /// Dev-only verification hook state (GLYPH_ZSPACE_SELFTEST=1): same

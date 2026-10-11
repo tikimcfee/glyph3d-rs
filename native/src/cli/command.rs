@@ -172,11 +172,6 @@ impl Cli {
                 color_mode: self.color_mode,
                 emoji_sheet,
             }
-        } else if let Some(file) = &self.engine_render {
-            SceneChoice::EngineText {
-                file: file.clone(),
-                emoji_sheet,
-            }
         } else {
             SceneChoice::Text {
                 file: self.render_file.clone().unwrap_or_else(default_text_file),

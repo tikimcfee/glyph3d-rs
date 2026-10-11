@@ -15,7 +15,6 @@ use std::path::Path;
 
 use crate::atlas::{Atlas, FLAG_MISSING};
 use crate::glyph_scene::{seg_tint, GlyphInstance, GroupRow, PickContext, SegCull};
-use crate::layout::{GlyphArena, ItemPlacement};
 
 /// World-space height of one em cell (ascender→descender). Everything scales
 /// from this; only the ratio to the font units matters.
@@ -889,42 +888,6 @@ pub fn fold_leaders(bytes: &[u8], wrap: i32, mode: crate::fold::WrapMode) -> Fol
     (leaders, rows, cols, lines)
 }
 
-
-/// Present one item's staged arena as a renderable scene.
-///
-/// Since the layout seam landed, compaction and the extents happen behind it,
-/// so this does no arithmetic at all: it names which extent the camera frames
-/// and packages the scene. The INK extent is the right one — the quads of the
-/// glyphs that survived, not the page rectangle they were laid out on — and
-/// choosing between them is exactly the kind of policy the seam declines to
-/// have on the caller's behalf.
-///
-/// An item with no ink has no meaningful frame; a unit square is this caller's
-/// answer, unchanged from when the loop lived here.
-pub fn stage_records(arena: GlyphArena, placement: &ItemPlacement, slot_ink: &[Option<[f32; 4]>]) -> StagedText {
-    let (min, max) = if arena.is_empty() {
-        ([0.0, 0.0, 0.0], [1.0, 1.0, 0.0])
-    } else {
-        (placement.ink.min, placement.ink.max)
-    };
-    let glyphs_emitted = arena.len();
-    let segments = vec![cover_segment(arena.instances(), min, max, slot_ink)];
-
-    StagedText {
-        glyphs_emitted,
-        groups: vec![GroupRow::identity([0.0; 3])],
-        segments,
-        instances: arena,
-        bounds_min: min,
-        bounds_max: max,
-        codepoints_decoded: placement.record_count as usize,
-        missing_or_bitmap: (placement.record_count - placement.slot_count) as usize,
-        focus_bounds: None,
-        pick: None,
-        controller: None,
-        item_params: vec![glyph_field::ItemParamsGpu::default()],
-    }
-}
 
 /// Stage E2 — per-leader syntax colors for one file, in ENGINE record order
 /// (one entry per UTF-8 leader byte, exactly the records `compact` emits, so

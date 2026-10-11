@@ -51,8 +51,6 @@ pub enum SceneChoice {
     Demo,
     /// Stage C Slug text field: stage `file`, tiled `copies` times.
     Text { file: PathBuf, copies: u32, emoji_sheet: PathBuf, cluster_mode: fold::ClusterMode },
-    /// Stage E1: lay `file` out with the engine and render through Slug glyph renderer.
-    EngineText { file: PathBuf, emoji_sheet: PathBuf },
     /// Agent Session: 3D Agent Carrel with Turn Deck and Workdesk.
     AgentSession {
         session_path: PathBuf,
@@ -82,39 +80,6 @@ pub fn atlas_dir() -> PathBuf {
 
 pub fn default_emoji_sheet() -> PathBuf {
     atlas_dir().join("emoji-sheet.bin")
-}
-
-pub fn engine_item_params_at(origin: [f64; 3]) -> layout::ItemParams {
-    layout::ItemParams {
-        line_height: (text::CELL_HEIGHT_WORLD * text::LINE_HEIGHT_FACTOR) as f64,
-        origin_x: origin[0],
-        origin_y: origin[1],
-        origin_z: origin[2],
-        ..Default::default()
-    }
-}
-
-pub fn engine_item(bytes: &[u8]) -> layout::LayoutItem<'_> {
-    engine_item_at(bytes, [0.0, 0.0, 0.0])
-}
-
-pub fn engine_item_at(bytes: &[u8], origin: [f64; 3]) -> layout::LayoutItem<'_> {
-    layout::LayoutItem {
-        bytes,
-        params: engine_item_params_at(origin),
-        group_id: 0,
-        paint: layout::Paint::Flat(layout::DEFAULT_COLOR_PACKED),
-    }
-}
-
-pub fn engine_layout(file: &Path) -> (layout::GlyphArena, layout::ItemPlacement) {
-    let bytes = std::fs::read(file).expect("failed to read engine input file");
-    let mut backend = layout::LayoutEngine::hyper();
-    let mut arena = layout::GlyphArena::new();
-    let placements = backend
-        .layout_items(&[engine_item(&bytes)], &mut arena)
-        .expect("engine layout failed");
-    (arena, placements[0])
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -293,18 +258,6 @@ fn build_scene_impl(
             let mut scene = GlyphScene::new(ctx, color_format, &atlas, staged, camera_mode, cull, field_mode);
             scene.set_probe_cluster_mode(matches!(cluster_mode, fold::ClusterMode::Cluster));
             glyph(scene)
-        }
-        SceneChoice::EngineText { file, emoji_sheet } => {
-            let atlas = atlas::Atlas::load(ctx, emoji_sheet);
-            let (arena, placement) = engine_layout(file);
-            log::info!(
-                "engine-staged {}: {} records ({} blank/missing slots dropped)",
-                file.display(),
-                placement.record_count,
-                placement.record_count - placement.slot_count,
-            );
-            let staged = text::stage_records(arena, &placement, &atlas.slot_ink);
-            glyph(GlyphScene::new(ctx, color_format, &atlas, staged, camera_mode, cull, field_mode))
         }
         SceneChoice::AgentSession { session_path, emoji_sheet, layout_options, cached_session } => {
             let cached_opt = cached_session.read().ok().and_then(|g| g.clone());

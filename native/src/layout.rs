@@ -512,7 +512,7 @@ impl GlyphArena {
         Self::default()
     }
 
-    /// Wrap a host Vec (the text/engine-text scenes stage from their own fold).
+    /// Wrap a host Vec (the text and agent-session scenes stage from their own layout).
     pub fn from_vec(instances: Vec<GlyphInstance>) -> Self {
         Self { instances, device: None, visible: None }
     }

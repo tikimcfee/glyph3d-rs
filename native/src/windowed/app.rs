@@ -51,7 +51,6 @@ pub(super) fn apply_relayout(
         let emoji_sheet = match choice {
             SceneChoice::AgentSession { emoji_sheet, .. } => emoji_sheet.clone(),
             SceneChoice::Text { emoji_sheet, .. } => emoji_sheet.clone(),
-            SceneChoice::EngineText { emoji_sheet, .. } => emoji_sheet.clone(),
             SceneChoice::Repo { emoji_sheet, .. } => emoji_sheet.clone(),
             SceneChoice::Demo => crate::default_emoji_sheet(),
         };
