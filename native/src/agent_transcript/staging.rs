@@ -760,17 +760,7 @@ fn format_beat_right_body(
             if let Some(raw_text) = text_opt {
                 let text = normalize_multiline_text(raw_text);
                 for (line_idx, l) in text.lines().take(5000).enumerate() {
-                    let trimmed = l.trim_start();
-                    let color = if trimmed.starts_with("//")
-                        || trimmed.starts_with('#')
-                        || trimmed.starts_with("/*")
-                        || trimmed.starts_with('*')
-                    {
-                        pal().comment
-                    } else {
-                        pal().body
-                    };
-                    lines.push((format!("{:4} │ {}", line_idx + 1, l), color));
+                    lines.push((format!("{:4} │ {}", line_idx + 1, l), pal().body));
                 }
             } else {
                 lines.push((
@@ -843,17 +833,7 @@ fn format_beat_right_body(
                     if added_lines.contains(&line_no) {
                         lines.push((format!("{:4} +│ {}", line_no, l), pal().diff_add));
                     } else {
-                        let trimmed = l.trim_start();
-                        let color = if trimmed.starts_with("//")
-                            || trimmed.starts_with('#')
-                            || trimmed.starts_with("/*")
-                            || trimmed.starts_with('*')
-                        {
-                            pal().comment
-                        } else {
-                            pal().body
-                        };
-                        lines.push((format!("{:4}  │ {}", line_no, l), color));
+                        lines.push((format!("{:4}  │ {}", line_no, l), pal().body));
                     }
                 }
             } else {
@@ -877,17 +857,7 @@ fn format_beat_right_body(
             if let Some(raw_text) = text_opt {
                 let text = normalize_multiline_text(raw_text);
                 for (line_idx, l) in text.lines().take(5000).enumerate() {
-                    let trimmed = l.trim_start();
-                    let color = if trimmed.starts_with("//")
-                        || trimmed.starts_with('#')
-                        || trimmed.starts_with("/*")
-                        || trimmed.starts_with('*')
-                    {
-                        pal().comment
-                    } else {
-                        pal().body
-                    };
-                    lines.push((format!("{:4} │ {}", line_idx + 1, l), color));
+                    lines.push((format!("{:4} │ {}", line_idx + 1, l), pal().body));
                 }
             } else {
                 lines.push(("  (Empty file created)".to_string(), pal().muted));
@@ -1004,17 +974,7 @@ fn format_revision_card_body(rev: &FileRevision) -> Vec<(String, [u8; 3])> {
             if added_lines.contains(&line_no) {
                 lines.push((format!("{:4} +│ {}", line_no, l), pal().diff_add));
             } else {
-                let trimmed = l.trim_start();
-                let color = if trimmed.starts_with("//")
-                    || trimmed.starts_with('#')
-                    || trimmed.starts_with("/*")
-                    || trimmed.starts_with('*')
-                {
-                    pal().comment
-                } else {
-                    pal().body
-                };
-                lines.push((format!("{:4}  │ {}", line_no, l), color));
+                lines.push((format!("{:4}  │ {}", line_no, l), pal().body));
             }
         }
     } else if !rev.hunks.is_empty() {

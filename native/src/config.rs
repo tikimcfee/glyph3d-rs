@@ -228,8 +228,6 @@ pub struct AgentTextSettings {
     pub emphasis: [u8; 3],
     /// Empty states ("(No ... recorded)").
     pub muted: [u8; 3],
-    /// Comment lines inside shown source.
-    pub comment: [u8; 3],
     pub ok: [u8; 3],
     pub error: [u8; 3],
     pub diff_add: [u8; 3],
