@@ -697,6 +697,7 @@ impl GlyphScene {
         // The pick reads every file's live TRS from the CPU mirror: take
         // the moves a library deferred (2026-10-10).
         self.sync_group_mirror();
+        self.set_picked_region(None);
         if matches!(cmd, PickCommand::Clear) {
             self.selection = None;
             self.picked = None;
@@ -747,9 +748,58 @@ impl GlyphScene {
                 // space = deselect). `picked` is untouched — verb semantics
                 // (act on the most recent pick) are unchanged.
                 self.selection = None;
+                // No file under the ray: the innermost library region it
+                // enters, if any (content out-picks regions). A region pick
+                // is the newest pick, so a verb no longer acts on an older
+                // file (`picked` is dropped), and `g` drags the region.
+                if let PickCommand::Pixel { x, y } = cmd {
+                    if let Some(line) = self.pick_region_at(*x, *y) {
+                        self.picked = None;
+                        return Some(line);
+                    }
+                }
                 Some("pick: MISS (no file under the ray / no path match)".to_string())
             }
         }
+    }
+
+    /// The library region a click at pixel (x, y) lands in when it hit no
+    /// file: the tree cull's boxes refit first (a move since the last cull),
+    /// then the innermost region along the ray (`RegionTable::pick`). Sets
+    /// `picked_region` and returns the reply naming the directory.
+    fn pick_region_at(&mut self, x: f32, y: f32) -> Option<String> {
+        let (ro, rd) = self.pixel_ray(x, y)?;
+        let regions = self.library_regions.as_ref()?;
+        let cull = self.cull.as_ref()?;
+        let mut tree = cull.tree.as_ref()?.borrow_mut();
+        let t = self.nodes.tables();
+        tree.refit(&t, cull);
+        let mut table = regions.table.borrow_mut();
+        table.sync(&mut tree);
+        let (r, at) = table.pick(&t, ro, rd)?;
+        let (d, depth) = table.dir_of(r);
+        drop((table, tree, t));
+        let lib = self.controller.as_ref()?.library.as_ref()?;
+        let dir = &lib.plan.dirs[d];
+        let files = dir.books.len();
+        let line = format!("pick: region {}/ (dir:{}, depth {depth}, {files} file(s) on its own pages, t={at:.2}) — g drags it, scroll scales", dir.path, dir.path);
+        self.set_picked_region(Some(d));
+        Some(line)
+    }
+
+    /// Set (or drop) the picked region and its highlight.
+    pub(super) fn set_picked_region(&mut self, d: Option<usize>) {
+        self.picked_region = d;
+        if let Some(regions) = &self.library_regions {
+            regions.set_picked(d.and_then(|d| regions.table.borrow().region_of_dir(d)));
+        }
+    }
+
+    /// The picked region's zone id (`dir:<path>`, what a `c` grab names).
+    pub(super) fn picked_region_zone(&self) -> Option<String> {
+        let d = self.picked_region?;
+        let lib = self.controller.as_ref()?.library.as_ref()?;
+        Some(format!("dir:{}", lib.plan.dirs.get(d)?.path))
     }
 
     /// Stage L (L4): pick hit → selection mask content.
@@ -1303,7 +1353,7 @@ impl GlyphScene {
 }
 
 /// Slab ray-AABB test; returns the entry t (0 when the origin is inside).
-fn ray_aabb(ro: DVec3, rd: DVec3, min: DVec3, max: DVec3) -> Option<f64> {
+pub(super) fn ray_aabb(ro: DVec3, rd: DVec3, min: DVec3, max: DVec3) -> Option<f64> {
     let mut t0 = 0.0f64;
     let mut t1 = f64::MAX;
     for ax in 0..3 {

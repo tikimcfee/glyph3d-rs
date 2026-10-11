@@ -1,0 +1,10 @@
+fn item_0() { let x = 0; }  // xxxxxxxxxxxxx
+fn item_1() { let x = 3; }  // xxxxxxxxxxxxxxxx
+fn item_2() { let x = 6; }  // xx
+fn item_3() { let x = 9; }  // xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+fn item_4() { let x = 12; }  // xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+fn item_5() { let x = 15; }  // xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+fn item_6() { let x = 18; }  // xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+fn item_7() { let x = 21; }  // xxxxxxxxxxxxx
+fn item_8() { let x = 24; }  // xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+fn item_9() { let x = 27; }  // 

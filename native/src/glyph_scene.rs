@@ -107,6 +107,7 @@ mod interaction;
 mod nodes;
 mod tree_cull;
 pub(crate) mod faces;
+mod regions;
 mod library;
 mod style;
 mod setup;
@@ -245,6 +246,13 @@ pub struct GlyphScene {
     /// A library load's page faces, written on the GPU from the sheets'
     /// resolved worlds (`faces.rs`); None in every other scene.
     pub(crate) library_faces: Option<faces::LibraryFaces>,
+    /// A library load's bounding regions, one box per directory below the
+    /// root (`regions.rs`, `[library] regions`); None in every other scene
+    /// and with regions off.
+    pub(in crate::glyph_scene) library_regions: Option<regions::LibraryRegions>,
+    /// The picked region (a `Plan::dirs` index): a click inside a region
+    /// that hit no file. A file pick, a miss or a clear drops it.
+    pub(in crate::glyph_scene) picked_region: Option<usize>,
     /// The staged scene's lowest y (all files, not the camera's focus): the
     /// environment's ground sits `[environment] ground_gap` below it.
     pub(in crate::glyph_scene) scene_min_y: f32,

@@ -297,6 +297,21 @@ pub(super) fn render_scene(
         }
     };
 
+    // The library's regions: the cull's refits re-pad their boxes (only
+    // the refit ones are uploaded), and a GPU pass composes them with their
+    // directories' worlds when anything resolved or was uploaded.
+    if let (Some(regions), Some(tree), Some(world)) =
+        (&scene.library_regions, scene.cull.as_ref().and_then(|c| c.tree.as_ref()), scene.nodes.world_buffer())
+    {
+        let cost = regions.prepare(&ctx.device, &ctx.queue, encoder, &mut tree.borrow_mut(), &world, flush.as_ref());
+        // GLYPH_LIBRARY_TIMING: one line per frame the regions did anything
+        // (a settled library prints nothing): refits taken, rows uploaded,
+        // whether the compose pass ran, and the CPU time of it all.
+        if (cost.refits > 0 || cost.composed) && std::env::var_os("GLYPH_LIBRARY_TIMING").is_some() {
+            println!("REGIONTIME refits={} uploaded={} upload_bytes={} composed={} prepare_ms={:.4}", cost.refits, cost.uploaded, cost.bytes, cost.composed, cost.ms);
+        }
+    }
+
     // Stage K: refresh the windowed debug-UI probe (installed only by
     // windowed runs; offscreen skips this entirely). Camera fields are
     // this frame's ACTUAL products; the pick line is the same string
@@ -538,6 +553,11 @@ pub(super) fn render_scene(
                 // same position in the phase.
                 if let Some(faces) = &scene.library_faces {
                     mp_ref.render_from(&mut pass, crate::glyph_scene::mesh::UnitMesh::Quad, 0..faces.count(), &scene.mesh_frame_bg, &faces.instances);
+                }
+                // The regions after the faces (a page hides the walls
+                // behind it), before the glyphs (which read over them).
+                if let Some(regions) = &scene.library_regions {
+                    regions.draw(&mut pass);
                 }
                 if let Some(meshes) = &scene_meshes {
                     let q_len = meshes.quads.len() as u32;

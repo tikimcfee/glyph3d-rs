@@ -329,3 +329,34 @@ aspect = 1.5
 page_faces = true
 page_face_color = [0.085, 0.085, 0.11, 0.85]
 page_face_gap = 0.05
+# Bounding regions (2026-10-10, the JS ContentTreeMarkers): one translucent box
+# per directory below the root, enclosing its whole subtree (its pages and every
+# child directory), so containment and relative placement read at a glance.
+# A region rides its directory's transform; clicking inside one (not on a
+# file) picks it, and g drags the directory with everything in it.
+regions = true
+# Padding beyond the subtree's box at the top level (region_pad in x/y,
+# region_z_pad in z), each nesting level region_pad_step less, down to
+# region_pad_min — so a child's walls sit inside its parent's, never on them.
+# A flat directory still gets region_min_thickness of depth.
+region_pad = 2.5
+region_z_pad = 2.0
+region_pad_step = 0.3
+region_pad_min = 0.5
+region_min_thickness = 4.0
+# Colour is a gradient over nesting depth (linear RGB): region_color_a at the
+# shallowest directories (the JS 0x2e5f8a), region_color_b at the deepest in
+# the tree (0x7a3a8a), however deep that is. Nested boxes overlap, so depth of
+# nesting reads as density of tint.
+region_color_a = [0.0273, 0.1144, 0.2542]
+region_color_b = [0.1946, 0.0423, 0.2542]
+# Fill opacity per box face, times region_opacity_decay per level below the
+# first (1 = constant), never under region_min_opacity; the edge hairline's
+# opacity and width in pixels. A picked region draws brighter.
+region_opacity = 0.07
+region_opacity_decay = 1.0
+region_min_opacity = 0.02
+region_edge_opacity = 0.35
+region_edge_px = 1.0
+region_picked_opacity = 0.14
+region_picked_edge_opacity = 0.9
