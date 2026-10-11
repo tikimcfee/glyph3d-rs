@@ -27,7 +27,8 @@
 //!   - instance fields (color/pos/advance/height): queue.write_buffer into
 //!     the affected arena chunk at slot granularity (32 B RenderSlot stride,
 //!     4-aligned);
-//!   - group TRS/color/alpha: one 80 B GroupRow write per edit, plus a CPU
+//!   - group TRS/color/alpha: one node-table row per edit (since 2026-10-10
+//!     the GPU resolve writes the 96 B GroupRow; `glyph_scene/nodes.rs`), plus a CPU
 //!     segment-table sync (AABB follows the group; backdrop tint follows the
 //!     group color; hidden groups are skipped by the cull entirely).
 //!
@@ -103,6 +104,7 @@ pub use ui_probe::{LodHandle, UiCarrelState, UiProbe, UiProbeState};
 
 mod environment;
 mod interaction;
+mod nodes;
 mod library;
 mod style;
 mod setup;
@@ -167,11 +169,16 @@ pub struct GlyphScene {
     /// the legacy per-chunk draws.
     pub(in crate::glyph_scene) cull: Option<CullState>,
     // ── Stage G: picking & live manipulation ────────────────────────────
-    /// Group table buffer, kept for partial per-row uploads (80 B/row).
+    /// Group table buffer (96 B rows): columns 0-3 written by the group
+    /// nodes' resolve pass, whole rows by the load and the glyph verbs.
     pub(crate) group_buf: wgpu::Buffer,
     /// CPU mirror of the group table — the pick path reads the LIVE TRS from
     /// here and every group verb writes it back (then uploads just that row).
     pub(crate) groups_cpu: Vec<GroupRow>,
+    /// Every group row as a node of the transform tree (2026-10-10,
+    /// `nodes.rs`): the group verbs write its tables, and its resolve pass
+    /// writes the rows' transform and appearance columns on the GPU.
+    pub(crate) nodes: nodes::GroupNodes,
     /// Repo-mode pick context (None for text/engine scenes).
     pub(crate) pick: Option<PickContext>,
     /// The panel's cluster-toggle seed for scenes WITHOUT a pick context

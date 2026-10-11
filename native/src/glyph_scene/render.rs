@@ -28,6 +28,11 @@ pub(super) fn render_scene(
         width,
         height,
     } = *target;
+    // The transform tree first: the frame's group edits go up and the moved
+    // subtrees resolve into the group table before any pass reads a row
+    // (the Visible field's cull below, the glyph pass). Nothing moved,
+    // nothing dispatched.
+    scene.nodes.flush(ctx, encoder);
     let aspect = width as f32 / height.max(1) as f32;
     scene.viewport.set((width, height));
     let frame = scene.camera_frame(t, aspect);

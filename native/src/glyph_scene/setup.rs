@@ -68,6 +68,9 @@ impl GlyphScene {
             mapped_at_creation: false,
         });
         ctx.queue.write_buffer(&group_buf, 0, bytemuck::cast_slice(&groups));
+        // The rows as nodes under an identity root: the first frame's resolve
+        // rewrites columns 0-3 of every row with the bits uploaded here.
+        let nodes = super::nodes::GroupNodes::new(device, &group_buf, max_groups as u32, &groups);
         log::info!(
             "emoji sheet bound: {} cells, {} mip levels, {:.1} MiB",
             atlas.emoji.sheet.cells.len(),
@@ -384,6 +387,7 @@ impl GlyphScene {
             cull,
             group_buf,
             groups_cpu,
+            nodes,
             pick,
             probe_cluster_mode: None,
             probe_layout_mode: None,

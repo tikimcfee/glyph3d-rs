@@ -25,7 +25,7 @@
 # Ratchet, NOT an equality: tests are added constantly, so an exact pin would
 # redden on the most common good action in the repo. A green run whose real
 # count exceeds the floor prints a NOTE naming the value to raise it to.
-test_floor = 355
+test_floor = 357
 # Every golden view is rendered again under each of these and must match the
 # SAME baseline byte for byte (2026-10-09, C20). The Derived field renders
 # every golden frame identically to Instanced (measured on vulkan-nvidia and
@@ -1178,3 +1178,44 @@ op = "replace"
 find = "    let slot = ((order * (i as i64 - head)) % n + n) % n;"
 with = "    let slot = ((-order.abs() * (i as i64 - head)) % n + n) % n;"
 expect = "deck_slot_law_reads_page_order_or_recency"
+
+[[mutation]]
+name = "scene-graph-stale-handle-aliases"
+gate = "cargo-test"
+why = "a node handle checked by index alone, not index + generation: once a freed slot is reused, every handle to its old occupant reads and writes the new one — a verb on a closed file moving whatever took its row. The transform tree's whole addressing contract (crates/glyph-scene-graph, 2026-10-10). No golden view frees a node, so pixel-ab cannot see it. CONSUMED BY: NodeTables::is_live, which every accessor and setter checks through; reddens tables::tests::a_stale_handle_is_refused_and_never_aliases_a_reused_slot"
+file = "crates/glyph-scene-graph/src/tables.rs"
+op = "replace"
+find = "        i < self.alive.len() && self.alive[i] && self.generation[i] == h.generation"
+with = "        i < self.alive.len() && self.alive[i]"
+expect = "a_stale_handle_is_refused_and_never_aliases_a_reused_slot"
+
+[[mutation]]
+name = "resolve-compose-order-swapped"
+gate = "cargo-test"
+why = "the GPU resolve composing child-then-parent (acc ∘ local[parent]) instead of parent-then-child: a nested node's translation is no longer carried through its parent's rotation and scale. Every golden group is a child of an identity root, where the two orders agree bit for bit, so pixel-ab cannot see this; the GPU test on a random 5,000-node tree, held to the CPU reference, can. CONSUMED BY: resolve.wgsl's chain walk, every node of every flush; reddens the_resolve_matches_the_cpu_reference_through_every_upload_path"
+file = "crates/glyph-scene-graph/shaders/resolve.wgsl"
+op = "replace"
+find = "        acc = compose(locals[p], acc);"
+with = "        acc = compose(acc, locals[p]);"
+expect = "the_resolve_matches_the_cpu_reference_through_every_upload_path"
+
+[[mutation]]
+name = "resolve-group-tint-halved"
+gate = "pixel-ab"
+why = "the transitional resolve writing a wrong appearance column into the group table: the proof that the draw path reads what the resolve pass writes (2026-10-10: every group row is a node, and the first frame's resolve rewrites columns 0-3 of every row). A resolve that wrote nothing, or wrote to the wrong buffer, would leave every golden byte-equal for the wrong reason. CONSUMED BY: resolve.wgsl's group-row output, every group of every scene on its first frame; text.png is the first framed view with a group"
+file = "crates/glyph-scene-graph/shaders/resolve.wgsl"
+op = "replace"
+find = "        groups[g + 2u] = vec4<f32>(app.tint.xyz, alpha);"
+with = "        groups[g + 2u] = vec4<f32>(app.tint.xyz * 0.5, alpha);"
+expect = "text.png diverges from baseline"
+rebuild = "cargo build --release"
+
+[[mutation]]
+name = "group-adopt-takes-unchanged-appearance"
+gate = "cargo-test"
+why = "the library probe's E4 put back: rows an external writer (the layout controller's bevy sync: carrels, decks, the library's animation) moved are adopted whole, so its unchanged binding tint overwrites a tint-group or hide-group the user applied, and the next toggle-hidden inverts their intent. No golden view animates, so pixel-ab cannot see it. CONSUMED BY: GroupNodes::adopt, called by write_group_rows for every controller-synced group; reddens glyph_scene::nodes::tests::an_external_move_keeps_a_verbs_tint_and_hide"
+file = "native/src/glyph_scene/nodes.rs"
+op = "replace"
+find = "        if self.ext[gid as usize] != ext {"
+with = "        if self.ext[gid as usize] != ext || gid < u32::MAX {"
+expect = "an_external_move_keeps_a_verbs_tint_and_hide"
