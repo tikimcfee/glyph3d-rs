@@ -1454,7 +1454,12 @@ mod tests {
         let seeded = format!("{}\nafter\tthe\tlong line\n", tabbed_line(3 * crate::layout_hyper::SEGMENT_BYTES));
         let cut = tabbed_line(2 * CHUNK_THRESHOLD_BYTES + 4096);
         assert!(!cut.contains('\n'));
-        let texts: [&str; 3] = [small, &seeded, &cut];
+        // The same line ENDING inside a later chunk: that chunk holds a
+        // newline, so the aggregation does not walk it again, and its
+        // continued first line's tabs rest on the line-table replays and
+        // `measure_continued_lines` taking the true seed (review, 2026-10-11).
+        let cut_then_ends = format!("{cut}\tthe\tline\tends\nnext\tline\t|\n");
+        let texts: [&str; 4] = [small, &seeded, &cut, &cut_then_ends];
         // (wrap, mode, page_rows, page_cols, pages_wide)
         let shapes: [(i32, fold::WrapMode, i32, i32, i32); 6] = [
             (0, fold::WrapMode::Back, 0, 0, 1),
