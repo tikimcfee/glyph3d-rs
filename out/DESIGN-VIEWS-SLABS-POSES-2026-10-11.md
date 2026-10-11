@@ -387,7 +387,8 @@ node tree does the rest. No arrow points back.
 A highlight sidecar and AST/LSP tokens are properties of the TEXT; "two views
 over the same bytes" (the design's instancing case) might want different
 colours. **Verdict:** spans live on the buffer by default; a view may carry
-an override span table later. Flagged as Ivan's call (§ 7).
+an override span table later. Flagged as Ivan's call (§ 7). **Superseded**
+by his decision (§ 7.1): meaning on the buffer, look on the view.
 
 ### 3.11 What splits
 
@@ -700,6 +701,52 @@ Not in this order, and deliberately: the Visible-only syntax decision, the
    witnesses for steps A and G?** Both need a human to look at a frame once.
 7. **f16 or f32 pose offsets?** Sparse slabs make f32 cheap; f16 was chosen
    when the slab was dense.
+
+### 7.1 Decided (Ivan, 2026-10-11)
+
+1. **Side list (C).** It can be somewhat dynamic, so it needs a tight
+   controller to maintain it: one owner that adds, moves and frees side-list
+   records and blanks or restores the main slots, so no verb does it by hand.
+2. **Scale about the pen origin, neighbours unmoved.** An offset pivot may come
+   later.
+3. **Style: meaning on the buffer, look on the view.** The buffer carries what
+   the text IS (token kinds from syntax, AST, LSP). The view carries how it
+   LOOKS: a theme mapping kinds to colours, plus span layers (highlight,
+   search hits, selection). A pose colour wins last. So two views over one
+   region can look different from day one, and the analysis runs once per
+   buffer.
+4. **User-set transforms stick for every node** (`local = planned + user`):
+   "if a user does something, you don't undo it."
+5. **Per-glyph background stays, as the view's span layers.** Highlighting a
+   subsection IS per-glyph background, so dropping it would need a new
+   abstraction anyway. Highlights become rectangles a view's span layer
+   draws (the editor shape, and the regions box pipeline's), not a group row
+   per glyph. **A posed glyph's background travels with it**, because it is
+   the glyph's background. What that asks of the build:
+   - *One mechanism draws every background.* The span layer reads the view's
+     pose slab, cuts a highlight's run around each posed glyph and draws that
+     glyph's rectangle at layout + pose, under the same pen-origin scale. The
+     cell a posed glyph left shows no background. Cost: one extra rectangle
+     per posed glyph inside a highlight. The side list stays ink-only, with
+     no background lane.
+   - *Coplanar draw order.* Today the background is painted inside the
+     glyph's own fragment and cannot depth-fight its ink. A rectangle pass
+     sits on the text's plane, so it needs a stated order: rectangles first,
+     depth test on and depth write off, then glyphs. The blend arithmetic is
+     the same, but the GPU may round it differently, so the witness is
+     today's in-shader background frame against the rectangle-layer frame,
+     with any difference measured before it is accepted. (The library
+     regions' depth order against the glyph pass is unwatched too; one
+     answer should serve both.)
+   - *Visible needs span x-extents.* It stores no records, so a span's
+     rectangles come from a CPU re-derivation of the highlighted lines (the
+     pick path already does this per item), or later from the layout kernel.
+     CPU first, measured.
+   - *Deferred:* block and column selection (per-row column ranges; an
+     editor feature, the same rectangle layer later).
+6. **Yes to both witnesses**: the permutation test (landed with step A, § 8)
+   and a word-cloud golden for step G.
+7. **f32 pose offsets.** Simplify ahead of time.
 
 ## 8. Step A: as built (2026-10-11)
 
