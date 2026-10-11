@@ -105,6 +105,7 @@ pub use ui_probe::{LodHandle, UiCarrelState, UiProbe, UiProbeState};
 mod environment;
 mod interaction;
 mod nodes;
+pub(crate) mod faces;
 mod library;
 mod style;
 mod setup;
@@ -240,6 +241,9 @@ pub struct GlyphScene {
     pub(in crate::glyph_scene) params: Cell<Params>,
     pub(crate) mesh_pipeline: std::cell::RefCell<mesh::MeshPipeline>,
     pub(crate) mesh_frame_bg: wgpu::BindGroup,
+    /// A library load's page faces, written on the GPU from the sheets'
+    /// resolved worlds (`faces.rs`); None in every other scene.
+    pub(crate) library_faces: Option<faces::LibraryFaces>,
     /// The staged scene's lowest y (all files, not the camera's focus): the
     /// environment's ground sits `[environment] ground_gap` below it.
     pub(in crate::glyph_scene) scene_min_y: f32,

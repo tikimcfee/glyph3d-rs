@@ -32,7 +32,14 @@ pub(super) fn render_scene(
     // subtrees resolve into the group table before any pass reads a row
     // (the Visible field's cull below, the glyph pass). Nothing moved,
     // nothing dispatched.
-    scene.nodes.flush(ctx, encoder);
+    let flush = scene.nodes.flush(ctx, encoder);
+    // The library's page faces follow their sheets' resolved worlds: one
+    // GPU pass after any resolve, nothing from the host (faces.rs).
+    if let (Some(faces), Some(st), Some(world)) = (&scene.library_faces, &flush, scene.nodes.world_buffer()) {
+        if st.dispatched {
+            faces.encode(&ctx.device, encoder, &world, st.grew);
+        }
+    }
     let aspect = width as f32 / height.max(1) as f32;
     scene.viewport.set((width, height));
     let frame = scene.camera_frame(t, aspect);
@@ -514,6 +521,12 @@ pub(super) fn render_scene(
                     }
                 }
 
+                // The library's faces take the scene meshes' place (a
+                // library load has no other scene mesh): same pipeline,
+                // same position in the phase.
+                if let Some(faces) = &scene.library_faces {
+                    mp_ref.render_from(&mut pass, crate::glyph_scene::mesh::UnitMesh::Quad, 0..faces.count(), &scene.mesh_frame_bg, &faces.instances);
+                }
                 if let Some(meshes) = &scene_meshes {
                     let q_len = meshes.quads.len() as u32;
                     let c_len = meshes.cubes.len() as u32;

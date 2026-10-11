@@ -291,6 +291,19 @@ impl MeshPipeline {
         instances_range: std::ops::Range<u32>,
         bind_group: &'a wgpu::BindGroup,
     ) {
+        self.render_from(pass, mesh_type, instances_range, bind_group, &self.instance_buffer);
+    }
+
+    /// Renders instances of a unit mesh from an instance buffer someone
+    /// else keeps (the library's page faces, written on the GPU).
+    pub fn render_from<'a>(
+        &'a self,
+        pass: &mut wgpu::RenderPass<'a>,
+        mesh_type: UnitMesh,
+        instances_range: std::ops::Range<u32>,
+        bind_group: &'a wgpu::BindGroup,
+        instances: &'a wgpu::Buffer,
+    ) {
         if instances_range.is_empty() {
             return;
         }
@@ -298,7 +311,7 @@ impl MeshPipeline {
         pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(0, bind_group, &[]);
         pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
-        pass.set_vertex_buffer(1, self.instance_buffer.slice(..));
+        pass.set_vertex_buffer(1, instances.slice(..));
         pass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
 
         let indices = match mesh_type {

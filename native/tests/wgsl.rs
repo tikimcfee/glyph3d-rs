@@ -38,7 +38,9 @@ fn all_wgsl_shaders_parse_and_validate() {
         // (the Instanced field mode owns it; that crate's tests/wgsl.rs
         // validates it and pins its own set).
         // 2026-10-09: environment.wgsl, the ground/sky pass (off by default).
-        ["composite.wgsl", "cull.wgsl", "environment.wgsl", "mesh.wgsl", "quad_field.wgsl"],
+        // 2026-10-10: library_faces.wgsl, the library's page faces written from the
+        // transform tree's world rows (glyph_scene/faces.rs).
+        ["composite.wgsl", "cull.wgsl", "environment.wgsl", "library_faces.wgsl", "mesh.wgsl", "quad_field.wgsl"],
         "shader file set changed — update the test's expected list"
     );
 
@@ -62,6 +64,12 @@ fn all_wgsl_shaders_parse_and_validate() {
                     }
                     if name == "BackdropInst" {
                         assert_eq!(span, 48, "BackdropInst WGSL struct size must match Rust 48-byte layout");
+                    }
+                    if name == "MeshInstance" {
+                        assert_eq!(span, 80, "library_faces.wgsl's MeshInstance must be mesh.rs MeshInstance (80 B)");
+                    }
+                    if name == "FaceParams" {
+                        assert_eq!(span, 64, "FaceParams WGSL struct size must match faces.rs FaceParamsGpu (64 B)");
                     }
                 }
             }

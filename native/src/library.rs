@@ -12,13 +12,15 @@
 //!   grid, contain-fit, the easing step.
 //! - `plan` — the scheme: directory tree, sort, stack extents, the
 //!   serpentine child tier; measure post-order, place pre-order.
-//! - `runtime` — the plan on the spatial scene (bevy_transform hierarchy:
-//!   dir → volume → sheet → mount → file card) and its animation.
+//! - `runtime` — the plan on the renderer's transform tree
+//!   (`glyph-scene-graph` nodes: root → dir → volume → sheet → mount →
+//!   file; bevy until 2026-10-10) and its animation.
 //!
 //! The contract with the renderer is the GroupRow, nothing else: a file's
-//! group carries its flattened world transform (T·R·S; the fit scale rides
-//! in S), the file's item origin is its local zero, and the slot formats and
-//! the group-row format are untouched. Named values live in `[library]` of
+//! group carries its world transform (T·R·S; the fit scale rides in S),
+//! written by the scene graph's GPU resolve from the file node's chain; the
+//! file's item origin is its local zero, and the slot formats and the
+//! group-row format are untouched. Named values live in `[library]` of
 //! `config/defaults.toml`.
 //!
 //! Runtime controls (all go through the verb path, so `--verb` scripts them
@@ -46,7 +48,7 @@ pub enum DepthAlign {
     /// The content's depth centred on the page plane (the JS scheme).
     Center,
 }
-pub use runtime::{FormCmd, Library, LibraryTick, Page};
+pub use runtime::{FaceSpec, FormCmd, LibNodes, Library, LibraryTick, Page};
 
 /// One runtime control, as `--verb` spells it (and the windowed keys build).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -105,6 +107,27 @@ impl LibraryVerb {
             other => return Err(format!("{other:?} is not a library verb")),
         })
     }
+}
+
+/// Each file's group row as the tree resolves it (on the CPU, the same
+/// arithmetic as the GPU resolve): world translation, rotation and the
+/// uniform scale, the directory tint at alpha 1, blend 0 — the columns
+/// `sync_all_to_group_rows` used to write off bevy's GlobalTransform, bit
+/// for bit (`tests::the_tree_resolves_the_rows_bevy_composed`).
+pub fn seated_rows(t: &glyph_scene_graph::NodeTables, nodes: &LibNodes, tints: &[[f32; 3]]) -> Vec<crate::glyph_scene::GroupRow> {
+    nodes
+        .file
+        .iter()
+        .zip(tints)
+        .map(|(&f, tint)| {
+            let (w, _) = t.world(f).expect("library nodes are live");
+            let mut g = crate::glyph_scene::GroupRow::tinted([0.0; 3], *tint);
+            g.cols[0] = [w.translation[0], w.translation[1], w.translation[2], 0.0];
+            g.cols[1] = w.rotation;
+            g.cols[3] = [w.scale, w.scale, w.scale, 0.0];
+            g
+        })
+        .collect()
 }
 
 #[cfg(test)]

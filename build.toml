@@ -25,7 +25,7 @@
 # Ratchet, NOT an equality: tests are added constantly, so an exact pin would
 # redden on the most common good action in the repo. A green run whose real
 # count exceeds the floor prints a NOTE naming the value to raise it to.
-test_floor = 359
+test_floor = 364
 # Every golden view is rendered again under each of these and must match the
 # SAME baseline byte for byte (2026-10-09, C20). The Derived field renders
 # every golden frame identically to Instanced (measured on vulkan-nvidia and
@@ -1249,3 +1249,33 @@ op = "replace"
 find = "        if self.ext[gid as usize] != ext {"
 with = "        if self.ext[gid as usize] != ext || gid < u32::MAX {"
 expect = "an_external_move_keeps_a_verbs_tint_and_hide"
+
+[[mutation]]
+name = "library-file-under-sheet"
+gate = "cargo-test"
+why = "the library's file node attached under its SHEET instead of its mount (2026-10-10, the library on the transform tree): the contain-fit scale and centring are lost, every page draws its file at scale 1 from the page centre. No golden view renders the library, so pixel-ab cannot see it; the rows-equal-bevy test can, because it rebuilds the hierarchy bevy used to compose. CONSUMED BY: Library::insert_nodes, which attach runs once per library load (setup.rs) and apply_library on a scratch table for the load rows; reddens library::tests::the_tree_resolves_the_rows_bevy_composed"
+file = "native/src/library/runtime.rs"
+op = "replace"
+find = "                    t.reparent(f, Some(mt)).expect(\"a file node is live\");"
+with = "                    t.reparent(f, Some(sh)).expect(\"a file node is live\");"
+expect = "the_tree_resolves_the_rows_bevy_composed"
+
+[[mutation]]
+name = "library-face-offset-dropped"
+gate = "cargo-test"
+why = "the page-face pass placing each face ON its sheet instead of page_face_gap behind it (2026-10-10: faces are written on the GPU from the sheets' resolved worlds, no longer extracted from bevy). The face writes depth and the content's front sits on the page plane, so a face on the plane z-fights the text it backs. No golden view renders the library; the GPU test reads the face pass back against its CPU twin, which the bevy test holds to bevy's extraction. CONSUMED BY: library_faces.wgsl, every face on every frame whose flush resolved anything; reddens glyph_scene::faces::tests::the_gpu_resolves_the_library_rows_and_faces_the_cpu_does"
+file = "native/src/shaders/library_faces.wgsl"
+op = "replace"
+find = "    let t = w.t_s.xyz + rotate(q, params.offset.xyz * s);"
+with = "    let t = w.t_s.xyz;"
+expect = "the_gpu_resolves_the_library_rows_and_faces_the_cpu_does"
+
+[[mutation]]
+name = "scene-graph-cpu-mirror-compose-swapped"
+gate = "cargo-test"
+why = "the CPU subtree resolve (the mirror of a move: the rows pick, the HUD and the CPU cull read) composing local ∘ parent-world instead of parent-world ∘ local. The GPU draws the right frame and the CPU readers see another: a pick or a cull box off wherever a nested node moves. No golden view nests a group. CONSUMED BY: NodeTables::resolve_subtrees, run by GroupNodes::mirror_subtrees for every library move (ease, zone drag, file drag); reddens tables::tests::resolving_subtrees_on_the_cpu_matches_world_node_for_node"
+file = "crates/glyph-scene-graph/src/tables.rs"
+op = "replace"
+find = "                    (Similarity::compose(&pw, &self.local[n]), pa * self.appearance[n].tint[3])"
+with = "                    (Similarity::compose(&self.local[n], &pw), pa * self.appearance[n].tint[3])"
+expect = "resolving_subtrees_on_the_cpu_matches_world_node_for_node"

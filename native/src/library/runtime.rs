@@ -1,25 +1,30 @@
-//! The library on the spatial scene: the plan's local positions become a
-//! bevy_transform hierarchy — library root → directory → volume → sheet →
-//! mount (the contain-fit scale) → file card (`GlyphGroupBinding`, identity)
-//! — so a file's GroupRow is its flattened world transform, written by the
-//! scene's existing `sync_to_group_rows`. Paging, form, stack and sort are
-//! RETARGETS: the plan is recomputed, every node's easing starts from where
-//! its transform actually is (mid-ease, or wherever a drag left it), and
-//! `tick` eases dirs and sheets toward their new slots with the Book's
-//! frame-rate-independent `1 − e^(−rate·dt)`. (The JS rebuilt its volume per
-//! pass and seeded only the sheets' poses, so its directories jumped; here
-//! directories glide too — the structure never changes, only targets.)
+//! The library on the renderer's transform tree (`glyph-scene-graph`; since
+//! 2026-10-10 — before, a bevy_transform hierarchy flattened on the CPU):
+//! library root → directory → volume → sheet → mount (the contain-fit
+//! scale) → file. The file node IS the file's group node: it routes its
+//! resolved world into its group row, so the GPU resolve writes the row the
+//! draw shaders read, and a move writes only the LOCAL rows of the nodes
+//! that moved — a page turn its sheets, a directory drag one row — never a
+//! row per descendant. Paging, form, stack and sort are RETARGETS: the plan
+//! is recomputed, every node's easing starts from where its local row
+//! actually is (mid-ease, or wherever a drag left it), and `tick` eases dirs
+//! and sheets toward their new slots with the Book's frame-rate-independent
+//! `1 − e^(−rate·dt)`. (The JS rebuilt its volume per pass and seeded only
+//! the sheets' poses, so its directories jumped; here directories glide too
+//! — the structure never changes, only targets.)
+//!
+//! The rows come out bit for bit as bevy's did: the resolve composes
+//! top-down, summing each translation root first exactly as bevy's
+//! propagation does, and every step of the chain is a product with 1 or a
+//! sum (`tests::the_tree_resolves_the_rows_bevy_composed`).
 
 use std::collections::HashMap;
 use std::time::Instant;
 
-use bevy_ecs::prelude::*;
-use bevy_transform::components::{GlobalTransform, Transform};
-use glam::Vec3;
+use glyph_scene_graph::{Appearance, NodeHandle, NodeTables, Similarity};
 
 use super::book::{ease_k, ease_step};
 use super::plan::{build_tree, plan, DirNode, Form, LibFile, Opts, Plan, Sort, Stack, VolumeState};
-use crate::spatial_scene::{LayoutZoneEntity, LocalBounds, SpatialScene};
 
 /// A paging request (`pageTo` / `scroll`: clamped at both ends, no wrap).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -38,16 +43,39 @@ pub enum FormCmd {
     Toggle,
 }
 
-/// What one animation step cost.
-#[derive(Clone, Copy, Debug, Default)]
+/// What one animation step did and cost.
+#[derive(Clone, Debug, Default)]
 pub struct LibraryTick {
-    /// Dir and sheet nodes whose transform was written this step.
+    /// Dir and sheet nodes whose local row was written this step.
     pub nodes_moved: usize,
-    /// The easing loop alone.
+    /// Those nodes (their subtrees are what moved).
+    pub moved: Vec<NodeHandle>,
+    /// The easing loop alone (local-row writes included).
     pub ease_ms: f64,
-    /// Transform propagation + scene mesh re-extraction (`update_transforms`).
-    pub propagate_ms: f64,
     pub still_animating: bool,
+}
+
+/// The library's nodes in a [`NodeTables`] (`Library::insert_nodes`).
+#[derive(Clone, Debug)]
+pub struct LibNodes {
+    pub root: NodeHandle,
+    /// Per `Plan::dirs` entry.
+    pub dir: Vec<NodeHandle>,
+    /// Per `Plan::dirs` entry: None for a directory without files.
+    pub volume: Vec<Option<NodeHandle>>,
+    /// Per file (load order): its sheet, its mount, and the file node.
+    pub sheet: Vec<NodeHandle>,
+    pub mount: Vec<NodeHandle>,
+    pub file: Vec<NodeHandle>,
+}
+
+/// The page face behind every sheet: a quad `size` wide centred on the
+/// sheet, `gap` behind its plane (`[library] page_faces`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct FaceSpec {
+    pub size: [f32; 2],
+    pub gap: f32,
+    pub color: [f32; 4],
 }
 
 pub struct Library {
@@ -59,94 +87,36 @@ pub struct Library {
     tree: DirNode,
     pub plan: Plan,
     volumes: HashMap<String, VolumeState>,
-    pub root: Entity,
-    pub dir_e: Vec<Entity>,
-    pub sheet_e: Vec<Entity>,
-    pub file_e: Vec<Entity>,
-    pub face_count: usize,
+    /// `dir:<path>` → index into `plan.dirs` (the zone a `c` grab names).
+    zone_dirs: HashMap<String, usize>,
+    /// The page face, when `[library] page_faces` is on.
+    pub face: Option<FaceSpec>,
+    /// The nodes in the scene's tables, once attached (`attach`).
+    pub nodes: Option<LibNodes>,
     dir_at: Vec<[f64; 3]>,
     sheet_at: Vec<[f64; 3]>,
     animating: bool,
 }
 
-fn v3(p: [f64; 3]) -> Vec3 {
-    Vec3::new(p[0] as f32, p[1] as f32, p[2] as f32)
+fn v3(p: [f64; 3]) -> [f32; 3] {
+    [p[0] as f32, p[1] as f32, p[2] as f32]
 }
 
 impl Library {
-    /// Spawn the library under a fresh root of `scene`, seated (no easing:
-    /// a library is laid down settled, as the JS `seatAll` did). `tints` is
-    /// each file's group tint; `dirs[i]` its directory (the zone key).
-    pub fn build(
-        scene: &mut SpatialScene,
-        files: Vec<LibFile>,
-        dirs: &[String],
-        tints: &[[f32; 3]],
-        settings: &crate::config::LibrarySettings,
-    ) -> Self {
+    /// Plan the library, seated (no easing: a library is laid down settled,
+    /// as the JS `seatAll` did). Nothing exists in any node table until
+    /// [`Library::attach`] or [`Library::insert_nodes`].
+    pub fn new(files: Vec<LibFile>, settings: &crate::config::LibrarySettings) -> Self {
         let opts = Opts::from_settings(settings);
         let tree = build_tree(&files);
         let volumes = HashMap::new();
         let p = plan(&tree, &files, &opts, &volumes, settings.form);
-
-        let root = scene.spawn_root("library_root");
-        let mut dir_e = Vec::with_capacity(p.dirs.len());
-        let mut vol_e: Vec<Option<Entity>> = Vec::with_capacity(p.dirs.len());
-        for d in &p.dirs {
-            let parent = d.parent.map_or(root, |i| dir_e[i]);
-            let e = scene.spawn_child(parent, Transform::from_translation(v3(d.pos)), format!("lib:dir:{}", d.path));
-            scene.world.entity_mut(e).insert((
-                LayoutZoneEntity { zone_id: format!("dir:{}", d.path), title: d.name.clone() },
-                LocalBounds {
-                    min: [(-d.size[0] / 2.0) as f32, -d.size[1] as f32, -d.size[2] as f32],
-                    max: [(d.size[0] / 2.0) as f32, 0.0, 0.0],
-                },
-            ));
-            dir_e.push(e);
-            vol_e.push((!d.books.is_empty()).then(|| {
-                scene.spawn_child(e, Transform::from_translation(v3(d.volume_pos)), format!("lib:volume:{}", d.path))
-            }));
-        }
-        let (pw, ph) = (opts.page_w as f32, opts.page_h as f32);
-        let mut sheet_e = vec![Entity::PLACEHOLDER; files.len()];
-        let mut file_e = vec![Entity::PLACEHOLDER; files.len()];
-        let mut face_count = 0;
-        for (i, (f, fp)) in files.iter().zip(&p.files).enumerate() {
-            let vol = vol_e[fp.dir].expect("a directory with a file has a volume");
-            let sheet = scene.spawn_child(vol, Transform::from_translation(v3(fp.slot)), format!("lib:sheet:{}", f.rel_path));
-            let s = fp.fit.scale as f32;
-            if settings.page_faces {
-                // The page plane, a hair behind it (the JS face sat on the
-                // sheet plane too). Content depth behind the plane — the wrap
-                // staircase under depth_align "front", half of it under
-                // "center" — is inside the book: the face, which writes
-                // depth, hides it from the front.
-                scene.spawn_plate(
-                    sheet,
-                    "lib:face",
-                    Transform::from_xyz(0.0, 0.0, -settings.page_face_gap),
-                    [pw, ph],
-                    [-pw / 2.0, -ph / 2.0],
-                    settings.page_face_color,
-                );
-                face_count += 1;
-            }
-            let mount = scene.spawn_child(
-                sheet,
-                Transform { translation: v3(fp.fit.mount), scale: Vec3::splat(s), ..Transform::IDENTITY },
-                "lib:mount",
-            );
-            file_e[i] = scene.spawn_file_card(
-                mount,
-                f.rel_path.clone(),
-                dirs[i].clone(),
-                i as u32,
-                Transform::IDENTITY,
-                (f.ink_min, f.ink_max),
-                tints[i],
-            );
-            sheet_e[i] = sheet;
-        }
+        let zone_dirs = p.dirs.iter().enumerate().map(|(i, d)| (format!("dir:{}", d.path), i)).collect();
+        let face = settings.page_faces.then_some(FaceSpec {
+            size: [opts.page_w as f32, opts.page_h as f32],
+            gap: settings.page_face_gap,
+            color: settings.page_face_color,
+        });
         let dir_at = p.dirs.iter().map(|d| d.pos).collect();
         let sheet_at = p.files.iter().map(|f| f.slot).collect();
         Library {
@@ -158,19 +128,81 @@ impl Library {
             tree,
             plan: p,
             volumes,
-            root,
-            dir_e,
-            sheet_e,
-            file_e,
-            face_count,
+            zone_dirs,
+            face,
+            nodes: None,
             dir_at,
             sheet_at,
             animating: false,
         }
     }
 
+    /// Insert the library's hierarchy into `t` under `parent` (a root when
+    /// None) at the current positions: root → directory → volume → sheet →
+    /// mount (translation + the contain-fit scale) → file (identity). With
+    /// `files`, those nodes become the file nodes — reparented under their
+    /// mounts, their local rows reset to the identity, their group rows
+    /// kept; without, fresh file nodes are made, routing to group row i.
+    /// Interior nodes route to no group row.
+    pub fn insert_nodes(&self, t: &mut NodeTables, parent: Option<NodeHandle>, files: Option<&[NodeHandle]>) -> LibNodes {
+        let id = Appearance::IDENTITY;
+        let root = t.insert(parent, Similarity::IDENTITY, id).expect("the parent is live");
+        let mut dir: Vec<NodeHandle> = Vec::with_capacity(self.plan.dirs.len());
+        let mut volume = Vec::with_capacity(self.plan.dirs.len());
+        for (d, at) in self.plan.dirs.iter().zip(&self.dir_at) {
+            let p = d.parent.map_or(root, |i| dir[i]);
+            let h = t.insert(Some(p), Similarity::from_translation(v3(*at)), id).expect("live");
+            dir.push(h);
+            volume.push(
+                (!d.books.is_empty())
+                    .then(|| t.insert(Some(h), Similarity::from_translation(v3(d.volume_pos)), id).expect("live")),
+            );
+        }
+        let n = self.files.len();
+        let (mut sheet, mut mount, mut file) = (Vec::with_capacity(n), Vec::with_capacity(n), Vec::with_capacity(n));
+        for (i, (fp, at)) in self.plan.files.iter().zip(&self.sheet_at).enumerate() {
+            let vol = volume[fp.dir].expect("a directory with a file has a volume");
+            let sh = t.insert(Some(vol), Similarity::from_translation(v3(*at)), id).expect("live");
+            let m = Similarity { scale: fp.fit.scale as f32, ..Similarity::from_translation(v3(fp.fit.mount)) };
+            let mt = t.insert(Some(sh), m, id).expect("live");
+            let f = match files {
+                Some(fs) => {
+                    let f = fs[i];
+                    t.reparent(f, Some(mt)).expect("a file node is live");
+                    t.set_local(f, Similarity::IDENTITY).expect("live");
+                    if t.post_scale(f).expect("live").xyz != [1.0; 3] {
+                        t.set_post_scale(f, [1.0; 3]).expect("live");
+                    }
+                    f
+                }
+                None => {
+                    let f = t.insert(Some(mt), Similarity::IDENTITY, id).expect("live");
+                    t.set_group_row(f, Some(i as u32)).expect("live");
+                    f
+                }
+            };
+            sheet.push(sh);
+            mount.push(mt);
+            file.push(f);
+        }
+        LibNodes { root, dir, volume, sheet, mount, file }
+    }
+
+    /// Move the library onto the scene's tables: `files[i]` (file i's group
+    /// node) is reparented under its mount, and the library keeps the
+    /// handles it eases.
+    pub fn attach(&mut self, t: &mut NodeTables, parent: Option<NodeHandle>, files: &[NodeHandle]) {
+        assert_eq!(files.len(), self.files.len(), "one group node per library file");
+        self.nodes = Some(self.insert_nodes(t, parent, Some(files)));
+    }
+
     pub fn is_animating(&self) -> bool {
         self.animating
+    }
+
+    /// Files in the library (one group each: group id = load index).
+    pub fn file_count(&self) -> usize {
+        self.files.len()
     }
 
     /// Directories that hold files (one volume each).
@@ -178,9 +210,10 @@ impl Library {
         self.plan.dirs.iter().filter(|d| !d.books.is_empty()).count()
     }
 
-    /// The zone key of every directory (`dir:<path>`) and its entity.
-    pub fn zones(&self) -> impl Iterator<Item = (String, Entity)> + '_ {
-        self.plan.dirs.iter().zip(&self.dir_e).map(|(d, &e)| (format!("dir:{}", d.path), e))
+    /// The directory node a zone id (`dir:<path>`) names, once attached.
+    pub fn zone_node(&self, zone_id: &str) -> Option<NodeHandle> {
+        let d = *self.zone_dirs.get(zone_id)?;
+        Some(self.nodes.as_ref()?.dir[d])
     }
 
     pub fn summary(&self) -> String {
@@ -203,7 +236,7 @@ impl Library {
             self.files.len(),
             self.plan.dirs.len(),
             self.volume_count(),
-            self.face_count,
+            if self.face.is_some() { self.files.len() } else { 0 },
             self.opts.stack,
             self.opts.sort,
             if self.opts.reverse { " reversed" } else { "" },
@@ -212,13 +245,12 @@ impl Library {
         )
     }
 
-    /// The world rect of file `f`'s page (sheet centre ± half a page), at
-    /// the sheet's CURRENT transform.
-    pub fn page_world_rect(&self, scene: &SpatialScene, f: usize) -> Option<([f32; 3], [f32; 3])> {
-        let g = scene.world.get::<GlobalTransform>(self.sheet_e[f])?;
-        let c = g.translation();
+    /// The world rect of a page (its sheet's world centre ± half a page),
+    /// from the sheet node's CURRENT world (O(depth)).
+    pub fn page_world_rect(&self, t: &NodeTables, sheet: NodeHandle) -> Option<([f32; 3], [f32; 3])> {
+        let c = t.world(sheet).ok()?.0.translation;
         let (hw, hh) = ((self.opts.page_w / 2.0) as f32, (self.opts.page_h / 2.0) as f32);
-        Some(([c.x - hw, c.y - hh, c.z], [c.x + hw, c.y + hh, c.z]))
+        Some(([c[0] - hw, c[1] - hh, c[2]], [c[0] + hw, c[1] + hh, c[2]]))
     }
 
     /// The volumes a verb addresses: the picked file's directory, else
@@ -237,7 +269,7 @@ impl Library {
 
     /// Turn the volumes in scope. Only a `z` stack pages (the shelf and the
     /// pile show every book at once).
-    pub fn page(&mut self, scene: &SpatialScene, picked: Option<usize>, cmd: Page) -> String {
+    pub fn page(&mut self, t: &NodeTables, picked: Option<usize>, cmd: Page) -> String {
         if self.opts.stack != Stack::Z {
             return format!("library: stack is {:?} — only a z stack (volumes) pages", self.opts.stack);
         }
@@ -260,7 +292,7 @@ impl Library {
             st.head = head;
             self.volumes.insert(self.plan.dirs[d].path.clone(), st);
         }
-        self.replan(scene);
+        self.replan(t);
         let one = (scope.len() == 1).then(|| {
             let d = &self.plan.dirs[scope[0]];
             format!(" — '{}' page {}/{}", d.path, d.head + 1, d.books.len())
@@ -269,7 +301,7 @@ impl Library {
     }
 
     /// Set or toggle the form of the volumes in scope (each toggles its own).
-    pub fn form(&mut self, scene: &SpatialScene, picked: Option<usize>, cmd: FormCmd) -> String {
+    pub fn form(&mut self, t: &NodeTables, picked: Option<usize>, cmd: FormCmd) -> String {
         if self.opts.stack != Stack::Z {
             return format!("library: stack is {:?} — forms are a z stack's (volumes)", self.opts.stack);
         }
@@ -292,79 +324,77 @@ impl Library {
                 self.default_form = f;
             }
         }
-        self.replan(scene);
+        self.replan(t);
         format!("library: form {cmd:?} on {} volume(s)", scope.len())
     }
 
-    pub fn set_stack(&mut self, scene: &SpatialScene, stack: Stack) -> String {
+    pub fn set_stack(&mut self, t: &NodeTables, stack: Stack) -> String {
         self.opts.stack = stack;
-        self.replan(scene);
+        self.replan(t);
         format!("library: stack {stack:?}")
     }
 
-    pub fn set_sort(&mut self, scene: &SpatialScene, sort: Sort, reverse: bool) -> String {
+    pub fn set_sort(&mut self, t: &NodeTables, sort: Sort, reverse: bool) -> String {
         self.opts.sort = sort;
         self.opts.reverse = reverse;
-        self.replan(scene);
+        self.replan(t);
         format!("library: sort {sort:?}{}", if reverse { " reversed" } else { "" })
     }
 
-    /// Recompute every target; each node's ease starts from its live
-    /// transform (mid-ease, or dragged), so nothing teleports.
-    fn replan(&mut self, scene: &SpatialScene) {
+    /// Recompute every target; each node's ease starts from its live local
+    /// row (mid-ease, or dragged), so nothing teleports.
+    fn replan(&mut self, t: &NodeTables) {
         self.plan = plan(&self.tree, &self.files, &self.opts, &self.volumes, self.default_form);
-        let live = |e: Entity| scene.world.get::<Transform>(e).map(|t| t.translation);
-        for (at, &e) in self.dir_at.iter_mut().zip(&self.dir_e) {
-            if let Some(t) = live(e) {
-                *at = [f64::from(t.x), f64::from(t.y), f64::from(t.z)];
+        if let Some(n) = &self.nodes {
+            let live = |h: NodeHandle| t.local(h).ok().map(|l| l.translation.map(f64::from));
+            for (at, &h) in self.dir_at.iter_mut().zip(&n.dir) {
+                if let Some(p) = live(h) {
+                    *at = p;
+                }
             }
-        }
-        for (at, &e) in self.sheet_at.iter_mut().zip(&self.sheet_e) {
-            if let Some(t) = live(e) {
-                *at = [f64::from(t.x), f64::from(t.y), f64::from(t.z)];
+            for (at, &h) in self.sheet_at.iter_mut().zip(&n.sheet) {
+                if let Some(p) = live(h) {
+                    *at = p;
+                }
             }
         }
         self.animating = true;
     }
 
     /// One animation step of `dt` seconds. None when settled (nothing to
-    /// do, nothing written); otherwise the transforms are written and
-    /// propagated, and the caller syncs the changed group rows.
-    pub fn tick(&mut self, scene: &mut SpatialScene, dt: f32) -> Option<LibraryTick> {
+    /// do, nothing written); otherwise the moved nodes' local rows are
+    /// written and returned, and the caller mirrors what they carry.
+    pub fn tick(&mut self, t: &mut NodeTables, dt: f32) -> Option<LibraryTick> {
         if !self.animating {
             return None;
         }
+        let nodes = self.nodes.as_ref()?;
         let t0 = Instant::now();
         let k = ease_k(self.lerp, f64::from(dt));
-        let mut moved = 0usize;
+        let mut moved = Vec::new();
         let mut pending = false;
-        let mut step = |at: &mut [f64; 3], target: [f64; 3], e: Entity, world: &mut World| {
-            let (next, did) = ease_step(*at, target, k, self.settle);
+        let settle = self.settle;
+        let mut step = |at: &mut [f64; 3], target: [f64; 3], h: NodeHandle, t: &mut NodeTables| {
+            let (next, did) = ease_step(*at, target, k, settle);
             if did {
                 *at = next;
-                if let Some(mut t) = world.get_mut::<Transform>(e) {
-                    t.translation = v3(next);
-                }
-                moved += 1;
+                let l = t.local(h).expect("library nodes stay live");
+                t.set_local(h, Similarity { translation: v3(next), ..l }).expect("live");
+                moved.push(h);
             }
             if next != target {
                 pending = true;
             }
         };
         for (d, at) in self.dir_at.iter_mut().enumerate() {
-            step(at, self.plan.dirs[d].pos, self.dir_e[d], &mut scene.world);
+            step(at, self.plan.dirs[d].pos, nodes.dir[d], t);
         }
         for (f, at) in self.sheet_at.iter_mut().enumerate() {
-            step(at, self.plan.files[f].slot, self.sheet_e[f], &mut scene.world);
+            step(at, self.plan.files[f].slot, nodes.sheet[f], t);
         }
         let ease_ms = t0.elapsed().as_secs_f64() * 1e3;
-        let t1 = Instant::now();
-        if moved > 0 {
-            scene.update_transforms();
-        }
-        let propagate_ms = t1.elapsed().as_secs_f64() * 1e3;
         self.animating = pending;
-        Some(LibraryTick { nodes_moved: moved, ease_ms, propagate_ms, still_animating: pending })
+        Some(LibraryTick { nodes_moved: moved.len(), moved, ease_ms, still_animating: pending })
     }
 }
 

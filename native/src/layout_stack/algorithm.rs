@@ -33,39 +33,33 @@ impl LayoutController {
         self.apply_dynamic_stack(views)
     }
 
-    /// `--layout-mode library`: build the books on a fresh spatial scene,
-    /// seat them, and read every file's group row off its flattened world
-    /// transform (`sync_all_to_group_rows`) — translation AND the fit scale.
-    /// `views[i].offset` takes the translation; the scale is read from the
-    /// group row by everything downstream (`RepoLoad::into_staged`'s cull
-    /// boxes, `CullState`'s local boxes). Bounds are the union of every
-    /// file's scaled ink box and every page rect, so the camera frames the
-    /// pages, not only the text.
+    /// `--layout-mode library`: plan the books and read every file's group
+    /// row off its world transform — translation AND the fit scale —
+    /// resolved on the CPU from the library's hierarchy in a scratch node
+    /// table (the same nodes, composed the same way, that the scene's tables
+    /// will hold and the GPU resolve will draw: `GlyphScene::new` attaches
+    /// the library to them). No bevy scene: the library has none since
+    /// 2026-10-10. `views[i].offset` takes the translation; the scale is
+    /// read from the group row by everything downstream
+    /// (`RepoLoad::into_staged`'s cull boxes, `CullState`'s local boxes).
+    /// Bounds are the union of every file's scaled ink box and every page
+    /// rect, so the camera frames the pages, not only the text.
     fn apply_library(
         &mut self,
         views: &mut [FileView],
     ) -> (Vec<GroupRow>, [f32; 3], [f32; 3]) {
         self.scene = SpatialScene::new();
         self.zone_entities.clear();
+        self.file_entities.clear();
         let files: Vec<crate::library::plan::LibFile> = views
             .iter()
             .map(|v| crate::library::plan::LibFile { rel_path: v.rel_path.clone(), ink_min: v.ink.min, ink_max: v.ink.max })
             .collect();
-        let dirs: Vec<String> = views.iter().map(|v| v.dir.clone()).collect();
         let tints: Vec<[f32; 3]> = views.iter().map(|v| dir_tint(&v.dir)).collect();
-        let lib = crate::library::Library::build(
-            &mut self.scene,
-            files,
-            &dirs,
-            &tints,
-            &crate::config::settings().library,
-        );
-        self.scene.update_transforms();
-        let mut groups: Vec<GroupRow> = tints.iter().map(|t| GroupRow::tinted([0.0; 3], *t)).collect();
-        self.scene.sync_all_to_group_rows(&mut groups);
-        // Spawning marked every transform changed; the first page turn must
-        // sync only what it moves.
-        self.scene.world.clear_trackers();
+        let lib = crate::library::Library::new(files, &crate::config::settings().library);
+        let mut scratch = glyph_scene_graph::NodeTables::default();
+        let nodes = lib.insert_nodes(&mut scratch, None, None);
+        let groups = crate::library::seated_rows(&scratch, &nodes, &tints);
         let (mut lo, mut hi) = ([f32::INFINITY; 3], [f32::NEG_INFINITY; 3]);
         for (i, (v, g)) in views.iter_mut().zip(&groups).enumerate() {
             v.offset = [g.cols[0][0], g.cols[0][1], g.cols[0][2]];
@@ -74,7 +68,7 @@ impl LayoutController {
                 lo[a] = lo[a].min(v.offset[a] + v.ink.min[a] * s[a]);
                 hi[a] = hi[a].max(v.offset[a] + v.ink.max[a] * s[a]);
             }
-            if let Some((pmin, pmax)) = lib.page_world_rect(&self.scene, i) {
+            if let Some((pmin, pmax)) = lib.page_world_rect(&scratch, nodes.sheet[i]) {
                 for a in 0..3 {
                     lo[a] = lo[a].min(pmin[a]);
                     hi[a] = hi[a].max(pmax[a]);
@@ -83,10 +77,6 @@ impl LayoutController {
         }
         if views.is_empty() {
             (lo, hi) = ([0.0; 3], [1.0; 3]);
-        }
-        self.file_entities = lib.file_e.clone();
-        for (zid, e) in lib.zones() {
-            self.zone_entities.insert(zid, e);
         }
         println!("{}", lib.summary());
         log::info!(
