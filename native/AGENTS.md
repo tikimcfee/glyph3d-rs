@@ -126,7 +126,9 @@ caller; the short version:
     colour, x nudge, group; y/z nudge and `scale-glyph` are not representable,
     as in Derived, and the reply says so); `recolor-line` is a span over the
     row's byte range; `hide-group` also calls `set_item_hidden`, and every
-    `sync_segment` pushes the recomputed box with `set_item_bbox`. The stored
+    item carries a LOCAL box its cull carries through the live group row
+    (2026-10-10; until then every `sync_segment` pushed a world box with
+    `set_item_bbox`). The stored
     modes' slot paths are untouched. `--debug-tint lod|cull`
     colours its glyphs by LOD tier or cull state (the other modes never read it).
   - **The Derived lanes are a load-time limit** (`layout_hyper::derived_lane_limits`,
@@ -248,7 +250,8 @@ its staging text predates C22). Key touchpoints:
   moved, groups synced, the CPU stages (`ease_ms`, `propagate_ms` = bevy
   transform propagation + scene-mesh re-extraction, `sync_ms`, `upload_ms`,
   `seg_ms` = `sync_segment` per moved file) and the bytes queued (group rows,
-  Visible item boxes, page-face mesh instances). Animations run on the
+  page-face mesh instances; the Visible field's item boxes stopped being
+  uploaded on 2026-10-10 — its cull reads the group rows). Animations run on the
   offscreen 1/60 s clock (`SceneLike::animate`), so `--verb page-next
   --frames 120` is a deterministic page turn. A settled library prints
   nothing: it does no work. `out/LIBRARY-LAYOUT-FINDINGS-2026-10-10.md` has
@@ -310,9 +313,9 @@ its staging text predates C22). Key touchpoints:
   400: straight down), `on_key(G)` to release — one step every fourth frame
   from t≈3 s, printing the HUD line after each (`GRAB-SELFTEST step N …`)
   and the group's offset at the end (`move-group 0 0 0`). An item still in
-  view after the drag must stay counted visible (`items a/b`): the drag
-  pushes its box to the Visible field (`sync_segment` → `set_item_bbox`)
-  every step. Pair it with `--cam-pose` so the drag lands where you want.
+  view after the drag must stay counted visible (`items a/b`): the
+  field's item cull carries the item's local box through the live group
+  row (since 2026-10-10; before, the drag pushed a world box every step). Pair it with `--cam-pose` so the drag lands where you want.
 - `GLYPH_POSE_PRINT=1` — windowed: F2 (screenshot) also prints the frame's
   camera as the `--cam-pose X Y Z YAW PITCH` argument (degrees) that
   reproduces it — the same line the Debug panel's "copy pose" button puts on

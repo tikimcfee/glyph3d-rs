@@ -3,9 +3,8 @@
 //! transforms to the GPU through the paths every group edit already takes —
 //! `sync_to_group_rows` (the changed files' flattened transforms into the
 //! CPU group mirror), `write_group_rows` (one upload), and `sync_segment`
-//! per moved file (the CPU cull box, and in the Visible field the item's
-//! world box: `item_visible` tests a host-set box, so a group that moved
-//! without it would be culled where it used to be).
+//! per moved file (the CPU cull box; the Visible field's item cull reads
+//! the uploaded group rows itself, so it needs nothing per file).
 //!
 //! `GLYPH_LIBRARY_TIMING=1` prints one `LIBTIME` line per animated frame:
 //! what moved, what each stage cost, and the bytes it queued.
@@ -83,7 +82,6 @@ impl GlyphScene {
         }
         if std::env::var_os("GLYPH_LIBRARY_TIMING").is_some() {
             let (group_bytes, group_writes) = group_upload(&gids);
-            let visible = self.field.visible().is_some();
             let mesh_bytes = if tick.nodes_moved > 0 {
                 (quads * std::mem::size_of::<crate::glyph_scene::mesh::MeshInstance>()) as u64
             } else {
@@ -91,7 +89,7 @@ impl GlyphScene {
             };
             println!(
                 "LIBTIME nodes_moved={} groups_synced={} ease_ms={:.4} propagate_ms={:.4} sync_ms={:.4} upload_ms={:.4} seg_ms={:.4} \
-                 group_bytes={} group_writes={} item_box_bytes={} item_box_writes={} mesh_bytes={} animating={}",
+                 group_bytes={} group_writes={} mesh_bytes={} animating={}",
                 tick.nodes_moved,
                 gids.len(),
                 tick.ease_ms,
@@ -101,8 +99,6 @@ impl GlyphScene {
                 seg_ms,
                 group_bytes,
                 group_writes,
-                if visible { gids.len() * 24 } else { 0 },
-                if visible { gids.len() } else { 0 },
                 mesh_bytes,
                 tick.still_animating,
             );

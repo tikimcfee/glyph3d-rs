@@ -175,8 +175,10 @@ pub struct VisibleItem {
     /// Its colour spans.
     pub span_base: u32,
     pub span_count: u32,
-    /// World-space box of its glyphs, group offset applied — what the scene
-    /// culls today (`SegCull.min/max`).
+    /// LOCAL box of its glyphs, in the item's own frame (the scene's
+    /// `SegCull` box before the group's T·R·S). The item cull carries it
+    /// through the live group row every frame, so a group edit needs no box
+    /// upload (2026-10-10; it was a world box, re-sent per moved item).
     pub bbox_min: [f32; 3],
     pub bbox_max: [f32; 3],
     /// The scene's group row (the same as `params.group`).
@@ -357,11 +359,12 @@ impl VisibleField {
         self.resident.set_item_hidden(queue, item, hidden);
     }
 
-    /// Replace the world box the item cull tests (after a group edit moves
-    /// the item; the line cull reads the live group table and needs no
-    /// update).
-    pub fn set_item_bbox(&self, queue: &wgpu::Queue, item: u32, bbox_min: [f32; 3], bbox_max: [f32; 3]) {
-        self.resident.set_item_bbox(queue, item, bbox_min, bbox_max);
+    /// Replace an item's LOCAL box (`VisibleItem::bbox_min/max`) — for an
+    /// edit that changes what the item holds. A group edit (move, scale, a
+    /// drag, a layout animating) needs nothing: the item cull, like the line
+    /// cull, reads the live group table.
+    pub fn set_item_local_box(&self, queue: &wgpu::Queue, item: u32, local_min: [f32; 3], local_max: [f32; 3]) {
+        self.resident.set_item_local_box(queue, item, local_min, local_max);
     }
 
     // ── M3: edits and selection keyed by (item, byte) ─────────────────

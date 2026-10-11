@@ -1,9 +1,11 @@
 // visible_cull.wgsl — the Visible field's per-frame cull, four dispatches in
 // one compute pass, nothing read back:
 //
-//   cull_items     one invocation per item, 256 to a workgroup: its world
-//                  box (the scene's own `SegCull` box, group offset applied)
-//                  against the frustum, the `hidden` bit, and the projected
+//   cull_items     one invocation per item, 256 to a workgroup: its LOCAL
+//                  box (the scene's `SegCull` box before the group's T·R·S)
+//                  through the live group row, as the line cull does
+//                  (2026-10-10; until then a host-written world box, which
+//                  every moved group had to re-upload), against the frustum, the `hidden` bit, and the projected
 //                  row height at the box's nearest point — under
 //                  `lod_backdrop_px` the item is a BACKDROP (the scene draws
 //                  its quad; nothing is laid out), else its `item_flag` is
@@ -278,14 +280,20 @@ fn item_visible(i: u32) -> u32 {
         return 0u;
     }
     let it = items[i];
-    var b: Box;
-    b.lo = vec3<f32>(it.bbox_min_x, it.bbox_min_y, it.bbox_min_z);
-    b.hi = vec3<f32>(it.bbox_max_x, it.bbox_max_y, it.bbox_max_z);
-    if (b.lo.x > b.hi.x || !box_in_frustum(b)) {
+    var lb: Box;
+    lb.lo = vec3<f32>(it.bbox_min_x, it.bbox_min_y, it.bbox_min_z);
+    lb.hi = vec3<f32>(it.bbox_max_x, it.bbox_max_y, it.bbox_max_z);
+    if (lb.lo.x > lb.hi.x) {
         atomicAdd(&counters[C_ITEMS_CULLED], 1u);
         return 0u;
     }
-    let gscale = groups[group_base(it.group) + 3u];
+    let gbase = group_base(it.group);
+    let b = to_world(gbase, lb);
+    if (!box_in_frustum(b)) {
+        atomicAdd(&counters[C_ITEMS_CULLED], 1u);
+        return 0u;
+    }
+    let gscale = groups[gbase + 3u];
     if (row_px(b, it.line_height * gscale.y) < frame.lod.y) {
         atomicAdd(&counters[C_ITEMS_BACKDROP], 1u);
         return 0u;
